@@ -4,6 +4,7 @@
 #include <QKeyEvent>
 #include <QTest>
 
+#include <cstdint>
 #include <deque>
 #include <vector>
 
@@ -34,10 +35,10 @@ bool sameGrid(const Grid& a, const Grid& b)
     return true;
 }
 
-// Drives the history the way SegmentationModule::applyHistoryEntry does: an
-// edit records the positions it overwrites, and undo or redo records the
-// current positions (UndoHistory::inverseFor) before restoring them, so every
-// step can be reversed.
+// Drives the history the way SegmentationModule does: an edit records the
+// positions it overwrites, and undo or redo go through UndoHistory::step, the
+// same call SegmentationModule::applyHistoryEntry makes, with this grid in
+// place of the edit session's preview points.
 class Editor
 {
 public:
@@ -62,23 +63,23 @@ public:
     // approvalSteps: whether the paired auto-approval could be stepped too.
     bool step(bool redo, bool approvalSteps = true)
     {
-        auto entry = redo ? history.takeRedo() : history.takeUndo();
-        if (!entry) {
-            return false;
-        }
-        UndoHistory::Entry replaced = UndoHistory::inverseFor(grid, *entry);
-        if (entry->isDelta()) {
-            UndoHistory::applyDeltas(grid, *entry);
-        } else if (entry->points.size() == grid.size()) {
-            entry->points.copyTo(grid);
-        } else {
-            return false;  // Like setPreviewPoints; the entry is dropped
-        }
-        if (entry->autoApprovalId != 0 && approvalSteps) {
-            replaced.autoApprovalId = entry->autoApprovalId;
-        }
-        history.pushReplaced(redo, std::move(replaced));
-        return true;
+        return history.step(
+            redo, grid,
+            [this](const UndoHistory::Entry& entry, const UndoHistory::Entry&) {
+                if (entry.isDelta()) {
+                    UndoHistory::applyDeltas(grid, entry);
+                    return true;
+                }
+                if (entry.points.size() != grid.size()) {
+                    return false;  // Like setPreviewPoints
+                }
+                entry.points.copyTo(grid);
+                return true;
+            },
+            [this, approvalSteps](std::uint64_t id) {
+                steppedApprovals.push_back(id);
+                return approvalSteps;
+            });
     }
 
     bool undo() { return step(false); }
@@ -86,6 +87,7 @@ public:
 
     Grid grid;
     UndoHistory history;
+    std::vector<std::uint64_t> steppedApprovals;
 };
 
 std::size_t snapshotBytes(const Grid& grid)
@@ -340,9 +342,28 @@ private slots:
 
         QVERIFY(editor.undo());
         QVERIFY(editor.undo());
+        // Only the paired edit steps an approval.
+        QCOMPARE(editor.steppedApprovals.size(), std::size_t{1});
+        QCOMPARE(editor.steppedApprovals.front(), std::uint64_t{42});
         auto redoEntry = editor.history.takeRedo();
         QVERIFY(redoEntry.has_value());
         QCOMPARE(redoEntry->autoApprovalId, std::uint64_t{42});
+    }
+
+    void entryThatDoesNotApplyIsDroppedWithItsApproval()
+    {
+        // A snapshot of another grid size cannot be restored: step drops it
+        // without stepping its approval, and the steps behind it stay usable.
+        Editor editor(makeGrid(2, 2, 0.0f));
+        editor.move(0, 0, 1.0f);
+        editor.history.capture(makeGrid(3, 3, 5.0f));
+        editor.history.setLastAutoApprovalId(9);
+        QVERIFY(!editor.undo());
+        QVERIFY(editor.steppedApprovals.empty());
+        QVERIFY(!editor.history.canRedo());
+        QCOMPARE(editor.history.size(), std::size_t{1});
+        QVERIFY(editor.undo());
+        QCOMPARE(editor.grid(0, 0), cv::Vec3f(0.0f, 0.0f, 0.0f));
     }
 
     void autoApprovalIdIsDroppedWhenTheApprovalStepFails()

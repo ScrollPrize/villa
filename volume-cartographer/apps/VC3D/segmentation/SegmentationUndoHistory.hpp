@@ -225,6 +225,33 @@ public:
         }
     }
 
+    // One undo (redo false) or redo step on grid, the surface the entries
+    // address. Takes the next entry and reads the entry that reverses it from
+    // grid (inverseFor) before apply(entry, inverse) writes the entry into
+    // grid. apply returns whether it applied; an entry that does not apply is
+    // dropped, so it cannot block the steps behind it. When it applied and
+    // has a paired auto-approval, stepApproval(id) steps that too and says
+    // whether it could; only then is the reverse entry linked to it. The
+    // reverse entry goes on the opposite stack, so the step can be reversed.
+    // Returns whether a step was applied.
+    template <typename Apply, typename StepApproval>
+    bool step(bool redo, const cv::Mat_<cv::Vec3f>& grid, Apply&& apply, StepApproval&& stepApproval)
+    {
+        auto entry = redo ? takeRedo() : takeUndo();
+        if (!entry) {
+            return false;
+        }
+        Entry inverse = inverseFor(grid, *entry);
+        if (!apply(static_cast<const Entry&>(*entry), static_cast<const Entry&>(inverse))) {
+            return false;
+        }
+        if (entry->autoApprovalId != 0 && stepApproval(entry->autoApprovalId)) {
+            inverse.autoApprovalId = entry->autoApprovalId;
+        }
+        pushReplaced(redo, std::move(inverse));
+        return true;
+    }
+
 private:
     static bool insideGrid(const cv::Mat_<cv::Vec3f>& grid, const VertexDelta& delta)
     {

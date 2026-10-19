@@ -232,8 +232,8 @@ void SegmentationModule::discardLastUndoSnapshot()
     notifyUndoAvailability();
 }
 
-// Applies the next undo (or redo) entry and stores the state it replaces on
-// the opposite stack, so every step can be reversed.
+// Applies the next undo (or redo) entry. UndoHistory::step keeps the state it
+// replaces on the opposite stack, so every step can be reversed.
 bool SegmentationModule::applyHistoryEntry(bool redo)
 {
     if (_suppressUndoCapture) {
@@ -243,51 +243,45 @@ bool SegmentationModule::applyHistoryEntry(bool redo)
         return false;
     }
 
-    auto entry = redo ? _undoHistory.takeRedo() : _undoHistory.takeUndo();
-    if (!entry) {
-        return false;
-    }
-
     _suppressUndoCapture = true;
-    bool applied = false;
-    // The current state, kept for the opposite step
-    auto replaced = segmentation::UndoHistory::inverseFor(_editManager->previewPoints(), *entry);
     std::vector<SegmentationEditManager::VertexEdit> autosaveEdits;
     const bool editingWasEnabled = _editingEnabled;
 
-    if (entry->isDelta()) {
-        // Restore the recorded positions
-        auto& previewPoints = _editManager->previewPointsMutable();
-        segmentation::UndoHistory::applyDeltas(previewPoints, *entry);
-        autosaveEdits.reserve(replaced.deltas.size());
-        for (const auto& delta : replaced.deltas) {
-            autosaveEdits.push_back({delta.row, delta.col, {}, previewPoints(delta.row, delta.col), false});
-        }
+    const auto apply = [&](const segmentation::UndoHistory::Entry& entry,
+                           const segmentation::UndoHistory::Entry& replaced) {
+        bool applied = false;
+        if (entry.isDelta()) {
+            // Restore the recorded positions
+            auto& previewPoints = _editManager->previewPointsMutable();
+            segmentation::UndoHistory::applyDeltas(previewPoints, entry);
+            autosaveEdits.reserve(replaced.deltas.size());
+            for (const auto& delta : replaced.deltas) {
+                autosaveEdits.push_back({delta.row, delta.col, {}, previewPoints(delta.row, delta.col), false});
+            }
 
-        _editManager->applyPreview();
-        if (auto surface = _editManager->previewSurface()) {
-            surface->invalidateCache();
-        }
-        applied = true;
-    } else if (!entry->points.empty()) {
-        // Legacy full snapshot restore
-        applied = _editManager->setPreviewPoints(entry->points, false);
-        if (applied) {
             _editManager->applyPreview();
+            if (auto surface = _editManager->previewSurface()) {
+                surface->invalidateCache();
+            }
+            applied = true;
+        } else if (!entry.points.empty()) {
+            // Legacy full snapshot restore; a snapshot of another grid size
+            // does not apply
+            applied = _editManager->setPreviewPoints(entry.points, false);
+            if (applied) {
+                _editManager->applyPreview();
+            }
         }
-    }
+        if (!applied) {
+            return false;
+        }
 
-    // An entry that does not apply (a snapshot of another grid size) is
-    // dropped rather than put back, so it cannot block the steps behind it.
-    if (applied) {
         auto restoredSurface = _editManager->previewSurface();
         if (restoredSurface) {
             restoredSurface->invalidateCache();
         }
 
-        if (_editManager) {
-            _editManager->refreshFromBaseSurface();
-        }
+        _editManager->refreshFromBaseSurface();
 
         if (_surfaceMaskTool) {
             _surfaceMaskTool->setSurface(restoredSurface.get());
@@ -296,10 +290,7 @@ bool SegmentationModule::applyHistoryEntry(bool redo)
         }
 
         if (_state) {
-            auto preview = _editManager->previewSurface();
-
-
-            _state->setSurface("segmentation", preview, false, true);
+            _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
         }
 
         if (editingWasEnabled && !_editingEnabled) {
@@ -308,22 +299,25 @@ bool SegmentationModule::applyHistoryEntry(bool redo)
                 _widget->setEditingEnabled(true);
             }
         }
+        return true;
+    };
 
-        // Also undo or redo the auto-approval the edit painted, if any
-        if (entry->autoApprovalId != 0 && _overlay && _overlay->hasApprovalMaskData()) {
-            const bool stepped = redo ? _overlay->redoAutoApproval(entry->autoApprovalId)
-                                      : _overlay->undoAutoApproval(entry->autoApprovalId);
-            if (stepped) {
-                replaced.autoApprovalId = entry->autoApprovalId;
-                // Schedule save to persist the change
-                if (_editManager && _editManager->baseSurface()) {
-                    _overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
-                }
-            }
+    // Also undo or redo the auto-approval the edit painted, if any
+    const auto stepApproval = [&](std::uint64_t approvalId) {
+        if (!_overlay || !_overlay->hasApprovalMaskData()) {
+            return false;
         }
+        const bool stepped = redo ? _overlay->redoAutoApproval(approvalId)
+                                  : _overlay->undoAutoApproval(approvalId);
+        // Schedule save to persist the change
+        if (stepped && _editManager->baseSurface()) {
+            _overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
+        }
+        return stepped;
+    };
 
-        _undoHistory.pushReplaced(redo, std::move(replaced));
-
+    const bool applied = _undoHistory.step(redo, _editManager->previewPoints(), apply, stepApproval);
+    if (applied) {
         refreshOverlay();
         emitPendingChanges();
         queueAutosaveVertexUpdates(autosaveEdits);
