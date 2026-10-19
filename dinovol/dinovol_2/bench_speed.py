@@ -2,43 +2,24 @@ from __future__ import annotations
 
 import json
 import os
-import signal
+import shlex
 import subprocess
 import sys
-import time
+import tempfile
 from pathlib import Path
 
 
 RUN_DIR = Path("/ephemeral/sean/dinovol_perf/runs/pretrain_8_9um_objects_meshes_ink_160k")
+BENCH_ROOT = RUN_DIR.with_name(f"{RUN_DIR.name}_benchmarks")
 CODE_DIR = Path("/ephemeral/sean/dinovol_perf/code")
 VENV_PY = "/home/ubuntu/dinovol/.venv/bin/python"
 
 
-def kill_gpu6_procs() -> None:
-    my_pid = os.getpid()
-    out = subprocess.check_output(
-        ["nvidia-smi", "-i", "6", "--query-compute-apps=pid", "--format=csv,noheader"],
-        text=True,
-    )
-    for line in out.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        pid = int(line)
-        if pid != my_pid:
-            try:
-                os.kill(pid, signal.SIGKILL)
-                print(f"Killed GPU 6 PID {pid}", flush=True)
-            except ProcessLookupError:
-                pass
-
-
-def launch_training() -> None:
-    kill_gpu6_procs()
-    time.sleep(1.0)
-
-    cfg_path = RUN_DIR / "config.json"
-    cfg = json.loads(cfg_path.read_text())
+def launch_training() -> Path:
+    checkpoint = (RUN_DIR / "checkpoint_step_160000.pt").resolve()
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"Benchmark seed checkpoint is missing: {checkpoint}")
+    cfg = json.loads((RUN_DIR / "config.json").read_text())
     cfg["batch_size"] = 10
     cfg["grad_accumulation_steps"] = 1
     cfg["model"]["grad_checkpointing"] = False
@@ -46,21 +27,22 @@ def launch_training() -> None:
     cfg["dataset"]["num_local_crops"] = 4
     cfg["dataset"]["object_points"].pop("slab_thickness", None)
     cfg["dataset"]["object_points"]["mesh_cache_dir"] = "/ephemeral/sean/dinovol_perf/mesh_cache_8_9um"
+    BENCH_ROOT.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(tempfile.mkdtemp(prefix="run-", dir=BENCH_ROOT)).resolve()
+    cfg.update(output_dir=str(output_dir), resume_from=str(checkpoint), resume=True, auto_resume=False)
+    cfg_path = output_dir / "config.json"
     cfg_path.write_text(json.dumps(cfg, indent=2) + "\n")
 
-    for ckpt in sorted(RUN_DIR.glob("checkpoint_step_*.pt")):
-        if ckpt.name != "checkpoint_step_160000.pt":
-            ckpt.unlink()
-            print(f"Removed intermediate {ckpt.name}", flush=True)
-
-    log_path = RUN_DIR / "train.log"
-    pid_path = RUN_DIR / "train.pid"
+    log_path = output_dir / "train.log"
+    pid_path = output_dir / "train.pid"
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = "6"
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     env["PYTHONUNBUFFERED"] = "1"
 
-    cmd = f"source /ephemeral/sean/dinovol_perf/env.sh && exec {VENV_PY} -u -m dinovol_2.pretrain {cfg_path}"
+    cmd = "source /ephemeral/sean/dinovol_perf/env.sh && exec " + shlex.join(
+        [VENV_PY, "-u", "-m", "dinovol_2.pretrain", str(cfg_path)]
+    )
     with open(log_path, "w") as log_f:
         proc = subprocess.Popen(
             ["/bin/bash", "-c", cmd],
@@ -72,7 +54,9 @@ def launch_training() -> None:
             start_new_session=True,
         )
     pid_path.write_text(f"{proc.pid}\n")
+    (BENCH_ROOT / "latest-run.txt").write_text(str(output_dir) + "\n")
     print(f"Launched training PID={proc.pid} log={log_path}", flush=True)
+    return output_dir
 
 
 def check_status() -> None:
@@ -91,7 +75,11 @@ def check_status() -> None:
         text=True,
     ).strip()
     print(f"GPU 6: {smi} | Apps: {apps}", flush=True)
-    log_path = RUN_DIR / "train.log"
+    latest_run = BENCH_ROOT / "latest-run.txt"
+    if not latest_run.exists():
+        print("No benchmark has been launched.", flush=True)
+        return
+    log_path = Path(latest_run.read_text().strip()) / "train.log"
     if log_path.exists():
         lines = log_path.read_text(errors="replace").splitlines()
         print(f"--- train.log ({len(lines)} lines, last 25) ---", flush=True)

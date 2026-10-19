@@ -233,6 +233,12 @@ class DinoIBOTPretrainer:
                     }
                 )
             if "region_head" in self.model.student:
+                # Ignoring the head also skips DDP's initialization broadcast.
+                # Start its manually averaged gradients and EMA from shared weights.
+                region_head = self.model.student["region_head"]
+                for param in region_head.parameters():
+                    dist.broadcast(param.detach(), src=0)
+                self.model.teacher["region_head"].load_state_dict(region_head.state_dict())
                 DDP._set_params_and_buffers_to_ignore_for_model(
                     self.model,
                     [f"student.region_head.{k}" for k, _ in self.model.student["region_head"].named_parameters()],

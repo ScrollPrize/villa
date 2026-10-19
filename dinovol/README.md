@@ -279,6 +279,32 @@ PHerc0332, PHerc1451, PHerc1299 and PHercParis4. PHercParis3 has no surface or f
 predictions in this format and trains without object labels. MANBp, 0343P and 0500P2
 are thinner than a source window and use `object_mask_min_inside: 0.5`.
 
+### Local benchmark launcher
+
+`dinovol_2/bench_speed.py` is a machine-specific launcher using the paths defined
+in that file and GPU 6. On the configured benchmark host, run:
+
+```bash
+python -m dinovol_2.bench_speed launch
+python -m dinovol_2.bench_speed status
+```
+
+Each launch creates a fresh `run-*` directory under `BENCH_ROOT`, next to the
+source `RUN_DIR`, with its own config, checkpoints, log, and PID file. It resumes
+explicitly from `RUN_DIR/checkpoint_step_160000.pt`; the source checkpoint is read
+in place, and the source config, logs, and other checkpoints are preserved.
+The seed checkpoint must exist before launch. `status` reads the latest launch
+recorded in `BENCH_ROOT/latest-run.txt`. Earlier benchmark directories are kept,
+including when a later launch fails. The launcher does not stop existing GPU
+processes; choose a free GPU before running it.
+
+The filesystem behavior is checked with mocked process launches (no GPU or
+training process is started):
+
+```bash
+python -m unittest discover -s tests -p test_bench_speed.py
+```
+
 ### Pseudo-object losses
 
 To encourage object-centric features (each papyrus sheet and each fiber a

@@ -738,7 +738,8 @@ class PatchEmbedDeeper(nn.Module):
         skips = []
         for stage in self.stages:
             x = stage(x)
-            skips.append(x)
+            if return_skips:
+                skips.append(x)
         x = self.final_proj(x)
         if return_skips:
             # The last stage only feeds the projection to tokens.

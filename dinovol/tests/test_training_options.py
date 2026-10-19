@@ -78,7 +78,58 @@ def _koleo_worker(rank, init_path, result_path):
         dist.destroy_process_group()
 
 
+def _region_head_sync_worker(rank, init_path, output_dir):
+    dist.init_process_group("gloo", init_method=f"file://{init_path}", rank=rank,
+                            world_size=2, timeout=timedelta(seconds=30))
+    try:
+        # Independent RNG streams must not leave ignored DDP parameters different.
+        torch.manual_seed(100 + rank)
+        trainer = DinoIBOTPretrainer({
+            "device": "cpu", "use_amp": False, "use_ddp": True,
+            "output_dir": output_dir, "max_iterations": 2,
+            "model": tiny_model_config(
+                embedding_type="deeper", deeper_embed_stage_channels=[8, 16, 24, 36],
+                deeper_embed_stage_strides=[1, 2, 2, 2],
+                deeper_embed_depth_per_level=[1] * 4, deeper_embed_final_projection=True,
+            ),
+            "object_losses": {"enabled": True, "head": {
+                "hidden_dim": 24, "out_dim": 16, "region_dim": 12,
+            }},
+        })
+        model = trainer.model_module
+
+        def assert_synced(head):
+            for param in head.parameters():
+                gathered = [torch.empty_like(param) for _ in range(2)]
+                dist.all_gather(gathered, param.detach())
+                torch.testing.assert_close(gathered[0], gathered[1], rtol=0, atol=0)
+
+        assert_synced(model.student.region_head)
+        assert_synced(model.teacher.region_head)
+        for student, teacher in zip(model.student.region_head.parameters(), model.teacher.region_head.parameters()):
+            torch.testing.assert_close(student, teacher, rtol=0, atol=0)
+
+        # Rank-local inputs, averaged gradients, and EMA must preserve agreement.
+        model.student.region_head(torch.randn(4, 36)).square().mean().backward()
+        for param in model.student.region_head.parameters():
+            dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+            param.grad.div_(2)
+        trainer.optimizer.step()
+        model.update_teacher(.994)
+        assert_synced(model.student.region_head)
+        assert_synced(model.teacher.region_head)
+    finally:
+        dist.destroy_process_group()
+
+
 class TrainingConfigTests(unittest.TestCase):
+    @unittest.skipUnless(dist.is_available() and dist.is_gloo_available(), "Gloo is unavailable")
+    def test_distributed_region_heads_start_and_remain_synchronized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            mp.spawn(_region_head_sync_worker, args=(str(root / "init"), str(root / "run")),
+                     nprocs=2, join=True)
+
     def test_v3_defaults_and_legacy_v2_are_distinct(self):
         with tempfile.TemporaryDirectory() as directory:
             config = {"device": "cpu", "use_amp": False, "output_dir": directory,

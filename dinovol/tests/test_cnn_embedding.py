@@ -4,6 +4,7 @@ import copy
 import json
 from pathlib import Path
 import unittest
+import weakref
 
 import torch
 from torch import nn
@@ -14,6 +15,74 @@ from dinovol_2.model.patch_encode_decode import PatchEmbedDeeper
 
 
 class CNNEmbeddingTests(unittest.TestCase):
+    def test_no_grad_embedding_retains_stage_outputs_only_when_requested(self):
+        encoder = PatchEmbedDeeper(
+            patch_size=(4, 4, 4), input_channels=1, embed_dim=12,
+            stage_channels=(4, 8, 12), stage_strides=(1, 2, 2),
+            stem_channels=4, stem_type="conv",
+        ).eval()
+        refs, alive_at_projection = [], []
+        handles = [stage.register_forward_hook(lambda module, args, output: refs.append(weakref.ref(output)))
+                   for stage in encoder.stages]
+        handles.append(encoder.final_proj.register_forward_pre_hook(
+            lambda module, args: alive_at_projection.extend(ref() is not None for ref in refs)))
+        x = torch.randn(1, 1, 8, 8, 8)
+        try:
+            with torch.no_grad():
+                tokens = encoder(x, return_skips=False)
+                self.assertEqual(alive_at_projection, [False, False, True])
+                refs.clear()
+                alive_at_projection.clear()
+                tokens_with_skips, skips = encoder(x, return_skips=True)
+                self.assertEqual(alive_at_projection, [True, True, True])
+                self.assertEqual(len(skips), 2)
+                torch.testing.assert_close(tokens, tokens_with_skips, rtol=0, atol=0)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+    def test_embedding_skips_avoid_single_chunk_copies_and_preserve_gradients(self):
+        for chunk_size in (None, 1, 2, 4):
+            with self.subTest(chunk_size=chunk_size):
+                torch.manual_seed(23)
+                backbone = DinoVitStudentTeacher._build_backbone({
+                    "model_type": "v2", "embed_dim": 12, "num_heads": 2, "depth": 1,
+                    "global_crops_size": [8] * 3, "local_crops_size": [8] * 3,
+                    "patch_size": [4] * 3, "embedding_type": "deeper",
+                    "deeper_embed_stage_channels": [4, 8, 12],
+                    "deeper_embed_stage_strides": [1, 2, 2],
+                    "deeper_embed_depth_per_level": [1, 1, 1],
+                    "deeper_embed_final_projection": True,
+                    "deeper_embed_batch_chunk_size": chunk_size,
+                })
+                reference = copy.deepcopy(backbone.down_projection)
+                x = torch.randn(2, 1, 8, 8, 8, requires_grad=True)
+                ref_x = x.detach().clone().requires_grad_()
+                raw_outputs = []
+                handle = backbone.down_projection.register_forward_hook(
+                    lambda module, args, output: raw_outputs.append(output))
+                skips = []
+                try:
+                    tokens = backbone._down_project_with_skips(x, skips)
+                finally:
+                    handle.remove()
+                if chunk_size != 1:
+                    self.assertEqual(len(raw_outputs), 1)
+                    self.assertIs(tokens, raw_outputs[0][0])
+                    for skip, original in zip(skips, raw_outputs[0][1]):
+                        self.assertIs(skip, original)
+                chunks = ref_x.split(chunk_size) if chunk_size is not None and chunk_size < 2 else (ref_x,)
+                ref_outputs = [reference(chunk, return_skips=True) for chunk in chunks]
+                ref_tokens = torch.cat([output[0] for output in ref_outputs])
+                ref_skips = [torch.cat(level) for level in zip(*(output[1] for output in ref_outputs))]
+                for actual, expected in zip([tokens, *skips], [ref_tokens, *ref_skips]):
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                sum(t.square().mean() for t in [tokens, *skips]).backward()
+                sum(t.square().mean() for t in [ref_tokens, *ref_skips]).backward()
+                torch.testing.assert_close(x.grad, ref_x.grad, rtol=0, atol=0)
+                for actual, expected in zip(backbone.down_projection.parameters(), reference.parameters()):
+                    torch.testing.assert_close(actual.grad, expected.grad, rtol=0, atol=0)
+
     def test_rotary_attention_checkpointing_matches_direct_gradients(self):
         for chunks in (0, 2, 4):
             with self.subTest(block_chunks=chunks):

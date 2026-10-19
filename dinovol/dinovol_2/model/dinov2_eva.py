@@ -782,7 +782,11 @@ class Eva(nn.Module):
 
     def _down_project_with_skips(self, x, skips):
         batch_chunk_size = self.deeper_embed_batch_chunk_size
-        chunks = x.split(batch_chunk_size) if batch_chunk_size is not None and x.shape[0] > batch_chunk_size else (x,)
+        if batch_chunk_size is None or x.shape[0] <= batch_chunk_size:
+            tokens, levels = self.down_projection(x, return_skips=True)
+            skips.extend(levels)
+            return tokens
+        chunks = x.split(batch_chunk_size)
         outputs = [self.down_projection(chunk, return_skips=True) for chunk in chunks]
         skips.extend(torch.cat(level, dim=0) for level in zip(*(levels for _, levels in outputs)))
         return torch.cat([tokens for tokens, _ in outputs], dim=0)
