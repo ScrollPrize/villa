@@ -437,15 +437,26 @@ void MenuActionController::exportTheme()
     const QString folder = themes.userThemesDirectory();
     QDir().mkpath(folder);
     QString name = vc3d::theme::normalizeThemeId(themes.currentTheme().name + QStringLiteral(" copy"));
-    QString path = QFileDialog::getSaveFileName(
-        _window, QObject::tr("Export Current Theme as Template"),
-        QDir(folder).filePath(name + QStringLiteral(".vc3dtheme")),
-        QObject::tr("VC3D themes (*.vc3dtheme)"));
-    if (path.isEmpty()) {
+    // The dialog adds the suffix itself, so its overwrite question covers the
+    // file that is written.
+    QFileDialog dialog(_window, QObject::tr("Export Current Theme as Template"),
+                       QDir(folder).filePath(name + QStringLiteral(".vc3dtheme")),
+                       QObject::tr("VC3D themes (*.vc3dtheme)"));
+    dialog.setAcceptMode(QFileDialog::AcceptSave);
+    dialog.setDefaultSuffix(QStringLiteral("vc3dtheme"));
+    if (dialog.exec() != QDialog::Accepted || dialog.selectedFiles().isEmpty()) {
         return;
     }
+    QString path = dialog.selectedFiles().constFirst();
     if (!path.endsWith(QStringLiteral(".vc3dtheme"), Qt::CaseInsensitive)) {
+        // A name with another suffix, such as ocean.json.
         path += QStringLiteral(".vc3dtheme");
+        if (QFileInfo::exists(path) &&
+            QMessageBox::question(_window, QObject::tr("Export Theme"),
+                                  QObject::tr("%1 already exists. Replace it?")
+                                      .arg(QDir::toNativeSeparators(path))) != QMessageBox::Yes) {
+            return;
+        }
     }
     QString error;
     vc3d::theme::ThemeProblems warnings;
