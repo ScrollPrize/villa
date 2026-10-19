@@ -128,12 +128,11 @@ Prepared patch(const fs::path& source)
     detail::validatePatchFiles(source);
     QuadSurface surface(source);
     const auto grid = surface.rawPoints();
-    std::vector<float> values;
-    values.reserve(grid.total() * 3);
-    for (int row = 0; row < grid.rows; ++row)
-        for (int col = 0; col < grid.cols; ++col)
-            for (int axis = 0; axis < 3; ++axis) values.push_back(grid(row, col)[axis]);
-    p.geometry.arrays.push_back(array<float>("points", "<f4", {grid.rows, grid.cols, 3}, values));
+    // TIFF loading produces a contiguous XYZ grid. Retain a fallback for a
+    // strided view, but avoid building a second full-size scalar vector.
+    const cv::Mat contiguous = grid.isContinuous() ? grid : grid.clone();
+    p.geometry.arrays.push_back(array<float>("points", "<f4", {grid.rows, grid.cols, 3},
+        std::span<const float>(contiguous.ptr<float>(), contiguous.total() * 3)));
     PatchDetail d;
     d.gridWidth = grid.cols; d.gridHeight = grid.rows;
     const auto scale = surface.scale(); d.scale = {scale[0], scale[1]};
@@ -247,8 +246,11 @@ void publishBatch(ObjectStore& db, std::vector<Prepared> batch,
         normalizeMetadata(p);
         if (!existing) db.upsertObject(write, p.object);
         const auto revision = db.putGeometry(write, p.object.uuid, p.geometry, e.revision);
+        // Publication no longer needs these arrays; release them before the
+        // next object and the topology import allocate their workspaces.
+        p.geometry.arrays.clear();
         const bool seedMetadata = !existing || !Json::parse(existing->meta).contains("source");
-        if (seedMetadata) sources.push_back({p.object, p.source});
+        if (seedMetadata) sources.push_back({p.object, std::move(p.source)});
         if (e.revision && revision == *e.revision && !seedMetadata) { ++unchanged; continue; }
         auto record = *db.objectByUuid(write, p.object.uuid);
         auto metadata = Json::parse(record.meta);
@@ -281,7 +283,9 @@ void publishBatch(ObjectStore& db, std::vector<Prepared> batch,
 void publish(ObjectStore& db, Prepared p, const Expected& expected, GeometryIngestReport& report)
 {
     std::map<std::string, Expected> expectations{{p.object.uuid, expected}};
-    publishBatch(db, {std::move(p)}, expectations, report);
+    std::vector<Prepared> batch;
+    batch.push_back(std::move(p));
+    publishBatch(db, std::move(batch), expectations, report);
 }
 void problem(GeometryIngestReport& report, const std::string& label, const std::exception& error)
 {
