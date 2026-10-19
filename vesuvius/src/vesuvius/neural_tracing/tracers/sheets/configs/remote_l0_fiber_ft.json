@@ -1,0 +1,150 @@
+{
+ "data": {
+  "patches_dir": [
+   "/ephemeral/sean/sheet_tracing/data/verified_patches_old",
+   "/ephemeral/sean/sheet_tracing/data/verified_patches_working",
+   "/ephemeral/sean/sheet_tracing/data/cut_windings_square",
+   "/ephemeral/sean/sheet_tracing/data/unseen/PHerc0139/train_patches",
+   "/ephemeral/sean/sheet_tracing/data/unseen/PHerc1667/train_patches"
+  ],
+  "volume": "/ephemeral/sean/sheet_tracing/data/s1_ds2.zarr",
+  "volume_level": 0,
+  "front_points": 5,
+  "point_spacing": 60.0,
+  "step": 20.0,
+  "steps": 12,
+  "history": 1,
+  "gt_resolution": 5.0,
+  "gt_margin": 40.0,
+  "roi": 640,
+  "min_valid_fraction": 0.9,
+  "patch_weight_power": 0.5,
+  "split_block": 1024,
+  "val_fraction": 0.1,
+  "split_seed": 0,
+  "seed_noise_normal": 1.5,
+  "seed_noise_tangent": 3.0,
+  "worker_cache_mb": 256,
+  "max_tries": 200,
+  "anchor_tries": 8,
+  "patch_volumes": [
+   "",
+   "",
+   "",
+   "/ephemeral/sean/sheet_tracing/data/unseen/PHerc0139/volume.zarr",
+   "/ephemeral/sean/sheet_tracing/data/unseen/PHerc1667/volume.zarr"
+  ],
+  "dir_weights": [
+   0.22,
+   0.45,
+   0.08,
+   0.125,
+   0.125
+  ],
+  "front_points_range": [
+   3,
+   9
+  ],
+  "unpadded_blocks": true,
+  "fiber_runs": "/ephemeral/sean/sheet_tracing/data/afv/paris4_H_fiber_runs.jsonl",
+  "fiber_fraction": 0.25,
+  "follow_fraction": 0.2,
+  "fiber_pool": "/ephemeral/sean/sheet_tracing/data/afv/paris4_fiber_pool"
+ },
+ "model": {
+  "crop": [
+   24,
+   48,
+   32
+  ],
+  "crop_spacing": 1.0,
+  "crop_forward": 10.0,
+  "channels": [
+   32,
+   64,
+   128
+  ],
+  "strides": [
+   1,
+   2,
+   2
+  ],
+  "dim": 256,
+  "layers": 8,
+  "heads": 8,
+  "mlp_ratio": 8.0,
+  "memory_rows": 3,
+  "token_crop": [
+   16,
+   16,
+   16
+  ],
+  "token_spacing": 1.0,
+  "token_channels": [
+   32,
+   64,
+   96
+  ],
+  "token_strides": [
+   1,
+   2,
+   2
+  ],
+  "point_bottleneck": 32,
+  "fiber_follow_mode": true,
+  "fiber_tokens": 48
+ },
+ "trace": {
+  "spline_samples": 6,
+  "confidence_threshold": 0.5
+ },
+ "loss": {
+  "normal": 1.0,
+  "advance": 0.3,
+  "tangent": 0.1,
+  "spline": 0.5,
+  "confidence": 0.5,
+  "huber": 2.0,
+  "sheet_tolerance": 6.0,
+  "good_distance": 3.0,
+  "front_length": 0.2
+ },
+ "train": {
+  "name": "remote_l0_fiber_ft",
+  "iterations": 200000,
+  "batch": 32,
+  "workers": 32,
+  "lr": 0.0001,
+  "weight_decay": 0.0001,
+  "warmup": 200,
+  "grad_clip": 1.0,
+  "amp": "bf16",
+  "state_noise_normal": 0.75,
+  "state_noise_tangent": 1.5,
+  "reset_distance": 8.0,
+  "free_fraction": 0.5,
+  "jump_probability": 0.3,
+  "jump_min": 7.0,
+  "jump_max": 24.0,
+  "prefetch": 2,
+  "compile_geometry": true,
+  "val_episodes": 64,
+  "log_every": 50,
+  "val_every": 1000,
+  "viz_every": 1000,
+  "ckpt_every": 500,
+  "keep_every": 1000,
+  "max_minutes": 240,
+  "seed": 0,
+  "device": "cuda",
+  "ema": 0.999,
+  "compile_model": false,
+  "points_per_batch": 160
+ },
+ "eval": {
+  "episodes": 32,
+  "steps": 10,
+  "roi": 512,
+  "after_training": true
+ }
+}

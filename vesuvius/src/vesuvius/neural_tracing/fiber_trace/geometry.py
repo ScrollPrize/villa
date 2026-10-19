@@ -3,7 +3,10 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from lasagna.omezarr_pyramid import _decode_normals as _lasagna_decode_normals
+try:
+    from lasagna.omezarr_pyramid import _decode_normals as _lasagna_decode_normals
+except ImportError:  # pragma: no cover - supports PYTHONPATH=lasagna style runs.
+    from omezarr_pyramid import _decode_normals as _lasagna_decode_normals
 
 from vesuvius.neural_tracing.fiber_trace.labels import (
     IGNORE_INDEX,

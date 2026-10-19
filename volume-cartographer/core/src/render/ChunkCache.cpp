@@ -1488,12 +1488,14 @@ PersistentCacheLayout ChunkCache::resolvePersistentCacheLayout(
         return PersistentCacheLayout::ZarrMirror;
     }
 
-    if (hasLegacyCacheFootprint(root))
-        return PersistentCacheLayout::Legacy;
+    // Mirrors can also contain logical decoded payloads and empty markers.
+    // These must not override their native Zarr metadata on reacquisition.
     if (hasNativeZarrMetadata(root)) {
         validateMirrorFetchers();
         return PersistentCacheLayout::ZarrMirror;
     }
+    if (hasLegacyCacheFootprint(root))
+        return PersistentCacheLayout::Legacy;
     // Generic chunk fetchers do not define a native Zarr object namespace;
     // their persistent paths remain the legacy logical layout even when a
     // test or caller pre-populated files before constructing the cache.
