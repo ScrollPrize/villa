@@ -112,10 +112,12 @@ NB_MODULE(objects, m)
     nb::class_<PyObjectStore>(m, "ObjectStore")
         .def_static("create", &PyObjectStore::create, nb::arg("path"), nb::arg("author"),
                     nb::arg("hostname") = std::nullopt, nb::arg("reader_pool_size") = 4,
+                    nb::arg("geometry_cache_bytes") = 16 * 1024 * 1024,
                     "Create a new object database at path (refuses existing files).")
         .def_static("open", &PyObjectStore::open, nb::arg("path"), nb::arg("author") = std::nullopt,
                     nb::arg("read_only") = false, nb::arg("hostname") = std::nullopt,
                     nb::arg("reader_pool_size") = 4,
+                    nb::arg("geometry_cache_bytes") = 16 * 1024 * 1024,
                     "Open an existing object database. author is required unless read_only.")
         .def("close", &PyObjectStore::close)
         .def("__enter__", [](nb::object self) { return self; })
@@ -315,6 +317,17 @@ NB_MODULE(objects, m)
             return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
         }, nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("row"), nb::arg("column"),
            nb::arg("rows"), nb::arg("columns"), "Read a dense row-major patch rectangle, preserving exact float32 XYZ bytes.")
+        .def("read_geometry_rectangles", [](PyObjectStore& self, const std::string& uuid, const std::string& name,
+                                            const std::vector<std::array<int64_t, 4>>& rectangles) {
+            std::vector<std::vector<uint8_t>> values;
+            { auto lease = self.db; self.require(); nb::gil_scoped_release release;
+              values = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
+                  return db.readGeometryRectangles(txn, uuid, name, rectangles); }); }
+            nb::list out;
+            for (const auto& bytes : values) out.append(nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+            return out;
+        }, nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("rectangles"),
+           "Read [row,column,rows,columns] rectangles in order, sharing verified chunks.")
         .def("read_geometry_ranges", [](PyObjectStore& self, const std::string& uuid, const std::string& name,
                                         const std::vector<std::array<int64_t, 2>>& ranges) {
             std::vector<std::vector<uint8_t>> values;

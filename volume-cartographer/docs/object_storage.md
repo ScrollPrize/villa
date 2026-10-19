@@ -229,7 +229,7 @@ For many point reads from the same array, use
 C++ exposes `readGeometryRanges` with an existing transaction. These calls share
 one verified manifest and a bounded 8 MiB LRU chunk cache. Geometry edit and repair
 operations also reuse readers and stable-point-ID indexes across relationship
-checks. Caches end with the operation; subsequent calls reverify stored bytes.
+checks. Write/internal readers remain scoped to their operation.
 
 For patch rectangles, use
 `read_geometry_rectangle(revision_uuid, array_name, row, column, rows, columns)`
@@ -238,6 +238,31 @@ XYZ bytes, with exact preservation of stored bit patterns. Coordinates and
 counts are in vertices; the array must be a patch float32 XYZ array. Empty
 rectangles are allowed, and out-of-bounds rectangles fail. Both old linear and
 new tiled storage layouts are supported.
+
+For several rectangles from one revision/array, use
+`read_geometry_rectangles(revision_uuid, array_name, rectangles)` (C++
+`readGeometryRectangles`), with each rectangle `(row, column, rows, columns)`.
+Results preserve caller order, including duplicates and empty rectangles. A batch
+shares the manifest and verified chunks even when retention between calls is disabled.
+
+Rectangle and batched byte-range reads retain verified readers on pooled read
+connections. Each connection has a **16 MiB retention budget** by default, charging
+payload bytes and conservative metadata overhead, with at most 64 revisions and
+8 MiB of chunks per revision. Thus the default four-reader pool can retain up to
+64 MiB of charged cache data; active reads, returned buffers, allocator overhead
+and SQLite's own page cache are separate. `geometry_cache_bytes` on Python
+`ObjectStore.create/open`, or C++ `OpenOptions::geometryCacheBytes`, changes the
+per-connection budget; zero disables retention. Oversized readers are not retained.
+
+A read connection pins its SQLite snapshot before checking `PRAGMA data_version`.
+A change discards that connection's retained readers, including after commits by
+another process or this store's writer. Concurrent snapshots have separate caches;
+a snapshot cannot obtain a revision cached by a newer snapshot. Any commit currently
+invalidates retention, including metadata-only changes. Write transactions never use
+this cache, so rolled-back publications cannot become cached readable revisions.
+Newly loaded manifests/chunks are hash-verified; cache hits reuse verified RAM bytes.
+`read_geometry_array`, exports, sync and internal publication/integrity paths still
+use fresh readers. No schema change or geometry migration is needed.
 
 New patch `points` revisions use non-overlapping **128×128-vertex storage tiles**
 by default, independently of the 32×32-cell R-tree tiles. A full physical tile
@@ -262,8 +287,8 @@ logical geometry format version (still 1). Tiled arrays use
 means legacy linear chunks. Physical chunks are ordered by tile row then tile
 column. Readers and sync reject unknown layouts, inconsistent sizes, missing
 chunks, and hash mismatches. Sync preserves incoming layouts and chunk hashes.
-The cache remains scoped to an operation/transaction; later calls reverify stored
-bytes, including after a prior successful read.
+After a committed database change, later rectangle/range reads invalidate their
+retained cache and reverify stored bytes, including after a prior successful read.
 
 To publish arrays directly, supply a dictionary with `kind`, optional
 `attributes`, and an `arrays` list. Each array has `name`, `dtype`, `shape`, and
@@ -799,4 +824,139 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_BUILD_PYTHON=build/python .venv/bin/python -
 build/bin/test_object_store
 build/bin/test_object_records
 build/bin/test_object_links
+```
+
+### Comparison with VC3D's existing surface index
+
+The tiled-storage speedups above compare two database layouts. They do **not**
+establish parity with VC3D's resident or memory-mapped surface queries.
+The native C++ harness below calls the actual `SurfacePatchIndex` implementation
+and the public `ObjectStore` API, without Python binding overhead:
+
+```sh
+ninja -C build benchmark_object_store_surface test_surface_patch_index test_object_store
+build/bin/benchmark_object_store_surface /tmp/vcobj-vc3d-surface.json 0
+ctest --test-dir build -R '^(test_surface_patch_index|test_object_store)$' --output-on-failure
+```
+
+Inputs are single planar float32 surfaces of shape 1025×1025, 2049×2049 and
+65×65537, with XYZ `(column, row, 1 + column/16)` and scale `(1,1)`.
+The DB uses default 128×128 physical storage tiles; VC3D uses sampling stride 1
+and its native 8-cell index tiles. Four repeated ROIs exercise a small hit,
+a tile-boundary crossing, a 255×15-unit viewport, and a miss. This is a warm-cache
+microbenchmark, not a cold-start, many-surface, curved-mesh or interactive-frame
+measurement. Each operation receives 10 warmups and nine batches of 20 calls;
+operation order rotates between batches. JSON records every batch average plus
+mean/min/median/max. Startup timings are single observations, not distributions;
+DB publication also persists geometry and is not equivalent to index construction.
+
+For an equal-output candidate/geometry comparison, a benchmark-only adapter
+normalizes VC3D candidates to the DB's 32-cell regions and copies the corresponding
+33×33 resident vertices. It recovers grid anchors from this fixture's planar
+bounds; it is **not** a general mesh adapter. The query is padded by four units,
+as in VC3D's plane-intersection path, to compensate for VC3D's quantized boxes;
+the adapter rechecks the exact planar region bounds. The DB directly returns
+region descriptors and loads each rectangle with a fresh verified reader, inside
+one new read transaction per query. Region sets are checked against an independent
+grid oracle and returned geometry is checked byte for byte outside timing.
+
+On ARM64 Linux, RelWithDebInfo (`-O2 -g -DNDEBUG`), the first comparison measured
+the following microseconds per call, median [min–max] of batch averages:
+
+| Surface / request | VC3D index + resident region copies | DB index + rectangle reads |
+|---|---:|---:|
+| 1025×1025 / one region | 0.478 [0.470–0.486] | 145.114 [144.488–145.698] |
+| 2049×2049 / one region | 0.505 [0.486–0.521] | 226.702 [225.053–228.346] |
+| 65×65537 / one region | 0.488 [0.470–0.517] | 264.978 [263.337–266.591] |
+| 65×65537 / nine regions | 5.702 [5.526–5.902] | 2419.197 [2410.641–2423.034] |
+
+One region returns 13,068 bytes; nine return 117,612 bytes. On the wide fixture,
+index-only medians are 0.149 µs for the normalized VC3D adapter and 8.733 µs for
+DB descriptors. The one-region total means are 0.491 and 264.886 µs respectively;
+nine-region means are 5.715 and 2418.677 µs. This makes geometry retrieval the
+dominant measured DB stage. Code inspection shows each rectangle reconstructs
+its reader/manifest and verifies touched chunks again, including when another
+rectangle in the same query already read that chunk. These timings do not
+separate parsing, SQLite lookup and hashing CPU costs: native perf sampling was
+unavailable (`perf_event_paranoid=4`).
+
+The harness also times the existing `forEachTriangle` API without the adapter.
+For the wide small-hit query it returns eight triangle candidates in 6.838 µs
+resident / 7.082 µs mapped; for the viewport it returns 8,192 in 328.204 / 346.253 µs.
+These are context for the eventual consumer workload, **not equal-work ratios**
+against DB rectangle reads: the DB still needs consumer-side triangulation and
+fine filtering. Mapped surfaces are asserted to remain lazy after the queries.
+
+The correctness checks also expose an existing generic-query limitation:
+the unpadded `TriangleQuery` over x=[127.5,128.5], y=[31.5,32.5] returns four of
+the eight expected triangle candidates, with both resident and mapped geometry.
+VC3D rounds index bounds to a ~1.54-unit grid; the tile starting at y=32 has its
+lower bound shifted to approximately 32.578. The harness records missing
+triangles explicitly; those timings must not be treated as equal-result
+comparisons. `computePlaneIntersections` already compensates with query and
+box-test padding, so this finding is not evidence that its overlays miss those
+triangles. The DB and padded comparison adapter both return all four regions.
+
+This comparison motivated the batched rectangle reader and bounded connection
+cache described below. The optional final argument `0` disables retention to
+reproduce the baseline behavior. Merely changing chunk layout does not replace
+VC3D's inexpensive cached geometry access.
+
+### Retained geometry cache and batched rectangles
+
+Reproduce with the same binary, first without retention and then with the
+default 16 MiB per read connection. Run these sequentially, without builds or
+tests competing for CPU:
+
+```sh
+ninja -C build benchmark_object_store_surface vc_object_bindings test_object_store test_object_records test_object_links
+build/bin/benchmark_object_store_surface /tmp/vcobj-resident-disabled.json 0
+build/bin/benchmark_object_store_surface /tmp/vcobj-resident-cached.json
+```
+
+ARM64 Linux, RelWithDebInfo, the same planar inputs, ten warmups and nine batches
+of twenty calls. All candidate sets and geometry bytes pass the same correctness
+checks as the baseline. Times are microseconds per call, median [min–max] of
+batch averages; every combined query includes a fresh read transaction:
+
+| Surface / request | Retention disabled, separate rectangles | Retained cache, separate rectangles | Retained cache, batch |
+|---|---:|---:|---:|
+| 1025×1025 / one region | 145.270 [144.868–147.935] | 8.459 [8.422–8.595] | 8.476 [8.454–8.658] |
+| 2049×2049 / one region | 232.300 [231.841–232.566] | 9.075 [9.038–9.282] | 9.121 [9.098–9.288] |
+| 65×65537 / one region | 275.856 [273.721–276.277] | 8.934 [8.899–9.041] | 8.975 [8.934–9.104] |
+| 65×65537 / nine regions | 2524.078 [2521.903–2528.792] | 24.491 [24.314–25.336] | 23.832 [23.767–24.156] |
+
+The existing rectangle API therefore improves about **31×** for the wide small
+query and **103×** for the nine-region query, without caller changes. Their
+disabled/enabled means are 275.698/8.938 µs and 2524.724/24.572 µs. The batched
+nine-region mean is 23.870 µs. Even with retention disabled, batching reduces
+the nine-region median to 395.807 µs [395.295–396.573], mean 395.758 µs, because
+the rectangles share manifest parsing and chunk verification within the call.
+This disabled-retention run still has warm OS/SQLite pages; it is not cold disk I/O.
+
+For comparison, VC3D's normalized index plus resident copies measures 0.480 µs
+for one wide region and 5.482 µs for nine. The complete DB query is still about
+19×/4.3× slower (using the batched nine-region path). The measured DB index stage
+alone is 8.350/19.178 µs, so SQL candidate lookup and descriptor construction now
+dominate the warm path. Reading already-known rectangles within an existing
+snapshot takes 0.478 µs [0.473–0.486] for one and 4.178 µs [4.152–4.330] for nine.
+Those last numbers exclude spatial lookup and transaction setup; they are not
+complete-query comparisons. Cache-off/on and stage timings isolate the effect of
+retention, not individual native CPU hotspots; perf sampling remains unavailable.
+
+These results apply to a resident working set and repeated queries. Cache misses,
+eviction, commits that invalidate retention, and new reader connections still pay
+verification costs. This does not establish full VC3D frame-rate or spiral-fitting
+throughput parity. The remaining warm-path target is candidate lookup, potentially
+through a reusable resident spatial index or query batching at the consumer level.
+
+Validation covers exact tiled/linear bytes and float bit patterns, ordered batches,
+invalid/empty rectangles, cache-disabled and undersized budgets, concurrent readers,
+old snapshots, rolled-back publications, finished/foreign transactions, and external
+SQL corruption of previously cached manifests/chunks. All 146 Python tests and the
+four CTest suites below pass:
+
+```sh
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_BUILD_PYTHON=build/python .venv/bin/python -m pytest -q python/tests/test_object*.py python/tests/test_objects.py
+ctest --test-dir build -R '^(test_object_store|test_object_records|test_object_links|test_surface_patch_index)$' --output-on-failure
 ```

@@ -330,12 +330,14 @@ struct PyObjectStore {
     }
 
     static PyObjectStore create(const std::string& path, const std::string& author,
-                                             const std::optional<std::string>& hostname, int readerPoolSize)
+                                             const std::optional<std::string>& hostname, int readerPoolSize,
+                                             size_t geometryCacheBytes)
     {
         vo::OpenOptions o;
         o.author = author;
         o.hostnameOverride = hostname;
         o.readerPoolSize = readerPoolSize;
+        o.geometryCacheBytes = geometryCacheBytes;
         PyObjectStore self;
         self.db = std::make_shared<vo::ObjectStore>(vo::ObjectStore::create(path, o));
         return self;
@@ -343,13 +345,14 @@ struct PyObjectStore {
 
     static PyObjectStore open(const std::string& path, const std::optional<std::string>& author,
                                            bool readOnly, const std::optional<std::string>& hostname,
-                                           int readerPoolSize)
+                                           int readerPoolSize, size_t geometryCacheBytes)
     {
         vo::OpenOptions o;
         o.readOnly = readOnly;
         o.author = author.value_or("");
         o.hostnameOverride = hostname;
         o.readerPoolSize = readerPoolSize;
+        o.geometryCacheBytes = geometryCacheBytes;
         PyObjectStore self;
         self.db = std::make_shared<vo::ObjectStore>(vo::ObjectStore::open(path, o));
         return self;

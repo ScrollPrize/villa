@@ -30,13 +30,19 @@
 #include "vc/core/util/Uuid.hpp"
 
 namespace vc::objects {
+namespace detail { class GeometryReadCache; }
 // Connections are leased to one thread per transaction. Cache idle statements
 // on the connection; the thread-local registry only identifies the active lease.
 struct StatementPool {
+    std::shared_ptr<detail::GeometryReadCache> geometryCache;
     std::unordered_multimap<std::string, sqlite3_stmt*> idle;
     ~StatementPool() { for (auto& [sql, stmt] : idle) sqlite3_finalize(stmt); }
 };
 inline thread_local std::unordered_map<sqlite3*, StatementPool*> activeStatementPools;
+namespace detail {
+// Called only after a read connection has pinned its new SQLite snapshot.
+void beginGeometryRead(sqlite3*, StatementPool&, size_t budget);
+}
 struct ObjectStore::Impl {
     std::filesystem::path path;
     OpenOptions options;

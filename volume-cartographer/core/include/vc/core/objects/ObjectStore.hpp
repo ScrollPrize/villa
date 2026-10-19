@@ -5,6 +5,7 @@
 #include "vc/core/objects/Geometry.hpp"
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -110,6 +111,9 @@ struct OpenOptions {
     int busyTimeoutMs = 5000;
     std::string author;  // required for read-write opens
     std::optional<std::string> hostnameOverride;  // tests / reproducible imports only
+    // Retained verified geometry per pooled read connection; zero disables it.
+    // Payload bytes plus conservatively charged metadata, excluding active reads.
+    std::size_t geometryCacheBytes = 16 * 1024 * 1024;
 };
 
 struct ObjectSelection {
@@ -286,8 +290,14 @@ public:
 
     // Dense row-major float32 XYZ rectangle from a patch points array. Exact
     // bytes; handles tiled and legacy layouts. Coordinates/counts are vertices.
+    // Rectangle/range reads may reuse verified bytes on a pooled reader until
+    // its next snapshot observes a commit. Writes always use fresh readers.
     std::vector<uint8_t> readGeometryRectangle(const Txn&, const std::string& revisionUuid,
         const std::string& arrayName, int64_t row, int64_t column, int64_t rows, int64_t columns) const;
+
+    // [row,column,rows,columns], in caller order, sharing manifest/chunk reads.
+    std::vector<std::vector<uint8_t>> readGeometryRectangles(const Txn&, const std::string& revisionUuid,
+        const std::string& arrayName, const std::vector<std::array<int64_t, 4>>& rectangles) const;
 
     // Approval: one generic call for objects and edges. Stamps the
     // current generation without bumping it. State must be

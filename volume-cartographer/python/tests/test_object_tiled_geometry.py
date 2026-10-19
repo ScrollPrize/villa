@@ -52,13 +52,48 @@ def test_tiled_full_ranges_rectangles_and_special_float_bits(db, tile):
         rectangles.append((y, x, rng.randrange(130-y), rng.randrange(142-x)))
     for y, x, h, w in rectangles:
         assert db.read_geometry_rectangle(rev, 'points', y, x, h, w) == crop(payload, 141, y, x, h, w)
+    assert db.read_geometry_rectangles(rev, 'points', rectangles) == [crop(payload, 141, *r) for r in rectangles]
+    assert db.read_geometry_rectangles(rev, 'points', []) == []
     for args in [(-1, 0, 1, 1), (0, 0, -1, 1), (128, 0, 2, 1), (0, 141, 1, 1), (130, 0, 0, 0)]:
         with pytest.raises(IndexError, match='invalid rectangle'):
             db.read_geometry_rectangle(rev, 'points', *args)
+        with pytest.raises(IndexError, match='invalid rectangle'):
+            db.read_geometry_rectangles(rev, 'points', [(0, 0, 1, 1), args])
     with pytest.raises(ValueError, match='array not found'):
         db.read_geometry_rectangle(rev, 'missing', 0, 0, 1, 1)
     with ObjectStore.open(db.path, read_only=True) as ro:
         assert ro.read_geometry_rectangle(rev, 'points', 31, 63, 33, 33) == crop(payload, 141, 31, 63, 33, 33)
+
+
+@pytest.mark.parametrize('budget', [0, 1, 64*1024, 16*1024*1024])
+def test_rectangle_cache_budgets_and_concurrent_readers(tmp_path, budget):
+    from concurrent.futures import ThreadPoolExecutor
+
+    path = str(tmp_path / 'cache.vcobj')
+    with ObjectStore.create(path, author='test', geometry_cache_bytes=budget) as db:
+        revisions = []
+        for n in range(6):
+            data = patch(65, 129)
+            raw = bytearray(data['arrays'][0]['data'])
+            raw[:12] = struct.pack('<3f', n, 0, 1)
+            data['arrays'][0]['data'] = bytes(raw)
+            uid = db.upsert_object(dict(kind='patch'))
+            revisions.append((db.put_geometry(uid, data), bytes(raw)))
+        rectangles = [(0, 0, 33, 33), (32, 96, 33, 33), (0, 0, 1, 1)]
+
+        def read(i):
+            rev, raw = revisions[i % len(revisions)]
+            assert db.read_geometry_rectangles(rev, 'points', rectangles) == [crop(raw, 129, *r) for r in rectangles]
+        # Repeated reads across revisions, budget pressure and concurrent leases.
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            list(workers.map(read, range(120)))
+        # Another connection publishes; already cached old revisions remain exact.
+        with ObjectStore.open(path, author='other', geometry_cache_bytes=budget) as other:
+            uid = other.upsert_object(dict(kind='patch'))
+            rev = other.put_geometry(uid, patch(2, 2))
+        assert db.read_geometry_rectangle(rev, 'points', 0, 0, 2, 2) == patch(2, 2)['arrays'][0]['data']
+        for i in range(len(revisions)):
+            read(i)
 
 
 @pytest.mark.parametrize('shape', [(0, 0), (0, 100), (100, 0), (1, 1), (1, 129), (129, 1), (64, 64)])
@@ -165,6 +200,7 @@ def test_unknown_layout_rejected_and_invalid_writer_options_leave_no_state(db):
             db.put_geometry(uid, patch(2, 2), patch_tile_size=size)
         assert db.current_geometry(uid) is None
     rev = db.put_geometry(uid, patch(2, 2))
+    db.read_geometry_rectangle(rev, 'points', 0, 0, 2, 2)
     m = manifest(db, rev)
     m['arrays']['points']['storage']['version'] = 999
     text = json.dumps(m, sort_keys=True, separators=(',', ':'))
@@ -172,3 +208,5 @@ def test_unknown_layout_rejected_and_invalid_writer_options_leave_no_state(db):
     sqlite_rows(db.path, 'UPDATE geometry_revisions SET manifest=?,content_hash=?', (text, hashlib.sha256(text.encode()).hexdigest()))
     with pytest.raises(RuntimeError, match='unsupported storage layout'):
         db.read_geometry_array(rev, 'points')
+    with pytest.raises(RuntimeError, match='unsupported storage layout'):
+        db.read_geometry_rectangle(rev, 'points', 0, 0, 2, 2)

@@ -55,6 +55,7 @@ ReadTxn ObjectStore::read()
         // see one consistent state even before the first real query.
         Statement pin(conn, "SELECT uuid FROM store_identity LIMIT 1");
         (void)pin.row();
+        detail::beginGeometryRead(conn, *impl_->statementPools.at(conn), impl_->options.geometryCacheBytes);
     } catch (...) {
         sqlite3_exec(conn, "ROLLBACK;", nullptr, nullptr, nullptr);
         activeStatementPools.erase(conn);

@@ -4,6 +4,76 @@
 
 namespace vc::objects {
 namespace detail {
+// One instance per leased reader connection: no shared mutable geometry or
+// cross-snapshot lookups between concurrent readers. The SQLite data_version is
+// connection-local and changes on commits by any *other* connection, including
+// this store's writer. Writer connections never receive this cache.
+class GeometryReadCache {
+public:
+    explicit GeometryReadCache(size_t budget) : budget_(budget) {}
+    void begin(int version) {
+        if (version != version_) {
+            readers_.clear(); recency_.clear(); charge_ = 0; version_ = version;
+        }
+    }
+    std::shared_ptr<GeometryReader> take(const std::string& revision) {
+        const auto found = readers_.find(revision);
+        if (found == readers_.end()) return {};
+        auto reader = std::move(found->second.reader);
+        charge_ -= found->second.charge;
+        recency_.erase(found->second.recency);
+        readers_.erase(found);
+        return reader;
+    }
+    void retain(const std::string& revision, std::shared_ptr<GeometryReader> reader) {
+        const auto charge = reader->retainedCharge();
+        if (charge > budget_) return;
+        // Also bound revision/node overhead, including empty geometries.
+        while (charge_ > budget_ - charge || readers_.size() >= 64) {
+            const auto old = readers_.find(recency_.front());
+            charge_ -= old->second.charge;
+            readers_.erase(old); recency_.pop_front();
+        }
+        recency_.push_back(revision);
+        try {
+            readers_.emplace(revision, Entry{std::move(reader), charge, std::prev(recency_.end())});
+        } catch (...) { recency_.pop_back(); throw; }
+        charge_ += charge;
+    }
+private:
+    struct Entry {
+        std::shared_ptr<GeometryReader> reader;
+        size_t charge;
+        std::list<std::string>::iterator recency;
+    };
+    size_t budget_, charge_ = 0;
+    int version_ = -1;
+    std::map<std::string, Entry> readers_;
+    std::list<std::string> recency_;
+};
+
+void beginGeometryRead(sqlite3* db, StatementPool& pool, size_t budget)
+{
+    if (!budget) { pool.geometryCache.reset(); return; }
+    if (!pool.geometryCache) pool.geometryCache = std::make_shared<GeometryReadCache>(budget);
+    pool.geometryCache->begin(pragmaInt(db, "data_version"));
+}
+
+template<class F> auto withGeometryReader(const Txn& txn, const std::string& revision, F&& read)
+{
+    auto* db = ObjectStoreImplAccess::conn(txn);
+    std::shared_ptr<GeometryReadCache> cache;
+    if (const auto lease = activeStatementPools.find(db); lease != activeStatementPools.end())
+        cache = lease->second->geometryCache;
+    auto reader = cache ? cache->take(revision) : nullptr;
+    if (!reader) reader = std::make_shared<GeometryReader>(db, revision);
+    // A failed read discards its reader; partially verified data never poisons
+    // a future attempt. Successful readers remain connection/snapshot scoped.
+    auto result = read(*reader);
+    if (cache) cache->retain(revision, std::move(reader));
+    return result;
+}
+
 GeometryReader::GeometryReader(const Txn& txn, const std::string& revision, bool cacheChunks)
     : GeometryReader(ObjectStoreImplAccess::conn(txn), revision, cacheChunks) {}
 
@@ -14,6 +84,9 @@ GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool ca
     row.bindBlob(1, revision_);
     if (!row.row()) throw std::invalid_argument("geometry: revision not found");
     const auto text = row.text(1);
+    // Charge JSON nodes/strings, layouts and cache bookkeeping conservatively,
+    // in addition to the separately accounted retained payload bytes.
+    metadataCharge_ = text.size() * 32 + 4096;
     if (geometryHash(std::span(reinterpret_cast<const uint8_t*>(text.data()), text.size())) != row.text(0))
         throw std::runtime_error("geometry: corrupt revision manifest");
     manifest_ = nlohmann::json::parse(text);
@@ -355,18 +428,33 @@ std::vector<std::vector<uint8_t>> ObjectStore::readGeometryRanges(const Txn& txn
     const std::string& arrayName, const std::vector<std::array<int64_t, 2>>& ranges) const
 {
     (void)connection(txn);
-    detail::GeometryReader reader(txn, revisionUuid);
-    std::vector<std::vector<uint8_t>> result;
-    result.reserve(ranges.size());
-    for (const auto& range : ranges) result.push_back(reader.read(arrayName, range[0], range[1]));
-    return result;
+    return detail::withGeometryReader(txn, revisionUuid, [&](auto& reader) {
+        std::vector<std::vector<uint8_t>> result;
+        result.reserve(ranges.size());
+        for (const auto& range : ranges) result.push_back(reader.read(arrayName, range[0], range[1]));
+        return result;
+    });
 }
 
 std::vector<uint8_t> ObjectStore::readGeometryRectangle(const Txn& txn, const std::string& revisionUuid,
     const std::string& arrayName, int64_t row, int64_t column, int64_t rows, int64_t columns) const
 {
     (void)connection(txn);
-    return detail::GeometryReader(txn, revisionUuid).rectangle(arrayName, row, column, rows, columns);
+    return detail::withGeometryReader(txn, revisionUuid, [&](auto& reader) {
+        return reader.rectangle(arrayName, row, column, rows, columns);
+    });
+}
+
+std::vector<std::vector<uint8_t>> ObjectStore::readGeometryRectangles(const Txn& txn, const std::string& revisionUuid,
+    const std::string& arrayName, const std::vector<std::array<int64_t, 4>>& rectangles) const
+{
+    (void)connection(txn);
+    return detail::withGeometryReader(txn, revisionUuid, [&](auto& reader) {
+        std::vector<std::vector<uint8_t>> result;
+        result.reserve(rectangles.size());
+        for (const auto& r : rectangles) result.push_back(reader.rectangle(arrayName, r[0], r[1], r[2], r[3]));
+        return result;
+    });
 }
 
 } // namespace vc::objects
