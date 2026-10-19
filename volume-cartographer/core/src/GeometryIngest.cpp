@@ -1,11 +1,11 @@
-#include "vc/core/graph/GeometryIngest.hpp"
+#include "vc/core/objects/GeometryIngest.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/PackedTrackStore.hpp"
 #include "vc/core/util/Uuid.hpp"
-#include "GraphFiberInput.hpp"
-#include "GraphPatchInput.hpp"
-#include "GraphTrackInput.hpp"
+#include "ObjectFiberInput.hpp"
+#include "ObjectPatchInput.hpp"
+#include "ObjectTrackInput.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <bit>
@@ -18,7 +18,7 @@
 #include <set>
 #include <span>
 
-namespace vc::graph {
+namespace vc::objects {
 namespace {
 using Json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -201,19 +201,19 @@ Prepared track(const PackedTrackStore& store, size_t row, ObjectRecord object)
     return p;
 }
 struct Expected { std::optional<std::string> revision; std::optional<int64_t> generation; };
-Expected expectedAt(GraphDb& db, const Txn& read, const std::string& id)
+Expected expectedAt(ObjectStore& db, const Txn& read, const std::string& id)
 {
     Expected e;
     if (const auto object = db.objectByUuid(read, id)) e.generation = object->generation;
     if (const auto geometry = db.currentGeometry(read, id)) e.revision = geometry->uuid;
     return e;
 }
-Expected expected(GraphDb& db, const std::string& id)
+Expected expected(ObjectStore& db, const std::string& id)
 {
     auto read = db.read();
     return expectedAt(db, read, id);
 }
-void publish(GraphDb& db, Prepared p, const Expected& e, GeometryIngestReport& report)
+void publish(ObjectStore& db, Prepared p, const Expected& e, GeometryIngestReport& report)
 {
     auto write = db.write();
     const auto existing = db.objectByUuid(write, p.object.uuid);
@@ -238,7 +238,7 @@ void problem(GeometryIngestReport& report, const std::string& label, const std::
 }
 }
 
-GeometryIngestReport ingestRegisteredGeometry(GraphDb& db, const std::optional<fs::path>& datasetRoot,
+GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::optional<fs::path>& datasetRoot,
     const std::vector<std::string>& objectUuids, const util::ProgressCallback& progress)
 {
     GeometryIngestReport report;
@@ -299,7 +299,7 @@ GeometryIngestReport ingestRegisteredGeometry(GraphDb& db, const std::optional<f
     return report;
 }
 
-GeometryIngestReport ingestGeometrySource(GraphDb& db, const std::string& kind, const fs::path& source,
+GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& kind, const fs::path& source,
     const util::ProgressCallback& progress)
 {
     GeometryIngestReport report;
@@ -361,4 +361,4 @@ GeometryIngestReport ingestGeometrySource(GraphDb& db, const std::string& kind, 
     } catch (const std::exception& error) { problem(report, source.string(), error); }
     return report;
 }
-} // namespace vc::graph
+} // namespace vc::objects

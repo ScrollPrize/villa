@@ -14,18 +14,23 @@ endif()
 target_compile_features(vc_fiber_collection PUBLIC cxx_std_20)
 set_target_properties(vc_fiber_collection PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# Unified geometry/metadata graph (SQLite). Standalone like vc_fiber_collection:
-# no Qt / tracing stack, usable from the GUI, CLI tools and tests.
-add_library(vc_graph STATIC src/GraphDb.cpp)
-target_include_directories(vc_graph PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-if(TARGET SQLite3::SQLite3)
-    target_link_libraries(vc_graph PUBLIC SQLite3::SQLite3)
-else()
-    target_link_libraries(vc_graph PUBLIC SQLite::SQLite3)
-endif()
-target_link_libraries(vc_graph PRIVATE nlohmann_json::nlohmann_json OpenSSL::Crypto)
-target_compile_features(vc_graph PUBLIC cxx_std_20)
-set_target_properties(vc_graph PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# Independent SQLite record machinery and versioned object store.
+add_library(vc_storage STATIC src/RecordDb.cpp)
+add_library(vc_objects STATIC src/ObjectStore.cpp)
+add_library(vc_graph STATIC src/GraphDb.cpp src/GraphObjectReferences.cpp)
+foreach(target vc_storage vc_objects vc_graph)
+    target_include_directories(${target} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    if(TARGET SQLite3::SQLite3)
+        target_link_libraries(${target} PUBLIC SQLite3::SQLite3)
+    else()
+        target_link_libraries(${target} PUBLIC SQLite::SQLite3)
+    endif()
+    target_link_libraries(${target} PRIVATE nlohmann_json::nlohmann_json)
+    target_compile_features(${target} PUBLIC cxx_std_20)
+    set_target_properties(${target} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endforeach()
+target_link_libraries(vc_objects PUBLIC vc_storage PRIVATE OpenSSL::Crypto)
+target_link_libraries(vc_graph PUBLIC vc_objects)
 
 # Shared with Spiral's native Python adapter; independent of geometry/Qt/Python.
 add_library(vc_track_crossings STATIC src/TrackCrossings.cpp)
@@ -35,16 +40,16 @@ target_compile_features(vc_track_crossings PUBLIC cxx_std_20)
 set_target_properties(vc_track_crossings PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Source-format ingestion/export is separate from the standalone SQLite store.
-add_library(vc_graph_geometry STATIC src/GeometryIngest.cpp src/GeometryExport.cpp)
-target_include_directories(vc_graph_geometry PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(vc_graph_geometry PUBLIC vc_graph PRIVATE vc_core nlohmann_json::nlohmann_json)
-target_compile_features(vc_graph_geometry PUBLIC cxx_std_20)
-set_target_properties(vc_graph_geometry PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_library(vc_object_geometry STATIC src/GeometryIngest.cpp src/GeometryExport.cpp)
+target_include_directories(vc_object_geometry PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(vc_object_geometry PUBLIC vc_objects PRIVATE vc_core nlohmann_json::nlohmann_json)
+target_compile_features(vc_object_geometry PUBLIC cxx_std_20)
+set_target_properties(vc_object_geometry PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Edge detection layer above vc_graph: geometry passes that propose
 # edges (pending approval, provenance in edge meta). Depends on vc_core
-# for geometry (QuadSurface, SurfacePatchIndex, ...); vc_graph itself
-# stores typed geometry bytes without depending on source-format readers.
+# for geometry (QuadSurface, SurfacePatchIndex, ...); graph topology and
+# object payload storage remain independent of source-format readers.
 add_library(vc_graph_links STATIC src/GraphLinks.cpp src/GraphLinksPatchOverlap.cpp src/GraphLinksFiberPatch.cpp src/GraphLinksTrackTrack.cpp
     src/GraphLinksTrackInput.cpp src/GraphLinksLinePatch.cpp src/GraphLinksTrackPatch.cpp
     src/GraphLinksPointCollectionPatch.cpp)

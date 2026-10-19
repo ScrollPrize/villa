@@ -3,7 +3,7 @@
 #include <stdexcept>
 #include <string_view>
 
-namespace vc::graph::detail {
+namespace vc::objects::detail {
 // QuadSurface's display loader tolerates damaged tiles and can recover saves.
 // Authoritative ingestion/detection must not interpret substituted pixels as
 // evidence of new geometry or missing relationships.
@@ -17,4 +17,4 @@ inline void validatePatchFiles(const std::filesystem::path& source)
         if (!isReadableTiff(file)) throw std::runtime_error("incomplete or unreadable TIFF: " + file.string());
     }
 }
-} // namespace vc::graph::detail
+} // namespace vc::objects::detail

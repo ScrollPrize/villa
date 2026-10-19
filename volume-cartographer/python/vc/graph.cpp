@@ -1,266 +1,12 @@
-// Python bindings for the unified metadata graph database (vc_graph).
-// Records cross the boundary as plain dicts using the same shape as the
-// vc_graph_export JSON format: kind is a field in the dict, never part
-// of a method name, and arbitrary extra metadata rides in "meta".
-
-#include <algorithm>
-#include <optional>
-#include <string>
-#include <vector>
-
-#include <nanobind/nanobind.h>
-#include <nanobind/stl/optional.h>
-#include <nanobind/stl/array.h>
-#include <nanobind/stl/filesystem.h>
-#include <nanobind/stl/shared_ptr.h>
-#include <nanobind/stl/string.h>
-#include <nanobind/stl/vector.h>
-
+#include "StorageBindings.hpp"
 #include "vc/core/graph/GraphDb.hpp"
-#include "vc/core/graph/GeometryIngest.hpp"
-#include "vc/core/graph/GeometryExport.hpp"
 #include "vc/core/graph_links/GraphLinks.hpp"
 #include "vc/core/util/CtSheetNormal.hpp"
-
-namespace nb = nanobind;
 namespace vg = vc::graph;
-
+using namespace vc::python;
+using PyGraphDb = PyDatabase<vg::GraphDb>;
+using PyWriteTxn = PyTransaction<vg::GraphDb>;
 namespace {
-
-std::string jsonDumps(const nb::handle& obj)
-{
-    return nb::cast<std::string>(nb::module_::import_("json").attr("dumps")(obj));
-}
-
-nb::object jsonLoads(const std::string& text)
-{
-    return nb::cast<nb::object>(nb::module_::import_("json").attr("loads")(text));
-}
-
-bool has(const nb::dict& d, const char* key) { return d.contains(key) && !d[key].is_none(); }
-
-std::string getStr(const nb::dict& d, const char* key, const std::string& fallback = "")
-{
-    return has(d, key) ? nb::cast<std::string>(d[key]) : fallback;
-}
-
-int64_t getInt(const nb::dict& d, const char* key, int64_t fallback = 0)
-{
-    return has(d, key) ? nb::cast<int64_t>(d[key]) : fallback;
-}
-
-double getFloat(const nb::dict& d, const char* key, double fallback = 0.0)
-{
-    return has(d, key) ? nb::cast<double>(d[key]) : fallback;
-}
-
-bool getBool(const nb::dict& d, const char* key, bool fallback = false)
-{
-    return has(d, key) ? nb::cast<bool>(d[key]) : fallback;
-}
-
-std::vector<std::string> getTags(const nb::dict& d)
-{
-    std::vector<std::string> out;
-    if (has(d, "tags"))
-        for (nb::handle t : d["tags"])
-            out.push_back(nb::cast<std::string>(t));
-    return out;
-}
-
-std::optional<std::array<double, 6>> getBbox(const nb::dict& d)
-{
-    if (!has(d, "bbox")) return std::nullopt;
-    nb::sequence seq = nb::cast<nb::sequence>(d["bbox"]);
-    if (nb::len(seq) != 6)
-        throw std::runtime_error("bbox must have 6 numbers");
-    std::array<double, 6> box{};
-    for (int i = 0; i < 6; ++i) box[size_t(i)] = nb::cast<double>(seq[i]);
-    return box;
-}
-
-nb::object bboxToPy(const std::optional<std::array<double, 6>>& box)
-{
-    if (!box) return nb::none();
-    nb::list out;
-    for (double v : *box) out.append(v);
-    return out;
-}
-
-vg::Anchor anchorFromPy(const nb::handle& obj)
-{
-    vg::Anchor a;
-    if (obj.is_none()) return a;
-    nb::dict d = nb::cast<nb::dict>(obj);
-    if (has(d, "index")) a.index = nb::cast<int64_t>(d["index"]);
-    for (const char* key : {"position", "direction"}) {
-        if (!has(d, key)) continue;
-        nb::sequence seq = nb::cast<nb::sequence>(d[key]);
-        if (nb::len(seq) != 3)
-            throw std::runtime_error(std::string("anchor ") + key + " must have 3 numbers");
-        std::array<double, 3> v{nb::cast<double>(seq[0]), nb::cast<double>(seq[1]), nb::cast<double>(seq[2])};
-        if (std::string(key) == "position") a.position = v; else a.direction = v;
-    }
-    return a;
-}
-
-nb::dict anchorToPy(const vg::Anchor& a)
-{
-    nb::dict d;
-    if (a.index) d["index"] = *a.index;
-    if (a.position) d["position"] = nb::make_tuple((*a.position)[0], (*a.position)[1], (*a.position)[2]);
-    if (a.direction) d["direction"] = nb::make_tuple((*a.direction)[0], (*a.direction)[1], (*a.direction)[2]);
-    return d;
-}
-
-nb::str pyStr(const std::string& s) { return nb::str(s.data(), s.size()); }
-
-void commonToPy(nb::dict& d, const vg::RecordCommon& r)
-{
-    d["uuid"] = r.uuid;
-    d["kind"] = r.kind;
-    d["generation"] = r.generation;
-    d["created_by"] = r.createdBy;
-    d["created_at"] = r.createdAt;
-    d["created_host"] = r.createdHost;
-    d["changed_by"] = r.changedBy;
-    d["changed_at"] = r.changedAt;
-    d["changed_host"] = r.changedHost;
-    d["approval_state"] = r.approvalState;
-    d["approved_by"] = r.approvedBy ? nb::object(pyStr(*r.approvedBy)) : nb::none();
-    d["approved_at"] = r.approvedAt ? nb::object(pyStr(*r.approvedAt)) : nb::none();
-    d["approved_host"] = r.approvedHost ? nb::object(pyStr(*r.approvedHost)) : nb::none();
-    d["approved_generation"] = r.approvedGeneration ? nb::object(nb::int_(*r.approvedGeneration)) : nb::none();
-    nb::list tags;
-    for (const auto& t : r.tags) tags.append(pyStr(t));
-    d["tags"] = tags;
-    d["meta"] = jsonLoads(r.meta);
-}
-
-nb::dict objectToPy(const vg::ObjectRecord& r)
-{
-    nb::dict d;
-    commonToPy(d, r);
-    d["name"] = r.name;
-    d["format_version"] = r.formatVersion;
-    d["storage_kind"] = r.storageKind;
-    d["storage_ref"] = r.storageRef;
-    d["data_generation"] = r.dataGeneration;
-    d["data_checksum"] = r.dataChecksum ? nb::object(pyStr(*r.dataChecksum)) : nb::none();
-    if (r.fiber) {
-        nb::dict f;
-        f["family"] = r.fiber->family;
-        f["manual_family"] = r.fiber->manualFamily;
-        f["control_point_count"] = r.fiber->controlPointCount;
-        f["line_point_count"] = r.fiber->linePointCount;
-        f["length"] = r.fiber->length;
-        f["width"] = r.fiber->width;
-        f["width_gap_fraction"] = r.fiber->widthGapFraction;
-        f["optimization_mode"] = r.fiber->optimizationMode;
-        f["bbox"] = bboxToPy(r.fiber->bbox);
-        d["fiber"] = f;
-    }
-    if (r.patch) {
-        nb::dict p;
-        p["grid_width"] = r.patch->gridWidth;
-        p["grid_height"] = r.patch->gridHeight;
-        p["scale"] = nb::make_tuple(r.patch->scale[0], r.patch->scale[1]);
-        p["bbox"] = bboxToPy(r.patch->bbox);
-        d["patch"] = p;
-    }
-    if (r.track) {
-        nb::dict t;
-        t["dataset_ref"] = r.track->datasetRef;
-        t["external_key"] = r.track->externalKey;
-        t["family"] = r.track->family;
-        t["point_count"] = r.track->pointCount;
-        t["length"] = r.track->length;
-        t["bbox"] = bboxToPy(r.track->bbox);
-        d["track"] = t;
-    }
-    return d;
-}
-
-vg::ObjectRecord objectFromPy(const nb::dict& d)
-{
-    vg::ObjectRecord r;
-    r.uuid = getStr(d, "uuid");
-    r.kind = getStr(d, "kind");
-    r.name = getStr(d, "name");
-    r.formatVersion = getInt(d, "format_version");
-    r.storageKind = getStr(d, "storage_kind");
-    r.storageRef = getStr(d, "storage_ref");
-    r.dataGeneration = getInt(d, "data_generation");
-    if (has(d, "data_checksum")) r.dataChecksum = nb::cast<std::string>(d["data_checksum"]);
-    r.tags = getTags(d);
-    if (has(d, "meta")) r.meta = jsonDumps(d["meta"]);
-    if (has(d, "fiber")) {
-        const nb::dict f = nb::cast<nb::dict>(d["fiber"]);
-        vg::FiberDetail det;
-        det.family = getStr(f, "family");
-        det.manualFamily = getBool(f, "manual_family");
-        det.controlPointCount = getInt(f, "control_point_count");
-        det.linePointCount = getInt(f, "line_point_count");
-        det.length = getFloat(f, "length");
-        det.width = getFloat(f, "width");
-        det.widthGapFraction = getFloat(f, "width_gap_fraction", 0.2);
-        det.optimizationMode = getStr(f, "optimization_mode");
-        det.bbox = getBbox(f);
-        r.fiber = det;
-    }
-    if (has(d, "patch")) {
-        const nb::dict p = nb::cast<nb::dict>(d["patch"]);
-        vg::PatchDetail det;
-        det.gridWidth = getInt(p, "grid_width");
-        det.gridHeight = getInt(p, "grid_height");
-        if (has(p, "scale")) {
-            const nb::object scale = p["scale"];
-            if (nb::isinstance<nb::float_>(scale) || nb::isinstance<nb::int_>(scale))
-                det.scale.fill(nb::cast<double>(scale));
-            else det.scale = nb::cast<std::array<double, 2>>(scale);
-        }
-        det.bbox = getBbox(p);
-        r.patch = det;
-    }
-    if (has(d, "track")) {
-        const nb::dict t = nb::cast<nb::dict>(d["track"]);
-        vg::TrackDetail det;
-        det.datasetRef = getStr(t, "dataset_ref");
-        det.externalKey = getStr(t, "external_key");
-        det.family = getStr(t, "family");
-        det.pointCount = getInt(t, "point_count");
-        det.length = getFloat(t, "length");
-        det.bbox = getBbox(t);
-        r.track = det;
-    }
-    return r;
-}
-
-nb::dict edgeToPy(const vg::EdgeRecord& e)
-{
-    nb::dict d;
-    commonToPy(d, e);
-    d["a"] = e.aUuid;
-    d["b"] = e.bUuid;
-    d["a_anchor"] = anchorToPy(e.aAnchor);
-    d["b_anchor"] = anchorToPy(e.bAnchor);
-    return d;
-}
-
-vg::EdgeRecord edgeFromPy(const nb::dict& d)
-{
-    vg::EdgeRecord e;
-    e.uuid = getStr(d, "uuid");
-    e.kind = getStr(d, "kind");
-    e.aUuid = getStr(d, "a");
-    e.bUuid = getStr(d, "b");
-    if (has(d, "a_anchor")) e.aAnchor = anchorFromPy(d["a_anchor"]);
-    if (has(d, "b_anchor")) e.bAnchor = anchorFromPy(d["b_anchor"]);
-    e.tags = getTags(d);
-    if (has(d, "meta")) e.meta = jsonDumps(d["meta"]);
-    return e;
-}
-
 nb::dict detectorReportToPy(const vc::graph_links::DetectorReport& rep)
 {
     nb::dict d;
@@ -286,140 +32,6 @@ nb::dict reportToPy(const vg::ImportReport& rep)
     d["problems"] = problems;
     return d;
 }
-
-vg::GeometryData geometryFromPy(const nb::dict& input)
-{
-    vg::GeometryData result;
-    result.kind = nb::cast<std::string>(input["kind"]);
-    if (input.contains("format_version")) result.formatVersion = nb::cast<int64_t>(input["format_version"]);
-    if (input.contains("coordinate_system")) result.coordinateSystem = nb::cast<std::string>(input["coordinate_system"]);
-    if (input.contains("attributes")) result.attributes = jsonDumps(input["attributes"]);
-    for (const auto item : nb::cast<nb::list>(input["arrays"])) {
-        const auto a = nb::cast<nb::dict>(item);
-        vg::GeometryArray array;
-        array.name = nb::cast<std::string>(a["name"]);
-        array.dtype = nb::cast<std::string>(a["dtype"]);
-        array.shape = nb::cast<std::vector<int64_t>>(a["shape"]);
-        const auto bytes = nb::cast<nb::bytes>(a["data"]);
-        const auto* begin = reinterpret_cast<const uint8_t*>(bytes.c_str());
-        array.bytes.assign(begin, begin + bytes.size());
-        result.arrays.push_back(std::move(array));
-    }
-    return result;
-}
-nb::dict geometryToPy(const vg::GeometryRevision& r)
-{
-    nb::dict result;
-    result["uuid"] = r.uuid; result["object_uuid"] = r.objectUuid;
-    result["parent_uuid"] = r.parentUuid; result["content_hash"] = r.contentHash;
-    result["kind"] = r.kind; result["format_version"] = r.formatVersion;
-    result["coordinate_system"] = r.coordinateSystem; result["attributes"] = jsonLoads(r.attributes);
-    result["object_generation"] = r.objectGeneration;
-    result["created_by"] = r.createdBy; result["created_at"] = r.createdAt; result["created_host"] = r.createdHost;
-    nb::list arrays;
-    for (const auto& a : r.arrays) {
-        nb::dict item; item["name"] = a.name; item["dtype"] = a.dtype;
-        item["shape"] = a.shape; item["byte_length"] = a.byteLength; arrays.append(item);
-    }
-    result["arrays"] = arrays;
-    return result;
-}
-nb::dict geometryReportToPy(const vg::GeometryIngestReport& r)
-{
-    nb::dict result;
-    result["ingested"] = r.ingested; result["unchanged"] = r.unchanged; result["problems"] = r.problems;
-    return result;
-}
-
-struct PyGraphDb {
-    std::optional<vg::GraphDb> db;
-
-    vg::GraphDb& require()
-    {
-        if (!db) throw std::runtime_error("graph database is closed");
-        return *db;
-    }
-
-    static PyGraphDb create(const std::string& path, const std::string& author,
-                                             const std::optional<std::string>& hostname, int readerPoolSize)
-    {
-        vg::OpenOptions o;
-        o.author = author;
-        o.hostnameOverride = hostname;
-        o.readerPoolSize = readerPoolSize;
-        PyGraphDb self;
-        self.db = vg::GraphDb::create(path, o);
-        return self;
-    }
-
-    static PyGraphDb open(const std::string& path, const std::optional<std::string>& author,
-                                           bool readOnly, const std::optional<std::string>& hostname,
-                                           int readerPoolSize)
-    {
-        vg::OpenOptions o;
-        o.readOnly = readOnly;
-        o.author = author.value_or("");
-        o.hostnameOverride = hostname;
-        o.readerPoolSize = readerPoolSize;
-        PyGraphDb self;
-        self.db = vg::GraphDb::open(path, o);
-        return self;
-    }
-
-    void close() { db.reset(); }
-
-    template <typename Fn>
-    auto withRead(Fn&& fn)
-    {
-        auto& g = require();
-        auto txn = g.read();
-        return fn(g, txn);
-    }
-    template <typename Fn>
-    auto withWrite(Fn&& fn)
-    {
-        auto& g = require();
-        auto txn = g.write();
-        auto result = fn(g, txn);
-        txn.commit();
-        return result;
-    }
-
-    std::string upsertObjectIn(vg::GraphDb& g, vg::WriteTxn& txn, const nb::dict& rec)
-    {
-        return g.upsertObject(txn, objectFromPy(rec));
-    }
-    std::string addEdgeIn(vg::GraphDb& g, vg::WriteTxn& txn, const nb::dict& rec)
-    {
-        return g.addEdge(txn, edgeFromPy(rec));
-    }
-};
-
-// Batch write transaction usable as a context manager:
-//   with db.write() as w: w.upsert_object(...); w.add_edge(...)
-// Commits on clean exit, rolls back on exception.
-struct PyWriteTxn {
-    PyGraphDb* owner = nullptr;
-    std::unique_ptr<vg::WriteTxn> txn;
-
-    vg::WriteTxn& require()
-    {
-        if (!txn) throw std::runtime_error("write transaction is finished; use it as a context manager");
-        return *txn;
-    }
-    PyWriteTxn& enter()
-    {
-        txn = std::make_unique<vg::WriteTxn>(owner->require().write());
-        return *this;
-    }
-    void exit(bool failed)
-    {
-        if (txn) {
-            if (!failed) txn->commit();
-            txn.reset();  // RAII rolls back when not committed
-        }
-    }
-};
 
 bool setLinePatchParameter(vc::graph_links::LinePatchParams& p, const std::string& key, nb::handle val)
 {
@@ -461,6 +73,7 @@ bool setLinePatchParameter(vc::graph_links::LinePatchParams& p, const std::strin
 
 NB_MODULE(graph, m)
 {
+    nb::module_::import_("vc.objects");
     nb::class_<vc::CtSheetNormalSampler>(m, "CtSheetNormalSampler")
         .def(nb::init<const std::filesystem::path&, int, double>(),
              nb::arg("ct_volume"), nb::arg("level") = 0, nb::arg("working_to_ct_scale") = 1.0)
@@ -643,31 +256,33 @@ NB_MODULE(graph, m)
                 return out;
             },
             nb::arg("after_seq") = 0)
-        .def("put_geometry", [](PyGraphDb& self, const std::string& uuid, const nb::dict& input,
-                               const std::optional<std::string>& expected) {
-            const auto data = geometryFromPy(input);
-            nb::gil_scoped_release release;
-            return self.withWrite([&](vg::GraphDb& db, vg::WriteTxn& txn) { return db.putGeometry(txn, uuid, data, expected); });
-        }, nb::arg("object_uuid"), nb::arg("geometry"), nb::arg("expected_revision") = std::nullopt)
-        .def("current_geometry", [](PyGraphDb& self, const std::string& uuid) -> nb::object {
-            const auto revision = self.withRead([&](vg::GraphDb& db, vg::ReadTxn& txn) { return db.currentGeometry(txn, uuid); });
-            return revision ? nb::object(geometryToPy(*revision)) : nb::none();
+        .def("selected_object", [](PyGraphDb& self, const std::string& uuid) -> nb::object {
+            const auto selection = self.withRead([&](vg::GraphDb& db, vg::ReadTxn& txn) { return db.selectedObject(txn, uuid); });
+            if (!selection) return nb::none();
+            nb::dict result;
+            result["object_uuid"] = selection->objectUuid;
+            result["store_uuid"] = selection->storeUuid;
+            result["revision_uuid"] = selection->revisionUuid;
+            return result;
         }, nb::arg("object_uuid"))
-        .def("geometry_revision", [](PyGraphDb& self, const std::string& uuid) -> nb::object {
-            const auto revision = self.withRead([&](vg::GraphDb& db, vg::ReadTxn& txn) { return db.geometryRevision(txn, uuid); });
-            return revision ? nb::object(geometryToPy(*revision)) : nb::none();
-        }, nb::arg("revision_uuid"))
-        .def("geometry_history", [](PyGraphDb& self, const std::string& uuid) {
-            const auto revisions = self.withRead([&](vg::GraphDb& db, vg::ReadTxn& txn) { return db.geometryHistory(txn, uuid); });
-            nb::list result; for (const auto& r : revisions) result.append(geometryToPy(r)); return result;
-        }, nb::arg("object_uuid"))
-        .def("read_geometry_array", [](PyGraphDb& self, const std::string& uuid, const std::string& name,
-                                      int64_t offset, const std::optional<int64_t>& count) {
-            std::vector<uint8_t> bytes;
-            { nb::gil_scoped_release release;
-              bytes = self.withRead([&](vg::GraphDb& db, vg::ReadTxn& txn) { return db.readGeometryArray(txn, uuid, name, offset, count); }); }
-            return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-        }, nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("byte_offset") = 0, nb::arg("byte_count") = std::nullopt)
+        .def("available_updates", [](PyGraphDb& self, PyObjectStore& store) {
+            const auto updates = self.withRead([&](vg::GraphDb& db, vg::ReadTxn& txn) { return db.availableUpdates(txn, store.require()); });
+            nb::list result;
+            for (const auto& update : updates) {
+                nb::dict item;
+                item["object_uuid"] = update.objectUuid;
+                item["selected_revision"] = update.selectedRevision;
+                item["current_revision"] = update.currentRevision;
+                result.append(item);
+            }
+            return result;
+        }, nb::arg("store"))
+        .def("include_object", [](PyGraphDb& self, PyObjectStore& store, const std::string& object, const std::string& revision) {
+            self.withWrite([&](vg::GraphDb& db, vg::WriteTxn& txn) { db.includeObject(txn, store.require(), object, revision); return 0; });
+        }, nb::arg("store"), nb::arg("object_uuid"), nb::arg("revision"))
+        .def("advance_object", [](PyGraphDb& self, PyObjectStore& store, const std::string& object, const std::string& revision, const std::string& expected) {
+            self.withWrite([&](vg::GraphDb& db, vg::WriteTxn& txn) { db.advanceObject(txn, store.require(), object, revision, expected); return 0; });
+        }, nb::arg("store"), nb::arg("object_uuid"), nb::arg("revision"), nb::arg("expected_revision"))
         .def("edge_geometry_state", [](PyGraphDb& self, const std::string& uuid) {
             const auto state = self.withRead([&](vg::GraphDb& db, vg::ReadTxn& txn) { return db.edgeGeometryState(txn, uuid); });
             nb::dict result; result["a_revision"] = state.aRevision; result["b_revision"] = state.bRevision; result["stale"] = state.stale; return result;
@@ -675,25 +290,6 @@ NB_MODULE(graph, m)
         .def("revalidate_edge_geometry", [](PyGraphDb& self, const std::string& uuid) {
             self.withWrite([&](vg::GraphDb& db, vg::WriteTxn& txn) { db.revalidateEdgeGeometry(txn, uuid); return 0; });
         }, nb::arg("edge_uuid"))
-        .def("ingest_registered_geometry", [](PyGraphDb& self, const std::optional<std::filesystem::path>& root,
-                                             const std::vector<std::string>& uuids) {
-            vg::GeometryIngestReport result;
-            { nb::gil_scoped_release release; result = vg::ingestRegisteredGeometry(self.require(), root, uuids); }
-            return geometryReportToPy(result);
-        }, nb::arg("dataset_root") = std::nullopt, nb::arg("object_uuids") = std::vector<std::string>{})
-        .def("ingest_geometry_source", [](PyGraphDb& self, const std::string& kind, const std::filesystem::path& source) {
-            vg::GeometryIngestReport result;
-            { nb::gil_scoped_release release; result = vg::ingestGeometrySource(self.require(), kind, source); }
-            return geometryReportToPy(result);
-        }, nb::arg("kind"), nb::arg("source"))
-        .def("export_geometry", [](PyGraphDb& self, const std::string& object,
-                                   const std::filesystem::path& destination,
-                                   const std::optional<std::string>& revision, bool overwrite) {
-            nb::gil_scoped_release release;
-            return vg::exportGeometry(self.require(), object, destination, revision, overwrite);
-        }, nb::arg("object_uuid"), nb::arg("destination"), nb::arg("revision_uuid") = std::nullopt,
-           nb::arg("overwrite") = false,
-           "Export one immutable revision to native files; return its UUID. Does not modify the graph.")
         .def("resolve_storage_path",
              [](PyGraphDb& self, const std::string& uuid,
                 const std::optional<std::filesystem::path>& datasetRoot) {
@@ -888,6 +484,7 @@ NB_MODULE(graph, m)
                 w.owner = &self;
                 return w;
             },
+            nb::keep_alive<0, 1>(),
             "Batch write transaction context manager: 'with db.write() as w: w.upsert_object(...)'");
 
     nb::class_<PyWriteTxn>(m, "WriteTransaction")
@@ -899,11 +496,12 @@ NB_MODULE(graph, m)
             const bool failed = nb::len(args) > 0 && !args[0].is_none();
             self.exit(failed);
         })
-        .def("put_geometry", [](PyWriteTxn& self, const std::string& uuid, const nb::dict& input,
-                               const std::optional<std::string>& expected) {
-            const auto data = geometryFromPy(input);
-            return self.owner->require().putGeometry(self.require(), uuid, data, expected);
-        }, nb::arg("object_uuid"), nb::arg("geometry"), nb::arg("expected_revision") = std::nullopt)
+        .def("include_object", [](PyWriteTxn& self, PyObjectStore& store, const std::string& object, const std::string& revision) {
+            self.owner->require().includeObject(self.require(), store.require(), object, revision);
+        }, nb::arg("store"), nb::arg("object_uuid"), nb::arg("revision"))
+        .def("advance_object", [](PyWriteTxn& self, PyObjectStore& store, const std::string& object, const std::string& revision, const std::string& expected) {
+            self.owner->require().advanceObject(self.require(), store.require(), object, revision, expected);
+        }, nb::arg("store"), nb::arg("object_uuid"), nb::arg("revision"), nb::arg("expected_revision"))
         .def("revalidate_edge_geometry", [](PyWriteTxn& self, const std::string& uuid) {
             self.owner->require().revalidateEdgeGeometry(self.require(), uuid);
         }, nb::arg("edge_uuid"))

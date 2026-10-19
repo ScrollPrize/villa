@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-namespace vc::graph {
+namespace vc::objects {
 
 // Contiguous C-order, little-endian arrays. Supported dtypes: |u1, <i4,
 // <i8, <u8, <f4, <f8. Shape and byte length are checked before publication.
@@ -42,9 +42,4 @@ struct GeometryRevision {
     std::vector<GeometryArrayInfo> arrays;
 };
 
-struct EdgeGeometryState {
-    std::optional<std::string> aRevision, bRevision;
-    bool stale = false;
-};
-
-} // namespace vc::graph
+} // namespace vc::objects

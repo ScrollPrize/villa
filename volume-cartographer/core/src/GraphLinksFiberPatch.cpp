@@ -1,6 +1,6 @@
 // Fiber JSON adapter for the shared line-to-patch linker.
 #include "GraphLinksLinePatch.hpp"
-#include "GraphFiberInput.hpp"
+#include "ObjectFiberInput.hpp"
 #include "vc/core/util/Uuid.hpp"
 #include <algorithm>
 #include <cmath>
@@ -14,7 +14,7 @@ namespace {
 std::vector<cv::Vec3d> parsePoints(const nlohmann::json& root, const char* key)
 {
     std::vector<cv::Vec3d> out;
-    for (const auto& p : graph::detail::fiberPoints(root, key)) out.emplace_back(p[0], p[1], p[2]);
+    for (const auto& p : objects::detail::fiberPoints(root, key)) out.emplace_back(p[0], p[1], p[2]);
     return out;
 }
 
@@ -35,9 +35,9 @@ std::optional<detail::LineData> loadFiber(const std::filesystem::path& file, dou
             report.problems.push_back(file.filename().string() + ": missing/invalid uuid, skipped");
             return std::nullopt;
         }
-        const auto sourceLine = graph::detail::fiberPoints(root, "line_points");
+        const auto sourceLine = objects::detail::fiberPoints(root, "line_points");
         fiber.object.fiber = graph::FiberDetail{};
-        fiber.object.fiber->length = graph::detail::fiberPolylineLength(sourceLine);
+        fiber.object.fiber->length = objects::detail::fiberPolylineLength(sourceLine);
         for (const auto& p : sourceLine) fiber.line.emplace_back(p[0], p[1], p[2]);
         fiber.controls = parsePoints(root, "control_points");
         for (auto* points : {&fiber.line, &fiber.controls})

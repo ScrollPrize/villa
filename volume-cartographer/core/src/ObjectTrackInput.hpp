@@ -1,12 +1,12 @@
 #pragma once
 // Shared source identity and measurements for ingestion and link detection.
-#include "vc/core/graph/GraphDb.hpp"
+#include "vc/core/storage/RecordDb.hpp"
 #include "vc/core/util/PackedTrackStore.hpp"
 #include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <stdexcept>
-namespace vc::graph::detail {
+namespace vc::objects::detail {
 inline uint64_t trackSourceId(const std::string& key)
 {
     uint64_t id;
@@ -38,7 +38,7 @@ inline std::string trackFamily(const PackedTrackStore& store, size_t row)
     const auto family = store.families()[row];
     return family == 0 ? "horizontal" : family == 1 ? "vertical" : "";
 }
-inline size_t trackRow(const PackedTrackStore& store, const ObjectRecord& object)
+inline size_t trackRow(const PackedTrackStore& store, const storage::ObjectRecord& object)
 {
     if (!object.track) throw std::runtime_error("missing track detail: " + object.uuid);
     const auto id = trackSourceId(object.track->externalKey);
@@ -53,4 +53,4 @@ inline size_t trackRow(const PackedTrackStore& store, const ObjectRecord& object
         throw std::runtime_error("registered point count differs from packed track " + std::to_string(id));
     return static_cast<size_t>(row);
 }
-} // namespace vc::graph::detail
+} // namespace vc::objects::detail

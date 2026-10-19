@@ -1,5 +1,5 @@
 #pragma once
-#include "vc/core/graph/Geometry.hpp"
+#include "vc/core/objects/Geometry.hpp"
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 #include <algorithm>
@@ -9,7 +9,7 @@
 #include <span>
 #include <stdexcept>
 
-namespace vc::graph::detail {
+namespace vc::objects::detail {
 inline constexpr size_t geometryChunkSize = 1024 * 1024;
 inline std::string geometryHash(std::span<const uint8_t> bytes)
 {
@@ -87,4 +87,4 @@ inline nlohmann::json geometryManifest(const GeometryData& data)
     return {{"kind", data.kind}, {"format_version", data.formatVersion}, {"coordinate_system", data.coordinateSystem},
         {"attributes", attributes}, {"arrays", arrays}};
 }
-} // namespace vc::graph::detail
+} // namespace vc::objects::detail

@@ -1,1166 +1,25 @@
 #include "vc/core/graph/GraphDb.hpp"
-#include "GraphFiberInput.hpp"
-#include "GraphGeometryInternal.hpp"
-
-#include <sqlite3.h>
-
-#include <algorithm>
-#include <chrono>
-#include <climits>
-#include <cmath>
-#include <condition_variable>
-#include <cstdio>
-#include <cstring>
-#include <fstream>
-#include <map>
-#include <sstream>
-#include <ctime>
-#include <mutex>
-#include <queue>
-#include <set>
-#include <stdexcept>
-#include <unordered_map>
-#include <unordered_set>
-
-#ifndef _WIN32
-#include <unistd.h>
-#endif
-
-#include <nlohmann/json.hpp>
-
-#include "vc/core/util/Uuid.hpp"
-
+#include "vc/core/objects/ObjectStore.hpp"
+#include "GraphDbInternal.hpp"
+#include "ObjectFiberInput.hpp"
 namespace vc::graph {
-namespace {
-
-constexpr int kApplicationId = 0x56434752;  // VCGR
-constexpr int kSchemaVersion = 3;
-
-[[noreturn]] void fail(sqlite3* db, const std::string& what)
-{
-    throw std::runtime_error(what + ": " + (db ? sqlite3_errmsg(db) : "no database"));
+GraphDb::GraphDb(std::unique_ptr<Impl> impl) : RecordDb(std::move(impl)) {}
+GraphDb GraphDb::create(const std::filesystem::path& p, const OpenOptions& o) { return GraphDb(openImpl(p,o,true,Kind::Graph)); }
+GraphDb GraphDb::open(const std::filesystem::path& p, const OpenOptions& o) { return GraphDb(openImpl(p,o,false,Kind::Graph)); }
+void GraphDb::setApproval(WriteTxn& txn, const std::string& uuid, const std::string& state) {
+    (void)connection(txn);
+    if (state == "approved" && edgeByUuid(txn, uuid) && edgeGeometryState(txn, uuid).stale)
+        throw std::runtime_error("graph db: revalidate edge geometry before approving a stale edge");
+    RecordDb::setApproval(txn, uuid, state);
 }
-
-void check(int rc, sqlite3* db, const char* what = "sqlite")
-{
-    if (rc != SQLITE_OK && rc != SQLITE_ROW && rc != SQLITE_DONE)
-        fail(db, what);
-}
-
-void exec(sqlite3* db, const char* sql)
-{
-    char* err = nullptr;
-    if (sqlite3_exec(db, sql, nullptr, nullptr, &err) != SQLITE_OK) {
-        std::string msg = err ? err : sqlite3_errmsg(db);
-        sqlite3_free(err);
-        throw std::runtime_error("sqlite exec failed: " + msg);
-    }
-}
-
-class Statement {
-public:
-    Statement(sqlite3* db, const char* sql) : db_(db)
-    {
-        check(sqlite3_prepare_v2(db, sql, -1, &value, nullptr), db, "prepare");
-    }
-    Statement(sqlite3* db, const std::string& sql) : Statement(db, sql.c_str()) {}
-    ~Statement() { sqlite3_finalize(value); }
-    Statement(const Statement&) = delete;
-    Statement& operator=(const Statement&) = delete;
-
-    void bind(int i, int64_t v) { check(sqlite3_bind_int64(value, i, v), db_, "bind"); }
-    void bind(int i, double v) { check(sqlite3_bind_double(value, i, v), db_, "bind"); }
-    void bind(int i, const std::string& v) { check(sqlite3_bind_text(value, i, v.c_str(), int(v.size()), SQLITE_TRANSIENT), db_, "bind"); }
-    void bindNull(int i) { check(sqlite3_bind_null(value, i), db_, "bind"); }
-    void bindBlob(int i, const std::array<unsigned char, 16>& v)
-    {
-        check(sqlite3_bind_blob(value, i, v.data(), 16, SQLITE_TRANSIENT), db_, "bind");
-    }
-    bool row()
-    {
-        const int rc = sqlite3_step(value);
-        if (rc == SQLITE_ROW) return true;
-        if (rc == SQLITE_DONE) return false;
-        fail(db_, "step");
-    }
-    void stepDone()
-    {
-        if (row()) fail(db_, "unexpected row");
-    }
-    void reset()
-    {
-        check(sqlite3_reset(value), db_, "reset");
-        check(sqlite3_clear_bindings(value), db_, "clear_bindings");
-    }
-
-    bool isNull(int c) const { return sqlite3_column_type(value, c) == SQLITE_NULL; }
-    int64_t i64(int c) const { return sqlite3_column_int64(value, c); }
-    double f64(int c) const { return sqlite3_column_double(value, c); }
-    std::string text(int c) const
-    {
-        const auto* p = sqlite3_column_text(value, c);
-        return p ? std::string(reinterpret_cast<const char*>(p), size_t(sqlite3_column_bytes(value, c))) : "";
-    }
-    std::optional<std::string> optText(int c) const
-    {
-        if (isNull(c)) return std::nullopt;
-        return text(c);
-    }
-    std::array<unsigned char, 16> blob16(int c) const
-    {
-        if (sqlite3_column_bytes(value, c) != 16)
-            throw std::runtime_error("graph db: uuid column is not 16 bytes");
-        std::array<unsigned char, 16> out{};
-        std::memcpy(out.data(), sqlite3_column_blob(value, c), 16);
-        return out;
-    }
-
-    sqlite3_stmt* value = nullptr;
-
-private:
-    sqlite3* db_;
-};
-
-std::array<unsigned char, 16> parseUuid(const std::string& uuid)
-{
-    if (!util::isUuid(uuid))
-        throw std::runtime_error("graph db: not a UUID: " + uuid);
-    std::array<unsigned char, 16> out{};
-    int nibble = 0;
-    for (char ch : uuid) {
-        if (ch == '-') continue;
-        int v;
-        if (ch >= '0' && ch <= '9') v = ch - '0';
-        else if (ch >= 'a' && ch <= 'f') v = ch - 'a' + 10;
-        else v = ch - 'A' + 10;
-        out[size_t(nibble / 2)] = static_cast<unsigned char>((out[size_t(nibble / 2)] << 4) | v);
-        ++nibble;
-    }
-    return out;
-}
-
-std::string formatUuid(const std::array<unsigned char, 16>& bytes)
-{
-    constexpr char hex[] = "0123456789abcdef";
-    std::string out;
-    out.reserve(36);
-    for (size_t i = 0; i < bytes.size(); ++i) {
-        if (i == 4 || i == 6 || i == 8 || i == 10) out.push_back('-');
-        out.push_back(hex[bytes[i] >> 4]);
-        out.push_back(hex[bytes[i] & 0x0f]);
-    }
-    return out;
-}
-
-std::string nowIsoUtc()
-{
-    const auto now = std::chrono::system_clock::now();
-    const std::time_t t = std::chrono::system_clock::to_time_t(now);
-    std::tm tm{};
-#ifdef _WIN32
-    gmtime_s(&tm, &t);
-#else
-    gmtime_r(&t, &tm);
-#endif
-    char buf[32];
-    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &tm);
-    return buf;
-}
-
-std::string detectHostname()
-{
-#ifdef _WIN32
-    const char* name = std::getenv("COMPUTERNAME");
-    return name && *name ? name : "unknown";
-#else
-    char buf[256]{};
-    if (gethostname(buf, sizeof(buf) - 1) == 0 && buf[0])
-        return buf;
-    return "unknown";
-#endif
-}
-
-const char* kSchemaSql = R"SQL(
-CREATE TABLE objects(
-  id INTEGER PRIMARY KEY,
-  uuid BLOB NOT NULL UNIQUE,
-  kind TEXT NOT NULL CHECK(length(kind)>0),
-  name TEXT NOT NULL DEFAULT '',
-  generation INTEGER NOT NULL DEFAULT 1,
-  created_by TEXT NOT NULL, created_at TEXT NOT NULL, created_host TEXT NOT NULL,
-  changed_by TEXT NOT NULL, changed_at TEXT NOT NULL, changed_host TEXT NOT NULL,
-  approval_state TEXT NOT NULL DEFAULT 'pending' CHECK(approval_state IN ('pending','approved','rejected')),
-  approved_by TEXT, approved_at TEXT, approved_host TEXT, approved_generation INTEGER,
-  format_version INTEGER NOT NULL DEFAULT 0,
-  storage_kind TEXT NOT NULL DEFAULT '', storage_ref TEXT NOT NULL DEFAULT '',
-  data_generation INTEGER NOT NULL DEFAULT 0, data_checksum TEXT,
-  meta TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(meta) AND json_type(meta)='object')
-);
-CREATE INDEX objects_kind ON objects(kind);
-CREATE INDEX objects_approval ON objects(approval_state);
-CREATE TABLE fibers(
-  object_id INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,
-  family TEXT NOT NULL DEFAULT '', manual_family INTEGER NOT NULL DEFAULT 0,
-  control_point_count INTEGER NOT NULL DEFAULT 0, line_point_count INTEGER NOT NULL DEFAULT 0,
-  length REAL NOT NULL DEFAULT 0, width REAL NOT NULL DEFAULT 0, width_gap_fraction REAL NOT NULL DEFAULT 0.2,
-  optimization_mode TEXT NOT NULL DEFAULT '',
-  bbox_min_x REAL, bbox_min_y REAL, bbox_min_z REAL, bbox_max_x REAL, bbox_max_y REAL, bbox_max_z REAL
-);
-CREATE TABLE patches(
-  object_id INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,
-  grid_width INTEGER NOT NULL DEFAULT 0, grid_height INTEGER NOT NULL DEFAULT 0, scale REAL NOT NULL DEFAULT 0,
-  scale_y REAL NOT NULL DEFAULT 0,
-  bbox_min_x REAL, bbox_min_y REAL, bbox_min_z REAL, bbox_max_x REAL, bbox_max_y REAL, bbox_max_z REAL
-);
-CREATE TABLE tracks(
-  object_id INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,
-  dataset_ref TEXT NOT NULL DEFAULT '', external_key TEXT NOT NULL DEFAULT '',
-  family TEXT NOT NULL DEFAULT '', point_count INTEGER NOT NULL DEFAULT 0, length REAL NOT NULL DEFAULT 0,
-  bbox_min_x REAL, bbox_min_y REAL, bbox_min_z REAL, bbox_max_x REAL, bbox_max_y REAL, bbox_max_z REAL
-);
-CREATE UNIQUE INDEX tracks_identity ON tracks(dataset_ref, external_key) WHERE external_key<>'';
-CREATE TABLE object_tags(
-  object_id INTEGER NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
-  tag TEXT NOT NULL, PRIMARY KEY(object_id, tag)
-);
-CREATE INDEX object_tags_tag ON object_tags(tag);
-CREATE TABLE edges(
-  id INTEGER PRIMARY KEY,
-  uuid BLOB NOT NULL UNIQUE,
-  a_id INTEGER NOT NULL REFERENCES objects(id) ON DELETE RESTRICT,
-  b_id INTEGER NOT NULL REFERENCES objects(id) ON DELETE RESTRICT,
-  kind TEXT NOT NULL CHECK(length(kind)>0),
-  generation INTEGER NOT NULL DEFAULT 1,
-  created_by TEXT NOT NULL, created_at TEXT NOT NULL, created_host TEXT NOT NULL,
-  changed_by TEXT NOT NULL, changed_at TEXT NOT NULL, changed_host TEXT NOT NULL,
-  approval_state TEXT NOT NULL DEFAULT 'pending' CHECK(approval_state IN ('pending','approved','rejected')),
-  approved_by TEXT, approved_at TEXT, approved_host TEXT, approved_generation INTEGER,
-  a_anchor_index INTEGER, a_anchor_x REAL, a_anchor_y REAL, a_anchor_z REAL,
-  a_dir_x REAL, a_dir_y REAL, a_dir_z REAL,
-  b_anchor_index INTEGER, b_anchor_x REAL, b_anchor_y REAL, b_anchor_z REAL,
-  b_dir_x REAL, b_dir_y REAL, b_dir_z REAL,
-  meta TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(meta) AND json_type(meta)='object'),
-  CHECK(a_id < b_id)
-);
-CREATE INDEX edges_a ON edges(a_id, kind);
-CREATE INDEX edges_b ON edges(b_id, kind);
-CREATE UNIQUE INDEX edges_unique_unanchored ON edges(kind, a_id, b_id)
-  WHERE a_anchor_index IS NULL AND b_anchor_index IS NULL;
-CREATE UNIQUE INDEX edges_unique_anchored ON edges(kind, a_id, a_anchor_index, b_id, b_anchor_index)
-  WHERE a_anchor_index IS NOT NULL AND b_anchor_index IS NOT NULL;
-CREATE TABLE edge_tags(
-  edge_id INTEGER NOT NULL REFERENCES edges(id) ON DELETE CASCADE,
-  tag TEXT NOT NULL, PRIMARY KEY(edge_id, tag)
-);
-CREATE INDEX edge_tags_tag ON edge_tags(tag);
-CREATE TABLE journal(
-  seq INTEGER PRIMARY KEY AUTOINCREMENT,
-  record_uuid BLOB NOT NULL, generation INTEGER NOT NULL,
-  author TEXT NOT NULL, hostname TEXT NOT NULL, timestamp TEXT NOT NULL,
-  change_kind TEXT NOT NULL,
-  approval_state TEXT, approved_by TEXT, approved_at TEXT, approved_host TEXT, approved_generation INTEGER
-);
-CREATE INDEX journal_record ON journal(record_uuid, seq);
-)SQL";
-
-const char* kGeometrySchemaSql = R"SQL(
-CREATE TABLE geometry_chunks(
-  hash TEXT PRIMARY KEY CHECK(length(hash)=64),
-  data BLOB NOT NULL CHECK(length(data)>0 AND length(data)<=1048576)
-);
-CREATE TABLE geometry_revisions(
-  uuid BLOB PRIMARY KEY CHECK(length(uuid)=16),
-  object_uuid BLOB NOT NULL REFERENCES objects(uuid) ON DELETE RESTRICT,
-  parent_uuid BLOB,
-  content_hash TEXT NOT NULL CHECK(length(content_hash)=64),
-  manifest TEXT NOT NULL CHECK(json_valid(manifest) AND json_type(manifest)='object'),
-  object_generation INTEGER NOT NULL,
-  created_by TEXT NOT NULL, created_at TEXT NOT NULL, created_host TEXT NOT NULL,
-  UNIQUE(object_uuid,uuid),
-  FOREIGN KEY(object_uuid,parent_uuid) REFERENCES geometry_revisions(object_uuid,uuid)
-);
-CREATE INDEX geometry_history ON geometry_revisions(object_uuid,object_generation);
-CREATE TABLE geometry_heads(
-  object_uuid BLOB PRIMARY KEY REFERENCES objects(uuid) ON DELETE RESTRICT,
-  revision_uuid BLOB NOT NULL,
-  FOREIGN KEY(object_uuid,revision_uuid) REFERENCES geometry_revisions(object_uuid,uuid)
-);
-CREATE TABLE geometry_revision_chunks(
-  revision_uuid BLOB NOT NULL REFERENCES geometry_revisions(uuid),
-  array_name TEXT NOT NULL, chunk_index INTEGER NOT NULL CHECK(chunk_index>=0),
-  hash TEXT NOT NULL REFERENCES geometry_chunks(hash),
-  PRIMARY KEY(revision_uuid,array_name,chunk_index)
-);
-CREATE TABLE edge_geometry_bindings(
-  edge_id INTEGER PRIMARY KEY REFERENCES edges(id) ON DELETE CASCADE,
-  a_revision BLOB REFERENCES geometry_revisions(uuid),
-  b_revision BLOB REFERENCES geometry_revisions(uuid)
-);
-INSERT INTO edge_geometry_bindings(edge_id) SELECT id FROM edges;
-CREATE TRIGGER geometry_chunks_immutable_update BEFORE UPDATE ON geometry_chunks
-  BEGIN SELECT RAISE(ABORT,'geometry chunks are immutable'); END;
-CREATE TRIGGER geometry_chunks_immutable_delete BEFORE DELETE ON geometry_chunks
-  BEGIN SELECT RAISE(ABORT,'geometry chunks are retained'); END;
-CREATE TRIGGER geometry_revisions_immutable_update BEFORE UPDATE ON geometry_revisions
-  BEGIN SELECT RAISE(ABORT,'geometry revisions are immutable'); END;
-CREATE TRIGGER geometry_revisions_immutable_delete BEFORE DELETE ON geometry_revisions
-  BEGIN SELECT RAISE(ABORT,'geometry revisions are retained'); END;
-CREATE TRIGGER geometry_revision_chunks_immutable_update BEFORE UPDATE ON geometry_revision_chunks
-  BEGIN SELECT RAISE(ABORT,'geometry chunk references are immutable'); END;
-CREATE TRIGGER geometry_revision_chunks_immutable_delete BEFORE DELETE ON geometry_revision_chunks
-  BEGIN SELECT RAISE(ABORT,'geometry chunk references are retained'); END;
-)SQL";
-
-void applyPragmas(sqlite3* db, const OpenOptions& options, bool queryOnly)
-{
-    sqlite3_busy_timeout(db, options.busyTimeoutMs);
-    exec(db, "PRAGMA foreign_keys=ON;");
-    exec(db, "PRAGMA temp_store=MEMORY;");
-    exec(db, "PRAGMA cache_size=-8000;");
-    if (queryOnly)
-        exec(db, "PRAGMA query_only=ON;");
-}
-
-sqlite3* openConnection(const std::filesystem::path& path, int flags, const OpenOptions& options, bool queryOnly)
-{
-    sqlite3* db = nullptr;
-    const auto name = path.u8string();
-    const int rc = sqlite3_open_v2(reinterpret_cast<const char*>(name.c_str()), &db, flags | SQLITE_OPEN_FULLMUTEX, nullptr);
-    if (rc != SQLITE_OK) {
-        std::string msg = db ? sqlite3_errmsg(db) : "open failed";
-        if (db) sqlite3_close(db);
-        throw std::runtime_error("graph db: cannot open " + path.string() + ": " + msg);
-    }
-    try {
-        applyPragmas(db, options, queryOnly);
-    } catch (...) {
-        sqlite3_close(db);
-        throw;
-    }
-    return db;
-}
-
-int pragmaInt(sqlite3* db, const char* pragma)
-{
-    Statement s(db, (std::string("PRAGMA ") + pragma).c_str());
-    if (!s.row())
-        throw std::runtime_error(std::string("graph db: PRAGMA ") + pragma + " returned no row");
-    return int(s.i64(0));
-}
-
-void migrateSchema(sqlite3* db, const std::string& author, const std::string& hostname)
-{
-    exec(db, "BEGIN IMMEDIATE;");
-    try {
-        const int version = pragmaInt(db, "user_version");
-        if (version == 1) {
-            exec(db, "ALTER TABLE patches ADD COLUMN scale_y REAL NOT NULL DEFAULT 0;"
-                     "UPDATE patches SET scale_y=scale;"
-                     "ALTER TABLE journal ADD COLUMN approval_state TEXT;"
-                     "ALTER TABLE journal ADD COLUMN approved_by TEXT;"
-                     "ALTER TABLE journal ADD COLUMN approved_at TEXT;"
-                     "ALTER TABLE journal ADD COLUMN approved_host TEXT;"
-                     "ALTER TABLE journal ADD COLUMN approved_generation INTEGER;");
-            // Old decisions cannot be reconstructed. Preserve the state that
-            // survives migration before any subsequent edits can clear it.
-            for (const char* table : {"objects", "edges"}) {
-                Statement snapshot(db, std::string("INSERT INTO journal(record_uuid,generation,author,hostname,timestamp,change_kind,") +
-                    "approval_state,approved_by,approved_at,approved_host,approved_generation) "
-                    "SELECT uuid,generation,?,?,?,'migration_snapshot',approval_state,approved_by,approved_at,approved_host,"
-                    "approved_generation FROM " + table);
-                snapshot.bind(1, author); snapshot.bind(2, hostname); snapshot.bind(3, nowIsoUtc());
-                snapshot.stepDone();
-            }
-            exec(db, "PRAGMA user_version=2;");
-        }
-        if (version == 1 || version == 2) {
-            exec(db, kGeometrySchemaSql);
-            exec(db, "PRAGMA user_version=3;");
-        } else if (version != kSchemaVersion) {
-            throw std::runtime_error("graph db: unsupported schema version");
-        }
-        exec(db, "COMMIT;");
-    } catch (...) {
-        exec(db, "ROLLBACK;");
-        throw;
-    }
-}
-
-}  // namespace
-
-struct GraphDb::Impl {
-    std::filesystem::path path;
-    OpenOptions options;
-    std::string hostname;
-    sqlite3* writer = nullptr;
-    std::mutex writerMutex;
-    std::unique_lock<std::mutex> writerLock;  // held for the lifetime of a WriteTxn
-    std::vector<sqlite3*> readerPool;
-    std::mutex poolMutex;
-    std::condition_variable poolCv;
-    bool closing = false;
-
-    ~Impl()
-    {
-        for (sqlite3* c : readerPool)
-            if (c) sqlite3_close(c);
-        if (writer) sqlite3_close(writer);
-    }
-
-    sqlite3* checkoutReader()
-    {
-        std::unique_lock<std::mutex> lock(poolMutex);
-        poolCv.wait(lock, [&] { return closing || !readerPool.empty(); });
-        if (readerPool.empty())
-            throw std::runtime_error("graph db: handle is closing");
-        sqlite3* conn = readerPool.back();
-        readerPool.pop_back();
-        return conn;
-    }
-    void checkinReader(sqlite3* conn)
-    {
-        {
-            std::lock_guard<std::mutex> lock(poolMutex);
-            readerPool.push_back(conn);
-        }
-        poolCv.notify_one();
-    }
-};
-
-GraphDb::GraphDb(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
-GraphDb::~GraphDb() = default;
-GraphDb::GraphDb(GraphDb&&) noexcept = default;
-GraphDb& GraphDb::operator=(GraphDb&&) noexcept = default;
-
-std::unique_ptr<GraphDb::Impl> GraphDb::openImpl(const std::filesystem::path& path, const OpenOptions& options, bool create)
-{
-    if (sqlite3_threadsafe() == 0)
-        throw std::runtime_error("graph db: SQLite build is not thread-safe");
-    if (!create && !options.readOnly && options.author.empty())
-        throw std::runtime_error("graph db: read-write open requires an author (session identity)");
-    if (create && options.author.empty())
-        throw std::runtime_error("graph db: create requires an author (session identity)");
-
-    auto impl = std::make_unique<GraphDb::Impl>();
-    impl->path = path;
-    impl->options = options;
-    impl->options.readerPoolSize = std::max(1, options.readerPoolSize);
-    impl->hostname = options.hostnameOverride.value_or(detectHostname());
-
-    if (create) {
-        std::error_code ec;
-        if (std::filesystem::exists(path) && std::filesystem::file_size(path, ec) > 0)
-            throw std::runtime_error("graph db: create refuses existing non-empty file: " + path.string());
-        impl->writer = openConnection(path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, options, false);
-        exec(impl->writer, "PRAGMA journal_mode=WAL;");
-        exec(impl->writer, "PRAGMA synchronous=NORMAL;");
-        exec(impl->writer, ("PRAGMA application_id=" + std::to_string(kApplicationId) + ";").c_str());
-        exec(impl->writer, "BEGIN IMMEDIATE;");
-        try {
-            exec(impl->writer, kSchemaSql);
-            exec(impl->writer, kGeometrySchemaSql);
-            exec(impl->writer, ("PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";").c_str());
-            exec(impl->writer, "COMMIT;");
-        } catch (...) {
-            exec(impl->writer, "ROLLBACK;");
-            throw;
-        }
-    } else {
-        if (!options.readOnly) {
-            impl->writer = openConnection(path, SQLITE_OPEN_READWRITE, options, false);
-            exec(impl->writer, "PRAGMA journal_mode=WAL;");
-            exec(impl->writer, "PRAGMA synchronous=NORMAL;");
-            if (pragmaInt(impl->writer, "application_id") != kApplicationId)
-                throw std::runtime_error("graph db: not a VC graph database: " + path.string());
-            migrateSchema(impl->writer, options.author, impl->hostname);
-        }
-    }
-
-    // WAL readers need write access to the -shm file, so pooled readers
-    // are read-write connections pinned to query_only (true READONLY
-    // only for a fully read-only open).
-    const int readerFlags = options.readOnly ? SQLITE_OPEN_READONLY : SQLITE_OPEN_READWRITE;
-    for (int i = 0; i < impl->options.readerPoolSize; ++i) {
-        sqlite3* conn = openConnection(path, readerFlags, options, true);
-        impl->readerPool.push_back(conn);
-        if (options.readOnly) {
-            if (pragmaInt(conn, "application_id") != kApplicationId)
-                throw std::runtime_error("graph db: not a VC graph database: " + path.string());
-            const auto version = pragmaInt(conn, "user_version");
-            if (version > 0 && version < kSchemaVersion)
-                throw std::runtime_error("graph db: schema v" + std::to_string(version) + " requires migration; open read-write once before opening read-only");
-            if (version != kSchemaVersion)
-                throw std::runtime_error("graph db: unsupported schema version in " + path.string());
-        }
-    }
-    return impl;
-}
-
-GraphDb GraphDb::create(const std::filesystem::path& path, const OpenOptions& options)
-{
-    return GraphDb(openImpl(path, options, true));
-}
-
-GraphDb GraphDb::open(const std::filesystem::path& path, const OpenOptions& options)
-{
-    return GraphDb(openImpl(path, options, false));
-}
-
-const std::filesystem::path& GraphDb::path() const { return impl_->path; }
-std::string GraphDb::hostname() const { return impl_->hostname; }
-std::string GraphDb::author() const { return impl_->options.author; }
-
-Txn::Txn(Txn&& other) noexcept : db_(other.db_), handle_(other.handle_), write_(other.write_)
-{
-    other.handle_ = nullptr;
-}
-
-Txn::~Txn()
-{
-    if (handle_) {
-        try {
-            release(false);
-        } catch (...) {
-        }
-    }
-}
-
-void Txn::commit()
-{
-    if (!handle_)
-        throw std::runtime_error("graph db: commit on finished transaction");
-    release(true);
-}
-
-void Txn::release(bool commit)
-{
-    auto* conn = static_cast<sqlite3*>(handle_);
-    handle_ = nullptr;
-    exec(conn, commit ? "COMMIT;" : "ROLLBACK;");
-    if (write_) {
-        if (db_->impl_->writerLock.owns_lock())
-            db_->impl_->writerLock.unlock();
-    } else {
-        db_->impl_->checkinReader(conn);
-    }
-}
-
-ReadTxn GraphDb::read()
-{
-    sqlite3* conn = impl_->checkoutReader();
-    try {
-        exec(conn, "BEGIN;");
-        // Establish the snapshot now, so all reads in this transaction
-        // see one consistent state even before the first real query.
-        Statement pin(conn, "SELECT count(*) FROM objects");
-        (void)pin.row();
-    } catch (...) {
-        impl_->checkinReader(conn);
-        throw;
-    }
-    return ReadTxn(this, conn);
-}
-
-WriteTxn GraphDb::write()
-{
-    if (!impl_->writer)
-        throw std::runtime_error("graph db: handle is read-only");
-    impl_->writerLock = std::unique_lock<std::mutex>(impl_->writerMutex);
-    try {
-        exec(impl_->writer, "BEGIN IMMEDIATE;");
-    } catch (...) {
-        impl_->writerLock.unlock();
-        throw;
-    }
-    return WriteTxn(this, impl_->writer);
-}
-
-void GraphDb::checkpoint()
-{
-    if (!impl_->writer)
-        throw std::runtime_error("graph db: checkpoint on read-only handle");
-    std::lock_guard<std::mutex> lock(impl_->writerMutex);
-    check(sqlite3_wal_checkpoint_v2(impl_->writer, nullptr, SQLITE_CHECKPOINT_FULL, nullptr, nullptr), impl_->writer, "checkpoint");
-}
-
-struct GraphDbImplAccess {
-    static sqlite3* conn(const Txn& txn)
-    {
-        if (!txn.active())
-            throw std::runtime_error("graph db: use of finished transaction");
-        return static_cast<sqlite3*>(txn.handle_);
-    }
-};
-
-namespace {
-
-const char* kObjectCols =
-    "id,uuid,kind,name,generation,created_by,created_at,created_host,changed_by,changed_at,changed_host,"
-    "approval_state,approved_by,approved_at,approved_host,approved_generation,format_version,storage_kind,"
-    "storage_ref,data_generation,data_checksum,meta";
-
-void appendJournal(sqlite3* db, const std::string& author, const std::string& hostname,
-                   const std::array<unsigned char, 16>& uuid, int64_t generation, const char* changeKind)
-{
-    Statement state(db, "SELECT approval_state,approved_by,approved_at,approved_host,approved_generation FROM objects WHERE uuid=? "
-                        "UNION ALL SELECT approval_state,approved_by,approved_at,approved_host,approved_generation FROM edges WHERE uuid=?");
-    state.bindBlob(1, uuid); state.bindBlob(2, uuid);
-    const bool hasState = state.row();
-    Statement s(db, "INSERT INTO journal(record_uuid,generation,author,hostname,timestamp,change_kind,"
-                    "approval_state,approved_by,approved_at,approved_host,approved_generation) VALUES(?,?,?,?,?,?,?,?,?,?,?)");
-    s.bindBlob(1, uuid);
-    s.bind(2, generation);
-    s.bind(3, author);
-    s.bind(4, hostname);
-    s.bind(5, nowIsoUtc());
-    s.bind(6, std::string(changeKind));
-    for (int i = 0; i < 4; ++i) {
-        if (hasState && !state.isNull(i)) s.bind(7 + i, state.text(i));
-        else s.bindNull(7 + i);
-    }
-    if (hasState && !state.isNull(4)) s.bind(11, state.i64(4));
-    else s.bindNull(11);
-    s.stepDone();
-}
-
-void readCommon(RecordCommon& rec, const Statement& s, int uuidCol, int kindCol, int genCol)
-{
-    rec.uuid = formatUuid(s.blob16(uuidCol));
-    rec.kind = s.text(kindCol);
-    rec.generation = s.i64(genCol);
-    rec.createdBy = s.text(genCol + 1);
-    rec.createdAt = s.text(genCol + 2);
-    rec.createdHost = s.text(genCol + 3);
-    rec.changedBy = s.text(genCol + 4);
-    rec.changedAt = s.text(genCol + 5);
-    rec.changedHost = s.text(genCol + 6);
-    rec.approvalState = s.text(genCol + 7);
-    rec.approvedBy = s.optText(genCol + 8);
-    rec.approvedAt = s.optText(genCol + 9);
-    rec.approvedHost = s.optText(genCol + 10);
-    if (!s.isNull(genCol + 11))
-        rec.approvedGeneration = s.i64(genCol + 11);
-}
-
-std::optional<std::array<double, 6>> readBbox(const Statement& s, int firstCol)
-{
-    if (s.isNull(firstCol)) return std::nullopt;
-    std::array<double, 6> box{};
-    for (int i = 0; i < 6; ++i) box[size_t(i)] = s.f64(firstCol + i);
-    return box;
-}
-
-void bindBbox(Statement& s, int firstIdx, const std::optional<std::array<double, 6>>& box)
-{
-    for (int i = 0; i < 6; ++i) {
-        if (box) s.bind(firstIdx + i, (*box)[size_t(i)]);
-        else s.bindNull(firstIdx + i);
-    }
-}
-
-ObjectRecord readObjectRow(sqlite3* db, const Statement& s)
-{
-    ObjectRecord rec;
-    const int64_t id = s.i64(0);
-    readCommon(rec, s, 1, 2, 4);
-    rec.name = s.text(3);
-    rec.formatVersion = s.i64(16);
-    rec.storageKind = s.text(17);
-    rec.storageRef = s.text(18);
-    rec.dataGeneration = s.i64(19);
-    rec.dataChecksum = s.optText(20);
-    rec.meta = s.text(21);
-
-    {
-        Statement tags(db, "SELECT tag FROM object_tags WHERE object_id=? ORDER BY tag");
-        tags.bind(1, id);
-        while (tags.row()) rec.tags.push_back(tags.text(0));
-    }
-    if (rec.kind == "fiber") {
-        Statement d(db, "SELECT family,manual_family,control_point_count,line_point_count,length,width,"
-                        "width_gap_fraction,optimization_mode,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z "
-                        "FROM fibers WHERE object_id=?");
-        d.bind(1, id);
-        if (d.row()) {
-            FiberDetail f;
-            f.family = d.text(0);
-            f.manualFamily = d.i64(1) != 0;
-            f.controlPointCount = d.i64(2);
-            f.linePointCount = d.i64(3);
-            f.length = d.f64(4);
-            f.width = d.f64(5);
-            f.widthGapFraction = d.f64(6);
-            f.optimizationMode = d.text(7);
-            f.bbox = readBbox(d, 8);
-            rec.fiber = f;
-        }
-    } else if (rec.kind == "patch") {
-        Statement d(db, "SELECT grid_width,grid_height,scale,scale_y,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z "
-                        "FROM patches WHERE object_id=?");
-        d.bind(1, id);
-        if (d.row()) {
-            PatchDetail p;
-            p.gridWidth = d.i64(0);
-            p.gridHeight = d.i64(1);
-            p.scale = {d.f64(2), d.f64(3)};
-            p.bbox = readBbox(d, 4);
-            rec.patch = p;
-        }
-    } else if (rec.kind == "track") {
-        Statement d(db, "SELECT dataset_ref,external_key,family,point_count,length,bbox_min_x,bbox_min_y,bbox_min_z,"
-                        "bbox_max_x,bbox_max_y,bbox_max_z FROM tracks WHERE object_id=?");
-        d.bind(1, id);
-        if (d.row()) {
-            TrackDetail t;
-            t.datasetRef = d.text(0);
-            t.externalKey = d.text(1);
-            t.family = d.text(2);
-            t.pointCount = d.i64(3);
-            t.length = d.f64(4);
-            t.bbox = readBbox(d, 5);
-            rec.track = t;
-        }
-    }
-    return rec;
-}
-
-std::optional<int64_t> objectIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid)
-{
-    Statement s(db, "SELECT id FROM objects WHERE uuid=?");
-    s.bindBlob(1, uuid);
-    if (!s.row()) return std::nullopt;
-    return s.i64(0);
-}
-
-void writeObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec)
-{
-    for (const char* table : {"fibers", "patches", "tracks"}) {
-        Statement del(db, std::string("DELETE FROM ") + table + " WHERE object_id=?");
-        del.bind(1, id);
-        del.stepDone();
-    }
-    if (rec.fiber && rec.kind != "fiber")
-        throw std::runtime_error("graph db: fiber detail on object of kind " + rec.kind);
-    if (rec.patch && rec.kind != "patch")
-        throw std::runtime_error("graph db: patch detail on object of kind " + rec.kind);
-    if (rec.track && rec.kind != "track")
-        throw std::runtime_error("graph db: track detail on object of kind " + rec.kind);
-    if (rec.fiber) {
-        Statement s(db, "INSERT INTO fibers(object_id,family,manual_family,control_point_count,line_point_count,length,width,"
-                        "width_gap_fraction,optimization_mode,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-        const auto& f = *rec.fiber;
-        s.bind(1, id); s.bind(2, f.family); s.bind(3, int64_t(f.manualFamily ? 1 : 0));
-        s.bind(4, f.controlPointCount); s.bind(5, f.linePointCount); s.bind(6, f.length);
-        s.bind(7, f.width); s.bind(8, f.widthGapFraction); s.bind(9, f.optimizationMode);
-        bindBbox(s, 10, f.bbox);
-        s.stepDone();
-    } else if (rec.patch) {
-        Statement s(db, "INSERT INTO patches(object_id,grid_width,grid_height,scale,scale_y,bbox_min_x,bbox_min_y,bbox_min_z,"
-                        "bbox_max_x,bbox_max_y,bbox_max_z) VALUES(?,?,?,?,?,?,?,?,?,?,?)");
-        const auto& p = *rec.patch;
-        s.bind(1, id); s.bind(2, p.gridWidth); s.bind(3, p.gridHeight);
-        s.bind(4, p.scale[0]); s.bind(5, p.scale[1]);
-        bindBbox(s, 6, p.bbox);
-        s.stepDone();
-    } else if (rec.track) {
-        Statement s(db, "INSERT INTO tracks(object_id,dataset_ref,external_key,family,point_count,length,bbox_min_x,bbox_min_y,"
-                        "bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)");
-        const auto& t = *rec.track;
-        s.bind(1, id); s.bind(2, t.datasetRef); s.bind(3, t.externalKey); s.bind(4, t.family);
-        s.bind(5, t.pointCount); s.bind(6, t.length);
-        bindBbox(s, 7, t.bbox);
-        s.stepDone();
-    }
-}
-
-void writeTags(sqlite3* db, const char* table, const char* idColumn, int64_t id, const std::vector<std::string>& tags)
-{
-    {
-        Statement del(db, std::string("DELETE FROM ") + table + " WHERE " + idColumn + "=?");
-        del.bind(1, id);
-        del.stepDone();
-    }
-    Statement ins(db, std::string("INSERT OR IGNORE INTO ") + table + "(" + idColumn + ",tag) VALUES(?,?)");
-    for (const auto& tag : tags) {
-        if (tag.empty()) continue;
-        ins.reset();
-        ins.bind(1, id);
-        ins.bind(2, tag);
-        ins.stepDone();
-    }
-}
-
-void restoreCommon(sqlite3* db, const char* table, const RecordCommon& rec)
-{
-    Statement s(db, std::string("UPDATE ") + table + " SET generation=?,created_by=?,created_at=?,created_host=?,"
-        "changed_by=?,changed_at=?,changed_host=?,approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_generation=? WHERE uuid=?");
-    s.bind(1, rec.generation);
-    s.bind(2, rec.createdBy); s.bind(3, rec.createdAt); s.bind(4, rec.createdHost);
-    s.bind(5, rec.changedBy); s.bind(6, rec.changedAt); s.bind(7, rec.changedHost);
-    s.bind(8, rec.approvalState);
-    if (rec.approvedBy) s.bind(9, *rec.approvedBy); else s.bindNull(9);
-    if (rec.approvedAt) s.bind(10, *rec.approvedAt); else s.bindNull(10);
-    if (rec.approvedHost) s.bind(11, *rec.approvedHost); else s.bindNull(11);
-    if (rec.approvedGeneration) s.bind(12, *rec.approvedGeneration); else s.bindNull(12);
-    s.bindBlob(13, parseUuid(rec.uuid));
-    s.stepDone();
-}
-
-// preserveApproval is reserved for import paths seeding legacy records;
-// the public API always starts/resets approval through the normal rules.
-std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::string& host, const ObjectRecord& input,
-                             bool preserveApproval, bool preserveRecord = false)
-{
-    if (input.kind.empty())
-        throw std::runtime_error("graph db: object kind must be non-empty");
-    if (input.patch)
-        for (double axis : input.patch->scale)
-            if (!std::isfinite(axis) || axis < 0)
-                throw std::runtime_error("graph db: patch scale must be finite and nonnegative");
-    ObjectRecord rec = input;
-    if (rec.uuid.empty())
-        rec.uuid = util::newUuid();
-    if (rec.meta.empty())
-        rec.meta = "{}";
-    const auto uuid = parseUuid(rec.uuid);
-    Statement collision(db, "SELECT 1 FROM edges WHERE uuid=?");
-    collision.bindBlob(1, uuid);
-    if (collision.row()) throw std::runtime_error("graph db: UUID already belongs to an edge");
-    const std::string now = nowIsoUtc();
-    Statement managed(db, "SELECT o.data_generation,o.data_checksum,o.storage_ref FROM objects o JOIN geometry_heads h ON h.object_uuid=o.uuid WHERE o.uuid=?");
-    managed.bindBlob(1, uuid);
-    if (managed.row()) {
-        rec.storageKind = "sqlite";
-        rec.storageRef = managed.text(2);
-        rec.dataGeneration = managed.i64(0);
-        rec.dataChecksum = managed.text(1);
-    } else if (rec.storageKind == "sqlite") {
-        throw std::invalid_argument("graph db: managed geometry requires putGeometry, not a storage_kind override");
-    }
-
-    int64_t id = 0;
-    int64_t generation = 1;
-    if (auto existing = objectIdByUuid(db, uuid)) {
-        id = *existing;
-        Statement cur(db, "SELECT kind,generation FROM objects WHERE id=?");
-        cur.bind(1, id);
-        (void)cur.row();
-        if (cur.text(0) != rec.kind)
-            throw std::runtime_error("graph db: object kind cannot change (" + cur.text(0) + " -> " + rec.kind + ")");
-        generation = cur.i64(1) + 1;
-        Statement s(db, "UPDATE objects SET name=?,generation=?,changed_by=?,changed_at=?,changed_host=?,"
-                        "approval_state='pending',approved_by=NULL,approved_at=NULL,approved_host=NULL,approved_generation=NULL,"
-                        "format_version=?,storage_kind=?,storage_ref=?,data_generation=?,data_checksum=?,meta=? WHERE id=?");
-        s.bind(1, rec.name); s.bind(2, generation); s.bind(3, author); s.bind(4, now); s.bind(5, host);
-        s.bind(6, rec.formatVersion); s.bind(7, rec.storageKind); s.bind(8, rec.storageRef); s.bind(9, rec.dataGeneration);
-        if (rec.dataChecksum) s.bind(10, *rec.dataChecksum); else s.bindNull(10);
-        s.bind(11, rec.meta); s.bind(12, id);
-        s.stepDone();
-        if (preserveApproval && rec.approvalState != "pending") {
-            Statement a(db, "UPDATE objects SET approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_generation=? WHERE id=?");
-            a.bind(1, rec.approvalState);
-            if (rec.approvedBy) a.bind(2, *rec.approvedBy); else a.bindNull(2);
-            if (rec.approvedAt) a.bind(3, *rec.approvedAt); else a.bindNull(3);
-            if (rec.approvedHost) a.bind(4, *rec.approvedHost); else a.bindNull(4);
-            if (rec.approvedGeneration) a.bind(5, *rec.approvedGeneration); else a.bindNull(5);
-            a.bind(6, id);
-            a.stepDone();
-        }
-    } else {
-        Statement s(db, "INSERT INTO objects(uuid,kind,name,generation,created_by,created_at,created_host,changed_by,changed_at,"
-                        "changed_host,approval_state,approved_by,approved_at,approved_host,approved_generation,format_version,"
-                        "storage_kind,storage_ref,data_generation,data_checksum,meta) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-        s.bindBlob(1, uuid); s.bind(2, rec.kind); s.bind(3, rec.name); s.bind(4, generation);
-        s.bind(5, author); s.bind(6, now); s.bind(7, host);
-        s.bind(8, author); s.bind(9, now); s.bind(10, host);
-        const std::string state = preserveApproval ? rec.approvalState : "pending";
-        s.bind(11, state.empty() ? std::string("pending") : state);
-        if (preserveApproval && rec.approvedBy) s.bind(12, *rec.approvedBy); else s.bindNull(12);
-        if (preserveApproval && rec.approvedAt) s.bind(13, *rec.approvedAt); else s.bindNull(13);
-        if (preserveApproval && rec.approvedHost) s.bind(14, *rec.approvedHost); else s.bindNull(14);
-        if (preserveApproval && rec.approvedGeneration) s.bind(15, *rec.approvedGeneration); else s.bindNull(15);
-        s.bind(16, rec.formatVersion); s.bind(17, rec.storageKind); s.bind(18, rec.storageRef); s.bind(19, rec.dataGeneration);
-        if (rec.dataChecksum) s.bind(20, *rec.dataChecksum); else s.bindNull(20);
-        s.bind(21, rec.meta);
-        s.stepDone();
-        id = sqlite3_last_insert_rowid(db);
-    }
-    writeObjectDetail(db, id, rec);
-    writeTags(db, "object_tags", "object_id", id, rec.tags);
-    if (preserveRecord) restoreCommon(db, "objects", rec);
-    appendJournal(db, author, host, uuid, preserveRecord ? rec.generation : generation, preserveRecord ? "import" : "upsert");
-    return rec.uuid;
-}
-
-const char* kEdgeCols =
-    "id,uuid,a_id,b_id,kind,generation,created_by,created_at,created_host,changed_by,changed_at,changed_host,"
-    "approval_state,approved_by,approved_at,approved_host,approved_generation,"
-    "a_anchor_index,a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
-    "b_anchor_index,b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta";
-
-Anchor readAnchor(const Statement& s, int firstCol)
-{
-    Anchor a;
-    if (!s.isNull(firstCol)) a.index = s.i64(firstCol);
-    if (!s.isNull(firstCol + 1)) a.position = std::array<double, 3>{s.f64(firstCol + 1), s.f64(firstCol + 2), s.f64(firstCol + 3)};
-    if (!s.isNull(firstCol + 4)) a.direction = std::array<double, 3>{s.f64(firstCol + 4), s.f64(firstCol + 5), s.f64(firstCol + 6)};
-    return a;
-}
-
-void bindAnchor(Statement& s, int firstIdx, const Anchor& a)
-{
-    if (a.index) s.bind(firstIdx, *a.index); else s.bindNull(firstIdx);
-    for (int i = 0; i < 3; ++i) {
-        if (a.position) s.bind(firstIdx + 1 + i, (*a.position)[size_t(i)]); else s.bindNull(firstIdx + 1 + i);
-    }
-    for (int i = 0; i < 3; ++i) {
-        if (a.direction) s.bind(firstIdx + 4 + i, (*a.direction)[size_t(i)]); else s.bindNull(firstIdx + 4 + i);
-    }
-}
-
-std::string uuidTextByObjectId(sqlite3* db, int64_t id)
-{
-    Statement s(db, "SELECT uuid FROM objects WHERE id=?");
-    s.bind(1, id);
-    if (!s.row()) throw std::runtime_error("graph db: dangling edge endpoint id");
-    return formatUuid(s.blob16(0));
-}
-
-EdgeRecord readEdgeRow(sqlite3* db, const Statement& s)
-{
-    EdgeRecord rec;
-    const int64_t id = s.i64(0);
-    const int64_t aId = s.i64(2);
-    const int64_t bId = s.i64(3);
-    readCommon(rec, s, 1, 4, 5);
-    rec.aAnchor = readAnchor(s, 17);
-    rec.bAnchor = readAnchor(s, 24);
-    rec.meta = s.text(31);
-    rec.aUuid = uuidTextByObjectId(db, aId);
-    rec.bUuid = uuidTextByObjectId(db, bId);
-    Statement tags(db, "SELECT tag FROM edge_tags WHERE edge_id=? ORDER BY tag");
-    tags.bind(1, id);
-    while (tags.row()) rec.tags.push_back(tags.text(0));
-    return rec;
-}
-
-std::optional<int64_t> edgeIdByUuid(sqlite3* db, const std::array<unsigned char, 16>& uuid)
-{
-    Statement s(db, "SELECT id FROM edges WHERE uuid=?");
-    s.bindBlob(1, uuid);
-    if (!s.row()) return std::nullopt;
-    return s.i64(0);
-}
-
-std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::string& host, const EdgeRecord& input,
-                        bool preserveApproval, bool preserveRecord = false)
-{
-    if (input.kind.empty())
-        throw std::runtime_error("graph db: edge kind must be non-empty");
-    EdgeRecord rec = input;
-    if (rec.uuid.empty())
-        rec.uuid = util::newUuid();
-    if (rec.meta.empty())
-        rec.meta = "{}";
-    if (objectIdByUuid(db, parseUuid(rec.uuid)))
-        throw std::runtime_error("graph db: UUID already belongs to an object");
-    const auto aUuid = parseUuid(rec.aUuid);
-    const auto bUuid = parseUuid(rec.bUuid);
-    auto aId = objectIdByUuid(db, aUuid);
-    auto bId = objectIdByUuid(db, bUuid);
-    if (!aId) throw std::runtime_error("graph db: edge endpoint not found: " + rec.aUuid);
-    if (!bId) throw std::runtime_error("graph db: edge endpoint not found: " + rec.bUuid);
-    if (*aId == *bId)
-        throw std::runtime_error("graph db: self-edges are not allowed");
-    if (*aId > *bId) {
-        std::swap(aId, bId);
-        std::swap(rec.aUuid, rec.bUuid);
-        std::swap(rec.aAnchor, rec.bAnchor);
-    }
-    const std::string now = nowIsoUtc();
-    Statement s(db, "INSERT INTO edges(uuid,a_id,b_id,kind,generation,created_by,created_at,created_host,changed_by,changed_at,"
-                    "changed_host,approval_state,approved_by,approved_at,approved_host,approved_generation,"
-                    "a_anchor_index,a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
-                    "b_anchor_index,b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-    s.bindBlob(1, parseUuid(rec.uuid));
-    s.bind(2, *aId); s.bind(3, *bId); s.bind(4, rec.kind); s.bind(5, int64_t(1));
-    s.bind(6, author); s.bind(7, now); s.bind(8, host);
-    s.bind(9, author); s.bind(10, now); s.bind(11, host);
-    const std::string state = preserveApproval ? rec.approvalState : "pending";
-    s.bind(12, state.empty() ? std::string("pending") : state);
-    if (preserveApproval && rec.approvedBy) s.bind(13, *rec.approvedBy); else s.bindNull(13);
-    if (preserveApproval && rec.approvedAt) s.bind(14, *rec.approvedAt); else s.bindNull(14);
-    if (preserveApproval && rec.approvedHost) s.bind(15, *rec.approvedHost); else s.bindNull(15);
-    if (preserveApproval && rec.approvedGeneration) s.bind(16, *rec.approvedGeneration); else s.bindNull(16);
-    bindAnchor(s, 17, rec.aAnchor);
-    bindAnchor(s, 24, rec.bAnchor);
-    s.bind(31, rec.meta);
-    s.stepDone();
-    const int64_t id = sqlite3_last_insert_rowid(db);
-    Statement binding(db, "INSERT INTO edge_geometry_bindings(edge_id,a_revision,b_revision) VALUES(?,"
-        "(SELECT revision_uuid FROM geometry_heads WHERE object_uuid=?),"
-        "(SELECT revision_uuid FROM geometry_heads WHERE object_uuid=?))");
-    binding.bind(1, id); binding.bindBlob(2, parseUuid(rec.aUuid)); binding.bindBlob(3, parseUuid(rec.bUuid));
-    binding.stepDone();
-    writeTags(db, "edge_tags", "edge_id", id, rec.tags);
-    if (preserveRecord) restoreCommon(db, "edges", rec);
-    appendJournal(db, author, host, parseUuid(rec.uuid), preserveRecord ? rec.generation : 1, preserveRecord ? "import" : "add_edge");
-    return rec.uuid;
-}
-
-// Shared content-mutation stamp for setMeta/removeMeta: bumps
-// generation, restamps changed_*, resets approval, journals.
-void stampContentChange(sqlite3* db, const std::string& author, const std::string& host, const char* table,
-                        int64_t id, const std::array<unsigned char, 16>& uuid, const char* changeKind)
-{
-    int64_t generation = 0;
-    {
-        Statement cur(db, std::string("SELECT generation FROM ") + table + " WHERE id=?");
-        cur.bind(1, id);
-        (void)cur.row();
-        generation = cur.i64(0) + 1;
-    }
-    Statement s(db, std::string("UPDATE ") + table +
-                        " SET generation=?,changed_by=?,changed_at=?,changed_host=?,approval_state='pending',"
-                        "approved_by=NULL,approved_at=NULL,approved_host=NULL,approved_generation=NULL WHERE id=?");
-    s.bind(1, generation);
-    s.bind(2, author);
-    s.bind(3, nowIsoUtc());
-    s.bind(4, host);
-    s.bind(5, id);
-    s.stepDone();
-    appendJournal(db, author, host, uuid, generation, changeKind);
-}
-
-std::string jsonPathForKey(const std::string& key)
-{
-    std::string out = "$.\"";
-    for (char ch : key) {
-        if (ch == '"' || ch == '\\') out.push_back('\\');
-        out.push_back(ch);
-    }
-    out.push_back('"');
-    return out;
-}
-
-}  // namespace
-
-std::string GraphDb::upsertObject(WriteTxn& txn, const ObjectRecord& record)
-{
-    return upsertObjectImpl(GraphDbImplAccess::conn(txn), impl_->options.author, impl_->hostname, record, false);
-}
-
-namespace {
-void refreshLineMeasurements(sqlite3* db, const std::string& author, const std::string& host,
-    const std::string& table, const std::string& uuid, double length,
-    const std::optional<std::string>& family, const char* journalKind)
-{
-    if (!std::isfinite(length) || length < 0)
-        throw std::invalid_argument("graph db: line length must be finite and nonnegative");
-    const auto key = parseUuid(uuid);
-    Statement current(db, "SELECT o.id,o.generation,t.length,t.family FROM objects o JOIN " + table +
-        " t ON t.object_id=o.id WHERE o.uuid=?");
-    current.bindBlob(1, key);
-    if (!current.row()) throw std::runtime_error("graph db: " + table + " record not found: " + uuid);
-    const auto previousFamily = current.text(3);
-    if (family && !previousFamily.empty() && previousFamily != *family)
-        throw std::runtime_error("graph db: registered family differs from source: " + uuid);
-    const auto newFamily = family.value_or(previousFamily);
-    if (current.f64(2) == length && previousFamily == newFamily) return;
-    Statement update(db, "UPDATE " + table + " SET length=?,family=? WHERE object_id=?");
-    update.bind(1, length);
-    update.bind(2, newFamily);
-    update.bind(3, current.i64(0));
-    update.stepDone();
-    stampContentChange(db, author, host, "objects", current.i64(0), key, journalKind);
-}
-} // namespace
-
-void GraphDb::setTrackLength(WriteTxn& txn, const std::string& uuid, double length,
-    const std::optional<std::string>& family)
-{
-    if (family && *family != "" && *family != "horizontal" && *family != "vertical")
-        throw std::invalid_argument("graph db: invalid packed track family");
-    refreshLineMeasurements(GraphDbImplAccess::conn(txn), impl_->options.author, impl_->hostname,
-        "tracks", uuid, length, family, family ? "track_measurements" : "track_length");
-}
-
-void GraphDb::setFiberLength(WriteTxn& txn, const std::string& uuid, double length)
-{
-    refreshLineMeasurements(GraphDbImplAccess::conn(txn), impl_->options.author, impl_->hostname,
-        "fibers", uuid, length, std::nullopt, "fiber_length");
-}
-
-std::optional<ObjectRecord> GraphDb::objectByUuid(const Txn& txn, const std::string& uuid) const
-{
-    sqlite3* db = GraphDbImplAccess::conn(txn);
-    Statement s(db, std::string("SELECT ") + kObjectCols + " FROM objects WHERE uuid=?");
-    s.bindBlob(1, parseUuid(uuid));
-    if (!s.row()) return std::nullopt;
-    return readObjectRow(db, s);
-}
-
-std::vector<ObjectRecord> GraphDb::objectsByKind(const Txn& txn, const std::string& kind,
-                                                 const std::optional<std::string>& approvalState) const
-{
-    sqlite3* db = GraphDbImplAccess::conn(txn);
-    std::string sql = std::string("SELECT ") + kObjectCols + " FROM objects WHERE kind=?";
-    if (approvalState) sql += " AND approval_state=?";
-    sql += " ORDER BY id";
-    Statement s(db, sql);
-    s.bind(1, kind);
-    if (approvalState) s.bind(2, *approvalState);
-    std::vector<ObjectRecord> out;
-    while (s.row()) out.push_back(readObjectRow(db, s));
-    return out;
-}
-
-int64_t GraphDb::objectCount(const Txn& txn, const std::string& kind) const
-{
-    Statement s(GraphDbImplAccess::conn(txn), "SELECT count(*) FROM objects WHERE kind=?");
-    s.bind(1, kind);
-    (void)s.row();
-    return s.i64(0);
-}
-
-std::vector<ObjectRecord> GraphDb::objectsByTag(const Txn& txn, const std::string& tag) const
-{
-    sqlite3* db = GraphDbImplAccess::conn(txn);
-    std::string cols = kObjectCols;
-    // Column names are ambiguous under the join only for id; qualify by selecting explicit object columns.
-    Statement s(db, "SELECT o.id,o.uuid,o.kind,o.name,o.generation,o.created_by,o.created_at,o.created_host,o.changed_by,o.changed_at,"
-                    "o.changed_host,o.approval_state,o.approved_by,o.approved_at,o.approved_host,o.approved_generation,o.format_version,"
-                    "o.storage_kind,o.storage_ref,o.data_generation,o.data_checksum,o.meta FROM objects o "
-                    "JOIN object_tags t ON t.object_id=o.id WHERE t.tag=? ORDER BY o.id");
-    (void)cols;
-    s.bind(1, tag);
-    std::vector<ObjectRecord> out;
-    while (s.row()) out.push_back(readObjectRow(db, s));
-    return out;
-}
-
-void GraphDb::deleteObject(WriteTxn& txn, const std::string& uuid)
-{
-    sqlite3* db = GraphDbImplAccess::conn(txn);
-    const auto bytes = parseUuid(uuid);
-    auto id = objectIdByUuid(db, bytes);
-    if (!id) throw std::runtime_error("graph db: object not found: " + uuid);
-    Statement s(db, "DELETE FROM objects WHERE id=?");  // FK RESTRICT on edges refuses while referenced
-    s.bind(1, *id);
-    s.stepDone();
-    appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "delete");
-}
-
 std::string GraphDb::addEdge(WriteTxn& txn, const EdgeRecord& record)
 {
-    return addEdgeImpl(GraphDbImplAccess::conn(txn), impl_->options.author, impl_->hostname, record, false);
+    return addEdgeImpl(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, record, false);
 }
 
 void GraphDb::updateEdge(WriteTxn& txn, const EdgeRecord& record)
 {
-    auto* db = GraphDbImplAccess::conn(txn);
+    auto* db = static_cast<sqlite3*>(connection(txn));
     const auto existing = edgeByUuid(txn, record.uuid);
     if (!existing) throw std::runtime_error("graph db: edge not found: " + record.uuid);
     auto rec = record;
@@ -1196,7 +55,7 @@ void GraphDb::updateEdge(WriteTxn& txn, const EdgeRecord& record)
 
 std::optional<EdgeRecord> GraphDb::edgeByUuid(const Txn& txn, const std::string& uuid) const
 {
-    sqlite3* db = GraphDbImplAccess::conn(txn);
+    sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE uuid=?");
     s.bindBlob(1, parseUuid(uuid));
     if (!s.row()) return std::nullopt;
@@ -1205,7 +64,7 @@ std::optional<EdgeRecord> GraphDb::edgeByUuid(const Txn& txn, const std::string&
 
 void GraphDb::removeEdge(WriteTxn& txn, const std::string& uuid)
 {
-    sqlite3* db = GraphDbImplAccess::conn(txn);
+    sqlite3* db = static_cast<sqlite3*>(connection(txn));
     const auto bytes = parseUuid(uuid);
     auto id = edgeIdByUuid(db, bytes);
     if (!id) throw std::runtime_error("graph db: edge not found: " + uuid);
@@ -1217,7 +76,7 @@ void GraphDb::removeEdge(WriteTxn& txn, const std::string& uuid)
 
 std::vector<EdgeRecord> GraphDb::edgesOf(const Txn& txn, const std::string& objectUuid) const
 {
-    sqlite3* db = GraphDbImplAccess::conn(txn);
+    sqlite3* db = static_cast<sqlite3*>(connection(txn));
     auto id = objectIdByUuid(db, parseUuid(objectUuid));
     if (!id) throw std::runtime_error("graph db: object not found: " + objectUuid);
     Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE a_id=? OR b_id=? ORDER BY id");
@@ -1230,7 +89,7 @@ std::vector<EdgeRecord> GraphDb::edgesOf(const Txn& txn, const std::string& obje
 
 std::vector<EdgeRecord> GraphDb::edgesByKind(const Txn& txn, const std::string& edgeKind) const
 {
-    sqlite3* db = GraphDbImplAccess::conn(txn);
+    sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE kind=? ORDER BY id");
     s.bind(1, edgeKind);
     std::vector<EdgeRecord> out;
@@ -1325,7 +184,7 @@ std::vector<std::string> GraphDb::componentOf(const Txn& txn, const std::string&
                                               const std::vector<std::string>& edgeKindFilter,
                                               const std::atomic_bool* cancel) const
 {
-    return traverse(GraphDbImplAccess::conn(txn), objectUuid, INT_MAX, edgeKindFilter, cancel);
+    return traverse(static_cast<sqlite3*>(connection(txn)), objectUuid, INT_MAX, edgeKindFilter, cancel);
 }
 
 std::vector<std::string> GraphDb::reachableWithin(const Txn& txn, const std::string& objectUuid, int maxDepth,
@@ -1333,232 +192,7 @@ std::vector<std::string> GraphDb::reachableWithin(const Txn& txn, const std::str
                                                   const std::atomic_bool* cancel) const
 {
     if (maxDepth < 0) throw std::runtime_error("graph db: maxDepth must be >= 0");
-    return traverse(GraphDbImplAccess::conn(txn), objectUuid, maxDepth, edgeKindFilter, cancel);
-}
-
-void GraphDb::setApproval(WriteTxn& txn, const std::string& recordUuid, const std::string& state)
-{
-    if (state == "approved" && edgeByUuid(txn, recordUuid) && edgeGeometryState(txn, recordUuid).stale)
-        throw std::runtime_error("graph db: revalidate edge geometry before approving a stale edge");
-    if (state != "pending" && state != "approved" && state != "rejected")
-        throw std::runtime_error("graph db: invalid approval state: " + state);
-    sqlite3* db = GraphDbImplAccess::conn(txn);
-    const auto bytes = parseUuid(recordUuid);
-    const char* table = nullptr;
-    int64_t id = 0;
-    int64_t generation = 0;
-    if (auto oid = objectIdByUuid(db, bytes)) {
-        table = "objects";
-        id = *oid;
-    } else if (auto eid = edgeIdByUuid(db, bytes)) {
-        table = "edges";
-        id = *eid;
-    } else {
-        throw std::runtime_error("graph db: record not found: " + recordUuid);
-    }
-    {
-        Statement cur(db, std::string("SELECT generation FROM ") + table + " WHERE id=?");
-        cur.bind(1, id);
-        (void)cur.row();
-        generation = cur.i64(0);
-    }
-    Statement s(db, std::string("UPDATE ") + table +
-                        " SET approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_generation=? WHERE id=?");
-    s.bind(1, state);
-    if (state == "pending") {
-        s.bindNull(2); s.bindNull(3); s.bindNull(4); s.bindNull(5);
-    } else {
-        s.bind(2, impl_->options.author);
-        s.bind(3, nowIsoUtc());
-        s.bind(4, impl_->hostname);
-        s.bind(5, generation);
-    }
-    s.bind(6, id);
-    s.stepDone();
-    appendJournal(db, impl_->options.author, impl_->hostname, bytes, generation, "approval");
-}
-
-namespace {
-
-void mutateMeta(sqlite3* db, const std::string& author, const std::string& host, const std::string& recordUuid,
-                const std::string& key, const std::optional<std::string>& jsonValue)
-{
-    if (key.empty()) throw std::runtime_error("graph db: meta key must be non-empty");
-    const auto bytes = parseUuid(recordUuid);
-    const char* table = nullptr;
-    int64_t id = 0;
-    if (auto oid = objectIdByUuid(db, bytes)) {
-        table = "objects";
-        id = *oid;
-    } else if (auto eid = edgeIdByUuid(db, bytes)) {
-        table = "edges";
-        id = *eid;
-    } else {
-        throw std::runtime_error("graph db: record not found: " + recordUuid);
-    }
-    if (jsonValue) {
-        Statement s(db, std::string("UPDATE ") + table + " SET meta=json_set(meta,?,json(?)) WHERE id=?");
-        s.bind(1, jsonPathForKey(key));
-        s.bind(2, *jsonValue);
-        s.bind(3, id);
-        s.stepDone();
-    } else {
-        Statement s(db, std::string("UPDATE ") + table + " SET meta=json_remove(meta,?) WHERE id=?");
-        s.bind(1, jsonPathForKey(key));
-        s.bind(2, id);
-        s.stepDone();
-    }
-    stampContentChange(db, author, host, table, id, bytes, "meta");
-}
-
-}  // namespace
-
-void GraphDb::setMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key, const std::string& jsonValue)
-{
-    mutateMeta(GraphDbImplAccess::conn(txn), impl_->options.author, impl_->hostname, recordUuid, key, jsonValue);
-}
-
-void GraphDb::removeMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key)
-{
-    mutateMeta(GraphDbImplAccess::conn(txn), impl_->options.author, impl_->hostname, recordUuid, key, std::nullopt);
-}
-
-std::vector<JournalEntry> GraphDb::journalSince(const Txn& txn, int64_t afterSeq) const
-{
-    sqlite3* db = GraphDbImplAccess::conn(txn);
-    Statement s(db, "SELECT seq,record_uuid,generation,author,hostname,timestamp,change_kind,"
-                    "approval_state,approved_by,approved_at,approved_host,approved_generation FROM journal WHERE seq>? ORDER BY seq");
-    s.bind(1, afterSeq);
-    std::vector<JournalEntry> out;
-    while (s.row()) {
-        JournalEntry e;
-        e.seq = s.i64(0);
-        e.recordUuid = formatUuid(s.blob16(1));
-        e.generation = s.i64(2);
-        e.author = s.text(3);
-        e.hostname = s.text(4);
-        e.timestamp = s.text(5);
-        e.changeKind = s.text(6);
-        e.approvalState = s.optText(7);
-        e.approvedBy = s.optText(8);
-        e.approvedAt = s.optText(9);
-        e.approvedHost = s.optText(10);
-        if (!s.isNull(11)) e.approvedGeneration = s.i64(11);
-        out.push_back(std::move(e));
-    }
-    return out;
-}
-
-std::optional<std::filesystem::path> GraphDb::resolveStoragePath(
-    const Txn& txn, const std::string& objectUuid,
-    const std::optional<std::filesystem::path>& datasetRoot) const
-{
-    namespace fs = std::filesystem;
-    const auto object = objectByUuid(txn, objectUuid);
-    if (!object || (object->storageKind != "file" && object->storageKind != "sqlite") ||
-        (object->kind != "patch" && object->kind != "fiber" && object->kind != "point_collection"))
-        return std::nullopt;
-
-    const bool patch = object->kind == "patch";
-    const auto uuid = parseUuid(object->uuid);
-    const auto matches = [&](const fs::path& candidate) {
-        const auto metadata = patch ? candidate / "meta.json" : candidate;
-        if (!patch && metadata.extension() != ".json")
-            return false;
-        std::ifstream input(metadata);
-        if (!input)
-            return false;
-        try {
-            const auto json = nlohmann::json::parse(input);
-            if (object->kind == "point_collection") {
-                if (!json.is_object() || json.value("vc_pointcollections_json_version", "") != "1" ||
-                    !json.contains("collections") || !json.at("collections").is_object()) return false;
-                for (const auto& collection : json.at("collections")) {
-                    const auto sourceUuid = collection.value("uuid", "");
-                    if (util::isUuid(sourceUuid) && parseUuid(sourceUuid) == uuid) return true;
-                }
-                return false;
-            }
-            if (!json.is_object() || !json.contains("uuid") || !json["uuid"].is_string())
-                return false;
-            if (!patch && !json.contains("control_points") && !json.contains("line_points"))
-                return false;
-            const auto sourceUuid = json["uuid"].get<std::string>();
-            return util::isUuid(sourceUuid) && parseUuid(sourceUuid) == uuid;
-        } catch (const nlohmann::json::exception&) {
-            return false;
-        }
-    };
-
-    const auto root = fs::absolute(datasetRoot.value_or(fs::absolute(impl_->path).parent_path())).lexically_normal();
-    if (!object->storageRef.empty() && object->storageRef.find("://") == std::string::npos) {
-        const auto hint = (root / object->storageRef).lexically_normal();
-        if (matches(hint))
-            return hint;
-    }
-    if (!fs::exists(root))
-        return std::nullopt;
-    // The caller may supply the patch directory itself as the search root.
-    if (patch && matches(root))
-        return root;
-
-    std::optional<fs::path> found;
-    for (fs::recursive_directory_iterator it(root), end; it != end; ++it) {
-        const auto& entry = *it;
-        fs::path candidate;
-        if (entry.is_directory()) {
-            const auto name = entry.path().filename().string();
-            if (name.front() == '.' || entry.path().extension() == ".zarr") {
-                it.disable_recursion_pending();
-                continue;
-            }
-            if (!fs::is_regular_file(entry.path() / "meta.json"))
-                continue;
-            // Patch geometry can be large; only its metadata is relevant.
-            it.disable_recursion_pending();
-            if (!patch)
-                continue;
-            candidate = entry.path();
-        } else {
-            if (patch || entry.path().filename() == "meta.json" || !entry.is_regular_file())
-                continue;
-            candidate = entry.path();
-        }
-        if (!matches(candidate))
-            continue;
-        if (found) {
-            // Multiple symlinks/hard links to the same object are harmless.
-            if (fs::equivalent(*found, candidate))
-                continue;
-            throw std::runtime_error("ambiguous storage for UUID " + object->uuid + ": " +
-                                     found->string() + " and " + candidate.string());
-        }
-        found = candidate;
-    }
-    return found;
-}
-
-std::vector<std::string> GraphDb::sweepExternalData(const Txn& txn) const
-{
-    sqlite3* db = GraphDbImplAccess::conn(txn);
-    std::vector<std::string> problems;
-    Statement s(db, "SELECT uuid,storage_ref,data_generation,generation FROM objects WHERE storage_ref<>'' AND storage_kind<>'sqlite' ORDER BY id");
-    const auto root = impl_->path.parent_path();
-    while (s.row()) {
-        const std::string uuid = formatUuid(s.blob16(0));
-        const std::string ref = s.text(1);
-        const int64_t dataGen = s.i64(2);
-        const int64_t gen = s.i64(3);
-        if (dataGen > gen)
-            problems.push_back(uuid + ": data_generation " + std::to_string(dataGen) + " ahead of generation " + std::to_string(gen));
-        // Dataset URIs (containing "://") are not local files to check.
-        if (ref.find("://") == std::string::npos) {
-            std::error_code ec;
-            if (!std::filesystem::exists(root / ref, ec))
-                problems.push_back(uuid + ": storage file missing: " + ref);
-        }
-    }
-    return problems;
+    return traverse(static_cast<sqlite3*>(connection(txn)), objectUuid, maxDepth, edgeKindFilter, cancel);
 }
 
 namespace {
@@ -1755,7 +389,7 @@ nlohmann::json edgeToJson(EdgeRecord e)
 std::string GraphDb::exportJson(const Txn& txn, const std::optional<std::string>& objectKind,
                                 const std::optional<std::string>& tag) const
 {
-    sqlite3* db = GraphDbImplAccess::conn(txn);
+    sqlite3* db = static_cast<sqlite3*>(connection(txn));
     nlohmann::json out;
     out["format"] = "vc_graph_export";
     out["version"] = 2;
@@ -1775,8 +409,8 @@ std::string GraphDb::exportJson(const Txn& txn, const std::optional<std::string>
     if (tag && objectKind)
         std::erase_if(objects, [&](const ObjectRecord& o) { return o.kind != *objectKind; });
     for (const auto& o : objects) {
-        if (currentGeometry(txn, o.uuid))
-            throw std::runtime_error("graph db: JSON export is metadata-only; use a SQLite backup to preserve geometry and revision history");
+        if (selectedObject(txn, o.uuid))
+            throw std::runtime_error("graph db: JSON export does not include object-store revision bindings; use a SQLite backup of the graph and retain its object stores");
         included.insert(o.uuid);
         out["objects"].push_back(objectToJson(o));
     }
@@ -1791,14 +425,13 @@ std::string GraphDb::exportJson(const Txn& txn, const std::optional<std::string>
 
 void GraphDb::importJson(WriteTxn& txn, const std::string& jsonText)
 {
-    sqlite3* db = GraphDbImplAccess::conn(txn);
+    sqlite3* db = static_cast<sqlite3*>(connection(txn));
     const auto root = nlohmann::json::parse(jsonText);
     if (root.value("format", "") != "vc_graph_export")
         throw std::runtime_error("graph db: not a vc_graph_export document");
-    const int version = root.value("version", 1);
-    if (version != 1 && version != 2)
+    const int version = root.value("version", 0);
+    if (version != 2)
         throw std::runtime_error("graph db: unsupported export version");
-    const bool snapshot = version == 2;
     // A failed import must not leave half a snapshot, even if the caller
     // catches the error and commits other work in its enclosing transaction.
     exec(db, "SAVEPOINT graph_import;");
@@ -1812,15 +445,14 @@ void GraphDb::importJson(WriteTxn& txn, const std::string& jsonText)
         for (const auto& j : root.at("objects")) {
             auto object = objectFromJson(j);
             checkIdentity(object.uuid);
-            if (snapshot) commonFromJson(j, object);
-            else object.dataGeneration = object.dataGeneration > 0 ? 1 : 0;
+            commonFromJson(j, object);
             if (edgeByUuid(txn, object.uuid))
                 throw std::runtime_error("graph db: snapshot UUID belongs to an edge: " + object.uuid);
             if (auto existing = objectByUuid(txn, object.uuid)) {
-                if (snapshot && objectToJson(*existing) == objectToJson(object)) continue;
+                if (objectToJson(*existing) == objectToJson(object)) continue;
                 throw std::runtime_error("graph db: snapshot conflicts with existing object: " + object.uuid);
             }
-            upsertObjectImpl(db, impl_->options.author, impl_->hostname, object, true, snapshot);
+            upsertObjectImpl(db, impl_->options.author, impl_->hostname, object, true, true);
         }
         for (const auto& j : root.at("edges")) {
             EdgeRecord e;
@@ -1834,14 +466,14 @@ void GraphDb::importJson(WriteTxn& txn, const std::string& jsonText)
             if (j.contains("tags")) e.tags = j.at("tags").get<std::vector<std::string>>();
             if (j.contains("meta")) e.meta = j.at("meta").dump();
             e.approvalState = j.value("approval_state", "pending");
-            if (snapshot) commonFromJson(j, e);
+            commonFromJson(j, e);
             if (objectByUuid(txn, e.uuid))
                 throw std::runtime_error("graph db: snapshot UUID belongs to an object: " + e.uuid);
             if (auto existing = edgeByUuid(txn, e.uuid)) {
-                if (snapshot && edgeToJson(*existing) == edgeToJson(e)) continue;
+                if (edgeToJson(*existing) == edgeToJson(e)) continue;
                 throw std::runtime_error("graph db: snapshot conflicts with existing edge: " + e.uuid);
             }
-            addEdgeImpl(db, impl_->options.author, impl_->hostname, e, true, snapshot);
+            addEdgeImpl(db, impl_->options.author, impl_->hostname, e, true, true);
         }
         exec(db, "RELEASE graph_import;");
     } catch (...) {
@@ -1946,7 +578,7 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
             report.problems.push_back(file.filename().string() + ": missing/invalid uuid, skipped");
             continue;
         }
-        if (db.currentGeometry(txn, uuid)) {
+        if (db.selectedObject(txn, uuid)) {
             report.problems.push_back(file.filename().string() +
                 ": geometry is database-owned; use ingestGeometrySource to publish a revision (legacy branch import skipped)");
             continue;
@@ -1969,9 +601,9 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
                 if (t.is_string()) o.tags.push_back(t.get<std::string>());
         FiberDetail f;
         try {
-            auto points = detail::fiberPoints(root, "line_points");
-            if (points.empty()) points = detail::fiberPoints(root, "control_points");
-            f.length = detail::fiberPolylineLength(points);
+            auto points = objects::detail::fiberPoints(root, "line_points");
+            if (points.empty()) points = objects::detail::fiberPoints(root, "control_points");
+            f.length = objects::detail::fiberPolylineLength(points);
         } catch (const std::exception& error) {
             report.problems.push_back(p.fileName + ": invalid fiber geometry: " + error.what());
             continue;
@@ -2030,8 +662,8 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
             refreshed.meta = existing->meta;
             refreshed.dataGeneration = existing->dataGeneration + 1;
             for (const auto& edge : db.edgesOf(txn, existing->uuid))
-                stampContentChange(GraphDbImplAccess::conn(txn), db.author(), db.hostname(), "edges",
-                    *edgeIdByUuid(GraphDbImplAccess::conn(txn), parseUuid(edge.uuid)), parseUuid(edge.uuid), "geometry_invalidated");
+                stampContentChange(RecordDbImplAccess::conn(txn), db.author(), db.hostname(), "edges",
+                    *edgeIdByUuid(RecordDbImplAccess::conn(txn), parseUuid(edge.uuid)), parseUuid(edge.uuid), "geometry_invalidated");
         }
         db.upsertObject(txn, refreshed);
         ++report.objectsImported;
@@ -2100,7 +732,7 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
             edge.aAnchor = b.local; edge.bAnchor = b.target;
             edge.meta = nlohmann::json{{"adjacent", b.adjacent}, {"source_import", "fiber-json"}}.dump();
             edge.approvalState = b.pending ? "pending" : "approved";
-            retainedBranches.insert(addEdgeImpl(GraphDbImplAccess::conn(txn), db.author(), db.hostname(), edge, true));
+            retainedBranches.insert(addEdgeImpl(RecordDbImplAccess::conn(txn), db.author(), db.hostname(), edge, true));
             ++report.edgesImported;
         }
     }
@@ -2235,7 +867,7 @@ ImportReport importTrackList(GraphDb& db, WriteTxn& txn, const std::filesystem::
         if (it != registered.end()) {
             const ObjectRecord& cur = it->second;
             o.name = cur.name; o.tags = cur.tags; o.meta = cur.meta;
-            if (db.currentGeometry(txn, cur.uuid)) {
+            if (db.selectedObject(txn, cur.uuid)) {
                 report.problems.push_back(label + ": geometry is database-owned; use ingestGeometrySource to publish a revision");
                 continue;
             }
@@ -2258,158 +890,10 @@ ImportReport importTrackList(GraphDb& db, WriteTxn& txn, const std::filesystem::
     return report;
 }
 
-namespace {
-std::optional<std::string> geometryHead(sqlite3* db, const std::string& objectUuid)
-{
-    Statement s(db, "SELECT revision_uuid FROM geometry_heads WHERE object_uuid=?");
-    s.bindBlob(1, parseUuid(objectUuid));
-    return s.row() ? std::optional(formatUuid(s.blob16(0))) : std::nullopt;
-}
-
-GeometryRevision readGeometryRevision(const Statement& s)
-{
-    GeometryRevision r;
-    r.uuid = formatUuid(s.blob16(0)); r.objectUuid = formatUuid(s.blob16(1));
-    if (!s.isNull(2)) r.parentUuid = formatUuid(s.blob16(2));
-    r.contentHash = s.text(3);
-    const auto text = s.text(4);
-    if (detail::geometryHash(std::span(reinterpret_cast<const uint8_t*>(text.data()), text.size())) != r.contentHash)
-        throw std::runtime_error("geometry: corrupt revision manifest");
-    const auto manifest = nlohmann::json::parse(text);
-    r.kind = manifest.at("kind"); r.formatVersion = manifest.at("format_version");
-    r.coordinateSystem = manifest.at("coordinate_system"); r.attributes = manifest.at("attributes").dump();
-    r.objectGeneration = s.i64(5); r.createdBy = s.text(6); r.createdAt = s.text(7); r.createdHost = s.text(8);
-    for (const auto& [name, a] : manifest.at("arrays").items())
-        r.arrays.push_back({name, a.at("dtype"), a.at("shape").get<std::vector<int64_t>>(), a.at("byte_length")});
-    return r;
-}
-constexpr const char* geometryColumns = "uuid,object_uuid,parent_uuid,content_hash,manifest,object_generation,created_by,created_at,created_host";
-}
-
-std::optional<GeometryRevision> GraphDb::geometryRevision(const Txn& txn, const std::string& revisionUuid) const
-{
-    if (txn.db_ != this) throw std::invalid_argument("geometry: transaction belongs to another database");
-    Statement s(GraphDbImplAccess::conn(txn), std::string("SELECT ") + geometryColumns + " FROM geometry_revisions WHERE uuid=?");
-    s.bindBlob(1, parseUuid(revisionUuid));
-    return s.row() ? std::optional(readGeometryRevision(s)) : std::nullopt;
-}
-
-std::optional<GeometryRevision> GraphDb::currentGeometry(const Txn& txn, const std::string& objectUuid) const
-{
-    if (txn.db_ != this) throw std::invalid_argument("geometry: transaction belongs to another database");
-    const auto head = geometryHead(GraphDbImplAccess::conn(txn), objectUuid);
-    return head ? geometryRevision(txn, *head) : std::nullopt;
-}
-
-std::vector<GeometryRevision> GraphDb::geometryHistory(const Txn& txn, const std::string& objectUuid) const
-{
-    if (txn.db_ != this) throw std::invalid_argument("geometry: transaction belongs to another database");
-    Statement s(GraphDbImplAccess::conn(txn), std::string("SELECT ") + geometryColumns + " FROM geometry_revisions WHERE object_uuid=? ORDER BY object_generation");
-    s.bindBlob(1, parseUuid(objectUuid));
-    std::vector<GeometryRevision> result;
-    while (s.row()) result.push_back(readGeometryRevision(s));
-    return result;
-}
-
-std::string GraphDb::putGeometry(WriteTxn& txn, const std::string& objectUuid, const GeometryData& data,
-    const std::optional<std::string>& expectedRevision)
-{
-    if (txn.db_ != this) throw std::invalid_argument("geometry: transaction belongs to another database");
-    auto* db = GraphDbImplAccess::conn(txn);
-    const auto object = objectByUuid(txn, objectUuid);
-    if (!object || object->kind != data.kind) throw std::invalid_argument("geometry: object missing or kind mismatch");
-    const auto current = currentGeometry(txn, objectUuid);
-    const auto expected = expectedRevision ? std::optional(formatUuid(parseUuid(*expectedRevision))) : std::nullopt;
-    if ((current ? std::optional(current->uuid) : std::nullopt) != expected)
-        throw std::runtime_error("geometry: current revision changed; reload before committing");
-    const auto manifest = detail::geometryManifest(data);
-    const auto manifestText = manifest.dump();
-    const auto contentHash = detail::geometryHash(std::span(reinterpret_cast<const uint8_t*>(manifestText.data()), manifestText.size()));
-    if (current && current->contentHash == contentHash) return current->uuid;
-
-    exec(db, "SAVEPOINT geometry_publish;");
-    try {
-        const auto revisionUuid = util::newUuid();
-        Statement revision(db, "INSERT INTO geometry_revisions VALUES(?,?,?,?,?,?,?,?,?)");
-        revision.bindBlob(1, parseUuid(revisionUuid)); revision.bindBlob(2, parseUuid(objectUuid));
-        if (current) revision.bindBlob(3, parseUuid(current->uuid)); else revision.bindNull(3);
-        revision.bind(4, contentHash); revision.bind(5, manifestText); revision.bind(6, object->generation + 1);
-        revision.bind(7, author()); revision.bind(8, nowIsoUtc()); revision.bind(9, hostname()); revision.stepDone();
-        Statement insert(db, "INSERT INTO geometry_chunks(hash,data) VALUES(?,?) ON CONFLICT(hash) DO NOTHING");
-        Statement verify(db, "SELECT data FROM geometry_chunks WHERE hash=?");
-        Statement reference(db, "INSERT INTO geometry_revision_chunks VALUES(?,?,?,?)");
-        for (const auto& array : data.arrays) {
-            size_t index = 0;
-            for (size_t offset = 0; offset < array.bytes.size(); offset += detail::geometryChunkSize, ++index) {
-                const auto bytes = std::span(array.bytes).subspan(offset, std::min(detail::geometryChunkSize, array.bytes.size() - offset));
-                const std::string hash = manifest.at("arrays").at(array.name).at("chunks").at(index);
-                insert.reset(); insert.bind(1, hash);
-                check(sqlite3_bind_blob64(insert.value, 2, bytes.data(), bytes.size(), SQLITE_STATIC), db, "bind geometry chunk");
-                insert.stepDone();
-                // Never silently reuse corrupt data, even on a hash collision.
-                verify.reset(); verify.bind(1, hash);
-                if (!verify.row() || sqlite3_column_bytes(verify.value, 0) != static_cast<int>(bytes.size()) ||
-                    std::memcmp(sqlite3_column_blob(verify.value, 0), bytes.data(), bytes.size()) != 0)
-                    throw std::runtime_error("geometry: corrupt or colliding payload hash");
-                reference.reset(); reference.bindBlob(1, parseUuid(revisionUuid)); reference.bind(2, array.name);
-                reference.bind(3, static_cast<int64_t>(index)); reference.bind(4, hash); reference.stepDone();
-            }
-        }
-        Statement head(db, "INSERT INTO geometry_heads VALUES(?,?) ON CONFLICT(object_uuid) DO UPDATE SET revision_uuid=excluded.revision_uuid");
-        head.bindBlob(1, parseUuid(objectUuid)); head.bindBlob(2, parseUuid(revisionUuid)); head.stepDone();
-        const auto id = *objectIdByUuid(db, parseUuid(objectUuid));
-        stampContentChange(db, author(), hostname(), "objects", id, parseUuid(objectUuid), "geometry");
-        Statement update(db, "UPDATE objects SET storage_kind='sqlite',data_generation=generation,data_checksum=? WHERE id=?");
-        update.bind(1, contentHash); update.bind(2, id); update.stepDone();
-        // Retain endpoint bindings: they now identify what old anchors refer to.
-        // Legacy edges have unknown bindings and become stale on first ingestion.
-        for (const auto& edge : edgesOf(txn, objectUuid))
-            stampContentChange(db, author(), hostname(), "edges", *edgeIdByUuid(db, parseUuid(edge.uuid)), parseUuid(edge.uuid), "geometry_invalidated");
-        exec(db, "RELEASE geometry_publish;");
-        return revisionUuid;
-    } catch (...) {
-        exec(db, "ROLLBACK TO geometry_publish; RELEASE geometry_publish;");
-        throw;
-    }
-}
-
-std::vector<uint8_t> GraphDb::readGeometryArray(const Txn& txn, const std::string& revisionUuid,
-    const std::string& arrayName, int64_t byteOffset, const std::optional<int64_t>& byteCount) const
-{
-    const auto revision = geometryRevision(txn, revisionUuid);
-    if (!revision) throw std::invalid_argument("geometry: revision not found");
-    const auto array = std::find_if(revision->arrays.begin(), revision->arrays.end(), [&](const auto& a) { return a.name == arrayName; });
-    if (array == revision->arrays.end()) throw std::invalid_argument("geometry: array not found: " + arrayName);
-    if (byteOffset < 0 || byteOffset > array->byteLength) throw std::out_of_range("geometry: invalid byte offset");
-    const auto count = byteCount.value_or(array->byteLength - byteOffset);
-    if (count < 0 || count > array->byteLength - byteOffset) throw std::out_of_range("geometry: invalid byte count");
-    std::vector<uint8_t> result(static_cast<size_t>(count));
-    if (!count) return result;
-    auto* db = GraphDbImplAccess::conn(txn);
-    Statement manifestQuery(db, "SELECT manifest FROM geometry_revisions WHERE uuid=?");
-    manifestQuery.bindBlob(1, parseUuid(revisionUuid)); (void)manifestQuery.row();
-    const auto hashes = nlohmann::json::parse(manifestQuery.text(0)).at("arrays").at(arrayName).at("chunks");
-    const auto first = byteOffset / detail::geometryChunkSize, last = (byteOffset + count - 1) / detail::geometryChunkSize;
-    Statement chunk(db, "SELECT c.data,r.hash FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "
-        "WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?");
-    for (auto i = first; i <= last; ++i) {
-        chunk.reset(); chunk.bindBlob(1, parseUuid(revisionUuid)); chunk.bind(2, arrayName); chunk.bind(3, static_cast<int64_t>(i));
-        if (!chunk.row()) throw std::runtime_error("geometry: missing payload chunk");
-        const auto bytes = std::span(static_cast<const uint8_t*>(sqlite3_column_blob(chunk.value, 0)), static_cast<size_t>(sqlite3_column_bytes(chunk.value, 0)));
-        const auto base = static_cast<int64_t>(i * detail::geometryChunkSize);
-        if (static_cast<int64_t>(bytes.size()) != std::min<int64_t>(detail::geometryChunkSize, array->byteLength - base) ||
-            chunk.text(1) != hashes.at(i).get<std::string>() || detail::geometryHash(bytes) != chunk.text(1))
-            throw std::runtime_error("geometry: corrupt payload chunk");
-        const auto begin = std::max(base, byteOffset), end = std::min(base + static_cast<int64_t>(bytes.size()), byteOffset + count);
-        std::memcpy(result.data() + begin - byteOffset, bytes.data() + begin - base, static_cast<size_t>(end - begin));
-    }
-    return result;
-}
-
 EdgeGeometryState GraphDb::edgeGeometryState(const Txn& txn, const std::string& edgeUuid) const
 {
-    if (txn.db_ != this) throw std::invalid_argument("geometry: transaction belongs to another database");
-    auto* db = GraphDbImplAccess::conn(txn);
+    (void)connection(txn);
+    auto* db = static_cast<sqlite3*>(connection(txn));
     const auto edge = edgeByUuid(txn, edgeUuid);
     if (!edge) throw std::invalid_argument("geometry: edge not found");
     Statement binding(db, "SELECT b.a_revision,b.b_revision FROM edge_geometry_bindings b JOIN edges e ON e.id=b.edge_id WHERE e.uuid=?");
@@ -2427,7 +911,7 @@ void GraphDb::revalidateEdgeGeometry(WriteTxn& txn, const std::string& edgeUuid)
 {
     const auto state = edgeGeometryState(txn, edgeUuid);
     if (!state.stale) return;
-    auto* db = GraphDbImplAccess::conn(txn);
+    auto* db = static_cast<sqlite3*>(connection(txn));
     const auto edge = *edgeByUuid(txn, edgeUuid);
     const auto id = *edgeIdByUuid(db, parseUuid(edgeUuid));
     exec(db, "SAVEPOINT geometry_revalidate;");
@@ -2446,9 +930,5 @@ void GraphDb::revalidateEdgeGeometry(WriteTxn& txn, const std::string& edgeUuid)
     }
 }
 
-}  // namespace vc::graph
 
-
-
-
-
+} // namespace vc::graph

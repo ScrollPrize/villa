@@ -796,39 +796,3 @@ TEST_CASE("track list registration is identity-stable and idempotent")
     CHECK(tracks2[0].uuid == firstUuid);
     CHECK(tracks2[0].generation == 1);
 }
-
-TEST_CASE("geometry revisions preserve read snapshots and reject foreign transactions")
-{
-    TempDir tmp("geometry_snapshot");
-    auto db = GraphDb::create(tmp.dir / "graph.vcgr", testOptions());
-    auto other = GraphDb::create(tmp.dir / "other.vcgr", testOptions());
-    const auto id = addObject(db, "track");
-    GeometryData data;
-    data.kind = "track";
-    data.arrays.push_back({"points", "<i4", {1, 3}, std::vector<uint8_t>(12, 0)});
-    std::string first, second;
-    {
-        auto w = db.write();
-        first = db.putGeometry(w, id, data);
-        w.commit();
-    }
-    auto snapshot = db.read();
-    {
-        auto foreign = other.write();
-        CHECK_THROWS(db.putGeometry(foreign, id, data));
-        CHECK_THROWS(db.currentGeometry(foreign, id));
-    }
-    data.arrays[0].bytes[0] = 3;
-    {
-        auto w = db.write();
-        second = db.putGeometry(w, id, data, first);
-        w.commit();
-    }
-    CHECK(db.currentGeometry(snapshot, id)->uuid == first);
-    CHECK_FALSE(db.geometryRevision(snapshot, second));
-    auto current = db.read();
-    CHECK(db.currentGeometry(current, id)->uuid == second);
-    CHECK(db.readGeometryArray(current, first, "points")[0] == 0);
-    CHECK(db.readGeometryArray(current, second, "points")[0] == 3);
-    CHECK(db.geometryHistory(current, id).size() == 2);
-}

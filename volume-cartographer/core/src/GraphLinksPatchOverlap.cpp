@@ -10,7 +10,7 @@
 // commitCandidates(); no merged geometry is produced here.
 
 #include "vc/core/graph_links/GraphLinks.hpp"
-#include "GraphPatchInput.hpp"
+#include "ObjectPatchInput.hpp"
 
 #include <algorithm>
 #include <array>
@@ -165,7 +165,7 @@ std::optional<LoadedPatch> loadPatch(const std::filesystem::path& dir, const Pat
     LoadedPatch patch;
     patch.path = dir;
     try {
-        graph::detail::validatePatchFiles(dir);
+        objects::detail::validatePatchFiles(dir);
         patch.surface = std::make_shared<QuadSurface>(dir);
         patch.uuid = patch.surface->objectUuid();
         if (!vc::util::isUuid(patch.uuid)) {

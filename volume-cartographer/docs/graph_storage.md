@@ -1,8 +1,12 @@
 # Graph object identity and storage
 
-Schema v3 also supports [managed geometry inside SQLite](graph_geometry.md),
-including immutable revisions, chunked binary arrays, and source ingestion.
-The external-file behavior below describes metadata-only objects and the
+Geometry is owned by an independent [ObjectStore](object_storage.md).
+Graphs select committed object revisions explicitly and store relationships and
+graph-local annotations. Object storage can be used without a graph, and graph
+topology can be queried without opening the store. There is no legacy-schema
+migration: earlier WIP databases must be recreated.
+
+The external-file behavior below applies to unbound graph registrations and
 source-location hints retained for re-ingestion.
 
 The graph identifies objects by UUID. Patch import preserves the UUID in
@@ -61,16 +65,14 @@ metadata, tags, detail fields and storage references. Import restores these
 fields exactly. Importing identical existing records is a no-op; a conflicting
 UUID rejects the whole import, without overwriting local changes. The import
 uses a savepoint, so a caller can catch a conflict without committing a partial
-snapshot. Unknown export versions are rejected.
+snapshot. Unknown export versions are rejected. Selections containing bound
+object-store memberships are refused; use a graph database backup to preserve
+revision selections and endpoint bindings.
 
 Each imported record receives a local journal entry attributed to the importer;
 its original authors remain on the record. A snapshot contains current records,
 not the source journal or external geometry, and is not a distributed merge or
 a complete database backup. Use a database copy after checkpointing for history.
-
-Legacy version 1 exports remain readable into fresh identities. Their missing
-provenance cannot be recovered: records start at generation 1, positive
-`data_generation` values become 1, and approval stamps remain unknown.
 
 The journal now captures approval state, reviewer, time, host and reviewed
 generation after each record mutation. Approval decisions remain visible after
@@ -79,26 +81,11 @@ missing track families count as content edits: generation increases, change
 stamps update, and approval returns to pending. Identical measurements do not
 write a journal entry or invalidate approval.
 
-## Schema migration and patch scale
-
-Schema v1 databases migrate to v2 atomically on a writable open:
-
-```python
-with GraphDb.open("/data/graph.vcgr", author="reviewer"):
-    pass
-```
-
-Read-only opens never migrate and report when a writable open is needed first.
-Older binaries cannot open the migrated database for writing. Historical v1
-journal entries have null approval snapshot fields because the old decisions
-were not stored. Migration adds `migration_snapshot` entries preserving the
-current approval of every surviving record; it does not invent past decisions.
+## Patch scale
 
 Patch `scale` is now a two-element array in JSON, a pair in Python, and
 `std::array<double, 2>` in C++, matching the column/row values written by
-QuadSurface. Both axes survive import, export and linking. Legacy scalar input
-is accepted as isotropic; migration copies the stored scalar to both axes.
-Anisotropy previously discarded by v1 cannot be recovered from the database.
+QuadSurface. Both axes survive import, export and linking. Scalar source input is accepted as isotropic.
 Patch import also reads the nested bounding box in `meta.json`; malformed scale
 or bounding-box fields are reported and that patch is skipped.
 
@@ -107,9 +94,9 @@ or bounding-box fields are reported and that patch is skipped.
 Legacy file import seeds object names, tags, and metadata on first registration.
 Subsequent fiber/track imports preserve those database-owned annotations and
 refresh only source descriptors and measurements. A changed legacy fiber file
-invalidates connected-link approvals. Once an object has stored geometry,
-legacy import refuses to refresh it from external files; use geometry ingestion
-to publish a new revision instead. Stored geometry remains authoritative.
+invalidates connected-link approvals. Once a graph object selects stored geometry,
+file import refuses to refresh it from external files. Use ObjectStore ingestion
+to publish a revision and explicit graph adoption to change the selection.
 
 Newly imported fiber branches carry `meta.source_import="fiber-json"`. Re-import
 refreshes their anchors while preserving UUIDs and graph annotations, resets
@@ -127,8 +114,8 @@ newly created and skipped edges. Patch-overlap stale deletion is limited to
 pairs whose patches both loaded successfully, including when a run finds no
 candidates. Damaged TIFFs and interrupted saves are excluded from that scope.
 
-Stored-geometry publication already resets connected-link approvals and leaves
-revision bindings stale. Refreshing edge content does not assert that an external
+Adopting an object revision in a graph resets connected-link approvals and leaves
+revision bindings stale. ObjectStore publication alone does not change graphs. Refreshing edge content does not assert that an external
 file detector ran against the stored revision: explicit geometry revalidation
 is still required before approving stale links.
 

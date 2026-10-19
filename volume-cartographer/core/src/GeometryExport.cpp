@@ -1,7 +1,7 @@
-#include "vc/core/graph/GeometryExport.hpp"
+#include "vc/core/objects/GeometryExport.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Uuid.hpp"
-#include "GraphTrackInput.hpp"
+#include "ObjectTrackInput.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <bit>
@@ -21,7 +21,7 @@
 #include <linux/fs.h>
 #endif
 
-namespace vc::graph {
+namespace vc::objects {
 namespace {
 namespace fs = std::filesystem;
 using Json = nlohmann::json;
@@ -207,7 +207,7 @@ void publish(const fs::path& source, const fs::path& destination, bool overwrite
 }
 } // namespace
 
-std::string exportGeometry(GraphDb& db, const std::string& objectUuid, const fs::path& destination,
+std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const fs::path& destination,
     const std::optional<std::string>& revisionUuid, bool overwrite)
 {
     if (destination.empty()) throw std::invalid_argument("export destination is empty");
@@ -258,4 +258,4 @@ std::string exportGeometry(GraphDb& db, const std::string& objectUuid, const fs:
     publish(output, dest, overwrite, directory);
     return snapshot.revision.uuid;
 }
-} // namespace vc::graph
+} // namespace vc::objects

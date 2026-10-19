@@ -1,4 +1,4 @@
-#include "vc/core/graph/GeometryExport.hpp"
+#include "vc/core/objects/GeometryExport.hpp"
 #include <iostream>
 
 int main(int argc, char** argv)
@@ -19,23 +19,23 @@ try {
         else if (arg == "--output") destination = next();
         else if (arg == "--overwrite") overwrite = true;
         else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: vc_graph_export --db graph.vcgr --uuid UUID --output PATH [options]\n"
+            std::cout << "Usage: vc_object_export --db objects.vcobj --uuid UUID --output PATH [options]\n"
                 "  --revision UUID  export a historical revision (default: current)\n"
                 "  --overwrite      replace the entire destination atomically\n"
                 "Exports one patch directory, fiber JSON, single-collection JSON, or\n"
                 "single-track packed directory. The output parent must already exist.\n"
-                "The graph opens read-only; original source files are not needed.\n";
+                "The object store opens read-only; original source files are not needed.\n";
             return 0;
         } else throw std::runtime_error("unknown argument: " + arg);
     }
     if (path.empty() || object.empty() || destination.empty())
         throw std::runtime_error("specify --db, --uuid and --output; see --help");
-    vc::graph::OpenOptions options; options.readOnly = true;
-    auto db = vc::graph::GraphDb::open(path, options);
-    const auto exported = vc::graph::exportGeometry(db, object, destination, revision, overwrite);
+    vc::objects::OpenOptions options; options.readOnly = true;
+    auto db = vc::objects::ObjectStore::open(path, options);
+    const auto exported = vc::objects::exportGeometry(db, object, destination, revision, overwrite);
     std::cout << "Exported revision " << exported << " to " << destination << '\n';
     return 0;
 } catch (const std::exception& error) {
-    std::cerr << "vc_graph_export: " << error.what() << '\n';
+    std::cerr << "vc_object_export: " << error.what() << '\n';
     return 1;
 }

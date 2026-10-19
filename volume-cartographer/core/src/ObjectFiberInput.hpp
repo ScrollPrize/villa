@@ -5,7 +5,7 @@
 #include <vector>
 #include <nlohmann/json.hpp>
 
-namespace vc::graph::detail {
+namespace vc::objects::detail {
 // Shared by fiber registration and patch linking; retain the original point order.
 inline std::vector<std::array<double, 3>> fiberPoints(const nlohmann::json& root, const char* key)
 {
@@ -41,4 +41,4 @@ inline double fiberPolylineLength(const std::vector<std::array<double, 3>>& poin
     if (!std::isfinite(length)) throw std::runtime_error("non-finite fiber length");
     return length;
 }
-} // namespace vc::graph::detail
+} // namespace vc::objects::detail

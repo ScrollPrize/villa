@@ -1,4 +1,4 @@
-#include "vc/core/graph/GeometryIngest.hpp"
+#include "vc/core/objects/GeometryIngest.hpp"
 #include "vc/core/util/TerminalProgress.hpp"
 #include <iostream>
 
@@ -27,7 +27,7 @@ try {
         else if (arg == "--tracks") sources.emplace_back("track", next());
         else if (arg == "--no-progress") showProgress = false;
         else if (arg == "--help" || arg == "-h") {
-            std::cout << "Usage: vc_graph_ingest --db graph.vcgr --author NAME [options]\n"
+            std::cout << "Usage: vc_object_ingest --db objects.vcobj --author NAME [options]\n"
                 "  --registered              ingest all registered linkable objects\n"
                 "  --uuid UUID               ingest selected registered objects (repeatable)\n"
                 "  --dataset-root DIR        resolve registered source paths relative to DIR\n"
@@ -37,34 +37,34 @@ try {
                 "  --tracks PATH             ingest/register packed tracks (or DBM with packed mirror)\n"
                 "  --no-progress             suppress progress display\n"
                 "Each object commits atomically. Failures are reported and exit status is nonzero.\n"
-                "Source flags are repeatable. Existing identities, tags and links are retained;\n"
-                "new geometry revisions reset object/edge approval and mark old links stale.\n";
+                "Source flags are repeatable. Existing identities, tags and metadata are retained;\n"
+                "new geometry revisions reset object approval; graphs adopt revisions explicitly.\n";
             return 0;
         } else throw std::runtime_error("unknown argument: " + arg);
     }
     if (path.empty() || author.empty() || (!registered && sources.empty()))
         throw std::runtime_error("specify --db, --author and --registered/--uuid or source flags; see --help");
-    vc::graph::OpenOptions options; options.author = author;
-    auto db = std::filesystem::exists(path) ? vc::graph::GraphDb::open(path, options) : vc::graph::GraphDb::create(path, options);
+    vc::objects::OpenOptions options; options.author = author;
+    auto db = std::filesystem::exists(path) ? vc::objects::ObjectStore::open(path, options) : vc::objects::ObjectStore::create(path, options);
     bool failed = false;
-    auto print = [&](const vc::graph::GeometryIngestReport& report) {
+    auto print = [&](const vc::objects::GeometryIngestReport& report) {
         std::cout << report.ingested << " ingested, " << report.unchanged << " unchanged, " << report.problems.size() << " problems\n";
         for (const auto& problem : report.problems) std::cerr << problem << '\n';
         failed |= !report.problems.empty();
     };
     for (const auto& [kind, source] : sources) {
         vc::util::TerminalProgress progress("Ingest " + kind, showProgress);
-        const auto report = vc::graph::ingestGeometrySource(db, kind, source, progress.callback());
+        const auto report = vc::objects::ingestGeometrySource(db, kind, source, progress.callback());
         progress.finish(); print(report);
     }
     if (registered) {
         vc::util::TerminalProgress progress("Ingest registered geometry", showProgress);
-        const auto report = vc::graph::ingestRegisteredGeometry(db, root, uuids, progress.callback());
+        const auto report = vc::objects::ingestRegisteredGeometry(db, root, uuids, progress.callback());
         progress.finish(); print(report);
     }
     db.checkpoint();
     return failed ? 1 : 0;
 } catch (const std::exception& error) {
-    std::cerr << "vc_graph_ingest: " << error.what() << '\n';
+    std::cerr << "vc_object_ingest: " << error.what() << '\n';
     return 1;
 }
