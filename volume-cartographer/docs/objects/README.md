@@ -4,11 +4,7 @@
 single SQLite file. Ingest native data, discover relationships from stored
 geometry, then query, annotate, export, or synchronize using that same handle.
 
-[Storage and synchronization API](../object_storage.md) ·
-[Link detector reference](../object_links.md)
-
-The [query APIs](../object_storage.md#consumer-queries-and-store-backed-graph-reads)
-provide bounded pages, graph views, and packed geometry arrays for resident
+The query APIs provide bounded pages, graph views, and packed geometry arrays for resident
 working data. Existing application consumers remain separate from the store.
 
 ## Build and command line
@@ -58,7 +54,7 @@ geometry bindings. Source paths are ingestion hints; UUIDs identify records.
 Geometry-backed endpoints declare their exact point dependencies. Changing a
 referenced point requires an explicit retain/update/remove decision for each affected
 relationship in `put_geometry(..., edge_edits=[...])`. Unrelated point edits leave
-relationships untouched. See the [edit contract](../object_storage.md#point-relationships-and-geometry-edits).
+relationships untouched.
 
 ## C++
 
@@ -90,6 +86,4 @@ const auto metadata = store.exportJson(read, exportOptions);
 Use a write transaction to commit metadata and geometry together. Each read
 transaction sees a consistent snapshot. For independent copies, establish a
 shared baseline with `synchronize` before editing, then review conflicting
-records and choose a side explicitly. See the
-[synchronization contract](../object_storage.md#two-store-three-way-synchronization)
-for geometry transfer and interruption recovery.
+records and choose a side explicitly.
