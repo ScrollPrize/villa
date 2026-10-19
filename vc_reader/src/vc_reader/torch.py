@@ -58,6 +58,24 @@ def _seeds(values, count):
     return result
 
 
+def _params(params, count):
+    if params is None:
+        return {}
+    if not isinstance(params, Mapping):
+        raise TypeError("params must map parameter names to CPU scalar sequences")
+    result = {}
+    for name, values in params.items():
+        if not isinstance(name, str):
+            raise TypeError("parameter names must be strings")
+        if isinstance(values, DeviceArray) or (isinstance(values, torch.Tensor) and values.device.type != "cpu"):
+            raise ValueError("parameters must be on CPU")
+        values = np.asarray(values)
+        if values.shape != (count,):
+            raise ValueError(f"parameter {name} needs one value per sample")
+        result[name] = values.tolist()
+    return result
+
+
 def _device(device, targets):
     resident = []
     for value in targets.values():
@@ -109,9 +127,10 @@ class _PendingBatch:
         self.inputs = self.owner = self.outputs = self.result = self.event = None
 
 
-def _submit(pipeline, batch, seeds, device=None, stream=None):
+def _submit(pipeline, batch, seeds, device=None, stream=None, params=None):
     targets, count = _targets(pipeline, batch)
     seeds = _seeds(seeds, count)
+    params = _params(params, count)
     device = _device(device, targets)
     stream = stream if stream is not None else torch.cuda.current_stream(device)
     stream.wait_stream(torch.cuda.current_stream(device))
@@ -143,7 +162,7 @@ def _submit(pipeline, batch, seeds, device=None, stream=None):
                     raise TypeError(f"{key}: continuous targets require uint8, float32 or float64")
                 arrays[key] = value.contiguous()
             outputs, _, owner = pipeline._native.run_batch(
-                arrays, seeds, {}, False, True, {}, allocator=allocate, stream=stream.cuda_stream)
+                arrays, seeds, params, False, True, {}, allocator=allocate, stream=stream.cuda_stream)
             event = stream.record_event()
         result = {k: v for k, v in batch.items() if k not in targets}
         result.update(outputs)
@@ -155,8 +174,8 @@ def _submit(pipeline, batch, seeds, device=None, stream=None):
         raise
 
 
-def _batch(pipeline, batch, *, seeds, device=None):
-    pending = _submit(pipeline, batch, seeds, device)
+def _batch(pipeline, batch, *, seeds, device=None, params=None):
+    pending = _submit(pipeline, batch, seeds, device, params=params)
     try:
         return pending.wait()
     finally:

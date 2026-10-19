@@ -1,4 +1,5 @@
 #include "resident.cuh"
+#include "../../cuda_buffer.hpp"
 namespace vcr::augment::cuda {
 Session::Session(const Sample& s) {
     for (const auto& [key,f] : s) {
@@ -14,25 +15,47 @@ int* Session::check_flags() {
     }
     return checks->ptr;
 }
+static void validate_status(int checks, int nonfinite, int geometry) {
+    require(!(checks&1),"nonfinite input; use a validity mask for missing data");
+    require(!(checks&2),"validity masks must contain only zero or one");
+    require(!(checks&8),"value-based label transforms require integer IDs within +/- (2**53 - 1)");
+    require(!(checks&16),"value is not representable in target dtype");
+    require(!(checks&4),"values too large for float32 filtering without the float64 fallback; use sync=True");
+    require(!nonfinite,"normalization requires finite crop values");
+    require(!(geometry&2),"point outside output");
+    require(!(geometry&1),"deformation inverse failed to converge for a point; reduce deformation strength");
+    require(!(geometry&4),"singular spatial transform");
+}
 void Session::check_status() {
-    if (checks) {
-        int flags = 0; checks->download(&flags);
-        require(!(flags&1),"nonfinite input; use a validity mask for missing data");
-        require(!(flags&2),"validity masks must contain only zero or one");
-        require(!(flags&8),"value-based label transforms require integer IDs within +/- (2**53 - 1)");
-        require(!(flags&16),"value is not representable in target dtype");
-        require(!(flags&4),"values too large for float32 filtering without the float64 fallback; use sync=True");
+    int a=0,b=0,c=0;
+    if (checks) checks->download(&a);
+    if (nonfinite) nonfinite->download(&b);
+    if (geometry) geometry->download(&c);
+    validate_status(a,b,c);
+}
+void check_devices(const std::vector<std::shared_ptr<void>>& contexts) {
+    // Only status scalars cross to the host. Queue every sample's checks before
+    // waiting, so batch size does not multiply stream synchronizations.
+    thread_local vcr::device::PinnedBuffer staging;
+    staging.reserve(contexts.size()*3*sizeof(int));
+    auto* flags=reinterpret_cast<int*>(staging.data());
+    std::fill_n(flags,contexts.size()*3,0);
+    bool pending=false;
+    try {
+        for (std::size_t i=0;i<contexts.size();++i) {
+            auto& s=*static_cast<Session*>(contexts[i].get());
+            const Buffer<int>* buffers[]={s.checks.get(),s.nonfinite.get(),s.geometry.get()};
+            for (int j=0;j<3;++j) if (buffers[j]) {
+                check(cudaMemcpyAsync(flags+3*i+j,buffers[j]->ptr,sizeof(int),cudaMemcpyDeviceToHost,vcr::device::stream()));
+                pending=true;
+            }
+        }
+        if (pending) check(cudaStreamSynchronize(vcr::device::stream()));
+    } catch (...) {
+        cudaStreamSynchronize(vcr::device::stream());
+        throw;
     }
-    if (nonfinite) {
-        int invalid = 0; nonfinite->download(&invalid);
-        require(!invalid,"normalization requires finite crop values");
-    }
-    if (geometry) {
-        int flags = 0; geometry->download(&flags);
-        require(!(flags&2),"point outside output");
-        require(!(flags&1),"deformation inverse failed to converge for a point; reduce deformation strength");
-        require(!(flags&4),"singular spatial transform");
-    }
+    for (std::size_t i=0;i<contexts.size();++i) validate_status(flags[3*i],flags[3*i+1],flags[3*i+2]);
 }
 int* Session::geometry_status() {
     if (!geometry) {

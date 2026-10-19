@@ -172,5 +172,25 @@ For changing augmentation seeds, supply caller-selected occurrence seeds or use
 CudaLoader's `seed` plus `set_epoch()` instead of `seed_key`. Sampler, distributed
 rank and region choices remain caller responsibilities.
 
+For caller-selected augmentation values, construct the pipeline once with named
+parameters and supply a CPU scalar sequence for each batch. Each row retains
+its own seed and parameters; image arrays stay on CUDA:
+
+```python
+pipeline = A.Pipeline([
+    A.Contrast(factor=A.Param("contrast"), preserve_range=False),
+    A.GaussianNoise(std=A.Param("noise")),
+], targets={"image": A.Image()}, backend="cuda")
+output = pipeline.batch({"image": cuda_images}, seeds=[11, 12],
+                        params={"contrast": [0.8, 1.2], "noise": [0.0, 0.1]})
+```
+
+`Param` works wherever a transform accepts a scalar distribution. For a single
+CPU or CUDA sample, pass scalar values with `pipeline(sample, seed=11,
+params={"contrast": 0.8, "noise": 0.0})`. Recorded replay plans retain the
+resolved values. Batch submission uses the shared native executor for every
+CUDA transform; it still launches kernels per sample, rather than fusing them
+across the batch. Deferred status flags are downloaded together at completion.
+
 See [acceptance and measurements](training-workflow-benchmarks.md) for independent
 comparisons, exact commands, measured overhead and outstanding real fixtures.

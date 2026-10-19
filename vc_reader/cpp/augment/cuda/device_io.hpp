@@ -9,6 +9,8 @@ std::map<std::string,std::vector<DeviceInput>> device_pyramids(void*);
 void export_outputs(void*);
 // Raises deferred device checks; the caller first ensures completion.
 void check_device(void*);
+// Download all sessions' status flags with one stream synchronization.
+void check_devices(const std::vector<std::shared_ptr<void>>&);
 // Frees (stream-ordered) a session's arrays once copied elsewhere.
 void release_outputs(void*, const std::vector<std::string>& keys);
 void finish_device(void*);

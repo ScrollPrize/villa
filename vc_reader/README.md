@@ -89,6 +89,51 @@ reading, CUDA augmentation, and mesh-segment rendering.
 | DataLoader integration and worker lifecycle | [Training workflows](docs/training-workflows.md) |
 | Measurements and reproduction commands | [Benchmarks](benchmarks/README.md) |
 
+## CT sheet normals
+
+`vc_reader.sheet_normal` implements the anisotropic structure tensor used for
+fiber-strip linking on `graph-unification` (commit
+`cd0ee74e3a4f8dd7f3b4884b01c7e411fc49ee6e`). Both CPU and CUDA use recipe
+`ct-anisotropic-1-24-4-grid3-r48-v4`: full-resolution Gaussian derivatives,
+a global three-voxel sampling lattice, radius 48, and three anisotropic
+refinements with tangent sigma 24 and normal sigma 4.
+
+```python
+import numpy as np
+from vc_reader.reader import ZarrReader
+from vc_reader.sheet_normal import sample_sheet_normals
+
+reader = ZarrReader.open("/path/to/ct.zarr", level=0)
+points_xyz = np.array([[1000.25, 1200.5, 3000.0]])  # native CT voxel coordinates
+cpu = sample_sheet_normals(reader, points_xyz)    # NumPy (B, 4)
+gpu = sample_sheet_normals(reader.cuda(cache_bytes=256 << 20), points_xyz)
+# gpu is a DeviceArray: torch.from_dlpack(gpu) shares its CUDA storage.
+```
+
+Columns are unsigned unit normal X/Y/Z and relative principal eigengap.
+Insufficient volume support, flat CT, and ambiguous principal axes return a
+zero row. The complete 109³ context must lie within the volume. H/V headings
+can be derived by crossing world Z with the normal (H), or projecting world Z
+onto the sheet (V), then normalizing and choosing the sign from a prior heading.
+Those headings are ambiguous when the sheet normal is parallel to world Z.
+
+CUDA reads use `source="chunks"`; patches, gradients, median selection,
+tensor integration and eigensolves stay on device. Only query metadata is
+uploaded. There is no Torch dependency or implicit result download. For
+existing patches, `sheet_normals(patches, offsets_xyz)` accepts contiguous
+`(B,109,109,109)` uint8 or float32 CT in the raw [0,255] range. Patch origins
+are `floor(query / 3) * 3 - 54`; offsets are `query - floor(query / 3) * 3`
+in XYZ order. Arrays use BZYX order. See the function docstrings for validity
+masks and synchronization when sharing CUDA inputs.
+
+Group large requests into batches of 4–32 queries to bound temporary memory
+(CUDA supports at most 128 per call). Filters and images use float32; only
+the small tensor reductions/eigensystems use float64 to resolve the 1e-6
+eigengap threshold. CPU execution releases the GIL and can run in DataLoader
+workers; create CUDA readers in the process owning the GPU. Chunk caches
+are bounded by the reader's cache budget; gradient fields are computed per
+request, without a separate persistent gradient cache.
+
 ## Augmentations
 
 Image augmentations and normalization support channel-first **2D `(C, Y, X)`
@@ -503,6 +548,8 @@ A.Gamma(gamma=0.8)
 <summary><strong>GaussianBlur</strong></summary>
 
 Smooth the volume with a separable 3D Gaussian filter.
+
+`full_width=False, truncate=4` uses radius `round(4*sigma)`, matching SciPy Gaussian filter support. The default `full_width=True` interprets `truncate` as the full width. Both CPU and CUDA use the same convention.
 
 ```python
 A.GaussianBlur(sigma=1)

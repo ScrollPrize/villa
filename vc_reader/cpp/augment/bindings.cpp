@@ -198,7 +198,7 @@ NB_MODULE(_augment, m) {
     bind<RicianNoise>(m, "RicianNoise", [](auto& t, auto& a) { t.std = parameter(a, "std", t.std); t.shared_noise = a.get("shared_noise", false); });
     bind<ClipOutliers>(m, "ClipOutliers", [](auto& t, auto& a) { t.lower = parameter(a, "lower", t.lower); t.upper = parameter(a, "upper", t.upper); t.p_retain_std = a.get("p_retain_std", 1.); probability(t.p_retain_std); });
     bind<GaussianBlur>(m, "GaussianBlur", [](auto& t, auto& a) {
-        t.sigma = parameter(a, "sigma", t.sigma); t.shared_axes = a.get("shared_axes", true); t.truncate = a.get("truncate", 6.);
+        t.sigma = parameter(a, "sigma", t.sigma); t.shared_axes = a.get("shared_axes", true); t.truncate = a.get("truncate", 6.); t.full_width = a.get("full_width", true);
         auto boundary = a.get("boundary", std::string("mirror"));
         require(boundary == "mirror" || boundary == "reflect" || boundary == "nearest", "boundary must be mirror, reflect or nearest");
         t.boundary = boundary == "mirror" ? Boundary::Mirror : boundary == "nearest" ? Boundary::Nearest : Boundary::Reflect;

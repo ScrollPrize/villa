@@ -46,6 +46,22 @@ class ConfigurationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "CUDA pipeline"):
             CudaLoader([], pipeline)
 
+    def test_named_cpu_parameters_and_replay(self):
+        import pickle
+        transforms = [A.BrightnessMultiply(A.Param('gain')), A.GaussianBlur(
+            sigma=A.Param('sigma'), full_width=False, truncate=4., boundary='reflect')]
+        pipeline = pickle.loads(pickle.dumps(A.Pipeline(transforms, compact=False)))
+        image = image_batch(1)[0].numpy().astype(np.float32)
+        params = {'gain': 1.7, 'sigma': .9}
+        actual = pipeline({'image': image}, seed=17, params=params)['image']
+        from scipy.ndimage import gaussian_filter
+        expected = gaussian_filter(image * 1.7, sigma=(0., .9, .9, .9), mode='reflect')
+        np.testing.assert_allclose(actual, expected, atol=1e-5, rtol=1e-6)
+        plan = pipeline.sample({'image': image}, seed=17, params=params)
+        np.testing.assert_array_equal(plan.apply({'image': image})['image'], actual)
+        with self.assertRaisesRegex(ValueError, 'gain'):
+            pipeline({'image': image}, seed=17)
+
     def test_import_does_not_require_torch(self):
         # The catalog and ordinary augmentation APIs remain independent of Torch.
         code = """
@@ -96,6 +112,30 @@ class BatchTests(unittest.TestCase):
                     self.assertSame(first[key], second[key])
                 self.assertSame(source.cpu(), torch.from_numpy(host))
                 self.assertTrue(torch.isfinite(weight.grad))
+
+    def test_named_batch_parameters_and_partitioning(self):
+        transforms = [A.Flip(axes='x', p_axis=.5),
+                      A.BrightnessMultiply(A.Param('gain')),
+                      A.GaussianBlur(sigma=A.Param('sigma'), full_width=False, truncate=4., boundary='reflect'),
+                      A.GaussianNoise(std=A.Param('noise'))]
+        pipeline = A.Pipeline(transforms, backend='cuda', compact=False)
+        host = image_batch().numpy().astype(np.float32)
+        source = torch.from_numpy(host).cuda()
+        params = {'gain': [1., .3, 1.7], 'sigma': [0., .9, 1.25], 'noise': [0., .1, .3]}
+        seeds = [7, 31, 100]
+        batch = pipeline.batch({'image': source}, seeds=seeds, params=params)['image']
+        for i in range(3):
+            single = {key: values[i] for key, values in params.items()}
+            expected = pipeline({'image': cuda.asarray(host[i])}, seed=seeds[i], params=single)['image']
+            self.assertSame(batch[i], torch.from_dlpack(expected))
+        split = pipeline.batch({'image': source[1:]}, seeds=seeds[1:],
+                               params={key: values[1:] for key, values in params.items()})['image']
+        self.assertSame(batch[1:], split)
+        self.assertSame(source.cpu(), torch.from_numpy(host))
+        with self.assertRaisesRegex(ValueError, 'one value per sample'):
+            pipeline.batch({'image': source}, seeds=seeds, params={'gain': [1.]})
+        with self.assertRaisesRegex(ValueError, 'CPU'):
+            pipeline.batch({'image': source}, seeds=seeds, params={'gain': source[:, 0, 0, 0, 0]})
 
     def test_samples_labels_metadata_and_inputs(self):
         pipeline = A.Pipeline([A.Normalize('minmax'), A.Flip(axes='x', p_axis=1), A.BrightnessMultiply((.5, 1.5))],
@@ -153,7 +193,7 @@ class BatchTests(unittest.TestCase):
     def test_errors_before_consumption_and_recovery(self):
         p = A.Pipeline([A.Normalize('minmax')], backend='cuda')
         bad = image_batch().float()
-        bad[0, 0, 0, 0, 0] = float('nan')
+        bad[-1, 0, 0, 0, 0] = float('nan')
         with self.assertRaisesRegex((ValueError, RuntimeError), 'nonfinite'):
             p.batch({'image': bad}, seeds=[1, 2, 3])
         with self.assertRaisesRegex((ValueError, RuntimeError), 'zero or one'):

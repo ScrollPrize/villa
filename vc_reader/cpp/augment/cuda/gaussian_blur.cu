@@ -106,7 +106,7 @@ void blur_into(View<float> data, View<float> output, const Grid& g, const std::v
 void blur_into(View<double> data, View<double> output, const Grid& g, const std::vector<double>& sigmas, double truncate, Boundary mirror, bool full) { blur_impl(data,output,g,sigmas,truncate,mirror,full); }
 void apply_cuda(const GaussianBlur& t, Sample& s, const Parameters& p, Session& session) {
     apply_channels(t,s,p,session,[](const auto& t, auto v, const Grid& g, const ChannelPlan& c) {
-        blur(v,g,c.values,t.truncate,t.boundary,true);
+        blur(v,g,c.values,t.truncate,t.boundary,t.full_width);
     });
 }
 } // namespace vcr::augment::cuda

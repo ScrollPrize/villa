@@ -14,7 +14,7 @@ struct DeviceOutputs {
     void mark_exported() { for (auto& s:sessions) cuda::export_outputs(s.get()); for (auto& b:stacked) b->exported=true; }
     void check() {
         vcr::device::Guard guard(device); vcr::device::StreamScope scope(stream);
-        for (auto& s:sessions) cuda::check_device(s.get());
+        cuda::check_devices(sessions);
     }
 };
 static char dlpack_kind(nb::dlpack::dtype dt) {
@@ -180,7 +180,7 @@ static nb::tuple run_batch(const Pipeline& pipeline, const std::map<std::string,
     for (auto item:arrays) if (!allocator.is_none() || !nb::isinstance<nb::list>(item.second)) stacked.push_back(nb::cast<std::string>(item.first));
     { nb::gil_scoped_release release; vcr::device::Guard guard(imported.device);
       for (auto& s:owner->sessions) cuda::release_outputs(s.get(),stacked);
-      if (!async) { for (auto& s:owner->sessions) cuda::check_device(s.get()); vcr::device::complete(); } }
+      if (!async) { cuda::check_devices(owner->sessions); vcr::device::complete(); } }
     nb::dict names; for (const auto& [k,v]:sources) names[nb::str(k.c_str())]=nb::str(v.c_str());
     return nb::make_tuple(arrays,names,holder);
 }

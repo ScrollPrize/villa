@@ -48,7 +48,7 @@ def _factory(constructor):
 
 
 _constructors = (
-    "Uniform Normal Choice BalancedContrast Image Label ScalarField ValidMask Points "
+    "Param Uniform Normal Choice BalancedContrast Image Label ScalarField ValidMask Points "
     "Vectors VectorField NormalField CoordinateField OneOf "
     "BrightnessMultiply BrightnessAdd Contrast Gamma Invert Normalize GaussianNoise RicianNoise "
     "ClipOutliers GaussianBlur MedianFilter Sharpen BrightnessGradient LocalContrast "
@@ -219,23 +219,23 @@ class Pipeline:
             out["_aug_perf"] = timings
         return out
 
-    def __call__(self, sample, *, seed, profile=False, inplace=False):
+    def __call__(self, sample, *, seed, profile=False, inplace=False, params=None):
         device = self._device_inputs(sample)
         if device is not None:
-            result = self._device_result(self._native.run_device(device, seed, False, profile, inplace))
+            result = self._device_result(self._native.run_device(device, seed, False, profile, inplace, params=params or {}))
             return self._outputs(sample, dict.fromkeys(device), result, profile)
         arrays, converters = self._inputs(sample, inplace)
-        result = self._native.run(arrays, seed, False, profile, inplace)
+        result = self._native.run(arrays, seed, False, profile, inplace, params=params or {})
         return self._outputs(sample, converters, result, profile)
 
-    def sample(self, sample, *, seed):
+    def sample(self, sample, *, seed, params=None):
         device = self._device_inputs(sample)
         if device is not None:
-            return Plan(self, self._native.run_device(device, seed, True, False, False)[3])
+            return Plan(self, self._native.run_device(device, seed, True, False, False, params=params or {})[3])
         arrays, _ = self._inputs(sample)
-        return Plan(self, self._native.run(arrays, seed, True, False)[3])
+        return Plan(self, self._native.run(arrays, seed, True, False, params=params or {})[3])
 
-    def batch(self, batch, *, seeds, device=None):
+    def batch(self, batch, *, seeds, device=None, params=None):
         """Augment a batch, returning PyTorch CUDA tensors and unchanged metadata.
 
         Requires the optional PyTorch integration and a CUDA pipeline. Dense
@@ -246,11 +246,13 @@ class Pipeline:
 
         Work uses PyTorch's current stream and completes/checks once per batch.
         CudaLoader uses the same executor with one batch of GPU prefetch.
+        params maps each Param(name) to one CPU scalar per sample. Kernels run
+        per sample within the native executor; this is not kernel fusion.
         Uniform outputs are stacked tensors; differing sample shapes are lists.
         Undeclared fields, including tensor metadata, pass through unchanged.
         """
         from ..torch import _batch
-        return _batch(self, batch, seeds=seeds, device=device)
+        return _batch(self, batch, seeds=seeds, device=device, params=params)
 
     def apply(self, sample, plan):
         if not isinstance(plan, Plan) or plan._pipeline is not self:

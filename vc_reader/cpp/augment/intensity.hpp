@@ -16,7 +16,7 @@ struct Invert { ChannelOptions options; };
 struct GaussianNoise { Scalar std = Uniform{0, .1}; bool shared_noise = false; ChannelOptions options; };
 struct RicianNoise { Scalar std = Uniform{0, .1}; bool shared_noise = false; ChannelOptions options; };
 struct ClipOutliers { Scalar lower = .2, upper = 99.8; double p_retain_std = 1; ChannelOptions options; };
-struct GaussianBlur { Scalar sigma = Uniform{.3, 1.5}; bool shared_axes = true; Boundary boundary = Boundary::Mirror; double truncate = 6; ChannelOptions options; };
+struct GaussianBlur { Scalar sigma = Uniform{.3, 1.5}; bool shared_axes = true; Boundary boundary = Boundary::Mirror; double truncate = 6; bool full_width = true; ChannelOptions options; };
 struct MedianFilter { Scalar size = Uniform{3, 7}; bool quantize = false; ChannelOptions options; };
 struct Sharpen { Scalar strength = Uniform{.1, .5}; double p_clamp = .5; ChannelOptions options; };
 struct BrightnessGradient { Scalar strength = Uniform{-.5, .5}; bool mean_centered = true, clip = false; LocalOptions local; ChannelOptions options; };
@@ -211,7 +211,7 @@ template<class T> inline void channel_apply(const ClipOutliers&, std::vector<T>&
     if (p.values[2]) { double m = mean(v), after = deviation(v, m); if (after > 1e-8) for (auto& x : v) x = (x - m) / after * std + m; }
 }
 template<class T>
-inline void channel_apply(const GaussianBlur& t, std::vector<T>& v, const Grid& g, const ChannelPlan& p) { gaussian_blur(v, g, p.values, t.truncate, t.boundary, true); }
+inline void channel_apply(const GaussianBlur& t, std::vector<T>& v, const Grid& g, const ChannelPlan& p) { gaussian_blur(v, g, p.values, t.truncate, t.boundary, t.full_width); }
 // Exact palette compression, not quantization. This benefits CT patches and
 // pointwise intensity transforms of them; continuous-valued inputs use the
 // small-window network or nth_element. The bounded palette stays in L1 cache.

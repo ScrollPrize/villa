@@ -141,9 +141,9 @@ if(VC_READER_BUILD_READER)
     # NOMINSIZE: nanobind otherwise appends -Os, which costs the point samplers ~8%.
     nanobind_add_module(_native NB_STATIC NOMINSIZE cpp/bindings.cpp)
     if(VC_READER_ENABLE_CUDA)
-        target_sources(_native PRIVATE cpp/reader_cuda/kernels.cu cpp/aligned/kernels.cu cpp/surface/kernels.cu)
-        # Geometric predicates and categorical ties use separate float32 rounding.
-        set_source_files_properties(cpp/surface/kernels.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
+        target_sources(_native PRIVATE cpp/reader_cuda/kernels.cu cpp/aligned/kernels.cu cpp/surface/kernels.cu cpp/sheet_normal/kernels.cu)
+        # Separate float32 rounding preserves geometric ties and filter agreement.
+        set_source_files_properties(cpp/surface/kernels.cu cpp/sheet_normal/kernels.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
         target_compile_definitions(_native PRIVATE VC_READER_CUDA=1)
         target_link_libraries(_native PRIVATE CUDA::cudart)
         set_target_properties(_native PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
