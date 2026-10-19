@@ -880,16 +880,3 @@ QFrame#persistentCacheWarningBanner QPushButton {
 QFrame#persistentCacheWarningBanner QPushButton:hover {
     border-color: @warning_text@;
 }
-
-/* Status text. A panel can mark a label with the dynamic property
-   vc3dStatus ("danger", "warning" or "success") instead of hard coding a
-   color, so the color follows the theme. */
-QLabel[vc3dStatus="danger"] {
-    color: @danger@;
-}
-QLabel[vc3dStatus="warning"] {
-    color: @warning@;
-}
-QLabel[vc3dStatus="success"] {
-    color: @success@;
-}

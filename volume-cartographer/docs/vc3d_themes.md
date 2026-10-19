@@ -289,9 +289,6 @@ and
 | **Status** | | | |
 | `warning_text` | `#664d03` | `#664d03` | Text and button text on VC3D's yellow warning banner (the banner keeps its own background). |
 | `warning_border` | `#9a7a12` | `#9a7a12` | Outline of the button on the warning banner. |
-| `danger` | `#f87171` | `#b91c1c` | Error text: labels whose dynamic property vc3dStatus is "danger" (at least 4.5:1 on window, section_body and input). |
-| `warning` | `#fbbf24` | `#b45309` | Warning text: labels whose vc3dStatus is "warning". |
-| `success` | `#4ade80` | `#15803d` | Success text: labels whose vc3dStatus is "success". |
 | **Shape** | | | |
 | `radius_small` | `4px` | `4px` | Corners of check boxes, list and menu items, scroll handles, progress bars. |
 | `radius` | `6px` | `6px` | Corners of buttons, fields, sections, group boxes, tabs, dock bar buttons. |
