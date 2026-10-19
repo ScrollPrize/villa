@@ -4,6 +4,7 @@
 #include <QtTest/QtTest>
 
 #include <filesystem>
+#include <future>
 #include <string>
 
 class GraphDbControllerTest : public QObject
@@ -50,8 +51,15 @@ private slots:
         QCOMPARE(controller.neighbours(fiberUuid)[0], patchUuid);
         QCOMPARE(controller.edgesOf(patchUuid).size(), size_t(1));
         QVERIFY(controller.objectByUuid(fiberUuid).has_value());
+        const auto handle = controller.readHandle();
         controller.close();
         QVERIFY(!controller.isOpen());
+        // A query already dispatched must own the old DB through close/reopen.
+        auto query = std::async(std::launch::async, [handle, fiberUuid] {
+            auto read = handle->read();
+            return std::make_pair(handle->objectCount(read, "fiber"), handle->componentOf(read, fiberUuid).size());
+        });
+        QCOMPARE(query.get(), (std::pair<int64_t, size_t>{1, 2}));
     }
 
     void openFailureIsReportedNotFatal()

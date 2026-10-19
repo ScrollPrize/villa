@@ -4,6 +4,7 @@
 #include "vc/core/util/PackedTrackStore.hpp"
 #include "vc/core/util/Uuid.hpp"
 #include "GraphFiberInput.hpp"
+#include "GraphPatchInput.hpp"
 #include "GraphTrackInput.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -109,8 +110,6 @@ Prepared fiber(const fs::path& source)
 }
 Prepared patch(const fs::path& source)
 {
-    if (fs::exists(source / ".vc-save-rollback"))
-        throw std::runtime_error("patch has an incomplete save; recover it before ingestion");
     auto fingerprint = [&]() {
         std::map<std::string, std::pair<uintmax_t, fs::file_time_type>> result;
         for (const auto& entry : fs::directory_iterator(source))
@@ -122,13 +121,7 @@ Prepared patch(const fs::path& source)
     const auto root = readJson(source / "meta.json");
     Prepared p;
     p.object = sourceObject(root, "patch", source); p.geometry.kind = "patch";
-    // The visualization loader tolerates damaged tiles. Ingestion must not
-    // publish those substituted zeros/sentinels as authoritative geometry.
-    for (const char* name : {"x.tif", "y.tif", "z.tif", "mask.tif"}) {
-        const auto file = source / name;
-        if (std::string_view(name) == "mask.tif" && !fs::exists(file)) continue;
-        if (!isReadableTiff(file)) throw std::runtime_error("incomplete or unreadable TIFF: " + file.string());
-    }
+    detail::validatePatchFiles(source);
     QuadSurface surface(source);
     const auto grid = surface.rawPoints();
     std::vector<float> values;

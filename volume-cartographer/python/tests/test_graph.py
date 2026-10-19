@@ -1164,3 +1164,93 @@ def test_geometry_export_failures_preserve_destination(db, tmp_path, failure):
     assert (dest / "keep" if failure == "type" else dest).read_text() == "old"
     assert db.current_geometry(uid)["uuid"] == revision and db.journal_since() == before
     assert not list(tmp_path.glob(".vc-export-*"))
+
+
+@pytest.mark.parametrize("explicit_path", [False, True])
+@pytest.mark.parametrize("duplicates", [False, True])
+def test_track_uuid_selection_is_case_insensitive(db, tmp_path, explicit_path, duplicates):
+    packed = tmp_path / "tracks.vctracks"
+    _packed_tracks(packed, _crossing_lines(), [0, 1], [11, 22])
+    ids = _register_tracks(db, packed, [11, 22], ["horizontal", "vertical"])
+    selected = [u.upper() for u in ids]
+    if duplicates: selected += ids
+    report = db.link_tracks_to_tracks(str(packed) if explicit_path else "", track_uuids=selected)
+    assert report["problems"] == []
+    assert report["objects_considered"] == 2 and report["edges_created"] == 1
+    assert {o["uuid"] for o in db.objects_by_kind("track")} == set(ids)
+    assert db.object_count("track") == 2 and db.object_count("missing") == 0
+    before = db.journal_since()
+    missing = db.link_tracks_to_tracks(str(packed) if explicit_path else "", track_uuids=selected + [str(uuid.uuid4()).upper()])
+    assert missing["problems"] and db.journal_since() == before
+
+
+def test_object_edge_uuids_share_namespace(db):
+    a = db.upsert_object({"kind": "fiber", "uuid": "abcdefab-1111-4111-8111-111111111111"})
+    b = db.upsert_object({"kind": "fiber"})
+    before = db.journal_since()
+    with pytest.raises(RuntimeError, match="belongs to an object"):
+        db.add_edge({"uuid": a.upper(), "kind": "connected", "a": a, "b": b})
+    assert db.journal_since() == before and db.edges_of(a) == []
+    edge = db.add_edge({"kind": "connected", "a": a, "b": b})
+    before = db.journal_since()
+    with pytest.raises(RuntimeError, match="belongs to an edge"):
+        db.upsert_object({"uuid": edge.upper(), "kind": "fiber"})
+    assert db.journal_since() == before and db.object(edge) is None
+    db.set_approval(edge.upper(), "approved")
+    assert db.edge(edge)["approval_state"] == "approved"
+    assert db.object(a)["approval_state"] == "pending"
+    assert db.neighbours(a.upper()) == [b]
+
+
+def test_legacy_fiber_refresh_preserves_annotations_and_reconciles_branches(db, tmp_path):
+    source = tmp_path / "fibers"; source.mkdir()
+    a, b = str(uuid.uuid4()), str(uuid.uuid4())
+    def branch(target, xyz):
+        return {"control_point_index": 0, "branch_file": target, "branch_control_point_index": 0,
+                "control_point_position": xyz, "branch_control_point_position": [3, 4, 5], "pending": False}
+    first = {"uuid": a, "control_points": [[1, 2, 3]], "line_points": [[1, 2, 3], [4, 5, 6]],
+             "tags": ["source"], "branches": [branch("b.json", [1, 2, 3])]}
+    second = {"uuid": b, "control_points": [[3, 4, 5]], "branches": []}
+    (source / "a.json").write_text(json.dumps(first)); (source / "b.json").write_text(json.dumps(second))
+    assert db.import_fibers(str(source))["edges_imported"] == 1
+    edge = db.edges_of(a)[0]
+    db.set_meta(a, "review_note", "keep")
+    db.set_meta(edge["uuid"], "review_note", "edge note")
+    annotated = db.object(a); annotated["tags"] = ["database"]
+    db.upsert_object(annotated)
+    db.set_approval(edge["uuid"], "approved")
+    first["line_points"][1] = [8, 2, 3]
+    first["branches"][0]["control_point_position"] = [2, 2, 3]
+    first["tags"] = ["changed-source"]
+    (source / "a.json").write_text(json.dumps(first))
+    assert db.import_fibers(str(source))["objects_imported"] == 1
+    assert db.object(a)["meta"] == {"review_note": "keep"} and db.object(a)["tags"] == ["database"]
+    refreshed = db.edge(edge["uuid"])
+    anchor = refreshed["a_anchor"] if refreshed["a"] == a else refreshed["b_anchor"]
+    assert anchor["position"] == (2, 2, 3)
+    assert refreshed["approval_state"] == "pending" and refreshed["meta"]["review_note"] == "edge note"
+    # Omitted/unreadable target files cannot establish a removed branch.
+    first["branches"] = []; (source / "a.json").write_text(json.dumps(first))
+    (source / "b.json").write_text("{")
+    assert db.import_fibers(str(source))["problems"]
+    assert db.edge(edge["uuid"]) is not None
+    (source / "b.json").write_text(json.dumps(second))
+    db.import_fibers(str(source))
+    assert db.edge(edge["uuid"]) is None
+    before = db.journal_since()
+    assert db.import_fibers(str(source))["objects_imported"] == 0
+    assert db.journal_since() == before
+
+
+def test_legacy_import_does_not_refresh_managed_geometry_from_files(db, tmp_path):
+    source = tmp_path / "fibers"; source.mkdir()
+    uid = str(uuid.uuid4())
+    data = {"uuid": uid, "type": "vc3d_fiber", "control_points": [], "line_points": [[1, 2, 3]]}
+    file = source / "fiber.json"; file.write_text(json.dumps(data))
+    assert db.ingest_geometry_source("fiber", file)["ingested"] == 1
+    db.set_meta(uid, "review_note", "keep")
+    before, journal = db.object(uid), db.journal_since()
+    data["line_points"] = [[9, 8, 7]]; file.write_text(json.dumps(data))
+    report = db.import_fibers(str(source))
+    assert "database-owned" in report["problems"][0]
+    assert db.object(uid) == before and db.journal_since() == journal

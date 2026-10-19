@@ -8,6 +8,8 @@
 #endif
 
 #include <filesystem>
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <functional>
 #include <fstream>
@@ -468,9 +470,12 @@ TEST_CASE("fiber-patch: anchors, multi-round growth, strip gate and isolated clu
         }
         CHECK((target == a || target == b || target == c));
     }
+    // This helper changes stripMarchStep from 5 to 20: refresh evidence even
+    // though the endpoint/anchor-index identities did not change.
     const auto repeat = linkTestFiberPatches(db, fibers, patches, ctVolume);
     CHECK(repeat.edgesCreated == 0);
-    CHECK(repeat.edgesSkippedExisting == 3);
+    CHECK(repeat.edgesUpdated == 3);
+    CHECK(linkTestFiberPatches(db, fibers, patches, ctVolume).edgesSkippedExisting == 3);
     FiberPatchParams oneRound;
     oneRound.maxRounds = 1;
     const auto limited = linkTestFiberPatches(db, fibers, patches, ctVolume, oneRound);
@@ -987,6 +992,11 @@ TEST_CASE("track-patch uses fiber strip rules, raw anchors and existing track id
     TrackPatchParams p;
     p.trackScale = 0.5;
     p.stripMarchStep = 20;
+    auto upper = track;
+    std::transform(upper.begin(), upper.end(), upper.begin(), [](unsigned char c) { return char(std::toupper(c)); });
+    SUBCASE("all tracks") {}
+    SUBCASE("uppercase UUID selection") { p.trackUuids = {upper}; }
+    SUBCASE("casing variants deduplicate") { p.trackUuids = {track, upper}; }
     const auto report = linkTracksToPatches(db, packed, patches, ct, p);
     for (const auto& problem : report.problems) INFO(problem);
     REQUIRE(report.problems.empty());
@@ -1034,6 +1044,7 @@ TEST_CASE("track-patch uses fiber strip rules, raw anchors and existing track id
     OpenOptions freshOptions;
     freshOptions.author = "test";
     auto fresh = GraphDb::create(tmp.dir / "fresh.vcgr", freshOptions);
+    p.trackUuids.clear();
     REQUIRE(linkTracksToPatches(fresh, packed, patches, ct, p).problems.empty());
     { auto read = fresh.read(); const auto object = fresh.objectsByKind(read, "track").at(0);
       CHECK(object.track->length == 480); CHECK(object.track->family == "horizontal"); }
@@ -1088,4 +1099,60 @@ TEST_CASE("pending anchors are refreshed when their index convention changes")
     CHECK(updated.edgesSkippedExisting == 0);
     const auto edge = fiberEdges(db, a).at(0);
     CHECK(nlohmann::json::parse(edge.meta)["anchor_index_space"] == "line_points");
+}
+
+TEST_CASE("pending detector links refresh anchors and evidence while retaining identity and annotations")
+{
+    TempDir tmp("refresh_candidates");
+    auto db = makeDb(tmp.dir);
+    const auto a = addObject(db, "fiber"), b = addObject(db, "patch");
+    auto c = cand(a, b);
+    c.aAnchor.index = 4; c.aAnchor.position = {1, 2, 3}; c.score = 0.5;
+    c.meta = R"({"distance":5})";
+    REQUIRE(commitCandidates(db, "detector", 1, {c}).edgesCreated == 1);
+    std::string id;
+    { auto read = db.read(); id = db.edgesOf(read, a).at(0).uuid; }
+    { auto w = db.write(); db.setMeta(w, id, "review_note", "\"retain\""); auto edge = *db.edgeByUuid(w, id); edge.tags = {"user"}; db.updateEdge(w, edge); w.commit(); }
+    c.aAnchor.position = {7, 8, 9}; c.score = 0.9; c.meta = R"({"distance":1})";
+    CHECK(commitCandidates(db, "detector", 2, {c}).edgesUpdated == 1);
+    { auto read = db.read(); const auto edge = db.edgeByUuid(read, id);
+      REQUIRE(edge); const auto& anchor = edge->aUuid == a ? edge->aAnchor : edge->bAnchor;
+      CHECK(anchor.position == c.aAnchor.position);
+      const auto meta = nlohmann::json::parse(edge->meta);
+      CHECK(meta["review_note"] == "retain"); CHECK(meta["distance"] == 1); CHECK(meta["detector"]["score"] == 0.9);
+      CHECK(edge->tags == std::vector<std::string>{"user"}); }
+    CHECK(commitCandidates(db, "detector", 2, {c}).edgesSkippedExisting == 1);
+    { auto w = db.write(); db.setApproval(w, id, "approved"); w.commit(); }
+    c.aAnchor.position = {10, 11, 12};
+    CHECK(commitCandidates(db, "detector", 3, {c}).edgesUpdated == 0);
+    { auto read = db.read(); CHECK(db.edgeByUuid(read, id)->approvalState == "approved"); }
+    { auto w = db.write(); db.setApproval(w, id, "pending"); w.commit(); }
+    // Caller rollback preserves the old content and journal.
+    { auto w = db.write(); CHECK(commitCandidates(db, w, "detector", 3, {c}).edgesUpdated == 1); }
+    { auto read = db.read(); const auto edge = db.edgeByUuid(read, id);
+      CHECK((edge->aUuid == a ? edge->aAnchor : edge->bAnchor).position == std::optional(std::array<double,3>{7,8,9})); }
+}
+
+TEST_CASE("patch overlap stale removal is limited to successfully loaded inputs, including empty results")
+{
+    TempDir tmp("overlap_scope");
+    auto db = makeDb(tmp.dir);
+    const auto all = tmp.dir / "patches", subset = tmp.dir / "subset";
+    auto plane = [](int r, int c) { return cv::Vec3f(100+c, 100+r, 100); };
+    const auto a = writePatch(all / "a", 40, 60, plane), b = writePatch(all / "b", 40, 60, plane);
+    const auto c = addObject(db, "patch"), d = addObject(db, "patch");
+    commitCandidates(db, kPatchOverlapDetector, 1, {cand(c, d)});
+    fs::create_directories(subset);
+    fs::create_directory_symlink(all / "a", subset / "a");
+    fs::create_directory_symlink(all / "b", subset / "b");
+    REQUIRE(linkPatchOverlaps(db, subset).edgesCreated == 1);
+    CHECK(edgeCount(db, c) == 1); CHECK(edgeCount(db, a) == 1);
+    fs::rename(all / "b" / "meta.json", all / "b" / "meta.saved");
+    std::ofstream(all / "b" / "meta.json") << "{";
+    CHECK_FALSE(linkPatchOverlaps(db, subset).problems.empty());
+    CHECK(edgeCount(db, a) == 1); CHECK(edgeCount(db, c) == 1);
+    fs::remove(all / "b" / "meta.json"); fs::rename(all / "b" / "meta.saved", all / "b" / "meta.json");
+    PatchOverlapParams strict; strict.minInliers = 100000;
+    CHECK(linkPatchOverlaps(db, subset, strict).staleRemoved == 1);
+    CHECK(edgeCount(db, a) == 0); CHECK(edgeCount(db, c) == 1);
 }

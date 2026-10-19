@@ -1,6 +1,9 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
 
+#include <QFutureWatcher>
+#include <QtConcurrent>
+#include <QTimer>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -87,84 +90,104 @@ std::optional<std::string> optParam(const QJsonValue& params, const char* key)
     return p.value(key).toString().toStdString();
 }
 
-void requireObject(GraphDbController* graph, const std::string& uuid)
+void requireObject(vc::graph::GraphDb& db, const vc::graph::Txn& read, const std::string& uuid)
 {
-    if (!graph->objectByUuid(uuid))
+    if (!db.objectByUuid(read, uuid))
         throw AgentBridgeError{-32007, QStringLiteral("Unknown object uuid: %1").arg(qs(uuid)), {}};
 }
 
 }  // namespace
 
+QJsonObject AgentBridgeServer::deferGraphQuery(std::function<QJsonObject(const std::atomic_bool*)> query)
+{
+    struct Result { QJsonObject value; std::optional<AgentBridgeError> error; };
+    const int token = beginDeferred(30000, "graph query");
+    auto cancel = std::make_shared<std::atomic_bool>(false);
+    auto* watcher = new QFutureWatcher<Result>(this);
+    // Deferred timers are destroyed on timeout, disconnect, or completion.
+    connect(_pendingDeferred[token].timer, &QObject::destroyed, watcher, [cancel] { cancel->store(true); });
+    connect(watcher, &QObject::destroyed, [cancel] { cancel->store(true); });
+    connect(watcher, &QFutureWatcher<Result>::finished, this, [this, token, watcher] {
+        const auto result = watcher->result();
+        watcher->deleteLater();
+        if (result.error) completeDeferredError(token, result.error->code, result.error->message, result.error->data);
+        else completeDeferredResult(token, result.value);
+    });
+    watcher->setFuture(QtConcurrent::run([query = std::move(query), cancel] {
+        Result result;
+        try { result.value = query(cancel.get()); }
+        catch (const AgentBridgeError& error) { result.error = error; }
+        catch (const std::exception& error) { result.error = AgentBridgeError{-32010, QString::fromUtf8(error.what()), {}}; }
+        catch (...) { result.error = AgentBridgeError{-32010, "Unknown graph query error", {}}; }
+        return result;
+    }));
+    throw AgentBridgeDeferred{};
+}
+
 QJsonObject AgentBridgeServer::handleGraphStatus(const QJsonValue&)
 {
-    QJsonObject result;
     GraphDbController* graph = _window ? _window->graphDbController() : nullptr;
-    result["open"] = graph && graph->isOpen();
-    if (graph && graph->isOpen()) {
-        result["path"] = graph->path();
+    if (!graph || !graph->isOpen()) return {{"open", false}};
+    const auto db = graph->readHandle();
+    const auto path = graph->path();
+    return deferGraphQuery([db, path](const std::atomic_bool*) {
+        auto read = db->read();
         QJsonObject counts;
-        for (const char* kind : {"fiber", "patch", "track"})
-            counts[kind] = double(graph->objectsByKind(kind).size());
-        result["objectCounts"] = counts;
-    }
-    return result;
+        for (const char* kind : {"fiber", "patch", "track"}) counts[kind] = double(db->objectCount(read, kind));
+        return QJsonObject{{"open", true}, {"path", path}, {"objectCounts", counts}};
+    });
 }
 
 QJsonObject AgentBridgeServer::handleGraphObject(const QJsonValue& params)
 {
-    GraphDbController* graph = requireGraph(_window);
-    const std::string uuid = paramUuid(params);
-    const auto obj = graph->objectByUuid(uuid);
-    if (!obj)
-        throw AgentBridgeError{-32007, QStringLiteral("Unknown object uuid: %1").arg(qs(uuid)), {}};
-    QJsonObject result;
-    result["object"] = objectJson(*obj);
-    return result;
+    const auto db = requireGraph(_window)->readHandle();
+    const auto uuid = paramUuid(params);
+    return deferGraphQuery([db, uuid](const std::atomic_bool*) {
+        auto read = db->read();
+        const auto object = db->objectByUuid(read, uuid);
+        if (!object) throw AgentBridgeError{-32007, QStringLiteral("Unknown object uuid: %1").arg(qs(uuid)), {}};
+        return QJsonObject{{"object", objectJson(*object)}};
+    });
 }
 
 QJsonObject AgentBridgeServer::handleGraphNeighbours(const QJsonValue& params)
 {
-    GraphDbController* graph = requireGraph(_window);
-    const std::string uuid = paramUuid(params);
-    requireObject(graph, uuid);
-    QJsonArray neighbours;
-    for (const auto& n : graph->neighbours(uuid, optParam(params, "edgeKind"), optParam(params, "neighbourKind")))
-        neighbours.append(qs(n));
-    QJsonObject result;
-    result["uuid"] = qs(uuid);
-    result["neighbours"] = neighbours;
-    return result;
+    const auto db = requireGraph(_window)->readHandle();
+    const auto uuid = paramUuid(params);
+    const auto edgeKind = optParam(params, "edgeKind"), neighbourKind = optParam(params, "neighbourKind");
+    return deferGraphQuery([db, uuid, edgeKind, neighbourKind](const std::atomic_bool*) {
+        auto read = db->read();
+        requireObject(*db, read, uuid);
+        QJsonArray neighbours;
+        for (const auto& n : db->neighbours(read, uuid, edgeKind, neighbourKind)) neighbours.append(qs(n));
+        return QJsonObject{{"uuid", qs(uuid)}, {"neighbours", neighbours}};
+    });
 }
 
 QJsonObject AgentBridgeServer::handleGraphEdges(const QJsonValue& params)
 {
-    GraphDbController* graph = requireGraph(_window);
-    const std::string uuid = paramUuid(params);
-    requireObject(graph, uuid);
-    QJsonArray edges;
-    for (const auto& e : graph->edgesOf(uuid))
-        edges.append(edgeJson(e));
-    QJsonObject result;
-    result["uuid"] = qs(uuid);
-    result["edges"] = edges;
-    return result;
+    const auto db = requireGraph(_window)->readHandle();
+    const auto uuid = paramUuid(params);
+    return deferGraphQuery([db, uuid](const std::atomic_bool*) {
+        auto read = db->read();
+        requireObject(*db, read, uuid);
+        QJsonArray edges;
+        for (const auto& edge : db->edgesOf(read, uuid)) edges.append(edgeJson(edge));
+        return QJsonObject{{"uuid", qs(uuid)}, {"edges", edges}};
+    });
 }
 
 QJsonObject AgentBridgeServer::handleGraphComponent(const QJsonValue& params)
 {
-    GraphDbController* graph = requireGraph(_window);
-    const std::string uuid = paramUuid(params);
-    requireObject(graph, uuid);
+    const auto db = requireGraph(_window)->readHandle();
+    const auto uuid = paramUuid(params);
     std::vector<std::string> kinds;
-    const QJsonObject p = params.toObject();
-    if (p.contains("edgeKinds") && p.value("edgeKinds").isArray())
-        for (const auto& k : p.value("edgeKinds").toArray())
-            kinds.push_back(k.toString().toStdString());
-    QJsonArray members;
-    for (const auto& m : graph->componentOf(uuid, kinds))
-        members.append(qs(m));
-    QJsonObject result;
-    result["uuid"] = qs(uuid);
-    result["component"] = members;
-    return result;
+    for (const auto& kind : params.toObject().value("edgeKinds").toArray()) kinds.push_back(kind.toString().toStdString());
+    return deferGraphQuery([db, uuid, kinds](const std::atomic_bool* cancel) {
+        auto read = db->read();
+        requireObject(*db, read, uuid);
+        QJsonArray members;
+        for (const auto& member : db->componentOf(read, uuid, kinds, cancel)) members.append(qs(member));
+        return QJsonObject{{"uuid", qs(uuid)}, {"component", members}};
+    });
 }

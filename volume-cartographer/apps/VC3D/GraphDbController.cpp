@@ -13,7 +13,7 @@ bool GraphDbController::open(const QString& path, QString* errorMessage)
         vc::graph::OpenOptions options;
         options.readOnly = true;
         options.readerPoolSize = 4;
-        db_ = vc::graph::GraphDb::open(std::filesystem::path(path.toStdString()), options);
+        db_ = std::make_shared<vc::graph::GraphDb>(vc::graph::GraphDb::open(std::filesystem::path(path.toStdString()), options));
         path_ = path;
         return true;
     } catch (const std::exception& e) {

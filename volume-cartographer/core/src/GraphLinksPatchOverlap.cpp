@@ -10,6 +10,7 @@
 // commitCandidates(); no merged geometry is produced here.
 
 #include "vc/core/graph_links/GraphLinks.hpp"
+#include "GraphPatchInput.hpp"
 
 #include <algorithm>
 #include <array>
@@ -164,6 +165,7 @@ std::optional<LoadedPatch> loadPatch(const std::filesystem::path& dir, const Pat
     LoadedPatch patch;
     patch.path = dir;
     try {
+        graph::detail::validatePatchFiles(dir);
         patch.surface = std::make_shared<QuadSurface>(dir);
         patch.uuid = patch.surface->objectUuid();
         if (!vc::util::isUuid(patch.uuid)) {
@@ -823,9 +825,12 @@ DetectorReport linkPatchOverlaps(graph::GraphDb& db, const std::filesystem::path
     for (const auto& [reason, count] : rejections)
         report.problems.push_back("patch-overlap: " + std::to_string(count) + " pair(s) rejected: " + reason);
 
-    DetectorReport committed = commitCandidates(db, kPatchOverlapDetector, 1, candidates, params.replaceStalePending, nullptr, progress);
+    StaleEdgeScope scope{{params.edgeKind}, {}};
+    for (const auto& patch : patches) scope.objectUuids.push_back(patch.uuid);
+    DetectorReport committed = commitCandidates(db, kPatchOverlapDetector, 1, candidates, params.replaceStalePending, &scope, progress);
     report.candidatesFound = committed.candidatesFound;
     report.edgesCreated = committed.edgesCreated;
+    report.edgesUpdated = committed.edgesUpdated;
     report.edgesSkippedExisting = committed.edgesSkippedExisting;
     report.staleRemoved = committed.staleRemoved;
     return report;

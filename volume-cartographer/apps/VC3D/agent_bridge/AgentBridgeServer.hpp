@@ -5,7 +5,9 @@
 //
 // Everything here runs on the Qt GUI thread: QLocalSocket delivers readyRead on
 // the main thread, so no extra thread is required and handlers may touch the UI
-// directly. Handlers must never spin a nested event loop (no dialog exec()).
+// directly. Expensive graph queries defer their response and run on workers
+// holding a database handle, without touching UI objects. Handlers must never
+// spin a nested event loop (no dialog exec()).
 
 #include <QByteArray>
 #include <QHash>
@@ -17,6 +19,7 @@
 #include <QStringList>
 
 #include <deque>
+#include <atomic>
 #include <functional>
 #include <optional>
 #include <vector>
@@ -147,6 +150,7 @@ private:
     // Unified graph DB (read-only, opt-in via --graph-db /
     // graph/db_path; AgentBridgeHandlers_graph.cpp). All throw
     // -32000 when no graph database is open.
+    QJsonObject deferGraphQuery(std::function<QJsonObject(const std::atomic_bool*)> query);
     QJsonObject handleGraphStatus(const QJsonValue& params);
     QJsonObject handleGraphObject(const QJsonValue& params);
     QJsonObject handleGraphNeighbours(const QJsonValue& params);

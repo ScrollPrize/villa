@@ -11,6 +11,7 @@
 #include <QString>
 
 #include <optional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -23,8 +24,10 @@ public:
     // closed). An empty path just closes and returns true.
     bool open(const QString& path, QString* errorMessage = nullptr);
     void close();
-    bool isOpen() const { return db_.has_value(); }
+    bool isOpen() const { return bool(db_); }
     QString path() const { return path_; }
+    // Acquire on the GUI thread; workers retain the open DB through close/reopen.
+    std::shared_ptr<vc::graph::GraphDb> readHandle() const { requireDb(); return db_; }
 
     // Query passthroughs. Each runs in its own short read transaction.
     // Throws std::runtime_error when no graph DB is open or on a
@@ -40,6 +43,6 @@ public:
 
 private:
     vc::graph::GraphDb& requireDb() const;
-    mutable std::optional<vc::graph::GraphDb> db_;
+    std::shared_ptr<vc::graph::GraphDb> db_;
     QString path_;
 };

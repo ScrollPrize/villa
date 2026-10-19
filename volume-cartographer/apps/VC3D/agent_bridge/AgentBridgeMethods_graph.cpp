@@ -19,7 +19,7 @@ void AgentBridgeServer::registerGraphHandlers()
     registerMethod(
         {
             .name = QStringLiteral("graph.status"),
-            .errors = {-32602, -32000},
+            .errors = {-32602, -32000, -32004, -32005, -32010},
             .mcp = mcp(QStringLiteral("vc3d_graph_status")),
         },
         [this](const QJsonValue& p) { return handleGraphStatus(p); });
@@ -30,7 +30,7 @@ void AgentBridgeServer::registerGraphHandlers()
             .params = {
                 Params::requiredString(QStringLiteral("uuid")),
             },
-            .errors = {-32602, -32000, -32007},
+            .errors = {-32602, -32000, -32007, -32004, -32005, -32010},
             .mcp = mcp(QStringLiteral("vc3d_graph_object")),
         },
         [this](const QJsonValue& p) { return handleGraphObject(p); });
@@ -43,7 +43,7 @@ void AgentBridgeServer::registerGraphHandlers()
                 Params::optionalString(QStringLiteral("edgeKind")),
                 Params::optionalString(QStringLiteral("neighbourKind")),
             },
-            .errors = {-32602, -32000, -32007},
+            .errors = {-32602, -32000, -32007, -32004, -32005, -32010},
             .mcp = mcp(QStringLiteral("vc3d_graph_neighbours")),
         },
         [this](const QJsonValue& p) { return handleGraphNeighbours(p); });
@@ -54,7 +54,7 @@ void AgentBridgeServer::registerGraphHandlers()
             .params = {
                 Params::requiredString(QStringLiteral("uuid")),
             },
-            .errors = {-32602, -32000, -32007},
+            .errors = {-32602, -32000, -32007, -32004, -32005, -32010},
             .mcp = mcp(QStringLiteral("vc3d_graph_edges")),
         },
         [this](const QJsonValue& p) { return handleGraphEdges(p); });
@@ -68,7 +68,7 @@ void AgentBridgeServer::registerGraphHandlers()
                     QStringLiteral("edgeKinds"),
                     AgentBridgeParamType::String),
             },
-            .errors = {-32602, -32000, -32007},
+            .errors = {-32602, -32000, -32007, -32004, -32005, -32010},
             .mcp = mcp(QStringLiteral("vc3d_graph_component")),
         },
         [this](const QJsonValue& p) { return handleGraphComponent(p); });

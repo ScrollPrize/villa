@@ -50,6 +50,7 @@ struct DetectorReport {
     int64_t objectsConsidered = 0;   // objects the pass examined
     int64_t candidatesFound = 0;     // candidates produced (before dedupe)
     int64_t edgesCreated = 0;
+    int64_t edgesUpdated = 0;
     int64_t edgesSkippedExisting = 0;
     int64_t staleRemoved = 0;        // own pending edges replaced on re-run
     std::vector<std::string> problems;
@@ -66,14 +67,15 @@ struct StaleEdgeScope {
 // - each new edge gets meta.detector = {name, version, score?} merged
 //   over candidate.meta, and starts life 'pending' (vc_graph default);
 // - candidates already present (same kind, endpoints, anchor indexes)
-//   are skipped, whatever their approval state or provenance;
+//   refresh this detector's pending edges when replacement is enabled,
+//   preserving their UUIDs and graph annotations; unchanged edges are skipped;
 // - when replaceStalePending is true, this detector's own *pending*
 //   edges (matched by meta.detector.name) that are not among the
 //   candidates are removed first. The scan covers the edge kinds
 //   present in this batch (a detector re-run emits its kinds even
 //   when individual pairs change; an empty batch removes nothing).
 //   Approved, rejected, manually created, and other detectors'
-//   edges are never touched.
+//   edges are never touched by detector reconciliation.
 // - with staleScope, stale removal uses its explicit kinds and requires
 //   both endpoints in its object set, including for an empty batch.
 // - a candidate with a changed nonempty meta.anchor_index_space replaces

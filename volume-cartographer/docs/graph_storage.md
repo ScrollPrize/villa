@@ -101,3 +101,44 @@ is accepted as isotropic; migration copies the stored scalar to both axes.
 Anisotropy previously discarded by v1 cannot be recovered from the database.
 Patch import also reads the nested bounding box in `meta.json`; malformed scale
 or bounding-box fields are reported and that patch is skipped.
+
+### Source imports and link reconciliation
+
+Legacy file import seeds object names, tags, and metadata on first registration.
+Subsequent fiber/track imports preserve those database-owned annotations and
+refresh only source descriptors and measurements. A changed legacy fiber file
+invalidates connected-link approvals. Once an object has stored geometry,
+legacy import refuses to refresh it from external files; use geometry ingestion
+to publish a new revision instead. Stored geometry remains authoritative.
+
+Newly imported fiber branches carry `meta.source_import="fiber-json"`. Re-import
+refreshes their anchors while preserving UUIDs and graph annotations, resets
+approval on changes, and removes branches absent from both successfully parsed
+endpoint files. Missing, unreadable, and omitted files do not establish removal.
+Unmarked pre-existing branches have ambiguous ownership and are left alone;
+they are not retroactively claimed as importer-owned.
+
+Detector reruns refresh their own pending edges when replacement is enabled,
+including coordinates, directions, scores, and supplied metadata fields. They
+retain edge UUIDs, tags, and metadata keys outside the detector's supplied fields.
+Unchanged edges remain no-ops. Reviewed edges, manual edges, and edges belonging
+to other detectors remain protected. Reports distinguish `edges_updated` from
+newly created and skipped edges. Patch-overlap stale deletion is limited to
+pairs whose patches both loaded successfully, including when a run finds no
+candidates. Damaged TIFFs and interrupted saves are excluded from that scope.
+
+Stored-geometry publication already resets connected-link approvals and leaves
+revision bindings stale. Refreshing edge content does not assert that an external
+file detector ran against the stored revision: explicit geometry revalidation
+is still required before approving stale links.
+
+Object and edge insertion share a UUID namespace: ordinary writes reject a UUID
+already used by the other record type, including casing variants. This does not
+repair collisions that may already exist in older databases.
+
+`objectCount` / Python `object_count` uses an indexed aggregate. Component and
+bounded-depth queries probe endpoint indexes as they visit nodes instead of
+materializing all graph edges. Bridge graph queries execute on worker threads
+and retain the opened database through controller close/reopen. Responses retain
+the existing JSON shape; deferred queries have a 30-second deadline, and component
+traversal observes cancellation when the request expires or the server closes.

@@ -197,12 +197,16 @@ public:
     std::optional<ObjectRecord> objectByUuid(const Txn& txn, const std::string& uuid) const;
     std::vector<ObjectRecord> objectsByKind(const Txn& txn, const std::string& kind,
                                             const std::optional<std::string>& approvalState = std::nullopt) const;
+    int64_t objectCount(const Txn& txn, const std::string& kind) const;
     std::vector<ObjectRecord> objectsByTag(const Txn& txn, const std::string& tag) const;
     void deleteObject(WriteTxn& txn, const std::string& uuid);  // fails while edges or retained geometry reference it
 
     // Edges. addEdge normalises endpoint order (swapping anchors to
     // match) and enforces (kind, endpoints, anchors) uniqueness.
     std::string addEdge(WriteTxn& txn, const EdgeRecord& record);
+    // Refresh anchors/tags/meta while retaining UUID, endpoints, kind and history.
+    // Changes reset approval; revision bindings remain stale until explicitly checked.
+    void updateEdge(WriteTxn& txn, const EdgeRecord& record);
     std::optional<EdgeRecord> edgeByUuid(const Txn& txn, const std::string& uuid) const;
     void removeEdge(WriteTxn& txn, const std::string& uuid);
     std::vector<EdgeRecord> edgesOf(const Txn& txn, const std::string& objectUuid) const;

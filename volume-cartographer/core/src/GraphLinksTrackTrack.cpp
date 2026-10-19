@@ -44,7 +44,7 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
     try {
         checkCancelled(cancel);
         std::map<std::string, std::vector<graph::ObjectRecord>> datasets;
-        std::set<std::string> requested(params.trackUuids.begin(), params.trackUuids.end());
+        const auto requested = detail::requestedTrackUuids(params.trackUuids);
         std::vector<graph::ObjectRecord> registered;
         if (params.tracksPath.empty()) {
             auto read = db.read();
@@ -210,6 +210,7 @@ DetectorReport linkTracksToTracks(graph::GraphDb& db, const TrackTrackParams& pa
         transaction.commit();
         report.candidatesFound = committed.candidatesFound;
         report.edgesCreated = committed.edgesCreated;
+        report.edgesUpdated = committed.edgesUpdated;
         report.edgesSkippedExisting = committed.edgesSkippedExisting;
         report.staleRemoved = committed.staleRemoved;
         report.problems = committed.problems;

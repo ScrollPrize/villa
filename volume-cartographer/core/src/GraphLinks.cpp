@@ -148,7 +148,7 @@ DetectorReport commitCandidates(graph::GraphDb& db, graph::WriteTxn& txn,
     for (const auto& c : candidates) {
         util::reportProgress(progress, "writing links", processed++, candidates.size());
         const std::string key = candidateKey(c);
-        if (!seen.insert(key).second || existing.contains(key)) {
+        if (!seen.insert(key).second) {
             ++report.edgesSkippedExisting;
             continue;
         }
@@ -167,8 +167,24 @@ DetectorReport commitCandidates(graph::GraphDb& db, graph::WriteTxn& txn,
         e.bAnchor = c.bAnchor;
         e.tags = c.tags;
         e.meta = meta.dump();
-        db.addEdge(txn, e);  // starts 'pending' until reviewed
-        ++report.edgesCreated;
+        if (const auto found = existing.find(key); found != existing.end()) {
+            const auto& old = found->second;
+            if (!replaceStalePending || old.approvalState != "pending" || !isDetectorsOwnEdge(old, detectorName)) {
+                ++report.edgesSkippedExisting;
+                continue;
+            }
+            e.uuid = old.uuid;
+            auto merged = nlohmann::json::parse(old.meta);
+            merged.update(meta); // preserve graph annotations outside detector-owned keys
+            e.meta = merged.dump();
+            e.tags.insert(e.tags.end(), old.tags.begin(), old.tags.end());
+            db.updateEdge(txn, e);
+            if (db.edgeByUuid(txn, e.uuid)->generation == old.generation) ++report.edgesSkippedExisting;
+            else ++report.edgesUpdated;
+        } else {
+            db.addEdge(txn, e);  // starts 'pending' until reviewed
+            ++report.edgesCreated;
+        }
     }
 
     util::reportProgress(progress, "writing links", candidates.size(), candidates.size());

@@ -237,7 +237,7 @@ try {
         progress.finish();
         std::cout << "track-tracks: " << report.objectsConsidered << " tracks, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
-                  << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
+                  << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
         for (const auto& problem : report.problems)
             std::cerr << "  ! " << problem << "\n";
         trackLinkFailed = !report.problems.empty();
@@ -249,7 +249,7 @@ try {
         progress.finish();
         std::cout << "patch-overlaps: " << report.objectsConsidered << " patches, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
-                  << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
+                  << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
         for (const auto& problem : report.problems)
             std::cerr << "  ! " << problem << "\n";
     }
@@ -261,7 +261,7 @@ try {
         progress.finish();
         std::cout << "track-patches: " << report.objectsConsidered << " objects, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
-                  << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
+                  << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
         for (const auto& problem : report.problems)
             std::cerr << "  ! " << problem << "\n";
         trackLinkFailed |= !report.problems.empty();
@@ -274,7 +274,7 @@ try {
         progress.finish();
         std::cout << "fiber-patches: " << report.objectsConsidered << " objects, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
-                  << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
+                  << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
         for (const auto& problem : report.problems)
             std::cerr << "  ! " << problem << "\n";
     }
@@ -285,7 +285,7 @@ try {
         progress.finish();
         std::cout << "pcl-patches: " << report.objectsConsidered << " objects, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
-                  << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
+                  << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
         for (const auto& problem : report.problems) std::cerr << "  ! " << problem << "\n";
     }
     if (!importJsonPath.empty()) {

@@ -949,6 +949,7 @@ DetectorReport linkLinesToPatches(graph::GraphDb& db, size_t lineCount, const Li
         txn.commit();
         report.candidatesFound = committed.candidatesFound;
         report.edgesCreated = committed.edgesCreated;
+        report.edgesUpdated = committed.edgesUpdated;
         report.edgesSkippedExisting = committed.edgesSkippedExisting;
         report.staleRemoved = committed.staleRemoved;
     } catch (const std::exception&) {

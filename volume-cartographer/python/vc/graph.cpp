@@ -267,6 +267,7 @@ nb::dict detectorReportToPy(const vc::graph_links::DetectorReport& rep)
     d["objects_considered"] = rep.objectsConsidered;
     d["candidates_found"] = rep.candidatesFound;
     d["edges_created"] = rep.edgesCreated;
+    d["edges_updated"] = rep.edgesUpdated;
     d["edges_skipped_existing"] = rep.edgesSkippedExisting;
     d["stale_removed"] = rep.staleRemoved;
     nb::list problems;
@@ -513,6 +514,9 @@ NB_MODULE(graph, m)
                 return out;
             },
             nb::arg("kind"), nb::arg("approval_state") = std::nullopt)
+        .def("object_count", [](PyGraphDb& self, const std::string& kind) {
+            return self.withRead([&](vg::GraphDb& db, vg::ReadTxn& txn) { return db.objectCount(txn, kind); });
+        }, nb::arg("kind"))
         .def(
             "objects_by_tag",
             [](PyGraphDb& self, const std::string& tag) {

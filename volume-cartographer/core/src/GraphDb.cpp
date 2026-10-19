@@ -824,6 +824,9 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
     if (rec.meta.empty())
         rec.meta = "{}";
     const auto uuid = parseUuid(rec.uuid);
+    Statement collision(db, "SELECT 1 FROM edges WHERE uuid=?");
+    collision.bindBlob(1, uuid);
+    if (collision.row()) throw std::runtime_error("graph db: UUID already belongs to an edge");
     const std::string now = nowIsoUtc();
     Statement managed(db, "SELECT o.data_generation,o.data_checksum,o.storage_ref FROM objects o JOIN geometry_heads h ON h.object_uuid=o.uuid WHERE o.uuid=?");
     managed.bindBlob(1, uuid);
@@ -960,6 +963,8 @@ std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::strin
         rec.uuid = util::newUuid();
     if (rec.meta.empty())
         rec.meta = "{}";
+    if (objectIdByUuid(db, parseUuid(rec.uuid)))
+        throw std::runtime_error("graph db: UUID already belongs to an object");
     const auto aUuid = parseUuid(rec.aUuid);
     const auto bUuid = parseUuid(rec.bUuid);
     auto aId = objectIdByUuid(db, aUuid);
@@ -1112,6 +1117,14 @@ std::vector<ObjectRecord> GraphDb::objectsByKind(const Txn& txn, const std::stri
     return out;
 }
 
+int64_t GraphDb::objectCount(const Txn& txn, const std::string& kind) const
+{
+    Statement s(GraphDbImplAccess::conn(txn), "SELECT count(*) FROM objects WHERE kind=?");
+    s.bind(1, kind);
+    (void)s.row();
+    return s.i64(0);
+}
+
 std::vector<ObjectRecord> GraphDb::objectsByTag(const Txn& txn, const std::string& tag) const
 {
     sqlite3* db = GraphDbImplAccess::conn(txn);
@@ -1143,6 +1156,42 @@ void GraphDb::deleteObject(WriteTxn& txn, const std::string& uuid)
 std::string GraphDb::addEdge(WriteTxn& txn, const EdgeRecord& record)
 {
     return addEdgeImpl(GraphDbImplAccess::conn(txn), impl_->options.author, impl_->hostname, record, false);
+}
+
+void GraphDb::updateEdge(WriteTxn& txn, const EdgeRecord& record)
+{
+    auto* db = GraphDbImplAccess::conn(txn);
+    const auto existing = edgeByUuid(txn, record.uuid);
+    if (!existing) throw std::runtime_error("graph db: edge not found: " + record.uuid);
+    auto rec = record;
+    rec.aUuid = formatUuid(parseUuid(rec.aUuid));
+    rec.bUuid = formatUuid(parseUuid(rec.bUuid));
+    if (rec.aUuid == existing->bUuid && rec.bUuid == existing->aUuid) {
+        std::swap(rec.aUuid, rec.bUuid); std::swap(rec.aAnchor, rec.bAnchor);
+    }
+    if (rec.kind != existing->kind || rec.aUuid != existing->aUuid || rec.bUuid != existing->bUuid)
+        throw std::runtime_error("graph db: edge kind and endpoints cannot change");
+    auto sameAnchor = [](const Anchor& a, const Anchor& b) {
+        return a.index == b.index && a.position == b.position && a.direction == b.direction;
+    };
+    std::sort(rec.tags.begin(), rec.tags.end());
+    rec.tags.erase(std::unique(rec.tags.begin(), rec.tags.end()), rec.tags.end());
+    if (sameAnchor(rec.aAnchor, existing->aAnchor) && sameAnchor(rec.bAnchor, existing->bAnchor) &&
+        rec.tags == existing->tags && nlohmann::json::parse(rec.meta) == nlohmann::json::parse(existing->meta)) return;
+    const auto id = *edgeIdByUuid(db, parseUuid(rec.uuid));
+    exec(db, "SAVEPOINT edge_refresh;");
+    try {
+        Statement s(db, "UPDATE edges SET a_anchor_index=?,a_anchor_x=?,a_anchor_y=?,a_anchor_z=?,a_dir_x=?,a_dir_y=?,a_dir_z=?,"
+            "b_anchor_index=?,b_anchor_x=?,b_anchor_y=?,b_anchor_z=?,b_dir_x=?,b_dir_y=?,b_dir_z=?,meta=? WHERE id=?");
+        bindAnchor(s, 1, rec.aAnchor); bindAnchor(s, 8, rec.bAnchor);
+        s.bind(15, rec.meta); s.bind(16, id); s.stepDone();
+        writeTags(db, "edge_tags", "edge_id", id, rec.tags);
+        stampContentChange(db, author(), hostname(), "edges", id, parseUuid(rec.uuid), "update_edge");
+        exec(db, "RELEASE edge_refresh;");
+    } catch (...) {
+        exec(db, "ROLLBACK TO edge_refresh; RELEASE edge_refresh;");
+        throw;
+    }
 }
 
 std::optional<EdgeRecord> GraphDb::edgeByUuid(const Txn& txn, const std::string& uuid) const
@@ -1195,9 +1244,10 @@ std::vector<std::string> GraphDb::neighbours(const Txn& txn, const std::string& 
 {
     std::vector<std::string> out;
     std::set<std::string> seen;
-    for (const auto& e : edgesOf(txn, objectUuid)) {
+    const auto canonical = formatUuid(parseUuid(objectUuid));
+    for (const auto& e : edgesOf(txn, canonical)) {
         if (edgeKind && e.kind != *edgeKind) continue;
-        const std::string& other = (e.aUuid == objectUuid) ? e.bUuid : e.aUuid;
+        const std::string& other = (e.aUuid == canonical) ? e.bUuid : e.aUuid;
         if (!seen.insert(other).second) continue;
         if (neighbourKind) {
             auto obj = objectByUuid(txn, other);
@@ -1231,25 +1281,16 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
     const auto startBytes = parseUuid(startUuid);
     if (!objectIdByUuid(db, startBytes))
         throw std::runtime_error("graph db: object not found: " + startUuid);
-    std::string sql = "SELECT a_id,b_id FROM edges";
+    // Probe the endpoint indexes only for nodes reached by this traversal.
+    // ORDER BY id preserves the previous breadth-first visitation order.
+    std::string sql = "SELECT id,CASE WHEN a_id=? THEN b_id ELSE a_id END FROM edges WHERE (a_id=? OR b_id=?)";
     if (!edgeKindFilter.empty()) {
-        sql += " WHERE kind IN (";
+        sql += " AND kind IN (";
         for (size_t i = 0; i < edgeKindFilter.size(); ++i) sql += (i ? ",?" : "?");
         sql += ")";
     }
-    Statement s(db, sql);
-    for (size_t i = 0; i < edgeKindFilter.size(); ++i) s.bind(int(i) + 1, edgeKindFilter[i]);
-    std::unordered_map<int64_t, std::vector<int64_t>> adjacency;
-    try {
-        while (s.row()) {
-            adjacency[s.i64(0)].push_back(s.i64(1));
-            adjacency[s.i64(1)].push_back(s.i64(0));
-        }
-    } catch (const std::runtime_error&) {
-        checkCancelled();  // SQL was interrupted by the progress handler
-        throw;
-    }
-    checkCancelled();
+    sql += " ORDER BY id";
+    Statement adjacent(db, sql);
     const int64_t startId = *objectIdByUuid(db, startBytes);
     std::vector<std::string> out;
     std::unordered_set<int64_t> visited{startId};
@@ -1261,8 +1302,19 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
         queue.pop();
         out.push_back(uuidTextByObjectId(db, id));
         if (depth >= maxDepth) continue;
-        for (int64_t next : adjacency[id])
-            if (visited.insert(next).second) queue.emplace(next, depth + 1);
+        adjacent.reset();
+        adjacent.bind(1, id); adjacent.bind(2, id); adjacent.bind(3, id);
+        for (size_t i = 0; i < edgeKindFilter.size(); ++i) adjacent.bind(int(i) + 4, edgeKindFilter[i]);
+        try {
+            while (adjacent.row()) {
+                checkCancelled();
+                const auto next = adjacent.i64(1);
+                if (visited.insert(next).second) queue.emplace(next, depth + 1);
+            }
+        } catch (const std::runtime_error&) {
+            checkCancelled(); // translate SQLite's interrupt into the cancellation contract
+            throw;
+        }
     }
     return out;
 }
@@ -1894,12 +1946,17 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
             report.problems.push_back(file.filename().string() + ": missing/invalid uuid, skipped");
             continue;
         }
+        if (db.currentGeometry(txn, uuid)) {
+            report.problems.push_back(file.filename().string() +
+                ": geometry is database-owned; use ingestGeometrySource to publish a revision (legacy branch import skipped)");
+            continue;
+        }
         Parsed p;
         p.path = file;
         p.fileName = file.filename().string();
         p.checksum = fnvHashHex(text);
         ObjectRecord& o = p.object;
-        o.uuid = uuid;
+        o.uuid = formatUuid(parseUuid(uuid));
         o.kind = "fiber";
         o.name = file.stem().string();
         o.formatVersion = root.value("version", int64_t(1));
@@ -1960,13 +2017,23 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
     size_t objectIndex = 0;
     for (const auto& p : parsed) {
         util::reportProgress(progress, "registering fibers", objectIndex++, parsed.size());
+        auto refreshed = p.object;
         if (auto existing = db.objectByUuid(txn, p.object.uuid)) {
             if (existing->dataChecksum && *existing->dataChecksum == p.checksum) {
                 db.setFiberLength(txn, p.object.uuid, p.object.fiber->length);
                 continue;
             }
+            // Files seed annotations once. Subsequent imports own only the
+            // source descriptor and measurements, not graph names/tags/meta.
+            refreshed.name = existing->name;
+            refreshed.tags = existing->tags;
+            refreshed.meta = existing->meta;
+            refreshed.dataGeneration = existing->dataGeneration + 1;
+            for (const auto& edge : db.edgesOf(txn, existing->uuid))
+                stampContentChange(GraphDbImplAccess::conn(txn), db.author(), db.hostname(), "edges",
+                    *edgeIdByUuid(GraphDbImplAccess::conn(txn), parseUuid(edge.uuid)), parseUuid(edge.uuid), "geometry_invalidated");
         }
-        db.upsertObject(txn, p.object);
+        db.upsertObject(txn, refreshed);
         ++report.objectsImported;
     }
 
@@ -1982,7 +2049,8 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
         return false;
     };
 
-    std::set<std::string> seenPairs;
+    std::set<std::string> seenPairs, retainedBranches, importedObjects;
+    for (const auto& p : parsed) importedObjects.insert(p.object.uuid);
     size_t branchIndex = 0;
     for (const auto& p : parsed) {
         util::reportProgress(progress, "importing fiber branches", branchIndex++, parsed.size());
@@ -2002,30 +2070,46 @@ ImportReport importFibers(GraphDb& db, WriteTxn& txn, const std::filesystem::pat
                                           " (edge imported from this side only)");
             if (!seenPairs.insert(pairKey).second)
                 continue;
-            // Skip if an identical edge already exists (idempotent re-import).
-            bool exists = false;
-            for (const auto& e : db.edgesOf(txn, p.object.uuid)) {
-                const std::string& other = e.aUuid == p.object.uuid ? e.bUuid : e.aUuid;
-                const Anchor& mine = e.aUuid == p.object.uuid ? e.aAnchor : e.bAnchor;
-                const Anchor& theirs = e.aUuid == p.object.uuid ? e.bAnchor : e.aAnchor;
-                if (other == target.object.uuid && e.kind == "fiber_branch" && mine.index == b.local.index &&
-                    theirs.index == b.target.index) {
-                    exists = true;
+            std::optional<EdgeRecord> existing;
+            for (const auto& edge : db.edgesOf(txn, p.object.uuid)) {
+                const bool forward = edge.aUuid == p.object.uuid;
+                if ((forward ? edge.bUuid : edge.aUuid) == target.object.uuid && edge.kind == "fiber_branch" &&
+                    (forward ? edge.aAnchor : edge.bAnchor).index == b.local.index &&
+                    (forward ? edge.bAnchor : edge.aAnchor).index == b.target.index) {
+                    existing = edge;
                     break;
                 }
             }
-            if (exists) continue;
-            EdgeRecord e;
-            e.kind = "fiber_branch";
-            e.aUuid = p.object.uuid;
-            e.bUuid = target.object.uuid;
-            e.aAnchor = b.local;
-            e.bAnchor = b.target;
-            e.meta = nlohmann::json{{"adjacent", b.adjacent}}.dump();
-            e.approvalState = b.pending ? "pending" : "approved";
-            addEdgeImpl(GraphDbImplAccess::conn(txn), db.author(), db.hostname(), e, true);
+            if (existing) {
+                retainedBranches.insert(existing->uuid);
+                auto meta = nlohmann::json::parse(existing->meta);
+                // Unmarked legacy/manual edges have ambiguous ownership. Do
+                // not silently claim or delete them based on external files.
+                if (meta.value("source_import", "") != "fiber-json") continue;
+                auto refreshed = *existing;
+                refreshed.aUuid = p.object.uuid; refreshed.bUuid = target.object.uuid;
+                refreshed.aAnchor = b.local; refreshed.bAnchor = b.target;
+                meta["adjacent"] = b.adjacent;
+                refreshed.meta = meta.dump();
+                db.updateEdge(txn, refreshed);
+                continue;
+            }
+            EdgeRecord edge;
+            edge.kind = "fiber_branch";
+            edge.aUuid = p.object.uuid; edge.bUuid = target.object.uuid;
+            edge.aAnchor = b.local; edge.bAnchor = b.target;
+            edge.meta = nlohmann::json{{"adjacent", b.adjacent}, {"source_import", "fiber-json"}}.dump();
+            edge.approvalState = b.pending ? "pending" : "approved";
+            retainedBranches.insert(addEdgeImpl(GraphDbImplAccess::conn(txn), db.author(), db.hostname(), edge, true));
             ++report.edgesImported;
         }
+    }
+    // Only reconcile this importer's edges when both files were parsed.
+    // Missing, unreadable, or omitted files cannot establish branch removal.
+    for (const auto& edge : db.edgesByKind(txn, "fiber_branch")) {
+        if (!importedObjects.contains(edge.aUuid) || !importedObjects.contains(edge.bUuid) || retainedBranches.contains(edge.uuid)) continue;
+        const auto meta = nlohmann::json::parse(edge.meta);
+        if (meta.value("source_import", "") == "fiber-json") db.removeEdge(txn, edge.uuid);
     }
     util::reportProgress(progress, "importing fiber branches", parsed.size(), parsed.size());
     return report;
@@ -2150,7 +2234,12 @@ ImportReport importTrackList(GraphDb& db, WriteTxn& txn, const std::filesystem::
         auto it = registered.find({datasetRef, externalKey});
         if (it != registered.end()) {
             const ObjectRecord& cur = it->second;
-            const bool unchanged = cur.name == o.name && cur.tags == o.tags && cur.meta == o.meta && cur.track &&
+            o.name = cur.name; o.tags = cur.tags; o.meta = cur.meta;
+            if (db.currentGeometry(txn, cur.uuid)) {
+                report.problems.push_back(label + ": geometry is database-owned; use ingestGeometrySource to publish a revision");
+                continue;
+            }
+            const bool unchanged = cur.track &&
                                    cur.track->family == t.family && cur.track->pointCount == t.pointCount &&
                                    cur.track->length == t.length && cur.track->bbox == t.bbox;
             if (unchanged)

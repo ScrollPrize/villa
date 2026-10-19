@@ -14,6 +14,16 @@ void checkCancelled(const std::atomic_bool* cancel)
     if (cancel && cancel->load()) throw std::runtime_error("track loading cancelled");
 }
 }
+std::set<std::string> requestedTrackUuids(const std::vector<std::string>& uuids)
+{
+    std::set<std::string> result;
+    for (auto uuid : uuids) {
+        if (!util::isUuid(uuid)) throw std::runtime_error("invalid track UUID: " + uuid);
+        std::transform(uuid.begin(), uuid.end(), uuid.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+        result.insert(std::move(uuid));
+    }
+    return result;
+}
 TrackInput loadTrackInput(graph::GraphDb& db, const std::filesystem::path& path,
     const std::vector<uint64_t>& sourceIds, const std::vector<std::string>& trackUuids,
     const std::atomic_bool* cancel, const util::ProgressCallback& progress)
@@ -21,7 +31,7 @@ TrackInput loadTrackInput(graph::GraphDb& db, const std::filesystem::path& path,
     checkCancelled(cancel);
     util::reportProgress(progress, "opening track dataset");
     TrackInput result;
-    std::set<std::string> requested(trackUuids.begin(), trackUuids.end());
+    const auto requested = requestedTrackUuids(trackUuids);
     std::vector<graph::ObjectRecord> registered;
     {
         auto read = db.read();

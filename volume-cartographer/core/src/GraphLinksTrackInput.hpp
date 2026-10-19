@@ -2,7 +2,10 @@
 #include "vc/core/graph_links/GraphLinks.hpp"
 #include "vc/core/util/PackedTrackStore.hpp"
 #include "GraphTrackInput.hpp"
+#include <set>
 namespace vc::graph_links::detail {
+// Normalize before deduplication so casing variants select one object.
+std::set<std::string> requestedTrackUuids(const std::vector<std::string>& uuids);
 struct TrackInput {
     std::filesystem::path packedPath;
     std::string datasetRef;
