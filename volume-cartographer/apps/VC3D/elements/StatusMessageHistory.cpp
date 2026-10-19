@@ -4,11 +4,20 @@
 #include <QClipboard>
 #include <QGuiApplication>
 #include <QMenu>
+#include <QRegularExpression>
+#include <QStyle>
 
 #include <algorithm>
 
 namespace {
 constexpr int kMaxMenuTextLength = 120;
+
+// The text with each number (digits, with any decimal part) replaced by '#'.
+QString withoutNumbers(const QString& text)
+{
+    static const QRegularExpression number(QStringLiteral("\\d+(?:[.,]\\d+)*"));
+    return QString(text).replace(number, QStringLiteral("#"));
+}
 }
 
 StatusMessageHistory::StatusMessageHistory(std::size_t capacity)
@@ -22,8 +31,9 @@ void StatusMessageHistory::add(const QString& text, const QDateTime& time)
     if (trimmed.isEmpty()) {
         return;
     }
-    if (!_entries.empty() && _entries.back().text == trimmed) {
+    if (!_entries.empty() && repeats(_entries.back().text, trimmed)) {
         _entries.back().time = time;
+        _entries.back().text = trimmed;
         ++_entries.back().repeats;
         return;
     }
@@ -31,6 +41,11 @@ void StatusMessageHistory::add(const QString& text, const QDateTime& time)
     while (_entries.size() > _capacity) {
         _entries.pop_front();
     }
+}
+
+bool StatusMessageHistory::repeats(const QString& a, const QString& b)
+{
+    return a == b || withoutNumbers(a) == withoutNumbers(b);
 }
 
 QString StatusMessageHistory::formatEntry(const Entry& entry)
@@ -56,7 +71,12 @@ StatusMessageHistoryButton::StatusMessageHistoryButton(QWidget* parent)
     , _menu(new QMenu(this))
 {
     setObjectName(QStringLiteral("statusMessageHistoryButton"));
+    // Icon only; the text stays for accessibility and for styles without
+    // the icon.
     setText(tr("History"));
+    setIcon(style()->standardIcon(QStyle::SP_FileDialogDetailedView));
+    setToolButtonStyle(icon().isNull() ? Qt::ToolButtonTextOnly : Qt::ToolButtonIconOnly);
+    setAccessibleName(tr("Status message history"));
     setAutoRaise(true);
     setPopupMode(QToolButton::InstantPopup);
     _menu->setObjectName(QStringLiteral("statusMessageHistoryMenu"));
@@ -75,8 +95,8 @@ void StatusMessageHistoryButton::record(const QString& text)
 void StatusMessageHistoryButton::updateToolTip()
 {
     const auto count = static_cast<int>(_history.entries().size());
-    setToolTip(count == 0 ? tr("Recent status messages (none yet)")
-                          : tr("Recent status messages (%1)").arg(count));
+    setToolTip(count == 0 ? tr("Status message history (none yet)")
+                          : tr("Status message history (%1)").arg(count));
 }
 
 void StatusMessageHistoryButton::rebuildMenu()

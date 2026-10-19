@@ -434,6 +434,9 @@ private:
     QTimer* _persistentCacheSpaceTimer{nullptr};
     bool _persistentCacheBannerShownThisSession{false};
     QStringList _sharedCacheStatsItems;
+    // When the cache readout last needed its full width (ms since epoch); it
+    // narrows only after a few seconds without needing it.
+    qint64 _sharedCacheStatsWideAtMs{0};
     QString _segmentationGrowthStatusText;
     QString _lastSegmentTransformWarningVolumeId;
     bool _relayingNativeStatusMessage{false};

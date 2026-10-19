@@ -8962,13 +8962,19 @@ void CWindow::updateSharedStatusLabel()
     }
     const QString text = items.join(QStringLiteral("  "));
     _sharedCacheStatsLabel->setText(text);
-    // Grow but never shrink, so the widgets beside it stop shifting whenever
-    // a number gets shorter.
+    // Grow at once, but narrow only once the text has fit in less for a few
+    // seconds, so the widgets beside it stop shifting whenever a number gets
+    // shorter, and one long reading does not keep it wide.
+    constexpr qint64 kNarrowAfterMs = 5000;
     const QMargins margins = _sharedCacheStatsLabel->contentsMargins();
-    _sharedCacheStatsLabel->setMinimumWidth(std::max(
-        _sharedCacheStatsLabel->minimumWidth(),
-        _sharedCacheStatsLabel->fontMetrics().horizontalAdvance(text) +
-        margins.left() + margins.right()));
+    const int needed = _sharedCacheStatsLabel->fontMetrics().horizontalAdvance(text) +
+                       margins.left() + margins.right();
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (needed >= _sharedCacheStatsLabel->minimumWidth() ||
+        now - _sharedCacheStatsWideAtMs > kNarrowAfterMs) {
+        _sharedCacheStatsLabel->setMinimumWidth(needed);
+        _sharedCacheStatsWideAtMs = now;
+    }
 }
 
 // Open volume package
