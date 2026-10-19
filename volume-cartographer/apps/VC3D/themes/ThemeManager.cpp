@@ -22,9 +22,11 @@ namespace {
 
 constexpr int kLiveReloadDelayMs = 200;
 constexpr int kStatusMessageMs = 15000;
+#if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
 // How long after a theme stops forcing its color scheme the platform's next
-// report is taken as the system preference (Qt 6.8 and newer).
+// report is taken as the system preference.
 constexpr int kSchemeSettleMs = 2000;
+#endif
 
 // Widget classes that platform themes (macOS, Windows, KDE) give palettes of
 // their own. Setting the application palette clears those, so classic puts
