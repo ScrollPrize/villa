@@ -25,6 +25,7 @@ import math
 import os
 import re
 import sys
+import threading
 import urllib.request
 from typing import Any, Sequence
 
@@ -223,6 +224,66 @@ def tangent_points(P: np.ndarray, N: np.ndarray, radius: float, rng: np.random.G
 
 def is_tifxyz(src: str) -> bool:
     return os.path.isdir(src) and all(os.path.exists(os.path.join(src, f)) for f in ("x.tif", "y.tif", "z.tif"))
+
+
+# --------------------------------------------------------------------------- chunk cache
+
+
+class ChunkCache:
+    """Array-like over ``vol`` that keeps every native chunk it reads as a ``.npy`` under ``root``.
+
+    A second run against the same remote volume (another surface, the controls'
+    re-reads, a rerun with other settings) then reads from disk instead of the
+    server. Files are keyed by the volume's shape, chunk size and dtype, so a
+    different volume or level gets its own directory. Leading non-spatial axes
+    are read at index 0. Writes go through a temp file and ``os.replace`` so
+    concurrent threads never see a partial chunk.
+    """
+
+    def __init__(self, vol, root: str, default_chunk: int = 128):
+        self.vol = vol
+        self.ndim = vol.ndim
+        self.shape = tuple(int(n) for n in vol.shape)
+        self.dtype = np.dtype(vol.dtype)
+        self.spatial = self.shape[-3:]
+        chunks = getattr(vol, "chunks", None) or (default_chunk,) * 3
+        self.chunks = tuple(int(c) for c in chunks[-3:])
+        tag = "x".join(map(str, self.spatial)) + "_c" + "x".join(map(str, self.chunks)) + "_" + self.dtype.name
+        self.root = os.path.join(root, tag)
+        os.makedirs(self.root, exist_ok=True)
+        self.fetched = 0
+
+    def _chunk(self, c: tuple[int, int, int]) -> np.ndarray:
+        path = os.path.join(self.root, f"{c[0]}_{c[1]}_{c[2]}.npy")
+        if os.path.exists(path):
+            return np.load(path)
+        lo = [ci * s for ci, s in zip(c, self.chunks)]
+        hi = [min(l + s, n) for l, s, n in zip(lo, self.chunks, self.spatial)]
+        index = (0,) * (self.ndim - 3) + tuple(slice(l, h) for l, h in zip(lo, hi))
+        arr = np.asarray(self.vol[index]).reshape([h - l for l, h in zip(lo, hi)])
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(tmp, "wb") as f:
+            np.save(f, arr)
+        os.replace(tmp, path)
+        self.fetched += 1
+        return arr
+
+    def __getitem__(self, index) -> np.ndarray:
+        sl = index[-3:]
+        lo = [int(s.start or 0) for s in sl]
+        hi = [int(n if s.stop is None else s.stop) for s, n in zip(sl, self.spatial)]
+        out = np.empty([h - l for l, h in zip(lo, hi)], self.dtype)
+        ranges = [range(l // c, (h - 1) // c + 1) for l, h, c in zip(lo, hi, self.chunks)]
+        for cz in ranges[0]:
+            for cy in ranges[1]:
+                for cx in ranges[2]:
+                    blk = self._chunk((cz, cy, cx))
+                    b0 = [ci * s for ci, s in zip((cz, cy, cx), self.chunks)]
+                    src = tuple(slice(max(l - b, 0), min(h - b, n)) for l, h, b, n in zip(lo, hi, b0, blk.shape))
+                    dst = tuple(slice(max(b - l, 0), max(b - l, 0) + (sr.stop - sr.start))
+                                for sr, l, b in zip(src, lo, b0))
+                    out[dst] = blk[src]
+        return out
 
 
 # --------------------------------------------------------------------------- profiles
@@ -441,6 +502,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-prominence", type=float, default=0.15, help="peak prominence as a fraction of the profile range")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--workers", type=int, default=8, help="threads for volume reads (default 8)")
+    p.add_argument("--cache", metavar="DIR", help="keep every CT chunk read under DIR (.npy per chunk); "
+                   "reruns against the same volume read from disk instead of the server")
     p.add_argument("--plot", action="store_true")
     p.add_argument("--fail-on", action="append", default=[], metavar="METRIC=MAX",
                    help="exit 2 if any surface exceeds MAX for METRIC (e.g. offset_abs_gt_2_frac=0.5)")
@@ -454,6 +517,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     limits = parse_fail_on(a.fail_on)
     vol = open_volume(a.volume, a.level)
+    if a.cache:
+        vol = ChunkCache(vol, a.cache)
     os.makedirs(a.out, exist_ok=True)
     rng = np.random.default_rng(a.seed)
     rows: list[dict[str, Any]] = []

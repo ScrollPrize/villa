@@ -196,3 +196,29 @@ def test_bad_arguments(tmp_path, ct):
     with pytest.raises(SystemExit):
         spa.main(["--surface", "x.obj", "--volume", ct, "--out", str(tmp_path), "--fail-on", "nope=1"])
     assert spa.main(["--surface", "x.obj", "--volume", ct, "--out", str(tmp_path), "--half", "0"]) == 1
+
+
+def test_chunk_cache_matches_direct_reads_and_reuses_chunks(tmp_path):
+    rng = np.random.default_rng(3)
+    vol = rng.integers(0, 255, (37, 50, 41), dtype=np.uint8)  # not a multiple of the chunk
+    cache = spa.ChunkCache(vol, str(tmp_path / "cache"), default_chunk=16)
+    windows = [(slice(0, 37), slice(0, 50), slice(0, 41)), (slice(15, 17), slice(31, 33), slice(16, 32)),
+               (slice(36, 37), slice(49, 50), slice(40, 41)), (slice(3, 20), slice(0, 7), slice(30, 41))]
+    for w in windows:
+        np.testing.assert_array_equal(cache[w], vol[w])
+    fetched = cache.fetched
+    assert fetched > 0 and len(list((tmp_path / "cache").rglob("*.npy"))) == fetched
+    for w in windows:
+        np.testing.assert_array_equal(cache[w], vol[w])
+    assert cache.fetched == fetched  # second pass came from disk
+
+
+def test_cache_flag_gives_the_same_result(tmp_path, ct):
+    pts = grid_points(28.0)
+    nrm = np.tile([0.0, 0.0, 1.0], (len(pts), 1))
+    write_obj(tmp_path / "s.obj", pts, nrm)
+    _, _, direct = run(tmp_path / "a", ct, [str(tmp_path / "s.obj")])
+    _, _, cached = run(tmp_path / "b", ct, [str(tmp_path / "s.obj")], "--cache", str(tmp_path / "cache"))
+    _, _, again = run(tmp_path / "c", ct, [str(tmp_path / "s.obj")], "--cache", str(tmp_path / "cache"))
+    assert direct[0]["offset_median"] == cached[0]["offset_median"] == again[0]["offset_median"]
+    assert list((tmp_path / "cache").rglob("*.npy"))
