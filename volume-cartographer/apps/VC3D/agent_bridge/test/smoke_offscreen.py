@@ -519,6 +519,26 @@ def check_viewer_registry(client: BridgeClient, results: Results) -> None:
         results.record("viewer_registry", False, f"{type(error).__name__}: {error}")
 
 
+def wait_held(client: BridgeClient, key: str, held: bool,
+              timeout: float = 5.0) -> tuple[bool, float]:
+    """Poll state.get until key is (or is no longer) in heldKeys.
+
+    Returns whether that happened within timeout and the monotonic time it
+    was seen, so checks do not depend on how fast the bridge handles a
+    request on a slow runner.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        keys = [k.get("key") for k in state.get("heldKeys", [])]
+        seen = time.monotonic()
+        if (key in keys) == held:
+            return True, seen
+        if seen >= deadline:
+            return False, seen
+        time.sleep(0.05)
+
+
 def check_canvas_input(sock_path: str, client: BridgeClient, results: Results) -> None:
     """canvas.key and canvas.wheel reach the viewer through real Qt events."""
     failures: list[str] = []
@@ -544,9 +564,9 @@ def check_canvas_input(sock_path: str, client: BridgeClient, results: Results) -
         client.call(
             "canvas.key", {"key": "F23", "action": "press", "holdMs": 100},
             timeout=RPC_TIMEOUT)
-        time.sleep(0.5)
+        released_in_time, _ = wait_held(client, "F23", held=False)
         state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
-        if state.get("heldKeys") != []:
+        if not released_in_time or state.get("heldKeys") != []:
             failures.append(f"press limit kept {state.get('heldKeys')}")
         started = time.monotonic()
         held, _ = client.call(
@@ -567,13 +587,18 @@ def check_canvas_input(sock_path: str, client: BridgeClient, results: Results) -
 
         holder = threading.Thread(target=hold, daemon=True)
         holder.start()
-        time.sleep(0.2)
+        # Release only once the bridge holds the key, however long the
+        # request took to arrive; the hold's timer started before this.
+        hold_seen, held_at = wait_held(client, "F20", held=True)
+        if not hold_seen:
+            failures.append("hold of F20 never reached heldKeys")
         client.call("canvas.key", {"key": "F20", "action": "release"}, timeout=RPC_TIMEOUT)
         client.call(
             "canvas.key", {"key": "F20", "action": "press", "holdMs": 5000},
             timeout=RPC_TIMEOUT)
         holder.join(timeout=RPC_TIMEOUT)
-        time.sleep(0.2)
+        # Look again after the first hold's 800 ms timer has fired.
+        time.sleep(max(0.0, held_at + 1.3 - time.monotonic()))
         state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
         still_held = [k.get("key") for k in state.get("heldKeys", [])]
         client.call("canvas.key", {"key": "F20", "action": "release"}, timeout=RPC_TIMEOUT)
