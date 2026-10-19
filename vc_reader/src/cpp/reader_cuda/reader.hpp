@@ -472,7 +472,7 @@ public:
     // host transfer of coordinates. Missing bricks read as fill.
     Result points_resident(const void* points, std::size_t count, int bits, const Index& base, int kind, int order, bool valid, bool sync=true) {
         ready(); std::lock_guard lock(mutex_); device::Guard guard(device_); chain();
-        if ((kind!=2 && kind!=3) || (kind==2 && bits!=32) || (bits!=32 && bits!=64) || (order!=0 && order!=1)) throw std::invalid_argument("invalid point request");
+        if ((kind!=2 && kind!=3) || (bits!=32 && bits!=64) || (order!=0 && order!=1)) throw std::invalid_argument("invalid point request");
         const bool floating=kind==2 && order; auto result=output(count,floating,valid);
         if (!count) return result;
         launch(resident_source(),nullptr,0,0,points,bits,count,base.data(),kind,order,floating,result.storage->ptr,mask(result));
@@ -497,7 +497,7 @@ public:
     }
 private:
     std::set<std::int64_t> discover_points(const void* points, std::size_t count, int bits, const Index& base, int kind, int order) {
-        if ((kind!=2 && kind!=3) || (bits!=32 && bits!=64) || (kind==2 && bits!=32) || (order!=0 && order!=1) || base.size()!=3 || count>SIZE_MAX/24) throw std::invalid_argument("invalid point request");
+        if ((kind!=2 && kind!=3) || (bits!=32 && bits!=64) || (order!=0 && order!=1) || base.size()!=3 || count>SIZE_MAX/24) throw std::invalid_argument("invalid point request");
         for (auto b:base) if (b<0 || b>(1LL<<30)) throw std::invalid_argument("coordinate origin must be in [0, 2**30]");
         std::set<std::int64_t> needed;
         // C++ chunk discovery avoids Python's point enumeration/unique bottleneck.
@@ -512,6 +512,7 @@ private:
         };
         constexpr std::size_t grain=65536;
         std::vector<ChunkSet> segments((count+grain-1)/grain);
+        const auto discover = [&]<class Coord>() {
         array_.parallel_for(segments.size(),[&](std::size_t segment) {
         auto& keys=segments[segment];
         for (std::size_t p=segment*grain;p<std::min(count,(segment+1)*grain);++p) {
@@ -520,11 +521,11 @@ private:
                 for (int a=0;a<3;++a) at[a]=bits==32 ? static_cast<const std::int32_t*>(points)[3*p+a] : static_cast<const std::int64_t*>(points)[3*p+a];
                 add(keys,at);
             } else {
-                const float* c=static_cast<const float*>(points)+3*p; bool outside=false;
-                float frac[3];
+                const Coord* c=static_cast<const Coord*>(points)+3*p; bool outside=false;
+                Coord frac[3];
                 for (int a=0;a<3;++a) {
-                    if (!(c[a]>float(-1-base[a]) && c[a]<float(source_.shape[a]-base[a])+(order ? 0.f : 1.f))) { outside=true; break; }
-                    const float low=std::floor(c[a]); frac[a]=c[a]-low; at[a]=base[a]+std::int64_t(low);
+                    if (!(c[a]>Coord(-1-base[a]) && c[a]<Coord(source_.shape[a]-base[a])+(order ? 0.f : 1.f))) { outside=true; break; }
+                    const Coord low=std::floor(c[a]); frac[a]=c[a]-low; at[a]=base[a]+std::int64_t(low);
                     if (!order) at[a]+=(frac[a]>.5f || (frac[a]==.5f && (at[a]&1)));
                 }
                 if (outside) continue;
@@ -538,6 +539,9 @@ private:
             }
         }
         });
+        };
+        if (kind==2 && bits==64) discover.template operator()<double>();
+        else discover.template operator()<float>();
         for (const auto& segment:segments) needed.insert(segment.values.begin(),segment.values.end());
         return needed;
     }
@@ -548,8 +552,14 @@ private:
         if (route_cpu(needed,count,kind,route)) {
             ++cpu_routes_; std::vector<std::uint8_t> host(count*(floating ? 4 : 1));
             if (kind==2) {
-                FloatPoints coords; coords.data=static_cast<const float*>(points); coords.ndim=3; std::copy_n(base.begin(),3,coords.offset.begin());
-                array_.sample_u8_float32(coords,count,order,host.data());
+                const auto sample = [&]<class Coord>() {
+                    RebasedCoordinates<PointCoordinates<Coord>> coords;
+                    coords.data=static_cast<const Coord*>(points); coords.ndim=3;
+                    std::copy_n(base.begin(),3,coords.offset.begin());
+                    array_.sample_u8_float32(coords,count,order,host.data());
+                };
+                if (bits==64) sample.template operator()<double>();
+                else sample.template operator()<float>();
             } else {
                 std::vector<std::int64_t> wide;
                 const auto* ptr=static_cast<const std::int64_t*>(points);

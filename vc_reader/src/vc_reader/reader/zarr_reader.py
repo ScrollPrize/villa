@@ -691,8 +691,10 @@ class ZarrReader:
         ``order=1``: n-linear (trilinear for 3-D) interpolation of the
         neighbouring elements, computed in float64 and returned as ``dtype``
         (float32 or float64). For 3-D uint8 CT, float32 output instead uses
-        float32 coordinates, weights and accumulation. Integer global origins
-        are split off before narrowing. Pass coordinate_origin=(z,y,x) with
+        float32 weights and accumulation. Compact point batches use local
+        float32 coordinates after splitting off an integer global origin;
+        dispersed batches retain float64 coordinates to preserve voxel positions.
+        Pass coordinate_origin=(z,y,x) with
         already-local float32 points to preserve precision at large locations.
         Neighbours outside the array count as
         ``fill_value``, as in ``scipy.ndimage.map_coordinates(mode="grid-constant",
@@ -872,7 +874,7 @@ def _make_spec(
             raise ValueError("cache_max_bytes must be nonnegative or None")
         if is_remote(loc) and not dirs:
             raise ValueError("cache_max_bytes requires cache_dir")
-    access = auth if isinstance(auth, Access) else resolve_access(loc, auth)
+    access = auth if isinstance(auth, Access) else resolve_access(loc, auth, offline=offline)
     spec = dict(location=loc, group=group, level_key=level_key, cache_dirs=dirs, cache_writes=cache_writes,
                 cache_max_bytes=cache_max_bytes,
                 compress_cache=compress_cache, allow_lossy_cache=allow_lossy_cache, threads=threads,

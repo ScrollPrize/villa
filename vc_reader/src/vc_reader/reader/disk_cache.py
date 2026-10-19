@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import configparser
 import json
+import math
 import os
 import threading
 import warnings
@@ -202,6 +203,17 @@ def is_lossless_codec(config: dict | None) -> bool:
     return int(config.get("quant", 1) or 1) <= 1
 
 
+def _metadata_equal(left, right) -> bool:
+    """Compare JSON metadata, including normalized floating NaN fill values."""
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_metadata_equal(left[k], right[k]) for k in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(_metadata_equal(a, b) for a, b in zip(left, right))
+    if isinstance(left, float) and isinstance(right, float) and math.isnan(left) and math.isnan(right):
+        return True
+    return left == right
+
+
 def _same_array(stored: dict, source: ArrayMeta, *, ignore_codec: bool) -> bool:
     d = source.dtype
     try:
@@ -213,7 +225,8 @@ def _same_array(stored: dict, source: ArrayMeta, *, ignore_codec: bool) -> bool:
         and list(stored.get("shape") or ()) == list(source.shape)
         and list(stored.get("chunks") or ()) == list(source.chunks)
         and (stored.get("dimension_separator") or ".") == source.separator
-        and np.asarray(stored.get("fill_value") or 0, d) == np.asarray(source.fill_value, d)
+        and np.array_equal(np.asarray(stored.get("fill_value") or 0, d),
+                           np.asarray(source.fill_value, d), equal_nan=d.kind in "fc")
     )
     if not same or ignore_codec:
         return same
@@ -252,7 +265,7 @@ def _decoded_layer(root: Path, source: ArrayMeta, url: str, create: bool, compre
     record = (_read_json(root / ".zattrs") or {}).get("vc_reader")
     if record is not None:  # ours: uncompressed or Delta3D, as its .zarray says
         comp = stored.get("compressor")
-        ok = (record.get("source_zarray") == dict(source.raw) and not stored.get("filters")
+        ok = (_metadata_equal(record.get("source_zarray"), dict(source.raw)) and not stored.get("filters")
               and (comp is None or comp.get("id") == DELTA3D_ID))
         if ok and not allow_lossy and not is_lossless_codec(comp):
             return None

@@ -926,12 +926,12 @@ private:
         std::size_t k = 0;
     };
 
-    template <std::size_t N, class Real, class Coordinates>
-    static void cell_of(const Real* c, std::size_t nd, Cell<N,Real>& cell, const Coordinates& coords)
+    template <std::size_t N, class Real, class Coordinates, class Coord>
+    static void cell_of(const Coord* c, std::size_t nd, Cell<N,Real>& cell, const Coordinates& coords)
     {
         cell.k = 0;
         for (std::size_t i = 0; i < (N ? N : nd); ++i) {
-            const Real f = std::floor(c[i]);
+            const Coord f = std::floor(c[i]);
             cell.lo[i] = coords.base(i) + static_cast<std::int64_t>(f);
             cell.frac[i] = c[i] - f;
             if (cell.frac[i] != 0.0)
@@ -947,7 +947,8 @@ private:
     void sample_linear_as(const Coordinates& coords, std::size_t n, const ElementType& type, bool out64, void* out,
                           Load load)
     {
-        using Real = typename Coordinates::value_type;
+        using Coord = typename Coordinates::value_type;
+        using Real = decltype(load(static_cast<const std::uint8_t*>(nullptr)));
         const std::size_t nd = N ? N : spec_.shape.size();
         const std::size_t isz = spec_.itemsize;
         const Real fill = static_cast<Real>(type.load(spec_.fill.data()));
@@ -989,12 +990,12 @@ private:
             const std::size_t m = std::min(kPointBatch, n - b0);
             split.assign(plan_segments(m), Splits{});
             auto work = plan_points<N>(m, points, runs, [&](std::size_t s, std::size_t p, std::int64_t* idx, auto& emit) {
-                Real scratch[N ? N : kMaxSampleDims];
-                const Real* c = coords(b0 + p, scratch);
+                Coord scratch[N ? N : kMaxSampleDims];
+                const Coord* c = coords(b0 + p, scratch);
                 bool finite = true, outside = false;
                 for (std::size_t i = 0; i < nd; ++i) {
                     finite &= std::isfinite(c[i]);
-                    outside |= !(c[i] > Real(-1-coords.base(i)) && c[i] < Real(spec_.shape[i]-coords.base(i)));
+                    outside |= !(c[i] > Coord(-1-coords.base(i)) && c[i] < Coord(spec_.shape[i]-coords.base(i)));
                 }
                 if (!finite || outside) {  // no neighbour inside the array
                     store(b0 + p, finite ? fill : std::numeric_limits<Real>::quiet_NaN());
@@ -1046,7 +1047,7 @@ private:
             op.read = [&](const std::uint8_t* data, std::int64_t origin, const Work& w) {
                 for_points(w.points, [&](std::span<const Point> part) {
                     Cell<N,Real> cell;
-                    Real coordinate[N ? N : kMaxSampleDims];
+                    Coord coordinate[N ? N : kMaxSampleDims];
                     for (std::size_t j = 0; j < part.size(); ++j) {
 #if defined(__GNUC__) || defined(__clang__)
                         // Chunk grouping makes the voxel reads local, but random
@@ -1083,7 +1084,7 @@ private:
                 const Index chunk = chunk_base(w);
                 for_runs(w.runs, [&](std::span<const Run> part) {
                     Cell<N,Real> cell;
-                    Real coordinate[N ? N : kMaxSampleDims];
+                    Coord coordinate[N ? N : kMaxSampleDims];
                     for (const Run& r : part)
                         for (std::uint64_t p = r.first; p < r.first + r.count; ++p) {
                             cell_of<N>(coords(p, coordinate), nd, cell, coords);
@@ -1093,7 +1094,7 @@ private:
             };
             op.fill = [&](const Work& w) {
                 Cell<N,Real> cell;
-                Real coordinate[N ? N : kMaxSampleDims];
+                Coord coordinate[N ? N : kMaxSampleDims];
                 for (const Point& pt : w.points) {
                     if (pt.tag & kSplit)
                         continue;  // its raw slot holds fill already
@@ -1109,7 +1110,7 @@ private:
             run(work, {}, &op);
             pool_.parallel_for(split.size(), [&](std::size_t s) {
                 Cell<N,Real> cell;
-                Real coordinate[N ? N : kMaxSampleDims];
+                Coord coordinate[N ? N : kMaxSampleDims];
                 for (const Split& sp : split[s].points) {
                     const std::uint8_t* at = raw.data() + (base[s] + sp.first) * isz;
                     cell_of<N>(coords(sp.p, coordinate), nd, cell, coords);

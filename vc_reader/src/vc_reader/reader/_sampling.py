@@ -1,4 +1,4 @@
-"""Integer global origins plus local float32 CT geometry, shared by CPU/CUDA."""
+"""Local float32 CT geometry with precise dispersed points, shared by CPU/CUDA."""
 import math
 import operator
 import numpy as np
@@ -27,14 +27,17 @@ def points32(points, coordinate_origin=None):
         raise ValueError("points must be a numeric array of shape (..., 3)")
     flat = pts.reshape(-1, 3)
     if coordinate_origin is None:
-        # Split before narrowing float64 caller inputs. Float32 caller inputs
-        # already carry their original precision; explicit origins avoid loss.
-        finite = np.isfinite(flat).all(axis=1)
-        first = flat[np.flatnonzero(finite)[0]] if finite.any() else (0, 0, 0)
-        base = tuple(max(0, min(2**30, math.floor(float(v)))) for v in first)
+        from .. import _reader
+
+        flat = np.ascontiguousarray(flat, dtype=np.float32 if pts.dtype == np.float32 else np.float64)
+        base = _reader._point_origin(flat)
+        if base is None:
+            # Dispersed global coordinates cannot share a float32 local frame
+            # without losing voxel positions. Only coordinates need float64;
+            # uint8 interpolation and its output remain float32.
+            return np.ascontiguousarray(flat, dtype=np.float64), (0, 0, 0), pts.shape[:-1]
         with np.errstate(over="ignore", invalid="ignore"):
-            difference = flat - np.asarray(base, dtype=pts.dtype) if pts.dtype.kind == "f" else flat.astype(np.float64) - base
-            local = np.ascontiguousarray(difference, dtype=np.float32)
+            local = np.ascontiguousarray(flat - np.asarray(base, dtype=flat.dtype), dtype=np.float32)
     else:
         base = origin3(coordinate_origin)
         with np.errstate(over="ignore"):

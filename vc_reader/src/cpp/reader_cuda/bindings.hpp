@@ -96,7 +96,7 @@ inline void bind(nb::module_& m) {
     const auto point_dtype=[](auto points,int kind) {
         const auto dtype=points.dtype();
         if (points.ndim()!=2 || points.shape(1)!=3 || dtype.lanes!=1 ||
-            (kind==2 ? (dtype.code!=std::uint8_t(nb::dlpack::dtype_code::Float) || dtype.bits!=32) :
+            (kind==2 ? (dtype.code!=std::uint8_t(nb::dlpack::dtype_code::Float) || (dtype.bits!=32 && dtype.bits!=64)) :
                        (dtype.code!=std::uint8_t(nb::dlpack::dtype_code::Int) || (dtype.bits!=32 && dtype.bits!=64)))) throw nb::value_error("invalid point array");
         return int(dtype.bits);
     };
@@ -118,7 +118,7 @@ inline void bind(nb::module_& m) {
         .def("prepare_points",[](Reader& r,Host points,const Index& base,int kind,int order) {
             const auto dtype=points.dtype();
             if (points.ndim()!=2 || points.shape(1)!=3 || dtype.lanes!=1 ||
-                (kind==2 ? (dtype.code!=std::uint8_t(nb::dlpack::dtype_code::Float) || dtype.bits!=32) :
+                (kind==2 ? (dtype.code!=std::uint8_t(nb::dlpack::dtype_code::Float) || (dtype.bits!=32 && dtype.bits!=64)) :
                            (dtype.code!=std::uint8_t(nb::dlpack::dtype_code::Int) || (dtype.bits!=32 && dtype.bits!=64)))) throw nb::value_error("invalid point array");
             nb::gil_scoped_release release;
             return r.prepare_points(points.data(),points.shape(0),dtype.bits,base,kind,order);
@@ -178,7 +178,7 @@ inline void bind(nb::module_& m) {
         .def("points",[](Reader& r,Host points,const Index& base,int kind,int order,const std::string& route,bool valid) {
             const auto dtype=points.dtype();
             if (points.ndim()!=2 || points.shape(1)!=3 || dtype.lanes!=1 ||
-                (kind==2 ? (dtype.code!=std::uint8_t(nb::dlpack::dtype_code::Float) || dtype.bits!=32) :
+                (kind==2 ? (dtype.code!=std::uint8_t(nb::dlpack::dtype_code::Float) || (dtype.bits!=32 && dtype.bits!=64)) :
                            (dtype.code!=std::uint8_t(nb::dlpack::dtype_code::Int) || (dtype.bits!=32 && dtype.bits!=64)))) throw nb::value_error("invalid point array");
             Result result; { nb::gil_scoped_release release; result=r.points(points.data(),points.shape(0),dtype.bits,base,kind,order,route,valid); }
             return outputs(std::move(result),r.device_id());

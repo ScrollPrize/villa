@@ -23,5 +23,5 @@ def read_node_file(location: str, name: str, access: Access) -> bytes | None:
 
 
 def cache_url(location: str, access: Access) -> str:
-    """Canonical cache identity shared with the C++ Zarr reader."""
-    return location if access.kind == 's3' else http_url(location)
+    """Canonical cache identity, independent of S3 credentials or online state."""
+    return location if location.startswith('s3://') or access.kind == 's3' else http_url(location)

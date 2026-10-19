@@ -282,7 +282,7 @@ class Access:
 _ANON = Access("anonymous")
 
 
-def resolve_access(location: str, auth: Any = "auto") -> Access:
+def resolve_access(location: str, auth: Any = "auto", *, offline: bool = False) -> Access:
     """The :class:`Access` for a location and an ``auth`` argument (see the module docstring)."""
     if not is_remote(location) or auth is None or auth == "anonymous":
         return _ANON
@@ -295,6 +295,10 @@ def resolve_access(location: str, auth: Any = "auto") -> Access:
         if s3:
             raise ValueError("HTTP basic auth needs an http(s):// URL, not s3://")
         return Access("basic", basic=(str(auth[0]), str(auth[1])))
+    # Cached reads need neither signing credentials nor a bucket region. Avoid
+    # the AWS credential chain too: its providers may contact metadata services.
+    if offline and s3 and (auth in ("auto", "aws") or isinstance(auth, S3Credentials)):
+        return _ANON
     if auth == "auto":
         from ..artifacts import to_https
 

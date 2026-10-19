@@ -21,6 +21,43 @@ using Bytes = nb::ndarray<std::uint8_t, nb::ndim<1>, nb::c_contig, nb::device::c
 using LayerTuple = std::tuple<std::string, std::string, std::string, std::string, bool>;
 // (kind, user or access key id, password or secret key, session token, region); see vcr::Auth.
 using AuthTuple = std::tuple<std::string, std::string, std::string, std::string, std::string>;
+using HostPoints = nb::ndarray<nb::ro, nb::ndim<2>, nb::c_contig, nb::device::cpu>;
+
+template<class T> static nb::object point_origin(const HostPoints& points)
+{
+    const auto* p = static_cast<const T*>(points.data());
+    T low[3] = {INFINITY, INFINITY, INFINITY}, high[3] = {-INFINITY, -INFINITY, -INFINITY};
+    {
+        nb::gil_scoped_release release;
+        for (std::size_t i = 0; i < points.shape(0); ++i, p += 3) {
+            if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) continue;
+            for (int a = 0; a < 3; ++a) {
+                low[a] = std::min(low[a], p[a]);
+                high[a] = std::max(high[a], p[a]);
+            }
+        }
+    }
+    vcr::Index base(3, 0);
+    if (std::isfinite(low[0])) {
+        for (int a = 0; a < 3; ++a) {
+            base[a] = static_cast<std::int64_t>(std::clamp(std::floor(double(low[a])), 0., double(1LL << 30)));
+            // Keep local rounding below 1/4096 voxel, independent of point order.
+            if (double(low[a]) - base[a] < -4096 || double(high[a]) - base[a] > 4096)
+                return nb::none();
+        }
+    }
+    return nb::cast(base);
+}
+
+template<class T> static void sample_u8_points(vcr::Array& a, const HostPoints& points,
+                                              const vcr::Index& offset, Bytes out, int order)
+{
+    vcr::RebasedCoordinates<vcr::PointCoordinates<T>> coords;
+    coords.data = static_cast<const T*>(points.data()); coords.ndim = 3;
+    std::copy_n(offset.begin(), 3, coords.offset.begin());
+    nb::gil_scoped_release release;
+    a.sample_u8_float32(coords, points.shape(0), order, out.data());
+}
 
 #ifdef VC_READER_CUDA
 #include "reader_cuda/bindings.hpp"
@@ -72,6 +109,12 @@ static std::vector<std::size_t> output_counts(const std::vector<vcr::Index>& sha
 NB_MODULE(_reader, m)
 {
     m.doc() = "Zarr reader: local and HTTP chunks, disk cache layers, memory cache.";
+    m.def("_point_origin", [](HostPoints points) -> nb::object {
+        if (points.shape(1) != 3) throw nb::value_error("expected points of shape (N, 3)");
+        if (points.dtype() == nb::dtype<float>()) return point_origin<float>(points);
+        if (points.dtype() == nb::dtype<double>()) return point_origin<double>(points);
+        throw nb::type_error("expected float32 or float64 points");
+    });
 #ifdef VC_READER_CUDA
     vcr::reader_cuda::bind(m);
 #else
@@ -363,20 +406,18 @@ NB_MODULE(_reader, m)
             "Sample regular affine grids with generated coordinates (the GIL is released).")
         // Float32 CT implementation shared by the public CPU and CUDA fallback.
         .def("_sample_u8_float32", [](vcr::Array& a,
-             nb::ndarray<float, nb::ndim<2>, nb::c_contig, nb::device::cpu> points,
+             HostPoints points,
              const vcr::Index& offset, Bytes out, int order) {
             if (points.shape(1) != 3 || offset.size() != 3 || (order != 0 && order != 1))
                 throw nb::value_error("expected 3-D points/origin and order 0 or 1");
             if (out.size() != points.shape(0)*(order ? sizeof(float) : 1))
                 throw nb::value_error("output size does not match points");
-            vcr::FloatPoints coords;
-            coords.data=points.data(); coords.ndim=3;
             for (int i=0;i<3;++i) {
                 if (offset[i] < 0 || offset[i] > (1LL<<30)) throw nb::value_error("invalid integer origin");
-                coords.offset[i]=offset[i];
             }
-            nb::gil_scoped_release release;
-            a.sample_u8_float32(coords,points.shape(0),order,out.data());
+            if (points.dtype() == nb::dtype<float>()) sample_u8_points<float>(a,points,offset,out,order);
+            else if (points.dtype() == nb::dtype<double>()) sample_u8_points<double>(a,points,offset,out,order);
+            else throw nb::type_error("expected float32 or float64 points");
         })
         .def("_affine_u8_float32", [](vcr::Array& a, const vcr::Index& shape,
              const std::vector<float>& origin, const std::vector<float>& axes,

@@ -40,16 +40,16 @@ struct Corner {
     }
 };
 struct Load { __device__ float operator()(const unsigned char* p) const { return float(*p); } };
-__device__ float interpolate(Source s, const float* c, const std::int64_t* base, int order, bool& ok) {
+template<class Coord> __device__ float interpolate(Source s, const Coord* c, const std::int64_t* base, int order, bool& ok) {
     Cell cell;
     bool finite=true, outside=false;
     for (int a=0;a<3;++a) {
         finite &= isfinite(c[a]);
-        outside |= !(c[a]>float(-1-base[a]) && c[a]<float(s.shape[a]-base[a])+(order ? 0.f : 1.f));
+        outside |= !(c[a]>Coord(-1-base[a]) && c[a]<Coord(s.shape[a]-base[a])+(order ? 0.f : 1.f));
     }
     if (!finite || outside) { ok=false; return !finite && order ? nanf("") : float(s.fill); }
     for (int a=0;a<3;++a) {
-        const float low=floorf(c[a]), f=c[a]-low;
+        const Coord low=std::floor(c[a]), f=c[a]-low;
         const auto integer=base[a]+static_cast<std::int64_t>(low);
         cell.lo[a]=integer+(order ? 0 : (f>.5f || (f==.5f && (integer&1))));
         cell.frac[a]=order ? f : 0;
@@ -166,6 +166,8 @@ template<class Out> __global__ void sample(Source s, const Grid* grids, const vo
                 at[1]=g.base[1]+std::int64_t(i/g.shape[2]%g.shape[1]); at[2]=g.base[2]+std::int64_t(i%g.shape[2]);
             } else for (int a=0;a<3;++a) at[a]=bits==32 ? static_cast<const std::int32_t*>(points)[3*i+a] : static_cast<const std::int64_t*>(points)[3*i+a];
             const auto* p=Lookup{s}.address(at); value=p ? *p : s.fill; ok=p;
+        } else if (kind==2 && bits==64) {
+            value=interpolate(s,static_cast<const double*>(points)+3*i,base.v,order,ok);
         } else {
             float c[3];
             if (kind==1) {
@@ -183,11 +185,12 @@ __device__ bool present(const Source& s, const std::int64_t* at, bool resident) 
     for (int a=0;a<3;++a) if (at[a]<0 || at[a]>=s.shape[a]) return false;
     return !resident || Lookup{s}.address(at)!=nullptr;
 }
-__device__ unsigned char supported(const Source& s, const float* c, const std::int64_t* base, int order, bool resident) {
+template<class Coord> __device__ unsigned char supported(const Source& s, const Coord* c, const std::int64_t* base, int order, bool resident) {
     std::int64_t lo[3]; float frac[3];
     for (int a=0;a<3;++a) {
         if (!isfinite(c[a])) return 0;
-        const float low=floorf(fminf(fmaxf(c[a],-4.f-float(base[a])),float(s.shape[a]-base[a])+4.f)), f=c[a]-low;
+        if (!(c[a]>Coord(-1-base[a]) && c[a]<Coord(s.shape[a]-base[a])+1)) return 0;
+        const Coord low=std::floor(c[a]), f=c[a]-low;
         const auto integer=base[a]+static_cast<std::int64_t>(low);
         lo[a]=integer+(order ? 0 : (f>.5f || (f==.5f && (integer&1))));
         frac[a]=order ? f : 0;
@@ -212,6 +215,8 @@ __global__ void valid_samples(Source s, const Grid* grids, const void* points, i
                 at[1]=g.base[1]+std::int64_t(i/g.shape[2]%g.shape[1]); at[2]=g.base[2]+std::int64_t(i%g.shape[2]);
             } else for (int a=0;a<3;++a) at[a]=bits==32 ? static_cast<const std::int32_t*>(points)[3*i+a] : static_cast<const std::int64_t*>(points)[3*i+a];
             ok=present(s,at,resident);
+        } else if (kind==2 && bits==64) {
+            ok=supported(s,static_cast<const double*>(points)+3*i,base.v,order,resident);
         } else {
             float c[3];
             if (kind==1) {

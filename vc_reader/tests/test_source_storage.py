@@ -391,6 +391,33 @@ class RemoteFixtureCase(FixtureCase):
 
 
 class RemoteTests(RemoteFixtureCase):
+    def test_offline_s3_zarr_skips_auth_and_region_discovery(self):
+        from vc_reader.reader import ZarrGroup
+        from vc_reader.reader.auth import Access
+        from vc_reader.reader.transport import cache_url
+        group = self.root/'offline-group'
+        group.mkdir()
+        (group/'.zgroup').write_text('{"zarr_format": 2}')
+        (group/'.zattrs').write_text(json.dumps(dict(multiscales=[dict(datasets=[dict(path='0')])])))
+        values = np.arange(12, dtype=np.uint8).reshape(3, 4)
+        array(group/'0', values)
+        url = 's3://bucket/offline-group'
+        keys = S3Credentials('example', 'test-secret', region='us-east-1', endpoint_url=self.url)
+        with ZarrGroup.open(url, cache_dir=self.cache, auth=keys) as reader:
+            np.testing.assert_array_equal(reader.level(0)[:], values)
+        before = dict(self.counts)
+        with patch('vc_reader.reader.auth.bucket_region', side_effect=AssertionError('region discovery')), \
+             patch('vc_reader.reader.auth._AwsSource', side_effect=AssertionError('credential discovery')), \
+             patch('vc_reader._reader.http_get', side_effect=AssertionError('metadata fetch')):
+            for auth in ('auto', 'aws', None, S3Credentials('example', 'test-secret')):
+                with self.subTest(auth=type(auth).__name__):
+                    with ZarrReader.open(url+'/0', cache_dir=self.cache, offline=True, auth=auth) as reader:
+                        np.testing.assert_array_equal(reader[:], values)
+                    with ZarrGroup.open(url, cache_dir=self.cache, offline=True, auth=auth) as reader:
+                        np.testing.assert_array_equal(reader.level(0)[:], values)
+        self.assertEqual(before, self.counts)
+        self.assertEqual(cache_url(url, Access('anonymous')), cache_url(url, Access('s3')))
+
     def test_shared_memory_cache_separates_lossy_and_exact_reads(self):
         data = np.arange(64, dtype=np.uint8).reshape(4, 4, 4)
         array(self.root/'volume.zarr', data)

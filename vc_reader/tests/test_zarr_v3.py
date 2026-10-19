@@ -183,6 +183,33 @@ class V3Tests(FixtureCase):
 
 
 class V3RemoteTests(RemoteFixtureCase):
+    def test_nan_fill_cache_reopens_and_rejects_metadata_changes(self):
+        path = self.root/'nan'
+        path.mkdir()
+        metadata = dict(zarr_format=3, node_type='array', shape=[2, 2], data_type='float32',
+            chunk_grid=dict(name='regular', configuration=dict(chunk_shape=[1, 2])),
+            chunk_key_encoding=dict(name='default', configuration=dict(separator='/')),
+            fill_value='NaN', codecs=[dict(name='bytes', configuration=dict(endian='little'))], attributes={})
+        (path/'zarr.json').write_text(json.dumps(metadata))
+        (path/'c/0').mkdir(parents=True)
+        (path/'c/0/0').write_bytes(np.array([1., 2.], dtype='<f4').tobytes())
+        url = self.url+'/nan'
+        for offline in (False, False, True):
+            with ZarrReader.open(url, cache_dir=self.cache, offline=offline) as reader:
+                np.testing.assert_array_equal(reader[:], [[1., 2.], [np.nan, np.nan]])
+        # A cache without the provenance record still compares decoded fills.
+        from vc_reader.reader.disk_cache import decoded_cache_path
+        attrs = Path(decoded_cache_path(self.cache, url))/'.zattrs'
+        saved = attrs.read_bytes()
+        attrs.unlink()
+        with ZarrReader.open(url, cache_dir=self.cache) as reader:
+            np.testing.assert_array_equal(reader[:], [[1., 2.], [np.nan, np.nan]])
+        attrs.write_bytes(saved)
+        for change in (dict(fill_value=0), dict(shape=[3, 2]), dict(attributes={'changed': True})):
+            (path/'zarr.json').write_text(json.dumps(dict(metadata, **change)))
+            with self.assertRaisesRegex(ValueError, 'holds a different array'):
+                ZarrReader.open(url, cache_dir=self.cache)
+
     def test_rejected_ranges_and_changed_shards(self):
         write_v3(self.root/'v3')
         for prefix, message in (('ignore-range', 'ignored HTTP Range'), ('bad-range', 'Content-Range')):
