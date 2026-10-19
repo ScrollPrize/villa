@@ -1,4 +1,4 @@
-"""Consumer-owned outputs and native storage lifetime across CUDA streams."""
+"""Consumer-owned outputs and device storage lifetime across CUDA streams."""
 import gc
 import os
 from pathlib import Path
@@ -7,12 +7,12 @@ import sys
 import numpy as np
 import pytest
 
-if os.environ.get('VC_READER_NATIVE_DIR'):
+if os.environ.get('VC_READER_BUILD_DIR'):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-    from native_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_NATIVE_DIR']))
+    from extension_build import load_extensions
+    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
 
-from vc_reader import cuda, _native, augment
+from vc_reader import cuda, _reader, augment
 from vc_reader.reader import ZarrReader
 from vc_reader.sheet_normal import sheet_normals
 from test_source_storage import array
@@ -74,7 +74,7 @@ def test_normal_output_other_stream(torch_cuda):
         patches = torch.as_tensor(host,device='cuda')
         out = torch.empty((2,4),device='cuda')
         stream.synchronize()
-        _native._set_stream(stream.cuda_stream)
+        _reader._set_stream(stream.cuda_stream)
         try:
             assert sheet_normals(patches,out=out) is out
             result = out.clone()
@@ -86,7 +86,7 @@ def test_normal_output_other_stream(torch_cuda):
                 sheet_normals(floats,out=floats.flatten()[:8].reshape(2,4))
         finally:
             stream.synchronize()
-            _native._set_stream(0)
+            _reader._set_stream(0)
     np.testing.assert_allclose(result.cpu(),expected,atol=2e-5)
 
 

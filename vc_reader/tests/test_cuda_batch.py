@@ -1,4 +1,4 @@
-"""Batch independence and native CUDA stage coverage."""
+"""Batch independence and CUDA stage coverage."""
 import os
 from pathlib import Path
 import sys
@@ -8,16 +8,16 @@ import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-if os.environ.get('VC_READER_NATIVE_DIR'):
+if os.environ.get('VC_READER_BUILD_DIR'):
     sys.path.insert(0, str(ROOT / 'benchmarks'))
-    from native_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_NATIVE_DIR']))
+    from extension_build import load_extensions
+    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
 
 from vc_reader import augment as A, cuda
 
 
-@unittest.skipUnless(torch.cuda.is_available() and A._native.cuda_available(), 'CUDA build and device required')
-class NativeBatchTests(unittest.TestCase):
+@unittest.skipUnless(torch.cuda.is_available() and A._augment.cuda_available(), 'CUDA build and device required')
+class CudaBatchTests(unittest.TestCase):
     def compare(self, transform, sample, *, targets=None, seeds=(3, 19, 107), params=None):
         pipeline = A.Pipeline(transform if isinstance(transform, list) else [transform],
                               targets=targets, backend='cuda', compact=False)

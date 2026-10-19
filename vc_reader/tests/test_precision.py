@@ -9,17 +9,17 @@ import unittest
 
 import numpy as np
 
-if os.environ.get('VC_READER_NATIVE_DIR'):
+if os.environ.get('VC_READER_BUILD_DIR'):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-    from native_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_NATIVE_DIR']))
+    from extension_build import load_extensions
+    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
 
 from vc_reader import augment as A
 
 
 def elastic_field(plan):
     """Read the field from a single Elastic VCA2 record for independent checks."""
-    stream = io.BytesIO(plan._native.dump())
+    stream = io.BytesIO(plan._plan.dump())
     assert stream.read(4) == b'VCA2'
 
     def number():
@@ -43,7 +43,7 @@ def elastic_field(plan):
 
 class PrecisionTests(unittest.TestCase):
     def backends(self):
-        return ('cpu', 'cuda') if A._native.cuda_available() else ('cpu',)
+        return ('cpu', 'cuda') if A._augment.cuda_available() else ('cpu',)
 
     def test_transforms_and_replay(self):
         rng = np.random.default_rng(124)
@@ -482,7 +482,7 @@ class PrecisionTests(unittest.TestCase):
                 with self.subTest(transform=repr(transform), backend=backend):
                     pipeline = A.Pipeline([transform], backend=backend, compact=False)
                     plan = pipeline.sample(sample, seed=0)
-                    self.assertLess(len(plan._native.dump()), 2048)
+                    self.assertLess(len(plan._plan.dump()), 2048)
 
     def test_zscore_large_baseline_small_deviation(self):
         image = np.full((1, 17, 19), 1e6, dtype=np.float32)

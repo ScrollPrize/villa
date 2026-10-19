@@ -12,12 +12,12 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
 from bench_augmentations import compare, update_readme
 from augmentation_cases import CASES, input_sample
-from native_build import load_extensions
+from extension_build import load_extensions
 
 
 class AugmentationBenchmarkTests(unittest.TestCase):
     def test_cases_run_on_planar_and_volume_inputs(self):
-        directory = os.environ.get('VC_READER_NATIVE_DIR')
+        directory = os.environ.get('VC_READER_BUILD_DIR')
         if directory:
             load_extensions(Path(directory))
         from vc_reader import augment as A, cuda
@@ -41,11 +41,11 @@ class AugmentationBenchmarkTests(unittest.TestCase):
                             self.assertTrue(np.isfinite(value).all())
                             np.testing.assert_array_equal(source[key], original[key])
 
-    def test_native_override_is_idempotent(self):
+    def test_build_override_is_idempotent(self):
         import importlib.machinery
         with tempfile.TemporaryDirectory() as directory:
             modules = {}
-            for name in ('_native', '_augment'):
+            for name in ('_reader', '_augment'):
                 path = Path(directory) / (name+importlib.machinery.EXTENSION_SUFFIXES[0])
                 path.touch()
                 modules['vc_reader.'+name] = SimpleNamespace(__file__=str(path))

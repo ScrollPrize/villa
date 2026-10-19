@@ -11,7 +11,7 @@ import os
 
 import numpy as np
 
-from . import _native
+from . import _reader
 from . import cuda as _cuda
 
 
@@ -35,8 +35,8 @@ def _input(value, dtype, device):
     return np.ascontiguousarray(value, dtype=dtype)
 
 
-def _native_array(value):
-    return value._native if isinstance(value, _cuda.DeviceArray) else value
+def _array_view(value):
+    return value._array if isinstance(value, _cuda.DeviceArray) else value
 
 
 def _empty(shape, dtype, device):
@@ -54,17 +54,17 @@ def _output(out, shape, dtype, device):
         raise ValueError('out must be on the geometry CUDA device')
     if tuple(view.shape) != tuple(shape) or np.dtype(view.dtype) != np.dtype(dtype):
         raise ValueError(f'out must have shape {shape} and dtype {np.dtype(dtype)}')
-    return out, _native_array(view)
+    return out, _array_view(view)
 
 
 def _outputs(out, specification, device):
     if out is not None and (not isinstance(out, dict) or set(out) != set(specification)):
         raise ValueError(f'out requires fields {tuple(specification)}')
-    result, native = {}, []
+    result, views = {}, []
     for key, (shape, dtype) in specification.items():
         result[key], view = _output(None if out is None else out[key], shape, dtype, device)
-        native.append(view)
-    return result if out is None else out, native
+        views.append(view)
+    return result if out is None else out, views
 
 
 def _points(value, device):
@@ -90,9 +90,9 @@ class _Resident:
 
     @property
     def nbytes(self):
-        """Bytes of persistent native geometry/index storage."""
+        """Bytes of persistent geometry/index storage."""
         self._ready()
-        return self._native.nbytes
+        return self._storage.nbytes
 
     def __getstate__(self):
         raise TypeError('Geometry indexes cannot be pickled; construct them in the worker')
@@ -123,7 +123,7 @@ class PolylineSet(_Resident):
         arcs = np.empty(0, np.float32) if arclengths is None else _input(arclengths, np.float32, -1)
         if arcs.ndim != 1 or (arclengths is not None and arcs.shape != (len(points),)):
             raise ValueError('arclengths must have shape (N,)')
-        self._native = _native.GeometryCurves(points, offsets, arcs)
+        self._storage = _reader.GeometryCurves(points, offsets, arcs)
         self.device, self._pid = -1, os.getpid()
         self.n_curves, self.n_points = len(offsets)-1, len(points)
 
@@ -140,7 +140,7 @@ class PolylineSet(_Resident):
         if not _cuda.is_available():
             raise RuntimeError('CUDA geometry requires a CUDA-enabled build and device')
         result = object.__new__(type(self))
-        result._native = _native.GeometryCudaCurves(self._native, device)
+        result._storage = _reader.GeometryCudaCurves(self._storage, device)
         result.device, result._pid = device, os.getpid()
         result.n_curves, result.n_points = self.n_curves, self.n_points
         return result
@@ -162,7 +162,7 @@ class PolylineSet(_Resident):
         point_shape, arc_shape = ((n,2,3), (n,2)) if segments else ((n,3), (n,))
         result, arrays = _outputs(out, dict(points=(point_shape,np.float32), arclengths=(arc_shape,np.float32),
             curve_ids=((n,),np.int64), valid=((n,),np.bool_)), self.device)
-        _native._geometry_gather(self._native, _native_array(ids), bool(segments), *arrays)
+        _reader._geometry_gather(self._storage, _array_view(ids), bool(segments), *arrays)
         return result
 
     def interpolate(self, curve_ids, distances, *, out=None):
@@ -179,7 +179,7 @@ class PolylineSet(_Resident):
             raise ValueError('curve_ids and distances must have shape (Q,)')
         n = ids.shape[0]
         result, arrays = _outputs(out, dict(points=((n,3),np.float32), valid=((n,),np.bool_)), self.device)
-        _native._geometry_interpolate(self._native, _native_array(ids), _native_array(s), *arrays)
+        _reader._geometry_interpolate(self._storage, _array_view(ids), _array_view(s), *arrays)
         return result
 
     def intersect_planes(self, curve_ids, planes, *, intervals=None, direction=1, out=None):
@@ -207,7 +207,7 @@ class PolylineSet(_Resident):
         direction = operator.index(direction)
         result, arrays = _outputs(out, dict(points=((n,3),np.float32), arclengths=((n,),np.float32),
             indices=((n,),np.int64), valid=((n,),np.bool_)), self.device)
-        _native._geometry_intersect(self._native, _native_array(ids), _native_array(p), _native_array(spans), direction, *arrays)
+        _reader._geometry_intersect(self._storage, _array_view(ids), _array_view(p), _array_view(spans), direction, *arrays)
         return result
 
     def nearest(self, points, *, curve_ids=None, vertices=False, max_distance=np.inf, out=None):
@@ -226,7 +226,7 @@ class PolylineSet(_Resident):
         result, arrays = _outputs(out, dict(points=((n,3),np.float32), distances=((n,),np.float32),
             arclengths=((n,),np.float32), indices=((n,),np.int64), curve_ids=((n,),np.int64),
             valid=((n,),np.bool_)), self.device)
-        _native._geometry_nearest(self._native, _native_array(p), _native_array(ids), bool(vertices), float(max_distance), *arrays)
+        _reader._geometry_nearest(self._storage, _array_view(p), _array_view(ids), bool(vertices), float(max_distance), *arrays)
         return result
 
 
@@ -251,7 +251,7 @@ class PolylineSet(_Resident):
         ids = _ids(curve_ids, n, self.device)
         result, arrays = _outputs(out, dict(indices=((n,capacity),np.int64), counts=((n,),np.int64),
             valid=((n,),np.bool_)), self.device)
-        _native._geometry_boxes(self._native, _native_array(lower), _native_array(upper), _native_array(ids), bool(vertices), capacity, *arrays)
+        _reader._geometry_boxes(self._storage, _array_view(lower), _array_view(upper), _array_view(ids), bool(vertices), capacity, *arrays)
         return result
 
 
@@ -270,7 +270,7 @@ def transform_points(points, matrices, *, vectors=False, out=None):
     if matrices.ndim != 3 or matrices.shape[1:] != (3,4) or matrices.shape[0] not in (1,p.shape[0]):
         raise ValueError('matrices must have shape (3,4), (1,3,4), or (Q,3,4)')
     result, output = _output(out, p.shape, np.float32, device)
-    _native._geometry_transform(_native_array(p), _native_array(matrices), bool(vectors), output)
+    _reader._geometry_transform(_array_view(p), _array_view(matrices), bool(vectors), output)
     return result
 
 
@@ -294,7 +294,7 @@ class VoxelSet(_Resident):
         self.batches = operator.index(batches)
         if len(self.shape) != 3:
             raise ValueError('shape must be (D,H,W)')
-        self._native = _native._geometry_voxelize(_native_array(p), _native_array(ids), self.shape, self.batches)
+        self._storage = _reader._geometry_voxelize(_array_view(p), _array_view(ids), self.shape, self.batches)
 
     def cuda(self, device=0):
         """Upload a CPU occupancy index once, retaining sparse storage."""
@@ -309,7 +309,7 @@ class VoxelSet(_Resident):
         if not _cuda.is_available():
             raise RuntimeError('CUDA geometry requires a CUDA-enabled build and device')
         result = object.__new__(type(self))
-        result._native = _native._geometry_voxels_cuda(self._native, device)
+        result._storage = _reader._geometry_voxels_cuda(self._storage, device)
         result.device, result._pid = device, os.getpid()
         result.shape, result.batches = self.shape, self.batches
         return result
@@ -320,7 +320,7 @@ class VoxelSet(_Resident):
         p = _points(points, self.device)
         ids = _ids(batch_ids, p.shape[0], self.device)
         result, output = _output(out, (p.shape[0],), np.bool_, self.device)
-        _native._geometry_contains(self._native, _native_array(p), _native_array(ids), output)
+        _reader._geometry_contains(self._storage, _array_view(p), _array_view(ids), output)
         return result
 
     def sorted_keys(self, *, capacity=None, out=None):
@@ -339,12 +339,12 @@ class VoxelSet(_Resident):
         if capacity < count:
             raise ValueError('key output capacity is too small')
         result, output = _output(out, (capacity,), np.int64, self.device)
-        _native._geometry_keys(self._native, output)
+        _reader._geometry_keys(self._storage, output)
         return result
 
     def to_dense(self, *, out=None):
         """Explicitly materialize (B,D,H,W) uint8 occupancy on this device."""
         self._ready()
         result, output = _output(out, (self.batches,*self.shape), np.uint8, self.device)
-        _native._geometry_dense(self._native, output)
+        _reader._geometry_dense(self._storage, output)
         return result

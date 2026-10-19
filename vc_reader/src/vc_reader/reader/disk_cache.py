@@ -1,6 +1,6 @@
 """Finding the on-disk chunk caches of a remote array, in the formats other tools already write.
 
-The native reader reads and appends chunks; this module only finds caches,
+The C++ reader reads and appends chunks; this module only finds caches,
 checks that they hold the requested array, creates level metadata where an
 append needs it, and holds VC3D's lease. Supported layouts:
 
@@ -52,18 +52,18 @@ _inherited_budgets: list[Any] = []
 
 
 def disk_budget(root: str, max_bytes: int | None):
-    """One native eviction index per directory and process, shared by writers."""
+    """One C++ eviction index per directory and process, shared by writers."""
     global _budget_pid, _budget_lock, _budgets
     if _budget_pid != os.getpid():
         _inherited_budgets.append(_budgets)
         _budgets = {}
         _budget_lock = threading.Lock()
         _budget_pid = os.getpid()
-    from .. import _native
+    from .. import _reader
     with _budget_lock:
         budget = _budgets.get(root)
         if budget is None:
-            budget = _native.DiskCache(root, -1 if max_bytes is None else max_bytes)
+            budget = _reader.DiskCache(root, -1 if max_bytes is None else max_bytes)
         elif max_bytes is not None:
             budget.set_max_bytes(max_bytes)
         _budgets[root] = budget
@@ -175,7 +175,7 @@ class CacheLayer:
     lease: Vc3dLease | None = field(default=None, repr=False)
     budget_root: str = ""  # only the selected decoded writer when a limit is configured
 
-    def native_spec(self) -> tuple[str, str, str, str, bool]:
+    def reader_spec(self) -> tuple[str, str, str, str, bool]:
         return (self.kind, self.root, self.stored.codec_id, self.empty_root, self.allow_lossy)
 
     def close(self) -> None:

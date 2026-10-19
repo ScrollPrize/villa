@@ -10,7 +10,7 @@ Saved outputs show an executed run on the published data.
 | [3D ink training](02_ink_training_3d.ipynb) | Scans a full PHercParis4 segment for supervised 512×512 seeds, caches projected CT patches on disk, trains a 3D U-Net for complete epochs, then stitches overlapping predictions into a flattened letter-scale image on a held-out segment. |
 | [Zarr reader](03_zarr_reader.ipynb) | Opens groups and arrays, selects levels, reads slices and batches of blocks, reuses buffers and bounded caches, and reopens a crop offline. |
 | [Augmentations and CUDA](04_augmentations_and_cuda.ipynb) | Shows image/label/validity semantics and reproducible CPU augmentation, then a pinned DataLoader → CudaLoader → model → optimizer path. |
-| [Mesh segment rendering](05_render_mesh_segment.ipynb) | Discovers registered geometry and displays CT at −1, 0 and +1 native voxel along the surface normals, with an optional CUDA comparison. |
+| [Mesh segment rendering](05_render_mesh_segment.ipynb) | Discovers registered geometry and displays CT at −1, 0 and +1 source voxel along the surface normals, with an optional CUDA comparison. |
 
 ## Run
 
@@ -21,7 +21,7 @@ From the repository root, install the package with the extras used by the notebo
 python -m pip install -e '.[reader,labels,torch]'
 ```
 
-This builds and installs the native extensions. The reader notebook needs NumPy
+This builds and installs the compiled extensions. The reader notebook needs NumPy
 and Pillow. The surface and training notebooks also need the `labels`
 dependencies (including tifffile),
 and training/augmentation need PyTorch. These correspond to the package's
@@ -35,19 +35,19 @@ need a CUDA-enabled build and device; both training notebooks also run on CPU.
 The general reader and mesh-rendering notebooks do not import PyTorch.
 
 An editable installation uses the current Python source but still needs its
-compiled extensions rebuilt after native changes. If a notebook reports
+compiled extensions rebuilt after C++/CUDA changes. If a notebook reports
 `cache_max_bytes must be nonnegative` with the default settings, check which
 kernel and extensions it loaded:
 
 ```python
 import sys
-from vc_reader import _native, _augment
+from vc_reader import _reader, _augment
 print(sys.executable)
-print(_native.__file__)
+print(_reader.__file__)
 print(_augment.__file__)
 ```
 
-Use the environment containing the current build. After reinstalling native
+Use the environment containing the current build. After reinstalling compiled
 extensions, **restart the kernel and run all cells**; re-running imports does
 not unload an extension already in memory.
 
@@ -70,7 +70,7 @@ The examples never download a complete CT volume or search it for random patches
 ## Data and supervision choices
 
 The 2.5D example selects PHercParis4 segment `20231210121321`, label set
-`20260918`, native volume `20260411134726`. It prints the published ink,
+`20260918`, source volume `20260411134726`. It prints the published ink,
 supervision and CT URLs plus the original annotation raster names. This segment
 has no published validation mask. The notebook reserves a contiguous bottom
 section, choosing a whole-tile-row boundary closest to 20% of supervised pixels.
@@ -103,11 +103,11 @@ transfer to other segments or scrolls.
 The 3D example uses training segment `20230702185753` and holds out segment
 `20230929220926`, both PHercParis4 label set `20260918`. A label-only scan at
 level 3 covers the entire training canvas with a non-overlapping grid of
-512×512-native-pixel seeds. Every tile with scanned supervision is retained,
+seeds of 512×512 full-resolution pixels. Every tile with scanned supervision is retained,
 including negative-only and partial edge tiles. The scan finds 772 training
 seeds covering 2,060,815 supervised level-3 pixels. Published decimation can
 omit finer annotations. Validation selects 43 supervised seeds from the fixed
-4096×4096-native-pixel field used for the final stitched view. Figures show the
+field of 4096×4096 full-resolution pixels used for the final stitched view. Figures show the
 ink, published supervision and selected grid; the notebook prints source URLs.
 
 Seeds project into CT level 2 with a 9.6 µm projection band and 19.2 µm context
@@ -134,8 +134,8 @@ not that input channel. Label-pixel-to-UV registration is explicitly declared
 using the published full render-canvas convention; volume registration and
 geometry ownership are discovered from metadata.
 
-After training, the 3D notebook predicts the 4096×4096-native-pixel validation
-context with 225 geometry-bounded chunks, seeded by 512×512 rectangles at stride
+After training, the 3D notebook predicts the validation context of 4096×4096
+full-resolution pixels with 225 geometry-bounded chunks, seeded by 512×512 rectangles at stride
 256. Each 3D prediction is trilinearly sampled at the registered sheet's label
 pixel centers, then blended in 2D with tapered overlap weights. The final
 512×512 surface view shows CT, supervised ink and stitched probabilities over

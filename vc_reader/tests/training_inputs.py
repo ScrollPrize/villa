@@ -74,7 +74,7 @@ def build_workflow(name, root, metadata=None):
     if name in ('custom', 'registered', 'transfer', 'local-render', 'local-project'):
         scroll, ids = local_inputs(root)
         provenance = dict(fixture='analytic local arrays; not real annotation acceptance', workflow=name,
-                          scroll=scroll.id, native_volume='a', reference_volume='b' if name == 'transfer' else 'a')
+                          scroll=scroll.id, source_volume='a', reference_volume='b' if name == 'transfer' else 'a')
         if name == 'custom':
             label = scroll.labels[ids['ink']]
             spec = ReadSpec(label, mode='paired', image=label.images.zarr())
@@ -104,7 +104,7 @@ def build_workflow(name, root, metadata=None):
                               transform_provenance='explicit analytic A→B translation, x + 2',
                               known_coverage='A shape ZYX 12,14,16 mapped to B x in [2,18); B x in [0,16)')
         provenance.update(label=label.id, features=features.id, reference_level=0,
-                          native_registration=label.source.to_dict(), component_frame='selected reference volume XYZ voxels')
+                          source_registration=label.source.to_dict(), component_frame='selected reference volume XYZ voxels')
         return [ReadSpec(volume, targets=targets)], [(0, (1, 2, i), (3, 4, 5)) for i in range(6)], arrays, 3, provenance
 
     if name == 'published-transfer':
@@ -132,8 +132,8 @@ def build_workflow(name, root, metadata=None):
         # Projection bounds depend on geometry: use batch_size=1 or explicitly pad.
         return ([spec], [(0, (18576 + 2*i, 7984 + 2*i), (16, 16)) for i in range(6)], arrays,
                 3, dict(label=label.to_dict(), workflow=name,
-                published=published.summary(), native_volume=published.volume.id,
-                reference_volume=destination, native_level=0, reference_level=0,
+                published=published.summary(), source_volume=published.volume.id,
+                reference_volume=destination, source_level=0, reference_level=0,
                 required_operations=mapping.required_operations, affine=mapping.transform.matrix,
                 derivation_path=mapping.transform.derivation_path,
                 registration_basis='declared vc_render_tifxyz canvas convention; volume affine from catalog'))

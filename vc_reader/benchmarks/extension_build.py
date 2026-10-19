@@ -1,4 +1,4 @@
-"""Select native extensions from an existing build for benchmarks and tests."""
+"""Select compiled extensions from an existing build for benchmarks and tests."""
 import importlib.util
 from pathlib import Path
 import sys
@@ -7,7 +7,7 @@ import sys
 def load_extensions(directory):
     import importlib.machinery
 
-    for name in ("_native", "_augment"):
+    for name in ("_reader", "_augment"):
         candidates = [directory / (name + suffix) for suffix in importlib.machinery.EXTENSION_SUFFIXES]
         path = next((p for p in candidates if p.is_file()), None)
         if path is None:

@@ -11,8 +11,8 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
 from training_support import (Array, TrainingDataset, augment_cpu_sample, cpu_batches, data_loader,
-                                image_arrays, load_native, pipeline, restore_layers, select_arrays)
-load_native()
+                                image_arrays, load_build, pipeline, restore_layers, select_arrays)
+load_build()
 import numpy as np
 import torch
 from vc_reader import Affine, ScrollSource, ValueFrame

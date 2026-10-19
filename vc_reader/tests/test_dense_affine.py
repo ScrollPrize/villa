@@ -8,10 +8,10 @@ import sys
 import numpy as np
 import pytest
 
-if os.environ.get('VC_READER_NATIVE_DIR'):
+if os.environ.get('VC_READER_BUILD_DIR'):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-    from native_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_NATIVE_DIR']))
+    from extension_build import load_extensions
+    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
 
 from vc_reader import cuda
 from vc_reader.reader import ZarrReader

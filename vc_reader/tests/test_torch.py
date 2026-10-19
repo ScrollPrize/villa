@@ -1,4 +1,4 @@
-"""Run with unittest; VC_READER_NATIVE_DIR selects an existing native build."""
+"""Run with unittest; VC_READER_BUILD_DIR selects an existing CMake build."""
 import gc
 import os
 from pathlib import Path
@@ -6,10 +6,10 @@ import subprocess
 import sys
 import unittest
 
-if os.environ.get("VC_READER_NATIVE_DIR"):
+if os.environ.get("VC_READER_BUILD_DIR"):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "benchmarks"))
-    from native_build import load_extensions
-    load_extensions(Path(os.environ["VC_READER_NATIVE_DIR"]))
+    from extension_build import load_extensions
+    load_extensions(Path(os.environ["VC_READER_BUILD_DIR"]))
 
 import numpy as np
 import torch
@@ -66,11 +66,11 @@ class ConfigurationTests(unittest.TestCase):
         # The catalog and ordinary augmentation APIs remain independent of Torch.
         code = """
 import sys, os
-if os.environ.get('VC_READER_NATIVE_DIR'):
+if os.environ.get('VC_READER_BUILD_DIR'):
     sys.path.insert(0, 'benchmarks')
     from pathlib import Path
-    from native_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_NATIVE_DIR']))
+    from extension_build import load_extensions
+    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
 import vc_reader
 from vc_reader import augment
 assert 'torch' not in sys.modules
@@ -79,7 +79,7 @@ assert 'torch' not in sys.modules
                        cwd=Path(__file__).resolve().parents[1])
 
 
-@unittest.skipUnless(torch.cuda.is_available() and A._native.cuda_available(), "CUDA build and device required")
+@unittest.skipUnless(torch.cuda.is_available() and A._augment.cuda_available(), "CUDA build and device required")
 class BatchTests(unittest.TestCase):
     def assertSame(self, actual, expected):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -161,8 +161,8 @@ class BatchTests(unittest.TestCase):
         result = pipeline.batch({'image': x}, seeds=[1, 2, 3])['image']
         self.assertEqual(result.dtype, torch.float64)
         self.assertSame(result, x.flip(-1))
-        native = cuda.asarray(image_batch().numpy())
-        self.assertSame(pipeline.batch({'image': native}, seeds=[1, 2, 3])['image'],
+        device_array = cuda.asarray(image_batch().numpy())
+        self.assertSame(pipeline.batch({'image': device_array}, seeds=[1, 2, 3])['image'],
                         image_batch().to('cuda', dtype=torch.float32).flip(-1))
 
     def test_changed_shape_generated_target_and_removed_source(self):
@@ -313,7 +313,7 @@ class BatchTests(unittest.TestCase):
         self.assertSame(next(iter(CudaLoader([batch], p, seed_key='seed')))['image'], expected)
 
 
-@unittest.skipUnless(torch.cuda.is_available() and A._native.cuda_available(), "CUDA build and device required")
+@unittest.skipUnless(torch.cuda.is_available() and A._augment.cuda_available(), "CUDA build and device required")
 class LoaderTests(unittest.TestCase):
     def pipeline(self):
         return A.Pipeline([A.Flip(axes='x', p_axis=.5), A.BrightnessMultiply((.5, 1.5))],
@@ -386,7 +386,7 @@ class LoaderTests(unittest.TestCase):
         torch.testing.assert_close(result, ref, rtol=0, atol=0)
 
 
-@unittest.skipUnless(torch.cuda.is_available() and A._native.cuda_available(), "CUDA build and device required")
+@unittest.skipUnless(torch.cuda.is_available() and A._augment.cuda_available(), "CUDA build and device required")
 class GeometryTests(unittest.TestCase):
     def test_exact_reflections_all_axes_shapes_and_dtypes(self):
         import itertools

@@ -1,4 +1,4 @@
-"""Zarr v3 metadata normalized for the shared native chunk reader.
+"""Zarr v3 metadata normalized for the shared C++ chunk reader.
 
 Supports regular grids, bytes plus optional Blosc/Zstd compression, and indexed
 shards with bytes/CRC32C indexes. Other codec pipelines fail explicitly.

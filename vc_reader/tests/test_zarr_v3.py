@@ -1,4 +1,4 @@
-"""Value-exact v3 chunks/shards through the existing native reader and caches."""
+"""Value-exact v3 chunks/shards through the existing C++ reader and caches."""
 
 import copy
 import ctypes
@@ -96,7 +96,7 @@ def write_v3(path, *, sharded=True, index_end=True, compressed=False, endian='li
 
 class V3Tests(FixtureCase):
     @unittest.skipUnless('fork' in multiprocessing.get_all_start_methods(), 'fork is unavailable')
-    def test_inherited_native_reader_reopens_after_fork(self):
+    def test_inherited_chunk_reader_reopens_after_fork(self):
         path = self.root/'fork'
         expected, _ = write_v3(path, compressed=True)
         with Source('fork', Storage(str(path), 'zarr')).open(memory_cache=4096) as reader:
@@ -107,7 +107,7 @@ class V3Tests(FixtureCase):
             process.start()
             child.close()
             try:
-                self.assertTrue(parent.poll(20), 'forked native reader did not return')
+                self.assertTrue(parent.poll(20), 'forked C++ reader did not return')
                 result = parent.recv()
                 if isinstance(result, BaseException):
                     raise result

@@ -7,12 +7,12 @@ import sys
 import numpy as np
 import pytest
 
-if os.environ.get('VC_READER_NATIVE_DIR'):
+if os.environ.get('VC_READER_BUILD_DIR'):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-    from native_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_NATIVE_DIR']))
+    from extension_build import load_extensions
+    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
 
-from vc_reader import cuda, _native
+from vc_reader import cuda, _reader
 from vc_reader.geometry import PolylineSet, VoxelSet, transform_points
 
 
@@ -224,14 +224,14 @@ def test_cuda_torch_owned_outputs_and_other_stream():
         s=torch.ones(64,device='cuda')
         out=dict(points=torch.empty((64,3),device='cuda'),valid=torch.empty(64,device='cuda',dtype=torch.bool))
         stream.synchronize()
-        _native._set_stream(stream.cuda_stream)
+        _reader._set_stream(stream.cuda_stream)
         try:
             assert c.interpolate(ids,s,out=out) is out
             value=out['points'].clone()
             bad=dict(out,points=torch.empty((64,6),device='cuda')[:,::2])
             with pytest.raises((TypeError,RuntimeError)): c.interpolate(ids,s,out=bad)
         finally:
-            stream.synchronize();_native._set_stream(0)
+            stream.synchronize();_reader._set_stream(0)
     np.testing.assert_array_equal(value.cpu(),np.tile([1,0,0],(64,1)))
     # Neither query validation nor destruction should drain an unrelated stream.
     done=torch.cuda.Event()
@@ -261,7 +261,7 @@ def test_cuda_wrap_does_not_fence_default_stream():
             tensor = torch.empty(16, device='cuda')
             torch.cuda._sleep(500_000_000)
             done.record()
-            _native._set_stream(producer.cuda_stream)
+            _reader._set_stream(producer.cuda_stream)
             wrapped = cuda.wrap(tensor)
             assert wrapped.shape == (16,)
         # Importing storage must not make the unrelated default stream wait
@@ -270,7 +270,7 @@ def test_cuda_wrap_does_not_fence_default_stream():
         assert not done.query()
     finally:
         producer.synchronize()
-        _native._set_stream(0)
+        _reader._set_stream(0)
 
 
 def test_many_curves_and_zero_length_segments(backend):

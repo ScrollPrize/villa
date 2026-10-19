@@ -10,11 +10,11 @@ import os
 from pathlib import Path
 
 
-def load_native(directory=None):
+def load_build(directory=None):
     """Use an existing build, including in spawned workers; never install it."""
-    directory = directory or os.environ.get('VC_READER_NATIVE_DIR')
+    directory = directory or os.environ.get('VC_READER_BUILD_DIR')
     if directory:
-        from native_build import load_extensions
+        from extension_build import load_extensions
         load_extensions(Path(directory))
 
 
@@ -112,7 +112,7 @@ class TrainingDataset:
     """
     def __init__(self, specs, requests, arrays, *, seeds, memory_cache_bytes=64 << 20,
                  threads=1, sampling_cache_bytes=16 << 20, plan_cache_bytes=4 << 20,
-                 cache_dir=None, offline=False, native_dir=None):
+                 cache_dir=None, offline=False, build_dir=None):
         self.specs, self.requests, self.arrays = tuple(specs), tuple(requests), dict(arrays)
         self.seeds = tuple(map(operator.index, seeds))
         if len(self.requests) != len(self.seeds):
@@ -121,7 +121,7 @@ class TrainingDataset:
             raise ValueError('seeds must be unsigned 64-bit integers')
         if threads < 1 or memory_cache_bytes < 0:
             raise ValueError('threads must be positive and cache budget nonnegative')
-        self.memory_cache_bytes, self.native_dir = memory_cache_bytes, native_dir
+        self.memory_cache_bytes, self.build_dir = memory_cache_bytes, build_dir
         self.options = dict(threads=threads, sampling_cache_bytes=sampling_cache_bytes,
                             plan_cache_bytes=plan_cache_bytes, cache_dir=cache_dir, offline=offline)
         self._runtime = self._finalizer = None
@@ -134,7 +134,7 @@ class TrainingDataset:
 
     def reader(self, index):
         if self._runtime is None:
-            load_native(self.native_dir)
+            load_build(self.build_dir)
             from multiprocessing.util import Finalize
             from vc_reader.reader import MemoryCache
             stack = ExitStack()

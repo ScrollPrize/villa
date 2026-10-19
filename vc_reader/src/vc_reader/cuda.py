@@ -8,11 +8,11 @@ import math
 import operator
 import os
 import numpy as np
-from . import _native
+from . import _reader
 
 
 def is_available():
-    return bool(getattr(_native, "reader_cuda_available", lambda: False)())
+    return bool(getattr(_reader, "reader_cuda_available", lambda: False)())
 
 
 class _ExportOwners:
@@ -31,13 +31,13 @@ class DeviceArray:
     DLPack consumers (e.g. torch.from_dlpack) share storage and its lifetime.
     reshape() is a view; astype(float32) converts uint8 on device.
     """
-    def __init__(self, native, shape, dtype, device=0, *, _export_owner=None):
-        storage_type = getattr(_native, "CudaStorage", None)
-        if storage_type is not None and isinstance(native, storage_type):
-            _export_owner = native
-            native = _native._cuda_view(native.array(), shape, 0)
+    def __init__(self, array, shape, dtype, device=0, *, _export_owner=None):
+        storage_type = getattr(_reader, "CudaStorage", None)
+        if storage_type is not None and isinstance(array, storage_type):
+            _export_owner = array
+            array = _reader._cuda_view(array.array(), shape, 0)
         self._export_owner = _export_owner
-        self._native = native
+        self._array = array
         self.shape = tuple(shape)
         self.dtype = np.dtype(dtype)
         self.device = operator.index(device)
@@ -57,12 +57,12 @@ class DeviceArray:
     def numpy(self):
         self._ready()
         out = np.empty(self.shape, self.dtype)
-        _native._cuda_download(self._native, out.reshape(-1).view(np.uint8))
+        _reader._cuda_download(self._array, out.reshape(-1).view(np.uint8))
         return out
 
     def _view(self, shape, offset=0):
         self._ready()
-        return DeviceArray(_native._cuda_view(self._native, shape, offset), shape, self.dtype, self.device,
+        return DeviceArray(_reader._cuda_view(self._array, shape, offset), shape, self.dtype, self.device,
                            _export_owner=self._export_owner)
 
     def reshape(self, *shape):
@@ -87,13 +87,13 @@ class DeviceArray:
             return self
         if self.dtype != np.uint8 or dtype != np.float32:
             raise TypeError("device conversion supports uint8 to float32")
-        return DeviceArray(_native._cuda_cast(self._native), (self.size,), dtype, self.device).reshape(self.shape)
+        return DeviceArray(_reader._cuda_cast(self._array), (self.size,), dtype, self.device).reshape(self.shape)
 
     def __dlpack__(self, *, stream=None, **kwargs):
         self._ready()
         if self._export_owner is not None:
             self._export_owner.export()
-        return self._native.__dlpack__(stream=stream, **kwargs)
+        return self._array.__dlpack__(stream=stream, **kwargs)
 
     def __dlpack_device__(self):
         self._ready()
@@ -139,9 +139,9 @@ def wrap(value):
         return value
     # DLPack uses 1 for CUDA's default stream. An omitted stream would make
     # Torch fence its default stream even when all work uses a separate stream.
-    value = _StreamInput(value, _native._get_stream() or 1)
-    shape, dtype, device = _native._cuda_describe(value)
-    return DeviceArray(_native._cuda_view(value, shape, 0), shape, np.dtype(dtype), device)
+    value = _StreamInput(value, _reader._get_stream() or 1)
+    shape, dtype, device = _reader._cuda_describe(value)
+    return DeviceArray(_reader._cuda_view(value, shape, 0), shape, np.dtype(dtype), device)
 
 
 def empty(shape, dtype=np.float32, *, device=0):
@@ -157,7 +157,7 @@ def empty(shape, dtype=np.float32, *, device=0):
     if not is_available():
         raise RuntimeError('CUDA reader unavailable: build with VC_READER_ENABLE_CUDA=ON')
     device = operator.index(device)
-    return DeviceArray(_native._cuda_empty(math.prod(shape), dtype.kind, dtype.itemsize, device),
+    return DeviceArray(_reader._cuda_empty(math.prod(shape), dtype.kind, dtype.itemsize, device),
                        shape, dtype, device)
 
 
@@ -174,4 +174,4 @@ def asarray(array, *, device=0):
     if not array.dtype.isnative or array.dtype.kind not in "buif" or array.dtype.itemsize not in (1, 2, 4, 8):
         raise TypeError("unsupported device array dtype")
     array = np.require(array, requirements=["C", "A"])
-    return DeviceArray(_native._cuda_upload(array, operator.index(device)), array.shape, array.dtype, device)
+    return DeviceArray(_reader._cuda_upload(array, operator.index(device)), array.shape, array.dtype, device)

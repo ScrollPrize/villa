@@ -52,7 +52,7 @@ shape, or collation rule is selected by the library.
 Metadata includes the selecting label and pixel patch, surface ID, UV mapping,
 destination reference/level, crop shape and ZYX origin, crop-to-reference affine,
 reference-to-level-0 affine, thickness, padding and geometry preparation time.
-The public Source descriptors retain their native frames.
+The public Source descriptors retain their source coordinate frames.
 
 ## Supply explicit geometry and registration
 
@@ -76,11 +76,11 @@ the actual render registration for your data. Shape, filename, matching render
 resolution, or segment membership cannot establish that relationship.
 Discovery's `mappable_volumes` continues to report `surface_projection` until
 projection is explicitly requested. A transformed tifxyz geometry Asset can be
-passed directly when discovery provides its native Surface registration;
+passed directly when discovery provides its source Surface registration;
 other geometry IDs must uniquely resolve to a configured target's descriptor.
 
 Tifxyz opens `x.tif`, `y.tif`, `z.tif`, and `meta.json` through the shared storage
-readers. Its `scale` is **XY**: stored column/row coordinates equal native UV
+readers. Its `scale` is **XY**: stored column/row coordinates equal full-resolution UV
 coordinates multiplied by those respective scales. Coordinate-value units are
 independent of UV scale. An explicitly supplied surface `pixel_to_uv` must
 agree with that metadata. Nonfinite/negative tifxyz coordinates and an optional
@@ -111,7 +111,7 @@ with open_sample(reference, {"ink": ink}, backend="cuda") as reader:
     )
 ```
 
-Here `start` and `size` are YX in **native surface UV pixels**, rather than the
+Here `start` and `size` are YX in **full-resolution surface UV pixels**, rather than the
 label grid. Volume outputs are `(C, D, H, W)` in the supplied offset order;
 labels and masks remain `(C, H, W)`. Coordinate grids are bilinearly sampled
 with valid quad support and interpolation halos. There is no extrapolation

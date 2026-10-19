@@ -23,7 +23,7 @@ import time
 
 import numpy as np
 
-from native_build import load_extensions
+from extension_build import load_extensions
 
 
 def positive(value):
@@ -50,7 +50,7 @@ def arguments():
     parser.add_argument("--surface", type=Path, default=Path(__file__).resolve().parent / "fixtures/fiber_132487",
                         help="tifxyz directory for the surface workload (default: bundled PHercParis4 strip)")
     parser.add_argument("--surface-size", type=positive, nargs=2, default=(96, 512), metavar=("H", "W"),
-                        help="surface tile in native UV pixels, upsampled according to meta.json scale")
+                        help="surface tile in full-resolution UV pixels, upsampled according to meta.json scale")
     parser.add_argument("--surface-coordinate-scale", type=float, default=1.,
                         help="multiply stored XYZ to map to array voxels; bundled fixture uses level-2 voxels")
     parser.add_argument("--batch-size", type=positive, default=8, help="crops per ML request")
@@ -81,7 +81,7 @@ def arguments():
     parser.add_argument("--cuda-output", choices=("host", "device"), default="host",
                         help="host includes final download; device leaves output ready for a GPU consumer")
     parser.add_argument("--device", type=nonnegative, default=0)
-    parser.add_argument("--native-dir", type=Path, help="use both extensions from an existing CMake build, without installing")
+    parser.add_argument("--build-dir", type=Path, help="use both extensions from an existing CMake build, without installing")
     parser.add_argument("--output", type=Path, help="write complete JSON report, including raw measurements")
     args = parser.parse_args()
     if not np.isfinite(args.jitter) or args.jitter < 0 or not np.isfinite(args.angle):
@@ -143,21 +143,21 @@ def summary(values):
 
 
 def environment(args, *, augmentation=False):
-    from vc_reader import _native
+    from vc_reader import _reader
 
     result = dict(python=sys.version, numpy=np.__version__, platform=platform.platform(),
                   processor=platform.processor(), cpu_count=os.cpu_count(),
                   affinity=sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
                   extensions={})
-    modules = {"reader": _native}
+    modules = {"reader": _reader}
     if augmentation:
         from vc_reader import _augment
         modules["augment"] = _augment
     for name, module in modules.items():
         path = Path(module.__file__)
         result["extensions"][name] = dict(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
-    cache = args.native_dir / "CMakeCache.txt" if args.native_dir else None
-    result["build"] = {"type": "unknown (use --native-dir to record CMake settings)"}
+    cache = args.build_dir / "CMakeCache.txt" if args.build_dir else None
+    result["build"] = {"type": "unknown (use --build-dir to record CMake settings)"}
     if cache and cache.is_file():
         keys = ("CMAKE_BUILD_TYPE", "CMAKE_CXX_COMPILER", "CMAKE_CUDA_ARCHITECTURES", "VC_READER_ENABLE_CUDA")
         result["build"] = {line.split(":", 1)[0]: line.split("=", 1)[1]
@@ -217,7 +217,7 @@ def reading_workloads(args, volume_shape):
 
 
 def sampling_box(grid):
-    """Baseline ROI and coordinates using the native reader's float32 geometry.
+    """Baseline ROI and coordinates using the C++ reader's float32 geometry.
 
     SciPy performs interpolation; coordinates are generated here to avoid
     comparing float64 affine geometry against vc_reader's float32 contract.
@@ -348,8 +348,8 @@ class BaselineReader:
 
 
 def reading_benchmark(args):
-    if args.native_dir:
-        load_extensions(args.native_dir.resolve())
+    if args.build_dir:
+        load_extensions(args.build_dir.resolve())
     from vc_reader import cuda
     from vc_reader.reader import ZarrReader
 
@@ -361,7 +361,7 @@ def reading_benchmark(args):
                   environment=environment(args), workloads={},
                   protocol=dict(included="request planning, allocation, reads, decode, interpolation, final CUDA download when selected",
                                 excluded="normalization, augmentation, setup, warmup, validation, destruction, cache clearing",
-                                sampling="TensorStore/zarr read an enclosing ROI then SciPy order=1 samples matched float32 coordinates; vc_reader samples chunks natively",
+                                sampling="TensorStore/zarr read an enclosing ROI then SciPy order=1 samples matched float32 coordinates; vc_reader samples chunks directly",
                                 batching="ML: one vc_reader read_many call, concurrent TensorStore futures, zarr thread-pool reads; no pre-stacking",
                                 order="cyclic rotation of backend order each repetition",
                                 caches="warm OS cache; vc_reader/TensorStore use requested decoded-cache budgets; zarr has no added decoded cache",
@@ -473,10 +473,10 @@ def reading_benchmark(args):
                                            raw_ms=samples, samples=len(samples), requests_per_second=len(samples)/seconds,
                                            crops_per_second=crops/seconds, mvoxels_per_second=voxels/seconds/1e6,
                                            output_gib_per_second=voxels*np.dtype(row["dtype"]).itemsize/seconds/(1<<30))
-            row["speedups"] = {f"{baseline}_over_{native}": row["results"][baseline]["timings"]["total"]["p50_ms"] /
-                                row["results"][native]["timings"]["total"]["p50_ms"]
-                                for native in ("cpu", "cuda") if native in modes
-                                for baseline in modes if baseline != native}
+            row["speedups"] = {f"{baseline}_over_{backend}": row["results"][baseline]["timings"]["total"]["p50_ms"] /
+                                row["results"][backend]["timings"]["total"]["p50_ms"]
+                                for backend in ("cpu", "cuda") if backend in modes
+                                for baseline in modes if baseline != backend}
             report["workloads"][name] = row
             print(f"{name}: validation passed; " + ", ".join(f"{mode}={row['results'][mode]['timings']['total']['p50_ms']:.3f} ms" for mode in modes), flush=True)
     return report
@@ -521,8 +521,8 @@ def heavy_transforms():
 
 
 def benchmark(args):
-    if args.native_dir:
-        load_extensions(args.native_dir.resolve())
+    if args.build_dir:
+        load_extensions(args.build_dir.resolve())
     from vc_reader import augment as A, cuda
     from vc_reader.reader import ZarrReader
 
@@ -638,7 +638,7 @@ def main():
     try:
         report = reading_benchmark(args) if args.suite == "readers" else benchmark(args)
     except (ImportError, AttributeError, RuntimeError, ValueError, AssertionError) as exc:
-        raise SystemExit(f"Benchmark failed: {exc}\nUse matching reader/augmentation extensions; --native-dir can select an existing build.") from exc
+        raise SystemExit(f"Benchmark failed: {exc}\nUse matching reader/augmentation extensions; --build-dir can select an existing build.") from exc
     if args.suite == "readers":
         print("Workload     Backend       mean ms     p50 ms     p95 ms      req/s     Mvox/s")
         for name, workload in report["workloads"].items():

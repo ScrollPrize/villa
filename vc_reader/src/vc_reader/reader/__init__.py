@@ -1,7 +1,7 @@
 """Array and image readers, loaded only when their public names are used.
 
 Image decoding needs the ``labels`` extra. Zarr access additionally needs the
-native reader extension. Neither is imported merely to describe a source.
+C++ reader extension. Neither is imported merely to describe a source.
 """
 
 from importlib import import_module

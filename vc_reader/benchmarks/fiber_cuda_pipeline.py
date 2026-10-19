@@ -32,7 +32,7 @@ def reader_spec(ct):
     return dict(location=ct.path)
 
 
-def native_reader(ct):
+def chunk_reader(ct):
     reader = getattr(ct, '_vc_reader', None)
     if reader is None:
         from vc_reader.reader import ZarrReader
@@ -42,13 +42,13 @@ def native_reader(ct):
 
 
 def read_block(ct, start, size):
-    return native_reader(ct).read_region(start, size)
+    return chunk_reader(ct).read_region(start, size)
 
 
 def read_nearest(ct, points):
     # Preserve the trainer's ties-to-even nearest-voxel rule.
     points = np.rint(points).astype(np.int64)
-    return native_reader(ct).read_points(points)
+    return chunk_reader(ct).read_points(points)
 
 
 def deferred_images(items, vol, crop, pool=None):
@@ -109,7 +109,7 @@ def crop_affines(positions, frames, crop, scale):
 
 def augmentation_pipeline(backend='cuda'):
     from vc_reader import augment as a
-    # Per-sample values are resolved by the common native batch executor.
+    # Per-sample values are resolved by the common C++ batch executor.
     return a.Pipeline([
         a.Normalize(mode='fixed', scale=255.),
         a.Normalize(mode='zscore', nonzero=False, eps=1e-6),

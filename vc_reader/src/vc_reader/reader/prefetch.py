@@ -411,7 +411,7 @@ def _local(reader):
 
 
 class _ServiceBackend:
-    """Manager-owned scheduler and native readers; no training-specific state."""
+    """Manager-owned scheduler and C++ readers; no training-specific state."""
     def __init__(self, options):
         self.scheduler = _Scheduler(**options)
         self.readers = {}
@@ -422,7 +422,7 @@ class _ServiceBackend:
         spec = dict(spec, prefetcher=None, threads=1, connections=self.scheduler.connections)
         # Reader identity includes cache/fidelity/auth policy; compatible workers
         # share a reader even when their local thread counts differ.
-        identity = dict(spec, meta=None, attrs=None, access=spec["access"].native(),
+        identity = dict(spec, meta=None, attrs=None, access=spec["access"].auth_tuple(),
                         resolved_url=spec["access"].url(spec["location"]))
         name = hashlib.sha256(pickle.dumps(identity)).hexdigest()
         with self.lock:
@@ -486,9 +486,9 @@ class PrefetchClient:
         return self._backend.register(spec)
 
     def demand(self, target, index):
-        from .. import _native
+        from .. import _reader
         try:
-            return _native.ChunkHandle.from_bytes(self._backend.demand(target, index))
+            return _reader.ChunkHandle.from_bytes(self._backend.demand(target, index))
         except (EOFError, BrokenPipeError, ConnectionError, FileNotFoundError) as exc:
             raise RuntimeError("prefetch service stopped; no independent download attempted") from exc
 

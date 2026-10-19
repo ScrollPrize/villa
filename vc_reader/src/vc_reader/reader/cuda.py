@@ -2,7 +2,7 @@
 import operator
 import os
 import numpy as np
-from .. import _native
+from .. import _reader
 from ..cuda import DeviceArray, is_available, is_device_array, wrap
 from ._sampling import affine32, origin3, points32, shape3
 from ._indexing import parse_index
@@ -42,13 +42,13 @@ def _device_points(points, device, dtype):
 
 class PointRequest:
     """Immutable point coordinates/planning retained for repeated device reads."""
-    def __init__(self, reader, native, shape, dtype):
-        self.reader, self._native, self.shape, self.dtype = reader, native, shape, dtype
+    def __init__(self, reader, plan, shape, dtype):
+        self.reader, self._plan, self.shape, self.dtype = reader, plan, shape, dtype
 
     def read(self, *, source="auto", valid=False):
         self.reader._ready()
-        native = self.reader._native.read_plan(self._native, source, valid)
-        return self.reader._point_outputs(native, self.dtype, self.shape, valid)
+        outputs = self.reader._engine.read_plan(self._plan, source, valid)
+        return self.reader._point_outputs(outputs, self.dtype, self.shape, valid)
 
     def __getstate__(self):
         raise TypeError("CUDA point requests cannot be pickled")
@@ -74,28 +74,28 @@ class CudaReader:
         if not is_available():
             raise RuntimeError("CUDA reader unavailable: build with VC_READER_ENABLE_CUDA=ON and use a CUDA device")
         self.reader, self.device, self._pid = reader, device, os.getpid()
-        self._native = _native.CudaReader(reader._array, cache_bytes, device)
+        self._engine = _reader.CudaReader(reader._array, cache_bytes, device)
 
     def _ready(self):
         if self._pid != os.getpid():
             raise RuntimeError("CUDA reader cannot be used after fork; create it in the worker")
-        if self._native is None:
+        if self._engine is None:
             raise ValueError("CUDA reader is closed")
         self.reader._ready()
 
     def clear_cache(self):
         self._ready()
-        self._native.clear()
+        self._engine.clear()
 
     @property
     def stats(self):
         self._ready()
-        return dict(zip(("cache_bytes", "cache_budget", "cache_hits", "chunk_uploads", "uploaded_bytes", "cpu_routes", "gpu_routes"), self._native.stats()))
+        return dict(zip(("cache_bytes", "cache_budget", "cache_hits", "chunk_uploads", "uploaded_bytes", "cpu_routes", "gpu_routes"), self._engine.stats()))
 
     def close(self):
-        if self._pid == os.getpid() and self._native is not None:
-            self._native.clear()
-            self._native = None
+        if self._pid == os.getpid() and self._engine is not None:
+            self._engine.clear()
+            self._engine = None
 
     def __enter__(self): return self
     def __exit__(self, *exc): self.close()
@@ -126,14 +126,14 @@ class CudaReader:
         destination = None if out is None else _device_input(out, self.device, dtype)
         if destination is not None and destination.size != total:
             raise ValueError('output size mismatch')
-        native = self._native.grids(shapes, bases, [list(o) for o in origins], [np.asarray(a).ravel().tolist() for a in axes],
+        outputs = self._engine.grids(shapes, bases, [list(o) for o in origins], [np.asarray(a).ravel().tolist() for a in axes],
                                     kind, order, dtype == np.float32, source, valid,
-                                    None if destination is None else destination._native)
+                                    None if destination is None else destination._array)
         if destination is not None:
-            masks = DeviceArray(native, (total,), np.uint8, self.device) if valid else None
+            masks = DeviceArray(outputs, (total,), np.uint8, self.device) if valid else None
             return destination.reshape(total), masks, shapes
-        native, mask = native if valid else (native, None)
-        flat = DeviceArray(native, (total,), dtype, self.device)
+        outputs, mask = outputs if valid else (outputs, None)
+        flat = DeviceArray(outputs, (total,), dtype, self.device)
         masks = DeviceArray(mask, (total,), np.uint8, self.device) if valid else None
         return flat, masks, shapes
 
@@ -201,7 +201,7 @@ class CudaReader:
 
         out may be a contiguous CUDA array of the exact output shape/dtype.
         Writes complete before return and the supplied object is returned.
-        Consumer-owned storage avoids exporting a native allocation or copying
+        Consumer-owned storage avoids exporting a device allocation or copying
         a temporary output. out requires source='auto', 'chunks', or 'cpu'.
         """
         self._ready()
@@ -216,7 +216,7 @@ class CudaReader:
             origins = _device_input(origins, self.device)
             axes = _device_input(axes, self.device, np.float32)
             base = None if coordinate_origin is None else list(origin3(coordinate_origin))
-            result = self._native.affine_resident(origins._native, axes._native, list(shape), base, order,
+            result = self._engine.affine_resident(origins._array, axes._array, list(shape), base, order,
                                                   dtype == np.float32, valid)
             samples, masks = result if valid else (result, None)
             count = origins.shape[0]
@@ -242,7 +242,7 @@ class CudaReader:
             start = tuple(operator.index(n) for n in start)
             if len(start) != 3: raise ValueError("start must have three integers")
             shapes.append(shape3(size)); bases.append(start)
-        self._native.warm(shapes, bases)
+        self._engine.warm(shapes, bases)
 
     def sample(self, points, *, order=1, dtype=np.float32, coordinate_origin=None, source="auto", valid=False):
         """points may be a CUDA array: source="resident" samples it in place from
@@ -255,12 +255,12 @@ class CudaReader:
         if source == "resident":
             flat, shape = _device_points(points, self.device, np.float32)
             base = [0, 0, 0] if coordinate_origin is None else list(origin3(coordinate_origin))
-            return self._point_outputs(self._native.points_resident(flat._native, base, 2, order, valid), out_dtype, shape, valid)
+            return self._point_outputs(self._engine.points_resident(flat._array, base, 2, order, valid), out_dtype, shape, valid)
         local, base, shape = points32(_host_input(points), coordinate_origin)
-        return self._point_outputs(self._native.points(local, base, 2, order, source, valid), out_dtype, shape, valid)
+        return self._point_outputs(self._engine.points(local, base, 2, order, source, valid), out_dtype, shape, valid)
 
-    def _point_outputs(self, native, dtype, shape, valid):
-        samples, mask = native if valid else (native, None)
+    def _point_outputs(self, outputs, dtype, shape, valid):
+        samples, mask = outputs if valid else (outputs, None)
         count = int(np.prod(shape))
         out = DeviceArray(samples, (count,), dtype, self.device).reshape(shape)
         return (out, DeviceArray(mask, (count,), np.uint8, self.device).reshape(shape)) if valid else out
@@ -269,9 +269,9 @@ class CudaReader:
         self._ready()
         if source == "resident":
             flat, shape = _device_points(points, self.device, None)
-            return self._point_outputs(self._native.points_resident(flat._native, [0, 0, 0], 3, 0, valid), np.uint8, shape, valid)
+            return self._point_outputs(self._engine.points_resident(flat._array, [0, 0, 0], 3, 0, valid), np.uint8, shape, valid)
         flat, shape = _integer_points(_host_input(points))
-        return self._point_outputs(self._native.points(flat, [0, 0, 0], 3, 0, source, valid), np.uint8, shape, valid)
+        return self._point_outputs(self._engine.points(flat, [0, 0, 0], 3, 0, source, valid), np.uint8, shape, valid)
 
     def prepare_points(self, points, *, integer=False, order=1, coordinate_origin=None):
         """Plan/upload coordinates once; request.read() reuses them on device.
@@ -288,5 +288,5 @@ class CudaReader:
         else:
             local, base, shape = points32(points, coordinate_origin)
             kind, dtype = 2, np.float32 if order else np.uint8
-        plan = self._native.prepare_points(local, base, kind, order)
+        plan = self._engine.prepare_points(local, base, kind, order)
         return PointRequest(self, plan, shape, dtype)

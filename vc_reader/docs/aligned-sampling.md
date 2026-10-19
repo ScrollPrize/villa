@@ -3,8 +3,8 @@
 `vc_reader.sampling.open_sample` opens a reusable reader for a `VolumeLevel` or
 registered volumetric image `Source`. Target names are caller-owned; `image`
 is reserved for the reference. Discovery and importing `vc_reader.sampling`
-remain independent of NumPy, native extensions, decoders, and PyTorch. Opening
-requires the native reader and NumPy; image formats additionally require their
+remain independent of NumPy, compiled extensions, decoders, and PyTorch. Opening
+requires the C++ reader and NumPy; image formats additionally require their
 existing optional decoders.
 
 ```python
@@ -112,13 +112,13 @@ if it is also needed in the batch.
 
 Pass `backend='cuda', device=0` to return existing `vc_reader.cuda.DeviceArray`
 objects. Use `.numpy()` for an explicit download or DLPack to share storage
-with a consumer. Operations complete on the existing native reader stream
+with a consumer. Operations complete on the existing C++ reader stream
 before returning. No PyTorch or GPU image decoder dependency is added.
 Create CUDA readers in the process owning the device; they reject fork reuse,
 pickling, and creation inside an active PyTorch DataLoader worker.
 
 CPU readers serialize descriptors/options and reopen lazily after unpickling
-or fork. Read calls on one reader serialize; native I/O uses the configured
+or fork. Read calls on one reader serialize; C++ I/O uses the configured
 reader threads, defaulting to one. Explicit shared `MemoryCache` and
 `DecodedCache` objects retain their ownership semantics. Otherwise the sampler
 owns one shared cache of each kind across its source readers and clears them
@@ -130,10 +130,10 @@ Additional sampling controls:
 | --- | ---: | --- |
 | `sampling_cache_bytes` | 64 MiB | Retained native-endian CPU tiles or CUDA tiles, shared across targets |
 | `sampling_work_bytes` | 64 MiB | Conservative simultaneous source/canonical/device tile buffers per request block |
-| `plan_cache_bytes` | 8 MiB | Retained native affine plan storage |
+| `plan_cache_bytes` | 8 MiB | Retained affine plan storage |
 | `device` | 0 | CUDA device ordinal |
 
-All other reader options are passed to `Source.open()`. Native source chunk
+All other reader options are passed to `Source.open()`. Source chunk
 caches, image decode scratch, plan-building scratch, Python object overhead,
 and caller-owned result arrays have separate accounting. Plans contain at most
 32768 output voxels' tile requests; they never retain a dense coordinate grid.
@@ -155,10 +155,10 @@ changes nearest-neighbor decisions. There are no bulk float64 coordinate arrays.
 Using the existing environments and configured build directories:
 
 ```bash
-AGENTS_AGENT_MODE=1 cmake --build build/cp314-cp314-linux_x86_64 --target _native _augment -j 2
-AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --target _native _augment -j 2
-AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=build/cp314-cp314-linux_x86_64 .venv/bin/python -m unittest discover -s tests -p test_sampling.py -v
-AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda .venv/bin/python -m unittest discover -s tests -v
+AGENTS_AGENT_MODE=1 cmake --build build/cp314-cp314-linux_x86_64 --target _reader _augment -j 2
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --target _reader _augment -j 2
+AGENTS_AGENT_MODE=1 VC_READER_BUILD_DIR=build/cp314-cp314-linux_x86_64 .venv/bin/python -m unittest discover -s tests -p test_sampling.py -v
+AGENTS_AGENT_MODE=1 VC_READER_BUILD_DIR=/tmp/vc-reader-cuda .venv/bin/python -m unittest discover -s tests -v
 ```
 
 See the [reader and pipeline benchmarks](../benchmarks/README.md#reader-and-pipeline-benchmarks)

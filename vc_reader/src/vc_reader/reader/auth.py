@@ -211,7 +211,7 @@ class Access:
         self.region = region
         self.endpoint_url = endpoint_url.rstrip("/") if endpoint_url else None
         self._lock = threading.Lock()
-        self._native: tuple[str, str, str, str, str] | None = None
+        self._auth_tuple: tuple[str, str, str, str, str] | None = None
         self._next_check = 0.0
 
     def __repr__(self) -> str:
@@ -224,7 +224,7 @@ class Access:
         state = dict(self.__dict__)
         del state["_lock"]
         if self.source is not None:  # refreshable: resolved again in the new process
-            state["_native"], state["_next_check"] = None, 0.0
+            state["_auth_tuple"], state["_next_check"] = None, 0.0
         return state
 
     def __setstate__(self, state):
@@ -259,24 +259,24 @@ class Access:
 
     # -- credentials ----------------------------------------------------------------------
 
-    def native(self) -> tuple[str, str, str, str, str]:
-        """The native auth tuple, with refreshable credentials checked at most every REFRESH_INTERVAL_S."""
+    def auth_tuple(self) -> tuple[str, str, str, str, str]:
+        """The reader authentication tuple, with refreshable credentials checked at most every REFRESH_INTERVAL_S."""
         if self.kind == "anonymous":
             return ANONYMOUS
         if self.kind == "basic":
             assert self.basic is not None
             return ("basic", self.basic[0], self.basic[1], "", "")
-        if self._native is not None and (self.source is None or time.monotonic() < self._next_check):
-            return self._native
+        if self._auth_tuple is not None and (self.source is None or time.monotonic() < self._next_check):
+            return self._auth_tuple
         with self._lock:
-            if self._native is None or (self.source is not None and time.monotonic() >= self._next_check):
+            if self._auth_tuple is None or (self.source is not None and time.monotonic() >= self._next_check):
                 keys = self.keys if self.source is None else self.source.current()
                 if keys is None:
                     raise PermissionError("no AWS credentials found (environment, AWS_PROFILE or ~/.aws)")
-                self._native = ("s3", keys.access_key_id, keys.secret_access_key, keys.session_token or "",
+                self._auth_tuple = ("s3", keys.access_key_id, keys.secret_access_key, keys.session_token or "",
                                 self.region or "us-east-1")
                 self._next_check = time.monotonic() + REFRESH_INTERVAL_S
-            return self._native
+            return self._auth_tuple
 
 
 _ANON = Access("anonymous")

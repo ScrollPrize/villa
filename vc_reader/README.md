@@ -165,7 +165,7 @@ All operations accept `out=` (a dictionary for multi-output queries), including
 contiguous Torch CUDA tensors. Outputs must have the documented shape/dtype
 and must not overlap inputs or each other. CUDA calls complete on the selected
 vc_reader stream before returning; finish external writes before passing shared
-arrays. Supplying Torch-owned outputs avoids native-storage export barriers.
+arrays. Supplying Torch-owned outputs avoids device-storage export barriers.
 Neither query execution nor sparse CUDA construction implicitly downloads data.
 Create indexes in DataLoader workers; create CUDA indexes in the GPU-owning
 process. No fiber supervision rules or label names are part of these APIs.
@@ -185,7 +185,7 @@ from vc_reader.reader import ZarrReader
 from vc_reader.sheet_normal import sample_sheet_normals
 
 reader = ZarrReader.open("/path/to/ct.zarr", level=0)
-points_xyz = np.array([[1000.25, 1200.5, 3000.0]])  # native CT voxel coordinates
+points_xyz = np.array([[1000.25, 1200.5, 3000.0]])  # source CT voxel coordinates
 cpu = sample_sheet_normals(reader, points_xyz)    # NumPy (B, 4)
 cuda_reader = reader.cuda(cache_bytes=256 << 20)
 gpu = sample_sheet_normals(cuda_reader, points_xyz)
@@ -208,7 +208,7 @@ device. They return the supplied object. CUDA `read_affine_batch` also accepts
 `out=` with the exact `(B, *shape)` and output dtype for host-planned sources
 (`auto`, `chunks`, `cpu`). Outputs are written directly and complete before
 return. Finish external writes before calling, including writes to reused
-output buffers. Native arrays kept within vc_reader do not acquire the
+output buffers. Device arrays kept within vc_reader do not acquire the
 device-wide destruction barrier required after exporting their storage to an
 external DLPack consumer. No CT image download is involved.
 

@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
-project(vc_reader_native LANGUAGES CXX)
+project(vc_reader_extensions LANGUAGES CXX)
 
-# Native read path for vc_reader (module vc_reader._native), built by
+# C++ read path for vc_reader (module vc_reader._reader), built by
 # scikit-build-core. Needs libcurl, c-blosc, zstd and SQLite development files:
 #   Ubuntu: apt install libcurl4-openssl-dev libblosc-dev libzstd-dev libsqlite3-dev
 #   macOS:  brew install c-blosc zstd sqlite   (libcurl comes with the SDK)
@@ -119,7 +119,7 @@ if(VC_READER_ENABLE_CUDA)
     target_compile_options(_augment PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
 endif()
 
-option(VC_READER_BUILD_READER "Build the native Zarr reader as well as augmentation" ON)
+option(VC_READER_BUILD_READER "Build the C++ Zarr reader as well as augmentation" ON)
 if(VC_READER_BUILD_READER)
     find_package(CURL REQUIRED)
     find_package(PkgConfig REQUIRED)
@@ -139,16 +139,16 @@ if(VC_READER_BUILD_READER)
     set_target_properties(vc_delta3d PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
     # NOMINSIZE: nanobind otherwise appends -Os, which costs the point samplers ~8%.
-    nanobind_add_module(_native NB_STATIC NOMINSIZE cpp/bindings.cpp)
+    nanobind_add_module(_reader NB_STATIC NOMINSIZE cpp/bindings.cpp)
     if(VC_READER_ENABLE_CUDA)
-        target_sources(_native PRIVATE cpp/reader_cuda/kernels.cu cpp/aligned/kernels.cu cpp/surface/kernels.cu cpp/sheet_normal/kernels.cu cpp/geometry/kernels.cu)
+        target_sources(_reader PRIVATE cpp/reader_cuda/kernels.cu cpp/aligned/kernels.cu cpp/surface/kernels.cu cpp/sheet_normal/kernels.cu cpp/geometry/kernels.cu)
         # Separate float32 rounding preserves geometric ties and filter agreement.
         set_source_files_properties(cpp/surface/kernels.cu cpp/sheet_normal/kernels.cu cpp/geometry/kernels.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
-        target_compile_definitions(_native PRIVATE VC_READER_CUDA=1)
-        target_link_libraries(_native PRIVATE CUDA::cudart)
-        set_target_properties(_native PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+        target_compile_definitions(_reader PRIVATE VC_READER_CUDA=1)
+        target_link_libraries(_reader PRIVATE CUDA::cudart)
+        set_target_properties(_reader PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
     endif()
-    target_include_directories(_native PRIVATE cpp)
-    target_link_libraries(_native PRIVATE CURL::libcurl PkgConfig::BLOSC PkgConfig::ZSTD SQLite::SQLite3 vc_delta3d::vc_delta3d Threads::Threads)
-    install(TARGETS _native LIBRARY DESTINATION vc_reader)
+    target_include_directories(_reader PRIVATE cpp)
+    target_link_libraries(_reader PRIVATE CURL::libcurl PkgConfig::BLOSC PkgConfig::ZSTD SQLite::SQLite3 vc_delta3d::vc_delta3d Threads::Threads)
+    install(TARGETS _reader LIBRARY DESTINATION vc_reader)
 endif()

@@ -1,6 +1,6 @@
 """Trainer policy adapter for vc_reader's general geometry operations.
 
-Sampling/state decisions remain in workers. Native CPU plane intersections
+Sampling/state decisions remain in workers. C++ CPU plane intersections
 replace their Python plane loops. Final neighbor clearance, frame transforms
 and voxelization use the selected backend; compiled losses consume sorted sparse keys.
 """
@@ -135,7 +135,7 @@ def install(*, validate=False, placement='prefetch', backend='cuda'):
         if backend != 'cuda':
             raise ValueError('CPU geometry runs in loader workers or on the main thread')
         from vesuvius.neural_tracing.tracers.fibers.train import train
-        from vc_reader import _native
+        from vc_reader import _reader
         from fiber_timeline import span
         original = train.DecisionBatchPrefetch.collect
         # Reuse the trainer's existing one-batch producer. Its completed CUDA
@@ -146,7 +146,7 @@ def install(*, validate=False, placement='prefetch', backend='cuda'):
         def collect(prefetch):
             batches = original(prefetch)
             with torch.cuda.stream(stream):
-                _native._set_stream(stream.cuda_stream)
+                _reader._set_stream(stream.cuda_stream)
                 try:
                     for batch in batches:
                         began = time.perf_counter()
@@ -155,7 +155,7 @@ def install(*, validate=False, placement='prefetch', backend='cuda'):
                         batch['_bench_geometry_timing'] = dict(began=began, ready=time.perf_counter())
                 finally:
                     stream.synchronize()
-                    _native._set_stream(0)
+                    _reader._set_stream(0)
             return batches
         train.DecisionBatchPrefetch.collect = collect
     return geometry
@@ -200,7 +200,7 @@ class Geometry:
             points = torch.as_tensor(np.concatenate([i['points'] for i in requests if i is not None]), device=self.device)
             frames = torch.as_tensor(np.stack([i['frame'] if i is not None else np.eye(3)
                                                for i in requests]), device=self.device)
-            # Only cell quantization needs float64. Native nearest-query inputs,
+            # Only cell quantization needs float64. C++ nearest-query inputs,
             # distances, cell centers and all model tensors remain float32.
             local = torch.bmm(points[:, None], frames[ids]).squeeze(1)
             indices = torch.stack((local[:, 2]/crop.spacing+crop.behind,
@@ -285,5 +285,5 @@ class Geometry:
     def stats(self):
         return dict(self.counters, backend=self.device, worker_planes='vc_reader CPU',
                     placement=self.placement,
-                    foreign='sorted sparse keys; native clearance, transforms and voxelization',
+                    foreign='sorted sparse keys; vc_reader clearance, transforms and voxelization',
                     sampling_feedback='CPU trainer policy', resident_parent_limit=256)

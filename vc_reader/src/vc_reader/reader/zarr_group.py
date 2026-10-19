@@ -310,7 +310,7 @@ class ZarrGroup:
     def _list_s3(self) -> list[str]:
         """Immediate sub-prefixes of this group's S3 prefix (ListObjectsV2)."""
         from ..artifacts import to_s3
-        from .. import _native
+        from .. import _reader
 
         s3 = self.location if self.location.startswith("s3://") else to_s3(self.location)
         if s3 is None:
@@ -321,7 +321,7 @@ class ZarrGroup:
         names: list[str] = []
         token = None
         while True:
-            body = _native.http_get(self.access.list_url(s3, token), auth=self.access.native())
+            body = _reader.http_get(self.access.list_url(s3, token), auth=self.access.auth_tuple())
             if body is None:
                 raise FileNotFoundError(f"cannot list {s3}: bucket not found")
             root = ET.fromstring(body)

@@ -438,7 +438,7 @@ struct ChannelOptions {
     std::vector<std::size_t> channels;
     std::vector<std::string> on;
 };
-// A compact sampled record, owned by the native replay plan. Parameters are
+// A compact sampled record, owned by the replay plan. Parameters are
 // interpreted by their concrete transform's overload, never a string dispatcher.
 struct ChannelPlan {
     std::string key;

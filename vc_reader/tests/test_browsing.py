@@ -147,16 +147,16 @@ class BrowsingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 c.scrolls.volumes.at_resolution(um, rel_tol=tolerance)
 
-    def test_overlays_explicit_pairing_serialization_and_native_registration(self):
+    def test_overlays_explicit_pairing_serialization_and_source_registration(self):
         c = catalog()
         before = json.dumps(c.raw)
         s = c.samples['s']
-        native = s.labels.ink(artifact_id='new').source
+        source = s.labels.ink(artifact_id='new').source
         render = Source('render', Storage('/tmp/custom.zarr', 'zarr'), role='image', axes=('z', 'y', 'x'))
         label = Source('label', Storage('/tmp/label.png', 'png'), role='label', axes=('y', 'x'), artifact_kind='ink-labels')
         s = s.with_source(render, kind='image', volume='a', segment='user:seg')
         s = s.with_source(label, kind='label', volume='a', segment='user:seg', image=render.id, same_grid=True)
-        self.assertIs(s.labels[native.id].source, native)
+        self.assertIs(s.labels[source.id].source, source)
         self.assertEqual(s.labels[label.id].images.get().id, render.id)
         self.assertEqual(s.images[render.id].labels.get().id, label.id)
         self.assertEqual(s.labels[label.id].segment.id, 'user:seg')
@@ -164,7 +164,7 @@ class BrowsingTests(unittest.TestCase):
         self.assertNotIn(label.id, [l.id for l in c.samples['s'].labels])
         for restored in (pickle.loads(pickle.dumps(s)), ScrollSource.from_dict(json.loads(json.dumps(s.to_dict())))):
             self.assertEqual(restored.labels[label.id].images.get().id, render.id)
-            self.assertEqual(restored.labels[native.id].source.registration, native.registration)
+            self.assertEqual(restored.labels[source.id].source.registration, source.registration)
         with self.assertRaisesRegex(ValueError, 'exactly one'):
             c.samples['s'].with_source(label, kind='label', image=render.id)
         unknown = c.samples['s'].with_source(label, kind='label')
@@ -183,7 +183,7 @@ class BrowsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'contradicts'):
             s.with_source(replace(rep, id='bad'), kind='representation', volume='b')
 
-    def test_unpublished_native_target_and_historical_mapped_destination(self):
+    def test_unpublished_source_target_and_historical_mapped_destination(self):
         from test_sources import catalog as source_catalog
         c = source_catalog()
         label = c.samples['s'].labels.ink(artifact_id='absent')
@@ -238,7 +238,7 @@ class PublishedLabelMappingTests(unittest.TestCase):
             self.assertEqual(label.volume.source.artifact_kind, 'ome-zarr')
             self.assertNotEqual(surface_volume.source.id, label.volume.source.id)
             summary = label.summary()
-            self.assertEqual(summary['native_volume'], '20250820154339')
+            self.assertEqual(summary['source_volume'], '20250820154339')
             self.assertIn('registration.pixel_to_uv', summary['unresolved_fields'])
             mapping = label.mappable_volumes['20250521125136']
             self.assertEqual(mapping.required_operations, ('surface_projection', 'volume_transform'))
@@ -251,6 +251,6 @@ class PublishedLabelMappingTests(unittest.TestCase):
             self.assertIn('20250521125136', repr(label))
             restored = json.loads(json.dumps(summary))
             self.assertEqual(len(restored['mappable_volumes']), 2)
-            self.assertEqual(label.volume.id, summary['native_volume'])
-            # Native ownership never moves the label into B's direct-label list.
+            self.assertEqual(label.volume.id, summary['source_volume'])
+            # Source ownership never moves the label into B's direct-label list.
             self.assertFalse(mapping.volume.labels)

@@ -16,7 +16,7 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering",
 ]
-# The catalog layer is stdlib-only. The reader is the native extension built
+# The catalog layer is stdlib-only. The reader is the compiled extension built
 # from cpp/ (see CMakeLists.txt) plus numpy.
 dependencies = []
 
@@ -32,7 +32,7 @@ bench = ["numpy>=1.24", "tensorstore>=0.1.60", "zarr>=3", "scipy>=1.11", "tifffi
 vc-reader = "vc_reader.cli:main"
 
 [tool.scikit-build]
-# The native read path (cpp/, module vc_reader._native); see CMakeLists.txt for system deps.
+# The C++ read path (cpp/, module vc_reader._reader); see CMakeLists.txt for system deps.
 minimum-version = "build-system.requires"
 wheel.packages = ["src/vc_reader"]
 cmake.build-type = "Release"

@@ -1,4 +1,4 @@
-"""Seekable image files using the reader's native transport and disk budget."""
+"""Seekable image files using the reader's HTTP transport and disk budget."""
 
 from contextlib import contextmanager
 import hashlib
@@ -80,14 +80,14 @@ class EncodedFiles:
             if self._temp is None:
                 self._temp = tempfile.TemporaryDirectory(prefix='vc-reader-images-')
             root = Path(self._temp.name)
-        # None reuses the configured directory limit, or the native 1 GiB default
+        # None reuses the configured directory limit, or the reader's 1 GiB default
         # for a new directory. It never resets another reader's explicit budget.
         budget = disk_budget(str(root), self.max_bytes)
         if location not in self._access:
             self._access[location] = resolve_access(location, self.auth)
         access = self._access[location]
         fd, etag, modified, received = budget.open_file(
-            str(root / 'encoded' / name), access.url(location), access.native(), False,
+            str(root / 'encoded' / name), access.url(location), access.auth_tuple(), False,
             location not in self._checked)
         self.bytes_read += received
         if fd < 0:

@@ -417,7 +417,7 @@ class Asset:
 
     @property
     def surface_volumes(self):
-        """Surface layer stacks paired with this label; volume is the native CT."""
+        """Surface layer stacks paired with this label; volume is the source CT."""
         return _surface_volumes(self.images)
 
     @property
@@ -434,38 +434,38 @@ class Asset:
 
     @property
     def mappable_volumes(self):
-        """Volume affines reachable from this asset's native volume.
+        """Volume affines reachable from this asset's source volume.
 
-        Surface labels retain their native volume even when pixel-to-UV fields
+        Surface labels retain their source volume even when pixel-to-UV fields
         are unresolved. Inspect required_operations before opening a destination.
         This property reads metadata only.
         """
-        native = self.volume
-        if native is None or self.source.registration is None:
+        source_volume = self.volume
+        if source_volume is None or self.source.registration is None:
             return Collection()
         result = []
         for volume in self.scroll.volumes._all:
-            transform = self.scroll.transform(native.id, volume.id)
+            transform = self.scroll.transform(source_volume.id, volume.id)
             if transform is None:
                 continue
             coverage = next((c for c in self.source.coverage if c.volume_id == volume.id), None)
             operations = ('surface_projection',) if isinstance(self.source.registration, SurfaceRegistration) else ()
-            if volume.id != native.id:
+            if volume.id != source_volume.id:
                 operations += ('volume_transform',)
             result.append(VolumeMapping(volume, transform, coverage, operations))
         return Collection(result)
 
     def summary(self):
-        """JSON-ready native ownership, volume mappings and unresolved fields.
+        """JSON-ready source ownership, volume mappings and unresolved fields.
 
         Mapping availability and pixel/geometry declarations are independent.
         Coverage describes published segment bounds, not a crop guarantee.
         No storage headers or image arrays are requested.
         """
-        native, segment = self.volume, self.segment
+        source_volume, segment = self.volume, self.segment
         return dict(id=self.id, kind=self.kind, sample=self.scroll.id,
                     segment=None if segment is None else segment.id,
-                    native_volume=None if native is None else native.id,
+                    source_volume=None if source_volume is None else source_volume.id,
                     unresolved_fields=list(self.source.unresolved_fields),
                     mappable_volumes=[dict(volume=m.id, required_operations=list(m.required_operations),
                         affine=m.transform.matrix, derivation_path=m.transform.derivation_path,
@@ -490,8 +490,8 @@ class Asset:
         return PairedReader(self.source, image.source, matches[0], level=level, layers=layers, backend=backend, **options)
 
     def __repr__(self):
-        native = self.volume
-        details = f', native_volume={native.id!r}' if native is not None else ''
+        source_volume = self.volume
+        details = f', source_volume={source_volume.id!r}' if source_volume is not None else ''
         if self.kind == 'label':
             details += f', mappable_volumes={[m.id for m in self.mappable_volumes]!r}'
         return f'Asset({self.id!r}, kind={self.kind!r}{details})'
@@ -521,7 +521,7 @@ def _select_level(source, level):
         selection = replace(source.storage.selection, level=level, array_path=None, corresponding=None)
         return replace(source, storage=replace(source.storage, selection=selection))
     if level:
-        raise ValueError('a native array has only level 0')
+        raise ValueError('a single-resolution array has only level 0')
     return source
 
 

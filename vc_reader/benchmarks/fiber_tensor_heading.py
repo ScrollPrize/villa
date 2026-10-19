@@ -225,15 +225,15 @@ class Service(HeadingCalculator):
 
     def run(self):
         if self.stream_mode == 'separate':
-            from vc_reader import _native
+            from vc_reader import _reader
             stream = torch.cuda.Stream()
             with torch.cuda.stream(stream):
-                _native._set_stream(stream.cuda_stream)
+                _reader._set_stream(stream.cuda_stream)
                 try:
                     self.serve()
                 finally:
                     stream.synchronize()
-                    _native._set_stream(0)
+                    _reader._set_stream(0)
         else:
             self.serve()
 

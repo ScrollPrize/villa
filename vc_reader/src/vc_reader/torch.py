@@ -121,7 +121,7 @@ class _PendingBatch:
 
     def close(self):
         # Also used on early iterator close and exceptions. In particular, keep
-        # pinned host buffers and imported native allocations alive until copied.
+        # pinned host buffers and imported C++ allocations alive until copied.
         if self.event is not None:
             self.event.synchronize()
         self.inputs = self.owner = self.outputs = self.result = self.event = None
@@ -141,7 +141,7 @@ def _submit(pipeline, batch, seeds, device=None, stream=None, params=None):
         # torch-owned allocations lets record_stream protect later consumers.
         dtype = torch.from_numpy(np.empty((), dtype=np.dtype(dtype))).dtype
         result = torch.empty(tuple(shape), dtype=dtype, device=torch.device("cuda", index))
-        allocated.append(result)  # retained even if native execution raises
+        allocated.append(result)  # retained even if C++ execution raises
         return result
 
     try:
@@ -161,14 +161,14 @@ def _submit(pipeline, batch, seeds, device=None, stream=None, params=None):
                 if continuous and value.dtype not in (torch.float32, torch.float64):
                     raise TypeError(f"{key}: continuous targets require uint8, float32 or float64")
                 arrays[key] = value.contiguous()
-            outputs, _, owner = pipeline._native.run_batch(
+            outputs, _, owner = pipeline._engine.run_batch(
                 arrays, seeds, params, False, True, {}, allocator=allocate, stream=stream.cuda_stream)
             event = stream.record_event()
         result = {k: v for k, v in batch.items() if k not in targets}
         result.update(outputs)
         return _PendingBatch(result, outputs, owner, (targets, arrays), stream, event)
     except BaseException:
-        # Pending native reads/copies must not outlive Python-owned inputs or
+        # Pending C++ reads/copies must not outlive Python-owned inputs or
         # outputs, even when validation/allocation fails midway through a batch.
         stream.synchronize()
         raise

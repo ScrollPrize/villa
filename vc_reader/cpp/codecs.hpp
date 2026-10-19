@@ -1,4 +1,4 @@
-// Chunk codecs implemented natively: raw, blosc, zstd, LZW and vc-delta3d.
+// Chunk codecs implemented in C++: raw, blosc, zstd, LZW and vc-delta3d.
 #pragma once
 
 #include "lzw.hpp"
@@ -32,7 +32,7 @@ inline Codec parse_codec(const std::string& id)
         return Codec::Lzw;
     if (id == "vc-delta3d")
         return Codec::Delta3d;
-    throw std::invalid_argument("native reader does not support codec '" + id + "'");
+    throw std::invalid_argument("C++ reader does not support codec '" + id + "'");
 }
 
 inline void check_raw_size(std::size_t n, std::size_t expected)

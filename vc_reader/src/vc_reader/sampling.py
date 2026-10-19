@@ -1,6 +1,6 @@
 """Aligned, bounded CPU/CUDA reads in a caller-selected reference array grid.
 
-Importing this module does not import NumPy, native extensions, or PyTorch.
+Importing this module does not import NumPy, compiled extensions, or PyTorch.
 """
 from dataclasses import asdict, replace
 import math
@@ -19,7 +19,7 @@ def open_sample(reference, targets=None, *, backend='cpu', catalog=None, **reade
     """Open a reusable aligned reader; reads return unbatched CZYX SampleResults.
 
     ``sampling_cache_bytes`` (64 MiB) bounds retained CPU/device tiles;
-    ``sampling_work_bytes`` (64 MiB) bounds tiles held by one native request.
+    ``sampling_work_bytes`` (64 MiB) bounds tiles held by one reader request.
     ``plan_cache_bytes`` (8 MiB) bounds reusable affine plans. ``device`` selects
     the CUDA device. ``surface_output_bytes`` (512 MiB) limits dense surface
     results; projection can instead yield bounded tiles. Other options are
@@ -138,16 +138,16 @@ class SampleReader(SamplingEngine):
             q, reg = descriptor.query, descriptor.registration
             if q is None:
                 continue
-            native = _frame(reg)
+            source_frame = _frame(reg)
             qframe = (q.reference.sample_id, q.reference.volume_id)
             if self._catalog is not None:
                 expected = self._catalog.samples[reg.sample_id].transform(reg.volume_id, q.reference.volume_id)
                 if reg.sample_id != q.reference.sample_id or expected is None or expected.matrix != q.transform.matrix:
                     raise ValueError(f'{descriptor.id}: query context conflicts with catalog registration')
             candidate = None
-            if native == frame and qframe == destination:
+            if source_frame == frame and qframe == destination:
                 candidate = q.transform
-            elif native == destination and qframe == frame:
+            elif source_frame == destination and qframe == frame:
                 candidate = q.transform.inverse()
             if candidate is not None:
                 if declared is not None and candidate.matrix != declared.matrix:
@@ -169,7 +169,7 @@ class SampleReader(SamplingEngine):
 
     def _prepare(self, source, reader):
         import numpy as np
-        from . import _native
+        from . import _reader
         try:
             placement = array_placement(reader.registration)
             if reader.spatial_axes not in (('z', 'y', 'x'), ('y', 'x')):
@@ -284,7 +284,7 @@ class SampleReader(SamplingEngine):
             return results
 
     def render_surface(self, surface, start, size, *, offsets_um=(0,)):
-        """Sample physical-offset layers over a YX patch in native surface UV."""
+        """Sample physical-offset layers over a YX patch in full-resolution surface UV."""
         from .surface import render_surface
         self._ready()
         with self._lock:

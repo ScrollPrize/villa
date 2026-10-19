@@ -1,4 +1,4 @@
-"""Native augmentation with CPU and optional CUDA execution.
+"""Augmentation with CPU and optional CUDA execution.
 
 Python only constructs configurations and adapts dictionaries/array containers.
 Parameter sampling, target routing, transforms, and replay run without the GIL.
@@ -6,12 +6,12 @@ Parameter sampling, target routing, transforms, and replay run without the GIL.
 from copy import deepcopy
 from functools import wraps
 import numpy as np
-from .. import _augment as _native
+from .. import _augment
 
 
 def _unwrap(value):
     if isinstance(value, _Config):
-        return value._native
+        return value._config
     if isinstance(value, (tuple, list)):
         return [_unwrap(v) for v in value]
     if isinstance(value, dict):
@@ -24,7 +24,7 @@ class _Config:
     def __init__(self, constructor, args, kwargs):
         self._constructor = constructor
         self._args, self._kwargs = deepcopy(args), deepcopy(kwargs)
-        self._native = constructor(*_unwrap(self._args), **_unwrap(self._kwargs))
+        self._config = constructor(*_unwrap(self._args), **_unwrap(self._kwargs))
 
     def __reduce__(self):
         # Names are used only to reconstruct configuration after spawn/pickle.
@@ -37,7 +37,7 @@ class _Config:
 
 
 def _restore_config(name, args, kwargs):
-    return _Config(getattr(_native, name), args, kwargs)
+    return _Config(getattr(_augment, name), args, kwargs)
 
 
 def _factory(constructor):
@@ -62,8 +62,8 @@ _constructors = (
     "AdditiveNoise SaltAndPepper MotionBlur Defocus ZoomBlur UnsharpMask GibbsRinging RingingOvershoot "
     "ForegroundCrop ChannelMisalignment GridDropout StripeMasking ForegroundDropout ObjectDropout"
 ).split()
-globals().update({name: _factory(getattr(_native, name)) for name in _constructors})
-seed = _native.seed
+globals().update({name: _factory(getattr(_augment, name)) for name in _constructors})
+seed = _augment.seed
 
 
 def translate_crop_box(box, points, *, seed, **kwargs):
@@ -74,7 +74,7 @@ def translate_crop_box(box, points, *, seed, **kwargs):
     points = np.asarray(points, dtype=np.float64)
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError("points must have shape (N, 3)")
-    return tuple(_native.translate_crop_box(box, points.ravel().tolist(), seed, **kwargs))
+    return tuple(_augment.translate_crop_box(box, points.ravel().tolist(), seed, **kwargs))
 
 
 def _as_array(value, inplace=False):
@@ -95,23 +95,23 @@ def _as_array(value, inplace=False):
 
 
 class Plan:
-    """Sample-specific native replay record, including data-dependent deformations."""
-    def __init__(self, pipeline, native):
-        self._pipeline, self._native = pipeline, native
+    """Sample-specific replay record, including data-dependent deformations."""
+    def __init__(self, pipeline, plan):
+        self._pipeline, self._plan = pipeline, plan
 
     def apply(self, sample):
         return self._pipeline.apply(sample, self)
 
     def __getstate__(self):
-        return self._pipeline, self._native.dump()
+        return self._pipeline, self._plan.dump()
 
     def __setstate__(self, state):
         self._pipeline = state[0]
-        self._native = self._pipeline._native.load_plan(state[1])
+        self._plan = self._pipeline._engine.load_plan(state[1])
 
     @property
     def steps(self):
-        return self._native.steps
+        return self._plan.steps
 
 
 class Pipeline:
@@ -141,7 +141,7 @@ class Pipeline:
         self.targets = deepcopy(targets) if targets is not None else {
             "image": Image(), "mask": Label(), "padding_mask": ValidMask(),
         }
-        self._native = _native.Pipeline(_unwrap(self.transforms), _unwrap(self.targets), self.compact, backend)
+        self._engine = _augment.Pipeline(_unwrap(self.transforms), _unwrap(self.targets), self.compact, backend)
 
     def with_targets(self, **targets):
         """Return a new pipeline with added or replaced target declarations.
@@ -165,7 +165,7 @@ class Pipeline:
     @property
     def backend(self):
         """Resolved execution backend (cpu or cuda)."""
-        return self._native.backend
+        return self._engine.backend
 
     def _inputs(self, sample, inplace=False):
         arrays, converters = {}, {}
@@ -189,7 +189,7 @@ class Pipeline:
                 if not isinstance(value, DeviceArray):
                     raise TypeError("device samples require DeviceArray for every array target")
                 value._ready()
-                arrays[key] = value._native
+                arrays[key] = value._array
             elif isinstance(value, (DeviceArray, np.ndarray)):
                 raise ValueError(f"array field {key!r} needs a target declaration")
         return arrays
@@ -219,19 +219,19 @@ class Pipeline:
     def __call__(self, sample, *, seed, profile=False, inplace=False, params=None):
         device = self._device_inputs(sample)
         if device is not None:
-            result = self._device_result(self._native.run_device(device, seed, False, profile, inplace, params=params or {}),
+            result = self._device_result(self._engine.run_device(device, seed, False, profile, inplace, params=params or {}),
                                          [sample[k] for k in device] if inplace else ())
             return self._outputs(sample, dict.fromkeys(device), result, profile)
         arrays, converters = self._inputs(sample, inplace)
-        result = self._native.run(arrays, seed, False, profile, inplace, params=params or {})
+        result = self._engine.run(arrays, seed, False, profile, inplace, params=params or {})
         return self._outputs(sample, converters, result, profile)
 
     def sample(self, sample, *, seed, params=None):
         device = self._device_inputs(sample)
         if device is not None:
-            return Plan(self, self._native.run_device(device, seed, True, False, False, params=params or {})[3])
+            return Plan(self, self._engine.run_device(device, seed, True, False, False, params=params or {})[3])
         arrays, _ = self._inputs(sample)
-        return Plan(self, self._native.run(arrays, seed, True, False, params=params or {})[3])
+        return Plan(self, self._engine.run(arrays, seed, True, False, params=params or {})[3])
 
     def batch(self, batch, *, seeds, device=None, params=None):
         """Augment a batch, returning PyTorch CUDA tensors and unchanged metadata.
@@ -259,10 +259,10 @@ class Pipeline:
             raise ValueError("plan belongs to another pipeline; use plan.apply(sample)")
         device = self._device_inputs(sample)
         if device is not None:
-            result = self._device_result(self._native.replay_device(device, plan._native))
+            result = self._device_result(self._engine.replay_device(device, plan._plan))
             return self._outputs(sample, dict.fromkeys(device), result, False)
         arrays, converters = self._inputs(sample)
-        return self._outputs(sample, converters, self._native.replay(arrays, plan._native), False)
+        return self._outputs(sample, converters, self._engine.replay(arrays, plan._plan), False)
 
 
 __all__ = [*_constructors, "Pipeline", "Plan", "seed", "translate_crop_box"]

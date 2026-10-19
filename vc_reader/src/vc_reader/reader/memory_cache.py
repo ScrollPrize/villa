@@ -1,11 +1,11 @@
-"""A process-local native cache whose shared budget survives worker startup."""
+"""A process-local C++ cache whose shared budget survives worker startup."""
 
 from __future__ import annotations
 
 import operator
 import os
 
-from .. import _native
+from .. import _reader
 
 # Never destroy a cache inherited while another thread might have held its lock.
 _INHERITED: list[object] = []
@@ -15,7 +15,7 @@ class MemoryCache:
     """One decoded-chunk budget shared by readers, independently in each process.
 
     Pickling preserves sharing through Python's normal object memo. Forked
-    workers lazily replace the native cache once, without touching its locks.
+    workers lazily replace the C++ cache once, without touching its locks.
     Contents are never copied between processes.
     """
 
@@ -24,13 +24,13 @@ class MemoryCache:
         if self._max_bytes < 0:
             raise ValueError("max_bytes must be nonnegative")
         self._pid = os.getpid()
-        self._cache = _native.MemoryCache(self._max_bytes)
+        self._cache = _reader.MemoryCache(self._max_bytes)
 
     @property
-    def _native(self):
+    def _engine(self):
         if self._pid != os.getpid():
             _INHERITED.append(self._cache)
-            self._cache = _native.MemoryCache(self._max_bytes)
+            self._cache = _reader.MemoryCache(self._max_bytes)
             self._pid = os.getpid()
         return self._cache
 
@@ -40,21 +40,21 @@ class MemoryCache:
 
     @property
     def nbytes(self) -> int:
-        return self._native.nbytes
+        return self._engine.nbytes
 
     @property
     def hits(self) -> int:
-        return self._native.hits
+        return self._engine.hits
 
     @property
     def misses(self) -> int:
-        return self._native.misses
+        return self._engine.misses
 
     def __len__(self) -> int:
-        return len(self._native)
+        return len(self._engine)
 
     def clear(self) -> None:
-        self._native.clear()
+        self._engine.clear()
 
     def __getstate__(self):
         return self._max_bytes

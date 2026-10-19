@@ -26,8 +26,8 @@ environment and build-selection options.
 | Input pipeline | Reading / sampling | Augmentation | Geometry targets | Heading |
 | --- | --- | --- | --- | --- |
 | Original trainer | Trainer CPU code | Trainer CPU code | Trainer CPU code | Learned heading model and trainer CT fallback |
-| vc_reader CPU | Native CPU, loader workers | Native CPU, loader workers | Native CPU, loader workers | CPU structure tensor |
-| vc_reader CUDA | Native CUDA | Native CUDA batches | Native CUDA in batch prefetch; worker plane targets on CPU | CUDA structure tensor |
+| vc_reader CPU | C++ CPU, loader workers | C++ CPU, loader workers | C++ CPU, loader workers | CPU structure tensor |
+| vc_reader CUDA | CUDA | CUDA batches | CUDA in batch prefetch; worker plane targets on CPU | CUDA structure tensor |
 
 
 Measured **2026-10-19** on an **Intel Core Ultra 7 270K Plus / RTX 5090**, with PyTorch **2.12.1+cu130**,
@@ -84,7 +84,7 @@ CPU reading followed by CUDA augmentation.
   --shape 128 128 128 --output /tmp/pipeline.json
 ```
 
-`--native-dir` selects an existing build. `--cuda-output device` measures a GPU
+`--build-dir` selects an existing build. `--cuda-output device` measures a GPU
 consumer endpoint; host output includes downloads. `--memory-cache-mib` and
 `--cuda-cache warm|clear` control decoded/device cache reuse. Reports record
 configuration, versions, hashes, validation, raw samples and latency percentiles.
@@ -105,7 +105,7 @@ README without altering examples or images.
 VC_BENCH_VOLUME=/path/to/PHercParis4-volume.zarr
 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 \
   .venv/bin/python benchmarks/bench_augmentations.py \
-  --native-dir /tmp/vc-reader-cuda --array "$VC_BENCH_VOLUME" --level 2 \
+  --build-dir /tmp/vc-reader-cuda --array "$VC_BENCH_VOLUME" --level 2 \
   --start 9000 3600 3600 --size 128 --warmup 1 --reps 5 \
   --output /tmp/augmentations.json
 ```
@@ -127,12 +127,12 @@ no forward/backward pass; use the fiber trainer comparison for actual training.
 
 ```bash
 .venv/bin/python benchmarks/bench_torch.py \
-  --native-dir /tmp/vc-reader-cuda --array /path/to/volume.zarr --level 2 \
+  --build-dir /tmp/vc-reader-cuda --array /path/to/volume.zarr --level 2 \
   --batches 64 --batch-size 4 --reps 3 --output /tmp/torch-batches.json
 ```
 
 Use `--help` for workload and profiling options. Correctness coverage is in `tests/test_torch.py` and
-`tests/test_native_batch.py`.
+`tests/test_cuda_batch.py`.
 
 
 ## Reporting

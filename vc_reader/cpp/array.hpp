@@ -1,4 +1,4 @@
-// Native read path for one Zarr array: plan, then resolve every chunk through
+// C++ read path for one Zarr array: plan, then resolve every chunk through
 // the memory cache, the disk layers (in their own formats) and the remote, and
 // copy into the caller's output buffers.
 #pragma once

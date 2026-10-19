@@ -2,7 +2,7 @@
 
 The catalog and public views use the standard library. `load()` reads catalog
 metadata; navigating an already loaded catalog does not request arrays or
-import NumPy, native extensions, Pillow, or PyTorch.
+import NumPy, compiled extensions, Pillow, or PyTorch.
 
 ## Collections and relationships
 
@@ -80,13 +80,13 @@ and immutable `Source` descriptors; navigation never rewrites registration.
 
 ## Find labels mapped to another scan
 
-Registrations connect **volumes**. Follow segment → label → native volume →
+Registrations connect **volumes**. Follow segment → label → source volume →
 volume affine → destination; a label need not have `VolumeRegistration` to
 have a known destination mapping. Surface labels require explicit projection.
 
 ```python
 label = catalog.samples['PHerc0009B'].segments['20250919125754'].labels.ink(label_set='20260918')
-print(label.summary())  # native volume, destinations, affines, coverage, unresolved fields
+print(label.summary())  # source volume, destinations, affines, coverage, unresolved fields
 mapping = label.mappable_volumes['20250521125136']
 print(label.volume.id)             # 20250820154339
 print(mapping.required_operations) # ('surface_projection', 'volume_transform')
@@ -98,7 +98,7 @@ print(mapping.coverage.overlap_ratio)  # 1.0 for this published segment
 fields separately from available volume affines. Resolve the pixel convention
 before projection; geometry headers may supply the surface grid's UV mapping.
 Published coverage describes the segment and does not guarantee coverage of
-any particular crop. Native ownership stays separate from mapped destinations.
+any particular crop. Source ownership stays separate from mapped destinations.
 
 See [surface sampling](surface-sampling.md) for projecting annotations into
 a destination volume.
@@ -115,7 +115,7 @@ with match.open() as reader:
     patch = reader[100:104, 200:204, 300:304]
 ```
 
-All native and catalog-convention pyramid matches within tolerance are returned,
+All full-resolution and catalog-convention pyramid matches within tolerance are returned,
 including nearby matches when another volume matches exactly. Ordering is
 resolution difference, scroll ID, volume ID, level, source ID. Tolerance
 is 0.5% by default. Candidates start `verified=False`; `.resolve()` checks

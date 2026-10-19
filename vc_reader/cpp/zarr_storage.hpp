@@ -47,7 +47,7 @@ public:
           requests_(requests), bytes_(bytes)
     {
         // Encoded compression may add overhead, but cannot allocate a shard-sized
-        // buffer from an unchecked index. Native chunks retain their normal budget.
+        // buffer from an unchecked index. Source chunks retain their normal budget.
         max_payload_ = chunk_bytes > (std::numeric_limits<std::size_t>::max()-(1<<20))/2 ?
                        chunk_bytes : 2*chunk_bytes+(1<<20);
         if (!shards_.empty()) {

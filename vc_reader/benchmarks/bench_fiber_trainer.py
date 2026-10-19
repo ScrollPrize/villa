@@ -156,20 +156,20 @@ def main():
         from fiber_tensor_heading import install
         heading = install(backend.pool, stream=args.heading_stream)
 
-    native_build = None
+    extension_build = None
     if backend is not None:
-        from vc_reader import _augment, _native
+        from vc_reader import _augment, _reader
         binary = Path(_augment.__file__).resolve()
-        native_build = dict(path=str(binary), sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+        extension_build = dict(path=str(binary), sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                             revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'],
                                 cwd=Path(__file__).resolve().parent, text=True).strip())
-        reader_binary = Path(_native.__file__).resolve()
-        native_build['reader'] = dict(path=str(reader_binary), sha256=hashlib.sha256(reader_binary.read_bytes()).hexdigest())
-        native_build['adapters'] = {name: hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest()
+        reader_binary = Path(_reader.__file__).resolve()
+        extension_build['reader'] = dict(path=str(reader_binary), sha256=hashlib.sha256(reader_binary.read_bytes()).hexdigest())
+        extension_build['adapters'] = {name: hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest()
             for name in ('bench_fiber_trainer.py', 'fiber_cuda_pipeline.py', 'fiber_cpu_pipeline.py',
                          'fiber_tensor_heading.py', 'fiber_geometry.py')}
         from vc_reader import cuda
-        native_build['python'] = {name: hashlib.sha256((Path(cuda.__file__).parent/name).read_bytes()).hexdigest()
+        extension_build['python'] = {name: hashlib.sha256((Path(cuda.__file__).parent/name).read_bytes()).hexdigest()
                                  for name in ('cuda.py', 'geometry.py')}
     from fiber_timeline import span
     if args.timeline:
@@ -322,7 +322,7 @@ def main():
                   command=[sys.executable, *sys.argv],
                   cuda_augmentation=args.cuda_augmentation if backend is not None and not cpu_reader else None,
                   cuda_cache=args.cuda_cache if backend is not None and not cpu_reader else None,
-                  native_build=native_build, timeline=args.timeline, profile_batches=args.profile_batches,
+                  extension_build=extension_build, timeline=args.timeline, profile_batches=args.profile_batches,
                   timing_sync=args.timing_sync,
                   gil_interval=sys.getswitchinterval(),
                   warmup=args.warmup, steps=args.steps, batch=run['training']['batch'],

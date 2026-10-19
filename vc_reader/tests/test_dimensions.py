@@ -1,4 +1,4 @@
-"""Native planar augmentation, spatial parameter validation and dimension semantics."""
+"""Planar augmentation, spatial parameter validation and dimension semantics."""
 import os
 from pathlib import Path
 import pickle
@@ -7,10 +7,10 @@ import unittest
 
 import numpy as np
 
-if os.environ.get('VC_READER_NATIVE_DIR'):
+if os.environ.get('VC_READER_BUILD_DIR'):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-    from native_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_NATIVE_DIR']))
+    from extension_build import load_extensions
+    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
 
 from vc_reader import augment as A
 
@@ -46,7 +46,7 @@ def bilinear(image, y, x):
 
 class DimensionTests(unittest.TestCase):
     def backends(self):
-        return ('cpu', 'cuda') if A._native.cuda_available() else ('cpu',)
+        return ('cpu', 'cuda') if A._augment.cuda_available() else ('cpu',)
 
     def check_transform(self, transform, sample, targets=None, atol=6e-5):
         results = {}

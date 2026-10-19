@@ -151,7 +151,7 @@ static nb::tuple run_batch(const Pipeline& pipeline, const std::map<std::string,
     nb::dict arrays;
     // Optional consumer allocator owns the final tensors. This also handles
     // shape-changing, ragged and pyramid outputs without predicting shapes in
-    // Python or exporting native allocations to an unrelated stream allocator.
+    // Python or exporting C++ allocations to an unrelated stream allocator.
     const auto allocated = [&](const Shape& shape, const std::vector<cuda::DeviceInput>& values) -> nb::object {
         const auto& first=values.front();
         auto result=allocate_array(shape,first);

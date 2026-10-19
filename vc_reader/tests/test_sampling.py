@@ -17,10 +17,10 @@ import numpy as np
 from PIL import Image
 import tifffile
 
-if os.environ.get('VC_READER_NATIVE_DIR'):
+if os.environ.get('VC_READER_BUILD_DIR'):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-    from native_build import load_extensions
-    load_extensions(Path(os.environ['VC_READER_NATIVE_DIR']))
+    from extension_build import load_extensions
+    load_extensions(Path(os.environ['VC_READER_BUILD_DIR']))
 
 from vc_reader import (Affine, Catalog, Companion, Encoding, Frame, Plane, QueryContext, Selection,
                        Source, Storage, ValueFrame, VolumeRegistration)
@@ -365,10 +365,10 @@ class SamplingTests(unittest.TestCase):
             import torch
         except ImportError:
             self.skipTest('PyTorch is optional')
-        from vc_reader import _native
+        from vc_reader import _reader
         stream = torch.cuda.Stream()
         try:
-            _native._set_stream(stream.cuda_stream)
+            _reader._set_stream(stream.cuda_stream)
             with open_sample(self.ref, backend='cuda') as reader:
                 result = reader.read((-1, 0, 0), (3, 2, 2))
             value = torch.from_dlpack(result['image'].data)
@@ -381,7 +381,7 @@ class SamplingTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'DataLoader'):
                     open_sample(self.ref, backend='cuda')
         finally:
-            _native._set_stream(0)
+            _reader._set_stream(0)
 
 
     def test_sparse_large_array_origins_and_multiblock_exact_labels(self):
@@ -445,7 +445,7 @@ class SamplingTests(unittest.TestCase):
             self.assertEqual(result['image'].data.shape, (1, 0, 1, 1))
         with self.assertRaisesRegex(ValueError, 'closed'):
             reader.read((0, 0, 0), (1, 1, 1))
-        code = "import sys; import vc_reader.sampling; assert not {'numpy', 'torch', 'PIL', 'vc_reader._native'} & sys.modules.keys()"
+        code = "import sys; import vc_reader.sampling; assert not {'numpy', 'torch', 'PIL', 'vc_reader._reader'} & sys.modules.keys()"
         subprocess.run([sys.executable, '-c', code], check=True)
 
     def test_catalog_contexts_and_source_reference_coordinates(self):

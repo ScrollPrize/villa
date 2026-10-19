@@ -1,4 +1,4 @@
-"""Zarr array metadata normalized for native chunks and decoded disk caches."""
+"""Zarr array metadata normalized for source chunks and decoded disk caches."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-#: Compressors the native reader decodes, by numcodecs id (None: uncompressed).
+#: Compressors the C++ reader decodes, by numcodecs id (None: uncompressed).
 SUPPORTED_COMPRESSORS = {None: "", "blosc": "blosc", "zstd": "zstd", "lzw": "lzw",
                          "imagecodecs_lzw": "lzw", "vc-delta3d": "vc-delta3d"}
 
@@ -72,7 +72,7 @@ class ArrayMeta:
 
     @property
     def codec_id(self) -> str:
-        """The native reader's id for this array's compressor; ValueError if it cannot read the chunks."""
+        """The C++ reader's id for this array's compressor; ValueError if it cannot read the chunks."""
         cid = self.compressor.get("id") if self.compressor else None
         if cid not in SUPPORTED_COMPRESSORS:
             raise ValueError(f"vc_reader cannot read arrays compressed with {cid!r} "

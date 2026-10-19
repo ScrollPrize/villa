@@ -1,4 +1,4 @@
-// Python bindings for the native read path (module vc_reader._native).
+// Python bindings for the C++ read path (module vc_reader._reader).
 #include "array.hpp"
 #include "output_pool.hpp"
 
@@ -69,9 +69,9 @@ static std::vector<std::size_t> output_counts(const std::vector<vcr::Index>& sha
 #include "sheet_normal/bindings.hpp"
 #include "geometry/bindings.hpp"
 
-NB_MODULE(_native, m)
+NB_MODULE(_reader, m)
 {
-    m.doc() = "Native zarr v2 read path: local and HTTP chunks, disk cache layers, memory cache.";
+    m.doc() = "Zarr reader: local and HTTP chunks, disk cache layers, memory cache.";
 #ifdef VC_READER_CUDA
     vcr::reader_cuda::bind(m);
 #else
@@ -86,7 +86,7 @@ NB_MODULE(_native, m)
     // still referenced at exit; that is not a leak worth reporting.
     nb::set_leak_warnings(false);
 
-    // Native errors with a Python meaning: offline cache misses and refused requests.
+    // C++ exceptions with a Python meaning: offline cache misses and refused requests.
     nb::register_exception_translator([](const std::exception_ptr& p, void*) {
         try {
             std::rethrow_exception(p);

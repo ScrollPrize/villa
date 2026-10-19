@@ -159,9 +159,9 @@ class PairedReader(SamplingEngine):
                         raise ValueError(f'{companion.name}: companion storage transforms contradict same_grid')
                 else:
                     # Resolve each declared grid before comparing placements.
-                    native_label = self._open(_select_level(replace(label, companions=()), 0))
-                    native_mask = self._open(_select_level(replace(companion.source, companions=()), 0))
-                    mask_to_label = _companion_to_label(native_label.registration, native_mask.registration)
+                    full_resolution_label = self._open(_select_level(replace(label, companions=()), 0))
+                    full_resolution_mask = self._open(_select_level(replace(companion.source, companions=()), 0))
+                    mask_to_label = _companion_to_label(full_resolution_label.registration, full_resolution_mask.registration)
                 self._masks[companion.name] = self._planar_target(mask_source, base, label_to_selected @ mask_to_label, level)
             self.metadata = dict(image_id=image.id, label_id=label.id, image_selection=selected_image.resolved.selection,
                                  label_selection=self._targets['label']['reader'].resolved.selection,

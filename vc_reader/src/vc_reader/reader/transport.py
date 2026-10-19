@@ -12,10 +12,10 @@ def read_node_file(location: str, name: str, access: Access) -> bytes | None:
             return Path(location, name).read_bytes()
         except (FileNotFoundError, NotADirectoryError):
             return None
-    from .. import _native
+    from .. import _reader
 
     try:
-        return _native.http_get(access.url(f'{location}/{name}'), auth=access.native())
+        return _reader.http_get(access.url(f'{location}/{name}'), auth=access.auth_tuple())
     except PermissionError as error:
         if access.kind == 'anonymous':
             raise PermissionError(f'{error} (requested anonymously: pass auth= with credentials)') from None
@@ -23,5 +23,5 @@ def read_node_file(location: str, name: str, access: Access) -> bytes | None:
 
 
 def cache_url(location: str, access: Access) -> str:
-    """Canonical cache identity shared with the native Zarr reader."""
+    """Canonical cache identity shared with the C++ Zarr reader."""
     return location if access.kind == 's3' else http_url(location)

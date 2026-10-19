@@ -132,8 +132,8 @@ neither transform includes the other's implementation.
 Using existing configured Release builds, without installing dependencies:
 
 ```bash
-export VC_READER_NATIVE_DIR=/path/to/configured/cuda-build
-AGENTS_AGENT_MODE=1 cmake --build "$VC_READER_NATIVE_DIR" --parallel 4
+export VC_READER_BUILD_DIR=/path/to/configured/cuda-build
+AGENTS_AGENT_MODE=1 cmake --build "$VC_READER_BUILD_DIR" --parallel 4
 AGENTS_AGENT_MODE=1 \
   .venv/bin/python tests/test_precision.py -v
 AGENTS_AGENT_MODE=1 \

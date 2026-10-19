@@ -17,7 +17,7 @@ import time
 
 import numpy as np
 
-from native_build import load_extensions
+from extension_build import load_extensions
 from bench_pipeline import environment, nonnegative, positive, summary
 from augmentation_cases import CASES, input_sample
 
@@ -71,7 +71,7 @@ def update_readme(path, results):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--native-dir', type=Path, required=True)
+    parser.add_argument('--build-dir', type=Path, required=True)
     parser.add_argument('--array', required=True)
     parser.add_argument('--level', default='2')
     parser.add_argument('--start', type=int, nargs=3, default=(9000, 3600, 3600))
@@ -90,7 +90,7 @@ def main():
     if args.update_readme and (args.size != 128 or args.plane):
         parser.error('README timing rows describe 128-cubed inputs')
     args.backend = 'both'
-    load_extensions(args.native_dir)
+    load_extensions(args.build_dir)
     from vc_reader import augment as A, cuda
     from vc_reader.reader import ZarrReader
     if not cuda.is_available():

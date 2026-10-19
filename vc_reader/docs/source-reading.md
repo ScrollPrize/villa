@@ -5,11 +5,11 @@ TIFF, and explicitly ordered stacks of 2D files. It exposes `shape`, `dtype`,
 `axes`, NumPy-style indexing, `companions`, `resolved`,
 `stats()`, and `close()`. The source descriptor stays immutable.
 
-Zarr sources use the existing native reader, authentication, memory cache,
+Zarr sources use the existing C++ reader, authentication, memory cache,
 chunk planning, disk cache, prefetch support, and worker lifecycle. Remote image
 files use that same HTTP/S3 transport and directory budget. No installation
 occurs at runtime. Image decoders come from the optional `labels` extra
-(NumPy, Pillow, tifffile); local image reads do not load the native extension,
+(NumPy, Pillow, tifffile); local image reads do not load the compiled extension,
 PyTorch, or CUDA. Unsupported TIFF compression identifies the required codec.
 
 ```python
@@ -157,7 +157,7 @@ blocks for an actively pinned inode can remain until its read finishes.
 retained image/tile data and concurrent image decode/conversion working space.
 Pass one `DecodedCache` to share both limits across readers in a process;
 configure limits on that object, without also passing per-reader byte limits.
-Zarr retains its native `memory_cache` and bounded thread/connections controls;
+Zarr retains its `memory_cache` and bounded thread/connections controls;
 source selection/encoding scratch is additionally checked against
 `max_decode_bytes`. Caller-owned output arrays have separate accounting.
 
@@ -192,19 +192,19 @@ Index working storage is limited to 64 MiB. One remote index of at most 8 MiB
 can be retained per array; larger indexes are reread within the working limit.
 Encoded payloads are capped at twice the decoded inner-chunk size plus 1 MiB.
 Arrays requiring larger indexes or unusual oversized encoded payloads raise.
-These limits never materialize an entire shard. Native chunk sizes and worker
-counts still determine the native decoder's working memory.
+These limits never materialize an entire shard. Source chunk sizes and worker
+counts still determine the C++ decoder's working memory.
 
 ## Run and validate
 
 With existing dependencies and configured build directories:
 
 ```bash
-AGENTS_AGENT_MODE=1 cmake --build build/cp314-cp314-linux_x86_64 --target _native -j 2
-AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --target _native -j 2
-AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=/tmp/vc-reader-cuda .venv/bin/python -m unittest discover -s tests -v
-AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=build/cp314-cp314-linux_x86_64 .venv/bin/python -m unittest discover -s tests -p 'test_source*.py' -v
-AGENTS_AGENT_MODE=1 VC_READER_NATIVE_DIR=build/cp314-cp314-linux_x86_64 .venv/bin/python -m unittest discover -s tests -p test_zarr_v3.py -v
+AGENTS_AGENT_MODE=1 cmake --build build/cp314-cp314-linux_x86_64 --target _reader -j 2
+AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --target _reader -j 2
+AGENTS_AGENT_MODE=1 VC_READER_BUILD_DIR=/tmp/vc-reader-cuda .venv/bin/python -m unittest discover -s tests -v
+AGENTS_AGENT_MODE=1 VC_READER_BUILD_DIR=build/cp314-cp314-linux_x86_64 .venv/bin/python -m unittest discover -s tests -p 'test_source*.py' -v
+AGENTS_AGENT_MODE=1 VC_READER_BUILD_DIR=build/cp314-cp314-linux_x86_64 .venv/bin/python -m unittest discover -s tests -p test_zarr_v3.py -v
 ```
 
 HTTP tests use loopback servers. Tests cover

@@ -1,6 +1,6 @@
 """Catalog metadata records and the scroll-centered browsing entry point.
 
-Records retain native relationships; contextual views share these records.
+Records retain source relationships; contextual views share these records.
 Import and navigation require only the standard library.
 """
 from __future__ import annotations

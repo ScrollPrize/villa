@@ -17,12 +17,12 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from native_build import load_extensions
+from extension_build import load_extensions
 from bench_pipeline import environment, heavy_transforms, positive, summary, synthetic_array
 
 # Spawned DataLoader workers must import the same extensions as the parent.
-if os.environ.get("VC_READER_NATIVE_DIR"):
-    load_extensions(Path(os.environ["VC_READER_NATIVE_DIR"]))
+if os.environ.get("VC_READER_BUILD_DIR"):
+    load_extensions(Path(os.environ["VC_READER_BUILD_DIR"]))
 
 
 def pipeline():
@@ -71,7 +71,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--array')
     parser.add_argument('--level')
-    parser.add_argument('--native-dir', type=Path)
+    parser.add_argument('--build-dir', type=Path)
     parser.add_argument('--modes', nargs='+', choices=['serial', 'batch', 'prefetch'],
                         default=['serial', 'batch', 'prefetch'])
     parser.add_argument('--shape', type=positive, nargs=3, default=(128, 128, 128))
@@ -83,10 +83,10 @@ def main():
     parser.add_argument('--seed', type=int, default=123)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
-    if args.native_dir:
-        args.native_dir = args.native_dir.resolve()
-        os.environ['VC_READER_NATIVE_DIR'] = str(args.native_dir)
-        load_extensions(args.native_dir)
+    if args.build_dir:
+        args.build_dir = args.build_dir.resolve()
+        os.environ['VC_READER_BUILD_DIR'] = str(args.build_dir)
+        load_extensions(args.build_dir)
     from vc_reader.torch import CudaLoader
     torch.set_num_threads(1)
     torch.cuda.init()

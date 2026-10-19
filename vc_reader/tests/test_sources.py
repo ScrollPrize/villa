@@ -92,7 +92,7 @@ with patch('urllib.request.urlopen', side_effect=AssertionError('network request
     list(c.samples['s'].artifacts)
     c.samples['s'].on_volume('a').labels.ink()
     c.samples['s'].volumes.at_resolution(8)
-assert not any(n in sys.modules for n in ('numpy', 'torch', 'PIL', 'tifffile', 'vc_reader._native'))
+assert not any(n in sys.modules for n in ('numpy', 'torch', 'PIL', 'tifffile', 'vc_reader._reader'))
 """
         subprocess.run([sys.executable, '-S', '-c', code], check=True, capture_output=True, text=True)
 

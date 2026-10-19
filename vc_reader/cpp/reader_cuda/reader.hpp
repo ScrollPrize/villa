@@ -500,7 +500,7 @@ private:
         if ((kind!=2 && kind!=3) || (bits!=32 && bits!=64) || (kind==2 && bits!=32) || (order!=0 && order!=1) || base.size()!=3 || count>SIZE_MAX/24) throw std::invalid_argument("invalid point request");
         for (auto b:base) if (b<0 || b>(1LL<<30)) throw std::invalid_argument("coordinate origin must be in [0, 2**30]");
         std::set<std::int64_t> needed;
-        // Native discovery avoids Python's point enumeration/unique bottleneck.
+        // C++ chunk discovery avoids Python's point enumeration/unique bottleneck.
         // The set is bounded by the touched chunks, not the number of samples.
         struct ChunkSet {
             ChunkIds ids;

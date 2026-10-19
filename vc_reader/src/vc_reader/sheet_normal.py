@@ -10,7 +10,7 @@ normals (flat/ambiguous tensor or insufficient volume support) are zero.
 from __future__ import annotations
 
 import numpy as np
-from . import _native
+from . import _reader
 
 RECIPE = "ct-anisotropic-1-24-4-grid3-r48-v4"
 
@@ -50,15 +50,15 @@ def sheet_normals(patches, offsets_xyz=None, *, valid=None, out=None):
             if not is_device_array(out):
                 raise TypeError('out must be a CUDA array for CUDA patches')
             destination = wrap(out)
-            _native._sheet_normals_cuda(patches._native, centers, destination._native)
+            _reader._sheet_normals_cuda(patches._array, centers, destination._array)
             return out
-        return DeviceArray(_native._sheet_normals_cuda(patches._native, centers), (n, 4), np.float32, patches.device)
+        return DeviceArray(_reader._sheet_normals_cuda(patches._array, centers), (n, 4), np.float32, patches.device)
     if out is not None:
         if not isinstance(out, np.ndarray) or out.dtype != np.float32 or out.shape != (n,4) or not out.flags.c_contiguous or not out.flags.writeable:
             raise ValueError('out must be writable contiguous (B,4) float32 NumPy storage')
         if np.shares_memory(patches, out):
             raise ValueError('out must not overlap input patches')
-    return _native._sheet_normals_cpu(np.ascontiguousarray(patches), centers, out)
+    return _reader._sheet_normals_cpu(np.ascontiguousarray(patches), centers, out)
 
 
 def sheet_normal_regions(points_xyz, shape_zyx):

@@ -1,4 +1,4 @@
-"""Availability of the optional native CUDA augmentation backend.
+"""Availability of the optional CUDA augmentation backend.
 
 Use ``augment.Pipeline(transforms, backend="cuda")`` to require CUDA, or
 ``backend="auto"`` to use CUDA when available and CPU otherwise. Inputs and

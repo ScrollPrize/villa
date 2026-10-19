@@ -15,7 +15,7 @@ using Input = nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu>;
 #include "device_bindings.hpp"
 #endif
 
-// Constructor parsing only. Native execution never reads Python objects.
+// Constructor parsing only. C++ execution never reads Python objects.
 struct Arguments {
     nb::args positional;
     nb::dict keywords;
@@ -139,7 +139,7 @@ static nb::tuple export_result(RunResult result, bool plan, const std::map<std::
 #include "volumetric_bindings.hpp"
 
 NB_MODULE(_augment, m) {
-    m.doc() = "Native CPU augmentation: configuration, sampling, execution and replay.";
+    m.doc() = "CPU/CUDA augmentation: configuration, sampling, execution and replay.";
     nb::class_<Uniform>(m, "Uniform").def(nb::init<double, double>(), "low"_a, "high"_a);
     nb::class_<Normal>(m, "Normal").def(nb::init<double, double>(), "mean"_a = 0., "std"_a = .1);
     nb::class_<Choice>(m, "Choice").def(nb::init<std::vector<double>>(), "values"_a);

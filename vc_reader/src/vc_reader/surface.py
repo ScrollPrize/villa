@@ -1,6 +1,6 @@
 """Registered coordinate grids and bounded surface geometry operations.
 
-NumPy, image decoders and native kernels load only when opening geometry.
+NumPy, image decoders and compiled kernels load only when opening geometry.
 """
 from dataclasses import replace
 import math
@@ -149,9 +149,9 @@ class Geometry:
             if (value.sample_id, value.volume_id) != (surface.sample_id, surface.volume_id):
                 if not hasattr(owner, '_between'):
                     raise ValueError('cross-volume normals need a volume-aligned reader with a known frame relationship')
-                native = owner._between(surface.normals,(surface.sample_id,surface.volume_id))
+                source_transform = owner._between(surface.normals,(surface.sample_id,surface.volume_id))
                 values = owner._between(surface.normals,(value.sample_id,value.volume_id))
-                mapping = native.inverse() @ values @ mapping
+                mapping = source_transform.inverse() @ values @ mapping
             inv = (_scale(surface.spacing_um) @ surface.xyz_to_volume.inverse() @ mapping).inverse()
             self.normal_transform = np.asarray(inv.linear, np.float32).T
 
@@ -213,7 +213,7 @@ class Geometry:
     def sample(self, uv, offsets, destination, uv_origin=(0,0,0)):
         """Interpolate a bounded UV block; outputs are XYZ in destination grid."""
         import numpy as np
-        from . import _native
+        from . import _reader
         coords, base = _transform(np.column_stack((uv, np.zeros(len(uv), np.float32))), self.from_uv, uv_origin)
         coords[:, :2] += np.asarray(base[:2], np.float32)
         finite = np.isfinite(coords[:, :2]).all(axis=1)
@@ -253,7 +253,7 @@ class Geometry:
                 if self.owner.backend == 'cuda':
                     self.owner._surface_metrics['geometry_upload_bytes'] += xyz.nbytes+valid.nbytes+local_queries.nbytes+normals.nbytes
                     self.owner._surface_metrics['geometry_download_bytes'] += values.nbytes+good.nbytes
-                _native._surface_interpolate(xyz,valid.view(np.uint8).ravel(),local_queries,normals,values,good.view(np.uint8),
+                _reader._surface_interpolate(xyz,valid.view(np.uint8).ravel(),local_queries,normals,values,good.view(np.uint8),
                                              _matrix(_scale(spacing)),_matrix(tile_destination),self.orientation,offset,
                                              self.owner.device if self.owner.backend=='cuda' else -1)
                 output[depth,at],support[depth,at] = values,good
@@ -334,14 +334,14 @@ def render_surface(reader, surface, start, size, offsets):
     # Output rows are contiguous UV strips, keeping scratch independent of H/W.
     for name,target in {**reader._targets,**targets}.items():
         depth = len(offsets) if name in reader._targets else 1
-        dtype = np.dtype('float32') if target['order'] else target['native_dtype']
+        dtype = np.dtype('float32') if target['order'] else target['native_endian_dtype']
         if reader.backend == 'cpu' and not target['order']:
             dtype = target['dtype']
         result.targets[name] = TargetResult(
             reader._owned_empty((target['channels'],depth*n),dtype),
             reader._owned_empty((1,depth*n),np.dtype('bool')))
         result[name].masks = {k:reader._owned_empty((t['channels'],depth*n),np.dtype('float32') if t['order'] else
-                              t['dtype'] if reader.backend == 'cpu' else t['native_dtype'])
+                              t['dtype'] if reader.backend == 'cpu' else t['native_endian_dtype'])
                               for k,t in target['companions'].items()}
     for first in range(0,n,8192):
         index=np.arange(first,min(first+8192,n))
@@ -609,7 +609,7 @@ class Projection:
         import numpy as np
         r=self.reader;n=math.prod(shape)
         before=time.perf_counter()
-        arrays=[np.full((target['channels'],n),target['reader'].fill_value,target['native_dtype']),
+        arrays=[np.full((target['channels'],n),target['reader'].fill_value,target['native_endian_dtype']),
                 np.zeros((1,n),bool),np.zeros((1,n),bool),np.full(n,np.inf,np.float32),
                 np.full(n,np.iinfo(np.int64).max,np.int64),np.full((n,2),np.nan,np.float32),
                 np.zeros((1,n),bool)]
@@ -622,11 +622,11 @@ class Projection:
 
     def _raster(self,triangles,ids,origin,shape,states):
         import numpy as np
-        from . import _native
+        from . import _reader
         r=self.reader
         before=time.perf_counter()
         try:
-            plan=_native.SurfacePlan(triangles,ids,shape,_matrix(self.metric),self.radius,self.expansion,origin,r._work_bytes//3)
+            plan=_reader.SurfacePlan(triangles,ids,shape,_matrix(self.metric),self.radius,self.expansion,origin,r._work_bytes//3)
         except (ValueError,MemoryError) as error:
             if 'batch exceeds' not in str(error) or len(ids)<=1:
                 raise
@@ -664,7 +664,7 @@ class Projection:
             label=r._tiles.get(key)
             if label is None:
                 label=(r._canonical(target['reader'].read(lo,size),target['reader'])[:,0] if all(size)
-                       else np.empty((target['channels'],0,0),target['native_dtype']))
+                       else np.empty((target['channels'],0,0),target['native_endian_dtype']))
                 r._tile_reads+=1
                 if r.backend=='cuda':
                     from .cuda import asarray
@@ -678,7 +678,7 @@ class Projection:
             if r.backend=='cpu':
                 plan.cpu(config,r._bytes(label),target['dtype'].kind,target['dtype'].itemsize,*[r._bytes(a) for a in state])
             else:
-                _native._surface_raster_cuda(plan,config,label._native,target['dtype'].kind,target['dtype'].itemsize,*[a._native for a in state])
+                _reader._surface_raster_cuda(plan,config,label._array,target['dtype'].kind,target['dtype'].itemsize,*[a._array for a in state])
                 r._surface_metrics['candidate_upload_bytes'] += plan.upload_bytes
             r._surface_metrics['raster_call_seconds'] += time.perf_counter()-before
 
@@ -764,8 +764,8 @@ def _copy_region(reader,src,dst,offset):
     if reader.backend=='cpu':
         dst[(slice(None),*(slice(a,a+n) for a,n in zip(offset,src.shape[1:])))] = src
     else:
-        from . import _native
-        _native._surface_region_copy_cuda(src._native,dst._native,src.shape[1:],dst.shape[1:],offset,src.shape[0],src.dtype.itemsize)
+        from . import _reader
+        _reader._surface_region_copy_cuda(src._array,dst._array,src.shape[1:],dst.shape[1:],offset,src.shape[0],src.dtype.itemsize)
 
 
 def _read_crop(projection,origin,shape):

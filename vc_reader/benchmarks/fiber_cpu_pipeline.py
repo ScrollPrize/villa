@@ -96,7 +96,7 @@ def state():
     return STATE
 
 
-def worker_native_reader(ct):
+def worker_chunk_reader(ct):
     return state().pool.get(reader_spec(ct), 'context')
 
 
@@ -104,8 +104,8 @@ def init_worker(worker_id=None, *, tensor_heading=True):
     from fiber_cuda_pipeline import volume
     install_worker_reader(worker_id)
     # Context, headings and final images share each worker's decoded chunks.
-    volume.ChunkedArray.read = lambda ct, start, size: worker_native_reader(ct).read_region(start, size)
-    volume.ChunkedArray.sample_nearest = lambda ct, points: worker_native_reader(ct).read_points(
+    volume.ChunkedArray.read = lambda ct, start, size: worker_chunk_reader(ct).read_region(start, size)
+    volume.ChunkedArray.sample_nearest = lambda ct, points: worker_chunk_reader(ct).read_points(
         np.rint(points).astype(np.int64))
     if tensor_heading:
         install_heading(client=LocalHeadingClient(state().heading))
@@ -142,8 +142,8 @@ class CpuBackend:
     def stats(self):
         return dict(backend='cpu', placement='workers', workers=self.workers,
                     image_output_device='cpu', decoded_cache_bytes_per_worker_volume=384 << 20,
-                    augmentation='per-sample native CPU pipeline',
-                    heading='native CPU structure tensor', geometry='native CPU geometry')
+                    augmentation='per-sample C++ CPU pipeline',
+                    heading='C++ CPU structure tensor', geometry='C++ CPU geometry')
 
 
 def install(*, tensor_heading=True):

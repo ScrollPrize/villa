@@ -6,7 +6,7 @@ from collections import OrderedDict
 from threading import RLock
 from .affine import Affine
 
-# Retain inherited native locks rather than destroying them after fork.
+# Retain inherited C++ locks rather than destroying them after fork.
 _INHERITED = []
 
 class _Bounded:
@@ -81,7 +81,7 @@ class SamplingEngine:
 
     def _sampling_target(self, source, reader, mapping, *, plane=False, planar_grid=False, field=None, metadata=None):
         import numpy as np
-        from . import _native
+        from . import _reader
         dtype = np.dtype(reader.dtype)
         if dtype.kind not in 'buif' or (dtype.kind == 'f' and dtype.itemsize not in (4, 8)):
             raise TypeError('sampling requires bool, integer, float32 or float64 values')
@@ -93,9 +93,9 @@ class SamplingEngine:
         direct = (not plane or planar_grid) and mapping.linear == Affine.identity().linear and all(v.is_integer() for v in mapping.translation)
         return dict(source=source, reader=reader, mapping=mapping,
                     shape=tuple(shape.get(a, 1) for a in ('z', 'y', 'x')), channels=shape.get('c', 1),
-                    dtype=dtype, native_dtype=dtype.newbyteorder('='), plane=plane, storage_key=storage_key,
+                    dtype=dtype, native_endian_dtype=dtype.newbyteorder('='), plane=plane, storage_key=storage_key,
                     order=int(source.role != 'label'), direct=direct, field=field, metadata=metadata,
-                    native_field=_native._aligned_make_field(*field) if field else _native.AlignedField())
+                    field_state=_reader._aligned_make_field(*field) if field else _reader.AlignedField())
 
     def _open(self, source):
         # IDs alone do not identify selected arrays, encodings, or placement.
@@ -140,7 +140,7 @@ class SamplingEngine:
                     yield offset, tuple(min(n-o, step) for n, o, step in zip(size, offset, (16, 32, 64)))
 
     def _plan(self, target, start, size, offset, block, tiles=True):
-        from . import _native
+        from . import _reader
         mapping = target['mapping']
         # Only this small matrix/origin calculation uses Python double. Splitting
         # before float32 preserves e.g. the subvoxel part of 2**26 + .25.
@@ -155,16 +155,16 @@ class SamplingEngine:
                target['channels'], target['order'], target['plane'], tiles)
         plan = self._plans.get(key)
         if plan is None:
-            plan = _native.AlignedPlan(*key)
+            plan = _reader.AlignedPlan(*key)
             self._plans.put(key, plan, plan.nbytes)
         return plan, tile
 
     def _empty(self, shape, dtype):
         import numpy as np
-        from . import _native
+        from . import _reader
         if self.backend == 'cpu':
             return np.empty(shape, dtype=dtype)
-        return _native._aligned_empty(math.prod(shape), dtype.kind, dtype.itemsize, self.device)
+        return _reader._aligned_empty(math.prod(shape), dtype.kind, dtype.itemsize, self.device)
 
     @staticmethod
     def _bytes(array):
@@ -172,7 +172,7 @@ class SamplingEngine:
         return array.reshape(-1).view(np.uint8)
 
     def _tile_inputs(self, target, plan, tile):
-        from . import _native
+        from . import _reader
         reader = target['reader']
         starts = [tuple(p) for p in plan.starts()]
         tile_bytes = math.prod(tile)*target['channels']*target['dtype'].itemsize
@@ -196,7 +196,7 @@ class SamplingEngine:
             array = self._canonical(array, reader)
             value = array
             if self.backend == 'cuda':
-                value = _native._cuda_upload(array, self.device)
+                value = _reader._cuda_upload(array, self.device)
                 self._uploads += array.nbytes
             inputs[position] = value
             self._tiles.put((target['storage_key'], starts[position], tile), value, tile_bytes)
@@ -204,7 +204,7 @@ class SamplingEngine:
 
     def _execute(self, target, start, size, offset, block, output, valid):
         import numpy as np
-        from . import _native
+        from . import _reader
         plan, tile = self._plan(target, start, size, offset, block)
         inputs = self._tile_inputs(target, plan, tile)
         if inputs is None:
@@ -217,24 +217,24 @@ class SamplingEngine:
             self._execute(target, start, size, offset, tuple(left), output, valid)
             self._execute(target, start, size, tuple(after), tuple(right), output, valid)
             return
-        dtype = target['native_dtype']
+        dtype = target['native_endian_dtype']
         fill = np.array([target['reader'].fill_value], dtype=dtype).view(np.uint8)
         if self.backend == 'cpu':
-            plan.cpu([self._bytes(a) for a in inputs], fill, dtype.kind, dtype.itemsize, self._bytes(output), self._bytes(valid), target['native_field'])
+            plan.cpu([self._bytes(a) for a in inputs], fill, dtype.kind, dtype.itemsize, self._bytes(output), self._bytes(valid), target['field_state'])
         else:
-            _native._aligned_cuda(plan, inputs, fill, dtype.kind, dtype.itemsize, output, valid, target['native_field'])
+            _reader._aligned_cuda(plan, inputs, fill, dtype.kind, dtype.itemsize, output, valid, target['field_state'])
 
     def _cuda_blocks(self, target, start, size, output, valid):
         import numpy as np
-        from . import _native
-        dtype = target['native_dtype']
+        from . import _reader
+        dtype = target['native_endian_dtype']
         fill = np.array([target['reader'].fill_value], dtype=dtype).view(np.uint8)
         plans, inputs, working = [], [], 0
 
         def flush():
             if plans:
-                _native._aligned_cuda_many(plans, inputs, fill, dtype.kind, dtype.itemsize,
-                                           output, valid, target['native_field'])
+                _reader._aligned_cuda_many(plans, inputs, fill, dtype.kind, dtype.itemsize,
+                                           output, valid, target['field_state'])
                 plans.clear()
                 inputs.clear()
 
@@ -256,7 +256,7 @@ class SamplingEngine:
 
     def _sample_many(self, target, regions):
         import numpy as np
-        from . import _native
+        from . import _reader
         reader = target['reader']
         arrays = None
         if target['direct']:
@@ -275,7 +275,7 @@ class SamplingEngine:
                 affine_arrays = reader._backend.reader.read_affine_many(grids, order=target['order'])
         results = []
         for index, (start, size) in enumerate(regions):
-            dtype = target['native_dtype'] if target['direct'] or not target['order'] else np.dtype('float32')
+            dtype = target['native_endian_dtype'] if target['direct'] or not target['order'] else np.dtype('float32')
             if target['metadata'] is not None:
                 dtype = np.dtype('float32')
             shape = (target['channels'], *size)
@@ -284,7 +284,7 @@ class SamplingEngine:
                 output = self._canonical(arrays[index], reader).astype(dtype, copy=False)
                 if self.backend == 'cuda':
                     self._uploads += output.nbytes
-                    output = _native._cuda_upload(output, self.device)
+                    output = _reader._cuda_upload(output, self.device)
                 at = tuple(s+d for s, d in zip(start, shift))
                 if self.backend == 'cpu':
                     valid.fill(False)
@@ -292,7 +292,7 @@ class SamplingEngine:
                                    for s, n, extent in zip(at, size, target['shape']))
                     valid[(0, *bounds)] = True
                 else:
-                    _native._aligned_box_valid_cuda(target['shape'], at, size, valid)
+                    _reader._aligned_box_valid_cuda(target['shape'], at, size, valid)
 
             elif affine_arrays is not None:
                 output = affine_arrays[index].reshape(shape)
@@ -308,9 +308,9 @@ class SamplingEngine:
                         self._execute(target, start, size, offset, block, output, valid)
             if target['field'] is not None and (arrays is not None or affine_arrays is not None):
                 if self.backend == 'cpu':
-                    _native._aligned_field_cpu(self._bytes(output), self._bytes(valid), *target['field'])
+                    _reader._aligned_field_cpu(self._bytes(output), self._bytes(valid), *target['field'])
                 else:
-                    _native._aligned_field_cuda(output, valid, *target['field'])
+                    _reader._aligned_field_cuda(output, valid, *target['field'])
             if self.backend == 'cuda':
                 from .cuda import DeviceArray
                 output = DeviceArray(output, shape, dtype, self.device)
@@ -334,11 +334,11 @@ class SamplingEngine:
     def _point_block(self, target, points, base):
         """Sample one local-coordinate block using the shared tile kernels."""
         import numpy as np
-        from . import _native
+        from . import _reader
         n = len(points)
         limits = (1, 32, 32) if target['plane'] else (16, 16, 16)
         tile = tuple(max(1, min(s, t)) for s, t in zip(target['shape'], limits))
-        plan = _native.PointPlan(target['shape'], base, points, tile,
+        plan = _reader.PointPlan(target['shape'], base, points, tile,
                                  target['channels'], target['order'], target['plane'])
         inputs = self._tile_inputs(target, plan, tile)
         if inputs is None:
@@ -347,16 +347,16 @@ class SamplingEngine:
             yield from self._point_block(target, points[:n//2], base)
             yield from self._point_block(target, points[n//2:], base)
             return
-        dtype = np.dtype('float32') if target['order'] else target['native_dtype']
+        dtype = np.dtype('float32') if target['order'] else target['native_endian_dtype']
         out = self._empty((target['channels'], n), dtype)
         valid = self._empty((1, n), np.dtype('bool'))
-        fill = np.array([target['reader'].fill_value], dtype=target['native_dtype']).view(np.uint8)
+        fill = np.array([target['reader'].fill_value], dtype=target['native_endian_dtype']).view(np.uint8)
         if self.backend == 'cpu':
             plan.cpu([self._bytes(a) for a in inputs], fill, target['dtype'].kind,
-                     target['dtype'].itemsize, self._bytes(out), self._bytes(valid), target['native_field'])
+                     target['dtype'].itemsize, self._bytes(out), self._bytes(valid), target['field_state'])
         else:
-            _native._aligned_cuda(plan, inputs, fill, target['dtype'].kind, target['dtype'].itemsize,
-                                  out, valid, target['native_field'])
+            _reader._aligned_cuda(plan, inputs, fill, target['dtype'].kind, target['dtype'].itemsize,
+                                  out, valid, target['field_state'])
             from .cuda import DeviceArray
             out = DeviceArray(out, (target['channels'], n), dtype, self.device)
             valid = DeviceArray(valid, (1, n), np.bool_, self.device)
@@ -366,7 +366,7 @@ class SamplingEngine:
         """ZYX local float32 points plus an integer source-grid origin."""
         import numpy as np
         n = len(points)
-        dtype = np.dtype('float32') if target['order'] else target['native_dtype']
+        dtype = np.dtype('float32') if target['order'] else target['native_endian_dtype']
         if self.backend == 'cpu' and not target['order']:
             dtype = target['dtype']
         out, valid = self._owned_empty((target['channels'], n), dtype), self._owned_empty((1, n), np.dtype('bool'))
@@ -391,8 +391,8 @@ class SamplingEngine:
         if self.backend == 'cpu':
             destination[:, offset:offset+source.shape[1]] = source
         else:
-            from . import _native
-            _native._surface_copy_cuda(source._native, destination._native, source.shape[0],
+            from . import _reader
+            _reader._surface_copy_cuda(source._array, destination._array, source.shape[0],
                                       source.shape[1], destination.shape[1], offset, source.dtype.itemsize)
 
     def close(self):

@@ -442,7 +442,7 @@ class SourceReader:
             return output
 
     def _read_zarr(self, bounds, origin, output):
-        # Read only selected channels/time. ZarrReader supplies native chunk
+        # Read only selected channels/time. ZarrReader supplies source chunk
         # planning, authentication, missing-chunk fill and cache ownership.
         starts, sizes = [], []
         for axis, length in zip(self._raw_axes, self._raw_shape):

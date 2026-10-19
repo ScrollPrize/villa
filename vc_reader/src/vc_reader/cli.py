@@ -30,7 +30,7 @@ def main(argv=None):
         if name == 'labels':
             p.add_argument('--label-set')
         if name == 'volumes':
-            p.add_argument('--resolution', type=float, help='native or pyramid resolution in micrometers')
+            p.add_argument('--resolution', type=float, help='full-resolution or pyramid-level voxel spacing in micrometers')
             p.add_argument('--rel-tol', type=float, default=DEFAULT_RESOLUTION_REL_TOL)
             p.add_argument('--resolve', action='store_true', help='verify candidates against storage headers')
     args = parser.parse_args(argv)
@@ -53,7 +53,7 @@ def main(argv=None):
                     rows = [['scroll', 'volume', 'level', 'estimated um', 'verified']]
                     rows.extend([v.scroll.id, v.volume.id, v.level, v.estimated_resolution_um, v.verified] for v in values)
                 else:
-                    rows = [['volume', 'native um', 'labels', 'segments']]
+                    rows = [['volume', 'full-res um', 'labels', 'segments']]
                     rows.extend([v.id, v.pixel_size_um, len(v.labels), len(v.segments)] for v in values)
             elif args.command == 'segments':
                 rows = [['segment', 'labels', 'images']]
@@ -61,7 +61,7 @@ def main(argv=None):
             else:
                 if args.command == 'labels' and args.label_set:
                     values = values.filter(label_set=args.label_set)
-                rows = [['id', 'kind', 'native volume', 'segment', 'label set', 'location']]
+                rows = [['id', 'kind', 'source volume', 'segment', 'label set', 'location']]
                 rows.extend([a.id, a.artifact_kind, a.volume.id if a.volume else None,
                              a.segment.id if a.segment else None, a.label_set, a.source.storage.location] for a in values)
         print(_table(rows))

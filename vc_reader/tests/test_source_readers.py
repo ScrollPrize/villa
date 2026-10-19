@@ -398,7 +398,7 @@ from vc_reader import Source, Storage
 from vc_reader.reader import DecodedCache
 s = Source('unopened', Storage('/absent.png', 'png'))
 assert callable(s.open)
-assert not any(n in sys.modules for n in ('numpy', 'PIL', 'tifffile', 'torch', 'vc_reader._native'))
+assert not any(n in sys.modules for n in ('numpy', 'PIL', 'tifffile', 'torch', 'vc_reader._reader'))
 '''
         code = f'import sys; sys.path.insert(0, {str(Path(__file__).resolve().parents[1] / "src")!r})\n' + code
         result = subprocess.run([sys.executable, '-S', '-c', code], capture_output=True, text=True)

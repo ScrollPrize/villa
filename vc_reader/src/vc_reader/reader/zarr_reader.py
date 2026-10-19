@@ -1,10 +1,10 @@
 """Fast reads of Zarr v2/v3 arrays, local or remote, with optional disk and memory chunk caches.
 
-All reading happens in the native extension (``vc_reader._native``, C++): local
+All reading happens in the compiled extension (``vc_reader._reader``, C++): local
 chunk files through persistent memory maps (or ``pread``), HTTP fetches with
 libcurl, raw / blosc / vc-delta3d decoding, disk-cache reads and appends in
 each cache's own format, an in-memory LRU, and assembly into the outputs, on
-native threads without the GIL. Python finds the caches, checks them against
+C++ threads without the GIL. Python finds the caches, checks them against
 the remote ``.zarray`` and holds VC3D's lease.
 
 Values are exactly the stored values; missing chunks and out-of-bounds regions
@@ -19,7 +19,7 @@ Processes and fork: a reader's work runs on background threads (the read pool
 and the disk-cache writers), and a forked process (e.g. a PyTorch DataLoader
 worker on Linux) inherits the reader but not its threads. A reader therefore
 notices when it is used in a different process than it was opened in, and
-rebuilds its native engine there from its saved settings (as unpickling does);
+rebuilds its C++ engine there from its saved settings (as unpickling does);
 the inherited engine is left untouched, and the parent still finishes its own
 queued cache writes. A shared MemoryCache starts empty in each worker and
 retains one budget shared by all the readers that reference it.
@@ -40,7 +40,7 @@ from typing import Any, Iterable, Sequence
 
 import numpy as np
 
-from .. import _native
+from .. import _reader
 from ..errors import CacheMissError
 from .auth import Access, http_url, is_remote, resolve_access
 from .disk_cache import CacheLayer, cached_source_zarray, open_layers, cached_node_dirs, atomic_write, disk_budget
@@ -50,7 +50,7 @@ from .zarr_meta import ArrayMeta
 
 READ_MODES = ("mmap", "slab")
 
-# Native engines inherited through fork, kept alive and never touched: their
+# C++ engines inherited through fork, kept alive and never touched: their
 # threads do not exist in the child, and their locks may have been held by them.
 _INHERITED: list[Any] = []
 
@@ -73,7 +73,7 @@ class ZarrReader:
     Indexing is ``[z, y, x]`` like the stored array.
 
     Safe across fork: used in a forked process (e.g. a DataLoader worker), the
-    reader rebuilds its native engine there (see the module docstring).
+    reader rebuilds its C++ engine there (see the module docstring).
     """
 
     def __init__(self, spec: dict[str, Any], cache: MemoryCache | None):
@@ -115,13 +115,13 @@ class ZarrReader:
             names = v3['metadata'].get('dimension_names')
             if names is not None:
                 self._attrs['_ARRAY_DIMENSIONS'] = names
-        # Raises for arrays the native reader cannot decode; offline, chunks only come from the caches.
+        # Raises for arrays the C++ reader cannot decode; offline, chunks only come from the caches.
         codec = "" if self.offline else self.meta.codec_id
         self.cache_layers: list[CacheLayer] = []
         self.write_layer: CacheLayer | None = None
         layers: list[tuple] = []
         write_index, remote_url = -1, ""
-        self._auth = _native_auth = self.access.native() if remote and not self.offline else ("", "", "", "", "")
+        self._auth = auth_tuple = self.access.auth_tuple() if remote and not self.offline else ("", "", "", "", "")
         if remote:
             remote_url = self.access.url(self.location)
             if spec["cache_dirs"]:
@@ -130,7 +130,7 @@ class ZarrReader:
                     writable=spec["cache_writes"] and not self.offline and self._prefetch_client is None,
                     allow_lossy=spec["allow_lossy_cache"],
                     compress=spec["compress_cache"], cache_max_bytes=spec["cache_max_bytes"])
-                layers = [layer.native_spec() for layer in self.cache_layers]
+                layers = [layer.reader_spec() for layer in self.cache_layers]
                 if self.write_layer is not None:
                     write_index = self.cache_layers.index(self.write_layer)
             if self.offline and not self.cache_layers:
@@ -144,13 +144,13 @@ class ZarrReader:
         try:
             budget = (disk_budget(self.write_layer.budget_root, spec["cache_max_bytes"])
                       if self.write_layer is not None and self.write_layer.budget_root else None)
-            self._array = _native.Array(
+            self._array = _reader.Array(
                 list(self.meta.shape), list(self.meta.chunks), self.meta.dtype.itemsize,
                 np.asarray(self.meta.fill_value, dtype=self.meta.dtype).tobytes(), self.meta.separator, identity,
                 layers, write_layer=write_index, remote_url=remote_url, remote_codec=codec if remote_url or v3 else "",
-                auth=_native_auth, offline=self.offline or self._prefetch_client is not None,
+                auth=auth_tuple, offline=self.offline or self._prefetch_client is not None,
                 read_mode=spec["read_mode"], threads=threads,
-                connections=spec["connections"], cache=cache._native if cache is not None else None,
+                connections=spec["connections"], cache=cache._engine if cache is not None else None,
                 disk_cache=budget,
                 source_root=(remote_url if remote else root) if v3 else '',
                 source_prefix=v3['prefix'] if v3 else '', shard_chunks=v3['shard_chunks'] if v3 else [],
@@ -261,7 +261,7 @@ class ZarrReader:
         return f"ZarrReader({self.location!r}, shape={self.shape}, chunks={self.chunks}, dtype={self.dtype})"
 
     def _check_process(self) -> None:
-        """After a fork, rebuild the native engine in this process (see the module docstring)."""
+        """After a fork, rebuild the C++ engine in this process (see the module docstring)."""
         if self._pid == os.getpid() or self._array is None:
             return
         self._abandon_inherited()
@@ -577,7 +577,7 @@ class ZarrReader:
         Explicit ``dtype`` also permits float32/float64 conversion for order 0.
         ``out`` must be writable, aligned, C-contiguous and have the requested
         shape and dtype. It is returned unchanged as an object. Coordinates
-        are generated natively, with bounded point-planning scratch space.
+        are generated in C++, with bounded point-planning scratch space.
         """
         return self.read_affine_many([(shape, origin, axes)], order=order, dtype=dtype,
                                      out=None if out is None else [out], coordinate_origin=coordinate_origin)[0]
@@ -589,7 +589,7 @@ class ZarrReader:
     ) -> list[np.ndarray]:
         """Sample ``(shape, origin, axes)`` grids using :meth:`read_affine` semantics.
 
-        Grids may have different shapes. The native call processes them in
+        Grids may have different shapes. The C++ call processes them in
         order, parallelizing chunk work within each grid and sharing the
         reader's caches. Chunk loads are deduplicated within each point batch
         (up to 2**20 points); reuse across grids depends on the caches.
@@ -645,7 +645,7 @@ class ZarrReader:
                 raise ValueError("shape must have three non-negative integers") from exc
             if len(shape) != 3 or any(n < 0 for n in shape):
                 raise ValueError("shape must have three non-negative integers")
-            # Python integers avoid overflow before the native allocation.
+            # Python integers avoid overflow before the C++ allocation.
             count = 1
             for n in shape:
                 if n > np.iinfo(np.intp).max:
@@ -699,7 +699,7 @@ class ZarrReader:
         ``order=0``: the nearest element (halves round to even, like ``np.rint``),
         exactly as stored, in the array's dtype; outside points read as ``fill_value``.
 
-        The neighbours are read natively, each chunk once per batch of points.
+        The neighbours are read in C++, each chunk once per batch of points.
         Use :meth:`read_points` for integer indices.
         """
         self._ready()
@@ -802,7 +802,7 @@ class ZarrReader:
         if self._array is None:
             raise ValueError("reader is closed")
         if self.access.source is not None and not self.offline:
-            auth = self.access.native()
+            auth = self.access.auth_tuple()
             if auth is not self._auth:
                 self._array.set_auth(auth)
                 self._auth = auth
@@ -898,7 +898,7 @@ def _crop_output_dtype(source: np.dtype, default: np.dtype, dtype: Any) -> tuple
 
 def _empty(shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
     """An uninitialized array from the recycled output pool (every byte is overwritten by a read)."""
-    return _native.empty(int(np.prod(shape, dtype=np.int64)) * dtype.itemsize).view(dtype).reshape(shape)
+    return _reader.empty(int(np.prod(shape, dtype=np.int64)) * dtype.itemsize).view(dtype).reshape(shape)
 
 
 def set_output_pool_bytes(max_bytes: int) -> None:
@@ -909,12 +909,12 @@ def set_output_pool_bytes(max_bytes: int) -> None:
     Buffers of arrays the program has dropped are reused by later reads of the
     same size instead.
     """
-    _native.set_output_pool_bytes(int(max_bytes))
+    _reader.set_output_pool_bytes(int(max_bytes))
 
 
 def output_pool_stats() -> dict[str, int]:
     """The output pool's budget, retained bytes, and allocation hits and misses."""
-    return dict(_native.output_pool_stats())
+    return dict(_reader.output_pool_stats())
 
 
 def _shutdown(array, layers: list[CacheLayer], pid: int) -> None:
