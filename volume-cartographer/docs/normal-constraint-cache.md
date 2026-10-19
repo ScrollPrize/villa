@@ -59,4 +59,34 @@ ctest --test-dir build-normal-cache -R '^test_normal_constraint_grid_change$' --
 
 These are reproduction commands for a dependency-equipped checkout. Completed validation used GCC 15.2, Ceres 2.2, OpenCV 4.10, PCH enabled and an offline SDK with explicit dependency overrides. The commands above have not been run verbatim on a new general-purpose host. The test creates and removes its own temporary grids. A setup or compile failure is not the expected unfixed failure.
 
-The cost header on the checked submission base is identical to the tested original header. The patch applies there, but that newer whole-main revision has not been built or executed. macOS and arm64 are untested. Real-data payloads and raw capture streams are not included. The synthetic regression requires no data download. Formulas, weights and within-grid movement thresholds are unchanged.
+The cost header on the checked submission base is identical to the tested original header. The later focused build and CTest below supersede the earlier pending status for that target. They do not cover the whole application. macOS and arm64 are untested. Real-data payloads and raw capture streams are not included. The synthetic regression requires no data download. Formulas, weights and within-grid movement thresholds are unchanged.
+
+## Subsequent focused validation
+
+Subsequent agent-run local validation completed the focused target build and one CTest run against pinned upstream base `1db9cd94487c2fb5e759cc4ee72018dcb7359984` with the cache correction applied. The test passed 1/1 registered test, covering 12 configurations, 156 evaluations and 108 comparisons, with `summary,108,0,0`. This supersedes the earlier pending build and test status for this target only. It does not establish full CI, whole-application correctness, physical geometry improvement or speed.
+
+The tested `CostFunctions.hpp` is byte-identical to the public contribution header, SHA256 `bc057f48c68a02874c3f1421e6adf9e8e472e664412c45b6e5bb12e1d76c4818`. The two test sources and CMake registration also match the R823 source bindings. The whole-main revision was not rebuilt as an application.
+
+## Recorded numerical result
+
+This is a screenshot of retained native replay output recorded on October 15, 2026. It was captured for presentation on October 18; the native program was not rerun for this screenshot. The result is a numerical error, so the program exits successfully rather than crashing.
+
+For the same second recorded call, the unfixed warm cache returns residual `0.18034527073927942`. A fresh unfixed cost returns `0.5366718345666804`; both warm and fresh fixed costs return `0.5366718345666804`. This residual contributes to the optimizer's objective. It is not the total geometric cost or a confidence score.
+
+![Retained native replay output](images/normal-constraint-cache/recorded-native-output.png)
+
+The retained source is `isolated-prefix-replay-v473/family/replay.jsonl`, 1,795 bytes, SHA256 `585cedafd06f9044f9bcbd0e821ce795a0ff057ba70ddc55f00071f1353b316d`. It contains two calls across four arms. This compact example supplements the larger instrumented-solve and regression results above.
+
+## Retained PHerc0343 mesh views
+
+These screenshots show the retained unfixed V494 and fixed V501 outputs on the same CT crop with the same default camera and display settings: XY at native Z=10350, window 0–255, threshold 70, opacity 0.12, zoom 1. Red identifies the unfixed output; green identifies the fixed output. The overlay uses their original coordinates without amplifying displacement.
+
+![Unfixed retained mesh on the CT crop](images/normal-constraint-cache/unfixed-viewer.png)
+
+![Fixed retained mesh on the same CT crop](images/normal-constraint-cache/fixed-viewer.png)
+
+![Overlay of both retained meshes on the same CT crop](images/normal-constraint-cache/overlay-viewer.png)
+
+The views illustrate different optimization trajectories. They do not establish which mesh better follows the physical sheet. The numerical cache checks and regression tests establish the correction. These are views in our local CT inspection tool, not screenshots of the Villa GUI, and they do not depict a PHerc1447 solve.
+
+The exported meshes each contain 100 valid points, 81 quads and 180 unique quad edges. They came from the retained `x.tif`, `y.tif`, `z.tif`, `generations.tif` and `meta.json` files. Export and screenshot provenance are recorded separately; the screenshots themselves are unmodified browser captures.
