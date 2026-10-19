@@ -242,6 +242,12 @@ private slots:
         QCOMPARE(normalizeThemeId(QStringLiteral("Ocean Night")), QStringLiteral("ocean-night"));
         QCOMPARE(normalizeThemeId(QStringLiteral("  __High_Contrast!! ")), QStringLiteral("high-contrast"));
         QCOMPARE(normalizeThemeId(QStringLiteral("%%%")), QString());
+        // What names a theme file or folder rather than an installed theme.
+        QVERIFY(!looksLikeThemePath(QStringLiteral("modern-dark")));
+        QVERIFY(looksLikeThemePath(QStringLiteral("ocean-night.vc3dtheme")));
+        QVERIFY(looksLikeThemePath(QStringLiteral("OCEAN.VC3DTHEME")));
+        QVERIFY(looksLikeThemePath(QStringLiteral("/themes/ocean")));
+        QVERIFY(looksLikeThemePath(QStringLiteral("C:\\themes\\ocean")));
     }
 
     void baseResolution()

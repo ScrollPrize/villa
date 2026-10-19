@@ -154,6 +154,9 @@ struct ResolvedTheme
 QString normalizeThemeId(const QString& raw);
 QStringList builtinThemeIds();
 bool isBuiltinThemeId(const QString& id);
+// Whether a --theme value or a theme.set id names a theme file or folder
+// rather than an installed theme: it contains a slash or ends in .vc3dtheme.
+bool looksLikeThemePath(const QString& value);
 
 // Token names and values of the built-in modern-dark theme. They define which
 // token names are known and which ones hold colors.

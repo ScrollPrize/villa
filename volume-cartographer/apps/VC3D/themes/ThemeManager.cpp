@@ -35,12 +35,6 @@ constexpr const char* kPlatformPaletteClasses[] = {
     "QMenu", "QMenuBar", "QTextEdit", "QTextControl", "QLineEdit",
 };
 
-bool looksLikePath(const QString& value)
-{
-    return value.contains(QLatin1Char('/')) || value.contains(QLatin1Char('\\')) ||
-           value.endsWith(QLatin1String(kThemeFileSuffix), Qt::CaseInsensitive);
-}
-
 // The application style's name. While a style sheet is set, the style is a
 // style sheet wrapper whose own name is empty; the real style is its child.
 QString applicationStyleName()
@@ -313,7 +307,7 @@ bool ThemeManager::setTheme(const QString& idOrPath, bool persist, QString* erro
     QString id = normalizeThemeId(requested);
     QString saved = id;
 
-    const bool knownId = !looksLikePath(requested) && _registry.contains(id);
+    const bool knownId = !looksLikeThemePath(requested) && _registry.contains(id);
     if (!knownId) {
         if (!QFileInfo::exists(requested)) {
             *message = QStringLiteral("unknown theme \"%1\"").arg(requested);

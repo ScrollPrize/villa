@@ -687,6 +687,12 @@ bool isBuiltinThemeId(const QString& id)
     return builtinThemeIds().contains(id);
 }
 
+bool looksLikeThemePath(const QString& value)
+{
+    return value.contains(QLatin1Char('/')) || value.contains(QLatin1Char('\\')) ||
+           value.endsWith(QLatin1String(kThemeFileSuffix), Qt::CaseInsensitive);
+}
+
 const QMap<QString, QString>& builtinTokens()
 {
     static const QMap<QString, QString> tokens = [] {
