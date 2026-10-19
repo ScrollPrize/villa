@@ -260,12 +260,13 @@ def test_cache_keeps_levels_of_one_source_apart(tmp_path):
 
 
 def test_non_default_spacing_picks_nearest_peak_by_distance_from_zero(tmp_path):
-    # t = -8, -6.5, ..., -0.5, 1, 2.5, ...: no sample at 0. Sheets at -2 and +2.5; the nearer is -2,
-    # but picking by index distance from the middle sample (t=+1) chose +2.5.
+    # step 1.5: t = ..., -3, -1.5, 0, 1.5, 3, .... Sheets at -2 and +2.5 sample at -1.5 and +3;
+    # the nearer is the negative one, but picking by index distance from the middle sample
+    # (before the grid was built through zero, t=+1) chose the positive sheet.
     p = tmp_path / "ct.tif"
     tifffile.imwrite(p, two_sheet_volume([28.0, 32.5]))
     m = one_surface(tmp_path, str(p), 30.0, "--half", "8", "--step", "1.5", "--sigma", "0")
-    assert m["offset_median"] == pytest.approx(-2.0, abs=0.3)
+    assert m["offset_median"] == pytest.approx(-1.5, abs=0.3)
 
 
 def test_non_default_spacing_reads_the_surface_intensity_at_zero(tmp_path):
@@ -292,3 +293,19 @@ def test_interior_peaks_are_not_censored(tmp_path):
     tifffile.imwrite(p, sheet_volume(z0=32.0))
     m = one_surface(tmp_path, str(p), 30.0)
     assert m["n_valid"] > 0 and m["censored_frac"] == 0.0
+
+
+def test_small_obj_vertex_block_is_found_without_bisection():
+    # a sub-2 KB obj with a comment header used to be skipped past its own vertices
+    data = b"# made by hand\n# second line\n" + b"".join(
+        f"v {i} 0 0\nvn 0 0 1\n".encode() for i in range(3)) + b"f 1//1 2//2 3//3\n"
+    end = spa._vertex_region_end(lambda s, n: data[s:s + n], len(data), probe=4096)
+    assert data[:end].endswith(b"vn 0 0 1\n") and data[end:].startswith(b"f ")
+
+
+def test_profile_grid_is_symmetric_and_bounded():
+    vol = np.zeros((64, 64, 64), np.float32)
+    P = np.array([[32.0, 32.0, 32.0]]); N = np.array([[0.0, 0.0, 1.0]])
+    _, t, _ = spa.read_profiles(vol, P, N, half=8, step=1.5, sigma=1.0, workers=1)
+    assert t.min() >= -8 and t.max() <= 8 and 0.0 in t
+    assert np.allclose(t, -t[::-1])

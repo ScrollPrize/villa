@@ -460,3 +460,25 @@ def test_url_input_is_zarr_unless_it_names_a_tif():
     assert _is_zarr("s3://bucket/vol")
     assert not _is_zarr("https://host/label.tif")
     assert not _is_zarr("https://host/label.TIFF")
+
+
+def test_tif_url_is_fetched_and_decoded(monkeypatch, tmp_path):
+    import io
+    arr = (np.arange(27, dtype=np.uint8) % 2).reshape(3, 3, 3)
+    tifffile.imwrite(tmp_path / "x.tif", arr)
+    payload = (tmp_path / "x.tif").read_bytes()
+    seen = []
+
+    class Resp(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda url: (seen.append(url), Resp(payload))[1])
+    out = lta.open_volume("https://host/label.tif?x=1")
+    assert seen == ["https://host/label.tif?x=1"] and np.array_equal(out, arr)
+
+
+def test_threshold_values_that_share_a_crop_name_are_refused():
+    with pytest.raises(ValueError, match="collide"):
+        lta.parse_thresholds("0.5000001,0.5000002")
+    assert lta.parse_thresholds("0.5,0.6") == [0.5, 0.6]

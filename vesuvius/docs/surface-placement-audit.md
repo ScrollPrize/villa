@@ -48,7 +48,8 @@ vesuvius.surface_placement_audit --surface seg_a.obj seg_b/ --volume ct.zarr \
   rather than a peak, counts as no peak.
 - `--workers` (8): threads for volume reads. `--seed` fixes the sample.
 - `--cache DIR`: keep every CT chunk read as a `.npy` under `DIR` (one
-  subdirectory per volume shape, chunking and dtype). A rerun against the same
+  subdirectory per volume source and level, plus its shape, chunking and
+  dtype; a local file also keys on size and mtime). A rerun against the same
   remote volume, or the next surface on it, then reads from disk. A pass over
   the public Scroll 1 segments at 20000 samples fills roughly 20–40 GB.
 

@@ -383,8 +383,8 @@ def flat_keys() -> list[str]:
 
 def _is_zarr(src: str) -> bool:
     s = str(src)
-    if "://" in s:  # a URL is zarr unless it names a tif
-        return not s.lower().endswith((".tif", ".tiff"))
+    if "://" in s:  # a URL is zarr unless its path names a tif
+        return not s.split("?", 1)[0].lower().endswith((".tif", ".tiff"))
     return s.rstrip("/").endswith(".zarr") or (Path(s) / ".zarray").exists() \
         or (Path(s) / ".zattrs").exists() or (Path(s) / "zarr.json").exists()
 
@@ -393,6 +393,11 @@ def open_volume(src: str, level: str = "0"):
     """Return an array-like with .shape/.ndim/__getitem__ for a .tif file or a zarr array/group."""
     if not _is_zarr(src):
         import tifffile
+        if "://" in str(src):  # a tif URL: fetch it whole, tifffile reads paths and file objects only
+            import io
+            from urllib.request import urlopen
+            with urlopen(str(src)) as r:
+                return tifffile.imread(io.BytesIO(r.read()))
         return tifffile.imread(src)
     try:
         import zarr
@@ -469,6 +474,9 @@ def parse_thresholds(spec: str | None) -> list[float] | None:
         raise ValueError(f"--threshold expects numbers separated by commas, got {spec!r}")
     if not vals:
         raise ValueError("--threshold is empty")
+    names = [f"{v:g}" for v in vals]
+    if len(set(names)) != len(names):
+        raise ValueError(f"--threshold values collide in crop names ({', '.join(names)}): keep them distinct at 6 digits")
     return vals
 
 

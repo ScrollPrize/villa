@@ -123,6 +123,13 @@ def _vertex_region_end(reader, size: int, probe: int = 4096) -> int:
             return False
         return all(ln.startswith((b"v ", b"vn ")) for ln in lines)
 
+    if size <= 2 * probe:  # small file: scan it whole, no bisection
+        blob, pos = reader(0, size), 0
+        for ln in blob.split(b"\n"):
+            if not ln.startswith((b"v ", b"vn ", b"#")):
+                break
+            pos += len(ln) + 1
+        return min(pos, size)
     lo, hi = 0, size
     if not is_vertex_block(0):
         # header comments first: skip ahead a little
@@ -308,7 +315,9 @@ def read_profiles(vol, P: np.ndarray, N: np.ndarray, half: float, step: float, s
     """
     from scipy import ndimage as ndi
 
-    t = np.arange(-half, half + step / 2, step)
+    # symmetric grid through zero, bounded by half (np.arange would overshoot for a non-integer ratio)
+    pos_t = np.arange(0, half + 1e-9, step)
+    t = np.concatenate([-pos_t[:0:-1], pos_t])
     shape = np.asarray(vol.shape[-3:])
     pad = int(math.ceil(half + 3 * sigma + 2))
     prof = np.full((len(P), len(t)), np.nan, np.float32)
@@ -344,7 +353,8 @@ def nearest_peak(prof: np.ndarray, t: np.ndarray, min_contrast: float, min_promi
     """Offset of the nearest local maximum of each profile to t=0, and its contrast.
 
     A peak counts when the profile range is at least ``min_contrast`` and the peak
-    rises at least ``min_prominence`` x range above the lower of its two flanking minima.
+    rises at least ``min_prominence`` x range above the higher of its two flanking minima
+    (the prominence, so a shoulder on a bigger peak does not count).
     Returns (offset, contrast, valid); offset is NaN when no peak qualifies.
     """
     n, m = prof.shape
