@@ -1,4 +1,5 @@
 """Validation and README updates for the augmentation benchmark harness."""
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import sys
@@ -9,24 +10,36 @@ from unittest.mock import patch
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-from bench_augmentations import compare, constructor, inputs, planar_recipe, recipes, update_readme, workload
+from bench_augmentations import compare, update_readme
+from augmentation_cases import CASES, input_sample
 from bench_pipeline import load_extensions
 
 
 class AugmentationBenchmarkTests(unittest.TestCase):
-    def test_planar_recipes_and_targets(self):
-        image = np.ones((1, 7, 9), dtype=np.float32)
-        sample = inputs(image)
-        self.assertEqual(sample['image']['image'].shape, (1, 7, 9))
-        self.assertEqual(sample['both']['mask'].shape, (1, 7, 9))
-        self.assertEqual(sample['channels']['image'].shape, (2, 7, 9))
-        self.assertEqual(sample['surface']['surface'].shape, (3, 7, 9))
-        self.assertEqual(planar_recipe('CLAHE', 'A.CLAHE(tile_shape=(3, 4, 5))'),
-                         'A.CLAHE(tile_shape=(4, 5))')
-        self.assertEqual(planar_recipe('OrientedBlur', 'A.OrientedBlur(axis=(1, 0, 0))'),
-                         'A.OrientedBlur(axis=(1, 0))')
-        self.assertEqual(planar_recipe('StripeMasking', "A.StripeMasking(axes='zyx')"),
-                         "A.StripeMasking(axes='yx')")
+    def test_cases_run_on_planar_and_volume_inputs(self):
+        directory = os.environ.get('VC_READER_NATIVE_DIR')
+        if directory:
+            load_extensions(Path(directory))
+        from vc_reader import augment as A, cuda
+        backends = ['cpu', 'cuda'] if cuda.is_available() else ['cpu']
+        for dims in (2, 3):
+            image = np.random.default_rng(123).random((1,) + (16,) * dims, dtype=np.float32)
+            reference = np.ascontiguousarray(image[..., ::-1])
+            for case in CASES:
+                for backend in backends:
+                    with self.subTest(case=case.name, dims=dims, backend=backend):
+                        source = input_sample(image, case.sample)
+                        original = {key: value.copy() for key, value in source.items()}
+                        transform = case.construct(A, reference, dims)
+                        pipeline = A.Pipeline([transform], backend=backend,
+                            targets=dict(image=A.Image(), mask=A.Label(), surface=A.CoordinateField()))
+                        output = pipeline(source, seed=123)
+                        self.assertEqual(output.keys(), source.keys())
+                        for key, value in output.items():
+                            self.assertEqual(value.ndim, source[key].ndim)
+                            self.assertEqual(value.dtype, source[key].dtype)
+                            self.assertTrue(np.isfinite(value).all())
+                            np.testing.assert_array_equal(source[key], original[key])
 
     def test_native_override_is_idempotent(self):
         import importlib.machinery
@@ -53,23 +66,31 @@ class AugmentationBenchmarkTests(unittest.TestCase):
             with self.assertRaises(AssertionError):
                 compare(bad, source)
 
-    def test_recipes_and_input_routing(self):
-        readme = Path(__file__).resolve().parents[1] / 'README.md'
-        selected = recipes(readme)
-        image = np.arange(64, dtype=np.float32).reshape(1, 4, 4, 4)/63
-        samples = inputs(image)
-        for name in selected:
-            self.assertIn(workload(name).sample, samples)
-        np.testing.assert_array_equal(samples['both']['mask'], image > .5)
-        np.testing.assert_array_equal(samples['strip']['image'], image[:, 2])
-        self.assertEqual(samples['channels']['image'].shape, (2, 4, 4, 4))
-        self.assertEqual(samples['surface']['surface'].shape, (3, 4, 4))
-        augment = SimpleNamespace(__all__=['Example'], Example=lambda *a, **k: (a, k))
-        self.assertEqual(constructor('Example', 'A.Example(reference, strength=.5)', 'ref', augment),
-                         (('ref',), {'strength': .5}))
-        for unsafe in ('other.Example()', 'A.Example(open("file"))', 'A.Example(**{})'):
-            with self.assertRaises(ValueError):
-                constructor('Example', unsafe, 'ref', augment)
+    def test_input_routing_and_image_allocation(self):
+        for shape in ((1, 4, 6), (1, 3, 4, 6)):
+            image = np.linspace(0, 1, np.prod(shape), dtype=np.float32).reshape(shape)
+            # Image-only cases must not allocate labels, duplicated channels or surfaces.
+            with patch('numpy.indices', side_effect=AssertionError('surface allocated')), \
+                 patch('numpy.concatenate', side_effect=AssertionError('channels allocated')):
+                self.assertIs(input_sample(image, 'image')['image'], image)
+            mask = input_sample(image, 'both')['mask']
+            self.assertEqual(mask.dtype, np.int16)
+            np.testing.assert_array_equal(mask, image > .5)
+            np.testing.assert_array_equal(input_sample(image, 'labels')['mask'], mask)
+            binary = input_sample(image, 'binary')['image']
+            self.assertEqual(binary.dtype, np.float32)
+            np.testing.assert_array_equal(binary, mask)
+            channels = input_sample(image, 'channels')['image']
+            np.testing.assert_array_equal(channels, np.concatenate([image, image]))
+            plane = image if image.ndim == 3 else image[:, 1]
+            np.testing.assert_array_equal(input_sample(image, 'strip')['image'], plane)
+            surface = input_sample(image, 'surface')['surface']
+            self.assertEqual(surface.dtype, np.float32)
+            np.testing.assert_array_equal(surface[0], plane[0] * 2)
+            np.testing.assert_array_equal(surface[1], np.broadcast_to(np.arange(4)[:, None], (4, 6)))
+            np.testing.assert_array_equal(surface[2], np.broadcast_to(np.arange(6), (4, 6)))
+        with self.assertRaises(ValueError):
+            input_sample(image, 'unknown')
 
     def test_timing_update_preserves_recipes_and_images(self):
         text = '''<details>

@@ -277,8 +277,8 @@ retain commands, configuration, extension hashes, raw timings and comparisons.
 
 Reproduce with the existing environment/builds (no installation). Use
 `/tmp/vc-median-before` for the saved baseline, and distinct report paths for
-repetitions. `--plane` reads a single Z plane and adapts the catalog recipes
-and their targets to 2D; it cannot update the cubic-volume README timing tables.
+repetitions. `--plane` reads a single Z plane and uses explicit planar case
+parameters and 2D targets; it cannot update the cubic-volume README timing tables.
 
 ```bash
 AGENTS_AGENT_MODE=1 cmake --build /tmp/vc-reader-cuda --target _augment --parallel 4
@@ -851,17 +851,21 @@ AGENTS_AGENT_MODE=1 .venv/bin/python benchmarks/bench_cuda_geometry.py \
 
 [`bench_augmentations.py`](bench_augmentations.py) measures all **61** README
 recipes (59 volume examples and two 2D companions) on CPU, CUDA with host
-inputs/outputs, and CUDA with resident inputs/outputs. Recipe parsing and sample
-construction are shared with preview generation in `scripts/augment_examples.py`;
-there is no second hand-maintained transform list. This command updates only
-timing rows, preserving recipes, descriptions, images and the Elastic video.
+inputs/outputs, and CUDA with resident inputs/outputs. Explicit parameters,
+2D overrides, and input construction live in
+[`augmentation_cases.py`](augmentation_cases.py), shared with
+[`generate_augment_previews.py`](generate_augment_previews.py). Only the current
+case's input variant is constructed; preparation is outside the timed calls.
+The README is a documentation/output destination, not executable configuration.
+This command updates only timing rows, preserving recipes, descriptions, images
+and the Elastic video.
 
 The real PHercParis4 level-2 image starts at `(9000, 3600, 3600)`, is 128³, and
 is divided by 255 to float32. The reference image starts 384 voxels farther along
 Z. Masks are int16 CT > 0.5; geometric cases route both images and labels,
 ChannelMisalignment uses two identical image channels, and the two companions
 use a central slice or CT-derived coordinate surface. These match the README
-preview helpers and the previous catalog's workload construction.
+preview workloads.
 
 One CPU thread, `compact=True`, one warmup and five measured calls per route,
 seeds 123–127; case and backend orders are deterministically shuffled. All calls
@@ -895,8 +899,22 @@ AGENTS_AGENT_MODE=1 .venv/bin/python tests/test_augment_benchmark.py -v
 
 Use `--only Elastic Gamma` for a subset, and omit `--update-readme` to inspect a
 report first. NumPy and the existing reader/augmentation extensions suffice;
-preview rendering still uses Pillow. The new harness tests verify numerical
-failure detection, exact large integer comparisons, safe recipe parsing, input
+preview rendering uses Pillow. With the existing reader/augmentation build
+available, regenerate selected previews and their provenance using:
+
+```bash
+PYTHONPATH=src:benchmarks .venv/bin/python benchmarks/generate_augment_previews.py \
+  --array "$VC_BENCH_VOLUME" --level 2 --start 9000 3600 3600 \
+  --only Elastic Gamma --output /tmp/augment-previews \
+  --manifest /tmp/augment-previews.json
+```
+
+Both tools construct transforms directly from `augmentation_cases.py`. Reports
+record the resolved parameters and the case module's SHA256. Update explicit
+cases and README snippets together when changing gallery settings.
+
+The harness tests verify numerical
+failure detection, exact large integer comparisons, 2D/3D case execution, input
 routing, and timing-row updates without modifying recipes/images.
 The shared native-build loader is idempotent so combined unittest discovery
 does not re-register native types. Run the complete regression suite with:
@@ -1570,10 +1588,10 @@ columns and rows respectively. Previous surface timing tables used the opposite
 axis interpretation; their selected UV requests and hashes are not comparable
 to new runs. The volume reader workload still samples one surface layer.
 
-## Composable training workflows
+## Training integration benchmark
 
-`bench_training.py` shares the example-owned Dataset and input recipes from
-`scripts/training_workflows.py` and `scripts/training_inputs.py`. It compares
+`bench_training.py` uses the benchmark-owned Dataset and input fixtures in
+`training_support.py` and `training_inputs.py`. It compares
 reader and Dataset overhead, then measures default collation, host pinning,
 upload, resident augmentation and persistent-worker epochs separately. Each
 workload has six fixed requests, two warmup passes and ten measured passes.
@@ -1584,7 +1602,7 @@ Run `--help` for workflow names and options. Exact real IDs, independent
 comparisons, reproduction commands, measured costs and real volume-transfer
 acceptance are recorded in
 [training workflow acceptance](../docs/training-workflow-benchmarks.md).
-The [usage guide](../docs/training-workflows.md) documents cache budgets, field
+The [benchmark guide](training.md) documents cache budgets, field
 semantics, layer validity, seeds, process cleanup and optional dependencies.
 
 ## Fiber trainer comparison

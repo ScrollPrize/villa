@@ -1,4 +1,4 @@
-"""Exercise example-owned integration, without adding a package Dataset API."""
+"""Exercise benchmark-owned integration, without adding a package Dataset API."""
 from dataclasses import replace
 import json
 import os
@@ -9,8 +9,8 @@ import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from training_workflows import (Array, TrainingDataset, augment_cpu_sample, cpu_batches, data_loader,
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
+from training_support import (Array, TrainingDataset, augment_cpu_sample, cpu_batches, data_loader,
                                 image_arrays, load_native, pipeline, restore_layers, select_arrays)
 load_native()
 import numpy as np
@@ -219,9 +219,9 @@ class TrainingTests(unittest.TestCase):
             for key in arrays:
                 np.testing.assert_allclose(actual[key][0].cpu().numpy(), result[key], rtol=1e-6, atol=1e-6)
 
-    def test_catalog_and_example_import_without_torch_numpy(self):
-        code = "import sys; import vc_reader; import training_workflows; assert 'torch' not in sys.modules; assert 'numpy' not in sys.modules"
-        environment = {**os.environ, 'PYTHONPATH': os.pathsep.join(['src', 'scripts'])}
+    def test_catalog_and_benchmark_import_without_torch_numpy(self):
+        code = "import sys; import vc_reader; import training_support; assert 'torch' not in sys.modules; assert 'numpy' not in sys.modules"
+        environment = {**os.environ, 'PYTHONPATH': os.pathsep.join(['src', 'benchmarks'])}
         subprocess.run([sys.executable, '-c', code], env=environment, check=True, timeout=30,
                        cwd=Path(__file__).resolve().parents[1])
 

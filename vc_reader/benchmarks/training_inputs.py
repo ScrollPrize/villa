@@ -1,18 +1,18 @@
-"""Explicit input recipes shared by the training example and its benchmarks.
+"""Explicit input fixtures for the training benchmark and its validation tests.
 
 Local analytic arrays exercise registration; they are never reported as real
 annotation acceptance. Published selections pin IDs and caller-owned regions.
 """
 from dataclasses import replace
 import json
-from training_workflows import Array, ReadSpec, image_arrays, label_arrays
+from training_support import Array, ReadSpec, image_arrays, label_arrays
 
 PAIRED_STARTS = ((18576, 7984), (19344, 14192), (19856, 15696),
                  (20496, 13232), (22128, 11472), (23152, 7984))
 
 
 def write_array(path, values, axes):
-    """Write tiny uncompressed deterministic example inputs, one chunk each."""
+    """Write tiny uncompressed deterministic benchmark inputs, one chunk each."""
     path.mkdir(parents=True, exist_ok=True)
     (path / '.zarray').write_text(json.dumps(dict(zarr_format=2, shape=values.shape,
         chunks=values.shape, dtype=values.dtype.str, compressor=None, filters=None,
@@ -112,7 +112,7 @@ def build_workflow(name, root, metadata=None):
 
     catalog = load(metadata) if metadata else load()
     if name == 'paired':
-        from paired_reading import discover
+        from bench_paired import discover
         label, image = discover(catalog)
         return ([ReadSpec(label, mode='paired', image=image, layers=slice(40, 65))],
                 [(0, start, (128, 128)) for start in PAIRED_STARTS],

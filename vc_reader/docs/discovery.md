@@ -100,15 +100,8 @@ before projection; geometry headers may supply the surface grid's UV mapping.
 Published coverage describes the segment and does not guarantee coverage of
 any particular crop. Native ownership stays separate from mapped destinations.
 
-Enumerate actual published labels without opening arrays:
-
-```bash
-PYTHONPATH=src .venv/bin/python scripts/discovery_examples.py --metadata /path/to/metadata.bin
-```
-
-Optional `--sample`, `--segment`, and `--volume` select sample, segment, and
-native ownership. The [training example](training-workflows.md) implements the
-complete `published-transfer` read with both scans and projected annotations.
+The [training benchmark](../benchmarks/training.md) exercises the complete
+`published-transfer` read with both scans and projected annotations.
 
 ## CT resolution candidates
 
@@ -213,10 +206,10 @@ views also preserves those relationships.
 
 ## Run and verify
 
-Run [`scripts/paired_reading.py`](../scripts/paired_reading.py) with `--metadata`
-and optionally `--native-dir` pointing to an existing build. It discovers the
-acceptance pair, reads the fixed crop, verifies all arrays independently, and
-asserts 9,926 nonzero ink pixels. `--backend cuda` repeats on CUDA.
+[`benchmarks/bench_paired.py`](../benchmarks/bench_paired.py) discovers the
+acceptance pair and verifies six fixed crops against independently opened
+arrays. Supply `--metadata`, `--native-dir`, `--cache-dir`, and `--output`;
+`--backend cuda` repeats on CUDA.
 The CLI supports `samples`, `scrolls`, `volumes`, `labels`, `segments`, `images`,
 and `representations`; `volumes --resolution 8 --rel-tol .02 --resolve` validates
 header selections. See [exact test/benchmark commands and results](scroll-reading-benchmarks.md).

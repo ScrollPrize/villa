@@ -1,4 +1,4 @@
-"""Caller-owned Dataset → default collation → CPU/CUDA augmentation examples.
+"""Training benchmark support: Dataset, collation and CPU/CUDA augmentation.
 
 No random region selection or supervision policy is implemented here. Importing
 this module does not import Torch; only loader construction requires it.
@@ -14,8 +14,6 @@ def load_native(directory=None):
     """Use an existing build, including in spawned workers; never install it."""
     directory = directory or os.environ.get('VC_READER_NATIVE_DIR')
     if directory:
-        import sys
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
         from bench_pipeline import load_extensions
         load_extensions(Path(directory))
 
@@ -106,7 +104,7 @@ def select_arrays(sample, arrays):
 
 
 class TrainingDataset:
-    """Map-style example Dataset with explicit (reader_index, start, size) requests.
+    """Map-style benchmark Dataset with explicit (reader_index, start, size) requests.
 
     One decoded chunk budget is shared by all readers in each process. Sampling
     and plan budgets are per reader. Use spawn when the parent has opened data.
@@ -245,58 +243,3 @@ def cpu_batches(loader, augmentation):
         samples = [augment_cpu_sample(augmentation, {key: batch[key][i] for key in augmentation.targets}, seed=int(seed))
                    for i, seed in enumerate(batch['seed'].tolist())]
         yield {**batch, **default_collate(samples)}
-
-
-def main():
-    import argparse
-    import json
-    import tempfile
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('workflow', choices=('paired', 'custom', 'ct', 'registered', 'transfer', 'render', 'project', 'local-render', 'local-project', 'published-target', 'published-transfer'))
-    parser.add_argument('--metadata')
-    parser.add_argument('--native-dir')
-    parser.add_argument('--cache-dir', default='/tmp/vc-reader-paired-cache')
-    parser.add_argument('--offline', action='store_true')
-    parser.add_argument('--backend', choices=('cpu', 'cuda'), default='cpu')
-    parser.add_argument('--workers', type=int, default=2)
-    parser.add_argument('--batch-size', type=int, default=2)
-    parser.add_argument('--epochs', type=int, default=2)
-    parser.add_argument('--threads', type=int, default=1)
-    parser.add_argument('--torch-threads', type=int, default=1)
-    parser.add_argument('--memory-cache-mib', type=int, default=64)
-    args = parser.parse_args()
-    if args.workflow in ('project', 'published-transfer') and args.batch_size != 1:
-        parser.error('project crops have geometry-dependent shapes; use --batch-size 1')
-    load_native(args.native_dir)
-    import torch
-    torch.set_num_threads(args.torch_threads)
-    from training_inputs import build_workflow
-    with tempfile.TemporaryDirectory(prefix='vc-training-') as directory:
-        specs, requests, arrays, dimensions, provenance = build_workflow(args.workflow, Path(directory), args.metadata)
-        with TrainingDataset(specs, requests, arrays, seeds=range(100, 100 + len(requests)),
-                             memory_cache_bytes=args.memory_cache_mib << 20, threads=args.threads,
-                             cache_dir=args.cache_dir, offline=args.offline, native_dir=args.native_dir) as dataset:
-            # Rich provenance stays outside collation. Geometry/frame outputs are
-            # inspectable without converting them to training policy.
-            first = dataset.read_sample(0)
-            print(json.dumps({'inputs': provenance, 'sample_metadata': first.metadata}, default=str))
-            augmentation = pipeline(arrays, spatial_dims=dimensions, backend=args.backend)
-            with data_loader(dataset, batch_size=args.batch_size, workers=args.workers,
-                             pin_memory=args.backend == 'cuda') as loader:
-                if args.backend == 'cuda':
-                    from vc_reader.torch import CudaLoader
-                    batches = CudaLoader(loader, augmentation, seed_key='seed')
-                for epoch in range(args.epochs):
-                    iterator = iter(batches) if args.backend == 'cuda' else cpu_batches(loader, augmentation)
-                    try:
-                        for batch in iterator:
-                            shapes = {name: tuple(batch[name].shape) for name in arrays}
-                            if arrays['image'].layers:
-                                shapes['restored_image'] = tuple(restore_layers(batch).shape)
-                            print(json.dumps(dict(epoch=epoch, indices=batch['index'].tolist(), shapes=shapes)))
-                    finally:
-                        iterator.close()
-
-
-if __name__ == '__main__':
-    main()

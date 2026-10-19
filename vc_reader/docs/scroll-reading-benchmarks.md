@@ -115,17 +115,9 @@ validity work. Profiling overhead is excluded from the timing table.
 
 ## Reproduce with existing environments
 
-From `vc_reader/`, run the independently verified pair example:
-
-```bash
-AGENTS_AGENT_MODE=1 PYTHONPATH=src .venv/bin/python scripts/paired_reading.py \
-  --metadata /home/sean/.cache/vc_reader/metadata-cff196b7c8a57b2d.bin \
-  --native-dir build/cp314-cp314-linux_x86_64
-```
-
-Repeat with `--native-dir /tmp/vc-reader-cuda --backend cuda`. The example's
-cache defaults to `/tmp/vc-reader-paired-cache` and can be selected explicitly.
-A network connection is needed to populate missing public data.
+From `vc_reader/`, run the discovery and independently verified paired-read
+benchmarks. Use `--native-dir /tmp/vc-reader-cuda --backend cuda` for CUDA paired
+reads. A network connection is needed to populate missing public data.
 
 ```bash
 AGENTS_AGENT_MODE=1 PYTHONPATH=src .venv/bin/python benchmarks/bench_discovery.py \

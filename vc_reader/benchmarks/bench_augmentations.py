@@ -1,6 +1,6 @@
-"""Time every README augmentation on the same real CT crop, without rendering.
+"""Time explicit augmentation cases on the same real CT crop, without rendering.
 
-Reuses the preview recipe/input helpers. CPU, CUDA uploaded and CUDA resident
+Shares cases with preview generation. CPU, CUDA uploaded and CUDA resident
 use synchronous public calls; output validation and disposal are not timed.
 """
 import argparse
@@ -18,10 +18,9 @@ import time
 import numpy as np
 
 from bench_pipeline import environment, load_extensions, nonnegative, positive, summary
+from augmentation_cases import CASES, input_sample
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / 'scripts'))
-from augment_examples import constructor, inputs, planar_recipe, recipes, workload
 
 
 def fingerprint(sample):
@@ -77,12 +76,12 @@ def main():
     parser.add_argument('--start', type=int, nargs=3, default=(9000, 3600, 3600))
     parser.add_argument('--size', type=positive, default=128)
     parser.add_argument('--plane', action='store_true',
-                        help='read one Z plane and adapt catalog recipes to 2D; record adapted recipes')
+                        help='read one Z plane and use explicit 2D case parameters')
     parser.add_argument('--reps', type=positive, default=5)
     parser.add_argument('--warmup', type=positive, default=1)
     parser.add_argument('--seed', type=nonnegative, default=123)
     parser.add_argument('--only', nargs='+')
-    parser.add_argument('--readme', type=Path, default=ROOT / 'README.md')
+    parser.add_argument('--readme', type=Path, default=ROOT / 'README.md', help='destination for --update-readme')
     parser.add_argument('--update-readme', action='store_true', help='replace timing rows after validation')
     parser.add_argument('--allow-differences', action='store_true', help='retain and report numerical mismatches')
     parser.add_argument('--output', type=Path, required=True)
@@ -95,13 +94,12 @@ def main():
     from vc_reader.reader import ZarrReader
     if not cuda.is_available():
         parser.error('CUDA reader and augmentation builds and a device are required')
-    selected = recipes(args.readme)
+    selected = {case.name: case for case in CASES}
     if args.only:
         if set(args.only)-selected.keys():
             parser.error('unknown augmentation name')
-        selected = {name: recipe for name, recipe in selected.items() if name in args.only}
-    if args.plane:
-        selected = {name: planar_recipe(name, recipe) for name, recipe in selected.items()}
+        selected = {name: case for name, case in selected.items() if name in args.only}
+    spatial_dims = 2 if args.plane else 3
     shape = (1, args.size, args.size) if args.plane else (args.size,)*3
     reference_start = (args.start[0]+384, *args.start[1:])
     with ZarrReader.open(args.array, level=args.level, threads=1) as reader:
@@ -115,7 +113,6 @@ def main():
     if args.plane:
         image = np.ascontiguousarray(image[:, 0])
         reference = np.ascontiguousarray(reference[:, 0])
-    samples = inputs(image)
     report = dict(command=[sys.executable, *sys.argv],
                   recorded_at=datetime.now(timezone.utc).isoformat(),
                   git_revision=subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
@@ -128,16 +125,17 @@ def main():
                            'reads, preparation, validation, output disposal and rendering excluded; '
                            'CUDA uploaded includes transfers; resident excludes initial upload/final download; '
                            'public-call input preservation and validation included',
-                  inputs={key: fingerprint(sample) for key, sample in samples.items()},
+                  inputs={},
                   reference_start=reference_start, reference=fingerprint({'reference': reference}),
-                  readme_sha256=hashlib.sha256(args.readme.read_bytes()).hexdigest(),
+                  cases_sha256=hashlib.sha256(Path(__file__).with_name('augmentation_cases.py').read_bytes()).hexdigest(),
                   validation=dict(atol=5e-5, rtol=1e-5, integer='exact', mismatched_cases=[]), results={})
     names = list(selected)
     random.Random(21017).shuffle(names)
     for name in names:
-        case = workload(name)
-        source = samples[case.sample]
-        transform = constructor(name, selected[name], reference, A)
+        case = selected[name]
+        source = input_sample(image, case.sample)
+        report['inputs'][case.sample] = fingerprint(source)
+        transform = case.construct(A, reference, spatial_dims)
         pipelines = {mode: A.Pipeline([transform], backend='cpu' if mode == 'cpu' else 'cuda',
                                      targets=dict(image=A.Image(), mask=A.Label(), surface=A.CoordinateField()))
                      for mode in ('cpu', 'cuda_host', 'cuda_resident')}
@@ -167,7 +165,7 @@ def main():
             del outputs
         if fingerprint(source) != report['inputs'][case.sample]:
             raise AssertionError(f'{name}: source mutated')
-        row = dict(recipe=selected[name], sample=case.sample,
+        row = dict(recipe=case.recipe(spatial_dims), sample=case.sample,
                    timings={mode: summary(values) for mode, values in measured.items()},
                    raw_ms=measured, comparisons=comparisons)
         mismatch = any(v['mismatched'] for item in comparisons for mode in ('cuda_host', 'cuda_resident')
@@ -178,7 +176,7 @@ def main():
         args.output.write_text(json.dumps(report, indent=2, allow_nan=False)+'\n')
         print(name, {mode: round(t['p50_ms'], 3) for mode, t in row['timings'].items()},
               'CPU/CUDA differences' if mismatch else 'validated', flush=True)
-        del pipelines, device
+        del pipelines, device, source
     if report['validation']['mismatched_cases'] and not args.allow_differences:
         raise SystemExit('Numerical differences recorded; inspect validation before publishing timings')
     if args.update_readme:

@@ -13,6 +13,13 @@ import time
 STARTS = ((18576, 7984), (19344, 14192), (19856, 15696), (20496, 13232), (22128, 11472), (23152, 7984))
 
 
+def discover(catalog):
+    from vc_reader import ScrollSource
+    scroll = ScrollSource('PHerc0009B', '20250820154339', catalog=catalog)
+    label = scroll.segments['20250919125754'].labels.ink(label_set='20260918')
+    return label, label.surface_volumes.zarr()
+
+
 def summary(times):
     return dict(mean_ms=statistics.mean(times), p50_ms=statistics.median(times),
                 p95_ms=statistics.quantiles(times, n=20, method='inclusive')[18] if len(times)>1 else times[0], samples_ms=times)
@@ -40,8 +47,6 @@ def main():
     from vc_reader import load, AmbiguousMatchError
     from vc_reader.cuda import asarray, is_available
     from vc_reader.reader import ZarrGroup, MemoryCache
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'scripts'))
-    from paired_reading import discover
     if args.backend == 'cuda' and not is_available():
         raise RuntimeError('CUDA device is unavailable')
     catalog = load(args.metadata)

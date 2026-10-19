@@ -13,8 +13,7 @@ import resource
 import sys
 import tempfile
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-from training_workflows import (TrainingDataset, augment_cpu_sample, cpu_batches, data_loader, load_native,
+from training_support import (TrainingDataset, augment_cpu_sample, cpu_batches, data_loader, load_native,
                                 pipeline, select_arrays)
 from training_inputs import build_workflow
 from bench_paired import summary, timed

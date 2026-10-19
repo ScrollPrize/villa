@@ -1,7 +1,7 @@
 """Generate the README's augmentation WebPs from a real Zarr crop.
 
-Recipes come from the README's A.Transform(...) examples, parsed as literal
-arguments (never eval). Requires vc-reader[reader,augment] and Pillow with WebP.
+Uses the explicit benchmark cases in augmentation_cases.py.
+Requires vc-reader[reader,augment] and Pillow with WebP.
 """
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import textwrap
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, features
 
-from augment_examples import constructor, inputs, recipes, workload
+from augmentation_cases import CASES, input_sample
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -161,19 +161,18 @@ def generate(args):
 
     if not features.check("webp"):
         raise ValueError("Pillow was built without WebP support")
-    selected = recipes(args.readme)
+    selected = {case.name: case for case in CASES}
     if args.only:
         missing = set(args.only) - selected.keys()
         if missing:
             raise ValueError("unknown augmentation names: " + ", ".join(sorted(missing)))
-        selected = {name: recipe for name, recipe in selected.items() if name in args.only}
+        selected = {name: case for name, case in selected.items() if name in args.only}
     with ZarrReader.open(args.array, level=args.level, threads=args.threads) as reader:
         if reader.ndim != 3:
             raise ValueError("input must be a 3-D Zarr array")
         shape = (args.size,) * 3
         start = args.start or [(n - args.size) // 2 for n in reader.shape]
-        # Keep the reference distinct when possible, matching the old gallery's
-        # +384 Z-voxel reference for 128-cubed inputs.
+        # Keep the reference distinct when possible: +384 Z voxels for 128-cubed inputs.
         reference_start = args.reference_start or [min(start[0] + 3 * args.size, reader.shape[0] - args.size), *start[1:]]
         for origin in (start, reference_start):
             if any(s < 0 or s + args.size > n for s, n in zip(origin, reader.shape)):
@@ -183,19 +182,18 @@ def generate(args):
         source_metadata = dict(shape=list(reader.shape), chunks=list(reader.chunks), dtype=str(reader.dtype))
     if not np.isfinite(image).all() or not np.isfinite(reference).all() or np.ptp(image) == 0:
         raise ValueError("choose a finite crop with visible CT signal (not constant background)")
-    sources = inputs(image)
     manifest = dict(array=args.array, level=args.level, source=source_metadata, start=start, reference_start=reference_start,
                     size=args.size, divisor=args.divisor, seed=args.seed, seed_trials=args.seed_trials,
-                    readme=str(args.readme), readme_sha256=hashlib.sha256(args.readme.read_bytes()).hexdigest(),
+                    cases_sha256=hashlib.sha256(Path(__file__).with_name('augmentation_cases.py').read_bytes()).hexdigest(),
                     image_sha256=hashlib.sha256(image.tobytes()).hexdigest(),
                     reference_sha256=hashlib.sha256(reference.tobytes()).hexdigest(),
                     extension_sha256=hashlib.sha256(Path(_augment.__file__).read_bytes()).hexdigest(), previews={})
     args.output.mkdir(parents=True, exist_ok=True)
-    for name, recipe in selected.items():
-        case = workload(name)
-        transform = constructor(name, recipe, reference, A)
+    for name, case in selected.items():
+        recipe = case.recipe()
+        transform = case.construct(A, reference)
         pipeline = A.Pipeline([transform], targets=dict(image=A.Image(), mask=A.Label(), surface=A.CoordinateField()), backend="cpu")
-        source = sources[case.sample]
+        source = input_sample(image, case.sample)
         best_score = -1
         for seed in range(args.seed, args.seed + args.seed_trials):
             result = pipeline(source, seed=seed)
@@ -232,13 +230,12 @@ def main():
     parser.add_argument("--level", help="array level within a Zarr group")
     parser.add_argument("--start", type=int, nargs=3, metavar=("Z", "Y", "X"), help="crop origin; default: volume center")
     parser.add_argument("--reference-start", type=int, nargs=3, metavar=("Z", "Y", "X"))
-    parser.add_argument("--size", type=int, default=128, help="cube edge; recipes use their literal README sizes")
+    parser.add_argument("--size", type=int, default=128, help="cube edge; cases retain their explicit sizes")
     parser.add_argument("--divisor", type=float, default=255, help="divide CT intensities by this value; use 1 for already normalized data")
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--seed-trials", type=int, default=5, help="select the most visibly changed seed deterministically")
     parser.add_argument("--threads", type=int, default=1)
-    parser.add_argument("--only", nargs="+", help="subset of README augmentation names")
-    parser.add_argument("--readme", type=Path, default=ROOT / "README.md")
+    parser.add_argument("--only", nargs="+", help="subset of augmentation case names")
     parser.add_argument("--output", type=Path, default=ROOT / "docs/augmentations/previews")
     parser.add_argument("--manifest", type=Path, help="optional JSON provenance: recipes, inputs, seeds, planes and hashes")
     args = parser.parse_args()

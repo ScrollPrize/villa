@@ -146,21 +146,9 @@ nsys stats --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,cuda_api_sum \
   --format csv /tmp/plan03-sampling-profile.nsys-rep
 ```
 
-The executable catalog example also opened PHercParis4 volume `20260411134726`
-level 2 through its published group metadata and read a `(16, 32, 32)` region
-using existing cached chunks, with cache writes disabled. Snapshot SHA-256:
-`de38ba456eedfa4e0c4c6d6b4e093f4664d635eae551bfbe923bbdf6dc4ec58d`.
+For interactive catalog selection and Zarr reads, use the
+[Zarr reader notebook](../examples/03_zarr_reader.ipynb).
 
-```bash
-AGENTS_AGENT_MODE=1 .venv/bin/python scripts/sampling_examples.py \
-  --metadata /home/sean/.cache/vc_reader/metadata-cff196b7c8a57b2d.bin \
-  --sample PHercParis4 --volume 20260411134726 --level 2 \
-  --slice 9000:9016 3600:3632 3600:3632 \
-  --cache-dir /mnt/raid_nvme/volume_cache --native-dir /tmp/vc-reader-cuda
-```
-
-Pass `--target name=source.json` for an explicitly registered user source or
-`--catalog-target name=source-id` for an explicitly chosen catalog descriptor.
 New surface-layer generation and volume projection remain
 [planned geometry work](../plans/04-surface-labels-and-projection.md). Reading
 published flattened render/label pairs is

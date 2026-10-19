@@ -129,11 +129,9 @@ AGENTS_AGENT_MODE=1 PYTHONPATH=src:benchmarks .venv/bin/python benchmarks/bench_
 
 AGENTS_AGENT_MODE=1 PYTHONPATH=src:benchmarks nsys profile --trace=cuda --sample=none --cpuctxsw=none --force-overwrite=true -o /tmp/plan04-projection-profile .venv/bin/python benchmarks/bench_surface.py --native-dir /tmp/vc-reader-cuda --backend cuda --label-source benchmarks/fixtures/surface_projection/label.json --reference-source benchmarks/fixtures/surface_projection/reference.json --start 18576 7984 --size 16 16 --cache-dir /tmp/vc-reader-surface-cache --offline --output /tmp/plan04-projection-profile.json
 nsys stats --report cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,cuda_gpu_mem_size_sum --format csv /tmp/plan04-projection-profile.nsys-rep
-
-AGENTS_AGENT_MODE=1 PYTHONPATH=src:benchmarks .venv/bin/python scripts/paired_reading.py --backend cuda --native-dir /tmp/vc-reader-cuda --offline
 ```
 
-Remove `--offline` for the first projection/paired run to populate its cache.
+Remove `--offline` for the first projection run to populate its cache.
 The default layer workload requires the local PHercParis4 volume path recorded
 in `bench_surface.py`. Reports include source descriptors, requests, raw timing
 samples, profiles, counters and output hashes. Generated local copies are saved

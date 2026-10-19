@@ -86,7 +86,7 @@ reading, CUDA augmentation, and mesh-segment rendering.
 | Source formats, storage and caches | [Source reading](docs/source-reading.md) |
 | Registered labels and fields | [Aligned sampling](docs/aligned-sampling.md) |
 | Surface layers and projecting ink into CT | [Surface sampling](docs/surface-sampling.md) |
-| DataLoader integration and worker lifecycle | [Training workflows](docs/training-workflows.md) |
+| Training integration measurements | [Training benchmark](benchmarks/training.md) |
 | Measurements and reproduction commands | [Benchmarks](benchmarks/README.md) |
 
 ## CT sheet normals

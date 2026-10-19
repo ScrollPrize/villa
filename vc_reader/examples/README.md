@@ -148,8 +148,8 @@ without a host round-trip. Training chunks use the same seed size as inference.
 Holding out a segment ID does not establish that different segments never cover
 overlapping physical sheet regions.
 
-For streaming datasets, persistent spawned workers, advanced field declarations,
-and detailed stage timings, see [training integration](../docs/training-workflows.md).
+For measurements of reading, collation, augmentation, and persistent spawned
+workers, see the [training benchmark](../benchmarks/training.md).
 
 ## Recorded validation
 

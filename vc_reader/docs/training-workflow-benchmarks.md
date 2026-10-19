@@ -5,7 +5,7 @@ Validated on 2026-10-18 with CPython 3.14.4, Linux amd64, Intel Core Ultra 7
 installed. Native kernels are unchanged; browsing now exposes `Asset.summary()`. The complete CPU suite
 passed **130 tests and 1,376 subtests**, with 22 CUDA skips. The complete CUDA
 suite passed **152 tests and 2,910 subtests**. Seven warnings concern existing
-fork-based tests; the new DataLoader examples use spawn.
+fork-based tests; the DataLoader benchmark uses spawn.
 
 ## Acceptance by workflow
 
@@ -14,8 +14,8 @@ SHA256 `55aa3d217732a3c75401765f7d425738a35fecab75baad6e4ef5cb8d8b9844e3`.
 Its canonical source-ID fingerprint is
 `de38ba456eedfa4e0c4c6d6b4e093f4664d635eae551bfbe923bbdf6dc4ec58d`.
 Input IDs, levels and six exact requests are encoded in
-[`training_inputs.py`](../scripts/training_inputs.py), shared by the runnable
-example and benchmark, and included in every generated JSON report.
+[`training_inputs.py`](../benchmarks/training_inputs.py), used by the benchmark
+and its validation tests, and included in every generated JSON report.
 
 | Workflow | Recorded evidence | Remaining acceptance |
 | --- | --- | --- |
@@ -189,7 +189,7 @@ counters separately and full provenance for both scans and annotations.
 
 ## Reproduce
 
-The [usage guide](training-workflows.md) lists source selections and optional
+The [benchmark guide](../benchmarks/training.md) lists source selections and optional
 dependencies. The linked plan overview was absent from this checkout; the
 six/two/ten protocol was taken from the plan text and existing reader reports.
 Use the existing builds without installation:
@@ -233,10 +233,9 @@ AGENTS_AGENT_MODE=1 PYTHONPATH=src:benchmarks .venv/bin/python benchmarks/bench_
   --offline --cuda --batch-size 1 --output /tmp/training-published-transfer.json
 ```
 
-The runnable training CLI was also checked using
-`--metadata benchmarks/fixtures/training/catalog.json`, two spawned workers,
-two epochs, batch size one and CUDA augmentation. Remove `--offline` for initial
-cache population.
+For a portable catalog selection, use
+`--metadata benchmarks/fixtures/training/catalog.json`. Remove `--offline` for
+initial cache population.
 
 For `ct`, use the `published-target` command with `ct` and a distinct output
 filename. For `custom`, `registered`, `transfer`, `local-render` and
