@@ -397,6 +397,16 @@ void ThemeManager::applyToApplication(const ResolvedTheme& theme, bool dark, con
     if (!_lookTouched)
         _systemDark = classicPrefersDark();
 
+    // While the main window has a style sheet of its own, every restyle below
+    // also matches each widget against it. Leaving Classic, the window drops
+    // its sheet first; entering Classic, it takes its sheet last. With a
+    // project open this halves the switch from Classic to Modern Dark.
+    const QString windowSheet =
+        theme.isClassic() && !theme.replaced ? classicWindowStyleSheet(dark) : QString();
+    _windowStyleSheet = windowSheet;
+    if (windowSheet.isEmpty())
+        emit windowStyleSheetChanged(windowSheet);
+
 #if QT_VERSION >= QT_VERSION_CHECK(6, 8, 0)
     // The flags change first: the platform may report the new scheme before
     // these calls return.
@@ -471,7 +481,8 @@ void ThemeManager::applyToApplication(const ResolvedTheme& theme, bool dark, con
     if (qApp->styleSheet() != styleSheetText)
         qApp->setStyleSheet(styleSheetText);
     _currentStyleSheet = styleSheet;
-    _windowStyleSheet = theme.isClassic() && !theme.replaced ? classicWindowStyleSheet(dark) : QString();
+    if (!windowSheet.isEmpty())
+        emit windowStyleSheetChanged(windowSheet);
 }
 
 void ThemeManager::persist(const QString& value) const

@@ -95,6 +95,11 @@ public:
     QString windowStyleSheet() const { return _windowStyleSheet; }
 
 signals:
+    // The main window's style sheet for the theme being applied. Emitted
+    // during each switch, before the application is restyled when the sheet
+    // is empty and after it otherwise, so Qt never restyles every widget
+    // against both sheets.
+    void windowStyleSheetChanged(const QString& styleSheet);
     void themeChanged(const QString& id);
     void themesChanged();
     // A live reload of the theme being edited failed; the last good version

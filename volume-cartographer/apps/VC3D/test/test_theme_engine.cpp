@@ -591,10 +591,21 @@ private slots:
         QCOMPARE(QApplication::palette(), startupPalette);
         QVERIFY(!manager.windowStyleSheet().isEmpty());
         QSignalSpy changed(&manager, &ThemeManager::themeChanged);
+        // Each window style sheet, and whether the application had a style
+        // sheet when it came.
+        QList<QPair<QString, bool>> windowSheets;
+        connect(&manager, &ThemeManager::windowStyleSheetChanged, &manager,
+                [&windowSheets](const QString& sheet) {
+                    windowSheets.append({sheet, !qApp->styleSheet().isEmpty()});
+                });
 
         QString error;
         QVERIFY2(manager.setTheme(QStringLiteral("modern-dark"), true, &error), qPrintable(error));
         QCOMPARE(changed.count(), 1);
+        // Leaving Classic, the window drops its sheet before the restyle.
+        QCOMPARE(windowSheets.size(), 1);
+        QVERIFY(windowSheets.last().first.isEmpty());
+        QVERIFY(!windowSheets.last().second);
         QCOMPARE(styleName().toLower(), QStringLiteral("fusion"));
         QCOMPARE(QApplication::palette().color(QPalette::Window), QColor("#161b22"));
         QVERIFY(qApp->styleSheet().contains(QStringLiteral("QMenuBar")));
@@ -622,6 +633,9 @@ private slots:
         QVERIFY(qApp->styleSheet().isEmpty());
         QVERIFY(!manager.windowStyleSheet().isEmpty());
         QCOMPARE(changed.count(), 3);
+        // Entering Classic, the window takes its sheet after the restyle.
+        QCOMPARE(windowSheets.last().first, manager.windowStyleSheet());
+        QVERIFY(!windowSheets.last().second);
     }
 
     void startupChoiceAndFallback()

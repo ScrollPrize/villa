@@ -2944,8 +2944,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     // The theme. Classic, the default, installs its dark palette here when the
     // system prefers dark; the window carries its gradient menu bar.
     auto& themes = vc3d::theme::ThemeManager::instance();
+    connect(&themes, &vc3d::theme::ThemeManager::windowStyleSheetChanged, this,
+            [this](const QString& styleSheet) { setStyleSheet(styleSheet); });
     connect(&themes, &vc3d::theme::ThemeManager::themeChanged, this, [this]() {
-        setStyleSheet(vc3d::theme::ThemeManager::instance().windowStyleSheet());
         // The project name label is sized to its text, so size it again once
         // the new theme's font has reached it.
         QTimer::singleShot(0, this, &CWindow::updateProjectNameLabel);
