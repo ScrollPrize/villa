@@ -141,22 +141,58 @@ together.
 
 ## Performance 
 
-**Zarr reading and sampling — median milliseconds per request:**
+**Zarr reading and sampling:**
 
-| Workload | zarr-python | TensorStore | vc_reader CPU | vc_reader CUDA |
-| --- | ---: | ---: | ---: | ---: |
-| Batch of 8 × 128³ crops | 14.158 | 4.894 | **1.147** | 4.796 |
-| Curved surface, 96 × 512 | 10.824 | 6.645 | **0.868** | 1.792 |
-| Rotated box, 128³ | 69.288 | 65.259 | 13.792 | **1.629** |
+Rows are sorted fastest first by aggregate Mvox/s across all workloads
+(total output voxels / total measured seconds). Each cell shows **total seconds**,
+**MB/s**, then **Mvox/s**.
 
 
-**Transform pipeline — median milliseconds per 128³ crop:**
+Each workload covers at least **5,000 distinct 128³ storage chunks** in nonzero
+regions of PHercParis4 level 2. Measured 2026-10-19 with eight reader threads.
+Total seconds sum all measured request durations across **five repetitions after
+one warmup pass**. Host decoded caches are disabled; CUDA chunks are cleared
+per request and host downloads are timed.
 
-| Work | CPU throughout | CPU read → CUDA processing |
-| --- | ---: | ---: |
-| 12 transforms only, excluding transfers | 146.465 | **0.673** |
-| Read + normalize + 12 transforms + CPU output | 149.723 | **1.833** |
+zarr-python and tensorstore used scipy for trilinear so the most direct raw read speed comps are the chunk based ones (batch and slab)
 
+| Reader | Batch, 8 × 128³ | Plane, 512² | Surface, 96 × 512 | Slab, 16 × 512² | Rotated box, 128³ |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| vc_reader CPU | 2.738 s<br>13,539.4 MB/s<br>13,539.4 Mvox/s | 3.631 s<br>557.3 MB/s<br>139.3 Mvox/s | 3.091 s<br>249.4 MB/s<br>62.3 Mvox/s | 0.910 s<br>9,283.8 MB/s<br>9,283.8 Mvox/s | 12.612 s<br>2,700.4 MB/s<br>675.1 Mvox/s |
+| vc_reader CUDA | 11.738 s<br>3,158.8 MB/s<br>3,158.8 Mvox/s | 3.578 s<br>565.6 MB/s<br>141.4 Mvox/s | 7.342 s<br>105.0 MB/s<br>26.2 Mvox/s | 4.504 s<br>1,876.4 MB/s<br>1,876.4 Mvox/s | 6.853 s<br>4,969.8 MB/s<br>1,242.4 Mvox/s |
+| TensorStore | 13.256 s<br>2,796.9 MB/s<br>2,796.9 Mvox/s | 34.737 s<br>58.3 MB/s<br>14.6 Mvox/s | 27.506 s<br>28.0 MB/s<br>7.0 Mvox/s | 5.968 s<br>1,416.2 MB/s<br>1,416.2 Mvox/s | 263.496 s<br>129.3 MB/s<br>32.3 Mvox/s |
+| zarr-python | 32.237 s<br>1,150.2 MB/s<br>1,150.2 Mvox/s | 59.458 s<br>34.0 MB/s<br>8.5 Mvox/s | 47.532 s<br>16.2 MB/s<br>4.1 Mvox/s | 12.356 s<br>684.0 MB/s<br>684.0 Mvox/s | 275.765 s<br>123.5 MB/s<br>30.9 Mvox/s |
+
+
+MB/s counts decimal output megabytes; Mvox/s counts output voxels. Box/slab
+outputs are uint8, and interpolated outputs are float32. Throughput uses the
+same total seconds shown above. See [benchmark details](benchmarks/README.md#reader-results)
+for median latencies, coverage, request counts, and reproduction settings.
+
+**Read + normalize + 12 transforms:**
+
+Rows are sorted fastest first by aggregate Mvox/s across all workloads.
+Each cell shows **total seconds**, **MB/s**, then **Mvox/s**.
+
+| Reader | Batch, 8 × 128³ | Plane, 512² | Surface, 96 × 512 | Slab, 16 × 512² | Rotated box, 128³ |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| vc_reader CUDA batched | 4.818 s<br>6,156.1 MB/s<br>1,539.0 Mvox/s | 0.747 s<br>542.1 MB/s<br>135.5 Mvox/s | 1.585 s<br>97.3 MB/s<br>24.3 Mvox/s | 2.074 s<br>3,260.3 MB/s<br>815.1 Mvox/s | 1.687 s<br>4,038.8 MB/s<br>1,009.7 Mvox/s |
+| vc_reader CUDA unbatched | 5.376 s<br>5,517.4 MB/s<br>1,379.3 Mvox/s | 0.759 s<br>533.0 MB/s<br>133.2 Mvox/s | 1.565 s<br>98.5 MB/s<br>24.6 Mvox/s | 2.147 s<br>3,149.5 MB/s<br>787.4 Mvox/s | 1.666 s<br>4,089.2 MB/s<br>1,022.3 Mvox/s |
+| vc_reader CPU | 515.514 s<br>57.5 MB/s<br>14.4 Mvox/s | 8.563 s<br>47.3 MB/s<br>11.8 Mvox/s | 3.989 s<br>38.6 MB/s<br>9.7 Mvox/s | 134.556 s<br>50.2 MB/s<br>12.6 Mvox/s | 120.389 s<br>56.6 MB/s<br>14.1 Mvox/s |
+
+Uses the **exact same accepted requests and 5,000+ chunk coverage** as the reader
+comparison. Measured 2026-10-19: **one complete timed pass after one complete
+warmup pass** per configuration. All outputs are float32; MB/s is four times
+Mvox/s. Timing includes reading, normalization, all twelve transforms,
+device batch assembly where applicable, and CUDA host downloads. Both CUDA
+modes use **reused pinned host buffers** prepared during warmup. Batched CUDA
+uses `Pipeline.batch()` per request: eight crops for ML and one otherwise.
+Unbatched CUDA and CPU apply transforms per crop. CPU measurements are retained
+from the matching full-coverage CPU run. See
+[pipeline benchmark details](benchmarks/README.md#pipeline-results) for validation
+and reproduction settings, and the
+[focused batching comparison](benchmarks/README.md#focused-cuda-batching-comparison)
+for transform-only timings and crop-size scaling.
 
 ## Examples and guides
 

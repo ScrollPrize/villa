@@ -24,6 +24,7 @@ import time
 import numpy as np
 
 from extension_build import load_extensions
+from reader_coverage import spread_workload
 
 
 def positive(value):
@@ -66,7 +67,12 @@ def arguments():
     parser.add_argument("--backend", choices=("cpu", "cuda", "both"), default="cpu")
     parser.add_argument("--shape", type=positive, nargs=3, default=(128, 128, 128), metavar=("Z", "Y", "X"))
     parser.add_argument("--start", type=float, nargs=3, help="first crop origin in source ZYX coordinates; default: centered")
-    parser.add_argument("--crops", type=positive, default=4, help="seeded requests per repetition (each ML request is a batch)")
+    parser.add_argument("--crops", type=positive, default=4,
+                        help="reader geometry templates/minimum requests; pipeline requests per repetition")
+    parser.add_argument("--min-unique-chunks", type=positive, default=5000,
+                        help="readers: minimum distinct sampled storage chunks per workload")
+    parser.add_argument("--xy-radius", type=nonnegative, default=1024,
+                        help="readers: maximum XY translation from templates, in voxels; Z sweeps span the volume")
     parser.add_argument("--jitter", type=float, default=32, help="origin jitter in voxels, clipped to in-bounds origins")
     parser.add_argument("--angle", type=float, default=10, help="rotation degrees: two coordinate planes in readers suite, YX in pipeline suite")
     parser.add_argument("--normalization", choices=("minmax", "zscore", "percentile", "robust"), default="minmax")
@@ -82,6 +88,12 @@ def arguments():
                         help="host includes final download; device leaves output ready for a GPU consumer")
     parser.add_argument("--device", type=nonnegative, default=0)
     parser.add_argument("--build-dir", type=Path, help="use both extensions from an existing CMake build, without installing")
+    parser.add_argument("--requests-from", type=Path,
+                        help="pipeline suite: replay the selected workloads from a schema-3 reader report")
+    parser.add_argument("--cuda-transforms", choices=("batched", "unbatched"), default="batched",
+                        help="pipeline replay: CUDA Pipeline.batch per request or individual per-crop calls")
+    parser.add_argument("--cuda-host-memory", choices=("pinned", "allocating"), default="pinned",
+                        help="pipeline replay host output: reuse pinned buffers or allocate each request")
     parser.add_argument("--output", type=Path, help="write complete JSON report, including raw measurements")
     args = parser.parse_args()
     if not np.isfinite(args.jitter) or args.jitter < 0 or not np.isfinite(args.angle):
@@ -92,6 +104,8 @@ def arguments():
         parser.error("--level requires --array")
     if (args.include_hybrid or args.pipeline_read != "affine") and args.suite != "pipeline":
         parser.error("--include-hybrid and --pipeline-read apply to --suite pipeline")
+    if args.requests_from and (args.suite != "pipeline" or args.include_hybrid or args.pipeline_read != "affine"):
+        parser.error("--requests-from requires --suite pipeline without --include-hybrid/--pipeline-read overrides")
     if args.include_hybrid and args.backend == "cpu":
         parser.error("--include-hybrid requires --backend cuda or both")
     if not np.isfinite(args.surface_coordinate_scale) or args.surface_coordinate_scale <= 0:
@@ -101,17 +115,20 @@ def arguments():
     return args
 
 
-def synthetic_array(path, shape, seed):
+def synthetic_array(path, shape, seed, min_chunks=0):
     """Write raw Zarr chunks with NumPy/stdlib only; generation is not timed."""
     path.mkdir()
     chunk = 32
     edge = ((2 * max(shape) + chunk - 1) // chunk + 1) * chunk
+    if min_chunks:
+        # Leave room for overlapping requests and in-bounds crop margins.
+        edge = max(edge, int(np.ceil((min_chunks * 4) ** (1 / 3))) * chunk)
     metadata = dict(zarr_format=2, shape=[edge] * 3, chunks=[chunk] * 3,
                     dtype="|u1", compressor=None, fill_value=0, order="C", filters=None)
     (path / ".zarray").write_text(json.dumps(metadata))
     rng = np.random.default_rng(seed)
     for index in itertools.product(range(edge // chunk), repeat=3):
-        rng.integers(0, 256, (chunk,) * 3, dtype=np.uint8).tofile(path / ".".join(map(str, index)))
+        rng.integers(1 if min_chunks else 0, 256, (chunk,) * 3, dtype=np.uint8).tofile(path / ".".join(map(str, index)))
     return str(path)
 
 
@@ -279,7 +296,7 @@ def surface_workload(args, volume_shape):
             from vc_reader.surface import _transform
             local, base = _transform(points[0], Affine.scale(args.surface_coordinate_scale), xyz_base)
             local = np.ascontiguousarray(local[...,::-1]); base = tuple(reversed(base))
-            shape = tuple(size)
+            shape = tuple(int(n) for n in size)
             lower = local.reshape(-1,3).min(axis=0)
             upper = local.reshape(-1,3).max(axis=0)
             if any(lo+b<0 or hi+b>n-1 for lo,hi,b,n in zip(lower,upper,base,volume_shape)):
@@ -356,17 +373,17 @@ def reading_benchmark(args):
     modes = (["cpu", "cuda"] if args.backend == "both" else [args.backend]) + list(dict.fromkeys(args.baselines))
     if "cuda" in modes and not cuda.is_available():
         raise ValueError("CUDA reader unavailable; use a CUDA build and accessible device")
-    report = dict(schema_version=2, suite="readers", command=[sys.executable, *sys.argv],
+    report = dict(schema_version=3, suite="readers", command=[sys.executable, *sys.argv],
                   config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
                   environment=environment(args), workloads={},
                   protocol=dict(included="request planning, allocation, reads, decode, interpolation, final CUDA download when selected",
-                                excluded="normalization, transform, setup, warmup, validation, destruction, cache clearing",
+                                excluded="normalization, transform, setup, workload placement, coverage/padding checks, warmup, validation, destruction, cache clearing",
                                 sampling="TensorStore/zarr read an enclosing ROI then SciPy order=1 samples matched float32 coordinates; vc_reader samples chunks directly",
                                 batching="ML: one vc_reader read_many call, concurrent TensorStore futures, zarr thread-pool reads; no pre-stacking",
                                 order="cyclic rotation of backend order each repetition",
                                 caches="warm OS cache; vc_reader/TensorStore use requested decoded-cache budgets; zarr has no added decoded cache",
                                 endpoints="all outputs on host except when --cuda-output=device",
-                                throughput="output voxels/bytes, not bytes fetched from storage",
+                                throughput="output voxels/bytes divided by summed timed request seconds; MB=10^6 bytes, Mvox=10^6 voxels; not storage bandwidth",
                                 speedup="baseline p50 / vc_reader p50; >1 means vc_reader is faster"))
     for package in ("tensorstore", "zarr", "scipy", "numcodecs", "tifffile"):
         try:
@@ -381,7 +398,7 @@ def reading_benchmark(args):
         if location is None:
             work = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="vc-readers-")))
             size = max(*args.shape, *args.plane_size, args.slab_depth)
-            location = synthetic_array(work / "input.zarr", (size,) * 3, args.seed)
+            location = synthetic_array(work / "input.zarr", (size,) * 3, args.seed, args.min_unique_chunks)
         location = location.rstrip("/") + "/" + args.level if args.level is not None else location
         host = stack.enter_context(ZarrReader.open(location, threads=args.threads, memory_cache=args.memory_cache_mib << 20))
         if host.ndim != 3 or host.dtype != np.uint8:
@@ -422,10 +439,11 @@ def reading_benchmark(args):
             return out, dict(read_sample=(ready-start)/1e6, download=(done-ready)/1e6 if mode == "cuda" and args.cuda_output == "host" else 0.,
                              total=(done-start)/1e6)
 
-        for name, requests in workloads.items():
+        for name, templates in workloads.items():
+            requests, coverage, placements = spread_workload(name, templates, host, args, sampling_box, coordinate_box)
             sampling = "surface" if name == "surface" else "affine" if name in ("plane", "rotated_box") else None
-            geometry = report["surface"]["tiles"] if sampling == "surface" else [[(shape, origin, axes.tolist()) for shape, origin, axes in batch] for batch in requests]
-            row = dict(requests=geometry, sampling=sampling,
+            geometry = placements if sampling == "surface" else [[(shape, origin, axes.tolist()) for shape, origin, axes in batch] for batch in requests]
+            row = dict(requests=geometry, sampling=sampling, coverage=coverage,
                        dtype="float32" if sampling else "uint8", validation=dict(atol=5e-5, rtol=1e-5, requests=[]), results={})
             for index, grids in enumerate(requests):
                 outputs = {}
@@ -449,6 +467,7 @@ def reading_benchmark(args):
                         errors.append(float(np.abs(a.astype(np.float64) - b).max()))
                     validation["comparisons"][mode] = dict(max_abs=max(errors))
                 row["validation"]["requests"].append(validation)
+            print(f"{name}: validated {len(requests)} requests across {len(modes)} readers", flush=True)
             for _ in range(args.warmup):
                 for grids in requests:
                     for mode in modes:
@@ -463,6 +482,7 @@ def reading_benchmark(args):
                         out, times = run(mode, grids, sampling)
                         records[mode].append(dict(repetition=rep, request=index, **times))
                         del out
+                print(f"{name}: timed repetition {rep + 1}/{args.reps} complete", flush=True)
             row["cache_stats"] = dict(before=before, after=dict(host=host.stats(), cuda=readers["cuda"].stats if "cuda" in modes else None))
             voxels = sum(int(np.prod(g[0])) for batch in requests for g in batch) * args.reps
             crops = sum(len(batch) for batch in requests) * args.reps
@@ -470,14 +490,18 @@ def reading_benchmark(args):
                 stages = [key for key in samples[0] if key not in ("repetition", "request")]
                 seconds = sum(s["total"] for s in samples) / 1000
                 row["results"][mode] = dict(timings={stage: summary([s[stage] for s in samples]) for stage in stages},
-                                           raw_ms=samples, samples=len(samples), requests_per_second=len(samples)/seconds,
+                                           raw_ms=samples, samples=len(samples), total_seconds=seconds, requests_per_second=len(samples)/seconds,
                                            crops_per_second=crops/seconds, mvoxels_per_second=voxels/seconds/1e6,
+                                           output_mbytes_per_second=voxels*np.dtype(row["dtype"]).itemsize/seconds/1e6,
                                            output_gib_per_second=voxels*np.dtype(row["dtype"]).itemsize/seconds/(1<<30))
             row["speedups"] = {f"{baseline}_over_{backend}": row["results"][baseline]["timings"]["total"]["p50_ms"] /
                                 row["results"][backend]["timings"]["total"]["p50_ms"]
                                 for backend in ("cpu", "cuda") if backend in modes
                                 for baseline in modes if baseline != backend}
             report["workloads"][name] = row
+            if args.output:
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                args.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
             print(f"{name}: validation passed; " + ", ".join(f"{mode}={row['results'][mode]['timings']['total']['p50_ms']:.3f} ms" for mode in modes), flush=True)
     return report
 
@@ -636,16 +660,20 @@ def benchmark(args):
 def main():
     args = arguments()
     try:
-        report = reading_benchmark(args) if args.suite == "readers" else benchmark(args)
+        if args.requests_from:
+            from pipeline_replay import benchmark_replay
+            report = benchmark_replay(args)
+        else:
+            report = reading_benchmark(args) if args.suite == "readers" else benchmark(args)
     except (ImportError, AttributeError, RuntimeError, ValueError, AssertionError) as exc:
         raise SystemExit(f"Benchmark failed: {exc}\nUse matching reader/transform extensions; --build-dir can select an existing build.") from exc
-    if args.suite == "readers":
-        print("Workload     Backend       mean ms     p50 ms     p95 ms      req/s     Mvox/s")
+    if "workloads" in report:
+        print("Workload     Backend       total s    mean ms     p50 ms     p95 ms      req/s       MB/s     Mvox/s")
         for name, workload in report["workloads"].items():
             for mode, result in workload["results"].items():
                 t = result["timings"]["total"]
-                print(f"{name:12} {mode:12} {t['mean_ms']:10.3f} {t['p50_ms']:10.3f} {t['p95_ms']:10.3f} "
-                      f"{result['requests_per_second']:10.2f} {result['mvoxels_per_second']:10.2f}")
+                print(f"{name:12} {mode:12} {result['total_seconds']:10.3f} {t['mean_ms']:10.3f} {t['p50_ms']:10.3f} {t['p95_ms']:10.3f} "
+                      f"{result['requests_per_second']:10.2f} {result['output_mbytes_per_second']:10.2f} {result['mvoxels_per_second']:10.2f}")
             print("Speedups (baseline/vc_reader): " + ", ".join(f"{key}={value:.2f}x" for key, value in workload["speedups"].items()))
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)
