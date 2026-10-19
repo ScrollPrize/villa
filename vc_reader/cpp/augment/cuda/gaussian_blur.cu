@@ -1,6 +1,6 @@
 #include "gaussian.cuh"
 namespace vcr::augment::cuda {
-template<class T> __global__ void convolution(const T* src, T* dst, Layout g, int axis, const T* weights, int radius, Boundary mirror) {
+template<class T> __device__ void convolution(KernelIndex vcr_launch, const T* src, T* dst, Layout g, int axis, const T* weights, int radius, Boundary mirror) {
     EACH_INDEX(g.size) {
         const auto x = g.coord(i, axis), base = i - x * g.stride[axis];
         T sum = 0;
@@ -9,12 +9,15 @@ template<class T> __global__ void convolution(const T* src, T* dst, Layout g, in
         dst[i] = sum;
     }
 }
+struct convolution_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { convolution(index,args...); }
+};
 // Extend a tile once, then reuse its samples for every tap. The contiguous
 // axis uses a row; other axes use 32 adjacent lines so global loads coalesce.
 // This removes per-output/per-tap boundary division and redundant global reads.
-template<class T, class Index, bool Contiguous>
-__global__ void convolution_tile(const T* src, T* dst, Index extent, Index stride,
-                                Index lines, const T* weights, int radius, Boundary edge) {
+template<class T, class Index, bool Contiguous, class Weights>
+__device__ void convolution_tile(KernelIndex vcr_launch, const T* src, T* dst, Index extent, Index stride,
+                                Index lines, const Weights& weights, int radius, Boundary edge) {
     extern __shared__ __align__(16) unsigned char storage[];
     T* tile = reinterpret_cast<T*>(storage);
     constexpr unsigned width = Contiguous ? 128 : 8;
@@ -22,7 +25,7 @@ __global__ void convolution_tile(const T* src, T* dst, Index extent, Index strid
     const Index chunks = (extent - 1) / width + 1;
     const std::size_t groups = (std::size_t(lines) - 1) / lanes + 1;
     const std::size_t count = groups * chunks;
-    for (std::size_t block = blockIdx.x; block < count; block += gridDim.x) {
+    for (std::size_t block = vcr_launch.block; block < count; block += vcr_launch.blocks) {
         const Index tile_index = Index(block);
         const Index start = (tile_index % chunks) * width;
         const Index first_line = (tile_index / chunks) * lanes;
@@ -49,8 +52,12 @@ __global__ void convolution_tile(const T* src, T* dst, Index extent, Index strid
         __syncthreads();
     }
 }
-template<class T, class Index> void launch_convolution_tile(const T* src, T* dst, const Grid& g,
-                                                           int axis, const T* weights, int radius, Boundary edge) {
+template<class T, class Index, bool Contiguous> struct convolution_tile_launch3 {
+    static constexpr bool inline_arguments = true;
+    template<class... Args> __device__ void operator()(KernelIndex index, const Args&... args) const { convolution_tile<T,Index,Contiguous>(index,args...); }
+};
+template<class T, class Index, class Weights> void launch_convolution_tile(const T* src, T* dst, const Grid& g,
+                                                                         int axis, Weights weights, int radius, Boundary edge) {
     const Index extent = Index(g.shape[axis]), stride = Index(g.stride[axis]);
     const Index lines = Index(g.size / extent);
     const bool contiguous = stride == 1;
@@ -58,10 +65,14 @@ template<class T, class Index> void launch_convolution_tile(const T* src, T* dst
                                  : ((std::size_t(lines) - 1) / 32 + 1) * ((extent - 1) / 8 + 1);
     const unsigned blocks = unsigned(std::min<std::size_t>(count,65535));
     if (contiguous)
-        convolution_tile<T,Index,true><<<blocks,128,(128+2*radius)*sizeof(T),vcr::device::stream()>>>(src,dst,extent,stride,lines,weights,radius,edge);
+        launch(blocks,128,(128+2*radius)*sizeof(T),vcr::device::stream(), convolution_tile_launch3<T,Index,true>{}, src,dst,extent,stride,lines,weights,radius,edge);
     else
-        convolution_tile<T,Index,false><<<blocks,256,(8+2*radius)*32*sizeof(T),vcr::device::stream()>>>(src,dst,extent,stride,lines,weights,radius,edge);
+        launch(blocks,256,(8+2*radius)*32*sizeof(T),vcr::device::stream(), convolution_tile_launch3<T,Index,false>{}, src,dst,extent,stride,lines,weights,radius,edge);
 }
+template<class T> struct InlineGaussianWeights {
+    T values[17]{};
+    __device__ T operator[](int i) const { return values[i]; }
+};
 template<class T> void blur_impl(View<T> data, View<T> output, const Grid& grid, const std::vector<double>& sigmas, double truncate, Boundary mirror, bool full) {
     require(sigmas.size() == grid.shape.size() && truncate > 0 && std::isfinite(truncate), "invalid Gaussian parameters");
     Layout g(grid); std::vector<std::vector<T>> kernels(g.dim); unsigned passes = 0;
@@ -86,15 +97,30 @@ template<class T> void blur_impl(View<T> data, View<T> output, const Grid& grid,
         const auto& host = kernels[a];
         if (host.empty()) continue;
         if (host.size() == 1) continue;
-        Buffer<T> weights(host); const int radius = int(host.size()/2);
+        const int radius = int(host.size()/2);
         // Bound shared memory independently of sigma. Wide filters retain the
         // general implementation; large arrays retain full-width indexing.
         if (radius <= 32) {
-            // Leave headroom for the final partial tile's inactive threads.
-            if (g.size <= 0xffffff00ull)
-                launch_convolution_tile<T,unsigned>(source,dest,grid,a,weights.ptr,radius,mirror);
-            else launch_convolution_tile<T,std::size_t>(source,dest,grid,a,weights.ptr,radius,mirror);
-        } else convolution<<<blocks(g.size),256,0,vcr::device::stream()>>>(source,dest,g,a,weights.ptr,radius,mirror);
+            const auto tiled=[&](auto weights) {
+                // Leave headroom for the final partial tile's inactive threads.
+                if (g.size <= 0xffffff00ull)
+                    launch_convolution_tile<T,unsigned>(source,dest,grid,a,weights,radius,mirror);
+                else launch_convolution_tile<T,std::size_t>(source,dest,grid,a,weights,radius,mirror);
+            };
+            if (radius <= 8) {
+                // Short filters fit in the launch packet, avoiding a separate
+                // device allocation and host upload for every sample and axis.
+                InlineGaussianWeights<T> weights;
+                std::copy(host.begin(),host.end(),weights.values);
+                tiled(weights);
+            } else {
+                Buffer<T> weights(host);
+                tiled(weights.ptr);
+            }
+        } else {
+            Buffer<T> weights(host);
+            launch(blocks(g.size),256,0,vcr::device::stream(), convolution_launch{}, source,dest,g,a,weights.ptr,radius,mirror);
+        }
         check(cudaGetLastError()); source = dest;
         dest = dest == output.ptr ? tmp.ptr : output.ptr;
     }

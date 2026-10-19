@@ -5,7 +5,7 @@
 // count as `outside`: false matches the CPU default, true its neutral border.
 namespace vcr::augment::cuda {
 struct Offset { int v[3]; };
-template<class T, class O> __global__ void morphology_kernel(const T* input, O* output, Layout g, const Offset* footprint, std::size_t count, bool dilate, bool outside = false) {
+template<class T, class O> __device__ void morphology_kernel(KernelIndex vcr_launch, const T* input, O* output, Layout g, const Offset* footprint, std::size_t count, bool dilate, bool outside = false) {
     EACH_INDEX(g.size) {
         bool result = !dilate;
         for (std::size_t j = 0; j < count; ++j) {
@@ -20,6 +20,9 @@ template<class T, class O> __global__ void morphology_kernel(const T* input, O* 
         output[i] = O(result);
     }
 }
+struct morphology_kernel_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { morphology_kernel(index,args...); }
+};
 inline Buffer<Offset> footprint_offsets(const Footprint& footprint) {
     std::vector<Offset> offsets(footprint.size());
     for (std::size_t i = 0; i < offsets.size(); ++i) std::copy(footprint[i].begin(),footprint[i].end(),offsets[i].v);

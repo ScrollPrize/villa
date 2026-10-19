@@ -48,7 +48,7 @@ Parameters sample_strip(const StripGeometry&, const Sample&, Random&, bool);
 Parameters sample_sheet(const SheetCompression&, const Sample&, Random&, bool, Session&);
 Parameters sample_surface(const SurfacePerturb&, const Sample&, Random&, bool, Session&);
 Parameters sample_components(const RemoveComponents&, const Sample&, Random&, bool, Session&);
-Parameters sample_foreground(const ForegroundCrop&, const Sample&, Random&, Session&);
+Parameters sample_foreground(const ForegroundCrop&, const Sample&, Random&, bool, Session&);
 Parameters sample_dropout(const GridDropout&, const Sample&, Random&, bool, Session&);
 Parameters sample_dropout(const StripeMasking&, const Sample&, Random&, bool, Session&);
 Parameters sample_dropout(const ForegroundDropout&, const Sample&, Random&, bool, Session&);

@@ -14,10 +14,13 @@ __device__ inline void join_components(ComponentIndex* parents,ComponentIndex a,
         if(atomicCAS(parents+high,high,low)==high)return;
     }
 }
-template<class T,bool Classes> __global__ void initialize_components(const T* mask,std::size_t n,double threshold,ComponentIndex* parents){
+template<class T,bool Classes> __device__ void initialize_components(KernelIndex vcr_launch, const T* mask,std::size_t n,double threshold,ComponentIndex* parents){
     EACH_INDEX(n)parents[i]=(Classes?double(mask[i])>threshold:mask[i]!=0)?ComponentIndex(i):ComponentIndex(n);
 }
-template<class T,bool Classes> __global__ void connect_components(const T* mask,Layout g,bool full,ComponentIndex* parents){
+template<class T,bool Classes> struct initialize_components_launch2 {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { initialize_components<T,Classes>(index,args...); }
+};
+template<class T,bool Classes> __device__ void connect_components(KernelIndex vcr_launch, const T* mask,Layout g,bool full,ComponentIndex* parents){
     EACH_INDEX(g.size){
         if(atomicAdd(parents+i,0ULL)==g.size)continue;
         if(!full){for(int a=0;a<g.dim;++a)if(g.coord(i,a)){
@@ -33,12 +36,18 @@ template<class T,bool Classes> __global__ void connect_components(const T* mask,
         }
     }
 }
-__global__ inline void flatten_components(ComponentIndex* parents,std::size_t n){
+template<class T,bool Classes> struct connect_components_launch2 {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { connect_components<T,Classes>(index,args...); }
+};
+__device__ inline void flatten_components(KernelIndex vcr_launch, ComponentIndex* parents,std::size_t n){
     EACH_INDEX(n)if(atomicAdd(parents+i,0ULL)!=n){const auto root=component_root(parents,i);atomicMin(parents+i,root);}
 }
+struct flatten_components_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { flatten_components(index,args...); }
+};
 template<bool Classes,class T> void label_components(const T* mask,const Grid& grid,double threshold,bool full,Buffer<ComponentIndex>& parents){
-    initialize_components<T,Classes><<<blocks(grid.size),256,0,vcr::device::stream()>>>(mask,grid.size,threshold,parents.ptr);
-    connect_components<T,Classes><<<blocks(grid.size),256,0,vcr::device::stream()>>>(mask,Layout(grid),full,parents.ptr);
-    flatten_components<<<blocks(grid.size),256,0,vcr::device::stream()>>>(parents.ptr,grid.size);check(cudaGetLastError());
+    launch(blocks(grid.size),256,0,vcr::device::stream(), initialize_components_launch2<T,Classes>{}, mask,grid.size,threshold,parents.ptr);
+    launch(blocks(grid.size),256,0,vcr::device::stream(), connect_components_launch2<T,Classes>{}, mask,Layout(grid),full,parents.ptr);
+    launch(blocks(grid.size),256,0,vcr::device::stream(), flatten_components_launch{}, parents.ptr,grid.size);check(cudaGetLastError());
 }
 }

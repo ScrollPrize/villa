@@ -4,18 +4,24 @@
 #include "../voxel_transform.hpp"
 namespace vcr::augment::cuda {
 namespace vd = volume_detail;
-template<class T> __global__ void check_channel_output(const T* data,std::size_t size,double limit,int* error) {
+template<class T> __device__ void check_channel_output(KernelIndex vcr_launch, const T* data,std::size_t size,double limit,int* error) {
     EACH_INDEX(size) if(!isfinite(data[i]) || fabs(data[i])>limit)atomicExch(error,1);
 }
-template<class Kernel,class T,int D> __global__ void voxel_transform_kernel(Kernel kernel,vd::GridND<D> grid,const T* input,T* output,
+struct check_channel_output_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { check_channel_output(index,args...); }
+};
+template<class Kernel,class T,int D> __device__ void voxel_transform_kernel(KernelIndex vcr_launch, Kernel kernel,vd::GridND<D> grid,const T* input,T* output,
                                                                const vd::Stats* summary,const double* table,const vd::Stats* reference,int* error,const T* auxiliary) {
     vd::ChannelContextT<T,D> context{grid,*summary,table,reference?*reference:vd::Stats{},auxiliary};
     EACH_INDEX(grid.size){T value=kernel(input,i,context);if(!isfinite(value))atomicExch(error,1);output[i]=value;}
 }
+struct voxel_transform_kernel_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { voxel_transform_kernel(index,args...); }
+};
 template<class Kernel,class T> void launch_voxel_transform(const Kernel& kernel,const Grid& grid,View<T> input,View<T> output,
                                                    const vd::Stats* summary,int* error,const double* table=nullptr,const vd::Stats* reference=nullptr,const T* auxiliary=nullptr) {
     vd::with_grid(grid.shape,[&](const auto& g) {
-    voxel_transform_kernel<<<blocks(input.size),256,0,vcr::device::stream()>>>(kernel,g,input.ptr,output.ptr,summary,table,reference,error,auxiliary);
+    launch(blocks(input.size),256,0,vcr::device::stream(), voxel_transform_kernel_launch{}, kernel,g,input.ptr,output.ptr,summary,table,reference,error,auxiliary);
     check(cudaGetLastError());
     });
 }
@@ -25,9 +31,9 @@ template<class Transform,class Function> void with_voxel_channels(const Transfor
             using Value=typename decltype(values)::value_type;
             Buffer<Value> output(values.size);Buffer<vd::Stats> summary(1);
             if constexpr(channel_bounds<Transform>) summarize_channel(values,summary.ptr,channel_moments<Transform>);
-            else check(cudaMemsetAsync(summary.ptr,0,sizeof(vd::Stats),vcr::device::stream()));
+            else check(memset_async(summary.ptr,0,sizeof(vd::Stats),vcr::device::stream()));
             fn(grid,c,values,View<Value>{output.ptr,values.size},summary.ptr,session.finite_status());
-            check_channel_output<<<blocks(values.size),256,0,vcr::device::stream()>>>(output.ptr,values.size,std::numeric_limits<Value>::max(),session.finite_status());
+            launch(blocks(values.size),256,0,vcr::device::stream(), check_channel_output_launch{}, output.ptr,values.size,std::numeric_limits<Value>::max(),session.finite_status());
             check(cudaGetLastError());
             copy_device(values,View<Value>{output.ptr,values.size});
         };
@@ -35,7 +41,7 @@ template<class Transform,class Function> void with_voxel_channels(const Transfor
             const bool wide=channel_wide_parameters(t,c);
             if(wide){
                 Buffer<double> values(image.size);View<double> promoted{values.ptr,values.size};convert(promoted,image);run(promoted);
-                check_channel_output<<<blocks(image.size),256,0,vcr::device::stream()>>>(values.ptr,image.size,std::numeric_limits<float>::max(),session.finite_status());
+                launch(blocks(image.size),256,0,vcr::device::stream(), check_channel_output_launch{}, values.ptr,image.size,std::numeric_limits<float>::max(),session.finite_status());
                 check(cudaGetLastError());convert(image,promoted);
             }else run(image);
         }else run(image);

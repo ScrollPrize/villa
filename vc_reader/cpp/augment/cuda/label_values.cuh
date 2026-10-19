@@ -2,12 +2,15 @@
 #include "../labels.hpp"
 #include "resident.cuh"
 namespace vcr::augment::cuda {
-template<class T> __global__ void check_label_ids(View<T> data, int* invalid) {
+template<class T> __device__ void check_label_ids(KernelIndex vcr_launch, View<T> data, int* invalid) {
     EACH_INDEX(data.size) if (data.ptr[i] < -9007199254740991. || data.ptr[i] > 9007199254740991.) atomicOr(invalid,8);
 }
+struct check_label_ids_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { check_label_ids(index,args...); }
+};
 inline void require_exact_labels(const DeviceArray& a, Session& session) {
     if ((a.kind == 'i' || a.kind == 'u') && a.bytes == 8) {
-        a.typed([&](auto data) { check_label_ids<<<blocks(data.size),256,0,vcr::device::stream()>>>(data,session.check_flags()); });
+        a.typed([&](auto data) { launch(blocks(data.size),256,0,vcr::device::stream(), check_label_ids_launch{}, data,session.check_flags()); });
         check(cudaGetLastError());
     }
 }

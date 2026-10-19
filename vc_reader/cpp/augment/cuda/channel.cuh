@@ -17,7 +17,7 @@ template<class T, class Channel> void apply_channels(const T& t, Sample& s, cons
             // need the float64 path, rather than reading statistics back.
             if (session.async) flag_magnitude(input,limit,session.check_flags(),4);
             else {
-                Buffer<int> flag(1); check(cudaMemsetAsync(flag.ptr,0,sizeof(int),vcr::device::stream()));
+                Buffer<int> flag(1); check(memset_async(flag.ptr,0,sizeof(int),vcr::device::stream()));
                 flag_magnitude(input,limit,flag.ptr,1);
                 int exceeded = 0; flag.download(&exceeded); wide |= exceeded != 0;
             }

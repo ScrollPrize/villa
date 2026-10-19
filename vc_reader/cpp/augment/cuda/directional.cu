@@ -9,8 +9,10 @@ struct Transform {
     double matrix[9]{}, inverse[9]{}, offset[3]{};
     Layout grid;
     const float* field = nullptr;
+    const long long* device_offset=nullptr;
     int component[3]{};  // spatial axis of each stored component
     explicit Transform(const Parameters& p, const Target& t, const float* f) : grid(Grid(p.shape)), field(f) {
+        if(p.device_offset) device_offset=std::static_pointer_cast<Buffer<long long>>(p.device_offset)->ptr;
         const auto d = p.shape.size(); const auto inv = vcr::augment::inverse(p.matrix,d);
         std::copy(p.matrix.begin(),p.matrix.end(),matrix); std::copy(inv.begin(),inv.end(),inverse);
         std::copy(p.offset.begin(),p.offset.end(),offset);
@@ -37,7 +39,7 @@ __device__ void displacement(const Transform& t, const double* out, double* q) {
 __device__ void backward(const Transform& t, const double* out, double* q) {
     const int d = t.grid.dim;
     for (int a = 0; a < d; ++a) {
-        q[a] = t.offset[a];
+        q[a] = t.device_offset?double(t.device_offset[a]):t.offset[a];
         for (int b = 0; b < d; ++b) q[a] += t.matrix[a*d+b]*out[b];
     }
     if (t.field) {
@@ -79,7 +81,7 @@ __device__ void unit(double* v, int d) { vcr::direction::unit(v,d); }
 // Output position of an input-frame point: Newton iteration on backward().
 __device__ bool forward(const Transform& t, double* point) {
     const int d = t.grid.dim; double source[3]{point[0],point[1],point[2]};
-    for (int a = 0; a < d; ++a) point[a] -= t.offset[a];
+    for (int a = 0; a < d; ++a) point[a] -= t.device_offset?double(t.device_offset[a]):t.offset[a];
     apply_matrix(t.inverse,point,d);
     if (!t.field) return true;
     for (int iteration = 0; iteration < 50; ++iteration) {
@@ -94,7 +96,7 @@ __device__ bool forward(const Transform& t, double* point) {
     return false;
 }
 enum : int { Unconverged = 1, Outside = 2, Singular = 4 };
-template<class T> __global__ void dense_kernel(T* data, Transform t, Role role, bool normalize, int* status) {
+template<class T> __device__ void dense_kernel(KernelIndex vcr_launch, T* data, Transform t, Role role, bool normalize, int* status) {
     const auto& g = t.grid; const int d = g.dim;
     EACH_INDEX(g.size) {
         double v[3]{}, pos[3]{};
@@ -115,7 +117,10 @@ template<class T> __global__ void dense_kernel(T* data, Transform t, Role role, 
         for (int j = 0; j < d; ++j) data[j*g.size+i] = T(v[t.component[j]]);
     }
 }
-template<class T> __global__ void sparse_kernel(T* data, std::size_t count, Transform t, Role role, bool normalize,
+struct dense_kernel_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { dense_kernel(index,args...); }
+};
+template<class T> __device__ void sparse_kernel(KernelIndex vcr_launch, T* data, std::size_t count, Transform t, Role role, bool normalize,
                                                 int outside, unsigned* keep, int* status) {
     const auto& g = t.grid; const int d = g.dim;
     EACH_INDEX(count) {
@@ -130,9 +135,15 @@ template<class T> __global__ void sparse_kernel(T* data, std::size_t count, Tran
         for (int j = 0; j < d; ++j) data[i*d+j] = T(v[t.component[j]]);
     }
 }
-template<class T> __global__ void compact_rows(const T* data, T* out, const unsigned* keep, const unsigned* index, std::size_t count, int d) {
+struct sparse_kernel_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { sparse_kernel(index,args...); }
+};
+template<class T> __device__ void compact_rows(KernelIndex vcr_launch, const T* data, T* out, const unsigned* keep, const unsigned* index, std::size_t count, int d) {
     EACH_INDEX(count) if (keep[i]) for (int j = 0; j < d; ++j) out[std::size_t(index[i])*d+j] = data[i*d+j];
 }
+struct compact_rows_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { compact_rows(index,args...); }
+};
 } // namespace
 
 void directional_cuda(DeviceArray& a, const Target& target, const Parameters& p, const float* field, Session& session) {
@@ -140,7 +151,7 @@ void directional_cuda(DeviceArray& a, const Target& target, const Parameters& p,
     a.typed([&](auto view) {
         using T = typename decltype(view)::value_type;
         if constexpr (std::is_floating_point_v<T>)
-            dense_kernel<<<blocks(t.grid.size),256,0,vcr::device::stream()>>>(view.ptr,t,target.role,target.normalize,session.geometry_status());
+            launch(blocks(t.grid.size),256,0,vcr::device::stream(), dense_kernel_launch{}, view.ptr,t,target.role,target.normalize,session.geometry_status());
     });
     check(cudaGetLastError());
 }
@@ -154,23 +165,24 @@ void sparse_cuda(DeviceArray& a, const Target& target, const Parameters& p, cons
     a.typed([&](auto view) {
         using T = typename decltype(view)::value_type;
         if constexpr (std::is_floating_point_v<T>) {
-            if (count) sparse_kernel<<<blocks(count),256,0,vcr::device::stream()>>>(view.ptr,count,t,target.role,target.normalize,outside,
+            if (count) launch(blocks(count),256,0,vcr::device::stream(), sparse_kernel_launch{}, view.ptr,count,t,target.role,target.normalize,outside,
                                                             keep ? keep->ptr : nullptr,session.geometry_status());
             check(cudaGetLastError());
             if (!keep) return;
             // Dropping points changes the output shape: the kept count is the
             // one value read back, and only for outside="drop".
             Buffer<unsigned> index(count); std::size_t bytes = 0;
+            if(BatchQueue::current) BatchQueue::current->flush();
             check(cub::DeviceScan::ExclusiveSum(nullptr,bytes,keep->ptr,index.ptr,count,vcr::device::stream()));
             Buffer<std::byte> scratch(bytes);
             check(cub::DeviceScan::ExclusiveSum(scratch.ptr,bytes,keep->ptr,index.ptr,count,vcr::device::stream()));
             unsigned last[2]{};
-            check(cudaMemcpyAsync(last,index.ptr+count-1,sizeof(unsigned),cudaMemcpyDeviceToHost,vcr::device::stream()));
-            check(cudaMemcpyAsync(last+1,keep->ptr+count-1,sizeof(unsigned),cudaMemcpyDeviceToHost,vcr::device::stream()));
+            check(copy_async(last,index.ptr+count-1,sizeof(unsigned),cudaMemcpyDeviceToHost,vcr::device::stream()));
+            check(copy_async(last+1,keep->ptr+count-1,sizeof(unsigned),cudaMemcpyDeviceToHost,vcr::device::stream()));
             check(cudaStreamSynchronize(vcr::device::stream()));
             const std::size_t kept = std::size_t(last[0])+last[1];
             DeviceArray out(Shape{kept,d},a.kind,a.bytes);
-            compact_rows<<<blocks(count),256,0,vcr::device::stream()>>>(view.ptr,out.view<T>().ptr,keep->ptr,index.ptr,count,int(d));
+            launch(blocks(count),256,0,vcr::device::stream(), compact_rows_launch{}, view.ptr,out.view<T>().ptr,keep->ptr,index.ptr,count,int(d));
             check(cudaGetLastError());
             a = std::move(out);
         }

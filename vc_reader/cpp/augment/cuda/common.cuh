@@ -1,6 +1,7 @@
 #pragma once
 #include "../core.hpp"
 #include "../../cuda_stream.hpp"
+#include "batch_queue.hpp"
 #include <cuda_runtime.h>
 #include <unistd.h>
 namespace vcr::augment::cuda {
@@ -26,9 +27,10 @@ template<class T> struct Buffer {
         int supported = 0;
         check(cudaDeviceGetAttribute(&supported,cudaDevAttrMemoryPoolsSupported,device));
         pooled = supported;
-        if (pooled) { check(cudaMallocAsync(&ptr,n*sizeof(T),stream)); return; }
+        if (pooled) check(cudaMallocAsync(&ptr,n*sizeof(T),stream)); else
 #endif
         check(cudaMalloc(&ptr,n*sizeof(T)));
+        if (BatchQueue::current) BatchQueue::current->allocated(n*sizeof(T));
     }
     explicit Buffer(const std::vector<T>& v) : Buffer(v.size()) { upload(v.data()); }
     Buffer(T* data, std::size_t n) : ptr(data),size(n),borrowed(true) { check(cudaGetDevice(&device)); }
@@ -37,6 +39,10 @@ template<class T> struct Buffer {
     Buffer& operator=(const Buffer&) = delete;
     ~Buffer() {
         if (!ptr || borrowed || pid != getpid()) return;
+        if (BatchQueue::current && !exported) {
+            BatchQueue::current->retire(ptr,pooled,stream);
+            return;
+        }
         int previous = 0;
         if (cudaGetDevice(&previous) != cudaSuccess || cudaSetDevice(device) != cudaSuccess) return;
         if (exported) cudaDeviceSynchronize();
@@ -51,6 +57,7 @@ template<class T> struct Buffer {
     void upload(const T* p) { if (size) check(cudaMemcpyAsync(ptr,p,size*sizeof(T),cudaMemcpyHostToDevice,vcr::device::stream())); }
     void download(T* p) const {
         if (!size) return;
+        if (BatchQueue::current) BatchQueue::current->flush();
         check(cudaMemcpyAsync(p,ptr,size*sizeof(T),cudaMemcpyDeviceToHost,vcr::device::stream()));
         check(cudaStreamSynchronize(vcr::device::stream()));
     }
@@ -97,7 +104,7 @@ template<class T> __device__ inline T from_double(double x) {
     if constexpr (std::is_same_v<T, float>) return narrow(x); else return T(x);
 }
 inline unsigned blocks(std::size_t n) { return unsigned(std::min<std::size_t>((n + 255) / 256, 65535)); }
-#define EACH_INDEX(n) for (std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < (n); i += std::size_t(blockDim.x) * gridDim.x)
+#define EACH_INDEX(n) for (std::size_t i = std::size_t(vcr_launch.block) * blockDim.x + threadIdx.x; i < (n); i += std::size_t(blockDim.x) * vcr_launch.blocks)
 __device__ inline double clamp_value(double x, double low, double high) { return x < low ? low : x > high ? high : x; }
 __device__ inline std::size_t boundary(long long x, std::size_t n, Boundary edge) {
     if (edge == Boundary::Nearest) return x < 0 ? 0 : x >= static_cast<long long>(n) ? n - 1 : std::size_t(x);
@@ -116,3 +123,6 @@ template<class T> __device__ double power(double x, double exponent) {
 }
 
 } // namespace vcr::augment::cuda
+
+#include "launch.cuh"
+#include "memory.cuh"

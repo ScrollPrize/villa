@@ -60,6 +60,12 @@ namespace cuda { inline bool available() { return false; } }
 #endif
 struct OneOf { std::vector<Op> transforms; std::vector<double> weights; double p = 1; };
 struct Program { std::vector<Op> transforms; std::map<std::string, Target> targets; };
+#ifdef VC_READER_CUDA
+namespace cuda {
+void run_batch_steps(const Program&, std::vector<Sample>&, const std::vector<std::uint64_t>&,
+                     const std::map<std::string,std::vector<double>>&, const std::vector<std::shared_ptr<void>>&);
+}
+#endif
 struct InputSpec {
     Shape shape; char kind; std::size_t bytes;
     bool operator==(const InputSpec&) const = default;

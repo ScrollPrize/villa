@@ -1,5 +1,6 @@
 #pragma once
 #include "cuda/device_io.hpp"
+#include "cuda/batch_queue.hpp"
 #include "../cuda_buffer.hpp"
 #include "../cuda_event.hpp"
 using DeviceInputArray = nb::ndarray<nb::array_api, nb::c_contig, nb::device::cuda>;
@@ -11,6 +12,7 @@ struct DeviceOutputs {
     std::vector<std::shared_ptr<vcr::device::Buffer>> stacked;
     int device = 0;
     cudaStream_t stream = vcr::device::stream();
+    std::vector<nb::object> working_owners;
     void mark_exported() { for (auto& s:sessions) cuda::export_outputs(s.get()); for (auto& b:stacked) b->exported=true; }
     void check() {
         vcr::device::Guard guard(device); vcr::device::StreamScope scope(stream);
@@ -98,24 +100,50 @@ static nb::tuple run_batch(const Pipeline& pipeline, const std::map<std::string,
     auto imported=import_device(pipeline,inputs,1);
     auto owner=std::make_shared<DeviceOutputs>();
     owner->device=imported.device;
+    // Start in consumer-owned contiguous storage. Transforms that retain their
+    // input allocation can return it directly, without a final batch-size copy.
+    std::map<std::string,nb::object> working;
+    std::map<std::string,cuda::DeviceInput> destinations;
+    const auto allocate_array = [&](const Shape& shape,const cuda::DeviceInput& first) {
+        auto result=allocator(nb::cast(shape),std::string(1,first.kind)+std::to_string(first.bytes),imported.device);
+        const auto dest=nb::cast<DeviceInputArray>(result);
+        Shape got; for(std::size_t a=0;a<dest.ndim();++a)got.push_back(dest.shape(a));
+        require(got==shape && dlpack_kind(dest.dtype())==first.kind && std::size_t(dest.dtype().bits/8)==first.bytes && dest.device_id()==imported.device,
+                "allocator must return a contiguous CUDA array of the requested shape, dtype and device");
+        return result;
+    };
+    if(!inplace && !allocator.is_none())for(const auto& [key,in]:imported.arrays) {
+        Shape shape{count};shape.insert(shape.end(),in.shape.begin(),in.shape.end());
+        auto result=allocate_array(shape,in);
+        const auto dest=nb::cast<DeviceInputArray>(result);
+        destinations.emplace(key,cuda::DeviceInput{dest.data(),in.shape,in.kind,in.bytes,in.device});
+        working.emplace(key,result);owner->working_owners.push_back(std::move(result));
+    }
     std::vector<std::map<std::string,cuda::DeviceInput>> results(count);
     std::vector<std::map<std::string,std::vector<cuda::DeviceInput>>> pyramids(count);
     std::map<std::string,std::string> sources;
     {
         nb::gil_scoped_release release; vcr::device::Guard guard(imported.device);
+        std::vector<Sample> samples(count,imported.sample);
+        cuda::BatchQueue initialization(count);
         for (std::size_t b=0;b<count;++b) {
-            auto sample=imported.sample; auto arrays=imported.arrays;
+            initialization.lane(b);
+            auto& sample=samples[b]; auto arrays=imported.arrays; auto outputs=destinations;
             for (auto& [key,a]:arrays) a.data=static_cast<char*>(a.data)+b*product(a.shape)*a.bytes;
+            for (auto& [key,a]:outputs) a.data=static_cast<char*>(a.data)+b*product(a.shape)*a.bytes;
             NamedValues values; for (const auto& [name,v]:params) values[name]=v[b];
             NamedScope named(&values);
             validate(sample,false);
-            auto context=cuda::begin_device(arrays,sample,inplace,async);
-            auto result=pipeline.run(std::move(sample),seeds[b],false,false,context);
-            results[b]=cuda::device_outputs(context.get());
-            pyramids[b]=cuda::device_pyramids(context.get());
-            if (!b) for (const auto& [key,f]:result.sample) sources[key]=f.source;
+            auto context=cuda::begin_device(arrays,sample,inplace,async,outputs);
             owner->sessions.push_back(std::move(context));
         }
+        initialization.flush();
+        cuda::run_batch_steps(*pipeline.program(),samples,seeds,params,owner->sessions);
+        for (std::size_t b=0;b<count;++b) {
+            results[b]=cuda::device_outputs(owner->sessions[b].get());
+            pyramids[b]=cuda::device_pyramids(owner->sessions[b].get());
+        }
+        for (const auto& [key,f]:samples[0]) sources[key]=f.source;
     }
     nb::object holder=nb::cast(owner);
     nb::list input_owners;
@@ -126,15 +154,10 @@ static nb::tuple run_batch(const Pipeline& pipeline, const std::map<std::string,
     // Python or exporting native allocations to an unrelated stream allocator.
     const auto allocated = [&](const Shape& shape, const std::vector<cuda::DeviceInput>& values) -> nb::object {
         const auto& first=values.front();
-        auto result=allocator(nb::cast(shape), std::string(1,first.kind)+std::to_string(first.bytes), imported.device);
+        auto result=allocate_array(shape,first);
         const auto dest=nb::cast<DeviceInputArray>(result);
-        Shape got; for (std::size_t a=0;a<dest.ndim();++a) got.push_back(dest.shape(a));
-        require(got==shape && dlpack_kind(dest.dtype())==first.kind && std::size_t(dest.dtype().bits/8)==first.bytes && dest.device_id()==imported.device,
-                "allocator must return a contiguous CUDA array of the requested shape, dtype and device");
-        const std::size_t bytes=product(first.shape)*first.bytes;
         { nb::gil_scoped_release release; vcr::device::Guard guard(imported.device);
-          for (std::size_t b=0;b<values.size();++b)
-              if (bytes) vcr::device::check(cudaMemcpyAsync(static_cast<char*>(dest.data())+b*bytes,values[b].data,bytes,cudaMemcpyDeviceToDevice,vcr::device::stream())); }
+          cuda::copy_batch_output(dest.data(),values); }
         return result;
     };
     const auto pack = [&](const std::string& key,const std::vector<cuda::DeviceInput>& values,bool allow_out) -> nb::object {
@@ -146,6 +169,14 @@ static nb::tuple run_batch(const Pipeline& pipeline, const std::map<std::string,
             return items;
         }
         Shape shape{count};shape.insert(shape.end(),first.shape.begin(),first.shape.end());
+        if(allow_out && working.count(key)) {
+            const auto& dest=destinations.at(key);
+            bool retained=dest.shape==first.shape && dest.kind==first.kind && dest.bytes==first.bytes;
+            const auto bytes=product(first.shape)*first.bytes;
+            for(std::size_t b=0;b<values.size();++b)
+                retained &= values[b].data==static_cast<char*>(dest.data)+b*bytes;
+            if(retained)return working.at(key);
+        }
         if (!allocator.is_none()) return allocated(shape,values);
         const std::size_t bytes=product(first.shape)*first.bytes;void* target;nb::object array_owner;
         if(allow_out && out.count(key)) {
@@ -157,7 +188,7 @@ static nb::tuple run_batch(const Pipeline& pipeline, const std::map<std::string,
             auto buffer=vcr::device::allocate(count*bytes,imported.device);owner->stacked.push_back(buffer);target=buffer->ptr;array_owner=holder;
         }
         {nb::gil_scoped_release release;vcr::device::Guard guard(imported.device);
-         for(std::size_t b=0;b<count;++b)vcr::device::check(cudaMemcpyAsync(static_cast<char*>(target)+b*bytes,values[b].data,bytes,cudaMemcpyDeviceToDevice,vcr::device::stream()));}
+         cuda::copy_batch_output(target,values);}
         return nb::make_tuple(device_array(target,shape,first.kind,first.bytes,imported.device,array_owner),shape,std::string(1,first.kind)+std::to_string(first.bytes),imported.device);
     };
     for(const auto& [key,first]:results[0]) {

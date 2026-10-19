@@ -1,8 +1,10 @@
 #include "common.cuh"
 #include "geometry.cuh"
+#include <bit>
 namespace vcr::augment::cuda {
 template<class Real> struct GeometryArgs {
     Real matrix[9]{}, offset[3]{};
+    const long long* device_offset=nullptr;
     double fill = 0;
     bool border = false, nearest = false, validity = false, identity = false;
     int mode = 0;
@@ -10,21 +12,73 @@ template<class Real> struct GeometryArgs {
 // Exact same-shape axis reflections need only integer address arithmetic.
 // Keep geometry_cuda's target routing, sparse/directional handling and validity
 // restoration shared with the general resampler.
-template<class T, class Index> __global__ void reflect_kernel(const T* src, T* dst, Layout g, std::size_t channels,
-                                                            unsigned reflected, bool validity) {
-    EACH_INDEX(g.size*channels) {
-        const Index index=Index(i), size=Index(g.size), voxel=index%size;
-        Index at=voxel;
+template<class T, class Index> __device__ void reflect_kernel(KernelIndex vcr_launch, const T* src, T* dst, Layout g, std::size_t count,
+                                                            unsigned reflected, Index xor_mask, bool validity) {
+    EACH_INDEX(count) {
+        const Index index=Index(i);
+        Index at=index ^ xor_mask;
         for (int a=0;a<g.dim;++a) if (reflected & (1u<<a)) {
             const Index stride=Index(g.stride[a]), extent=Index(g.shape[a]);
-            const Index x=(voxel/stride)%extent;
+            const Index x=(index/stride)%extent;
             at -= x*stride;
             at += (extent-1-x)*stride;
         }
-        const T value=src[(index/size)*size+at];
+        // A reflection is an involution: only one thread touches each pair.
+        // Keeping the working buffer avoids a volume allocation and the copy
+        // back into the caller's contiguous batch output.
+        if (src==dst && index>at) continue;
+        const T value=src[at];
+        if (src==dst && index<at) {
+            const T other=src[index];
+            dst[at]=validity ? T(other>=T(1)) : other;
+        }
         // The general validity interpolation canonicalizes signed zero too.
         dst[i]=validity ? T(value>=T(1)) : value;
     }
+}
+template<class T, class Index> struct reflect_kernel_launch2 {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { reflect_kernel<T,Index>(index,args...); }
+};
+template<class T, class Index> struct reflect_pairs_launch {
+    __device__ void operator()(KernelIndex vcr_launch, T* data, std::size_t count,
+                               Index mask, Index pivot, bool validity) const {
+        EACH_INDEX(count/2) {
+            // Insert a zero at the highest reflected bit. This enumerates
+            // exactly one member of every pair, with no idle half of the grid.
+            const Index below=pivot-1;
+            const Index first=(Index(i)&below) | ((Index(i)&~below)<<1);
+            const Index second=first^mask;
+            const T a=data[first], b=data[second];
+            data[first]=validity ? T(b>=T(1)) : b;
+            data[second]=validity ? T(a>=T(1)) : a;
+        }
+    }
+};
+static void reflect_cuda(const DeviceArray& src, DeviceArray& out, unsigned reflected, bool validity) {
+    if (!reflected && !validity && src.buffer->ptr==out.buffer->ptr) return;
+    Layout grid{Grid(src.spatial())};
+    std::size_t xor_mask=0;
+    // Power-of-two axes occupy disjoint bits of the flattened index. Reverse
+    // those bits directly; other axes keep exact integer coordinate mapping.
+    for (int a=0;a<grid.dim;++a) if (reflected & (1u<<a)) {
+        const auto extent=grid.shape[a], stride=grid.stride[a];
+        if ((extent & (extent-1))==0 && (stride & (stride-1))==0) {
+            xor_mask |= (extent-1)*stride;
+            reflected &= ~(1u<<a);
+        }
+    }
+    src.typed([&](auto input) {
+        using T=typename decltype(input)::value_type;
+        const auto run=[&]<class Index>() {
+            if (!reflected && xor_mask && src.buffer->ptr==out.buffer->ptr)
+                launch(blocks(out.size()/2),256,0,vcr::device::stream(), reflect_pairs_launch<T,Index>{}, input.ptr,out.size(),Index(xor_mask),Index(std::bit_floor(xor_mask)),validity);
+            else
+                launch(blocks(out.size()),256,0,vcr::device::stream(), reflect_kernel_launch2<T,Index>{}, input.ptr,out.view<T>().ptr,grid,out.size(),reflected,Index(xor_mask),validity);
+        };
+        if (out.size()<=UINT32_MAX) run.template operator()<std::uint32_t>();
+        else run.template operator()<std::size_t>();
+    });
+    check(cudaGetLastError());
 }
 static int reflection_axes(const Parameters& p, const Shape& shape, const float* field) {
     if (!p.exact || field || p.shape!=shape) return -1;
@@ -66,7 +120,7 @@ __device__ Real interior_sample(const T* src, Index base, Layout in, const Real*
     return resize_sample<D,Real>(src+base,q);
 }
 template<class T, class Real, int D = 0, class Index = std::size_t>
-__global__ void geometry_kernel(const T* src, T* dst, Layout in, Layout out, std::size_t channels, GeometryArgs<Real> p, const float* field, T pad, int* used_pad) {
+__device__ void geometry_kernel(KernelIndex vcr_launch, const T* src, T* dst, Layout in, Layout out, std::size_t channels, GeometryArgs<Real> p, const float* field, T pad, int* used_pad) {
     EACH_INDEX(out.size*channels) {
         const Index voxel = Index(i)%Index(out.size), channel = Index(i)/Index(out.size);
         const int dim = D ? D : out.dim;
@@ -81,7 +135,7 @@ __global__ void geometry_kernel(const T* src, T* dst, Layout in, Layout out, std
         for (int a = 0; a < dim; ++a) {
             if (p.identity) q[a]=coords[a];
             else for (int b = 0; b < dim; ++b) q[a] += p.matrix[a*dim+b]*coords[b];
-            q[a] += p.offset[a];
+            q[a] += p.device_offset?Real(p.device_offset[a]):p.offset[a];
             if (field) q[a] += Real(field[std::size_t(voxel)*dim+a]);
             if (p.border && !p.validity) q[a] = fmin(fmax(q[a],Real(0)),Real(in.shape[a]-1));
             if (!isfinite(q[a]) || q[a] < -1 || q[a] > Real(in.shape[a])) { far = true; continue; }
@@ -119,26 +173,27 @@ __global__ void geometry_kernel(const T* src, T* dst, Layout in, Layout out, std
         }
     }
 }
+struct geometry_kernel_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { geometry_kernel(index,args...); }
+};
+template<class T, class Real, int D = 0, class Index = std::size_t> struct geometry_kernel_launch4 {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { geometry_kernel<T,Real,D,Index>(index,args...); }
+};
 DeviceArray resample_cuda(const DeviceArray& src, const Parameters& p, bool nearest, double fill, bool validity, const float* field) {
     Shape shape{src.shape[0]}; shape.insert(shape.end(),p.shape.begin(),p.shape.end());
     DeviceArray out(shape,src.kind,src.bytes);
     Layout in{Grid(src.spatial())}, output{Grid(p.shape)};
-    const int reflected=reflection_axes(p,src.spatial(),field);
+    const int reflected=p.device_offset?-1:reflection_axes(p,src.spatial(),field);
     if (reflected>=0 && (nearest || validity)) {
-        src.typed([&](auto input) {
-            using T=typename decltype(input)::value_type;
-            if (out.size()<=UINT32_MAX)
-                reflect_kernel<T,std::uint32_t><<<blocks(out.size()),256,0,vcr::device::stream()>>>(input.ptr,out.view<T>().ptr,in,src.shape[0],unsigned(reflected),validity);
-            else
-                reflect_kernel<T,std::size_t><<<blocks(out.size()),256,0,vcr::device::stream()>>>(input.ptr,out.view<T>().ptr,in,src.shape[0],unsigned(reflected),validity);
-        });
-        check(cudaGetLastError()); return out;
+        reflect_cuda(src,out,unsigned(reflected),validity);
+        return out;
     }
     // Bound float32 affine roundoff to < 0.001 voxel. Large coordinates or
     // cancellation between large matrix/offset terms use float64 coordinates.
     const bool narrow = !(src.kind == 'f' && src.bytes == 8) && geometry_float32(p, src.spatial());
     const auto run = [&]<class Real>() {
         GeometryArgs<Real> args{};
+        if(p.device_offset) args.device_offset=std::static_pointer_cast<Buffer<long long>>(p.device_offset)->ptr;
         std::copy(p.matrix.begin(),p.matrix.end(),args.matrix); std::copy(p.offset.begin(),p.offset.end(),args.offset);
         args.fill = fill; args.border = p.border; args.nearest = nearest; args.validity = validity; args.mode = p.nearest_mode;
         args.identity = p.matrix == identity(p.shape.size());
@@ -153,13 +208,13 @@ DeviceArray resample_cuda(const DeviceArray& src, const Parameters& p, bool near
             if constexpr (std::is_same_v<T,float> && std::is_same_v<Real,float>) {
                 if (out.size()<=UINT32_MAX && in.size<=UINT32_MAX) {
                     if (output.dim==3)
-                        geometry_kernel<T,Real,3,std::uint32_t><<<blocks(out.size()),256,0,vcr::device::stream()>>>(input.ptr,out.view<T>().ptr,in,output,src.shape[0],args,field,pad,used.ptr);
+                        launch(blocks(out.size()),256,0,vcr::device::stream(), geometry_kernel_launch4<T,Real,3,std::uint32_t>{}, input.ptr,out.view<T>().ptr,in,output,src.shape[0],args,field,pad,used.ptr);
                     else
-                        geometry_kernel<T,Real,2,std::uint32_t><<<blocks(out.size()),256,0,vcr::device::stream()>>>(input.ptr,out.view<T>().ptr,in,output,src.shape[0],args,field,pad,used.ptr);
+                        launch(blocks(out.size()),256,0,vcr::device::stream(), geometry_kernel_launch4<T,Real,2,std::uint32_t>{}, input.ptr,out.view<T>().ptr,in,output,src.shape[0],args,field,pad,used.ptr);
                     specialized=true;
                 }
             }
-            if (!specialized) geometry_kernel<<<blocks(out.size()),256,0,vcr::device::stream()>>>(input.ptr,out.view<T>().ptr,in,output,src.shape[0],args,field,pad,used.ptr);
+            if (!specialized) launch(blocks(out.size()),256,0,vcr::device::stream(), geometry_kernel_launch{}, input.ptr,out.view<T>().ptr,in,output,src.shape[0],args,field,pad,used.ptr);
             check(cudaGetLastError());
             if (used.size) { used.download(&used_host); require(!used_host,"value is not representable in target dtype"); }
         });
@@ -167,7 +222,7 @@ DeviceArray resample_cuda(const DeviceArray& src, const Parameters& p, bool near
     if (narrow) run.template operator()<float>(); else run.template operator()<double>();
     return out;
 }
-template<class T> __global__ void resize_nearest_kernel(const T* src,T* dst,Layout input,Layout output,
+template<class T> __device__ void resize_nearest_kernel(KernelIndex vcr_launch, const T* src,T* dst,Layout input,Layout output,
                                                        std::size_t channels,bool legacy) {
     EACH_INDEX(output.size*channels) {
         const auto voxel=i%output.size;
@@ -177,13 +232,16 @@ template<class T> __global__ void resize_nearest_kernel(const T* src,T* dst,Layo
         dst[i]=src[at];
     }
 }
+struct resize_nearest_kernel_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { resize_nearest_kernel(index,args...); }
+};
 DeviceArray resize_cuda(const DeviceArray& src, const Shape& shape, bool nearest, bool legacy) {
     if(nearest) {
         Shape target{src.shape[0]};target.insert(target.end(),shape.begin(),shape.end());
         DeviceArray out(target,src.kind,src.bytes);
         src.typed([&](auto input) {
             using T=typename decltype(input)::value_type;
-            resize_nearest_kernel<<<blocks(out.size()),256,0,vcr::device::stream()>>>(input.ptr,out.view<T>().ptr,Layout{Grid(src.spatial())},Layout{Grid(shape)},src.shape[0],legacy);
+            launch(blocks(out.size()),256,0,vcr::device::stream(), resize_nearest_kernel_launch{}, input.ptr,out.view<T>().ptr,Layout{Grid(src.spatial())},Layout{Grid(shape)},src.shape[0],legacy);
         });
         check(cudaGetLastError());return out;
     }
@@ -207,13 +265,20 @@ void geometry_cuda(Sample& s, const Parameters& p, Session& session) {
             sparse_cuda(a,f.target,p,displacement,session); f.array.shape = a.shape; continue;
         }
         auto& a = session.arrays.at(key);
-        a = resample_cuda(a,p,role == Role::Label || (p.exact && role != Role::Valid),f.target.fill,role == Role::Valid,field->ptr);
+        const int reflected=p.device_offset?-1:reflection_axes(p,a.spatial(),displacement);
+        if (reflected>=0) reflect_cuda(a,a,unsigned(reflected),role == Role::Valid);
+        else a = resample_cuda(a,p,role == Role::Label || (p.exact && role != Role::Valid),f.target.fill,role == Role::Valid,field->ptr);
         if (directional(role) || (role == Role::CoordinateField && !f.target.external))
             directional_cuda(a,f.target,p,displacement,session);
         f.array.shape = a.shape;
     }
     if (!specialized.empty()) {
         auto cpu = p;
+        if(p.device_offset) {
+            std::vector<long long> offset(p.shape.size());
+            std::static_pointer_cast<Buffer<long long>>(p.device_offset)->download(offset.data());
+            std::copy(offset.begin(),offset.end(),cpu.offset.begin());
+        }
         if (p.device_field && cpu.field.empty()) { cpu.field.resize(field->size); field->download(cpu.field.data()); }
         apply_geometry(specialized,cpu);
         for (auto& [key,f] : specialized) {

@@ -59,13 +59,13 @@ inline int axis(char c, std::size_t dim) {
 
 struct Random {
     std::uint64_t state;
-    std::uint64_t next() {
+    VCR_HD std::uint64_t next() {
         auto z = (state += UINT64_C(0x9e3779b97f4a7c15));
         z = (z ^ (z >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
         z = (z ^ (z >> 27)) * UINT64_C(0x94d049bb133111eb);
         return z ^ (z >> 31);
     }
-    double uniform() { return (double(next() >> 11) + 0.5) * 0x1.0p-53; }
+    VCR_HD double uniform() { return (double(next() >> 11) + 0.5) * 0x1.0p-53; }
     bool chance(double p) { probability(p); return uniform() < p; }
     std::size_t index(std::size_t n) {
         require(n > 0, "cannot sample an empty choice");
@@ -451,6 +451,8 @@ struct ChannelPlan {
     // Voxel indices are integers, not floating-point deformation samples.
     std::vector<std::size_t> indices;
     std::shared_ptr<void> device_indices;
+    // Device-resident selection state, materialized as indices when recording.
+    std::shared_ptr<void> device_selection;
 };
 struct Parameters {
     std::vector<ChannelPlan> channels;
@@ -459,6 +461,8 @@ struct Parameters {
     std::vector<float> field;
     bool border = false, exact = false;
     std::shared_ptr<void> device_field;
+    // Exact integer crop offsets computed from foreground on the device.
+    std::shared_ptr<void> device_offset;
     int nearest_mode = 0; // 0: ties-to-even, 1: half-up resize, 2: floor resize
 };
 template<class F>

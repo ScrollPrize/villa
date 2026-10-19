@@ -246,8 +246,10 @@ class Pipeline:
 
         Work uses PyTorch's current stream and completes/checks once per batch.
         CudaLoader uses the same executor with one batch of GPU prefetch.
-        params maps each Param(name) to one CPU scalar per sample. Kernels run
-        per sample within the native executor; this is not kernel fusion.
+        params maps each Param(name) to one CPU scalar per sample. Compatible
+        kernel stages execute across samples in a single launch. Filters,
+        reductions and FFTs retain their necessary stages; randomness and
+        statistics remain independent for each sample.
         Uniform outputs are stacked tensors; differing sample shapes are lists.
         Undeclared fields, including tensor metadata, pass through unchanged.
         """

@@ -1,17 +1,20 @@
 #include "morphology.cuh"
 namespace vcr::augment::cuda {
 // Binary input with the ignore value removed; values keep the labels for the product.
-template<class T> __global__ void binarize(const T* labels, std::uint8_t* skeleton, float* values, std::size_t n, bool ignore, double ignored) {
+template<class T> __device__ void binarize(KernelIndex vcr_launch, const T* labels, std::uint8_t* skeleton, float* values, std::size_t n, bool ignore, double ignored) {
     EACH_INDEX(n) {
         const double v = double(labels[i]);
         const double kept = ignore && v == ignored ? 0. : v;
         values[i] = float(kept); skeleton[i] = kept > 0;
     }
 }
+struct binarize_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { binarize(index,args...); }
+};
 // Zhang-Suen thinning, one block per YX slice: each subpass marks every
 // deletable pixel of the slice before deleting any, as on the CPU.
-__global__ void thin_slices(std::uint8_t* image, std::uint8_t* marks, long long height, long long width) {
-    auto* slice = image + blockIdx.x*height*width; auto* mark = marks + blockIdx.x*height*width;
+__device__ void thin_slices(KernelIndex vcr_launch, std::uint8_t* image, std::uint8_t* marks, long long height, long long width) {
+    auto* slice = image + vcr_launch.block*height*width; auto* mark = marks + vcr_launch.block*height*width;
     const auto at = [&](long long y, long long x) { return y >= 0 && x >= 0 && y < height && x < width && slice[y*width+x] != 0; };
     for (bool changed = true; changed;) {
         changed = false;
@@ -35,9 +38,15 @@ __global__ void thin_slices(std::uint8_t* image, std::uint8_t* marks, long long 
         }
     }
 }
-__global__ void multiply(const std::uint8_t* skeleton, const float* values, float* out, std::size_t n) {
+struct thin_slices_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { thin_slices(index,args...); }
+};
+__device__ void multiply(KernelIndex vcr_launch, const std::uint8_t* skeleton, const float* values, float* out, std::size_t n) {
     EACH_INDEX(n) out[i] = float(skeleton[i]) * values[i];
 }
+struct multiply_launch {
+    template<class... Args> __device__ void operator()(KernelIndex index, Args... args) const { multiply(index,args...); }
+};
 void apply_cuda(const MedialSurface& t, Sample& s, const Parameters&, Session& session) {
     std::vector<std::pair<std::string, Field>> outputs;
     for (const auto& [name,f] : s) if (selected_label(name,f,t.on)) {
@@ -49,16 +58,16 @@ void apply_cuda(const MedialSurface& t, Sample& s, const Parameters&, Session& s
         const bool ignore = t.ignore.count(name); const double ignored = ignore ? t.ignore.at(name) : 0;
         // dilate/erode ping-pong through scratch; erosion uses the neutral border.
         const auto morph = [&](bool dilate) {
-            morphology_kernel<<<blocks(grid.size),256,0,vcr::device::stream()>>>(skeleton.ptr,scratch.ptr,g,footprint.ptr,footprint.size,dilate,!dilate);
+            launch(blocks(grid.size),256,0,vcr::device::stream(), morphology_kernel_launch{}, skeleton.ptr,scratch.ptr,g,footprint.ptr,footprint.size,dilate,!dilate);
             std::swap(skeleton.ptr,scratch.ptr);
         };
         for (std::size_t c = 0; c < a.shape[0]; ++c) {
-            a.typed([&](auto labels) { binarize<<<blocks(grid.size),256,0,vcr::device::stream()>>>(labels.ptr+c*grid.size,skeleton.ptr,values.ptr,grid.size,ignore,ignored); });
-            thin_slices<<<unsigned(grid.size/(h*w)),1024,0,vcr::device::stream()>>>(skeleton.ptr,scratch.ptr,(long long)h,(long long)w);
+            a.typed([&](auto labels) { launch(blocks(grid.size),256,0,vcr::device::stream(), binarize_launch{}, labels.ptr+c*grid.size,skeleton.ptr,values.ptr,grid.size,ignore,ignored); });
+            launch(unsigned(grid.size/(h*w)),1024,0,vcr::device::stream(), thin_slices_launch{}, skeleton.ptr,scratch.ptr,(long long)h,(long long)w);
             if (t.tube) { morph(true); morph(true); }
             if (t.open) { morph(false); morph(true); }
             if (t.close) { morph(true); morph(false); }
-            multiply<<<blocks(grid.size),256,0,vcr::device::stream()>>>(skeleton.ptr,values.ptr,out.view<float>().ptr+c*grid.size,grid.size);
+            launch(blocks(grid.size),256,0,vcr::device::stream(), multiply_launch{}, skeleton.ptr,values.ptr,out.view<float>().ptr+c*grid.size,grid.size);
             check(cudaGetLastError());
         }
         Array metadata; metadata.shape = a.shape; metadata.kind = 'f'; metadata.bytes = 4;
