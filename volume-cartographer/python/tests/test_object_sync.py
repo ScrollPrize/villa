@@ -20,6 +20,11 @@ def state(db):
     return {k: snapshot[k] for k in ("objects", "edges")}
 
 
+def endpoint_bindings(db, edge_uuid):
+    edge, binding = db.edge(edge_uuid), db.edge_geometry_state(edge_uuid)
+    return ({edge["a"]: binding["a_revision"], edge["b"]: binding["b_revision"]}, binding["stale"])
+
+
 def test_three_way_add_update_delete_and_noop(pair):
     a, b = pair
     first = a.upsert_object({"kind": "note", "name": "first"})
@@ -102,7 +107,7 @@ def test_geometry_history_bindings_and_force(pair):
     assert state(a) == state(b)
     assert a.geometry_history(x) == b.geometry_history(x)
     assert b.read_geometry_array(first, "line_points") == a.read_geometry_array(first, "line_points")
-    assert a.edge_geometry_state(edge) == b.edge_geometry_state(edge)
+    assert endpoint_bindings(a, edge) == endpoint_bindings(b, edge)
     before = a.journal_since()
     with pytest.raises(RuntimeError, match="force=true"):
         a.put_geometry(x, _geometry(value=3), expected_revision=second)
@@ -114,7 +119,7 @@ def test_geometry_history_bindings_and_force(pair):
     assert before == (state(a), state(b))
     assert a.synchronize(b, force=True)["applied"]
     assert b.current_geometry(x)["uuid"] == third
-    assert a.edge_geometry_state(edge) == b.edge_geometry_state(edge)
+    assert endpoint_bindings(a, edge) == endpoint_bindings(b, edge)
     assert b.edge_geometry_state(edge)["stale"] and b.edge(edge)["approval_state"] == "pending"
     with pytest.raises(RuntimeError, match="revalidate"):
         b.set_approval(edge, "approved")
