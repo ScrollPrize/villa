@@ -22,6 +22,7 @@ finds a published ink label and reads its corresponding surface-rendered CT
 layers and masks:
 
 ```python
+import numpy as np
 from vc_reader import load, ScrollSource
 
 catalog = load()
@@ -31,7 +32,7 @@ segment = ct_volume.segments["20250919125754"]
 label = segment.labels.ink(label_set="20260918")
 surface_volume = label.surface_volumes.zarr()
 
-with label.open_paired(image=surface_volume, layers=slice(40, 65), backend="cpu") as reader:
+with label.open_paired(image=surface_volume, layers=np.s_[40:65], backend="cpu") as reader:
     patch = reader[18576:18704, 7984:8112]
     ct_layers = patch.image.data                # (1, 25, 128, 128)
     ink = patch.label.data                      # (1, 128, 128)

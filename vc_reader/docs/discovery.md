@@ -134,7 +134,9 @@ explicitly, using its actual storage transform for aligned sampling.
 ## Flattened paired reads
 
 ```python
-with label.open_paired(image=surface_volume, layers=slice(40, 65), backend='cpu') as reader:
+import numpy as np
+
+with label.open_paired(image=surface_volume, layers=np.s_[40:65], backend='cpu') as reader:
     patch = reader[18576:18704, 7984:8112]
     image = patch.image.data       # C,D,H,W
     ink = patch.label.data         # C,H,W

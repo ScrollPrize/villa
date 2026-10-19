@@ -83,6 +83,7 @@ With `scripts` on `PYTHONPATH`, construct a Dataset using views already selected
 through `ScrollSource` or the catalog:
 
 ```python
+import numpy as np
 from training_workflows import (
     ReadSpec, TrainingDataset, image_arrays, label_arrays,
     pipeline, data_loader, restore_layers,
@@ -92,7 +93,7 @@ from vc_reader.torch import CudaLoader
 # image is the render selected by label.surface_volumes.zarr(), as in the README.
 arrays = {**image_arrays(layers=True),
           **label_arrays(masks=("supervision", "validation"))}
-spec = ReadSpec(label, mode="paired", image=image, layers=slice(40, 65))
+spec = ReadSpec(label, mode="paired", image=image, layers=np.s_[40:65])
 requests = [(0, (18576, 7984), (128, 128)), (0, (19344, 14192), (128, 128))]
 dataset = TrainingDataset([spec], requests, arrays, seeds=[123, 456],
                           memory_cache_bytes=64 << 20, threads=1)
