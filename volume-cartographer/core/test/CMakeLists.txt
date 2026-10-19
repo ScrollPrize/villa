@@ -688,6 +688,12 @@ if(TARGET vc_render_tifxyz)
             $<TARGET_FILE:vc_render_tifxyz>)
     set_tests_properties(test_render_band_prefetch PROPERTIES TIMEOUT 120)
     vc_register_ctest(test_render_band_prefetch vc_render_tifxyz)
+    add_test(NAME test_render_rotate_flip
+        COMMAND ${Python3_EXECUTABLE}
+            "${CMAKE_CURRENT_SOURCE_DIR}/test_render_rotate_flip.py"
+            $<TARGET_FILE:vc_render_tifxyz>)
+    set_tests_properties(test_render_rotate_flip PROPERTIES TIMEOUT 300)
+    vc_register_ctest(test_render_rotate_flip vc_render_tifxyz)
 endif()
 
 vc_add_test(NAME test_fiber_side_strip_intersections LIBS doctest::doctest vc_fiber_tracer)
@@ -747,6 +753,7 @@ vc_add_test(NAME test_quadsurface_components)
 vc_add_test(NAME test_volume_local)
 
 vc_add_test(NAME test_zarr_helpers)
+vc_add_test(NAME test_rotate_flip_rect)
 
 vc_add_test(NAME test_chunked_plane_sampler)
 
