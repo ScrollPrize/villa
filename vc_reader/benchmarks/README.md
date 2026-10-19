@@ -10,11 +10,11 @@ local artifacts ignored by Git. Input fixtures remain versioned.
 | [`bench_pipeline.py`](bench_pipeline.py) | CPU/CUDA reading, sampling, normalization and augmentation |
 | [`bench_augmentations.py`](bench_augmentations.py) | Individual augmentation recipes, including transfers and resident CUDA arrays |
 | [`bench_torch.py`](bench_torch.py) | Per-sample processing, CUDA batches and loader prefetch |
-| [`bench_fiber_trainer.py`](bench_fiber_trainer.py) | Full model and optimizer updates with the fiber trainer |
+| [`fiber_training/bench_fiber_trainer.py`](fiber_training/bench_fiber_trainer.py) | Full model and optimizer updates with the fiber trainer |
 
 ## Fiber trainer comparison
 
-[`bench_fiber_trainer.py`](bench_fiber_trainer.py) runs real sampled batches
+[`fiber_training/bench_fiber_trainer.py`](fiber_training/bench_fiber_trainer.py) runs real sampled batches
 through the model and optimizer. The table uses `--steps 500 --warmup 20
 --grad-steps 1 --lookahead 0 --timeline`; initialization and warmup are excluded.
 Use `--backend existing` for the trainer pipeline, or `--backend vc-reader

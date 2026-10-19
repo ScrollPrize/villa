@@ -40,7 +40,7 @@ def main():
     parser.add_argument('--backend', choices=('existing', 'vc-reader'), required=True)
     parser.add_argument('--reader-device', choices=('cpu', 'cuda'), default='cuda')
     parser.add_argument('--trainer-source', type=Path,
-                        default=Path(__file__).resolve().parents[2]/'vesuvius'/'src',
+                        default=Path(__file__).resolve().parents[3]/'vesuvius'/'src',
                         help='Trainer source checkout; defaults to this branch')
     parser.add_argument('--location-weights-dir', type=Path,
                         help='Explicit sampling-weight cache shared by all compared routes')
