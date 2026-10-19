@@ -353,12 +353,13 @@ def ranked(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             for i, r in enumerate(hit, start=1)]
 
 
-def _parse_fail_on(specs: Sequence[str]) -> dict[str, float]:
+def _parse_fail_on(specs: Sequence[str], keys: Sequence[str] | None = None) -> dict[str, float]:
+    keys = list(flat_keys()) if keys is None else list(keys)
     limits = {}
     for spec in specs:
         key, sep, val = spec.partition("=")
-        if not sep or key not in set(flat_keys()):
-            raise SystemExit(f"--fail-on expects METRIC=MAX with METRIC in {flat_keys()}: {spec!r}")
+        if not sep or key not in keys:
+            raise SystemExit(f"--fail-on expects METRIC=MAX with METRIC in {keys}: {spec!r}")
         try:
             limits[key] = float(val)
         except ValueError:

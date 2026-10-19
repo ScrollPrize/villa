@@ -39,8 +39,8 @@ vesuvius.surface_placement_audit --surface seg_a.obj seg_b/ --volume ct.zarr \
   URL); `--level` picks the multiscale level. Surface coordinates must be in
   the voxel grid of that level.
 - `--samples` (20000): points per surface. An obj is read in `--blobs` (40)
-  byte ranges of its vertex block, each a spatially compact patch since VolCart
-  writes vertices in grid order, with the same number of points drawn from each.
+  byte ranges of its vertex block, with the same number of points drawn from
+  each. The controls below measure a further 4 × 5000 points.
 - `--half` (8), `--step` (0.5): the profile runs from `-half` to `+half`
   voxels along the normal. `--sigma` (1.0) smooths the CT first.
 - `--min-contrast` (8 grey levels), `--min-prominence` (0.15 of the profile
@@ -65,7 +65,9 @@ surface, and `<name>.png` with `--plot` (offset as colour in two projections).
 | `off_sheet_frac` | share of valid points where the CT at the point is below the half-maximum of its peak, i.e. the point is outside the sheet |
 | `sheet_fwhm_median` | half-maximum width of the located sheet, voxels |
 | `contrast_median` | median profile range |
-| `n_patches`, `patch_offset_*`, `patch_abs_gt_2_frac` | median offset per sampling patch (30+ valid points): quantiles, range, and the share of patches more than 2 voxels off; a large range with a small per-patch spread is drift, not noise |
+| `n_patches`, `patch_offset_*`, `patch_abs_gt_2_frac` | median offset per 32-voxel cell (30+ valid points): quantiles, range, and the share of cells more than 2 voxels off |
+| `snap_remeasure_sd`, `snap_remeasure_abs_gt_2_frac` | control: each valid point moved to its located peak and measured again; the spread left is the precision of the peak location, not of the surface (0.5 voxels on Scroll 1) |
+| `tangent_absdiff_median_{2,4,8}`, `tangent_corr_{2,4,8}` | a second point 2, 4 and 8 voxels away in the tangent plane: median absolute difference of the two offsets, and their correlation. Agreement at 2 and disagreement at 8 means the surface misses the sheet at a scale below its own triangles; agreement at all three means a displaced surface |
 
 The sign convention follows the stored normal and is not flipped to the CT
 gradient, so a consistently negative median on a segment whose normals point
@@ -85,3 +87,22 @@ surfaces with the same normal convention.
 It measures distance to the nearest density peak, not winding identity: a
 surface that jumped cleanly onto the neighbouring sheet reads as well placed.
 Use it with the topology audit, not instead of it.
+
+## Results on the public Scroll 1 segments
+
+Three segments (20230827161847, 20231007101619, 20230929220926) against the
+public `54keV_7.91um_Scroll1A` volume, 20000 samples each, defaults:
+
+| | offset median | IQR | share > 2 vox | off sheet | no peak |
+| --- | --- | --- | --- | --- | --- |
+| all three | −1.5 | −3.5 … +1.0 | 0.56–0.59 | 0.35–0.37 | 0.24–0.31 |
+
+The three segments give the same numbers, and the offset histogram is nearly
+flat from −6 to +6, so this is not three segments drifting the same way. The
+controls say what it is: the snap control remeasures at a spread of 0.5
+voxels, so the peak location is precise, and the offsets of two points 2
+voxels apart agree (median difference 0.5) while points 16 voxels apart are
+uncorrelated. The public meshes are triangles of roughly 18 voxels, and the
+sheet moves by several voxels inside one triangle. On half the surface area the
+mesh is more than 2 voxels (16 µm) from the sheet, and that is a resolution
+limit of the mesh, not a tracing error that a global shift would fix.

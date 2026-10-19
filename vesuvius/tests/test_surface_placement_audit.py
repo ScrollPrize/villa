@@ -71,6 +71,20 @@ def test_known_offset_is_recovered(tmp_path, ct, shift):
     assert rows[0]["surface"] == "s"
 
 
+def test_controls_on_a_flat_sheet(tmp_path, ct):
+    # on a flat synthetic sheet the snapped points remeasure at 0 and tangent neighbours agree
+    pts = grid_points(32.0)
+    obj = tmp_path / "s.obj"
+    write_obj(obj, pts, np.tile([0, 0, 1.0], (len(pts), 1)))
+    _, out, _ = run(tmp_path, ct, [str(obj)])
+    m = json.load(open(out / "s.json"))
+    assert m["snap_remeasure_sd"] == pytest.approx(0.0, abs=0.3)
+    assert m["snap_remeasure_abs_gt_2_frac"] == 0.0
+    for r in (2, 4, 8):
+        assert m[f"tangent_absdiff_median_{r}"] == pytest.approx(0.0, abs=0.5)
+    assert m["n_patches"] >= 1
+
+
 def test_flipped_normal_flips_sign(tmp_path, ct):
     pts = grid_points(32.0)
     obj = tmp_path / "s.obj"
@@ -123,8 +137,18 @@ def test_samples_csv_has_coordinates(tmp_path, ct):
     assert set(rows[0]) >= {"z", "y", "x", "nz", "ny", "nx", "patch", "offset", "contrast", "valid"}
 
 
+def test_nan_metric_fails_the_gate(tmp_path):
+    p = tmp_path / "flat.tif"
+    tifffile.imwrite(p, np.full((64, 64, 64), 90, np.uint8))
+    pts = grid_points(30.0)
+    obj = tmp_path / "s.obj"
+    write_obj(obj, pts, np.tile([0, 0, 1.0], (len(pts), 1)))
+    rc, _, _ = run(tmp_path, str(p), [str(obj)], "--fail-on", "offset_abs_gt_2_frac=0.5")
+    assert rc == 2
+
+
 def test_parse_v_vn_drops_partial_and_unpaired_lines():
-    blob = b"1.5 2.5\nv 1 2 3\nvn 0 0 1\nv 4 5 6\nvt 0.1 0.2\nv 7 8 9\nvn 1 0 0\nv 10 11"
+    blob = b"1.5 2.5\nv 1 2 3\nvn 0 0 1\nv 4 5 6\nvt 0.1 0.2\nv 7 8 9\nvn 1 0 0\nv 1 2\nvn 0 0 1\nv 3 4 nan\nvn 0 0 1\nv 10 11"
     P, N = spa._parse_v_vn(blob)
     assert P.tolist() == [[1, 2, 3], [7, 8, 9]]
     assert N.tolist() == [[0, 0, 1], [1, 0, 0]]

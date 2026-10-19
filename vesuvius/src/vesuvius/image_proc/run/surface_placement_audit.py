@@ -30,7 +30,7 @@ from typing import Any, Sequence
 
 import numpy as np
 
-from vesuvius.image_proc.run.label_topology_audit import open_volume
+from vesuvius.image_proc.run.label_topology_audit import _parse_fail_on, open_volume
 
 METRICS = (
     "n_samples", "n_inside_volume", "n_valid", "no_peak_frac",
@@ -39,37 +39,38 @@ METRICS = (
     "off_sheet_frac", "sheet_fwhm_median", "contrast_median",
     "n_patches", "patch_offset_q25", "patch_offset_median", "patch_offset_q75",
     "patch_offset_range", "patch_abs_gt_2_frac",
+    "snap_remeasure_sd", "snap_remeasure_abs_gt_2_frac",
+    "tangent_absdiff_median_2", "tangent_absdiff_median_4", "tangent_absdiff_median_8",
+    "tangent_corr_2", "tangent_corr_4", "tangent_corr_8",
 )
+TANGENT_RADII = (2.0, 4.0, 8.0)
 
 
 def parse_fail_on(specs: Sequence[str]) -> dict[str, float]:
-    limits = {}
-    for spec in specs:
-        key, sep, val = spec.partition("=")
-        if not sep or key not in METRICS:
-            raise SystemExit(f"--fail-on expects METRIC=MAX with METRIC in {METRICS}: {spec!r}")
-        try:
-            limits[key] = float(val)
-        except ValueError:
-            raise SystemExit(f"--fail-on limit must be a number: {spec!r}") from None
-        if not np.isfinite(limits[key]):
-            raise SystemExit(f"--fail-on limit must be finite: {spec!r}")
-    return limits
+    return _parse_fail_on(specs, METRICS)
 
 
 # --------------------------------------------------------------------------- surfaces
 
 
+HTTP_TIMEOUT = 60
+
+
 def _http_size(url: str) -> int:
     req = urllib.request.Request(url, method="HEAD")
-    with urllib.request.urlopen(req) as r:
-        return int(r.headers["Content-Length"])
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+        size = r.headers.get("Content-Length")
+    if size is None:
+        raise ValueError(f"{url}: server gives no Content-Length; range sampling needs it")
+    return int(size)
 
 
 def _http_range(url: str, start: int, length: int) -> bytes:
     req = urllib.request.Request(url, headers={"Range": f"bytes={start}-{start + length - 1}"})
-    with urllib.request.urlopen(req) as r:
-        return r.read()
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as r:
+        if r.status != 206:
+            raise ValueError(f"{url}: server ignored the Range header (status {r.status}); range sampling needs it")
+        return r.read(length)
 
 
 def _parse_v_vn(blob: bytes, at_start: bool = False) -> tuple[np.ndarray, np.ndarray]:
@@ -86,21 +87,26 @@ def _parse_v_vn(blob: bytes, at_start: bool = False) -> tuple[np.ndarray, np.nda
         if ln.startswith(b"vn "):
             if last_v is not None:
                 try:
-                    nrm.append([float(t) for t in ln[3:].split()[:3]])
-                    pts.append(last_v)
+                    vals = [float(t) for t in ln[3:].split()]
+                    if len(vals) >= 3:
+                        nrm.append(vals[:3])
+                        pts.append(last_v)
                 except ValueError:
                     pass
             last_v = None
         elif ln.startswith(b"v "):
             try:
-                last_v = [float(t) for t in ln[2:].split()[:3]]
+                vals = [float(t) for t in ln[2:].split()]
+                last_v = vals[:3] if len(vals) >= 3 else None
             except ValueError:
                 last_v = None
         else:
             last_v = None
     if not pts:
         return np.zeros((0, 3)), np.zeros((0, 3))
-    return np.asarray(pts, np.float64), np.asarray(nrm, np.float64)
+    P, N = np.asarray(pts, np.float64), np.asarray(nrm, np.float64)
+    ok = np.isfinite(P).all(1) & np.isfinite(N).all(1) & (np.linalg.norm(N, axis=1) > 0)
+    return P[ok], N[ok]
 
 
 def _vertex_region_end(reader, size: int, probe: int = 4096) -> int:
@@ -125,7 +131,10 @@ def _vertex_region_end(reader, size: int, probe: int = 4096) -> int:
             hi = mid
     # exact end: scan the last window line by line
     blob = reader(lo, min(2 * probe, size - lo))
-    pos = lo if lo == 0 else lo + blob.index(b"\n") + 1
+    nl = blob.find(b"\n")
+    if lo > 0 and nl < 0:
+        raise ValueError("obj vertex block: no line break in the probed window")
+    pos = lo if lo == 0 else lo + nl + 1
     for ln in blob[pos - lo:].split(b"\n"):
         if not ln.startswith((b"v ", b"vn ", b"#")):
             break
@@ -136,21 +145,23 @@ def _vertex_region_end(reader, size: int, probe: int = 4096) -> int:
 def sample_obj(src: str, samples: int, blobs: int, rng: np.random.Generator, blob_bytes: int = 1 << 19):
     """Random surface points and normals from an obj, reading ``blobs`` byte ranges of the vertex block.
 
-    Vertices in VolCart objs are written in grid order, so each range is one spatially
-    compact patch; ``samples`` points are drawn evenly across the patches. Returns
-    (points zyx, normals zyx, n_vertices_declared).
+    ``samples`` points are drawn evenly across the ranges. Returns
+    (points zyx, normals zyx, 32-voxel cell id per point, n_vertices_declared).
     """
     if src.startswith(("http://", "https://")):
         size = _http_size(src)
-        reader = lambda s, n: _http_range(src, s, n)  # noqa: E731
-    else:
-        size = os.path.getsize(src)
-        fh = open(src, "rb")
+        return _sample_obj(src, size, lambda s, n: _http_range(src, s, n), samples, blobs, rng, blob_bytes)
+    size = os.path.getsize(src)
+    with open(src, "rb") as fh:
 
         def reader(s, n):
             fh.seek(s)
             return fh.read(n)
 
+        return _sample_obj(src, size, reader, samples, blobs, rng, blob_bytes)
+
+
+def _sample_obj(src, size, reader, samples, blobs, rng, blob_bytes):
     head = reader(0, 4096)
     m = re.search(rb"# Vertices: (\d+)", head)
     declared = int(m.group(1)) if m else -1
@@ -160,19 +171,19 @@ def sample_obj(src: str, samples: int, blobs: int, rng: np.random.Generator, blo
     blobs = max(1, min(blobs, max(1, end // blob_bytes)))
     starts = np.sort(rng.integers(0, max(1, end - blob_bytes), blobs)) if end > blob_bytes else np.array([0])
     per = max(1, math.ceil(samples / len(starts)))
-    P, N, patch = [], [], []
-    for k, s in enumerate(starts):
+    P, N = [], []
+    for s in starts:
         pts, nrm = _parse_v_vn(reader(int(s), min(blob_bytes, end - int(s)) + 1), at_start=int(s) == 0)
         if len(pts) == 0:
             continue
         pick = rng.choice(len(pts), min(per, len(pts)), replace=False)
-        P.append(pts[pick]); N.append(nrm[pick]); patch.append(np.full(len(pick), k))
+        P.append(pts[pick]); N.append(nrm[pick])
     if not P:
         raise ValueError(f"{src}: vertex block yielded no v/vn pairs")
     P = np.concatenate(P)[:, ::-1]
     N = np.concatenate(N)[:, ::-1]
     N /= np.linalg.norm(N, axis=1, keepdims=True) + 1e-12
-    return P, N, np.concatenate(patch), declared
+    return P, N, cell_ids(P), declared
 
 
 def sample_tifxyz(path: str, samples: int, rng: np.random.Generator):
@@ -193,9 +204,21 @@ def sample_tifxyz(path: str, samples: int, rng: np.random.Generator):
     P = np.stack([z.ravel()[pick], y.ravel()[pick], x.ravel()[pick]], 1).astype(np.float64)
     N = np.stack([nz.ravel()[pick], ny.ravel()[pick], nx.ravel()[pick]], 1).astype(np.float64)
     N /= np.linalg.norm(N, axis=1, keepdims=True) + 1e-12
-    # patch id: 64x64 cells of the stored grid
-    patch = (r // 64) * (x.shape[1] // 64 + 1) + (c // 64)
-    return P, N, patch, int(ok.sum())
+    return P, N, cell_ids(P), int(ok.sum())
+
+
+def cell_ids(P: np.ndarray, size: float = 32.0) -> np.ndarray:
+    """Spatial patch id: the ``size``-voxel cell each point falls in."""
+    c = np.floor(P / size).astype(np.int64)
+    return c[:, 0] * 10**10 + c[:, 1] * 10**5 + c[:, 2]
+
+
+def tangent_points(P: np.ndarray, N: np.ndarray, radius: float, rng: np.random.Generator) -> np.ndarray:
+    """A point ``radius`` voxels from each P along a random direction in its tangent plane."""
+    r = rng.standard_normal(P.shape)
+    r -= (r * N).sum(1, keepdims=True) * N
+    r /= np.linalg.norm(r, axis=1, keepdims=True) + 1e-12
+    return P + radius * r
 
 
 def is_tifxyz(src: str) -> bool:
@@ -226,7 +249,8 @@ def read_profiles(vol, P: np.ndarray, N: np.ndarray, half: float, step: float, s
         sel = np.flatnonzero((key == k) & inside)
         lo = np.maximum(P[sel].min(0).astype(int) - pad, 0)
         hi = np.minimum(P[sel].max(0).astype(int) + pad + 1, shape)
-        box = np.asarray(vol[tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))], dtype=np.float32)
+        index = (0,) * (vol.ndim - 3) + tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
+        box = np.asarray(vol[index], dtype=np.float32)
         if box.ndim > 3:
             box = box.reshape(box.shape[-3:])
         if sigma > 0:
@@ -336,6 +360,43 @@ def summarize(off: np.ndarray, contrast: np.ndarray, valid: np.ndarray, inside: 
     return out
 
 
+def controls(vol, P, N, off, valid, a, rng) -> dict[str, float]:
+    """Two checks on the offsets themselves.
+
+    Snap control: each valid point moved to its located peak and measured again; the
+    spread that remains is the precision of the peak location, not of the surface.
+    Tangent check: a second point 2, 4 and 8 voxels away in the tangent plane; the
+    agreement of its offset with the first says over what distance the offset is a
+    property of the surface (drift) rather than of one point (noise or sheet texture).
+    """
+    out: dict[str, float] = {k: float("nan") for k in METRICS if k.startswith(("snap_", "tangent_"))}
+    idx = np.flatnonzero(valid)
+    if len(idx) < 30:
+        return out
+    if len(idx) > 5000:
+        idx = rng.choice(idx, 5000, replace=False)
+    P0, N0, o0 = P[idx], N[idx], off[idx]
+    extra = [P0 + o0[:, None] * N0] + [tangent_points(P0, N0, r, rng) for r in TANGENT_RADII]
+    Q = np.concatenate(extra)
+    NQ = np.tile(N0, (len(extra), 1))
+    prof, t, inside = read_profiles(vol, Q, NQ, a.half, a.step, a.sigma, workers=a.workers)
+    offq, _, vq = nearest_peak(prof, t, a.min_contrast, a.min_prominence)
+    vq &= inside
+    n = len(idx)
+    s_off, s_ok = offq[:n], vq[:n]
+    if s_ok.sum() >= 30:
+        out["snap_remeasure_sd"] = float(np.std(s_off[s_ok]))
+        out["snap_remeasure_abs_gt_2_frac"] = float(np.mean(np.abs(s_off[s_ok]) > 2))
+    for k, r in enumerate(TANGENT_RADII, start=1):
+        t_off, t_ok = offq[k * n:(k + 1) * n], vq[k * n:(k + 1) * n]
+        if t_ok.sum() >= 30:
+            d = o0[t_ok] - t_off[t_ok]
+            tag = f"{int(r)}"
+            out[f"tangent_absdiff_median_{tag}"] = float(np.median(np.abs(d)))
+            out[f"tangent_corr_{tag}"] = float(np.corrcoef(o0[t_ok], t_off[t_ok])[0, 1]) if o0[t_ok].std() > 0 and t_off[t_ok].std() > 0 else float("nan")
+    return out
+
+
 def plot(P, off, valid, path: str, name: str) -> None:
     import matplotlib
 
@@ -407,6 +468,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         off, contrast, valid = nearest_peak(prof, t, a.min_contrast, a.min_prominence)
         valid &= inside
         m = summarize(off, contrast, valid, inside, patch, prof, t, a.half)
+        m.update(controls(vol, P, N, off, valid, a, rng))
         m.update({"surface": name, "source": src, "volume": a.volume, "n_vertices": int(n_vert),
                   "half": a.half, "step": a.step, "sigma": a.sigma,
                   "min_contrast": a.min_contrast, "min_prominence": a.min_prominence})
@@ -425,9 +487,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         rows.append(m)
         print(f"{name}: valid {m['n_valid']}/{m['n_samples']} offset median {m['offset_median']:+.2f} "
               f"IQR [{m['offset_q25']:+.2f}, {m['offset_q75']:+.2f}] |off|>2 {m['offset_abs_gt_2_frac']:.2f} "
-              f"off-sheet {m['off_sheet_frac']:.2f} no-peak {m['no_peak_frac']:.2f}", flush=True)
+              f"off-sheet {m['off_sheet_frac']:.2f} no-peak {m['no_peak_frac']:.2f} "
+              f"snap-sd {m['snap_remeasure_sd']:.2f} tangent|diff| 2/4/8 {m['tangent_absdiff_median_2']:.1f}/"
+              f"{m['tangent_absdiff_median_4']:.1f}/{m['tangent_absdiff_median_8']:.1f}", flush=True)
         for k, lim in limits.items():
-            if k in m and isinstance(m[k], (int, float)) and m[k] > lim:
+            if not (m[k] <= lim):  # NaN (nothing measured) fails too
                 print(f"FAIL {name}: {k}={m[k]} > {lim}", flush=True)
                 failed = True
     keys = [k for k in rows[0] if k not in ("source", "volume")]
