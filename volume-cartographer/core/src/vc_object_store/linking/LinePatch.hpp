@@ -1,9 +1,9 @@
 #pragma once
-#include "vc/core/graph_links/GraphLinks.hpp"
+#include "vc/core/object_links/ObjectLinks.hpp"
 #include <functional>
 #include <opencv2/core.hpp>
 
-namespace vc::graph_links::detail {
+namespace vc::object_links::detail {
 struct LineData {
     std::filesystem::path path; // diagnostic label; not necessarily a file
     std::string uuid;
@@ -22,4 +22,4 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, size_t lineCount, co
     const std::filesystem::path& patchesDir, const std::filesystem::path& ctVolume,
     const LinePatchParams& params, double sourceScale, const char* detector, int version,
     const std::atomic_bool* cancel);
-} // namespace vc::graph_links::detail
+} // namespace vc::object_links::detail

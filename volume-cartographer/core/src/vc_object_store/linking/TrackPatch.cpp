@@ -3,7 +3,7 @@
 #include <cmath>
 #include <stdexcept>
 
-namespace vc::graph_links {
+namespace vc::object_links {
 DetectorReport linkTracksToPatches(objects::ObjectStore& db, const std::filesystem::path& tracksPath,
     const std::filesystem::path& patchesDir, const std::filesystem::path& ctVolume,
     const TrackPatchParams& params, const std::atomic_bool* cancel)
@@ -58,4 +58,4 @@ DetectorReport linkTracksToPatches(objects::ObjectStore& db, const std::filesyst
         return report;
     }
 }
-} // namespace vc::graph_links
+} // namespace vc::object_links

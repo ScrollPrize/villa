@@ -6,7 +6,7 @@
 // docs/plans/graph_db_initial_implementation.md (Phase 4).
 
 #include "vc/core/objects/ObjectStore.hpp"
-#include "vc/core/graph_links/GraphLinks.hpp"
+#include "vc/core/object_links/ObjectLinks.hpp"
 #include "vc/core/util/TerminalProgress.hpp"
 
 #include <exception>
@@ -96,14 +96,14 @@ try {
     fs::path dbPath, fiberDir, segmentsDir, tracksPath, overlapDir, importJsonPath, exportJsonPath;
     fs::path linkFiberDir, linkTrackPath, ctVolume;
     std::vector<fs::path> pclFiles;
-    vc::graph_links::PointCollectionPatchParams pclParams;
-    vc::graph_links::TrackPatchParams trackPatchParams;
-    vc::graph_links::FiberPatchParams fiberPatchParams;
+    vc::object_links::PointCollectionPatchParams pclParams;
+    vc::object_links::TrackPatchParams trackPatchParams;
+    vc::object_links::FiberPatchParams fiberPatchParams;
     bool linkTracks = false;
     bool showProgress = true;
-    vc::graph_links::TrackTrackParams trackParams;
+    vc::object_links::TrackTrackParams trackParams;
     std::string author;
-    vc::graph_links::PatchOverlapParams overlapParams;
+    vc::object_links::PatchOverlapParams overlapParams;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         auto next = [&](const char* flag) -> std::string {
@@ -188,7 +188,7 @@ try {
         throw std::runtime_error("PCL linking requires --segments");
     pclParams.patchScale = fiberPatchParams.patchScale;
 
-    static_cast<vc::graph_links::LinePatchParams&>(trackPatchParams) = fiberPatchParams;
+    static_cast<vc::object_links::LinePatchParams&>(trackPatchParams) = fiberPatchParams;
     trackPatchParams.sourceIds = trackParams.sourceIds;
     trackPatchParams.trackUuids = trackParams.trackUuids;
 
@@ -236,7 +236,7 @@ try {
     if (linkTracks) {
         vc::util::TerminalProgress progress("Track crossings", showProgress);
         trackParams.progress = progress.callback();
-        const auto report = vc::graph_links::linkTracksToTracks(db, trackParams);
+        const auto report = vc::object_links::linkTracksToTracks(db, trackParams);
         progress.finish();
         std::cout << "track-tracks: " << report.objectsConsidered << " tracks, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
@@ -248,7 +248,7 @@ try {
     if (!overlapDir.empty()) {
         vc::util::TerminalProgress progress("Patch overlaps", showProgress);
         overlapParams.progress = progress.callback();
-        const auto report = vc::graph_links::linkPatchOverlaps(db, overlapDir, overlapParams);
+        const auto report = vc::object_links::linkPatchOverlaps(db, overlapDir, overlapParams);
         progress.finish();
         std::cout << "patch-overlaps: " << report.objectsConsidered << " patches, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
@@ -259,7 +259,7 @@ try {
     if (!linkTrackPath.empty()) {
         vc::util::TerminalProgress progress("Track to patch", showProgress);
         trackPatchParams.progress = progress.callback();
-        const auto report = vc::graph_links::linkTracksToPatches(
+        const auto report = vc::object_links::linkTracksToPatches(
             db, linkTrackPath, segmentsDir, ctVolume, trackPatchParams);
         progress.finish();
         std::cout << "track-patches: " << report.objectsConsidered << " objects, "
@@ -272,7 +272,7 @@ try {
     if (!linkFiberDir.empty()) {
         vc::util::TerminalProgress progress("Fiber to patch", showProgress);
         fiberPatchParams.progress = progress.callback();
-        const auto report = vc::graph_links::linkFibersToPatches(
+        const auto report = vc::object_links::linkFibersToPatches(
             db, linkFiberDir, segmentsDir, ctVolume, fiberPatchParams);
         progress.finish();
         std::cout << "fiber-patches: " << report.objectsConsidered << " objects, "
@@ -284,7 +284,7 @@ try {
     for (const auto& pclFile : pclFiles) {
         vc::util::TerminalProgress progress("Point collections to patches", showProgress);
         pclParams.progress = progress.callback();
-        const auto report = vc::graph_links::linkPointCollectionsToPatches(db, pclFile, segmentsDir, pclParams);
+        const auto report = vc::object_links::linkPointCollectionsToPatches(db, pclFile, segmentsDir, pclParams);
         progress.finish();
         std::cout << "pcl-patches: " << report.objectsConsidered << " objects, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "

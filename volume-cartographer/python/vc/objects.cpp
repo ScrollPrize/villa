@@ -3,11 +3,11 @@
 #include "vc/core/objects/import/FiberImport.hpp"
 #include "StorageBindings.hpp"
 #include "vc/core/objects/ObjectStore.hpp"
-#include "vc/core/graph_links/GraphLinks.hpp"
+#include "vc/core/object_links/ObjectLinks.hpp"
 #include "vc/core/util/CtSheetNormal.hpp"
 using namespace vc::python;
 namespace {
-nb::dict detectorReportToPy(const vc::graph_links::DetectorReport& rep)
+nb::dict detectorReportToPy(const vc::object_links::DetectorReport& rep)
 {
     nb::dict d;
     d["objects_considered"] = rep.objectsConsidered;
@@ -33,7 +33,7 @@ nb::dict reportToPy(const vo::ImportReport& rep)
     return d;
 }
 
-bool setLinePatchParameter(vc::graph_links::LinePatchParams& p, const std::string& key, nb::handle val)
+bool setLinePatchParameter(vc::object_links::LinePatchParams& p, const std::string& key, nb::handle val)
 {
     if (key == "patch_scale") p.patchScale = nb::cast<double>(val);
     else if (key == "normals_manifest") p.normalsManifest = nb::cast<std::string>(val);
@@ -357,7 +357,7 @@ NB_MODULE(objects, m)
             "link_point_collections_to_patches",
             [](PyObjectStore& self, const std::string& collectionsFile, const std::string& patchesDir,
                const nb::kwargs& kwargs) {
-                vc::graph_links::PointCollectionPatchParams p;
+                vc::object_links::PointCollectionPatchParams p;
                 for (auto item : kwargs) {
                     const auto key = nb::cast<std::string>(item.first);
                     const nb::handle value = item.second;
@@ -371,11 +371,11 @@ NB_MODULE(objects, m)
                     else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(value);
                     else throw std::runtime_error("link_point_collections_to_patches: unknown parameter '" + key + "'");
                 }
-                vc::graph_links::DetectorReport report;
+                vc::object_links::DetectorReport report;
                 auto& db = self.require();
                 {
                     nb::gil_scoped_release release;
-                    report = vc::graph_links::linkPointCollectionsToPatches(db, collectionsFile, patchesDir, p);
+                    report = vc::object_links::linkPointCollectionsToPatches(db, collectionsFile, patchesDir, p);
                 }
                 return detectorReportToPy(report);
             },
@@ -386,7 +386,7 @@ NB_MODULE(objects, m)
         .def(
             "link_patch_overlaps",
             [](PyObjectStore& self, const std::string& dir, const nb::kwargs& kwargs) {
-                vc::graph_links::PatchOverlapParams p;
+                vc::object_links::PatchOverlapParams p;
                 for (auto item : kwargs) {
                     const std::string key = nb::cast<std::string>(item.first);
                     const nb::handle val = item.second;
@@ -409,7 +409,7 @@ NB_MODULE(objects, m)
                     else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(val);
                     else throw std::runtime_error("link_patch_overlaps: unknown parameter '" + key + "'");
                 }
-                auto rep = vc::graph_links::linkPatchOverlaps(self.require(), dir, p);
+                auto rep = vc::object_links::linkPatchOverlaps(self.require(), dir, p);
                 return detectorReportToPy(rep);
             },
             "Run the patch-overlap detector over the tifxyz segment dirs in dir; "
@@ -417,7 +417,7 @@ NB_MODULE(objects, m)
         .def(
             "link_tracks_to_tracks",
             [](PyObjectStore& self, const std::string& tracksPath, const nb::kwargs& kwargs) {
-                vc::graph_links::TrackTrackParams p;
+                vc::object_links::TrackTrackParams p;
                 p.tracksPath = tracksPath;
                 for (auto item : kwargs) {
                     const auto key = nb::cast<std::string>(item.first);
@@ -433,11 +433,11 @@ NB_MODULE(objects, m)
                     else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(value);
                     else throw std::runtime_error("link_tracks_to_tracks: unknown parameter '" + key + "'");
                 }
-                vc::graph_links::DetectorReport report;
+                vc::object_links::DetectorReport report;
                 auto& db = self.require();
                 {
                     nb::gil_scoped_release release;
-                    report = vc::graph_links::linkTracksToTracks(db, p);
+                    report = vc::object_links::linkTracksToTracks(db, p);
                 }
                 return detectorReportToPy(report);
             },
@@ -450,7 +450,7 @@ NB_MODULE(objects, m)
             "link_tracks_to_patches",
             [](PyObjectStore& self, const std::string& tracksPath, const std::string& patchesDir,
                const std::string& ctVolume, const nb::kwargs& kwargs) {
-                vc::graph_links::TrackPatchParams p;
+                vc::object_links::TrackPatchParams p;
                 for (auto item : kwargs) {
                     const auto key = nb::cast<std::string>(item.first);
                     const nb::handle val = item.second;
@@ -460,11 +460,11 @@ NB_MODULE(objects, m)
                     else if (!setLinePatchParameter(p, key, val))
                         throw std::runtime_error("link_tracks_to_patches: unknown parameter '" + key + "'");
                 }
-                vc::graph_links::DetectorReport report;
+                vc::object_links::DetectorReport report;
                 auto& db = self.require();
                 {
                     nb::gil_scoped_release release;
-                    report = vc::graph_links::linkTracksToPatches(db, tracksPath, patchesDir, ctVolume, p);
+                    report = vc::object_links::linkTracksToPatches(db, tracksPath, patchesDir, ctVolume, p);
                 }
                 return detectorReportToPy(report);
             },
@@ -476,7 +476,7 @@ NB_MODULE(objects, m)
             "link_fibers_to_patches",
             [](PyObjectStore& self, const std::string& fibersDir, const std::string& patchesDir,
                const std::string& ctVolume, const nb::kwargs& kwargs) {
-                vc::graph_links::FiberPatchParams p;
+                vc::object_links::FiberPatchParams p;
                 for (auto item : kwargs) {
                     const std::string key = nb::cast<std::string>(item.first);
                     const nb::handle val = item.second;
@@ -485,7 +485,7 @@ NB_MODULE(objects, m)
                     else if (!setLinePatchParameter(p, key, val))
                         throw std::runtime_error("link_fibers_to_patches: unknown parameter '" + key + "'");
                 }
-                return detectorReportToPy(vc::graph_links::linkFibersToPatches(
+                return detectorReportToPy(vc::object_links::linkFibersToPatches(
                     self.require(), fibersDir, patchesDir, ctVolume, p));
             },
             nb::arg("fibers_dir"), nb::arg("patches_dir"), nb::arg("ct_volume"), nb::arg("kwargs"),

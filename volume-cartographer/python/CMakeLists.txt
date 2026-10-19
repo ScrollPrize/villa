@@ -114,7 +114,7 @@ set_target_properties(vc_object_bindings PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
     INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
 )
-target_link_libraries(vc_object_bindings PRIVATE vc_object_geometry vc_graph_links vc_core)
+target_link_libraries(vc_object_bindings PRIVATE vc_object_geometry vc_object_links vc_core)
 target_compile_features(vc_object_bindings PRIVATE cxx_std_23)
 
 # A stale graph extension must not keep the removed split-database API importable.

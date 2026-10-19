@@ -8,7 +8,7 @@ exist without geometry or relationships.
 
 The C++ database library is `vc_objects`. Headers, record types, and transactions
 live under `vc/core/objects/` in `vc::objects`. Native file import/export lives
-in `vc_object_geometry`; link detectors live in `vc_graph_links`. These higher
+in `vc_object_geometry`; link detectors live in `vc_object_links`. These higher
 layers depend on the object store. The database library itself does not depend
 on CT readers or Qt. Python exposes the database and its helpers in `vc.objects`.
 
@@ -282,7 +282,7 @@ Use a complete database backup for those objects.
 ## Implementation layout and validation
 
 Implementation and target definitions are grouped in `core/src/vc_object_store/`.
-`vc_objects` owns the database; `vc_object_geometry` and `vc_graph_links` are
+`vc_objects` owns the database; `vc_object_geometry` and `vc_object_links` are
 higher-level adapters, not alternative database owners.
 
 | Location | Responsibility |
@@ -306,7 +306,7 @@ Build and run the affected tests:
 ```sh
 ninja -C build
 QT_QPA_PLATFORM=offscreen ctest --test-dir build --output-on-failure \
-  -R '^(test_object_store|test_graph_db|test_graph_links|test_progress|graph_db_controller)$'
+  -R '^(test_object_store|test_graph_db|test_object_links|test_progress|graph_db_controller)$'
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_BUILD_PYTHON=build/python .venv/bin/python -m pytest \
   python/tests/test_objects.py python/tests/test_graph.py python/tests/test_graph_objects.py -q
 ```

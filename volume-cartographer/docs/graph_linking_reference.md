@@ -87,7 +87,7 @@ Edges record measurements, rounds, coordinate scales, the actual normal source,
 estimator ID, and detector version 3. Reruns preserve reviewed/manual edges; stale pending links
 are removed only for successfully processed inputs. Failed inputs are excluded.
 
-C++ exposes `vc::graph_links::linkFibersToPatches`. Python exposes
+C++ exposes `vc::object_links::linkFibersToPatches`. Python exposes
 `ObjectStore.link_fibers_to_patches(fibers_dir, patches_dir, ct_volume, **kwargs)`;
 snake_case keywords match `FiberPatchParams`, including `ct_level` and
 `ct_to_base_scale`. `vc.objects.CtSheetNormalSampler` exposes the same estimator
@@ -114,8 +114,8 @@ The normal source must still be accessible when rerunning the detector.
 
 ## Track-to-track graph links
 
-`vc::graph_links::linkTracksToTracks` implements Spiral's exact-voxel crossing
-relation in `vc_graph_links`. Tracks must share an integer voxel, belong to
+`vc::object_links::linkTracksToTracks` implements Spiral's exact-voxel crossing
+relation in `vc_object_links`. Tracks must share an integer voxel, belong to
 opposite known families (`horizontal` and `vertical`), and have an unsigned
 local tangent angle of at least 30°. Tangents extend 12 source voxels from the
 crossing in each direction, measured by Euclidean distance. Repeated visits to
@@ -131,7 +131,7 @@ pending edges to SQLite. There is no selected-tracks JSON step and
 `crossings.npz` is neither read nor written.
 
 ```sh
-ninja -C build vc_graph_import vc_object_bindings test_graph_links
+ninja -C build vc_graph_import vc_object_bindings test_object_links
 build/bin/vc_graph_import --db objects.vcobj --author "$USER" \
   --link-track-tracks /mnt/bigpc/spiral_dataset_working/tracks/2um_ds2_ps256_surf_v2.dbm \
   --track-workers 4
@@ -218,7 +218,7 @@ neither is read, and no sidecar is created. No full-collection crossing test was
 Regression checks:
 
 ```sh
-build/bin/test_graph_links
+build/bin/test_object_links
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PWD/build/python" \
   python -m pytest python/tests/test_graph.py -q
 ```
@@ -323,7 +323,7 @@ at quarter resolution, use `--track-scale 1 --patch-scale 1
 CT normals are the default; `--normals-manifest` selects the same optional
 Lasagna comparison path.
 
-C++ exposes `vc::graph_links::linkTracksToPatches` and `TrackPatchParams`.
+C++ exposes `vc::object_links::linkTracksToPatches` and `TrackPatchParams`.
 Python exposes:
 
 ```python
@@ -400,7 +400,7 @@ and their complete fit metadata matched the original exactly across all runs.
 Regression tests additionally compare serial/parallel capped fits, cancellation,
 callback thread identity and batched/individual nearest queries.
 
-Build with `ninja -C build vc_graph_import vc_object_bindings test_graph_links
+Build with `ninja -C build vc_graph_import vc_object_bindings test_object_links
 test_surface_patch_index`. The benchmark harness in `/tmp/vc-overlap-perf/bench.py`
 times the command below, with a new output basename for each run. The original
 executable and core library were saved in that temporary directory for comparison;

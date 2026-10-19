@@ -131,7 +131,7 @@ manual edits such as `txn.set_approval(...)` and `txn.set_meta(...)` atomically.
 
 ## C++
 
-Link against `vc_objects` for storage and queries, or `vc_graph_links` for geometry
+Link against `vc_objects` for storage and queries, or `vc_object_links` for geometry
 detectors. Both require C++20. In a CMake build that includes Volume Cartographer,
 add targets for the examples below:
 
@@ -139,7 +139,7 @@ add targets for the examples below:
 add_executable(graph_query graph_query.cpp)
 target_link_libraries(graph_query PRIVATE vc_objects)
 add_executable(graph_build graph_build.cpp)
-target_link_libraries(graph_build PRIVATE vc_graph_links)
+target_link_libraries(graph_build PRIVATE vc_object_links)
 ```
 
 Build with `ninja -C build graph_query graph_build`. In the Volume Cartographer
@@ -207,7 +207,7 @@ build/bin/graph_build /data/dataset /data/ct.zarr
 #include "vc/core/objects/ObjectStore.hpp"
 #include "vc/core/objects/import/FiberImport.hpp"
 #include "vc/core/objects/import/PatchImport.hpp"
-#include "vc/core/graph_links/GraphLinks.hpp"
+#include "vc/core/object_links/ObjectLinks.hpp"
 
 int main(int argc, char** argv) {
     if (argc != 3) {
@@ -231,17 +231,17 @@ int main(int argc, char** argv) {
         txn.commit();
     }
     // Detectors manage their own transactions: call outside the write scope.
-    vc::graph_links::PatchOverlapParams overlaps;
+    vc::object_links::PatchOverlapParams overlaps;
     overlaps.workers = 4;
-    check(vc::graph_links::linkPatchOverlaps(db, root / "verified_patches", overlaps));
+    check(vc::object_links::linkPatchOverlaps(db, root / "verified_patches", overlaps));
 
-    vc::graph_links::FiberPatchParams params;
+    vc::object_links::FiberPatchParams params;
     params.fiberScale = 0.25;
     params.patchScale = 1;
     params.workingToBaseScale = 4;
     params.ctToBaseScale = 4;
     params.ctLevel = 0;
-    check(vc::graph_links::linkFibersToPatches(
+    check(vc::object_links::linkFibersToPatches(
         db, root / "fibers", root / "verified_patches", argv[2], params));
 }
 ```

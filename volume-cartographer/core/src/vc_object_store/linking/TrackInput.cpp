@@ -7,7 +7,7 @@
 #include <map>
 #include <set>
 #include <stdexcept>
-namespace vc::graph_links::detail {
+namespace vc::object_links::detail {
 namespace {
 void checkCancelled(const std::atomic_bool* cancel)
 {
@@ -103,4 +103,4 @@ TrackInput loadTrackInput(objects::ObjectStore& db, const std::filesystem::path&
     result.packedPath = packedPath;
     return result;
 }
-} // namespace vc::graph_links::detail
+} // namespace vc::object_links::detail

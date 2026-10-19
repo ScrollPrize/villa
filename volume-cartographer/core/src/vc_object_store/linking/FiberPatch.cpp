@@ -9,7 +9,7 @@
 #include <sstream>
 #include <nlohmann/json.hpp>
 
-namespace vc::graph_links {
+namespace vc::object_links {
 namespace {
 std::vector<cv::Vec3d> parsePoints(const nlohmann::json& root, const char* key)
 {
@@ -128,4 +128,4 @@ DetectorReport linkFibersToPatches(objects::ObjectStore& db, const std::filesyst
     return detail::linkLinesToPatches(db, files.size(), load, patchesDir, ctVolume,
         params, params.fiberScale, kFiberPatchDetector, 3, cancel);
 }
-} // namespace vc::graph_links
+} // namespace vc::object_links

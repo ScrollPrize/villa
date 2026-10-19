@@ -1,4 +1,4 @@
-#include "vc/core/graph_links/GraphLinks.hpp"
+#include "vc/core/object_links/ObjectLinks.hpp"
 
 #include <algorithm>
 #include <set>
@@ -7,7 +7,7 @@
 
 #include <nlohmann/json.hpp>
 
-namespace vc::graph_links {
+namespace vc::object_links {
 namespace {
 
 using objects::EdgeRecord;
@@ -67,7 +67,7 @@ DetectorReport placeholder(objects::ObjectStore& db, const char* detectorName,
     for (const auto& kind : objectKinds)
         report.objectsConsidered += int64_t(db.objectsByKind(txn, kind).size());
     report.problems.push_back(std::string(detectorName) +
-                              ": detector not implemented yet (placeholder in vc_objects_links); no edges written");
+                              ": detector not implemented yet (placeholder in vc_object_links); no edges written");
     return report;
 }
 
@@ -206,4 +206,4 @@ DetectorReport linkTracksToFibers(objects::ObjectStore& db, const TrackFiberPara
     return placeholder(db, kTrackFiberDetector, {"track", "fiber"}, cancel);
 }
 
-}  // namespace vc::graph_links
+}  // namespace vc::object_links

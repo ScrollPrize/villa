@@ -1,4 +1,4 @@
-#include "vc/core/graph_links/GraphLinks.hpp"
+#include "vc/core/object_links/ObjectLinks.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/Uuid.hpp"
@@ -15,7 +15,7 @@
 #include <unordered_map>
 #include <nlohmann/json.hpp>
 
-namespace vc::graph_links {
+namespace vc::object_links {
 namespace {
 using Json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -311,4 +311,4 @@ DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db, const fs:
     report.objectsConsidered = int64_t(collections.size() + patches.size());
     return report;
 }
-} // namespace vc::graph_links
+} // namespace vc::object_links

@@ -1,4 +1,4 @@
-// Patch-overlap detector for vc_graph_links.
+// Patch-overlap detector for vc_object_links.
 //
 // Pair acceptance follows spiral-fitting's patch_merger (merging-patches
 // branch): correspondences harvested by 3D proximity, a two-point
@@ -9,7 +9,7 @@
 // under the fitted pose. Accepted pairs become pending graph edges via
 // commitCandidates(); no merged geometry is produced here.
 
-#include "vc/core/graph_links/GraphLinks.hpp"
+#include "vc/core/object_links/ObjectLinks.hpp"
 #include "formats/PatchInput.hpp"
 
 #include <algorithm>
@@ -34,7 +34,7 @@
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/Uuid.hpp"
 
-namespace vc::graph_links {
+namespace vc::object_links {
 namespace {
 
 struct PhaseTimer {
@@ -836,5 +836,5 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db, const std::filesystem
     return report;
 }
 
-}  // namespace vc::graph_links
+}  // namespace vc::object_links
 

@@ -72,7 +72,7 @@ vc_add_test(NAME test_graph_db LIBS doctest::doctest vc_objects)
 vc_add_test(NAME test_object_store LIBS doctest::doctest vc_objects)
 vc_add_test(NAME test_progress LIBS doctest::doctest vc_objects)
 
-vc_add_test(NAME test_graph_links LIBS doctest::doctest vc_graph_links vc_core)
+vc_add_test(NAME test_object_links LIBS doctest::doctest vc_object_links vc_core)
 
 vc_add_test(NAME test_omp_thread_point_collection)
 

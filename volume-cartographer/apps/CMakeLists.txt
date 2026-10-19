@@ -32,7 +32,7 @@ add_executable(vc_object_export src/vc_object_export.cpp)
 target_link_libraries(vc_object_export vc_object_geometry)
 
 add_executable(vc_graph_import src/vc_graph_import.cpp)
-target_link_libraries(vc_graph_import vc_graph_links)
+target_link_libraries(vc_graph_import vc_object_links)
 
 add_executable(vc_grow_seg_from_segments src/vc_grow_seg_from_segments.cpp)
 target_link_libraries(vc_grow_seg_from_segments vc_core vc_tracer Boost::program_options)

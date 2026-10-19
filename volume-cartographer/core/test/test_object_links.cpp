@@ -2,7 +2,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
-#include "vc/core/graph_links/GraphLinks.hpp"
+#include "vc/core/object_links/ObjectLinks.hpp"
 #include "vc/core/util/TrackCrossings.hpp"
 #ifdef _OPENMP
 #include <omp.h>
@@ -29,14 +29,14 @@
 namespace
 {
 using namespace vc::objects;
-using namespace vc::graph_links;
+using namespace vc::object_links;
 namespace fs = std::filesystem;
 
 struct TempDir {
     fs::path dir;
     explicit TempDir(const std::string& name)
     {
-        dir = fs::temp_directory_path() / ("vc_graph_links_test_" + name + "_" + vc::util::newUuid());
+        dir = fs::temp_directory_path() / ("vc_object_links_test_" + name + "_" + vc::util::newUuid());
         fs::create_directories(dir);
     }
     ~TempDir() { fs::remove_all(dir); }

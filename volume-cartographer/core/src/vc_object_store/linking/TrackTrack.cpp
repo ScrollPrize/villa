@@ -1,4 +1,4 @@
-#include "vc/core/graph_links/GraphLinks.hpp"
+#include "vc/core/object_links/ObjectLinks.hpp"
 #include "vc/core/util/PackedTrackStore.hpp"
 #include "vc/core/util/TrackCrossings.hpp"
 #include "linking/TrackInput.hpp"
@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <nlohmann/json.hpp>
 
-namespace vc::graph_links {
+namespace vc::object_links {
 namespace {
 struct Cancelled {};
 void checkCancelled(const std::atomic_bool* cancel)
@@ -221,4 +221,4 @@ DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackPara
     }
     return report;
 }
-} // namespace vc::graph_links
+} // namespace vc::object_links

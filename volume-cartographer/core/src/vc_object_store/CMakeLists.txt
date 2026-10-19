@@ -33,7 +33,7 @@ target_compile_features(vc_object_geometry PUBLIC cxx_std_20)
 set_target_properties(vc_object_geometry PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Detectors propose relationship metadata; they do not own a second database.
-add_library(vc_graph_links STATIC
+add_library(vc_object_links STATIC
     linking/LinkCandidates.cpp
     linking/PatchOverlap.cpp
     linking/FiberPatch.cpp
@@ -43,7 +43,7 @@ add_library(vc_graph_links STATIC
     linking/TrackPatch.cpp
     linking/PointCollectionPatch.cpp
 )
-target_include_directories(vc_graph_links PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_graph_links PUBLIC vc_objects PRIVATE vc_track_crossings vc_core vc_lasagna nlohmann_json::nlohmann_json)
-target_compile_features(vc_graph_links PUBLIC cxx_std_20)
-set_target_properties(vc_graph_links PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(vc_object_links PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(vc_object_links PUBLIC vc_objects PRIVATE vc_track_crossings vc_core vc_lasagna nlohmann_json::nlohmann_json)
+target_compile_features(vc_object_links PUBLIC cxx_std_20)
+set_target_properties(vc_object_links PROPERTIES POSITION_INDEPENDENT_CODE ON)

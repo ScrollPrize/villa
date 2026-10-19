@@ -22,7 +22,7 @@
 #include "vc/core/objects/ObjectStore.hpp"
 #include "vc/core/util/Progress.hpp"
 
-namespace vc::graph_links {
+namespace vc::object_links {
 
 // Detector identities recorded in edge meta ("detector.name"). A
 // detector may replace only its own still-pending edges on re-runs.
@@ -320,4 +320,4 @@ DetectorReport linkTracksToPatches(objects::ObjectStore& db, const std::filesyst
                                    const TrackPatchParams& params = {},
                                    const std::atomic_bool* cancel = nullptr);
 
-}  // namespace vc::graph_links
+}  // namespace vc::object_links

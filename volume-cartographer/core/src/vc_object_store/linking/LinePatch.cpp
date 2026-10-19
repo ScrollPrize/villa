@@ -35,7 +35,7 @@
 #include "vc/core/util/CtSheetNormal.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
 
-namespace vc::graph_links::detail {
+namespace vc::object_links::detail {
 namespace {
 
 // Both sources feed exactly the same strip marching and patch-link gates.
@@ -959,4 +959,4 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, size_t lineCount, co
     return report;
 }
 
-}  // namespace vc::graph_links::detail
+}  // namespace vc::object_links::detail
