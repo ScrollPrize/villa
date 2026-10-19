@@ -1,7 +1,5 @@
-#include "vc/core/objects/import/TrackImport.hpp"
-#include "vc/core/objects/import/PatchImport.hpp"
-#include "vc/core/objects/import/FiberImport.hpp"
 #include "StorageBindings.hpp"
+#include <nanobind/stl/map.h>
 #include "vc/core/objects/ObjectStore.hpp"
 #include "vc/core/object_links/ObjectLinks.hpp"
 #include "vc/core/util/CtSheetNormal.hpp"
@@ -16,17 +14,6 @@ nb::dict detectorReportToPy(const vc::object_links::DetectorReport& rep)
     d["edges_updated"] = rep.edgesUpdated;
     d["edges_skipped_existing"] = rep.edgesSkippedExisting;
     d["stale_removed"] = rep.staleRemoved;
-    nb::list problems;
-    for (const auto& p : rep.problems) problems.append(pyStr(p));
-    d["problems"] = problems;
-    return d;
-}
-
-nb::dict reportToPy(const vo::ImportReport& rep)
-{
-    nb::dict d;
-    d["objects_imported"] = rep.objectsImported;
-    d["edges_imported"] = rep.edgesImported;
     nb::list problems;
     for (const auto& p : rep.problems) problems.append(pyStr(p));
     d["problems"] = problems;
@@ -257,11 +244,11 @@ NB_MODULE(objects, m)
             },
             nb::arg("after_seq") = 0)
         .def("put_geometry", [](PyObjectStore& self, const std::string& uuid, const nb::dict& input,
-                               const std::optional<std::string>& expected) {
+                               const std::optional<std::string>& expected, bool force) {
             const auto data = geometryFromPy(input);
             auto lease = self.db; self.require(); nb::gil_scoped_release release;
-            return self.withWrite([&](vo::ObjectStore& db, vo::WriteTxn& txn) { return db.putGeometry(txn, uuid, data, expected); });
-        }, nb::arg("object_uuid"), nb::arg("geometry"), nb::arg("expected_revision") = std::nullopt)
+            return self.withWrite([&](vo::ObjectStore& db, vo::WriteTxn& txn) { return db.putGeometry(txn, uuid, data, expected, force); });
+        }, nb::arg("object_uuid"), nb::arg("geometry"), nb::arg("expected_revision") = std::nullopt, nb::arg("force") = false)
         .def("current_geometry", [](PyObjectStore& self, const std::string& uuid) -> nb::object {
             const auto revision = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.currentGeometry(txn, uuid); });
             return revision ? nb::object(geometryToPy(*revision)) : nb::none();
@@ -282,16 +269,16 @@ NB_MODULE(objects, m)
             return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
         }, nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("byte_offset") = 0, nb::arg("byte_count") = std::nullopt)
         .def("ingest_registered_geometry", [](PyObjectStore& self, const std::optional<std::filesystem::path>& root,
-                                             const std::vector<std::string>& uuids) {
+                                             const std::vector<std::string>& uuids, bool force) {
             vo::GeometryIngestReport result;
-            { auto lease = self.db; self.require(); nb::gil_scoped_release release; result = vo::ingestRegisteredGeometry(self.require(), root, uuids); }
+            { auto lease = self.db; self.require(); nb::gil_scoped_release release; result = vo::ingestRegisteredGeometry(self.require(), root, uuids, {}, force); }
             return geometryReportToPy(result);
-        }, nb::arg("dataset_root") = std::nullopt, nb::arg("object_uuids") = std::vector<std::string>{})
-        .def("ingest_geometry_source", [](PyObjectStore& self, const std::string& kind, const std::filesystem::path& source) {
+        }, nb::arg("dataset_root") = std::nullopt, nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("force") = false)
+        .def("ingest_geometry_source", [](PyObjectStore& self, const std::string& kind, const std::filesystem::path& source, bool force) {
             vo::GeometryIngestReport result;
-            { auto lease = self.db; self.require(); nb::gil_scoped_release release; result = vo::ingestGeometrySource(self.require(), kind, source); }
+            { auto lease = self.db; self.require(); nb::gil_scoped_release release; result = vo::ingestGeometrySource(self.require(), kind, source, {}, force); }
             return geometryReportToPy(result);
-        }, nb::arg("kind"), nb::arg("source"))
+        }, nb::arg("kind"), nb::arg("source"), nb::arg("force") = false)
         .def("export_geometry", [](PyObjectStore& self, const std::string& object,
                                    const std::filesystem::path& destination,
                                    const std::optional<std::string>& revision, bool overwrite) {
@@ -315,15 +302,53 @@ NB_MODULE(objects, m)
                  });
              }, nb::arg("uuid"), nb::arg("dataset_root") = std::nullopt,
              "Find a patch/fiber by source UUID, verifying the saved path before searching the dataset root.")
-        .def("sweep_external_data",
-             [](PyObjectStore& self) { return self.withRead([](vo::ObjectStore& g, vo::ReadTxn& t) { return g.sweepExternalData(t); }); })
         .def("checkpoint", [](PyObjectStore& self) { self.require().checkpoint(); })
-        .def(
-            "export_json",
-            [](PyObjectStore& self, const std::optional<std::string>& objectKind, const std::optional<std::string>& tag) {
-                return self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.exportJson(t, objectKind, tag); });
-            },
-            nb::arg("object_kind") = std::nullopt, nb::arg("tag") = std::nullopt)
+        .def("select_objects", [](PyObjectStore& self, const std::optional<std::string>& kind,
+            const std::optional<std::string>& tag, const std::vector<std::string>& ids,
+            const std::optional<std::string>& connected, const std::vector<std::string>& edgeKinds) {
+            vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds};
+            auto records = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.selectObjects(txn, selection); });
+            nb::list result; for (const auto& record : records) result.append(objectToPy(record)); return result;
+        }, nb::arg("object_kind") = std::nullopt, nb::arg("tag") = std::nullopt,
+           nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("connected_to") = std::nullopt,
+           nb::arg("edge_kinds") = std::vector<std::string>{})
+        .def("export_json", [](PyObjectStore& self, const std::optional<std::string>& kind,
+            const std::optional<std::string>& tag, const std::vector<std::string>& ids,
+            const std::optional<std::string>& connected, const std::vector<std::string>& edgeKinds,
+            const std::vector<std::string>& fields) {
+            vo::JsonExportOptions options{{kind, tag, connected, ids, edgeKinds}, fields};
+            return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.exportJson(txn, options); });
+        }, nb::arg("object_kind") = std::nullopt, nb::arg("tag") = std::nullopt,
+           nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("connected_to") = std::nullopt,
+           nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("fields") = std::vector<std::string>{})
+        .def_prop_ro("replica_uuid", [](PyObjectStore& self) {
+            return self.withRead([](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.replicaUuid(txn); });
+        })
+        .def("fork_replica", [](PyObjectStore& self) {
+            self.require();
+            if (self.db.use_count() != 1) throw std::runtime_error("fork_replica requires an idle store");
+            return self.require().forkReplica();
+        })
+        .def("synchronize", [](PyObjectStore& self, PyObjectStore& peer, bool dryRun, bool force,
+            const std::map<std::string, std::string>& resolutions, const std::optional<std::string>& expected) {
+            self.require(); peer.require();
+            if (self.db.use_count() != 1 || peer.db.use_count() != 1)
+                throw std::runtime_error("synchronize requires idle stores with no active transactions");
+            vo::SyncReport report;
+            { auto localLease = self.db, remoteLease = peer.db; nb::gil_scoped_release release;
+              report = localLease->synchronize(*remoteLease, {dryRun, force, resolutions, expected}); }
+            nb::dict result; result["applied"] = report.applied; result["plan_token"] = report.planToken;
+            result["local_replica"] = report.localReplica; result["remote_replica"] = report.remoteReplica;
+            result["local_changes"] = report.localChanges; result["remote_changes"] = report.remoteChanges;
+            nb::list conflicts;
+            for (const auto& c : report.conflicts) {
+                nb::dict item; item["uuid"] = c.uuid; item["reason"] = c.reason;
+                item["base"] = jsonLoads(c.base); item["local"] = jsonLoads(c.local); item["remote"] = jsonLoads(c.remote);
+                conflicts.append(item);
+            }
+            result["conflicts"] = conflicts; return result;
+        }, nb::arg("peer"), nb::arg("dry_run") = false, nb::arg("force") = false,
+           nb::arg("resolutions") = std::map<std::string, std::string>{}, nb::arg("expected_plan") = std::nullopt)
         .def(
             "import_json",
             [](PyObjectStore& self, const std::string& jsonText) {
@@ -333,27 +358,6 @@ NB_MODULE(objects, m)
                 });
             },
             nb::arg("json_text"))
-        .def(
-            "import_fibers",
-            [](PyObjectStore& self, const std::string& dir) {
-                auto rep = self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) { return vo::importFibers(g, t, dir); });
-                return reportToPy(rep);
-            },
-            nb::arg("dir"))
-        .def(
-            "import_patches",
-            [](PyObjectStore& self, const std::string& dir) {
-                auto rep = self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) { return vo::importPatches(g, t, dir); });
-                return reportToPy(rep);
-            },
-            nb::arg("dir"))
-        .def(
-            "import_track_list",
-            [](PyObjectStore& self, const std::string& file) {
-                auto rep = self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) { return vo::importTrackList(g, t, file); });
-                return reportToPy(rep);
-            },
-            nb::arg("file"))
         .def(
             "link_point_collections_to_patches",
             [](PyObjectStore& self, const nb::kwargs& kwargs) {
@@ -521,10 +525,10 @@ NB_MODULE(objects, m)
             self.owner->require().revalidateEdgeGeometry(self.require(), uuid);
         }, nb::arg("edge_uuid"))
         .def("put_geometry", [](PyObjectWriteTxn& self, const std::string& uuid, const nb::dict& input,
-                               const std::optional<std::string>& expected) {
+                               const std::optional<std::string>& expected, bool force) {
             const auto data = geometryFromPy(input);
-            return self.owner->require().putGeometry(self.require(), uuid, data, expected);
-        }, nb::arg("object_uuid"), nb::arg("geometry"), nb::arg("expected_revision") = std::nullopt)
+            return self.owner->require().putGeometry(self.require(), uuid, data, expected, force);
+        }, nb::arg("object_uuid"), nb::arg("geometry"), nb::arg("expected_revision") = std::nullopt, nb::arg("force") = false)
         .def("upsert_object",
              [](PyObjectWriteTxn& self, const nb::dict& rec) { return self.owner->upsertObjectIn(self.owner->require(), self.require(), rec); })
         .def("add_edge",

@@ -6,13 +6,12 @@ add_library(vc_objects STATIC
     Metadata.cpp
     SourcePaths.cpp
     Snapshots.cpp
+    sync/Synchronize.cpp
+    sync/GeometryTransfer.cpp
     geometry/Geometry.cpp
     relationships/Edges.cpp
     relationships/Traversal.cpp
     relationships/EdgeGeometry.cpp
-    imports/FiberImport.cpp
-    imports/PatchImport.cpp
-    imports/TrackImport.cpp
 )
 target_include_directories(vc_objects PUBLIC "${PROJECT_SOURCE_DIR}/core/include"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -26,7 +25,7 @@ target_compile_features(vc_objects PUBLIC cxx_std_20)
 set_target_properties(vc_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # Native source geometry adapters depend on the database and VC's file readers.
-add_library(vc_object_geometry STATIC geometry/GeometryIngest.cpp geometry/GeometryExport.cpp)
+add_library(vc_object_geometry STATIC geometry/GeometryIngest.cpp geometry/GeometryExport.cpp geometry/SourceMetadata.cpp imports/SourceRelationships.cpp)
 target_include_directories(vc_object_geometry PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(vc_object_geometry PUBLIC vc_objects PRIVATE vc_core nlohmann_json::nlohmann_json)
 target_compile_features(vc_object_geometry PUBLIC cxx_std_20)

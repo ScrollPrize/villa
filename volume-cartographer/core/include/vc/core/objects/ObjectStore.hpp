@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -99,6 +100,32 @@ struct OpenOptions {
     std::optional<std::string> hostnameOverride;  // tests / reproducible imports only
 };
 
+struct ObjectSelection {
+    std::optional<std::string> kind, tag, connectedTo;
+    std::vector<std::string> uuids, edgeKinds;
+};
+struct JsonExportOptions {
+    ObjectSelection selection;
+    std::vector<std::string> fields; // top-level record fields; UUIDs/endpoints always retained
+};
+
+struct SyncOptions {
+    bool dryRun = false;
+    bool force = false; // allow geometry-head changes; invalidate incident-edge approval
+    std::map<std::string, std::string> resolutions; // record UUID -> "local" or "remote"
+    std::optional<std::string> expectedPlan; // preview token; required with resolutions
+};
+struct SyncConflict {
+    std::string uuid, reason;
+    std::string base, local, remote; // canonical record JSON, or "null" for absence/deletion
+};
+struct SyncReport {
+    bool applied = false;
+    std::string localReplica, remoteReplica, planToken;
+    int64_t localChanges = 0, remoteChanges = 0;
+    std::vector<SyncConflict> conflicts;
+};
+
 class ObjectStore;
 struct ObjectStoreImplAccess;
 
@@ -161,16 +188,19 @@ public:
     // Stable store identity, independent of its filesystem location.
     std::string uuid(const Txn&) const;
 
+    // Two-store three-way merge. Conflicts/dry runs leave both stores untouched.
+    // Both stores must be writable, with no active caller write transactions.
+    // Commits are sequential; retained common baselines make interrupted sync retryable.
+    SyncReport synchronize(ObjectStore& peer, const SyncOptions& options = {});
+    std::string replicaUuid(const Txn&) const;
+    // Assign a copied database its own replica identity before editing/synchronizing it.
+    // Clears sync history; synchronize with the original before editing either copy.
+    std::string forkReplica();
+
     // Objects. upsertObject creates (minting a UUID when record.uuid is
     // empty) or updates by UUID; updates bump generation, restamp
     // changed_*, reset approval, and journal. Returns the UUID.
     std::string upsertObject(WriteTxn& txn, const ObjectRecord& record);
-    // Refresh geometry metadata. Changed values bump generation, restamp
-    // changed_*, reset approval and journal; identical values are a no-op.
-    // An optional packed-store family fills an unset family; conflicts fail.
-    void setTrackLength(WriteTxn& txn, const std::string& uuid, double length,
-                        const std::optional<std::string>& family = std::nullopt);
-    void setFiberLength(WriteTxn& txn, const std::string& uuid, double length);
     std::optional<ObjectRecord> objectByUuid(const Txn& txn, const std::string& uuid) const;
     std::vector<ObjectRecord> objectsByKind(const Txn& txn, const std::string& kind,
                                             const std::optional<std::string>& approvalState = std::nullopt) const;
@@ -181,10 +211,12 @@ public:
     // Immutable geometry. A null expectedRevision means "expect no geometry";
     // pass the current revision UUID to replace it. Stale writers fail, even
     // when their proposed bytes match. Identical current content is a no-op.
-    // The write is savepoint-protected and invalidates object and incident-edge approvals.
+    // Changes with incident edges are refused unless force=true. Forced writes
+    // invalidate their approvals and retain old revision bindings (stale anchors).
+    // The write is savepoint-protected. Identical content is always a no-op.
     std::string putGeometry(WriteTxn& txn, const std::string& objectUuid,
                             const GeometryData& data,
-                            const std::optional<std::string>& expectedRevision = std::nullopt);
+                            const std::optional<std::string>& expectedRevision = std::nullopt, bool force = false);
     std::optional<GeometryRevision> currentGeometry(const Txn& txn, const std::string& objectUuid) const;
     std::optional<GeometryRevision> geometryRevision(const Txn& txn, const std::string& revisionUuid) const;
     std::vector<GeometryRevision> geometryHistory(const Txn& txn, const std::string& objectUuid) const;
@@ -239,9 +271,9 @@ public:
                                              const std::vector<std::string>& edgeKindFilter = {},
                                              const std::atomic_bool* cancel = nullptr) const;
 
-    // Metadata-only export refuses objects with managed geometry; use a database backup.
-    std::string exportJson(const Txn&, const std::optional<std::string>& objectKind = std::nullopt,
-                           const std::optional<std::string>& tag = std::nullopt) const;
+    std::vector<ObjectRecord> selectObjects(const Txn&, const ObjectSelection& = {}) const;
+    // Metadata only, with geometry UUID/hash references; payloads stay in the store.
+    std::string exportJson(const Txn&, const JsonExportOptions& = {}) const;
     void importJson(WriteTxn&, const std::string&);
 
     // Resolve a file-backed patch/fiber/point_collection by its source UUID.
@@ -256,12 +288,6 @@ public:
     std::optional<std::filesystem::path> resolveStoragePath(
         const Txn& txn, const std::string& objectUuid,
         const std::optional<std::filesystem::path>& datasetRoot = std::nullopt) const;
-
-    // Managed geometry objects are excluded from this external-source audit.
-    // Reports objects whose external data reference does not check out
-    // (storage file missing, or data_generation ahead of generation).
-    // Paths are resolved relative to the DB file's directory.
-    std::vector<std::string> sweepExternalData(const Txn& txn) const;
 
     // Flush the WAL into the main DB file (safe copying). Must not be
     // called while a WriteTxn is live on this handle.

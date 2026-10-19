@@ -1,4 +1,5 @@
 """Objects, geometry, and relationship metadata share one atomic database."""
+import json
 import sqlite3
 import struct
 from pathlib import Path
@@ -40,15 +41,14 @@ def test_one_database_owns_objects_geometry_and_relationships(store):
                           "geometry_chunks", "geometry_revisions", "geometry_revision_chunks", "store_identity"}
         assert {r[1] for r in sql.execute("PRAGMA table_info(geometry_heads)")} == {"object_uuid", "revision_uuid"}
         assert not list(sql.execute("PRAGMA foreign_key_check"))
-        assert sql.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert sql.execute("PRAGMA user_version").fetchone()[0] == 1
     assert store.neighbours(a) == [b]
     record, state = store.edge(edge), store.edge_geometry_state(edge)
     revisions = {a: ra, b: rb}
     assert state == {"a_revision": revisions[record["a"]], "b_revision": revisions[record["b"]], "stale": False}
-    for removed in ("include_object", "advance_object", "selected_object", "available_updates"):
-        assert not hasattr(store, removed)
-    with pytest.raises(RuntimeError, match="managed geometry"):
-        store.export_json()
+    exported = json.loads(store.export_json())
+    assert exported["metadata_only"]
+    assert len(exported["objects"]) == 2 and len(exported["edges"]) == 1
 
 
 def test_publication_invalidates_only_incident_edges_and_requires_revalidation(store):
@@ -61,7 +61,10 @@ def test_publication_invalidates_only_incident_edges_and_requires_revalidation(s
     before_edge = store.edge(edge)
     before_state = store.edge_geometry_state(edge)
     before = store.journal_since()
-    second = store.put_geometry(a, geometry(9), expected_revision=first)
+    with pytest.raises(RuntimeError, match="force=true"):
+        store.put_geometry(a, geometry(9), expected_revision=first)
+    assert store.journal_since() == before
+    second = store.put_geometry(a, geometry(9), expected_revision=first, force=True)
     assert store.object(a)["meta"] == {"review_note": "keep"}
     assert store.object(a)["tags"] == ["source"]
     assert store.edge(edge)["approval_state"] == "pending"
@@ -92,7 +95,9 @@ def test_initial_geometry_invalidates_existing_relationships(store):
     b = store.upsert_object({"kind": "note"})
     edge = store.add_edge({"kind": "connected", "a": a, "b": b})
     store.set_approval(edge, "approved")
-    store.put_geometry(a, geometry())
+    with pytest.raises(RuntimeError, match="force=true"):
+        store.put_geometry(a, geometry())
+    store.put_geometry(a, geometry(), force=True)
     assert store.edge(edge)["approval_state"] == "pending"
     assert store.edge_geometry_state(edge)["stale"]
 
@@ -114,7 +119,7 @@ def test_invalidation_failure_rolls_back_geometry_and_metadata_within_transactio
                     "BEGIN SELECT RAISE(ABORT,'injected'); END")
     with store.write() as tx:
         with pytest.raises(RuntimeError, match="injected"):
-            tx.put_geometry(a, geometry(5), expected_revision=first)
+            tx.put_geometry(a, geometry(5), expected_revision=first, force=True)
         tx.upsert_object({"kind": "note", "name": "survives"})
     assert store.current_geometry(a)["uuid"] == first
     assert store.object(a) == before_object
@@ -171,15 +176,15 @@ def test_transactions_keep_handle_alive_and_reject_close(store):
 
 
 @pytest.mark.parametrize("readonly", [False, True])
-@pytest.mark.parametrize("application_id,version", [(0x56434F42, 1), (0x56434752, 4), (0x56434752, 3), (0x56434F42, 999)])
-def test_old_database_formats_are_rejected_without_migration(tmp_path, readonly, application_id, version):
+@pytest.mark.parametrize("application_id,version", [(0x12345678, 1), (0x56434F42, 999)])
+def test_unrecognized_database_format_is_rejected_without_writes(tmp_path, readonly, application_id, version):
     path = tmp_path / "old.sqlite"
     with sqlite3.connect(path) as sql:
         sql.execute(f"PRAGMA application_id={application_id}")
         sql.execute(f"PRAGMA user_version={version}")
         sql.execute("CREATE TABLE sentinel(value TEXT)")
         sql.execute("INSERT INTO sentinel VALUES('preserve')")
-    with pytest.raises(RuntimeError, match="recreate and re-ingest"):
+    with pytest.raises(RuntimeError, match="unsupported"):
         ObjectStore.open(str(path), read_only=readonly, author="tester")
     with sqlite3.connect(path) as sql:
         assert sql.execute("PRAGMA application_id").fetchone()[0] == application_id
@@ -187,7 +192,7 @@ def test_old_database_formats_are_rejected_without_migration(tmp_path, readonly,
         assert sql.execute("SELECT value FROM sentinel").fetchall() == [("preserve",)]
 
 
-def test_object_module_does_not_import_graph_or_volume(tmp_path):
+def test_object_module_does_not_import_volume(tmp_path):
     import subprocess
     import sys
     import vc.objects
@@ -197,7 +202,6 @@ import sys
 sys.meta_path[:] = [f for f in sys.meta_path if not type(f).__module__.startswith('_editable_skbc')]
 sys.path.insert(0, {str(Path(package_dir).parent)!r})
 from vc.objects import ObjectStore
-assert 'vc.graph' not in sys.modules
 assert 'vc.volume' not in sys.modules
 with ObjectStore.create({str(tmp_path / 'independent.vcobj')!r}, author='test') as store:
     a = store.upsert_object({{'kind': 'note'}})

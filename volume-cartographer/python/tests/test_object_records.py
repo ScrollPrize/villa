@@ -2,7 +2,7 @@
 
 Run against the built module with
 ``PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_BUILD_PYTHON=build/python
-.venv/bin/python -m pytest python/tests/test_graph.py``.
+.venv/bin/python -m pytest python/tests/test_object_records.py``.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def test_snapshot_preserves_provenance_and_conflicts_are_atomic(db, tmp_path):
     db.set_approval(a, "approved")
     db.set_approval(edge, "rejected")
     snapshot = json.loads(db.export_json())
-    assert snapshot["version"] == 2
+    assert snapshot["version"] == 1
     with ObjectStore.create(str(tmp_path / "restored.vcobj"), author="importer", hostname="elsewhere") as restored:
         # Different internal IDs must not affect endpoint/anchor comparison.
         swapped = dict(snapshot, objects=list(reversed(snapshot["objects"])))
@@ -73,30 +73,11 @@ def test_approval_journal_keeps_decisions_and_stamps(db, kind):
     assert entries[-1]["approved_by"] is None
 
 
-@pytest.mark.parametrize("scale, expected", [([0.25, 0.5], (0.25, 0.5)), (0.5, (0.5, 0.5))])
-def test_patch_import_tifxyz_metadata(db, tmp_path, scale, expected):
-    patches = tmp_path / "patches"
-    patch = patches / "valid"
-    patch.mkdir(parents=True)
-    uid = str(uuid.uuid4())
-    (patch / "meta.json").write_text(json.dumps({"uuid": uid, "type": "seg", "format": "tifxyz",
-        "scale": scale, "bbox": [[10, 20, 30], [40, 50, 60]]}))
-    bad = patches / "invalid"
-    bad.mkdir()
-    (bad / "meta.json").write_text(json.dumps({"uuid": str(uuid.uuid4()), "scale": [1, 2, 3]}))
-    report = db.import_patches(str(patches))
-    assert report["objects_imported"] == 1 and len(report["problems"]) == 1
-    record = db.object(uid)
-    assert record["patch"]["scale"] == expected
-    assert record["patch"]["bbox"] == [10, 20, 30, 40, 50, 60]
-    with ObjectStore.create(str(tmp_path / "copy.vcobj"), author="copy") as copy:
-        copy.import_json(db.export_json())
-        assert copy.object(uid) == record
 
 
 @pytest.fixture()
 def db_path(tmp_path: Path) -> str:
-    return str(tmp_path / "graph.vcobj")
+    return str(tmp_path / "objects.vcobj")
 
 
 @pytest.fixture()
@@ -205,7 +186,7 @@ def test_reopen_read_only_and_export(db_path: str) -> None:
         db.add_edge({"a": a, "b": b, "kind": "same-surface"})
         exported = db.export_json()
     doc = json.loads(exported)
-    assert doc["format"] == "vc_graph_export"
+    assert doc["format"] == "vc_object_metadata"
     assert len(doc["objects"]) == 2 and len(doc["edges"]) == 1
 
     with ObjectStore.open(db_path, read_only=True) as db:
@@ -219,69 +200,10 @@ def test_reopen_read_only_and_export(db_path: str) -> None:
         assert len(db.objects_by_kind("patch")) == 1
 
 
-def test_track_list_registration(db, tmp_path: Path) -> None:
-    track_file = tmp_path / "tracks.json"
-    track_file.write_text(json.dumps([
-        {"dataset_ref": "spiral://s1", "external_key": "t1",
-         "family": "H", "point_count": 5},
-        {"external_key": "no-dataset"},
-    ]))
-    report = db.import_track_list(str(track_file))
-    assert report["objects_imported"] == 1
-    assert len(report["problems"]) == 1
-    first = db.objects_by_kind("track")
-    assert first[0]["track"]["external_key"] == "t1"
-
-    again = db.import_track_list(str(track_file))
-    assert again["objects_imported"] == 0  # stable identity, no-op
-    assert db.objects_by_kind("track")[0]["uuid"] == first[0]["uuid"]
 
 
-@pytest.mark.parametrize("line, expected", [
-    ([[0, 0, 0], [0, 3, 4], [0, 3, 4], [12, 3, 4]], 17),
-    (None, 13), ([], 13), ([[3, 2, 1]], 0),
-])
-def test_fiber_import_lengths_and_legacy_backfill(db, tmp_path, line, expected):
-    import uuid
-    fibers = tmp_path / "fibers"
-    fibers.mkdir()
-    uid = str(uuid.uuid4())
-    root = {"uuid": uid, "control_points": [{"position": [0, 0, 0]}, {"position": [12, 3, 4]}],
-            "hv_classification": {"automatic_tag": "H", "manual_tag": "V"}}
-    if line is not None:
-        root["line_points"] = line
-    (fibers / "fiber.json").write_text(json.dumps(root))
-    report = db.import_fibers(str(fibers))
-    assert report["problems"] == [] and report["objects_imported"] == 1
-    obj = db.object(uid)
-    assert obj["fiber"]["length"] == expected
-    assert obj["fiber"]["family"] == "V" and obj["fiber"]["manual_family"]
-    # Keep the matching file checksum to exercise the old importer no-op path.
-    obj["fiber"]["length"] = 0
-    db.upsert_object(obj)
-    db.set_approval(uid, "approved")
-    before = db.object(uid)
-    assert db.import_fibers(str(fibers))["problems"] == []
-    after = db.object(uid)
-    assert after["fiber"] == dict(before["fiber"], length=expected)
-    assert after["generation"] == before["generation"] + (expected != 0)
-    assert after["approval_state"] == ("pending" if expected != 0 else "approved")
-    if expected != 0:
-        assert after["approved_by"] is None and after["approved_generation"] is None
-    snapshot = db.export_json()
-    journal = db.journal_since(0)
-    assert db.import_fibers(str(fibers))["objects_imported"] == 0
-    assert db.export_json() == snapshot and db.journal_since(0) == journal
 
 
-def test_fiber_import_rejects_invalid_dense_geometry(db, tmp_path):
-    import uuid
-    fibers = tmp_path / "fibers"
-    fibers.mkdir()
-    (fibers / "bad.json").write_text(json.dumps({"uuid": str(uuid.uuid4()),
-        "line_points": [[0, 0, 0], [1, 2]], "control_points": [[0, 0, 0], [1, 0, 0]]}))
-    report = db.import_fibers(str(fibers))
-    assert report["problems"] and db.objects_by_kind("fiber") == []
 
 
 def test_object_edge_uuids_share_namespace(db):
@@ -302,55 +224,5 @@ def test_object_edge_uuids_share_namespace(db):
     assert db.neighbours(a.upper()) == [b]
 
 
-def test_legacy_fiber_refresh_preserves_annotations_and_reconciles_branches(db, tmp_path):
-    source = tmp_path / "fibers"; source.mkdir()
-    a, b = str(uuid.uuid4()), str(uuid.uuid4())
-    def branch(target, xyz):
-        return {"control_point_index": 0, "branch_file": target, "branch_control_point_index": 0,
-                "control_point_position": xyz, "branch_control_point_position": [3, 4, 5], "pending": False}
-    first = {"uuid": a, "control_points": [[1, 2, 3]], "line_points": [[1, 2, 3], [4, 5, 6]],
-             "tags": ["source"], "branches": [branch("b.json", [1, 2, 3])]}
-    second = {"uuid": b, "control_points": [[3, 4, 5]], "branches": []}
-    (source / "a.json").write_text(json.dumps(first)); (source / "b.json").write_text(json.dumps(second))
-    assert db.import_fibers(str(source))["edges_imported"] == 1
-    edge = db.edges_of(a)[0]
-    db.set_meta(a, "review_note", "keep")
-    db.set_meta(edge["uuid"], "review_note", "edge note")
-    annotated = db.object(a); annotated["tags"] = ["database"]
-    db.upsert_object(annotated)
-    db.set_approval(edge["uuid"], "approved")
-    first["line_points"][1] = [8, 2, 3]
-    first["branches"][0]["control_point_position"] = [2, 2, 3]
-    first["tags"] = ["changed-source"]
-    (source / "a.json").write_text(json.dumps(first))
-    assert db.import_fibers(str(source))["objects_imported"] == 1
-    assert db.object(a)["meta"] == {"review_note": "keep"} and db.object(a)["tags"] == ["database"]
-    refreshed = db.edge(edge["uuid"])
-    anchor = refreshed["a_anchor"] if refreshed["a"] == a else refreshed["b_anchor"]
-    assert anchor["position"] == (2, 2, 3)
-    assert refreshed["approval_state"] == "pending" and refreshed["meta"]["review_note"] == "edge note"
-    # Omitted/unreadable target files cannot establish a removed branch.
-    first["branches"] = []; (source / "a.json").write_text(json.dumps(first))
-    (source / "b.json").write_text("{")
-    assert db.import_fibers(str(source))["problems"]
-    assert db.edge(edge["uuid"]) is not None
-    (source / "b.json").write_text(json.dumps(second))
-    db.import_fibers(str(source))
-    assert db.edge(edge["uuid"]) is None
-    before = db.journal_since()
-    assert db.import_fibers(str(source))["objects_imported"] == 0
-    assert db.journal_since() == before
 
 
-def test_legacy_import_does_not_refresh_managed_geometry_from_files(db, tmp_path):
-    source = tmp_path / "fibers"; source.mkdir()
-    uid = str(uuid.uuid4())
-    data = {"uuid": uid, "type": "vc3d_fiber", "control_points": [], "line_points": [[1, 2, 3]]}
-    file = source / "fiber.json"; file.write_text(json.dumps(data))
-    assert db.ingest_geometry_source("fiber", file)["ingested"] == 1
-    db.set_meta(uid, "review_note", "keep")
-    before, journal = db.object(uid), db.journal_since()
-    data["line_points"] = [[9, 8, 7]]; file.write_text(json.dumps(data))
-    report = db.import_fibers(str(source))
-    assert "database-owned" in report["problems"][0]
-    assert db.object(uid) == before and db.journal_since() == journal

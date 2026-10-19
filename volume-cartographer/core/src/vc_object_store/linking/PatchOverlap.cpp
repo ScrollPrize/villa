@@ -214,8 +214,8 @@ struct Correspondence {
     std::uint64_t cell = 0;
 };
 
-// Keep the same lowest splitmix64(cell) ranks as the original final truncation,
-// but discard cells that can never survive as soon as the cap is reached.
+// Keep the lowest splitmix64(cell) ranks, discarding cells that cannot survive
+// once the correspondence cap is reached.
 // This bounds memory when collecting many targets during one seed pass.
 class CorrespondenceCollector {
 public:

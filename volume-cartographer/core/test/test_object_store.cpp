@@ -21,7 +21,7 @@ struct TempDir {
     fs::path dir;
     explicit TempDir(const std::string& name)
     {
-        dir = fs::temp_directory_path() / ("vc_graph_test_" + name);
+        dir = fs::temp_directory_path() / ("vc_object_test_" + name);
         fs::remove_all(dir);
         fs::create_directories(dir);
     }
@@ -89,7 +89,8 @@ TEST_CASE("geometry revisions preserve read snapshots and reject foreign transac
     data.arrays[0].bytes[0] = 3;
     {
         auto w = db.write();
-        second = db.putGeometry(w, id, data, first);
+        CHECK_THROWS_AS(db.putGeometry(w, id, data, first), std::runtime_error);
+        second = db.putGeometry(w, id, data, first, true);
         w.commit();
     }
     CHECK(db.currentGeometry(snapshot, id)->uuid == first);

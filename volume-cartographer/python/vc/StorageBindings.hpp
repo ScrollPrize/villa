@@ -293,7 +293,7 @@ nb::dict geometryToPy(const vo::GeometryRevision& r)
 nb::dict geometryReportToPy(const vo::GeometryIngestReport& r)
 {
     nb::dict result;
-    result["ingested"] = r.ingested; result["unchanged"] = r.unchanged; result["problems"] = r.problems;
+    result["edges_imported"] = r.edgesImported; result["ingested"] = r.ingested; result["unchanged"] = r.unchanged; result["problems"] = r.problems;
     return result;
 }
 

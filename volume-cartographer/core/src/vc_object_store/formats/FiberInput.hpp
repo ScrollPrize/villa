@@ -6,7 +6,7 @@
 #include <nlohmann/json.hpp>
 
 namespace vc::objects::detail {
-// Shared by fiber registration and patch linking; retain the original point order.
+// Decode native fiber point arrays without changing point order.
 inline std::vector<std::array<double, 3>> fiberPoints(const nlohmann::json& root, const char* key)
 {
     std::vector<std::array<double, 3>> points;

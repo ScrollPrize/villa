@@ -1,10 +1,3 @@
-#include "vc/core/objects/import/TrackImport.hpp"
-#include "vc/core/objects/import/PatchImport.hpp"
-#include "vc/core/objects/import/FiberImport.hpp"
-// Import existing fiber/segment metadata into an object database and
-// export the metadata graph as JSON. See
-// docs/plans/graph_db_initial_implementation.md (Phase 4).
-
 #include "vc/core/objects/ObjectStore.hpp"
 #include "vc/core/object_links/ObjectLinks.hpp"
 #include "vc/core/util/TerminalProgress.hpp"
@@ -25,11 +18,8 @@ namespace {
 void usage()
 {
     std::cerr
-        << "usage: vc_graph_import --db <graph.vcobj> --author <name> [options]\n"
+        << "usage: vc_object_links --db <objects.vcobj> --author <name> [options]\n"
         << "  --no-progress        disable terminal progress reporting (stderr)\n"
-        << "  --fibers <dir>       import vc3d_fiber JSON files (objects + branch edges)\n"
-        << "  --segments <dir>     register segment dirs with meta.json as patch objects\n"
-        << "  --tracks <json>      import track metadata from a track list\n"
         << "  --link-pcl-patches             link stored point collections to stored patches\n"
         << "  --pcl-tolerance <vx>           maximum point distance (default 2.5)\n"
         << "  --point-scale <factor>         point XYZ -> working XYZ\n"
@@ -72,27 +62,16 @@ void usage()
         << "  --fiber-scale <factor>           fiber XYZ -> working XYZ (default 1)\n"
         << "  --patch-scale <factor>           patch XYZ -> working XYZ (default 1)\n"
         << "  --working-to-base-scale <factor> working voxel size in common base units (default 1)\n"
-        << "  --fiber-strip-rows <n>           rows each side (default 1, at 20 vx)\n"
-        << "  --fiber-anchor-contact <vx>      minimum anchor contact (default 75)\n"
-        << "  --import-json <path> import a vc_graph_export JSON document\n"
-        << "  --export-json <path> write a vc_graph_export JSON document (- for stdout)\n"
-        << "Ingest geometry with vc_object_ingest before discovery. Metadata imports run in one write\n"
-        << "transaction each and print a report (problems go to stderr).\n";
-}
-
-void printReport(const char* what, const ImportReport& report)
-{
-    std::cout << what << ": " << report.objectsImported << " objects, " << report.edgesImported
-              << " edges, " << report.problems.size() << " problems\n";
-    for (const auto& problem : report.problems)
-        std::cerr << "  ! " << problem << "\n";
+        << "  --import-json <path> import a vc_object_metadata JSON document\n"
+        << "  --export-json <path> write a vc_object_metadata JSON document (- for stdout)\n"
+        << "Ingest geometry with vc_object_ingest before discovery.\n";
 }
 
 }  // namespace
 
 int main(int argc, char** argv)
 try {
-    fs::path dbPath, fiberDir, segmentsDir, tracksPath, importJsonPath, exportJsonPath;
+    fs::path dbPath, importJsonPath, exportJsonPath;
     fs::path ctVolume;
     bool linkFibers = false, linkTrackPatches = false, linkPcl = false, linkOverlaps = false;
     vc::object_links::PointCollectionPatchParams pclParams;
@@ -112,8 +91,6 @@ try {
         if (arg == "--no-progress") showProgress = false;
         else if (arg == "--db") dbPath = next("--db");
         else if (arg == "--author") author = next("--author");
-        else if (arg == "--fibers") fiberDir = next("--fibers");
-        else if (arg == "--segments") segmentsDir = next("--segments");
         else if (arg == "--link-pcl-patches") linkPcl = true;
         else if (arg == "--pcl-tolerance") pclParams.tolerance = std::stod(next(arg.c_str()));
         else if (arg == "--point-scale") pclParams.pointScale = std::stod(next(arg.c_str()));
@@ -121,7 +98,6 @@ try {
         else if (arg == "--pcl-window-min-points") pclParams.windowMinPoints = std::stoi(next(arg.c_str()));
         else if (arg == "--pcl-absolute") pclParams.absoluteWinding = true;
         else if (arg == "--pcl-relative") pclParams.absoluteWinding = false;
-        else if (arg == "--tracks") tracksPath = next("--tracks");
         else if (arg == "--link-track-tracks") linkTracks = true;
         else if (arg == "--patch-uuid") {
             const auto uuid = next(arg.c_str());
@@ -161,8 +137,8 @@ try {
         else if (arg == "--fiber-scale") fiberPatchParams.fiberScale = std::stod(next(arg.c_str()));
         else if (arg == "--patch-scale") fiberPatchParams.patchScale = std::stod(next(arg.c_str()));
         else if (arg == "--working-to-base-scale") fiberPatchParams.workingToBaseScale = std::stod(next(arg.c_str()));
-        else if ((arg == "--fiber-strip-rows" || arg == "--strip-rows")) fiberPatchParams.stripRowsEachSide = std::stoi(next(arg.c_str()));
-        else if ((arg == "--fiber-anchor-contact" || arg == "--anchor-contact")) fiberPatchParams.anchorContact = std::stod(next(arg.c_str()));
+        else if (arg == "--strip-rows") fiberPatchParams.stripRowsEachSide = std::stoi(next(arg.c_str()));
+        else if (arg == "--anchor-contact") fiberPatchParams.anchorContact = std::stod(next(arg.c_str()));
         else if (arg == "--import-json") importJsonPath = next("--import-json");
         else if (arg == "--export-json") exportJsonPath = next("--export-json");
         else if (arg == "--help" || arg == "-h") {
@@ -190,58 +166,32 @@ try {
     const bool exists = fs::exists(dbPath) && fs::file_size(dbPath, ec) > 0;
     ObjectStore db = [&] {
         vc::util::TerminalProgress progress("Open object database", showProgress);
-        auto graph = exists ? ObjectStore::open(dbPath, options) : ObjectStore::create(dbPath, options);
+        auto store = exists ? ObjectStore::open(dbPath, options) : ObjectStore::create(dbPath, options);
         progress.finish();
-        return graph;
+        return store;
     }();
     if (!exists)
         std::cout << "created " << dbPath.string() << "\n";
 
-    if (!fiberDir.empty()) {
-        vc::util::TerminalProgress progress("Import fibers", showProgress);
-        auto w = db.write();
-        ImportReport report = importFibers(db, w, fiberDir, progress.callback());
-        vc::util::reportProgress(progress.callback(), "committing transaction");
-        w.commit();
-        progress.finish();
-        printReport("fibers", report);
-    }
-    if (!segmentsDir.empty()) {
-        vc::util::TerminalProgress progress("Import patches", showProgress);
-        auto w = db.write();
-        ImportReport report = importPatches(db, w, segmentsDir, progress.callback());
-        vc::util::reportProgress(progress.callback(), "committing transaction");
-        w.commit();
-        progress.finish();
-        printReport("segments", report);
-    }
-    if (!tracksPath.empty()) {
-        vc::util::TerminalProgress progress("Import tracks", showProgress);
-        auto w = db.write();
-        ImportReport report = importTrackList(db, w, tracksPath, progress.callback());
-        vc::util::reportProgress(progress.callback(), "committing transaction");
-        w.commit();
-        progress.finish();
-        printReport("tracks", report);
-    }
-    bool trackLinkFailed = false;
+    bool linkFailed = false;
     if (linkTracks) {
         vc::util::TerminalProgress progress("Track crossings", showProgress);
         trackParams.progress = progress.callback();
         const auto report = vc::object_links::linkTracksToTracks(db, trackParams);
         progress.finish();
+        linkFailed |= !report.problems.empty();
         std::cout << "track-tracks: " << report.objectsConsidered << " tracks, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
                   << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
         for (const auto& problem : report.problems)
             std::cerr << "  ! " << problem << "\n";
-        trackLinkFailed = !report.problems.empty();
     }
     if (linkOverlaps) {
         vc::util::TerminalProgress progress("Patch overlaps", showProgress);
         overlapParams.progress = progress.callback();
         const auto report = vc::object_links::linkPatchOverlaps(db, overlapParams);
         progress.finish();
+        linkFailed |= !report.problems.empty();
         std::cout << "patch-overlaps: " << report.objectsConsidered << " patches, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
                   << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
@@ -254,12 +204,12 @@ try {
         const auto report = vc::object_links::linkTracksToPatches(
             db, ctVolume, trackPatchParams);
         progress.finish();
+        linkFailed |= !report.problems.empty();
         std::cout << "track-patches: " << report.objectsConsidered << " objects, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
                   << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
         for (const auto& problem : report.problems)
             std::cerr << "  ! " << problem << "\n";
-        trackLinkFailed |= !report.problems.empty();
     }
     if (linkFibers) {
         vc::util::TerminalProgress progress("Fiber to patch", showProgress);
@@ -267,6 +217,7 @@ try {
         const auto report = vc::object_links::linkFibersToPatches(
             db, ctVolume, fiberPatchParams);
         progress.finish();
+        linkFailed |= !report.problems.empty();
         std::cout << "fiber-patches: " << report.objectsConsidered << " objects, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
                   << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
@@ -278,6 +229,7 @@ try {
         pclParams.progress = progress.callback();
         const auto report = vc::object_links::linkPointCollectionsToPatches(db, pclParams);
         progress.finish();
+        linkFailed |= !report.problems.empty();
         std::cout << "pcl-patches: " << report.objectsConsidered << " objects, "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
                   << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
@@ -300,7 +252,7 @@ try {
     }
     if (!exportJsonPath.empty()) {
         vc::util::TerminalProgress progress("Export JSON", showProgress);
-        vc::util::reportProgress(progress.callback(), "serializing graph");
+        vc::util::reportProgress(progress.callback(), "serializing object metadata");
         std::string json;
         {
             auto r = db.read();
@@ -318,8 +270,8 @@ try {
             std::cout << "exported to " << exportJsonPath.string() << "\n";
         }
     }
-    return trackLinkFailed ? 1 : 0;
+    return linkFailed ? 1 : 0;
 } catch (const std::exception& e) {
-    std::cerr << "vc_graph_import: " << e.what() << "\n";
+    std::cerr << "vc_object_links: " << e.what() << "\n";
     return 1;
 }

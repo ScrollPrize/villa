@@ -12,12 +12,9 @@ in `vc_object_geometry`; link detectors live in `vc_object_links`. These higher
 layers depend on the object store. The database library itself does not depend
 on CT readers or Qt. Python exposes the database and its helpers in `vc.objects`.
 
-This is a deliberate WIP API/schema break. The separate `GraphDb` and `RecordDb`
-APIs and the `vc.graph` Python module have been removed. Object schema version 2
-uses application ID `0x56434f42`. Earlier object stores and unified or split graph
-databases are rejected without migration; create a new file and re-ingest sources.
-Geometry ingestion does not run link detectors or integrate stored arrays into
-VC3D/Spiral readers.
+The database uses SQLite application ID `0x56434f42`. Geometry ingestion and
+relationship discovery operate on the same store. VC3D/Spiral geometry readers
+are separate consumers.
 
 ## One handle and one transaction
 
@@ -31,7 +28,7 @@ with ObjectStore.create("objects.vcobj", author="sean") as store:
         other_id = tx.upsert_object({"kind": "patch", "name": "patch-002"})
         edge_id = tx.add_edge({"kind": "same-surface", "a": patch_id, "b": other_id})
 
-    second = store.put_geometry(patch_id, edited_geometry, expected_revision=first)
+    second = store.put_geometry(patch_id, edited_geometry, expected_revision=first, force=True)
     assert store.edge_geometry_state(edge_id)["stale"]
     # After checking the relationship and its anchors against the new geometry:
     with store.write() as tx:
@@ -82,13 +79,28 @@ dataset aliases and object UUIDs are reused.
 
 Source files must remain stable during ingestion. Patch size/mtime checks detect
 ordinary concurrent writes, and incomplete patch saves are rejected before
-loading. Geometry decoding happens outside write transactions. Each object
-publishes in one transaction; a malformed object leaves its previous state
-intact. The batch continues and reports failures, with a nonzero CLI exit code.
-A multi-collection JSON is parsed/validated before any of its collections publish.
-Re-running an unchanged ingestion does not create revisions, journal entries,
-or approval changes. A concurrent object edit causes that object's publication
-to fail rather than overwriting newer state.
+loading. Geometry decoding happens outside write transactions. Registered-object
+batches and each fiber-directory/collection source publish atomically, including
+their native relationships. Any invalid endpoint or anchor rolls back that batch.
+Packed tracks publish individually and report partial success. A nonzero CLI exit
+code indicates problems. A concurrent object edit aborts publication.
+
+On first ingestion, tags and typed fiber/patch/track properties become object
+fields. Other native annotations live in editable `object.meta["source"]`.
+Fiber branches become `fiber_branch` edges; point links become `point_link`
+edges with point-ID anchors; linked winding collections become
+`collection_winding` edges. Distinct anchors within the same object are supported.
+These edges start pending and bind to the ingested geometry revisions. Ingest
+connected fibers together with `--fiber DIR`, or supply a branch's `target_uuid`
+for a target already stored. Source filenames are resolved only during ingestion;
+stored edges use UUIDs. Point and collection source IDs are scoped to their
+originating JSON document.
+
+Subsequent ingestion retains edited DB annotations and relationships, including
+manual deletions, and refreshes geometry measurements. Unchanged ingestion is a
+no-op. Replacing geometry that has edges requires `force=True` (`--force` in the
+CLI); it invalidates edge approvals and leaves old anchors stale. Source metadata
+is seeded when an object does not yet have `meta.source`.
 
 ## Discovering relationships from the store
 
@@ -127,7 +139,7 @@ and parameter structs with the same selections (`patchUuids`, etc.). CLI link
 flags are now bare flags, for example:
 
 ```sh
-build/bin/vc_graph_import --db objects.vcobj --author "$USER" --link-patch-overlaps
+build/bin/vc_object_links --db objects.vcobj --author "$USER" --link-patch-overlaps
 ```
 
 Each pass reads one snapshot, computes candidates, then checks the observed
@@ -136,7 +148,6 @@ inputs abort publication. New links bind to those revisions. Reruns revalidate
 the detector's own pending links against the geometry it actually examined;
 reviewed/manual links remain untouched. Stale pending removal is limited to
 successfully processed selected endpoints. Inspect each report's `problems`.
-Fiber–fiber and track–fiber detectors remain unimplemented placeholders.
 
 ## Representations
 
@@ -145,20 +156,20 @@ Coordinates are unscaled source XYZ; they are not transformed to fitting units.
 
 | Kind | Arrays | Immutable attributes |
 | --- | --- | --- |
-| `patch` | `points`: `<f4`, `[rows, columns, 3]` | Source meta.json, including two-axis `scale` |
-| `fiber` | `control_points`, `line_points`: `<f8`, `[N, 3]` | Source fields and per-point extra attributes, including tracing settings |
-| `point_collection` | `points`: `<f8`, `[N, 3]`; `point_ids`: `<i8`, `[N]` | Collection fields and ordered per-point annotations, including winding values |
-| `track` | `points`: `<i4`, `[N, 3]` | Source ID and family |
+| `patch` | `points`: `<f4`, `[rows, columns, 3]` | Two-axis `scale` (immutable); other source fields in object metadata |
+| `fiber` | `control_points`, `line_points`: `<f8`, `[N, 3]` | Object metadata holds source fields and per-point tracing settings |
+| `point_collection` | `points`: `<f8`, `[N, 3]`; `point_ids`: `<i8`, `[N]` | Object metadata holds collection fields and ordered winding annotations |
+| `track` | `points`: `<i4`, `[N, 3]` | Source ID/family in object track detail |
 
 Patch coordinates follow the existing QuadSurface loader, including invalid
 points and applied masks. Ancillary TIFF channels such as rendered images and
 generation visualizations are not ingested. Fiber point order is retained.
 Collection points are ordered by numeric ID; IDs are retained, not renumbered.
 Track ZYX integers are reordered to XYZ without rescaling or reducing precision.
-Source annotations are retained as immutable JSON attributes; geometry coordinate
-arrays are binary, not JSON. Object tags and caller metadata remain on the object.
-Changes to captured source attributes also create a geometry revision, even if
-its coordinate payload chunks can all be reused.
+Coordinates and point IDs are binary arrays. Immutable geometry attributes hold
+format properties such as patch scale. Source annotations are editable object
+metadata, not geometry revisions. Updating object
+metadata does not advance geometry.
 
 ## Revisions and access
 
@@ -207,7 +218,7 @@ To publish arrays directly, supply a dictionary with `kind`, optional
 `data` as Python bytes. Supported dtypes are `|u1`, `<i4`, `<i8`, `<u8`, `<f4`,
 and `<f8`; each object kind requires the layouts listed above. Patch attributes
 must contain a finite, positive two-axis scale. Both `db.put_geometry(...)` and
-`with db.write() as w: w.put_geometry(...)` accept `expected_revision`.
+`with db.write() as w: w.put_geometry(...)` accept `expected_revision` and `force=False`.
 The C++ equivalents accept `GeometryData` and an existing `WriteTxn`, so geometry
 and other object changes can commit atomically. Publication uses an internal
 savepoint: catching an error and committing other work cannot retain a partial
@@ -215,7 +226,7 @@ geometry revision.
 
 Python ingestion methods are `ingest_geometry_source(kind, source)` and
 `ingest_registered_geometry(dataset_root=None, object_uuids=[])`. They return
-`ingested`, `unchanged`, and `problems` and own their per-object transactions.
+`ingested`, `unchanged`, `edges_imported`, and `problems`, and own their transactions.
 
 ## Exporting native files
 
@@ -274,9 +285,13 @@ Patch masks are already baked into the stored geometry; masked-out original
 coordinates and ancillary TIFFs cannot be recovered. Patch invalid samples must
 use `(-1,-1,-1)`; a different sample with `z <= 0` is rejected because the native
 loader would discard it. Empty patch grids and nonfinite floating coordinates
-are also rejected. Captured source attributes are exported rather than current
-object tags/metadata; other derived source annotations are the caller's
-responsibility when editing geometry. If point counts change, update or remove
+are also rejected. Exports use current object names, tags, typed properties, `meta.source`
+annotations, and stored native relationships. This also applies when selecting
+historical geometry: annotations are current, not historical snapshots. Native
+relationships must bind to the exported revision and be non-stale; otherwise
+export fails. Generic relationships remain available through metadata JSON export.
+Other derived source annotations remain the caller's responsibility when editing
+geometry. If point counts change, update or remove
 the corresponding positional annotation lists. Export rejects mismatched
 annotation counts, duplicate/negative collection point IDs, and auxiliary arrays
 that native formats cannot represent, avoiding silent data loss. It does not
@@ -289,8 +304,9 @@ endpoint order. Objects without managed geometry have null bindings.
 `edge_geometry_state(edge_uuid)` compares the saved bindings with current
 object heads. Historical revisions remain readable and exportable.
 
-Publishing changed geometry bumps and journals the object and all connected
-edges, resetting their approvals in the same transaction. Existing endpoint
+Publishing changed geometry with existing edges fails by default. Passing
+`force=True` explicitly allows it, bumps and journals the object and all connected
+edges, and resets their approvals in the same transaction. Existing endpoint
 bindings remain unchanged, identifying the revisions the old anchors refer to.
 This also applies when geometry is first published for an already linked object.
 Unrelated edges are unchanged, and identical-content publication with the correct
@@ -315,17 +331,86 @@ Objects with geometry use `storage_kind='sqlite'`; their `data_checksum` and
 `data_generation` describe the current geometry. Metadata upserts cannot replace
 these managed storage fields. `storage_ref` remains a source-location hint for
 explicit re-ingestion, never the authoritative geometry. `resolve_storage_path`
-can locate that source by UUID. `sweep_external_data` excludes managed objects
-because absent source files do not make retained geometry unavailable.
+can locate that source by UUID. Source hints are used only for explicit re-ingestion; geometry access and
+relationship discovery read the database.
 
 Use SQLite's backup API for live copies, or stop writers, checkpoint, and copy
 the database. One backup contains objects, geometry history, relationships,
 approvals, revision bindings, and the journal. Copies retain the store identity;
-use one logical writable store per identity rather than editing divergent copies.
+each independently edited copy needs a separate replica identity. Call
+`copy.fork_replica()` on a new copy, then synchronize it with the original **before
+editing either copy** to establish their shared baseline.
 
-JSON export/import remains a metadata snapshot format. Export rejects selected
-objects with managed geometry instead of discarding payloads and revision bindings.
-Use a complete database backup for those objects.
+## Metadata selection and export
+
+`select_objects` and `export_json` share filters for `object_kind`, `tag`,
+`object_uuids`, and `connected_to` (the full connected component). `edge_kinds`
+restricts component traversal and exported edges. Filters intersect. Empty UUID
+and edge-kind lists mean unrestricted. Export contains only edges whose endpoints
+are both selected, with geometry UUID/hash references and endpoint revision
+bindings; binary payloads are never included.
+
+```python
+selection = dict(connected_to=object_uuid, edge_kinds=["fiber_branch"], tag="reviewed")
+records = store.select_objects(**selection)
+metadata_json = store.export_json(**selection, fields=["name", "tags", "meta"])
+```
+
+`fields` projects top-level record fields; UUIDs, kinds, edge endpoints and
+geometry references are always retained. An empty list exports all metadata.
+`import_json` accepts complete metadata-only records without managed geometry.
+Projected exports are for inspection; use synchronization to transfer objects
+with geometry and their revision bindings.
+
+## Two-store three-way synchronization
+
+```python
+with ObjectStore.open("alice.vcobj", author="alice") as local, \
+     ObjectStore.open("bob.vcobj", author="bob") as remote:
+    preview = local.synchronize(remote, dry_run=True)
+    # Inspect preview["conflicts"]: UUID, reason, base, local and remote records.
+    if not preview["conflicts"]:
+        result = local.synchronize(remote, expected_plan=preview["plan_token"])
+    else:
+        resolutions = {conflict["uuid"]: "local" for conflict in preview["conflicts"]}
+        # Choose local/remote per record after reviewing, not automatically in production.
+        result = local.synchronize(remote, resolutions=resolutions,
+                                   expected_plan=preview["plan_token"])
+```
+
+C++ uses `ObjectStore::synchronize(peer, SyncOptions)` and returns `SyncReport`.
+Both handles must be writable and have no caller-owned active writes. Python
+also refuses handles in use by another operation. Preview takes consistent write
+locks but makes no changes. Unresolved conflicts leave both databases unchanged.
+Resolutions require the current preview token, so concurrent edits cannot be
+silently overwritten after review. Successful synchronization updates both files.
+
+The last state shared by these two replica UUIDs is the merge baseline. One-sided
+additions, edits and deletions apply automatically. Different edits to the same
+record (including delete-versus-edit) conflict, even when they touch different
+fields. No timestamp or generation wins implicitly. On the first sync, identical
+records and disjoint additions merge; differing records with the same UUID need
+resolution. Object/edge UUID collisions, dangling endpoints and duplicate track
+or edge identities also block publication. Duplicate edges with distinct UUIDs
+can be resolved by choosing one duplicate's absent side.
+
+A geometry head change that affects existing edges requires `force=True` on
+synchronization too. Force does not resolve competing edits; explicit record
+choices are still required. Changed geometry invalidates edge approval, and old
+bindings remain stale until revalidation. Retained geometry cannot be deleted by
+merge. All retained geometry histories from both replicas are copied, including
+unselected branches, with original revision UUIDs, provenance and verified chunk
+hashes. Record provenance is preserved; each replica keeps its own local journal
+of applied changes rather than combining journal sequence numbers.
+
+The report includes `applied`, `conflicts`, `plan_token`, replica IDs and counts
+of local/remote record changes. Sync is currently whole-store and record-level;
+there is no server, field-level merge, pruning, or payload garbage collection.
+Shared baseline histories are retained in both files. SQLite commits across two
+WAL files are sequential: if interrupted after the first commit, retry sync. It
+uses the last baseline present in **both** files and reconciles any subsequent
+edits normally; there is no claim of distributed atomic commit. Do not discard a
+replica's baseline history between syncs.
 
 ## Implementation layout and validation
 
@@ -340,23 +425,24 @@ higher-level adapters, not alternative database owners.
 | `SourcePaths.cpp`, `Snapshots.cpp` | Source lookup and metadata JSON snapshots |
 | `geometry/` | Revision/chunk storage and native geometry ingestion/export |
 | `relationships/` | Edge CRUD, traversal, and geometry revision validation |
-| `imports/` | Separate fiber, patch, and track metadata registration |
+| `imports/` | Native branch, point and winding relationship ingestion |
+| `sync/` | Three-way merge, conflict validation and immutable geometry transfer |
 | `linking/` | Geometry detectors that propose relationship metadata |
 | `formats/`, `internal/` | Shared source-format helpers and private SQLite machinery |
 
-The source import APIs have explicit public headers under
-`vc/core/objects/import/`: `FiberImport.hpp`, `PatchImport.hpp`, and
-`TrackImport.hpp`. Including `ObjectStore.hpp` alone exposes database operations,
-not filesystem import entry points.
+Native ingestion and export have public headers `GeometryIngest.hpp` and
+`GeometryExport.hpp` under `vc/core/objects/`. `ObjectStore.hpp` exposes database
+operations. Link discovery uses `vc/core/object_links/ObjectLinks.hpp`.
 
 Build and run the affected tests:
 
 ```sh
 ninja -C build
 QT_QPA_PLATFORM=offscreen ctest --test-dir build --output-on-failure \
-  -R '^(test_object_store|test_graph_db|test_object_links|test_progress|graph_db_controller)$'
+  -R '^(test_object_store|test_object_records|test_object_links|test_progress|graph_db_controller)$'
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_BUILD_PYTHON=build/python .venv/bin/python -m pytest \
-  python/tests/test_objects.py python/tests/test_graph.py python/tests/test_graph_objects.py python/tests/test_object_links.py -q
+  python/tests/test_objects.py python/tests/test_object_records.py python/tests/test_object_geometry.py python/tests/test_object_links.py \
+  python/tests/test_object_ingestion.py python/tests/test_object_sync.py -q
 ```
 
 `VC_BUILD_PYTHON` selects the built package before any installed editable copy

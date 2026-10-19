@@ -1,15 +1,5 @@
 #include "linking/StoredGeometry.hpp"
-// Shared line->patch geometry for fibers and tracks: a port of
-// vc::constraints::autoLinkFiber + makeFastFiberNode from the removed
-// constraint-graph workspace (see ConstraintGraph.md in git history at
-// 679effcbe^). Differences from the original, by design here:
-//  * the fiber strip is reduced: stripRowsEachSide rows (default 1)
-//    at stripSpacing instead of the original 3 rows each side;
-//  * strip normals come from CT (1/24/4 anisotropic tensor), without pred_dt snapping;
-//  * geometry is converted into explicit working voxel coordinates, and
-//    results are committed as pending graph edges via commitCandidates
-//    instead of review decisions.
-
+// Shared strip construction and patch-contact tests for stored fibers and tracks.
 #include "linking/LinePatch.hpp"
 
 #include <algorithm>

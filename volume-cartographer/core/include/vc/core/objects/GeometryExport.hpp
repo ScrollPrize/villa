@@ -2,8 +2,8 @@
 #include "vc/core/objects/ObjectStore.hpp"
 
 namespace vc::objects {
-// Reconstruct one object's native file/directory from an immutable revision.
-// Defaults to the current revision; explicit revisions must belong to the object.
+// Reconstruct native files from immutable geometry and current DB annotations/topology.
+// Explicit revisions must belong to the object; native edges must bind that revision.
 // Returns the exported revision UUID. No database or source-file writes occur.
 // The parent directory must exist. Existing destinations require overwrite;
 // directories are replaced as a whole, never merged. Publication is atomic

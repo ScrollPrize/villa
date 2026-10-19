@@ -43,7 +43,7 @@ def test_patch_discovery_uses_current_revisions_and_preserves_review(db):
     assert db.link_patch_overlaps()["edges_skipped_existing"] == 1
     # A new revision with identical coordinates still needs revalidation.
     gb["attributes"]["edit"] = True
-    db.put_geometry(b, gb, expected_revision=db.current_geometry(b)["uuid"])
+    db.put_geometry(b, gb, expected_revision=db.current_geometry(b)["uuid"], force=True)
     assert db.edge_geometry_state(edge)["stale"]
     assert db.link_patch_overlaps()["edges_updated"] == 1
     assert db.edges_of(a)[0]["uuid"] == edge
@@ -86,7 +86,7 @@ def test_stored_track_crossings_selection_and_atomic_failure(db):
     assert edge["b_anchor"]["position"] == (15, 15, 20)
     assert db.link_tracks_to_tracks(track_uuids=[a.upper(), a])["stale_removed"] == 0
     gb["arrays"] = [array("points", [[50, y, 20] for y in range(31)], "<i4")]
-    db.put_geometry(b, gb, expected_revision=db.current_geometry(b)["uuid"])
+    db.put_geometry(b, gb, expected_revision=db.current_geometry(b)["uuid"], force=True)
     assert db.link_tracks_to_tracks(track_uuids=[a, b])["stale_removed"] == 1
     bad = db.upsert_object({"kind": "track", "track": {"dataset_ref": "missing", "external_key": "0"}})
     before = db.journal_since()
@@ -101,7 +101,7 @@ def test_stored_collection_ids_winding_scaling_and_rerun(db):
     collection, geometry = put(db, "point_collection", [
         array("points", [[10, 10, 40], [20, 20, 40]], "<f8"),
         array("point_ids", [90, 7], "<i8"),
-    ], {"point_attributes": [{"wind_a": 3}, {"wind_a": 4}], "winding_is_absolute": True})
+    ], meta={"source": {"point_attributes": [{"wind_a": 3}, {"wind_a": 4}], "winding_is_absolute": True}})
     report = db.link_point_collections_to_patches(point_scale=0.5, window_points=3, window_min_points=3)
     assert report["edges_created"] == 2
     edges = db.edges_of(collection)
@@ -115,7 +115,7 @@ def test_stored_collection_ids_winding_scaling_and_rerun(db):
     assert db.link_point_collections_to_patches(point_scale=0.5)["edges_updated"] == 2
     assert db.link_point_collections_to_patches(point_scale=0.5)["edges_skipped_existing"] == 2
     geometry["arrays"][0] = array("points", [[1000, 1000, 40], [2000, 2000, 40]], "<f8")
-    db.put_geometry(collection, geometry, expected_revision=db.current_geometry(collection)["uuid"])
+    db.put_geometry(collection, geometry, expected_revision=db.current_geometry(collection)["uuid"], force=True)
     assert db.link_point_collections_to_patches(collection_uuids=[collection], patch_uuids=[patch], point_scale=0.5)["stale_removed"] == 2
 
 

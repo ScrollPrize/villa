@@ -71,7 +71,7 @@ DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackPara
                 checkCancelled(cancel);
                 const auto geometry = inputs.load(*object);
                 const auto xyz = geometry.values<int32_t>("points");
-                const auto familyName = nlohmann::json::parse(geometry.revision.attributes).value("family", std::string());
+                const auto familyName = object->track->family;
                 if (!familyName.empty() && familyName != "horizontal" && familyName != "vertical")
                     throw std::runtime_error("invalid stored track family");
                 const int8_t family = familyName == "horizontal" ? 0 : familyName == "vertical" ? 1 : -1;

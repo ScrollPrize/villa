@@ -90,27 +90,4 @@ std::optional<std::filesystem::path> ObjectStore::resolveStoragePath(
     return found;
 }
 
-std::vector<std::string> ObjectStore::sweepExternalData(const Txn& txn) const
-{
-    sqlite3* db = static_cast<sqlite3*>(connection(txn));
-    std::vector<std::string> problems;
-    Statement s(db, "SELECT uuid,storage_ref,data_generation,generation FROM objects WHERE storage_ref<>'' AND storage_kind<>'sqlite' ORDER BY id");
-    const auto root = impl_->path.parent_path();
-    while (s.row()) {
-        const std::string uuid = formatUuid(s.blob16(0));
-        const std::string ref = s.text(1);
-        const int64_t dataGen = s.i64(2);
-        const int64_t gen = s.i64(3);
-        if (dataGen > gen)
-            problems.push_back(uuid + ": data_generation " + std::to_string(dataGen) + " ahead of generation " + std::to_string(gen));
-        // Dataset URIs (containing "://") are not local files to check.
-        if (ref.find("://") == std::string::npos) {
-            std::error_code ec;
-            if (!std::filesystem::exists(root / ref, ec))
-                problems.push_back(uuid + ": storage file missing: " + ref);
-        }
-    }
-    return problems;
-}
-
 } // namespace vc::objects

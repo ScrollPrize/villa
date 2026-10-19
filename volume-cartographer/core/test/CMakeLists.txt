@@ -68,7 +68,7 @@ vc_add_test(NAME test_smoke LIBS doctest::doctest)
 
 vc_add_test(NAME test_fiber_collection LIBS doctest::doctest vc_fiber_collection)
 
-vc_add_test(NAME test_graph_db LIBS doctest::doctest vc_objects)
+vc_add_test(NAME test_object_records LIBS doctest::doctest vc_objects)
 vc_add_test(NAME test_object_store LIBS doctest::doctest vc_objects)
 vc_add_test(NAME test_progress LIBS doctest::doctest vc_objects)
 

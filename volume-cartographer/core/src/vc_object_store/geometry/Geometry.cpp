@@ -49,7 +49,7 @@ std::vector<GeometryRevision> ObjectStore::geometryHistory(const Txn& txn, const
 }
 
 std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUuid, const GeometryData& data,
-    const std::optional<std::string>& expectedRevision)
+    const std::optional<std::string>& expectedRevision, bool force)
 {
     (void)connection(txn);
     auto* db = static_cast<sqlite3*>(connection(txn));
@@ -63,6 +63,9 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
     const auto manifestText = manifest.dump();
     const auto contentHash = detail::geometryHash(std::span(reinterpret_cast<const uint8_t*>(manifestText.data()), manifestText.size()));
     if (current && current->contentHash == contentHash) return current->uuid;
+
+    if (!force && !edgesOf(txn, objectUuid).empty())
+        throw std::runtime_error("geometry change affects existing edges; pass force=true to invalidate them");
 
     exec(db, "SAVEPOINT geometry_publish;");
     try {

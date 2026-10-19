@@ -54,7 +54,7 @@ EdgeRecord readEdgeRow(sqlite3* db, const Statement& s)
 }
 
 std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::string& host, const EdgeRecord& input,
-                        bool preserveApproval, bool preserveRecord = false)
+                        bool preserveRecord = false, const char* importOperation = "import")
 {
     if (input.kind.empty())
         throw std::runtime_error("object store: edge kind must be non-empty");
@@ -71,9 +71,9 @@ std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::strin
     auto bId = objectIdByUuid(db, bUuid);
     if (!aId) throw std::runtime_error("object store: edge endpoint not found: " + rec.aUuid);
     if (!bId) throw std::runtime_error("object store: edge endpoint not found: " + rec.bUuid);
-    if (*aId == *bId)
-        throw std::runtime_error("object store: self-edges are not allowed");
-    if (*aId > *bId) {
+    if (*aId == *bId && (!rec.aAnchor.index || !rec.bAnchor.index || rec.aAnchor.index == rec.bAnchor.index))
+        throw std::runtime_error("object store: self-edges require two distinct anchor indices");
+    if (*aId > *bId || (*aId == *bId && rec.bAnchor.index < rec.aAnchor.index)) {
         std::swap(aId, bId);
         std::swap(rec.aUuid, rec.bUuid);
         std::swap(rec.aAnchor, rec.bAnchor);
@@ -88,12 +88,12 @@ std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::strin
     s.bind(2, *aId); s.bind(3, *bId); s.bind(4, rec.kind); s.bind(5, int64_t(1));
     s.bind(6, author); s.bind(7, now); s.bind(8, host);
     s.bind(9, author); s.bind(10, now); s.bind(11, host);
-    const std::string state = preserveApproval ? rec.approvalState : "pending";
+    const std::string state = preserveRecord ? rec.approvalState : "pending";
     s.bind(12, state.empty() ? std::string("pending") : state);
-    if (preserveApproval && rec.approvedBy) s.bind(13, *rec.approvedBy); else s.bindNull(13);
-    if (preserveApproval && rec.approvedAt) s.bind(14, *rec.approvedAt); else s.bindNull(14);
-    if (preserveApproval && rec.approvedHost) s.bind(15, *rec.approvedHost); else s.bindNull(15);
-    if (preserveApproval && rec.approvedGeneration) s.bind(16, *rec.approvedGeneration); else s.bindNull(16);
+    if (preserveRecord && rec.approvedBy) s.bind(13, *rec.approvedBy); else s.bindNull(13);
+    if (preserveRecord && rec.approvedAt) s.bind(14, *rec.approvedAt); else s.bindNull(14);
+    if (preserveRecord && rec.approvedHost) s.bind(15, *rec.approvedHost); else s.bindNull(15);
+    if (preserveRecord && rec.approvedGeneration) s.bind(16, *rec.approvedGeneration); else s.bindNull(16);
     bindAnchor(s, 17, rec.aAnchor);
     bindAnchor(s, 24, rec.bAnchor);
     s.bind(31, rec.meta);
@@ -106,7 +106,7 @@ std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::strin
     binding.stepDone();
     writeTags(db, "edge_tags", "edge_id", id, rec.tags);
     if (preserveRecord) restoreCommon(db, "edges", rec);
-    appendJournal(db, author, host, parseUuid(rec.uuid), preserveRecord ? rec.generation : 1, preserveRecord ? "import" : "add_edge");
+    appendJournal(db, author, host, parseUuid(rec.uuid), preserveRecord ? rec.generation : 1, preserveRecord ? importOperation : "add_edge");
     return rec.uuid;
 }
 

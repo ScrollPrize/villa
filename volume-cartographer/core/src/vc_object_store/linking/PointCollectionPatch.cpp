@@ -52,7 +52,7 @@ std::vector<Collection> loadCollections(detail::StoredGeometry& inputs,
         const auto geometry = inputs.load(object);
         const auto xyz = geometry.values<double>("points");
         const auto ids = geometry.values<int64_t>("point_ids");
-        const auto attributes = Json::parse(geometry.revision.attributes);
+        const auto attributes = Json::parse(object.meta).value("source", Json::object());
         const auto extras = attributes.value("point_attributes", Json());
         if (!extras.is_null() && (!extras.is_array() || extras.size() != ids.size()))
             throw std::runtime_error("stored point annotations do not match geometry");

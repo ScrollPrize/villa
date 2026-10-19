@@ -6,47 +6,6 @@ std::string ObjectStore::upsertObject(WriteTxn& txn, const ObjectRecord& record)
     return upsertObjectImpl(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, record, false);
 }
 
-namespace {
-void refreshLineMeasurements(sqlite3* db, const std::string& author, const std::string& host,
-    const std::string& table, const std::string& uuid, double length,
-    const std::optional<std::string>& family, const char* journalKind)
-{
-    if (!std::isfinite(length) || length < 0)
-        throw std::invalid_argument("object store: line length must be finite and nonnegative");
-    const auto key = parseUuid(uuid);
-    Statement current(db, "SELECT o.id,o.generation,t.length,t.family FROM objects o JOIN " + table +
-        " t ON t.object_id=o.id WHERE o.uuid=?");
-    current.bindBlob(1, key);
-    if (!current.row()) throw std::runtime_error("object store: " + table + " record not found: " + uuid);
-    const auto previousFamily = current.text(3);
-    if (family && !previousFamily.empty() && previousFamily != *family)
-        throw std::runtime_error("object store: registered family differs from source: " + uuid);
-    const auto newFamily = family.value_or(previousFamily);
-    if (current.f64(2) == length && previousFamily == newFamily) return;
-    Statement update(db, "UPDATE " + table + " SET length=?,family=? WHERE object_id=?");
-    update.bind(1, length);
-    update.bind(2, newFamily);
-    update.bind(3, current.i64(0));
-    update.stepDone();
-    stampContentChange(db, author, host, "objects", current.i64(0), key, journalKind);
-}
-} // namespace
-
-void ObjectStore::setTrackLength(WriteTxn& txn, const std::string& uuid, double length,
-    const std::optional<std::string>& family)
-{
-    if (family && *family != "" && *family != "horizontal" && *family != "vertical")
-        throw std::invalid_argument("object store: invalid packed track family");
-    refreshLineMeasurements(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname,
-        "tracks", uuid, length, family, family ? "track_measurements" : "track_length");
-}
-
-void ObjectStore::setFiberLength(WriteTxn& txn, const std::string& uuid, double length)
-{
-    refreshLineMeasurements(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname,
-        "fibers", uuid, length, std::nullopt, "fiber_length");
-}
-
 std::optional<ObjectRecord> ObjectStore::objectByUuid(const Txn& txn, const std::string& uuid) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));

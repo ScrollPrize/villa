@@ -1,6 +1,3 @@
-#include "vc/core/objects/import/TrackImport.hpp"
-#include "vc/core/objects/import/PatchImport.hpp"
-#include "vc/core/objects/import/FiberImport.hpp"
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
@@ -24,7 +21,7 @@ struct TempDir {
     fs::path dir;
     explicit TempDir(const std::string& name)
     {
-        dir = fs::temp_directory_path() / ("vc_graph_test_" + name);
+        dir = fs::temp_directory_path() / ("vc_object_test_" + name);
         fs::remove_all(dir);
         fs::create_directories(dir);
     }
@@ -81,12 +78,18 @@ ObjectRecord getObject(ObjectStore& db, const std::string& uuid)
     return *obj;
 }
 
+void writeText(const fs::path& path, const std::string& text)
+{
+    fs::create_directories(path.parent_path());
+    std::ofstream(path) << text;
+}
+
 }  // namespace
 
 TEST_CASE("create, open, and validation")
 {
     TempDir tmp("create");
-    const auto path = tmp.dir / "graph.vcobj";
+    const auto path = tmp.dir / "objects.vcobj";
     {
         auto db = ObjectStore::create(path, testOptions());
         CHECK(db.hostname() == "testhost");
@@ -124,44 +127,10 @@ TEST_CASE("create, open, and validation")
     }
 }
 
-TEST_CASE("changed track measurements invalidate review, journal changes and roll back")
-{
-    TempDir tmp("track_length");
-    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
-    auto object = makeObject("track");
-    object.track = TrackDetail{"dataset", "1"};
-    std::string uuid;
-    { auto write = db.write(); uuid = db.upsertObject(write, object);
-      db.setApproval(write, uuid, "approved"); write.commit(); }
-    const auto before = getObject(db, uuid);
-    { auto write = db.write(); db.setTrackLength(write, uuid, 17); write.commit(); }
-    const auto after = getObject(db, uuid);
-    CHECK(after.track->length == 17);
-    CHECK(after.generation == before.generation + 1);
-    CHECK(after.changedBy == "tester");
-    CHECK(after.changedHost == "testhost");
-    CHECK_FALSE(after.approvedBy.has_value());
-    CHECK_FALSE(after.approvedAt.has_value());
-    CHECK_FALSE(after.approvedHost.has_value());
-    CHECK_FALSE(after.approvedGeneration.has_value());
-    CHECK(after.approvalState == "pending");
-    int64_t seq;
-    { auto read = db.read(); const auto journal = db.journalSince(read, 0);
-      CHECK(journal.back().changeKind == "track_length"); seq = journal.back().seq; }
-    { auto write = db.write(); db.setTrackLength(write, uuid, 17); write.commit(); }
-    { auto write = db.write(); db.setTrackLength(write, uuid, 19); } // rollback
-    { auto read = db.read(); CHECK(db.journalSince(read, seq).empty()); }
-    CHECK(getObject(db, uuid).track->length == 17);
-    { auto write = db.write();
-      CHECK_THROWS(db.setTrackLength(write, uuid, -1));
-      CHECK_THROWS(db.setTrackLength(write, uuid, std::numeric_limits<double>::infinity()));
-      CHECK_THROWS(db.setTrackLength(write, uuid, std::numeric_limits<double>::quiet_NaN())); }
-}
-
 TEST_CASE("object CRUD stamps, generation, journal, kinds as data")
 {
     TempDir tmp("crud");
-    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "objects.vcobj", testOptions());
 
     ObjectRecord fiber = makeObject("fiber", "f1");
     fiber.tags = {"reviewed", "h"};
@@ -243,7 +212,7 @@ TEST_CASE("object CRUD stamps, generation, journal, kinds as data")
 TEST_CASE("approval lifecycle and open-ended metadata")
 {
     TempDir tmp("approval");
-    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "objects.vcobj", testOptions());
     const std::string uuid = addObject(db, "fiber", "f");
 
     {
@@ -309,7 +278,7 @@ TEST_CASE("approval lifecycle and open-ended metadata")
 TEST_CASE("edges: canonicalisation, anchors, uniqueness")
 {
     TempDir tmp("edges");
-    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "objects.vcobj", testOptions());
     const std::string a = addObject(db, "fiber", "a");
     const std::string b = addObject(db, "patch", "b");
     const std::string c = addObject(db, "fiber", "c");
@@ -377,7 +346,7 @@ TEST_CASE("edges: canonicalisation, anchors, uniqueness")
 TEST_CASE("traversal crosses object kinds and filters by edge kind")
 {
     TempDir tmp("traversal");
-    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "objects.vcobj", testOptions());
     const std::string f1 = addObject(db, "fiber");
     const std::string p1 = addObject(db, "patch");
     const std::string f2 = addObject(db, "fiber");
@@ -460,142 +429,7 @@ TEST_CASE("snapshot conflicts roll back only the import when caught inside a tra
     CHECK(getObject(target, b).name == "local edit");
 }
 
-TEST_CASE("family-only refresh invalidates approval and unchanged measurements preserve it")
-{
-    TempDir tmp("family_refresh");
-    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
-    auto object = makeObject("track");
-    object.track = TrackDetail{"dataset", "1"};
-    object.track->length = 17;
-    std::string uuid;
-    { auto w = db.write(); uuid = db.upsertObject(w, object); db.setApproval(w, uuid, "approved"); w.commit(); }
-    { auto w = db.write(); db.setTrackLength(w, uuid, 17, "horizontal"); w.commit(); }
-    CHECK(getObject(db, uuid).generation == 2);
-    CHECK(getObject(db, uuid).approvalState == "pending");
-    { auto w = db.write(); db.setApproval(w, uuid, "approved"); w.commit(); }
-    size_t journalSize;
-    { auto r = db.read(); journalSize = db.journalSince(r, 0).size(); }
-    { auto w = db.write(); db.setTrackLength(w, uuid, 17, "horizontal"); w.commit(); }
-    CHECK(getObject(db, uuid).generation == 2);
-    CHECK(getObject(db, uuid).approvalState == "approved");
-    { auto r = db.read(); CHECK(db.journalSince(r, 0).size() == journalSize); }
-}
-
-namespace
-{
-void writeText(const fs::path& path, const std::string& text)
-{
-    fs::create_directories(path.parent_path());
-    std::ofstream(path) << text;
-}
-
-std::string fiberJson(const std::string& uuid, const std::string& branchEntries)
-{
-    return R"({"type":"vc3d_fiber","version":4,"uuid":")" + uuid + R"(",
-      "optimization_mode":"lasagna","width":10,"tags":["t1"],
-      "control_points":[{"position":[0,0,0]},{"position":[1,0,0]},{"position":[2,0,0]}],
-      "line_points":[[0,0,0],[1,0,0],[2,0,0]],
-      "branches":[)" + branchEntries + "]}\n";
-}
-
-std::string branchJson(int local, const std::string& file, int target, bool pending)
-{
-    return std::string("{\"control_point_index\":") + std::to_string(local) +
-           ",\"branch_file\":\"" + file + "\",\"branch_control_point_index\":" + std::to_string(target) +
-           ",\"control_point_position\":[0,0,0],\"branch_control_point_position\":[1,0,0]" +
-           ",\"control_point_direction\":[1,0,0],\"branch_control_point_direction\":[1,0,0]" +
-           (pending ? ",\"pending\":true" : "") + "}";
-}
-}  // namespace
-
-TEST_CASE("fiber importer: reciprocal, one-sided, unresolved, pending mapping")
-{
-    TempDir tmp("import_fibers");
-    const auto dir = tmp.dir / "fibers";
-    const std::string u1 = "11111111-1111-4111-8111-111111111111";
-    const std::string u2 = "22222222-2222-4222-8222-222222222222";
-    const std::string u3 = "33333333-3333-4333-8333-333333333333";
-    // f1 <-> f2 reciprocal (not pending); f1 -> f3 one-sided (pending);
-    // f2 -> missing.json unresolved.
-    writeText(dir / "f1.json", fiberJson(u1, branchJson(1, "f2.json", 2, false) + "," + branchJson(0, "f3.json", 1, true)));
-    writeText(dir / "f2.json", fiberJson(u2, branchJson(2, "f1.json", 1, false) + "," + branchJson(0, "missing.json", 0, false)));
-    writeText(dir / "f3.json", fiberJson(u3, ""));
-    writeText(dir / "notes.json", R"({"unrelated":true})");
-
-    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
-    ImportReport report;
-    std::set<std::string> stages;
-    {
-        auto w = db.write();
-        report = importFibers(db, w, dir, [&](const vc::util::ProgressUpdate& update) {
-            CHECK((update.total == 0 || update.completed <= update.total));
-            stages.insert(std::string(update.stage));
-        });
-        w.commit();
-    }
-    CHECK(stages.contains("reading fibers"));
-    CHECK(stages.contains("registering fibers"));
-    CHECK(stages.contains("importing fiber branches"));
-    CHECK(report.objectsImported == 3);
-    CHECK(report.edgesImported == 2);
-    REQUIRE(report.problems.size() == 2);  // one one-sided, one unresolved
-
-    auto r = db.read();
-    auto f1Edges = db.edgesOf(r, u1);
-    REQUIRE(f1Edges.size() == 2);
-    for (const auto& e : f1Edges) {
-        CHECK(e.kind == "fiber_branch");
-        const bool toF3 = (e.aUuid == u3 || e.bUuid == u3);
-        if (toF3) {
-            CHECK(e.approvalState == "pending");
-        } else {
-            // Legacy non-pending branch: approved, but with no fabricated stamps.
-            CHECK(e.approvalState == "approved");
-            CHECK(e.approvedBy == std::nullopt);
-            CHECK(e.approvedGeneration == std::nullopt);
-        }
-    }
-    CHECK(db.componentOf(r, u1).size() == 3);
-    r.commit();
-
-    // Re-import is a no-op.
-    {
-        auto w = db.write();
-        ImportReport again = importFibers(db, w, dir);
-        w.commit();
-        CHECK(again.objectsImported == 0);
-        CHECK(again.edgesImported == 0);
-    }
-}
-
-TEST_CASE("patch importer registers segments and ignores overlapping.json")
-{
-    TempDir tmp("import_patches");
-    const auto segs = tmp.dir / "segments";
-    writeText(segs / "seg_a" / "meta.json", R"({"uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","grid_width":10})");
-    writeText(segs / "seg_b" / "meta.json", R"({"uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"})");
-    writeText(segs / "seg_a" / "overlapping.json", R"(["seg_b"])");
-    writeText(segs / "seg_b" / "overlapping.json", R"(["seg_a"])");
-    writeText(segs / "no_uuid" / "meta.json", R"({"name":"x"})");
-
-    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
-    ImportReport report;
-    {
-        auto w = db.write();
-        report = importPatches(db, w, segs);
-        w.commit();
-    }
-    CHECK(report.objectsImported == 2);
-    CHECK(report.problems.size() == 1);  // the uuid-less segment
-    auto r = db.read();
-    const auto patches = db.objectsByKind(r, "patch");
-    REQUIRE(patches.size() == 2);
-    // The overlapping.json files had no effect: no edges exist.
-    for (const auto& p : patches)
-        CHECK(db.edgesOf(r, p.uuid).empty());
-}
-
-TEST_CASE("external geometry resolves by UUID after rename and path reuse")
+TEST_CASE("source geometry resolves by UUID after rename and path reuse")
 {
     TempDir tmp("resolve_uuid");
     const auto patches = tmp.dir / "patches";
@@ -604,11 +438,15 @@ TEST_CASE("external geometry resolves by UUID after rename and path reuse")
     const std::string fiberUuid = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
     writeText(patches / "original" / "meta.json", "{\"uuid\":\"" + patchUuid + "\"}");
     writeText(fibers / "original.json", "{\"uuid\":\"" + fiberUuid + "\",\"line_points\":[]}");
-    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "objects.vcobj", testOptions());
     {
         auto w = db.write();
-        REQUIRE(importPatches(db, w, patches).objectsImported == 1);
-        REQUIRE(importFibers(db, w, fibers).objectsImported == 1);
+        auto patch = makeObject("patch"); patch.uuid = patchUuid;
+        patch.storageKind = "file"; patch.storageRef = "patches/original";
+        db.upsertObject(w, patch);
+        auto fiber = makeObject("fiber"); fiber.uuid = fiberUuid;
+        fiber.storageKind = "file"; fiber.storageRef = "fibers/original.json";
+        db.upsertObject(w, fiber);
         w.commit();
     }
     auto r = db.read();
@@ -632,20 +470,22 @@ TEST_CASE("external geometry resolves by UUID after rename and path reuse")
     CHECK_FALSE(db.resolveStoragePath(r, fiberUuid).has_value());
 }
 
-TEST_CASE("external geometry supports a separate dataset root on read-only graphs")
+TEST_CASE("source geometry supports a separate dataset root on read-only stores")
 {
     TempDir tmp("resolve_root");
     const auto source = tmp.dir / "source";
     const std::string uuid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     writeText(source / "patches" / "old" / "meta.json", "{\"uuid\":\"" + uuid + "\"}");
     {
-        auto db = ObjectStore::create(source / "graph.vcobj", testOptions());
+        auto db = ObjectStore::create(source / "objects.vcobj", testOptions());
         auto w = db.write();
-        importPatches(db, w, source / "patches");
+        auto patch = makeObject("patch"); patch.uuid = uuid;
+        patch.storageKind = "file"; patch.storageRef = "patches/old";
+        db.upsertObject(w, patch);
         w.commit();
         db.checkpoint();
     }
-    fs::rename(source / "graph.vcobj", tmp.dir / "graph.vcobj");
+    fs::rename(source / "objects.vcobj", tmp.dir / "objects.vcobj");
     fs::rename(source, tmp.dir / "dataset");
     const auto root = tmp.dir / "dataset";
     fs::rename(root / "patches" / "old", root / "patches" / "new");
@@ -653,7 +493,7 @@ TEST_CASE("external geometry supports a separate dataset root on read-only graph
     writeText(root / ".strip-cache" / "copy" / "meta.json", "{\"uuid\":\"" + uuid + "\"}");
     OpenOptions options;
     options.readOnly = true;
-    auto db = ObjectStore::open(tmp.dir / "graph.vcobj", options);
+    auto db = ObjectStore::open(tmp.dir / "objects.vcobj", options);
     auto r = db.read();
     CHECK(db.resolveStoragePath(r, uuid, root) == root / "patches" / "new");
     CHECK(db.resolveStoragePath(r, uuid, root / "patches" / "new") == root / "patches" / "new");
@@ -662,29 +502,10 @@ TEST_CASE("external geometry supports a separate dataset root on read-only graph
     CHECK(db.objectByUuid(r, uuid)->generation == 1);
 }
 
-TEST_CASE("sweep reports missing external data")
-{
-    TempDir tmp("sweep");
-    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
-    ObjectRecord o = makeObject("patch", "gone");
-    o.storageKind = "file";
-    o.storageRef = "nope.tifxyz";
-    o.dataGeneration = 1;
-    {
-        auto w = db.write();
-        db.upsertObject(w, o);
-        w.commit();
-    }
-    auto r = db.read();
-    const auto problems = db.sweepExternalData(r);
-    REQUIRE(problems.size() == 1);
-    CHECK(problems[0].find("storage file missing") != std::string::npos);
-}
-
 TEST_CASE("reader snapshot is stable across a concurrent commit")
 {
     TempDir tmp("snapshot");
-    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "objects.vcobj", testOptions());
     const std::string first = addObject(db, "patch", "first");
     auto r = db.read();
     CHECK(db.objectsByKind(r, "patch").size() == 1);
@@ -699,7 +520,7 @@ TEST_CASE("reader snapshot is stable across a concurrent commit")
 TEST_CASE("concurrent readers while a writer commits")
 {
     TempDir tmp("concurrent");
-    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "objects.vcobj", testOptions());
     const std::string anchorObj = addObject(db, "patch", "anchor");
     std::atomic<int> errors{0};
     std::atomic<bool> done{false};
@@ -743,7 +564,7 @@ TEST_CASE("concurrent readers while a writer commits")
 TEST_CASE("traversal cancellation via atomic flag")
 {
     TempDir tmp("cancel");
-    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
+    auto db = ObjectStore::create(tmp.dir / "objects.vcobj", testOptions());
     const std::string a = addObject(db, "fiber");
     const std::string b = addObject(db, "fiber");
     addEdge(db, makeEdge(a, b));
@@ -758,44 +579,3 @@ TEST_CASE("traversal cancellation via atomic flag")
     CHECK_THROWS_AS(db.reachableWithin(r, a, 5, {}, &cancel), std::runtime_error);
 }
 
-TEST_CASE("track list registration is identity-stable and idempotent")
-{
-    TempDir tmp("tracks");
-    const auto listPath = tmp.dir / "tracks.json";
-    writeText(listPath,
-              R"([{"dataset_ref":"spiral://scroll1/tracks","external_key":"t-001","family":"H","point_count":42,"length":12.5},
-                  {"dataset_ref":"spiral://scroll1/tracks","external_key":"t-002","family":"V"},
-                  {"external_key":"no-dataset"},
-                  42])");
-    auto db = ObjectStore::create(tmp.dir / "graph.vcobj", testOptions());
-    ImportReport report;
-    {
-        auto w = db.write();
-        report = importTrackList(db, w, listPath);
-        w.commit();
-    }
-    CHECK(report.objectsImported == 2);
-    CHECK(report.problems.size() == 2);
-
-    auto r = db.read();
-    const auto tracks = db.objectsByKind(r, "track");
-    REQUIRE(tracks.size() == 2);
-    const std::string firstUuid = tracks[0].uuid;
-    CHECK(tracks[0].track->externalKey == "t-001");
-    CHECK(tracks[0].track->pointCount == 42);
-    CHECK(tracks[0].generation == 1);
-    r.commit();
-
-    // Re-registering the same list keeps UUIDs and generations.
-    {
-        auto w = db.write();
-        ImportReport again = importTrackList(db, w, listPath);
-        w.commit();
-        CHECK(again.objectsImported == 0);
-    }
-    auto r2 = db.read();
-    const auto tracks2 = db.objectsByKind(r2, "track");
-    REQUIRE(tracks2.size() == 2);
-    CHECK(tracks2[0].uuid == firstUuid);
-    CHECK(tracks2[0].generation == 1);
-}

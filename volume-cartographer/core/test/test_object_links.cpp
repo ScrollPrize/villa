@@ -153,23 +153,6 @@ TEST_CASE("stale replacement removes only own pending edges")
     CHECK(edgeCount(db, cObj) == 2);
 }
 
-TEST_CASE("placeholder detectors write nothing and say so")
-{
-    TempDir tmp("placeholder");
-    auto db = makeDb(tmp.dir);
-    const std::string p = addObject(db, "patch");
-    addObject(db, "fiber");
-    addObject(db, "track");
-
-    for (const auto& report : {linkFibersToFibers(db), linkTracksToFibers(db)}) {
-        CHECK(report.edgesCreated == 0);
-        REQUIRE(report.problems.size() == 1);
-        CHECK(report.problems[0].find("not implemented") != std::string::npos);
-        CHECK(report.objectsConsidered > 0);
-    }
-    CHECK(edgeCount(db, p) == 0);
-}
-
 TEST_CASE("track crossing kernel: clustered medians, clearance and tie breaking")
 {
     namespace tc = vc::track_crossings;
@@ -262,27 +245,6 @@ TEST_CASE("caller-owned candidate transaction rolls registration and edges back 
     auto read = db.read();
     CHECK(db.objectsByKind(read, "track").empty());
     CHECK(db.edgesByKind(read, "same-surface").empty());
-}
-
-TEST_CASE("pending anchors are refreshed when their index convention changes")
-{
-    TempDir tmp("anchor_index_space");
-    auto db = makeDb(tmp.dir);
-    const auto a = addObject(db, "fiber"), b = addObject(db, "patch");
-    auto legacy = cand(a,b);
-    legacy.aAnchor.index = 1;
-    legacy.aAnchor.position = std::array<double,3>{100,0,0};
-    commitCandidates(db, kFiberPatchDetector, 2, {legacy});
-    auto current = legacy;
-    current.aAnchor.position = std::array<double,3>{10,0,0};
-    current.meta = R"({"anchor_index_space":"line_points"})";
-    const auto updated = commitCandidates(db, kFiberPatchDetector, 3, {current});
-    CHECK(updated.staleRemoved == 1);
-    CHECK(updated.edgesCreated == 1);
-    CHECK(updated.edgesSkippedExisting == 0);
-    auto read = db.read();
-    const auto edge = db.edgesOf(read, a).at(0);
-    CHECK(nlohmann::json::parse(edge.meta)["anchor_index_space"] == "line_points");
 }
 
 TEST_CASE("pending detector links refresh anchors and evidence while retaining identity and annotations")
@@ -425,7 +387,7 @@ TEST_CASE("discovery refuses to publish links if stored inputs change during com
         if (progress.stage == "checking patch pairs" && !edited) {
             edited = true;
             auto txn = db.write();
-            db.putGeometry(txn, b, storedPlane(1000, 100), db.currentGeometry(txn, b)->uuid);
+            db.putGeometry(txn, b, storedPlane(1000, 100), db.currentGeometry(txn, b)->uuid, true);
             txn.commit();
         }
     };

@@ -45,7 +45,7 @@ std::vector<std::string> traverse(sqlite3* db, const std::string& startUuid, int
     if (!objectIdByUuid(db, startBytes))
         throw std::runtime_error("object store: object not found: " + startUuid);
     // Probe the endpoint indexes only for nodes reached by this traversal.
-    // ORDER BY id preserves the previous breadth-first visitation order.
+    // Visit neighbours in stable internal-ID order.
     std::string sql = "SELECT id,CASE WHEN a_id=? THEN b_id ELSE a_id END FROM edges WHERE (a_id=? OR b_id=?)";
     if (!edgeKindFilter.empty()) {
         sql += " AND kind IN (";

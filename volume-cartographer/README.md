@@ -410,5 +410,5 @@ _Widget for creating initial segmentations which can be used for traces or later
 ### Object graph
 
 The graph database stores patches, fibers, tracks, and their relationships by UUID.
-See the [graph README](docs/graph/README.md) for importing and linking objects,
+See the [object-store guide](docs/objects/README.md) for importing and linking objects,
 querying overlaps and neighbours in Python and C++, and locating their files.

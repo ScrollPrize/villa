@@ -1,4 +1,5 @@
 #include "geometry/GeometrySnapshot.hpp"
+#include "geometry/SourceMetadata.hpp"
 #include "vc/core/objects/GeometryExport.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Uuid.hpp"
@@ -202,14 +203,15 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
     // Never replace the open database, a hard link to it, its sidecars, or an
     // ancestor directory containing it, even with explicit overwrite.
     for (auto p = database; !p.empty(); p = p.parent_path()) {
-        if (resolved == p) throw std::runtime_error("export destination contains the open graph database");
+        if (resolved == p) throw std::runtime_error("export destination contains the open object database");
         if (p == p.root_path()) break;
     }
     if (resolved == database.string() + "-wal" || resolved == database.string() + "-shm" || resolved == database.string() + "-journal" ||
         (fs::exists(dest) && fs::equivalent(dest, database)))
-        throw std::runtime_error("cannot export over the open graph database or its sidecars");
+        throw std::runtime_error("cannot export over the open object database or its sidecars");
     if (!fs::is_directory(dest.parent_path())) throw std::runtime_error("export parent directory must exist");
     Snapshot snapshot;
+    Json attributes;
     {
         auto read = db.read();
         const auto object = db.objectByUuid(read, objectUuid);
@@ -218,6 +220,7 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
         if (!revision) throw std::runtime_error("geometry revision not found");
         if (revision->objectUuid != object->uuid) throw std::runtime_error("geometry revision belongs to another object");
         snapshot.revision = *revision;
+        attributes = detail::nativeMetadata(db, read, *object, *revision);
         if (revision->formatVersion != 1 || revision->coordinateSystem != "source_xyz")
             throw std::runtime_error("unsupported geometry format for native export");
         const std::set<std::string> names = revision->kind == "fiber" ? std::set<std::string>{"control_points", "line_points"} :
@@ -234,7 +237,6 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
     Stage stage{stagingPath};
     const auto output = stage.root / "payload";
     if (directory) fs::create_directory(output);
-    const auto attributes = Json::parse(snapshot.revision.attributes);
     if (kind == "fiber") fiber(snapshot, attributes, output);
     else if (kind == "point_collection") collection(snapshot, attributes, output);
     else if (kind == "patch") patch(snapshot, attributes, output);

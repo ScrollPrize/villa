@@ -1,18 +1,13 @@
-# Graph linking reference
+# Object linking reference
 
-[Graph README](graph/README.md) · [Volume Cartographer](../README.md)
+[Object store](objects/README.md) · [Volume Cartographer](../README.md)
 
-Detailed detector behavior, cache rules, and recorded validation results.
-All current detector APIs read ingested geometry from `ObjectStore`. Ingest
-sources first; see [the workflow](object_storage.md#discovering-relationships-from-the-store).
-The historical measurements below predate the store-based loaders.
-Benchmark paths and timings below describe historical experiments; those inputs
-and temporary harnesses are not distributed with the repository.
+Detector behavior and cache rules. All detector APIs read ingested geometry
+from `ObjectStore`; see [the workflow](object_storage.md#discovering-relationships-from-the-store).
 
+## Fiber-to-patch object links
 
-## Fiber-to-patch graph links
-
-`vc_graph_import` reports progress on stderr by default for every import and
+`vc_object_links` reports progress on stderr by default for every import and
 linking operation. It shows the current stage, completed/total counts and a bar
 when the total is known, elapsed time, and an estimated remaining time once
 progress is available. A heartbeat continues during individual slow loads,
@@ -23,15 +18,15 @@ flashing a new bar for every subtask. Fiber/track linking likewise keeps one
 overall line counter, with normal sampling and contact checks shown as details.
 
 C++ callers can provide `vc::util::ProgressCallback` through detector
-`params.progress` or the optional last argument of the metadata import functions.
+`params.progress`. Ingestion accepts its own progress callback.
 The library itself does not print progress. `vc::util::TerminalProgress` is the
 shared CLI renderer, also used by `vc_zarr_download_region`; finish it before
 printing an operation's summary. Callback string views must be copied if retained.
 
-`vc_graph_import` proposes pending fiber-to-patch links using CT sheet normals:
+`vc_object_links` proposes pending fiber-to-patch links using CT sheet normals:
 
 ```sh
-build/bin/vc_graph_import --db objects.vcobj --author "$USER" \
+build/bin/vc_object_links --db objects.vcobj --author "$USER" \
   --link-fiber-patches \
   --ct /path/to/ct.zarr --ct-level 0
 ```
@@ -40,7 +35,7 @@ Inputs are stored fiber and patch geometry plus a uint8 CT volume. The detector
 finds anchors through
 long fiber contact and strip agreement, then grows through same-sheet patch
 overlap. The strip has the centerline plus **one row on each side at 20 working
-voxels**. `--fiber-strip-rows` and `--fiber-anchor-contact` control its width and
+voxels**. `--strip-rows` and `--anchor-contact` control its width and
 minimum anchor contact (default 75 working voxels).
 
 Fiber contacts and anchors can use every dense line point between the projected
@@ -48,8 +43,8 @@ first and last control points, inclusive; extensions outside that span are
 excluded. Without controls, the full line is eligible. The saved anchor is the
 median contact's original `line_points` index and source XYZ position, without
 snapping to a control point. Edge metadata marks `anchor_index_space` as
-`line_points`. Reviewed legacy anchors are preserved; pending anchors with the
-old index convention are replaced on rerun.
+`line_points`. Reviewed anchors are preserved; detector-owned pending anchors
+are refreshed on rerun.
 
 Ingestion populates object measurements. Discovery reads geometry revisions and
 writes only relationship metadata, leaving object lengths and approvals alone.
@@ -61,9 +56,7 @@ three-voxel lattice within radius 48, using full-resolution Gaussian derivatives
 and a complete six-voxel derivative halo. It reuses gradient tiles across nearby
 queries and evaluates weights at the original query position. Flat or ambiguous
 CT has no valid normal. The default CT path needs no Lasagna manifest and does
-not use `pred_dt` snapping. Measured patch-normal errors and workflow timings
-are recorded under [CT normal validation](#ct-normal-validation). Historical seven-row link accuracy has not been established
-for this variant.
+not use `pred_dt` snapping. 
 
 `--fiber-scale` and `--patch-scale` multiply source XYZ into common working
 voxels (defaults 1). `--working-to-base-scale` and `--ct-to-base-scale` specify
@@ -82,7 +75,7 @@ disabled. Python accepts the equivalent `normals_manifest` keyword. This option
 allows measuring normal-source effects without changing strip width or gates.
 
 Edges record measurements, rounds, coordinate scales, the actual normal source,
-estimator ID, and detector version 3. Reruns preserve reviewed/manual edges; stale pending links
+estimator ID, and detector identity. Reruns preserve reviewed/manual edges; stale pending links
 are removed only for successfully processed inputs. Failed inputs are excluded.
 
 C++ exposes `vc::object_links::linkFibersToPatches`. Python exposes
@@ -108,7 +101,7 @@ volume. After editing voxel data in place without changing its metadata, use
 `--rebuild-fiber-strips` (Python: `rebuild_strips=True`) or remove `.strip-cache/`.
 The normal source must still be accessible when rerunning the detector.
 
-## Track-to-track graph links
+## Track-to-track object links
 
 `vc::object_links::linkTracksToTracks` implements Spiral's exact-voxel crossing
 relation in `vc_object_links`. Tracks must share an integer voxel, belong to
@@ -127,8 +120,8 @@ packed `.vctracks` geometry or a DBM with a current packed mirror. Discovery
 only reads stored revisions; `crossings.npz` is neither read nor written.
 
 ```sh
-ninja -C build vc_graph_import vc_object_bindings test_object_links
-build/bin/vc_graph_import --db objects.vcobj --author "$USER" \
+ninja -C build vc_object_links_cli vc_object_bindings test_object_links
+build/bin/vc_object_links --db objects.vcobj --author "$USER" \
   --link-track-tracks --track-workers 4
 ```
 
@@ -164,16 +157,7 @@ Python adapter. Spiral's CMake defaults to the sibling `volume-cartographer`
 checkout; `VC_TRACK_CROSSINGS_ROOT` can point at another checkout. The kernel
 retains the native radix sort, parallel event scan and CSR consolidation, with
 a serial fallback when compiled without OpenMP. No Python dependency is added
-to the C++ graph library.
-
-Validation used 24 real tracks (6,192 points) from
-`2um_ds2_ps256_surf_v2.dbm.vctracks`: all 18 crossings, raw indices,
-arclengths and clearances matched both Spiral's Python fallback and its
-previous native kernel exactly. The graph linker produced the same 18 edges
-and an idempotent rerun. The DBM CLI entry point also registered those 24 tracks
-from `/mnt/bigpc/spiral_dataset_working/tracks` and reproduced the same 18 edges;
-rerunning with the `.dbm.db` backing filename reused all identities and links.
-Those source-path discovery entry points have since been removed. No full-collection crossing test was run.
+to the C++ object-link library.
 
 Regression checks:
 
@@ -186,7 +170,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH="$PWD/build/python" \
 Use a Python interpreter matching the compiled bindings, with NumPy and pytest
 available; it must load `vc` from `build/python`, not an older installed build.
 
-## Point-collection-to-patch graph links
+## Point-collection-to-patch object links
 
 Regular PCL linking uses the rules from Spiral's `fit_spiral.py`: each point
 chooses the largest patch within tolerance, then the closest on area ties.
@@ -196,7 +180,7 @@ nearest hit within that named pair. If either patch is absent, they use the
 general rule. Remaining ties use sorted object UUID order.
 
 ```sh
-build/bin/vc_graph_import --db objects.vcobj --author "$USER" \
+build/bin/vc_object_links --db objects.vcobj --author "$USER" \
   --link-pcl-patches --pcl-tolerance 2.5
 ```
 
@@ -221,7 +205,7 @@ the next odd size; the requirement is clipped at collection ends. CLI flags
 are `--pcl-window-points` and `--pcl-window-min-points`; both default to 1.
 
 Ingestion records the `abs_winding.json` role as a `winding_is_absolute`
-geometry attribute. Absolute collections bypass the neighbor gate. Python
+field in `object.meta["source"]`. Absolute collections bypass the neighbor gate. Python
 `absolute_winding=True/False` or CLI `--pcl-absolute` / `--pcl-relative` overrides
 that stored role for the selected collections.
 
@@ -239,23 +223,14 @@ only this detector's stale pending links within the successfully processed
 collection/patch scope. Reviewed and manual links survive. The original source
 files can be removed or relocated after ingestion.
 
-Validation used 29 real collections (259 points) and 24 real patches from
-`/home/sean/Desktop/spiral_dataset_graph_uuid`. All 17 selected attachments and
-winding annotations matched Spiral's Python fallback, with grid-coordinate
-differences below 0.000001 cells and distance differences below 0.0006 voxels.
-A three-point/two-hit neighbor gate rejected all 17 in both implementations;
-an absolute-role override restored them. CLI results and idempotent reruns
-matched. Those comparisons used the former file-based discovery API.
-No full-dataset run was performed.
-
-## Track-to-patch graph links
+## Track-to-patch object links
 
 Track-to-patch linking shares the fiber-to-patch implementation: dense-point
 proximity, CT sheet-normal strips, long-contact anchors, strip agreement, and
 same-sheet growth all use the same rules and defaults.
 
 ```sh
-build/bin/vc_graph_import --db objects.vcobj --author "$USER" \
+build/bin/vc_object_links --db objects.vcobj --author "$USER" \
   --link-track-patches \
   --ct /path/to/ct.zarr --track-scale 1 --patch-scale 1
 ```
@@ -289,7 +264,7 @@ Python accepts all shared fiber-link keywords, with `track_scale` replacing
 `fiber_scale`, plus optional `track_uuids` and `patch_uuids` selections. Every raw
 track point is eligible. Anchors save the median contact's raw local index and
 source XYZ position, with `anchor_index_space: "line_points"`. Edge provenance
-records detector `track-patch` version 1, source identity, normal method, scales,
+records detector `track-patch`, source identity, normal method, scales,
 and contact/strip/growth measurements.
 
 Links commit together after validating input revisions. Reviewed/manual edges are preserved;
@@ -297,12 +272,7 @@ stale pending links are removed only for successfully processed tracks and
 patches in the current selection. Unreadable geometry is reported and skipped,
 and its existing links remain. Cancellation commits no changes.
 
-Validation used four real tracks (977 points) and three real patches: three
-links matched equivalent fiber inputs exactly, including anchors and all
-contact/strip/growth measurements. Rerunning skipped all three existing links;
-the CLI produced the same result. No full-collection test was run. These results used the former file-based discovery API.
-
-## Patch-to-patch graph linking performance
+## Patch-to-patch object linking
 
 Patch overlap linking queries all eligible target patches together for each
 seed sample, instead of scanning the same seed separately for every target.
@@ -313,55 +283,17 @@ many workers. Python accepts `db.link_patch_overlaps(workers=4)`; C++ uses
 
 Workers retain bounded correspondence sets and merge in source order. Nearest
 triangle selection, distance ties, thinning, correspondence caps, RANSAC seeds,
-fitting and acceptance thresholds retain the original behavior. Index queries
+fitting and acceptance thresholds are deterministic. Index queries
 borrow immutable raw filter sets, avoid allocations for empty results, and
 share one index lock across each batch of 512 samples. Progress callbacks run
 on the calling thread, including updates during correspondence searches.
 The pair-checking bar keeps one overall counter throughout the search; the
 current patch, search percentage and fitting activity appear only in its detail text.
 
-Measurements on Linux arm64 with GCC 13, `RelWithDebInfo` and LTO, three runs
-per version with a fresh graph each time (seconds, min / median / max):
-
-| Input | Original total | Optimized total | Median speedup |
-| --- | --- | --- | --- |
-| 8 real patches | 0.710 / 0.721 / 0.729 | 0.225 / 0.277 / 0.323 | 2.6x |
-| 24 real patches | 1.563 / 1.565 / 1.569 | 0.298 / 0.317 / 0.328 | 4.9x |
-| 3 dense synthetic patches | 2.768 / 2.791 / 2.860 | 0.704 / 0.723 / 0.840 | 3.9x |
-
-Real inputs were small symlink subsets of
-`/home/sean/Desktop/spiral_dataset_graph_uuid/verified_patches`, staged in
-`/tmp/vc-overlap-perf/patches` and `patches24`. The 24-patch subset was the first
-24 sorted directories with at most 6 MB of TIFF geometry, giving 434,673 seed
-samples and 50 bounding-box candidate pairs. The synthetic input contained
-three 321x321 grids with curvature, small displacements, reflection and a hole,
-using sample spacing 1 to exercise the 4,096-correspondence cap. No full
-collection was tested; these timings do not predict full-collection runtime.
-
-Phase profiling identified correspondence collection as the bottleneck:
-on 24 patches its median fell from 1.389 s to 0.144 s (9.6x), and spatial
-queries fell from 3,902,813 to 408,683. Loading, indexing, fitting and agreement
-checks accounted for much less time. All accepted links (1, 9 and 3 respectively)
-and their complete fit metadata matched the original exactly across all runs.
-These comparisons used the former file-based discovery API.
-
-Build with `ninja -C build vc_graph_import vc_object_bindings test_object_links
-test_surface_patch_index`. The benchmark harness in `/tmp/vc-overlap-perf/bench.py`
-times the command below, with a new output basename for each run. The original
-executable and core library were saved in that temporary directory for comparison;
-benchmark inputs and output graphs are not repository files.
-
-```sh
-VC_PATCH_OVERLAP_PROFILE=1 build/bin/vc_graph_import \
-  --db /tmp/vc-overlap-perf/example.vcobj --author overlap-perf \
-  --link-patch-overlaps /tmp/vc-overlap-perf/patches24 --no-progress \
-  --export-json /tmp/vc-overlap-perf/example.json
-```
-
 Setting `VC_PATCH_OVERLAP_PROFILE` emits one `PATCH_OVERLAP_PROFILE` JSON line
 on stderr with phase timings and query counts. Profiling is off by default.
 
-## CT normal validation
+## CT normal sampling
 
 The default method is **`ct-anisotropic-1-24-4-grid3-r48-v4`**. Its radius-48
 support contains 33³ quadrature samples. A 1024-entry indexed LRU caches
@@ -370,32 +302,3 @@ strip columns march in reverse order to reuse tiles from the centerline pass.
 Retained sampler storage is about **102 MiB**, excluding the shared CT chunk
 cache. The selected CT level defaults to 0; changing levels does not rescale
 the estimator's widths automatically.
-
-Validation on 535 saved regression probes (508 patch points and 27 fiber
-points) produced valid normals for both CT and Lasagna at every point. Angular
-errors are unsigned normal-axis errors against patch geometry:
-
-| Probe set / method | Mean error | Median error | p95 error | Maximum error |
-| --- | ---: | ---: | ---: | ---: |
-| Patch points, CT | 2.70° | 2.26° | 5.95° | 24.70° |
-| Patch points, Lasagna | 3.38° | 2.92° | 7.15° | 18.00° |
-| Fiber points, CT | 3.20° | 2.71° | 7.29° | 11.21° |
-| Fiber points, Lasagna | 4.24° | 4.01° | 9.41° | 10.37° |
-
-CT has better mean/median/p95 error on these probes, but worse maximum error.
-These reused regression probes are not a new unseen holdout or a measurement
-of link precision.
-
-Small-workflow timing on Linux/aarch64, GCC 13, RelWithDebInfo, using level 0 of
-`s1_ds2.zarr`, separate processes and warm OS caches:
-
-| Workflow | CT total | Lasagna total | CT normal sampling |
-| --- | ---: | ---: | ---: |
-| Two fibers, 849 candidate patches | 4.75 s | 1.16 s | 3.43 s |
-| One fiber, three patches | 0.83 s | 0.12 s | 0.67 s |
-
-The two-fiber input made 5,589 valid normal calls and produced no links. The
-selected positive case made 1,242 valid calls and retained the same three links
-and two anchors with both normal sources. No full-collection workflow was run.
-The standalone benchmark and experiment scripts were removed after this work;
-these numbers record the completed validation, not a bundled benchmark suite.

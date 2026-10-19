@@ -38,19 +38,4 @@ inline std::string trackFamily(const PackedTrackStore& store, size_t row)
     const auto family = store.families()[row];
     return family == 0 ? "horizontal" : family == 1 ? "vertical" : "";
 }
-inline size_t trackRow(const PackedTrackStore& store, const ObjectRecord& object)
-{
-    if (!object.track) throw std::runtime_error("missing track detail: " + object.uuid);
-    const auto id = trackSourceId(object.track->externalKey);
-    const auto found = std::lower_bound(store.sourceIds().begin(), store.sourceIds().end(), id);
-    if (found == store.sourceIds().end() || *found != id)
-        throw std::runtime_error("source ID " + std::to_string(id) + " missing from " + object.track->datasetRef);
-    const auto row = found - store.sourceIds().begin();
-    const auto name = trackFamily(store, row);
-    if (!object.track->family.empty() && object.track->family != name)
-        throw std::runtime_error("registered family differs from packed track " + std::to_string(id));
-    if (object.track->pointCount != 0 && object.track->pointCount != store.offsets()[row+1] - store.offsets()[row])
-        throw std::runtime_error("registered point count differs from packed track " + std::to_string(id));
-    return static_cast<size_t>(row);
-}
 } // namespace vc::objects::detail

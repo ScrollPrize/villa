@@ -215,10 +215,8 @@ void restoreCommon(sqlite3* db, const char* table, const RecordCommon& rec)
     s.stepDone();
 }
 
-// preserveApproval is reserved for import paths seeding legacy records;
-// the public API always starts/resets approval through the normal rules.
 std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::string& host, const ObjectRecord& input,
-                             bool preserveApproval, bool preserveRecord = false)
+                             bool preserveRecord = false, const char* importOperation = "import")
 {
     if (input.kind.empty())
         throw std::runtime_error("object store: object kind must be non-empty");
@@ -243,7 +241,7 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
         rec.storageRef = managed.text(2);
         rec.dataGeneration = managed.i64(0);
         rec.dataChecksum = managed.text(1);
-    } else if (rec.storageKind == "sqlite" || rec.storageKind == "object_store") {
+    } else if (rec.storageKind == "sqlite") {
         throw std::invalid_argument("object store: managed geometry requires putGeometry, not a storage_kind override");
     }
 
@@ -265,16 +263,6 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
         if (rec.dataChecksum) s.bind(10, *rec.dataChecksum); else s.bindNull(10);
         s.bind(11, rec.meta); s.bind(12, id);
         s.stepDone();
-        if (preserveApproval && rec.approvalState != "pending") {
-            Statement a(db, "UPDATE objects SET approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_generation=? WHERE id=?");
-            a.bind(1, rec.approvalState);
-            if (rec.approvedBy) a.bind(2, *rec.approvedBy); else a.bindNull(2);
-            if (rec.approvedAt) a.bind(3, *rec.approvedAt); else a.bindNull(3);
-            if (rec.approvedHost) a.bind(4, *rec.approvedHost); else a.bindNull(4);
-            if (rec.approvedGeneration) a.bind(5, *rec.approvedGeneration); else a.bindNull(5);
-            a.bind(6, id);
-            a.stepDone();
-        }
     } else {
         Statement s(db, "INSERT INTO objects(uuid,kind,name,generation,created_by,created_at,created_host,changed_by,changed_at,"
                         "changed_host,approval_state,approved_by,approved_at,approved_host,approved_generation,format_version,"
@@ -282,12 +270,12 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
         s.bindBlob(1, uuid); s.bind(2, rec.kind); s.bind(3, rec.name); s.bind(4, generation);
         s.bind(5, author); s.bind(6, now); s.bind(7, host);
         s.bind(8, author); s.bind(9, now); s.bind(10, host);
-        const std::string state = preserveApproval ? rec.approvalState : "pending";
+        const std::string state = preserveRecord ? rec.approvalState : "pending";
         s.bind(11, state.empty() ? std::string("pending") : state);
-        if (preserveApproval && rec.approvedBy) s.bind(12, *rec.approvedBy); else s.bindNull(12);
-        if (preserveApproval && rec.approvedAt) s.bind(13, *rec.approvedAt); else s.bindNull(13);
-        if (preserveApproval && rec.approvedHost) s.bind(14, *rec.approvedHost); else s.bindNull(14);
-        if (preserveApproval && rec.approvedGeneration) s.bind(15, *rec.approvedGeneration); else s.bindNull(15);
+        if (preserveRecord && rec.approvedBy) s.bind(12, *rec.approvedBy); else s.bindNull(12);
+        if (preserveRecord && rec.approvedAt) s.bind(13, *rec.approvedAt); else s.bindNull(13);
+        if (preserveRecord && rec.approvedHost) s.bind(14, *rec.approvedHost); else s.bindNull(14);
+        if (preserveRecord && rec.approvedGeneration) s.bind(15, *rec.approvedGeneration); else s.bindNull(15);
         s.bind(16, rec.formatVersion); s.bind(17, rec.storageKind); s.bind(18, rec.storageRef); s.bind(19, rec.dataGeneration);
         if (rec.dataChecksum) s.bind(20, *rec.dataChecksum); else s.bindNull(20);
         s.bind(21, rec.meta);
@@ -297,7 +285,7 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
     writeObjectDetail(db, id, rec);
     writeTags(db, "object_tags", "object_id", id, rec.tags);
     if (preserveRecord) restoreCommon(db, "objects", rec);
-    appendJournal(db, author, host, uuid, preserveRecord ? rec.generation : generation, preserveRecord ? "import" : "upsert");
+    appendJournal(db, author, host, uuid, preserveRecord ? rec.generation : generation, preserveRecord ? importOperation : "upsert");
     return rec.uuid;
 }
 

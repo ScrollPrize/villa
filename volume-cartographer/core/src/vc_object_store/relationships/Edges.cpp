@@ -14,7 +14,8 @@ void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
     auto rec = record;
     rec.aUuid = formatUuid(parseUuid(rec.aUuid));
     rec.bUuid = formatUuid(parseUuid(rec.bUuid));
-    if (rec.aUuid == existing->bUuid && rec.bUuid == existing->aUuid) {
+    if ((rec.aUuid != rec.bUuid && rec.aUuid == existing->bUuid && rec.bUuid == existing->aUuid) ||
+        (rec.aUuid == rec.bUuid && rec.bAnchor.index < rec.aAnchor.index)) {
         std::swap(rec.aUuid, rec.bUuid); std::swap(rec.aAnchor, rec.bAnchor);
     }
     if (rec.kind != existing->kind || rec.aUuid != existing->aUuid || rec.bUuid != existing->bUuid)

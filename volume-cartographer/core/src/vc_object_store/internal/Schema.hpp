@@ -69,7 +69,7 @@ const char* kEdgeSchema = R"SQL(CREATE TABLE edges(
   b_anchor_index INTEGER, b_anchor_x REAL, b_anchor_y REAL, b_anchor_z REAL,
   b_dir_x REAL, b_dir_y REAL, b_dir_z REAL,
   meta TEXT NOT NULL DEFAULT '{}' CHECK(json_valid(meta) AND json_type(meta)='object'),
-  CHECK(a_id < b_id)
+  CHECK(a_id < b_id OR (a_id = b_id AND a_anchor_index IS NOT NULL AND b_anchor_index IS NOT NULL AND a_anchor_index < b_anchor_index))
 );
 CREATE INDEX edges_a ON edges(a_id, kind);
 CREATE INDEX edges_b ON edges(b_id, kind);
@@ -129,11 +129,21 @@ CREATE TABLE edge_geometry_bindings(
   a_revision BLOB, b_revision BLOB
 );
 )SQL";
+const char* kSyncSchema = R"SQL(
+CREATE TABLE sync_replica(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid TEXT NOT NULL);
+CREATE TABLE sync_baselines(seq INTEGER PRIMARY KEY AUTOINCREMENT, peer TEXT NOT NULL,
+    token TEXT NOT NULL, state TEXT NOT NULL CHECK(json_valid(state)), UNIQUE(peer,token));
+)SQL";
+void createSyncSchema(sqlite3* db) {
+    exec(db, kSyncSchema);
+    Statement id(db, "INSERT INTO sync_replica VALUES(1,?)"); id.bind(1, util::newUuid()); id.stepDone();
+}
 void createSchema(sqlite3* db) {
     exec(db, kObjectSchema);
     exec(db, kEdgeSchema);
     exec(db, kEdgeGeometrySchema);
     exec(db, kObjectGeometrySchema);
+    createSyncSchema(db);
     exec(db, "CREATE TABLE store_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid BLOB NOT NULL UNIQUE CHECK(length(uuid)=16));");
     Statement id(db, "INSERT INTO store_identity VALUES(1,?)");
     id.bindBlob(1, parseUuid(util::newUuid())); id.stepDone();

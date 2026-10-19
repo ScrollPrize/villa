@@ -23,8 +23,6 @@ namespace vc::object_links {
 // detector may replace only its own still-pending edges on re-runs.
 inline constexpr const char* kPatchOverlapDetector = "patch-overlap";
 inline constexpr const char* kFiberPatchDetector = "fiber-patch";
-inline constexpr const char* kFiberFiberDetector = "fiber-fiber";
-inline constexpr const char* kTrackFiberDetector = "track-fiber";
 inline constexpr const char* kTrackTrackDetector = "track-track";
 inline constexpr const char* kTrackPatchDetector = "track-patch";
 inline constexpr const char* kPointCollectionPatchDetector = "point-collection-patch";
@@ -98,7 +96,7 @@ struct PointCollectionPatchParams {
     double patchScale = 1.0;
     int windowPoints = 1;         // even values use the next odd centered window
     int windowMinPoints = 1;      // clipped at collection ends
-    // Override the ingestion-time role stored in geometry attributes.
+    // Override the ingestion-time role stored in object metadata.
     std::optional<bool> absoluteWinding;
     std::string edgeKind = "point-patch";
     bool replaceStalePending = true;
@@ -111,14 +109,7 @@ struct PointCollectionPatchParams {
 DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
     const PointCollectionPatchParams& params = {}, const std::atomic_bool* cancel = nullptr);
 
-// PCL->patch, patch overlap, fiber->patch, track->track and track->patch are implemented; the rest are placeholders that
-// count the objects they would consider, write nothing, and report
-// "not implemented". Signatures and parameter structs are final
-// shapes so callers can be wired now.
-
-// Parameters mirror the patch-merging tool this detector is based on
-// (spiral-fitting's patch_merger, merging-patches branch). Distances
-// are in base-volume voxels unless noted.
+// Patch overlap distances are in working voxels unless noted.
 struct PatchOverlapParams {
     std::vector<std::string> patchUuids;
     int workers = 0; // 0: auto, at most 8; positive: requested search concurrency
@@ -158,12 +149,8 @@ struct PatchOverlapParams {
 DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
     const PatchOverlapParams& params = {}, const std::atomic_bool* cancel = nullptr);
 
-// Shared parameters for fiber/track->patch auto-linking, ported from
-// vc::constraints::AutoLink. The historical review results apply to
-// the original ribbon, not this reduced-width variant. Distances are in
-// volume voxels. The strip is deliberately reduced relative to the
-// original 7-row ribbon: stripRowsEachSide rows at stripSpacing on
-// each side of the centerline (default: one row at 20 vx each side).
+// Fiber/track-to-patch strips have stripRowsEachSide rows at stripSpacing
+// on each side of the centerline. Distances are in working voxels.
 struct LinePatchParams {
     std::vector<std::string> patchUuids;
     util::ProgressCallback progress; // optional; no terminal output from the library
@@ -220,26 +207,6 @@ struct FiberPatchParams : LinePatchParams {
 DetectorReport linkFibersToPatches(objects::ObjectStore& db,
     const std::filesystem::path& ctVolume, const FiberPatchParams& params = {},
     const std::atomic_bool* cancel = nullptr);
-
-struct FiberFiberParams {
-    double maxDistanceVoxels = 3.0;  // control/line point proximity for candidate pairs
-    std::string edgeKind = "same-surface";
-    bool replaceStalePending = true;
-};
-// Fiber <-> fiber: two fibers lie on the same surface (crossing or
-// otherwise co-located), anchored at the nearest control points.
-DetectorReport linkFibersToFibers(objects::ObjectStore& db, const FiberFiberParams& params = {},
-                                  const std::atomic_bool* cancel = nullptr);
-
-struct TrackFiberParams {
-    double maxDistanceVoxels = 3.0;
-    double minCoverageFraction = 0.5;
-    std::string edgeKind = "same-surface";
-    bool replaceStalePending = true;
-};
-// Track -> fiber: an external (Spiral) track follows the same fiber.
-DetectorReport linkTracksToFibers(objects::ObjectStore& db, const TrackFiberParams& params = {},
-                                  const std::atomic_bool* cancel = nullptr);
 
 struct TrackTrackParams {
     util::ProgressCallback progress; // optional; no terminal output from the library

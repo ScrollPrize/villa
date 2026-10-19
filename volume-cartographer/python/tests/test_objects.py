@@ -74,7 +74,6 @@ def test_geometry_revisions_approval_history_and_source_independence(db, db_path
     db.set_meta(a, "annotation", "changed")
     assert db.current_geometry(a)["uuid"] == second
     assert db.object(a)["tags"] == ["keep"]
-    assert not db.sweep_external_data()
     with ObjectStore.open(db_path, read_only=True) as read:
         assert read.uuid == db.uuid
         assert read.read_geometry_array(first, "line_points") == db.read_geometry_array(first, "line_points")
@@ -151,22 +150,22 @@ def test_geometry_ingest_patch_fiber_and_point_collections(db, tmp_path):
     _write_pcl(pcl_file, {"1": {"uuid": pcl_id, "name": "collection", "points": {
         "10": {"p": [7, 8, 9], "wind_a": 2}, "2": {"p": [1, 2, 3], "custom": True}}}})
     for kind, path in (("patch", patch_dir), ("fiber", fiber_file), ("point_collection", pcl_file)):
-        assert db.ingest_geometry_source(kind, path) == {"ingested": 1, "unchanged": 0, "problems": []}
-        assert db.ingest_geometry_source(kind, path) == {"ingested": 0, "unchanged": 1, "problems": []}
+        assert db.ingest_geometry_source(kind, path) == {"ingested": 1, "unchanged": 0, "edges_imported": 0, "problems": []}
+        assert db.ingest_geometry_source(kind, path) == {"ingested": 0, "unchanged": 1, "edges_imported": 0, "problems": []}
     pcl = db.current_geometry(pcl_id)
     assert np.frombuffer(db.read_geometry_array(pcl["uuid"], "point_ids"), dtype="<i8").tolist() == [2, 10]
-    assert pcl["attributes"]["point_attributes"] == [{"custom": True}, {"wind_a": 2}]
+    assert db.object(pcl_id)["meta"]["source"]["point_attributes"] == [{"custom": True}, {"wind_a": 2}]
     patch = db.current_geometry(patch_id)
     points = np.frombuffer(db.read_geometry_array(patch["uuid"], "points"), dtype="<f4").reshape(3, 4, 3)
     assert points[2, 3].tolist() == [103, 102, 50]
     assert db.object(patch_id)["patch"]["scale"] == (0.25, 0.5)
     first = db.current_geometry(fiber_id)
-    assert first["attributes"]["control_points_attributes"][0]["segment_to_next"] == {"mode": "trace"}
+    assert db.object(fiber_id)["meta"]["source"]["control_points_attributes"][0]["segment_to_next"] == {"mode": "trace"}
     db.set_meta(fiber_id, "keep", True)
     fiber["line_points"][1] = [8, 2, 3]
     fiber_file.write_text(json.dumps(fiber))
     assert db.ingest_registered_geometry(object_uuids=[fiber_id])["ingested"] == 1
-    assert db.object(fiber_id)["meta"] == {"keep": True}
+    assert db.object(fiber_id)["meta"]["keep"] is True
     assert db.object(fiber_id)["fiber"]["length"] == 7
     second = db.current_geometry(fiber_id)
     # Malformed re-ingestion preserves the last good geometry and graph state.
@@ -177,7 +176,6 @@ def test_geometry_ingest_patch_fiber_and_point_collections(db, tmp_path):
     fiber_file.unlink(); pcl_file.unlink()
     assert db.read_geometry_array(first["uuid"], "line_points")
     assert db.read_geometry_array(pcl["uuid"], "points")
-    assert not db.sweep_external_data()
 
 
 def test_geometry_ingest_packed_tracks(db, tmp_path):
@@ -190,7 +188,7 @@ def test_geometry_ingest_packed_tracks(db, tmp_path):
               "source_ids.u64": np.array([42, 99], dtype="<u8"),
               "family_codes.i8": np.array([0, 1], dtype="i1")}
     for name, values in arrays.items(): values.tofile(packed / name)
-    assert db.ingest_geometry_source("track", packed) == {"ingested": 2, "unchanged": 0, "problems": []}
+    assert db.ingest_geometry_source("track", packed) == {"ingested": 2, "unchanged": 0, "edges_imported": 0, "problems": []}
     objects = db.objects_by_kind("track")
     by_id = {o["track"]["external_key"]: o for o in objects}
     track = by_id["42"]
@@ -336,12 +334,18 @@ def test_geometry_export_modified_patch_and_annotations(db, tmp_path):
     assert meta["scale"] == [0.25, 0.5]
     db.export_geometry(fiber_id, fiber_file)
     db.export_geometry(pcl_id, pcl_file)
-    assert json.loads(fiber_file.read_text()) == fiber
-    assert json.loads(pcl_file.read_text())["collections"] == {"17": pcl}
+    exported = json.loads(fiber_file.read_text())
+    for field, value in fiber.items(): assert exported[field] == value
+    exported = json.loads(pcl_file.read_text())["collections"]["17"]
+    for field, value in pcl.items():
+        if field == "points":
+            for pid, point in value.items():
+                for key, expected in point.items(): assert exported[field][pid][key] == expected
+        else: assert exported[field] == value
     assert db.journal_since() == before
     with ObjectStore.create(str(tmp_path / "roundtrip.vcobj"), author="test") as restored:
         for uid, kind, source in ((patch_id, "patch", out), (fiber_id, "fiber", fiber_file), (pcl_id, "point_collection", pcl_file)):
-            assert restored.ingest_geometry_source(kind, source) == {"ingested": 1, "unchanged": 0, "problems": []}
+            assert restored.ingest_geometry_source(kind, source) == {"ingested": 1, "unchanged": 0, "edges_imported": 0, "problems": []}
             original, roundtrip = _stored_geometry(db, uid), _stored_geometry(restored, uid)
             assert roundtrip["arrays"] == original["arrays"]
             if kind != "patch": assert roundtrip["attributes"] == original["attributes"]
@@ -357,16 +361,17 @@ def test_geometry_export_v4_unannotated_controls(db, tmp_path):
     assert db.ingest_geometry_source("fiber", source)["ingested"] == 1
     assert "control_points_attributes" not in db.current_geometry(uid)["attributes"]
     db.export_geometry(uid, source, overwrite=True)
-    assert json.loads(source.read_text()) == root
+    exported = json.loads(source.read_text())
+    for key, value in root.items(): assert exported[key] == value
 
 
 @pytest.mark.parametrize("count", [0, 1, 3])
 def test_geometry_export_track_roundtrip(db, tmp_path, count):
     import numpy as np
     import struct
-    uid = db.upsert_object({"kind": "track"})
+    uid = db.upsert_object({"kind": "track", "track": {"external_key": str(2**64-1), "family": "vertical"}})
     xyz = np.array([[1, 2, 3], [1, 2, 6], [5, 2, 6]], dtype="<i4")[:count]
-    revision = db.put_geometry(uid, {"kind": "track", "attributes": {"family": "vertical", "external_key": str(2**64-1)},
+    revision = db.put_geometry(uid, {"kind": "track",
         "arrays": [{"name": "points", "dtype": "<i4", "shape": [count, 3], "data": xyz.tobytes()}]})
     destination = tmp_path / "export.vctracks"
     db.export_geometry(uid, destination)
@@ -377,7 +382,8 @@ def test_geometry_export_track_roundtrip(db, tmp_path, count):
     assert json.loads((destination / "metadata.json").read_text())["graph_revision_uuid"] == revision
     assert db.ingest_geometry_source("track", destination)["ingested"] == 1
     restored = next(o for o in db.objects_by_kind("track") if o["uuid"] != uid)
-    assert _stored_geometry(db, restored["uuid"]) == _stored_geometry(db, uid)
+    assert _stored_geometry(db, restored["uuid"])["arrays"] == _stored_geometry(db, uid)["arrays"]
+    assert restored["track"]["family"] == "vertical"
     db.export_geometry(uid, destination, overwrite=True)
     assert not list(tmp_path.glob(".vc-export-*"))
 
@@ -387,7 +393,7 @@ def test_geometry_export_failures_preserve_destination(db, tmp_path, failure):
     import struct
     uid = db.upsert_object({"kind": "fiber"})
     geometry = _geometry()
-    if failure == "annotations": geometry["attributes"] = {"line_points_attributes": []}
+    if failure == "annotations": db.set_meta(uid, "source", {"line_points_attributes": []})
     if failure == "nonfinite": geometry["arrays"][1]["data"] = struct.pack("<ddd", float("nan"), 2, 3)
     if failure == "auxiliary": geometry["arrays"].append({"name": "extra", "dtype": "|u1", "shape": [1], "data": b"x"})
     revision = db.put_geometry(uid, geometry)

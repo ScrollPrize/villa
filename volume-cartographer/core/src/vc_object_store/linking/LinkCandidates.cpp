@@ -50,28 +50,6 @@ bool isDetectorsOwnEdge(const EdgeRecord& e, const std::string& detectorName)
     }
 }
 
-std::string anchorIndexSpace(const std::string& meta)
-{
-    try { return nlohmann::json::parse(meta).value("anchor_index_space", ""); }
-    catch (const std::exception&) { return {}; }
-}
-
-DetectorReport placeholder(objects::ObjectStore& db, const char* detectorName,
-                           const std::vector<std::string>& objectKinds, const std::atomic_bool* cancel)
-{
-    DetectorReport report;
-    if (cancel && cancel->load()) {
-        report.problems.push_back(std::string(detectorName) + ": cancelled");
-        return report;
-    }
-    auto txn = db.read();
-    for (const auto& kind : objectKinds)
-        report.objectsConsidered += int64_t(db.objectsByKind(txn, kind).size());
-    report.problems.push_back(std::string(detectorName) +
-                              ": detector not implemented yet (placeholder in vc_object_links); no edges written");
-    return report;
-}
-
 }  // namespace
 
 static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::WriteTxn& txn,
@@ -80,7 +58,7 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
                                 const StaleEdgeScope* staleScope, const util::ProgressCallback& progress, bool validateGeometry)
 {
     if (detectorName.empty())
-        throw std::runtime_error("graph links: detector name must be non-empty");
+        throw std::runtime_error("object links: detector name must be non-empty");
     DetectorReport report;
     report.candidatesFound = int64_t(candidates.size());
 
@@ -100,11 +78,9 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
             existing[candidateKey(e)] = e;
 
     std::set<std::string> candidateKeys;
-    std::unordered_map<std::string, std::string> candidateIndexSpaces;
     for (const auto& c : candidates) {
         const auto key = candidateKey(c);
         candidateKeys.insert(key);
-        candidateIndexSpaces[key] = anchorIndexSpace(c.meta);
     }
 
     if (replaceStalePending) {
@@ -112,12 +88,7 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
         for (const auto& [key, e] : existing) {
             if (staleScope && (!scopedKinds.contains(e.kind) || !scopedObjects.contains(e.aUuid) ||
                                !scopedObjects.contains(e.bUuid))) continue;
-            if (candidateKeys.contains(key)) {
-                const auto& space = candidateIndexSpaces.at(key);
-                // A pending control-point anchor must not masquerade as a
-                // line-point anchor merely because their integer indices match.
-                if (space.empty() || space == anchorIndexSpace(e.meta)) continue;
-            }
+            if (candidateKeys.contains(key)) continue;
             if (e.approvalState != "pending") continue;  // reviewed edges are never touched
             if (!isDetectorsOwnEdge(e, detectorName)) continue;
             staleKeys.push_back(key);
@@ -143,7 +114,7 @@ static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::Wr
         }
         auto meta = nlohmann::json::parse(c.meta.empty() ? "{}" : c.meta);
         if (!meta.is_object())
-            throw std::runtime_error("graph links: candidate meta must be a JSON object");
+            throw std::runtime_error("object links: candidate meta must be a JSON object");
         nlohmann::json detector{{"name", detectorName}, {"version", detectorVersion}};
         if (c.score) detector["score"] = *c.score;
         meta["detector"] = std::move(detector);
@@ -209,21 +180,6 @@ DetectorReport detail::commitStoredCandidates(objects::ObjectStore& db, const St
     inputs.validate(txn);
     return commitCandidatesImpl(db, txn, detectorName, detectorVersion, candidates,
         replaceStalePending, staleScope, progress, true);
-}
-
-DetectorReport linkFibersToFibers(objects::ObjectStore& db, const FiberFiberParams& /*params*/,
-                                  const std::atomic_bool* cancel)
-{
-    // TODO: fiber/fiber proximity at control points (spatial index over
-    // line points, not whole-fiber bboxes).
-    return placeholder(db, kFiberFiberDetector, {"fiber"}, cancel);
-}
-
-DetectorReport linkTracksToFibers(objects::ObjectStore& db, const TrackFiberParams& /*params*/,
-                                  const std::atomic_bool* cancel)
-{
-    // TODO: external track geometry vs fiber lines (distance + coverage).
-    return placeholder(db, kTrackFiberDetector, {"track", "fiber"}, cancel);
 }
 
 }  // namespace vc::object_links
