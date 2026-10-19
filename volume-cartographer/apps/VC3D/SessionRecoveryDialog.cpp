@@ -34,13 +34,14 @@ QString pointsText(const SessionRecovery::LeftoverSession& session)
 } // namespace
 
 SessionRecoveryDialog* SessionRecoveryDialog::offer(QWidget* parent,
-                                                    const SessionRecovery& recovery,
+                                                    SessionRecovery& recovery,
                                                     VCCollection* collection,
                                                     Actions actions)
 {
     for (const auto& session : recovery.leftoverSessions()) {
         if (auto claim = SessionRecovery::claim(session)) {
-            auto* dialog = new SessionRecoveryDialog(parent, session, std::move(claim), collection, std::move(actions));
+            auto* dialog = new SessionRecoveryDialog(parent, &recovery, session, std::move(claim), collection,
+                                                     std::move(actions));
             dialog->show();
             return dialog;
         }
@@ -49,11 +50,13 @@ SessionRecoveryDialog* SessionRecoveryDialog::offer(QWidget* parent,
 }
 
 SessionRecoveryDialog::SessionRecoveryDialog(QWidget* parent,
+                                             SessionRecovery* recovery,
                                              SessionRecovery::LeftoverSession session,
                                              std::shared_ptr<QLockFile> claim,
                                              VCCollection* collection,
                                              Actions actions)
     : QDialog(parent)
+    , _recovery(recovery)
     , _session(std::move(session))
     , _claim(std::move(claim))
     , _collection(collection)
@@ -131,12 +134,28 @@ void SessionRecoveryDialog::recover()
         return;
     }
 
+    // The restored points reach disk again, in this session's own copy, before
+    // the old copy goes: selecting the segment can take a while, and a crash
+    // then must not lose them. The copy names the segment too, so the next
+    // start would offer to select it again.
+    const QString previousSegment = _recovery ? _recovery->segmentId() : QString();
+    if (_recovery && selectSegment) {
+        _recovery->setSegment(_session.segmentId);
+    }
+    const bool copied = _recovery && _recovery->writeNow();
     _claim.reset();
-    SessionRecovery::discard(_session);
     QString status = tr("Recovered %1 from the previous session.").arg(pointsText(_session));
+    if (copied) {
+        SessionRecovery::discard(_session);
+    } else {
+        status += QLatin1Char(' ') + tr("The old recovery copy is kept, since a new one could not be written.");
+    }
     QString error;
     if (selectSegment && !(_actions.activateSegment && _actions.activateSegment(_session.segmentId, &error))) {
         status += QLatin1Char(' ') + tr("Could not select segment %1: %2.").arg(_session.segmentId, error);
+        if (_recovery) {
+            _recovery->setSegment(previousSegment);
+        }
     }
     finish(status);
 }

@@ -78,9 +78,15 @@ bool heldByRunningSession(const QString& directory)
     return takeLock(directory) == nullptr;
 }
 
+bool isTemporaryCollection(const std::string& name)
+{
+    return SessionRecovery::temporaryCollections().contains(QString::fromStdString(name));
+}
+
 // The part of the collections a recovery copy keeps, or null when that has
-// no points. Segment correction points (anchored collections) are left out:
-// their segment's corrections.json already keeps them.
+// no points. Segment correction points (anchored collections) are left out,
+// since their segment's corrections.json already keeps them, and so are the
+// seeding panel's temporary previews.
 std::shared_ptr<const PointCollections> recoverablePoints(const PointCollections& live,
                                                           int* collections,
                                                           int* points)
@@ -89,7 +95,7 @@ std::shared_ptr<const PointCollections> recoverablePoints(const PointCollections
     *collections = 0;
     *points = 0;
     for (const auto& [id, collection] : live.getAllCollections()) {
-        if (collection.anchor2d) {
+        if (collection.anchor2d || isTemporaryCollection(collection.name)) {
             copy->clearCollection(id);
         } else {
             ++*collections;
@@ -140,6 +146,14 @@ bool writeSession(const SessionWrite& job)
     return file.open(QIODevice::WriteOnly) && file.write(job.record) == job.record.size() && file.commit();
 }
 
+// Session folders under directory. Symbolic links are skipped, so pruning
+// and Discard never delete what a link points to.
+QFileInfoList sessionFolders(const QString& directory)
+{
+    return QDir(directory).entryInfoList({kSessionPrefix + QStringLiteral("*")},
+                                         QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks);
+}
+
 SessionRecovery::LeftoverSession readLeftover(const QString& directory)
 {
     SessionRecovery::LeftoverSession session;
@@ -170,6 +184,14 @@ QString SessionRecovery::LeftoverSession::pointsFile() const
 bool SessionRecovery::LeftoverSession::hasPoints() const
 {
     return pointCount > 0 && QFileInfo::exists(pointsFile());
+}
+
+const QStringList& SessionRecovery::temporaryCollections()
+{
+    // SeedingWidget's ray, peak and radius previews: recomputed on demand.
+    static const QStringList names{QStringLiteral("ray_preview"), QStringLiteral("seeding_peaks"),
+                                   QStringLiteral("seeding_preview")};
+    return names;
 }
 
 SessionRecovery::SessionRecovery(QString directory, QObject* parent)
@@ -232,15 +254,38 @@ bool SessionRecovery::begin(VCCollection* collection)
 
     _collection = collection;
     if (collection) {
+        // Changes to the temporary previews alone leave the copy as it is.
         const auto changed = [this] { scheduleSave(); };
-        connect(collection, &VCCollection::collectionChanged, this, changed);
-        connect(collection, &VCCollection::collectionsAdded, this, changed);
+        const auto changedIn = [this](uint64_t id) {
+            if (isCopied(id)) {
+                scheduleSave();
+            }
+        };
+        connect(collection, &VCCollection::collectionChanged, this, changedIn);
+        connect(collection, &VCCollection::collectionsAdded, this, [this](const std::vector<uint64_t>& ids) {
+            if (std::any_of(ids.begin(), ids.end(), [this](uint64_t id) { return isCopied(id); })) {
+                scheduleSave();
+            }
+        });
         connect(collection, &VCCollection::collectionRemoved, this, changed);
-        connect(collection, &VCCollection::pointAdded, this, changed);
-        connect(collection, &VCCollection::pointsAdded, this, changed);
-        connect(collection, &VCCollection::pointChanged, this, changed);
-        connect(collection, &VCCollection::pointRemoved, this, changed);
-        connect(collection, &VCCollection::pointsRemoved, this, changed);
+        connect(collection, &VCCollection::pointAdded, this,
+                [changedIn](const ColPoint& point) { changedIn(point.collectionId); });
+        connect(collection, &VCCollection::pointsAdded, this, [this](const std::vector<ColPoint>& points) {
+            if (std::any_of(points.begin(), points.end(),
+                            [this](const ColPoint& point) { return isCopied(point.collectionId); })) {
+                scheduleSave();
+            }
+        });
+        connect(collection, &VCCollection::pointChanged, this,
+                [changedIn](const ColPoint& point) { changedIn(point.collectionId); });
+        connect(collection, &VCCollection::pointRemoved, this,
+                [changedIn](vc::PointRef point) { changedIn(point.collectionId); });
+        connect(collection, &VCCollection::pointsRemoved, this, [this](const std::vector<vc::PointRef>& points) {
+            if (std::any_of(points.begin(), points.end(),
+                            [this](const vc::PointRef& point) { return isCopied(point.collectionId); })) {
+                scheduleSave();
+            }
+        });
     }
     if (auto* app = QCoreApplication::instance()) {
         connect(app, &QCoreApplication::aboutToQuit, this, &SessionRecovery::markCleanExit);
@@ -267,6 +312,16 @@ void SessionRecovery::setSegment(const QString& segmentId)
     }
     _segmentId = segmentId;
     flush();
+}
+
+bool SessionRecovery::isCopied(uint64_t collectionId) const
+{
+    if (!_collection) {
+        return false;
+    }
+    const auto& collections = _collection->getAllCollections();
+    const auto found = collections.find(collectionId);
+    return found == collections.end() || !isTemporaryCollection(found->second.name);
 }
 
 void SessionRecovery::scheduleSave()
@@ -335,6 +390,13 @@ bool SessionRecovery::waitForWrite()
     }
 }
 
+bool SessionRecovery::writeNow()
+{
+    flush();
+    return waitForWrite() && !_sessionDir.isEmpty() && _pointCount > 0 &&
+           QFileInfo::exists(QDir(_sessionDir).filePath(kPointsFile));
+}
+
 // Takes the result of a finished write, once.
 void SessionRecovery::collectWrite()
 {
@@ -372,8 +434,7 @@ void SessionRecovery::markCleanExit()
 std::vector<SessionRecovery::LeftoverSession> SessionRecovery::leftoverSessions() const
 {
     std::vector<LeftoverSession> sessions;
-    const QFileInfoList folders = QDir(_directory).entryInfoList(
-        {kSessionPrefix + QStringLiteral("*")}, QDir::Dirs | QDir::NoDotAndDotDot);
+    const QFileInfoList folders = sessionFolders(_directory);
     for (const QFileInfo& folder : folders) {
         const QString directory = folder.absoluteFilePath();
         if (directory == QFileInfo(_sessionDir).absoluteFilePath() || heldByRunningSession(directory)) {
@@ -393,8 +454,7 @@ std::vector<SessionRecovery::LeftoverSession> SessionRecovery::leftoverSessions(
 void SessionRecovery::pruneLeftovers()
 {
     // Folders with nothing to recover go at once; otherwise keep the newest few.
-    const QFileInfoList folders = QDir(_directory).entryInfoList(
-        {kSessionPrefix + QStringLiteral("*")}, QDir::Dirs | QDir::NoDotAndDotDot);
+    const QFileInfoList folders = sessionFolders(_directory);
     for (const QFileInfo& folder : folders) {
         const QString directory = folder.absoluteFilePath();
         if (directory == QFileInfo(_sessionDir).absoluteFilePath() || heldByRunningSession(directory)) {
@@ -436,5 +496,7 @@ bool SessionRecovery::restorePoints(const LeftoverSession& session,
 
 bool SessionRecovery::discard(const LeftoverSession& session)
 {
-    return !session.directory.isEmpty() && QDir(session.directory).removeRecursively();
+    // Never through a symbolic link: removeRecursively would empty its target.
+    return !session.directory.isEmpty() && !QFileInfo(session.directory).isSymLink() &&
+           QDir(session.directory).removeRecursively();
 }

@@ -159,6 +159,10 @@ struct FakeWindow
     QString project;
     bool openSucceeds{true};
     QStringList calls;
+    // When set, selecting a segment also records what is on disk at that
+    // moment: the running session's copy and whether oldCopy still exists.
+    SessionRecovery* recovery{nullptr};
+    QString oldCopy;
 
     SessionRecoveryDialog::Actions actions()
     {
@@ -175,7 +179,18 @@ struct FakeWindow
                 return true;
             },
             [this](const QString& id, QString*) {
-                calls << QStringLiteral("segment %1 with %2 points").arg(id).arg(points->getPoints("corrections").size());
+                QString call =
+                    QStringLiteral("segment %1 with %2 points").arg(id).arg(points->getPoints("corrections").size());
+                if (recovery) {
+                    VCCollection copy;
+                    const bool read = copy.loadFromJSON(
+                        QDir(recovery->sessionDirectory()).filePath("points.json").toStdString());
+                    call += QStringLiteral("; copy %1 points for segment %2; old copy %3")
+                                .arg(read ? copy.getPoints("corrections").size() : 0)
+                                .arg(readRecord(recovery->sessionDirectory()).value("segment").toString(),
+                                     QFileInfo::exists(oldCopy) ? QStringLiteral("kept") : QStringLiteral("gone"));
+                }
+                calls << call;
                 addCorrection(*points, "segment corrections");
                 return true;
             },
@@ -645,6 +660,8 @@ private slots:
         VCCollection live;
         QVERIFY(session.begin(&live));
         FakeWindow window{&live};
+        window.recovery = &session;
+        window.oldCopy = QDir(root.path()).filePath("session-crashed");
 
         QPointer<SessionRecoveryDialog> dialog =
             SessionRecoveryDialog::offer(nullptr, session, &live, window.actions());
@@ -659,10 +676,14 @@ private slots:
         dialog->findChild<QPushButton*>("recoverSessionButton")->click();
         // The project opens first (clearing the collections), the points
         // follow, and the segment, whose correction points load with it, goes
-        // last, so they neither block nor replace the restore.
+        // last, so they neither block nor replace the restore. By the time the
+        // segment loads, which can take long enough to crash in, the points
+        // are in this session's copy, which names the segment, and only then
+        // is the old copy gone.
         QCOMPARE(window.calls.size(), 3);
         QCOMPARE(window.calls.at(0), "open " + kProject);
-        QCOMPARE(window.calls.at(1), QStringLiteral("segment %1 with 1 points").arg(kSegment));
+        QCOMPARE(window.calls.at(1),
+                 QStringLiteral("segment %1 with 1 points; copy 1 points for segment %1; old copy gone").arg(kSegment));
         QVERIFY(window.calls.at(2).contains("Recovered 1 point"));
         QCOMPARE(live.getPoints("corrections").size(), std::size_t{1});
         QCOMPARE(live.getPoints("segment corrections").size(), std::size_t{1});
@@ -744,6 +765,97 @@ private slots:
         QVERIFY(busy.calls.front().contains("kept"));
         QCOMPARE(session.leftoverSessions().size(), std::size_t{1});
         session.markCleanExit();
+    }
+
+    void dialogKeepsTheOldCopyWhenTheNewOneCannotBeWritten()
+    {
+        QTemporaryDir root;
+        writeLeftover(root.path(), "session-crashed", QDateTime::currentDateTimeUtc(), true);
+        SessionRecovery session(root.path());
+        VCCollection live;
+        QVERIFY(session.begin(&live));
+        QVERIFY(session.waitForWrite());
+        // A folder where the temporary copy goes makes the new copy fail.
+        QVERIFY(QDir(session.sessionDirectory()).mkdir("points.json.tmp"));
+        FakeWindow window{&live};
+
+        QPointer<SessionRecoveryDialog> dialog =
+            SessionRecoveryDialog::offer(nullptr, session, &live, window.actions());
+        QVERIFY(dialog);
+        dialog->findChild<QPushButton*>("recoverSessionButton")->click();
+        // The points are back and the segment is selected, but the old copy
+        // stays, since nothing else holds the points on disk.
+        QCOMPARE(live.getPoints("corrections").size(), std::size_t{1});
+        QCOMPARE(window.calls.size(), 3);
+        QVERIFY(window.calls.at(1).startsWith("segment"));
+        QVERIFY(window.calls.at(2).contains("kept"));
+        QVERIFY(QFileInfo::exists(QDir(root.path()).filePath("session-crashed/points.json")));
+        QCOMPARE(session.leftoverSessions().size(), std::size_t{1});
+        session.markCleanExit();
+    }
+
+    void copyLeavesOutTemporaryPreviews()
+    {
+        QTemporaryDir root;
+        VCCollection points;
+        auto session = std::make_unique<SessionRecovery>(root.path());
+        QVERIFY(session->begin(&points));
+        QVERIFY(session->waitForWrite());
+        const QString copy = QDir(session->sessionDirectory()).filePath("points.json");
+        const QString updated = readRecord(session->sessionDirectory()).value("updated").toString();
+        QVERIFY(!updated.isEmpty());
+
+        // The seeding panel's previews leave nothing to recover, and changing
+        // them does not even schedule a copy.
+        for (const QString& name : SessionRecovery::temporaryCollections()) {
+            points.addPoints(name.toStdString(), {{1.0f, 2.0f, 3.0f}, {4.0f, 5.0f, 6.0f}});
+        }
+        QTest::qWait(SessionRecovery::kSaveDelayMs + 500);
+        QCOMPARE(readRecord(session->sessionDirectory()).value("updated").toString(), updated);
+        session->flush();
+        QVERIFY(session->waitForWrite());
+        QVERIFY(!QFileInfo::exists(copy));
+        QCOMPARE(readRecord(session->sessionDirectory()).value("points").toInt(), 0);
+
+        points.addPoint("my points", {1.0f, 2.0f, 3.0f});
+        session->flush();
+        QVERIFY(session->waitForWrite());
+        session.reset();
+
+        SessionRecovery next(root.path());
+        const auto leftovers = next.leftoverSessions();
+        QCOMPARE(leftovers.size(), std::size_t{1});
+        QCOMPARE(leftovers.front().pointCount, 1);
+        VCCollection restored;
+        QVERIFY(SessionRecovery::restorePoints(leftovers.front(), &restored));
+        QCOMPARE(restored.getAllCollections().size(), std::size_t{1});
+        QCOMPARE(restored.getPoints("my points").size(), std::size_t{1});
+    }
+
+    void pruningAndDiscardNeverFollowALink()
+    {
+#ifndef Q_OS_UNIX
+        QSKIP("Needs a symbolic link to a folder");
+#else
+        QTemporaryDir root;
+        QTemporaryDir elsewhere;
+        QFile file(QDir(elsewhere.path()).filePath("keep.txt"));
+        QVERIFY(file.open(QIODevice::WriteOnly));
+        file.write("data");
+        file.close();
+        // Named like a leftover with nothing to recover, which pruning deletes.
+        const QString link = QDir(root.path()).filePath("session-link");
+        QVERIFY(QFile::link(elsewhere.path(), link));
+
+        SessionRecovery session(root.path());
+        QVERIFY(session.begin(nullptr));
+        QVERIFY(session.leftoverSessions().empty());
+        SessionRecovery::LeftoverSession linked;
+        linked.directory = link;
+        QVERIFY(!SessionRecovery::discard(linked));
+        QCOMPARE(QDir(elsewhere.path()).entryList(QDir::Files | QDir::Hidden), QStringList{"keep.txt"});
+        session.markCleanExit();
+#endif
     }
 
     void dialogLaterKeepsAndDiscardDeletes()

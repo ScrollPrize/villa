@@ -15,10 +15,13 @@ class VCCollection;
 // Offers what a crashed session left behind (see SessionRecovery): its
 // points, restored into the project they were placed in, and its segment,
 // selected again. The dialog is application modal, so nothing changes behind
-// it before the user answers, and nothing is applied before Recover. The copy
-// is deleted once its points are restored, or with Discard; Later keeps it for
-// the next start. While the dialog is open it holds the session's lock, so a
-// second VC3D started at the same time does not offer it too.
+// it before the user answers, and nothing is applied before Recover. Once its
+// points are restored, the running session's own copy is written, and only
+// then is the old copy deleted, before the segment is selected, so a crash
+// while the segment loads still leaves the points on disk. Discard deletes
+// the copy; Later keeps it for the next start. While the dialog is open it
+// holds the session's lock, so a second VC3D started at the same time does not
+// offer it too.
 class SessionRecoveryDialog : public QDialog
 {
     Q_OBJECT
@@ -34,10 +37,11 @@ public:
     };
 
     // Shows the dialog for the newest leftover session of recovery that no
-    // other VC3D is offering, or returns nullptr when there is none. The
-    // dialog deletes itself when it closes.
+    // other VC3D is offering, or returns nullptr when there is none. Recover
+    // writes the restored points into recovery's own copy. The dialog deletes
+    // itself when it closes.
     static SessionRecoveryDialog* offer(QWidget* parent,
-                                        const SessionRecovery& recovery,
+                                        SessionRecovery& recovery,
                                         VCCollection* collection,
                                         Actions actions);
 
@@ -46,6 +50,7 @@ public:
 
 private:
     SessionRecoveryDialog(QWidget* parent,
+                          SessionRecovery* recovery,
                           SessionRecovery::LeftoverSession session,
                           std::shared_ptr<QLockFile> claim,
                           VCCollection* collection,
@@ -56,6 +61,7 @@ private:
     [[nodiscard]] bool projectIsOpen() const;
     void finish(const QString& status);
 
+    QPointer<SessionRecovery> _recovery;
     SessionRecovery::LeftoverSession _session;
     std::shared_ptr<QLockFile> _claim;
     QPointer<VCCollection> _collection;

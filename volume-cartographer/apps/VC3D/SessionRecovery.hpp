@@ -5,7 +5,9 @@
 #include <QObject>
 #include <QPointer>
 #include <QString>
+#include <QStringList>
 
+#include <cstdint>
 #include <memory>
 #include <vector>
 
@@ -21,7 +23,8 @@ template <typename T> class QFutureWatcher;
 // record of the open project and segment, and a copy of the point
 // collections that is rewritten a few seconds after they change. Segment
 // correction points (collections anchored to the segment grid) are left out
-// of the copy, since they are already saved with their segment. The copy is
+// of the copy, since they are already saved with their segment, and so are
+// the seeding panel's temporary previews (temporaryCollections()). The copy is
 // serialized on a worker thread, and the record is written after it, so the
 // record never describes points that are not on disk yet. A clean exit
 // deletes the folder, so a folder whose lock no running VC3D holds is left
@@ -72,12 +75,21 @@ public:
     // Waits until everything flushed so far is written. False once a write
     // has failed; after the first failure nothing more is written.
     bool waitForWrite();
+    // Writes the points copy and the record now and waits for them. True when
+    // this session's folder then holds a copy of at least one point; false
+    // when recovery has not begun, a write failed or there is nothing to copy.
+    bool writeNow();
     [[nodiscard]] bool isWriting() const;
     // Deletes this session's folder, after any running write. Called on a
     // normal quit.
     void markCleanExit();
 
     [[nodiscard]] QString sessionDirectory() const { return _sessionDir; }
+    [[nodiscard]] QString segmentId() const { return _segmentId; }
+
+    // Names of the collections VC3D fills with temporary previews, which a
+    // recovery copy leaves out.
+    [[nodiscard]] static const QStringList& temporaryCollections();
 
     // Sessions that ended without a clean exit and left points to recover,
     // newest first. Sessions of running VC3D instances are skipped.
@@ -105,6 +117,8 @@ signals:
 
 private:
     void scheduleSave();
+    // Whether a change to this collection can change the copy.
+    [[nodiscard]] bool isCopied(uint64_t collectionId) const;
     void collectWrite();
     void pruneLeftovers();
 

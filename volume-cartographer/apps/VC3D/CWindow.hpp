@@ -449,6 +449,10 @@ private:
     QMainWindow* _segmentWorkspaceWindow{nullptr};
     StatusDockPanelHost* _statusDockPanelHost{nullptr};
     SessionRecovery* _sessionRecovery{nullptr};
+    // While a crash recovery offer is pending, the open-data catalog shown at
+    // startup waits for it (startSessionRecovery).
+    bool _sessionRecoveryOfferPending{false};
+    bool _startupCatalogDeferred{false};
     QMainWindow* _lasagnaWorkspaceWindow{nullptr};
     QMainWindow* _atlasWorkspaceWindow{nullptr};
     QMainWindow* _fiberSliceWorkspaceWindow{nullptr};
