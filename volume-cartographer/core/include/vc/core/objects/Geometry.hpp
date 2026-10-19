@@ -30,6 +30,12 @@ struct GeometryArrayInfo {
     int64_t byteLength = 0;
 };
 
+// Applies to new revisions only. Unchanged geometry retains its revision and
+// layout. Zero selects legacy linear storage; other arrays remain linear.
+struct GeometryStorageOptions {
+    int64_t patchTileSize = 128; // supported sizes: 0, 32, 64, 128 vertices
+};
+
 // Descriptors do not load payloads. Revision UUIDs are independent of object
 // UUIDs and content hashes. Parentage records edits, including undo/reverts.
 struct GeometryRevision {

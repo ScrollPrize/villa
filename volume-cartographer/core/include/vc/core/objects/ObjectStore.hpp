@@ -264,7 +264,8 @@ public:
     std::string putGeometry(WriteTxn& txn, const std::string& objectUuid,
                             const GeometryData& data,
                             const std::optional<std::string>& expectedRevision = std::nullopt,
-                            const std::vector<GeometryEdgeEdit>& edgeEdits = {});
+                            const std::vector<GeometryEdgeEdit>& edgeEdits = {},
+                            const GeometryStorageOptions& storage = {});
     // Preview the relationships whose declared point dependencies change.
     // Unknown dependencies are included and require update (with explicit
     // dependencies) or removal. Does not publish geometry or modify edges.
@@ -282,6 +283,11 @@ public:
     // Batched byte ranges [offset,count], in caller order, sharing verified chunks.
     std::vector<std::vector<uint8_t>> readGeometryRanges(const Txn&, const std::string& revisionUuid,
         const std::string& arrayName, const std::vector<std::array<int64_t, 2>>& ranges) const;
+
+    // Dense row-major float32 XYZ rectangle from a patch points array. Exact
+    // bytes; handles tiled and legacy layouts. Coordinates/counts are vertices.
+    std::vector<uint8_t> readGeometryRectangle(const Txn&, const std::string& revisionUuid,
+        const std::string& arrayName, int64_t row, int64_t column, int64_t rows, int64_t columns) const;
 
     // Approval: one generic call for objects and edges. Stamps the
     // current generation without bumping it. State must be

@@ -43,7 +43,7 @@ def test_one_database_owns_objects_geometry_and_relationships(store):
                           "geometry_chunks", "geometry_revisions", "geometry_revision_chunks", "store_identity"}
         assert {r[1] for r in sql.execute("PRAGMA table_info(geometry_heads)")} == {"object_uuid", "revision_uuid"}
         assert not list(sql.execute("PRAGMA foreign_key_check"))
-        assert sql.execute("PRAGMA user_version").fetchone()[0] == 5
+        assert sql.execute("PRAGMA user_version").fetchone()[0] == 6
     assert store.neighbours(a) == [b]
     record, state = store.edge(edge), store.edge_geometry_state(edge)
     revisions = {a: ra, b: rb}

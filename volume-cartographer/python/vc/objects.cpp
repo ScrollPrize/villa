@@ -275,13 +275,13 @@ NB_MODULE(objects, m)
             },
             nb::arg("after_seq") = 0)
         .def("put_geometry", [](PyObjectStore& self, const std::string& uuid, const nb::dict& input,
-                               const std::optional<std::string>& expected, const nb::list& choices) {
+                               const std::optional<std::string>& expected, const nb::list& choices, int64_t patchTileSize) {
             const auto data = geometryFromPy(input);
             const auto edits = edgeEditsFromPy(choices);
             auto lease = self.db; self.require(); nb::gil_scoped_release release;
-            return self.withWrite([&](vo::ObjectStore& db, vo::WriteTxn& txn) { return db.putGeometry(txn, uuid, data, expected, edits); });
+            return self.withWrite([&](vo::ObjectStore& db, vo::WriteTxn& txn) { return db.putGeometry(txn, uuid, data, expected, edits, vo::GeometryStorageOptions{patchTileSize}); });
         }, nb::arg("object_uuid"), nb::arg("geometry"), nb::arg("expected_revision") = std::nullopt,
-           nb::arg("edge_edits") = nb::list())
+           nb::arg("edge_edits") = nb::list(), nb::arg("patch_tile_size") = vo::GeometryStorageOptions{}.patchTileSize)
         .def("affected_geometry_edges", [](PyObjectStore& self, const std::string& uuid, const nb::dict& input) {
             const auto data = geometryFromPy(input);
             auto edges = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.affectedGeometryEdges(txn, uuid, data); });
@@ -306,6 +306,15 @@ NB_MODULE(objects, m)
               bytes = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.readGeometryArray(txn, uuid, name, offset, count); }); }
             return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
         }, nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("byte_offset") = 0, nb::arg("byte_count") = std::nullopt)
+        .def("read_geometry_rectangle", [](PyObjectStore& self, const std::string& uuid, const std::string& name,
+                                           int64_t row, int64_t column, int64_t rows, int64_t columns) {
+            std::vector<uint8_t> bytes;
+            { auto lease = self.db; self.require(); nb::gil_scoped_release release;
+              bytes = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
+                  return db.readGeometryRectangle(txn, uuid, name, row, column, rows, columns); }); }
+            return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+        }, nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("row"), nb::arg("column"),
+           nb::arg("rows"), nb::arg("columns"), "Read a dense row-major patch rectangle, preserving exact float32 XYZ bytes.")
         .def("read_geometry_ranges", [](PyObjectStore& self, const std::string& uuid, const std::string& name,
                                         const std::vector<std::array<int64_t, 2>>& ranges) {
             std::vector<std::vector<uint8_t>> values;
@@ -601,11 +610,11 @@ NB_MODULE(objects, m)
             self.owner->require().repairEdgeGeometry(self.require(), repairFromPy(input));
         }, nb::arg("repair"))
         .def("put_geometry", [](PyObjectWriteTxn& self, const std::string& uuid, const nb::dict& input,
-                               const std::optional<std::string>& expected, const nb::list& choices) {
+                               const std::optional<std::string>& expected, const nb::list& choices, int64_t patchTileSize) {
             const auto data = geometryFromPy(input);
             return self.owner->require().putGeometry(self.require(), uuid, data, expected, edgeEditsFromPy(choices));
         }, nb::arg("object_uuid"), nb::arg("geometry"), nb::arg("expected_revision") = std::nullopt,
-           nb::arg("edge_edits") = nb::list())
+           nb::arg("edge_edits") = nb::list(), nb::arg("patch_tile_size") = vo::GeometryStorageOptions{}.patchTileSize)
         .def("affected_geometry_edges", [](PyObjectWriteTxn& self, const std::string& uuid, const nb::dict& input) {
             const auto edges = self.owner->require().affectedGeometryEdges(self.require(), uuid, geometryFromPy(input));
             nb::list result; for (const auto& edge : edges) result.append(edgeToPy(edge)); return result;

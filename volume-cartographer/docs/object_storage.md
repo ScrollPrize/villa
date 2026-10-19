@@ -12,12 +12,14 @@ in `vc_object_geometry`; link detectors live in `vc_object_links`. These higher
 layers depend on the object store. The database library itself does not depend
 on CT readers or Qt. Python exposes the database and its helpers in `vc.objects`.
 
-The database uses SQLite application ID `0x56434f42`, schema version 5.
-Writable opens migrate version-2/3/4 files transactionally, building spatial bounds
-from current geometry. This first migration reads the current geometry payloads;
-subsequent opens reuse the persisted index. Read-only opens can inspect older
-versions without migration. Whole-object spatial queries require version 4;
-fine spatial regions require version 5. Older binaries cannot open version 5. SQLite must include its R-tree module.
+The database uses SQLite application ID `0x56434f42`, schema version 6.
+Writable opens migrate versions 2–5 transactionally. Versions 2–4 build spatial
+bounds from current geometry, reading the current payloads once; version 5 only
+advances the schema marker to permit tiled patch storage. Existing geometry
+manifests, revision identities, and payloads are never rewritten by migration.
+Read-only opens can inspect older versions without migration. Whole-object
+spatial queries require version 4; fine spatial regions require version 5.
+Older binaries cannot open version 6. SQLite must include its R-tree module.
 Metadata JSON exports use `vc_object_metadata` version 2. Geometry ingestion and
 relationship discovery operate on the same store. VC3D/Spiral geometry readers
 are separate consumers.
@@ -183,7 +185,8 @@ metadata does not advance geometry.
 `geometry_revisions` records the object UUID, parent revision UUID, content hash,
 manifest, object generation at publication, and author/time/host stamps.
 `geometry_heads` selects the current revision for each object. A revision's
-manifest lists named arrays, dtype, shape, byte length, and ordered chunk hashes.
+manifest lists named arrays, dtype, shape, byte length, physical storage layout,
+and ordered chunk hashes.
 `geometry_chunks` stores raw BLOBs of at most 1 MiB, keyed by SHA-256; identical
 chunks are shared across objects and revisions. `geometry_revision_chunks`
 provides foreign-key-backed references to their payloads. SQL triggers reject
@@ -224,9 +227,43 @@ For many point reads from the same array, use
 `read_geometry_ranges(revision_uuid, array_name, ranges)`, where each range is
 `(byte_offset, byte_count)`. The result is a list of byte strings in caller order.
 C++ exposes `readGeometryRanges` with an existing transaction. These calls share
-one verified manifest and a bounded eight-chunk cache. Geometry edit and repair
+one verified manifest and a bounded 8 MiB LRU chunk cache. Geometry edit and repair
 operations also reuse readers and stable-point-ID indexes across relationship
 checks. Caches end with the operation; subsequent calls reverify stored bytes.
+
+For patch rectangles, use
+`read_geometry_rectangle(revision_uuid, array_name, row, column, rows, columns)`
+(or C++ `readGeometryRectangle`). It returns densely packed, row-major float32
+XYZ bytes, with exact preservation of stored bit patterns. Coordinates and
+counts are in vertices; the array must be a patch float32 XYZ array. Empty
+rectangles are allowed, and out-of-bounds rectangles fail. Both old linear and
+new tiled storage layouts are supported.
+
+New patch `points` revisions use non-overlapping **128×128-vertex storage tiles**
+by default, independently of the 32×32-cell R-tree tiles. A full physical tile
+contains 192 KiB; boundary tiles store only their actual vertices, without
+padding. One 33×33 spatial region touches at most four physical tiles, regardless
+of surface width. Logical array layout, shape, dtype, and all coordinate bytes
+remain unchanged. Full-array reads and arbitrary byte-range reads reconstruct
+that same logical row-major sequence. Other geometry arrays retain their original
+1 MiB linear chunks.
+
+`put_geometry(..., patch_tile_size=32|64|128)` selects a different tile size for
+new patch revisions; `patch_tile_size=0` selects legacy linear storage. C++ uses
+the final `GeometryStorageOptions` argument to `putGeometry`. This preference
+never forces a new revision for unchanged content: no-op publication and affected
+relationship checks compare against the current revision's layout. A subsequent
+actual edit uses the requested layout. There is no automatic history repacking
+or explicit repack API in this change.
+
+Storage metadata lives per array in the immutable manifest, separately from the
+logical geometry format version (still 1). Tiled arrays use
+`storage={"version":1,"layout":"tiles","tile_size":128}`; missing storage metadata
+means legacy linear chunks. Physical chunks are ordered by tile row then tile
+column. Readers and sync reject unknown layouts, inconsistent sizes, missing
+chunks, and hash mismatches. Sync preserves incoming layouts and chunk hashes.
+The cache remains scoped to an operation/transaction; later calls reverify stored
+bytes, including after a prior successful read.
 
 To publish arrays directly, supply a dictionary with `kind`, optional
 `attributes`, and an `arrays` list. Each array has `name`, `dtype`, `shape`, and
@@ -625,22 +662,17 @@ own conservative handling. A caller can perform full-resolution intersection on
 returned slices without adopting VC3D's current tiling or sampling scheme.
 
 Region descriptors bind to immutable revisions. Use their `revision_uuid` when
-loading, even if the object's head changes between query and read. Fetch array
-layout once per revision (or cache it) and batch row ranges:
+loading, even if the object's head changes between query and read:
 
 ```python
 for tile in store.spatial_regions(view_box, object_kind="patch"):
     if tile["revision_uuid"] is None:
         continue  # External geometry.
-    revision = store.geometry_revision(tile["revision_uuid"])
-    layout = next(a for a in revision["arrays"] if a["name"] == tile["array_name"])
-    columns = layout["shape"][1]
     row, col = tile["start"]
     height, width = tile["shape"]
-    rows = store.read_geometry_ranges(
-        tile["revision_uuid"], tile["array_name"],
-        [((y * columns + col) * 12, width * 12) for y in range(row, row + height)],
-    )  # Patch coordinates are little-endian float32 XYZ.
+    vertices = store.read_geometry_rectangle(
+        tile["revision_uuid"], tile["array_name"], row, col, height, width,
+    )  # Dense little-endian float32 XYZ; reshape to (height, width, 3).
 ```
 
 The index stores geometry ranges and bounds, not payload copies, and is rebuilt
@@ -648,16 +680,17 @@ locally during migration/sync. Publication still scans the provided coordinates,
 but unchanged regions retain their R-tree entries; only changed/new/removed
 regions modify the tree. This avoids rewriting thousands of entries for a local
 edit. Index updates and head publication share the same savepoint. Migration
-uses verified, bounded reads in row-major order. All region reads honor the
+uses verified, bounded reads ordered to match the physical layout. All region reads honor the
 transaction snapshot. Historical revisions retain their payloads, but only the
 current head has a spatial index.
 
-Array slices are small, but storage chunks remain 1 MiB: a tiny tile can still
-require verifying several chunks, particularly in very wide patches. This is a
-separate payload-layout/cache issue, not something finer R-tree boxes eliminate.
+Old revisions retain linear 1 MiB chunks and their associated wide-surface read
+amplification. New tiled revisions avoid that dependency on surface width. A
+single operation still verifies its entire manifest; large numbers of small
+storage tiles increase manifest parsing and SQLite lookup overhead.
 
 
-### Spatial performance checks
+### Spatial performance checks (schema-5 baseline)
 
 Reproduce with `scripts/benchmark_object_store_workflows.py` (build bindings
 with `ninja -C build vc_object_bindings`). The spatial workers create temporary
@@ -685,8 +718,7 @@ Each tile returns 13,068 bytes. The square 2049×2049 surface has 4,096 tiles;
 the region tables, R-tree and supporting index occupy about 0.60 MB. Candidate
 queries alone take about 0.011 ms. The very wide surface demonstrates the
 remaining amplification from row-major 1 MiB chunks: the same 13 KB tile
-requires verifying about 26 MB. Tile-friendly payload layout or a verified
-chunk cache is the next target for that workload.
+requires verifying about 26 MB. The tiled-storage comparison below addresses this amplification.
 
 A 1,048,576-point fiber returns a 257-point block (6,168 bytes) in about
 0.57 ms including query/load, versus 31.3 ms for its full 24 MiB array.
@@ -698,3 +730,73 @@ accepts, copies, hashes and scans the complete supplied arrays. A single-coordin
 edit in the roughly 50 MB surface takes about 131 ms in this benchmark (including
 Python construction of the replacement payload). Finer indexing does not yet
 provide a partial geometry edit API or eliminate that full-array work.
+
+
+### Tiled-storage performance checks
+
+Build and reproduce all four layouts against identical inputs:
+
+```sh
+ninja -C build vc_object_bindings test_object_store test_object_records test_object_links
+.venv/bin/python scripts/benchmark_object_store_tiles.py --output /tmp/vcobj-tiles.json
+```
+
+The script measures 1 MiB linear storage (`0`) and 32/64/128-vertex tiles in
+fresh processes and temporary databases. It checks byte-for-byte equality for
+full reads, batched byte ranges, rectangles, and synced history. The report
+includes raw samples, mean/min/median/max, bytes verified, manifest sizes,
+retained edit bytes, build flags and source hashes. SQL diagnostics run in a
+separate process to isolate Python/native SQLite builds' WAL locking state.
+
+Measured on ARM64 Linux, RelWithDebInfo (`-O2 -g -DNDEBUG`), FULL durability,
+warm cache, one warmup and three timed repetitions. Query plus 33×33-vertex
+rectangle load, median [min–max] milliseconds:
+
+| Surface | Linear | 32×32 | 64×64 | 128×128 (default) |
+|---|---:|---:|---:|---:|
+| 1025×1,025 | 0.645 [0.615–0.673] | 0.533 [0.523–0.557] | 0.197 [0.194–0.214] | 0.172 [0.167–0.194] |
+| 2049×2,049 | 0.647 [0.622–0.696] | 2.216 [2.193–2.272] | 0.527 [0.524–0.591] | 0.294 [0.286–0.451] |
+| 65×65,537 | 20.174 [19.978–20.380] | 2.753 [2.709–2.853] | 0.972 [0.964–1.009] | 0.354 [0.342–0.372] |
+
+For the wide surface, the default layout verifies **99,840 payload bytes in one
+chunk**, versus **25,953,036 bytes in 25 chunks** for linear storage; both return
+13,068 bytes. A deliberately boundary-straddling rectangle takes 0.374 ms versus
+19.575 ms with linear storage. Chunk sizes change neither geometry precision nor
+spatial-index coverage.
+
+The 128×128 default balances manifest size, lookup overhead and payload size.
+For the wide surface, 32×32 storage creates 6,147 chunk references and a 412 KB
+manifest, versus 513 references and a 35 KB manifest for 128×128. Smaller tiles
+can still win on some aligned/full reads or small boundary-heavy workloads;
+64×64 beats 128×128 on the measured 2049×2049 corner rectangle (0.596 vs 0.843 ms).
+The API keeps the size selectable rather than coupling it to the R-tree stride.
+
+This is not a universal throughput improvement. On the wide fixture:
+
+| Operation | Linear | 128×128 |
+|---|---:|---:|
+| Full array read | 72.481 ms | 75.762 ms |
+| Single-coordinate publication | 136.332 ms | 143.719 ms |
+| Initial sync, history and spatial rebuild | 474.866 ms | 520.323 ms |
+
+A wide-surface edit retains 99,840 new payload bytes instead of 1 MiB (its tile
+is only 65 vertices high). A full 128×128 tile retains 192 KiB. The complete-array
+publication API still copies/hashes/scans the submitted geometry, so write
+latency does not improve in proportion to retained bytes. Sync preserves all
+historical representations and verifies incoming chunks.
+
+API-boundary profiling of 20 wide rectangle reads spent 0.386 s in the linear
+read wrapper and 0.00554 s in the tiled read wrapper. This profiler cannot split
+native C++ work; hardware perf counters were unavailable (`perf_event_paranoid=4`).
+Manifest parsing and chunk-lookup overhead are inferred from code and the
+layout scaling, rather than attributed native CPU percentages. Timings above
+come from separate unprofiled runs; no VC3D frame-rate claim is implied.
+
+Validation commands:
+
+```sh
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_BUILD_PYTHON=build/python .venv/bin/python -m pytest -q python/tests/test_object*.py python/tests/test_objects.py
+build/bin/test_object_store
+build/bin/test_object_records
+build/bin/test_object_links
+```

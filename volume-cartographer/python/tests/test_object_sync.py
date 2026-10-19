@@ -386,7 +386,7 @@ def test_version_two_baseline_migration_and_read_only_open(pair):
         assert a.synchronize(b)["applied"]
         assert state(a) == state(b)
         with sqlite3.connect(a.path) as sql:
-            assert sql.execute("PRAGMA user_version").fetchone()[0] == 5
+            assert sql.execute("PRAGMA user_version").fetchone()[0] == 6
             assert sql.execute("SELECT count(*) FROM sync_baseline_records").fetchone()[0] == 1
         a.set_approval(uid, "approved")
         assert a.synchronize(b)["applied"]

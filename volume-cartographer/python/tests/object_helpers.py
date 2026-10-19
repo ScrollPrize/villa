@@ -1,4 +1,5 @@
 """Explicit caller decisions used in object-store tests."""
+from scripts.object_store_sqlite import sqlite_rows
 def remove_spatial_schema(sql):
     """Restore the pre-v4 schema for migration fixtures, including its indexes."""
     sql.execute("DROP TABLE object_bounds")  # Also drops its maintenance triggers.

@@ -46,12 +46,17 @@ void transferGeometry(sqlite3* source, sqlite3* destination, const std::string& 
         chunks.bindBlob(1, revisions.blob16(0));
         const auto parsed = nlohmann::json::parse(manifest);
         size_t count = 0, expected = 0;
-        for (const auto& array : parsed.at("arrays")) expected += array.at("chunks").size();
+        std::map<std::string, GeometryLayout> layouts;
+        for (const auto& [name, array] : parsed.at("arrays").items()) {
+            const auto layout = geometryLayout(array);
+            expected += layout.chunkCount(); layouts.emplace(name, layout);
+        }
         while (chunks.row()) {
             ++count;
             const auto* data = static_cast<const uint8_t*>(sqlite3_column_blob(chunks.value, 3));
             const auto size = sqlite3_column_bytes(chunks.value, 3);
-            if (geometryHash(std::span(data, size)) != chunks.text(2) ||
+            if (size != layouts.at(chunks.text(0)).chunkBytes(chunks.i64(1)) ||
+                geometryHash(std::span(data, size)) != chunks.text(2) ||
                 parsed.at("arrays").at(chunks.text(0)).at("chunks").at(chunks.i64(1)) != chunks.text(2))
                 throw std::runtime_error("sync: corrupt geometry chunk");
             Statement old(destination, "SELECT hash,data FROM geometry_chunks WHERE hash=?"); old.bind(1, chunks.text(2));

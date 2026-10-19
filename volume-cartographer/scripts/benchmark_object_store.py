@@ -28,6 +28,8 @@ import sys
 import tempfile
 import time
 
+from object_store_sqlite import sqlite_rows
+
 
 def measure(results, name, operation, repeats=5, warmup=True, check=None, **details):
     if warmup:

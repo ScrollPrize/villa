@@ -32,7 +32,7 @@ import tempfile
 import time
 import uuid
 
-from benchmark_object_store import count_is, measure, native_plan
+from benchmark_object_store import count_is, measure, native_plan, sqlite_rows
 
 
 def bench(results, name, fn, check=None, **details):
@@ -231,9 +231,17 @@ def spatial(Store, root, n, results):
         height, width = tile['shape']
         ranges = [((y*cols+col)*12, width*12) for y in range(row, row+height)]
         expected = [payload[o:o+c] for o, c in ranges]
-        touched = set(k for o, c in ranges for k in range(o//1048576, (o+c-1)//1048576+1))
+        descriptor = json.loads(sqlite_rows(db.path, 'SELECT manifest FROM geometry_revisions')[0][0])['arrays']['points']
+        chunk_sizes = dict(sqlite_rows(db.path, 'SELECT r.chunk_index,length(c.data) FROM geometry_revision_chunks r JOIN geometry_chunks c USING(hash)'))
+        size = descriptor.get('storage', {}).get('tile_size', 0)
+        if size:
+            tile_cols = (cols + size - 1) // size
+            touched = {r*tile_cols+c for r in range(row//size, (row+height-1)//size+1)
+                       for c in range(col//size, (col+width-1)//size+1)}
+        else:
+            touched = {k for o, c in ranges for k in range(o//1048576, (o+c-1)//1048576+1)}
         results.append(dict(name='viewport_working_set', candidate_regions=len(hits), returned_bytes=sum(map(len, expected)),
-                            chunks_touched=len(touched), chunk_bytes_to_verify=sum(min(1048576, len(payload)-k*1048576) for k in touched)))
+                            chunks_touched=len(touched), chunk_bytes_to_verify=sum(chunk_sizes[k] for k in touched)))
         bench(results, 'spatial_regions_query', lambda: db.spatial_regions(box, object_kind='patch'),
               lambda v: assert_equal(v, hits))
         bench(results, 'whole_object_query', lambda: db.select_objects(bbox=box, object_kind='patch', fields=[]), count_is(1))
@@ -250,14 +258,18 @@ def spatial(Store, root, n, results):
 
         bench(results, 'whole_object_query_and_load_then_slice', whole_read, lambda v: assert_equal(v, expected))
         bench(results, 'region_query_and_load_slice', region_read, lambda v: assert_equal(v, expected))
+        def rectangle_read():
+            hit = db.spatial_regions(box, object_kind='patch')[0]
+            return db.read_geometry_rectangle(hit['revision_uuid'], 'points', *hit['start'], *hit['shape'])
+        bench(results, 'region_query_and_load_rectangle', rectangle_read, lambda v: assert_equal(v, b''.join(expected)))
         empty_box = [x, y, cols/16-1, x+.5, y+.5, cols/16]
         assert len(db.select_objects(bbox=empty_box, fields=[])) == 1
         bench(results, 'region_query_reject_empty_space_in_object_aabb',
               lambda: db.spatial_regions(empty_box), count_is(0))
-        with sqlite3.connect(db.path) as sql:
-            results.append(dict(name='index_storage', regions=sql.execute("SELECT count(*) FROM spatial_regions WHERE array_name!=''").fetchone()[0],
-                database_bytes=Path(db.path).stat().st_size,
-                index_bytes=sql.execute("SELECT sum(pgsize) FROM dbstat WHERE name LIKE 'spatial_regions%' OR name LIKE 'sqlite_autoindex_spatial_regions%'").fetchone()[0]))
+        results.append(dict(name='index_storage',
+            regions=sqlite_rows(db.path, "SELECT count(*) FROM spatial_regions WHERE array_name!=''")[0][0],
+            database_bytes=Path(db.path).stat().st_size,
+            index_bytes=sqlite_rows(db.path, "SELECT sum(pgsize) FROM dbstat WHERE name LIKE 'spatial_regions%' OR name LIKE 'sqlite_autoindex_spatial_regions%'")[0][0]))
         predicates = ' AND '.join(f'r.max_{a}>={box[i]} AND r.min_{a}<={box[i+3]} AND b.max_{a}>={box[i]} AND b.min_{a}<={box[i+3]}'
                                   for i, a in enumerate('xyz'))
         query = "SELECT o.uuid,h.revision_uuid FROM spatial_regions_rtree r CROSS JOIN spatial_regions b ON b.id=r.id " + \

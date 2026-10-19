@@ -213,7 +213,7 @@ def test_v4_migration_preserves_read_only_object_queries_and_builds_regions(tmp_
     path = str(tmp_path / 'v4.vcobj')
     with ObjectStore.create(path, author='test') as db:
         uid = db.upsert_object(dict(kind='patch'))
-        db.put_geometry(uid, patch(65, 65))
+        db.put_geometry(uid, patch(65, 65), patch_tile_size=0)
         before = db.uuid, db.journal_since(), db.export_json()
         expected = regions(db, uid)
     downgrade_to_v4(path)
@@ -225,7 +225,7 @@ def test_v4_migration_preserves_read_only_object_queries_and_builds_regions(tmp_
         assert (db.uuid, db.journal_since(), db.export_json()) == before
         assert regions(db, uid) == expected
     with sqlite3.connect(path) as sql:
-        assert sql.execute('PRAGMA user_version').fetchone()[0] == 5
+        assert sql.execute('PRAGMA user_version').fetchone()[0] == 6
         assert sql.execute('PRAGMA foreign_key_check').fetchall() == []
         assert sql.execute("SELECT name FROM sqlite_master WHERE sql LIKE 'CREATE VIRTUAL TABLE%rtree%'").fetchall() == [('spatial_regions_rtree',)]
 

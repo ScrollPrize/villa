@@ -149,3 +149,39 @@ TEST_CASE("object store serializes independent writer transactions")
     auto read = store.read();
     CHECK(store.objectCount(read, "note") == 30);
 }
+
+TEST_CASE("tiled patch rectangles preserve revision snapshots and logical byte order")
+{
+    TempDir tmp("patch_rectangle");
+    auto db = ObjectStore::create(tmp.dir / "objects.vcobj", testOptions());
+    auto other = ObjectStore::create(tmp.dir / "other.vcobj", testOptions());
+    const auto id = addObject(db, "patch");
+    GeometryData data;
+    data.kind = "patch"; data.attributes = R"({"scale":[1,1]})";
+    data.arrays.push_back({"points", "<f4", {2, 130, 3}, std::vector<uint8_t>(2 * 130 * 12, 0)});
+    auto& bytes = data.arrays[0].bytes;
+    for (size_t point = 0; point < 260; ++point) {
+        bytes[point * 12 + 10] = 0x80; bytes[point * 12 + 11] = 0x3f; // z=1, little endian
+    }
+    std::string first, second;
+    {
+        auto w = db.write(); first = db.putGeometry(w, id, data); w.commit();
+    }
+    auto snapshot = db.read();
+    const auto old = db.readGeometryRectangle(snapshot, first, "points", 0, 127, 2, 3);
+    REQUIRE(old.size() == 72);
+    bytes[(130 + 128) * 12 + 11] = 0x40; // z=4 in the second physical tile
+    {
+        auto w = db.write(); second = db.putGeometry(w, id, data, first); w.commit();
+    }
+    CHECK(db.currentGeometry(snapshot, id)->uuid == first);
+    CHECK(db.readGeometryRectangle(snapshot, first, "points", 0, 127, 2, 3) == old);
+    CHECK_THROWS(db.readGeometryRectangle(snapshot, second, "points", 0, 127, 2, 3));
+    auto current = db.read();
+    CHECK(db.readGeometryArray(current, second, "points") == bytes);
+    const auto changed = db.readGeometryRectangle(current, second, "points", 0, 127, 2, 3);
+    CHECK(changed[36 + 12 + 11] == 0x40);
+    CHECK(old[36 + 12 + 11] == 0x3f);
+    auto foreign = other.read();
+    CHECK_THROWS(db.readGeometryRectangle(foreign, first, "points", 0, 0, 1, 1));
+}

@@ -104,9 +104,9 @@ struct Region {
 };
 using RegionKey = std::tuple<std::string, int64_t, int64_t>;
 
-template<class Read>
+template<class Read, class ReadRectangle>
 void indexGeometry(sqlite3* db, int64_t objectId, const std::string& revision,
-                   const std::string& kind, const std::vector<GeometryArrayInfo>& arrays, Read&& read)
+                   const std::string& kind, const std::vector<GeometryArrayInfo>& arrays, Read&& read, ReadRectangle&& readRectangle, bool tiledPatch = false)
 {
     // Reuse unchanged entries rather than churning the R-tree on every edit.
     // Revision identity belongs to the object's head, so unchanged blocks do
@@ -153,13 +153,22 @@ void indexGeometry(sqlite3* db, int64_t objectId, const std::string& revision,
             for (int64_t row = 0; row < std::max<int64_t>(1, rows - 1); row += cells) {
                 const int64_t height = std::min(cells + 1, rows - row);
                 std::vector<BoundsBuilder> tiles(static_cast<size_t>(tileColumns));
-                // Read in row-major order, including ALL vertices, not just
-                // corners. Neighboring tiles share their boundary vertices.
-                for (int64_t y = row; y < row + height; ++y)
+                if (tiledPatch) {
+                    // Tiled payloads are visited as rectangles, once per region.
                     for (int64_t t = 0; t < tileColumns; ++t) {
                         const auto col = t * cells, width = std::min(cells + 1, cols - col);
-                        tiles[t].append(read(a.name, (y * cols + col) * stride, width * stride), a.dtype, true);
+                        tiles[t].append(readRectangle(a.name, row, col, height, width), a.dtype, true);
                     }
+                } else {
+                    // Legacy and in-memory arrays need row-major traversal:
+                    // tile-major reads on a wide legacy patch would repeatedly
+                    // fetch dozens of 1 MiB chunks for each small region.
+                    for (int64_t y = row; y < row + height; ++y)
+                        for (int64_t t = 0; t < tileColumns; ++t) {
+                            const auto col = t * cells, width = std::min(cells + 1, cols - col);
+                            tiles[t].append(read(a.name, (y * cols + col) * stride, width * stride), a.dtype, true);
+                        }
+                }
                 for (int64_t t = 0; t < tileColumns; ++t)
                     emit(a.name, row, t * cells, height, std::min(cells + 1, cols - t * cells), tiles[t]);
             }
@@ -201,6 +210,12 @@ void indexGeometryBounds(sqlite3* db, int64_t objectId, const std::string& revis
     indexGeometry(db, objectId, revision, geometry.kind, arrays,
         [&](const std::string& name, int64_t offset, int64_t count) {
             return std::span<const uint8_t>(data.at(name)->bytes).subspan(offset, count);
+        }, [&](const std::string& name, int64_t row, int64_t col, int64_t rows, int64_t cols) {
+            const auto& a = *data.at(name);
+            std::vector<uint8_t> bytes(rows * cols * 12);
+            for (int64_t y = 0; y < rows; ++y)
+                std::memcpy(bytes.data() + y * cols * 12, a.bytes.data() + ((row + y) * a.shape[1] + col) * 12, cols * 12);
+            return bytes;
         });
 }
 
@@ -216,7 +231,10 @@ void refreshGeometryBounds(sqlite3* db, const std::string& objectUuid)
     for (const auto& [name, a] : manifest.at("arrays").items())
         arrays.push_back({name, a.at("dtype"), a.at("shape").get<std::vector<int64_t>>(), a.at("byte_length")});
     indexGeometry(db, head.i64(0), revision, manifest.at("kind").get<std::string>(), arrays,
-        [&](const std::string& name, int64_t offset, int64_t count) { return reader.read(name, offset, count); });
+        [&](const std::string& name, int64_t offset, int64_t count) { return reader.read(name, offset, count); },
+        [&](const std::string& name, int64_t row, int64_t col, int64_t rows, int64_t cols) {
+            return reader.rectangle(name, row, col, rows, cols);
+        }, manifest.at("kind") == "patch" && manifest.at("arrays").at("points").contains("storage"));
 }
 
 namespace {
