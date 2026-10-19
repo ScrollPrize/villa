@@ -89,6 +89,10 @@
 namespace
 {
 constexpr int kMaxStoredRemoteUrls = 10;
+// A theme switch restyles every widget, which takes a second or two with a
+// project open. The delay lets the menu close and the wait cursor and status
+// note show first.
+constexpr int kThemeApplyDelayMs = 50;
 bool isAuthError(const QString& msg);
 
 } // namespace
@@ -358,11 +362,25 @@ void MenuActionController::rebuildThemeMenu()
 
 void MenuActionController::applyTheme(const QString& id)
 {
-    QString error;
-    if (!vc3d::theme::ThemeManager::instance().setTheme(id, true, &error)) {
-        QMessageBox::warning(_window, QObject::tr("Theme"),
-                             QObject::tr("The theme could not be applied:\n\n%1").arg(error));
+    auto& themes = vc3d::theme::ThemeManager::instance();
+    const auto* listed = themes.registry().find(id);
+    const QString name = listed ? listed->name : id;
+    if (_window) {
+        _window->showStatusBarMessage(QObject::tr("Applying %1...").arg(name));
     }
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    QTimer::singleShot(kThemeApplyDelayMs, this, [this, id, name]() {
+        QString error;
+        const bool applied = vc3d::theme::ThemeManager::instance().setTheme(id, true, &error);
+        QApplication::restoreOverrideCursor();
+        if (_window) {
+            _window->showStatusBarMessage(applied ? QObject::tr("Theme: %1").arg(name) : QString(), 3000);
+        }
+        if (!applied) {
+            QMessageBox::warning(_window, QObject::tr("Theme"),
+                                 QObject::tr("The theme could not be applied:\n\n%1").arg(error));
+        }
+    });
 }
 
 void MenuActionController::importThemeFile()
