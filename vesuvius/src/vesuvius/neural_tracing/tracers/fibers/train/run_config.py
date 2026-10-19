@@ -85,7 +85,7 @@ DEFAULTS = dict(
 # Per model type: runtime defaults where they differ from RUNTIME.
 RUNTIME_DEFAULTS = dict(regression={}, flow={}, sequence=dict(worker_cache_gb=1.))
 RUNTIME = dict(device='cuda', workers=10, worker_cache_gb=.5, threads=4, dagger_threads=4,
-               remote_prefetch_connections=48, remote_prefetch_queue_size=512, remote_prefetch_lookahead=0,
+               remote_prefetch_connections=48, remote_prefetch_queue_size=512, remote_prefetch_lookahead=16,
                remote_prefetch_timeout=120.,
                # Data-parallel processes, one GPU each (scripts/launch_train.sh starts torchrun when > 1;
                # shared/distributed.py). Batch and grad_steps are per process.
