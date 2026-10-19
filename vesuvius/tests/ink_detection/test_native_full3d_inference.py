@@ -227,6 +227,28 @@ def test_probability_rules_resize_and_exact_eight_way_tta():
         torch.testing.assert_close(actual, expected, rtol=0.0, atol=2e-7)
 
 
+def test_native_model_pads_input_depth_and_resizes_like_training(monkeypatch):
+    from vesuvius.ink_detection.training.train import prepare_loss_inputs
+
+    class EchoInk(torch.nn.Module):
+        def forward(self, image):
+            return {"ink": image}
+
+    monkeypatch.setattr(native, "make_model", lambda config: EchoInk())
+    monkeypatch.setattr(native, "load_model_state", lambda model, state: None)
+    config = SimpleNamespace(model=SimpleNamespace(input_pad_depth_to=4))
+    args = native.parse_args(["tifxyz", "memory.pth", "out.zarr", "--no-compile"])
+    bundle = native._load_native_model({"model": {}}, config, args)
+    logits = bundle.model(torch.randn(1, 1, 3, 8, 8).to(bundle.device)).cpu()
+    assert logits.shape[2] == 4  # the depth the model was trained on
+
+    patch = torch.zeros(1, 1, 3, 8, 8)
+    batch = {"image": patch, "inklabels": patch, "supervision_mask": patch + 1}
+    expected = prepare_loss_inputs(logits, batch, mode="full_3d")[0].sigmoid()
+    actual = native.logits_to_probabilities(logits, patch_size_zyx=(3, 8, 8))
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=1e-6)
+
+
 def test_importance_maps_and_sparse_accumulator_round_half_to_even():
     gaussian = native.create_importance_map((3, 4, 5), mode="gaussian")
     assert gaussian.shape == (3, 4, 5)
