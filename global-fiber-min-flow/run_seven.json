@@ -1,0 +1,6 @@
+{
+  "fiber_min_flow_benchmark": {
+    "project": "/home/hendrik/villa2/global-fiber-sgd",
+    "output_root": "/home/hendrik/villa_super/villa-min-flow/global-fiber-min-flow/data/seven_v1"
+  }
+}

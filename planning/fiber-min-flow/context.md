@@ -1,0 +1,2 @@
+# Context
+Source branch global-fiber-sgd-surface is db07e60fd, currently checked out in villa4. Villa2 is now global-fiber-loopy-bp at 68a41b9f0; its newer benchmark manifests and cached data will be reused read-only. These histories differ: the requested surface branch lacks the newer benchmark runner. Implement an independent integer benchmark adapter without porting unrelated geometry optimization.

@@ -1,0 +1,826 @@
+{
+  "full": {
+    "internal": {
+      "parallel": {
+        "violations": 0,
+        "known_events": 6,
+        "percent": 0.0
+      },
+      "perpendicular": {
+        "violations": 0,
+        "known_events": 40,
+        "percent": 0.0
+      }
+    },
+    "reversed_order": 0,
+    "missing_next_winding": 0,
+    "max_violation_steps": 0,
+    "affected_fibers": 0,
+    "most_affected": [],
+    "violations_involving_any_seam_transport": 0,
+    "contradictions": 6,
+    "objective": 15.0,
+    "reference": {
+      "all": {
+        "events": 41,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "perpendicular": {
+        "events": 35,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "parallel": {
+        "events": 6,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "excluded_reference_source_ids": [
+        7
+      ],
+      "scored_events": 41,
+      "unscored_events": 5
+    },
+    "components": 1,
+    "excluded_unsigned": {
+      "count": 0,
+      "compatible_with_one_target": 0,
+      "nearest_target_l1": 0.0
+    },
+    "solution_sha256": "7370e950532ee548f4d934c8622532f043022aac6eed9072862eacf597dbd989"
+  },
+  "half": {
+    "internal": {
+      "parallel": {
+        "violations": 0,
+        "known_events": 6,
+        "percent": 0.0
+      },
+      "perpendicular": {
+        "violations": 0,
+        "known_events": 40,
+        "percent": 0.0
+      }
+    },
+    "reversed_order": 0,
+    "missing_next_winding": 0,
+    "max_violation_steps": 0,
+    "affected_fibers": 0,
+    "most_affected": [],
+    "violations_involving_any_seam_transport": 0,
+    "contradictions": 6,
+    "objective": 15.0,
+    "reference": {
+      "all": {
+        "events": 41,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "perpendicular": {
+        "events": 35,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "parallel": {
+        "events": 6,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "excluded_reference_source_ids": [
+        7
+      ],
+      "scored_events": 41,
+      "unscored_events": 5
+    },
+    "components": 1,
+    "excluded_unsigned": {
+      "count": 0,
+      "compatible_with_one_target": 0,
+      "nearest_target_l1": 0.0
+    },
+    "solution_sha256": "7370e950532ee548f4d934c8622532f043022aac6eed9072862eacf597dbd989"
+  },
+  "double": {
+    "internal": {
+      "parallel": {
+        "violations": 0,
+        "known_events": 6,
+        "percent": 0.0
+      },
+      "perpendicular": {
+        "violations": 0,
+        "known_events": 40,
+        "percent": 0.0
+      }
+    },
+    "reversed_order": 0,
+    "missing_next_winding": 0,
+    "max_violation_steps": 0,
+    "affected_fibers": 0,
+    "most_affected": [],
+    "violations_involving_any_seam_transport": 0,
+    "contradictions": 6,
+    "objective": 15.0,
+    "reference": {
+      "all": {
+        "events": 41,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "perpendicular": {
+        "events": 35,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "parallel": {
+        "events": 6,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "excluded_reference_source_ids": [
+        7
+      ],
+      "scored_events": 41,
+      "unscored_events": 5
+    },
+    "components": 1,
+    "excluded_unsigned": {
+      "count": 0,
+      "compatible_with_one_target": 0,
+      "nearest_target_l1": 0.0
+    },
+    "solution_sha256": "7370e950532ee548f4d934c8622532f043022aac6eed9072862eacf597dbd989"
+  },
+  "sign": {
+    "internal": {
+      "parallel": {
+        "violations": 0,
+        "known_events": 6,
+        "percent": 0.0
+      },
+      "perpendicular": {
+        "violations": 0,
+        "known_events": 40,
+        "percent": 0.0
+      }
+    },
+    "reversed_order": 0,
+    "missing_next_winding": 0,
+    "max_violation_steps": 0,
+    "affected_fibers": 0,
+    "most_affected": [],
+    "violations_involving_any_seam_transport": 0,
+    "contradictions": 29,
+    "objective": 0.0,
+    "reference": {
+      "all": {
+        "events": 41,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "perpendicular": {
+        "events": 35,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "parallel": {
+        "events": 6,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "excluded_reference_source_ids": [
+        7
+      ],
+      "scored_events": 41,
+      "unscored_events": 5
+    },
+    "components": 1,
+    "excluded_unsigned": {
+      "count": 0,
+      "compatible_with_one_target": 0,
+      "nearest_target_l1": 0.0
+    },
+    "solution_sha256": "b838735ea18071c8ffa8fa7a4ace4f2d51a18e22a78f2d46917cf9f20733065b"
+  },
+  "sign_sparse_control": {
+    "internal": {
+      "parallel": {
+        "violations": 0,
+        "known_events": 6,
+        "percent": 0.0
+      },
+      "perpendicular": {
+        "violations": 0,
+        "known_events": 40,
+        "percent": 0.0
+      }
+    },
+    "reversed_order": 0,
+    "missing_next_winding": 0,
+    "max_violation_steps": 0,
+    "affected_fibers": 0,
+    "most_affected": [],
+    "violations_involving_any_seam_transport": 0,
+    "contradictions": 29,
+    "objective": 0.0,
+    "reference": {
+      "all": {
+        "events": 41,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "perpendicular": {
+        "events": 35,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "parallel": {
+        "events": 6,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "excluded_reference_source_ids": [
+        7
+      ],
+      "scored_events": 41,
+      "unscored_events": 5
+    },
+    "components": 1,
+    "excluded_unsigned": {
+      "count": 0,
+      "compatible_with_one_target": 0,
+      "nearest_target_l1": 0.0
+    },
+    "solution_sha256": "b838735ea18071c8ffa8fa7a4ace4f2d51a18e22a78f2d46917cf9f20733065b"
+  },
+  "free": {
+    "internal": {
+      "parallel": {
+        "violations": 0,
+        "known_events": 10772,
+        "percent": 0.0
+      },
+      "perpendicular": {
+        "violations": 22,
+        "known_events": 4283,
+        "percent": 0.5136586504786365
+      }
+    },
+    "reversed_order": 11,
+    "missing_next_winding": 11,
+    "max_violation_steps": 1,
+    "affected_fibers": 44,
+    "most_affected": [
+      {
+        "source_id": 87273,
+        "incident_violations": 1
+      },
+      {
+        "source_id": 88151,
+        "incident_violations": 1
+      },
+      {
+        "source_id": 89277,
+        "incident_violations": 1
+      },
+      {
+        "source_id": 90999,
+        "incident_violations": 1
+      },
+      {
+        "source_id": 91194,
+        "incident_violations": 1
+      },
+      {
+        "source_id": 116042,
+        "incident_violations": 1
+      },
+      {
+        "source_id": 244649,
+        "incident_violations": 1
+      },
+      {
+        "source_id": 270975,
+        "incident_violations": 1
+      },
+      {
+        "source_id": 271093,
+        "incident_violations": 1
+      },
+      {
+        "source_id": 271336,
+        "incident_violations": 1
+      }
+    ],
+    "violations_involving_any_seam_transport": 1,
+    "contradictions": 793,
+    "objective": 886.0,
+    "reference": {
+      "all": {
+        "events": 4918,
+        "l1": 0.0508336722244815,
+        "correct_percent": 94.95729971533143,
+        "max_error": 2
+      },
+      "perpendicular": {
+        "events": 575,
+        "l1": 0.14782608695652175,
+        "correct_percent": 85.3913043478261,
+        "max_error": 2
+      },
+      "parallel": {
+        "events": 4343,
+        "l1": 0.03799217131015427,
+        "correct_percent": 96.22380842735436,
+        "max_error": 2
+      },
+      "available_events": 5251,
+      "scored_events": 4918,
+      "unscored_events": 333,
+      "component_gauges": {
+        "0": {
+          "offset": 6,
+          "events": 4848
+        },
+        "1": {
+          "offset": 0,
+          "events": 1
+        },
+        "2": {
+          "offset": 4,
+          "events": 6
+        },
+        "3": {
+          "offset": 1,
+          "events": 63
+        }
+      },
+      "gauge_policy": "per-component integer median; GT used only for evaluation",
+      "reference": "frozen gt_winding_reference.json; source 7 excluded",
+      "single_global_gauge": {
+        "offset": 6,
+        "metrics": {
+          "all": {
+            "events": 4918,
+            "l1": 0.118137454249695,
+            "correct_percent": 93.55429036193574,
+            "max_error": 6
+          },
+          "perpendicular": {
+            "events": 575,
+            "l1": 0.1791304347826087,
+            "correct_percent": 84.69565217391303,
+            "max_error": 6
+          },
+          "parallel": {
+            "events": 4343,
+            "l1": 0.11006216900759844,
+            "correct_percent": 94.72714713331798,
+            "max_error": 5
+          }
+        }
+      },
+      "signs": {
+        "parallel": {
+          "events": 4343,
+          "violations": 9
+        },
+        "perpendicular": {
+          "events": 575,
+          "violations": 4
+        }
+      }
+    },
+    "components": 5,
+    "excluded_unsigned": {
+      "count": 20,
+      "compatible_with_one_target": 17,
+      "nearest_target_l1": 6.0
+    },
+    "solution_sha256": "f124c6d0919b105b31546dea3dd05c3a729554af4228baed5a8778d2ba606a24",
+    "reference_recomputed_identically": true,
+    "all_known_signs_enforced": {
+      "feasible": true,
+      "objective": 906.0,
+      "potential_rounding_max": 0.0,
+      "violations": 0,
+      "total_deficit": 0.0,
+      "extra_l1_cost": 20.0,
+      "reference": {
+        "all": {
+          "events": 4918,
+          "l1": 0.04351362342415616,
+          "correct_percent": 95.66897112647418,
+          "max_error": 2
+        },
+        "perpendicular": {
+          "events": 575,
+          "l1": 0.14782608695652175,
+          "correct_percent": 85.3913043478261,
+          "max_error": 2
+        },
+        "parallel": {
+          "events": 4343,
+          "l1": 0.0297029702970297,
+          "correct_percent": 97.02970297029702,
+          "max_error": 1
+        },
+        "available_events": 5251,
+        "scored_events": 4918,
+        "unscored_events": 333,
+        "component_gauges": {
+          "0": {
+            "offset": 5,
+            "events": 4848
+          },
+          "1": {
+            "offset": 0,
+            "events": 1
+          },
+          "2": {
+            "offset": 5,
+            "events": 6
+          },
+          "3": {
+            "offset": 0,
+            "events": 63
+          }
+        },
+        "gauge_policy": "per-component integer median; GT used only for evaluation",
+        "reference": "frozen gt_winding_reference.json; source 7 excluded",
+        "single_global_gauge": {
+          "offset": 5,
+          "metrics": {
+            "all": {
+              "events": 4918,
+              "l1": 0.10858072387149248,
+              "correct_percent": 94.36762911752746,
+              "max_error": 5
+            },
+            "perpendicular": {
+              "events": 575,
+              "l1": 0.17391304347826086,
+              "correct_percent": 84.86956521739131,
+              "max_error": 5
+            },
+            "parallel": {
+              "events": 4343,
+              "l1": 0.09993092332489063,
+              "correct_percent": 95.6251439097398,
+              "max_error": 5
+            }
+          }
+        },
+        "signs": {
+          "parallel": {
+            "events": 4343,
+            "violations": 0
+          },
+          "perpendicular": {
+            "events": 575,
+            "violations": 6
+          }
+        }
+      }
+    },
+    "least_ordering_deficit_at_same_l1_optimum": {
+      "feasible": true,
+      "objective": 886.0,
+      "potential_rounding_max": 0.0,
+      "violations": 9,
+      "total_deficit": 9.0,
+      "reference": {
+        "all": {
+          "events": 4918,
+          "l1": 0.04961366409109394,
+          "correct_percent": 95.0793005286702,
+          "max_error": 2
+        },
+        "perpendicular": {
+          "events": 575,
+          "l1": 0.1582608695652174,
+          "correct_percent": 84.34782608695653,
+          "max_error": 2
+        },
+        "parallel": {
+          "events": 4343,
+          "l1": 0.03522910430577941,
+          "correct_percent": 96.50011512779186,
+          "max_error": 2
+        },
+        "available_events": 5251,
+        "scored_events": 4918,
+        "unscored_events": 333,
+        "component_gauges": {
+          "0": {
+            "offset": 4,
+            "events": 4848
+          },
+          "1": {
+            "offset": 2,
+            "events": 1
+          },
+          "2": {
+            "offset": 6,
+            "events": 6
+          },
+          "3": {
+            "offset": 0,
+            "events": 63
+          }
+        },
+        "gauge_policy": "per-component integer median; GT used only for evaluation",
+        "reference": "frozen gt_winding_reference.json; source 7 excluded",
+        "single_global_gauge": {
+          "offset": 4,
+          "metrics": {
+            "all": {
+              "events": 4918,
+              "l1": 0.10370069133794226,
+              "correct_percent": 93.6762911752745,
+              "max_error": 4
+            },
+            "perpendicular": {
+              "events": 575,
+              "l1": 0.1826086956521739,
+              "correct_percent": 83.65217391304348,
+              "max_error": 4
+            },
+            "parallel": {
+              "events": 4343,
+              "l1": 0.0932535113976514,
+              "correct_percent": 95.00345383375547,
+              "max_error": 4
+            }
+          }
+        },
+        "signs": {
+          "parallel": {
+            "events": 4343,
+            "violations": 9
+          },
+          "perpendicular": {
+            "events": 575,
+            "violations": 6
+          }
+        }
+      }
+    }
+  },
+  "joint": {
+    "internal": {
+      "parallel": {
+        "violations": 0,
+        "known_events": 15428,
+        "percent": 0.0
+      },
+      "perpendicular": {
+        "violations": 24,
+        "known_events": 4924,
+        "percent": 0.487408610885459
+      }
+    },
+    "reversed_order": 11,
+    "missing_next_winding": 13,
+    "max_violation_steps": 1,
+    "affected_fibers": 46,
+    "most_affected": [
+      {
+        "source_id": 471177,
+        "incident_violations": 3
+      },
+      {
+        "source_id": 87273,
+        "incident_violations": 1
+      },
+      {
+        "source_id": 88151,
+        "incident_violations": 1
+      },
+      {
+        "source_id": 89277,
+        "incident_violations": 1
+      },
+      {
+        "source_id": 90999,
+        "incident_violations": 1
+      },
+      {
+        "source_id": 91194,
+        "incident_violations": 1
+      },
+      {
+        "source_id": 244649,
+        "incident_violations": 1
+      },
+      {
+        "source_id": 270975,
+        "incident_violations": 1
+      },
+      {
+        "source_id": 271093,
+        "incident_violations": 1
+      },
+      {
+        "source_id": 271336,
+        "incident_violations": 1
+      }
+    ],
+    "violations_involving_any_seam_transport": 1,
+    "contradictions": 984,
+    "objective": 1099.0,
+    "reference": {
+      "all": {
+        "events": 4918,
+        "l1": 0.03355022366815779,
+        "correct_percent": 96.66531110207401,
+        "max_error": 2
+      },
+      "perpendicular": {
+        "events": 575,
+        "l1": 0.1408695652173913,
+        "correct_percent": 86.08695652173914,
+        "max_error": 2
+      },
+      "parallel": {
+        "events": 4343,
+        "l1": 0.019341469030623993,
+        "correct_percent": 98.0658530969376,
+        "max_error": 1
+      },
+      "available_events": 5251,
+      "scored_events": 4918,
+      "unscored_events": 333,
+      "component_gauges": {
+        "0": {
+          "offset": 6,
+          "events": 4918
+        }
+      },
+      "gauge_policy": "per-component integer median; GT used only for evaluation",
+      "reference": "frozen gt_winding_reference.json; source 7 excluded",
+      "single_global_gauge": {
+        "offset": 6,
+        "metrics": {
+          "all": {
+            "events": 4918,
+            "l1": 0.03355022366815779,
+            "correct_percent": 96.66531110207401,
+            "max_error": 2
+          },
+          "perpendicular": {
+            "events": 575,
+            "l1": 0.1408695652173913,
+            "correct_percent": 86.08695652173914,
+            "max_error": 2
+          },
+          "parallel": {
+            "events": 4343,
+            "l1": 0.019341469030623993,
+            "correct_percent": 98.0658530969376,
+            "max_error": 1
+          }
+        }
+      },
+      "signs": {
+        "parallel": {
+          "events": 4343,
+          "violations": 0
+        },
+        "perpendicular": {
+          "events": 575,
+          "violations": 3
+        }
+      }
+    },
+    "components": 2,
+    "excluded_unsigned": {
+      "count": 20,
+      "compatible_with_one_target": 17,
+      "nearest_target_l1": 6.0
+    },
+    "solution_sha256": "a3e61c6bf40c43573f42a2dfb9765fb2eca2592449d524b0970c2cec7732ec7a",
+    "reference_recomputed_identically": true,
+    "all_known_signs_enforced": {
+      "feasible": false,
+      "contradictory_cycle": [
+        {
+          "from_source": 423838,
+          "to_source": 471177,
+          "input_index": 19333,
+          "event_id": 19333,
+          "upper_bound": 1
+        },
+        {
+          "from_source": 471177,
+          "to_source": 425073,
+          "input_index": 20060,
+          "event_id": 20060,
+          "upper_bound": -1
+        },
+        {
+          "from_source": 425073,
+          "to_source": 424617,
+          "input_index": 13118,
+          "event_id": 13118,
+          "upper_bound": 0
+        },
+        {
+          "from_source": 424617,
+          "to_source": 423838,
+          "input_index": 12624,
+          "event_id": 12624,
+          "upper_bound": -1
+        }
+      ],
+      "cycle_bound_sum": -1
+    },
+    "least_ordering_deficit_at_same_l1_optimum": {
+      "feasible": true,
+      "objective": 1099.0,
+      "potential_rounding_max": 0.0,
+      "violations": 12,
+      "total_deficit": 12.0,
+      "reference": {
+        "all": {
+          "events": 4918,
+          "l1": 0.03334688897925986,
+          "correct_percent": 96.6856445709638,
+          "max_error": 2
+        },
+        "perpendicular": {
+          "events": 575,
+          "l1": 0.1391304347826087,
+          "correct_percent": 86.26086956521739,
+          "max_error": 2
+        },
+        "parallel": {
+          "events": 4343,
+          "l1": 0.019341469030623993,
+          "correct_percent": 98.0658530969376,
+          "max_error": 1
+        },
+        "available_events": 5251,
+        "scored_events": 4918,
+        "unscored_events": 333,
+        "component_gauges": {
+          "0": {
+            "offset": 3,
+            "events": 4918
+          }
+        },
+        "gauge_policy": "per-component integer median; GT used only for evaluation",
+        "reference": "frozen gt_winding_reference.json; source 7 excluded",
+        "single_global_gauge": {
+          "offset": 3,
+          "metrics": {
+            "all": {
+              "events": 4918,
+              "l1": 0.03334688897925986,
+              "correct_percent": 96.6856445709638,
+              "max_error": 2
+            },
+            "perpendicular": {
+              "events": 575,
+              "l1": 0.1391304347826087,
+              "correct_percent": 86.26086956521739,
+              "max_error": 2
+            },
+            "parallel": {
+              "events": 4343,
+              "l1": 0.019341469030623993,
+              "correct_percent": 98.0658530969376,
+              "max_error": 1
+            }
+          }
+        },
+        "signs": {
+          "parallel": {
+            "events": 4343,
+            "violations": 0
+          },
+          "perpendicular": {
+            "events": 575,
+            "violations": 3
+          }
+        }
+      }
+    }
+  }
+}

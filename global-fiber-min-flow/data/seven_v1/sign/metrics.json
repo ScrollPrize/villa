@@ -1,0 +1,68 @@
+{
+  "nodes": 7,
+  "events": 46,
+  "used_events": 46,
+  "cached_interpolated_angle_seam_disagreements": {
+    "a": 0,
+    "b": 0
+  },
+  "unsigned_events": 0,
+  "unsigned_unique_target_retained": 0,
+  "excluded_ambiguous_events": 0,
+  "signs": {
+    "parallel": {
+      "events": 6,
+      "violations": 0
+    },
+    "perpendicular": {
+      "events": 40,
+      "violations": 0
+    }
+  },
+  "seam": {
+    "fiber_endpoint_crossings": 162,
+    "connectors_crossing": 0
+  },
+  "certificate": {
+    "primal": 0.0,
+    "dual": 0.0,
+    "gap": 0.0,
+    "conservation_max": 0.0,
+    "capacity_violation_max": 0.0,
+    "potential_rounding_max": 0.0,
+    "components": 1,
+    "seconds": 0.0027127161156386137,
+    "optimal": true,
+    "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+    "iterations": 9
+  },
+  "sign_only": true,
+  "reference": {
+    "all": {
+      "events": 41,
+      "l1": 0.0,
+      "correct_percent": 100.0,
+      "max_error": 0
+    },
+    "perpendicular": {
+      "events": 35,
+      "l1": 0.0,
+      "correct_percent": 100.0,
+      "max_error": 0
+    },
+    "parallel": {
+      "events": 6,
+      "l1": 0.0,
+      "correct_percent": 100.0,
+      "max_error": 0
+    },
+    "excluded_reference_source_ids": [
+      7
+    ],
+    "scored_events": 41,
+    "unscored_events": 5
+  },
+  "retained_fiber_percent": 100.0,
+  "geometry_width_metrics": "not applicable: no optimized geometry or widths",
+  "seconds_total": 0.015455468092113733
+}

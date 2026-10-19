@@ -1,0 +1,107 @@
+{
+  "nodes": 2060,
+  "events": 21186,
+  "used_events": 21166,
+  "cached_interpolated_angle_seam_disagreements": {
+    "a": 4,
+    "b": 9
+  },
+  "unsigned_events": 834,
+  "unsigned_unique_target_retained": 814,
+  "excluded_ambiguous_events": 20,
+  "signs": {
+    "parallel": {
+      "events": 15428,
+      "violations": 0
+    },
+    "perpendicular": {
+      "events": 4924,
+      "violations": 24
+    }
+  },
+  "seam": {
+    "fiber_endpoint_crossings": 9640,
+    "connectors_crossing": 56
+  },
+  "certificate": {
+    "primal": 1099.0,
+    "dual": 1099.0,
+    "gap": 0.0,
+    "conservation_max": 0.0,
+    "capacity_violation_max": 0.0,
+    "potential_rounding_max": 0.0,
+    "components": 2,
+    "seconds": 0.15855977521277964,
+    "optimal": true,
+    "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+    "iterations": 3731
+  },
+  "sign_only": false,
+  "reference": {
+    "all": {
+      "events": 4918,
+      "l1": 0.03355022366815779,
+      "correct_percent": 96.66531110207401,
+      "max_error": 2
+    },
+    "perpendicular": {
+      "events": 575,
+      "l1": 0.1408695652173913,
+      "correct_percent": 86.08695652173914,
+      "max_error": 2
+    },
+    "parallel": {
+      "events": 4343,
+      "l1": 0.019341469030623993,
+      "correct_percent": 98.0658530969376,
+      "max_error": 1
+    },
+    "available_events": 5251,
+    "scored_events": 4918,
+    "unscored_events": 333,
+    "component_gauges": {
+      "0": {
+        "offset": 6,
+        "events": 4918
+      }
+    },
+    "gauge_policy": "per-component integer median; GT used only for evaluation",
+    "reference": "frozen gt_winding_reference.json; source 7 excluded",
+    "single_global_gauge": {
+      "offset": 6,
+      "metrics": {
+        "all": {
+          "events": 4918,
+          "l1": 0.03355022366815779,
+          "correct_percent": 96.66531110207401,
+          "max_error": 2
+        },
+        "perpendicular": {
+          "events": 575,
+          "l1": 0.1408695652173913,
+          "correct_percent": 86.08695652173914,
+          "max_error": 2
+        },
+        "parallel": {
+          "events": 4343,
+          "l1": 0.019341469030623993,
+          "correct_percent": 98.0658530969376,
+          "max_error": 1
+        }
+      }
+    },
+    "signs": {
+      "parallel": {
+        "events": 4343,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 575,
+        "violations": 3
+      }
+    }
+  },
+  "retained_fiber_percent": 100.0,
+  "geometry_width_metrics": "not applicable: no optimized geometry or widths",
+  "seconds_total": 12.864552557934076
+}

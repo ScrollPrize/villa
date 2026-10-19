@@ -1,0 +1,575 @@
+{
+  "full": {
+    "nodes": 7,
+    "events": 46,
+    "used_events": 46,
+    "cached_interpolated_angle_seam_disagreements": {
+      "a": 0,
+      "b": 0
+    },
+    "unsigned_events": 0,
+    "unsigned_unique_target_retained": 0,
+    "excluded_ambiguous_events": 0,
+    "signs": {
+      "parallel": {
+        "events": 6,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 40,
+        "violations": 0
+      }
+    },
+    "seam": {
+      "fiber_endpoint_crossings": 162,
+      "connectors_crossing": 0
+    },
+    "certificate": {
+      "primal": 15.0,
+      "dual": 15.0,
+      "gap": 0.0,
+      "conservation_max": 0.0,
+      "capacity_violation_max": 0.0,
+      "potential_rounding_max": 0.0,
+      "components": 1,
+      "seconds": 0.011212582001462579,
+      "optimal": true,
+      "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+      "iterations": 6
+    },
+    "sign_only": false,
+    "reference": {
+      "all": {
+        "events": 41,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "perpendicular": {
+        "events": 35,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "parallel": {
+        "events": 6,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "excluded_reference_source_ids": [
+        7
+      ],
+      "scored_events": 41,
+      "unscored_events": 5
+    },
+    "retained_fiber_percent": 100.0,
+    "geometry_width_metrics": "not applicable: no optimized geometry or widths",
+    "seconds_total": 1.7407706249505281
+  },
+  "half": {
+    "nodes": 7,
+    "events": 46,
+    "used_events": 46,
+    "cached_interpolated_angle_seam_disagreements": {
+      "a": 0,
+      "b": 0
+    },
+    "unsigned_events": 0,
+    "unsigned_unique_target_retained": 0,
+    "excluded_ambiguous_events": 0,
+    "signs": {
+      "parallel": {
+        "events": 6,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 40,
+        "violations": 0
+      }
+    },
+    "seam": {
+      "fiber_endpoint_crossings": 162,
+      "connectors_crossing": 0
+    },
+    "certificate": {
+      "primal": 15.0,
+      "dual": 15.0,
+      "gap": 0.0,
+      "conservation_max": 0.0,
+      "capacity_violation_max": 0.0,
+      "potential_rounding_max": 0.0,
+      "components": 1,
+      "seconds": 0.003090738086029887,
+      "optimal": true,
+      "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+      "iterations": 6
+    },
+    "sign_only": false,
+    "reference": {
+      "all": {
+        "events": 41,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "perpendicular": {
+        "events": 35,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "parallel": {
+        "events": 6,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "excluded_reference_source_ids": [
+        7
+      ],
+      "scored_events": 41,
+      "unscored_events": 5
+    },
+    "retained_fiber_percent": 100.0,
+    "geometry_width_metrics": "not applicable: no optimized geometry or widths",
+    "seconds_total": 0.015768348006531596
+  },
+  "double": {
+    "nodes": 7,
+    "events": 46,
+    "used_events": 46,
+    "cached_interpolated_angle_seam_disagreements": {
+      "a": 0,
+      "b": 0
+    },
+    "unsigned_events": 0,
+    "unsigned_unique_target_retained": 0,
+    "excluded_ambiguous_events": 0,
+    "signs": {
+      "parallel": {
+        "events": 6,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 40,
+        "violations": 0
+      }
+    },
+    "seam": {
+      "fiber_endpoint_crossings": 162,
+      "connectors_crossing": 0
+    },
+    "certificate": {
+      "primal": 15.0,
+      "dual": 15.0,
+      "gap": 0.0,
+      "conservation_max": 0.0,
+      "capacity_violation_max": 0.0,
+      "potential_rounding_max": 0.0,
+      "components": 1,
+      "seconds": 0.002856981009244919,
+      "optimal": true,
+      "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+      "iterations": 6
+    },
+    "sign_only": false,
+    "reference": {
+      "all": {
+        "events": 41,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "perpendicular": {
+        "events": 35,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "parallel": {
+        "events": 6,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "excluded_reference_source_ids": [
+        7
+      ],
+      "scored_events": 41,
+      "unscored_events": 5
+    },
+    "retained_fiber_percent": 100.0,
+    "geometry_width_metrics": "not applicable: no optimized geometry or widths",
+    "seconds_total": 0.015095342183485627
+  },
+  "sign": {
+    "nodes": 7,
+    "events": 46,
+    "used_events": 46,
+    "cached_interpolated_angle_seam_disagreements": {
+      "a": 0,
+      "b": 0
+    },
+    "unsigned_events": 0,
+    "unsigned_unique_target_retained": 0,
+    "excluded_ambiguous_events": 0,
+    "signs": {
+      "parallel": {
+        "events": 6,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 40,
+        "violations": 0
+      }
+    },
+    "seam": {
+      "fiber_endpoint_crossings": 162,
+      "connectors_crossing": 0
+    },
+    "certificate": {
+      "primal": 0.0,
+      "dual": 0.0,
+      "gap": 0.0,
+      "conservation_max": 0.0,
+      "capacity_violation_max": 0.0,
+      "potential_rounding_max": 0.0,
+      "components": 1,
+      "seconds": 0.0027127161156386137,
+      "optimal": true,
+      "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+      "iterations": 9
+    },
+    "sign_only": true,
+    "reference": {
+      "all": {
+        "events": 41,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "perpendicular": {
+        "events": 35,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "parallel": {
+        "events": 6,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "excluded_reference_source_ids": [
+        7
+      ],
+      "scored_events": 41,
+      "unscored_events": 5
+    },
+    "retained_fiber_percent": 100.0,
+    "geometry_width_metrics": "not applicable: no optimized geometry or widths",
+    "seconds_total": 0.015455468092113733
+  },
+  "sign_sparse_control": {
+    "nodes": 7,
+    "events": 46,
+    "used_events": 46,
+    "cached_interpolated_angle_seam_disagreements": {
+      "a": 0,
+      "b": 0
+    },
+    "unsigned_events": 0,
+    "unsigned_unique_target_retained": 0,
+    "excluded_ambiguous_events": 0,
+    "signs": {
+      "parallel": {
+        "events": 6,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 40,
+        "violations": 0
+      }
+    },
+    "seam": {
+      "fiber_endpoint_crossings": 162,
+      "connectors_crossing": 0
+    },
+    "certificate": {
+      "primal": 0.0,
+      "dual": 0.0,
+      "gap": 0.0,
+      "conservation_max": 0.0,
+      "capacity_violation_max": 0.0,
+      "potential_rounding_max": 0.0,
+      "components": 1,
+      "seconds": 0.0026275641284883022,
+      "optimal": true,
+      "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+      "iterations": 9
+    },
+    "sign_only": true,
+    "reference": {
+      "all": {
+        "events": 41,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "perpendicular": {
+        "events": 35,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "parallel": {
+        "events": 6,
+        "l1": 0.0,
+        "correct_percent": 100.0,
+        "max_error": 0
+      },
+      "excluded_reference_source_ids": [
+        7
+      ],
+      "scored_events": 41,
+      "unscored_events": 5
+    },
+    "retained_fiber_percent": 100.0,
+    "geometry_width_metrics": "not applicable: no optimized geometry or widths",
+    "seconds_total": 0.014688897877931595
+  },
+  "free": {
+    "nodes": 2053,
+    "events": 15889,
+    "used_events": 15869,
+    "cached_interpolated_angle_seam_disagreements": {
+      "a": 2,
+      "b": 9
+    },
+    "unsigned_events": 834,
+    "unsigned_unique_target_retained": 814,
+    "excluded_ambiguous_events": 20,
+    "signs": {
+      "parallel": {
+        "events": 10772,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 4283,
+        "violations": 22
+      }
+    },
+    "seam": {
+      "fiber_endpoint_crossings": 1422,
+      "connectors_crossing": 54
+    },
+    "certificate": {
+      "primal": 886.0,
+      "dual": 886.0,
+      "gap": 0.0,
+      "conservation_max": 0.0,
+      "capacity_violation_max": 0.0,
+      "potential_rounding_max": 0.0,
+      "components": 5,
+      "seconds": 0.13001960492692888,
+      "optimal": true,
+      "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+      "iterations": 2823
+    },
+    "sign_only": false,
+    "reference": {
+      "all": {
+        "events": 4918,
+        "l1": 0.0508336722244815,
+        "correct_percent": 94.95729971533143,
+        "max_error": 2
+      },
+      "perpendicular": {
+        "events": 575,
+        "l1": 0.14782608695652175,
+        "correct_percent": 85.3913043478261,
+        "max_error": 2
+      },
+      "parallel": {
+        "events": 4343,
+        "l1": 0.03799217131015427,
+        "correct_percent": 96.22380842735436,
+        "max_error": 2
+      },
+      "available_events": 5251,
+      "scored_events": 4918,
+      "unscored_events": 333,
+      "component_gauges": {
+        "0": {
+          "offset": 6,
+          "events": 4848
+        },
+        "1": {
+          "offset": 0,
+          "events": 1
+        },
+        "2": {
+          "offset": 4,
+          "events": 6
+        },
+        "3": {
+          "offset": 1,
+          "events": 63
+        }
+      },
+      "gauge_policy": "per-component integer median; GT used only for evaluation",
+      "reference": "frozen gt_winding_reference.json; source 7 excluded",
+      "single_global_gauge": {
+        "offset": 6,
+        "metrics": {
+          "all": {
+            "events": 4918,
+            "l1": 0.118137454249695,
+            "correct_percent": 93.55429036193574,
+            "max_error": 6
+          },
+          "perpendicular": {
+            "events": 575,
+            "l1": 0.1791304347826087,
+            "correct_percent": 84.69565217391303,
+            "max_error": 6
+          },
+          "parallel": {
+            "events": 4343,
+            "l1": 0.11006216900759844,
+            "correct_percent": 94.72714713331798,
+            "max_error": 5
+          }
+        }
+      },
+      "signs": {
+        "parallel": {
+          "events": 4343,
+          "violations": 9
+        },
+        "perpendicular": {
+          "events": 575,
+          "violations": 4
+        }
+      }
+    },
+    "retained_fiber_percent": 100.0,
+    "geometry_width_metrics": "not applicable: no optimized geometry or widths",
+    "source_measurement_audit": {
+      "tensor_hash_matches_original_sgd_solve": true,
+      "tensor_sha256": "4f03b705a79be3f8ff17965f1baf78845f91cdc9ac5b8a34c8f27e1070730d55",
+      "source_afc_recomputation": "unavailable: original database path no longer exists",
+      "missing_database": "/home/hendrik/villa2/global-fiber-sgd/data/oriented_normals_v1/full.afc.sqlite",
+      "rows_verified": 0
+    },
+    "seconds_total": 9.811861495953053
+  },
+  "joint": {
+    "nodes": 2060,
+    "events": 21186,
+    "used_events": 21166,
+    "cached_interpolated_angle_seam_disagreements": {
+      "a": 4,
+      "b": 9
+    },
+    "unsigned_events": 834,
+    "unsigned_unique_target_retained": 814,
+    "excluded_ambiguous_events": 20,
+    "signs": {
+      "parallel": {
+        "events": 15428,
+        "violations": 0
+      },
+      "perpendicular": {
+        "events": 4924,
+        "violations": 24
+      }
+    },
+    "seam": {
+      "fiber_endpoint_crossings": 9640,
+      "connectors_crossing": 56
+    },
+    "certificate": {
+      "primal": 1099.0,
+      "dual": 1099.0,
+      "gap": 0.0,
+      "conservation_max": 0.0,
+      "capacity_violation_max": 0.0,
+      "potential_rounding_max": 0.0,
+      "components": 2,
+      "seconds": 0.15855977521277964,
+      "optimal": true,
+      "backend": "scipy.optimize.linprog/highs-ds capacitated circulation",
+      "iterations": 3731
+    },
+    "sign_only": false,
+    "reference": {
+      "all": {
+        "events": 4918,
+        "l1": 0.03355022366815779,
+        "correct_percent": 96.66531110207401,
+        "max_error": 2
+      },
+      "perpendicular": {
+        "events": 575,
+        "l1": 0.1408695652173913,
+        "correct_percent": 86.08695652173914,
+        "max_error": 2
+      },
+      "parallel": {
+        "events": 4343,
+        "l1": 0.019341469030623993,
+        "correct_percent": 98.0658530969376,
+        "max_error": 1
+      },
+      "available_events": 5251,
+      "scored_events": 4918,
+      "unscored_events": 333,
+      "component_gauges": {
+        "0": {
+          "offset": 6,
+          "events": 4918
+        }
+      },
+      "gauge_policy": "per-component integer median; GT used only for evaluation",
+      "reference": "frozen gt_winding_reference.json; source 7 excluded",
+      "single_global_gauge": {
+        "offset": 6,
+        "metrics": {
+          "all": {
+            "events": 4918,
+            "l1": 0.03355022366815779,
+            "correct_percent": 96.66531110207401,
+            "max_error": 2
+          },
+          "perpendicular": {
+            "events": 575,
+            "l1": 0.1408695652173913,
+            "correct_percent": 86.08695652173914,
+            "max_error": 2
+          },
+          "parallel": {
+            "events": 4343,
+            "l1": 0.019341469030623993,
+            "correct_percent": 98.0658530969376,
+            "max_error": 1
+          }
+        }
+      },
+      "signs": {
+        "parallel": {
+          "events": 4343,
+          "violations": 0
+        },
+        "perpendicular": {
+          "events": 575,
+          "violations": 3
+        }
+      }
+    },
+    "retained_fiber_percent": 100.0,
+    "geometry_width_metrics": "not applicable: no optimized geometry or widths",
+    "seconds_total": 12.864552557934076
+  }
+}

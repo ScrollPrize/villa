@@ -51,6 +51,9 @@ def bp_metrics(log):
 
 
 def run(config):
+    if 'fiber_min_flow_benchmark' in config:
+        from .fiber_min_flow_benchmark import run as run_min_flow
+        return run_min_flow(config['fiber_min_flow_benchmark'])
     if 'fiber_lasagna_surface' in config:
         from .fiber_lasagna_surface import run as surface_fit
         return surface_fit(config['fiber_lasagna_surface'])
