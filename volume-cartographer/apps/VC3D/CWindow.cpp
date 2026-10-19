@@ -141,7 +141,6 @@
 #include "FiberAnnotationController.hpp"
 #include "overlays/FiberOverlayController.hpp"
 #include "FiberCollectionController.hpp"
-#include "GraphDbController.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationDialog.hpp"
 #include "SurfaceTreeWidget.hpp"
@@ -2830,7 +2829,6 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _fiberOverlay = std::make_unique<FiberOverlayController>(this);
     _fiberOverlay->bindToViewerManager(_viewerManager.get());
     _fiberCollection = std::make_unique<FiberCollectionController>(_state, _viewerManager.get(), this, _lineAnnotationController.get());
-    _graphDb = std::make_unique<GraphDbController>();
     updateActiveWorkspaceViewerControls();
     if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
         _spiralWorkspace->viewerManager()->forEachBaseViewer(
@@ -9105,21 +9103,6 @@ bool CWindow::OpenVolume(const QString& path,
 void CWindow::openFiberCollection(const QString& path)
 {
     _fiberCollection->openCollection(path);
-}
-
-void CWindow::openObjectDb(const QString& path)
-{
-    if (path.trimmed().isEmpty())
-        return;
-    QString errorMessage;
-    if (!_graphDb->open(path, &errorMessage)) {
-        // Opt-in auxiliary feature: warn and continue without graph access.
-        Logger()->warn("Object DB: {}", errorMessage.toStdString());
-        onShowStatusMessage(errorMessage, 8000);
-        return;
-    }
-    Logger()->info("Object DB: opened read-only: {}", path.toStdString());
-    onShowStatusMessage(tr("Object database opened: %1").arg(path), 5000);
 }
 
 bool CWindow::openVolumePackage(const QString& path,

@@ -5,9 +5,7 @@
 //
 // Everything here runs on the Qt GUI thread: QLocalSocket delivers readyRead on
 // the main thread, so no extra thread is required and handlers may touch the UI
-// directly. Expensive graph queries defer their response and run on workers
-// holding a database handle, without touching UI objects. Handlers must never
-// spin a nested event loop (no dialog exec()).
+// directly. Handlers must never spin a nested event loop (no dialog exec()).
 
 #include <QByteArray>
 #include <QHash>
@@ -19,7 +17,6 @@
 #include <QStringList>
 
 #include <deque>
-#include <atomic>
 #include <functional>
 #include <optional>
 #include <vector>
@@ -90,7 +87,6 @@ private:
     void registerPointsHandlers();
     void registerSeedingHandlers();
     void registerSurfaceOpsHandlers();
-    void registerGraphHandlers();
     void registerMethod(AgentBridgeMethod method, Handler handler);
 
     // --- Discovery registry file (mirrors LasagnaServiceManager's
@@ -147,15 +143,6 @@ private:
     // (AgentBridgeHandlers_review.cpp); reads meta["tags"] without forcing a
     // heavy surface load.
     QJsonObject handleSegmentsReview(const QJsonValue& params);
-    // Unified graph DB (read-only, opt-in via --object-db /
-    // objects/db_path; AgentBridgeHandlers_graph.cpp). All throw
-    // -32000 when no object database is open.
-    QJsonObject deferGraphQuery(std::function<QJsonObject(const std::atomic_bool*)> query);
-    QJsonObject handleGraphStatus(const QJsonValue& params);
-    QJsonObject handleGraphObject(const QJsonValue& params);
-    QJsonObject handleGraphNeighbours(const QJsonValue& params);
-    QJsonObject handleGraphEdges(const QJsonValue& params);
-    QJsonObject handleGraphComponent(const QJsonValue& params);
     QJsonObject handleScreenshotCapture(const QJsonValue& params);
     QJsonObject handleCursorVolumePoint(const QJsonValue& params);
     QJsonObject handleCanvasClick(const QJsonValue& params, bool addShift);

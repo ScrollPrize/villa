@@ -383,13 +383,6 @@ auto main(int argc, char* argv[]) -> int
         "fiber-collection", "Attach a read-only Automated Fiber Volume (.afv) to the opened CT volume.", "path");
     parser.addOption(fiberCollectionOption);
 
-    QCommandLineOption objectDbOption(
-        "object-db",
-        "Open a unified object database (.vcobj) read-only (overrides the "
-        "objects/db_path setting; empty/unset keeps graph access off).",
-        "path");
-    parser.addOption(objectDbOption);
-
     QCommandLineOption debugOption(
         "debug",
         "Enable verbose diagnostic logging while loading surfaces.");
@@ -598,21 +591,6 @@ auto main(int argc, char* argv[]) -> int
 
         if (parser.isSet(fiberCollectionOption)) {
             aWin.openFiberCollection(parser.value(fiberCollectionOption).trimmed());
-        }
-
-        // Object DB (opt-in, off by default): CLI flag > objects/db_path
-        // setting > no graph access.
-        {
-            QString objectDbPath = parser.value(objectDbOption).trimmed();
-            if (objectDbPath.isEmpty()) {
-                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                objectDbPath = settings.value(vc3d::settings::objects::DB_PATH,
-                                             vc3d::settings::objects::DB_PATH_DEFAULT)
-                                  .toString()
-                                  .trimmed();
-            }
-            if (!objectDbPath.isEmpty())
-                aWin.openObjectDb(objectDbPath);
         }
 
         // Agent bridge (opt-in, off by default). Constructed only when a bridge

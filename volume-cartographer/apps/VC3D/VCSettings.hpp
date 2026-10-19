@@ -189,14 +189,6 @@ namespace atlas {
 }
 
 // -----------------------------------------------------------------------------
-// Object Database Settings (opt-in object store and relationship metadata; empty = off)
-// -----------------------------------------------------------------------------
-namespace objects {
-    constexpr auto DB_PATH = "objects/db_path";
-    constexpr auto DB_PATH_DEFAULT = "";
-} // namespace objects
-
-// -----------------------------------------------------------------------------
 // Performance Settings
 // -----------------------------------------------------------------------------
 namespace perf {
