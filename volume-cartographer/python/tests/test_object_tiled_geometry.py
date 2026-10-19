@@ -6,7 +6,7 @@ import struct
 
 import pytest
 from vc.objects import ObjectStore
-from test_object_spatial_regions import patch
+from object_helpers import patch
 from object_helpers import edge_choice, sqlite_rows
 
 

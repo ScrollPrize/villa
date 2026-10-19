@@ -1,6 +1,7 @@
 #include "internal/Schema.hpp"
 
 namespace vc::objects {
+using namespace detail;
 ObjectStore::ObjectStore(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
 ObjectStore::~ObjectStore() = default;
 ObjectStore::ObjectStore(ObjectStore&&) noexcept = default;

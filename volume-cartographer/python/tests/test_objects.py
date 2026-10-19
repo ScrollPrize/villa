@@ -4,24 +4,8 @@ import sqlite3
 import uuid
 from pathlib import Path
 import pytest
+from object_helpers import _geometry
 ObjectStore = pytest.importorskip("vc.objects").ObjectStore
-
-@pytest.fixture()
-def db_path(tmp_path):
-    return str(tmp_path / "objects.vcobj")
-
-@pytest.fixture()
-def db(db_path):
-    with ObjectStore.create(db_path, author="pytest", hostname="testhost") as store:
-        yield store
-
-def _geometry(kind="fiber", value=1.0):
-    import struct
-    return {"kind": kind, "arrays": [
-        {"name": "control_points", "dtype": "<f8", "shape": [0, 3], "data": b""},
-        {"name": "line_points", "dtype": "<f8", "shape": [1, 3],
-         "data": struct.pack("<ddd", value, 2.0, 3.0)}]}
-
 
 def _write_pcl_patch(path, rows, cols, z, scale=(1.0, 1.0)):
     import numpy as np

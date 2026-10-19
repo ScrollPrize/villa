@@ -1,5 +1,5 @@
-#include <set>
 #pragma once
+#include <set>
 #include <algorithm>
 #include <optional>
 #include <string>
@@ -15,6 +15,8 @@
 
 #include "vc/core/objects/GeometryIngest.hpp"
 #include "vc/core/objects/GeometryExport.hpp"
+#include "internal/Anchors.hpp"
+#include "internal/JsonFields.hpp"
 
 namespace nb = nanobind;
 namespace vo = vc::objects;
@@ -103,6 +105,7 @@ vo::Anchor anchorFromPy(const nb::handle& obj)
         std::array<double, 3> v{nb::cast<double>(seq[0]), nb::cast<double>(seq[1]), nb::cast<double>(seq[2])};
         if (std::string(key) == "position") a.position = v; else a.direction = v;
     }
+    vo::detail::validateAnchor(a);
     return a;
 }
 
@@ -228,9 +231,10 @@ vo::ObjectRecord objectFromPy(const nb::dict& d)
         det.gridHeight = getInt(p, "grid_height");
         if (has(p, "scale")) {
             const nb::object scale = p["scale"];
-            if (nb::isinstance<nb::float_>(scale) || nb::isinstance<nb::int_>(scale))
-                det.scale.fill(nb::cast<double>(scale));
-            else det.scale = nb::cast<std::array<double, 2>>(scale);
+            const auto value = nb::isinstance<nb::float_>(scale) || nb::isinstance<nb::int_>(scale)
+                ? nlohmann::json(nb::cast<double>(scale))
+                : nlohmann::json(nb::cast<std::array<double, 2>>(scale));
+            det.scale = vo::detail::scaleFromJson(value);
         }
         det.bbox = getBbox(p);
         r.patch = det;

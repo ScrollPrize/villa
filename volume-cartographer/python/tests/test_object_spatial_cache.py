@@ -5,8 +5,8 @@ import sqlite3
 
 import pytest
 from vc.objects import ObjectStore
-from test_object_spatial import db, track
-from test_object_spatial_regions import ALL, patch
+from object_helpers import track
+from object_helpers import ALL, patch
 
 
 @pytest.mark.parametrize("budget", [0, 1, 4096, 16 * 1024 * 1024])

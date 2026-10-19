@@ -31,10 +31,7 @@ Json readJson(const fs::path& path)
 }
 std::string uuid(const Json& data)
 {
-    auto value = data.at("uuid").get<std::string>();
-    if (!util::isUuid(value)) throw std::runtime_error("source has no valid UUID");
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-    return value;
+    return util::canonicalUuid(data.at("uuid").get<std::string>());
 }
 // Store explicit little-endian scalar bytes on every supported host.
 template<class T> GeometryArray array(std::string name, std::string dtype, std::vector<int64_t> shape, std::span<const T> values)
@@ -342,10 +339,10 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
                 else if (object.kind == "fiber") p = fiber(*path);
                 else if (object.kind == "point_collection") {
                     if (!pclCache.contains(*path)) pclCache[*path] = collections(*path);
-                    const auto& collections = pclCache.at(*path);
+                    auto& collections = pclCache.at(*path);
                     const auto found = std::find_if(collections.begin(), collections.end(), [&](const auto& c) { return c.object.uuid == object.uuid; });
                     if (found == collections.end()) throw std::runtime_error("collection disappeared");
-                    p = *found;
+                    p = std::move(*found);
                 } else throw std::runtime_error("unsupported object kind");
                 if (p.object.uuid != object.uuid) throw std::runtime_error("source UUID changed during ingestion");
             }

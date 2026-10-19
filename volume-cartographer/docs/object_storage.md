@@ -53,6 +53,22 @@ relationship set: no graph membership copies, explicit adoption, or independent
 graph revision selections. A stable store UUID identifies the database even
 when its file moves.
 
+## Source summaries and current geometry
+
+The `fiber`, `patch`, and `track` detail records are editable source/import
+annotations. Their counts, lengths, grid dimensions, scale, and bounding boxes
+are captured during ingestion. `put_geometry()` preserves these fields, just
+as it preserves names and other annotations; they are not computed views of the
+current revision. Re-ingestion refreshes the geometry summaries when publishing
+changed source geometry.
+
+For current geometry, use `current_geometry()` for array shapes and patch
+`attributes["scale"]`. `select_objects(bbox=...)` and `spatial_regions(...)` use
+the managed geometry's spatial bounds from the same transaction snapshot,
+regardless of the annotated boxes. Objects without managed geometry use their
+annotated boxes. Callers that maintain updated summary annotations can publish
+those metadata changes together with geometry in one write transaction.
+
 ## Ingesting geometry
 
 Build the importer and bindings with Ninja:

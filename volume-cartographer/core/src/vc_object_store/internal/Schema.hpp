@@ -1,7 +1,7 @@
 #pragma once
 #include "internal/Database.hpp"
 #include "internal/Spatial.hpp"
-namespace vc::objects { namespace {
+namespace vc::objects::detail {
 const char* kObjectSchema = R"SQL(CREATE TABLE objects(
   id INTEGER PRIMARY KEY,
   uuid BLOB NOT NULL UNIQUE,
@@ -171,4 +171,4 @@ void createSchema(sqlite3* db) {
 
 }
 
-} }
+} // namespace vc::objects::detail

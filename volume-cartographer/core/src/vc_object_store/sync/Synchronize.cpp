@@ -1,10 +1,12 @@
 #include "geometry/Dependencies.hpp"
 #include "internal/RecordJson.hpp"
+#include "internal/EdgeSql.hpp"
 #include "geometry/GeometryInternal.hpp"
 #include "sync/GeometryTransfer.hpp"
 #include "sync/Baselines.hpp"
 
 namespace vc::objects {
+using namespace detail;
 namespace {
 using Json = nlohmann::json;
 std::string hash(const std::string& text) {
@@ -204,9 +206,7 @@ SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& option
                 const auto target = at(merged, chosen.at(endpoint).get<std::string>());
                 if (!object(target)) conflict(id, "edge endpoint was deleted or is not an object");
             }
-            const auto identity = Json::array({"edge", chosen["kind"], chosen["a"], chosen["b"],
-                dependenciesToJson(anchorFromJson(chosen.at("a_anchor"))),
-                dependenciesToJson(anchorFromJson(chosen.at("b_anchor")))}).dump();
+            const auto identity = edgeIdentity(edgeFromJson(chosen));
             auto [it, added] = identities.emplace(identity, id);
             if (!added) conflict(id, "edge identity also belongs to " + it->second + "; resolve one duplicate to its absent side");
         }

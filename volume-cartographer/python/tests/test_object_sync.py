@@ -5,7 +5,7 @@ import sqlite3
 
 import pytest
 from vc.objects import ObjectStore
-from test_objects import _geometry
+from object_helpers import _geometry
 from object_helpers import edge_choice
 
 

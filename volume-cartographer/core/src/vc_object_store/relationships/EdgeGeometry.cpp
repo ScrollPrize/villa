@@ -2,6 +2,7 @@
 #include "geometry/Dependencies.hpp"
 
 namespace vc::objects {
+using namespace detail;
 void ObjectStore::repairEdgeGeometry(WriteTxn& txn, const EdgeGeometryRepair& repair)
 {
     detail::DependencyScope dependencyScope;
@@ -20,41 +21,27 @@ void ObjectStore::repairEdgeGeometry(WriteTxn& txn, const EdgeGeometryRepair& re
     for (const auto& [uuid, anchor] : {std::pair{edge->aUuid, a}, std::pair{edge->bUuid, b}})
         if (const auto revision = currentGeometry(txn, uuid))
             detail::validateDependencies(anchor, detail::dependencyGeometry(*this, txn, *revision));
-    for (const auto* anchor : {&a, &b}) {
-        for (const auto* vector : {&anchor->position, &anchor->direction})
-            if (*vector) for (double value : **vector)
-                if (!std::isfinite(value)) throw std::invalid_argument("geometry repair: anchors must be finite");
-    }
-    if (edge->aUuid == edge->bUuid) {
-        if (a.points.empty() || b.points.empty() || a.points.front() == b.points.front())
-            throw std::invalid_argument("geometry repair: self-edges require distinct point references");
-        if (dependenciesToJson(b).dump() < dependenciesToJson(a).dump()) std::swap(a, b);
-    }
-    auto same = [](const Anchor& x, const Anchor& y) {
-        return x.position == y.position && x.direction == y.direction &&
-            x.points == y.points && x.wholeGeometry == y.wholeGeometry;
-    };
+    auto normalized = *edge;
+    normalized.aAnchor = a; normalized.bAnchor = b;
+    canonicalizeEdge(normalized);
+    if (normalized.aUuid != edge->aUuid) swapEndpoints(normalized);
+    a = normalized.aAnchor; b = normalized.bAnchor;
     const auto state = edgeGeometryState(txn, repair.edgeUuid);
-    if (state.aRevision == aRevision && state.bRevision == bRevision && same(a, edge->aAnchor) && same(b, edge->bAnchor)) return;
+    if (state.aRevision == aRevision && state.bRevision == bRevision && a == edge->aAnchor && b == edge->bAnchor) return;
     const auto id = *edgeIdByUuid(db, parseUuid(repair.edgeUuid));
-    exec(db, "SAVEPOINT geometry_repair;");
-    try {
-        Statement anchors(db, "UPDATE edges SET a_anchor_x=?,a_anchor_y=?,a_anchor_z=?,a_dir_x=?,a_dir_y=?,a_dir_z=?,"
-            "b_anchor_x=?,b_anchor_y=?,b_anchor_z=?,b_dir_x=?,b_dir_y=?,b_dir_z=?,a_dependencies=?,b_dependencies=? WHERE id=?");
-        bindAnchor(anchors, 1, a); bindAnchor(anchors, 7, b);
-        anchors.bind(13, dependenciesToJson(a).dump()); anchors.bind(14, dependenciesToJson(b).dump());
-        anchors.bind(15, id); anchors.stepDone();
-        Statement binding(db, "INSERT INTO edge_geometry_bindings VALUES(?,?,?) ON CONFLICT(edge_id) DO UPDATE SET a_revision=excluded.a_revision,b_revision=excluded.b_revision");
-        binding.bind(1, id);
-        if (aRevision) binding.bindBlob(2, parseUuid(*aRevision)); else binding.bindNull(2);
-        if (bRevision) binding.bindBlob(3, parseUuid(*bRevision)); else binding.bindNull(3);
-        binding.stepDone();
-        stampContentChange(db, author(), hostname(), "edges", id, parseUuid(repair.edgeUuid), "geometry_repaired");
-        exec(db, "RELEASE geometry_repair;");
-    } catch (...) {
-        exec(db, "ROLLBACK TO geometry_repair; RELEASE geometry_repair;");
-        throw;
-    }
+    Savepoint savepoint(db);
+    Statement anchors(db, "UPDATE edges SET a_anchor_x=?,a_anchor_y=?,a_anchor_z=?,a_dir_x=?,a_dir_y=?,a_dir_z=?,"
+        "b_anchor_x=?,b_anchor_y=?,b_anchor_z=?,b_dir_x=?,b_dir_y=?,b_dir_z=?,a_dependencies=?,b_dependencies=? WHERE id=?");
+    bindAnchor(anchors, 1, a); bindAnchor(anchors, 7, b);
+    anchors.bind(13, dependenciesToJson(a).dump()); anchors.bind(14, dependenciesToJson(b).dump());
+    anchors.bind(15, id); anchors.stepDone();
+    Statement binding(db, "INSERT INTO edge_geometry_bindings VALUES(?,?,?) ON CONFLICT(edge_id) DO UPDATE SET a_revision=excluded.a_revision,b_revision=excluded.b_revision");
+    binding.bind(1, id);
+    if (aRevision) binding.bindBlob(2, parseUuid(*aRevision)); else binding.bindNull(2);
+    if (bRevision) binding.bindBlob(3, parseUuid(*bRevision)); else binding.bindNull(3);
+    binding.stepDone();
+    stampContentChange(db, author(), hostname(), "edges", id, parseUuid(repair.edgeUuid), "geometry_repaired");
+    savepoint.release();
 }
 
 EdgeGeometryState ObjectStore::edgeGeometryState(const Txn& txn, const std::string& edgeUuid) const

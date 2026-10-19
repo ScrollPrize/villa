@@ -5,19 +5,14 @@ import sqlite3
 import struct
 
 import pytest
+from object_helpers import patch
 from vc.objects import ObjectStore
-from test_object_spatial import db, track
+from object_helpers import ALL, track
 
 
-ALL = [-1e101] * 3 + [1e101] * 3
 
 
-def patch(rows, cols, points=None):
-    if points is None:
-        points = [(float(x), float(y), 1.) for y in range(rows) for x in range(cols)]
-    return dict(kind="patch", attributes={"scale": [1, 1]}, arrays=[dict(
-        name="points", dtype="<f4", shape=[rows, cols, 3],
-        data=struct.pack(f"<{len(points)*3}f", *(v for p in points for v in p)))])
+
 
 
 def regions(db, uid, bbox=ALL, **filters):

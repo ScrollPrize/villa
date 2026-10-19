@@ -397,3 +397,22 @@ TEST_CASE("discovery refuses to publish links if stored inputs change during com
     params.progress = {};
     CHECK(linkPatchOverlaps(db, params).edgesCreated == 0);
 }
+
+TEST_CASE("candidate identity canonicalizes UUID case and endpoint order")
+{
+    TempDir tmp("canonical_candidates");
+    auto db = makeDb(tmp.dir);
+    const auto a = addObject(db, "patch"), b = addObject(db, "patch");
+    auto upper = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return char(std::toupper(c)); });
+        return value;
+    };
+    const auto original = cand(a, b), reversed = cand(upper(b), upper(a));
+    const auto first = commitCandidates(db, "canonical", 1, {original, reversed});
+    CHECK(first.edgesCreated == 1);
+    CHECK(first.edgesSkippedExisting == 1);
+    const auto again = commitCandidates(db, "canonical", 1, {reversed});
+    CHECK(again.edgesCreated == 0);
+    CHECK(again.edgesSkippedExisting == 1);
+    CHECK(edgeCount(db, a) == 1);
+}

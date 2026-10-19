@@ -1,11 +1,13 @@
 #include "internal/RecordSql.hpp"
 
 namespace vc::objects {
+using namespace detail;
 void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, const std::string& state)
 {
     if (state != "pending" && state != "approved" && state != "rejected")
         throw std::runtime_error("object store: invalid approval state: " + state);
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
+    Savepoint savepoint(db);
     if (state == "approved" && edgeByUuid(txn, recordUuid) && edgeGeometryState(txn, recordUuid).stale)
         throw std::runtime_error("object store: explicitly update the relationship before approving stale geometry");
     const auto bytes = parseUuid(recordUuid);
@@ -41,6 +43,7 @@ void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, cons
     s.bind(6, id);
     s.stepDone();
     appendJournal(db, impl_->options.author, impl_->hostname, bytes, generation, "approval");
+    savepoint.release();
 }
 
 namespace {
@@ -48,6 +51,7 @@ namespace {
 void mutateMeta(sqlite3* db, const std::string& author, const std::string& host, const std::string& recordUuid,
                 const std::string& key, const std::optional<std::string>& jsonValue)
 {
+    Savepoint savepoint(db);
     if (key.empty()) throw std::runtime_error("object store: meta key must be non-empty");
     const auto bytes = parseUuid(recordUuid);
     const char* table = nullptr;
@@ -74,6 +78,7 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
         s.stepDone();
     }
     stampContentChange(db, author, host, table, id, bytes, "meta");
+    savepoint.release();
 }
 
 }  // namespace

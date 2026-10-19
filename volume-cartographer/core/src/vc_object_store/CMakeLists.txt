@@ -1,15 +1,23 @@
 # Primary SQLite object database; no dependency on vc_core or Qt.
 add_library(vc_objects STATIC
+    internal/Anchors.cpp
+    internal/Sqlite.cpp
+    internal/RecordSql.cpp
+    internal/EdgeSql.cpp
+    internal/RecordJson.cpp
+    internal/JsonFields.cpp
     Database.cpp
     Transactions.cpp
     Records.cpp
     Metadata.cpp
     SourcePaths.cpp
     Snapshots.cpp
+    Queries.cpp
     Spatial.cpp
     sync/Synchronize.cpp
     sync/GeometryTransfer.cpp
     geometry/Geometry.cpp
+    geometry/GeometryReader.cpp
     relationships/Edges.cpp
     relationships/Traversal.cpp
     relationships/EdgeGeometry.cpp

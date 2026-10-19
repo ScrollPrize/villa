@@ -37,7 +37,7 @@ with ObjectStore.create("objects.vcobj", author="reviewer") as store:
 
     patches = store.objects_by_kind("patch")
     seed = patches[0]["uuid"]
-    neighbours = store.neighbours(seed, edge_kinds=["same-surface"])
+    neighbours = store.neighbours(seed, edge_kind="same-surface")
     component = store.component(seed, edge_kinds=["same-surface"])
     for edge in store.edges_of(seed):
         store.set_meta(edge["uuid"], "review_note", "inspect this contact")
@@ -46,6 +46,9 @@ with ObjectStore.create("objects.vcobj", author="reviewer") as store:
 ```
 
 Names, tags, typed properties and native annotations belong to object metadata.
+Typed point counts, lengths, grid dimensions and boxes are source/import
+summaries; direct geometry edits preserve them. Read current array shapes and
+patch scale from `current_geometry()`, and current bounds through spatial queries.
 Edges hold relationship types, anchors, provenance, approvals, and endpoint
 geometry bindings. Source paths are ingestion hints; UUIDs identify records.
 Geometry-backed endpoints declare their exact point dependencies. Changing a

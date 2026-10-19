@@ -2,7 +2,7 @@
 #include "internal/RecordJson.hpp"
 #include "geometry/GeometryInternal.hpp"
 
-namespace vc::objects { namespace {
+namespace vc::objects::detail {
 using Json = nlohmann::json;
 
 struct SyncCursor { int64_t journal = 0, geometry = 0; };
@@ -143,4 +143,4 @@ void saveBaseline(sqlite3* db, const std::string& peer, const std::string& token
     Statement mark(db, "INSERT INTO sync_baseline_cursors VALUES(?,?,?)");
     mark.bind(1, int64_t(seq)); mark.bind(2, cursor.journal); mark.bind(3, cursor.geometry); mark.stepDone();
 }
-} }
+} // namespace vc::objects::detail

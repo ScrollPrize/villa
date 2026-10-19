@@ -1,6 +1,7 @@
 #include "internal/Database.hpp"
 
 namespace vc::objects {
+using namespace detail;
 Txn::Txn(Txn&& other) noexcept : db_(other.db_), handle_(other.handle_), write_(other.write_)
 {
     other.handle_ = nullptr;

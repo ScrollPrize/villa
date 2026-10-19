@@ -1,6 +1,7 @@
 #include "internal/EdgeSql.hpp"
 
 namespace vc::objects {
+using namespace detail;
 std::vector<std::string> ObjectStore::neighbours(const Txn& txn, const std::string& objectUuid,
                                              const std::optional<std::string>& edgeKind,
                                              const std::optional<std::string>& neighbourKind) const

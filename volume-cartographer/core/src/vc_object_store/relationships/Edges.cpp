@@ -2,6 +2,7 @@
 #include "geometry/Dependencies.hpp"
 
 namespace vc::objects {
+using namespace detail;
 std::string ObjectStore::addEdge(WriteTxn& txn, const EdgeRecord& record)
 {
     detail::DependencyScope dependencyScope;
@@ -18,44 +19,29 @@ void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
     const auto existing = edgeByUuid(txn, record.uuid);
     if (!existing) throw std::runtime_error("object store: edge not found: " + record.uuid);
     auto rec = record;
-    rec.aUuid = formatUuid(parseUuid(rec.aUuid));
-    rec.bUuid = formatUuid(parseUuid(rec.bUuid));
-    if ((rec.aUuid != rec.bUuid && rec.aUuid == existing->bUuid && rec.bUuid == existing->aUuid) ||
-        (rec.aUuid == rec.bUuid && dependenciesToJson(rec.bAnchor).dump() < dependenciesToJson(rec.aAnchor).dump())) {
-        std::swap(rec.aUuid, rec.bUuid); std::swap(rec.aAnchor, rec.bAnchor);
-    }
+    canonicalizeEdge(rec);
+    if (rec.aUuid != rec.bUuid && rec.aUuid == existing->bUuid && rec.bUuid == existing->aUuid)
+        swapEndpoints(rec);
     if (rec.kind != existing->kind || rec.aUuid != existing->aUuid || rec.bUuid != existing->bUuid)
         throw std::runtime_error("object store: edge kind and endpoints cannot change");
-    if (rec.aUuid == rec.bUuid && (rec.aAnchor.points.empty() || rec.bAnchor.points.empty() ||
-        rec.aAnchor.points.front() == rec.bAnchor.points.front()))
-        throw std::invalid_argument("object store: self-edges require two distinct point references");
     for (const auto& [uuid, anchor] : {std::pair{rec.aUuid, rec.aAnchor}, std::pair{rec.bUuid, rec.bAnchor}})
         if (const auto revision = currentGeometry(txn, uuid))
             detail::validateDependencies(anchor, detail::dependencyGeometry(*this, txn, *revision));
-    auto sameAnchor = [](const Anchor& a, const Anchor& b) {
-        return a.position == b.position && a.direction == b.direction &&
-            a.points == b.points && a.wholeGeometry == b.wholeGeometry;
-    };
     std::sort(rec.tags.begin(), rec.tags.end());
     rec.tags.erase(std::unique(rec.tags.begin(), rec.tags.end()), rec.tags.end());
-    if (sameAnchor(rec.aAnchor, existing->aAnchor) && sameAnchor(rec.bAnchor, existing->bAnchor) &&
+    if (rec.aAnchor == existing->aAnchor && rec.bAnchor == existing->bAnchor &&
         rec.tags == existing->tags && nlohmann::json::parse(rec.meta) == nlohmann::json::parse(existing->meta)) return;
     const auto id = *edgeIdByUuid(db, parseUuid(rec.uuid));
-    exec(db, "SAVEPOINT edge_refresh;");
-    try {
-        Statement s(db, "UPDATE edges SET a_anchor_x=?,a_anchor_y=?,a_anchor_z=?,a_dir_x=?,a_dir_y=?,a_dir_z=?,"
-            "b_anchor_x=?,b_anchor_y=?,b_anchor_z=?,b_dir_x=?,b_dir_y=?,b_dir_z=?,meta=?,a_dependencies=?,b_dependencies=? WHERE id=?");
-        bindAnchor(s, 1, rec.aAnchor); bindAnchor(s, 7, rec.bAnchor);
-        s.bind(13, rec.meta);
-        s.bind(14, dependenciesToJson(rec.aAnchor).dump()); s.bind(15, dependenciesToJson(rec.bAnchor).dump());
-        s.bind(16, id); s.stepDone();
-        writeTags(db, "edge_tags", "edge_id", id, rec.tags);
-        stampContentChange(db, author(), hostname(), "edges", id, parseUuid(rec.uuid), "update_edge");
-        exec(db, "RELEASE edge_refresh;");
-    } catch (...) {
-        exec(db, "ROLLBACK TO edge_refresh; RELEASE edge_refresh;");
-        throw;
-    }
+    Savepoint savepoint(db);
+    Statement s(db, "UPDATE edges SET a_anchor_x=?,a_anchor_y=?,a_anchor_z=?,a_dir_x=?,a_dir_y=?,a_dir_z=?,"
+        "b_anchor_x=?,b_anchor_y=?,b_anchor_z=?,b_dir_x=?,b_dir_y=?,b_dir_z=?,meta=?,a_dependencies=?,b_dependencies=? WHERE id=?");
+    bindAnchor(s, 1, rec.aAnchor); bindAnchor(s, 7, rec.bAnchor);
+    s.bind(13, rec.meta);
+    s.bind(14, dependenciesToJson(rec.aAnchor).dump()); s.bind(15, dependenciesToJson(rec.bAnchor).dump());
+    s.bind(16, id); s.stepDone();
+    writeTags(db, "edge_tags", "edge_id", id, rec.tags);
+    stampContentChange(db, author(), hostname(), "edges", id, parseUuid(rec.uuid), "update_edge");
+    savepoint.release();
 }
 
 std::optional<EdgeRecord> ObjectStore::edgeByUuid(const Txn& txn, const std::string& uuid) const
@@ -70,6 +56,7 @@ std::optional<EdgeRecord> ObjectStore::edgeByUuid(const Txn& txn, const std::str
 void ObjectStore::removeEdge(WriteTxn& txn, const std::string& uuid)
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
+    Savepoint savepoint(db);
     const auto bytes = parseUuid(uuid);
     auto id = edgeIdByUuid(db, bytes);
     if (!id) throw std::runtime_error("object store: edge not found: " + uuid);
@@ -77,6 +64,7 @@ void ObjectStore::removeEdge(WriteTxn& txn, const std::string& uuid)
     s.bind(1, *id);
     s.stepDone();
     appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "remove_edge");
+    savepoint.release();
 }
 
 std::vector<EdgeRecord> ObjectStore::edgesOf(const Txn& txn, const std::string& objectUuid) const
@@ -87,9 +75,7 @@ std::vector<EdgeRecord> ObjectStore::edgesOf(const Txn& txn, const std::string& 
     Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE a_id=? OR b_id=? ORDER BY id");
     s.bind(1, *id);
     s.bind(2, *id);
-    std::vector<EdgeRecord> out;
-    while (s.row()) out.push_back(readEdgeRow(db, s));
-    return out;
+    return readEdgeRows(db, s);
 }
 
 std::vector<EdgeRecord> ObjectStore::edgesByKind(const Txn& txn, const std::string& edgeKind) const
@@ -97,9 +83,7 @@ std::vector<EdgeRecord> ObjectStore::edgesByKind(const Txn& txn, const std::stri
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE kind=? ORDER BY id");
     s.bind(1, edgeKind);
-    std::vector<EdgeRecord> out;
-    while (s.row()) out.push_back(readEdgeRow(db, s));
-    return out;
+    return readEdgeRows(db, s);
 }
 
 } // namespace vc::objects

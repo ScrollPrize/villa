@@ -16,6 +16,11 @@
 
 namespace vc::objects {
 
+// Typed detail fields are editable source/import annotations. Counts, lengths,
+// dimensions and boxes are summaries captured at ingestion, not live views of
+// managed geometry. Use currentGeometry() for current array shapes/patch scale,
+// and selectObjects()/spatialRegions() for revision-consistent spatial bounds.
+// putGeometry() deliberately does not overwrite these annotations.
 struct FiberDetail {
     std::string family;          // "H", "V", or "" (unset)
     bool manualFamily = false;
@@ -88,6 +93,7 @@ struct Anchor {
     // direction/interpolated anchor. Empty means unknown, not independent.
     std::vector<PointReference> points;
     bool wholeGeometry = false; // explicit object-wide relationship
+    bool operator==(const Anchor&) const = default;
 };
 
 struct EdgeRecord : RecordCommon {

@@ -11,18 +11,13 @@ std::vector<objects::ObjectRecord> StoredGeometry::select(const std::string& kin
     const std::vector<std::string>& uuids)
 {
     std::set<std::string> requested;
-    for (auto uuid : uuids) {
-        if (!util::isUuid(uuid)) throw std::invalid_argument("invalid object UUID: " + uuid);
-        std::transform(uuid.begin(), uuid.end(), uuid.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-        requested.insert(std::move(uuid));
-    }
-    auto objects = db_.objectsByKind(read_, kind);
-    if (!requested.empty()) {
-        std::erase_if(objects, [&](const auto& o) { return !requested.contains(o.uuid); });
-        if (objects.size() != requested.size())
-            throw std::invalid_argument("requested objects are missing or not of kind " + kind);
-    }
-    std::sort(objects.begin(), objects.end(), [](const auto& a, const auto& b) { return a.uuid < b.uuid; });
+    for (const auto& uuid : uuids) requested.insert(util::canonicalUuid(uuid));
+    objects::ObjectSelection selection;
+    selection.kind = kind;
+    selection.uuids.assign(requested.begin(), requested.end());
+    auto objects = db_.selectObjects(read_, selection);
+    if (!requested.empty() && objects.size() != requested.size())
+        throw std::invalid_argument("requested objects are missing or not of kind " + kind);
     for (const auto& object : objects) generations_[object.uuid] = object.generation;
     return objects;
 }
@@ -61,9 +56,11 @@ std::shared_ptr<QuadSurface> patchSurface(const objects::detail::GeometrySnapsho
         descriptor->shape[0] < 2 || descriptor->shape[1] < 2 ||
         descriptor->shape[0] > INT_MAX || descriptor->shape[1] > INT_MAX)
         throw std::runtime_error("patch discovery requires a grid of at least 2 by 2 points");
-    const auto xyz = geometry.values<float>("points");
     cv::Mat_<cv::Vec3f> points(int(descriptor->shape[0]), int(descriptor->shape[1]));
-    for (size_t i = 0; i < points.total(); ++i) points.ptr<cv::Vec3f>()[i] = {xyz[3*i], xyz[3*i+1], xyz[3*i+2]};
+    geometry.copyValues<float>("points", {reinterpret_cast<float*>(points.data), points.total() * 3});
+    for (const auto& point : points)
+        for (float value : point.val)
+            if (!std::isfinite(value)) throw std::runtime_error("geometry requires finite coordinates");
     const auto scale = nlohmann::json::parse(geometry.revision.attributes).at("scale").get<std::array<float, 2>>();
     if (!(scale[0] > 0 && scale[1] > 0) || !std::isfinite(scale[0]) || !std::isfinite(scale[1]))
         throw std::runtime_error("invalid stored patch scale");

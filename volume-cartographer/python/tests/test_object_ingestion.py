@@ -6,7 +6,7 @@ import uuid
 import pytest
 from vc.objects import ObjectStore
 from object_helpers import edge_choice
-from test_objects import db, db_path, _geometry
+from object_helpers import _geometry
 
 
 def fiber(uid, branches=()):

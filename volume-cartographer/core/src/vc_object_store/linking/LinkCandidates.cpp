@@ -1,4 +1,5 @@
 #include "linking/StoredGeometry.hpp"
+#include "internal/Anchors.hpp"
 #include "vc/core/object_links/ObjectLinks.hpp"
 
 #include <algorithm>
@@ -13,32 +14,17 @@ namespace {
 
 using objects::EdgeRecord;
 
-std::string anchorKey(const std::string& uuid, const objects::Anchor& anchor)
-{
-    nlohmann::json points = nlohmann::json::array();
-    for (const auto& point : anchor.points) points.push_back({{"array", point.array}, {"index", point.index}});
-    return uuid + "#" + nlohmann::json{{"whole_geometry", anchor.wholeGeometry}, {"points", points}}.dump();
-}
-
-// Order-independent identity of a (kind, endpoints, point dependencies)
-// triple, matching vc_objects's uniqueness scopes.
-std::string candidateKey(const std::string& kind, const std::string& aUuid, const objects::Anchor& aAnchor,
-                         const std::string& bUuid, const objects::Anchor& bAnchor)
-{
-    std::string first = anchorKey(aUuid, aAnchor);
-    std::string second = anchorKey(bUuid, bAnchor);
-    if (second < first) std::swap(first, second);
-    return kind + "|" + first + "|" + second;
-}
-
 std::string candidateKey(const LinkCandidate& c)
 {
-    return candidateKey(c.kind, c.aUuid, c.aAnchor, c.bUuid, c.bAnchor);
+    EdgeRecord edge;
+    edge.kind = c.kind; edge.aUuid = c.aUuid; edge.bUuid = c.bUuid;
+    edge.aAnchor = c.aAnchor; edge.bAnchor = c.bAnchor;
+    return objects::detail::edgeIdentity(std::move(edge));
 }
 
 std::string candidateKey(const EdgeRecord& e)
 {
-    return candidateKey(e.kind, e.aUuid, e.aAnchor, e.bUuid, e.bAnchor);
+    return objects::detail::edgeIdentity(e);
 }
 
 bool isDetectorsOwnEdge(const EdgeRecord& e, const std::string& detectorName)

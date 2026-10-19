@@ -226,3 +226,41 @@ def test_object_edge_uuids_share_namespace(db):
 
 
 
+
+
+def test_caught_upsert_failure_preserves_record_details_approval_and_journal(db):
+    uid = db.upsert_object(dict(kind="track", name="original", tags=["keep"],
+        track=dict(dataset_ref="tracks", external_key="one", bbox=[1, 2, 3, 4, 5, 6])))
+    other = db.upsert_object(dict(kind="track", track=dict(dataset_ref="tracks", external_key="two")))
+    db.set_approval(uid, "approved")
+    before = db.object(uid)
+    journal = db.journal_since()
+    with db.write() as tx:
+        # The uniqueness failure occurs after the old detail row was deleted.
+        with pytest.raises(RuntimeError):
+            tx.upsert_object(dict(before, name="must roll back",
+                track=dict(before["track"], external_key="two")))
+        with pytest.raises(RuntimeError):
+            tx.upsert_object(dict(kind="fiber", patch={"grid_width": 4}))
+        tx.set_meta(other, "continued", True)
+    assert db.object(uid) == before
+    assert db.object_count("fiber") == 0
+    assert db.object(other)["meta"] == {"continued": True}
+    assert db.journal_since()[:-1] == journal
+    assert [r["uuid"] for r in db.select_objects(bbox=[1, 2, 3, 4, 5, 6], fields=[])] == [uid]
+
+
+@pytest.mark.parametrize("field", ["position", "direction"])
+def test_anchor_vector_validation_matches_python_and_json_import(db, tmp_path, field):
+    a = db.upsert_object(dict(kind="patch"))
+    b = db.upsert_object(dict(kind="patch"))
+    with pytest.raises(RuntimeError, match="3 numbers"):
+        db.add_edge(dict(kind="contact", a=a, b=b, a_anchor={field: [1, 2]}))
+    db.add_edge(dict(kind="contact", a=a, b=b))
+    document = json.loads(db.export_json())
+    document["edges"][0]["a_anchor"][field] = [1, 2]
+    with ObjectStore.create(str(tmp_path / "import.vcobj"), author="test") as imported:
+        with pytest.raises(ValueError, match="3 numbers"):
+            imported.import_json(json.dumps(document))
+        assert imported.object_count("patch") == 0
+        assert imported.journal_since() == []

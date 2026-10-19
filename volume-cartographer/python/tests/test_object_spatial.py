@@ -6,19 +6,9 @@ import sqlite3
 import struct
 
 import pytest
+from object_helpers import track
 from vc.objects import ObjectStore
 from object_helpers import remove_spatial_schema
-
-
-@pytest.fixture()
-def db(tmp_path):
-    with ObjectStore.create(str(tmp_path / "spatial.vcobj"), author="test") as store:
-        yield store
-
-
-def track(points):
-    return dict(kind="track", arrays=[dict(name="points", dtype="<i4", shape=[len(points), 3],
-                data=struct.pack(f"<{len(points)*3}i", *(v for p in points for v in p)))])
 
 
 def identities(db, bbox, **kwargs):

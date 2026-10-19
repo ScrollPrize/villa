@@ -579,3 +579,30 @@ TEST_CASE("traversal cancellation via atomic flag")
     CHECK_THROWS_AS(db.reachableWithin(r, a, 5, {}, &cancel), std::runtime_error);
 }
 
+
+TEST_CASE("all edge mutation paths reject nonfinite anchors without changing records")
+{
+    TempDir tmp("finite_anchors");
+    auto db = ObjectStore::create(tmp.dir / "objects.vcobj", testOptions());
+    const auto a = addObject(db, "patch"), b = addObject(db, "patch");
+    const auto id = addEdge(db, makeEdge(a, b));
+    auto txn = db.write();
+    const auto original = *db.edgeByUuid(txn, id);
+    const auto journalSize = db.journalSince(txn, 0).size();
+    for (double invalid : {std::numeric_limits<double>::infinity(), std::numeric_limits<double>::quiet_NaN()}) {
+        auto edge = original;
+        edge.aAnchor.position = std::array<double, 3>{invalid, 1, 2};
+        CHECK_THROWS_AS(db.updateEdge(txn, edge), std::invalid_argument);
+        edge.uuid.clear();
+        CHECK_THROWS_AS(db.addEdge(txn, edge), std::invalid_argument);
+        EdgeGeometryRepair repair;
+        repair.edgeUuid = id; repair.expectedGeneration = original.generation;
+        repair.aAnchor = edge.aAnchor; repair.bAnchor = edge.bAnchor;
+        CHECK_THROWS_AS(db.repairEdgeGeometry(txn, repair), std::invalid_argument);
+    }
+    CHECK(db.edgeByUuid(txn, id)->generation == original.generation);
+    CHECK(db.edgeByUuid(txn, id)->aAnchor == original.aAnchor);
+    CHECK(db.journalSince(txn, 0).size() == journalSize);
+    db.setMeta(txn, a, "continued", "true");
+    txn.commit();
+}

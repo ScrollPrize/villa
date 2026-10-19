@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <algorithm>
+#include <stdexcept>
 #include <cctype>
 #include <random>
 #include <string>
@@ -18,6 +20,13 @@ inline bool isUuid(const std::string& value)
         }
     }
     return true;
+}
+
+inline std::string canonicalUuid(std::string value)
+{
+    if (!isUuid(value)) throw std::invalid_argument("invalid UUID: " + value);
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    return value;
 }
 
 inline std::string newUuid()

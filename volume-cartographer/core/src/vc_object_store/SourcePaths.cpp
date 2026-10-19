@@ -1,6 +1,7 @@
 #include "internal/RecordSql.hpp"
 
 namespace vc::objects {
+using namespace detail;
 std::optional<std::filesystem::path> ObjectStore::resolveStoragePath(
     const Txn& txn, const std::string& objectUuid,
     const std::optional<std::filesystem::path>& datasetRoot) const
