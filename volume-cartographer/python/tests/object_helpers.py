@@ -13,14 +13,6 @@ def sqlite_rows(path, statement, parameters=()):
         [sys.executable, '-c', code, str(path), statement, json.dumps(parameters)], text=True))
 
 
-def sqlite_backup(source, destination):
-    """Copy a live native store without disturbing its SQLite file locks."""
-    code = ("import sqlite3,sys; "
-            "s=sqlite3.connect(sys.argv[1]); d=sqlite3.connect(sys.argv[2]); "
-            "s.backup(d); d.close(); s.close()")
-    subprocess.run([sys.executable, '-c', code, str(source), str(destination)], check=True)
-
-
 def remove_spatial_schema(sql):
     """Restore the pre-v4 schema for migration fixtures, including its indexes."""
     sql.execute("DROP TABLE object_bounds")  # Also drops its maintenance triggers.

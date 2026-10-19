@@ -7,13 +7,11 @@ Run against the built module with
 from __future__ import annotations
 
 import json
-import sqlite3
 import uuid
-from pathlib import Path
 
 import pytest
 
-ObjectStore = pytest.importorskip("vc.objects").ObjectStore
+from vc.objects import ObjectStore
 
 
 def test_snapshot_preserves_provenance_and_conflicts_are_atomic(db, tmp_path):
@@ -71,7 +69,6 @@ def test_approval_journal_keeps_decisions_and_stamps(db, kind):
         assert entry["approved_generation"] == 1
     assert entries[-1]["generation"] == 2
     assert entries[-1]["approved_by"] is None
-
 
 
 def test_object_and_edge_roundtrip(db) -> None:
@@ -137,61 +134,6 @@ def test_kinds_are_data_not_api(db) -> None:
         db.upsert_object({"name": "kindless"})
 
 
-def test_approval_and_meta(db) -> None:
-    uuid = db.upsert_object({"kind": "fiber", "name": "f"})
-    db.set_approval(uuid, "approved")
-    obj = db.object(uuid)
-    assert obj["approval_state"] == "approved"
-    assert obj["approved_by"] == "pytest"
-    assert obj["approved_host"] == "testhost"
-    assert obj["generation"] == 1
-
-    db.set_meta(uuid, "review.note", {"text": "ok", "score": 3})
-    obj = db.object(uuid)
-    assert obj["approval_state"] == "pending"  # content change resets approval
-    assert obj["generation"] == 2
-    assert obj["meta"] == {"review.note": {"text": "ok", "score": 3}}
-    db.remove_meta(uuid, "review.note")
-    assert db.object(uuid)["meta"] == {}
-
-
-def test_write_transaction_commit_and_rollback(db) -> None:
-    with db.write() as w:
-        kept = w.upsert_object({"kind": "fiber", "name": "kept"})
-    assert db.object(kept) is not None
-
-    with pytest.raises(RuntimeError):
-        with db.write() as w:
-            w.upsert_object({"kind": "fiber", "name": "dropped"})
-            raise RuntimeError("boom")
-    assert [o["name"] for o in db.objects_by_kind("fiber")] == ["kept"]
-
-
-def test_reopen_read_only_and_export(db_path: str) -> None:
-    with ObjectStore.create(db_path, author="pytest") as db:
-        a = db.upsert_object({"kind": "fiber", "name": "a"})
-        b = db.upsert_object({"kind": "patch", "name": "b"})
-        db.add_edge({"a": a, "b": b, "kind": "same-surface"})
-        exported = db.export_json()
-    doc = json.loads(exported)
-    assert doc["format"] == "vc_object_metadata"
-    assert len(doc["objects"]) == 2 and len(doc["edges"]) == 1
-
-    with ObjectStore.open(db_path, read_only=True) as db:
-        assert len(db.objects_by_kind("fiber")) == 1
-        with pytest.raises(RuntimeError):
-            db.upsert_object({"kind": "fiber", "name": "nope"})
-
-    fresh = str(Path(db_path).with_name("copy.vcobj"))
-    with ObjectStore.create(fresh, author="pytest") as db:
-        db.import_json(exported)
-        assert len(db.objects_by_kind("patch")) == 1
-
-
-
-
-
-
 def test_object_edge_uuids_share_namespace(db):
     a = db.upsert_object({"kind": "fiber", "uuid": "abcdefab-1111-4111-8111-111111111111"})
     b = db.upsert_object({"kind": "fiber"})
@@ -208,9 +150,6 @@ def test_object_edge_uuids_share_namespace(db):
     assert db.edge(edge)["approval_state"] == "approved"
     assert db.object(a)["approval_state"] == "pending"
     assert db.neighbours(a.upper()) == [b]
-
-
-
 
 
 def test_caught_upsert_failure_preserves_record_details_approval_and_journal(db):
@@ -249,3 +188,37 @@ def test_anchor_vector_validation_matches_python_and_json_import(db, tmp_path, f
             imported.import_json(json.dumps(document))
         assert imported.object_count("patch") == 0
         assert imported.journal_since() == []
+
+
+@pytest.mark.parametrize('edge', [False, True])
+def test_unchanged_metadata_preserves_approval_and_journal(db, edge):
+    a = db.upsert_object(dict(kind='note'))
+    b = db.upsert_object(dict(kind='note'))
+    record = db.add_edge(dict(kind='link', a=a, b=b)) if edge else a
+    read = db.edge if edge else db.object
+    db.set_meta(record, 'nested.key', {'a': 1, 'b': [None, False]})
+    db.set_approval(record, 'approved')
+    before = read(record), db.journal_since()
+    db.set_meta(record, 'nested.key', {'b': [None, False], 'a': 1})
+    db.remove_meta(record, 'missing')
+    assert (read(record), db.journal_since()) == before
+    db.set_meta(record, 'null', None)  # missing != null
+    assert read(record)['generation'] == before[0]['generation'] + 1
+    assert read(record)['approval_state'] == 'pending'
+    db.set_meta(record, 'null', None)
+    assert read(record)['generation'] == before[0]['generation'] + 1
+    db.remove_meta(record, 'null')
+    assert read(record)['generation'] == before[0]['generation'] + 2
+
+
+def test_bulk_metadata_atomicity_and_null(db):
+    a = db.upsert_object(dict(kind='note'))
+    before = db.object(a), db.journal_since()
+    with pytest.raises(RuntimeError, match='not found'):
+        db.set_meta_many([(a, 'key', 1), (str(uuid.uuid4()), 'key', 2)])
+    assert (db.object(a), db.journal_since()) == before
+    db.set_meta_many([(a, 'key', None), (a, 'other', {'x': 1})])
+    assert db.object(a)['meta'] == {'key': None, 'other': {'x': 1}}
+    with db.write() as tx:
+        tx.set_meta(a, 'other', None)
+    assert db.object(a)['meta']['other'] is None

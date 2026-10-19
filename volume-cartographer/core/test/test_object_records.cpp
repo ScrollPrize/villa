@@ -7,7 +7,6 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
-#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -127,154 +126,6 @@ TEST_CASE("create, open, and validation")
     }
 }
 
-TEST_CASE("object CRUD stamps, generation, journal, kinds as data")
-{
-    TempDir tmp("crud");
-    auto db = ObjectStore::create(tmp.dir / "objects.vcobj", testOptions());
-
-    ObjectRecord fiber = makeObject("fiber", "f1");
-    fiber.tags = {"reviewed", "h"};
-    FiberDetail fd;
-    fd.family = "H";
-    fd.controlPointCount = 3;
-    fiber.fiber = fd;
-    std::string uuid;
-    {
-        auto w = db.write();
-        uuid = db.upsertObject(w, fiber);
-        w.commit();
-    }
-    ObjectRecord got = getObject(db, uuid);
-    CHECK(got.kind == "fiber");
-    CHECK(got.generation == 1);
-    CHECK(got.createdBy == "tester");
-    CHECK(got.createdHost == "testhost");
-    CHECK(got.changedHost == "testhost");
-    CHECK(got.approvalState == "pending");
-    CHECK(got.tags.size() == 2);
-    REQUIRE(got.fiber.has_value());
-    CHECK(got.fiber->family == "H");
-    CHECK(got.fiber->controlPointCount == 3);
-
-    // Update bumps generation exactly once and restamps changed_* only.
-    got.name = "renamed";
-    {
-        auto w = db.write();
-        db.upsertObject(w, got);
-        w.commit();
-    }
-    ObjectRecord updated = getObject(db, uuid);
-    CHECK(updated.generation == 2);
-    CHECK(updated.name == "renamed");
-    CHECK(updated.createdAt == got.createdAt);
-
-    // Rolled-back transaction changes nothing.
-    {
-        auto w = db.write();
-        ObjectRecord edit = updated;
-        edit.name = "never";
-        db.upsertObject(w, edit);
-    }  // no commit = rollback
-    CHECK(getObject(db, uuid).name == "renamed");
-    CHECK(getObject(db, uuid).generation == 2);
-
-    // Kinds are data: a made-up kind with no detail table round-trips
-    // through the same generic calls.
-    const std::string odd = addObject(db, "widget", "w1");
-    CHECK(getObject(db, odd).kind == "widget");
-
-    // Empty kind and kind changes are refused.
-    {
-        auto w = db.write();
-        ObjectRecord bad = makeObject("", "x");
-        CHECK_THROWS(db.upsertObject(w, bad));
-    }
-    {
-        auto w = db.write();
-        ObjectRecord edit = updated;
-        edit.kind = "patch";
-        CHECK_THROWS(db.upsertObject(w, edit));
-    }
-
-    // Journal records the full generation stamps.
-    {
-        auto r = db.read();
-        auto entries = db.journalSince(r, 0);
-        REQUIRE(entries.size() >= 3);
-        CHECK(entries[0].recordUuid == uuid);
-        CHECK(entries[0].author == "tester");
-        CHECK(entries[0].hostname == "testhost");
-        CHECK(entries[0].generation == 1);
-        CHECK(entries[1].generation == 2);
-    }
-}
-
-TEST_CASE("approval lifecycle and open-ended metadata")
-{
-    TempDir tmp("approval");
-    auto db = ObjectStore::create(tmp.dir / "objects.vcobj", testOptions());
-    const std::string uuid = addObject(db, "fiber", "f");
-
-    {
-        auto w = db.write();
-        db.setApproval(w, uuid, "approved");
-        w.commit();
-    }
-    ObjectRecord got = getObject(db, uuid);
-    CHECK(got.approvalState == "approved");
-    CHECK(got.approvedBy == "tester");
-    CHECK(got.approvedHost == "testhost");
-    CHECK(got.approvedGeneration == 1);
-    CHECK(got.generation == 1);  // approving does not bump generation
-
-    // A content change (here setMeta) bumps generation and resets approval.
-    {
-        auto w = db.write();
-        db.setMeta(w, uuid, "review.note", "\"looks good\"");
-        db.setMeta(w, uuid, "score", "7");
-        w.commit();
-    }
-    got = getObject(db, uuid);
-    CHECK(got.approvalState == "pending");
-    CHECK(got.approvedBy == std::nullopt);
-    CHECK(got.generation == 3);  // one bump per setMeta call
-    CHECK(got.meta.find("review.note") != std::string::npos);
-    CHECK(got.meta.find("looks good") != std::string::npos);
-
-    // Removing one key leaves the others alone.
-    {
-        auto w = db.write();
-        db.removeMeta(w, uuid, "score");
-        w.commit();
-    }
-    got = getObject(db, uuid);
-    CHECK(got.meta.find("score") == std::string::npos);
-    CHECK(got.meta.find("review.note") != std::string::npos);
-
-    // Invalid meta JSON value and invalid approval state are refused.
-    {
-        auto w = db.write();
-        CHECK_THROWS(db.setMeta(w, uuid, "k", "not json"));
-    }
-    {
-        auto w = db.write();
-        CHECK_THROWS(db.setApproval(w, uuid, "maybe"));
-    }
-    // The failed setMeta's transaction rolled back: no stray generation bump
-    // beyond the removeMeta one (generation was 4 after removeMeta).
-    CHECK(getObject(db, uuid).generation == 4);
-
-    // Approval filtering on listing calls.
-    {
-        auto w = db.write();
-        db.setApproval(w, uuid, "rejected");
-        w.commit();
-    }
-    auto r = db.read();
-    CHECK(db.objectsByKind(r, "fiber", "rejected").size() == 1);
-    CHECK(db.objectsByKind(r, "fiber", "approved").empty());
-}
-
 TEST_CASE("edges: canonicalisation, anchors, uniqueness")
 {
     TempDir tmp("edges");
@@ -341,68 +192,6 @@ TEST_CASE("edges: canonicalisation, anchors, uniqueness")
     }
     auto r = db.read();
     CHECK(!db.objectByUuid(r, b).has_value());
-}
-
-TEST_CASE("traversal crosses object kinds and filters by edge kind")
-{
-    TempDir tmp("traversal");
-    auto db = ObjectStore::create(tmp.dir / "objects.vcobj", testOptions());
-    const std::string f1 = addObject(db, "fiber");
-    const std::string p1 = addObject(db, "patch");
-    const std::string f2 = addObject(db, "fiber");
-    const std::string lonely = addObject(db, "track");
-    addEdge(db, makeEdge(f1, p1, "same-surface"));
-    addEdge(db, makeEdge(p1, f2, "same-surface"));
-    addEdge(db, makeEdge(f1, f2, "weak-hint"));  // cycle + differently-kinded edge
-
-    auto r = db.read();
-    const auto component = db.componentOf(r, f1);
-    CHECK(component.size() == 3);
-    CHECK(std::set<std::string>(component.begin(), component.end()).count(p1) == 1);
-    CHECK(db.componentOf(r, lonely).size() == 1);
-    // Filtering to one edge kind isolates f1<->f2 from the patch path only
-    // if we exclude same-surface; with only weak-hint, p1 drops out.
-    const auto weak = db.componentOf(r, f1, {"weak-hint"});
-    CHECK(weak.size() == 2);
-    CHECK(std::set<std::string>(weak.begin(), weak.end()).count(p1) == 0);
-    CHECK(db.reachableWithin(r, f1, 0).size() == 1);
-    CHECK(db.reachableWithin(r, f1, 1).size() == 3);
-    CHECK(db.neighbours(r, p1).size() == 2);
-    CHECK(db.neighbours(r, p1, std::nullopt, "fiber").size() == 2);
-    CHECK(db.neighbours(r, p1, std::nullopt, "track").empty());
-}
-
-TEST_CASE("export and re-import preserve the graph")
-{
-    TempDir tmp("export");
-    auto db = ObjectStore::create(tmp.dir / "a.vcobj", testOptions());
-    const std::string a = addObject(db, "fiber", "a");
-    const std::string b = addObject(db, "patch", "b");
-    const std::string e = addEdge(db, makeEdge(a, b, "same-surface"));
-    {
-        auto w = db.write();
-        db.setApproval(w, e, "approved");
-        w.commit();
-    }
-    std::string json;
-    {
-        auto r = db.read();
-        json = db.exportJson(r);
-    }
-    auto db2 = ObjectStore::create(tmp.dir / "b.vcobj", testOptions());
-    {
-        auto w = db2.write();
-        db2.importJson(w, json);
-        w.commit();
-    }
-    auto r = db2.read();
-    REQUIRE(db2.objectByUuid(r, a).has_value());
-    REQUIRE(db2.objectByUuid(r, b).has_value());
-    auto edge = db2.edgeByUuid(r, e);
-    REQUIRE(edge.has_value());
-    CHECK(edge->kind == "same-surface");
-    CHECK(edge->approvalState == "approved");
-    CHECK(db2.componentOf(r, a).size() == 2);
 }
 
 TEST_CASE("snapshot conflicts roll back only the import when caught inside a transaction")
@@ -500,21 +289,6 @@ TEST_CASE("source geometry supports a separate dataset root on read-only stores"
     CHECK_FALSE(db.resolveStoragePath(r, uuid, tmp.dir / "missing").has_value());
     CHECK_FALSE(db.resolveStoragePath(r, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", root).has_value());
     CHECK(db.objectByUuid(r, uuid)->generation == 1);
-}
-
-TEST_CASE("reader snapshot is stable across a concurrent commit")
-{
-    TempDir tmp("snapshot");
-    auto db = ObjectStore::create(tmp.dir / "objects.vcobj", testOptions());
-    const std::string first = addObject(db, "patch", "first");
-    auto r = db.read();
-    CHECK(db.objectsByKind(r, "patch").size() == 1);
-    addObject(db, "patch", "second");  // writer commits while r is open
-    CHECK(db.objectsByKind(r, "patch").size() == 1);  // snapshot unchanged
-    r.commit();
-    auto r2 = db.read();
-    CHECK(db.objectsByKind(r2, "patch").size() == 2);
-    (void)first;
 }
 
 TEST_CASE("concurrent readers while a writer commits")

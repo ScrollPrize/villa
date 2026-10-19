@@ -2,13 +2,9 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/objects/ObjectStore.hpp"
-#include <sqlite3.h>
 
 #include <atomic>
 #include <filesystem>
-#include <fstream>
-#include <limits>
-#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -55,42 +51,6 @@ std::string addObject(ObjectStore& db, const std::string& kind, const std::strin
 }
 
 } // namespace
-
-TEST_CASE("geometry cache invalidation token is pinned to the SQLite read snapshot")
-{
-    TempDir tmp("cache_version_snapshot");
-    auto open = [&] {
-        sqlite3* raw = nullptr;
-        const auto rc = sqlite3_open((tmp.dir / "version.sqlite").string().c_str(), &raw);
-        std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db(raw, sqlite3_close);
-        REQUIRE(rc == SQLITE_OK);
-        return db;
-    };
-    auto writer = open();
-    REQUIRE(sqlite3_exec(writer.get(), "PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES(1)",
-                        nullptr, nullptr, nullptr) == SQLITE_OK);
-    auto reader = open();
-    auto scalar = [&](const char* sql) {
-        sqlite3_stmt* raw = nullptr;
-        const auto rc = sqlite3_prepare_v2(reader.get(), sql, -1, &raw, nullptr);
-        std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> stmt(raw, sqlite3_finalize);
-        REQUIRE(rc == SQLITE_OK);
-        REQUIRE(sqlite3_step(stmt.get()) == SQLITE_ROW);
-        return sqlite3_column_int(stmt.get(), 0);
-    };
-    const auto before = scalar("PRAGMA data_version");
-    REQUIRE(sqlite3_exec(reader.get(), "BEGIN", nullptr, nullptr, nullptr) == SQLITE_OK);
-    CHECK(scalar("SELECT x FROM t") == 1); // pin first, as ObjectStore::read does
-    REQUIRE(sqlite3_exec(writer.get(), "UPDATE t SET x=2", nullptr, nullptr, nullptr) == SQLITE_OK);
-    // A commit between pinning and reading the token must not label old cached
-    // bytes with the newer snapshot's version.
-    CHECK(scalar("PRAGMA data_version") == before);
-    CHECK(scalar("SELECT x FROM t") == 1);
-    REQUIRE(sqlite3_exec(reader.get(), "COMMIT; BEGIN", nullptr, nullptr, nullptr) == SQLITE_OK);
-    CHECK(scalar("SELECT x FROM t") == 2);
-    CHECK(scalar("PRAGMA data_version") != before);
-    REQUIRE(sqlite3_exec(reader.get(), "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK);
-}
 
 TEST_CASE("geometry revisions preserve read snapshots and reject foreign transactions")
 {

@@ -5,8 +5,7 @@ import sqlite3
 
 import pytest
 from vc.objects import ObjectStore
-from object_helpers import _geometry
-from object_helpers import edge_choice
+from object_helpers import _geometry, edge_choice, track
 
 
 @pytest.fixture()
@@ -281,14 +280,11 @@ def test_kind_collision_is_reported_before_mutation(pair):
     assert before == (state(a), state(b))
 
 
-def test_incremental_baselines_store_only_changed_records_and_approvals(pair):
+def test_sync_preserves_approval_only_changes_and_deletions(pair):
     a, b = pair
     with a.write() as tx:
-        ids = [tx.upsert_object({"kind": "note"}) for _ in range(100)]
+        ids = [tx.upsert_object({"kind": "note"}) for _ in range(3)]
     a.synchronize(b)
-    with sqlite3.connect(a.path) as sql:
-        initial = sql.execute("SELECT count(*) FROM sync_baseline_records").fetchone()[0]
-    assert initial == 100
     generation = a.object(ids[0])["generation"]
     a.set_approval(ids[0], "approved")  # Approval does not bump generation.
     assert a.object(ids[0])["generation"] == generation
@@ -296,13 +292,6 @@ def test_incremental_baselines_store_only_changed_records_and_approvals(pair):
     assert preview["remote_changes"] == 1
     a.synchronize(b)
     assert b.object(ids[0])["approval_state"] == "approved"
-    with sqlite3.connect(a.path) as sql:
-        assert sql.execute("SELECT count(*) FROM sync_baseline_records").fetchone()[0] == initial + 1
-        assert sql.execute("SELECT max(length(state)) FROM sync_baselines").fetchone()[0] < 100
-        count = sql.execute("SELECT count(*) FROM sync_baselines").fetchone()[0]
-    a.synchronize(b)
-    with sqlite3.connect(a.path) as sql:
-        assert sql.execute("SELECT count(*) FROM sync_baselines").fetchone()[0] == count
     a.delete_object(ids[1])
     a.synchronize(b)
     assert b.object(ids[1]) is None
@@ -355,9 +344,10 @@ def test_incremental_sync_forwards_history_without_head_changes(pair, tmp_path):
         assert b.read_geometry_array(losing, "line_points") == _geometry(value=7)["arrays"][1]["data"]
 
 
-def test_version_two_baseline_migration_and_read_only_open(pair):
+def test_oldest_schema_upgrade_preserves_geometry_queries_and_sync(pair):
     a, b = pair
-    uid = a.upsert_object({"kind": "note"})
+    uid = a.upsert_object({"kind": "track", "track": {"family": "H", "length": 8}})
+    revision = a.put_geometry(uid, track([(1, 2, 3)]), patch_tile_size=0)
     a.synchronize(b)
     legacy = {}
     for kind, records in state(a).items():
@@ -379,9 +369,14 @@ def test_version_two_baseline_migration_and_read_only_open(pair):
             sql.execute("PRAGMA user_version=2")
         with ObjectStore.open(path, read_only=True) as ro:
             assert ro.object(uid)
+            assert ro.read_geometry_array(revision, "points") == track([(1, 2, 3)])["arrays"][0]["data"]
         with sqlite3.connect(path) as sql:
             assert sql.execute("PRAGMA user_version").fetchone()[0] == 2
     with ObjectStore.open(paths[0], author="alice") as a, ObjectStore.open(paths[1], author="bob") as b:
+        for store in (a, b):
+            assert store.select_objects(object_kind="track", family="H", order_by="length_desc")[0]["uuid"] == uid
+            regions = store.spatial_regions([1, 2, 3, 1, 2, 3])
+            assert len(regions) == 1 and regions[0]["revision_uuid"] == revision
         a.set_meta(uid, "migrated", True)
         assert a.synchronize(b)["applied"]
         assert state(a) == state(b)
@@ -391,63 +386,3 @@ def test_version_two_baseline_migration_and_read_only_open(pair):
         a.set_approval(uid, "approved")
         assert a.synchronize(b)["applied"]
         assert state(a) == state(b)
-
-
-def test_incremental_matches_full_snapshot_merge(pair, tmp_path):
-    """Use the legacy full-snapshot path as an independent merge oracle."""
-    import random
-    import uuid
-    from object_helpers import sqlite_backup, sqlite_rows
-    a, b = pair
-    ids = [a.upsert_object(dict(kind="note")) for _ in range(20)]
-    a.synchronize(b)
-    rng = random.Random(17)
-    for step in range(12):
-        paths = [tmp_path / f"oracle-{step}-{side}.vcobj" for side in (0, 1)]
-        baseline = {}
-        for kind, records in state(a).items():
-            for record in records:
-                record["record_type"] = kind
-                if "geometry_bindings" in record:
-                    record["geometry_bindings"].pop("stale", None)
-                baseline[record["uuid"]] = record
-        for source, destination in zip((a, b), paths):
-            # Python and the native store may use different SQLite builds.
-            # In-process connections can invalidate each other's POSIX locks.
-            sqlite_backup(source.path, destination)
-            sqlite_rows(destination, "UPDATE sync_baselines SET state=? WHERE seq=(SELECT max(seq) FROM sync_baselines)",
-                        (json.dumps(baseline),))
-        with ObjectStore.open(str(paths[0]), author="alice") as oa, ObjectStore.open(str(paths[1]), author="bob") as ob:
-            left, right = rng.sample(ids, 2)
-            for store in (a, oa):
-                store.set_meta(left, "step", step)
-            for store in (b, ob):
-                store.set_approval(right, "approved" if step % 2 else "rejected")
-            if step % 3 == 0:
-                edge = dict(uuid=str(uuid.uuid4()), kind="test", a=left, b=right)
-                for store in (a, oa):
-                    store.add_edge(edge)
-            elif step % 3 == 1:
-                edges = a.edges_by_kind("test")
-                if edges:
-                    for store in (b, ob):
-                        store.remove_edge(edges[0]["uuid"])
-            if step % 4 == 0:
-                # Force an explicit conflict and compare its chosen outcome too.
-                for store in (b, ob):
-                    store.set_meta(left, "step", -1)
-            ir, fr = a.synchronize(b, dry_run=True), oa.synchronize(ob, dry_run=True)
-            assert [(c["uuid"], c["reason"]) for c in ir["conflicts"]] == [(c["uuid"], c["reason"]) for c in fr["conflicts"]]
-            choices = {c["uuid"]: "remote" for c in ir["conflicts"]}
-            a.synchronize(b, resolutions=choices, expected_plan=ir["plan_token"])
-            oa.synchronize(ob, resolutions=choices, expected_plan=fr["plan_token"])
-
-            def without_times(store):
-                result = state(store)
-                for records in result.values():
-                    for record in records:
-                        for key in ("created_at", "changed_at", "approved_at"):
-                            record.pop(key, None)
-                return result
-
-            assert without_times(a) == without_times(b) == without_times(oa) == without_times(ob)

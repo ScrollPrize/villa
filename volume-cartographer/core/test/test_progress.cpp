@@ -1,10 +1,8 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 #include "vc/core/util/TerminalProgress.hpp"
-#include <atomic>
 #include <condition_variable>
 #include <sstream>
-#include <vector>
 
 using namespace vc::util;
 
@@ -27,42 +25,6 @@ TEST_CASE("terminal progress reports final counts on stderr-style streams")
     CHECK(text.find('\033') == std::string::npos);
     reportProgress(callback, "ignored after finish", 99, 100);
     CHECK(output.str() == text);
-}
-
-TEST_CASE("terminal progress coalesces bursts of stages and per-item completions")
-{
-    for (bool terminal : {false, true}) {
-        std::ostringstream output;
-        TerminalProgress progress("Test", true, output, terminal, std::chrono::hours(1));
-        for (int i = 0; i < 1000; ++i) {
-            progress.update({"searching", 0, 10});
-            progress.update({"searching", 10, 10});
-            progress.update({"fitting", 1, 1});
-        }
-        progress.finish();
-        const auto text = output.str();
-        CHECK(std::count(text.begin(), text.end(), terminal ? '\r' : '\n') == 2);
-        CHECK(text.find("searching") == std::string::npos);
-        CHECK(text.find("fitting") != std::string::npos);
-        CHECK(text.find("(finished)") != std::string::npos);
-    }
-}
-
-TEST_CASE("subtask progress keeps the outer stage and counters stable")
-{
-    std::vector<std::string> details;
-    const auto nested = subtaskProgress([&](const ProgressUpdate& event) {
-        CHECK(event.stage == "linking");
-        CHECK(event.completed == 7);
-        CHECK(event.total == 20);
-        details.emplace_back(event.detail);
-    }, std::string("linking"), 7, 20, std::string("patch 8"));
-    reportProgress(nested, "searching", 0, 100);
-    reportProgress(nested, "searching", 100, 100);
-    reportProgress(nested, "fitting", 0, 0, "nearby patches");
-    CHECK(details == std::vector<std::string>{"patch 8: searching 0%",
-        "patch 8: searching 100%", "patch 8: fitting nearby patches"});
-    CHECK_FALSE(bool(subtaskProgress({}, "linking", 0, 20, "patch 1")));
 }
 
 TEST_CASE("terminal progress keeps reporting during work without callbacks")

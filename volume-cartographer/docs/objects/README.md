@@ -87,3 +87,22 @@ Use a write transaction to commit metadata and geometry together. Each read
 transaction sees a consistent snapshot. For independent copies, establish a
 shared baseline with `synchronize` before editing, then review conflicting
 records and choose a side explicitly.
+
+## Tests
+
+Run the focused suite against the existing build and Python environment:
+
+```sh
+ninja -C build
+ctest --test-dir build --output-on-failure \
+  -R '^(test_object_(records|store|links)|test_progress|test_surface_patch_index|test_volume_static_read|test_volume_chunk_errors)$'
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_BUILD_PYTHON=build/python \
+  .venv/bin/python -m pytest python/tests/test_object*.py -q
+```
+
+Python tests cover public storage workflows, including ingestion/export of the
+checked-in PHerc 0172 segments. Native tests cover transaction snapshots,
+concurrency, detector kernels, and C++ validation. Keep each regression at the
+layer that exercises it directly; avoid duplicating CRUD tests, checking SQLite
+itself, or recreating every intermediate development schema. One oldest-supported
+schema upgrade smoke test covers compatibility.

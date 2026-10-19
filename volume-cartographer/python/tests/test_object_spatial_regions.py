@@ -10,11 +10,6 @@ from vc.objects import ObjectStore
 from object_helpers import ALL, track
 
 
-
-
-
-
-
 def regions(db, uid, bbox=ALL, **filters):
     return db.spatial_regions(bbox, object_uuids=[uid], **filters)
 
@@ -187,56 +182,3 @@ def test_region_edit_rollback_sync_and_unchanged_tiles(db, tmp_path):
         assert regions(peer, uid) == regions(db, uid) == []
         with sqlite3.connect(db.path) as sql:
             assert sql.execute('SELECT count(*) FROM spatial_regions_rtree').fetchone()[0] == 0
-
-
-def downgrade_to_v4(path):
-    """Recreate the previous shared whole-object index, preserving payloads."""
-    with sqlite3.connect(path) as sql:
-        for trigger in ('insert', 'update', 'delete'):
-            sql.execute(f'DROP TRIGGER object_bounds_{trigger}')
-        sql.execute('DROP TABLE spatial_regions')
-        sql.execute('DROP TABLE spatial_regions_rtree')
-        sql.execute('CREATE VIRTUAL TABLE object_bounds_rtree USING rtree(object_id,min_x,max_x,min_y,max_y,min_z,max_z)')
-        sql.execute('INSERT INTO object_bounds_rtree SELECT object_id,min_x,max_x,min_y,max_y,min_z,max_z FROM object_bounds')
-        # Migration only drops these triggers; fixture data is already populated.
-        for trigger in ('insert', 'update', 'delete'):
-            sql.execute(f'CREATE TRIGGER object_bounds_{trigger} AFTER {trigger} ON object_bounds BEGIN SELECT 1; END')
-        sql.execute('PRAGMA user_version=4')
-
-
-def test_v4_migration_preserves_read_only_object_queries_and_builds_regions(tmp_path):
-    path = str(tmp_path / 'v4.vcobj')
-    with ObjectStore.create(path, author='test') as db:
-        uid = db.upsert_object(dict(kind='patch'))
-        db.put_geometry(uid, patch(65, 65), patch_tile_size=0)
-        before = db.uuid, db.journal_since(), db.export_json()
-        expected = regions(db, uid)
-    downgrade_to_v4(path)
-    with ObjectStore.open(path, read_only=True) as ro:
-        assert ro.select_objects(bbox=[0, 0, 1, 64, 64, 1], fields=[]) == [dict(uuid=uid, kind='patch')]
-        with pytest.raises(RuntimeError, match='schema 5'):
-            ro.spatial_regions(ALL)
-    with ObjectStore.open(path, author='test') as db:
-        assert (db.uuid, db.journal_since(), db.export_json()) == before
-        assert regions(db, uid) == expected
-    with sqlite3.connect(path) as sql:
-        assert sql.execute('PRAGMA user_version').fetchone()[0] == 7
-        assert sql.execute('PRAGMA foreign_key_check').fetchall() == []
-        assert sql.execute("SELECT name FROM sqlite_master WHERE sql LIKE 'CREATE VIRTUAL TABLE%rtree%'").fetchall() == [('spatial_regions_rtree',)]
-
-
-def test_failed_v4_migration_rolls_back_old_index(tmp_path):
-    path = str(tmp_path / 'corrupt-v4.vcobj')
-    with ObjectStore.create(path, author='test') as db:
-        uid = db.upsert_object(dict(kind='track'))
-        db.put_geometry(uid, track([(2, 3, 4)]))
-    downgrade_to_v4(path)
-    with sqlite3.connect(path) as sql:
-        sql.execute('DROP TRIGGER geometry_chunks_immutable_update')
-        sql.execute('UPDATE geometry_chunks SET data=zeroblob(length(data))')
-    with pytest.raises(RuntimeError, match='corrupt payload'):
-        ObjectStore.open(path, author='test')
-    with sqlite3.connect(path) as sql:
-        assert sql.execute('PRAGMA user_version').fetchone()[0] == 4
-        assert sql.execute('SELECT count(*) FROM object_bounds_rtree').fetchone()[0] == 1
-        assert sql.execute("SELECT name FROM sqlite_master WHERE name LIKE 'spatial_regions%'").fetchall() == []
