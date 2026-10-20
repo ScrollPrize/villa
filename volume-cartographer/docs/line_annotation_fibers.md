@@ -10,6 +10,17 @@ These are coordinate-frame dimensions, not necessarily the scan's finest grid.
 Opening older unstamped fibers first uses their recorded/selected inference
 manifest; without one, their existing unscaled active-volume interpretation is
 recorded on save. Saving without a valid shape fails rather than omitting it.
+Once resolved, this shape is retained in the loaded fiber and its open sessions
+before saves are queued. Changing the active volume or inference dataset does
+not reinterpret previously resolved geometry.
+
+Import and export preserve stored coordinates and `coordinate_base_shape_zyx`
+unchanged. There is no import/export scale control or API parameter; the shape
+determines the display conversion into the active volume. Agent requests that
+still supply `scale` are rejected. Old collection-level `scale` metadata is not
+applied; it described a transform already baked into the exported points.
+Previously scaled exports with inconsistent shape metadata need correction
+at their source; they cannot be repaired unambiguously on import.
 
 ## CP direction annotations
 

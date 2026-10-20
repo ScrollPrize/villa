@@ -449,10 +449,10 @@ public:
     // their interactive counterparts are used in connect().
 
     // Writes a vc3d_fiber_collection bundle without opening a dialog.
-    bool exportFibersToPath(const std::filesystem::path& path, double scale,
+    bool exportFibersToPath(const std::filesystem::path& path,
                             QString* errorMessage = nullptr, int* exportedCount = nullptr);
     // Imports a fiber JSON, bundle, or directory without opening a dialog.
-    bool importFibersFromPath(const std::filesystem::path& path, double scale,
+    bool importFibersFromPath(const std::filesystem::path& path,
                               QString* errorMessage = nullptr,
                               int* importedCount = nullptr, int* skippedCount = nullptr);
     // Adds one unlinked vc3d_fiber to the package without reloading the other
@@ -1072,6 +1072,7 @@ private:
     // fiberBaseShapeManifestCandidates). nullopt when none can be resolved.
     [[nodiscard]] std::optional<std::array<std::size_t, 3>>
         resolveStoredFiberCoordinateBaseShape(const StoredFiber& fiber) const;
+    void retainStoredFiberCoordinateBaseShape(StoredFiber& fiber) const;
     [[nodiscard]] std::optional<std::array<std::size_t, 3>>
         fiberManifestBaseShape(const std::string& location) const;
     [[nodiscard]] std::filesystem::path relativeFiberPath(const StoredFiber& fiber) const;
@@ -1136,7 +1137,6 @@ private:
     [[nodiscard]] bool controlPointHasBranch(const LineAnnotationSession& session,
                                              int controlPointIndex) const;
     std::vector<uint64_t> syncBranchEndpointPositions(LineAnnotationSession& session);
-    static void scaleStoredFiber(StoredFiber& fiber, double scale);
     [[nodiscard]] static vc::lasagna::LineModel lineModelFromPoints(
         const std::vector<cv::Vec3d>& points,
         const vc::lasagna::NormalSampler* normalSampler);
@@ -1163,8 +1163,8 @@ private:
     void scheduleSessionAutoSave(LineAnnotationSession& session);
     void flushSessionAutoSave(const std::string& surfaceName);
     void flushAllPendingSessionAutoSaves();
-    [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber, double scale = 1.0) const;
-    void saveFiberNow(const StoredFiber& fiber) const;
+    [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber) const;
+    void saveFiberNow(StoredFiber& fiber) const;
     void scheduleFiberSave(const StoredFiber& fiber);
     void scheduleFiberPairSave(const StoredFiber& first, const StoredFiber& second);
     void scheduleFiberSaveSnapshots(std::vector<FiberSaveSnapshot> snapshots,
@@ -1176,10 +1176,9 @@ private:
                             bool showErrors,
                             std::vector<std::shared_ptr<FiberSaveBatchTracker>> batches);
     void waitForFiberSaves();
-    [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber) const;
+    [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber);
     [[nodiscard]] static nlohmann::json fiberSaveSnapshotToJson(
-        const FiberSaveSnapshot& snapshot,
-        double scale = 1.0);
+        const FiberSaveSnapshot& snapshot);
     // A link entry a load dropped from a stored record (neutralized, removed
     // by a repair, or stripped by the lenient parser). Fields a stripped
     // entry did not parse stay unset; a descriptor without a target matches
