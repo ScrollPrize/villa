@@ -265,7 +265,8 @@ class iBOTPatchLoss(nn.Module):
         if self._use_triton(teacher_features, teacher_weight):
             from .ibot_triton import prototype_scales
             return prototype_scales(teacher_features, teacher_weight, teacher_temp,
-                                    n_masked_patches_tensor, n_iterations)
+                                    n_masked_patches_tensor, n_iterations,
+                                    self.masked_loss_chunk_size or 4096)
         chunk_size = self.masked_loss_chunk_size or max(1, teacher_features.shape[0])
         n_samples = n_masked_patches_tensor.to(device=teacher_features.device, dtype=torch.float32)
         if dist.is_initialized():

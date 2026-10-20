@@ -165,13 +165,65 @@ class TiledIBOTTests(RNGIsolatedTestCase):
         with self.assertRaises(ValueError):
             iBOTPatchLoss(19, kernel_backend="invalid")
 
+    def test_projection_tile_dispatch(self):
+        from dinovol_2.loss.ibot_triton import _projection_tile
+
+        features = torch.empty(1, 256, device="meta")
+        weight = torch.empty(131072, 256, device="meta")
+        for capability in ((8, 0), (9, 0), (10, 0), (12, 0)):
+            with self.subTest(capability=capability), patch(
+                "torch.cuda.get_device_capability", return_value=capability
+            ):
+                expected = (64, 128, 64) if capability == (12, 0) else (32, 128, 64)
+                self.assertEqual(_projection_tile(features, weight), expected)
+                self.assertEqual(_projection_tile(features, weight[:259]), (32, 128, 64))
+                self.assertEqual(_projection_tile(features[:, :70], weight[:, :70]), (32, 128, 64))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_sinkhorn_reductions_bound_scratch_memory(self):
+        from dinovol_2.loss import ibot_triton
+
+        torch.manual_seed(11)
+        m, k, d, chunk = 4097, 4099, 64, 129
+        # Exactly representable projections isolate chunk/reduction errors from
+        # the different rounding of cuBLAS and Triton projection accumulators.
+        t = torch.randint(-2, 3, (m, d), device="cuda").half() / 16
+        w = torch.randint(-2, 3, (k, d), device="cuda").half() / 16
+        if not ibot_triton.supported(t, w):
+            self.skipTest("requires a supported Triton CUDA device")
+        e = torch.exp((t @ w.T).float() / .07)
+        b = torch.rand(k, device="cuda") / k
+        a = torch.rand(m, device="cuda") / m
+        # Check both tiles, all reductions, and a tail smaller than a tile.
+        # The previous full-batch partial buffers exceed 1 MiB for each tile;
+        # chunked scratch plus output must stay below 512 KiB.
+        for bm in (32, 64):
+            with patch.object(ibot_triton, "_projection_tile", return_value=(bm, 128, 64)):
+                for mode, scales in ((0, t), (1, b), (2, a)):
+                    with self.subTest(tile=bm, mode=mode):
+                        expected = (e * b).sum(1) if mode == 1 else (
+                            (e * a[:, None]).sum(0) if mode == 2 else e.sum(0)
+                        )
+                        # Exclude first-use compilation from the allocation check.
+                        ibot_triton._reduce_projection(t, w, .07, scales, mode, chunk)
+                        torch.cuda.synchronize()
+                        baseline = torch.cuda.memory_allocated()
+                        torch.cuda.reset_peak_memory_stats()
+                        actual = ibot_triton._reduce_projection(t, w, .07, scales, mode, chunk)
+                        scratch = torch.cuda.max_memory_allocated() - baseline
+                        self.assertLess(scratch, 512 * 1024)
+                        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=2e-6)
+                        del actual
+
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_tiled_loss_and_gradients(self):
         torch.manual_seed(5)
         # Non-multiple tiles/features, multiple row chunks, AMP-scaled upstream gradients.
         for dtype in (torch.float16, torch.bfloat16):
-            for iterations in (1, 3):
-                with self.subTest(dtype=dtype, iterations=iterations):
+            for iterations, bm in ((1, 32), (3, 32), (1, 64), (3, 64)):
+                with self.subTest(dtype=dtype, iterations=iterations, tile=bm), patch(
+                    "dinovol_2.loss.ibot_triton._projection_tile", return_value=(bm, 128, 64)
+                ):
                     m, k, d = 73, 259, 70
                     s = F.normalize(torch.randn(m, d, device="cuda"), dim=-1).to(dtype)
                     t = F.normalize(torch.randn_like(s).float(), dim=-1).to(dtype)
@@ -200,9 +252,13 @@ class TiledIBOTTests(RNGIsolatedTestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_distributed_prototype_reduction_contract(self):
         """Emulate collectives from two unequal shards against the full-batch reference."""
+        from dinovol_2.loss.ibot_triton import supported
+
         torch.manual_seed(7)
         t = F.normalize(torch.randn(73, 64, device="cuda"), dim=-1).half()
         w = F.normalize(torch.randn(259, 64, device="cuda"), dim=-1).half()
+        if not supported(t, w):
+            self.skipTest("requires a supported Triton CUDA device")
         e = torch.exp((t @ w.T).float() / .07)
         sums = e.sum(0)
         global_sums = [sums]
@@ -212,7 +268,7 @@ class TiledIBOTTests(RNGIsolatedTestCase):
             sums = (e * a).sum(0)
             global_sums.append(sums)
             b = b / (sums * b * 259)
-        for shard in (t[:31], t[31:]):
+        for shard in (t[:31], t[31:], t[:0]):
             collective_values = [torch.tensor([73], device="cuda"), *global_sums]
             calls = []
 
@@ -224,7 +280,9 @@ class TiledIBOTTests(RNGIsolatedTestCase):
             with patch("torch.distributed.is_initialized", return_value=True), patch(
                 "torch.distributed.all_reduce", side_effect=all_reduce
             ):
-                actual = iBOTPatchLoss(259, kernel_backend="triton").sinkhorn_knopp_prototype_scales(
+                actual = iBOTPatchLoss(
+                    259, masked_loss_chunk_size=17, kernel_backend="triton"
+                ).sinkhorn_knopp_prototype_scales(
                     shard, w, .07, count
                 )
             torch.testing.assert_close(actual, b.log())

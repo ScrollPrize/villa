@@ -99,7 +99,15 @@ a config sets it:
   gradient filtering, or precision reduction is used. CUDA devices with compute
   capability 8+ and contiguous FP16/BF16 features use the kernel; other inputs and
   installations without Triton use the existing PyTorch path. This setting does
-  not change checkpoint parameter names or shapes.
+  not change checkpoint parameter names or shapes. Sinkhorn reuses partial
+  reduction buffers bounded by `ibot_masked_loss_chunk_size` rows (4,096 when
+  unset), accumulating prototype sums in chunk order before each distributed
+  reduction. This bounds scratch memory as the masked batch grows; the final
+  per-row scales still grow with the batch. On SM120 GPUs, the measured
+  256-wide / 131,072-prototype head uses 64-row projection tiles; other devices
+  and head shapes retain 32-row tiles. Backward adds half-precision GEMM results
+  directly into the FP32 weight-gradient accumulator without a separate FP32
+  conversion buffer. Precision and the backward row chunk size are unchanged.
 - `model.deeper_embed_channels_last`: CNN activations and weights use the
   channels-last 3D layout, which cuDNN's tensor-core convolutions use natively.
   Weights are converted after initialization; checkpoints are layout-independent.
@@ -368,6 +376,29 @@ validation runs; gradient relative L2 differences were below `3.7e-5` and interp
 absolute error was `9.54e-7`. This is floating-point agreement, not bitwise
 equivalence. Benchmark on the training GPU before enabling the optional iBOT
 backend, especially for different prototype counts or bottleneck widths.
+
+The subsequent iBOT tile/scratch changes were checked on one real 192³ global
+crop and one 64³ local crop from the same PHerc0125 array and checkpoint, at
+ZYX origins `(10240,3840,3840)` and `(10305,3901,3897)`. The global view had 4,182
+masked tokens, with 131,072 prototypes, 256-wide FP16 bottlenecks, and 4,096-row
+chunks. The local view had 512 tokens; local tokens do not enter the iBOT loss.
+On the same RTX 5090 / PyTorch 2.10.0 / Triton 3.6.0 environment, synchronized
+operator timings over 30 iterations after six warmups were:
+
+| iBOT including Sinkhorn and backward | Mean / median ms | Min–max ms | Peak allocated MiB |
+| --- | --- | --- | --- |
+| Initial tiled kernels | 20.921 / 20.628 | 20.222–22.201 | 1588.1 |
+| Tuned tiles, bounded Sinkhorn, no FP32 conversion buffer | 17.424 / 17.365 | 16.654–18.541 | 1460.1 |
+
+Isolated Sinkhorn scratch/output overhead fell from 67.0 to 34.0 MiB.
+The final loss matched the PyTorch reference on this fixture; feature and weight
+gradient relative L2 errors were `3.73e-5` and `2.78e-5` or less, using an upstream
+AMP gradient scale of 1,024. These peaks include the retained fixture tensors,
+not the backbone, and timings exclude data loading, encoding, compilation, and
+profiling. This is not a full training-step measurement: cross-view training
+requires two global views. The kernel regression command above checks both
+projection tiles, FP16/BF16 gradients, a bounded allocation budget for all three
+Sinkhorn reduction modes, and distributed reductions with an empty local shard.
 
 ### Local benchmark launcher
 

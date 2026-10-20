@@ -2,7 +2,7 @@
 
 No FP32 [samples, prototypes] logits or targets are stored. Backward temporarily
 stores one row chunk of half-precision logit gradients for cuBLAS dX/dW GEMMs.
-Prototype reductions use deterministic partial buffers, not atomic additions.
+Prototype reductions reuse row-chunk-sized partial buffers, not atomic additions.
 """
 import torch
 import torch.distributed as dist
@@ -112,38 +112,60 @@ if triton is not None:
         tl.store(Grad + m[:, None] * K + k[None, :], grad, (m[:, None] < M) & (k[None, :] < K))
 
 
-_BM, _BN, _BD = 32, 128, 64
+def _projection_tile(features, weight):
+    # Measured on SM120 with the production head. Keep the original tile for
+    # other devices/head shapes until they have been benchmarked.
+    if (features.shape[1] == 256 and weight.shape[0] == 131072
+            and torch.cuda.get_device_capability(features.device) == (12, 0)):
+        return 64, 128, 64
+    return 32, 128, 64
 
 
-def _reduce_projection(features, weight, temp, scales, mode):
+def _reduce_projection(features, weight, temp, scales, mode, chunk_size):
     m, d = features.shape
     k = weight.shape[0]
-    shape = (m, triton.cdiv(k, _BN)) if mode == 1 else (triton.cdiv(m, _BM), k)
+    if not m:
+        return features.new_zeros(0 if mode == 1 else k, dtype=torch.float32)
+    bm, bn, bd = _projection_tile(features, weight)
+    rows = min(m, chunk_size)
+    shape = (rows, triton.cdiv(k, bn)) if mode == 1 else (triton.cdiv(rows, bm), k)
     partial = torch.empty(shape, device=features.device, dtype=torch.float32)
-    if m:
-        _sinkhorn[(triton.cdiv(m, _BM), triton.cdiv(k, _BN))](
-            features, weight, scales, partial, m, k, d, temp, mode, _BM, _BN, _BD,
+    sums = features.new_empty(m, dtype=torch.float32) if mode == 1 else None
+    for start in range(0, m, chunk_size):
+        end = min(start + chunk_size, m)
+        n = end - start
+        chunk_scales = scales[start:end] if mode == 2 else scales
+        _sinkhorn[(triton.cdiv(n, bm), triton.cdiv(k, bn))](
+            features[start:end], weight, chunk_scales, partial, n, k, d, temp, mode, bm, bn, bd,
             num_warps=4,
         )
-    return partial.sum(dim=1 if mode == 1 else 0)
+        if mode == 1:
+            torch.sum(partial[:n], dim=1, out=sums[start:end])
+        else:
+            chunk_sums = partial[:triton.cdiv(n, bm)].sum(dim=0)
+            if sums is None:
+                sums = chunk_sums
+            else:
+                sums.add_(chunk_sums)
+    return sums
 
 
 @torch.no_grad()
-def prototype_scales(features, weight, temp, sample_count, n_iterations):
+def prototype_scales(features, weight, temp, sample_count, n_iterations, chunk_size=4096):
     count = sample_count.to(device=features.device, dtype=torch.float32).clone()
     if dist.is_initialized():
         dist.all_reduce(count)
     k = weight.shape[0]
 
     def columns(scales, mode):
-        sums = _reduce_projection(features, weight, temp, scales, mode)
+        sums = _reduce_projection(features, weight, temp, scales, mode, chunk_size)
         if dist.is_initialized():
             dist.all_reduce(sums)
         return sums
 
     b = 1. / (columns(features, 0) * k)
     for _ in range(n_iterations - 1):
-        a = 1. / (_reduce_projection(features, weight, temp, b, 1) * count)
+        a = 1. / (_reduce_projection(features, weight, temp, b, 1, chunk_size) * count)
         sums = columns(a, 2)
         b = b / (sums * b * k)
     return b.log()
@@ -154,15 +176,16 @@ class ProjectionLogLikelihood(torch.autograd.Function):
     def forward(ctx, s, sw, t, tw, log_b, st, tt, chunk_size):
         n, d = s.shape
         k = sw.shape[0]
+        bm, bn, bd = _projection_tile(s, sw)
         rows = s.new_empty(n, dtype=torch.float32)
         slse, tlse = torch.empty_like(rows), torch.empty_like(rows)
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
             m = end - start
-            nt = triton.cdiv(k, _BN)
+            nt = triton.cdiv(k, bn)
             stats = s.new_empty((5, m, nt), dtype=torch.float32)
-            _loss_stats[(triton.cdiv(m, _BM), nt)](
-                s[start:end], sw, t[start:end], tw, log_b, stats, m, k, d, st, tt, _BM, _BN, _BD,
+            _loss_stats[(triton.cdiv(m, bm), nt)](
+                s[start:end], sw, t[start:end], tw, log_b, stats, m, k, d, st, tt, bm, bn, bd,
                 num_warps=4,
             )
             _finish_stats[(m,)](stats, rows[start:end], slse[start:end], tlse[start:end],
@@ -170,6 +193,7 @@ class ProjectionLogLikelihood(torch.autograd.Function):
             del stats
         ctx.save_for_backward(s, sw, t, tw, log_b, slse, tlse)
         ctx.st, ctx.tt, ctx.chunk_size = st, tt, chunk_size
+        ctx.tile = bm, bn, bd
         return rows
 
     @staticmethod
@@ -177,6 +201,7 @@ class ProjectionLogLikelihood(torch.autograd.Function):
         s, sw, t, tw, log_b, slse, tlse = ctx.saved_tensors
         n, d = s.shape
         k = sw.shape[0]
+        bm, bn, bd = ctx.tile
         dx = torch.empty_like(s)
         dw = sw.new_zeros(sw.shape, dtype=torch.float32)
         grad_rows = grad_rows.contiguous()
@@ -186,11 +211,13 @@ class ProjectionLogLikelihood(torch.autograd.Function):
                 end = min(start + ctx.chunk_size, n)
                 m = end - start
                 dg = s.new_empty((m, k))
-                _logit_grad[(triton.cdiv(m, _BM), triton.cdiv(k, _BN))](
+                _logit_grad[(triton.cdiv(m, bm), triton.cdiv(k, bn))](
                     s[start:end], sw, t[start:end], tw, log_b, slse[start:end], tlse[start:end],
-                    grad_rows[start:end], dg, m, k, d, ctx.st, ctx.tt, _BM, _BN, _BD, num_warps=4,
+                    grad_rows[start:end], dg, m, k, d, ctx.st, ctx.tt, bm, bn, bd, num_warps=4,
                 )
                 dx[start:end] = torch.mm(dg, sw)
-                dw += torch.mm(dg.t(), s[start:end]).float()
+                # TensorIterator promotes the half GEMM result during the FP32
+                # addition, avoiding a full FP32 weight-gradient temporary.
+                dw.add_(torch.mm(dg.t(), s[start:end]))
                 del dg
         return dx, dw.to(sw.dtype), None, None, None, None, None, None
