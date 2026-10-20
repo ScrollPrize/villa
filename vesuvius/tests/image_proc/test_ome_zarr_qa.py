@@ -109,6 +109,22 @@ def _write_multiscales(group_path, axes_names=("z", "y", "x"), num_levels=3,
     zattrs.write_text(json.dumps({"multiscales": [{"version": "0.4", "axes": axes, "datasets": datasets}]}))
 
 
+def _write_v3_array(level_path, shape, chunks=(8, 8, 8), dtype="uint8"):
+    """Write a minimal zarr v3 array document (metadata only)."""
+    level_path.mkdir(parents=True, exist_ok=True)
+    chunks = tuple(min(c, s) for c, s in zip(chunks, shape))
+    (level_path / "zarr.json").write_text(json.dumps({
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": list(shape),
+        "data_type": dtype,
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": list(chunks)}},
+        "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+        "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+        "fill_value": 0,
+    }))
+
+
 def _by_name(results):
     return {r.name: r for r in results}
 
@@ -605,3 +621,86 @@ def test_chunk_coverage_sample_detects_deleted_last_chunk(tmp_path):
     assert result.status == WARN
     assert result.details["offenders"] == [{"level": 1, "chunk": "1/1/1"}]
     assert result.details["per_level"] == [{"level": 1, "examined": 3, "total": 8}]
+
+
+# Review regression #1: OME-Zarr 0.5 stores multiscales under the `ome` namespace
+# (zarr.json.attributes.ome). read_group_attrs must normalise it so v3 stores are
+# not reported as missing multiscales (and do not skip dataset/scale validation).
+
+
+def test_v3_ome_namespace_multiscales_detected(tmp_path):
+    group = tmp_path / "vol.zarr"
+    group.mkdir()
+    shapes = [(8, 8, 8), (4, 4, 4), (2, 2, 2)]
+    datasets = []
+    for lvl, shape in enumerate(shapes):
+        _write_v3_array(group / str(lvl), shape)
+        datasets.append({
+            "path": str(lvl),
+            "coordinateTransformations": [{"type": "scale", "scale": [2.0 ** lvl] * 3}],
+        })
+    axes = [{"name": n, "type": "space", "unit": "micrometer"} for n in ("z", "y", "x")]
+    (group / "zarr.json").write_text(json.dumps({
+        "zarr_format": 3,
+        "node_type": "group",
+        "attributes": {"ome": {
+            "version": "0.5",
+            "multiscales": [{"version": "0.5", "axes": axes, "datasets": datasets}],
+        }},
+    }))
+
+    # The `ome` namespace is normalised away so callers see multiscales directly.
+    attrs = qa.read_group_attrs(group)
+    assert "multiscales" in attrs
+
+    metas = [read_array_meta(l, group / str(l)) for l in discover_levels(group)]
+    result = check_ome_scale_metadata(group, metas)
+    assert result.status == PASS, result.message
+    # The whole run is clean (no false "missing multiscales" FAIL under --strict).
+    assert not [r for r in run_all_checks(group) if r.status == FAIL]
+
+
+# Review regression #2: a valid small compressed chunk (codec overhead dwarfs the
+# tiny declared size) must not be mistaken for a mis-declared grid (#1965 still FAILs).
+
+
+def test_small_compressed_chunk_not_flagged(tmp_path):
+    import zlib
+
+    group = tmp_path / "vol.zarr"
+    level0 = group / "0"
+    level0.mkdir(parents=True)
+    (group / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
+    # uint8 (1,1,1) chunk: declared size is 1 byte; the zlib-compressed object is
+    # 9 bytes and round-trips correctly.
+    (level0 / ".zarray").write_text(json.dumps({
+        "zarr_format": 2, "shape": [1, 1, 1], "chunks": [1, 1, 1], "dtype": "|u1",
+        "compressor": {"id": "zlib", "level": 1}, "fill_value": 0, "order": "C",
+        "filters": None, "dimension_separator": "/",
+    }))
+    payload = zlib.compress(b"\x01", 1)
+    assert len(payload) == 9
+    (level0 / "0" / "0").mkdir(parents=True)
+    (level0 / "0" / "0" / "0").write_bytes(payload)
+
+    metas = [read_array_meta(0, level0)]
+    assert metas[0].compressed is True
+    result = check_chunk_object_sizes(metas)
+    assert result.status != FAIL
+    assert result.details["offenders"] == []
+
+
+# Review regression #3: when a canonical meta.json is present, Volume reads it
+# first, so metadata.json need not carry `scan` (the #2078 workaround).
+
+
+def test_scan_not_required_when_meta_json_present(tmp_path):
+    group = tmp_path / "vol.zarr"
+    _write_level(group, 0, (8, 8, 8))
+    (group / "meta.json").write_text(json.dumps({"voxelsize": 7.91}))
+    (group / "metadata.json").write_text(json.dumps({
+        "z_direction_is_top_to_bottom": True}))  # no `scan`
+    result = check_metadata_json_keys(group)
+    assert result.status == PASS, result.message
+    assert "scan" not in result.details.get("missing", [])
+    assert result.details["meta_json_present"] is True

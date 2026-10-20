@@ -117,6 +117,7 @@ class ArrayMeta:
     dimension_separator: str
     zarr_format: int
     chunk_key_encoding: str = "v2"
+    compressed: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +152,7 @@ def read_array_meta(level: int, level_path: Path) -> ArrayMeta:
         chunks = tuple(int(v) for v in zarray["chunks"])
         dtype = str(zarray["dtype"])
         sep = zarray.get("dimension_separator", ".")
+        compressed = zarray.get("compressor") is not None or bool(zarray.get("filters"))
         return ArrayMeta(
             level=level,
             path=str(level_path),
@@ -160,6 +162,7 @@ def read_array_meta(level: int, level_path: Path) -> ArrayMeta:
             itemsize=_itemsize(dtype),
             dimension_separator=sep,
             zarr_format=2,
+            compressed=compressed,
         )
 
     zarr_json = _read_json(level_path / "zarr.json")
@@ -171,6 +174,13 @@ def read_array_meta(level: int, level_path: Path) -> ArrayMeta:
         sep = "/"
         cke = zarr_json.get("chunk_key_encoding", {})
         sep = cke.get("configuration", {}).get("separator", "." if cke.get("name") == "v2" else "/")
+        codecs = zarr_json.get("codecs", []) or []
+        # Any bytes->bytes codec beyond the raw array->bytes codec (compression,
+        # checksum, ...) adds a small fixed overhead to each stored chunk.
+        compressed = any(
+            isinstance(c, dict) and c.get("name") not in ("bytes", "transpose")
+            for c in codecs
+        )
         return ArrayMeta(
             level=level,
             path=str(level_path),
@@ -181,6 +191,7 @@ def read_array_meta(level: int, level_path: Path) -> ArrayMeta:
             dimension_separator=sep,
             zarr_format=3,
             chunk_key_encoding=cke.get("name", "default"),
+            compressed=compressed,
         )
 
     raise ValueError(f"no .zarray or array zarr.json at {level_path}")
@@ -212,13 +223,23 @@ def discover_levels(group_path: Path, max_levels: Optional[int] = None) -> List[
 
 def read_group_attrs(group_path: Path) -> dict:
     """Return the group's user attributes (``.zattrs`` for v2, ``attributes`` in
-    ``zarr.json`` for v3). Empty dict if none."""
+    ``zarr.json`` for v3). Empty dict if none.
+
+    OME-Zarr 0.5 stores its multiscales metadata under the ``ome`` namespace
+    (``zarr.json.attributes.ome``). Normalise that here so every caller sees
+    ``multiscales`` at the top level and valid v3 stores are not reported as
+    missing metadata (which would bypass dataset/scale validation and fail
+    ``--strict``)."""
     zattrs = _read_json(group_path / ".zattrs")
     if zattrs is not None:
         return zattrs
     zarr_json = _read_json(group_path / "zarr.json")
     if zarr_json is not None and zarr_json.get("node_type") == "group":
-        return zarr_json.get("attributes", {}) or {}
+        attrs = zarr_json.get("attributes", {}) or {}
+        ome = attrs.get("ome")
+        if isinstance(ome, dict):
+            return ome
+        return attrs
     return {}
 
 
@@ -459,14 +480,19 @@ def _chunk_files(level_path: Path, limit: int) -> List[Path]:
 
 def check_chunk_object_sizes(
     metas: Sequence[ArrayMeta], sample: int = 32, warn_ratio: float = 1.25,
-    fail_ratio: float = 2.0,
+    fail_ratio: float = 2.0, codec_overhead: int = 64,
 ) -> CheckResult:
     """Sampled level-0 chunk files must not dwarf the declared chunk byte size.
 
     A stored chunk is at most its uncompressed ``prod(chunks) * itemsize`` plus a
-    little compressor overhead. A file several times larger means the declared
+    little compressor/codec overhead (a fixed header, and slight inflation of
+    tiny inputs). A file several times larger than that bound means the declared
     chunk grid does not match what was written (#1965). Listing + stat only — no
     pixel reads.
+
+    Size bounds are encoding-aware: compressed/checksummed encodings get a small
+    fixed ``codec_overhead`` allowance so a valid small compressed chunk (e.g. a
+    9-byte zlib-compressed 1-voxel chunk) is not mistaken for a mis-declared grid.
     """
     name = "chunk_object_sizes"
     if not metas:
@@ -479,6 +505,14 @@ def check_chunk_object_sizes(
         return CheckResult(
             name, SKIP, "declared chunk byte size is zero; cannot compare", {}
         )
+
+    # Encoding-aware allowance: an uncompressed chunk is written at exactly its
+    # declared size, so no slack is granted; a compressed/checksummed one carries
+    # a small fixed header that dominates for tiny chunks but is negligible for
+    # the large grids the #1965 oversized detection targets.
+    overhead = codec_overhead if level0.compressed else 0
+    warn_bound = declared_bytes * warn_ratio + overhead
+    fail_bound = declared_bytes * fail_ratio + overhead
 
     files = _chunk_files(level_path, sample)
     if not files:
@@ -494,7 +528,7 @@ def check_chunk_object_sizes(
         size = p.stat().st_size
         ratio = size / declared_bytes
         max_ratio = max(max_ratio, ratio)
-        if ratio > warn_ratio:
+        if size > warn_bound:
             offenders.append(
                 {
                     "chunk": p.relative_to(level_path).as_posix(),
@@ -506,28 +540,30 @@ def check_chunk_object_sizes(
 
     details = {
         "declared_chunk_bytes": declared_bytes,
+        "codec_overhead_bytes": overhead,
         "sampled": len(files),
         "max_ratio": round(max_ratio, 3),
         "offenders": offenders,
     }
-    if any(o["ratio"] > fail_ratio for o in offenders):
+    if any(o["size_bytes"] > fail_bound for o in offenders):
         return CheckResult(
             name, FAIL,
-            f"{len(offenders)} sampled chunk(s) exceed declared size; "
-            f"max {max_ratio:.2f}x of {declared_bytes} bytes (chunk grid mis-declared? #1965)",
+            f"{len(offenders)} sampled chunk(s) exceed the allowed size; "
+            f"max {max_ratio:.2f}x of {declared_bytes} bytes (+{overhead} B overhead) "
+            f"(chunk grid mis-declared? #1965)",
             details,
         )
     if offenders:
         return CheckResult(
             name, WARN,
-            f"{len(offenders)} sampled chunk(s) slightly exceed declared size "
+            f"{len(offenders)} sampled chunk(s) slightly exceed the allowed size "
             f"(max {max_ratio:.2f}x)",
             details,
         )
     return CheckResult(
         name, PASS,
-        f"{len(files)} sampled level-0 chunks are within the declared "
-        f"{declared_bytes}-byte size (max {max_ratio:.2f}x)",
+        f"{len(files)} sampled level-0 chunks are within the allowed size "
+        f"(declared {declared_bytes} B + {overhead} B overhead; max {max_ratio:.2f}x)",
         details,
     )
 
@@ -675,9 +711,19 @@ def check_metadata_json_keys(group_path: Path) -> CheckResult:
             {"path": str(md_path)},
         )
 
-    required = ["scan"]
+    # Volume::loadMetadata reads a canonical ``meta.json`` first and only falls
+    # back to ``metadata.json.scan`` when it is absent
+    # (volume-cartographer/core/src/Volume.cpp:1031-1039). So only require
+    # ``scan`` when no sibling ``meta.json`` exists, else a store that opens fine
+    # via meta.json (the #2078 workaround) gets a false FAIL here.
+    meta_json_present = any(
+        (directory / "meta.json").exists()
+        for directory in dict.fromkeys((group_path, md_path.parent))
+    )
+    required = [] if meta_json_present else ["scan"]
     missing = [k for k in required if k not in md]
-    details = {"path": str(md_path), "keys": sorted(md.keys())}
+    details = {"path": str(md_path), "keys": sorted(md.keys()),
+               "meta_json_present": meta_json_present}
 
     resolved = _resolve_voxel_size(group_path, md_path)
     details["voxel_size"] = resolved
