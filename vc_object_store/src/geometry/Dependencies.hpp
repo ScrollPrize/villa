@@ -4,6 +4,7 @@
 #include <functional>
 #include "geometry/GeometryReader.hpp"
 #include "geometry/PersistentTree.hpp"
+#include "imports/SourceIdentityIndex.hpp"
 
 namespace vc::objects::detail {
 // A bounded reader for either a published revision or a proposed payload.
@@ -62,6 +63,16 @@ inline DependencyGeometry dependencyGeometry(const ObjectStore& db, const Txn& t
             if(!states.contains(array)||!states.at(array).contains("identities"))return std::nullopt;
             const auto point=identityGet(connection,states.at(array).at("identities"),id);
             return point.is_null()?std::nullopt:std::optional(point.at("bytes").get<std::vector<uint8_t>>());
+        };
+    }
+    auto* connection=ObjectStoreImplAccess::conn(txn);
+    if (revision.kind=="point_collection" && !result.identityArrays.contains("point_ids") &&
+        indexedSourceRevision(connection,revision.objectUuid,revision.uuid)) {
+        result.identityArrays.insert("point_ids");
+        result.identity=[reader,connection,object=revision.objectUuid](const std::string&,int64_t id)->std::optional<std::vector<uint8_t>> {
+            const auto offset=indexedSourcePointOffset(connection,object,id);
+            if(!offset || *offset<0) return std::nullopt;
+            return reader->read("points",*offset*24,24);
         };
     }
     result.read = [reader](const auto& name, auto offset, auto count) {

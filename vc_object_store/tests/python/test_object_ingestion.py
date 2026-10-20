@@ -39,7 +39,7 @@ def test_fiber_directory_topology_metadata_and_export(db, tmp_path):
     updated["fiber"]["width"] = 9
     db.upsert_object(updated)
     db.set_approval(edge["uuid"], "approved")
-    assert db.ingest_geometry_source("fiber", source)["unchanged"] == 2
+    assert "re-import is unsupported" in db.ingest_geometry_source("fiber", source)["problems"][0]
     assert db.edge(edge["uuid"])["approval_state"] == "approved"
     out = tmp_path / "out.json"
     db.export_geometry(a, out)
@@ -47,9 +47,9 @@ def test_fiber_directory_topology_metadata_and_export(db, tmp_path):
     assert exported["name"] == "renamed" and exported["tags"] == ["reviewed"]
     assert exported["width"] == 9 and exported["branches"][0]["target_uuid"] == b
     assert not exported["branches"][0]["pending"]
-    # DB removals are authoritative; re-ingestion doesn't resurrect source topology.
+    # Repeat imports fail and cannot resurrect removed topology.
     db.remove_edge(edge["uuid"])
-    db.ingest_geometry_source("fiber", source)
+    assert db.ingest_geometry_source("fiber", source)["problems"]
     assert db.edges_of(a) == []
 
 
@@ -186,7 +186,9 @@ def test_geometry_ingest_patch_fiber_and_point_collections(db, tmp_path):
         "10": {"p": [7, 8, 9], "wind_a": 2}, "2": {"p": [1, 2, 3], "custom": True}}}})
     for kind, path in (("patch", patch_dir), ("fiber", fiber_file), ("point_collection", pcl_file)):
         assert db.ingest_geometry_source(kind, path) == {"ingested": 1, "unchanged": 0, "edges_imported": 0, "problems": []}
-        assert db.ingest_geometry_source(kind, path) == {"ingested": 0, "unchanged": 1, "edges_imported": 0, "problems": []}
+        report = db.ingest_geometry_source(kind, path)
+        assert report["ingested"] == report["unchanged"] == 0
+        assert "re-import is unsupported" in report["problems"][0]
     pcl = db.current_geometry(pcl_id)
     assert np.frombuffer(db.read_geometry_array(pcl["uuid"], "point_ids"), dtype="<i8").tolist() == [2, 10]
     assert db.object(pcl_id)["meta"]["source"]["point_attributes"] == [{"custom": True}, {"wind_a": 2}]
@@ -199,10 +201,11 @@ def test_geometry_ingest_patch_fiber_and_point_collections(db, tmp_path):
     db.set_meta(fiber_id, "keep", True)
     fiber["line_points"][1] = [8, 2, 3]
     fiber_file.write_text(json.dumps(fiber))
-    assert db.ingest_registered_geometry(object_uuids=[fiber_id])["ingested"] == 1
+    assert "re-import is unsupported" in db.ingest_registered_geometry(object_uuids=[fiber_id])["problems"][0]
     assert db.object(fiber_id)["meta"]["keep"] is True
-    assert db.object(fiber_id)["fiber"]["length"] == 7
+    assert db.object(fiber_id)["fiber"]["length"] == 5
     second = db.current_geometry(fiber_id)
+    assert second == first
     # Malformed re-ingestion preserves the last good geometry and graph state.
     fiber["line_points"] = "invalid"; fiber_file.write_text(json.dumps(fiber))
     report = db.ingest_registered_geometry(object_uuids=[fiber_id])
@@ -230,9 +233,12 @@ def test_geometry_ingest_packed_tracks(db, tmp_path):
     assert track["track"]["length"] == 3
     rev = db.current_geometry(track["uuid"])
     assert np.frombuffer(db.read_geometry_array(rev["uuid"], "points"), dtype="<i4").reshape(-1, 3).tolist() == [[3, 2, 1], [3, 2, 4]]
-    assert db.ingest_geometry_source("track", packed)["unchanged"] == 2
-    assert {o["uuid"] for o in db.objects_by_kind("track")} == {o["uuid"] for o in objects}
-    assert db.ingest_registered_geometry()["unchanged"] == 2
+    with db.write(expected_revisions={track["uuid"]: db.current_object_revision(track["uuid"])["uuid"]}) as tx:
+        tx.retire_object(track["uuid"])
+    report = db.ingest_geometry_source("track", packed)
+    assert report["ingested"] == report["unchanged"] == 0 and len(report["problems"]) == 2
+    assert {o["uuid"] for o in db.objects_by_kind("track", include_retired=True)} == {o["uuid"] for o in objects}
+    assert db.ingest_registered_geometry()["problems"]
 
 
 def test_geometry_ingest_rejects_damaged_patch_and_incomplete_save(db, tmp_path):

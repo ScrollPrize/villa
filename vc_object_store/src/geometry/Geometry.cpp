@@ -2,6 +2,7 @@
 #include "geometry/GeometryInternal.hpp"
 #include "geometry/Dependencies.hpp"
 #include "geometry/DependencyIndex.hpp"
+#include "imports/SourceIdentityIndex.hpp"
 #include "geometry/GeometryDelta.hpp"
 #include "internal/History.hpp"
 #include "geometry/SharedGeometry.hpp"
@@ -445,6 +446,8 @@ std::string detail::publishSharedGeometry(ObjectStore& store, WriteTxn& txn, con
     stampContentChange(db,store.author(),store.hostname(),"objects",id,parseUuid(objectUuid),"geometry");
     Statement update(db,"UPDATE objects SET storage_kind='sqlite',data_generation=generation,data_checksum=? WHERE id=?");
     update.bind(1,hash); update.bind(2,id); update.stepDone();
+    if (manifest.at("kind")=="point_collection" && changedIds && changedIds->first=="point_ids")
+        updateSourcePointIdentities(db,objectUuid,current->uuid,uuid,manifest,changedIds->second);
     applyEdgeDecisions(store,txn,db,affected,decisions);
     return uuid;
 }

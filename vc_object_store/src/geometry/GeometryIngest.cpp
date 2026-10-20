@@ -1,4 +1,5 @@
 #include "imports/SourceRelationships.hpp"
+#include "internal/Database.hpp"
 #include "internal/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/GeometryIngest.hpp"
 #include "vc_object_store/PackedTrackStore.hpp"
@@ -51,10 +52,23 @@ void normalizeMetadata(Prepared& p, const std::string& coordinateContext)
 }
 void publishBatch(ObjectStore& db, std::vector<Prepared> batch,
     const std::map<std::string, Expected>& expectations, GeometryIngestReport& report,
-    const std::string& coordinateContext = "{}")
+    const std::string& coordinateContext = "{}", bool registeredInitial = false)
 {
     auto write = db.write();
-    int64_t ingested = 0, unchanged = 0;
+    auto* connection=ObjectStoreImplAccess::conn(write);
+    std::set<std::string> incoming;
+    // Check the entire batch under the writer lock before mutating any object.
+    for(const auto& p:batch) {
+        if(!incoming.insert(p.object.uuid).second)
+            throw std::runtime_error("duplicate object UUID in import: "+p.object.uuid);
+        const auto existing=db.objectByUuid(write,p.object.uuid);
+        detail::Statement history(connection,"SELECT 1 FROM geometry_revisions WHERE object_uuid=? LIMIT 1");
+        history.bindBlob(1,detail::parseUuid(p.object.uuid));
+        detail::Statement prior(connection,"SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1"); prior.bind(1,p.object.uuid);
+        if(registeredInitial ? (!existing || existing->retired || history.row()) : (existing.has_value() || prior.row()))
+            throw std::runtime_error("object already exists or was previously imported; re-import is unsupported: "+p.object.uuid);
+    }
+    int64_t ingested = 0;
     std::vector<detail::SourceRecord> sources;
     for (auto& p : batch) {
         const auto& e = expectations.at(p.object.uuid);
@@ -64,45 +78,29 @@ void publishBatch(ObjectStore& db, std::vector<Prepared> batch,
         if (existing && existing->kind != p.object.kind) throw std::runtime_error("source UUID belongs to another object kind");
         normalizeMetadata(p, coordinateContext);
         if (!existing) db.upsertObject(write, p.object);
-        const auto revision = db.putGeometry(write, p.object.uuid, p.geometry, e.revision);
+        db.putGeometry(write, p.object.uuid, p.geometry, e.revision);
         // Publication no longer needs these arrays; release them before the
         // next object and the topology import allocate their workspaces.
         p.geometry.arrays.clear();
-        const bool seedMetadata = !existing || !Json::parse(existing->meta).contains("source");
-        if (seedMetadata) sources.push_back({p.object, std::move(p.source)});
-        if (e.revision && revision == *e.revision && !seedMetadata) { ++unchanged; continue; }
+        sources.push_back({p.object, std::move(p.source)});
         auto record = *db.objectByUuid(write, p.object.uuid);
         auto metadata = Json::parse(record.meta);
-        // Seed source annotations once; subsequent ingestion preserves DB edits.
-        if (!metadata.contains("source")) {
-            const auto incoming = Json::parse(p.object.meta);
-            metadata["source"] = incoming["source"];
-            metadata["coordinates"] = detail::mergeGeometryCoordinates(
-                metadata.value("coordinates", Json::object()), incoming["coordinates"]);
-        }
+        // First geometry loading seeds source fields, preserving unrelated
+        // placeholder metadata and rejecting conflicting coordinate declarations.
+        const auto incoming = Json::parse(p.object.meta);
+        metadata["source"] = incoming["source"];
+        metadata["coordinates"] = detail::mergeGeometryCoordinates(
+            metadata.value("coordinates", Json::object()), incoming["coordinates"]);
         record.meta = metadata.dump();
-        if (p.object.fiber) {
-            if (e.revision && record.fiber) {
-                record.fiber->controlPointCount = p.object.fiber->controlPointCount;
-                record.fiber->linePointCount = p.object.fiber->linePointCount;
-                record.fiber->length = p.object.fiber->length;
-                record.fiber->bbox = p.object.fiber->bbox;
-            } else record.fiber = p.object.fiber;
-        }
+        if (p.object.fiber) record.fiber = p.object.fiber;
         if (p.object.patch) record.patch = p.object.patch;
-        if (p.object.track) {
-            if (e.revision && record.track) {
-                record.track->pointCount = p.object.track->pointCount;
-                record.track->length = p.object.track->length;
-                record.track->bbox = p.object.track->bbox;
-            } else record.track = p.object.track;
-        }
+        if (p.object.track) record.track = p.object.track;
         db.upsertObject(write, record);
         ++ingested;
     }
     const auto edges = detail::importSourceRelationships(db, write, sources);
     write.commit();
-    report.ingested += ingested; report.unchanged += unchanged; report.edgesImported += edges;
+    report.ingested += ingested; report.edgesImported += edges;
 }
 void publish(ObjectStore& db, Prepared p, const Expected& expected, GeometryIngestReport& report,
     const std::string& coordinateContext)
@@ -179,7 +177,7 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
         } catch (const std::exception& error) { problem(report, object.uuid, error); }
     }
     if (report.problems.empty()) {
-        try { publishBatch(db, std::move(prepared), expectations, report); }
+        try { publishBatch(db, std::move(prepared), expectations, report, "{}", true); }
         catch (const std::exception& error) { problem(report, "batch", error); }
     }
     util::reportProgress(progress, "ingesting geometry", objects.size(), objects.size());
@@ -200,7 +198,7 @@ GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& ki
             std::set<std::string> refs;
             {
                 auto read = db.read();
-                for (const auto& object : db.objectsByKind(read, "track")) {
+                for (const auto& object : db.objectsByKind(read, "track", std::nullopt, true)) {
                     if (!object.track) continue;
                     fs::path path(object.track->datasetRef);
                     if (path.is_relative()) path = db.path().parent_path() / path;
@@ -232,8 +230,8 @@ GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& ki
             std::vector<Prepared> batch;
             std::map<std::string, Expected> expectations;
             {
-                // Pin the object snapshot before reading files so a concurrent
-                // geometry edit cannot be overwritten by a slow source load.
+                // Pin registration expectations while reading files. Publication
+                // rechecks duplicate identities under the writer lock.
                 auto read = db.read();
                 if (kind == "patch") batch.push_back(patch(source));
                 else if (kind == "fiber") {

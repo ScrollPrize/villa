@@ -1,5 +1,6 @@
 #include "internal/Database.hpp"
 #include "internal/History.hpp"
+#include "imports/SourceIdentityIndex.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -35,7 +36,10 @@ void Txn::release(bool commit)
         else db_->impl_->checkinReader(conn);
     };
     try {
-        if (commit && write_) publishHistory(conn);
+        if (commit && write_) {
+            refreshSourceIdentityIndex(conn);
+            publishHistory(conn);
+        }
         exec(conn, commit ? "COMMIT;" : "ROLLBACK;");
     }
     catch (...) {

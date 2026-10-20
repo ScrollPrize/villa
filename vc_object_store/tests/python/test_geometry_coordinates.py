@@ -212,7 +212,7 @@ def test_explicit_backfill_preserves_annotations_and_history(db, kind):
     assert heads(db, uid) == current and db.object(uid)["meta"]["review"] == "keep"
 
 
-def test_reingestion_does_not_refresh_but_source_backfill_does(db, tmp_path):
+def test_reingestion_is_rejected_but_explicit_source_backfill_works(db, tmp_path):
     source = tmp_path / "collections.json"
     ids, document = collection_document(source)
     assert not db.ingest_geometry_source("point_collection", source)["problems"]
@@ -222,7 +222,7 @@ def test_reingestion_does_not_refresh_but_source_backfill_does(db, tmp_path):
     before = heads(db, *ids)
     document.update(LEGACY, volume_uuid=VOLUME)
     source.write_text(json.dumps(document))
-    assert db.ingest_geometry_source("point_collection", source)["unchanged"] == 2
+    assert "re-import is unsupported" in db.ingest_geometry_source("point_collection", source)["problems"][0]
     assert heads(db, *ids) == before
     declarations = read_geometry_source_coordinates("point_collection", source, ids[0])
     with db.write(expected_revisions=before) as tx:

@@ -30,6 +30,87 @@ link library target and the installed executable name. Use `--help` for detector
 options. Original geometry files are needed only for ingestion. CT
 volumes remain inputs to fiber/track-to-patch detection.
 
+## One-time source ingestion
+
+`ingest_geometry_source` / `ingestGeometrySource` creates new objects only.
+An existing UUID is an error, including an unchanged or retired object. Duplicate
+UUIDs within a source batch also fail. Fiber directories and PCL documents publish
+atomically: if a batch mixes new and existing objects, none of it is imported.
+Packed tracks retain their per-track transactions and partial reports; their
+identity is the dataset reference plus external key. Check `problems` on every
+report. The compatibility field `unchanged` is always zero.
+
+`ingest_registered_geometry` / `ingestRegisteredGeometry` is only for first
+geometry loading of registered placeholders. It rejects any object with geometry
+history, including one restored to a state without current geometry. It seeds
+source annotations while preserving unrelated placeholder metadata. After import,
+use the checked geometry, metadata, relationship, and structural editing APIs.
+There is no repeat import, refresh, or file reconciliation.
+
+New point collections resolve source links through indexes on document-scoped
+collection/point identities. Document identity remains the stored `source.origin`:
+imports use the absolute, lexically normalized file path. Symlink aliases and moved
+files are distinct namespaces; no automatic remapping is inferred. To add objects
+to an existing document namespace, import a file containing only the new
+collections at that path. Existing collections may be relationship targets but
+must not appear again as incoming objects. Explicit store metadata edits can move
+a source namespace, with the usual revision/relationship checks.
+
+Only active owners resolve incoming links. Retired objects retain their UUIDs and
+history but do not capture links after points transfer to active objects. Duplicate
+active source identities and missing/ambiguous targets fail explicitly. Resolution
+reads the referenced coordinate chunks or identity-tree entries, without decoding
+all stored PCLs. Existing chunk sizes still bound physical decoding; a single-point
+read can decompress its containing chunk.
+
+Schema 12 maintains these derived indexes transactionally, including structural
+edits, metadata namespace changes, restoration, and synchronization. Structural
+edits update changed identities rather than rebuilding every point row. Initial
+index creation, migration from older writable stores, and replacement/restoration
+of a different complete ID array may process all IDs of the affected objects.
+Migration changes no object history; older stores remain readable read-only.
+Indexes add storage proportional to imported point count.
+
+Import scaling and payload-work checks:
+
+```sh
+AGENTS_AGENT_MODE=1 ninja -C build -j 4
+AGENTS_AGENT_MODE=1 build/bin/bench_source_import 5
+AGENTS_AGENT_MODE=1 PYTHONPATH=build/python /path/to/python scripts/bench_source_import.py
+```
+
+The native harness profiles exclusive storage/publication phases and asserts
+bounded identity/payload work for new imports and subsequent structural appends.
+The Python harness times complete one-point imports with 0, 20,000, and 100,000
+existing points in the same document (five imports each; fixture creation is
+outside timing). Both use synthetic inputs; these are scaling checks, not
+real-scroll or cross-platform latency claims.
+
+Recorded on Linux aarch64, GCC 13.3, RelWithDebInfo (2026-10-20), five
+iterations per case. Times are milliseconds, including publication and commit:
+
+| Existing points | Before mean (min / median / max) | After mean (min / median / max) |
+| ---: | ---: | ---: |
+| 0 | 4.99 (3.90 / 3.96 / 7.96) | 4.47 (3.29 / 4.28 / 6.34) |
+| 20,000 | 14.42 (13.46 / 13.97 / 16.52) | 9.32 (5.01 / 6.20 / 18.95) |
+| 100,000 | 63.19 (58.33 / 61.69 / 72.21) | 1.82 (1.33 / 1.59 / 2.68) |
+
+The small samples show filesystem/cache/scheduling noise; bounded-work checks
+provide the stronger scaling evidence. At every size, the native harness records
+24 coordinate bytes, 16 ID bytes, and three identity-row operations for an
+unlinked import. A link to an existing 1,000-point collection reads 24,048
+coordinate bytes (including its containing chunk), 16 ID bytes, and eight
+identity-row operations, independent of unrelated collection count.
+
+For the 100,000-point cases, the largest instrumented exclusive phases average
+0.110 ms for geometry publication, 0.076 ms for history, and 0.042 ms for index
+maintenance without links; with a link, relationship import is 0.466 ms and
+history publication is 0.384 ms. These spans exclude uninstrumented parsing and
+commit costs included in total latency. The exploratory Python profiler did not
+expose native calls; these are native scoped measurements. Exact commands,
+original timing script, individual samples, and native profiles are in the
+[raw report](benchmarks/source-import-2026-10-20.json).
+
 ## Python
 
 ```python
@@ -386,7 +467,7 @@ decision, with expected revisions for participating endpoints. This is a
 dependency declaration; the store does not establish physical registration or
 validate a domain-specific geometric connection.
 
-Ordinary re-ingestion still seeds source metadata once and preserves database
+Ingestion is one-time: repeat imports are rejected. Explicit backfill preserves database
 annotations. Use explicit checked backfill to repair older objects:
 
 ```python
@@ -452,8 +533,8 @@ additional object fields and unresolved identity strings are retained. These
 are directional source claims: ingestion creates no overlap graph edges,
 resolves no target revision, and infers neither symmetry nor completeness.
 This avoids inventing identity mappings or dropping not-yet-imported targets.
-As with other source annotations, ingestion seeds this metadata once; file
-refresh/reconciliation is the separate audit item 6.
+As with other source annotations, ingestion seeds this metadata once. Re-import
+is rejected; later edits use the store APIs. File refresh/reconciliation is unsupported.
 
 Use `update_surface_channels` / `ObjectStore::updateSurfaceChannels` to add or
 replace supplied channels and remove named channels in one publication. Supply

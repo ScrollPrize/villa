@@ -1,5 +1,7 @@
 #include "imports/SourceRelationships.hpp"
 #include "geometry/GeometrySnapshot.hpp"
+#include "geometry/Dependencies.hpp"
+#include "imports/SourceIdentityIndex.hpp"
 #include <map>
 #include <set>
 
@@ -8,18 +10,12 @@ namespace {
 using Json = nlohmann::json;
 struct Points {
     std::vector<double> xyz;
-    std::vector<int64_t> ids;
-    Anchor anchor(int64_t index, bool pointId = false) const {
-        auto offset = index;
-        if (pointId) {
-            auto it = std::find(ids.begin(), ids.end(), index);
-            if (it == ids.end()) throw std::runtime_error("source link refers to missing point ID");
-            offset = it - ids.begin();
-        }
+    Anchor anchor(int64_t index) const {
+        const auto offset = index;
         if (offset < 0 || static_cast<size_t>(offset) >= xyz.size() / 3)
             throw std::runtime_error("source branch control point index out of range");
         Anchor result;
-        result.points.push_back({pointId ? "point_ids" : "control_points", {index}});
+        result.points.push_back({"control_points", {index}});
         result.position = {xyz[3*offset], xyz[3*offset+1], xyz[3*offset+2]};
         return result;
     }
@@ -27,21 +23,20 @@ struct Points {
 }
 int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vector<SourceRecord>& sources)
 {
+    GeometryPhase phase("importSourceRelationships");
+    DependencyScope dependencies;
+    auto* connection=ObjectStoreImplAccess::conn(txn);
+    refreshSourceIdentityIndex(connection);
     std::map<std::string, Points> points;
-    auto load = [&](const std::string& id, const std::string& kind) -> const Points& {
+    auto load = [&](const std::string& id) -> const Points& {
         if (points.contains(id)) return points.at(id);
         auto object = db.objectByUuid(txn, id);
         auto revision = db.currentGeometry(txn, id);
-        if (!object || object->kind != kind || !revision)
-            throw std::runtime_error("source relationship endpoint needs stored " + kind + " geometry: " + id);
+        if (!object || object->kind != "fiber" || !revision)
+            throw std::runtime_error("source relationship endpoint needs stored fiber geometry: " + id);
         GeometrySnapshot snapshot; snapshot.revision = *revision;
-        const auto name = kind == "fiber" ? "control_points" : "points";
-        snapshot.arrays[name] = db.readGeometryArray(txn, revision->uuid, name);
-        Points p; p.xyz = snapshot.values<double>(name);
-        if (kind == "point_collection") {
-            snapshot.arrays["point_ids"] = db.readGeometryArray(txn, revision->uuid, "point_ids");
-            p.ids = snapshot.values<int64_t>("point_ids");
-        }
+        snapshot.arrays["control_points"] = db.readGeometryArray(txn, revision->uuid, "control_points");
+        Points p; p.xyz = snapshot.values<double>("control_points");
         return points.emplace(id, std::move(p)).first->second;
     };
     int64_t inserted = 0;
@@ -58,6 +53,7 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
     };
     // Resolve source filenames only during ingestion; stored edges always use UUIDs.
     std::map<std::string, std::set<std::string>> fiberNames;
+    if (std::any_of(sources.begin(),sources.end(),[](const auto& s) { return s.object.kind=="fiber"; }))
     for (const auto& object : db.objectsByKind(txn, "fiber")) {
         fiberNames[std::filesystem::path(object.storageRef).filename().string()].insert(object.uuid);
         fiberNames[object.name + ".json"].insert(object.uuid);
@@ -79,8 +75,8 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
                 }
                 EdgeRecord edge; edge.kind = "fiber_branch";
                 edge.aUuid = entry.object.uuid; edge.bUuid = target;
-                edge.aAnchor = load(edge.aUuid, "fiber").anchor(branch.at("control_point_index").get<int64_t>());
-                edge.bAnchor = load(edge.bUuid, "fiber").anchor(branch.at("branch_control_point_index").get<int64_t>());
+                edge.aAnchor = load(edge.aUuid).anchor(branch.at("control_point_index").get<int64_t>());
+                edge.bAnchor = load(edge.bUuid).anchor(branch.at("branch_control_point_index").get<int64_t>());
                 for (auto [anchor, field] : {std::pair{&edge.aAnchor, "control_point_direction"}, {&edge.bAnchor, "branch_control_point_direction"}})
                     if (branch.contains(field)) anchor->direction = branch.at(field).get<std::array<double, 3>>();
                 edge.meta = Json{{"source_import", "object-source"}, {"adjacent", std::string(key) == "adjacent_branches"}}.dump();
@@ -89,42 +85,46 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
         }
     }
     if (std::none_of(sources.begin(), sources.end(), [](const auto& s) { return s.object.kind == "point_collection"; })) return inserted;
-    // Point IDs and collection IDs are scoped to the originating document.
-    using Key = std::pair<std::string, std::string>;
-    std::map<Key, std::string> collections, pointOwners;
-    for (const auto& object : db.objectsByKind(txn, "point_collection")) {
-        if (!db.currentGeometry(txn, object.uuid)) continue;
-        auto source = Json::parse(object.meta).value("source", Json::object());
-        if (!source.contains("source_collection_id")) continue;
-        auto origin = source.value("origin", object.storageRef);
-        if (!collections.emplace(Key{origin, source.at("source_collection_id").get<std::string>()}, object.uuid).second)
-            throw std::runtime_error("duplicate source collection ID");
-        for (auto id : load(object.uuid, "point_collection").ids)
-            if (!pointOwners.emplace(Key{origin, std::to_string(id)}, object.uuid).second)
-                throw std::runtime_error("duplicate point ID in source document");
-    }
+    // Validate only the incoming identities. Indexed probes include existing
+    // owners in the same document, without reading unrelated geometry.
+    for(const auto& entry:sources)
+        if(entry.object.kind=="point_collection") validateSourceIdentities(connection,entry.object.uuid);
+    auto anchor=[&](const std::string& object,int64_t id) {
+        const auto revision=db.currentGeometry(txn,object);
+        if(!revision) throw std::runtime_error("source relationship endpoint needs stored point_collection geometry: "+object);
+        const PointReference reference{"point_ids",{id}};
+        const auto bytes=pointValue(dependencyGeometry(db,txn,*revision),reference);
+        if(!bytes) throw std::runtime_error("source link refers to missing point ID");
+        GeometrySnapshot snapshot; snapshot.arrays["point"]=*bytes;
+        const auto xyz=snapshot.values<double>("point");
+        Anchor result; result.points.push_back(reference); result.position={xyz[0],xyz[1],xyz[2]}; return result;
+    };
     for (const auto& entry : sources) {
         if (entry.object.kind != "point_collection") continue;
         const auto origin = entry.source.value("origin", entry.object.storageRef);
-        const auto& p = load(entry.object.uuid, "point_collection");
-        const auto extras = entry.source.at("point_attributes");
-        for (size_t i = 0; i < p.ids.size(); ++i) {
-            for (const auto& link : extras.at(i).value("links", Json::array())) {
+        const auto& extras = entry.source.at("point_attributes");
+        Statement ids(connection,"SELECT point_id FROM source_points WHERE object_uuid=? ORDER BY point_offset");
+        ids.bindBlob(1,parseUuid(entry.object.uuid));
+        size_t i=0;
+        while(ids.row()) {
+            const auto point=ids.i64(0);
+            const auto& attributes=extras.at(i++);
+            for (const auto& link : attributes.value("links", Json::array())) {
                 const auto id = link.get<int64_t>();
-                auto found = pointOwners.find({origin, std::to_string(id)});
-                if (found == pointOwners.end()) throw std::runtime_error("point link target not ingested: " + std::to_string(id));
-                EdgeRecord edge; edge.kind = "point_link"; edge.aUuid = entry.object.uuid; edge.bUuid = found->second;
-                edge.aAnchor = p.anchor(p.ids[i], true);
-                edge.bAnchor = load(edge.bUuid, "point_collection").anchor(id, true);
+                const auto found=sourcePoint(connection,origin,id);
+                if(!found) throw std::runtime_error("point link target not ingested: " + std::to_string(id));
+                EdgeRecord edge; edge.kind = "point_link"; edge.aUuid = entry.object.uuid; edge.bUuid = found->object;
+                edge.aAnchor = anchor(edge.aUuid,point);
+                edge.bAnchor = anchor(edge.bUuid,id);
                 edge.meta = R"({"source_import":"object-source"})";
                 add(std::move(edge));
             }
         }
         for (const auto& link : entry.source.value("windings_linked", Json::array())) {
             const auto id = link.is_string() ? link.get<std::string>() : std::to_string(link.get<int64_t>());
-            auto found = collections.find({origin, id});
-            if (found == collections.end()) throw std::runtime_error("winding link target not ingested: " + id);
-            EdgeRecord edge; edge.kind = "collection_winding"; edge.aUuid = entry.object.uuid; edge.bUuid = found->second;
+            const auto found=sourceCollection(connection,origin,id);
+            if(!found) throw std::runtime_error("winding link target not ingested: " + id);
+            EdgeRecord edge; edge.kind = "collection_winding"; edge.aUuid = entry.object.uuid; edge.bUuid = *found;
             edge.aAnchor.wholeGeometry = true; edge.bAnchor.wholeGeometry = true;
             edge.meta = R"({"source_import":"object-source"})";
             add(std::move(edge));

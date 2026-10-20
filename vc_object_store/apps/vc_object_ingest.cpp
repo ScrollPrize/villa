@@ -28,17 +28,17 @@ try {
         else if (arg == "--no-progress") showProgress = false;
         else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: vc_object_ingest --db objects.vcobj --author NAME [options]\n"
-                "  --registered              ingest all registered linkable objects\n"
-                "  --uuid UUID               ingest selected registered objects (repeatable)\n"
+                "  --registered              load initial geometry for registered placeholders\n"
+                "  --uuid UUID               load selected placeholders (flag repeatable)\n"
                 "  --dataset-root DIR        resolve registered source paths relative to DIR\n"
-                "  --patch DIR               ingest/register a tifxyz patch\n"
-                "  --fiber PATH              ingest a fiber JSON or directory of connected fibers\n"
-                "  --point-collections FILE  ingest/register every collection in a JSON\n"
-                "  --tracks PATH             ingest/register packed tracks (or DBM with packed mirror)\n"
+                "  --patch DIR               import a new tifxyz patch\n"
+                "  --fiber PATH              import new fibers from JSON or a directory\n"
+                "  --point-collections FILE  import new collections from a JSON\n"
+                "  --tracks PATH             import new packed tracks (or DBM with packed mirror)\n"
                 "  --no-progress             suppress progress display\n"
                 "Fiber/collection sources and registered batches commit atomically; tracks commit individually. Failures are reported and exit status is nonzero.\n"
-                "Source flags are repeatable. Existing identities, tags and metadata are retained;\n"
-                "geometry changes affecting relationships require explicit edit decisions through the object API.\n";
+                "Source flags are repeatable. Existing object identities are errors, even when unchanged.\n"
+                "Edit imported geometry, annotations and relationships through the object API.\n";
             return 0;
         } else throw std::runtime_error("unknown argument: " + arg);
     }
@@ -48,7 +48,7 @@ try {
     auto db = std::filesystem::exists(path) ? vc::objects::ObjectStore::open(path, options) : vc::objects::ObjectStore::create(path, options);
     bool failed = false;
     auto print = [&](const vc::objects::GeometryIngestReport& report) {
-        std::cout << report.ingested << " ingested, " << report.unchanged << " unchanged, " << report.problems.size() << " problems\n";
+        std::cout << report.ingested << " ingested, " << report.problems.size() << " problems\n";
         for (const auto& problem : report.problems) std::cerr << problem << '\n';
         failed |= !report.problems.empty();
     };

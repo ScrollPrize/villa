@@ -4,6 +4,6 @@
 namespace vc::objects::detail {
 struct SourceRecord { ObjectRecord object; nlohmann::json source; };
 // Endpoints must already exist. Resolves source labels to UUIDs once, imports
-// canonical anchored edges, and reconciles only this importer's pending edges.
+// canonical anchored edges for newly imported objects. Never reconciles old imports.
 int64_t importSourceRelationships(ObjectStore&, WriteTxn&, const std::vector<SourceRecord>&);
 }
