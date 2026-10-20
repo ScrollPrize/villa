@@ -370,10 +370,12 @@ set_target_properties(test_fiber_network_layout PROPERTIES
 
 target_include_directories(test_fiber_network_layout PRIVATE
     ${PROJECT_SOURCE_DIR}/apps/VC3D
+    ${PROJECT_SOURCE_DIR}/core/include
     ${OpenCV_INCLUDE_DIRS})
 
 target_link_libraries(test_fiber_network_layout PRIVATE
     Qt6::Core
+    Qt6::Gui
     Qt6::Test)
 
 add_test(NAME fiber_network_layout COMMAND test_fiber_network_layout)
