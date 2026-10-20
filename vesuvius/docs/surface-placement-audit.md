@@ -112,16 +112,19 @@ segments (10th / median / 90th):
 | `tangent_corr_2` / `_4` / `_8` | 0.79 / 0.62 / 0.41 | 0.85 / 0.72 / 0.54 | 0.89 / 0.79 / 0.66 |
 
 The segments give the same picture, and the offset histogram is nearly
-flat from −6 to +6, so this is not segments drifting the same way. The
-controls say what it is: the snap control remeasures at a spread of 0.3
-voxels, so the peak location is precise; the offsets of two points 2 and 4
-voxels apart agree (median difference 0.5, correlation 0.85 and 0.7), at 8
-voxels they differ by 1 (correlation 0.5), and in a dense resample of one crop
-they are uncorrelated by 16 voxels. The public meshes are triangles of roughly
-18 voxels, and the sheet moves by several voxels inside one triangle. On half
-the surface area the mesh is more than 2 voxels (16 µm) from the sheet, and
-that is a resolution limit of the mesh, not a tracing error that a global
-shift would fix. Per-segment rows are in the evidence repository
+flat from −6 to +6, so this is not segments drifting the same way. What the
+controls show: the snap control remeasures at a spread of 0.3 voxels, so the
+peak location is repeatable once a peak is found; the offsets of two points 2
+and 4 voxels apart agree (median difference 0.5, correlation 0.85 and 0.7), at
+8 voxels they differ by 1 (correlation 0.5), and in a dense resample of one
+crop they are uncorrelated by 16 voxels, so the offset varies along the
+surface on a scale of a few voxels. On half the surface area the mesh is more
+than 2 voxels (16 µm) from the sheet. What the controls do not show: that the
+detected peak is the papyrus surface rather than another layer or an edge, or
+what causes the offsets. One hypothesis is that the public meshes, with
+roughly 18 voxels between vertices, cannot follow a sheet that wanders a few
+voxels inside one triangle; this was not tested (for instance against a finer
+mesh). Per-segment rows are in the evidence repository
 (`data/scroll1_segment_placement.csv`). At 20000 samples over a segment of hundreds of cm² no 32-voxel
 cell collects 30 points, so the `patch_*` metrics are NaN; they need a dense
 sample (a small tifxyz patch, or `--samples` in the millions).

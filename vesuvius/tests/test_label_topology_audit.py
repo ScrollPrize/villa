@@ -285,9 +285,39 @@ def test_fusion_heuristic_flags_thick_lobes_joined_by_a_thin_bridge():
     label[8:22, 8:22, 4:18] = 1
     label[8:22, 8:22, 32:46] = 1
     label[14:16, 14:16, 18:32] = 1
-    metrics, _ = lta.audit(label)
+    metrics, flags = lta.audit(label)
     assert metrics["n_components"] == metrics["n_fused_components"] == 1
     assert metrics["fused_voxel_frac"] == 1
+    # a 14-voxel bridge is detected as fusion but not located: after erosion the
+    # two pieces are far apart, and bridge voxels are only those within one
+    # voxel of both pieces (documented limitation)
+    assert metrics["bridge_voxels"] == 0 and not flags["bridge"].any()
+
+
+def test_bridge_voxels_locate_a_one_voxel_neck():
+    label = np.zeros((30, 30, 50), np.uint8)
+    label[8:22, 8:22, 4:18] = 1
+    label[8:22, 8:22, 19:33] = 1
+    label[14:16, 14:16, 18] = 1  # one-voxel neck joining the lobes
+    metrics, flags = lta.audit(label)
+    assert metrics["n_fused_components"] == 1
+    assert metrics["bridge_voxels"] == 4
+    assert flags["bridge"][14:16, 14:16, 18].all() and flags["bridge"].sum() == 4
+
+
+def test_empty_crop_audits_end_to_end_and_gates(tmp_path):
+    # thickness is undefined on an empty crop (None in the flat row); the gate
+    # only accepts the integer/fraction metrics, so None never reaches a comparison
+    tifffile.imwrite(tmp_path / "empty.tif", np.zeros((16, 16, 16), np.uint8))
+    out = tmp_path / "out"
+    rc = lta.main(["--label", str(tmp_path / "empty.tif"), "--out", str(out)])
+    assert rc == 0
+    row = json.loads((out / "empty.json").read_text())
+    assert row["thickness"] == {} and "thick_p95" not in lta.flat_keys()
+    with pytest.raises(SystemExit):
+        lta._parse_fail_on(["thick_p95=12"])
+    rc = lta.main(["--label", str(tmp_path / "empty.tif"), "--out", str(out), "--fail-on", "fg_frac=-1"])
+    assert rc == 2
 
 
 def test_parse_roi_clips_and_rejects_empty():

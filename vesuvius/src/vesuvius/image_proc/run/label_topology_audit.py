@@ -14,7 +14,9 @@ Per crop it measures:
   * sheet thickness: 2*EDT-1 sampled at medial-ridge voxels (local EDT maxima)
   * fused sheets: after eroding by ``--erode`` voxels, a component that splits
     into >= 2 pieces of >= ``--min-piece`` voxels is "fused" (blind on 1-3
-    voxel sheets, which erosion deletes)
+    voxel sheets, which erosion deletes); ``bridge_voxels`` are foreground voxels
+    within one voxel of two different pieces, so it locates one-voxel necks and
+    line contacts only; a longer bridge is counted as fused but not located
   * hole locations: closing-filled background blobs whose filling lowers b1
     (centre, size, interior/crop face); ``--hole-masks`` writes them for fix_holes.py
   * non-planar junction clusters (structure tensor): a clean sheet is rank-1;

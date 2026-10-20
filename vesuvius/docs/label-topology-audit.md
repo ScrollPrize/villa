@@ -116,7 +116,7 @@ vesuvius.label_topology_audit --label DATA_DIR/labels/sample_00340.tif \
 | `b2_total_big` | Betti-2: enclosed cavities (a hollow shell is 1) |
 | `n_closed_big`, `n_closed_with_b1` | big components not touching the crop border or ignore voxels; this does not establish physical correctness |
 | `thick_*` | thickness proxy in voxel units (`2*EDT-1` at medial ridge voxels, with background padding); truncated at crop faces and not calibrated physical thickness; `frac_ge_7` is the share at 7 voxels or more |
-| `n_fused_components`, `bridge_voxels` | components that split into several large pieces after `--erode` erosion; blind on 1-3 voxel sheets |
+| `n_fused_components`, `bridge_voxels` | components that split into several large pieces after `--erode` erosion; blind on 1-3 voxel sheets. `bridge_voxels` counts foreground voxels within one voxel of two different pieces, so it locates one-voxel necks and line contacts only; a longer bridge is counted as fused but not located (on the 892 Kaggle crops it is nonzero on 1 of 22 fused crops) |
 | `n_junction_clusters` | clusters (20+ voxels) where the structure tensor is not planar: merged sheets or bridges |
 | `largest_component_frac` | share of foreground in the biggest component |
 
