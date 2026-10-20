@@ -57,6 +57,7 @@ set_target_properties(vc_core vc_lasagna utils utils_c3d_codec c3d utils_volcomp
 nanobind_add_module(vc_volume
     NOMINSIZE
     vc/volume.cpp
+    vc/normal_sampler.cpp
 )
 set_target_properties(vc_volume PROPERTIES
     OUTPUT_NAME volume
@@ -65,7 +66,7 @@ set_target_properties(vc_volume PROPERTIES
     # site-packages root one level up, so search both.
     INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
 )
-target_link_libraries(vc_volume PRIVATE vc_core)
+target_link_libraries(vc_volume PRIVATE vc_core vc_lasagna)
 target_compile_features(vc_volume PRIVATE cxx_std_23)
 
 nanobind_add_module(vc_surface_index

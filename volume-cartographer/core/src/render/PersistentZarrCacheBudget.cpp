@@ -1,6 +1,7 @@
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
 
 #include "vc/core/render/ChunkFetch.hpp"
+#include "vc/core/render/detail/CacheAgeBuckets.hpp"
 
 #include "vc/core/util/Logging.hpp"
 
@@ -261,9 +262,11 @@ Registry& registry()
 } // namespace
 
 struct PersistentZarrCacheBudget::Impl {
+    using Ages = detail::CacheAgeBuckets<const std::string*>;
     struct Entry {
         std::uint64_t size = 0;
         fs::file_time_type touched{};
+        Ages::Handle age = Ages::none;
     };
 
     fs::path root;
@@ -285,7 +288,164 @@ struct PersistentZarrCacheBudget::Impl {
     // is stable instead of blocking the caller that performs the rename.
     bool scanRestartRequested = false;
     bool trimInFlight = false;
+    bool trimRequested = false;
+    bool pressure = false;
     std::size_t retirementsInFlight = 0;
+    Ages ages{generation()};
+    std::set<std::string> deleting;
+    std::set<std::string> scanChangedPaths;
+    double averageObjectBytes = 0.0;
+    std::jthread vacuumThread;
+
+    ~Impl()
+    {
+        {
+            std::lock_guard lock(mutex);
+            vacuumThread.request_stop();
+        }
+        cv.notify_all();
+    }
+
+    static std::uint64_t generation()
+    {
+        return 32 + std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    }
+
+    void indexEntry(const std::string& path, Entry& entry, std::uint64_t gen)
+    {
+        if (!entry.size)
+            return;
+        entry.age = ages.insert(&path, gen);
+        if (readPins.contains(path) || writePins.contains(path))
+            ages.suspend(entry.age);
+    }
+
+    void suspend(const std::string& path)
+    {
+        auto it = entries.find(path);
+        if (it != entries.end() && it->second.age != Ages::none)
+            ages.suspend(it->second.age);
+    }
+
+    void resume(const std::string& path)
+    {
+        auto it = entries.find(path);
+        if (it != entries.end() && it->second.age != Ages::none &&
+            !readPins.contains(path) && !writePins.contains(path) &&
+            !deleting.contains(path))
+            ages.resume(it->second.age);
+    }
+
+    void erase(std::unordered_map<std::string, Entry>::iterator it)
+    {
+        managedBytes -= std::min(managedBytes, it->second.size);
+        if (it->second.age != Ages::none)
+            ages.erase(it->second.age);
+        entries.erase(it);
+    }
+
+    static std::uint64_t add(std::uint64_t a, std::uint64_t b)
+    {
+        return a + std::min(b, std::numeric_limits<std::uint64_t>::max() - a);
+    }
+
+    void vacuum(std::stop_token stop)
+    {
+        std::unique_lock lock(mutex);
+        while (!stop.stop_requested()) {
+            cv.wait(lock, [&] { return stop.stop_requested() ||
+                (trimRequested && !scanInFlight); });
+            if (stop.stop_requested())
+                break;
+            trimRequested = false;
+            trimInFlight = true;
+            lock.unlock();
+            std::error_code spaceError;
+            const auto space = spaceProvider(root, spaceError);
+            lock.lock();
+            if (!spaceError)
+                freeBytes = space.available;
+            lowSpace = limits.minimumFreeBytes && freeBytes < limits.minimumFreeBytes;
+            const auto cap = limits.maximumBytes.value_or(spaceError ? 0 : space.capacity);
+            const auto headroom = static_cast<std::uint64_t>(std::min(
+                double(cap / 100), averageObjectBytes * 1000.0));
+            auto deficit = [](std::uint64_t used, std::uint64_t limit) {
+                return used > limit ? used - limit : 0;
+            };
+            auto needed = [&](std::uint64_t reserve) {
+                std::uint64_t bytes = 0;
+                if (limits.maximumBytes) {
+                    const auto target = *limits.maximumBytes - std::min(reserve, *limits.maximumBytes);
+                    bytes = deficit(add(managedBytes, reservedGrowth), target);
+                }
+                if (!spaceError && limits.minimumFreeBytes) {
+                    bytes = std::max(bytes, deficit(add(add(limits.minimumFreeBytes, reserve),
+                                                       reservedTemporaryBytes), freeBytes));
+                }
+                return bytes;
+            };
+            pressure = needed(headroom / 2) > 0;
+            std::vector<std::string> failed;
+            while (pressure && !stop.stop_requested()) {
+                auto bytes = needed(headroom);
+                if (!bytes) {
+                    pressure = false;
+                    break;
+                }
+                ages.advance(generation());
+                std::vector<std::pair<std::string, std::uint64_t>> victims;
+                std::uint64_t selectedBytes = 0;
+                // Bound both lazy bucket repairs and deletion batch size.
+                for (int work = 0; work < 128 && selectedBytes < bytes; ++work) {
+                    const auto id = ages.takeOldest(1);
+                    if (id == Ages::none) {
+                        if (ages.empty())
+                            break;
+                        continue;
+                    }
+                    const auto& path = *ages.value(id);
+                    const auto size = entries.at(path).size;
+                    deleting.insert(path);
+                    victims.emplace_back(path, size);
+                    selectedBytes = add(selectedBytes, size);
+                }
+                if (victims.empty() && ages.empty())
+                    break; // Pins/failures may prevent reaching the target.
+                lock.unlock();
+                for (const auto& [path, size] : victims) {
+                    std::error_code ec;
+                    fs::remove(path, ec);
+                    // Already absent is success: external deletion must not
+                    // leave an uncollectable phantom in the accounting index.
+                    lock.lock();
+                    deleting.erase(path);
+                    if (!ec) {
+                        if (auto it = entries.find(path); it != entries.end())
+                            erase(it);
+                        freeBytes = add(freeBytes, size);
+                    } else {
+                        failed.push_back(path);
+                    }
+                    lock.unlock();
+                    cv.notify_all();
+                    if (ec)
+                        Logger()->warn("Could not evict persistent Zarr cache entry {}: {}",
+                                       path, ec.message());
+                }
+                // Refresh actual free space outside the lock, once per batch.
+                const auto refreshed = spaceProvider(root, spaceError);
+                lock.lock();
+                if (!spaceError)
+                    freeBytes = refreshed.available;
+            }
+            for (const auto& path : failed)
+                resume(path); // Retry only on a subsequent activity event.
+            lowSpace = limits.minimumFreeBytes && freeBytes < limits.minimumFreeBytes;
+            trimInFlight = false;
+            cv.notify_all();
+        }
+    }
 };
 
 PersistentZarrCacheBudget::PersistentZarrCacheBudget(
@@ -298,6 +458,9 @@ PersistentZarrCacheBudget::PersistentZarrCacheBudget(
                                     : [](const fs::path& path, std::error_code& ec) {
                                           return fs::space(path, ec);
                                       };
+    impl_->vacuumThread = std::jthread([this](std::stop_token stop) {
+        impl_->vacuum(stop);
+    });
 }
 
 std::shared_ptr<PersistentZarrCacheBudget> PersistentZarrCacheBudget::configure(
@@ -406,7 +569,6 @@ void PersistentZarrCacheBudget::startScan()
             }
 
             std::unordered_map<std::string, Impl::Entry> found;
-            std::uint64_t total = 0;
             const auto genericPayloads = managedGenericPayloads(files);
             for (const auto& path : files) {
                 if (!isVolumeChunk(path, self->impl_->root) &&
@@ -422,7 +584,6 @@ void PersistentZarrCacheBudget::startScan()
                 if (fileEc)
                     continue;
                 found.emplace(path.string(), Impl::Entry{size, touched});
-                total += size;
             }
 
             bool restart = false;
@@ -431,8 +592,32 @@ void PersistentZarrCacheBudget::startScan()
                 restart = self->impl_->scanRestartRequested;
                 self->impl_->scanRestartRequested = false;
                 if (!restart) {
+                    // Writes continue during inventory. Their live accounting
+                    // wins over paths observed before/during those writes.
+                    for (const auto& path : self->impl_->scanChangedPaths)
+                        found.erase(path);
+                    for (const auto& [path, entry] : self->impl_->entries)
+                        found.insert_or_assign(path, entry);
                     self->impl_->entries = std::move(found);
-                    self->impl_->managedBytes = total;
+                    auto& impl = *self->impl_;
+                    impl.scanChangedPaths.clear();
+                    const auto gen = Impl::generation();
+                    impl.ages = Impl::Ages(gen);
+                    impl.managedBytes = 0;
+                    std::size_t objects = 0;
+                    const auto now = fs::file_time_type::clock::now();
+                    for (auto& [path, entry] : impl.entries) {
+                        entry.age = Impl::Ages::none;
+                        const auto age = std::clamp<std::int64_t>(
+                            std::chrono::duration_cast<std::chrono::seconds>(now - entry.touched).count() / 10,
+                            0, 32);
+                        impl.indexEntry(path, entry, gen - age);
+                        impl.managedBytes += entry.size;
+                        objects += entry.size > 0;
+                    }
+                    if (!impl.averageObjectBytes && objects)
+                        impl.averageObjectBytes = double(impl.managedBytes) / objects;
+                    impl.trimRequested = true;
                     self->impl_->scanInFlight = false;
                     self->impl_->retirementsInFlight += retiredRoots.size();
                 }
@@ -445,9 +630,7 @@ void PersistentZarrCacheBudget::startScan()
                 break;
             }
         }
-        self->startTrim();
         self->impl_->cv.notify_all();
-        self->pollSpace();
     }).detach();
 }
 
@@ -473,98 +656,32 @@ void PersistentZarrCacheBudget::removeRetiredSubtreeAsync(
         {
             std::lock_guard lock(self->impl_->mutex);
             --self->impl_->retirementsInFlight;
+            self->impl_->trimRequested = true;
         }
         self->impl_->cv.notify_all();
-        self->pollSpace();
     }).detach();
 }
 
 void PersistentZarrCacheBudget::updateLimits(Limits limits)
 {
-    bool lower = false;
     {
         std::lock_guard lock(impl_->mutex);
-        lower = limits.maximumBytes &&
-                (!impl_->limits.maximumBytes ||
-                 *limits.maximumBytes < *impl_->limits.maximumBytes);
         impl_->limits = limits;
     }
-    pollSpace();
-    if (lower)
-        startTrim();
+    startTrim();
 }
 
 void PersistentZarrCacheBudget::startTrim()
 {
     {
         std::lock_guard lock(impl_->mutex);
-        if (impl_->trimInFlight || !impl_->limits.maximumBytes)
-            return;
-        impl_->trimInFlight = true;
+        impl_->trimRequested = true;
     }
-    auto self = shared_from_this();
-    std::thread([self] {
-        std::unique_lock lock(self->impl_->mutex);
-        self->impl_->cv.wait(lock, [&] { return !self->impl_->scanInFlight; });
-        while (self->impl_->limits.maximumBytes &&
-               self->impl_->managedBytes > *self->impl_->limits.maximumBytes) {
-            auto victim = self->impl_->entries.end();
-            for (auto it = self->impl_->entries.begin(); it != self->impl_->entries.end(); ++it) {
-                if (self->impl_->readPins.contains(it->first) ||
-                    self->impl_->writePins.contains(it->first))
-                    continue;
-                if (victim == self->impl_->entries.end() ||
-                    it->second.touched < victim->second.touched)
-                    victim = it;
-            }
-            if (victim == self->impl_->entries.end())
-                break;
-            const auto path = fs::path(victim->first);
-            const auto size = victim->second.size;
-            std::error_code ec;
-            if (fs::remove(path, ec) && !ec) {
-                self->impl_->managedBytes -= std::min(self->impl_->managedBytes, size);
-                self->impl_->entries.erase(victim);
-            } else {
-                Logger()->warn("Could not evict persistent Zarr cache entry {}: {}",
-                               path.string(), ec.message());
-                // Avoid retrying a failing entry forever in this trim pass.
-                victim->second.touched = fs::file_time_type::max();
-                bool anyOther = false;
-                for (const auto& [key, entry] : self->impl_->entries) {
-                    if (key != path.string() && entry.touched != fs::file_time_type::max() &&
-                        !self->impl_->readPins.contains(key) &&
-                        !self->impl_->writePins.contains(key)) {
-                        anyOther = true;
-                        break;
-                    }
-                }
-                if (!anyOther)
-                    break;
-            }
-        }
-        self->impl_->trimInFlight = false;
-        lock.unlock();
-        self->impl_->cv.notify_all();
-        self->pollSpace();
-    }).detach();
-}
-
-void PersistentZarrCacheBudget::pollSpace()
-{
-    std::error_code ec;
-    const auto info = impl_->spaceProvider(impl_->root, ec);
-    if (ec)
-        return;
-    std::lock_guard lock(impl_->mutex);
-    impl_->freeBytes = info.available;
-    impl_->lowSpace = impl_->limits.minimumFreeBytes > 0 &&
-                      info.available < impl_->limits.minimumFreeBytes;
+    impl_->cv.notify_all();
 }
 
 PersistentZarrCacheBudget::Stats PersistentZarrCacheBudget::stats()
 {
-    pollSpace();
     std::lock_guard lock(impl_->mutex);
     return Stats{impl_->managedBytes,
                  impl_->freeBytes,
@@ -572,7 +689,7 @@ PersistentZarrCacheBudget::Stats PersistentZarrCacheBudget::stats()
                  impl_->limits.minimumFreeBytes,
                  impl_->lowSpace,
                  impl_->scanInFlight,
-                 impl_->trimInFlight};
+                 impl_->trimInFlight || impl_->trimRequested};
 }
 
 PersistentZarrCacheBudget::ReadPin PersistentZarrCacheBudget::pinRead(const fs::path& path)
@@ -581,9 +698,11 @@ PersistentZarrCacheBudget::ReadPin PersistentZarrCacheBudget::pinRead(const fs::
     {
         std::unique_lock lock(impl_->mutex);
         impl_->cv.wait(lock, [&] {
-            return !impl_->writePins.contains(normalized.string());
+            return !impl_->writePins.contains(normalized.string()) &&
+                   !impl_->deleting.contains(normalized.string());
         });
         ++impl_->readPins[normalized.string()];
+        impl_->suspend(normalized.string());
     }
     return ReadPin(shared_from_this(), normalized);
 }
@@ -614,17 +733,14 @@ PersistentZarrCacheBudget::reserveWriteImpl(
         path = normalizedPath(path);
 
     std::unique_lock lock(impl_->mutex);
-    // Protected structural metadata is not part of the managed chunk index, so
-    // it can be published while an accounting scan is running. Managed payload
-    // writes still wait for an exact index before enforcing size limits.
-    if (managed)
-        impl_->cv.wait(lock, [&] { return !impl_->scanInFlight; });
     impl_->cv.wait(lock, [&] {
         if (impl_->writePins.contains(normalizedTarget.string()) ||
+            impl_->deleting.contains(normalizedTarget.string()) ||
             impl_->readPins.contains(normalizedTarget.string()))
             return false;
         for (const auto& path : replacements) {
             if (impl_->writePins.contains(path.string()) ||
+                impl_->deleting.contains(path.string()) ||
                 impl_->readPins.contains(path.string()))
                 return false;
         }
@@ -645,86 +761,20 @@ PersistentZarrCacheBudget::reserveWriteImpl(
         ? newSize - oldSize
         : 0;
 
-    std::error_code spaceEc;
-    const auto space = impl_->spaceProvider(impl_->root, spaceEc);
-    const std::uint64_t free = spaceEc ? impl_->freeBytes : space.available;
-    impl_->freeBytes = free;
-    impl_->lowSpace = impl_->limits.minimumFreeBytes > 0 &&
-                      free < impl_->limits.minimumFreeBytes;
-
-    std::uint64_t needed = 0;
-    if (managed && impl_->limits.maximumBytes) {
-        const auto projected = impl_->managedBytes + impl_->reservedGrowth + netGrowth;
-        if (projected > *impl_->limits.maximumBytes)
-            needed = projected - *impl_->limits.maximumBytes;
-    }
-    if (impl_->limits.minimumFreeBytes > 0) {
-        const auto pendingTemporaryBytes =
-            impl_->reservedTemporaryBytes >
-                    std::numeric_limits<std::uint64_t>::max() - newSize
-                ? std::numeric_limits<std::uint64_t>::max()
-                : impl_->reservedTemporaryBytes + newSize;
-        if (free < impl_->limits.minimumFreeBytes)
-            needed = std::max(needed, pendingTemporaryBytes);
-        else if (pendingTemporaryBytes > free - impl_->limits.minimumFreeBytes)
-            needed = std::max(needed,
-                              pendingTemporaryBytes -
-                                  (free - impl_->limits.minimumFreeBytes));
-    }
-
-    std::set<std::string> protectedPaths{normalizedTarget.string()};
-    for (const auto& path : replacements)
-        protectedPaths.insert(path.string());
-
-    if (needed > 0) {
-        struct Candidate {
-            std::string path;
-            std::uint64_t size;
-            fs::file_time_type touched;
-        };
-        std::vector<Candidate> candidates;
-        std::uint64_t evictable = 0;
-        for (const auto& [path, entry] : impl_->entries) {
-            if (protectedPaths.contains(path) || impl_->readPins.contains(path) ||
-                impl_->writePins.contains(path))
-                continue;
-            candidates.push_back({path, entry.size, entry.touched});
-            evictable = entry.size >
-                                std::numeric_limits<std::uint64_t>::max() - evictable
-                            ? std::numeric_limits<std::uint64_t>::max()
-                            : evictable + entry.size;
-        }
-        if (evictable < needed)
-            return {};
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const Candidate& a, const Candidate& b) {
-                      return a.touched < b.touched;
-                  });
-
-        std::uint64_t evicted = 0;
-        for (const auto& candidate : candidates) {
-            if (evicted >= needed)
-                break;
-            const auto victimPath = fs::path(candidate.path);
-            std::error_code ec;
-            if (fs::remove(victimPath, ec) && !ec) {
-                evicted += candidate.size;
-                impl_->managedBytes -= std::min(impl_->managedBytes, candidate.size);
-                impl_->entries.erase(candidate.path);
-            } else {
-                Logger()->warn("Could not evict persistent Zarr cache entry {}: {}",
-                               victimPath.string(), ec.message());
-            }
-        }
-        if (evicted < needed)
-            return {};
-    }
-
     impl_->reservedGrowth += netGrowth;
     impl_->reservedTemporaryBytes += newSize;
     impl_->writePins.insert(normalizedTarget.string());
-    for (const auto& path : replacements)
+    impl_->suspend(normalizedTarget.string());
+    if (impl_->scanInFlight)
+        impl_->scanChangedPaths.insert(normalizedTarget.string());
+    for (const auto& path : replacements) {
         impl_->writePins.insert(path.string());
+        impl_->suspend(path.string());
+        if (impl_->scanInFlight)
+            impl_->scanChangedPaths.insert(path.string());
+    }
+    impl_->trimRequested = true;
+    impl_->cv.notify_all();
     return WriteReservation(shared_from_this(), normalizedTarget,
                             std::move(replacements), netGrowth, newSize,
                             managed);
@@ -744,7 +794,7 @@ bool PersistentZarrCacheBudget::removeCacheSubtree(
     };
     std::unique_lock lock(impl_->mutex);
     impl_->cv.wait(lock, [&] {
-        if (impl_->trimInFlight && !impl_->scanInFlight)
+        if (std::any_of(impl_->deleting.begin(), impl_->deleting.end(), overlaps))
             return false;
         for (const auto& [path, count] : impl_->readPins) {
             (void)count;
@@ -770,20 +820,21 @@ bool PersistentZarrCacheBudget::removeCacheSubtree(
         return false;
     }
 
-    const bool startRescan = retired && !impl_->scanInFlight;
-    if (startRescan)
-        impl_->scanInFlight = true;
-    else if (retired)
-        impl_->scanRestartRequested = true;
-    lock.unlock();
-    if (retired) {
-        // The restarted scan skips retired cache trees, accounts the live root,
-        // and schedules deletion exactly once after publishing that index.
-        if (startRescan)
-            startScan();
-    } else {
-        pollSpace();
+    for (auto it = impl_->entries.begin(); it != impl_->entries.end();) {
+        if (overlaps(it->first))
+            impl_->erase(it++);
+        else
+            ++it;
     }
+    if (retired && impl_->scanInFlight)
+        impl_->scanRestartRequested = true;
+    if (retired)
+        ++impl_->retirementsInFlight;
+    impl_->trimRequested = true;
+    lock.unlock();
+    if (retired)
+        removeRetiredSubtreeAsync(std::move(*retired), true);
+    impl_->cv.notify_all();
     return true;
 }
 
@@ -814,11 +865,7 @@ bool PersistentZarrCacheBudget::moveCacheSubtree(
     };
     std::unique_lock lock(impl_->mutex);
     impl_->cv.wait(lock, [&] {
-        // A trim that is waiting for the startup scan has not touched the
-        // filesystem yet. The scan will be restarted after this rename and the
-        // trim will consume the resulting paths. An active post-scan trim must
-        // still finish first.
-        if (impl_->trimInFlight && !impl_->scanInFlight)
+        if (std::any_of(impl_->deleting.begin(), impl_->deleting.end(), overlapsEither))
             return false;
         for (const auto& [path, count] : impl_->readPins) {
             (void)count;
@@ -844,42 +891,60 @@ bool PersistentZarrCacheBudget::moveCacheSubtree(
     if (ec)
         return false;
 
-    const bool startRescan = !impl_->scanInFlight;
-    if (startRescan)
-        impl_->scanInFlight = true;
-    else
+    struct Moved { std::string path; Impl::Entry entry; std::uint64_t generation; };
+    std::vector<Moved> moved;
+    for (auto it = impl_->entries.begin(); it != impl_->entries.end();) {
+        // The destination did not exist on disk. Forget any stale inventory
+        // left there by external deletion before installing the moved paths.
+        if (isWithin(fs::path(it->first), normalizedDestination)) {
+            impl_->erase(it++);
+            continue;
+        }
+        if (!isWithin(fs::path(it->first), normalizedSource)) {
+            ++it;
+            continue;
+        }
+        const auto gen = it->second.age == Impl::Ages::none ? Impl::generation()
+            : impl_->ages.lastAccess(it->second.age);
+        moved.push_back({(normalizedDestination / fs::path(it->first).lexically_relative(
+            normalizedSource)).string(), it->second, gen});
+        impl_->erase(it++);
+    }
+    for (const auto& item : moved) {
+        auto [it, inserted] = impl_->entries.emplace(item.path, item.entry);
+        it->second.age = Impl::Ages::none;
+        impl_->indexEntry(it->first, it->second, item.generation);
+        impl_->managedBytes += it->second.size;
+    }
+    if (impl_->scanInFlight)
         impl_->scanRestartRequested = true;
+    impl_->trimRequested = true;
     lock.unlock();
-    if (startRescan)
-        startScan();
+    impl_->cv.notify_all();
     return true;
 }
 
 void PersistentZarrCacheBudget::releaseRead(const fs::path& path, bool touch)
 {
-    if (touch) {
-        std::error_code ec;
-        const auto now = fs::file_time_type::clock::now();
-        fs::last_write_time(path, now, ec);
-        if (!ec) {
-            std::lock_guard lock(impl_->mutex);
-            if (auto it = impl_->entries.find(path.string()); it != impl_->entries.end())
-                it->second.touched = now;
-        }
-    }
-    bool needsTrim = false;
     {
         std::lock_guard lock(impl_->mutex);
-        if (auto it = impl_->readPins.find(path.string()); it != impl_->readPins.end()) {
+        const auto key = path.string();
+        if (touch) {
+            const auto gen = Impl::generation();
+            impl_->ages.advance(gen);
+            if (auto it = impl_->entries.find(key); it != impl_->entries.end() &&
+                it->second.age != Impl::Ages::none)
+                impl_->ages.touch(it->second.age, gen);
+        }
+        if (auto it = impl_->readPins.find(key); it != impl_->readPins.end()) {
             if (--it->second == 0)
                 impl_->readPins.erase(it);
         }
-        needsTrim = impl_->limits.maximumBytes &&
-                    impl_->managedBytes > *impl_->limits.maximumBytes;
+        impl_->resume(key);
+        if (impl_->pressure)
+            impl_->trimRequested = true;
     }
     impl_->cv.notify_all();
-    if (needsTrim)
-        startTrim();
 }
 
 void PersistentZarrCacheBudget::finishWrite(
@@ -887,53 +952,61 @@ void PersistentZarrCacheBudget::finishWrite(
     std::uint64_t reservedGrowth, std::uint64_t reservedTemporaryBytes,
     bool committed, bool managed)
 {
-    bool needsTrim = false;
+    // The reservation pins all paths until the stat results are published.
+    // No filesystem calls occur while holding the shared accounting mutex.
+    std::vector<std::pair<std::string, std::optional<Impl::Entry>>> refreshed;
+    auto inspect = [&](const fs::path& path) {
+        std::optional<Impl::Entry> entry;
+        std::error_code ec;
+        if (managed && fs::is_regular_file(path, ec) && !ec) {
+            const auto size = fs::file_size(path, ec);
+            if (!ec)
+                entry = Impl::Entry{size, fs::file_time_type::clock::now()};
+        }
+        refreshed.emplace_back(path.string(), entry);
+    };
+    inspect(target);
+    for (const auto& path : replacements)
+        inspect(path);
     {
         std::lock_guard lock(impl_->mutex);
         impl_->reservedGrowth -= std::min(impl_->reservedGrowth, reservedGrowth);
         impl_->reservedTemporaryBytes -=
             std::min(impl_->reservedTemporaryBytes, reservedTemporaryBytes);
-        impl_->writePins.erase(target.string());
-        for (const auto& path : replacements)
-            impl_->writePins.erase(path.string());
-        if (committed) {
-            auto refresh = [&](const fs::path& path, bool track) {
-                const auto key = path.string();
-                if (auto it = impl_->entries.find(key); it != impl_->entries.end()) {
-                    impl_->managedBytes -= std::min(impl_->managedBytes, it->second.size);
-                    impl_->entries.erase(it);
+        const auto gen = Impl::generation();
+        impl_->ages.advance(gen);
+        for (const auto& [path, entry] : refreshed) {
+            impl_->writePins.erase(path);
+            if (auto it = impl_->entries.find(path); it != impl_->entries.end()) {
+                if (!committed && !impl_->scanInFlight) {
+                    impl_->resume(path);
+                    continue;
                 }
-                if (!track)
-                    return;
-                std::error_code ec;
-                if (!fs::is_regular_file(path, ec) || ec)
-                    return;
-                const auto size = fs::file_size(path, ec);
-                if (ec)
-                    return;
-                const auto touched = fs::last_write_time(path, ec);
-                if (ec)
-                    return;
-                impl_->entries.emplace(key, Impl::Entry{size, touched});
-                impl_->managedBytes += size;
-            };
-            refresh(target, managed);
-            for (const auto& path : replacements)
-                refresh(path, managed);
+                impl_->erase(it);
+            }
+            if (entry) {
+                auto [it, inserted] = impl_->entries.emplace(path, *entry);
+                impl_->indexEntry(it->first, it->second, gen);
+                impl_->managedBytes += entry->size;
+            }
         }
-        needsTrim = impl_->limits.maximumBytes &&
-                    impl_->managedBytes > *impl_->limits.maximumBytes;
+        if (committed && managed && !refreshed.empty() &&
+            refreshed.front().second && refreshed.front().second->size) {
+            const double size = double(refreshed.front().second->size);
+            impl_->averageObjectBytes = impl_->averageObjectBytes
+                ? impl_->averageObjectBytes + (size - impl_->averageObjectBytes) / 32.0
+                : size;
+        }
+        impl_->trimRequested = true;
     }
     impl_->cv.notify_all();
-    if (needsTrim)
-        startTrim();
 }
 
 void PersistentZarrCacheBudget::waitForIdle()
 {
     std::unique_lock lock(impl_->mutex);
     impl_->cv.wait(lock, [&] {
-        return !impl_->scanInFlight && !impl_->trimInFlight &&
+        return !impl_->scanInFlight && !impl_->trimInFlight && !impl_->trimRequested &&
                impl_->writePins.empty() && impl_->retirementsInFlight == 0;
     });
 }

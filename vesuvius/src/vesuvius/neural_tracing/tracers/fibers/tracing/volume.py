@@ -425,6 +425,11 @@ def build_tracer(args):
     params = TraceParams.from_policy(policy, max_len=args.max_len, precision=args.precision,
                                      forward_chunk=args.forward_chunk, seed=args.sampling_seed)
     tracer = FiberTracer(model, vol, crop, n_hist, params, device=args.device)
+    if getattr(args, 'cuda_graph', False):
+        if args.forward_chunk <= 0 or getattr(model.cfg, 'model_type', '') != 'regression':
+            raise ValueError('CUDA graph inference requires regression and a positive forward chunk')
+        from vesuvius.neural_tracing.tracers.shared.inference_graph import InferenceGraph
+        tracer.forward_model = InferenceGraph(model, args.forward_chunk)
     tracer.checkpoint_path = path
     if args.axis_workers:
         # Continuation crop axes in worker processes (spawned: the parent holds CUDA); same values as in-process.
@@ -432,6 +437,7 @@ def build_tracer(args):
         from concurrent.futures import ProcessPoolExecutor
         tracer.axis_pool = ProcessPoolExecutor(args.axis_workers, mp_context=multiprocessing.get_context('spawn'),
                                                initializer=_worker_init, initargs=(spec.to_dict(),))
+        tracer.observations.geometry_pool = tracer.axis_pool
     if args.crops == 'gpu':
         use_gpu_crops(tracer, vol, args.device, args.gpu_chunks)
     return tracer, vol, spec, policy
@@ -463,7 +469,9 @@ def seed_headings(vol, dots, pool):
     """CT seed headings (signed along the presence direction) in the worker processes; rows without a usable one
     are dropped. (numpy/scipy work in tracer threads crashed CPython 3.14, so it runs in processes.)"""
     tasks = list(zip(dots['xyz'], dots['family'], dots['direction']))
-    heads = list(pool.map(_seed_heading, tasks, chunksize=max(1, len(tasks)//32)))
+    # Each seed has substantial independent CT work. Dispatch individually so
+    # workers can take the next seed immediately; map retains input order.
+    heads = list(pool.map(_seed_heading, tasks, chunksize=1))
     keep = np.array([h is not None for h in heads], bool)
     out = {k: v[keep] for k, v in dots.items()}
     out['heading'] = np.asarray([h for h in heads if h is not None]).reshape(-1, 3)
@@ -763,15 +771,20 @@ def save_tile(out, name, pieces, spec, provenance, write_json):
 def load_done(out, owned):
     """Finished tiles' pieces back into ``owned``; returns (done tile names, next fiber id)."""
     done, next_id = set(), 0
+    started = time.monotonic()
     for f in sorted((out/'tiles').glob('*.npz')):
         if f.name.endswith('.partial.npz'):
             continue
-        d = np.load(f)
-        o = d['offsets']
-        for fid, a, b in zip(d['id'], o[:-1], o[1:]):
-            owned.add(d['points'][a:b].astype(np.float64), int(fid))
-            next_id = max(next_id, int(fid)+1)
+        # NpzFile does not cache members: d['points'] inside the fiber loop
+        # rereads the entire tile array for every fiber in that tile.
+        with np.load(f) as d:
+            o, ids, points = d['offsets'], d['id'], d['points']
+            for fid, a, b in zip(ids, o[:-1], o[1:]):
+                owned.add(points[a:b].astype(np.float64), int(fid))
+                next_id = max(next_id, int(fid)+1)
         done.add(f.stem)
+        if len(done) % 100 == 0:
+            print(f'restore: tiles={len(done)} elapsed={time.monotonic()-started:.1f}s', flush=True)
     owned.flush()
     progress = out/'progress.json'
     if progress.exists():  # ids issued before a stop may be linked from saved tiles: never reuse them
@@ -832,6 +845,7 @@ def main(argv=None):
                          'the frame model on the GPU; CPU: the CPU sampler and CPU frame model')
     ap.add_argument('--gpu-chunks', type=int, default=2048, help='GPU chunk cache slots (2 MiB each for 128^3 uint8)')
     ap.add_argument('--forward-chunk', type=int, default=128)
+    ap.add_argument('--cuda-graph', action='store_true', help='Replay full regression forward chunks with a CUDA graph')
     ap.add_argument('--axis-workers', type=int, default=8,
                     help='worker processes for continuation crop axes and seed headings (at least 1)')
     ap.add_argument('--tile-workers', type=int, default=3,
@@ -874,7 +888,7 @@ def main(argv=None):
     if run_json.exists():
         old = json.loads(run_json.read_text())
         # settings that only change speed or reporting may differ on resume
-        speed_only = ('device', 'status_every', 'rows', 'min_feed', 'open_tiles', 'max_open', 'forward_chunk', 'gpu_chunks',
+        speed_only = ('device', 'status_every', 'rows', 'min_feed', 'open_tiles', 'max_open', 'forward_chunk', 'gpu_chunks', 'cuda_graph',
                       'axis_workers', 'tile_workers', 'tile_ahead', 'afv', 'afv_template',  # speed or the end-of-run export
                       'cache_dir', 'frame_checkpoint')  # locations (the frame model is pinned by its sha256)
         # derived from the (compared) checkpoint and --ct; absent from runs started before they were recorded
@@ -930,9 +944,13 @@ def main(argv=None):
             st.prefetch = prefetch
 
             t_band = time.time()
+            reported_time, reported_decisions = t_band, 0
+            reported_stage = dict(getattr(tracer, 'stage_seconds', {}))
 
             def status(force=False):
                 nonlocal last, kept_total, traced_total, w_run, fibers_total
+                nonlocal reported_time, reported_decisions
+                nonlocal reported_stage
                 for line in st.finished_tiles:
                     kept_total += line['kept_vox']
                     fibers_total += line['fibers']
@@ -945,6 +963,8 @@ def main(argv=None):
                 st.finished_tiles = []
                 if force or time.time()-last >= args.status_every:
                     last = time.time()
+                    interval_rate = (st.decisions-reported_decisions)/max(last-reported_time, 1e-9)
+                    reported_time, reported_decisions = last, st.decisions
                     el = time.time()-t_start
                     started = w_bands+st.read_weight  # presence weight of tiles whose dots were started, this session
                     eta = el/max(started, 1)*(total_w-done_w-started)
@@ -953,11 +973,17 @@ def main(argv=None):
                           f'{kept_total*mm/1000:.2f} m kept, {traced_total*mm/1000:.2f} m traced | '
                           f'{len(st.rows)} traces running, '
                           f'{len(st.open)} tiles open | {st.decisions/max(time.time()-t_band, 1e-9):.0f} decisions/s | '
+                          f'interval {interval_rate:.0f} decisions/s | '
                           f'feed {st.timing["feed"]/max(time.time()-t_band, 1e-9):.0%} checks '
                           f'{st.timing["checks"]/max(time.time()-t_band, 1e-9):.0%} write '
                           f'{st.timing["write"]/max(time.time()-t_band, 1e-9):.0%} of time | '
                           f'GPU chunk loads {getattr(getattr(tracer, "chunk_cache", None), "loads", 0)/max(el, 1e-9):.0f}/s | '
                           f'elapsed {el/3600:.2f} h, ETA {eta/3600:.1f} h', flush=True)
+                    stages = dict(getattr(tracer, 'stage_seconds', {}))
+                    delta = {k: v-reported_stage.get(k, 0.) for k, v in stages.items()}
+                    total = max(sum(delta.values()), 1e-9)
+                    print('stage wall: '+ ' '.join(f'{k}={v:.2f}s({v/total:.0%})' for k, v in delta.items()), flush=True)
+                    reported_stage = stages
 
             orig_before = st.before_step
             def before_step(idx, pos, frames):

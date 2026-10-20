@@ -32,6 +32,7 @@ add_library(vc_core
         src/Slicing.cpp
         src/Compositing.cpp
         src/AffineTransform.cpp
+        src/ScaleTifxyz.cpp
         src/PlaneSurface.cpp
         src/Surface.cpp
         src/QuadSurface.cpp
@@ -57,6 +58,8 @@ add_library(vc_core
         src/render/DecodedChunkCacheBudget.cpp
         src/render/PersistentZarrCacheBudget.cpp
         src/render/ChunkedPlaneSampler.cpp
+        src/render/PinnedChunkRegion.cpp
+        src/render/SamplingWaitProfile.cpp
         src/render/SurfaceCache.cpp
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
