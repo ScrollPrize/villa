@@ -353,6 +353,9 @@ bool canAttachRepresentation(const OpenDataArtifact& artifact)
     if (!artifact.hasResolvedUrl()) return false;
     const auto kind = classifyDerivedRepresentation(artifact);
     if (!kind) return false;
+    if (*kind == OpenDataRepresentationKind::NormalGrids &&
+        artifact.levelParameterPresent && !artifact.sourceCoordinateLevel)
+        return false;
     if (*kind != OpenDataRepresentationKind::Prediction) return true;
     // Prediction artifacts are not necessarily volumes (e.g. meshes).
     const auto type = qstr(artifact.type).toLower().replace('_', '-');
@@ -521,6 +524,12 @@ void OpenDataCatalogWindow::setOpenSampleHandler(std::function<bool(const OpenDa
 void OpenDataCatalogWindow::setCreateProjectHandler(CreateProjectHandler handler)
 {
     _createProjectHandler = std::move(handler);
+    updateActionButtons();
+}
+
+void OpenDataCatalogWindow::setAttachPredictionHandler(AttachPredictionHandler handler)
+{
+    _attachPredictionHandler = std::move(handler);
     updateActionButtons();
 }
 
@@ -946,8 +955,17 @@ void OpenDataCatalogWindow::buildUi()
             emit attachNormalGridsRequested(qstr(sample->id), qstr(sample->volumes.at(volumeIndex).id),
                 artifactUrl(*artifact), artifact->sourceCoordinateLevel.value_or(0),
                 artifact->sourceCoordinateLevel.has_value());
-        } else {
-            emit attachVolumeRequested(artifactUrl(*artifact));
+        } else if (_attachPredictionHandler) {
+            // Preserve the complete catalog context for descriptor validation
+            // and coordinate tags, but attach only the selected prediction.
+            const auto* item = _representationsTable->item(_representationsTable->currentRow(), 0);
+            OpenDataResourceSelection selection;
+            selection.rawVolumeIds.emplace();
+            selection.representations = std::vector<OpenDataRepresentationRef>{{
+                item->data(kRepresentationVolumeIndexRole).toULongLong(),
+                item->data(kRepresentationArtifactIndexRole).toULongLong(), kind}};
+            const auto sample = *selectedSample();
+            _attachPredictionHandler(sample, selection);
         }
     });
     _attachRepresentationButton->setObjectName("attachCatalogRepresentation");
@@ -1543,7 +1561,9 @@ void OpenDataCatalogWindow::updateActionButtons()
     const auto* representation = selectedRepresentationArtifact();
     if (_attachRepresentationButton) {
         _attachRepresentationButton->setEnabled(manifestReady && representation &&
-            canAttachRepresentation(*representation));
+            canAttachRepresentation(*representation) &&
+            (classifyDerivedRepresentation(*representation) != OpenDataRepresentationKind::Prediction ||
+             bool(_attachPredictionHandler)));
     }
     const bool hasSegmentUrl = !selectedSegmentUrl().isEmpty();
     const auto* sample = selectedSample();

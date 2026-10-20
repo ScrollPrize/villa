@@ -41,9 +41,32 @@ private slots:
         auto unresolved = volume.artifacts.front();
         unresolved.resolvedUrl.clear();
         volume.artifacts.push_back(unresolved);
+        auto invalidNormal = volume.artifacts[4];
+        invalidNormal.levelParameterPresent = true;
+        invalidNormal.sourceCoordinateLevel.reset();
+        volume.artifacts.push_back(invalidNormal);
         sample.volumes.push_back(volume);
         manifest.samples.push_back(sample);
         OpenDataCatalogWindow catalog(manifest);
+        int predictions = 0;
+        catalog.setAttachPredictionHandler([&](const OpenDataSample& selected,
+                const OpenDataResourceSelection& selection) {
+            QCOMPARE(selected.id, sample.id);
+            QCOMPARE(selected.volumes.front().id, volume.id);
+            QVERIFY(selection.rawVolumeIds.has_value());
+            QVERIFY(selection.rawVolumeIds->empty());
+            QVERIFY(selection.representations.has_value());
+            QCOMPARE(selection.representations->size(), std::size_t(1));
+            const auto ref = selection.representations->front();
+            QCOMPARE(ref.volumeIndex, std::size_t(0));
+            QCOMPARE(ref.artifactIndex, std::size_t(predictions));
+            QCOMPARE(ref.kind, OpenDataRepresentationKind::Prediction);
+            const auto& artifact = selected.volumes.at(ref.volumeIndex).artifacts.at(ref.artifactIndex);
+            QCOMPARE(artifact.sourceCoordinateLevel.value(), 2);
+            QCOMPARE(QString::fromStdString(artifact.resolvedUrl),
+                "https://example.invalid/" + types[predictions]);
+            ++predictions;
+        });
         for (auto* table : catalog.findChildren<QTableWidget*>()) {
             if (table->horizontalHeaderItem(0)->text() == "Sample ID")
                 table->setCurrentCell(0, 0);
@@ -52,7 +75,7 @@ private slots:
         auto* button = catalog.findChild<QPushButton*>("attachCatalogRepresentation");
         QVERIFY(table);
         QVERIFY(button);
-        QCOMPARE(table->rowCount(), 7);
+        QCOMPARE(table->rowCount(), 8);
         QSignalSpy volumes(&catalog, &OpenDataCatalogWindow::attachVolumeRequested);
         QSignalSpy lasagna(&catalog, &OpenDataCatalogWindow::attachLasagnaRequested);
         QSignalSpy normals(&catalog, &OpenDataCatalogWindow::attachNormalGridsRequested);
@@ -61,9 +84,8 @@ private slots:
             QCOMPARE(button->isEnabled(), row < 5);
             button->click();
         }
-        QCOMPARE(volumes.count(), 3);
-        for (int i = 0; i < 3; ++i)
-            QCOMPARE(volumes.at(i).at(0).toString(), "https://example.invalid/" + types[i]);
+        QCOMPARE(predictions, 3);
+        QCOMPARE(volumes.count(), 0); // Predictions must not take the URL-only path.
         QCOMPARE(lasagna.count(), 1);
         QCOMPARE(lasagna.at(0).at(1).toBool(), true);
         QCOMPARE(normals.count(), 1);

@@ -519,6 +519,26 @@ void MenuActionController::showOpenDataCatalog()
             this, &MenuActionController::showAttachRemoteZarrDialog);
     connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachLasagnaRequested,
             this, &MenuActionController::attachCatalogLasagna);
+    dialog->setAttachPredictionHandler([this](const vc3d::opendata::OpenDataSample& sample,
+            const vc3d::opendata::OpenDataResourceSelection& selection) {
+        if (!_window || !_window->_state || !_window->_state->vpkg()) {
+            QMessageBox::information(_window, tr("No project"), tr("Open or create a project first."));
+            return;
+        }
+        try {
+            const auto result = vc3d::opendata::attachOpenDataSampleVolumes(
+                *_window->_state->vpkg(), sample, &selection);
+            _window->refreshCurrentVolumePackageUi(QString(), true);
+            if (result.failedVolumes) {
+                QStringList messages;
+                for (const auto& message : result.messages)
+                    messages.push_back(QString::fromStdString(message));
+                QMessageBox::warning(_window, tr("Attach incomplete"), messages.join('\n'));
+            }
+        } catch (const std::exception& e) {
+            QMessageBox::warning(_window, tr("Attach failed"), QString::fromUtf8(e.what()));
+        }
+    });
     connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachNormalGridsRequested,
             this, [this](const QString& sample, const QString& volume, const QString& url,
                          int level, bool explicitLevel) {

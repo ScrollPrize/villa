@@ -35,6 +35,9 @@ public:
     using CreateProjectHandler = std::function<bool(const OpenDataSample&,
         const OpenDataResourceSelection&, const OpenDataNewProject&)>;
     void setCreateProjectHandler(CreateProjectHandler handler);
+    using AttachPredictionHandler = std::function<void(const OpenDataSample&,
+        const OpenDataResourceSelection&)>;
+    void setAttachPredictionHandler(AttachPredictionHandler handler);
 
 signals:
     void attachVolumeRequested(const QString& url);
@@ -141,6 +144,7 @@ private:
     QString _pendingPhotoSampleId;
     std::function<bool(const OpenDataSample&)> _openSampleHandler;
     CreateProjectHandler _createProjectHandler;
+    AttachPredictionHandler _attachPredictionHandler;
 };
 
 } // namespace vc3d::opendata
