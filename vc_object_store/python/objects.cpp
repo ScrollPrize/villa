@@ -346,7 +346,7 @@ NB_MODULE(_native, m)
             });
             nb::list result; for (const auto& edge : edges) result.append(edgeToPy(edge)); return result;
         }, nb::arg("object_uuid"), nb::arg("edits"), nb::arg("expected_revision"))
-        .def("affected_geometry_edges", [](PyObjectStore& self, const std::string& uuid, const nb::dict& input) {
+        .def("affected_geometry_edges", [](PyObjectStore& self, const std::string& uuid, const nb::object& input) {
             const auto data = geometryInputFromPy(input);
             auto edges = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.affectedGeometryEdges(txn, uuid, data); });
             nb::list result; for (const auto& edge : edges) result.append(edgeToPy(edge)); return result;
@@ -813,8 +813,8 @@ NB_MODULE(_native, m)
             const auto edges = self.owner->require().affectedGeometryEditEdges(self.require(), uuid, geometryEditsFromPy(input), expected);
             nb::list result; for (const auto& edge : edges) result.append(edgeToPy(edge)); return result;
         }, nb::arg("object_uuid"), nb::arg("edits"), nb::arg("expected_revision"))
-        .def("affected_geometry_edges", [](PyObjectWriteTxn& self, const std::string& uuid, const nb::dict& input) {
-            const auto edges = self.owner->require().affectedGeometryEdges(self.require(), uuid, geometryFromPy(input));
+        .def("affected_geometry_edges", [](PyObjectWriteTxn& self, const std::string& uuid, const nb::object& input) {
+            const auto edges = self.owner->require().affectedGeometryEdges(self.require(), uuid, geometryInputFromPy(input));
             nb::list result; for (const auto& edge : edges) result.append(edgeToPy(edge)); return result;
         }, nb::arg("object_uuid"), nb::arg("geometry"))
         .def("upsert_object",

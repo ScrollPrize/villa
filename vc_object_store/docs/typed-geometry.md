@@ -153,7 +153,9 @@ No relationship meaning is inferred by the geometry layer.
 
 Structural changes (adding/removing/reordering points or changing dimensions)
 use an owned value and `putGeometry` / `put_geometry` with the expected geometry
-revision and explicit relationship decisions. For actions involving multiple
+revision and explicit relationship decisions. Python `affected_geometry_edges()`
+also accepts owned values to preview a replacement, on both the store and a
+write transaction. For actions involving multiple
 object replacements or metadata changes, use the existing checked write
 transaction API.
 

@@ -161,6 +161,10 @@ def test_relationship_decisions_are_required_and_atomic(db):
         "a_anchor": {"points": [{"array": "point_ids", "index": [42]}]},
         "b_anchor": {"points": [{"array": "points", "index": [0]}]},
     })
+    replacement = PointCollection([42], [[7, 8, 9]])
+    assert [e["uuid"] for e in db.affected_geometry_edges(a, replacement)] == [eid]
+    with db.write() as write:
+        assert [e["uuid"] for e in write.affected_geometry_edges(a, replacement)] == [eid]
     with db.geometry_snapshot() as snapshot:
         edit = snapshot.point_collection(a).edit()
         edit.move_point(42, [7, 8, 9])
