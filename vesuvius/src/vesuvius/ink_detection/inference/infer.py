@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import shutil
@@ -254,22 +255,56 @@ def _sliding_positions_1d(length: int, patch_size: int, stride: int) -> list[int
     return positions
 
 
+def resolve_roi_bounds(
+    values: Sequence[int] | None, *, height: int, width: int
+) -> tuple[int, int, int, int]:
+    """Half-open row-start/stop, column-start/stop in the selected input level."""
+
+    if values is None:
+        return (0, height, 0, width)
+    if len(values) != 4 or any(isinstance(v, bool) or not isinstance(v, (int, np.integer)) for v in values):
+        raise ValueError("--roi requires four integer grid indices")
+    r0, r1, c0, c1 = (int(value) for value in values)
+    if not (0 <= r0 < r1 <= height and 0 <= c0 < c1 <= width):
+        raise ValueError(f"--roi must be nonempty and inside shape {(height, width)!r}")
+    return r0, r1, c0, c1
+
+
+def clip_block_to_roi(block: Block, bounds: tuple[int, int, int, int]) -> Block | None:
+    """Clip a parent block and translate its output into the ROI frame."""
+
+    r0, r1, c0, c1 = bounds
+    top, bottom = max(block.y0, r0), min(block.y0 + block.valid_h, r1)
+    left, right = max(block.x0, c0), min(block.x0 + block.valid_w, c1)
+    if top >= bottom or left >= right:
+        return None
+    return Block(top - r0, left - c0, bottom - top, right - left)
+
+
 def iter_blocks(
     image_shape: tuple[int, int],
     patch_size: int,
     stride: int,
     mask_lowres: np.ndarray | None = None,
     occupancy_scale: tuple[int, int] = (1, 1),
+    *,
+    roi_bounds: tuple[int, int, int, int] | None = None,
 ) -> list[Block]:
     """Schedule flat patches, including a final boundary-aligned position."""
 
     height, width = (int(value) for value in image_shape)
     scale_y, scale_x = (max(1, int(value)) for value in occupancy_scale)
+    if roi_bounds is not None:
+        roi_bounds = resolve_roi_bounds(roi_bounds, height=height, width=width)
     blocks: list[Block] = []
     for y0 in _sliding_positions_1d(height, patch_size, stride):
         valid_h = min(patch_size, height - y0)
+        if roi_bounds is not None and (y0 >= roi_bounds[1] or y0 + valid_h <= roi_bounds[0]):
+            continue
         for x0 in _sliding_positions_1d(width, patch_size, stride):
             valid_w = min(patch_size, width - x0)
+            if roi_bounds is not None and (x0 >= roi_bounds[3] or x0 + valid_w <= roi_bounds[2]):
+                continue
             if mask_lowres is not None:
                 low_y0 = y0 // scale_y
                 low_x0 = x0 // scale_x
@@ -741,6 +776,7 @@ def run_block_inference(
     amp_dtype: torch.dtype | None,
     tta_axes: Sequence[int],
     tta_batch_size: int | None,
+    roi_bounds: tuple[int, int, int, int] | None = None,
 ) -> None:
     """Forward nonempty flat patches and feed their weighted probabilities."""
 
@@ -780,6 +816,18 @@ def run_block_inference(
                     weights = weights * mask_f32[
                         y0 : y0 + valid_h, x0 : x0 + valid_w
                     ]
+                if roi_bounds is not None:
+                    clipped = clip_block_to_roi(Block(y0, x0, valid_h, valid_w), roi_bounds)
+                    if clipped is None:
+                        continue
+                    source_y0 = clipped.y0 + roi_bounds[0] - y0
+                    source_x0 = clipped.x0 + roi_bounds[2] - x0
+                    source = (
+                        slice(source_y0, source_y0 + clipped.valid_h),
+                        slice(source_x0, source_x0 + clipped.valid_w),
+                    )
+                    tile, weights = tile[source], weights[source]
+                    y0, x0 = clipped.y0, clipped.x0
                 accumulator.add_tile(
                     y0=y0,
                     x0=x0,
@@ -967,6 +1015,11 @@ def infer_single_zarr(
     resolution = "0" if hasattr(root, "shape") else str(args.resolution)
     volume = select_volume_level(root, resolution, source=str(input_zarr))
     depth_first, depth, height, width, chunk_h, chunk_w = _volume_axes(volume)
+    roi_values = getattr(args, "roi", None)
+    output_bounds = resolve_roi_bounds(roi_values, height=height, width=width)
+    roi_bounds = output_bounds if roi_values is not None else None
+    r0, r1, c0, c1 = output_bounds
+    output_shape = (r1 - r0, c1 - c0)
     patch_size = configured_model.patch_size
     stride = resolve_patch_stride(
         patch_size=patch_size,
@@ -1054,8 +1107,11 @@ def infer_single_zarr(
         stride,
         occupancy,
         occupancy_scale,
+        roi_bounds=roi_bounds,
     )
     LOGGER.info("Selected %d patches for inference", len(blocks))
+    output_blocks = blocks if roi_bounds is None else [clip_block_to_roi(block, roi_bounds) for block in blocks]
+    LOGGER.info("Output bounds=(%d, %d, %d, %d) shape=%s; parent patch grid retained", *output_bounds, output_shape)
     dataset = FlatBlockDataset(
         reader=reader,
         blocks=blocks,
@@ -1092,26 +1148,26 @@ def infer_single_zarr(
     temporary = Path(tempfile.mkdtemp(prefix="ink_flat_infer_"))
     try:
         accumulation_chunks = (
-            min(tile_shape[0], height),
-            min(tile_shape[1], width),
+            min(tile_shape[0], output_shape[0]),
+            min(tile_shape[1], output_shape[1]),
         )
         probability_sum = open_temp_zarr_array(
             temporary / "probability.zarr",
-            shape=(height, width),
+            shape=output_shape,
             chunks=accumulation_chunks,
         )
         weight_sum = open_temp_zarr_array(
             temporary / "weight.zarr",
-            shape=(height, width),
+            shape=output_shape,
             chunks=accumulation_chunks,
         )
         accumulator = ChunkAccumulator(
-            shape=(height, width),
+            shape=output_shape,
             chunk_shape=accumulation_chunks,
             prob_sum_store=probability_sum,
             weight_sum_store=weight_sum,
             contribution_counts=compute_chunk_contribution_counts(
-                blocks, chunk_shape=accumulation_chunks
+                output_blocks, chunk_shape=accumulation_chunks
             ),
         )
         if blocks:
@@ -1125,18 +1181,32 @@ def infer_single_zarr(
                 amp_dtype=configured_model.amp_dtype,
                 tta_axes=tta_axes,
                 tta_batch_size=args.tta_batch_size,
+                roi_bounds=roi_bounds,
             )
             accumulator.flush_remaining()
         else:
             LOGGER.warning(
                 "No occupied blocks were found; writing an all-zero output"
             )
+        metadata_path = output_tiff.with_suffix(output_tiff.suffix + ".roi.json")
+        # An overwritten full-frame image must not inherit a previous ROI's frame.
+        # Invalidate the old metadata before replacing its associated image.
+        metadata_path.unlink(missing_ok=True)
         write_output_tiff(
             probability_sum,
             weight_sum,
             output_tiff,
             tile_shape,
         )
+        if roi_bounds is not None:
+            metadata_path.write_text(json.dumps({
+                "input": str(input_zarr), "input_resolution": resolution,
+                "parent_shape_yx": [height, width],
+                "roi_row_start_stop_col_start_stop": list(roi_bounds),
+                "patch_size": patch_size, "stride": stride, "blend_mode": blend_mode,
+                "layer_indices": layer_indices.tolist(), "direction": layer_direction,
+                "parent_grid_retained": True,
+            }, indent=2) + "\n", encoding="utf-8")
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
 
@@ -1305,6 +1375,11 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--checkpoint-path", type=Path)
     parser.add_argument("--output-prefix", default="")
     parser.add_argument("--mask-path", type=Path)
+    parser.add_argument(
+        "--roi", nargs=4, type=int,
+        metavar=("ROW_START", "ROW_STOP", "COL_START", "COL_STOP"),
+        help="Half-open output rectangle at --resolution; retain original parent patches and CT context.",
+    )
     parser.add_argument("--resolution", default="0")
     parser.add_argument(
         "--num-workers", "--workers", dest="num_workers", type=int, default=4
