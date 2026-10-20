@@ -108,6 +108,7 @@ class EvaAttention(nn.Module):
             attn_head_dim: Optional[int] = None,
             norm_layer: Optional[Callable] = None,
             attention_backend: Optional[str] = "flash",
+            qk_norm: bool = False,
     ):
         """
 
@@ -122,6 +123,7 @@ class EvaAttention(nn.Module):
             norm_layer:
             attention_backend: preferred fused SDPA kernel (see attention_priority);
                 None keeps PyTorch's default choice.
+            qk_norm: apply RMSNorm over each query/key head before RoPE.
         """
         super().__init__()
         self.num_heads = num_heads
@@ -154,6 +156,8 @@ class EvaAttention(nn.Module):
             self.qkv = None
             self.q_bias = self.k_bias = self.v_bias = None
 
+        self.q_norm = nn.RMSNorm(head_dim, eps=1e-6) if qk_norm else nn.Identity()
+        self.k_norm = nn.RMSNorm(head_dim, eps=1e-6) if qk_norm else nn.Identity()
         self.attn_drop = nn.Dropout(attn_drop)
         self.norm = norm_layer(all_head_dim) if norm_layer is not None else nn.Identity()
         self.proj = nn.Linear(all_head_dim, dim)
@@ -184,6 +188,10 @@ class EvaAttention(nn.Module):
             q = self.q_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)  # B, num_heads, N, C
             k = self.k_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
             v = self.v_proj(x).reshape(B, N, self.num_heads, -1).transpose(1, 2)
+
+        # Normalize each head independently; keep the projection dtype under AMP.
+        q = self.q_norm(q).type_as(v)
+        k = self.k_norm(k).type_as(v)
 
         if rope is not None:
             q = apply_rotary_embedding(q, rope, prefix_tokens=self.num_prefix_tokens).type_as(v)
@@ -284,6 +292,7 @@ class EvaBlock(nn.Module):
             ndim: Optional[int] = None,
             attention_type: str = "full",
             attention_backend: Optional[str] = "flash",
+            qk_norm: bool = False,
     ):
         """
 
@@ -324,6 +333,7 @@ class EvaBlock(nn.Module):
             attn_head_dim=attn_head_dim,
             norm_layer=norm_layer if scale_attn_inner else None,
             attention_backend=attention_backend,
+            qk_norm=qk_norm,
         )
         self.attn = (EvaAxialAttention(**attention_kwargs, axis=0, ndim=ndim)
                      if attention_type == "axial" else EvaAttention(**attention_kwargs))
@@ -496,6 +506,7 @@ class Eva(nn.Module):
             deeper_embed_stem_type: Optional[str] = None,
             attention_type: str = "full",
             attention_backend: Optional[str] = "flash",
+            qk_norm: bool = False,
     ):
         """
         Diff to timm implementation
@@ -620,6 +631,7 @@ class Eva(nn.Module):
                 num_heads=num_heads,
                 qkv_bias=qkv_bias,
                 qkv_fused=qkv_fused,
+                qk_norm=qk_norm,
                 mlp_ratio=mlp_ratio,
                 swiglu_mlp=swiglu_mlp,
                 scale_mlp=scale_mlp,

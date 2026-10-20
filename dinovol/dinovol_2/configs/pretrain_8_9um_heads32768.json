@@ -1,0 +1,529 @@
+{
+  "output_dir": "./dinovol_pretrain_8_9um_cnn192proj_10blocks_ffn2048_full_g128_p8_stem16_heads32768/",
+  "resume": true,
+  "auto_resume": true,
+  "lr": 1.768e-04,
+  "warmup_steps": 2000,
+  "min_lr": 1e-06,
+  "weight_decay": 0.04,
+  "weight_decay_end": 0.04,
+  "patch_embed_lr_mult": 1.0,
+  "freeze_last_layer_steps": 1250,
+  "momentum_teacher": 0.994,
+  "final_momentum_teacher": 0.994,
+  "warmup_teacher_temp": 0.04,
+  "teacher_temp": 0.07,
+  "warmup_teacher_temp_steps": 37500,
+  "clip_grad": 3.0,
+  "ibot_masked_loss_chunk_size": 4096,
+  "max_iterations": 1000000,
+  "batch_size": 12,
+  "grad_accumulation_steps": 2,
+  "train_monitor_every_n": 500,
+  "monitor_batch_size": 12,
+  "monitor_pca_sets": 4,
+  "save_every_n": 5000,
+  "num_workers": 24,
+  "prefetch_factor": 2,
+  "persistent_workers": true,
+  "fused_optimizer": true,
+  "cuda_expandable_segments": true,
+  "cudnn_benchmark": true,
+  "ibot_targets": "cross_view",
+  "ibot_fused_last_layer": true,
+  "compile": {
+    "enabled": true,
+    "backend": "inductor",
+    "mode": "default",
+    "dynamic": {"backbone": false}
+  },
+  "model": {
+    "model_type": "v3",
+    "dino_out_dim": 32768,
+    "dino_head_bottleneck_dim": 256,
+    "ibot_out_dim": 32768,
+    "attention_type": "full",
+    "attention_backend": "flash",
+    "qk_norm": true,
+    "embedding_type": "deeper",
+    "embed_dim": 480,
+    "depth": 10,
+    "num_heads": 10,
+    "patch_size": [8, 8, 8],
+    "deeper_embed_stage_channels": [32, 64, 128, 256],
+    "deeper_embed_stage_strides": [1, 2, 2, 2],
+    "deeper_embed_depth_per_level": [1, 2, 2, 1],
+    "deeper_embed_use_stem": true,
+    "deeper_embed_stem_channels": 32,
+    "deeper_embed_stem_type": "conv",
+    "deeper_embed_final_projection": true,
+    "deeper_embed_batch_chunk_size": 1,
+    "deeper_embed_channels_last": true,
+    "global_crops_size": [
+      128,
+      128,
+      128
+    ],
+    "local_crops_size": [
+      64,
+      64,
+      64
+    ],
+    "rope_type": "mixed",
+    "rope_shift_coords": 1.5,
+    "rope_jitter_coords": 1.5,
+    "rope_rescale_coords": 2.5,
+    "untie_cls_and_patch_norms": false,
+    "untie_global_and_local_cls_norm": true,
+    "scale_mlp": false,
+    "mlp_ratio": 7.2,
+    "qkv_bias": false,
+    "grad_checkpointing": true
+  },
+  "gram": {
+    "enabled": false
+  },
+  "object_losses": {
+    "enabled": true,
+    "point_weight": 0.0,
+    "object_weight": 0.1,
+    "ink_weight": 0.1,
+    "region_weight": 0.1,
+    "object_temperature": 0.15,
+    "region_temperature": 0.15,
+    "ink_temperature": 0.15,
+    "pos_margin": 0.75,
+    "ink_queue_size": 512,
+    "ramp_steps": 2000,
+    "head": {
+      "hidden_dim": 384,
+      "out_dim": 64,
+      "ink_dim": 32,
+      "region_dim": 128
+    }
+  },
+  "dataset": {
+    "source_sampling_size": [192, 192, 192],
+    "occupancy_level": 5,
+    "object_mask": {"enabled": true, "gap_um": 2000, "z_trim_pct": 0.05},
+    "read_ahead": 2,
+    "gaussian_blur": true,
+    "augmentation": "full",
+    "object_points": {
+      "enabled": true,
+      "points_per_sample": 384,
+      "max_labeled_points": 384,
+      "points_per_sheet": 48,
+      "points_per_fiber": 32,
+      "points_per_object": 32,
+      "max_objects": 12,
+      "presence_threshold": 127,
+      "use_metadata_meshes": true,
+      "mesh_cache_dir": "../mesh_cache_8_9um",
+      "mesh_oversample": 2.0,
+      "ink_oversample": 3.0,
+      "fiber_oversample": 1.5,
+      "mesh_anchor_prob": 0.5,
+      "ink_anchor_prob": 0.6
+    },
+    "global_crop_scale": [0.18, 0.45],
+    "local_crop_scale": [0.023, 0.057],
+    "global_crop_size": [
+      128,
+      128,
+      128
+    ],
+    "local_crop_size": [
+      64,
+      64,
+      64
+    ],
+    "datasets": [
+      {
+        "sample_id": "PHerc0125",
+        "pixel_size_um": 9.362,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0125/volumes/20250821151825-9.362um-1.2m-113keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0125/representations/predictions/surfaces/20250821151825-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0139",
+        "pixel_size_um": 9.596,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 2,
+        "fiber_presence_path": "s3://vesuvius-challenge-open-data/PHerc0139/representations/predictions/fibers/20260102150214-fibers-20260915212757-L1/PHerc0139-20260102150214-las-sd1-59ad8624_presence.ome.zarr",
+        "fiber_nx_path": "s3://vesuvius-challenge-open-data/PHerc0139/representations/predictions/fibers/20260102150214-fibers-20260915212757-L1/PHerc0139-20260102150214-las-sd1-59ad8624_nx.ome.zarr",
+        "fiber_ny_path": "s3://vesuvius-challenge-open-data/PHerc0139/representations/predictions/fibers/20260102150214-fibers-20260915212757-L1/PHerc0139-20260102150214-las-sd1-59ad8624_ny.ome.zarr",
+        "fiber_level": 3,
+        "fiber_factor": 2
+      },
+      {
+        "sample_id": "PHerc0172",
+        "pixel_size_um": 7.91,
+        "scan_location": "DLS (Diamond Light Source)",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0172/volumes/20241024131839-7.910um-53keV-masked.zarr/",
+        "volume_scale": 0
+      },
+      {
+        "sample_id": "PHerc0175A",
+        "pixel_size_um": 8.64,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0175A/volumes/20250521115057-8.640um-1.2m-116keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0175A/representations/predictions/surfaces/20250521115057-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0175B",
+        "pixel_size_um": 8.64,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0175B/volumes/20250521125822-8.640um-1.2m-116keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0175B/representations/predictions/surfaces/20250521125822-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0191",
+        "pixel_size_um": 9.362,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0191/volumes/20250821151635-9.362um-1.2m-113keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0191/representations/predictions/surfaces/20250821151635-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0211",
+        "pixel_size_um": 9.362,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0211/volumes/20250821151803-9.362um-1.2m-113keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0211/representations/predictions/surfaces/20250821151803-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0257",
+        "pixel_size_um": 9.362,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0257/volumes/20250821151750-9.362um-1.2m-113keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0257/representations/predictions/surfaces/20250821151750-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0268",
+        "pixel_size_um": 8.64,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0268/volumes/20251110183117-8.640um-1.2m-116keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0268/representations/predictions/surfaces/20251110183117-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0306B",
+        "pixel_size_um": 8.64,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0306B/volumes/20250521133212-8.640um-1.2m-116keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0306B/representations/predictions/surfaces/20250521133212-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0332",
+        "pixel_size_um": 9.596,
+        "scan_location": "DLS (Diamond Light Source)",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0332/volumes/20251211183505-2.399um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 2,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0332/representations/predictions/surfaces/20251211183505-surface-20260413222639-surface-m7-L2-th0.2.zarr",
+        "surface_level": 0,
+        "fiber_presence_path": "s3://vesuvius-challenge-open-data/PHerc0332/representations/predictions/fibers/20251211183505-fibers-20260915212757-L1/PHerc0332-20251211183505-las-sd1-f6b7319a_presence.ome.zarr",
+        "fiber_nx_path": "s3://vesuvius-challenge-open-data/PHerc0332/representations/predictions/fibers/20251211183505-fibers-20260915212757-L1/PHerc0332-20251211183505-las-sd1-f6b7319a_nx.ome.zarr",
+        "fiber_ny_path": "s3://vesuvius-challenge-open-data/PHerc0332/representations/predictions/fibers/20251211183505-fibers-20260915212757-L1/PHerc0332-20251211183505-las-sd1-f6b7319a_ny.ome.zarr",
+        "fiber_level": 3,
+        "fiber_factor": 2
+      },
+      {
+        "sample_id": "PHerc0343",
+        "pixel_size_um": 8.64,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0343/volumes/20250521140437-8.640um-1.2m-116keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0343/representations/predictions/surfaces/20250521140437-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0358",
+        "pixel_size_um": 9.362,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0358/volumes/20250821151737-9.362um-1.2m-113keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0358/representations/predictions/surfaces/20250821151737-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0483A",
+        "pixel_size_um": 8.64,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0483A/volumes/20250521140913-8.640um-1.2m-116keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0483A/representations/predictions/surfaces/20250521140913-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0483B",
+        "pixel_size_um": 8.64,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0483B/volumes/20251124083638-8.640um-1.2m-116keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0483B/representations/predictions/surfaces/20251124083638-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0490A",
+        "pixel_size_um": 8.64,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0490A/volumes/20250521151210-8.640um-1.2m-116keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0490A/representations/predictions/surfaces/20250521151210-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0490B",
+        "pixel_size_um": 8.64,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0490B/volumes/20250521151215-8.640um-1.2m-116keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0490B/representations/predictions/surfaces/20250521151215-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0800",
+        "pixel_size_um": 8.64,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0800/volumes/20250521135224-8.640um-1.2m-116keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0800/representations/predictions/surfaces/20250521135224-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0813",
+        "pixel_size_um": 9.362,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0813/volumes/20250821151723-9.362um-1.2m-113keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0813/representations/predictions/surfaces/20250821151723-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0814",
+        "pixel_size_um": 9.362,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0814/volumes/20250804134230-9.362um-1.2m-113keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0814/representations/predictions/surfaces/20250804134230-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0826",
+        "pixel_size_um": 9.362,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0826/volumes/20250821151701-9.362um-1.2m-113keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0826/representations/predictions/surfaces/20250821151701-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0841",
+        "pixel_size_um": 9.366,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0841/volumes/20250821151531-9.366um-1.2m-113keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0841/representations/predictions/surfaces/20250821151531-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0846A",
+        "pixel_size_um": 9.362,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0846A/volumes/20250728152254-9.362um-1.2m-113keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0846A/representations/predictions/surfaces/20250728152254-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0846B",
+        "pixel_size_um": 9.362,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0846B/volumes/20250804142305-9.362um-1.2m-113keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0846B/representations/predictions/surfaces/20250804142305-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc1203",
+        "pixel_size_um": 9.362,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc1203/volumes/20250820131727-9.362um-1.2m-113keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc1203/representations/predictions/surfaces/20250820131727-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc1218",
+        "pixel_size_um": 8.64,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc1218/volumes/20250521120456-8.640um-1.2m-116keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc1218/representations/predictions/surfaces/20250521120456-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc1447",
+        "pixel_size_um": 8.64,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc1447/volumes/20250521151220-8.640um-1.2m-116keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc1447/representations/predictions/surfaces/20250521151220-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc1451",
+        "pixel_size_um": 9.596,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc1451/volumes/20260319101107-2.399um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 2,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc1451/representations/predictions/surfaces/20260319101107-surface-20260413222639-surface-m7-L2-th0.2.zarr",
+        "surface_level": 0,
+        "fiber_presence_path": "s3://vesuvius-challenge-open-data/PHerc1451/representations/predictions/fibers/20260319101107-fibers-20260915212757-L1/PHerc1451-20260319101107-las-sd1-40cc618f_presence.ome.zarr",
+        "fiber_nx_path": "s3://vesuvius-challenge-open-data/PHerc1451/representations/predictions/fibers/20260319101107-fibers-20260915212757-L1/PHerc1451-20260319101107-las-sd1-40cc618f_nx.ome.zarr",
+        "fiber_ny_path": "s3://vesuvius-challenge-open-data/PHerc1451/representations/predictions/fibers/20260319101107-fibers-20260915212757-L1/PHerc1451-20260319101107-las-sd1-40cc618f_ny.ome.zarr",
+        "fiber_level": 3,
+        "fiber_factor": 2
+      },
+      {
+        "sample_id": "PHerc1545",
+        "pixel_size_um": 9.362,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc1545/volumes/20250821151648-9.362um-1.2m-113keV-masked.zarr/",
+        "volume_scale": 0,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc1545/representations/predictions/surfaces/20250821151648-surface-20260413222639-surface-m7-L0-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc1667",
+        "pixel_size_um": 9.596,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 2
+      },
+      {
+        "sample_id": "PHercParis4",
+        "pixel_size_um": 9.6,
+        "scan_location": "DLS (Diamond Light Source)",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 2,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHercParis4/representations/predictions/surfaces/20260411134726-surface-20260413222639-surface-m7-L2-th0.2.zarr",
+        "surface_level": 0,
+        "fiber_presence_path": "s3://vesuvius-challenge-open-data/PHercParis4/representations/predictions/fibers/20260411134726-fibers-20260915212757-L1/PHercParis4-20260411134726-las-sd1-7ff0ce6c_presence.ome.zarr",
+        "fiber_nx_path": "s3://vesuvius-challenge-open-data/PHercParis4/representations/predictions/fibers/20260411134726-fibers-20260915212757-L1/PHercParis4-20260411134726-las-sd1-7ff0ce6c_nx.ome.zarr",
+        "fiber_ny_path": "s3://vesuvius-challenge-open-data/PHercParis4/representations/predictions/fibers/20260411134726-fibers-20260915212757-L1/PHercParis4-20260411134726-las-sd1-7ff0ce6c_ny.ome.zarr",
+        "fiber_level": 3,
+        "fiber_factor": 2
+      },
+      {
+        "sample_id": "PHerc1299",
+        "pixel_size_um": 9.596,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc1299/volumes/20260309130042-2.399um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 2,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc1299/representations/predictions/surfaces/20260309130042-surface-20260413222639-surface-m7-L2-th0.2.zarr",
+        "surface_level": 0,
+        "fiber_presence_path": "s3://vesuvius-challenge-open-data/PHerc1299/representations/predictions/fibers/20260309130042-fibers-20260915212757-L1/PHerc1299-20260309130042-las-sd1-e7a931d5_presence.ome.zarr",
+        "fiber_nx_path": "s3://vesuvius-challenge-open-data/PHerc1299/representations/predictions/fibers/20260309130042-fibers-20260915212757-L1/PHerc1299-20260309130042-las-sd1-e7a931d5_nx.ome.zarr",
+        "fiber_ny_path": "s3://vesuvius-challenge-open-data/PHerc1299/representations/predictions/fibers/20260309130042-fibers-20260915212757-L1/PHerc1299-20260309130042-las-sd1-e7a931d5_ny.ome.zarr",
+        "fiber_level": 3,
+        "fiber_factor": 2
+      },
+      {
+        "sample_id": "PHercMAN5",
+        "pixel_size_um": 9.596,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHercMAN5/volumes/20260311104824-2.399um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 2,
+        "object_mask_source": "sam2",
+        "surface_path": "s3://vesuvius-challenge-open-data/PHercMAN5/representations/predictions/surfaces/20260311104824-surface-20260413222639-surface-m7-L2-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHercMANB",
+        "pixel_size_um": 9.596,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHercMANB/volumes/20260323091048-2.399um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 2,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHercMANB/representations/predictions/surfaces/20260323091048-surface-20260413222639-surface-m7-L2-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHercMANBp",
+        "pixel_size_um": 9.596,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHercMANBp/volumes/20251216152116-2.399um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 2,
+        "object_mask_min_inside": 0.5,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHercMANBp/representations/predictions/surfaces/20251216152116-surface-20260413222639-surface-m7-L2-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHercParis3",
+        "pixel_size_um": 9.6,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHercParis3/volumes/20260427095331-2.400um-0.2m-78keV-masked.zarr/",
+        "volume_scale": 2
+      },
+      {
+        "sample_id": "PHerc0009B",
+        "pixel_size_um": 9.604,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0009B/volumes/20260319104112-2.401um-0.3m-77keV-masked.zarr/",
+        "volume_scale": 2,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0009B/representations/predictions/surfaces/20260319104112-surface-20260413222639-surface-m7-L2-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0343P",
+        "pixel_size_um": 8.86,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0343P/volumes/20260304131111-2.215um-0.4m-111keV-masked.zarr/",
+        "volume_scale": 2,
+        "object_mask_min_inside": 0.5,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0343P/representations/predictions/surfaces/20260304131111-surface-20260413222639-surface-m7-L2-th0.2.zarr",
+        "surface_level": 0
+      },
+      {
+        "sample_id": "PHerc0500P2",
+        "pixel_size_um": 8.86,
+        "scan_location": "ESRF Grenoble",
+        "volume_path": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250526151718-2.215um-0.4m-111keV-masked.zarr/",
+        "volume_scale": 2,
+        "object_mask_min_inside": 0.5,
+        "surface_path": "s3://vesuvius-challenge-open-data/PHerc0500P2/representations/predictions/surfaces/20250526151718-surface-20260413222639-surface-m7-L2-th0.2.zarr",
+        "surface_level": 0
+      }
+    ],
+    "num_global_crops": 2,
+    "num_local_crops": 4,
+    "s3_storage_options": {
+      "anon": true
+    }
+  },
+  "lr_schedule": "constant",
+  "koleo_distributed": true,
+  "koleo_loss_group_size": 24,
+  "use_amp": true,
+  "amp_dtype": "bfloat16",
+  "point_supervision": {
+    "enabled": false
+  }
+}

@@ -652,6 +652,14 @@ The following settings can be added to a training config:
   architecture, preserve their saved model configuration or explicitly set all
   three old values (`mlp_ratio: 2.6666666666666665` in JSON); changing these
   settings changes parameter shapes and state-dict keys.
+- `qk_norm` (default `false` for all presets) applies separate learned RMSNorms
+  to Q and K over each head's channels after projection and before RoPE, for
+  both full and axial attention. Each norm shares its channel scales across
+  heads and uses epsilon `1e-6`; V and the attention scaling are unchanged.
+  `pretrain_8_9um_heads32768.json` enables it. Enabling it adds Q/K norm weights
+  and changes attention behavior: use a fresh run/output directory rather than
+  auto-resuming a checkpoint trained without it. Leave it disabled to preserve
+  existing checkpoint layouts and behavior.
 - `attention_backend` (default `"flash"`) names the preferred
   fused attention kernel: `cudnn`, `flash`, `efficient` or `math`, with the others
   as fallbacks. Each attention call applies it, so compiled graphs record the
