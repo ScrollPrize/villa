@@ -3464,9 +3464,9 @@ public:
     };
 
     struct OptionChunkMaps {
-        vc::lasagna::LasagnaChannelChunkCache::ResolvedChunkMap presence;
-        vc::lasagna::LasagnaChannelChunkCache::ResolvedChunkMap nx;
-        vc::lasagna::LasagnaChannelChunkCache::ResolvedChunkMap ny;
+        vc::lasagna::LasagnaResolvedChunks presence;
+        vc::lasagna::LasagnaResolvedChunks nx;
+        vc::lasagna::LasagnaResolvedChunks ny;
     };
 
     struct OptionSamplingGrid {
@@ -3474,8 +3474,8 @@ public:
     };
 
     Impl(const vc::lasagna::LasagnaDataset& dataset, size_t maxCachedBytes)
-        : cache_(vc::lasagna::sharedLasagnaChannelChunkCache(maxCachedBytes))
     {
+        vc::render::processChunkCacheService()->configureDecodedByteCapacity(maxCachedBytes);
         const auto& manifest = dataset.manifest();
         const auto prefixes = manifest.fiberPredictionPrefixes();
         if (prefixes.empty())
@@ -3520,7 +3520,7 @@ public:
     [[nodiscard]] vc::lasagna::NormalPrefetchReport prefetchSamples(
         const std::vector<cv::Vec3d>& volumePoints) const
     {
-        std::vector<vc::lasagna::LasagnaChannelChunkCache::PrefetchRequest> requests;
+        std::vector<vc::lasagna::LasagnaPrefetchRequest> requests;
         requests.reserve(volumePoints.size() * options_.size() * 24);
         std::vector<vc::lasagna::LasagnaChannelChunkKey> keys;
         keys.reserve(volumePoints.size() * 8);
@@ -3543,7 +3543,7 @@ public:
                     requests.emplace_back(&option.ny, key);
             }
         }
-        return cache_->prefetchInterleaved(requests);
+        return vc::lasagna::prefetchLasagnaChunks(requests);
     }
 
     void materializeGroupedPredictionCorners(
@@ -4048,7 +4048,7 @@ public:
             std::vector<vc::lasagna::LasagnaLocalChunkResolver> resolvers;
             resolvers.reserve(optionCount);
             for (const auto& option : options_)
-                resolvers.emplace_back(bindingSelector(option), *cache_);
+                resolvers.emplace_back(bindingSelector(option));
             return resolvers;
         };
 
@@ -4270,35 +4270,28 @@ public:
 
         const auto prefetchStart = TraceClock::now();
         std::vector<OptionChunkMaps> chunks(optionCount);
-        const size_t readWorkers = vc::lasagna::lasagnaReadWorkersPerChannel();
         std::vector<std::future<vc::lasagna::NormalPrefetchReport>> prefetches;
         prefetches.reserve(optionCount * 3);
         for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
             prefetches.push_back(std::async(std::launch::async, [&, optionIndex]() {
                 const auto& option = options_[optionIndex];
-                return cache_->prefetchResolved(
+                return vc::lasagna::resolveLasagnaChunks(
                     option.presence,
-                    *option.presence.array,
                     presenceKeys[optionIndex],
-                    readWorkers,
                     chunks[optionIndex].presence);
             }));
             prefetches.push_back(std::async(std::launch::async, [&, optionIndex]() {
                 const auto& option = options_[optionIndex];
-                return cache_->prefetchResolved(
+                return vc::lasagna::resolveLasagnaChunks(
                     option.nx,
-                    *option.nx.array,
                     nxKeys[optionIndex],
-                    readWorkers,
                     chunks[optionIndex].nx);
             }));
             prefetches.push_back(std::async(std::launch::async, [&, optionIndex]() {
                 const auto& option = options_[optionIndex];
-                return cache_->prefetchResolved(
+                return vc::lasagna::resolveLasagnaChunks(
                     option.ny,
-                    *option.ny.array,
                     nyKeys[optionIndex],
-                    readWorkers,
                     chunks[optionIndex].ny);
             }));
         }
@@ -4404,9 +4397,9 @@ public:
                     option.ny, volumePoint);
             }
             vc::lasagna::LasagnaLocalChunkResolver presenceResolver(
-                option.presence, *cache_);
-            vc::lasagna::LasagnaLocalChunkResolver nxResolver(option.nx, *cache_);
-            vc::lasagna::LasagnaLocalChunkResolver nyResolver(option.ny, *cache_);
+                option.presence);
+            vc::lasagna::LasagnaLocalChunkResolver nxResolver(option.nx);
+            vc::lasagna::LasagnaLocalChunkResolver nyResolver(option.ny);
             presenceResolver.resolve(presenceRequest);
             nxResolver.resolve(nxRequest);
             nyResolver.resolve(nyRequest);
@@ -4433,7 +4426,6 @@ public:
 private:
     std::vector<Option> options_;
     std::vector<OptionSamplingGrid> optionGrids_;
-    std::shared_ptr<vc::lasagna::LasagnaChannelChunkCache> cache_;
     bool cornerSamplingAvailable_ = true;
 };
 

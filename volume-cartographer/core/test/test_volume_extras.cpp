@@ -117,6 +117,30 @@ TEST_CASE("Volume::sample writes a Mat at the requested coords")
     fs::remove_all(d);
 }
 
+TEST_CASE("Volume chunk cache reports cumulative decoder work")
+{
+    auto d = tmpDir("decode_stats");
+    auto v = Volume::New(d, optsU8());
+    REQUIRE(v);
+    Array3D<uint8_t> seed({16, 16, 16}, 19);
+    v->writeZYX(seed, {0, 0, 0}, 0);
+    auto cache = v->sharedChunkCache();
+    REQUIRE(cache);
+    v->invalidateCache();
+    const auto before = cache->stats();
+
+    Array3D<uint8_t> out({16, 16, 16});
+    CHECK(v->readZYX(out, {0, 0, 0}, 0));
+    const auto after = cache->stats();
+
+    CHECK(after.decodeAttempts > before.decodeAttempts);
+    CHECK(after.decodedChunks > before.decodedChunks);
+    CHECK(after.decodeInputBytes > before.decodeInputBytes);
+    CHECK(after.decodedChunkBytes > before.decodedChunkBytes);
+    CHECK(after.decodeNanoseconds >= before.decodeNanoseconds);
+    fs::remove_all(d);
+}
+
 TEST_CASE("Volume::sample uint16 overload")
 {
     auto d = tmpDir("sample_u16");
@@ -186,6 +210,15 @@ TEST_CASE("Volume uses the process chunk-cache service")
     REQUIRE(cache);
     CHECK(cache->sourceId() != vc::render::VolumeSourceId{});
     fs::remove_all(d);
+}
+
+TEST_CASE("process chunk-cache decode concurrency is configurable")
+{
+    auto service = vc::render::processChunkCacheService();
+    const auto original = service->decodeConcurrency();
+    service->configureDecodeConcurrency(1);
+    CHECK(service->decodeConcurrency() == 1);
+    service->configureDecodeConcurrency(original);
 }
 
 TEST_CASE("process chunk-cache configuration preserves the service")

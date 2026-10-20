@@ -17,6 +17,7 @@
 #include <memory>
 #include <stdexcept>
 #include <vector>
+#include <thread>
 
 using vc::render::ChunkedPlaneSampler;
 using vc::render::ChunkKey;
@@ -543,6 +544,54 @@ TEST_CASE("Options round-trip")
     ChunkedPlaneSampler::Options def;
     CHECK(def.sampling == vc::Sampling::Nearest);
     CHECK(def.tileSize == 32);
+}
+
+TEST_CASE("Single-worker corner visitor stays on caller and matches pooled output")
+{
+    AllDataArray a(37, 11);
+    std::vector<vc::render::IChunkedArray*> arrays{&a};
+    const std::vector<cv::Vec3f> points{{.25f,.5f,.75f},{1.5f,1.25f,1.75f},{-1,0,0}};
+    struct Output {
+        std::vector<std::array<uint8_t,8>> values;
+        std::vector<cv::Vec3f> fractions;
+        std::vector<int> valid, onCaller;
+        std::thread::id caller=std::this_thread::get_id();
+        explicit Output(size_t n):values(n),fractions(n),valid(n),onCaller(n) {}
+    } direct(points.size()), pooled(points.size());
+    auto visitor=+[](void* ptr,size_t i,const cv::Vec3f& f,bool valid,
+                     std::span<const std::array<uint8_t,8>> values) {
+        auto& o=*static_cast<Output*>(ptr);
+        o.onCaller[i]=std::this_thread::get_id()==o.caller;
+        o.valid[i]=valid;
+        if(valid) { o.values[i]=values[0]; o.fractions[i]=f; }
+    };
+    auto stats=ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
+        arrays,0,points,&direct,visitor,1,false);
+    ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
+        arrays,0,points,&pooled,visitor,2,false);
+    CHECK(direct.values==pooled.values);
+    CHECK(direct.fractions==pooled.fractions);
+    CHECK(direct.valid==pooled.valid);
+    CHECK(direct.onCaller==std::vector<int>{1,1,1});
+    CHECK(stats.cornerWorkerTasks==1);
+    Output single(1);
+    ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
+        arrays,0,{points[0]},&single,visitor,0,false);
+    CHECK(single.onCaller[0]==1);
+    Output empty(0);
+    ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
+        arrays,0,{},&empty,visitor,1,false);
+    auto throwing=+[](void*,size_t,const cv::Vec3f&,bool,std::span<const std::array<uint8_t,8>>) {
+        throw std::runtime_error("visitor failure");
+    };
+    for(int workers: {1,2}) {
+        bool caught=false;
+        try {
+            ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
+                arrays,0,points,nullptr,throwing,workers,false);
+        } catch(const std::runtime_error& e) { caught=std::string(e.what())=="visitor failure"; }
+        CHECK(caught);
+    }
 }
 
 TEST_CASE("Blocking samplers preserve foreground request priority")

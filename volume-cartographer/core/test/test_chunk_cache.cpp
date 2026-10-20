@@ -637,6 +637,23 @@ TEST_CASE("Delta3D cache mode permits sources without persistent caching")
           vc::render::PersistentCacheLayout::Legacy);
 }
 
+TEST_CASE("ChunkCacheService can initialize bounded physical worker pools")
+{
+    auto options = serviceOptions(1024 * 1024, 1);
+    options.fetchConcurrency.workerCapacity = 1;
+    options.probeWorkerCapacity = 1;
+    options.decodeWorkerCapacity = 1;
+    auto service = std::make_shared<ChunkCacheService>(options);
+    CHECK(service->fetchConcurrency().workerCapacity == 1);
+    CHECK(service->probeWorkerCapacity() == 1);
+    CHECK(service->decodeWorkerCapacity() == 1);
+    CHECK(service->decodeConcurrency() == 1);
+    auto fetcher = std::make_shared<CountingFetcher>();
+    CHECK(makeServiceCache(service, "bounded-workers", fetcher));
+    options.decodeWorkerCapacity = 0;
+    CHECK_THROWS_AS(ChunkCacheService(options), std::invalid_argument);
+}
+
 TEST_CASE("ChunkCacheService carries adaptive download state into its shared scheduler")
 {
     const ChunkCacheService::AdaptiveDownloadState initial{
@@ -1540,9 +1557,10 @@ TEST_CASE("ChunkCache: blocking read survives a sub-chunk decoded budget")
     REQUIRE(result.bytes);
     CHECK(result.bytes->size() == 64);
     CHECK(fetcher->fetchCalls.load() == 1);
-    // Releasing the pin re-enforces the budget, so the overshoot the pin
-    // allowed does not persist.
-    CHECK(service->decodedByteBudget()->stats().decodedBytes <= 16);
+    // The parked reader is gone. Drop cache ownership immediately, without
+    // invalidating the returned lease or waiting for another cache operation.
+    CHECK(service->decodedByteBudget()->stats().decodedBytes == 0);
+    CHECK(result.bytes->at(0) == std::byte{55});
 }
 
 TEST_CASE("ChunkCache: blocking read survives zero metadata entry capacity")
@@ -1573,9 +1591,10 @@ TEST_CASE("ChunkCache: blocking read survives zero metadata entry capacity")
     REQUIRE(result.bytes);
     CHECK(result.bytes->size() == 64);
     CHECK(fetcher->fetchCalls.load() == 1);
-    // The reader's exit re-enforces the entry-count capacity, so the entry
-    // its registration protected is evicted once the reader has the result.
+    // The lease survives eviction but does not defeat metadata capacity.
+    CHECK(cache->stats().blockingReaders == 0);
     CHECK(cache->stats().decodedBytes == 0);
+    CHECK(result.bytes->at(0) == std::byte{55});
 }
 
 TEST_CASE("ChunkCache: reader protection covers a successor it did not create")
@@ -1612,6 +1631,7 @@ TEST_CASE("ChunkCache: reader protection covers a successor it did not create")
     REQUIRE(result.bytes);
     CHECK(result.bytes->size() == 64);
     CHECK(fetcher->calls({0, 0, 0, 0}) == 2);
+    CHECK(cache->stats().blockingReaders == 0);
     CHECK(cache->stats().decodedBytes == 0);
 }
 
@@ -1671,7 +1691,8 @@ TEST_CASE("ChunkCache: a reader exiting first cannot strip another's protection"
     REQUIRE(resultA.bytes);
     REQUIRE(resultB.bytes);
     CHECK(fetcher->calls({0, 0, 0, 0}) == 2);
-    // Both readers exited; the last exit re-enforced the budget.
+    // Both callers retain the same bytes without retaining the cache entry.
+    CHECK(resultA.bytes == resultB.bytes);
     CHECK(cache->stats().decodedBytes == 0);
     CHECK(cache->stats().blockingReaders == 0);
 }
@@ -2175,6 +2196,67 @@ TEST_CASE("ChunkCache: shared decoded budget is enforced across caches")
     CHECK(c1->stats().decodedByteCapacity == 128);
     CHECK(c1->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::Data);
     CHECK(c2->tryGetChunk(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+}
+
+TEST_CASE("ChunkCache: external leases cannot defeat byte or entry limits")
+{
+    struct Payload final : vc::render::DecodedChunkPayload {
+        std::array<std::byte, 64> data{};
+        std::size_t residentBytes() const noexcept override { return data.size(); }
+    };
+    struct FreshFetcher final : IChunkFetcher {
+        bool opaque;
+        explicit FreshFetcher(bool value) : opaque(value) {}
+        ChunkFetchResult fetch(const ChunkKey&) override {
+            ChunkFetchResult result;
+            result.status = ChunkFetchStatus::Found;
+            if (opaque)
+                result.payload = std::make_shared<Payload>();
+            else
+                result.bytes = makeBytes(64, std::byte{55});
+            return result;
+        }
+    };
+    for (bool opaque : {false, true}) {
+        for (bool limitEntries : {false, true}) {
+            CAPTURE(opaque);
+            CAPTURE(limitEntries);
+            auto service = makeService(limitEntries ? 1024 : 128);
+            ChunkCache::Options options;
+            options.detectAllFillChunks = false;
+            options.metadataEntryCapacity = limitEntries ? 2 : 100;
+            auto cache = service->acquireSource(
+                "lease-budget", {{{8, 8, 8}, {4, 4, 4}, {}}},
+                {std::make_shared<FreshFetcher>(opaque)}, 0.0,
+                opaque ? ChunkDtype::Opaque : ChunkDtype::UInt8, options);
+            std::vector<ChunkResult> leases;
+            for (int z : {0, 1})
+                for (int y : {0, 1})
+                    for (int x : {0, 1}) {
+                        leases.push_back(cache->getChunkBlocking(0, z, y, x));
+                        REQUIRE(leases.back().status == ChunkStatus::Data);
+                        CHECK(service->decodedByteBudget()->stats().decodedBytes <= 128);
+                    }
+            CHECK(cache->getChunkIfCached(0, 0, 0, 0).status == ChunkStatus::MissQueued);
+            for (const auto& lease : leases) {
+                if (opaque) {
+                    REQUIRE(lease.payload);
+                    CHECK(lease.payload->residentBytes() == 64);
+                } else {
+                    REQUIRE(lease.bytes);
+                    CHECK(lease.bytes->at(0) == std::byte{55});
+                }
+            }
+            std::weak_ptr<const std::vector<std::byte>> firstBytes = leases.front().bytes;
+            std::weak_ptr<const vc::render::DecodedChunkPayload> firstPayload = leases.front().payload;
+            leases.clear();
+            // No read or budget update after release: evicted buffers must
+            // die immediately, with at most the two budgeted chunks retained.
+            CHECK(firstBytes.expired());
+            CHECK(firstPayload.expired());
+            CHECK(service->decodedByteBudget()->stats().decodedBytes <= 128);
+        }
+    }
 }
 
 TEST_CASE("ChunkCache: invalidation releases shared decoded budget bytes")
