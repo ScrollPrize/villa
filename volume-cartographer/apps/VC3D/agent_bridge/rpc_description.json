@@ -671,11 +671,6 @@
         "properties": {
           "path": {
             "type": "string"
-          },
-          "scale": {
-            "default": 1,
-            "exclusiveMinimum": 0,
-            "type": "number"
           }
         },
         "required": [
@@ -699,11 +694,6 @@
         "properties": {
           "path": {
             "type": "string"
-          },
-          "scale": {
-            "default": 1,
-            "exclusiveMinimum": 0,
-            "type": "number"
           }
         },
         "required": [

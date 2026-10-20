@@ -277,11 +277,80 @@ def test_baseline_adoption_preserves_initial_loader_exclusions(context, monkeypa
     assert set(context.verified_patches) == {'baseline'}
 
 
+def test_binding_before_the_first_derivation_matches_adopting_after_it(context):
+    # A resident build binds the workspace's baseline identities before its
+    # one derivation, instead of deriving and then adopting them through a
+    # second full relink. Both must leave the same resident inputs.
+    on_patch = relink._regular_pcl(5, [[50, 20, 20], [50, 30, 30]])
+    off_patch = relink._regular_pcl(6, [[50, 520, 520], [50, 530, 530]])
+    off_patch['id'] = 4
+    context._source_point_collections = {5: on_patch, 6: off_patch}
+    context.next_id = 7
+    records = [
+        {'id': 'patch-uuid', 'kind': 'patch', 'role': None, 'revision': 1,
+         'source_path': '/dataset/verified_patches/baseline', 'source_id': 'baseline',
+         'path': '/workspace/baseline', 'deleted': False, 'adopt': True},
+        {'id': 'on-uuid', 'kind': 'pcl', 'role': 'legacy', 'revision': 1,
+         'source_path': '/inputs/drawn.json', 'source_id': '3',
+         'path': '/workspace/on.json', 'deleted': False, 'adopt': True},
+        {'id': 'off-uuid', 'kind': 'pcl', 'role': 'legacy', 'revision': 2,
+         'source_path': '/inputs/drawn.json', 'source_id': '4',
+         'path': '/workspace/off.json', 'deleted': False, 'adopt': True},
+    ]
+
+    def summary(ctx):
+        def view(pcl):
+            metadata = pcl.get('metadata', {})
+            return (metadata.get('logical_input_id'), metadata.get('logical_input_revision'),
+                    sorted((str(key), len(points))
+                           for key, points in pcl.get('points_by_patch', {}).items()))
+        return {
+            'membership': ctx._workspace_membership,
+            'next_id': ctx.next_id,
+            'catalog': {
+                cid: (pcl['metadata'], sorted(
+                    (pid, (point.get('on_patch') or {}).get('id'))
+                    for pid, point in pcl['points'].items()))
+                for cid, pcl in ctx.regular_pcl_catalog.items()},
+            'cross': [view(pcl) for pcl in ctx.cross_patch_pcls],
+            'strips': len(ctx.unattached_pcl_strips),
+            'verified': sorted(ctx.verified_patches),
+        }
+
+    adopted_after = summary(context.prepare_input_changes(records))
+
+    derive = FitContext._derive_point_inputs
+    derive_calls = []
+
+    def counting_derive(ctx, *args, **kwargs):
+        derive_calls.append(1)
+        return derive(ctx, *args, **kwargs)
+
+    context._workspace_membership = {}
+    context._bind_input_records(records)
+    points, fibers = context._enabled_point_inputs()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(FitContext, '_derive_point_inputs', counting_derive)
+        context._derive_point_inputs(context.verified_patches, points, fibers)
+    bound_before = summary(context)
+
+    assert len(derive_calls) == 1
+    assert bound_before == adopted_after
+    assert bound_before['membership']['off-uuid'] == {
+        'kind': 'pcl', 'revision': 2, 'resident_id': 6, 'deleted': False}
+    assert {cid: meta['logical_input_id']
+            for cid, (meta, _) in bound_before['catalog'].items()} == {5: 'on-uuid', 6: 'off-uuid'}
+    # Sources stay pristine: no attachment leaks into the retained geometry.
+    assert all('on_patch' not in point
+               for pcl in context._source_point_collections.values()
+               for point in pcl['points'].values())
+
+
 @pytest.mark.parametrize('adopt', [True, False])
 def test_theta_rejected_baseline_replay(context, monkeypatch, adopt):
     import fit_spiral
-    # Startup retains pre-validation sources, even after excluding a patch
-    # from the active geometry. Replay must repeat that exclusion successfully.
+    # A theta-rejected patch leaves the resident sources too, so later batches
+    # neither re-reject it nor relink every point a second time without it.
     excluded = relink._flat_patch(50, 510, 510)
     source = context._source_verified_patches
     source['excluded'] = excluded
@@ -308,15 +377,32 @@ def test_theta_rejected_baseline_replay(context, monkeypatch, adopt):
         assert source['excluded'] is excluded
         return
 
-    for _ in range(2):
+    derive = FitContext._derive_point_inputs
+    derive_calls = []
+
+    def counting_derive(candidate, *args, **kwargs):
+        derive_calls.append(set(args[0]))
+        return derive(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(FitContext, '_derive_point_inputs', counting_derive)
+    for batch in range(2):
+        derive_calls.clear()
         candidate = context.prepare_input_changes([record])
         assert 'excluded' not in candidate.verified_patches
-        assert candidate._source_verified_patches['excluded'] is excluded
+        assert 'excluded' not in candidate._source_verified_patches
         assert set(candidate.verified_patches) == {'baseline'}
-        assert any('non-liftable patch' in warning for warning in candidate._input_warnings)
+        rejected_now = any('non-liftable patch' in warning
+                           for warning in candidate._input_warnings)
+        if batch == 0:
+            assert rejected_now
+            assert derive_calls == [{'baseline', 'excluded'}, {'baseline'}]
+        else:
+            assert not rejected_now
+            assert derive_calls == [{'baseline'}]
         assert candidate._workspace_membership['excluded-uuid'] == {
             'kind': 'patch', 'revision': 1, 'resident_id': 'excluded', 'deleted': False}
         context.install_input_changes(candidate)
+    assert 'excluded' not in context._source_verified_patches
 
 
 @pytest.mark.parametrize('role', ['same_winding', 'relative', 'absolute', 'drawn_control_points'])

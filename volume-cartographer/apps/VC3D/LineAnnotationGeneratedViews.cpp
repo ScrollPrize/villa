@@ -1247,6 +1247,7 @@ const GeneratedOverlay::FiberIntersectionMarker* nearbyFiberIntersection(
 struct ClickLocationActions {
     QAction* openNearbyAnnotation = nullptr;
     QAction* newLineAnnotation = nullptr;
+    QAction* newModelLineAnnotation = nullptr;
     QAction* newLinkedLineAnnotation = nullptr;
     const GeneratedOverlay::FiberIntersectionMarker* nearbyIntersection = nullptr;
 
@@ -1268,6 +1269,8 @@ struct ClickLocationActions {
             options.viewer->sampleSceneVolume(options.scenePoint).has_value();
         newLineAnnotation = menu.addAction(QWidget::tr("New line annotation"));
         newLineAnnotation->setEnabled(canSampleClickedVolume);
+        newModelLineAnnotation = menu.addAction(QWidget::tr("New 2D line annotation (model)"));
+        newModelLineAnnotation->setEnabled(canSampleClickedVolume);
         // Only while a link candidate is designated.
         if (options.newLineAnnotationLinkedToCandidate &&
             !options.newLinkedToCandidateLabel.isEmpty()) {
@@ -1286,6 +1289,9 @@ struct ClickLocationActions {
         }
         if (newLineAnnotation && selected == newLineAnnotation && newLineAnnotation->isEnabled()) {
             return GeneratedControlPointContextResult::NewLineAnnotationRequested;
+        }
+        if (newModelLineAnnotation && selected == newModelLineAnnotation && newModelLineAnnotation->isEnabled()) {
+            return GeneratedControlPointContextResult::NewModelLineAnnotationRequested;
         }
         if (newLinkedLineAnnotation && selected == newLinkedLineAnnotation &&
             newLinkedLineAnnotation->isEnabled()) {

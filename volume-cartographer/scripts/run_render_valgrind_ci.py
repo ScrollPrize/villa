@@ -40,15 +40,21 @@ REPLAY_CONFIGURATION = {
 
 
 def collect_evaluate(args: argparse.Namespace) -> None:
-    """Retry invalid captures, never a valid score's comparison to the reference."""
+    """Allow two fresh retries for capture, replay, or reference-check failures."""
     case = args.case_dir.resolve()
     capture = case / "callgrind"
     output = case / "evaluation.json"
     case.mkdir(parents=True, exist_ok=True)
-    output.unlink(missing_ok=True)
+    reference = getattr(args, "reference", None)
+    checked = case / "checked.json"
+    checked.unlink(missing_ok=True)
     for attempt in range(1, 4):
-        shutil.rmtree(capture, ignore_errors=True)
-        capture.mkdir()
+        reuse = (attempt == 1 and getattr(args, "reuse_capture", False)
+                 and (capture / "collected.stamp").is_file() and output.is_file())
+        if not reuse:
+            output.unlink(missing_ok=True)
+            shutil.rmtree(capture, ignore_errors=True)
+            capture.mkdir()
         print(f"{args.fixture}/{args.scenario}: capture attempt {attempt}/3", flush=True)
         scheduler = capture / "scheduler.log"
         collect = [
@@ -77,19 +83,28 @@ def collect_evaluate(args: argparse.Namespace) -> None:
         if args.fixture == "parallel":
             evaluate += ["--callgrind-scheduler", str(scheduler)]
         env = dict(os.environ, VC_RENDER_SAMPLER_THREADS="4" if args.fixture == "parallel" else "1")
-        result = subprocess.run(collect, env=env, check=False)
-        if result.returncode == 0:
+        result = None if reuse else subprocess.run(collect, env=env, check=False)
+        if not reuse and result.returncode == 0:
             result = subprocess.run(evaluate, check=False)
-        if result.returncode == 0 and output.is_file():
+        valid = (reuse or result.returncode == 0) and output.is_file()
+        if valid and reference is not None:
+            gate = list(evaluate)
+            gate[gate.index("--output") + 1] = str(checked)
+            result = subprocess.run(gate + ["--reference", str(reference)], check=False)
+            valid = result.returncode == 0 and checked.is_file()
+        if valid:
             (capture / "collected.stamp").touch()
             return
-        output.unlink(missing_ok=True)
-        failed = case / f"failed-attempt-{attempt}"
+        prefix = "failed-gate-attempt" if reference is not None else "failed-attempt"
+        failed = case / f"{prefix}-{attempt}"
         shutil.rmtree(failed, ignore_errors=True)
         capture.rename(failed)
-        print(f"Capture/replay attempt {attempt} failed; retained files in {failed}",
+        for artifact in (output, checked, case / "checked.failed.json"):
+            if artifact.exists():
+                artifact.rename(failed / artifact.name)
+        print(f"Capture/replay/reference attempt {attempt} failed; retained files in {failed}",
               file=sys.stderr, flush=True)
-    raise RuntimeError(f"{args.fixture}/{args.scenario}: capture/replay failed after 3 attempts")
+    raise RuntimeError(f"{args.fixture}/{args.scenario}: capture/replay/reference failed after 3 attempts")
 
 
 def sha256_file(path: Path) -> str:
@@ -245,6 +260,8 @@ def parse_args() -> argparse.Namespace:
         collect.add_argument(f"--{option}", required=True, type=Path)
     collect.add_argument("--fixture", choices=("serial", "parallel"), required=True)
     collect.add_argument("--scenario", choices=SCENARIOS, required=True)
+    collect.add_argument("--reference", type=Path)
+    collect.add_argument("--reuse-capture", action="store_true")
     collect.set_defaults(function=collect_evaluate)
 
     freeze = subparsers.add_parser("freeze-reference")

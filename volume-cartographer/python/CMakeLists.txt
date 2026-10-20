@@ -57,6 +57,7 @@ set_target_properties(vc_core vc_lasagna utils utils_c3d_codec c3d utils_volcomp
 nanobind_add_module(vc_volume
     NOMINSIZE
     vc/volume.cpp
+    vc/normal_sampler.cpp
 )
 set_target_properties(vc_volume PROPERTIES
     OUTPUT_NAME volume
@@ -65,7 +66,7 @@ set_target_properties(vc_volume PROPERTIES
     # site-packages root one level up, so search both.
     INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
 )
-target_link_libraries(vc_volume PRIVATE vc_core)
+target_link_libraries(vc_volume PRIVATE vc_core vc_lasagna)
 target_compile_features(vc_volume PRIVATE cxx_std_23)
 
 nanobind_add_module(vc_surface_index
@@ -95,18 +96,31 @@ target_compile_options(vc_grid_raycast PRIVATE
     $<$<AND:$<CONFIG:RelWithDebInfo>,$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>>:-O3>
 )
 
+nanobind_add_module(vc_fiber_trace
+    NOMINSIZE
+    vc/fiber_trace.cpp
+)
+set_target_properties(vc_fiber_trace PROPERTIES
+    OUTPUT_NAME fiber_trace
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
+    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
+)
+target_link_libraries(vc_fiber_trace PRIVATE vc_fiber_tracer)
+target_compile_features(vc_fiber_trace PRIVATE cxx_std_23)
+set_target_properties(vc_fiber_tracer PROPERTIES INSTALL_RPATH "$ORIGIN")
+
 install(TARGETS vc_lasagna_amgx
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
 )
 
-install(TARGETS vc_core vc_lasagna utils utils_c3d_codec c3d utils_volcomp_codec volcomp
+install(TARGETS vc_core vc_lasagna vc_fiber_tracer utils utils_c3d_codec c3d utils_volcomp_codec volcomp
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .
     ARCHIVE DESTINATION .
 )
 
-install(TARGETS vc_volume vc_surface_index vc_grid_raycast
+install(TARGETS vc_volume vc_surface_index vc_grid_raycast vc_fiber_trace
     LIBRARY DESTINATION vc
     RUNTIME DESTINATION vc
 )
