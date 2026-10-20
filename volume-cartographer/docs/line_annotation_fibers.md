@@ -235,8 +235,10 @@ through the same fiber-mode path as the asynchronous solves so that removing
 the tag regrows the ordinary tails. The gap is read from the span tag: a break
 that closes a gap span is the far edge of the damage, so the fiber continues
 past it with the ordinary extrapolation. The tail is ordinary open-tail
-geometry (excluded from lengths and overlays as before); the solve report
-counts it as `ray_extrapolations`.
+geometry (clipped from the other fibers' overlays and excluded from the
+length of a fiber with two or more controls as before; a single control's
+length counts its whole line, rays included); the solve report counts it as
+`ray_extrapolations`.
 
 Placing a control point beyond a lone end break (a pure append on the ray, or
 a prepend before a lone head break; the `/` and `0` keys and the strips go
@@ -254,14 +256,16 @@ edit changed no interpolation goal (which starts a re-solve of its own) the
 session is marked Unoptimized and, in Auto-reoptimize mode, its tails are
 re-traced (a tails-only solve, or a whole-line one when work was already
 queued); in manual mode the next reoptimization or the save/close
-finalization applies it. Changing either menu distance behaves the same and
-also invalidates an armed collapse/mode rollback snapshot (a later restore
-lands Unoptimized rather than as the snapshot's state). The same fiber open
+finalization applies it. Changing either menu distance marks the session
+Unoptimized, requests a whole-line solve (started at once in Auto-reoptimize
+mode, queued otherwise) and invalidates an armed collapse/mode rollback
+snapshot (a later restore lands Unoptimized rather than as the snapshot's
+state). The same fiber open
 in another pane receives the tag together with the span tags and the gap goal
 policy, so a save from that pane cannot regress a goal; that pane starts no
 new solve of its own but is marked Unoptimized (save/close finalizes it) and
 owed a whole-line pass, and a solve already running there is superseded and
-re-dispatched. A landing that still owes queued work publishes as Unoptimized
+its successor dispatched or, in manual mode, kept queued. A landing that still owes queued work publishes as Unoptimized
 so the autosave never persists it and save/close finalizes it; a solve that
 fails while the interior is not optimized owes a whole-line pass again for
 the next dispatch, and a goal change or tail refresh from such an interior
@@ -848,6 +852,8 @@ row, `lineAnnotation/break_extrapolation_distance_vx`, default 400, clamped to
 100..1000000 everywhere it is read), in every global mode. A single control
 whose both sides are rays traces nothing and needs no inference inputs (nor
 the fiber-follow service in a normal-backed session). A single control with
-a traced side whose session holds no trace inputs finalizes synchronously as
-Lasagna for that one solve instead of opening a dataset picker (the session's
-persisted mode is untouched).
+a traced side under the native prediction tracer (fiber-follow off) whose
+session holds no trace inputs finalizes synchronously as Lasagna for that one
+solve instead of opening a dataset picker (the session's persisted mode is
+untouched); model sessions and fiber-follow sessions ensure their service as
+before.

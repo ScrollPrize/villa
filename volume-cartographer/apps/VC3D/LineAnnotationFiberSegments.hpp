@@ -378,6 +378,15 @@ struct OpenTailPolicy {
     const std::vector<LineControlPoint>& previousControls,
     const PreparedControlPointEdit& prepared);
 
+// Nearest line vertex to `target`; among equally near candidates (a line
+// that revisits its own coordinates) `tie` picks the first or the last, so
+// a head control resolves to its first visit and a tail control to its last.
+// Throws std::invalid_argument on an empty line.
+enum class NearestTie { First, Last };
+[[nodiscard]] size_t nearestLineIndex(const std::vector<cv::Vec3d>& points,
+                                      const cv::Vec3d& target,
+                                      NearestTie tie);
+
 // The sample positions of a straight ray from `endpoint` along `direction`
 // (normalised inside): k*spacing for k = 1..n, n = max(1, ceil(distance /
 // spacing)), the last clamped to exactly `distance`, so a ray always has at

@@ -6790,6 +6790,18 @@ std::vector<cv::Vec3d> straightLine(int fromX, int toX, int step)
     return points;
 }
 
+// Every returned control names its exact vertex through BOTH index fields.
+void checkControlsNameTheirVertices(const vc3d::line_annotation::FiberModeOptimizationResult& result)
+{
+    const auto& points = result.optimization.line.points;
+    for (const auto& control : result.controlPoints) {
+        REQUIRE(control.optimizedIndex >= 0);
+        REQUIRE(control.optimizedIndex < int(points.size()));
+        CHECK(control.linePosition == doctest::Approx(double(control.optimizedIndex)));
+        CHECK(cv::norm(points[size_t(control.optimizedIndex)].position - control.volumePoint) < 1e-9);
+    }
+}
+
 double tailLengthPast(const vc::lasagna::LineModel& line, int controlIndex, bool head)
 {
     const auto& points = line.points;
@@ -6904,6 +6916,19 @@ TEST_CASE("Ray tail points: spacing, clamped last sample, validation")
                     std::invalid_argument);
 }
 
+TEST_CASE("Nearest line index resolves a revisited coordinate by side")
+{
+    using namespace vc3d::line_annotation;
+    std::vector<cv::Vec3d> points = straightLine(0, 8, 1);
+    points[6] = points[4];  // the line revisits P4 at index 6
+    CHECK(nearestLineIndex(points, {2, 0, 0}, NearestTie::First) == 2);
+    CHECK(nearestLineIndex(points, {2, 0, 0}, NearestTie::Last) == 2);
+    CHECK(nearestLineIndex(points, {4, 0, 0}, NearestTie::First) == 4);
+    CHECK(nearestLineIndex(points, {4, 0, 0}, NearestTie::Last) == 6);
+    CHECK(nearestLineIndex(points, {4.4, 0, 0}, NearestTie::Last) == 6);
+    CHECK_THROWS_AS(nearestLineIndex({}, {0, 0, 0}, NearestTie::First), std::invalid_argument);
+}
+
 TEST_CASE("Ray tail replacement keeps the controlled range and shifts indices")
 {
     using namespace vc3d::line_annotation;
@@ -6996,22 +7021,29 @@ TEST_CASE("Fiber mode open tails: rays past lone breaks in every backend")
         return request;
     };
     const auto checkRay = [](const FiberModeOptimizationResult& result, bool head, double length) {
+        checkControlsNameTheirVertices(result);
         const int index = head ? result.controlPoints.front().optimizedIndex
                                : result.controlPoints.back().optimizedIndex;
         const auto& points = result.optimization.line.points;
-        REQUIRE(index >= 0);
-        REQUIRE(index < int(points.size()));
         const auto& cp = head ? result.controlPoints.front() : result.controlPoints.back();
-        CHECK(points[size_t(index)].position == cp.volumePoint);
         CHECK(tailLengthPast(result.optimization.line, index, head) == doctest::Approx(length));
-        // Straight: every sample of the ray is collinear with the end tangent.
-        const cv::Vec3d end = head ? points.front().position : points.back().position;
-        const cv::Vec3d tangent = cv::normalize(end - cp.volumePoint);
+        // The expected direction is computed independently of the ray: the
+        // annotated direction (negated on the head) when there is one, else
+        // outward from the inward neighbour on the retained line.
         const int step = head ? -1 : 1;
+        cv::Vec3d expected = cp.direction
+            ? (head ? -*cp.direction : *cp.direction)
+            : cp.volumePoint - points[size_t(index - step)].position;
+        expected = cv::normalize(expected);
+        int samples = 0;
         for (int i = index + step; i >= 0 && i < int(points.size()); i += step) {
+            ++samples;
             const cv::Vec3d offset = points[size_t(i)].position - cp.volumePoint;
-            CHECK(cv::norm(offset - tangent * offset.dot(tangent)) < 1e-6);
+            const double along = offset.dot(expected);
+            CHECK(along > 0.0);
+            CHECK(cv::norm(offset - expected * along) < 1e-6);
         }
+        CHECK(samples >= 1);
     };
 
     SUBCASE("Lasagna mode keeps the solver's tail on the other side") {
@@ -7078,6 +7110,41 @@ TEST_CASE("Fiber mode open tails: rays past lone breaks in every backend")
             if (side == 0) CHECK(tailLengthPast(result.optimization.line, result.controlPoints.front().optimizedIndex, true) == doctest::Approx(8.0));
             if (side == 1) CHECK(tailLengthPast(result.optimization.line, result.controlPoints.back().optimizedIndex, false) == doctest::Approx(8.0));
         }
+    }
+    SUBCASE("an annotated direction, not the line tangent, aims the ray") {
+        auto request = baseRequest();
+        request.globalMode = FiberOptimizationMode::Lasagna;
+        tagControl(request.controlPoints.front(), kBreakTag);
+        tagControl(request.controlPoints.back(), kBreakTag);
+        request.controlPoints.front().direction = cv::Vec3d(0.0, 0.0, 1.0);
+        request.controlPoints.back().direction = cv::Vec3d(0.0, 1.0, 0.0);
+        const auto result = optimizeFiberWithNativeFallback(request);
+        CHECK(result.rayExtrapolations == 2);
+        checkRay(result, true, 6.0);
+        checkRay(result, false, 6.0);
+        const auto& points = result.optimization.line.points;
+        CHECK(cv::norm(points.front().position - (cv::Vec3d(0, 0, 0) + cv::Vec3d(0, 0, -6))) < 1e-9);
+        CHECK(cv::norm(points.back().position - (cv::Vec3d(16, 0, 0) + cv::Vec3d(0, 6, 0))) < 1e-9);
+    }
+    SUBCASE("three shuffled controls with a head ray: every control keeps its vertex") {
+        auto request = baseRequest();
+        request.globalMode = FiberOptimizationMode::Lasagna;
+        request.linePointsBase = straightLine(-8, 40, 4);
+        request.controlPoints = {{10.0, {32.0, 0.0, 0.0}, false, 10},
+                                 {2.0, {0.0, 0.0, 0.0}, true, 2},
+                                 {6.0, {16.0, 0.0, 0.0}, false, 6}};
+        request.controlPoints[1].segmentToNext.emplace();
+        request.controlPoints[1].segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
+        request.controlPoints[2].segmentToNext.emplace();
+        request.controlPoints[2].segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
+        tagControl(request.controlPoints[1], kBreakTag);
+        const auto result = optimizeFiberWithNativeFallback(request);
+        REQUIRE(result.controlPoints.size() == 3);
+        CHECK(result.rayExtrapolations == 1);
+        checkRay(result, true, 6.0);
+        CHECK(result.controlPoints[1].volumePoint == cv::Vec3d(16, 0, 0));
+        CHECK(result.controlPoints[0].optimizedIndex < result.controlPoints[1].optimizedIndex);
+        CHECK(result.controlPoints[1].optimizedIndex < result.controlPoints[2].optimizedIndex);
     }
     SUBCASE("a trace side that fails keeps its Lasagna fallback; the ray side never reports") {
         auto request = baseRequest();
@@ -7161,9 +7228,8 @@ TEST_CASE("Fiber mode single control: tags switch both tails between rays and or
         return request;
     };
     const auto bothTails = [](const FiberModeOptimizationResult& result) {
+        checkControlsNameTheirVertices(result);
         const int index = result.controlPoints.front().optimizedIndex;
-        REQUIRE(index >= 0);
-        REQUIRE(index < int(result.optimization.line.points.size()));
         CHECK(result.optimization.line.points[size_t(index)].position == cv::Vec3d(0, 0, 0));
         return std::make_pair(tailLengthPast(result.optimization.line, index, true),
                               tailLengthPast(result.optimization.line, index, false));
@@ -7308,6 +7374,51 @@ TEST_CASE("Model-only fiber: rays replace the model's tails and cancellation is 
             CHECK(tailLengthPast(result.optimization.line, b, false) == doctest::Approx(side == 1 ? 8.0 : 3.0));
         }
     }
+    SUBCASE("cancellation raised inside the model builder or a trace completes nothing") {
+        for (const bool twoControls : {false, true}) {
+            int builds = 0, traces = 0;
+            auto request = baseRequest(builds, traces);
+            if (twoControls) {
+                request.linePointsBase = {{9, 20, 30}, {10, 20, 30}, {11, 20, 30}, {12, 20, 30}, {13, 20, 30}};
+                request.controlPoints.push_back({3.0, {12.0, 20.0, 30.0}, false, 3});
+                request.controlPoints.front().segmentToNext.emplace();
+                request.controlPoints.front().segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
+            }
+            tagControl(request.controlPoints.back(), kBreakTag);
+            std::atomic<bool> cancel{false};
+            request.cancelFlag = &cancel;
+            auto build = request.modelLineBuilder;
+            request.modelLineBuilder = [&cancel, build](const auto& points) {
+                cancel.store(true);
+                return build(points);
+            };
+            CHECK_THROWS_AS(optimizeFiberWithNativeFallback(request), vc::lasagna::LineOptimizationCancelled);
+            CHECK(builds == 1);
+            // A trace that sets the flag: the ray on the other side and the
+            // rebuild never happen.
+            cancel.store(false);
+            auto request2 = baseRequest(builds, traces);
+            if (twoControls) {
+                request2 = request;
+                request2.modelLineBuilder = build;
+                // Head traces, tail is a ray.
+            }
+            // A single control tagged break would be a ray on both sides and
+            // trace nothing: leave it untagged so its first trace sets the flag.
+            request2.cancelFlag = &cancel;
+            request2.externalExtrapolation = [&cancel](const auto& history, const auto& direction, double distance) {
+                cancel.store(true);
+                vc::fiber_tracer::FiberTraceOneWayResult result;
+                result.points = {history.back(), history.back() + direction / cv::norm(direction) * distance};
+                result.reason = "fiber_follow: max_len";
+                result.reachedTraceLength = true;
+                return result;
+            };
+            builds = 0;
+            CHECK_THROWS_AS(optimizeFiberWithNativeFallback(request2), vc::lasagna::LineOptimizationCancelled);
+            CHECK(builds == 0);
+        }
+    }
     SUBCASE("an already-cancelled request completes nothing") {
         for (const bool twoControls : {false, true}) {
             int builds = 0, traces = 0;
@@ -7344,6 +7455,21 @@ TEST_CASE("Empty dirty set re-traces only the tails")
         request.controlPoints[i].segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
         request.controlPoints[i].segmentToNext->message = "cspline";
     }
+    // The first span is an explicit model trace whose fake bends the line
+    // off the straight spline reconstruction: a re-solve of the interior
+    // would call the fake again and straighten it.
+    request.controlPoints[0].segmentToNext->interpGoal = SegmentInterpolationGoal::Trace;
+    int segmentCalls = 0;
+    request.externalSegment = [&segmentCalls](const auto& span) {
+        ++segmentCalls;
+        vc::fiber_tracer::FiberTraceSegmentResult result;
+        result.accepted = true;
+        const auto start = span.referenceLine.at(span.startIndex);
+        const auto end = span.referenceLine.at(span.targetIndex);
+        result.fusedLine = {start, (start + end) * 0.5 + cv::Vec3d(0.0, 3.0, 0.0), end};
+        result.reason = "fiber_follow: target_plane";
+        return result;
+    };
     setSpanTag(request.controlPoints[1].segmentToNext, kDamagedSpanTag, true);
     request.extrapolationDistanceBaseVoxels = 8.0;
     request.breakExtrapolationDistanceBaseVoxels = 4.0;
@@ -7360,6 +7486,16 @@ TEST_CASE("Empty dirty set re-traces only the tails")
     };
     const auto full = optimizeFiberWithNativeFallback(request);
     REQUIRE(full.controlPoints.size() == 3);
+    CHECK(segmentCalls == 1);
+    CHECK(full.nativeSegments == 1);
+    checkControlsNameTheirVertices(full);
+    {
+        const int a = full.controlPoints[0].optimizedIndex;
+        const int b = full.controlPoints[1].optimizedIndex;
+        REQUIRE(b - a == 2);
+        CHECK(full.optimization.line.points[size_t(a + 1)].position == cv::Vec3d(8.0, 3.0, 0.0));
+    }
+    segmentCalls = 0;
 
     // Re-solve nothing but the tails, from the solved line, with the last
     // control now a lone break.
@@ -7370,9 +7506,13 @@ TEST_CASE("Empty dirty set re-traces only the tails")
     tagControl(again.controlPoints.back(), kBreakTag);
     again.dirtySegments = std::vector<size_t>{};
     const auto tails = optimizeFiberWithNativeFallback(again);
+    CHECK(segmentCalls == 0);
     CHECK(tails.nativeSegments == 0);
     CHECK(tails.rayExtrapolations == 1);
     CHECK(tails.nativeExtrapolations == 1);
+    checkControlsNameTheirVertices(tails);
+    CHECK(tails.optimization.line.points[size_t(tails.controlPoints[0].optimizedIndex + 1)].position ==
+          cv::Vec3d(8.0, 3.0, 0.0));
     const int a = tails.controlPoints.front().optimizedIndex;
     const int b = tails.controlPoints.back().optimizedIndex;
     const int fa = full.controlPoints.front().optimizedIndex;
@@ -7384,7 +7524,7 @@ TEST_CASE("Empty dirty set re-traces only the tails")
     }
     for (size_t i = 0; i < 2; ++i) {
         REQUIRE(tails.controlPoints[i].segmentToNext);
-        CHECK(tails.controlPoints[i].segmentToNext->interpGoal == SegmentInterpolationGoal::Cspline);
+        CHECK(tails.controlPoints[i].segmentToNext->interpGoal == full.controlPoints[i].segmentToNext->interpGoal);
         CHECK(tails.controlPoints[i].segmentToNext->interpMode == full.controlPoints[i].segmentToNext->interpMode);
         CHECK(tails.controlPoints[i].segmentToNext->tags == full.controlPoints[i].segmentToNext->tags);
         CHECK(tails.controlPoints[i].segmentToNext->message == full.controlPoints[i].segmentToNext->message);
@@ -7516,6 +7656,24 @@ TEST_CASE("Mirrored control edits report tail-policy and goal changes per list")
         CHECK(outcome.snapshotChanged);
         CHECK(!hasControlPointTag(live[2].tags, kBreakTag));
         CHECK(hasControlPointTag(rollback[3].tags, kBreakTag));
+    }
+    SUBCASE("a gap that forms only in a snapshot changes its goal there") {
+        for (const bool viaModeChange : {true, false}) {
+            auto live = makeControls();
+            tagControl(live[2], kBreakTag);  // already a break: the live edit is a no-op
+            auto snapshot = makeControls();
+            tagControl(snapshot[1], kBreakTag);
+            const auto outcome = applyMirroredControlPointEdit(
+                live, viaModeChange ? &snapshot : nullptr, viaModeChange ? nullptr : &snapshot,
+                {20, 0, 0}, setBreak);
+            CHECK(outcome.changed);
+            CHECK(!outcome.livePolicyChanged);
+            CHECK(!outcome.liveSync.changed());
+            CHECK(outcome.snapshotChanged);
+            CHECK(spanIsGap(snapshot[1].segmentToNext));
+            CHECK(snapshot[1].segmentToNext->interpGoal == SegmentInterpolationGoal::Cspline);
+            CHECK(!spanIsGap(live[1].segmentToNext));
+        }
     }
     SUBCASE("dissolving a gap while still cspline returns it to global") {
         auto live = makeControls();

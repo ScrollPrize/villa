@@ -459,6 +459,13 @@ int replaceOpenTails(
         throw std::runtime_error(
             "Lasagna fallback returned invalid endpoint control indices");
     }
+    const auto throwIfCancelled = [&request] {
+        if (request.cancelFlag &&
+            request.cancelFlag->load(std::memory_order_relaxed)) {
+            throw vc::lasagna::LineOptimizationCancelled();
+        }
+    };
+    throwIfCancelled();
     const bool traceMode =
         request.globalMode == FiberOptimizationMode::NativeFiberTrace3d;
     const auto actionFor = [traceMode](bool ray) {
@@ -614,6 +621,9 @@ int replaceOpenTails(
         }
     }
 
+    // A trace may have set the flag; the rebuild below samples normals for
+    // the whole line and must not run for a superseded solve.
+    throwIfCancelled();
     std::vector<cv::Vec3d> combined;
     combined.reserve(leftTail.size() + finalPoints.size() + rightTail.size());
     combined.insert(combined.end(), leftTail.begin(), leftTail.end());
@@ -764,6 +774,9 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         }
         throwIfCancelled();
         finishModelLine(output);
+        // The model builder is a long callback too: a solve cancelled during
+        // it must not complete.
+        throwIfCancelled();
         appendFiberModeReport(output);
         output.controlPoints = std::move(request.controlPoints);
         return output;
@@ -1258,6 +1271,7 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     }
     throwIfCancelled();
     finishModelLine(output);
+    throwIfCancelled();
     appendFiberModeReport(output);
     output.controlPoints = std::move(request.controlPoints);
     return output;
@@ -1777,6 +1791,26 @@ std::optional<size_t> appendedControlToTagAsBreak(
         return std::nullopt;
     }
     return prepared.replacementIndex;
+}
+
+size_t nearestLineIndex(const std::vector<cv::Vec3d>& points,
+                        const cv::Vec3d& target,
+                        NearestTie tie)
+{
+    if (points.empty()) {
+        throw std::invalid_argument("cannot resolve a control point on an empty line");
+    }
+    size_t best = 0;
+    double bestDistance = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < points.size(); ++i) {
+        const double distance = cv::norm(points[i] - target);
+        if (distance < bestDistance ||
+            (tie == NearestTie::Last && distance == bestDistance)) {
+            bestDistance = distance;
+            best = i;
+        }
+    }
+    return best;
 }
 
 std::vector<cv::Vec3d> rayTailPoints(const cv::Vec3d& endpoint,

@@ -804,6 +804,14 @@ private:
     // policy differs from `before` and no solve was started, refresh.
     void refreshTailsIfPolicyChanged(const std::string& surfaceName,
                                      vc3d::line_annotation::OpenTailPolicy before);
+    // Scope-guard body of the break handlers (point menu, span menu): on
+    // EVERY exit, also after a refused second end, reconcile the gap goals
+    // of whatever was committed (the re-solve re-traces the tails), else
+    // refresh the tails if the policy changed.
+    void finishBreakEdit(const std::string& surfaceName,
+                         const std::vector<size_t>& gapOwnersBefore,
+                         bool enabled,
+                         vc3d::line_annotation::OpenTailPolicy before);
     // Extrapolation / Break extrapolation Apply: a solver-input change that
     // also invalidates an armed rollback snapshot's geometry.
     void handleTailConfigChanged(const std::string& surfaceName);
