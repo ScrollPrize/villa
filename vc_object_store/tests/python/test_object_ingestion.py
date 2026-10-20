@@ -1,4 +1,3 @@
-import os
 """Native ingestion/export preserves geometry, annotations and relationships."""
 import json
 from pathlib import Path
@@ -63,53 +62,6 @@ def test_bad_source_relationship_rolls_back_whole_batch(db, tmp_path):
     report = db.ingest_geometry_source("fiber", source)
     assert report["ingested"] == 0 and "out of range" in report["problems"][0]
     assert db.object(a) is None and db.object(b) is None and db.journal_since() == []
-
-
-def test_registered_real_patch_batch_preserves_geometry_and_atomic_topology(db, tmp_path):
-    # Use measured PHerc 0172 geometry with independent object identities.
-    # TIFFs remain shared/read-only; only each copied identity changes.
-    fixture = Path(os.environ.get("VC_OBJECT_STORE_FIXTURES", Path(__file__).resolve().parents[3] / "volume-cartographer/core/test/data")) / "segments/20241113070770"
-    metadata = json.loads((fixture / "meta.json").read_text())
-    patches = []
-    with db.write() as txn:
-        for i in range(3):
-            source = tmp_path / str(i)
-            source.mkdir()
-            for tif in fixture.glob("*.tif"):
-                (source / tif.name).symlink_to(tif)
-            uid = str(uuid.uuid4())
-            metadata["uuid"] = uid
-            (source / "meta.json").write_text(json.dumps(metadata))
-            txn.upsert_object({"uuid": uid, "kind": "patch", "storage_kind": "file",
-                               "storage_ref": str(source)})
-            patches.append(uid)
-    a, b = str(uuid.uuid4()), str(uuid.uuid4())
-    first = fiber(a, [{"control_point_index": 99, "branch_control_point_index": 0,
-                       "target_uuid": b}])
-    first_path = tmp_path / "first.json"
-    for name, data in (("first", first), ("second", fiber(b))):
-        path = tmp_path / f"{name}.json"
-        path.write_text(json.dumps(data))
-        db.upsert_object({"uuid": data["uuid"], "kind": "fiber", "storage_kind": "file",
-                          "storage_ref": str(path)})
-    journal = db.journal_since()
-    report = db.ingest_registered_geometry()
-    assert report["ingested"] == 0 and "out of range" in report["problems"][0]
-    assert all(db.current_geometry(uid) is None for uid in patches + [a, b])
-    assert db.journal_since() == journal
-
-    first["branches"][0]["control_point_index"] = 1
-    first_path.write_text(json.dumps(first))
-    report = db.ingest_registered_geometry()
-    assert report == {"ingested": 5, "unchanged": 0, "edges_imported": 1, "problems": []}
-    expected = db.read_geometry_array(db.current_geometry(patches[0])["uuid"], "points")
-    assert len(expected) == 129 * 129 * 3 * 4
-    # Every published object must retain its own complete geometry.
-    for uid in patches:
-        assert db.read_geometry_array(db.current_geometry(uid)["uuid"], "points") == expected
-    assert db.neighbours(a) == [b]
-    assert db.ingest_registered_geometry() == {
-        "ingested": 0, "unchanged": 5, "edges_imported": 0, "problems": []}
 
 
 def test_point_links_self_edges_winding_and_native_export(db, tmp_path):

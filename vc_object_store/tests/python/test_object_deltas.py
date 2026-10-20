@@ -1,11 +1,7 @@
-import os
 """Sparse array editing, retained history, and current materialization contracts."""
 import json
-import shutil
 import sqlite3
 import struct
-import uuid
-from pathlib import Path
 
 import pytest
 from vc_object_store import ObjectStore
@@ -169,46 +165,6 @@ def test_v7_migration_keeps_snapshot_and_allows_delta(tmp_path):
         second=store.edit_geometry(uid,[edit(0,struct.pack('<i',9))],expected_revision=first)
         assert store.read_geometry_array(second,'points') == struct.pack('<3i',9,2,3)
         assert store.read_geometry_array(first,'points') == struct.pack('<3i',1,2,3)
-
-
-def test_real_scroll_patch_sparse_history_storage_and_reopen(tmp_path):
-    """Use actual PHerc 0172 coordinates, not generated geometry, for storage evidence."""
-    np=pytest.importorskip('numpy')
-    fixture=Path(os.environ.get('VC_OBJECT_STORE_FIXTURES', Path(__file__).resolve().parents[3]/'volume-cartographer/core/test/data'))/'segments/20241113070770'
-    copied=tmp_path/'segment'; shutil.copytree(fixture,copied)
-    metadata=json.loads((copied/'meta.json').read_text()); uid=str(uuid.uuid4()); metadata['uuid']=uid
-    (copied/'meta.json').write_text(json.dumps(metadata))
-    path=str(tmp_path/'history.vcobj')
-    with ObjectStore.create(path,author='test') as store:
-        assert store.ingest_geometry_source('patch',copied)['ingested']==1
-        first=rev=store.current_geometry(uid)['uuid']
-        initial_object = store.current_object_revision(uid)
-        with store.write(expected_revisions={uid: initial_object['uuid']}) as tx:
-            tx.set_meta(uid, 'history_validation', {'accepted': True})
-        metadata_revision = store.current_object_revision(uid)
-        assert metadata_revision['geometry_revision'] == first
-        assert 'history_validation' not in store.object_revision(initial_object['uuid'])['record']['meta']
-        assert metadata_revision['record']['meta']['history_validation'] == {'accepted': True}
-        initial=store.read_geometry_array(first,'points'); pts=np.frombuffer(initial,dtype='<f4').reshape(-1,3)
-        valid=np.flatnonzero(np.isfinite(pts).all(axis=1) & (pts[:,2]>0))[:100]
-        assert len(valid)==100
-        original_chunks=sqlite_rows(path,'SELECT count(*),sum(length(data)) FROM geometry_chunks')[0]
-        expected=bytearray(initial)
-        saved=[]
-        for i in range(100):
-            point=int(valid[i%len(valid)]); offset=point*3+2
-            value=struct.pack('<f',float(pts[point,2])+0.25*(i+1))
-            rev=store.edit_geometry(uid,[edit(offset,value)],expected_revision=rev)
-            expected[offset*4:offset*4+4]=value
-            if i in (0,49,99): saved.append((rev,bytes(expected)))
-        assert sqlite_rows(path,'SELECT count(*),sum(length(data)) FROM geometry_chunks')[0]==original_chunks
-        assert sqlite_rows(path,'SELECT count(*) FROM geometry_deltas')[0][0]==100
-        assert sqlite_rows(path,'SELECT sum(length(data)) FROM geometry_deltas')[0][0]<100*512
-        for r,raw in saved: assert store.read_geometry_array(r,'points')==raw
-        store.checkpoint()
-    with ObjectStore.open(path,read_only=True) as store:
-        assert store.read_geometry_array(first,'points')==initial
-        assert store.read_geometry_array(rev,'points')==bytes(expected)
 
 
 def test_compressed_auxiliary_ranges_cross_linear_chunks_and_hashes(db):

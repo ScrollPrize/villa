@@ -72,8 +72,7 @@ Surface proximity queries use the store's resident bounds index and exact
 triangles. Bounds are not quantized, so queries near tile boundaries can find
 valid hits that VC's rounded bounding boxes previously omitted.
 
-Tests use the real segment fixtures under the sibling
-`volume-cartographer/core/test/data`; they do not compile or link VC. Set
-`VC_OBJECT_STORE_FIXTURES` to use a separate copy of that data directory.
+Tests are self-contained and do not require the volume-cartographer checkout or
+its fixture data.
 The edit benchmark is `build/bin/bench_object_edits`; the convenience runner is
 `scripts/bench_object_edits.py`.

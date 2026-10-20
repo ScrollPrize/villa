@@ -1,11 +1,9 @@
-import os
 """Discovery consumes stored revisions, never object source paths."""
 import uuid
 
 import numpy as np
 import pytest
 
-from vc_object_store import ObjectStore
 from object_helpers import edge_choice
 
 
@@ -113,41 +111,3 @@ def test_stored_collection_ids_winding_scaling_and_rerun(db):
     geometry["arrays"][0] = array("points", [[1000, 1000, 40], [2000, 2000, 40]], "<f8")
     db.put_geometry(collection, geometry, expected_revision=db.current_geometry(collection)["uuid"], edge_edits=[edge_choice(db, e["uuid"], "remove") for e in db.affected_geometry_edges(collection, geometry)])
     assert db.link_point_collections_to_patches(collection_uuids=[collection], patch_uuids=[patch], point_scale=0.5)["stale_removed"] == 0
-
-
-def test_ingested_real_patch_links_after_sources_removed_and_store_moved(tmp_path):
-    import json
-    import shutil
-    from pathlib import Path
-
-    source = tmp_path / "source"
-    fixture = Path(os.environ.get("VC_OBJECT_STORE_FIXTURES", Path(__file__).resolve().parents[3] / "volume-cartographer/core/test/data")) / "segments/20241113070770"
-    shutil.copytree(fixture, source)
-    metadata = json.loads((source / "meta.json").read_text())
-    # This fixture predates UUIDs; only normalize its copied identity.
-    a = str(uuid.uuid4())
-    metadata["uuid"] = a
-    (source / "meta.json").write_text(json.dumps(metadata))
-    path = tmp_path / "before.vcobj"
-    with ObjectStore.create(str(path), author="test") as store:
-        assert store.ingest_geometry_source("patch", source)["ingested"] == 1
-        revision = store.current_geometry(a)
-        geometry = {"kind": "patch", "attributes": revision["attributes"], "arrays": [
-            {"name": d["name"], "dtype": d["dtype"], "shape": d["shape"],
-             "data": store.read_geometry_array(revision["uuid"], d["name"])}
-            for d in revision["arrays"]
-        ]}
-        # A second object containing the same measured surface must overlap.
-        b = store.upsert_object({"kind": "patch"})
-        store.put_geometry(b, geometry)
-        store.checkpoint()
-    shutil.rmtree(source)
-    moved = tmp_path / "moved.vcobj"
-    path.rename(moved)
-    with ObjectStore.open(str(moved), author="test") as store:
-        report = store.link_patch_overlaps(workers=2)
-        assert report["edges_created"] == 1, report
-        edge = store.edges_of(a)[0]
-        assert {edge["a"], edge["b"]} == {a, b}
-        assert not store.edge_geometry_state(edge["uuid"])["stale"]
-        assert store.link_patch_overlaps(workers=1)["edges_skipped_existing"] == 1
