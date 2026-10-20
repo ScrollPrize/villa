@@ -1,4 +1,5 @@
 #include "imports/SourceRelationships.hpp"
+#include "internal/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/GeometryIngest.hpp"
 #include "vc_object_store/PackedTrackStore.hpp"
 #include "vc_object_store/Uuid.hpp"
@@ -29,9 +30,12 @@ Expected expectedAt(ObjectStore& db, const Txn& read, const std::string& id)
     if (const auto geometry = db.currentGeometry(read, id)) e.revision = geometry->uuid;
     return e;
 }
-void normalizeMetadata(Prepared& p)
+void normalizeMetadata(Prepared& p, const std::string& coordinateContext)
 {
     auto source = p.source;
+    const auto coordinates = detail::mergeGeometryCoordinates(
+        detail::sourceGeometryCoordinates(source), Json::parse(coordinateContext));
+    detail::eraseSourceGeometryCoordinates(source);
     for (const auto* field : {"uuid", "name", "type", "version", "branches", "adjacent_branches", "windings_linked"}) source.erase(field);
     if (source.contains("tags") && source["tags"].is_array()) source.erase("tags");
     if (p.object.kind == "patch") for (const auto* field : {"scale", "bbox", "tiff_dimensions", "format"}) source.erase(field);
@@ -43,10 +47,11 @@ void normalizeMetadata(Prepared& p)
     }
     if (p.object.kind == "point_collection" && source.contains("point_attributes"))
         for (auto& point : source["point_attributes"]) if (point.is_object()) point.erase("links");
-    p.object.meta = Json{{"source", source}}.dump();
+    p.object.meta = Json{{"source", source}, {"coordinates", coordinates}}.dump();
 }
 void publishBatch(ObjectStore& db, std::vector<Prepared> batch,
-    const std::map<std::string, Expected>& expectations, GeometryIngestReport& report)
+    const std::map<std::string, Expected>& expectations, GeometryIngestReport& report,
+    const std::string& coordinateContext = "{}")
 {
     auto write = db.write();
     int64_t ingested = 0, unchanged = 0;
@@ -57,7 +62,7 @@ void publishBatch(ObjectStore& db, std::vector<Prepared> batch,
         if ((existing ? std::optional(existing->generation) : std::nullopt) != e.generation)
             throw std::runtime_error("object changed while reading source; retry ingestion");
         if (existing && existing->kind != p.object.kind) throw std::runtime_error("source UUID belongs to another object kind");
-        normalizeMetadata(p);
+        normalizeMetadata(p, coordinateContext);
         if (!existing) db.upsertObject(write, p.object);
         const auto revision = db.putGeometry(write, p.object.uuid, p.geometry, e.revision);
         // Publication no longer needs these arrays; release them before the
@@ -69,7 +74,12 @@ void publishBatch(ObjectStore& db, std::vector<Prepared> batch,
         auto record = *db.objectByUuid(write, p.object.uuid);
         auto metadata = Json::parse(record.meta);
         // Seed source annotations once; subsequent ingestion preserves DB edits.
-        if (!metadata.contains("source")) metadata["source"] = Json::parse(p.object.meta)["source"];
+        if (!metadata.contains("source")) {
+            const auto incoming = Json::parse(p.object.meta);
+            metadata["source"] = incoming["source"];
+            metadata["coordinates"] = detail::mergeGeometryCoordinates(
+                metadata.value("coordinates", Json::object()), incoming["coordinates"]);
+        }
         record.meta = metadata.dump();
         if (p.object.fiber) {
             if (e.revision && record.fiber) {
@@ -94,12 +104,13 @@ void publishBatch(ObjectStore& db, std::vector<Prepared> batch,
     write.commit();
     report.ingested += ingested; report.unchanged += unchanged; report.edgesImported += edges;
 }
-void publish(ObjectStore& db, Prepared p, const Expected& expected, GeometryIngestReport& report)
+void publish(ObjectStore& db, Prepared p, const Expected& expected, GeometryIngestReport& report,
+    const std::string& coordinateContext)
 {
     std::map<std::string, Expected> expectations{{p.object.uuid, expected}};
     std::vector<Prepared> batch;
     batch.push_back(std::move(p));
-    publishBatch(db, std::move(batch), expectations, report);
+    publishBatch(db, std::move(batch), expectations, report, coordinateContext);
 }
 void problem(GeometryIngestReport& report, const std::string& label, const std::exception& error)
 {
@@ -176,10 +187,11 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
 }
 
 GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& kind, const fs::path& source,
-    const util::ProgressCallback& progress)
+    const util::ProgressCallback& progress, const std::string& coordinateContext)
 {
     GeometryIngestReport report;
     try {
+        detail::geometryCoordinates(Json::parse(coordinateContext));
         if (kind == "track") {
             const auto packed = resolvePackedTrackStore(source);
             PackedTrackStore store(packed);
@@ -213,7 +225,7 @@ GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& ki
                         object.track = TrackDetail{}; object.track->datasetRef = ref; object.track->externalKey = key;
                     }
                     const auto e = expectations.contains(object.uuid) ? expectations.at(object.uuid) : Expected{};
-                    publish(db, track(store, row, object), e, report);
+                    publish(db, track(store, row, object), e, report, coordinateContext);
                 } catch (const std::exception& error) { problem(report, key, error); }
             }
         } else {
@@ -237,7 +249,7 @@ GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& ki
                 else throw std::runtime_error("unsupported geometry kind: " + kind);
                 for (const auto& p : batch) expectations[p.object.uuid] = expectedAt(db, read, p.object.uuid);
             }
-            publishBatch(db, std::move(batch), expectations, report);
+            publishBatch(db, std::move(batch), expectations, report, coordinateContext);
         }
     } catch (const std::exception& error) { problem(report, source.string(), error); }
     return report;

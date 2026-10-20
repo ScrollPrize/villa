@@ -113,6 +113,16 @@ bool setLinePatchParameter(vc::object_links::LinePatchParams& p, const std::stri
 
 NB_MODULE(_native, m)
 {
+    m.def("read_geometry_source_coordinates",
+        [](const std::string& kind, const std::filesystem::path& source,
+           const std::string& uuid, const nb::dict& context) {
+            const auto declarations = jsonDumps(context);
+            std::string result;
+            { nb::gil_scoped_release release;
+              result = vo::readGeometrySourceCoordinates(kind, source, uuid, declarations); }
+            return jsonLoads(result);
+        }, nb::arg("kind"), nb::arg("source"), nb::arg("object_uuid"),
+           nb::arg("coordinate_context") = nb::dict());
     nb::class_<vc::CtSheetNormalSampler>(m, "CtSheetNormalSampler")
         .def(nb::init<const std::filesystem::path&, int, double>(),
              nb::arg("ct_volume"), nb::arg("level") = 0, nb::arg("working_to_ct_scale") = 1.0)
@@ -432,11 +442,13 @@ NB_MODULE(_native, m)
             { auto lease = self.db; self.require(); nb::gil_scoped_release release; result = vo::ingestRegisteredGeometry(self.require(), root, uuids, {}); }
             return geometryReportToPy(result);
         }, nb::arg("dataset_root") = std::nullopt, nb::arg("object_uuids") = std::vector<std::string>{})
-        .def("ingest_geometry_source", [](PyObjectStore& self, const std::string& kind, const std::filesystem::path& source) {
+        .def("ingest_geometry_source", [](PyObjectStore& self, const std::string& kind, const std::filesystem::path& source,
+                                         const nb::dict& context) {
             vo::GeometryIngestReport result;
-            { auto lease = self.db; self.require(); nb::gil_scoped_release release; result = vo::ingestGeometrySource(self.require(), kind, source, {}); }
+            const auto declarations = jsonDumps(context);
+            { auto lease = self.db; self.require(); nb::gil_scoped_release release; result = vo::ingestGeometrySource(self.require(), kind, source, {}, declarations); }
             return geometryReportToPy(result);
-        }, nb::arg("kind"), nb::arg("source"))
+        }, nb::arg("kind"), nb::arg("source"), nb::arg("coordinate_context") = nb::dict())
         .def("export_geometry", [](PyObjectStore& self, const std::string& object,
                                    const std::filesystem::path& destination,
                                    const std::optional<std::string>& revision, bool overwrite) {
@@ -857,6 +869,10 @@ NB_MODULE(_native, m)
              [](PyObjectWriteTxn& self, const std::string& uuid, const std::string& key, const nb::object& value) {
                  self.owner->require().setMeta(self.require(), uuid, key, jsonDumps(value));
              }, nb::arg("uuid"), nb::arg("key"), nb::arg("value").none())
+        .def("backfill_geometry_coordinates",
+             [](PyObjectWriteTxn& self, const std::string& uuid, const nb::dict& declarations) {
+                 self.owner->require().backfillGeometryCoordinates(self.require(), uuid, jsonDumps(declarations));
+             }, nb::arg("uuid"), nb::arg("declarations") = nb::dict())
         .def("set_approval", [](PyObjectWriteTxn& self, const std::string& uuid, const std::string& state) {
             self.owner->require().setApproval(self.require(), uuid, state);
         });

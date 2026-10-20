@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include <nlohmann/json.hpp>
 
 #include <atomic>
 #include <filesystem>
@@ -84,6 +85,53 @@ void writeText(const fs::path& path, const std::string& text)
 }
 
 }  // namespace
+
+TEST_CASE("geometry coordinate metadata uses one checked revision contract")
+{
+    TempDir tmp("coordinates");
+    auto db = ObjectStore::create(tmp.dir / "objects.vcobj", testOptions());
+    using Json = nlohmann::json;
+    for (const auto* kind : {"point_collection", "fiber", "patch", "track"}) {
+        auto object = makeObject(kind);
+        object.meta = R"({"coordinates":{"volume_uuid":"ABCDEFAB-1111-4111-8111-111111111111","scale_factor":4},"note":"keep"})";
+        std::string uuid, before;
+        {
+            auto w = db.write();
+            uuid = db.upsertObject(w, object);
+            w.commit();
+        }
+        {
+            auto r = db.read();
+            const auto revision = db.currentObjectRevision(r, uuid);
+            REQUIRE(revision);
+            before = revision->uuid;
+            CHECK(Json::parse(revision->record.meta)["coordinates"]["volume_uuid"] ==
+                  "abcdefab-1111-4111-8111-111111111111");
+        }
+        {
+            auto w = db.write(RevisionSelection{{uuid, before}});
+            CHECK_THROWS(db.setMeta(w, uuid, "coordinates", R"({"scale_factor":false})"));
+            db.setMeta(w, uuid, "coordinates", R"({"scale_factor":0.5})");
+            w.commit();
+        }
+        std::string current;
+        {
+            auto r = db.read();
+            CHECK(Json::parse(db.objectRevision(r, before)->record.meta)["coordinates"]["scale_factor"] == 4);
+            const auto revision = db.currentObjectRevision(r, uuid);
+            current = revision->uuid;
+            CHECK(Json::parse(revision->record.meta)["coordinates"]["scale_factor"] == 0.5);
+            CHECK(Json::parse(revision->record.meta)["coordinates"]["volume_uuid"].is_null());
+        }
+        CHECK_THROWS(db.write(RevisionSelection{{uuid, before}}));
+        {
+            auto w = db.write(RevisionSelection{{uuid, current}});
+            db.backfillGeometryCoordinates(w, uuid, R"({"volume_uuid":"abcdefab-1111-4111-8111-111111111111"})");
+            w.commit();
+        }
+        CHECK(Json::parse(getObject(db, uuid).meta)["note"] == "keep");
+    }
+}
 
 TEST_CASE("create, open, and validation")
 {

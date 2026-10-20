@@ -1,4 +1,6 @@
 #include "internal/RecordSql.hpp"
+#include "internal/GeometryCoordinates.hpp"
+#include "internal/History.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -101,7 +103,42 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
 
 void ObjectStore::setMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key, const std::string& jsonValue)
 {
+    if (key == "coordinates") {
+        const auto object = objectByUuid(txn, recordUuid);
+        if (object && hasGeometryCoordinates(object->kind)) {
+            const auto value = geometryCoordinates(nlohmann::json::parse(jsonValue));
+            mutateMeta(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, recordUuid, key, value.dump());
+            return;
+        }
+    }
     mutateMeta(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, recordUuid, key, jsonValue);
+}
+
+void ObjectStore::backfillGeometryCoordinates(WriteTxn& txn, const std::string& uuid,
+                                             const std::string& declarations)
+{
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    if (!activeStatementPools.at(db)->checkedAction)
+        throw std::runtime_error("geometry coordinate backfill requires write(expected revisions)");
+    Savepoint savepoint(db);
+    try {
+        const auto object = objectByUuid(txn, uuid);
+        if (!object || !hasGeometryCoordinates(object->kind))
+            throw std::invalid_argument("coordinate backfill requires an existing geometry object");
+        auto meta = nlohmann::json::parse(object->meta);
+        auto coordinates = geometryCoordinates(meta.value("coordinates", nlohmann::json::object()));
+        if (meta.contains("source"))
+            coordinates = mergeGeometryCoordinates(coordinates, sourceGeometryCoordinates(meta["source"]));
+        coordinates = mergeGeometryCoordinates(coordinates, nlohmann::json::parse(declarations));
+        setMeta(txn, uuid, "coordinates", coordinates.dump());
+        if (meta.contains("source")) {
+            eraseSourceGeometryCoordinates(meta["source"]);
+            setMeta(txn, uuid, "source", meta["source"].dump());
+        }
+        savepoint.release();
+    } catch (const std::exception& error) {
+        historyConflict(db, error.what());
+    }
 }
 
 void ObjectStore::removeMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key)

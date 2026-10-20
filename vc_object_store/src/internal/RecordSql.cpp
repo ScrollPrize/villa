@@ -1,4 +1,5 @@
 #include "internal/RecordSql.hpp"
+#include "internal/GeometryCoordinates.hpp"
 
 namespace vc::objects::detail {
 const char* kObjectCols =
@@ -320,6 +321,14 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
     if (rec.meta.empty())
         rec.meta = "{}";
     const auto uuid = parseUuid(rec.uuid);
+    if (hasGeometryCoordinates(rec.kind)) {
+        auto meta = nlohmann::json::parse(rec.meta);
+        if (meta.contains("coordinates"))
+            meta["coordinates"] = geometryCoordinates(meta["coordinates"]);
+        else if (!preserveRecord && !objectIdByUuid(db, uuid))
+            meta["coordinates"] = geometryCoordinates(nlohmann::json::object());
+        rec.meta = meta.dump();
+    }
     const auto bounds = detail::recordBounds(rec);
     if (bounds) detail::validateBounds(*bounds);
     Statement collision(db, "SELECT 1 FROM edges WHERE uuid=?");

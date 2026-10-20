@@ -156,6 +156,7 @@ def test_caught_upsert_failure_preserves_record_details_approval_and_journal(db)
     uid = db.upsert_object(dict(kind="track", name="original", tags=["keep"],
         track=dict(dataset_ref="tracks", external_key="one", bbox=[1, 2, 3, 4, 5, 6])))
     other = db.upsert_object(dict(kind="track", track=dict(dataset_ref="tracks", external_key="two")))
+    other_meta = db.object(other)["meta"]
     db.set_approval(uid, "approved")
     before = db.object(uid)
     journal = db.journal_since()
@@ -169,7 +170,7 @@ def test_caught_upsert_failure_preserves_record_details_approval_and_journal(db)
         tx.set_meta(other, "continued", True)
     assert db.object(uid) == before
     assert db.object_count("fiber") == 0
-    assert db.object(other)["meta"] == {"continued": True}
+    assert db.object(other)["meta"] == {**other_meta, "continued": True}
     assert db.journal_since()[:-1] == journal
     assert [r["uuid"] for r in db.select_objects(bbox=[1, 2, 3, 4, 5, 6], fields=[])] == [uid]
 

@@ -27,6 +27,7 @@ def test_publication_requires_explicit_decisions_and_preserves_unrelated_edges(d
     db.set_approval(unrelated, "approved")
     unrelated_before = db.edge(unrelated)
     db.set_meta(a, "review_note", "keep")
+    before_meta = db.object(a)["meta"]
     before_edge = db.edge(edge)
     before_state = db.edge_geometry_state(edge)
     before = db.journal_since()
@@ -34,7 +35,7 @@ def test_publication_requires_explicit_decisions_and_preserves_unrelated_edges(d
         db.put_geometry(a, _geometry(value=9), expected_revision=first)
     assert db.journal_since() == before
     second = db.put_geometry(a, _geometry(value=9), expected_revision=first, edge_edits=[edge_choice(db, edge, "retain")])
-    assert db.object(a)["meta"] == {"review_note": "keep"}
+    assert db.object(a)["meta"] == before_meta
     assert db.object(a)["tags"] == ["source"]
     assert db.edge(edge)["approval_state"] == "pending"
     assert db.edge(edge)["generation"] == before_edge["generation"] + 1

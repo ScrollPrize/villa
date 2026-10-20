@@ -446,10 +446,21 @@ public:
     void setApproval(WriteTxn& txn, const std::string& recordUuid, const std::string& state);
 
     // Open-ended metadata: single-key atomic updates via SQLite JSON1.
+    // All four geometry kinds use meta.coordinates = {volume_uuid, scale_factor}.
+    // UUID is canonical hyphenated hex (or null); scale is positive finite (or
+    // null), with stored XYZ = volume-voxel XYZ * scale_factor. Metadata only:
+    // neither writes nor import transform geometry. Omission means unknown.
     // jsonValue is JSON text (e.g. "\"reviewed\"", "3", "true").
     // Both bump generation and reset approval, like any content change.
     void setMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key, const std::string& jsonValue);
     void removeMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key);
+
+    // Fill unknown meta.coordinates volume_uuid/scale_factor from declarations
+    // (JSON object) and any old source annotations, rejecting known conflicts.
+    // Requires write(RevisionSelection). Removes legacy coordinate fields from
+    // current source metadata, preserving other annotations and all history.
+    void backfillGeometryCoordinates(WriteTxn&, const std::string& objectUuid,
+        const std::string& declarations = "{}");
 
     std::vector<JournalEntry> journalSince(const Txn& txn, int64_t afterSeq) const;
 

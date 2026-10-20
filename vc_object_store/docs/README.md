@@ -213,6 +213,104 @@ without matching local object history receives the same explicitly incomplete,
 untimed baseline. Use a database copy when the complete original timeline must
 be transported.
 
+## Volume identity and coordinate scale
+
+Patches, fibers, tracks, and point collections share one object metadata field:
+
+```json
+{"coordinates": {"volume_uuid": "abcdefab-1111-4111-8111-111111111111", "scale_factor": 4}}
+```
+
+This is `ObjectRecord::meta` in C++ and `store.object(uuid)["meta"]` in Python.
+Each object owns its values independently. `volume_uuid` is an explicit volume
+identifier, represented as 32 hexadecimal digits with hyphens in the
+`8-4-4-4-12` layout; uppercase input is normalized to lowercase. It does not
+require a corresponding object in this database. Paths, coordinate-space labels,
+and object UUIDs never supply an inferred volume identity.
+
+`scale_factor` is a finite positive JSON number. Its direction is
+`stored_xyz = volume_voxel_xyz * scale_factor`: it describes the geometry's
+annotation frame relative to the identified source volume's voxel frame.
+For example, factor 4 describes coordinates on an annotation grid four times
+finer than that volume grid. It is distinct from physical voxel resolution and
+from a patch's two-dimensional grid `scale`. **It is metadata only: ingestion,
+metadata edits, and backfill never rescale XYZ or change geometry payloads.**
+Consumers decide whether and how to use it; detectors do not automatically
+change their scale parameters.
+
+Both fields default to JSON `null` on new geometry objects. Missing fields in
+older records likewise mean unknown, including a missing `coordinates` object;
+unknown scale does not mean 1. Setting `coordinates` replaces the whole field,
+normalizing omitted members to `null`. Unknown keys and malformed UUIDs/scales
+are rejected. Positive 64-bit integers retain their exact JSON integer values.
+
+Native import accepts `coordinates` on a source object and, for point
+collections, on the document or individual collection. Flat `volume_uuid` and
+`scale_factor` declarations are also accepted as input. Python's
+`ingest_geometry_source(..., coordinate_context={...})` and the final
+`coordinateContext` JSON argument of C++ `ingestGeometrySource` supply the same
+two fields for any geometry kind. Packed tracks have no native declarations;
+use context or ordinary metadata writes. Known declarations must agree;
+missing/null declarations may be filled by another source. Collection documents
+publish atomically; packed tracks retain their existing per-track publication.
+
+Legacy `vc_open_data_source_coordinate_scale_factor` is accepted only as an
+input mapping to `scale_factor`. All five legacy `vc_open_data_*` coordinate
+fields are removed from newly imported source metadata; no legacy coordinate
+API is retained. A level, resolution, path, or label alone never generates a
+scale or volume UUID. Discarded legacy fields are not interpreted or validated.
+
+```python
+uid = store.upsert_object({
+    "kind": "point_collection",
+    "meta": {"coordinates": {"volume_uuid": volume_uuid, "scale_factor": 4}},
+})
+head = store.current_object_revision(uid)["uuid"]
+with store.write(expected_revisions={uid: head}) as tx:
+    tx.set_meta(uid, "coordinates", {"volume_uuid": volume_uuid, "scale_factor": 2})
+assert store.object_revision(head)["record"]["meta"]["coordinates"]["scale_factor"] == 4
+```
+
+Coordinate edits use ordinary object revisions and reuse the same geometry
+revision. Relationships that depend on the frame should declare
+`metadata_keys=["coordinates"]` on the affected endpoint anchors. A coordinate
+edit then requires the usual explicit keep-recorded, retain, update, or remove
+decision, with expected revisions for participating endpoints. This is a
+dependency declaration; the store does not establish physical registration or
+validate a domain-specific geometric connection.
+
+Ordinary re-ingestion still seeds source metadata once and preserves database
+annotations. Use explicit checked backfill to repair older objects:
+
+```python
+from vc_object_store import read_geometry_source_coordinates
+
+# Pin before reading source metadata; no geometry arrays are decoded.
+head = store.current_object_revision(uid)["uuid"]
+declarations = read_geometry_source_coordinates("point_collection", source_path, uid)
+with store.write(expected_revisions={uid: head}) as tx:
+    tx.backfill_geometry_coordinates(uid, declarations)
+```
+
+`read_geometry_source_coordinates` also supports a fiber JSON file or patch
+directory and accepts `coordinate_context`. It checks the source object UUID.
+Alternatively pass the two declarations directly, or omit them to use any
+legacy scale already in `meta.source`. Backfill fills unknown fields, refuses to
+overwrite known conflicting values, preserves other annotations, and removes
+legacy coordinate fields from current source metadata. A conflict, even if
+caught inside the writer, aborts the checked action. Multiple backfills and
+relationship decisions can share one transaction. Without available information,
+values stay unknown. Historical revisions remain unchanged, including any legacy
+metadata they already contained.
+
+The C++ equivalents are `readGeometrySourceCoordinates(kind, path, uuid,
+coordinateContext)` from `<vc_object_store/objects/GeometryIngest.hpp>` and
+`store.backfillGeometryCoordinates(writeTxn, uuid, declarationsJson)` from
+`ObjectStore.hpp`. Use `store.write(RevisionSelection{{uuid, expectedRevision}})`;
+unchecked writers are rejected for backfill. Ordinary `setMeta` and
+`upsertObject` use the same coordinate validator. No schema migration, shared
+collection-set object, or native-export change is involved.
+
 ## Surface channels and overlap sidecars
 
 Every extra named array on a patch is a grid-aligned channel. `points` remains

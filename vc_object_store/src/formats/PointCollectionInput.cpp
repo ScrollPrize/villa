@@ -1,5 +1,6 @@
 #include "formats/GeometryInput.hpp"
 #include "geometry/ArrayBytes.hpp"
+#include "internal/GeometryCoordinates.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include <charconv>
 #include <set>
@@ -13,6 +14,7 @@ std::vector<Prepared> collections(const fs::path& source)
     if (root.value("vc_pointcollections_json_version", "") != "1" || !root.at("collections").is_object())
         throw std::runtime_error("expected vc_pointcollections JSON version 1");
     std::vector<Prepared> result;
+    const auto documentCoordinates = detail::sourceGeometryCoordinates(root);
     std::set<std::string> seen;
     for (const auto& [collectionId, original] : root.at("collections").items()) {
         Prepared p;
@@ -30,6 +32,10 @@ std::vector<Prepared> collections(const fs::path& source)
         std::vector<int64_t> ids;
         std::vector<std::array<double, 3>> coordinates;
         auto attributes = original; attributes.erase("points");
+        const auto localCoordinates = detail::mergeGeometryCoordinates(
+            documentCoordinates, detail::sourceGeometryCoordinates(original));
+        detail::eraseSourceGeometryCoordinates(attributes);
+        attributes["coordinates"] = localCoordinates;
         attributes["source_collection_id"] = collectionId;
         attributes["origin"] = p.object.storageRef;
         if (!attributes.contains("winding_is_absolute") && source.filename() == "abs_winding.json")
