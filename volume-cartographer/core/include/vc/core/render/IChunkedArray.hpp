@@ -23,7 +23,10 @@ enum class ChunkStatus {
 
 enum class ChunkDtype {
     UInt8,
-    UInt16
+    UInt16,
+    // Variable-length application records, never dense tensor samples.
+    Opaque,
+    Float32 // Signed scalar channels; sampled through typed channel readers.
 };
 
 struct ChunkResult {
@@ -32,6 +35,7 @@ struct ChunkResult {
     std::array<int, 3> shape{};
     std::shared_ptr<const std::vector<std::byte>> bytes;
     std::string error;
+    std::shared_ptr<const DecodedChunkPayload> payload;
 };
 
 struct ChunkRequestContext {

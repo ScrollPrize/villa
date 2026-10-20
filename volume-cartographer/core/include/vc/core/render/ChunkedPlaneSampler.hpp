@@ -13,6 +13,7 @@
 
 namespace vc::render {
 
+class PinnedChunkRegion;
 class ChunkedPlaneSampler {
 public:
     using TrilinearCornerPointVisitor = void (*)(
@@ -26,6 +27,9 @@ public:
         Options()
             : sampling(vc::Sampling::Nearest)
             , tileSize(32)
+            , parallelThreads(0)
+            , chunkLocalityFastPath(true)
+            , collectLocalityStats(false)
             , queueMisses(true)
             , queuedFallbackLevels(-1)
         {
@@ -33,6 +37,9 @@ public:
         Options(vc::Sampling sampling_, int tileSize_)
             : sampling(sampling_)
             , tileSize(tileSize_)
+            , parallelThreads(0)
+            , chunkLocalityFastPath(true)
+            , collectLocalityStats(false)
             , queueMisses(true)
             , queuedFallbackLevels(-1)
         {
@@ -40,6 +47,13 @@ public:
 
         vc::Sampling sampling;
         int tileSize;
+        // 0 uses the process-wide automatic sampler pool limit. Positive
+        // values cap workers for this call; 1 executes sampling serially.
+        int parallelThreads;
+        // Exact requested-level locality optimization. False exists for
+        // matched diagnostic benchmarking against the scalar reference path.
+        bool chunkLocalityFastPath;
+        bool collectLocalityStats;
         // When false, sample only decoded chunks already resident in memory.
         // Resident-only reads also leave the shared cache's LRU order alone.
         bool queueMisses;
@@ -58,6 +72,20 @@ public:
         int missingChunks = 0;
         int fallbackLevels = 0;
         bool requestedLevelOnly = false;
+        int sampleWorkers = 0;
+        double dependencySeconds = 0.0;
+        double chunkResolveSeconds = 0.0;
+        double sampleSeconds = 0.0;
+        uint64_t dependencyPoints = 0;
+        uint64_t dependencyFootprintReuses = 0;
+        uint64_t dependencyFootprintChanges = 0;
+        uint64_t dependencyKeyLookups = 0;
+        uint64_t dependencyHashProbes = 0;
+        uint64_t dependencyChunkRunReuses = 0;
+        uint64_t sampleDirectGatherPoints = 0;
+        uint64_t sampleBoundaryPoints = 0;
+        uint64_t samplePinnedMapLookups = 0;
+        uint64_t sampleChunkRunReuses = 0;
         double cornerPrepareSeconds = 0.0;
         double cornerLayoutSeconds = 0.0;
         double cornerPinSeconds = 0.0;
@@ -217,7 +245,8 @@ public:
         TrilinearCornerPointVisitor visitor,
         int parallelThreads = 0,
         bool collectLocalityStats = false,
-        const ChunkRequestContext& request = {});
+        const ChunkRequestContext& request = {},
+        const PinnedChunkRegion* pinnedRegion = nullptr);
 
     // Fine-to-coarse fallback. Finer covered pixels are never overwritten by
     // coarser levels.
