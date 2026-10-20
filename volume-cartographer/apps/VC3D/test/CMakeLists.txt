@@ -7,6 +7,16 @@ add_test(NAME surface_transform_name COMMAND test_surface_transform_name)
 vc_register_test_target(test_surface_transform_name)
 vc_register_ctest(surface_transform_name test_surface_transform_name)
 
+add_executable(test_volume_path_labels test_volume_path_labels.cpp
+    ../elements/VolumeSelector.cpp ../elements/VolumeSelector.hpp)
+set_target_properties(test_volume_path_labels PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_volume_path_labels PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_volume_path_labels PRIVATE Qt6::Widgets Qt6::Test)
+add_test(NAME volume_path_labels COMMAND test_volume_path_labels)
+set_tests_properties(volume_path_labels PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+vc_register_test_target(test_volume_path_labels)
+vc_register_ctest(volume_path_labels test_volume_path_labels)
+
 add_executable(test_surface_render_policy test_surface_render_policy.cpp)
 set_target_properties(test_surface_render_policy PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
