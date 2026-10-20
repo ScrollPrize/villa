@@ -278,6 +278,17 @@ struct FiberInput {
 
 class FiberPredictionSource {
 public:
+    // Optional auxiliary channels. Coordinates use the same working grid as sample().
+    // Width values retain stored units; embeddings are normalized after interpolation.
+    virtual void sampleWidths(const std::vector<cv::Vec3f>&, std::vector<float>&) const
+    {
+        throw std::runtime_error("width tracing requested but source has no width channel");
+    }
+    virtual void sampleEmbeddings(const std::vector<cv::Vec3f>&,
+                                 std::vector<std::vector<float>>&) const
+    {
+        throw std::runtime_error("embedding tracing requested but source has no embedding channels");
+    }
     virtual ~FiberPredictionSource() = default;
     [[nodiscard]] virtual bool supportsConcurrentSampling() const noexcept
     {
@@ -311,8 +322,20 @@ public:
         const cv::Vec3d& referenceDirection) const = 0;
 };
 
+struct FiberPredictionFieldOptions {
+    FiberPredictionFieldBindingMode bindingMode = FiberPredictionFieldBindingMode::TraceOptions;
+    size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL;
+    bool enableEmbeddings = false;
+    bool enableWidth = false;
+};
+
 class FiberPredictionField final : public FiberPredictionSource {
 public:
+    FiberPredictionField(const vc::lasagna::LasagnaDataset& dataset,
+                         const FiberPredictionFieldOptions& options);
+    void sampleWidths(const std::vector<cv::Vec3f>& points, std::vector<float>& widths) const override;
+    void sampleEmbeddings(const std::vector<cv::Vec3f>& points,
+                          std::vector<std::vector<float>>& embeddings) const override;
     explicit FiberPredictionField(
         const vc::lasagna::LasagnaDataset& dataset,
         size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL);

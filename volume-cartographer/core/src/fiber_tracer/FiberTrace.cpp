@@ -3475,7 +3475,8 @@ public:
     };
 
     Impl(const vc::lasagna::LasagnaDataset& dataset, size_t maxCachedBytes,
-         FiberPredictionFieldBindingMode bindingMode = FiberPredictionFieldBindingMode::TraceOptions)
+         FiberPredictionFieldBindingMode bindingMode = FiberPredictionFieldBindingMode::TraceOptions,
+         bool enableEmbeddings = false, bool enableWidth = false)
     {
         vc::render::processChunkCacheService()->configureDecodedByteCapacity(maxCachedBytes);
         const auto& manifest = dataset.manifest();
@@ -3520,6 +3521,17 @@ public:
             options_.push_back(std::move(option));
             if (prefix.empty())
                 canonicalOptionIndex_ = options_.size() - 1;
+        }
+        if (enableEmbeddings) {
+            embeddings_ = vc::lasagna::bindLasagnaEmbeddingChannels(manifest, options_.front().presence);
+        }
+        if (enableWidth) {
+            auto width = vc::lasagna::bindLasagnaChannel(manifest, "width", true);
+            const auto& lattice = options_.front().presence;
+            if (width.array->metadata().dtype != utils::ZarrDtype::float32 ||
+                width.spacing != lattice.spacing || width.shapeZYX != lattice.shapeZYX)
+                throw std::runtime_error("width channel must be float32 on the prediction lattice");
+            width_.push_back(std::move(width));
         }
         if (canonicalOptionIndex_.has_value()) {
             const auto& canonical = options_[*canonicalOptionIndex_];
@@ -3571,6 +3583,25 @@ public:
             }
         }
         return vc::lasagna::prefetchLasagnaChunks(requests);
+    }
+
+    void sampleEmbeddings(const std::vector<cv::Vec3f>& points,
+                          std::vector<std::vector<float>>& values) const
+    {
+        if (embeddings_.empty())
+            throw std::runtime_error("embedding sampling was not enabled for prediction field");
+        vc::lasagna::sampleLasagnaVectorBatch(embeddings_, points, values);
+    }
+
+    void sampleWidths(const std::vector<cv::Vec3f>& points, std::vector<float>& widths) const
+    {
+        if (width_.empty())
+            throw std::runtime_error("width sampling was not enabled for prediction field");
+        std::vector<std::vector<float>> values;
+        vc::lasagna::sampleLasagnaVectorBatch(width_, points, values, false, &options_.front().presence);
+        widths.resize(values.size());
+        for (size_t i = 0; i < values.size(); ++i)
+            widths[i] = values[i].empty() ? 0 : values[i][0];
     }
 
     void materializeGroupedPredictionCorners(
@@ -4640,6 +4671,8 @@ public:
 
 private:
     std::vector<Option> options_;
+    std::vector<vc::lasagna::LasagnaChannelBinding> embeddings_;
+    std::vector<vc::lasagna::LasagnaChannelBinding> width_;
     bool sourceScaleExplicit_ = false;
     std::optional<size_t> canonicalOptionIndex_;
     FiberPredictionGridInfo canonicalGridInfo_;
@@ -4655,6 +4688,23 @@ FiberPredictionField::FiberPredictionField(
 }
 
 FiberPredictionField::~FiberPredictionField() = default;
+
+FiberPredictionField::FiberPredictionField(const vc::lasagna::LasagnaDataset& dataset,
+    const FiberPredictionFieldOptions& options)
+    : impl_(std::make_unique<Impl>(dataset, options.maxCachedBytes, options.bindingMode,
+                                  options.enableEmbeddings, options.enableWidth)) {}
+
+void FiberPredictionField::sampleWidths(const std::vector<cv::Vec3f>& points,
+                                        std::vector<float>& widths) const
+{
+    impl_->sampleWidths(points, widths);
+}
+
+void FiberPredictionField::sampleEmbeddings(const std::vector<cv::Vec3f>& points,
+                                           std::vector<std::vector<float>>& embeddings) const
+{
+    impl_->sampleEmbeddings(points, embeddings);
+}
 
 FiberPredictionField::FiberPredictionField(const vc::lasagna::LasagnaDataset& dataset,
     FiberPredictionFieldBindingMode mode, size_t maxCachedBytes)
