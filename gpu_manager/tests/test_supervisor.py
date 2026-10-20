@@ -387,6 +387,22 @@ class BlockingAdapter(CpuAdapter):
         return super().run_unit()
 
 
+class PaddedSharedMemoryAdapter(CpuAdapter):
+    """Emulate page-rounded mappings even on Linux, inside each spawned worker."""
+
+    def __init__(self, rank, grant, state):
+        super().__init__(rank, grant, state)
+        import villa_gpu_manager.cohort as implementation
+        original = implementation.SharedMemory
+
+        def padded_memory(*args, **kwargs):
+            if kwargs.get("create"):
+                kwargs["size"] += 4096
+            return original(*args, **kwargs)
+
+        implementation.SharedMemory = padded_memory
+
+
 @pytest.mark.parametrize("stall", ["initialization", "release_initialization", "work", "none"])
 def test_deadlines_exclude_authorization_wait_and_separate_work(tmp_path, stall):
     from functools import partial
@@ -444,10 +460,11 @@ def until(cohort, predicate):
         time.sleep(0.01)
 
 
-def test_real_spawn_join_handoff_and_resume():
+@pytest.mark.parametrize("adapter", [CpuAdapter, PaddedSharedMemoryAdapter])
+def test_real_spawn_join_handoff_and_resume(adapter):
     original = os.environ.get("CUDA_VISIBLE_DEVICES")
     completed = []
-    cohort = ProcessCohort(CpuAdapter, GRANT, on_unit=lambda rows: completed.append(rows))
+    cohort = ProcessCohort(adapter, GRANT, on_unit=lambda rows: completed.append(rows))
     try:
         cohort.authorize()
         until(cohort, lambda: cohort.ready)
@@ -541,8 +558,9 @@ class CpuTensorAdapter(CpuAdapter):
         return "same", self.state
 
 
+@pytest.mark.torch
 def test_tensor_state_survives_sender_exit_without_resource_sharer():
-    import torch
+    torch = pytest.importorskip("torch")
     cohort = ProcessCohort(CpuTensorAdapter, GRANT)
     try:
         cohort.authorize()
@@ -631,8 +649,13 @@ class FailingGlooAdapter:
             raise RuntimeError("injected release failure")
 
 
+@pytest.mark.torch
 @pytest.mark.parametrize("stage", ["forward", "reduction", "handoff", "release"])
 def test_real_cohort_failure_aborts_peers_before_releasing(stage, tmp_path):
+    pytest.importorskip("torch")
+    dist = pytest.importorskip("torch.distributed")
+    if not dist.is_available() or not dist.is_gloo_available():
+        pytest.skip("CPU Gloo backend is unavailable")
     from functools import partial
     from multiprocessing.shared_memory import SharedMemory
     client = LocalClient()
@@ -667,6 +690,7 @@ def test_real_cohort_failure_aborts_peers_before_releasing(stage, tmp_path):
             time.sleep(.005)
         assert supervisor.error is not None
         assert "cohort worker" in str(supervisor.error)
+        assert f"injected {stage} failure" in str(supervisor.error)
         assert supervisor.state is None  # Never adopt a partially captured state.
         assert len(cohorts) == 1  # No silent retry of the failed update/cohort.
         assert completed == ([] if stage in ("forward", "reduction") else [[1, 1]])

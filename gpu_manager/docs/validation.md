@@ -22,6 +22,13 @@ The extracted suite passed **157 tests in 50.90 seconds** on Linux/Python 3.14.
 Linux/macOS Python 3.11/3.14 CI is configured separately; a local Linux pass
 does not certify those other platform/interpreter combinations.
 
+Initial CI exposed an undeclared optional Torch test dependency and a macOS
+page-rounded shared-memory mapping bug. Payload writes now address only their
+serialized length; a padded-mapping handoff/resume regression exercises this on
+Linux too. Torch cases explicitly skip without their dependency and run in a
+dedicated CPU-Torch CI job. Failure-injection tests require the intended failure
+message, so missing imports cannot masquerade as successful cleanup coverage.
+
 ## Historical real-data evidence
 
 This manager was developed while running fiber training and tracing on real

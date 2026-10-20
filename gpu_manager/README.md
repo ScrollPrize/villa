@@ -32,6 +32,11 @@ and `psutil` are the only runtime requirements. This Unix-only package does not
 support Windows; macOS can run the metadata service/tests but NVIDIA discovery
 requires an available `nvidia-smi`.
 
+Five optional CPU Torch/Gloo integration cases skip when those dependencies
+are absent; the standalone tests do not require Torch. CI runs the integration
+cases in a separate job with CPU-only Torch installed. With Torch/Gloo available,
+run them explicitly with `python -m pytest -q gpu_manager/tests -m torch`.
+
 No installer or GPU service is automatically started by importing the package.
 Linux/macOS Unix sockets are supported; NVIDIA inventory monitoring requires
 `nvidia-smi`. Tests use fake inventories and do not allocate GPUs.

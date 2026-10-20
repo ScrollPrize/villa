@@ -180,7 +180,9 @@ def _worker(sock, factory, rank, grant, initial_state, state_name):
                     data = pickle.dumps(state, protocol=pickle.HIGHEST_PROTOCOL)
                     memory = SharedMemory(name=state_name, create=True, size=len(data))
                     try:
-                        memory.buf[:] = data
+                        # macOS may round the mapping up to a page boundary.
+                        # The descriptor tracks payload size, not mapping size.
+                        memory.buf[:len(data)] = data
                     finally:
                         memory.close()
                     descriptor = dict(name=state_name, size=len(data))
