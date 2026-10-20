@@ -83,3 +83,4 @@ dinovol/cufile.log
 /spiral-fitting/experiments
 /vc_reader/benchmarks/results
 *.csv
+/dinovol/perf_results

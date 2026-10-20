@@ -38,6 +38,31 @@ def _save_convolutions_policy(ctx, op, *args, **kwargs):
 _save_convolutions_context = partial(create_selective_checkpoint_contexts, _save_convolutions_policy)
 
 
+def _save_attention_policy(ctx, op, *args, **kwargs):
+    # Keep fused attention (including its backward auxiliaries), but recompute
+    # projections, normalization and the MLP. Avoid saving quadratic math-SDPA
+    # intermediates when a fused backend is unavailable.
+    if op in (
+        torch.ops.aten._scaled_dot_product_cudnn_attention.default,
+        torch.ops.aten._scaled_dot_product_efficient_attention.default,
+    ):
+        dropout_index = 5
+    elif op in (
+        torch.ops.aten._scaled_dot_product_flash_attention.default,
+        torch.ops.aten._scaled_dot_product_flash_attention_for_cpu.default,
+    ):
+        dropout_index = 3
+    else:
+        return CheckpointPolicy.PREFER_RECOMPUTE
+    dropout = kwargs.get("dropout_p", args[dropout_index] if len(args) > dropout_index else 0.)
+    # Skipping a random SDPA call during eager replay would shift the RNG stream
+    # for subsequent dropout/drop-path operations in the checkpointed block.
+    return CheckpointPolicy.MUST_SAVE if dropout == 0. else CheckpointPolicy.PREFER_RECOMPUTE
+
+
+_save_attention_context = partial(create_selective_checkpoint_contexts, _save_attention_policy)
+
+
 class InitWeights_He(object):
     def __init__(self, neg_slope: float = 1e-2):
         self.neg_slope = neg_slope
@@ -458,12 +483,14 @@ class Eva(nn.Module):
             rope_impl=RopePositionEmbedding,
             rope_kwargs=None,
             grad_checkpointing=False,
+            checkpoint_save_attention: bool = True,
             deeper_embed_batch_chunk_size: Optional[int] = None,
             deeper_embed_stage_channels: Optional[Tuple[int, ...]] = None,
             deeper_embed_depth_per_level: Optional[Tuple[int, ...]] = None,
             deeper_embed_use_stem: bool = True,
             deeper_embed_final_projection: bool = True,
             deeper_embed_channels_last: bool = False,
+            deeper_embed_norm_backend: str = "auto",
             deeper_embed_stage_strides=None,
             deeper_embed_stem_channels: Optional[int] = None,
             deeper_embed_stem_type: Optional[str] = None,
@@ -533,6 +560,7 @@ class Eva(nn.Module):
                 stem_channels=deeper_embed_stem_channels,
                 stem_type=deeper_embed_stem_type,
                 channels_last=deeper_embed_channels_last,
+                norm_backend=deeper_embed_norm_backend,
             )
         else:
             raise ValueError(
@@ -545,6 +573,7 @@ class Eva(nn.Module):
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
         self.dynamic_img_size = dynamic_img_size
         self.grad_checkpointing = grad_checkpointing
+        self.checkpoint_save_attention = checkpoint_save_attention
 
         self.num_reg_tokens = num_reg_tokens
         self.num_class_tokens = (1 if class_token else 0)
@@ -901,10 +930,13 @@ class Eva(nn.Module):
         for blk in self.blocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():
                 x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords,
-                               use_reentrant=False)
+                               use_reentrant=False, **self._attention_checkpoint_kwargs())
             else:
                 x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
         return self._with_skips(self._format_features(x, masks, view_kind=view_kind), skips, skip_points)
+
+    def _attention_checkpoint_kwargs(self):
+        return {"context_fn": _save_attention_context} if self.checkpoint_save_attention else {}
 
     def _sample_embed_skips(self, skips, point_coordinates, input_shape):
         """Sample the CNN skips at [B, P, 3] input-voxel point coordinates before the blocks run.
@@ -1072,14 +1104,14 @@ class EvaWithChunking(Eva):
             for chunk in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
                     x = checkpoint(chunk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords,
-                                   use_reentrant=False)
+                                   use_reentrant=False, **self._attention_checkpoint_kwargs())
                 else:
                     x = chunk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
         else:
             for blk in self.blocks:
                 if self.grad_checkpointing and not torch.jit.is_scripting():
                     x = checkpoint(blk, x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords,
-                                   use_reentrant=False)
+                                   use_reentrant=False, **self._attention_checkpoint_kwargs())
                 else:
                     x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
 

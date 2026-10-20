@@ -103,14 +103,25 @@ class CompilationTests(unittest.TestCase):
         compiled = DinoIBOTPretrainer(config)
         eager = DinoIBOTPretrainer({**config, "compile": False})
         eager.model_module.load_state_dict(compiled.model_module.state_dict())
+        # This toy head overflows even on the original eager path. Let the
+        # scaler back off, then compare finite gradients and an actual update.
+        for trainer in (compiled, eager):
+            trainer.scaler = torch.amp.GradScaler(
+                "cuda", init_scale=1., enabled=trainer.scaler.is_enabled()
+            )
         batch = self.batch()
         previous_autocast = functorch_config.backward_pass_autocast
-        expected = eager.train_step(batch, 0)
-        actual = compiled.train_step(batch, 0)
+        for _ in range(8):
+            expected = eager.train_step(batch, 0)
+            actual = compiled.train_step(batch, 0)
+            self.assertEqual(eager.scaler.get_scale(), compiled.scaler.get_scale())
+            eager_grad = torch.cat([p.grad.flatten() for p in eager.model_module.student.parameters() if p.grad is not None])
+            compiled_grad = torch.cat([p.grad.flatten() for p in compiled.model_module.student.parameters() if p.grad is not None])
+            if torch.isfinite(eager_grad).all() and torch.isfinite(compiled_grad).all():
+                break
         self.assertEqual(functorch_config.backward_pass_autocast, previous_autocast)
         torch.testing.assert_close(actual["loss"], expected["loss"], rtol=0.01, atol=0.01)
-        eager_grad = torch.cat([p.grad.flatten() for p in eager.model_module.student.parameters() if p.grad is not None])
-        compiled_grad = torch.cat([p.grad.flatten() for p in compiled.model_module.student.parameters() if p.grad is not None])
+        self.assertTrue(torch.isfinite(eager_grad).all())
         self.assertTrue(torch.isfinite(compiled_grad).all())
         self.assertGreater(torch.nn.functional.cosine_similarity(eager_grad, compiled_grad, dim=0).item(), 0.99)
 

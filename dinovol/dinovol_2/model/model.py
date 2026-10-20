@@ -41,6 +41,7 @@ _BACKBONE_DEFAULTS = {
     "deeper_embed_use_stem": True,
     "deeper_embed_final_projection": True,
     "deeper_embed_channels_last": False,
+    "deeper_embed_norm_backend": "auto",
     "depth": 24,
     "num_heads": 16,
     "qkv_bias": True,
@@ -60,6 +61,7 @@ _BACKBONE_DEFAULTS = {
     "untie_cls_and_patch_norms": False,
     "untie_global_and_local_cls_norm": False,
     "grad_checkpointing": False,
+    "checkpoint_save_attention": True,
     "block_chunks": 0,
 }
 
@@ -81,6 +83,7 @@ _BACKBONE_DEFAULTS_V2 = {
     "deeper_embed_use_stem": True,
     "deeper_embed_final_projection": True,
     "deeper_embed_channels_last": False,
+    "deeper_embed_norm_backend": "auto",
     "depth": 24,
     "num_heads": 16,
     "qkv_bias": True,
@@ -100,6 +103,7 @@ _BACKBONE_DEFAULTS_V2 = {
     "untie_cls_and_patch_norms": False,
     "untie_global_and_local_cls_norm": False,
     "grad_checkpointing": False,
+    "checkpoint_save_attention": True,
     "block_chunks": 0,
 }
 

@@ -15,7 +15,7 @@ from dinovol_2.ops.point_embeddings import sample_grid_points
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("operation", choices=("interpolation", "ibot"))
+    parser.add_argument("operation", choices=("interpolation", "ibot", "channel_norm"))
     parser.add_argument("--backend", choices=("torch", "triton"), default="torch")
     parser.add_argument("--rows", type=int, default=8192)
     parser.add_argument("--prototypes", type=int, default=131072)
@@ -27,9 +27,17 @@ def main():
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--profile", action="store_true")
     parser.add_argument("--features", help="Fixture written by dinovol_2.validate_real_kernels")
+    parser.add_argument("--spatial-size", type=int, default=64, help="Channel-norm volume edge")
+    parser.add_argument("--batch-size", type=int, default=2, help="Channel-norm batch size")
+    parser.add_argument("--fusion", choices=("none", "relu", "residual_relu"), default="residual_relu")
     args = parser.parse_args()
     if args.rows < 1 or args.warmup < 1 or args.iterations < 1:
         parser.error("rows, warmup, and iterations must be positive")
+    if args.operation == "channel_norm":
+        if min(args.dim, args.batch_size, args.spatial_size) < 1:
+            parser.error("channel-norm dimensions must be positive")
+        if args.features:
+            parser.error("--features is supported for interpolation and iBOT only")
     torch.manual_seed(5)
     dtype = getattr(torch, args.dtype)
     fixture = torch.load(args.features, map_location="cpu", weights_only=True) if args.features else None
@@ -49,6 +57,25 @@ def main():
                 return sample_grid_points(grid[source_rows], coordinates, (192,) * 3).to(dtype).flatten(0, 1)[indices]
             from dinovol_2.ops.point_embeddings import sample_selected_grid_points
             return sample_selected_grid_points(grid, coordinates, (192,) * 3, indices, source_rows)
+    elif args.operation == "channel_norm":
+        from dinovol_2.model.patch_encode_decode import LayerNormNd
+        x = torch.randn(args.batch_size, args.dim, *([args.spatial_size] * 3),
+                        device="cuda", dtype=dtype).contiguous(memory_format=torch.channels_last_3d)
+        x.requires_grad_()
+        residual = torch.randn_like(x, requires_grad=True) if args.fusion == "residual_relu" else None
+        norm = LayerNormNd(args.dim, eps=1e-5, backend=args.backend).cuda()
+        if args.compile:
+            norm.compile(fullgraph=True)
+        dy = torch.randn_like(x)
+
+        def run():
+            x.grad = None
+            norm.zero_grad(set_to_none=True)
+            if residual is not None:
+                residual.grad = None
+            result = norm(x, residual, args.fusion != "none")
+            result.backward(dy)
+            return result
     else:
         features = F.normalize(torch.randn(args.rows, args.dim, device="cuda"), dim=-1).to(dtype)
         teacher_features = F.normalize(torch.randn_like(features).float(), dim=-1).to(dtype)

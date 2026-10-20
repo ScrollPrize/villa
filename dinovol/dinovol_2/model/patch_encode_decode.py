@@ -8,6 +8,7 @@ import torch
 from torch import nn
 from torch.nn.modules.conv import _ConvNd, _ConvTransposeNd
 from torch.nn.modules.dropout import _DropoutNd
+from dinovol_2.ops import channel_norm
 
 block_type = Literal["basic", "bottleneck"]
 block_style = Literal["residual", "conv"]
@@ -47,22 +48,19 @@ def get_matching_pool_op(conv_op: Type[_ConvNd], *, pool_type: str = "avg") -> T
 
 
 class LayerNormNd(nn.Module):
-    def __init__(self, num_channels: int, eps: float = 1e-6) -> None:
+    def __init__(self, num_channels: int, eps: float = 1e-6, backend: str = "torch") -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.ones(num_channels))
         self.bias = nn.Parameter(torch.zeros(num_channels))
         self.eps = eps
+        if backend not in ("auto", "torch", "triton"):
+            raise ValueError(f"unsupported channel normalization backend: {backend!r}")
+        self.backend = backend
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Statistics and affine in float32, output in the input dtype. Under autocast the
-        # float32 affine parameters would otherwise promote every activation to float32.
-        dtype = x.dtype
-        x = x.float()
-        u = x.mean(1, keepdim=True)
-        s = (x - u).pow(2).mean(1, keepdim=True)
-        x = (x - u) / torch.sqrt(s + self.eps)
-        idx = (None, slice(None), *([None] * (x.ndim - 2)))
-        return (self.weight[idx] * x + self.bias[idx]).to(dtype)
+    def forward(self, x: torch.Tensor, residual=None, relu: bool = False) -> torch.Tensor:
+        if self.backend != "torch" and channel_norm.supported(x, self.weight, self.bias, residual):
+            return channel_norm.channel_norm(x, self.weight, self.bias, self.eps, residual, relu)
+        return channel_norm.reference(x, self.weight, self.bias, self.eps, residual, relu)
 
 
 def _is_power_of_two(value: int) -> bool:
@@ -124,8 +122,15 @@ class ConvDropoutNormReLU(nn.Module):
         if nonlin_first and norm_op is not None and nonlin is not None:
             ops[-1], ops[-2] = ops[-2], ops[-1]
         self.all_modules = nn.Sequential(*ops)
+        self.fuse_norm_relu = (
+            isinstance(getattr(self, "norm", None), LayerNormNd)
+            and self.norm.backend != "torch" and isinstance(getattr(self, "nonlin", None), nn.ReLU)
+            and dropout_op is None and not nonlin_first
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.fuse_norm_relu:
+            return self.norm(self.conv(x), relu=True)
         return self.all_modules(x)
 
 
@@ -281,6 +286,9 @@ class BasicBlockD(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = self.skip(x)
+        if (isinstance(getattr(self.conv2, "norm", None), LayerNormNd)
+                and self.conv2.norm.backend != "torch" and isinstance(self.nonlin2, nn.ReLU)):
+            return self.conv2.norm(self.conv2.conv(self.conv1(x)), residual=residual, relu=True)
         out = self.conv2(self.conv1(x))
         out = out + residual
         return self.nonlin2(out)
@@ -557,6 +565,7 @@ class PatchEmbedDeeper(nn.Module):
         stem_channels: Optional[int] = None,
         stem_type: Optional[str] = None,
         channels_last: bool = False,
+        norm_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.patch_size = tuple(int(p) for p in patch_size)
@@ -630,7 +639,7 @@ class PatchEmbedDeeper(nn.Module):
         kernel_size = [3] * self.ndim
         block = BottleneckD if embed_block_type == "bottleneck" else BasicBlockD
         nonlin = nn.LeakyReLU if embed_block_type == "bottleneck" else nn.ReLU
-        norm_op_kwargs = {"eps": 1e-5}
+        norm_op_kwargs = {"eps": 1e-5, "backend": norm_backend}
         nonlin_kwargs = {"inplace": True}
 
         if not use_stem:

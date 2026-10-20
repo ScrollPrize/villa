@@ -111,6 +111,34 @@ a config sets it:
 - `model.deeper_embed_channels_last`: CNN activations and weights use the
   channels-last 3D layout, which cuDNN's tensor-core convolutions use natively.
   Weights are converted after initialization; checkpoints are layout-independent.
+- `model.checkpoint_save_attention: true` (default): when gradient checkpointing
+  is enabled, retain fused SDPA results and their backward auxiliaries while
+  recomputing the rest of each transformer block. This also supports block
+  chunking. The math-attention fallback retains the original recomputation
+  policy, avoiding saved quadratic attention matrices. Set this to `false`
+  to restore the original transformer checkpoint policy. Fused attention with
+  nonzero attention dropout is also recomputed so that replay preserves the RNG
+  stream for subsequent dropout operations.
+- `model.deeper_embed_norm_backend: "auto"` (default): use a Triton CNN channel
+  normalization on supported CUDA inputs, including fused ReLU and residual/ReLU
+  where applicable. The custom backward finishes input and affine gradients
+  together, preventing cross-stage compiler fusion from extending full-volume
+  buffer lifetimes. It recomputes statistics and uses bounded FP32 affine-gradient
+  scratch space, with no atomic reductions. FP32 statistics and affine arithmetic
+  and the original FP16/BF16 activation rounding boundaries are preserved;
+  reduction order can change rounding. Outputs use channels-last 3D layout.
+  NVIDIA compute capability 8+, up to 256 channels, FP16/BF16/FP32 5D activations,
+  and FP32 affine parameters are supported. CPU, other shapes/dtypes, and
+  installations without Triton fall back to PyTorch. `"triton"` has the same
+  compatibility fallback; `"torch"` disables the custom path. Use `"torch"` for
+  higher-order differentiation. Parameter names and shapes are unchanged.
+  Validate with `AGENTS_AGENT_MODE=1 .venv/bin/python -m unittest
+  tests.test_channel_norm tests.test_attention_checkpoint`. An isolated
+  full-resolution forward/backward comparison is available with
+  `AGENTS_AGENT_MODE=1 .venv/bin/python -m dinovol_2.bench_kernels channel_norm
+  --dim 32 --spatial-size 192 --batch-size 2 --backend triton --compile`;
+  use `--backend torch --compile` for the compiled reference. This microbenchmark
+  uses synthetic activations and does not predict whole-model peak memory.
 - `model.deeper_embed_batch_chunk_size: null`: the CNN embeds the whole batch at
   once instead of one sample at a time (the default of 1).
 - `fused_optimizer`: fused CUDA AdamW.
@@ -124,6 +152,35 @@ a config sets it:
   benchmarks Triton matmul and convolution kernels against the library ones at
   compile time and keeps the fastest. The first launch compiles for about 13
   minutes; the inductor cache makes later launches fast.
+
+On an RTX 5090 with PyTorch 2.10/CUDA 12.8, the `teacher_585k.pt` configuration
+(depth 10, width 480, 10 heads, patch size 8) was measured on one fixed real
+PHerc0125 sample with two 192³ global and two 64³ local views. Both branches
+were initialized from the teacher checkpoint. With FP16 autocast, cuDNN attention,
+and `max-autotune-no-cudagraphs`, three warmups followed by ten forward/backward
+iterations gave:
+
+| checkpoint / CNN normalization | mean ms | median [min–max] ms | peak allocated GiB |
+| --- | ---: | ---: | ---: |
+| original / PyTorch | 622 | 617 [611–641] | 11.44 |
+| save attention / PyTorch | 572 | 569 [564–596] | 11.44 |
+| save attention / Triton | 559 | 557 [548–576] | 9.25 |
+
+These exclude compilation, data loading/augmentation, optimizer steps/moments,
+and EMA. The fixture has unlabeled object points and no surface/fiber/ink labels.
+The custom CNN path reduces overlapping full-resolution backward buffers and
+layout conversions; this whole-model result is distinct from the isolated
+normalization benchmark above. All 160.7M gradient elements were compared:
+the combined implementation had 0.61% relative L2 error and 0.99998 cosine
+similarity to the original path on this batch, with finite gradients throughout.
+The switches above retain the original paths for comparison.
+
+A separate comparison with both optimizations and `model.attention_backend:
+"flash"` took 523 ms mean, 519 ms median [516–546], with the same 9.25 GiB
+allocated peak. The profiler confirmed FlashAttention forward and backward.
+Compared with the optimized cuDNN run, full gradients differed by 0.56% relative
+L2 with 0.99998 cosine similarity. The default attention backend is unchanged;
+these single-batch checks do not assess training convergence.
 
 Historical optimizer-step measurements used an earlier version of
 `pretrain_8_9um.json` with width 288, a 2,048-wide FFN, a 16-channel CNN stem,
