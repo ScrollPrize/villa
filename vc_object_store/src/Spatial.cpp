@@ -1,6 +1,7 @@
 #include "internal/Database.hpp"
 #include "internal/Spatial.hpp"
 #include "geometry/GeometryReader.hpp"
+#include "geometry/PersistentTree.hpp"
 #include <bit>
 #include <tuple>
 
@@ -38,27 +39,6 @@ std::optional<Bounds> recordBounds(const ObjectRecord& object)
 namespace {
 struct BoundsBuilder {
     std::optional<Bounds> bounds;
-    template<class T> void append(std::span<const uint8_t> bytes, bool patch) {
-        if (bytes.size() % (3 * sizeof(T))) throw std::runtime_error("spatial index: invalid XYZ array");
-        for (size_t offset = 0; offset < bytes.size(); offset += 3 * sizeof(T)) {
-            std::array<double, 3> xyz;
-            for (size_t axis = 0; axis < 3; ++axis) {
-                std::array<uint8_t, sizeof(T)> scalar;
-                std::memcpy(scalar.data(), bytes.data() + offset + axis * sizeof(T), sizeof(T));
-                if constexpr (std::endian::native != std::endian::little) std::reverse(scalar.begin(), scalar.end());
-                xyz[axis] = std::bit_cast<T>(scalar);
-            }
-            // Conservatively cover both VC3D validity conventions: raw surfaces
-            // use x != -1, mapped surfaces use z > 0. Narrow phases choose
-            // their own convention; indexing their union cannot lose triangles.
-            if (!std::isfinite(xyz[0]) || !std::isfinite(xyz[1]) || !std::isfinite(xyz[2]) || (patch && xyz[0] == -1 && xyz[2] <= 0)) continue;
-            if (!bounds) bounds = Bounds{xyz[0], xyz[1], xyz[2], xyz[0], xyz[1], xyz[2]};
-            else for (size_t axis = 0; axis < 3; ++axis) {
-                (*bounds)[axis] = std::min((*bounds)[axis], xyz[axis]);
-                (*bounds)[axis + 3] = std::max((*bounds)[axis + 3], xyz[axis]);
-            }
-        }
-    }
     void merge(const Bounds& b) {
         if (!bounds) bounds = b;
         else for (size_t axis = 0; axis < 3; ++axis) {
@@ -67,10 +47,8 @@ struct BoundsBuilder {
         }
     }
     void append(std::span<const uint8_t> bytes, const std::string& dtype, bool patch) {
-        if (dtype == "<f4") append<float>(bytes, patch);
-        else if (dtype == "<f8") append<double>(bytes, patch);
-        else if (dtype == "<i4") append<int32_t>(bytes, patch);
-        else throw std::runtime_error("spatial index: unsupported coordinate dtype");
+        const auto value=coordinateBounds(bytes,dtype,patch);
+        if(!value.is_null())merge(value.get<Bounds>());
     }
 };
 bool coordinates(const std::string& kind, const std::string& name) {
@@ -150,6 +128,7 @@ void indexGeometry(sqlite3* db, int64_t objectId, const std::string& revision,
     BoundsBuilder total;
     auto emit = [&](const std::string& name, int64_t row, int64_t col, int64_t rows, int64_t cols,
                     const BoundsBuilder& builder) {
+        if (geometryWork) ++geometryWork->spatialRows;
         if (!builder.bounds) return;
         const auto& box = *builder.bounds;
         total.merge(box);
@@ -244,6 +223,9 @@ void refreshGeometryBounds(sqlite3* db, const std::string& objectUuid)
     const auto revision = formatUuid(head.blob16(1));
     GeometryReader reader(db, revision);
     const auto& manifest = reader.manifest();
+    bool indexed=true;for(const auto& a:manifest.at("arrays"))indexed &= a.contains("tree");
+    if(indexed) {auto copy=manifest;indexSharedGeometry(db,head.i64(0),revision,copy);return;}
+
     std::vector<GeometryArrayInfo> arrays;
     for (const auto& [name, a] : manifest.at("arrays").items())
         arrays.push_back({name, a.at("dtype"), a.at("shape").get<std::vector<int64_t>>(), a.at("byte_length")});
@@ -402,4 +384,131 @@ void backfillSpatialBounds(sqlite3* db)
     Statement heads(db, "SELECT object_uuid FROM geometry_heads");
     while (heads.row()) refreshGeometryBounds(db, formatUuid(heads.blob16(0)));
 }
+}
+
+// Structural layouts keep conservative per-block bounds in their immutable
+// manifests. Unchanged blocks reuse bounds as well as payload. Region offsets
+// are rebuilt from descriptors, without reading unchanged coordinate payloads.
+#include "geometry/SharedGeometry.hpp"
+namespace vc::objects::detail {
+void indexSharedGeometry(sqlite3* db, int64_t objectId, const std::string& revision, nlohmann::json& manifest)
+{
+    GeometryPhase phase("indexSharedGeometry");
+    const std::string kind=manifest.at("kind");
+    bool indexed=true; for(const auto& a:manifest.at("arrays"))indexed &= a.contains("tree");
+    if(indexed) {
+        // The immutable tree carries the fine-grained bounds. SQL stores one
+        // coarse candidate per coordinate array, independent of object size.
+        Statement cleanup(db,"DELETE FROM spatial_regions WHERE object_id=? AND array_name!='' AND array_name NOT LIKE '@tree:%'");
+        cleanup.bind(1,objectId);cleanup.stepDone();
+        RegionWriter writer(db,objectId); BoundsBuilder total;
+        for(const auto& [name,a]:manifest.at("arrays").items())if(coordinates(kind,name)) {
+            const auto& root=a.at("tree");std::optional<Bounds> bounds;
+            if(!root.is_null()&&!root.at("bounds").is_null())bounds=root.at("bounds").get<Bounds>();
+            const auto shape=a.at("shape").get<std::vector<int64_t>>();
+            writer.update("@tree:"+name,0,0,shape[0],kind=="patch"?shape[1]:0,bounds);
+            if(bounds)total.merge(*bounds);
+            if(geometryWork)++geometryWork->spatialRows;
+        }
+        writeBounds(db,objectId,total.bounds,revision);return;
+    }
+
+    Statement remove(db,"DELETE FROM spatial_regions WHERE object_id=? AND array_name!=''");
+    remove.bind(1,objectId); remove.stepDone();
+    RegionWriter writer(db,objectId); BoundsBuilder total;
+    for (auto& [name,a] : manifest.at("arrays").items()) {
+        if (!coordinates(kind,name)) continue;
+        const auto shape=a.at("shape").get<std::vector<int64_t>>();
+        const std::string dtype=a.at("dtype"); const auto stride=geometryByteLength(dtype,{3});
+        if (a.contains("blocks")) {
+            int64_t offset=0;
+            for (auto& b : a.at("blocks")) {
+                const int64_t length=b.at("length");
+                const auto begin=offset/stride, end=std::min(shape[0],(offset+length+stride-1)/stride);
+                BoundsBuilder bounds;
+                // Bounds cover complete points intersecting this block. A line
+                // region also includes the next point to cover crossing spans.
+                const auto count=std::min(shape[0]-begin,end-begin+(kind!="point_collection"));
+                if (b.contains("bounds") && b.contains("bounds_count") && b.at("bounds_count")==count) {
+                    if (!b.at("bounds").is_null()) bounds.merge(b.at("bounds").get<Bounds>());
+                } else {
+                    bounds.append(readSharedArray(db,a,name,begin*stride,count*stride),dtype,false);
+                    b["bounds"]=bounds.bounds ? nlohmann::json(*bounds.bounds) : nlohmann::json(); b["bounds_count"]=count;
+                }
+                if (bounds.bounds) { total.merge(*bounds.bounds); writer.update(name,begin,0,count,0,bounds.bounds); }
+                offset+=length;
+                if (geometryWork) ++geometryWork->spatialRows;
+            }
+        } else {
+            // Each tile's stored bounds cover its own vertices. For triangles
+            // crossing tile boundaries, include neighbours conservatively.
+            for (auto& t : a.at("tiles")) if (!t.contains("bounds")) {
+                auto temporary=a; temporary["tiles"]=nlohmann::json::array({t});
+                const int64_t r=t.at("row"), c=t.at("column"), h=t.at("rows"), w=t.at("columns");
+                BoundsBuilder bounds;
+                bounds.append(readSharedRectangle(db,temporary,name,r,c,h,w),dtype,true);
+                t["bounds"]=bounds.bounds ? nlohmann::json(*bounds.bounds) : nlohmann::json();
+            }
+            std::map<std::pair<int64_t,int64_t>, const nlohmann::json*> neighbours;
+            const int64_t tile=a.at("tile_size");
+            const auto origin=manifest.value("grid_origin",std::array<int64_t,2>{0,0});
+            auto cell=[&](int64_t n) { auto q=n/tile; if (n%tile<0) --q; return q; };
+            for (const auto& t:a.at("tiles")) neighbours[{cell(origin[0]+t.at("row").get<int64_t>()),cell(origin[1]+t.at("column").get<int64_t>())}]=&t;
+            for (const auto& t : a.at("tiles")) {
+                const int64_t r=t.at("row"),c=t.at("column"),h=t.at("rows"),w=t.at("columns");
+                BoundsBuilder bounds;
+                for (int dr=-1;dr<=1;++dr) for (int dc=-1;dc<=1;++dc) {
+                    const auto found=neighbours.find({cell(origin[0]+r)+dr,cell(origin[1]+c)+dc});
+                    if (found!=neighbours.end() && !found->second->at("bounds").is_null()) bounds.merge(found->second->at("bounds").get<Bounds>());
+                }
+                if (bounds.bounds) { total.merge(*bounds.bounds); writer.update(name,r,c,std::min(h+1,shape[0]-r),std::min(w+1,shape[1]-c),bounds.bounds); }
+                if (geometryWork) ++geometryWork->spatialRows;
+            }
+        }
+    }
+    writeBounds(db,objectId,total.bounds,revision);
+}
+std::vector<SpatialRegion> refineIndexedRegions(sqlite3* db,const std::vector<SpatialRegion>& candidates,const ObjectSelection& selection) {
+    TreeCacheScope cache;
+    std::vector<SpatialRegion> result;
+    auto overlaps=[&](const nlohmann::json& bounds) {
+        if(bounds.is_null())return false;
+        for(int i=0;i<3;++i)if(bounds.at(i).get<double>()>(*selection.bbox)[i+3]||bounds.at(i+3).get<double>()<(*selection.bbox)[i])return false;
+        return true;
+    };
+    for(const auto& candidate:candidates) {
+        if(!candidate.revisionUuid||!candidate.arrayName.starts_with("@tree:")) {result.push_back(candidate);continue;}
+        auto region=candidate;region.arrayName.erase(0,6);
+        GeometryReader reader(db,*region.revisionUuid);const auto& a=reader.manifest().at("arrays").at(region.arrayName);
+        if(!a.contains("tree")) {result.push_back(region);continue;}
+        const auto stride=geometryByteLength(a.at("dtype"),{3});const bool patch=a.contains("tile_size");
+        const auto shape=a.at("shape").get<std::vector<int64_t>>();
+        std::function<void(const Tree&,int64_t)> visit=[&](const Tree& ref,int64_t offset) {
+            if(ref.is_null()||!overlaps(ref.at("bounds")))return;
+            const auto node=treeNode(db,ref);
+            if(node.contains("value")) {
+                auto r=region;r.bbox=ref.at("bounds").get<Bounds>();
+                if(patch) {
+                    const auto origin=a.at("origin").get<std::array<int64_t,2>>();const auto& v=node.at("value");
+                    const int64_t row=v.at("row").get<int64_t>()-origin[0],col=v.at("column").get<int64_t>()-origin[1];
+                    const auto top=std::max<int64_t>(0,row-1),left=std::max<int64_t>(0,col-1);
+                    r.start={top,left};r.shape={std::min(shape[0],row+v.at("rows").get<int64_t>()+1)-top,std::min(shape[1],col+v.at("columns").get<int64_t>()+1)-left};
+                } else {r.start={offset/stride};r.shape={treeSize(ref)/stride};}
+                result.push_back(std::move(r));return;
+            }
+            const auto& left=node.at("left");const auto& right=node.at("right");
+            visit(left,offset);visit(right,offset+treeSize(left));
+            if(!patch&&region.kind!="point_collection") {
+                const auto bounds=mergeTreeBounds(left.at("last_bounds"),right.at("first_bounds"));
+                if(overlaps(bounds)) {auto r=region;r.bbox=bounds.get<Bounds>();r.start={(offset+treeSize(left))/stride-1};r.shape={2};result.push_back(std::move(r));}
+            }
+        };
+        visit(a.at("tree"),0);
+    }
+    std::sort(result.begin(),result.end(),[](const auto& a,const auto& b){return std::tie(a.objectUuid,a.arrayName,a.start)<std::tie(b.objectUuid,b.arrayName,b.start);});
+    const auto begin=std::min<uint64_t>(selection.offset,result.size());
+    const auto count=selection.limit?std::min<uint64_t>(*selection.limit,result.size()-begin):result.size()-begin;
+    return {result.begin()+begin,result.begin()+begin+count};
+}
+
 }

@@ -742,3 +742,7 @@ AGENTS_AGENT_MODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_OBJECT_STORE_BUILD_PYTHO
 
 All three native test executables and all 20 Python edit tests passed. The 28
 recorded benchmark runs also passed their exact geometry and file verification.
+
+Structural sequence edits and coordinated surface growth/cropping are described
+in [Structural geometry editing](structural-editing.md), including checked
+transactions, identity/span semantics, storage reuse, and current cost limits.

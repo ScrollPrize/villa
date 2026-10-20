@@ -68,7 +68,10 @@ std::optional<Point> PointCollection::point(PointId id) const
     const auto i = indexOf(id);
     return i ? std::optional<Point>(points.at(*i)) : std::nullopt;
 }
-void Fiber::validate() const { finite(controlPoints); finite(linePoints); }
+void Fiber::validate() const {
+    finite(controlPoints); finite(linePoints);
+    if (!controlPointIds.empty()) PointCollection{controlPointIds,controlPoints}.validate();
+}
 double Fiber::length() const { validate(); return polylineLength(linePoints.empty() ? controlPoints : linePoints); }
 void Track::validate() const {}
 double Track::length() const { return polylineLength(points); }
@@ -108,6 +111,10 @@ objects::GeometryData encode(const Geometry& geometry)
             data.kind = "fiber";
             data.arrays = {xyzArray<double>("control_points", "<f8", {int64_t(g.controlPoints.size()), 3}, g.controlPoints),
                 xyzArray<double>("line_points", "<f8", {int64_t(g.linePoints.size()), 3}, g.linePoints)};
+            if (!g.controlPointIds.empty()) {
+                PointCollection{g.controlPointIds,g.controlPoints}.validate();
+                data.arrays.push_back(scalarArray<int64_t>("control_point_ids","<i8",{int64_t(g.controlPointIds.size())},g.controlPointIds));
+            }
         } else if constexpr (std::is_same_v<T, Track>) {
             data.kind = "track";
             data.arrays = {xyzArray<int32_t>("points", "<i4", {int64_t(g.points.size()), 3}, g.points)};
@@ -129,8 +136,9 @@ Geometry decode(const objects::GeometryData& data)
     std::set<std::string> names;
     for (const auto& a : data.arrays)
         if (!names.insert(a.name).second) throw std::invalid_argument("duplicate geometry array");
-    const auto expected = data.kind == "fiber" ? std::set<std::string>{"control_points", "line_points"} :
+    auto expected = data.kind == "fiber" ? std::set<std::string>{"control_points", "line_points"} :
         data.kind == "point_collection" ? std::set<std::string>{"points", "point_ids"} : std::set<std::string>{"points"};
+    if (data.kind=="fiber" && names.contains("control_point_ids")) expected.insert("control_point_ids");
     if (names != expected) throw std::invalid_argument("typed geometry requires exactly its native arrays");
     const auto attributes = nlohmann::json::parse(data.attributes);
     if (!attributes.is_object() || attributes.size() != (data.kind == "patch" ? 1 : 0))
@@ -146,6 +154,12 @@ Geometry decode(const objects::GeometryData& data)
     } else if (data.kind == "fiber") {
         result = Fiber{xyzValues<double>(require(data, "control_points", "<f8", 2).bytes),
             xyzValues<double>(require(data, "line_points", "<f8", 2).bytes)};
+        if (names.contains("control_point_ids")) {
+            auto& fiber=std::get<Fiber>(result);
+            const auto& ids=require(data,"control_point_ids","<i8",1);
+            fiber.controlPointIds.resize(ids.bytes.size()/8); copyScalars<int64_t>(ids.bytes,fiber.controlPointIds);
+            PointCollection{fiber.controlPointIds,fiber.controlPoints}.validate();
+        }
     } else if (data.kind == "track") {
         result = Track{xyzValues<int32_t>(require(data, "points", "<i4", 2).bytes)};
     } else if (data.kind == "patch") {

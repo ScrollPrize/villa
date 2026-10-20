@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <array>
 #include <optional>
 #include <string>
 #include <vector>
@@ -47,6 +48,33 @@ struct GeometryArrayEdit {
     std::vector<uint8_t> bytes;
 };
 
+// A structural sequence is assembled from immutable slices and/or new rows.
+// A reference copies identities and annotations as well as coordinates. New
+// point_collection/control_points rows require explicit nonnegative stable IDs.
+struct GeometrySequencePart {
+    std::optional<std::string> revision;
+    int64_t start = 0, count = 0;
+    bool reverse = false;
+    std::vector<uint8_t> bytes;
+    std::vector<int64_t> ids;
+    std::string annotations = "[]"; // one JSON object/null per new row, or []
+};
+struct GeometrySequenceEdit {
+    std::string array;
+    int64_t start = 0, eraseCount = 0;
+    std::vector<GeometrySequencePart> parts;
+    // Required when any existing/new annotation has span/direction semantics.
+    // Complete resulting positional annotations, transformed by the caller.
+    std::optional<std::string> transformedAnnotations;
+};
+
+// New logical (r,c) maps to old (r+row,c+column). Negative offsets grow
+// top/left. Every array requires one explicitly typed fill pixel, even on crop.
+struct GeometrySurfaceResize {
+    int64_t row = 0, column = 0, rows = 0, columns = 0;
+    std::vector<GeometryArray> fill; // shape {1,1[,components]}, matching dtype
+};
+
 // Descriptors do not load payloads. Revision UUIDs are independent of object
 // UUIDs and content hashes. Parentage records edits, including undo/reverts.
 struct GeometryRevision {
@@ -57,6 +85,7 @@ struct GeometryRevision {
     int64_t objectGeneration = 0;
     std::string createdBy, createdAt, createdHost;
     std::vector<GeometryArrayInfo> arrays;
+    std::array<int64_t, 2> gridOrigin{0, 0}; // stable surface grid coordinates
 };
 
 } // namespace vc::objects

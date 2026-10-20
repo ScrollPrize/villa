@@ -379,6 +379,9 @@ NB_MODULE(_native, m)
             auto edges = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.affectedGeometryEdges(txn, uuid, data); });
             nb::list result; for (const auto& edge : edges) result.append(edgeToPy(edge)); return result;
         }, nb::arg("object_uuid"), nb::arg("geometry"))
+        .def("geometry_point_annotations", [](PyObjectStore& self,const std::string& revision,const std::string& array) {
+            return jsonLoads(self.withRead([&](vo::ObjectStore& db,vo::ReadTxn& txn) { return db.geometryPointAnnotations(txn,revision,array); }));
+        },nb::arg("revision_uuid"),nb::arg("array_name"))
         .def("current_geometry", [](PyObjectStore& self, const std::string& uuid) -> nb::object {
             const auto revision = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.currentGeometry(txn, uuid); });
             return revision ? nb::object(geometryToPy(*revision)) : nb::none();
@@ -845,6 +848,12 @@ NB_MODULE(_native, m)
                                 const std::string& expected, const nb::list& choices) {
             return self.owner->require().editGeometry(self.require(), uuid, geometryEditsFromPy(input), expected, edgeEditsFromPy(choices));
         }, nb::arg("object_uuid"), nb::arg("edits"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
+        .def("edit_geometry_sequence", [](PyObjectWriteTxn& self,const std::string& uuid,const nb::dict& input,const std::string& expected,const nb::list& choices) {
+            return self.owner->require().editGeometrySequence(self.require(),uuid,sequenceEditFromPy(input),expected,edgeEditsFromPy(choices));
+        },nb::arg("object_uuid"),nb::arg("edit"),nb::arg("expected_revision"),nb::arg("edge_edits")=nb::list())
+        .def("resize_surface", [](PyObjectWriteTxn& self,const std::string& uuid,const nb::dict& input,const std::string& expected,const nb::list& choices) {
+            return self.owner->require().resizeSurface(self.require(),uuid,surfaceResizeFromPy(input),expected,edgeEditsFromPy(choices));
+        },nb::arg("object_uuid"),nb::arg("resize"),nb::arg("expected_revision"),nb::arg("edge_edits")=nb::list())
         .def("update_surface_channels", [](PyObjectWriteTxn& self, const std::string& uuid, const nb::list& channels,
                                            const std::vector<std::string>& remove, const std::string& expected, const nb::list& choices) {
             nb::dict input; input["kind"] = "patch"; input["arrays"] = channels;

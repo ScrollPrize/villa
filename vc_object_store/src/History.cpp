@@ -232,6 +232,7 @@ void detail::recordRelationshipValidation(sqlite3* db, const EdgeRecord& edge, b
 
 void detail::publishHistory(sqlite3* db, bool migration, bool importedBindings)
 {
+    GeometryPhase phase("detail::publishHistory");
     if (const auto pool = activeStatementPools.find(db); pool != activeStatementPools.end() && pool->second->actionConflict)
         throw std::runtime_error("object history: action had a revision conflict; all changes rolled back");
     struct Pending {
@@ -244,6 +245,10 @@ void detail::publishHistory(sqlite3* db, bool migration, bool importedBindings)
     Statement dirty(db, "SELECT uuid FROM history_dirty_objects");
     Statement checked(db, "SELECT 1 FROM history_checked");
     const bool strict = checked.row();
+    if (geometryWork) {
+        Statement bytes(db,"SELECT coalesce(sum(length(meta)),0) FROM objects WHERE uuid IN (SELECT uuid FROM history_dirty_objects)");
+        bytes.row(); geometryWork->metadataBytes+=bytes.i64(0);
+    }
     if (strict) {
         Statement required(db, "SELECT uuid FROM history_required");
         while (required.row()) {
@@ -602,14 +607,20 @@ void ObjectStore::keepRecordedRelationship(WriteTxn& txn, const std::string& uui
     auto* db = static_cast<sqlite3*>(connection(txn));
     const auto edge = edgeByUuid(txn, uuid);
     if (!edge) throw std::invalid_argument("object history: unknown relationship");
-    for (const auto& [object, anchor] : {std::pair{edge->aUuid, edge->aAnchor}, std::pair{edge->bUuid, edge->bAnchor}}) {
-        const auto published = currentObjectRevision(txn, object);
-        // An unchanged geometry was already accepted in the published state.
-        // Lifecycle-only preservation must not decode point IDs or XYZ again.
-        if (published && published->geometryRevision == geometryHead(db, object) &&
-            published->record.lifecycleEpoch != currentRecord(db, object).value("lifecycle_epoch", "")) continue;
-        if (const auto geometry = currentGeometry(txn, object))
-            validateDependencies(anchor, dependencyGeometry(*this, txn, *geometry));
+    const auto binding=edgeGeometryState(txn,uuid);
+    // Preservation validates the immutable reference, not a substitution of
+    // today's endpoint. Structural deletion may remove that point from the
+    // current sequence while the recorded historical point remains resolvable.
+    for (const auto& [revision,anchor] : {std::pair{binding.aRevision,edge->aAnchor},std::pair{binding.bRevision,edge->bAnchor}}) {
+        if (revision) {
+            const auto object=revision==binding.aRevision ? edge->aUuid : edge->bUuid;
+            const auto published=currentObjectRevision(txn,object);
+            if (published && published->geometryRevision==revision && geometryHead(db,object)==revision &&
+                published->record.lifecycleEpoch!=currentRecord(db,object).value("lifecycle_epoch","")) continue;
+            const auto geometry=geometryRevision(txn,*revision);
+            if (!geometry) throw std::runtime_error("recorded relationship geometry is missing");
+            validateDependencies(anchor,dependencyGeometry(*this,txn,*geometry));
+        }
     }
     recordRelationshipValidation(db, *edge, true);
 }

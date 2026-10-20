@@ -82,7 +82,7 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
         attributes = detail::nativeMetadata(db, read, *object, *revision);
         if (revision->formatVersion != 1 || revision->coordinateSystem != "source_xyz")
             throw std::runtime_error("unsupported geometry format for native export");
-        const std::set<std::string> names = revision->kind == "fiber" ? std::set<std::string>{"control_points", "line_points"} :
+        const std::set<std::string> names = revision->kind == "fiber" ? std::set<std::string>{"control_points", "line_points", "control_point_ids"} :
             revision->kind == "point_collection" ? std::set<std::string>{"points", "point_ids"} : std::set<std::string>{"points"};
         for (const auto& array : revision->arrays) {
             if (!names.contains(array.name)) throw std::runtime_error("native export cannot represent auxiliary array: " + array.name);

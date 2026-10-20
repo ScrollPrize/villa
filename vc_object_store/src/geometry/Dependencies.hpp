@@ -3,14 +3,18 @@
 #include "geometry/GeometrySnapshot.hpp"
 #include <functional>
 #include "geometry/GeometryReader.hpp"
+#include "geometry/PersistentTree.hpp"
 
 namespace vc::objects::detail {
 // A bounded reader for either a published revision or a proposed payload.
 struct DependencyGeometry {
     std::string kind, attributes;
+    std::array<int64_t,2> gridOrigin{0,0};
     std::map<std::string, std::string> fingerprints;
     std::map<std::string, GeometryArrayInfo> arrays;
     std::function<std::vector<uint8_t>(const std::string&, int64_t, int64_t)> read;
+    std::function<std::optional<std::vector<uint8_t>>(const std::string&, int64_t)> identity;
+    std::set<std::string> identityArrays;
     struct PointIndex {
         bool loaded = false;
         std::vector<std::pair<int64_t, int64_t>> offsets;
@@ -23,6 +27,7 @@ struct DependencyGeometry {
 using DependencyCache = std::map<std::pair<const Txn*, std::string>, DependencyGeometry>;
 inline thread_local DependencyCache* activeDependencies = nullptr;
 class DependencyScope {
+    TreeCacheScope trees_;
     std::unique_ptr<DependencyCache> owned_;
 public:
     DependencyScope() {
@@ -40,12 +45,24 @@ inline DependencyGeometry dependencyGeometry(const ObjectStore& db, const Txn& t
         const auto cached = activeDependencies->find(key);
         if (cached != activeDependencies->end()) return cached->second;
     }
-    DependencyGeometry result; result.kind = revision.kind; result.attributes = revision.attributes;
+    DependencyGeometry result; result.kind = revision.kind; result.attributes = revision.attributes; result.gridOrigin = revision.gridOrigin;
     for (const auto& array : revision.arrays) result.arrays.emplace(array.name, array);
     auto reader = std::make_shared<GeometryReader>(txn, revision.uuid);
     for (const auto& [name, a] : reader->manifest().at("arrays").items()) {
         auto descriptor = a; descriptor.erase("source_revision");
         result.fingerprints[name] = descriptor.dump();
+    }
+    if (reader->manifest().contains("sequences")) {
+        for(const auto& [name,state]:reader->manifest().at("sequences").items())if(state.contains("identities"))
+            result.identityArrays.insert(name=="points"?"point_ids":"control_point_ids");
+        auto* connection=ObjectStoreImplAccess::conn(txn);
+        result.identity=[reader,connection](const std::string& name,int64_t id)->std::optional<std::vector<uint8_t>> {
+            const auto array=name=="point_ids"?"points":"control_points";
+            const auto& states=reader->manifest().at("sequences");
+            if(!states.contains(array)||!states.at(array).contains("identities"))return std::nullopt;
+            const auto point=identityGet(connection,states.at(array).at("identities"),id);
+            return point.is_null()?std::nullopt:std::optional(point.at("bytes").get<std::vector<uint8_t>>());
+        };
     }
     result.read = [reader](const auto& name, auto offset, auto count) {
         return reader->read(name, offset, count);
@@ -76,8 +93,18 @@ inline std::optional<std::vector<uint8_t>> pointValue(const DependencyGeometry& 
 {
     auto index = point.index;
     auto name = point.array;
-    if (name == "point_ids") {
-        if (geometry.kind != "point_collection" || index.size() != 1 || index[0] < 0) return std::nullopt;
+    if (name == "point_ids" || name == "control_point_ids") {
+        if ((name == "point_ids" ? geometry.kind != "point_collection" : geometry.kind != "fiber") || index.size() != 1 || index[0] < 0) return std::nullopt;
+        if (geometry.identity && geometry.identityArrays.contains(name)) {
+            auto bytes=geometry.identity(name,index[0]);
+            if(bytes) {
+                GeometrySnapshot snapshot;snapshot.arrays["point"]=*bytes;
+                const auto coordinate=name=="point_ids"?"points":"control_points";
+                if(geometry.arrays.at(coordinate).dtype=="<f8") (void)snapshot.values<double>("point");
+                else (void)snapshot.values<float>("point");
+            }
+            return bytes;
+        }
         const auto found = geometry.arrays.find(name);
         if (found == geometry.arrays.end()) return std::nullopt;
         auto& cache = *geometry.pointIndex;
@@ -94,7 +121,7 @@ inline std::optional<std::vector<uint8_t>> pointValue(const DependencyGeometry& 
         if (id == cache.offsets.end() || id->first != index[0]) return std::nullopt;
         if (id + 1 != cache.offsets.end() && (id + 1)->first == index[0])
             throw std::runtime_error("geometry dependency has ambiguous point ID");
-        index = {id->second}; name = "points";
+        index = {id->second}; name = name == "point_ids" ? "points" : "control_points";
     } else {
         // Collections use stable IDs, never vector offsets.
         if (geometry.kind == "point_collection") return std::nullopt;
@@ -133,7 +160,7 @@ inline void validateDependencies(const Anchor& anchor, const DependencyGeometry&
 
 inline bool dependenciesChanged(const Anchor& anchor, const DependencyGeometry& before, const DependencyGeometry& after)
 {
-    if (before.kind != after.kind || before.attributes != after.attributes) return true;
+    if (before.kind != after.kind || before.attributes != after.attributes || before.gridOrigin != after.gridOrigin) return true;
     auto changed = [&](const std::string& name) {
         const auto a = before.arrays.find(name), b = after.arrays.find(name);
         if (a == before.arrays.end() || b == after.arrays.end()) return a != before.arrays.end() || b != after.arrays.end();
@@ -158,11 +185,21 @@ inline bool dependenciesChanged(const Anchor& anchor, const DependencyGeometry& 
                before.fingerprints.at(name) == after.fingerprints.at(name);
     };
     for (const auto& point : anchor.points) {
-        if (identical(point.array) && (point.array != "point_ids" || identical("points"))) continue;
+        if (before.kind=="fiber" && point.array=="control_points" && point.index.size()==1) {
+            auto identity=[&](const DependencyGeometry& geometry) -> std::optional<int64_t> {
+                const auto index=point.index[0];
+                if (index<0 || index>=geometry.arrays.at("control_points").shape[0]) return std::nullopt;
+                if (!geometry.arrays.contains("control_point_ids")) return index;
+                const auto bytes=geometry.read("control_point_ids",index*8,8);
+                std::array<int64_t,1> value; copyScalars<int64_t>(bytes,value); return value[0];
+            };
+            if (identity(before)!=identity(after)) return true;
+        }
+        if (identical(point.array) && (point.array == "point_ids" ? identical("points") : point.array == "control_point_ids" ? identical("control_points") : true)) continue;
         const auto old = pointValue(before, point), next = pointValue(after, point);
         if (!old || !next || old != next) return true;
         // Positional identities cannot be assumed to survive insertion/removal.
-        if (point.array != "point_ids" && before.arrays.at(point.array).shape != after.arrays.at(point.array).shape) return true;
+        if (point.array != "point_ids" && point.array != "control_point_ids" && before.arrays.at(point.array).shape != after.arrays.at(point.array).shape) return true;
     }
     return false;
 }

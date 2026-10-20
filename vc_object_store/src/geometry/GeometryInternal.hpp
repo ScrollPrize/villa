@@ -11,13 +11,16 @@
 #include <map>
 #include <span>
 #include <cstring>
+#include <chrono>
 #include <stdexcept>
 
 namespace vc::objects::detail {
 // Opt-in internal instrumentation for storage-work regression tests. Scoped
 // by the caller on its transaction thread; no global counters or payload copies.
 struct GeometryWork {
-    std::map<std::string, uint64_t> readBytes, hashedBytes;
+    std::map<std::string, uint64_t> readBytes, hashedBytes, writtenBytes, phaseNanoseconds;
+    uint64_t manifestBytesRead = 0, manifestBytesWritten = 0, metadataBytes = 0;
+    uint64_t manifestEntries = 0, identityRows = 0, relationshipRows = 0, spatialRows = 0, compactions = 0;
 };
 inline thread_local GeometryWork* geometryWork = nullptr;
 class GeometryWorkScope {
@@ -25,6 +28,28 @@ class GeometryWorkScope {
 public:
     explicit GeometryWorkScope(GeometryWork& work) : previous_(geometryWork) { geometryWork = &work; }
     ~GeometryWorkScope() { geometryWork = previous_; }
+};
+// Exclusive wall-time profiler (including SQLite waits), enabled only with a
+// GeometryWorkScope. Nested instrumented phases are subtracted from parents.
+class GeometryPhase;
+inline thread_local GeometryPhase* activeGeometryPhase=nullptr;
+class GeometryPhase {
+    GeometryWork* work_=geometryWork;
+    GeometryPhase* previous_=nullptr;
+    const char* name_;
+    std::chrono::steady_clock::time_point start_;
+    uint64_t children_=0;
+public:
+    explicit GeometryPhase(const char* name):name_(name) {
+        if(work_) {previous_=activeGeometryPhase;activeGeometryPhase=this;start_=std::chrono::steady_clock::now();}
+    }
+    ~GeometryPhase() {
+        if(!work_)return;
+        const auto elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start_).count();
+        work_->phaseNanoseconds[name_]+=elapsed-children_;
+        if(previous_)previous_->children_+=elapsed;
+        activeGeometryPhase=previous_;
+    }
 };
 inline constexpr size_t geometryChunkSize = 1024 * 1024;
 inline std::string geometryHash(std::span<const uint8_t> bytes)
@@ -101,6 +126,56 @@ inline GeometryLayout geometryLayout(const nlohmann::json& array, bool checkChun
     result.length = geometryByteLength(array.at("dtype"), shape);
     if (result.length != array.at("byte_length").get<int64_t>())
         throw std::runtime_error("geometry: inconsistent array byte length");
+    if (array.contains("tree")) {
+        const auto& root=array.at("tree");
+        if (!root.is_null() && (root.at("hash").get<std::string>().size()!=64 || root.at("height").get<int>()<1 || root.at("height").get<int>()>96))
+            throw std::runtime_error("geometry: invalid indexed root");
+        if (!array.contains("tile_size") && (root.is_null()?0:root.at("size").get<int64_t>())!=result.length)
+            throw std::runtime_error("geometry: indexed array length mismatch");
+        return result;
+    }
+    if (array.contains("blocks") || array.contains("tiles")) {
+        if (array.contains("blocks") && array.contains("tiles")) throw std::runtime_error("geometry: ambiguous shared layout");
+        auto hash=[](const nlohmann::json& entry) {
+            const auto value=entry.at("hash").get<std::string>();
+            if (value.size()!=64 || value.find_first_not_of("0123456789abcdef")!=std::string::npos)
+                throw std::runtime_error("geometry: invalid shared hash");
+        };
+        if (array.contains("blocks")) {
+            int64_t total=0;
+            if (!array.at("blocks").is_array()) throw std::runtime_error("geometry: invalid shared blocks");
+            for (const auto& block:array.at("blocks")) {
+                hash(block); const int64_t offset=block.at("offset"), length=block.at("length");
+                if (offset<0 || offset>int64_t(geometryChunkSize) || length<=0 || length>int64_t(geometryChunkSize)-offset || length>result.length-total)
+                    throw std::runtime_error("geometry: invalid shared block range");
+                total+=length;
+            }
+            if (total!=result.length) throw std::runtime_error("geometry: incomplete shared blocks");
+        } else {
+            const auto pixel=surfacePixelBytes(array.at("dtype"),shape);
+            const int64_t tile=array.at("tile_size"); validatePatchTileSize(tile);
+            if (!tile || !array.at("tiles").is_array()) throw std::runtime_error("geometry: invalid shared tiles");
+            std::map<int64_t,std::pair<int64_t,std::map<int64_t,int64_t>>> bands;
+            for (const auto& t:array.at("tiles")) {
+                hash(t); const int64_t r=t.at("row"),c=t.at("column"),h=t.at("rows"),w=t.at("columns");
+                if (r<0 || c<0 || h<=0 || w<=0 || h>tile || w>tile || r>shape[0]-h || c>shape[1]-w || h*w>int64_t(geometryChunkSize)/pixel)
+                    throw std::runtime_error("geometry: invalid shared tile rectangle");
+                auto& band=bands[r];
+                if ((band.first && band.first!=h) || !band.second.emplace(c,w).second) throw std::runtime_error("geometry: overlapping shared tiles");
+                band.first=h;
+            }
+            int64_t row=0;
+            for (const auto& [r,band]:bands) {
+                if (r!=row) throw std::runtime_error("geometry: incomplete shared tile rows");
+                int64_t col=0;
+                for (const auto& [c,w]:band.second) { if (c!=col) throw std::runtime_error("geometry: incomplete shared tile columns"); col+=w; }
+                if (col!=shape[1]) throw std::runtime_error("geometry: incomplete shared tile columns");
+                row+=band.first;
+            }
+            if (shape[1] && row!=shape[0]) throw std::runtime_error("geometry: incomplete shared tile rows");
+        }
+        return result;
+    }
     if (array.contains("storage")) {
         const auto& storage = array.at("storage");
         if (storage.at("version") != 1 || storage.at("layout") != "tiles" ||
@@ -177,6 +252,11 @@ inline nlohmann::json geometryManifest(const GeometryData& data, int64_t patchTi
     if (data.kind == "fiber") {
         require("control_points", "<f8", 2, true);
         require("line_points", "<f8", 2, true);
+        if (arrays.contains("control_point_ids")) {
+            require("control_point_ids", "<i8", 1, false);
+            if (arrays["control_point_ids"]["shape"][0] != arrays["control_points"]["shape"][0])
+                throw std::invalid_argument("geometry: control IDs and coordinates differ in length");
+        }
     }
     if (data.kind == "track") require("points", "<i4", 2, true);
     if (data.kind == "point_collection") {

@@ -26,6 +26,10 @@ add_library(vc_objects STATIC
     sync/Synchronize.cpp
     sync/GeometryTransfer.cpp
     geometry/GeometryViews.cpp
+    geometry/DependencyIndex.cpp
+    geometry/PersistentTree.cpp
+    geometry/SharedGeometry.cpp
+    geometry/StructuralGeometry.cpp
     geometry/Geometry.cpp
     geometry/GeometryDelta.cpp
     geometry/GeometryReader.cpp

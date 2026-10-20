@@ -26,6 +26,7 @@ inline void bindTypedGeometry(nb::module_& m)
              nb::arg("control_points"), nb::arg("line_points") = std::vector<vg::Point>{})
         .def_rw("control_points", &vg::Fiber::controlPoints)
         .def_rw("line_points", &vg::Fiber::linePoints)
+        .def_rw("control_point_ids", &vg::Fiber::controlPointIds)
         .def("validate", &vg::Fiber::validate)
         .def("length", &vg::Fiber::length);
     nb::class_<vg::Track>(m, "Track")

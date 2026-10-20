@@ -403,7 +403,7 @@ public:
                                                 const GeometryData&) const;
     // Sparse, lossless, compressed edits. One call publishes one revision in
     // the caller's transaction. expectedRevision is mandatory, even for no-ops.
-    // No automatic checkpoints. Use putGeometry for structural replacements.
+    // No automatic checkpoints. Use editGeometrySequence/resizeSurface for structure.
     std::string editGeometry(WriteTxn&, const std::string& objectUuid,
                              const std::vector<GeometryArrayEdit>&,
                              const std::string& expectedRevision,
@@ -440,6 +440,20 @@ public:
         const std::string& arrayName, int64_t row, int64_t column, int64_t rows, int64_t columns,
         const std::vector<uint8_t>& bytes, const std::string& expectedRevision,
         const std::vector<GeometryEdgeEdit>& edgeEdits = {});
+
+    // Structural mutations require write(expected object revisions). References
+    // to another object's revision require that object's expected head too.
+    // Append/insert/delete/replace are splices; reverse/reorder/split/merge use
+    // immutable slices. Source retirement is explicit in the same transaction.
+    std::string editGeometrySequence(WriteTxn&, const std::string& objectUuid,
+        const GeometrySequenceEdit&, const std::string& expectedRevision,
+        const std::vector<GeometryEdgeEdit>& edgeEdits = {});
+    std::string resizeSurface(WriteTxn&, const std::string& objectUuid,
+        const GeometrySurfaceResize&, const std::string& expectedRevision,
+        const std::vector<GeometryEdgeEdit>& edgeEdits = {});
+    // Aligned annotations for a geometry revision, derived from stable IDs.
+    std::string geometryPointAnnotations(const Txn&, const std::string& revisionUuid,
+        const std::string& arrayName) const;
 
     // Dense row-major rectangle from any aligned patch array. Exact
     // bytes; handles tiled and legacy layouts. Coordinates/counts are vertices.

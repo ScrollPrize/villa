@@ -273,7 +273,7 @@ def test_schema_nine_migration_and_readonly_compatibility(tmp_path):
         assert db.object_count('note') == 0
         assert not db.object_revision(before)['record']['retired']
     with sqlite3.connect(path) as sql:
-        assert sql.execute('PRAGMA user_version').fetchone()[0] == 10
+        assert sql.execute('PRAGMA user_version').fetchone()[0] == 11
 
 
 def test_restore_decisions_and_validation_order_are_atomic(db):

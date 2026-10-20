@@ -21,6 +21,7 @@ uint64_t number(std::span<const uint8_t> bytes, size_t& pos) {
 }
 nlohmann::json loadGeometryManifest(sqlite3* db, const std::string& revision,
                                     const std::string& text, const std::string& contentHash) {
+    if (geometryWork) geometryWork->manifestBytesRead += text.size();
     auto manifest = nlohmann::json::parse(text);
     if (!manifest.contains("delta")) return verifiedGeometryManifest(text, contentHash);
     Statement checksum(db, "SELECT manifest_hash FROM geometry_deltas WHERE revision_uuid=?");

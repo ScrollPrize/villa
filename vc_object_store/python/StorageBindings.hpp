@@ -327,6 +327,7 @@ nb::dict geometryToPy(const vo::GeometryRevision& r)
     result["parent_uuid"] = r.parentUuid; result["content_hash"] = r.contentHash;
     result["kind"] = r.kind; result["format_version"] = r.formatVersion;
     result["coordinate_system"] = r.coordinateSystem; result["attributes"] = jsonLoads(r.attributes);
+    result["grid_origin"] = r.gridOrigin;
     result["object_generation"] = r.objectGeneration;
     result["created_by"] = r.createdBy; result["created_at"] = r.createdAt; result["created_host"] = r.createdHost;
     nb::list arrays;
@@ -477,4 +478,29 @@ struct PyObjectWriteTxn {
 };
 
 
+}
+
+vo::GeometrySequenceEdit sequenceEditFromPy(const nb::dict& input) {
+    vo::GeometrySequenceEdit edit;
+    edit.array=nb::cast<std::string>(input["array"]);
+    edit.start=nb::cast<int64_t>(input["start"]); edit.eraseCount=nb::cast<int64_t>(input["erase_count"]);
+    if (has(input,"transformed_annotations")) edit.transformedAnnotations=jsonDumps(input["transformed_annotations"]);
+    if (has(input,"parts")) for (const auto item:nb::cast<nb::list>(input["parts"])) {
+        const auto p=nb::cast<nb::dict>(item); vo::GeometrySequencePart part;
+        if (has(p,"revision")) part.revision=nb::cast<std::string>(p["revision"]);
+        part.start=getInt(p,"start"); part.count=getInt(p,"count");
+        if (has(p,"reverse")) part.reverse=nb::cast<bool>(p["reverse"]);
+        if (has(p,"data")) { const auto bytes=nb::cast<nb::bytes>(p["data"]); const auto* b=reinterpret_cast<const uint8_t*>(bytes.c_str()); part.bytes.assign(b,b+bytes.size()); }
+        if (has(p,"ids")) part.ids=nb::cast<std::vector<int64_t>>(p["ids"]);
+        if (has(p,"annotations")) part.annotations=jsonDumps(p["annotations"]);
+        edit.parts.push_back(std::move(part));
+    }
+    return edit;
+}
+vo::GeometrySurfaceResize surfaceResizeFromPy(const nb::dict& input) {
+    vo::GeometrySurfaceResize resize;
+    resize.row=nb::cast<int64_t>(input["row"]); resize.column=nb::cast<int64_t>(input["column"]);
+    resize.rows=nb::cast<int64_t>(input["rows"]); resize.columns=nb::cast<int64_t>(input["columns"]);
+    nb::dict data; data["kind"]="patch"; data["arrays"]=input["fill"];
+    resize.fill=geometryFromPy(data).arrays; return resize;
 }

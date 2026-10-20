@@ -1,4 +1,5 @@
 #include "internal/Schema.hpp"
+#include "geometry/DependencyIndex.hpp"
 #include "internal/History.hpp"
 #include "internal/RecordSql.hpp"
 
@@ -12,7 +13,7 @@ ObjectStore& ObjectStore::operator=(ObjectStore&&) noexcept = default;
 std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::path& path, const OpenOptions& options, bool create)
 {
     const int kApplicationId = 0x56434f42;
-    const int kSchemaVersion = 10;
+    const int kSchemaVersion = 11;
     if (create && options.readOnly) throw std::invalid_argument("create requires writable options");
     if (sqlite3_threadsafe() == 0)
         throw std::runtime_error("object store: SQLite build is not thread-safe");
@@ -40,6 +41,7 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
             createSchema(impl->writer);
             createHistorySchema(impl->writer);
             createLifecycleSchema(impl->writer);
+            createDependencyIndex(impl->writer);
             exec(impl->writer, ("PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";").c_str());
             exec(impl->writer, "COMMIT;");
         } catch (...) {
@@ -92,6 +94,10 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
                     if (pragmaInt(impl->writer, "user_version") == 9) {
                         createLifecycleSchema(impl->writer);
                         exec(impl->writer, "PRAGMA user_version=10;");
+                    }
+                    if (pragmaInt(impl->writer, "user_version") == 10) {
+                        createDependencyIndex(impl->writer);
+                        exec(impl->writer, "PRAGMA user_version=11;");
                     }
                     exec(impl->writer, "COMMIT;");
                 } catch (...) { exec(impl->writer, "ROLLBACK;"); throw; }

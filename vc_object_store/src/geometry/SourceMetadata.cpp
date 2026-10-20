@@ -10,6 +10,11 @@ Json nativeMetadata(ObjectStore& db, const Txn& txn, const ObjectRecord& object,
     auto result = metadata.value("source", Json::object());
     if (object.kind == "patch") result["scale"] = Json::parse(revision.attributes).at("scale");
     result.erase("origin");
+    GeometryReader structure(txn,revision.uuid);
+    if (structure.manifest().contains("sequences"))
+        for (const auto& [name,state]:structure.manifest().at("sequences").items())
+            result[object.kind=="point_collection" ? "point_attributes" : name+"_attributes"] =
+                Json::parse(db.geometryPointAnnotations(txn,revision.uuid,name));
     result["name"] = object.name;
     if (object.kind == "point_collection" && metadata.contains("source") && result.contains("tags") && result.at("tags").is_object()) {
         auto tags = Json::object();
