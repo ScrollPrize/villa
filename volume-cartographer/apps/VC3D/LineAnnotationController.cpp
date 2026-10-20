@@ -216,6 +216,11 @@ struct LineAnnotationController::LineAnnotationSession {
     std::optional<std::vector<size_t>> runningSolveControlMap;
     std::vector<size_t> runningSolveEditedSpans;
     bool runningSolveConfigChanged = false;
+    // An armed rollback snapshot (controlPointCollapseRollback /
+    // controlPointsBeforeModeChange) no longer describes an optimized state:
+    // a tag edit mirrored from another pane changed its tail policy or goals,
+    // or a tail distance changed. A restore then lands Unoptimized.
+    bool rollbackInvalidatesOptimization = false;
     // A debounced dispatch of the queue's pending solve is scheduled.
     bool solveDispatchScheduled = false;
     // A debounced session autosave is scheduled (see scheduleSessionAutoSave).
@@ -381,6 +386,7 @@ using vc3d::line_annotation::finitePoint;
 using vc3d::line_annotation::matchingStoredControlPointIndex;
 using vc3d::line_annotation::normalizedOrZero;
 using vc3d::line_annotation::pointsApproximatelyEqual;
+using vc3d::line_annotation::nearestControlAtPoint;
 using vc3d::line_annotation::storedControlPointIndexByPosition;
 using vc3d::line_annotation::tangentAtLinePosition;
 using vc3d::line_annotation::fiberGeometryKey;
@@ -1717,8 +1723,11 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
     int activeStart,
     int activeEnd,
     const vc::lasagna::NormalSampler& sampler,
+    double rayTailDistanceBaseVoxels,
     const std::atomic<bool>* cancelFlag = nullptr);
 
+// rayTailDistanceBaseVoxels: the straight-ray length for open tails past a
+// lone break or a kollesis end (OpenTailPolicy), applied to the result.
 LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
     fs::path manifestPath,
     double workingToBaseScale,
@@ -1730,6 +1739,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
     bool forceFullOptimization,
     int activeStart,
     int activeEnd,
+    double rayTailDistanceBaseVoxels,
     const std::atomic<bool>* cancelFlag = nullptr)
 {
     vc::lasagna::LasagnaDataset dataset =
@@ -1746,6 +1756,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineFromManifest(
                                    activeStart,
                                    activeEnd,
                                    sampler,
+                                   rayTailDistanceBaseVoxels,
                                    cancelFlag);
 }
 
@@ -1760,6 +1771,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
     int activeStart,
     int activeEnd,
     const vc::lasagna::NormalSampler& sampler,
+    double rayTailDistanceBaseVoxels,
     const std::atomic<bool>* cancelFlag)
 {
     LineAnnotationController::OptimizationTaskResult task;
@@ -1871,6 +1883,43 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
             task.result = optimizer.optimizeFromControlPoints(
                 vc3d::line_annotation::optimizerControlPoints(task.controlPoints), config);
         }
+        // Open tails past a lone break or a kollesis end are straight rays
+        // whatever produced the line. The outer controls' vertices are
+        // resolved on the result (nearest vertex: the fixed points are exact
+        // members); the landing re-resolves every control the same way.
+        const auto tailPolicy =
+            vc3d::line_annotation::openTailPolicyForControls(task.controlPoints);
+        if (tailPolicy.any() && task.result.line.points.size() >= 2) {
+            std::vector<size_t> order(task.controlPoints.size());
+            std::iota(order.begin(), order.end(), size_t{0});
+            std::stable_sort(order.begin(), order.end(), [&task](size_t a, size_t b) {
+                return task.controlPoints[a].linePosition < task.controlPoints[b].linePosition;
+            });
+            const auto nearestIndex = [&task](const cv::Vec3d& target) {
+                int best = 0;
+                double bestDistance = std::numeric_limits<double>::infinity();
+                for (size_t i = 0; i < task.result.line.points.size(); ++i) {
+                    const double distance = cv::norm(task.result.line.points[i].position - target);
+                    if (distance < bestDistance) {
+                        bestDistance = distance;
+                        best = static_cast<int>(i);
+                    }
+                }
+                return best;
+            };
+            const auto& head = task.controlPoints[order.front()];
+            const auto& tail = task.controlPoints[order.back()];
+            vc3d::line_annotation::replaceRayTails(
+                task.result.line,
+                nearestIndex(head.volumePoint),
+                nearestIndex(tail.volumePoint),
+                tailPolicy,
+                head.direction,
+                tail.direction,
+                rayTailDistanceBaseVoxels,
+                std::max(0.1, config.segmentLength),
+                &sampler);
+        }
         task.ok = true;
     } catch (const std::exception& ex) {
         task.ok = false;
@@ -1880,6 +1929,14 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
         task.error = "Unknown Lasagna line optimization error.";
     }
     return task;
+}
+
+// The persisted ray length for paths without a dialog (headless solves, the
+// legacy wrappers); the dialog's applied value wins when there is one.
+int breakExtrapolationDistanceVxFromSettings()
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    return vc3d::settings::line_annotation::breakExtrapolationDistanceVx(settings);
 }
 
 void applyFocusBoundsToOptimizationTask(
@@ -2786,6 +2843,7 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
                                 std::move(*session.controlPointsBeforeModeChange);
                             session.controlPointsBeforeModeChange.reset();
                         }
+                        consumeRollbackInvalidation(session);
                         if (session.optimizedLineBeforeModeChange) {
                             session.optimizedLine =
                                 std::move(*session.optimizedLineBeforeModeChange);
@@ -2805,38 +2863,11 @@ bool LineAnnotationController::launchSession(LineAnnotationController::SourceKin
         connect(dialog,
                 &LineAnnotationDialog::extrapolationDistanceChanged,
                 this,
-                [this, surfaceName](int) {
-                    auto* pane = paneForSurface(surfaceName);
-                    if (!pane || !pane->session) {
-                        return;
-                    }
-                    auto& session = *pane->session;
-                    if (session.optimizedLine.points.size() < 2 ||
-                        session.controlPoints.empty()) {
-                        return;
-                    }
-                    setSessionOptimizationState(
-                        session, SessionOptimizationState::Unoptimized);
-                    if (session.taskState == LineAnnotationSession::TaskState::Running) {
-                        // The running solve computes tails with the OLD distance:
-                        // refuse its wholesale publication (the epoch routes its
-                        // landing through the merge, where the config flag keeps
-                        // the current tails) and queue a whole-line pass instead
-                        // of silently dropping the new setting. Dispatch stays
-                        // mode-gated.
-                        session.solveQueue.noteSessionMutated();
-                        session.runningSolveConfigChanged = true;
-                        session.solveQueue.addPending({}, true);
-                        return;
-                    }
-                    if (pane->dialog &&
-                        pane->dialog->reoptimizationMode() !=
-                            LineAnnotationDialog::ReoptimizationMode::AutoReoptimize) {
-                        return;
-                    }
-                    if (ensureDatasetForSession(session))
-                        startFiberModeOptimization(session, false);
-                });
+                [this, surfaceName](int) { handleTailConfigChanged(surfaceName); });
+        connect(dialog,
+                &LineAnnotationDialog::breakExtrapolationDistanceChanged,
+                this,
+                [this, surfaceName](int) { handleTailConfigChanged(surfaceName); });
         connect(dialog,
                 &LineAnnotationDialog::reoptimizationModeChanged,
                 this,
@@ -8127,8 +8158,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     // state this edit is about to build on top of; applying it to a later
     // solve failure would silently discard this edit too. Each edit owns at
     // most its own.
-    session.controlPointCollapseRollback.reset();
-    session.controlPointsBeforeModeChange.reset();
+    disarmRollbackSnapshots(session);
     session.optimizedLineBeforeModeChange.reset();
     session.branchesBeforeModeChange.reset();
     session.restoreFiberOptimizationModeOnFailure = false;
@@ -8157,6 +8187,16 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     }
     if (direction)
         prepared.controlPoints[prepared.replacementIndex].direction = direction;
+    // Placing beyond a lone end break: the new control is a break too, so
+    // the span between them is a gap (closed to placement, bridged by a
+    // cubic spline by the policy below) and the damaged papyrus past the
+    // break is never traced. previousControls is the pre-edit list (the
+    // prepared snapshot already holds the inserted control).
+    if (const auto tagIndex = vc3d::line_annotation::appendedControlToTagAsBreak(
+            previousControls, prepared)) {
+        vc3d::line_annotation::setControlPointTag(
+            prepared.controlPoints[*tagIndex].tags, vc3d::line_annotation::kBreakTag, true);
+    }
     session.controlPoints = std::move(prepared.controlPoints);
     // A collapse can make two break points neighbours (or part them): the
     // span tags and the gap goal policy follow before the solve below runs.
@@ -8196,7 +8236,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
             syncLinkedBranchMetadataAfterFiberModification(
                 session, nullptr, &previousBranches);
         scheduleBranchMetadataSaves(branchSync.affectedFiberIds, session.fiberId);
-        session.controlPointCollapseRollback.reset();
+        disarmRollbackSnapshots(session);
     }
 
     // Immediate feedback: the new control point appears in the overlays now;
@@ -10942,32 +10982,6 @@ bool LineAnnotationController::ensureFiberInferenceDatasetForSession(
     return true;
 }
 
-namespace {
-
-// The control of `controls` that stands for the one at `point`: the NEAREST
-// within the position tolerance, so an exact twin wins over a distinct visit
-// that merely passes within tolerance (a line that revisits its own
-// coordinates). Null when none.
-template <typename Controls>
-auto nearestControlAtPoint(Controls& controls, const cv::Vec3d& point) -> decltype(&controls.front())
-{
-    decltype(&controls.front()) best = nullptr;
-    double bestDistance = std::numeric_limits<double>::infinity();
-    for (auto& control : controls) {
-        if (!pointsApproximatelyEqual(control.volumePoint, point)) {
-            continue;
-        }
-        const double distance = cv::norm(control.volumePoint - point);
-        if (distance < bestDistance) {
-            bestDistance = distance;
-            best = &control;
-        }
-    }
-    return best;
-}
-
-} // namespace
-
 bool LineAnnotationController::applyControlPointEditAndPersist(
     const std::string& surfaceName,
     size_t controlPointIndex,
@@ -11075,13 +11089,6 @@ bool LineAnnotationController::applyControlPointEditAndPersist(
     // One control per vector: the toggle named a single point, so a
     // coincident duplicate (should the geometry ever carry one) is left alone;
     // the nearest match is the one the preflight above judged.
-    const auto applyToControls =
-        [&editedPoint, &edit](std::vector<vc3d::line_annotation::LineControlPoint>& controls) {
-            if (auto* control = nearestControlAtPoint(controls, editedPoint)) {
-                return edit(*control);
-            }
-            return false;
-        };
     // Panes without a dialog are intersection-inspection sides; their
     // generated overlays redraw only on request.
     bool dialogLessPaneTouched = !pane->dialog;
@@ -11094,27 +11101,38 @@ bool LineAnnotationController::applyControlPointEditAndPersist(
                                                       session.fiberId, session.fiberFileName)) {
             continue;
         }
-        bool changed = applyToControls(other.controlPoints);
         // A running or rolled-back task in that pane restores these
         // snapshots wholesale; they must carry the tag too or the rollback
-        // would undo it.
-        if (other.controlPointsBeforeModeChange) {
-            changed = applyToControls(*other.controlPointsBeforeModeChange) || changed;
-        }
-        if (other.controlPointCollapseRollback) {
-            changed = applyToControls(other.controlPointCollapseRollback->controlPoints) || changed;
-        }
-        if (!changed) {
+        // would undo it. The span tags and the gap goal policy follow in
+        // every list the edit changed, so no later save from that pane can
+        // regress a goal the initiating pane's reconcile applied.
+        const auto outcome = vc3d::line_annotation::applyMirroredControlPointEdit(
+            other.controlPoints,
+            other.controlPointsBeforeModeChange ? &*other.controlPointsBeforeModeChange : nullptr,
+            other.controlPointCollapseRollback ? &other.controlPointCollapseRollback->controlPoints
+                                               : nullptr,
+            editedPoint,
+            edit);
+        if (!outcome.changed) {
             continue;
         }
-        // And their span tags with them.
-        vc3d::line_annotation::syncGapSpanTags(other.controlPoints);
-        if (other.controlPointsBeforeModeChange) {
-            vc3d::line_annotation::syncGapSpanTags(*other.controlPointsBeforeModeChange);
+        if (outcome.livePolicyChanged || outcome.liveSync.changed()) {
+            // The peer's tails or goals no longer match its geometry. No new
+            // solve is started in a peer: it is marked Unoptimized (save/close
+            // finalizes it) and owed a whole-line pass; a solve already
+            // running there is superseded outright (its merge map dropped,
+            // so nothing stale is adopted at landing) and its landing then
+            // dispatches or retains that pass, mode-gated.
+            setSessionOptimizationState(other, SessionOptimizationState::Unoptimized);
+            if (other.taskState == LineAnnotationSession::TaskState::Running) {
+                other.runningSolveControlMap.reset();
+                other.solveQueue.noteSessionMutated();
+                other.runningSolveConfigChanged = true;
+            }
+            other.solveQueue.addPending({}, true);
         }
-        if (other.controlPointCollapseRollback) {
-            vc3d::line_annotation::syncGapSpanTags(
-                other.controlPointCollapseRollback->controlPoints);
+        if (outcome.snapshotChanged) {
+            other.rollbackInvalidatesOptimization = true;
         }
         if (otherPane.dialog) {
             otherPane.dialog->setGeneratedBranchOverlayData(
@@ -11290,7 +11308,7 @@ bool LineAnnotationController::breakRefusedNearKollesis(const LineAnnotationSess
     return false;
 }
 
-void LineAnnotationController::reconcileGapGoalsAfterBreakEdit(
+bool LineAnnotationController::reconcileGapGoalsAfterBreakEdit(
     LineAnnotationSession& session,
     const std::vector<size_t>& gapsBefore,
     bool enabled)
@@ -11320,11 +11338,9 @@ void LineAnnotationController::reconcileGapGoalsAfterBreakEdit(
                 owners.push_back(owner);
             }
         }
-        if (!owners.empty()) {
+        return !owners.empty() &&
             applySegmentInterpolationGoals(
                 session, owners, vc3d::line_annotation::SegmentInterpolationGoal::Cspline);
-        }
-        return;
     }
     // A dissolved gap span returns to the global goal, but only when it still
     // carries the spline the gap gave it: an explicit choice made since is
@@ -11335,10 +11351,97 @@ void LineAnnotationController::reconcileGapGoalsAfterBreakEdit(
             owners.push_back(owner);
         }
     }
-    if (!owners.empty()) {
+    return !owners.empty() &&
         applySegmentInterpolationGoals(
             session, owners, vc3d::line_annotation::SegmentInterpolationGoal::Global);
+}
+
+void LineAnnotationController::refreshTailsAfterTailPolicyChange(
+    LineAnnotationSession& session,
+    bool wholeLine)
+{
+    if (session.optimizedLine.points.size() < 2 || session.controlPoints.empty()) {
+        return;
     }
+    setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+    if (session.taskState == LineAnnotationSession::TaskState::Running) {
+        // The running solve computes tails with the OLD policy or distance:
+        // refuse its wholesale publication (the epoch routes its landing
+        // through the merge, where the config flag keeps the current tails)
+        // and queue a whole-line pass instead of silently dropping the
+        // change. Dispatch stays mode-gated.
+        session.solveQueue.noteSessionMutated();
+        session.runningSolveConfigChanged = true;
+        session.solveQueue.addPending({}, true);
+        return;
+    }
+    auto* pane = paneForSurface(session.surfaceName);
+    if (!pane || !pane->dialog ||
+        pane->dialog->reoptimizationMode() !=
+            LineAnnotationDialog::ReoptimizationMode::AutoReoptimize) {
+        return;
+    }
+    if (!ensureDatasetForSession(session)) {
+        return;
+    }
+    // Tails only (every span fixed) unless work is already pending or the
+    // caller asked for the whole line: a whole-line solve subsumes the
+    // pending request at dispatch instead of landing a tails-only result
+    // with the successor still queued.
+    if (wholeLine || session.solveQueue.hasPending()) {
+        startFiberModeOptimization(session, false);
+    } else {
+        startFiberModeOptimization(session, false, std::vector<size_t>{});
+    }
+}
+
+void LineAnnotationController::refreshTailsIfPolicyChanged(
+    const std::string& surfaceName,
+    vc3d::line_annotation::OpenTailPolicy before)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session) {
+        return;
+    }
+    auto& session = *pane->session;
+    if (session.taskState == LineAnnotationSession::TaskState::Running) {
+        // A solve this edit started re-traces the tails anyway.
+        return;
+    }
+    if (vc3d::line_annotation::openTailPolicyForControls(session.controlPoints) != before) {
+        refreshTailsAfterTailPolicyChange(session, false);
+    }
+}
+
+void LineAnnotationController::handleTailConfigChanged(const std::string& surfaceName)
+{
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || !pane->session) {
+        return;
+    }
+    auto& session = *pane->session;
+    // An armed rollback snapshot was solved with the old distance: a later
+    // restore must not land as optimized.
+    if (session.controlPointCollapseRollback || session.controlPointsBeforeModeChange) {
+        session.rollbackInvalidatesOptimization = true;
+    }
+    refreshTailsAfterTailPolicyChange(session, true);
+}
+
+void LineAnnotationController::disarmRollbackSnapshots(LineAnnotationSession& session)
+{
+    session.controlPointCollapseRollback.reset();
+    session.controlPointsBeforeModeChange.reset();
+    session.rollbackInvalidatesOptimization = false;
+}
+
+void LineAnnotationController::consumeRollbackInvalidation(LineAnnotationSession& session)
+{
+    if (!session.rollbackInvalidatesOptimization) {
+        return;
+    }
+    session.rollbackInvalidatesOptimization = false;
+    setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
 }
 
 void LineAnnotationController::handleGeneratedSpanSetGap(
@@ -11362,6 +11465,13 @@ void LineAnnotationController::handleGeneratedSpanSetGap(
                   session.suppressErrorDialogs);
         return;
     }
+    // The tail policy may change here without a goal change (the far end
+    // of this span is an end control): refreshed on every exit path, also
+    // when the second end's save is refused after the first succeeded.
+    const auto policyBefore = vc3d::line_annotation::openTailPolicyForControls(session.controlPoints);
+    const auto tailRefresh = qScopeGuard([this, surfaceName, policyBefore]() {
+        refreshTailsIfPolicyChanged(surfaceName, policyBefore);
+    });
     const std::array<size_t, 2> ends{firstControlPointIndex, secondControlPointIndex};
     const auto ownersOf = [](const std::vector<std::pair<size_t, size_t>>& spans) {
         std::vector<size_t> owners;
@@ -11493,6 +11603,11 @@ void LineAnnotationController::handleGeneratedControlPointSetKollesisTermination
         return;
     }
     auto& session = *pane->session;
+    // A kollesis end's tail is a short ray: refreshed on every exit path.
+    const auto policyBefore = vc3d::line_annotation::openTailPolicyForControls(session.controlPoints);
+    const auto tailRefresh = qScopeGuard([this, surfaceName, policyBefore]() {
+        refreshTailsIfPolicyChanged(surfaceName, policyBefore);
+    });
     // One or the other: a break point cannot also be a termination. Removing
     // the tag is always allowed, so a point that somehow carries both (an
     // edited file) can be repaired from either menu item.
@@ -11522,6 +11637,12 @@ void LineAnnotationController::handleGeneratedControlPointSetBreak(
         return;
     }
     auto& session = *pane->session;
+    // A lone end break's tail is a short ray: refreshed on every exit path
+    // when no goal change started a solve.
+    const auto policyBefore = vc3d::line_annotation::openTailPolicyForControls(session.controlPoints);
+    const auto tailRefresh = qScopeGuard([this, surfaceName, policyBefore]() {
+        refreshTailsIfPolicyChanged(surfaceName, policyBefore);
+    });
     if (enabled && breakRefusedNearKollesis(session, controlPointIndex)) {
         showError(tr("Cannot tag this point as a break: a break at or next to a kollesis "
                      "termination is not allowed."),
@@ -11662,6 +11783,7 @@ bool LineAnnotationController::applySegmentInterpolationGoals(
             session.branches = std::move(*session.branchesBeforeModeChange);
             session.branchesBeforeModeChange.reset();
         }
+        consumeRollbackInvalidation(session);
         return false;
     }
     return true;
@@ -11982,7 +12104,12 @@ bool LineAnnotationController::finalizeSessionOptimizationSynchronously(
     const auto focusBoundsBase = _state ? _state->activeFocusBounds()
                                         : std::nullopt;
 
-    if (session.controlPoints.size() >= 2 || session.modelOnly) {
+    // Every session finalizes through the fiber-mode solver, a single
+    // control too (its branch regenerates the line from the control, so the
+    // open tails follow the current tail policy: rays past a lone break or
+    // a kollesis end, the ordinary tails once such a tag is removed); the
+    // asynchronous solves have always used it for one control as well.
+    if (!session.controlPoints.empty()) {
         const bool needsTrace = session.fiberOptimizationMode ==
                 vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d ||
             std::any_of(session.controlPoints.begin(), session.controlPoints.end(),
@@ -11991,11 +12118,28 @@ bool LineAnnotationController::finalizeSessionOptimizationSynchronously(
                                 control.segmentToNext->interpGoal ==
                                     vc3d::line_annotation::SegmentInterpolationGoal::Trace;
                         });
+        // A single control whose both tails are rays traces nothing, so the
+        // trace inputs are not needed for it. The model service is always
+        // ensured for a model session: its request installs the callbacks
+        // the solver requires whatever the tails do.
+        const bool rayOnly = vc3d::line_annotation::singleControlRayOnly(session.controlPoints);
+        bool solveAsLasagna = false;
         if (needsTrace && (session.modelOnly || fiberFollowEnabled())) {
             auto* pane = paneForSurface(session.surfaceName);
             if (!ensureFiberFollowService(session.suppressErrorDialogs, pane ? pane->dialog.data() : nullptr))
                 return false;
-        } else if (needsTrace &&
+        } else if (needsTrace && !rayOnly && session.controlPoints.size() == 1 &&
+                   (!session.fiberPredictionField || !session.traceNormalSampler)) {
+            // A seed placed without an inference dataset (VC3D allows that;
+            // the seed itself was a Lasagna line). The synchronous save/close
+            // path never opened a dataset picker for one control and must
+            // not start to: this one solve runs as Lasagna (tails grown or
+            // rays); the session's persisted optimization mode is untouched.
+            solveAsLasagna = true;
+            Logger()->info(
+                "Line annotation finalize: single control without trace inputs, "
+                "solving its tails as Lasagna");
+        } else if (needsTrace && !rayOnly &&
             (!ensureFiberInferenceDatasetForSession(session) ||
              !session.fiberPredictionField || !session.traceNormalSampler)) {
             return false;
@@ -12006,9 +12150,12 @@ bool LineAnnotationController::finalizeSessionOptimizationSynchronously(
         task.seedPoint = session.seedPoint;
         task.focusBoundsBase = focusBoundsBase;
         try {
+            auto request = makeFiberModeOptimizationRequest(session, false);
+            if (solveAsLasagna) {
+                request.globalMode = vc3d::line_annotation::FiberOptimizationMode::Lasagna;
+            }
             auto optimized =
-                vc3d::line_annotation::optimizeFiberWithNativeFallback(
-                    makeFiberModeOptimizationRequest(session, false));
+                vc3d::line_annotation::optimizeFiberWithNativeFallback(std::move(request));
             task.controlPoints = std::move(optimized.controlPoints);
             std::vector<cv::Vec3d> points;
             points.reserve(optimized.optimization.line.points.size());
@@ -12037,52 +12184,15 @@ bool LineAnnotationController::finalizeSessionOptimizationSynchronously(
             // failing solve restore state from before work this pass just
             // finalized (the async success path clears the same fields).
             (void)session.solveQueue.takePending();
-            session.controlPointCollapseRollback.reset();
-            session.controlPointsBeforeModeChange.reset();
+            disarmRollbackSnapshots(session);
             session.optimizedLineBeforeModeChange.reset();
             session.branchesBeforeModeChange.reset();
             session.restoreFiberOptimizationModeOnFailure = false;
         }
         return applied;
     }
-
-    std::vector<cv::Vec3d> initialLinePoints;
-    initialLinePoints.reserve(session.optimizedLine.points.size());
-    for (const auto& point : session.optimizedLine.points) {
-        initialLinePoints.push_back(point.position);
-    }
-    const auto* pane = paneForSurface(session.surfaceName);
-    const int initialCenterlineLengthVx = pane && pane->dialog
-        ? pane->dialog->initialCenterlineLengthVx()
-        : vc3d::settings::line_annotation::INITIAL_CENTERLINE_LENGTH_VX_DEFAULT;
-    OptimizationTaskResult task = optimizeLineWithSampler(session.selectedManifestPath,
-                                                          session.controlPoints,
-                                                          std::move(initialLinePoints),
-                                                          session.sourceSliceNormal,
-                                                          session.initialDirectionMode,
-                                                          initialCenterlineLengthVx,
-                                                          false,
-                                                          -1,
-                                                          -1,
-                                                          *session.normalSampler);
-    task.focusBoundsBase = focusBoundsBase;
-    const bool applied = applyOptimizationTaskResult(session,
-                                                     std::move(task),
-                                                     false,
-                                                     SessionOptimizationState::Optimized,
-                                                     "final_full_line_opt",
-                                                     fireSuccessCallback);
-    if (applied) {
-        // This synchronous whole-line solve subsumes any queued request and
-        // any armed rollback (see the multi-control branch above).
-        (void)session.solveQueue.takePending();
-        session.controlPointCollapseRollback.reset();
-        session.controlPointsBeforeModeChange.reset();
-        session.optimizedLineBeforeModeChange.reset();
-        session.branchesBeforeModeChange.reset();
-        session.restoreFiberOptimizationModeOnFailure = false;
-    }
-    return applied;
+    // Unreachable: needsFinalOptimization requires a control.
+    return true;
 }
 
 void LineAnnotationController::requestFinalizedClose(const std::string& surfaceName)
@@ -12220,6 +12330,8 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
     auto cancelFlag = session.runningSolveCancel;
     const auto focusBoundsBase = _state ? _state->activeFocusBounds()
                                         : std::nullopt;
+    const double rayTailDistanceBaseVoxels = static_cast<double>(
+        breakExtrapolationDistanceVxForPane(paneForSurface(session.surfaceName)));
     watcher->setFuture(QtConcurrent::run(&_lineSolvePool,
                                           [factory,
                                            manifestPath,
@@ -12235,7 +12347,8 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                            dataset,
                                            normalSampler,
                                            cancelFlag,
-                                           focusBoundsBase]() mutable {
+                                           focusBoundsBase,
+                                           rayTailDistanceBaseVoxels]() mutable {
         OptimizationTaskResult task;
         if (factory) {
             task = factory(manifestPath,
@@ -12259,6 +12372,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                            activeStart,
                                            activeEnd,
                                            *normalSampler,
+                                           rayTailDistanceBaseVoxels,
                                            cancelFlag.get());
         } else {
             task = optimizeLineFromManifest(manifestPath,
@@ -12271,6 +12385,7 @@ void LineAnnotationController::startOptimization(LineAnnotationSession& session,
                                             forceFullOptimization,
                                             activeStart,
                                             activeEnd,
+                                            rayTailDistanceBaseVoxels,
                                             cancelFlag.get());
         }
         task.focusBoundsBase = focusBoundsBase;
@@ -12319,6 +12434,8 @@ LineAnnotationController::makeFiberModeOptimizationRequest(
         : vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT;
     request.extrapolationDistanceBaseVoxels =
         static_cast<double>(extrapolationDistanceVx);
+    request.breakExtrapolationDistanceBaseVoxels =
+        static_cast<double>(breakExtrapolationDistanceVxForPane(pane));
     request.extrapolationFallbackCallback =
         [modelOnly = session.modelOnly](const vc3d::line_annotation::FiberExtrapolationFallbackDiagnostic& diagnostic) {
             const char* side = diagnostic.side ==
@@ -12559,6 +12676,7 @@ void LineAnnotationController::dispatchPendingSolve(const std::string& surfaceNa
         session.fiberMetricsMatchStoredFiber =
             rollback.fiberMetricsMatchStoredFiber;
         setSessionOptimizationState(session, rollback.optimizationState);
+        consumeRollbackInvalidation(session);
         // The dispatched request may have carried EARLIER edits' coalesced
         // spans too; the rollback restored a numbering they no longer fit,
         // so escalate to a whole-line request instead of dropping them (the
@@ -12587,13 +12705,18 @@ void LineAnnotationController::startFiberModeOptimization(
                             control.segmentToNext->interpGoal ==
                                 vc3d::line_annotation::SegmentInterpolationGoal::Trace;
                     });
+    // A single control whose both tails are rays (lone break, kollesis end)
+    // traces nothing: no inference inputs are needed for it. A model session
+    // always ensures its service (the request installs the callbacks the
+    // solver requires).
+    const bool rayOnly = vc3d::line_annotation::singleControlRayOnly(session.controlPoints);
     if (needsTrace && (session.modelOnly || fiberFollowEnabled())) {
         auto* tracePane = paneForSurface(session.surfaceName);
         if (!ensureFiberFollowService(session.suppressErrorDialogs,
                                       tracePane ? tracePane->dialog.data() : nullptr)) {
             return;
         }
-    } else if (needsTrace &&
+    } else if (needsTrace && !rayOnly &&
         (!ensureFiberInferenceDatasetForSession(session) ||
          !session.traceNormalSampler || !session.fiberPredictionField)) {
         return;
@@ -12626,8 +12749,10 @@ void LineAnnotationController::startFiberModeOptimization(
     session.runningSolveEditedSpans.clear();
     session.runningSolveConfigChanged = false;
     session.runningSolveCancel = std::make_shared<std::atomic<bool>>(false);
-    if (!dirtySegments) {
+    if (!dirtySegments && !globalGoalsOnly) {
         // A whole-line solve subsumes whatever partial request was pending.
+        // (A global-goals-only pass does not: it leaves explicit-goal spans
+        // alone, so the request it would swallow is re-queued below.)
         (void)session.solveQueue.takePending();
     } else if (session.solveQueue.hasPending()) {
         // A pending request recorded before this caller's own session
@@ -12733,10 +12858,14 @@ void LineAnnotationController::startFiberModeOptimization(
                     };
                 }
                 auto extrapolate = request.externalExtrapolation;
-                request.externalExtrapolation = [&, extrapolate](const auto& history, const auto& direction,
-                                                                double distance) {
+                // A ray side (lone break / kollesis end) never calls the
+                // model: with a ray head the only call is the last control's.
+                const bool headIsRay =
+                    vc3d::line_annotation::openTailPolicyForControls(request.controlPoints).headRay;
+                request.externalExtrapolation = [&, extrapolate, headIsRay](const auto& history, const auto& direction,
+                                                                           double distance) {
                     ++traceCalls;
-                    const QString end = ++tailCalls == 1 ? QObject::tr("first") : QObject::tr("last");
+                    const QString end = ++tailCalls == 1 && !headIsRay ? QObject::tr("first") : QObject::tr("last");
                     const QString operation = QObject::tr("Fiber follow: extending outward from %1 control…").arg(end);
                     traceProgress(operation);
                     try {
@@ -12967,8 +13096,7 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                 // fibers, which no local rollback can restore — an armed
                 // collapse/mode snapshot applied by a later failure would
                 // leave those links one-sided.
-                session.controlPointCollapseRollback.reset();
-                session.controlPointsBeforeModeChange.reset();
+                disarmRollbackSnapshots(session);
                 session.optimizedLineBeforeModeChange.reset();
                 session.branchesBeforeModeChange.reset();
                 session.restoreFiberOptimizationModeOnFailure = false;
@@ -13037,6 +13165,11 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
         }
         auto pending = session.solveQueue.finishSolve();
         session.detachedPendingWork = pending.requested;
+        if (pending.requested) {
+            // Work is still owed: not an optimized state, whatever the
+            // successor does (dispatched, retained in manual mode, failed).
+            setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
+        }
         const bool autoReoptimize = !pane->dialog ||
             pane->dialog->reoptimizationMode() ==
                 LineAnnotationDialog::ReoptimizationMode::AutoReoptimize;
@@ -13090,10 +13223,17 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
     // previous surfaces, so the rollback must rematerialize.
     const bool taskProducedResult = task.ok;
     session.nativeSeedTracePending = false;
+    // A landing that still owes queued work (a successor it will dispatch or
+    // retain below) is not an optimized state: it publishes as Unoptimized,
+    // so a successor that fails restores Unoptimized, a retained request
+    // keeps the autosave away, and save/close finalizes.
+    const SessionOptimizationState resultState = pendingAfterPublish.requested
+        ? SessionOptimizationState::Unoptimized
+        : session.pendingOptimizationState;
     const bool ok = applyOptimizationTaskResult(session,
                                                std::move(task),
                                                !chainNativeSeedTrace,
-                                               session.pendingOptimizationState,
+                                               resultState,
                                                {},
                                                !chainNativeSeedTrace,
                                                !chainNativeSeedTrace);
@@ -13141,6 +13281,7 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                     session.fiberOptimizationMode);
             }
         }
+        consumeRollbackInvalidation(session);
         if ((taskProducedResult || rollbackRestoredModel) &&
             !session.suppressGeneratedViews &&
             !session.optimizedLine.points.empty() &&
@@ -13154,8 +13295,7 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
             materializeGeneratedViews(session);
         }
     } else {
-        session.controlPointCollapseRollback.reset();
-        session.controlPointsBeforeModeChange.reset();
+        disarmRollbackSnapshots(session);
         session.optimizedLineBeforeModeChange.reset();
         session.branchesBeforeModeChange.reset();
         session.restoreFiberOptimizationModeOnFailure = false;
@@ -13168,6 +13308,11 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
                           session.suppressErrorDialogs);
             }
         }
+    }
+    if (pendingAfterPublish.requested) {
+        // Re-asserted after a failed apply's rollback restore, which set
+        // the snapshot's own state.
+        setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
     }
     if (pendingAfterPublish.requested &&
         session.taskState != LineAnnotationSession::TaskState::Running &&
@@ -14705,7 +14850,16 @@ LineAnnotationController::OptimizationTaskResult LineAnnotationController::runOp
                                     initialCenterlineLengthVx,
                                     forceFullOptimization,
                                     activeStart,
-                                    activeEnd);
+                                    activeEnd,
+                                    breakExtrapolationDistanceVxFromSettings());
+}
+
+int LineAnnotationController::breakExtrapolationDistanceVxForPane(const PaneRecord* pane) const
+{
+    if (pane && pane->dialog) {
+        return pane->dialog->breakExtrapolationDistanceVx();
+    }
+    return breakExtrapolationDistanceVxFromSettings();
 }
 
 void LineAnnotationController::loadFibersForCurrentPackage()
@@ -16032,7 +16186,8 @@ void LineAnnotationController::optimizeAndSaveFiberHeadless(
         [request = std::move(request),
          externalExtrapolation = std::move(tracerTemplate.externalExtrapolation),
          externalSegment = std::move(tracerTemplate.externalSegment),
-         fiberFollowExtrapolation]() mutable {
+         fiberFollowExtrapolation,
+         breakExtrapolation = static_cast<double>(breakExtrapolationDistanceVxFromSettings())]() mutable {
             HeadlessResult output;
             try {
                 vc::lasagna::LineOptimizationConfig config;
@@ -16089,6 +16244,7 @@ void LineAnnotationController::optimizeAndSaveFiberHeadless(
                     vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d;
                 fiberRequest.retainOpenTails = false;
                 fiberRequest.extrapolationDistanceBaseVoxels = 0.0;
+                fiberRequest.breakExtrapolationDistanceBaseVoxels = breakExtrapolation;
                 if (externalSegment) {
                     fiberRequest.externalExtrapolation = std::move(externalExtrapolation);
                     fiberRequest.externalSegment = std::move(externalSegment);

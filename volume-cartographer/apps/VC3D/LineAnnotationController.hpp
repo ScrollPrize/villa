@@ -788,9 +788,35 @@ private:
     // After a break tag edit: the gap spans that formed take the cubic-spline
     // goal, those that dissolved while still cspline return to global, each
     // through applySegmentInterpolationGoals.
-    void reconcileGapGoalsAfterBreakEdit(LineAnnotationSession& session,
+    // Returns whether it started a re-solve.
+    bool reconcileGapGoalsAfterBreakEdit(LineAnnotationSession& session,
                                          const std::vector<size_t>& gapOwnersBefore,
                                          bool enabled);
+    // The session's open-tail policy (lone end breaks, kollesis ends) or the
+    // tail distances changed and no solve covers it yet: mark Unoptimized and,
+    // in auto mode, re-trace the tails (a tails-only solve, or a whole-line
+    // one when work is already pending); a running solve is superseded and a
+    // whole-line pass queued. Shared by the tag handlers' scope guards and
+    // the menu rows' Apply (handleTailConfigChanged).
+    void refreshTailsAfterTailPolicyChange(LineAnnotationSession& session, bool wholeLine);
+    // Scope-guard body of the tag handlers: after the edit (on every exit
+    // path, including a refused second end of the span menu), when the
+    // policy differs from `before` and no solve was started, refresh.
+    void refreshTailsIfPolicyChanged(const std::string& surfaceName,
+                                     vc3d::line_annotation::OpenTailPolicy before);
+    // Extrapolation / Break extrapolation Apply: a solver-input change that
+    // also invalidates an armed rollback snapshot's geometry.
+    void handleTailConfigChanged(const std::string& surfaceName);
+    // Rollback snapshot bookkeeping: every site that drops the snapshots on
+    // success clears the invalidation flag; every site that RESTORES one
+    // consumes it after the restore (Unoptimized instead of the snapshot's
+    // state when a mirrored tag edit or a tail-distance change made the
+    // snapshot's tails or goals stale).
+    void disarmRollbackSnapshots(LineAnnotationSession& session);
+    void consumeRollbackInvalidation(LineAnnotationSession& session);
+    // The ray length for a pane: the dialog's applied value, else the
+    // persisted setting (inspection panes, headless paths).
+    [[nodiscard]] int breakExtrapolationDistanceVxForPane(const PaneRecord* pane) const;
     // The span menu captured its two controls before a nested event loop; a
     // solve landing meanwhile can reorder the session. A span action runs
     // only if the two are still neighbours in line-position order.
