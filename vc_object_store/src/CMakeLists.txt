@@ -16,6 +16,7 @@ add_library(vc_objects STATIC
     Database.cpp
     Transactions.cpp
     History.cpp
+    Lifecycle.cpp
     Records.cpp
     Metadata.cpp
     SourcePaths.cpp

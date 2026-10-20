@@ -94,7 +94,7 @@ void bindGraphReadView(nb::module_& m) {
             self.require();
             std::vector<vo::ObjectRecord> records;
             if (!self.graph->objectUuids.empty()) {
-                vo::ObjectSelection selection; selection.uuids = self.graph->objectUuids;
+                vo::ObjectSelection selection; selection.includeRetired = true; selection.uuids = self.graph->objectUuids;
                 nb::gil_scoped_release release;
                 records = self.store->selectObjects(*self.txn, selection, fields);
             }
@@ -107,7 +107,7 @@ void bindGraphReadView(nb::module_& m) {
         }, nb::arg("fields") = std::nullopt)
         .def("edges", [](PyGraphReadView& self, const std::optional<std::vector<std::string>>& fields) {
             self.require();
-            vo::EdgeSelection selection; selection.uuids = self.graph->edgeUuids;
+            vo::EdgeSelection selection; selection.includeRetired = true; selection.uuids = self.graph->edgeUuids;
             std::vector<vo::EdgeRecord> records;
             { nb::gil_scoped_release release; records = self.store->selectEdges(*self.txn, selection, fields); }
             const std::set<std::string> projection = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};

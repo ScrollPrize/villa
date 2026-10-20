@@ -4,12 +4,13 @@ namespace vc::objects {
 using namespace detail;
 std::vector<std::string> ObjectStore::neighbours(const Txn& txn, const std::string& objectUuid,
                                              const std::optional<std::string>& edgeKind,
-                                             const std::optional<std::string>& neighbourKind) const
+                                             const std::optional<std::string>& neighbourKind, bool includeRetired) const
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
     const auto id = objectIdByUuid(db, parseUuid(objectUuid));
     if (!id) throw std::runtime_error("object store: object not found: " + objectUuid);
-    const std::string filter = edgeKind ? " AND kind=?2" : "";
+    const std::string filter = (edgeKind ? std::string(" AND kind=?2") : "") +
+        (includeRetired ? "" : " AND " + activeEdgeSql(db));
     // Order by the first incident edge, as edgesOf() did, without hydrating edges.
     std::string sql = "SELECT o.uuid FROM (SELECT id,b_id AS neighbour FROM edges INDEXED BY edges_a WHERE a_id=?1" + filter +
         " UNION SELECT id,a_id AS neighbour FROM edges INDEXED BY edges_b WHERE b_id=?1" + filter +
@@ -33,7 +34,7 @@ struct ProgressGuard {
 };
 
 std::vector<int64_t> traverse(sqlite3* db, const std::string& startUuid, int maxDepth,
-                                  const std::vector<std::string>& edgeKindFilter, const std::atomic_bool* cancel)
+                                  const std::vector<std::string>& edgeKindFilter, const std::atomic_bool* cancel, bool includeRetired)
 {
     auto checkCancelled = [&] {
         if (cancel && cancel->load())
@@ -48,6 +49,11 @@ std::vector<int64_t> traverse(sqlite3* db, const std::string& startUuid, int max
     const auto startBytes = parseUuid(startUuid);
     if (!objectIdByUuid(db, startBytes))
         throw std::runtime_error("object store: object not found: " + startUuid);
+    if (!includeRetired) {
+        Statement active(db, "SELECT 1 FROM objects WHERE uuid=? AND " + activeObjectSql(db, "objects.id"));
+        active.bindBlob(1, startBytes);
+        if (!active.row()) return {};
+    }
     // Probe the endpoint indexes only for nodes reached by this traversal.
     // Visit neighbours in stable internal-ID order.
     std::string filter;
@@ -57,6 +63,7 @@ std::vector<int64_t> traverse(sqlite3* db, const std::string& startUuid, int max
             filter += (i ? ",?" : "?") + std::to_string(i + 2);
         filter += ")";
     }
+    if (!includeRetired) filter += " AND " + activeEdgeSql(db);
     // Each UNION arm uses an endpoint-leading index even without ANALYZE.
     std::string sql = "SELECT id,b_id FROM edges INDEXED BY edges_a WHERE a_id=?1" + filter +
         " UNION SELECT id,a_id FROM edges INDEXED BY edges_b WHERE b_id=?1" + filter + " ORDER BY id";
@@ -103,14 +110,14 @@ std::vector<std::string> uuidList(sqlite3* db, const std::vector<int64_t>& ids)
 }  // namespace
 
 std::vector<int64_t> detail::componentIds(sqlite3* db, const std::string& start,
-                                        const std::vector<std::string>& kinds)
+                                        const std::vector<std::string>& kinds, bool includeRetired)
 {
     StatementPool* pool = nullptr;
     if (auto it = activeStatementPools.find(db); it != activeStatementPools.end() && it->second->readSnapshot)
         pool = it->second;
-    const auto key = nlohmann::json({formatUuid(parseUuid(start)), kinds}).dump();
+    const auto key = nlohmann::json({formatUuid(parseUuid(start)), kinds, includeRetired}).dump();
     if (pool) if (auto it = pool->components.find(key); it != pool->components.end()) return it->second;
-    auto ids = traverse(db, start, INT_MAX, kinds, nullptr);
+    auto ids = traverse(db, start, INT_MAX, kinds, nullptr, includeRetired);
     // Bound the transaction-local membership cache; never reuse across snapshots.
     if (pool && ids.size() <= 262144) {
         if (pool->componentNodes + ids.size() > 262144) { pool->components.clear(); pool->componentNodes = 0; }
@@ -122,20 +129,20 @@ std::vector<int64_t> detail::componentIds(sqlite3* db, const std::string& start,
 
 std::vector<std::string> ObjectStore::componentOf(const Txn& txn, const std::string& objectUuid,
                                               const std::vector<std::string>& edgeKindFilter,
-                                              const std::atomic_bool* cancel) const
+                                              const std::atomic_bool* cancel, bool includeRetired) const
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
-    return uuidList(db, cancel ? traverse(db, objectUuid, INT_MAX, edgeKindFilter, cancel)
-                              : componentIds(db, objectUuid, edgeKindFilter));
+    return uuidList(db, cancel ? traverse(db, objectUuid, INT_MAX, edgeKindFilter, cancel, includeRetired)
+                              : componentIds(db, objectUuid, edgeKindFilter, includeRetired));
 }
 
 std::vector<std::string> ObjectStore::reachableWithin(const Txn& txn, const std::string& objectUuid, int maxDepth,
                                                   const std::vector<std::string>& edgeKindFilter,
-                                                  const std::atomic_bool* cancel) const
+                                                  const std::atomic_bool* cancel, bool includeRetired) const
 {
     if (maxDepth < 0) throw std::runtime_error("object store: maxDepth must be >= 0");
     auto* db = static_cast<sqlite3*>(connection(txn));
-    return uuidList(db, traverse(db, objectUuid, maxDepth, edgeKindFilter, cancel));
+    return uuidList(db, traverse(db, objectUuid, maxDepth, edgeKindFilter, cancel, includeRetired));
 }
 
 GraphReadView ObjectStore::graphReadView(const Txn& txn, const ObjectSelection& objects,
@@ -159,6 +166,7 @@ GraphReadView ObjectStore::graphReadView(const Txn& txn, const ObjectSelection& 
             std::optional(formatUuid(objectsQuery->blob16(3))));
     }
     auto selection = edges; selection.bothEndpoints = true;
+    selection.includeRetired = objects.includeRetired;
     auto links = edgeSelectionQuery(db, selection, "uuid,a_id,b_id", ids);
     while (links->row()) {
         result.edgeUuids.push_back(formatUuid(links->blob16(0)));

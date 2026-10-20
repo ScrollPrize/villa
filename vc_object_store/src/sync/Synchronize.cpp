@@ -15,13 +15,13 @@ std::string hash(const std::string& text) {
     return detail::geometryHash(std::span(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
 }
 Json snapshot(ObjectStore& store, const Txn& txn) {
-    const auto exported = Json::parse(store.exportJson(txn));
+    // Synchronization includes retired objects and dormant relationships, and
+    // uses the same representation as incremental reads.
+    Statement rows(ObjectStoreImplAccess::conn(txn), "SELECT uuid FROM objects UNION SELECT uuid FROM edges ORDER BY uuid");
     auto result = Json::object();
-    for (const auto* type : {"objects", "edges"}) for (auto record : exported.at(type)) {
-        record["record_type"] = type;
-        if (record.contains("geometry_bindings")) record["geometry_bindings"].erase("stale");
-        const auto id = record.at("uuid").get<std::string>();
-        result[id] = std::move(record);
+    while (rows.row()) {
+        const auto id = formatUuid(rows.blob16(0));
+        result[id] = syncRecord(store, txn, id);
     }
     return result;
 }
@@ -69,6 +69,8 @@ void applyHeadsAndEdges(ObjectStore& store, WriteTxn& txn, const Json& before, c
         addEdgeImpl(db, store.author(), store.hostname(), edge, true, "sync");
         const auto actual = *store.edgeByUuid(txn, id);
         const bool swap = actual.aUuid != edge.aUuid;
+        const auto epochs = record.value("lifecycle_bindings", Json::object());
+        bindLifecycle(db, actual, epochs.value(swap ? "b" : "a", ""), epochs.value(swap ? "a" : "b", ""));
         const auto bindings = record.value("geometry_bindings", Json::object());
         const auto a = bindings.value(swap ? "b" : "a", Json()), b = bindings.value(swap ? "a" : "b", Json());
         Statement put(db, "UPDATE edge_geometry_bindings SET a_revision=?,b_revision=? WHERE edge_id=(SELECT id FROM edges WHERE uuid=?)");
@@ -147,7 +149,9 @@ SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& option
                 // Metadata-only edits need no graph walk. Endpoint deletions or
                 // geometry changes must check even unchanged incident edges.
                 if (changed.contains(id) && (object(l) || object(r) || object(b)) &&
-                    (l.is_null() || r.is_null() || head(l) != head(b) || head(r) != head(b))) {
+                    (l.is_null() || r.is_null() || head(l) != head(b) || head(r) != head(b) ||
+                     l.value("lifecycle_epoch", "") != (b.is_object() ? b.value("lifecycle_epoch", "") : "") ||
+                     r.value("lifecycle_epoch", "") != (b.is_object() ? b.value("lifecycle_epoch", "") : ""))) {
                     for (auto* db : {localDb, remoteDb}) {
                         Statement edges(db, "SELECT uuid FROM edges WHERE a_id=(SELECT id FROM objects WHERE uuid=?1) "
                                             "OR b_id=(SELECT id FROM objects WHERE uuid=?1)");

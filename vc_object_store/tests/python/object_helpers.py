@@ -23,6 +23,8 @@ def remove_spatial_schema(sql):
 
 def remove_history_schema(sql):
     """Make a real pre-v9 fixture before lowering PRAGMA user_version."""
+    for table in ("edge_lifecycle_bindings", "object_lifecycle"):
+        sql.execute(f"DROP TABLE IF EXISTS {table}")
     for name, in sql.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE '%_history_%'").fetchall():
         sql.execute(f'DROP TRIGGER "{name}"')
     for table in ("object_relationship_deltas", "object_relationship_heads",

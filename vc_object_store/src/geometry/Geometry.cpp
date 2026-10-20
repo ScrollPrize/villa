@@ -62,7 +62,7 @@ int64_t revisionPatchTileSize(const Txn& txn, const GeometryRevision& revision)
 std::vector<EdgeRecord> affectedEdges(const ObjectStore& store, const Txn& txn, const std::string& objectUuid,
     const std::optional<GeometryRevision>& current, const detail::DependencyGeometry& after)
 {
-    const auto edges = store.edgesOf(txn, objectUuid);
+    const auto edges = store.edgesOf(txn, objectUuid, true);
     if (edges.empty()) return {};
     const auto before = current ? std::optional(detail::dependencyGeometry(store, txn, *current)) : std::nullopt;
     std::vector<EdgeRecord> result;

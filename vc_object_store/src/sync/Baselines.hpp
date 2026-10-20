@@ -70,6 +70,11 @@ void changedRecords(sqlite3* db, SyncCursor after, std::set<std::string>& ids) {
 Json syncRecord(ObjectStore& store, const Txn& txn, const std::string& id) {
     if (const auto object = store.objectByUuid(txn, id)) {
         auto record = objectToJson(*object); record["record_type"] = "objects";
+        // Keep pre-lifecycle records byte-compatible with retained v9 sync
+        // baselines; absent fields have exactly these defaults.
+        if (!object->retired && object->lifecycleEpoch.empty()) {
+            record.erase("retired"); record.erase("lifecycle_epoch");
+        }
         if (const auto geometry = store.currentGeometry(txn, id))
             record["geometry"] = {{"revision_uuid", geometry->uuid}, {"content_hash", geometry->contentHash}};
         return record;
@@ -81,6 +86,10 @@ Json syncRecord(ObjectStore& store, const Txn& txn, const std::string& id) {
         binding.bindBlob(1, parseUuid(id));
         if (!binding.row()) throw std::runtime_error("sync: missing edge geometry binding");
         const bool swap = record["a"] != edge->aUuid;
+        const auto epochs = lifecycleBinding(ObjectStoreImplAccess::conn(txn), *edge);
+        if (!epochs.first.empty() || !epochs.second.empty())
+            record["lifecycle_bindings"] = {{"a", swap ? epochs.second : epochs.first},
+                                             {"b", swap ? epochs.first : epochs.second}};
         auto revision = [&](int column) -> Json { return binding.isNull(column) ? Json() : Json(formatUuid(binding.blob16(column))); };
         record["geometry_bindings"] = {{"a", revision(swap ? 1 : 0)}, {"b", revision(swap ? 0 : 1)}};
         return record;

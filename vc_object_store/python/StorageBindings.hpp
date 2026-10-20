@@ -161,6 +161,8 @@ nb::dict objectToPy(const vo::ObjectRecord& r, const std::set<std::string>* fiel
     auto include = [&](const char* name) { return !fields || fields->contains(name); };
     nb::dict d;
     commonToPy(d, r, fields);
+    if (include("retired")) d["retired"] = r.retired;
+    if (include("lifecycle_epoch")) d["lifecycle_epoch"] = r.lifecycleEpoch;
     if (include("name")) d["name"] = r.name;
     if (include("format_version")) d["format_version"] = r.formatVersion;
     if (include("storage_kind")) d["storage_kind"] = r.storageKind;

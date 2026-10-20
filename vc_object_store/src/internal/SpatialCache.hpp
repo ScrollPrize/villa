@@ -27,13 +27,21 @@ inline SpatialRegion readSpatialRegion(const Statement& rows)
 class ResidentSpatialIndex {
     std::vector<SpatialRegion> regions_;
     BoundsIndex bounds_;
+    std::set<std::string> retired_;
 public:
     bool load(sqlite3* db, size_t budget) {
+        if (pragmaInt(db, "user_version") >= 10) {
+            Statement states(db, "SELECT uuid FROM objects JOIN object_lifecycle lc ON lc.object_id=objects.id WHERE lc.retired=1");
+            while (states.row()) {
+                retired_.insert(formatUuid(states.blob16(0)));
+                if (retired_.size() > budget / 128) return false;
+            }
+        }
         Statement rows(db, std::string("SELECT ") + regionColumns +
             " FROM spatial_regions b JOIN objects o ON o.id=b.object_id "
             "JOIN object_bounds h ON h.object_id=b.object_id "
             "WHERE b.array_name!='' OR h.revision_uuid IS NULL");
-        size_t dynamic = sizeof(*this) + 256;
+        size_t dynamic = sizeof(*this) + 256 + retired_.size() * 128;
         while (rows.row()) {
             auto r = readSpatialRegion(rows);
             // Charge actual descriptor capacities, allocation overhead, and an
@@ -66,6 +74,7 @@ public:
         std::vector<size_t> hits;
         if(selection.limit != 0) bounds_.query(*selection.bbox,[&](size_t index){
             const auto& r=regions_[index];
+            if (!selection.includeRetired && retired_.contains(r.objectUuid)) return;
             if(selection.kind && r.kind!=*selection.kind)return;
             if(!uuids.empty()&&!std::binary_search(uuids.begin(),uuids.end(),r.objectUuid))return;
             hits.push_back(index);

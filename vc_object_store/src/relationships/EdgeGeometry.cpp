@@ -29,6 +29,9 @@ void ObjectStore::repairEdgeGeometry(WriteTxn& txn, const EdgeGeometryRepair& re
     a = normalized.aAnchor; b = normalized.bAnchor;
     const auto state = edgeGeometryState(txn, repair.edgeUuid);
     if (state.aRevision == aRevision && state.bRevision == bRevision && a == edge->aAnchor && b == edge->bAnchor) {
+        if (!lifecycleBindingMatches(db, *edge))
+            stampContentChange(db, author(), hostname(), "edges", *edgeIdByUuid(db, parseUuid(edge->uuid)),
+                               parseUuid(edge->uuid), "lifecycle_revalidated");
         recordRelationshipValidation(db, *edge);
         return;
     }

@@ -37,6 +37,9 @@ void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
     rec.tags.erase(std::unique(rec.tags.begin(), rec.tags.end()), rec.tags.end());
     if (rec.aAnchor == existing->aAnchor && rec.bAnchor == existing->bAnchor &&
         rec.tags == existing->tags && nlohmann::json::parse(rec.meta) == nlohmann::json::parse(existing->meta)) {
+        if (!lifecycleBindingMatches(db, rec))
+            stampContentChange(db, author(), hostname(), "edges", *edgeIdByUuid(db, parseUuid(rec.uuid)),
+                               parseUuid(rec.uuid), "lifecycle_revalidated");
         recordRelationshipValidation(db, rec);
         return;
     }
@@ -77,21 +80,23 @@ void ObjectStore::removeEdge(WriteTxn& txn, const std::string& uuid)
     savepoint.release();
 }
 
-std::vector<EdgeRecord> ObjectStore::edgesOf(const Txn& txn, const std::string& objectUuid) const
+std::vector<EdgeRecord> ObjectStore::edgesOf(const Txn& txn, const std::string& objectUuid, bool includeRetired) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     auto id = objectIdByUuid(db, parseUuid(objectUuid));
     if (!id) throw std::runtime_error("object store: object not found: " + objectUuid);
-    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE a_id=? OR b_id=? ORDER BY id");
+    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE (a_id=? OR b_id=?)" +
+        (includeRetired ? std::string() : " AND " + activeEdgeSql(db)) + " ORDER BY id");
     s.bind(1, *id);
     s.bind(2, *id);
     return readEdgeRows(db, s);
 }
 
-std::vector<EdgeRecord> ObjectStore::edgesByKind(const Txn& txn, const std::string& edgeKind) const
+std::vector<EdgeRecord> ObjectStore::edgesByKind(const Txn& txn, const std::string& edgeKind, bool includeRetired) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
-    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE kind=? ORDER BY id");
+    Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE kind=?" +
+        (includeRetired ? std::string() : " AND " + activeEdgeSql(db)) + " ORDER BY id");
     s.bind(1, edgeKind);
     return readEdgeRows(db, s);
 }
@@ -103,6 +108,7 @@ std::unique_ptr<Statement> detail::edgeSelectionQuery(sqlite3* db, const EdgeSel
     const bool candidates = endpointIds || selection.endpointUuids || selection.uuids || selection.tag;
     std::string sql = "SELECT " + columns + " FROM edges" +
         (candidates ? " NOT INDEXED" : "") + " WHERE 1";
+    if (!selection.includeRetired) sql += " AND " + activeEdgeSql(db);
     std::vector<std::string> parameters;
     auto parameter = [&](const std::string& value) {
         parameters.push_back(value);

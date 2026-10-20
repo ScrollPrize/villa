@@ -4,6 +4,14 @@
 
 namespace vc::objects::detail {
 extern const char* kObjectCols;
+void createLifecycleSchema(sqlite3*);
+void readLifecycle(sqlite3*, int64_t id, ObjectRecord&);
+void writeLifecycle(sqlite3*, int64_t id, const ObjectRecord&);
+std::string activeObjectSql(sqlite3*, const std::string& id);
+std::string activeEdgeSql(sqlite3*);
+std::pair<std::string, std::string> lifecycleBinding(sqlite3*, const EdgeRecord&);
+bool lifecycleBindingMatches(sqlite3*, const EdgeRecord&);
+void bindLifecycle(sqlite3*, const EdgeRecord&, const std::string& aEpoch, const std::string& bEpoch);
 // Shared selection semantics for records and compact graph topology.
 std::unique_ptr<Statement> objectSelectionQuery(sqlite3* db, const ObjectSelection& selection,
                                                const std::string& columns);

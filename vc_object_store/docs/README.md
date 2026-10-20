@@ -200,7 +200,8 @@ mutators and requires the same relationship decisions. Domain-specific validity
 remains the application's decision; the store validates declared dependencies
 and anchor identities.
 
-Writable opens migrate schema v8 to v9 atomically. Pre-v9 annotations were mutable,
+Writable opens migrate older schemas atomically, including the v9 history and
+v10 lifecycle tables. Pre-v9 annotations were mutable,
 so migration cannot recover their original historical values. Migration baselines
 are marked `metadata_complete=False`, including detached baselines needed to
 preserve stale geometry bindings. Those detached baselines have no publication
@@ -212,6 +213,112 @@ peer's historical metadata/graph timeline. An incoming binding to older geometry
 without matching local object history receives the same explicitly incomplete,
 untimed baseline. Use a database copy when the complete original timeline must
 be transported.
+
+## Retirement, restoration, and retained references
+
+Schema v10 adds library-managed `retired` and `lifecycle_epoch` fields to object
+records. They are ordinary immutable revision content, backed by an indexed
+current lifecycle table. They cannot be changed through `upsert_object` or
+ordinary `meta` fields. Writable opens migrate older stores atomically without
+rewriting geometry or old history. Read-only access to older schemas retains its
+existing behavior; retirement requires a writable migrated store.
+
+Use a checked action for lifecycle changes, including every modified object and
+all endpoints used for relationship decisions:
+
+```python
+observed = {u: store.current_object_revision(u)["uuid"] for u in (source, target)}
+with store.write(expected_revisions=observed) as tx:
+    tx.retire_object(source)
+    tx.keep_recorded_relationship(edge_uuid)
+
+observed = {u: store.current_object_revision(u)["uuid"] for u in (source, target)}
+with store.write(expected_revisions=observed) as tx:
+    tx.restore_object(source)
+    tx.keep_recorded_relationship(edge_uuid)  # preserve the old pins, still inactive
+    # Instead, retain_relationship(edge_uuid) explicitly validates a current link.
+```
+
+C++ provides `retireObject(WriteTxn&, uuid)` and
+`restoreObject(WriteTxn&, uuid, optionalSourceRevision)`. Retirement preserves
+identity, geometry, metadata, and recorded links. Restoration publishes new
+history with the metadata and geometry of the last active revision, or of the
+explicit active `source_revision` belonging to that object. Creation stamps stay
+unchanged; content generation advances and approval resets normally. Changes
+made while retired remain in history; default restoration returns to the last
+active content. Already-retired retirement and already-active default restoration
+are no-ops. Direct UUID lookup, geometry reads, and historical reads remain
+available. Restoring a physically removed live row is not supported.
+
+Each transition requires explicit decisions for all remaining incident edges,
+including already inactive ones. Call `keep_recorded_relationship`,
+`retain_relationship`, or `update_edge` after endpoint edits, or `remove_edge`
+within the action. Commit checks decisions against the final state. Removed
+edges stay removed; selecting historical object content does not resurrect a
+shared edge or overwrite another endpoint's history. Recreate desired links
+explicitly with `add_edge`, or validate surviving links. Stale expectations,
+missing participants, and missing decisions roll back the whole action, including
+new objects and geometry. Source retirement can therefore accompany a merge or
+split assembled with existing geometry mutators; this adds no structural-edit API.
+
+A lifecycle epoch changes on retirement/restoration. Preserved relationships keep
+their pinned epochs, so restoration does not silently reactivate them even when
+geometry is identical. An explicit revalidation publishes a shared relationship
+revision and a journal-visible change. Historical selections before retirement
+continue to resolve and evaluate their original relationships. Retired selected
+endpoints are always inapplicable to current use. Lifecycle-only changes reuse
+geometry references without decoding, copying, or hashing payloads. Restoring
+different historical geometry reuses immutable storage but rebuilds the current
+spatial index, which can read the selected geometry.
+
+Current catalogs, counts, kind/tag selections, spatial regions (SQL and resident
+cache), neighbours, connected selections, traversal, edge queries, graph views,
+and metadata exports exclude retired objects by default. Traversal cannot pass
+through a retired node. Edges with retired endpoints or incompatible lifecycle
+epochs are excluded too. Use `include_retired=True` for explicit inspection;
+on edge/traversal/graph queries this also exposes dormant recorded links, **not**
+a claim of applicability. C++ selections have `includeRetired`; convenience
+queries take a trailing boolean. `object(uuid)`, `edge(uuid)`, and C++ direct UUID
+lookups always return existing records regardless of lifecycle. The current
+record APIs still do not replace `relationships_at` for all geometry and metadata
+dependency checks.
+
+`revision_selection_at` and `revision_read_view_at` exclude objects retired at
+the requested time; `include_retired=True` includes their selected retired
+revisions. Explicit `revision_read_view(selection)` includes exactly the selected
+objects. Recorded references always resolve their pinned revisions regardless
+of today's visibility.
+
+Represent a reference stored conceptually in an application metadata field by
+registering an ordinary edge with kind `declared_reference`, endpoints identifying
+the referencing and referenced objects, and `meta` describing the application
+field and role. Use `whole_geometry=True` on each anchor for an object-wide
+reference, or normal point/channel dependencies for a narrower reference. These
+are shared edges with normal revision pins and explicit lifecycle decisions;
+endpoint order is canonicalized, so record any directional role explicitly in
+edge metadata. Graph-like objects register each referenced object as an endpoint
+of one of these edges. No separate untracked JSON-reference format is promised.
+Arbitrary UUID strings in metadata are **not** declared references and do not
+block deletion or create graph membership. Current and retained historical
+`declared_reference` edges remain readable through the ordinary history APIs.
+
+`delete_object` still only removes an eligible live row while preserving history;
+managed geometry and current edge foreign-key restrictions remain unchanged.
+It is not a purge and is not made more permissive here. There is no history or
+payload purge API: lack of current edges does not authorize removing the object's
+own revisions, historical references, undo content, or shared payloads. A future
+retention operation must account for all retained relationship versions,
+including declared-reference edges, before any physical purge.
+
+Synchronization carries current lifecycle state and lifecycle relationship
+bindings, preserving dormant links on existing and fresh replicas. It still does
+not transport the complete peer timeline. Missing historical lifecycle pins get
+explicitly incomplete, untimed baselines, as older geometry pins do. Default
+restoration uses only published active revisions, never detached reference
+baselines. A fresh replica of a retired object can lack its last active revision;
+restore on the originating replica and synchronize, or copy its full database.
+Metadata-only JSON import rejects lifecycle-bearing exports: use synchronization for state
+transfer or a database copy for a complete timeline.
 
 ## Volume identity and coordinate scale
 

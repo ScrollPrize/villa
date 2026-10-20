@@ -353,6 +353,9 @@ def test_oldest_schema_upgrade_preserves_geometry_queries_and_sync(pair):
     for kind, records in state(a).items():
         for record in records:
             record["record_type"] = kind
+            # A schema-v2 snapshot predates library-managed lifecycle state.
+            record.pop("retired", None)
+            record.pop("lifecycle_epoch", None)
             if "geometry_bindings" in record:
                 record["geometry_bindings"].pop("stale", None)
             legacy[record["uuid"]] = record
@@ -384,7 +387,7 @@ def test_oldest_schema_upgrade_preserves_geometry_queries_and_sync(pair):
         assert a.synchronize(b)["applied"]
         assert state(a) == state(b)
         with sqlite3.connect(a.path) as sql:
-            assert sql.execute("PRAGMA user_version").fetchone()[0] == 9
+            assert sql.execute("PRAGMA user_version").fetchone()[0] == 10
             assert sql.execute("SELECT count(*) FROM sync_baseline_records").fetchone()[0] == 1
         a.set_approval(uid, "approved")
         assert a.synchronize(b)["applied"]

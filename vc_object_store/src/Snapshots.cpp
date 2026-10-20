@@ -37,6 +37,8 @@ std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& opt
     }
     std::string members = "SELECT e.id FROM json_each(?1) selected CROSS JOIN edges e INDEXED BY edges_a "
         "WHERE e.a_id=selected.value AND e.b_id IN (SELECT value FROM json_each(?1))";
+    if (!options.selection.includeRetired)
+        members += " AND e.id IN (SELECT id FROM edges WHERE " + activeEdgeSql(db) + ")";
     if (!options.selection.edgeKinds.empty()) members += " AND e.kind IN (SELECT value FROM json_each(?2))";
     Statement states(db, "SELECT e.uuid,b.a_revision,b.b_revision,ha.revision_uuid,hb.revision_uuid FROM edges e "
         "LEFT JOIN edge_geometry_bindings b ON b.edge_id=e.id "
@@ -81,8 +83,11 @@ void ObjectStore::importJson(WriteTxn& txn, const std::string& jsonText)
     if (version != 2)
         throw std::runtime_error("object store: unsupported export version");
     if (root.value("projected", false)) throw std::runtime_error("projected exports are for inspection, not import");
-    for (const auto& object : root.at("objects"))
+    for (const auto& object : root.at("objects")) {
         if (object.contains("geometry")) throw std::runtime_error("metadata export references stored geometry; use synchronize to transfer it");
+        if (object.value("retired", false) || !object.value("lifecycle_epoch", "").empty())
+            throw std::runtime_error("metadata export contains lifecycle state; use synchronize to preserve relationship bindings");
+    }
     // A failed import must not leave half a snapshot, even if the caller
     // catches the error and commits other work in its enclosing transaction.
     Savepoint savepoint(db);

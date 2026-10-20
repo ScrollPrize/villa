@@ -58,6 +58,8 @@ void commonFromJson(const nlohmann::json& j, RecordCommon& r)
 nlohmann::json objectToJson(const ObjectRecord& r, const std::set<std::string>* fields)
 {
     nlohmann::json j = commonToJson(r, fields);
+    if (includeField(fields, "retired")) j["retired"] = r.retired;
+    if (includeField(fields, "lifecycle_epoch")) j["lifecycle_epoch"] = r.lifecycleEpoch;
     if (includeField(fields, "name")) j["name"] = r.name;
     if (includeField(fields, "format_version")) j["format_version"] = r.formatVersion;
     if (includeField(fields, "storage_kind")) j["storage_kind"] = r.storageKind;
@@ -89,6 +91,8 @@ ObjectRecord objectFromJson(const nlohmann::json& j)
     r.uuid = j.value("uuid", "");
     r.kind = j.value("kind", "");
     r.name = j.value("name", "");
+    r.retired = j.value("retired", false);
+    r.lifecycleEpoch = j.value("lifecycle_epoch", "");
     r.formatVersion = j.value("format_version", int64_t(0));
     r.storageKind = j.value("storage_kind", "");
     r.storageRef = j.value("storage_ref", "");

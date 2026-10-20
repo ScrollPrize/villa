@@ -36,10 +36,11 @@ SelectionFilter objectFilter(sqlite3* db, const ObjectSelection& selection)
     for (const auto& uuid : selection.uuids)
         if (const auto id = objectIdByUuid(db, parseUuid(uuid))) selected.insert(*id);
     if (selection.connectedTo) {
-        const auto ids = componentIds(db, *selection.connectedTo, selection.edgeKinds);
+        const auto ids = componentIds(db, *selection.connectedTo, selection.edgeKinds, selection.includeRetired);
         connected.insert(ids.begin(), ids.end());
     }
     SelectionFilter filter;
+    if (!selection.includeRetired) filter.sql = " AND " + activeObjectSql(db, "o.id");
     auto bind = [&](const std::string& clause, const std::string& value) {
         filter.sql += clause; filter.parameters.push_back(value);
     };

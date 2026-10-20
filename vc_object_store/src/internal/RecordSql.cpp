@@ -22,7 +22,7 @@ std::string projectedObjectColumns(const ObjectFields& fields)
         {"approved_host", "NULL"}, {"approved_generation", "NULL"}, {"format_version", "0"},
         {"storage_kind", "''"}, {"storage_ref", "''"}, {"data_generation", "0"},
         {"data_checksum", "NULL"}, {"meta", "'{}'"}};
-    std::set<std::string> valid{"tags", "fiber", "patch", "track"};
+    std::set<std::string> valid{"tags", "fiber", "patch", "track", "retired", "lifecycle_epoch"};
     std::string sql = "id";
     for (const auto& [name, fallback] : columns) {
         valid.insert(name);
@@ -141,6 +141,7 @@ ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details)
     rec.dataGeneration = s.i64(19);
     rec.dataChecksum = s.optText(20);
     rec.meta = s.text(21);
+    readLifecycle(db, id, rec);
 
     if (!details) return rec;
     {
@@ -184,6 +185,8 @@ std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const Obj
     while (rows.row()) {
         if (hydrate) { positions.emplace(rows.i64(0), result.size()); ids.push_back(rows.i64(0)); }
         result.push_back(readObjectRow(db, rows, false));
+        if (!wants(fields, "retired")) result.back().retired = false;
+        if (!wants(fields, "lifecycle_epoch")) result.back().lifecycleEpoch.clear();
         if (hydrate) kinds.insert(result.back().kind);
     }
     if (result.empty() || !hydrate) return result;
@@ -387,7 +390,10 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
     writeObjectDetail(db, id, rec);
     if (!hasGeometry) detail::setSpatialBounds(db, id, bounds);
     writeTags(db, "object_tags", "object_id", id, rec.tags);
-    if (preserveRecord) restoreCommon(db, "objects", rec);
+    if (preserveRecord) {
+        restoreCommon(db, "objects", rec);
+        writeLifecycle(db, id, rec);
+    }
     appendJournal(db, author, host, uuid, preserveRecord ? rec.generation : generation, preserveRecord ? importOperation : "upsert");
     savepoint.release();
     return rec.uuid;

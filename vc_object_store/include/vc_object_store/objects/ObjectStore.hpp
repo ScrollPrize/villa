@@ -66,6 +66,9 @@ struct RecordCommon {
 };
 
 struct ObjectRecord : RecordCommon {
+    // Library-managed lifecycle, independent of ordinary JSON metadata.
+    bool retired = false;
+    std::string lifecycleEpoch;
     std::string name;
     int64_t formatVersion = 0;
     std::string storageKind;  // e.g. "file", "dataset", "" (db-only)
@@ -180,6 +183,7 @@ struct ObjectSelection {
     std::string orderBy = "uuid"; // or "length_desc", UUID tie break
     std::optional<std::string> afterUuid;
     std::optional<double> afterLength; // paired with afterUuid for length_desc
+    bool includeRetired = false;
 };
 struct EdgeSelection {
     std::optional<std::string> kind, tag;
@@ -189,6 +193,7 @@ struct EdgeSelection {
     bool bothEndpoints = false; // induced subgraph vs incident edges
     std::optional<int64_t> limit;
     std::optional<std::string> afterUuid; // exclusive, UUID-ordered cursor
+    bool includeRetired = false; // includes lifecycle-inactive recorded edges
 };
 
 // Compact topology read from one store transaction. No separate persistent
@@ -335,7 +340,7 @@ public:
     // Latest revision of each live object at or before this publication time.
     // All objects changed by an action have the same timestamp; no partial action
     // can be selected. Empty before the first publication. Deletions are excluded.
-    RevisionSelection revisionSelectionAt(const Txn&, int64_t publishedAtUs) const;
+    RevisionSelection revisionSelectionAt(const Txn&, int64_t publishedAtUs, bool includeRetired = false) const;
     std::vector<RelationshipRevision> recordedRelationships(const Txn&, const std::string& objectRevisionUuid) const;
     // Explicit, closed selection: omitted endpoints are not selected. null
     // selects the latest head (unlike write(), where null expects absence).
@@ -369,9 +374,16 @@ public:
     std::string upsertObject(WriteTxn& txn, const ObjectRecord& record);
     std::optional<ObjectRecord> objectByUuid(const Txn& txn, const std::string& uuid) const;
     std::vector<ObjectRecord> objectsByKind(const Txn& txn, const std::string& kind,
-                                            const std::optional<std::string>& approvalState = std::nullopt) const;
-    int64_t objectCount(const Txn& txn, const std::string& kind) const;
-    std::vector<ObjectRecord> objectsByTag(const Txn& txn, const std::string& tag) const;
+                                            const std::optional<std::string>& approvalState = std::nullopt, bool includeRetired = false) const;
+    int64_t objectCount(const Txn& txn, const std::string& kind, bool includeRetired = false) const;
+    std::vector<ObjectRecord> objectsByTag(const Txn& txn, const std::string& tag, bool includeRetired = false) const;
+    // Require write(expected). Decisions use keepRecordedRelationship,
+    // updateEdge/retainRelationship, or removeEdge before commit. UUID lookup
+    // always includes retired objects. Restore copies content into a new revision;
+    // omitted source selects the last active revision. Links need explicit validation.
+    void retireObject(WriteTxn&, const std::string& uuid);
+    void restoreObject(WriteTxn&, const std::string& uuid,
+                       const std::optional<std::string>& sourceRevision = std::nullopt);
     void deleteObject(WriteTxn& txn, const std::string& uuid);  // fails while edges or retained geometry reference it
 
     // Immutable geometry. A null expectedRevision means "expect no geometry";
@@ -480,8 +492,8 @@ public:
     void updateEdge(WriteTxn& txn, const EdgeRecord& record);
     std::optional<EdgeRecord> edgeByUuid(const Txn& txn, const std::string& uuid) const;
     void removeEdge(WriteTxn& txn, const std::string& uuid);
-    std::vector<EdgeRecord> edgesOf(const Txn& txn, const std::string& objectUuid) const;
-    std::vector<EdgeRecord> edgesByKind(const Txn& txn, const std::string& edgeKind) const;
+    std::vector<EdgeRecord> edgesOf(const Txn& txn, const std::string& objectUuid, bool includeRetired = false) const;
+    std::vector<EdgeRecord> edgesByKind(const Txn& txn, const std::string& edgeKind, bool includeRetired = false) const;
     // Projection always includes uuid/kind/a/b; empty fields means identities.
     std::vector<EdgeRecord> selectEdges(const Txn&, const EdgeSelection& = {},
         const std::optional<std::vector<std::string>>& fields = std::nullopt) const;
@@ -493,7 +505,7 @@ public:
     // neighbour object kind.
     std::vector<std::string> neighbours(const Txn& txn, const std::string& objectUuid,
                                         const std::optional<std::string>& edgeKind = std::nullopt,
-                                        const std::optional<std::string>& neighbourKind = std::nullopt) const;
+                                        const std::optional<std::string>& neighbourKind = std::nullopt, bool includeRetired = false) const;
 
     // Indexed traversal, filtered by edgeKindFilter when non-empty. When
     // cancel is given and becomes true, the traversal aborts with a
@@ -501,10 +513,10 @@ public:
     // checked each BFS step in memory); safe to set from another thread.
     std::vector<std::string> componentOf(const Txn& txn, const std::string& objectUuid,
                                          const std::vector<std::string>& edgeKindFilter = {},
-                                         const std::atomic_bool* cancel = nullptr) const;
+                                         const std::atomic_bool* cancel = nullptr, bool includeRetired = false) const;
     std::vector<std::string> reachableWithin(const Txn& txn, const std::string& objectUuid, int maxDepth,
                                              const std::vector<std::string>& edgeKindFilter = {},
-                                             const std::atomic_bool* cancel = nullptr) const;
+                                             const std::atomic_bool* cancel = nullptr, bool includeRetired = false) const;
 
     // No fields argument loads complete records. With fields, only requested
     // top-level fields plus uuid/kind are loaded; other C++ members stay default.

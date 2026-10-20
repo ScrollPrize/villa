@@ -181,25 +181,25 @@ NB_MODULE(_native, m)
             nb::arg("uuid"))
         .def(
             "objects_by_kind",
-            [](PyObjectStore& self, const std::string& kind, const std::optional<std::string>& approvalState) {
-                auto recs = self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.objectsByKind(t, kind, approvalState); });
+            [](PyObjectStore& self, const std::string& kind, const std::optional<std::string>& approvalState, bool includeRetired) {
+                auto recs = self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.objectsByKind(t, kind, approvalState, includeRetired); });
                 nb::list out;
                 for (const auto& r : recs) out.append(objectToPy(r));
                 return out;
             },
-            nb::arg("kind"), nb::arg("approval_state") = std::nullopt)
-        .def("object_count", [](PyObjectStore& self, const std::string& kind) {
-            return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.objectCount(txn, kind); });
-        }, nb::arg("kind"))
+            nb::arg("kind"), nb::arg("approval_state") = std::nullopt, nb::arg("include_retired") = false)
+        .def("object_count", [](PyObjectStore& self, const std::string& kind, bool includeRetired) {
+            return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.objectCount(txn, kind, includeRetired); });
+        }, nb::arg("kind"), nb::arg("include_retired") = false)
         .def(
             "objects_by_tag",
-            [](PyObjectStore& self, const std::string& tag) {
-                auto recs = self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.objectsByTag(t, tag); });
+            [](PyObjectStore& self, const std::string& tag, bool includeRetired) {
+                auto recs = self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.objectsByTag(t, tag, includeRetired); });
                 nb::list out;
                 for (const auto& r : recs) out.append(objectToPy(r));
                 return out;
             },
-            nb::arg("tag"))
+            nb::arg("tag"), nb::arg("include_retired") = false)
         .def(
             "delete_object",
             [](PyObjectStore& self, const std::string& uuid) {
@@ -233,38 +233,38 @@ NB_MODULE(_native, m)
             nb::arg("uuid"))
         .def(
             "edges_of",
-            [](PyObjectStore& self, const std::string& uuid) {
-                auto recs = self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.edgesOf(t, uuid); });
+            [](PyObjectStore& self, const std::string& uuid, bool includeRetired) {
+                auto recs = self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.edgesOf(t, uuid, includeRetired); });
                 nb::list out;
                 for (const auto& e : recs) out.append(edgeToPy(e));
                 return out;
             },
-            nb::arg("uuid"))
+            nb::arg("uuid"), nb::arg("include_retired") = false)
         .def(
             "edges_by_kind",
-            [](PyObjectStore& self, const std::string& kind) {
-                auto recs = self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.edgesByKind(t, kind); });
+            [](PyObjectStore& self, const std::string& kind, bool includeRetired) {
+                auto recs = self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.edgesByKind(t, kind, includeRetired); });
                 nb::list out;
                 for (const auto& e : recs) out.append(edgeToPy(e));
                 return out;
             },
-            nb::arg("edge_kind"))
+            nb::arg("edge_kind"), nb::arg("include_retired") = false)
         .def("neighbours",
              [](PyObjectStore& self, const std::string& uuid, const std::optional<std::string>& edgeKind,
-                const std::optional<std::string>& neighbourKind) {
-                 return self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.neighbours(t, uuid, edgeKind, neighbourKind); });
+                const std::optional<std::string>& neighbourKind, bool includeRetired) {
+                 return self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.neighbours(t, uuid, edgeKind, neighbourKind, includeRetired); });
              },
-             nb::arg("uuid"), nb::arg("edge_kind") = std::nullopt, nb::arg("neighbour_kind") = std::nullopt)
+             nb::arg("uuid"), nb::arg("edge_kind") = std::nullopt, nb::arg("neighbour_kind") = std::nullopt, nb::arg("include_retired") = false)
         .def("component",
-             [](PyObjectStore& self, const std::string& uuid, const std::vector<std::string>& edgeKinds) {
-                 return self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.componentOf(t, uuid, edgeKinds); });
+             [](PyObjectStore& self, const std::string& uuid, const std::vector<std::string>& edgeKinds, bool includeRetired) {
+                 return self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.componentOf(t, uuid, edgeKinds, nullptr, includeRetired); });
              },
-             nb::arg("uuid"), nb::arg("edge_kinds") = std::vector<std::string>{})
+             nb::arg("uuid"), nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("include_retired") = false)
         .def("reachable_within",
-             [](PyObjectStore& self, const std::string& uuid, int maxDepth, const std::vector<std::string>& edgeKinds) {
-                 return self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.reachableWithin(t, uuid, maxDepth, edgeKinds); });
+             [](PyObjectStore& self, const std::string& uuid, int maxDepth, const std::vector<std::string>& edgeKinds, bool includeRetired) {
+                 return self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.reachableWithin(t, uuid, maxDepth, edgeKinds, nullptr, includeRetired); });
              },
-             nb::arg("uuid"), nb::arg("max_depth"), nb::arg("edge_kinds") = std::vector<std::string>{})
+             nb::arg("uuid"), nb::arg("max_depth"), nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("include_retired") = false)
         .def(
             "set_approval",
             [](PyObjectStore& self, const std::string& uuid, const std::string& state) {
@@ -477,10 +477,10 @@ NB_MODULE(_native, m)
         .def("select_edges", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::vector<std::string>& states, const std::optional<std::vector<std::string>>& endpoints,
             bool both, const std::optional<std::string>& tag, const std::optional<int64_t>& limit,
-            const std::optional<std::string>& after, const std::optional<std::vector<std::string>>& fields) {
+            const std::optional<std::string>& after, const std::optional<std::vector<std::string>>& fields, bool includeRetired) {
             vo::EdgeSelection selection; selection.kind = kind; selection.approvalStates = states;
             selection.endpointUuids = endpoints; selection.bothEndpoints = both;
-            selection.tag = tag; selection.limit = limit; selection.afterUuid = after;
+            selection.tag = tag; selection.limit = limit; selection.afterUuid = after; selection.includeRetired = includeRetired;
             std::vector<vo::EdgeRecord> records;
             { auto lease = self.db; self.require(); nb::gil_scoped_release release;
               records = self.withRead([&](auto& db, auto& txn) { return db.selectEdges(txn, selection, fields); }); }
@@ -490,14 +490,14 @@ NB_MODULE(_native, m)
         }, nb::arg("edge_kind") = std::nullopt, nb::arg("approval_states") = std::vector<std::string>{},
            nb::arg("endpoint_uuids") = std::nullopt, nb::arg("both_endpoints") = false,
            nb::arg("tag") = std::nullopt, nb::arg("limit") = std::nullopt,
-           nb::arg("after_uuid") = std::nullopt, nb::arg("fields") = std::nullopt)
+           nb::arg("after_uuid") = std::nullopt, nb::arg("fields") = std::nullopt, nb::arg("include_retired") = false)
         .def("graph_read", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::vector<std::string>& ids, const std::optional<std::string>& edgeKind,
             const std::vector<std::string>& states, const std::optional<std::array<double, 6>>& bbox,
-            const std::optional<std::string>& tag) {
+            const std::optional<std::string>& tag, bool includeRetired) {
             self.require();
             auto view = std::make_unique<PyGraphReadView>(); view->store = self.db;
-            vo::ObjectSelection objects; objects.kind = kind; objects.uuids = ids; objects.bbox = bbox;
+            vo::ObjectSelection objects; objects.kind = kind; objects.uuids = ids; objects.bbox = bbox; objects.includeRetired = includeRetired;
             vo::EdgeSelection edges; edges.kind = edgeKind; edges.approvalStates = states; edges.tag = tag;
             { nb::gil_scoped_release release;
               view->txn = std::make_unique<vo::ReadTxn>(view->store->read());
@@ -506,7 +506,7 @@ NB_MODULE(_native, m)
         }, nb::rv_policy::take_ownership, nb::arg("object_kind") = std::nullopt,
            nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("edge_kind") = std::nullopt,
            nb::arg("approval_states") = std::vector<std::string>{"approved"},
-           nb::arg("bbox") = std::nullopt, nb::arg("edge_tag") = std::nullopt,
+           nb::arg("bbox") = std::nullopt, nb::arg("edge_tag") = std::nullopt, nb::arg("include_retired") = false,
            "Pin a store graph read view; use as a context manager and close before checkpointing.")
         .def("select_objects", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::optional<std::string>& tag, const std::vector<std::string>& ids,
@@ -515,10 +515,10 @@ NB_MODULE(_native, m)
             const std::optional<std::array<double, 6>>& bbox, const std::optional<std::vector<std::string>>& fields,
             const std::optional<std::string>& family, const std::optional<double>& minLength,
             const std::string& orderBy, const std::optional<std::string>& afterUuid,
-            const std::optional<double>& afterLength) {
+            const std::optional<double>& afterLength, bool includeRetired) {
             vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset, bbox};
             selection.family = family; selection.minLength = minLength; selection.orderBy = orderBy;
-            selection.afterUuid = afterUuid; selection.afterLength = afterLength;
+            selection.afterUuid = afterUuid; selection.afterLength = afterLength; selection.includeRetired = includeRetired;
             std::vector<vo::ObjectRecord> records;
             { auto lease = self.db; self.require(); nb::gil_scoped_release release;
               records = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.selectObjects(txn, selection, fields); }); }
@@ -531,14 +531,14 @@ NB_MODULE(_native, m)
            nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("limit") = std::nullopt, nb::arg("offset") = 0,
            nb::arg("bbox") = std::nullopt, nb::arg("fields") = std::nullopt,
            nb::arg("family") = std::nullopt, nb::arg("min_length") = std::nullopt,
-           nb::arg("order_by") = "uuid", nb::arg("after_uuid") = std::nullopt, nb::arg("after_length") = std::nullopt)
+           nb::arg("order_by") = "uuid", nb::arg("after_uuid") = std::nullopt, nb::arg("after_length") = std::nullopt, nb::arg("include_retired") = false)
         .def("spatial_regions", [](PyObjectStore& self, const std::array<double, 6>& bbox,
             const std::optional<std::string>& kind, const std::optional<std::string>& tag,
             const std::vector<std::string>& ids, const std::optional<std::string>& connected,
             const std::vector<std::string>& edgeKinds, const std::optional<int64_t>& limit, int64_t offset,
-            const std::optional<std::string>& family, const std::optional<double>& minLength) {
+            const std::optional<std::string>& family, const std::optional<double>& minLength, bool includeRetired) {
             vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset, bbox};
-            selection.family = family; selection.minLength = minLength;
+            selection.family = family; selection.minLength = minLength; selection.includeRetired = includeRetired;
             std::vector<vo::SpatialRegion> regions;
             { auto lease = self.db; self.require(); nb::gil_scoped_release release;
               regions = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.spatialRegions(txn, selection); }); }
@@ -553,17 +553,17 @@ NB_MODULE(_native, m)
         }, nb::arg("bbox"), nb::arg("object_kind") = std::nullopt, nb::arg("tag") = std::nullopt,
            nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("connected_to") = std::nullopt,
            nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("limit") = std::nullopt, nb::arg("offset") = 0,
-           nb::arg("family") = std::nullopt, nb::arg("min_length") = std::nullopt,
+           nb::arg("family") = std::nullopt, nb::arg("min_length") = std::nullopt, nb::arg("include_retired") = false,
            "Return revision-bound surface tiles, polyline/point blocks, or external object boxes. Bounds are conservative candidates.")
         .def("export_json", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::optional<std::string>& tag, const std::vector<std::string>& ids,
             const std::optional<std::string>& connected, const std::vector<std::string>& edgeKinds,
-            const std::vector<std::string>& fields) {
-            vo::JsonExportOptions options{{kind, tag, connected, ids, edgeKinds}, fields};
+            const std::vector<std::string>& fields, bool includeRetired) {
+            vo::JsonExportOptions options{{kind, tag, connected, ids, edgeKinds}, fields}; options.selection.includeRetired = includeRetired;
             return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.exportJson(txn, options); });
         }, nb::arg("object_kind") = std::nullopt, nb::arg("tag") = std::nullopt,
            nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("connected_to") = std::nullopt,
-           nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("fields") = std::vector<std::string>{})
+           nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("fields") = std::vector<std::string>{}, nb::arg("include_retired") = false)
         .def_prop_ro("replica_uuid", [](PyObjectStore& self) {
             return self.withRead([](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.replicaUuid(txn); });
         })
@@ -781,14 +781,14 @@ NB_MODULE(_native, m)
             });
         }, nb::arg("selection"),
            "Resolve selected objects, metadata, geometry references and relationship applicability in one read snapshot.")
-        .def("revision_selection_at", [](PyObjectStore& self, int64_t time) {
-            return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.revisionSelectionAt(txn, time); });
-        }, nb::arg("published_at_us"))
-        .def("revision_read_view_at", [](PyObjectStore& self, int64_t time) {
+        .def("revision_selection_at", [](PyObjectStore& self, int64_t time, bool includeRetired) {
+            return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.revisionSelectionAt(txn, time, includeRetired); });
+        }, nb::arg("published_at_us"), nb::arg("include_retired") = false)
+        .def("revision_read_view_at", [](PyObjectStore& self, int64_t time, bool includeRetired) {
             return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
-                return revisionViewToPy(db, txn, db.revisionSelectionAt(txn, time));
+                return revisionViewToPy(db, txn, db.revisionSelectionAt(txn, time, includeRetired));
             });
-        }, nb::arg("published_at_us"),
+        }, nb::arg("published_at_us"), nb::arg("include_retired") = false,
            "Recover all objects, geometry references and recorded relationships at a publication time (UTC Unix microseconds).")
         .def(
             "write",
@@ -810,6 +810,13 @@ NB_MODULE(_native, m)
             const bool failed = nb::len(args) > 0 && !args[0].is_none();
             self.exit(failed);
         })
+        .def("retire_object", [](PyObjectWriteTxn& self, const std::string& uuid) {
+            self.owner->require().retireObject(self.require(), uuid);
+        }, nb::arg("uuid"))
+        .def("restore_object", [](PyObjectWriteTxn& self, const std::string& uuid,
+                                  const std::optional<std::string>& source) {
+            self.owner->require().restoreObject(self.require(), uuid, source);
+        }, nb::arg("uuid"), nb::arg("source_revision") = std::nullopt)
         .def("repair_edge_geometry", [](PyObjectWriteTxn& self, const nb::dict& input) {
             self.owner->require().repairEdgeGeometry(self.require(), repairFromPy(input));
         }, nb::arg("repair"))
