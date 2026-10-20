@@ -219,6 +219,37 @@ struct FiberPredictionTraceScales {
     double predictionSpacingInTraceVoxels = 1.0;
 };
 
+struct FiberPredictionGridInfo {
+    std::array<size_t, 3> shapeZYX{0, 0, 0};
+    double predictionToBaseScale = 1.0;
+};
+
+struct FiberStoredPredictionSample {
+    cv::Vec3d direction{0.0, 0.0, 0.0};
+    double presence = 0.0;
+    bool valid = false;
+    bool presenceValid = false;
+};
+
+struct FiberStoredPresenceSample {
+    double presence = 0.0;
+    bool valid = false;
+};
+
+struct FiberPresenceChunkScanReport {
+    std::array<size_t, 3> shapeZYX{0, 0, 0};
+    std::array<size_t, 3> chunksZYX{0, 0, 0};
+    std::array<size_t, 3> chunkGridShapeZYX{0, 0, 0};
+    size_t missingChunks = 0;
+    size_t emptyChunks = 0;
+    std::vector<std::array<size_t, 3>> nonemptyChunksZYX;
+};
+
+enum class FiberPredictionFieldBindingMode {
+    TraceOptions,
+    CanonicalStoredGrid,
+};
+
 struct FiberTraceCoordinateAdapter {
     explicit FiberTraceCoordinateAdapter(double traceToBaseScale);
 
@@ -286,6 +317,15 @@ public:
         const vc::lasagna::LasagnaDataset& dataset,
         size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL);
     ~FiberPredictionField() override;
+    FiberPredictionField(const vc::lasagna::LasagnaDataset& dataset,
+        FiberPredictionFieldBindingMode mode,
+        size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL);
+    [[nodiscard]] FiberPredictionGridInfo storedGridInfo() const;
+    [[nodiscard]] FiberPresenceChunkScanReport scanStoredPresenceChunks(int parallelThreads) const;
+    void sampleStoredGridBatch(const std::vector<std::array<size_t, 3>>& indicesZYX,
+        int parallelThreads, std::vector<FiberStoredPredictionSample>& samples) const;
+    void sampleStoredPresenceBatch(const std::vector<std::array<size_t, 3>>& indicesZYX,
+        int parallelThreads, std::vector<FiberStoredPresenceSample>& samples) const;
 
     [[nodiscard]] bool supportsConcurrentSampling() const noexcept override { return true; }
     [[nodiscard]] vc::lasagna::NormalPrefetchReport prefetchSamples(

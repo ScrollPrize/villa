@@ -287,6 +287,15 @@ vc_add_test(NAME test_lasagna_maxflow_graph LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_fiber_trace3d
     LIBS doctest::doctest vc_fiber_tracer
     DEFS VC_TESTING)
+vc_add_test(NAME test_fiber_anchors LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiberlet_storage LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiberlet_paths LIBS doctest::doctest vc_fiber_tracer DEFS VC_TESTING)
+if(TARGET test_fiberlet_paths AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # The inline optimized/reference kernels assert bitwise operation-order
+    # equality. Do not let the compiler contract just one expression into FMA.
+    # This affects the comparison harness only, not production code.
+    target_compile_options(test_fiberlet_paths PRIVATE -ffp-contract=off)
+endif()
 
 # Qt-free data/IO layer.
 vc_add_test(NAME test_point_collections)

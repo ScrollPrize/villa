@@ -125,6 +125,11 @@ install(TARGETS vc_volume vc_surface_index vc_grid_raycast vc_fiber_trace
     RUNTIME DESTINATION vc
 )
 install(FILES vc/__init__.py DESTINATION vc)
+install(FILES vc/fiberlets_cli.py DESTINATION vc)
+if(TARGET vc_fiberlets)
+    install(TARGETS vc_fiberlets RUNTIME DESTINATION vc/bin)
+endif()
+configure_file(vc/fiberlets_cli.py "${CMAKE_CURRENT_BINARY_DIR}/vc/fiberlets_cli.py" COPYONLY)
 install(FILES vc/compression/__init__.py DESTINATION vc/compression)
 install(FILES
     vc/compression/vcz1.py

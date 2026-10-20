@@ -1,3 +1,21 @@
+if(VC_BUILD_FIBERLETS)
+    add_executable(vc_fiberlets src/vc_fiberlets.cpp)
+    target_link_libraries(vc_fiberlets PRIVATE vc_fiber_tracer vc_lasagna)
+    target_compile_definitions(vc_fiberlets PRIVATE
+        VC_FIBERLET_COMPILER_ID="${CMAKE_CXX_COMPILER_ID}"
+        VC_FIBERLET_COMPILER_VERSION="${CMAKE_CXX_COMPILER_VERSION}"
+        VC_FIBERLET_BUILD_CONFIG="$<CONFIG>")
+    if(VC_BUILD_PYTHON AND NOT VC_BUILD_APPS)
+        if(APPLE)
+            set_target_properties(vc_fiberlets PROPERTIES INSTALL_RPATH "@loader_path/../..")
+        elseif(NOT WIN32)
+            set_target_properties(vc_fiberlets PROPERTIES INSTALL_RPATH "$ORIGIN/../..")
+        endif()
+    elseif(NOT VC_BUILD_APPS)
+        install(TARGETS vc_fiberlets RUNTIME DESTINATION bin COMPONENT vc_runtime)
+    endif()
+endif()
+
 if(NOT VC_BUILD_APPS)
     return()
 endif()
@@ -279,6 +297,9 @@ set(VC_CLI_TARGETS
     vc_tifxyz2rgb vc_rgb2tifxyz vc_thinning vc_tifxyz vc_project_tifxyz
     vc_zarr_to_tiff vc_zarr_recompress vc_zarr_download_bench
     vc_zarr_download_region)
+if(VC_BUILD_FIBERLETS)
+    list(APPEND VC_CLI_TARGETS vc_fiberlets)
+endif()
 get_property(_vc_apps_directory_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
 list(FILTER _vc_apps_directory_targets INCLUDE REGEX "^vc_")
 set(_vc_expected_cli_targets ${VC_CLI_TARGETS})
