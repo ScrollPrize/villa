@@ -569,8 +569,10 @@ def test_levels_limit_retains_store_wide_gap_check(tmp_path):
 
 
 def test_voxel_size_meta_unresolvable_falls_back_and_scan_precedes_detector(tmp_path):
+    # A valid meta.json without any usable voxel size: resolution must fall back
+    # to metadata.json, and scan.voxelsize must win over the detector pixel size.
     group = _good_store(tmp_path / "vol.zarr")
-    (group / "meta.json").write_text("{broken")
+    (group / "meta.json").write_text(json.dumps({"unrelated": "field"}))
     (group / "metadata.json").write_text(json.dumps({
         "scan": {"voxelsize": "12.5", "tomo": {"acquisition": {
             "detector": {"samplePixelSize": 0.00791}}}},
@@ -579,6 +581,22 @@ def test_voxel_size_meta_unresolvable_falls_back_and_scan_precedes_detector(tmp_
     assert result.status == PASS
     assert result.details["voxel_size"]["value_um"] == 12.5
     assert result.details["voxel_size"]["source"].endswith(":scan.voxelsize")
+
+
+def test_corrupt_canonical_meta_json_fails(tmp_path):
+    """A present-but-broken canonical meta.json means the store cannot open: FAIL.
+
+    Volume::loadMetadata parses meta.json unconditionally, so its corruption must
+    not be waived just because metadata.json carries valid scan/voxel-size fields.
+    """
+    group = _good_store(tmp_path / "vol.zarr")
+    (group / "meta.json").write_text("{broken")
+    (group / "metadata.json").write_text(json.dumps({
+        "scan": {"voxelsize": "12.5"}, "z_direction_is_top_to_bottom": True}))
+    result = check_metadata_json_keys(group)
+    assert result.status == FAIL
+    assert "meta.json" in result.message
+    assert result.details["path"].endswith("meta.json")
 
 
 @pytest.mark.parametrize("resolution", [None, True, -1, 1.5, 32, "nan"])
@@ -704,3 +722,97 @@ def test_scan_not_required_when_meta_json_present(tmp_path):
     assert result.status == PASS, result.message
     assert "scan" not in result.details.get("missing", [])
     assert result.details["meta_json_present"] is True
+
+
+# Review regression (new): a scale carrying the JSON token "nan"/"inf" becomes a
+# non-finite float. It must still FAIL validation, but --json must emit strict
+# JSON (no bare NaN/Infinity tokens) that strict consumers can parse.
+
+
+@pytest.mark.parametrize("token", ["nan", "inf", "-inf"])
+def test_json_output_is_strict_with_non_finite_scale(tmp_path, capsys, token):
+    group = _good_store(tmp_path / "vol.zarr")
+    _edit_ms(group, lambda ms: ms["datasets"][1]["coordinateTransformations"][0].update(
+        scale=[token, token, token]))
+
+    rc = qa.main([str(group), "--json"])
+    out = capsys.readouterr().out
+    # No bare non-finite tokens; parses under a strict constant handler.
+    assert "NaN" not in out and "Infinity" not in out
+
+    def reject_constant(c):
+        raise AssertionError(f"non-finite token {c!r} in strict JSON")
+
+    payload = json.loads(out, parse_constant=reject_constant)
+    scale_result = {r["name"]: r for r in payload["results"]}["ome_scale_metadata"]
+    assert scale_result["status"] == FAIL
+    # The offending values are stringified, not dropped.
+    assert scale_result["details"]["scales"][1] == [token] * 3
+    assert rc == 1
+
+
+# Review regression (new): a valid v3 ``sharding_indexed`` object carries a
+# per-inner-chunk index whose size grows with the inner-chunk count. The size
+# check must account for it instead of failing a correct shard on the CI gate,
+# while #1965 oversized detection keeps working for non-sharded stores.
+
+
+def _write_v3_sharded_array(level_path, shape=(8, 8, 8), shard=(8, 8, 8),
+                            inner=(2, 2, 2), dtype="uint8"):
+    level_path.mkdir(parents=True, exist_ok=True)
+    (level_path / "zarr.json").write_text(json.dumps({
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": list(shape),
+        "data_type": dtype,
+        "chunk_grid": {"name": "regular", "configuration": {"chunk_shape": list(shard)}},
+        "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+        "codecs": [{
+            "name": "sharding_indexed",
+            "configuration": {
+                "chunk_shape": list(inner),
+                "codecs": [{"name": "bytes", "configuration": {"endian": "little"}}],
+                "index_codecs": [
+                    {"name": "bytes", "configuration": {"endian": "little"}},
+                    {"name": "crc32c"},
+                ],
+            },
+        }],
+        "fill_value": 0,
+    }))
+
+
+def test_sharded_chunk_within_index_allowance_not_flagged(tmp_path):
+    group = tmp_path / "vol.zarr"
+    level0 = group / "0"
+    _write_v3_sharded_array(level0, shape=(8, 8, 8), shard=(8, 8, 8), inner=(2, 2, 2))
+
+    meta = read_array_meta(0, level0)
+    assert meta.sharded is True and meta.inner_chunks == (2, 2, 2)
+
+    # declared payload = 8^3 * 1 = 512 B. A correct uncompressed shard adds a
+    # 64-inner-chunk index (16 B each) + checksum: 512 + 1024 + 4 = 1540 B. With
+    # the fixed 64 B allowance that was a FAIL; with the index allowance it is not.
+    shard = level0 / "c" / "0" / "0" / "0"
+    shard.parent.mkdir(parents=True, exist_ok=True)
+    shard.write_bytes(b"\x00" * (512 + 16 * 64 + 4))
+
+    result = check_chunk_object_sizes([meta])
+    assert result.status != FAIL, result.message
+    assert result.details["offenders"] == []
+
+
+def test_sharded_oversized_shard_still_fails(tmp_path):
+    """#1965 detection survives for shards: a wildly oversized shard still FAILs."""
+    group = tmp_path / "vol.zarr"
+    level0 = group / "0"
+    _write_v3_sharded_array(level0, shape=(8, 8, 8), shard=(8, 8, 8), inner=(2, 2, 2))
+    meta = read_array_meta(0, level0)
+
+    shard = level0 / "c" / "0" / "0" / "0"
+    shard.parent.mkdir(parents=True, exist_ok=True)
+    # 8x the declared payload, far beyond payload + index + checksum.
+    shard.write_bytes(b"\x00" * (512 * 8 + 16 * 64 + 4))
+
+    result = check_chunk_object_sizes([meta])
+    assert result.status == FAIL

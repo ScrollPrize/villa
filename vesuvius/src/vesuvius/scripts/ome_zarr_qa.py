@@ -118,6 +118,8 @@ class ArrayMeta:
     zarr_format: int
     chunk_key_encoding: str = "v2"
     compressed: bool = False
+    sharded: bool = False
+    inner_chunks: Optional[Tuple[int, ...]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +141,23 @@ def _read_json(path: Path) -> Optional[dict]:
 def _itemsize(dtype_str: str) -> int:
     """Byte width of a (v2 or v3) dtype string, via numpy."""
     return int(np.dtype(dtype_str).itemsize)
+
+
+def _json_safe(value):
+    """Recursively replace non-finite floats so a report is strict-JSON safe.
+
+    A malformed ``scale`` can carry the JSON tokens ``"nan"``/``"inf"``; these
+    become non-finite floats that ``json.dumps(..., allow_nan=False)`` rejects
+    and that strict consumers cannot parse. Stringify them (``"nan"``/``"inf"``)
+    for the report; validation still runs against the original float values.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
 
 
 def read_array_meta(level: int, level_path: Path) -> ArrayMeta:
@@ -175,11 +194,29 @@ def read_array_meta(level: int, level_path: Path) -> ArrayMeta:
         cke = zarr_json.get("chunk_key_encoding", {})
         sep = cke.get("configuration", {}).get("separator", "." if cke.get("name") == "v2" else "/")
         codecs = zarr_json.get("codecs", []) or []
+        # A ``sharding_indexed`` array->bytes codec packs many inner chunks into
+        # one stored shard object plus a per-inner-chunk index; the inner codecs
+        # (not the outer list) decide whether the payload is compressed.
+        shard_codec = next(
+            (c for c in codecs
+             if isinstance(c, dict) and c.get("name") == "sharding_indexed"),
+            None,
+        )
+        sharded = shard_codec is not None
+        inner_chunks: Optional[Tuple[int, ...]] = None
+        if sharded:
+            cfg = shard_codec.get("configuration", {}) or {}
+            inner = cfg.get("chunk_shape")
+            if inner is not None:
+                inner_chunks = tuple(int(v) for v in inner)
+            effective_codecs = cfg.get("codecs", []) or []
+        else:
+            effective_codecs = codecs
         # Any bytes->bytes codec beyond the raw array->bytes codec (compression,
         # checksum, ...) adds a small fixed overhead to each stored chunk.
         compressed = any(
             isinstance(c, dict) and c.get("name") not in ("bytes", "transpose")
-            for c in codecs
+            for c in effective_codecs
         )
         return ArrayMeta(
             level=level,
@@ -192,6 +229,8 @@ def read_array_meta(level: int, level_path: Path) -> ArrayMeta:
             zarr_format=3,
             chunk_key_encoding=cke.get("name", "default"),
             compressed=compressed,
+            sharded=sharded,
+            inner_chunks=inner_chunks,
         )
 
     raise ValueError(f"no .zarray or array zarr.json at {level_path}")
@@ -400,9 +439,10 @@ def check_ome_scale_metadata(group_path: Path, metas: Sequence[ArrayMeta], level
            for a in axes):
         warnings.append("one or more spatial axes are missing a physical `unit`")
 
-    # Scale transforms + ratios.
+    # Scale transforms + ratios. Keep the raw floats for validation below, but
+    # store a strict-JSON-safe copy in the report (non-finite tokens stringified).
     scales = [_extract_scale(d) for d in datasets]
-    details["scales"] = scales
+    details["scales"] = _json_safe(scales)
     for i, scale in enumerate(scales):
         rank = len(metas[i].shape) if i < len(metas) else ndim
         if scale is not None and len(scale) != rank:
@@ -511,6 +551,17 @@ def check_chunk_object_sizes(
     # a small fixed header that dominates for tiny chunks but is negligible for
     # the large grids the #1965 oversized detection targets.
     overhead = codec_overhead if level0.compressed else 0
+    # A sharded object additionally stores a per-inner-chunk index (16 bytes of
+    # offset+length each, plus a trailing checksum). Without this allowance a
+    # valid shard — whose index grows with the inner-chunk count — is mistaken
+    # for a mis-declared grid and fails the CI gate.
+    if level0.sharded and level0.inner_chunks:
+        inner = level0.inner_chunks
+        num_inner = int(np.prod([
+            (s + c - 1) // c
+            for s, c in zip(level0.chunks, inner)
+        ]))
+        overhead += 16 * num_inner + 4  # index entries + crc32c index checksum
     warn_bound = declared_bytes * warn_ratio + overhead
     fail_bound = declared_bytes * fail_ratio + overhead
 
@@ -716,10 +767,27 @@ def check_metadata_json_keys(group_path: Path) -> CheckResult:
     # (volume-cartographer/core/src/Volume.cpp:1031-1039). So only require
     # ``scan`` when no sibling ``meta.json`` exists, else a store that opens fine
     # via meta.json (the #2078 workaround) gets a false FAIL here.
-    meta_json_present = any(
-        (directory / "meta.json").exists()
-        for directory in dict.fromkeys((group_path, md_path.parent))
-    )
+    #
+    # Existence alone is not enough: Volume parses canonical ``meta.json``
+    # unconditionally, so a corrupt one means the store cannot open at all. A
+    # present-but-broken meta.json is a FAIL (and must not silently waive scan
+    # validation or voxel-size resolution). Only a *valid* meta.json is the
+    # #2078 workaround.
+    meta_json_present = False
+    for directory in dict.fromkeys((group_path, md_path.parent)):
+        meta_path = directory / "meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            _read_json(meta_path)
+        except Exception as exc:  # canonical meta.json is corrupt
+            return CheckResult(
+                name, FAIL,
+                f"canonical meta.json is not valid JSON: {exc} "
+                f"(Volume::loadMetadata parses it unconditionally; store cannot open)",
+                {"path": str(meta_path)},
+            )
+        meta_json_present = True
     required = [] if meta_json_present else ["scan"]
     missing = [k for k in required if k not in md]
     details = {"path": str(md_path), "keys": sorted(md.keys()),
@@ -899,16 +967,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     summary = {s: statuses.count(s) for s in (PASS, FAIL, WARN, SKIP)}
 
     if args.json:
-        print(
-            json.dumps(
-                {
-                    "group_path": str(args.group_path),
-                    "summary": summary,
-                    "results": [r.to_dict() for r in results],
-                },
-                indent=2,
-            )
-        )
+        payload = {
+            "group_path": str(args.group_path),
+            "summary": summary,
+            "results": [r.to_dict() for r in results],
+        }
+        # allow_nan=False guarantees strict JSON; _json_safe stringifies any
+        # non-finite float a check may have left in its details first.
+        print(json.dumps(_json_safe(payload), indent=2, allow_nan=False))
     else:
         print(f"OME-Zarr QA: {args.group_path}")
         _print_table(results)
