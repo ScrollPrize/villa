@@ -107,7 +107,7 @@ class EvaAttention(nn.Module):
             proj_drop: float = 0.,
             attn_head_dim: Optional[int] = None,
             norm_layer: Optional[Callable] = None,
-            attention_backend: Optional[str] = None,
+            attention_backend: Optional[str] = "flash",
     ):
         """
 
@@ -283,7 +283,7 @@ class EvaBlock(nn.Module):
             rope_kwargs=None,
             ndim: Optional[int] = None,
             attention_type: str = "full",
-            attention_backend: Optional[str] = None,
+            attention_backend: Optional[str] = "flash",
     ):
         """
 
@@ -484,7 +484,7 @@ class Eva(nn.Module):
             rope_kwargs=None,
             grad_checkpointing=False,
             checkpoint_save_attention: bool = True,
-            deeper_embed_batch_chunk_size: Optional[int] = None,
+            deeper_embed_batch_chunk_size: Optional[int] = 1,
             deeper_embed_stage_channels: Optional[Tuple[int, ...]] = None,
             deeper_embed_depth_per_level: Optional[Tuple[int, ...]] = None,
             deeper_embed_use_stem: bool = True,
@@ -495,7 +495,7 @@ class Eva(nn.Module):
             deeper_embed_stem_channels: Optional[int] = None,
             deeper_embed_stem_type: Optional[str] = None,
             attention_type: str = "full",
-            attention_backend: Optional[str] = None,
+            attention_backend: Optional[str] = "flash",
     ):
         """
         Diff to timm implementation

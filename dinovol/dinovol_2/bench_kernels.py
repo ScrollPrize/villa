@@ -21,7 +21,7 @@ def main():
     parser.add_argument("--prototypes", type=int, default=131072)
     parser.add_argument("--dim", type=int, default=256)
     parser.add_argument("--chunk-size", type=int, default=4096)
-    parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="float16")
+    parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--compile", action="store_true")
@@ -95,7 +95,7 @@ def main():
             options["kernel_backend"] = args.backend
         loss_fn = iBOTPatchLoss(args.prototypes, **options).cuda()
         if args.compile:
-            loss_fn.compile_kernels(backend="inductor", mode="max-autotune-no-cudagraphs")
+            loss_fn.compile_kernels(backend="inductor", mode="default")
         count = torch.tensor([args.rows], device="cuda")
         masks = torch.empty(4, 13824, device="cuda", dtype=torch.bool)
         weights = torch.full((args.rows,), 4 / args.rows, device="cuda")

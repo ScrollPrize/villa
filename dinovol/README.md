@@ -59,7 +59,7 @@ BF16. The FP16 performance measurements below predate this default change.
 Compilation is enabled for this recipe with the top-level setting:
 
 ```json
-"compile": {"enabled": true, "backend": "inductor", "mode": "max-autotune-no-cudagraphs", "dynamic": {"backbone": false}}
+"compile": {"enabled": true, "backend": "inductor", "mode": "default", "dynamic": {"backbone": false}}
 ```
 
 The trainer compiles the student and teacher backbones (CNN plus transformer)
@@ -89,8 +89,7 @@ workspace memory. Measure throughput and peak VRAM after warmup on the target GP
 compiled execution can change floating-point rounding and random-number streams.
 For compiler diagnostics, run with `TORCH_LOGS=graph_breaks,recompiles`.
 
-The recipe also enables these throughput and memory settings. Each is off unless
-a config sets it:
+The recipe uses these throughput and memory settings. Defaults are noted below:
 
 - `ibot_fused_last_layer` (top level): the heads return the iBOT bottleneck
   features and last-layer weight, and the loss forms the
@@ -148,8 +147,11 @@ a config sets it:
   --dim 32 --spatial-size 192 --batch-size 2 --backend triton --compile`;
   use `--backend torch --compile` for the compiled reference. This microbenchmark
   uses synthetic activations and does not predict whole-model peak memory.
-- `model.deeper_embed_batch_chunk_size: null`: the CNN embeds the whole batch at
-  once instead of one sample at a time (the default of 1).
+- `model.attention_backend: "flash"` (default): prefer FlashAttention, retaining
+  the other SDPA kernels as fallbacks when it is unavailable.
+- `model.deeper_embed_batch_chunk_size: 1` (default): embed one view at a time
+  through the CNN to lower peak VRAM, while preserving every view. Set `null`
+  to embed the whole batch together.
 - `fused_optimizer`: fused CUDA AdamW.
 - `cuda_expandable_segments`: the CUDA caching allocator uses expandable
   segments, avoiding fragmentation-driven cache flushes near full memory.
@@ -157,10 +159,10 @@ a config sets it:
   (fixed) crop shapes on first use. On the H100 this cut the
   `pretrain_8_9um.json` step from 1.65 s to 1.53 s. Algorithm choice can change
   floating-point rounding.
-- `compile.mode: "max-autotune-no-cudagraphs"` (used by `pretrain_8_9um.json`)
-  benchmarks Triton matmul and convolution kernels against the library ones at
-  compile time and keeps the fastest. The first launch compiles for about 13
-  minutes; the inductor cache makes later launches fast.
+- `compile.mode: "default"` (used by `pretrain_8_9um.json`) uses regular
+  Inductor compilation without maximum autotuning. This reduces startup time
+  when testing changes. Maximum autotuning remains an explicit opt-in; the
+  historical measurements below used it.
 
 On an RTX 5090 with PyTorch 2.10/CUDA 12.8, the `teacher_585k.pt` configuration
 (depth 10, width 480, 10 heads, patch size 8) was measured on one fixed real
@@ -188,8 +190,15 @@ A separate comparison with both optimizations and `model.attention_backend:
 "flash"` took 523 ms mean, 519 ms median [516–546], with the same 9.25 GiB
 allocated peak. The profiler confirmed FlashAttention forward and backward.
 Compared with the optimized cuDNN run, full gradients differed by 0.56% relative
-L2 with 0.99998 cosine similarity. The default attention backend is unchanged;
-these single-batch checks do not assess training convergence.
+L2 with 0.99998 cosine similarity. These historical single-batch checks do not
+assess training convergence.
+
+With BF16 and regular compilation (`mode: "default"`), the same four-view
+workload measured 557 ms mean and 9.25 GiB peak allocated with cuDNN attention
+and whole-batch CNN embedding. FlashAttention plus CNN chunk size 1 measured
+526 ms mean and 8.72 GiB peak allocated over ten steps after three warmups.
+Those are now the model defaults and the settings in `pretrain_8_9um.json`.
+The timing and memory exclusions listed above still apply.
 
 Historical optimizer-step measurements used an earlier version of
 `pretrain_8_9um.json` with width 288, a 2,048-wide FFN, a 16-channel CNN stem,
@@ -384,8 +393,8 @@ AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
 The real-volume validator checks that every required cached Zarr chunk exists,
 reads four overlapping 192³ crops, applies the checkpoint's normalization, and
 encodes masked/unmasked views with its teacher weights. It compares interpolation,
-Sinkhorn scales, loss, and AMP-scaled feature/classifier gradients. The saved
-fixture allows both backends to benchmark identical real features without I/O or
+Sinkhorn scales, loss, and feature/classifier gradients. New fixtures use BF16
+autocast without gradient scaling. The saved fixture allows both backends to benchmark identical real features without I/O or
 backbone time in the measurement. It is an operator validation, not a full
 training throughput or downstream-quality measurement.
 
@@ -413,10 +422,10 @@ AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
   --warmup 6 --iterations 20 --profile
 ```
 
-`--compile` uses the existing `max-autotune-no-cudagraphs` iBOT kernels as the
+`--compile` uses regular Inductor compilation (`mode="default"`) for the iBOT
 baseline; the Triton backend supplies its own kernels. Omitting `--features`
-benchmarks seeded synthetic inputs; `--rows`, `--dim`, `--prototypes`, and
-`--chunk-size` control the iBOT workload. No dependencies are installed by these
+benchmarks seeded synthetic inputs (BF16 by default); `--rows`, `--dim`,
+`--prototypes`, and `--chunk-size` control the iBOT workload. No dependencies are installed by these
 commands. CUDA access is required for benchmarks and real-volume validation.
 
 Measured on an RTX 5090, PyTorch 2.10.0+cu128 / Triton 3.6.0, using the above real
@@ -643,13 +652,13 @@ The following settings can be added to a training config:
   architecture, preserve their saved model configuration or explicitly set all
   three old values (`mlp_ratio: 2.6666666666666665` in JSON); changing these
   settings changes parameter shapes and state-dict keys.
-- `attention_backend` (default `null`, PyTorch's choice) names the preferred
+- `attention_backend` (default `"flash"`) names the preferred
   fused attention kernel: `cudnn`, `flash`, `efficient` or `math`, with the others
   as fallbacks. Each attention call applies it, so compiled graphs record the
   choice when traced (a process-wide setting would not reach graphs reloaded from
-  the compile cache). With 4101 tokens and head dimension 48, cuDNN attention
-  takes 7.1 ms forward plus backward per 32 global crops on the H100, against
-  12.4 ms for FlashAttention-2; `pretrain_8_9um.json` uses `cudnn`.
+  the compile cache). Set `null` to use PyTorch's kernel selection, or set
+  `"cudnn"` to prefer cuDNN. Performance depends on the GPU and token shape;
+  `pretrain_8_9um.json` uses `"flash"`.
 - `rope_type` selects the existing 3D `axial` or learnable per-block `mixed`
   implementation. The default is `axial` for `v3`, `mixed` for `v2`, and `axial`
   for the original unversioned model. Both support variable crop sizes and coordinate rescaling.

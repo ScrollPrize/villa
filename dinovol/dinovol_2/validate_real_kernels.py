@@ -73,7 +73,7 @@ def prepare(checkpoint, volume, start):
     counts = (masks & valid).sum(-1).clamp_min(1)
     masks_weight = (1. / counts)[indices // centers.shape[0]]
     teacher_tokens, student_tokens = [], []
-    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         for row, crop in enumerate(crops):
             x = crop.cuda()
             teacher_tokens.append(backbone(x)["x_norm_patchtokens"].cpu())
@@ -86,12 +86,12 @@ def prepare(checkpoint, volume, start):
         selected_teacher = sample_grid_points(grid[source_rows], coordinates, crop_size).to(grid.dtype).flatten(0, 1)[indices]
         selected_student = student_tokens.flatten(0, 1)[indices]
         # The trainer casts normalized bottlenecks to the AMP logit dtype before loss.
-        features = head(selected_student, apply_last_layer=False).to(torch.float16)
-        teacher_features = head(selected_teacher, apply_last_layer=False).to(torch.float16)
+        features = head(selected_student, apply_last_layer=False).to(torch.bfloat16)
+        teacher_features = head(selected_teacher, apply_last_layer=False).to(torch.bfloat16)
         weight = head.last_layer.weight.to(features.dtype)
     result = {
         "metadata": {"checkpoint": str(checkpoint), "volume": str(volume), "origins_zyx": starts,
-                     "crop_size": crop_size, "note": "Teacher checkpoint initializes both masked and unmasked paths"},
+                     "crop_size": crop_size, "amp_dtype": "bfloat16", "note": "Teacher checkpoint initializes both masked and unmasked paths"},
         "grid": grid, "coordinates": coordinates, "source_rows": source_rows, "indices": indices,
         "student_features": features, "teacher_features": teacher_features,
         "student_weight": weight, "teacher_weight": weight, "masks_weight": masks_weight,
@@ -114,7 +114,7 @@ def validate(fixture):
     for backend in ("torch", "triton"):
         loss_fn = iBOTPatchLoss(k, masked_loss_chunk_size=4096, kernel_backend=backend).cuda()
         if backend == "torch":
-            loss_fn.compile_kernels(backend="inductor", mode="max-autotune-no-cudagraphs")
+            loss_fn.compile_kernels(backend="inductor", mode="default")
         s = f["student_features"].clone().requires_grad_()
         w = f["student_weight"].clone().requires_grad_()
         with torch.autocast("cuda", dtype=s.dtype):
@@ -125,7 +125,7 @@ def validate(fixture):
                 s, w, f["teacher_features"], f["teacher_weight"], scales, .07,
                 torch.empty(4, 13824, device="cuda", dtype=torch.bool), f["masks_weight"],
             )
-        (value * 1024).backward()
+        value.backward()
         results.append((scales.detach().cpu(), value.detach().cpu(), s.grad.cpu(), w.grad.cpu()))
         print(f"Validated real-data {backend} forward/backward", flush=True)
     for name, actual, expected in zip(("scales", "loss", "features_grad", "weight_grad"), results[1], results[0]):

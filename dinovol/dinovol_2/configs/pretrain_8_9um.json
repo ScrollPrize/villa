@@ -34,13 +34,13 @@
   "compile": {
     "enabled": true,
     "backend": "inductor",
-    "mode": "max-autotune-no-cudagraphs",
+    "mode": "default",
     "dynamic": {"backbone": false}
   },
   "model": {
     "model_type": "v3",
     "attention_type": "full",
-    "attention_backend": "cudnn",
+    "attention_backend": "flash",
     "embedding_type": "deeper",
     "embed_dim": 480,
     "depth": 10,
@@ -53,7 +53,7 @@
     "deeper_embed_stem_channels": 32,
     "deeper_embed_stem_type": "conv",
     "deeper_embed_final_projection": true,
-    "deeper_embed_batch_chunk_size": null,
+    "deeper_embed_batch_chunk_size": 1,
     "deeper_embed_channels_last": true,
     "global_crops_size": [
       128,

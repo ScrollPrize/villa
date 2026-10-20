@@ -25,7 +25,7 @@ from dinovol_2.model.rope import MixedRopePositionEmbedding, RopePositionEmbeddi
 
 _BACKBONE_DEFAULTS = {
     "attention_type": "full",
-    "attention_backend": None,
+    "attention_backend": "flash",
     "input_channels": 1,
     "global_crops_size": (256, 256, 256),
     "local_crops_size": None,
@@ -67,7 +67,7 @@ _BACKBONE_DEFAULTS = {
 
 _BACKBONE_DEFAULTS_V2 = {
     "attention_type": "full",
-    "attention_backend": None,
+    "attention_backend": "flash",
     "input_channels": 1,
     "global_crops_size": (256, 256, 256),
     "local_crops_size": None,
