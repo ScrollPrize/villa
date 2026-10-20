@@ -242,3 +242,46 @@ TEST_CASE("tiled patch rectangles preserve revision snapshots and logical byte o
     CHECK_THROWS(db.readGeometryRectangle(foreign, first, "points", 0, 0, 1, 1));
     CHECK_THROWS(db.readGeometryRectangles(foreign, first, "points", {{0, 0, 1, 1}}));
 }
+
+TEST_CASE("sparse geometry revisions preserve pinned snapshots and transaction ownership")
+{
+    TempDir tmp("delta_snapshot");
+    auto store = ObjectStore::create(tmp.dir / "objects.vcobj", testOptions());
+    auto foreign = ObjectStore::create(tmp.dir / "foreign.vcobj", testOptions());
+    const auto uid = addObject(store, "track");
+    GeometryData data;
+    data.kind = "track";
+    data.arrays.push_back({"points", "<i4", {2, 3}, std::vector<uint8_t>(24, 0)});
+    std::string first, second, third;
+    {
+        auto w = store.write();
+        first = store.putGeometry(w, uid, data); w.commit();
+    }
+    {
+        auto w = store.write();
+        second = store.editGeometry(w, uid, {{"points", 0, {1, 0, 0, 0}}}, first); w.commit();
+    }
+    auto snapshot = store.read();
+    CHECK(store.readGeometryArray(snapshot, second, "points", 0, 4) == std::vector<uint8_t>{1, 0, 0, 0});
+    {
+        auto w = store.write();
+        CHECK_THROWS(foreign.editGeometry(w, uid, {}, second));
+        third = store.editGeometry(w, uid, {{"points", 0, {2, 0, 0, 0}}}, second); w.commit();
+    }
+    CHECK(store.currentGeometry(snapshot, uid)->uuid == second);
+    CHECK(store.readGeometryArray(snapshot, second, "points", 0, 4) == std::vector<uint8_t>{1, 0, 0, 0});
+    CHECK_FALSE(store.geometryRevision(snapshot, third));
+    snapshot.commit();
+    {
+        auto w = store.write();
+        CHECK_THROWS(store.editGeometry(w, uid, {}, second));
+        const auto reverted = store.editGeometry(w, uid, {{"points", 0, {0, 0, 0, 0}}}, third);
+        CHECK(store.readGeometryArray(w, reverted, "points") == data.arrays[0].bytes);
+        // Roll back a published delta and its materialized current chunks.
+    }
+    auto r = store.read();
+    CHECK(store.currentGeometry(r, uid)->uuid == third);
+    CHECK(store.geometryHistory(r, uid).size() == 3);
+    CHECK(store.readGeometryArray(r, second, "points", 0, 4) == std::vector<uint8_t>{1, 0, 0, 0});
+    CHECK(store.readGeometryArray(r, third, "points", 0, 4) == std::vector<uint8_t>{2, 0, 0, 0});
+}

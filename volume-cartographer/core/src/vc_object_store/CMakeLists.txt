@@ -17,6 +17,7 @@ add_library(vc_objects STATIC
     sync/Synchronize.cpp
     sync/GeometryTransfer.cpp
     geometry/Geometry.cpp
+    geometry/GeometryDelta.cpp
     geometry/GeometryReader.cpp
     relationships/Edges.cpp
     relationships/Traversal.cpp
@@ -29,7 +30,7 @@ if(TARGET SQLite3::SQLite3)
 else()
     target_link_libraries(vc_objects PUBLIC SQLite::SQLite3)
 endif()
-target_link_libraries(vc_objects PRIVATE nlohmann_json::nlohmann_json OpenSSL::Crypto)
+target_link_libraries(vc_objects PRIVATE nlohmann_json::nlohmann_json OpenSSL::Crypto zstd::libzstd)
 target_compile_features(vc_objects PUBLIC cxx_std_20)
 set_target_properties(vc_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

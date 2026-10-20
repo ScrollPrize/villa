@@ -321,6 +321,16 @@ public:
     // dependencies) or removal. Does not publish geometry or modify edges.
     std::vector<EdgeRecord> affectedGeometryEdges(const Txn&, const std::string& objectUuid,
                                                 const GeometryData&) const;
+    // Sparse, lossless, compressed edits. One call publishes one revision in
+    // the caller's transaction. expectedRevision is mandatory, even for no-ops.
+    // No automatic checkpoints. Use putGeometry for structural replacements.
+    std::string editGeometry(WriteTxn&, const std::string& objectUuid,
+                             const std::vector<GeometryArrayEdit>&,
+                             const std::string& expectedRevision,
+                             const std::vector<GeometryEdgeEdit>& edgeEdits = {});
+    std::vector<EdgeRecord> affectedGeometryEditEdges(const Txn&, const std::string& objectUuid,
+                             const std::vector<GeometryArrayEdit>&,
+                             const std::string& expectedRevision) const;
     std::optional<GeometryRevision> currentGeometry(const Txn& txn, const std::string& objectUuid) const;
     std::optional<GeometryRevision> geometryRevision(const Txn& txn, const std::string& revisionUuid) const;
     std::vector<GeometryRevision> geometryHistory(const Txn& txn, const std::string& objectUuid) const;

@@ -129,6 +129,30 @@ CREATE TABLE edge_geometry_bindings(
   a_revision BLOB, b_revision BLOB
 );
 )SQL";
+// Immutable history stores only delta payloads. The materialization is a
+// replaceable overlay on the last explicit snapshot, never another checkpoint.
+const char* kGeometryDeltaSchema = R"SQL(
+CREATE TABLE geometry_deltas(
+  revision_uuid BLOB PRIMARY KEY REFERENCES geometry_revisions(uuid),
+  data BLOB NOT NULL,
+  manifest_hash TEXT NOT NULL CHECK(length(manifest_hash)=64)
+);
+CREATE TRIGGER geometry_deltas_immutable_update BEFORE UPDATE ON geometry_deltas
+  BEGIN SELECT RAISE(ABORT,'geometry deltas are immutable'); END;
+CREATE TRIGGER geometry_deltas_immutable_delete BEFORE DELETE ON geometry_deltas
+  BEGIN SELECT RAISE(ABORT,'geometry deltas are retained'); END;
+CREATE TABLE geometry_materializations(
+  object_uuid BLOB PRIMARY KEY REFERENCES objects(uuid),
+  revision_uuid BLOB NOT NULL REFERENCES geometry_revisions(uuid),
+  manifest TEXT NOT NULL CHECK(json_valid(manifest))
+);
+CREATE TABLE geometry_current_chunks(
+  object_uuid BLOB NOT NULL REFERENCES objects(uuid),
+  array_name TEXT NOT NULL, chunk_index INTEGER NOT NULL,
+  hash TEXT NOT NULL, data BLOB NOT NULL,
+  PRIMARY KEY(object_uuid,array_name,chunk_index)
+);
+)SQL";
 const char* kSyncSchema = R"SQL(
 CREATE TABLE sync_replica(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid TEXT NOT NULL);
 CREATE TABLE sync_baselines(seq INTEGER PRIMARY KEY AUTOINCREMENT, peer TEXT NOT NULL,
@@ -169,6 +193,7 @@ void createSchema(sqlite3* db) {
     exec(db, kConsumerQueryIndexes);
     exec(db, kEdgeGeometrySchema);
     exec(db, kObjectGeometrySchema);
+    exec(db, kGeometryDeltaSchema);
     createSyncSchema(db);
     detail::createSpatialSchema(db);
     exec(db, "CREATE TABLE store_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid BLOB NOT NULL UNIQUE CHECK(length(uuid)=16));");

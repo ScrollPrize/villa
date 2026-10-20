@@ -88,6 +88,74 @@ transaction sees a consistent snapshot. For independent copies, establish a
 shared baseline with `synchronize` before editing, then review conflicting
 records and choose a side explicitly.
 
+## Sparse geometry edits
+
+`edit_geometry` / `ObjectStore::editGeometry` replaces scalar ranges in existing
+geometry arrays. It is independent of application tools and works with every
+supported array dtype and geometry kind, including auxiliary arrays. Offsets
+count **scalar elements in the flattened C-order array**, not bytes or points:
+XYZ point 5 begins at element 15. Supply exact little-endian bytes in the existing
+dtype. An edit cannot change array shape, dtype, names, or geometry attributes;
+use `put_geometry` for ingestion and explicit full/structural replacements.
+
+```python
+import struct
+
+current = store.current_geometry(object_uuid)
+edits = [
+    {"array": "points", "element_offset": 15,
+     "data": struct.pack("<3f", 12.0, 24.0, 36.0)},  # float32 example
+]
+affected = store.affected_geometry_edit_edges(
+    object_uuid, edits, expected_revision=current["uuid"])
+# If affected is nonempty, supply explicit edge_edits decisions, as for put_geometry.
+with store.write() as tx:
+    revision = tx.edit_geometry(
+        object_uuid, edits, expected_revision=current["uuid"], edge_edits=[])
+```
+
+One call creates at most one revision in the caller's transaction. Standalone
+Python calls commit their own transaction. Overlapping ranges are applied in
+input order (last write wins), original bytes come from the expected revision,
+and net no-ops produce no revision or journal entry. Stale revisions fail even
+for empty/no-op edits. Publication is savepoint-protected: a failed edit leaves
+the caller's transaction usable. Geometry, current storage, spatial bounds,
+relationship decisions, and approval changes publish atomically.
+
+Schema v8 retains initial/full snapshots and stores subsequent sparse revisions
+as immutable deltas. Within each changed physical chunk, the versioned binary
+encoding stores byte-range gaps/lengths as varints, original bytes, and exact
+bitwise XOR bytes. Each revision's payload uses Zstandard level 1 when smaller,
+otherwise raw bytes. Payload and manifest checksums, original/result chunk
+hashes, and a 256 MiB decoded-delta limit protect reconstruction. This is
+lossless for integers and all floating-point bit patterns, including signed
+zero and NaN payloads. It does not replay numerical operations.
+
+The current geometry is a replaceable chunk overlay on its full snapshot,
+with one complete current manifest. Delta revisions retain compact array
+descriptors and changed-chunk hashes, not full tile-reference lists. Only
+touched payload chunks and spatial regions are updated; manifest bookkeeping
+and aggregate spatial bounds still scale with the object's chunk/region count.
+`content_hash` continues to identify the complete resolved geometry manifest,
+independent of whether its revision uses a snapshot or delta.
+
+There are **no automatic checkpoints or recovery saves**. Existing revision,
+range, rectangle, packed-array, export, and synchronization APIs accept either
+representation. Historical reads verify the manifest chain back to the last
+explicit snapshot, then reconstruct touched chunks from that snapshot or reverse
+a shorter suffix from the current materialization when the target is its
+ancestor. Current reads do not replay history. Older historical reads can become
+slower as history grows; there is no pruning API. Metadata/relationship history
+is not reconstructed by geometry deltas.
+SQLite WAL checkpointing is separate from geometry checkpoints: long-lived read
+transactions can retain older current-tile pages in the WAL, temporarily using
+more disk space than the retained delta history.
+
+Writable opens upgrade older databases without rewriting their retained
+snapshots. Legacy snapshot databases remain readable in read-only mode.
+`put_geometry` retains its full-snapshot behavior; callers opt into sparse edits
+through the new API. VC3D's tools, undo stack, and file-save path are unchanged.
+
 ## Tests
 
 Run the focused suite against the existing build and Python environment:

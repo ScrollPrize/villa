@@ -1,6 +1,7 @@
 #include "sync/GeometryTransfer.hpp"
 #include "internal/Database.hpp"
 #include "geometry/GeometryInternal.hpp"
+#include "geometry/GeometryDelta.hpp"
 
 namespace vc::objects::detail {
 namespace {
@@ -31,8 +32,7 @@ void transferGeometry(sqlite3* source, sqlite3* destination, const std::string& 
     revisions.bindBlob(1, parseUuid(objectUuid)); revisions.bind(2, afterRow);
     while (revisions.row()) {
         const auto manifest = revisions.text(4);
-        if (geometryHash(std::span(reinterpret_cast<const uint8_t*>(manifest.data()), manifest.size())) != revisions.text(3))
-            throw std::runtime_error("sync: corrupt geometry manifest");
+        const auto parsed = loadGeometryManifest(source, formatUuid(revisions.blob16(0)), manifest, revisions.text(3));
         Statement existing(destination, "SELECT " + columns + " FROM geometry_revisions WHERE uuid=?");
         existing.bindBlob(1, revisions.blob16(0));
         const bool present = existing.row();
@@ -41,10 +41,25 @@ void transferGeometry(sqlite3* source, sqlite3* destination, const std::string& 
         // revisions need no payload I/O; verify every chunk of incoming revisions.
         if (present) continue;
         insertRow(destination, revisions, "INSERT INTO geometry_revisions VALUES(?,?,?,?,?,?,?,?,?)");
+        if (parsed.contains("delta")) {
+            const auto uuid = formatUuid(revisions.blob16(0));
+            const auto changes = decodeGeometryDelta(source, uuid, parsed);
+            if (revisions.isNull(2)) throw std::runtime_error("sync: delta has no parent");
+            GeometryReader parent(source, formatUuid(revisions.blob16(2)));
+            for (const auto& c : changes) {
+                auto bytes = parent.chunk(c.key.first, c.key.second);
+                applyGeometryDelta(bytes, c);
+            }
+            Statement payload(source, "SELECT revision_uuid,data,manifest_hash FROM geometry_deltas WHERE revision_uuid=?");
+            payload.bindBlob(1, revisions.blob16(0)); payload.row();
+            insertRow(destination, payload, "INSERT INTO geometry_deltas VALUES(?,?,?)");
+            // Resolve/validate ancestry and the resulting manifest as well.
+            GeometryReader incoming(destination, uuid);
+            continue;
+        }
         Statement chunks(source, "SELECT r.array_name,r.chunk_index,c.hash,c.data FROM geometry_revision_chunks r "
             "JOIN geometry_chunks c ON c.hash=r.hash WHERE r.revision_uuid=? ORDER BY r.array_name,r.chunk_index");
         chunks.bindBlob(1, revisions.blob16(0));
-        const auto parsed = nlohmann::json::parse(manifest);
         size_t count = 0, expected = 0;
         std::map<std::string, GeometryLayout> layouts;
         for (const auto& [name, array] : parsed.at("arrays").items()) {

@@ -36,6 +36,17 @@ struct GeometryStorageOptions {
     int64_t patchTileSize = 128; // supported sizes: 0, 32, 64, 128 vertices
 };
 
+// Replace a contiguous range of scalar elements in an existing array.
+// elementOffset indexes the flattened C-order array (XYZ is three elements).
+// Bytes use the array's existing little-endian dtype. Shape/dtype/attributes
+// remain unchanged. Edits are applied in order; overlapping writes use the last
+// value. The store captures original bytes and removes net no-ops.
+struct GeometryArrayEdit {
+    std::string array;
+    int64_t elementOffset = 0;
+    std::vector<uint8_t> bytes;
+};
+
 // Descriptors do not load payloads. Revision UUIDs are independent of object
 // UUIDs and content hashes. Parentage records edits, including undo/reverts.
 struct GeometryRevision {

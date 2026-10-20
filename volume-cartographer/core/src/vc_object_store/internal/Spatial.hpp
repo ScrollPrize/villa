@@ -7,6 +7,8 @@ using Bounds = std::array<double, 6>;
 void validateBounds(const Bounds&);
 std::optional<Bounds> recordBounds(const ObjectRecord&);
 void indexGeometryBounds(sqlite3*, int64_t objectId, const std::string& revision, const GeometryData&);
+void updateEditedGeometryBounds(sqlite3*, int64_t objectId, const std::string& revision,
+                                const std::vector<GeometryArrayEdit>&);
 void migrateSpatialRegions(sqlite3*);
 std::string spatialOverlapSql(int firstParameter = 1);
 void setSpatialBounds(sqlite3*, int64_t objectId, const std::optional<Bounds>&,

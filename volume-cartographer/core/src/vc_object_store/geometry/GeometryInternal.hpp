@@ -90,7 +90,7 @@ inline void validatePatchTileSize(int64_t size) {
     if (size != 0 && size != 32 && size != 64 && size != 128)
         throw std::invalid_argument("patch tile size must be 0 (linear), 32, 64, or 128");
 }
-inline GeometryLayout geometryLayout(const nlohmann::json& array)
+inline GeometryLayout geometryLayout(const nlohmann::json& array, bool checkChunks = true)
 {
     GeometryLayout result;
     const auto shape = array.at("shape").get<std::vector<int64_t>>();
@@ -107,7 +107,7 @@ inline GeometryLayout geometryLayout(const nlohmann::json& array)
         if (!result.tile) throw std::runtime_error("geometry: invalid tiled layout");
         result.rows = shape[0]; result.cols = shape[1];
     }
-    if (!array.at("chunks").is_array() || array.at("chunks").size() != static_cast<size_t>(result.chunkCount()))
+    if (checkChunks && (!array.at("chunks").is_array() || array.at("chunks").size() != static_cast<size_t>(result.chunkCount())))
         throw std::runtime_error("geometry: inconsistent chunk count");
     return result;
 }

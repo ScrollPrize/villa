@@ -278,6 +278,22 @@ vo::EdgeRecord edgeFromPy(const nb::dict& d)
     return e;
 }
 
+std::vector<vo::GeometryArrayEdit> geometryEditsFromPy(const nb::list& input)
+{
+    std::vector<vo::GeometryArrayEdit> result;
+    for (const auto item : input) {
+        const auto entry = nb::cast<nb::dict>(item);
+        const auto bytes = nb::cast<nb::bytes>(entry["data"]);
+        vo::GeometryArrayEdit edit;
+        edit.array = nb::cast<std::string>(entry["array"]);
+        edit.elementOffset = nb::cast<int64_t>(entry["element_offset"]);
+        const auto* p = reinterpret_cast<const uint8_t*>(bytes.c_str());
+        edit.bytes.assign(p, p + bytes.size());
+        result.push_back(std::move(edit));
+    }
+    return result;
+}
+
 vo::GeometryData geometryFromPy(const nb::dict& input)
 {
     vo::GeometryData result;

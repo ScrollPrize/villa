@@ -1,4 +1,5 @@
 #include "geometry/GeometryReader.hpp"
+#include "geometry/GeometryDelta.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -83,16 +84,100 @@ GeometryReader::GeometryReader(const Txn& txn, const std::string& revision, bool
 GeometryReader::GeometryReader(sqlite3* db, const std::string& revision, bool cacheChunks)
     : db_(db), revision_(parseUuid(revision)), cacheChunks_(cacheChunks)
 {
-    Statement row(db_, "SELECT content_hash,manifest FROM geometry_revisions WHERE uuid=?");
+    Statement row(db_, "SELECT content_hash,manifest,object_uuid,parent_uuid FROM geometry_revisions WHERE uuid=?");
     row.bindBlob(1, revision_);
     if (!row.row()) throw std::invalid_argument("geometry: revision not found");
     const auto text = row.text(1);
     // Charge JSON nodes/strings, layouts and cache bookkeeping conservatively,
     // in addition to the separately accounted retained payload bytes.
     metadataCharge_ = text.size() * 32 + 4096;
-    manifest_ = verifiedGeometryManifest(text, row.text(0));
+    manifest_ = loadGeometryManifest(db_, revision, text, row.text(0));
+    if (manifest_.contains("delta")) {
+        const auto target = manifest_;
+        const auto object = row.blob16(2);
+        baseRevision_ = target.at("delta").at("base").get<std::string>();
+        Statement current(db_, "SELECT manifest FROM geometry_materializations WHERE object_uuid=? AND revision_uuid=?");
+        current.bindBlob(1, object); current.bindBlob(2, revision_);
+        if (current.row()) {
+            const auto full = current.text(0);
+            manifest_ = verifiedGeometryManifest(full, target.at("delta").at("result_hash"));
+            auto compact = manifest_;
+            for (auto& a : compact.at("arrays")) a.erase("chunks");
+            auto expected = target; expected.erase("delta");
+            if (compact != expected) throw std::runtime_error("geometry delta: materialized layout mismatch");
+            materializedObject_ = formatUuid(object);
+        } else {
+            auto descriptor = target;
+            auto id = revision;
+            auto parent = row.isNull(3) ? std::string() : formatUuid(row.blob16(3));
+            std::set<std::string> seen;
+            while (descriptor.contains("delta")) {
+                if (!seen.insert(id).second || parent.empty())
+                    throw std::runtime_error("geometry delta: cyclic or missing parent");
+                deltas_.emplace_back(id, descriptor);
+                Statement previous(db_, "SELECT content_hash,manifest,parent_uuid,object_uuid FROM geometry_revisions WHERE uuid=?");
+                previous.bindBlob(1, parseUuid(parent));
+                if (!previous.row() || previous.blob16(3) != object ||
+                    previous.text(0) != descriptor.at("delta").at("parent_hash").get<std::string>())
+                    throw std::runtime_error("geometry delta: invalid parent");
+                id = parent;
+                descriptor = loadGeometryManifest(db_, id, previous.text(1), previous.text(0));
+                parent = previous.isNull(2) ? std::string() : formatUuid(previous.blob16(2));
+            }
+            if (id != baseRevision_) throw std::runtime_error("geometry delta: invalid base");
+            manifest_ = descriptor;
+            std::reverse(deltas_.begin(), deltas_.end());
+            for (const auto& [deltaId, delta] : deltas_) {
+                if (delta.at("delta").at("base") != baseRevision_)
+                    throw std::runtime_error("geometry delta: inconsistent base");
+                auto compact = manifest_;
+                for (auto& a : compact.at("arrays")) a.erase("chunks");
+                auto expected = delta; expected.erase("delta");
+                if (compact != expected) throw std::runtime_error("geometry delta: layout changed");
+                for (const auto& c : delta.at("delta").at("chunks")) {
+                    auto& hash = manifest_.at("arrays").at(c.at("array").get<std::string>()).at("chunks").at(c.at("index").get<int64_t>());
+                    if (hash != c.at("before")) throw std::runtime_error("geometry delta: parent hash mismatch");
+                    hash = c.at("after");
+                }
+                if (hashText(manifest_.dump()) != delta.at("delta").at("result_hash").get<std::string>())
+                    throw std::runtime_error("geometry delta: manifest result mismatch");
+                metadataCharge_ += delta.dump().size() * 32 + 256;
+            }
+            // Historical manifests are verified against their immutable base.
+            // For payloads, reversing a shorter current-head suffix avoids
+            // replaying a long prefix. Stop at branches/explicit replacements.
+            Statement tip(db_, "SELECT revision_uuid FROM geometry_materializations WHERE object_uuid=?");
+            tip.bindBlob(1, object);
+            if (tip.row()) {
+                const auto head = formatUuid(tip.blob16(0));
+                auto cursor = head;
+                std::vector<std::pair<std::string, nlohmann::json>> reverse;
+                while (cursor != revision && reverse.size() + 1 < deltas_.size()) {
+                    Statement step(db_, "SELECT manifest,content_hash,parent_uuid,object_uuid FROM geometry_revisions WHERE uuid=?");
+                    step.bindBlob(1, parseUuid(cursor));
+                    if (!step.row() || step.isNull(2) || step.blob16(3) != object) break;
+                    auto m = loadGeometryManifest(db_, cursor, step.text(0), step.text(1));
+                    if (!m.contains("delta") || m.at("delta").at("base") != baseRevision_) break;
+                    reverse.emplace_back(cursor, std::move(m));
+                    cursor = formatUuid(step.blob16(2));
+                }
+                if (cursor == revision && !reverse.empty()) {
+                    reverseSource_ = std::make_unique<GeometryReader>(db_, head, false);
+                    deltas_ = std::move(reverse);
+                    metadataCharge_ += reverseSource_->retainedCharge();
+                }
+            }
+        }
+        metadataCharge_ += manifest_.dump().size() * 32;
+    }
     for (const auto& [name, array] : manifest_.at("arrays").items())
         layouts_.emplace(name, geometryLayout(array));
+}
+
+std::vector<uint8_t> GeometryReader::chunk(const std::string& name, int64_t index) {
+    std::vector<uint8_t> result;
+    visitChunk(name, index, [&](auto bytes) { result.assign(bytes.begin(), bytes.end()); });
+    return result;
 }
 
 void GeometryReader::visitChunk(const std::string& name, int64_t index,
@@ -107,13 +192,50 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
     }
     const auto expectedSize = layouts_.at(name).chunkBytes(index);
     const auto& expectedHash = manifest_.at("arrays").at(name).at("chunks").at(index).get_ref<const std::string&>();
-    Statement chunk(db_, "SELECT c.data,r.hash FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "
-                         "WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?");
-    chunk.bindBlob(1, revision_); chunk.bind(2, name); chunk.bind(3, index);
-    if (!chunk.row()) throw std::runtime_error("geometry: missing payload chunk");
-    const auto bytes = std::span(static_cast<const uint8_t*>(sqlite3_column_blob(chunk.value, 0)),
-                                static_cast<size_t>(sqlite3_column_bytes(chunk.value, 0)));
-    verifyGeometryChunk(bytes, chunk.text(1), expectedHash, expectedSize);
+    std::vector<uint8_t> owned;
+    std::string storedHash;
+    if (!materializedObject_.empty()) {
+        Statement current(db_, "SELECT data,hash FROM geometry_current_chunks WHERE object_uuid=? AND array_name=? AND chunk_index=?");
+        current.bindBlob(1, parseUuid(materializedObject_)); current.bind(2, name); current.bind(3, index);
+        if (current.row()) {
+            const auto* p = static_cast<const uint8_t*>(sqlite3_column_blob(current.value, 0));
+            owned.assign(p, p + sqlite3_column_bytes(current.value, 0));
+            storedHash = current.text(1);
+        }
+    }
+    if (reverseSource_) {
+        owned = reverseSource_->chunk(name, index);
+        storedHash = reverseSource_->manifest().at("arrays").at(name).at("chunks").at(index);
+        for (const auto& [id, delta] : deltas_) {
+            bool touched = false;
+            for (const auto& c : delta.at("delta").at("chunks"))
+                if (c.at("array") == name && c.at("index") == index) { touched = true; break; }
+            if (!touched) continue;
+            for (const auto& c : decodeGeometryDelta(db_, id, delta)) if (c.key == key) {
+                applyGeometryDelta(owned, c, true); storedHash = c.beforeHash;
+            }
+        }
+    } else if (storedHash.empty()) {
+        Statement chunk(db_, "SELECT c.data,r.hash FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "
+                             "WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?");
+        chunk.bindBlob(1, baseRevision_.empty() ? revision_ : parseUuid(baseRevision_)); chunk.bind(2, name); chunk.bind(3, index);
+        if (!chunk.row()) throw std::runtime_error("geometry: missing payload chunk");
+        const auto* p = static_cast<const uint8_t*>(sqlite3_column_blob(chunk.value, 0));
+        owned.assign(p, p + sqlite3_column_bytes(chunk.value, 0)); storedHash = chunk.text(1);
+        verifyGeometryChunk(owned, storedHash, storedHash, expectedSize);
+        for (const auto& [id, delta] : deltas_) {
+            bool touched = false;
+            for (const auto& c : delta.at("delta").at("chunks"))
+                if (c.at("array") == name && c.at("index") == index) { touched = true; break; }
+            if (!touched) continue;
+            const auto changes = decodeGeometryDelta(db_, id, delta);
+            for (const auto& c : changes) if (c.key == key) {
+                applyGeometryDelta(owned, c); storedHash = c.afterHash;
+            }
+        }
+    }
+    const auto bytes = std::span<const uint8_t>(owned);
+    verifyGeometryChunk(bytes, storedHash, expectedHash, expectedSize);
     if (!cacheChunks_) { visit(bytes); return; }
     // Bound bytes, not chunk count: tiled chunks are smaller than linear ones.
     constexpr size_t budget = 8 * geometryChunkSize;
@@ -319,7 +441,32 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
         bind(manifests, begin, count);
         while (manifests.row()) {
             if (manifests.isNull(1)) throw std::invalid_argument("geometry: revision not found");
-            auto manifest = verifiedGeometryManifest(manifests.text(2), manifests.text(1));
+            auto manifest = loadGeometryManifest(db, revisions[begin + size_t(manifests.i64(0))], manifests.text(2), manifests.text(1));
+            if (manifest.contains("delta")) {
+                // Snapshot-only batches keep the SQL fast path below. Mixed
+                // batches use the same verified reader as all other APIs.
+                PackedGeometryArray packed;
+                for (const auto& revision : revisions) {
+                    GeometryReader reader(db, revision, false);
+                    const auto& arrays = reader.manifest().at("arrays");
+                    if (!arrays.contains(name)) throw std::invalid_argument("geometry: array not found: " + name);
+                    const auto& a = arrays.at(name);
+                    const auto shape = a.at("shape").get<std::vector<int64_t>>();
+                    const std::string dtype = a.at("dtype");
+                    if (packed.offsets.size() == 1) { packed.dtype = dtype; packed.shape = shape; packed.shape[0] = 0; }
+                    if (packed.dtype != dtype || packed.shape.size() != shape.size() ||
+                        !std::equal(shape.begin()+1, shape.end(), packed.shape.begin()+1))
+                        throw std::invalid_argument("geometry: packed arrays require matching dtype and trailing dimensions");
+                    const auto length = geometryLayout(a).length;
+                    if (shape[0] > std::numeric_limits<int64_t>::max() - packed.shape[0] ||
+                        uint64_t(length) > packed.data.max_size() - packed.data.size())
+                        throw std::overflow_error("geometry: packed array size overflow");
+                    auto bytes = reader.read(name, 0);
+                    packed.data.insert(packed.data.end(), bytes.begin(), bytes.end());
+                    packed.shape[0] += shape[0]; packed.offsets.push_back(packed.shape[0]);
+                }
+                return packed;
+            }
             const auto& descriptors = manifest.at("arrays");
             if (!descriptors.contains(name)) throw std::invalid_argument("geometry: array not found: " + name);
             GeometryLayout layout;
