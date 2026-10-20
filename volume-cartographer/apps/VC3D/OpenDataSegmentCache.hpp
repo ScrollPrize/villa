@@ -173,6 +173,14 @@ materializeOpenDataSegmentFolder(
 [[nodiscard]] std::vector<OpenDataInkDetectionEntry> cachedInkDetectionsForSegmentDirectory(
     const std::filesystem::path& segmentDir);
 
+// Adds one locally produced ink detection (for example from a plugin run) to
+// the segment's ink-detections.json, keeping every record the segment already
+// lists there or in catalog-origin.json. entry.localPath may be absolute.
+// Throws std::runtime_error when the folder is missing or the write fails.
+void appendInkDetectionForSegmentDirectory(
+    const std::filesystem::path& segmentDir,
+    const OpenDataInkDetectionEntry& entry);
+
 // Return the outermost registered immutable Open Data root that contains the
 // segment. Using the outermost root keeps editable copies outside every
 // protected catalog entry, including legacy nested representation entries.

@@ -1,0 +1,12 @@
+{
+  "schema": "vc3d-plugin/1",
+  "id": "villa.tifxyz2obj",
+  "name": "Export active segment as OBJ",
+  "description": "Runs vc_tifxyz2obj on the active segment and writes the mesh into the run folder.",
+  "menu": "Volume Cartographer",
+  "program": "vc_tifxyz2obj",
+  "args": ["{segment}", "{output}/{segment_id}.obj", "--normalize-uv"],
+  "result": {"kind": "file", "path": "{output}/{segment_id}.obj"},
+  "homepage": "https://github.com/ScrollPrize/villa/tree/main/volume-cartographer",
+  "license": "GPL-3.0"
+}

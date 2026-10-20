@@ -7,6 +7,14 @@ add_test(NAME surface_transform_name COMMAND test_surface_transform_name)
 vc_register_test_target(test_surface_transform_name)
 vc_register_ctest(surface_transform_name test_surface_transform_name)
 
+add_executable(test_plugin_manifest test_plugin_manifest.cpp
+    ../plugins/PluginManifest.cpp ../plugins/PluginManifest.hpp)
+target_include_directories(test_plugin_manifest PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_plugin_manifest PRIVATE Qt6::Core)
+add_test(NAME plugin_manifest COMMAND test_plugin_manifest)
+vc_register_test_target(test_plugin_manifest)
+vc_register_ctest(plugin_manifest test_plugin_manifest)
+
 add_executable(test_volume_path_labels test_volume_path_labels.cpp
     ../elements/VolumeSelector.cpp ../elements/VolumeSelector.hpp)
 set_target_properties(test_volume_path_labels PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)

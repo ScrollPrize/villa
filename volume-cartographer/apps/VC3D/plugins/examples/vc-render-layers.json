@@ -1,0 +1,13 @@
+{
+  "schema": "vc3d-plugin/1",
+  "id": "villa.render-layers",
+  "name": "Render 31 layers of active segment",
+  "description": "Runs vc_render_tifxyz on the current local volume and the active segment with the same defaults as Render segment (scale 1, level 0, 31 layers).",
+  "menu": "Volume Cartographer",
+  "program": "vc_render_tifxyz",
+  "args": ["--volume", "{volume}", "--segmentation", "{segment}", "--tif-output", "{output}/layers",
+           "--scale", "1", "--group-idx", "0", "--num-slices", "31"],
+  "result": {"kind": "none"},
+  "homepage": "https://github.com/ScrollPrize/villa/tree/main/volume-cartographer",
+  "license": "GPL-3.0"
+}

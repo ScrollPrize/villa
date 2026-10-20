@@ -106,6 +106,7 @@ class CommandLineToolRunner;
 class SegmentationModule;
 class SurfacePanelController;
 class MenuActionController;
+class PluginController;
 class VolumeAttachmentController;
 class ProjectAttachmentController;
 class SegmentationGrower;
@@ -531,6 +532,7 @@ private:
     std::unique_ptr<VolumeAttachmentController> _volumeAttachmentController;
     std::unique_ptr<ProjectAttachmentController> _projectAttachmentController;
     std::unique_ptr<MenuActionController> _menuController;
+    PluginController* _pluginController{nullptr};
     std::unique_ptr<SurfaceAffineTransformController> _surfaceAffineTransforms;
     // runner for command line tools
     CommandLineToolRunner* _cmdRunner;

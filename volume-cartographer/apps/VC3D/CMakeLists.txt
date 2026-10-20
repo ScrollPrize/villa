@@ -220,6 +220,10 @@ set(srcs
     MenuActionController.hpp
     SshPrompts.cpp
     SshPrompts.hpp
+    plugins/PluginController.cpp
+    plugins/PluginController.hpp
+    plugins/PluginManifest.cpp
+    plugins/PluginManifest.hpp
     VolumeAttachmentController.cpp
     VolumeAttachmentController.hpp
     ProjectAttachmentController.cpp

@@ -1427,6 +1427,46 @@ TEST_CASE("OpenDataSegmentCache discovers cached ink detection overlays")
     std::filesystem::remove_all(cacheRoot);
 }
 
+TEST_CASE("OpenDataSegmentCache appends a local ink detection without hiding catalog records")
+{
+    const auto cacheRoot = std::filesystem::temp_directory_path() /
+                           ("vc_open_data_ink_append_test_" + std::to_string(vc::memmap::pid()));
+    std::filesystem::remove_all(cacheRoot);
+    const auto segmentDir = cacheRoot / "segment";
+    // Catalog segments list their detections in catalog-origin.json until an
+    // ink-detections.json exists; the append must carry those records over.
+    writeFile(segmentDir / "catalog-origin.json",
+              R"({"sample_id":"PHerc0139","segment_id":"20260311000000",
+                  "ink_detections":[{"label":"catalog","local_file":"ink-detections/catalog.jpg"}]})");
+    writeFile(segmentDir / "ink-detections" / "catalog.jpg", "not-empty");
+    const auto runImage = cacheRoot / "run" / "prediction.png";
+    writeFile(runImage, "not-empty");
+
+    OpenDataInkDetectionEntry added;
+    added.label = "plugin run";
+    added.segmentId = "20260311000000";
+    added.artifactType = "plugin:example.ink";
+    added.localPath = runImage;
+    appendInkDetectionForSegmentDirectory(segmentDir, added);
+
+    const auto detections = cachedInkDetectionsForSegmentDirectory(segmentDir);
+    REQUIRE(detections.size() == 2);
+    CHECK(detections[0].label == "catalog");
+    CHECK(detections[0].localPath == segmentDir / "ink-detections" / "catalog.jpg");
+    CHECK(detections[1].label == "plugin run");
+    CHECK(detections[1].artifactType == "plugin:example.ink");
+    CHECK(detections[1].localPath == runImage);
+
+    // A second append keeps both earlier records.
+    added.label = "plugin run 2";
+    appendInkDetectionForSegmentDirectory(segmentDir, added);
+    CHECK(cachedInkDetectionsForSegmentDirectory(segmentDir).size() == 3);
+
+    CHECK_THROWS(appendInkDetectionForSegmentDirectory(cacheRoot / "missing", added));
+
+    std::filesystem::remove_all(cacheRoot);
+}
+
 TEST_CASE("OpenDataSegmentCache reports local freshness against the live manifest")
 {
     const auto manifest = parseOpenDataManifest(kFixture);

@@ -157,6 +157,7 @@
 #include "SurfacePanelController.hpp"
 #include "elements/DropdownChecklistButton.hpp"
 #include "MenuActionController.hpp"
+#include "plugins/PluginController.hpp"
 #include "VolumeAttachmentController.hpp"
 #include "ProjectAttachmentController.hpp"
 #include "FileWatcherService.hpp"
@@ -2924,6 +2925,19 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     // create menus/actions controller
     _menuController = std::make_unique<MenuActionController>(this);
     _menuController->populateMenus(menuBar());
+    // Plugins menu: external tools declared by JSON manifests (docs/plugins.md).
+    _pluginController = new PluginController(
+        PluginController::Host{
+            this,
+            _state,
+            _inkDetectionOverlay.get(),
+            [this]() -> CommandLineToolRunner* {
+                return initializeCommandLineRunner() ? _cmdRunner : nullptr;
+            },
+            [this]() { refreshCurrentVolumePackageUi(QString(), true); },
+            [this](const QString& text, int timeout) { showStatusBarMessage(text, timeout); }},
+        this);
+    _pluginController->installMenu(menuBar());
     // Wire the Actions -> Merge tifxyz... menu entry to the handler.
     // Has to happen here (not inside CreateWidgets) because
     // _menuController is created after CreateWidgets() returns.

@@ -2063,6 +2063,37 @@ std::vector<OpenDataInkDetectionEntry> cachedInkDetectionsForSegmentDirectory(
     return out;
 }
 
+void appendInkDetectionForSegmentDirectory(
+    const std::filesystem::path& segmentDir,
+    const OpenDataInkDetectionEntry& entry)
+{
+    if (!std::filesystem::is_directory(segmentDir)) {
+        throw std::runtime_error("segment folder not found: " + segmentDir.string());
+    }
+    if (entry.localPath.empty()) {
+        throw std::runtime_error("ink detection has no image path");
+    }
+
+    // Once ink-detections.json exists it replaces the catalog-origin list, so
+    // start from whatever the segment shows today and keep every record.
+    nlohmann::json records = nlohmann::json::array();
+    for (auto& record : readInkDetectionRecords(segmentDir)) {
+        records.push_back(std::move(record));
+    }
+
+    nlohmann::json record = nlohmann::json::object();
+    record["label"] = entry.label.empty() ? entry.localPath.filename().string() : entry.label;
+    record["local_file"] = entry.localPath.string();
+    if (!entry.sampleId.empty()) record["sample_id"] = entry.sampleId;
+    if (!entry.segmentId.empty()) record["segment_id"] = entry.segmentId;
+    if (!entry.segmentLongId.empty()) record["segment_long_id"] = entry.segmentLongId;
+    if (!entry.artifactType.empty()) record["artifact_type"] = entry.artifactType;
+    if (!entry.sourceUrl.empty()) record["original_source_uri"] = entry.sourceUrl;
+    records.push_back(std::move(record));
+
+    writeStringAtomic(segmentDir / "ink-detections.json", records.dump(2));
+}
+
 namespace {
 
 struct RegisteredCatalogEntry {
