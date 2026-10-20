@@ -420,10 +420,6 @@ class TrackCrossingCacheTests(unittest.TestCase):
         np.testing.assert_array_equal(order, expected)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class DbSignatureMatchTests(unittest.TestCase):
     NS = 1785295357776482751                 # a real DBM mtime_ns; mirrors keep only 1785295357000000000
 
@@ -458,3 +454,7 @@ class DbSignatureMatchTests(unittest.TestCase):
                        [['tracks.dbm', 10, None]], [['tracks.dbm', 'ten', self.NS]]):
             with self.subTest(stored=stored):
                 self.assertFalse(_db_signatures_match(stored, expected))
+
+
+if __name__ == '__main__':
+    unittest.main()
