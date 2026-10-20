@@ -46,7 +46,8 @@ METRICS = (
     "snap_remeasure_sd", "snap_remeasure_abs_gt_2_frac",
     "tangent_absdiff_median_2", "tangent_absdiff_median_4", "tangent_absdiff_median_8",
     "tangent_corr_2", "tangent_corr_4", "tangent_corr_8",
-    "n_grid_spikes", "grid_step_median", "grid_step_max",
+    "n_grid_spikes", "grid_step_median", "grid_step_max", "n_grid_holes", "grid_hole_points",
+    "outside_volume_frac",
 )
 TANGENT_RADII = (2.0, 4.0, 8.0)
 
@@ -245,6 +246,22 @@ def grid_step_check(x: np.ndarray, y: np.ndarray, z: np.ndarray, has_point: np.n
             "n_grid_spikes": int(spike.sum()), "grid_spike_rc": np.argwhere(spike.reshape(has_point.shape))}
 
 
+def grid_hole_check(has_point: np.ndarray) -> dict[str, Any]:
+    """Interior holes of a tifxyz grid: runs of invalid points enclosed by valid ones,
+    found by 4-connected labelling of the invalid mask minus the groups that touch
+    the grid border. A flattening whose quality filter punched holes through the
+    surface (villa PR #2128) exits 0 and looks fine on a step check; this counts it."""
+    from scipy import ndimage as ndi
+
+    lab, n = ndi.label(~has_point)
+    if n == 0:
+        return {"n_grid_holes": 0, "grid_hole_points": 0}
+    border = np.unique(np.concatenate([lab[0], lab[-1], lab[:, 0], lab[:, -1]]))
+    interior = np.setdiff1d(np.arange(1, n + 1), border)
+    return {"n_grid_holes": int(len(interior)),
+            "grid_hole_points": int(np.isin(lab, interior).sum())}
+
+
 def sample_tifxyz(path: str, samples: int, rng: np.random.Generator):
     """Random points and normals from a tifxyz directory at its stored resolution."""
     from vesuvius.tifxyz import read_tifxyz
@@ -256,6 +273,7 @@ def sample_tifxyz(path: str, samples: int, rng: np.random.Generator):
     if surf._mask is not None:
         has_point &= surf._mask.astype(bool)
     grid = grid_step_check(x, y, z, has_point)
+    grid.update(grid_hole_check(has_point))
     ok = has_point & np.isfinite(nx)
     # grid points with no computable normal (hole edges, grid border) are not sampled;
     # the count is reported so a defect that lives there is not silently skipped
@@ -487,6 +505,7 @@ def summarize(off: np.ndarray, contrast: np.ndarray, valid: np.ndarray, inside: 
     out = {
         "n_samples": int(len(off)),
         "n_inside_volume": int(inside.sum()),
+        "outside_volume_frac": float(1 - inside.sum() / max(1, len(inside))),
         "n_valid": int(valid.sum()),
         "no_peak_frac": float(1 - valid.sum() / max(1, inside.sum())),
         "n_censored": int(cen.sum()),
@@ -619,6 +638,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if n_no_normal:
                 print(f"{name}: {n_no_normal} grid points have no normal and were not sampled", file=sys.stderr)
             rc = grid.pop("grid_spike_rc")
+            if grid["n_grid_holes"]:
+                print(f"{name}: {grid['n_grid_holes']} interior holes in the grid "
+                      f"({grid['grid_hole_points']} points)", file=sys.stderr)
             if grid["n_grid_spikes"]:
                 print(f"{name}: {grid['n_grid_spikes']} grid points are more than 4x the median step from a "
                       f"neighbour (max {grid['grid_step_max']} voxels, median {grid['grid_step_median']})",
@@ -630,6 +652,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             P, N, patch, n_vert = sample_obj(src, a.samples, a.blobs, rng)
         prof, t, inside = read_profiles(vol, P, N, a.half, a.step, a.sigma, workers=a.workers)
+        if inside.sum() < 0.9 * len(inside):
+            # a surface mostly outside the volume is in the wrong coordinate frame
+            # (missing downscale or physical scale, villa PRs #2112 and #2137), not misplaced
+            print(f"{name}: {len(inside) - inside.sum()} of {len(inside)} points fall outside the volume; "
+                  f"check the surface's scale and downscale metadata before reading the offsets",
+                  file=sys.stderr)
         off, contrast, valid = nearest_peak(prof, t, a.min_contrast, a.min_prominence)
         valid &= inside
         m = summarize(off, contrast, valid, inside, patch, prof, t, a.half, a.min_contrast)

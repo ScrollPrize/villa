@@ -235,6 +235,32 @@ def test_grid_spikes_at_hole_edges_are_counted_and_located(tmp_path, ct):
     assert [r for r in csv.DictReader(open(out / "seg.grid_spikes.csv"))][0] == {"row": "9", "col": "10"}
 
 
+def test_interior_grid_holes_are_counted_but_border_notches_are_not():
+    """Only holes enclosed by valid points count (villa PR #2128's punched flattenings);
+    a notch in the grid edge is the trace ending, not a defect."""
+    has = np.ones((20, 20), bool)
+    assert spa.grid_hole_check(has) == {"n_grid_holes": 0, "grid_hole_points": 0}
+    has[5:8, 5:8] = False  # 9-point interior hole
+    has[0:3, 10] = False  # notch touching the border
+    has[15, 15] = False  # 1-point interior hole
+    assert spa.grid_hole_check(has) == {"n_grid_holes": 2, "grid_hole_points": 10}
+
+
+def test_surface_outside_the_volume_warns_and_is_reported(tmp_path, ct, capsys):
+    """A surface in the wrong coordinate frame (villa PR #2112: missing downscale) lands
+    mostly outside the volume; the audit must say so instead of reporting offsets."""
+    pts = grid_points(28.0)
+    pts[:, :2] += 400.0  # shift x, y far outside the test volume
+    nrm = np.tile([0.0, 0.0, 1.0], (len(pts), 1))
+    obj = tmp_path / "far.obj"
+    write_obj(obj, pts, nrm)
+    rc, out, rows = run(tmp_path, ct, [str(obj)])
+    assert rc == 0
+    j = json.load(open(out / "far.json"))
+    assert j["outside_volume_frac"] > 0.9
+    assert "outside the volume" in capsys.readouterr().err
+
+
 def test_bad_arguments(tmp_path, ct):
     with pytest.raises(SystemExit):
         spa.main(["--surface", "x.obj", "--volume", ct, "--out", str(tmp_path), "--fail-on", "nope=1"])
