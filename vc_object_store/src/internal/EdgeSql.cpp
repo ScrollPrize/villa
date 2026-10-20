@@ -1,6 +1,54 @@
 #include "internal/EdgeSql.hpp"
 
 namespace vc::objects::detail {
+std::string fiberAdjacencySql(std::optional<bool> adjacent)
+{
+    if (!adjacent) return {};
+    // Only JSON booleans (or the legacy missing flag) describe this relation.
+    return " AND kind='fiber_branch' AND coalesce(json_type(meta,'$.adjacent'),'false')='" +
+        std::string(*adjacent ? "true" : "false") + "'";
+}
+
+bool matchesFiberAdjacency(const EdgeRecord& edge, std::optional<bool> adjacent)
+{
+    if (!adjacent) return true;
+    if (edge.kind != "fiber_branch") return false;
+    const auto meta = nlohmann::json::parse(edge.meta);
+    const auto flag = meta.find("adjacent");
+    if (flag == meta.end()) return !*adjacent;
+    return flag->is_boolean() && flag->get<bool>() == *adjacent;
+}
+
+void validateEdgeSelection(const EdgeSelection& selection)
+{
+    if (selection.limit && *selection.limit < 0) throw std::invalid_argument("edge limit must be nonnegative");
+    for (const auto& state : selection.approvalStates)
+        if (state != "pending" && state != "approved" && state != "rejected")
+            throw std::invalid_argument("invalid edge approval state: " + state);
+    if (selection.afterUuid) (void)parseUuid(*selection.afterUuid);
+    for (const auto* ids : {&selection.endpointUuids, &selection.uuids})
+        if (*ids) for (const auto& id : **ids) (void)parseUuid(id);
+}
+
+bool matchesEdgeSelection(const EdgeRecord& edge, const EdgeSelection& selection)
+{
+    auto contains = [](const std::vector<std::string>& ids, const std::string& id) {
+        return std::any_of(ids.begin(), ids.end(), [&](const auto& value) { return formatUuid(parseUuid(value)) == id; });
+    };
+    if (selection.kind && edge.kind != *selection.kind) return false;
+    if (!matchesFiberAdjacency(edge, selection.adjacent)) return false;
+    if (!selection.approvalStates.empty() && std::find(selection.approvalStates.begin(), selection.approvalStates.end(),
+                                                    edge.approvalState) == selection.approvalStates.end()) return false;
+    if (selection.tag && std::find(edge.tags.begin(), edge.tags.end(), *selection.tag) == edge.tags.end()) return false;
+    if (selection.uuids && !contains(*selection.uuids, edge.uuid)) return false;
+    if (selection.afterUuid && edge.uuid <= formatUuid(parseUuid(*selection.afterUuid))) return false;
+    if (selection.endpointUuids) {
+        const bool a = contains(*selection.endpointUuids, edge.aUuid), b = contains(*selection.endpointUuids, edge.bUuid);
+        if (selection.bothEndpoints ? !(a && b) : !(a || b)) return false;
+    }
+    return true;
+}
+
 const char* kEdgeCols =
     "id,uuid,a_id,b_id,kind,generation,created_by,created_at,created_host,changed_by,changed_at,changed_host,"
     "approval_state,approved_by,approved_at,approved_host,approved_generation,"

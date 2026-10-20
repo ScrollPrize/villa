@@ -12,14 +12,14 @@ def heads(db, *objects):
     return {obj: db.current_object_revision(obj)["uuid"] for obj in objects}
 
 
-def linked(db, metadata_keys=()):
+def linked(db, metadata_keys=(), kind="connected", meta=None):
     a = db.upsert_object(dict(kind="track", meta={"winding": 1}))
     b = db.upsert_object(dict(kind="track", meta={"winding": 1}))
     ga = db.put_geometry(a, track([(1, 2, 3), (4, 5, 6)]))
     gb = db.put_geometry(b, track([(1, 2, 3)]))
     anchor = dict(points=[dict(array="points", index=[0])],
                   metadata_keys=list(metadata_keys))
-    edge = db.add_edge(dict(kind="connected", a=a, b=b,
+    edge = db.add_edge(dict(kind=kind, a=a, b=b, meta=meta or {},
                             a_anchor=anchor, b_anchor=anchor))
     return a, b, ga, gb, edge
 

@@ -88,6 +88,19 @@ Json dependencyMetadata(const Json& record, const Anchor& anchor)
                 {"lifecycle_epoch", record.value("lifecycle_epoch", "")}};
 }
 
+// One dependency definition for selected graphs and current indexed queries.
+bool endpointApplies(const ObjectStore& store, const Txn& txn, const Anchor& anchor,
+                     const std::optional<std::string>& geometry, const std::string& pinned,
+                     const ObjectRevision& selected)
+{
+    if (selected.deleted || selected.record.retired) return false;
+    const auto original = store.objectRevision(txn, pinned);
+    if (!original || (!anchor.metadataKeys.empty() && !original->metadataComplete)) return false;
+    return dependencyMetadata(objectToJson(original->record), anchor) ==
+               dependencyMetadata(objectToJson(selected.record), anchor) &&
+           !endpointChanged(store, txn, anchor, geometry, selected.geometryRevision);
+}
+
 Json currentRecord(sqlite3* db, const std::string& object)
 {
     Statement row(db, std::string("SELECT ") + kObjectCols + " FROM objects WHERE uuid=?");
@@ -570,20 +583,50 @@ std::vector<SelectedRelationship> ObjectStore::relationshipsAt(const Txn& txn, c
         auto endpoint = [&](const std::string& object, const Anchor& anchor, const std::optional<std::string>& geometry,
                             const std::string& pinned) {
             const auto found = revisions.find(object);
-            if (found == revisions.end() || found->second.record.retired) return false;
-            if (!anchor.metadataKeys.empty() && !objectRevision(txn, pinned)->metadataComplete)
-                return false; // imported geometry cannot prove lost metadata dependencies
+            if (found == revisions.end()) return false;
             const auto& membership = memberships.at(object);
             const auto member = membership.find(edge.record.uuid);
             return member != membership.end() && member->second == version &&
-                dependencyMetadata(metadata(db, pinned), anchor) == dependencyMetadata(objectToJson(found->second.record), anchor) &&
-                !endpointChanged(*this, txn, anchor, geometry, found->second.geometryRevision);
+                endpointApplies(*this, txn, anchor, geometry, pinned, found->second);
         };
         const bool applicable = endpoint(edge.record.aUuid, edge.record.aAnchor, edge.aGeometryRevision, edge.aRevision) &&
                                 endpoint(edge.record.bUuid, edge.record.bAnchor, edge.bGeometryRevision, edge.bRevision);
         result.push_back({std::move(edge), applicable});
     }
     return result;
+}
+
+void detail::requirePublishedGraphRead(const Txn& txn)
+{
+    auto* db = ObjectStoreImplAccess::conn(txn);
+    const auto pool = activeStatementPools.find(db);
+    if (pool == activeStatementPools.end() || !pool->second->readSnapshot)
+        throw std::invalid_argument("applicability graph queries require a read transaction");
+    if (pragmaInt(db, "user_version") < 9)
+        throw std::runtime_error("applicability graph queries require object history; open writable once to migrate");
+}
+
+bool detail::currentRelationshipApplicable(const ObjectStore& store, const Txn& txn,
+                                          const std::string& edgeUuid)
+{
+    DependencyScope dependencies;
+    auto* db = ObjectStoreImplAccess::conn(txn);
+    Statement current(db, "SELECT a.uuid,b.uuid FROM edges e JOIN objects a ON a.id=e.a_id "
+                          "JOIN objects b ON b.id=e.b_id WHERE e.uuid=?");
+    current.bindBlob(1, parseUuid(edgeUuid));
+    if (!current.row()) return false;
+    Statement membership(db,
+        "SELECT a.relationship_uuid FROM object_relationship_heads a "
+        "JOIN object_relationship_heads b ON b.edge_uuid=a.edge_uuid AND b.relationship_uuid=a.relationship_uuid "
+        "WHERE a.object_uuid=? AND b.object_uuid=? AND a.edge_uuid=?");
+    membership.bind(1, formatUuid(current.blob16(0))); membership.bind(2, formatUuid(current.blob16(1)));
+    membership.bind(3, formatUuid(parseUuid(edgeUuid)));
+    if (!membership.row()) return false;
+    const auto edge = relationship(db, membership.text(0));
+    const auto a = store.currentObjectRevision(txn, edge.record.aUuid);
+    const auto b = store.currentObjectRevision(txn, edge.record.bUuid);
+    return a && b && endpointApplies(store, txn, edge.record.aAnchor, edge.aGeometryRevision, edge.aRevision, *a) &&
+        endpointApplies(store, txn, edge.record.bAnchor, edge.bGeometryRevision, edge.bRevision, *b);
 }
 
 void ObjectStore::retainRelationship(WriteTxn& txn, const std::string& uuid)

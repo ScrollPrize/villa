@@ -428,3 +428,48 @@ TEST_CASE("all edge mutation paths reject nonfinite anchors without changing rec
     db.setMeta(txn, a, "continued", "true");
     txn.commit();
 }
+
+TEST_CASE("same-winding filters and selected graphs preserve closed connectivity")
+{
+    TempDir tmp("fiber_graph");
+    auto db = ObjectStore::create(tmp.dir / "store.vcobj", testOptions());
+    const auto a = addObject(db, "fiber"), b = addObject(db, "fiber"), c = addObject(db, "fiber");
+    const auto ab = addEdge(db, makeEdge(a, b, "fiber_branch"));
+    auto cross = makeEdge(b, c, "fiber_branch"); cross.meta = R"({"adjacent":true})";
+    addEdge(db, cross);
+    RevisionSelection selection;
+    {
+        auto txn = db.read();
+        for (const auto& id : {a,b,c}) selection[id] = db.currentObjectRevision(txn, id)->uuid;
+        EdgeSelection ordinary; ordinary.adjacent = false; ordinary.applicableOnly = true;
+        CHECK(db.selectEdges(txn, ordinary).size() == 1);
+        CHECK(db.neighbours(txn, a, {}, {}, false, false, true) == std::vector<std::string>{b});
+        CHECK(db.componentOf(txn, a, {}, nullptr, false, false, true) == std::vector<std::string>{a,b});
+        // Cache keys distinguish unfiltered, ordinary and adjacent traversals.
+        CHECK(db.componentOf(txn, a).size() == 3);
+        CHECK(db.componentOf(txn, a, {}, nullptr, false, false).size() == 2);
+        CHECK(db.componentOf(txn, a, {}, nullptr, false, true).size() == 1);
+        const auto graph = db.graphReadViewAt(txn, selection, ordinary);
+        CHECK(graph.edgeUuids == std::vector<std::string>{ab});
+        CHECK(graph.componentOf(a) == std::vector<std::string>{a,b});
+        CHECK(graph.componentOf(c) == std::vector<std::string>{c});
+        CHECK(graph.reachableWithin(a, 0) == std::vector<std::string>{a});
+        REQUIRE(graph.selectedRelationships);
+        CHECK(graph.selectedRelationships->front().record.uuid == ab);
+        std::atomic_bool cancel{true};
+        CHECK_THROWS_WITH_AS(graph.componentOf(a, &cancel), doctest::Contains("object store: traversal cancelled"), std::runtime_error);
+        CHECK_THROWS_WITH_AS(db.componentOf(txn, a, {}, &cancel, false, false, true), doctest::Contains("object store: traversal cancelled"), std::runtime_error);
+        CHECK_THROWS(graph.reachableWithin(a, -1));
+        ordinary.limit = 0;
+        CHECK(db.graphReadViewAt(txn, selection, ordinary).edgeUuids.empty());
+        ordinary.limit = -1;
+        CHECK_THROWS(db.graphReadViewAt(txn, selection, ordinary));
+        CHECK_THROWS(db.selectEdges(txn, ordinary));
+    }
+    {
+        auto txn = db.write();
+        EdgeSelection applicable; applicable.applicableOnly = true;
+        CHECK_THROWS_WITH_AS(db.selectEdges(txn, applicable), doctest::Contains("applicability graph queries require a read transaction"), std::invalid_argument);
+        CHECK_THROWS_WITH_AS(db.graphReadViewAt(txn, selection), doctest::Contains("applicability graph queries require a read transaction"), std::invalid_argument);
+    }
+}

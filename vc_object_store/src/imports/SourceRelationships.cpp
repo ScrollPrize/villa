@@ -47,7 +47,13 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
                 current.aAnchor.points == edge.aAnchor.points && current.bAnchor.points == edge.bAnchor.points;
             const bool reverse = current.bUuid == edge.aUuid && current.aUuid == edge.bUuid &&
                 current.bAnchor.points == edge.aAnchor.points && current.aAnchor.points == edge.bAnchor.points;
-            if (forward || reverse) return; // Existing DB annotations/reviews are authoritative.
+            if (forward || reverse) {
+                if (edge.kind == "fiber_branch" &&
+                    Json::parse(current.meta).value("adjacent", false) != Json::parse(edge.meta).value("adjacent", false))
+                    throw std::runtime_error("conflicting ordinary/adjacent fiber branch declarations: " +
+                                             edge.aUuid + " <-> " + edge.bUuid);
+                return; // Consistent reciprocal declarations represent one edge.
+            }
         }
         db.addEdge(txn, edge); ++inserted;
     };

@@ -104,20 +104,18 @@ std::vector<EdgeRecord> ObjectStore::edgesByKind(const Txn& txn, const std::stri
 std::unique_ptr<Statement> detail::edgeSelectionQuery(sqlite3* db, const EdgeSelection& selection,
     const std::string& columns, const std::optional<std::vector<int64_t>>& endpointIds)
 {
-    if (selection.limit && *selection.limit < 0) throw std::invalid_argument("edge limit must be nonnegative");
+    validateEdgeSelection(selection);
     const bool candidates = endpointIds || selection.endpointUuids || selection.uuids || selection.tag;
     std::string sql = "SELECT " + columns + " FROM edges" +
         (candidates ? " NOT INDEXED" : "") + " WHERE 1";
     if (!selection.includeRetired) sql += " AND " + activeEdgeSql(db);
+    sql += fiberAdjacencySql(selection.adjacent);
     std::vector<std::string> parameters;
     auto parameter = [&](const std::string& value) {
         parameters.push_back(value);
         return "?" + std::to_string(parameters.size());
     };
     if (selection.kind) sql += " AND kind=" + parameter(*selection.kind);
-    for (const auto& state : selection.approvalStates)
-        if (state != "pending" && state != "approved" && state != "rejected")
-            throw std::invalid_argument("invalid edge approval state: " + state);
     if (selection.approvalStates.size() == 1)
         sql += " AND approval_state=" + parameter(selection.approvalStates.front());
     else if (!selection.approvalStates.empty())
@@ -159,7 +157,22 @@ std::vector<EdgeRecord> ObjectStore::selectEdges(const Txn& txn, const EdgeSelec
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
     const ObjectFields fields = projection ? ObjectFields(std::in_place, projection->begin(), projection->end()) : std::nullopt;
-    auto rows = edgeSelectionQuery(db, selection, projectedEdgeColumns(fields));
+    const auto columns = projectedEdgeColumns(fields);
+    if (selection.applicableOnly) {
+        validateEdgeSelection(selection);
+        requirePublishedGraphRead(txn);
+        // Apply validity before pagination; then hydrate only accepted records.
+        auto candidates = selection; candidates.limit.reset(); candidates.applicableOnly = false;
+        auto rows = edgeSelectionQuery(db, candidates, "uuid");
+        std::vector<std::string> accepted;
+        while ((!selection.limit || accepted.size() < static_cast<size_t>(*selection.limit)) && rows->row()) {
+            auto uuid = formatUuid(rows->blob16(0));
+            if (currentRelationshipApplicable(*this, txn, uuid)) accepted.push_back(std::move(uuid));
+        }
+        EdgeSelection selected; selected.uuids = std::move(accepted); selected.includeRetired = true;
+        return selectEdges(txn, selected, projection);
+    }
+    auto rows = edgeSelectionQuery(db, selection, columns);
     return readEdgeRows(db, *rows, fields);
 }
 

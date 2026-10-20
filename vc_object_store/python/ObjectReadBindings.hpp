@@ -68,6 +68,18 @@ void bindGraphReadView(nb::module_& m) {
         .def_prop_ro("object_uuids", [](PyGraphReadView& self) { self.require(); return self.graph->objectUuids; })
         .def_prop_ro("edge_uuids", [](PyGraphReadView& self) { self.require(); return self.graph->edgeUuids; })
         .def_prop_ro("geometry_revisions", [](PyGraphReadView& self) { self.require(); return self.graph->geometryRevisions; })
+        .def_prop_ro("object_revisions", [](PyGraphReadView& self) {
+            self.require();
+            std::vector<std::string> revisions;
+            if (self.graph->selectedObjects) for (const auto& object : *self.graph->selectedObjects) revisions.push_back(object.uuid);
+            return revisions;
+        })
+        .def("component", [](PyGraphReadView& self, const std::string& uuid) {
+            self.require(); nb::gil_scoped_release release; return self.graph->componentOf(uuid);
+        }, nb::arg("uuid"))
+        .def("reachable_within", [](PyGraphReadView& self, const std::string& uuid, int maxDepth) {
+            self.require(); nb::gil_scoped_release release; return self.graph->reachableWithin(uuid, maxDepth);
+        }, nb::arg("uuid"), nb::arg("max_depth"))
         .def_prop_ro("generations", [](PyGraphReadView& self) { self.require(); return self.graph->generations; })
         .def_prop_ro("journal_sequence", [](PyGraphReadView& self) { self.require(); return self.graph->journalSequence; })
         .def_prop_ro("offsets", [](PyGraphReadView& self) {
@@ -93,7 +105,14 @@ void bindGraphReadView(nb::module_& m) {
         .def("objects", [](PyGraphReadView& self, const std::optional<std::vector<std::string>>& fields) {
             self.require();
             std::vector<vo::ObjectRecord> records;
-            if (!self.graph->objectUuids.empty()) {
+            if (self.graph->selectedObjects) {
+                if (fields) {
+                    vo::ObjectSelection validation; validation.limit = 0;
+                    nb::gil_scoped_release release;
+                    (void)self.store->selectObjects(*self.txn, validation, fields);
+                }
+                for (const auto& object : *self.graph->selectedObjects) records.push_back(object.record);
+            } else if (!self.graph->objectUuids.empty()) {
                 vo::ObjectSelection selection; selection.includeRetired = true; selection.uuids = self.graph->objectUuids;
                 nb::gil_scoped_release release;
                 records = self.store->selectObjects(*self.txn, selection, fields);
@@ -109,7 +128,14 @@ void bindGraphReadView(nb::module_& m) {
             self.require();
             vo::EdgeSelection selection; selection.includeRetired = true; selection.uuids = self.graph->edgeUuids;
             std::vector<vo::EdgeRecord> records;
-            { nb::gil_scoped_release release; records = self.store->selectEdges(*self.txn, selection, fields); }
+            if (self.graph->selectedRelationships) {
+                if (fields) {
+                    vo::EdgeSelection validation; validation.limit = 0;
+                    nb::gil_scoped_release release;
+                    (void)self.store->selectEdges(*self.txn, validation, fields);
+                }
+                for (const auto& relationship : *self.graph->selectedRelationships) records.push_back(relationship.record);
+            } else { nb::gil_scoped_release release; records = self.store->selectEdges(*self.txn, selection, fields); }
             const std::set<std::string> projection = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
             nb::list out;
             for (const auto& record : records) out.append(edgeToPy(record, fields ? &projection : nullptr));

@@ -251,20 +251,23 @@ NB_MODULE(_native, m)
             nb::arg("edge_kind"), nb::arg("include_retired") = false)
         .def("neighbours",
              [](PyObjectStore& self, const std::string& uuid, const std::optional<std::string>& edgeKind,
-                const std::optional<std::string>& neighbourKind, bool includeRetired) {
-                 return self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.neighbours(t, uuid, edgeKind, neighbourKind, includeRetired); });
+                const std::optional<std::string>& neighbourKind, bool includeRetired, std::optional<bool> adjacent, bool applicableOnly) {
+                 return self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.neighbours(t, uuid, edgeKind, neighbourKind, includeRetired, adjacent, applicableOnly); });
              },
-             nb::arg("uuid"), nb::arg("edge_kind") = std::nullopt, nb::arg("neighbour_kind") = std::nullopt, nb::arg("include_retired") = false)
+             nb::arg("uuid"), nb::arg("edge_kind") = std::nullopt, nb::arg("neighbour_kind") = std::nullopt, nb::arg("include_retired") = false,
+             nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false)
         .def("component",
-             [](PyObjectStore& self, const std::string& uuid, const std::vector<std::string>& edgeKinds, bool includeRetired) {
-                 return self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.componentOf(t, uuid, edgeKinds, nullptr, includeRetired); });
+             [](PyObjectStore& self, const std::string& uuid, const std::vector<std::string>& edgeKinds, bool includeRetired, std::optional<bool> adjacent, bool applicableOnly) {
+                 return self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.componentOf(t, uuid, edgeKinds, nullptr, includeRetired, adjacent, applicableOnly); });
              },
-             nb::arg("uuid"), nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("include_retired") = false)
+             nb::arg("uuid"), nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("include_retired") = false,
+             nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false)
         .def("reachable_within",
-             [](PyObjectStore& self, const std::string& uuid, int maxDepth, const std::vector<std::string>& edgeKinds, bool includeRetired) {
-                 return self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.reachableWithin(t, uuid, maxDepth, edgeKinds, nullptr, includeRetired); });
+             [](PyObjectStore& self, const std::string& uuid, int maxDepth, const std::vector<std::string>& edgeKinds, bool includeRetired, std::optional<bool> adjacent, bool applicableOnly) {
+                 return self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.reachableWithin(t, uuid, maxDepth, edgeKinds, nullptr, includeRetired, adjacent, applicableOnly); });
              },
-             nb::arg("uuid"), nb::arg("max_depth"), nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("include_retired") = false)
+             nb::arg("uuid"), nb::arg("max_depth"), nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("include_retired") = false,
+             nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false)
         .def(
             "set_approval",
             [](PyObjectStore& self, const std::string& uuid, const std::string& state) {
@@ -480,10 +483,11 @@ NB_MODULE(_native, m)
         .def("select_edges", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::vector<std::string>& states, const std::optional<std::vector<std::string>>& endpoints,
             bool both, const std::optional<std::string>& tag, const std::optional<int64_t>& limit,
-            const std::optional<std::string>& after, const std::optional<std::vector<std::string>>& fields, bool includeRetired) {
+            const std::optional<std::string>& after, const std::optional<std::vector<std::string>>& fields, bool includeRetired, std::optional<bool> adjacent, bool applicableOnly) {
             vo::EdgeSelection selection; selection.kind = kind; selection.approvalStates = states;
             selection.endpointUuids = endpoints; selection.bothEndpoints = both;
             selection.tag = tag; selection.limit = limit; selection.afterUuid = after; selection.includeRetired = includeRetired;
+            selection.adjacent = adjacent; selection.applicableOnly = applicableOnly;
             std::vector<vo::EdgeRecord> records;
             { auto lease = self.db; self.require(); nb::gil_scoped_release release;
               records = self.withRead([&](auto& db, auto& txn) { return db.selectEdges(txn, selection, fields); }); }
@@ -493,23 +497,30 @@ NB_MODULE(_native, m)
         }, nb::arg("edge_kind") = std::nullopt, nb::arg("approval_states") = std::vector<std::string>{},
            nb::arg("endpoint_uuids") = std::nullopt, nb::arg("both_endpoints") = false,
            nb::arg("tag") = std::nullopt, nb::arg("limit") = std::nullopt,
-           nb::arg("after_uuid") = std::nullopt, nb::arg("fields") = std::nullopt, nb::arg("include_retired") = false)
+           nb::arg("after_uuid") = std::nullopt, nb::arg("fields") = std::nullopt, nb::arg("include_retired") = false,
+           nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false)
         .def("graph_read", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::vector<std::string>& ids, const std::optional<std::string>& edgeKind,
             const std::vector<std::string>& states, const std::optional<std::array<double, 6>>& bbox,
-            const std::optional<std::string>& tag, bool includeRetired) {
+            const std::optional<std::string>& tag, bool includeRetired, std::optional<bool> adjacent,
+            bool applicableOnly, const std::optional<vo::RevisionSelection>& revisions) {
             self.require();
+            if (revisions && (kind || !ids.empty() || bbox || includeRetired))
+                throw std::invalid_argument("revisions specifies the complete graph object selection; cannot combine with object filters or include_retired");
             auto view = std::make_unique<PyGraphReadView>(); view->store = self.db;
             vo::ObjectSelection objects; objects.kind = kind; objects.uuids = ids; objects.bbox = bbox; objects.includeRetired = includeRetired;
             vo::EdgeSelection edges; edges.kind = edgeKind; edges.approvalStates = states; edges.tag = tag;
+            edges.adjacent = adjacent; edges.applicableOnly = applicableOnly;
             { nb::gil_scoped_release release;
               view->txn = std::make_unique<vo::ReadTxn>(view->store->read());
-              view->graph = std::make_shared<vo::GraphReadView>(view->store->graphReadView(*view->txn, objects, edges)); }
+              view->graph = std::make_shared<vo::GraphReadView>(revisions ? view->store->graphReadViewAt(*view->txn, *revisions, edges)
+                        : view->store->graphReadView(*view->txn, objects, edges)); }
             return view.release();
         }, nb::rv_policy::take_ownership, nb::arg("object_kind") = std::nullopt,
            nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("edge_kind") = std::nullopt,
            nb::arg("approval_states") = std::vector<std::string>{"approved"},
            nb::arg("bbox") = std::nullopt, nb::arg("edge_tag") = std::nullopt, nb::arg("include_retired") = false,
+           nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false, nb::arg("revisions") = std::nullopt,
            "Pin a store graph read view; use as a context manager and close before checkpointing.")
         .def("select_objects", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::optional<std::string>& tag, const std::vector<std::string>& ids,

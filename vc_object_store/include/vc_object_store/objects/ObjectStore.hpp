@@ -194,6 +194,11 @@ struct EdgeSelection {
     std::optional<int64_t> limit;
     std::optional<std::string> afterUuid; // exclusive, UUID-ordered cursor
     bool includeRetired = false; // includes lifecycle-inactive recorded edges
+    // nullopt: all kinds; false/true: ordinary/adjacent fiber_branch only.
+    // A missing adjacent metadata flag is an ordinary legacy fiber branch.
+    std::optional<bool> adjacent;
+    // Shared membership/dependencies against latest heads. Requires a ReadTxn.
+    bool applicableOnly = false;
 };
 
 // Compact topology read from one store transaction. No separate persistent
@@ -206,6 +211,14 @@ struct GraphReadView {
     std::vector<uint64_t> offsets, neighbours, edgeIndices;
     std::vector<std::array<uint64_t, 2>> endpoints;
     int64_t journalSequence = 0;
+    // Present for selected-revision graphs; records align with nodes/edges.
+    // These retain historical metadata and pins, including deleted current records.
+    std::optional<std::vector<ObjectRevision>> selectedObjects;
+    std::optional<std::vector<RelationshipRevision>> selectedRelationships;
+    std::vector<std::string> reachableWithin(const std::string& objectUuid, int maxDepth,
+                                            const std::atomic_bool* cancel = nullptr) const;
+    std::vector<std::string> componentOf(const std::string& objectUuid,
+                                       const std::atomic_bool* cancel = nullptr) const;
 };
 
 // Homogeneous arrays concatenated along their first dimension. Offsets index
@@ -515,22 +528,33 @@ public:
     // generations and geometry heads from the caller's consistent snapshot.
     GraphReadView graphReadView(const Txn&, const ObjectSelection& = {},
                                const EdgeSelection& = {}) const;
+    // Requires a ReadTxn. Closed selection, null revisions resolve to latest in this snapshot.
+    // Always includes only applicable relationships. Retains isolated objects,
+    // including explicitly selected retired objects (which have no applicable edges).
+    GraphReadView graphReadViewAt(const Txn&, const RevisionSelection&,
+                                 const EdgeSelection& = {}) const;
     // Neighbour object UUIDs, optionally filtered by edge kind and/or
     // neighbour object kind.
     std::vector<std::string> neighbours(const Txn& txn, const std::string& objectUuid,
                                         const std::optional<std::string>& edgeKind = std::nullopt,
-                                        const std::optional<std::string>& neighbourKind = std::nullopt, bool includeRetired = false) const;
+                                        const std::optional<std::string>& neighbourKind = std::nullopt, bool includeRetired = false,
+                                        std::optional<bool> adjacent = std::nullopt, bool applicableOnly = false) const;
 
-    // Indexed traversal, filtered by edgeKindFilter when non-empty. When
+    // Indexed traversal, filtered by edgeKindFilter when non-empty. An explicit
+    // adjacent=false selects same-winding fiber links and always excludes
+    // adjacent links. applicableOnly requires a ReadTxn and checks latest heads.
+    // When
     // cancel is given and becomes true, the traversal aborts with a
     // "cancelled" runtime_error (SQLite progress handler during SQL,
     // checked each BFS step in memory); safe to set from another thread.
     std::vector<std::string> componentOf(const Txn& txn, const std::string& objectUuid,
                                          const std::vector<std::string>& edgeKindFilter = {},
-                                         const std::atomic_bool* cancel = nullptr, bool includeRetired = false) const;
+                                         const std::atomic_bool* cancel = nullptr, bool includeRetired = false,
+                                         std::optional<bool> adjacent = std::nullopt, bool applicableOnly = false) const;
     std::vector<std::string> reachableWithin(const Txn& txn, const std::string& objectUuid, int maxDepth,
                                              const std::vector<std::string>& edgeKindFilter = {},
-                                             const std::atomic_bool* cancel = nullptr, bool includeRetired = false) const;
+                                             const std::atomic_bool* cancel = nullptr, bool includeRetired = false,
+                                             std::optional<bool> adjacent = std::nullopt, bool applicableOnly = false) const;
 
     // No fields argument loads complete records. With fields, only requested
     // top-level fields plus uuid/kind are loaded; other C++ members stay default.

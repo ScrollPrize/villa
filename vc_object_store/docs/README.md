@@ -256,9 +256,76 @@ or incompatible versions are reported as inapplicable. Explicit selections let
 applications query the inputs actually applied to a fit.
 `revision_read_view(selection)` returns `objects`, `relationships`, and the
 resolved `selection` together from one snapshot, including when selecting latest
-heads. C++ callers use these reads within one `ReadTxn`. The existing `edges_of`,
-traversal, and graph-view APIs remain current-record queries; they do not replace
-this revision-aware applicability check.
+heads. C++ callers use these reads within one `ReadTxn`. The existing `edges_of`, traversal, and graph-view APIs remain current-record
+queries by default. Opt-in applicability filters and selected-revision graphs
+are described below; they reuse this revision-aware check.
+
+### Same-winding and revision-selected graphs
+
+**Same-winding queries must always exclude adjacent fiber links.** Pass
+`adjacent=False` to `select_edges`, `neighbours`, `component`, `reachable_within`,
+or `graph_read`. This selects ordinary `fiber_branch` edges only, including
+legacy branches with no `adjacent` metadata flag. `adjacent=True` selects only
+adjacent fiber branches; `adjacent=None` preserves the unfiltered default.
+Explicit adjacency filters exclude other edge kinds and malformed non-boolean
+adjacency flags. A parallel adjacent link never bypasses the ordinary-link filter.
+Filtering happens before traversal, so an excluded edge cannot join components.
+
+Add `applicable_only=True` to these current queries to check shared relationship
+membership and declared geometry, metadata, and lifecycle dependencies against
+latest heads in the read snapshot. A reference preserved with `keep_recorded`
+may remain in raw queries but cannot cross into an applicable graph if its
+endpoint dependencies changed. Unrelated metadata edits do not invalidate it.
+Edge pagination applies after applicability filtering. `include_retired=True`
+does not override applicability. These checks reuse `relationships_at` semantics;
+they are not a comparison of revision UUIDs and do not infer physical validity.
+
+```python
+same_winding = store.component(seed_uuid, adjacent=False, applicable_only=True)
+
+# The inputs actually used by a fit; None resolves a latest head in this snapshot.
+selection = {fiber_a: applied_revision_a, fiber_b: applied_revision_b, fiber_c: None}
+with store.graph_read(revisions=selection, adjacent=False, approval_states=[]) as graph:
+    component = graph.component(fiber_a)
+    nearby = graph.reachable_within(fiber_a, 2)
+    objects = graph.objects()       # metadata from the selected object revisions
+    edges = graph.edges()          # matching immutable relationship versions
+    revisions = graph.object_revisions  # aligned with graph.object_uuids
+    geometry = graph.geometry_revisions
+```
+
+`revisions` is a closed object selection, including an explicitly empty mapping.
+It cannot be combined with current object filters (`object_kind`, `object_uuids`,
+`bbox`, or `include_retired`). Selected graphs always include only applicable
+relationships, even if `applicable_only` is omitted. Missing selected endpoints
+or incompatible relationship versions cannot provide connectivity. Explicitly
+selected retired objects remain isolated nodes. Isolated objects are retained,
+node order is canonical UUID order, and graph traversal is breadth-first in
+edge-UUID order. The graph's records and geometry continue to describe the
+selected revisions after later edits or removal of current records. Existing
+view closing, thread confinement, and NumPy buffer lifetime rules still apply.
+
+The existing Python `graph_read` approval filter still defaults to approved
+records; `approval_states=[]` requests all review states independently of link
+semantics. This change adds no pending-link handling or source-status mapping.
+
+C++ uses `EdgeSelection::adjacent` / `applicableOnly`, trailing adjacency and
+applicability arguments on the traversal/neighbour APIs, and
+`graphReadViewAt(txn, selection, edgeSelection)` for selected revisions.
+`GraphReadView::selectedObjects` and `selectedRelationships` retain exact records
+and pins in node/edge order; `componentOf` and `reachableWithin` traverse the
+already filtered graph. Applicability-aware queries and `graphReadViewAt` require
+a `ReadTxn` and schema 9 or newer. They cannot mix unpublished writer state with
+published revision history; open an old store writable once to migrate it.
+
+Fiber import rejects ordinary/adjacent disagreement for the same endpoint point
+identities, including reciprocal declarations and entries in both source lists.
+The source batch rolls back atomically. Consistent reciprocal declarations still
+deduplicate. Previously discarded source disagreements cannot be reconstructed
+automatically from the stored edge. No schema migration is needed for these filters. Winding offsets
+and fitting policies such as excluding explicitly winding-annotated collections
+remain consumer responsibilities. Selected graph construction uses the existing
+history machinery; no new latency or bounded-history performance claim is made.
 
 There are two distinct preservation decisions:
 
@@ -361,8 +428,8 @@ on edge/traversal/graph queries this also exposes dormant recorded links, **not*
 a claim of applicability. C++ selections have `includeRetired`; convenience
 queries take a trailing boolean. `object(uuid)`, `edge(uuid)`, and C++ direct UUID
 lookups always return existing records regardless of lifecycle. The current
-record APIs still do not replace `relationships_at` for all geometry and metadata
-dependency checks.
+record APIs without `applicable_only=True` still do not replace `relationships_at`
+for all geometry and metadata dependency checks.
 
 `revision_selection_at` and `revision_read_view_at` exclude objects retired at
 the requested time; `include_retired=True` includes their selected retired
