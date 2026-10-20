@@ -265,7 +265,8 @@ std::shared_ptr<ChunkCache> makeDelta3dCache(
 std::shared_ptr<ChunkCache> makeMirrorCache(
     std::shared_ptr<MirrorFetcher> f,
     const fs::path& persist,
-    std::optional<fs::path> budgetRoot = {})
+    std::optional<fs::path> budgetRoot = {},
+    std::optional<std::size_t> decodedByteCapacity = {})
 {
     std::vector<ChunkCache::LevelInfo> levels = {{{8, 8, 8}, {4, 4, 4}, {}}};
     ChunkCache::Options opts;
@@ -277,6 +278,8 @@ std::shared_ptr<ChunkCache> makeMirrorCache(
     ChunkCacheService::Options serviceOptions;
     serviceOptions.fetchConcurrency.workerCapacity = 4;
     serviceOptions.fetchConcurrency.maxConcurrentReads = 4;
+    if (decodedByteCapacity)
+        serviceOptions.decodedByteCapacity = *decodedByteCapacity;
     return std::make_shared<ChunkCache>(
         std::move(levels),
         std::vector<std::shared_ptr<IChunkFetcher>>{f},
@@ -1102,5 +1105,127 @@ TEST_CASE("persistent cache format transitions are leased and volume-local")
         persist / "0" / "0.0.0"));
     CHECK(fs::is_regular_file(sibling));
     restored.reset();
+    fs::remove_all(parent);
+}
+
+namespace {
+
+std::vector<std::byte> readAllBytes(const fs::path& path)
+{
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    const auto size = in.tellg();
+    std::vector<std::byte> bytes(size > 0 ? static_cast<std::size_t>(size) : 0);
+    in.seekg(0);
+    in.read(reinterpret_cast<char*>(bytes.data()),
+            static_cast<std::streamsize>(bytes.size()));
+    return bytes;
+}
+
+// Every regular file below `root`, as a path relative to `root`.
+std::vector<fs::path> regularFilesBelow(const fs::path& root)
+{
+    std::vector<fs::path> files;
+    for (const auto& entry : fs::recursive_directory_iterator(root)) {
+        if (entry.is_regular_file())
+            files.push_back(fs::relative(entry.path(), root));
+    }
+    return files;
+}
+
+} // namespace
+
+// A Zarr mirror keeps each downloaded storage object once, at its native Zarr
+// key. The decoded chunk must not also be persisted under the legacy
+// level_N/z/y/x.bin (or .empty) names, which no mirror reader consults.
+TEST_CASE("Zarr mirror keeps a single on-disk copy of each fetched object")
+{
+    const auto parent = tmpDir("mirror_single_copy");
+    const auto persist = parent / "cache";
+
+    const auto varied = variedBytes(64);
+    auto shifted = varied;
+    for (auto& b : shifted)
+        b = std::byte{static_cast<unsigned char>(std::to_integer<unsigned>(b) ^ 0x5a)};
+    const std::vector<std::byte> fill(64, std::byte{0});
+
+    ChunkFetchResult found;
+    found.status = ChunkFetchStatus::Found;
+    // Data, all-fill and (not canned) source-missing chunks: every status that
+    // the decoded store would otherwise persist next to the mirror object.
+    const ChunkKey dataA{0, 0, 0, 0};
+    const ChunkKey dataB{0, 0, 0, 1};
+    const ChunkKey allFill{0, 1, 0, 0};
+    const ChunkKey missing{0, 0, 1, 0};
+
+    auto fetcher = std::make_shared<MirrorFetcher>();
+    found.bytes = varied;
+    fetcher->setCanned(dataA, found);
+    found.bytes = shifted;
+    fetcher->setCanned(dataB, found);
+    found.bytes = fill;
+    fetcher->setCanned(allFill, found);
+
+    std::optional<std::size_t> decodedCapacity;
+    SUBCASE("chunks stay resident in decoded RAM") {}
+    SUBCASE("chunks are evicted from decoded RAM") {
+        // One chunk fits: every later chunk evicts an earlier one, which is
+        // the other place decoded bytes used to be written to disk.
+        decodedCapacity = 64;
+    }
+
+    {
+        auto cache = makeMirrorCache(fetcher, persist, {}, decodedCapacity);
+        REQUIRE(cache->persistentCacheLayout() ==
+                vc::render::PersistentCacheLayout::ZarrMirror);
+        CHECK(waitForResolved(*cache, 0, 0, 0, 0).status == ChunkStatus::Data);
+        CHECK(waitForResolved(*cache, 0, 0, 0, 1).status == ChunkStatus::Data);
+        CHECK(waitForResolved(*cache, 0, 1, 0, 0).status == ChunkStatus::AllFill);
+        CHECK(waitForResolved(*cache, 0, 0, 1, 0).status == ChunkStatus::Missing);
+        cache->waitForPersistentWrites();
+    }
+
+    // The native objects are there, byte for byte.
+    CHECK(readAllBytes(persist / "scale0" / "0.0.0") == varied);
+    CHECK(readAllBytes(persist / "scale0" / "0.0.1") == shifted);
+    CHECK(readAllBytes(persist / "scale0" / "1.0.0") == fill);
+    CHECK(fs::is_regular_file(persist / "scale0" / "0.1.0.empty"));
+
+    // ...and nothing else: no decoded copy under the legacy level_N layout.
+    const auto files = regularFilesBelow(persist);
+    std::size_t variedCopies = 0;
+    std::size_t shiftedCopies = 0;
+    std::size_t fillCopies = 0;
+    std::size_t emptyMarkers = 0;
+    for (const auto& file : files) {
+        CHECK_MESSAGE(!file.generic_string().starts_with("level_"),
+                      "decoded copy next to the mirror object: " << file.string());
+        if (file.extension() == ".empty") {
+            ++emptyMarkers;
+            continue;
+        }
+        const auto bytes = readAllBytes(persist / file);
+        variedCopies += bytes == varied;
+        shiftedCopies += bytes == shifted;
+        fillCopies += bytes == fill;
+    }
+    CHECK(variedCopies == 1);
+    CHECK(shiftedCopies == 1);
+    CHECK(fillCopies == 1);
+    CHECK(emptyMarkers == 1);
+    CHECK_FALSE(fs::exists(persist / "level_0"));
+
+    // A reopened mirror serves every chunk from the native objects alone.
+    auto offline = std::make_shared<MirrorFetcher>();
+    auto reopened = makeMirrorCache(offline, persist);
+    REQUIRE(reopened->persistentCacheLayout() ==
+            vc::render::PersistentCacheLayout::ZarrMirror);
+    const auto hot = waitForResolved(*reopened, 0, 0, 0, 1);
+    REQUIRE(hot.status == ChunkStatus::Data);
+    REQUIRE(hot.bytes);
+    CHECK(*hot.bytes == shifted);
+    CHECK(waitForResolved(*reopened, 0, 0, 1, 0).status == ChunkStatus::Missing);
+    CHECK(offline->fetchCalls.load() == 0);
+    reopened.reset();
+
     fs::remove_all(parent);
 }

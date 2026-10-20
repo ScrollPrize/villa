@@ -4500,6 +4500,10 @@ bool ChunkCache::queuePersistentWrite(const std::shared_ptr<State>& state,
 {
     if (!state || !state->options_.persistentCachePath || !bytes)
         return false;
+    // A Zarr mirror holds each storage object once, at its native key
+    // (writeMirrorObject). A decoded level_N/...bin next to it is never read.
+    if (state->persistentLayout_ == PersistentCacheLayout::ZarrMirror)
+        return false;
     if (persistentEntryIsRaw(*state, key) &&
         bytes->size() != expectedChunkBytes(*state, key))
         return false;
@@ -4782,6 +4786,10 @@ bool ChunkCache::queuePersistentEmptyWrite(const std::shared_ptr<State>& state,
                                            const ChunkKey& key)
 {
     if (!state || !state->options_.persistentCachePath)
+        return false;
+    // A Zarr mirror records a missing object as <object>.empty
+    // (writeMirrorEmpty); it has no level_N/...empty markers.
+    if (state->persistentLayout_ == PersistentCacheLayout::ZarrMirror)
         return false;
 
     state->persistentWritesInFlight_.fetch_add(1, std::memory_order_acq_rel);
