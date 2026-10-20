@@ -97,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     command_record = json.loads((run_dir / "command.json").read_text(encoding="utf-8"))
     command = command_record["resolved_argv"]
     prefetch_request = command_record.get("prefetch")
+    active_phase = str(metadata.get("active_lifecycle_phase") or "inference")
     log = (run_dir / "run.log").open("a", encoding="utf-8", buffering=1)
     pane_stdout = _TeeText(log, sys.stdout)
     pane_stderr = _TeeText(log, sys.stderr)
@@ -164,12 +165,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     except Exception:
         metadata.update(status="failed", ended_at=utc_now(), exit_code=None)
-        metadata["lifecycle"]["inference"] = "failed"
+        metadata["lifecycle"][active_phase] = "failed"
         atomic_json(metadata_path, metadata)
         log.close()
         raise
     metadata.update(status="running", pid=child.pid, process_start_time=_process_start_time(child.pid))
-    metadata["lifecycle"]["inference"] = "running"
+    metadata["lifecycle"][active_phase] = "running"
     atomic_json(metadata_path, metadata)
     assert child.stdout is not None
     log.flush()
@@ -188,19 +189,32 @@ def main(argv: list[str] | None = None) -> int:
     returncode = child.wait()
     status = "interrupted" if interrupted else "completed" if returncode == 0 else "failed"
     metadata.update(status=status, ended_at=utc_now(), exit_code=returncode)
-    metadata["lifecycle"]["inference"] = status
+    metadata["lifecycle"][active_phase] = status
+    if returncode == 0 and not interrupted and metadata.get("job_kind") == "fiberlet":
+        try:
+            from .fiberlets import finalize_fiberlet_provenance
+
+            finalize_fiberlet_provenance(run_dir, metadata)
+        except Exception as error:
+            returncode = 1
+            status = "failed"
+            metadata.update(status=status, exit_code=returncode)
+            metadata["completion_error"] = (
+                f"Fiberlet portable provenance validation failed: {error}"
+            )
     provenance_path = run_dir / metadata.get("artifacts", {}).get("provenance", "artifacts/inference.json")
     inventory, live_fetch, provenance_error = _load_completed_provenance(provenance_path)
     metadata.setdefault("artifacts", {})["inventory"] = inventory
     if live_fetch is not None:
         metadata["live_fetch"] = live_fetch
     if returncode == 0 and not interrupted and provenance_error:
+        returncode = 1
         status = "failed"
-        metadata.update(status=status)
+        metadata.update(status=status, exit_code=returncode)
         metadata["completion_error"] = provenance_error
     elif provenance_error:
         metadata["provenance_error"] = provenance_error
-    metadata["lifecycle"]["inference"] = status
+    metadata["lifecycle"][active_phase] = status
     atomic_json(metadata_path, metadata)
     log.close()
     return returncode
