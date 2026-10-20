@@ -1907,18 +1907,32 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
                 }
                 return best;
             };
+            // Every control's exact vertex, resolved before the replacement
+            // and shifted with it, so the task names the controls' vertices
+            // on the line it returns.
+            std::vector<int> resolved;
+            resolved.reserve(task.controlPoints.size());
+            for (const auto& control : task.controlPoints) {
+                resolved.push_back(nearestIndex(control.volumePoint));
+            }
             const auto& head = task.controlPoints[order.front()];
             const auto& tail = task.controlPoints[order.back()];
-            vc3d::line_annotation::replaceRayTails(
+            const int shift = vc3d::line_annotation::replaceRayTails(
                 task.result.line,
-                nearestIndex(head.volumePoint),
-                nearestIndex(tail.volumePoint),
+                resolved[order.front()],
+                resolved[order.back()],
                 tailPolicy,
                 head.direction,
                 tail.direction,
                 rayTailDistanceBaseVoxels,
                 std::max(0.1, config.segmentLength),
                 &sampler);
+            for (size_t i = 0; i < task.controlPoints.size(); ++i) {
+                task.controlPoints[i].optimizedIndex = resolved[i] + shift;
+                task.controlPoints[i].linePosition = static_cast<double>(resolved[i] + shift);
+            }
+            task.result.report.message += "\nray_extrapolations=" +
+                std::to_string(int(tailPolicy.headRay) + int(tailPolicy.tailRay));
         }
         task.ok = true;
     } catch (const std::exception& ex) {
@@ -11363,6 +11377,13 @@ void LineAnnotationController::refreshTailsAfterTailPolicyChange(
     if (session.optimizedLine.points.size() < 2 || session.controlPoints.empty()) {
         return;
     }
+    // A tails-only solve certifies the interior as it stands: allowed only
+    // when that interior was optimized and nothing is owed. Otherwise (a
+    // successor failed after an incomplete landing, provisional spans on
+    // screen, queued work) the whole line is solved.
+    const bool interiorOptimized =
+        session.optimizationState == SessionOptimizationState::Optimized &&
+        !session.solveQueue.hasPending();
     setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
         // The running solve computes tails with the OLD policy or distance:
@@ -11384,11 +11405,11 @@ void LineAnnotationController::refreshTailsAfterTailPolicyChange(
     if (!ensureDatasetForSession(session)) {
         return;
     }
-    // Tails only (every span fixed) unless work is already pending or the
-    // caller asked for the whole line: a whole-line solve subsumes the
-    // pending request at dispatch instead of landing a tails-only result
-    // with the successor still queued.
-    if (wholeLine || session.solveQueue.hasPending()) {
+    // Tails only (every span fixed) when the caller allows it and the
+    // interior was optimized with nothing pending; a whole-line solve
+    // otherwise (it subsumes a pending request at dispatch instead of
+    // landing a tails-only result with the successor still queued).
+    if (wholeLine || !interiorOptimized) {
         startFiberModeOptimization(session, false);
     } else {
         startFiberModeOptimization(session, false, std::vector<size_t>{});
@@ -12124,7 +12145,7 @@ bool LineAnnotationController::finalizeSessionOptimizationSynchronously(
         // the solver requires whatever the tails do.
         const bool rayOnly = vc3d::line_annotation::singleControlRayOnly(session.controlPoints);
         bool solveAsLasagna = false;
-        if (needsTrace && (session.modelOnly || fiberFollowEnabled())) {
+        if (needsTrace && (session.modelOnly || (fiberFollowEnabled() && !rayOnly))) {
             auto* pane = paneForSurface(session.surfaceName);
             if (!ensureFiberFollowService(session.suppressErrorDialogs, pane ? pane->dialog.data() : nullptr))
                 return false;
@@ -12710,7 +12731,7 @@ void LineAnnotationController::startFiberModeOptimization(
     // always ensures its service (the request installs the callbacks the
     // solver requires).
     const bool rayOnly = vc3d::line_annotation::singleControlRayOnly(session.controlPoints);
-    if (needsTrace && (session.modelOnly || fiberFollowEnabled())) {
+    if (needsTrace && (session.modelOnly || (fiberFollowEnabled() && !rayOnly))) {
         auto* tracePane = paneForSurface(session.surfaceName);
         if (!ensureFiberFollowService(session.suppressErrorDialogs,
                                       tracePane ? tracePane->dialog.data() : nullptr)) {
