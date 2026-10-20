@@ -409,6 +409,7 @@ void VolumeOverlayController::refreshVolumeOptions()
             const QString label = vc3d::volumeDisplayLabel(*_volumePkg, id, overlayVolumeLabel(volume, idStr));
             const int row = _ui.volumeSelect->count();
             _ui.volumeSelect->addItem(label, QVariant(idStr));
+            _ui.volumeSelect->setItemData(row, vc3d::volumeDisplayPath(*_volumePkg, id), Qt::ToolTipRole);
             if (!_overlayVolumeId.empty() && _overlayVolumeId == id) {
                 indexToSelect = row;
             }
@@ -416,6 +417,7 @@ void VolumeOverlayController::refreshVolumeOptions()
     }
 
     _ui.volumeSelect->setCurrentIndex(indexToSelect);
+    vc3d::refreshVolumeComboTooltip(_ui.volumeSelect);
     if (indexToSelect == 0 && !_overlayVolumeId.empty()) {
         _overlayVolumeId.clear();
     }

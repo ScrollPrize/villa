@@ -1,6 +1,8 @@
 #pragma once
 
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/types/Volume.hpp"
+#include "VolumePathLabels.hpp"
 #include <QString>
 #include <algorithm>
 #include <string>
@@ -20,11 +22,31 @@ inline QString volumeDisplayAlias(const std::vector<std::string>& tags)
     return {};
 }
 
+inline QString volumeDisplayPath(const VolumePkg& pkg, const std::string& id)
+{
+    const auto volume = pkg.volume(id);
+    return volumePathForDisplay(QString::fromStdString(volume->isRemote()
+        ? volume->remoteLocator() : volume->path().string()));
+}
+
 inline QString volumeDisplayLabel(const VolumePkg& pkg, const std::string& id,
                                   const QString& original)
 {
+    const auto ids = pkg.volumeIDs();
+    QStringList paths;
+    qsizetype selected = -1;
+    for (const auto& candidate : ids) {
+        if (candidate == id) selected = paths.size();
+        paths.push_back(volumeDisplayPath(pkg, candidate));
+    }
+    QString label = original;
+    if (selected >= 0) {
+        const auto suffix = distinguishingVolumePaths(paths)[selected];
+        if (suffix.contains('/'))
+            label += QStringLiteral(" [%1]").arg(suffix);
+    }
     const auto alias = volumeDisplayAlias(pkg.volumeTags(id));
-    return alias.isEmpty() ? original : alias + QStringLiteral(" - ") + original;
+    return alias.isEmpty() ? label : alias + QStringLiteral(" - ") + label;
 }
 
 inline auto orderedDisplayVolumeIds(const VolumePkg& pkg)
