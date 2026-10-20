@@ -185,7 +185,7 @@ AGENTS_AGENT_MODE=1 ninja -C build -j 4
 AGENTS_AGENT_MODE=1 ctest --test-dir build --output-on-failure
 AGENTS_AGENT_MODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python \
-  /home/sean/villa/volume-cartographer/.venv/bin/python -m pytest -q tests/python
+  /path/to/python -m pytest -q tests/python
 AGENTS_AGENT_MODE=1 build/bin/bench_structural_edits 5 > /tmp/structural-bench.jsonl
 ```
 
@@ -214,95 +214,4 @@ compactions and SQLite VM steps. Counters measure logical processing, not disk
 traffic. Metadata bytes count dirty current JSON once rather than every copy.
 Opt-in scoped timings report exclusive wall time in instrumented functions
 (nested phases subtracted), including SQLite waits. SQLite PROFILE durations
-are statement lifetimes, not exclusive CPU times. Kernel `perf` sampling was
-unavailable (`perf_event_paranoid=4`); no system setting was changed.
-
-## Recorded measurements (2026-10-20)
-
-Linux aarch64, GCC 13, **RelWithDebInfo**, five isolated timed edits per case.
-Each cell reports mean milliseconds and `(min / median / max)`. The
-[raw indexed report](benchmarks/structural-edits-indexed-2026-10-20.json)
-contains every sample, counter, initialization measurement and profile.
-The [earlier flat-layout report](benchmarks/structural-edits-2026-10-20.json)
-is retained for comparison; it described the incomplete first implementation.
-
-| Operation | Size | Links | Full replacement, ms | Indexed structural, ms |
-|---|---:|---:|---:|---:|
-| append | 1000 | 0 | 4.41 (3.98 / 4.49 / 4.78) | 5.38 (4.99 / 5.29 / 5.81) |
-| append | 10000 | 0 | 5.36 (5.11 / 5.21 / 5.70) | 6.54 (4.33 / 5.41 / 12.49) |
-| append | 100000 | 0 | 11.38 (5.68 / 7.49 / 23.41) | 3.24 (2.92 / 3.10 / 3.89) |
-| insert | 1000 | 0 | 4.34 (4.02 / 4.30 / 4.78) | 5.36 (4.69 / 5.48 / 5.81) |
-| insert | 10000 | 0 | 4.97 (4.51 / 4.71 / 5.91) | 6.83 (4.78 / 5.52 / 12.98) |
-| insert | 100000 | 0 | 16.52 (10.89 / 18.09 / 24.13) | 4.00 (3.70 / 3.82 / 4.67) |
-| right_growth | 128 | 0 | 4.64 (4.06 / 4.82 / 4.98) | 5.82 (5.45 / 5.96 / 6.12) |
-| right_growth | 512 | 0 | 12.88 (12.28 / 12.82 / 13.66) | 18.34 (15.69 / 16.86 / 24.66) |
-| right_growth | 1024 | 0 | 49.35 (45.67 / 46.69 / 55.38) | 37.29 (33.98 / 35.16 / 45.52) |
-| append | 1000 | 8 | 4.57 (3.98 / 4.67 / 5.01) | 4.91 (4.39 / 4.86 / 5.39) |
-| append | 10000 | 8 | 5.24 (4.55 / 5.11 / 6.00) | 6.30 (4.31 / 4.41 / 13.10) |
-| append | 100000 | 8 | 12.81 (8.53 / 10.00 / 24.12) | 3.64 (3.00 / 3.89 / 4.09) |
-| insert | 1000 | 8 | 4.62 (4.31 / 4.55 / 4.97) | 5.18 (4.73 / 4.83 / 6.13) |
-| insert | 10000 | 8 | 5.97 (5.44 / 6.07 / 6.33) | 6.70 (4.89 / 5.11 / 13.28) |
-| insert | 100000 | 8 | 22.02 (14.90 / 19.21 / 29.00) | 4.00 (3.70 / 3.89 / 4.30) |
-| right_growth | 128 | 8 | 7.45 (6.61 / 7.73 / 8.09) | 9.18 (8.89 / 9.02 / 9.58) |
-| right_growth | 512 | 8 | 25.39 (25.14 / 25.23 / 26.09) | 21.74 (19.69 / 19.99 / 27.78) |
-| right_growth | 1024 | 8 | 82.26 (76.26 / 81.66 / 87.79) | 40.97 (38.28 / 39.03 / 48.53) |
-
-Small objects can be slower with indexed storage because tree management and
-commit overhead outweigh avoided bulk work. The work counters, rather than
-latency alone, establish bounded publication. Repeated synthetic surface values
-allow considerable payload deduplication; these are not representative viewer
-latency guarantees.
-
-First-iteration indexed work (including tree metadata in `@tree`):
-
-| Operation | Size | Links | ID lookups | Relationship candidates | Coarse spatial rows | Node/root reference operations | Tree bytes read/hashed | Manifest bytes read/written |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| append | 1000 | 0 | 2 | 0 | 1 | 14 | 37,071 / 37,071 | 4,396 / 1,102 |
-| append | 10000 | 0 | 2 | 0 | 1 | 23 | 25,897 / 25,897 | 4,440 / 1,113 |
-| append | 100000 | 0 | 2 | 0 | 1 | 38 | 47,052 / 47,052 | 4,492 / 1,126 |
-| insert | 100000 | 8 | 2 | 0 | 1 | 59 | 69,156 / 69,156 | 4,492 / 1,124 |
-| right_growth | 128 | 8 | 0 | 8 | 1 | 42 | 41,330 / 41,330 | 22,881 / 789 |
-| right_growth | 512 | 8 | 0 | 8 | 1 | 290 | 326,570 / 326,570 | 23,031 / 795 |
-| right_growth | 1024 | 8 | 0 | 8 | 1 | 706 | 889,341 / 889,341 | 23,287 / 803 |
-
-ID lookups count requested identities; their bounded bucket/node processing is
-included in tree bytes and hashing. Spatial rows count SQL publication; subtree
-and halo updates are included in tree-node work. All tested append sizes perform
-two identity lookups and publish one coarse spatial row. Unchanged stable-ID
-links produce zero relationship candidates. In the earlier 10,000-point flat
-implementation, a single append scanned 20,000 identity rows. The earlier
-512-square/eight-link growth published 272 spatial rows and read about 2.15 MB
-of manifests. The indexed path removes those whole-object passes.
-
-Legacy conversion is a separate, explicit proportional cost. Independent
-zero-link conversions recorded during this run:
-
-| Conversion | Size | Samples | Mean ms | Min / median / max ms |
-|---|---:|---:|---:|---:|
-| sequence_initialize | 1000 | 5 | 8.28 | 7.10 / 7.71 / 11.52 |
-| sequence_initialize | 10000 | 4 | 44.72 | 39.68 / 41.69 / 55.83 |
-| sequence_initialize | 100000 | 4 | 434.49 | 420.25 / 427.67 / 462.37 |
-| surface_initialize | 128 | 2 | 5.05 | 4.60 / 5.05 / 5.50 |
-| surface_initialize | 512 | 2 | 35.47 | 30.91 / 35.47 / 40.02 |
-| surface_initialize | 1024 | 2 | 192.50 | 187.29 / 192.50 / 197.72 |
-
-The 80-append history runs start with 1,000 points and no relationships. Local
-compaction is inside every timed transaction:
-
-- Full replacement: 2.49 (1.20 / 1.79 / 9.53) ms; 0 local compactions.
-- Indexed structural: 4.38 (2.40 / 3.54 / 13.10) ms; 158 local compactions.
-
-The exclusive phase profile identifies these largest measured function costs
-(mean ms per edit; SQLite commit outside these phases also contributes):
-
-- append, 100000, 0 links: `treeNode` 0.676 ms; `identityPut` 0.243 ms; `ObjectStore::editGeometrySequence` 0.208 ms.
-- right_growth, 1024, 8 links: `treeNode` 16.440 ms; `ObjectStore::resizeSurface` 12.540 ms; `storeSharedPayload` 2.877 ms.
-
-Tree-node handling is now the main indexed-storage overhead; coordinate
-processing no longer grows with the untouched sequence. Further constant-factor
-tuning is possible without changing the completed structural contract.
-
-Final validation: **319 Python tests and all 9 C++ suites passed**, including
-20 Python structural cases and four C++ structural/instrumentation cases.
-`git diff --check` passed. Build/test commands are listed above; no dependencies
-were installed and no consumer integration or real-scroll validation is claimed.
+are statement lifetimes, not exclusive CPU times.

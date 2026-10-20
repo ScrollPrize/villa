@@ -186,7 +186,9 @@ AGENTS_AGENT_MODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
 For real data, the validation harness creates temporary databases, checks typed
 values against source JSON, compares every stored array byte-for-byte after
 typed decoding/encoding, and verifies native export. Patch/track exports are
-also re-ingested and their arrays compared. Sources are read-only; temporary
+also re-ingested and their arrays compared. Inputs must contain only the native
+geometry arrays: auxiliary surface channels are not representable by owned
+typed geometry or native export. Sources are read-only; temporary
 databases and exports are deleted on exit. Flags are repeatable:
 
 ```sh
@@ -197,20 +199,5 @@ AGENTS_AGENT_MODE=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python \
   --patch /data/patch
 ```
 
-Validation on Ubuntu arm64 with GCC 13, `RelWithDebInfo`, and Python 3.14:
-6 native test executables and 202 Python tests passed. The adapters-disabled
-configuration also passed its 4 native test executables. Real-data validation
-used `/home/sean/Desktop/spiral_dataset_graph_uuid` with:
-
-| Input | Objects | Points/vertices |
-| --- | ---: | ---: |
-| `abs_winding.json` | 6 collections | 59 |
-| `relative_windings.json` | 300 collections | 2,173 |
-| `sean_fiber_pcls.json` | 23 collections | 984 |
-| `fibers/anon_20260815T014816946_000002.json` | 1 fiber | 2,515 control + sampled points |
-| `verified_patches/0000_top_vt_strip_1` | 1 patch | 78,581 |
-
-All exact-array and native-export checks passed. Tracks are covered by the
-automated fixture tests; no real packed-track dataset was used for this run.
-macOS and amd64 were not executed in this environment. Existing native directory
+Existing native directory
 export still requires Linux `renameat2`; this change does not alter that limit.

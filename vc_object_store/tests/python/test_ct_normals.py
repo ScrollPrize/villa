@@ -31,8 +31,3 @@ def test_native_ct_adapter_levels_scaling_and_support(tmp_path):
         sampler.sample_normal([np.nan, 108, 108])
     with pytest.raises(ValueError):
         CtSheetNormalSampler(tmp_path, working_to_ct_scale=0)
-
-
-def test_removed_lasagna_option_is_rejected(db):
-    with pytest.raises((ValueError, TypeError, RuntimeError), match="normals_manifest"):
-        db.link_fibers_to_patches(normals_manifest="unused.json")

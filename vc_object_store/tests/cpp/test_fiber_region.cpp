@@ -1,4 +1,4 @@
-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
+#define VC_TEST_MAIN
 #include "vc_test.hpp"
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"

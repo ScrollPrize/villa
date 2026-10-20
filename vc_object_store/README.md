@@ -71,7 +71,7 @@ options remain in working voxels. CT normals use uint8 Zarr data with complete
 109³ support. Native CT opening supports local and anonymous HTTP/S3 arrays and
 pyramid levels; credentials and disk-cache configuration are not exposed by this
 adapter. The supported codecs are vc_reader's current codecs; `vcz1` is not
-supported. Removed Lasagna-normal options are rejected.
+supported.
 
 Surface proximity queries use the store's resident bounds index and exact
 triangles. Bounds are not quantized, so queries near tile boundaries can find

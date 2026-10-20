@@ -1,5 +1,5 @@
-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-#include <doctest/doctest.h>
+#define VC_TEST_MAIN
+#include "vc_test.hpp"
 #include "spatial/PatchIndex.hpp"
 using namespace vc::object_links;
 

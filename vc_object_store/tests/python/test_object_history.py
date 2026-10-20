@@ -1,5 +1,4 @@
 """Unified revisions, pinned graph membership and checked atomic actions."""
-import json
 import sqlite3
 import struct
 

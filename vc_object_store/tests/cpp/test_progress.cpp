@@ -1,5 +1,5 @@
-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-#include <doctest/doctest.h>
+#define VC_TEST_MAIN
+#include "vc_test.hpp"
 #include "vc_object_store/TerminalProgress.hpp"
 #include <condition_variable>
 #include <sstream>

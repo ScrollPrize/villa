@@ -57,7 +57,6 @@ int main(int argc, char** argv) try {
     if (!fs::create_directory(work)) throw std::runtime_error("Work directory must not exist");
     Cleanup cleanup{work};
     fs::copy(source, work / "surface", fs::copy_options::recursive);
-    // All snapshots and rotating backups stay inside the disposable workspace.
     auto surface = vc::object_links::readPatchGrid(work / "surface");
     auto original = surface.rawPoints().clone();
     if (!original.isContinuous()) throw std::runtime_error("Expected contiguous points");
@@ -163,8 +162,7 @@ int main(int argc, char** argv) try {
     db.checkpoint();
     const auto growth = fileBytes(db.path()) - initialBytes;
 
-    // Exact current autosave worker call, using its persistent warmed snapshot.
-    // First save includes the ordinary initial rotating recovery snapshot.
+    // Compare durable database edits with rewriting all three XYZ TIFFs.
     std::vector<double> fileTimes;
     auto* filePoints = surface.rawPointsPtr();
     for (int i = 0; i < saves; ++i) {

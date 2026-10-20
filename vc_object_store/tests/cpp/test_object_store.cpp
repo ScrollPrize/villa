@@ -1,5 +1,6 @@
-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-#include <doctest/doctest.h>
+#define VC_TEST_MAIN
+#include "vc_test.hpp"
+#include "TempDir.hpp"
 
 #include "vc_object_store/objects/ObjectStore.hpp"
 
@@ -14,16 +15,7 @@ namespace
 using namespace vc::objects;
 namespace fs = std::filesystem;
 
-struct TempDir {
-    fs::path dir;
-    explicit TempDir(const std::string& name)
-    {
-        dir = fs::temp_directory_path() / ("vc_object_test_" + name);
-        fs::remove_all(dir);
-        fs::create_directories(dir);
-    }
-    ~TempDir() { fs::remove_all(dir); }
-};
+using vc::test::TempDir;
 
 OpenOptions testOptions()
 {

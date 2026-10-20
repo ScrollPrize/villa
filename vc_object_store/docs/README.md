@@ -86,31 +86,6 @@ existing points in the same document (five imports each; fixture creation is
 outside timing). Both use synthetic inputs; these are scaling checks, not
 real-scroll or cross-platform latency claims.
 
-Recorded on Linux aarch64, GCC 13.3, RelWithDebInfo (2026-10-20), five
-iterations per case. Times are milliseconds, including publication and commit:
-
-| Existing points | Before mean (min / median / max) | After mean (min / median / max) |
-| ---: | ---: | ---: |
-| 0 | 4.99 (3.90 / 3.96 / 7.96) | 4.47 (3.29 / 4.28 / 6.34) |
-| 20,000 | 14.42 (13.46 / 13.97 / 16.52) | 9.32 (5.01 / 6.20 / 18.95) |
-| 100,000 | 63.19 (58.33 / 61.69 / 72.21) | 1.82 (1.33 / 1.59 / 2.68) |
-
-The small samples show filesystem/cache/scheduling noise; bounded-work checks
-provide the stronger scaling evidence. At every size, the native harness records
-24 coordinate bytes, 16 ID bytes, and three identity-row operations for an
-unlinked import. A link to an existing 1,000-point collection reads 24,048
-coordinate bytes (including its containing chunk), 16 ID bytes, and eight
-identity-row operations, independent of unrelated collection count.
-
-For the 100,000-point cases, the largest instrumented exclusive phases average
-0.110 ms for geometry publication, 0.076 ms for history, and 0.042 ms for index
-maintenance without links; with a link, relationship import is 0.466 ms and
-history publication is 0.384 ms. These spans exclude uninstrumented parsing and
-commit costs included in total latency. The exploratory Python profiler did not
-expose native calls; these are native scoped measurements. Exact commands,
-original timing script, individual samples, and native profiles are in the
-[raw report](benchmarks/source-import-2026-10-20.json).
-
 ## Python
 
 ```python
@@ -760,23 +735,22 @@ Run the focused suite against the existing build and Python environment:
 
 ```sh
 ninja -C build
-ctest --test-dir build --output-on-failure \
-  -R '^(test_object_(records|store|links)|test_progress|test_surface_patch_index|test_volume_static_read|test_volume_chunk_errors)$'
+ctest --test-dir build --output-on-failure
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python \
-  .venv/bin/python -m pytest tests/python/test_object*.py -q
+  /path/to/python -m pytest -q tests/python
 ```
 
-Python tests cover public storage workflows, including ingestion/export of the
-checked-in PHerc 0172 segments. Native tests cover transaction snapshots,
+Python tests cover public storage workflows with self-contained ingestion/export
+fixtures. Native tests cover transaction snapshots,
 concurrency, detector kernels, and C++ validation. Keep each regression at the
 layer that exercises it directly; avoid duplicating CRUD tests, checking SQLite
-itself, or recreating every intermediate development schema. One oldest-supported
-schema upgrade smoke test covers compatibility.
+itself, or recreating every intermediate development schema. Migration tests cover
+retained geometry, derived indexes, lifecycle state, and synchronization.
 
 ## Edit persistence benchmark
 
 `bench_object_edits` compares `editGeometry()` plus durable transaction commit
-with the existing `QuadSurface::saveOverwrite()` autosave worker call on copies
+with rewriting XYZ TIFFs through `writePatchGrid()` on copies
 of real tifxyz segments. It never writes to its source. The output reports mean,
 p50, p95, p99, and maximum milliseconds, separating update collection, delta
 packing, edit processing, and commit. It also reports first/last windows, database
@@ -786,7 +760,7 @@ saved tifxyz are verified byte-for-byte.
 
 ```sh
 AGENTS_AGENT_MODE=1 ninja -C build bench_object_edits
-AGENTS_AGENT_MODE=1 .venv/bin/python scripts/bench_object_edits.py \
+AGENTS_AGENT_MODE=1 /path/to/python scripts/bench_object_edits.py \
   --segment /path/to/real/segment \
   --radius 5.75 --radius 16 --radius 64 \
   --edits 1000 --file-saves 50 --repeats 3 \
@@ -809,87 +783,14 @@ Current VC3D geometry autosave queues vertices and runs the file save through
 `QtConcurrent`; its timer interval is 10 seconds. The benchmark deliberately
 measures each database action as a separate durable commit. It uses the default
 SQLite WAL/`synchronous=FULL` settings, with no geometry checkpoints. File-save
-timings use the existing write/close/rename implementation, which does not
-explicitly fsync each save, so the durability guarantees differ. The first file
-save includes the normal initial recovery snapshot; warm statistics exclude it.
+timings do not explicitly fsync each save, so the durability guarantees differ.
+Warm file-save statistics exclude the first save.
 Input loading and initial DB ingestion are outside the timed edit loops.
 
 These measurements do not establish interactive frame rates: they exclude
 rendering, deformation computation, relationship repairs, simultaneous writers,
 long-held read transactions, and approval-mask edits. Future integration should
 submit immutable edit data to a worker, preserving asynchronous persistence.
-
-### Measurements, 2026-10-20
-
-[Recorded results](benchmarks/edit-persistence-2026-10-20.json) use real Scroll 1
-9.6 µm segments from `spiral_dataset_graph_uuid/verified_patches`, on this ARM
-Cortex-X925/A725 machine with a Samsung NVMe/ext4 filesystem and a
-`RelWithDebInfo` build. The selected bounding boxes span 11.7–38.0 cm³; the point
-count and storage tiling, rather than physical bounding-box volume alone,
-determine persistence cost. These are 9.6 µm inputs, not exactly 8 µm.
-
-Each main case has three independent runs of 1,000 edits and 50 file saves.
-Values below are medians of the three per-run statistics, not pooled percentiles.
-Default-radius footprints contain up to 101 valid points.
-
-| Segment | Grid points | DB mean | DB p50 | DB p95 | File-save p50 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `0000_top_vt_strip_1` | 78,581 | 2.52 ms | 2.38 ms | 4.18 ms | 0.80 ms |
-| `0000_low_band_final` | 454,740 | 2.89 ms | 2.69 ms | 3.98 ms | 5.03 ms |
-| `0000_top_band` | 3,173,488 | 3.20 ms | 2.99 ms | 4.51 ms | 64.94 ms |
-
-On the largest surface, radius 16 has a median footprint of 797 points and
-commits in 3.63 ms p50 / 6.01 ms p95. Radius 64 has a median footprint of 9,177
-valid points (up to 12,814) and takes 8.93 ms p50 / 15.26 ms p95. The worst
-observed default-radius commit was 17.42 ms; the radius-64 maximum was 18.52 ms.
-Thus synchronous persistence on the UI thread cannot guarantee a 16.7 ms budget.
-Submitting one range per vertex instead of contiguous runs increased the large
-radius-64 case to 11.66 ms p50 / 18.10 ms p95 in a separate single run.
-
-Packing default-size edits took approximately 0.003 ms p95. At radius 64 on the
-largest surface, contiguous packing took 0.111 ms p95. On that surface, default
-commits spent approximately 1.81 ms in edit processing and 1.39 ms in commit
-(mean times). These are instrumented call-boundary timings; native sampling
-could not run because `perf_event_paranoid=4` and sandbox ptrace restrictions
-blocked perf and GDB respectively.
-
-There was no large progressive slowdown over 1,000 writes. Default first/last
-100-edit medians were 2.39/2.68 ms, 2.19/2.71 ms, and 3.09/2.99 ms for the three
-surfaces. Historical reconstruction remains a separate limitation: on the
-largest surface after 1,000 default edits, full current reads took about 50 ms,
-previous-version reads 138 ms, and middle-version reads 219 ms. A middle-version
-read after the radius-64 stress workload took approximately 4.85 seconds.
-Those are single reads per run, with medians across three runs; no cold-cache
-or history-navigation latency guarantee is implied.
-
-The evidence supports a background commit per completed action for these
-workloads. It does not demonstrate zero impact on interactive rendering, nor
-fast arbitrary history navigation. No VC3D integration or production DB changes
-were made for this benchmark.
-
-Reproduce the recorded inputs by passing these three `--segment` arguments to
-the command above:
-
-```sh
---segment /home/sean/Desktop/spiral_dataset_graph_uuid/verified_patches/0000_top_vt_strip_1 \
---segment /home/sean/Desktop/spiral_dataset_graph_uuid/verified_patches/0000_low_band_final \
---segment /home/sean/Desktop/spiral_dataset_graph_uuid/verified_patches/0000_top_band
-```
-
-Historical validation for the benchmark addition, before extraction into this
-package (the QuadSurface checks belong to volume-cartographer):
-
-```sh
-AGENTS_AGENT_MODE=1 ninja -C build bench_object_edits test_object_store \
-  test_quadsurface_save_roundtrip test_quadsurface_snapshot
-AGENTS_AGENT_MODE=1 ctest --test-dir build --output-on-failure \
-  -R '^(test_object_store|test_quadsurface_save_roundtrip|test_quadsurface_snapshot)$'
-AGENTS_AGENT_MODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python \
-  .venv/bin/python -m pytest tests/python/test_object_geometry_edits.py -q
-```
-
-All three native test executables and all 20 Python edit tests passed. The 28
-recorded benchmark runs also passed their exact geometry and file verification.
 
 Structural sequence edits and coordinated surface growth/cropping are described
 in [Structural geometry editing](structural-editing.md), including checked
@@ -1008,5 +909,5 @@ AGENTS_AGENT_MODE=1 ninja -C build -j 4
 AGENTS_AGENT_MODE=1 ctest --test-dir build --output-on-failure
 AGENTS_AGENT_MODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
   VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python \
-  /home/sean/villa/volume-cartographer/.venv/bin/python -m pytest -q tests/python
+  /path/to/python -m pytest -q tests/python
 ```

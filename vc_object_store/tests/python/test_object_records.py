@@ -1,9 +1,4 @@
-"""Tests for the ``vc_object_store`` bindings (object records and relationships).
-
-Run against the built module with
-``PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python
-.venv/bin/python -m pytest python/tests/test_object_records.py``.
-"""
+"""Object-record and relationship binding tests."""
 from __future__ import annotations
 
 import json

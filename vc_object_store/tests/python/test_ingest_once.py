@@ -5,7 +5,6 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
-import pytest
 from vc_object_store import ObjectStore
 from test_object_ingestion import fiber
 from test_structural_geometry import sequence, point, heads

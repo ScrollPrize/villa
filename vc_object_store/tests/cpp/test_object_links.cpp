@@ -1,5 +1,6 @@
-#define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
-#include <doctest/doctest.h>
+#define VC_TEST_MAIN
+#include "vc_test.hpp"
+#include "TempDir.hpp"
 
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/TrackCrossings.hpp"
@@ -31,15 +32,7 @@ using namespace vc::objects;
 using namespace vc::object_links;
 namespace fs = std::filesystem;
 
-struct TempDir {
-    fs::path dir;
-    explicit TempDir(const std::string& name)
-    {
-        dir = fs::temp_directory_path() / ("vc_object_links_test_" + name + "_" + vc::objects::util::newUuid());
-        fs::create_directories(dir);
-    }
-    ~TempDir() { fs::remove_all(dir); }
-};
+using vc::test::TempDir;
 
 ObjectStore makeDb(const fs::path& dir)
 {
