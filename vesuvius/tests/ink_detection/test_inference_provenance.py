@@ -23,10 +23,18 @@ from vesuvius.ink_detection.inference.provenance import (
 )
 
 
+_ZARR3 = int(zarr.__version__.split(".", 1)[0]) >= 3
+
+
+def _create(root, name, **kwargs):
+    """Child array on either supported Zarr API (Zarr 2 has no Group.create_array)."""
+    return (root.create_array if _ZARR3 else root.create_dataset)(name, **kwargs)
+
+
 def _ome_root(tmp_path: Path, scale_by_level: dict[str, list[float]], unit="micrometer"):
     root = zarr.open_group(str(tmp_path / "surface.zarr"), mode="w")
     for level in scale_by_level:
-        root.create_array(level, shape=(3, 8, 8), chunks=(3, 8, 8), dtype="uint8")
+        _create(root, level, shape=(3, 8, 8), chunks=(3, 8, 8), dtype="uint8")
     root.attrs["multiscales"] = [
         {
             "axes": [
@@ -147,7 +155,7 @@ def test_micrometre_scale_carries_no_note(tmp_path):
 
 def test_ome_0_5_layout_is_read_too(tmp_path):
     root = zarr.open_group(str(tmp_path / "ome5.zarr"), mode="w")
-    root.create_array("0", shape=(3, 8, 8), chunks=(3, 8, 8), dtype="uint8")
+    _create(root, "0", shape=(3, 8, 8), chunks=(3, 8, 8), dtype="uint8")
     root.attrs["ome"] = {
         "multiscales": [
             {
@@ -402,7 +410,7 @@ def test_cli_output_tiff_records_checkpoint_run_and_scale(tmp_path):
         shape=(3, 16, 16),
         chunks=(3, 16, 16),
         dtype="u1",
-        zarr_format=2,
+        **({"zarr_format": 2} if _ZARR3 else {}),
     )
     bare[:] = 1
     bare_output = tmp_path / "bare_prediction.tif"
