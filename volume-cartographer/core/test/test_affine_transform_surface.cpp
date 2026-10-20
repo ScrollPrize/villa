@@ -7,12 +7,16 @@
 
 #include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/Tiff.hpp"
 
 #include <opencv2/core.hpp>
 
 #include <cmath>
 #include <memory>
 #include <optional>
+#include <chrono>
+#include <fstream>
+#include <limits>
 
 using namespace vc::core::util;
 
@@ -37,6 +41,105 @@ cv::Matx44d scaleMatrix(double s)
 }
 
 } // namespace
+
+TEST_CASE("no-resample scaling preserves samples, sentinels and physical units")
+{
+    auto pts = makePlanarGrid(4, 5, 20);
+    pts(0, 0) = {-1, -1, -1};
+    pts(0, 1) = {20, -1, 3}; // -1 is a sentinel only in the X band.
+    QuadSurface surface(pts, {0.05f, 0.05f});
+    surface.meta = utils::Json::parse(R"({"base_shape_zyx":[10,10,10],"output_step_vx":20,"voxel_size_um":9.6,"area_vx2":100,"area_cm2":2})");
+    CHECK_THROWS(scaleSurfaceWithoutResampling(&surface, 4));
+    CHECK_THROWS(scaleSurfaceWithoutResampling(&surface, 0));
+    scaleSurfaceWithoutResampling(&surface, 4, std::array<int, 3>{40, 39, 39});
+    CHECK(surface.rawPointsPtr()->rows == 4);
+    CHECK(surface.rawPointsPtr()->cols == 5);
+    CHECK((*surface.rawPointsPtr())(0, 0) == cv::Vec3f(-1, -1, -1));
+    CHECK((*surface.rawPointsPtr())(0, 1) == cv::Vec3f(80, -4, 12));
+    CHECK(surface.scale()[0] == doctest::Approx(0.0125));
+    CHECK(surface.meta["output_step_vx"].get_double() == 80);
+    CHECK(surface.meta["voxel_size_um"].get_double() == doctest::Approx(2.4));
+    CHECK(surface.meta["area_vx2"].get_double() == 1600);
+    CHECK(surface.meta["area_cm2"].get_double() == 2);
+    CHECK(surface.meta["base_shape_zyx"][1].get_int() == 39);
+}
+
+TEST_CASE("streamed no-resample scaling reads tiled and stripped XYZ, publishes complete output")
+{
+    namespace fs = std::filesystem;
+    struct Scratch {
+        fs::path path = fs::current_path() / ("scale-tifxyz-test-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        Scratch() { fs::create_directory(path); }
+        ~Scratch() { std::error_code ec; fs::remove_all(path, ec); }
+    } scratch;
+    for (int format = 0; format < 4; ++format) {
+        const bool tiled = format == 1;
+        const auto input = scratch.path / ("input-" + std::to_string(format));
+        const auto output = scratch.path / ("output-" + std::to_string(format));
+        fs::create_directory(input);
+        auto pts = makePlanarGrid(19, 35, 20);
+        for (auto& point : pts) point[2] = 10;
+        pts(0, 0) = {-1, -1, -1};
+        pts(0, 1) = {20, -1, 3};
+        std::vector<cv::Mat> bands;
+        cv::split(pts, bands);
+        const std::array<const char*, 3> names{"x.tif", "y.tif", "z.tif"};
+        for (int axis = 0; axis < 3; ++axis)
+            writeTiff(input / names[axis], bands[axis], -1, tiled ? 16 : 0, tiled ? 16 : 0,
+                -1, (tiled || format == 2) ? COMPRESSION_LZW : COMPRESSION_NONE);
+        if (format == 3) {
+            // Exercise direct byte-swapped strip reads independently of host endianness.
+            for (int axis = 0; axis < 3; ++axis) {
+                TIFF* out = TIFFOpen((input / names[axis]).string().c_str(), "wb");
+                REQUIRE(out);
+                TIFFSetField(out, TIFFTAG_IMAGEWIDTH, pts.cols);
+                TIFFSetField(out, TIFFTAG_IMAGELENGTH, pts.rows);
+                TIFFSetField(out, TIFFTAG_BITSPERSAMPLE, 32);
+                TIFFSetField(out, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
+                TIFFSetField(out, TIFFTAG_SAMPLESPERPIXEL, 1);
+                TIFFSetField(out, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+                TIFFSetField(out, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
+                TIFFSetField(out, TIFFTAG_COMPRESSION, COMPRESSION_NONE);
+                TIFFSetField(out, TIFFTAG_ROWSPERSTRIP, 3);
+                auto band = bands[axis].clone(); // libtiff may byte-swap the write buffer.
+                for (int y = 0; y < pts.rows; ++y)
+                    CHECK(TIFFWriteScanline(out, band.ptr(y), y) == 1);
+                TIFFClose(out);
+            }
+        }
+        std::ofstream(input / "meta.json") << R"({"type":"seg","format":"tifxyz","uuid":"original","name":"original","scale":[0.05,0.05],"base_shape_zyx":[10,10,10],"grid_shape":[19,35],"output_step_vx":20,"voxel_size_um":9.6,"bbox":[[0,0,0],[680,360,3]]})";
+        std::ofstream(input / "ancillary.txt") << "unchanged";
+        CHECK_THROWS(scaleTifxyzWithoutResampling(input, output, 4));
+        CHECK_FALSE(fs::exists(output));
+        scaleTifxyzWithoutResampling(input, output / "", 4, std::array<int, 3>{40,39,39});
+        auto loaded = load_quad_from_tifxyz(output.string());
+        REQUIRE(loaded);
+        const auto* result = loaded->rawPointsPtr();
+        REQUIRE(result->size() == pts.size());
+        for (int y = 0; y < pts.rows; ++y)
+            for (int x = 0; x < pts.cols; ++x)
+                CHECK((*result)(y,x) == (pts(y,x)[0] == -1 ? pts(y,x) : pts(y,x) * 4));
+        CHECK(loaded->scale()[0] == doctest::Approx(0.0125));
+        CHECK(fs::file_size(output / "ancillary.txt") == 9);
+        TIFF* tif = TIFFOpen((output / "x.tif").string().c_str(), "r");
+        REQUIRE(tif);
+        CHECK_FALSE(TIFFIsTiled(tif));
+        uint16_t compression = 0;
+        TIFFGetFieldDefaulted(tif, TIFFTAG_COMPRESSION, &compression);
+        CHECK(compression == COMPRESSION_NONE);
+        TIFFClose(tif);
+        CHECK_THROWS(scaleTifxyzWithoutResampling(input, output, 4, std::array<int, 3>{40,39,39}));
+        // Failure after staging starts must not leave a partial destination or temp directory.
+        bands[2].setTo(std::numeric_limits<float>::max());
+        writeTiff(input / "z.tif", bands[2], -1, 0, 0, -1, COMPRESSION_NONE);
+        CHECK_THROWS(scaleTifxyzWithoutResampling(input, scratch.path / "overflow", 4,
+            std::array<int, 3>{40,39,39}));
+        CHECK_FALSE(fs::exists(scratch.path / "overflow"));
+        for (const auto& entry : fs::directory_iterator(scratch.path))
+            CHECK(entry.path().extension() != ".tmp");
+    }
+}
 
 TEST_CASE("transformSurfacePoints (int scale): no-op on identity + scale=1")
 {

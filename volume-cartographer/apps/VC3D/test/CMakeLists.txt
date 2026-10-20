@@ -1,5 +1,12 @@
 find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Network Test Widgets)
 
+add_executable(test_surface_transform_name test_surface_transform_name.cpp)
+target_include_directories(test_surface_transform_name PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_surface_transform_name PRIVATE Qt6::Core)
+add_test(NAME surface_transform_name COMMAND test_surface_transform_name)
+vc_register_test_target(test_surface_transform_name)
+vc_register_ctest(surface_transform_name test_surface_transform_name)
+
 add_executable(test_volume_path_labels test_volume_path_labels.cpp
     ../elements/VolumeSelector.cpp ../elements/VolumeSelector.hpp)
 set_target_properties(test_volume_path_labels PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)

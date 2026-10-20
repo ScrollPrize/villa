@@ -32,6 +32,7 @@ add_library(vc_core
         src/Slicing.cpp
         src/Compositing.cpp
         src/AffineTransform.cpp
+        src/ScaleTifxyz.cpp
         src/PlaneSurface.cpp
         src/Surface.cpp
         src/QuadSurface.cpp
