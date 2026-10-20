@@ -7,6 +7,10 @@ inference, native tifxyz-guided 3D inference, label conversion, and aligned
 For the complete config and CLI reference, see
 [`docs/ink_detection.md`](../../../docs/ink_detection.md).
 
+[`paris4_3d_gambiarra/`](paris4_3d_gambiarra/README.md) is a separate, self-contained pipeline:
+training and full-volume CT inference for the point-supervised PHercParis4
+model `ink_paris4_3d_4.8um_gambiarra`. It uses none of the configs below.
+
 ## Environment
 
 From `villa/vesuvius`:

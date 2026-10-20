@@ -1,4 +1,5 @@
 from copy import deepcopy
+from typing import Callable, Optional
 
 import numpy as np
 from time import time
@@ -11,7 +12,8 @@ from vesuvius.models.augmentation.transforms.base.basic_transform import ImageOn
 from fft_conv_pytorch import fft_conv
 
 
-def blur_dimension(img: torch.Tensor, sigma: float, dim_to_blur: int, force_use_fft: bool = None, truncate: float = 6):
+def blur_dimension(img: torch.Tensor, sigma: float, dim_to_blur: int, force_use_fft: bool = None, truncate: float = 6,
+                   padding_mode: str = "reflect", kernel_radius: Optional[int] = None):
     """
     Smoothes an input image with a 1D Gaussian kernel along the specified dimension.
     The function supports 1D, 2D, and 3D images.
@@ -20,12 +22,15 @@ def blur_dimension(img: torch.Tensor, sigma: float, dim_to_blur: int, force_use_
                 where C is the channel dimension and X, Y, Z are spatial dimensions.
     :param sigma: The standard deviation of the Gaussian kernel.
     :param dim_to_blur: The dimension along which to apply the Gaussian blur (0 for X, 1 for Y, 2 for Z).
+    :param padding_mode: torch.nn.functional.pad mode for the image border.
+    :param kernel_radius: kernel size 2 * kernel_radius + 1 instead of the size derived from truncate.
     :return: The blurred image tensor.
     """
     assert img.ndim - 1 > dim_to_blur, "dim_to_blur must be a valid spatial dimension of the input image."
     # Adjustments for kernel based on image dimensions
     spatial_dims = img.ndim - 1  # Number of spatial dimensions in the input image
-    kernel = _build_kernel(sigma, truncate=truncate, device=img.device, dtype=img.dtype)
+    kernel_size = None if kernel_radius is None else 2 * int(kernel_radius) + 1
+    kernel = _build_kernel(sigma, truncate=truncate, device=img.device, dtype=img.dtype, kernel_size=kernel_size)
 
     ksize = kernel.shape[0]
 
@@ -60,7 +65,7 @@ def blur_dimension(img: torch.Tensor, sigma: float, dim_to_blur: int, force_use_
             padding = [ksize // 2, ksize // 2, 0, 0, 0, 0]
 
     # Apply padding
-    img_padded = pad(img, padding, mode="reflect")
+    img_padded = pad(img, padding, mode=padding_mode)
 
     # Apply convolution
     # remember that weights are [c_out, c_in, ...]
@@ -78,7 +83,9 @@ class GaussianBlurTransform(ImageOnlyTransform):
                  synchronize_channels: bool = False,  # todo make this p_synchronize_channels
                  synchronize_axes: bool = False,  # todo make this p_synchronize_axes
                  p_per_channel: float = 1,
-                 benchmark: bool = True
+                 benchmark: bool = True,
+                 padding_mode: str = "reflect",
+                 kernel_radius: Optional[Callable[[float], int]] = None
                  ):
         """
         uses separable gaussian filters for all the speed
@@ -89,10 +96,14 @@ class GaussianBlurTransform(ImageOnlyTransform):
         :param synchronize_channels:
         :param synchronize_axes:
         :param p_per_channel:
+        :param padding_mode: torch.nn.functional.pad mode for the image border
+        :param kernel_radius: callable sigma -> kernel radius; None keeps the truncate-based kernel size
         """
         super().__init__()
         self.blur_sigma = blur_sigma
         self.benchmark = benchmark
+        self.padding_mode = padding_mode
+        self.kernel_radius = kernel_radius
         self.synchronize_channels = synchronize_channels
         self.synchronize_axes = synchronize_axes
         self.p_per_channel = p_per_channel
@@ -129,7 +140,7 @@ class GaussianBlurTransform(ImageOnlyTransform):
             for d in range(dim):
                 # print(d, params['sigmas'][d])
                 if not self.benchmark:
-                    img[params['apply_to_channel']] = blur_dimension(img[params['apply_to_channel']], params['sigmas'][d], d)
+                    img[params['apply_to_channel']] = self._blur(img[params['apply_to_channel']], params['sigmas'][d], d)
                 else:
                     img[params['apply_to_channel']] = self._benchmark_wrapper(img[params['apply_to_channel']], params['sigmas'][d], d)
         else:
@@ -139,17 +150,22 @@ class GaussianBlurTransform(ImageOnlyTransform):
                 for d in range(dim):
                     # print(i, d, params['sigmas'][i][d])
                     if not self.benchmark:
-                        img[i:i+1] = blur_dimension(img[i:i+1], params['sigmas'][j][d], d)
+                        img[i:i+1] = self._blur(img[i:i+1], params['sigmas'][j][d], d)
                     else:
                         img[i:i+1] = self._benchmark_wrapper(img[i:i+1], params['sigmas'][j][d], d)
         return img
 
+    def _blur(self, img: torch.Tensor, sigma: float, dim_to_blur: int, force_use_fft: bool = None):
+        radius = None if self.kernel_radius is None else self.kernel_radius(sigma)
+        return blur_dimension(img, sigma, dim_to_blur, force_use_fft=force_use_fft, padding_mode=self.padding_mode,
+                              kernel_radius=radius)
+
     def _benchmark_wrapper(self, img: torch.Tensor, sigma: float, dim_to_blur: int):
-        kernel_size = _compute_kernel_size(sigma)
+        kernel_size = _compute_kernel_size(sigma) if self.kernel_radius is None else 2 * int(self.kernel_radius(sigma)) + 1
         shp = img.shape[dim_to_blur + 1]
         # check if we already benchmarked this
         if shp in self.benchmark_use_fft.keys() and kernel_size in self.benchmark_use_fft[shp].keys():
-            return blur_dimension(img, sigma, dim_to_blur, force_use_fft=self.benchmark_use_fft[shp][kernel_size])
+            return self._blur(img, sigma, dim_to_blur, force_use_fft=self.benchmark_use_fft[shp][kernel_size])
         else:
             # let's not mess up the original image!
             if shp not in self.benchmark_use_fft.keys():
@@ -158,23 +174,24 @@ class GaussianBlurTransform(ImageOnlyTransform):
             times_nonfft = []
             for _ in range(self.benchmark_num_runs):
                 st = time()
-                blur_dimension(dummy_img, sigma, dim_to_blur, force_use_fft=False)
+                self._blur(dummy_img, sigma, dim_to_blur, force_use_fft=False)
                 times_nonfft.append(time() - st)
             times_fft = []
             for _ in range(self.benchmark_num_runs):
                 st = time()
-                blur_dimension(dummy_img, sigma, dim_to_blur, force_use_fft=True)
+                self._blur(dummy_img, sigma, dim_to_blur, force_use_fft=True)
                 times_fft.append(time() - st)
             # print(shp, kernel_size, np.median(times_fft), np.median(times_nonfft), np.median(times_fft) < np.median(times_nonfft))
             self.benchmark_use_fft[shp][kernel_size] = np.median(times_fft) < np.median(times_nonfft)
             # convenience stuff
             self.benchmark_use_fft[shp] = dict(sorted(self.benchmark_use_fft[shp].items()))
             # now create the real return value
-            return blur_dimension(img, sigma, dim_to_blur, force_use_fft=self.benchmark_use_fft[shp][kernel_size])
+            return self._blur(img, sigma, dim_to_blur, force_use_fft=self.benchmark_use_fft[shp][kernel_size])
 
 
-def _build_kernel(sigma: float, truncate: float = 4, device=None, dtype=None) -> torch.Tensor:
-    kernel_size = _compute_kernel_size(sigma, truncate=truncate)
+def _build_kernel(sigma: float, truncate: float = 4, device=None, dtype=None, kernel_size: Optional[int] = None) -> torch.Tensor:
+    if kernel_size is None:
+        kernel_size = _compute_kernel_size(sigma, truncate=truncate)
     ksize_half = (kernel_size - 1) * 0.5
 
     x = torch.linspace(-ksize_half, ksize_half, steps=kernel_size, device=device, dtype=dtype or torch.float32)

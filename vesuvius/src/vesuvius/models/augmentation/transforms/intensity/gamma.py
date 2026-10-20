@@ -1,4 +1,4 @@
-from typing import Callable, Union
+from typing import Callable, Optional, Tuple, Union
 
 import torch
 
@@ -8,8 +8,11 @@ from vesuvius.models.augmentation.transforms.base.basic_transform import ImageOn
 
 class GammaTransform(ImageOnlyTransform):
     def __init__(self, gamma: RandomScalar, p_invert_image: float, synchronize_channels: bool, p_per_channel: float,
-                 p_retain_stats: float):
+                 p_retain_stats: float, value_range: Optional[Tuple[float, float]] = None):
+        """value_range: apply the gamma curve on this fixed (low, high) intensity range instead of each channel's
+        min / max (values must lie inside it; (0, 1) gives x ** gamma)."""
         super().__init__()
+        self.value_range = value_range
         self.gamma = gamma
         self.p_invert_image = p_invert_image
         self.synchronize_channels = synchronize_channels
@@ -49,9 +52,13 @@ class GammaTransform(ImageOnlyTransform):
                 # std, mean = torch.std_mean(img[c])
                 mean = torch.mean(img[c])
                 std = torch.std(img[c])
-            minm = torch.min(img[c])
-            rnge = torch.max(img[c]) - minm
-            img[c] = torch.pow(((img[c] - minm) / torch.clamp(rnge, min=1e-7)), g) * rnge + minm
+            if self.value_range is None:
+                minm = torch.min(img[c])
+                rnge = torch.max(img[c]) - minm
+                img[c] = torch.pow(((img[c] - minm) / torch.clamp(rnge, min=1e-7)), g) * rnge + minm
+            else:
+                minm, rnge = self.value_range[0], self.value_range[1] - self.value_range[0]
+                img[c] = torch.pow((img[c] - minm) / rnge, g) * rnge + minm
             if r:
                 # std_here, mn_here = torch.std_mean(img[c])
                 mn_here = torch.mean(img[c])

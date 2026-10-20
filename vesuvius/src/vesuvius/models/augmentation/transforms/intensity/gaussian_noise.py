@@ -33,15 +33,19 @@ class GaussianNoiseTransform(ImageOnlyTransform):
         return img
 
     def _sample_gaussian_noise(self, img_shape: Tuple[int, ...], device=None, dtype=None, **params):
+        # params may carry a torch.Generator ('generator') for noise that replays independently of the global RNG.
+        generator = params.get('generator')
         if not isinstance(params['sigmas'], list):
             num_channels = sum(params['apply_to_channel'])
             # gaussian = torch.tile(torch.normal(0, params['sigmas'], size=(1, *img_shape[1:])),
             #                       (num_channels, *[1]*(len(img_shape) - 1)))
-            gaussian = torch.normal(0, params['sigmas'], size=(1, *img_shape[1:]), device=device, dtype=dtype)
+            gaussian = torch.normal(0, params['sigmas'], size=(1, *img_shape[1:]), device=device, dtype=dtype,
+                                    generator=generator)
             gaussian.expand((num_channels, *[-1]*(len(img_shape) - 1)))
         else:
             gaussian = [
-                torch.normal(0, i, size=(1, *img_shape[1:]), device=device, dtype=dtype) for i in params['sigmas']
+                torch.normal(0, i, size=(1, *img_shape[1:]), device=device, dtype=dtype, generator=generator)
+                for i in params['sigmas']
             ]
             gaussian = torch.cat(gaussian, dim=0)
         return gaussian

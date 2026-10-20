@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from vesuvius.models.augmentation.helpers.scalar_type import RandomScalar, sample_scalar
@@ -26,12 +28,16 @@ class BGContrast():
         return self.__class__.__name__ + f"(contrast_range={self.contrast_range})"
 
 class ContrastTransform(ImageOnlyTransform):
-    def __init__(self, contrast_range: RandomScalar, preserve_range: bool, synchronize_channels: bool, p_per_channel: float = 1):
+    def __init__(self, contrast_range: RandomScalar, preserve_range: bool, synchronize_channels: bool, p_per_channel: float = 1,
+                 mean_dtype: Optional[torch.dtype] = None):
+        """mean_dtype: accumulate each channel's mean in this dtype, then round it to the image dtype
+        (default: the image dtype)."""
         super().__init__()
         self.contrast_range = contrast_range
         self.preserve_range = preserve_range
         self.synchronize_channels = synchronize_channels
         self.p_per_channel = p_per_channel
+        self.mean_dtype = mean_dtype
 
     def get_parameters(self, **data_dict) -> dict:
         shape = data_dict['image'].shape
@@ -52,7 +58,7 @@ class ContrastTransform(ImageOnlyTransform):
         # array notation is not faster, let's leave it like this
         for i in range(len(params['apply_to_channel'])):
             c = params['apply_to_channel'][i]
-            mean = img[c].mean()
+            mean = img[c].mean() if self.mean_dtype is None else img[c].mean(dtype=self.mean_dtype).to(img.dtype)
             if self.preserve_range:
                 minm = img[c].min()
                 maxm = img[c].max()
