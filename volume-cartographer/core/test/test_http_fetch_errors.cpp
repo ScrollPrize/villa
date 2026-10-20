@@ -153,6 +153,30 @@ TEST_CASE("private S3 denial resolves deferred AWS credentials once")
     CHECK(loads == 1);
 }
 
+TEST_CASE("failed deferred credential discovery is cached across callers")
+{
+    std::atomic<int> loads{0};
+    vc::DeferredAwsAuth auth({}, true, "us-east-1", [&]() -> vc::HttpAuth {
+        ++loads;
+        throw std::runtime_error("credential provider failed");
+    });
+    std::vector<std::future<std::string>> callers;
+    for (int i = 0; i < 8; ++i) {
+        callers.push_back(std::async(std::launch::async, [&] {
+            try {
+                (void)auth.resolve();
+                return std::string{"unexpected success"};
+            } catch (const std::runtime_error& error) {
+                return std::string{error.what()};
+            }
+        }));
+    }
+    for (auto& caller : callers)
+        CHECK(caller.get() == "credential provider failed");
+    CHECK_THROWS_AS(auth.resolve(), std::runtime_error);
+    CHECK(loads == 1);
+}
+
 TEST_CASE("S3 access falls back once and preserves private authenticated mode")
 {
     vc::S3AuthFallback fallback(true, true);

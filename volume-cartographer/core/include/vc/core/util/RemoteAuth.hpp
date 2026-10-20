@@ -1,5 +1,6 @@
 #pragma once
 
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -45,16 +46,23 @@ public:
     [[nodiscard]] HttpAuth resolve() const
     {
         std::lock_guard lock(mutex_);
+        if (failure_)
+            std::rethrow_exception(failure_);
         if (!resolved_) {
-            auto auth = explicitAuth_;
-            if (auth.empty() && discoverAwsCredentials_) {
-                auth = loader_ ? loader_() : loadAwsCredentials();
+            try {
+                auto auth = explicitAuth_;
+                if (auth.empty() && discoverAwsCredentials_) {
+                    auth = loader_ ? loader_() : loadAwsCredentials();
+                }
+                if (!auth.empty() && auth.region.empty())
+                    auth.region = region_;
+                if (auth.access_key.empty() || auth.secret_key.empty())
+                    auth = {};
+                resolved_ = std::move(auth);
+            } catch (...) {
+                failure_ = std::current_exception();
+                throw;
             }
-            if (!auth.empty() && auth.region.empty())
-                auth.region = region_;
-            if (auth.access_key.empty() || auth.secret_key.empty())
-                auth = {};
-            resolved_ = std::move(auth);
         }
         return *resolved_;
     }
@@ -66,6 +74,7 @@ private:
     Loader loader_;
     mutable std::mutex mutex_;
     mutable std::optional<HttpAuth> resolved_;
+    mutable std::exception_ptr failure_;
 };
 
 } // namespace vc
