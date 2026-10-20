@@ -6,13 +6,14 @@ from pathlib import Path
 import sys
 from typing import Any, Mapping
 
-from dinovol_2.training.config import normalize_config
 
 if __package__ in {None, ""}:
     sys.path.append(str(Path(__file__).resolve().parents[1]))
     from dinovol_2.pretrain import DinoIBOTPretrainer
 else:
     from .pretrain import DinoIBOTPretrainer
+
+from dinovol_2.training.config import normalize_config
 
 def load_config(config_path: str | Path) -> dict[str, Any]:
     with open(config_path, "r", encoding="utf-8") as f:

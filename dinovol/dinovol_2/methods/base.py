@@ -49,7 +49,7 @@ class TrainingMethod(nn.Module):
 
     def evaluate(self, batch, step: int) -> Mapping[str, float]:
         output = self(batch, step)
-        return {name: float(value) for name, value in output.metrics.items()}
+        return {name: float(value) for name, value in {"loss": output.loss, **output.metrics}.items()}
 
     def dataset_config(self, config, *, training: bool):
         return dict(config)

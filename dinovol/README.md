@@ -983,7 +983,9 @@ The widget rebuilds the teacher backbone from the saved checkpoint config, compu
 `dinovol_2.pretrain` is the CLI. `training/trainer.py` owns iteration, AMP,
 gradient accumulation, backward, AdamW, logging and checkpoint cadence.
 `methods/dino.py` owns the DINO/iBOT model, teachers, loss state, schedules and
-optional point/object supervision. Rendering and pipeline diagnostics live in
+optional point/object supervision. Training and validation share one objective
+implementation. Validation retains same-view, unfused iBOT and excludes object
+losses; it consumes pending centers without enqueuing further updates. Rendering and pipeline diagnostics live in
 `training/monitoring.py` and `training/diagnostics.py`.
 
 Implement `TrainingMethod` and add a construction branch in `methods.build_method`

@@ -28,24 +28,6 @@ def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, flo
     return float(value[0]), float(value[1])
 
 
-def _as_3tuple(value: Any) -> tuple[int, int, int] | None:
-    if value is None:
-        return None
-    if isinstance(value, int):
-        return (value, value, value)
-    result = tuple(int(v) for v in value)
-    if len(result) != 3:
-        raise ValueError(f"Expected 3 values, got {result}")
-    return result
-
-
-def _config_get(config: Mapping[str, Any], *keys: str, default: Any = None) -> Any:
-    for key in keys:
-        if key in config:
-            return config[key]
-    return default
-
-
 def dino_loss_term_count(n_local_views: int, n_global_views: int = 2) -> int:
     if n_local_views < 0:
         raise ValueError(f"n_local_views must be non-negative, got {n_local_views}")
@@ -602,6 +584,9 @@ class DinoMethod(TrainingMethod):
     )
 
     def forward(self, batch: Mapping[str, Any], step: int) -> StepOutput:
+        return self._compute_objective(batch, step, training=True)
+
+    def _compute_objective(self, batch: Mapping[str, Any], step: int, *, training: bool) -> StepOutput:
         teacher_temp = self._teacher_temp(step)
         object_ramp = self._object_loss_ramp(step)
         if int(batch["n_global_views"]) != 2:
@@ -617,7 +602,7 @@ class DinoMethod(TrainingMethod):
         n_global_views = int(batch["n_global_views"])
         n_local_views = int(batch["n_local_views"])
         n_masked = int(batch["n_masked_patches"].item())
-        use_objects = self.do_object_losses and "object_point_coordinates" in batch
+        use_objects = training and self.do_object_losses and "object_point_coordinates" in batch
         point_coordinates = teacher_point_valid = student_point_valid = None
         if use_objects:
             point_coordinates, teacher_point_valid, student_point_valid = self._object_point_validity(
@@ -626,20 +611,20 @@ class DinoMethod(TrainingMethod):
 
         teacher_target_coordinates = teacher_target_rows = None
         ibot_target_fraction = global_crops.new_ones(())
-        if self.ibot_targets == "cross_view" and "global_token_targets" in batch:
+        if training and self.ibot_targets == "cross_view" and "global_token_targets" in batch:
             mask_indices, masks_weight, teacher_target_coordinates, teacher_target_rows, ibot_target_fraction = (
                 self._cross_view_ibot_selection(batch, global_crops, mask_indices, n_global_views)
             )
             n_masked = int(mask_indices.numel())
 
-        fused_ibot = self.ibot_fused_last_layer and self.do_ibot and self.centering == "sinkhorn_knopp"
+        fused_ibot = training and self.ibot_fused_last_layer and self.do_ibot and self.centering == "sinkhorn_knopp"
         model_outputs = self._forward_model(
             global_crops=global_crops,
             local_crops=local_crops if n_local_views else None,
             masks=masks,
             mask_indices=mask_indices,
             n_masked=n_masked,
-            return_teacher=self.do_dino or self.do_ibot,
+            return_teacher=self.do_dino or self.do_ibot or use_objects,
             masked_patch_features=fused_ibot,
             point_coordinates=point_coordinates,
             teacher_target_coordinates=teacher_target_coordinates,
@@ -650,6 +635,7 @@ class DinoMethod(TrainingMethod):
             teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(
                 teacher_branch["global_cls_projections"],
                 teacher_temp,
+                update_centers=training,
             )
         else:
             teacher_cls_0 = teacher_cls_1 = None
@@ -669,6 +655,7 @@ class DinoMethod(TrainingMethod):
             teacher_patch_targets = self._center_teacher_patch(
                 teacher_branch.pop("global_masked_patch_projections"),
                 teacher_temp,
+                update_centers=training,
             )
 
         student_branch = model_outputs["student"]
@@ -1027,115 +1014,18 @@ class DinoMethod(TrainingMethod):
         return added
 
     def evaluate(self, batch: Mapping[str, Any], step: int) -> dict[str, float]:
-        self.model.eval()
-        teacher_temp = self._teacher_temp(step)
+        """Retain the established validation objective, using the shared computation.
 
-        global_crops = batch["collated_global_crops"].to(self.device, non_blocking=True)
-        local_crops = batch["collated_local_crops"].to(self.device, non_blocking=True)
-        gram_teacher_crops = batch.get("collated_gram_teacher_crops")
-        if gram_teacher_crops is not None:
-            gram_teacher_crops = gram_teacher_crops.to(self.device, non_blocking=True)
-        masks = batch["collated_masks"].to(self.device, non_blocking=True)
-        mask_indices = batch["mask_indices_list"].to(self.device, non_blocking=True)
-        masks_weight = batch["masks_weight"].to(self.device, non_blocking=True)
-        n_global_views = int(batch["n_global_views"])
-        n_local_views = int(batch["n_local_views"])
-        n_masked = int(batch["n_masked_patches"].item())
-
-        with torch.no_grad(), torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
-            model_outputs = self._forward_model(
-                global_crops=global_crops,
-                local_crops=local_crops if n_local_views else None,
-                masks=masks,
-                mask_indices=mask_indices,
-                n_masked=n_masked,
-                return_teacher=self.do_dino or self.do_ibot,
-            )
-            teacher_branch = model_outputs.get("teacher")
-            teacher_cls_0, teacher_cls_1 = self._center_teacher_cls(
-                teacher_branch["global_cls_projections"],
-                teacher_temp,
-                update_centers=False,
-            ) if self.do_dino and teacher_branch is not None else (None, None)
-            teacher_patch_targets = self._center_teacher_patch(
-                teacher_branch["global_masked_patch_projections"],
-                teacher_temp,
-                update_centers=False,
-            ) if self.do_ibot and teacher_branch is not None else None
-
-            student_branch = model_outputs["student"]
-            student_global = student_branch["global"]
-            student_global_cls = student_branch["global_cls_projections"]
-            student_patch = student_branch["global_masked_patch_projections"]
-            global_cls_0, global_cls_1 = student_global_cls.chunk(n_global_views)
-
-            total_terms = dino_loss_term_count(n_local_views, n_global_views=n_global_views)
-            if self.do_dino:
-                dino_global_loss = (
-                    self.dino_loss([global_cls_0], [teacher_cls_1]) +
-                    self.dino_loss([global_cls_1], [teacher_cls_0])
-                ) / total_terms
-
-                if n_local_views:
-                    student_local = student_branch["local"]
-                    local_cls_chunks = list(student_local["cls_projections"].chunk(n_local_views))
-                    dino_local_loss = self.dino_loss(local_cls_chunks, [teacher_cls_0, teacher_cls_1]) / total_terms
-                else:
-                    dino_local_loss = global_crops.new_zeros(())
-            else:
-                dino_global_loss = global_crops.new_zeros(())
-                dino_local_loss = global_crops.new_zeros(())
-
-            if self.do_ibot and n_masked > 0:
-                ibot_loss = self.ibot_patch_loss.forward_masked(
-                    student_patch,
-                    teacher_patch_targets,
-                    student_masks_flat=masks,
-                    n_masked_patches=n_masked,
-                    masks_weight=masks_weight,
-                )
-            else:
-                ibot_loss = global_crops.new_zeros(())
-
-            if self.do_koleo:
-                koleo_loss = sum(self.koleo_loss(chunk) for chunk in student_global["cls_tokens"].chunk(n_global_views))
-            else:
-                koleo_loss = global_crops.new_zeros(())
-            gram_loss, _, _ = self._compute_gram_loss(
-                student_patch_tokens=student_global["patch_tokens"],
-                global_crops=global_crops,
-                gram_teacher_crops=gram_teacher_crops,
-            )
-            point_result, _ = self._compute_point_loss(
-                student_patch_tokens=student_global["patch_tokens"],
-                batch=batch,
-                global_crops=global_crops,
-            )
-
-            loss = (
-                self.dino_loss_weight * (dino_global_loss + dino_local_loss) +
-                self.ibot_loss_weight * ibot_loss +
-                self.koleo_loss_weight * koleo_loss +
-                self.gram_loss_weight * gram_loss +
-                self.point_loss_weight * point_result.loss
-            )
-
+        Validation uses same-view, unfused iBOT and excludes object losses. It
+        consumes pending centers but does not enqueue center or queue updates.
+        These differences are explicit rather than a second loss implementation.
+        """
+        output = self._compute_objective(batch, step, training=False)
+        names = self._TRAIN_METRICS[:12]
+        values = torch.stack([output.metrics[name] for name in names]).tolist()
         return {
-            "loss": float(loss.detach()),
-            "dino_global_loss": float(dino_global_loss.detach()),
-            "dino_local_loss": float(dino_local_loss.detach()),
-            "ibot_loss": float(ibot_loss.detach()),
-            "koleo_loss": float(koleo_loss.detach()),
-            "gram_loss": float(gram_loss.detach()),
+            **dict(zip(names, values)),
             "gram_loss_weight": float(self.gram_loss_weight),
-            "point_loss": float(point_result.loss.detach()),
-            "point_same_type_loss": float(point_result.same_type.detach()),
-            "point_different_type_loss": float(point_result.different_type.detach()),
             "point_loss_weight": float(self.point_loss_weight),
-            "point_count": float(point_result.point_count),
-            "point_same_pair_count": float(point_result.same_pair_count),
-            "point_different_pair_count": float(point_result.different_pair_count),
-            "teacher_temp": teacher_temp,
+            "teacher_temp": self._teacher_temp(step),
         }
-
-

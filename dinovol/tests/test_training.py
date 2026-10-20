@@ -4,6 +4,7 @@ import random
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -76,6 +77,54 @@ class TrainingTests(unittest.TestCase):
             self.assertEqual(first.updates, 1)
             for x,y in zip(first.parameters(), second.parameters()):
                 torch.testing.assert_close(x,y)
+
+    def test_teacher_free_fit_with_validation_and_checkpoint(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = dict(device='cpu', use_amp=False, max_iterations=3, warmup_steps=0,
+                          output_dir=folder, val_every_n=1, save_every_n=1)
+            method = RegressionMethod()
+            trainer = Trainer(config, method=method)
+            loader = torch.utils.data.DataLoader(torch.randn(4,3), batch_size=2)
+            with patch.object(trainer, 'build_dataloader', return_value=loader), \
+                 patch.object(trainer, 'build_val_dataloader', return_value=loader):
+                trainer.fit()
+            self.assertEqual(method.updates, 3)
+            self.assertTrue((Path(folder)/'checkpoint_step_000002.pt').exists())
+
+    def test_validation_policy_with_cross_view_and_fused_training(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = tiny_config(folder)
+            config.update(ibot_targets='cross_view', ibot_fused_last_layer=True)
+            trainer = DinoIBOTPretrainer(config)
+            batch = tiny_batch(local=0)
+            batch['global_token_targets'] = torch.zeros(4,8,3)
+            trainer.train_step(batch,0)
+            with patch.object(trainer.method, '_cross_view_ibot_selection', side_effect=AssertionError('training only')), \
+                 patch.object(trainer.method.ibot_patch_loss, 'forward_masked_from_features', side_effect=AssertionError('training only')):
+                metrics = trainer.validate(batch,0)
+            self.assertNotIn('object_loss',metrics)
+            self.assertEqual(metrics['dino_local_loss'],0.)
+            self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
+
+    def test_object_supervision_can_request_teacher_without_dino_ibot(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = tiny_config(folder)
+            config['model'].update(embedding_type='deeper',deeper_embed_stage_channels=[4,8],
+                deeper_embed_stage_strides=[2,2],deeper_embed_depth_per_level=[1,1])
+            config['object_losses'] = dict(enabled=True,head=dict(hidden_dim=8,out_dim=8,ink_dim=4,fpn_dim=4))
+            config.update(dino_loss_weight=0.,ibot_loss_weight=0.)
+            trainer = Trainer(config)
+            batch = tiny_batch()
+            batch.update(object_point_coordinates=torch.rand(4,4,3)*6,
+                object_point_valid=torch.ones(4,4,dtype=torch.bool),
+                object_point_objects=torch.tensor([[1,1,2,2]]*2),
+                object_point_ink=torch.tensor([[1,1,-1,-1]]*2),
+                object_negatives=torch.tensor([[[False,False,False],[False,False,True],[False,True,False]]]*2))
+            metrics = trainer.train_step(batch,0)
+            self.assertGreater(metrics['object_loss'],0.)
+            self.assertEqual(metrics['dino_global_loss'],0.)
+            self.assertEqual(metrics['ibot_loss'],0.)
+            self.assertTrue(all(np.isfinite(value) for value in metrics.values()))
 
     def test_dino_checkpoint_and_next_update(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -21,7 +21,7 @@ from dinovol_2.ops.point_embeddings import sample_grid_points, sample_selected_g
 
 
 def prepare(checkpoint, volume, start):
-    saved = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
+    saved = torch.load(checkpoint, map_location="cpu", weights_only=False, mmap=True)
     config, state = as_legacy_config(saved["config"], legacy_checkpoint=True), method_state(saved, expected_method="dino")["teacher"]
     crop_size = tuple(config["model"]["global_crops_size"])
     if crop_size != (192, 192, 192):

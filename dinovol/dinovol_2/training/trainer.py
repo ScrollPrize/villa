@@ -27,23 +27,6 @@ from .config import normalize_config
 from .checkpoint import FORMAT_VERSION, method_state
 from dinovol_2.training.schedules import CosineScheduler
 
-def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, float]:
-    if value is None:
-        return default
-    return float(value[0]), float(value[1])
-
-
-def _as_3tuple(value: Any) -> tuple[int, int, int] | None:
-    if value is None:
-        return None
-    if isinstance(value, int):
-        return (value, value, value)
-    result = tuple(int(v) for v in value)
-    if len(result) != 3:
-        raise ValueError(f"Expected 3 values, got {result}")
-    return result
-
-
 def _config_get(config: Mapping[str, Any], *keys: str, default: Any = None) -> Any:
     for key in keys:
         if key in config:
@@ -303,7 +286,7 @@ class Trainer:
         self,
         key: str,
         *,
-        enable_point_supervision: bool = False,
+        training: bool = False,
     ) -> list[dict[str, Any]] | None:
         dataset_config = self.data_config.get(key)
         if dataset_config is None:
@@ -314,7 +297,7 @@ class Trainer:
         if not variants:
             return [self._prepare_dataset_config(
                 base_config,
-                enable_point_supervision=enable_point_supervision,
+                training=training,
             )]
 
         resolved_configs: list[dict[str, Any]] = []
@@ -324,7 +307,7 @@ class Trainer:
             merged_config.update(variant_overrides)
             resolved_configs.append(self._prepare_dataset_config(
                 merged_config,
-                enable_point_supervision=enable_point_supervision,
+                training=training,
             ))
         return resolved_configs
 
@@ -338,7 +321,7 @@ class Trainer:
         return tuple(float(dict(variant).get("ratio", 1.0)) for variant in variants)
 
     def _dataset_config(self, key: str) -> Mapping[str, Any] | None:
-        resolved_configs = self._resolved_dataset_configs(key, enable_point_supervision=False)
+        resolved_configs = self._resolved_dataset_configs(key, training=False)
         if resolved_configs is None:
             return None
         return dict(resolved_configs[0])
@@ -382,7 +365,7 @@ class Trainer:
         )
 
     def build_dataloader(self) -> DataLoader | WeightedCombinedLoader:
-        dataset_configs = self._resolved_dataset_configs("dataset", enable_point_supervision=True)
+        dataset_configs = self._resolved_dataset_configs("dataset", training=True)
         if dataset_configs is None:
             raise ValueError("dataset configuration is required")
         return self._build_loader_from_configs(
@@ -392,10 +375,10 @@ class Trainer:
         )
 
     def build_val_dataloader(self) -> DataLoader | WeightedCombinedLoader | None:
-        val_dataset_configs = self._resolved_dataset_configs("val_dataset", enable_point_supervision=False)
+        val_dataset_configs = self._resolved_dataset_configs("val_dataset", training=False)
         val_weights = self._dataset_variant_weights("val_dataset")
         if val_dataset_configs is None:
-            train_dataset_configs = self._resolved_dataset_configs("dataset", enable_point_supervision=False)
+            train_dataset_configs = self._resolved_dataset_configs("dataset", training=False)
             if train_dataset_configs is None or len(train_dataset_configs) <= 1:
                 return None
             val_dataset_configs = [dict(train_dataset_configs[0])]
@@ -526,9 +509,6 @@ class Trainer:
 
     def _get_monitor_source(self) -> tuple[SSLZarrDataset, Any]:
         if self._monitor_dataset is None or self._monitor_collate_fn is None:
-            monitor_dataset_config = self.data_config.get("monitor_dataset")
-            if monitor_dataset_config is None:
-                monitor_dataset_config = self.data_config.get("val_dataset", self.data_config["dataset"])
             monitor_dataset_config = self._dataset_config("monitor_dataset") or self._dataset_config("val_dataset") or self._dataset_config("dataset")
             dataset = SSLZarrDataset(monitor_dataset_config, do_augmentations=True)
             collate_fn = self.method.build_collate(dataset)
@@ -744,10 +724,10 @@ class Trainer:
             self._close_dataloader(val_dataloader)
             self._close_auxiliary_datasets()
 
-    def _prepare_dataset_config(self, dataset_config, *, enable_point_supervision=False):
+    def _prepare_dataset_config(self, dataset_config, *, training=False):
         config = dict(dataset_config)
         config.setdefault("epoch_length", int(self.data_config.get("official_epoch_length", self.data_config.get("epoch_length", self.max_iterations))))
-        return self.method.dataset_config(config, training=enable_point_supervision)
+        return self.method.dataset_config(config, training=training)
 
     def _build_schedulers(self):
         final_lr = self.base_lr if self.lr_schedule_type == "constant" else self.min_lr
@@ -778,11 +758,12 @@ class Trainer:
             with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
                 output = self.method(micro_batch, step)
             self.scaler.scale(output.loss / len(micro_batches)).backward()
-            current_names = tuple(output.metrics)
+            metric_values = {"loss": output.loss, **output.metrics}
+            current_names = tuple(metric_values)
             if names is not None and names != current_names:
                 raise ValueError("Metric names must be consistent across microbatches")
             names = current_names
-            values = torch.stack([value.detach().float().reshape(()) for value in output.metrics.values()])
+            values = torch.stack([value.detach().float().reshape(()) for value in metric_values.values()])
             totals = values if totals is None else totals + values
         self.scaler.unscale_(self.optimizer)
         self.method.before_optimizer_step(step)
