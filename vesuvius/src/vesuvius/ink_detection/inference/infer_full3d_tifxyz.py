@@ -31,6 +31,7 @@ from vesuvius.ink_detection.data.geometry import (
 )
 from vesuvius.ink_detection.data.normalization import normalize_image
 from vesuvius.ink_detection.inference.inference_runtime import (
+    DEVICE_CHOICES,
     TargetModel,
     flip_spatial,
     iter_mirror_axes,
@@ -143,6 +144,12 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--compile-mode", default="reduce-overhead")
     parser.add_argument("--no-compile", dest="compile_model", action="store_false")
     parser.set_defaults(compile_model=True)
+    parser.add_argument(
+        "--device",
+        choices=DEVICE_CHOICES,
+        default="auto",
+        help="Device for the model. auto picks CUDA, then MPS, then CPU; --gpus implies CUDA.",
+    )
     parser.add_argument("--gpus", default=None)
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--max-target-chunks", type=int, default=None)
@@ -984,6 +991,7 @@ def _load_native_model(payload, config, args) -> NativeModelBundle:
     model, device = prepare_model_for_inference(
         model,
         gpu_ids=args.gpu_ids,
+        device_type=args.device,
         compile_model=bool(args.compile_model),
         compile_mode=str(args.compile_mode),
     )

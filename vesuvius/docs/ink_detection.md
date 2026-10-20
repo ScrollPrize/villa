@@ -447,6 +447,7 @@ the second output.
 | `--tta-mirror` | Average valid mirror variants. |
 | `--tta-batch-size` | Maximum mirror variants evaluated together. |
 | `--gpus` | Unique comma-separated CUDA IDs, for example `0,1`; omit for automatic CUDA/CPU selection. |
+| `--device` | `auto` (default), `cpu`, `mps` or `cuda`. `auto` picks CUDA, then MPS, then CPU; `--gpus` selects CUDA devices and cannot be combined with `cpu` or `mps`. |
 | `--compile-mode` | `torch.compile` mode, default `reduce-overhead`. |
 | `--no-compile` | Use eager inference. Multiple selected GPUs also disable compilation. |
 
@@ -508,6 +509,7 @@ uv run --extra models python -m vesuvius.ink_detection.inference.infer_full3d_ti
 | `--compile-mode` | `torch.compile` mode, default `reduce-overhead`. |
 | `--no-compile` | Use eager inference. Multiple selected GPUs also disable compilation. |
 | `--gpus` | Unique comma-separated CUDA IDs; omit for automatic CUDA/CPU selection. |
+| `--device` | `auto` (default), `cpu`, `mps` or `cuda`. `auto` picks CUDA, then MPS, then CPU; `--gpus` selects CUDA devices and cannot be combined with `cpu` or `mps`. |
 | `--plan-only` | Print volume/chunk/patch counts without building or running the model or creating output. The checkpoint is still deserialized for its config. |
 | `--max-target-chunks` | Refuse plans larger than this positive count. |
 | `--cache-dir`, `--cache-max-gb` | Optional Zarr-3 compressed-volume cache root and per-volume decimal-GB budget. |
