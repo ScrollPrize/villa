@@ -38,6 +38,10 @@ geometry before calculating routes. `preprocess-volume` uses the chunk pipeline
 directly and can be rerun with identical settings to reuse completed work.
 It scans stored presence chunks to select work; absent and all-zero input chunks
 do not require dense volume processing. This presence scan is repeated on resume.
+Sparse scanning requires an explicit zero presence fill value. Both route CLI
+commands validate the normal dataset's base extent, working scale and channel
+layout before calculating paths; mismatched inputs fail rather than silently
+supplying invalid normals.
 
 ## Storage contract
 

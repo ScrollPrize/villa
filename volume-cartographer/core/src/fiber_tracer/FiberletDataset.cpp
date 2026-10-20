@@ -1,4 +1,5 @@
 #include "vc/fiber_tracer/FiberletDataset.hpp"
+#include "vc/fiber_tracer/FiberTrace.hpp"
 
 #include "vc/core/util/AtomicFile.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
@@ -1775,20 +1776,31 @@ void validateFiberletNormalDatasetCompatibility(
         throw std::invalid_argument(
             "fiberlet dataset does not use the whole-volume base coordinate frame");
     }
-    const auto predictionShape = fiberletPredictionShape(metadata);
+    validateFiberletNormalDatasetCompatibility(
+        FiberPredictionGridInfo{fiberletPredictionShape(metadata), metadata.predictionToBaseScale},
+        normals);
+}
+
+void validateFiberletNormalDatasetCompatibility(
+    const FiberPredictionGridInfo& grid,
+    const vc::lasagna::LasagnaDataset& normals)
+{
+    if (!(grid.predictionToBaseScale > 0.0) || !std::isfinite(grid.predictionToBaseScale))
+        throw std::invalid_argument("fiberlet prediction-to-base scale must be positive and finite");
+    const auto& predictionShape = grid.shapeZYX;
     const auto& manifest = normals.manifest();
     if (!manifest.baseShapeZYX.has_value())
         throw std::invalid_argument(
             "normal manifest must declare base_shape_zyx");
     if (!nearlyEqual(manifest.workingToBaseScale,
-                     metadata.predictionToBaseScale)) {
+                     grid.predictionToBaseScale)) {
         throw std::invalid_argument(
             "normal dataset working scale does not match the Fiberlet prediction scale");
     }
     for (std::size_t axis = 0; axis < predictionShape.size(); ++axis) {
         const auto expected = static_cast<std::size_t>(std::ceil(
             static_cast<double>((*manifest.baseShapeZYX)[axis]) /
-            metadata.predictionToBaseScale));
+            grid.predictionToBaseScale));
         if (predictionShape[axis] != expected) {
             throw std::invalid_argument(
                 "normal manifest base_shape_zyx is incompatible with the Fiberlet prediction grid");

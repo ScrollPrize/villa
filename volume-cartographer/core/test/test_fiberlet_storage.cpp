@@ -23,6 +23,16 @@
 
 using namespace vc::fiber_tracer;
 
+TEST_CASE("Metadata construction rejects nonpositive storage sides")
+{
+    for (const int side : {0, -12}) {
+        CHECK_THROWS_AS(makeFiberletDatasetMetadata(
+            FiberletDatasetKind::Anchors, {{12, 12, 12}, 1.0},
+            FiberAnchorConfig{}, FiberletPathConfig{}, side, nlohmann::json::object()),
+            std::invalid_argument);
+    }
+}
+
 TEST_CASE("Published payload preserves real stored fiberlet geometry")
 {
     const auto* prefixPath = std::getenv("VC_TEST_FIBERLET_PREFIX");

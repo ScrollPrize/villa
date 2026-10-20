@@ -687,6 +687,7 @@ int runWholeVolumePreprocessing(
     normalOptions.workingToBaseScale = grid.predictionToBaseScale;
     normalOptions.remoteCacheRoot = options.remoteCacheDirectory;
     const auto normalDataset = vc::lasagna::LasagnaDataset::openLocation(options.normalManifestLocation, normalOptions);
+    validateFiberletNormalDatasetCompatibility(grid, normalDataset);
     auto normalSampler =
         std::make_shared<vc::lasagna::LasagnaNormalSampler>(normalDataset);
 
@@ -1061,6 +1062,7 @@ int main(int argc, char** argv) {
         normalOptions.workingToBaseScale = grid.predictionToBaseScale;
         normalOptions.remoteCacheRoot = options.remoteCacheDirectory;
         const auto normalDataset = vc::lasagna::LasagnaDataset::openLocation(options.normalManifestLocation, normalOptions);
+        vc::fiber_tracer::validateFiberletNormalDatasetCompatibility(grid, normalDataset);
         const vc::lasagna::LasagnaNormalSampler normalSampler(normalDataset);
         const auto report = vc::fiber_tracer::traceFiberletPaths(
             anchors,

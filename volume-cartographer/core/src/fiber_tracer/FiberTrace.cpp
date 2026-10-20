@@ -4467,6 +4467,9 @@ public:
     {
         (void)storedGridInfo();
         const auto& binding = options_[*canonicalOptionIndex_].presence;
+        if (binding.array->metadata().fill_value != std::optional<double>{0.0})
+            throw std::invalid_argument(
+                "sparse fiber presence scanning requires fill_value=0");
         FiberPresenceChunkScanReport report;
         report.shapeZYX = binding.shapeZYX;
         report.chunksZYX = binding.chunksZYX;

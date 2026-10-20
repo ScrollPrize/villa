@@ -19,6 +19,7 @@ namespace vc::lasagna { class LasagnaDataset; }
 
 namespace vc::fiber_tracer
 {
+struct FiberPredictionGridInfo;
 
 // Bump whenever current anchor or Fiberlet generation can produce different
 // authoritative payloads for otherwise identical effective inputs.
@@ -147,6 +148,10 @@ void finalizeFiberletDatasetIdentity(FiberletDatasetMetadata& metadata);
 
 void validateFiberletNormalDatasetCompatibility(
     const FiberletDatasetMetadata& metadata,
+    const vc::lasagna::LasagnaDataset& normals);
+// Validate CLI inputs before constructing storage metadata or generating routes.
+void validateFiberletNormalDatasetCompatibility(
+    const FiberPredictionGridInfo& grid,
     const vc::lasagna::LasagnaDataset& normals);
 
 // Producer diagnostics do not affect cache compatibility. This also permits

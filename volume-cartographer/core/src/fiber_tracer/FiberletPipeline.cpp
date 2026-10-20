@@ -29,6 +29,8 @@ FiberletDatasetMetadata makeFiberletDatasetMetadata(
     FiberletStorageProfile storageProfile,
     std::string_view selectionIdentity)
 {
+    if (storageChunkSideBaseVoxels <= 0)
+        throw std::invalid_argument("storage chunk side must be positive");
     const double cellSideBase = static_cast<double>(anchors.cellSizePredictionVoxels) * grid.predictionToBaseScale;
     const auto roundedCellSideBase = std::llround(cellSideBase);
     if (!(roundedCellSideBase > 0) || std::abs(cellSideBase - static_cast<double>(roundedCellSideBase)) > 1.0e-9 ||

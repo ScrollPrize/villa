@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/fiber_tracer/FiberAnchors.hpp"
+#include "vc/fiber_tracer/FiberletDataset.hpp"
 #include "vc/fiber_tracer/detail/FiberAnchorPeakGrid.hpp"
 #include "vc/fiber_tracer/detail/FiberAnchorSupportStencil.hpp"
 #include "vc/lasagna/Dataset.hpp"
@@ -2606,6 +2607,51 @@ TEST_CASE("fiber presence chunk scan distinguishes missing empty and nonempty ch
     CHECK(report.missingChunks == 1);
     CHECK(report.emptyChunks == 1);
     CHECK(report.nonemptyChunksZYX == std::vector<std::array<size_t, 3>>{{0, 0, 2}});
+    // Missing chunks are only safely skipped when their logical fill is zero.
+    metadata.fill_value = 17.0;
+    utils::ZarrArray::create(directory / "nonzero.zarr", metadata);
+    auto nonzeroManifest = nlohmann::json::parse(std::ifstream(manifestPath));
+    nonzeroManifest["groups"]["presence"]["zarr"] = "nonzero.zarr";
+    writeText(directory / "nonzero.lasagna.json", nonzeroManifest.dump());
+    const auto nonzeroDataset = vc::lasagna::LasagnaDataset::open(directory / "nonzero.lasagna.json");
+    const vc::fiber_tracer::FiberPredictionField nonzeroField(nonzeroDataset,
+        vc::fiber_tracer::FiberPredictionFieldBindingMode::CanonicalStoredGrid);
+    CHECK_THROWS_WITH_AS(nonzeroField.scanStoredPresenceChunks(3),
+        doctest::Contains("fill_value=0"), std::invalid_argument);
+    std::filesystem::remove_all(directory);
+}
+
+TEST_CASE("Fiberlet normal input validation rejects wrong volumes and channel shapes")
+{
+    const auto directory = temporaryDirectory("fiberlet_normal_compatibility");
+    for (const auto* channel : {"nx", "ny", "grad_mag"})
+        createConstantZarr(directory / (std::string(channel) + ".zarr"),
+            {4, 4, 4}, {4, 4, 4}, 128);
+    auto manifest = nlohmann::json::parse(R"({
+      "version":2,"source_to_base":1.0,"base_shape_zyx":[4,4,4],
+      "grad_mag_encode_scale":255.0,"grad_mag_factor":1.0,
+      "groups":{
+        "nx":{"zarr":"nx.zarr","scaledown":0,"channels":["nx"]},
+        "ny":{"zarr":"ny.zarr","scaledown":0,"channels":["ny"]},
+        "grad_mag":{"zarr":"grad_mag.zarr","scaledown":0,"channels":["grad_mag"]}
+      }
+    })");
+    const auto path = directory / "normals.lasagna.json";
+    const vc::fiber_tracer::FiberPredictionGridInfo grid{{4,4,4}, 1.0};
+    writeText(path, manifest.dump());
+    vc::fiber_tracer::validateFiberletNormalDatasetCompatibility(
+        grid, vc::lasagna::LasagnaDataset::open(path));
+    manifest["base_shape_zyx"] = {8,8,8};
+    writeText(path, manifest.dump());
+    CHECK_THROWS_WITH_AS(vc::fiber_tracer::validateFiberletNormalDatasetCompatibility(
+        grid, vc::lasagna::LasagnaDataset::open(path)),
+        doctest::Contains("incompatible"), std::invalid_argument);
+    manifest["base_shape_zyx"] = {4,4,4};
+    createConstantZarr(directory / "wrong_ny.zarr", {2,4,4}, {2,4,4}, 128);
+    manifest["groups"]["ny"]["zarr"] = "wrong_ny.zarr";
+    writeText(path, manifest.dump());
+    CHECK_THROWS_AS(vc::fiber_tracer::validateFiberletNormalDatasetCompatibility(
+        grid, vc::lasagna::LasagnaDataset::open(path)), std::invalid_argument);
     std::filesystem::remove_all(directory);
 }
 
