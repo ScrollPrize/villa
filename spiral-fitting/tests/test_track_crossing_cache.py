@@ -1,9 +1,12 @@
 import dbm
+import json
 import os
 import pickle
 from pathlib import Path
+import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -12,13 +15,14 @@ from build_track_crossings import build_cache
 from tracks import (
     PackedTrackCollection,
     _build_crossing_partner_csr,
+    _db_signatures_match,
     _load_native_track_crossings,
     _pack_track_points,
+    _packed_store_if_current,
     _restrict_crossing_partner_csr,
     load_track_crossing_cache,
     load_tracks_from_dbm,
     prepare_main_phase_tracks,
-    _packed_store_if_current,
     _sample_prepared_track_points,
     _tracks_db_signature,
     track_crossing_cache_path,
@@ -227,28 +231,99 @@ class TrackCrossingCacheTests(unittest.TestCase):
 
             self.assertIsNone(load_track_crossing_cache(path, warn=False))
 
-    def test_sidecars_survive_dbm_mtime_change(self):
-        # Downloading or copying a DBM gives its backing files new modification
-        # times; sidecars published beside it must still validate.
+    def make_db_with_sidecars(self, root):
+        path = self.make_db(root)
+        build_cache(path, show_progress=False)
+        write_packed_track_store(path, show_progress=False)
+        return path
+
+    def edit_sidecar_metadata(self, path, edit):
+        """Apply ``edit`` to the metadata of both sidecars beside ``path``."""
+        cache_path = track_crossing_cache_path(path)
+        with np.load(cache_path, allow_pickle=False) as stored:
+            arrays = {name: stored[name] for name in stored.files}
+        metadata = json.loads(str(arrays['metadata'].item()))
+        edit(metadata, 'db_signature', 'db_digest')
+        arrays['metadata'] = np.asarray(json.dumps(metadata, sort_keys=True))
+        with cache_path.open('wb') as stream:
+            np.savez(stream, **arrays)
+        store_metadata = track_store_path(path) / 'metadata.json'
+        metadata = json.loads(store_metadata.read_text(encoding='utf-8'))
+        edit(metadata, 'source_db_signature', 'source_db_digest')
+        store_metadata.write_text(json.dumps(metadata), encoding='utf-8')
+
+    def sidecars_current(self, path):
+        crossings = load_track_crossing_cache(path, warn=False) is not None
+        packed = _packed_store_if_current(path) == track_store_path(path)
+        self.assertEqual(crossings, packed)
+        return crossings
+
+    def test_unchanged_mtimes_validate_without_hashing(self):
         with tempfile.TemporaryDirectory() as temporary:
-            path = self.make_db(temporary)
-            build_cache(path, show_progress=False)
-            write_packed_track_store(path, show_progress=False)
+            path = self.make_db_with_sidecars(temporary)
+            metadata = json.loads(
+                (track_store_path(path) / 'metadata.json').read_text(encoding='utf-8'))
+            for digest in metadata['source_db_digest'].values():
+                self.assertRegex(digest, '^sha256:[0-9a-f]{64}$')
+            with mock.patch('tracks._tracks_db_digest',
+                            side_effect=AssertionError('hashed')):
+                self.assertTrue(self.sidecars_current(path))
+
+    def test_same_size_rewrite_invalidates_sidecars_with_digest(self):
+        # SQLite-backed DBMs (dbm.sqlite3, Python >= 3.14) are usually edited
+        # without changing size, so names and sizes alone cannot catch this.
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.make_db_with_sidecars(temporary)
+            name, size, _mtime = max(
+                _tracks_db_signature(path), key=lambda item: item[1])
+            backing = Path(temporary) / name
+            with backing.open('r+b') as stream:
+                stream.seek(size // 2)
+                byte = stream.read(1)
+                stream.seek(size // 2)
+                stream.write(bytes([byte[0] ^ 0xFF]))
+            os.utime(backing, ns=(10**18, 10**18))
+            self.assertEqual(backing.stat().st_size, size)
+
+            self.assertFalse(self.sidecars_current(path))
+
+    def test_copied_dbm_with_new_mtimes_keeps_sidecars_with_digest(self):
+        with (tempfile.TemporaryDirectory() as source,
+              tempfile.TemporaryDirectory() as target):
+            path = self.make_db_with_sidecars(source)
+            copied = Path(target) / path.name
             for name, _size, _mtime in _tracks_db_signature(path):
-                os.utime(Path(temporary) / name, ns=(10**18, 10**18))
+                shutil.copyfile(Path(source) / name, Path(target) / name)
+                os.utime(Path(target) / name, ns=(10**18 + 123_456_700,) * 2)
+            shutil.copyfile(
+                track_crossing_cache_path(path),
+                track_crossing_cache_path(copied))
+            shutil.copytree(track_store_path(path), track_store_path(copied))
 
-            self.assertIsNotNone(load_track_crossing_cache(path, warn=False))
-            self.assertEqual(
-                _packed_store_if_current(path), track_store_path(path))
+            self.assertTrue(self.sidecars_current(copied))
 
-    def test_changed_dbm_invalidates_packed_store(self):
+    def test_sidecars_without_digest_keep_the_mtime_rule(self):
+        stored_ns = 1785295357776482751
+
+        def as_old_sidecar(metadata, signature_key, digest_key):
+            metadata.pop(digest_key, None)
+            metadata[signature_key] = [
+                [name, size, stored_ns]
+                for name, size, _mtime in metadata[signature_key]]
+
         with tempfile.TemporaryDirectory() as temporary:
-            path = self.make_db(temporary)
-            write_packed_track_store(path, show_progress=False)
-            with dbm.open(str(path), 'w') as database:
-                database[b'h:new'] = pickle.dumps([line_track(4)])
-
-            self.assertIsNone(_packed_store_if_current(path))
+            path = self.make_db_with_sidecars(temporary)
+            self.edit_sidecar_metadata(path, as_old_sidecar)
+            whole_second = stored_ns // 10**9 * 10**9
+            for mtime_ns, current in (
+                    (whole_second, True),             # HTTP Last-Modified
+                    (stored_ns // 100 * 100, False),  # NTFS keeps 100 ns
+                    (whole_second + 10**9, False),    # FAT 2 s, time zones
+            ):
+                with self.subTest(mtime_ns=mtime_ns):
+                    for name, _size, _mtime in _tracks_db_signature(path):
+                        os.utime(Path(temporary) / name, ns=(mtime_ns,) * 2)
+                    self.assertEqual(self.sidecars_current(path), current)
 
     def test_parallel_crossing_scan_matches_single_worker(self):
         horizontal = line_track(20, z=10, y=10, axis=2)
@@ -347,3 +422,39 @@ class TrackCrossingCacheTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class DbSignatureMatchTests(unittest.TestCase):
+    NS = 1785295357776482751                 # a real DBM mtime_ns; mirrors keep only 1785295357000000000
+
+    def test_exact_match(self):
+        self.assertTrue(_db_signatures_match([['tracks.dbm', 10, self.NS]], [['tracks.dbm', 10, self.NS]]))
+
+    def test_mtime_truncated_to_whole_seconds_matches(self):
+        truncated = self.NS // 1_000_000_000 * 1_000_000_000
+        self.assertTrue(_db_signatures_match([['tracks.dbm', 10, self.NS]], [['tracks.dbm', 10, truncated]]))
+        self.assertTrue(_db_signatures_match([['tracks.dbm', 10, truncated]], [['tracks.dbm', 10, self.NS]]))
+
+    def test_local_edit_within_the_same_second_does_not_match(self):
+        self.assertFalse(_db_signatures_match([['tracks.dbm', 10, self.NS]], [['tracks.dbm', 10, self.NS + 1000]]))
+
+    def test_different_second_does_not_match(self):
+        self.assertFalse(_db_signatures_match([['tracks.dbm', 10, self.NS]], [['tracks.dbm', 10, self.NS + 1_000_000_000]]))
+        truncated = self.NS // 1_000_000_000 * 1_000_000_000
+        self.assertFalse(_db_signatures_match([['tracks.dbm', 10, self.NS]], [['tracks.dbm', 10, truncated + 1_000_000_000]]))
+
+    def test_name_or_size_mismatch(self):
+        self.assertFalse(_db_signatures_match([['tracks.dbm', 10, self.NS]], [['other.dbm', 10, self.NS]]))
+        self.assertFalse(_db_signatures_match([['tracks.dbm', 10, self.NS]], [['tracks.dbm', 11, self.NS]]))
+
+    def test_length_mismatch(self):
+        stored = [['tracks.dbm.dat', 10, self.NS], ['tracks.dbm.dir', 5, self.NS]]
+        self.assertFalse(_db_signatures_match(stored, stored[:1]))
+        self.assertFalse(_db_signatures_match(stored[:1], stored))
+
+    def test_malformed_entries_do_not_match(self):
+        expected = [['tracks.dbm', 10, self.NS]]
+        for stored in (None, {}, [None], [['tracks.dbm', 10]], [['tracks.dbm', None, self.NS]],
+                       [['tracks.dbm', 10, None]], [['tracks.dbm', 'ten', self.NS]]):
+            with self.subTest(stored=stored):
+                self.assertFalse(_db_signatures_match(stored, expected))

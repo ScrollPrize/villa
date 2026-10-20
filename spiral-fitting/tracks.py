@@ -1,5 +1,6 @@
 import colorsys
 import dbm
+import hashlib
 import importlib
 import itertools
 import json
@@ -38,6 +39,8 @@ TRACK_CROSSING_CACHE_SUFFIX = '.crossings.npz'
 TRACK_STORE_SUFFIX = '.vctracks'
 TRACK_STORE_VERSION = 1
 TRACK_STORE_MAGIC = b'VCTRK01\0'
+_DB_DIGEST_CHUNK_BYTES = 16 << 20
+_DB_DIGEST_MEMO = {}
 
 
 def _load_native_track_crossings():
@@ -226,26 +229,80 @@ def _tracks_db_signature(path):
     return sorted(result)
 
 
-def _portable_db_signature(signature):
-    """Reduce a DBM signature to the parts that survive a copy or download.
+def _db_signatures_match(stored, expected):
+    """Compare a stored DBM signature with the current one.
 
-    Stored signatures carry ``(name, size, mtime_ns)`` per backing file. The
-    modification time changes whenever the DBM is downloaded, copied or
-    restored, so a sidecar published next to its DBM could never validate.
-    Names and sizes are compared instead.
+    Signatures are ``(name, size, mtime_ns)`` per backing file. Downloads and
+    copies routinely lose the sub-second part of mtime (HTTP Last-Modified has
+    one-second resolution), which made every cache shipped alongside a dataset
+    look stale after download even though name and size matched. Name and size
+    must match exactly. mtime must match exactly, except that when one side is
+    a whole second (a copy that dropped the sub-second part) the seconds must
+    match. Two nanosecond mtimes still have to agree, so an edit within the
+    same second on a local file is still detected.
     """
-    return sorted((str(item[0]), int(item[1])) for item in signature)
-
-
-def _db_signature_matches(stored, path):
-    """Return whether a stored DBM signature matches the DBM at ``path``."""
-    if not isinstance(stored, list):
+    if not isinstance(stored, list) or len(stored) != len(expected):
         return False
     try:
-        stored_portable = _portable_db_signature(stored)
-    except (TypeError, ValueError, IndexError):
+        for item, want in zip(stored, expected):
+            if not isinstance(item, (list, tuple)) or len(item) != 3:
+                return False
+            if item[0] != want[0] or int(item[1]) != int(want[1]):
+                return False
+            have, need = int(item[2]), int(want[2])
+            if have != need:
+                truncated = have % 1_000_000_000 == 0 or need % 1_000_000_000 == 0
+                if not truncated or have // 1_000_000_000 != need // 1_000_000_000:
+                    return False
+    except (TypeError, ValueError):
+        return False                        # malformed metadata (e.g. null entries): treat as stale
+    return True
+
+
+def _tracks_db_digest(path, signature):
+    """Hash the backing files listed in a ``(name, size, mtime_ns)`` signature.
+
+    Returns ``{name: 'sha256:<hex>'}``, or ``None`` if a file no longer has
+    the size and mtime recorded in ``signature`` once it has been read. Each
+    file is hashed at most once per process for a given path, size and mtime.
+    """
+    folder = Path(normalize_tracks_dbm_path(path)).parent
+    digests = {}
+    for name, size, mtime_ns in signature:
+        file_path = folder / name
+        key = (os.fspath(file_path.resolve()), int(size), int(mtime_ns))
+        if key not in _DB_DIGEST_MEMO:
+            hasher = hashlib.sha256()
+            with file_path.open('rb') as stream:
+                while chunk := stream.read(_DB_DIGEST_CHUNK_BYTES):
+                    hasher.update(chunk)
+            stat = file_path.stat()
+            if (stat.st_size, stat.st_mtime_ns) != key[1:]:
+                return None
+            _DB_DIGEST_MEMO[key] = 'sha256:' + hasher.hexdigest()
+        digests[name] = _DB_DIGEST_MEMO[key]
+    return digests
+
+
+def _db_contents_match(stored, stored_digest, path, expected):
+    """Whether a DBM that fails ``_db_signatures_match`` still has the same bytes.
+
+    Copies and downloads that stamp a new mtime (``cp``, ``curl`` without
+    ``-R``, Python ``requests``) fail the mtime check although the files are
+    identical. When the sidecar recorded content digests, names and sizes must
+    match and every backing file must hash the same. Size alone is not enough:
+    SQLite-backed DBMs (``dbm.sqlite3``, Python >= 3.14) rarely change size
+    when edited. Sidecars without digests keep the mtime rule.
+    """
+    if stored_digest is None or not isinstance(stored, list):
         return False
-    return stored_portable == _portable_db_signature(_tracks_db_signature(path))
+    try:
+        if [[str(name), int(size)] for name, size, _mtime in stored] != [
+                [name, size] for name, size, _mtime in expected]:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return _tracks_db_digest(path, expected) == stored_digest
 
 
 def track_store_path(path):
@@ -365,9 +422,11 @@ def write_packed_track_store(
                 track_count, point_count, 0, 0, 0, 0))
             stream.flush()
             os.fsync(stream.fileno())
+        signature = _tracks_db_signature(logical)
         metadata = {
             'version': TRACK_STORE_VERSION,
-            'source_db_signature': [list(item) for item in _tracks_db_signature(logical)],
+            'source_db_signature': [list(item) for item in signature],
+            'source_db_digest': _tracks_db_digest(logical, signature),
             'track_count': track_count,
             'point_count': point_count,
         }
@@ -405,8 +464,11 @@ def _load_packed_track_collection(path, z_lo=None, z_hi=None, warn=True):
             metadata = json.load(stream)
         if metadata.get('version') != TRACK_STORE_VERSION:
             raise ValueError('unsupported packed track-store version')
-        if not _db_signature_matches(
-                metadata.get('source_db_signature'), path):
+        expected = [list(item) for item in _tracks_db_signature(path)]
+        stored = metadata.get('source_db_signature')
+        if not (_db_signatures_match(stored, expected)
+                or _db_contents_match(stored, metadata.get('source_db_digest'),
+                                      path, expected)):
             raise ValueError('source DBM changed after the packed store was written')
         result = native.load(
             os.fspath(store),
@@ -438,8 +500,11 @@ def _packed_store_if_current(path):
             metadata = json.load(stream)
         if metadata.get('version') != TRACK_STORE_VERSION:
             return None
-        if not _db_signature_matches(
-                metadata.get('source_db_signature'), path):
+        expected = [list(item) for item in _tracks_db_signature(path)]
+        stored = metadata.get('source_db_signature')
+        if not (_db_signatures_match(stored, expected)
+                or _db_contents_match(stored, metadata.get('source_db_digest'),
+                                      path, expected)):
             return None
         return store
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
@@ -1611,6 +1676,7 @@ def write_track_crossing_cache(
     metadata = {
         'version': TRACK_CROSSING_CACHE_VERSION,
         'db_signature': [list(item) for item in signature],
+        'db_digest': _tracks_db_digest(path, signature),
         'angle_degrees': 30.0,
         'tangent_radius_voxels': 12.0,
         'cluster_local_index_radius': 4,
@@ -1657,7 +1723,11 @@ def load_track_crossing_cache(path, warn=True, expected_z_range=None):
             if metadata.get('version') != TRACK_CROSSING_CACHE_VERSION:
                 raise ValueError(
                     f"unsupported version {metadata.get('version')!r}")
-            if not _db_signature_matches(metadata.get('db_signature'), path):
+            expected_signature = [list(item) for item in _tracks_db_signature(path)]
+            stored_signature = metadata.get('db_signature')
+            if not (_db_signatures_match(stored_signature, expected_signature)
+                    or _db_contents_match(stored_signature, metadata.get('db_digest'),
+                                          path, expected_signature)):
                 raise ValueError('tracks DBM has changed since the cache was built')
             if (expected_z_range is not None
                     and metadata.get('z_range', [None, None])
