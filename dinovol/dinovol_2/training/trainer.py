@@ -24,6 +24,7 @@ from dinovol_2.ops.precision import resolve_amp_dtype
 
 from dinovol_2.methods import build_method
 from .config import normalize_config
+from .checkpoint import FORMAT_VERSION, method_state
 from dinovol_2.training.schedules import CosineScheduler
 
 def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, float]:
@@ -124,6 +125,7 @@ class Trainer:
             raise ValueError("grad_accumulation_steps must be at least 1")
         self.method = method if method is not None else build_method(
             self.config, device=self.device, is_distributed=self.is_distributed, rank=self.rank)
+        self.config["method"]["name"] = self.method.name
         self.optimizer = self._build_optimizer()
         self.scaler = torch.amp.GradScaler(
             "cuda", enabled=self.use_amp and self.device.type == "cuda" and self.amp_dtype == torch.float16)
@@ -733,7 +735,7 @@ class Trainer:
                         )
                 if self.task_eval_every and step > 0 and step % self.task_eval_every == 0:
                     self._run_task_evals(step)
-                if self.is_main_process and self.save_every_n and step > 0 and step % self.save_every_n == 0:
+                if self.save_every_n and step > 0 and step % self.save_every_n == 0:
                     self.save_checkpoint(step)
         finally:
             if progress is not None:
@@ -800,22 +802,43 @@ class Trainer:
         return self.method.save_monitor_image(batch, step, metrics, directory=self.monitor_dir, config=self.runtime_config)
 
     def save_checkpoint(self, step: int) -> Path:
+        """Collective under DDP: every rank contributes runtime state; rank zero writes."""
         path = self.output_dir / f"checkpoint_step_{step:06d}.pt"
-        tmp_path = path.with_suffix(".pt.tmp")
-        torch.save({
-            "step": step, "config": self.config, "wandb_run_id": self._current_wandb_run_id(),
-            **self.method.checkpoint_state(),
-            "optimizer": self.optimizer.state_dict(),
-            "scaler": self.scaler.state_dict() if self.scaler.is_enabled() else None,
+        # Let methods finish outstanding state updates before taking the snapshot.
+        state = self.method.checkpoint_state()
+        runtime_state = {
             "rng_state": self._capture_rng_state(),
-        }, tmp_path)
-        tmp_path.replace(path)
+            "train_sampler_epoch": self._train_sampler_epoch,
+            "val_sampler_epoch": self._val_sampler_epoch,
+            "monitor_rng_state": self._monitor_selection_rng.getstate(),
+            "method_state": self.method.rank_checkpoint_state(),
+        }
+        if self.is_distributed:
+            runtime_states = [None] * self.world_size if self.is_main_process else None
+            dist.gather_object(runtime_state, runtime_states, dst=0)
+        else:
+            runtime_states = [runtime_state]
+        if self.is_main_process:
+            tmp_path = path.with_suffix(".pt.tmp")
+            torch.save({
+                "format_version": FORMAT_VERSION,
+                "step": step,
+                "config": self.config,
+                "wandb_run_id": self._current_wandb_run_id(),
+                "method": {"name": self.method.name, "state": state},
+                "evaluation_backbone": self.method.evaluation_backbone().state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "scaler": self.scaler.state_dict() if self.scaler.is_enabled() else None,
+                "runtime_states": runtime_states,
+            }, tmp_path)
+            tmp_path.replace(path)
         return path
 
     def load_checkpoint(self, checkpoint_path: str | Path) -> int:
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        state = method_state(checkpoint, expected_method=self.method.name)
         step = int(checkpoint.get("step", -1))
-        added = self.method.load_checkpoint_state(checkpoint, step)
+        added = self.method.load_checkpoint_state(state, step)
         if "optimizer" in checkpoint:
             self.method.load_optimizer_state(self.optimizer, checkpoint["optimizer"], added)
             self._optimizer_to_device()
@@ -824,4 +847,19 @@ class Trainer:
         if checkpoint.get("wandb_run_id") and not self.wandb_run_id:
             self.wandb_run_id = str(checkpoint["wandb_run_id"])
             self.runtime_config["wandb_run_id"] = self.wandb_run_id
+        runtime_states = checkpoint.get("runtime_states")
+        if runtime_states:
+            # A changed world size cannot restore RNG streams for newly added ranks.
+            if self.rank < len(runtime_states):
+                runtime = runtime_states[self.rank]
+                self.method.load_rank_checkpoint_state(runtime.get("method_state", {}))
+                self._restore_rng_state(runtime["rng_state"])
+                self._train_sampler_epoch = int(runtime.get("train_sampler_epoch", 0))
+                self._val_sampler_epoch = int(runtime.get("val_sampler_epoch", 0))
+                if "monitor_rng_state" in runtime:
+                    self._monitor_selection_rng.setstate(runtime["monitor_rng_state"])
+        else:
+            self.method.load_rank_checkpoint_state({})
+            if "rng_state" in checkpoint:
+                self._restore_rng_state(checkpoint["rng_state"])
         return step

@@ -19,6 +19,7 @@ from dinovol_2.ops.point_embeddings import gather_variable_points, sample_normal
 from .dino_data import build_dino_ibot_collate_fn
 from dinovol_2.training.schedules import CosineScheduler
 from dinovol_2.training.config import dino_model_config
+from dinovol_2.training.checkpoint import method_state
 from .base import TrainingMethod, StepOutput
 
 def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, float]:
@@ -294,6 +295,8 @@ class DinoMethod(TrainingMethod):
         if self.gram_teacher_backbone is None:
             return
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if "format_version" in checkpoint:
+            checkpoint = method_state(checkpoint, expected_method=self.name)
         if checkpoint.get("gram_teacher_backbone") is not None:
             state_dict = checkpoint["gram_teacher_backbone"]
         elif "teacher" in checkpoint:
@@ -863,6 +866,10 @@ class DinoMethod(TrainingMethod):
         return resolved_config
 
     def checkpoint_state(self):
+        # Centering delays its reduction until the next forward. Finish it here so
+        # saving/resuming preserves the next targets without serializing work handles.
+        self.dino_loss.apply_center_update()
+        self.ibot_patch_loss.apply_center_update()
         return {
             "student": self.model_module.student.state_dict(),
             "teacher": self.model_module.teacher.state_dict(),
@@ -871,7 +878,25 @@ class DinoMethod(TrainingMethod):
             "object_loss": self.object_loss.state_dict() if self.do_object_losses else None,
             "gram_teacher_backbone": self.gram_teacher_backbone.state_dict() if self.gram_teacher_backbone is not None else None,
             "object_heads_start_step": self.object_heads_start_step,
+
         }
+
+    def rank_checkpoint_state(self):
+        return {
+            name: getattr(self.object_loss, name).detach().cpu()
+            for name in ("ink_pos_queue", "ink_neg_queue")
+        } if self.do_object_losses else {}
+
+    def load_rank_checkpoint_state(self, state):
+        if not self.do_object_losses:
+            return
+        for name in ("ink_pos_queue", "ink_neg_queue"):
+            queue = state.get(name)
+            if queue is None:
+                queue = torch.empty((0, self.object_loss.ink_dim))
+            if queue.ndim != 2 or queue.shape[1] != self.object_loss.ink_dim:
+                raise ValueError(f"Checkpoint {name} does not match the ink head dimension")
+            setattr(self.object_loss, name, queue.to(self.device).clone())
 
     _ADDABLE_MODULES = ("dense_head.", "region_head.")
     _GROUP_KEYS = ("lr_multiplier", "wd_multiplier", "is_last_layer")
@@ -955,6 +980,11 @@ class DinoMethod(TrainingMethod):
                     raise RuntimeError("Remapped optimizer state does not match its parameter's shape.")
 
     def load_checkpoint_state(self, checkpoint, step):
+        for loss in (self.dino_loss, self.ibot_patch_loss):
+            loss.apply_center_update()
+            loss.updated = True
+            loss.reduce_handle = None
+            loss.async_batch_center = None
         student = self.model_module.student
         teacher = self.model_module.teacher
         added = self._load_branch(student, checkpoint["student"])

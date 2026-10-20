@@ -977,3 +977,59 @@ Workflow:
 - click `Similarity For Selected Points` or `Similarity For All Points`
 
 The widget rebuilds the teacher backbone from the saved checkpoint config, computes a patch embedding grid only inside the active bbox for the selected OME-Zarr scale, and limits the PCA and cosine-similarity outputs to that same crop. The dock widget opens on the bottom of the napari window.
+
+## Extending the training method
+
+`dinovol_2.pretrain` is the CLI. `training/trainer.py` owns iteration, AMP,
+gradient accumulation, backward, AdamW, logging and checkpoint cadence.
+`methods/dino.py` owns the DINO/iBOT model, teachers, loss state, schedules and
+optional point/object supervision. Rendering and pipeline diagnostics live in
+`training/monitoring.py` and `training/diagnostics.py`.
+
+Implement `TrainingMethod` and add a construction branch in `methods.build_method`
+to introduce another method. `Trainer(config, method=...)` also accepts an
+already constructed method. Its forward returns `StepOutput(loss, metrics)`;
+metrics are scalar tensors, and `loss` retains its gradient. The trainer runs
+forward once per microbatch and handles backward. Method hooks before/after the
+optimizer step run once per accumulated step. Trainable forwards must pass
+through the method's DDP-wrapped model. DINO keeps its region-head gradient
+reduction in `before_optimizer_step` and EMA/Gram updates in
+`after_optimizer_step`. `evaluation_backbone()` selects the encoder supplied to
+downstream evaluation. `model.build_backbone()` constructs a standalone encoder
+without projection heads or a teacher.
+
+The shared `MultiCropBatch` contract is defined in `ops/collate.py`. Global and
+local crops have independent spatial sizes and view-major rows:
+`row = view_index * batch_size + sample_index`. The same sample index across
+views refers to the same source. Zero local views is supported. Crops and
+annotations are collated independently of the method; `methods/dino_data.py`
+adds iBOT masks and preserves labeled-point interpolation support. Shared data
+loading supports arbitrary positive global-view counts. DINO and paired
+cross-view token correspondences require exactly two.
+
+New checkpoints use `format_version: 2`. The trainer saves optimizer/scaler and
+per-rank runtime state; the method supplies its own named state. DINO includes
+student/teacher weights, centers, the Gram teacher and auxiliary-head ramp state.
+Pending center reductions are completed before saving. Ink queues and RNG state
+are saved per rank. An evaluation-backbone export is included for other methods.
+Legacy DINO checkpoints remain readable by training and inference adapters.
+A checkpoint from a different method is rejected before loading model weights.
+
+Checkpoint saving is collective under DDP: every rank must call
+`save_checkpoint`, and rank zero writes the file atomically. Resuming restores
+saved RNG streams, sampler epochs and monitor selection state. Worker prefetch
+queues and the exact position within a dataset iterator are not serialized, so
+resuming a live data pipeline does not promise the exact next batch. Changing
+world size also changes rank streams. Fixed-batch optimizer continuation is
+covered by tests, including centering and auxiliary state.
+
+Run the regression and CUDA integration suite from this directory:
+
+```bash
+AGENTS_AGENT_MODE=1 .venv/bin/python -m unittest discover -s tests -v
+```
+
+The suite includes a teacher-free method, shared crop ordering/geometry,
+legacy/new checkpoints, and two-rank CPU/Gloo coverage for the region head and
+rank-local resume. CUDA tests require GPU access; run outside a restrictive
+sandbox when necessary.

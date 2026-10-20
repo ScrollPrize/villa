@@ -981,14 +981,9 @@ class Eva(nn.Module):
 
     def load_pretrained_weights(self, state_dict, backbone_only=False, unchunk=False):
         if isinstance(state_dict, str):
-            state_dict = torch.load(state_dict, map_location="cpu", weights_only=False)['teacher']
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                if not k.startswith("backbone."):
-                    continue
-                new_key = k.replace("backbone.", "", 1)
-                new_state_dict[new_key] = v
-            state_dict = new_state_dict
+            from dinovol_2.training.checkpoint import backbone_state
+            saved = torch.load(state_dict, map_location="cpu", weights_only=False)
+            state_dict, _ = backbone_state(saved)
 
         if unchunk:
             state_dict = self.unchunk_state_dict(state_dict)

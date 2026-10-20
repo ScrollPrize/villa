@@ -65,6 +65,13 @@ class TrainingMethod(nn.Module):
         self.load_state_dict(state["model"])
         return ()
 
+    def rank_checkpoint_state(self) -> dict[str, Any]:
+        """Small, CPU-resident algorithm state that differs between ranks."""
+        return {}
+
+    def load_rank_checkpoint_state(self, state: Mapping[str, Any]) -> None:
+        pass
+
     def load_optimizer_state(self, optimizer, state, added=()) -> None:
         optimizer.load_state_dict(state)
 

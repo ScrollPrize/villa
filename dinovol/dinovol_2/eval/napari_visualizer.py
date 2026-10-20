@@ -17,6 +17,7 @@ from dinovol_2.dataset.cuda_pipeline import NORMALIZATION_SCHEMES, normalize_bat
 from dinovol_2.dataset.volume_reader import open_volume
 from dinovol_2.model import build_backbone
 from dinovol_2.training.config import as_legacy_config
+from dinovol_2.training.checkpoint import backbone_state, method_state
 from dinovol_2.model.model import PointDenseHead, _upgrade_weight_norm_state_dict_keys
 from dinovol_2.ops.point_embeddings import sample_grid_points
 
@@ -308,25 +309,8 @@ def _extract_backbone_state_dict(
     *,
     preferred_branch: str = "teacher",
 ) -> tuple[dict[str, Any], str]:
-    branch_order = [preferred_branch]
-    if preferred_branch != "teacher":
-        branch_order.append("teacher")
-    if preferred_branch != "student":
-        branch_order.append("student")
-
-    for branch_name in branch_order:
-        branch_state = checkpoint.get(branch_name)
-        if not isinstance(branch_state, dict):
-            continue
-        backbone_state = {
-            key.replace("backbone.", "", 1): value
-            for key, value in branch_state.items()
-            if key.startswith("backbone.")
-        }
-        if backbone_state:
-            return _upgrade_weight_norm_state_dict_keys(backbone_state), branch_name
-
-    raise ValueError("checkpoint does not contain teacher.backbone or student.backbone weights")
+    state, source = backbone_state(checkpoint, preferred_branch=preferred_branch)
+    return _upgrade_weight_norm_state_dict_keys(state), source
 
 
 def _build_dense_head_from_checkpoint(
@@ -341,7 +325,7 @@ def _build_dense_head_from_checkpoint(
     if not skip_channels:
         return None
 
-    branch_state = checkpoint.get(source_branch)
+    branch_state = method_state(checkpoint).get(source_branch)
     if not isinstance(branch_state, dict):
         return None
     dense_state = {

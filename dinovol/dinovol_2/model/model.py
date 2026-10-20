@@ -11,6 +11,7 @@ from torch.nn.init import trunc_normal_
 from torch.nn.utils.parametrizations import weight_norm
 from torch.utils.checkpoint import checkpoint
 
+from dinovol_2.training.checkpoint import method_state
 from dinovol_2.ops.point_embeddings import sample_grid_points, sample_selected_grid_points
 from dinovol_2.model.backbone import (
     build_backbone, materialize_backbone_config as _materialize_backbone_config,
@@ -452,6 +453,8 @@ class DinoVitStudentTeacher(nn.Module):
             return
 
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if "format_version" in checkpoint:
+            checkpoint = method_state(checkpoint, expected_method="dino")
         if "teacher" in checkpoint:
             state_dict = checkpoint["teacher"]
         elif "model" in checkpoint:
