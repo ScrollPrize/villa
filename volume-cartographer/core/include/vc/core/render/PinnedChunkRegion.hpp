@@ -6,8 +6,8 @@
 #include <unordered_set>
 
 namespace vc::render {
-// Immutable ownership view, not a cache: payloads stay owned by the regular
-// cache AND these pins until all synchronous users have finished.
+// Immutable ownership view, not a cache: pins keep payloads alive until all
+// synchronous users finish, even if the regular cache evicts its own entries.
 struct PinnedRegionMiss : std::runtime_error {
     explicit PinnedRegionMiss(const std::string& detail):std::runtime_error("sampling exceeded pinned chunk region: "+detail){}
 };

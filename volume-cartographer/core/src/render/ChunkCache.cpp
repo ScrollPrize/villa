@@ -5678,9 +5678,7 @@ void ChunkCache::enforceCapacityLocked(const std::shared_ptr<State>& state)
             continue;
         }
         Entry& entry = entryIt->second;
-        if ((entry.bytes && entry.bytes.use_count() > 1) ||
-            (entry.payload && entry.payload.use_count() > 1) ||
-            hasParkedBlockingReaderLocked(*state, *victimIt)) {
+        if (hasParkedBlockingReaderLocked(*state, *victimIt)) {
             state->lru_.splice(state->lru_.begin(), state->lru_, victimIt);
             entry.lruIt = state->lru_.begin();
             ++protectedEntries;
@@ -5708,8 +5706,6 @@ std::optional<std::uint64_t> ChunkCache::oldestDecodedTouch(
         auto entry = state->entries_.find(*it);
         if (entry != state->entries_.end() &&
             entry->second.status == EntryStatus::Data &&
-            (!entry->second.bytes || entry->second.bytes.use_count() == 1) &&
-            (!entry->second.payload || entry->second.payload.use_count() == 1) &&
             !hasParkedBlockingReaderLocked(*state, *it)) {
             // Must mirror evictOldestDecodedLocked's reader skip: reporting
             // a protected entry's touch would make the budget's enforce()
@@ -5738,9 +5734,10 @@ std::size_t ChunkCache::evictOldestDecodedLocked(const std::shared_ptr<State>& s
         Entry& entry = entryIt->second;
         if (entry.status != EntryStatus::Data)
             continue;
-        if ((entry.bytes && entry.bytes.use_count() > 1) ||
-            (entry.payload && entry.payload.use_count() > 1) ||
-            hasParkedBlockingReaderLocked(*state, *it)) {
+        // External shared owners keep their payload alive independently. Do
+        // not retain a cache entry just for them: their eventual release has
+        // no eviction callback, so that would leave the cache over budget.
+        if (hasParkedBlockingReaderLocked(*state, *it)) {
             continue;
         }
 

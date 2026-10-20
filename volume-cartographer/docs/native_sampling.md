@@ -3,6 +3,11 @@
 CT and Lasagna channel readers share the process-wide decoded chunk cache.
 There is no separate normal-sampler RAM budget. Sources are keyed by identity;
 concurrent readers coalesce chunk requests and retain pinned data while sampling.
+Eviction removes cache ownership even if a caller still holds the decoded data;
+that caller's shared reference remains valid. The cache budget therefore bounds
+cache-owned data, not all application memory (active batches and region pins can
+hold additional data). Releasing a caller's last reference frees evicted data
+without requiring another cache operation.
 Separate processes still have separate decoded caches.
 
 ## Python
@@ -72,7 +77,9 @@ consumers; they do not add these types to the CT rendering API.
 3. Caller suggestion, then `$HOME/.VC3D/remote_cache`.
 
 Malformed explicit configuration fails rather than silently falling back.
-Public HTTP reads do not eagerly invoke AWS credential discovery. See
+Public HTTP reads do not eagerly invoke AWS credential discovery. Each deferred
+credential resolver caches either its result or its exception; a failed provider
+is not rerun for every subsequent request. See
 [remote_file_cache.md](remote_file_cache.md) for authentication behavior.
 
 ## Validation

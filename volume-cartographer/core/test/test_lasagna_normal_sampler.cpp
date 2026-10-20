@@ -638,11 +638,13 @@ TEST_CASE("Lasagna regular cache coalesces concurrent cold readers and preserves
     } restore{budget, budget->maximumBytes()};
     budget->setMaximumBytes(1);
     (void)binding.chunkSource->getChunkBlocking(0,1,1,1);
-    // The regular budget protects caller-held pins and continues accounting them.
-    CHECK(binding.chunkSource->getChunkIfCached(0,0,0,0).bytes == pin.bytes);
+    // Drop cache ownership under pressure, but keep the caller's pin readable.
+    CHECK(binding.chunkSource->getChunkIfCached(0,0,0,0).status == vc::render::ChunkStatus::MissQueued);
     CHECK(pin.bytes->at(0) == std::byte{43});
+    CHECK(budget->stats().decodedBytes <= 1);
     pin = {};
-    budget->setMaximumBytes(1);
+    // No new read or budget update is needed after releasing the pin.
+    CHECK(budget->stats().decodedBytes <= 1);
     CHECK(binding.chunkSource->getChunkIfCached(0,0,0,0).status == vc::render::ChunkStatus::MissQueued);
     fs::remove_all(dir);
 }
