@@ -21,10 +21,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from dinovol_2.loss import (
     DINOLoss, GramLoss, KoLeoLoss, ObjectLoss, ObjectLossResult, PointCosineLoss, PointLossResult, iBOTPatchLoss,
 )
-from dinovol_2.model.model import DinoVitStudentTeacher, _materialize_backbone_config, _upgrade_weight_norm_state_dict_keys
+from dinovol_2.model.model import DinoVitStudentTeacher, _upgrade_weight_norm_state_dict_keys
 from dinovol_2.ops.point_embeddings import gather_variable_points, sample_normalized_patch_embeddings
 from .dino_data import build_dino_ibot_collate_fn
 from dinovol_2.training.schedules import CosineScheduler
+from dinovol_2.model import materialize_backbone_config
 from .base import TrainingMethod, StepOutput
 
 def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, float]:
@@ -76,7 +77,7 @@ class DinoMethod(TrainingMethod):
         from dinovol_2.ops.precision import resolve_amp_dtype
         self.amp_dtype = resolve_amp_dtype(config.get("amp_dtype", "bfloat16"))
         self.total_steps = int(config.get("max_iterations", config.get("num_iterations", 1000000)))
-        self.model_config = {**config["model"], **_materialize_backbone_config(config["model"])}
+        self.model_config = {**config["model"], **materialize_backbone_config(config["model"])}
         self.config["model"] = self.model_config
         modern_defaults = str(self.model_config.get("model_type", "")).strip().lower() == "v3"
         self.freeze_last_layer_steps = self._resolve_freeze_last_layer_steps()

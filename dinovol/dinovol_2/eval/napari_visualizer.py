@@ -15,7 +15,8 @@ from skimage.morphology.binary import binary_dilation
 
 from dinovol_2.dataset.cuda_pipeline import NORMALIZATION_SCHEMES, normalize_batch
 from dinovol_2.dataset.volume_reader import open_volume
-from dinovol_2.model.model import DinoVitStudentTeacher, PointDenseHead, _upgrade_weight_norm_state_dict_keys
+from dinovol_2.model import build_backbone
+from dinovol_2.model.model import PointDenseHead, _upgrade_weight_norm_state_dict_keys
 from dinovol_2.ops.point_embeddings import sample_grid_points
 
 DEFAULT_NORMALIZATION_SCHEME = "robust"
@@ -398,7 +399,7 @@ def load_backbone_from_checkpoint(
         checkpoint,
         preferred_branch=preferred_branch,
     )
-    backbone = DinoVitStudentTeacher._build_backbone(model_config)
+    backbone = build_backbone(model_config)
     backbone.load_state_dict(backbone_state_dict, strict=True)
 
     selected_device = device or _select_device()

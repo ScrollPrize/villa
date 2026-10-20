@@ -436,9 +436,9 @@ class PatchEncodeDecodeTaskDecoder(nn.Module):
 
 
 class Dinov2TaskModel(nn.Module):
-    def __init__(self, teacher_backbone: nn.Module, num_classes: int, decoder_type: str) -> None:
+    def __init__(self, backbone: nn.Module, num_classes: int, decoder_type: str) -> None:
         super().__init__()
-        self.backbone = deepcopy(teacher_backbone)
+        self.backbone = deepcopy(backbone)
         for parameter in self.backbone.parameters():
             parameter.requires_grad = False
 
@@ -702,7 +702,7 @@ class TaskEvalRunner:
         *,
         task_name: str,
         dataset: TaskVolumeSet,
-        teacher_backbone: nn.Module,
+        backbone: nn.Module,
         step: int,
     ) -> dict[str, Any]:
         task_seed = self._task_seed(self.seed, task_name, step)
@@ -710,7 +710,7 @@ class TaskEvalRunner:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(task_seed)
         rng = np.random.default_rng(task_seed + 1000003 * self.rank)
-        model = Dinov2TaskModel(teacher_backbone, 1, self.decoder_type).to(self.device)
+        model = Dinov2TaskModel(backbone, 1, self.decoder_type).to(self.device)
         ddp_model: nn.Module = model
         if self.world_size > 1:
             ddp_model = DDP(model, **self._ddp_kwargs(self.device))
@@ -795,9 +795,9 @@ class TaskEvalRunner:
             "image_path": image_path,
         }
 
-    def run(self, *, teacher_backbone: nn.Module, step: int) -> dict[str, dict[str, Any]]:
+    def run(self, *, backbone: nn.Module, step: int) -> dict[str, dict[str, Any]]:
         self._ensure_data()
-        crop_size = tuple(int(v) for v in teacher_backbone.global_crops_size)
+        crop_size = tuple(int(v) for v in backbone.global_crops_size)
         results: dict[str, dict[str, Any]] = {}
         for task_name in self.tasks:
             dataset = self._dataset_for(task_name, crop_size)
@@ -805,7 +805,7 @@ class TaskEvalRunner:
                 results[task_name] = self._run_single_task(
                     task_name=task_name,
                     dataset=dataset,
-                    teacher_backbone=teacher_backbone,
+                    backbone=backbone,
                     step=step,
                 )
             except Exception:

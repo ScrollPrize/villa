@@ -628,7 +628,7 @@ class Trainer:
         rng_state = self._capture_rng_state()
         try:
             results = self._task_evaluator.run(
-                teacher_backbone=self.method.evaluation_backbone(),
+                backbone=self.method.evaluation_backbone(),
                 step=step,
             )
         finally:

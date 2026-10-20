@@ -12,7 +12,8 @@ from dinovol_2.dataset.volume_reader import open_volume
 
 from dinovol_2.dataset.cuda_pipeline import normalize_batch
 from dinovol_2.loss.ibot_patch_loss import iBOTPatchLoss
-from dinovol_2.model.model import DINOHead, DinoVitStudentTeacher
+from dinovol_2.model import build_backbone
+from dinovol_2.model.model import DINOHead
 from dinovol_2.ops.point_embeddings import sample_grid_points, sample_selected_grid_points
 
 
@@ -51,7 +52,7 @@ def prepare(checkpoint, volume, start):
                                      config["dataset"].get("normalization_scheme", "robust")))
     array.close()
 
-    backbone = DinoVitStudentTeacher._build_backbone({**config["model"], "grad_checkpointing": False})
+    backbone = build_backbone({**config["model"], "grad_checkpointing": False})
     backbone.load_state_dict({k.removeprefix("backbone."): v for k, v in state.items() if k.startswith("backbone.")})
     backbone = backbone.cuda().eval()
     head = DINOHead(
