@@ -7,6 +7,8 @@ import torch
 from torch._functorch import config as functorch_config
 
 from dinovol_2.pretrain import DinoIBOTPretrainer
+from dinovol_2.eval.task_eval import TaskEvalRunner
+from dinovol_2.ops.precision import resolve_amp_dtype
 
 
 class CompilationTests(unittest.TestCase):
@@ -97,12 +99,32 @@ class CompilationTests(unittest.TestCase):
         torch.testing.assert_close(actual, expected)
 
     def test_compiled_amp_backward_matches_eager(self):
-        config = self.config({"enabled": True, "backend": "aot_eager", "fullgraph": True})
+        # Retain explicit FP16 coverage after switching the default to BF16.
+        self._check_amp_backward("float16" if torch.cuda.is_available() else "bfloat16")
+
+    def test_compiled_default_bf16_backward_matches_eager(self):
+        self._check_amp_backward()
+
+    def _check_amp_backward(self, amp_dtype=None):
+        backend = "inductor" if amp_dtype is None and torch.cuda.is_available() else "aot_eager"
+        config = self.config({"enabled": True, "backend": backend, "fullgraph": True})
         # CPU oneDNN lacks half-precision convolution backward on some platforms.
         config.update(use_amp=True, koleo_loss_weight=0., device="cuda" if torch.cuda.is_available() else "cpu")
+        if amp_dtype is not None:
+            config["amp_dtype"] = amp_dtype
         compiled = DinoIBOTPretrainer(config)
         eager = DinoIBOTPretrainer({**config, "compile": False})
         eager.model_module.load_state_dict(compiled.model_module.state_dict())
+        expected_dtype = resolve_amp_dtype(amp_dtype or "bfloat16")
+        self.assertEqual(compiled.amp_dtype, expected_dtype)
+        self.assertEqual(compiled.scaler.is_enabled(), expected_dtype == torch.float16 and compiled.device.type == "cuda")
+        if amp_dtype is None:
+            self.assertEqual(compiled.config["amp_dtype"], "bfloat16")
+        observed_dtypes = []
+        handle = eager.model_module.student.dino_head.mlp[0].register_forward_hook(
+            lambda module, inputs, output: observed_dtypes.append(output.dtype)
+        )
+        self.addCleanup(handle.remove)
         # This toy head overflows even on the original eager path. Let the
         # scaler back off, then compare finite gradients and an actual update.
         for trainer in (compiled, eager):
@@ -123,7 +145,37 @@ class CompilationTests(unittest.TestCase):
         torch.testing.assert_close(actual["loss"], expected["loss"], rtol=0.01, atol=0.01)
         self.assertTrue(torch.isfinite(eager_grad).all())
         self.assertTrue(torch.isfinite(compiled_grad).all())
+        self.assertTrue(observed_dtypes)
+        self.assertEqual(set(observed_dtypes), {expected_dtype})
         self.assertGreater(torch.nn.functional.cosine_similarity(eager_grad, compiled_grad, dim=0).item(), 0.99)
+
+    def test_amp_dtype_configuration_and_checkpoint_resume(self):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        config = {**self.config(), "device": device, "use_amp": True}
+        bf16 = DinoIBOTPretrainer(config)
+        fp16 = DinoIBOTPretrainer({**config, "amp_dtype": "fp16"})
+        self.assertEqual(bf16.amp_dtype, torch.bfloat16)
+        self.assertFalse(bf16.scaler.is_enabled())
+        self.assertEqual(fp16.amp_dtype, torch.float16)
+        self.assertEqual(fp16.scaler.is_enabled(), device == "cuda")
+        # Resume in either direction: BF16 ignores an FP16 scaler state, while
+        # FP16 starts its own scaler when the saved BF16 state is absent.
+        self.assertEqual(bf16.load_checkpoint(fp16.save_checkpoint(0)), 0)
+        self.assertFalse(bf16.scaler.is_enabled())
+        self.assertEqual(fp16.load_checkpoint(bf16.save_checkpoint(1)), 1)
+        self.assertEqual(fp16.scaler.is_enabled(), device == "cuda")
+        runner = TaskEvalRunner(bf16.config, output_dir=bf16.output_dir,
+                                device=bf16.device, use_amp=True)
+        self.assertEqual(runner.amp_dtype, bf16.amp_dtype)
+        preview = runner._probability_preview(torch.rand(5, 7).bfloat16())
+        self.assertEqual(preview.shape, (5, 7, 3))
+        for name in ("bf16", "bfloat16", "BF16"):
+            self.assertEqual(resolve_amp_dtype(name), torch.bfloat16)
+        for name in ("fp16", "float16"):
+            self.assertEqual(resolve_amp_dtype(name), torch.float16)
+        for value in ("float32", "typo", None, 16):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                resolve_amp_dtype(value)
 
     def test_compile_configuration_and_disabled_default(self):
         trainer = DinoIBOTPretrainer(self.config())

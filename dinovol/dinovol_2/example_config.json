@@ -67,6 +67,7 @@
     "max_points_per_view": 64
   },
   "use_amp": true,
+  "amp_dtype": "bfloat16",
   "dataset": {
     "global_crop_size": [
       96,

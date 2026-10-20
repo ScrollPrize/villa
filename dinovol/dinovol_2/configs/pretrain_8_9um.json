@@ -518,6 +518,7 @@
   "koleo_distributed": true,
   "koleo_loss_group_size": 24,
   "use_amp": true,
+  "amp_dtype": "bfloat16",
   "point_supervision": {
     "enabled": false
   }

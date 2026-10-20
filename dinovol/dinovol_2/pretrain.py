@@ -38,6 +38,7 @@ from dinovol_2.loss import (
 )
 from dinovol_2.model.model import DinoVitStudentTeacher, _materialize_backbone_config, _upgrade_weight_norm_state_dict_keys
 from dinovol_2.ops.point_embeddings import gather_variable_points, sample_normalized_patch_embeddings
+from dinovol_2.ops.precision import resolve_amp_dtype
 
 
 def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, float]:
@@ -165,6 +166,8 @@ class DinoIBOTPretrainer:
             # Autotune convolution algorithms per input shape (crop shapes are fixed).
             torch.backends.cudnn.benchmark = True
         self.use_amp = bool(self.config.get("use_amp", self.device.type == "cuda"))
+        self.amp_dtype = resolve_amp_dtype(self.config.get("amp_dtype", "bfloat16"))
+        self.config["amp_dtype"] = str(self.amp_dtype).removeprefix("torch.")
         self.fused_optimizer = bool(self.config.get("fused_optimizer", False)) and self.device.type == "cuda"
         self.max_iterations = int(self.config.get("max_iterations", self.config.get("num_iterations", 1000000)))
         self.total_steps = self.max_iterations
@@ -244,7 +247,9 @@ class DinoIBOTPretrainer:
                     [f"student.region_head.{k}" for k, _ in self.model.student["region_head"].named_parameters()],
                 )
             self.model = DDP(self.model, **ddp_kwargs)
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp and self.device.type == "cuda")
+        self.scaler = torch.amp.GradScaler(
+            "cuda", enabled=self.use_amp and self.device.type == "cuda" and self.amp_dtype == torch.float16
+        )
 
         dino_out_dim = int(self.model_config.get("dino_out_dim", 131072))
         ibot_out_dim = int(self.model_config.get("ibot_out_dim", dino_out_dim))
@@ -1266,7 +1271,7 @@ class DinoIBOTPretrainer:
         n_masked = int(batch["n_masked_patches"].item())
 
         self.model.eval()
-        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+        with torch.no_grad(), torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
             model_outputs = self._forward_model(
                 global_crops=global_crops,
                 local_crops=local_crops if n_local_views else None,
@@ -1698,7 +1703,7 @@ class DinoIBOTPretrainer:
             n_masked = int(mask_indices.numel())
 
         fused_ibot = self.ibot_fused_last_layer and self.do_ibot and self.centering == "sinkhorn_knopp"
-        with torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+        with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
             model_outputs = self._forward_model(
                 global_crops=global_crops,
                 local_crops=local_crops if n_local_views else None,
@@ -2163,7 +2168,7 @@ class DinoIBOTPretrainer:
         # the dense point head, of its object embedding and ink embedding at every voxel
         # of that slice (colors are comparable only within one panel).
         dense_panels = self.model_module.dense_enabled
-        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+        with torch.no_grad(), torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
             global_crops = monitor_batch["collated_global_crops"].to(self.device, non_blocking=True)
             student_outputs = self.model(
                 student_input=global_crops,
@@ -2233,7 +2238,7 @@ class DinoIBOTPretrainer:
         n_local_views = int(batch["n_local_views"])
         n_masked = int(batch["n_masked_patches"].item())
 
-        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=self.use_amp):
+        with torch.no_grad(), torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
             model_outputs = self._forward_model(
                 global_crops=global_crops,
                 local_crops=local_crops if n_local_views else None,

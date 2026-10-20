@@ -47,6 +47,15 @@ and point supervision are disabled.
 The FFN uses `mlp_ratio: 7.2` (3,456 / 480); its packed input projection produces
 two 3,456-wide branches before gating.
 
+When `use_amp` is enabled, autocast defaults to BF16 (`"amp_dtype": "bfloat16"`).
+Training, monitoring, validation, and task evaluation use the same setting.
+Parameters remain FP32, and BF16 runs disable gradient scaling. Set the top-level
+`"amp_dtype": "float16"` to use FP16 autocast with CUDA gradient scaling, or
+`"use_amp": false` to disable autocast. The aliases `bf16` and `fp16` are accepted.
+Resuming uses the current config's precision setting; old configs without
+`amp_dtype` now select BF16. Saved FP16 scaler state is ignored when resuming in
+BF16. The FP16 performance measurements below predate this default change.
+
 Compilation is enabled for this recipe with the top-level setting:
 
 ```json

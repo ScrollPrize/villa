@@ -19,6 +19,7 @@
   "save_every_n": 1000,
   "batch_size": 1,
   "use_amp": true,
+  "amp_dtype": "bfloat16",
   "model": {
     "input_channels": 1,
     "global_crops_size": [

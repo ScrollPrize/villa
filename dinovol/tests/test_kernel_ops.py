@@ -122,7 +122,7 @@ class TiledIBOTTests(RNGIsolatedTestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             config = {
-                "device": "cuda", "use_amp": True, "output_dir": directory,
+                "device": "cuda", "use_amp": True, "amp_dtype": "float16", "output_dir": directory,
                 "max_iterations": 2, "warmup_steps": 0, "batch_size": 2,
                 "ibot_fused_last_layer": True, "ibot_masked_loss_chunk_size": 23,
                 "ibot_targets": "cross_view", "model": tiny_model_config(),
