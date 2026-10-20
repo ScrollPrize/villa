@@ -71,6 +71,7 @@ class Server:
         forbidden = 0o007 if self.shared_group else 0o077
         require(not (stat.S_IMODE(info.st_mode) & forbidden), "socket directory permissions are too broad")
         require(not self.shared_group or bool(info.st_mode & stat.S_ISVTX), "shared socket directory requires sticky bit (1770)")
+        socket_gid = info.st_gid
         lock_path = str(self.path) + ".lock"
         self.lock = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
         lock_info = os.fstat(self.lock)
@@ -112,6 +113,8 @@ class Server:
         self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.listener.bind(str(self.path))
         self.bound = True
+        if self.shared_group:
+            os.chown(self.path, -1, socket_gid)
         self.path.chmod(0o660 if self.shared_group else 0o600)
         self.listener.listen()
         self.listener.setblocking(False)

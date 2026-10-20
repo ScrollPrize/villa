@@ -335,7 +335,12 @@ class ExclusiveTask:
                         break
                     except (OSError, ProtocolError) as error:
                         self.client.close()
-                        if isinstance(error, ProtocolError) and error.code not in ("stale_epoch", "unavailable", "terminal"):
+                        if isinstance(error, ProtocolError) and error.code == "terminal":
+                            # Authenticated re-registration after a lost finish
+                            # reply confirms the journal already retired us.
+                            # Workers have been joined before entering this loop.
+                            break
+                        if isinstance(error, ProtocolError) and error.code not in ("stale_epoch", "unavailable"):
                             raise
                         if time.monotonic() >= deadline:
                             raise RuntimeError("workers stopped but manager release unconfirmed; reservation retained") from error

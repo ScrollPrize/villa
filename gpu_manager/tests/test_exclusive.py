@@ -142,6 +142,31 @@ def test_uncertain_applied_response_never_executes_and_releases_after_cleanup(tm
     assert task["terminal"] and task["granted"] == empty()
 
 
+def test_lost_finish_reply_reconciles_terminal_registration(tmp_path):
+    e = engine()
+    base = memory_client(e)
+    registrations = []
+
+    class LostFinish(base):
+        def register(self, *args, **kwargs):
+            registrations.append(self.task_id)
+            return super().register(*args, **kwargs)
+
+        def finish(self, *args, **kwargs):
+            super().finish(*args, **kwargs)
+            self.close()
+            raise ConnectionError("lost journaled finish reply")
+
+    marker = tmp_path / "finished"
+    assert run_exclusive(marker_command(marker), socket="unused", gpu_uuids=["GPU-a"],
+                         client_factory=LostFinish, poll_interval=.001,
+                         cleanup_timeout=.2) == 0
+    task, = e.tasks.values()
+    assert marker.exists()
+    assert task["terminal"] and task["granted"] == empty() and task["held"] == empty()
+    assert len(registrations) == 2  # one terminal reconciliation, not a retry loop
+
+
 def test_nonpausable_blocker_does_not_get_evicted(tmp_path):
     e = engine()
     from test_scheduling import rigid

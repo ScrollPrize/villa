@@ -129,6 +129,30 @@ def test_waiting_exclusive_prevents_new_rigid_blockers():
     assert state(e, x)["granted"] == empty()
 
 
+@pytest.mark.parametrize("blocked_by", ["ordinary", "capacity"])
+def test_every_pending_exclusive_blocks_new_rigid_admission(blocked_by):
+    e = engine()
+    if blocked_by == "ordinary":
+        a = register(e, priority=20, max_gpus=1, max_cpu_cores=4)
+        report(e, a, "applied")
+        x = register(e, exclusive=True, priority=10)
+    else:
+        x = register(e, exclusive=True, priority=10,
+                     min_vram_bytes_per_gpu=200, max_vram_bytes_per_gpu=200)
+    b = rigid(e, priority=0, max_gpus=1, max_cpu_cores=4)
+    assert state(e, b)["granted"] == empty()
+    assert state(e, b)["reason"] == "waiting_for_higher_priority_exclusive"
+    # Pausable work may still use spare capacity while the exclusive waits.
+    c = register(e, priority=-1, max_gpus=1, max_cpu_cores=4)
+    settle(e, [a, c] if blocked_by == "ordinary" else [c])
+    assert state(e, c)["granted"] != empty()
+    if blocked_by == "ordinary":
+        finish(e, a)
+        assert state(e, c)["phase"] == "release"
+        report(e, c, "released", empty())
+        assert state(e, x)["phase"] == "initialize"
+
+
 @pytest.mark.parametrize("pausable,adaptable", [(False, True), (1, False), (False, 0)])
 def test_invalid_capability_flags(pausable, adaptable):
     e = engine()

@@ -26,6 +26,48 @@ from villa_gpu_manager.processes import process_identity, process_state
 from test_manager import POOL, engine, call, register, report, request, settle, task_call
 
 
+@pytest.mark.parametrize("restart", [False, True])
+def test_shared_socket_uses_directory_group(tmp_path, monkeypatch, restart):
+    path = tmp_path / "shared" / "socket"
+    path.parent.mkdir(mode=0o1770)
+    path.parent.chmod(0o1770)
+    if restart:
+        with Server(path, POOL, shared_group=True):
+            pass  # Existing journal must not replace the remembered directory GID.
+    original = Path.lstat
+    shared_gid = os.getgid() + 1
+
+    def directory_stat(p, *args, **kwargs):
+        info = original(p, *args, **kwargs)
+        if p == path.parent:
+            values = list(info)
+            values[5] = shared_gid
+            return os.stat_result(values)
+        return info
+
+    ownership = []
+    monkeypatch.setattr(Path, "lstat", directory_stat)
+    monkeypatch.setattr(os, "chown", lambda p, uid, gid: ownership.append((p, uid, gid)))
+    with Server(path, POOL, shared_group=True):
+        assert ownership == [(path, -1, shared_gid)]
+        assert path.stat().st_mode & 0o777 == 0o660
+
+
+def test_shared_socket_group_failure_aborts_startup(tmp_path, monkeypatch):
+    path = tmp_path / "shared" / "socket"
+    path.parent.mkdir(mode=0o1770)
+    path.parent.chmod(0o1770)
+
+    def denied(*args):
+        raise PermissionError("cannot assign shared group")
+
+    monkeypatch.setattr(os, "chown", denied)
+    with pytest.raises(PermissionError, match="shared group"):
+        with Server(path, POOL, shared_group=True):
+            pytest.fail("must not start with wrong socket group")
+    assert not path.exists()
+
+
 @contextmanager
 def running_server(path, **options):
     options["engine_options"] = {"protected_processes": lambda: [], **options.get("engine_options", {})}

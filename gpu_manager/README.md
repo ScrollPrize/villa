@@ -110,6 +110,9 @@ Explicit paths override selection. Its directory must be private and
 owned by the server user. For explicit cross-user cooperation, preconfigure a
 shared group directory with sticky mode `1770` and use `--shared-group --allow-uid UID`; granting control
 over other clients additionally requires `--controller-uid UID`. No sudo is used.
+The socket inherits the directory's group explicitly, even without setgid on
+the directory. The server user must be permitted to assign that group; startup
+fails if it cannot do so. Journal and lock files remain private to the owner.
 
 `request.json` contains the complete replacement request:
 

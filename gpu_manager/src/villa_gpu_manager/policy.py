@@ -122,10 +122,12 @@ def targets(tasks, inventory, override=None, reasons=None):
     pending_exclusive = False
     for key in active:
         if tasks[key]["request"]["exclusive"]:
+            # Any pending exclusive blocks new lower-priority rigid work,
+            # regardless of why this exclusive cannot yet be admitted.
+            pending_exclusive = True
             blockers = sorted(pinned - {key})
             if blockers:
                 reasons[key] = "blocked_by_nonpausable_task:" + ",".join(blockers)
-                pending_exclusive = True
                 continue
             if admitted:
                 reasons[key] = "blocked_by_higher_priority_task:" + ",".join(admitted)
