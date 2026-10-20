@@ -632,6 +632,23 @@ TEST_CASE("Delta3D cache mode permits sources without persistent caching")
           vc::render::PersistentCacheLayout::Legacy);
 }
 
+TEST_CASE("ChunkCacheService can initialize bounded physical worker pools")
+{
+    auto options = serviceOptions(1024 * 1024, 1);
+    options.fetchConcurrency.workerCapacity = 1;
+    options.probeWorkerCapacity = 1;
+    options.decodeWorkerCapacity = 1;
+    auto service = std::make_shared<ChunkCacheService>(options);
+    CHECK(service->fetchConcurrency().workerCapacity == 1);
+    CHECK(service->probeWorkerCapacity() == 1);
+    CHECK(service->decodeWorkerCapacity() == 1);
+    CHECK(service->decodeConcurrency() == 1);
+    auto fetcher = std::make_shared<CountingFetcher>();
+    CHECK(makeServiceCache(service, "bounded-workers", fetcher));
+    options.decodeWorkerCapacity = 0;
+    CHECK_THROWS_AS(ChunkCacheService(options), std::invalid_argument);
+}
+
 TEST_CASE("ChunkCacheService carries adaptive download state into its shared scheduler")
 {
     const ChunkCacheService::AdaptiveDownloadState initial{
@@ -1468,9 +1485,10 @@ TEST_CASE("ChunkCache: blocking read survives a sub-chunk decoded budget")
     REQUIRE(result.bytes);
     CHECK(result.bytes->size() == 64);
     CHECK(fetcher->fetchCalls.load() == 1);
-    // Releasing the pin re-enforces the budget, so the overshoot the pin
-    // allowed does not persist.
-    CHECK(service->decodedByteBudget()->stats().decodedBytes <= 16);
+    // The parked-reader pin is gone, but the returned byte lease deliberately
+    // keeps the entry resident until the caller releases it. Existing lease
+    // eviction coverage verifies that later pressure reclaims it.
+    CHECK(service->decodedByteBudget()->stats().decodedBytes == 64);
 }
 
 TEST_CASE("ChunkCache: blocking read survives zero metadata entry capacity")
@@ -1501,9 +1519,10 @@ TEST_CASE("ChunkCache: blocking read survives zero metadata entry capacity")
     REQUIRE(result.bytes);
     CHECK(result.bytes->size() == 64);
     CHECK(fetcher->fetchCalls.load() == 1);
-    // The reader's exit re-enforces the entry-count capacity, so the entry
-    // its registration protected is evicted once the reader has the result.
-    CHECK(cache->stats().decodedBytes == 0);
+    // Reader registration is released, while the returned byte lease keeps
+    // the cache entry resident despite the zero metadata capacity.
+    CHECK(cache->stats().blockingReaders == 0);
+    CHECK(cache->stats().decodedBytes == 64);
 }
 
 TEST_CASE("ChunkCache: reader protection covers a successor it did not create")
@@ -1540,7 +1559,8 @@ TEST_CASE("ChunkCache: reader protection covers a successor it did not create")
     REQUIRE(result.bytes);
     CHECK(result.bytes->size() == 64);
     CHECK(fetcher->calls({0, 0, 0, 0}) == 2);
-    CHECK(cache->stats().decodedBytes == 0);
+    CHECK(cache->stats().blockingReaders == 0);
+    CHECK(cache->stats().decodedBytes == 64);
 }
 
 TEST_CASE("ChunkCache: a reader exiting first cannot strip another's protection")
@@ -1599,8 +1619,9 @@ TEST_CASE("ChunkCache: a reader exiting first cannot strip another's protection"
     REQUIRE(resultA.bytes);
     REQUIRE(resultB.bytes);
     CHECK(fetcher->calls({0, 0, 0, 0}) == 2);
-    // Both readers exited; the last exit re-enforced the budget.
-    CHECK(cache->stats().decodedBytes == 0);
+    // Both parked-reader registrations exited. Their returned leases still
+    // keep the single shared cache entry resident.
+    CHECK(cache->stats().decodedBytes == 64);
     CHECK(cache->stats().blockingReaders == 0);
 }
 

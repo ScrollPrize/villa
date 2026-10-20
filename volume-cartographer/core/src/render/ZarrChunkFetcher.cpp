@@ -1147,25 +1147,23 @@ OpenedRemoteChunkedZarr openRemoteZarrPyramid(
 {
     auto spec = vc::parseRemoteVolumeSpec(url);
     auto auth = std::move(options.auth);
-    if (spec.useAwsSigv4 && auth.empty() && options.discoverAwsCredentials) {
-        auth = vc::loadAwsCredentials();
-        if (auth.region.empty())
-            auth.region = spec.awsRegion;
-        if (auth.access_key.empty() || auth.secret_key.empty())
-            auth = {};
-    } else if (spec.useAwsSigv4 && !auth.empty() && auth.region.empty()) {
-        auth.region = spec.awsRegion;
-    }
+    vc::DeferredAwsAuth deferredAuth(
+        auth,
+        spec.useAwsSigv4 && options.discoverAwsCredentials,
+        spec.awsRegion);
 
     OpenedChunkedZarr opened;
-    if (!spec.useAwsSigv4 || auth.empty()) {
+    if (!spec.useAwsSigv4) {
         opened = openHttpZarrPyramid(spec.portableLocator, auth);
     } else {
         try {
             opened = openHttpZarrPyramid(spec.portableLocator, {});
             auth = {};
         } catch (const std::exception& error) {
-            if (!isRemoteAuthError(error))
+            if (!isRemoteAuthError(error) || !deferredAuth.available())
+                throw;
+            auth = deferredAuth.resolve();
+            if (auth.empty())
                 throw;
             opened = openHttpZarrPyramid(spec.portableLocator, auth);
         }
@@ -1219,9 +1217,11 @@ std::unique_ptr<ChunkCache> createChunkCache(
     ChunkDtype dtype = ChunkDtype::UInt8;
     if (meta.dtype == utils::ZarrDtype::uint16) {
         dtype = ChunkDtype::UInt16;
+    } else if (meta.dtype == utils::ZarrDtype::float32) {
+        dtype = ChunkDtype::Float32;
     } else if (meta.dtype != utils::ZarrDtype::uint8) {
         throw std::runtime_error(
-            "streaming zarr cache currently supports uint8 and uint16 only");
+            "streaming zarr cache supports uint8, uint16 and float32 only");
     }
 
     std::vector<std::size_t> chunkShape = meta.chunks;
@@ -1255,9 +1255,11 @@ std::shared_ptr<ChunkCache> acquireProcessChunkCache(
     ChunkDtype dtype = ChunkDtype::UInt8;
     if (meta.dtype == utils::ZarrDtype::uint16) {
         dtype = ChunkDtype::UInt16;
+    } else if (meta.dtype == utils::ZarrDtype::float32) {
+        dtype = ChunkDtype::Float32;
     } else if (meta.dtype != utils::ZarrDtype::uint8) {
         throw std::runtime_error(
-            "streaming zarr cache currently supports uint8 and uint16 only");
+            "streaming zarr cache supports uint8, uint16 and float32 only");
     }
 
     std::vector<std::size_t> chunkShape = meta.chunks;

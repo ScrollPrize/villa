@@ -4,6 +4,8 @@
 #include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "utils/thread_pool.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
+#include "vc/core/render/PinnedChunkRegion.hpp"
+#include "vc/core/render/LocalChunkCache.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -13,6 +15,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <limits>
+#include <optional>
+#include <tuple>
 #include <stdexcept>
 #include <vector>
 
@@ -83,6 +88,7 @@ public:
 
     std::array<int, 2> queuedLookups{};
     std::array<int, 2> cachedLookups{};
+    int blockingLookups=0,prefetchCalls=0;
 
 private:
     vc::render::ChunkResult chunkResult(int level, int iz, int iy, int ix)
@@ -109,10 +115,11 @@ private:
 public:
     vc::render::ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override
     {
+        ++blockingLookups;
         return chunkResult(level, iz, iy, ix);
     }
 
-    void prefetchChunks(const std::vector<vc::render::ChunkKey>&, bool, int) override {}
+    void prefetchChunks(const std::vector<vc::render::ChunkKey>&, bool, int) override {++prefetchCalls;}
 
     ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback) override
     {
@@ -129,6 +136,93 @@ private:
     std::array<double, 3> level1Scale_;
 };
 
+class ProceduralChunkedArray final : public vc::render::IChunkedArray {
+public:
+    using MissingKey = std::tuple<int, int, int>;
+
+    explicit ProceduralChunkedArray(
+        std::array<int, 3> shape = {11, 13, 17},
+        std::array<int, 3> chunkShape = {3, 5, 7},
+        std::optional<MissingKey> missing = std::nullopt,
+        bool transformed = false)
+        : shape_(shape), chunkShape_(chunkShape), missing_(missing), transformed_(transformed)
+    {
+    }
+
+    int numLevels() const override { return 1; }
+    std::array<int, 3> shape(int) const override { return shape_; }
+    std::array<int, 3> chunkShape(int) const override { return chunkShape_; }
+    vc::render::ChunkDtype dtype() const override { return vc::render::ChunkDtype::UInt8; }
+    double fillValue() const override { return 19.0; }
+    LevelTransform levelTransform(int) const override
+    {
+        LevelTransform transform;
+        if (transformed_) {
+            transform.scaleFromLevel0 = {0.75, 0.5, 1.25};
+            transform.offsetFromLevel0 = {0.125, 0.25, 0.375};
+        }
+        return transform;
+    }
+    vc::render::ChunkResult tryGetChunk(int level, int iz, int iy, int ix) override
+    {
+        return chunkResult(level, iz, iy, ix);
+    }
+    vc::render::ChunkResult getChunkIfCached(int level, int iz, int iy, int ix) override
+    {
+        return chunkResult(level, iz, iy, ix);
+    }
+    vc::render::ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override
+    {
+        return chunkResult(level, iz, iy, ix);
+    }
+    void prefetchChunks(const std::vector<vc::render::ChunkKey>&, bool, int) override {}
+    ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback) override { return 0; }
+    void removeChunkReadyListener(ChunkReadyCallbackId) override {}
+
+private:
+    vc::render::ChunkResult chunkResult(int level, int cz, int cy, int cx) const
+    {
+        vc::render::ChunkResult result;
+        result.dtype = vc::render::ChunkDtype::UInt8;
+        result.shape = chunkShape_;
+        if (level != 0 || cz < 0 || cy < 0 || cx < 0 ||
+            cz * chunkShape_[0] >= shape_[0] ||
+            cy * chunkShape_[1] >= shape_[1] ||
+            cx * chunkShape_[2] >= shape_[2]) {
+            result.status = vc::render::ChunkStatus::Missing;
+            return result;
+        }
+        if (missing_ && *missing_ == MissingKey{cz, cy, cx}) {
+            result.status = vc::render::ChunkStatus::Missing;
+            return result;
+        }
+        result.status = vc::render::ChunkStatus::Data;
+        auto bytes = std::make_shared<std::vector<std::byte>>(
+            std::size_t(chunkShape_[0]) * std::size_t(chunkShape_[1]) *
+                std::size_t(chunkShape_[2]));
+        for (int z = 0; z < chunkShape_[0]; ++z) {
+            for (int y = 0; y < chunkShape_[1]; ++y) {
+                for (int x = 0; x < chunkShape_[2]; ++x) {
+                    const int gz = cz * chunkShape_[0] + z;
+                    const int gy = cy * chunkShape_[1] + y;
+                    const int gx = cx * chunkShape_[2] + x;
+                    const auto offset = (std::size_t(z) * chunkShape_[1] + y) *
+                        chunkShape_[2] + x;
+                    (*bytes)[offset] = std::byte(
+                        static_cast<uint8_t>((gz * 37 + gy * 11 + gx * 3) & 255));
+                }
+            }
+        }
+        result.bytes = std::move(bytes);
+        return result;
+    }
+
+    std::array<int, 3> shape_;
+    std::array<int, 3> chunkShape_;
+    std::optional<MissingKey> missing_;
+    bool transformed_ = false;
+};
+
 cv::Mat_<cv::Vec3f> singleCoord(const cv::Vec3f& coord)
 {
     cv::Mat_<cv::Vec3f> coords(1, 1);
@@ -136,7 +230,60 @@ cv::Mat_<cv::Vec3f> singleCoord(const cv::Vec3f& coord)
     return coords;
 }
 
+std::vector<vc::render::ChunkKey> sortedKeys(std::vector<vc::render::ChunkKey> keys)
+{
+    std::sort(keys.begin(), keys.end(), [](const auto& a, const auto& b) {
+        return std::tie(a.level, a.iz, a.iy, a.ix) <
+               std::tie(b.level, b.iz, b.iy, b.ix);
+    });
+    return keys;
+}
+
 } // namespace
+
+TEST_CASE("Pinned sampling owns payloads and never queues an unexpected dependency")
+{
+    using namespace vc::render;
+    auto array=std::make_shared<PyramidChunkedArray>(ChunkStatus::Data,17,ChunkStatus::Data,9);
+    PinnedChunkRegion region;
+    region.pin(array,{{0,0,0,0}});
+    region.seal();
+    CHECK(region.bytes()==64);
+    const auto* expected=&region.get(array.get(),0,0,0,0);
+    CHECK(activePinnedChunkRegion()==nullptr);
+    {
+        ScopedPinnedChunkRegion scope(&region);
+        LocalChunkCache local(*array);
+        int requested=0,errors=0;
+        CHECK(&local.get({0,0,0,0},requested,errors)==expected);
+        CHECK(requested==0);
+        CHECK(array->queuedLookups[0]==0);
+        CHECK(array->cachedLookups[0]==0);
+        CHECK_THROWS_AS(local.get({0,0,0,1},requested,errors),PinnedRegionMiss);
+        CHECK_THROWS_AS(region.pin(array,{{0,0,0,0}}),std::logic_error);
+        { ScopedPinnedChunkRegion inner(nullptr); CHECK(activePinnedChunkRegion()==nullptr); }
+        CHECK(activePinnedChunkRegion()==&region);
+    }
+    CHECK(activePinnedChunkRegion()==nullptr);
+    CHECK(std::to_integer<int>((*expected->bytes)[0])==17);
+    CHECK_THROWS_AS(region.pin(array,{{0,0,0,0}}),std::logic_error);
+    {
+        ScopedPinnedChunkRegion scope(&region);
+        int visits=0;
+        const auto visitor=+[](void* context,size_t,const cv::Vec3f&,bool valid,
+            std::span<const std::array<uint8_t,8>> corners) {
+            ++*static_cast<int*>(context);
+            CHECK(valid);
+            REQUIRE(corners.size()==1);
+            for(auto value:corners[0]) CHECK(value==17);
+        };
+        (void)ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
+            {array.get()},0,{{1.25f,1.5f,1.75f}},&visits,visitor,1,true);
+        CHECK(visits==1);
+        CHECK(array->blockingLookups==1); // preparation only
+        CHECK(array->prefetchCalls==1); // preparation only
+    }
+}
 
 TEST_CASE("ChunkedPlaneSampler selects one analytic source level from camera scale")
 {
@@ -317,6 +464,104 @@ TEST_CASE("ChunkedPlaneSampler base and overlay buffers fall back independently"
     CHECK(overlayOut(0, 0) == 99);
 }
 
+TEST_CASE("requested-level locality path matches scalar reference on transformed non-power-of-two chunks")
+{
+    ProceduralChunkedArray array({11, 13, 17}, {3, 5, 7}, std::nullopt, true);
+    cv::Mat_<cv::Vec3f> coords(8, 16);
+    const std::array<cv::Vec3f, 24> points{{
+        {1.20f, 1.30f, 1.40f}, {1.80f, 1.30f, 1.40f},
+        {2.20f, 1.30f, 1.40f}, {2.80f, 1.30f, 1.40f},
+        {6.20f, 4.20f, 2.20f}, {6.80f, 4.80f, 2.80f},
+        {7.20f, 5.20f, 3.20f}, {7.80f, 5.80f, 3.80f},
+        {15.75f, 11.25f, 9.50f}, {16.00f, 12.00f, 10.00f},
+        {-0.25f, 2.0f, 2.0f}, {17.25f, 2.0f, 2.0f},
+        {0.0f, 0.0f, 0.0f},
+        {std::numeric_limits<float>::quiet_NaN(), 2.0f, 2.0f},
+        {std::numeric_limits<float>::infinity(), 2.0f, 2.0f},
+        {3.10f, 9.90f, 5.90f}, {3.20f, 9.80f, 5.80f},
+        {3.30f, 9.70f, 5.70f}, {13.95f, 4.95f, 8.95f},
+        {14.05f, 5.05f, 9.05f}, {8.5f, 7.5f, 4.5f},
+        {8.6f, 7.6f, 4.6f}, {8.7f, 7.7f, 4.7f}, {8.8f, 7.8f, 4.8f}}};
+    uint32_t state = 0x6d2b79f5U;
+    const auto randomUnit = [&] {
+        state = state * 1664525U + 1013904223U;
+        return float(state >> 8U) / float(uint32_t{1} << 24U);
+    };
+    for (auto& point : coords) {
+        point = {randomUnit() * 21.0f - 2.0f,
+                 randomUnit() * 17.0f - 2.0f,
+                 randomUnit() * 15.0f - 2.0f};
+    }
+    std::copy(points.begin(), points.end(), coords.begin());
+    cv::Mat_<uint8_t> initialCoverage(coords.rows, coords.cols, uint8_t{0});
+    initialCoverage(0, 3) = 1;
+
+    for (const vc::Sampling sampling : {vc::Sampling::Nearest, vc::Sampling::Trilinear}) {
+        vc::render::ChunkedPlaneSampler::Options reference(sampling, 4);
+        reference.parallelThreads = 1;
+        reference.chunkLocalityFastPath = false;
+        reference.collectLocalityStats = true;
+        auto optimized = reference;
+        optimized.chunkLocalityFastPath = true;
+
+        CHECK(sortedKeys(vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
+                  array, 0, coords, initialCoverage, reference)) ==
+              sortedKeys(vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
+                  array, 0, coords, initialCoverage, optimized)));
+
+        cv::Mat_<uint8_t> referenceOut(coords.rows, coords.cols, uint8_t{73});
+        cv::Mat_<uint8_t> optimizedOut = referenceOut.clone();
+        cv::Mat_<uint8_t> referenceCoverage = initialCoverage.clone();
+        cv::Mat_<uint8_t> optimizedCoverage = initialCoverage.clone();
+        const auto referenceStats =
+            vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
+                array, 0, coords, referenceOut, referenceCoverage, reference);
+        const auto optimizedStats =
+            vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
+                array, 0, coords, optimizedOut, optimizedCoverage, optimized);
+        CHECK(cv::countNonZero(referenceOut != optimizedOut) == 0);
+        CHECK(cv::countNonZero(referenceCoverage != optimizedCoverage) == 0);
+        CHECK(referenceStats.requestedChunks == optimizedStats.requestedChunks);
+        CHECK(referenceStats.missingChunks == optimizedStats.missingChunks);
+        CHECK(referenceStats.errorChunks == optimizedStats.errorChunks);
+        if (sampling == vc::Sampling::Trilinear) {
+            CHECK(optimizedStats.sampleDirectGatherPoints > 0);
+            CHECK(optimizedStats.samplePinnedMapLookups < referenceStats.samplePinnedMapLookups);
+            CHECK(optimizedStats.dependencyKeyLookups < referenceStats.dependencyKeyLookups);
+        }
+    }
+}
+
+TEST_CASE("requested-level locality path preserves missing-chunk scalar policy")
+{
+    ProceduralChunkedArray array({11, 13, 17}, {3, 5, 7},
+                                 ProceduralChunkedArray::MissingKey{1, 1, 1});
+    cv::Mat_<cv::Vec3f> coords(1, 3);
+    coords(0, 0) = {7.2f, 5.2f, 3.2f};
+    coords(0, 1) = {7.8f, 5.8f, 3.8f};
+    coords(0, 2) = {1.2f, 1.2f, 1.2f};
+    vc::render::ChunkedPlaneSampler::Options reference(vc::Sampling::Trilinear, 2);
+    reference.parallelThreads = 1;
+    reference.chunkLocalityFastPath = false;
+    auto optimized = reference;
+    optimized.chunkLocalityFastPath = true;
+    cv::Mat_<uint8_t> referenceOut(1, 3, uint8_t{99});
+    cv::Mat_<uint8_t> optimizedOut = referenceOut.clone();
+    cv::Mat_<uint8_t> referenceCoverage(1, 3, uint8_t{0});
+    cv::Mat_<uint8_t> optimizedCoverage = referenceCoverage.clone();
+    const auto referenceStats =
+        vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
+            array, 0, coords, referenceOut, referenceCoverage, reference);
+    const auto optimizedStats =
+        vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
+            array, 0, coords, optimizedOut, optimizedCoverage, optimized);
+    CHECK(cv::countNonZero(referenceOut != optimizedOut) == 0);
+    CHECK(cv::countNonZero(referenceCoverage != optimizedCoverage) == 0);
+    CHECK(referenceStats.missingChunks == optimizedStats.missingChunks);
+    CHECK(referenceOut(0, 0) == 0);
+    CHECK(referenceOut(0, 1) == 0);
+}
+
 TEST_CASE("ChunkedPlaneSampler blocking requested-level does not fall back to coarse level")
 {
     PyramidChunkedArray array(vc::render::ChunkStatus::Missing, 0,
@@ -352,6 +597,42 @@ TEST_CASE("ChunkedPlaneSampler blocking requested-level keeps requested-level da
     CHECK(stats.requestedLevelOnly);
     CHECK(stats.fallbackLevels == 0);
     CHECK(stats.missingChunks == 0);
+}
+
+TEST_CASE("ChunkedPlaneSampler coordinate worker limit preserves blocking samples")
+{
+    PyramidChunkedArray array(vc::render::ChunkStatus::Data, 7,
+                              vc::render::ChunkStatus::Data, 42);
+    cv::Mat_<cv::Vec3f> coords(128, 128, cv::Vec3f{1.25f, 1.25f, 1.25f});
+    cv::Mat_<uint8_t> serialOut(128, 128, uint8_t(0));
+    cv::Mat_<uint8_t> serialCoverage(128, 128, uint8_t(0));
+    cv::Mat_<uint8_t> boundedOut(128, 128, uint8_t(0));
+    cv::Mat_<uint8_t> boundedCoverage(128, 128, uint8_t(0));
+
+    vc::render::ChunkedPlaneSampler::Options serialOptions(
+        vc::Sampling::Trilinear, 32);
+    serialOptions.parallelThreads = 1;
+    const auto serialStats =
+        vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
+            array, 0, coords, serialOut, serialCoverage, serialOptions);
+
+    vc::render::ChunkedPlaneSampler::Options boundedOptions(
+        vc::Sampling::Trilinear, 32);
+    boundedOptions.parallelThreads = 3;
+    const auto boundedStats =
+        vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
+            array, 0, coords, boundedOut, boundedCoverage, boundedOptions);
+
+    CHECK(serialStats.sampleWorkers == 1);
+    CHECK(boundedStats.sampleWorkers >= 1);
+    CHECK(boundedStats.sampleWorkers <= 3);
+    CHECK(serialStats.requestedLevelOnly);
+    CHECK(boundedStats.requestedLevelOnly);
+    CHECK(serialStats.dependencySeconds >= 0.0);
+    CHECK(serialStats.chunkResolveSeconds >= 0.0);
+    CHECK(serialStats.sampleSeconds > 0.0);
+    CHECK(cv::countNonZero(serialOut != boundedOut) == 0);
+    CHECK(cv::countNonZero(serialCoverage != boundedCoverage) == 0);
 }
 
 TEST_CASE("ChunkedPlaneSampler blocking requested-level rejects unresolved chunks")

@@ -799,6 +799,7 @@ vc_add_test(NAME test_surface_patch_index)
 vc_add_test(NAME test_tiff_merge)
 
 vc_add_test(NAME test_http_fetch_errors)
+vc_add_test(NAME test_global_cache_root)
 vc_add_test(NAME test_sftp_fetch LIBS doctest::doctest vc_core Qt6::Core)
 if(VC_BUILD_PYTHON)
     find_package(Python REQUIRED COMPONENTS Interpreter)
