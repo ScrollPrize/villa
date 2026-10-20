@@ -46,8 +46,8 @@ defaults and override repeated options. An explicit `--device` or `--devices`
 also removes the configured mutually exclusive device selector.
 
 `fiberlet_threads` is the native whole-volume worker budget and is always
-passed as `--threads`. Set it to the host-appropriate value (128 on the current
-large inference host). `fiberlet_params` contains additional native arguments.
+passed as `--threads`. Set it to the available CPU budget.
+`fiberlet_params` contains additional native arguments.
 A per-run `fiberlet run ... --threads N` or repeated option after `--` occurs
 last and therefore overrides the configured value.
 
@@ -311,7 +311,7 @@ PID reconciliation, and durable status machinery as inference. Its layout is:
   cache/fiberlets.anchors.zarr  # local resumable float cache; never uploaded
   artifacts/
     fiberlets.json              # bounded portable provenance
-    fiberlets.zarr/             # final combined anchors/prefix/routes dataset
+    fiberlets.zarr/             # final anchors/prefix/routes logical chunk tuples
 ```
 
 `fiberlet resume` revalidates both upstream manifests and their hashes, then
@@ -421,7 +421,7 @@ Run these commands in order:
 
    This copies `artifacts/` to
    `<upload_staging_s3>/inference/<run-uuid>/` (for example,
-   `s3://philodemos/hendrik/lasagna/inference/<run-uuid>/`) and writes or
+   `s3://my-staging-bucket/lasagna/inference/<run-uuid>/`) and writes or
    updates the corresponding files below `<atlas_dir>/data/models/lasagna/`
    and `<atlas_dir>/data/volumes/`. It does **not** publish to the public
    open-data bucket.
@@ -503,10 +503,38 @@ bucket and leaves `atlas_publication = not_started`.
 Fiberlets are registered as a derived `fiberlets` volume representation, not
 as a new model. The entry binds the already-published Fiber and normal Lasagna
 models/levels and their manifest hashes to the native dataset fingerprint.
-Atlas plans exactly one canonical copy and, for CC BY-NC volumes, one public
-copy under
+With a compatible Atlas adapter, publication plans a canonical copy and, for
+CC BY-NC volumes, a public copy under
 `<sample>/representations/fiberlets/<volume>-fiberlets-<identity>/`. No derive
 workflow is required because the staged combined Zarr is already final.
+
+**Atlas compatibility:** this manager writes format-2 combined Fiberlet
+datasets (`anchors/`, `prefix/`, `routes/`). Fiberlet publication requires an
+Atlas `fiberlet_bundle` adapter accepting that format. An adapter accepting
+only format-3 published datasets (`fiberlets/`) is not compatible. Atlas
+preflight runs before any upload; a format mismatch leaves staging untouched.
+Inference publication uses the separate `inference_bundle` adapter.
+
+## Validation
+
+```sh
+python -m pytest -q lasagna/tests/test_manager.py lasagna/tests/test_manager_open_data.py lasagna/tests/test_bootstrap_venv.py lasagna/tests/test_inference_provenance.py
+```
+
+To validate existing real artifacts without running inference or uploading,
+set `LAS_MANAGER_TEST_FIBER_RUN`, `LAS_MANAGER_TEST_NORMAL_RUN`, and
+`LAS_MANAGER_TEST_FIBERLET_RUN` to completed manager run directories. The Fiber
+and normal runs must share an output directory. Optionally set
+`LAS_MANAGER_TEST_SNAPSHOT` to the Fiber run's exact checkpoint to check import
+and model identity. Then run:
+
+```sh
+python -m pytest -q lasagna/tests/test_manager_real_runs.py
+```
+
+These tests read the source runs without changing them. Only checkpoint copies
+and small metadata files are written to the test's temporary directory; Zarr
+payloads are neither copied nor enumerated.
 
 ### Refinement direction: reuse generic Atlas ingestion
 

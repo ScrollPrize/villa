@@ -400,16 +400,20 @@ def test_upload_updates_independent_lifecycle_and_calls_ingester(
     }
 
 
-def test_atlas_preflight_failure_happens_before_staging(tmp_path: Path) -> None:
-    config, _run = _completed_run(tmp_path)
+@pytest.mark.parametrize("fiberlet", [False, True])
+def test_atlas_preflight_failure_happens_before_staging(tmp_path: Path, fiberlet: bool) -> None:
+    config, run = (_completed_fiberlet_run if fiberlet else _completed_run)(tmp_path)
     store = FakeStore()
+    before = (run / "metadata.json").read_bytes()
+    message = "unsupported Fiberlet format" if fiberlet else "unknown Atlas model"
 
     def reject(**_kwargs):
-        raise ValueError("unknown Atlas model")
+        raise ValueError(message)
 
-    with pytest.raises(ValueError, match="unknown Atlas model"):
+    with pytest.raises(ValueError, match=message):
         upload_inference(
-            config, "fiber-run", store=store, validator=reject,
+            config, run.name, store=store, validator=reject,
             ingester=lambda **_kwargs: pytest.fail("ingest called"),
         )
     assert store.events == []
+    assert (run / "metadata.json").read_bytes() == before

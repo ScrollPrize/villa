@@ -29,7 +29,10 @@ class BootstrapVenvTests(unittest.TestCase):
         with patch(
             "lasagna.scripts.bootstrap_venv.shutil.which",
             return_value="/usr/bin/uv",
-        ), patch("lasagna.scripts.bootstrap_venv.run") as mocked_run:
+        ), patch("lasagna.scripts.bootstrap_venv.run") as mocked_run, patch(
+            "lasagna.scripts.bootstrap_venv.volume_cartographer_build_environment",
+            return_value={"CC": "/usr/bin/gcc-13", "CXX": "/usr/bin/g++-13"},
+        ) as build_environment:
             self.assertEqual(main([
                 "--project", str(villa / "lasagna"),
                 "--venv", "/tmp/test-lasagna-bootstrap-venv",
@@ -42,6 +45,15 @@ class BootstrapVenvTests(unittest.TestCase):
             command[-2:] == ["-e", str(villa / "volume-cartographer")]
             for command in commands
         ))
+        native_calls = [
+            call for call in mocked_run.call_args_list
+            if call.args[0][-2:] == ["-e", str(villa / "volume-cartographer")]
+        ]
+        self.assertEqual(len(native_calls), 1)
+        self.assertEqual(native_calls[0].kwargs["environment"], build_environment.return_value)
+        for call in mocked_run.call_args_list:
+            if call not in native_calls:
+                self.assertNotIn("environment", call.kwargs)
 
     @patch("lasagna.scripts.bootstrap_venv.sys.platform", "linux")
     @patch.dict("lasagna.scripts.bootstrap_venv.os.environ", {}, clear=True)

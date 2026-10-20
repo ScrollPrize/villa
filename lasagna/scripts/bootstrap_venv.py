@@ -286,7 +286,6 @@ def main(argv: list[str] | None = None) -> int:
             f"torchvision=={build.torchvision}",
         ],
         dry_run=args.dry_run,
-        environment=volume_cartographer_build_environment(),
     )
     run(
         [
@@ -299,6 +298,7 @@ def main(argv: list[str] | None = None) -> int:
             str(volume_cartographer),
         ],
         dry_run=args.dry_run,
+        environment=volume_cartographer_build_environment(),
     )
     run(
         [uv, "pip", "install", "--python", str(venv_python), "-e", str(project)],
