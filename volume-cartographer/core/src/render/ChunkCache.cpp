@@ -1,6 +1,5 @@
 #include "ChunkCache.hpp"
 #include "SamplingWaitProfile.hpp"
-#include "vc/core/render/PinnedChunkRegion.hpp"
 
 #include <utils/thread_pool.hpp>
 #include <utils/Json.hpp>
@@ -1669,7 +1668,6 @@ ChunkResult ChunkCache::tryGetChunk(int level, int iz, int iy, int ix)
 ChunkResult ChunkCache::tryGetChunk(int level, int iz, int iy, int ix,
                                     const ChunkRequestContext& request)
 {
-    if(const auto* pinned=borrowedPinnedChunk(this,level,iz,iy,ix)) return *pinned;
     auto state = state_;
     const ChunkKey key{level, iz, iy, ix, state->sourceId_};
     std::unique_lock lock(state->mutex_);
@@ -1717,7 +1715,6 @@ ChunkResult ChunkCache::tryGetChunk(int level, int iz, int iy, int ix,
 
 ChunkResult ChunkCache::getChunkIfCached(int level, int iz, int iy, int ix)
 {
-    if(const auto* pinned=borrowedPinnedChunk(this,level,iz,iy,ix)) return *pinned;
     detail::SamplingWaitTimer operationTimer(4);
     auto state = state_;
     const ChunkKey key{level, iz, iy, ix, state->sourceId_};
@@ -1755,7 +1752,6 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
 ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix,
                                         const ChunkRequestContext& request)
 {
-    if(const auto* pinned=borrowedPinnedChunk(this,level,iz,iy,ix)) return *pinned;
     detail::SamplingWaitTimer operationTimer(0);
     auto state = state_;
     const ChunkKey key{level, iz, iy, ix, state->sourceId_};
@@ -1906,10 +1902,6 @@ void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys,
                                 int priorityOffset,
                                 const ChunkRequestContext& request)
 {
-    if(activePinnedChunkRegion()) {
-        for(const auto& k:keys) (void)borrowedPinnedChunk(this,k.level,k.iz,k.iy,k.ix);
-        return;
-    }
     detail::SamplingWaitTimer operationTimer(2);
     auto state = state_;
     std::unique_lock lock(state->mutex_,std::defer_lock);

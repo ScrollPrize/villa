@@ -761,6 +761,15 @@ bool sampleNearest(IChunkedArray& array,
     return readVoxel(array, cache, access, level, iz, iy, ix, out, requested, errors);
 }
 
+// Keep the identical arithmetic shared without a call per sampled voxel.
+// Plain inline is only a hint; GCC's size heuristic outlines this hot helper.
+#if defined(_MSC_VER)
+__forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+__attribute__((always_inline)) inline
+#else
+inline
+#endif
 uint8_t interpolateTrilinearU8(float fx,
                                float fy,
                                float fz,
@@ -2166,7 +2175,8 @@ ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
     TrilinearCornerPointVisitor visitor,
     int parallelThreads,
     bool collectLocalityStats,
-    const ChunkRequestContext& request)
+    const ChunkRequestContext& request,
+    const PinnedChunkRegion* pinnedRegion)
 {
     using Clock = std::chrono::steady_clock;
     const auto prepareStart = Clock::now();
@@ -2482,7 +2492,7 @@ ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
     for (size_t volumeIndex = 0; volumeIndex < arrays.size(); ++volumeIndex) {
         const auto& dependencies = layouts[volumeLayout[volumeIndex]].dependencies;
         stats.requestedChunks += static_cast<int>(dependencies.size());
-        if (!dependencies.empty() && !activePinnedChunkRegion())
+        if (!dependencies.empty() && !pinnedRegion)
             arrays[volumeIndex]->prefetchChunks(dependencies, false, 0, request);
     }
 
@@ -2502,12 +2512,15 @@ ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
     }
     size_t volumeIndex = 0;
     for (IChunkedArray* array : arrays) {
+        std::optional<PinnedChunkLookup> lookup;
+        if (pinnedRegion)
+            lookup.emplace(*pinnedRegion, array);
         const auto& dependencies = layouts[volumeLayout[volumeIndex]].dependencies;
         for (size_t dependencyIndex = 0;
              dependencyIndex < dependencies.size();
             ++dependencyIndex) {
             const ChunkKey& key = dependencies[dependencyIndex];
-            const auto* borrowed=borrowedPinnedChunk(array,key.level,key.iz,key.iy,key.ix);
+            const auto* borrowed = lookup ? &lookup->get(key) : nullptr;
             if(!borrowed) pinned[volumeIndex].chunks[dependencyIndex]=array->getChunkBlocking(key.level,key.iz,key.iy,key.ix,request);
             const ChunkResult& result=borrowed?*borrowed:pinned[volumeIndex].chunks[dependencyIndex];
             if (result.status == ChunkStatus::Error) {

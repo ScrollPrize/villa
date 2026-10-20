@@ -250,25 +250,18 @@ TEST_CASE("Pinned sampling owns payloads and never queues an unexpected dependen
     region.seal();
     CHECK(region.bytes()==64);
     const auto* expected=&region.get(array.get(),0,0,0,0);
-    CHECK(activePinnedChunkRegion()==nullptr);
     {
-        ScopedPinnedChunkRegion scope(&region);
-        LocalChunkCache local(*array);
-        int requested=0,errors=0;
-        CHECK(&local.get({0,0,0,0},requested,errors)==expected);
-        CHECK(requested==0);
+        PinnedChunkLookup local(region, array.get());
+        CHECK(&local.get({0,0,0,0})==expected);
+        CHECK(&local.get({0,0,0,0})==expected); // last-chunk fast path
         CHECK(array->queuedLookups[0]==0);
         CHECK(array->cachedLookups[0]==0);
-        CHECK_THROWS_AS(local.get({0,0,0,1},requested,errors),PinnedRegionMiss);
+        CHECK_THROWS_AS(local.get({0,0,0,1}),PinnedRegionMiss);
         CHECK_THROWS_AS(region.pin(array,{{0,0,0,0}}),std::logic_error);
-        { ScopedPinnedChunkRegion inner(nullptr); CHECK(activePinnedChunkRegion()==nullptr); }
-        CHECK(activePinnedChunkRegion()==&region);
     }
-    CHECK(activePinnedChunkRegion()==nullptr);
     CHECK(std::to_integer<int>((*expected->bytes)[0])==17);
     CHECK_THROWS_AS(region.pin(array,{{0,0,0,0}}),std::logic_error);
     {
-        ScopedPinnedChunkRegion scope(&region);
         int visits=0;
         const auto visitor=+[](void* context,size_t,const cv::Vec3f&,bool valid,
             std::span<const std::array<uint8_t,8>> corners) {
@@ -278,10 +271,103 @@ TEST_CASE("Pinned sampling owns payloads and never queues an unexpected dependen
             for(auto value:corners[0]) CHECK(value==17);
         };
         (void)ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
-            {array.get()},0,{{1.25f,1.5f,1.75f}},&visits,visitor,1,true);
+            {array.get()},0,{{1.25f,1.5f,1.75f}},&visits,visitor,1,true,{},&region);
         CHECK(visits==1);
         CHECK(array->blockingLookups==1); // preparation only
         CHECK(array->prefetchCalls==1); // preparation only
+    }
+}
+
+TEST_CASE("Local acquisition variants reuse consecutive and revisited chunks")
+{
+    using namespace vc::render;
+    auto array = std::make_shared<PyramidChunkedArray>(
+        ChunkStatus::Data, 17, ChunkStatus::Data, 9);
+    const ChunkKey a{0, 0, 0, 0}, b{1, 0, 0, 0};
+    int requested = 0, errors = 0;
+    const auto exercise = [&](auto& cache) {
+        const auto first = cache.get(a, requested, errors).bytes;
+        CHECK(cache.get(a, requested, errors).bytes == first);
+        CHECK(std::to_integer<int>((*cache.get(b, requested, errors).bytes)[0]) == 9);
+        CHECK(cache.get(a, requested, errors).bytes == first);
+    };
+    LocalChunkCache queued(*array);
+    exercise(queued);
+    CHECK(array->queuedLookups[0] == 1);
+    CHECK(array->queuedLookups[1] == 1);
+    LocalChunkCache resident(*array, 8, false);
+    exercise(resident);
+    CHECK(array->cachedLookups[0] == 1);
+    CHECK(array->cachedLookups[1] == 1);
+    BlockingLocalChunkCache blocking(*array);
+    exercise(blocking);
+    CHECK(array->blockingLookups == 2);
+
+    PinnedChunkRegion region;
+    region.pin(array, {a, b});
+    CHECK_THROWS_AS(PinnedChunkLookup(region, array.get()), std::logic_error);
+    region.seal();
+    CHECK_THROWS_AS(PinnedChunkLookup(region, nullptr), std::logic_error);
+    PinnedChunkLookup pinned(region, array.get());
+    const auto* first = &pinned.get(a);
+    const auto ownershipCount = first->bytes.use_count();
+    CHECK(&pinned.get(a) == first);
+    CHECK(std::to_integer<int>((*pinned.get(b).bytes)[0]) == 9);
+    CHECK(&pinned.get(a) == first);
+    CHECK(first->bytes.use_count() == ownershipCount); // borrows, never copies
+    CHECK(array->blockingLookups == 4); // only region preparation
+    CHECK(array->queuedLookups[0] == 1);
+    CHECK(array->cachedLookups[0] == 1);
+    // Explicit pins must never intercept ordinary cache access.
+    LocalChunkCache independent(*array);
+    CHECK(independent.get(a, requested, errors).bytes != first->bytes);
+    CHECK(array->queuedLookups[0] == 2);
+}
+
+TEST_CASE("Explicit pinned corner batches match ordinary batches across chunks and workers")
+{
+    using namespace vc::render;
+    auto array = std::make_shared<ProceduralChunkedArray>();
+    auto other = std::make_shared<ProceduralChunkedArray>();
+    PinnedChunkRegion region;
+    std::vector<ChunkKey> keys;
+    const auto shape = array->shape(0), chunk = array->chunkShape(0);
+    for (int z = 0; z < shape[0]; z += chunk[0])
+        for (int y = 0; y < shape[1]; y += chunk[1])
+            for (int x = 0; x < shape[2]; x += chunk[2])
+                keys.push_back({0, z / chunk[0], y / chunk[1], x / chunk[2]});
+    region.pin(array, keys);
+    region.pin(other, keys);
+    region.seal();
+    std::vector<cv::Vec3f> points;
+    for (int z = 0; z < shape[0]; ++z)
+        for (int y = 0; y < shape[1]; ++y)
+            for (int x = 0; x < shape[2]; ++x)
+                points.emplace_back(x + .25f, y + .5f, z + .75f);
+    using Corners = std::vector<std::array<uint8_t, 8>>;
+    struct Output {
+        std::vector<Corners> corners;
+        std::vector<cv::Vec3f> fractions;
+        std::vector<uint8_t> valid;
+        explicit Output(size_t n) : corners(n), fractions(n), valid(n) {}
+    };
+    const auto visitor = +[](void* context, size_t i, const cv::Vec3f& fraction,
+                             bool valid, std::span<const std::array<uint8_t, 8>> corners) {
+        auto& output = *static_cast<Output*>(context);
+        output.corners[i].assign(corners.begin(), corners.end());
+        output.fractions[i] = fraction;
+        output.valid[i] = valid;
+    };
+    Output expected(points.size());
+    (void)ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
+        {array.get(), other.get()}, 0, points, &expected, visitor, 1);
+    for (int workers : {1, 4}) {
+        Output actual(points.size());
+        (void)ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
+            {array.get(), other.get()}, 0, points, &actual, visitor, workers, true, {}, &region);
+        CHECK(actual.corners == expected.corners);
+        CHECK(actual.fractions == expected.fractions);
+        CHECK(actual.valid == expected.valid);
     }
 }
 

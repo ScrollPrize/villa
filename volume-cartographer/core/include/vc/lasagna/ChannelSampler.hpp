@@ -4,6 +4,7 @@
 #include "vc/lasagna/LineModel.hpp"
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/render/LocalChunkCache.hpp"
+#include "vc/core/render/PinnedChunkRegion.hpp"
 
 #include <array>
 #include <cstddef>
@@ -105,12 +106,14 @@ using LasagnaPrefetchRequest = std::pair<const LasagnaChannelBinding*, LasagnaCh
 
 class LasagnaLocalChunkResolver {
 public:
-    explicit LasagnaLocalChunkResolver(const LasagnaChannelBinding& binding);
+    explicit LasagnaLocalChunkResolver(const LasagnaChannelBinding& binding,
+        const vc::render::PinnedChunkRegion* pinnedRegion = nullptr);
     void resolve(LasagnaCubeRequest& request);
 
 private:
     [[nodiscard]] vc::render::ChunkResult resolveKey(const LasagnaChannelChunkKey& key);
-    vc::render::LocalChunkCache local_;
+    vc::render::BlockingLocalChunkCache local_;
+    std::optional<vc::render::PinnedChunkLookup> pinned_;
     int requested_ = 0;
     int errors_ = 0;
 };
@@ -175,7 +178,8 @@ private:
         void* visitorContext,
         LasagnaCornerPointVisitor visitor,
         int parallelThreads,
-        bool collectLocalityStats);
+        bool collectLocalityStats,
+        const vc::render::PinnedChunkRegion* pinnedRegion);
 
     class Impl;
     std::unique_ptr<Impl> impl_;
@@ -199,7 +203,8 @@ private:
     void* visitorContext,
     LasagnaCornerPointVisitor visitor,
     int parallelThreads = 0,
-    bool collectLocalityStats = false);
+    bool collectLocalityStats = false,
+    const vc::render::PinnedChunkRegion* pinnedRegion = nullptr);
 
 [[nodiscard]] size_t lasagnaReadWorkersPerChannel();
 
@@ -242,7 +247,7 @@ encodeCompactNormalToRaw(const cv::Vec3d& normal);
 void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels,
     const std::vector<cv::Vec3f>& points, std::vector<std::vector<float>>& vectors,
     bool normalize = true, const LasagnaChannelBinding* validity = nullptr,
-    bool skipPinnedPlanning = false);
+    const vc::render::PinnedChunkRegion* pinnedRegion = nullptr);
 
 [[nodiscard]] LasagnaCubeRequest prepareLasagnaCubeRequest(
     const LasagnaChannelBinding& binding,

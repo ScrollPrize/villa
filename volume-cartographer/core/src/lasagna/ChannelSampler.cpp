@@ -662,7 +662,8 @@ NormalPrefetchReport visitLasagnaChannelCorners(
     void* visitorContext,
     LasagnaCornerPointVisitor visitor,
     int parallelThreads,
-    bool collectLocalityStats)
+    bool collectLocalityStats,
+    const vc::render::PinnedChunkRegion* pinnedRegion)
 {
     if (samplers.empty() || volumePoints.empty())
         return {};
@@ -693,7 +694,8 @@ NormalPrefetchReport visitLasagnaChannelCorners(
             visitor,
             parallelThreads,
             collectLocalityStats,
-            vc::render::ChunkRequestContext{.foreground = true});
+            vc::render::ChunkRequestContext{.foreground = true},
+            pinnedRegion);
     return {
         static_cast<uint64_t>(stats.requestedChunks),
         static_cast<uint64_t>(stats.requestedChunks),
@@ -810,10 +812,6 @@ NormalPrefetchReport prefetchLasagnaChunks(const std::vector<LasagnaPrefetchRequ
         ++report.requestedChunks;
         const auto& key = request.second;
         auto& source = *request.first->chunkSource;
-        if(const auto* pinned=vc::render::borrowedPinnedChunk(&source,0,key.z,key.y,key.x)) {
-            validateChunk(*pinned);
-            continue;
-        }
         auto result = source.getChunkIfCached(0, key.z, key.y, key.x);
         if (result.status == vc::render::ChunkStatus::MissQueued) {
             ++report.chunksRead;
@@ -828,9 +826,12 @@ NormalPrefetchReport prefetchLasagnaChunks(const std::vector<LasagnaPrefetchRequ
     return report;
 }
 
-LasagnaLocalChunkResolver::LasagnaLocalChunkResolver(const LasagnaChannelBinding& binding)
-    : local_(*binding.chunkSource, 8, true, {}, true)
+LasagnaLocalChunkResolver::LasagnaLocalChunkResolver(const LasagnaChannelBinding& binding,
+    const vc::render::PinnedChunkRegion* pinnedRegion)
+    : local_(*binding.chunkSource, 8)
 {
+    if (pinnedRegion)
+        pinned_.emplace(*pinnedRegion, binding.chunkSource.get());
 }
 
 vc::render::ChunkResult LasagnaLocalChunkResolver::resolveKey(const LasagnaChannelChunkKey& key)
@@ -843,10 +844,11 @@ void LasagnaLocalChunkResolver::resolve(LasagnaCubeRequest& request)
 {
     if (!request.valid)
         return;
-    if(vc::render::activePinnedChunkRegion()) {
+    if (pinned_) {
         for(size_t i=0;i<(request.singleChunk?1u:8u);++i) {
             const auto& k=request.keys[i];
-            request.borrowed[i]=vc::render::borrowedPinnedChunk(&local_.array,0,k.z,k.y,k.x);
+            request.borrowed[i] = &pinned_->get(
+                {0, static_cast<int>(k.z), static_cast<int>(k.y), static_cast<int>(k.x)});
             validateChunk(*request.borrowed[i]);
         }
         return;
@@ -1656,11 +1658,11 @@ std::vector<LasagnaChannelBinding> bindLasagnaEmbeddingChannels(
 
 void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels,
     const std::vector<cv::Vec3f>& points, std::vector<std::vector<float>>& vectors, bool normalize,
-    const LasagnaChannelBinding* validity, bool skipPinnedPlanning)
+    const LasagnaChannelBinding* validity, const vc::render::PinnedChunkRegion* pinnedRegion)
 {
     if (channels.empty()) throw std::invalid_argument("vector sampling requires channels");
     std::vector<LasagnaPrefetchRequest> requests;
-    const bool pinned=skipPinnedPlanning && vc::render::activePinnedChunkRegion();
+    const bool pinned = pinnedRegion != nullptr;
     if (validity) {
         std::vector<LasagnaChannelChunkKey> keys;
         for (const auto& c:channels) if (c.spacing!=validity->spacing || c.shapeZYX!=validity->shapeZYX)
@@ -1677,10 +1679,10 @@ void sampleLasagnaVectorBatch(const std::vector<LasagnaChannelBinding>& channels
     }
     (void)prefetchLasagnaChunks(requests);
     std::vector<LasagnaLocalChunkResolver> resolvers;
-    for (const auto& channel : channels) resolvers.emplace_back(channel);
+    for (const auto& channel : channels) resolvers.emplace_back(channel, pinnedRegion);
     vectors.assign(points.size(), {});
     std::unique_ptr<LasagnaLocalChunkResolver> maskResolver;
-    if (validity) maskResolver=std::make_unique<LasagnaLocalChunkResolver>(*validity);
+    if (validity) maskResolver=std::make_unique<LasagnaLocalChunkResolver>(*validity, pinnedRegion);
     for (size_t i = 0; i < points.size(); ++i) {
         auto& vector = vectors[i];
         double norm2 = 0;

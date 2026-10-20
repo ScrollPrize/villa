@@ -13,6 +13,7 @@
 
 namespace vc::render {
 
+class PinnedChunkRegion;
 class ChunkedPlaneSampler {
 public:
     using TrilinearCornerPointVisitor = void (*)(
@@ -244,7 +245,8 @@ public:
         TrilinearCornerPointVisitor visitor,
         int parallelThreads = 0,
         bool collectLocalityStats = false,
-        const ChunkRequestContext& request = {});
+        const ChunkRequestContext& request = {},
+        const PinnedChunkRegion* pinnedRegion = nullptr);
 
     // Fine-to-coarse fallback. Finer covered pixels are never overwritten by
     // coarser levels.

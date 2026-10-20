@@ -12,6 +12,7 @@ struct PinnedRegionMiss : std::runtime_error {
     explicit PinnedRegionMiss(const std::string& detail):std::runtime_error("sampling exceeded pinned chunk region: "+detail){}
 };
 class PinnedChunkRegion {
+    friend class PinnedChunkLookup;
     struct Array {std::shared_ptr<IChunkedArray> source;std::map<std::array<int,4>,ChunkResult> chunks;};
     std::unordered_map<const IChunkedArray*,Array> arrays_;
     std::unordered_set<const void*> readyOwners_;
@@ -25,15 +26,26 @@ public:
     bool ready(const void* owner) const {return readyOwners_.contains(owner);}
     size_t bytes() const;
 };
-// Never span a coroutine yield or parallelFor: install on each synchronous job.
-class ScopedPinnedChunkRegion {
-    const PinnedChunkRegion* previous_;
+// Per-operation, per-array lookup. Region must be sealed and outlive this
+// object and all borrowed results. No TLS, I/O, locks or shared_ptr increments.
+// The tiny pointer window preserves locality across chunk boundaries.
+class PinnedChunkLookup {
+    const PinnedChunkRegion* region_;
+    const IChunkedArray* source_;
+    const PinnedChunkRegion::Array* array_;
+    ChunkKey lastKey_{};
+    const ChunkResult* last_ = nullptr;
+    std::array<ChunkKey, 8> keys_{};
+    std::array<const ChunkResult*, 8> results_{};
+    size_t size_ = 0;
+    size_t next_ = 0;
+    const ChunkResult& resolve(const ChunkKey&);
 public:
-    explicit ScopedPinnedChunkRegion(const PinnedChunkRegion*);
-    ~ScopedPinnedChunkRegion();
-    ScopedPinnedChunkRegion(const ScopedPinnedChunkRegion&)=delete;
-    ScopedPinnedChunkRegion& operator=(const ScopedPinnedChunkRegion&)=delete;
+    PinnedChunkLookup(const PinnedChunkRegion&, const IChunkedArray*);
+    const ChunkResult& get(const ChunkKey& key) {
+        if (last_ && lastKey_ == key)
+            return *last_;
+        return resolve(key);
+    }
 };
-const PinnedChunkRegion* activePinnedChunkRegion();
-const ChunkResult* borrowedPinnedChunk(const IChunkedArray*,int,int,int,int);
 }

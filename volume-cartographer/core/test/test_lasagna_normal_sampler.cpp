@@ -314,9 +314,8 @@ TEST_CASE("pinned scalar stride gather matches masked general reads at chunk and
     pinLasagnaRegion(pinned,width,{0,0,0},{6,5,4});pinLasagnaRegion(pinned,mask,{0,0,0},{6,5,4});pinned.seal();
     for(bool masked:{false,true}) {
         std::vector<std::vector<float>> expected,actual;
-        sampleLasagnaVectorBatch({width},points,expected,false,masked?&mask:nullptr,false);
-        {vc::render::ScopedPinnedChunkRegion scope(&pinned);
-            sampleLasagnaVectorBatch({width},points,actual,false,masked?&mask:nullptr,true);}
+        sampleLasagnaVectorBatch({width},points,expected,false,masked?&mask:nullptr);
+        sampleLasagnaVectorBatch({width},points,actual,false,masked?&mask:nullptr,&pinned);
         CHECK(actual==expected);
     }
     fs::remove_all(dir);
@@ -349,8 +348,7 @@ TEST_CASE("validity masks companion corners without diluting width or presence")
     vc::render::PinnedChunkRegion pinned;
     pinLasagnaRegion(pinned,w,{0,0,0},{1,1,1});pinLasagnaRegion(pinned,m,{0,0,0},{1,1,1});pinned.seal();
     {
-        vc::render::ScopedPinnedChunkRegion scope(&pinned);
-        sampleLasagnaVectorBatch({w},{{.5f,.5f,.5f},{1,1,1},{0,0,0}},out,false,&m,true);
+        sampleLasagnaVectorBatch({w},{{.5f,.5f,.5f},{1,1,1},{0,0,0}},out,false,&m,&pinned);
         CHECK(out==expected);
     }
     CHECK(*sampleLasagnaChannel(m,cv::Vec3d(.5,.5,.5))==doctest::Approx(255./8));

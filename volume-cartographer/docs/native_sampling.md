@@ -64,8 +64,44 @@ The optional AVX2/FMA normal interpolation path is compile-time guarded and has
 a scalar fallback with the same corner order and fused operations.
 
 `PinnedChunkRegion` supports readers that need a stable resolved region.
+Seal it after loading, then pass it explicitly to `sampleLasagnaVectorBatch`,
+`visitLasagnaChannelCorners`, or the requested-level corner visitor. The region
+must outlive the synchronous operation and any borrowed results. It never
+intercepts ordinary cache reads. `PinnedChunkLookup` binds one source once and
+retains a last-chunk shortcut plus eight borrowed pointers; misses outside the
+region throw rather than fetching. Ordinary queued/resident and blocking local
+caches have the same last-chunk shortcut, without pinned-region checks.
 Opaque decoded payloads and float32 typed channels are available to native
 consumers; they do not add these types to the CT rendering API.
+
+### Explicit pinned lookup regression check
+
+Compared with `d9e4fb4d9`, removing implicit TLS interception and keeping
+interpolation inline produced these native timings (milliseconds per render):
+
+| Warm fixture | Workers | Before mean / p50 / p95 | After mean / p50 / p95 |
+|---|---:|---:|---:|
+| fallback_3, 256×256 | 8 | 1.842 / 1.841 / 1.849 | 1.612 / 1.574 / 1.779 |
+| fallback_3, 96×96 | 1 | 1.184 / 1.045 / 1.734 | 0.720 / 0.720 / 0.722 |
+| full_res, 256×256 | 8 | 1.224 / 1.188 / 1.351 | 0.721 / 0.692 / 0.834 |
+
+Release, GCC 13.4, x86-64-v3, seven trials of 100 renders each. Checksums
+unchanged. These native timings include host scheduling noise and are not the
+generic-build Valgrind modeled-runtime CI gate.
+
+```bash
+cmake --build volume-cartographer/build/pr-native --target bench_render_synthetic -j 8
+volume-cartographer/build/pr-native/bin/bench_render_synthetic \
+  --fixture parallel --scenario fallback_3 --repetitions 100 --native-trials 7
+```
+
+Use `--fixture serial` for the 96×96 case and `--scenario full_res` for the
+full-resolution case. Regression tests additionally compare explicit pinned
+and ordinary corner batches across chunk boundaries with one/four workers,
+and verify local queued, resident, blocking and pinned lookup reuse.
+Real Paris4 validation below remains byte/mask-identical; the 128³
+requested-level locality path measured 91.70 / 91.81 / 92.86 ms mean/p50/p95
+over ten warmed iterations with one sampling worker.
 
 ## Cache location and authentication
 
