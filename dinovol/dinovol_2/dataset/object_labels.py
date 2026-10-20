@@ -24,7 +24,7 @@ from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
 import tifffile
-import zarr
+from dinovol_2.dataset.volume_reader import open_volume
 
 from dinovol_2.dataset.point_annotations import map_scale0_voxel_centers, xyz_to_zyx
 
@@ -482,14 +482,8 @@ def _read_tiff(url_or_path: str, storage_options: dict[str, Any] | None = None) 
 
 
 def _open_ink_zarr_level(url_or_path: str, level: str = "4", storage_options: dict[str, Any] | None = None) -> np.ndarray:
-    path_str = str(url_or_path).rstrip("/")
-    opts = dict(storage_options or {})
-    if path_str.startswith("s3://"):
-        opts.setdefault("anon", True)
-        arr = zarr.open(path_str, path=level, mode="r", storage_options=opts)
-    else:
-        arr = zarr.open(path_str, path=level, mode="r")
-    return np.asarray(arr[:])
+    with open_volume(url_or_path, level, s3_storage_options=storage_options) as array:
+        return array[:]
 
 
 def build_mesh_segment_from_arrays(

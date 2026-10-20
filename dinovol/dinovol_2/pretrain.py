@@ -27,6 +27,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 from PIL import Image
 
+from dinovol_2.dataset.cuda_pipeline import CudaBatchProcessor, CudaDataLoader
 from dinovol_2.dataset.ssl_zarr_dataset import SSLZarrDataset
 
 from dinovol_2.eval.task_eval import TaskEvalRunner
@@ -772,8 +773,9 @@ class DinoIBOTPretrainer:
             world_size=self.world_size,
             shuffle=shuffle,
         )
-        return DataLoader(
+        return CudaDataLoader(
             dataset,
+            device=self.device,
             batch_size=int(self.config.get("batch_size", 2)),
             shuffle=shuffle if sampler is None else False,
             sampler=sampler,
@@ -958,7 +960,7 @@ class DinoIBOTPretrainer:
                 }
             )
             self._monitor_dataset = dataset
-            self._monitor_collate_fn = collate_fn
+            self._monitor_collate_fn = CudaBatchProcessor(dataset.config, collate_fn, device=self.device)
         return self._monitor_dataset, self._monitor_collate_fn
 
     def build_monitor_batch(self, seed: int | None = None) -> dict[str, Any]:

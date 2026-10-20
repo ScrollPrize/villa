@@ -11,7 +11,6 @@ requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.13.3",
     "einops",
-    "fft-conv-pytorch",
     "fsspec>=2026.2.0",
     "numpy>=2.4.3",
     "pillow>=12.1.1",
@@ -20,8 +19,8 @@ dependencies = [
     "s3fs",
     "timm==1.0.20",
     "torch>=2.10.0",
+    "vc-reader[reader,transforms,torch]>=0.1.0",
     "tqdm>=4.67.3",
-    "zarr>=3.1.5",
     "wandb>=0.25.1",
     "tifffile>=2026.3.3",
     "imagecodecs>=2026.3.6",
@@ -30,3 +29,9 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 include = ["dinovol_2*"]
+
+[tool.uv.sources]
+vc-reader = { path = "../vc_reader" }
+
+[tool.uv.config-settings-package]
+vc-reader = { "cmake.define.VC_READER_ENABLE_CUDA" = "ON", "cmake.define.CMAKE_CUDA_ARCHITECTURES" = "native" }

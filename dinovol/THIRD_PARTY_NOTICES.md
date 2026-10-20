@@ -44,19 +44,3 @@ with modifications for Dinovol. Copyright 2022 Division of Medical Image
 Computing, German Cancer Research Center (DKFZ), Heidelberg, Germany. The
 upstream project is licensed under the
 [Apache License 2.0](LICENSES/Apache-2.0.txt).
-
-## batchgeneratorsv2
-
-`dinovol_2/augmentation/` is a modified adaptation of
-[batchgeneratorsv2](https://github.com/MIC-DKFZ/batchgeneratorsv2). Copyright
-2019 Division of Medical Image Computing, German Cancer Research Center
-(DKFZ), Heidelberg, Germany. The upstream project is licensed under the
-[Apache License 2.0](LICENSES/Apache-2.0.txt).
-
-## nnU-Net
-
-`dinovol_2/dataset/normalization.py` is adapted from
-[nnU-Net](https://github.com/MIC-DKFZ/nnUNet). Copyright 2019 Division of
-Medical Image Computing, German Cancer Research Center (DKFZ), Heidelberg,
-Germany. The upstream project is licensed under the
-[Apache License 2.0](LICENSES/Apache-2.0.txt).

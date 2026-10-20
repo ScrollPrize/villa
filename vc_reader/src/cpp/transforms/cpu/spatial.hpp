@@ -388,8 +388,9 @@ inline Parameters sample(const CropPad& t, const Sample& s, Random& r) {
 inline Parameters sample(const Affine& t, const Sample& s, Random& r) {
     auto input = sample_shape(s); auto d = input.size(); auto p = geometry(t.shape.empty() ? input : t.shape);
     require(p.shape.size() == d && product(p.shape), "invalid affine output shape");
+    require(t.scale_factors.empty() || t.scale_factors.size() == d, "scale_factors must match spatial dimensions");
     Matrix forward_m = identity(d); double shared_scale = draw(t.scale, r);
-    for (std::size_t a = 0; a < d; ++a) { double scale = t.shared_scale ? shared_scale : draw(t.scale, r); require(scale > 0, "scale must be positive"); forward_m[a * d + a] = scale; }
+    for (std::size_t a = 0; a < d; ++a) { double scale = t.shared_scale ? shared_scale : draw(t.scale, r); require(scale > 0, "scale must be positive"); forward_m[a * d + a] = scale * (t.scale_factors.empty() ? 1. : t.scale_factors[a]); }
     for (char c : t.rotation_axes) {
         if (d == 2 && c != 'z') continue;
         auto fixed = d == 3 ? axis(c, d) : -1; std::vector<std::size_t> plane;

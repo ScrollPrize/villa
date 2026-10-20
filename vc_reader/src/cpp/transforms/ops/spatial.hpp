@@ -8,6 +8,7 @@ struct Transpose { std::string order; double p = 1; };
 struct CropPad { Shape shape; bool random = false; double p = 1; };
 struct Affine {
     Scalar degrees = 0., scale = 1., translate = 0., shear = 0.;
+    std::vector<double> scale_factors;
     std::string rotation_axes = "zyx"; bool shared_scale = true, border = false; Shape shape; double p = 1;
 };
 struct Elastic { Scalar sigma = Uniform{5, 10}, magnitude = Uniform{1, 5}; bool border = false; double p = 1; };

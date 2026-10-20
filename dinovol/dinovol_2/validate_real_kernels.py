@@ -8,9 +8,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import zarr
+from dinovol_2.dataset.volume_reader import open_volume
 
-from dinovol_2.dataset.normalization import get_normalization
+from dinovol_2.dataset.cuda_pipeline import normalize_batch
 from dinovol_2.loss.ibot_patch_loss import iBOTPatchLoss
 from dinovol_2.model.model import DINOHead, DinoVitStudentTeacher
 from dinovol_2.ops.point_embeddings import sample_grid_points, sample_selected_grid_points
@@ -23,8 +23,7 @@ def prepare(checkpoint, volume, start):
     if crop_size != (192, 192, 192):
         raise ValueError("This validation workload expects the 192^3 checkpoint recipe")
     meta = json.loads((volume / ".zarray").read_text())
-    array = zarr.open_array(str(volume), mode="r")
-    normalizer = get_normalization(config["dataset"].get("normalization_scheme", "robust"))
+    array = open_volume(volume)
     # Two sample pairs with overlapping, non-token-aligned crop origins, in view-major order.
     starts = [
         tuple(start),
@@ -48,8 +47,9 @@ def prepare(checkpoint, volume, start):
                           "raw_min": int(raw.min()), "raw_max": int(raw.max())}), flush=True)
         if fraction < .1:
             raise ValueError("Choose a tissue-containing origin; this crop is mostly empty")
-        normalized = normalizer.run(raw.astype(np.float32)) if normalizer else raw.astype(np.float32)
-        crops.append(torch.from_numpy(normalized.copy())[None, None])
+        crops.append(normalize_batch(torch.from_numpy(raw.copy())[None, None],
+                                     config["dataset"].get("normalization_scheme", "robust")))
+    array.close()
 
     backbone = DinoVitStudentTeacher._build_backbone({**config["model"], "grad_checkpointing": False})
     backbone.load_state_dict({k.removeprefix("backbone."): v for k, v in state.items() if k.startswith("backbone.")})

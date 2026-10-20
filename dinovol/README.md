@@ -8,8 +8,7 @@ The canonical source is
 Run project commands from the monorepository's `dinovol/` directory.
 
 - `dinov2_eva` is adapted from [dynamic-network-architectures](https://github.com/MIC-DKFZ/dynamic-network-architectures/blob/main/dynamic_network_architectures/architectures/dinov2_eva.py), with minimal changes.
-- The augmentation library is a modified [batchgeneratorsv2](https://github.com/MIC-DKFZ/batchgeneratorsv2).
-- Normalization is mostly borrowed from [nnU-Net](https://github.com/MIC-DKFZ/nnUNet).
+- Volume reads, normalization, resampling and augmentations use [vc_reader](../vc_reader) with CUDA.
 - RoPE is adapted from the [DINOv3 implementation](https://github.com/facebookresearch/dinov3/blob/main/dinov3/layers/rope_position_encoding.py) and extended to support 3D.
 
 This implementation is still incomplete. Pretraining works, but finetuning has
@@ -252,22 +251,16 @@ mostly empty.
   on PHerc0826). Startup reads ~13 GB nominal (less in practice: masked-out
   chunks are absent from S3), most of it the twelve 2.2–2.4 µm volumes' 8× levels.
 - `dataset.read_ahead`: each loader process reads this many future source
-  windows in background threads while it augments the current sample. Window
+  windows in background threads while it prepares crop and point metadata. Window
   locations are still drawn in the loader process, so sampling stays
   deterministic, but enabling it changes the order of random draws.
-- `dataset.read_retries` (default 5) and `dataset.read_retry_backoff` (default
-  1 s): source-window and occupancy reads retry transient network errors
-  (dropped connections, truncated responses, timeouts) with doubling backoff,
-  re-reading the same window, so a single dropped S3 connection no longer kills
-  a run. Each retry is printed to stderr.
 - `dataset.gaussian_blur: true` and `dataset.global_crop_scale: [0.18, 0.45]` /
   `dataset.local_crop_scale: [0.023, 0.057]`: views are resampled only 0.87–1.18×
   from the 192³ source window (global 108–147 → 128 voxels, local 55–74 → 64)
   with Gaussian blur enabled as part of the augmentation. The zoom range
   covers the 7.9–9.4 µm spread in voxel size between scans.
 - `num_workers: 24`, `prefetch_factor: 2`, `persistent_workers: true`: with
-  read-ahead, one worker produces about 1.8 samples/s (augmentation-bound), so 24
-  workers comfortably exceed the GPU's ~20 samples/s on an H100.
+  workers read source windows and prepare crop plans ahead of batched CUDA processing.
 
 The teacher forward now runs before the student forward, so its no-grad
 intermediates are freed before student activations accumulate.
@@ -480,6 +473,50 @@ The seed checkpoint must exist before launch. `status` reads the latest launch
 recorded in `BENCH_ROOT/latest-run.txt`. Earlier benchmark directories are kept,
 including when a later launch fails. The launcher does not stop existing GPU
 processes; choose a free GPU before running it.
+
+### CUDA data pipeline
+
+Dinovol requires the sibling `../vc_reader` package built with CUDA, a CUDA-capable
+PyTorch installation, and an NVIDIA GPU. `pyproject.toml` resolves vc_reader from
+that checkout and enables its CUDA build. Follow [vc_reader's build requirements](../vc_reader/README.md)
+for the native libraries and CUDA toolkit, then run `uv sync` from `dinovol/`.
+The default build targets the visible GPU (`CMAKE_CUDA_ARCHITECTURES=native`).
+For a build machine without a visible GPU, specify the deployment architecture,
+for example `uv sync --config-setting-package vc-reader:cmake.define.CMAKE_CUDA_ARCHITECTURES=120-real`.
+Rebuild vc_reader after changing its native sources.
+
+`CudaDataLoader` workers use the native reader and sample raw crop windows plus
+point metadata. The parent process normalizes each crop on CUDA **before** native
+affine resampling, then applies scanner, geometry and intensity transforms.
+Images remain CUDA tensors through collation and the model. Point coordinates,
+object labels and cross-view token targets share the image geometry. Paired
+Gram-teacher crops share that geometry and optionally the augmentation seed.
+Inference normalization also uses CUDA.
+
+All image stages use `Pipeline.batch()`. For the batch-12 recipe with two global
+and four local views per sample, intensity transforms process all 24 global
+crops together and all 48 local crops together. Preparation groups variable input
+sizes; geometry groups matching output shapes and sampled operations. Per-axis
+affine scales support anisotropic crops. Every view has its own random seed;
+`augmentation: "dino"` and `gaussian_blur: false` are supported.
+
+To benchmark only data delivery using the local partial volume cache:
+
+```bash
+export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+.venv/bin/python -m dinovol_2.bench_data_pipeline --prepare
+.venv/bin/python -m dinovol_2.bench_data_pipeline --warmup 48 --batches 120 --tag run1 --profile
+.venv/bin/python -m unittest discover -s tests -p 'test_cuda_pipeline.py' -v
+```
+
+The default config is `dinovol_2/configs/pretrain_8_9um_heads32768.json`; the cache
+is `/mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data`. Preparation
+inventories files locally and samples only complete chunk neighborhoods, with
+nonzero rejection. Missing occupancy masks and mesh/surface/fiber label sources
+are excluded from this benchmark; unlabeled object points and cross-view token
+targets remain enabled. No model or optimizer is timed. The exact inventory,
+resolved configuration, batch latencies and optional CUDA trace are written to
+`perf_results/cuda_pipeline/`. Warmup and profiling are excluded from throughput.
 
 ### Pseudo-object losses
 

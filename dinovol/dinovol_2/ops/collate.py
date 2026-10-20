@@ -48,7 +48,7 @@ def collate_dino_ibot_batch(
         ).to(dtype)
     else:
         local_shape = samples[0]["global_views"][0].shape
-        local_crops = torch.empty((0, *local_shape), dtype=dtype)
+        local_crops = global_crops.new_empty((0, *local_shape), dtype=dtype)
 
     if samples[0].get("gram_teacher_views"):
         collated_gram_teacher_crops = torch.stack(
