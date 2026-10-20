@@ -132,6 +132,10 @@ Inference requires a non-empty trusted `model_identifier` and fails before
 creating a run otherwise. Identity may come from the manager import sidecar,
 matching embedded checkpoint metadata, or an exact-SHA Atlas registration;
 conflicting sources are rejected.
+Publication also checks any carried `model_identifier` against that trusted
+snapshot identity. For historical runs whose identifier was added only to
+provenance, import the exact checkpoint with `snapshot import` first; editing
+the run JSON alone does not register its external identity.
 
 ## Prefetch and inference
 

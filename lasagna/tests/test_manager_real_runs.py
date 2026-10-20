@@ -17,7 +17,7 @@ import pytest
 from lasagna.manager.config import ManagerConfig
 from lasagna.manager.fiberlets import resolve_fiberlet_inputs
 from lasagna.manager.open_data import resolve_model_id, validate_inference
-from lasagna.manager.snapshots import import_snapshot
+from lasagna.manager.snapshots import import_snapshot, index_snapshots
 
 
 def _run_path(name: str) -> Path:
@@ -36,7 +36,20 @@ def test_existing_fiber_and_normal_inputs(tmp_path: Path) -> None:
     roots = tuple(filter(None, os.environ.get("LAS_MANAGER_TEST_SNAPSHOT_DIRS", "").split(os.pathsep)))
     config = ManagerConfig(
         output_dir=str(fiber_path.parent), cache_dir=str(tmp_path), snapshot_dirs=roots,
+        model_dir=str(tmp_path / "models"),
     )
+    # Historical bundles predate mandatory registered repository identity.
+    # Register their exact checkpoints in the temporary test model directory;
+    # never modify the production snapshots or their sidecars.
+    snapshots = index_snapshots(config, write_cache=False)
+    for run in (fiber_path, normal_path):
+        record = json.loads((run / "metadata.json").read_text())
+        provenance = json.loads((run / record["artifacts"]["provenance"]).read_text())
+        model = provenance["model"]
+        if model.get("model_identifier"):
+            snapshot = next(item for item in snapshots if item.sha256 == model["sha256"])
+            import_snapshot(config, snapshot.path, run=model["run"],
+                            model_identifier=model["model_identifier"])
     fiber, normal = resolve_fiberlet_inputs(config, fiber_path.name, normal_path.name)
     assert fiber["source"]["sample_id"] == normal["source"]["sample_id"]
     assert fiber["source"]["volume_id"] == normal["source"]["volume_id"]

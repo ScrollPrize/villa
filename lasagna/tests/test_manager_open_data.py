@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -125,6 +126,26 @@ def test_model_creation_offset_is_normalized_to_utc(
     monkeypatch.setattr("lasagna.manager.open_data.index_snapshots", lambda _config, **_kwargs: [naive])
     with pytest.raises(ValueError, match="UTC offset"):
         resolve_model_id(config, {"model": {"sha256": digest}})
+
+
+def test_model_identifier_must_match_trusted_snapshot(tmp_path, monkeypatch):
+    path = tmp_path / "best.pt"
+    path.write_bytes(b"checkpoint")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    record = replace(_snapshot_record(path, digest), model_identifier="owner/model")
+    records = [record]
+    monkeypatch.setattr("lasagna.manager.open_data.index_snapshots", lambda *_args, **_kwargs: records)
+    config = ManagerConfig(snapshot_dirs=(str(tmp_path),), cache_dir=str(tmp_path / "cache"))
+    model = {"sha256": digest, "model_identifier": "owner/model"}
+    assert resolve_model_id(config, {"model": model}) == "20260801084232-lasagna"
+    with pytest.raises(ValueError, match="model_identifier"):
+        resolve_model_id(config, {"model": {**model, "model_identifier": "owner/wrong"}})
+    records[:] = [replace(record, model_identifier=None)]
+    with pytest.raises(ValueError, match="model_identifier"):
+        resolve_model_id(config, {"model": model})
+    records[:] = [record, replace(record, model_identifier="owner/conflict")]
+    with pytest.raises(ValueError, match="conflicting identity"):
+        resolve_model_id(config, {"model": model})
 
 
 def test_model_resolution_accepts_byte_identical_checkpoint_aliases(

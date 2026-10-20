@@ -150,6 +150,92 @@ def test_catalog_indexes_lasagna_prediction_roles_from_exact_models():
     ) == normal[0]
 
 
+@pytest.mark.parametrize("scheme,region", [("s3", "us-east-1"), ("s3+eu-west-1", "eu-west-1")])
+def test_published_normal_discovery_skips_http_root_and_preserves_region(monkeypatch, scheme, region):
+    cache = prediction_catalog()
+    volume = cache.document["samples"]["PHerc0001"]["volumes"]["one"]
+    entry = next(item for item in volume["data"] if item.get("parameters", {}).get("model_id") == "20260419180421")
+    entry["origins"][0]["access_roots"] = [
+        {"url": "https://example.org", "usage": "public-read"},
+        {"url": f"{scheme}://public", "usage": "public-read"},
+    ]
+    record = next(item for item in index_lasagna_predictions(cache) if item.role == "normal")
+    calls = []
+    def listing(bucket, prefix, **kwargs):
+        calls.append((bucket, prefix, kwargs))
+        return [prefix + "normal.lasagna.json"]
+    monkeypatch.setattr("lasagna.scripts.download_omezarr.list_s3_prefix", listing)
+    assert manager_fiberlets._discover_published_manifest(record) == (
+        f"https://public.s3.{region}.amazonaws.com/"
+        "PHerc0001/representations/predictions/lasagna/normals/normal.lasagna.json")
+    assert calls[0][0] == "public"
+    assert calls[0][2] == {"anon": True, "region": region}
+
+
+def test_published_normal_rejects_absolute_http_origin_even_with_s3_root():
+    cache = prediction_catalog()
+    volume = cache.document["samples"]["PHerc0001"]["volumes"]["one"]
+    entry = next(item for item in volume["data"] if item.get("parameters", {}).get("model_id") == "20260419180421")
+    entry["origins"][0]["path"] = "https://example.org/normals"
+    record = next(item for item in index_lasagna_predictions(cache) if item.model_id == "20260419180421")
+    assert "no usable S3" in record.validation_error
+
+
+def test_fiberlet_inventory_streams_numeric_order_and_preserves_digest(tmp_path):
+    keys = [(10, 0, 2), (2, 10, 0), (2, 2, 10), (2, 2, 2)]
+    for z, y, x in keys:
+        path = tmp_path / "fiberlets" / str(z) / str(y) / str(x)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"chunk")
+    (tmp_path / "fiberlets" / ".zarray").write_text("{}")
+    inventory = manager_fiberlets._fiberlet_inventory(tmp_path)
+    assert iter(inventory) is inventory
+    assert list(inventory) == sorted(keys)
+    # Independent original byte-stream implementation guards wire compatibility.
+    canonical = "".join(f"{z}/{y}/{x}\n" for z, y, x in sorted(keys)).encode()
+    encoded = bytearray()
+    mask = (1 << 64) - 1
+    for lane in range(4):
+        value = 14695981039346656037 ^ (0x9E3779B97F4A7C15 * (lane + 1) & mask)
+        for byte in canonical:
+            value = ((value ^ byte) * 1099511628211) & mask
+        encoded.extend(value.to_bytes(8, "little"))
+    assert manager_fiberlets._fiberlet_inventory_summary(
+        manager_fiberlets._fiberlet_inventory(tmp_path)) == (len(keys), "fnv256:" + encoded.hex())
+
+
+@pytest.mark.parametrize("key", ["01/2/3", "1/2", "1/2/3/4", "1/a/3"])
+def test_fiberlet_inventory_rejects_noncanonical_keys(tmp_path, key):
+    path = tmp_path / "fiberlets" / key
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"bad")
+    with pytest.raises(ValueError, match="Fiberlet"):
+        list(manager_fiberlets._fiberlet_inventory(tmp_path))
+
+
+def test_fiberlet_inventory_does_not_visit_later_subtrees_before_yielding(tmp_path):
+    first = tmp_path / "fiberlets" / "0" / "0" / "0"
+    first.parent.mkdir(parents=True)
+    first.write_bytes(b"chunk")
+    later = tmp_path / "fiberlets" / "1" / "invalid"
+    later.parent.mkdir(parents=True)
+    later.write_bytes(b"bad")
+    inventory = manager_fiberlets._fiberlet_inventory(tmp_path)
+    assert next(inventory) == (0, 0, 0)
+    with pytest.raises(ValueError, match="invalid chunk key"):
+        next(inventory)
+
+
+def test_fiberlet_inventory_rejects_symlink_directories(tmp_path):
+    array = tmp_path / "fiberlets"
+    array.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (array / "0").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="invalid chunk key"):
+        list(manager_fiberlets._fiberlet_inventory(tmp_path))
+
+
 def test_config_init_round_trip_and_no_overwrite(tmp_path, monkeypatch):
     path = tmp_path / "cfg" / "config.toml"
     monkeypatch.setenv("LAS_MANAGER_CONFIG", str(path))

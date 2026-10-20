@@ -13,8 +13,27 @@ import time
 from typing import Any, Iterable
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
 
 from .config import ManagerConfig
+
+
+def parse_catalog_s3_url(value: str) -> tuple[str, str, str]:
+    """Return bucket, key and region for the catalogue's S3 URL schemes."""
+    parsed = urlsplit(value)
+    region = "us-east-1" if parsed.scheme == "s3" else parsed.scheme.removeprefix("s3+")
+    if (not (parsed.scheme == "s3" or parsed.scheme.startswith("s3+"))
+            or not region or not parsed.netloc or parsed.query or parsed.fragment):
+        raise ValueError(f"invalid catalogue S3 URL: {value!r}")
+    return parsed.netloc, parsed.path.lstrip("/"), region
+
+
+def _origin_url(origin: dict[str, Any], root: dict[str, Any]) -> str:
+    base = str(root.get("url") or "")
+    path = str(origin.get("path") or origin.get("url") or origin.get("uri") or "")
+    if path.startswith(("s3://", "s3+", "http://", "https://")):
+        return path
+    return base.rstrip("/") + "/" + path.lstrip("/") if path else base
 
 
 @dataclass(frozen=True)
@@ -91,18 +110,7 @@ class LasagnaPredictionRecord:
     def source_url(self) -> str | None:
         if self.selected_origin is None or self.selected_access_root is None:
             return None
-        root = str(self.selected_access_root.get("url") or "")
-        path = str(
-            self.selected_origin.get("path")
-            or self.selected_origin.get("url")
-            or self.selected_origin.get("uri")
-            or ""
-        )
-        if not root:
-            return None
-        if path.startswith(("s3://", "s3+", "http://", "https://")):
-            return path
-        return root.rstrip("/") + "/" + path.lstrip("/") if path else root
+        return _origin_url(self.selected_origin, self.selected_access_root) or None
 
     @property
     def artifact_url(self) -> str | None:
@@ -123,17 +131,9 @@ class LasagnaPredictionRecord:
                 + value[len(challenge):]
             ).rstrip("/")
         if value.startswith("s3://") or value.startswith("s3+"):
-            if value.startswith("s3://"):
-                region = "us-east-1"
-                bucket_and_key = value[len("s3://"):]
-            else:
-                scheme, separator, bucket_and_key = value.partition("://")
-                if not separator:
-                    return value.rstrip("/")
-                region = scheme[len("s3+"):]
-            bucket, separator, key = bucket_and_key.partition("/")
+            bucket, key, region = parse_catalog_s3_url(value)
             result = f"https://{bucket}.s3.{region}.amazonaws.com"
-            if separator:
+            if key:
                 result += f"/{key}"
             return result.rstrip("/")
         return value.rstrip("/")
@@ -393,13 +393,17 @@ def index_lasagna_predictions(cache: CatalogCache) -> list[LasagnaPredictionReco
                             str(root.get("usage") or "").lower() == "public-read"
                             and root.get("url")
                         ):
+                            try:
+                                parse_catalog_s3_url(_origin_url(origin, root))
+                            except ValueError:
+                                continue
                             selected = origin
                             selected_root = root
                             break
                     if selected is not None:
                         break
                 if selected is None and error is None:
-                    error = "no public-read origin is available"
+                    error = "no usable S3 public-read origin is available"
                     role = "invalid"
                 records.append(LasagnaPredictionRecord(
                     sample_id=str(volume.get("sample_id") or sample_id),

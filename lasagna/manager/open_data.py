@@ -144,7 +144,7 @@ def _matching_snapshot(config: ManagerConfig, model: dict[str, Any]) -> Snapshot
     if not verified:
         raise ValueError("no configured snapshot matches inference model.sha256")
     normalized = {
-        (record.backend, record.run, record.model_creation_utc)
+        (record.backend, record.run, record.model_creation_utc, record.model_identifier)
         for record in verified
     }
     if len(normalized) != 1:
@@ -155,6 +155,8 @@ def _matching_snapshot(config: ManagerConfig, model: dict[str, Any]) -> Snapshot
     if expected_checkpoint and not named:
         raise ValueError("inference model.checkpoint does not match any byte-identical snapshot copy")
     chosen = sorted(named or verified, key=lambda record: record.path)[0]
+    if model.get("model_identifier") is not None and model["model_identifier"] != chosen.model_identifier:
+        raise ValueError("inference model.model_identifier conflicts with trusted snapshot metadata")
     if expected_run and str(expected_run) != chosen.run:
         raise ValueError("inference model.run does not match the hashed snapshot")
     expected_snapshot = f"{chosen.run}/snapshots/{chosen.checkpoint}"

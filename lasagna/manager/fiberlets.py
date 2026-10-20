@@ -12,13 +12,14 @@ import shutil
 import socket
 import sys
 import tempfile
-from typing import Any, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from .catalog import (
     CatalogCache, LasagnaPredictionRecord, index_lasagna_predictions,
     normal_predictions_for_volume, resolve_lasagna_prediction,
+    parse_catalog_s3_url,
 )
 from .config import ManagerConfig, config_path
 from .runs import (
@@ -51,45 +52,54 @@ def resolve_bundle_relative(bundle: Path, value: str, *, label: str) -> Path:
     return candidate
 
 
-def _fiberlet_inventory(dataset: Path) -> list[tuple[int, int, int]]:
+def _fiberlet_inventory(dataset: Path) -> Iterator[tuple[int, int, int]]:
     array = dataset / "fiberlets"
-    chunks: list[tuple[int, int, int]] = []
     if not array.is_dir():
-        return chunks
-    metadata_path = array / ".zarray"
-    for path in array.rglob("*"):
-        if not path.is_file() or path == metadata_path:
-            continue
-        try:
-            path.resolve().relative_to(array.resolve())
-        except ValueError as error:
-            raise ValueError(
-                f"published Fiberlet chunk path escapes its array: {path}"
-            ) from error
-        relative = path.relative_to(array)
-        if len(relative.parts) != 3 or not all(
-            part.isascii() and part.isdigit() for part in relative.parts
-        ):
-            raise ValueError(
-                f"published Fiberlet array contains an invalid chunk key: {relative}"
-            )
-        chunks.append(tuple(int(part) for part in relative.parts))
-    return sorted(chunks)
+        return
+
+    def walk(directory: Path, prefix: tuple[int, ...]) -> Iterator[tuple[int, int, int]]:
+        # Only retain siblings at the three active levels, never the full tree.
+        children = []
+        for path in directory.iterdir():
+            if not prefix and path.name == ".zarray":
+                continue
+            name = path.name
+            if (path.is_symlink() or not name.isascii() or not name.isdigit()
+                    or str(int(name)) != name):
+                raise ValueError(f"published Fiberlet array contains an invalid chunk key: {path}")
+            children.append((int(name), path))
+        for index, path in sorted(children):
+            key = (*prefix, index)
+            if len(key) == 3:
+                if not path.is_file():
+                    raise ValueError(f"published Fiberlet chunk is not a file: {path}")
+                yield key
+            else:
+                if not path.is_dir():
+                    raise ValueError(f"published Fiberlet chunk key is incomplete: {path}")
+                yield from walk(path, key)
+
+    yield from walk(array, ())
 
 
-def _fiberlet_inventory_digest(chunks: Sequence[tuple[int, int, int]]) -> str:
-    canonical = "".join(f"{z}/{y}/{x}\n" for z, y, x in chunks).encode()
-    encoded = bytearray()
+def _fiberlet_inventory_summary(chunks: Iterable[tuple[int, int, int]]) -> tuple[int, str]:
     mask = (1 << 64) - 1
-    for lane in range(4):
-        value = 14695981039346656037 ^ (
-            0x9E3779B97F4A7C15 * (lane + 1) & mask
-        )
-        for byte in canonical:
-            value ^= byte
-            value = value * 1099511628211 & mask
-        encoded.extend(value.to_bytes(8, "little"))
-    return "fnv256:" + encoded.hex()
+    values = [14695981039346656037 ^ (0x9E3779B97F4A7C15 * (lane + 1) & mask)
+              for lane in range(4)]
+    count = 0
+    for z, y, x in chunks:
+        canonical = f"{z}/{y}/{x}\n".encode()
+        for lane, value in enumerate(values):
+            for byte in canonical:
+                value = ((value ^ byte) * 1099511628211) & mask
+            values[lane] = value
+        count += 1
+    encoded = b"".join(value.to_bytes(8, "little") for value in values)
+    return count, "fnv256:" + encoded.hex()
+
+
+def _fiberlet_inventory_digest(chunks: Iterable[tuple[int, int, int]]) -> str:
+    return _fiberlet_inventory_summary(chunks)[1]
 
 
 def validate_published_fiberlet_dataset(dataset: Path) -> dict[str, Any]:
@@ -113,10 +123,10 @@ def validate_published_fiberlet_dataset(dataset: Path) -> dict[str, Any]:
         or array.get("dimension_separator") != "/"
     ):
         raise ValueError("native Fiberlet output has an invalid published array")
-    chunks = _fiberlet_inventory(dataset)
-    if attrs.get("expected_chunk_count") != len(chunks):
+    count, digest = _fiberlet_inventory_summary(_fiberlet_inventory(dataset))
+    if attrs.get("expected_chunk_count") != count:
         raise ValueError("published Fiberlet chunk count does not match metadata")
-    if attrs.get("expected_chunk_digest") != _fiberlet_inventory_digest(chunks):
+    if attrs.get("expected_chunk_digest") != digest:
         raise ValueError("published Fiberlet chunk inventory does not match metadata")
     return attrs
 
@@ -277,17 +287,17 @@ def _remote_bytes(url: str) -> bytes:
 def _discover_published_manifest(
     record: LasagnaPredictionRecord,
 ) -> str:
-    from lasagna.scripts.download_omezarr import list_s3_prefix, parse_s3_uri
+    from lasagna.scripts.download_omezarr import list_s3_prefix
 
     artifact_s3 = record.s3_url
     artifact_url = record.artifact_url
     if not artifact_s3 or not artifact_url:
         raise ValueError(f"published prediction {record.selector} has no usable S3 origin")
-    bucket, prefix = parse_s3_uri(artifact_s3)
+    bucket, prefix, region = parse_catalog_s3_url(artifact_s3)
     prefix = prefix.rstrip("/") + "/"
     try:
         entries = list_s3_prefix(
-            bucket, prefix, anon=True, region="us-east-1",
+            bucket, prefix, anon=True, region=region,
         )
     except Exception as error:
         raise RuntimeError(
