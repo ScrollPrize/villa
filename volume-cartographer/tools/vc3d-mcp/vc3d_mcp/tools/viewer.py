@@ -596,10 +596,11 @@ async def vc3d_key(
     "Delete", "F5", "Left", "1", "%", or a combination such as "Shift+G".
     Bare modifier keys are "Shift", "Ctrl", "Alt", "Meta". VC3D's Help >
     Keybinds dialog lists every binding; among those without a typed tool are
-    B / N (approval / unapproval painting), S (line drawing, held), Q / E
-    (push/pull radius), Space (toggle the volume overlay), R (center focus on
-    the cursor), X (recenter on focus), and Shift+G / Shift+H (lower / raise
-    the Z-scroll sensitivity).
+    S (line drawing, held), Q / E (push/pull radius), Space (toggle the
+    volume overlay), R (center focus on the cursor), X (recenter on focus),
+    and Shift+G / Shift+H (lower / raise the Z-scroll sensitivity). For
+    approval painting (B / N) use vc3d_set_approval_mask_mode and
+    vc3d_undo_approval_stroke instead.
     viewer: viewer id ("v1") or surface-slot name; default "segmentation".
     It must be visible (switch to its workspace first). Keyboard focus moves
     to it for the call and then returns to where it was.
