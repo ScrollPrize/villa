@@ -35,14 +35,18 @@ def apply_rotary_embedding(x: Tensor, rope: RopeEmbedding, *, prefix_tokens: int
             f"x.shape[-2]={x.shape[-2]}, prefix_tokens={prefix_tokens}, rope_tokens={sin.shape[-2]}"
         )
 
-    x_dtype = x.dtype
-    rope_dtype = sin.dtype
-    x_prefix = x[..., :prefix_tokens, :]
-    x_suffix = x[..., prefix_tokens:, :].to(dtype=rope_dtype)
-    x_suffix = rope_apply(x_suffix, sin, cos).to(dtype=x_dtype)
-    if prefix_tokens == 0:
-        return x_suffix
-    return torch.cat((x_prefix, x_suffix), dim=-2)
+    # Equal to concatenating the prefix with rope_apply of the suffix, without
+    # concatenating activations: the prefix gets the identity rotation (cos 1, sin 0)
+    # and rotate_half is a gather with the sign folded into sin. Gathers and
+    # pointwise ops can be recomputed in backward by compiled graphs instead of saved.
+    if prefix_tokens:
+        sin = torch.nn.functional.pad(sin, (0, 0, prefix_tokens, 0))
+        cos = torch.nn.functional.pad(cos, (0, 0, prefix_tokens, 0), value=1.0)
+    half = x.shape[-1] // 2
+    rotation = torch.arange(x.shape[-1], device=x.device).roll(half)
+    signed_sin = torch.cat((-sin[..., :half], sin[..., half:]), dim=-1)
+    x_rope = x.to(dtype=sin.dtype)
+    return ((x_rope * cos) + (x_rope[..., rotation] * signed_sin)).to(dtype=x.dtype)
 
 
 class _BaseRopePositionEmbedding(nn.Module):
