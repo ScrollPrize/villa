@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+from vesuvius.neural_tracing.tracers.fibers.tracing import volume
 from vesuvius.neural_tracing.tracers.fibers.tracing.volume import tile_dots
 
 
@@ -37,6 +38,21 @@ def test_planes_follow_global_spacing_independently_of_tile_boundaries(axis, spa
 
 
 @pytest.mark.parametrize('axis', [0, 1, 2])
-def test_fractional_spacing_below_one_visits_each_plane_once(axis):
-    dots = plane_seeds(fiber_presence(axis), axis, .75, 16, 32)
+@pytest.mark.parametrize('spacing', [.75, 1e-9])
+def test_fractional_spacing_below_one_visits_each_plane_once(axis, spacing, monkeypatch):
+    original_arange = np.arange
+
+    def bounded_arange(*args, **kwargs):
+        if len(args) >= 2 and args[1]-args[0] > 1000:
+            pytest.fail('Subvoxel spacing allocated duplicate nominal planes')
+        return original_arange(*args, **kwargs)
+
+    monkeypatch.setattr(volume.np, 'arange', bounded_arange)
+    dots = plane_seeds(fiber_presence(axis), axis, spacing, 16, 32)
     np.testing.assert_array_equal(dots[:, axis], np.arange(16, 32))
+
+
+@pytest.mark.parametrize('spacing', [0., -1., float('nan'), float('inf'), -float('inf')])
+def test_invalid_plane_spacing_is_rejected(spacing):
+    with pytest.raises(ValueError, match='plane spacing must be finite and positive'):
+        plane_seeds(fiber_presence(2), 2, spacing, 16, 32)

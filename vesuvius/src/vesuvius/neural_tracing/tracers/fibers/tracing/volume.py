@@ -159,6 +159,10 @@ def ridge_directions(presence, points_zyx):
 
 def tile_dots(presence_array, lo, hi, args):
     """Seeds of one tile [lo, hi) (grid xyz): positions, directions, families, presence values, in tracing order."""
+    spacing = float(args.plane_spacing)
+    if not np.isfinite(spacing) or spacing <= 0:
+        raise ValueError('plane spacing must be finite and positive')
+    spacing = max(spacing, 1.)  # Sampling planes are integer voxels; do not allocate duplicate subvoxel planes.
     margin = HESSIAN_RADIUS+2
     want_lo = lo[::-1].astype(int)-margin
     want_hi = np.ceil(hi[::-1]).astype(int)+margin
@@ -174,10 +178,10 @@ def tile_dots(presence_array, lo, hi, args):
     plans = (('z', 2, 0, 'V'), ('x', 0, 2, 'H'), ('y', 1, 1, 'H'))  # name, xyz axis, zyx axis, family
     out = []
     for name, axis_xyz, axis_zyx, family in plans:
-        first = np.ceil(lo[axis_xyz]/args.plane_spacing)
-        last = np.ceil(hi[axis_xyz]/args.plane_spacing)
+        first = np.ceil(lo[axis_xyz]/spacing)
+        last = np.ceil(hi[axis_xyz]/spacing)
         # Quantize each global plane, not the spacing: fractional steps must not accumulate drift within a tile.
-        for c in np.unique((np.arange(first, last)*args.plane_spacing).astype(int)):
+        for c in (np.arange(first, last)*spacing).astype(int):
             k = c-int(lo[axis_xyz])+margin
             plane = np.take(smooth, k, axis=axis_zyx)
             peak = (plane == ndimage.maximum_filter(plane, size)) & (plane > args.threshold)
