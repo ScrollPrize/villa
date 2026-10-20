@@ -174,8 +174,10 @@ def tile_dots(presence_array, lo, hi, args):
     plans = (('z', 2, 0, 'V'), ('x', 0, 2, 'H'), ('y', 1, 1, 'H'))  # name, xyz axis, zyx axis, family
     out = []
     for name, axis_xyz, axis_zyx, family in plans:
-        first = int(np.ceil(lo[axis_xyz]/args.plane_spacing)*args.plane_spacing)
-        for c in range(first, int(hi[axis_xyz]), int(args.plane_spacing)):
+        first = np.ceil(lo[axis_xyz]/args.plane_spacing)
+        last = np.ceil(hi[axis_xyz]/args.plane_spacing)
+        # Quantize each global plane, not the spacing: fractional steps must not accumulate drift within a tile.
+        for c in np.unique((np.arange(first, last)*args.plane_spacing).astype(int)):
             k = c-int(lo[axis_xyz])+margin
             plane = np.take(smooth, k, axis=axis_zyx)
             peak = (plane == ndimage.maximum_filter(plane, size)) & (plane > args.threshold)
