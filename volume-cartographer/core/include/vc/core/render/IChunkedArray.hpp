@@ -42,6 +42,10 @@ struct ChunkRequestContext {
     std::uint64_t viewId = 0;
     std::uint64_t viewVersion = 0;
 
+    // View-independent interactive computation (e.g. tracing). Survives render
+    // replacement and shares admission fairly with GUI work.
+    bool foreground = false;
+
     [[nodiscard]] bool interactive() const noexcept { return viewId != 0; }
 };
 
@@ -102,6 +106,12 @@ public:
     // Blocking access is for CLI, batch, optimization, and prefetch callers.
     // Viewer rendering paths must not call this on the Qt/main thread.
     virtual ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) = 0;
+    virtual ChunkResult getChunkBlocking(int level, int iz, int iy, int ix,
+                                         const ChunkRequestContext& request)
+    {
+        (void)request;
+        return getChunkBlocking(level, iz, iy, ix);
+    }
     virtual void prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset = 0) = 0;
     virtual void prefetchChunks(const std::vector<ChunkKey>& keys,
                                 bool wait,

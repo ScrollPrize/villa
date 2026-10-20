@@ -47,7 +47,7 @@ Lasagna hit/download diagnostics redact query strings.
 
 ## Disk Accounting
 
-`Managed` payloads reserve space and hold read pins through
+`Managed` payloads account pending writes and hold read pins through
 `PersistentZarrCacheBudget`. Startup scanning recognizes managed remote-file
 payloads so accounting survives process restart. Budget eviction removes the
 payload; a later lookup treats the remaining or missing sidecar as a miss.
@@ -55,6 +55,87 @@ payload; a later lookup treats the remaining or missing sidecar as a miss.
 `Unmanaged` payloads are small control files outside the evictable Zarr-byte
 budget. Cached Lasagna manifests use this class. Callers must choose the class
 deliberately and keep large data payloads managed.
+
+### Asynchronous Disk Vacuum
+
+Disk limits are soft during active writes. Reservations protect individual paths
+and account pending growth/temporary bytes; they do not query free space, sort
+victims, or delete files. Downloads continue while one worker per cache root
+reclaims space. Actual write failures (including ENOSPC) still follow the
+caller's existing persistence-error handling; a reservation is not a guarantee
+that the filesystem can accept the bytes.
+
+The worker wakes on write reservation/completion, limit changes, subtree changes,
+and pin release when cleanup is blocked by pins. There is no polling timer.
+Status reads return the last worker measurement without filesystem access.
+Consequently unrelated disk usage changes during an idle session are noticed
+on the next cache event, not immediately.
+
+Eviction uses 32 ten-second access-generation buckets plus an oldest overflow
+list. Bucket links are pooled integer indices. Access generations use a monotonic
+clock; bucket placement is repaired lazily when selecting a victim. Recycling
+a bucket splices its contents into overflow in constant time. Pinned/writing
+entries are detached from eligibility until released, and a deletion reservation
+prevents new readers/writers from racing removal of that same file. Successful
+reads no longer write filesystem mtimes. Restart ordering is approximate, using
+file modification times; entries older than 320 seconds share the oldest class.
+
+Headroom is the smaller of 1,000 estimated storage-object sizes and 1% of the
+configured cache capacity. With no cache-size limit, filesystem capacity supplies
+the 1% cap. The estimate starts with inventoried nonempty payload sizes and then
+uses an EMA (1/32) of published nonempty objects, including complete outer shards.
+Cleanup starts below half the target headroom and reclaims the full headroom,
+respecting both the cache-size limit and a configured minimum-free-space reserve.
+The latter includes the existing free-space deficit, not just incoming bytes.
+
+Selection/lazy repair is bounded to 128 entries per batch. Filesystem deletion
+and free-space queries run outside the bookkeeping mutex. Missing victims are
+removed from accounting; failed removals are retried only on a later activity
+event, not repeatedly within one cleanup pass. Zero-byte markers remain indexed
+but are not byte-reclamation victims. If pins or failures prevent cleanup, the
+worker sleeps until further activity rather than spinning.
+
+Startup inventories the cache once and merges writes completed during inventory.
+Ordinary subtree removal/movement updates the in-memory index without rescanning
+the filesystem. A subtree change racing the initial inventory may restart that
+inventory to avoid publishing paths from the old layout.
+
+The opt-in synthetic benchmark uses 20,000 100-byte files, halves the cache limit,
+then performs 200 writes at capacity. Setup/inventory are outside measured time:
+
+```bash
+cmake --build volume-cartographer/build --target test_persistent_zarr_cache_budget -j8
+env TMPDIR="$PWD/volume-cartographer/build" VC_CACHE_BUDGET_BENCH=1 \
+  volume-cartographer/build/bin/test_persistent_zarr_cache_budget
+```
+
+Run three times on an idle machine; compare `trim_s`, `churn_s`, and `cpu_s`.
+The benchmark waits for cleanup to finish, so it includes asynchronous work rather
+than merely measuring how fast writes return. Other budget regression tests also
+run in this executable.
+
+Measured 2026-10-16 on Linux, GCC 15 Release, three runs per version (seconds):
+
+| Metric                   | Previous min / median / max | Buckets min / median / max |
+|--------------------------|-----------------------------|----------------------------|
+| Bulk trim wall           | 5.534 / 5.549 / 5.557        | 0.433 / 0.459 / 0.492      |
+| 200 writes + vacuum wall | 0.261 / 0.262 / 0.265        | 0.017 / 0.018 / 0.020      |
+| Combined CPU             | 5.738 / 5.757 / 5.768        | 0.443 / 0.478 / 0.512      |
+
+The new trim also reserves 1% headroom, so it removes slightly more data than
+the previous trim. These are local synthetic results, not remote-network or
+interactive GUI latency measurements. A worker-scoped Callgrind profile recorded
+71.6M instructions; leading identified self costs were filesystem path splitting
+(16.6%), byte hashing (7.7%), and `free` (6.6%). Instruction percentages do not
+measure filesystem wait time. The profile can be reproduced with:
+
+```bash
+env TMPDIR="$PWD/volume-cartographer/build" VC_CACHE_BUDGET_BENCH=1 \
+  valgrind --tool=callgrind --collect-atstart=no \
+  '--toggle-collect=*PersistentZarrCacheBudget::Impl::vacuum*' \
+  --callgrind-out-file=volume-cartographer/build/cache-vacuum.callgrind \
+  volume-cartographer/build/bin/test_persistent_zarr_cache_budget
+```
 
 ## Lasagna Layout
 
@@ -168,7 +249,7 @@ schedulers. Decoded payloads remain ordinary heap-owned byte vectors; they are
 not memory mapped. Sources report decoded usage and expose LRU eviction
 callbacks to the aggregate budget, but do not apply independent byte ceilings.
 
-Source-read concurrency is global to a service. The service constructor fixes
+Remote-download concurrency is global to a service. The service constructor fixes
 the physical worker capacity and initial fixed/adaptive admission policy.
 `acquireSource()` accepts only source-local metadata and persistent-cache
 options, so acquiring or reacquiring a source cannot change concurrency.
@@ -237,9 +318,10 @@ reopens the source nor refetches resident chunks. Cache retention is
 capacity-bound, not guaranteed. Explicit volume invalidation clears only that
 source and rejects stale fetch completion.
 No switch-time cancellation of already-running fetch/decode work is
-implemented. Interactive ownership comes only from explicit versioned per-view
-demand snapshots; pending work without current interactive or background
-ownership is canceled, while already-running work may drain.
+implemented. GUI ownership comes from explicit versioned per-view demand
+snapshots. Foreground computations have independent ownership; pending work
+without GUI, foreground, or background ownership is canceled, while
+already-running work may drain.
 
 Interactive VC3D renders publish versioned per-view demand before normal
 sampling starts. A sparse, stratified viewport probe associates missing chunks
@@ -275,17 +357,35 @@ Fallback bounds use the same declared scale; they never estimate scale from
 generated coordinates or cache contents. `QuadSurface::scale()` only maps its
 point grid to base-voxel surface coordinates and is not a second LOD.
 
-GUI and non-GUI callers use separate pending lanes in three shared scheduler
-stages:
+GUI rendering, view-independent foreground computation, ordinary background
+work, and maintenance use separate pending lanes in the shared scheduler stages:
 
 1. A 32-worker local probe stage classifies persistent data objects, persistent
    empty markers, and cache misses using filesystem metadata only.
-2. A source-read stage performs remote downloads, or direct source reads when
-   no persistent cache is configured. Its physical capacity and initial
-   admission policy are service construction options; only
-   `ChunkCacheService::configureFetchConcurrency()` changes admission later.
+2. Source reads have two independent queues and worker pools. Local encoded
+   source reads use 16 workers by default (`Options::localReadWorkers`, fixed
+   at service creation). Remote sources use the existing adaptive/manual
+   download pool; `ChunkCacheService::configureFetchConcurrency()` changes only
+   its admission. Network requests cannot occupy local source-read slots.
+   Classification comes from the fetcher/store, including remote Lasagna stores
+   which can also serve persistent disk hits, not from whether telemetry exists.
 3. An eight-worker CPU stage reads persistent object hits and decodes logical
    chunks from persistent or newly downloaded object bytes.
+
+Lasagna corner sampling used by fiber prediction/normal tracing and line solves
+requests foreground computation priority through `ChunkRequestContext::foreground`.
+Blocking corner sampling carries that context through dependency prefetch and
+blocking reads (including retries). At every stage, GUI and foreground work
+alternate when both are pending; GUI level/view/distance ordering remains intact
+within its lane. After seven interactive selections, an ordinary background task
+gets a turn if pending. Maintenance remains last. A chunk required by a solve
+survives view-demand replacement/closure without a fake view ID. Shared chunks
+and shard objects remain deduplicated, including mixed GUI/solve consumers.
+
+The local pool reads encoded bytes; production Zarr decompression remains in the
+eight-worker decode pool. Custom fetchers using the legacy combined `fetch()`
+interface may still decode inside their source call. None of these settings
+creates another cache or changes stored values.
 
 The local probe never reads or decodes payloads. Consequently it can classify
 the visible working set quickly, send known misses to the network, and send

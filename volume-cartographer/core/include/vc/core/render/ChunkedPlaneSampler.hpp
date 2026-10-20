@@ -243,7 +243,8 @@ public:
         void* visitorContext,
         TrilinearCornerPointVisitor visitor,
         int parallelThreads = 0,
-        bool collectLocalityStats = false);
+        bool collectLocalityStats = false,
+        const ChunkRequestContext& request = {});
 
     // Fine-to-coarse fallback. Finer covered pixels are never overwritten by
     // coarser levels.

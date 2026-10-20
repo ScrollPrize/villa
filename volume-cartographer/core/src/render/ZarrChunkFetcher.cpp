@@ -102,6 +102,7 @@ bool isMissingZarrMetadataError(const std::exception& error)
 
 class ClassifyingHttpStore final : public utils::Store {
 public:
+    bool is_remote() const noexcept override { return true; }
     explicit ClassifyingHttpStore(std::string baseUrl, vc::HttpAuth auth = {})
         : baseUrl_(stripTrailingSlash(std::move(baseUrl)))
         , client_(makeClient(std::move(auth)))
@@ -273,6 +274,11 @@ public:
     [[nodiscard]] bool measuresRemoteTransfer() const noexcept override
     {
         return remoteHttp_;
+    }
+
+    [[nodiscard]] bool isRemoteSource() const noexcept override
+    {
+        return remoteHttp_ || array_->is_remote();
     }
 
     ChunkFetchResult fetchEncoded(const ChunkKey& key) override

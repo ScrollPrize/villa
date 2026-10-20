@@ -776,7 +776,7 @@ NB_MODULE(volume, m)
                   ->configureFetchConcurrency(count, false);
           },
           "count"_a,
-          "Set fixed process-wide regular chunk source-read concurrency.");
+          "Set fixed process-wide remote-download concurrency; local source reads use a separate pool.");
     m.def("set_chunk_cache_decode_threads",
           [](std::size_t count) {
               if (count == 0)

@@ -669,6 +669,11 @@ struct ChunkCacheService::Impl {
                 options.decodedByteCapacity);
         }
 
+        if (options.localReadWorkers == 0)
+            throw std::invalid_argument("local source-read worker count must be positive");
+        localReadScheduler = std::make_shared<ChunkRequestScheduler>(
+            options.localReadWorkers, 7, schedulerSelectionGate);
+
         std::optional<ChunkRequestScheduler::AdaptiveConcurrency> adaptiveOptions;
         std::optional<ChunkRequestScheduler::AdaptiveState> initialState;
         if (activeFetchAdaptive) {
@@ -712,6 +717,7 @@ struct ChunkCacheService::Impl {
     std::shared_ptr<ChunkRequestScheduler> decodeScheduler;
     std::size_t activeDecodeWorkers;
     std::shared_ptr<ChunkRequestScheduler> fetchScheduler;
+    std::shared_ptr<ChunkRequestScheduler> localReadScheduler;
     std::size_t activeFetchWorkers = 0;
     bool activeFetchAdaptive = false;
 };
@@ -773,6 +779,7 @@ ChunkCacheService::~ChunkCacheService()
     // schedulers so their worker threads are joined by this thread.
     impl_->probeScheduler->waitIdle();
     impl_->fetchScheduler->waitIdle();
+    impl_->localReadScheduler->waitIdle();
     impl_->decodeScheduler->waitIdle();
 }
 
@@ -803,6 +810,10 @@ std::shared_ptr<ChunkCacheService> configureProcessChunkCacheService(
         options.decodeWorkerCapacity != registry.service->decodeWorkerCapacity()) {
         throw std::invalid_argument(
             "process ChunkCacheService probe/decode capacity is fixed after creation");
+    }
+    if (options.localReadWorkers != registry.service->localReadWorkers()) {
+        throw std::invalid_argument(
+            "process ChunkCacheService local worker capacity is fixed after creation");
     }
     if (options.persistentCacheEncoding !=
         registry.service->persistentCacheEncoding()) {
@@ -960,6 +971,7 @@ std::shared_ptr<ChunkCache> ChunkCacheService::acquireSource(
     state->persistentCacheWarning_ = std::move(cachePreparation.warning);
     state->probeScheduler_ = impl_->probeScheduler;
     state->fetchScheduler_ = impl_->fetchScheduler;
+    state->localReadScheduler_ = impl_->localReadScheduler;
     state->decodeScheduler_ = impl_->decodeScheduler;
     state->schedulerSelectionGate_ = impl_->schedulerSelectionGate;
     state->activeViewId_ = impl_->activeViewId;
@@ -1010,6 +1022,11 @@ void ChunkCacheService::configureDecodeConcurrency(
     std::lock_guard lock(impl_->mutex);
     impl_->decodeScheduler->configureConcurrency(maxConcurrentDecodes);
     impl_->activeDecodeWorkers = maxConcurrentDecodes;
+}
+
+std::size_t ChunkCacheService::localReadWorkers() const noexcept
+{
+    return impl_->localReadScheduler->workerCapacity();
 }
 
 ChunkCacheService::FetchConcurrency ChunkCacheService::fetchConcurrency() const
@@ -1210,6 +1227,8 @@ void ChunkCache::refreshFetchers(
         ++state->fetcherGeneration_;
         const std::uint64_t schedulerEpoch = ++state->schedulerEpoch_;
         if (auto scheduler = state->fetchScheduler_.lock())
+            scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
+        if (auto scheduler = state->localReadScheduler_.lock())
             scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
         if (auto scheduler = state->probeScheduler_.lock())
             scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
@@ -1730,6 +1749,12 @@ ChunkResult ChunkCache::getChunkIfCached(int level, int iz, int iy, int ix)
 
 ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
 {
+    return getChunkBlocking(level, iz, iy, ix, {});
+}
+
+ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix,
+                                        const ChunkRequestContext& request)
+{
     if(const auto* pinned=borrowedPinnedChunk(this,level,iz,iy,ix)) return *pinned;
     detail::SamplingWaitTimer operationTimer(0);
     auto state = state_;
@@ -1795,7 +1820,8 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
     try {
         for (int attempt = 0;; ++attempt) {
             auto [it, inserted] = state->entries_.emplace(key, Entry{});
-            it->second.backgroundDemand = true;
+            it->second.foregroundDemand |= request.foreground;
+            it->second.backgroundDemand |= !request.foreground;
             bool notifyRemoteStart = false;
             if (inserted) {
                 try {
@@ -1813,8 +1839,8 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
             } else if (it->second.status == EntryStatus::InFlight) {
                 const int boosted =
                     fetchBasePriority(*state, key, kBlockingFetchPriorityOffset);
-                if (boosted < it->second.basePriority) {
-                    it->second.basePriority = boosted;
+                if (boosted < it->second.basePriority || request.foreground) {
+                    it->second.basePriority = std::min(boosted, it->second.basePriority);
                     reprioritizeEntryLocked(*state, key, it->second);
                 }
             }
@@ -1834,7 +1860,8 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
                 auto entry = state->entries_.find(key);
                 if (entry == state->entries_.end())
                     return true;
-                entry->second.backgroundDemand = true;
+                entry->second.foregroundDemand |= request.foreground;
+                entry->second.backgroundDemand |= !request.foreground;
                 return entry->second.status != EntryStatus::InFlight;
             });
             }
@@ -2443,6 +2470,8 @@ void ChunkCache::invalidateState(const std::shared_ptr<State>& state)
     }
     if (auto scheduler = state->fetchScheduler_.lock())
         scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
+    if (auto scheduler = state->localReadScheduler_.lock())
+        scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
     if (auto scheduler = state->probeScheduler_.lock())
         scheduler->cancelGroupBefore(state->schedulerGroup_, schedulerEpoch);
     if (auto scheduler = state->decodeScheduler_.lock())
@@ -2561,7 +2590,7 @@ ChunkCache::PersistentRequestResult ChunkCache::persistChunkBlocking(
                     } else {
                         priority.maintenance = true;
                     }
-                    if (auto scheduler = state->fetchScheduler_.lock())
+                    if (auto scheduler = sourceScheduler(*state, *transfer->second.fetcher))
                         scheduler->reprioritize(
                             transfer->second.taskId, priority);
                 }
@@ -2789,6 +2818,7 @@ ChunkWorkPriority ChunkCache::workPriorityLocked(const State& state,
     ChunkWorkPriority priority;
     priority.levelPriority = fetchBasePriority(state, key, 0);
     priority.backgroundPriority = entry.basePriority;
+    priority.foreground = entry.foregroundDemand;
     if (entry.viewDemands.empty())
         return priority;
 
@@ -2859,7 +2889,7 @@ void ChunkCache::reprioritizeEntryLocked(const State& state,
             scheduler->reprioritize(entry.probeTaskId, priority);
     }
     if (!sharedObjectTask && entry.fetchTaskId != 0) {
-        if (auto scheduler = state.fetchScheduler_.lock())
+        if (auto scheduler = sourceScheduler(state, *state.fetchers_.at(key.level)))
             scheduler->reprioritize(entry.fetchTaskId, priority);
     }
     if (!sharedObjectTask && entry.decodeTaskId != 0) {
@@ -2901,10 +2931,12 @@ ChunkWorkPriority ChunkCache::storageObjectPriorityLocked(
              candidateDistance < bestDistance) ||
             (!candidate.interactive && !best.interactive &&
              candidate.backgroundPriority < best.backgroundPriority);
+        const bool foreground = best.foreground || candidate.foreground;
         if (better) {
             best = candidate;
             have = true;
         }
+        best.foreground = foreground;
     }
     best.maintenance = !have;
     return best;
@@ -2923,7 +2955,7 @@ void ChunkCache::reprioritizeStorageObjectTransferLocked(
         scheduler = state.decodeScheduler_.lock();
         break;
     case StorageObjectTransfer::Stage::Source:
-        scheduler = state.fetchScheduler_.lock();
+        scheduler = sourceScheduler(state, *transfer.fetcher);
         break;
     }
     if (scheduler)
@@ -2936,6 +2968,10 @@ bool ChunkCache::addRequestDemandLocked(State& state,
                                         Entry& entry,
                                         const ChunkRequestContext& request)
 {
+    if (request.foreground) {
+        entry.foregroundDemand = true;
+        return true;
+    }
     if (!request.interactive()) {
         entry.backgroundDemand = true;
         return true;
@@ -2963,7 +2999,7 @@ bool ChunkCache::addRequestDemandLocked(State& state,
 
 bool ChunkCache::hasDemandLocked(const Entry& entry)
 {
-    return entry.backgroundDemand || !entry.viewDemands.empty();
+    return entry.backgroundDemand || entry.foregroundDemand || !entry.viewDemands.empty();
 }
 
 bool ChunkCache::hasParkedBlockingReaderLocked(const State& state,
@@ -3016,7 +3052,7 @@ bool ChunkCache::cancelUndemandedEntryLocked(State& state,
                             scheduler = state.decodeScheduler_.lock();
                             break;
                         case StorageObjectTransfer::Stage::Source:
-                            scheduler = state.fetchScheduler_.lock();
+                            scheduler = sourceScheduler(state, *transfer->second.fetcher);
                             break;
                         }
                         if (scheduler && scheduler->cancel(transfer->second.taskId))
@@ -3061,10 +3097,10 @@ bool ChunkCache::cancelUndemandedEntryLocked(State& state,
         priority.maintenance = true;
         if (const auto operation = transfer->second.persistence.lock())
             priority.reserveForegroundSlot = !operation->refresh;
-        if (auto scheduler = state.fetchScheduler_.lock())
+        if (auto scheduler = sourceScheduler(state, *transfer->second.fetcher))
             scheduler->reprioritize(sourceTaskId, priority);
     } else {
-        cancel(entry.fetchTaskId, state.fetchScheduler_);
+        cancel(entry.fetchTaskId, sourceScheduler(state, *state.fetchers_.at(key.level)));
     }
     if (sourceTaskId != 0 && entry.fetchTaskId == 0) {
         transfer = state.sourceTransfers_.find(key);
@@ -3261,6 +3297,13 @@ void ChunkCache::queueRemoteFetch(const std::shared_ptr<State>& state,
         state->cv_.notify_all();
 }
 
+std::shared_ptr<ChunkRequestScheduler> ChunkCache::sourceScheduler(
+    const State& state, const IChunkFetcher& fetcher)
+{
+    return (fetcher.isRemoteSource()
+        ? state.fetchScheduler_ : state.localReadScheduler_).lock();
+}
+
 void ChunkCache::joinSourceTransferLocked(
     const std::shared_ptr<State>& state,
     const ChunkKey& key,
@@ -3268,7 +3311,7 @@ void ChunkCache::joinSourceTransferLocked(
     bool decodeRequested,
     const std::shared_ptr<PersistenceOperation>& persistence)
 {
-    auto scheduler = state->fetchScheduler_.lock();
+    auto scheduler = sourceScheduler(*state, *context.fetcher);
     if (!scheduler)
         return;
 
@@ -3708,7 +3751,7 @@ bool ChunkCache::joinStorageObjectTransferLocked(
     state->storageObjectTransfers_.emplace(objectKey, std::move(transfer));
     auto scheduler = stage == StorageObjectTransfer::Stage::Probe
         ? state->probeScheduler_.lock()
-        : state->fetchScheduler_.lock();
+        : sourceScheduler(*state, *context.fetcher);
     if (!scheduler)
         return false;
     std::weak_ptr<State> weakState = state;
@@ -3884,7 +3927,7 @@ void ChunkCache::queueStorageObjectSourceLocked(
             operation->sourceTaskId = transfer.taskId;
         }
     }
-    auto scheduler = state->fetchScheduler_.lock();
+    auto scheduler = sourceScheduler(*state, *transfer.fetcher);
     if (!scheduler)
         return;
     const auto taskId = transfer.taskId;

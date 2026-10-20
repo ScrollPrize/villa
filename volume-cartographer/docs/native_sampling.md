@@ -42,8 +42,12 @@ Coordinates use the opened volume's level-zero frame.
 
 `sample_coords(..., sampler_threads=1)` executes the sampling stage serially.
 It does **not** disable background source-read, probe or decode workers.
-`set_chunk_cache_io_threads` and `set_chunk_cache_decode_threads` adjust admission
-on the existing pools; `set_chunk_cache_budget` changes decoded-cache capacity.
+`set_chunk_cache_io_threads` adjusts remote-download admission;
+`set_chunk_cache_decode_threads` adjusts decode admission on the existing pools.
+Local source reads use the independent pool introduced upstream (16 workers by
+default, configured through C++ `ChunkCacheService::Options.localReadWorkers`),
+not the remote-download limit.
+`set_chunk_cache_budget` changes decoded-cache capacity.
 Repeated initialization must preserve physical pool capacities.
 Legacy C++ `LasagnaNormalSamplerOptions.maxCachedBytes` remains accepted, but
 sets the shared process budget rather than creating a second channel cache.
@@ -81,9 +85,9 @@ cmake --build volume-cartographer/build/pr-native --target \
   vc_volume vc_fiber_trace test_chunk_cache test_chunked_plane_sampler \
   test_chunked_plane_sampler_fallback test_lasagna_normal_sampler \
   test_http_fetch_errors test_global_cache_root test_remote_file_cache \
-  test_lasagna_manifest test_volume_extras -j 8
+  test_lasagna_manifest test_volume_extras test_persistent_zarr_cache_budget -j 8
 ctest --test-dir volume-cartographer/build/pr-native --output-on-failure \
-  -R '^test_(chunk_cache|chunked_plane_sampler|chunked_plane_sampler_fallback|lasagna_normal_sampler|http_fetch_errors|global_cache_root|remote_file_cache|lasagna_manifest|volume_extras)$'
+  -R '^test_(chunk_cache|chunked_plane_sampler|chunked_plane_sampler_fallback|lasagna_normal_sampler|http_fetch_errors|global_cache_root|remote_file_cache|lasagna_manifest|volume_extras|persistent_zarr_cache_budget)$'
 python -m pytest -q \
   volume-cartographer/python/tests/test_native_sampling.py \
   volume-cartographer/python/tests/test_fiber_trace.py \

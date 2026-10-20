@@ -110,6 +110,8 @@ private:
 
 class MultiBlockingFetcher : public IChunkFetcher {
 public:
+    bool isRemoteSource() const noexcept override { return remote; }
+    bool remote = false;
     ChunkFetchResult fetch(const ChunkKey& key) override
     {
         {
@@ -487,6 +489,9 @@ ChunkCacheService::Options serviceOptions(
         8, maxConcurrentReads);
     options.fetchConcurrency.maxConcurrentReads = maxConcurrentReads;
     options.fetchConcurrency.adaptive = adaptive;
+    // Ordering fixtures deliberately use the same small capacity for both
+    // independent pools unless the test explicitly exercises their separation.
+    options.localReadWorkers = maxConcurrentReads;
     return options;
 }
 
@@ -721,6 +726,7 @@ TEST_CASE("ChunkCacheService increases admission without restarting work")
     auto service = makeService(1024 * 1024, 1);
     auto fetcher = std::make_shared<MultiBlockingFetcher>();
     auto cache = makeServiceCache(service, "scheduler-reconfigure", fetcher);
+    fetcher->remote = true;
     std::atomic<int> callbacks{0};
     cache->addChunkReadyListener([&] { ++callbacks; });
 
@@ -742,6 +748,72 @@ TEST_CASE("ChunkCacheService increases admission without restarting work")
     const auto concurrency = service->fetchConcurrency();
     CHECK(concurrency.maxConcurrentReads == 2);
     CHECK_FALSE(concurrency.adaptive);
+}
+
+TEST_CASE("Local source reads progress while remote admission is saturated")
+{
+    auto options = serviceOptions(1024 * 1024, 1);
+    options.localReadWorkers = 16;
+    auto service = std::make_shared<ChunkCacheService>(options);
+    CHECK(service->localReadWorkers() == 16);
+    CHECK(ChunkCacheService::Options{}.localReadWorkers == 16);
+    auto remote = std::make_shared<MultiBlockingFetcher>();
+    remote->remote = true;
+    auto local = std::make_shared<CountingFetcher>();
+    auto remoteCache = makeServiceCache(service, "remote-saturated", remote);
+    auto localCache = makeServiceCache(service, "local-independent", local);
+    FetcherReleaseGuard release(*remote);
+    remoteCache->tryGetChunk(0, 0, 0, 0);
+    REQUIRE(remote->waitForStarted(1, std::chrono::seconds{2}));
+    remoteCache->tryGetChunk(0, 0, 0, 1);
+    CHECK_FALSE(remote->waitForStarted(2, std::chrono::milliseconds{50}));
+    localCache->tryGetChunk(0, 0, 0, 0);
+    CHECK(waitForResolved(*localCache, 0, 0, 0, 0).status == ChunkStatus::Missing);
+    CHECK(local->fetchCalls == 1);
+    service->configureFetchConcurrency(2, false);
+    CHECK(service->localReadWorkers() == 16);
+    REQUIRE(remote->waitForStarted(2, std::chrono::seconds{2}));
+}
+
+TEST_CASE("Foreground computation survives view demand replacement")
+{
+    auto service = makeService(1024 * 1024, 1);
+    auto fetcher = std::make_shared<MultiBlockingFetcher>();
+    auto cache = makeServiceCache(service, "foreground-demand", fetcher);
+    FetcherReleaseGuard release(*fetcher);
+    cache->tryGetChunk(0, 0, 0, 0);
+    REQUIRE(fetcher->waitForStarted(1, std::chrono::seconds{2}));
+    const vc::render::ChunkRequestContext view{91, 1};
+    cache->replaceViewDemand(view, {0, 0}, {{{0, 0, 0, 1}, {0, 0}, 0}});
+    cache->prefetchChunks({{0, 0, 0, 1}}, false, 0,
+                         {.foreground = true});
+    cache->replaceViewDemand({91, 2}, {0, 0}, {});
+    cache->clearViewDemand(91, 3);
+    fetcher->release();
+    // Observe the original queued request starting before any read could
+    // accidentally resubmit a canceled request.
+    CHECK(fetcher->waitForStarted(2, std::chrono::seconds{2}));
+    CHECK(waitForResolved(*cache, 0, 0, 0, 1).status == ChunkStatus::Data);
+    CHECK(fetcher->calls({0, 0, 0, 1}) == 1);
+}
+
+TEST_CASE("Default local source pool admits sixteen reads independently of download settings")
+{
+    ChunkCacheService::Options options;
+    options.fetchConcurrency.workerCapacity = 1;
+    options.fetchConcurrency.maxConcurrentReads = 1;
+    auto service = std::make_shared<ChunkCacheService>(options);
+    auto fetcher = std::make_shared<MultiBlockingFetcher>();
+    auto cache = service->acquireSource(
+        "sixteen-local-readers", {{{4, 4, 68}, {4, 4, 4}, {}}},
+        {fetcher}, 0.0, ChunkDtype::UInt8);
+    FetcherReleaseGuard release(*fetcher);
+    for (int x = 0; x < 17; ++x)
+        cache->tryGetChunk(0, 0, 0, x);
+    CHECK(fetcher->waitForStarted(16, std::chrono::seconds{2}));
+    CHECK_FALSE(fetcher->waitForStarted(17, std::chrono::milliseconds{50}));
+    fetcher->release();
+    CHECK(waitForResolved(*cache, 0, 0, 0, 16).status == ChunkStatus::Data);
 }
 
 TEST_CASE("ChunkCacheService shares results and keeps sources warm")
@@ -780,7 +852,7 @@ TEST_CASE("ChunkCacheService shares results and keeps sources warm")
 
 TEST_CASE("ChunkCacheService refreshes in-flight fetchers without stale publication")
 {
-    auto service = makeService();
+    auto service = makeService(1024 * 1024, 2);
     auto expired = std::make_shared<BlockingEncodedFetcher>();
     auto first = makeServiceCache(service, "credential-refresh", expired, 2);
 
@@ -855,7 +927,7 @@ TEST_CASE("ChunkCacheService refresh retries retained source errors")
 
 TEST_CASE("ChunkCache source-scoped view clear preserves other sources")
 {
-    auto service = makeService();
+    auto service = makeService(1024 * 1024, 1);
     auto blocker = std::make_shared<BlockingFetcher>();
     auto baseFetcher = std::make_shared<CountingFetcher>();
     auto overlayFetcher = std::make_shared<CountingFetcher>();
@@ -2357,7 +2429,8 @@ TEST_CASE("ChunkCache active-view marking defers queue resort until render publi
 
 TEST_CASE("ChunkCacheService prioritizes the active view across sources")
 {
-    auto service = makeService();
+    // This ordering test needs one local worker, not just one download slot.
+    auto service = makeService(1024 * 1024, 1);
     auto order = std::make_shared<SharedServiceFetchOrder>();
     auto fetcherB = std::make_shared<LabeledServiceFetcher>(order, 'B', false);
     auto fetcherA = std::make_shared<LabeledServiceFetcher>(order, 'A', true);
@@ -2513,6 +2586,32 @@ TEST_CASE("ChunkRequestScheduler cancels pending keyed work only once")
     cv.notify_all();
     scheduler.waitIdle();
     CHECK(order == std::vector<int>{1});
+}
+
+TEST_CASE("ChunkRequestScheduler alternates GUI and foreground and retains background fairness")
+{
+    auto gate = std::make_shared<ChunkRequestSelectionGate>();
+    ChunkRequestScheduler scheduler(1, 3, gate);
+    std::vector<int> order;
+    gate->publish([&] {
+        for (int i = 0; i < 4; ++i) {
+            ChunkWorkPriority gui;
+            gui.interactive = true;
+            gui.levelPriority = 100;
+            scheduler.submit(1 + i, gui, 1, 0, [&, i] { order.push_back(10 + i); });
+            ChunkWorkPriority trace;
+            trace.foreground = true;
+            scheduler.submit(11 + i, trace, 2, 0, [&, i] { order.push_back(20 + i); });
+        }
+        scheduler.submit(21, {}, 3, 0, [&] { order.push_back(30); });
+        ChunkWorkPriority pending;
+        scheduler.submit(22, pending, 4, 0, [&] { order.push_back(99); });
+        pending.foreground = true;
+        CHECK(scheduler.reprioritize(22, pending));
+        CHECK(scheduler.cancel(22));
+    });
+    scheduler.waitIdle();
+    CHECK(order == std::vector<int>{10, 20, 11, 30, 21, 12, 22, 13, 23});
 }
 
 TEST_CASE("ChunkRequestScheduler bounds interactive bursts")
