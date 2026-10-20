@@ -441,10 +441,8 @@ class PointDenseHead(nn.Module):
 
         # Top-down 3D FPN over the 16^3 -> 32^3 CNN skip grids so 128^3 and 64^3 grids
         # are only indexed by sample_grid_points and freed before iBOT backward.
-        fpn_skips = self.skip_channels[2:] if len(self.skip_channels) > 2 else self.skip_channels[1:]
-        if not fpn_skips:
-            fpn_skips = self.skip_channels
-        self._fpn_skip_start = max(0, len(self.skip_channels) - len(fpn_skips))
+        self._fpn_skip_start = self.fpn_skip_start(len(self.skip_channels))
+        fpn_skips = self.skip_channels[self._fpn_skip_start:]
         self.fpn_in = nn.Conv3d(self.token_dim, self.fpn_dim, kernel_size=1)
         self.fpn_laterals = nn.ModuleList(
             nn.Conv3d(ch, self.fpn_dim, kernel_size=1) for ch in reversed(fpn_skips)
@@ -475,6 +473,13 @@ class PointDenseHead(nn.Module):
         self.obj_proj = nn.Linear(self.hidden_dim, self.out_dim)
         self.ink_proj = nn.Linear(self.hidden_dim, self.ink_dim)
 
+    @staticmethod
+    def fpn_skip_start(num_skips: int) -> int:
+        """Index of the first (finest) CNN skip level the FPN refines; finer ones are only sampled."""
+        if num_skips > 2:
+            return 2
+        return 1 if num_skips == 2 else 0
+
     def _sample_fpn_points(
         self,
         token_grid: torch.Tensor,
@@ -501,14 +506,18 @@ class PointDenseHead(nn.Module):
         skips: list[torch.Tensor],
         point_coordinates: torch.Tensor,
         input_shape: Tuple[int, ...],
+        skip_points: Optional[list[torch.Tensor]] = None,
     ) -> dict[str, torch.Tensor]:
+        """skip_points: the skips already sampled at point_coordinates (the backbone's
+        embed_skip_points); skips then only needs the FPN levels."""
         dtype = token_grid.dtype
         tokens = sample_grid_points(token_grid, point_coordinates, input_shape)
         fpn_pts = self.fpn_norm(self._sample_fpn_points(token_grid, skips, point_coordinates, input_shape))
-        skip_parts = [
-            norm(sample_grid_points(level.permute(0, 2, 3, 4, 1), point_coordinates, input_shape).to(dtype))
-            for norm, level in zip(self.skip_norms, skips)
-        ]
+        if skip_points is None:
+            skip_points = [
+                sample_grid_points(level.permute(0, 2, 3, 4, 1), point_coordinates, input_shape) for level in skips
+            ]
+        skip_parts = [norm(points.to(dtype)) for norm, points in zip(self.skip_norms, skip_points)]
         tokens_cast = tokens.to(dtype)
         trunk = self.trunk_norm(
             self.mlp(torch.cat([tokens_cast, *skip_parts, fpn_pts], dim=-1)) + self.token_shortcut(tokens_cast)
@@ -544,6 +553,9 @@ class DinoVitStudentTeacher(nn.Module):
         self.dense_enabled = bool(self.dense_config.get("enabled", False))
         if self.dense_enabled:
             student_backbone.return_embed_skips = True
+            student_backbone.embed_skip_grid_start = PointDenseHead.fpn_skip_start(
+                len(student_backbone.down_projection.skip_channels)
+            )
         teacher_backbone = deepcopy(student_backbone)
 
         student_modules = {
@@ -861,8 +873,9 @@ class DinoVitStudentTeacher(nn.Module):
             "cls_tokens": cls_tokens,
             "patch_tokens": backbone_outputs["x_norm_patchtokens"],
         }
-        if "embed_skips" in backbone_outputs:
-            outputs["embed_skips"] = backbone_outputs["embed_skips"]
+        for key in ("embed_skips", "embed_skip_points"):
+            if key in backbone_outputs:
+                outputs[key] = backbone_outputs[key]
         if project_cls_tokens:
             outputs["cls_projections"] = self.project_cls_tokens(branch, cls_tokens)
         if project_patch_tokens:
@@ -878,8 +891,12 @@ class DinoVitStudentTeacher(nn.Module):
         project_patch_tokens: bool = False,
         *,
         view_kind: str = "global",
+        point_coordinates: Optional[torch.Tensor] = None,
     ) -> Mapping[str, torch.Tensor] | list[dict[str, torch.Tensor]]:
-        backbone_outputs = branch.backbone(x, masks=masks, is_training=self.training, view_kind=view_kind)
+        """point_coordinates: dense-head points; the backbone then samples its CNN skips there."""
+        backbone_outputs = branch.backbone(
+            x, masks=masks, is_training=self.training, view_kind=view_kind, point_coordinates=point_coordinates
+        )
         if isinstance(backbone_outputs, list):
             return [
                 self._format_branch_outputs(
@@ -925,10 +942,11 @@ class DinoVitStudentTeacher(nn.Module):
         released (the teacher's) or left to autograd (the student's).
         """
         skips = outputs.pop("embed_skips")
+        skip_points = outputs.pop("embed_skip_points", None)
         patch_tokens = outputs["patch_tokens"]
         token_shape = tuple(size // patch for size, patch in zip(input_shape, branch.backbone.patch_size))
         token_grid = patch_tokens.reshape(patch_tokens.shape[0], *token_shape, patch_tokens.shape[-1])
-        return branch.dense_head.forward_points(token_grid, skips, point_coordinates, input_shape)
+        return branch.dense_head.forward_points(token_grid, skips, point_coordinates, input_shape, skip_points)
 
     def forward(
         self,
@@ -967,11 +985,13 @@ class DinoVitStudentTeacher(nn.Module):
                     project_cls_tokens=project_cls_tokens,
                     project_patch_tokens=project_teacher_patch_tokens and mask_indices_list is None,
                     view_kind="global",
+                    point_coordinates=point_coordinates,
                 )
                 teacher_points = None
                 if point_coordinates is not None and "embed_skips" in teacher_outputs:
                     teacher_points = self._point_features(self.teacher, teacher_outputs, point_coordinates, input_shape)
                 teacher_outputs.pop("embed_skips", None)
+                teacher_outputs.pop("embed_skip_points", None)
                 if mask_indices_list is None:
                     teacher_result = teacher_outputs
                 else:
@@ -996,11 +1016,13 @@ class DinoVitStudentTeacher(nn.Module):
             project_cls_tokens=project_cls_tokens,
             project_patch_tokens=project_student_patch_tokens and mask_indices_list is None,
             view_kind="global",
+            point_coordinates=point_coordinates,
         )
         student_points = None
         if point_coordinates is not None and "embed_skips" in student_outputs:
             student_points = self._point_features(self.student, student_outputs, point_coordinates, input_shape)
         student_outputs.pop("embed_skips", None)
+        student_outputs.pop("embed_skip_points", None)
         if mask_indices_list is None:
             outputs: dict[str, Mapping[str, torch.Tensor] | dict[str, Mapping[str, torch.Tensor] | torch.Tensor]] = {
                 "student": student_outputs

@@ -54,11 +54,15 @@ class LayerNormNd(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Statistics and affine in float32, output in the input dtype. Under autocast the
+        # float32 affine parameters would otherwise promote every activation to float32.
+        dtype = x.dtype
+        x = x.float()
         u = x.mean(1, keepdim=True)
         s = (x - u).pow(2).mean(1, keepdim=True)
         x = (x - u) / torch.sqrt(s + self.eps)
         idx = (None, slice(None), *([None] * (x.ndim - 2)))
-        return self.weight[idx] * x + self.bias[idx]
+        return (self.weight[idx] * x + self.bias[idx]).to(dtype)
 
 
 def _is_power_of_two(value: int) -> bool:

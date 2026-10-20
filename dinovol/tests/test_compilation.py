@@ -98,7 +98,8 @@ class CompilationTests(unittest.TestCase):
 
     def test_compiled_amp_backward_matches_eager(self):
         config = self.config({"enabled": True, "backend": "aot_eager", "fullgraph": True})
-        config.update(use_amp=True, koleo_loss_weight=0.)
+        # CPU oneDNN lacks half-precision convolution backward on some platforms.
+        config.update(use_amp=True, koleo_loss_weight=0., device="cuda" if torch.cuda.is_available() else "cpu")
         compiled = DinoIBOTPretrainer(config)
         eager = DinoIBOTPretrainer({**config, "compile": False})
         eager.model_module.load_state_dict(compiled.model_module.state_dict())

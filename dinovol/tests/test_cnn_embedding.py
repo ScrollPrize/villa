@@ -11,10 +11,19 @@ from torch import nn
 
 from dinovol_2.model.dinov2_eva import EvaBlock
 from dinovol_2.model.model import DinoVitStudentTeacher, _materialize_backbone_config
-from dinovol_2.model.patch_encode_decode import PatchEmbedDeeper
+from dinovol_2.model.patch_encode_decode import LayerNormNd, PatchEmbedDeeper
+from dinovol_2.ops.point_embeddings import sample_grid_points
 
 
 class CNNEmbeddingTests(unittest.TestCase):
+    def setUp(self):
+        # Exact gradient comparisons need deterministic cuDNN weight-gradient kernels.
+        self.cudnn_deterministic = torch.backends.cudnn.deterministic
+        torch.backends.cudnn.deterministic = True
+
+    def tearDown(self):
+        torch.backends.cudnn.deterministic = self.cudnn_deterministic
+
     def test_no_grad_embedding_retains_stage_outputs_only_when_requested(self):
         encoder = PatchEmbedDeeper(
             patch_size=(4, 4, 4), input_channels=1, embed_dim=12,
@@ -237,6 +246,131 @@ class CNNEmbeddingTests(unittest.TestCase):
         ):
             with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, message):
                 PatchEmbedDeeper(patch_size=(4, 4, 4), embed_dim=24, **kwargs)
+
+
+    @unittest.skipUnless(torch.cuda.is_available(), "autocast behaviour is tested on CUDA")
+    def test_layer_norm_keeps_input_dtype_under_autocast(self):
+        torch.manual_seed(31)
+        norm = LayerNormNd(8).cuda()
+        with torch.no_grad():
+            norm.weight.uniform_(0.5, 1.5)
+            norm.bias.uniform_(-0.5, 0.5)
+        x = 4 * torch.randn(2, 8, 5, 6, 7, device="cuda") + 3
+        idx = (None, slice(None), None, None, None)
+        u = x.mean(1, keepdim=True)
+        normalized = (x - u) / torch.sqrt((x - u).pow(2).mean(1, keepdim=True) + norm.eps)
+        expected = norm.weight[idx] * normalized + norm.bias[idx]
+        # Float32 without autocast is the previous computation exactly.
+        torch.testing.assert_close(norm(x), expected, rtol=0, atol=0)
+        with torch.autocast("cuda"):
+            actual = norm(x.half())
+        self.assertEqual(actual.dtype, torch.float16)
+        torch.testing.assert_close(actual, norm(x.half().float()).half(), rtol=0, atol=0)
+
+    def _dense_backbone(self, **overrides):
+        model = DinoVitStudentTeacher({
+            "model_type": "v3", "embed_dim": 24, "num_heads": 2, "depth": 1,
+            "global_crops_size": [16] * 3, "local_crops_size": [16] * 3, "patch_size": [4] * 3,
+            "embedding_type": "deeper", "deeper_embed_stage_channels": [4, 8, 16],
+            "deeper_embed_stage_strides": [1, 2, 2], "deeper_embed_depth_per_level": [1, 2, 1],
+            "deeper_embed_final_projection": True, "deeper_embed_channels_last": True, "drop_path_rate": 0.0,
+            "rope_shift_coords": None, "rope_jitter_coords": None, "rope_rescale_coords": None,
+            "dino_out_dim": 16, "ibot_out_dim": 16, "dino_head_hidden_dim": 16, "ibot_head_hidden_dim": 16,
+            "dino_head_bottleneck_dim": 8, "ibot_head_bottleneck_dim": 8,
+            "dense_head": {"enabled": True, "hidden_dim": 16, "out_dim": 8, "ink_dim": 4},
+            **overrides,
+        })
+        return model.student
+
+    @unittest.skipUnless(torch.cuda.is_available(), "autocast behaviour is tested on CUDA")
+    def test_selective_cnn_checkpointing_matches_direct_gradients(self):
+        torch.manual_seed(37)
+        student = self._dense_backbone().cuda()
+        backbone = student.backbone
+        reference = copy.deepcopy(backbone)
+        backbone.grad_checkpointing = True
+        reference.grad_checkpointing = False
+        x = torch.randn(2, 1, 16, 16, 16, device="cuda")
+        results = []
+        for model in (backbone, reference):
+            with torch.autocast("cuda"):
+                features = model(x)
+                outputs = [features["x_norm_patchtokens"], *features["embed_skips"]]
+            loss = sum((output.float() * torch.linspace(-1, 1, output.numel(), device="cuda").view_as(output)).sum()
+                       for output in outputs)
+            loss.backward()
+            results.append((outputs, [p.grad for p in model.parameters()]))
+        (outputs, grads), (ref_outputs, ref_grads) = results
+        for actual, expected in zip(outputs, ref_outputs):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for actual, expected in zip(grads, ref_grads):
+            if expected is None:
+                self.assertIsNone(actual)
+            else:
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "memory is measured on CUDA")
+    def test_selective_cnn_checkpointing_saves_one_tensor_per_convolution(self):
+        torch.manual_seed(41)
+        cnn = PatchEmbedDeeper(
+            patch_size=(4, 4, 4), input_channels=1, embed_dim=16, stage_channels=(16, 16, 16),
+            stage_strides=(1, 2, 2), depth_per_level=(1, 1, 1), stem_type="conv", stem_channels=16,
+            channels_last=True,
+        ).cuda()
+        cnn.to(memory_format=cnn.memory_format)
+        backbone = self._dense_backbone().backbone.cuda()
+        backbone.down_projection = cnn
+        x = torch.randn(1, 1, 64, 64, 64, device="cuda", requires_grad=True)
+        retained = {}
+        for checkpointing in (False, True):
+            backbone.grad_checkpointing = checkpointing
+            torch.cuda.synchronize()
+            start = torch.cuda.memory_allocated()
+            with torch.autocast("cuda"):
+                tokens = backbone._run_down_projection(x)
+            retained[checkpointing] = torch.cuda.memory_allocated() - start - tokens.untyped_storage().nbytes()
+            tokens.float().sum().backward()
+        # Full-resolution fp16 tensors: stem conv, block conv1, block conv2, one each.
+        full_resolution = 16 * 64 ** 3 * 2
+        self.assertLess(retained[True], 3.5 * full_resolution)
+        self.assertGreater(retained[False], 2 * retained[True])
+
+    def test_point_sampled_skips_match_dense_head_sampling(self):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        torch.manual_seed(43)
+        student = self._dense_backbone().to(device)
+        reference = copy.deepcopy(student)
+        backbone, head = student.backbone, student.dense_head
+        self.assertEqual(backbone.embed_skip_grid_start, head._fpn_skip_start)
+        x = torch.randn(2, 1, 16, 16, 16, device=device)
+        coordinates = torch.rand(2, 9, 3, device=device) * 16 - 0.5
+        features = backbone(x, point_coordinates=coordinates)
+        grids, points = features["embed_skips"], features["embed_skip_points"]
+        self.assertEqual([grid is None for grid in grids],
+                         [index < head._fpn_skip_start for index in range(len(head.skip_channels))])
+        ref_features = reference.backbone(x)
+        ref_skips = ref_features["embed_skips"]
+        for actual, level in zip(points, ref_skips):
+            expected = sample_grid_points(level.permute(0, 2, 3, 4, 1), coordinates, (16, 16, 16))
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        def head_outputs(features, dense_head, skip_points):
+            tokens = features["x_norm_patchtokens"]
+            grid = tokens.reshape(tokens.shape[0], 4, 4, 4, tokens.shape[-1])
+            return dense_head.forward_points(grid, features["embed_skips"], coordinates, (16, 16, 16), skip_points)
+
+        actual = head_outputs(features, head, points)
+        expected = head_outputs(ref_features, reference.dense_head, None)
+        for key in expected:
+            torch.testing.assert_close(actual[key], expected[key], rtol=0, atol=0, msg=key)
+        weights = {key: torch.randn_like(value) for key, value in expected.items()}
+        sum((actual[key] * weights[key]).sum() for key in actual).backward()
+        sum((expected[key] * weights[key]).sum() for key in expected).backward()
+        for (name, parameter), ref_parameter in zip(student.named_parameters(), reference.parameters()):
+            if ref_parameter.grad is None:
+                self.assertIsNone(parameter.grad, name)
+            else:
+                torch.testing.assert_close(parameter.grad, ref_parameter.grad, msg=name)
 
 
 if __name__ == "__main__":

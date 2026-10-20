@@ -2,6 +2,7 @@
 # See THIRD_PARTY_NOTICES.md and LICENSES/Apache-2.0.txt.
 
 from collections import OrderedDict
+from functools import partial
 import math
 from typing import Callable, Optional, Tuple
 
@@ -12,7 +13,7 @@ from timm.layers import trunc_normal_, use_fused_attn, DropPath, SwiGLU, GluMlp,
 from torch import nn
 from torch.nn import LayerNorm
 from torch.nn.attention import SDPBackend, sdpa_kernel
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import CheckpointPolicy, checkpoint, create_selective_checkpoint_contexts
 from einops import rearrange
 
 from dinovol_2.model.patch_encode_decode import PatchEmbed, PatchEmbedDeeper
@@ -23,6 +24,18 @@ from dinovol_2.model.rope import (
     RopePositionEmbedding,
     apply_rotary_embedding,
 )
+from dinovol_2.ops.point_embeddings import sample_grid_points
+
+
+def _save_convolutions_policy(ctx, op, *args, **kwargs):
+    # Convolution outputs are kept; the norms and activations between them are cheap
+    # pointwise work, recomputed in backward instead of saving each one's output as well.
+    if op is torch.ops.aten.convolution.default:
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+_save_convolutions_context = partial(create_selective_checkpoint_contexts, _save_convolutions_policy)
 
 
 class InitWeights_He(object):
@@ -482,6 +495,9 @@ class Eva(nn.Module):
         # Return the CNN embedding's intermediate stage outputs of global views as
         # features["embed_skips"] (used by the dense point head).
         self.return_embed_skips = False
+        # When point coordinates are given, embed_skips keeps full grids only from this
+        # level on (None below it); every level is returned sampled at the points.
+        self.embed_skip_grid_start = 0
 
         if self.embedding_type == "deeper":
             self._assert_patch_aligned(
@@ -780,14 +796,23 @@ class Eva(nn.Module):
         # Never modify the shared crop in place: the teacher needs its original values.
         return x.masked_fill(voxel_mask, 0)
 
+    def _run_down_projection(self, x, **kwargs):
+        """With grad checkpointing, the CNN embedding is selectively checkpointed: backward
+        keeps the convolution outputs and recomputes the norms and activations between them."""
+        if (self.embedding_type == "deeper" and self.grad_checkpointing and torch.is_grad_enabled()
+                and not torch.jit.is_scripting()):
+            return checkpoint(self.down_projection, x, use_reentrant=False, context_fn=_save_convolutions_context,
+                              **kwargs)
+        return self.down_projection(x, **kwargs)
+
     def _down_project_with_skips(self, x, skips):
         batch_chunk_size = self.deeper_embed_batch_chunk_size
         if batch_chunk_size is None or x.shape[0] <= batch_chunk_size:
-            tokens, levels = self.down_projection(x, return_skips=True)
+            tokens, levels = self._run_down_projection(x, return_skips=True)
             skips.extend(levels)
             return tokens
         chunks = x.split(batch_chunk_size)
-        outputs = [self.down_projection(chunk, return_skips=True) for chunk in chunks]
+        outputs = [self._run_down_projection(chunk, return_skips=True) for chunk in chunks]
         skips.extend(torch.cat(level, dim=0) for level in zip(*(levels for _, levels in outputs)))
         return torch.cat([tokens for tokens, _ in outputs], dim=0)
 
@@ -803,9 +828,9 @@ class Eva(nn.Module):
                 raise ValueError("embedding skips require the deeper CNN embedding")
             x = self._down_project_with_skips(x, skips)
         elif self.embedding_type == "deeper" and batch_chunk_size is not None and x.shape[0] > batch_chunk_size:
-            x = torch.cat([self.down_projection(chunk) for chunk in x.split(batch_chunk_size)], dim=0)
+            x = torch.cat([self._run_down_projection(chunk) for chunk in x.split(batch_chunk_size)], dim=0)
         else:
-            x = self.down_projection(x)
+            x = self._run_down_projection(x)
         if self.ndim == 2:
             x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
         else:
@@ -820,9 +845,11 @@ class Eva(nn.Module):
 
         return x, rot_pos_embed, target_patch_shape
 
-    def forward_features_list(self, x_list, masks_list, *, view_kind: str = "global"):
+    def forward_features_list(self, x_list, masks_list, *, view_kind: str = "global", point_coordinates=None):
         if not isinstance(x_list, list):
-            return self.forward_features(x_list, masks_list, view_kind=view_kind)
+            return self.forward_features(x_list, masks_list, view_kind=view_kind, point_coordinates=point_coordinates)
+        if point_coordinates is not None:
+            raise ValueError("point_coordinates require a single input tensor, not a list")
         output = []
         for x, masks in zip(x_list, masks_list):
             x_out = self.forward_features(x, masks, view_kind=view_kind)
@@ -865,9 +892,11 @@ class Eva(nn.Module):
             "masks": masks,
         }
 
-    def forward_features(self, x, masks=None, *, view_kind: str = "global"):
+    def forward_features(self, x, masks=None, *, view_kind: str = "global", point_coordinates=None):
         skips = [] if self.return_embed_skips and view_kind == "global" else None
+        input_shape = tuple(x.shape[2:])
         x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind, skips=skips)
+        skips, skip_points = self._sample_embed_skips(skips, point_coordinates, input_shape)
         rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
         for blk in self.blocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():
@@ -875,16 +904,32 @@ class Eva(nn.Module):
                                use_reentrant=False)
             else:
                 x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
-        return self._with_skips(self._format_features(x, masks, view_kind=view_kind), skips)
+        return self._with_skips(self._format_features(x, masks, view_kind=view_kind), skips, skip_points)
+
+    def _sample_embed_skips(self, skips, point_coordinates, input_shape):
+        """Sample the CNN skips at [B, P, 3] input-voxel point coordinates before the blocks run.
+
+        The sampling backward scatters into skip-sized gradient grids. Sampled here, autograd
+        runs it after the block backward, just before the CNN backward that consumes those
+        grids, instead of holding them through the block backward. Grids below
+        embed_skip_grid_start are dropped (None) since only their samples are used.
+        """
+        if skips is None or point_coordinates is None:
+            return skips, None
+        points = [sample_grid_points(level.permute(0, 2, 3, 4, 1), point_coordinates, input_shape) for level in skips]
+        grids = [level if index >= self.embed_skip_grid_start else None for index, level in enumerate(skips)]
+        return grids, points
 
     @staticmethod
-    def _with_skips(features, skips):
+    def _with_skips(features, skips, skip_points=None):
         if skips is not None:
             features["embed_skips"] = skips
+        if skip_points is not None:
+            features["embed_skip_points"] = skip_points
         return features
 
-    def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global"):
-        return self.forward_features_list(x, masks, view_kind=view_kind)
+    def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global", point_coordinates=None):
+        return self.forward_features_list(x, masks, view_kind=view_kind, point_coordinates=point_coordinates)
 
     def load_pretrained_weights(self, state_dict, backbone_only=False, unchunk=False):
         if isinstance(state_dict, str):
@@ -1016,9 +1061,11 @@ class EvaWithChunking(Eva):
             chunks.append(block_chunk)
         self.blocks = nn.ModuleList(chunks)
 
-    def forward_features(self, x, masks=None, *, view_kind: str = "global"):
+    def forward_features(self, x, masks=None, *, view_kind: str = "global", point_coordinates=None):
         skips = [] if self.return_embed_skips and view_kind == "global" else None
+        input_shape = tuple(x.shape[2:])
         x, rot_pos_embed, rope_shape = self.prepare_tokens_with_masks(x, masks, view_kind=view_kind, skips=skips)
+        skips, skip_points = self._sample_embed_skips(skips, point_coordinates, input_shape)
         rope_coords = self._get_shared_per_block_rope_coords(rope_shape)
 
         if self.chunked_blocks:
@@ -1036,10 +1083,10 @@ class EvaWithChunking(Eva):
                 else:
                     x = blk(x, rope=rot_pos_embed, rope_shape=rope_shape, rope_coords=rope_coords)
 
-        return self._with_skips(self._format_features(x, masks, view_kind=view_kind), skips)
+        return self._with_skips(self._format_features(x, masks, view_kind=view_kind), skips, skip_points)
 
-    def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global"):
-        return self.forward_features_list(x, masks, view_kind=view_kind)
+    def forward(self, x, masks=None, is_training=True, *, view_kind: str = "global", point_coordinates=None):
+        return self.forward_features_list(x, masks, view_kind=view_kind, point_coordinates=point_coordinates)
 
 
 class Dinov2PrimusEncL(Eva):

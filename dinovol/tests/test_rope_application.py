@@ -4,7 +4,7 @@ import unittest
 
 import torch
 
-from dinovol_2.model.rope import apply_rotary_embedding, rope_apply
+from dinovol_2.model.rope import MixedRopePositionEmbedding, apply_rotary_embedding, rope_apply
 
 
 def concatenated_rotary_embedding(x, rope, prefix_tokens):
@@ -31,6 +31,19 @@ class RotaryEmbeddingTests(unittest.TestCase):
                     for got, want in zip(torch.autograd.grad(actual, (x, sin, cos), grad),
                                          torch.autograd.grad(expected, (x, sin, cos), grad)):
                         torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+    @unittest.skipUnless(torch.cuda.is_available(), "autocast behaviour is tested on CUDA")
+    def test_mixed_rope_stays_float32_under_autocast(self):
+        torch.manual_seed(7)
+        rope = MixedRopePositionEmbedding(48, ndim=3, num_heads=4, rescale_coords=None).cuda().eval()
+        coords = rope.get_coords((6, 5, 4))
+        expected = rope.get_embed_from_coords(coords)
+        with torch.autocast("cuda"):
+            actual = rope.get_embed_from_coords(coords)
+        for got, want in zip(actual, expected):
+            self.assertEqual(got.dtype, torch.float32)
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

@@ -338,7 +338,9 @@ class MixedRopePositionEmbedding(_BaseRopePositionEmbedding):
         return {"mix_frequencies"}
 
     def get_embed_from_coords(self, coords: RopeCoords) -> RopeEmbedding:
-        angles = 2 * math.pi * torch.einsum("td,hpd->htp", coords, self.mix_frequencies)
+        # Autocast would run the einsum, and so the angles and sin/cos, in half precision.
+        with torch.autocast(device_type=coords.device.type, enabled=False):
+            angles = 2 * math.pi * torch.einsum("td,hpd->htp", coords, self.mix_frequencies)
         angles = angles.tile(2)
         cos = torch.cos(angles)
         sin = torch.sin(angles)
