@@ -685,19 +685,17 @@ if(VC_RUN_RENDER_BENCHMARKS)
 
                 set(_gate "${_case_dir}/checked.json")
                 set(_gate_command
-                    $<TARGET_FILE:bench_thread_sync_replay>
-                    evaluate-render
+                    ${Python3_EXECUTABLE}
+                    "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
+                    collect-evaluate --reuse-capture
+                    --valgrind "${VC_VALGRIND_EXECUTABLE}"
+                    --benchmark $<TARGET_FILE:bench_render_synthetic>
+                    --replay $<TARGET_FILE:bench_thread_sync_replay>
                     --fixture ${_fixture}
                     --scenario ${_scenario}
-                    --callgrind-prefix "${_callgrind_prefix}"
-                    --callgrind-metadata "${_callgrind_metadata}"
+                    --case-dir "${_case_dir}"
                     --model "${_render_valgrind_ci_model}"
-                    --reference "${_render_valgrind_ci_reference}"
-                    --output "${_gate}")
-                if(_fixture STREQUAL "parallel")
-                    list(APPEND _gate_command
-                        --callgrind-scheduler "${_callgrind_scheduler}")
-                endif()
+                    --reference "${_render_valgrind_ci_reference}")
                 add_custom_command(
                     OUTPUT "${_gate}"
                     BYPRODUCTS "${_case_dir}/checked.failed.json"
@@ -706,6 +704,7 @@ if(VC_RUN_RENDER_BENCHMARKS)
                         "${_evaluation}"
                         "${_callgrind_stamp}"
                         bench_thread_sync_replay
+                        "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
                         "${_render_valgrind_ci_model}"
                         "${_render_valgrind_ci_reference}"
                     VERBATIM)
