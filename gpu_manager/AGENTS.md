@@ -17,8 +17,8 @@ A version bump is not a workaround for that requirement.
 
 Internal fixes may preserve the protocol, but require regression tests proving
 that ownership cannot be released before the client's resources are gone.
-Keep the package independent of Torch/VC3D/Lasagna. Linux/macOS support must be
-guarded where peer credentials/process inspection differ; tests must not allocate
+Keep the package independent of Torch/VC3D/Lasagna. Only Linux is supported;
+do not claim macOS support without validating process cleanup. Tests must not allocate
 real GPUs unless explicitly authorized. No sudo or hard resource enforcement.
 
 Normal tests must finish within minutes; use `python -m pytest -q gpu_manager/tests`.

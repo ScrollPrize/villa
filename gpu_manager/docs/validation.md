@@ -19,8 +19,10 @@ tests. The optional `GPU_MANAGER_SCHEMA_PYTHON` selects another interpreter with
 `jsonschema` installed; it is not needed in a complete test environment.
 
 The extracted suite passed **157 tests in 50.90 seconds** on Linux/Python 3.14.
-Linux/macOS Python 3.11/3.14 CI is configured separately; a local Linux pass
-does not certify those other platform/interpreter combinations.
+Linux Python 3.11/3.14 CI and the CPU-Torch integration job passed after the
+fixes below (run 39480512827). Only Linux is supported. macOS CI exposed an
+orphaned-loader cleanup check that still observed a live process; macOS was
+removed from the supported matrix rather than weakening that safety assertion.
 
 Initial CI exposed an undeclared optional Torch test dependency and a macOS
 page-rounded shared-memory mapping bug. Payload writes now address only their

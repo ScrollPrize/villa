@@ -28,9 +28,9 @@ python -m pip install -e ./gpu_manager
 ```
 
 For development tests, install `./gpu_manager[test]` instead. Python 3.11+
-and `psutil` are the only runtime requirements. This Unix-only package does not
-support Windows; macOS can run the metadata service/tests but NVIDIA discovery
-requires an available `nvidia-smi`.
+and `psutil` are the only runtime requirements. **Only Linux is supported.**
+macOS and Windows are unsupported; macOS process-cleanup guarantees have not
+passed validation. NVIDIA discovery requires an available `nvidia-smi`.
 
 Five optional CPU Torch/Gloo integration cases skip when those dependencies
 are absent; the standalone tests do not require Torch. CI runs the integration
@@ -38,7 +38,7 @@ cases in a separate job with CPU-only Torch installed. With Torch/Gloo available
 run them explicitly with `python -m pytest -q gpu_manager/tests -m torch`.
 
 No installer or GPU service is automatically started by importing the package.
-Linux/macOS Unix sockets are supported; NVIDIA inventory monitoring requires
+Linux Unix sockets are supported; NVIDIA inventory monitoring requires
 `nvidia-smi`. Tests use fake inventories and do not allocate GPUs.
 
 ## Service responsiveness
@@ -176,7 +176,7 @@ with the identical allocation. See the protocol's authorized scheduling amendmen
 provides gated spawned children with bounded private controls and opaque CPU RAM
 state handoff. Application adapters provide initialize/run-unit/capture/close;
 only joined children count as released. These helpers do not import Torch.
-On Ubuntu/macOS each worker has a dedicated session. Loader descendants must
+On Linux each worker has a dedicated session. Loader descendants must
 remain in that session (no `setsid`/daemon detachment); failure cleanup stops the
 whole owned session, including orphaned loaders, before allowing release.
 
