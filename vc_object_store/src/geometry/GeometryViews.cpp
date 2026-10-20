@@ -1,5 +1,6 @@
 #include "vc_object_store/store/GeometryViews.hpp"
 #include "geometry/ArrayBytes.hpp"
+#include "geometry/ArrayLayout.hpp"
 #include <nlohmann/json.hpp>
 #include <cmath>
 
@@ -26,18 +27,8 @@ struct GeometryViewState {
         if (it == revision.arrays.end()) throw std::invalid_argument("missing geometry array: " + name);
         return *it;
     }
-    void require(const char* name, const char* dtype, size_t rank, size_t scalarSize) const {
-        const auto& a = array(name);
-        if (a.dtype != dtype || a.shape.size() != rank)
-            throw std::invalid_argument("invalid typed geometry layout");
-        uint64_t bytes = scalarSize;
-        for (auto dim : a.shape) {
-            if (dim < 0 || (dim && bytes > uint64_t(INT64_MAX) / uint64_t(dim)))
-                throw std::invalid_argument("invalid typed geometry shape");
-            bytes *= dim;
-        }
-        if (a.byteLength < 0 || bytes != uint64_t(a.byteLength) || (rank > 1 && a.shape.back() != 3))
-            throw std::invalid_argument("invalid typed geometry byte length");
+    void require(const char* name, const char* dtype, size_t rank) const {
+        requireArrayLayout(array(name), dtype, rank);
     }
     std::vector<uint8_t> range(const std::string& name, int64_t start, int64_t count) const {
         const auto& a = array(name);
@@ -108,15 +99,15 @@ std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::
     auto result = std::make_shared<State>();
     result->read = state_; result->revision = *revision; result->objectRevision = object->uuid;
     if (revision->kind == "point_collection") {
-        result->require("points", "<f8", 2, 8);
-        result->require("point_ids", "<i8", 1, 8);
+        result->require("points", "<f8", 2);
+        result->require("point_ids", "<i8", 1);
         if (result->array("points").shape[0] != result->array("point_ids").shape[0])
             throw std::invalid_argument("point IDs and coordinates differ in length");
     } else if (revision->kind == "fiber") {
-        result->require("control_points", "<f8", 2, 8);
-        result->require("line_points", "<f8", 2, 8);
-    } else if (revision->kind == "track") result->require("points", "<i4", 2, 4);
-    else if (revision->kind == "patch") result->require("points", "<f4", 3, 4);
+        result->require("control_points", "<f8", 2);
+        result->require("line_points", "<f8", 2);
+    } else if (revision->kind == "track") result->require("points", "<i4", 2);
+    else if (revision->kind == "patch") result->require("points", "<f4", 3);
     else throw std::invalid_argument("unsupported geometry kind");
     return result;
 }

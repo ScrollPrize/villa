@@ -1,5 +1,6 @@
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "geometry/ArrayBytes.hpp"
+#include "geometry/ArrayLayout.hpp"
 #include <nlohmann/json.hpp>
 #include <cmath>
 #include <limits>
@@ -28,20 +29,13 @@ template<class T> double length(std::span<const std::array<T, 3>> points)
     return result;
 }
 const objects::GeometryArray& require(const objects::GeometryData& data,
-    const char* name, const char* dtype, size_t rank, size_t scalarSize)
+    const char* name, const char* dtype, size_t rank)
 {
     const auto it = std::find_if(data.arrays.begin(), data.arrays.end(),
         [&](const auto& a) { return a.name == name; });
     if (it == data.arrays.end() || it->dtype != dtype || it->shape.size() != rank)
         throw std::invalid_argument(std::string("invalid geometry array: ") + name);
-    uint64_t bytes = scalarSize;
-    for (auto dim : it->shape) {
-        if (dim < 0 || (dim && bytes > uint64_t(INT64_MAX) / uint64_t(dim)))
-            throw std::invalid_argument("invalid geometry shape");
-        bytes *= dim;
-    }
-    if (bytes != it->bytes.size() || (rank > 1 && it->shape.back() != 3))
-        throw std::invalid_argument("geometry shape/bytes mismatch");
+    objects::detail::requireArrayLayout({it->name, it->dtype, it->shape, int64_t(it->bytes.size())}, dtype, rank);
     return *it;
 }
 }
@@ -144,18 +138,18 @@ Geometry decode(const objects::GeometryData& data)
     Geometry result;
     if (data.kind == "point_collection") {
         PointCollection g;
-        g.points = xyzValues<double>(require(data, "points", "<f8", 2, 8).bytes);
-        const auto& ids = require(data, "point_ids", "<i8", 1, 8);
+        g.points = xyzValues<double>(require(data, "points", "<f8", 2).bytes);
+        const auto& ids = require(data, "point_ids", "<i8", 1);
         g.ids.resize(ids.bytes.size() / 8);
         copyScalars<int64_t>(ids.bytes, g.ids);
         result = std::move(g);
     } else if (data.kind == "fiber") {
-        result = Fiber{xyzValues<double>(require(data, "control_points", "<f8", 2, 8).bytes),
-            xyzValues<double>(require(data, "line_points", "<f8", 2, 8).bytes)};
+        result = Fiber{xyzValues<double>(require(data, "control_points", "<f8", 2).bytes),
+            xyzValues<double>(require(data, "line_points", "<f8", 2).bytes)};
     } else if (data.kind == "track") {
-        result = Track{xyzValues<int32_t>(require(data, "points", "<i4", 2, 4).bytes)};
+        result = Track{xyzValues<int32_t>(require(data, "points", "<i4", 2).bytes)};
     } else if (data.kind == "patch") {
-        const auto& a = require(data, "points", "<f4", 3, 4);
+        const auto& a = require(data, "points", "<f4", 3);
         result = Patch{a.shape[0], a.shape[1], attributes.at("scale").get<std::array<double, 2>>(), xyzValues<float>(a.bytes)};
     } else throw std::invalid_argument("unsupported geometry kind");
     std::visit([](const auto& g) { g.validate(); }, result);
