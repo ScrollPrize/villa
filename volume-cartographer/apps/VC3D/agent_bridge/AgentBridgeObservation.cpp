@@ -58,11 +58,21 @@ QHash<QString, QByteArray> AgentBridgeServer::observedStateFingerprints(
     fields["workspace"] = fingerprint(snapshot.value("workspace").toObject().value("current")) +
                           QByteArray::number(tabs ? tabs->currentIndex() : -1);
 
+    QByteArray overlay;
     try {
-        fields["overlay"] = fingerprint(handleViewerGetOverlay(QJsonValue()));
+        overlay = fingerprint(handleViewerGetOverlay(QJsonValue()));
     } catch (const AgentBridgeError&) {
-        fields["overlay"] = QByteArray();
     }
+    // The ink detection overlay's selection and display settings. Its list of
+    // available detections follows the active segment, reported above.
+    try {
+        QJsonObject ink = inkOverlayJson();
+        ink.remove(QStringLiteral("available"));
+        ink.remove(QStringLiteral("colormaps"));
+        overlay += fingerprint(ink);
+    } catch (const AgentBridgeError&) {
+    }
+    fields["overlay"] = overlay;
 
     // Running jobs plus the latest job's state, so a job that starts and
     // finishes between two refreshes is still reported.

@@ -298,7 +298,7 @@ bridge call, another client, or a person using the GUI. Its params are:
 | `editing` | segmentation editing, manual add, its line or interpolation mode, correction points, same-wrap annotation, or axis-aligned slices change |
 | `viewers` | a viewer is created or closed, or changes workspace or visibility |
 | `workspace` | the current workspace tab changes |
-| `overlay` | the active workspace's overlay-volume settings change |
+| `overlay` | the active workspace's overlay-volume settings, or the ink detection overlay's selection, opacity, colormap or flips, change |
 | `jobs` | a job starts or finishes |
 
 The bridge checks when an application signal reports a change (the project,
@@ -311,8 +311,8 @@ is reported at the next request or `state.get`. A request's notification is
 sent before its response, and changes within one check are coalesced into
 one notification. `revision` starts at 0 when VC3D
 starts and increases by one per notification; `state.get` returns the
-revision that matches its snapshot. Zoom, pan, cursor, and point edits are not
-reported. Delivery is best-effort like `job.progress`; `state.get` is
+revision that matches its snapshot. Zoom, pan, render settings, cursor, and
+point edits are not reported. Delivery is best-effort like `job.progress`; `state.get` is
 authoritative.
 
 ## Headless application behavior

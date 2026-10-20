@@ -2117,11 +2117,23 @@ def check_ink_overlay(client: BridgeClient, results: Results) -> None:
     results.record("viewer_set_ink_overlay_unknown_colormap", ok, detail)
     try:
         before = state.get("opacity")
+        revision = client.call("state.get", {}, timeout=RPC_TIMEOUT)[0].get("revision", 0)
         changed, _ = client.call(
             "viewer.set_ink_overlay",
             {"opacity": 0.25, "flipHorizontal": True},
             timeout=RPC_TIMEOUT,
         )
+        try:
+            # The notification is written before the response.
+            note = client.wait_for_notification(
+                "state.changed",
+                predicate=lambda p: ("overlay" in p.get("changed", [])
+                                     and p.get("revision", -1) > revision),
+                timeout=5.0,
+            )
+            results.record("viewer_set_ink_overlay_state_changed", True, f"note={note}")
+        except TimeoutError as error:
+            results.record("viewer_set_ink_overlay_state_changed", False, str(error))
         restored, _ = client.call(
             "viewer.set_ink_overlay",
             {"opacity": before, "flipHorizontal": state.get("flipHorizontal")},
