@@ -661,6 +661,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         off, contrast, valid = nearest_peak(prof, t, a.min_contrast, a.min_prominence)
         valid &= inside
         m = summarize(off, contrast, valid, inside, patch, prof, t, a.half, a.min_contrast)
+        if inside.sum() and valid.sum() < 0.05 * inside.sum():
+            # inside the volume bounds but no sheet anywhere along the profiles: the surface is
+            # in the wrong place (a missing downscale factor leaves it inside the bounds but in
+            # empty space, villa PR #2112) or paired with the wrong volume or level
+            print(f"{name}: a sheet peak was found at only {int(valid.sum())} of {int(inside.sum())} points "
+                  f"inside the volume; the surface is probably in the wrong coordinate frame "
+                  f"or paired with the wrong volume", file=sys.stderr)
         m.update(controls(vol, P, N, off, valid, a, rng))
         m.update({"surface": name, "source": src, "volume": a.volume, "n_vertices": int(n_vert),
                   "n_no_normal": n_no_normal, **grid, "half": a.half, "step": a.step, "sigma": a.sigma,

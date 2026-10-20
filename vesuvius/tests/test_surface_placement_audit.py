@@ -261,6 +261,20 @@ def test_surface_outside_the_volume_warns_and_is_reported(tmp_path, ct, capsys):
     assert "outside the volume" in capsys.readouterr().err
 
 
+def test_surface_in_empty_space_warns(tmp_path, ct, capsys):
+    """A missing downscale factor (villa PR #2112) can leave a surface inside the volume
+    bounds but away from any sheet; every profile is then empty and the audit must say so."""
+    pts = grid_points(14.0)  # 16 voxels below the sheet, further than --half reaches
+    nrm = np.tile([0.0, 0.0, 1.0], (len(pts), 1))
+    obj = tmp_path / "empty.obj"
+    write_obj(obj, pts, nrm)
+    rc, out, rows = run(tmp_path, ct, [str(obj)])
+    assert rc == 0
+    j = json.load(open(out / "empty.json"))
+    assert j["outside_volume_frac"] == 0.0 and j["no_peak_frac"] == 1.0
+    assert "wrong coordinate frame" in capsys.readouterr().err
+
+
 def test_bad_arguments(tmp_path, ct):
     with pytest.raises(SystemExit):
         spa.main(["--surface", "x.obj", "--volume", ct, "--out", str(tmp_path), "--fail-on", "nope=1"])
