@@ -487,7 +487,6 @@ void closeLineAnnotationDialogAfterFinalization(LineAnnotationDialog* dialog)
 
 struct FiberJsonPathOptions {
     fs::path path;
-    double scale = 1.0;
 };
 
 QString fiberDisplayNameFromFileName(const std::string& fileName)
@@ -580,14 +579,7 @@ std::optional<FiberJsonPathOptions> showFiberJsonPathDialog(QWidget* parent,
         });
     }
 
-    auto* scaleSpin = new QDoubleSpinBox(&dialog);
-    scaleSpin->setRange(-1000000000.0, 1000000000.0);
-    scaleSpin->setDecimals(6);
-    scaleSpin->setSingleStep(0.25);
-    scaleSpin->setValue(1.0);
-
     form->addRow(QObject::tr("Path:"), pathRow);
-    form->addRow(QObject::tr("Scale:"), scaleSpin);
     layout->addLayout(form);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel,
@@ -628,12 +620,6 @@ std::optional<FiberJsonPathOptions> showFiberJsonPathDialog(QWidget* parent,
             return;
         }
 
-        if (!std::isfinite(scaleSpin->value())) {
-            QMessageBox::warning(&dialog,
-                                 dialog.windowTitle(),
-                                 QObject::tr("Scale must be a finite number."));
-            return;
-        }
         dialog.accept();
     });
 
@@ -641,8 +627,7 @@ std::optional<FiberJsonPathOptions> showFiberJsonPathDialog(QWidget* parent,
         return std::nullopt;
     }
 
-    return FiberJsonPathOptions{fs::path(pathEdit->text().trimmed().toStdString()),
-                                scaleSpin->value()};
+    return FiberJsonPathOptions{fs::path(pathEdit->text().trimmed().toStdString())};
 }
 
 void writeJsonAtomic(const fs::path& finalPath, const nlohmann::json& root)
@@ -2187,12 +2172,13 @@ void LineAnnotationController::launchFromViewerAtPoint(CChunkedVolumeViewer* vie
     auto sourceSurface = std::make_shared<PlaneSurface>(sample->position, normal);
     auto session = std::make_shared<LineAnnotationSession>();
     session->modelOnly = modelOnly;
-    if (modelOnly && _state && _state->currentVolume()) {
-        const auto shape = _state->currentVolume()->shape();
-        session->coordinateBaseShapeZYX = std::array<std::size_t, 3>{
-            static_cast<std::size_t>(shape[0]), static_cast<std::size_t>(shape[1]),
-            static_cast<std::size_t>(shape[2])};
+    const auto volume = _state ? _state->currentVolume() : nullptr;
+    if (!volume) {
+        showError(tr("Creating a fiber requires an active volume."));
+        return;
     }
+    session->coordinateBaseShapeZYX =
+        vc3d::line_annotation::fiberCoordinateShapeFromVolume(volume->shape());
     if (!launchSession(SourceKind::Plane,
                        surfaceName,
                        std::move(sourceSurface),
@@ -3019,6 +3005,7 @@ void LineAnnotationController::openFiberWithControlPoint(uint64_t fiberId,
 
     const std::optional<std::array<std::size_t, 3>> coordinateBaseShapeZYX =
         resolveStoredFiberCoordinateBaseShape(*it);
+    it->coordinateBaseShapeZYX = coordinateBaseShapeZYX;
 
     double fiberBaseToVolumeScale = 1.0;
     if (coordinateBaseShapeZYX) {
@@ -3616,7 +3603,7 @@ void LineAnnotationController::importFibers()
     QString errorMessage;
     int imported = 0;
     int skipped = 0;
-    if (!importFibersFromPath(options->path, options->scale, &errorMessage,
+    if (!importFibersFromPath(options->path, &errorMessage,
                               &imported, &skipped)) {
         showError(errorMessage);
         return;
@@ -3631,7 +3618,6 @@ void LineAnnotationController::importFibers()
 }
 
 bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
-                                                    double scale,
                                                     QString* errorMessage,
                                                     int* importedCount,
                                                     int* skippedCount)
@@ -3676,7 +3662,6 @@ bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
             ++skipped;
             return;
         }
-        scaleStoredFiber(*fiber, scale);
         importedFibers.push_back(std::move(*fiber));
     };
     auto bundleEntryPath = [&](const nlohmann::json& item, size_t index) {
@@ -3892,7 +3877,7 @@ void LineAnnotationController::exportFibers()
 
     QString errorMessage;
     int exported = 0;
-    if (!exportFibersToPath(options->path, options->scale, &errorMessage, &exported)) {
+    if (!exportFibersToPath(options->path, &errorMessage, &exported)) {
         showError(errorMessage);
         return;
     }
@@ -3904,7 +3889,6 @@ void LineAnnotationController::exportFibers()
 }
 
 bool LineAnnotationController::exportFibersToPath(const fs::path& exportPath,
-                                                  double scale,
                                                   QString* errorMessage,
                                                   int* exportedCount)
 {
@@ -3925,11 +3909,11 @@ bool LineAnnotationController::exportFibersToPath(const fs::path& exportPath,
         nlohmann::json root = nlohmann::json::object();
         root["type"] = "vc3d_fiber_collection";
         root["version"] = 1;
-        root["scale"] = scale;
         copyCoordinateIdentityToJson(root, coordinateIdentityForState(_state));
         root["point_collections"] = nlohmann::json::array();
-        for (const auto& fiber : _fibers) {
-            root["point_collections"].push_back(fiberToJson(fiber, scale));
+        for (auto& fiber : _fibers) {
+            retainStoredFiberCoordinateBaseShape(fiber);
+            root["point_collections"].push_back(fiberToJson(fiber));
         }
 
         writeJsonAtomic(exportPath, root);
@@ -13439,6 +13423,14 @@ void LineAnnotationController::invalidateScrollUmbilicus()
 
 void LineAnnotationController::onActiveVolumeChanged()
 {
+    // Package loading precedes volume selection. Finish only metadata writes
+    // deferred for lack of a coordinate frame, not withheld branch repairs.
+    if (_state && _state->currentVolume()) {
+        for (auto& fiber : _fibers) {
+            if (_pendingCoordinateShapeSaves.count(fiber.id))
+                saveLoadedFiberMetadata(fiber);
+        }
+    }
     // Deliberately conservative: any volume switch marks built views stale,
     // including a downsample-level switch of one scan, where the rebuild will
     // reproduce the same orientation. The alternative — proving the previous
@@ -14774,6 +14766,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         }
     }
     _fibers.clear();
+    _pendingCoordinateShapeSaves.clear();
     // Geometry caches keyed by fiber id and validated by the fiber's save
     // generation: a reload can bring changed geometry under the same id and
     // generation (a file edited or replaced on disk), so they start over.
@@ -15071,19 +15064,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
     for (auto& fiber : loadedFibers) {
         addKnownFiberTags(fiber.tags);
         if (!deferHealWrites && fiber.needsSave && fiber.sourceRoot == primarySource) {
-            if (adjacentHealSaveIsStale(fiber)) {
-                fiber.needsSave = false;
-                continue;
-            }
-            try {
-                fiber.needsSave = false;
-                saveFiberNow(fiber);
-            } catch (const std::exception& ex) {
-                fiber.needsSave = true;
-                Logger()->warn("Could not update VC3D fiber metadata {}: {}",
-                               fiberPath(fiber).string(),
-                               ex.what());
-            }
+            saveLoadedFiberMetadata(fiber);
         }
     }
 
@@ -15587,10 +15568,28 @@ LineAnnotationController::resolveStoredFiberCoordinateBaseShape(
     if (!candidates.empty()) {
         Logger()->warn(
             "Line annotation: could not resolve fiber coordinate shape for {}; "
-            "its geometry will be shown unscaled",
+            "using the active volume's unscaled coordinate frame",
             fiber.fileName);
     }
+    // Unstamped legacy geometry has always been interpreted in the active
+    // volume grid when no manifest resolves. Record that actual frame on save.
+    if (const auto volume = _state->currentVolume()) {
+        return vc3d::line_annotation::fiberCoordinateShapeFromVolume(volume->shape());
+    }
     return std::nullopt;
+}
+
+void LineAnnotationController::retainStoredFiberCoordinateBaseShape(StoredFiber& fiber) const
+{
+    vc3d::line_annotation::retainFiberCoordinateShape(
+        fiber.coordinateBaseShapeZYX,
+        [this, &fiber] { return resolveStoredFiberCoordinateBaseShape(fiber); });
+    for (const auto& pane : _panes) {
+        if (pane.session && pane.session->fiberId == fiber.id &&
+            pane.session->fiberUuid == fiber.uuid &&
+            !pane.session->coordinateBaseShapeZYX)
+            pane.session->coordinateBaseShapeZYX = fiber.coordinateBaseShapeZYX;
+    }
 }
 
 fs::path LineAnnotationController::fibersRootDir() const
@@ -15952,6 +15951,10 @@ void LineAnnotationController::optimizeAndSaveFiberHeadless(
     const auto coordinateBaseShapeZYX = request.inputs.fiberDataset
         ? request.inputs.fiberDataset->manifest().baseShapeZYX
         : request.inputs.normalDataset->manifest().baseShapeZYX;
+    if (!coordinateBaseShapeZYX) {
+        fail(tr("Inference manifest must declare base_shape_zyx before creating fibers."));
+        return;
+    }
 
     struct HeadlessResult {
         bool ok = false;
@@ -17774,36 +17777,6 @@ std::vector<uint64_t> LineAnnotationController::syncBranchEndpointPositions(
     return affectedFiberIds;
 }
 
-void LineAnnotationController::scaleStoredFiber(StoredFiber& fiber, double scale)
-{
-    if (!std::isfinite(scale) || approximatelyEqual(scale, 1.0)) {
-        return;
-    }
-    fiber.width *= scale;
-    for (auto& point : fiber.controlPoints) {
-        static_cast<cv::Vec3d&>(point) *= scale;
-        if (point.segmentToNext) {
-            point.segmentToNext->traceToBaseScale *= scale;
-            if (point.segmentToNext->interpMode ==
-                    vc3d::line_annotation::SegmentInterpolationMode::Trace &&
-                point.segmentToNext->metric) {
-                *point.segmentToNext->metric *= scale;
-            }
-            if (point.segmentToNext->meetingErrorBaseVoxels)
-                *point.segmentToNext->meetingErrorBaseVoxels *= scale;
-        }
-    }
-    for (auto& point : fiber.linePoints) {
-        point = point * scale;
-    }
-    for (auto& branch : fiber.branches) {
-        branch.controlPointPosition = branch.controlPointPosition * scale;
-        branch.branchControlPointPosition = branch.branchControlPointPosition * scale;
-    }
-    fiber.hvClassification = vc3d::line_annotation::classifyFiberHv(
-        vc3d::line_annotation::storedControlPointPositions(fiber.controlPoints));
-}
-
 LineAnnotationController::CachedFiberAlignmentMetrics
 LineAnnotationController::calculateAlignmentMetricsForFiber(
     const StoredFiber& fiber,
@@ -18215,6 +18188,16 @@ LineAnnotationController::makeStoredFiberSessionSnapshot(LineAnnotationSession& 
         ? uint64_t{1}
         : std::max<uint64_t>(uint64_t{1}, existingIt->generation + 1);
     fiber.coordinateBaseShapeZYX = session.coordinateBaseShapeZYX;
+    if (!fiber.coordinateBaseShapeZYX) {
+        if (!approximatelyEqual(session.fiberBaseToVolumeScale, 1.0))
+            throw std::runtime_error("Cannot save a scaled fiber without its coordinate base shape");
+        const auto volume = _state ? _state->currentVolume() : nullptr;
+        if (!volume)
+            throw std::runtime_error("Cannot save a fiber without a coordinate base shape or active volume");
+        fiber.coordinateBaseShapeZYX =
+            vc3d::line_annotation::fiberCoordinateShapeFromVolume(volume->shape());
+        session.coordinateBaseShapeZYX = fiber.coordinateBaseShapeZYX;
+    }
 
     std::vector<size_t> order(session.controlPoints.size());
     std::iota(order.begin(), order.end(), size_t{0});
@@ -18613,9 +18596,10 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
     }
 }
 
-nlohmann::json LineAnnotationController::fiberToJson(const StoredFiber& fiber, double scale) const
+nlohmann::json LineAnnotationController::fiberToJson(const StoredFiber& fiber) const
 {
     StoredFiber serialized = fiber;
+    serialized.coordinateBaseShapeZYX = resolveStoredFiberCoordinateBaseShape(fiber);
     auto branchFileNameForId = [this](uint64_t fiberId) -> std::string {
         for (const auto& storedFiber : _fibers) {
             if (storedFiber.id == fiberId) {
@@ -18638,15 +18622,13 @@ nlohmann::json LineAnnotationController::fiberToJson(const StoredFiber& fiber, d
     FiberSaveSnapshot snapshot;
     snapshot.fiber = std::move(serialized);
     copyCoordinateIdentityToJson(snapshot.coordinateIdentity, coordinateIdentityForState(_state));
-    return fiberSaveSnapshotToJson(snapshot, scale);
+    return fiberSaveSnapshotToJson(snapshot);
 }
 
 nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
-    const FiberSaveSnapshot& snapshot,
-    double scale)
+    const FiberSaveSnapshot& snapshot)
 {
     StoredFiber serialized = snapshot.fiber;
-    scaleStoredFiber(serialized, scale);
     // StoredFiber and sessions mint a uuid at construction, so this only
     // guards a fiber whose identity was somehow cleared: never write a
     // present-but-empty uuid, which parseVc3dFiberJson rejects on load.
@@ -18666,9 +18648,12 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
     if (serialized.modelOnly) root["model_only"] = true;
     root["optimization_mode"] =
         vc3d::line_annotation::fiberOptimizationModeToString(serialized.optimizationMode);
-    if (serialized.coordinateBaseShapeZYX) {
-        root["coordinate_base_shape_zyx"] = *serialized.coordinateBaseShapeZYX;
-    }
+    if (!serialized.coordinateBaseShapeZYX ||
+        std::any_of(serialized.coordinateBaseShapeZYX->begin(),
+                    serialized.coordinateBaseShapeZYX->end(),
+                    [](std::size_t size) { return size == 0; }))
+        throw std::runtime_error("Cannot save fiber without a positive coordinate_base_shape_zyx");
+    root["coordinate_base_shape_zyx"] = *serialized.coordinateBaseShapeZYX;
     root["tags"] = serialized.tags;
     if (serialized.width > 0) root["width"] = serialized.width;
     root["width_gap_fraction"] = serialized.widthGapFraction;
@@ -18751,7 +18736,32 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
     return root;
 }
 
-void LineAnnotationController::saveFiberNow(const StoredFiber& fiber) const
+void LineAnnotationController::saveLoadedFiberMetadata(StoredFiber& fiber)
+{
+    _pendingCoordinateShapeSaves.erase(fiber.id);
+    if (fiber.readOnly || !fiber.needsSave)
+        return;
+    if (adjacentHealSaveIsStale(fiber)) {
+        fiber.needsSave = false;
+        return;
+    }
+    try {
+        if (!fiber.coordinateBaseShapeZYX) {
+            fiber.coordinateBaseShapeZYX = resolveStoredFiberCoordinateBaseShape(fiber);
+            if (!fiber.coordinateBaseShapeZYX) {
+                _pendingCoordinateShapeSaves.insert(fiber.id);
+                return;
+            }
+        }
+        saveFiberNow(fiber);
+        fiber.needsSave = false;
+    } catch (const std::exception& ex) {
+        Logger()->warn("Could not update VC3D fiber metadata {}: {}",
+                       fiberPath(fiber).string(), ex.what());
+    }
+}
+
+void LineAnnotationController::saveFiberNow(StoredFiber& fiber) const
 {
     if (fiber.readOnly) {
         return;
@@ -18761,17 +18771,32 @@ void LineAnnotationController::saveFiberNow(const StoredFiber& fiber) const
         throw std::runtime_error("No volume package is loaded");
     }
 
+    retainStoredFiberCoordinateBaseShape(fiber);
     writeJsonAtomic(fiberPath(fiber), fiberToJson(fiber));
 }
 
 LineAnnotationController::FiberSaveSnapshot
-LineAnnotationController::makeFiberSaveSnapshot(const StoredFiber& fiber) const
+LineAnnotationController::makeFiberSaveSnapshot(const StoredFiber& fiber)
 {
     FiberSaveSnapshot snapshot;
     snapshot.fiberId = fiber.id;
     snapshot.generation = fiber.generation;
     snapshot.path = fiberPath(fiber);
     snapshot.fiber = fiber;
+    // Pin the frame before queuing, not on completion: another metadata save
+    // may be requested while this snapshot is still being written.
+    const auto stored = std::find_if(_fibers.begin(), _fibers.end(),
+        [&fiber](const StoredFiber& candidate) {
+            return candidate.id == fiber.id && candidate.uuid == fiber.uuid;
+        });
+    if (stored != _fibers.end()) {
+        if (!stored->coordinateBaseShapeZYX)
+            stored->coordinateBaseShapeZYX = fiber.coordinateBaseShapeZYX;
+        retainStoredFiberCoordinateBaseShape(*stored);
+        snapshot.fiber.coordinateBaseShapeZYX = stored->coordinateBaseShapeZYX;
+    } else {
+        retainStoredFiberCoordinateBaseShape(snapshot.fiber);
+    }
     auto branchFileNameForId = [this](uint64_t fiberId) -> std::string {
         for (const auto& storedFiber : _fibers) {
             if (storedFiber.id == fiberId) {
@@ -19837,4 +19862,3 @@ QString LineAnnotationController::takeLastSuppressedError()
     _lastSuppressedError.clear();
     return message;
 }
-
