@@ -151,53 +151,27 @@ Python accepts the same decision dictionaries as `edit_geometry()`. Other
 relationship endpoints are also checked against the editor's snapshot.
 No relationship meaning is inferred by the geometry layer.
 
-Structural changes (adding/removing/reordering points or changing dimensions)
-use an owned value and `putGeometry` / `put_geometry` with the expected geometry
-revision and explicit relationship decisions. Python `affected_geometry_edges()`
-also accepts owned values to preview a replacement, on both the store and a
-write transaction. For actions involving multiple
-object replacements or metadata changes, use the existing checked write
-transaction API.
+For adding/removing/reordering points or changing dimensions, use
+[structural edits](structural-editing.md). Full `put_geometry` replacement remains
+available before structural management begins; `affected_geometry_edges()` previews
+its relationship dependencies. Multi-object actions use checked write transactions.
 
-## Compatibility and implementation
+## Validation
 
-The database schema, hashes, array names/dtypes, file formats and existing APIs
-are unchanged. Generic array reads and writes remain supported. Historical
-`FiberDetail`, `PatchDetail` and `TrackDetail` counts and lengths remain import
-annotations for compatibility; use view counts and owned geometry measurements
-for current values.
+Import-summary counts/lengths remain historical annotations; view counts and owned
+measurements describe current geometry. Generic arrays retain their stored names,
+dtypes and byte order. See the [build/test commands](../README.md#build).
 
-`src/formats/{Fiber,Patch,PointCollection,Track}Input.cpp` decode sources.
-`GeometryOutput.cpp` encodes native files. These adapters do not access the
-database: ingestion resolves identities and imports relationships; export
-resolves revision metadata and publishes staged files. Shared array encoding and
-layout validation serve both typed geometry and the existing storage paths.
-
-The tests run without application checkouts or real fixture files:
+The real-data harness uses temporary databases, compares typed roundtrips byte for
+byte, and reimports native exports for all four geometry kinds.
+Inputs must contain native geometry only; auxiliary channels are not representable
+by owned values or native export. Sources stay read-only, temporary data is removed,
+and flags may be repeated:
 
 ```sh
-AGENTS_AGENT_MODE=1 cmake --build build -j 8
-AGENTS_AGENT_MODE=1 ctest --test-dir build --output-on-failure
-AGENTS_AGENT_MODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-  VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python \
-  /path/to/python -m pytest -q tests/python
+VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python /path/to/python \
+  scripts/validate_typed_geometry.py --point-collections /data/collections.json \
+  --fiber /data/fiber.json --patch /data/patch --tracks /data/tracks
 ```
 
-For real data, the validation harness creates temporary databases, checks typed
-values against source JSON, compares every stored array byte-for-byte after
-typed decoding/encoding, and verifies native export. Patch/track exports are
-also re-ingested and their arrays compared. Inputs must contain only the native
-geometry arrays: auxiliary surface channels are not representable by owned
-typed geometry or native export. Sources are read-only; temporary
-databases and exports are deleted on exit. Flags are repeatable:
-
-```sh
-AGENTS_AGENT_MODE=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python \
-  /path/to/python scripts/validate_typed_geometry.py \
-  --point-collections /data/abs_winding.json \
-  --fiber /data/fiber.json \
-  --patch /data/patch
-```
-
-Existing native directory
-export still requires Linux `renameat2`; this change does not alter that limit.
+Native directory export currently requires Linux `renameat2`.

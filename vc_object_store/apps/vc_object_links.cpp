@@ -172,67 +172,24 @@ try {
         std::cout << "created " << dbPath.string() << "\n";
 
     bool linkFailed = false;
-    if (linkTracks) {
-        vc::objects::util::TerminalProgress progress("Track crossings", showProgress);
-        trackParams.progress = progress.callback();
-        const auto report = vc::object_links::linkTracksToTracks(db, trackParams);
+    auto run = [&](const char* title, const char* label, const char* noun,
+                   auto& params, auto detector, const auto&... inputs) {
+        vc::objects::util::TerminalProgress progress(title, showProgress);
+        params.progress = progress.callback();
+        const auto report = detector(db, inputs..., params, nullptr);
         progress.finish();
         linkFailed |= !report.problems.empty();
-        std::cout << "track-tracks: " << report.objectsConsidered << " tracks, "
-                  << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
-                  << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
-        for (const auto& problem : report.problems)
-            std::cerr << "  ! " << problem << "\n";
-    }
-    if (linkOverlaps) {
-        vc::objects::util::TerminalProgress progress("Patch overlaps", showProgress);
-        overlapParams.progress = progress.callback();
-        const auto report = vc::object_links::linkPatchOverlaps(db, overlapParams);
-        progress.finish();
-        linkFailed |= !report.problems.empty();
-        std::cout << "patch-overlaps: " << report.objectsConsidered << " patches, "
-                  << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
-                  << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
-        for (const auto& problem : report.problems)
-            std::cerr << "  ! " << problem << "\n";
-    }
-    if (linkTrackPatches) {
-        vc::objects::util::TerminalProgress progress("Track to patch", showProgress);
-        trackPatchParams.progress = progress.callback();
-        const auto report = vc::object_links::linkTracksToPatches(
-            db, ctVolume, trackPatchParams);
-        progress.finish();
-        linkFailed |= !report.problems.empty();
-        std::cout << "track-patches: " << report.objectsConsidered << " objects, "
-                  << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
-                  << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
-        for (const auto& problem : report.problems)
-            std::cerr << "  ! " << problem << "\n";
-    }
-    if (linkFibers) {
-        vc::objects::util::TerminalProgress progress("Fiber to patch", showProgress);
-        fiberPatchParams.progress = progress.callback();
-        const auto report = vc::object_links::linkFibersToPatches(
-            db, ctVolume, fiberPatchParams);
-        progress.finish();
-        linkFailed |= !report.problems.empty();
-        std::cout << "fiber-patches: " << report.objectsConsidered << " objects, "
-                  << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
-                  << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
-        for (const auto& problem : report.problems)
-            std::cerr << "  ! " << problem << "\n";
-    }
-    if (linkPcl) {
-        vc::objects::util::TerminalProgress progress("Point collections to patches", showProgress);
-        pclParams.progress = progress.callback();
-        const auto report = vc::object_links::linkPointCollectionsToPatches(db, pclParams);
-        progress.finish();
-        linkFailed |= !report.problems.empty();
-        std::cout << "pcl-patches: " << report.objectsConsidered << " objects, "
+        std::cout << label << ": " << report.objectsConsidered << " " << noun << ", "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
                   << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
         for (const auto& problem : report.problems) std::cerr << "  ! " << problem << "\n";
-    }
+    };
+    using namespace vc::object_links;
+    if (linkTracks) run("Track crossings", "track-tracks", "tracks", trackParams, linkTracksToTracks);
+    if (linkOverlaps) run("Patch overlaps", "patch-overlaps", "patches", overlapParams, linkPatchOverlaps);
+    if (linkTrackPatches) run("Track to patch", "track-patches", "objects", trackPatchParams, linkTracksToPatches, ctVolume);
+    if (linkFibers) run("Fiber to patch", "fiber-patches", "objects", fiberPatchParams, linkFibersToPatches, ctVolume);
+    if (linkPcl) run("Point collections to patches", "pcl-patches", "objects", pclParams, linkPointCollectionsToPatches);
     if (!importJsonPath.empty()) {
         vc::objects::util::TerminalProgress progress("Import JSON", showProgress);
         vc::objects::util::reportProgress(progress.callback(), "reading JSON");

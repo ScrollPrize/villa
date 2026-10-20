@@ -106,112 +106,39 @@ Existing rectangle edits and channel add/replace/remove operations work after
 resizing. Reads still return contiguous arrays, byte ranges, packed arrays, and
 rectangles. Consumers do not need to interpret shared storage.
 
-## Storage, history and cost limits
+## Storage and cost
 
-Sequence arrays are immutable AVL ropes with subtree byte counts and coordinate
-bounds. A manifest contains one root per array instead of every block reference.
-Splicing path-copies the affected branches and retains whole unchanged subtrees.
-Leaves refer to exact byte slices of payloads of at most 64 KiB, aligned to
-complete points. Newly adjacent fragments whose combined size is at most 4 KiB
-are compacted locally, including boundaries exposed by slicing. Thus an array
-of B bytes has at most `2 * (B // 4096 + 1)` leaves. Compaction never rewrites the
-whole array and its work is included in measurements. Reads traverse tree
-weights, not a revision chain: bounded reads cost tree descent plus the requested
-leaves; full reads cost proportionally to output and its bounded fragmentation.
+The first structural edit converts legacy layouts/annotations in work proportional
+to the geometry. Later sequence splices path-copy immutable AVL ropes with bounded
+leaves; surface edits update persistent tile maps in stable grid coordinates.
+Unchanged subtrees and payloads are shared. Reads descend trees rather than replaying
+revision chains. Identity indexes retain deleted-ID allocation ledgers through
+restoration; annotations remain associated with IDs independently of row order.
 
-Stable-ID indexes use persistent ordered trees with at most 128 IDs per bucket.
-Each live identity owns its coordinate bytes and annotation independently of
-sequence position. Insertions/deletions update only affected buckets and tree
-paths. Allocation ledgers retain deleted IDs, including after lifecycle undo;
-restoring divergent allocation roots unions them without rewriting history.
-Annotations larger than 1 KiB use separate chunked immutable blobs, keeping
-identity buckets bounded. Sample annotations use a separate row-counted tree.
-Span/direction summaries travel with tree roots, so detecting a required caller
-transformation does not scan all annotations. A complete caller-supplied
-transformation still costs proportionally to its input.
+Work scales with new data, changed boundaries, tree paths and affected relationships.
+Reversal, complete annotation transforms, retracing and full reads can process their
+entire inputs. Spatial queries refine coarse array bounds through tree bounds and
+paginate afterward; seams conservatively cover crossing segments. The per-operation
+tree cache is bounded by an 8 MiB charge. There is no background compaction or
+numerical approximation. Large annotations use separately chunked immutable blobs.
 
-Surface arrays use persistent ordered tile maps keyed by stable signed grid
-coordinates. Resizing visits changed cells and changed edge boundaries, retaining
-interior subtrees. For example, right growth of a one-row, very wide grid does
-not scan its unchanged width. Cropping removes outside cells and rewrites partial
-boundary tiles, so subsequent growth uses fills instead of resurrecting old
-pixels. Tile bounds include neighbouring tile bounds for conservative triangle
-coverage; only affected neighbourhoods are updated.
-
-SQL spatial indexes retain one coarse row per coordinate array. Fine spatial
-queries descend immutable subtree bounds, return bounded leaf regions and line
-seams, and apply pagination after refinement. Both SQL and resident spatial-cache
-queries use this path. Whole-object bounds come from root summaries. No positional
-suffix index is rebuilt after insertion. Broad-phase regions are conservative;
-exact coordinates and numerical validity conventions are preserved.
-
-The relationship dependency index maps stable point IDs to incident edges.
-Sequence publication checks changed IDs plus conservative whole-geometry,
-channel and positional dependencies; unchanged ID links need no scan. Surface
-shape/origin changes still require decisions for applicable positional links.
-Stable-ID validation uses the persistent identity index instead of reading the
-full ID array. Work remains proportional to the number of affected relationships.
-
-The **first structural edit converts legacy layouts and annotations**, with
-work proportional to the source geometry. This one-time cost is measured
-separately. Subsequent append/insertion is bounded by new data, split/compaction
-boundaries and tree paths; growth is bounded by changed tiles/neighbourhoods and
-tree paths. Reversal, arbitrary reordering, complete retracing, explicit complete
-annotation transforms and full contiguous reads may process their full input.
-There is no background compaction, reduced precision, approximation, or revision
-replay hidden in the incremental path. The operation-local tree cache is bounded
-by an 8 MiB conservative charge and is discarded between operations.
-
-Schema **11** gates the indexed representation, adds the derived relationship
-lookup table/triggers and a geometry-generation index. Writable opens migrate
-atomically; legacy payloads and revisions remain untouched until conversion.
-Older databases remain readable with read-only opens. Older binaries reject
-schema 11 instead of attempting to interpret its storage. The public logical
-geometry format and array APIs remain unchanged.
-
-Synchronization recursively transfers new immutable tree nodes, payloads and
-annotation blobs, reuses existing subtrees, and validates hashes/collisions.
-Retained historical geometry stays readable after reopening and synchronization.
-Existing synchronization limitations on complete object metadata/relationship
-timelines still apply; use a database copy when that entire timeline is required.
-No physical purge is introduced.
+Schema 11 gates this representation. Writable migration preserves old revisions
+and payloads until conversion; older binaries reject it. Synchronization transfers
+and verifies new nodes/payloads while reusing existing subtrees. It does not copy the
+complete object metadata/relationship timeline; use a database copy for that.
 
 ## Validation and measurement
 
-From the package directory, using the existing build and environment:
+See the [build/test commands](../README.md#build). Native regressions check bounded
+payload, identity, relationship and spatial work for large appends, annotated
+insertions and narrow/wide surface growth. Run `build/bin/bench_structural_edits 5`
+for the synthetic scaling benchmark: full replacement versus append/insertion and
+right growth, with zero/eight relationships and initialization reported separately.
 
-```sh
-AGENTS_AGENT_MODE=1 ninja -C build -j 4
-AGENTS_AGENT_MODE=1 ctest --test-dir build --output-on-failure
-AGENTS_AGENT_MODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-  VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python \
-  /path/to/python -m pytest -q tests/python
-AGENTS_AGENT_MODE=1 build/bin/bench_structural_edits 5 > /tmp/structural-bench.jsonl
-```
-
-The C++ regressions instrument complete checked publication, including
-100,000-point annotated collections with 128 unchanged ID relationships,
-a 500,000-point append and 128/16,384-column one-row grids. They bound identity,
-manifest, tree-node, relationship and spatial work in addition to payload bytes.
-Python tests cover sequence operations/labels, explicit span transforms,
-all-side growth/cropping, typed channels, historical/pinned reads, rollback,
-split/merge retirement, random long edit histories, AVL/fragmentation invariants,
-sparse edits, large annotation blobs, spatial seams/pagination under both cache
-modes, synchronization, and v10 migration without unintended history changes.
-
-The benchmark compares full replacement with structural append/insertion and
-right growth on deterministic synthetic inputs, with zero/eight relationships.
-Initialization is reported separately. Each edit includes expected-head reads,
-checked history publication, commit/durability, and any local compaction. The
-full-replacement baseline includes caller array preparation. Inputs are
-1,000/10,000/100,000-point collections and 128/512/1,024-square surfaces, with an
-additional 80-append history. These are scaling fixtures, not real-scroll viewer
-workloads. No macOS/amd64 execution or universal interactive-latency claim is made.
-
-Reports include mean/min/median/max latency, payload and tree bytes
-read/hashed/written, manifest bytes, identity/relationship/spatial work,
-compactions and SQLite VM steps. Counters measure logical processing, not disk
-traffic. Metadata bytes count dirty current JSON once rather than every copy.
-Opt-in scoped timings report exclusive wall time in instrumented functions
-(nested phases subtracted), including SQLite waits. SQLite PROFILE durations
-are statement lifetimes, not exclusive CPU times.
+Each measured edit includes expected-head reads, checked publication, durable
+commit and local compaction; full replacement includes caller preparation. Inputs
+span 1,000–100,000 points, 128–1,024-square surfaces and an 80-append history.
+Reports include mean/min/median/max latency, payload/tree/manifest work, SQLite
+steps and exclusive scoped phase times. Counters measure logical work, not disk
+traffic; SQLite PROFILE times are statement lifetimes. These fixtures do not
+establish real-scroll viewer latency.
