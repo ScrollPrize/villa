@@ -93,6 +93,10 @@ enum Field : std::uint16_t {
     LastStepX = 58,
     LastStepY = 59,
     LastStepZ = 60,
+    PublishedOwnedAnchors = 70,
+    PublishedReferencedAnchors = 71,
+    PublishedPrefixes = 72,
+    PublishedRoutes = 73,
     TraceOrdinal = 70,
     TraceSeedX = 71,
     TraceSeedY = 72,
@@ -401,7 +405,8 @@ std::vector<std::byte> encodePayload(
     output.reserve(totalBytes);
     output.insert(output.end(), kMagic.begin(), kMagic.end());
     appendLittle(output, kVersion);
-    appendLittle(output, static_cast<std::uint8_t>(kind));
+    appendLittle(output, kind == FiberletStorageChunkKind::PublishedFiberlets
+        ? std::uint8_t{4} : static_cast<std::uint8_t>(kind));
     appendLittle(output, static_cast<std::uint8_t>(config.profile));
     appendLittle(output, config.coordinateBits);
     appendLittle(output, config.deltaBits);
@@ -462,7 +467,10 @@ DecodedPayload decodePayload(std::span<const std::byte> bytes, FiberletStorageCh
         throw std::invalid_argument("invalid fiberlet payload magic");
     if (readLittle<std::uint32_t>(bytes, 8) != kVersion)
         throw std::invalid_argument("unsupported fiberlet payload version");
-    const auto kind = static_cast<FiberletStorageChunkKind>(readLittle<std::uint8_t>(bytes, 12));
+    auto kind = static_cast<FiberletStorageChunkKind>(readLittle<std::uint8_t>(bytes, 12));
+    if (kind == FiberletStorageChunkKind::FiberTraces &&
+        readLittle<std::uint8_t>(bytes, 13) != static_cast<std::uint8_t>(FiberletStorageProfile::Float64Traces))
+        kind = FiberletStorageChunkKind::PublishedFiberlets;
     if (kind != expectedKind)
         throw std::invalid_argument("fiberlet payload kind does not match decoder");
     if (readLittle<std::uint8_t>(bytes, 19) != 0 || readLittle<std::uint32_t>(bytes, 108) != 0)
@@ -583,6 +591,70 @@ void validateFinite(const cv::Vec3d& value, const char* name)
 {
     if (!std::isfinite(value[0]) || !std::isfinite(value[1]) || !std::isfinite(value[2])) {
         throw std::invalid_argument(std::string("fiberlet ") + name + " is not finite");
+    }
+}
+
+void requirePublishedSubpayloadConfig(
+    const FiberletStorageCodecConfig& nested,
+    const FiberletStorageCodecConfig& outer,
+    bool allowDifferentOrigin)
+{
+    if (nested.profile != outer.profile ||
+        nested.chunkZYX != outer.chunkZYX ||
+        nested.datasetFingerprint != outer.datasetFingerprint ||
+        (!allowDifferentOrigin &&
+            nested.coordinateOriginZYX != outer.coordinateOriginZYX) ||
+        nested.coordinateBits != outer.coordinateBits ||
+        nested.deltaBits != outer.deltaBits ||
+        nested.routeCountBits != outer.routeCountBits ||
+        nested.routeLatticeBits != outer.routeLatticeBits ||
+        nested.costBits != outer.costBits ||
+        nested.positionQuantumBaseVoxels != outer.positionQuantumBaseVoxels ||
+        nested.predictionToBaseScale != outer.predictionToBaseScale) {
+        throw std::invalid_argument(
+            "published fiberlet subpayload configuration does not match its envelope");
+    }
+}
+
+void validatePublishedRecords(
+    const FiberletDecodedAnchors& owned,
+    const FiberletDecodedAnchors& referenced,
+    const FiberletDecodedPrefixes& prefixes,
+    const FiberletDecodedRoutes& routes)
+{
+    if (prefixes.prefixes.size() != routes.routes.size())
+        throw std::invalid_argument(
+            "published fiberlet prefix and route record counts differ");
+    std::vector<FiberletStorageKey> anchors;
+    anchors.reserve(owned.anchors.size() + referenced.anchors.size());
+    for (const auto& anchor : owned.anchors)
+        anchors.push_back(anchor.key);
+    for (const auto& anchor : referenced.anchors)
+        anchors.push_back(anchor.key);
+    if (!std::is_sorted(anchors.begin(), anchors.begin() + owned.anchors.size()) ||
+        !std::is_sorted(anchors.begin() + owned.anchors.size(), anchors.end())) {
+        throw std::invalid_argument("published fiberlet anchor facets are not sorted");
+    }
+    std::sort(anchors.begin(), anchors.end());
+    if (std::adjacent_find(anchors.begin(), anchors.end()) != anchors.end())
+        throw std::invalid_argument(
+            "published fiberlet owned and referenced anchors overlap");
+    for (std::size_t index = 0; index < prefixes.prefixes.size(); ++index) {
+        const auto& prefix = prefixes.prefixes[index];
+        const auto& route = routes.routes[index];
+        if (!std::binary_search(anchors.begin(), anchors.end(), prefix.id.first) ||
+            !std::binary_search(anchors.begin(), anchors.end(), prefix.id.second)) {
+            throw std::invalid_argument(
+                "published fiberlet endpoint anchor is unresolved");
+        }
+        const auto points = static_cast<std::size_t>(prefix.interiorPointCount);
+        const auto expectedMiddle = points > 1 ? points - 2 : 0;
+        if (route.middleUV.size() != expectedMiddle)
+            throw std::invalid_argument(
+                "published fiberlet route length does not match its prefix");
+        if (route.segmentCostDensities.size() != points + 1)
+            throw std::invalid_argument(
+                "published fiberlet segment costs do not match its geometry");
     }
 }
 
@@ -1233,11 +1305,91 @@ FiberletDecodedTraces deserializeFiberletTraces(std::span<const std::byte> bytes
     return result;
 }
 
+std::vector<std::byte> serializePublishedFiberletChunk(
+    const FiberletStorageCodecConfig& config,
+    std::span<const std::byte> ownedAnchorPayload,
+    std::span<const std::byte> referencedAnchorPayload,
+    std::span<const std::byte> prefixPayload,
+    std::span<const std::byte> routePayload)
+{
+    validateConfig(config);
+    if (config.profile == FiberletStorageProfile::Float64Traces)
+        throw std::invalid_argument("published Fiberlets cannot use the trace profile");
+    const auto owned = deserializeFiberletAnchors(ownedAnchorPayload);
+    const auto referenced = deserializeFiberletAnchors(referencedAnchorPayload);
+    const auto prefixes = deserializeFiberletPrefixes(prefixPayload);
+    const auto routes = deserializeFiberletRoutes(routePayload);
+    requirePublishedSubpayloadConfig(owned.config, config, false);
+    requirePublishedSubpayloadConfig(referenced.config, config, true);
+    requirePublishedSubpayloadConfig(prefixes.config, config, false);
+    requirePublishedSubpayloadConfig(routes.config, config, false);
+    validatePublishedRecords(owned, referenced, prefixes, routes);
+
+    std::vector<FieldBlock> fields;
+    const auto add = [&](Field id, std::span<const std::byte> payload) {
+        auto field = makeField(id, Scalar::U8, payload.size());
+        field.decoded.assign(payload.begin(), payload.end());
+        fields.push_back(std::move(field));
+    };
+    add(PublishedOwnedAnchors, ownedAnchorPayload);
+    add(PublishedReferencedAnchors, referencedAnchorPayload);
+    add(PublishedPrefixes, prefixPayload);
+    add(PublishedRoutes, routePayload);
+    return encodePayload(
+        config, FiberletStorageChunkKind::PublishedFiberlets,
+        prefixes.prefixes.size(), owned.anchors.size() + referenced.anchors.size(),
+        0.0F, 0.0F, std::move(fields));
+}
+
+FiberletDecodedPublishedChunk deserializePublishedFiberletChunk(
+    std::span<const std::byte> bytes)
+{
+    auto payload = decodePayload(
+        bytes, FiberletStorageChunkKind::PublishedFiberlets);
+    if (payload.fields.size() != 4)
+        throw std::invalid_argument(
+            "published fiberlet payload contains unknown fields");
+    const auto copyField = [&](Field id) {
+        const auto found = payload.fields.find(id);
+        if (found == payload.fields.end() || found->second.first != Scalar::U8)
+            throw std::invalid_argument(
+                "published fiberlet payload is missing a required subpayload");
+        return found->second.second;
+    };
+    FiberletDecodedPublishedChunk result;
+    result.config = payload.config;
+    result.ownedAnchorPayload = copyField(PublishedOwnedAnchors);
+    result.referencedAnchorPayload = copyField(PublishedReferencedAnchors);
+    result.prefixPayload = copyField(PublishedPrefixes);
+    result.routePayload = copyField(PublishedRoutes);
+    result.ownedAnchors = deserializeFiberletAnchors(result.ownedAnchorPayload);
+    result.referencedAnchors = deserializeFiberletAnchors(result.referencedAnchorPayload);
+    result.prefixes = deserializeFiberletPrefixes(result.prefixPayload);
+    result.routes = deserializeFiberletRoutes(result.routePayload);
+    requirePublishedSubpayloadConfig(result.ownedAnchors.config, result.config, false);
+    requirePublishedSubpayloadConfig(result.referencedAnchors.config, result.config, true);
+    requirePublishedSubpayloadConfig(result.prefixes.config, result.config, false);
+    requirePublishedSubpayloadConfig(result.routes.config, result.config, false);
+    validatePublishedRecords(
+        result.ownedAnchors, result.referencedAnchors,
+        result.prefixes, result.routes);
+    if (payload.recordCount != result.prefixes.prefixes.size() ||
+        payload.auxiliaryCount != result.ownedAnchors.anchors.size() +
+            result.referencedAnchors.anchors.size()) {
+        throw std::invalid_argument(
+            "published fiberlet envelope counts do not match its subpayloads");
+    }
+    return result;
+}
+
 std::vector<std::byte> materializeFiberletPayload(std::span<const std::byte> bytes)
 {
-    if (bytes.size() < 13)
+    if (bytes.size() < 14)
         throw std::invalid_argument("fiberlet payload is truncated");
-    const auto kind = static_cast<FiberletStorageChunkKind>(readLittle<std::uint8_t>(bytes, 12));
+    auto kind = static_cast<FiberletStorageChunkKind>(readLittle<std::uint8_t>(bytes, 12));
+    if (kind == FiberletStorageChunkKind::FiberTraces &&
+        readLittle<std::uint8_t>(bytes, 13) != static_cast<std::uint8_t>(FiberletStorageProfile::Float64Traces))
+        kind = FiberletStorageChunkKind::PublishedFiberlets;
     auto payload = decodePayload(bytes, kind);
     std::vector<FieldBlock> fields;
     fields.reserve(payload.fields.size());

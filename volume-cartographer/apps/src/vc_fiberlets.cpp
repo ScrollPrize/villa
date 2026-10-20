@@ -72,6 +72,7 @@ struct CliOptions {
     bool writePresenceSlices = true;
     int storageChunkSideBaseVoxels = 512;
     std::filesystem::path anchorCacheRoot;
+    std::filesystem::path fiberletCacheRoot;
     std::filesystem::path sourceContextPath;
 };
 [[noreturn]] void fail(const std::string& message)
@@ -84,7 +85,7 @@ void usage(const char* executable) {
               << "  " << executable << " paths MANIFEST ANCHORS_JSON OUTPUT --normal-manifest MANIFEST\n"
               << "  " << executable << " preprocess-volume MANIFEST OUTPUT --normal-manifest MANIFEST\n"
               << "Common: --threads N --cache-gib N --remote-cache-dir DIR --stats\n"
-              << "Preprocess: --anchor-cache DIR --source-context JSON --storage-chunk-side N\n"
+              << "Preprocess: --anchor-cache DIR --fiberlet-cache DIR --source-context JSON --storage-chunk-side N\n"
               << "Fit: --cell-size N --falloff N --peak-sigma N --axial-sigma N --peak-step N\n"
               << "     --gradient-weight N --window N --presence-floor N --minimum-support N\n"
               << "     --robust-max-trim N --robust-mad-multiplier N --robust-min-angle-deg N\n"
@@ -186,6 +187,8 @@ CliOptions parseArgs(int argc, char** argv) {
             argument == "--anchor-cache" &&
             isWholeVolumeCommand(options.command)) {
             options.anchorCacheRoot = valueAfter(index, argc, argv, "anchor-cache");
+        } else if (argument == "--fiberlet-cache" && isWholeVolumeCommand(options.command)) {
+            options.fiberletCacheRoot = valueAfter(index, argc, argv, "fiberlet-cache");
         } else if (argument == "--cell-size" && options.command != Command::Paths) {
             options.anchors.cellSizePredictionVoxels = parseInt(valueAfter(index, argc, argv, "cell-size"), "cell-size");
         } else if (argument == "--falloff" && options.command != Command::Paths) {
@@ -288,6 +291,20 @@ nlohmann::json fiberletSourceIdentity(
     const vc::lasagna::LasagnaDataset& fiberDataset,
     const vc::lasagna::LasagnaDataset& normalDataset)
 {
+    if (!fiberDataset.manifest().baseShapeZYX)
+        fail("fiber prediction manifest is missing base_shape_zyx");
+    if (normalDataset.manifest().baseShapeZYX) {
+        for (std::size_t axis = 0; axis < 3; ++axis) {
+            const auto fiberExtent =
+                (*fiberDataset.manifest().baseShapeZYX)[axis];
+            const auto normalExtent =
+                (*normalDataset.manifest().baseShapeZYX)[axis];
+            const auto difference = fiberExtent > normalExtent
+                ? fiberExtent - normalExtent : normalExtent - fiberExtent;
+            if (difference > 1)
+                fail("fiber and normal prediction base_shape_zyx values disagree");
+        }
+    }
     nlohmann::json sources = nlohmann::json::object();
     if (!options.sourceContextPath.empty()) {
         std::ifstream input(options.sourceContextPath);
@@ -304,9 +321,15 @@ nlohmann::json fiberletSourceIdentity(
                      field + "'");
         }
     }
-    return vc::fiber_tracer::makeFiberletSourceIdentity(
+    sources = vc::fiber_tracer::makeFiberletSourceIdentity(
         fiberDataset.manifest().manifestPath,
         normalDataset.manifest().manifestPath, std::move(sources));
+    const nlohmann::json baseShape = *fiberDataset.manifest().baseShapeZYX;
+    auto& source = sources["source_volume"];
+    if (source.contains("base_shape_zyx") && source["base_shape_zyx"] != baseShape)
+        fail("source-context base_shape_zyx disagrees with fiber manifest");
+    source["base_shape_zyx"] = baseShape;
+    return sources;
 }
 
 vc::fiber_tracer::FiberletDatasetMetadata replayDatasetMetadata(
@@ -422,6 +445,14 @@ std::filesystem::path defaultWholeVolumeAnchorRoot(const std::filesystem::path& 
 {
     const auto stem = outputRoot.stem().empty() ? outputRoot.filename().string() : outputRoot.stem().string();
     return outputRoot.parent_path() / (stem + ".anchors.zarr");
+}
+
+std::filesystem::path defaultWholeVolumeFiberletRoot(
+    const std::filesystem::path& outputRoot)
+{
+    const auto stem = outputRoot.stem().empty()
+        ? outputRoot.filename().string() : outputRoot.stem().string();
+    return outputRoot.parent_path() / (stem + ".paths.zarr");
 }
 
 class AtomicTemporaryCleanup final
@@ -633,11 +664,9 @@ std::uint64_t finalTupleSize(
     const vc::fiber_tracer::FiberletChunkDataset& dataset,
     const vc::render::ChunkKey& owner)
 {
-    auto route = owner;
-    route.level = 1;
-    return existingFileSize(dataset.chunkPath(vc::fiber_tracer::FiberletStorageChunkKind::Anchors, owner)) +
-        existingFileSize(dataset.chunkPath(vc::fiber_tracer::FiberletStorageChunkKind::FiberletPrefix, owner)) +
-        existingFileSize(dataset.chunkPath(vc::fiber_tracer::FiberletStorageChunkKind::FiberletRoutes, route));
+    return existingFileSize(dataset.chunkPath(
+        vc::fiber_tracer::FiberletStorageChunkKind::PublishedFiberlets,
+        owner));
 }
 
 int runWholeVolumePreprocessing(
@@ -672,8 +701,8 @@ int runWholeVolumePreprocessing(
         {},
         FiberletStorageProfile::Float32Cache,
         "whole_volume_presence_chunks_v1");
-    auto finalMetadata = replayDatasetMetadata(
-        FiberletDatasetKind::Combined,
+    auto fiberletMetadata = replayDatasetMetadata(
+        FiberletDatasetKind::Fiberlets,
         grid,
         options,
         fiberDataset,
@@ -686,20 +715,36 @@ int runWholeVolumePreprocessing(
             .storageChunkSideBaseVoxels = options.storageChunkSideBaseVoxels},
         FiberletStorageProfile::CompactDirectionsFixedCost,
         "whole_volume_presence_chunks_v1");
+    auto finalMetadata = fiberletMetadata;
+    finalMetadata.kind = FiberletDatasetKind::Published;
+    finalizeFiberletDatasetIdentity(finalMetadata);
 
     const auto anchorRoot = options.anchorCacheRoot.empty() ? defaultWholeVolumeAnchorRoot(options.outputDirectory) : options.anchorCacheRoot;
+    const auto fiberletRoot = options.fiberletCacheRoot.empty()
+        ? defaultWholeVolumeFiberletRoot(options.outputDirectory)
+        : options.fiberletCacheRoot;
     std::filesystem::create_directories(options.outputDirectory);
     std::filesystem::create_directories(anchorRoot);
-    const auto outputCanonical = std::filesystem::canonical(options.outputDirectory);
-    const auto anchorCanonical = std::filesystem::canonical(anchorRoot);
-    if (outputCanonical == anchorCanonical)
-        throw std::invalid_argument("whole-volume anchor cache and final output must use different roots");
-    const bool outputFirst = outputCanonical.string() < anchorCanonical.string();
-    auto firstLock = std::make_unique<vc::core::util::ExclusiveDirectoryLock>(outputFirst ? outputCanonical : anchorCanonical);
-    auto secondLock = std::make_unique<vc::core::util::ExclusiveDirectoryLock>(outputFirst ? anchorCanonical : outputCanonical);
+    std::filesystem::create_directories(fiberletRoot);
+    std::vector<std::filesystem::path> lockedRoots{
+        std::filesystem::canonical(options.outputDirectory),
+        std::filesystem::canonical(anchorRoot),
+        std::filesystem::canonical(fiberletRoot)};
+    std::sort(lockedRoots.begin(), lockedRoots.end());
+    if (std::adjacent_find(lockedRoots.begin(), lockedRoots.end()) !=
+        lockedRoots.end())
+        throw std::invalid_argument(
+            "whole-volume output, anchor cache, and fiberlet cache must use different roots");
+    std::vector<std::unique_ptr<vc::core::util::ExclusiveDirectoryLock>> locks;
+    locks.reserve(lockedRoots.size());
+    for (const auto& root : lockedRoots)
+        locks.push_back(
+            std::make_unique<vc::core::util::ExclusiveDirectoryLock>(root));
     (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(anchorRoot);
+    (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(fiberletRoot);
     (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(options.outputDirectory);
-    AtomicTemporaryCleanup temporaryCleanup{{anchorRoot, options.outputDirectory}};
+    AtomicTemporaryCleanup temporaryCleanup{
+        {anchorRoot, fiberletRoot, options.outputDirectory}};
 
     auto finalDataset = FiberletChunkDataset::createOrOpen(options.outputDirectory, finalMetadata);
     std::cerr << "fiberlet_preprocess_presence status=started\n";
@@ -722,7 +767,7 @@ int runWholeVolumePreprocessing(
     // Whole-volume parallelism is across chunks so one global worker budget can
     // move dynamically between ready fiberlets and their anchor dependencies.
     auto onDemand = makeCanonicalFiberletOnDemandConfig(
-        anchorRoot, options.outputDirectory, anchorMetadata, finalMetadata,
+        anchorRoot, fiberletRoot, anchorMetadata, fiberletMetadata,
         grid, options.anchors, options.paths,
         [&field](const auto& indices, int threads, auto& samples) {
             field.sampleStoredGridBatch(indices, threads, samples);
@@ -757,7 +802,7 @@ int runWholeVolumePreprocessing(
     completedOutputs.reserve(activeChunks.size());
     std::uint64_t fiberletPayloadBytes = 0;
     for (const auto& key : activeChunks) {
-        if (!finalDataset->readMaterializedChunk(FiberletStorageChunkKind::FiberletPrefix, key))
+        if (!finalDataset->readPublishedChunk(key))
             continue;
         completedOutputs.push_back(key);
         fiberletPayloadBytes += finalTupleSize(*finalDataset, key);
@@ -815,50 +860,84 @@ int runWholeVolumePreprocessing(
             const auto anchors = std::dynamic_pointer_cast<const FiberletAnchorChunkPayload>(anchorChunk.payload);
             if (anchorChunk.status != vc::render::ChunkStatus::Data || !anchors)
                 throw std::runtime_error("whole-volume final anchor source is unavailable");
-            if (anchors->anchors.empty())
-                return std::uint64_t{0};
-            const auto compactCodec = finalDataset->codecConfig(FiberletStorageChunkKind::Anchors, work.key);
-            const auto compactAnchors = serializeFiberletAnchors(compactCodec, anchors->anchors);
-            finalDataset->publishChunk(FiberletStorageChunkKind::Anchors, work.key, compactAnchors);
-            const auto removeFinalTuple = [&] {
-                auto routeKey = work.key;
-                routeKey.level = 1;
-                std::error_code ignored;
-                std::filesystem::remove(
-                    finalDataset->chunkPath(FiberletStorageChunkKind::Anchors, work.key), ignored);
-                std::filesystem::remove(
-                    finalDataset->chunkPath(FiberletStorageChunkKind::FiberletPrefix, work.key), ignored);
-                std::filesystem::remove(
-                    finalDataset->chunkPath(FiberletStorageChunkKind::FiberletRoutes, routeKey), ignored);
-            };
+            const auto prefixChunk = preprocessor->fiberletCache()->getChunkBlocking(
+                0, work.key.iz, work.key.iy, work.key.ix);
+            const auto routeChunk = preprocessor->fiberletCache()->getChunkBlocking(
+                1, work.key.iz, work.key.iy, work.key.ix);
+            const auto prefixes = std::dynamic_pointer_cast<const FiberletPrefixChunkPayload>(prefixChunk.payload);
+            const auto routes = std::dynamic_pointer_cast<const FiberletRouteChunkPayload>(routeChunk.payload);
+            if (prefixChunk.status != vc::render::ChunkStatus::Data ||
+                routeChunk.status != vc::render::ChunkStatus::Data || !prefixes || !routes)
+                throw std::runtime_error("whole-volume fiberlet generation failed: " +
+                    prefixChunk.error + " " + routeChunk.error);
 
-            const auto fiberletChunk = [&] {
-                try {
-                    return preprocessor->fiberletCache()->getChunkBlocking(
-                        work.key.level, work.key.iz, work.key.iy, work.key.ix);
-                } catch (...) {
-                    removeFinalTuple();
-                    throw;
+            std::map<FiberletStorageKey, FiberletStoredAnchor>
+                referencedByKey;
+            const auto ownedContains = [&](const FiberletStorageKey& key) {
+                return anchors->find(key) != nullptr;
+            };
+            for (const auto& prefix : prefixes->prefixes) {
+                for (const auto& endpoint :
+                    {prefix.id.first, prefix.id.second}) {
+                    if (ownedContains(endpoint) ||
+                        referencedByKey.contains(endpoint))
+                        continue;
+                    const auto endpointChunkKey =
+                        preprocessor->anchorDataset()->chunkOwningAnchor(
+                            endpoint);
+                    const auto endpointChunk =
+                        preprocessor->anchorCache()->getChunkBlocking(
+                            endpointChunkKey.level, endpointChunkKey.iz,
+                            endpointChunkKey.iy, endpointChunkKey.ix);
+                    const auto endpointAnchors = std::dynamic_pointer_cast<
+                        const FiberletAnchorChunkPayload>(endpointChunk.payload);
+                    const auto* endpointAnchor = endpointAnchors
+                        ? endpointAnchors->find(endpoint) : nullptr;
+                    if (endpointChunk.status !=
+                            vc::render::ChunkStatus::Data ||
+                        !endpointAnchor) {
+                        throw std::runtime_error(
+                            "whole-volume final endpoint anchor is unavailable");
+                    }
+                    referencedByKey.emplace(endpoint, *endpointAnchor);
                 }
-            }();
-            if (fiberletChunk.status != vc::render::ChunkStatus::Data || !fiberletChunk.payload) {
-                removeFinalTuple();
+            }
+            std::vector<FiberletStoredAnchor> referencedAnchors;
+            referencedAnchors.reserve(referencedByKey.size());
+            for (const auto& [key, anchor] : referencedByKey) {
+                (void)key;
+                referencedAnchors.push_back(anchor);
+            }
+
+            const auto finalCodec = finalDataset->codecConfig(
+                FiberletStorageChunkKind::PublishedFiberlets, work.key);
+            auto referencedCodec = finalCodec;
+            if (!referencedAnchors.empty()) {
+                for (std::size_t axis = 0; axis < 3; ++axis) {
+                    referencedCodec.coordinateOriginZYX[axis] =
+                        std::min_element(
+                            referencedAnchors.begin(), referencedAnchors.end(),
+                            [axis](const auto& left, const auto& right) {
+                                return left.key.coordinateZYX[axis] <
+                                    right.key.coordinateZYX[axis];
+                            })->key.coordinateZYX[axis];
+                }
+            }
+            const auto ownedBytes = serializeFiberletAnchors(
+                finalCodec, anchors->anchors);
+            const auto referencedBytes = serializeFiberletAnchors(
+                referencedCodec, referencedAnchors);
+            const auto prefixBytes = serializeFiberletPrefixes(
+                finalCodec, prefixes->prefixes);
+            const auto routeBytes = serializeFiberletRoutes(
+                finalCodec, routes->routes);
+            const auto publishedBytes = serializePublishedFiberletChunk(
+                finalCodec, ownedBytes, referencedBytes, prefixBytes,
+                routeBytes);
+            finalDataset->publishPublishedChunk(work.key, publishedBytes);
+            if (!finalDataset->readPublishedChunk(work.key))
                 throw std::runtime_error(
-                    "whole-volume fiberlet chunk generation failed at " + std::to_string(work.key.iz) + '/' +
-                    std::to_string(work.key.iy) + '/' + std::to_string(work.key.ix) +
-                    (fiberletChunk.error.empty() ? std::string{} : ": " + fiberletChunk.error));
-            }
-            const auto prefixes = std::dynamic_pointer_cast<const FiberletPrefixChunkPayload>(fiberletChunk.payload);
-            if (!prefixes) {
-                removeFinalTuple();
-                throw std::runtime_error("whole-volume fiberlet chunk has the wrong decoded payload");
-            }
-            if (prefixes->prefixes.empty()) {
-                removeFinalTuple();
-                return std::uint64_t{0};
-            }
-            if (!finalDataset->readMaterializedChunk(FiberletStorageChunkKind::FiberletPrefix, work.key))
-                throw std::runtime_error("whole-volume final tuple is incomplete after publication");
+                    "whole-volume final chunk is incomplete after publication");
             return finalTupleSize(*finalDataset, work.key);
         });
     };
@@ -898,33 +977,18 @@ int runWholeVolumePreprocessing(
     preprocessor->shutdown();
     (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(anchorRoot);
     (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(options.outputDirectory);
-    auto verifiedDataset = FiberletChunkDataset::openExisting(
-        options.outputDirectory);
-    for (const auto& key : activeChunks) {
-        // Missing tuples are canonical sparse empties. Present tuples must
-        // still decode and validate as a complete anchor/prefix/route unit.
-        const bool anchorPresent = std::filesystem::exists(
-            verifiedDataset->chunkPath(FiberletStorageChunkKind::Anchors, key));
-        const auto pairPresence = verifiedDataset->pairPresence(key);
-        if (!anchorPresent &&
-            pairPresence == FiberletChunkDataset::PairPresence::Absent) {
-            continue;
-        }
-        if (!anchorPresent ||
-            pairPresence != FiberletChunkDataset::PairPresence::Complete ||
-            !verifiedDataset->readMaterializedChunk(
-                FiberletStorageChunkKind::FiberletPrefix, key)) {
-            throw std::runtime_error(
-                "whole-volume Fiberlet output contains a partial sparse tuple at " +
-                std::to_string(key.iz) + '/' + std::to_string(key.iy) + '/' +
-                std::to_string(key.ix));
-        }
-    }
+    (void)vc::core::util::cleanupAtomicWriteTemporaryFiles(fiberletRoot);
+    finalDataset->markComplete();
+    auto verifiedDataset = FiberletChunkDataset::openExisting(options.outputDirectory);
+    if (!verifiedDataset->datasetComplete())
+        throw std::runtime_error("published fiberlet output is incomplete");
     std::cout << "fiberlet_preprocess_volume status=completed"
               << " active_chunks=" << activeChunks.size() << " anchor_chunks=" << anchorChunks.size()
               << " resumed_chunks=" << completedOutputs.size()
               << " elapsed_seconds=" << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count()
-              << " anchor_cache=" << anchorRoot << " output=" << options.outputDirectory << '\n';
+              << " anchor_cache=" << anchorRoot
+              << " fiberlet_cache=" << fiberletRoot
+              << " output=" << options.outputDirectory << '\n';
     return 0;
 }
 

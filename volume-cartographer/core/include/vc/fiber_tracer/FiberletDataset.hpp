@@ -86,11 +86,27 @@ public:
   std::vector<FiberletStoredTrace> traces;
 };
 
+class FiberletPublishedChunkPayload final : public vc::render::DecodedChunkPayload
+{
+public:
+    explicit FiberletPublishedChunkPayload(FiberletDecodedPublishedChunk decoded);
+
+    [[nodiscard]] std::size_t residentBytes() const noexcept override;
+
+    FiberletDecodedPublishedChunk decoded;
+};
+
 enum class FiberletDatasetKind {
     Anchors,
     Fiberlets,
     Combined,
-  Traces,
+    Published,
+    Traces,
+};
+
+enum class FiberletDatasetBuildState {
+    Partial,
+    Complete,
 };
 
 struct FiberletDatasetMetadata {
@@ -116,6 +132,10 @@ struct FiberletDatasetMetadata {
     // Complete effective scientific processing, selection, layout, storage,
     // and codec settings required to interpret or reproduce this dataset.
     nlohmann::json processing = nlohmann::json::object();
+    // Publication lifecycle fields are intentionally excluded from identity.
+    FiberletDatasetBuildState buildState = FiberletDatasetBuildState::Partial;
+    std::optional<std::uint64_t> expectedChunkCount;
+    std::optional<std::string> expectedChunkDigest;
 };
 
 // Canonically derive the algorithm and dataset fingerprints from the
@@ -159,10 +179,14 @@ public:
     [[nodiscard]] const FiberletDatasetMetadata& metadata() const noexcept;
     [[nodiscard]] bool datasetComplete() const;
     void configureExpectedChunks(std::span<const vc::render::ChunkKey> chunks);
+    void markComplete();
+    void markPartial();
     [[nodiscard]] const std::vector<vc::render::ChunkKey>& expectedChunks() const noexcept;
     [[nodiscard]] bool isExpectedChunk(const vc::render::ChunkKey& key) const;
     [[nodiscard]] MaterializationStats materializationStats() const noexcept;
     [[nodiscard]] FiberletStorageCodecConfig codecConfig(FiberletStorageChunkKind kind, const vc::render::ChunkKey& key) const;
+    [[nodiscard]] vc::render::ChunkKey chunkOwningAnchor(
+        const FiberletStorageKey& anchor, int level = 0) const;
     [[nodiscard]] std::filesystem::path chunkPath(FiberletStorageChunkKind kind, const vc::render::ChunkKey& key) const;
     [[nodiscard]] std::optional<std::vector<std::byte>> readChunk(FiberletStorageChunkKind kind, const vc::render::ChunkKey& key) const;
     struct MaterializedChunk {
@@ -199,6 +223,11 @@ public:
     };
     [[nodiscard]] PairPresence pairPresence(
         const vc::render::ChunkKey& owner) const;
+    void publishPublishedChunk(
+        const vc::render::ChunkKey& key,
+        std::span<const std::byte> bytes) const;
+    [[nodiscard]] std::optional<FiberletDecodedPublishedChunk>
+    readPublishedChunk(const vc::render::ChunkKey& key) const;
     void validateChunk(FiberletStorageChunkKind kind, const vc::render::ChunkKey& key, std::span<const std::byte> bytes) const;
 
 private:
@@ -211,7 +240,7 @@ private:
     FiberletDatasetMetadata metadata_;
     std::vector<vc::render::ChunkKey> expectedChunks_;
     bool expectedChunksConfigured_ = false;
-  mutable std::array<std::atomic_size_t, 4> materializationDecodes_{};
+  mutable std::array<std::atomic_size_t, 5> materializationDecodes_{};
     std::shared_ptr<FiberletChunkWriteBackCache> writeBack_;
     std::uint64_t writeBackLayer_ = 0;
 };

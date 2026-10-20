@@ -41,22 +41,25 @@ do not require dense volume processing. This presence scan is repeated on resume
 
 ## Storage contract
 
-The final sparse Zarr group contains `anchors/`, `prefix/`, and `routes/` arrays.
-These form a **logical chunk tuple**, not one physical file. Owner anchors are
-copied into the final group, so reading final output does not require the
-temporary anchor cache. Chunk keys use slash-separated coordinates.
+The published output is format 3: one `fiberlets/` array with slash-separated
+chunk keys. Each physical chunk contains owned anchors, referenced endpoint
+anchors, prefixes and routes. It is self-contained and does not depend on
+the private working caches. `--anchor-cache` and `--fiberlet-cache` select those
+private caches; their internal cache formats are not publication formats.
 
 Metadata is created before generation. It records source manifest hashes,
-effective processing settings, grid shape, prediction-to-base scale, codec
+effective processing settings, original base-volume shape, grid shape, prediction-to-base scale, codec
 profile, and generation contract version. `--source-context` supplies additional
 source-volume/model identities. Fingerprints exclude runtime paths and toolchain
 diagnostics. Incompatible metadata is rejected, not silently reused.
 
 Chunk publication uses atomic replacement and file locks. Readers validate codec
-headers, identity and tuple completeness. Missing sparse tuples represent empty
-output; partially present tuples are errors. No separate expected-chunk index or
-completion ledger is required. Do not interpret metadata alone as proof that an
-interrupted whole-volume run finished.
+headers, identity and endpoint ownership. Metadata starts with
+`build_state: partial`; completion requires every source-selected chunk,
+including explicit empty payloads, to be present and valid. Metadata records the
+expected chunk count and inventory digest and changes to `complete` only after
+validation. Missing expected chunks and stale extra chunks are errors.
+Legacy combined datasets remain readable, but the CLI publishes only format 3.
 
 ## Library integration
 

@@ -24,6 +24,8 @@ enum class FiberletStorageChunkKind : std::uint8_t {
     FiberletPrefix = 2,
     FiberletRoutes = 3,
   FiberTraces = 4,
+    // Distinct API kind; its historical wire tag is 4 with a non-trace profile.
+    PublishedFiberlets = 5,
 };
 
 struct FiberletStorageKey {
@@ -143,6 +145,22 @@ struct FiberletDecodedTraces {
   std::vector<FiberletStoredTrace> traces;
 };
 
+// One portable published chunk. The four nested payloads retain the exact
+// private anchor/prefix/route wire encodings; the distinction between anchors
+// owned by this spatial chunk and foreign endpoint anchors is therefore
+// explicit and cannot leak foreign anchors through the owned-anchor facet.
+struct FiberletDecodedPublishedChunk {
+    FiberletStorageCodecConfig config;
+    FiberletDecodedAnchors ownedAnchors;
+    FiberletDecodedAnchors referencedAnchors;
+    FiberletDecodedPrefixes prefixes;
+    FiberletDecodedRoutes routes;
+    std::vector<std::byte> ownedAnchorPayload;
+    std::vector<std::byte> referencedAnchorPayload;
+    std::vector<std::byte> prefixPayload;
+    std::vector<std::byte> routePayload;
+};
+
 [[nodiscard]] std::vector<std::byte> serializeFiberletAnchors(
     const FiberletStorageCodecConfig& config,
     std::span<const FiberletStoredAnchor> anchors);
@@ -167,6 +185,16 @@ serializeFiberletTraces(const FiberletStorageCodecConfig &config,
 
 [[nodiscard]] FiberletDecodedTraces
 deserializeFiberletTraces(std::span<const std::byte> bytes);
+
+[[nodiscard]] std::vector<std::byte> serializePublishedFiberletChunk(
+    const FiberletStorageCodecConfig& config,
+    std::span<const std::byte> ownedAnchorPayload,
+    std::span<const std::byte> referencedAnchorPayload,
+    std::span<const std::byte> prefixPayload,
+    std::span<const std::byte> routePayload);
+
+[[nodiscard]] FiberletDecodedPublishedChunk deserializePublishedFiberletChunk(
+    std::span<const std::byte> bytes);
 
 // Decode field compression while retaining the same strict payload envelope.
 // Generated ChunkCache instances keep this byte form in their decoded LRU and
