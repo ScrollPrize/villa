@@ -6,6 +6,11 @@ command-line tools, and a Python package. Storage and detectors build without
 volume-cartographer or Qt. CT-based detectors link vc_reader's C++ reader and
 structure-tensor normal implementation.
 
+Shared C++ and Python geometry types represent point collections, fibers,
+tracks and patches independently of files and object identity. Snapshot views
+provide typed, bounded reads and checked sparse edits. See the
+[geometry API](docs/typed-geometry.md) for examples and lifetime rules.
+
 ## Build
 
 Build from a villa checkout, with `vc_reader` beside this directory:

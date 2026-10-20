@@ -7,6 +7,10 @@ geometry, then query, annotate, export, or synchronize using that same handle.
 The query APIs provide bounded pages, graph views, and packed geometry arrays for resident
 working data. Existing application consumers remain separate from the store.
 
+The [shared geometry API](typed-geometry.md) provides owned point collections,
+fibers, tracks and patches, typed snapshot views, bounded reads and checked
+edits in C++ and Python. It preserves the generic array API and stored formats.
+
 ## Build and command line
 
 Run these commands from `villa/vc_object_store`, after configuring with
@@ -61,7 +65,8 @@ relationships untouched.
 
 ## C++
 
-Link `vc_objects` for storage, `vc_object_geometry` for native ingestion/export,
+Link `vc_geometry` for owned geometry, `vc_objects` for storage and typed views,
+`vc_object_geometry` for native ingestion/export,
 and `vc_object_links` for relationship detection.
 
 ```cpp
