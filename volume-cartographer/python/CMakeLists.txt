@@ -108,13 +108,6 @@ target_link_libraries(vc_fiber_trace PRIVATE vc_fiber_tracer)
 target_compile_features(vc_fiber_trace PRIVATE cxx_std_23)
 set_target_properties(vc_fiber_tracer PROPERTIES INSTALL_RPATH "$ORIGIN")
 
-# Removed extensions must not remain importable in an incremental build.
-file(GLOB VC_STALE_OBJECT_MODULES "${CMAKE_CURRENT_BINARY_DIR}/vc/objects*${CMAKE_SHARED_MODULE_SUFFIX}"
-    "${CMAKE_CURRENT_BINARY_DIR}/vc/graph*${CMAKE_SHARED_MODULE_SUFFIX}")
-if(VC_STALE_OBJECT_MODULES)
-    file(REMOVE ${VC_STALE_OBJECT_MODULES})
-endif()
-
 install(TARGETS vc_lasagna_amgx
     LIBRARY DESTINATION .
     RUNTIME DESTINATION .

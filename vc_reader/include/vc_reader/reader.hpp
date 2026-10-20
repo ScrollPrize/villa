@@ -9,6 +9,7 @@
 #include <vector>
 
 namespace vcr {
+class Array;
 // Native CT adapter. ZYX buffers; XYZ points. Owns one reader and bounded cache.
 class CtReader {
 public:
@@ -17,6 +18,8 @@ public:
     CtReader(CtReader&&) noexcept;
     CtReader& operator=(CtReader&&) noexcept;
     std::array<int64_t, 3> shape() const;
+    // Borrowed access for general sampling and CUDA readers; this owner must outlive them.
+    Array& array();
     void readRegion(std::array<int64_t, 3> start, std::array<int64_t, 3> shape, std::span<uint8_t> out);
     // Normal XYZ and relative eigengap; invalid support returns all zeros.
     std::vector<std::array<float, 4>> sheetNormals(std::span<const std::array<double, 3>> xyz);

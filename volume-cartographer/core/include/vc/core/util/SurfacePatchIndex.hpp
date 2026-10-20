@@ -8,7 +8,6 @@
 #include <memory>
 #include <optional>
 #include <shared_mutex>
-#include <span>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -109,16 +108,10 @@ public:
     // Cheap overlap-style variant of locate(): returns the first accepted hit
     // within tolerance instead of scanning every candidate for the nearest,
     // and filters against the caller's include/exclude sets without copying
-    // them (locate() copies shared-pointer sets, but borrows raw sets). Safe to call concurrently
+    // them (locate() copies the sets per call). Safe to call concurrently
     // from many threads while queries hold the shared lock.
     std::optional<LookupResult> locateAny(const PointQuery& query) const;
     std::vector<LookupResult> locateAll(const PointQuery& query) const;
-    // Identical queries with one shared index lock per batch. Filter sets must
-    // remain unchanged throughout the call. The visitor runs synchronously and
-    // must not re-enter or mutate this index; result references are temporary.
-    void locateAllBatch(std::span<const cv::Vec3f> points, float tolerance,
-                        const SurfaceFilter& surfaces,
-                        const std::function<void(size_t, const std::vector<LookupResult>&)>& visitor) const;
     std::vector<SurfacePtr> locateSurfaces(const PointQuery& query) const;
 
     void forEachTriangle(const TriangleQuery& query,
@@ -173,7 +166,6 @@ public:
     uint64_t globalGeneration() const;
 
 private:
-    std::vector<LookupResult> locateAllUnlocked(const PointQuery& query) const;
     struct NoPatchFilter {
         template <typename Box>
         bool operator()(const Box&) const { return true; }

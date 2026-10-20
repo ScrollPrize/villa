@@ -218,6 +218,7 @@ CtReader::CtReader(CtReader&&) noexcept = default;
 CtReader& CtReader::operator=(CtReader&&) noexcept = default;
 
 std::array<int64_t, 3> CtReader::shape() const { return impl_->shape; }
+Array& CtReader::array() { return *impl_->array; }
 
 void CtReader::readRegion(std::array<int64_t, 3> start, std::array<int64_t, 3> shape,
                           std::span<uint8_t> out)

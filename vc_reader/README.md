@@ -1420,17 +1420,14 @@ A.SurfacePerturb(blobs=3, amplitude=1, points_affected=100, p=1)
 
 </details>
 
-## Native C++ CT reading and normals
+## Native C++ API
 
-`vc_reader::reader` provides `vc_reader/reader.hpp` without Python or nanobind.
-Configure with `-DVC_READER_BUILD_PYTHON=OFF` for a native-only build, then build
-with Ninja and install with CMake. Installed consumers use
-`find_package(vc_reader CONFIG REQUIRED)` and link `vc_reader::reader`.
+Readers, sampling, geometry, and the full transform catalog are available to
+C++20 clients through `vc_reader::reader` and `vc_reader::transforms`, including
+CUDA backends. Python and C++ use the same implementations. Configure with
+`VC_READER_BUILD_PYTHON=OFF` to build without Python or nanobind, and select
+`VC_READER_ENABLE_CUDA=ON` or `OFF` for the desired backend.
 
-`vcr::CtReader(location, level, cacheBytes)` opens a uint8 Zarr array or pyramid
-level. `readRegion` fills caller-owned ZYX storage; `sheetNormals` takes XYZ
-points and returns normal XYZ plus eigengap, with zeros for invalid support.
-It uses the same CPU kernel as the Python sheet-normal API and batches at most
-eight 109³ patches at a time. Native opening supports local and anonymous
-HTTP/S3 sources; authenticated access and disk-cache configuration remain on
-the existing Python reader interface. Existing CUDA Python APIs are unchanged.
+See the [C++ guide](docs/cpp.md) for installation, target and header coverage,
+array/cache configuration, transform pipelines and replay, device-buffer
+ownership, streams, and a complete CPU/CUDA CT-normal example.
