@@ -2804,7 +2804,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         if (stats.lowSpace) {
             const double freeGiB = static_cast<double>(stats.freeBytes) /
                                    (1024.0 * 1024.0 * 1024.0);
-            const QString text = tr("Low disk space: %1 GiB free; remote Zarr cache growth is paused.")
+            const QString text = tr("Low disk space: %1 GiB free. Cache cleanup runs asynchronously; downloads continue and cache writes may fail if the disk fills.")
                                      .arg(freeGiB, 0, 'f', 1);
             _persistentCacheLowSpaceLabel->setText(QStringLiteral("⚠ ") + text);
             _persistentCacheLowSpaceLabel->show();

@@ -45,7 +45,7 @@ Lasagna hit/download diagnostics redact query strings.
 
 ## Disk Accounting
 
-`Managed` payloads reserve space and hold read pins through
+`Managed` payloads account pending writes and hold read pins through
 `PersistentZarrCacheBudget`. Startup scanning recognizes managed remote-file
 payloads so accounting survives process restart. Budget eviction removes the
 payload; a later lookup treats the remaining or missing sidecar as a miss.
@@ -53,6 +53,87 @@ payload; a later lookup treats the remaining or missing sidecar as a miss.
 `Unmanaged` payloads are small control files outside the evictable Zarr-byte
 budget. Cached Lasagna manifests use this class. Callers must choose the class
 deliberately and keep large data payloads managed.
+
+### Asynchronous Disk Vacuum
+
+Disk limits are soft during active writes. Reservations protect individual paths
+and account pending growth/temporary bytes; they do not query free space, sort
+victims, or delete files. Downloads continue while one worker per cache root
+reclaims space. Actual write failures (including ENOSPC) still follow the
+caller's existing persistence-error handling; a reservation is not a guarantee
+that the filesystem can accept the bytes.
+
+The worker wakes on write reservation/completion, limit changes, subtree changes,
+and pin release when cleanup is blocked by pins. There is no polling timer.
+Status reads return the last worker measurement without filesystem access.
+Consequently unrelated disk usage changes during an idle session are noticed
+on the next cache event, not immediately.
+
+Eviction uses 32 ten-second access-generation buckets plus an oldest overflow
+list. Bucket links are pooled integer indices. Access generations use a monotonic
+clock; bucket placement is repaired lazily when selecting a victim. Recycling
+a bucket splices its contents into overflow in constant time. Pinned/writing
+entries are detached from eligibility until released, and a deletion reservation
+prevents new readers/writers from racing removal of that same file. Successful
+reads no longer write filesystem mtimes. Restart ordering is approximate, using
+file modification times; entries older than 320 seconds share the oldest class.
+
+Headroom is the smaller of 1,000 estimated storage-object sizes and 1% of the
+configured cache capacity. With no cache-size limit, filesystem capacity supplies
+the 1% cap. The estimate starts with inventoried nonempty payload sizes and then
+uses an EMA (1/32) of published nonempty objects, including complete outer shards.
+Cleanup starts below half the target headroom and reclaims the full headroom,
+respecting both the cache-size limit and a configured minimum-free-space reserve.
+The latter includes the existing free-space deficit, not just incoming bytes.
+
+Selection/lazy repair is bounded to 128 entries per batch. Filesystem deletion
+and free-space queries run outside the bookkeeping mutex. Missing victims are
+removed from accounting; failed removals are retried only on a later activity
+event, not repeatedly within one cleanup pass. Zero-byte markers remain indexed
+but are not byte-reclamation victims. If pins or failures prevent cleanup, the
+worker sleeps until further activity rather than spinning.
+
+Startup inventories the cache once and merges writes completed during inventory.
+Ordinary subtree removal/movement updates the in-memory index without rescanning
+the filesystem. A subtree change racing the initial inventory may restart that
+inventory to avoid publishing paths from the old layout.
+
+The opt-in synthetic benchmark uses 20,000 100-byte files, halves the cache limit,
+then performs 200 writes at capacity. Setup/inventory are outside measured time:
+
+```bash
+cmake --build volume-cartographer/build --target test_persistent_zarr_cache_budget -j8
+env TMPDIR="$PWD/volume-cartographer/build" VC_CACHE_BUDGET_BENCH=1 \
+  volume-cartographer/build/bin/test_persistent_zarr_cache_budget
+```
+
+Run three times on an idle machine; compare `trim_s`, `churn_s`, and `cpu_s`.
+The benchmark waits for cleanup to finish, so it includes asynchronous work rather
+than merely measuring how fast writes return. Other budget regression tests also
+run in this executable.
+
+Measured 2026-10-16 on Linux, GCC 15 Release, three runs per version (seconds):
+
+| Metric                   | Previous min / median / max | Buckets min / median / max |
+|--------------------------|-----------------------------|----------------------------|
+| Bulk trim wall           | 5.534 / 5.549 / 5.557        | 0.433 / 0.459 / 0.492      |
+| 200 writes + vacuum wall | 0.261 / 0.262 / 0.265        | 0.017 / 0.018 / 0.020      |
+| Combined CPU             | 5.738 / 5.757 / 5.768        | 0.443 / 0.478 / 0.512      |
+
+The new trim also reserves 1% headroom, so it removes slightly more data than
+the previous trim. These are local synthetic results, not remote-network or
+interactive GUI latency measurements. A worker-scoped Callgrind profile recorded
+71.6M instructions; leading identified self costs were filesystem path splitting
+(16.6%), byte hashing (7.7%), and `free` (6.6%). Instruction percentages do not
+measure filesystem wait time. The profile can be reproduced with:
+
+```bash
+env TMPDIR="$PWD/volume-cartographer/build" VC_CACHE_BUDGET_BENCH=1 \
+  valgrind --tool=callgrind --collect-atstart=no \
+  '--toggle-collect=*PersistentZarrCacheBudget::Impl::vacuum*' \
+  --callgrind-out-file=volume-cartographer/build/cache-vacuum.callgrind \
+  volume-cartographer/build/bin/test_persistent_zarr_cache_budget
+```
 
 ## Lasagna Layout
 
