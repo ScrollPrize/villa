@@ -4,6 +4,7 @@ import json
 import torch.distributed as dist
 
 from dinovol_2.training.trainer import Trainer
+from dinovol_2.training.config import normalize_config
 from dinovol_2.training.schedules import CosineScheduler
 from dinovol_2.methods.dino import dino_loss_term_count
 
@@ -38,15 +39,17 @@ def main() -> None:
     with open(args.config, 'r') as f:
         config = json.load(f)
 
+    config = normalize_config(config)
+    runtime = config["runtime"]
     if args.resume_from is not None:
-        config["resume_from"] = args.resume_from
-        config["resume"] = True
+        runtime["resume_from"] = args.resume_from
+        runtime["resume"] = True
     if args.no_resume:
-        config["resume"] = False
-        config["auto_resume"] = False
-        config.pop("resume_from", None)
+        runtime["resume"] = False
+        runtime["auto_resume"] = False
+        runtime.pop("resume_from", None)
     if args.ddp:
-        config["use_ddp"] = True
+        runtime["use_ddp"] = True
 
     trainer = Trainer(config)
     try:

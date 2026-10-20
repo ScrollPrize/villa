@@ -25,7 +25,7 @@ from dinovol_2.model.model import DinoVitStudentTeacher, _upgrade_weight_norm_st
 from dinovol_2.ops.point_embeddings import gather_variable_points, sample_normalized_patch_embeddings
 from .dino_data import build_dino_ibot_collate_fn
 from dinovol_2.training.schedules import CosineScheduler
-from dinovol_2.model import materialize_backbone_config
+from dinovol_2.training.config import dino_model_config
 from .base import TrainingMethod, StepOutput
 
 def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, float]:
@@ -69,17 +69,18 @@ class DinoMethod(TrainingMethod):
 
     def __init__(self, config: Mapping[str, Any], *, device, is_distributed=False, rank=0) -> None:
         super().__init__()
-        self.config = dict(config)
+        self.config = dict(config["method"])
+        runtime = config["runtime"]
+        self.data_config = config["data"]
+        self.compile_config = runtime.get("compile", False)
         self.device = torch.device(device)
         self.is_distributed = is_distributed
         self.rank = rank
-        self.use_amp = bool(config.get("use_amp", self.device.type == "cuda"))
+        self.use_amp = bool(runtime.get("use_amp", self.device.type == "cuda"))
         from dinovol_2.ops.precision import resolve_amp_dtype
-        self.amp_dtype = resolve_amp_dtype(config.get("amp_dtype", "bfloat16"))
-        self.total_steps = int(config.get("max_iterations", config.get("num_iterations", 1000000)))
-        self.model_config = {**config["model"], **materialize_backbone_config(config["model"])}
-        self.config["model"] = self.model_config
-        modern_defaults = str(self.model_config.get("model_type", "")).strip().lower() == "v3"
+        self.amp_dtype = resolve_amp_dtype(runtime.get("amp_dtype", "bfloat16"))
+        self.total_steps = int(runtime.get("max_iterations", runtime.get("num_iterations", 1000000)))
+        self.model_config = dino_model_config(config)
         self.freeze_last_layer_steps = self._resolve_freeze_last_layer_steps()
         # object_losses: dense point head + object/ink/region losses on pseudo-object
         # points (dataset.object_points). Weights are relative to the DINO loss.
@@ -148,7 +149,7 @@ class DinoMethod(TrainingMethod):
         ).to(self.device)
         self.koleo_loss = KoLeoLoss(
             distributed=bool(self.config.get("koleo_distributed", True)),
-            loss_group_size=self.config.get("koleo_loss_group_size", 16 if modern_defaults else None),
+            loss_group_size=self.config.get("koleo_loss_group_size", 16),
         ).to(self.device)
         self.gram_config = dict(self.config.get("gram") or {})
         self.do_gram = bool(self.gram_config.get("enabled", False))
@@ -175,7 +176,7 @@ class DinoMethod(TrainingMethod):
         }
         self.point_config.update(dict(self.config.get("point_supervision") or {}))
         self.config["point_supervision"] = dict(self.point_config)
-        configured_train_dataset = self.config.get("dataset") or {}
+        configured_train_dataset = self.data_config.get("dataset") or {}
         train_datasets = list(configured_train_dataset.get("datasets", []))
         for variant in configured_train_dataset.get("variants", []) or []:
             train_datasets.extend(dict(variant).get("datasets", []))
@@ -217,8 +218,8 @@ class DinoMethod(TrainingMethod):
         self.warmup_teacher_temp_steps = int(
             self.config.get("warmup_teacher_temp_steps", round(self.total_steps * 0.3))
         )
-        self.momentum_teacher = float(self.config.get("momentum_teacher", 0.994 if modern_defaults else 0.992))
-        self.final_momentum_teacher = float(self.config.get("final_momentum_teacher", self.momentum_teacher if modern_defaults else 1.0))
+        self.momentum_teacher = float(self.config.get("momentum_teacher", 0.994))
+        self.final_momentum_teacher = float(self.config.get("final_momentum_teacher", self.momentum_teacher))
         self.momentum_schedule = CosineScheduler(
             base_value=self.momentum_teacher, final_value=self.final_momentum_teacher, total_iters=self.total_steps)
         self.teacher_temp_schedule = CosineScheduler(
@@ -227,7 +228,7 @@ class DinoMethod(TrainingMethod):
         self._configure_model_compilation()
 
     def _configure_model_compilation(self) -> None:
-        settings = self.config.get("compile", False)
+        settings = self.compile_config
         if isinstance(settings, bool):
             settings = {"enabled": settings}
         elif isinstance(settings, Mapping):
@@ -333,7 +334,7 @@ class DinoMethod(TrainingMethod):
         if steps_key in self.config:
             return int(self.config[steps_key])
         if epochs_key in self.config:
-            epoch_length = self.config.get("official_epoch_length", self.config.get("epoch_length"))
+            epoch_length = self.data_config.get("official_epoch_length", self.data_config.get("epoch_length"))
             if epoch_length is None:
                 raise ValueError(f"{epochs_key} requires official_epoch_length or epoch_length in the config.")
             return int(self.config[epochs_key]) * int(epoch_length)

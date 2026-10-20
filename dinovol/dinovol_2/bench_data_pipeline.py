@@ -4,6 +4,8 @@ Run --prepare once to inventory the partial cache, then measure in a fresh proce
 Unavailable occupancy masks and label sources are excluded explicitly.
 """
 from __future__ import annotations
+
+from dinovol_2.training.config import as_legacy_config
 import argparse
 import hashlib
 import json
@@ -29,7 +31,7 @@ def seed(value):
 
 
 def prepare(args):
-    config = json.loads(args.config.read_text())
+    config = as_legacy_config(json.loads(args.config.read_text()))
     dc = config["dataset"]
     selected, inventory, starts = [], [], {}
     window = np.asarray(dc["source_sampling_size"])

@@ -15,7 +15,7 @@ from .dinov2_eva import Eva, EvaWithChunking
 from .rope import CompassRopePositionEmbedding, MixedRopePositionEmbedding, RopePositionEmbedding
 
 
-_BACKBONE_DEFAULTS = {
+_LEGACY_BACKBONE_DEFAULTS = {
     "attention_type": "full",
     "attention_backend": "flash",
     "input_channels": 1,
@@ -156,7 +156,7 @@ def _resolve_backbone_defaults(config: Mapping[str, Any]) -> Mapping[str, Any]:
         return _BACKBONE_DEFAULTS_V3
     if isinstance(model_type, str) and model_type.strip().lower() == "v2":
         return _BACKBONE_DEFAULTS_V2
-    return _BACKBONE_DEFAULTS
+    return _BACKBONE_DEFAULTS_V3
 
 
 def _resolve_default_rope_type(config: Mapping[str, Any]) -> str:

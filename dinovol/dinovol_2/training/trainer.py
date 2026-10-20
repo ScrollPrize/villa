@@ -30,6 +30,7 @@ from dinovol_2.ops.precision import resolve_amp_dtype
 
 
 from dinovol_2.methods import build_method
+from .config import normalize_config
 from dinovol_2.training.schedules import CosineScheduler
 
 def _as_float_pair(value: Any, default: tuple[float, float]) -> tuple[float, float]:
@@ -58,14 +59,17 @@ def _config_get(config: Mapping[str, Any], *keys: str, default: Any = None) -> A
 
 class Trainer:
     def __init__(self, config: Mapping[str, Any], *, method=None) -> None:
-        self.config = dict(config)
-        distributed_config = resolve_distributed_config(self.config)
+        self.config = normalize_config(config)
+        self.runtime_config = self.config["runtime"]
+        self.optimizer_config = self.config["optimizer"]
+        self.data_config = self.config["data"]
+        distributed_config = resolve_distributed_config(self.runtime_config)
         self.is_distributed = bool(distributed_config["use_ddp"])
         self.rank = int(distributed_config["rank"])
         self.local_rank = int(distributed_config["local_rank"])
         self.world_size = int(distributed_config["world_size"])
 
-        configured_device_name = self.config.get("device")
+        configured_device_name = self.runtime_config.get("device")
         configured_device = torch.device(configured_device_name) if configured_device_name is not None else None
         prefers_cuda = configured_device is None or configured_device.type == "cuda"
         if self.is_distributed and prefers_cuda and torch.cuda.is_available():
@@ -92,38 +96,37 @@ class Trainer:
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
 
-        if self.device.type == "cuda" and bool(self.config.get("cuda_expandable_segments", False)):
+        if self.device.type == "cuda" and bool(self.runtime_config.get("cuda_expandable_segments", False)):
             # Expandable segments avoid fragmentation-driven cache flushes near full
             # memory. They apply to allocations made after this call.
             torch.cuda.memory._set_allocator_settings("expandable_segments:True")
-        if self.device.type == "cuda" and bool(self.config.get("cudnn_benchmark", False)):
+        if self.device.type == "cuda" and bool(self.runtime_config.get("cudnn_benchmark", False)):
             # Autotune convolution algorithms per input shape (crop shapes are fixed).
             torch.backends.cudnn.benchmark = True
-        self.use_amp = bool(self.config.get("use_amp", self.device.type == "cuda"))
-        self.amp_dtype = resolve_amp_dtype(self.config.get("amp_dtype", "bfloat16"))
-        self.config["amp_dtype"] = str(self.amp_dtype).removeprefix("torch.")
-        self.fused_optimizer = bool(self.config.get("fused_optimizer", False)) and self.device.type == "cuda"
-        self.max_iterations = int(self.config.get("max_iterations", self.config.get("num_iterations", 1000000)))
+        self.use_amp = bool(self.runtime_config.get("use_amp", self.device.type == "cuda"))
+        self.amp_dtype = resolve_amp_dtype(self.runtime_config.get("amp_dtype", "bfloat16"))
+        self.runtime_config["amp_dtype"] = str(self.amp_dtype).removeprefix("torch.")
+        self.fused_optimizer = bool(self.optimizer_config.get("fused_optimizer", False)) and self.device.type == "cuda"
+        self.max_iterations = int(self.runtime_config.get("max_iterations", self.runtime_config.get("num_iterations", 1000000)))
         self.total_steps = self.max_iterations
-        modern_defaults = str(self.config.get("model", {}).get("model_type", "")).lower() == "v3"
-        self.base_lr = float(self.config.get("lr", 1e-4))
-        self.min_lr = float(self.config.get("min_lr", 1e-6))
-        self.lr_schedule_type = str(self.config.get("lr_schedule", "constant" if modern_defaults else "cosine")).lower()
+        self.base_lr = float(self.optimizer_config.get("lr", 1e-4))
+        self.min_lr = float(self.optimizer_config.get("min_lr", 1e-6))
+        self.lr_schedule_type = str(self.optimizer_config.get("lr_schedule", "constant")).lower()
         if self.lr_schedule_type not in {"cosine", "constant"}:
             raise ValueError("lr_schedule must be 'cosine' or 'constant'")
-        self.base_weight_decay = float(self.config.get("weight_decay", 0.04))
-        self.final_weight_decay = float(self.config.get("weight_decay_end", self.base_weight_decay if modern_defaults else 0.4))
-        self.betas = tuple(self.config.get("betas", (0.9, 0.999)))
-        self.clip_grad = float(self.config.get("clip_grad", 3.0))
-        self.layer_decay = float(self.config.get("layer_decay", self.config.get("layerwise_decay", 1.0)))
-        self.patch_embed_lr_mult = float(self.config.get("patch_embed_lr_mult", 0.2))
+        self.base_weight_decay = float(self.optimizer_config.get("weight_decay", 0.04))
+        self.final_weight_decay = float(self.optimizer_config.get("weight_decay_end", self.base_weight_decay))
+        self.betas = tuple(self.optimizer_config.get("betas", (0.9, 0.999)))
+        self.clip_grad = float(self.optimizer_config.get("clip_grad", 3.0))
+        self.layer_decay = float(self.optimizer_config.get("layer_decay", self.optimizer_config.get("layerwise_decay", 1.0)))
+        self.patch_embed_lr_mult = float(self.optimizer_config.get("patch_embed_lr_mult", 0.2))
 
-        warmup_ratio = float(self.config.get("warmup_ratio", 0.1))
+        warmup_ratio = float(self.optimizer_config.get("warmup_ratio", 0.1))
         default_warmup_steps = 0
         if self.total_steps > 0 and warmup_ratio > 0.0:
             default_warmup_steps = max(1, round(self.total_steps * warmup_ratio))
-        self.warmup_steps = int(self.config["warmup_steps"]) if "warmup_steps" in self.config else default_warmup_steps
-        self.grad_accumulation_steps = int(self.config.get("grad_accumulation_steps", 1))
+        self.warmup_steps = int(self.optimizer_config["warmup_steps"]) if "warmup_steps" in self.optimizer_config else default_warmup_steps
+        self.grad_accumulation_steps = int(self.runtime_config.get("grad_accumulation_steps", 1))
         if self.grad_accumulation_steps < 1:
             raise ValueError("grad_accumulation_steps must be at least 1")
         self.method = method if method is not None else build_method(
@@ -133,30 +136,30 @@ class Trainer:
             "cuda", enabled=self.use_amp and self.device.type == "cuda" and self.amp_dtype == torch.float16)
         self.lr_schedule, self.wd_schedule = self._build_schedulers()
 
-        self.log_every = int(self.config.get("log_every", 20))
-        self.val_every_n = int(self.config.get("val_every_n", 0))
+        self.log_every = int(self.runtime_config.get("log_every", 20))
+        self.val_every_n = int(self.runtime_config.get("val_every_n", 0))
         # Save a monitor image from the current training batch every N steps (0 disables).
-        self.train_monitor_every_n = int(self.config.get("train_monitor_every_n", 0))
-        self.save_every_n = int(self.config.get("save_every_n", self.config.get("save_every", 0)))
-        self.monitor_batch_size = max(5, int(self.config.get("monitor_batch_size", 5)))
+        self.train_monitor_every_n = int(self.runtime_config.get("train_monitor_every_n", 0))
+        self.save_every_n = int(self.runtime_config.get("save_every_n", self.runtime_config.get("save_every", 0)))
+        self.monitor_batch_size = max(5, int(self.runtime_config.get("monitor_batch_size", 5)))
         # Monitor PCA panels: components 1-3, 4-6, ... as RGB, `monitor_pca_sets` of them.
-        self.monitor_pca_sets = max(1, int(self.config.get("monitor_pca_sets", 4)))
-        self.monitor_pool_size = max(1, int(self.config.get("monitor_pool_size", 5000)))
-        self.monitor_seed = int(self.config.get("monitor_seed", 0))
-        self.output_dir = Path(self.config.get("output_dir", "./dinov2_pretrain_runs"))
+        self.monitor_pca_sets = max(1, int(self.runtime_config.get("monitor_pca_sets", 4)))
+        self.monitor_pool_size = max(1, int(self.runtime_config.get("monitor_pool_size", 5000)))
+        self.monitor_seed = int(self.runtime_config.get("monitor_seed", 0))
+        self.output_dir = Path(self.runtime_config.get("output_dir", "./dinov2_pretrain_runs"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.monitor_dir = self.output_dir / "monitor"
         self.monitor_dir.mkdir(parents=True, exist_ok=True)
-        self.wandb_project = _config_get(self.config, "wandb-project", "wandb_project")
-        self.wandb_entity = _config_get(self.config, "wandb-entity", "wandb_entity")
-        self.wandb_run_name = _config_get(self.config, "wandb-run-name", "wandb_run_name")
-        self.wandb_run_id = _config_get(self.config, "wandb-run-id", "wandb_run_id")
+        self.wandb_project = _config_get(self.runtime_config, "wandb-project", "wandb_project")
+        self.wandb_entity = _config_get(self.runtime_config, "wandb-entity", "wandb_entity")
+        self.wandb_run_name = _config_get(self.runtime_config, "wandb-run-name", "wandb_run_name")
+        self.wandb_run_id = _config_get(self.runtime_config, "wandb-run-id", "wandb_run_id")
         self._wandb: Any | None = None
         self._warned_missing_val_dataset = False
-        self.resume = bool(self.config.get("resume", False))
-        self.auto_resume = bool(self.config.get("auto_resume", self.resume or bool(self.config.get("resume_from"))))
+        self.resume = bool(self.runtime_config.get("resume", False))
+        self.auto_resume = bool(self.runtime_config.get("auto_resume", self.resume or bool(self.runtime_config.get("resume_from"))))
         self.resume_path = self._resolve_resume_path()
-        configured_wandb_resume = _config_get(self.config, "wandb-resume", "wandb_resume")
+        configured_wandb_resume = _config_get(self.runtime_config, "wandb-resume", "wandb_resume")
         self.wandb_resume = self._normalize_wandb_resume_mode(
             configured_wandb_resume if configured_wandb_resume is not None else ("allow" if self.resume_path is not None else None)
         )
@@ -166,10 +169,10 @@ class Trainer:
         self._monitor_selection_rng = random.Random(self.monitor_seed)
         self._train_sampler_epoch = 0
         self._val_sampler_epoch = 0
-        self.task_eval_every = int(self.config.get("task_eval_every", 0))
+        self.task_eval_every = int(self.runtime_config.get("task_eval_every", 0))
         self._task_evaluator = (
             TaskEvalRunner(
-                self.config,
+                self.runtime_config,
                 output_dir=self.output_dir,
                 device=self.device,
                 use_amp=self.use_amp,
@@ -273,7 +276,7 @@ class Trainer:
         )
 
     def _build_dataloader_kwargs(self) -> dict[str, Any]:
-        num_workers = int(_config_get(self.config, "dataloader-workers", "dataloader_workers", "num_workers", default=0))
+        num_workers = int(_config_get(self.data_config, "dataloader-workers", "dataloader_workers", "num_workers", default=0))
         if num_workers < 0:
             raise ValueError(f"dataloader workers must be non-negative, got {num_workers}")
 
@@ -283,7 +286,7 @@ class Trainer:
             "drop_last": True,
         }
 
-        prefetch_factor = _config_get(self.config, "prefetch-factor", "prefetch_factor")
+        prefetch_factor = _config_get(self.data_config, "prefetch-factor", "prefetch_factor")
         if prefetch_factor is not None:
             prefetch_factor = int(prefetch_factor)
             if prefetch_factor <= 0:
@@ -292,7 +295,7 @@ class Trainer:
                 raise ValueError("prefetch factor requires dataloader workers greater than zero")
             kwargs["prefetch_factor"] = prefetch_factor
 
-        persistent_workers = _config_get(self.config, "persistent-workers", "persistent_workers")
+        persistent_workers = _config_get(self.data_config, "persistent-workers", "persistent_workers")
         if persistent_workers is not None:
             persistent_workers = bool(persistent_workers)
             if persistent_workers and num_workers <= 0:
@@ -307,7 +310,7 @@ class Trainer:
         *,
         enable_point_supervision: bool = False,
     ) -> list[dict[str, Any]] | None:
-        dataset_config = self.config.get(key)
+        dataset_config = self.data_config.get(key)
         if dataset_config is None:
             return None
 
@@ -331,7 +334,7 @@ class Trainer:
         return resolved_configs
 
     def _dataset_variant_weights(self, key: str) -> tuple[float, ...] | None:
-        dataset_config = self.config.get(key)
+        dataset_config = self.data_config.get(key)
         if dataset_config is None:
             return None
         variants = dataset_config.get("variants")
@@ -348,7 +351,7 @@ class Trainer:
     def _build_ssl_dataloader(self, dataset_config: Mapping[str, Any], *, shuffle: bool) -> DataLoader:
         dataset = SSLZarrDataset(dataset_config, do_augmentations=True)
         collate_fn = self.method.build_collate(dataset)
-        shuffle = bool(self.config.get("shuffle", False))
+        shuffle = bool(self.data_config.get("shuffle", shuffle))
         sampler = build_distributed_sampler(
             dataset,
             is_distributed=self.is_distributed,
@@ -359,7 +362,7 @@ class Trainer:
         return CudaDataLoader(
             dataset,
             device=self.device,
-            batch_size=int(self.config.get("batch_size", 2)),
+            batch_size=int(self.data_config.get("batch_size", 2)),
             shuffle=shuffle if sampler is None else False,
             sampler=sampler,
             collate_fn=collate_fn,
@@ -380,7 +383,7 @@ class Trainer:
         return WeightedCombinedLoader(
             dataloaders,
             weights=weights if weights is not None else tuple(1.0 for _ in dataloaders),
-            seed=int(self.config.get("seed", 0)),
+            seed=int(self.data_config.get("seed", 0)),
         )
 
     def build_dataloader(self) -> DataLoader | WeightedCombinedLoader:
@@ -389,7 +392,7 @@ class Trainer:
             raise ValueError("dataset configuration is required")
         return self._build_loader_from_configs(
             dataset_configs,
-            shuffle=bool(self.config.get("shuffle", False)),
+            shuffle=bool(self.data_config.get("shuffle", False)),
             weights=self._dataset_variant_weights("dataset"),
         )
 
@@ -467,9 +470,9 @@ class Trainer:
 
         run_id = self._resolve_wandb_run_id()
         if run_id:
-            self.config["wandb_run_id"] = run_id
+            self.runtime_config["wandb_run_id"] = run_id
         if self.wandb_resume is not None:
-            self.config["wandb_resume"] = self.wandb_resume
+            self.runtime_config["wandb_resume"] = self.wandb_resume
 
         init_kwargs: dict[str, Any] = {
             "project": self.wandb_project,
@@ -494,7 +497,7 @@ class Trainer:
         self._wandb.define_metric("task_eval/*", step_metric="trainer/step")
         self.wandb_run_id = self._current_wandb_run_id()
         if self.wandb_run_id is not None:
-            self.config["wandb_run_id"] = self.wandb_run_id
+            self.runtime_config["wandb_run_id"] = self.wandb_run_id
         self._write_wandb_metadata()
 
     def _wandb_enabled(self) -> bool:
@@ -528,9 +531,9 @@ class Trainer:
 
     def _get_monitor_source(self) -> tuple[SSLZarrDataset, Any]:
         if self._monitor_dataset is None or self._monitor_collate_fn is None:
-            monitor_dataset_config = self.config.get("monitor_dataset")
+            monitor_dataset_config = self.data_config.get("monitor_dataset")
             if monitor_dataset_config is None:
-                monitor_dataset_config = self.config.get("val_dataset", self.config["dataset"])
+                monitor_dataset_config = self.data_config.get("val_dataset", self.data_config["dataset"])
             monitor_dataset_config = self._dataset_config("monitor_dataset") or self._dataset_config("val_dataset") or self._dataset_config("dataset")
             dataset = SSLZarrDataset(monitor_dataset_config, do_augmentations=True)
             collate_fn = self.method.build_collate(dataset)
@@ -602,7 +605,7 @@ class Trainer:
         return checkpoints[-1]
 
     def _resolve_resume_path(self) -> Path | None:
-        resume_from = self.config.get("resume_from")
+        resume_from = self.runtime_config.get("resume_from")
         if resume_from:
             return Path(resume_from)
         if self.auto_resume:
@@ -748,7 +751,7 @@ class Trainer:
 
     def _prepare_dataset_config(self, dataset_config, *, enable_point_supervision=False):
         config = dict(dataset_config)
-        config.setdefault("epoch_length", int(self.config.get("official_epoch_length", self.config.get("epoch_length", self.max_iterations))))
+        config.setdefault("epoch_length", int(self.data_config.get("official_epoch_length", self.data_config.get("epoch_length", self.max_iterations))))
         return self.method.dataset_config(config, training=enable_point_supervision)
 
     def _build_schedulers(self):
@@ -801,7 +804,7 @@ class Trainer:
             return dict(self.method.evaluate(batch, step))
 
     def save_monitor_image(self, batch, step, metrics):
-        return self.method.save_monitor_image(batch, step, metrics, directory=self.monitor_dir, config=self.config)
+        return self.method.save_monitor_image(batch, step, metrics, directory=self.monitor_dir, config=self.runtime_config)
 
     def save_checkpoint(self, step: int) -> Path:
         path = self.output_dir / f"checkpoint_step_{step:06d}.pt"
@@ -827,5 +830,5 @@ class Trainer:
             self.scaler.load_state_dict(checkpoint["scaler"])
         if checkpoint.get("wandb_run_id") and not self.wandb_run_id:
             self.wandb_run_id = str(checkpoint["wandb_run_id"])
-            self.config["wandb_run_id"] = self.wandb_run_id
+            self.runtime_config["wandb_run_id"] = self.wandb_run_id
         return step

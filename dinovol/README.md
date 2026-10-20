@@ -14,24 +14,43 @@ Run project commands from the monorepository's `dinovol/` directory.
 This implementation is still incomplete. Pretraining works, but finetuning has
 not yet been implemented.
 
-Use the `v3` preset for new runs, as selected by every example recipe. It uses
-plain SwiGLU with a 2x hidden width and no query/key/value projection biases,
-axial 3D RoPE, separate local/global CLS output normalization, constant LR after
-warmup, constant weight decay and teacher momentum, and KoLeo groups of up to 16.
-The `v2` preset and configs without `model_type` retain their older defaults for
-checkpoint compatibility. Explicit config values override preset defaults.
-To select the new defaults, set `model.model_type` to `v3`:
+DINO uses the current v3 defaults automatically: plain SwiGLU with a 2x hidden
+width, no query/key/value projection biases, axial 3D RoPE, separate local/global
+CLS output normalization, constant LR after warmup, constant weight decay and
+teacher momentum, and KoLeo groups of up to 16. No `model_type` is needed.
+Architecture options and training schedules can be overridden independently.
+
+Recipes now separate five concerns:
+
+| Section | Settings |
+| --- | --- |
+| `data` | `dataset`, `val_dataset`, `monitor_dataset`, batch size and loader workers |
+| `backbone` | CNN/ViT architecture, patch size, RoPE and crop sizes |
+| `method` | `name` (default `dino`), loss weights, teachers, masks, auxiliary supervision; `heads` holds projection-head settings |
+| `optimizer` | LR/weight-decay schedules, AdamW, clipping and parameter-group multipliers |
+| `runtime` | Device/DDP, precision, compilation, iteration count, accumulation, logging, evaluation and output paths |
 
 ```json
 {
-  "model": {
-    "model_type": "v3",
+  "backbone": {
     "embedding_type": "default",
     "global_crops_size": [96, 96, 96],
     "local_crops_size": [48, 48, 48]
-  }
+  },
+  "method": {"name": "dino"},
+  "optimizer": {"lr": 0.0001},
+  "runtime": {"max_iterations": 1000000}
 }
 ```
+
+Add volume sources under `data.dataset` as in the complete recipes below. Crop
+sizes can be inferred from `data.dataset` when omitted from `backbone`.
+`training.config.normalize_config` also accepts existing flat JSON configs;
+explicit section values take precedence. Legacy explicit `model_type: "v2"`
+settings are expanded by that adapter. Newly supplied unnamed configs now use
+current defaults; old unnamed checkpoint configurations are interpreted using
+their historical defaults when loading for inference. Detailed setting names
+below also retain their legacy flat spelling for compatibility.
 
 ## Pretraining on 8–9 µm scroll volumes
 
@@ -48,14 +67,13 @@ two 3,456-wide branches before gating.
 
 When `use_amp` is enabled, autocast defaults to BF16 (`"amp_dtype": "bfloat16"`).
 Training, monitoring, validation, and task evaluation use the same setting.
-Parameters remain FP32, and BF16 runs disable gradient scaling. Set the top-level
-`"amp_dtype": "float16"` to use FP16 autocast with CUDA gradient scaling, or
+Parameters remain FP32, and BF16 runs disable gradient scaling. Set `runtime.amp_dtype` to `"float16"` to use FP16 autocast with CUDA gradient scaling, or
 `"use_amp": false` to disable autocast. The aliases `bf16` and `fp16` are accepted.
 Resuming uses the current config's precision setting; old configs without
 `amp_dtype` now select BF16. Saved FP16 scaler state is ignored when resuming in
 BF16. The FP16 performance measurements below predate this default change.
 
-Compilation is enabled for this recipe with the top-level setting:
+Compilation is enabled for this recipe with this setting in `runtime`:
 
 ```json
 "compile": {"enabled": true, "backend": "inductor", "mode": "default", "dynamic": {"backbone": false}}
@@ -90,7 +108,7 @@ For compiler diagnostics, run with `TORCH_LOGS=graph_breaks,recompiles`.
 
 The recipe uses these throughput and memory settings. Defaults are noted below:
 
-- `ibot_fused_last_layer` (top level): the heads return the iBOT bottleneck
+- `method.ibot_fused_last_layer`: the heads return the iBOT bottleneck
   features and last-layer weight, and the loss forms the
   `[n_masked, ibot_out_dim]` logits, Sinkhorn-Knopp targets, and gradients one
   chunk of `ibot_masked_loss_chunk_size` rows at a time. Sinkhorn-Knopp reduces to
@@ -115,10 +133,10 @@ The recipe uses these throughput and memory settings. Defaults are noted below:
   and head shapes retain 32-row tiles. Backward adds half-precision GEMM results
   directly into the FP32 weight-gradient accumulator without a separate FP32
   conversion buffer. Precision and the backward row chunk size are unchanged.
-- `model.deeper_embed_channels_last`: CNN activations and weights use the
+- `backbone.deeper_embed_channels_last`: CNN activations and weights use the
   channels-last 3D layout, which cuDNN's tensor-core convolutions use natively.
   Weights are converted after initialization; checkpoints are layout-independent.
-- `model.checkpoint_save_attention: true` (default): when gradient checkpointing
+- `backbone.checkpoint_save_attention: true` (default): when gradient checkpointing
   is enabled, retain fused SDPA results and their backward auxiliaries while
   recomputing the rest of each transformer block. This also supports block
   chunking. The math-attention fallback retains the original recomputation
@@ -126,7 +144,7 @@ The recipe uses these throughput and memory settings. Defaults are noted below:
   to restore the original transformer checkpoint policy. Fused attention with
   nonzero attention dropout is also recomputed so that replay preserves the RNG
   stream for subsequent dropout operations.
-- `model.deeper_embed_norm_backend: "auto"` (default): use a Triton CNN channel
+- `backbone.deeper_embed_norm_backend: "auto"` (default): use a Triton CNN channel
   normalization on supported CUDA inputs, including fused ReLU and residual/ReLU
   where applicable. The custom backward finishes input and affine gradients
   together, preventing cross-stage compiler fusion from extending full-volume
@@ -144,9 +162,9 @@ The recipe uses these throughput and memory settings. Defaults are noted below:
   --dim 32 --spatial-size 192 --batch-size 2 --backend triton --compile`;
   use `--backend torch --compile` for the compiled reference. This microbenchmark
   uses synthetic activations and does not predict whole-model peak memory.
-- `model.attention_backend: "flash"` (default): prefer FlashAttention, retaining
+- `backbone.attention_backend: "flash"` (default): prefer FlashAttention, retaining
   the other SDPA kernels as fallbacks when it is unavailable.
-- `model.deeper_embed_batch_chunk_size: 1` (default): embed one view at a time
+- `backbone.deeper_embed_batch_chunk_size: 1` (default): embed one view at a time
   through the CNN to lower peak VRAM, while preserving every view. Set `null`
   to embed the whole batch together.
 - `fused_optimizer`: fused CUDA AdamW.
@@ -183,7 +201,7 @@ the combined implementation had 0.61% relative L2 error and 0.99998 cosine
 similarity to the original path on this batch, with finite gradients throughout.
 The switches above retain the original paths for comparison.
 
-A separate comparison with both optimizations and `model.attention_backend:
+A separate comparison with both optimizations and `backbone.attention_backend:
 "flash"` took 523 ms mean, 519 ms median [516–546], with the same 9.25 GiB
 allocated peak. The profiler confirmed FlashAttention forward and backward.
 Compared with the optimized cuDNN run, full gradients differed by 0.56% relative
@@ -207,7 +225,7 @@ memory so there is no data wait; median of 10 steps after 6 warmup steps):
 | --- | --- | --- |
 | previous config | 1.649 | 19.4 |
 | + `cudnn_benchmark` | 1.527 | 21.0 |
-| + `model.attention_backend: "cudnn"` | 1.389 | 23.0 |
+| + `backbone.attention_backend: "cudnn"` | 1.389 | 23.0 |
 | + `compile.mode: "max-autotune-no-cudagraphs"` | 1.350 | 23.7 |
 
 In those measurements, the GPU was the bottleneck (97–100% utilization in
@@ -658,12 +676,9 @@ The following settings can be added to a training config:
 
 ```json
 {
-  "lr_schedule": "constant",
-  "warmup_steps": 1000,
-  "koleo_distributed": true,
-  "koleo_loss_group_size": 16,
-  "model": {
-    "model_type": "v3",
+  "optimizer": {"lr_schedule": "constant", "warmup_steps": 1000},
+  "method": {"koleo_distributed": true, "koleo_loss_group_size": 16},
+  "backbone": {
     "rope_type": "axial",
     "scale_mlp": false,
     "mlp_ratio": 2.0,
@@ -674,17 +689,17 @@ The following settings can be added to a training config:
 }
 ```
 
-- `lr_schedule` defaults to `constant` for `v3`, and `cosine` for older presets. `constant` uses the existing linear
+- `optimizer.lr_schedule` defaults to `constant`. `constant` uses the existing linear
   warmup and then holds the configured `lr`, including beyond `max_iterations`;
   it ignores `min_lr`. Last-layer freezing and parameter-group LR multipliers
   still apply. Weight decay, teacher momentum, and temperature retain their
-  own schedules. In `v3`, weight decay defaults to a constant `0.04` and teacher
+  own schedules. Weight decay defaults to a constant `0.04` and teacher
   momentum to a constant `0.994`; overriding their initial values also changes
   their default final values. Set `weight_decay_end` equal to `weight_decay` and
   `final_momentum_teacher` equal to `momentum_teacher` to hold those constant too.
   `warmup_steps: 0` disables LR warmup; otherwise the default is 10% of the run.
 - `scale_mlp`, `mlp_ratio`, and `qkv_bias` default to `false`, `2.0`, and
-  `false` in `v3`, following the DINOv3 7B pretraining block. `scale_mlp: false`
+  `false`, following the DINOv3 7B pretraining block. `scale_mlp: false`
   removes the extra normalization inside SwiGLU; the usual pre-attention and
   pre-MLP norms remain. Our ratio specifies the effective hidden width directly:
   DINOv3's `ffn_ratio: 3` applies an internal two-thirds adjustment. Older presets
@@ -771,7 +786,7 @@ The following settings can be added to a training config:
 Model head dimensions and `pretrained_weights` are preserved in the resolved
 training config. When enabling separate norms on an older checkpoint, missing
 norm weights are initialized from its trained shared norm (or its existing CLS
-norm for the new local norm). Use `model.pretrained_weights` to start a new run
+norm for the new local norm). Use `backbone.pretrained_weights` to start a new run
 when changing normalization options; resuming optimizer state requires the same
 parameter layout. A checkpoint written with axial RoPE can be resumed with
 `rope_type: "mixed"`: each block's mixed frequencies start at the axial layout, so

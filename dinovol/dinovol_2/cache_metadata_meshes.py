@@ -6,6 +6,8 @@ Usage:
 
 from __future__ import annotations
 
+from dinovol_2.training.config import as_legacy_config
+
 import argparse
 import json
 from pathlib import Path
@@ -55,7 +57,7 @@ def main() -> None:
     args = parser.parse_args()
 
     with args.config.open("r", encoding="utf-8") as f:
-        config = json.load(f)
+        config = as_legacy_config(json.load(f))
 
     dataset_cfg = dict(config.get("dataset") or {})
     obj_cfg = dict(dataset_cfg.get("object_points") or {})

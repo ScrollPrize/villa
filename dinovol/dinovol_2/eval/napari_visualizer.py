@@ -16,6 +16,7 @@ from skimage.morphology.binary import binary_dilation
 from dinovol_2.dataset.cuda_pipeline import NORMALIZATION_SCHEMES, normalize_batch
 from dinovol_2.dataset.volume_reader import open_volume
 from dinovol_2.model import build_backbone
+from dinovol_2.training.config import as_legacy_config
 from dinovol_2.model.model import PointDenseHead, _upgrade_weight_norm_state_dict_keys
 from dinovol_2.ops.point_embeddings import sample_grid_points
 
@@ -288,7 +289,7 @@ def _extract_model_config(checkpoint: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise ValueError("checkpoint does not contain a saved config dictionary")
 
-    model_config = config.get("model")
+    model_config = as_legacy_config(config, legacy_checkpoint=True).get("model")
     if not isinstance(model_config, dict):
         raise ValueError("checkpoint config does not contain a model configuration")
     return model_config
@@ -298,7 +299,7 @@ def _extract_dataset_config(checkpoint: dict[str, Any]) -> dict[str, Any]:
     config = checkpoint.get("config")
     if not isinstance(config, dict):
         return {}
-    dataset_config = config.get("dataset")
+    dataset_config = as_legacy_config(config, legacy_checkpoint=True).get("dataset")
     return dataset_config if isinstance(dataset_config, dict) else {}
 
 
@@ -351,7 +352,7 @@ def _build_dense_head_from_checkpoint(
     if not dense_state:
         return None
 
-    config = checkpoint.get("config") if isinstance(checkpoint.get("config"), dict) else {}
+    config = as_legacy_config(checkpoint.get("config") or {}, legacy_checkpoint=True)
     obj_cfg = config.get("object_losses") if isinstance(config.get("object_losses"), dict) else {}
     head_cfg = obj_cfg.get("head") if isinstance(obj_cfg.get("head"), dict) else {}
 

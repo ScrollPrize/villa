@@ -1,6 +1,8 @@
 """Validate kernels using checkpoint features from fully cached real volume crops."""
 from __future__ import annotations
 
+from dinovol_2.training.config import as_legacy_config
+
 import argparse
 import itertools
 import json
@@ -19,7 +21,7 @@ from dinovol_2.ops.point_embeddings import sample_grid_points, sample_selected_g
 
 def prepare(checkpoint, volume, start):
     saved = torch.load(checkpoint, map_location="cpu", weights_only=True, mmap=True)
-    config, state = saved["config"], saved["teacher"]
+    config, state = as_legacy_config(saved["config"], legacy_checkpoint=True), saved["teacher"]
     crop_size = tuple(config["model"]["global_crops_size"])
     if crop_size != (192, 192, 192):
         raise ValueError("This validation workload expects the 192^3 checkpoint recipe")
