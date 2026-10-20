@@ -7,6 +7,8 @@ import tempfile
 import threading
 from pathlib import Path
 import types
+import builtins
+from contextlib import chdir
 from unittest import mock
 
 import numpy as np
@@ -52,6 +54,7 @@ from preprocess_cos_omezarr import (
 	_omezarr_chunk_exists,
 	_omezarr_chunk_group_complete,
 	_predict3d_overall_eta,
+	_predict3d_tile_eta,
 	cli_main,
 	run_preprocess_3d,
 )
@@ -76,7 +79,8 @@ class _StopAfterManifest(Exception):
 
 
 def _write_zarr_array(path: Path, shape: tuple[int, int, int], value: int = 1) -> Path:
-	arr = zarr.open(str(path), mode="w", shape=shape, chunks=(4, 4, 4), dtype="uint8")
+	# The production TensorStore input reader consumes Zarr-v2 arrays.
+	arr = zarr.open(str(path), mode="w", shape=shape, chunks=(4, 4, 4), dtype="uint8", zarr_format=2)
 	arr[:] = np.full(shape, value, dtype=np.uint8)
 	return path
 
@@ -190,6 +194,22 @@ class _IdentityProductAdapter:
 
 	def product_tensors_from_output(self, raw_output):
 		return {self._products[0].name: raw_output}
+
+
+class _NativeStrideProductAdapter(_IdentityProductAdapter):
+	def __init__(self, product: OutputProductSpec, native_output_stride: int):
+		super().__init__(product)
+		self.native_output_stride = int(native_output_stride)
+
+	def run_tile_inference(self, model, tile: torch.Tensor, *, device: torch.device):
+		self.calls += 1
+		_ = model, device
+		return torch.nn.functional.avg_pool3d(
+			tile,
+			kernel_size=self.native_output_stride,
+			stride=self.native_output_stride,
+			ceil_mode=True,
+		)
 
 
 class _RaisingProductAdapter(_IdentityProductAdapter):
@@ -357,6 +377,52 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(next(events), (0, 4, 4, True, 4))
 		self.assertEqual(next(events), (4, 0, 0, False, 8))
 
+	def test_accumulation_frontier_reserves_capacity_from_later_results(self):
+		events = {
+			10: {"status": "done_skip"},
+			11: {"status": "reading"},
+			**{sequence: {"status": "ready"} for sequence in range(12, 28)},
+		}
+		self.assertEqual(shared_predict3d._frontier_slot_reservation(events, 10), 1)
+		free_inputs = free_results = 16
+		for sequence in range(12, 27):
+			self.assertTrue(shared_predict3d._shared_slot_pair_available(
+				events=events, frontier_sequence=10, sequence=sequence,
+				free_input_count=free_inputs, free_result_count=free_results,
+			))
+			free_inputs -= 1
+			free_results -= 1
+		self.assertEqual((free_inputs, free_results), (1, 1))
+		self.assertFalse(shared_predict3d._shared_slot_pair_available(
+			events=events, frontier_sequence=10, sequence=27,
+			free_input_count=free_inputs, free_result_count=free_results,
+		))
+		events[11]["status"] = "ready"
+		self.assertTrue(shared_predict3d._shared_slot_pair_available(
+			events=events, frontier_sequence=10, sequence=11,
+			free_input_count=1, free_result_count=1,
+		))
+		events[11]["status"] = "assigned"
+		self.assertEqual(shared_predict3d._frontier_slot_reservation(events, 10), 0)
+		events[11]["status"] = "ready"
+		message = shared_predict3d._frontier_capacity_deadlock(
+			events=events, frontier_sequence=10, free_inputs=(0,), free_results=(),
+			slot_owners={
+				("result", 0): (0, 12, "gpu-result"),
+				("result", 1): (0, 13, "gpu"),
+			},
+		)
+		self.assertIn("raw_frontier=10 effective_frontier=11", message)
+		self.assertIn("skipped_prefix=[10] status=ready", message)
+		self.assertIsNone(shared_predict3d._frontier_capacity_deadlock(
+			events=events, frontier_sequence=10, free_inputs=(0,), free_results=(2,),
+			slot_owners={("result", 0): (0, 12, "gpu-result")},
+		))
+		self.assertIsNone(shared_predict3d._frontier_capacity_deadlock(
+			events=events, frontier_sequence=10, free_inputs=(), free_results=(),
+			slot_owners={("result", 0): (0, 10, "accumulating")},
+		))
+
 	def test_progress_refresh_is_not_suppressed_for_piped_stdout(self):
 		ticks = iter((0.0, 0.5, 1.1, 61.1))
 		emitter = shared_predict3d._Predict3dProgressEmitter(clock=lambda: next(ticks))
@@ -367,6 +433,14 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			emitter.emit("second", done=2, total=4)
 			emitter.emit("third", done=3, total=4)
 		self.assertEqual(output.getvalue(), "\rsecond  \rthird\n")
+
+	def test_progress_force_reports_flush_completion_without_more_tiles(self):
+		emitter = shared_predict3d._Predict3dProgressEmitter(clock=lambda: 0.0)
+		with mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+			emitter.emit("tiles done, flushing", done=2, total=2)
+			emitter.emit("suppressed", done=2, total=2)
+			emitter.emit("final_z=8/8", done=2, total=2, force=True)
+		self.assertEqual(output.getvalue(), "tiles done, flushing\nfinal_z=8/8\n")
 
 	def test_shared_result_layout_is_packed_without_queue_payloads(self):
 		layouts, total = shared_predict3d._packed_layouts((
@@ -416,7 +490,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		process = ctx.Process(
 			target=shared_predict3d._multi_gpu_worker_main,
 			args=(0, "cpu", SpawnIdentityAdapter(product), {"gain": torch.tensor(2.0)}, 4,
-				np.ones(4, dtype=np.float32), {"identity": 1}, input_specs,
+				np.ones(4, dtype=np.float32), {"identity": 1}, 1, input_specs,
 				result_specs, work_queue, result_queue),
 		)
 		try:
@@ -466,16 +540,60 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
 				self.chunks[chunk_origin_zyx] = np.array(data["value"], copy=True)
 
-		volume = (np.arange(8 * 4 * 4, dtype=np.uint16) * np.uint16(257)).reshape(8, 4, 4)
+		# Four Z bands and four tiles per band exceed both the two shared slots
+		# and the bounded read window, while the delayed first tile forces
+		# out-of-order GPU completion.
+		volume = (np.arange(16 * 8 * 8, dtype=np.uint16) * np.uint16(257)).reshape(16, 8, 8)
 		serial_output = Output()
-		parallel_output = Output()
+
+		class DelayedCacheTask:
+			def __init__(self, polls):
+				self.polls = int(polls)
+
+			def done(self):
+				if self.polls > 0:
+					self.polls -= 1
+					return False
+				return True
+
+			def result(self):
+				if self.polls > 0:
+					raise RuntimeError("live-cache result collected before completion")
+				return None
+
+			def cancel(self):
+				return False
+
+		class LiveCache:
+			lookahead_tiles = 10
+
+			def __init__(self, level_path):
+				self.requests = []
+				self.safe_boundaries = []
+				self.source = type("Source", (), {"level_path": Path(level_path)})()
+
+			def request_region(self, bounds):
+				self.requests.append(bounds)
+				return DelayedCacheTask(1 + len(self.requests) % 3)
+
+			def region_has_remote_chunks(self, bounds):
+				return True
+
+			def advance_safe_boundary(self, z):
+				self.safe_boundaries.append(int(z))
+
+			def snapshot(self):
+				return {}
+
 		common = dict(
-			crop_slices=(0, 8, 0, 4, 0, 4), device=torch.device("cpu"),
-			products=(product,), output_regions_zyx={"identity": (0, 0, 0, 8, 4, 4)},
-			full_output_shapes_zyx={"identity": (8, 4, 4)}, tile_size=4,
+			crop_slices=(0, 16, 0, 8, 0, 8), device=torch.device("cpu"),
+			products=(product,), output_regions_zyx={"identity": (0, 0, 0, 16, 8, 8)},
+			full_output_shapes_zyx={"identity": (16, 8, 8)}, tile_size=4,
 			overlap=0, border=0, product_accumulator_dtype="float16",
 		)
 		with tempfile.TemporaryDirectory() as td:
+			live_input_path = Path(td) / "live-input.zarr"
+			live_cache = LiveCache(live_input_path)
 			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True):
 				serial_adapter = _IdentityProductAdapter(product)
 				run_tiled_inference_3d(
@@ -483,16 +601,77 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 					model_adapter=serial_adapter, output_adapter=serial_output,
 					tmp_dir=td, **common,
 				)
-				parallel_adapter = SpawnIdentityAdapter(product, delay_zero_origin=True)
+				for label, selected_live_cache in (("local", None), ("live", live_cache)):
+					parallel_root = Path(td) / f"parallel-output-{label}"
+					parallel_output = SpawnFileOutputAdapter(str(parallel_root), delay_s=0.01)
+					parallel_adapter = SpawnIdentityAdapter(product, delay_zero_origin=True)
+					run_tiled_inference_3d(
+						None, volume, model_adapter=parallel_adapter,
+						output_adapter=parallel_output, tmp_dir=td,
+						devices=(torch.device("cpu"), torch.device("cpu")),
+						slots_per_gpu=1, prefetch_workers=2, prefetch_tiles_per_gpu=1,
+						accumulator_workers=2, flush_workers=2,
+						live_cache=selected_live_cache, **common,
+						input_zarr_path=str(live_input_path),
+					)
+					self.assertEqual(
+						len(list(parallel_root.glob("chunk_*.npy"))), len(serial_output.chunks),
+					)
+					for origin, expected in serial_output.chunks.items():
+						path = parallel_root / ("chunk_" + "_".join(str(v) for v in origin) + ".npy")
+						np.testing.assert_array_equal(expected, np.load(path))
+		self.assertEqual(len(live_cache.requests), 16)
+		self.assertEqual(live_cache.safe_boundaries, [4, 8, 12, 16])
+
+	def test_shared_runner_composes_native_and_requested_output_stride(self):
+		product = OutputProductSpec(
+			name="identity", level=2, scaledown=4, inference_scaledown=4,
+			channels=("value",), chunk_size=2,
+		)
+
+		class Output:
+			def __init__(self):
+				self.chunks = {}
+
+			def product_chunk_complete(self, product, *, chunk_origin_zyx):
+				return False
+
+			def write_product_chunk(self, product, *, chunk_origin_zyx, data):
+				self.chunks[chunk_origin_zyx] = np.array(data["value"], copy=True)
+
+		volume = np.full((8, 8, 8), 255, dtype=np.uint8)
+		adapter = _NativeStrideProductAdapter(product, native_output_stride=4)
+		output = Output()
+		with tempfile.TemporaryDirectory() as td:
+			with mock.patch(f"{run_tiled_inference_3d.__module__}._input_has_chunks", return_value=True), \
+					mock.patch(f"{run_tiled_inference_3d.__module__}._accumulator_native_module", return_value=None):
 				run_tiled_inference_3d(
-					None, volume, model_adapter=parallel_adapter,
-					output_adapter=parallel_output, tmp_dir=td,
-					devices=(torch.device("cpu"), torch.device("cpu")),
-					slots_per_gpu=1, prefetch_workers=2, accumulator_workers=2, **common,
+					adapter.load_model(device=torch.device("cpu")), volume,
+					crop_slices=(0, 8, 0, 8, 0, 8), device=torch.device("cpu"),
+					model_adapter=adapter, output_adapter=output, products=(product,),
+					output_regions_zyx={"identity": (0, 0, 0, 2, 2, 2)},
+					full_output_shapes_zyx={"identity": (2, 2, 2)},
+					tile_size=8, overlap=0, border=0, tmp_dir=td,
 				)
-		self.assertEqual(set(serial_output.chunks), set(parallel_output.chunks))
-		for origin in serial_output.chunks:
-			np.testing.assert_array_equal(serial_output.chunks[origin], parallel_output.chunks[origin])
+		self.assertEqual(set(output.chunks), {(0, 0, 0)})
+		self.assertEqual(output.chunks[(0, 0, 0)].shape, (2, 2, 2))
+		self.assertTrue(np.all(output.chunks[(0, 0, 0)] > 0))
+
+		incompatible = OutputProductSpec(
+			name="identity", level=0, scaledown=1, inference_scaledown=1,
+			channels=("value",), chunk_size=2,
+		)
+		with tempfile.TemporaryDirectory() as td:
+			with self.assertRaisesRegex(ValueError, "native model output stride 4"):
+				run_tiled_inference_3d(
+					object(), volume,
+					crop_slices=(0, 8, 0, 8, 0, 8), device=torch.device("cpu"),
+					model_adapter=_NativeStrideProductAdapter(incompatible, 4),
+					output_adapter=Output(), products=(incompatible,),
+					output_regions_zyx={"identity": (0, 0, 0, 8, 8, 8)},
+					full_output_shapes_zyx={"identity": (8, 8, 8)},
+					tile_size=8, overlap=0, border=0, tmp_dir=td,
+				)
 
 	def test_shared_parallel_tensorstore_pipeline_matches_python_zarr_exactly(self):
 		product = OutputProductSpec(
@@ -912,6 +1091,37 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 						ome_chunk=4,
 					)
 
+	def _dispatch_predict3d_fixture(self, args):
+		"""Exercise real CLI provenance I/O; mock only expensive inference/procfs."""
+		with tempfile.TemporaryDirectory() as td, chdir(td):
+			for flag in ("--input", "--base-ref", "--pred-dt"):
+				if flag in args:
+					_write_zarr_array(Path(args[args.index(flag) + 1]), (8, 8, 8))
+			checkpoint = Path(args[args.index("--unet-checkpoint") + 1])
+			torch.save({"state_dict": {}, "patch_size": 64}, checkpoint)
+			def fake_run(**kwargs):
+				manifest = Path(kwargs["output_path"])
+				_write_zarr_array(manifest.parent / "cos.ome.zarr" / "0", (2, 2, 2))
+				manifest.write_text(json.dumps({"version": 2, "groups": {
+					"cos": {"zarr": "cos.ome.zarr/0", "scaledown": 0, "channels": ["cos"]}
+				}}))
+			real_open = builtins.open
+			def deny_proc_adjustment(path, *positional, **keywords):
+				if str(path) == "/proc/self/oom_score_adj":
+					raise PermissionError("test must not change process OOM policy")
+				return real_open(path, *positional, **keywords)
+			with mock.patch("builtins.open", side_effect=deny_proc_adjustment), \
+				 mock.patch("preprocess_cos_omezarr._shared_auto_download") as auto_download, \
+				 mock.patch("preprocess_cos_omezarr.run_preprocess_3d", side_effect=fake_run) as run:
+				self.assertEqual(cli_main(args), 0)
+			manifest = Path(args[args.index("--output") + 1])
+			provenance = json.loads((manifest.parent / "inference.json").read_text())
+			self.assertEqual(provenance["status"], "completed")
+			self.assertEqual(provenance["checkpoint"]["name"], checkpoint.name)
+			self.assertEqual(len(provenance["checkpoint"]["sha256"]), 64)
+			self.assertTrue(provenance["artifacts"])
+			return run, auto_download
+
 	def test_predict3d_cli_dispatch_preserves_legacy_args(self):
 		args = [
 			"predict3d",
@@ -938,10 +1148,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			"--ome-chunk", "32",
 			"--no-download",
 		]
-		with mock.patch("builtins.open", side_effect=PermissionError):
-			with mock.patch("preprocess_cos_omezarr._auto_download") as auto_download:
-				with mock.patch("preprocess_cos_omezarr.run_preprocess_3d") as run:
-					self.assertEqual(cli_main(args), 0)
+		run, auto_download = self._dispatch_predict3d_fixture(args)
 
 		auto_download.assert_not_called()
 		run.assert_called_once()
@@ -996,9 +1203,8 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			"--download-workers", "123",
 			"--ome-compressor", "none",
 		]
-		with mock.patch("builtins.open", side_effect=PermissionError):
-			with mock.patch("preprocess_cos_omezarr.run_preprocess_3d") as run:
-				self.assertEqual(cli_main(args), 0)
+		run, auto_download = self._dispatch_predict3d_fixture(args)
+		auto_download.assert_not_called()
 		kwargs = run.call_args.kwargs
 		self.assertIsNone(kwargs["device"])
 		self.assertEqual(kwargs["devices"], "cuda:0,cuda:2")
@@ -1016,7 +1222,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		self.assertEqual(kwargs["download_workers"], 123)
 		self.assertEqual(kwargs["ome_compressor"], "none")
 
-	def test_predict3d_overall_eta_uses_processed_counts_not_skipped_done(self):
+	def test_predict3d_overall_eta_uses_processed_counts_for_dense_work(self):
 		progress = {
 			"tiles_total": 100,
 			"tiles_done": 90,
@@ -1029,6 +1235,48 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		}
 
 		self.assertEqual(_predict3d_overall_eta(progress), " | overall eta 02:50")
+
+	def test_predict3d_tile_eta_extrapolates_observed_empty_fraction(self):
+		progress = {
+			"tiles_total": 100,
+			"tiles_done": 60,
+			"tiles_processed": 15,
+			"tiles_skipped_empty": 45,
+			"tiles_skipped_resume": 0,
+			"tile_time_sum": 30.0,
+		}
+
+		# 75% of clean-run candidates were empty, so only 10 of the 40
+		# remaining candidates are predicted to consume processed-tile time.
+		self.assertEqual(_predict3d_tile_eta(progress), 20.0)
+		self.assertEqual(_predict3d_overall_eta(progress), " | overall eta 00:20")
+
+	def test_predict3d_tile_eta_does_not_extrapolate_resume_skips(self):
+		progress = {
+			"tiles_total": 100,
+			"tiles_done": 90,
+			"tiles_processed": 5,
+			"tiles_skipped_empty": 5,
+			"tiles_skipped_resume": 80,
+			"tile_time_sum": 10.0,
+		}
+
+		# Resume skips are commonly a completed prefix. They do not imply that
+		# the unfinished suffix will also be skipped; only the 50% empty fraction
+		# observed among clean-run candidates reduces the remaining estimate.
+		self.assertEqual(_predict3d_tile_eta(progress), 10.0)
+
+	def test_predict3d_tile_eta_waits_for_nonresume_observation(self):
+		progress = {
+			"tiles_total": 100,
+			"tiles_done": 80,
+			"tiles_processed": 0,
+			"tiles_skipped_empty": 0,
+			"tiles_skipped_resume": 80,
+			"tile_time_sum": 0.0,
+		}
+
+		self.assertIsNone(_predict3d_tile_eta(progress))
 
 	def test_predict3d_status_reports_finalized_z_after_band_flush(self):
 		with tempfile.TemporaryDirectory() as td:
@@ -1066,11 +1314,12 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 
 			out = stdout.getvalue()
 			self.assertIn(
-				"rolling accumulators: fine channels=1 zyx=(8,4,4) sd=1; "
-				"coarse channels=7 zyx=(8,4,4) sd=1",
+				"ring sd=1 zyx=(8,4,4) logical_z=8 products=2",
 				out,
 			)
-			self.assertIn("final_z=4/8", out)
+			# Flush acknowledgements may occur after the last tile progress line.
+			self.assertIn("flush complete sd=1 z=4", out)
+			self.assertIn("flush complete sd=1 z=8", out)
 			self.assertIn("final_z=8/8", out)
 			self.assertNotIn("\n[predict3d] final_z=", out)
 
@@ -1597,7 +1846,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			input_path = Path(td) / "input.zarr"
 			arr = zarr.open(
 				str(input_path), mode="w", shape=(24, 24, 24),
-				chunks=(8, 8, 8), dtype="uint8",
+				chunks=(8, 8, 8), dtype="uint8", zarr_format=2,
 			)
 			arr[:] = 1
 			output = Output()
@@ -1669,7 +1918,10 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 		with tempfile.TemporaryDirectory() as td:
 			root = Path(td)
 			input_path = root / "input.zarr"
-			arr = zarr.open(str(input_path), mode="w", shape=(8, 4, 4), chunks=(4, 4, 4), dtype="uint8")
+			arr = zarr.open(
+				str(input_path), mode="w", shape=(8, 4, 4), chunks=(4, 4, 4),
+				dtype="uint8", zarr_format=2,
+			)
 			arr[4:8, :, :] = np.full((4, 4, 4), 1, dtype=np.uint8)
 			output_path = root / "vol.lasagna.json"
 			gpu_pause_stub = types.ModuleType("gpu_pause")
@@ -1711,8 +1963,8 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 				self.assertFalse(_omezarr_chunk_exists(path, 0, 0, 0, 0, 4))
 				self.assertTrue(_omezarr_chunk_exists(path, 0, 4, 0, 0, 4))
 			out = stdout.getvalue()
-			self.assertIn("final_z=4/8", out)
-			self.assertIn("final_z=8/8", out)
+			self.assertIn("flush complete sd=1 z=4", out)
+			self.assertIn("flush complete sd=1 z=8", out)
 
 	def test_shared_runner_does_not_clear_or_write_unsupported_xy_chunks(self):
 		product = OutputProductSpec(
@@ -1741,7 +1993,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 
 		with tempfile.TemporaryDirectory() as td:
 			input_path = Path(td) / "input.zarr"
-			arr = zarr.open(str(input_path), mode="w", shape=(4, 8, 8), chunks=(4, 4, 4), dtype="uint8")
+			arr = zarr.open(str(input_path), mode="w", shape=(4, 8, 8), chunks=(4, 4, 4), dtype="uint8", zarr_format=2)
 			arr[0:4, 0:4, 0:4] = 1
 			with mock.patch.object(_CircularZBand, "clear", new=spy_clear):
 				run_tiled_inference_3d(
@@ -1777,7 +2029,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			input_path = Path(td) / "input.zarr"
 			arr = zarr.open(
 				str(input_path), mode="w", shape=(16, 16, 16),
-				chunks=(8, 8, 8), dtype="uint8",
+				chunks=(8, 8, 8), dtype="uint8", zarr_format=2,
 			)
 			arr[8:16, 8:16, 8:16] = 1
 			output = Output()
@@ -1815,7 +2067,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 			input_path = Path(td) / "input.zarr"
 			zarr.open(
 				str(input_path), mode="w", shape=(16, 16, 16),
-				chunks=(8, 8, 8), dtype="uint8",
+				chunks=(8, 8, 8), dtype="uint8", zarr_format=2,
 			)
 			output = Output()
 			run_tiled_inference_3d(
@@ -1876,6 +2128,7 @@ class PreprocessCosOmezarrTests(unittest.TestCase):
 				shape=(16, 16, 16),
 				chunks=(4, 4, 4),
 				dtype=np.uint8,
+				zarr_format=2,
 			)
 			zz, yy, xx = np.indices((16, 16, 16), dtype=np.int32)
 			arr[:] = ((zz * 17 + yy * 5 + xx * 3) % 251).astype(np.uint8)
