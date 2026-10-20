@@ -5,6 +5,7 @@
 #include "geometry/GeometryDelta.hpp"
 #include "sync/GeometryTransfer.hpp"
 #include "sync/Baselines.hpp"
+#include "internal/History.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -258,6 +259,10 @@ SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& option
     for (const auto& id : ids)
         if (syncRecord(*this, localTxn, id) != at(merged, id) || syncRecord(peer, remoteTxn, id) != at(merged, id))
             throw std::runtime_error("sync: applied state differs from merge; both transactions rolled back");
+    // Validate/materialize both local history publications before either store
+    // commits. Sync merges current records, not the peer's historical timeline.
+    detail::publishHistory(localDb, false, true);
+    detail::publishHistory(remoteDb, false, true);
     std::string digest = shared.incremental ? shared.state.at("digest").get<std::string>() : std::string(64, '0');
     if (shared.incremental) {
         for (const auto& [id, record] : base.items()) toggleDigest(digest, record);

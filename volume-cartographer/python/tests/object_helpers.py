@@ -21,6 +21,17 @@ def remove_spatial_schema(sql):
     sql.execute("DROP INDEX objects_kind_uuid")
 
 
+def remove_history_schema(sql):
+    """Make a real pre-v9 fixture before lowering PRAGMA user_version."""
+    for name, in sql.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE '%_history_%'").fetchall():
+        sql.execute(f'DROP TRIGGER "{name}"')
+    for table in ("object_relationship_deltas", "object_relationship_heads",
+                  "relationship_revisions", "object_head_records", "object_heads", "object_revisions",
+                  "history_dirty_objects", "history_dirty_edges", "history_expected",
+                  "history_checked", "history_validated_edges", "history_required"):
+        sql.execute(f"DROP TABLE {table}")
+
+
 def edge_choice(db, edge_uuid, action, **anchors):
     edge = db.edge(edge_uuid)
     revisions = [db.current_geometry(edge[side]) for side in ("a", "b")]

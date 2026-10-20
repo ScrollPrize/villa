@@ -88,6 +88,123 @@ transaction sees a consistent snapshot. For independent copies, establish a
 shared baseline with `synchronize` before editing, then review conflicting
 records and choose a side explicitly.
 
+## Object revisions and checked actions
+
+An immutable object revision identifies its geometry payload, complete metadata,
+and relationship membership. `current_object_revision`, `object_revision`, and
+`object_history` return these identities and metadata. Use the returned
+`geometry_revision` with the existing array/range/rectangle readers. Object and
+geometry revision UUIDs are distinct; annotations can change without creating a
+geometry revision.
+
+For an edit prepared outside a writer transaction, supply the object revisions
+you observed, including every participating relationship endpoint:
+
+```python
+observed = {uuid: store.current_object_revision(uuid)["uuid"]
+            for uuid in (a_uuid, b_uuid)}
+with store.write(expected_revisions=observed) as tx:
+    tx.set_meta(a_uuid, "review_note", "checked")
+    tx.set_meta(edge_uuid, "confidence", 0.9)
+```
+
+C++ uses `store.write(RevisionSelection{...})` and the existing transaction
+mutators. Expectations are checked before entering the action. Commit checks
+coverage of all modified objects and endpoints used in relationship validation.
+Missing expectations, stale heads, and caught geometry revision conflicts roll
+back the entire checked action, including its geometry payloads and journal
+entries. A `None` expectation means the object must not yet exist; choose its UUID
+before creating it in a checked action. The original `write()` remains available
+for serialized ingestion and read/modify/write operations performed under its
+writer lock. It does not protect edits prepared from earlier external reads.
+
+Every object revision also stores `published_at_us`, a UTC Unix timestamp in
+microseconds. All revisions from one action receive the same timestamp; the
+writer guarantees strictly increasing publication times across actions, including
+clock ties or backward clock adjustments. There is no separate commit-marker
+table. Save a revision's publication time to recover the entire store at that
+point:
+
+```python
+at = store.current_object_revision(object_uuid)["published_at_us"]
+# Later, even after geometry, annotations and links have changed:
+past = store.revision_read_view_at(at)
+past_objects = past["objects"]          # metadata plus immutable geometry UUIDs
+past_links = past["relationships"]      # exact recorded links, with applicability
+past_selection = past["selection"]      # object UUID -> revision UUID
+```
+
+`revision_selection_at(at)` (C++ `revisionSelectionAt`) picks the latest published
+revision at or before `at` for each object. Physical deletions leave history
+events and are excluded after their publication time. These events do not change
+the existing restrictions on deleting objects with retained geometry. Objects
+created after `at` are also excluded. Read referenced geometry with the usual
+array readers; all returned geometry and metadata correspond to the same
+selection. A recorded link's pinned target may intentionally be older than that
+selection; `applicable` distinguishes those historical references from usable
+connections at the selected time. Restoring into the live store is a new checked
+action rather than moving the historical heads.
+
+One commit publishes at most one revision per changed object. Revision reads
+inside an uncommitted writer still describe the last published state. Metadata
+uses JSON field deltas; geometry uses the existing immutable chunks and sparse
+deltas. Unchanged relationship versions and memberships are inherited, with
+indexed materializations for current metadata and membership reads.
+
+Relationships are shared records owned by both endpoints. Addition, modification,
+removal, or explicit rebinding revises both endpoint objects in the same action
+(once for a self-link). `recorded_relationships(object_revision_uuid)` reads the
+exact immutable versions belonging to that object revision. Each result contains
+the edge record, `a_revision`/`b_revision` object pins, and the geometry bindings
+used for validation. Follow those object pins to resolve recorded references;
+never substitute current heads.
+
+`relationships_at({object_uuid: revision_uuid, ...})` evaluates a closed revision
+selection. Here `None` selects the latest head in the query's read snapshot.
+Results include `applicable`: both selected endpoints must contain the same
+relationship version and its declared dependencies must match. Missing endpoints
+or incompatible versions are reported as inapplicable. Explicit selections let
+applications query the inputs actually applied to a fit.
+`revision_read_view(selection)` returns `objects`, `relationships`, and the
+resolved `selection` together from one snapshot, including when selecting latest
+heads. C++ callers use these reads within one `ReadTxn`. The existing `edges_of`,
+traversal, and graph-view APIs remain current-record queries; they do not replace
+this revision-aware applicability check.
+
+There are two distinct preservation decisions:
+
+- `keep_recorded_relationship(edge_uuid)`, or a geometry edge decision with
+  `action="keep_recorded"`, checks the resulting anchor identities but preserves
+  the historical pins and shared relationship version. The edited object inherits
+  the reference; other objects need no new revision. The relationship can be
+  inapplicable to the new selected geometry.
+- `retain_relationship(edge_uuid)` explicitly validates and binds the shared
+  relationship to the resulting endpoint state. Geometry decisions named
+  `retain` and `update` retain this existing rebinding behavior. Rebinding is a
+  shared relationship change and revises both endpoints.
+
+An anchor can declare `metadata_keys`, the top-level ordinary metadata keys that
+affect its meaning, such as `["winding"]`. Changes to these require an explicit
+keep, revalidate, update, or remove decision. Decisions are checked against final
+metadata at commit. Other metadata edits leave geometric applicability unchanged.
+Restoring old metadata or geometry is a new checked action through the same
+mutators and requires the same relationship decisions. Domain-specific validity
+remains the application's decision; the store validates declared dependencies
+and anchor identities.
+
+Writable opens migrate schema v8 to v9 atomically. Pre-v9 annotations were mutable,
+so migration cannot recover their original historical values. Migration baselines
+are marked `metadata_complete=False`, including detached baselines needed to
+preserve stale geometry bindings. Those detached baselines have no publication
+timestamp and are never selected as past live heads. New revisions record complete publication
+state. Open an older store writable once before using these history APIs.
+Publication times describe this store's timeline. The existing `synchronize`
+operation merges current records and geometry history; it does not replicate a
+peer's historical metadata/graph timeline. An incoming binding to older geometry
+without matching local object history receives the same explicitly incomplete,
+untimed baseline. Use a database copy when the complete original timeline must
+be transported.
+
 ## Sparse geometry edits
 
 `edit_geometry` / `ObjectStore::editGeometry` replaces scalar ranges in existing

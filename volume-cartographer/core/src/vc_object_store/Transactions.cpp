@@ -1,4 +1,5 @@
 #include "internal/Database.hpp"
+#include "internal/History.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -33,7 +34,10 @@ void Txn::release(bool commit)
         if (write_) db_->impl_->writerMutex.unlock();
         else db_->impl_->checkinReader(conn);
     };
-    try { exec(conn, commit ? "COMMIT;" : "ROLLBACK;"); }
+    try {
+        if (commit && write_) publishHistory(conn);
+        exec(conn, commit ? "COMMIT;" : "ROLLBACK;");
+    }
     catch (...) {
         sqlite3_exec(conn, "ROLLBACK;", nullptr, nullptr, nullptr);
         releaseConnection(); throw;
@@ -77,10 +81,19 @@ WriteTxn ObjectStore::write()
     std::unique_lock<std::mutex> lock(impl_->writerMutex);
     activeStatementPools[impl_->writer] = impl_->statementPools.at(impl_->writer).get();
     impl_->statementPools.at(impl_->writer)->readSnapshot = false;
+    impl_->statementPools.at(impl_->writer)->checkedAction = false;
+    impl_->statementPools.at(impl_->writer)->actionConflict = false;
     try { exec(impl_->writer, "BEGIN IMMEDIATE;"); }
     catch (...) { activeStatementPools.erase(impl_->writer); throw; }
     lock.release(); // WriteTxn releases the mutex on commit or rollback.
     return WriteTxn(this, impl_->writer);
+}
+
+WriteTxn ObjectStore::write(const RevisionSelection& expected)
+{
+    auto txn = write();
+    expectHistory(static_cast<sqlite3*>(connection(txn)), expected);
+    return txn;
 }
 
 void ObjectStore::checkpoint()

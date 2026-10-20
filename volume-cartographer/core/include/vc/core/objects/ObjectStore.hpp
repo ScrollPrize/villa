@@ -93,12 +93,49 @@ struct Anchor {
     // direction/interpolated anchor. Empty means unknown, not independent.
     std::vector<PointReference> points;
     bool wholeGeometry = false; // explicit object-wide relationship
+    // Top-level ordinary metadata keys that affect this relationship.
+    // Changing these requires an explicit retain/update/remove decision.
+    std::vector<std::string> metadataKeys;
     bool operator==(const Anchor&) const = default;
 };
 
 struct EdgeRecord : RecordCommon {
     std::string aUuid, bUuid;  // endpoint order is normalised by addEdge
     Anchor aAnchor, bAnchor;
+};
+
+// Object UUID -> immutable object revision UUID. null means expect no object.
+// These are object revisions, not geometry payload revisions.
+using RevisionSelection = std::map<std::string, std::optional<std::string>>;
+
+struct ObjectRevision {
+    std::string uuid, objectUuid;
+    std::optional<std::string> parentUuid, geometryRevision;
+    int64_t sequence = 0;
+    // False only for migration baselines: pre-v9 metadata history did not exist.
+    bool metadataComplete = true;
+    // UTC Unix microseconds assigned once per atomic publication, monotonically
+    // increasing within this store. Missing only for untimed migration baselines.
+    std::optional<int64_t> publishedAtUs;
+    bool deleted = false;
+    ObjectRecord record;
+};
+
+// Shared edges are owned by both endpoints. Adding, changing or removing one
+// revises both objects in the same transaction. Unchanged membership is inherited.
+// Pins never follow heads: resolve aRevision/bRevision with objectRevision().
+struct RelationshipRevision {
+    std::string uuid;
+    EdgeRecord record;
+    std::string aRevision, bRevision;
+    std::optional<std::string> aGeometryRevision, bGeometryRevision;
+};
+
+struct SelectedRelationship {
+    RelationshipRevision relationship;
+    // Both selected endpoints must contain this version and its declared
+    // dependencies must still match. Unrelated metadata edits remain applicable.
+    bool applicable = false;
 };
 
 struct JournalEntry {
@@ -256,9 +293,11 @@ struct EdgeGeometryRepair {
 struct GeometryEdgeEdit {
     std::string edgeUuid;
     int64_t expectedGeneration = 0;
-    // Exactly "retain", "update", or "remove". Retain keeps the same
+    // "retain", "update", "remove", or "keep_recorded". Retain keeps the same
     // relationship and anchors; update supplies both complete anchors in
     // stored a/b order. Revisions are the heads observed BEFORE the edit.
+    // keep_recorded checks the resulting anchor identities but preserves the
+    // historical pins; it does NOT assert applicability to the new geometry.
     std::string action;
     std::optional<std::string> aRevision, bRevision;
     Anchor aAnchor, bAnchor;
@@ -279,6 +318,30 @@ public:
     ~ObjectStore();
     ReadTxn read();
     WriteTxn write();
+    // Optimistic action: check every supplied head before making changes and
+    // require an expectation for every modified object and relationship endpoint.
+    // One commit publishes one object revision per changed object. Any missing
+    // expectation or conflict rolls back the ENTIRE transaction, even if caught.
+    // Use this overload for edits prepared outside the writer transaction.
+    WriteTxn write(const RevisionSelection& expected);
+    std::optional<ObjectRevision> currentObjectRevision(const Txn&, const std::string& objectUuid) const;
+    std::optional<ObjectRevision> objectRevision(const Txn&, const std::string& revisionUuid) const;
+    std::vector<ObjectRevision> objectHistory(const Txn&, const std::string& objectUuid) const;
+    // Latest revision of each live object at or before this publication time.
+    // All objects changed by an action have the same timestamp; no partial action
+    // can be selected. Empty before the first publication. Deletions are excluded.
+    RevisionSelection revisionSelectionAt(const Txn&, int64_t publishedAtUs) const;
+    std::vector<RelationshipRevision> recordedRelationships(const Txn&, const std::string& objectRevisionUuid) const;
+    // Explicit, closed selection: omitted endpoints are not selected. null
+    // selects the latest head (unlike write(), where null expects absence).
+    std::vector<SelectedRelationship> relationshipsAt(const Txn&, const RevisionSelection&) const;
+    // Explicitly validate and retain an existing relationship against the
+    // resulting endpoint state, including metadataKeys. Call after endpoint edits.
+    // Domain-specific meaning is the caller's decision; the store checks anchors.
+    void retainRelationship(WriteTxn&, const std::string& edgeUuid);
+    // Keep historical pins after an endpoint edit without asserting that the
+    // relationship applies to the edited endpoint. Current queries may be stale.
+    void keepRecordedRelationship(WriteTxn&, const std::string& edgeUuid);
     const std::filesystem::path& path() const;
     std::string hostname() const;
     std::string author() const;

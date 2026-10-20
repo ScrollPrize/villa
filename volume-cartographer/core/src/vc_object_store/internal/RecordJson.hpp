@@ -16,7 +16,7 @@ nlohmann::json objectToJson(const ObjectRecord& r, const std::set<std::string>* 
 
 ObjectRecord objectFromJson(const nlohmann::json& j);
 
-nlohmann::json edgeToJson(EdgeRecord e, const std::set<std::string>* fields = nullptr);
+nlohmann::json edgeToJson(EdgeRecord e, const std::set<std::string>* fields = nullptr, bool canonicalOrder = true);
 
 EdgeRecord edgeFromJson(const nlohmann::json& j);
 

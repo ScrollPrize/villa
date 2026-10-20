@@ -134,9 +134,9 @@ ObjectRecord objectFromJson(const nlohmann::json& j)
     return r;
 }
 
-nlohmann::json edgeToJson(EdgeRecord e, const std::set<std::string>* fields)
+nlohmann::json edgeToJson(EdgeRecord e, const std::set<std::string>* fields, bool canonicalOrder)
 {
-    canonicalizeEdge(e);
+    if (canonicalOrder) canonicalizeEdge(e);
     auto j = commonToJson(e, fields);
     j["a"] = e.aUuid;
     j["b"] = e.bUuid;

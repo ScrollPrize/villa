@@ -1,4 +1,5 @@
 #include "internal/Schema.hpp"
+#include "internal/History.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -10,7 +11,7 @@ ObjectStore& ObjectStore::operator=(ObjectStore&&) noexcept = default;
 std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::path& path, const OpenOptions& options, bool create)
 {
     const int kApplicationId = 0x56434f42;
-    const int kSchemaVersion = 8;
+    const int kSchemaVersion = 9;
     if (create && options.readOnly) throw std::invalid_argument("create requires writable options");
     if (sqlite3_threadsafe() == 0)
         throw std::runtime_error("object store: SQLite build is not thread-safe");
@@ -36,6 +37,7 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
         exec(impl->writer, "BEGIN IMMEDIATE;");
         try {
             createSchema(impl->writer);
+            createHistorySchema(impl->writer);
             exec(impl->writer, ("PRAGMA user_version=" + std::to_string(kSchemaVersion) + ";").c_str());
             exec(impl->writer, "COMMIT;");
         } catch (...) {
@@ -79,6 +81,11 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
                     if (pragmaInt(impl->writer, "user_version") == 7) {
                         exec(impl->writer, kGeometryDeltaSchema);
                         exec(impl->writer, "PRAGMA user_version=8;");
+                    }
+                    if (pragmaInt(impl->writer, "user_version") == 8) {
+                        createHistorySchema(impl->writer);
+                        publishHistory(impl->writer, true);
+                        exec(impl->writer, "PRAGMA user_version=9;");
                     }
                     exec(impl->writer, "COMMIT;");
                 } catch (...) { exec(impl->writer, "ROLLBACK;"); throw; }

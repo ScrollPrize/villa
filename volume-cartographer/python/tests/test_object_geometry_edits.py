@@ -238,6 +238,6 @@ def test_sync_of_unrelated_point_edit_preserves_approval(linked, tmp_path):
 def test_relationship_decisions_have_no_implicit_resolution_mode(linked, action):
     db, a, b, first, edge = linked
     before = db.export_json(), db.journal_since()
-    with pytest.raises(ValueError, match="retain, update, or remove"):
+    with pytest.raises(ValueError, match="retain, update, remove, or keep_recorded"):
         db.put_geometry(a, fiber(value=99), expected_revision=first, edge_edits=[edge_choice(db, edge, action)])
     assert (db.export_json(), db.journal_since()) == before

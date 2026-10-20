@@ -1,5 +1,6 @@
 #include "internal/EdgeSql.hpp"
 #include "geometry/Dependencies.hpp"
+#include "internal/History.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -14,9 +15,9 @@ void ObjectStore::repairEdgeGeometry(WriteTxn& txn, const EdgeGeometryRepair& re
     };
     const auto aRevision = canonical(repair.aRevision), bRevision = canonical(repair.bRevision);
     if (geometryHead(db, edge->aUuid) != aRevision || geometryHead(db, edge->bUuid) != bRevision)
-        throw std::runtime_error("geometry repair: endpoint revision changed; recompute repair");
+        historyConflict(db, "geometry repair: endpoint revision changed; recompute repair");
     if (edge->generation != repair.expectedGeneration)
-        throw std::runtime_error("geometry repair: edge generation changed; recompute repair");
+        historyConflict(db, "geometry repair: edge generation changed; recompute repair");
     auto a = repair.aAnchor, b = repair.bAnchor;
     for (const auto& [uuid, anchor] : {std::pair{edge->aUuid, a}, std::pair{edge->bUuid, b}})
         if (const auto revision = currentGeometry(txn, uuid))
@@ -27,7 +28,10 @@ void ObjectStore::repairEdgeGeometry(WriteTxn& txn, const EdgeGeometryRepair& re
     if (normalized.aUuid != edge->aUuid) swapEndpoints(normalized);
     a = normalized.aAnchor; b = normalized.bAnchor;
     const auto state = edgeGeometryState(txn, repair.edgeUuid);
-    if (state.aRevision == aRevision && state.bRevision == bRevision && a == edge->aAnchor && b == edge->bAnchor) return;
+    if (state.aRevision == aRevision && state.bRevision == bRevision && a == edge->aAnchor && b == edge->bAnchor) {
+        recordRelationshipValidation(db, *edge);
+        return;
+    }
     const auto id = *edgeIdByUuid(db, parseUuid(repair.edgeUuid));
     Savepoint savepoint(db);
     Statement anchors(db, "UPDATE edges SET a_anchor_x=?,a_anchor_y=?,a_anchor_z=?,a_dir_x=?,a_dir_y=?,a_dir_z=?,"
@@ -41,6 +45,7 @@ void ObjectStore::repairEdgeGeometry(WriteTxn& txn, const EdgeGeometryRepair& re
     if (bRevision) binding.bindBlob(3, parseUuid(*bRevision)); else binding.bindNull(3);
     binding.stepDone();
     stampContentChange(db, author(), hostname(), "edges", id, parseUuid(repair.edgeUuid), "geometry_repaired");
+    recordRelationshipValidation(db, normalized);
     savepoint.release();
 }
 

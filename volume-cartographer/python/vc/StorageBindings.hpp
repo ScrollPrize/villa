@@ -89,10 +89,11 @@ vo::Anchor anchorFromPy(const nb::handle& obj)
     nb::dict d = nb::cast<nb::dict>(obj);
     for (auto item : d) {
         const auto key = nb::cast<std::string>(item.first);
-        if (key != "points" && key != "whole_geometry" && key != "position" && key != "direction")
+        if (key != "points" && key != "whole_geometry" && key != "position" && key != "direction" && key != "metadata_keys")
             throw std::invalid_argument("unknown anchor field: " + key);
     }
     if (has(d, "whole_geometry")) a.wholeGeometry = nb::cast<bool>(d["whole_geometry"]);
+    if (has(d, "metadata_keys")) a.metadataKeys = nb::cast<std::vector<std::string>>(d["metadata_keys"]);
     if (has(d, "points")) for (nb::handle item : nb::cast<nb::list>(d["points"])) {
         const auto point = nb::cast<nb::dict>(item);
         a.points.push_back({nb::cast<std::string>(point["array"]), nb::cast<std::vector<int64_t>>(point["index"])});
@@ -113,6 +114,7 @@ nb::dict anchorToPy(const vo::Anchor& a)
 {
     nb::dict d;
     if (a.wholeGeometry) d["whole_geometry"] = true;
+    if (!a.metadataKeys.empty()) d["metadata_keys"] = a.metadataKeys;
     if (!a.points.empty()) {
         nb::list points;
         for (const auto& point : a.points) {
@@ -423,6 +425,7 @@ struct PyObjectWriteTxn {
     PyObjectStore* owner = nullptr;
     std::shared_ptr<vo::ObjectStore> lease;
     std::unique_ptr<vo::WriteTxn> txn;
+    std::optional<vo::RevisionSelection> expected;
 
     vo::WriteTxn& require()
     {
@@ -434,7 +437,7 @@ struct PyObjectWriteTxn {
         if (txn) throw std::runtime_error("transaction is already active");
         owner->require();
         lease = owner->db;
-        try { txn = std::make_unique<vo::WriteTxn>(lease->write()); }
+        try { txn = std::make_unique<vo::WriteTxn>(expected ? lease->write(*expected) : lease->write()); }
         catch (...) { lease.reset(); throw; }
         return *this;
     }

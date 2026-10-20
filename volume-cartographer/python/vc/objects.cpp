@@ -6,6 +6,44 @@
 #include "vc/core/util/CtSheetNormal.hpp"
 using namespace vc::python;
 namespace {
+nb::dict objectRevisionToPy(const vo::ObjectRevision& revision)
+{
+    nb::dict d;
+    d["uuid"] = revision.uuid; d["object_uuid"] = revision.objectUuid;
+    d["parent_uuid"] = revision.parentUuid; d["geometry_revision"] = revision.geometryRevision;
+    d["sequence"] = revision.sequence; d["metadata_complete"] = revision.metadataComplete;
+    d["published_at_us"] = revision.publishedAtUs; d["deleted"] = revision.deleted;
+    d["record"] = objectToPy(revision.record);
+    return d;
+}
+
+nb::dict relationshipRevisionToPy(const vo::RelationshipRevision& revision)
+{
+    nb::dict d;
+    d["uuid"] = revision.uuid; d["record"] = edgeToPy(revision.record);
+    d["a_revision"] = revision.aRevision; d["b_revision"] = revision.bRevision;
+    d["a_geometry_revision"] = revision.aGeometryRevision; d["b_geometry_revision"] = revision.bGeometryRevision;
+    return d;
+}
+
+nb::dict revisionViewToPy(vo::ObjectStore& db, const vo::Txn& txn, const vo::RevisionSelection& selection)
+{
+    const auto relationships = db.relationshipsAt(txn, selection);
+    nb::dict result, resolved;
+    nb::list objects, edges;
+    for (const auto& [uuid, selected] : selection) {
+        const auto revision = selected ? db.objectRevision(txn, *selected) : db.currentObjectRevision(txn, uuid);
+        objects.append(objectRevisionToPy(*revision)); // selection was validated above
+        resolved[pyStr(revision->objectUuid)] = revision->uuid;
+    }
+    for (const auto& relationship : relationships) {
+        auto edge = relationshipRevisionToPy(relationship.relationship);
+        edge["applicable"] = relationship.applicable; edges.append(edge);
+    }
+    result["objects"] = objects; result["relationships"] = edges; result["selection"] = resolved;
+    return result;
+}
+
 std::vector<vo::GeometryEdgeEdit> edgeEditsFromPy(const nb::list& edits)
 {
     std::vector<vo::GeometryEdgeEdit> result;
@@ -689,14 +727,60 @@ NB_MODULE(objects, m)
         .def_prop_ro("uuid", [](PyObjectStore& self) {
             return self.withRead([](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.uuid(txn); });
         })
+        .def("current_object_revision", [](PyObjectStore& self, const std::string& uuid) -> nb::object {
+            const auto revision = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.currentObjectRevision(txn, uuid); });
+            return revision ? nb::object(objectRevisionToPy(*revision)) : nb::none();
+        }, nb::arg("object_uuid"))
+        .def("object_revision", [](PyObjectStore& self, const std::string& uuid) -> nb::object {
+            const auto revision = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.objectRevision(txn, uuid); });
+            return revision ? nb::object(objectRevisionToPy(*revision)) : nb::none();
+        }, nb::arg("revision_uuid"))
+        .def("object_history", [](PyObjectStore& self, const std::string& uuid) {
+            const auto revisions = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.objectHistory(txn, uuid); });
+            nb::list result;
+            for (const auto& revision : revisions) result.append(objectRevisionToPy(revision));
+            return result;
+        }, nb::arg("object_uuid"))
+        .def("recorded_relationships", [](PyObjectStore& self, const std::string& uuid) {
+            const auto revisions = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.recordedRelationships(txn, uuid); });
+            nb::list result;
+            for (const auto& revision : revisions) result.append(relationshipRevisionToPy(revision));
+            return result;
+        }, nb::arg("object_revision_uuid"))
+        .def("relationships_at", [](PyObjectStore& self, const vo::RevisionSelection& selection) {
+            const auto revisions = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.relationshipsAt(txn, selection); });
+            nb::list result;
+            for (const auto& revision : revisions) {
+                auto d = relationshipRevisionToPy(revision.relationship);
+                d["applicable"] = revision.applicable;
+                result.append(d);
+            }
+            return result;
+        }, nb::arg("selection"))
+        .def("revision_read_view", [](PyObjectStore& self, const vo::RevisionSelection& selection) {
+            return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
+                return revisionViewToPy(db, txn, selection);
+            });
+        }, nb::arg("selection"),
+           "Resolve selected objects, metadata, geometry references and relationship applicability in one read snapshot.")
+        .def("revision_selection_at", [](PyObjectStore& self, int64_t time) {
+            return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.revisionSelectionAt(txn, time); });
+        }, nb::arg("published_at_us"))
+        .def("revision_read_view_at", [](PyObjectStore& self, int64_t time) {
+            return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
+                return revisionViewToPy(db, txn, db.revisionSelectionAt(txn, time));
+            });
+        }, nb::arg("published_at_us"),
+           "Recover all objects, geometry references and recorded relationships at a publication time (UTC Unix microseconds).")
         .def(
             "write",
-            [](PyObjectStore& self) {
+            [](PyObjectStore& self, const std::optional<vo::RevisionSelection>& expected) {
                 PyObjectWriteTxn w;
                 w.owner = &self;
+                w.expected = expected;
                 return w;
             },
-            nb::keep_alive<0, 1>(),
+            nb::arg("expected_revisions") = std::nullopt, nb::keep_alive<0, 1>(),
             "Batch write transaction context manager: 'with db.write() as w: w.upsert_object(...)'");
 
     nb::class_<PyObjectWriteTxn>(m, "WriteTransaction")
@@ -711,6 +795,21 @@ NB_MODULE(objects, m)
         .def("repair_edge_geometry", [](PyObjectWriteTxn& self, const nb::dict& input) {
             self.owner->require().repairEdgeGeometry(self.require(), repairFromPy(input));
         }, nb::arg("repair"))
+        .def("retain_relationship", [](PyObjectWriteTxn& self, const std::string& uuid) {
+            self.owner->require().retainRelationship(self.require(), uuid);
+        }, nb::arg("edge_uuid"))
+        .def("keep_recorded_relationship", [](PyObjectWriteTxn& self, const std::string& uuid) {
+            self.owner->require().keepRecordedRelationship(self.require(), uuid);
+        }, nb::arg("edge_uuid"))
+        .def("update_edge", [](PyObjectWriteTxn& self, const nb::dict& record) {
+            self.owner->require().updateEdge(self.require(), edgeFromPy(record));
+        })
+        .def("remove_edge", [](PyObjectWriteTxn& self, const std::string& uuid) {
+            self.owner->require().removeEdge(self.require(), uuid);
+        })
+        .def("remove_meta", [](PyObjectWriteTxn& self, const std::string& uuid, const std::string& key) {
+            self.owner->require().removeMeta(self.require(), uuid, key);
+        })
         .def("put_geometry", [](PyObjectWriteTxn& self, const std::string& uuid, const nb::dict& input,
                                const std::optional<std::string>& expected, const nb::list& choices, int64_t patchTileSize) {
             const auto data = geometryFromPy(input);

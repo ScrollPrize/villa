@@ -8,6 +8,7 @@ add_library(vc_objects STATIC
     internal/JsonFields.cpp
     Database.cpp
     Transactions.cpp
+    History.cpp
     Records.cpp
     Metadata.cpp
     SourcePaths.cpp

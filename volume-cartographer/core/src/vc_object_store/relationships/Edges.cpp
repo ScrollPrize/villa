@@ -1,5 +1,6 @@
 #include "internal/EdgeSql.hpp"
 #include "geometry/Dependencies.hpp"
+#include "internal/History.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -9,7 +10,12 @@ std::string ObjectStore::addEdge(WriteTxn& txn, const EdgeRecord& record)
     for (const auto& [uuid, anchor] : {std::pair{record.aUuid, record.aAnchor}, std::pair{record.bUuid, record.bAnchor}})
         if (const auto revision = currentGeometry(txn, uuid))
             detail::validateDependencies(anchor, detail::dependencyGeometry(*this, txn, *revision));
-    return addEdgeImpl(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, record, false);
+    auto* db = static_cast<sqlite3*>(connection(txn));
+    Savepoint savepoint(db);
+    const auto uuid = addEdgeImpl(db, impl_->options.author, impl_->hostname, record, false);
+    recordRelationshipValidation(db, *edgeByUuid(txn, uuid));
+    savepoint.release();
+    return uuid;
 }
 
 void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
@@ -30,7 +36,10 @@ void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
     std::sort(rec.tags.begin(), rec.tags.end());
     rec.tags.erase(std::unique(rec.tags.begin(), rec.tags.end()), rec.tags.end());
     if (rec.aAnchor == existing->aAnchor && rec.bAnchor == existing->bAnchor &&
-        rec.tags == existing->tags && nlohmann::json::parse(rec.meta) == nlohmann::json::parse(existing->meta)) return;
+        rec.tags == existing->tags && nlohmann::json::parse(rec.meta) == nlohmann::json::parse(existing->meta)) {
+        recordRelationshipValidation(db, rec);
+        return;
+    }
     const auto id = *edgeIdByUuid(db, parseUuid(rec.uuid));
     Savepoint savepoint(db);
     Statement s(db, "UPDATE edges SET a_anchor_x=?,a_anchor_y=?,a_anchor_z=?,a_dir_x=?,a_dir_y=?,a_dir_z=?,"
@@ -41,6 +50,7 @@ void ObjectStore::updateEdge(WriteTxn& txn, const EdgeRecord& record)
     s.bind(16, id); s.stepDone();
     writeTags(db, "edge_tags", "edge_id", id, rec.tags);
     stampContentChange(db, author(), hostname(), "edges", id, parseUuid(rec.uuid), "update_edge");
+    recordRelationshipValidation(db, rec);
     savepoint.release();
 }
 

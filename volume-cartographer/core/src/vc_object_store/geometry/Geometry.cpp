@@ -2,6 +2,7 @@
 #include "geometry/GeometryInternal.hpp"
 #include "geometry/Dependencies.hpp"
 #include "geometry/GeometryDelta.hpp"
+#include "internal/History.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -89,14 +90,14 @@ std::map<std::string, GeometryEdgeEdit> validateEdgeEdits(const ObjectStore& sto
             throw std::runtime_error("geometry edit requires explicit retain/update/remove for affected edge " + edge.uuid);
         const auto& edit = found->second;
         if (edit.expectedGeneration != edge.generation)
-            throw std::runtime_error("geometry edit: edge generation changed; reload decisions");
+            historyConflict(db, "geometry edit: edge generation changed; reload decisions");
         auto canonical = [](const std::optional<std::string>& id) -> std::optional<std::string> {
             return id ? std::optional(formatUuid(parseUuid(*id))) : std::nullopt;
         };
         if (canonical(edit.aRevision) != geometryHead(db, edge.aUuid) || canonical(edit.bRevision) != geometryHead(db, edge.bUuid))
-            throw std::runtime_error("geometry edit: endpoint revision changed; reload decisions");
-        if (edit.action != "retain" && edit.action != "update" && edit.action != "remove")
-            throw std::invalid_argument("geometry edge action must be retain, update, or remove");
+            historyConflict(db, "geometry edit: endpoint revision changed; reload decisions");
+        if (edit.action != "retain" && edit.action != "update" && edit.action != "remove" && edit.action != "keep_recorded")
+            throw std::invalid_argument("geometry edge action must be retain, update, remove, or keep_recorded");
         if (edit.action == "remove") continue;
         auto validate = [&](const std::string& endpoint, const Anchor& anchor) {
             if (endpoint == objectUuid) detail::validateDependencies(anchor, after);
@@ -105,8 +106,8 @@ std::map<std::string, GeometryEdgeEdit> validateEdgeEdits(const ObjectStore& sto
             else if (!anchor.wholeGeometry || !anchor.points.empty())
                 throw std::runtime_error("geometry edit: relationship endpoint has no geometry for its point references");
         };
-        validate(edge.aUuid, edit.action == "retain" ? edge.aAnchor : edit.aAnchor);
-        validate(edge.bUuid, edit.action == "retain" ? edge.bAnchor : edit.bAnchor);
+        validate(edge.aUuid, edit.action == "update" ? edit.aAnchor : edge.aAnchor);
+        validate(edge.bUuid, edit.action == "update" ? edit.bAnchor : edge.bAnchor);
     }
     if (decisions.size() != affected.size())
         throw std::invalid_argument("geometry decisions include an edge not affected by this edit");
@@ -141,7 +142,7 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
     const auto current = currentGeometry(txn, objectUuid);
     const auto expected = expectedRevision ? std::optional(formatUuid(parseUuid(*expectedRevision))) : std::nullopt;
     if ((current ? std::optional(current->uuid) : std::nullopt) != expected)
-        throw std::runtime_error("geometry: current revision changed; reload before committing");
+        historyConflict(db, "geometry: current revision changed; reload before committing");
     const auto manifest = detail::geometryManifest(data, storage.patchTileSize);
     const auto manifestText = manifest.dump();
     const auto contentHash = detail::geometryHash(std::span(reinterpret_cast<const uint8_t*>(manifestText.data()), manifestText.size()));
@@ -199,6 +200,7 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
     for (const auto& edge : affected) {
         const auto& edit = decisions.at(edge.uuid);
         if (edit.action == "remove") { removeEdge(txn, edge.uuid); continue; }
+        if (edit.action == "keep_recorded") { keepRecordedRelationship(txn, edge.uuid); continue; }
         EdgeGeometryRepair repair;
         repair.edgeUuid = edge.uuid; repair.expectedGeneration = edge.generation;
         repair.aRevision = geometryHead(db, edge.aUuid); repair.bRevision = geometryHead(db, edge.bUuid);
@@ -223,7 +225,7 @@ std::shared_ptr<SparseGeometryEdit> prepareEdit(const ObjectStore& store, const 
 {
     const auto revision = store.currentGeometry(txn, objectUuid);
     if (!revision || revision->uuid != formatUuid(parseUuid(expected)))
-        throw std::runtime_error("geometry: current revision changed; reload before committing");
+        historyConflict(ObjectStoreImplAccess::conn(txn), "geometry: current revision changed; reload before committing");
     auto plan = std::make_shared<SparseGeometryEdit>();
     plan->reader = std::make_shared<GeometryReader>(txn, revision->uuid);
     plan->manifest = plan->reader->manifest();
@@ -374,6 +376,7 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
     for (const auto& edge : affected) {
         const auto& decision = decisions.at(edge.uuid);
         if (decision.action == "remove") { removeEdge(txn, edge.uuid); continue; }
+        if (decision.action == "keep_recorded") { keepRecordedRelationship(txn, edge.uuid); continue; }
         EdgeGeometryRepair repair;
         repair.edgeUuid = edge.uuid; repair.expectedGeneration = edge.generation;
         repair.aRevision = geometryHead(db, edge.aUuid); repair.bRevision = geometryHead(db, edge.bUuid);

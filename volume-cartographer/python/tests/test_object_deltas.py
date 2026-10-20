@@ -159,6 +159,8 @@ def test_v7_migration_keeps_snapshot_and_allows_delta(tmp_path):
     with ObjectStore.create(path,author='test') as store:
         uid=store.upsert_object(dict(kind='track')); first=store.put_geometry(uid,track([(1,2,3)]))
     with sqlite3.connect(path) as sql:
+        from object_helpers import remove_history_schema
+        remove_history_schema(sql)
         for table in ('geometry_deltas','geometry_current_chunks','geometry_materializations'): sql.execute(f'DROP TABLE {table}')
         sql.execute('PRAGMA user_version=7')
     with ObjectStore.open(path,read_only=True) as ro: assert ro.read_geometry_array(first,'points') == struct.pack('<3i',1,2,3)
@@ -179,6 +181,13 @@ def test_real_scroll_patch_sparse_history_storage_and_reopen(tmp_path):
     with ObjectStore.create(path,author='test') as store:
         assert store.ingest_geometry_source('patch',copied)['ingested']==1
         first=rev=store.current_geometry(uid)['uuid']
+        initial_object = store.current_object_revision(uid)
+        with store.write(expected_revisions={uid: initial_object['uuid']}) as tx:
+            tx.set_meta(uid, 'history_validation', {'accepted': True})
+        metadata_revision = store.current_object_revision(uid)
+        assert metadata_revision['geometry_revision'] == first
+        assert 'history_validation' not in store.object_revision(initial_object['uuid'])['record']['meta']
+        assert metadata_revision['record']['meta']['history_validation'] == {'accepted': True}
         initial=store.read_geometry_array(first,'points'); pts=np.frombuffer(initial,dtype='<f4').reshape(-1,3)
         valid=np.flatnonzero(np.isfinite(pts).all(axis=1) & (pts[:,2]>0))[:100]
         assert len(valid)==100
