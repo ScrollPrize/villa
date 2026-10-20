@@ -296,8 +296,9 @@ def run_fiber_smoke(client: BridgeClient, rec: Recorder, proc: VC3DProcess) -> N
 
         # 3. fiber.export error paths.
         call_expect_error("fiber.export (missing path) -> -32602", "fiber.export", {}, -32602)
-        call_expect_error("fiber.export (scale 0) -> -32602", "fiber.export",
-                          {"path": str(tmp_dir / "x.json"), "scale": 0}, -32602)
+        for method in ("fiber.export", "fiber.import"):
+            call_expect_error(f"{method} (obsolete scale) -> -32602", method,
+                              {"path": str(tmp_dir / "x.json"), "scale": 2}, -32602)
         if not baseline_ids:
             call_expect_error("fiber.export (no fibers) -> -32005", "fiber.export",
                               {"path": str(tmp_dir / "empty.json")}, -32005)
