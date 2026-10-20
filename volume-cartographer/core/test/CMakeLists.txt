@@ -66,6 +66,12 @@ endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
 
+vc_add_test(NAME test_sampling_wait_profile)
+add_test(NAME test_sampling_wait_profile_enabled
+    COMMAND ${CMAKE_COMMAND} -E env VC_SAMPLING_WAIT_PROFILE=1
+        $<TARGET_FILE:test_sampling_wait_profile>)
+vc_register_ctest(test_sampling_wait_profile_enabled test_sampling_wait_profile)
+
 vc_add_test(NAME test_fiber_collection LIBS doctest::doctest vc_fiber_collection)
 
 vc_add_test(NAME test_omp_thread_point_collection)
