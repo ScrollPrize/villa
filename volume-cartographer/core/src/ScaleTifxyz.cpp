@@ -1,5 +1,6 @@
 #include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfaceIdentity.hpp"
 
 #include <tiffio.h>
 #include <algorithm>
@@ -224,9 +225,11 @@ void scaleTifxyzWithoutResampling(const std::filesystem::path& input,
         for (const auto& entry : fs::directory_iterator(input)) {
             const auto name = entry.path().filename().string();
             if (name == "meta.json" || name == "x.tif" || name == "y.tif" || name == "z.tif") continue;
+            // Presence of this marker makes VC3D treat a surface as immutable.
+            if (name == "catalog-origin.json") continue;
             if (entry.is_regular_file()) fs::copy_file(entry.path(), staging / entry.path().filename());
         }
-        meta["uuid"] = output.filename().string();
+        meta["uuid"] = newDerivedSurfaceIdentity(meta);
         meta["name"] = output.filename().string();
         std::ofstream out(staging / "meta.json");
         out.exceptions(std::ios::badbit | std::ios::failbit);

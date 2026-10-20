@@ -21,7 +21,10 @@ Invalid XYZ samples are preserved. Bbox and voxel-space area/step metadata are
 scaled, physical area stays unchanged, and voxel size is divided by the factor.
 Historical `fit_config` remains unchanged; current voxel size is written at the
 top level, using the fit-config voxel size if no top-level value existed.
-Destination name and UUID come from the output directory name.
+The destination name comes from the output directory name; its UUID is newly
+generated, as with GUI Save As New. Derived outputs omit `catalog-origin.json`
+and `vc_open_data_representation` so they are editable local surfaces, not
+immutable catalog entries. Other coordinate/provenance metadata is retained.
 
 If the input records `base_shape_zyx`, the actual target shape is required:
 rounding at lower pyramid levels cannot be inverted to recover exact dimensions.

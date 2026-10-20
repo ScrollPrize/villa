@@ -8,6 +8,7 @@
 #include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Tiff.hpp"
+#include "vc/core/util/Uuid.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -139,6 +140,57 @@ TEST_CASE("streamed no-resample scaling reads tiled and stripped XYZ, publishes 
         for (const auto& entry : fs::directory_iterator(scratch.path))
             CHECK(entry.path().extension() != ".tmp");
     }
+}
+
+TEST_CASE("streamed scaling resets catalog identity but retains coordinate provenance")
+{
+    namespace fs = std::filesystem;
+    struct Scratch {
+        fs::path path = fs::current_path() / ("scale-identity-test-" + vc::util::newUuid());
+        Scratch() { fs::create_directory(path); }
+        ~Scratch() { std::error_code ec; fs::remove_all(path, ec); }
+    } scratch;
+    const auto input = scratch.path / "catalog";
+    QuadSurface source(makePlanarGrid(4, 5, 20), {0.05f, 0.05f});
+    source.meta = utils::Json::parse(R"({
+        "vc_open_data_representation":{"sample_id":"Paris4"},
+        "base_shape_zyx":[10,10,10],
+        "fit_config":{"voxel_size_um":9.6,"source":"original"},
+        "vc_open_data_coordinate_space":"Paris4/scan@L2"
+    })");
+    source.save(input);
+    const auto sourceUuid = source.objectUuid();
+    REQUIRE(vc::util::isUuid(sourceUuid));
+    std::ofstream(input / "catalog-origin.json") << "{}";
+    std::ofstream(input / "ancillary.txt") << "unchanged";
+    const auto original = utils::Json::parse_file(input / "meta.json");
+    std::string previousUuid;
+    for (const auto* parent : {"first", "second"}) {
+        const auto output = scratch.path / parent / "same-name";
+        scaleTifxyzWithoutResampling(input, output, 4, std::array<int, 3>{40,39,39});
+        const auto metadata = utils::Json::parse_file(output / "meta.json");
+        const auto uuid = metadata["uuid"].get_string();
+        CHECK(vc::util::isUuid(uuid));
+        CHECK(uuid != sourceUuid);
+        CHECK(uuid != previousUuid);
+        CHECK(metadata["name"].get_string() == "same-name");
+        CHECK_FALSE(metadata.contains("vc_open_data_representation"));
+        CHECK_FALSE(fs::exists(output / "catalog-origin.json"));
+        CHECK(metadata["vc_open_data_coordinate_space"].get_string() == "Paris4/scan@L2");
+        CHECK(metadata["fit_config"].dump() == original["fit_config"].dump());
+        CHECK(metadata["base_shape_zyx"][1].get_int() == 39);
+        CHECK(metadata["voxel_size_um"].get_double() == doctest::Approx(2.4));
+        CHECK(fs::file_size(output / "ancillary.txt") == 9);
+        previousUuid = uuid;
+    }
+    source.saveAsNew(scratch.path / "gui-copy");
+    const auto guiMeta = utils::Json::parse_file(scratch.path / "gui-copy/meta.json");
+    CHECK(vc::util::isUuid(guiMeta["uuid"].get_string()));
+    CHECK(guiMeta["uuid"].get_string() != sourceUuid);
+    CHECK_FALSE(guiMeta.contains("vc_open_data_representation"));
+    CHECK(guiMeta["fit_config"].dump() == original["fit_config"].dump());
+    CHECK(utils::Json::parse_file(input / "meta.json").dump() == original.dump());
+    CHECK(fs::exists(input / "catalog-origin.json"));
 }
 
 TEST_CASE("transformSurfacePoints (int scale): no-op on identity + scale=1")
