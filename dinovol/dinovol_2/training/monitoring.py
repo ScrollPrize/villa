@@ -1,10 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# This source code is licensed under the Apache License, Version 2.0
-# found in LICENSES/Apache-2.0.txt.
-#
-# Modified for Dinovol's three-dimensional training pipeline.
-
 """Rendering for the DINO method; never participates in optimization."""
 from pathlib import Path
 from typing import Any, Mapping

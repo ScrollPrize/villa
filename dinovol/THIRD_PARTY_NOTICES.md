@@ -17,10 +17,19 @@ Inc. and affiliates, and are provided under the
 - `dinovol_2/model/model.py`
 - `dinovol_2/ops/collate.py`
 - `dinovol_2/ops/masking.py`
-- `dinovol_2/pretrain.py`
+- `dinovol_2/model/backbone.py`
+- `dinovol_2/methods/dino.py`
+- `dinovol_2/methods/dino_data.py`
+- `dinovol_2/training/trainer.py`
+- `dinovol_2/training/schedules.py`
+- `dinovol_2/training/diagnostics.py`
+- `dinovol_2/training/monitoring.py`
+
+Copyright (c) Meta Platforms, Inc. and affiliates.
 
 These files have been modified for Dinovol's three-dimensional training
-pipeline.
+pipeline. Source-file attribution headers are consolidated here, including
+code extracted from the original `pretrain.py` during the training refactor.
 
 ## DINOv3
 
@@ -31,6 +40,8 @@ Inc. and affiliates, and are distributed under the
 
 - `dinovol_2/loss/gram_loss.py`
 - `dinovol_2/model/rope.py`
+
+Copyright (c) Meta Platforms, Inc. and affiliates.
 
 These files have been modified for Dinovol, including three-dimensional
 position encoding and training integration.

@@ -1,10 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# This source code is licensed under the Apache License, Version 2.0
-# found in LICENSES/Apache-2.0.txt.
-#
-# Modified for Dinovol.
-
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
