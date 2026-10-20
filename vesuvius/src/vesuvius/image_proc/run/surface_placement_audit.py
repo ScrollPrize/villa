@@ -204,9 +204,13 @@ def sample_tifxyz(path: str, samples: int, rng: np.random.Generator):
     surf = read_tifxyz(path)
     nx, ny, nz = surf.compute_normals()
     x, y, z = surf._x, surf._y, surf._z
-    ok = np.isfinite(nx) & np.isfinite(x) & (x > 0) & (y > 0) & (z > 0)
+    has_point = np.isfinite(x) & (x > 0) & (y > 0) & (z > 0)
     if surf._mask is not None:
-        ok &= surf._mask.astype(bool)
+        has_point &= surf._mask.astype(bool)
+    ok = has_point & np.isfinite(nx)
+    # grid points with no computable normal (hole edges, grid border) are not sampled;
+    # the count is reported so a defect that lives there is not silently skipped
+    n_no_normal = int(has_point.sum() - ok.sum())
     idx = np.flatnonzero(ok)
     if len(idx) == 0:
         raise ValueError(f"{path}: no valid surface points")
@@ -215,7 +219,7 @@ def sample_tifxyz(path: str, samples: int, rng: np.random.Generator):
     P = np.stack([z.ravel()[pick], y.ravel()[pick], x.ravel()[pick]], 1).astype(np.float64)
     N = np.stack([nz.ravel()[pick], ny.ravel()[pick], nx.ravel()[pick]], 1).astype(np.float64)
     N /= np.linalg.norm(N, axis=1, keepdims=True) + 1e-12
-    return P, N, cell_ids(P), int(ok.sum())
+    return P, N, cell_ids(P), int(ok.sum()), n_no_normal
 
 
 def cell_ids(P: np.ndarray, size: float = 32.0) -> np.ndarray:
@@ -559,8 +563,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     failed = False
     for src in a.surface:
         name = surface_name(src)
+        n_no_normal = 0
         if is_tifxyz(src):
-            P, N, patch, n_vert = sample_tifxyz(src, a.samples, rng)
+            P, N, patch, n_vert, n_no_normal = sample_tifxyz(src, a.samples, rng)
+            if n_no_normal:
+                print(f"{name}: {n_no_normal} grid points have no normal and were not sampled", file=sys.stderr)
         else:
             P, N, patch, n_vert = sample_obj(src, a.samples, a.blobs, rng)
         prof, t, inside = read_profiles(vol, P, N, a.half, a.step, a.sigma, workers=a.workers)
@@ -569,7 +576,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         m = summarize(off, contrast, valid, inside, patch, prof, t, a.half, a.min_contrast)
         m.update(controls(vol, P, N, off, valid, a, rng))
         m.update({"surface": name, "source": src, "volume": a.volume, "n_vertices": int(n_vert),
-                  "half": a.half, "step": a.step, "sigma": a.sigma,
+                  "n_no_normal": n_no_normal, "half": a.half, "step": a.step, "sigma": a.sigma,
                   "min_contrast": a.min_contrast, "min_prominence": a.min_prominence})
         with open(os.path.join(a.out, f"{name}.json"), "w") as f:
             json.dump(m, f, indent=1)

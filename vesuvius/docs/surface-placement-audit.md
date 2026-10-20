@@ -63,6 +63,7 @@ surface, and `<name>.png` with `--plot` (offset as colour in two projections).
 | metric | meaning |
 | --- | --- |
 | `n_samples`, `n_inside_volume`, `n_valid` | points drawn, inside the volume with the full profile, with a located peak |
+| `n_no_normal` | tifxyz input only: valid grid points with no computable normal (hole edges, grid border), which are never sampled. Vertex-level defects that sit there, such as the resampling spikes of villa PR #2067, are invisible to this audit; the count says how much of the grid it did not look at |
 | `no_peak_frac` | share of inside points with no qualifying peak (low contrast, air, or a shoulder) |
 | `offset_median`, `offset_q25`, `offset_q75`, `offset_mean_abs` | signed offset from the surface point to the sheet peak, in voxels along the stored normal; positive means the peak lies in the normal direction |
 | `offset_abs_gt_1_frac`, `_2_`, `_3_` | share of valid points more than 1, 2 or 3 voxels from the peak |

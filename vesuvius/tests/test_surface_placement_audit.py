@@ -192,6 +192,24 @@ def test_tifxyz_input(tmp_path, ct):
     assert abs(m["offset_median"]) == pytest.approx(2.0, abs=0.5)
 
 
+def test_tifxyz_points_without_a_normal_are_counted_not_silently_dropped(tmp_path, ct):
+    """A hole in the grid leaves its edge points without a normal. They cannot be audited;
+    the JSON must say how many so a defect at a hole edge is not hidden (villa PR #2067)."""
+    from vesuvius.tifxyz.types import Tifxyz
+    from vesuvius.tifxyz.writer import write_tifxyz
+
+    yy, xx = np.meshgrid(np.linspace(16, 48, 24), np.linspace(16, 48, 24))
+    x, y, z = xx.astype(np.float32), yy.astype(np.float32), np.full(xx.shape, 32.0, np.float32)
+    x[10:13, 10:13] = y[10:13, 10:13] = z[10:13, 10:13] = -1.0  # a 3 x 3 hole
+    d = write_tifxyz(tmp_path / "seg", Tifxyz(_x=x, _y=y, _z=z, _scale=(1.0, 1.0), path=None))
+    P, N, _, n_ok, n_no_normal = spa.sample_tifxyz(str(d), 10_000, np.random.default_rng(0))
+    assert n_no_normal > 0 and n_ok + n_no_normal == 24 * 24 - 9
+    assert np.isfinite(N).all() and len(P) == n_ok
+    rc, out, rows = run(tmp_path, ct, [str(d)])
+    assert rc == 0
+    assert json.load(open(out / "seg.json"))["n_no_normal"] == n_no_normal
+
+
 def test_bad_arguments(tmp_path, ct):
     with pytest.raises(SystemExit):
         spa.main(["--surface", "x.obj", "--volume", ct, "--out", str(tmp_path), "--fail-on", "nope=1"])
