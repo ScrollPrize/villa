@@ -36,6 +36,9 @@ import numpy as np
 
 from vesuvius.image_proc.run.label_topology_audit import _parse_fail_on, open_volume
 
+GRID_SPIKE_FACTOR = 4.0  # a step longer than this times the median step ties a spike group
+GRID_KEYS = ("n_grid_spikes", "grid_step_median", "grid_step_max", "n_grid_holes", "grid_hole_points")
+
 METRICS = (
     "n_samples", "n_inside_volume", "n_valid", "no_peak_frac", "n_censored", "censored_frac",
     "offset_median", "offset_q25", "offset_q75", "offset_mean_abs",
@@ -200,7 +203,7 @@ def _sample_obj(src, size, reader, samples, blobs, rng, blob_bytes):
 
 
 def grid_step_check(x: np.ndarray, y: np.ndarray, z: np.ndarray, has_point: np.ndarray,
-                    factor: float = 4.0) -> dict[str, Any]:
+                    factor: float = GRID_SPIKE_FACTOR, max_group_frac: float = 0.05) -> dict[str, Any]:
     """Geometry of a tifxyz grid without the CT. Adjacent valid grid points are joined
     when their distance is at most ``factor`` times the median step; the largest
     connected group is the surface. Any other group that is still tied to the rest by
@@ -228,7 +231,10 @@ def grid_step_check(x: np.ndarray, y: np.ndarray, z: np.ndarray, has_point: np.n
     if len(d) == 0:
         return {"grid_step_median": float("nan"), "grid_step_max": float("nan"), "n_grid_spikes": 0,
                 "grid_spike_rc": np.zeros((0, 2), int)}
-    med = float(np.median(d))
+    med = float(np.median(d[d > 0])) if (d > 0).any() else 0.0  # duplicate vertices give zero steps
+    if med == 0.0:
+        return {"grid_step_median": 0.0, "grid_step_max": round(float(d.max()), 3), "n_grid_spikes": 0,
+                "grid_spike_rc": np.zeros((0, 2), int)}
     short = d <= factor * med
     graph = coo_matrix((np.ones(short.sum()), (a[short], b[short])), shape=(n, n))
     _, comp = connected_components(graph, directed=False)
@@ -241,6 +247,7 @@ def grid_step_check(x: np.ndarray, y: np.ndarray, z: np.ndarray, has_point: np.n
     tied[la[cross]] = True
     tied[lb[cross]] = True
     tied[largest] = False
+    tied &= sizes < max_group_frac * sizes[largest]  # a large group joined by a long step is a fold, not a spike
     spike = (comp >= 0) & tied[np.maximum(comp, 0)]
     return {"grid_step_median": round(med, 3), "grid_step_max": round(float(d.max()), 3),
             "n_grid_spikes": int(spike.sum()), "grid_spike_rc": np.argwhere(spike.reshape(has_point.shape))}
@@ -632,7 +639,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     for src in a.surface:
         name = surface_name(src)
         n_no_normal = 0
-        grid: dict[str, Any] = {}
+        grid: dict[str, Any] = {k: float("nan") for k in GRID_KEYS}  # obj input has no grid
         if is_tifxyz(src):
             P, N, patch, n_vert, n_no_normal, grid = sample_tifxyz(src, a.samples, rng)
             if n_no_normal:
@@ -642,7 +649,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"{name}: {grid['n_grid_holes']} interior holes in the grid "
                       f"({grid['grid_hole_points']} points)", file=sys.stderr)
             if grid["n_grid_spikes"]:
-                print(f"{name}: {grid['n_grid_spikes']} grid points are more than 4x the median step from a "
+                print(f"{name}: {grid['n_grid_spikes']} grid points are more than {GRID_SPIKE_FACTOR:g}x the median step from a "
                       f"neighbour (max {grid['grid_step_max']} voxels, median {grid['grid_step_median']})",
                       file=sys.stderr)
                 with open(os.path.join(a.out, f"{name}.grid_spikes.csv"), "w", newline="") as f:

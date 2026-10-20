@@ -235,6 +235,62 @@ def test_grid_spikes_at_hole_edges_are_counted_and_located(tmp_path, ct):
     assert [r for r in csv.DictReader(open(out / "seg.grid_spikes.csv"))][0] == {"row": "9", "col": "10"}
 
 
+def test_grid_spike_rule_edge_cases():
+    """The rule must not fire on things that are not spikes (an untied island, a fold
+    joined by long steps, duplicate vertices) and must count a whole spike run."""
+    yy, xx = np.meshgrid(np.linspace(16, 48, 24), np.linspace(16, 48, 24))
+    x, y, z = xx.astype(np.float32), yy.astype(np.float32), np.full(xx.shape, 32.0, np.float32)
+    has = np.ones(x.shape, bool)
+    # a 2x2 run of spikes counts 4 and locates all of them
+    z2 = z.copy()
+    z2[5:7, 5:7] += 400.0
+    r = spa.grid_step_check(x, y, z2, has)
+    assert r["n_grid_spikes"] == 4 and sorted(r["grid_spike_rc"].tolist()) == [[5, 5], [5, 6], [6, 5], [6, 6]]
+    # an island separated from the surface by invalid points is not tied, so not a spike
+    has_i = has.copy()
+    has_i[8, :] = False
+    z_i = z.copy()
+    z_i[:8] += 400.0
+    assert spa.grid_step_check(x, y, z_i, has_i)["n_grid_spikes"] == 0
+    # a fold: the whole top half displaced is a large group, not a spike
+    z_f = z.copy()
+    z_f[:12] += 400.0
+    assert spa.grid_step_check(x, y, z_f, has)["n_grid_spikes"] == 0
+    # duplicate vertices: most steps zero, the rule stays quiet instead of flagging everything
+    x_d, y_d = x.copy(), y.copy()
+    x_d[1:, :] = x_d[:1, :]  # xx varies along axis 0 here, yy along axis 1
+    y_d[:, 1:] = y_d[:, :1]
+    r = spa.grid_step_check(x_d, y_d, z, has)
+    assert r["n_grid_spikes"] == 0 and r["grid_step_median"] == 0.0
+    # degenerate grids do not crash
+    for h in (np.zeros((3, 3), bool), np.ones((1, 1), bool)):
+        sub = (slice(0, h.shape[0]), slice(0, h.shape[1]))
+        assert spa.grid_step_check(x[sub], y[sub], z[sub], h)["n_grid_spikes"] == 0
+        assert spa.grid_hole_check(h)["n_grid_holes"] == 0
+
+
+def test_grid_hole_check_is_four_connected():
+    """Two interior invalid points touching only at a corner are two holes, not one."""
+    has = np.ones((12, 12), bool)
+    has[4, 4] = False
+    has[5, 5] = False
+    assert spa.grid_hole_check(has) == {"n_grid_holes": 2, "grid_hole_points": 2}
+
+
+def test_obj_input_carries_nan_grid_metrics(tmp_path, ct):
+    """An obj surface has no grid; the grid metrics must still exist (NaN) so that
+    --fail-on on them does not crash and aggregate.csv keeps the columns whichever
+    input comes first."""
+    pts = grid_points(30.0)
+    obj = tmp_path / "s.obj"
+    write_obj(obj, pts, np.tile([0, 0, 1.0], (len(pts), 1)))
+    rc, out, rows = run(tmp_path, ct, [str(obj), "--fail-on", "n_grid_spikes=0"])
+    assert rc == 2  # NaN fails the gate like any unmeasured metric
+    j = json.load(open(out / "s.json"))
+    assert all(j[k] != j[k] for k in spa.GRID_KEYS)  # NaN
+    assert "n_grid_spikes" in rows[0]
+
+
 def test_interior_grid_holes_are_counted_but_border_notches_are_not():
     """Only holes enclosed by valid points count (villa PR #2128's punched flattenings);
     a notch in the grid edge is the trace ending, not a defect."""
