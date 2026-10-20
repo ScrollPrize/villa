@@ -166,7 +166,7 @@ schedulers. Decoded payloads remain ordinary heap-owned byte vectors; they are
 not memory mapped. Sources report decoded usage and expose LRU eviction
 callbacks to the aggregate budget, but do not apply independent byte ceilings.
 
-Source-read concurrency is global to a service. The service constructor fixes
+Remote-download concurrency is global to a service. The service constructor fixes
 the physical worker capacity and initial fixed/adaptive admission policy.
 `acquireSource()` accepts only source-local metadata and persistent-cache
 options, so acquiring or reacquiring a source cannot change concurrency.
@@ -235,9 +235,10 @@ reopens the source nor refetches resident chunks. Cache retention is
 capacity-bound, not guaranteed. Explicit volume invalidation clears only that
 source and rejects stale fetch completion.
 No switch-time cancellation of already-running fetch/decode work is
-implemented. Interactive ownership comes only from explicit versioned per-view
-demand snapshots; pending work without current interactive or background
-ownership is canceled, while already-running work may drain.
+implemented. GUI ownership comes from explicit versioned per-view demand
+snapshots. Foreground computations have independent ownership; pending work
+without GUI, foreground, or background ownership is canceled, while
+already-running work may drain.
 
 Interactive VC3D renders publish versioned per-view demand before normal
 sampling starts. A sparse, stratified viewport probe associates missing chunks
@@ -273,17 +274,35 @@ Fallback bounds use the same declared scale; they never estimate scale from
 generated coordinates or cache contents. `QuadSurface::scale()` only maps its
 point grid to base-voxel surface coordinates and is not a second LOD.
 
-GUI and non-GUI callers use separate pending lanes in three shared scheduler
-stages:
+GUI rendering, view-independent foreground computation, ordinary background
+work, and maintenance use separate pending lanes in the shared scheduler stages:
 
 1. A 32-worker local probe stage classifies persistent data objects, persistent
    empty markers, and cache misses using filesystem metadata only.
-2. A source-read stage performs remote downloads, or direct source reads when
-   no persistent cache is configured. Its physical capacity and initial
-   admission policy are service construction options; only
-   `ChunkCacheService::configureFetchConcurrency()` changes admission later.
+2. Source reads have two independent queues and worker pools. Local encoded
+   source reads use 16 workers by default (`Options::localReadWorkers`, fixed
+   at service creation). Remote sources use the existing adaptive/manual
+   download pool; `ChunkCacheService::configureFetchConcurrency()` changes only
+   its admission. Network requests cannot occupy local source-read slots.
+   Classification comes from the fetcher/store, including remote Lasagna stores
+   which can also serve persistent disk hits, not from whether telemetry exists.
 3. An eight-worker CPU stage reads persistent object hits and decodes logical
    chunks from persistent or newly downloaded object bytes.
+
+Lasagna corner sampling used by fiber prediction/normal tracing and line solves
+requests foreground computation priority through `ChunkRequestContext::foreground`.
+Blocking corner sampling carries that context through dependency prefetch and
+blocking reads (including retries). At every stage, GUI and foreground work
+alternate when both are pending; GUI level/view/distance ordering remains intact
+within its lane. After seven interactive selections, an ordinary background task
+gets a turn if pending. Maintenance remains last. A chunk required by a solve
+survives view-demand replacement/closure without a fake view ID. Shared chunks
+and shard objects remain deduplicated, including mixed GUI/solve consumers.
+
+The local pool reads encoded bytes; production Zarr decompression remains in the
+eight-worker decode pool. Custom fetchers using the legacy combined `fetch()`
+interface may still decode inside their source call. None of these settings
+creates another cache or changes stored values.
 
 The local probe never reads or decodes payloads. Consequently it can classify
 the visible working set quickly, send known misses to the network, and send
