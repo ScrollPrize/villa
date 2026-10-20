@@ -2,7 +2,8 @@
 from vc_reader.reader import S3Credentials, load_basic_auth, open_zarr
 
 
-def open_volume(path, level=None, auth=None, s3_storage_options=None):
+def open_volume(path, level=None, auth=None, s3_storage_options=None, *, cache_dir=None):
+    """Read remote chunks through cache_dir/<scheme>/<bucket>/<path>/<level>."""
     credentials = None
     if str(path).startswith("s3://"):
         options = dict(s3_storage_options or {})
@@ -12,4 +13,7 @@ def open_volume(path, level=None, auth=None, s3_storage_options=None):
             credentials = "aws"
     elif str(path).startswith(("http://", "https://")) and auth:
         credentials = load_basic_auth(auth)
-    return open_zarr(str(path), level=level, auth=credentials, threads=1, memory_cache=0)
+    return open_zarr(
+        str(path), level=level, auth=credentials, threads=1, memory_cache=0,
+        cache_dir=cache_dir,
+    )

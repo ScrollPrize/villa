@@ -11,7 +11,7 @@ from torch.nn.init import trunc_normal_
 from torch.nn.utils.parametrizations import weight_norm
 from torch.utils.checkpoint import checkpoint
 
-from dinovol_2.training.checkpoint import method_state
+from dinovol_2.training.checkpoint import backbone_state, method_state
 from dinovol_2.ops.point_embeddings import sample_grid_points, sample_selected_grid_points
 from dinovol_2.model.backbone import (
     build_backbone, materialize_backbone_config as _materialize_backbone_config,
@@ -319,12 +319,17 @@ class DinoVitStudentTeacher(nn.Module):
         self.teacher = nn.ModuleDict(teacher_modules)
 
         pretrained_weights = self.config.get("pretrained_weights")
+        pretrained_cnn_weights = self.config.get("pretrained_cnn_weights")
+        if pretrained_weights and pretrained_cnn_weights:
+            raise ValueError("Configure only one of pretrained_weights and pretrained_cnn_weights")
         if pretrained_weights:
             self.load_pretrained_weights(
                 pretrained_weights,
                 backbone_only=bool(self.config.get("pretrained_backbone_only", True)),
                 unchunk=bool(self.config.get("pretrained_unchunk", False)),
             )
+        elif pretrained_cnn_weights:
+            self.load_pretrained_cnn_weights(pretrained_cnn_weights)
 
         self.synchronize_teacher_from_student()
         self._freeze_teacher()
@@ -444,6 +449,40 @@ class DinoVitStudentTeacher(nn.Module):
             params_groups.append(group)
 
         return _fuse_params_groups(params_groups)
+
+    def load_pretrained_cnn_weights(self, checkpoint_path: str) -> None:
+        """Initialize the deeper CNN stem/stages, keeping the final projection random.
+
+        Strides can differ without changing convolution weight shapes. Require
+        every stem/stage tensor to match, rather than silently loading a subset.
+        The normal constructor synchronization initializes the EMA teacher too.
+        """
+        if self.student.backbone.embedding_type != "deeper":
+            raise ValueError("pretrained_cnn_weights requires embedding_type='deeper'")
+        # Full training checkpoints also contain NumPy RNG state. As with the
+        # other pretrained loaders, only load trusted checkpoint files.
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        source, _ = backbone_state(checkpoint)
+        prefixes = ("down_projection.stem.", "down_projection.stages.")
+        source = {key: value for key, value in source.items() if key.startswith(prefixes)}
+        target = {key: value for key, value in self.student.backbone.state_dict().items()
+                  if key.startswith(prefixes)}
+        missing = sorted(target.keys() - source.keys())
+        unexpected = sorted(source.keys() - target.keys())
+        mismatched = sorted(key for key in target.keys() & source.keys()
+                            if target[key].shape != source[key].shape)
+        if not target or missing or unexpected or mismatched:
+            raise RuntimeError(
+                "Incompatible pretrained CNN stem/stages: "
+                f"missing={missing}, unexpected={unexpected}, shape_mismatches={mismatched}"
+            )
+        # All components are validated before any live weights are overwritten.
+        for name in ("stem", "stages"):
+            prefix = f"down_projection.{name}."
+            getattr(self.student.backbone.down_projection, name).load_state_dict(
+                {key.removeprefix(prefix): value for key, value in source.items()
+                 if key.startswith(prefix)}, strict=True,
+            )
 
     def load_pretrained_weights(self, checkpoint_path: str, *, backbone_only: bool = True, unchunk: bool = False) -> None:
         if backbone_only:

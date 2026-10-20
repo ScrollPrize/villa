@@ -54,6 +54,33 @@ below also retain their legacy flat spelling for compatibility.
 
 ## Pretraining on 8–9 µm scroll volumes
 
+`dinovol_2/configs/pretrain_8_9um_heads32768.json` uses only volume data:
+surface/fiber predictions, metadata meshes, and auxiliary object losses are
+disabled. Its sampling mask is derived from the volume itself.
+This recipe uses a 384-wide backbone, two `16×384×384` global crops and four
+`16×128×128` local crops (Z, Y, X), with `16×8×8` patches: 2,304 global tokens
+and 256 local tokens. The CNN strides are `[2,1,1]`, then three `[2,2,2]`
+stages. The source sampling window is `24×576×576`; random resized crop scales
+remain unchanged. Its output directory identifies the new crop and patch sizes
+and CNN initialization. This recipe starts a fresh run (`resume` and
+`auto_resume` are false), initializing the CNN stem and stages from
+`/mnt/raid_nvme/dinovol_ckpts/teacher_615k.pt`. The final CNN projection,
+transformer, and heads start randomly initialized; optimizer and schedules
+start at step zero. Enable auto-resume when restarting this new run.
+A short RTX 5090 check of this architecture with random initialization at
+batch 12 with two accumulation
+microbatches measured 16.12 GiB peak allocated VRAM and 1.58 s mean per optimizer
+step (three measured steps after three warmups, BF16, compilation and
+checkpointing enabled). It used synthetic volume data passed through the crop
+pipeline, then GPU-resident batches for full teacher/student forward, backward,
+AdamW, and EMA. Timings exclude data loading, augmentation, monitoring, and
+compilation; this checks feasibility, not training quality or maximum batch size.
+`data.dataset.volume_cache_dir` is `/mnt/raid_nvme/volume_cache`; the reader
+appends `s3/vesuvius-challenge-open-data/<volume path>/<level>/`, reuses existing
+cached chunks, and fetches missing chunks into the same layout. Keep the S3
+volume URLs so partial caches can be filled. Remote metadata is still checked
+when opening a volume.
+
 [`dinovol_2/configs/pretrain_8_9um.json`](dinovol_2/configs/pretrain_8_9um.json)
 is a standalone pretraining config with 128³ global crops and 64³ local crops.
 Volumes use pyramid level 0 or 2 to target roughly 8–9 µm voxels, as listed below.
@@ -794,6 +821,14 @@ outputs are unchanged at the resume step, and they then train (without weight
 decay); optimizer state of all existing parameters is kept, matched by name.
 Other switches between mixed and axial RoPE are architecture changes, not exact
 checkpoint conversions.
+
+For CNN-only initialization, set `method.pretrained_cnn_weights` to a teacher
+export or training checkpoint. This requires `embedding_type: "deeper"` and
+loads only `down_projection.stem` and `down_projection.stages` from the preferred
+teacher backbone. All CNN keys and tensor shapes must match; strides may differ.
+The final projection, transformer, and heads retain their random initialization,
+then the complete student is copied into the frozen EMA teacher. This option is
+mutually exclusive with `pretrained_weights` and does not restore training state.
 
 ## Training monitor
 
