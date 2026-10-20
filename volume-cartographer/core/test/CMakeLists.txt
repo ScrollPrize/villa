@@ -288,6 +288,7 @@ vc_add_test(NAME test_fiber_trace3d
     LIBS doctest::doctest vc_fiber_tracer
     DEFS VC_TESTING)
 vc_add_test(NAME test_fiber_anchors LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_prediction_channels LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_replay_metric LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiberlet_storage LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiberlet_paths LIBS doctest::doctest vc_fiber_tracer DEFS VC_TESTING)
