@@ -257,8 +257,8 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     set(_lto -flto=thin)
     if(APPLE)
         set(_link "")
-        # ld64.lld (the LLVM Mach-O linker the macOS preset selects via
-        # -fuse-ld=lld) mishandles C++ exception unwind info for our large
+        # ld64.lld (the LLVM Mach-O linker, selected with -fuse-ld=lld; the
+        # macOS preset no longer passes it) mishandles C++ exception unwind info for our large
         # ThinLTO binaries: a `throw` that should be caught by an enclosing
         # handler instead unwinds past every handler into std::terminate
         # (SIGABRT). The failure is in how lld lays out the unwind tables —
@@ -277,8 +277,8 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         # error, so executables need the workaround too.
         #
         # -fuse-ld= with an empty value selects the driver default (Apple ld).
-        # A later -fuse-ld= (empty) on the link line overrides the preset's
-        # earlier -fuse-ld=lld; clang honors the last one. Applied via
+        # A later -fuse-ld= (empty) on the link line overrides an earlier
+        # -fuse-ld=lld passed in the linker flags; clang honors the last one. Applied via
         # add_link_options so it is idempotent across reconfigures.
         if(CMAKE_EXE_LINKER_FLAGS MATCHES "lld" OR CMAKE_SHARED_LINKER_FLAGS MATCHES "lld")
             add_link_options(-fuse-ld=)
