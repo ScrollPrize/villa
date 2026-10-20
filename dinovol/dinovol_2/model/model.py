@@ -19,7 +19,7 @@ from torch.nn.utils.parametrizations import weight_norm
 from torch.utils.checkpoint import checkpoint
 
 from dinovol_2.model.dinov2_eva import Eva, EvaWithChunking
-from dinovol_2.ops.point_embeddings import sample_grid_points
+from dinovol_2.ops.point_embeddings import sample_grid_points, sample_selected_grid_points
 from dinovol_2.model.rope import MixedRopePositionEmbedding, RopePositionEmbedding
 
 
@@ -836,15 +836,15 @@ class DinoVitStudentTeacher(nn.Module):
         masked_patch_features: bool,
         masked_source_tokens: Optional[torch.Tensor] = None,
     ) -> dict[str, Mapping[str, torch.Tensor] | torch.Tensor]:
-        """masked_source_tokens: tokens to select the masked ones from, if not the patch tokens."""
+        """masked_source_tokens: already selected cross-view teacher tokens, when supplied."""
         global_outputs = dict(global_outputs)
         cls_projections = self.project_cls_tokens(branch, global_outputs["cls_tokens"])
         outputs: dict[str, Mapping[str, torch.Tensor] | torch.Tensor] = {
             "global": global_outputs,
             "global_cls_projections": cls_projections,
         }
-        masked_tokens = self.select_masked_patch_tokens(
-            global_outputs["patch_tokens"] if masked_source_tokens is None else masked_source_tokens,
+        masked_tokens = masked_source_tokens if masked_source_tokens is not None else self.select_masked_patch_tokens(
+            global_outputs["patch_tokens"],
             mask_indices_list=mask_indices_list,
             n_masked_patches=n_masked_patches,
         )
@@ -921,10 +921,13 @@ class DinoVitStudentTeacher(nn.Module):
         coordinates: torch.Tensor,
         rows: torch.Tensor,
         input_shape: Tuple[int, ...],
+        mask_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Patch tokens of view rows[r] interpolated at coordinates[r] (input voxels), [rows, P, C]."""
+        """Interpolate teacher tokens; optionally return only selected flat rows [M,C]."""
         token_shape = tuple(size // patch for size, patch in zip(input_shape, branch.backbone.patch_size))
         token_grid = patch_tokens.reshape(patch_tokens.shape[0], *token_shape, patch_tokens.shape[-1])
+        if mask_indices is not None:
+            return sample_selected_grid_points(token_grid, coordinates.float(), input_shape, mask_indices, rows)
         # Coordinates outside the view (tokens without a counterpart, left out of the
         # loss by the trainer) are clamped to the border by the sampler.
         return sample_grid_points(token_grid[rows], coordinates.float(), input_shape).to(patch_tokens.dtype)
@@ -1000,6 +1003,7 @@ class DinoVitStudentTeacher(nn.Module):
                         target_tokens = self._cross_view_tokens(
                             self.teacher, teacher_outputs["patch_tokens"], teacher_target_coordinates,
                             teacher_target_rows, input_shape,
+                            mask_indices_list[:n_masked_patches] if n_masked_patches is not None else mask_indices_list,
                         )
                     teacher_result = self._structured_global_outputs(
                         self.teacher,

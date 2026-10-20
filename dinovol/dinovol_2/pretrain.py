@@ -258,6 +258,7 @@ class DinoIBOTPretrainer:
         self.ibot_patch_loss = iBOTPatchLoss(
             ibot_out_dim,
             masked_loss_chunk_size=masked_loss_chunk_size,
+            kernel_backend=str(self.config.get("ibot_kernel_backend", "torch")),
         ).to(self.device)
         self.koleo_loss = KoLeoLoss(
             distributed=bool(self.config.get("koleo_distributed", True)),

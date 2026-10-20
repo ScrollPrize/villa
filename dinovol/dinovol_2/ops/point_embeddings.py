@@ -131,6 +131,12 @@ def sample_grid_points(
     backward pass scatters into a single grid-sized gradient.
     """
     batch, points = coordinates_zyx.shape[:2]
+    rows = torch.arange(batch, device=grid.device)[:, None].expand(batch, points)
+    return _sample_grid_points_at_rows(grid, coordinates_zyx, input_shape, rows)
+
+
+def _sample_grid_points_at_rows(grid, coordinates_zyx, input_shape, rows):
+    """Shared differentiable sampler for batched or flattened point coordinates."""
     grid_shape = coordinates_zyx.new_tensor(tuple(float(size) for size in grid.shape[1:4]))
     scale = grid_shape / coordinates_zyx.new_tensor(tuple(float(size) for size in input_shape))
     position = ((coordinates_zyx + 0.5) * scale - 0.5).clamp(min=0.0)
@@ -138,8 +144,28 @@ def sample_grid_points(
     lower = position.floor()
     fraction = position - lower
     offsets = coordinates_zyx.new_tensor(tuple(product((0.0, 1.0), repeat=3)))  # [8, 3]
-    index = torch.minimum(lower[:, :, None, :] + offsets, grid_shape - 1.0).long()  # [B, P, 8, 3]
-    weight = torch.where(offsets > 0, fraction[:, :, None, :], 1.0 - fraction[:, :, None, :]).prod(-1)
-    rows = torch.arange(batch, device=grid.device)[:, None, None].expand(batch, points, 8)
-    corners = grid[rows, index[..., 0], index[..., 1], index[..., 2]]  # [B, P, 8, C]
-    return (corners.float() * weight[..., None]).sum(2)
+    index = torch.minimum(lower[..., None, :] + offsets, grid_shape - 1.0).long()
+    weight = torch.where(offsets > 0, fraction[..., None, :], 1.0 - fraction[..., None, :]).prod(-1)
+    corners = grid[rows[..., None], index[..., 0], index[..., 1], index[..., 2]]
+    return (corners.float() * weight[..., None]).sum(-2)
+
+
+def sample_selected_grid_points(grid, coordinates_zyx, input_shape, indices, source_rows, *, use_triton=True):
+    """Sample only flattened selected coordinates, without copying source grids.
+
+    Returns [len(indices), C] in the grid dtype. The CUDA kernel is forward-only:
+    differentiable callers and platforms without Triton use the shared PyTorch sampler.
+    """
+    if grid.ndim != 5 or coordinates_zyx.ndim != 3 or coordinates_zyx.shape[-1] != 3:
+        raise ValueError("Expected a [B,D,H,W,C] grid and [rows,points,3] coordinates")
+    if indices.ndim != 1 or source_rows.shape != coordinates_zyx.shape[:1]:
+        raise ValueError("Expected flat indices and one source row per coordinate row")
+    needs_grad = torch.is_grad_enabled() and (grid.requires_grad or coordinates_zyx.requires_grad)
+    if (use_triton and grid.is_cuda and not needs_grad and coordinates_zyx.dtype == torch.float32
+            and grid.dtype in (torch.float16, torch.bfloat16, torch.float32)):
+        from dinovol_2.ops.selected_interpolation import available, sample_selected
+        if available():
+            return sample_selected(grid, coordinates_zyx, input_shape, indices, source_rows)
+    selected = coordinates_zyx.flatten(0, 1)[indices]
+    rows = source_rows[torch.div(indices, coordinates_zyx.shape[1], rounding_mode="floor")]
+    return _sample_grid_points_at_rows(grid, selected, input_shape, rows).to(grid.dtype)

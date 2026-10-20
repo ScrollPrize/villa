@@ -90,6 +90,16 @@ a config sets it:
   per-prototype scales `b` with targets `softmax(teacher_logits / T + log b)`, so
   three passes over recomputed teacher logits replace the stored matrices. The
   math is unchanged; only floating-point rounding differs.
+- `ibot_kernel_backend: "triton"` (optional, default `"torch"`): with
+  `ibot_fused_last_layer: true` and Sinkhorn centering, tile the projection and
+  Sinkhorn/soft-target-loss reductions without storing FP32 logit or target
+  matrices. Backward retains a row chunk of FP16/BF16 logit gradients for cuBLAS
+  feature/weight-gradient GEMMs. FP32 accumulation and the AMP logit rounding
+  boundary are retained; reduction order changes rounding. No prototype sampling,
+  gradient filtering, or precision reduction is used. CUDA devices with compute
+  capability 8+ and contiguous FP16/BF16 features use the kernel; other inputs and
+  installations without Triton use the existing PyTorch path. This setting does
+  not change checkpoint parameter names or shapes.
 - `model.deeper_embed_channels_last`: CNN activations and weights use the
   channels-last 3D layout, which cuDNN's tensor-core convolutions use natively.
   Weights are converted after initialization; checkpoints are layout-independent.
@@ -281,6 +291,83 @@ read from their 2.2–2.4 µm masked scans at scale 2 (8.9–9.6 µm), like PHer
 PHerc0332, PHerc1451, PHerc1299 and PHercParis4. PHercParis3 has no surface or fiber
 predictions in this format and trains without object labels. MANBp, 0343P and 0500P2
 are thinner than a source window and use `object_mask_min_inside: 0.5`.
+
+### Interpolation and iBOT kernel validation
+
+Cross-view teacher interpolation selects the valid masked coordinates before
+sampling. On CUDA with Triton it accumulates the eight neighbours directly into
+the output, avoiding copied source grids and `[points, 8, channels] intermediates.
+CPU, differentiable callers, and installations without Triton use the shared
+PyTorch sampler. Point supervision's differentiable sampler is unchanged.
+
+Run the kernel regressions in the existing environment:
+
+```bash
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  .venv/bin/python -m unittest tests.test_kernel_ops -v
+```
+
+The real-volume validator checks that every required cached Zarr chunk exists,
+reads four overlapping 192³ crops, applies the checkpoint's normalization, and
+encodes masked/unmasked views with its teacher weights. It compares interpolation,
+Sinkhorn scales, loss, and AMP-scaled feature/classifier gradients. The saved
+fixture allows both backends to benchmark identical real features without I/O or
+backbone time in the measurement. It is an operator validation, not a full
+training throughput or downstream-quality measurement.
+
+```bash
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  .venv/bin/python -m dinovol_2.validate_real_kernels \
+  --checkpoint /mnt/raid_nvme/dinovol_ckpts/teacher_585k.pt \
+  --volume /mnt/raid_nvme/volume_cache/s3/vesuvius-challenge-open-data/PHerc0125/volumes/20250821151825-9.362um-1.2m-113keV-masked.zarr/0 \
+  --start 10240 3840 3840 --features /tmp/dinovol-real-kernel-features.pt
+```
+
+Recheck that fixture with `--reuse --features /tmp/dinovol-real-kernel-features.pt`
+instead of the checkpoint/volume arguments. To benchmark, run each command below
+with both `--backend torch` and `--backend triton`, sequentially on an idle GPU:
+
+```bash
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  .venv/bin/python -m dinovol_2.bench_kernels interpolation \
+  --backend torch --dtype float32 --features /tmp/dinovol-real-kernel-features.pt \
+  --warmup 6 --iterations 20 --profile
+
+AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  .venv/bin/python -m dinovol_2.bench_kernels ibot \
+  --backend torch --compile --features /tmp/dinovol-real-kernel-features.pt \
+  --warmup 6 --iterations 20 --profile
+```
+
+`--compile` uses the existing `max-autotune-no-cudagraphs` iBOT kernels as the
+baseline; the Triton backend supplies its own kernels. Omitting `--features`
+benchmarks seeded synthetic inputs; `--rows`, `--dim`, `--prototypes`, and
+`--chunk-size` control the iBOT workload. No dependencies are installed by these
+commands. CUDA access is required for benchmarks and real-volume validation.
+
+Measured on an RTX 5090, PyTorch 2.10.0+cu128 / Triton 3.6.0, using the above real
+crops (origins ZYX: `(10240,3840,3840)`, `(10368,3968,3968)`,
+`(10272,3857,3863)`, `(10387,3997,3979)`), 6,007 selected rows, 131,072 prototypes,
+256-wide FP16 bottlenecks, and 4,096-row chunks. Timings are synchronized wall time
+after six warmups, over twenty iterations, excluding compilation and profiling.
+Interpolation uses FP32 token features; iBOT includes all three Sinkhorn
+iterations, loss forward, and backward.
+
+| Operation | Backend | Mean / median ms | Min–max ms | Peak allocated MiB |
+| --- | --- | --- | --- | --- |
+| Cross-view interpolation + selection | Original PyTorch | 3.192 / 3.004 | 2.988–3.699 | 1940.4 |
+| Cross-view interpolation + selection | Selected Triton | 0.036 / 0.034 | 0.032–0.052 | 113.7 |
+| iBOT including backward | Compiled PyTorch | 36.005 / 35.867 | 34.768–37.802 | 4378.1 |
+| iBOT including backward | Tiled Triton | 30.399 / 30.228 | 29.300–31.929 | 1490.1 |
+
+These peaks include the operator inputs and outputs, not the model or CUDA
+allocator reservation. The interpolation profile was dominated by indexing,
+weighted products, and reductions; tiled iBOT is dominated by projection/reduction
+kernels and gradient GEMMs. The real-data loss differed by at most `4.77e-7` across
+validation runs; gradient relative L2 differences were below `3.7e-5` and interpolation maximum
+absolute error was `9.54e-7`. This is floating-point agreement, not bitwise
+equivalence. Benchmark on the training GPU before enabling the optional iBOT
+backend, especially for different prototype counts or bottleneck widths.
 
 ### Local benchmark launcher
 

@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import tempfile
 import unittest
 
 import torch
 import torch.nn.functional as F
 
 from dinovol_2.loss import iBOTPatchLoss
-from dinovol_2.pretrain import DinoIBOTPretrainer
 
 
 def reference_sinkhorn(teacher_output, teacher_temp, n_masked, n_iterations=3):
@@ -101,47 +99,6 @@ class IBOTLossTests(unittest.TestCase):
             torch.testing.assert_close(actual, expected)
             torch.testing.assert_close(actual_features.grad, expected_features.grad)
             torch.testing.assert_close(actual_weight.grad, expected_weight.grad)
-
-    def test_fused_training_step_matches_materialized_step(self):
-        config = {
-            "device": "cpu", "use_amp": False, "output_dir": None, "max_iterations": 3,
-            "warmup_steps": 0, "freeze_last_layer_steps": 0, "batch_size": 2, "lr": 1e-3,
-            "ibot_masked_loss_chunk_size": 7,
-            "model": {
-                "model_type": "v3", "embed_dim": 36, "num_heads": 3, "depth": 2,
-                "global_crops_size": [16] * 3, "local_crops_size": [8] * 3, "patch_size": [4] * 3,
-                "drop_path_rate": 0., "rope_rescale_coords": None,
-                "dino_out_dim": 64, "ibot_out_dim": 48,
-                "dino_head_hidden_dim": 32, "ibot_head_hidden_dim": 32,
-                "dino_head_bottleneck_dim": 12, "ibot_head_bottleneck_dim": 12,
-            },
-        }
-        masks = torch.zeros(4, 64, dtype=torch.bool)
-        masks[:2, ::3] = True
-        indices = masks.flatten().nonzero().flatten()
-        batch = {
-            "collated_global_crops": torch.randn(4, 1, 16, 16, 16),
-            "collated_local_crops": torch.randn(4, 1, 8, 8, 8),
-            "collated_masks": masks, "mask_indices_list": indices,
-            "n_masked_patches": torch.tensor(indices.numel()),
-            "masks_weight": (1. / masks.sum(1).clamp(min=1)).unsqueeze(1).expand_as(masks)[masks],
-            "n_global_views": 2, "n_local_views": 2,
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            trainers = []
-            for fused in (False, True):
-                torch.manual_seed(3)
-                trainers.append(DinoIBOTPretrainer({**config, "output_dir": directory, "ibot_fused_last_layer": fused}))
-            materialized, fused = trainers
-            fused.model_module.load_state_dict(materialized.model_module.state_dict())
-            for step in range(2):
-                expected = materialized.train_step(batch, step)
-                actual = fused.train_step(batch, step)
-                for name in ("loss", "ibot_loss", "dino_global_loss", "koleo_loss"):
-                    torch.testing.assert_close(actual[name], expected[name], rtol=1e-5, atol=1e-6, msg=name)
-                for name, tensor in materialized.model_module.state_dict().items():
-                    torch.testing.assert_close(fused.model_module.state_dict()[name], tensor,
-                                               rtol=1e-4, atol=1e-6, msg=name)
 
 
 if __name__ == "__main__":

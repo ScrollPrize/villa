@@ -148,6 +148,7 @@ class iBOTPatchLoss(nn.Module):
         student_temp=0.1,
         center_momentum=0.9,
         masked_loss_chunk_size: int | None = None,
+        kernel_backend: str = "torch",
     ):
         super().__init__()
         if masked_loss_chunk_size is not None and masked_loss_chunk_size <= 0:
@@ -155,6 +156,9 @@ class iBOTPatchLoss(nn.Module):
         self.student_temp = student_temp
         self.center_momentum = center_momentum
         self.masked_loss_chunk_size = masked_loss_chunk_size
+        if kernel_backend not in ("torch", "triton"):
+            raise ValueError("iBOT kernel_backend must be 'torch' or 'triton'")
+        self.kernel_backend = kernel_backend
         self._log_likelihood_fn = _soft_target_log_likelihood
         self._log_likelihood_grad_fn = _soft_target_log_likelihood_grad
         self._fused_kernels = dict(_FUSED_KERNELS)
@@ -258,6 +262,10 @@ class iBOTPatchLoss(nn.Module):
                                         n_masked_patches_tensor, n_iterations=3):
         """Log prototype scales b such that softmax(z_t W_t^T / T + log b) equals the
         Sinkhorn-Knopp targets of sinkhorn_knopp_teacher on the teacher logits."""
+        if self._use_triton(teacher_features, teacher_weight):
+            from .ibot_triton import prototype_scales
+            return prototype_scales(teacher_features, teacher_weight, teacher_temp,
+                                    n_masked_patches_tensor, n_iterations)
         chunk_size = self.masked_loss_chunk_size or max(1, teacher_features.shape[0])
         n_samples = n_masked_patches_tensor.to(device=teacher_features.device, dtype=torch.float32)
         if dist.is_initialized():
@@ -307,11 +315,25 @@ class iBOTPatchLoss(nn.Module):
         dtype under mixed precision), matching what the head's last linear layer would use.
         """
         chunk_size = self.masked_loss_chunk_size or max(1, student_features.shape[0])
+        if (self._use_triton(student_features, student_weight)
+                and self._use_triton(teacher_features, teacher_weight)):
+            from .ibot_triton import ProjectionLogLikelihood
+            loss = ProjectionLogLikelihood.apply(
+                student_features, student_weight, teacher_features, teacher_weight, log_prototype_scales,
+                self.student_temp, teacher_temp, chunk_size,
+            )
+            return -(loss * masks_weight).sum() / student_masks_flat.shape[0]
         loss = _FusedProjectionLogLikelihood.apply(
             student_features, student_weight, teacher_features, teacher_weight, log_prototype_scales,
             self.student_temp, teacher_temp, chunk_size, self._fused_kernels,
         )
         return -(loss * masks_weight).sum() / student_masks_flat.shape[0]
+
+    def _use_triton(self, features, weight):
+        if self.kernel_backend != "triton" or not features.is_cuda:
+            return False
+        from .ibot_triton import supported
+        return supported(features, weight)
 
     def compile_kernels(self, **options) -> None:
         """Compile the per-chunk masked-loss kernels into fused reductions."""
