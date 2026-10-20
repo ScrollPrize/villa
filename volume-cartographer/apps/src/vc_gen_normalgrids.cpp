@@ -460,6 +460,7 @@ static void print_usage() {
               << "  --sparse-volume     Process every N-th slice, 1 = all (default: 1)\n"
               << "  --chunk-budget-mib  Max chunk batch budget per direction (default: 512)\n"
               << "  --io-threads        OMP team size for the chunk-read loop, 0 = OMP default (default: 0)\n"
+              << "  --threshold         Voxels >= this uint8 value are surface; 1 = any non-zero voxel (default: 1)\n"
               << "  --preview-every     Write preview image every N written slices, 0 disables (default: 100)\n"
               << "  --verify-grid-save  Verify GridStore save by reloading each file (default: false)\n"
               << "  --debug-per-slice   Emit a stdout log line for every slice (existing/empty/written) (default: false)\n"
@@ -537,6 +538,7 @@ int main(int argc, char* argv[]) {
             ("sparse-volume", po::value<int>()->default_value(1), "Process every N-th slice (1 = all slices)")
             ("chunk-budget-mib", po::value<size_t>()->default_value(512), "Maximum chunk batch budget in MiB")
             ("io-threads", po::value<int>()->default_value(0), "OMP team size for the chunk-read loop (0 = OMP default; raise above core count when IO-bound)")
+            ("threshold", po::value<int>()->default_value(1), "Voxels >= this uint8 value count as surface (1 = any non-zero voxel, the default; e.g. 51 = p >= 0.2 on an 8-bit probability map)")
             ("preview-every", po::value<int>()->default_value(100), "Write preview image every N written slices, 0 disables")
             ("verify-grid-save", po::bool_switch()->default_value(false), "Verify GridStore files by reloading after save")
             ("debug-per-slice", po::bool_switch()->default_value(false), "Emit a stdout log line for every slice processed (existing/empty_binary/empty_trace/written)")
@@ -1109,6 +1111,10 @@ void run_generate(const po::variables_map& vm) {
     if (io_threads < 0) {
         throw std::runtime_error("--io-threads must be >= 0");
     }
+    const int threshold = vm["threshold"].as<int>();
+    if (threshold < 1 || threshold > 255) {
+        throw std::runtime_error("--threshold must be in [1, 255]");
+    }
     const int preview_every = vm["preview-every"].as<int>();
     if (preview_every < 0) {
         throw std::runtime_error("--preview-every must be >= 0");
@@ -1290,6 +1296,9 @@ void run_generate(const po::variables_map& vm) {
         metadata["input-level"] = input_level;
         metadata["chunk-budget-mib"] = chunk_budget_mib;
         metadata["io-threads"] = io_threads;
+        if (threshold != 1) {
+            metadata["threshold"] = threshold;
+        }
         metadata["preview-every"] = preview_every;
         metadata["verify-grid-save"] = verify_grid_save;
         metadata["debug-per-slice"] = debug_per_slice;
@@ -1550,7 +1559,8 @@ void run_generate(const po::variables_map& vm) {
                         volume_shape_i,
                         source_chunk_shape_i,
                         std::span<vc::core::util::BinarySliceTarget>(targets),
-                        io_threads);
+                        io_threads,
+                        static_cast<uint8_t>(threshold));
                     const double read_seconds = seconds_since(read_start);
                     record_timing(dir_metrics, "read_chunk", read_seconds);
 

@@ -261,3 +261,138 @@ TEST_CASE("XZ direction also produces some non-empty slices on PHerc 0172 L5")
     CHECK(ts[0].anyNonZero);
     fs::remove_all(d);
 }
+
+// --threshold (vc_gen_normalgrids): a cut above 1 on the same staged scan.
+// The expected slices come from a separate per-chunk read (readChunkOrFill),
+// not from fillBinarySliceBatchFromVolume, clipped to the volume extent.
+#include <map>
+#include <optional>
+
+namespace {
+
+using ChunkKey = std::array<size_t, 3>;
+
+struct ThrRun {
+    std::vector<cv::Mat> slices;
+    std::vector<bool> any;
+};
+
+ThrRun runFill(Volume& v, NormalGridSliceDirection dir, int sliceChunk,
+               const std::vector<int>& locals, int threshold)
+{
+    // threshold < 0: call without the threshold argument (the old call).
+    const std::array<int, 3> shape{kSliceCount, kHeight, kWidth};
+    const std::array<int, 3> chunks{kChunk, kChunk, kChunk};
+    const auto size = normalGridSliceSize(
+        {size_t(kSliceCount), size_t(kHeight), size_t(kWidth)}, dir);
+    ThrRun r;
+    r.slices.resize(locals.size());
+    std::vector<BinarySliceTarget> targets(locals.size());
+    for (size_t i = 0; i < locals.size(); ++i) {
+        r.slices[i] = cv::Mat::zeros(size, CV_8UC1);
+        targets[i].binarySlice = &r.slices[i];
+        targets[i].localSliceIndex = locals[i];
+    }
+    if (threshold < 0) {
+        fillBinarySliceBatchFromVolume(
+            v, 0, dir, sliceChunk, shape, chunks,
+            std::span<BinarySliceTarget>(targets), 1);
+    } else {
+        fillBinarySliceBatchFromVolume(
+            v, 0, dir, sliceChunk, shape, chunks,
+            std::span<BinarySliceTarget>(targets), 1,
+            static_cast<uint8_t>(threshold));
+    }
+    for (auto& t : targets) r.any.push_back(t.anyNonZero);
+    return r;
+}
+
+cv::Mat expectedSlice(Volume& v, std::map<ChunkKey, std::vector<std::byte>>& cache,
+                      NormalGridSliceDirection dir, int sliceChunk, int local,
+                      int threshold)
+{
+    const auto size = normalGridSliceSize(
+        {size_t(kSliceCount), size_t(kHeight), size_t(kWidth)}, dir);
+    cv::Mat out = cv::Mat::zeros(size, CV_8UC1);
+    const int s = sliceChunk * kChunk + local;
+    for (int r = 0; r < out.rows; ++r) {
+        for (int c = 0; c < out.cols; ++c) {
+            int z = 0, y = 0, x = 0;
+            if (dir == NormalGridSliceDirection::XY) { z = s; y = r; x = c; }
+            else if (dir == NormalGridSliceDirection::XZ) { z = r; y = s; x = c; }
+            else { z = r; y = c; x = s; }
+            if (z >= kSliceCount || y >= kHeight || x >= kWidth) continue;
+            const ChunkKey key{size_t(z / kChunk), size_t(y / kChunk), size_t(x / kChunk)};
+            auto it = cache.find(key);
+            if (it == cache.end()) it = cache.emplace(key, v.readChunkOrFill(0, key)).first;
+            const size_t off = (size_t(z % kChunk) * kChunk + size_t(y % kChunk)) * kChunk + size_t(x % kChunk);
+            const auto val = std::to_integer<uint8_t>(it->second.at(off));
+            out.ptr<uint8_t>(r)[c] = val >= threshold ? 255 : 0;
+        }
+    }
+    return out;
+}
+
+int differingPixels(const cv::Mat& a, const cv::Mat& b)
+{
+    cv::Mat d;
+    cv::compare(a, b, d, cv::CMP_NE);
+    return cv::countNonZero(d);
+}
+
+} // namespace
+
+TEST_CASE("threshold above 1 keeps exactly the voxels >= threshold on PHerc 0172 L5")
+{
+    auto d = tmpDir("pherc172_l5_thr");
+    auto staged = stagePHerc172Level5(d);
+    if (staged.empty()) { fs::remove_all(d); return; }
+
+    std::shared_ptr<Volume> v;
+    try {
+        v = Volume::New(staged);
+    } catch (const std::exception& e) {
+        if (requireNetwork()) FAIL("Volume::New on staged dir: " << e.what());
+        fs::remove_all(d);
+        return;
+    }
+    REQUIRE(v);
+    std::map<ChunkKey, std::vector<std::byte>> cache;
+
+    struct Case { NormalGridSliceDirection dir; int sliceChunk; };
+    // XY: z 256..383 (chunk 2); XZ: y 128..209 (chunk 1, clipped at 210).
+    for (const Case cs : {Case{NormalGridSliceDirection::XY, 2},
+                          Case{NormalGridSliceDirection::XZ, 1}}) {
+        const std::vector<int> locals{0, 16, 40, 64};
+        const auto noArg = runFill(*v, cs.dir, cs.sliceChunk, locals, -1);
+        const auto one = runFill(*v, cs.dir, cs.sliceChunk, locals, 1);
+        int cutDiffers = 0;
+        for (size_t i = 0; i < locals.size(); ++i) {
+            // (a) threshold 1 = the old call, pixel for pixel, and = voxel != 0.
+            CHECK(differingPixels(one.slices[i], noArg.slices[i]) == 0);
+            CHECK(one.any[i] == noArg.any[i]);
+            CHECK(differingPixels(one.slices[i],
+                expectedSlice(*v, cache, cs.dir, cs.sliceChunk, locals[i], 1)) == 0);
+        }
+        for (const int thr : {51, 128}) {
+            const auto cut = runFill(*v, cs.dir, cs.sliceChunk, locals, thr);
+            for (size_t i = 0; i < locals.size(); ++i) {
+                // (b) threshold N = 255 * (voxel >= N), from the separate read.
+                const cv::Mat want = expectedSlice(*v, cache, cs.dir, cs.sliceChunk, locals[i], thr);
+                CHECK(differingPixels(cut.slices[i], want) == 0);
+                CHECK(cut.any[i] == (cv::countNonZero(want) > 0));
+                cutDiffers += differingPixels(cut.slices[i], one.slices[i]);
+            }
+        }
+        // (c) the cut changes the slices (the test is not trivially equal).
+        CHECK(cutDiffers > 0);
+        MESSAGE("direction " << static_cast<int>(cs.dir) << ": " << cutDiffers
+                << " pixels differ between threshold 1 and the cuts");
+    }
+
+    // (d) threshold 0 is refused (with a non-empty target list).
+    CHECK_THROWS_AS(runFill(*v, NormalGridSliceDirection::XY, 2, {0}, 0),
+                    std::runtime_error);
+
+    fs::remove_all(d);
+}

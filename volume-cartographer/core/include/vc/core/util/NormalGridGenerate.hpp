@@ -180,7 +180,8 @@ inline void distributeChunk(
     int rowOffset, int colOffset,
     std::span<const int> sliceForLocal,             // size = sourceSliceAxisLen, -1 for none
     std::span<BinarySliceTarget> targets,
-    std::span<std::atomic<uint8_t>> anyFlags)
+    std::span<std::atomic<uint8_t>> anyFlags,
+    uint8_t threshold)
 {
     const int H = chunkShape[1];
     const int W = chunkShape[2];
@@ -202,10 +203,10 @@ inline void distributeChunk(
                 }
                 const int slot = sliceForLocal[local];
                 if (slot < 0) continue;
-                const uint8_t v = row[lx];
+                const bool on = row[lx] >= threshold;
                 targets[slot].binarySlice->ptr<uint8_t>(dr)[dc] =
-                    v ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
-                if (v) {
+                    on ? static_cast<uint8_t>(255) : static_cast<uint8_t>(0);
+                if (on) {
                     anyFlags[slot].store(1, std::memory_order_relaxed);
                 }
             }
@@ -220,7 +221,9 @@ inline void distributeChunk(
 // AllFill), and distribute voxels into the caller-provided binary slice
 // batch. Each target's cv::Mat is pre-allocated zero CV_8U at the slice
 // extent given by normalGridSliceSize(volumeShape, direction); the helper
-// writes 255 where voxel != 0, 0 otherwise, and toggles anyNonZero.
+// writes 255 where voxel >= threshold, 0 otherwise, and toggles anyNonZero.
+// The default threshold 1 keeps "any non-zero voxel is surface"; pass a
+// higher value to binarize an 8-bit probability map (e.g. 51 for p >= 0.2).
 //
 // `ioThreads` overrides the OMP team size for the chunk-read loop. Pass 0
 // to keep the OMP default (omp_get_max_threads()). Useful as an IO-bound
@@ -237,10 +240,15 @@ inline void fillBinarySliceBatchFromVolume(
     const std::array<int, 3>& volumeShape,
     const std::array<int, 3>& sourceChunkShape,
     std::span<BinarySliceTarget> targets,
-    int ioThreads = 0)
+    int ioThreads = 0,
+    uint8_t threshold = 1)
 {
     if (targets.empty()) {
         return;
+    }
+    if (threshold == 0) {
+        throw std::runtime_error(
+            "fillBinarySliceBatchFromVolume: threshold must be >= 1");
     }
     if (volume.dtype() != vc::render::ChunkDtype::UInt8) {
         throw std::runtime_error(
@@ -340,7 +348,7 @@ inline void fillBinarySliceBatchFromVolume(
                         scratch.data(), sourceChunkShape, validD, validH, validW,
                         rowOffset, colOffset,
                         std::span<const int>(sliceForLocal), targets,
-                        std::span<std::atomic<uint8_t>>(anyFlags));
+                        std::span<std::atomic<uint8_t>>(anyFlags), threshold);
                     break;
                 case NormalGridSliceDirection::XZ:
                     validD = std::min(D, std::max(0, volZ - rowOffset));
@@ -350,7 +358,7 @@ inline void fillBinarySliceBatchFromVolume(
                         scratch.data(), sourceChunkShape, validD, validH, validW,
                         rowOffset, colOffset,
                         std::span<const int>(sliceForLocal), targets,
-                        std::span<std::atomic<uint8_t>>(anyFlags));
+                        std::span<std::atomic<uint8_t>>(anyFlags), threshold);
                     break;
                 case NormalGridSliceDirection::YZ:
                     validD = std::min(D, std::max(0, volZ - rowOffset));
@@ -360,7 +368,7 @@ inline void fillBinarySliceBatchFromVolume(
                         scratch.data(), sourceChunkShape, validD, validH, validW,
                         rowOffset, colOffset,
                         std::span<const int>(sliceForLocal), targets,
-                        std::span<std::atomic<uint8_t>>(anyFlags));
+                        std::span<std::atomic<uint8_t>>(anyFlags), threshold);
                     break;
                 }
             }
