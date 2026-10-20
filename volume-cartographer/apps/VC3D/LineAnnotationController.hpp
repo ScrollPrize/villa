@@ -1014,6 +1014,7 @@ private:
                                                              int activeStart = -1,
                                                              int activeEnd = -1) const;
     void loadFibersForCurrentPackage();
+    void saveLoadedFiberMetadata(StoredFiber& fiber);
     // Drop fibers that are the same fiber seen through several sources (or
     // identical geometry under another name); records link aliases so branch
     // links written against a dropped copy still resolve to the survivor.
@@ -1388,6 +1389,7 @@ private:
     // This covers those pre-publication continuations only; the loader is
     // not otherwise reentrant-safe.
     uint64_t _fiberLoadSequence = 0;
+    std::unordered_set<uint64_t> _pendingCoordinateShapeSaves;
     std::deque<FiberSaveJob> _pendingFiberSaveJobs;
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;

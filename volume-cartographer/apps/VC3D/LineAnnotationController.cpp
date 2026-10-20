@@ -13423,6 +13423,14 @@ void LineAnnotationController::invalidateScrollUmbilicus()
 
 void LineAnnotationController::onActiveVolumeChanged()
 {
+    // Package loading precedes volume selection. Finish only metadata writes
+    // deferred for lack of a coordinate frame, not withheld branch repairs.
+    if (_state && _state->currentVolume()) {
+        for (auto& fiber : _fibers) {
+            if (_pendingCoordinateShapeSaves.count(fiber.id))
+                saveLoadedFiberMetadata(fiber);
+        }
+    }
     // Deliberately conservative: any volume switch marks built views stale,
     // including a downsample-level switch of one scan, where the rebuild will
     // reproduce the same orientation. The alternative — proving the previous
@@ -14788,6 +14796,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
         }
     }
     _fibers.clear();
+    _pendingCoordinateShapeSaves.clear();
     // Geometry caches keyed by fiber id and validated by the fiber's save
     // generation: a reload can bring changed geometry under the same id and
     // generation (a file edited or replaced on disk), so they start over.
@@ -15085,19 +15094,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
     for (auto& fiber : loadedFibers) {
         addKnownFiberTags(fiber.tags);
         if (!deferHealWrites && fiber.needsSave && fiber.sourceRoot == primarySource) {
-            if (adjacentHealSaveIsStale(fiber)) {
-                fiber.needsSave = false;
-                continue;
-            }
-            try {
-                fiber.needsSave = false;
-                saveFiberNow(fiber);
-            } catch (const std::exception& ex) {
-                fiber.needsSave = true;
-                Logger()->warn("Could not update VC3D fiber metadata {}: {}",
-                               fiberPath(fiber).string(),
-                               ex.what());
-            }
+            saveLoadedFiberMetadata(fiber);
         }
     }
 
@@ -18767,6 +18764,31 @@ nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
         root.update(snapshot.coordinateIdentity);
     }
     return root;
+}
+
+void LineAnnotationController::saveLoadedFiberMetadata(StoredFiber& fiber)
+{
+    _pendingCoordinateShapeSaves.erase(fiber.id);
+    if (fiber.readOnly || !fiber.needsSave)
+        return;
+    if (adjacentHealSaveIsStale(fiber)) {
+        fiber.needsSave = false;
+        return;
+    }
+    try {
+        if (!fiber.coordinateBaseShapeZYX) {
+            fiber.coordinateBaseShapeZYX = resolveStoredFiberCoordinateBaseShape(fiber);
+            if (!fiber.coordinateBaseShapeZYX) {
+                _pendingCoordinateShapeSaves.insert(fiber.id);
+                return;
+            }
+        }
+        saveFiberNow(fiber);
+        fiber.needsSave = false;
+    } catch (const std::exception& ex) {
+        Logger()->warn("Could not update VC3D fiber metadata {}: {}",
+                       fiberPath(fiber).string(), ex.what());
+    }
 }
 
 void LineAnnotationController::saveFiberNow(StoredFiber& fiber) const

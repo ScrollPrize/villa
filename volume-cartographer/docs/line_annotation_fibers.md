@@ -13,6 +13,12 @@ recorded on save. Saving without a valid shape fails rather than omitting it.
 Once resolved, this shape is retained in the loaded fiber and its open sessions
 before saves are queued. Changing the active volume or inference dataset does
 not reinterpret previously resolved geometry.
+Package loading happens before volume activation. Load-time metadata writes
+(including assigning a missing UUID) that cannot yet resolve a coordinate shape
+are deferred until a volume becomes active. The already generated in-memory UUID
+is preserved during that wait; existing UUIDs are not replaced. Deferred writes
+are discarded on a fiber reload/package change, and this retry does not enable
+writes withheld for unresolved branch-link issues.
 
 Import and export preserve stored coordinates and `coordinate_base_shape_zyx`
 unchanged. There is no import/export scale control or API parameter; the shape
