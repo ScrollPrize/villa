@@ -1,5 +1,6 @@
 #include "elements/VolumeSelector.hpp"
 #include "VolumePathLabels.hpp"
+#include "VolumeComboTooltip.hpp"
 
 #include <QAbstractItemView>
 #include <QHBoxLayout>

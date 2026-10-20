@@ -1,4 +1,5 @@
 #include "CWindow.hpp"
+#include "VolumeComboTooltip.hpp"
 #include "FiberLengthDisplay.hpp"
 #include "VolumeDisplayNames.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
@@ -9482,13 +9483,15 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     bool preferredVolumeFound = false;
     const bool hasOpenDataSegments = packageHasOpenDataSegments(*_state->vpkg());
     const auto volumeIds = vc3d::orderedDisplayVolumeIds(*_state->vpkg());
+    const auto volumeSuffixes = vc3d::volumeDisplaySuffixes(*_state->vpkg());
     for (const auto& id : volumeIds) {
         try {
             auto vol = _state->vpkg()->volume(id);
             const QString idStr = QString::fromStdString(id);
             const QString nameStr = QString::fromStdString(vol->name());
             const QString label = vc3d::volumeDisplayLabel(*_state->vpkg(), id,
-                nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr));
+                nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr),
+                volumeSuffixes.value(idStr));
 
             orderedIds.push_back(idStr);
             volumeEntries.append({idStr, label});

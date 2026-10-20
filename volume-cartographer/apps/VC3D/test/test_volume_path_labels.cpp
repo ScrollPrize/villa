@@ -1,4 +1,5 @@
 #include "VolumePathLabels.hpp"
+#include "VolumeComboTooltip.hpp"
 #include "elements/VolumeSelector.hpp"
 #include <QtTest/QtTest>
 
