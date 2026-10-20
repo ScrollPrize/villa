@@ -262,7 +262,10 @@ policy, so a save from that pane cannot regress a goal; that pane starts no
 new solve of its own but is marked Unoptimized (save/close finalizes it) and
 owed a whole-line pass, and a solve already running there is superseded and
 re-dispatched. A landing that still owes queued work publishes as Unoptimized
-so the autosave never persists it and save/close finalizes it.
+so the autosave never persists it and save/close finalizes it; a solve that
+fails while the interior is not optimized owes a whole-line pass again for
+the next dispatch, and a goal change or tail refresh from such an interior
+solves the whole line rather than certifying provisional spans.
 
 A gap span is closed to placement: the click, the `/` and `0` keys and the
 current-position marker (cut views, strips, overview bar and the

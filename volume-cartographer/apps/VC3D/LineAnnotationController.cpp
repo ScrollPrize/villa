@@ -11790,8 +11790,16 @@ bool LineAnnotationController::applySegmentInterpolationGoals(
         }
         metadata->interpGoal = goal;
     }
+    // A dirty-span solve certifies the rest of the interior as it stands:
+    // only from an optimized interior with nothing owed. Otherwise (an
+    // incomplete landing whose successor failed, provisional spans, queued
+    // work) the goal change solves the whole line.
+    const bool interiorOptimized =
+        session.optimizationState == SessionOptimizationState::Optimized &&
+        !session.solveQueue.hasPending();
     setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
-    startFiberModeOptimization(session, true, dirtySpans);
+    startFiberModeOptimization(session, true,
+                               interiorOptimized ? std::optional(dirtySpans) : std::nullopt);
     if (session.taskState != LineAnnotationSession::TaskState::Running) {
         session.controlPoints = std::move(*session.controlPointsBeforeModeChange);
         session.controlPointsBeforeModeChange.reset();
@@ -12698,6 +12706,9 @@ void LineAnnotationController::dispatchPendingSolve(const std::string& surfaceNa
             rollback.fiberMetricsMatchStoredFiber;
         setSessionOptimizationState(session, rollback.optimizationState);
         consumeRollbackInvalidation(session);
+        // Whole-line work is queued below: a session that owes queued work
+        // is never Optimized, whatever the snapshot said.
+        setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
         // The dispatched request may have carried EARLIER edits' coalesced
         // spans too; the rollback restored a numbering they no longer fit,
         // so escalate to a whole-line request instead of dropping them (the
@@ -13303,6 +13314,15 @@ void LineAnnotationController::finishOptimization(const std::string& surfaceName
             }
         }
         consumeRollbackInvalidation(session);
+        if (session.optimizationState != SessionOptimizationState::Optimized) {
+            // The failed solve owed this interior its certification (an
+            // incomplete landing's successor, or a solve over provisional
+            // spans): owe it again as a whole-line pass for the NEXT
+            // dispatch. Not retried from this epilogue (pendingAfterPublish
+            // was taken before the apply), so a persistent failure cannot
+            // storm; the invariant "pending work => Unoptimized" holds.
+            session.solveQueue.addPending({}, true);
+        }
         if ((taskProducedResult || rollbackRestoredModel) &&
             !session.suppressGeneratedViews &&
             !session.optimizedLine.points.empty() &&
