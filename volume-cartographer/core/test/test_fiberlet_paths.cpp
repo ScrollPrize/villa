@@ -2065,6 +2065,24 @@ TEST_CASE("fiberlet anchor loader is strict and preserves component identity")
     }
     CHECK_THROWS(vc::fiber_tracer::loadFiberAnchorArtifact(path));
 
+    // The stored base coordinates use scale 2. Accept rounding below 1e-3
+    // prediction voxels, but still reject a displacement above that threshold.
+    for (const double residual : {0.0005, 0.002}) {
+        auto rounded = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
+        rounded["cells"][0]["components"][0]["position_base_xyz"][0] = 5.0 + 2.0 * residual;
+        {
+            std::ofstream output(path);
+            output << rounded.dump(2);
+        }
+        if (residual < 0.001) {
+            const auto roundTrip = vc::fiber_tracer::loadFiberAnchorArtifact(path);
+            CHECK(roundTrip.report.nonEmptyCells.size() == 2);
+        } else {
+            CHECK_THROWS_WITH_AS(vc::fiber_tracer::loadFiberAnchorArtifact(path),
+                doctest::Contains("rotating-plane window"), std::runtime_error);
+        }
+    }
+
     auto offPlane = vc::fiber_tracer::fiberAnchorReportJson(anchors.report, anchors.artifact);
     offPlane["cells"][0]["components"][0]["position_base_xyz"][0] = 5.5;
     {

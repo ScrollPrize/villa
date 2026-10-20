@@ -3145,7 +3145,10 @@ LoadedFiberAnchorArtifact loadFiberAnchorArtifact(const std::filesystem::path& p
                     throw std::runtime_error("fiber anchor position is outside its owning cell");
                 }
             }
-            if (planeResidual > 1.0e-5F || pivotDistance > config.localWindowRadiusPredictionVoxels + 1.0e-5F) {
+            // Absolute float32 coordinates lose sub-voxel precision at large
+            // grid indices. Allow 1e-3 prediction voxels of plane residual
+            // after serialization, without widening the permitted fit window.
+            if (planeResidual > 1.0e-3F || pivotDistance > config.localWindowRadiusPredictionVoxels + 1.0e-5F) {
                 throw std::runtime_error("fiber anchor position violates its rotating-plane window");
             }
             ++cell.retainedAnchorCount;

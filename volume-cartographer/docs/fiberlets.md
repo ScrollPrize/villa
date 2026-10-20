@@ -84,12 +84,11 @@ Tests cover anchor fits, DP objectives, route codecs, malformed data, atomic
 publication, sparse tuples, cache reuse and dependency scheduling. The inline
 scalar/prepared scoring comparison disables FMA contraction **in its test target
 only** so bitwise operation-order assertions are meaningful; production compiler
-settings and numerical tolerances are unchanged.
+settings are unchanged.
 
-Known inherited limitation: at large absolute coordinates, the inspection
-`anchors` → `paths` JSON round trip can fail the strict rotating-plane residual
-check after float32 coordinate rounding. Both the source executable and extracted
-executable reject the same Paris4 artifact. This extraction deliberately does not
-relax the geometry validation. The direct chunk pipeline does not load that JSON
-artifact. Linux Release was validated locally; other platform validation remains
-for CI.
+The anchor JSON loader allows a rotating-plane residual of `1e-3` prediction
+voxels (previously `1e-5`), accommodating float32 absolute-coordinate rounding.
+The fit-window radius, owning-cell and other validation checks are unchanged.
+Regression tests check acceptance below and rejection above this threshold.
+The direct chunk pipeline does not load that JSON artifact. Linux Release was
+validated locally; other platform validation remains for CI.
