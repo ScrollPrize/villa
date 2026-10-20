@@ -1,5 +1,6 @@
 #pragma once
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include <functional>
 struct sqlite3;
 
 namespace vc::objects::detail {
@@ -16,5 +17,8 @@ void setSpatialBounds(sqlite3*, int64_t objectId, const std::optional<Bounds>&,
 void refreshGeometryBounds(sqlite3*, const std::string& objectUuid);
 void createSpatialSchema(sqlite3*);
 void backfillSpatialBounds(sqlite3*);
+class GeometryReader;
+void visitIndexedRegions(sqlite3*, const SpatialRegion&, const Bounds&, GeometryReader&,
+                         const std::function<void(const SpatialRegion&)>&);
 std::vector<SpatialRegion> refineIndexedRegions(sqlite3*, const std::vector<SpatialRegion>&, const ObjectSelection&);
 }

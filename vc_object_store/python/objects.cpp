@@ -1,6 +1,7 @@
 #include "StorageBindings.hpp"
 #include "ObjectReadBindings.hpp"
 #include "TypedGeometryBindings.hpp"
+#include "FiberRegionBindings.hpp"
 #include <nanobind/stl/map.h>
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
@@ -140,6 +141,7 @@ NB_MODULE(_native, m)
     m.doc() = "Revisioned objects and relationships, with owned geometry and typed snapshot views.";
 
     bindGraphReadView(m);
+    bindFiberRegion(m);
     bindTypedGeometry(m); // Shared C++ geometry and revision-pinned views.
 
     nb::class_<PyObjectStore>(m, "ObjectStore")
@@ -546,6 +548,8 @@ NB_MODULE(_native, m)
            nb::arg("bbox") = std::nullopt, nb::arg("fields") = std::nullopt,
            nb::arg("family") = std::nullopt, nb::arg("min_length") = std::nullopt,
            nb::arg("order_by") = "uuid", nb::arg("after_uuid") = std::nullopt, nb::arg("after_length") = std::nullopt, nb::arg("include_retired") = false)
+        .def("fiber_region", &fiberRegionFromPy, nb::arg("slice"),
+             nb::arg("options") = vo::FiberRegionOptions{}, nb::arg("cancel") = nb::none())
         .def("spatial_regions", [](PyObjectStore& self, const std::array<double, 6>& bbox,
             const std::optional<std::string>& kind, const std::optional<std::string>& tag,
             const std::vector<std::string>& ids, const std::optional<std::string>& connected,

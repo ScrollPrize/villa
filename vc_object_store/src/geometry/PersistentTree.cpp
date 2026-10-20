@@ -6,27 +6,20 @@
 
 namespace vc::objects::detail {
 namespace {
-using NodeCache=std::map<std::pair<sqlite3*,std::string>,Tree>;
+struct CachedNode { Tree node; size_t bytes; };
+using NodeCache=std::map<std::pair<sqlite3*,std::string>,CachedNode>;
 thread_local std::unique_ptr<NodeCache> nodeCache;
 thread_local size_t nodeCacheBytes=0;
 void cacheNode(sqlite3* db,const std::string& hash,const Tree& node) {
     if(!nodeCache)return;
-    const auto charge=node.dump().size()*16+256;
+    const auto bytes=node.dump().size();
+    const auto charge=bytes*16+256;
     if(charge>8*1024*1024)return;
     if(nodeCacheBytes+charge>8*1024*1024) {nodeCache->clear();nodeCacheBytes=0;}
     nodeCacheBytes+=charge;
-    nodeCache->emplace(std::pair{db,hash},node);
+    nodeCache->emplace(std::pair{db,hash},CachedNode{node,bytes});
 }
 int height(const Tree& t) { return t.is_null() ? 0 : t.at("height").get<int>(); }
-std::vector<uint8_t> load(sqlite3* db,const std::string& hash,const std::string& name) {
-    Statement s(db,"SELECT data FROM geometry_chunks WHERE hash=?"); s.bind(1,hash);
-    if (!s.row()) throw std::runtime_error("geometry: missing tree payload");
-    const auto* p=static_cast<const uint8_t*>(sqlite3_column_blob(s.value,0));
-    std::vector<uint8_t> out(p,p+sqlite3_column_bytes(s.value,0));
-    if (geometryWork) geometryWork->readBytes[name]+=out.size();
-    if (geometryPayloadHash(name,out)!=hash) throw std::runtime_error("geometry: corrupt tree payload");
-    return out;
-}
 Tree save(sqlite3* db,Tree node,Tree ref) {
     node["summary"]=ref;
     const auto text=node.dump();
@@ -71,10 +64,11 @@ Tree mergeTreeBounds(const Tree& a,const Tree& b) {
     return out;
 }
 Tree treeNode(sqlite3* db,const Tree& ref) {
+    requestWork(&FiberRegionStats::treeVisits);
     GeometryPhase phase("treeNode");
     Tree node;
-    if(nodeCache) {const auto found=nodeCache->find({db,ref.at("hash").get<std::string>()});if(found!=nodeCache->end())node=found->second;}
-    if(node.is_null()) {const auto bytes=load(db,ref.at("hash"),"@tree");node=Tree::parse(bytes);cacheNode(db,ref.at("hash"),node);}
+    if(nodeCache) {const auto found=nodeCache->find({db,ref.at("hash").get<std::string>()});if(found!=nodeCache->end()) { requestBytes(found->second.bytes, &FiberRegionStats::cacheBytes); node=found->second.node; }}
+    if(node.is_null()) {const auto bytes=readSharedPayload(db,"@tree",ref.at("hash"));node=Tree::parse(bytes);cacheNode(db,ref.at("hash"),node);}
     auto expected=ref; expected.erase("hash");
     if (node.at("summary")!=expected || height(ref)<1 || height(ref)>96 || treeSize(ref)<=0)
         throw std::runtime_error("geometry: invalid tree summary");
@@ -179,7 +173,7 @@ Tree byteTree(sqlite3* db,const std::string& name,const std::string& dtype,std::
 std::vector<uint8_t> treeBytes(sqlite3* db,const Tree& root,const std::string& name,int64_t start,int64_t count) {
     std::vector<uint8_t> out; out.reserve(count);
     treeVisit(db,root,start,count,[&](const Tree& v,int64_t offset,int64_t length) {
-        const auto bytes=load(db,v.at("hash"),name); const int64_t begin=v.at("offset").get<int64_t>()+offset;
+        const auto bytes=readSharedPayload(db,name,v.at("hash")); const int64_t begin=v.at("offset").get<int64_t>()+offset;
         if (begin<0 || begin>int64_t(bytes.size()) || length>int64_t(bytes.size())-begin) throw std::runtime_error("invalid tree block");
         out.insert(out.end(),bytes.begin()+begin,bytes.begin()+begin+length);
     }); return out;
@@ -194,7 +188,7 @@ Tree byteSlice(sqlite3* db,const Tree& root,const std::string& name,const std::s
         auto value=node.at("value");value["offset"]=value.at("offset").get<int64_t>()+start;value["length"]=count;
         Tree bounds;
         if(coordinates) {
-            const auto bytes=load(db,value.at("hash"),name);const auto part=std::span(bytes).subspan(value.at("offset").get<int64_t>(),count);
+            const auto bytes=readSharedPayload(db,name,value.at("hash"));const auto part=std::span(bytes).subspan(value.at("offset").get<int64_t>(),count);
             const auto stride=geometryByteLength(dtype,{3});bounds=coordinateBounds(part,dtype,false);
             value["first_bounds"]=coordinateBounds(part.first(stride),dtype,false);value["last_bounds"]=coordinateBounds(part.last(stride),dtype,false);
         }
@@ -327,14 +321,14 @@ void transferTree(sqlite3* source,sqlite3* destination,const Tree& root) {
     if (root.is_null()) return;
     Statement old(destination,"SELECT data FROM geometry_chunks WHERE hash=?");old.bind(1,root.at("hash").get<std::string>());
     if(old.row()) {
-        const auto bytes=load(source,root.at("hash"),"@tree");
+        const auto bytes=readSharedPayload(source,"@tree",root.at("hash"));
         if(sqlite3_column_bytes(old.value,0)!=int64_t(bytes.size())||std::memcmp(sqlite3_column_blob(old.value,0),bytes.data(),bytes.size()))
             throw std::runtime_error("sync: corrupt or colliding tree node");
         return;
     }
     const auto node=treeNode(source,root);
     if (node.contains("left")) { transferTree(source,destination,node.at("left")); transferTree(source,destination,node.at("right")); }
-    else if (node.at("value").contains("hash")) { const auto bytes=load(source,node.at("value").at("hash"),"@transfer"); storeSharedPayload(destination,"@transfer",bytes); }
+    else if (node.at("value").contains("hash")) { const auto bytes=readSharedPayload(source,"@transfer",node.at("value").at("hash")); storeSharedPayload(destination,"@transfer",bytes); }
     if(node.contains("value")) {
         std::function<void(const Tree&)> annotations=[&](const Tree& v) {
             if(v.is_object()&&v.contains("span_fields")) {if(v.contains("annotation_blob"))transferTree(source,destination,v.at("annotation_blob"));return;}
@@ -342,6 +336,6 @@ void transferTree(sqlite3* source,sqlite3* destination,const Tree& root) {
         };
         annotations(node.at("value"));
     }
-    const auto bytes=load(source,root.at("hash"),"@tree"); storeSharedPayload(destination,"@tree",bytes);
+    const auto bytes=readSharedPayload(source,"@tree",root.at("hash")); storeSharedPayload(destination,"@tree",bytes);
 }
 }

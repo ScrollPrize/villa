@@ -41,3 +41,8 @@ if(VC_OBJECT_STORE_BUILD_ADAPTERS)
     target_link_libraries(bench_source_import PRIVATE vc_object_geometry nlohmann_json::nlohmann_json OpenSSL::Crypto)
     add_test(NAME test_source_import_work COMMAND bench_source_import 1)
 endif()
+
+add_executable(test_fiber_region test_fiber_region.cpp)
+target_include_directories(test_fiber_region PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../../src")
+target_link_libraries(test_fiber_region PRIVATE vc_objects nlohmann_json::nlohmann_json)
+add_test(NAME test_fiber_region COMMAND test_fiber_region)

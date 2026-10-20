@@ -5,9 +5,12 @@
 
 namespace vc::objects::detail {
 using Json = nlohmann::json;
-namespace {
-constexpr int64_t blockSize = 64 * 1024;
-std::vector<uint8_t> payload(sqlite3* db, const std::string& name, const std::string& hash) {
+std::vector<uint8_t> readSharedPayload(sqlite3* db, const std::string& name, const std::string& hash) {
+    if (readRequest) {
+        Statement size(db, "SELECT length(data) FROM geometry_chunks WHERE hash=?"); size.bind(1, hash);
+        if (!size.row()) throw std::runtime_error("geometry: missing shared payload");
+        requestBytes(size.i64(0), &FiberRegionStats::payloadBytes);
+    }
     Statement row(db, "SELECT data FROM geometry_chunks WHERE hash=?"); row.bind(1, hash);
     if (!row.row()) throw std::runtime_error("geometry: missing shared payload");
     auto* p = static_cast<const uint8_t*>(sqlite3_column_blob(row.value, 0));
@@ -16,6 +19,8 @@ std::vector<uint8_t> payload(sqlite3* db, const std::string& name, const std::st
     if (geometryPayloadHash(name, bytes) != hash) throw std::runtime_error("geometry: corrupt shared payload");
     return bytes;
 }
+namespace {
+constexpr int64_t blockSize = 64 * 1024;
 void append(Json& out, Json part) {
     if (!part.at("length").get<int64_t>()) return;
     if (!out.empty() && out.back().at("hash") == part.at("hash") &&
@@ -77,6 +82,7 @@ Json sliceSharedBlocks(const Json& blocks, int64_t offset, int64_t count) {
     auto result = Json::array();
     int64_t cursor = 0, copied = 0;
     for (const auto& b : blocks) {
+        requestWork(&FiberRegionStats::candidateVisits);
         const auto size = b.at("length").get<int64_t>();
         if (size < 0 || cursor > INT64_MAX-size) throw std::runtime_error("geometry: invalid shared block length");
         const auto begin = std::max(offset, cursor), end = std::min(offset + count, cursor + size);
@@ -113,7 +119,8 @@ std::vector<uint8_t> readSharedArray(sqlite3* db, const Json& a, const std::stri
     std::map<std::string, std::vector<uint8_t>> loaded;
     auto get = [&](const Json& b) -> const std::vector<uint8_t>& {
         const std::string hash = b.at("hash"); auto found = loaded.find(hash);
-        if (found == loaded.end()) found = loaded.emplace(hash, payload(db, name, hash)).first;
+        if (found == loaded.end()) found = loaded.emplace(hash, readSharedPayload(db, name, hash)).first;
+        else requestBytes(found->second.size(), &FiberRegionStats::cacheBytes);
         return found->second;
     };
     if (a.contains("blocks")) {
@@ -161,7 +168,7 @@ std::vector<uint8_t> readSharedRectangle(sqlite3* db, const Json& a, const std::
             if(t.is_null()) throw std::runtime_error("missing indexed surface tile");
             const int64_t r=t.at("row"),c=t.at("column"),h=t.at("rows"),w=t.at("columns");
             const auto rt=std::max(r,top),rb=std::min(r+h,top+rows),cl=std::max(c,left),cr=std::min(c+w,left+columns);
-            const auto bytes=payload(db,name,t.at("hash"));
+            const auto bytes=readSharedPayload(db,name,t.at("hash"));
             if (int64_t(bytes.size())!=h*w*pixel || rt>=rb || cl>=cr) throw std::runtime_error("invalid indexed surface tile");
             for(auto yy=rt;yy<rb;++yy) std::memcpy(out.data()+((yy-top)*columns+cl-left)*pixel,bytes.data()+((yy-r)*w+cl-c)*pixel,(cr-cl)*pixel);
             copied+=(rb-rt)*(cr-cl)*pixel;
@@ -178,7 +185,7 @@ std::vector<uint8_t> readSharedRectangle(sqlite3* db, const Json& a, const std::
             const int64_t r=t.at("row"),c=t.at("column"),h=t.at("rows"),w=t.at("columns");
             const auto top=std::max(row,r),bottom=std::min(row+rows,r+h),left=std::max(column,c),right=std::min(column+columns,c+w);
             if (top>=bottom || left>=right) continue;
-            const auto bytes=payload(db,name,t.at("hash"));
+            const auto bytes=readSharedPayload(db,name,t.at("hash"));
             if (int64_t(bytes.size())!=h*w*pixel) throw std::runtime_error("geometry: corrupt shared tile size");
             for (auto y=top;y<bottom;++y) std::memcpy(out.data()+((y-row)*columns+left-column)*pixel,
                 bytes.data()+((y-r)*w+left-c)*pixel,(right-left)*pixel);
@@ -259,7 +266,7 @@ void editSharedArray(sqlite3* db, Json& manifest, const GeometryArrayEdit& edit)
         }
         std::set<std::pair<int64_t,int64_t>> changedTiles;
         for(const auto& key:touched) {
-            auto t=treeGet(db,a.at("tree"),key); auto bytes=payload(db,edit.array,t.at("hash"));
+            auto t=treeGet(db,a.at("tree"),key); auto bytes=readSharedPayload(db,edit.array,t.at("hash"));
             const int64_t r=t.at("row").get<int64_t>()-origin[0],c=t.at("column").get<int64_t>()-origin[1],h=t.at("rows"),w=t.at("columns");
             for(auto y=r;y<r+h;++y) {
                 const auto base=(y*shape[1]+c)*pixel,begin=std::max(offset,base),end=std::min(offset+int64_t(edit.bytes.size()),base+w*pixel);
@@ -285,7 +292,7 @@ void editSharedArray(sqlite3* db, Json& manifest, const GeometryArrayEdit& edit)
             for (auto y=r;y<r+h;++y) {
                 const auto base=(y*shape[1]+c)*pixel, begin=std::max(offset,base), stop=std::min(end,base+w*pixel);
                 if (begin>=stop) continue;
-                if (bytes.empty()) bytes=payload(db,edit.array,t.at("hash"));
+                if (bytes.empty()) bytes=readSharedPayload(db,edit.array,t.at("hash"));
                 if (int64_t(bytes.size()) != h*w*pixel) throw std::runtime_error("geometry: corrupt shared tile");
                 std::memcpy(bytes.data()+(y-r)*w*pixel+begin-base,edit.bytes.data()+begin-offset,stop-begin);
             }

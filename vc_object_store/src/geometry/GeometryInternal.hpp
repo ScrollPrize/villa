@@ -1,6 +1,7 @@
 #pragma once
 #include "vc_object_store/objects/Geometry.hpp"
 #include "geometry/ArrayLayout.hpp"
+#include "internal/ReadRequest.hpp"
 #include <nlohmann/json.hpp>
 #include <openssl/evp.h>
 #include <algorithm>
@@ -54,6 +55,7 @@ public:
 inline constexpr size_t geometryChunkSize = 1024 * 1024;
 inline std::string geometryHash(std::span<const uint8_t> bytes)
 {
+    requestBytes(bytes.size(), &FiberRegionStats::verifiedBytes);
     unsigned char digest[EVP_MAX_MD_SIZE];
     unsigned int size = 0;
     if (EVP_Digest(bytes.data(), bytes.size(), digest, &size, EVP_sha256(), nullptr) != 1)

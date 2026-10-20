@@ -468,42 +468,52 @@ void indexSharedGeometry(sqlite3* db, int64_t objectId, const std::string& revis
     }
     writeBounds(db,objectId,total.bounds,revision);
 }
+void visitIndexedRegions(sqlite3* db, const SpatialRegion& candidate, const Bounds& bounds,
+                         GeometryReader& reader, const std::function<void(const SpatialRegion&)>& emit) {
+    auto overlaps=[&](const nlohmann::json& box) {
+        requestPoll();
+        if(box.is_null())return false;
+        for(int i=0;i<3;++i)if(box.at(i).get<double>()>bounds[i+3]||box.at(i+3).get<double>()<bounds[i])return false;
+        return true;
+    };
+    auto region=candidate;
+    if (!region.arrayName.starts_with("@tree:")) { emit(region); return; }
+    region.arrayName.erase(0,6);
+    const auto& a=reader.manifest().at("arrays").at(region.arrayName);
+    if(!a.contains("tree")) {emit(region);return;}
+    const auto stride=geometryByteLength(a.at("dtype"),{3});const bool patch=a.contains("tile_size");
+    const auto shape=a.at("shape").get<std::vector<int64_t>>();
+    std::function<void(const Tree&,int64_t)> visit=[&](const Tree& ref,int64_t offset) {
+        if(ref.is_null()||!overlaps(ref.at("bounds")))return;
+        const auto node=treeNode(db,ref);
+        if(node.contains("value")) {
+            auto r=region;r.bbox=ref.at("bounds").get<Bounds>();
+            if(patch) {
+                const auto origin=a.at("origin").get<std::array<int64_t,2>>();const auto& v=node.at("value");
+                const int64_t row=v.at("row").get<int64_t>()-origin[0],col=v.at("column").get<int64_t>()-origin[1];
+                const auto top=std::max<int64_t>(0,row-1),left=std::max<int64_t>(0,col-1);
+                r.start={top,left};r.shape={std::min(shape[0],row+v.at("rows").get<int64_t>()+1)-top,std::min(shape[1],col+v.at("columns").get<int64_t>()+1)-left};
+            } else {r.start={offset/stride};r.shape={treeSize(ref)/stride};}
+            emit(r);return;
+        }
+        const auto& left=node.at("left");const auto& right=node.at("right");
+        visit(left,offset);
+        // In-order seams connect adjacent leaf spans exactly once.
+        if(!patch&&region.kind!="point_collection") {
+            const auto seam=mergeTreeBounds(left.at("last_bounds"),right.at("first_bounds"));
+            if(overlaps(seam)) {auto r=region;r.bbox=seam.get<Bounds>();r.start={(offset+treeSize(left))/stride-1};r.shape={2};emit(r);}
+        }
+        visit(right,offset+treeSize(left));
+    };
+    visit(a.at("tree"),0);
+}
 std::vector<SpatialRegion> refineIndexedRegions(sqlite3* db,const std::vector<SpatialRegion>& candidates,const ObjectSelection& selection) {
     TreeCacheScope cache;
     std::vector<SpatialRegion> result;
-    auto overlaps=[&](const nlohmann::json& bounds) {
-        if(bounds.is_null())return false;
-        for(int i=0;i<3;++i)if(bounds.at(i).get<double>()>(*selection.bbox)[i+3]||bounds.at(i+3).get<double>()<(*selection.bbox)[i])return false;
-        return true;
-    };
     for(const auto& candidate:candidates) {
         if(!candidate.revisionUuid||!candidate.arrayName.starts_with("@tree:")) {result.push_back(candidate);continue;}
-        auto region=candidate;region.arrayName.erase(0,6);
-        GeometryReader reader(db,*region.revisionUuid);const auto& a=reader.manifest().at("arrays").at(region.arrayName);
-        if(!a.contains("tree")) {result.push_back(region);continue;}
-        const auto stride=geometryByteLength(a.at("dtype"),{3});const bool patch=a.contains("tile_size");
-        const auto shape=a.at("shape").get<std::vector<int64_t>>();
-        std::function<void(const Tree&,int64_t)> visit=[&](const Tree& ref,int64_t offset) {
-            if(ref.is_null()||!overlaps(ref.at("bounds")))return;
-            const auto node=treeNode(db,ref);
-            if(node.contains("value")) {
-                auto r=region;r.bbox=ref.at("bounds").get<Bounds>();
-                if(patch) {
-                    const auto origin=a.at("origin").get<std::array<int64_t,2>>();const auto& v=node.at("value");
-                    const int64_t row=v.at("row").get<int64_t>()-origin[0],col=v.at("column").get<int64_t>()-origin[1];
-                    const auto top=std::max<int64_t>(0,row-1),left=std::max<int64_t>(0,col-1);
-                    r.start={top,left};r.shape={std::min(shape[0],row+v.at("rows").get<int64_t>()+1)-top,std::min(shape[1],col+v.at("columns").get<int64_t>()+1)-left};
-                } else {r.start={offset/stride};r.shape={treeSize(ref)/stride};}
-                result.push_back(std::move(r));return;
-            }
-            const auto& left=node.at("left");const auto& right=node.at("right");
-            visit(left,offset);visit(right,offset+treeSize(left));
-            if(!patch&&region.kind!="point_collection") {
-                const auto bounds=mergeTreeBounds(left.at("last_bounds"),right.at("first_bounds"));
-                if(overlaps(bounds)) {auto r=region;r.bbox=bounds.get<Bounds>();r.start={(offset+treeSize(left))/stride-1};r.shape={2};result.push_back(std::move(r));}
-            }
-        };
-        visit(a.at("tree"),0);
+        GeometryReader reader(db,*candidate.revisionUuid);
+        visitIndexedRegions(db,candidate,*selection.bbox,reader,[&](const auto& region){result.push_back(region);});
     }
     std::sort(result.begin(),result.end(),[](const auto& a,const auto& b){return std::tie(a.objectUuid,a.arrayName,a.start)<std::tie(b.objectUuid,b.arrayName,b.start);});
     const auto begin=std::min<uint64_t>(selection.offset,result.size());

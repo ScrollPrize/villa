@@ -23,6 +23,7 @@ add_library(vc_objects STATIC
     Snapshots.cpp
     Queries.cpp
     Spatial.cpp
+    FiberRegion.cpp
     sync/Synchronize.cpp
     sync/GeometryTransfer.cpp
     geometry/GeometryViews.cpp

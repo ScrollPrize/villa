@@ -191,6 +191,7 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
     const ChunkKey key{name, index};
     auto found = chunks_.find(key);
     if (found != chunks_.end()) {
+        requestBytes(found->second.bytes.size(), &FiberRegionStats::cacheBytes);
         recency_.splice(recency_.end(), recency_, found->second.recency);
         visit(found->second.bytes);
         return;
@@ -200,6 +201,11 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
     std::vector<uint8_t> owned;
     std::string storedHash;
     if (!materializedObject_.empty()) {
+        if (readRequest) {
+            Statement size(db_, "SELECT length(data) FROM geometry_current_chunks WHERE object_uuid=? AND array_name=? AND chunk_index=?");
+            size.bindBlob(1, parseUuid(materializedObject_)); size.bind(2, name); size.bind(3, index);
+            if (size.row()) requestBytes(size.i64(0), &FiberRegionStats::payloadBytes);
+        }
         Statement current(db_, "SELECT data,hash FROM geometry_current_chunks WHERE object_uuid=? AND array_name=? AND chunk_index=?");
         current.bindBlob(1, parseUuid(materializedObject_)); current.bind(2, name); current.bind(3, index);
         if (current.row()) {
@@ -239,6 +245,13 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
             owned = inherited.chunk(name, index);
             storedHash = original.at("chunks").at(index);
         } else {
+            if (readRequest) {
+                Statement size(db_, "SELECT length(c.data) FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "
+                    "WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?");
+                size.bindBlob(1, baseRevision_.empty() ? revision_ : parseUuid(baseRevision_)); size.bind(2, name); size.bind(3, index);
+                if (!size.row()) throw std::runtime_error("geometry: missing payload chunk");
+                requestBytes(size.i64(0), &FiberRegionStats::payloadBytes);
+            }
             Statement chunk(db_, "SELECT c.data,r.hash FROM geometry_revision_chunks r JOIN geometry_chunks c ON c.hash=r.hash "
                                  "WHERE r.revision_uuid=? AND r.array_name=? AND r.chunk_index=?");
             chunk.bindBlob(1, baseRevision_.empty() ? revision_ : parseUuid(baseRevision_)); chunk.bind(2, name); chunk.bind(3, index);
@@ -284,6 +297,7 @@ std::vector<uint8_t> GeometryReader::read(const std::string& name, int64_t offse
     if (offset < 0 || offset > length) throw std::out_of_range("geometry: invalid byte offset");
     const int64_t size = count.value_or(length - offset);
     if (size < 0 || size > length - offset) throw std::out_of_range("geometry: invalid byte count");
+    requestBytes(size, &FiberRegionStats::reconstructedBytes);
     if (sharedArray(manifest_.at("arrays").at(name)))
         return readSharedArray(db_,manifest_.at("arrays").at(name),name,offset,size);
     std::vector<uint8_t> result(static_cast<size_t>(size));

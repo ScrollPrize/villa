@@ -894,3 +894,119 @@ recorded benchmark runs also passed their exact geometry and file verification.
 Structural sequence edits and coordinated surface growth/cropping are described
 in [Structural geometry editing](structural-editing.md), including checked
 transactions, identity/span semantics, storage reuse, and current cost limits.
+
+## Bounded oriented fiber browsing
+
+`ObjectStore::fiberRegion(ReadTxn, FiberSlice, FiberRegionOptions, cancel)` and
+Python `store.fiber_region(slice, options, cancel=None)` compose spatial bounds,
+bounded geometry reads, and exact double-precision segment/slab intersection.
+They return **original**, unclipped coordinates and zero-based segment indices
+in contiguous runs. Rendering and endpoint trimming belong to the consumer.
+The public, dependency-free `geometry/SegmentClip.hpp` helper provides the same
+slab operation to other consumers.
+
+```python
+from vc_object_store import FiberSlice, FiberRegionOptions, FiberRegionCancellation
+
+view = FiberSlice()
+view.origin = [100, 200, 300]
+view.u = [1, 0, 0]
+view.v = [0, 1, 0]
+view.normal = [0, 0, 1]
+view.local_bounds = [-50, -50, -0.5, 50, 50, 0.5]
+options = FiberRegionOptions()
+options.maximum_fibers = 100
+options.selected = selected_uuid  # optional; attempted first when maximum > 0
+options.family = "H"            # optional exact source annotation; None = all
+options.min_length = 10          # inclusive source/import length annotation
+cancel = FiberRegionCancellation()
+result = store.fiber_region(view, options, cancel)
+# Another Python thread may call cancel.cancel(); the query releases the GIL.
+for run in result["runs"]:
+    draw(run["points"], run["first_segment"], run["object_uuid"])
+print(result["stop"], result["stats"])
+```
+
+Axes must be finite and orthonormal (dot-product tolerance `1e-12`). Local bounds
+are finite, ordered minXYZ/maxXYZ; zero thickness is allowed. The reader derives
+conservative world bounds from the actual projection inverse. A segment can
+intersect with both endpoints outside. Sampled `line_points` are used when
+nonempty, otherwise `control_points`; `min_points` (default 2) checks the current
+chosen array's shape. Family and minimum length use annotations in the same
+snapshot, **not** recomputed arclength. This API does not change the source-summary
+contract. Retired and external-only fibers are excluded.
+
+Fibers are processed in canonical UUID order, with the selected fiber first in
+limited mode. This is a stable package ordering, not AFV's salted numeric-ID
+priority. Only fibers with emitted intersecting segments consume the fiber limit;
+all visible segments of each chosen fiber are processed before advancing. A
+selected miss does not consume the limit. `maximum_fibers=0` is unlimited and
+ignores `selected`. Insufficient budget can prevent even the selected fiber from
+being returned; the query stops instead of substituting a cheaper fiber.
+Ordinary block boundaries and persistent-tree structural seams contribute each
+segment once, and adjacent runs are merged across storage boundaries.
+
+The result owns its data after the read transaction closes. Each run carries its
+geometry `revision_uuid`, array, family, and object identity. Bounds, metadata and
+geometry come from one SQLite read snapshot. There is no continuation token and
+no cached claim of spatial coverage. C++ callers may repeat a query in the same
+active `ReadTxn` to retain that snapshot; Python starts a fresh read snapshot for
+each call.
+
+`stop` is one of `exhausted`, `fiber_limit`, `output_budget`, `processing_budget`,
+`candidate_budget`, `sql_budget`, or `cancelled`. Only `exhausted` sets `complete`.
+A fiber-limit result does not establish full spatial coverage. A budget/cancelled
+result may end partway through a fiber/run; the emitted segments are still valid.
+Invalid inputs, corruption, and other database errors raise rather than returning
+a successful or partial result.
+
+Independent, strict allowances (zero means zero allowance, not unlimited):
+
+| Option | Default | Charged work |
+| --- | ---: | --- |
+| `output_byte_budget` | 8 MiB | 24 bytes per original XYZ double point appended to runs; a new run needs 48 bytes |
+| `processing_byte_budget` | 64 MiB | Whole stored payloads, verification bytes, copied metadata, reconstructed range/delta bytes, and whole cached chunks/nodes used |
+| `candidate_work_budget` | 1,000,000 | Sum of candidate/block-descriptor visits, tree-node visits, and exact segment tests |
+| `sql_step_budget` | 10,000,000 | SQLite VM instruction allowance, including candidate selection, rejected probes, and geometry queries |
+| `max_unit_bytes` | 1 MiB | Largest admitted individual payload, metadata value, verification, or reconstruction operation |
+
+Work is reserved before application processing; a unit that exceeds either the
+remaining allowance or `max_unit_bytes` is refused with `processing_budget`.
+Whole payload lengths are checked before fetching blobs, including small ranges
+crossing chunk boundaries. Counters can include reserved work interrupted before
+completion. `processing_bytes` is the sum of `payload_bytes`, `verified_bytes`,
+`metadata_bytes`, `reconstructed_bytes`, and `cache_bytes`; it is a work measure,
+not unique data size, memory usage, or disk I/O. Verification and reconstruction
+are charged separately, and repeatedly touching a cached chunk charges its full
+size again even when only a small range is copied. Current sparse materializations
+and structurally shared trees use the ordinary verified reader. Reconstructed
+legacy deltas larger than the unit allowance are refused, not silently decoded.
+Budgets apply regardless of warm SQLite/OS caches. Within-request chunk and tree
+caches are reused; the adapter does not retain a separate cross-request geometry
+or candidate cache.
+
+Candidate selection walks the UUID index once, probes indexed spatial bounds,
+and yields immediately without collecting/sorting the complete candidate set or
+replaying offset pages. Stable priority can require nonintersecting object probes;
+these consume SQL allowance. Fine tree regions are emitted incrementally in
+segment order through the same refinement helper as `spatialRegions`.
+
+C++ cancellation is an optional `FiberRegionCancel` predicate over the current
+stats (e.g. a lambda reading `std::atomic_bool`). It must not re-enter the store.
+Checks occur at each SQL VM instruction, candidate/tree visit, admitted processing
+unit, and segment test. Callback exceptions propagate safely after leaving
+SQLite. Geometry batches contain at most 257 points. An admitted hash, JSON
+parse/copy, or delta decompression is indivisible and bounded by `max_unit_bytes`;
+a SQLite instruction or OS I/O wait has no wall-clock bound. These allowances
+therefore do **not** guarantee latency or cap SQLite/allocator memory. Default
+budgets are API policy, not measured interactive-performance targets.
+
+Focused validation (existing configured build; no dependency installation):
+
+```sh
+AGENTS_AGENT_MODE=1 ninja -C build -j 4
+AGENTS_AGENT_MODE=1 ctest --test-dir build --output-on-failure
+AGENTS_AGENT_MODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python \
+  /home/sean/villa/volume-cartographer/.venv/bin/python -m pytest -q tests/python
+```

@@ -3,6 +3,7 @@
 
 namespace vc::objects::detail {
 using SharedJson = nlohmann::json;
+std::vector<uint8_t> readSharedPayload(sqlite3*, const std::string& name, const std::string& hash);
 bool sharedArray(const SharedJson&);
 bool identityManaged(sqlite3*, const std::string&);
 SharedJson sharedDescriptor(sqlite3*, GeometryReader&, const std::string&);

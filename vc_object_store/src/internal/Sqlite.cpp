@@ -1,4 +1,5 @@
 #include "internal/Database.hpp"
+#include "internal/ReadRequest.hpp"
 
 namespace vc::objects::detail {
 [[noreturn]] void fail(sqlite3* db, const std::string& what)
@@ -162,7 +163,9 @@ void Statement::bindBlob(int i, const std::array<unsigned char, 16>& v)
 
 bool Statement::row()
 {
+    requestPoll();
     const int rc = sqlite3_step(value);
+    requestPoll();
     if (rc == SQLITE_ROW) return true;
     if (rc == SQLITE_DONE) return false;
     fail(db_, "step");
@@ -190,6 +193,7 @@ double Statement::f64(int c) const
 
 std::string Statement::text(int c) const
 {
+    if (readRequest) requestBytes(sqlite3_column_bytes(value, c), &FiberRegionStats::metadataBytes);
     const auto* p = sqlite3_column_text(value, c);
     return p ? std::string(reinterpret_cast<const char*>(p), size_t(sqlite3_column_bytes(value, c))) : "";
 }
@@ -197,6 +201,7 @@ std::string Statement::text(int c) const
 std::optional<std::string> Statement::optText(int c) const
 {
     if (isNull(c)) return std::nullopt;
+    if (readRequest) requestBytes(sqlite3_column_bytes(value, c), &FiberRegionStats::metadataBytes);
     const auto* p = sqlite3_column_text(value, c);
     return std::optional<std::string>(std::in_place,
         p ? reinterpret_cast<const char*>(p) : "", p ? size_t(sqlite3_column_bytes(value, c)) : 0);
