@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
 from lasagna.manager.config import ManagerConfig
+from lasagna.manager.fiberlets import _fiberlet_inventory_digest
 from lasagna.manager.open_data import (
     INCOMPLETE_MARKER,
     S3ObjectStore,
@@ -238,15 +240,21 @@ def _completed_fiberlet_run(tmp_path: Path) -> tuple[ManagerConfig, Path]:
     output = tmp_path / "outputs"
     run = output / "fiberlet-run"
     bundle = run / "artifacts"
-    dataset = bundle / "fiberlets.zarr"
-    for relative in ("anchors/.zarray", "prefix/.zarray", "routes/.zarray"):
-        path = dataset / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{}", encoding="utf-8")
+    dataset_name = "fiberlet-run.fiberlets.zarr"
+    dataset = bundle / dataset_name
+    array = dataset / "fiberlets" / ".zarray"
+    array.parent.mkdir(parents=True, exist_ok=True)
+    array.write_text(json.dumps({
+        "zarr_format": 2, "dtype": "|O", "dimension_separator": "/",
+    }), encoding="utf-8")
     (dataset / ".zgroup").write_text("{}", encoding="utf-8")
     (dataset / ".zattrs").write_text(json.dumps({
         "vc_format": "fiberlet_dataset",
-        "dataset_kind": "combined",
+        "format_version": 3,
+        "dataset_kind": "published",
+        "build_state": "complete",
+        "expected_chunk_count": 0,
+        "expected_chunk_digest": _fiberlet_inventory_digest([]),
     }), encoding="utf-8")
     atomic_json(bundle / "fiberlets.json", {
         "schema_version": 1,
@@ -258,7 +266,12 @@ def _completed_fiberlet_run(tmp_path: Path) -> tuple[ManagerConfig, Path]:
             "license": {"name": "CC BY-NC 4.0"},
         },
         "dependencies": {},
-        "artifacts": [{"kind": "fiberlet-zarr", "path": "fiberlets.zarr"}],
+        "artifacts": [{
+            "kind": "fiberlet-zarr", "path": dataset_name,
+            "metadata_sha256": hashlib.sha256(
+                (dataset / ".zattrs").read_bytes()
+            ).hexdigest(),
+        }],
     })
     atomic_json(run / "metadata.json", {
         "run_uuid": "fiberlet-uuid", "run_name": "fiberlet-run",
@@ -266,6 +279,7 @@ def _completed_fiberlet_run(tmp_path: Path) -> tuple[ManagerConfig, Path]:
         "artifact_kind": "fiberlets", "status": "completed",
         "artifacts": {
             "root": "artifacts", "provenance": "artifacts/fiberlets.json",
+            "dataset": f"artifacts/{dataset_name}",
         },
         "lifecycle": {
             "fiberlet_preprocess": "completed", "staging_upload": "not_started",

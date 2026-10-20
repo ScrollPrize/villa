@@ -309,22 +309,30 @@ PID reconciliation, and durable status machinery as inference. Its layout is:
   source_context.json           # stable source identities and hashes only
   run.log
   cache/fiberlets.anchors.zarr  # local resumable float cache; never uploaded
+  cache/fiberlets.paths.zarr    # private prefix/route cache; never uploaded
   artifacts/
     fiberlets.json              # bounded portable provenance
-    fiberlets.zarr/             # final anchors/prefix/routes logical chunk tuples
+    <run-name>.fiberlets.zarr/  # final self-contained format-3 dataset
 ```
 
 `fiberlet resume` revalidates both upstream manifests and their hashes, then
-reuses the recorded native command, final Zarr, and local anchor cache. The
-manager owns the input, output, normal-manifest, remote-cache, anchor-cache, and source-context
+reuses the recorded native command, final Zarr, and both local caches. The
+manager owns the input, output, normal-manifest, remote-cache, anchor-cache,
+fiberlet-cache, and source-context
 arguments; configured or passthrough arguments cannot replace them.
+
+The final Zarr contains one self-contained `fiberlets/z/y/x` object per selected
+spatial chunk, including owned and referenced endpoint anchors, prefixes and
+routes. It records the original `base_shape_zyx`. Metadata starts as partial;
+it becomes complete only after validating the expected chunk count and digest.
+The manager validates that completion state and inventory before publication.
 
 The final Zarr is self-describing and contains versioned stable source
 identities plus all effective scientific processing, coordinate, layout,
 storage, quantization, and codec settings needed to open it. Dataset identity
 includes those settings and source hashes but excludes filesystem paths,
 output/cache directories, host identity, and the executable location. Native
-preprocessing rescans source presence and validates every expected sparse tuple
+preprocessing rescans source presence and validates every expected published chunk
 before it exits successfully; the manager additionally requires completed
 portable provenance.
 
@@ -506,13 +514,12 @@ models/levels and their manifest hashes to the native dataset fingerprint.
 With a compatible Atlas adapter, publication plans a canonical copy and, for
 CC BY-NC volumes, a public copy under
 `<sample>/representations/fiberlets/<volume>-fiberlets-<identity>/`. No derive
-workflow is required because the staged combined Zarr is already final.
+workflow is required because the staged published Zarr is already final.
 
-**Atlas compatibility:** this manager writes format-2 combined Fiberlet
-datasets (`anchors/`, `prefix/`, `routes/`). Fiberlet publication requires an
-Atlas `fiberlet_bundle` adapter accepting that format. An adapter accepting
-only format-3 published datasets (`fiberlets/`) is not compatible. Atlas
-preflight runs before any upload; a format mismatch leaves staging untouched.
+**Atlas compatibility:** only complete format-3 published Fiberlet datasets
+(`fiberlets/`) are accepted. Legacy combined output is rejected, not silently
+converted. Atlas preflight runs before any upload; a format mismatch leaves
+staging untouched.
 Inference publication uses the separate `inference_bundle` adapter.
 
 ## Validation
@@ -526,7 +533,10 @@ set `LAS_MANAGER_TEST_FIBER_RUN`, `LAS_MANAGER_TEST_NORMAL_RUN`, and
 `LAS_MANAGER_TEST_FIBERLET_RUN` to completed manager run directories. The Fiber
 and normal runs must share an output directory. Optionally set
 `LAS_MANAGER_TEST_SNAPSHOT` to the Fiber run's exact checkpoint to check import
-and model identity. Then run:
+identity. Set `LAS_MANAGER_TEST_SNAPSHOT_DIRS` (OS path-separated directories)
+when old input provenance needs its Atlas model ID resolved from a checkpoint.
+Legacy format-2 Fiberlet runs are checked for publication rejection, not acceptance.
+Then run:
 
 ```sh
 python -m pytest -q lasagna/tests/test_manager_real_runs.py

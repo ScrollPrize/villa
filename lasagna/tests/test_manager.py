@@ -831,6 +831,35 @@ def _completed_prediction_run(
     return run_dir
 
 
+@pytest.mark.parametrize("broken", ["partial", "legacy", "missing", "extra"])
+def test_published_fiberlet_inventory_rejects_incomplete_output(tmp_path, broken):
+    dataset = tmp_path / "published.zarr"
+    array = dataset / "fiberlets"
+    array.mkdir(parents=True)
+    attrs = {
+        "vc_format": "fiberlet_dataset", "format_version": 3,
+        "dataset_kind": "published", "build_state": "complete",
+        "expected_chunk_count": 0,
+        "expected_chunk_digest": manager_fiberlets._fiberlet_inventory_digest([]),
+    }
+    atomic_json(dataset / ".zgroup", {"zarr_format": 2})
+    atomic_json(array / ".zarray", {
+        "zarr_format": 2, "dtype": "|O", "dimension_separator": "/",
+    })
+    if broken == "partial":
+        attrs["build_state"] = "partial"
+    elif broken == "legacy":
+        attrs.update(format_version=2, dataset_kind="combined")
+    elif broken == "missing":
+        attrs["expected_chunk_count"] = 1
+    else:
+        (array / "0" / "0").mkdir(parents=True)
+        (array / "0" / "0" / "0").write_bytes(b"extra")
+    atomic_json(dataset / ".zattrs", attrs)
+    with pytest.raises(ValueError):
+        manager_fiberlets.validate_published_fiberlet_dataset(dataset)
+
+
 def test_fiberlet_launch_uses_shared_runner_and_portable_source_identity(tmp_path):
     python = tmp_path / "venv" / "bin" / "python"
     python.parent.mkdir(parents=True)
@@ -865,36 +894,49 @@ def test_fiberlet_launch_uses_shared_runner_and_portable_source_identity(tmp_pat
     assert command["resolved_argv"][:2] == [str(binary), "preprocess-volume"]
     assert command["resolved_argv"][-4:] == ["--threads", "32", "--threads", "8"]
     assert str(run_dir / "cache") in command["resolved_argv"][command["resolved_argv"].index("--anchor-cache") + 1]
+    assert str(run_dir / "cache") in command["resolved_argv"][command["resolved_argv"].index("--fiberlet-cache") + 1]
     assert str(run_dir / "cache") not in json.dumps(context)
     assert "manifest_path" not in json.dumps(context)
     assert context["source_volume"] == {
         "sample_id": "PHerc0001", "volume_id": "20260101000001",
+        "base_shape_zyx": [100, 80, 60],
     }
-    dataset = run_dir / "artifacts" / "fiberlets.zarr"
+    dataset = run_dir / "artifacts" / f"{record['run_name']}.fiberlets.zarr"
     dataset.mkdir()
     atomic_json(dataset / ".zattrs", {
-        "vc_format": "fiberlet_dataset", "dataset_kind": "combined",
-        "format_version": 2, "dataset_fingerprint": "b" * 64,
+        "vc_format": "fiberlet_dataset", "dataset_kind": "published",
+        "format_version": 3, "build_state": "complete",
+        "expected_chunk_count": 0,
+        "expected_chunk_digest": manager_fiberlets._fiberlet_inventory_digest([]),
+        "dataset_fingerprint": "b" * 64,
         "algorithm_fingerprint": "fnv1a64:0123456789abcdef",
         "processing": {"contract_version": 2},
         "sources": {
-            name: {
-                "run_uuid": dependency["run_uuid"],
-                "manifest_sha256": dependency["manifest_sha256"],
-            }
-            for name, dependency in record["dependencies"].items()
+            "source_volume": {
+                "sample_id": "PHerc0001",
+                "volume_id": "20260101000001",
+                "base_shape_zyx": [100, 80, 60],
+            },
+            **{
+                name: {
+                    "run_uuid": dependency["run_uuid"],
+                    "manifest_sha256": dependency["manifest_sha256"],
+                }
+                for name, dependency in record["dependencies"].items()
+            },
         },
     })
     (dataset / ".zgroup").write_text("{}", encoding="utf-8")
-    for relative in ("anchors/.zarray", "prefix/.zarray", "routes/.zarray"):
-        path = dataset / relative
-        path.parent.mkdir()
-        path.write_text("{}", encoding="utf-8")
+    array = dataset / "fiberlets" / ".zarray"
+    array.parent.mkdir()
+    atomic_json(array, {
+        "zarr_format": 2, "dtype": "|O", "dimension_separator": "/",
+    })
     finalize_fiberlet_provenance(run_dir, record)
     portable = json.loads((run_dir / "artifacts" / "fiberlets.json").read_text())
     assert portable["artifact_kind"] == "fiberlets"
     assert portable["artifacts"] == [{
-        "kind": "fiberlet-zarr", "path": "fiberlets.zarr",
+        "kind": "fiberlet-zarr", "path": f"{record['run_name']}.fiberlets.zarr",
         "metadata_sha256": hashlib.sha256((dataset / ".zattrs").read_bytes()).hexdigest(),
     }]
     assert str(tmp_path) not in json.dumps(portable)

@@ -31,10 +31,94 @@ from .tmux import Tmux
 
 _MANAGER_OWNED_OPTIONS = {
     "--anchor-cache",
+    "--fiberlet-cache",
     "--normal-manifest",
     "--source-context",
     "--remote-cache-dir",
 }
+
+
+def resolve_bundle_relative(bundle: Path, value: str, *, label: str) -> Path:
+    relative = Path(value)
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        raise ValueError(f"{label} must be a safe relative path")
+    bundle_resolved = bundle.resolve()
+    candidate = (bundle / relative).resolve()
+    try:
+        candidate.relative_to(bundle_resolved)
+    except ValueError as error:
+        raise ValueError(f"{label} escapes the artifact bundle") from error
+    return candidate
+
+
+def _fiberlet_inventory(dataset: Path) -> list[tuple[int, int, int]]:
+    array = dataset / "fiberlets"
+    chunks: list[tuple[int, int, int]] = []
+    if not array.is_dir():
+        return chunks
+    metadata_path = array / ".zarray"
+    for path in array.rglob("*"):
+        if not path.is_file() or path == metadata_path:
+            continue
+        try:
+            path.resolve().relative_to(array.resolve())
+        except ValueError as error:
+            raise ValueError(
+                f"published Fiberlet chunk path escapes its array: {path}"
+            ) from error
+        relative = path.relative_to(array)
+        if len(relative.parts) != 3 or not all(
+            part.isascii() and part.isdigit() for part in relative.parts
+        ):
+            raise ValueError(
+                f"published Fiberlet array contains an invalid chunk key: {relative}"
+            )
+        chunks.append(tuple(int(part) for part in relative.parts))
+    return sorted(chunks)
+
+
+def _fiberlet_inventory_digest(chunks: Sequence[tuple[int, int, int]]) -> str:
+    canonical = "".join(f"{z}/{y}/{x}\n" for z, y, x in chunks).encode()
+    encoded = bytearray()
+    mask = (1 << 64) - 1
+    for lane in range(4):
+        value = 14695981039346656037 ^ (
+            0x9E3779B97F4A7C15 * (lane + 1) & mask
+        )
+        for byte in canonical:
+            value ^= byte
+            value = value * 1099511628211 & mask
+        encoded.extend(value.to_bytes(8, "little"))
+    return "fnv256:" + encoded.hex()
+
+
+def validate_published_fiberlet_dataset(dataset: Path) -> dict[str, Any]:
+    for relative in (".zgroup", ".zattrs", "fiberlets/.zarray"):
+        if not (dataset / relative).is_file():
+            raise ValueError(f"native Fiberlet output is missing {relative}")
+    attrs = _load_json(dataset / ".zattrs", "Fiberlet dataset metadata")
+    if (
+        attrs.get("vc_format") != "fiberlet_dataset"
+        or attrs.get("format_version") != 3
+        or attrs.get("dataset_kind") != "published"
+        or attrs.get("build_state") != "complete"
+    ):
+        raise ValueError(
+            "native output is not a complete self-contained Fiberlet dataset"
+        )
+    array = _load_json(dataset / "fiberlets" / ".zarray", "Fiberlet array metadata")
+    if (
+        array.get("zarr_format") != 2
+        or array.get("dtype") != "|O"
+        or array.get("dimension_separator") != "/"
+    ):
+        raise ValueError("native Fiberlet output has an invalid published array")
+    chunks = _fiberlet_inventory(dataset)
+    if attrs.get("expected_chunk_count") != len(chunks):
+        raise ValueError("published Fiberlet chunk count does not match metadata")
+    if attrs.get("expected_chunk_digest") != _fiberlet_inventory_digest(chunks):
+        raise ValueError("published Fiberlet chunk inventory does not match metadata")
+    return attrs
 
 
 def _validate_native_options(values: Sequence[str], *, source: str) -> None:
@@ -147,6 +231,12 @@ def _completed_dependency(
         raise ValueError("whole-volume Fiberlet preprocessing does not accept cropped prediction bundles")
     source = provenance.get("source") if isinstance(provenance.get("source"), dict) else {}
     model = provenance.get("model") if isinstance(provenance.get("model"), dict) else {}
+    if not model.get("atlas_model_id"):
+        # Use the same verified checkpoint identity as inference publication.
+        # Import locally because open_data also validates Fiberlet bundles.
+        from .open_data import resolve_model_id
+
+        model = {**model, "atlas_model_id": resolve_model_id(config, provenance)}
     source_scale = provenance.get("source_scale") if isinstance(provenance.get("source_scale"), dict) else {}
     return {
         "run_dir": run_dir,
@@ -690,11 +780,14 @@ def _resolve_binary(config: ManagerConfig) -> Path:
 
 def _dependency_identity(value: dict[str, Any]) -> dict[str, Any]:
     model = value["model"]
+    model_id = model.get("atlas_model_id")
+    if isinstance(model_id, str) and len(model_id) >= 14 and model_id[:14].isdigit():
+        model_id = model_id[:14]
     identity = {
         "dependency_kind": value.get("dependency_kind", "manager-run"),
         "artifact_kind": value["artifact_kind"],
         "manifest_sha256": value["manifest_sha256"],
-        "model_id": model.get("atlas_model_id"),
+        "model_id": model_id,
         "model_sha256": model.get("sha256"),
         "model_run": model.get("run"),
         "snapshot": model.get("snapshot"),
@@ -742,12 +835,17 @@ def launch_fiberlet(
     artifacts.mkdir()
     cache = run_dir / "cache"
     cache.mkdir()
-    output = artifacts / "fiberlets.zarr"
+    dataset_name = f"{run_name}.fiberlets.zarr"
+    output = artifacts / dataset_name
     context_path = run_dir / "source_context.json"
     fiber_identity = _dependency_identity(fiber)
     normal_identity = _dependency_identity(normal)
     source_context = {
-        "source_volume": {"sample_id": sample_id, "volume_id": volume_id},
+        "source_volume": {
+            "sample_id": sample_id,
+            "volume_id": volume_id,
+            "base_shape_zyx": list(fiber["manifest"]["base_shape_zyx"]),
+        },
         "fiber_prediction": fiber_identity,
         "normal_prediction": normal_identity,
     }
@@ -761,6 +859,7 @@ def launch_fiberlet(
         str(binary), "preprocess-volume", str(fiber["manifest_path"]), str(output),
         "--normal-manifest", str(normal["manifest_path"]),
         "--anchor-cache", str(cache / "fiberlets.anchors.zarr"),
+        "--fiberlet-cache", str(cache / "fiberlets.paths.zarr"),
         "--source-context", str(context_path),
         *effective_args,
     ]
@@ -789,6 +888,7 @@ def launch_fiberlet(
         "source": {
             "sample_id": sample_id,
             "volume_id": volume_id,
+            "base_shape_zyx": list(fiber["manifest"]["base_shape_zyx"]),
             "license": source_license,
         },
         "dependencies": {
@@ -806,7 +906,7 @@ def launch_fiberlet(
         "artifacts": {
             "root": "artifacts",
             "provenance": "artifacts/fiberlets.json",
-            "dataset": "artifacts/fiberlets.zarr",
+            "dataset": f"artifacts/{dataset_name}",
             "inventory": [],
         },
         "lifecycle": {
@@ -836,17 +936,19 @@ def launch_fiberlet(
 
 
 def finalize_fiberlet_provenance(run_dir: Path, record: dict[str, Any]) -> None:
-    dataset = run_dir / str(record["artifacts"]["dataset"])
-    for relative in (".zgroup", "anchors/.zarray", "prefix/.zarray", "routes/.zarray"):
-        if not (dataset / relative).is_file():
-            raise ValueError(f"native Fiberlet output is missing {relative}")
-    attrs = _load_json(dataset / ".zattrs", "Fiberlet dataset metadata")
-    if (
-        attrs.get("vc_format") != "fiberlet_dataset"
-        or attrs.get("format_version") != 2
-        or attrs.get("dataset_kind") != "combined"
-    ):
-        raise ValueError("native output is not a combined Fiberlet dataset")
+    artifact_root = Path(str(record["artifacts"]["root"]))
+    dataset_record = Path(str(record["artifacts"]["dataset"]))
+    try:
+        dataset_relative = dataset_record.relative_to(artifact_root)
+    except ValueError as error:
+        raise ValueError("recorded Fiberlet dataset must be inside the artifact bundle") from error
+    bundle = resolve_bundle_relative(
+        run_dir, artifact_root.as_posix(), label="artifact root",
+    )
+    dataset = resolve_bundle_relative(
+        bundle, dataset_relative.as_posix(), label="Fiberlet dataset path",
+    )
+    attrs = validate_published_fiberlet_dataset(dataset)
     if not isinstance(attrs.get("processing"), dict):
         raise ValueError("native Fiberlet output has no processing contract")
     dataset_fingerprint = str(attrs.get("dataset_fingerprint") or "")
@@ -855,6 +957,11 @@ def finalize_fiberlet_provenance(run_dir: Path, record: dict[str, Any]) -> None:
     ):
         raise ValueError("native Fiberlet output has an invalid dataset fingerprint")
     sources = attrs.get("sources") if isinstance(attrs.get("sources"), dict) else {}
+    source_volume = sources.get("source_volume") if isinstance(sources.get("source_volume"), dict) else {}
+    if source_volume.get("base_shape_zyx") != record["source"].get("base_shape_zyx"):
+        raise ValueError(
+            "native Fiberlet output base_shape_zyx differs from the recorded fiber prediction"
+        )
     for name in ("fiber_prediction", "normal_prediction"):
         stored = sources.get(name) if isinstance(sources.get(name), dict) else {}
         expected = record["dependencies"][name]
@@ -882,7 +989,7 @@ def finalize_fiberlet_provenance(run_dir: Path, record: dict[str, Any]) -> None:
         },
         "artifacts": [{
             "kind": "fiberlet-zarr",
-            "path": "fiberlets.zarr",
+            "path": dataset_relative.as_posix(),
             "metadata_sha256": _sha256(dataset / ".zattrs"),
         }],
     }

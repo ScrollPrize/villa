@@ -11,12 +11,11 @@ from dataclasses import replace
 import json
 import os
 from pathlib import Path
-import shutil
 
 import pytest
 
 from lasagna.manager.config import ManagerConfig
-from lasagna.manager.fiberlets import finalize_fiberlet_provenance, resolve_fiberlet_inputs
+from lasagna.manager.fiberlets import resolve_fiberlet_inputs
 from lasagna.manager.open_data import resolve_model_id, validate_inference
 from lasagna.manager.snapshots import import_snapshot
 
@@ -34,11 +33,15 @@ def test_existing_fiber_and_normal_inputs(tmp_path: Path) -> None:
     fiber_path = _run_path("LAS_MANAGER_TEST_FIBER_RUN")
     normal_path = _run_path("LAS_MANAGER_TEST_NORMAL_RUN")
     assert fiber_path.parent == normal_path.parent
-    config = ManagerConfig(output_dir=str(fiber_path.parent), cache_dir=str(tmp_path))
+    roots = tuple(filter(None, os.environ.get("LAS_MANAGER_TEST_SNAPSHOT_DIRS", "").split(os.pathsep)))
+    config = ManagerConfig(
+        output_dir=str(fiber_path.parent), cache_dir=str(tmp_path), snapshot_dirs=roots,
+    )
     fiber, normal = resolve_fiberlet_inputs(config, fiber_path.name, normal_path.name)
     assert fiber["source"]["sample_id"] == normal["source"]["sample_id"]
     assert fiber["source"]["volume_id"] == normal["source"]["volume_id"]
     assert fiber["manifest_sha256"] and normal["manifest_sha256"]
+    assert fiber["model"]["atlas_model_id"] and normal["model"]["atlas_model_id"]
 
 
 def test_existing_fiberlet_bundle_has_bounded_publication_plan(tmp_path: Path) -> None:
@@ -47,18 +50,16 @@ def test_existing_fiberlet_bundle_has_bounded_publication_plan(tmp_path: Path) -
         output_dir=str(run.parent), cache_dir=str(tmp_path),
         upload_staging_s3="s3://test-only/not-uploaded",
     )
+    record = json.loads((run / "metadata.json").read_text())
+    attrs = json.loads((run / record["artifacts"]["dataset"] / ".zattrs").read_text())
+    if attrs.get("format_version") != 3:
+        with pytest.raises(ValueError):
+            validate_inference(config, run.name)
+        return
     plan = validate_inference(config, run.name)
     assert plan.files is None  # No materialized payload inventory.
     assert plan.model_id is None  # Derived artifact, not a new model.
-    record = json.loads((run / "metadata.json").read_text())
-    local_dataset = tmp_path / record["artifacts"]["dataset"]
-    for name in (".zgroup", ".zattrs", "anchors/.zarray", "prefix/.zarray", "routes/.zarray"):
-        destination = local_dataset / name
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(run / record["artifacts"]["dataset"] / name, destination)
-    finalize_fiberlet_provenance(tmp_path, record)
-    rebuilt = json.loads((tmp_path / record["artifacts"]["provenance"]).read_text())
-    assert rebuilt["fiberlet_dataset"] == plan.provenance["fiberlet_dataset"]
+    assert plan.provenance["fiberlet_dataset"]["format_version"] == 3
 
 
 def test_existing_checkpoint_import_preserves_publication_identity(tmp_path: Path) -> None:

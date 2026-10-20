@@ -18,6 +18,9 @@ except ImportError:  # pragma: no cover - monorepo package import mode.
     from lasagna.inference_provenance import validate_portable_bundle
 
 from .config import ManagerConfig
+from .fiberlets import (
+    resolve_bundle_relative, validate_published_fiberlet_dataset,
+)
 from .runs import atomic_json, resolve_run, utc_now
 from .snapshots import SnapshotRecord, index_snapshots
 
@@ -241,10 +244,38 @@ def validate_inference(
         "fiberlets" if is_fiberlet else "inference",
     )
     if is_fiberlet:
-        expected = bundle / "fiberlets.zarr"
-        for relative in (".zgroup", ".zattrs", "anchors/.zarray", "prefix/.zarray", "routes/.zarray"):
-            if not (expected / relative).is_file():
-                raise ValueError(f"Fiberlet bundle is missing fiberlets.zarr/{relative}")
+        entries = [
+            entry for entry in provenance.get("artifacts", ())
+            if isinstance(entry, dict) and entry.get("kind") == "fiberlet-zarr"
+        ]
+        if len(entries) != 1 or not isinstance(entries[0].get("path"), str):
+            raise ValueError(
+                "Fiberlet provenance must record exactly one dataset path"
+            )
+        relative = str(entries[0]["path"])
+        expected = resolve_bundle_relative(
+            bundle, relative, label="Fiberlet provenance dataset path",
+        )
+        artifact_root = Path(str(record["artifacts"].get("root", "artifacts")))
+        dataset_record = Path(str(record["artifacts"].get("dataset", "")))
+        try:
+            recorded_relative = dataset_record.relative_to(artifact_root).as_posix()
+        except ValueError as error:
+            raise ValueError(
+                "recorded Fiberlet dataset must be inside the artifact bundle"
+            ) from error
+        if recorded_relative != Path(relative).as_posix():
+            raise ValueError(
+                "Fiberlet provenance dataset path differs from the durable run record"
+            )
+        validate_published_fiberlet_dataset(expected)
+        metadata_hash = str(entries[0].get("metadata_sha256") or "").lower()
+        if metadata_hash != hashlib.sha256(
+            (expected / ".zattrs").read_bytes()
+        ).hexdigest():
+            raise ValueError(
+                "Fiberlet root metadata differs from portable provenance"
+            )
         if (bundle / INCOMPLETE_MARKER).exists():
             raise ValueError(f"reserved upload filename in bundle: {INCOMPLETE_MARKER}")
         files = None
