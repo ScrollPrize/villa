@@ -69,7 +69,7 @@
       64,
       64
     ],
-    "rope_type": "mixed",
+    "rope_type": "compass",
     "rope_shift_coords": 1.5,
     "rope_jitter_coords": 1.5,
     "rope_rescale_coords": 2.5,

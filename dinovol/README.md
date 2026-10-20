@@ -140,9 +140,7 @@ The recipe uses these throughput and memory settings. Defaults are noted below:
   installations without Triton fall back to PyTorch. `"triton"` has the same
   compatibility fallback; `"torch"` disables the custom path. Use `"torch"` for
   higher-order differentiation. Parameter names and shapes are unchanged.
-  Validate with `AGENTS_AGENT_MODE=1 .venv/bin/python -m unittest
-  tests.test_channel_norm tests.test_attention_checkpoint`. An isolated
-  full-resolution forward/backward comparison is available with
+  An isolated full-resolution forward/backward comparison is available with
   `AGENTS_AGENT_MODE=1 .venv/bin/python -m dinovol_2.bench_kernels channel_norm
   --dim 32 --spatial-size 192 --batch-size 2 --backend triton --compile`;
   use `--backend torch --compile` for the compiled reference. This microbenchmark
@@ -343,10 +341,6 @@ parameter layout. All CNN embeddings now use zero padding; older checkpoints
 can load with matching architecture, but their boundary behavior changes.
 Spatial CNN chunking and the separate `*_view_size` dataset settings have been
 removed; use `*_crop_size` and optionally `deeper_embed_batch_chunk_size`.
-The CNN regression tests check the recipe's architecture
-on a 32³ synthetic crop, gradients, masking, and checkpoint reconstruction;
-the pretraining smoke suite also exercises the projection-free path with a
-smaller CNN and synthetic volume.
 
 The volume list is pinned from the public
 [scan metadata](https://vesuvius-challenge-open-data.s3.amazonaws.com/metadata.json),
@@ -382,13 +376,6 @@ sampling. On CUDA with Triton it accumulates the eight neighbours directly into
 the output, avoiding copied source grids and `[points, 8, channels] intermediates.
 CPU, differentiable callers, and installations without Triton use the shared
 PyTorch sampler. Point supervision's differentiable sampler is unchanged.
-
-Run the kernel regressions in the existing environment:
-
-```bash
-AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
-  .venv/bin/python -m unittest tests.test_kernel_ops -v
-```
 
 The real-volume validator checks that every required cached Zarr chunk exists,
 reads four overlapping 192³ crops, applies the checkpoint's normalization, and
@@ -493,13 +480,6 @@ The seed checkpoint must exist before launch. `status` reads the latest launch
 recorded in `BENCH_ROOT/latest-run.txt`. Earlier benchmark directories are kept,
 including when a later launch fails. The launcher does not stop existing GPU
 processes; choose a free GPU before running it.
-
-The filesystem behavior is checked with mocked process launches (no GPU or
-training process is started):
-
-```bash
-python -m unittest discover -s tests -p test_bench_speed.py
-```
 
 ### Pseudo-object losses
 
@@ -667,10 +647,33 @@ The following settings can be added to a training config:
   the compile cache). Set `null` to use PyTorch's kernel selection, or set
   `"cudnn"` to prefer cuDNN. Performance depends on the GPU and token shape;
   `pretrain_8_9um.json` uses `"flash"`.
-- `rope_type` selects the existing 3D `axial` or learnable per-block `mixed`
+- `rope_type` selects 3D `axial`, learnable per-block `mixed`, or `compass`
   implementation. The default is `axial` for `v3`, `mixed` for `v2`, and `axial`
-  for the original unversioned model. Both support variable crop sizes and coordinate rescaling.
-  The attention head dimension must be divisible by six for 3D RoPE.
+  for the original unversioned model. All support variable crop sizes and coordinate rescaling.
+  The attention head dimension must be divisible by six for axial/mixed 3D RoPE;
+  Compass only requires an even head dimension.
+- `rope_type: "compass"` implements [Compass-RoPE](https://openreview.net/pdf?id=kbIXDF7PD0)
+  (Section 5 and Appendix F): signed learnable radii, stratified angular
+  initialization, and unitary Fourier mixing within each head, independently
+  per block. Its 2D path implements the paper's complex DFT exactly using real
+  matrix products. The paper does not define a 3D version: Dinovol extends it
+  with spherical directions (stratified azimuth and independently shuffled,
+  stratified cos(polar)) and a real orthogonal Hartley transform across pairs,
+  applied identically to all three frequency components. This preserves frequency
+  energy and commutes with spatial rotations. It is an unvalidated 3D adaptation,
+  not a reproduction of the paper's 2D results.
+  Phases use Cartesian dot products, equivalent to the polar formula without
+  singularities at the origin, and retain Dinovol's normalized coordinates,
+  `2*pi` frequency convention and coordinate augmentations. Radii initialize
+  from the configured geometric period schedule over all pairs, with 1% uniform
+  multiplicative jitter (the paper leaves the noise amplitude unspecified).
+  Set `rope_kwargs: {"use_dft": false}` for the no-mixing ablation, or
+  `rope_kwargs: {"radial_jitter": 0.0}` to disable initialization noise.
+  Phase computation disables autocast and requires FP32 (default) or FP64;
+  radii and angles receive no weight decay, as with mixed frequencies.
+  `pretrain_8_9um_heads32768.json` enables Compass. Start a fresh run when switching
+  from axial/mixed: their frequency tensors and optimizer states cannot be
+  resumed as Compass parameters. Existing Compass checkpoints resume normally.
 - `rope_shift_coords`, `rope_jitter_coords` and `rope_rescale_coords` augment the
   student's RoPE coordinates during training (the EMA teacher always uses the
   plain grid): a uniform shift in `[-shift, shift]` per axis (coordinates span
@@ -741,8 +744,7 @@ token-only masking, including parameter gradients. For `"deeper"`, it prevents
 neighboring embeddings from observing the hidden voxel values and changes
 training behavior, including when resuming an older checkpoint. There is no
 legacy masking mode or configuration switch; checkpoint parameter shapes stay
-unchanged. Output/gradient equivalence and hidden-voxel isolation are covered by
-`tests/test_voxel_masking.py` in the standard test suite.
+unchanged.
 
 ## Gram Anchoring And HR Adaptation
 
@@ -824,23 +826,6 @@ To sanity-check one batch end to end:
 ```bash
 uv run python -m dinovol_2.verify dinovol_2/example_config.json --no-amp
 ```
-
-To run the synthetic smoke suite:
-
-```bash
-uv run python -m unittest discover -s tests -v
-```
-
-With an existing environment, run without installing or updating dependencies:
-
-```bash
-AGENTS_AGENT_MODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 .venv/bin/python -m unittest discover -s tests -v
-```
-
-The suite includes synthetic volume smoke tests and regressions for checkpoint
-initialization, output norms, both RoPE implementations, constant LR, paired Gram
-geometry, and two-rank KoLeo gradients. It does not establish downstream quality;
-validate training changes on real held-out volumes before a long run.
 
 ## Point-supervised pretraining
 

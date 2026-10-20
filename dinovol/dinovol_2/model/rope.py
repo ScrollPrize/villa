@@ -352,3 +352,116 @@ class MixedRopePositionEmbedding(_BaseRopePositionEmbedding):
 
     def forward(self, shape: Sequence[int]) -> RopeEmbedding:
         return self.get_embed(shape)
+
+
+class CompassRopePositionEmbedding(_BaseRopePositionEmbedding):
+    """Compass-RoPE (Sec. 5 / Appendix F, https://openreview.net/pdf?id=kbIXDF7PD0).
+
+    In 2D, signed radii and stratified polar angles form complex frequencies,
+    mixed by a unitary DFT within each head. Cartesian phase evaluation is
+    equivalent to the paper's polar formula, without atan2 at the grid origin.
+
+    The paper is 2D only. Our 3D extension uses spherical angles and the real
+    orthogonal Hartley transform (Re(DFT) - Im(DFT)) on each spatial component.
+    Unlike discarding the imaginary part of a complex FFT, this preserves
+    frequency energy and commutes with spatial rotations, without favoring an
+    axis. Both paths retain Dinovol's normalized coordinates and 2*pi scaling.
+    """
+
+    def __init__(
+        self,
+        head_dim: int,
+        *,
+        ndim: int,
+        num_heads: int,
+        base: float | None = 100.0,
+        min_period: float | None = None,
+        max_period: float | None = None,
+        normalize_coords: Literal["min", "max", "separate"] = "separate",
+        shift_coords: float | None = None,
+        jitter_coords: float | None = None,
+        rescale_coords: float | None = 2.0,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+        use_dft: bool = True,
+        radial_jitter: float = 0.01,
+    ) -> None:
+        if head_dim <= 0 or head_dim % 2:
+            raise ValueError(f"Compass RoPE requires a positive even head_dim, got {head_dim}")
+        if num_heads <= 0:
+            raise ValueError(f"num_heads must be positive for Compass RoPE, got {num_heads}")
+        if not 0 <= radial_jitter < 1:
+            raise ValueError(f"radial_jitter must be in [0, 1), got {radial_jitter}")
+        if dtype not in (None, torch.float32, torch.float64):
+            raise ValueError("Compass RoPE requires float32 or float64 phase precision")
+        super().__init__(
+            head_dim, ndim=ndim, base=base, min_period=min_period, max_period=max_period,
+            normalize_coords=normalize_coords, shift_coords=shift_coords,
+            jitter_coords=jitter_coords, rescale_coords=rescale_coords, dtype=dtype, device=device,
+        )
+        self.num_heads = int(num_heads)
+        self.num_pairs = self.head_dim // 2
+        self.use_dft = bool(use_dft)
+        self.radial_jitter = float(radial_jitter)
+        self.register_buffer("periods", self._build_periods(self.num_pairs, self.head_dim, device=device))
+        self.radii = nn.Parameter(torch.empty(num_heads, self.num_pairs, device=device, dtype=self.dtype))
+        self.angles = nn.Parameter(torch.empty(num_heads, self.num_pairs, ndim - 1, device=device, dtype=self.dtype))
+
+        # Real matrix products implement the small per-head transforms without
+        # complex tensors, including under torch.compile and mixed precision.
+        indices = torch.arange(self.num_pairs, device=device, dtype=self.dtype)
+        phase = (2 * math.pi / self.num_pairs) * indices[:, None] * indices[None, :]
+        self.register_buffer("_dft_cos", phase.cos() / math.sqrt(self.num_pairs), persistent=False)
+        self.register_buffer("_dft_sin", phase.sin() / math.sqrt(self.num_pairs), persistent=False)
+        self._init_weights()
+
+    @torch.no_grad()
+    def _init_weights(self) -> None:
+        self.periods.copy_(self._build_periods(self.num_pairs, self.head_dim, device=self.periods.device))
+        self.radii.uniform_(1 - self.radial_jitter, 1 + self.radial_jitter)
+        self.radii.mul_(self.periods.reciprocal())
+        bins = torch.arange(self.num_pairs, device=self.periods.device, dtype=self.periods.dtype)
+        azimuth = (bins + torch.rand_like(self.radii)) * (2 * math.pi / self.num_pairs)
+        self.angles[..., 0].copy_(azimuth)
+        if self.ndim == 3:
+            # Uniform polar angles would concentrate directions at the poles.
+            # Stratify cos(polar) instead, and independently permute its bins
+            # per head so latitude is not correlated with azimuth or radius.
+            for head in range(self.num_heads):
+                order = torch.randperm(self.num_pairs, device=self.periods.device)
+                z = 2 * (bins + torch.rand_like(bins)) / self.num_pairs - 1
+                self.angles[head, :, 1].copy_(z[order].acos())
+
+    @torch.jit.ignore
+    def no_weight_decay(self) -> set[str]:
+        return {"radii", "angles"}
+
+    def _mix_frequencies(self, frequencies: Tensor) -> Tensor:
+        if not self.use_dft:
+            return frequencies
+        if self.ndim == 2:
+            x, y = frequencies.unbind(-1)
+            # (C - iS) @ (x + iy), exactly fft(..., norm="ortho").
+            return torch.stack((x @ self._dft_cos.T + y @ self._dft_sin.T,
+                                y @ self._dft_cos.T - x @ self._dft_sin.T), dim=-1)
+        return (self._dft_cos + self._dft_sin) @ frequencies
+
+    def get_embed_from_coords(self, coords: RopeCoords) -> RopeEmbedding:
+        with torch.autocast(device_type=coords.device.type, enabled=False):
+            azimuth = self.angles[..., 0]
+            if self.ndim == 2:
+                directions = torch.stack((azimuth.cos(), azimuth.sin()), dim=-1)
+            else:
+                polar = self.angles[..., 1]
+                directions = torch.stack((polar.sin() * azimuth.cos(),
+                                          polar.sin() * azimuth.sin(), polar.cos()), dim=-1)
+            frequencies = self._mix_frequencies(self.radii[..., None] * directions)
+            phases = 2 * math.pi * torch.einsum("td,hpd->htp", coords.to(self.radii.dtype), frequencies)
+            phases = phases.tile(2)
+            return phases.sin(), phases.cos()
+
+    def get_embed(self, shape: Sequence[int]) -> RopeEmbedding:
+        return self.get_embed_from_coords(self.get_coords(shape))
+
+    def forward(self, shape: Sequence[int]) -> RopeEmbedding:
+        return self.get_embed(shape)

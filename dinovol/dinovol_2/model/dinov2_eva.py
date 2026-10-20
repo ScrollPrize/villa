@@ -18,6 +18,7 @@ from einops import rearrange
 
 from dinovol_2.model.patch_encode_decode import PatchEmbed, PatchEmbedDeeper
 from dinovol_2.model.rope import (
+    CompassRopePositionEmbedding,
     MixedRopePositionEmbedding,
     RopeCoords,
     RopeEmbedding,
@@ -599,15 +600,18 @@ class Eva(nn.Module):
         self.pos_embed = nn.Parameter(
             torch.zeros(1, num_patches + self.num_class_tokens, embed_dim)) if use_abs_pos_emb else None
         self.pos_drop = nn.Dropout(p=pos_drop_rate)
-        self.use_per_block_rope = bool(use_rot_pos_emb and rope_impl is MixedRopePositionEmbedding)
+        self.use_per_block_rope = bool(
+            use_rot_pos_emb and rope_impl in (MixedRopePositionEmbedding, CompassRopePositionEmbedding)
+        )
         if use_rot_pos_emb and embed_dim % num_heads != 0:
             raise ValueError(
                 f"embed_dim must be divisible by num_heads, got embed_dim={embed_dim}, num_heads={num_heads}"
             )
         head_dim = embed_dim // num_heads
-        if use_rot_pos_emb and head_dim % (2 * self.ndim) != 0:
+        rope_dim_multiple = 2 if rope_impl is CompassRopePositionEmbedding else 2 * self.ndim
+        if use_rot_pos_emb and head_dim % rope_dim_multiple != 0:
             raise ValueError(
-                f"RoPE requires head_dim divisible by 2 * ndim, got head_dim={head_dim}, ndim={self.ndim}"
+                f"RoPE requires head_dim divisible by {rope_dim_multiple}, got head_dim={head_dim}, ndim={self.ndim}"
             )
         if use_rot_pos_emb and not self.use_per_block_rope:
             self.rope_embed = rope_impl(

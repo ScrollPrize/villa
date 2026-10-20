@@ -20,7 +20,7 @@ from torch.utils.checkpoint import checkpoint
 
 from dinovol_2.model.dinov2_eva import Eva, EvaWithChunking
 from dinovol_2.ops.point_embeddings import sample_grid_points, sample_selected_grid_points
-from dinovol_2.model.rope import MixedRopePositionEmbedding, RopePositionEmbedding
+from dinovol_2.model.rope import CompassRopePositionEmbedding, MixedRopePositionEmbedding, RopePositionEmbedding
 
 
 _BACKBONE_DEFAULTS = {
@@ -156,6 +156,7 @@ _ROPE_IMPL_ALIASES = {
     "default": RopePositionEmbedding,
     "mixed": MixedRopePositionEmbedding,
     "mixed_learnable": MixedRopePositionEmbedding,
+    "compass": CompassRopePositionEmbedding,
 }
 _HEAD_DEFAULTS = {
     "hidden_dim": 2048,
