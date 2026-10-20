@@ -89,10 +89,11 @@ vo::Anchor anchorFromPy(const nb::handle& obj)
     nb::dict d = nb::cast<nb::dict>(obj);
     for (auto item : d) {
         const auto key = nb::cast<std::string>(item.first);
-        if (key != "points" && key != "whole_geometry" && key != "position" && key != "direction" && key != "metadata_keys")
+        if (key != "points" && key != "whole_geometry" && key != "position" && key != "direction" && key != "metadata_keys" && key != "channels")
             throw std::invalid_argument("unknown anchor field: " + key);
     }
     if (has(d, "whole_geometry")) a.wholeGeometry = nb::cast<bool>(d["whole_geometry"]);
+    if (has(d, "channels")) a.channels = nb::cast<std::vector<std::string>>(d["channels"]);
     if (has(d, "metadata_keys")) a.metadataKeys = nb::cast<std::vector<std::string>>(d["metadata_keys"]);
     if (has(d, "points")) for (nb::handle item : nb::cast<nb::list>(d["points"])) {
         const auto point = nb::cast<nb::dict>(item);
@@ -114,6 +115,7 @@ nb::dict anchorToPy(const vo::Anchor& a)
 {
     nb::dict d;
     if (a.wholeGeometry) d["whole_geometry"] = true;
+    if (!a.channels.empty()) d["channels"] = a.channels;
     if (!a.metadataKeys.empty()) d["metadata_keys"] = a.metadataKeys;
     if (!a.points.empty()) {
         nb::list points;
@@ -328,6 +330,7 @@ nb::dict geometryToPy(const vo::GeometryRevision& r)
     nb::list arrays;
     for (const auto& a : r.arrays) {
         nb::dict item; item["name"] = a.name; item["dtype"] = a.dtype;
+        if (r.kind == "patch") item["components"] = a.shape.size() == 3 ? a.shape[2] : 1;
         item["shape"] = a.shape; item["byte_length"] = a.byteLength; arrays.append(item);
     }
     result["arrays"] = arrays;

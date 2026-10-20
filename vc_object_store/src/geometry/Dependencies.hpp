@@ -8,6 +8,7 @@ namespace vc::objects::detail {
 // A bounded reader for either a published revision or a proposed payload.
 struct DependencyGeometry {
     std::string kind, attributes;
+    std::map<std::string, std::string> fingerprints;
     std::map<std::string, GeometryArrayInfo> arrays;
     std::function<std::vector<uint8_t>(const std::string&, int64_t, int64_t)> read;
     struct PointIndex {
@@ -39,9 +40,13 @@ inline DependencyGeometry dependencyGeometry(const ObjectStore& db, const Txn& t
         const auto cached = activeDependencies->find(key);
         if (cached != activeDependencies->end()) return cached->second;
     }
-    DependencyGeometry result{revision.kind, revision.attributes, {}, {}};
+    DependencyGeometry result; result.kind = revision.kind; result.attributes = revision.attributes;
     for (const auto& array : revision.arrays) result.arrays.emplace(array.name, array);
     auto reader = std::make_shared<GeometryReader>(txn, revision.uuid);
+    for (const auto& [name, a] : reader->manifest().at("arrays").items()) {
+        auto descriptor = a; descriptor.erase("source_revision");
+        result.fingerprints[name] = descriptor.dump();
+    }
     result.read = [reader](const auto& name, auto offset, auto count) {
         return reader->read(name, offset, count);
     };
@@ -54,7 +59,7 @@ inline DependencyGeometry dependencyGeometry(const ObjectStore& db, const Txn& t
 
 inline DependencyGeometry dependencyGeometry(const GeometryData& data)
 {
-    DependencyGeometry result{data.kind, data.attributes, {}, {}};
+    DependencyGeometry result; result.kind = data.kind; result.attributes = data.attributes;
     for (const auto& array : data.arrays)
         result.arrays.emplace(array.name, GeometryArrayInfo{array.name, array.dtype, array.shape, static_cast<int64_t>(array.bytes.size())});
     result.read = [&data](const auto& name, int64_t offset, int64_t count) {
@@ -128,8 +133,32 @@ inline void validateDependencies(const Anchor& anchor, const DependencyGeometry&
 
 inline bool dependenciesChanged(const Anchor& anchor, const DependencyGeometry& before, const DependencyGeometry& after)
 {
-    if (anchor.wholeGeometry || anchor.points.empty() || before.kind != after.kind || before.attributes != after.attributes) return true;
+    if (before.kind != after.kind || before.attributes != after.attributes) return true;
+    auto changed = [&](const std::string& name) {
+        const auto a = before.arrays.find(name), b = after.arrays.find(name);
+        if (a == before.arrays.end() || b == after.arrays.end()) return a != before.arrays.end() || b != after.arrays.end();
+        if (a->second.dtype != b->second.dtype || a->second.shape != b->second.shape) return true;
+        if (before.fingerprints.contains(name) && after.fingerprints.contains(name))
+            return before.fingerprints.at(name) != after.fingerprints.at(name);
+        return before.read(name, 0, a->second.byteLength) != after.read(name, 0, b->second.byteLength);
+    };
+    for (const auto& channel : anchor.channels) if (changed(channel)) return true;
+    if (anchor.wholeGeometry || anchor.points.empty()) {
+        // Whole geometry includes every array; unknown legacy dependencies
+        // remain conservative. Explicit point anchors depend only on their
+        // declared points and optional channels.
+        std::set<std::string> names;
+        for (const auto& [name, a] : before.arrays) names.insert(name);
+        for (const auto& [name, a] : after.arrays) names.insert(name);
+        for (const auto& name : names) if (changed(name)) return true;
+        return false;
+    }
+    auto identical = [&](const std::string& name) {
+        return before.fingerprints.contains(name) && after.fingerprints.contains(name) &&
+               before.fingerprints.at(name) == after.fingerprints.at(name);
+    };
     for (const auto& point : anchor.points) {
+        if (identical(point.array) && (point.array != "point_ids" || identical("points"))) continue;
         const auto old = pointValue(before, point), next = pointValue(after, point);
         if (!old || !next || old != next) return true;
         // Positional identities cannot be assumed to survive insertion/removal.

@@ -113,7 +113,7 @@ std::vector<GeometryChunkChange> decodeGeometryDelta(sqlite3* db, const std::str
     return result;
 }
 void applyGeometryDelta(std::vector<uint8_t>& bytes, const GeometryChunkChange& c, bool reverse) {
-    if (geometryHash(bytes) != (reverse ? c.afterHash : c.beforeHash))
+    if (geometryPayloadHash(c.key.first, bytes) != (reverse ? c.afterHash : c.beforeHash))
         throw std::runtime_error("geometry delta: parent chunk mismatch");
     for (const auto& edit : c.changes) {
         const auto& before = reverse ? edit.after : edit.before;
@@ -123,7 +123,7 @@ void applyGeometryDelta(std::vector<uint8_t>& bytes, const GeometryChunkChange& 
             throw std::runtime_error("geometry delta: original bytes mismatch");
         std::copy(after.begin(), after.end(), bytes.begin() + edit.offset);
     }
-    if (geometryHash(bytes) != (reverse ? c.beforeHash : c.afterHash))
+    if (geometryPayloadHash(c.key.first, bytes) != (reverse ? c.beforeHash : c.afterHash))
         throw std::runtime_error("geometry delta: result chunk mismatch");
 }
 void clearGeometryMaterialization(sqlite3* db, const std::string& object) {

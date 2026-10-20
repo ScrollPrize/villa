@@ -6,6 +6,8 @@
 #include <filesystem>
 #include <iostream>
 #include <map>
+#include <memory>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
 #include <vector>
@@ -512,4 +514,68 @@ void atomicImwriteMulti(const std::filesystem::path& outPath,
         std::filesystem::remove(tmpPath, ec);
         throw;
     }
+}
+
+TiffSamples readTiffSamples(const std::filesystem::path& path, bool strictLayout)
+{
+    std::unique_ptr<TIFF, decltype(&TIFFClose)> tif(TIFFOpen(path.string().c_str(), "r"), TIFFClose);
+    auto fail = [&](const char* reason) { throw std::runtime_error(std::string(reason) + ": " + path.string()); };
+    if (!tif) fail("cannot read TIFF");
+    TiffSamples result;
+    uint16_t planar = 0, orientation = 0, photometric = 0;
+    uint32_t depth = 1;
+    TIFFGetField(tif.get(), TIFFTAG_IMAGEWIDTH, &result.width);
+    TIFFGetField(tif.get(), TIFFTAG_IMAGELENGTH, &result.height);
+    TIFFGetFieldDefaulted(tif.get(), TIFFTAG_BITSPERSAMPLE, &result.bits);
+    TIFFGetFieldDefaulted(tif.get(), TIFFTAG_SAMPLEFORMAT, &result.sampleFormat);
+    TIFFGetFieldDefaulted(tif.get(), TIFFTAG_SAMPLESPERPIXEL, &result.components);
+    TIFFGetFieldDefaulted(tif.get(), TIFFTAG_PLANARCONFIG, &planar);
+    TIFFGetFieldDefaulted(tif.get(), TIFFTAG_ORIENTATION, &orientation);
+    TIFFGetFieldDefaulted(tif.get(), TIFFTAG_PHOTOMETRIC, &photometric);
+    TIFFGetFieldDefaulted(tif.get(), TIFFTAG_IMAGEDEPTH, &depth);
+    if (!result.width || !result.height || result.width > INT_MAX || result.height > INT_MAX || !result.components ||
+        (planar != PLANARCONFIG_CONTIG && planar != PLANARCONFIG_SEPARATE) ||
+        !((result.sampleFormat == SAMPLEFORMAT_IEEEFP && (result.bits == 32 || result.bits == 64)) ||
+          ((result.sampleFormat == SAMPLEFORMAT_UINT || result.sampleFormat == SAMPLEFORMAT_INT) &&
+           (result.bits == 8 || result.bits == 16 || result.bits == 32 || result.bits == 64))))
+        fail("unsupported TIFF samples");
+    if (strictLayout && (orientation != ORIENTATION_TOPLEFT || depth != 1 || TIFFNumberOfDirectories(tif.get()) != 1 ||
+        (photometric != PHOTOMETRIC_MINISBLACK && photometric != PHOTOMETRIC_MINISWHITE && photometric != PHOTOMETRIC_RGB)))
+        fail("unsupported TIFF layout (orientation, depth, pages or photometric)");
+    const size_t scalar = result.bits / 8, pixel = scalar * result.components;
+    const uint64_t pixels = uint64_t(result.width) * result.height;
+    if (pixels > result.bytes.max_size() / pixel) fail("TIFF dimensions overflow");
+    const auto size = pixels * pixel;
+    result.bytes.resize(size);
+    const size_t stride = planar == PLANARCONFIG_SEPARATE ? scalar : pixel;
+    const auto planes = planar == PLANARCONFIG_SEPARATE ? result.components : 1;
+    auto copy = [&](uint32_t y, uint32_t x, uint16_t plane, const uint8_t* input) {
+        std::memcpy(result.bytes.data() + (size_t(y)*result.width+x)*pixel + plane*scalar, input, stride);
+    };
+    if (TIFFIsTiled(tif.get())) {
+        uint32_t tw = 0, th = 0, td = 1;
+        TIFFGetField(tif.get(), TIFFTAG_TILEWIDTH, &tw); TIFFGetField(tif.get(), TIFFTAG_TILELENGTH, &th);
+        TIFFGetFieldDefaulted(tif.get(), TIFFTAG_TILEDEPTH, &td);
+        const auto bytes = TIFFTileSize(tif.get());
+        if (!tw || !th || td != 1 || bytes <= 0 || uint64_t(tw)*th*stride != uint64_t(bytes)) fail("invalid TIFF tile");
+        std::vector<uint8_t> buffer(size_t(bytes), 0);
+        for (uint16_t plane = 0; plane < planes; ++plane)
+            for (uint32_t y = 0; y < result.height; y += th)
+                for (uint32_t x = 0; x < result.width; x += tw) {
+                    if (TIFFReadTile(tif.get(), buffer.data(), x, y, 0, plane) != bytes) fail("truncated TIFF tile");
+                    for (uint32_t dy = 0; dy < std::min(th, result.height-y); ++dy)
+                        for (uint32_t dx = 0; dx < std::min(tw, result.width-x); ++dx)
+                            copy(y+dy, x+dx, plane, buffer.data()+(size_t(dy)*tw+dx)*stride);
+                }
+    } else {
+        const auto bytes = TIFFScanlineSize(tif.get());
+        if (bytes <= 0 || uint64_t(result.width)*stride != uint64_t(bytes)) fail("invalid TIFF row");
+        std::vector<uint8_t> buffer(size_t(bytes), 0);
+        for (uint16_t plane = 0; plane < planes; ++plane)
+            for (uint32_t y = 0; y < result.height; ++y) {
+                if (TIFFReadScanline(tif.get(), buffer.data(), y, plane) != 1) fail("truncated TIFF row");
+                for (uint32_t x = 0; x < result.width; ++x) copy(y, x, plane, buffer.data()+x*stride);
+            }
+    }
+    return result;
 }

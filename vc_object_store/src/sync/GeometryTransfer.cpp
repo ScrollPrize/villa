@@ -64,7 +64,14 @@ void transferGeometry(sqlite3* source, sqlite3* destination, const std::string& 
         std::map<std::string, GeometryLayout> layouts;
         for (const auto& [name, array] : parsed.at("arrays").items()) {
             const auto layout = geometryLayout(array);
-            expected += layout.chunkCount(); layouts.emplace(name, layout);
+            if (!array.contains("source_revision")) expected += layout.chunkCount();
+            else {
+                GeometryReader inherited(destination, array.at("source_revision").get<std::string>(), false);
+                auto original = inherited.manifest().at("arrays").at(name);
+                auto descriptor = array; original.erase("source_revision"); descriptor.erase("source_revision");
+                if (original != descriptor) throw std::runtime_error("sync: invalid inherited array");
+            }
+            layouts.emplace(name, layout);
         }
         while (chunks.row()) {
             ++count;

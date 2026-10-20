@@ -8,38 +8,23 @@ namespace vc::object_links {
 namespace {
 template<class T> double scalar(const uint8_t* p){T v;std::memcpy(&v,p,sizeof v);return double(v);}
 cv::Mat_<double> band(const std::filesystem::path& path){
-    std::unique_ptr<TIFF,decltype(&TIFFClose)> tif(TIFFOpen(path.string().c_str(),"r"),TIFFClose);
-    if(!tif)throw std::runtime_error("cannot read TIFF: "+path.string());
-    uint32_t w=0,h=0;uint16_t bits=0,fmt=0,samples=1,planar=1;
-    TIFFGetField(tif.get(),TIFFTAG_IMAGEWIDTH,&w);TIFFGetField(tif.get(),TIFFTAG_IMAGELENGTH,&h);
-    TIFFGetFieldDefaulted(tif.get(),TIFFTAG_BITSPERSAMPLE,&bits);TIFFGetFieldDefaulted(tif.get(),TIFFTAG_SAMPLEFORMAT,&fmt);
-    TIFFGetFieldDefaulted(tif.get(),TIFFTAG_SAMPLESPERPIXEL,&samples);TIFFGetFieldDefaulted(tif.get(),TIFFTAG_PLANARCONFIG,&planar);
-    if(!w||!h||w>INT_MAX||h>INT_MAX||!samples||!((fmt==SAMPLEFORMAT_IEEEFP&&(bits==32||bits==64))||((fmt==SAMPLEFORMAT_UINT||fmt==SAMPLEFORMAT_INT)&&(bits==8||bits==16||bits==32))))
-        throw std::runtime_error("unsupported TIFF samples: "+path.string());
-    auto value=[&](const uint8_t* p){
-        if(fmt==SAMPLEFORMAT_IEEEFP)return bits==32?scalar<float>(p):scalar<double>(p);
-        if(fmt==SAMPLEFORMAT_UINT){if(bits==8)return scalar<uint8_t>(p);if(bits==16)return scalar<uint16_t>(p);return scalar<uint32_t>(p);}
-        if(bits==8)return scalar<int8_t>(p);if(bits==16)return scalar<int16_t>(p);return scalar<int32_t>(p);
+    const auto samples = readTiffSamples(path, false);
+    const auto bits = samples.bits, fmt = samples.sampleFormat;
+    if (bits == 64 && fmt != SAMPLEFORMAT_IEEEFP)
+        throw std::runtime_error("unsupported TIFF samples: " + path.string());
+    auto value = [&](const uint8_t* p) -> double {
+        if (fmt == SAMPLEFORMAT_IEEEFP) return bits == 32 ? scalar<float>(p) : scalar<double>(p);
+        if (fmt == SAMPLEFORMAT_UINT) {
+            if (bits == 8) return scalar<uint8_t>(p); if (bits == 16) return scalar<uint16_t>(p);
+            return scalar<uint32_t>(p);
+        }
+        if (bits == 8) return scalar<int8_t>(p); if (bits == 16) return scalar<int16_t>(p);
+        return scalar<int32_t>(p);
     };
-    cv::Mat_<double> output(int(h),int(w),0.0);
-    size_t stride=(bits/8)*(planar==PLANARCONFIG_SEPARATE?1:samples);
-    if(TIFFIsTiled(tif.get())){
-        uint32_t tw=0,th=0;TIFFGetField(tif.get(),TIFFTAG_TILEWIDTH,&tw);TIFFGetField(tif.get(),TIFFTAG_TILELENGTH,&th);
-        auto bytes=TIFFTileSize(tif.get());if(!tw||!th||bytes<=0||uint64_t(tw)*th*stride>uint64_t(bytes))throw std::runtime_error("invalid TIFF tile");
-        std::vector<uint8_t> buffer(size_t(bytes),0);
-        for(uint32_t y=0;y<h;y+=th)for(uint32_t x=0;x<w;x+=tw){
-            if(TIFFReadTile(tif.get(),buffer.data(),x,y,0,0)<bytes)throw std::runtime_error("truncated TIFF tile");
-            for(uint32_t dy=0;dy<std::min(th,h-y);++dy)for(uint32_t dx=0;dx<std::min(tw,w-x);++dx)
-                output(int(y+dy),int(x+dx))=value(buffer.data()+(size_t(dy)*tw+dx)*stride);
-        }
-    }else{
-        auto bytes=TIFFScanlineSize(tif.get());if(bytes<=0||uint64_t(w)*stride>uint64_t(bytes))throw std::runtime_error("invalid TIFF row");
-        std::vector<uint8_t> buffer(size_t(bytes),0);
-        for(uint32_t y=0;y<h;++y){
-            if(TIFFReadScanline(tif.get(),buffer.data(),y,0)!=1)throw std::runtime_error("truncated TIFF row");
-            for(uint32_t x=0;x<w;++x)output(int(y),int(x))=value(buffer.data()+x*stride);
-        }
-    }
+    cv::Mat_<double> output(int(samples.height), int(samples.width), 0.0);
+    const size_t stride = (bits/8)*samples.components;
+    for (int y = 0; y < output.rows; ++y) for (int x = 0; x < output.cols; ++x)
+        output(y,x) = value(samples.bytes.data() + (size_t(y)*samples.width+x)*stride);
     return output;
 }
 }

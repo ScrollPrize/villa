@@ -12,6 +12,8 @@ void validateAnchor(const Anchor& anchor)
             if (!std::isfinite(value)) throw std::invalid_argument("anchors must be finite");
     if (anchor.wholeGeometry && !anchor.points.empty())
         throw std::invalid_argument("anchor cannot have both whole_geometry and point dependencies");
+    for (const auto& name : anchor.channels)
+        if (name.empty() || name == "points") throw std::invalid_argument("invalid channel dependency name");
     for (const auto& key : anchor.metadataKeys)
         if (key.empty()) throw std::invalid_argument("metadata dependency keys must be non-empty");
     for (const auto& point : anchor.points)
@@ -57,6 +59,7 @@ nlohmann::json dependenciesToJson(const Anchor& anchor)
     validateAnchor(anchor);
     nlohmann::json value = nlohmann::json::object();
     if (anchor.wholeGeometry) value["whole_geometry"] = true;
+    if (!anchor.channels.empty()) value["channels"] = anchor.channels;
     if (!anchor.metadataKeys.empty()) value["metadata_keys"] = anchor.metadataKeys;
     if (!anchor.points.empty()) {
         value["points"] = nlohmann::json::array();
@@ -69,6 +72,7 @@ nlohmann::json dependenciesToJson(const Anchor& anchor)
 
 void dependenciesFromJson(Anchor& anchor, const nlohmann::json& value)
 {
+    anchor.channels = value.value("channels", std::vector<std::string>{});
     anchor.wholeGeometry = value.value("whole_geometry", false);
     anchor.metadataKeys = value.value("metadata_keys", std::vector<std::string>{});
     for (const auto& point : value.value("points", nlohmann::json::array()))
@@ -90,7 +94,7 @@ Anchor anchorFromJson(const nlohmann::json& j)
     Anchor a;
     if (!j.is_object()) throw std::invalid_argument("anchor must be a JSON object");
     for (const auto& [key, value] : j.items())
-        if (key != "points" && key != "whole_geometry" && key != "position" && key != "direction" && key != "metadata_keys")
+        if (key != "points" && key != "whole_geometry" && key != "position" && key != "direction" && key != "metadata_keys" && key != "channels")
             throw std::invalid_argument("unknown anchor field: " + key);
     dependenciesFromJson(a, j);
     for (const char* key : {"position", "direction"}) {

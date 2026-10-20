@@ -116,3 +116,12 @@ bool mergeTiffParts(const std::string& outputPath, int numParts);
 // renames.
 void atomicImwriteMulti(const std::filesystem::path& outPath,
                         const std::vector<cv::Mat>& pages);
+
+// Native sample bytes in host byte order, interleaved in TIFF component order.
+// No color conversion, scaling, mask normalization or float conversion.
+struct TiffSamples {
+    uint32_t width = 0, height = 0;
+    uint16_t bits = 0, sampleFormat = 0, components = 0;
+    std::vector<uint8_t> bytes;
+};
+TiffSamples readTiffSamples(const std::filesystem::path&, bool strictLayout = true);

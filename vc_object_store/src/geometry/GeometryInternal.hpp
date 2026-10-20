@@ -8,11 +8,24 @@
 #include <limits>
 #include <cmath>
 #include <set>
+#include <map>
 #include <span>
 #include <cstring>
 #include <stdexcept>
 
 namespace vc::objects::detail {
+// Opt-in internal instrumentation for storage-work regression tests. Scoped
+// by the caller on its transaction thread; no global counters or payload copies.
+struct GeometryWork {
+    std::map<std::string, uint64_t> readBytes, hashedBytes;
+};
+inline thread_local GeometryWork* geometryWork = nullptr;
+class GeometryWorkScope {
+    GeometryWork* previous_;
+public:
+    explicit GeometryWorkScope(GeometryWork& work) : previous_(geometryWork) { geometryWork = &work; }
+    ~GeometryWorkScope() { geometryWork = previous_; }
+};
 inline constexpr size_t geometryChunkSize = 1024 * 1024;
 inline std::string geometryHash(std::span<const uint8_t> bytes)
 {
@@ -27,6 +40,11 @@ inline std::string geometryHash(std::span<const uint8_t> bytes)
     }
     return result;
 }
+inline std::string geometryPayloadHash(const std::string& name, std::span<const uint8_t> bytes)
+{
+    if (geometryWork) geometryWork->hashedBytes[name] += bytes.size();
+    return geometryHash(bytes);
+}
 inline nlohmann::json verifiedGeometryManifest(const std::string& text, const std::string& hash)
 {
     if (geometryHash(std::span(reinterpret_cast<const uint8_t*>(text.data()), text.size())) != hash)
@@ -34,15 +52,15 @@ inline nlohmann::json verifiedGeometryManifest(const std::string& text, const st
     return nlohmann::json::parse(text);
 }
 inline void verifyGeometryChunk(std::span<const uint8_t> bytes, const std::string& storedHash,
-                                const std::string& expectedHash, int64_t expectedSize)
+                                const std::string& expectedHash, int64_t expectedSize, const std::string& name = {})
 {
-    if (static_cast<int64_t>(bytes.size()) != expectedSize || storedHash != expectedHash || geometryHash(bytes) != expectedHash)
+    if (static_cast<int64_t>(bytes.size()) != expectedSize || storedHash != expectedHash || geometryPayloadHash(name, bytes) != expectedHash)
         throw std::runtime_error("geometry: corrupt payload chunk");
 }
 // Storage layout is independent of logical geometry format_version. Missing
 // storage metadata denotes the original contiguous 1 MiB chunk representation.
 struct GeometryLayout {
-    int64_t length = 0, rows = 0, cols = 0, tile = 0;
+    int64_t length = 0, rows = 0, cols = 0, tile = 0, pixelBytes = 0;
     int64_t tileColumns() const { return cols / tile + (cols % tile != 0); }
     int64_t chunkCount() const {
         return tile ? (rows / tile + (rows % tile != 0)) * tileColumns()
@@ -56,7 +74,7 @@ struct GeometryLayout {
         if (index < 0 || index >= chunkCount()) throw std::runtime_error("geometry: invalid chunk index");
         if (!tile) return std::min<int64_t>(geometryChunkSize, length - index * geometryChunkSize);
         const auto rect = rectangle(index);
-        return rect[2] * rect[3] * 12;
+        return rect[2] * rect[3] * pixelBytes;
     }
 };
 // Copy one physical chunk into its full logical row-major array destination.
@@ -68,8 +86,8 @@ inline void copyGeometryChunk(const GeometryLayout& layout, int64_t index,
     } else {
         const auto [y, x, h, w] = layout.rectangle(index);
         for (int64_t row = 0; row < h; ++row)
-            std::memcpy(destination + ((y + row) * layout.cols + x) * 12,
-                        bytes.data() + row * w * 12, w * 12);
+            std::memcpy(destination + ((y + row) * layout.cols + x) * layout.pixelBytes,
+                        bytes.data() + row * w * layout.pixelBytes, w * layout.pixelBytes);
     }
 }
 inline void validatePatchTileSize(int64_t size) {
@@ -86,12 +104,13 @@ inline GeometryLayout geometryLayout(const nlohmann::json& array, bool checkChun
     if (array.contains("storage")) {
         const auto& storage = array.at("storage");
         if (storage.at("version") != 1 || storage.at("layout") != "tiles" ||
-            array.at("dtype") != "<f4" || shape.size() != 3 || shape[2] != 3)
+            (shape.size() != 2 && shape.size() != 3))
             throw std::runtime_error("geometry: unsupported storage layout");
         result.tile = storage.at("tile_size").get<int64_t>();
         validatePatchTileSize(result.tile);
         if (!result.tile) throw std::runtime_error("geometry: invalid tiled layout");
         result.rows = shape[0]; result.cols = shape[1];
+        result.pixelBytes = surfacePixelBytes(array.at("dtype"), shape);
     }
     if (checkChunks && (!array.at("chunks").is_array() || array.at("chunks").size() != static_cast<size_t>(result.chunkCount())))
         throw std::runtime_error("geometry: inconsistent chunk count");
@@ -109,14 +128,15 @@ void forEachGeometryChunk(const GeometryArray& array, int64_t tile, Visit&& visi
         return;
     }
     const auto rows = array.shape.at(0), cols = array.shape.at(1);
+    const auto pixelBytes = surfacePixelBytes(array.dtype, array.shape);
     std::vector<uint8_t> buffer;
     int64_t index = 0;
     for (int64_t y = 0; rows && cols && y < rows; y += tile)
         for (int64_t x = 0; x < cols; x += tile) {
             const auto h = std::min(tile, rows - y), w = std::min(tile, cols - x);
-            buffer.resize(h * w * 12);
+            buffer.resize(h * w * pixelBytes);
             for (int64_t r = 0; r < h; ++r)
-                std::memcpy(buffer.data() + r * w * 12, array.bytes.data() + ((y + r) * cols + x) * 12, w * 12);
+                std::memcpy(buffer.data() + r * w * pixelBytes, array.bytes.data() + ((y + r) * cols + x) * pixelBytes, w * pixelBytes);
             visit(index++, std::span<const uint8_t>(buffer));
         }
 }
@@ -147,6 +167,7 @@ inline nlohmann::json geometryManifest(const GeometryData& data, int64_t patchTi
     };
     if (data.kind == "patch") {
         require("points", "<f4", 3, true);
+        for (const auto& array : data.arrays) validateSurfaceChannel(array, arrays.at("points").at("shape").get<std::vector<int64_t>>());
         if (!attributes.contains("scale") || !attributes.at("scale").is_array() || attributes.at("scale").size() != 2)
             throw std::invalid_argument("geometry: patch attributes require two-axis scale");
         for (const auto& value : attributes.at("scale"))
@@ -166,10 +187,10 @@ inline nlohmann::json geometryManifest(const GeometryData& data, int64_t patchTi
     }
     for (const auto& array : data.arrays) {
         auto& descriptor = arrays[array.name];
-        const auto tile = data.kind == "patch" && array.name == "points" ? patchTileSize : 0;
+        const auto tile = data.kind == "patch" ? patchTileSize : 0;
         if (tile) descriptor["storage"] = {{"version", 1}, {"layout", "tiles"}, {"tile_size", tile}};
         forEachGeometryChunk(array, tile, [&](int64_t, std::span<const uint8_t> bytes) {
-            descriptor["chunks"].push_back(geometryHash(bytes));
+            descriptor["chunks"].push_back(geometryPayloadHash(array.name, bytes));
         });
     }
     return {{"kind", data.kind}, {"format_version", data.formatVersion}, {"coordinate_system", data.coordinateSystem},

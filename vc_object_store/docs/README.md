@@ -213,6 +213,124 @@ without matching local object history receives the same explicitly incomplete,
 untimed baseline. Use a database copy when the complete original timeline must
 be transported.
 
+## Surface channels and overlap sidecars
+
+Every extra named array on a patch is a grid-aligned channel. `points` remains
+reserved for float32 XYZ. Channels have a name, native dtype, full C-order shape,
+and component count: `[rows, columns]` is scalar; `[rows, columns, components]`
+has a positive component count. Both spatial dimensions must match `points`.
+`GeometryRevision::arrays` exposes the descriptors without reading payloads;
+Python's `geometry_revision` / `current_geometry` descriptors also include
+`components`. Supported storage dtypes are `|u1`, `<u2`, `<i4`, `<i8`, `<u8`,
+`<f4`, and `<f8`. Absence is distinct from a present, zero-filled channel.
+
+Patch ingestion recognizes every regular lowercase `*.tif` or `*.tiff` file
+beside `meta.json`, except the XYZ planes. The filename stem is the channel name
+(e.g. `approval`, `generations`, `winding`, `mask`, or an additional custom name).
+Duplicate stems and the reserved `points` stem fail ingestion. All recognized
+channels must be aligned; unsupported dtypes/layouts, unreadable/truncated data,
+multipage/volume TIFFs and non-top-left orientation fail explicitly, before
+publication. Both stripped/tiled and contiguous/separate sample planes are
+supported. Scalar gray and multicomponent RGB sample values are preserved in
+**TIFF sample order**; no RGB/BGR conversion, scaling, resampling, zero/NaN
+normalization, or alpha premultiplication occurs. The native sample reader is
+shared with the existing XYZ loader, whose invalid-point/mask behavior remains
+unchanged. An oversized legacy mask is reported as unaligned instead of being
+silently resized for channel storage.
+
+The complete `overlapping.json` value is stored at
+`object["meta"]["source"]["overlapping.json"]`, in ordinary object history.
+A missing key means unknown overlaps; a present empty list (or
+`{"overlapping": []}`) means known empty. The sidecar may be a list of source
+identity strings or an object with an `overlapping` list. Order, duplicates,
+additional object fields and unresolved identity strings are retained. These
+are directional source claims: ingestion creates no overlap graph edges,
+resolves no target revision, and infers neither symmetry nor completeness.
+This avoids inventing identity mappings or dropping not-yet-imported targets.
+As with other source annotations, ingestion seeds this metadata once; file
+refresh/reconciliation is the separate audit item 6.
+
+Use `update_surface_channels` / `ObjectStore::updateSurfaceChannels` to add or
+replace supplied channels and remove named channels in one publication. Supply
+only the changed channels, with little-endian bytes. An empty `remove` list
+removes nothing; removing an absent channel, duplicate names, or mismatched
+layouts raises an error. Replacement may change dtype and components but not
+the spatial dimensions. Growth/cropping and coordinated explicit fills belong
+to audit item 5; these APIs deliberately provide no separate resizing mechanism.
+
+```python
+import numpy as np
+
+current = store.current_geometry(surface_uuid)
+points = next(a for a in current["arrays"] if a["name"] == "points")
+rows, columns = points["shape"][:2]
+generations = np.zeros((rows, columns), dtype="<u2")
+head = store.current_object_revision(surface_uuid)["uuid"]
+with store.write(expected_revisions={surface_uuid: head}) as tx:
+    revision = tx.update_surface_channels(
+        surface_uuid,
+        channels=[dict(name="generations", dtype="<u2", shape=[rows, columns],
+                       data=generations.tobytes())],
+        remove=[], expected_revision=current["uuid"])
+    tx.set_meta(surface_uuid, "review_pass", 1)
+
+# Read or edit one grid cell without loading the full channel or XYZ.
+raw = store.read_geometry_rectangle(revision, "generations", 0, 0, 1, 1)
+value = np.frombuffer(raw, dtype="<u2")[0]
+revision = store.edit_geometry_rectangle(
+    surface_uuid, "generations", 0, 0, 1, 1, b"\x01\x00", revision)
+revision = store.update_surface_channels(surface_uuid, [], ["generations"], revision)
+```
+
+The C++ equivalents accept `GeometryArray` values and return geometry revision
+UUIDs; `editGeometryRectangle` takes row, column, height, width and a byte vector.
+Existing array/range/packed readers and `editGeometry` scalar edits also work
+with channels. Rectangle reads/edits preserve the existing dtype and all
+components; bounds and exact byte lengths are checked. New patch arrays share
+the configured 32/64/128 tile size (default 128); tile size 0 retains linear
+storage, whose small reads may require a full 1 MiB chunk. Legacy linear arrays
+remain readable/editable. Historical revisions retain channel absence,
+descriptors and exact values, including after reopen and geometry sync.
+
+Lifecycle publication writes only supplied channel payloads. Unchanged arrays
+carry immutable `source_revision` references, including references to earlier
+sparse-delta revisions, instead of copying or hashing their payloads. References
+are flattened when possible. Sparse edits keep the existing byte-delta format
+and touched-tile overlay. Manifest/reference bookkeeping still scales with the
+array/chunk descriptors; historical inherited/delta reads can traverse history.
+This is storage reuse, not a claim of constant-time publication or measured
+interactive latency. Native export still rejects auxiliary arrays and remains
+outside this channel contract. Owned typed `Patch` values also still contain XYZ
+only; loading a complete channel-bearing patch into that owned type is rejected,
+while bounded patch views and the named-array APIs remain available. Older binaries do not understand inherited
+array descriptors; use an updated reader for databases written with this API.
+
+Channel operations participate in the same checked object transaction as
+metadata and relationships, with expected geometry revisions as an additional
+check. Point anchors depend on their declared XYZ points; changing an unrelated
+channel does not invalidate them. An anchor can additionally declare
+`channels=["approval", "winding"]` (C++ `Anchor::channels`); changes to presence,
+layout or values of those channels require an explicit edge decision. A whole
+geometry/unknown anchor remains conservative and depends on all arrays.
+Declared channel absence is also meaningful; retaining a relationship after
+removal is an explicit caller decision. Domain-specific validity remains the
+caller’s responsibility. Supply `edge_edits` and expected object revisions for
+all validation endpoints when such decisions are needed, as in the checked-action
+examples above.
+
+Channel regression tests are `tests/python/test_surface_channels.py` and
+`tests/cpp/test_surface_channels.cpp`. TIFF fixture tests additionally use
+`tifffile` in the existing Python test environment; the production package has
+no new Python dependency. The C++ test's internal `GeometryWorkScope` counts
+per-array payload bytes read and hashed, independently of chunk deduplication.
+Run the normal build and tests from the package README; the focused commands are:
+
+```sh
+ctest --test-dir build --output-on-failure -R '^test_surface_channels$'
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python \
+  /path/to/python -m pytest -q tests/python/test_surface_channels.py
+```
+
 ## Sparse geometry edits
 
 `edit_geometry` / `ObjectStore::editGeometry` replaces scalar ranges in existing
@@ -221,7 +339,8 @@ supported array dtype and geometry kind, including auxiliary arrays. Offsets
 count **scalar elements in the flattened C-order array**, not bytes or points:
 XYZ point 5 begins at element 15. Supply exact little-endian bytes in the existing
 dtype. An edit cannot change array shape, dtype, names, or geometry attributes;
-use `put_geometry` for ingestion and explicit full/structural replacements.
+use `update_surface_channels` for channel lifecycle operations and `put_geometry`
+for ingestion and explicit full/structural replacements.
 
 ```python
 import struct
@@ -269,7 +388,8 @@ range, rectangle, packed-array, export, and synchronization APIs accept either
 representation. Historical reads verify the manifest chain back to the last
 explicit snapshot, then reconstruct touched chunks from that snapshot or reverse
 a shorter suffix from the current materialization when the target is its
-ancestor. Current reads do not replay history. Older historical reads can become
+ancestor. Current sparse-head reads use their overlay; inherited arrays may still follow
+earlier revision references. Older historical reads can become
 slower as history grows; there is no pruning API. Metadata/relationship history
 is not reconstructed by geometry deltas.
 SQLite WAL checkpointing is separate from geometry checkpoints: long-lived read

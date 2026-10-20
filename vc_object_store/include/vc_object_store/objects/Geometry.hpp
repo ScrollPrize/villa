@@ -7,7 +7,7 @@
 
 namespace vc::objects {
 
-// Contiguous C-order, little-endian arrays. Supported dtypes: |u1, <i4,
+// Contiguous C-order, little-endian arrays. Supported dtypes: |u1, <u2, <i4,
 // <i8, <u8, <f4, <f8. Shape and byte length are checked before publication.
 struct GeometryArray {
     std::string name;
@@ -31,7 +31,7 @@ struct GeometryArrayInfo {
 };
 
 // Applies to new revisions only. Unchanged geometry retains its revision and
-// layout. Zero selects legacy linear storage; other arrays remain linear.
+// layout. Zero selects legacy linear storage; all aligned patch channels use the same tile size.
 struct GeometryStorageOptions {
     int64_t patchTileSize = 128; // supported sizes: 0, 32, 64, 128 vertices
 };

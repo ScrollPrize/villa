@@ -96,6 +96,8 @@ struct Anchor {
     // Top-level ordinary metadata keys that affect this relationship.
     // Changing these requires an explicit retain/update/remove decision.
     std::vector<std::string> metadataKeys;
+    // Whole named surface channels, including presence, layout and values.
+    std::vector<std::string> channels;
     bool operator==(const Anchor&) const = default;
 };
 
@@ -415,7 +417,19 @@ public:
     PackedGeometryArray readGeometryArrays(const Txn&, const std::vector<std::string>& revisionUuids,
         const std::string& arrayName) const;
 
-    // Dense row-major float32 XYZ rectangle from a patch points array. Exact
+    // Add/replace only supplied channels; remove named channels. Never resize
+    // points or read/rehash unchanged arrays. Uses ordinary geometry/object
+    // revision checks and relationship decisions. "points" is reserved.
+    std::string updateSurfaceChannels(WriteTxn&, const std::string& objectUuid,
+        const std::vector<GeometryArray>& channels, const std::vector<std::string>& remove,
+        const std::string& expectedRevision, const std::vector<GeometryEdgeEdit>& edgeEdits = {});
+    // Dense C-order rectangle edit; dtype/components match the existing array.
+    std::string editGeometryRectangle(WriteTxn&, const std::string& objectUuid,
+        const std::string& arrayName, int64_t row, int64_t column, int64_t rows, int64_t columns,
+        const std::vector<uint8_t>& bytes, const std::string& expectedRevision,
+        const std::vector<GeometryEdgeEdit>& edgeEdits = {});
+
+    // Dense row-major rectangle from any aligned patch array. Exact
     // bytes; handles tiled and legacy layouts. Coordinates/counts are vertices.
     // Rectangle/range reads may reuse verified bytes on a pooled reader until
     // its next snapshot observes a commit. Writes always use fresh readers.

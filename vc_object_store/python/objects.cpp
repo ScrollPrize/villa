@@ -338,6 +338,24 @@ NB_MODULE(_native, m)
                 return db.editGeometry(txn, uuid, edits, expected, edges);
             });
         }, nb::arg("object_uuid"), nb::arg("edits"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
+        .def("update_surface_channels", [](PyObjectStore& self, const std::string& uuid, const nb::list& channels,
+                                           const std::vector<std::string>& remove, const std::string& expected, const nb::list& choices) {
+            nb::dict input; input["kind"] = "patch"; input["arrays"] = channels;
+            const auto data = geometryFromPy(input); const auto edges = edgeEditsFromPy(choices);
+            auto lease = self.db; self.require(); nb::gil_scoped_release release;
+            return self.withWrite([&](auto& db, auto& txn) { return db.updateSurfaceChannels(txn, uuid, data.arrays, remove, expected, edges); });
+        }, nb::arg("object_uuid"), nb::arg("channels"), nb::arg("remove"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
+        .def("edit_geometry_rectangle", [](PyObjectStore& self, const std::string& uuid, const std::string& name,
+                                          int64_t row, int64_t column, int64_t rows, int64_t columns,
+                                          const nb::bytes& data, const std::string& expected, const nb::list& choices) {
+            const auto* p = reinterpret_cast<const uint8_t*>(data.c_str());
+            const std::vector<uint8_t> bytes(p, p + data.size()); const auto edges = edgeEditsFromPy(choices);
+            auto lease = self.db; self.require(); nb::gil_scoped_release release;
+            return self.withWrite([&](auto& db, auto& txn) {
+                return db.editGeometryRectangle(txn, uuid, name, row, column, rows, columns, bytes, expected, edges);
+            });
+        }, nb::arg("object_uuid"), nb::arg("array_name"), nb::arg("row"), nb::arg("column"), nb::arg("rows"), nb::arg("columns"),
+           nb::arg("data"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
         .def("affected_geometry_edit_edges", [](PyObjectStore& self, const std::string& uuid,
                                                 const nb::list& input, const std::string& expected) {
             const auto edits = geometryEditsFromPy(input);
@@ -387,7 +405,7 @@ NB_MODULE(_native, m)
                   return db.readGeometryRectangle(txn, uuid, name, row, column, rows, columns); }); }
             return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
         }, nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("row"), nb::arg("column"),
-           nb::arg("rows"), nb::arg("columns"), "Read a dense row-major patch rectangle, preserving exact float32 XYZ bytes.")
+           nb::arg("rows"), nb::arg("columns"), "Read a dense row-major patch rectangle, preserving native dtype and component bytes.")
         .def("read_geometry_rectangles", [](PyObjectStore& self, const std::string& uuid, const std::string& name,
                                             const std::vector<std::array<int64_t, 4>>& rectangles) {
             std::vector<std::vector<uint8_t>> values;
@@ -808,6 +826,20 @@ NB_MODULE(_native, m)
                                 const std::string& expected, const nb::list& choices) {
             return self.owner->require().editGeometry(self.require(), uuid, geometryEditsFromPy(input), expected, edgeEditsFromPy(choices));
         }, nb::arg("object_uuid"), nb::arg("edits"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
+        .def("update_surface_channels", [](PyObjectWriteTxn& self, const std::string& uuid, const nb::list& channels,
+                                           const std::vector<std::string>& remove, const std::string& expected, const nb::list& choices) {
+            nb::dict input; input["kind"] = "patch"; input["arrays"] = channels;
+            const auto data = geometryFromPy(input); const auto edges = edgeEditsFromPy(choices);
+            return self.owner->require().updateSurfaceChannels(self.require(), uuid, data.arrays, remove, expected, edges);
+        }, nb::arg("object_uuid"), nb::arg("channels"), nb::arg("remove"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
+        .def("edit_geometry_rectangle", [](PyObjectWriteTxn& self, const std::string& uuid, const std::string& name,
+                                          int64_t row, int64_t column, int64_t rows, int64_t columns,
+                                          const nb::bytes& data, const std::string& expected, const nb::list& choices) {
+            const auto* p = reinterpret_cast<const uint8_t*>(data.c_str());
+            const std::vector<uint8_t> bytes(p, p + data.size()); const auto edges = edgeEditsFromPy(choices);
+            return self.owner->require().editGeometryRectangle(self.require(), uuid, name, row, column, rows, columns, bytes, expected, edges);
+        }, nb::arg("object_uuid"), nb::arg("array_name"), nb::arg("row"), nb::arg("column"), nb::arg("rows"), nb::arg("columns"),
+           nb::arg("data"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
         .def("affected_geometry_edit_edges", [](PyObjectWriteTxn& self, const std::string& uuid,
                                                 const nb::list& input, const std::string& expected) {
             const auto edges = self.owner->require().affectedGeometryEditEdges(self.require(), uuid, geometryEditsFromPy(input), expected);
