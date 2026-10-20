@@ -23,7 +23,7 @@ from dinovol_2.loss import (
 )
 from dinovol_2.model.model import DinoVitStudentTeacher, _materialize_backbone_config, _upgrade_weight_norm_state_dict_keys
 from dinovol_2.ops.point_embeddings import gather_variable_points, sample_normalized_patch_embeddings
-from dinovol_2.ops.collate import build_dino_ibot_collate_fn
+from .dino_data import build_dino_ibot_collate_fn
 from dinovol_2.training.schedules import CosineScheduler
 from .base import TrainingMethod, StepOutput
 
@@ -845,6 +845,8 @@ class DinoMethod(TrainingMethod):
         training: bool = False,
     ) -> dict[str, Any]:
         resolved_config = dict(dataset_config)
+        if int(resolved_config.get("num_global_crops", 2)) != 2:
+            raise ValueError("DINO requires exactly two global views")
         if self.do_gram:
             resolved_config.setdefault(
                 "gram_teacher_crop_size",

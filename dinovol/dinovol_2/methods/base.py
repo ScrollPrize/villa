@@ -55,7 +55,8 @@ class TrainingMethod(nn.Module):
         return dict(config)
 
     def build_collate(self, dataset):
-        raise NotImplementedError
+        from dinovol_2.ops.collate import collate_multicrop_batch
+        return collate_multicrop_batch
 
     def checkpoint_state(self) -> dict[str, Any]:
         return {"model": self.state_dict()}

@@ -322,9 +322,10 @@ class SSLZarrDataset(Dataset):
             self.cross_view_token_patch_size = token_patch
 
         if not self.single_crop_only:
-            if self.num_global_crops != 2:
-                raise ValueError(
-                    f"SSLZarrDataset currently expects exactly 2 global crops, got {self.num_global_crops}")
+            if self.num_global_crops < 1:
+                raise ValueError("SSLZarrDataset requires at least one global crop")
+            if self.cross_view_token_patch_size is not None and self.num_global_crops != 2:
+                raise ValueError("Cross-view token correspondences require exactly two global crops")
             if self.local_crop_size is not None and self.num_local_crops < 0:
                 raise ValueError(
                     f"SSLZarrDataset expects a non-negative number of local crops, got {self.num_local_crops}")

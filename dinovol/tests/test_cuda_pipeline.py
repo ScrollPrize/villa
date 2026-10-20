@@ -191,6 +191,25 @@ class CudaPipelineTests(unittest.TestCase):
             finally:
                 dataset.close()
 
+    def test_method_independent_view_counts(self):
+        from dinovol_2.ops.collate import collate_multicrop_batch
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            write_array(root / 'volume', np.ones((40,)*3, dtype=np.uint8))
+            config = dict(datasets=[dict(volume_path=str(root / 'volume'), volume_scale=0)],
+                epoch_length=2, vol_trim_pct=1, source_sampling_size=[24]*3,
+                global_crop_size=[16]*3, local_crop_size=[8]*3, num_global_crops=3,
+                num_local_crops=1, global_crop_scale=[.4,.8], local_crop_scale=[.1,.2],
+                augmentation='dino')
+            dataset = SSLZarrDataset(config)
+            try:
+                batch = next(iter(CudaDataLoader(dataset, batch_size=2, collate_fn=collate_multicrop_batch)))
+                self.assertEqual(batch['collated_global_crops'].shape, (6,1,16,16,16))
+                self.assertEqual(batch['collated_local_crops'].shape, (2,1,8,8,8))
+                self.assertNotIn('collated_masks', batch)
+            finally:
+                dataset.close()
+
     def test_training_step_and_monitor(self):
         from dinovol_2.pretrain import DinoIBOTPretrainer
         with tempfile.TemporaryDirectory() as folder:
