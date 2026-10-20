@@ -845,7 +845,9 @@ data-edge truncation do not emit this warning. A side whose end control is a
 lone break or a kollesis termination is neither traced nor grown: it is a
 straight ray of the break extrapolation distance (`Break extrapolation` menu
 row, `lineAnnotation/break_extrapolation_distance_vx`, default 400, clamped to
-100..1000000 everywhere it is read), in every global mode; a single control
-whose both sides are rays needs no inference inputs, and its synchronous
-finalization without them solves as Lasagna instead of opening a dataset
-picker.
+100..1000000 everywhere it is read), in every global mode. A single control
+whose both sides are rays traces nothing and needs no inference inputs (nor
+the fiber-follow service in a normal-backed session). A single control with
+a traced side whose session holds no trace inputs finalizes synchronously as
+Lasagna for that one solve instead of opening a dataset picker (the session's
+persisted mode is untouched).
