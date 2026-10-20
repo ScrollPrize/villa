@@ -511,7 +511,7 @@ def _pyrdown3d(t: torch.Tensor, *, factor: int) -> torch.Tensor:
 			shape[dim + 2] = 5
 			kd = k.view(*shape).expand(C, 1, *shape[2:])
 			t = F.conv3d(F.pad(t.unsqueeze(0), pad_arg, mode='reflect'), kd, groups=C)[0]
-		t = t[:, ::2, ::2, ::2]
+		t = t[:, ::2, ::2, ::2].contiguous()
 		f //= 2
 	return t
 
