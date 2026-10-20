@@ -132,10 +132,13 @@ def serve(checkpoint_path, volume_zarr, volume_scale, socket_path, parent_pid, n
         def parent_watchdog():
             while True:
                 if not parent_alive():
-                    print(
-                        f"parent process {parent_pid} is gone (current ppid={os.getppid()}); exiting.",
-                        flush=True,
-                    )
+                    try:
+                        print(
+                            f"parent process {parent_pid} is gone (current ppid={os.getppid()}); exiting.",
+                            flush=True,
+                        )
+                    except OSError:  # the parent held the read end of our stdout pipe; it went with the parent
+                        pass
                     os._exit(0)
                 time.sleep(1.0)
 

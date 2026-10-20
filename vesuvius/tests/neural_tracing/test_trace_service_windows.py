@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -104,3 +105,48 @@ def test_parent_watch_follows_the_given_pid(monkeypatch):
         child.wait()
     if os.name == "nt":
         assert not alive()
+
+
+_STAND_IN = """
+import os, subprocess, sys
+service = subprocess.Popen(sys.argv[1:] + ["--parent_pid", str(os.getpid())],
+                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+print(service.pid, flush=True)
+print(service.stdout.readline().decode().strip(), flush=True)  # "neural-tracing service listening on ..."
+"""
+
+
+def _running(service, pid):
+    if os.name == "nt":
+        return service._parent_alive(pid)()
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    try:  # a zombie only waits for its new parent to reap it
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return True
+
+
+def test_service_exits_when_the_parent_that_reads_its_output_is_gone(monkeypatch, tmp_path):
+    """VC3D reads the service's stdout and stderr through pipes, so once VC3D is gone the watch's last print fails
+    (Windows: EINVAL, POSIX: EPIPE). The service must still exit instead of running on with the model in memory."""
+    service = _import_service(monkeypatch)
+    script = Path(service.__file__)
+    path = Path(tempfile.gettempdir()) / f"neural_tracer_test_{uuid.uuid4().hex[:8]}.sock"
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(filter(None, [str(script.parents[2]), os.environ.get("PYTHONPATH")])))
+    stand_in = subprocess.run([sys.executable, "-c", _STAND_IN, sys.executable, str(script), "--volume_zarr",
+                               str(tmp_path), "--volume_scale", "0", "--socket_path", str(path)],
+                              capture_output=True, text=True, env=env, timeout=300)
+    pid = int(stand_in.stdout.split()[0])
+    try:
+        assert "listening" in stand_in.stdout, stand_in.stdout + stand_in.stderr
+        deadline = time.monotonic() + 60
+        while _running(service, pid) and time.monotonic() < deadline:
+            time.sleep(0.5)
+        assert not _running(service, pid), "the service outlived its parent"
+    finally:
+        if _running(service, pid):
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True) if os.name == "nt"                 else os.kill(pid, 9)
+        path.unlink(missing_ok=True)
