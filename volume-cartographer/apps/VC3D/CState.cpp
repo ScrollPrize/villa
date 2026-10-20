@@ -201,10 +201,16 @@ std::shared_ptr<VolumePkg> CState::vpkg() const { return _vpkg; }
 
 void CState::setVpkg(std::shared_ptr<VolumePkg> pkg)
 {
-    if (_vpkg != pkg) {
-        clearFocusBounds();
-    }
+    const bool changed = _vpkg != pkg;
     _vpkg = std::move(pkg);
+    if (changed) {
+        // Restore without invoking setters: switching projects must not persist
+        // the previous project's bounds into either project.
+        _focusBounds = _vpkg ? _vpkg->focusBounds() : std::nullopt;
+        _focusBoundsEnabled = _vpkg && _vpkg->focusBoundsEnabled();
+        ++_focusBoundsRevision;
+        emit focusBoundsChanged();
+    }
     emit vpkgChanged(_vpkg);
 }
 
@@ -266,6 +272,7 @@ void CState::setFocusBounds(const Rect3D& bounds)
         return;
     }
     _focusBounds = normalized;
+    if (_vpkg) _vpkg->setFocusBounds(_focusBounds, _focusBoundsEnabled);
     ++_focusBoundsRevision;
     emit focusBoundsChanged();
 }
@@ -276,6 +283,7 @@ void CState::setFocusBoundsEnabled(bool enabled)
         return;
     }
     _focusBoundsEnabled = enabled;
+    if (_vpkg) _vpkg->setFocusBounds(_focusBounds, _focusBoundsEnabled);
     ++_focusBoundsRevision;
     emit focusBoundsChanged();
 }
@@ -287,6 +295,7 @@ void CState::clearFocusBounds()
     }
     _focusBounds.reset();
     _focusBoundsEnabled = false;
+    if (_vpkg) _vpkg->setFocusBounds(_focusBounds, false);
     ++_focusBoundsRevision;
     emit focusBoundsChanged();
 }

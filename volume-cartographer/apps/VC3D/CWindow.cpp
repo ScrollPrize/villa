@@ -10543,6 +10543,17 @@ void CWindow::onManualLocationChanged()
 
 void CWindow::refreshFocusBoundsUi()
 {
+    if (_fiberMapWorkspace) {
+        auto bounds = _state ? _state->activeFocusBounds() : std::nullopt;
+        if (bounds && _lineAnnotationController) {
+            // Viewer bounds index the current volume; map geometry indexes
+            // the annotation frame (which can be a different pyramid base).
+            const float factor = static_cast<float>(_lineAnnotationController->annotationFrame().factor);
+            bounds->low *= factor;
+            bounds->high *= factor;
+        }
+        _fiberMapWorkspace->setFocusBounds(bounds);
+    }
     if (!ui.chkFocusBBox || !ui.focusBBoxMin || !ui.focusBBoxMax) {
         return;
     }

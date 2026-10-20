@@ -58,6 +58,32 @@ struct TestAutosaveRoot {
 
 TestAutosaveRoot testAutosaveRoot;
 
+TEST_CASE("Project focus bounds persist independently of enabled state")
+{
+    const auto path = testAutosaveRoot.root / "focus.volpkg.json";
+    auto project = VolumePkg::newDetached();
+    CHECK_FALSE(project->focusBounds().has_value());
+    CHECK_FALSE(project->focusBoundsEnabled());
+    project->setFocusBounds(Rect3D{{30, 20, 10}, {1, 2, 3}}, true);
+    project->save(path);
+    auto loaded = VolumePkg::load(path);
+    REQUIRE(loaded->focusBounds().has_value());
+    CHECK(loaded->focusBounds()->low == cv::Vec3f(1, 2, 3));
+    CHECK(loaded->focusBounds()->high == cv::Vec3f(30, 20, 10));
+    CHECK(loaded->focusBoundsEnabled());
+
+    loaded->setFocusBounds(loaded->focusBounds(), false);
+    auto disabled = VolumePkg::load(path);
+    REQUIRE(disabled->focusBounds().has_value());
+    CHECK_FALSE(disabled->focusBoundsEnabled());
+    CHECK(disabled->focusBounds()->high == cv::Vec3f(30, 20, 10));
+    disabled->setFocusBounds(std::nullopt, false);
+    auto cleared = VolumePkg::load(path);
+    CHECK_FALSE(cleared->focusBounds().has_value());
+    CHECK_FALSE(cleared->focusBoundsEnabled());
+    CHECK_FALSE(VolumePkg::newDetached()->focusBounds().has_value());
+}
+
 void stageSegments(const fs::path& root, const std::string& dirName = "paths")
 {
     auto paths = root / dirName;

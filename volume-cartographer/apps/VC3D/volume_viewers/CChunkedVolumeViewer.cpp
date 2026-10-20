@@ -3401,10 +3401,10 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     job.surfaceCache = _surfaceCache;
     job.overlaySurfaceCache = _overlaySurfaceCache;
     job.surfaceCacheEpoch = _surfaceCacheEpoch;
-    const bool focusBoundsSupported =
-        dynamic_cast<PlaneSurface*>(surf.get()) != nullptr ||
-        property("vc_viewer_role").toString() == QStringLiteral("annotation");
-    if (focusBoundsSupported && _state) {
+    // Focus bounds are in volume base coordinates for every view, including
+    // segment and atlas QuadSurfaces. Mask the generated coordinates, not UVs;
+    // the underlying surface and its cached tiles remain unchanged.
+    if (_state) {
         job.focusBoundsBase = _state->activeFocusBounds();
     }
     job.genCache = _genSurfaceCache;
