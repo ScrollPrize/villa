@@ -25,6 +25,7 @@ import queue
 import re
 import threading
 import time
+from typing import Iterable
 
 import numpy as np
 import torch
@@ -102,6 +103,8 @@ def cleanup_stale_live_tmp(channel_paths: Iterable[Path]) -> int:
     removed = 0
     for channel_path in channel_paths:
         live_tmp = Path(channel_path) / ".live_tmp"
+        if live_tmp.is_symlink():
+            continue
         try:
             entries = tuple(os.scandir(live_tmp))
         except FileNotFoundError:
@@ -111,6 +114,15 @@ def cleanup_stale_live_tmp(channel_paths: Iterable[Path]) -> int:
                 continue
             if not entry.is_dir(follow_symlinks=False):
                 continue
+            # A prefix is not proof that every child belongs to us. Legacy
+            # sessions contain only flat raw/weight mmap files (with optional
+            # shards). Preserve unknown content and links rather than deleting
+            # an arbitrary tree during cache startup.
+            with os.scandir(entry.path) as children:
+                if any(child.is_symlink() or not child.is_file(follow_symlinks=False)
+                       or re.fullmatch(r"(?:raw-\d+|weight)(?:\.part-\d+)?\.mmap", child.name) is None
+                       for child in children):
+                    continue
             shutil.rmtree(entry.path)
             removed += 1
     return removed

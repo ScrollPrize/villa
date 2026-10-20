@@ -1018,6 +1018,33 @@ def test_legacy_stale_scratch_is_cleaned_on_resume(tmp_path):
     assert unrelated.read_text() == "keep"
 
 
+def test_stale_scratch_cleanup_preserves_symlinks_and_unknown_children(tmp_path):
+    from lasagna.demand_predict3d import cleanup_stale_live_tmp
+    channel = tmp_path / "channel"
+    scratch = channel / ".live_tmp"
+    scratch.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    payload = outside / "raw-0.mmap"
+    payload.write_bytes(b"keep")
+    (scratch / "session-link").symlink_to(outside, target_is_directory=True)
+    nested = scratch / "session-nested"
+    nested.mkdir()
+    (nested / "raw-0.mmap").symlink_to(payload)
+    good = scratch / "session-known"
+    good.mkdir()
+    (good / "raw-0.part-0000.mmap").write_bytes(b"scratch")
+    (good / "weight.mmap").write_bytes(b"scratch")
+    assert cleanup_stale_live_tmp([channel]) == 1
+    assert not good.exists()
+    assert payload.read_bytes() == b"keep"
+    assert (nested / "raw-0.mmap").is_symlink()
+    linked = tmp_path / "linked-channel"
+    linked.mkdir()
+    (linked / ".live_tmp").symlink_to(scratch, target_is_directory=True)
+    assert cleanup_stale_live_tmp([linked]) == 0
+
+
 class SiblingIdentityAdapter(IdentityAdapter):
     def __init__(self, root):
         super().__init__(root, 4, 1)
