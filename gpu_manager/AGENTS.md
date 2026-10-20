@@ -21,6 +21,5 @@ Keep the package independent of Torch/VC3D/Lasagna. Linux/macOS support must be
 guarded where peer credentials/process inspection differ; tests must not allocate
 real GPUs unless explicitly authorized. No sudo or hard resource enforcement.
 
-Normal tests must finish within minutes. The reusable cooperative test launcher
-has a five-minute total budget; do not restore the long timing sweep without an
-explicit request. GPU tests retain the currently authorized per-device limits.
+Normal tests must finish within minutes; use `python -m pytest -q gpu_manager/tests`.
+Do not run long timing sweeps or real GPU tests without explicit authorization.

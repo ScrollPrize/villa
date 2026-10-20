@@ -36,7 +36,7 @@ delay, 30 sequential status+poll pairs took min/median/max
 From the Villa root:
 
 ```bash
-GPU_MANAGER_SCHEMA_PYTHON=/usr/bin/python3 CUDA_VISIBLE_DEVICES='' OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 /home/hendrik/.venv_las/bin/python -m pytest -q gpu_manager/tests
+python -m pytest -q gpu_manager/tests
 ```
 
 `test_process_service.py -s` prints collection and RPC measurements. Its five

@@ -10,14 +10,14 @@ failure/recovery tests pass. Fiber integration was validated on two H100 GPUs
 with real S1A data, including GPU-free pause, partial VRAM and resize. This is
 cooperative accounting, not isolation or enforcement. Other training/device
 configurations require their own calibration. See the [protocol](docs/protocol-v1.md)
-and [validation report](../vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/cooperative_validation.md).
+and [validation scope](docs/validation.md).
 
 ## Local development
 
 From the Villa root, without installing:
 
 ```bash
-/home/hendrik/.venv_las/bin/python -m pytest -q gpu_manager/tests
+python -m pytest -q gpu_manager/tests
 PYTHONPATH=gpu_manager/src python -m villa_gpu_manager.cli --help
 ```
 
@@ -26,6 +26,11 @@ Explicit installation into your chosen Python environment:
 ```bash
 python -m pip install -e ./gpu_manager
 ```
+
+For development tests, install `./gpu_manager[test]` instead. Python 3.11+
+and `psutil` are the only runtime requirements. This Unix-only package does not
+support Windows; macOS can run the metadata service/tests but NVIDIA discovery
+requires an available `nvidia-smi`.
 
 No installer or GPU service is automatically started by importing the package.
 Linux/macOS Unix sockets are supported; NVIDIA inventory monitoring requires
@@ -198,3 +203,15 @@ with the same task token. Commands must not detach their descendants.
 Application launchers may call `ensure_manager()` first and supply a
 `before_authorize` check for external GPU occupancy. There is no unmanaged
 fallback on bootstrap, admission, or ownership failure.
+
+For a fixed nonexclusive job, `wait_for_exact=True` returns incomplete admission
+grants without starting workers and retries registration until the requested
+allocation is available. This is opt-in; it can wait indefinitely and each new
+registration joins the FIFO queue anew.
+
+`ProcessOwner` provides a separate ownership root for sibling cohorts managed
+by one coordinator. Pass its identity as `Client(registration_root=...)`,
+track each worker session before authorizing it, and retire it only after joining
+its workers. Closing the owner or losing the coordinator triggers cleanup of
+tracked sessions. This uses the existing explicit-root/worker protocol and does
+not claim unrelated coordinator children.

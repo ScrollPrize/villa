@@ -3,7 +3,7 @@
 Validated by the manager conformance/recovery suite and real Fiber S1A reference
 lifecycle, calibration and gradient checks. The user replaced the extended
 repeated timing gate with short tests; one full timing/lifecycle comparison had
-already completed. See the [validation report](../../vesuvius/src/vesuvius/neural_tracing/fiber_trace_2d/docs/cooperative_validation.md).
+already completed. See the [validation scope](validation.md).
 Changes to wire shapes **or semantics**, even additive ones, require explicit
 user authorization. A version bump is not a substitute for that authorization.
 
