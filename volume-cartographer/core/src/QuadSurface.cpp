@@ -7,6 +7,7 @@
 #include "vc/core/util/PointIndex.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/core/util/SurfaceIdentity.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Uuid.hpp"
 
@@ -2207,8 +2208,8 @@ void QuadSurface::saveAsNew(const std::filesystem::path &path_, bool force_overw
 {
     // A derived local surface is not the source's catalog representation.
     // Keep coordinate/provenance fields, but use its directory as the UI key.
-    if (meta.is_object()) meta.erase("vc_open_data_representation");
-    saveWithUuid(path_, vc::util::newUuid(), force_overwrite);
+    const auto uuid = vc::core::util::newDerivedSurfaceIdentity(meta);
+    saveWithUuid(path_, uuid, force_overwrite);
 }
 
 void QuadSurface::saveEdited(const std::filesystem::path &source,
