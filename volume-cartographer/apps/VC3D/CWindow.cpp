@@ -1,4 +1,5 @@
 #include "CWindow.hpp"
+#include "VolumeComboTooltip.hpp"
 #include "FiberLengthDisplay.hpp"
 #include "VolumeDisplayNames.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
@@ -9482,13 +9483,15 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     bool preferredVolumeFound = false;
     const bool hasOpenDataSegments = packageHasOpenDataSegments(*_state->vpkg());
     const auto volumeIds = vc3d::orderedDisplayVolumeIds(*_state->vpkg());
+    const auto volumeSuffixes = vc3d::volumeDisplaySuffixes(*_state->vpkg());
     for (const auto& id : volumeIds) {
         try {
             auto vol = _state->vpkg()->volume(id);
             const QString idStr = QString::fromStdString(id);
             const QString nameStr = QString::fromStdString(vol->name());
             const QString label = vc3d::volumeDisplayLabel(*_state->vpkg(), id,
-                nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr));
+                nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr),
+                volumeSuffixes.value(idStr));
 
             orderedIds.push_back(idStr);
             volumeEntries.append({idStr, label});
@@ -9571,10 +9574,12 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
         for (const auto& [id, label] : volumeEntries) {
             selector->addItem(label, QVariant(id));
             const int row = selector->count() - 1;
+            const auto sourcePath = vc3d::volumeDisplayPath(*_state->vpkg(), id.toStdString());
+            selector->setItemData(row, sourcePath, Qt::ToolTipRole);
             if (openDataVolumesWithoutSegments.find(id) != openDataVolumesWithoutSegments.end()) {
                 selector->setItemData(row, QBrush(QColor(245, 124, 0)), Qt::ForegroundRole);
                 selector->setItemData(row,
-                                      tr("No segment transform is available for this volume."),
+                                      sourcePath + QStringLiteral("\n") + tr("No segment transform is available for this volume."),
                                       Qt::ToolTipRole);
             }
         }
@@ -9586,6 +9591,7 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
             const int activeIndex = selector->findData(activeCandidate);
             selector->setCurrentIndex(activeIndex >= 0 ? activeIndex : 0);
         }
+        vc3d::refreshVolumeComboTooltip(selector);
     }
 
     QString activeId;

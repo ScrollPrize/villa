@@ -1,4 +1,6 @@
 #include "elements/VolumeSelector.hpp"
+#include "VolumePathLabels.hpp"
+#include "VolumeComboTooltip.hpp"
 
 #include <QAbstractItemView>
 #include <QHBoxLayout>
@@ -14,6 +16,7 @@ VolumeSelector::VolumeSelector(QWidget* parent)
 
     _label = new QLabel(tr("Volume:"), this);
     _combo = new QComboBox(this);
+    vc3d::refreshVolumeComboTooltip(_combo);
     _browseButton = new QToolButton(this);
     _browseButton->setText(QStringLiteral("…"));
     _browseButton->setToolTip(tr("Browse for a volume path"));
@@ -80,6 +83,7 @@ VolumeSelector::VolumeSelector(QWidget* parent)
         const QString label = info.fileName().isEmpty() ? cleanedPath : info.fileName();
         const int row = _combo->count();
         _combo->addItem(label, cleanedPath);
+        _combo->setItemData(row, cleanedPath, Qt::ToolTipRole);
         _combo->setItemData(row, QString(), Qt::UserRole + 1);
         _combo->setCurrentIndex(row);
     });
@@ -145,14 +149,20 @@ void VolumeSelector::setVolumes(const QVector<VolumeOption>& volumes, const QStr
         }
     }
 
+    QStringList paths;
+    for (const auto& opt : volumes) paths.push_back(opt.path);
+    const auto suffixes = vc3d::distinguishingVolumePaths(paths);
     for (int i = 0; i < volumes.size(); ++i) {
         const auto& opt = volumes[i];
-        const QString label = opt.name.isEmpty()
+        QString label = opt.name.isEmpty()
             ? opt.id
             : tr("%1 (%2)").arg(opt.name, opt.id);
+        if (suffixes[i].contains('/'))
+            label += QStringLiteral(" [%1]").arg(suffixes[i]);
         const int row = _combo->count();
         _combo->addItem(label, opt.path);
         _combo->setItemData(row, opt.id, Qt::UserRole + 1);
+        _combo->setItemData(row, vc3d::volumePathForDisplay(opt.path), Qt::ToolTipRole);
         if (defaultIndex == -1 && !defaultVolumeId.isEmpty() && opt.id == defaultVolumeId) {
             defaultIndex = row;
         }
@@ -167,6 +177,7 @@ void VolumeSelector::setVolumes(const QVector<VolumeOption>& volumes, const QStr
     } else {
         _combo->setEnabled(false);
     }
+    vc3d::refreshVolumeComboTooltip(_combo);
 }
 
 QString VolumeSelector::selectedVolumeId() const
