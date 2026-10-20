@@ -174,3 +174,120 @@ concurrency, detector kernels, and C++ validation. Keep each regression at the
 layer that exercises it directly; avoid duplicating CRUD tests, checking SQLite
 itself, or recreating every intermediate development schema. One oldest-supported
 schema upgrade smoke test covers compatibility.
+
+## Edit persistence benchmark
+
+`bench_object_edits` compares `editGeometry()` plus durable transaction commit
+with the existing `QuadSurface::saveOverwrite()` autosave worker call on copies
+of real tifxyz segments. It never writes to its source. The output reports mean,
+p50, p95, p99, and maximum milliseconds, separating update collection, delta
+packing, edit processing, and commit. It also reports first/last windows, database
+growth after SQLite WAL checkpointing, peak WAL file size, and full-array reads
+of current, previous, middle, and initial revisions. All four versions and the
+saved tifxyz are verified byte-for-byte.
+
+```sh
+AGENTS_AGENT_MODE=1 ninja -C build bench_object_edits
+AGENTS_AGENT_MODE=1 .venv/bin/python scripts/bench_object_edits.py \
+  --segment /path/to/real/segment \
+  --radius 5.75 --radius 16 --radius 64 \
+  --edits 1000 --file-saves 50 --repeats 3 \
+  --output /tmp/edit-results.jsonl
+```
+
+The runner executes cases serially, using a fresh temporary database for each
+case. Supply `--segment` repeatedly for more inputs. Output files must not exist.
+Use `--per-point` to test one API range per vertex instead of contiguous runs.
+Temporary copies and databases are removed after each successful native run.
+
+The workloads select valid points in circular grid footprints at 64 deterministic
+locations, including tile boundaries, and change all XYZ components. They model
+the persistence workload, not the actual push/pull deformation or rendering.
+The UI default radius is 5.75 grid steps (sigma 2), while 16 and 64 are larger
+footprint stress cases. World-distance filtering, curvature, invalid points,
+and movement during a stroke change the actual number of edited vertices.
+
+Current VC3D geometry autosave queues vertices and runs the file save through
+`QtConcurrent`; its timer interval is 10 seconds. The benchmark deliberately
+measures each database action as a separate durable commit. It uses the default
+SQLite WAL/`synchronous=FULL` settings, with no geometry checkpoints. File-save
+timings use the existing write/close/rename implementation, which does not
+explicitly fsync each save, so the durability guarantees differ. The first file
+save includes the normal initial recovery snapshot; warm statistics exclude it.
+Input loading and initial DB ingestion are outside the timed edit loops.
+
+These measurements do not establish interactive frame rates: they exclude
+rendering, deformation computation, relationship repairs, simultaneous writers,
+long-held read transactions, and approval-mask edits. Future integration should
+submit immutable edit data to a worker, preserving asynchronous persistence.
+
+### Measurements, 2026-10-20
+
+[Recorded results](benchmarks/edit-persistence-2026-10-20.json) use real Scroll 1
+9.6 µm segments from `spiral_dataset_graph_uuid/verified_patches`, on this ARM
+Cortex-X925/A725 machine with a Samsung NVMe/ext4 filesystem and a
+`RelWithDebInfo` build. The selected bounding boxes span 11.7–38.0 cm³; the point
+count and storage tiling, rather than physical bounding-box volume alone,
+determine persistence cost. These are 9.6 µm inputs, not exactly 8 µm.
+
+Each main case has three independent runs of 1,000 edits and 50 file saves.
+Values below are medians of the three per-run statistics, not pooled percentiles.
+Default-radius footprints contain up to 101 valid points.
+
+| Segment | Grid points | DB mean | DB p50 | DB p95 | File-save p50 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `0000_top_vt_strip_1` | 78,581 | 2.52 ms | 2.38 ms | 4.18 ms | 0.80 ms |
+| `0000_low_band_final` | 454,740 | 2.89 ms | 2.69 ms | 3.98 ms | 5.03 ms |
+| `0000_top_band` | 3,173,488 | 3.20 ms | 2.99 ms | 4.51 ms | 64.94 ms |
+
+On the largest surface, radius 16 has a median footprint of 797 points and
+commits in 3.63 ms p50 / 6.01 ms p95. Radius 64 has a median footprint of 9,177
+valid points (up to 12,814) and takes 8.93 ms p50 / 15.26 ms p95. The worst
+observed default-radius commit was 17.42 ms; the radius-64 maximum was 18.52 ms.
+Thus synchronous persistence on the UI thread cannot guarantee a 16.7 ms budget.
+Submitting one range per vertex instead of contiguous runs increased the large
+radius-64 case to 11.66 ms p50 / 18.10 ms p95 in a separate single run.
+
+Packing default-size edits took approximately 0.003 ms p95. At radius 64 on the
+largest surface, contiguous packing took 0.111 ms p95. On that surface, default
+commits spent approximately 1.81 ms in edit processing and 1.39 ms in commit
+(mean times). These are instrumented call-boundary timings; native sampling
+could not run because `perf_event_paranoid=4` and sandbox ptrace restrictions
+blocked perf and GDB respectively.
+
+There was no large progressive slowdown over 1,000 writes. Default first/last
+100-edit medians were 2.39/2.68 ms, 2.19/2.71 ms, and 3.09/2.99 ms for the three
+surfaces. Historical reconstruction remains a separate limitation: on the
+largest surface after 1,000 default edits, full current reads took about 50 ms,
+previous-version reads 138 ms, and middle-version reads 219 ms. A middle-version
+read after the radius-64 stress workload took approximately 4.85 seconds.
+Those are single reads per run, with medians across three runs; no cold-cache
+or history-navigation latency guarantee is implied.
+
+The evidence supports a background commit per completed action for these
+workloads. It does not demonstrate zero impact on interactive rendering, nor
+fast arbitrary history navigation. No VC3D integration or production DB changes
+were made for this benchmark.
+
+Reproduce the recorded inputs by passing these three `--segment` arguments to
+the command above:
+
+```sh
+--segment /home/sean/Desktop/spiral_dataset_graph_uuid/verified_patches/0000_top_vt_strip_1 \
+--segment /home/sean/Desktop/spiral_dataset_graph_uuid/verified_patches/0000_low_band_final \
+--segment /home/sean/Desktop/spiral_dataset_graph_uuid/verified_patches/0000_top_band
+```
+
+Validation for the benchmark addition:
+
+```sh
+AGENTS_AGENT_MODE=1 ninja -C build bench_object_edits test_object_store \
+  test_quadsurface_save_roundtrip test_quadsurface_snapshot
+AGENTS_AGENT_MODE=1 ctest --test-dir build --output-on-failure \
+  -R '^(test_object_store|test_quadsurface_save_roundtrip|test_quadsurface_snapshot)$'
+AGENTS_AGENT_MODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_BUILD_PYTHON=build/python \
+  .venv/bin/python -m pytest python/tests/test_object_geometry_edits.py -q
+```
+
+All three native test executables and all 20 Python edit tests passed. The 28
+recorded benchmark runs also passed their exact geometry and file verification.

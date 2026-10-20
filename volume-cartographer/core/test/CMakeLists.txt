@@ -70,6 +70,13 @@ vc_add_test(NAME test_fiber_collection LIBS doctest::doctest vc_fiber_collection
 
 vc_add_test(NAME test_object_records LIBS doctest::doctest vc_objects)
 vc_add_test(NAME test_object_store LIBS doctest::doctest vc_objects)
+add_executable(bench_object_edits bench_object_edits.cpp)
+target_link_libraries(bench_object_edits PRIVATE vc_objects vc_core)
+vc_register_test_target(bench_object_edits)
+if(VC_RUN_BENCHES)
+    add_test(NAME bench_object_edits COMMAND bench_object_edits --help)
+    vc_register_ctest(bench_object_edits bench_object_edits)
+endif()
 vc_add_test(NAME test_progress LIBS doctest::doctest vc_objects)
 
 vc_add_test(NAME test_object_links LIBS doctest::doctest vc_object_links vc_core)
