@@ -1,5 +1,16 @@
 # VC3D Line Annotation Fibers
 
+## Fiber coordinate shape
+
+Every saved fiber includes `coordinate_base_shape_zyx`, the dimensions of the
+grid its stored points index. New viewer annotations record the active volume's
+exact shape; linked fibers inherit the parent session's shape and display scale.
+Headless inference annotations require the inference manifest's `base_shape_zyx`.
+These are coordinate-frame dimensions, not necessarily the scan's finest grid.
+Opening older unstamped fibers first uses their recorded/selected inference
+manifest; without one, their existing unscaled active-volume interpretation is
+recorded on save. Saving without a valid shape fails rather than omitting it.
+
 ## CP direction annotations
 
 Shift-drag near an existing CP in either strip to edit its forward direction.

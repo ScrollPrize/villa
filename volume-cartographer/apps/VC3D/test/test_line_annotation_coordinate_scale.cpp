@@ -6,6 +6,7 @@ class TestLineAnnotationCoordinateScale : public QObject {
     Q_OBJECT
 
 private slots:
+    void stampsExactViewerGrid();
     void acceptsSameLevelOffByOneDomains();
     void acceptsDyadicNormalAndFiberDomains();
     void mapsFiberBaseCoordinatesIntoDownsampledVolume();
@@ -14,6 +15,17 @@ private slots:
     void ordersManifestCandidatesFiberFirstThenSelection();
     void omitsEmptyAndDuplicateManifestCandidates();
 };
+
+void TestLineAnnotationCoordinateScale::stampsExactViewerGrid()
+{
+    using vc3d::line_annotation::fiberCoordinateShapeFromVolume;
+    const std::array<std::size_t, 3> expected{18946, 8174, 8174};
+    QVERIFY(fiberCoordinateShapeFromVolume({18946, 8174, 8174}) == expected);
+    QVERIFY_EXCEPTION_THROWN(fiberCoordinateShapeFromVolume({0, 8174, 8174}),
+                             std::runtime_error);
+    QVERIFY_EXCEPTION_THROWN(fiberCoordinateShapeFromVolume({18946, -1, 8174}),
+                             std::runtime_error);
+}
 
 void TestLineAnnotationCoordinateScale::ordersManifestCandidatesFiberFirstThenSelection()
 {

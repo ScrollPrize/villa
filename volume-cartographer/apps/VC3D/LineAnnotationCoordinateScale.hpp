@@ -12,6 +12,20 @@
 
 namespace vc3d::line_annotation {
 
+// A viewer-created fiber uses the viewer's volume grid, not an inferred
+// level-0 grid (whose dimensions cannot be recovered exactly by scaling).
+inline std::array<std::size_t, 3> fiberCoordinateShapeFromVolume(
+    const std::array<int, 3>& shapeZYX)
+{
+    std::array<std::size_t, 3> result{};
+    for (std::size_t axis = 0; axis < result.size(); ++axis) {
+        if (shapeZYX[axis] <= 0)
+            throw std::runtime_error("Fiber creation requires a positive volume shape");
+        result[axis] = static_cast<std::size_t>(shapeZYX[axis]);
+    }
+    return result;
+}
+
 struct FiberNormalCoordinateScales {
     double fiberBaseToNormalBase = 1.0;
     double traceToNormalBase = 1.0;
