@@ -93,7 +93,7 @@ public:
     };
 
     struct FetchConcurrency {
-        // Number of physical source-read workers owned by this service.
+        // Number of physical remote-download workers owned by this service.
         std::size_t workerCapacity = 16;
         // Fixed admission limit, or the upper adaptive bound.
         std::size_t maxConcurrentReads = 16;
@@ -105,6 +105,8 @@ public:
         std::size_t decodedByteCapacity = 512ULL * 1024ULL * 1024ULL;
         std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget;
         FetchConcurrency fetchConcurrency;
+        // Independent local encoded-source I/O; never network-adaptive.
+        std::size_t localReadWorkers = 16;
         std::optional<AdaptiveDownloadState> initialAdaptiveDownloadState;
         // Startup-only selection for remote-volume persistent caches. Sources
         // acquired from this service cannot change representation in place.
@@ -130,7 +132,7 @@ public:
         double fillValue,
         ChunkDtype dtype,
         ChunkCacheOptions options = {});
-    // Changes service-wide source-read admission in place. Running and queued
+    // Changes service-wide remote-download admission in place. Running and queued
     // work is neither cancelled nor restarted.
     void configureFetchConcurrency(std::size_t maxConcurrentReads,
                                    bool adaptive);
@@ -138,6 +140,7 @@ public:
     // running work are preserved; reductions evict only decoded LRU entries.
     void configureDecodedByteCapacity(std::size_t decodedByteCapacity);
     FetchConcurrency fetchConcurrency() const;
+    std::size_t localReadWorkers() const noexcept;
     PersistentCacheEncoding persistentCacheEncoding() const noexcept;
     std::size_t sourceCount() const;
     bool invalidateSource(std::string_view sourceIdentity);
@@ -249,6 +252,8 @@ public:
                             const ChunkRequestContext& request) override;
     ChunkResult getChunkIfCached(int level, int iz, int iy, int ix) override;
     ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override;
+    ChunkResult getChunkBlocking(int level, int iz, int iy, int ix,
+                                 const ChunkRequestContext& request) override;
     void prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset = 0) override;
     void prefetchChunks(const std::vector<ChunkKey>& keys,
                         bool wait,
@@ -363,6 +368,7 @@ private:
         std::uint64_t decodeTaskId = 0;
         std::uint64_t budgetTouch = 0;
         bool backgroundDemand = false;
+        bool foregroundDemand = false;
         std::unordered_map<std::uint64_t, ViewDemandSlot> viewDemands;
         std::list<ChunkKey>::iterator lruIt;
     };
@@ -528,6 +534,7 @@ private:
         std::uint64_t nextSourceTransferSerial_ = 1;
         std::weak_ptr<ChunkRequestScheduler> probeScheduler_;
         std::weak_ptr<ChunkRequestScheduler> fetchScheduler_;
+        std::weak_ptr<ChunkRequestScheduler> localReadScheduler_;
         std::weak_ptr<ChunkRequestScheduler> decodeScheduler_;
         std::shared_ptr<ChunkRequestSelectionGate> schedulerSelectionGate_;
         std::shared_ptr<std::atomic<std::uint64_t>> activeViewId_;
@@ -603,6 +610,8 @@ private:
     static void queueRemoteFetch(const std::shared_ptr<State>& state,
                                  const ChunkKey& key,
                                  FetchContext context);
+    static std::shared_ptr<ChunkRequestScheduler> sourceScheduler(
+        const State& state, const IChunkFetcher& fetcher);
     static void joinSourceTransferLocked(
         const std::shared_ptr<State>& state,
         const ChunkKey& key,

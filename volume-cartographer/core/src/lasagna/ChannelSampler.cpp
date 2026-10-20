@@ -592,6 +592,7 @@ public:
         cv::Mat_<uint8_t> coverage = cv::Mat_<uint8_t>::zeros(rows, 8);
         vc::render::ChunkedPlaneSampler::Options options(
             vc::Sampling::Nearest, 32);
+        options.request.foreground = true;
         const auto stats =
             vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
                 *cache_, 0, coords, values, coverage, options);
@@ -678,7 +679,8 @@ NormalPrefetchReport visitLasagnaChannelCorners(
             visitorContext,
             visitor,
             parallelThreads,
-            collectLocalityStats);
+            collectLocalityStats,
+            vc::render::ChunkRequestContext{.foreground = true});
     return {
         static_cast<uint64_t>(stats.requestedChunks),
         static_cast<uint64_t>(stats.requestedChunks),

@@ -69,6 +69,7 @@ volume-cartographer/AGENTS.md
 /spiral-fitting/plans
 /volume-cartographer/scripts/spiral/out
 /spiral-fitting/.claude
+dinovol/cufile.log
 /vesuvius/src/vesuvius/neural_tracing/tracers/fibers/datasets/automated_fiber_volumes
 /vesuvius/src/vesuvius/neural_tracing/tracers/fibers/plans
 /vesuvius/src/vesuvius/neural_tracing/tracers/sheets/output
@@ -82,3 +83,5 @@ volume-cartographer/AGENTS.md
 /volume-cartographer/plans
 /spiral-fitting/experiments
 /volume-cartographer/docs/objects/benchmarks
+/vc_reader/benchmarks/results
+*.csv

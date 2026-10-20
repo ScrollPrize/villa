@@ -1703,11 +1703,12 @@ ChunkedPlaneSampler::Stats sampleCoordsLevelBlockingRequestedLevelImpl(
     stats.requestedChunks = static_cast<int>(keys.size());
 
     if (!keys.empty())
-        array.prefetchChunks(keys, false);
+        array.prefetchChunks(keys, false, 0, options.request);
 
     PinnedChunkCache pinned(keys.size());
     for (const ChunkKey& key : keys) {
-        ChunkResult result = array.getChunkBlocking(key.level, key.iz, key.iy, key.ix);
+        ChunkResult result = array.getChunkBlocking(
+            key.level, key.iz, key.iy, key.ix, options.request);
         if (result.status == ChunkStatus::Error) {
             ++stats.errorChunks;
             const std::string message = result.error.empty()
@@ -1844,7 +1845,8 @@ ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
     void* visitorContext,
     TrilinearCornerPointVisitor visitor,
     int parallelThreads,
-    bool collectLocalityStats)
+    bool collectLocalityStats,
+    const ChunkRequestContext& request)
 {
     using Clock = std::chrono::steady_clock;
     const auto prepareStart = Clock::now();
@@ -2205,7 +2207,7 @@ ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
         const auto& dependencies = layouts[volumeLayout[volumeIndex]].dependencies;
         stats.requestedChunks += static_cast<int>(dependencies.size());
         if (!dependencies.empty())
-            arrays[volumeIndex]->prefetchChunks(dependencies, false);
+            arrays[volumeIndex]->prefetchChunks(dependencies, false, 0, request);
     }
 
     struct PinnedVolume {
@@ -2230,7 +2232,7 @@ ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
             ++dependencyIndex) {
             const ChunkKey& key = dependencies[dependencyIndex];
             ChunkResult result = array->getChunkBlocking(
-                key.level, key.iz, key.iy, key.ix);
+                key.level, key.iz, key.iy, key.ix, request);
             if (result.status == ChunkStatus::Error) {
                 ++stats.errorChunks;
                 throw std::runtime_error(

@@ -111,6 +111,13 @@ public:
     virtual ~IChunkFetcher() = default;
     virtual ChunkFetchResult fetch(const ChunkKey& key) = 0;
 
+    // Admission classification is independent of telemetry: a remote store
+    // can serve disk hits without reporting a network transfer.
+    [[nodiscard]] virtual bool isRemoteSource() const noexcept
+    {
+        return measuresRemoteTransfer();
+    }
+
     // True only when fetchEncoded() issues a remote HTTP payload request and
     // reports its response-body bytes through DownloadProgressCallback.
     // The scheduler uses this before the call so connection and TTFB time are

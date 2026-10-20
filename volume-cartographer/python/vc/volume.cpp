@@ -947,7 +947,7 @@ NB_MODULE(volume, m)
                   ->configureFetchConcurrency(count, false);
           },
           "count"_a,
-          "Set fixed process-wide regular chunk source-read concurrency.");
+          "Set fixed process-wide remote-download concurrency; local source reads use a separate pool.");
 
     nb::class_<Volume>(m, "Volume")
         .def_static("open",

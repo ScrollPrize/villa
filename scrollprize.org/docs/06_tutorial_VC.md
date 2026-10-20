@@ -172,7 +172,7 @@ make install
 
 Now let's gather our scroll data and setup our folders...
 
-We're going to start with Scroll 1 (PHerc. Paris 4) as this is the scroll that the 2023 Grand Prize segments were from, and is also the easiest of the current scrolls to segment. VC requires all of the folders listed under the PHercParis4.volpkg, in addition to the config.json and meta.json files.
+We're going to start with Scroll 1 (PHerc. Paris. 4) as this is the scroll that the 2023 Grand Prize segments were from, and is also the easiest of the current scrolls to segment. VC requires all of the folders listed under the PHercParis4.volpkg, in addition to the config.json and meta.json files.
 
 
 This is the recommended structure for the full_scrolls folder (with a full example given for Scroll1):

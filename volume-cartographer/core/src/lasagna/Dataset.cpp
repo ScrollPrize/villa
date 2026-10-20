@@ -228,6 +228,7 @@ void resolveGroupLocations(
 // origin, whose own compressor remains responsible for lossless decoding.
 class PersistentHttpStore final : public utils::Store {
 public:
+    bool is_remote() const noexcept override { return true; }
     PersistentHttpStore(std::string baseUrl,
                         std::filesystem::path cacheRoot,
                         vc::HttpAuth remoteAuth,
