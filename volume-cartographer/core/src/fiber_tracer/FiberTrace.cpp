@@ -1,4 +1,5 @@
 #include "vc/fiber_tracer/FiberTrace.hpp"
+#include "vc/fiber_tracer/FiberEmbedding.hpp"
 #include "utils/zarr.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
 
@@ -544,6 +545,16 @@ void requireNormalSamplerForNormalAwareSmoothness(
 
 void validateTraceConfig(const FiberTraceConfig& config)
 {
+    if (!std::isfinite(config.embeddingWeight) || config.embeddingWeight < 0 ||
+        !std::isfinite(config.embeddingHistorySpacingBaseVoxels) || config.embeddingHistorySpacingBaseVoxels <= 0 ||
+        !std::isfinite(config.embeddingHistoryWindowBaseVoxels) ||
+        config.embeddingHistoryWindowBaseVoxels < config.embeddingHistorySpacingBaseVoxels ||
+        config.embeddingHistoryCount < 1 || config.embeddingHistoryCount > 64)
+        throw std::invalid_argument("invalid embedding weight/history configuration");
+    if (config.embeddingReferenceMode != "mean" && config.embeddingReferenceMode != "best")
+        throw std::invalid_argument("unknown embedding reference mode");
+    (void)fiberEmbeddingCost({}, {}, 0, config.embeddingHistoryWindowBaseVoxels,
+        config.embeddingHistoryFalloff, config.embeddingReferenceMode == "best");
     auto requireFinite = [](double value, const char* name) {
         if (!std::isfinite(value))
             throw std::invalid_argument(std::string(name) + " must be finite");
@@ -714,6 +725,7 @@ void validateTraceConfig(const FiberTraceConfig& config)
 }
 
 struct BeamState {
+    FiberEmbeddingHistory embeddingHistory;
     struct PathNode {
         TraceVec point{0.0f, 0.0f, 0.0f};
         std::shared_ptr<const PathNode> previous;
@@ -770,7 +782,25 @@ struct CandidateScore {
     TraceVec selectedCurrentDirection{0.0f, 0.0f, 0.0f};
     float selectedPresence = 0.0f;
     bool valid = false;
+    std::vector<float> embedding;
 };
+
+void addEmbeddingScore(CandidateScore& score, const std::vector<float>& vector,
+    const BeamState& parent, const TraceVec& point, const FiberTraceConfig& config)
+{
+    if (!score.valid || config.embeddingWeight == 0) return;
+    if (vector.empty()) {
+        score.valid = false;
+        score.loss = std::numeric_limits<float>::infinity();
+        return;
+    }
+    const double arc = (parent.tracedLength + traceLength(point-beamEndpoint(parent))) *
+        config.traceToBaseScale;
+    score.loss += static_cast<float>(config.embeddingWeight * fiberEmbeddingCost(
+        vector, parent.embeddingHistory, arc, config.embeddingHistoryWindowBaseVoxels,
+        config.embeddingHistoryFalloff, config.embeddingReferenceMode == "best"));
+    score.embedding = vector;
+}
 
 struct CandidateTask {
     uint32_t beamIndex = 0;
@@ -1279,6 +1309,12 @@ void sampleCandidateNormals(
         normalSampler,
         config,
         tasks.size());
+    std::vector<std::vector<float>> embeddingSamples;
+    if (config.embeddingWeight > 0) {
+        predictions.sampleEmbeddings(candidatePoints, embeddingSamples);
+        if (embeddingSamples.size() != tasks.size())
+            throw std::runtime_error("invalid embedding batch size");
+    }
     if (workers <= 1) {
         const auto scoreStart = TraceClock::now();
         for (size_t index = 0; index < tasks.size(); ++index) {
@@ -1290,6 +1326,9 @@ void sampleCandidateNormals(
                 task.direction,
                 candidatePoints[index],
                 config);
+            if (config.embeddingWeight > 0)
+                addEmbeddingScore(scores[index], embeddingSamples[index], beams[task.beamIndex],
+                    candidatePoints[index], config);
             storeScoredFrontierCandidate(
                 frontierOutput,
                 beams,
@@ -1318,6 +1357,7 @@ void sampleCandidateNormals(
         std::vector<CandidateScore>* scores;
         const FrontierScoreOutput* frontierOutput;
         size_t optionCount;
+        const std::vector<std::vector<float>>* embeddings;
     } cornerContext{
         &beams,
         &tasks,
@@ -1325,7 +1365,8 @@ void sampleCandidateNormals(
         &config,
         &scores,
         frontierOutput,
-        field ? field->optionCount() : 0};
+        field ? field->optionCount() : 0,
+        &embeddingSamples};
     const auto scoreCornerPoint = +[](
         void* rawContext,
         size_t pointIndex,
@@ -1347,6 +1388,9 @@ void sampleCandidateNormals(
             (*context.beams)[task.beamIndex],
             task.direction,
             *context.config);
+        if (context.config->embeddingWeight > 0)
+            addEmbeddingScore(score, (*context.embeddings)[pointIndex],
+                (*context.beams)[task.beamIndex], (*context.candidatePoints)[pointIndex], *context.config);
         storeScoredFrontierCandidate(
             context.frontierOutput,
             *context.beams,
@@ -1431,6 +1475,9 @@ void sampleCandidateNormals(
             task.direction,
             config,
             normal);
+        if (config.embeddingWeight > 0)
+            addEmbeddingScore(scores[index], embeddingSamples[index], beams[task.beamIndex],
+                candidatePoints[index], config);
         storeScoredFrontierCandidate(
             frontierOutput,
             beams,
@@ -1800,6 +1847,10 @@ void updateTargetPlaneCrossings(
     out.loss = candidate.loss;
     out.tracedLength = parent.tracedLength +
         traceLength(candidate.point - beamEndpoint(parent));
+    if (config.embeddingWeight > 0)
+        advanceFiberEmbeddingHistory(out.embeddingHistory, score.embedding,
+            out.tracedLength * config.traceToBaseScale, config.embeddingHistorySpacingBaseVoxels,
+            config.embeddingHistoryWindowBaseVoxels, static_cast<size_t>(config.embeddingHistoryCount));
     out.depth = candidate.depth;
     out.reached = candidate.reached;
     out.crossedTargetPlaneMask = candidate.crossedTargetPlaneMask;
@@ -2238,6 +2289,14 @@ template <typename LossAt>
 
     BeamState initial;
     initial.path = appendBeamPathPoint(nullptr, start);
+    if (request.config.embeddingWeight > 0) {
+        std::vector<std::vector<float>> seed;
+        predictions.sampleEmbeddings({start}, seed);
+        if (seed.size() != 1 || seed.front().empty())
+            throw std::runtime_error("trace seed has no valid embedding");
+        (void)fiberEmbeddingCosine(seed.front(), seed.front());
+        initial.embeddingHistory.push_back({0, seed.front()});
+    }
     initial.previousStepDirection = startDirection;
     initial.currentSampleDirection = startDirection;
     initial.historyDirection = startDirection;

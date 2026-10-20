@@ -290,6 +290,7 @@ vc_add_test(NAME test_fiber_trace3d
 vc_add_test(NAME test_fiber_anchors LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_prediction_channels LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_replay_metric LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_embedding_scoring LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiberlet_storage LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiberlet_paths LIBS doctest::doctest vc_fiber_tracer DEFS VC_TESTING)
 if(TARGET test_fiberlet_paths AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

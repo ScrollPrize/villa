@@ -51,7 +51,9 @@ struct Fixture {
     }
     vc::lasagna::LasagnaDataset dataset() const {
         return vc::lasagna::LasagnaDataset(vc::lasagna::LasagnaDatasetManifest::parseText(
-            nlohmann::json{{"version",2}, {"source_to_base",1}, {"groups",groups}}.dump(), path/"manifest.json"));
+            nlohmann::json{{"version",2}, {"source_to_base",1},
+                {"grad_mag_encode_scale",1000}, {"grad_mag_factor",1},
+                {"groups",groups}}.dump(), path/"manifest.json"));
     }
 };
 
@@ -180,4 +182,25 @@ TEST_CASE("real prediction cache remains identical through old and options const
     }
     CHECK(count > 0);
     std::cout << "Compared prediction field constructors at " << count << " real anchor positions\n";
+}
+
+TEST_CASE("embedding scoring preserves the fused normal corner path") {
+    Fixture fixture; fixture.auxiliary();
+    fixture.channel<uint8_t>("grad_mag", std::vector<uint8_t>(8,255), utils::ZarrDtype::uint8);
+    const auto dataset=fixture.dataset();
+    FiberPredictionField field(dataset,auxiliaryOptions());
+    vc::lasagna::LasagnaNormalSampler normals(dataset);
+    FiberTraceConfig config;
+    config.stepVoxels=.1;
+    config.beamWidth=3;
+    config.beamPruneDistanceVoxels=0;
+    config.embeddingWeight=.3;
+    config.parallelThreads=1;
+    const auto serial=traceFiberExtrapolation(field,{.5,.5,.5},{0,0,1},.2,config,&normals);
+    config.parallelThreads=4;
+    FiberTraceProfile profile; config.profile=&profile;
+    const auto fused=traceFiberExtrapolation(field,{.5,.5,.5},{0,0,1},.2,config,&normals);
+    REQUIRE(serial.points.size()>1);
+    CHECK(serial.points==fused.points);
+    CHECK(profile.cornerPointCount>0);
 }
