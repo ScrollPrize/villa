@@ -1,4 +1,4 @@
-foreach(name test_object_records test_object_store test_progress)
+foreach(name test_object_records test_object_store test_progress test_typed_geometry)
     add_executable(${name} ${name}.cpp)
     target_include_directories(${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(${name} PRIVATE vc_objects nlohmann_json::nlohmann_json)

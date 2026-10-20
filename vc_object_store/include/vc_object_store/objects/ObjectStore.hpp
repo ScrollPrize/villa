@@ -241,6 +241,7 @@ struct SyncReport {
 };
 
 class ObjectStore;
+class GeometrySnapshot;
 struct ObjectStoreImplAccess;
 
 class Txn {
@@ -317,6 +318,8 @@ public:
     ObjectStore& operator=(const ObjectStore&) = delete;
     ~ObjectStore();
     ReadTxn read();
+    // Typed, bounded geometry reads. Include store/GeometryViews.hpp to use.
+    GeometrySnapshot geometrySnapshot();
     WriteTxn write();
     // Optimistic action: check every supplied head before making changes and
     // require an expectation for every modified object and relationship endpoint.

@@ -1,5 +1,6 @@
 #include "StorageBindings.hpp"
 #include "ObjectReadBindings.hpp"
+#include "TypedGeometryBindings.hpp"
 #include <nanobind/stl/map.h>
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
@@ -44,24 +45,6 @@ nb::dict revisionViewToPy(vo::ObjectStore& db, const vo::Txn& txn, const vo::Rev
     return result;
 }
 
-std::vector<vo::GeometryEdgeEdit> edgeEditsFromPy(const nb::list& edits)
-{
-    std::vector<vo::GeometryEdgeEdit> result;
-    for (nb::handle item : edits) {
-        const auto d = nb::cast<nb::dict>(item);
-        vo::GeometryEdgeEdit edit;
-        edit.edgeUuid = nb::cast<std::string>(d["edge_uuid"]);
-        edit.expectedGeneration = nb::cast<int64_t>(d["expected_generation"]);
-        edit.action = nb::cast<std::string>(d["action"]);
-        edit.aRevision = nb::cast<std::optional<std::string>>(d["a_revision"]);
-        edit.bRevision = nb::cast<std::optional<std::string>>(d["b_revision"]);
-        if (edit.action == "update") {
-            edit.aAnchor = anchorFromPy(d["a_anchor"]); edit.bAnchor = anchorFromPy(d["b_anchor"]);
-        }
-        result.push_back(std::move(edit));
-    }
-    return result;
-}
 
 vo::EdgeGeometryRepair repairFromPy(const nb::dict& d)
 {
@@ -144,10 +127,10 @@ NB_MODULE(_native, m)
             return result;
         }, nb::arg("point_xyz"));
 
-    m.doc() = "Object database with immutable geometry and relationship metadata. Records are dicts; "
-              "'kind' is metadata in the dict, never part of a method name.";
+    m.doc() = "Revisioned objects and relationships, with owned geometry and typed snapshot views.";
 
     bindGraphReadView(m);
+    bindTypedGeometry(m);
 
     nb::class_<PyObjectStore>(m, "ObjectStore")
         .def_static("create", &PyObjectStore::create, nb::arg("path"), nb::arg("author"),
@@ -161,6 +144,12 @@ NB_MODULE(_native, m)
                     nb::arg("geometry_cache_bytes") = 16 * 1024 * 1024,
                     nb::arg("spatial_cache_bytes") = 16 * 1024 * 1024,
                     "Open an existing object database. author is required unless read_only.")
+        .def("geometry_snapshot", [](PyObjectStore& self) {
+            self.require();
+            auto lease = self.db;
+            nb::gil_scoped_release release;
+            return vo::GeometrySnapshot(std::move(lease));
+        })
         .def("close", &PyObjectStore::close)
         .def("__enter__", [](nb::object self) { return self; })
         .def("__exit__", [](PyObjectStore& self, nb::args) { self.close(); })
@@ -332,9 +321,9 @@ NB_MODULE(_native, m)
                 return out;
             },
             nb::arg("after_seq") = 0)
-        .def("put_geometry", [](PyObjectStore& self, const std::string& uuid, const nb::dict& input,
+        .def("put_geometry", [](PyObjectStore& self, const std::string& uuid, const nb::object& input,
                                const std::optional<std::string>& expected, const nb::list& choices, int64_t patchTileSize) {
-            const auto data = geometryFromPy(input);
+            const auto data = geometryInputFromPy(input);
             const auto edits = edgeEditsFromPy(choices);
             auto lease = self.db; self.require(); nb::gil_scoped_release release;
             return self.withWrite([&](vo::ObjectStore& db, vo::WriteTxn& txn) { return db.putGeometry(txn, uuid, data, expected, edits, vo::GeometryStorageOptions{patchTileSize}); });
@@ -358,7 +347,7 @@ NB_MODULE(_native, m)
             nb::list result; for (const auto& edge : edges) result.append(edgeToPy(edge)); return result;
         }, nb::arg("object_uuid"), nb::arg("edits"), nb::arg("expected_revision"))
         .def("affected_geometry_edges", [](PyObjectStore& self, const std::string& uuid, const nb::dict& input) {
-            const auto data = geometryFromPy(input);
+            const auto data = geometryInputFromPy(input);
             auto edges = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.affectedGeometryEdges(txn, uuid, data); });
             nb::list result; for (const auto& edge : edges) result.append(edgeToPy(edge)); return result;
         }, nb::arg("object_uuid"), nb::arg("geometry"))
@@ -809,9 +798,9 @@ NB_MODULE(_native, m)
         .def("remove_meta", [](PyObjectWriteTxn& self, const std::string& uuid, const std::string& key) {
             self.owner->require().removeMeta(self.require(), uuid, key);
         })
-        .def("put_geometry", [](PyObjectWriteTxn& self, const std::string& uuid, const nb::dict& input,
+        .def("put_geometry", [](PyObjectWriteTxn& self, const std::string& uuid, const nb::object& input,
                                const std::optional<std::string>& expected, const nb::list& choices, int64_t patchTileSize) {
-            const auto data = geometryFromPy(input);
+            const auto data = geometryInputFromPy(input);
             return self.owner->require().putGeometry(self.require(), uuid, data, expected, edgeEditsFromPy(choices), vo::GeometryStorageOptions{patchTileSize});
         }, nb::arg("object_uuid"), nb::arg("geometry"), nb::arg("expected_revision") = std::nullopt,
            nb::arg("edge_edits") = nb::list(), nb::arg("patch_tile_size") = vo::GeometryStorageOptions{}.patchTileSize)

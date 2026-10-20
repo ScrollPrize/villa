@@ -17,6 +17,8 @@ add_library(vc_objects STATIC
     Spatial.cpp
     sync/Synchronize.cpp
     sync/GeometryTransfer.cpp
+    geometry/TypedGeometry.cpp
+    geometry/GeometryViews.cpp
     geometry/Geometry.cpp
     geometry/GeometryDelta.cpp
     geometry/GeometryReader.cpp
@@ -63,7 +65,9 @@ add_library(vc_object_formats STATIC Tiff.cpp MemMap.cpp PackedTrackStore.cpp sp
 target_include_directories(vc_object_formats PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(vc_object_formats PUBLIC opencv_core TIFF::TIFF PRIVATE opencv_imgcodecs nlohmann_json::nlohmann_json)
 target_compile_features(vc_object_formats PUBLIC cxx_std_20)
-add_library(vc_object_geometry STATIC geometry/GeometryIngest.cpp geometry/GeometryExport.cpp geometry/SourceMetadata.cpp imports/SourceRelationships.cpp)
+add_library(vc_object_geometry STATIC geometry/GeometryIngest.cpp geometry/GeometryExport.cpp geometry/SourceMetadata.cpp imports/SourceRelationships.cpp
+    formats/GeometryInput.cpp formats/FiberInput.cpp formats/PatchInput.cpp
+    formats/PointCollectionInput.cpp formats/TrackInput.cpp formats/GeometryOutput.cpp)
 target_include_directories(vc_object_geometry PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(vc_object_geometry PUBLIC vc_objects PRIVATE vc_object_formats nlohmann_json::nlohmann_json)
 add_library(vc_object_links STATIC

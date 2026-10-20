@@ -1,20 +1,12 @@
 #include "imports/SourceRelationships.hpp"
 #include "vc_object_store/objects/GeometryIngest.hpp"
-#include "spatial/PatchGrid.hpp"
-#include "vc_object_store/Tiff.hpp"
 #include "vc_object_store/PackedTrackStore.hpp"
 #include "vc_object_store/Uuid.hpp"
-#include "formats/FiberInput.hpp"
-#include "formats/PatchInput.hpp"
+#include "formats/GeometryInput.hpp"
 #include "formats/TrackInput.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
-#include <bit>
-#include <charconv>
 #include <cctype>
-#include <cmath>
-#include <cstring>
-#include <fstream>
 #include <map>
 #include <set>
 #include <span>
@@ -23,190 +15,12 @@ namespace vc::objects {
 namespace {
 using Json = nlohmann::json;
 namespace fs = std::filesystem;
-Json readJson(const fs::path& path)
-{
-    std::ifstream input(path);
-    if (!input) throw std::runtime_error("cannot read " + path.string());
-    return Json::parse(input);
-}
-std::string uuid(const Json& data)
-{
-    return util::canonicalUuid(data.at("uuid").get<std::string>());
-}
-// Store explicit little-endian scalar bytes on every supported host.
-template<class T> GeometryArray array(std::string name, std::string dtype, std::vector<int64_t> shape, std::span<const T> values)
-{
-    GeometryArray result{std::move(name), std::move(dtype), std::move(shape), {}};
-    result.bytes.resize(values.size_bytes());
-    if (!values.empty()) std::memcpy(result.bytes.data(), values.data(), values.size_bytes());
-    if constexpr (std::endian::native != std::endian::little)
-        for (size_t i = 0; i < result.bytes.size(); i += sizeof(T))
-            std::reverse(result.bytes.begin() + i, result.bytes.begin() + i + sizeof(T));
-    return result;
-}
-GeometryArray points(const char* name, const std::vector<std::array<double, 3>>& values)
-{
-    std::vector<double> flat;
-    flat.reserve(values.size() * 3);
-    for (const auto& point : values) flat.insert(flat.end(), point.begin(), point.end());
-    return array<double>(name, "<f8", {static_cast<int64_t>(values.size()), 3}, flat);
-}
-struct Prepared {
-    ObjectRecord object;
-    GeometryData geometry;
-    Json source;
-};
-ObjectRecord sourceObject(const Json& root, const std::string& kind, const fs::path& source)
-{
-    ObjectRecord result;
-    result.uuid = uuid(root); result.kind = kind; result.name = source.stem().string();
-    result.storageKind = "file"; result.storageRef = fs::absolute(source).lexically_normal().string();
-    result.formatVersion = root.value("version", int64_t(1));
-    result.name = root.value("name", result.name);
-    if (root.contains("tags") && root.at("tags").is_array())
-        for (const auto& tag : root.at("tags")) result.tags.push_back(tag.get<std::string>());
-    if (kind == "point_collection" && root.contains("tags") && root.at("tags").is_object())
-        for (const auto& [name, value] : root.at("tags").items()) result.tags.push_back(name);
-    return result;
-}
-Prepared fiber(const fs::path& source)
-{
-    auto root = readJson(source);
-    if (root.value("type", "") != "vc3d_fiber") throw std::runtime_error("expected vc3d_fiber JSON");
-    Prepared p;
-    p.object = sourceObject(root, "fiber", source); p.geometry.kind = "fiber";
-    for (const char* key : {"control_points", "line_points"}) {
-        if (!root.contains(key)) continue;
-        if (!root.at(key).is_array()) throw std::runtime_error("invalid fiber point array");
-        for (const auto& entry : root.at(key)) {
-            const auto& xyz = entry.is_object() ? entry.at("position") : entry;
-            if (!xyz.is_array() || xyz.size() != 3) throw std::runtime_error("fiber points require exactly three XYZ coordinates");
-        }
-    }
-    const auto control = detail::fiberPoints(root, "control_points"), line = detail::fiberPoints(root, "line_points");
-    p.geometry.arrays = {points("control_points", control), points("line_points", line)};
-    FiberDetail f;
-    f.controlPointCount = control.size(); f.linePointCount = line.size();
-    f.length = detail::fiberPolylineLength(line.empty() ? control : line);
-    f.width = root.value("width", 0.0); f.widthGapFraction = root.value("width_gap_fraction", 0.2);
-    f.optimizationMode = root.value("optimization_mode", "");
-    if (root.contains("hv_classification")) {
-        const auto& hv = root.at("hv_classification");
-        const auto manual = hv.value("manual_tag", "");
-        f.manualFamily = !manual.empty(); f.family = f.manualFamily ? manual : hv.value("automatic_tag", "");
-    }
-    p.object.fiber = f;
-    // Retain per-control tracing settings and other source annotations, without
-    // duplicating coordinate arrays as JSON. Positional order remains unchanged.
-    for (const char* key : {"control_points", "line_points"}) {
-        Json extras = Json::array();
-        for (const auto& entry : root.value(key, Json::array())) {
-            if (entry.is_object()) { auto extra = entry; extra.erase("position"); extras.push_back(std::move(extra)); }
-            else extras.push_back(nullptr);
-        }
-        root.erase(key);
-        // Most line points have no extra fields. Avoid millions of JSON nulls.
-        if (std::any_of(extras.begin(), extras.end(), [](const auto& e) { return !e.is_null() && !e.empty(); }))
-            root[std::string(key) + "_attributes"] = std::move(extras);
-    }
-    p.source = root;
-    return p;
-}
-Prepared patch(const fs::path& source)
-{
-    auto fingerprint = [&]() {
-        std::map<std::string, std::pair<uintmax_t, fs::file_time_type>> result;
-        for (const auto& entry : fs::directory_iterator(source))
-            if (entry.is_regular_file() && (entry.path().extension() == ".tif" || entry.path().filename() == "meta.json"))
-                result[entry.path().filename().string()] = {entry.file_size(), entry.last_write_time()};
-        return result;
-    };
-    const auto before = fingerprint();
-    const auto root = readJson(source / "meta.json");
-    Prepared p;
-    p.object = sourceObject(root, "patch", source); p.geometry.kind = "patch";
-    detail::validatePatchFiles(source);
-    auto surface = vc::object_links::readPatchGrid(source);
-    const auto grid = surface.rawPoints();
-    // TIFF loading produces a contiguous XYZ grid. Retain a fallback for a
-    // strided view, but avoid building a second full-size scalar vector.
-    const cv::Mat contiguous = grid.isContinuous() ? grid : grid.clone();
-    p.geometry.arrays.push_back(array<float>("points", "<f4", {grid.rows, grid.cols, 3},
-        std::span<const float>(contiguous.ptr<float>(), contiguous.total() * 3)));
-    PatchDetail d;
-    d.gridWidth = grid.cols; d.gridHeight = grid.rows;
-    const auto scale = surface.scale(); d.scale = {scale[0], scale[1]};
-    if (root.contains("bbox") && root.at("bbox").is_array() && root.at("bbox").size() == 2) {
-        const auto low = root.at("bbox")[0].get<std::array<double, 3>>();
-        const auto high = root.at("bbox")[1].get<std::array<double, 3>>();
-        d.bbox = {low[0], low[1], low[2], high[0], high[1], high[2]};
-    }
-    p.object.patch = d;
-    if (before != fingerprint()) throw std::runtime_error("patch changed while reading; retry ingestion");
-    p.source = root;
-    p.geometry.attributes = Json{{"scale", root.at("scale")}}.dump();
-    return p;
-}
-std::vector<Prepared> collections(const fs::path& source)
-{
-    const auto root = readJson(source);
-    if (root.value("vc_pointcollections_json_version", "") != "1" || !root.at("collections").is_object())
-        throw std::runtime_error("expected vc_pointcollections JSON version 1");
-    std::vector<Prepared> result;
-    std::set<std::string> seen;
-    for (const auto& [collectionId, original] : root.at("collections").items()) {
-        Prepared p;
-        p.object = sourceObject(original, "point_collection", source);
-        if (!seen.insert(p.object.uuid).second) throw std::runtime_error("duplicate collection UUID");
-        p.object.name = original.value("name", ""); p.geometry.kind = "point_collection";
-        std::map<int64_t, Json> ordered;
-        if (!original.at("points").is_object()) throw std::runtime_error("points must be an object");
-        for (const auto& [key, value] : original.at("points").items()) {
-            int64_t id;
-            const auto [end, error] = std::from_chars(key.data(), key.data() + key.size(), id);
-            if (error != std::errc{} || end != key.data() + key.size() || id < 0 || !ordered.emplace(id, value).second)
-                throw std::runtime_error("invalid or duplicate numeric point ID");
-        }
-        std::vector<int64_t> ids;
-        std::vector<std::array<double, 3>> coordinates;
-        auto attributes = original; attributes.erase("points");
-        attributes["source_collection_id"] = collectionId;
-        attributes["origin"] = p.object.storageRef;
-        if (!attributes.contains("winding_is_absolute") && source.filename() == "abs_winding.json")
-            attributes["winding_is_absolute"] = true;
-        attributes["point_attributes"] = Json::array();
-        for (const auto& [id, entry] : ordered) {
-            if (!entry.at("p").is_array() || entry.at("p").size() != 3) throw std::runtime_error("invalid XYZ point");
-            auto xyz = entry.at("p").get<std::array<double, 3>>();
-            for (double value : xyz) if (!std::isfinite(value)) throw std::runtime_error("non-finite point");
-            ids.push_back(id); coordinates.push_back(xyz);
-            auto extra = entry; extra.erase("p"); attributes["point_attributes"].push_back(std::move(extra));
-        }
-        p.geometry.arrays.push_back(points("points", coordinates));
-        p.geometry.arrays.push_back(array<int64_t>("point_ids", "<i8", {static_cast<int64_t>(ids.size())}, ids));
-        p.source = std::move(attributes);
-        result.push_back(std::move(p));
-    }
-    return result;
-}
-Prepared track(const PackedTrackStore& store, size_t row, ObjectRecord object)
-{
-    Prepared p;
-    p.object = std::move(object); p.geometry.kind = "track";
-    const auto start = store.offsets()[row], count = store.offsets()[row + 1] - start;
-    std::vector<int32_t> xyz;
-    xyz.reserve(static_cast<size_t>(count) * 3);
-    const auto raw = store.coordinates();
-    for (int64_t i = 0; i < count; ++i) {
-        for (int axis = 2; axis >= 0; --axis) xyz.push_back(raw[3 * (start + i) + axis]);
-    }
-
-    p.geometry.arrays.push_back(array<int32_t>("points", "<i4", {count, 3}, xyz));
-    p.object.track->pointCount = count; p.object.track->length = detail::trackPolylineLength(store, row, nullptr);
-    p.object.track->family = detail::trackFamily(store, row);
-    p.source = Json::object();
-    return p;
-}
+using formats::Prepared;
+using formats::fiber;
+using formats::patch;
+using formats::collections;
+using formats::track;
+using formats::readJson;
 struct Expected { std::optional<std::string> revision; std::optional<int64_t> generation; };
 Expected expectedAt(ObjectStore& db, const Txn& read, const std::string& id)
 {

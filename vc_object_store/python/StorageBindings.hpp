@@ -340,6 +340,25 @@ nb::dict geometryReportToPy(const vo::GeometryIngestReport& r)
     return result;
 }
 
+std::vector<vo::GeometryEdgeEdit> edgeEditsFromPy(const nb::list& edits)
+{
+    std::vector<vo::GeometryEdgeEdit> result;
+    for (nb::handle item : edits) {
+        const auto d = nb::cast<nb::dict>(item);
+        vo::GeometryEdgeEdit edit;
+        edit.edgeUuid = nb::cast<std::string>(d["edge_uuid"]);
+        edit.expectedGeneration = nb::cast<int64_t>(d["expected_generation"]);
+        edit.action = nb::cast<std::string>(d["action"]);
+        edit.aRevision = nb::cast<std::optional<std::string>>(d["a_revision"]);
+        edit.bRevision = nb::cast<std::optional<std::string>>(d["b_revision"]);
+        if (edit.action == "update") {
+            edit.aAnchor = anchorFromPy(d["a_anchor"]); edit.bAnchor = anchorFromPy(d["b_anchor"]);
+        }
+        result.push_back(std::move(edit));
+    }
+    return result;
+}
+
 }
 namespace vc::python {
 struct PyObjectStore {

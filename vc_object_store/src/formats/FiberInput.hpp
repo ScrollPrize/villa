@@ -1,4 +1,5 @@
 #pragma once
+#include "vc_object_store/geometry/Geometry.hpp"
 #include <array>
 #include <cmath>
 #include <stdexcept>
@@ -29,16 +30,6 @@ inline std::vector<std::array<double, 3>> fiberPoints(const nlohmann::json& root
 
 inline double fiberPolylineLength(const std::vector<std::array<double, 3>>& points)
 {
-    double length = 0;
-    for (size_t i = 1; i < points.size(); ++i) {
-        double squared = 0;
-        for (size_t axis = 0; axis < 3; ++axis) {
-            const double delta = points[i][axis] - points[i-1][axis];
-            squared += delta * delta;
-        }
-        length += std::sqrt(squared);
-    }
-    if (!std::isfinite(length)) throw std::runtime_error("non-finite fiber length");
-    return length;
+    return vc::geometry::polylineLength(points);
 }
 } // namespace vc::objects::detail
