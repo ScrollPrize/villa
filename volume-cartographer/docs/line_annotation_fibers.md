@@ -437,13 +437,25 @@ The main window's **BBox** checkbox beneath **Focus** enables an annotation
 focus region. The adjacent minimum and maximum fields use inclusive absolute
 base-volume `x, y, z` coordinates. An unset box starts at the current volume
 extent; edited coordinates are normalized and clamped to that extent. The box
-is session-only, survives volume/channel changes in the current package, and is
-cleared when the project is replaced or closed.
+is stored per project together with its enabled state. UI fields and viewer
+mask APIs use the current volume's voxel coordinates, but `focus_bounds` in
+the project JSON uses the source annotation grid (`coordinate_frame:
+"annotation"`). The same frame derivation used by the Fiber Map supplies the
+conversion: exact catalog coordinate factors take precedence, and untagged
+rebased volumes use their pyramid-base factor. Bounds are converted on read,
+not repeatedly rewritten on volume changes, so switching pyramid levels or
+reopening with another preferred level preserves the region. With no usable
+volume frame, the mask is unavailable; stored bounds are retained. Bounds with
+an unspecified storage frame are rejected rather than silently misinterpreted.
+Disabling the box preserves its limits; switching projects restores that
+project's bounds and closing clears them.
 
 When enabled, ordinary plane views and all line-annotation cut/strip views show
 the area outside the box at half brightness. The dimming is applied after base
 and attached-volume composition and does not dim control markers. The main
-segmentation surface view is not covered by this version of the feature.
+segmentation surface view is also masked using its generated 3D coordinates.
+The 2D Fiber Map clips its strokes against the same box in annotation
+coordinates, without altering the underlying fibers or layout.
 
 New seeds, linked branch seeds, and control points must be inside the active
 box. Existing controls remain valid outside it, so a saved seed-only fiber can

@@ -188,6 +188,7 @@ public:
     // Viewer bbox in volume coordinates; disabling retains the saved limits.
     [[nodiscard]] std::optional<Rect3D> focusBounds() const { return focusBounds_; }
     [[nodiscard]] bool focusBoundsEnabled() const { return focusBoundsEnabled_; }
+    // Bounds are source annotation-frame XYZ, never current-volume voxel units.
     void setFocusBounds(std::optional<Rect3D> bounds, bool enabled);
 
     // The project's umbilicus polyline, if one has been attached explicitly.

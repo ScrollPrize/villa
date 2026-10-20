@@ -66,6 +66,8 @@ TEST_CASE("Project focus bounds persist independently of enabled state")
     CHECK_FALSE(project->focusBoundsEnabled());
     project->setFocusBounds(Rect3D{{30, 20, 10}, {1, 2, 3}}, true);
     project->save(path);
+    CHECK(utils::Json::parse_file(path).at("focus_bounds")
+              .at("coordinate_frame").get_string() == "annotation");
     auto loaded = VolumePkg::load(path);
     REQUIRE(loaded->focusBounds().has_value());
     CHECK(loaded->focusBounds()->low == cv::Vec3f(1, 2, 3));
@@ -82,6 +84,21 @@ TEST_CASE("Project focus bounds persist independently of enabled state")
     CHECK_FALSE(cleared->focusBounds().has_value());
     CHECK_FALSE(cleared->focusBoundsEnabled());
     CHECK_FALSE(VolumePkg::newDetached()->focusBounds().has_value());
+}
+
+TEST_CASE("Project focus bounds reject an unspecified coordinate frame")
+{
+    const auto path = testAutosaveRoot.root / "ambiguous-focus.volpkg.json";
+    auto project = VolumePkg::newDetached();
+    project->save(path);
+    auto json = utils::Json::parse_file(path);
+    json["focus_bounds"] = utils::Json::parse(
+        R"({"enabled":true,"low_xyz":[0,0,0],"high_xyz":[10,20,30]})");
+    {
+        std::ofstream output(path);
+        output << json.dump();
+    }
+    CHECK_THROWS_AS(VolumePkg::load(path), std::invalid_argument);
 }
 
 void stageSegments(const fs::path& root, const std::string& dirName = "paths")

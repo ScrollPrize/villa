@@ -13571,37 +13571,7 @@ vc3d::annotation::AnnotationFrame LineAnnotationController::annotationFrame() co
         return {};
     }
     try {
-        const auto volume = _state->currentVolume();
-        if (!volume) {
-            return {};
-        }
-        // The exact coordinate factor comes straight from the tags, not through
-        // coordinateIdentityForVolume(): that helper withholds the whole
-        // identity when the physical resolution is missing, and the factor is
-        // an exact integer statement that must not be lost over absent physical
-        // metadata. The stamped resolution, where present, is passed as the
-        // physical figure it is; deriveAnnotationFrame() never derives counts
-        // from it.
-        std::optional<double> exactFactor;
-        std::optional<double> stampedResolution;
-        if (_state->vpkg() && !_state->currentVolumeId().empty()) {
-            if (const auto identity = vc3d::opendata::coordinateIdentityFromTags(
-                    _state->vpkg()->volumeTags(_state->currentVolumeId()))) {
-                exactFactor =
-                    static_cast<double>(identity->sourceCoordinateScaleFactor);
-                if (identity->sourceOriginalResolution > 0.0) {
-                    stampedResolution = identity->sourceOriginalResolution;
-                }
-            }
-        }
-        return vc3d::annotation::deriveAnnotationFrame(
-            volume->voxelSize(),
-            volume->baseScaleLevel(),
-            exactFactor,
-            stampedResolution,
-            {static_cast<double>(volume->sliceWidth()),
-             static_cast<double>(volume->sliceHeight()),
-             static_cast<double>(volume->numSlices())});
+        return _state->annotationFrame();
     } catch (...) {
         return {};
     }

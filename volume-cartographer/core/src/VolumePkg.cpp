@@ -2268,6 +2268,7 @@ utils::Json VolumePkg::toJson() const
             high.push_back(double(focusBounds_->high[axis]));
         }
         j["focus_bounds"] = {{"enabled", focusBoundsEnabled_},
+                             {"coordinate_frame", "annotation"},
                              {"low_xyz", low}, {"high_xyz", high}};
     }
     return j;
@@ -2281,6 +2282,8 @@ void VolumePkg::fromJson(const utils::Json& j)
     focusBoundsEnabled_ = false;
     if (j.contains("focus_bounds")) {
         const auto saved = j.at("focus_bounds");
+        if (saved.value("coordinate_frame", std::string{}) != "annotation")
+            throw std::invalid_argument("Project focus bounds must declare coordinate_frame 'annotation'");
         const auto low = saved.at("low_xyz").get_double_array();
         const auto high = saved.at("high_xyz").get_double_array();
         if (low.size() != 3 || high.size() != 3)
