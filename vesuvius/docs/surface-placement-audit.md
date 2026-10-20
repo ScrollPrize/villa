@@ -64,6 +64,7 @@ surface, and `<name>.png` with `--plot` (offset as colour in two projections).
 | --- | --- |
 | `n_samples`, `n_inside_volume`, `n_valid` | points drawn, inside the volume with the full profile, with a located peak |
 | `n_no_normal` | tifxyz input only: valid grid points with no computable normal (hole edges, grid border), which are never sampled. Vertex-level defects that sit there, such as the resampling spikes of villa PR #2067, are invisible to this audit; the count says how much of the grid it did not look at |
+| `n_grid_spikes`, `grid_step_median`, `grid_step_max` | tifxyz input only, no CT read: adjacent valid grid points are joined when their distance is at most 4x the median step; the largest connected group is the surface, and any other group still tied to it by a long step is a spike (vertices thrown off the surface singly or as a run, the resampling defect of villa PR #2067, whose check inspired this one). Islands with no tie are left alone. Spike row/col pairs go to `<name>.grid_spikes.csv`. On segment 20231007101619 resampled on main it finds exactly the PR's 23 vertices and nothing on the fixed output |
 | `no_peak_frac` | share of inside points with no qualifying peak (low contrast, air, or a shoulder) |
 | `offset_median`, `offset_q25`, `offset_q75`, `offset_mean_abs` | signed offset from the surface point to the sheet peak, in voxels along the stored normal; positive means the peak lies in the normal direction |
 | `offset_abs_gt_1_frac`, `_2_`, `_3_` | share of valid points more than 1, 2 or 3 voxels from the peak |

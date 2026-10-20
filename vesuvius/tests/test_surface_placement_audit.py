@@ -202,12 +202,37 @@ def test_tifxyz_points_without_a_normal_are_counted_not_silently_dropped(tmp_pat
     x, y, z = xx.astype(np.float32), yy.astype(np.float32), np.full(xx.shape, 32.0, np.float32)
     x[10:13, 10:13] = y[10:13, 10:13] = z[10:13, 10:13] = -1.0  # a 3 x 3 hole
     d = write_tifxyz(tmp_path / "seg", Tifxyz(_x=x, _y=y, _z=z, _scale=(1.0, 1.0), path=None))
-    P, N, _, n_ok, n_no_normal = spa.sample_tifxyz(str(d), 10_000, np.random.default_rng(0))
+    P, N, _, n_ok, n_no_normal, _grid = spa.sample_tifxyz(str(d), 10_000, np.random.default_rng(0))
     assert n_no_normal > 0 and n_ok + n_no_normal == 24 * 24 - 9
     assert np.isfinite(N).all() and len(P) == n_ok
     rc, out, rows = run(tmp_path, ct, [str(d)])
     assert rc == 0
     assert json.load(open(out / "seg.json"))["n_no_normal"] == n_no_normal
+
+
+def test_grid_spikes_at_hole_edges_are_counted_and_located(tmp_path, ct):
+    """A vertex thrown far off the surface next to a hole (villa PR #2067's resampling
+    defect) has no normal and is never CT-sampled, so the grid check must catch it from
+    geometry alone: count it, locate it, and leave a clean grid at zero."""
+    from vesuvius.tifxyz.types import Tifxyz
+    from vesuvius.tifxyz.writer import write_tifxyz
+
+    yy, xx = np.meshgrid(np.linspace(16, 48, 24), np.linspace(16, 48, 24))
+    x, y, z = xx.astype(np.float32), yy.astype(np.float32), np.full(xx.shape, 32.0, np.float32)
+    x[10:13, 10:13] = y[10:13, 10:13] = z[10:13, 10:13] = -1.0
+    has = x > 0
+    clean = spa.grid_step_check(x, y, z, has)
+    assert clean["n_grid_spikes"] == 0 and abs(clean["grid_step_median"] - 32 / 23) < 1e-3
+    z[9, 10] = 32.0 + 400.0  # one hole-edge vertex 400 voxels off the plane
+    bad = spa.grid_step_check(x, y, z, has)
+    assert bad["n_grid_spikes"] == 1 and bad["grid_spike_rc"].tolist() == [[9, 10]]
+    assert bad["grid_step_max"] > 399
+    d = write_tifxyz(tmp_path / "seg", Tifxyz(_x=x, _y=y, _z=z, _scale=(1.0, 1.0), path=None))
+    rc, out, rows = run(tmp_path, ct, [str(d), "--fail-on", "n_grid_spikes=0"])
+    assert rc == 2
+    j = json.load(open(out / "seg.json"))
+    assert j["n_grid_spikes"] == 1 and "grid_spike_rc" not in j
+    assert [r for r in csv.DictReader(open(out / "seg.grid_spikes.csv"))][0] == {"row": "9", "col": "10"}
 
 
 def test_bad_arguments(tmp_path, ct):

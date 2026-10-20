@@ -46,6 +46,7 @@ METRICS = (
     "snap_remeasure_sd", "snap_remeasure_abs_gt_2_frac",
     "tangent_absdiff_median_2", "tangent_absdiff_median_4", "tangent_absdiff_median_8",
     "tangent_corr_2", "tangent_corr_4", "tangent_corr_8",
+    "n_grid_spikes", "grid_step_median", "grid_step_max",
 )
 TANGENT_RADII = (2.0, 4.0, 8.0)
 
@@ -197,6 +198,53 @@ def _sample_obj(src, size, reader, samples, blobs, rng, blob_bytes):
     return P, N, cell_ids(P), declared
 
 
+def grid_step_check(x: np.ndarray, y: np.ndarray, z: np.ndarray, has_point: np.ndarray,
+                    factor: float = 4.0) -> dict[str, Any]:
+    """Geometry of a tifxyz grid without the CT. Adjacent valid grid points are joined
+    when their distance is at most ``factor`` times the median step; the largest
+    connected group is the surface. Any other group that is still tied to the rest by
+    a long step is a spike: vertices thrown off the surface, singly or as a run, the
+    class villa PR #2067 found after resampling. CT sampling cannot see them because
+    they sit at hole edges and have no normal. Groups with no tie at all are islands
+    of the grid, not spikes, and are left alone."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    P = np.stack([z, y, x], -1).astype(np.float64)
+    n = has_point.size
+    idx = np.arange(n).reshape(has_point.shape)
+    a_all, b_all, d_all = [], [], []
+    for axis in (0, 1):
+        sl_a = [slice(None)] * 2
+        sl_b = [slice(None)] * 2
+        sl_a[axis] = slice(0, -1)
+        sl_b[axis] = slice(1, None)
+        both = has_point[tuple(sl_a)] & has_point[tuple(sl_b)]
+        a_all.append(idx[tuple(sl_a)][both])
+        b_all.append(idx[tuple(sl_b)][both])
+        d_all.append(np.linalg.norm(P[tuple(sl_b)][both] - P[tuple(sl_a)][both], axis=-1))
+    a, b, d = (np.concatenate(v) for v in (a_all, b_all, d_all))
+    if len(d) == 0:
+        return {"grid_step_median": float("nan"), "grid_step_max": float("nan"), "n_grid_spikes": 0,
+                "grid_spike_rc": np.zeros((0, 2), int)}
+    med = float(np.median(d))
+    short = d <= factor * med
+    graph = coo_matrix((np.ones(short.sum()), (a[short], b[short])), shape=(n, n))
+    _, comp = connected_components(graph, directed=False)
+    comp[~has_point.ravel()] = -1
+    sizes = np.bincount(comp[comp >= 0])
+    largest = int(np.argmax(sizes))
+    tied = np.zeros(len(sizes), bool)  # groups with a long step to another group
+    la, lb = comp[a[~short]], comp[b[~short]]
+    cross = la != lb
+    tied[la[cross]] = True
+    tied[lb[cross]] = True
+    tied[largest] = False
+    spike = (comp >= 0) & tied[np.maximum(comp, 0)]
+    return {"grid_step_median": round(med, 3), "grid_step_max": round(float(d.max()), 3),
+            "n_grid_spikes": int(spike.sum()), "grid_spike_rc": np.argwhere(spike.reshape(has_point.shape))}
+
+
 def sample_tifxyz(path: str, samples: int, rng: np.random.Generator):
     """Random points and normals from a tifxyz directory at its stored resolution."""
     from vesuvius.tifxyz import read_tifxyz
@@ -207,6 +255,7 @@ def sample_tifxyz(path: str, samples: int, rng: np.random.Generator):
     has_point = np.isfinite(x) & (x > 0) & (y > 0) & (z > 0)
     if surf._mask is not None:
         has_point &= surf._mask.astype(bool)
+    grid = grid_step_check(x, y, z, has_point)
     ok = has_point & np.isfinite(nx)
     # grid points with no computable normal (hole edges, grid border) are not sampled;
     # the count is reported so a defect that lives there is not silently skipped
@@ -219,7 +268,7 @@ def sample_tifxyz(path: str, samples: int, rng: np.random.Generator):
     P = np.stack([z.ravel()[pick], y.ravel()[pick], x.ravel()[pick]], 1).astype(np.float64)
     N = np.stack([nz.ravel()[pick], ny.ravel()[pick], nx.ravel()[pick]], 1).astype(np.float64)
     N /= np.linalg.norm(N, axis=1, keepdims=True) + 1e-12
-    return P, N, cell_ids(P), int(ok.sum()), n_no_normal
+    return P, N, cell_ids(P), int(ok.sum()), n_no_normal, grid
 
 
 def cell_ids(P: np.ndarray, size: float = 32.0) -> np.ndarray:
@@ -564,10 +613,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     for src in a.surface:
         name = surface_name(src)
         n_no_normal = 0
+        grid: dict[str, Any] = {}
         if is_tifxyz(src):
-            P, N, patch, n_vert, n_no_normal = sample_tifxyz(src, a.samples, rng)
+            P, N, patch, n_vert, n_no_normal, grid = sample_tifxyz(src, a.samples, rng)
             if n_no_normal:
                 print(f"{name}: {n_no_normal} grid points have no normal and were not sampled", file=sys.stderr)
+            rc = grid.pop("grid_spike_rc")
+            if grid["n_grid_spikes"]:
+                print(f"{name}: {grid['n_grid_spikes']} grid points are more than 4x the median step from a "
+                      f"neighbour (max {grid['grid_step_max']} voxels, median {grid['grid_step_median']})",
+                      file=sys.stderr)
+                with open(os.path.join(a.out, f"{name}.grid_spikes.csv"), "w", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(["row", "col"])
+                    w.writerows(rc.tolist())
         else:
             P, N, patch, n_vert = sample_obj(src, a.samples, a.blobs, rng)
         prof, t, inside = read_profiles(vol, P, N, a.half, a.step, a.sigma, workers=a.workers)
@@ -576,7 +635,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         m = summarize(off, contrast, valid, inside, patch, prof, t, a.half, a.min_contrast)
         m.update(controls(vol, P, N, off, valid, a, rng))
         m.update({"surface": name, "source": src, "volume": a.volume, "n_vertices": int(n_vert),
-                  "n_no_normal": n_no_normal, "half": a.half, "step": a.step, "sigma": a.sigma,
+                  "n_no_normal": n_no_normal, **grid, "half": a.half, "step": a.step, "sigma": a.sigma,
                   "min_contrast": a.min_contrast, "min_prominence": a.min_prominence})
         with open(os.path.join(a.out, f"{name}.json"), "w") as f:
             json.dump(m, f, indent=1)
