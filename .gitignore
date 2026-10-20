@@ -82,6 +82,6 @@ dinovol/cufile.log
 /vesuvius/src/vesuvius/neural_tracing/tracers/fibers/evaluation/audit
 /volume-cartographer/plans
 /spiral-fitting/experiments
-/volume-cartographer/docs/objects/benchmarks
+/vc_object_store/docs/benchmarks
 /vc_reader/benchmarks/results
 *.csv

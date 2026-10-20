@@ -406,9 +406,3 @@ _Widget for creating initial segmentations which can be used for traces or later
 - `Expand seeds` : expands the current seed points to the given number of iterations
 - `Clear all paths` : clears any user drawn paths / points (use this over the clear buttons most of the time)
 - `Start label wraps` : this is used for absolute or relative wrap labels, is not used during the seeding step, will detail in another document
-
-### Object store
-
-The object database stores geometry, annotations, and relationships by UUID.
-See the [object-store guide](docs/objects/README.md) for ingesting data, discovering
-relationships, querying objects, and synchronizing stores in Python and C++.

@@ -3,7 +3,6 @@ configure_file(src/Version.cpp.in Version.cpp)
 # Independent read-only collection reader: usable by the GUI and small tools
 # without linking the CT/tracing stack. R*Tree support is verified on open.
 find_package(SQLite3 REQUIRED)
-find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 add_library(vc_fiber_collection STATIC src/FiberCollection.cpp)
 target_include_directories(vc_fiber_collection PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 if(TARGET SQLite3::SQLite3)
@@ -14,18 +13,7 @@ endif()
 target_compile_features(vc_fiber_collection PUBLIC cxx_std_20)
 set_target_properties(vc_fiber_collection PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
-# Shared with Spiral's native Python adapter; independent of geometry/Qt/Python.
-add_library(vc_track_crossings STATIC src/TrackCrossings.cpp)
-target_include_directories(vc_track_crossings PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(vc_track_crossings PRIVATE OpenMP::OpenMP_CXX)
-target_compile_features(vc_track_crossings PUBLIC cxx_std_20)
-set_target_properties(vc_track_crossings PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-# Object storage and its adapters have their own source/build boundary.
-add_subdirectory(src/vc_object_store)
-
 add_library(vc_core
-        src/CtSheetNormal.cpp
         src/GridStore.cpp
         src/NormalGridVolume.cpp
         src/normalgridtools.cpp
@@ -37,7 +25,6 @@ add_library(vc_core
         src/Logging.cpp
         src/CrashHandler.cpp
         src/MemMap.cpp
-        src/PackedTrackStore.cpp
         src/UnixSocket.cpp
         src/VolpkgConvert.cpp
         src/VoxelSizeMetadata.cpp

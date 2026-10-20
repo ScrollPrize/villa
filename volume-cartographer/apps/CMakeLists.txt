@@ -26,14 +26,7 @@ target_link_libraries(vc_grow_seg_from_seed vc_core vc_tracer Boost::program_opt
 add_executable(vc_seg_add_overlap src/vc_seg_add_overlap.cpp)
 target_link_libraries(vc_seg_add_overlap vc_core)
 
-add_executable(vc_object_ingest src/vc_object_ingest.cpp)
-target_link_libraries(vc_object_ingest vc_object_geometry)
-add_executable(vc_object_export src/vc_object_export.cpp)
-target_link_libraries(vc_object_export vc_object_geometry)
 
-add_executable(vc_object_links_cli src/vc_object_links.cpp)
-set_target_properties(vc_object_links_cli PROPERTIES OUTPUT_NAME vc_object_links)
-target_link_libraries(vc_object_links_cli vc_object_links)
 
 add_executable(vc_grow_seg_from_segments src/vc_grow_seg_from_segments.cpp)
 target_link_libraries(vc_grow_seg_from_segments vc_core vc_tracer Boost::program_options)
@@ -287,7 +280,7 @@ set(VC_CLI_TARGETS
     vc_ngrids
     vc_tifxyz2rgb vc_rgb2tifxyz vc_thinning vc_tifxyz vc_project_tifxyz
     vc_zarr_to_tiff vc_zarr_recompress vc_zarr_download_bench
-    vc_zarr_download_region vc_object_links_cli vc_object_ingest vc_object_export)
+    vc_zarr_download_region)
 get_property(_vc_apps_directory_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
 list(FILTER _vc_apps_directory_targets INCLUDE REGEX "^vc_")
 set(_vc_expected_cli_targets ${VC_CLI_TARGETS})

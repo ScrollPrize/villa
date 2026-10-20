@@ -1419,3 +1419,18 @@ A.SurfacePerturb(blobs=3, amplitude=1, points_affected=100, p=1)
 2D-only companion: synthetic coordinate surface with CT-derived height. Preview is displacement magnitude, not an anatomical surface.
 
 </details>
+
+## Native C++ CT reading and normals
+
+`vc_reader::reader` provides `vc_reader/reader.hpp` without Python or nanobind.
+Configure with `-DVC_READER_BUILD_PYTHON=OFF` for a native-only build, then build
+with Ninja and install with CMake. Installed consumers use
+`find_package(vc_reader CONFIG REQUIRED)` and link `vc_reader::reader`.
+
+`vcr::CtReader(location, level, cacheBytes)` opens a uint8 Zarr array or pyramid
+level. `readRegion` fills caller-owned ZYX storage; `sheetNormals` takes XYZ
+points and returns normal XYZ plus eigengap, with zeros for invalid support.
+It uses the same CPU kernel as the Python sheet-normal API and batches at most
+eight 109³ patches at a time. Native opening supports local and anonymous
+HTTP/S3 sources; authenticated access and disk-cache configuration remain on
+the existing Python reader interface. Existing CUDA Python APIs are unchanged.

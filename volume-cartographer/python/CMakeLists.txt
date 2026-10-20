@@ -108,20 +108,11 @@ target_link_libraries(vc_fiber_trace PRIVATE vc_fiber_tracer)
 target_compile_features(vc_fiber_trace PRIVATE cxx_std_23)
 set_target_properties(vc_fiber_tracer PROPERTIES INSTALL_RPATH "$ORIGIN")
 
-nanobind_add_module(vc_object_bindings vc/objects.cpp)
-set_target_properties(vc_object_bindings PROPERTIES
-    OUTPUT_NAME objects
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
-    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
-)
-target_link_libraries(vc_object_bindings PRIVATE vc_object_geometry vc_object_links vc_core nlohmann_json::nlohmann_json)
-target_include_directories(vc_object_bindings PRIVATE "${PROJECT_SOURCE_DIR}/core/src/vc_object_store")
-target_compile_features(vc_object_bindings PRIVATE cxx_std_23)
-
-# A stale graph extension must not keep the removed split-database API importable.
-file(GLOB VC_STALE_GRAPH_MODULES "${CMAKE_CURRENT_BINARY_DIR}/vc/graph*${CMAKE_SHARED_MODULE_SUFFIX}")
-if(VC_STALE_GRAPH_MODULES)
-    file(REMOVE ${VC_STALE_GRAPH_MODULES})
+# Removed extensions must not remain importable in an incremental build.
+file(GLOB VC_STALE_OBJECT_MODULES "${CMAKE_CURRENT_BINARY_DIR}/vc/objects*${CMAKE_SHARED_MODULE_SUFFIX}"
+    "${CMAKE_CURRENT_BINARY_DIR}/vc/graph*${CMAKE_SHARED_MODULE_SUFFIX}")
+if(VC_STALE_OBJECT_MODULES)
+    file(REMOVE ${VC_STALE_OBJECT_MODULES})
 endif()
 
 install(TARGETS vc_lasagna_amgx
@@ -135,7 +126,7 @@ install(TARGETS vc_core vc_lasagna vc_fiber_tracer utils utils_c3d_codec c3d uti
     ARCHIVE DESTINATION .
 )
 
-install(TARGETS vc_volume vc_surface_index vc_grid_raycast vc_fiber_trace vc_object_bindings
+install(TARGETS vc_volume vc_surface_index vc_grid_raycast vc_fiber_trace
     LIBRARY DESTINATION vc
     RUNTIME DESTINATION vc
 )

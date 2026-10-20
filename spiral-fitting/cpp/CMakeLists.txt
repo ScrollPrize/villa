@@ -49,10 +49,10 @@ target_compile_options(vc_spiral_track_crossings PRIVATE
     $<$<AND:$<CONFIG:RelWithDebInfo>,$<COMPILE_LANG_AND_ID:CXX,GNU,Clang>>:-O3>
 )
 
-# Share the exact crossing kernel with vc_graph_links; keep nanobind out of it.
-set(VC_TRACK_CROSSINGS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../volume-cartographer"
-    CACHE PATH "volume-cartographer checkout containing the shared track crossing kernel")
+# Share the exact crossing kernel with vc_object_links; keep nanobind out of it.
+set(VC_TRACK_CROSSINGS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../vc_object_store"
+    CACHE PATH "vc_object_store checkout containing the shared track crossing kernel")
 target_sources(vc_spiral_track_crossings PRIVATE
-    "${VC_TRACK_CROSSINGS_ROOT}/core/src/TrackCrossings.cpp")
+    "${VC_TRACK_CROSSINGS_ROOT}/src/TrackCrossings.cpp")
 target_include_directories(vc_spiral_track_crossings PRIVATE
-    "${VC_TRACK_CROSSINGS_ROOT}/core/include")
+    "${VC_TRACK_CROSSINGS_ROOT}/include")
