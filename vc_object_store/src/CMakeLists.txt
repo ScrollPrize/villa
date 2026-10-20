@@ -1,3 +1,10 @@
+# Shared owned geometry and operations; no SQLite, OpenCV or application types.
+add_library(vc_geometry STATIC geometry/TypedGeometry.cpp)
+target_include_directories(vc_geometry PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>"
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(vc_geometry PRIVATE nlohmann_json::nlohmann_json)
+target_compile_features(vc_geometry PUBLIC cxx_std_20)
+
 # Primary SQLite object database; no dependency on vc_core or Qt.
 add_library(vc_objects STATIC
     internal/Anchors.cpp
@@ -17,7 +24,6 @@ add_library(vc_objects STATIC
     Spatial.cpp
     sync/Synchronize.cpp
     sync/GeometryTransfer.cpp
-    geometry/TypedGeometry.cpp
     geometry/GeometryViews.cpp
     geometry/Geometry.cpp
     geometry/GeometryDelta.cpp
@@ -33,7 +39,7 @@ if(TARGET SQLite3::SQLite3)
 else()
     target_link_libraries(vc_objects PUBLIC SQLite::SQLite3)
 endif()
-target_link_libraries(vc_objects PRIVATE nlohmann_json::nlohmann_json OpenSSL::Crypto zstd::libzstd)
+target_link_libraries(vc_objects PUBLIC vc_geometry PRIVATE nlohmann_json::nlohmann_json OpenSSL::Crypto zstd::libzstd)
 target_compile_features(vc_objects PUBLIC cxx_std_20)
 set_target_properties(vc_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

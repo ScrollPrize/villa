@@ -130,7 +130,7 @@ NB_MODULE(_native, m)
     m.doc() = "Revisioned objects and relationships, with owned geometry and typed snapshot views.";
 
     bindGraphReadView(m);
-    bindTypedGeometry(m);
+    bindTypedGeometry(m); // Shared C++ geometry and revision-pinned views.
 
     nb::class_<PyObjectStore>(m, "ObjectStore")
         .def_static("create", &PyObjectStore::create, nb::arg("path"), nb::arg("author"),

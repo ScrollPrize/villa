@@ -49,7 +49,7 @@ endif()
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
-set(_vc_store_targets vc_objects)
+set(_vc_store_targets vc_geometry vc_objects)
 if(VC_OBJECT_STORE_BUILD_ADAPTERS)
     list(APPEND _vc_store_targets vc_object_geometry vc_object_links vc_object_formats vc_track_crossings)
 endif()
