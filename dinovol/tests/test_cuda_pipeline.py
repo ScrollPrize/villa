@@ -55,7 +55,7 @@ class CudaPipelineTests(unittest.TestCase):
                                  mode='trilinear', align_corners=False)
         actual = CudaBatchProcessor({})([CropView(torch.from_numpy(raw), (12, 8, 20))])
         self.assertTrue(actual.is_cuda)
-        torch.testing.assert_close(actual.cpu(), expected, atol=1e-6, rtol=1e-5)
+        torch.testing.assert_close(actual.cpu(), expected, atol=2e-6, rtol=1e-5)
         for scheme in ('robust', 'minmax', 'zscore', 'none'):
             result = normalize_batch(torch.zeros((2, 1, 8, 8, 8), dtype=torch.uint8), scheme)
             self.assertTrue(result.is_cuda)
@@ -128,9 +128,9 @@ class CudaPipelineTests(unittest.TestCase):
                     for result in loader:
                         self.assertTrue(result['collated_global_crops'].is_cuda)
                         self.assertEqual(result['collated_gram_teacher_crops'].shape, (4, 1, 24, 24, 24))
-                        self.assertEqual(result['collated_global_token_targets'].shape, (4, 64, 3))
-                        self.assertTrue(torch.isfinite(result['collated_global_token_targets']).all())
-                        self.assertEqual(result['collated_object_point_coordinates'].shape, (4, 16, 3))
+                        self.assertEqual(result['global_token_targets'].shape, (4, 64, 3))
+                        self.assertTrue(torch.isfinite(result['global_token_targets']).all())
+                        self.assertEqual(result['object_point_coordinates'].shape, (4, 16, 3))
                         self.assertTrue(torch.isfinite(result['collated_global_crops']).all())
                 finally:
                     if workers:

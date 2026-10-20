@@ -261,6 +261,9 @@ Rotate, translate and scale the volume, applying the same geometry to images and
 
 ```python
 A.Affine(degrees=5, translate=2, scale=0.95)
+# Resize each spatial axis with voxel-center alignment (Y,X or Z,Y,X).
+A.Affine(shape=target_shape, border=True,
+         scale_factors=[out / size for out, size in zip(target_shape, input_shape)])
 ```
 
 | CPU | CUDA uploaded | CUDA resident | Uploaded speedup | Resident speedup |

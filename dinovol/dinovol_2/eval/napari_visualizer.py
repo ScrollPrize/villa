@@ -279,11 +279,7 @@ def _as_3tuple(value: Any, *, name: str) -> tuple[int, int, int]:
 
 
 def _select_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+    return torch.device("cuda")
 
 
 def _extract_model_config(checkpoint: dict[str, Any]) -> dict[str, Any]:
