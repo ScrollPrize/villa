@@ -107,7 +107,6 @@
     "occupancy_level": 5,
     "object_mask": {"enabled": true, "gap_um": 2000, "z_trim_pct": 0.05},
     "read_ahead": 2,
-    "gaussian_blur": true,
     "augmentation": "full",
     "object_points": {
       "enabled": true,

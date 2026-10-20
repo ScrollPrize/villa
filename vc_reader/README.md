@@ -15,6 +15,21 @@ training pipelines; its Zarr reader and transforms also work with your own data.
   transforms to 2D or 3D inputs while keeping images and labels aligned.
   `CudaLoader` adds GPU transforms and prefetching to a PyTorch DataLoader.
 
+CPU point metadata can share image geometry without allocating an image:
+
+```python
+from vc_reader import transforms as A
+
+geometry = A.Pipeline([A.Transpose(order="xyz"), A.Flip(axes="z", p_axis=1)],
+                      targets={"points": A.Points()})
+mapped = geometry.map_points({"points": points}, shape=(128, 128, 128), seed=42)
+```
+
+`map_points()` uses native geometry for Flip, Rotate90, Transpose, CropPad and
+Affine, with the same seed semantics as CPU/CUDA image processing. Point arrays
+stay on CPU and preserve their NumPy or Torch container type. Label targets use
+nearest-neighbor geometry; image intensity transforms do not change labels.
+
 ## Quick start
 
 See [installation and notebook setup](examples/README.md#run). This example
@@ -558,6 +573,21 @@ A.FDA(reference=reference, blend=1, fraction=0.1)
 | :---: | :---: | :---: |
 | [![FDA: original and transformed Z slices](docs/transforms/previews/FDA-z.webp)](docs/transforms/previews/FDA-z.webp) | [![FDA: original and transformed Y slices](docs/transforms/previews/FDA-y.webp)](docs/transforms/previews/FDA-y.webp) | [![FDA: original and transformed X slices](docs/transforms/previews/FDA-x.webp)](docs/transforms/previews/FDA-x.webp) |
 
+A named reference target supports a different style crop per sample, including
+CUDA tensors passed to `Pipeline.batch()`:
+
+```python
+pipeline = A.Pipeline(
+    [A.FDA("style", blend=(0.1, 0.3), fraction=0.05, on="image")],
+    targets={"image": A.Image(valid=None), "style": A.ScalarField()},
+    backend="cuda",
+)
+result = pipeline.batch({"image": crops, "style": reference_crops}, seeds=seeds)
+```
+
+Spatial dimensions must match; reference channels must be one or match the image.
+`on="image"` keeps the reference unchanged. CUDA references stay on device.
+
 </details>
 
 <details>
@@ -998,6 +1028,12 @@ A.PixelDistributionAdaptation(reference=reference, blend=1, mode='standard')
 | Z slice · YX plane | Y slice · ZX plane | X slice · ZY plane |
 | :---: | :---: | :---: |
 | [![PixelDistributionAdaptation: original and transformed Z slices](docs/transforms/previews/PixelDistributionAdaptation-z.webp)](docs/transforms/previews/PixelDistributionAdaptation-z.webp) | [![PixelDistributionAdaptation: original and transformed Y slices](docs/transforms/previews/PixelDistributionAdaptation-y.webp)](docs/transforms/previews/PixelDistributionAdaptation-y.webp) | [![PixelDistributionAdaptation: original and transformed X slices](docs/transforms/previews/PixelDistributionAdaptation-x.webp)](docs/transforms/previews/PixelDistributionAdaptation-x.webp) |
+
+`reference` can also name a sample target, as in
+`A.PixelDistributionAdaptation("style", blend=(0.1, 0.3), on="image")`.
+Declare `style` as `ScalarField()` and pass a crop with matching spatial shape
+and one or matching image channels. CPU and CUDA support named references;
+`Pipeline.batch()` keeps CUDA reference crops and their statistics on device.
 
 </details>
 

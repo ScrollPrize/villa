@@ -110,6 +110,7 @@ def benchmark(args):
     config = json.loads((args.output / "resolved_config.json").read_text())
     with (args.output / "dataset.pkl").open("rb") as stream:
         dataset = pickle.load(stream)
+    dataset.benchmark_seed, dataset.source_rng = args.seed, None
     workers = config["num_workers"] if args.workers is None else args.workers
     dataset.epoch_length = (args.warmup + args.batches + int(args.profile)) * config["batch_size"]
     collate = build_dino_ibot_collate_fn(dict(

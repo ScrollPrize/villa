@@ -159,6 +159,38 @@ public:
     const auto& backend() const { return backend_; }
     const auto& targets() const { return program_->targets; }
     const auto& program() const { return program_; }
+    // Map host point metadata with the same parameters as dense CPU/CUDA geometry.
+    // The shape carrier has no voxel storage and is never passed to execution.
+    RunResult map_points(Sample points, Shape shape, std::uint64_t seed) const {
+        require(shape.size() == 2 || shape.size() == 3, "shape must have two or three dimensions");
+        for (const auto& [name, f] : points)
+            require(f.target.role == Role::Points, "map_points accepts only Points targets");
+        Sample carrier;
+        Array extent; extent.shape = shape; extent.shape.insert(extent.shape.begin(), 1);
+        Target target; target.valid.clear();
+        carrier.emplace("", Field{std::move(extent), target});
+        // Validate point layout without inspecting the storage-free carrier.
+        Sample validation = points;
+        validation.emplace("", Field{});
+        validation.at("").array.shape = carrier.at("").array.shape;
+        validate(validation, false);
+        for (std::size_t i = 0; i < program_->transforms.size(); ++i) {
+            Random r{split_seed(seed, std::to_string(i))};
+            std::visit([&](const auto& t) {
+                using T = std::decay_t<decltype(t)>;
+                if constexpr (std::is_same_v<T, Flip> || std::is_same_v<T, Rotate90> ||
+                              std::is_same_v<T, Transpose> || std::is_same_v<T, CropPad> ||
+                              std::is_same_v<T, Affine>) {
+                    if (!r.chance(t.p)) return;
+                    auto parameters = sample(t, carrier, r);
+                    apply_geometry(points, parameters);
+                    carrier.at("").array.shape = parameters.shape;
+                    carrier.at("").array.shape.insert(carrier.at("").array.shape.begin(), 1);
+                } else throw std::invalid_argument("map_points supports Flip, Rotate90, Transpose, CropPad and Affine only");
+            }, program_->transforms[i]);
+        }
+        RunResult result; result.sample = std::move(points); return result;
+    }
     RunResult run(Sample s, std::uint64_t seed, bool record, bool profile, std::shared_ptr<void> context = {}) const {
         const bool resident = bool(context);
         require(!resident || executor_, "device inputs require a CUDA pipeline");

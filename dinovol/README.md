@@ -254,12 +254,12 @@ mostly empty.
   windows in background threads while it prepares crop and point metadata. Window
   locations are still drawn in the loader process, so sampling stays
   deterministic, but enabling it changes the order of random draws.
-- `dataset.gaussian_blur: true` and `dataset.global_crop_scale: [0.18, 0.45]` /
+- `dataset.global_crop_scale: [0.18, 0.45]` /
   `dataset.local_crop_scale: [0.023, 0.057]`: views are resampled only 0.87–1.18×
   from the 192³ source window (global 108–147 → 128 voxels, local 55–74 → 64)
   with Gaussian blur enabled as part of the augmentation. The zoom range
   covers the 7.9–9.4 µm spread in voxel size between scans.
-- `num_workers: 24`, `prefetch_factor: 2`, `persistent_workers: true`: with
+- `num_workers: 24`, `prefetch_factor: 2`, `persistent_workers: true`:
   workers read source windows and prepare crop plans ahead of batched CUDA processing.
 
 The teacher forward now runs before the student forward, so its no-grad
@@ -498,7 +498,7 @@ and four local views per sample, intensity transforms process all 24 global
 crops together and all 48 local crops together. Preparation groups variable input
 sizes; geometry groups matching output shapes and sampled operations. Per-axis
 affine scales support anisotropic crops. Every view has its own random seed;
-`augmentation: "dino"` and `gaussian_blur: false` are supported.
+`augmentation: "dino"` selects the lighter contrast/brightness recipe.
 
 To benchmark only data delivery using the local partial volume cache:
 
@@ -577,20 +577,43 @@ student) and the optimizer state of existing parameters is kept.
 `grad_accumulation_steps: 2` runs two batches of 12 per optimizer step
 (effective batch 24 per GPU). The configured learning rate is `1.768e-4`.
 
-`dataset.augmentation` selects the view augmentation applied after the random
-resized crop. `"full"` (the default, used by `pretrain_8_9um.json` together with
-`gaussian_blur: true`) applies simulated scanner artifacts (smear, slice
-illumination), right-angle rotations, flips and axis transposes, local brightness
-gradients and gamma, blur, noise, sharpening, contrast and brightness, low
-resolution, gamma and inversion. `"dino"` keeps only the rotations, flips,
-transposes and the contrast and brightness jitter. Rotations and transposes use
-every pair of axes with equal crop size (all three for cubic crops). The scanner
-artifacts act along fixed tensor axes, so they run before the rotations: they
-follow the volume's axes, as real scan artifacts do, instead of always lying along
-the same axes of the augmented view. Every crop draws its own augmentation (with
-the probabilities above, most intensity transforms change a 1-channel crop in
-10 to 40% of crops, since they also apply per channel with probability 0.5).
-Points, object points and token correspondences follow the spatial transforms.
+`dataset.augmentation: "full"` is the default. Geometry chooses uniformly among
+all 48 cube orientations: six axis permutations and independent 50% flips on
+each axis. This includes every right-angle rotation and reflection without a
+second, duplicate mirror operation. Noncubic views use only permutations that
+preserve both student and paired teacher shapes.
+
+Intensity probabilities below are independent per view, with all image channels
+participating when an effect is selected. These are moderate starting settings;
+training quality should guide subsequent tuning.
+
+| Probability | Transforms |
+| --- | --- |
+| 25% | contrast, gamma |
+| 15% | bias field, brightness gradient, local contrast, local gamma, brightness add, invert, slice illumination |
+| 10% | CLAHE, low resolution, plasma brightness/contrast, Rician noise, sharpen, unsharp mask, vignetting, smear, FDA, pixel distribution adaptation |
+| 8% | Gaussian blur, Gibbs ringing |
+| 5% | defocus, median filter |
+
+Rician noise uses a standard deviation of 1–4 raw uint8 intensity levels before
+normalization; magnitude noise requires nonnegative source intensities. Smear
+and slice illumination run before orientation changes, so artifacts follow scan
+axes. Gaussian blur uses sigma 0.3–0.8 voxels. FDA mixes 10–30% of the low-frequency
+amplitude from another crop in the same resolution group (frequency fraction
+0.05). Pixel distribution adaptation blends 10–30% toward the reference crop’s
+mean and standard deviation. Both reference crops and their statistics remain
+on CUDA. These effects are skipped when there is no other independently seeded
+view available in that group.
+
+Only geometry applies to supervision: label IDs and values are unchanged;
+point coordinates, object points and token correspondences follow their image's
+geometry. Worker point metadata uses vc_reader's native `Pipeline.map_points()`
+with the same spatial operations as CUDA images, without allocating an image.
+Intensity stages receive images only. Dense masks supplied to vc_reader should
+be declared `Label()` for geometry with nearest-neighbor sampling and exclusion
+from intensity transforms. `"dino"` uses the same geometry with contrast and
+brightness jitter. Paired Gram views share geometry and, when enabled, intensity
+seeds and reference crops.
 
 `ibot_targets: "cross_view"` (used by `pretrain_8_9um.json`; default
 `"same_view"`) takes the teacher's iBOT target for a masked student token from the

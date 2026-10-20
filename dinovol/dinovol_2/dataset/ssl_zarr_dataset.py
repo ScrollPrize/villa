@@ -340,7 +340,6 @@ class SSLZarrDataset(Dataset):
                 "source_sampling_size must be at least as large as the largest requested crop size, "
                 f"got source_sampling_size={self.source_sampling_size} and required={required_source_sampling_size}"
             )
-        # gaussian_blur: false removes blur, which erases one-voxel structures.
         # augmentation: "dino" keeps only flips, right-angle rotations, transposes and
         # brightness/contrast jitter on top of the random resized crops; "full"
         # (default) is the complete pipeline.

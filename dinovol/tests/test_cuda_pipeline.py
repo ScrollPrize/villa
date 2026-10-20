@@ -10,10 +10,11 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+from vc_reader import transforms as A
 from torch.nn import functional as F
 
 from dinovol_2.dataset.cuda_pipeline import (
-    CropView, CudaBatchProcessor, CudaDataLoader, SpatialPlan, normalize_batch, transform_points,
+    CropView, CudaBatchProcessor, CudaDataLoader, SpatialPlan, normalize_batch, point_pipeline, spatial_transforms,
 )
 from dinovol_2.dataset.ssl_zarr_dataset import SSLZarrDataset
 from dinovol_2.dataset.volume_reader import open_volume
@@ -62,6 +63,14 @@ class CudaPipelineTests(unittest.TestCase):
             self.assertTrue(torch.isfinite(result).all())
             self.assertEqual(result.count_nonzero().item(), 0)
 
+    def test_source_dtypes(self):
+        expected = torch.linspace(0, 1, 64).reshape(1, 1, 4, 4, 4)
+        for dtype in (torch.uint8, torch.uint16, torch.int16, torch.float32, torch.float64):
+            raw = torch.arange(64).reshape(1, 1, 4, 4, 4).to(dtype)
+            result = normalize_batch(raw, 'minmax')
+            self.assertEqual(result.dtype, torch.float32)
+            torch.testing.assert_close(result.cpu(), expected)
+
     def test_points_match_cuda_voxel_movements(self):
         for shape in ((8, 8, 8), (4, 8, 8), (4, 6, 8)):
             points = torch.cartesian_prod(*(torch.arange(n) for n in shape)).float()
@@ -75,9 +84,46 @@ class CudaPipelineTests(unittest.TestCase):
                 moved = planned['keypoints'].long()
                 torch.testing.assert_close(image[moved[:, 0], moved[:, 1], moved[:, 2]], raw.flatten(), rtol=0, atol=0)
 
+    def test_all_cube_orientations(self):
+        shape = (4,) * 3
+        points = torch.cartesian_prod(*(torch.arange(n) for n in shape)).float()
+        raw = torch.arange(64, dtype=torch.float32).reshape(shape)
+        processor = CudaBatchProcessor({'normalization_scheme': 'none'})
+        seen = set()
+        for order in itertools.permutations('zyx'):
+            for flips in itertools.product((False, True), repeat=3):
+                axes = ''.join(a for a, flip in zip('zyx', flips) if flip)
+                operations = (('transpose', ''.join(order)),) + ((('flip', axes),) if axes else ())
+                moved = point_pipeline(operations).map_points({'points': points}, shape=shape, seed=0)['points'].long()
+                image = processor([CropView(raw, shape, spatial=operations)])[0, 0].cpu()
+                torch.testing.assert_close(image[moved[:, 0], moved[:, 1], moved[:, 2]], raw.flatten(), rtol=0, atol=0)
+                seen.add(tuple(image.flatten().tolist()))
+        self.assertEqual(len(seen), 48)
+
+    def test_intensity_preserves_labels(self):
+        processor = CudaBatchProcessor({})
+        operations = [A.RicianNoise(std=2), *processor.scanner(16), *processor.intensity(16),
+                      A.FDA(reference='style', blend=.2, fraction=.1, on='image'),
+                      A.PixelDistributionAdaptation(reference='style', blend=.2, on='image')]
+        # Exercise every intensity effect, rather than relying on random selection.
+        operations = [getattr(A, op._constructor.__name__)(*op._args, **{**op._kwargs, 'p': 1}) for op in operations]
+        geometry = (('transpose', 'xyz'), ('flip', 'zy'))
+        image = torch.rand((2, 1, 16, 16, 16), device='cuda') * 200 + 1
+        labels = torch.randint(4, image.shape, device='cuda', dtype=torch.int32)
+        original = labels.clone()
+        pipeline = A.Pipeline([*operations, *spatial_transforms(geometry)], targets={
+            'image': A.Image(valid=None), 'mask': A.Label(), 'style': A.ScalarField()}, backend='cuda')
+        result = pipeline.batch({'image': image, 'mask': labels, 'style': image.flip(0)}, seeds=[7, 9])
+        expected = labels.permute(0, 1, 4, 3, 2).flip((2, 3))
+        torch.testing.assert_close(result['mask'], expected, rtol=0, atol=0)
+        torch.testing.assert_close(labels, original, rtol=0, atol=0)
+        self.assertEqual(result['mask'].dtype, labels.dtype)
+        self.assertTrue(result['image'].is_cuda)
+        self.assertTrue(torch.isfinite(result['image']).all())
+
     def test_paired_views_and_local_batching(self):
         for recipe in ('full', 'dino'):
-            processor = CudaBatchProcessor({'augmentation': recipe, 'gaussian_blur': False}, collate())
+            processor = CudaBatchProcessor({'augmentation': recipe}, collate())
             samples = []
             for _ in range(2):
                 globals_, teachers = [], []
@@ -144,6 +190,49 @@ class CudaPipelineTests(unittest.TestCase):
                 self.assertEqual(len(result['collated_local_crops']), 0)
             finally:
                 dataset.close()
+
+    def test_training_step_and_monitor(self):
+        from dinovol_2.pretrain import DinoIBOTPretrainer
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            write_array(root / 'volume', np.random.default_rng(5).integers(1, 255, (40,)*3, dtype=np.uint8))
+            config = dict(device='cuda', batch_size=2, num_workers=0, max_iterations=5,
+                output_dir=str(root / 'output'), use_amp=True, amp_dtype='bfloat16', compile=False,
+                ibot_targets='cross_view', monitor_batch_size=2, freeze_last_layer_steps=0,
+                warmup_steps=0, lr=1e-4, lr_schedule='constant',
+                model=dict(model_type='v3', embed_dim=96, depth=2, num_heads=4,
+                    global_crops_size=[16]*3, local_crops_size=[8]*3, patch_size=[4]*3,
+                    dino_out_dim=128, ibot_out_dim=128, dino_head_hidden_dim=64,
+                    dino_head_bottleneck_dim=32, ibot_head_hidden_dim=64, ibot_head_bottleneck_dim=32),
+                dataset=dict(datasets=[dict(volume_path=str(root / 'volume'), volume_scale=0)],
+                    epoch_length=4, vol_trim_pct=1, source_sampling_size=[24]*3,
+                    global_crop_size=[16]*3, local_crop_size=[8]*3, num_local_crops=2,
+                    global_crop_scale=[.4,.8], local_crop_scale=[.1,.2], augmentation='dino'))
+            trainer = DinoIBOTPretrainer(config)
+            loader = trainer.build_dataloader()
+            try:
+                batch = next(iter(loader))
+                report = trainer.verify_train_step(batch)
+                self.assertTrue(report['forward']['checks']['all_passed'], report['forward']['checks'])
+                self.assertTrue(report['train_step']['checks']['all_passed'], report['train_step']['checks'])
+                first = trainer.build_monitor_batch(seed=7)
+                second = trainer.build_monitor_batch(seed=7)
+                self.assertTrue(first['collated_global_crops'].is_cuda)
+                torch.testing.assert_close(first['collated_global_crops'], second['collated_global_crops'], rtol=0, atol=0)
+            finally:
+                trainer._close_dataloader(loader)
+                trainer._close_auxiliary_datasets()
+                trainer._finish_wandb()
+
+    def test_inference_preprocessing(self):
+        from dinovol_2.eval.napari_visualizer import normalize_volume, pad_volume_to_patch_size
+        raw = np.arange(5*7*9, dtype=np.float32).reshape(1, 5, 7, 9)
+        image = normalize_volume(raw, normalization_scheme='minmax')
+        padded, shape = pad_volume_to_patch_size(image, (4, 4, 4))
+        self.assertTrue(padded.is_cuda)
+        self.assertEqual(shape, (8, 8, 12))
+        torch.testing.assert_close(padded[:, :5, :7, :9], image)
+        self.assertEqual(float(padded[0, -1, -1, -1]), 1.)
 
     def test_cuda_required(self):
         with self.assertRaisesRegex(ValueError, 'requires CUDA'):

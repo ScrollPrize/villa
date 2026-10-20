@@ -317,6 +317,11 @@ NB_MODULE(_transforms, m) {
             return run_device(p,inputs,0,false,false,false,&plan);
         })
 #endif
+        .def("map_points", [](const Pipeline& p, const std::map<std::string, Input>& inputs, Shape shape, std::uint64_t seed) {
+            RunResult result;
+            { nb::gil_scoped_release release; result = p.map_points(import_sample(p, inputs), std::move(shape), seed); }
+            return export_result(std::move(result), false, inputs);
+        }, "inputs"_a, "shape"_a, "seed"_a)
         .def("load_plan", [](const Pipeline& p, nb::bytes bytes) { return load_plan(p.program(), std::string(bytes.c_str(), bytes.size())); })
         .def("run", [](const Pipeline& p, const std::map<std::string, Input>& inputs, std::uint64_t seed, bool record, bool profile, bool inplace, const NamedValues& params) {
             if (inplace) writable_inputs(inputs);

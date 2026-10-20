@@ -156,6 +156,19 @@ class Pipeline:
         result = self._engine.run(arrays, seed, False, profile, inplace, params=params or {})
         return self._outputs(sample, converters, result, profile)
 
+    def map_points(self, sample, *, shape, seed):
+        """Map CPU point metadata without allocating or transforming an image.
+
+        Declare each array as Points. shape is the input spatial (Y, X) or
+        (Z, Y, X) extent. Flip, Rotate90, Transpose, CropPad and Affine use the
+        same native geometry and seed as dense CPU/CUDA execution. Other
+        transforms raise. Returns NumPy arrays or CPU tensors matching inputs;
+        point IDs and other non-array metadata pass through unchanged.
+        """
+        arrays, converters = self._inputs(sample)
+        return self._outputs(sample, converters,
+                             self._engine.map_points(arrays, shape, seed), False)
+
     def sample(self, sample, *, seed, params=None):
         device = self._device_inputs(sample)
         if device is not None:
