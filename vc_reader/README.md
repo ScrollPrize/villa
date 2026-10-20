@@ -20,8 +20,8 @@ training pipelines; its Zarr reader and transforms also work with your own data.
 See [installation and notebook setup](examples/README.md#run). This example
 discovers two image/ink-label pairs on PHerc0009B and PHercParis4, then trains
 one tiny ink classifier on two automatically selected tiles from each pair.
-It requires PyTorch, a build with
-`VC_READER_ENABLE_CUDA=ON`, and an accessible CUDA device. Reads use the CUDA
+It requires PyTorch, a CUDA-enabled build (selected automatically when a CUDA
+compiler is found), and an accessible CUDA device. Reads use the CUDA
 backend; DLPack shares the returned GPU buffers with PyTorch without downloading
 them. A small CPU scan of the label masks finds annotated tiles before any CT
 pixels are fetched. The 25 surface layers become input channels for a 2D CNN

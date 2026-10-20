@@ -23,15 +23,36 @@ if(nanobind_VERSION VERSION_LESS 2.10.2)
 endif()
 find_package(Threads REQUIRED)
 
+# Initialize CUDA architecture defaults before creating targets.
+# An explicit CPU build skips CUDA discovery entirely.
+if(NOT DEFINED VC_READER_ENABLE_CUDA OR VC_READER_ENABLE_CUDA)
+    if(NOT DEFINED CMAKE_CUDA_COMPILER AND NOT DEFINED ENV{CUDACXX})
+        # Toolkit discovery also searches standard locations outside PATH.
+        find_package(CUDAToolkit QUIET)
+        if(CUDAToolkit_NVCC_EXECUTABLE)
+            set(CMAKE_CUDA_COMPILER "${CUDAToolkit_NVCC_EXECUTABLE}"
+                CACHE FILEPATH "CUDA compiler")
+        endif()
+    endif()
+    include(CheckLanguage)
+    check_language(CUDA)
+endif()
+set(_vc_reader_cuda_default OFF)
+if(CMAKE_CUDA_COMPILER)
+    set(_vc_reader_cuda_default ON)
+endif()
+option(VC_READER_ENABLE_CUDA "Build optional CUDA reader and transform backends"
+    ${_vc_reader_cuda_default})
+if(VC_READER_ENABLE_CUDA)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+endif()
+
 # The transform module has no dependency on reader networking or codecs.
 nanobind_add_module(_transforms NB_STATIC NOMINSIZE src/cpp/transforms/bindings.cpp)
 install(TARGETS _transforms LIBRARY DESTINATION vc_reader)
 
-# CPU builds never require the toolkit or load the CUDA runtime.
-option(VC_READER_ENABLE_CUDA "Build optional CUDA reader and transform backends" OFF)
 if(VC_READER_ENABLE_CUDA)
-    enable_language(CUDA)
-    find_package(CUDAToolkit REQUIRED)
     target_sources(_transforms PRIVATE
         src/cpp/transforms/cuda/bias_field.cu
         src/cpp/transforms/cuda/plasma_brightness_contrast.cu
