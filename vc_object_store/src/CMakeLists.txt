@@ -48,15 +48,11 @@ else()
 endif()
 target_link_libraries(vc_objects PUBLIC vc_geometry PRIVATE nlohmann_json::nlohmann_json OpenSSL::Crypto zstd::libzstd)
 target_compile_features(vc_objects PUBLIC cxx_std_20)
-set_target_properties(vc_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
 
 if(NOT VC_OBJECT_STORE_BUILD_ADAPTERS)
     return()
 endif()
-find_package(OpenCV REQUIRED COMPONENTS core imgproc imgcodecs calib3d)
 find_package(TIFF REQUIRED)
-find_package(OpenMP REQUIRED)
 set(VC_OBJECT_STORE_READER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../../vc_reader" CACHE PATH "vc_reader source checkout")
 if(NOT TARGET vc_reader::reader)
     find_package(vc_reader CONFIG QUIET)
@@ -76,7 +72,7 @@ target_link_libraries(vc_track_crossings PRIVATE OpenMP::OpenMP_CXX)
 target_compile_features(vc_track_crossings PUBLIC cxx_std_20)
 add_library(vc_object_formats STATIC Tiff.cpp MemMap.cpp PackedTrackStore.cpp spatial/PatchGrid.cpp)
 target_include_directories(vc_object_formats PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_object_formats PUBLIC opencv_core TIFF::TIFF PRIVATE opencv_imgcodecs nlohmann_json::nlohmann_json)
+target_link_libraries(vc_object_formats PUBLIC opencv_core TIFF::TIFF PRIVATE nlohmann_json::nlohmann_json)
 target_compile_features(vc_object_formats PUBLIC cxx_std_20)
 add_library(vc_object_geometry STATIC geometry/GeometryIngest.cpp geometry/GeometryExport.cpp geometry/SourceMetadata.cpp imports/SourceRelationships.cpp
     formats/GeometryInput.cpp formats/FiberInput.cpp formats/PatchInput.cpp
@@ -89,4 +85,4 @@ add_library(vc_object_links STATIC
     linking/TrackTrack.cpp linking/StoredGeometry.cpp linking/LinePatch.cpp
     linking/TrackPatch.cpp linking/PointCollectionPatch.cpp)
 target_include_directories(vc_object_links PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_object_links PUBLIC vc_objects PRIVATE vc_track_crossings vc_object_formats vc_reader::reader opencv_core opencv_calib3d nlohmann_json::nlohmann_json)
+target_link_libraries(vc_object_links PUBLIC vc_objects PRIVATE vc_track_crossings vc_object_formats vc_reader::reader opencv_core nlohmann_json::nlohmann_json)

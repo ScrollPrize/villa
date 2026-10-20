@@ -8,9 +8,6 @@
 
 namespace vc::objects::memmap {
 
-// Current process id (getpid / _getpid).
-int pid();
-
 // Whole-file read-only mapping. The underlying file handle is closed once the
 // view is established; the view stays valid until close()/destruction.
 class MappedFileRO {
@@ -51,11 +48,5 @@ private:
     void* data_ = nullptr;
     std::size_t size_ = 0;
 };
-
-// Shared read-write mapping of `bytes` bytes backed by `path`. Creates the
-// file if missing and extends it to `bytes` if shorter. The mapping is not
-// tracked — release it with unmapRW(). Throws std::runtime_error on failure.
-void* mapFileRW(const std::filesystem::path& path, std::size_t bytes);
-void unmapRW(void* ptr, std::size_t bytes) noexcept;
 
 }  // namespace vc::objects::memmap

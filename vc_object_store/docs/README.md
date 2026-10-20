@@ -76,15 +76,13 @@ Import scaling and payload-work checks:
 ```sh
 AGENTS_AGENT_MODE=1 ninja -C build -j 4
 AGENTS_AGENT_MODE=1 build/bin/bench_source_import 5
-AGENTS_AGENT_MODE=1 PYTHONPATH=build/python /path/to/python scripts/bench_source_import.py
 ```
 
-The native harness profiles exclusive storage/publication phases and asserts
-bounded identity/payload work for new imports and subsequent structural appends.
-The Python harness times complete one-point imports with 0, 20,000, and 100,000
-existing points in the same document (five imports each; fixture creation is
-outside timing). Both use synthetic inputs; these are scaling checks, not
-real-scroll or cross-platform latency claims.
+The harness times one-point imports with 0, 20,000, and 100,000 existing points
+in the same document, with and without links (fixture creation is outside timing).
+It profiles exclusive storage/publication phases and asserts bounded identity and
+payload work for new imports and subsequent structural appends. These synthetic
+inputs check scaling; they do not measure real-scroll latency.
 
 ## Python
 
@@ -901,13 +899,3 @@ parse/copy, or delta decompression is indivisible and bounded by `max_unit_bytes
 a SQLite instruction or OS I/O wait has no wall-clock bound. These allowances
 therefore do **not** guarantee latency or cap SQLite/allocator memory. Default
 budgets are API policy, not measured interactive-performance targets.
-
-Focused validation (existing configured build; no dependency installation):
-
-```sh
-AGENTS_AGENT_MODE=1 ninja -C build -j 4
-AGENTS_AGENT_MODE=1 ctest --test-dir build --output-on-failure
-AGENTS_AGENT_MODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
-  VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python \
-  /path/to/python -m pytest -q tests/python
-```

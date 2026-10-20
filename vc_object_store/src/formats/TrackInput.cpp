@@ -19,7 +19,7 @@ Prepared track(const PackedTrackStore& store, size_t row, ObjectRecord object)
     }
 
     p.geometry.arrays.push_back(detail::scalarArray<int32_t>("points", "<i4", {count, 3}, xyz));
-    p.object.track->pointCount = count; p.object.track->length = detail::trackPolylineLength(store, row, nullptr);
+    p.object.track->pointCount = count; p.object.track->length = detail::trackPolylineLength(store, row);
     p.object.track->family = detail::trackFamily(store, row);
     p.source = Json::object();
     return p;

@@ -1,5 +1,4 @@
 #pragma once
-#include "vc_object_store/geometry/Geometry.hpp"
 #include <array>
 #include <cmath>
 #include <stdexcept>
@@ -28,8 +27,4 @@ inline std::vector<std::array<double, 3>> fiberPoints(const nlohmann::json& root
     return points;
 }
 
-inline double fiberPolylineLength(const std::vector<std::array<double, 3>>& points)
-{
-    return vc::geometry::polylineLength(points);
-}
 } // namespace vc::objects::detail

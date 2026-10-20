@@ -11,7 +11,6 @@
 #    define NOMINMAX
 #  endif
 #  include <windows.h>
-#  include <process.h>
 #else
 #  include <fcntl.h>
 #  include <sys/mman.h>
@@ -20,15 +19,6 @@
 #endif
 
 namespace vc::objects::memmap {
-
-int pid()
-{
-#if defined(_WIN32)
-    return ::_getpid();
-#else
-    return static_cast<int>(::getpid());
-#endif
-}
 
 void MappedFileRO::open(const std::filesystem::path& path)
 {
@@ -93,65 +83,6 @@ void MappedFileRO::close() noexcept
     }
     data_ = nullptr;
     size_ = 0;
-}
-
-void* mapFileRW(const std::filesystem::path& path, std::size_t bytes)
-{
-#if defined(_WIN32)
-    HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
-                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        throw std::runtime_error("mapFileRW open failed: " + path.string());
-    }
-    // CreateFileMapping extends the file to `bytes` when it is shorter.
-    HANDLE mapping = ::CreateFileMappingW(file, nullptr, PAGE_READWRITE,
-                                          static_cast<DWORD>(static_cast<unsigned long long>(bytes) >> 32),
-                                          static_cast<DWORD>(bytes & 0xffffffffu), nullptr);
-    ::CloseHandle(file);
-    if (!mapping) {
-        throw std::runtime_error("mapFileRW mapping failed: " + path.string());
-    }
-    void* ptr = ::MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, bytes);
-    ::CloseHandle(mapping);
-    if (!ptr) {
-        throw std::runtime_error("mapFileRW map view failed: " + path.string());
-    }
-    return ptr;
-#else
-    int fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, static_cast<mode_t>(0600));
-    if (fd < 0) {
-        throw std::runtime_error("mapFileRW open failed: " + path.string());
-    }
-    struct stat st{};
-    if (::fstat(fd, &st) != 0) {
-        ::close(fd);
-        throw std::runtime_error("mapFileRW stat failed: " + path.string());
-    }
-    if (static_cast<std::size_t>(st.st_size) < bytes && ::ftruncate(fd, static_cast<off_t>(bytes)) != 0) {
-        ::close(fd);
-        throw std::runtime_error("mapFileRW ftruncate failed: " + path.string());
-    }
-    void* ptr = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    ::close(fd);
-    if (ptr == MAP_FAILED) {
-        throw std::runtime_error("mapFileRW mmap failed: " + path.string());
-    }
-    return ptr;
-#endif
-}
-
-void unmapRW(void* ptr, std::size_t bytes) noexcept
-{
-    if (!ptr) {
-        return;
-    }
-#if defined(_WIN32)
-    (void)bytes;
-    ::UnmapViewOfFile(ptr);
-#else
-    ::munmap(ptr, bytes);
-#endif
 }
 
 }  // namespace vc::objects::memmap

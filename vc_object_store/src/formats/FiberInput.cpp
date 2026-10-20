@@ -24,7 +24,7 @@ Prepared fiber(const fs::path& source)
     p.geometry = vc::geometry::encode(vc::geometry::Fiber{control, line});
     FiberDetail f;
     f.controlPointCount = control.size(); f.linePointCount = line.size();
-    f.length = detail::fiberPolylineLength(line.empty() ? control : line);
+    f.length = vc::geometry::polylineLength(line.empty() ? control : line);
     f.width = root.value("width", 0.0); f.widthGapFraction = root.value("width_gap_fraction", 0.2);
     f.optimizationMode = root.value("optimization_mode", "");
     if (root.contains("hv_classification")) {

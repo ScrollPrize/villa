@@ -7,7 +7,6 @@
 #include <functional>
 #include <iostream>
 #include <limits>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -126,7 +125,6 @@ struct Registrar {
 #define CHECK(...)         DOCTEST_CHECK_IMPL((__VA_ARGS__), false, "CHECK(" #__VA_ARGS__ ")")
 #define CHECK_FALSE(...)   DOCTEST_CHECK_IMPL(!(__VA_ARGS__), false, "CHECK_FALSE(" #__VA_ARGS__ ")")
 #define REQUIRE(...)       DOCTEST_CHECK_IMPL((__VA_ARGS__), true,  "REQUIRE(" #__VA_ARGS__ ")")
-#define INFO(...) do { std::ostringstream _vc; _vc << __VA_ARGS__; (void)_vc; } while (0)
 
 #define DOCTEST_THROWS_IMPL(expr, fatal)                                       \
     do {                                                                       \

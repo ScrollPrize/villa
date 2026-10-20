@@ -349,14 +349,12 @@ TEST_CASE("stored fibers and tracks use the same patch linker without source pat
     fp.stripMarchStep = 20;
     fp.fiberUuids = {fiberId}; fp.patchUuids = {patch};
     const auto fr = linkFibersToPatches(db, ct, fp);
-    for (const auto& problem : fr.problems) INFO(problem);
     REQUIRE(fr.problems.empty());
     CHECK(fr.edgesCreated == 1);
     TrackPatchParams tp;
     tp.stripMarchStep = 20;
     tp.trackUuids = {trackId}; tp.patchUuids = {patch};
     const auto tr = linkTracksToPatches(db, ct, tp);
-    for (const auto& problem : tr.problems) INFO(problem);
     REQUIRE(tr.problems.empty());
     CHECK(tr.edgesCreated == 1);
     auto read = db.read();

@@ -23,7 +23,7 @@ ctest --test-dir build --output-on-failure
 ```
 
 Dependencies: C++20 (C++23 for Python bindings), SQLite with R-tree support,
-OpenSSL Crypto, zstd, nlohmann-json, OpenCV (core, imgproc, imgcodecs, calib3d),
+OpenSSL Crypto, zstd, nlohmann-json, OpenCV core,
 libtiff and OpenMP. The native reader additionally needs libcurl, c-blosc and
 VC-Delta3D; its CMake build fetches the pinned codec if no installed package is
 available. `VC_OBJECT_STORE_READER_SOURCE` selects a different reader checkout.

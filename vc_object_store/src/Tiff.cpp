@@ -7,39 +7,10 @@
 #include <memory>
 #include <limits>
 #include <stdexcept>
-#include <system_error>
 #include <vector>
 #include <tiffio.h>
 
-#include <opencv2/imgcodecs.hpp>
-
-#if defined(_WIN32)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#endif
-
 namespace {
-
-void replaceFile(const std::filesystem::path& source,
-                 const std::filesystem::path& destination)
-{
-#if defined(_WIN32)
-    if (!::MoveFileExW(source.c_str(), destination.c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        const std::error_code ec(static_cast<int>(::GetLastError()),
-                                 std::system_category());
-        throw std::filesystem::filesystem_error(
-            "cannot replace TIFF", source, destination, ec);
-    }
-#else
-    std::filesystem::rename(source, destination);
-#endif
-}
 
 // Get TIFF parameters for a given OpenCV type
 struct TiffParams {
@@ -270,43 +241,6 @@ bool isReadableTiff(const std::filesystem::path& path)
     TIFFSetErrorHandler(prevError);
     TIFFSetWarningHandler(prevWarning);
     return ok;
-}
-
-void atomicImwriteMulti(const std::filesystem::path& outPath,
-                        const std::vector<cv::Mat>& pages)
-{
-    if (pages.empty()) {
-        throw std::runtime_error("atomicImwriteMulti: no pages to write to " +
-                                 outPath.string());
-    }
-
-    // Write the .tmp inside the same directory as the final path so the
-    // rename never crosses a filesystem boundary (EXDEV). Keep the
-    // original extension on the tail so cv::imwritemulti still picks
-    // the TIFF codec from the filename — `.tif.tmp` would dispatch as
-    // an unknown extension and the write would fail. Result: for
-    // `mask.tif` we write to `mask.tmp.tif`, then rename to `mask.tif`.
-    const std::filesystem::path parent = outPath.parent_path();
-    const std::string stem = outPath.stem().string();
-    const std::string ext = outPath.extension().string();  // includes the dot, may be empty
-    std::filesystem::path tmpPath =
-        parent / (stem + ".tmp" + (ext.empty() ? std::string{".tif"} : ext));
-
-    std::error_code ec;
-    std::filesystem::remove(tmpPath, ec);  // best effort
-
-    if (!cv::imwritemulti(tmpPath.string(), pages)) {
-        std::filesystem::remove(tmpPath, ec);
-        throw std::runtime_error("atomicImwriteMulti: cv::imwritemulti failed for " +
-                                 tmpPath.string());
-    }
-
-    try {
-        replaceFile(tmpPath, outPath);
-    } catch (...) {
-        std::filesystem::remove(tmpPath, ec);
-        throw;
-    }
 }
 
 TiffSamples readTiffSamples(const std::filesystem::path& path, bool strictLayout)

@@ -35,15 +35,6 @@ void writeTiff(
 // probing; the caller decides what to report.
 bool isReadableTiff(const std::filesystem::path& path);
 
-// Atomic multi-page TIFF write: write all pages to <outPath>.tmp, then
-// rename over outPath. A crash mid-write leaves the previous file (or
-// nothing, if there was none) intact rather than a torn half-written
-// TIFF. Throws on failure (write or rename). The .tmp is written
-// inside the same directory as outPath to avoid EXDEV from cross-mount
-// renames.
-void atomicImwriteMulti(const std::filesystem::path& outPath,
-                        const std::vector<cv::Mat>& pages);
-
 // Native sample bytes in host byte order, interleaved in TIFF component order.
 // No color conversion, scaling, mask normalization or float conversion.
 struct TiffSamples {
