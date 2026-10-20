@@ -285,9 +285,33 @@ def test_invalid_explicit_input_slots(tmp_path, slots):
     from types import SimpleNamespace
     geometry = DemandGeometry((4, 4, 4), 4, 0, 0, 1, 4)
     adapter, output = outputs(tmp_path, geometry.shape, geometry.chunk)
-    store = SimpleNamespace(model_adapter=adapter, geometry=geometry, products=adapter.output_products)
+    store = SimpleNamespace(model_adapter=adapter, geometry=geometry, products=adapter.output_products,
+                            dtype=np.dtype("float16"))
     with pytest.raises(ValueError, match="input_slots"):
         DemandWorkerPool({"test": store}, {}, ["cpu"], input_slots=slots)
+
+
+@pytest.mark.parametrize("chunks,dtypes", [
+    ((2, 4), ("float16", "float16")),
+    ((4, 4), ("float16", "float32")),
+])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_pool_rejects_incompatible_accumulator_records(tmp_path, monkeypatch, chunks, dtypes, reverse):
+    from contextlib import ExitStack
+    with ExitStack() as cleanup:
+        stores = {}
+        for index in ([1, 0] if reverse else [0, 1]):
+            root = tmp_path / str(index)
+            geometry = DemandGeometry((8, 8, 8), 4, 0, 0, 1, chunks[index])
+            adapter, output = outputs(root, geometry.shape, geometry.chunk)
+            stores[str(index)] = cleanup.enter_context(DemandStore(
+                root, {}, geometry, adapter, output, accumulator_dtype=dtypes[index]))
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("incompatible stores must fail before creating record layouts or workers")
+        monkeypatch.setattr(tiled, "_packed_layouts", forbidden)
+        with pytest.raises(ValueError, match="accumulator chunk size/dtype"):
+            DemandWorkerPool(stores, {}, ["cpu"])
 
 
 def test_gpu_lifetime_restart_retains_cpu_reads_and_exact_output(tmp_path):

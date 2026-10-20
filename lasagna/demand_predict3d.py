@@ -821,9 +821,10 @@ class DemandWorkerPool:
         if native_stride < 1 or self.geometry.scale % native_stride:
             raise ValueError("output scaledown must be divisible by the model native output stride")
         signature = lambda store: (store.geometry.tile, store.geometry.scale, store.geometry.border, store.geometry.overlap,
+                                   store.geometry.chunk, store.dtype,
                                    tuple((p.name, p.raw_channel_count) for p in store.products))
         if any(signature(s) != signature(first) for s in stores.values()):
-            raise ValueError("one worker pool requires common model output/tile geometry")
+            raise ValueError("one worker pool requires common model output/tile geometry and accumulator chunk size/dtype")
         for store in stores.values():
             adapter = store.model_adapter
             if (type(adapter) is not type(self.adapter)
