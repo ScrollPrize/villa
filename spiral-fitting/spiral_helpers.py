@@ -9,6 +9,7 @@ import scipy.ndimage
 import torch
 from tqdm import tqdm
 
+from devices import float_hi, scatter_reduce_
 from sample_spiral import get_spiral_yxs, get_theta_and_radii
 from surface_orientation import GridLayout, export_metadata
 from tifxyz import (load_tifxyz, patch_to_payload, save_tifxyz,
@@ -989,7 +990,7 @@ def compute_winding_range_and_input_extents(
                 per_strip_max_w = torch.full((num_strips,), -1, dtype=torch.int64, device=device)
                 strip_has_roi = torch.zeros(num_strips, dtype=torch.bool, device=device)
                 per_strip_max_r.scatter_reduce_(0, strip_id_roi, radius.to(torch.float32), reduce='amax')
-                per_strip_max_w.scatter_reduce_(0, strip_id_roi, winding_indices, reduce='amax')
+                scatter_reduce_(per_strip_max_w, strip_id_roi, winding_indices, 'amax')
                 strip_has_roi.scatter_(0, strip_id_roi, torch.ones_like(strip_id_roi, dtype=torch.bool))
                 per_strip_max_r_cpu = per_strip_max_r.cpu().tolist()
                 per_strip_max_w_cpu = per_strip_max_w.cpu().tolist()
@@ -1482,7 +1483,8 @@ def save_mesh(
     print(f'save_mesh {name}: winding range [{min_winding_idx}, {max_winding_idx})')
     grid_spacing = cfg['output_step_size']
     z_margin = cfg['model_flow_bounds_z_margin']
-    spiral_yxs_by_winding = get_spiral_yxs(max_winding_idx, dr_per_winding, grid_spacing, group_by_winding=True)
+    spiral_yxs_by_winding = get_spiral_yxs(max_winding_idx, dr_per_winding, grid_spacing, group_by_winding=True,
+                                           device=dr_per_winding.device)
     num_thetas_by_winding = [len(yxs_for_winding) for yxs_for_winding in spiral_yxs_by_winding]
     spiral_yxs = torch.cat(spiral_yxs_by_winding, dim=0)
     z0 = z_begin - z_margin
@@ -1639,6 +1641,7 @@ def save_combined_preview(
         dr_per_winding,
         grid_spacing,
         group_by_winding=True,
+        device=dr_per_winding.device,
     )
     z0 = z_begin - z_margin
     spiral_zs = torch.arange(
@@ -1774,6 +1777,13 @@ def _segmented_median_per_strip(ctx):
     device = ctx['device']
     if normalised_radii.numel() == 0:
         return torch.zeros(S, dtype=normalised_radii.dtype, device=device)
+
+    if float_hi(device) != torch.float64:
+        # The composite key below needs float64 to keep the value bits. A
+        # value sort followed by a stable strip sort gives the same order.
+        order = torch.argsort(normalised_radii)
+        order = order[torch.argsort(strip_id[order], stable=True)]
+        return normalised_radii[order][starts[:-1] + (lengths - 1) // 2]
 
     val_min = normalised_radii.min().to(torch.float64)
     val_max = normalised_radii.max().to(torch.float64)

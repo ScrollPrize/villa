@@ -9,6 +9,7 @@
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "VCSettings.hpp"
+#include "PythonExecutable.hpp"
 #include "ViewerManager.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
@@ -42,11 +43,14 @@
 #include <QPainterPath>
 #include <QPen>
 #include <QProgressBar>
+#include <QPlainTextEdit>
 #include <QRect>
 #include <QResizeEvent>
 #include <QScopeGuard>
 #include <QSignalBlocker>
 #include <QSettings>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QShortcut>
 #include <QSizePolicy>
 #include <QSplitter>
@@ -773,6 +777,76 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _fiberInferenceDatasetMenu->setToolTipsVisible(true);
     _fiberInferenceDatasetMenu->menuAction()->setToolTip(
         tr("Select the fiber inference dataset used for line annotation."));
+    {
+        // Fiber model backend: the neural fiber-follow model (a vesuvius
+        // checkpoint, run by the Python environment VC3D was started from)
+        // instead of the native tracer, for extrapolation and traced spans.
+        auto* fiberFollowMenu = annotationMenu->addMenu(tr("Fiber follow model"));
+        fiberFollowMenu->setToolTipsVisible(true);
+        _fiberFollowEnabledAction = fiberFollowMenu->addAction(tr("Use for the Fiber model"));
+        _fiberFollowEnabledAction->setCheckable(true);
+        _fiberFollowEnabledAction->setToolTip(
+            tr("Trace and extrapolate Fiber model lines with the fiber-follow model. "
+               "Uses the default Hugging Face model unless a checkpoint override is selected."));
+        connect(_fiberFollowEnabledAction, &QAction::toggled, this, [this](bool checked) {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            settings.setValue(vc3d::settings::line_annotation::FIBER_FOLLOW_ENABLED, checked);
+            updateFiberFollowMenu();
+            emit fiberFollowSettingsChanged();
+        });
+        auto* confidenceRow = new QWidget(fiberFollowMenu);
+        auto* confidenceLayout = new QHBoxLayout(confidenceRow);
+        confidenceLayout->setContentsMargins(12, 4, 12, 4);
+        confidenceLayout->addWidget(new QLabel(tr("Confidence"), confidenceRow));
+        _fiberFollowConfidenceSpin = new QDoubleSpinBox(confidenceRow);
+        _fiberFollowConfidenceSpin->setObjectName(QStringLiteral("fiberFollowConfidenceSpin"));
+        _fiberFollowConfidenceSpin->setRange(0.0, 1.0);
+        _fiberFollowConfidenceSpin->setDecimals(2);
+        _fiberFollowConfidenceSpin->setSingleStep(0.05);
+        _fiberFollowConfidenceSpin->setKeyboardTracking(false);
+        _fiberFollowConfidenceSpin->setToolTip(tr("Minimum confidence for subsequent model traces. Lower values allow longer, less certain traces."));
+        confidenceLayout->addWidget(_fiberFollowConfidenceSpin);
+        auto* confidenceAction = new QWidgetAction(fiberFollowMenu);
+        confidenceAction->setDefaultWidget(confidenceRow);
+        fiberFollowMenu->addAction(confidenceAction);
+        connect(_fiberFollowConfidenceSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            settings.setValue(vc3d::settings::line_annotation::FIBER_FOLLOW_CONFIDENCE, value);
+            emit fiberFollowConfidenceChanged();
+        });
+        _fiberFollowCheckpointAction = fiberFollowMenu->addAction(tr("Checkpoint…"));
+        connect(_fiberFollowCheckpointAction, &QAction::triggered, this, [this]() {
+            chooseFiberFollowCheckpoint();
+        });
+        auto* defaultCheckpoint = fiberFollowMenu->addAction(tr("Use default Hugging Face model"));
+        connect(defaultCheckpoint, &QAction::triggered, this, [this]() {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            settings.remove(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT);
+            updateFiberFollowMenu();
+            emit fiberFollowSettingsChanged();
+        });
+        _fiberFollowPythonAction = fiberFollowMenu->addAction(tr("Python…"));
+        connect(_fiberFollowPythonAction, &QAction::triggered, this, [this]() {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            const QString current = vc3d::pythonExecutableForServices(
+                settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_PYTHON).toString());
+            const QString path = QFileDialog::getOpenFileName(
+                this, tr("Python for the fiber-follow model"), current, tr("All files (*)"));
+            if (path.isEmpty()) {
+                return;
+            }
+            settings.setValue(vc3d::settings::line_annotation::FIBER_FOLLOW_PYTHON, path);
+            updateFiberFollowMenu();
+            emit fiberFollowSettingsChanged();
+        });
+        auto* autoPython = fiberFollowMenu->addAction(tr("Use VC3D's Python environment"));
+        connect(autoPython, &QAction::triggered, this, [this]() {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            settings.remove(vc3d::settings::line_annotation::FIBER_FOLLOW_PYTHON);
+            updateFiberFollowMenu();
+            emit fiberFollowSettingsChanged();
+        });
+    }
     annotationMenu->addSeparator();
     // Length / Extrapolation live in the menu as embedded label+spinbox rows
     // (QWidgetAction); editing them does not close the menu. Spinbox edits are
@@ -926,6 +1000,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
             });
 
     rebuildDatasetMenus();
+    updateFiberFollowMenu();
 
     auto* toggleVolumeOverlay = annotationMenu->addAction(tr("Toggle volume overlay"));
     toggleVolumeOverlay->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Space));
@@ -1064,6 +1139,40 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _fiberNameLabel->installEventFilter(this);
     buttonLayout->addWidget(_fiberNameLabel, 1);
     _layout->addWidget(buttonRow, 0);
+    _fiberTraceStatus = new QWidget(content);
+    _fiberTraceStatus->setObjectName(QStringLiteral("fiberTraceStatus"));
+    auto* traceLayout = new QVBoxLayout(_fiberTraceStatus);
+    traceLayout->setContentsMargins(8, 4, 8, 4);
+    auto* traceRow = new QHBoxLayout;
+    _fiberTraceProgress = new QProgressBar(_fiberTraceStatus);
+    _fiberTraceProgress->setRange(0, 0);
+    _fiberTraceProgress->setFixedWidth(80);
+    _fiberTraceProgress->setTextVisible(false);
+    traceRow->addWidget(_fiberTraceProgress);
+    _fiberTraceStatusText = new QLabel(_fiberTraceStatus);
+    _fiberTraceStatusText->setTextFormat(Qt::PlainText);
+    _fiberTraceStatusText->setWordWrap(true);
+    _fiberTraceStatusText->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    traceRow->addWidget(_fiberTraceStatusText, 1);
+    auto* traceDetailsButton = new QToolButton(_fiberTraceStatus);
+    traceDetailsButton->setText(tr("Details"));
+    traceDetailsButton->setCheckable(true);
+    traceRow->addWidget(traceDetailsButton);
+    traceLayout->addLayout(traceRow);
+    _fiberTraceDetails = new QPlainTextEdit(_fiberTraceStatus);
+    _fiberTraceDetails->setReadOnly(true);
+    _fiberTraceDetails->setMaximumBlockCount(500);
+    _fiberTraceDetails->setMaximumHeight(140);
+    _fiberTraceDetails->hide();
+    traceLayout->addWidget(_fiberTraceDetails);
+    connect(traceDetailsButton, &QToolButton::toggled, _fiberTraceDetails, &QWidget::setVisible);
+    _fiberTraceTimer = new QTimer(this);
+    _fiberTraceTimer->setInterval(1000);
+    connect(_fiberTraceTimer, &QTimer::timeout, this, [this]() {
+        setFiberTraceProgress(_fiberTraceSummary);
+    });
+    _fiberTraceStatus->hide();
+    _layout->addWidget(_fiberTraceStatus, 0);
     installGeneratedViewShortcuts();
 
     _mdiArea = new QMdiArea(content);
@@ -1144,6 +1253,69 @@ void LineAnnotationDialog::setFiberInferenceDatasetOptions(
     _fiberInferenceDatasetOptions = std::move(options);
     _selectedFiberInferenceDatasetLocation = selectedLocation;
     rebuildDatasetMenus();
+}
+
+void LineAnnotationDialog::chooseFiberFollowCheckpoint()
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QString current = settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT).toString();
+    const QString path = QFileDialog::getOpenFileName(
+        this, tr("Fiber-follow checkpoint"), current.isEmpty() ? QString() : QFileInfo(current).absolutePath(),
+        tr("Checkpoints (*.pt *.pth);;All files (*)"));
+    if (path.isEmpty()) {
+        return;
+    }
+    settings.setValue(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT, path);
+    updateFiberFollowMenu();
+    emit fiberFollowSettingsChanged();
+}
+
+void LineAnnotationDialog::setModelOnlySession(bool enabled)
+{
+    _modelOnlySession = enabled;
+    updateFiberFollowMenu();
+}
+
+void LineAnnotationDialog::updateFiberFollowMenu()
+{
+    if (!_fiberFollowEnabledAction) {
+        return;
+    }
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    namespace keys = vc3d::settings::line_annotation;
+    const QString checkpoint = settings.value(keys::FIBER_FOLLOW_CHECKPOINT).toString();
+    const bool enabled = _modelOnlySession || settings.value(keys::FIBER_FOLLOW_ENABLED, keys::FIBER_FOLLOW_ENABLED_DEFAULT).toBool();
+    _fiberFollowEnabledAction->setEnabled(!_modelOnlySession);
+    _fiberFollowEnabledAction->setText(_modelOnlySession
+        ? tr("Enabled for this model annotation session") : tr("Use for the Fiber model"));
+    if (_fiberFollowConfidenceSpin) {
+        QSignalBlocker block(_fiberFollowConfidenceSpin);
+        _fiberFollowConfidenceSpin->setValue(settings.value(keys::FIBER_FOLLOW_CONFIDENCE,
+            keys::FIBER_FOLLOW_CONFIDENCE_DEFAULT).toDouble());
+    }
+    {
+        QSignalBlocker block(_fiberFollowEnabledAction);
+        _fiberFollowEnabledAction->setChecked(enabled);
+    }
+    _fiberFollowCheckpointAction->setText(checkpoint.isEmpty()
+        ? tr("Checkpoint: default (Hugging Face)…")
+        : tr("Checkpoint: %1…").arg(QFileInfo(checkpoint).fileName()));
+    _fiberFollowCheckpointAction->setToolTip(checkpoint.isEmpty()
+        ? tr("Uses the service's default Hugging Face model. Click to choose a local checkpoint override.")
+        : checkpoint);
+    const QString configured = settings.value(keys::FIBER_FOLLOW_PYTHON).toString();
+    const QString python = vc3d::pythonExecutableForServices(configured);
+    _fiberFollowPythonAction->setText(configured.isEmpty()
+        ? tr("Python: %1 (VC3D's environment)…").arg(python)
+        : tr("Python: %1…").arg(python));
+    if (_fiberOptimizationCombo) {
+        const int index = _fiberOptimizationCombo->findData(
+            static_cast<int>(vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d));
+        if (index >= 0) {
+            _fiberOptimizationCombo->setItemText(
+                index, enabled ? tr("Fiber model (fiber follow)") : tr("Fiber model"));
+        }
+    }
 }
 
 void LineAnnotationDialog::rebuildDatasetMenus()
@@ -1589,7 +1761,7 @@ void LineAnnotationDialog::setOptimizationBusy(bool busy, bool blockInput)
     }
     updateOptimizationOverlayGeometry();
     const bool showOverlay = busy && blockInput;
-    const bool showBadge = busy && !blockInput;
+    const bool showBadge = busy && !blockInput && !_fiberTraceRunning;
     _optimizationOverlay->setVisible(showOverlay);
     _optimizationBadge->setVisible(showBadge);
     if (showOverlay) {
@@ -1604,6 +1776,43 @@ void LineAnnotationDialog::setOptimizationStatus(bool optimized)
 {
     _optimizationStatusOptimized = optimized;
     updateOptimizationStatusIndicator();
+}
+
+void LineAnnotationDialog::setFiberTraceStatus(const QString& summary, const QString& details,
+                                               bool running, bool warning)
+{
+    if (running && !_fiberTraceRunning)
+        _fiberTraceElapsed.start();
+    _fiberTraceRunning = running;
+    if (running)
+        _fiberTraceTimer->start();
+    else
+        _fiberTraceTimer->stop();
+    _fiberTraceProgress->setVisible(running);
+    if (!details.isNull())
+        _fiberTraceDetails->setPlainText(details);
+    _fiberTraceStatus->setStyleSheet(warning
+        ? QStringLiteral("#fiberTraceStatus { background: rgba(210, 125, 20, 65); }")
+        : QStringLiteral("#fiberTraceStatus { background: rgba(50, 130, 180, 35); }"));
+    setFiberTraceProgress(summary);
+    _fiberTraceStatus->show();
+    if (running && _optimizationBadge)
+        _optimizationBadge->hide();
+}
+
+void LineAnnotationDialog::setFiberTraceProgress(const QString& summary)
+{
+    _fiberTraceSummary = summary;
+    const QString visibleSummary = summary.section('\n', 0, 0).left(300);
+    _fiberTraceStatusText->setText(_fiberTraceRunning
+        ? tr("%1 — %2 s elapsed%3").arg(visibleSummary).arg(_fiberTraceElapsed.elapsed() / 1000)
+              .arg(_lineSolvePending ? tr("; edits queued") : QString())
+        : visibleSummary);
+}
+
+void LineAnnotationDialog::appendFiberTraceDetail(const QString& detail)
+{
+    _fiberTraceDetails->appendPlainText(detail);
 }
 
 void LineAnnotationDialog::setLineSolveActivity(bool running, bool pending)
@@ -2234,11 +2443,54 @@ void LineAnnotationDialog::setGeneratedOverlay(const std::string& surfaceName,
     viewer->connectOverlaysUpdated(this, apply);
 }
 
+double LineAnnotationDialog::carriedLinePosition(
+    const std::vector<cv::Vec3f>& oldLinePoints,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& oldControls,
+    const std::vector<vc3d::line_annotation::GeneratedPendingPlacement>& oldResolvedPlacements,
+    uint64_t oldLineRevision,
+    const std::vector<cv::Vec3f>& newLinePoints,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& newControls,
+    uint64_t newLineRevision,
+    double oldPosition) const
+{
+    // A control set indexes its line when every marker's revision names it;
+    // revision 0 on either side is "unknown" and trusted. A set that indexes
+    // another line (a provisional publish) anchors nothing: without anchors
+    // the carry degrades to the plain remap.
+    const auto indexesLine = [](const std::vector<GeneratedOverlay::ControlPointMarker>& controls,
+                                uint64_t lineRevision) {
+        if (lineRevision == 0) {
+            return true;
+        }
+        return std::all_of(controls.begin(), controls.end(), [lineRevision](const auto& control) {
+            return control.lineRevision == 0 || control.lineRevision == lineRevision;
+        });
+    };
+    std::vector<vc3d::line_annotation::GeneratedLineCarryControl> oldCarry =
+        indexesLine(oldControls, oldLineRevision)
+            ? vc3d::line_annotation::generatedLineCarryControls(oldControls)
+            : std::vector<vc3d::line_annotation::GeneratedLineCarryControl>{};
+    // A control placed since the displayed line was published (its publish
+    // indexes the controller's line) is anchored where this dialog placed
+    // it on the displayed line: a cursor working past that control is
+    // carried relative to it, not to the control before it.
+    vc3d::line_annotation::appendGeneratedLineCarryControls(
+        oldCarry, oldResolvedPlacements, oldLineRevision);
+    const std::vector<vc3d::line_annotation::GeneratedLineCarryControl> newCarry =
+        indexesLine(newControls, newLineRevision)
+            ? vc3d::line_annotation::generatedLineCarryControls(newControls)
+            : std::vector<vc3d::line_annotation::GeneratedLineCarryControl>{};
+    return vc3d::line_annotation::carriedGeneratedLinePosition(
+        oldLinePoints, oldCarry, newLinePoints, newCarry, oldPosition);
+}
+
 void LineAnnotationDialog::anchorGeneratedStripSurfacesForUpdate(
     QuadSurface* newLineSurface,
     QuadSurface* newLineSideSlice,
     const vc::lasagna::LineStripPositionMap& newPositionMap,
-    const std::vector<cv::Vec3f>& newLinePoints) const
+    const std::vector<cv::Vec3f>& newLinePoints,
+    const std::vector<GeneratedOverlay::ControlPointMarker>& newControls,
+    uint64_t newLineRevision) const
 {
     if (!_hasGeneratedViews || _stripViewers.size() != 2 || newLinePoints.empty()) {
         return;
@@ -2268,11 +2520,18 @@ void LineAnnotationDialog::anchorGeneratedStripSurfacesForUpdate(
         if (!std::isfinite(oldPosition)) {
             continue;
         }
-        // The same fiber spot's position on the new line, and its surface X
-        // under the new strip's (un-shifted) parameterization.
-        const double newPosition =
-            vc3d::line_annotation::remappedGeneratedLinePosition(
-                _generatedViews.linePoints, newLinePoints, oldPosition);
+        // The same fiber spot's position on the new line (carried relative
+        // to the controls around it, like the current position), and its
+        // surface X under the new strip's (un-shifted) parameterization.
+        const double newPosition = carriedLinePosition(
+            _generatedViews.linePoints,
+            _overviewLineSpaceControls,
+            _overviewResolvedArcs,
+            _generatedViews.lineRevision,
+            newLinePoints,
+            newControls,
+            newLineRevision,
+            oldPosition);
         const auto* points = newQuad->rawPointsPtr();
         if (!points || points->empty()) {
             continue;
@@ -2364,16 +2623,43 @@ bool LineAnnotationDialog::setGeneratedLineViews(
             static_cast<double>(_generatedViews.linePoints.size() - 1);
         // Land the current position on the same fiber spot: positions renumber
         // when the line is re-optimized, so the old numeric position is
-        // remapped through its 3D point instead of reused. Deliberately never
-        // recentered on a just-placed control point -- an update must not move
-        // the view (the cameras belong to the user, who may be mid-pan).
-        const double targetLinePosition =
-            vc3d::line_annotation::remappedGeneratedLinePosition(
+        // carried relative to the controls around it (the same spot within
+        // its span; the same distance past the last control in a re-traced
+        // tail) instead of reused. Deliberately never recentered on a
+        // just-placed control point -- an update must not move the view (the
+        // cameras belong to the user, who may be mid-pan).
+        const double targetLinePosition = carriedLinePosition(
+            _heldGeneratedViews.linePoints,
+            _heldOverviewLineSpaceControls,
+            _overviewResolvedArcs,
+            _heldGeneratedViews.lineRevision,
+            _generatedViews.linePoints,
+            _generatedViews.controlPoints,
+            _generatedViews.lineRevision,
+            previousLinePosition);
+        _currentLinePosition =
+            std::clamp(targetLinePosition, 0.0, maxLinePosition);
+        {
+            // Diagnostic for the position jump this carry replaces: the plain
+            // nearest-vertex remap would have landed far from the carried
+            // position (another wrap of the fiber, typically).
+            constexpr double kDivergenceSamples = 50.0;
+            const double plainRemap = vc3d::line_annotation::remappedGeneratedLinePosition(
                 _heldGeneratedViews.linePoints,
                 _generatedViews.linePoints,
                 previousLinePosition);
-        _currentLinePosition =
-            std::clamp(targetLinePosition, 0.0, maxLinePosition);
+            if (std::isfinite(plainRemap) &&
+                std::abs(plainRemap - _currentLinePosition) > kDivergenceSamples) {
+                Logger()->info(
+                    "line annotation: current position {:.1f} carried to {:.1f} "
+                    "(plain remap {:.1f}; old line {} points, new line {} points)",
+                    previousLinePosition,
+                    _currentLinePosition,
+                    plainRemap,
+                    _heldGeneratedViews.linePoints.size(),
+                    _generatedViews.linePoints.size());
+            }
+        }
         // The one step of the in-place update that can fail, validated before
         // the overlay-swap flags, offsets and viewer properties are touched:
         // set earlier, those would describe an update that never happened, for

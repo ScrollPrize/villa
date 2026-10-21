@@ -36,6 +36,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
+#include "utils/sftp_fetch.hpp"
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -62,6 +63,7 @@ bool isFiberLasagnaEntry(const Entry& entry)
 
 bool isLocationRemote(const std::string& location)
 {
+    if (utils::is_sftp_url(location)) return true;
     if (location.rfind("s3://", 0) == 0) return true;
     if (location.rfind("s3+", 0) == 0) return true;
     if (location.rfind("http://", 0) == 0) return true;
@@ -2230,6 +2232,21 @@ void VolumePkg::resolveNormalGridEntry(const vc::project::Entry& e)
     }
 }
 
+void VolumePkg::setFocusBounds(std::optional<Rect3D> bounds, bool enabled)
+{
+    if (bounds) {
+        for (int axis = 0; axis < 3; ++axis) {
+            if (!std::isfinite(bounds->low[axis]) || !std::isfinite(bounds->high[axis]))
+                throw std::invalid_argument("Project focus bounds must be finite");
+            if (bounds->low[axis] > bounds->high[axis])
+                std::swap(bounds->low[axis], bounds->high[axis]);
+        }
+    }
+    focusBounds_ = bounds;
+    focusBoundsEnabled_ = enabled && bounds.has_value();
+    persistProjectState();
+}
+
 utils::Json VolumePkg::toJson() const
 {
     auto j = utils::Json::object();
@@ -2243,6 +2260,17 @@ utils::Json VolumePkg::toJson() const
     if (selectedLasagnaDataset_) j["selected_lasagna_dataset"] = *selectedLasagnaDataset_;
     if (selectedFiberInferenceDataset_) j["selected_fiber_inference_dataset"] = *selectedFiberInferenceDataset_;
     if (umbilicus_) j["umbilicus"] = *umbilicus_;
+    if (focusBounds_) {
+        auto low = utils::Json::array();
+        auto high = utils::Json::array();
+        for (int axis = 0; axis < 3; ++axis) {
+            low.push_back(double(focusBounds_->low[axis]));
+            high.push_back(double(focusBounds_->high[axis]));
+        }
+        j["focus_bounds"] = {{"enabled", focusBoundsEnabled_},
+                             {"coordinate_frame", "annotation"},
+                             {"low_xyz", low}, {"high_xyz", high}};
+    }
     return j;
 }
 
@@ -2250,6 +2278,26 @@ void VolumePkg::fromJson(const utils::Json& j)
 {
     name_ = j.value("name", std::string("Untitled"));
     version_ = j.value("version", 1);
+    focusBounds_.reset();
+    focusBoundsEnabled_ = false;
+    if (j.contains("focus_bounds")) {
+        const auto saved = j.at("focus_bounds");
+        if (saved.value("coordinate_frame", std::string{}) != "annotation")
+            throw std::invalid_argument("Project focus bounds must declare coordinate_frame 'annotation'");
+        const auto low = saved.at("low_xyz").get_double_array();
+        const auto high = saved.at("high_xyz").get_double_array();
+        if (low.size() != 3 || high.size() != 3)
+            throw std::invalid_argument("Project focus bounds must contain three XYZ coordinates");
+        Rect3D bounds;
+        for (int axis = 0; axis < 3; ++axis) {
+            bounds.low[axis] = std::min(low[axis], high[axis]);
+            bounds.high[axis] = std::max(low[axis], high[axis]);
+            if (!std::isfinite(bounds.low[axis]) || !std::isfinite(bounds.high[axis]))
+                throw std::invalid_argument("Project focus bounds must be finite");
+        }
+        focusBounds_ = bounds;
+        focusBoundsEnabled_ = saved.value("enabled", false);
+    }
     if (j.contains("volumes")) volumes_ = entriesFromJson(j.at("volumes"));
     if (j.contains("segments")) segments_ = entriesFromJson(j.at("segments"));
     if (j.contains("normal_grids")) normalGrids_ = entriesFromJson(j.at("normal_grids"));

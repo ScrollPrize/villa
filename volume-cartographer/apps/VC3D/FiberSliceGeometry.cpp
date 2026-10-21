@@ -105,6 +105,52 @@ size_t nearestLinePointIndex(const std::vector<cv::Vec3d>& linePoints,
     return bestIndex;
 }
 
+double polylineLengthRange(const std::vector<cv::Vec3d>& linePoints,
+                           size_t firstIndex,
+                           size_t lastIndex)
+{
+    if (linePoints.size() < 2 || firstIndex >= linePoints.size() ||
+        lastIndex >= linePoints.size() || lastIndex <= firstIndex) {
+        return 0.0;
+    }
+    double length = 0.0;
+    for (size_t i = firstIndex + 1; i <= lastIndex; ++i) {
+        if (!isFinitePoint(linePoints[i - 1]) || !isFinitePoint(linePoints[i])) {
+            continue;
+        }
+        const cv::Vec3d delta = linePoints[i] - linePoints[i - 1];
+        const double step = std::sqrt(delta.dot(delta));
+        if (std::isfinite(step)) {
+            length += step;
+        }
+    }
+    return length;
+}
+
+double annotatedLineLengthVx(const std::vector<cv::Vec3d>& linePoints,
+                             const std::vector<cv::Vec3d>& controlPoints)
+{
+    if (linePoints.size() < 2) {
+        return 0.0;
+    }
+    size_t first = linePoints.size();
+    size_t last = 0;
+    size_t finiteControls = 0;
+    for (const cv::Vec3d& control : controlPoints) {
+        if (!isFinitePoint(control)) {
+            continue;
+        }
+        ++finiteControls;
+        const size_t index = nearestLinePointIndex(linePoints, control);
+        first = std::min(first, index);
+        last = std::max(last, index);
+    }
+    if (finiteControls < 2) {
+        return polylineLengthRange(linePoints, 0, linePoints.size() - 1);
+    }
+    return polylineLengthRange(linePoints, first, last);
+}
+
 ControlSpanSelection selectControlSpan(const std::vector<cv::Vec3d>& linePoints,
                                        const std::vector<cv::Vec3d>& controlPoints)
 {

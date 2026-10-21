@@ -31,7 +31,7 @@ When these options are absent, the legacy one-command behavior is unchanged.
 
 The ready-to-build snapshot was validated on 2026-08-25 from a clean Ubuntu EC2 worker. Verification included the source manifest, Docker build, command-line smoke tests, `NORMAL` global SfM without robustification, a separate histogram-producing scaling checkpoint, resume from the approved scaled scene, OpenMVS densification, reconstruction, refinement and texturing. The resulting mesh passed finite-geometry, topology, scale and visual checks on real scroll photographs.
 
-The operational instructions are in [`../photogrammetry-docs/README_HANDOVER.md`](../photogrammetry-docs/README_HANDOVER.md).
+The operational instructions are in [`../photogrammetry-docs/INSTRUCTIONS.md`](../photogrammetry-docs/INSTRUCTIONS.md).
 
 ## Newer upstream generation
 

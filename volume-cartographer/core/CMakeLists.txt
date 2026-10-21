@@ -14,6 +14,8 @@ target_compile_features(vc_fiber_collection PUBLIC cxx_std_20)
 set_target_properties(vc_fiber_collection PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(vc_core
+        src/AtomicFile.cpp
+        src/TexturedMesh.cpp
         src/GridStore.cpp
         src/NormalGridVolume.cpp
         src/normalgridtools.cpp
@@ -32,6 +34,7 @@ add_library(vc_core
         src/Slicing.cpp
         src/Compositing.cpp
         src/AffineTransform.cpp
+        src/ScaleTifxyz.cpp
         src/PlaneSurface.cpp
         src/Surface.cpp
         src/QuadSurface.cpp
@@ -57,6 +60,8 @@ add_library(vc_core
         src/render/DecodedChunkCacheBudget.cpp
         src/render/PersistentZarrCacheBudget.cpp
         src/render/ChunkedPlaneSampler.cpp
+        src/render/PinnedChunkRegion.cpp
+        src/render/SamplingWaitProfile.cpp
         src/render/SurfaceCache.cpp
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
@@ -84,11 +89,12 @@ target_link_libraries(vc_core
         CURL::libcurl
 )
 
-# utils header-only library + vendored c3d codec.
+# utils header-only library + vendored c3d and volcomp codecs.
 target_link_libraries(vc_core PUBLIC
     $<BUILD_INTERFACE:utils>
     $<BUILD_INTERFACE:utils_c3d_codec>
     vc_delta3d::vc_delta3d
+    $<BUILD_INTERFACE:utils_volcomp_codec>
 )
 target_link_libraries(vc_core PRIVATE
     Blosc::blosc
@@ -209,6 +215,22 @@ add_library(vc_atlas
 target_link_libraries(vc_atlas PUBLIC vc_core vc_lasagna PRIVATE Ceres::ceres)
 
 add_library(vc_fiber_tracer
+    src/fiber_tracer/FiberAnchors.cpp
+    src/fiber_tracer/FiberAnchorObjectives.cpp
+    src/fiber_tracer/FiberAnchorFinalEvaluation.cpp
+    src/fiber_tracer/FiberAxisTensor.cpp
+    src/fiber_tracer/FiberGraph.cpp
+    src/fiber_tracer/FiberLocalScoring.cpp
+    src/fiber_tracer/FiberPaths.cpp
+    src/fiber_tracer/FiberReplayMetric.cpp
+    src/fiber_tracer/FiberReverseConsistency.cpp
+    src/fiber_tracer/FiberReferenceReplayCore.cpp
+    src/fiber_tracer/PolylineGeometry.cpp
+    src/fiber_tracer/FiberletStorage.cpp
+    src/fiber_tracer/FiberletDataset.cpp
+    src/fiber_tracer/FiberletQuantization.cpp
+    src/fiber_tracer/FiberletOnDemand.cpp
+    src/fiber_tracer/FiberletPipeline.cpp
     src/fiber_tracer/FiberTrace.cpp
 )
 target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna)

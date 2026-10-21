@@ -48,6 +48,8 @@ namespace {
 [[nodiscard]] bool isRemoteLocation(std::string_view value)
 {
     return startsWithNoCase(value, "http://") ||
+           startsWithNoCase(value, "sftp://") ||
+           startsWithNoCase(value, "ssh://") ||
            startsWithNoCase(value, "https://") ||
            startsWithNoCase(value, "s3://") ||
            (startsWithNoCase(value, "s3+") &&
@@ -66,38 +68,12 @@ namespace {
     return resolved;
 }
 
-struct RemoteClients {
-    std::unique_ptr<utils::HttpClient> authenticated;
-    std::unique_ptr<utils::HttpClient> anonymous;
-    bool isS3 = false;
-    bool credentialsLoaded = false;
-};
-
-[[nodiscard]] RemoteClients makeRemoteClients(
-    const vc::ResolvedUrl& endpoint,
-    const vc::HttpAuth& explicitAuth,
-    bool discoverAwsCredentials)
+[[nodiscard]] std::unique_ptr<utils::HttpClient> makeAnonymousClient()
 {
-    utils::HttpClient::Config config;
-    config.transfer_timeout = std::chrono::seconds{60};
-    config.aws_auth = explicitAuth;
-    if (endpoint.useAwsSigv4) {
-        if (config.aws_auth.empty() && discoverAwsCredentials)
-            config.aws_auth = utils::AwsAuth::load();
-        if (!endpoint.awsRegion.empty())
-            config.aws_auth.region = endpoint.awsRegion;
-    }
-    RemoteClients clients;
-    clients.isS3 = endpoint.useAwsSigv4;
-    clients.credentialsLoaded = !config.aws_auth.empty();
-    clients.authenticated = std::make_unique<utils::HttpClient>(
-        std::move(config));
-
     utils::HttpClient::Config anonymousConfig;
     anonymousConfig.transfer_timeout = std::chrono::seconds{60};
-    clients.anonymous = std::make_unique<utils::HttpClient>(
+    return std::make_unique<utils::HttpClient>(
         std::move(anonymousConfig));
-    return clients;
 }
 
 [[nodiscard]] std::string remoteParentUrl(const std::string& normalizedRemoteUrl)
@@ -226,6 +202,7 @@ void resolveGroupLocations(
 // origin, whose own compressor remains responsible for lossless decoding.
 class PersistentHttpStore final : public utils::Store {
 public:
+    bool is_remote() const noexcept override { return true; }
     PersistentHttpStore(std::string baseUrl,
                         std::filesystem::path cacheRoot,
                         vc::HttpAuth remoteAuth,
@@ -235,12 +212,13 @@ public:
     {
         const auto endpoint = resolveRemoteEndpoint(baseUrl);
         baseUrl_ = endpoint.httpsUrl;
-        auto clients = makeRemoteClients(
-            endpoint, remoteAuth, discoverAwsCredentials);
-        client_ = std::move(clients.authenticated);
-        anonymousClient_ = std::move(clients.anonymous);
+        deferredAuth_ = std::make_unique<vc::DeferredAwsAuth>(
+            std::move(remoteAuth),
+            endpoint.useAwsSigv4 && discoverAwsCredentials,
+            endpoint.awsRegion);
+        anonymousClient_ = makeAnonymousClient();
         authFallback_ = std::make_unique<vc::S3AuthFallback>(
-            clients.isS3, clients.credentialsLoaded);
+            endpoint.useAwsSigv4, deferredAuth_->available());
     }
 
     bool exists(const std::string& key) const override
@@ -263,7 +241,8 @@ public:
             return true;
         }
         auto result = authFallback_->request([&](bool anonymous) {
-            return (anonymous ? anonymousClient_ : client_)->head(makeUrl(key));
+            return (anonymous ? *anonymousClient_ : authenticatedClient())
+                .head(makeUrl(key));
         });
         return result.response.ok();
     }
@@ -331,7 +310,8 @@ public:
         std::exception_ptr error;
         try {
             auto requestResult = authFallback_->request([&](bool anonymous) {
-                return (anonymous ? anonymousClient_ : client_)->get(makeUrl(key));
+                return (anonymous ? *anonymousClient_ : authenticatedClient())
+                    .get(makeUrl(key));
             });
             auto& response = requestResult.response;
             if (response.ok()) {
@@ -386,6 +366,29 @@ public:
         const auto count = std::min(length, bytes->size() - offset);
         return std::vector<std::byte>(bytes->begin() + static_cast<std::ptrdiff_t>(offset),
                                       bytes->begin() + static_cast<std::ptrdiff_t>(offset + count));
+    }
+
+    std::optional<std::size_t> size_of(const std::string& key) const override
+    {
+        auto bytes = get_if_exists(key);  // served from the local cache after the first fetch
+        if (!bytes) return std::nullopt;
+        return bytes->size();
+    }
+
+    std::optional<TrailingRange> get_trailing_range(
+        const std::string& key, std::size_t from_end, std::size_t length) const override
+    {
+        // Size and bytes from one read of the cached object, not a size_of()
+        // and a get_partial() that could each see a different publish.
+        auto bytes = get_if_exists(key);
+        if (!bytes || bytes->size() < from_end)
+            return std::nullopt;
+        const auto at = bytes->size() - from_end;
+        const auto count = std::min(length, from_end);
+        return TrailingRange{
+            bytes->size(),
+            std::vector<std::byte>(bytes->begin() + static_cast<std::ptrdiff_t>(at),
+                                   bytes->begin() + static_cast<std::ptrdiff_t>(at + count))};
     }
 
     void set(const std::string&, std::span<const std::byte>) override
@@ -505,8 +508,22 @@ private:
         return true;
     }
 
-    std::unique_ptr<utils::HttpClient> client_;
+    utils::HttpClient& authenticatedClient() const
+    {
+        std::lock_guard lock(clientMutex_);
+        if (!client_) {
+            utils::HttpClient::Config config;
+            config.transfer_timeout = std::chrono::seconds{60};
+            config.aws_auth = deferredAuth_->resolve();
+            client_ = std::make_unique<utils::HttpClient>(std::move(config));
+        }
+        return *client_;
+    }
+
+    mutable std::mutex clientMutex_;
+    mutable std::unique_ptr<utils::HttpClient> client_;
     std::unique_ptr<utils::HttpClient> anonymousClient_;
+    std::unique_ptr<vc::DeferredAwsAuth> deferredAuth_;
     std::unique_ptr<vc::S3AuthFallback> authFallback_;
     std::string baseUrl_;
     std::filesystem::path cacheRoot_;

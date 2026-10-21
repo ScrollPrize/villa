@@ -30,6 +30,8 @@ private:
 
 struct ChunkWorkPriority {
     bool interactive = false;
+    // Interactive computation without a viewport; alternates with GUI work.
+    bool foreground = false;
     // Maintenance shares this scheduler and its workers, but is selected only
     // after both interactive and ordinary background queues are empty.
     bool maintenance = false;
