@@ -163,19 +163,31 @@ const QColor kSuspect(QStringLiteral("#ff6b6b"));
 
 // Link markers use the line annotation's branch-link palette verbatim, so a
 // crossing reads the same here as it does in the slice and generated views:
-// H/V links are violet, same-type (H-H, V-V) links orange, and both go pale
-// blue / pale orange while they await review. These four rows mirror
-// apps/VC3D/overlays/FiberOverlayController.cpp and
-// apps/VC3D/LineAnnotationGeneratedViews.cpp and must stay in sync with them.
+// H/V links are violet, same-type (H-H, V-V) links orange, both go pale
+// blue / pale orange while they await review, and an unreviewed automatic
+// link is cyan / pink. Every row is built from the one shared table
+// (line_annotation::linkStateRgb), as the slice overlay and the generated
+// views build theirs.
 struct LinkPalette {
     QColor pen;
     QColor brush;
 };
-const LinkPalette kLinkCross{QColor(210, 95, 255, 245), QColor(210, 95, 255, 175)};
-const LinkPalette kLinkCrossPending{QColor(80, 150, 255, 245), QColor(80, 150, 255, 175)};
-const LinkPalette kLinkSameType{QColor(255, 140, 0, 245), QColor(255, 140, 0, 175)};
-const LinkPalette kLinkSameTypePending{QColor(255, 190, 120, 245),
-                                       QColor(255, 190, 120, 175)};
+// Built from the one shared table (line_annotation::linkStateRgb): pen at
+// 245, brush at 175, as the annotation views draw them.
+LinkPalette linkPaletteFromTable(bool pending, bool sameType, bool automatic)
+{
+    const vc3d::line_annotation::LinkStateRgb rgb =
+        vc3d::line_annotation::linkStateRgb(pending, sameType, automatic);
+    return LinkPalette{QColor(rgb.r, rgb.g, rgb.b, 245), QColor(rgb.r, rgb.g, rgb.b, 175)};
+}
+const LinkPalette kLinkCross = linkPaletteFromTable(false, false, false);
+const LinkPalette kLinkCrossPending = linkPaletteFromTable(true, false, false);
+const LinkPalette kLinkSameType = linkPaletteFromTable(false, true, false);
+const LinkPalette kLinkSameTypePending = linkPaletteFromTable(true, true, false);
+// Unreviewed automatic pending links: bright cyan, light pink same-type (the
+// cyan is well away from the theme's teal H fibers).
+const LinkPalette kLinkCrossAuto = linkPaletteFromTable(true, false, true);
+const LinkPalette kLinkSameTypeAuto = linkPaletteFromTable(true, true, true);
 
 // The map draws a link as a dot on each of its two control points, which
 // overlap when zoomed out; the fill is thinned so the two stacked compound
@@ -310,9 +322,6 @@ constexpr qreal kMinSceneMarginCm = 3.0;
 constexpr double kMinChipPixelsPerWinding = 180.0;
 constexpr double kFiberHitTolerancePx = 14.0;
 constexpr double kControlDotTolerancePx = 10.0;
-// The separate dashed ring of a tagged automatic-link endpoint, relative to
-// the dot it surrounds.
-constexpr double kAutoLinkRingScale = 1.45;
 constexpr int kClickSlopPx = 4;
 
 // Stand-in voxel size for a package that cannot say how big its voxels are. It
@@ -357,25 +366,6 @@ QPen cosmeticPen(const QColor& color, qreal width)
 
 // Dotted, for the gap spans and the break rims: distinct from the
 // interpolated dash by form, from every fiber colour by hue.
-// The pale fill of an automatic pending endpoint (dashed look): the
-// shared autoPendingFillAlpha rule on whatever alpha the dot would have had.
-QColor endpointFill(const QColor& fill, bool automaticDashed)
-{
-    if (!automaticDashed) {
-        return fill;
-    }
-    QColor pale = fill;
-    pale.setAlpha(vc3d::line_annotation::autoPendingFillAlpha(fill.alpha()));
-    return pale;
-}
-
-QPen dashedPen(const QColor& color, qreal width)
-{
-    QPen pen = cosmeticPen(color, width);
-    pen.setStyle(Qt::DashLine);
-    return pen;
-}
-
 QPen dottedPen(const QColor& color, qreal width)
 {
     QPen pen = cosmeticPen(color, width);
@@ -2947,10 +2937,10 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     }
 
     // The two endpoint dots of a link, from each endpoint's AGGREGATED look
-    // (endpointLook: pending outranks approved, dashed when every pending
-    // link on the point is automatic; a tagged endpoint keeps its tag rim
-    // and gets the separate dashed ring). Drawn for every link, suspect
-    // ones included (their red diagnostic rings go on top).
+    // (endpointLook: pending outranks approved, the automatic palette when
+    // every pending link on the point is automatic; a tagged endpoint keeps
+    // its tag rim over the fill). Drawn for every link, suspect ones
+    // included (their red diagnostic rings go on top).
     const auto drawEndpointDots = [&](const vc3d::fiber_map::PlacedLink& link,
                                       const QPointF& a, const QPointF& b,
                                       const std::array<std::optional<EndpointLook>, 2>& looks,
@@ -2972,18 +2962,15 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
             const bool breakTag = broken[endpointIndex];
             const EndpointLook look = looks[endpointIndex].value_or(
                 EndpointLook{palette.brush, palette.pen, link.pending, false});
-            const bool autoDashed = look.dashed;
             ++endpointIndex;
             // Two stacked fills read darker than one; this alpha
             // compounds, where the dots overlap, to about the palette's own.
             QColor fill = look.fill;
             fill.setAlpha(kLinkEndpointFillAlpha);
-            fill = endpointFill(fill, autoDashed);
             auto* dot = new ScaledDot(QBrush(fill),
                                       kollesis   ? cosmeticPen(kollesisColor(245), kKollesisRimWidthPx)
                                       : breakTag ? dottedPen(breakColor(245), kKollesisRimWidthPx)
-                                      : autoDashed ? dashedPen(look.pen, 1.0)
-                                                   : cosmeticPen(look.pen, 1.0),
+                                                 : cosmeticPen(look.pen, 1.0),
                                       crossingDotRadius,
                                       kMinCrossingDotPx, kMaxCrossingDotPx,
                                       crossingDotBounds,
@@ -2995,18 +2982,6 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
             // A tagged endpoint sits above its untagged twin where the two
             // overlap zoomed out, so the rim stays visible.
             dot->setZValue(kollesis || breakTag ? 4.1 : 4.0);
-            if (autoDashed && (kollesis || breakTag)) {
-                // The tag keeps the rim; the automatic link state gets
-                // its own dashed ring just outside it.
-                auto* ring = new ScaledDot(QBrush(Qt::NoBrush), dashedPen(look.pen, 1.0),
-                                           crossingDotRadius * kAutoLinkRingScale,
-                                           kMinCrossingDotPx * kAutoLinkRingScale,
-                                           kMaxCrossingDotPx * kAutoLinkRingScale,
-                                           crossingDotBounds * kAutoLinkRingScale);
-                _scene->addItem(ring);
-                ring->setPos(endpoint);
-                ring->setZValue(4.15);
-            }
         }
     };
     updateFocusBounds();
@@ -3026,8 +3001,8 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
             const LinkPalette& palette =
                 linkPalette(hvTagOf(link.fiberA), hvTagOf(link.fiberB), link.pending);
             // Each endpoint dot takes the endpoint's AGGREGATED look
-            // (endpointLook: pending outranks approved, dashed when every
-            // pending link on the point is automatic), so two links sharing
+            // (endpointLook: pending outranks approved, the automatic palette
+            // when every pending link on the point is automatic), so two links sharing
             // a control point never paint contradicting markers; the
             // connector keeps this link's own palette.
             const std::array<std::optional<EndpointLook>, 2> looks{
@@ -3049,30 +3024,23 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         line->setZValue(4.0);
         {
             // The endpoint markers a suspect link's control points carry
-            // (pending colours, dashing, tag rims) are the same as every
-            // other link's; the red ring is the diagnostic on top of them.
+            // (link palettes, tag rims) are the same as every other link's;
+            // the red ring is the diagnostic on top of them.
             const LinkPalette& palette =
                 linkPalette(hvTagOf(link.fiberA), hvTagOf(link.fiberB), link.pending);
             const std::array<std::optional<EndpointLook>, 2> looks{
                 endpointLook(link.fiberA, link.cpA), endpointLook(link.fiberB, link.cpB)};
             // The pre-existing suspect look (rings only) stays for an
             // endpoint without an automatic link; an endpoint WITH one gets
-            // the automatic decorations (pending-colour dot, dashing, tag
+            // the automatic decorations (the automatic-palette dot, tag
             // ring) under the red ring - decided per endpoint.
             const std::array<bool, 2> decorate{looks[0] && looks[0]->anyAuto,
                                                looks[1] && looks[1]->anyAuto};
             if (decorate[0] || decorate[1]) {
                 drawEndpointDots(link, a, b, looks, palette, decorate);
             }
-            const std::array<bool, 2> dashed{
-                endpointAutoPending(link.fiberA, link.cpA),
-                endpointAutoPending(link.fiberB, link.cpB)};
-            std::size_t endpointIndex = 0;
             for (const QPointF& endpoint : {a, b}) {
-                // A suspect automatic link keeps the red ring, dashed.
-                auto* ring = new ScaledDot(QBrush(Qt::NoBrush),
-                                           dashed[endpointIndex++] ? dashedPen(kSuspect, 1.4)
-                                                                   : cosmeticPen(kSuspect, 1.4),
+                auto* ring = new ScaledDot(QBrush(Qt::NoBrush), cosmeticPen(kSuspect, 1.4),
                                            suspectRingRadius, kMinSuspectRingPx,
                                            kMaxSuspectRingPx, suspectRingBounds);
                 _scene->addItem(ring);
@@ -3127,29 +3095,18 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
                 }
                 // A tagged point whose links the layout could not place (an
                 // automatic link to a one-point fiber, say) still draws its
-                // automatic decoration here: the pending fill inside the
-                // tag ring and the separate dashed ring, as its endpoint dot
-                // would have - selection and deselection then agree.
+                // automatic decoration here: the link fill inside the tag
+                // ring, as its endpoint dot would have - selection and
+                // deselection then agree.
                 const auto look = endpointLook(fiber.id, static_cast<int>(i));
                 const bool automatic = look && look->anyAuto;
-                auto* dot = new ScaledDot(
-                    automatic ? QBrush(endpointFill(look->fill, look->dashed)) : fill,
+                auto* dot = new ScaledDot(automatic ? QBrush(look->fill) : fill,
                                           kollesis ? rim : breakRim, crossingDotRadius,
                                           kMinCrossingDotPx, kMaxCrossingDotPx,
                                           crossingDotBounds, /*triangle=*/look && look->adjacent);
                 _scene->addItem(dot);
                 dot->setPos(fiber.controlPoints[i]);
                 dot->setZValue(4.1);
-                if (look && look->dashed) {
-                    auto* ring = new ScaledDot(QBrush(Qt::NoBrush), dashedPen(look->pen, 1.0),
-                                               crossingDotRadius * kAutoLinkRingScale,
-                                               kMinCrossingDotPx * kAutoLinkRingScale,
-                                               kMaxCrossingDotPx * kAutoLinkRingScale,
-                                               crossingDotBounds * kAutoLinkRingScale);
-                    _scene->addItem(ring);
-                    ring->setPos(fiber.controlPoints[i]);
-                    ring->setZValue(4.15);
-                }
             }
         }
     }
@@ -4009,20 +3966,22 @@ std::optional<FiberMapWorkspace::EndpointLook> FiberMapWorkspace::endpointLook(
     // From the endpoint's review state over EVERY link (the layout keeps
     // only the links it placed): the palette of the winning state (pending
     // over approved; the orange same-H/V warning when the winning state has
-    // one), the dashed outline, the triangle.
+    // one; the automatic palette when every pending link is automatic), the
+    // triangle.
     const auto it = _endpointReviews.find(vc3d::fiber_map::EndpointKey{fiberId, controlIndex});
     if (it == _endpointReviews.end() || !it->second.linked) {
         return std::nullopt;
     }
     const vc3d::fiber_map::EndpointReview& review = it->second;
     const LinkPalette& palette = review.pending
-        ? (review.sameHv ? kLinkSameTypePending : kLinkCrossPending)
+        ? (review.autoPending ? (review.sameHv ? kLinkSameTypeAuto : kLinkCrossAuto)
+                              : (review.sameHv ? kLinkSameTypePending : kLinkCrossPending))
         : (review.sameHv ? kLinkSameType : kLinkCross);
     EndpointLook look;
     look.fill = palette.brush;
     look.pen = palette.pen;
     look.pending = review.pending;
-    look.dashed = review.autoPending;
+    look.automatic = review.autoPending;
     look.anyAuto = review.anyAuto;
     look.adjacent = review.adjacent;
     return look;
@@ -4123,11 +4082,9 @@ void FiberMapWorkspace::drawControlPointDots(uint64_t fiberId)
         const bool kollesis =
             i < entry->fiber.kollesisTerminations.size() && entry->fiber.kollesisTerminations[i];
         const bool breakTag = !kollesis && i < entry->fiber.breaks.size() && entry->fiber.breaks[i];
-        // An unreviewed automatic link on this control: dashed rim (untagged)
-        // or a separate dashed ring outside the tag rim (tagged) - the same
-        // pair every other renderer draws (linkedMarkerDashed).
+        // An unreviewed automatic link on this control: the automatic
+        // palette (automaticLinkMarker, the rule every renderer draws).
         const auto look = endpointLook(fiberId, static_cast<int>(i));
-        const bool autoDashed = look && look->dashed;
         const bool anyAuto = look && look->anyAuto;
         const bool triangle = look && look->adjacent;
         // The pre-existing rule for the tag fill of a selected point: the
@@ -4147,18 +4104,18 @@ void FiberMapWorkspace::drawControlPointDots(uint64_t fiberId)
         }
         if (kollesis || breakTag) {
             if (look && (placedNonSuspectLink || anyAuto)) {
-                fill = QBrush(endpointFill(look->fill, autoDashed));
+                fill = QBrush(look->fill);
             } else {
                 fill = QBrush(Qt::NoBrush);
             }
             rim = kollesis ? cosmeticPen(kollesisColor(255), kKollesisRimWidthPx)
                            : dottedPen(breakColor(255), kKollesisRimWidthPx);
         } else if (anyAuto && look) {
-            // An untagged endpoint with an automatic link: the pending
-            // palette (fill and outline), dashed only when every pending
-            // link is automatic - a mixed point stays solid in the palette.
-            fill = QBrush(endpointFill(look->fill, autoDashed));
-            rim = autoDashed ? dashedPen(look->pen, 1.0) : cosmeticPen(look->pen, 1.0);
+            // An untagged endpoint with an automatic link: the look's palette
+            // (the automatic one when every pending link is automatic, the
+            // pending one for a mixed point), fill and outline.
+            fill = QBrush(look->fill);
+            rim = cosmeticPen(look->pen, 1.0);
         }
         auto* dot = new ScaledDot(fill, rim,
                                   kControlDotRadiusCm * vxPerCm, kMinControlDotPx,
@@ -4170,27 +4127,6 @@ void FiberMapWorkspace::drawControlPointDots(uint64_t fiberId)
         dot->setData(0, QVariant::fromValue<qulonglong>(fiberId));
         dot->setData(1, static_cast<int>(i));
         _controlPointDots.push_back(dot);
-        if (autoDashed && look && (kollesis || breakTag)) {
-            // Outside every retained tag stroke: the selected dot's own
-            // (kKollesisRimWidthPx) and the endpoint dot's underneath (the
-            // crossing dot's radius), with the ring's width on top.
-            const qreal clearancePx = kKollesisRimWidthPx + 1.5;
-            auto* ring = new ScaledDot(QBrush(Qt::NoBrush), dashedPen(look->pen, 1.0),
-                                       std::max(kControlDotRadiusCm, kCrossingDotRadiusCm) * vxPerCm *
-                                           kAutoLinkRingScale,
-                                       std::max(kMinControlDotPx, kMinCrossingDotPx) *
-                                               kAutoLinkRingScale + clearancePx,
-                                       std::max(kMaxControlDotPx, kMaxCrossingDotPx) *
-                                               kAutoLinkRingScale + clearancePx,
-                                       std::max(kControlDotBoundsCm, kCrossingDotBoundsCm) * vxPerCm *
-                                           kAutoLinkRingScale);
-            _scene->addItem(ring);
-            ring->setPos(entry->fiber.controlPoints[i]);
-            ring->setZValue(kHighlightZ + 1.1);
-            ring->setData(0, QVariant::fromValue<qulonglong>(fiberId));
-            ring->setData(1, static_cast<int>(i));
-            _controlPointDots.push_back(ring);
-        }
     }
 }
 

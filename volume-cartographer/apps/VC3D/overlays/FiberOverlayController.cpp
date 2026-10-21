@@ -247,32 +247,23 @@ void FiberOverlayController::collectPrimitives(VolumeViewerBase* viewer,
             if (mark.state == 0) {
                 continue;
             }
-            // The Line Annotation GUI's palettes: blue / purple for H-V
-            // links, the orange warning pair for same-H/V links, pending vs
-            // approved; an automatic pending point draws dashed.
+            // The Line Annotation GUI's palettes (generatedLinkStateColor):
+            // blue / purple for H-V links, the orange warning pair for
+            // same-H/V links, pending vs approved, cyan / pink for an
+            // automatic pending point.
             const bool pending = mark.state == 1 || mark.state == 3;
             const bool automatic = mark.state == 3;
             const bool tagged = mark.kollesisTermination || mark.breakTag;
+            // (linkStateRgb: this overlay's test target links no generated-views
+            // source, so the inline table rather than its QColor form.)
+            const vc3d::line_annotation::LinkStateRgb rgb =
+                vc3d::line_annotation::linkStateRgb(pending, mark.sameHv, automatic);
             OverlayStyle style;
-            if (pending) {
-                style.penColor = mark.sameHv ? QColor(255, 190, 120, 245) : QColor(80, 150, 255, 245);
-                style.brushColor = mark.sameHv ? QColor(255, 190, 120, 175) : QColor(80, 150, 255, 175);
-            } else {
-                style.penColor = mark.sameHv ? QColor(255, 140, 0, 245) : QColor(210, 95, 255, 245);
-                style.brushColor = mark.sameHv ? QColor(255, 140, 0, 175) : QColor(210, 95, 255, 175);
-            }
-            const QColor linkPen = style.penColor;
-            if (automatic) {
-                // The pale automatic fill (the shared rule), tagged or not.
-                style.brushColor.setAlpha(
-                    vc3d::line_annotation::autoPendingFillAlpha(style.brushColor.alpha()));
-            }
+            style.penColor = QColor(rgb.r, rgb.g, rgb.b, 245);
+            style.brushColor = QColor(rgb.r, rgb.g, rgb.b, 175);
             style.penColor.setAlphaF(style.penColor.alphaF() * opacity);
             style.brushColor.setAlphaF(style.brushColor.alphaF() * opacity);
             style.penWidth = 2.0;
-            if (automatic && !tagged) {
-                style.penStyle = Qt::DashLine;
-            }
             if (tagged) {
                 // The tag ring replaces the outline, the link fill stays.
                 style.penColor = mark.kollesisTermination ? QColor(255, 230, 0, 245)
@@ -294,18 +285,6 @@ void FiberOverlayController::collectPrimitives(VolumeViewerBase* viewer,
                 builder.addPainterPath(triangle, style);
             } else {
                 builder.addPoint(center, radius, style);
-            }
-            if (automatic && tagged) {
-                // The separate dashed link ring of a tagged automatic point,
-                // clear of the tag stroke.
-                OverlayStyle ring;
-                ring.penColor = linkPen;
-                ring.penColor.setAlphaF(ring.penColor.alphaF() * opacity);
-                ring.brushColor = Qt::transparent;
-                ring.penWidth = 2.0;
-                ring.penStyle = Qt::DashLine;
-                ring.z = 95.1;
-                builder.addPoint(center, radius + 3.5, ring);
             }
         }
     }

@@ -331,18 +331,19 @@ private:
     // The shared marker rule for one link endpoint of the published layout:
     // true when the control point has at least one pending link and every
     // pending link on it is an unreviewed automatic link
-    // (line_annotation::autoPendingMarker): its markers draw dashed.
+    // (line_annotation::autoPendingMarker): its markers take the automatic
+    // palette.
     [[nodiscard]] bool endpointAutoPending(uint64_t fiberId, int controlIndex) const;
     // The one look of a link endpoint, from the endpoint's AGGREGATED review
     // state (every link at that control point): pending outranks approved
     // for the palette (as the annotation views' marker precedence), the
-    // dashed outline follows endpointAutoPending. Every dot drawer uses it.
+    // automatic palette follows endpointAutoPending. Every dot drawer uses it.
     struct EndpointLook {
         QColor fill;
         QColor pen;
         bool pending = false;
-        // Dashed outline: every pending link on the point is automatic.
-        bool dashed = false;
+        // The automatic palette: every pending link on the point is automatic.
+        bool automatic = false;
         // Any automatic link on the point (a mixed point keeps the pending
         // palette solid; without one the pre-existing looks are untouched).
         bool anyAuto = false;

@@ -152,12 +152,10 @@ QPainterPath generatedTriangleMarkerPath(const QPointF& center, qreal radius)
     return path;
 }
 
-QColor generatedLinkStateColor(bool pending, bool sameHv, int alpha)
+QColor generatedLinkStateColor(bool pending, bool sameHv, int alpha, bool automatic)
 {
-    if (sameHv) {
-        return pending ? QColor(255, 190, 120, alpha) : QColor(255, 140, 0, alpha);
-    }
-    return pending ? QColor(80, 150, 255, alpha) : QColor(210, 95, 255, alpha);
+    const LinkStateRgb rgb = linkStateRgb(pending, sameHv, automatic);
+    return QColor(rgb.r, rgb.g, rgb.b, alpha);
 }
 
 QPointF generatedStripLinePositionToScene(CChunkedVolumeViewer* viewer,
@@ -436,6 +434,18 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     sameHvPendingBranchControlPointStyle.penColor = QColor(255, 190, 120, 245);
     sameHvPendingBranchControlPointStyle.brushColor = QColor(255, 190, 120, 175);
 
+    // Unreviewed automatic pending links: their own hues (generatedLinkStateColor).
+    ViewerOverlayControllerBase::OverlayStyle autoPendingBranchControlPointStyle =
+        pendingBranchControlPointStyle;
+    autoPendingBranchControlPointStyle.penColor = generatedLinkStateColor(true, false, 245, true);
+    autoPendingBranchControlPointStyle.brushColor = generatedLinkStateColor(true, false, 175, true);
+    ViewerOverlayControllerBase::OverlayStyle sameHvAutoPendingBranchControlPointStyle =
+        pendingBranchControlPointStyle;
+    sameHvAutoPendingBranchControlPointStyle.penColor =
+        generatedLinkStateColor(true, true, 245, true);
+    sameHvAutoPendingBranchControlPointStyle.brushColor =
+        generatedLinkStateColor(true, true, 175, true);
+
     ViewerOverlayControllerBase::OverlayStyle linkCandidateControlPointStyle = branchControlPointStyle;
     linkCandidateControlPointStyle.penColor = QColor(60, 235, 120, 245);
     linkCandidateControlPointStyle.brushColor = QColor(60, 235, 120, 175);
@@ -457,24 +467,6 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     const auto drawsTagRing = [&](const GeneratedOverlay::ControlPointMarker& control) {
         return drawsKollesisRing(control) || drawsBreakRing(control);
     };
-    // The separate dashed link ring of a TAGGED automatic pending point: the
-    // tag ring (kollesis / break) keeps the marker's outline, so the link
-    // state gets its own glyph two units outside it (the fast current-cut
-    // renderer and the overview bar draw the same pair).
-    const auto drawsAutoPendingLinkRing = [&](const GeneratedOverlay::ControlPointMarker& control) {
-        return control.hasPendingLinks && !control.isLinkCandidate &&
-               linkedMarkerDashed(true, control.hasAutoPendingLinks) && drawsTagRing(control);
-    };
-    auto autoPendingLinkRingStyle = [&](const GeneratedOverlay::ControlPointMarker& control)
-        -> ViewerOverlayControllerBase::OverlayStyle {
-        ViewerOverlayControllerBase::OverlayStyle style = control.hasSameHvPendingLinks
-            ? sameHvPendingBranchControlPointStyle
-            : pendingBranchControlPointStyle;
-        style.brushColor = Qt::transparent;
-        style.penStyle = Qt::DashLine;
-        style.z += 0.3;
-        return style;
-    };
     // Triangle instead of circle: an adjacent-winding link on the point, or
     // the point designated as an adjacent link candidate (a split candidate
     // keeps its own red circle).
@@ -490,18 +482,15 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         const bool linked = control.hasPendingLinks || control.hasBranches;
         ViewerOverlayControllerBase::OverlayStyle style;
         if (control.hasPendingLinks) {
-            style = control.hasSameHvPendingLinks ? sameHvPendingBranchControlPointStyle
-                                                  : pendingBranchControlPointStyle;
-            // An unreviewed automatic link: same colours, paler fill, dashed
-            // outline. A tagged point keeps its tag ring and gets a separate
-            // dashed link ring instead (autoPendingLinkRingStyle below).
-            const bool automatic = linkedMarkerDashed(true, control.hasAutoPendingLinks);
-            if (automatic) {
-                style.brushColor.setAlpha(autoPendingFillAlpha(style.brushColor.alpha()));
-            }
-            if (automatic && !drawsTagRing(control)) {
-                style.penStyle = Qt::DashLine;
-            }
+            // An unreviewed automatic link: the automatic palette (cyan, or
+            // pink same-H/V), solid like every other marker; a tagged point
+            // keeps that fill inside its tag ring, as any linked point does.
+            const bool automatic = automaticLinkMarker(true, control.hasAutoPendingLinks);
+            style = automatic
+                ? (control.hasSameHvPendingLinks ? sameHvAutoPendingBranchControlPointStyle
+                                                 : autoPendingBranchControlPointStyle)
+                : (control.hasSameHvPendingLinks ? sameHvPendingBranchControlPointStyle
+                                                 : pendingBranchControlPointStyle);
         } else if (control.hasBranches) {
             style = control.hasSameHvBranches ? sameHvBranchControlPointStyle
                                               : branchControlPointStyle;
@@ -769,15 +758,6 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                         primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
                             controlScene, radius, true, controlStyleForMarker(control)});
                     }
-                    if (drawsAutoPendingLinkRing(control)) {
-                        // The strip's tagged automatic point: the same
-                        // separate dashed link ring as the cut views, scaled
-                        // to the strip's marker size.
-                        // Clear of the tag stroke (2.5 wide) with the ring's
-                        // own width (2): centre at radius + 3.
-                        primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
-                            controlScene, radius + 3.0, true, autoPendingLinkRingStyle(control)});
-                    }
                 }
             }
             for (const auto& predSnap : overlay.predSnapPoints) {
@@ -881,17 +861,9 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                         generatedTriangleMarkerPath(controlScene, radius),
                         controlStyleForMarker(control)});
                 }
-                if (drawsAutoPendingLinkRing(control)) {
-                    addVolumePointMarker(control.point, radius + 3.0,
-                                         autoPendingLinkRingStyle(control));
-                }
                 continue;
             }
             addVolumePointMarker(control.point, radius, controlStyleForMarker(control));
-            if (drawsAutoPendingLinkRing(control)) {
-                addVolumePointMarker(control.point, radius + 3.0,
-                                     autoPendingLinkRingStyle(control));
-            }
         }
     }
 
@@ -929,7 +901,7 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         auto linkXStyle = branchLinkFiberIntersectionStyle;
         linkXStyle.penColor = generatedLinkStateColor(intersection.pendingBranchLink,
                                                       intersection.sameHvBranchLink,
-                                                      245);
+                                                      245, intersection.autoPendingBranchLink);
         // Pending glyphs keep drawing over approved ones where they overlap.
         linkXStyle.z = intersection.pendingBranchLink ? 168.3 : 168.25;
         if (intersection.connectorStart &&
@@ -938,9 +910,11 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
             if (finiteScenePoint(connectorScene) && finiteScenePoint(scenePoint)) {
                 auto connectorStyle = branchLinkStyle;
                 connectorStyle.penColor = generatedLinkStateColor(
-                    intersection.pendingBranchLink, intersection.sameHvBranchLink, 225);
+                    intersection.pendingBranchLink, intersection.sameHvBranchLink, 225,
+                    intersection.autoPendingBranchLink);
                 connectorStyle.brushColor = generatedLinkStateColor(
-                    intersection.pendingBranchLink, intersection.sameHvBranchLink, 165);
+                    intersection.pendingBranchLink, intersection.sameHvBranchLink, 165,
+                    intersection.autoPendingBranchLink);
                 primitives.push_back(ViewerOverlayControllerBase::LineStripPrimitive{
                     {connectorScene, scenePoint},
                     false,

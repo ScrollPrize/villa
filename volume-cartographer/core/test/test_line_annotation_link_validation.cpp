@@ -345,7 +345,7 @@ TEST_CASE("auto link: the JSON review-state keys round trip under the invariant"
 TEST_CASE("auto link: the marker rule is 'every pending link on the point is automatic'")
 {
     using vc3d::line_annotation::autoPendingMarker;
-    using vc3d::line_annotation::linkedMarkerDashed;
+    using vc3d::line_annotation::automaticLinkMarker;
     struct L {
         bool pending;
         bool autoLink;
@@ -355,9 +355,9 @@ TEST_CASE("auto link: the marker rule is 'every pending link on the point is aut
     CHECK_FALSE(autoPendingMarker(std::vector<L>{{true, true}, {true, false}}));
     CHECK_FALSE(autoPendingMarker(std::vector<L>{{false, false}}));
     CHECK_FALSE(autoPendingMarker(std::vector<L>{}));
-    CHECK(linkedMarkerDashed(true, true));
-    CHECK_FALSE(linkedMarkerDashed(true, false));
-    CHECK_FALSE(linkedMarkerDashed(false, true));
+    CHECK(automaticLinkMarker(true, true));
+    CHECK_FALSE(automaticLinkMarker(true, false));
+    CHECK_FALSE(automaticLinkMarker(false, true));
 }
 
 

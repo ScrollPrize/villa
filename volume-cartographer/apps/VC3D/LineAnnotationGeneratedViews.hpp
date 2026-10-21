@@ -200,6 +200,9 @@ struct GeneratedOverlay {
         // Set with projectedBranchLink when the local and linked fibers share
         // an H/V classification (the orange warning palette).
         bool sameHvBranchLink = false;
+        // Set with pendingBranchLink when that pending link is automatic
+        // (the connector and the X take the automatic palette).
+        bool autoPendingBranchLink = false;
         bool isLinkCandidateFiber = false;
         std::optional<cv::Vec3f> connectorStart;
     };
@@ -1876,27 +1879,41 @@ struct GeneratedLinkCandidateMenuState {
 
 // The link-state palette shared by linked control points, their connector
 // lines and the linked fiber's projected X marker: purple approved, blue
-// pending, orange same-H/V approved, light orange same-H/V pending.
-// Defined in the .cpp: this header is also compiled into QtCore-only tests.
-[[nodiscard]] QColor generatedLinkStateColor(bool pending, bool sameHv, int alpha);
+// pending, orange same-H/V approved, light orange same-H/V pending; an
+// AUTOMATIC pending link (automatic = true, pending = true) is bright cyan,
+// or light pink when same-H/V - hues of their own, so an unreviewed
+// automatic link reads apart from a human-made pending one at a glance and
+// from the Fiber Map's teal H fibers.
+// The hue itself is a QtCore-free inline rule (linkStateRgb) so every
+// renderer, the slice overlay's QtGui-only test target included, builds its
+// colours from the one table; generatedLinkStateColor (defined in the .cpp,
+// this header is also compiled into QtCore-only tests) is its QColor form.
+struct LinkStateRgb {
+    int r = 0;
+    int g = 0;
+    int b = 0;
+};
+[[nodiscard]] inline LinkStateRgb linkStateRgb(bool pending, bool sameHv, bool automatic = false)
+{
+    if (pending && automatic) {
+        return sameHv ? LinkStateRgb{255, 168, 216} : LinkStateRgb{32, 240, 255};
+    }
+    if (sameHv) {
+        return pending ? LinkStateRgb{255, 190, 120} : LinkStateRgb{255, 140, 0};
+    }
+    return pending ? LinkStateRgb{80, 150, 255} : LinkStateRgb{210, 95, 255};
+}
+[[nodiscard]] QColor generatedLinkStateColor(bool pending, bool sameHv, int alpha,
+                                             bool automatic = false);
 
-// Marker outline rule shared by every renderer (generated views, the fast
-// current-cut path, the overview bar, the slice overlay, the Fiber Map):
-// dashed iff the point draws in a pending colour AND is an automatic pending
-// point (ControlPointMarker::hasAutoPendingLinks, autoPendingMarker).
-inline bool linkedMarkerDashed(bool drawsPending, bool autoPending)
+// Marker palette rule shared by every renderer (generated views, the fast
+// current-cut path, the overview bar, the slice overlay, the Fiber Map): the
+// automatic palette iff the point draws in a pending colour AND is an
+// automatic pending point (ControlPointMarker::hasAutoPendingLinks,
+// autoPendingMarker: every pending link on it is automatic).
+inline bool automaticLinkMarker(bool drawsPending, bool autoPending)
 {
     return drawsPending && autoPending;
-}
-
-// The fill of an automatic pending marker (every point linkedMarkerDashed
-// says yes to, tagged or not) is thinned to two fifths of the pending
-// palette's fill alpha: on a small marker the dashed outline alone does not
-// tell it from a human-made pending link at a glance, the paler fill does.
-// Shared by every renderer so the two looks agree everywhere.
-[[nodiscard]] inline int autoPendingFillAlpha(int pendingFillAlpha)
-{
-    return (pendingFillAlpha * 2) / 5;
 }
 
 // The kollesis-termination ring colour: the ordinary control-point yellow.

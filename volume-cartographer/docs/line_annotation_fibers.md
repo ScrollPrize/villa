@@ -428,14 +428,16 @@ is refused ("A merge, split or link is in progress"). If the pair save fails,
 the link is withdrawn from the loaded fibers (every copy, including an edit's
 synced moves of its endpoints during the wait) and the status line says so.
 
-A pending automatic link is an ordinary pending link whose control-point
-markers draw with a DASHED outline and a paler (more transparent) fill in the
-pending colours (blue, or the orange same-H/V warning palette) everywhere a
-linked point is drawn: the cut views and strips (both renderers), the overview
-bar, the slice-view rings and the Fiber Map dots. A tagged point (kollesis termination, break) keeps its tag ring and
-gets a separate dashed ring just outside it. The rule for a point carrying
-several links: dashed only when every pending link on it is automatic; a
-human-made pending link outranks. The control-point menu's approve entry reads
+A pending automatic link is an ordinary pending link drawn in its own
+palette: bright cyan (#20f0ff), or light pink (#ffa8d8) for a same-H/V link,
+instead of the pending blue / orange - solid markers like every other link
+state, everywhere a linked point is drawn: the cut views and strips (both
+renderers), the overview bar, the slice-view rings and the Fiber Map dots, and
+the connector and projected X of the linked fiber in the cut views. A tagged
+point (kollesis termination, break) keeps its tag ring over that fill, as any
+linked point does. The rule for a point carrying several links: the automatic
+palette only when every pending link on it is automatic; a human-made pending
+link outranks (pending blue / orange). The control-point menu's approve entry reads
 "Approve auto link to <fiber> / CP n"; approving makes an ordinary approved
 link, exactly like approving a pending link. "Mark link as pending" on an
 approved link makes a plain (human) pending link.

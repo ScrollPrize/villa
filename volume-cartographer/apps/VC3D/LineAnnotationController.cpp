@@ -7358,6 +7358,7 @@ LineAnnotationController::markLinkCandidateFiberIntersections(
         marker.isLinkCandidateFiber =
             candidateFiberId != 0 && marker.fiberId == candidateFiberId;
         marker.pendingBranchLink = false;
+        marker.autoPendingBranchLink = false;
         marker.sameHvBranchLink = false;
         if (!marker.projectedBranchLink || !marker.connectorStart) {
             continue;
@@ -7370,6 +7371,7 @@ LineAnnotationController::markLinkCandidateFiberIntersections(
                 cv::norm(toVec3f(branch.controlPointPosition) -
                          *marker.connectorStart) <= 1.0e-3) {
                 marker.pendingBranchLink = true;
+                marker.autoPendingBranchLink = branch.autoLink;
                 break;
             }
         }

@@ -91,18 +91,10 @@ public:
         QGraphicsPathItem* pendingBranchControlPoints = nullptr;
         QGraphicsPathItem* sameHvBranchControlPoints = nullptr;
         QGraphicsPathItem* sameHvPendingBranchControlPoints = nullptr;
-        // Unreviewed automatic pending links (dashed outline, the two pending
-        // palettes), and the separate dashed link ring a TAGGED automatic
-        // pending point gets next to its tag ring.
+        // Unreviewed automatic pending links: the automatic palette (cyan,
+        // pink same-H/V), solid like the other link states.
         QGraphicsPathItem* autoPendingBranchControlPoints = nullptr;
         QGraphicsPathItem* sameHvAutoPendingBranchControlPoints = nullptr;
-        // The TAGGED automatic pending point's marker: the pale fill under
-        // its tag ring with the pending outline solid (the tag ring covers
-        // it), beside the separate dashed link ring below.
-        QGraphicsPathItem* autoPendingTaggedBranchControlPoints = nullptr;
-        QGraphicsPathItem* sameHvAutoPendingTaggedBranchControlPoints = nullptr;
-        QGraphicsPathItem* autoPendingLinkRings = nullptr;
-        QGraphicsPathItem* sameHvAutoPendingLinkRings = nullptr;
         // Hollow yellow rings of kollesis-tagged points, drawn over whichever
         // fill (link state) the point keeps; an unlinked tagged point has no
         // fill at all.
