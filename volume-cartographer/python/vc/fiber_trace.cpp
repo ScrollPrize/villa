@@ -27,6 +27,8 @@
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/fiber_tracer/FiberChunkTrace.hpp"
 #include "vc/fiber_tracer/FiberLiveBridge.hpp"
+#include "vc/fiber_tracer/FiberCaseQueue.hpp"
+#include <atomic>
 #include "vc/fiber_tracer/FiberReverseConsistency.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
@@ -344,6 +346,22 @@ struct ChunkCacheHandle {
         nb::gil_scoped_release release;
         return {cache.get(key,*predictions.field,trace,*normals.sampler,predictions.scales.traceToBaseScale)};
     }
+    std::vector<ChunkPathsHandle> getMany(const std::vector<std::array<int,3>>& keys,
+                                         size_t workers,size_t contexts) {
+        if(trace.parallelThreads!=1)
+            throw std::invalid_argument("get_many requires parallel_threads=1; the case queue owns parallelism");
+        std::vector<ChunkPathsHandle> result(keys.size());
+        nb::gil_scoped_release release;
+        std::atomic<size_t> next{0};
+        ft::FiberCaseQueue queue(workers,keys.size(),[&] {
+            const size_t index=next.fetch_add(1);
+            result[index].paths=cache.get(keys[index],*predictions.field,trace,*normals.sampler,
+                predictions.scales.traceToBaseScale,ft::FiberCaseQueue::parallelFor,
+                [](const auto& ready) { ft::FiberCaseQueue::await(ready); });
+        },contexts);
+        queue.join();
+        return result;
+    }
 };
 
 nb::dict chunkRoute(ChunkCacheHandle& self,Vec3 center,Vec3 direction,
@@ -519,7 +537,9 @@ NB_MODULE(fiber_trace, m)
             auto readiness=std::make_shared<ft::FiberCaseReadiness>(capacity);
             field.field->setReadinessGate([bridge=h.bridge,readiness,source,caseIndex,remaining](const auto& chunks) {
                 readiness->await(chunks,[&](const auto& missing) {
-                    bridge->await(source,caseIndex,remaining,missing);
+                    auto wait=[&] { bridge->await(source,caseIndex,remaining,missing); };
+                    if(auto* permit=ft::FiberConstructionCpuPermit::current()) permit->suspend(wait);
+                    else wait();
                 },[&] { bridge->checkActive(); });
             });
         }, "bridge"_a,"source"_a,"case_index"_a=0,"remaining_base_voxels"_a=0,
@@ -558,12 +578,16 @@ NB_MODULE(fiber_trace, m)
              "field"_a,"normal_sampler"_a,"trace_config"_a,"chunk_config"_a,"output_directory"_a,"source_identity"_a,
              nb::keep_alive<1,2>(),nb::keep_alive<1,3>())
         .def("get",&ChunkCacheHandle::get,"key_xyz"_a)
+        .def("get_many",&ChunkCacheHandle::getMany,"keys_xyz"_a,"workers"_a=4,"contexts_per_worker"_a=8,
+             "Bounded native cases; ordered results, cooperative publication and cache waits.")
         .def("route",&chunkRoute,"center_base"_a,"direction"_a,"metric"_a.noconvert(),
              "maximum_distance_base"_a,"maximum_steps"_a,
              "Return committed suffix points (excluding initial snap), reason and join diagnostics.")
         .def("replay",&chunkReplay,"reference_base"_a.noconvert(),"evaluation_normals"_a,"config"_a,
              "begin_arc_base"_a=0.,"end_arc_base"_a=nb::none(),"reverse_interval_base"_a=0.,
              "Shared reference replay; optional reverse checks use the configured acceptance radii.");
+
+    m.def("case_queue_supported",&ft::FiberCaseQueue::supported);
 
     nb::class_<ft::FiberTraceConfig>(m, "TraceConfig")
         .def("__init__", [](ft::FiberTraceConfig* self, nb::kwargs kwargs) {

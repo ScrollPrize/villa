@@ -189,6 +189,49 @@ def test_field_publication_and_bridge_ownership(inputs):
         gc.collect()
 
 
+def test_one_worker_yields_publication_and_duplicate_chunk_waits(inputs):
+    if not ft.case_queue_supported():
+        pytest.skip("native case contexts unavailable")
+    def respond(server, connection, request):
+        # The first build waits; its duplicate waits on the same cache future.
+        # A third case must still run on this ONE OS worker to publish both.
+        if len(server.requests) == 2:
+            for req in reversed(server.requests):
+                server.ready(connection, req)
+        elif len(server.requests) > 2:
+            server.ready(connection, request)
+    with Coordinator(respond) as server:
+        client = bridge(server, timeout_seconds=3)
+        field, normals = handles(inputs)
+        field.set_live_bridge(client, "fixture")
+        cfg = chunk_config()
+        cache = ft.ChunkCache(field, normals, trace_config(), cfg, str(inputs/"queued"), "queue")
+        # Different construction keys but the same actual prediction storage.
+        # This fixture has one storage chunk, so simultaneous demands prove
+        # readiness isn't cached before the acknowledgement.
+        result = cache.get_many([[0,0,0],[0,0,0],[-1,0,0]], workers=1, contexts_per_worker=3)
+        assert len(server.requests) >= 2
+        assert len(result)==3
+        assert result[0].key==result[1].key
+        assert result[2].key==[-1,0,0]
+        for a,b in zip(result[0].lines_base,result[1].lines_base,strict=True):
+            np.testing.assert_array_equal(a,b)
+        client.cancel()
+
+
+def test_queued_publication_failure_cancels_siblings(inputs):
+    if not ft.case_queue_supported():
+        pytest.skip("native case contexts unavailable")
+    with Coordinator(lambda s,c,r: s.send(c,type="error",message="inference failed")) as server:
+        client=bridge(server)
+        field,normals=handles(inputs)
+        field.set_live_bridge(client,"fixture")
+        cache=ft.ChunkCache(field,normals,trace_config(),chunk_config(),str(inputs/"queue-fail"),"queue")
+        with pytest.raises(RuntimeError,match="inference failed"):
+            cache.get_many([[0,0,0]]*10,workers=2,contexts_per_worker=2)
+        client.cancel()
+
+
 def test_cached_paris4_live_replay(tmp_path):
     from test_fiber_chunk_trace import test_real_paris4_chunk_replay
     if not os.environ.get("VC_TEST_WIDTH_MANIFEST"):

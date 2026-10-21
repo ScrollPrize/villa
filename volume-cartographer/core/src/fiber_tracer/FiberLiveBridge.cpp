@@ -1,4 +1,5 @@
 #include "vc/fiber_tracer/FiberLiveBridge.hpp"
+#include "vc/fiber_tracer/FiberCaseQueue.hpp"
 #include <condition_variable>
 #include <atomic>
 #include <map>
@@ -98,6 +99,7 @@ public:
             cancelled.store(true, std::memory_order_release);
         }
         changed.notify_all();
+        FiberCaseQueue::notify();
 #ifdef VC_LIVE_SOCKET_SUPPORTED
         if (fd >= 0) ::shutdown(fd, SHUT_RDWR);
 #endif
@@ -163,6 +165,7 @@ public:
                         std::lock_guard lock(mutex);
                         lastHeartbeat = std::chrono::steady_clock::now();
                         changed.notify_all();
+                        FiberCaseQueue::notify();
                         continue; // Liveness only: no request is marked ready.
                     }
                     if (value.at("type") != "ready") throw std::runtime_error("invalid live response type");
@@ -171,6 +174,7 @@ public:
                     if (found == waiting.end()) throw std::runtime_error("unknown live request acknowledgement");
                     found->second->done = true;
                     changed.notify_all();
+                    FiberCaseQueue::notify();
                 }
                 if (pending.size() > (1u << 20)) throw std::runtime_error("oversized live control response");
             }
@@ -210,7 +214,17 @@ public:
             auto lock = awaitLock(profile);
             const auto waitStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             bool expired = false;
-            if (heartbeatWait) {
+            if (FiberCaseQueue::active()) {
+                const auto deadline=std::chrono::steady_clock::now()+timeout;
+                lock.unlock();
+                FiberCaseQueue::await([&,deadline] {
+                    std::lock_guard guard(mutex);
+                    return state->done || !error.empty() || std::chrono::steady_clock::now() >=
+                        (heartbeatWait ? lastHeartbeat+timeout : deadline);
+                });
+                lock.lock();
+                expired=!state->done && error.empty();
+            } else if (heartbeatWait) {
                 while (!state->done && error.empty()) {
                     const auto deadline = lastHeartbeat + timeout;
                     changed.wait_until(lock, deadline);

@@ -296,6 +296,8 @@ vc_add_test(NAME test_fiber_reverse_consistency LIBS doctest::doctest vc_fiber_t
 vc_add_test(NAME test_fiber_reference_replay_core LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_chunk_trace LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_live_readiness LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_case_queue LIBS doctest::doctest vc_fiber_tracer)
+set_tests_properties(test_fiber_case_queue PROPERTIES TIMEOUT 30)
 vc_add_test(NAME test_fiberlet_storage LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiberlet_paths LIBS doctest::doctest vc_fiber_tracer DEFS VC_TESTING)
 if(TARGET test_fiberlet_paths AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
