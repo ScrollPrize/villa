@@ -196,6 +196,44 @@ private slots:
         QCOMPARE(spy.count(), 1);
     }
 
+    void singleKeyAndPunctuationShortcutsFireFromAFocusedChild()
+    {
+        QMainWindow window;
+        window.resize(300, 200);
+        auto* child = new QWidget(&window);
+        child->setFocusPolicy(Qt::StrongFocus);
+        window.setCentralWidget(child);
+        CommandCatalog catalog;
+        QAction* composite = catalog.addShortcut(vc3d::keybinds::shortcuts::CompositeView, &window);
+        QAction* offsetUp = catalog.addShortcut(vc3d::keybinds::shortcuts::WorldOffsetZPos, &window);
+        QAction* offsetDown = catalog.addShortcut(vc3d::keybinds::shortcuts::WorldOffsetZNeg, &window);
+        QSignalSpy compositeSpy(composite, &QAction::triggered);
+        QSignalSpy upSpy(offsetUp, &QAction::triggered);
+        QSignalSpy downSpy(offsetDown, &QAction::triggered);
+
+        window.show();
+        window.activateWindow();
+        QVERIFY(QTest::qWaitForWindowActive(&window));
+        child->setFocus();
+        QTRY_VERIFY(child->hasFocus());
+
+        QTest::keyClick(child, Qt::Key_C);
+        QTest::keyClick(child, Qt::Key_Period, Qt::ControlModifier);
+        QTest::keyClick(child, Qt::Key_Comma, Qt::ControlModifier);
+        QCOMPARE(compositeSpy.count(), 1);
+        QCOMPARE(upSpy.count(), 1);
+        QCOMPARE(downSpy.count(), 1);
+    }
+
+    void menuShortcutsShareTheirMenuCategory()
+    {
+        // The palette groups commands by category, so a keybind that belongs to a menu uses
+        // the menu's title, the same name MenuActionController gives that menu's actions.
+        QCOMPARE(QString::fromUtf8(vc3d::keybinds::shortcuts::OpenVolpkg.section), QStringLiteral("File"));
+        QCOMPARE(QString::fromUtf8(vc3d::keybinds::shortcuts::SurfaceNormals.section), QStringLiteral("View"));
+        QCOMPARE(QString::fromUtf8(vc3d::keybinds::shortcuts::CommandPalette.section), QStringLiteral("Help"));
+    }
+
     void panelIdsComeFromDockObjectNames()
     {
         QCOMPARE(CommandCatalog::panelId(QStringLiteral("dockWidgetVolumes")), QStringLiteral("panel.volumes"));
