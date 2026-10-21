@@ -481,11 +481,6 @@ checkpoint file exists. A checkpoint saved without a published preview, or one
 whose preview has already been pruned, gets nothing back; request a preview as
 before.
 
-Editing-workspace teardown and crash reclamation close the owner-lock handle
-before deleting its file, including on Windows. The parent storage lock remains
-held across removal and release; failed content removal retains ownership
-metadata for a later retry.
-
 On first start the service generates a strong API key at
 `~/.config/vc3d/spiral_api_key` (mode `0600`) and prints it to the console.
 For an SSH profile you never copy it: VC3D reads that file over SSH.
