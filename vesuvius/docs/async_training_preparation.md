@@ -5,13 +5,15 @@ existing asynchronous preparation stage extracted from the development trainer.
 It wraps a CPU batch source and prepares a bounded number of future batches on
 a dedicated CUDA stream while the caller trains on the preceding batch.
 
-This extraction does not switch the training CLI to a new loading path, change
-augmentation parameters, or alter model/loss behavior. Optional
+The training loop now connects this stage to its shared CPU sample queue when
+`training.sample_pipeline_cuda_prefetch_depth` is positive; it remains disabled
+by default. This does not change augmentation parameters or model/loss behavior.
+See [queued training](queued_training.md) for configuration and ownership. Optional
 [GPU value augmentation](gpu_value_augmentation.md) can run on the preparation
 stream. [Fixed effective-batch accumulation](effective_batch_accumulation.md)
 provides the one-backward utility, canonical batch mapping and
-`MacroBatchTargetSource` geometry-only count prepass. The later training-loop
-and cooperative lifecycle integration remain separate stages. The current
+`MacroBatchTargetSource` geometry-only count prepass. Bounded accumulation in the
+production loop and cooperative lifecycle integration remain separate stages. The current
 mask-aware CPU augmentation is unchanged.
 
 ## API and ownership
