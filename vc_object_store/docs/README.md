@@ -298,24 +298,6 @@ units and segment tests. Hash/JSON/decompression units are indivisible; neither
 SQLite instructions nor OS waits have wall-clock bounds. Budgets guarantee
 neither latency nor allocator memory. There is no continuation/coverage cache.
 
-## Validation and benchmarks
+## Tests
 
-[Build instructions](../README.md#build) include CTest and pytest commands.
-
-```sh
-build/bin/bench_source_import 5
-build/bin/bench_structural_edits 5
-/path/to/python scripts/bench_object_edits.py --segment /data/real-segment \
-  --radius 5.75 --edits 1000 --file-saves 50 --repeats 3 --output /tmp/edits.jsonl
-```
-
-Import/structural benchmarks use deterministic synthetic scaling fixtures and
-report scoped timings/work counters; they do not measure real-scroll latency.
-The edit runner uses read-only real tifxyz sources and temporary copies. It
-compares sparse edits plus durable commits with XYZ TIFF saves, verifies current
-and historical arrays byte-for-byte, and reports latency percentiles, DB/WAL
-sizes and read costs. Loading/initial ingestion are outside timed loops; file
-saves do not explicitly fsync, so durability differs. Rendering, deformation,
-relationship repair and concurrent access are excluded. Repeat `--segment` or
-`--radius` for more inputs; `--per-point` submits one range per vertex. Output
-must not exist. Successful native runs remove temporary data.
+[Build instructions](../README.md#build) include the pytest command.

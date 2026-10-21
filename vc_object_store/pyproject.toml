@@ -18,4 +18,3 @@ wheel.packages = []
 [tool.scikit-build.cmake.define]
 VC_OBJECT_STORE_BUILD_PYTHON = "ON"
 VC_OBJECT_STORE_BUILD_TOOLS = "OFF"
-VC_OBJECT_STORE_BUILD_TESTS = "OFF"

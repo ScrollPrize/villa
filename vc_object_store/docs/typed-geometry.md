@@ -162,16 +162,4 @@ Import-summary counts/lengths remain historical annotations; view counts and own
 measurements describe current geometry. Generic arrays retain their stored names,
 dtypes and byte order. See the [build/test commands](../README.md#build).
 
-The real-data harness uses temporary databases, compares typed roundtrips byte for
-byte, and reimports native exports for all four geometry kinds.
-Inputs must contain native geometry only; auxiliary channels are not representable
-by owned values or native export. Sources stay read-only, temporary data is removed,
-and flags may be repeated:
-
-```sh
-VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python /path/to/python \
-  scripts/validate_typed_geometry.py --point-collections /data/collections.json \
-  --fiber /data/fiber.json --patch /data/patch --tracks /data/tracks
-```
-
 Native directory export currently requires Linux `renameat2`.

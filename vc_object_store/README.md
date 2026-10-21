@@ -16,10 +16,8 @@ provide typed, bounded reads and checked sparse edits. See the
 Build from a villa checkout, with `vc_reader` beside this directory:
 
 ```sh
-cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-  -DVC_OBJECT_STORE_BUILD_TESTS=ON
+cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 ninja -C build
-ctest --test-dir build --output-on-failure
 ```
 
 Dependencies: C++20 (C++23 for Python bindings), SQLite with R-tree support,
@@ -76,5 +74,3 @@ triangles. Bounds are not quantized.
 
 Tests are self-contained and do not require the volume-cartographer checkout or
 its fixture data.
-The edit benchmark is `build/bin/bench_object_edits`; the convenience runner is
-`scripts/bench_object_edits.py`.
