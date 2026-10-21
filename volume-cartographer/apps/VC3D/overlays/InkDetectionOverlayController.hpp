@@ -58,6 +58,7 @@ signals:
     void availableDetectionsChanged();
     void selectionChanged();
     void opacityChanged(int opacity);
+    void colormapChanged(const QString& colormapId);
     void flipChanged(bool horizontal, bool vertical);
 
 protected:

@@ -6,7 +6,7 @@ from typing import Any, Literal, Optional
 
 from typing_extensions import NotRequired, TypedDict
 
-from ..core import mcp, _call, _strip_none
+from ..core import ObserveMode, mcp, _call, _observed_call, _strip_none
 
 
 class _Vec3(TypedDict):
@@ -39,6 +39,40 @@ class _OverlayComposite(TypedDict, total=False):
     method: Literal["max", "mean", "min"]
     layersFront: int
     layersBehind: int
+
+
+class _FocusBounds(TypedDict, total=False):
+    enabled: bool
+    min: _Vec3
+    max: _Vec3
+
+
+class _CompositePlanes(TypedDict, total=False):
+    xy: bool
+    xz: bool
+    yz: bool
+
+
+class _BaseComposite(TypedDict, total=False):
+    enabled: bool
+    method: Literal["max", "mean", "min", "alpha", "volumetric"]
+    layersFront: int
+    layersBehind: int
+    reverseDirection: bool
+    alphaMin: int
+    alphaMax: int
+    alphaThreshold: int
+    material: int
+    planes: _CompositePlanes
+    planeLayersFront: int
+    planeLayersBehind: int
+    planeReverseDirection: bool
+
+
+class _Volumetric(TypedDict, total=False):
+    gamma: float
+    lighting: float
+    wScale: float
 
 
 _OverlayColormap = Literal[
@@ -79,6 +113,7 @@ async def vc3d_click(
     space: Literal["volume", "scene"] = "volume",
     button: Literal["left", "right", "middle"] = "left",
     modifiers: Optional[_Modifiers] = None,
+    observe: ObserveMode = "none",
 ) -> dict[str, Any]:
     """Synthesize a mouse click in a viewer at a volume-space (or scene-space)
     position, with button and modifiers (e.g. modifiers=["shift"] to place a
@@ -91,6 +126,13 @@ async def vc3d_click(
     space="scene" with on-screen pixel coordinates.
     button: "left" | "right" | "middle".
     modifiers: any of "shift", "ctrl", "alt", "meta", "keypad".
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the call, the "revision", and the "changed" fields.
+    For a picture of the result, call vc3d_observe or vc3d_screenshot next.
+
+    Fails -32009 while a modal dialog or menu is open in VC3D (the click
+    would land behind it), as for a person.
 
     On a fiber-tracing (Line Annotation) workspace pane specifically: a PLAIN
     click (no "shift" modifier) is what adds a control point. Adding "shift"
@@ -98,7 +140,7 @@ async def vc3d_click(
     NOT place a control point on these panes, unlike its usual place-point
     role elsewhere.
     """
-    return await _call(
+    return await _observed_call(
         "canvas.click",
         _strip_none(
             {
@@ -109,6 +151,7 @@ async def vc3d_click(
                 "modifiers": modifiers if modifiers is not None else [],
             }
         ),
+        observe,
     )
 
 
@@ -119,14 +162,20 @@ async def vc3d_shift_click(
     space: Literal["volume", "scene"] = "volume",
     button: Literal["left", "right", "middle"] = "left",
     modifiers: Optional[_Modifiers] = None,
+    observe: ObserveMode = "none",
 ) -> dict[str, Any]:
     """Shift+click convenience: the canonical place-point / set-focus gesture.
     Identical to vc3d_click with "shift" unioned into modifiers.
 
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the call, the "revision", and the "changed" fields.
+    For a picture of the result, call vc3d_observe or vc3d_screenshot next.
+
     Exception: on a fiber-tracing (Line Annotation) workspace pane, this
     triggers a "predicted snap point" gesture instead of adding a control
     point -- use plain vc3d_click (no shift) there to add control points."""
-    return await _call(
+    return await _observed_call(
         "canvas.shift_click",
         _strip_none(
             {
@@ -137,29 +186,54 @@ async def vc3d_shift_click(
                 "modifiers": modifiers if modifiers is not None else [],
             }
         ),
+        observe,
     )
 
 
 @mcp.tool()
 async def vc3d_center_viewer(
-    point: _Vec3, viewer: Optional[str] = None, force_render: bool = True
+    point: _Vec3,
+    viewer: Optional[str] = None,
+    force_render: bool = True,
+    observe: ObserveMode = "none",
 ) -> dict[str, Any]:
-    """Center a viewer pane on a 3D volume point."""
-    return await _call(
+    """Center a viewer pane on a 3D volume point.
+
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the call, the "revision", and the "changed" fields.
+    For a picture of the result, call vc3d_observe or vc3d_screenshot next.
+    """
+    return await _observed_call(
         "viewer.center_on_point",
         _strip_none({"viewer": viewer, "point": point, "forceRender": force_render}),
+        observe,
     )
 
 
 @mcp.tool()
-async def vc3d_zoom_viewer(factor: float, viewer: Optional[str] = None) -> dict[str, Any]:
+async def vc3d_zoom_viewer(
+    factor: float,
+    viewer: Optional[str] = None,
+    observe: ObserveMode = "none",
+) -> dict[str, Any]:
     """Multiply a viewer's zoom scale by `factor` (>1 zooms in, <1 zooms out;
     e.g. 10 = 10x closer, 0.5 = half). It is a true multiplier applied in one
     call -- no need to repeat small steps. Returns the new scale, which is
     clamped to the viewer's zoom limits, so a very large factor saturates at
     max zoom and the returned scale may reflect less than the full multiply.
-    Compare the returned scale to gauge how much room is left."""
-    return await _call("viewer.zoom", _strip_none({"viewer": viewer, "factor": factor}))
+    Compare the returned scale to gauge how much room is left.
+
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the call, the "revision", and the "changed" fields.
+    For a picture of the result, call vc3d_observe or vc3d_screenshot next.
+    """
+    return await _observed_call(
+        "viewer.zoom",
+        _strip_none({"viewer": viewer, "factor": factor}),
+        observe,
+    )
 
 
 @mcp.tool()
@@ -167,6 +241,7 @@ async def vc3d_rotate_viewer(
     plane: Literal["seg xz", "seg yz", "xz", "yz"],
     degrees: float,
     relative: bool = True,
+    observe: ObserveMode = "none",
 ) -> dict[str, Any]:
     """Rotate an axis-aligned slice plane -- the same rotation a human gets by
     middle-drag on the "seg xz" / "seg yz" panes. `plane` must be "seg xz" or
@@ -175,9 +250,17 @@ async def vc3d_rotate_viewer(
     a relative delta added to the current angle (positive = same sense as
     dragging up); pass relative=False to set an absolute angle. Requires
     axis-aligned slice mode to be active. Returns the new and previous angles in
-    degrees."""
-    return await _call(
-        "viewer.rotate", {"plane": plane, "degrees": degrees, "relative": relative}
+    degrees.
+
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the call, the "revision", and the "changed" fields.
+    For a picture of the result, call vc3d_observe or vc3d_screenshot next.
+    """
+    return await _observed_call(
+        "viewer.rotate",
+        {"plane": plane, "degrees": degrees, "relative": relative},
+        observe,
     )
 
 
@@ -209,7 +292,10 @@ async def vc3d_get_render_settings() -> dict[str, Any]:
     "planeIntersectionLinesVisible" (bool), "showSurfaceNormals" (bool),
     "showDirectionHints" (bool), "surfaceOverlayEnabled" (bool),
     "normalArrowLengthScale" (float), "normalMaxArrows" (int),
-    "highlightedSurfaceIds" ([str...])}."""
+    "highlightedSurfaceIds" ([str...]), "axisOverlays", "coordinateFrames",
+    "rawPoints" (bool), "focusBounds" ({"enabled", "min", "max"}),
+    "composite" (the Composite dock, see vc3d_set_render_settings),
+    "volumetric" ({"gamma", "lighting", "wScale"})}."""
     return await _call("viewer.get_render_settings")
 
 
@@ -230,6 +316,12 @@ async def vc3d_set_render_settings(
     segmentation_cursor_mirroring: Optional[bool] = None,
     sampling_stride: Optional[int] = None,
     z_scroll_sensitivity: Optional[float] = None,
+    axis_overlays: Optional[bool] = None,
+    coordinate_frames: Optional[bool] = None,
+    raw_points: Optional[bool] = None,
+    focus_bounds: Optional[_FocusBounds] = None,
+    composite: Optional[_BaseComposite] = None,
+    volumetric: Optional[_Volumetric] = None,
 ) -> dict[str, Any]:
     """Update the global viewer render settings; changes apply across all
     viewers. Every argument is optional -- omitted (None) fields are left
@@ -254,6 +346,24 @@ async def vc3d_set_render_settings(
     sampling_stride: surface-patch intersection sampling stride, floored to 1.
     z_scroll_sensitivity: scroll-to-move-through-z sensitivity, clamped
     0.1..100.
+    axis_overlays: show the axis-aligned slice overlays (View dock).
+    coordinate_frames: show the coordinate frame gizmo (View dock).
+    raw_points: show the raw points overlay (the P key).
+    focus_bounds: {"enabled", "min", "max"} focus box in volume voxels
+    (View dock); min/max are rounded and clamped to the volume, need each
+    other, and need a current volume (-32001); enabled=true fails until a box
+    exists.
+    composite: the Composite dock's base-volume compositing, in the dock's
+    units: {"enabled", "method" ("max"|"mean"|"min"|"alpha"|"volumetric"),
+    "layersFront", "layersBehind", "reverseDirection", "alphaMin" /
+    "alphaMax" / "material" (0..255), "alphaThreshold" (0..10000), "planes":
+    {"xy", "xz", "yz"}, "planeLayersFront", "planeLayersBehind",
+    "planeReverseDirection"}. "enabled", the layer counts and
+    "reverseDirection" apply to the flattened segmentation view; the
+    "plane..." fields to the slice views; the rest to every view. Values are
+    set on the dock's controls, which clamp them to their ranges; read the
+    result to see the applied values.
+    volumetric: volumetric-mode {"gamma", "lighting" (0..1), "wScale"}.
 
     The numeric/global fields (opacities, thickness, max-surfaces, volume
     window, sampling stride, z-scroll sensitivity, cursor mirroring,
@@ -285,6 +395,12 @@ async def vc3d_set_render_settings(
                 "segmentationCursorMirroring": segmentation_cursor_mirroring,
                 "samplingStride": sampling_stride,
                 "zScrollSensitivity": z_scroll_sensitivity,
+                "axisOverlays": axis_overlays,
+                "coordinateFrames": coordinate_frames,
+                "rawPoints": raw_points,
+                "focusBounds": focus_bounds,
+                "composite": composite,
+                "volumetric": volumetric,
             }
         ),
     )
@@ -300,7 +416,8 @@ async def vc3d_get_overlay() -> dict[str, Any]:
     for grayscale), "opacity" (0..1), "threshold" (0..255), "windowLow"/
     "windowHigh" (0..255), "maxDisplayedResolution" (int 0..5),
     "composite": {"enabled" (bool), "method" ("max"|"mean"|"min"),
-    "layersFront"/"layersBehind" (int 0..64)}}."""
+    "layersFront"/"layersBehind" (int 0..64)}, "interpolation" ("nearest" |
+    "trilinear")}."""
     return await _call("viewer.get_overlay")
 
 
@@ -314,6 +431,7 @@ async def vc3d_set_overlay(
     window: Optional[_Window] = None,
     max_displayed_resolution: Optional[int] = None,
     composite: Optional[_OverlayComposite] = None,
+    interpolation: Optional[Literal["nearest", "trilinear"]] = None,
 ) -> dict[str, Any]:
     """Update the overlay-volume settings. Every argument is optional --
     omitted (None) fields are left unchanged; pass only what you want to
@@ -333,6 +451,8 @@ async def vc3d_set_overlay(
     composite: {"enabled", "method" ("max"|"mean"|"min"), "layersFront",
     "layersBehind"} -- any subset; merged over the current composite settings.
     An unrecognized method raises -32602.
+    interpolation: overlay sampling, "nearest" or "trilinear" (the Overlay
+    Volume controls' sampling choice).
 
     Returns the full resulting overlay settings object (same shape as
     vc3d_get_overlay). The active workspace and its Overlay Volume controls
@@ -352,6 +472,7 @@ async def vc3d_set_overlay(
                 "window": window,
                 "maxDisplayedResolution": max_displayed_resolution,
                 "composite": composite,
+                "interpolation": interpolation,
             }
         ),
     )
@@ -400,6 +521,7 @@ async def vc3d_drag(
     button: Literal["left", "right", "middle", "none"] = "left",
     modifiers: Optional[_Modifiers] = None,
     steps: int = 8,
+    observe: ObserveMode = "none",
 ) -> dict[str, Any]:
     """Synthesize a full press-move-release drag in a viewer, from one point to
     another (the twin of a human click-and-drag). Dispatched through the
@@ -412,7 +534,8 @@ async def vc3d_drag(
     (same rule as vc3d_click); an off-view endpoint fails -32003 with data.point
     naming the offender ("from" or "to").
     viewer: viewer id ("v1") or surface-slot name; default "segmentation". Must
-    resolve to a chunked volume viewer, else -32009.
+    resolve to a chunked volume viewer, else -32009. Also -32009 while a modal
+    dialog or menu is open in VC3D.
     space: "volume" | "scene"; applies to both endpoints.
     button: "left" | "right" | "middle", or "none" for a hover-only positioning
     drag -- press/release are skipped and only the interpolated move events fire
@@ -428,8 +551,13 @@ async def vc3d_drag(
     active (see vc3d_corrections_set_point_mode) commits an anchored correction
     and auto-triggers the corrections solver (a source:"growth" job -- poll
     vc3d_job_status before further editing RPCs).
+
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the call, the "revision", and the "changed" fields.
+    For a picture of the result, call vc3d_observe or vc3d_screenshot next.
     """
-    return await _call(
+    return await _observed_call(
         "canvas.drag",
         _strip_none(
             {
@@ -442,4 +570,141 @@ async def vc3d_drag(
                 "steps": steps,
             }
         ),
+        observe,
+    )
+
+
+@mcp.tool()
+async def vc3d_key(
+    key: str,
+    viewer: Optional[str] = None,
+    modifiers: Optional[_Modifiers] = None,
+    action: Literal["tap", "press", "release"] = "tap",
+    hold_ms: Optional[int] = None,
+    observe: ObserveMode = "none",
+) -> dict[str, Any]:
+    """Press a key in a viewer as a keyboard user would. VC3D receives real
+    key events: shortcuts get the first chance, then the viewer, then the main
+    window's key handler (segmentation editing, wrap annotation, fibers), so
+    every keybinding behaves as it does for a person. Prefer a typed tool
+    when one exists (vc3d_grow_segment, vc3d_push_pull_start/stop,
+    vc3d_enable_editing, vc3d_manual_add_begin, vc3d_zoom_viewer, ...): it
+    reports errors and jobs, which a key cannot. Use keys for bindings without
+    a typed tool.
+
+    key: one key in Qt portable text, case-insensitive: "E", "Esc", "Space",
+    "Delete", "F5", "Left", "1", "%", or a combination such as "Shift+G".
+    Bare modifier keys are "Shift", "Ctrl", "Alt", "Meta". VC3D's Help >
+    Keybinds dialog lists every binding; among those without a typed tool are
+    S (line drawing, held), Q / E (push/pull radius), Space (toggle the
+    volume overlay), R (center focus on the cursor), X (recenter on focus),
+    and Shift+G / Shift+H (lower / raise the Z-scroll sensitivity). For
+    approval painting (B / N) use vc3d_set_approval_mask_mode and
+    vc3d_undo_approval_stroke instead.
+    viewer: viewer id ("v1") or surface-slot name; default "segmentation".
+    It must be visible (switch to its workspace first). Keyboard focus moves
+    to it for the call and then returns to where it was.
+    modifiers: any of "shift", "ctrl", "alt", "meta", "keypad", merged with
+    any spelled in key. Modifier keys go down before the key and come up
+    after it.
+    action: "tap" (press then release, the default), "press" (the key stays
+    down until a matching "release" on this connection, or until hold_ms
+    runs out; pressing a held key again is an auto-repeat), or "release".
+    hold_ms: with "tap", keep the key down this long (1..60000 ms) and return
+    after the release; use it for hold tools such as line drawing (S). With
+    "press", the longest the key stays down before VC3D releases it
+    (default 10000), so a forgotten press cannot keep a tool running.
+
+    Keys held by this MCP connection are released automatically if it
+    disconnects; vc3d_get_state lists them in "heldKeys". Do not send keys
+    while a person is typing in VC3D: the events share the real focus chain.
+    Menu-bar shortcuts such as Ctrl+O or reset view fire only while VC3D's
+    window is the active window, as for a hardware keyboard; when VC3D runs
+    in the background on a desktop they return "accepted": false, while keys
+    the viewer or main window handle directly still work.
+    A key whose shortcut opens a dialog or menu has it answered as Escape
+    would (Cancel or No, never a destructive choice) and listed in
+    "dismissed"; use the typed tool for that action instead. Any modal
+    dialog that appears while the key is delivered is answered the same
+    way, including one a finishing background tool raises at that moment.
+
+    Returns {"viewerId", "key", "modifiers", "action", "accepted" (a widget or
+    shortcut handled the key), "heldKeys" (keys this connection still holds),
+    "dismissed"}, plus "holdMs"/"releasedEarly" for holds, "holdMs" and
+    "autoRepeat" for press, and "wasHeld" for release. Errors: -32602
+    (unknown key, hold_ms with release), -32002 (viewer), -32009 (not a
+    volume viewer, viewer not visible, a modal dialog or menu is open, or
+    tapping a key this connection holds), -32004 (another hold is already
+    pending on this connection).
+
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the call, the "revision", and the "changed" fields.
+    For a picture of the result, call vc3d_observe or vc3d_screenshot next.
+    """
+    # A tap with hold_ms answers only after the release.
+    timeout = hold_ms / 1000.0 + 10.0 if hold_ms is not None and action == "tap" else None
+    return await _observed_call(
+        "canvas.key",
+        _strip_none(
+            {
+                "viewer": viewer,
+                "key": key,
+                "modifiers": modifiers,
+                "action": action,
+                "holdMs": hold_ms,
+            }
+        ),
+        observe,
+        timeout=timeout,
+    )
+
+
+@mcp.tool()
+async def vc3d_wheel(
+    position: _Point,
+    delta_y: int,
+    viewer: Optional[str] = None,
+    space: Literal["volume", "scene"] = "volume",
+    modifiers: Optional[_Modifiers] = None,
+    observe: ObserveMode = "none",
+) -> dict[str, Any]:
+    """Turn the mouse wheel over a viewer at a position. VC3D receives a real
+    wheel event at that point, so the viewer's own wheel bindings apply:
+    plain wheel zooms around the point by one step per call whatever the
+    number of notches (use vc3d_zoom_viewer for a set factor), Shift+wheel
+    steps the slice (or the surface offset) one step per notch, and
+    Ctrl+wheel changes the segmentation tool radius by one step per notch.
+
+    position: {"x","y","z"} in volume space (default) or {"x","y"} in scene
+    space when space="scene"; a volume point must lie on the viewer's current
+    view (-32003), as for vc3d_click.
+    delta_y: wheel angle in Qt units, 120 per notch; positive scrolls up
+    (zoom in), negative down. Nonzero, within -12000..12000. Partial notches
+    accumulate in the viewer like a smooth-scrolling mouse.
+    viewer: viewer id ("v1") or surface-slot name; default "segmentation".
+    modifiers: any of "shift", "ctrl", "alt", "meta", "keypad".
+
+    Returns {"viewerId", "scene", "volumePoint" (null off the surface),
+    "deltaY", "notches", "modifiers", "accepted"}. Errors: -32602, -32002,
+    -32009 (not a volume viewer, or a modal dialog or menu is open), -32001
+    (no volume loaded), -32003 (point not on the view).
+
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the call, the "revision", and the "changed" fields.
+    For a picture of the result, call vc3d_observe or vc3d_screenshot next.
+    """
+    return await _observed_call(
+        "canvas.wheel",
+        _strip_none(
+            {
+                "viewer": viewer,
+                "position": position,
+                "space": space,
+                "deltaY": delta_y,
+                "modifiers": modifiers,
+            }
+        ),
+        observe,
     )

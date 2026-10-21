@@ -5,9 +5,19 @@ from __future__ import annotations
 import base64
 from typing import Any, Literal, Optional
 
+from typing_extensions import TypedDict
+
 from mcp.server.fastmcp import Image
 
-from ..core import mcp, _call, _strip_none
+from ..core import (
+    ObserveMode,
+    _call,
+    _observation,
+    _observed_call,
+    _strip_none,
+    mcp,
+)
+from .. import core
 
 INLINE_SCREENSHOT_MAX_DIM = 2048
 
@@ -21,8 +31,21 @@ async def vc3d_ping() -> dict[str, Any]:
 @mcp.tool()
 async def vc3d_get_state() -> dict[str, Any]:
     """Snapshot of VC3D: open volume package, current volume, active segment,
-    viewers (ids/names), editing mode, running job. Call this first."""
+    viewers (ids/names, each with its workspace and visibility), the current
+    and available workspaces, editing mode, running job. Call this first.
+
+    "revision" increases whenever the project, volume, active segment,
+    editing modes, viewers, workspace, overlay or jobs change, including
+    changes a person makes in the GUI; compare it with an earlier snapshot to
+    see whether anything moved."""
     return await _call("state.get")
+
+
+class _Region(TypedDict):
+    x: int
+    y: int
+    width: int
+    height: int
 
 
 @mcp.tool()
@@ -30,8 +53,11 @@ async def vc3d_screenshot(
     target: str = "window",
     file_path: Optional[str] = None,
     max_dim: Optional[int] = None,
+    region: Optional[_Region] = None,
+    reveal: bool = False,
 ) -> Any:
-    """Capture a PNG of the whole VC3D window or one viewer pane.
+    """Capture a PNG of the VC3D window, one viewer pane, one dock, or one
+    workspace.
 
     Return contract depends on file_path:
     - file_path omitted: the PNG is returned inline as an MCP image content
@@ -41,19 +67,34 @@ async def vc3d_screenshot(
       the raw result dict (path/metadata; its base64 field is null). No image
       is embedded in the reply.
 
-    target: "window" for the whole app, or a viewer ref (a "vN" registry id
-    or a surface-slot name like "segmentation"/"xy plane"/"seg xz"/"seg yz").
+    target: "window" for the whole app; a viewer ref (a "vN" registry id or a
+    surface-slot name like "segmentation"/"xy plane"/"seg xz"/"seg yz");
+    "dock:<objectName>" for one dock (vc3d_inspect_ui lists them); or
+    "workspace:<id>" for one workspace tab, e.g. "workspace:spiral".
     file_path: absolute path; when set, the PNG is written to disk and the
     result dict is returned. Omit to get the PNG back as an inline image.
     max_dim: optional downscale, longest side in pixels, aspect preserved.
     Inline captures default to 2048 pixels so their base64 response stays
     within the bridge transport budget. File captures default to full size.
+    region: {"x","y","width","height"} in the target's logical pixels, to
+    capture part of it; clipped to the target, -32602 when entirely outside.
+    reveal: when the target is hidden (another workspace tab, or a closed
+    dock), switch to its workspace and show its dock just for this capture,
+    then put the tab, the dock layout and keyboard focus back. A dock in the
+    bottom dock bar is captured as its panel: reveal opens that panel and
+    then reopens or closes the panel as it was. A viewer
+    revealed this way may still be drawing its tiles, so its image can lag;
+    the person at the screen sees a brief switch. A target in a hidden
+    floating dock is refused (-32009) rather than opened as a window.
 
-    Fails -32009 if the target widget isn't currently visible (e.g. it's on a
-    non-frontmost tab, such as a fiber/lasagna workspace pane while a
-    different tab is active) or its captured size is degenerate (<8px on a
-    side) -- rather than silently returning a meaningless near-zero-size
-    image. Switch to the right tab/workspace first if you hit this.
+    Fields that would hold credentials (password and API-key entries, text
+    containing a password, token or signed URL) are painted over in the
+    image; the result's "masked" counts them.
+
+    Fails -32009 if the target isn't visible and reveal is false (or
+    revealing could not show it), or its size is degenerate (<8px on a
+    side), rather than silently returning a meaningless image; -32007 for an
+    unknown dock or workspace.
     """
     effective_max_dim = max_dim
     if effective_max_dim is None and file_path is None:
@@ -62,7 +103,13 @@ async def vc3d_screenshot(
     result = await _call(
         "screenshot.capture",
         _strip_none(
-            {"target": target, "filePath": file_path, "maxDim": effective_max_dim}
+            {
+                "target": target,
+                "filePath": file_path,
+                "maxDim": effective_max_dim,
+                "region": region,
+                "reveal": reveal,
+            }
         ),
     )
     if file_path is not None:
@@ -76,27 +123,121 @@ async def vc3d_screenshot(
 
 
 @mcp.tool()
-async def vc3d_switch_workspace(
-    name: Literal["main", "lasagna", "fiber_slice"]
+async def vc3d_inspect_ui(
+    root: str = "window",
+    depth: int = 8,
+    include_hidden: bool = False,
 ) -> dict[str, Any]:
-    """Switch VC3D's active workspace tab. Requires a volume package to be open.
+    """Read VC3D's panels as a tree: what each control shows, without a
+    screenshot. The tree is Qt's accessibility tree, the one a screen reader
+    uses. Read-only; change settings through the typed tools.
 
-    name: "main" (the default segmentation/navigation workspace -- v1-v4's
-    viewers live here), "lasagna" (the Lasagna optimization workspace), or
-    "fiber_slice" (the fiber-slice workspace). Any viewers the workspace
-    creates register with the ViewerManager and become targetable by
-    vc3d_click / vc3d_drag / vc3d_screenshot etc. (they appear in
-    vc3d_get_state's viewers list).
+    root: "window" (the whole main window), "dock:<objectName>" (one dock;
+    the result's "docks" list gives every dock's objectName, title,
+    visibility, whether it lives in the bottom dock bar ("dockBar", read
+    through its panel, open or not) and workspace), "workspace:<id>" (one
+    workspace tab, such as
+    "workspace:spiral"), or "focused" (the widget with keyboard focus).
+    depth: levels below root to expand (0..64, default 8); deeper nodes carry
+    "childrenOmitted": true. Unnamed layout containers are skipped, so
+    depth counts meaningful widgets.
+    include_hidden: also list widgets hidden within root, such as other
+    tabs' pages. By default only widgets that would show with root are
+    listed, so a workspace that is not current can still be read.
 
-    "main" is the only documented way back from "lasagna"/"fiber_slice" --
-    there's no automatic return. This tab is real Qt UI state that persists
-    across app restarts: a freshly launched VC3D can silently open on a
-    leftover "lasagna"/"fiber_slice" tab from a prior session, in which case
-    vc3d_screenshot on a main-tab viewer fails -32009 (not visible) until you
-    call this with name="main" first. Check vc3d_get_state's viewers, or just
-    call this proactively if a main-tab capture unexpectedly fails.
+    Each node has "role" (such as "SpinBox", "CheckBox", "EditableText",
+    "ComboBox", "List", "PageTab"), "path", "enabled", "visible", and when
+    they apply: "class", "objectName", "name" (its label as a person reads
+    it), "description" (tooltip or placeholder), "value" (text, or a number
+    with "minimum"/"maximum"), "checked", "selected", "focused",
+    "readOnly", "items" with "rows" for lists, trees, tables and combo
+    boxes, "viewerId" for a viewer pane, and "children". Credentials are
+    withheld: a password or API-key entry, or any text containing a
+    password, token, signed URL or key, shows "redacted": true without that
+    text. Dialogs such as Settings are never read.
 
-    Returns {"workspace": str}. Errors: -32602 (unknown name), -32000 (no volume
-    package loaded).
+    Returns {"root", "tree", "nodeCount", "truncated" (more than 4000 nodes),
+    "docks", "workspace"}. Errors: -32602 (malformed root), -32007 (no such
+    dock or workspace, or nothing has focus).
     """
-    return await _call("workspace.switch", {"name": name})
+    return await _call(
+        "ui.inspect",
+        {"root": root, "depth": depth, "includeHidden": include_hidden},
+    )
+
+
+@mcp.tool()
+async def vc3d_switch_workspace(
+    name: Literal[
+        "main",
+        "lasagna",
+        "atlas",
+        "fiber-slice",
+        "intersections",
+        "spiral",
+        "fiber-map",
+        "fiber_slice",
+    ],
+    observe: ObserveMode = "none",
+) -> dict[str, Any]:
+    """Switch VC3D's active workspace tab, exactly as clicking the tab does.
+    Requires a volume package to be open.
+
+    name: a workspace id, in tab order: "main" (segmentation and navigation;
+    v1-v4 live here), "lasagna", "atlas", "fiber-slice", "intersections",
+    "spiral", "fiber-map". "fiber_slice" is the older spelling of
+    "fiber-slice" and is still accepted.
+
+    Viewers from every workspace (including Spiral's own panes) appear in
+    vc3d_get_state's viewers list with a "workspace" field and a "visible"
+    flag; vc3d_get_state's "workspace" field names the current tab and the
+    available ids. Spiral's panes reuse the main slot names ("segmentation",
+    "xy plane", ...), which keep meaning the main panes, so target Spiral's
+    by "viewerId". A viewer in a hidden tab can still receive input, but
+    vc3d_screenshot needs it visible, so switch here first.
+
+    The tab is real Qt UI state that persists across restarts: a freshly
+    launched VC3D can open on a leftover tab from a prior session. There is no
+    automatic return; switch back to "main" yourself.
+
+    observe: "none" (default) returns the plain result. "state" adds an
+    "observation" with a JSON Patch "stateDiff" of vc3d_get_state from just
+    before to just after the switch, the "revision", and the "changed"
+    fields. For a picture, call vc3d_observe next.
+
+    Returns {"workspace": id, "previous": id or null}. Errors: -32602 (unknown
+    name), -32000 (no volume package loaded), -32007 (that workspace is not
+    present in this build).
+    """
+    return await _observed_call("workspace.switch", {"name": name}, observe)
+
+
+@mcp.tool()
+async def vc3d_observe(
+    mode: Literal["state", "screenshot", "both"] = "both",
+    target: str = "window",
+) -> Any:
+    """Look at VC3D now: what changed since your last observation, and what it
+    looks like. Use it after any tool without an observe option, or to notice
+    what a person did in the GUI.
+
+    mode: "state" returns an "observation" with "stateDiff" (JSON Patch
+    operations on vc3d_get_state since the previous observation from this MCP
+    server; the first one returns "baseline": true instead), the current
+    "revision", and "changed" (field names from VC3D's state.changed
+    notifications since the last observation: project, volume,
+    activeSegment, editing, viewers, workspace, overlay, jobs). "screenshot"
+    adds an image of target; "both" does both.
+    target: "window" or anything vc3d_screenshot accepts as a target.
+
+    The interaction tools (vc3d_click, vc3d_shift_click, vc3d_drag, vc3d_key,
+    vc3d_wheel, vc3d_center_viewer, vc3d_zoom_viewer, vc3d_rotate_viewer,
+    vc3d_switch_workspace) take observe="state" to diff the state around a
+    single call; call this tool after one of them for its picture.
+
+    Returns {"observation": {...}} or [that, image]. A failed capture is
+    reported as observation.screenshotError rather than an error.
+    """
+    observation, image = await _observation(mode, core._last_observed_state, target)
+    out = {"observation": observation}
+    return [out, image] if image is not None else out

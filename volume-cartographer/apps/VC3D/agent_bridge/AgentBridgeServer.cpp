@@ -101,17 +101,14 @@ AgentBridgeServer::AgentBridgeServer(CWindow* window, QObject* parent)
     : QObject(parent), _window(window)
 {
     registerHandlers();
-    seedViewerRegistry();
-
-    if (_window && _window->_viewerManager) {
-        ViewerManager* vm = _window->_viewerManager.get();
-        connect(vm, &ViewerManager::baseViewerCreated,
-                this, [this](VolumeViewerBase* v) { registerViewer(v); });
-        connect(vm, &ViewerManager::baseViewerClosing,
-                this, [this](VolumeViewerBase* v) { unregisterViewer(v); });
-    }
+    syncViewerManagers();
 
     subscribeJobSignals();
+
+    // Prime the observed fingerprints, then follow the application's change
+    // signals.
+    refreshObservedStateNow();
+    connectStateSignals();
 }
 
 
@@ -120,6 +117,7 @@ AgentBridgeServer::~AgentBridgeServer()
     // Clean-shutdown removal of the discovery registry file. A hard kill skips
     // this; the reader-side stale-PID check reaps the orphan instead.
     removeRegistryFile();
+    delete _keyboardModifierSink.data();
 }
 
 
@@ -248,45 +246,140 @@ void AgentBridgeServer::onNewConnection()
 }
 
 
+// Marks the bridge busy while a request or queued work runs; leaving the
+// outermost scope schedules what waited (runWhenIdle below).
+class AgentBridgeServer::BusyScope
+{
+public:
+    explicit BusyScope(AgentBridgeServer* server) : _server(server) { ++_server->_busyDepth; }
+    ~BusyScope()
+    {
+        if (--_server->_busyDepth == 0 &&
+            (_server->_requestsPending || !_server->_idleWork.empty()))
+            _server->scheduleIdleWork();
+    }
+    BusyScope(const BusyScope&) = delete;
+    BusyScope& operator=(const BusyScope&) = delete;
+
+private:
+    AgentBridgeServer* _server;
+};
+
+
 void AgentBridgeServer::onSocketReadyRead()
 {
     auto* socket = qobject_cast<QLocalSocket*>(sender());
     if (!socket)
         return;
+    const auto buffer = _buffers.find(socket);
+    if (buffer == _buffers.end())
+        return;
+    buffer->append(socket->readAll());
+    if (_busyDepth > 0) {
+        // A request is still being handled (its handler is running a nested
+        // event loop); these lines are dispatched after it, in frame order.
+        _requestsPending = true;
+        return;
+    }
+    processBufferedLines(socket);
+}
 
-    QByteArray& buffer = _buffers[socket];
-    buffer.append(socket->readAll());
 
-    int newlineIdx;
-    while ((newlineIdx = buffer.indexOf('\n')) != -1) {
-        QByteArray line = buffer.left(newlineIdx);
-        buffer.remove(0, newlineIdx + 1);
+void AgentBridgeServer::processBufferedLines(QLocalSocket* socket)
+{
+    const QPointer<QLocalSocket> alive(socket);
+    while (alive) {
+        // Look the buffer up again for every line: handling a request runs
+        // application code that may connect or disconnect clients, which
+        // changes _buffers.
+        const auto buffer = _buffers.find(socket);
+        if (buffer == _buffers.end())
+            return;
+        const int newlineIdx = buffer->indexOf('\n');
+        if (newlineIdx < 0) {
+            // Bound the unterminated remainder: an oversized request that never
+            // sends a newline must not grow memory without limit. Any residual
+            // over the bound is a partial oversized line -- report it
+            // best-effort and drop only this client.
+            if (buffer->size() > kMaxLineBytes)
+                dropOversizedClient(socket);
+            return;
+        }
+        QByteArray line = buffer->left(newlineIdx);
+        buffer->remove(0, newlineIdx + 1);
         if (line.endsWith('\r'))
             line.chop(1);
         // Reject a complete line whose own length exceeds the limit.
         if (line.size() > kMaxLineBytes) {
-            sendError(socket, QJsonValue(QJsonValue::Null), -32600,
-                      QStringLiteral("Invalid Request: request exceeds %1-byte limit")
-                          .arg(kMaxLineBytes));
-            _buffers.remove(socket);  // `buffer` dangles after this; do not touch it
-            socket->disconnectFromServer();
+            dropOversizedClient(socket);
             return;
         }
         if (line.trimmed().isEmpty())
             continue;
+        BusyScope busy(this);
         processLine(socket, line);
     }
+}
 
-    // Bound the unterminated remainder: an oversized request that never sends a
-    // newline must not grow memory without limit. Any residual over the bound is
-    // a partial oversized line -- report it best-effort and drop only this client.
-    if (buffer.size() > kMaxLineBytes) {
-        sendError(socket, QJsonValue(QJsonValue::Null), -32600,
-                  QStringLiteral("Invalid Request: request exceeds %1-byte limit")
-                      .arg(kMaxLineBytes));
-        _buffers.remove(socket);  // `buffer` dangles after this; do not touch it
-        socket->disconnectFromServer();
+
+void AgentBridgeServer::dropOversizedClient(QLocalSocket* socket)
+{
+    sendError(socket, QJsonValue(QJsonValue::Null), -32600,
+              QStringLiteral("Invalid Request: request exceeds %1-byte limit")
+                  .arg(kMaxLineBytes));
+    _buffers.remove(socket);
+    socket->disconnectFromServer();
+}
+
+
+// ---------------------------------------------------------------------------
+// Re-entry. A handler may run a nested event loop (a dialog that a
+// synthesized key opens); requests, timers and state checks that arrive
+// meanwhile wait until the bridge is idle again.
+// ---------------------------------------------------------------------------
+
+void AgentBridgeServer::runWhenIdle(std::function<void()> work)
+{
+    _idleWork.push_back(std::move(work));
+    scheduleIdleWork();
+}
+
+
+void AgentBridgeServer::scheduleIdleWork()
+{
+    if (_idleWorkScheduled)
         return;
+    _idleWorkScheduled = true;
+    QTimer::singleShot(0, this, [this]() { runIdleWork(); });
+}
+
+
+void AgentBridgeServer::runIdleWork()
+{
+    _idleWorkScheduled = false;
+    if (_busyDepth > 0)
+        return;  // the outermost BusyScope schedules it again
+    std::vector<std::function<void()>> work;
+    work.swap(_idleWork);
+    for (const auto& job : work) {
+        BusyScope busy(this);
+        try {
+            job();
+        } catch (const std::exception& e) {
+            qWarning("agent bridge: queued work failed: %s", e.what());
+        } catch (...) {
+            qWarning("agent bridge: queued work failed");
+        }
+    }
+    if (!_requestsPending)
+        return;
+    _requestsPending = false;
+    std::vector<QPointer<QLocalSocket>> sockets;
+    for (auto it = _buffers.keyBegin(); it != _buffers.keyEnd(); ++it)
+        sockets.emplace_back(*it);
+    for (const QPointer<QLocalSocket>& socket : sockets) {
+        if (socket && _busyDepth == 0)
+            processBufferedLines(socket.data());
     }
 }
 
@@ -297,6 +390,7 @@ void AgentBridgeServer::onSocketDisconnected()
     if (!socket)
         return;
     _buffers.remove(socket);
+    releaseHeldKeys(socket);
 
     // Drop any deferred responses still pending for this connection so their
     // timers do not fire against a dead socket and the (connection, method)
@@ -378,6 +472,8 @@ void AgentBridgeServer::dispatch(QLocalSocket* socket, const QJsonObject& reques
         return;
     }
 
+    syncViewerManagers();
+
     ScopedLineAnnotationDialogSuppression suppressLineAnnotationDialogs(
         _window && _window->_lineAnnotationController
             ? _window->_lineAnnotationController.get()
@@ -401,11 +497,13 @@ void AgentBridgeServer::dispatch(QLocalSocket* socket, const QJsonObject& reques
         _currentSocket = nullptr;
         _currentRequestId = QJsonValue();
         _currentMethod.clear();
+        queueStateRefresh();
         return;
     } catch (const AgentBridgeError& e) {
         _currentSocket = nullptr;
         _currentRequestId = QJsonValue();
         _currentMethod.clear();
+        refreshObservedStateNow();
         if (!isNotification)
             sendError(socket, id, e.code, e.message, e.data);
         return;
@@ -413,6 +511,7 @@ void AgentBridgeServer::dispatch(QLocalSocket* socket, const QJsonObject& reques
         _currentSocket = nullptr;
         _currentRequestId = QJsonValue();
         _currentMethod.clear();
+        refreshObservedStateNow();
         if (!isNotification) {
             QJsonObject data;
             data["detail"] = QString::fromUtf8(e.what());
@@ -423,6 +522,7 @@ void AgentBridgeServer::dispatch(QLocalSocket* socket, const QJsonObject& reques
         _currentSocket = nullptr;
         _currentRequestId = QJsonValue();
         _currentMethod.clear();
+        refreshObservedStateNow();
         if (!isNotification)
             sendError(socket, id, -32010, "Internal error");
         return;
@@ -432,6 +532,11 @@ void AgentBridgeServer::dispatch(QLocalSocket* socket, const QJsonObject& reques
     _currentRequestId = QJsonValue();
     _currentMethod.clear();
 
+    // A request's state.changed goes out before its response, so a client
+    // that has the response has also seen the change it caused. state.get
+    // has already checked against the snapshot it returns.
+    if (method != QLatin1String("state.get"))
+        refreshObservedStateNow();
     if (!isNotification)
         sendResponse(socket, id, result);
 }
@@ -482,8 +587,15 @@ void AgentBridgeServer::broadcastNotification(const QString& method, const QJson
     message["jsonrpc"] = "2.0";
     message["method"] = method;
     message["params"] = params;
-    for (auto it = _buffers.begin(); it != _buffers.end(); ++it)
-        writeMessage(it.key(), message);
+    // A write to a peer that has gone away can emit disconnected at once,
+    // which removes that socket from _buffers, so iterate over a copy.
+    std::vector<QPointer<QLocalSocket>> sockets;
+    for (auto it = _buffers.keyBegin(); it != _buffers.keyEnd(); ++it)
+        sockets.emplace_back(*it);
+    for (const QPointer<QLocalSocket>& socket : sockets) {
+        if (socket)
+            writeMessage(socket.data(), message);
+    }
 }
 
 
@@ -501,16 +613,42 @@ void AgentBridgeServer::broadcastNotification(const QString& method, const QJson
 // Viewer registry
 // ---------------------------------------------------------------------------
 
-void AgentBridgeServer::seedViewerRegistry()
+void AgentBridgeServer::syncViewerManagers()
 {
-    if (!_window || !_window->_viewerManager)
-        return;
-    for (VolumeViewerBase* v : _window->_viewerManager->baseViewers())
-        registerViewer(v);
+    std::erase_if(_viewers, [](const ViewerEntry& e) { return e.object.isNull(); });
+    std::erase_if(_viewerManagers,
+                  [](const QPointer<ViewerManager>& m) { return m.isNull(); });
+
+    // Construction order puts the main workspace's manager first, so its
+    // viewers keep the lowest ids.
+    for (ViewerManager* manager : ViewerManager::allManagers()) {
+        if (!manager)
+            continue;
+        const bool known = std::any_of(
+            _viewerManagers.begin(), _viewerManagers.end(),
+            [manager](const QPointer<ViewerManager>& m) { return m.data() == manager; });
+        if (known)
+            continue;
+        _viewerManagers.emplace_back(manager);
+        const bool primary =
+            _window && _window->_viewerManager && manager == _window->_viewerManager.get();
+        connect(manager, &ViewerManager::baseViewerCreated,
+                this, [this, primary](VolumeViewerBase* v) {
+                    registerViewer(v, primary);
+                    queueStateRefresh();
+                });
+        connect(manager, &ViewerManager::baseViewerClosing,
+                this, [this](VolumeViewerBase* v) {
+                    unregisterViewer(v);
+                    queueStateRefresh();
+                });
+        for (VolumeViewerBase* v : manager->baseViewers())
+            registerViewer(v, primary);
+    }
 }
 
 
-void AgentBridgeServer::registerViewer(VolumeViewerBase* viewer)
+void AgentBridgeServer::registerViewer(VolumeViewerBase* viewer, bool primary)
 {
     if (!viewer)
         return;
@@ -518,7 +656,8 @@ void AgentBridgeServer::registerViewer(VolumeViewerBase* viewer)
         if (e.viewer == viewer)
             return; // already registered
     }
-    _viewers.push_back({QStringLiteral("v%1").arg(_nextViewerNum++), viewer});
+    _viewers.push_back({QStringLiteral("v%1").arg(_nextViewerNum++), viewer,
+                        QPointer<QObject>(viewer->asQObject()), primary});
 }
 
 
@@ -572,15 +711,22 @@ VolumeViewerBase* AgentBridgeServer::resolveViewer(const QJsonValue& ref,
 
     // Rule 1: exact registry id.
     for (const ViewerEntry& e : _viewers) {
-        if (e.id == key)
+        if (e.object && e.id == key)
             return e.viewer;
     }
 
-    // Rule 2: match against surface-slot name.
+    // Rule 2: match against surface-slot name, first among CWindow's own
+    // viewers, then among other workspaces' viewers (Spiral reuses the main
+    // slot names, so its panes are reached by id unless a name is theirs alone).
     std::vector<const ViewerEntry*> matches;
-    for (const ViewerEntry& e : _viewers) {
-        if (QString::fromStdString(e.viewer->surfName()) == key)
-            matches.push_back(&e);
+    for (const bool primary : {true, false}) {
+        for (const ViewerEntry& e : _viewers) {
+            if (e.object && e.primary == primary &&
+                QString::fromStdString(e.viewer->surfName()) == key)
+                matches.push_back(&e);
+        }
+        if (!matches.empty())
+            break;
     }
 
     if (matches.size() == 1)
@@ -701,6 +847,10 @@ void AgentBridgeServer::registerHandlers()
     registerFlattenHandlers();
 
     registerSurfaceOpsHandlers();
+    registerSegmentOpsHandlers();
+    registerProjectHandlers();
+    registerViewerDisplayHandlers();
+    registerEditSettingsHandlers();
 }
 
 
@@ -755,6 +905,7 @@ void AgentBridgeServer::completeDeferredResult(int token, const QJsonObject& res
         pd.timer->stop();
         pd.timer->deleteLater();
     }
+    refreshObservedStateNow();
     if (!pd.id.isUndefined() &&
         pd.socket && pd.socket->state() == QLocalSocket::ConnectedState) {
         sendResponse(pd.socket.data(), pd.id, result);
@@ -774,6 +925,7 @@ void AgentBridgeServer::completeDeferredError(int token, int code, const QString
         pd.timer->stop();
         pd.timer->deleteLater();
     }
+    refreshObservedStateNow();
     if (!pd.id.isUndefined() &&
         pd.socket && pd.socket->state() == QLocalSocket::ConnectedState) {
         sendError(pd.socket.data(), pd.id, code, message, data);

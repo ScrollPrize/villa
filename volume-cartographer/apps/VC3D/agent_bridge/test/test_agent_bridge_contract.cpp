@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <limits>
 #include <string>
+#include <utility>
 
 #include <QJsonArray>
 #include <QJsonObject>
@@ -12,8 +13,12 @@
 #include <opencv2/core.hpp>
 
 #include "agent_bridge/AgentBridgeCommandError.hpp"
+#include "agent_bridge/AgentBridgeEditSettings.hpp"
+#include "agent_bridge/AgentBridgeInput.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
 #include "agent_bridge/AgentBridgeMethod.hpp"
+#include "agent_bridge/AgentBridgeObservation.hpp"
+#include "agent_bridge/AgentBridgeUi.hpp"
 
 namespace {
 
@@ -315,6 +320,205 @@ int main()
     const auto busyError = mapLaunchError(CommandLaunchError::Busy);
     CHECK(busyError.code == -32004);
     CHECK(busyError.data.value("source").toString() == QLatin1String("tool"));
+
+    // --- Keyboard input: key spelling, event text, modifier key order ---
+    {
+        const AgentBridgeKeySpec e = parseAgentBridgeKey(QStringLiteral("e"), Qt::NoModifier);
+        CHECK(e.key == Qt::Key_E);
+        CHECK(e.modifiers == Qt::NoModifier);
+        CHECK(e.text == QLatin1String("e"));
+        CHECK(e.name == QLatin1String("E"));
+
+        const AgentBridgeKeySpec shiftE =
+            parseAgentBridgeKey(QStringLiteral("E"), Qt::ShiftModifier);
+        CHECK(shiftE.text == QLatin1String("E"));
+
+        const AgentBridgeKeySpec undo =
+            parseAgentBridgeKey(QStringLiteral("ctrl+z"), Qt::NoModifier);
+        CHECK(undo.key == Qt::Key_Z);
+        CHECK(undo.modifiers == Qt::ControlModifier);
+        CHECK(undo.text.isEmpty());
+        CHECK(undo.name == QLatin1String("Z"));
+
+        // Spelled and array modifiers merge.
+        const AgentBridgeKeySpec merged =
+            parseAgentBridgeKey(QStringLiteral("Ctrl+G"), Qt::ShiftModifier);
+        CHECK(merged.modifiers == (Qt::ControlModifier | Qt::ShiftModifier));
+
+        CHECK(parseAgentBridgeKey(QStringLiteral("Esc"), Qt::NoModifier).key == Qt::Key_Escape);
+        CHECK(parseAgentBridgeKey(QStringLiteral("Space"), Qt::NoModifier).text ==
+              QLatin1String(" "));
+        CHECK(parseAgentBridgeKey(QStringLiteral("%"), Qt::NoModifier).text ==
+              QLatin1String("%"));
+        CHECK(parseAgentBridgeKey(QStringLiteral("F5"), Qt::NoModifier).text.isEmpty());
+        CHECK(parseAgentBridgeKey(QStringLiteral("Shift"), Qt::NoModifier).key == Qt::Key_Shift);
+        CHECK(parseAgentBridgeKey(QStringLiteral("Ctrl"), Qt::NoModifier).key == Qt::Key_Control);
+        CHECK(parseAgentBridgeKey(QStringLiteral("ctrl"), Qt::NoModifier).key == Qt::Key_Control);
+    }
+    expectParamError("key<-empty", "key",
+        [&] { parseAgentBridgeKey(QString(), Qt::NoModifier); });
+    expectParamError("key<-sequence", "key",
+        [&] { parseAgentBridgeKey(QStringLiteral("A,B"), Qt::NoModifier); });
+    expectParamError("key<-unknown", "key",
+        [&] { parseAgentBridgeKey(QStringLiteral("NotAKey"), Qt::NoModifier); });
+    expectParamError("key<-dangling-modifier", "key",
+        [&] { parseAgentBridgeKey(QStringLiteral("Shift+"), Qt::NoModifier); });
+    {
+        const auto keys = agentBridgeModifierKeys(
+            Qt::MetaModifier | Qt::ShiftModifier | Qt::ControlModifier | Qt::KeypadModifier,
+            Qt::Key_A);
+        CHECK(keys.size() == 3);
+        CHECK(keys.size() == 3 && keys[0].first == Qt::Key_Shift);
+        CHECK(keys.size() == 3 && keys[1].first == Qt::Key_Control);
+        CHECK(keys.size() == 3 && keys[2].first == Qt::Key_Meta);
+        // A bare modifier key is not pressed twice.
+        CHECK(agentBridgeModifierKeys(Qt::ShiftModifier, Qt::Key_Shift).empty());
+        // A held key keeps its modifiers down, and a held modifier key its own.
+        CHECK(agentBridgeHeldModifiers(Qt::Key_Z, Qt::ControlModifier) == Qt::ControlModifier);
+        CHECK(agentBridgeHeldModifiers(Qt::Key_Shift, Qt::NoModifier) == Qt::ShiftModifier);
+        CHECK(agentBridgeHeldModifiers(Qt::Key_Control, Qt::ShiftModifier) ==
+              (Qt::ShiftModifier | Qt::ControlModifier));
+        CHECK(agentBridgeHeldModifiers(Qt::Key_A, Qt::NoModifier) == Qt::NoModifier);
+        const QJsonArray mods{QStringLiteral("shift"), QStringLiteral("keypad")};
+        CHECK(jsonToModifiers(mods) == (Qt::ShiftModifier | Qt::KeypadModifier));
+        CHECK(modifiersToJson(jsonToModifiers(mods)) == mods);
+        CHECK(jsonToModifiers(QJsonValue(QJsonValue::Null)) == Qt::NoModifier);
+    }
+
+    // --- state.changed revisions ---
+    {
+        AgentBridgeStateTracker tracker;
+        QHash<QString, QByteArray> fields{
+            {QStringLiteral("workspace"), QByteArray("main")},
+            {QStringLiteral("volume"), QByteArray("v1")},
+        };
+        CHECK(!tracker.update(fields));  // priming reports nothing
+        CHECK(tracker.revision() == 0);
+        CHECK(!tracker.update(fields));
+        CHECK(tracker.revision() == 0);
+        CHECK(tracker.takePending().isEmpty());
+
+        fields[QStringLiteral("workspace")] = QByteArray("spiral");
+        fields[QStringLiteral("volume")] = QByteArray("v2");
+        CHECK(tracker.update(fields));
+        CHECK(tracker.revision() == 1);  // one bump per refresh
+
+        fields.remove(QStringLiteral("volume"));
+        fields[QStringLiteral("jobs")] = QByteArray("job-1:running");
+        CHECK(tracker.update(fields));
+        CHECK(tracker.revision() == 2);
+        // Pending fields accumulate until taken, sorted.
+        CHECK(tracker.takePending() ==
+              QStringList({QStringLiteral("jobs"), QStringLiteral("volume"),
+                           QStringLiteral("workspace")}));
+        CHECK(tracker.takePending().isEmpty());
+        CHECK(agentBridgeObservedFields().size() == 8);
+        CHECK(agentBridgeObservedFields().contains(QStringLiteral("overlay")));
+    }
+
+    // Workspace ids: tab order, and the legacy workspace.switch spelling.
+    CHECK(agentBridgeWorkspaceIds().size() == 7);
+    CHECK(agentBridgeWorkspaceIds().front() == QLatin1String("main"));
+    CHECK(agentBridgeWorkspaceIds().contains(QStringLiteral("fiber-map")));
+    CHECK(canonicalWorkspaceId(QStringLiteral("fiber_slice")) ==
+          QLatin1String("fiber-slice"));
+    CHECK(canonicalWorkspaceId(QStringLiteral("spiral")) == QLatin1String("spiral"));
+    CHECK(!agentBridgeWorkspaceIds().contains(QStringLiteral("fiber_slice")));
+
+    // ui.inspect redaction: credential labels, matched as whole words.
+    for (const char* label : {"Password", "API key", "apiKeyEdit", "AWSSecretKey",
+                              "aws_secret_access_key", "Access token", "Auth:",
+                              "Private key file", "Bearer", "session cookie"}) {
+        CHECK(agentBridgeCredentialLabel(QString::fromLatin1(label)));
+    }
+    for (const char* label : {"", "Steps", "Draws", "Checkpoint", "Python executable",
+                              "Endpoint", "SSH host", "Author", "Keyboard", "Monkey"}) {
+        CHECK(!agentBridgeCredentialLabel(QString::fromLatin1(label)));
+    }
+    // ...and credential-shaped content anywhere.
+    for (const char* text : {"http://user:pw@gpu-host:8765",
+                             "https://b.s3.amazonaws.com/a.zarr?X-Amz-Signature=ab12",
+                             "https://host/api?token=abc", "key AKIAABCDEFGHIJKLMNOP",
+                             "Authorization: Bearer abcdefgh12345678",
+                             "-----BEGIN OPENSSH PRIVATE KEY-----"}) {
+        CHECK(agentBridgeCredentialContent(QString::fromLatin1(text)));
+    }
+    for (const char* text : {"", "http://gpu-host:8765", "/models/checkpoint.pt",
+                             "https://dl.ash2txt.org/full-scrolls/PHerc0332.volpkg",
+                             "s3://bucket/path?versionId=3", "akiaabcdefghijklmnop"}) {
+        CHECK(!agentBridgeCredentialContent(QString::fromLatin1(text)));
+    }
+    {
+        QString kind;
+        QString name;
+        CHECK(splitAgentBridgeTarget(QStringLiteral("dock:dockWidgetVolumes"), &kind, &name));
+        CHECK(kind == QLatin1String("dock") && name == QLatin1String("dockWidgetVolumes"));
+        CHECK(splitAgentBridgeTarget(QStringLiteral("workspace:fiber-map"), &kind, &name));
+        CHECK(kind == QLatin1String("workspace") && name == QLatin1String("fiber-map"));
+        CHECK(!splitAgentBridgeTarget(QStringLiteral("dock:"), &kind, &name));
+        CHECK(!splitAgentBridgeTarget(QStringLiteral("window"), &kind, &name));
+        CHECK(!splitAgentBridgeTarget(QStringLiteral("v1"), &kind, &name));
+    }
+
+    // screenshot.capture regions clip to the target without overflow.
+    {
+        const QSize target(100, 50);
+        CHECK(agentBridgeCaptureArea(10, 5, 20, 10, target) == QRect(10, 5, 20, 10));
+        CHECK(agentBridgeCaptureArea(90, 40, 50, 50, target) == QRect(90, 40, 10, 10));
+        CHECK(agentBridgeCaptureArea(0, 0, std::numeric_limits<int>::max(),
+                                     std::numeric_limits<int>::max(), target) ==
+              QRect(0, 0, 100, 50));
+        CHECK(agentBridgeCaptureArea(100, 0, 5, 5, target).isEmpty());
+        CHECK(agentBridgeCaptureArea(std::numeric_limits<int>::max(), 0, 5, 5, target).isEmpty());
+        CHECK(agentBridgeCaptureArea(0, 0, 0, 5, target).isEmpty());
+    }
+
+    // segmentation.set_settings zRange: a bound left out keeps the panel's
+    // value, a request may not invert the range, and the panel's own bounds
+    // are taken back even when its spin boxes hold min above max.
+    {
+        using Bounds = std::pair<int, int>;
+        expectNoThrow("zRange-one-bound-min", [&] {
+            CHECK(agentBridgeZRangeUpdate(QJsonObject{{"enabled", false}, {"min", 3}}, 0, 10) ==
+                  Bounds(3, 10));
+        });
+        expectNoThrow("zRange-one-bound-max", [&] {
+            CHECK(agentBridgeZRangeUpdate(QJsonObject{{"enabled", false}, {"max", 3}}, 0, 0) ==
+                  Bounds(0, 3));
+        });
+        expectNoThrow("zRange-equal-bounds", [&] {
+            CHECK(agentBridgeZRangeUpdate(QJsonObject{{"min", 5}, {"max", 5}}, 0, 0) ==
+                  Bounds(5, 5));
+        });
+        expectNoThrow("zRange-enabled-only", [&] {
+            CHECK(agentBridgeZRangeUpdate(QJsonObject{{"enabled", true}}, 4, 9) == Bounds(4, 9));
+        });
+        // A fresh settings store starts at [0, 0], so min alone cannot rise.
+        expectParamError("zRange-one-bound-min-above-kept-max", "zRange", [&] {
+            agentBridgeZRangeUpdate(QJsonObject{{"enabled", false}, {"min", 3}}, 0, 0);
+        });
+        expectParamError("zRange-inverted", "zRange", [&] {
+            agentBridgeZRangeUpdate(QJsonObject{{"enabled", true}, {"min", 10}, {"max", 2}}, 0, 0);
+        });
+        // The panel holds [500, 0] after a user raises min first; get_settings
+        // reports that, and passing it back, or only toggling enabled, works.
+        expectNoThrow("zRange-panel-inverted-echo", [&] {
+            CHECK(agentBridgeZRangeUpdate(
+                      QJsonObject{{"enabled", true}, {"min", 500}, {"max", 0}}, 500, 0) ==
+                  Bounds(500, 0));
+        });
+        expectNoThrow("zRange-panel-inverted-enabled-only", [&] {
+            CHECK(agentBridgeZRangeUpdate(QJsonObject{{"enabled", false}}, 500, 0) ==
+                  Bounds(500, 0));
+        });
+        expectNoThrow("zRange-panel-inverted-repaired", [&] {
+            CHECK(agentBridgeZRangeUpdate(QJsonObject{{"enabled", true}, {"max", 1500}}, 500, 0) ==
+                  Bounds(500, 1500));
+        });
+        expectParamError("zRange-panel-inverted-changed", "zRange", [&] {
+            agentBridgeZRangeUpdate(QJsonObject{{"enabled", true}, {"min", 600}}, 500, 0);
+        });
+    }
 
     if (g_failures == 0) {
         std::printf("PASS: all %d checks in test_agent_bridge_contract\n", g_checks);

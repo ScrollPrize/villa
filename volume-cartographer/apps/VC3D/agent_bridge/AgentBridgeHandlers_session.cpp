@@ -1,14 +1,21 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
+#include "agent_bridge/AgentBridgeAccessible.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
+#include "agent_bridge/AgentBridgeUi.hpp"
 
 #include <QBuffer>
 #include <QByteArray>
 #include <QCoreApplication>
+#include <QDockWidget>
 #include <QImage>
 #include <QJsonArray>
+#include <QMainWindow>
 #include <QPixmap>
 #include <QPointF>
+#include <QPointer>
+#include <QRect>
 #include <QRegularExpression>
+#include <QTabWidget>
 #include <QWidget>
 
 #include <algorithm>
@@ -21,6 +28,7 @@
 #include <vector>
 
 #include "CWindow.hpp"
+#include "StatusDockPanelHost.hpp"
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
@@ -54,6 +62,16 @@ QJsonObject AgentBridgeServer::handlePing(const QJsonValue&)
 
 QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
 {
+    QJsonObject result = stateSnapshot();
+    // Refresh first so the revision matches the snapshot it is returned with.
+    refreshObservedState(result);
+    result["revision"] = static_cast<double>(_stateTracker.revision());
+    return result;
+}
+
+
+QJsonObject AgentBridgeServer::stateSnapshot()
+{
     QJsonObject result;
     CState* state = _window ? _window->_state : nullptr;
 
@@ -72,6 +90,8 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["sameWrapAnnotation"] = QJsonValue::Null;
         result["autosave"] = QJsonValue::Null;
         result["viewers"] = QJsonArray();
+        result["workspace"] = workspacesJson();
+        result["heldKeys"] = heldKeysJson();
         result["job"] = QJsonValue::Null;
         result["focusPoi"] = QJsonValue::Null;
         return result;
@@ -180,9 +200,11 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["sameWrapAnnotation"] = QJsonValue::Null;
     }
 
-    // viewers
+    // viewers, from every workspace's viewer manager
     QJsonArray viewers;
     for (const ViewerEntry& e : _viewers) {
+        if (!e.object)
+            continue;
         QJsonObject v;
         v["viewerId"] = e.id;
         v["surfName"] = QString::fromStdString(e.viewer->surfName());
@@ -190,9 +212,16 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         v["kind"] = (dynamic_cast<CChunkedVolumeViewer*>(e.viewer) != nullptr)
                         ? QStringLiteral("chunked") : QStringLiteral("other");
         v["scale"] = e.viewer->getCurrentScale();
+        const auto* widget = qobject_cast<const QWidget*>(e.object.data());
+        const QString workspace = workspaceIdFor(widget);
+        v["workspace"] = workspace.isEmpty() ? QJsonValue(QJsonValue::Null)
+                                             : QJsonValue(workspace);
+        v["visible"] = widget != nullptr && widget->isVisible();
         viewers.push_back(v);
     }
     result["viewers"] = viewers;
+    result["workspace"] = workspacesJson();
+    result["heldKeys"] = heldKeysJson();
 
     // "job" is the most recently started active job; "jobs" lists all of them.
     QJsonObject mostRecentActive;
@@ -873,15 +902,74 @@ QJsonObject AgentBridgeServer::handleSegmentsFetch(const QJsonValue& params)
 }
 
 
+namespace {
+
+// What screenshot.capture's reveal changed: the workspace tab it left, the
+// keyboard focus it may have moved, the docks it showed, the layout of each
+// main window that owns one of those docks, and the dock bar panel it opened
+// with the panel that was open before.
+struct RevealRecord {
+    bool tabSwitched = false;
+    QString previousWorkspace;
+    int previousIndex = -1;
+    QPointer<QWidget> previousFocus;
+    std::vector<QPointer<QDockWidget>> shownDocks;
+    std::vector<std::pair<QPointer<QMainWindow>, QByteArray>> layouts;
+    QPointer<StatusDockPanelHost> dockBar;
+    QPointer<QDockWidget> previousPanel;
+
+    bool changed() const { return tabSwitched || !shownDocks.empty() || !dockBar.isNull(); }
+
+    void showDock(QDockWidget* dock)
+    {
+        auto* owner = qobject_cast<QMainWindow*>(dock->parentWidget());
+        const bool saved = std::any_of(layouts.begin(), layouts.end(),
+                                       [owner](const auto& l) { return l.first == owner; });
+        if (owner && !saved)
+            layouts.emplace_back(owner, owner->saveState());
+        dock->show();
+        shownDocks.emplace_back(dock);
+    }
+};
+
+}  // namespace
+
+
 QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
 {
     const QJsonObject p = params.toObject();
     const QString target =
         p.value("target").toString(QStringLiteral("window"));
+    const bool reveal = p.value("reveal").toBool(false);
 
     QWidget* widget = nullptr;
+    // A dock kept in the bottom dock bar is captured through its panel page.
+    QDockWidget* barDock = nullptr;
+    QString kind;
+    QString name;
     if (target.isEmpty() || target == QLatin1String("window")) {
         widget = _window;
+    } else if (splitAgentBridgeTarget(target, &kind, &name)) {
+        if (kind == QLatin1String("dock")) {
+            QDockWidget* dock = findDock(name);
+            if (QWidget* page = dockBarPage(dock)) {
+                widget = page;
+                barDock = dock;
+            } else {
+                widget = dock;
+            }
+        } else {
+            widget = workspacePage(name);
+        }
+        if (!widget) {
+            QJsonObject data;
+            data["kind"] = kind;
+            data["id"] = name;
+            throw AgentBridgeError{-32007,
+                kind == QLatin1String("dock") ? QStringLiteral("Dock not found")
+                                              : QStringLiteral("Workspace not available"),
+                data};
+        }
     } else {
         VolumeViewerBase* viewer = resolveViewer(QJsonValue(target));
         widget = dynamic_cast<QWidget*>(viewer);
@@ -895,28 +983,133 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     if (!widget)
         throw AgentBridgeError{-32002, "No capture target available", {}};
 
-    if (!widget->isVisible()) {
-        QJsonObject data;
-        data["detail"] = "target widget is not currently visible (e.g. it's on a "
-                          "non-frontmost tab or a hidden pane) -- a grab() of a "
-                          "hidden widget returns a meaningless, often near-zero-size "
-                          "image; switch to it (e.g. via workspace.switch) before "
-                          "capturing";
-        throw AgentBridgeError{-32009, "Capture target not visible", data};
-    }
+    // reveal: switch to the target's workspace and show the docks around it
+    // for this capture only. Everything is put back by restoreReveal(), on
+    // success and on failure, outside any exception unwinding.
+    RevealRecord revealed;
+    QTabWidget* tabs = _window ? _window->_workspaceTabs : nullptr;
+    auto restoreReveal = [&]() {
+        if (revealed.dockBar) {
+            if (revealed.previousPanel)
+                revealed.dockBar->expandDock(revealed.previousPanel);
+            else
+                revealed.dockBar->collapsePanel();
+        }
+        for (auto it = revealed.shownDocks.rbegin(); it != revealed.shownDocks.rend(); ++it) {
+            if (*it)
+                (*it)->hide();
+        }
+        for (const auto& [owner, layout] : revealed.layouts) {
+            if (owner)
+                owner->restoreState(layout);
+        }
+        if (revealed.tabSwitched) {
+            if (!revealed.previousWorkspace.isEmpty())
+                setCurrentWorkspace(revealed.previousWorkspace);
+            else if (tabs && revealed.previousIndex >= 0 &&
+                     revealed.previousIndex < tabs->count())
+                tabs->setCurrentIndex(revealed.previousIndex);
+        }
+        if (revealed.changed() && revealed.previousFocus)
+            revealed.previousFocus->setFocus(Qt::OtherFocusReason);
+    };
 
-    QPixmap pixmap = widget->grab();
+    QPixmap pixmap;
+    QRect area;
+    int masked = 0;
+    try {
+        if (reveal && !widget->isVisible() && barDock) {
+            // A dock in the bottom dock bar: open its panel as its bar button
+            // does. Its QDockWidget is an empty shell, and showing and hiding
+            // that shell would take the dock off the bar.
+            StatusDockPanelHost* bar = _window->_statusDockPanelHost;
+            revealed.previousFocus = _window->focusWidget();
+            revealed.previousPanel = bar->expandedDock();
+            if (!bar->expandDock(barDock)) {
+                QJsonObject data;
+                data["detail"] = QStringLiteral(
+                    "the dock \"%1\" has been closed, so it has no button in the "
+                    "dock bar to open").arg(barDock->objectName());
+                throw AgentBridgeError{-32009, "Capture target not revealable", data};
+            }
+            revealed.dockBar = bar;
+            QCoreApplication::sendPostedEvents(nullptr, QEvent::LayoutRequest);
+        } else if (reveal && !widget->isVisible()) {
+            // Showing a hidden floating dock would open a window on the
+            // person's desktop; refuse before changing anything.
+            for (QWidget* w = widget; w && w != _window; w = w->parentWidget()) {
+                auto* dock = qobject_cast<QDockWidget*>(w);
+                if (dock && dock->isHidden() && dock->isFloating()) {
+                    QJsonObject data;
+                    data["detail"] = QStringLiteral(
+                        "the target is in the hidden floating dock \"%1\"; showing it "
+                        "would open a separate window").arg(dock->objectName());
+                    throw AgentBridgeError{-32009, "Capture target not revealable", data};
+                }
+            }
+            revealed.previousFocus = _window ? _window->focusWidget() : nullptr;
+            const QString workspace =
+                kind == QLatin1String("workspace") ? name : workspaceIdFor(widget);
+            if (!workspace.isEmpty() && workspace != currentWorkspaceId()) {
+                revealed.previousWorkspace = currentWorkspaceId();
+                revealed.previousIndex = tabs ? tabs->currentIndex() : -1;
+                revealed.tabSwitched = setCurrentWorkspace(workspace);
+            }
+            for (QWidget* w = widget; w && w != _window; w = w->parentWidget()) {
+                if (auto* dock = qobject_cast<QDockWidget*>(w); dock && dock->isHidden())
+                    revealed.showDock(dock);
+            }
+            // Apply the layouts the switch posted so the target has its real
+            // geometry; this delivers only pending layout requests.
+            QCoreApplication::sendPostedEvents(nullptr, QEvent::LayoutRequest);
+        }
 
-    static constexpr int kMinCaptureDim = 8;
-    if (pixmap.width() < kMinCaptureDim || pixmap.height() < kMinCaptureDim) {
-        QJsonObject data;
-        data["detail"] = QStringLiteral(
-                              "captured pixmap is degenerate (%1x%2) -- the target "
-                              "widget has not been laid out to a meaningful size")
-                              .arg(pixmap.width())
-                              .arg(pixmap.height());
-        throw AgentBridgeError{-32009, "Capture target has degenerate size", data};
+        if (!widget->isVisible()) {
+            QJsonObject data;
+            data["detail"] = "target widget is not currently visible (e.g. it's on a "
+                             "non-frontmost tab or a hidden pane) -- a grab() of a "
+                             "hidden widget returns a meaningless, often near-zero-size "
+                             "image; switch to it (e.g. via workspace.switch) or pass "
+                             "reveal:true before capturing";
+            throw AgentBridgeError{-32009, "Capture target not visible", data};
+        }
+
+        static constexpr int kMinCaptureDim = 8;
+        if (widget->width() < kMinCaptureDim || widget->height() < kMinCaptureDim) {
+            QJsonObject data;
+            data["detail"] = QStringLiteral(
+                                 "captured pixmap is degenerate (%1x%2) -- the target "
+                                 "widget has not been laid out to a meaningful size")
+                                 .arg(widget->width())
+                                 .arg(widget->height());
+            throw AgentBridgeError{-32009, "Capture target has degenerate size", data};
+        }
+
+        // region: a rectangle in the target's logical pixels, clipped to it.
+        area = widget->rect();
+        if (p.contains("region")) {
+            const QJsonObject r = p.value("region").toObject();
+            area = agentBridgeCaptureArea(r.value("x").toInt(), r.value("y").toInt(),
+                                          r.value("width").toInt(), r.value("height").toInt(),
+                                          widget->size());
+            if (area.isEmpty()) {
+                QJsonObject data;
+                data["param"] = "region";
+                data["detail"] = QStringLiteral("region lies outside the %1x%2 target")
+                                     .arg(widget->width())
+                                     .arg(widget->height());
+                throw AgentBridgeError{-32602, "region is outside the target", data};
+            }
+        }
+
+        pixmap = widget->grab(area);
+        // Withhold what ui.inspect withholds.
+        masked = agentBridgeMaskSecrets(pixmap, widget, area);
+    } catch (...) {
+        restoreReveal();
+        throw;
     }
+    restoreReveal();
 
     if (p.contains("maxDim")) {
         const int maxDim = p.value("maxDim").toInt();
@@ -934,6 +1127,16 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     result["width"] = image.width();
     result["height"] = image.height();
     result["format"] = "png";
+    result["revealed"] = revealed.changed();
+    result["masked"] = masked;
+    if (p.contains("region")) {
+        QJsonObject region;
+        region["x"] = area.x();
+        region["y"] = area.y();
+        region["width"] = area.width();
+        region["height"] = area.height();
+        result["region"] = region;
+    }
 
     const QString filePath = p.value("filePath").toString();
     if (!filePath.isEmpty()) {
@@ -966,12 +1169,7 @@ QJsonObject AgentBridgeServer::handleCursorVolumePoint(const QJsonValue& params)
     const QJsonObject p = params.toObject();
 
     VolumeViewerBase* viewer = resolveViewer(p.value("viewer"));
-    auto* chunked = dynamic_cast<CChunkedVolumeViewer*>(viewer);
-    if (!chunked) {
-        QJsonObject data;
-        data["detail"] = "viewer is not a chunked volume viewer";
-        throw AgentBridgeError{-32009, "Unsupported viewer for canvas operation", data};
-    }
+    CChunkedVolumeViewer* chunked = requireChunkedViewer(viewer);
 
     if (!chunked->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};

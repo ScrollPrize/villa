@@ -33,11 +33,32 @@ public:
     ~FiberCollectionController() override;
     QDockWidget* dock() const { return dock_; }
     void setLineAnnotationActive(bool active);
-    void openCollection(const QString& path, bool persist = true, const std::string& expectedUuid = {});
+    // Why openCollection would refuse to open a file now.
+    enum class OpenRefusal { None, NoVolume, NoCoordinateIdentity };
+    OpenRefusal openRefusal() const;
+    // Opens `path`, closing any open collection, and returns an id that the
+    // collectionOpened signal for this open carries.
+    quint64 openCollection(const QString& path, bool persist = true, const std::string& expectedUuid = {});
+    // Closes the open collection and removes the project's attachment record;
+    // the .afv file is kept. Returns false when none was open or attached.
+    bool detachCollection();
+    // Absolute path of the open collection; empty when none is open.
+    QString collectionPath() const { return enabled_ ? path_ : QString(); }
+    // Writes the project's attachment record for the open collection beside
+    // the current project file. Returns false when none is open or the record
+    // cannot be written.
+    bool saveAttachmentRecord();
     // Selects the trace under a plain left click that no native tool, collection
     // point or fiber annotation used. Returns true if a trace was selected.
     bool handleVolumeClick(Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void detachViewer(VolumeViewerBase* viewer) override;
+signals:
+    // Emitted once per openCollection, with the id it returned: after a
+    // refused precondition, a failed validation, a superseding open or close,
+    // or a successful open. `attachmentSaved` is true when the open stored
+    // the project's attachment record.
+    void collectionOpened(quint64 openId, const QString& path, bool success,
+                          const QString& message, bool attachmentSaved);
 protected:
     bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
     bool needsOverlayRebuild(VolumeViewerBase* viewer) const override;

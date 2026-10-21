@@ -52,6 +52,7 @@ public:
         Window window;
         int maxDisplayedResolution{0};
         OverlayCompositeSettings composite;
+        vc::Sampling samplingMethod{vc::Sampling::Nearest};
     };
 
     struct Update {
@@ -63,6 +64,8 @@ public:
         std::optional<Window> window;
         std::optional<int> maxDisplayedResolution;
         std::optional<OverlayCompositeSettings> composite;
+        // Nearest or Trilinear; other methods fall back to Nearest.
+        std::optional<vc::Sampling> samplingMethod;
     };
 
     enum class ApplyResult {

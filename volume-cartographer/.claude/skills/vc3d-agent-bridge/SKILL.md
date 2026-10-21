@@ -68,7 +68,15 @@ it takes a few seconds.
 `vc3d_push_pull_start` acts at the last recorded pointer position, not a
 position you pass it. Use `vc3d_drag` with `button="none"` to hover-position
 the cursor first (no press/release, just interpolated move events), then
-call `vc3d_push_pull_start`, wait, then `vc3d_push_pull_stop`.
+call `vc3d_push_pull_start`, wait, then `vc3d_push_pull_stop`. The same rule
+applies to keyboard holds: hover first, then `vc3d_key(key="A", hold_ms=...)`.
+A `vc3d_key(action="press")` stays down until a matching `action="release"`
+or until its `hold_ms` (10 s by default) runs out, and keys are also released
+if the MCP connection drops; `vc3d_get_state` lists held keys in `heldKeys`.
+A key that opens a dialog or menu has it answered as Escape would (listed in
+`dismissed`), and so is any dialog a person at the window opens during that
+call. Keys and wheel turns need a visible viewer: switch to its workspace
+first. Prefer the typed tool whenever one exists.
 
 ## 7. Fiber tracing (`vc3d_fiber_launch` + a fiber workspace pane)
 
@@ -97,7 +105,10 @@ workspace pane while the main tab is active, or vice versa), `vc3d_screenshot`
 now fails `-32009` instead of silently returning a near-zero-size image — this
 used to return a genuinely degenerate (e.g. 15×50px) but "successful" PNG,
 which cost real debugging time before anyone noticed. If you hit this, switch
-to the right tab/workspace (or activate that pane) before capturing.
+to the right tab/workspace (or activate that pane) before capturing, or pass
+`reveal=True` to switch and show it for that one capture and put the GUI back
+afterwards. A revealed viewer may still be loading tiles; for a reliable image
+of a viewer, switch first and capture on a later call.
 
 ## 9. Seeding batch runs (`vc3d_seeding_run`/`_expand`) need a real local `paths`/`seed.json` — even on a remote volume
 

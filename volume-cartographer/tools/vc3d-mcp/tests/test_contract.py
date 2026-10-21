@@ -12,8 +12,8 @@ from vc3d_mcp import tools as _tools  # noqa: F401 - registers the MCP tools
 VC_ROOT = Path(__file__).resolve().parents[3]
 SPEC_PATH = VC_ROOT / "apps/VC3D/agent_bridge/SPEC.md"
 DESCRIPTION_PATH = VC_ROOT / "apps/VC3D/agent_bridge/rpc_description.json"
-EXPECTED_RPC_METHODS = 120
-MCP_ONLY_TOOLS = {"vc3d_wait_job"}
+EXPECTED_RPC_METHODS = 141
+MCP_ONLY_TOOLS = {"vc3d_wait_job", "vc3d_observe"}
 
 
 def _resolve_ref(schema: dict[str, Any], root: dict[str, Any]) -> dict[str, Any]:

@@ -848,6 +848,98 @@ utils::Json SegmentationGrowthPanel::patchTracerParamsJson() const
     return params;
 }
 
+void SegmentationGrowthPanel::setGrowthScale(int scale)
+{
+    if (_spinGrowthScale) {
+        _spinGrowthScale->setValue(std::clamp(scale, 0, 5));
+    }
+}
+
+void SegmentationGrowthPanel::setCorrectionsZRange(bool enabled, int zMin, int zMax)
+{
+    if (_spinCorrectionsZMin) {
+        _spinCorrectionsZMin->setValue(zMin);
+    }
+    if (_spinCorrectionsZMax) {
+        _spinCorrectionsZMax->setValue(zMax);
+    }
+    if (_chkCorrectionsUseZRange) {
+        _chkCorrectionsUseZRange->setChecked(enabled);
+    }
+}
+
+void SegmentationGrowthPanel::setAllowedGrowthDirections(
+    const std::vector<SegmentationGrowthDirection>& directions)
+{
+    int mask = 0;
+    for (const auto direction : directions) {
+        switch (direction) {
+        case SegmentationGrowthDirection::Up:    mask |= kGrowDirUpBit; break;
+        case SegmentationGrowthDirection::Down:  mask |= kGrowDirDownBit; break;
+        case SegmentationGrowthDirection::Left:  mask |= kGrowDirLeftBit; break;
+        case SegmentationGrowthDirection::Right: mask |= kGrowDirRightBit; break;
+        default:                                 mask |= kGrowDirAllMask; break;
+        }
+    }
+    setGrowthDirectionMask(mask);
+}
+
+void SegmentationGrowthPanel::setPatchTracerParams(const utils::Json& params)
+{
+    auto setInt = [&params](QSpinBox* spin, const char* key) {
+        if (spin && params.contains(key)) {
+            const QSignalBlocker blocker(spin);
+            spin->setValue(params.at(key).get_int());
+        }
+    };
+    auto setDouble = [&params](QDoubleSpinBox* spin, const char* key) {
+        if (spin && params.contains(key)) {
+            const QSignalBlocker blocker(spin);
+            spin->setValue(params.at(key).get_double());
+        }
+    };
+    auto setBool = [&params](QCheckBox* check, const char* key) {
+        if (check && params.contains(key)) {
+            const QSignalBlocker blocker(check);
+            check->setChecked(params.at(key).get_bool());
+        }
+    };
+    setInt(_spinPatchGlobalStepsPerWindow, "global_steps_per_window");
+    setInt(_spinPatchSrcStep, "src_step");
+    setInt(_spinPatchStep, "step");
+    setInt(_spinPatchMaxWidth, "max_width");
+    setDouble(_spinPatchLocalCostInlierThreshold, "local_cost_inl_th");
+    setDouble(_spinPatchSameSurfaceThreshold, "same_surface_th");
+    setDouble(_spinPatchStraightWeight, "straight_weight");
+    setDouble(_spinPatchStraightWeight3d, "straight_weight_3D");
+    setDouble(_spinPatchSlidingWindowScale, "sliding_w_scale");
+    setDouble(_spinPatchZLocationLossWeight, "z_loc_loss_w");
+    setDouble(_spinPatchDistLoss2dWeight, "dist_loss_2d_w");
+    setDouble(_spinPatchDistLoss3dWeight, "dist_loss_3d_w");
+    setDouble(_spinPatchStraightMinCount, "straight_min_count");
+    setInt(_spinPatchInlierBaseThreshold, "inlier_base_threshold");
+    setInt(_spinPatchConsensusDefaultThreshold, "consensus_default_th");
+    setInt(_spinPatchConsensusLimitThreshold, "consensus_limit_th");
+    setBool(_chkPatchFlipX, "flip_x");
+    setBool(_chkPatchDebugImages, "debug_images");
+    setBool(_chkPatchSingleWrap, "single wrap");
+    // One save for the whole set, reading the controls' clamped values.
+    persistPatchTracerParams();
+}
+
+bool SegmentationGrowthPanel::selectGrowthVolume(const QString& volumeId)
+{
+    if (!_comboVolumes) {
+        return false;
+    }
+    const int index = _comboVolumes->findData(volumeId);
+    if (index < 0) {
+        return false;
+    }
+    _comboVolumes->setCurrentIndex(index);
+    return true;
+}
+
 void SegmentationGrowthPanel::setGrowthDirectionMask(int mask)
 {
     mask = normalizeGrowthDirectionMask(mask);

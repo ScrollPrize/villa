@@ -1,5 +1,8 @@
 #include "SegmentationCommandHandler.hpp"
 
+#include "MergeTifxyzInputs.hpp"
+#include "SegmentFiles.hpp"
+
 #include "OpenDataCoordinateIdentity.hpp"
 #include "CState.hpp"
 #include "SurfacePanelController.hpp"
@@ -455,11 +458,7 @@ static bool writeJsonObject(const QString& path, const QJsonObject& obj)
     return true;
 }
 
-struct RasterizeDialogResult {
-    int chunkSize{128};
-    int zMin{0};
-    int zMax{-1};
-};
+using RasterizeDialogResult = SegmentationCommandHandler::RasterizeParams;
 
 static bool selectRasterizeParams(QWidget* parent, RasterizeDialogResult* out)
 {
@@ -2794,23 +2793,133 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
         return;
     }
 
-    QString selectedVolumePath = dlg.selectedVolumePath();
-    if (selectedVolumePath.isEmpty()) {
+    if (dlg.selectedVolumePath().isEmpty()) {
         QMessageBox::warning(_parentWidget, tr("Error"), tr("No target volume selected."));
         return;
     }
-
-    QString outputDirPath = dlg.outputPath().trimmed();
-    if (outputDirPath.isEmpty()) {
+    if (dlg.outputPath().trimmed().isEmpty()) {
         QMessageBox::warning(_parentWidget, tr("Error"), tr("Output path cannot be empty."));
         return;
     }
+
+    NeighborCopyParams params;
+    params.volumeId = dlg.selectedVolumeId();
+    params.outputDir = dlg.outputPath().trimmed();
+    params.neighborMaxDistance = dlg.neighborMaxDistance();
+    params.neighborMinClearance = dlg.neighborMinClearance();
+    params.neighborFill = dlg.neighborFill();
+    params.neighborInterpWindow = dlg.neighborInterpWindow();
+    params.generations = dlg.generations();
+    params.neighborSpikeWindow = dlg.neighborSpikeWindow();
+    params.resumeLocalOptStep = dlg.resumeLocalOptStep();
+    params.resumeLocalOptRadius = dlg.resumeLocalOptRadius();
+    params.resumeLocalMaxIters = dlg.resumeLocalMaxIters();
+    params.resumeLocalDenseQr = dlg.resumeLocalDenseQr();
+    params.pass2OmpThreads = dlg.pass2OmpThreads();
+    {
+        QString pass2Error;
+        auto extraParams = dlg.pass2TracerParamsJson(&pass2Error);
+        if (!pass2Error.isEmpty()) {
+            QMessageBox::warning(_parentWidget, tr("Error"), pass2Error);
+            return;
+        }
+        if (extraParams) {
+            params.pass2ParamOverrides = *extraParams;
+        }
+    }
+
+    CommandLaunchError error;
+    if (!startNeighborCopyImpl(segmentId, copyOut, params, /*interactive=*/true,
+                               &error, nullptr) &&
+        !error.message.isEmpty()) {
+        QMessageBox::warning(_parentWidget,
+                             error.kind == CommandLaunchError::Busy ? tr("Warning")
+                                                                    : tr("Error"),
+                             error.message);
+    }
+}
+
+bool SegmentationCommandHandler::startNeighborCopy(const QString& segmentId,
+                                                   bool copyOut,
+                                                   const NeighborCopyParams& params,
+                                                   CommandLaunchError* error,
+                                                   QString* resolvedOutputDir)
+{
+    return startNeighborCopyImpl(segmentId, copyOut, params, /*interactive=*/false,
+                                 error, resolvedOutputDir);
+}
+
+bool SegmentationCommandHandler::startNeighborCopyImpl(const QString& segmentId,
+                                                       bool copyOut,
+                                                       const NeighborCopyParams& params,
+                                                       bool interactive,
+                                                       CommandLaunchError* error,
+                                                       QString* resolvedOutputDir)
+{
+    const CommandLaunchErrorSetter setErr{error};
+
+    if (!_state || !_state->vpkg()) {
+        setErr(tr("No volume package loaded."), CommandLaunchError::InvalidState);
+        return false;
+    }
+    if (!_cmdRunner) {
+        setErr(tr("Command line tools not available"), CommandLaunchError::ToolUnavailable);
+        return false;
+    }
+    if (_cmdRunner->isRunning()) {
+        setErr(tr("A command line tool is already running."), CommandLaunchError::Busy);
+        return false;
+    }
+    if (_neighborCopyJob && _neighborCopyJob->stage != NeighborCopyJob::Stage::None) {
+        setErr(tr("Another neighbor copy request is already running."),
+               CommandLaunchError::Busy);
+        return false;
+    }
+    auto surf = _state->vpkg()->getSurface(segmentId.toStdString());
+    if (!surf) {
+        setErr(tr("Invalid surface selected."), CommandLaunchError::SegmentNotFound);
+        return false;
+    }
+
+    // Resolve the target volume as the dialog does: the current volume unless
+    // one is named.
+    QString defaultVolumeId;
+    const auto volOpts = buildVolumeOptionList(&defaultVolumeId);
+    if (volOpts.isEmpty()) {
+        setErr(tr("No volumes available in the volume package."),
+               CommandLaunchError::VolumeNotFound);
+        return false;
+    }
+    const QString volumeId = params.volumeId.isEmpty() ? defaultVolumeId : params.volumeId;
+    QString selectedVolumePath;
+    for (const auto& opt : volOpts) {
+        if (opt.id == volumeId) {
+            selectedVolumePath = opt.path;
+            break;
+        }
+    }
+    if (selectedVolumePath.isEmpty()) {
+        setErr(tr("Unknown volume id: %1").arg(volumeId), CommandLaunchError::VolumeNotFound);
+        return false;
+    }
+
+    QString volpkgRoot = _state->vpkgPath();
+    if (volpkgRoot.isEmpty()) {
+        volpkgRoot = QString::fromStdString(_state->vpkg()->getVolpkgDirectory());
+    }
+    QString outputDirPath = params.outputDir.trimmed();
+    if (outputDirPath.isEmpty()) {
+        outputDirPath = QDir(volpkgRoot).filePath(QStringLiteral("paths"));
+    } else if (QDir::isRelativePath(outputDirPath)) {
+        outputDirPath = QDir(volpkgRoot).filePath(outputDirPath);
+    }
     QDir outDir(outputDirPath);
     if (!outDir.exists() && !outDir.mkpath(".")) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to create output directory: %1").arg(outputDirPath));
-        return;
+        setErr(tr("Failed to create output directory: %1").arg(outputDirPath));
+        return false;
     }
     outputDirPath = outDir.absolutePath();
+    const QString surfacePath = QString::fromStdString(surf->path.string());
 
     QString normalGridPath = _normalGridPathGetter ? _normalGridPathGetter() : QString();
     if (normalGridPath.isEmpty() && _state && _state->vpkg()) {
@@ -2821,18 +2930,18 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
     QJsonObject pass1Params;
     pass1Params["normal_grid_path"] = normalGridPath;
     pass1Params["neighbor_dir"] = copyOut ? QStringLiteral("out") : QStringLiteral("in");
-    pass1Params["neighbor_max_distance"] = dlg.neighborMaxDistance();
+    pass1Params["neighbor_max_distance"] = params.neighborMaxDistance;
     pass1Params["mode"] = QStringLiteral("gen_neighbor");
-    pass1Params["neighbor_min_clearance"] = dlg.neighborMinClearance();
-    pass1Params["neighbor_fill"] = dlg.neighborFill();
-    pass1Params["neighbor_interp_window"] = dlg.neighborInterpWindow();
-    pass1Params["generations"] = dlg.generations();
-    pass1Params["neighbor_spike_window"] = dlg.neighborSpikeWindow();
+    pass1Params["neighbor_min_clearance"] = params.neighborMinClearance;
+    pass1Params["neighbor_fill"] = params.neighborFill;
+    pass1Params["neighbor_interp_window"] = params.neighborInterpWindow;
+    pass1Params["generations"] = params.generations;
+    pass1Params["neighbor_spike_window"] = params.neighborSpikeWindow;
 
     auto pass1JsonFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("neighbor_copy_pass1_XXXXXX.json"));
     if (!pass1JsonFile->open()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to create temporary params file."));
-        return;
+        setErr(tr("Failed to create temporary params file."));
+        return false;
     }
     pass1JsonFile->write(QJsonDocument(pass1Params).toJson(QJsonDocument::Indented));
     pass1JsonFile->flush();
@@ -2841,29 +2950,18 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
     pass2Params["normal_grid_path"] = normalGridPath;
     pass2Params["max_gen"] = 1;
     pass2Params["generations"] = 1;
-    pass2Params["resume_local_opt_step"] = dlg.resumeLocalOptStep();
-    pass2Params["resume_local_opt_radius"] = dlg.resumeLocalOptRadius();
-    pass2Params["resume_local_max_iters"] = dlg.resumeLocalMaxIters();
-    pass2Params["resume_local_dense_qr"] = dlg.resumeLocalDenseQr();
-
-    {
-        QString pass2Error;
-        auto extraParams = dlg.pass2TracerParamsJson(&pass2Error);
-        if (!pass2Error.isEmpty()) {
-            QMessageBox::warning(_parentWidget, tr("Error"), pass2Error);
-            return;
-        }
-        if (extraParams) {
-            for (auto it = extraParams->begin(); it != extraParams->end(); ++it) {
-                pass2Params.insert(it.key(), it.value());
-            }
-        }
+    pass2Params["resume_local_opt_step"] = params.resumeLocalOptStep;
+    pass2Params["resume_local_opt_radius"] = params.resumeLocalOptRadius;
+    pass2Params["resume_local_max_iters"] = params.resumeLocalMaxIters;
+    pass2Params["resume_local_dense_qr"] = params.resumeLocalDenseQr;
+    for (auto it = params.pass2ParamOverrides.begin(); it != params.pass2ParamOverrides.end(); ++it) {
+        pass2Params.insert(it.key(), it.value());
     }
 
     auto pass2JsonFile = std::make_unique<QTemporaryFile>(QDir::temp().filePath("neighbor_copy_pass2_XXXXXX.json"));
     if (!pass2JsonFile->open()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to create temporary params file for pass 2."));
-        return;
+        setErr(tr("Failed to create temporary params file for pass 2."));
+        return false;
     }
     pass2JsonFile->write(QJsonDocument(pass2Params).toJson(QJsonDocument::Indented));
     pass2JsonFile->flush();
@@ -2879,7 +2977,8 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
     job.pass2JsonPath = pass2JsonFile->fileName();
     job.directoryPrefix = copyOut ? QStringLiteral("neighbor_out_") : QStringLiteral("neighbor_in_");
     job.copyOut = copyOut;
-    job.pass2OmpThreads = dlg.pass2OmpThreads();
+    job.interactive = interactive;
+    job.pass2OmpThreads = params.pass2OmpThreads;
     // Snapshot current directory entries so we can detect the newly-created
     // surface after the first pass completes.
     {
@@ -2900,9 +2999,9 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
                                job.resumeSurfacePath,
                                QStringLiteral("skip"),
                                -1)) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to launch neighbor copy pass."));
         _neighborCopyJob.reset();
-        return;
+        setErr(tr("Failed to launch neighbor copy pass."));
+        return false;
     }
 
     const QString dirName = QFileInfo(job.resumeSurfacePath).fileName();
@@ -2910,6 +3009,9 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
                                  .arg(copyOut ? tr("out") : tr("in"))
                                  .arg(dirName.isEmpty() ? segmentId : dirName),
                              5000);
+    if (resolvedOutputDir)
+        *resolvedOutputDir = outputDirPath;
+    return true;
 }
 
 QJsonObject SegmentationCommandHandler::buildResumeLocalBaseParamsJson() const
@@ -3623,11 +3725,90 @@ void SegmentationCommandHandler::onConvertToObj(const std::string& segmentId)
         return;
     }
 
-    _cmdRunner->setToObjParams(dlg.tifxyzPath(), dlg.objPath());
-    _cmdRunner->setNextOmpThreads(dlg.ompThreads());
-    _cmdRunner->setToObjOptions(dlg.normalizeUV(), dlg.alignGrid());
-    _cmdRunner->execute(CommandLineToolRunner::Tool::tifxyz2obj);
+    ConvertToObjParams params;
+    params.objPath = dlg.objPath();
+    params.normalizeUV = dlg.normalizeUV();
+    params.alignGrid = dlg.alignGrid();
+    params.ompThreads = dlg.ompThreads();
+    launchConvertToObj(dlg.tifxyzPath(), params, CommandLineToolRunner::ExecutionOptions{});
     emit statusMessage(tr("Converting segment to OBJ: %1").arg(QString::fromStdString(segmentId)), 5000);
+}
+
+bool SegmentationCommandHandler::launchConvertToObj(
+    const QString& tifxyzPath,
+    const ConvertToObjParams& params,
+    CommandLineToolRunner::ExecutionOptions options)
+{
+    _cmdRunner->setToObjParams(tifxyzPath, params.objPath);
+    _cmdRunner->setNextOmpThreads(params.ompThreads);
+    _cmdRunner->setToObjOptions(params.normalizeUV, params.alignGrid);
+    return _cmdRunner->execute(CommandLineToolRunner::Tool::tifxyz2obj, options);
+}
+
+bool SegmentationCommandHandler::startConvertToObj(const std::string& segmentId,
+                                                   const ConvertToObjParams& params,
+                                                   CommandLaunchError* error,
+                                                   QString* resolvedObjPath)
+{
+    const CommandLaunchErrorSetter setErr{error};
+
+    // The checks of requireSurfaceAndRunner, without its dialogs.
+    if (!_state || _state->currentVolume() == nullptr || !_state->vpkg()) {
+        setErr(tr("No volume package or volume loaded."), CommandLaunchError::InvalidState);
+        return false;
+    }
+    auto surf = _state->vpkg()->getSurface(segmentId);
+    if (!surf) {
+        setErr(tr("Invalid segment or segment not loaded: %1")
+                   .arg(QString::fromStdString(segmentId)),
+               CommandLaunchError::SegmentNotFound);
+        return false;
+    }
+    if (!_cmdRunner) {
+        setErr(tr("Command line tools not available"), CommandLaunchError::ToolUnavailable);
+        return false;
+    }
+    if (_cmdRunner->isRunning()) {
+        setErr(tr("A command line tool is already running."), CommandLaunchError::Busy);
+        return false;
+    }
+    const QFileInfo toolInfo(QCoreApplication::applicationDirPath() +
+                             QStringLiteral("/vc_tifxyz2obj"));
+    if (!toolInfo.exists() || !toolInfo.isExecutable()) {
+        setErr(tr("vc_tifxyz2obj not found or not executable."),
+               CommandLaunchError::ToolUnavailable);
+        return false;
+    }
+
+    // The dialog's suggestion unless a path is given.
+    const std::filesystem::path objPath = params.objPath.isEmpty()
+        ? surf->path / (segmentId + ".obj")
+        : std::filesystem::path(params.objPath.toStdString());
+    std::error_code ec;
+    if (!params.overwrite && std::filesystem::exists(objPath, ec)) {
+        setErr(tr("%1 already exists.").arg(QString::fromStdString(objPath.string())),
+               CommandLaunchError::InvalidState);
+        return false;
+    }
+    if (objPath.has_parent_path() && !std::filesystem::exists(objPath.parent_path(), ec)) {
+        std::filesystem::create_directories(objPath.parent_path(), ec);
+        if (ec) {
+            setErr(tr("Failed to create output directory: %1")
+                       .arg(QString::fromStdString(ec.message())));
+            return false;
+        }
+    }
+
+    ConvertToObjParams resolved = params;
+    resolved.objPath = QString::fromStdString(objPath.string());
+    if (!launchConvertToObj(QString::fromStdString(surf->path.string()), resolved,
+                            CommandLineToolRunner::ExecutionOptions::silent())) {
+        setErr(tr("Failed to start OBJ conversion."));
+        return false;
+    }
+    if (resolvedObjPath)
+        *resolvedObjPath = resolved.objPath;
+    return true;
 }
 
 void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& segmentId)
@@ -3797,75 +3978,106 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
 
 void SegmentationCommandHandler::onFlipSurface(const std::string& segmentId, bool flipU)
 {
-    auto* surface = requireSurfaceAndRunner(segmentId, false);
-    if (!surface) return;
-
-    auto surf = _state->vpkg()->getSurface(segmentId);
-
-    if (flipU) {
-        surface->flipU();
-    } else {
-        surface->flipV();
-    }
-
-    try {
-        surface->save(surface->path, true);
-        emit surfaceSavedTo(QString::fromStdString(surface->path.string()));
-    } catch (const std::exception& ex) {
-        QMessageBox::critical(_parentWidget,
-                              tr("Flip failed"),
-                              tr("Failed to save flipped surface %1: %2")
-                                  .arg(QString::fromStdString(segmentId))
-                                  .arg(QString::fromUtf8(ex.what())));
-        return;
-    }
-
-    if (_state) {
-        _state->setSurface(segmentId, surf, false, false);
-        if (_state->activeSurfaceId() == segmentId) {
-            _state->setSurface("segmentation", surf, false, false);
-        }
-    }
-
-    const QString directionLabel = flipU ? tr("vertically") : tr("horizontally");
-    emit statusMessage(
-        tr("Flipped %1 %2")
-            .arg(QString::fromStdString(segmentId))
-            .arg(directionLabel),
-        5000);
+    transformSurfaceImpl(segmentId,
+                         flipU ? SurfaceTransform::FlipU : SurfaceTransform::FlipV,
+                         /*interactive=*/true, nullptr);
 }
 
 void SegmentationCommandHandler::onRotateSurface(const std::string& segmentId)
 {
-    auto* surface = requireSurfaceAndRunner(segmentId, false);
-    if (!surface) return;
+    transformSurfaceImpl(segmentId, SurfaceTransform::Rotate90, /*interactive=*/true, nullptr);
+}
 
+bool SegmentationCommandHandler::transformSurface(const std::string& segmentId,
+                                                  SurfaceTransform transform,
+                                                  QString* errorMessage)
+{
+    return transformSurfaceImpl(segmentId, transform, /*interactive=*/false, errorMessage);
+}
+
+bool SegmentationCommandHandler::transformSurfaceImpl(const std::string& segmentId,
+                                                      SurfaceTransform transform,
+                                                      bool interactive,
+                                                      QString* errorMessage)
+{
+    auto fail = [&](const QString& message) -> bool {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
+
+    // The checks of requireSurfaceAndRunner, which presents them in dialogs;
+    // the runner is irrelevant to a synchronous transform.
+    if (!_state || _state->currentVolume() == nullptr || !_state->vpkg()) {
+        const QString message = tr("No volume package or volume loaded.");
+        if (interactive) {
+            QMessageBox::warning(_parentWidget, tr("Error"), message);
+        }
+        return fail(message);
+    }
     auto surf = _state->vpkg()->getSurface(segmentId);
-    surface->rotate(90.0f);
+    if (!surf) {
+        const QString message = tr("Invalid segment or segment not loaded: %1")
+                                    .arg(QString::fromStdString(segmentId));
+        if (interactive) {
+            QMessageBox::warning(_parentWidget, tr("Error"), message);
+        }
+        return fail(message);
+    }
+    // The resolver reports its own failure on the status bar.
+    if (_editingDestinationResolver && !_editingDestinationResolver(surf)) {
+        return fail(tr("Could not prepare a managed working copy"));
+    }
+    QuadSurface* surface = surf.get();
 
+    switch (transform) {
+    case SurfaceTransform::FlipU:
+        surface->flipU();
+        break;
+    case SurfaceTransform::FlipV:
+        surface->flipV();
+        break;
+    case SurfaceTransform::Rotate90:
+        surface->rotate(90.0f);
+        break;
+    }
+
+    const QString segLabel = QString::fromStdString(segmentId);
     try {
         surface->save(surface->path, true);
         emit surfaceSavedTo(QString::fromStdString(surface->path.string()));
     } catch (const std::exception& ex) {
-        QMessageBox::critical(_parentWidget,
-                              tr("Rotate failed"),
-                              tr("Failed to save rotated surface %1: %2")
-                                  .arg(QString::fromStdString(segmentId))
-                                  .arg(QString::fromUtf8(ex.what())));
-        return;
-    }
-
-    if (_state) {
-        _state->setSurface(segmentId, surf, false, false);
-        if (_state->activeSurfaceId() == segmentId) {
-            _state->setSurface("segmentation", surf, false, false);
+        const QString detail = QString::fromUtf8(ex.what());
+        const bool rotate = transform == SurfaceTransform::Rotate90;
+        const QString message = rotate
+            ? tr("Failed to save rotated surface %1: %2").arg(segLabel, detail)
+            : tr("Failed to save flipped surface %1: %2").arg(segLabel, detail);
+        if (interactive) {
+            QMessageBox::critical(_parentWidget,
+                                  rotate ? tr("Rotate failed") : tr("Flip failed"),
+                                  message);
         }
+        return fail(message);
     }
 
-    emit statusMessage(
-        tr("Rotated %1 by 90 degrees clockwise")
-            .arg(QString::fromStdString(segmentId)),
-        5000);
+    _state->setSurface(segmentId, surf, false, false);
+    if (_state->activeSurfaceId() == segmentId) {
+        _state->setSurface("segmentation", surf, false, false);
+    }
+
+    switch (transform) {
+    case SurfaceTransform::FlipU:
+        emit statusMessage(tr("Flipped %1 %2").arg(segLabel, tr("vertically")), 5000);
+        break;
+    case SurfaceTransform::FlipV:
+        emit statusMessage(tr("Flipped %1 %2").arg(segLabel, tr("horizontally")), 5000);
+        break;
+    case SurfaceTransform::Rotate90:
+        emit statusMessage(tr("Rotated %1 by 90 degrees clockwise").arg(segLabel), 5000);
+        break;
+    }
+    return true;
 }
 
 void SegmentationCommandHandler::onAlphaCompRefine(const std::string& segmentId)
@@ -4056,17 +4268,23 @@ void SegmentationCommandHandler::handleNeighborCopyToolFinished(bool success)
 
     auto& job = *_neighborCopyJob;
     if (!success) {
-        _neighborCopyJob.reset();
+        finishNeighborCopy(false,
+                           job.cancelled ? tr("Neighbor copy cancelled.")
+                                         : tr("Neighbor copy pass failed."),
+                           QString());
         return;
     }
 
     if (job.stage == NeighborCopyJob::Stage::FirstPass) {
         const QString newSurface = findNewNeighborSurface(job);
         if (newSurface.isEmpty()) {
-            QMessageBox::warning(_parentWidget, tr("Error"),
-                                 tr("Could not locate the newly generated neighbor surface in %1.")
-                                     .arg(job.outputDir));
-            _neighborCopyJob.reset();
+            const QString message =
+                tr("Could not locate the newly generated neighbor surface in %1.")
+                    .arg(job.outputDir);
+            if (job.interactive) {
+                QMessageBox::warning(_parentWidget, tr("Error"), message);
+            }
+            finishNeighborCopy(false, message, QString());
             return;
         }
 
@@ -4084,16 +4302,42 @@ void SegmentationCommandHandler::handleNeighborCopyToolFinished(bool success)
     }
 
     const bool copyOut = job.copyOut;
-    const QString surfaceName = QFileInfo(job.generatedSurfacePath).fileName();
-    _neighborCopyJob.reset();
+    const QString surfacePath = job.generatedSurfacePath;
+    const QString surfaceName = QFileInfo(surfacePath).fileName();
     if (_surfacePanel) {
         _surfacePanel->reloadSurfacesFromDisk();
     }
 
-    emit statusMessage(tr("Copy %1 complete: %2")
-                                 .arg(copyOut ? tr("out") : tr("in"))
-                                 .arg(surfaceName),
-                             5000);
+    const QString message = tr("Copy %1 complete: %2")
+                                .arg(copyOut ? tr("out") : tr("in"))
+                                .arg(surfaceName);
+    emit statusMessage(message, 5000);
+    finishNeighborCopy(true, message, surfacePath);
+}
+
+bool SegmentationCommandHandler::cancelNeighborCopy()
+{
+    if (!_neighborCopyJob || _neighborCopyJob->stage == NeighborCopyJob::Stage::None) {
+        return false;
+    }
+    _neighborCopyJob->cancelled = true;
+    if (_cmdRunner && _cmdRunner->isRunning()) {
+        // The pass's toolFinished ends the job with the cancel message.
+        _cmdRunner->cancel();
+        return true;
+    }
+    // Between the passes: the queued second pass sees no job and does not start.
+    finishNeighborCopy(false, tr("Neighbor copy cancelled."), QString());
+    return true;
+}
+
+void SegmentationCommandHandler::finishNeighborCopy(bool success,
+                                                    const QString& message,
+                                                    const QString& outputPath)
+{
+    _neighborCopyJob.reset();
+    emit segmentOperationFinished(QStringLiteral("neighbor_copy"), success, message,
+                                  outputPath);
 }
 
 QString SegmentationCommandHandler::findNewNeighborSurface(const NeighborCopyJob& job) const
@@ -4144,6 +4388,10 @@ bool SegmentationCommandHandler::startNeighborCopyPass(const QString& paramsPath
         job.outputDir,
         resumeOpt);
     _cmdRunner->setNextOmpThreads(ompThreads);
+    if (!job.interactive) {
+        return _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy,
+                                   CommandLineToolRunner::ExecutionOptions::silent());
+    }
     _cmdRunner->showConsoleOutput();
     return _cmdRunner->execute(CommandLineToolRunner::Tool::NeighborCopy);
 }
@@ -4166,8 +4414,11 @@ void SegmentationCommandHandler::launchNeighborCopySecondPass()
                                    resumeSurface,
                                    QStringLiteral("local"),
                                    std::max(1, _neighborCopyJob->pass2OmpThreads))) {
-            QMessageBox::warning(_parentWidget, tr("Error"), tr("Failed to launch the second neighbor copy pass."));
-            _neighborCopyJob.reset();
+            const QString message = tr("Failed to launch the second neighbor copy pass.");
+            if (_neighborCopyJob->interactive) {
+                QMessageBox::warning(_parentWidget, tr("Error"), message);
+            }
+            finishNeighborCopy(false, message, QString());
             return;
         }
 
@@ -4179,22 +4430,64 @@ void SegmentationCommandHandler::launchNeighborCopySecondPass()
 
 void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentIds)
 {
+    startRasterizeSegmentsImpl(segmentIds, std::nullopt, /*interactive=*/true,
+                               nullptr, nullptr);
+}
+
+bool SegmentationCommandHandler::startRasterizeSegments(const QStringList& segmentIds,
+                                                        const RasterizeParams& params,
+                                                        CommandLaunchError* error,
+                                                        RasterizeLaunch* launch)
+{
+    return startRasterizeSegmentsImpl(segmentIds, params, /*interactive=*/false,
+                                      error, launch);
+}
+
+bool SegmentationCommandHandler::startRasterizeSegmentsImpl(
+    const QStringList& segmentIds,
+    const std::optional<RasterizeParams>& requestedParams,
+    bool interactive,
+    CommandLaunchError* error,
+    RasterizeLaunch* launch)
+{
+    const CommandLaunchErrorSetter setErr{error};
+    // Interactive launches present each refusal as the menu always has: a
+    // status-bar note, a warning or a critical message box.
+    enum class Presentation { StatusNote, Warning, Critical };
+    auto refuse = [&](const QString& message, CommandLaunchError::Kind kind,
+                      Presentation presentation, const QString& title = {}) {
+        if (interactive) {
+            switch (presentation) {
+            case Presentation::StatusNote:
+                emit statusMessage(message, 3000);
+                break;
+            case Presentation::Warning:
+                QMessageBox::warning(_parentWidget, title, message);
+                break;
+            case Presentation::Critical:
+                QMessageBox::critical(_parentWidget, title, message);
+                break;
+            }
+        }
+        setErr(message, kind);
+        return false;
+    };
+
     if (!_state || !_state->vpkg()) {
-        emit statusMessage(tr("No volume package loaded"), 3000);
-        return;
+        return refuse(tr("No volume package loaded"), CommandLaunchError::InvalidState,
+                      Presentation::StatusNote);
     }
 
     if (_cmdRunner && _cmdRunner->isRunning()) {
-        QMessageBox::warning(_parentWidget, tr("Warning"),
-                             tr("A command line tool is already running."));
-        return;
+        return refuse(tr("A command line tool is already running."),
+                      CommandLaunchError::Busy, Presentation::Warning, tr("Warning"));
     }
 
     QStringList requestedIds = segmentIds;
     requestedIds.removeAll(QString());
     if (requestedIds.isEmpty()) {
-        emit statusMessage(tr("No segments selected"), 3000);
-        return;
+        return refuse(tr("No segments selected"), CommandLaunchError::InvalidState,
+                      Presentation::StatusNote);
     }
 
     QStringList rasterIds;
@@ -4213,8 +4506,8 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     }
 
     if (rasterIds.isEmpty()) {
-        emit statusMessage(tr("No valid segments selected"), 3000);
-        return;
+        return refuse(tr("No valid segments selected"), CommandLaunchError::InvalidState,
+                      Presentation::StatusNote);
     }
 
     QStringList segmentPaths;
@@ -4241,10 +4534,9 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     }
 
     if (segmentPaths.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-                             tr("Selected segments are not tifxyz meshes: %1")
-                                 .arg(missingIds.join(QStringLiteral(", "))));
-        return;
+        return refuse(tr("Selected segments are not tifxyz meshes: %1")
+                          .arg(missingIds.join(QStringLiteral(", "))),
+                      CommandLaunchError::InputNotFound, Presentation::Warning, tr("Error"));
     }
     if (!missingIds.isEmpty()) {
         emit statusMessage(
@@ -4258,21 +4550,28 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         referenceZarr = getCurrentVolumePath();
     }
     if (referenceZarr.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-                             tr("Missing reference OME-Zarr. Load a normal3d/volume first."));
-        return;
+        return refuse(tr("Missing reference OME-Zarr. Load a normal3d/volume first."),
+                      CommandLaunchError::InvalidState, Presentation::Warning, tr("Error"));
     }
 
     const QString executable = findVcTool("vc_tifxyz2zarr_sparse");
     if (executable.isEmpty()) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-                             tr("vc_tifxyz2zarr_sparse tool not found. Configure tools/vc_tifxyz2zarr_sparse path."));
-        return;
+        return refuse(tr("vc_tifxyz2zarr_sparse tool not found. Configure tools/vc_tifxyz2zarr_sparse path."),
+                      CommandLaunchError::ToolUnavailable, Presentation::Warning, tr("Error"));
     }
 
     RasterizeDialogResult rasterizeParams;
-    if (!selectRasterizeParams(_parentWidget, &rasterizeParams)) {
-        return;
+    if (requestedParams) {
+        rasterizeParams = *requestedParams;
+        if (rasterizeParams.chunkSize < 1 || rasterizeParams.chunkSize > 4096 ||
+            rasterizeParams.zMin < 0 || rasterizeParams.zMax < -1 ||
+            (rasterizeParams.zMax >= 0 && rasterizeParams.zMin >= rasterizeParams.zMax)) {
+            return refuse(tr("Chunk size must be 1 to 4096, Z min non-negative, and Z min "
+                             "smaller than Z max unless Z max is -1."),
+                          CommandLaunchError::Other, Presentation::Warning, tr("Error"));
+        }
+    } else if (!interactive || !selectRasterizeParams(_parentWidget, &rasterizeParams)) {
+        return false;
     }
 
     const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMddHHmmss"));
@@ -4283,9 +4582,8 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     const std::filesystem::path volumesDir = volpkgDir / "volumes";
     std::filesystem::create_directories(volumesDir, ec);
     if (ec) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Cannot create volumes directory: %1").arg(QString::fromStdString(ec.message())));
-        return;
+        return refuse(tr("Cannot create volumes directory: %1").arg(QString::fromStdString(ec.message())),
+                      CommandLaunchError::Other, Presentation::Critical, tr("Error"));
     }
 
     std::filesystem::path finalOutputRoot = volumesDir / baseOutputName.toStdString();
@@ -4294,10 +4592,9 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
             QStringLiteral("labels_%1_%2.zarr").arg(timestamp).arg(suffix).toStdString();
     }
     if (std::filesystem::exists(finalOutputRoot)) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Unable to reserve output directory after retries: %1")
-                                  .arg(QString::fromStdString(finalOutputRoot.string())));
-        return;
+        return refuse(tr("Unable to reserve output directory after retries: %1")
+                          .arg(QString::fromStdString(finalOutputRoot.string())),
+                      CommandLaunchError::Other, Presentation::Critical, tr("Error"));
     }
 
     std::filesystem::path stagedOutputRoot =
@@ -4318,17 +4615,15 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         }
     }
     if (std::filesystem::exists(tempRoot, ec)) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Unable to reserve temporary input directory: %1")
-                                  .arg(QString::fromStdString(tempRoot.string())));
-        return;
+        return refuse(tr("Unable to reserve temporary input directory: %1")
+                          .arg(QString::fromStdString(tempRoot.string())),
+                      CommandLaunchError::Other, Presentation::Critical, tr("Error"));
     }
 
     if (!std::filesystem::create_directories(tempRoot, ec) || ec) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Cannot create temporary input directory: %1")
-                                  .arg(QString::fromStdString(ec.message())));
-        return;
+        return refuse(tr("Cannot create temporary input directory: %1")
+                          .arg(QString::fromStdString(ec.message())),
+                      CommandLaunchError::Other, Presentation::Critical, tr("Error"));
     }
 
     for (int i = 0; i < validIds.size(); ++i) {
@@ -4342,13 +4637,12 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
             std::filesystem::copy(sourceSeg, targetSeg,
                                   std::filesystem::copy_options::recursive, copyErr);
             if (copyErr) {
-                QMessageBox::critical(_parentWidget, tr("Error"),
-                                      tr("Failed to stage segment '%1': %2")
-                                          .arg(validIds.at(i))
-                                          .arg(QString::fromStdString(copyErr.message())));
                 std::filesystem::remove_all(stagedOutputRoot, ec);
                 std::filesystem::remove_all(tempRoot);
-                return;
+                return refuse(tr("Failed to stage segment '%1': %2")
+                                  .arg(validIds.at(i))
+                                  .arg(QString::fromStdString(copyErr.message())),
+                              CommandLaunchError::Other, Presentation::Critical, tr("Error"));
             }
         }
     }
@@ -4383,18 +4677,17 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
 
     auto runner = _cmdRunner;
     if (!runner) {
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Command runner is not available."));
         std::filesystem::remove_all(stagedOutputRoot);
         std::filesystem::remove_all(tempRoot);
-        return;
+        return refuse(tr("Command runner is not available."),
+                      CommandLaunchError::ToolUnavailable, Presentation::Critical, tr("Error"));
     }
 
     QPointer<SegmentationCommandHandler> guard(this);
     auto connection = std::make_shared<QMetaObject::Connection>();
     *connection = connect(runner, &CommandLineToolRunner::toolFinished,
                          this,
-                         [this, guard, connection, runner,
+                         [this, guard, connection, runner, interactive,
                           tempRootStr, stagedOutputRootStr, finalOutputRootStr,
                           validIds, segmentPaths, outputCoordinateIdentity](CommandLineToolRunner::Tool tool,
                                                   bool success,
@@ -4411,39 +4704,40 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
         disconnect(*connection);
 
         bool finalizeOutput = false;
+        QString outcome;
         if (!success) {
-            QMessageBox::critical(_parentWidget, tr("Error"),
-                                  tr("vc_tifxyz2zarr_sparse failed.\n%1")
-                                      .arg(message));
+            outcome = tr("vc_tifxyz2zarr_sparse failed.\n%1").arg(message);
+            if (interactive) {
+                QMessageBox::critical(_parentWidget, tr("Error"), outcome);
+            }
             emit statusMessage(tr("Rasterize failed"), 3000);
         } else if (!appendRasterizationMetadata(stagedOutputRootStr, validIds, segmentPaths)) {
-            emit showWarning(tr("Warning"), tr("Rasterization completed but metadata update failed"));
+            outcome = tr("Rasterization completed but metadata update failed");
+            emit showWarning(tr("Warning"), outcome);
             emit statusMessage(tr("Rasterize complete, but metadata update failed"), 5000);
         } else {
             std::error_code renameErr;
             std::filesystem::rename(stagedOutputRootStr.toStdString(), finalOutputRootStr.toStdString(), renameErr);
             if (renameErr) {
-                emit showWarning(tr("Warning"),
-                                 tr("Rasterization completed, but finalizing output folder failed: %1")
-                                     .arg(QString::fromStdString(renameErr.message())));
+                outcome = tr("Rasterization completed, but finalizing output folder failed: %1")
+                              .arg(QString::fromStdString(renameErr.message()));
+                emit showWarning(tr("Warning"), outcome);
                 emit statusMessage(tr("Rasterize complete, but finalizing output failed"), 5000);
             } else {
                 finalizeOutput = true;
                 if (!updateVolumeIdentityMetadata(
                         finalOutputRootStr, outputCoordinateIdentity)) {
-                    emit showWarning(
-                        tr("Warning"),
-                        tr("Rasterized volume created, but updating meta.json identity failed."));
+                    outcome = tr("Rasterized volume created, but updating meta.json identity failed.");
+                    emit showWarning(tr("Warning"), outcome);
                     emit statusMessage(
                         tr("Rasterized volume created, but metadata update failed -> %1")
                             .arg(QDir::toNativeSeparators(finalOutputRootStr)),
                         5000);
                 } else {
-                    emit statusMessage(
-                        tr("Rasterized %1 segment(s) -> %2")
-                            .arg(validIds.size())
-                            .arg(QDir::toNativeSeparators(finalOutputRootStr)),
-                        5000);
+                    outcome = tr("Rasterized %1 segment(s) -> %2")
+                                  .arg(validIds.size())
+                                  .arg(QDir::toNativeSeparators(finalOutputRootStr));
+                    emit statusMessage(outcome, 5000);
                 }
             }
         }
@@ -4453,20 +4747,49 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
             std::filesystem::remove_all(std::filesystem::path(stagedOutputRootStr.toStdString()), cleanupErr);
         }
         std::filesystem::remove_all(std::filesystem::path(tempRootStr.toStdString()), cleanupErr);
+        emit segmentOperationFinished(QStringLiteral("rasterize"), finalizeOutput, outcome,
+                                      finalizeOutput ? finalOutputRootStr : QString());
     });
 
-    if (!runner->executeCustomCommand(executable, args, QStringLiteral("vc_tifxyz2zarr_sparse"))) {
+    const auto options = interactive
+        ? CommandLineToolRunner::ExecutionOptions{}
+        : CommandLineToolRunner::ExecutionOptions::silent();
+    if (!runner->executeCustomCommand(executable, args, QStringLiteral("vc_tifxyz2zarr_sparse"),
+                                      options)) {
         QObject::disconnect(*connection);
-        QMessageBox::critical(_parentWidget, tr("Error"),
-                              tr("Failed to start vc_tifxyz2zarr_sparse."));
         std::error_code cleanupErr;
         std::filesystem::remove_all(stagedOutputRoot, cleanupErr);
         std::filesystem::remove_all(tempRoot);
-        return;
+        return refuse(tr("Failed to start vc_tifxyz2zarr_sparse."),
+                      CommandLaunchError::Other, Presentation::Critical, tr("Error"));
     }
 
     emit statusMessage(
         tr("Rasterization started for %1 segment(s)...").arg(validIds.size()), 0);
+    if (launch) {
+        launch->outputPath = finalOutputRootStr;
+        launch->segmentIds = validIds;
+        launch->skippedIds = missingIds;
+    }
+    return true;
+}
+
+QString SegmentationCommandHandler::findNewMergedSegment(const QString& pathsDir,
+                                                         const QSet<QString>& baselineEntries)
+{
+    QFileInfo newest;
+    bool found = false;
+    for (const auto& info : QDir(pathsDir).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+        const QString name = info.fileName();
+        if (baselineEntries.contains(name) || !name.contains(QStringLiteral("_merged"))) {
+            continue;
+        }
+        if (!found || info.lastModified() > newest.lastModified()) {
+            newest = info;
+            found = true;
+        }
+    }
+    return found ? newest.absoluteFilePath() : QString();
 }
 
 void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
@@ -4527,17 +4850,46 @@ void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
         return;
     }
 
-    _cmdRunner->setMergeParams(dlg.mergeJsonPath(),
+    MergeTifxyzParams params;
+    params.refSurface = dlg.refSurface();
+    params.ransacIters = dlg.ransacIters();
+    params.ransacMinThresh = dlg.ransacMinThresh();
+    params.ransacMaxThresh = dlg.ransacMaxThresh();
+    params.ransacMadK = dlg.ransacMadK();
+    params.ransacSeed = dlg.ransacSeed();
+    params.anchorCap = dlg.anchorCap();
+    params.stripCols = dlg.stripCols();
+    params.ompThreads = dlg.ompThreads();
+    if (!launchMergeTifxyz(dlg.mergeJsonPath(), pathsDir, params, /*interactive=*/true)) {
+        return;
+    }
+    emit statusMessage(tr("Merging tifxyz surfaces..."), 0);
+}
+
+bool SegmentationCommandHandler::launchMergeTifxyz(const QString& mergeJsonPath,
+                                                   const QString& pathsDir,
+                                                   const MergeTifxyzParams& params,
+                                                   bool interactive)
+{
+    auto vpkg = _state->vpkg();
+    // vc_merge_tifxyz names its output folder itself (<first name>_merged with
+    // a version suffix); the runner reports the merge.json, so the new folder
+    // is found against this snapshot when the run ends.
+    QSet<QString> baselineEntries;
+    for (const auto& info : QDir(pathsDir).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+        baselineEntries.insert(info.fileName());
+    }
+    _cmdRunner->setMergeParams(mergeJsonPath,
                                pathsDir,
-                               dlg.refSurface(),
-                               dlg.ransacIters(),
-                               dlg.ransacMinThresh(),
-                               dlg.ransacMaxThresh(),
-                               dlg.ransacMadK(),
-                               dlg.ransacSeed(),
-                               dlg.anchorCap(),
-                               dlg.stripCols());
-    if (dlg.ompThreads() > 0) _cmdRunner->setNextOmpThreads(dlg.ompThreads());
+                               params.refSurface,
+                               params.ransacIters,
+                               params.ransacMinThresh,
+                               params.ransacMaxThresh,
+                               params.ransacMadK,
+                               params.ransacSeed,
+                               params.anchorCap,
+                               params.stripCols);
+    if (params.ompThreads > 0) _cmdRunner->setNextOmpThreads(params.ompThreads);
     const QJsonObject outputCoordinateIdentity = coordinateIdentityObject(
         vc3d::opendata::coordinateIdentityForVolume(
             *vpkg, _state->currentVolumeId()));
@@ -4545,11 +4897,11 @@ void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
     auto connection = std::make_shared<QMetaObject::Connection>();
     *connection = connect(
         _cmdRunner, &CommandLineToolRunner::toolFinished, this,
-        [this, guard, connection, outputCoordinateIdentity](
+        [this, guard, connection, outputCoordinateIdentity, pathsDir, baselineEntries](
             CommandLineToolRunner::Tool tool,
             bool success,
+            const QString& message,
             const QString&,
-            const QString& outputPath,
             bool) {
             if (!guard) {
                 disconnect(*connection);
@@ -4558,19 +4910,100 @@ void SegmentationCommandHandler::onMergeTifxyz(const QStringList& segmentIds)
             if (tool != CommandLineToolRunner::Tool::MergeTifxyz)
                 return;
             disconnect(*connection);
-            if (success && !updateSegmentCoordinateMetadata(
-                               outputPath, outputCoordinateIdentity)) {
-                emit showWarning(
-                    tr("Warning"),
-                    tr("Merged tifxyz created, but coordinate metadata update failed."));
+            QString outcome = message;
+            QString mergedPath;
+            if (success) {
+                mergedPath = findNewMergedSegment(pathsDir, baselineEntries);
+                if (mergedPath.isEmpty()) {
+                    outcome = tr("vc_merge_tifxyz finished, but no new merged segment "
+                                 "was found in %1.").arg(pathsDir);
+                    emit showWarning(tr("Warning"), outcome);
+                } else if (!updateSegmentCoordinateMetadata(
+                               mergedPath, outputCoordinateIdentity)) {
+                    outcome = tr("Merged tifxyz created, but coordinate metadata update failed.");
+                    emit showWarning(tr("Warning"), outcome);
+                }
+                if (_surfacePanel) {
+                    _surfacePanel->reloadSurfacesFromDisk();
+                }
             }
+            emit segmentOperationFinished(QStringLiteral("merge"), success, outcome,
+                                          mergedPath);
         });
-    _cmdRunner->showConsoleOutput();
-    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergeTifxyz)) {
+    if (interactive) {
+        _cmdRunner->showConsoleOutput();
+    }
+    const auto options = interactive
+        ? CommandLineToolRunner::ExecutionOptions{}
+        : CommandLineToolRunner::ExecutionOptions::silent();
+    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergeTifxyz, options)) {
         disconnect(*connection);
-        return;
+        return false;
+    }
+    return true;
+}
+
+bool SegmentationCommandHandler::startMergeTifxyz(const MergeTifxyzParams& params,
+                                                  CommandLaunchError* error,
+                                                  QString* mergeJsonPath)
+{
+    const CommandLaunchErrorSetter setErr{error};
+    if (!_state || !_state->vpkg()) {
+        setErr(tr("Open a volpkg first."), CommandLaunchError::InvalidState);
+        return false;
+    }
+    if (!_cmdRunner) {
+        setErr(tr("Command runner is not initialized."), CommandLaunchError::ToolUnavailable);
+        return false;
+    }
+    if (_cmdRunner->isRunning()) {
+        setErr(tr("A command-line tool is already running."), CommandLaunchError::Busy);
+        return false;
+    }
+    const QFileInfo toolInfo(QCoreApplication::applicationDirPath() +
+                             QStringLiteral("/vc_merge_tifxyz"));
+    if (!toolInfo.exists() || !toolInfo.isExecutable()) {
+        setErr(tr("vc_merge_tifxyz not found or not executable."),
+               CommandLaunchError::ToolUnavailable);
+        return false;
+    }
+
+    auto vpkg = _state->vpkg();
+    const std::filesystem::path resolvedSeg = vpkg->outputSegmentsPath();
+    if (resolvedSeg.empty() || !std::filesystem::is_directory(resolvedSeg)) {
+        setErr(tr("No active segmentation directory; pick one before running merge."),
+               CommandLaunchError::InvalidState);
+        return false;
+    }
+    const QString pathsDir = QString::fromStdString(resolvedSeg.string());
+    const QString volpkgDir = QString::fromStdString(resolvedSeg.parent_path().string());
+
+    QStringList availableSegments;
+    for (const auto& id : vpkg->segmentationIDs()) {
+        availableSegments << QString::fromStdString(id);
+    }
+    const QString invalid = vc3d::merge_tifxyz::validate(
+        params.grid, availableSegments, pathsDir, params.refSurface,
+        params.ransacMinThresh, params.ransacMaxThresh);
+    if (!invalid.isEmpty()) {
+        setErr(invalid);
+        return false;
+    }
+
+    QString writeError;
+    const QString jsonPath = vc3d::merge_tifxyz::writeMergeJson(volpkgDir, params.grid, &writeError);
+    if (jsonPath.isEmpty()) {
+        setErr(writeError);
+        return false;
+    }
+    if (!launchMergeTifxyz(jsonPath, pathsDir, params, /*interactive=*/false)) {
+        setErr(tr("Failed to start vc_merge_tifxyz."));
+        return false;
     }
     emit statusMessage(tr("Merging tifxyz surfaces..."), 0);
+    if (mergeJsonPath)
+        *mergeJsonPath = jsonPath;
+    return true;
 }
 
 void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
@@ -4623,19 +5056,43 @@ void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
         return;
     }
 
-    _cmdRunner->setMergePatchParams(dlg.parentPath(),
-                                    dlg.childPath(),
-                                    dlg.explicitRoles(),
-                                    dlg.borderCells(),
-                                    dlg.blendCells(),
-                                    dlg.idwK(),
-                                    dlg.ransacIters(),
-                                    dlg.ransacMinThresh(),
-                                    dlg.ransacMaxThresh(),
-                                    dlg.ransacMadK(),
-                                    dlg.ransacSeed(),
-                                    dlg.anchorCap());
-    if (dlg.ompThreads() > 0) _cmdRunner->setNextOmpThreads(dlg.ompThreads());
+    MergePatchParams params;
+    params.explicitRoles = dlg.explicitRoles();
+    params.borderCells = dlg.borderCells();
+    params.blendCells = dlg.blendCells();
+    params.idwK = dlg.idwK();
+    params.ransacIters = dlg.ransacIters();
+    params.ransacMinThresh = dlg.ransacMinThresh();
+    params.ransacMaxThresh = dlg.ransacMaxThresh();
+    params.ransacMadK = dlg.ransacMadK();
+    params.ransacSeed = dlg.ransacSeed();
+    params.anchorCap = dlg.anchorCap();
+    params.ompThreads = dlg.ompThreads();
+    if (!launchMergePatch(dlg.parentPath(), dlg.childPath(), params, /*interactive=*/true)) {
+        emit statusMessage(tr("Failed to start vc_merge_patch"), 5000);
+        return;
+    }
+    emit statusMessage(tr("Patching tifxyz..."), 0);
+}
+
+bool SegmentationCommandHandler::launchMergePatch(const QString& parentPath,
+                                                  const QString& childPath,
+                                                  const MergePatchParams& params,
+                                                  bool interactive)
+{
+    _cmdRunner->setMergePatchParams(parentPath,
+                                    childPath,
+                                    params.explicitRoles,
+                                    params.borderCells,
+                                    params.blendCells,
+                                    params.idwK,
+                                    params.ransacIters,
+                                    params.ransacMinThresh,
+                                    params.ransacMaxThresh,
+                                    params.ransacMadK,
+                                    params.ransacSeed,
+                                    params.anchorCap);
+    if (params.ompThreads > 0) _cmdRunner->setNextOmpThreads(params.ompThreads);
 
     // One-shot handler: on success, force-refresh the parent (and any
     // other modified) surface from disk. The mask.tif mtime drives the
@@ -4646,7 +5103,7 @@ void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
     auto connection = std::make_shared<QMetaObject::Connection>();
     *connection = connect(_cmdRunner, &CommandLineToolRunner::toolFinished,
                           this,
-                          [this, guard, connection]
+                          [this, guard, connection, interactive]
                           (CommandLineToolRunner::Tool tool,
                            bool success,
                            const QString& message,
@@ -4660,30 +5117,109 @@ void SegmentationCommandHandler::onMergePatch(const QStringList& segmentIds)
             return;
         }
         disconnect(*connection);
+        QString outcome;
         if (success) {
             if (_surfacePanel) _surfacePanel->reloadSurfacesFromDisk();
-            emit statusMessage(
-                tr("Patch applied to %1")
-                    .arg(QDir::toNativeSeparators(outputPath)), 5000);
+            outcome = tr("Patch applied to %1").arg(QDir::toNativeSeparators(outputPath));
+            emit statusMessage(outcome, 5000);
         } else {
-            QMessageBox::critical(_parentWidget, tr("Patch tifxyz"),
-                                  tr("vc_merge_patch failed.\n%1").arg(message));
+            outcome = tr("vc_merge_patch failed.\n%1").arg(message);
+            if (interactive) {
+                QMessageBox::critical(_parentWidget, tr("Patch tifxyz"), outcome);
+            }
             emit statusMessage(tr("Patch failed"), 5000);
         }
+        emit segmentOperationFinished(QStringLiteral("patch"), success, outcome,
+                                      success ? outputPath : QString());
     });
 
-    _cmdRunner->showConsoleOutput();
+    if (interactive) {
+        _cmdRunner->showConsoleOutput();
+    }
+    const auto options = interactive
+        ? CommandLineToolRunner::ExecutionOptions{}
+        : CommandLineToolRunner::ExecutionOptions::silent();
     // If execute() rejects the launch (preflight failure, missing binary),
     // it never emits toolFinished -- so the one-shot lambda above would
     // stay attached and fire on the NEXT tool's toolFinished. Disconnect
     // immediately on launch failure to keep the runner's signal table
     // clean across subsequent runs.
-    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergePatch)) {
+    if (!_cmdRunner->execute(CommandLineToolRunner::Tool::MergePatch, options)) {
         QObject::disconnect(*connection);
-        emit statusMessage(tr("Failed to start vc_merge_patch"), 5000);
-        return;
+        return false;
+    }
+    return true;
+}
+
+bool SegmentationCommandHandler::startMergePatch(const MergePatchParams& params,
+                                                 CommandLaunchError* error)
+{
+    const CommandLaunchErrorSetter setErr{error};
+    if (!_state || !_state->vpkg()) {
+        setErr(tr("Open a volpkg first."), CommandLaunchError::InvalidState);
+        return false;
+    }
+    if (!_cmdRunner) {
+        setErr(tr("Command runner is not initialized."), CommandLaunchError::ToolUnavailable);
+        return false;
+    }
+    if (_cmdRunner->isRunning()) {
+        setErr(tr("A command-line tool is already running."), CommandLaunchError::Busy);
+        return false;
+    }
+    const QFileInfo toolInfo(QCoreApplication::applicationDirPath() +
+                             QStringLiteral("/vc_merge_patch"));
+    if (!toolInfo.exists() || !toolInfo.isExecutable()) {
+        setErr(tr("vc_merge_patch not found or not executable."),
+               CommandLaunchError::ToolUnavailable);
+        return false;
+    }
+
+    auto vpkg = _state->vpkg();
+    const std::filesystem::path resolvedSeg = vpkg->outputSegmentsPath();
+    if (resolvedSeg.empty() || !std::filesystem::is_directory(resolvedSeg)) {
+        setErr(tr("No active segmentation directory; pick one before running patch."),
+               CommandLaunchError::InvalidState);
+        return false;
+    }
+    if (params.parentId.isEmpty() || params.childId.isEmpty()) {
+        setErr(tr("Pick two surfaces before proceeding."));
+        return false;
+    }
+    if (params.parentId == params.childId) {
+        setErr(tr("Parent and child must be different surfaces."));
+        return false;
+    }
+    if (params.ransacMinThresh >= params.ransacMaxThresh) {
+        setErr(tr("RANSAC min threshold must be strictly less than max."));
+        return false;
+    }
+    const auto ids = vpkg->segmentationIDs();
+    for (const QString& id : {params.parentId, params.childId}) {
+        if (std::find(ids.begin(), ids.end(), id.toStdString()) == ids.end()) {
+            setErr(tr("Invalid segment or segment not loaded: %1").arg(id),
+                   CommandLaunchError::SegmentNotFound);
+            return false;
+        }
+    }
+
+    // Same resolution as the dialog: both directories sit in the segments dir.
+    const std::filesystem::path parentDir = resolvedSeg / params.parentId.toStdString();
+    const std::filesystem::path childDir = resolvedSeg / params.childId.toStdString();
+    if (!std::filesystem::is_directory(parentDir) || !std::filesystem::is_directory(childDir)) {
+        setErr(tr("Surface directories not found under %1.")
+                   .arg(QString::fromStdString(resolvedSeg.string())),
+               CommandLaunchError::InputNotFound);
+        return false;
+    }
+    if (!launchMergePatch(QString::fromStdString(parentDir.string()),
+                          QString::fromStdString(childDir.string()),
+                          params, /*interactive=*/false)) {
+        setErr(tr("Failed to start vc_merge_patch"));
+        return false;
     }
     emit statusMessage(tr("Patching tifxyz..."), 0);
+    return true;
 }
 
 void SegmentationCommandHandler::onGrowTrackPatches()
@@ -5408,161 +5944,222 @@ bool SegmentationCommandHandler::appendRasterizationMetadata(const QString& outp
 
 void SegmentationCommandHandler::onReloadFromBackup(const QString& segmentId, int backupIndex)
 {
-    if (!_state->vpkg()) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("No volume package loaded."));
-        return;
+    restoreSurfaceFromBackupImpl(segmentId, backupIndex, /*interactive=*/true, nullptr, nullptr);
+}
+
+std::vector<vc3d::segment_files::Backup>
+SegmentationCommandHandler::listSurfaceBackups(const QString& segmentId) const
+{
+    if (!_state || !_state->vpkg()) {
+        return {};
+    }
+    auto surf = _state->vpkg()->getSurface(segmentId.toStdString());
+    if (!surf || surf->path.empty()) {
+        return {};
+    }
+    return vc3d::segment_files::listBackups(
+        vc3d::segment_files::backupsDirectory(surf->path, surf->backupRoot));
+}
+
+bool SegmentationCommandHandler::restoreSurfaceFromBackup(const QString& segmentId,
+                                                          int backupIndex,
+                                                          QString* errorMessage,
+                                                          int* copiedFiles)
+{
+    return restoreSurfaceFromBackupImpl(segmentId, backupIndex, /*interactive=*/false,
+                                        errorMessage, copiedFiles);
+}
+
+bool SegmentationCommandHandler::restoreSurfaceFromBackupImpl(const QString& segmentId,
+                                                              int backupIndex,
+                                                              bool interactive,
+                                                              QString* errorMessage,
+                                                              int* copiedFiles)
+{
+    // Interactive restores present each failure in the message box the menu
+    // always used.
+    auto fail = [&](const QString& message, bool critical = false,
+                    const QString& title = QString()) -> bool {
+        if (interactive) {
+            const QString boxTitle = title.isEmpty() ? tr("Error") : title;
+            if (critical) {
+                QMessageBox::critical(_parentWidget, boxTitle, message);
+            } else {
+                QMessageBox::warning(_parentWidget, boxTitle, message);
+            }
+        }
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
+
+    if (!_state || !_state->vpkg()) {
+        return fail(tr("No volume package loaded."));
     }
 
     const std::string segIdStd = segmentId.toStdString();
     auto surf = _state->vpkg()->getSurface(segIdStd);
     if (!surf) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Surface not found: %1").arg(segmentId));
-        return;
+        return fail(tr("Surface not found: %1").arg(segmentId));
     }
 
-    // Backups live under <backupRoot>/backups/<id>/<index> (backupRoot is the
-    // volpkg.json's directory), matching QuadSurface::saveSnapshot().
     namespace fs = std::filesystem;
-    fs::path segmentDir = surf->path;
-    fs::path backupRoot = surf->backupRoot.empty() ? segmentDir.parent_path() : surf->backupRoot;
-    fs::path backupDir = backupRoot / "backups" / segmentDir.filename() / std::to_string(backupIndex);
+    const fs::path segmentDir = surf->path;
+    const fs::path backupDir =
+        vc3d::segment_files::backupsDirectory(segmentDir, surf->backupRoot) /
+        std::to_string(backupIndex);
 
     if (!fs::exists(backupDir)) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-            tr("Backup directory does not exist: %1").arg(QString::fromStdString(backupDir.string())));
-        return;
+        return fail(tr("Backup directory does not exist: %1")
+                        .arg(QString::fromStdString(backupDir.string())));
     }
 
     if (!fs::exists(segmentDir)) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-            tr("Segment directory does not exist: %1").arg(QString::fromStdString(segmentDir.string())));
-        return;
+        return fail(tr("Segment directory does not exist: %1")
+                        .arg(QString::fromStdString(segmentDir.string())));
     }
 
-    // Confirm with user
-    QMessageBox::StandardButton reply = QMessageBox::question(
-        _parentWidget,
-        tr("Confirm Reload from Backup"),
-        tr("This will replace the current segment '%1' with backup %2.\n\n"
-           "The current segment data will be overwritten. Continue?")
-           .arg(segmentId).arg(backupIndex),
-        QMessageBox::Yes | QMessageBox::No,
-        QMessageBox::No);
-
-    if (reply != QMessageBox::Yes) {
-        emit statusMessage(tr("Reload from backup cancelled"), 3000);
-        return;
-    }
-
-    // Files to copy from backup
-    std::vector<std::string> filesToCopy = {
-        "mesh.ply",
-        "mask.tif",
-        "meta.json",
-        "generations.tif"
-    };
-
-    std::error_code ec;
-    int copiedCount = 0;
-
-    for (const auto& filename : filesToCopy) {
-        fs::path srcFile = backupDir / filename;
-        fs::path dstFile = segmentDir / filename;
-
-        if (fs::exists(srcFile)) {
-            // Remove existing file first
-            if (fs::exists(dstFile)) {
-                fs::remove(dstFile, ec);
-                if (ec) {
-                    QMessageBox::warning(_parentWidget, tr("Error"),
-                        tr("Failed to remove existing file %1: %2")
-                           .arg(QString::fromStdString(dstFile.string()))
-                           .arg(QString::fromStdString(ec.message())));
-                    return;
-                }
-            }
-
-            // Copy from backup
-            fs::copy_file(srcFile, dstFile, fs::copy_options::overwrite_existing, ec);
-            if (ec) {
-                QMessageBox::warning(_parentWidget, tr("Error"),
-                    tr("Failed to copy %1: %2")
-                       .arg(QString::fromStdString(filename))
-                       .arg(QString::fromStdString(ec.message())));
-                return;
-            }
-            copiedCount++;
+    if (interactive) {
+        const QMessageBox::StandardButton reply = QMessageBox::question(
+            _parentWidget,
+            tr("Confirm Reload from Backup"),
+            tr("This will replace the current segment '%1' with backup %2.\n\n"
+               "The current segment data will be overwritten. Continue?")
+               .arg(segmentId).arg(backupIndex),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No);
+        if (reply != QMessageBox::Yes) {
+            emit statusMessage(tr("Reload from backup cancelled"), 3000);
+            return false;
         }
+    }
+
+    // With backups on, the state being replaced becomes the newest backup
+    // first, so a restore can itself be undone from the same menu; a full
+    // ring drops its oldest slot for it and the other slots move down by one.
+    // With backups off (QuadSurface::backupCount() is 0), or before the
+    // segment has its first x.tif, the snapshot does nothing and the
+    // replaced state is not kept.
+    const bool keepsReplaced = QuadSurface::backupCount() > 0 &&
+                               fs::exists(segmentDir / "x.tif");
+    QString restoreError;
+    const int copiedCount = vc3d::segment_files::restoreBackupFiles(
+        backupDir, segmentDir,
+        [&surf](QString* error) {
+            try {
+                surf->saveSnapshot(-1, /*force=*/true);
+                return true;
+            } catch (const std::exception& e) {
+                *error = tr("Could not back up the current segment, so nothing was "
+                            "restored: %1").arg(QString::fromUtf8(e.what()));
+                return false;
+            }
+        },
+        &restoreError);
+    if (copiedCount < 0) {
+        return fail(restoreError);
+    }
+    if (copiedFiles) {
+        *copiedFiles = copiedCount;
     }
 
     if (copiedCount == 0) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-            tr("No files found in backup directory."));
-        return;
+        return fail(tr("No files found in backup directory."));
     }
 
     // Reload the surface
-    bool wasSelected = (_state->activeSurfaceId() == segIdStd);
+    const bool wasSelected = (_state->activeSurfaceId() == segIdStd);
 
-    if (_state->vpkg()->reloadSingleSegmentation(segIdStd)) {
-        try {
-            auto reloadedSurf = _state->vpkg()->loadSurface(segIdStd);
-            if (reloadedSurf) {
-                if (_state) {
-                    _state->setSurface(segIdStd, reloadedSurf, false, false);
-                }
+    if (!_state->vpkg()->reloadSingleSegmentation(segIdStd)) {
+        return fail(tr("Files were copied but failed to reload the segmentation. "
+                       "Try using the reload button."),
+                    false, tr("Warning"));
+    }
+    try {
+        auto reloadedSurf = _state->vpkg()->loadSurface(segIdStd);
+        if (reloadedSurf) {
+            _state->setSurface(segIdStd, reloadedSurf, false, false);
+
+            if (_surfacePanel) {
+                _surfacePanel->refreshSurfaceMetrics(segIdStd);
+            }
+
+            if (wasSelected) {
+                _state->setActiveSurface(segIdStd, std::dynamic_pointer_cast<QuadSurface>(reloadedSurf));
+                _state->setSurface("segmentation", reloadedSurf, false, false);
 
                 if (_surfacePanel) {
-                    _surfacePanel->refreshSurfaceMetrics(segIdStd);
+                    _surfacePanel->syncSelectionUi(segIdStd, reloadedSurf.get());
                 }
-
-                if (wasSelected) {
-                    _state->setActiveSurface(segIdStd, std::dynamic_pointer_cast<QuadSurface>(reloadedSurf));
-
-                    if (_state) {
-                        _state->setSurface("segmentation", reloadedSurf, false, false);
-                    }
-
-                    if (_surfacePanel) {
-                        _surfacePanel->syncSelectionUi(segIdStd, reloadedSurf.get());
-                    }
-                }
-
-                emit statusMessage(
-                    tr("Restored '%1' from backup %2 (%3 files)")
-                       .arg(segmentId).arg(backupIndex).arg(copiedCount),
-                    5000);
             }
-        } catch (const std::exception& e) {
-            QMessageBox::critical(_parentWidget, tr("Error"),
-                tr("Failed to reload surface after restore: %1")
-                   .arg(QString::fromUtf8(e.what())));
+
+            emit statusMessage(
+                (keepsReplaced
+                     ? tr("Restored '%1' from backup %2 (%3 files); the replaced "
+                          "state is now the newest backup")
+                     : tr("Restored '%1' from backup %2 (%3 files)"))
+                   .arg(segmentId).arg(backupIndex).arg(copiedCount),
+                5000);
         }
-    } else {
-        QMessageBox::warning(_parentWidget, tr("Warning"),
-            tr("Files were copied but failed to reload the segmentation. "
-               "Try using the reload button."));
+    } catch (const std::exception& e) {
+        return fail(tr("Failed to reload surface after restore: %1")
+                        .arg(QString::fromUtf8(e.what())),
+                    true);
     }
+    return true;
 }
 
 void SegmentationCommandHandler::onMoveSegmentToPaths(const QString& segmentId)
 {
-    if (!_state->vpkg()) {
-        emit statusMessage(tr("No volume package loaded"), 3000);
-        return;
+    moveSegmentToPathsImpl(segmentId, /*replaceExisting=*/false, /*interactive=*/true,
+                           nullptr, nullptr, nullptr);
+}
+
+bool SegmentationCommandHandler::moveSegmentToPaths(const QString& segmentId,
+                                                    bool replaceExisting,
+                                                    QString* errorMessage,
+                                                    QString* newPath,
+                                                    bool* destinationExists)
+{
+    return moveSegmentToPathsImpl(segmentId, replaceExisting, /*interactive=*/false,
+                                  errorMessage, newPath, destinationExists);
+}
+
+bool SegmentationCommandHandler::moveSegmentToPathsImpl(const QString& segmentId,
+                                                        bool replaceExisting,
+                                                        bool interactive,
+                                                        QString* errorMessage,
+                                                        QString* newPathOut,
+                                                        bool* destinationExistsOut)
+{
+    auto setError = [&](const QString& message) {
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        return false;
+    };
+    // Precondition failures are status-bar notes in the menu.
+    auto note = [&](const QString& message) {
+        if (interactive) {
+            emit statusMessage(message, 3000);
+        }
+        return setError(message);
+    };
+
+    if (!_state || !_state->vpkg()) {
+        return note(tr("No volume package loaded"));
     }
 
     // Verify we're in traces directory
     if (_state->vpkg()->getSegmentationDirectory() != "traces") {
-        emit statusMessage(tr("Can only move segments from traces directory"), 3000);
-        return;
+        return note(tr("Can only move segments from traces directory"));
     }
 
     // Get the segment
     auto seg = _state->vpkg()->segmentation(segmentId.toStdString());
     if (!seg) {
-        emit statusMessage(tr("Segment not found: %1").arg(segmentId), 3000);
-        return;
+        return note(tr("Segment not found: %1").arg(segmentId));
     }
 
     // Build paths
@@ -5570,42 +6167,39 @@ void SegmentationCommandHandler::onMoveSegmentToPaths(const QString& segmentId)
     std::filesystem::path currentPath = seg->path();
     std::filesystem::path newPath = volpkgPath / "paths" / currentPath.filename();
 
-    // Check if destination exists
-    if (std::filesystem::exists(newPath)) {
-        QMessageBox::StandardButton reply = QMessageBox::question(
-            _parentWidget,
-            tr("Destination Exists"),
-            tr("Segment '%1' already exists in paths/.\nDo you want to replace it?").arg(segmentId),
-            QMessageBox::Yes | QMessageBox::No,
-            QMessageBox::No
-        );
-
-        if (reply != QMessageBox::Yes) {
-            return;
-        }
-
-        // Remove the existing one
-        try {
-            std::filesystem::remove_all(newPath);
-        } catch (const std::exception& e) {
-            QMessageBox::critical(_parentWidget, tr("Error"),
-                tr("Failed to remove existing segment: %1").arg(e.what()));
-            return;
-        }
+    const bool destinationExists = std::filesystem::exists(newPath);
+    if (destinationExistsOut) {
+        *destinationExistsOut = destinationExists;
     }
+    if (interactive) {
+        if (destinationExists) {
+            const QMessageBox::StandardButton reply = QMessageBox::question(
+                _parentWidget,
+                tr("Destination Exists"),
+                tr("Segment '%1' already exists in paths/.\nDo you want to replace it?").arg(segmentId),
+                QMessageBox::Yes | QMessageBox::No,
+                QMessageBox::No
+            );
+            if (reply != QMessageBox::Yes) {
+                return false;
+            }
+            replaceExisting = true;
+        }
 
-    // Confirm the move
-    QMessageBox::StandardButton reply = QMessageBox::question(
-        _parentWidget,
-        tr("Move to Paths"),
-        tr("Move segment '%1' from traces/ to paths/?\n\n"
-           "Note: The segment will be closed if currently open.").arg(segmentId),
-        QMessageBox::Yes | QMessageBox::No,
-        QMessageBox::Yes
-    );
-
-    if (reply != QMessageBox::Yes) {
-        return;
+        // Confirm the move
+        const QMessageBox::StandardButton reply = QMessageBox::question(
+            _parentWidget,
+            tr("Move to Paths"),
+            tr("Move segment '%1' from traces/ to paths/?\n\n"
+               "Note: The segment will be closed if currently open.").arg(segmentId),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::Yes
+        );
+        if (reply != QMessageBox::Yes) {
+            return false;
+        }
+    } else if (destinationExists && !replaceExisting) {
+        return setError(tr("Segment '%1' already exists in paths/.").arg(segmentId));
     }
 
     // === CRITICAL: Clean up the segment before moving ===
@@ -5615,18 +6209,16 @@ void SegmentationCommandHandler::onMoveSegmentToPaths(const QString& segmentId)
     bool wasSelected = (_state->activeSurfaceId() == idStd);
 
     // Clear from surface collection (including "segmentation" if it matches)
-    if (_state) {
-        auto currentSurface = _state->surface(idStd);
-        auto segmentationSurface = _state->surface("segmentation");
+    auto currentSurface = _state->surface(idStd);
+    auto segmentationSurface = _state->surface("segmentation");
 
-        // If this surface is currently shown as "segmentation", clear it
-        if (currentSurface && segmentationSurface && currentSurface == segmentationSurface) {
-            _state->setSurface("segmentation", nullptr, false, false);
-        }
-
-        // Clear the surface from the collection
-        _state->setSurface(idStd, nullptr, false, false);
+    // If this surface is currently shown as "segmentation", clear it
+    if (currentSurface && segmentationSurface && currentSurface == segmentationSurface) {
+        _state->setSurface("segmentation", nullptr, false, false);
     }
+
+    // Clear the surface from the collection
+    _state->setSurface(idStd, nullptr, false, false);
 
     // Unload the surface from VolumePkg
     _state->vpkg()->unloadSurface(idStd);
@@ -5638,30 +6230,37 @@ void SegmentationCommandHandler::onMoveSegmentToPaths(const QString& segmentId)
         }
     }
 
-    // Perform the move
-    try {
-        std::filesystem::rename(currentPath, newPath);
-
-        // Remove from VolumePkg's internal tracking for traces
-        _state->vpkg()->removeSingleSegmentation(idStd);
-
-        // The inotify system will pick up the IN_MOVED_TO in paths/
-        // and handle adding it there if the user switches to that directory
-
-        if (_surfacePanel) {
-            _surfacePanel->removeSingleSegmentation(idStd);
+    // Perform the move. A replaced paths/ segment is deleted only after the
+    // move succeeded and is put back if it fails.
+    QString moveError;
+    if (!vc3d::segment_files::moveSegmentDirectory(currentPath, newPath, replaceExisting,
+                                                   &moveError)) {
+        // The segment stays unloaded; reloading it here could race with the
+        // file watcher.
+        const QString message = tr("%1\n\nThe segment has been unloaded from the viewer.")
+                                    .arg(moveError);
+        if (interactive) {
+            QMessageBox::critical(_parentWidget, tr("Error"), message);
         }
-
-        emit statusMessage(
-            tr("Moved %1 from traces/ to paths/. Switch to paths directory to see it.").arg(segmentId), 5000);
-
-    } catch (const std::exception& e) {
-        // If move failed, we might want to reload the segment
-        // but it's probably safer to leave it unloaded
-        QMessageBox::critical(_parentWidget, tr("Error"),
-            tr("Failed to move segment: %1\n\n"
-               "The segment has been unloaded from the viewer.").arg(e.what()));
+        return setError(message);
     }
+
+    // Remove from VolumePkg's internal tracking for traces
+    _state->vpkg()->removeSingleSegmentation(idStd);
+
+    // The inotify system will pick up the IN_MOVED_TO in paths/
+    // and handle adding it there if the user switches to that directory
+
+    if (_surfacePanel) {
+        _surfacePanel->removeSingleSegmentation(idStd);
+    }
+
+    emit statusMessage(
+        tr("Moved %1 from traces/ to paths/. Switch to paths directory to see it.").arg(segmentId), 5000);
+    if (newPathOut) {
+        *newPathOut = QString::fromStdString(newPath.string());
+    }
+    return true;
 }
 
 void SegmentationCommandHandler::onRenameSurface(const QString& segmentId)

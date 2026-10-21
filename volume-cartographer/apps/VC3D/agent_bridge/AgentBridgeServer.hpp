@@ -5,13 +5,17 @@
 //
 // Everything here runs on the Qt GUI thread: QLocalSocket delivers readyRead on
 // the main thread, so no extra thread is required and handlers may touch the UI
-// directly. Handlers must never spin a nested event loop (no dialog exec()).
+// directly. Handlers must never spin a nested event loop (no dialog exec());
+// should one run anyway (canvas.key answering a dialog that a shortcut
+// opened), requests that arrive meanwhile wait until the current one ends.
 
 #include <QByteArray>
 #include <QHash>
+#include <QJsonArray>
 #include <QJsonObject>
 #include <QJsonValue>
 #include <QObject>
+#include <QPointF>
 #include <QPointer>
 #include <QString>
 #include <QStringList>
@@ -25,14 +29,21 @@
 #include "VolumeAttachmentController.hpp"
 
 #include "agent_bridge/AgentBridgeError.hpp"  // AgentBridgeError
+#include "agent_bridge/AgentBridgeKeyboard.hpp"
 #include "agent_bridge/AgentBridgeMethod.hpp"
+#include "agent_bridge/AgentBridgeObservation.hpp"
 
+class QDockWidget;
 class QLocalServer;
 class QLocalSocket;
 class QTimer;
+class QWidget;
+class CChunkedVolumeViewer;
 class CWindow;
+class ViewerManager;
 class VolumeViewerBase;
 struct CommandLaunchError;
+struct ProjectAttachmentOutcome;
 
 namespace vc3d::opendata {
 struct OpenDataManifest;
@@ -87,6 +98,10 @@ private:
     void registerPointsHandlers();
     void registerSeedingHandlers();
     void registerSurfaceOpsHandlers();
+    void registerSegmentOpsHandlers();
+    void registerProjectHandlers();
+    void registerViewerDisplayHandlers();
+    void registerEditSettingsHandlers();
     void registerMethod(AgentBridgeMethod method, Handler handler);
 
     // --- Discovery registry file (mirrors LasagnaServiceManager's
@@ -98,6 +113,10 @@ private:
     void writeRegistryFile();
     void removeRegistryFile();
 
+    // Dispatches the complete lines buffered for `socket`, in frame order.
+    void processBufferedLines(QLocalSocket* socket);
+    // Reports an oversized request best-effort and drops only that client.
+    void dropOversizedClient(QLocalSocket* socket);
     void processLine(QLocalSocket* socket, const QByteArray& line);
     void dispatch(QLocalSocket* socket, const QJsonObject& request);
     void sendResponse(QLocalSocket* socket, const QJsonValue& id, const QJsonObject& result);
@@ -113,12 +132,20 @@ private:
                                               const QString& source);
 
     // --- Viewer registry ---
+    // Viewers come from every live ViewerManager (one per workspace that owns
+    // viewers), so Spiral panes are targetable like the main ones.
     struct ViewerEntry {
         QString id;                 // stable "v<N>", never reused within a process
         VolumeViewerBase* viewer;   // live viewer; removed on baseViewerClosing
+        QPointer<QObject> object;   // drops viewers destroyed without that signal
+        // Owned by CWindow's own ViewerManager. Slot names resolve among these
+        // first, because Spiral reuses the main slot names for its panes.
+        bool primary = true;
     };
-    void seedViewerRegistry();
-    void registerViewer(VolumeViewerBase* viewer);
+    // Subscribes to managers not seen before and registers their viewers;
+    // prunes destroyed viewers. Cheap; runs before every dispatch.
+    void syncViewerManagers();
+    void registerViewer(VolumeViewerBase* viewer, bool primary);
     void unregisterViewer(VolumeViewerBase* viewer);
     QString viewerIdFor(VolumeViewerBase* viewer) const;
     QString viewerTitle(VolumeViewerBase* viewer) const;
@@ -126,6 +153,54 @@ private:
     // AgentBridgeError (-32002) on ambiguity or no match.
     VolumeViewerBase* resolveViewer(const QJsonValue& ref,
                                     const QString& defaultSlot = QStringLiteral("segmentation")) const;
+
+    // --- Workspaces (AgentBridgeWorkspaces.cpp) ---
+    // A workspace is a tab of CWindow's workspace tab widget whose page carries
+    // a "workspaceId" property. Line-annotation tabs have no id and are not
+    // addressable.
+    struct WorkspaceTab {
+        QString id;
+        QString title;
+        int index = -1;
+        QWidget* page = nullptr;
+    };
+    std::vector<WorkspaceTab> workspaceTabs() const;
+    QWidget* workspacePage(const QString& id) const;
+    QString currentWorkspaceId() const;
+    // Id of the workspace tab whose page contains `widget` (floating docks
+    // included), or empty when the widget is outside every addressable tab.
+    QString workspaceIdFor(const QWidget* widget) const;
+    // Makes `id` the current tab exactly as the GUI does. Returns false when
+    // no tab has that id.
+    bool setCurrentWorkspace(const QString& id);
+    // state.get's "workspace": the current tab's id and {id, title} of every
+    // addressable tab in tab order.
+    QJsonObject workspacesJson() const;
+    // Dock lookup by objectName (a visible match preferred) and the dock list
+    // ui.inspect reports (AgentBridgeHandlers_ui.cpp).
+    QDockWidget* findDock(const QString& objectName) const;
+    QJsonArray docksJson() const;
+    // The panel page of a dock kept in the bottom dock bar
+    // (StatusDockPanelHost), where its content lives while the QDockWidget
+    // itself stays an empty hidden shell; nullptr for any other dock.
+    QWidget* dockBarPage(const QDockWidget* dock) const;
+
+    // --- Observation (AgentBridgeObservation.cpp) ---
+    // state.get's snapshot and revision, and the state.changed notification.
+    // Fingerprints of the observed fields are compared when an application
+    // signal reports a change (connectStateSignals), after every request
+    // before its response, and in every state.get, so changes a person makes
+    // in the GUI are reported too. There is no polling.
+    QJsonObject stateSnapshot();
+    QHash<QString, QByteArray> observedStateFingerprints(const QJsonObject& snapshot);
+    // Bumps the revision and broadcasts state.changed when a fingerprint
+    // differs from the previous refresh.
+    void refreshObservedState(const QJsonObject& snapshot);
+    // Takes a snapshot and refreshes now; never throws.
+    void refreshObservedStateNow();
+    // Refreshes once the bridge is idle; repeated calls coalesce.
+    void queueStateRefresh();
+    void connectStateSignals();
 
     // --- Handlers ---
     QJsonObject handlePing(const QJsonValue& params);
@@ -144,9 +219,32 @@ private:
     // heavy surface load.
     QJsonObject handleSegmentsReview(const QJsonValue& params);
     QJsonObject handleScreenshotCapture(const QJsonValue& params);
+    // Read-only accessibility tree of the main window, a dock, a workspace,
+    // or the focused widget (AgentBridgeHandlers_ui.cpp,
+    // AgentBridgeAccessible.cpp).
+    QJsonObject handleUiInspect(const QJsonValue& params);
     QJsonObject handleCursorVolumePoint(const QJsonValue& params);
     QJsonObject handleCanvasClick(const QJsonValue& params, bool addShift);
     QJsonObject handleCanvasDrag(const QJsonValue& params);
+    // Keyboard and wheel input (AgentBridgeHandlers_input.cpp). Real QKeyEvent
+    // and QWheelEvent objects go through QApplication::notify, so shortcut
+    // overrides, the viewer's own handlers and propagation to
+    // CWindow::keyPressEvent behave as for hardware input.
+    QJsonObject handleCanvasKey(const QJsonValue& params);
+    QJsonObject handleCanvasWheel(const QJsonValue& params);
+    // Throws -32009 with data.window while a modal dialog or popup menu is
+    // open: synthesized events bypass Qt's modal blocking.
+    void requireNoBlockingWindow() const;
+    // The viewer as a chunked volume viewer; any other kind of viewer throws
+    // -32009 "Unsupported viewer for <operation>".
+    static CChunkedVolumeViewer* requireChunkedViewer(
+        VolumeViewerBase* viewer,
+        const QString& operation = QStringLiteral("canvas operation"));
+    // Converts a canvas "position" in `space` ("volume" or "scene") to a scene
+    // point; a volume point must round-trip onto the viewer's current view
+    // (-32003).
+    QPointF canvasScenePoint(VolumeViewerBase* viewer, const QJsonValue& position,
+                             const QString& space) const;
     QJsonObject handleViewerCenterOnPoint(const QJsonValue& params);
     QJsonObject handleViewerZoom(const QJsonValue& params);
     QJsonObject handleViewerRotate(const QJsonValue& params);
@@ -160,6 +258,11 @@ private:
     QJsonObject handleViewerSetOverlay(const QJsonValue& params);
     QJsonObject handleViewerListOverlayVolumes(const QJsonValue& params);
     QJsonObject handleViewerSetIntersects(const QJsonValue& params);
+    // Ink detection overlay (AgentBridgeHandlers_viewerdisplay.cpp).
+    QJsonObject handleViewerGetInkOverlay(const QJsonValue& params);
+    QJsonObject handleViewerSetInkOverlay(const QJsonValue& params);
+    QJsonObject inkOverlayJson() const;
+    QJsonObject handleViewerReset(const QJsonValue& params);
     QJsonObject handleSegmentationEnableEditing(const QJsonValue& params);
     QJsonObject handleSegmentationGrow(const QJsonValue& params);
     QJsonObject handleSegmentationGrowPatchFromSeed(const QJsonValue& params);
@@ -174,6 +277,13 @@ private:
     QJsonObject handleManualAddSetInterpolation(const QJsonValue& params);
     QJsonObject handleManualAddUndoConstraint(const QJsonValue& params);
     QJsonObject handleCorrectionsSetPointMode(const QJsonValue& params);
+    // Editing settings and approval-mask mode (AgentBridgeHandlers_editsettings.cpp)
+    // over SegmentationWidget and SegmentationModule.
+    QJsonObject handleSegmentationGetSettings(const QJsonValue& params);
+    QJsonObject handleSegmentationSetSettings(const QJsonValue& params);
+    QJsonObject handleApprovalMaskSetMode(const QJsonValue& params);
+    QJsonObject handleApprovalMaskUndo(const QJsonValue& params);
+    QJsonObject segmentationSettingsJson() const;
     // Same-winding wrap annotation (tutorial's shift+E). set_mode drives the
     // WrapAnnotationWidget checkbox; commit/undo mirror the shift+E / Ctrl+Z
     // key handlers over the chunked viewers.
@@ -298,6 +408,36 @@ private:
     QJsonObject handleSegmentAppendMask(const QJsonValue& params);
     QJsonObject handleSegmentMask(const QJsonValue& params, bool append);
 
+    // Segment file operations live in AgentBridgeHandlers_segmentops.cpp and
+    // drive SegmentationCommandHandler's dialog-free cores.
+    QJsonObject handleSegmentTransform(const QJsonValue& params);
+    // Throws -32004 while `segmentId` is being edited (any segment when
+    // empty), a mask render runs, or a "tool" job runs.
+    void requireSegmentFilesIdle(const QString& segmentId, const QString& operation) const;
+    QJsonObject handleSegmentExportObj(const QJsonValue& params);
+    QJsonObject handleSegmentRasterize(const QJsonValue& params);
+    QJsonObject handleSegmentNeighborCopy(const QJsonValue& params);
+    QJsonObject handleSegmentsMerge(const QJsonValue& params);
+    QJsonObject handleSegmentsPatch(const QJsonValue& params);
+    QJsonObject handleSegmentRestoreBackup(const QJsonValue& params);
+    QJsonObject handleSegmentsMoveToPaths(const QJsonValue& params);
+
+    // Project attachments and Save As (AgentBridgeHandlers_project.cpp).
+    // Asynchronous attachments are "project" jobs.
+    QJsonObject handleProjectAttach(const QJsonValue& params);
+    QJsonObject handleProjectDetach(const QJsonValue& params);
+    QJsonObject handleProjectSaveAs(const QJsonValue& params);
+    QJsonObject attachFiberVolume(const QString& location);
+    void completeProjectAttachmentJob(const QString& kind, const ProjectAttachmentOutcome& outcome);
+    // Registers a "tool" job for a launch that `launch` performs (reporting
+    // the job's output path) and, when `closingOperation` is non-empty, keeps
+    // it open until that operation's segmentOperationFinished. Throws the
+    // mapped launch error on failure.
+    QString launchSegmentToolJob(
+        const QString& kind, const QString& label, const QString& segmentId,
+        const QString& closingOperation,
+        const std::function<bool(CommandLaunchError* error, QString* outputPath)>& launch);
+
     // --- Open Data manifest acquisition ---
     // Serves the cached manifest synchronously when available and `refresh` is
     // false; otherwise starts an async re-fetch with a 30-second deadline and
@@ -330,6 +470,11 @@ private:
         // Additive terminal result body. Empty => "result": null on
         // the wire; catalog and volume-attachment jobs carry structured bodies.
         QJsonObject resultJson;
+        // Non-empty for a "tool" job whose operation post-processes the tool
+        // output or runs several tool passes: the job then ends on
+        // SegmentationCommandHandler::segmentOperationFinished for this kind
+        // instead of on the runner's toolFinished.
+        QString closingOperation;
     };
     void subscribeJobSignals();
     // Per-source running check: true when a bridge JobRecord for `source` is
@@ -355,6 +500,8 @@ private:
     // stays free of CommandLineToolRunner's enum).
     void handleToolStarted(const QString& message);
     void handleToolFinished(bool success, const QString& message, const QString& outputPath);
+    void handleSegmentOperationFinished(const QString& kind, bool success,
+                                        const QString& message, const QString& outputPath);
     void handleConsoleOutput(const QString& output);
     void handleGrowthStatusChanged(bool running);
     // Closes the "autosave"-source job when an explicit segment save
@@ -396,6 +543,53 @@ private:
     void completeCatalogOpenJob(const MenuActionController::OpenDataSampleOpenOutcome& outcome);
     void completeVolumeAttachmentJob(const VolumeAttachmentOutcome& outcome);
 
+    // --- Re-entry ---
+    // While a request is handled, or queued work runs, the bridge is busy:
+    // new request lines only accumulate in their buffers, and work passed to
+    // runWhenIdle() waits. Both run, in order, once it is idle again.
+    class BusyScope;
+    void runWhenIdle(std::function<void()> work);
+    void scheduleIdleWork();
+    void runIdleWork();
+    int _busyDepth = 0;
+    bool _idleWorkScheduled = false;
+    bool _requestsPending = false;
+    std::vector<std::function<void()>> _idleWork;
+
+    // --- Keys held by a connection (AgentBridgeHandlers_input.cpp) ---
+    // canvas.key presses and holds are tracked per connection, so a client
+    // that disconnects cannot leave a tool latched, and every held key has a
+    // timer that releases it.
+    struct HeldKey {
+        int serial = 0;  // matches the timer that releases this press only
+        QPointer<QLocalSocket> socket;
+        QPointer<QWidget> target;
+        QString viewerId;
+        AgentBridgeKeyStroke stroke;
+        bool orphaned = false;  // its connection closed; the release is queued
+    };
+    HeldKey& holdKey(QLocalSocket* socket, QWidget* target, const QString& viewerId,
+                     const AgentBridgeKeyStroke& stroke);
+    // After `delayMs`, releases the press `serial` if it is still held; with
+    // a deferred `token`, then answers it with `result`.
+    void scheduleHeldKeyRelease(int serial, int delayMs, int token,
+                                const QJsonObject& result, QLocalSocket* socket);
+    void finishHeldKey(int serial, int token, QJsonObject result,
+                       const QPointer<QLocalSocket>& socket);
+    // Releases a closed connection's keys once the bridge is idle.
+    void releaseHeldKeys(QLocalSocket* socket);
+    void releaseOrphanedKeys();
+    // Sets QGuiApplication::keyboardModifiers() to the modifiers of the keys
+    // still held (agentBridgeResetModifiers).
+    void resetKeyboardModifiers();
+    QJsonArray heldKeyNames(QLocalSocket* socket) const;
+    // state.get's "heldKeys": {key, modifiers, viewerId} for every held key.
+    QJsonArray heldKeysJson() const;
+    std::vector<HeldKey> _heldKeys;
+    int _nextHeldKeySerial = 1;
+    // Never shown and without a parent; deleted with the server.
+    QPointer<QWidget> _keyboardModifierSink;
+
     // --- Deferred responses ---
     // A handler calls beginDeferred() to stash the current (socket, id), arm a
     // timeout timer, and get a token; it then throws AgentBridgeDeferred{}. When
@@ -425,6 +619,10 @@ private:
 
     std::vector<ViewerEntry> _viewers;
     int _nextViewerNum = 1;
+    std::vector<QPointer<ViewerManager>> _viewerManagers;
+
+    AgentBridgeStateTracker _stateTracker;
+    bool _stateRefreshQueued = false;
 
     // At most one active job per source, with the last eight completed records
     // retained per source. Job numbers are shared across sources.
