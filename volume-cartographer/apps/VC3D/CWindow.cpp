@@ -9,6 +9,8 @@
 #include "RenderBenchRecorder.hpp"
 #include "RenderBenchReplay.hpp"
 #include "StatusDockPanelHost.hpp"
+#include "SessionRecovery.hpp"
+#include "SessionRecoveryDialog.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/render/ChunkCache.hpp"
@@ -3252,6 +3254,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         settings.value(vc3d::settings::project::SHOW_OPEN_DATA_CATALOG_ON_STARTUP,
                        vc3d::settings::project::SHOW_OPEN_DATA_CATALOG_ON_STARTUP_DEFAULT).toBool()) {
         QTimer::singleShot(0, this, [this]() {
+            // A crash recovery offer goes first; the catalog follows it.
+            if (_sessionRecoveryOfferPending) {
+                _startupCatalogDeferred = true;
+                return;
+            }
             if (_menuController && !_state->hasVpkg()) {
                 _menuController->showOpenDataCatalog();
                 updateVolumePackageEmptyState();
@@ -3478,6 +3485,60 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     } else if (!_benchOptions.recordPath.isEmpty()) {
         _benchRecorder = std::make_unique<RenderBenchRecorder>(_benchOptions.recordPath);
     }
+}
+
+void CWindow::startSessionRecovery(bool offerLeftovers)
+{
+    if (_sessionRecovery || !SessionRecovery::enabledInSettings()) {
+        return;
+    }
+    const auto projectPath = [this] {
+        return _state->vpkg() ? vc3d::pathToQString(_state->vpkg()->path()) : QString();
+    };
+    _sessionRecovery = new SessionRecovery(SessionRecovery::defaultDirectory(), this);
+    connect(_sessionRecovery, &SessionRecovery::writeFailed, this, [this](const QString& text) {
+        showStatusBarMessage(text, 15000);
+    });
+    _sessionRecovery->begin(_state->pointCollection());
+    _sessionRecovery->setProject(projectPath());
+    _sessionRecovery->setSegment(QString::fromStdString(_state->activeSurfaceId()));
+    connect(_state, &CState::vpkgChanged, _sessionRecovery, [this](std::shared_ptr<VolumePkg> vpkg) {
+        _sessionRecovery->setProject(vpkg ? vc3d::pathToQString(vpkg->path()) : QString());
+    });
+    connect(_surfacePanel.get(), &SurfacePanelController::surfaceActivated,
+            _sessionRecovery, &SessionRecovery::setSegment);
+    connect(_surfacePanel.get(), &SurfacePanelController::surfaceActivatedPreserveEditing,
+            _sessionRecovery, &SessionRecovery::setSegment);
+    if (!offerLeftovers || _sessionRecovery->leftoverSessions().empty()) {
+        return;
+    }
+    // The open-data catalog shown at startup would sit under the modal offer
+    // and stay over the project Recover opens, so it waits for the offer and
+    // shows only if no project is open by then.
+    _sessionRecoveryOfferPending = true;
+    QTimer::singleShot(0, this, [this, projectPath]() {
+        auto* dialog = SessionRecoveryDialog::offer(this, *_sessionRecovery, _state->pointCollection(), {
+            projectPath,
+            [this](const QString& path, QString* error) { return openVolumePackage(path, false, error); },
+            [this](const QString& id, QString* error) {
+                return _surfacePanel->activateSurfaceById(id.toStdString(), error);
+            },
+            [this](const QString& text) { showStatusBarMessage(text, 15000); }});
+        const auto offerDone = [this]() {
+            const bool showCatalog = _startupCatalogDeferred;
+            _sessionRecoveryOfferPending = false;
+            _startupCatalogDeferred = false;
+            if (showCatalog && !_destroyingWindow && _menuController && !_state->hasVpkg()) {
+                _menuController->showOpenDataCatalog();
+                updateVolumePackageEmptyState();
+            }
+        };
+        if (dialog) {
+            connect(dialog, &QDialog::finished, this, offerDone);
+        } else {
+            offerDone();
+        }
+    });
 }
 
 // Destructor

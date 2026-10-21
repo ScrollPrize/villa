@@ -185,6 +185,39 @@ vc_register_ctest(unified_browser_dialog test_unified_browser_dialog)
 set_tests_properties(unified_browser_dialog PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+# The VCCollection shim is not built into a library; compile it and its MOC here.
+qt6_wrap_cpp(session_recovery_vccollection_moc
+    ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+
+add_executable(test_session_recovery
+    test_session_recovery.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionRecovery.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionRecovery.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionRecoveryDialog.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionRecoveryDialog.hpp
+    ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
+    ${session_recovery_vccollection_moc})
+
+set_target_properties(test_session_recovery PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_session_recovery PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_session_recovery PRIVATE
+    vc_core
+    Qt6::Concurrent
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Test
+    Qt6::Widgets)
+
+add_test(NAME session_recovery COMMAND test_session_recovery)
+vc_register_test_target(test_session_recovery)
+vc_register_ctest(session_recovery test_session_recovery)
+set_tests_properties(session_recovery PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 60)
+
 add_executable(test_spiral_reload_comparison
     test_spiral_reload_comparison.cpp)
 

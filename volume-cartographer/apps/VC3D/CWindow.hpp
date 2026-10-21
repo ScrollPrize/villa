@@ -128,6 +128,7 @@ class FiberCollectionController;
 class WrapAnnotationWidget;
 class AtlasControlPointsDock;
 class StatusDockPanelHost;
+class SessionRecovery;
 class ViewerCompositePanel;
 class LineAnnotationDialog;
 class SpiralWorkspace;
@@ -194,6 +195,11 @@ public:
                            QString* errorMessage = nullptr,
                            const QString& preferredVolumeId = {},
                            VolumeOpenError* openError = nullptr);
+
+    // Keeps a crash recovery copy of the points and the open segment from now
+    // on and, with offerLeftovers, offers what a crashed session left once
+    // the window is up. Does nothing when backup/session_recovery is off.
+    void startSessionRecovery(bool offerLeftovers);
 
     // Helper method to get the current volume path
     QString getCurrentVolumePath() const;
@@ -449,6 +455,11 @@ private:
     QLabel* _projectNameLabel{nullptr};
     QMainWindow* _segmentWorkspaceWindow{nullptr};
     StatusDockPanelHost* _statusDockPanelHost{nullptr};
+    SessionRecovery* _sessionRecovery{nullptr};
+    // While a crash recovery offer is pending, the open-data catalog shown at
+    // startup waits for it (startSessionRecovery).
+    bool _sessionRecoveryOfferPending{false};
+    bool _startupCatalogDeferred{false};
     QMainWindow* _lasagnaWorkspaceWindow{nullptr};
     QMainWindow* _atlasWorkspaceWindow{nullptr};
     QMainWindow* _fiberSliceWorkspaceWindow{nullptr};

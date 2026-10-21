@@ -622,6 +622,13 @@ auto main(int argc, char* argv[]) -> int
             std::cout.flush();
         }
 
+        // Crash recovery needs a person at the window: agent bridge and
+        // render bench replay runs keep no copy. The offer would replace a
+        // project given on the command line, so it waits for a plain start.
+        if (!bridgeRequested && benchOptions.replayPath.isEmpty()) {
+            aWin.startSessionRecovery(!parser.isSet(volumePackageOption));
+        }
+
         aWin.show();
         rc = QApplication::exec();
     }
