@@ -11103,14 +11103,20 @@ bool LineAnnotationController::applyControlPointEditAndPersist(
     };
     const auto goalsBefore = goalsOf(session.controlPoints);
     (void)vc3d::line_annotation::applyGapSpanPolicy(session.controlPoints);
-    if (changedGoalOwners) {
-        changedGoalOwners->clear();
+    // Handed to the caller only once the edit is persisted: a failed save
+    // below restores controlsBeforeEdit, and the caller must then see no
+    // changed goals (nothing to re-solve against a rolled-back state).
+    std::vector<size_t> goalOwnersChanged;
+    {
         const auto goalsAfter = goalsOf(session.controlPoints);
         for (size_t i = 0; i < goalsAfter.size(); ++i) {
             if (goalsAfter[i] != goalsBefore[i]) {
-                changedGoalOwners->push_back(i);
+                goalOwnersChanged.push_back(i);
             }
         }
+    }
+    if (changedGoalOwners) {
+        changedGoalOwners->clear();
     }
 
     // The tag is fiber content: persist and mirror into the loaded fiber so
@@ -11162,6 +11168,10 @@ bool LineAnnotationController::applyControlPointEditAndPersist(
                       .arg(QString::fromStdString(ex.what())),
                   session.suppressErrorDialogs);
         return false;
+    }
+
+    if (changedGoalOwners) {
+        *changedGoalOwners = std::move(goalOwnersChanged);
     }
 
     // The same fiber can be open in another pane (an intersection-inspection
