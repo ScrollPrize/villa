@@ -8,7 +8,7 @@ phase, including a caller that already owns a demand-inference producer.
 
 This extracts the shared evaluation orchestrator and CP-bounded reference
 selection. It does not include dataset splits, parameter sweeps, visualization,
-fiberlet/skeleton evaluation or producer/model lifecycle management. The
+fiberlet/skeleton evaluation or model construction. The
 input schema is new and deliberately smaller than the experimental `replay-set`
 CLI; old experimental configs are not silently accepted.
 
@@ -154,6 +154,66 @@ controls correctness. More elaborate producer scheduling is not part of this
 extraction. Offline evaluation requires already-published predictions; it does
 not turn missing chunks into on-demand inference unless a bridge is configured.
 
+### Connecting an existing demand producer
+
+`lasagna.live_fiber_evaluation.evaluate_live` supplies the coordinator side of
+that protocol around the same callable evaluator. It borrows `DemandStore`s,
+validates each request against that source's product/channel paths and volume
+bounds, and calls their existing `request`/`ready` methods. A ready response
+means the coherent product has been published, not merely queued or inferred.
+It does not duplicate tile scheduling, accumulation, interpolation or encoding.
+
+```python
+from contextlib import contextmanager
+from lasagna.live_fiber_evaluation import evaluate_live
+
+@contextmanager
+def producer():
+    # Application-owned context: existing DemandWorkerPool and GPU lease.
+    # Construct deferred workers; do not block here waiting for a grant.
+    with application_demand_session() as session:
+        def pump():
+            session.lease.tick()  # nonblocking allocation/pause/idle handling
+            session.pool.pump()
+        yield pump
+    # The application session joins GPU workers BEFORE releasing its lease.
+
+report = evaluate_live(config, {"scan": demand_store}, producer,
+                       source="scan", base_directory="/data/evaluation")
+```
+
+`application_demand_session` above is the application's existing resource
+owner, not a new factory supplied by this module. For CPU tests a factory can
+directly enter `DemandWorkerPool(..., devices=["cpu"])` and yield `pool.pump`.
+For GPU use it **must** retain the existing manager grant/lease discipline;
+this adapter neither requests GPUs nor bypasses the manager. Automatic model,
+store and adaptive-lease construction belongs to the later application
+integration, not this small publication adapter.
+
+The factory is entered lazily, at most once, only on a cache miss. Fully cached
+evaluation needs no producer or GPU grant (`producer_factory=None` explicitly
+rejects cache misses). One coordinator thread exclusively owns store mutation
+and pumping; the caller must not concurrently pump those stores. No Python
+callback runs on suspended native case stacks. Heartbeats keep publication
+waits alive during a nonblocking resource wait; they never certify readiness.
+Both factory entry and pump must return promptly, so resource waiting belongs
+in the pump, not a blocking factory constructor.
+
+The native consumers join before context teardown. The producer context then
+closes/joins its workers and releases resources; borrowed stores remain owned
+by the caller. Stop on cancellation/failure, without trying to complete an
+unbounded inference backlog. Completed coherent chunks can be reused in a
+new session; never reuse a failed producer's in-memory scheduling state.
+No temporary config, evaluator subprocess, live config reload or model unload
+is introduced. Tokens are still stripped from results. `DemandPublicationSession`
+also exposes the scoped endpoint for another consumer of the same protocol.
+
+Regression tests cover cold publication, warm no-producer reuse, validation,
+failure and cancellation ordering. The opt-in real Paris4 CPU identity-model
+test uses `LASAGNA_TEST_VOLUME` and `LASAGNA_TEST_ORIGIN_ZYX`; it runs the actual
+demand worker/accumulator/publication pipeline and compares the published bytes
+with the CT crop. This is correctness evidence, not a GPU speed measurement.
+
 ## Native and low-level Python APIs
 
 `evaluateFiberChunkCases` in `vc/fiber_tracer/FiberEvaluation.hpp` takes a shared
@@ -186,6 +246,7 @@ With an existing native build and its Python environment:
 ```sh
 cmake --build <build> --target vc_fiber_trace -j 8
 python -m pytest volume-cartographer/python/tests/test_fiber_evaluation.py \
+  volume-cartographer/python/tests/test_fiber_live_evaluation.py \
   volume-cartographer/python/tests/test_fiber_chunk_trace.py \
   --vc-build-python <build>/python
 ```
