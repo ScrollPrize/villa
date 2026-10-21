@@ -57,8 +57,11 @@ OmeCoordinateTransform omeCoordinateTransform(
     const std::filesystem::path& attrsPath)
 {
     OmeCoordinateTransform result;
-    if (!dataset.contains("coordinateTransformations"))
-        return result;
+    if (!dataset.contains("coordinateTransformations")) {
+        throw std::invalid_argument(
+            "OME-Zarr dataset is missing coordinateTransformations: " +
+            attrsPath.string());
+    }
     const auto& transforms = dataset.at("coordinateTransformations");
     if (!transforms.is_array()) {
         throw std::invalid_argument(
@@ -102,6 +105,11 @@ OmeCoordinateTransform omeCoordinateTransform(
         }
         sawScale = sawScale || type == "scale";
         sawTranslation = sawTranslation || type == "translation";
+    }
+    if (!sawScale) {
+        throw std::invalid_argument(
+            "OME-Zarr dataset is missing a scale transformation: " +
+            attrsPath.string());
     }
     return result;
 }

@@ -165,6 +165,24 @@ TEST_CASE("crop CT source validates concrete uint8 arrays and preserves OME offs
     const auto source = validateFiberReplayStripCtVolume(*volume, (directory / "ct/1").string());
     CHECK(source.scaleFromBaseXYZ == std::array<double,3>{0.5,0.5,0.5});
     CHECK(source.offsetFromBaseXYZ == std::array<double,3>{1,1,1});
+    // Both datasets establish the lattice conversion. Neither an omitted nor
+    // an incomplete scale may silently become the identity transform.
+    for (const size_t index : {size_t{0}, size_t{1}}) {
+        const auto original = datasets[index]["coordinateTransformations"];
+        datasets[index].erase("coordinateTransformations");
+        vc::core::util::atomicWriteString(attrsPath, attrs.dump());
+        CHECK_THROWS_AS(validateFiberReplayStripCtVolume(*volume, source.locator), std::invalid_argument);
+        for (const auto& invalid : {
+                 nlohmann::json(nullptr), nlohmann::json::object(),
+                 nlohmann::json::array(),
+                 nlohmann::json::array({{{"type", "translation"}, {"translation", {0, 0, 0}}}})}) {
+            datasets[index]["coordinateTransformations"] = invalid;
+            vc::core::util::atomicWriteString(attrsPath, attrs.dump());
+            CHECK_THROWS_AS(validateFiberReplayStripCtVolume(*volume, source.locator), std::invalid_argument);
+        }
+        datasets[index]["coordinateTransformations"] = original;
+    }
+    vc::core::util::atomicWriteString(attrsPath, attrs.dump());
     CHECK_THROWS(writeFiberletCropBoxVisualization(*volume, source.locator,
         {0,0,0}, {1,1,1}, directory / "box", 1));
     CHECK_THROWS(writeFiberletCropBoxVisualization(*volume, source.locator,

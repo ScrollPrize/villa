@@ -24,7 +24,9 @@ samplers have their own declared working-to-base scale. Texture callbacks receiv
 XYZ coordinates in the selected CT array's lattice, not in base coordinates.
 `validateFiberReplayStripCtVolume` accepts one local, concrete uint8 OME-Zarr
 array; it reads the parent ZYX multiscale scale/translation relative to the first
-dataset. A whole pyramid, uint16 array, or missing coordinate metadata is rejected.
+dataset. Both the first and selected dataset must declare a three-axis scale
+transformation; an omitted translation means zero. A whole pyramid, uint16 array,
+or missing/incomplete scale metadata is rejected.
 For another storage source, supply an explicit `FiberReplayStripTextureSource`
 and rendering callback instead.
 
@@ -41,6 +43,8 @@ shown as maximum presence, even if an option's direction is invalid. Values are
 displayed as uint8 `255 * presence`; there is no per-image contrast stretch.
 Missing CT samples remain zero, with coverage/error counts logged by the sampler.
 An optional integer presence threshold adds binary rows without altering traces.
+The line-probe CLI, replay views and crop faces all use the same
+`renderCoordsTextureFineToCoarse` sampler and uncompressed TIFF writer.
 
 ## Calling from an evaluation
 
