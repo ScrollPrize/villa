@@ -8,6 +8,8 @@ counts, without accumulating a separate model-sized gradient bank per loss.
 This is a library extraction, not a switch of the current training CLI. The
 production loss-statistics API and geometry-count staging are included; wiring
 the training loop and cooperative worker lifecycle remain subsequent stages.
+Shared [snapshot and in-RAM handoff state](training_state.md) is also available
+for that later lifecycle integration.
 No model defaults, sampling policy or loss objective changes.
 The old component-by-component multiple-backward implementation is not included.
 

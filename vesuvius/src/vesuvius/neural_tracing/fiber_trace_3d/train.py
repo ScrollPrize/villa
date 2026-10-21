@@ -24,6 +24,9 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
 
 from vesuvius.neural_tracing.fiber_trace_3d.loss_statistics import LossStatistics as _LossStatistics
+from vesuvius.neural_tracing.fiber_trace_3d.training_state import (
+    model_optimizer_payload, restore_model_optimizer,
+)
 
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     DEFAULT_VOLUME_CACHE_MEMORY_MIB,
@@ -1504,15 +1507,12 @@ def _save_snapshot(
 ) -> None:
     snapshot_model = _unwrap_model(model)
     payload = {
-        "model": snapshot_model.state_dict(),
-        "optimizer": optimizer.state_dict(),
+        **model_optimizer_payload(snapshot_model, optimizer, grad_scaler),
         "step": int(step),
         "config": _json_safe(config),
         "metric": metric,
         "metric_name": metric_name,
     }
-    if _grad_scaler_enabled(grad_scaler):
-        payload["grad_scaler"] = grad_scaler.state_dict()
     torch.save(payload, path)
 
 
@@ -1542,18 +1542,10 @@ def _load_snapshot(
     map_location: torch.device | str = "cpu",
 ) -> int:
     payload = torch.load(path, map_location=map_location)
-    state = payload.get("model", payload)
-    model.load_state_dict(state)
+    restore_model_optimizer(payload, model=model, optimizer=optimizer, grad_scaler=grad_scaler)
     if optimizer is not None and isinstance(payload, dict) and "optimizer" in payload:
-        optimizer.load_state_dict(payload["optimizer"])
         if optimizer_hparams is not None:
             _apply_optimizer_hparams(optimizer, optimizer_hparams)
-    if (
-        _grad_scaler_enabled(grad_scaler)
-        and isinstance(payload, dict)
-        and "grad_scaler" in payload
-    ):
-        grad_scaler.load_state_dict(payload["grad_scaler"])
     return int(payload.get("step", 0)) if isinstance(payload, dict) else 0
 
 
