@@ -367,6 +367,14 @@ struct OpenTailPolicy {
 // normal sampler) are not needed for it.
 [[nodiscard]] bool singleControlRayOnly(const std::vector<LineControlPoint>& controls);
 
+// The solver's span index (rank in line-position order) of each owner in
+// `owners` that has a successor in that order; owners without one (the last
+// control, non-finite positions, out-of-range indices) are dropped. Session
+// vectors can be out of line order after a reopen, which is why dirty spans
+// are named by rank, never by vector index.
+[[nodiscard]] std::vector<size_t> lineOrderSpanRanks(const std::vector<LineControlPoint>& controls,
+                                                     const std::vector<size_t>& owners);
+
 // Placement beyond a lone end break: when `prepared` is a pure append
 // (prepend) with no collapse whose new last (first) control attaches to a
 // control that was a lone end BREAK in `previousControls` (the pre-edit

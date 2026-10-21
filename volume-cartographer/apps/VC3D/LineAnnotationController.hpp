@@ -767,11 +767,16 @@ private:
     // same edit on the matching control of every other pane showing this
     // fiber (and their rollback snapshots), and the overlay refreshes.
     // Returns false when nothing changed or the edit was refused.
+    // gapSync (optional out): the gap spans the edit formed or dissolved in
+    // this session, whose goals the gap policy changed WITH the tag (saved
+    // in the same file write, mirrored into the peers); the caller re-solves
+    // them (finishBreakEdit).
     using ControlPointEdit = std::function<bool(vc3d::line_annotation::LineControlPoint&)>;
     bool applyControlPointEditAndPersist(const std::string& surfaceName,
                                          size_t controlPointIndex,
                                          const QString& pendingSolveMessage,
-                                         const ControlPointEdit& edit);
+                                         const ControlPointEdit& edit,
+                                         vc3d::line_annotation::GapSpanSync* gapSync = nullptr);
     // Whether adding `tag` to the control (or the matching control of any
     // other pane showing this fiber, or of their rollback snapshots) would
     // combine the kollesis and break tags.
@@ -784,14 +789,21 @@ private:
                                       size_t controlPointIndex,
                                       const char* tag,
                                       bool enabled,
-                                      const QString& pendingSolveMessage);
-    // After a break tag edit: the gap spans that formed take the cubic-spline
-    // goal, those that dissolved while still cspline return to global, each
-    // through applySegmentInterpolationGoals.
-    // Returns whether it started a re-solve.
-    bool reconcileGapGoalsAfterBreakEdit(LineAnnotationSession& session,
-                                         const std::vector<size_t>& gapOwnersBefore,
-                                         bool enabled);
+                                      const QString& pendingSolveMessage,
+                                      vc3d::line_annotation::GapSpanSync* gapSync = nullptr);
+    // Re-solves the spans owned by `owners` whose goals a committed tag edit
+    // changed (gap formed -> cspline, dissolved -> global): the goals are
+    // already saved and mirrored, so nothing is rolled back but geometry.
+    // Marks the session Unoptimized first (a refused dataset leaves the
+    // goals in place for the save/close finalization). Returns whether a
+    // solve started.
+    bool startCommittedGoalSolve(LineAnnotationSession& session,
+                                 const std::vector<size_t>& owners);
+    // Shared launch of a goal re-solve: geometry snapshot, dirty ranks (or
+    // the whole line when the interior is not certified), rollback when the
+    // solve cannot start. The controls snapshot must already be armed.
+    bool launchGoalSolve(LineAnnotationSession& session,
+                         const std::vector<size_t>& dirtyRanks);
     // The session's open-tail policy (lone end breaks, kollesis ends) or the
     // tail distances changed and no solve covers it yet: mark Unoptimized and,
     // in auto mode, re-trace the tails (a tails-only solve, or a whole-line
@@ -805,12 +817,11 @@ private:
     void refreshTailsIfPolicyChanged(const std::string& surfaceName,
                                      vc3d::line_annotation::OpenTailPolicy before);
     // Scope-guard body of the break handlers (point menu, span menu): on
-    // EVERY exit, also after a refused second end, reconcile the gap goals
-    // of whatever was committed (the re-solve re-traces the tails), else
-    // refresh the tails if the policy changed.
+    // EVERY exit, also after a refused second end, re-solve the gap spans
+    // whose goals the committed tags changed (that solve re-traces the
+    // tails), else refresh the tails if the policy changed.
     void finishBreakEdit(const std::string& surfaceName,
-                         const std::vector<size_t>& gapOwnersBefore,
-                         bool enabled,
+                         const std::vector<size_t>& changedGapOwners,
                          vc3d::line_annotation::OpenTailPolicy before);
     // Extrapolation / Break extrapolation Apply: a solver-input change that
     // also invalidates an armed rollback snapshot's geometry.
@@ -838,13 +849,9 @@ private:
     // Sets the interpolation goal of the spans owned by `owners` and starts
     // the re-solve, with the mode-change rollback of the menu's goal change.
     // Returns false (nothing changed) when every span already has the goal.
-    // goalsCommitted: the goals follow a committed tag edit (the gap policy)
-    // rather than a menu choice, so a failed solve keeps them (the controls
-    // snapshot is taken after they are set; the geometry snapshot before).
     bool applySegmentInterpolationGoals(LineAnnotationSession& session,
                                         const std::vector<size_t>& owners,
-                                        vc3d::line_annotation::SegmentInterpolationGoal goal,
-                                        bool goalsCommitted = false);
+                                        vc3d::line_annotation::SegmentInterpolationGoal goal);
     // adjacent: designate the point as an ADJACENT link candidate (see
     // LinkCandidate::adjacent) rather than an ordinary one.
     void handleGeneratedControlPointLinkCandidate(const std::string& surfaceName,

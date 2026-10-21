@@ -760,8 +760,18 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         for (const auto& point : output.optimization.line.points) {
             baselinePoints.push_back(point.position);
         }
-        const int controlIndex = static_cast<int>(nearestPointIndex(
-            baselinePoints, request.controlPoints.front().volumePoint));
+        // The optimizer anchors its seed line at the seed: that index is
+        // authoritative when it names the seed vertex (a seed line can
+        // revisit the seed's coordinate on a folded normal field).
+        const int anchor = output.optimization.line.displayFrameAnchorIndex;
+        const bool anchorIsSeed = anchor >= 0 &&
+            anchor < static_cast<int>(baselinePoints.size()) &&
+            pointsApproximatelyEqual(baselinePoints[static_cast<size_t>(anchor)],
+                                     request.controlPoints.front().volumePoint);
+        const int controlIndex = anchorIsSeed
+            ? anchor
+            : static_cast<int>(nearestPointIndex(
+                  baselinePoints, request.controlPoints.front().volumePoint));
         request.controlPoints.front().optimizedIndex = controlIndex;
         request.controlPoints.front().linePosition =
             static_cast<double>(controlIndex);
@@ -785,22 +795,40 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     const std::vector<cv::Vec3d> referenceTrace =
         coordinates.baseToTrace(request.linePointsBase);
 
-    // A control's own index is authoritative when it names its vertex on
-    // the input line (every solve and landing keeps it so); the coordinate
+    // A control's own index fields are authoritative when they name its
+    // vertex on the input line (every solve and landing keeps them so):
+    // optimizedIndex first, then an integral linePosition. The coordinate
     // search is the fallback for controls without one (a fresh seed, a
-    // reopened file). A straight tail can revisit a control's coordinate
-    // exactly (a folded fiber), which the search alone could not tell apart.
+    // reopened file), restricted to the line AFTER the previous control so
+    // the controls resolve in line order: a straight tail can revisit a
+    // control's coordinate exactly (a folded fiber), which an unrestricted
+    // search could not tell apart.
     std::vector<size_t> originalControlIndices;
     originalControlIndices.reserve(request.controlPoints.size());
+    const auto namesVertex = [&request](double index, const cv::Vec3d& point) {
+        return std::isfinite(index) && index >= 0.0 &&
+            index == std::floor(index) &&
+            index < static_cast<double>(request.linePointsBase.size()) &&
+            pointsApproximatelyEqual(request.linePointsBase[static_cast<size_t>(index)], point);
+    };
     for (const auto& control : request.controlPoints) {
-        const bool indexNamesVertex = control.optimizedIndex >= 0 &&
-            control.optimizedIndex < static_cast<int>(request.linePointsBase.size()) &&
-            pointsApproximatelyEqual(
-                request.linePointsBase[static_cast<size_t>(control.optimizedIndex)],
-                control.volumePoint);
-        originalControlIndices.push_back(
-            indexNamesVertex ? static_cast<size_t>(control.optimizedIndex)
-                             : nearestPointIndex(request.linePointsBase, control.volumePoint));
+        const size_t searchFrom = originalControlIndices.empty()
+            ? 0
+            : originalControlIndices.back() + 1;
+        if (namesVertex(static_cast<double>(control.optimizedIndex), control.volumePoint)) {
+            originalControlIndices.push_back(static_cast<size_t>(control.optimizedIndex));
+        } else if (namesVertex(control.linePosition, control.volumePoint)) {
+            originalControlIndices.push_back(static_cast<size_t>(control.linePosition));
+        } else if (searchFrom < request.linePointsBase.size()) {
+            const std::vector<cv::Vec3d> rest(
+                request.linePointsBase.begin() + static_cast<std::ptrdiff_t>(searchFrom),
+                request.linePointsBase.end());
+            originalControlIndices.push_back(
+                searchFrom + nearestPointIndex(rest, control.volumePoint));
+        } else {
+            originalControlIndices.push_back(
+                nearestPointIndex(request.linePointsBase, control.volumePoint));
+        }
     }
     for (size_t index = 1; index < originalControlIndices.size(); ++index) {
         if (originalControlIndices[index] <= originalControlIndices[index - 1]) {
@@ -1762,6 +1790,26 @@ bool singleControlRayOnly(const std::vector<LineControlPoint>& controls)
     }
     const OpenTailPolicy policy = openTailPolicyForControls(controls);
     return policy.headRay && policy.tailRay;
+}
+
+std::vector<size_t> lineOrderSpanRanks(const std::vector<LineControlPoint>& controls,
+                                       const std::vector<size_t>& owners)
+{
+    const std::vector<size_t> order = lineOrder(controls);
+    std::vector<size_t> rankOf(controls.size(), controls.size());
+    for (size_t rank = 0; rank < order.size(); ++rank) {
+        rankOf[order[rank]] = rank;
+    }
+    std::vector<size_t> ranks;
+    for (const size_t owner : owners) {
+        if (owner >= controls.size() || rankOf[owner] + 1 >= order.size()) {
+            continue;
+        }
+        ranks.push_back(rankOf[owner]);
+    }
+    std::sort(ranks.begin(), ranks.end());
+    ranks.erase(std::unique(ranks.begin(), ranks.end()), ranks.end());
+    return ranks;
 }
 
 std::optional<size_t> appendedControlToTagAsBreak(

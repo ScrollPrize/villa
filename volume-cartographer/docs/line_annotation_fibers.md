@@ -261,9 +261,12 @@ Unoptimized and starts a whole-line solve in Auto-reoptimize mode (in manual
 mode the change waits for the next reoptimization or save/close; a change
 made while a solve runs queues a whole-line pass behind it), and invalidates
 an armed collapse/mode rollback snapshot (a later restore lands Unoptimized
-rather than as the snapshot's state). A gap goal that follows a committed
-break tag survives a failed solve (only the geometry is rolled back), so the
-panes and the file keep agreeing on it. The same fiber open
+rather than as the snapshot's state). The gap goal policy (cspline when a
+gap forms, global when it dissolves while still cspline) is applied in the
+same write that saves the break tag, so the file, the pane and its peers
+carry the goal together; the re-solve that follows rolls back geometry only
+when it fails or cannot start (a refused dataset leaves the session
+Unoptimized for the save/close finalization). The same fiber open
 in another pane receives the tag together with the span tags and the gap goal
 policy, so a save from that pane cannot regress a goal; that pane starts no
 new solve of its own but is marked Unoptimized (save/close finalizes it) and

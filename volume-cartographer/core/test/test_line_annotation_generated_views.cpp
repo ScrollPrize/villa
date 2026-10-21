@@ -7561,10 +7561,28 @@ TEST_CASE("A control's own index wins over a coordinate search on the input line
     const auto result = optimizeFiberWithNativeFallback(request);
     checkControlsNameTheirVertices(result);
     CHECK(result.controlPoints.back().volumePoint == cv::Vec3d(16, 0, 0));
-    // Without a usable index the coordinate search resolves the duplicate
-    // and the strict order check rejects the request.
+    // An integral linePosition that names the vertex serves as well.
     request.controlPoints.back().optimizedIndex = -1;
-    CHECK_THROWS_AS(optimizeFiberWithNativeFallback(request), std::runtime_error);
+    checkControlsNameTheirVertices(optimizeFiberWithNativeFallback(request));
+    // Without either, the coordinate search is restricted to the line after
+    // the previous control, so the duplicate at index 0 is never chosen.
+    request.controlPoints.back().linePosition = 6.5;
+    const auto searched = optimizeFiberWithNativeFallback(request);
+    checkControlsNameTheirVertices(searched);
+    CHECK(searched.controlPoints.front().optimizedIndex < searched.controlPoints.back().optimizedIndex);
+}
+
+TEST_CASE("Line-order span ranks drop owners without a successor")
+{
+    using namespace vc3d::line_annotation;
+    std::vector<LineControlPoint> controls{tailControl(20.0), tailControl(0.0, true), tailControl(10.0)};
+    CHECK(lineOrderSpanRanks(controls, {1}) == std::vector<size_t>{0});
+    CHECK(lineOrderSpanRanks(controls, {2}) == std::vector<size_t>{1});
+    CHECK(lineOrderSpanRanks(controls, {0}).empty());
+    CHECK(lineOrderSpanRanks(controls, {2, 1, 2, 7}) == std::vector<size_t>{0, 1});
+    controls[2].linePosition = std::numeric_limits<double>::quiet_NaN();
+    CHECK(lineOrderSpanRanks(controls, {1}) == std::vector<size_t>{0});
+    CHECK(lineOrderSpanRanks(controls, {2}).empty());
 }
 
 TEST_CASE("Placing beyond a lone end break tags the new control")
