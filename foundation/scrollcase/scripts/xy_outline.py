@@ -28,6 +28,7 @@ import matplotlib as mpl
 import numpy as np
 import trimesh
 from scipy import ndimage
+from scrollcase import case, smallest_circle
 
 mpl.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
@@ -121,7 +122,7 @@ def write_csv(path: Path, outline: np.ndarray) -> None:
 
 
 def plot_outline(ax, mesh, grid, origin, cell, outline, scroll_id) -> None:
-    """Draw the occupancy grid, mesh footprint coloured by z, and outline."""
+    """Draw the occupancy grid, mesh footprint coloured by z, outline and lining."""
     h, w = grid.shape
     extent = [
         origin[0] - cell / 2,
@@ -148,12 +149,25 @@ def plot_outline(ax, mesh, grid, origin, cell, outline, scroll_id) -> None:
     ax.plot(outline[:, 0], outline[:, 1], "o", ms=2, color="#c0392b")
     ax.axhline(0, color="#888", lw=0.5)
     ax.axvline(0, color="#888", lw=0.5)
+    # Lining outer circle, as reported in scroll_summary.csv: the smallest
+    # circle enclosing the scroll, padded by the lining gap and wall.
+    centre, radius = smallest_circle.smallest_enclosing_circle(v[:, :2])
+    radius = case.ScrollCaseConfig(
+        scroll_height_mm=0, scroll_radius_mm=radius
+    ).lining_outer_radius
+    ax.add_patch(
+        mpl.patches.Circle(centre, radius, fill=False, ls="--", lw=1, color="#888")
+    )
+    pad = 1.0
+    ax.set_xlim(centre[0] - radius - pad, centre[0] + radius + pad)
+    ax.set_ylim(centre[1] - radius - pad, centre[1] + radius + pad)
     ax.set_aspect("equal")
     ax.set_xlabel("x (mm)")
     ax.set_ylabel("y (mm)")
     ax.set_title(
         f"{scroll_id}: {len(outline)} pts, "
-        f"area {polygon_area(outline):.0f} mm², z {v[:, 2].min():.1f}–{v[:, 2].max():.1f} mm",
+        f"area {polygon_area(outline):.0f} mm², lining ⌀ {2 * radius:.2f} mm, "
+        f"z {v[:, 2].min():.1f}–{v[:, 2].max():.1f} mm",
         fontsize=9,
     )
     return sc
