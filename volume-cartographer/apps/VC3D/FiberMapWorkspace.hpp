@@ -559,6 +559,11 @@ private:
     // nothing when the token moved (a click between the publication and
     // the callback must cancel the resume, not only the waiting request).
     uint64_t _autoLinkResumeToken = 0;
+    // True from the moment a publication hands the request to its queued
+    // callback until that callback runs: a cancellation in between must
+    // clear the promise on the status line exactly like one of a waiting
+    // request.
+    bool _autoLinkResumeQueued = false;
     void cancelAutoLinkResume();
     void resumeAutoLinkAfterPublish();
     // Same drawn geometry: the runs (flags, points, arclengths) and the

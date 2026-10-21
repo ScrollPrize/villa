@@ -13468,17 +13468,17 @@ bool LineAnnotationController::ensureSessionSolveBackends(
         if (stillValid && !stillValid()) {
             return false;
         }
-    } else if (needsTrace && !rayOnly && session.controlPoints.size() == 1 &&
+    } else if (needsTrace && !rayOnly && solveAsLasagna && session.controlPoints.size() == 1 &&
                (!session.fiberPredictionField || !session.traceNormalSampler)) {
         // A seed placed without an inference dataset (VC3D allows that; the
         // seed itself was a Lasagna line). The synchronous save/close path
         // never opened a dataset picker for one control and must not start
         // to: this one solve runs as Lasagna (tails grown or rays); the
-        // session's persisted optimization mode is untouched. A caller that
-        // cannot take that decision (no out-parameter) is refused instead.
-        if (!solveAsLasagna) {
-            return false;
-        }
+        // session's persisted optimization mode is untouched. Only a caller
+        // that can take that decision (the finalizer, with the
+        // out-parameter) gets it; any other (the auto-link's pre-placement
+        // check of a one-control fiber) ensures the trace inputs below, as
+        // it always did.
         *solveAsLasagna = true;
         Logger()->info(
             "Line annotation finalize: single control without trace inputs, "

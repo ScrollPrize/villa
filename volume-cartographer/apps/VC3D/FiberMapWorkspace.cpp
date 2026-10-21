@@ -1774,6 +1774,11 @@ bool FiberMapWorkspace::applyStaleVerdict(const StaleVerdict& verdict)
             // The fresh floor with the selection (and the operation message).
             updateSelectionStatus();
         }
+        // A Link waiting for a fresh layout (resumeAutoLinkAfterPublish
+        // kept it while the layout was stale) gets its chance here too:
+        // freshness can return without a rebuild (a volume switched away
+        // and back), and then no publication would ever retry it.
+        resumeAutoLinkAfterPublish();
         break;
     }
     return false;
@@ -4420,11 +4425,17 @@ void FiberMapWorkspace::resumeAutoLinkAfterPublish()
     // start re-verifies them against the current ones first.
     const QPointer<FiberMapWorkspace> self(this);
     const uint64_t token = _autoLinkResumeToken;
+    _autoLinkResumeQueued = true;
     QMetaObject::invokeMethod(
         this,
         [self, resume, dependencies, token]() {
-            if (!self || self->_autoLinkResumeToken != token) {
-                // Cancelled between the publication and this callback.
+            if (!self) {
+                return;
+            }
+            self->_autoLinkResumeQueued = false;
+            if (self->_autoLinkResumeToken != token) {
+                // Cancelled between the publication and this callback (the
+                // cancellation cleared the promise).
                 return;
             }
             Logger()->info("Fiber map auto-link: resumed after the map update");
@@ -4435,10 +4446,11 @@ void FiberMapWorkspace::resumeAutoLinkAfterPublish()
 
 void FiberMapWorkspace::cancelAutoLinkResume()
 {
-    const bool waiting = _autoLinkResume.has_value();
+    const bool promised = _autoLinkResume.has_value() || _autoLinkResumeQueued;
     _autoLinkResume.reset();
+    _autoLinkResumeQueued = false;
     ++_autoLinkResumeToken;
-    if (waiting) {
+    if (promised) {
         // The line promised the link would continue by itself; it will not.
         clearOperationStatus();
     }
