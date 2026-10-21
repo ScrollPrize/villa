@@ -1,6 +1,7 @@
 #include "CWindow.hpp"
 #include "VolumeComboTooltip.hpp"
 #include "FiberLengthDisplay.hpp"
+#include "elements/StatusMessageHistory.hpp"
 #include "VolumeDisplayNames.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataLasagna.hpp"
@@ -2924,6 +2925,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _statusMessageLabel->setMinimumWidth(160);
     _statusMessageLabel->setWordWrap(false);
     statusBar()->addWidget(_statusMessageLabel, 1);
+    _statusHistoryButton = new StatusMessageHistoryButton(this);
+    statusBar()->addWidget(_statusHistoryButton);
 
     _statusMessageTimer = new QTimer(this);
     _statusMessageTimer->setSingleShot(true);
@@ -8822,6 +8825,9 @@ void CWindow::onShowStatusMessage(QString text, int timeout)
 
 void CWindow::showStatusBarMessage(const QString& text, int timeout)
 {
+    if (_statusHistoryButton) {
+        _statusHistoryButton->record(text);
+    }
     if (!_statusMessageLabel) {
         if (statusBar()) {
             statusBar()->showMessage(text, timeout);
@@ -8963,10 +8969,19 @@ void CWindow::updateSharedStatusLabel()
     }
     const QString text = items.join(QStringLiteral("  "));
     _sharedCacheStatsLabel->setText(text);
+    // Grow at once, but narrow only once the text has fit in less for a few
+    // seconds, so the widgets beside it stop shifting whenever a number gets
+    // shorter, and one long reading does not keep it wide.
+    constexpr qint64 kNarrowAfterMs = 5000;
     const QMargins margins = _sharedCacheStatsLabel->contentsMargins();
-    _sharedCacheStatsLabel->setMinimumWidth(
-        _sharedCacheStatsLabel->fontMetrics().horizontalAdvance(text) +
-        margins.left() + margins.right());
+    const int needed = _sharedCacheStatsLabel->fontMetrics().horizontalAdvance(text) +
+                       margins.left() + margins.right();
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (needed >= _sharedCacheStatsLabel->minimumWidth() ||
+        now - _sharedCacheStatsWideAtMs > kNarrowAfterMs) {
+        _sharedCacheStatsLabel->setMinimumWidth(needed);
+        _sharedCacheStatsWideAtMs = now;
+    }
 }
 
 // Open volume package

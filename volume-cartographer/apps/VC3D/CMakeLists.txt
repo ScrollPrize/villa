@@ -115,6 +115,8 @@ set(srcs
     elements/RangeSlider.hpp
     elements/ViewerStatsBar.cpp
     elements/ViewerStatsBar.hpp
+    elements/StatusMessageHistory.cpp
+    elements/StatusMessageHistory.hpp
     elements/DownloadQueueStats.cpp
     elements/DownloadQueueStats.hpp
     elements/DownloadQueueDebugOverlay.cpp
