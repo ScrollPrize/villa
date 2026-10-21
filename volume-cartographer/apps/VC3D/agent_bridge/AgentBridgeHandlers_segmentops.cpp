@@ -585,7 +585,7 @@ QJsonObject AgentBridgeServer::handleSegmentRestoreBackup(const QJsonValue& para
     result["segmentId"] = segmentId;
     result["index"] = index;
     result["copiedFiles"] = copiedFiles;
-    // The replaced state is now the newest backup.
+    // With backups on, the replaced state is now the newest backup.
     result["backups"] = backupsJson(handler->listSurfaceBackups(segmentId));
     return result;
 }

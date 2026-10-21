@@ -607,10 +607,14 @@ caller that retries after a timeout reads the segment's state first.
   that snapshot.
 - `segment.restore_backup` replaces a segment's files with every file of one
   of its rotating backups, the slots the context menu's "Reload from Backup"
-  offers, and reloads it. The replaced state is snapshotted as the newest
-  backup first, so the result's `backups` lists the slot that undoes the
-  restore; nothing is restored if that snapshot fails. An unknown index
-  returns -32007 and a call without `confirm: true` returns -32602, both with
+  offers, and reloads it. With backups on, the replaced state is snapshotted
+  as the newest backup first, so the result's `backups` lists the slot that
+  undoes the restore; nothing is restored if that snapshot fails. A full ring
+  drops its oldest slot for that snapshot and the other slots move down by
+  one, so list the backups again before the next restore. With backups off
+  (Settings, "Segment backups to keep" at 0) nothing is snapshotted and the
+  restore cannot be undone. An unknown index returns -32007 and a call
+  without `confirm: true` returns -32602, both with
   `data.available` and without changing anything, so a call without confirm
   lists the backups.
 - `segments.move_to_paths` requires `confirm: true`, applies only to the
