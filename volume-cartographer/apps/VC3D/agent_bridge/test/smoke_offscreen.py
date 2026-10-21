@@ -242,6 +242,7 @@ def check_rpc_describe(
         "viewer.center_on_point",
         "viewer.zoom",
         "viewer.rotate",
+        "viewer.reset",
         "viewer.set_axis_aligned_slices",
         "viewer.get_render_settings",
         "viewer.set_render_settings",
