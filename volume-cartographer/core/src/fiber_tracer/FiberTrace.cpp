@@ -736,6 +736,7 @@ struct BeamState {
         TraceVec point{0.0f, 0.0f, 0.0f};
         std::shared_ptr<const PathNode> previous;
         size_t length = 1;
+        float cumulativeLoss = 0.0f;
     };
 
     std::shared_ptr<const PathNode> path;
@@ -745,6 +746,7 @@ struct BeamState {
     float loss = 0.0f;
     float tracedLength = 0.0f;
     int depth = 0;
+    int historySamples = 0;
     bool valid = false;
     bool reached = false;
     uint8_t crossedTargetPlaneMask = 0;
@@ -754,10 +756,12 @@ struct BeamState {
 
 [[nodiscard]] std::shared_ptr<const BeamState::PathNode> appendBeamPathPoint(
     std::shared_ptr<const BeamState::PathNode> previous,
-    const TraceVec& point)
+    const TraceVec& point,
+    float cumulativeLoss = 0.0f)
 {
     auto node = std::make_shared<BeamState::PathNode>();
     node->point = point;
+    node->cumulativeLoss = cumulativeLoss;
     node->previous = std::move(previous);
     node->length = node->previous ? node->previous->length + 1 : 1;
     return node;
@@ -1860,14 +1864,16 @@ void updateTargetPlaneCrossings(
     const CandidateScore& score = scores[candidateIndex];
     const BeamState& parent = parents[task.beamIndex];
     BeamState out = parent;
-    out.path = appendBeamPathPoint(parent.path, candidate.point);
+    out.path = appendBeamPathPoint(parent.path, candidate.point, candidate.loss);
     out.previousStepDirection = task.direction;
     out.currentSampleDirection = score.selectedCurrentDirection;
     out.historyDirection = updateHistoryDirection(
         parent.historyDirection,
         task.direction,
-        parent.depth,
+        parent.historySamples,
         config.cumulativeSmoothnessSteps);
+    out.historySamples = std::min(parent.historySamples + 1,
+        std::max(1, config.cumulativeSmoothnessSteps));
     out.loss = candidate.loss;
     out.tracedLength = parent.tracedLength +
         traceLength(candidate.point - beamEndpoint(parent));
@@ -2246,7 +2252,8 @@ template <typename LossAt>
     const vc::lasagna::NormalSampler* normalSampler,
     const FiberTraceProgressCallback& progress,
     std::string phase,
-    std::optional<double> traceLengthLimitVoxels = std::nullopt)
+    std::optional<double> traceLengthLimitVoxels = std::nullopt,
+    const std::function<bool(const cv::Vec3d&, double, int)>& committedStep = {})
 {
     auto request = inputRequest;
     const TraceVec start = toTraceVec(request.startPoint);
@@ -2344,6 +2351,16 @@ template <typename LossAt>
     initial.previousStepDirection = startDirection;
     initial.currentSampleDirection = startDirection;
     initial.historyDirection = startDirection;
+    for (const auto& direction : request.initialStepDirections) {
+        if (!finitePoint(direction) || length(direction) <= kEpsilon)
+            throw std::invalid_argument("initial step history must contain finite nonzero directions");
+        const auto prior = toTraceVec(normalizedOrZero(direction));
+        initial.historyDirection = updateHistoryDirection(initial.historyDirection, prior,
+            initial.historySamples, request.config.cumulativeSmoothnessSteps);
+        initial.historySamples = std::min(initial.historySamples + 1,
+            std::max(1, request.config.cumulativeSmoothnessSteps));
+        initial.previousStepDirection = prior;
+    }
     updateTargetPlaneCrossings(
         start,
         start,
@@ -2368,7 +2385,7 @@ template <typename LossAt>
     // frontier can change branches; it must not bias the running width mean.
     auto observedPath = initial.path;
     const auto observeThrough = [&](std::shared_ptr<const BeamState::PathNode> path) {
-        if (!updateWidth) return;
+        if (!updateWidth && !committedStep) return true;
         std::vector<std::shared_ptr<const BeamState::PathNode>> pending;
         while (path && path != observedPath) {
             pending.push_back(path);
@@ -2377,14 +2394,31 @@ template <typename LossAt>
         if (!path)
             throw std::logic_error("fiber trace attempted to retract a committed prefix");
         for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
-            addWidth((*it)->point);
+            if (updateWidth) addWidth((*it)->point);
             observedPath = *it;
+            if (committedStep && !committedStep(toVec3d(observedPath->point),
+                    observedPath->cumulativeLoss, static_cast<int>(observedPath->length - 1)))
+                return false;
         }
+        return true;
+    };
+    const auto observerStopped = [&]() {
+        BeamState stopped;
+        stopped.path = observedPath;
+        FiberTraceOneWayResult result;
+        result.points = beamPathPoints(stopped);
+        result.steps = static_cast<int>(result.points.size() - 1);
+        result.reason = "observer_stop";
+        if (request.config.widthRelativeTolerance > 0) {
+            result.widthMean = request.config.widthReferenceMean;
+            result.widthSamples = width.count;
+        }
+        return result;
     };
     const auto finish = [&](const BeamState& state, bool reached, std::string resultReason) {
         // Also covers target exits and exhausted-frontier fallback; intermediate
         // lookahead points are included once, in path order.
-        observeThrough(state.path);
+        if (!observeThrough(state.path)) return observerStopped();
         auto result = oneWayResultFromState(state, targetPlanes, reached, std::move(resultReason),
             acceptThresholdVoxels, request.snapTraceToSelectedCrossing, traceLengthLimitVoxels);
         if (request.config.widthRelativeTolerance > 0) {
@@ -2648,7 +2682,7 @@ template <typename LossAt>
         }
         stepIndex += std::max(1, advanced);
 
-        if (updateWidth) {
+        if (updateWidth || committedStep) {
             auto common = lastValidState.path;
             for (const auto& beam : beams) {
                 auto other = beam.path;
@@ -2659,7 +2693,7 @@ template <typename LossAt>
                     other = other->previous;
                 }
             }
-            observeThrough(common);
+            if (!observeThrough(common)) return observerStopped();
         }
 
         if (progress) {
@@ -5087,7 +5121,9 @@ FiberTraceOneWayResult traceFiberExtrapolation(
     const FiberTraceConfig& config,
     const vc::lasagna::NormalSampler* normalSampler,
     const FiberTraceProgressCallback& progress,
-    bool fixInitialDirection)
+    bool fixInitialDirection,
+    const std::function<bool(const cv::Vec3d&, double, int)>& committedStep,
+    const std::vector<cv::Vec3d>& initialStepDirections)
 {
     validateTraceConfig(config);
     requireNormalSamplerForNormalAwareSmoothness(config, normalSampler);
@@ -5110,6 +5146,7 @@ FiberTraceOneWayResult traceFiberExtrapolation(
     request.targetPoint = startPoint + direction * distanceVoxels;
     request.initialDirection = direction;
     request.fixInitialDirection = fixInitialDirection;
+    request.initialStepDirections = initialStepDirections;
     request.budgetSpanVoxels = distanceVoxels;
     // No target planes and no endpoint acceptance here: an open-tail
     // extrapolation has a synthetic target at the requested distance, nothing
@@ -5122,7 +5159,8 @@ FiberTraceOneWayResult traceFiberExtrapolation(
         normalSampler,
         progress,
         "extrapolation",
-        distanceVoxels);
+        distanceVoxels,
+        committedStep);
 }
 
 double effectiveEndpointAcceptThresholdBaseVoxels(const FiberTraceConfig& config,
