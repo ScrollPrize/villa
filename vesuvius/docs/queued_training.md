@@ -133,6 +133,13 @@ validity masks and existing visualization API rather than importing later
 mask-free targets, embedding, profiling or manager orchestration. It does not
 add an alternate loader or a second training implementation.
 
+The optional `batch_source` hook now also connects the existing
+[persistent CPU broker and cancellable worker transport](persistent_training_samples.md).
+In that mode the trainer creates no private queue and closing a worker's input
+view leaves the CPU owner alive. Completed updates and train/test phases retain
+the same canonical ownership rules. Full manager/cohort orchestration and
+automatic calibration remain separate from this integration.
+
 ## Validation
 
 From `vesuvius/`, use an existing environment and the real CT/annotation fixture

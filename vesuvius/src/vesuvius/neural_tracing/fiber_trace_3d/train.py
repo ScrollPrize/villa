@@ -2346,6 +2346,7 @@ def training_units(
     test_hang_diagnostics: bool = False,
     handoff: dict[str, Any] | None = None,
     physical_microbatch_sizes: tuple[int, ...] | None = None,
+    batch_source: Any | None = None,
     summary_writer_factory: Any | None = None,
     distributed_init_method: str | None = None,
 ):
@@ -2362,6 +2363,8 @@ def training_units(
     bounded_accumulation = training.get("bounded_gradient_accumulation", False)
     if type(bounded_accumulation) is not bool:
         raise ValueError("training.bounded_gradient_accumulation must be a boolean")
+    if batch_source is not None and not bounded_accumulation:
+        raise ValueError("external canonical sample ownership requires bounded accumulation")
     evaluation_microbatch_size = training.get("evaluation_microbatch_size")
     if evaluation_microbatch_size is not None and (
         type(evaluation_microbatch_size) is not int or evaluation_microbatch_size < 1
@@ -2724,6 +2727,8 @@ def training_units(
         diagnostics.arm_test_watchdog(step)
         diagnostics.marker("test-routine-begin", step=step)
         try:
+            if batch_source is not None:
+                batch_source.begin_test(step)
             if cuda_batch_pipeline is not None:
                 cuda_batch_pipeline.pause()
             _diagnostic_cuda_synchronize(
@@ -2746,9 +2751,13 @@ def training_units(
                     captured_batches=captured_test_batches if distributed.is_main else None)
 
                 def evaluate_groups(indices):
-                    dense_iterator = QueuedBatchView(sample_queue, "test", queued_test_batches(
+                    dense_iterator = (QueuedBatchView(sample_queue, "test", queued_test_batches(
                         indices, batch_size=test_loader.config.batch_size,
                         sample_count=test_control_points, start_sample_index=test_start_sample_index))
+                        if sample_queue is not None else batch_source.test_batches(
+                            step=step, global_batch_indices=indices,
+                            batch_size=test_loader.config.batch_size, sample_count=test_control_points,
+                            start_sample_index=test_start_sample_index))
                     try:
                         return _evaluate_dense_loss_rows(raw_model, test_loader, **options,
                             global_batch_indices=indices, batch_iterator=dense_iterator,
@@ -2885,6 +2894,8 @@ def training_units(
                 step=step,
                 elapsed_s=f"{test_elapsed_seconds:.3f}",
             )
+            if batch_source is not None:
+                batch_source.end_test(step)
             return metric, metric_name
         finally:
             diagnostics.cancel_test_watchdog(step=step)
@@ -2924,16 +2935,17 @@ def training_units(
             _distributed_barrier(distributed)
 
     try:
-        sample_queue = _make_training_sample_queue(
-            loader.config, test_loader.config if test_loader is not None else None,
-            raw_config=raw_config, distributed=distributed,
-            sample_index_limit=sample_index_limit, test_sample_mode=test_sample_mode,
-            cuda_value_augmentation=cuda_value_augmentation,
-        )
-        queued_train = QueuedBatchView(sample_queue, "train", TrainingBatchIndices(
-            bounded_index or DistributedSampleIndex(loader.config.batch_size, distributed.world_size,
-                                                    distributed.rank, start_step),
-            optimizer_microbatch_takes, pipeline_batch_count), limit=0)
+        if batch_source is None:
+            sample_queue = _make_training_sample_queue(
+                loader.config, test_loader.config if test_loader is not None else None,
+                raw_config=raw_config, distributed=distributed,
+                sample_index_limit=sample_index_limit, test_sample_mode=test_sample_mode,
+                cuda_value_augmentation=cuda_value_augmentation,
+            )
+            queued_train = QueuedBatchView(sample_queue, "train", TrainingBatchIndices(
+                bounded_index or DistributedSampleIndex(loader.config.batch_size, distributed.world_size,
+                                                        distributed.rank, start_step),
+                optimizer_microbatch_takes, pipeline_batch_count), limit=0)
         initial_metric, initial_metric_name = None, None
         if handoff is None or pending_test is not None:
             is_initial = pending_test["initial"] if pending_test is not None else True
@@ -2956,10 +2968,10 @@ def training_units(
         if handoff is not None and initial_metric is not None and not is_initial:
             save_test_snapshots(start_step, initial_metric, initial_metric_name)
         admit_training_until_test(start_step)
-        train_iterator = queued_train
+        train_iterator = batch_source if batch_source is not None else queued_train
         if bounded_accumulation and optimizer_microbatch_count > 0:
             target_source = MacroBatchTargetSource(
-                queued_train, config=loader.config, device=device, output_stride=1,
+                train_iterator, config=loader.config, device=device, output_stride=1,
                 batch_sizes=optimizer_microbatch_takes,
                 conditioned=_model_uses_conditioned_decoder(raw_model))
             train_iterator = target_source
@@ -3121,6 +3133,9 @@ def training_units(
                 cleanup.callback(queued_train.close)
             if target_source is not None:
                 cleanup.callback(target_source.close)
+            if batch_source is not None:
+                # Wake a preparer waiting for future CPU data before joining it.
+                cleanup.callback(batch_source.close)
             if cuda_batch_pipeline is not None:
                 cleanup.callback(cuda_batch_pipeline.close)
 
