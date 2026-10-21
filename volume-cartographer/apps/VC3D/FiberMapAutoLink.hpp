@@ -70,6 +70,15 @@ struct MapMeeting {
 // quantity for callers without that dependency.
 [[nodiscard]] std::vector<double> cumulativeArclengths(const std::vector<cv::Vec3d>& linePoints);
 
+// The fractional line position of the point of a polyline nearest to `point`:
+// the foot on the segment with the smallest point-to-segment distance over
+// ALL segments (t clamped to [0, 1]; exact ties take the lower position), so
+// a point beside a later pass of the line is never anchored to a nearer
+// VERTEX of an earlier one. A single-vertex line gives 0; an empty one
+// nullopt.
+[[nodiscard]] std::optional<double> nearestLinePosition(const std::vector<cv::Vec3d>& linePoints,
+                                                        const cv::Vec3d& point);
+
 // The closest pass of the two fibers, searched only inside the line-point
 // ranges whose cumulative 3D arclength lies within +-windowVx of the
 // arclength at each fiber's source position (D3: the only along-fiber bound,

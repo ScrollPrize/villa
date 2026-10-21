@@ -335,6 +335,38 @@ cv::Vec3d pointAtLinePosition(const std::vector<cv::Vec3d>& linePoints, double l
     return linePoints[lower] * (1.0 - t) + linePoints[upper] * t;
 }
 
+std::optional<double> nearestLinePosition(const std::vector<cv::Vec3d>& linePoints,
+                                          const cv::Vec3d& point)
+{
+    if (linePoints.empty()) {
+        return std::nullopt;
+    }
+    if (linePoints.size() == 1) {
+        return 0.0;
+    }
+    std::optional<double> best;
+    double bestDistanceSq = std::numeric_limits<double>::infinity();
+    for (std::size_t i = 0; i + 1 < linePoints.size(); ++i) {
+        const cv::Vec3d a = linePoints[i];
+        const cv::Vec3d d = linePoints[i + 1] - a;
+        const double lengthSq = d.dot(d);
+        double t = 0.0;
+        if (lengthSq > 0.0) {
+            t = std::clamp((point - a).dot(d) / lengthSq, 0.0, 1.0);
+        }
+        const cv::Vec3d foot = a + t * d;
+        const cv::Vec3d offset = foot - point;
+        const double distanceSq = offset.dot(offset);
+        const double position = static_cast<double>(i) + t;
+        if (distanceSq < bestDistanceSq ||
+            (distanceSq == bestDistanceSq && best && position < *best)) {
+            bestDistanceSq = distanceSq;
+            best = position;
+        }
+    }
+    return best;
+}
+
 std::vector<double> cumulativeArclengths(const std::vector<cv::Vec3d>& linePoints)
 {
     std::vector<double> s(linePoints.size(), 0.0);

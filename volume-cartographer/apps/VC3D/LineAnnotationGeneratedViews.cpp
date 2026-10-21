@@ -815,16 +815,23 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
             }
         }
     } else if (!overlay.linePoints.empty()) {
-        sceneLine.reserve(overlay.linePoints.size());
+        // Projected per vertex, then enumerated by the one shared rule
+        // (generatedDrawnLineVertices): the anchor search of the
+        // "Link ... and ..." menu entry walks exactly these segments.
+        std::vector<QPointF> scenePoints(overlay.linePoints.size(),
+                                         QPointF(std::numeric_limits<double>::quiet_NaN(),
+                                                 std::numeric_limits<double>::quiet_NaN()));
         for (size_t pointIndex = 0; pointIndex < overlay.linePoints.size(); ++pointIndex) {
             const auto& point = overlay.linePoints[pointIndex];
-            if (!finiteGeneratedPoint(point)) {
-                continue;
+            if (finiteGeneratedPoint(point)) {
+                scenePoints[pointIndex] = viewer->volumeToScene(point);
             }
-            const QPointF scenePoint = viewer->volumeToScene(point);
-            if (finiteScenePoint(scenePoint)) {
-                sceneLine.push_back({scenePoint, static_cast<double>(pointIndex)});
-            }
+        }
+        const std::vector<size_t> drawn =
+            generatedDrawnLineVertices(overlay.linePoints, scenePoints);
+        sceneLine.reserve(drawn.size());
+        for (const size_t pointIndex : drawn) {
+            sceneLine.push_back({scenePoints[pointIndex], static_cast<double>(pointIndex)});
         }
     }
 
@@ -955,9 +962,7 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     }
 
     if (!overlay.useSurfaceCenterLine && sceneLine.size() >= 2) {
-        const auto controlRange = overlay.lineTailControlRange.has_value()
-            ? overlay.lineTailControlRange
-            : generatedControlLinePositionRange(overlay.controlPoints);
+        const auto controlRange = effectiveLineTailControlRange(overlay);
         // Consecutive non-tail segments accumulate into one polyline
         // primitive per run (same pattern as the branch lines above): a
         // primitive per segment meant one QGraphicsPathItem per segment,

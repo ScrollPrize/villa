@@ -144,6 +144,7 @@ class TestFiberMapAutoLink : public QObject
     Q_OBJECT
 
 private slots:
+    void nearestLinePositionFoot();
     // The arclength the layout resampled on is what unrolledLineArclengths
     // recomputes from the stored inputs, bitwise, and every drawn sample's
     // arclength is one of that parameterisation.
@@ -803,6 +804,30 @@ private slots:
         QCOMPARE(static_cast<int>(choice.kind), static_cast<int>(autolink::ControlChoice::Kind::Refused));
     }
 };
+
+void TestFiberMapAutoLink::nearestLinePositionFoot()
+{
+    // The counterexample to a nearest-vertex rule: the point sits ON the
+    // first segment (position 0.5) while the nearest vertex is the third.
+    const std::vector<cv::Vec3d> zigzag{{-10, 0, 0}, {10, 0, 0}, {0, 1, 0}, {0, 2, 0}};
+    const auto foot = autolink::nearestLinePosition(zigzag, cv::Vec3d{0, 0, 0});
+    QVERIFY(foot.has_value());
+    QCOMPARE(*foot, 0.5);
+    // Clamped at an end.
+    const auto before = autolink::nearestLinePosition(zigzag, cv::Vec3d{-20, 0, 0});
+    QVERIFY(before.has_value());
+    QCOMPARE(*before, 0.0);
+    // A tie takes the lower position.
+    const std::vector<cv::Vec3d> square{{0, 0, 0}, {10, 0, 0}, {10, 10, 0}, {0, 10, 0}};
+    const auto tie = autolink::nearestLinePosition(square, cv::Vec3d{5, 5, 0});
+    QVERIFY(tie.has_value());
+    QCOMPARE(*tie, 0.5);
+    // Degenerate inputs.
+    QVERIFY(!autolink::nearestLinePosition({}, cv::Vec3d{0, 0, 0}).has_value());
+    const auto single = autolink::nearestLinePosition({cv::Vec3d{1, 1, 1}}, cv::Vec3d{0, 0, 0});
+    QVERIFY(single.has_value());
+    QCOMPARE(*single, 0.0);
+}
 
 QTEST_APPLESS_MAIN(TestFiberMapAutoLink)
 #include "test_fiber_map_auto_link.moc"

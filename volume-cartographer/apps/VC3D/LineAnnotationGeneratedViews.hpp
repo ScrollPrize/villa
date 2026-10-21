@@ -1630,6 +1630,88 @@ inline bool generatedLineSegmentIsTail(
     return midpoint < controlRange->first || midpoint > controlRange->second;
 }
 
+// The vertices of an overlay line the renderer DRAWS, in order: every index
+// whose line point and whose projection are both finite. The drawn segments
+// join consecutive entries of this list, so a blanked (NaN) vertex does not
+// break the polyline - the segment bridges it, exactly as the renderer's
+// polyline runs do. One enumeration, shared by the renderer and the anchor
+// rule below so the two can never disagree about what is on screen.
+inline std::vector<std::size_t> generatedDrawnLineVertices(
+    const std::vector<cv::Vec3f>& linePoints,
+    const std::vector<QPointF>& scenePoints)
+{
+    std::vector<std::size_t> drawn;
+    const std::size_t count = std::min(linePoints.size(), scenePoints.size());
+    drawn.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto& point = linePoints[i];
+        const QPointF& scene = scenePoints[i];
+        if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2]) ||
+            !std::isfinite(scene.x()) || !std::isfinite(scene.y())) {
+            continue;
+        }
+        drawn.push_back(i);
+    }
+    return drawn;
+}
+
+// The control range the renderer classifies tails against: the overlay's
+// own lineTailControlRange when a builder set one (a windowed side cut), else
+// the range of the overlay's controls. The renderer's rule, in one place.
+inline std::optional<std::pair<double, double>> effectiveLineTailControlRange(
+    const GeneratedOverlay& overlay)
+{
+    return overlay.lineTailControlRange.has_value()
+        ? overlay.lineTailControlRange
+        : generatedControlLinePositionRange(overlay.controlPoints);
+}
+
+// The position on the DRAWN line nearest to a scene point: the foot of the
+// target on the nearest drawn, non-tail segment (generatedDrawnLineVertices,
+// generatedLineSegmentIsTail), as the fractional line position i + t (j - i)
+// of that foot with t clamped to [0, 1]. Exact ties take the lower position.
+// Nothing drawn -> nullopt. Pure: no viewer, the caller projects.
+inline std::optional<double> nearestDrawnLinePosition(
+    const std::vector<cv::Vec3f>& linePoints,
+    const std::vector<QPointF>& scenePoints,
+    const std::optional<std::pair<double, double>>& tailControlRange,
+    const QPointF& target)
+{
+    if (!std::isfinite(target.x()) || !std::isfinite(target.y())) {
+        return std::nullopt;
+    }
+    const std::vector<std::size_t> drawn = generatedDrawnLineVertices(linePoints, scenePoints);
+    std::optional<double> best;
+    double bestDistanceSq = std::numeric_limits<double>::infinity();
+    for (std::size_t k = 1; k < drawn.size(); ++k) {
+        const std::size_t i = drawn[k - 1];
+        const std::size_t j = drawn[k];
+        if (generatedLineSegmentIsTail(static_cast<double>(i), static_cast<double>(j),
+                                       tailControlRange)) {
+            continue;
+        }
+        const QPointF a = scenePoints[i];
+        const QPointF b = scenePoints[j];
+        const double dx = b.x() - a.x();
+        const double dy = b.y() - a.y();
+        const double lengthSq = dx * dx + dy * dy;
+        double t = 0.0;
+        if (lengthSq > 0.0) {
+            t = ((target.x() - a.x()) * dx + (target.y() - a.y()) * dy) / lengthSq;
+            t = std::clamp(t, 0.0, 1.0);
+        }
+        const double fx = a.x() + t * dx - target.x();
+        const double fy = a.y() + t * dy - target.y();
+        const double distanceSq = fx * fx + fy * fy;
+        const double position = static_cast<double>(i) + t * static_cast<double>(j - i);
+        if (distanceSq < bestDistanceSq || (distanceSq == bestDistanceSq && best && position < *best)) {
+            bestDistanceSq = distanceSq;
+            best = position;
+        }
+    }
+    return best;
+}
+
 // Defined further down (with the other tagged-end helpers); declared here for
 // the overlay builders' blocked-marker state.
 inline bool generatedLinePositionBeyondKollesisTermination(
