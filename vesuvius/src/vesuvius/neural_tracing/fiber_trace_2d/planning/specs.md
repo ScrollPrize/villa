@@ -396,7 +396,16 @@
   oversized axis-aligned zarr crop and then resample that crop with torch
   `grid_sample` for normal training. Array-backed tests may use the
   NumPy/trilinear fallback sampler. Value-only augmentations happen after
-  sampling as torch tensor operations.
+  sampling through the shared CPU preparation API, using the selected native
+  or Torch backend without changing augmentation order or mask statistics.
+- Reusable 3D sample preparation exposes explicit native/eager geometry and
+  native/Torch value backends, plus native I/O/decode/sampling thread knobs.
+  A source-tagged bounded worker owner retains per-source parsed loaders and
+  shares generation-checked volume/mask slots between train and test views. Canonical
+  sample IDs seed augmentation; queue ordinals never change sample semantics.
+  This API extraction does not yet replace the normal trainer entrypoint's
+  DataLoader wiring below; that wiring follows with its existing GPU-preparation
+  and effective-batch dependencies, rather than a separate reimplementation.
 - VC3D blocking coordinate sampling means strict requested-level sampling:
   every required requested-level chunk is fetched/decoded and locally pinned
   before sampling starts, scale fallback is disabled, and returned stats report
