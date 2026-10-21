@@ -2192,6 +2192,24 @@ def _bounded_data_sample_index(sample_index: int, sample_index_limit: int | None
     return int(sample_index) % limit
 
 
+@dataclass(frozen=True)
+class FiberTrace3DDatasetMetadata:
+    """Allocation-local consumer view; persistent loaders own records/samplers."""
+
+    config: FiberTrace3DConfig
+    sample_count: int
+
+    def for_config(self, config):
+        import copy
+        adapted = replace(self.config, batch_size=config.batch_size,
+            volume_io_threads=config.volume_io_threads,
+            volume_decode_threads=config.volume_decode_threads,
+            volume_sample_threads=config.volume_sample_threads)
+        if adapted != config:
+            raise ValueError("persistent dataset metadata differs from worker configuration")
+        return replace(self, config=copy.deepcopy(adapted))
+
+
 class FiberTrace3DLoader:
     def __init__(self, config: FiberTrace3DConfig) -> None:
         if config.batch_size <= 0:
@@ -2254,6 +2272,11 @@ class FiberTrace3DLoader:
     @property
     def sample_count(self) -> int:
         return int(self._flat_sample_count)
+
+    @property
+    def dataset_metadata(self):
+        import copy
+        return FiberTrace3DDatasetMetadata(copy.deepcopy(self.config), self.sample_count)
 
     def _load_records(self) -> list[_Record]:
         array_records = getattr(self.config, "_array_records", None)

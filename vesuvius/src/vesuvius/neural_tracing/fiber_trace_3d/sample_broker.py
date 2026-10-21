@@ -47,12 +47,14 @@ class CanonicalSampleBroker:
             training.update(training_overrides)
         sources = {"train": SampleQueueSource(loader_config, "random", sample_index_limit,
                                               defer_cuda_value_augmentation)}
+        loaders = {"train": FiberTrace3DLoader(loader_config)}
         count, offset, batch = 0, 0, 1
         interval = int(training.get("test_interval", 0))
         if raw.get("test_datasets") and interval > 0:
             config = config_from_mapping(_make_test_loader_raw_config(raw, training),
                                          config_dir=Path(config_path).resolve().parent)
             loader = FiberTrace3DLoader(config)
+            loaders["test"] = loader
             count, offset, mode = _resolve_dense_test_selection(training,
                 loader_sample_count=loader.sample_count, default_count=0)
             batch = config.batch_size
@@ -62,9 +64,12 @@ class CanonicalSampleBroker:
             slot_count=slot_count, initial_in_flight=initial_in_flight,
             initial_active_workers=0, profile=profile, own_worker_sessions=True,
             on_process_start=on_process_start)
-        return cls(queue, effective_batch_size=effective_batch_size, start_step=start_step,
+        result = cls(queue, effective_batch_size=effective_batch_size, start_step=start_step,
             max_steps=max_steps, test_interval=interval, test_sample_count=count,
             test_batch_size=batch, test_start_sample_index=offset)
+        result.loaders = loaders
+        result.dataset_metadata = {name: loader.dataset_metadata for name, loader in loaders.items()}
+        return result
 
     @property
     def ready(self):
