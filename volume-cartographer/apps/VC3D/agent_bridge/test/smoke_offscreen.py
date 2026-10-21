@@ -2269,9 +2269,19 @@ def check_segmentation_settings(client: BridgeClient, results: Results) -> None:
         echoed, _ = client.call("segmentation.set_settings", settings, timeout=RPC_TIMEOUT)
         radius = settings["drag"]["radius"]
         target = radius + 1.0
+        # A bound left out keeps its value. A fresh settings store starts at
+        # [0, 0], where min alone cannot rise, so max is raised alone first
+        # and min then rises alone below it.
+        z_min = settings["zRange"]["min"]
+        z_max = max(z_min, settings["zRange"]["max"]) + 3
+        widened, _ = client.call(
+            "segmentation.set_settings",
+            {"zRange": {"enabled": False, "max": z_max}},
+            timeout=RPC_TIMEOUT,
+        )
         changed, _ = client.call(
             "segmentation.set_settings",
-            {"drag": {"radius": target}, "zRange": {"enabled": False, "min": 3}},
+            {"drag": {"radius": target}, "zRange": {"enabled": False, "min": z_min + 3}},
             timeout=RPC_TIMEOUT,
         )
         restored, _ = client.call(
@@ -2281,13 +2291,15 @@ def check_segmentation_settings(client: BridgeClient, results: Results) -> None:
         )
         ok = (
             echoed["drag"] == settings["drag"]
+            and echoed["zRange"] == settings["zRange"]
+            and widened["zRange"] == {"enabled": False, "min": z_min, "max": z_max}
             and changed["drag"]["radius"] == target
-            and changed["zRange"]["min"] == 3
-            and changed["zRange"]["max"] == settings["zRange"]["max"]
+            and changed["zRange"] == {"enabled": False, "min": z_min + 3, "max": z_max}
             and restored["drag"]["radius"] == radius
             and restored["zRange"] == settings["zRange"]
         )
         results.record("segmentation_set_settings_round_trip", ok,
+                       f"widened={widened['zRange']} "
                        f"changed={changed['drag']} {changed['zRange']} "
                        f"restored={restored['drag']} {restored['zRange']}")
     except Exception as error:  # noqa: BLE001
