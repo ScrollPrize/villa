@@ -5,9 +5,11 @@ existing one-backward utility extracted from `3a4a7b2c1`. It accumulates a fixed
 logical optimizer batch while allowing different microbatch sizes and rank
 counts, without accumulating a separate model-sized gradient bank per loss.
 
-This is a library extraction, not a switch of the current training CLI. The
-production loss-statistics API and geometry-count staging are included; wiring
-the training loop and cooperative worker lifecycle remain subsequent stages.
+The production loss-statistics API, geometry-count staging and opt-in
+[shared resumable training loop](queued_training.md) are included. Ordinary
+CLI training retains its previous objective; bounded mode connects these
+utilities without adding DDP backward hooks. Cooperative worker lifecycle
+and automatic resource calibration remain subsequent stages.
 Shared [snapshot and in-RAM handoff state](training_state.md) is also available
 for that later lifecycle integration.
 No model defaults, sampling policy or loss objective changes.
@@ -150,12 +152,11 @@ This is not an exhaustive proof for arbitrary custom modules: callers must
 also avoid their own cross-sample communication/state and random operations.
 GroupNorm and other genuinely per-sample normalization can be used.
 
-`validate_target_only_loss_config` is an opt-in validation helper for this
-extraction stage. It rejects embedding and ordinary multi-branch training modes
+`validate_target_only_loss_config` is used by the opt-in bounded training loop
+and physical test batching. It rejects embedding and ordinary multi-branch training modes
 pending their later compatible loss extraction. It does not change existing
 inference support or silently disable an already-supported training CLI mode.
-Conditioned counts/statistics are available through the production API above;
-the current trainer loop is not yet wired to bounded accumulation.
+Conditioned counts/statistics use the same production API and target prepass.
 
 ## Validation
 

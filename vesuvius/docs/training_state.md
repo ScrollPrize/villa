@@ -91,10 +91,11 @@ Real cached Paris4 CT/annotation tests use a small sample-independent
 seven-channel head to compare subsequent loss, model and AdamW state exactly
 after RAM handoff or disk save/load, including CPU BF16 and
 enabled/disabled scalers. They also cover raw weights, LR/WD overrides, schema,
-wrapper keys and CPU-only behavior. Source tests depending on later
-`training_units`/physical-test-batch integration remain deferred with that
-trainer extraction; these utility tests do not claim manager interruption
-coverage.
+wrapper keys and CPU-only behavior. The additional real-data tests in
+`test_resumable_training.py` connect these utilities to the
+[shared training loop](queued_training.md), including physical-test-batch
+normalization and initial/periodic test interruption. These tests do not claim
+manager allocation or cohort interruption coverage.
 
 CUDA tests must be launched under a GPU-manager reservation for two GPUs:
 

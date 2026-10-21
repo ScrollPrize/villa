@@ -3,7 +3,8 @@
 `vesuvius.neural_tracing.ordered_sample_pipeline` provides the CPU scheduling
 foundation for shared training and evaluation loading. It is independent of
 fiber annotations, augmentation recipes, model outputs and GPU allocations.
-This extraction does **not** switch the existing trainer to this queue yet.
+The Fiber3D trainer uses one source-tagged queue per rank for training and dense
+evaluation; see [the training integration](queued_training.md).
 
 ## Fiber3D preparation integration
 
@@ -16,9 +17,9 @@ Serial and queued batches both use `collate_fiber_trace_3d_samples`.
 This layer is extracted from the CPU preparation stage before CUDA augmentation
 and the later annotation/refinement/embedding features. Its masks, fixed-sigma
 augmentation, targets and sampling remain that stage's existing behavior.
-The normal training CLI's replacement by the latest unified owner is deferred
-until its GPU preparation and effective-batch dependencies are extracted;
-the old trainer has not been rewritten as an alternative integration.
+The production loop now consumes these shared queues instead of separate
+whole-batch train/test worker pools. Cooperative GPU worker ownership and
+bounded effective-batch accumulation remain separate integration stages.
 
 `geometry_backend` defaults to `eager`; `value_augmentation_backend` defaults to
 `torch`, preserving unchanged-config preprocessing independently of which
