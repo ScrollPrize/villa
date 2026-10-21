@@ -387,7 +387,10 @@ dialog.
   fiber volume needs a current volume (-32001) with a verified coordinate
   identity (-32009), and attaching the open one again returns a synchronous
   result with `jobId: null`. A fiber volume whose attachment record cannot be
-  written fails the job, since it would not reopen with the project.
+  written fails the job, since it would not reopen with the project. The
+  Open Data Catalog window attaches a sample's Zarr predictions and streaming
+  normal grids itself, not through `ProjectAttachmentController`, so
+  `project.attach` does not cover those attaches.
 - `project.detach` requires `confirm: true` and never deletes data files;
   detaching an automated fiber volume removes its attachment record beside the
   project file. An entry is removed from every entry list that stores the
