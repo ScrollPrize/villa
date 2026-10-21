@@ -66,6 +66,12 @@ endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
 
+vc_add_test(NAME test_sampling_wait_profile)
+add_test(NAME test_sampling_wait_profile_enabled
+    COMMAND ${CMAKE_COMMAND} -E env VC_SAMPLING_WAIT_PROFILE=1
+        $<TARGET_FILE:test_sampling_wait_profile>)
+vc_register_ctest(test_sampling_wait_profile_enabled test_sampling_wait_profile)
+
 vc_add_test(NAME test_fiber_collection LIBS doctest::doctest vc_fiber_collection)
 
 vc_add_test(NAME test_omp_thread_point_collection)
@@ -281,6 +287,17 @@ vc_add_test(NAME test_lasagna_maxflow_graph LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_fiber_trace3d
     LIBS doctest::doctest vc_fiber_tracer
     DEFS VC_TESTING)
+vc_add_test(NAME test_fiber_anchors LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_prediction_channels LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_replay_metric LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiberlet_storage LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiberlet_paths LIBS doctest::doctest vc_fiber_tracer DEFS VC_TESTING)
+if(TARGET test_fiberlet_paths AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # The inline optimized/reference kernels assert bitwise operation-order
+    # equality. Do not let the compiler contract just one expression into FMA.
+    # This affects the comparison harness only, not production code.
+    target_compile_options(test_fiberlet_paths PRIVATE -ffp-contract=off)
+endif()
 
 # Qt-free data/IO layer.
 vc_add_test(NAME test_point_collections)
@@ -679,19 +696,17 @@ if(VC_RUN_RENDER_BENCHMARKS)
 
                 set(_gate "${_case_dir}/checked.json")
                 set(_gate_command
-                    $<TARGET_FILE:bench_thread_sync_replay>
-                    evaluate-render
+                    ${Python3_EXECUTABLE}
+                    "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
+                    collect-evaluate --reuse-capture
+                    --valgrind "${VC_VALGRIND_EXECUTABLE}"
+                    --benchmark $<TARGET_FILE:bench_render_synthetic>
+                    --replay $<TARGET_FILE:bench_thread_sync_replay>
                     --fixture ${_fixture}
                     --scenario ${_scenario}
-                    --callgrind-prefix "${_callgrind_prefix}"
-                    --callgrind-metadata "${_callgrind_metadata}"
+                    --case-dir "${_case_dir}"
                     --model "${_render_valgrind_ci_model}"
-                    --reference "${_render_valgrind_ci_reference}"
-                    --output "${_gate}")
-                if(_fixture STREQUAL "parallel")
-                    list(APPEND _gate_command
-                        --callgrind-scheduler "${_callgrind_scheduler}")
-                endif()
+                    --reference "${_render_valgrind_ci_reference}")
                 add_custom_command(
                     OUTPUT "${_gate}"
                     BYPRODUCTS "${_case_dir}/checked.failed.json"
@@ -700,6 +715,7 @@ if(VC_RUN_RENDER_BENCHMARKS)
                         "${_evaluation}"
                         "${_callgrind_stamp}"
                         bench_thread_sync_replay
+                        "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
                         "${_render_valgrind_ci_model}"
                         "${_render_valgrind_ci_reference}"
                     VERBATIM)
@@ -799,6 +815,7 @@ vc_add_test(NAME test_surface_patch_index)
 vc_add_test(NAME test_tiff_merge)
 
 vc_add_test(NAME test_http_fetch_errors)
+vc_add_test(NAME test_global_cache_root)
 vc_add_test(NAME test_sftp_fetch LIBS doctest::doctest vc_core Qt6::Core)
 if(VC_BUILD_PYTHON)
     find_package(Python REQUIRED COMPONENTS Interpreter)
