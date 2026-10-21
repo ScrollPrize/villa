@@ -485,6 +485,16 @@ Confirm that every input produced three readable, non-empty STLs and one CSV row
 
 The generator uses multiple workers and may finish its parent process even if a worker failed. A zero exit status is therefore insufficient. Require the padded identifier's three expected STLs, a populated `scroll_summary.csv` row, readable finite geometry and sensible assembly renders before accepting the kit. [`photogrammetry-tools/scrollcase_qa.py`](../photogrammetry-tools/) checks these, measures the clearance between the scroll and each half, and writes section and assembly renders.
 
+#### Scan footprint
+
+`scripts/xy_outline.py` projects each scroll along the case axis (z) and outlines the union of the x,y coordinates of its interior:
+
+```bash
+.venv/bin/python scripts/xy_outline.py "$SCROLLCASE_OUTPUT" --output /path/to/xy-outlines
+```
+
+Inputs may be the generator's output directory (searched for `*_scroll.stl`) or individual scroll STLs. The coordinates are those of the case frame: z along the case axis, origin on the axis at the base of the scroll, and the origin at the centre of the smallest circle enclosing the scroll's projection (so a lopsided fragment can look off-centre). +y is the side of the `_right` half, marked by the alignment arrow engraved on the bottom cap. For each scroll it writes `<padded-scroll-number>_xy_outline.csv`, the points of a closed counter-clockwise polyline in order, at most 1 mm apart (`x_mm,y_mm`; the script stops if a projection falls into several pieces), and `<padded-scroll-number>_xy_outline.png` showing the outline over the mesh footprint coloured by height, with the lining's outer circle (the diameter in `scroll_summary.csv`) dashed; `xy_outlines_overview.png` shows all of them. The projection is rasterised on a 0.5 mm grid, so the outline is within about 0.5 mm of the true footprint; use `--margin` to grow it outwards, and `--cell` and `--step` to change the grid and point spacing.
+
 #### Printing
 
 For scrolls fixtured in Naples, the historical supplier is 3DNa S.r.L. in Pomigliano d'Arco (NA). The printed cases are fragile and can be damaged in transit, so local printing and hand delivery to the library are preferred when possible. If shipment is unavoidable, use substantial protective packaging.
