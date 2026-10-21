@@ -985,3 +985,6 @@ if(VC_TESTING)
             COMMENT "Running clang source-based coverage")
     endif()
 endif()
+
+# Windows (MinGW): UTF-8 application manifest in every executable (#1979).
+include(cmake/WindowsUtf8Manifest.cmake)
