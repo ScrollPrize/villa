@@ -75,8 +75,54 @@ private:
     FiberEvaluationControl& control_;
 };
 
-std::vector<FiberReplayTraceResult> evaluateFiberChunkCases(
-    FiberChunkTraceCache& cache, const FiberPredictionSource& predictions,
+FiberReplayTraceResult replayFiberBeamCase(
+    const FiberPredictionSource& predictions, const FiberTraceConfig& trace, double scale,
+    const vc::lasagna::NormalSampler& tracingNormals,
+    const vc::lasagna::NormalSampler& evaluationNormals, double normalScale,
+    const FiberEvaluationCase& c, const FiberChunkReplayConfig& config,
+    double reverseInterval, const FiberTraceProgressCallback& progress)
+{
+    const FiberTraceCoordinateAdapter coordinates(scale);
+    validateFiberTraceConfig(trace);
+    const auto reference = makePolylineArcGeometry(c.referenceBase);
+    const double end = c.endArcBase.value_or(reference.length());
+    auto policy = fiberChunkReplayConsistency(predictions, tracingNormals, trace, config, reverseInterval);
+    policy.nextSeed = [&](double arc) -> std::optional<PolylineArcSample> {
+        if (arc >= end) return std::nullopt;
+        return samplePolylineArc(reference, arc);
+    };
+    double widthMean = trace.widthReferenceMean;
+    if (reverseInterval > 0) policy.verify = [&](const auto& points) {
+        auto reverse = trace;
+        reverse.traceToBaseScale = scale;
+        if (reverse.widthRelativeTolerance > 0) reverse.widthReferenceMean = widthMean;
+        const auto path = makePolylineArcGeometry(points);
+        return verifyFiberReverseSpan(predictions, tracingNormals, reverse, path, path.length(),
+            config.errorThresholdBase, config.errorThresholdBase * config.tangentialThresholdFactor) <= 1e-12;
+    };
+    const ReplaySegmentRunner run = [&](const PolylineArcSample& seed, double remaining,
+        int maximumSteps, const ReplayPointObserver& observe, const FiberTraceProgressCallback& report) {
+        FiberTraceOneWayRequest request;
+        request.startPoint = coordinates.baseToTrace(seed.point);
+        request.targetPoint = coordinates.baseToTrace(samplePolylineArc(reference, end).point);
+        request.initialDirection = seed.tangent;
+        request.budgetSpanVoxels = remaining / scale;
+        request.config = trace;
+        request.config.traceToBaseScale = scale;
+        widthMean = trace.widthReferenceMean;
+        return traceFiberReplaySegment(predictions, request, maximumSteps, tracingNormals, report,
+            [&](const auto& point, double loss, int step) {
+                return observe(coordinates.traceToBase(point), loss, step);
+            }, widthMean);
+    };
+    return traceReferenceReplayCore(reference, c.beginArcBase, end, trace.stepVoxels * scale,
+        trace.maxStepFactor, config.errorThresholdBase, config.excursionGraceBase,
+        config.tangentialThresholdFactor, config.matchRefineSteps, evaluationNormals,
+        normalScale, run, progress, {}, policy);
+}
+
+static std::vector<FiberReplayTraceResult> evaluateCases(
+    FiberChunkTraceCache* cache, const FiberPredictionSource& predictions,
     const FiberTraceConfig& traceInput, double scale,
     const vc::lasagna::NormalSampler& tracingNormals,
     const vc::lasagna::NormalSampler& evaluationNormals, double normalScale,
@@ -113,7 +159,10 @@ std::vector<FiberReplayTraceResult> evaluateFiberChunkCases(
         auto queue = std::make_unique<FiberCaseQueue>(workers, cases.size(), [&] {
             run.check();
             const size_t i = next.fetch_add(1);
-            results[i] = traceFiberChunkReferenceReplay(cache, predictions, trace, scale, tracingNormals,
+            if (!cache) results[i] = replayFiberBeamCase(predictions, trace, scale, tracingNormals,
+                evaluationNormals, normalScale, cases[i], config, reverseInterval,
+                [&](const auto&) { run.check(); });
+            else results[i] = traceFiberChunkReferenceReplay(*cache, predictions, trace, scale, tracingNormals,
                 references[i], cases[i].beginArcBase, cases[i].endArcBase.value_or(references[i].length()),
                 evaluationNormals, normalScale, config, FiberCaseQueue::parallelFor,
                 [](const auto& ready) { FiberCaseQueue::await(ready); },
@@ -134,5 +183,26 @@ std::vector<FiberReplayTraceResult> evaluateFiberChunkCases(
         run.failed("unknown evaluation error");
         throw;
     }
+}
+std::vector<FiberReplayTraceResult> evaluateFiberChunkCases(
+    FiberChunkTraceCache& cache, const FiberPredictionSource& predictions,
+    const FiberTraceConfig& trace, double scale, const vc::lasagna::NormalSampler& normals,
+    const vc::lasagna::NormalSampler& evaluationNormals, double normalScale,
+    const std::vector<FiberEvaluationCase>& cases, const FiberChunkReplayConfig& config,
+    FiberEvaluationControl& control, size_t workers, size_t contexts, double reverseInterval)
+{
+    return evaluateCases(&cache, predictions, trace, scale, normals, evaluationNormals,
+        normalScale, cases, config, control, workers, contexts, reverseInterval);
+}
+
+std::vector<FiberReplayTraceResult> evaluateFiberBeamCases(
+    const FiberPredictionSource& predictions, const FiberTraceConfig& trace, double scale,
+    const vc::lasagna::NormalSampler& normals, const vc::lasagna::NormalSampler& evaluationNormals,
+    double normalScale, const std::vector<FiberEvaluationCase>& cases,
+    const FiberChunkReplayConfig& config, FiberEvaluationControl& control,
+    size_t workers, size_t contexts, double reverseInterval)
+{
+    return evaluateCases(nullptr, predictions, trace, scale, normals, evaluationNormals,
+        normalScale, cases, config, control, workers, contexts, reverseInterval);
 }
 } // namespace vc::fiber_tracer

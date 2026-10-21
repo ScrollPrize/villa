@@ -29,6 +29,7 @@
 #include "vc/fiber_tracer/FiberLiveBridge.hpp"
 #include "vc/fiber_tracer/FiberCaseQueue.hpp"
 #include "vc/fiber_tracer/FiberEvaluation.hpp"
+#include "vc/fiber_tracer/FiberJson.hpp"
 #include <atomic>
 #include "vc/fiber_tracer/FiberReverseConsistency.hpp"
 #include "vc/lasagna/Dataset.hpp"
@@ -408,6 +409,34 @@ ft::FiberReplayTraceResult chunkReplay(ChunkCacheHandle& self,const PointsIn& po
 
 NB_MODULE(fiber_trace, m)
 {
+    m.def("reference_plan_json", [](const std::string& text) {
+        return ft::vc3dEvaluationReferencePlan(
+            ft::parseVc3dFiberJson(nlohmann::json::parse(text), "reference"), "reference").dump();
+    }, "annotation_json"_a);
+    m.def("beam_replay", [](const PredictionFieldHandle& field, const NormalSamplerHandle& normals,
+        const NormalSamplerHandle& evaluationNormals, const ft::FiberTraceConfig& config,
+        const ft::FiberEvaluationCase& input, const ft::FiberChunkReplayConfig& replay, double interval) {
+        const auto trace = checkedConfig(field, config, &normals);
+        const auto c = input;
+        const auto r = replay;
+        nb::gil_scoped_release release;
+        return ft::replayFiberBeamCase(*field.field, trace, field.scales.traceToBaseScale,
+            *normals.sampler, *evaluationNormals.sampler, evaluationNormals.workingToBaseScale, c, r, interval);
+    }, "field"_a, "normals"_a, "evaluation_normals"_a, "trace"_a, "case"_a, "replay"_a,
+       "reverse_interval_base"_a=0.);
+    m.def("beam_replay_many", [](const PredictionFieldHandle& field, const NormalSamplerHandle& normals,
+        const NormalSamplerHandle& evaluationNormals, const ft::FiberTraceConfig& config,
+        const std::vector<ft::FiberEvaluationCase>& input, const ft::FiberChunkReplayConfig& replay,
+        ft::FiberEvaluationControl& control, size_t workers, size_t contexts, double interval) {
+        const auto trace = checkedConfig(field, config, &normals);
+        const auto cases = input;
+        const auto r = replay;
+        nb::gil_scoped_release release;
+        return ft::evaluateFiberBeamCases(*field.field, trace, field.scales.traceToBaseScale,
+            *normals.sampler, *evaluationNormals.sampler, evaluationNormals.workingToBaseScale,
+            cases, r, control, workers, contexts, interval);
+    }, "field"_a, "normals"_a, "evaluation_normals"_a, "trace"_a, "cases"_a, "replay"_a,
+       "control"_a, "workers"_a=4, "contexts_per_worker"_a=8, "reverse_interval_base"_a=0.);
     m.doc() = "Python bindings for the Volume Cartographer native fiber beam tracer";
 
     nb::class_<ft::FiberChunkTraceConfig>(m,"ChunkConfig")

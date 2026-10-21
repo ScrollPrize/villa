@@ -1,4 +1,4 @@
-"""Callable chunk-reference evaluation; CLI is only config/result I/O.
+"""Callable chunk/direct-beam reference evaluation; CLI is only config/result I/O.
 
 No GPU inference, subprocesses, cohort selection or annotation rewriting.
 References are explicit base-XYZ polylines, one entry per tracing direction.
@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -43,6 +44,31 @@ CHUNK_KEYS = (
 )
 REPLAY_KEYS = ("error_threshold_base", "excursion_grace_base",
                "tangential_threshold_factor", "match_refine_steps")
+
+
+def reference_cases(annotation, identity, *, direction=None):
+    """Select CP-bounded non-lasagna runs with the shared native selector.
+
+    Never bridge excluded spans or extrapolate. Input coordinates must already
+    be base XYZ. Direction defaults to the annotation's evaluation_direction,
+    or both. Return cases plus the full selection/exclusion provenance.
+    """
+    direction = annotation.get("evaluation_direction", "both") if direction is None else direction
+    if direction not in ("both", "forward", "reverse"):
+        raise ValueError("reference direction must be both, forward or reverse")
+    plan = json.loads(ft.reference_plan_json(json.dumps(annotation, allow_nan=False)))
+    cases = []
+    for run in plan["runs"]:
+        for reverse in (False, True):
+            name = "reverse" if reverse else "forward"
+            if direction not in ("both", name):
+                continue
+            points = run["points_base_xyz"]
+            cases.append(dict(id=f"{identity}/run{run['run_index']}/{name}",
+                              points_base_xyz=points[::-1] if reverse else points,
+                              reference=dict(direction=name, **{k: v for k, v in run.items()
+                                                                if k != "points_base_xyz"})))
+    return cases, plan
 
 
 def replay_dict(result):
@@ -103,19 +129,43 @@ def evaluate(config, *, base_directory=".", control=None, progress=None):
     _keys(cfg, ("version", "prediction_manifest", "normal_manifest", "evaluation_normal_manifest",
                 "source_identity", "chunk_cache", "scaledown_power", "cache_bytes", "enable_width",
                 "remote_cache_root", "trace", "chunks", "replay", "cases", "workers",
-                "contexts_per_worker", "reverse_interval_base", "live_endpoint"), "evaluation")
+                "contexts_per_worker", "reverse_interval_base", "live_endpoint", "backend"), "evaluation")
     if cfg.get("version") != 1:
         raise ValueError("evaluation version must be 1")
+    backend = cfg.get("backend", "chunk")
+    if backend not in ("chunk", "beam"):
+        raise ValueError("backend must be chunk or beam")
+    if backend == "beam" and ("chunks" in cfg or "chunk_cache" in cfg):
+        raise ValueError("beam evaluation does not use chunks or chunk_cache")
     base = Path(base_directory).resolve()
 
     def location(value):
         text = str(value)
         return text if "://" in text else str((base / text).resolve())
 
+    selected, selection = [], []
+    input_ids = set()
+    for item in cfg["cases"]:
+        _keys(item, ("id", "points_base_xyz", "begin_arc_base", "end_arc_base", "fiber_path", "direction"), "case")
+        identity = item["id"]
+        if not isinstance(identity, str) or not identity or identity in input_ids:
+            raise ValueError("case IDs must be nonempty unique strings")
+        input_ids.add(identity)
+        if "fiber_path" in item:
+            if any(k in item for k in ("points_base_xyz", "begin_arc_base", "end_arc_base")):
+                raise ValueError("fiber_path cannot be combined with explicit points/arc limits")
+            path = Path(location(item["fiber_path"]))
+            data = path.read_bytes()
+            rows, plan = reference_cases(json.loads(data), identity, direction=item.get("direction"))
+            selected.extend(rows)
+            selection.append(dict(id=identity, fiber_path=str(path), sha256=hashlib.sha256(data).hexdigest(), **plan))
+        else:
+            if "direction" in item:
+                raise ValueError("explicit points already specify direction")
+            selected.append(item)
     identities = set()
     cases = []
-    for item in cfg["cases"]:
-        _keys(item, ("id", "points_base_xyz", "begin_arc_base", "end_arc_base"), "case")
+    for item in selected:
         identity = item["id"]
         if not isinstance(identity, str) or not identity or identity in identities:
             raise ValueError("case IDs must be nonempty unique strings")
@@ -142,9 +192,10 @@ def evaluate(config, *, base_directory=".", control=None, progress=None):
                  trace_to_base_scale=field.trace_to_base_scale)
     trace.update(cfg.get("trace", {}))
     trace = ft.TraceConfig.from_dict(trace)
-    chunks = _settings(ft.ChunkConfig, cfg.get("chunks", {}), CHUNK_KEYS)
     replay = _settings(ft.ChunkReplayConfig, cfg.get("replay", {}), REPLAY_KEYS)
-    cache = ft.ChunkCache(field, normals, trace, chunks, location(cfg["chunk_cache"]), source_identity)
+    if backend == "chunk":
+        chunks = _settings(ft.ChunkConfig, cfg.get("chunks", {}), CHUNK_KEYS)
+        cache = ft.ChunkCache(field, normals, trace, chunks, location(cfg["chunk_cache"]), source_identity)
     control = control if control is not None else ft.EvaluationControl()
     bridge = None
     try:
@@ -155,9 +206,13 @@ def evaluate(config, *, base_directory=".", control=None, progress=None):
                 endpoint.get("timeout_seconds", 600), endpoint.get("heartbeat_wait", False))
             field.set_live_bridge(bridge, endpoint["source"])
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="fiber-evaluation") as pool:
-            future = pool.submit(cache.replay_many, cases, evaluation_normals, replay, control,
-                                 cfg.get("workers", 4), cfg.get("contexts_per_worker", 8),
-                                 cfg.get("reverse_interval_base", 0.))
+            budgets = (cfg.get("workers", 4), cfg.get("contexts_per_worker", 8),
+                       cfg.get("reverse_interval_base", 0.))
+            if backend == "chunk":
+                future = pool.submit(cache.replay_many, cases, evaluation_normals, replay, control, *budgets)
+            else:
+                future = pool.submit(ft.beam_replay_many, field, normals, evaluation_normals,
+                                     trace, cases, replay, control, *budgets)
             try:
                 while True:
                     try:
@@ -171,12 +226,13 @@ def evaluate(config, *, base_directory=".", control=None, progress=None):
             except BaseException:
                 control.cancel("evaluation caller interrupted")
                 raise
-        rows = [dict(id=item["id"], **replay_dict(result))
-                for item, result in zip(cfg["cases"], results, strict=True)]
+        rows = [dict(id=item["id"], **({"reference": item["reference"]} if "reference" in item else {}),
+                     **replay_dict(result)) for item, result in zip(selected, results, strict=True)]
         public_config = copy.deepcopy(cfg)
         if "live_endpoint" in public_config:
             public_config["live_endpoint"].pop("token", None)
-        return dict(format="vc_chunk_evaluation", version=1, config=public_config,
+        return dict(format="vc_chunk_evaluation" if backend == "chunk" else "vc_beam_evaluation",
+                    version=1, config=public_config, reference_selection=selection,
                     cases=rows, failure_count=sum(len(row["failures"]) for row in rows),
                     filtered_stop_count=sum(len(row["filtered_stops"]) for row in rows),
                     retained_trace_length_base=sum(row["retained_trace_length_base"] for row in rows))

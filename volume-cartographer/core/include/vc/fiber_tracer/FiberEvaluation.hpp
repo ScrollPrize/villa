@@ -49,4 +49,21 @@ private:
     FiberEvaluationControl&, size_t workers = 4, size_t contextsPerWorker = 8,
     double reverseIntervalBase = 0);
 
+// Direct beam backend, without building/caching chunk paths. Same reference
+// metric and scheduler; starts/restarts at the selected reference point.
+[[nodiscard]] FiberReplayTraceResult replayFiberBeamCase(
+    const FiberPredictionSource&, const FiberTraceConfig&, double traceToBaseScale,
+    const vc::lasagna::NormalSampler& tracingNormals,
+    const vc::lasagna::NormalSampler& evaluationNormals, double normalWorkingToBaseScale,
+    const FiberEvaluationCase&, const FiberChunkReplayConfig&,
+    double reverseIntervalBase = 0, const FiberTraceProgressCallback& = {});
+
+[[nodiscard]] std::vector<FiberReplayTraceResult> evaluateFiberBeamCases(
+    const FiberPredictionSource&, const FiberTraceConfig&, double traceToBaseScale,
+    const vc::lasagna::NormalSampler& tracingNormals,
+    const vc::lasagna::NormalSampler& evaluationNormals, double normalWorkingToBaseScale,
+    const std::vector<FiberEvaluationCase>&, const FiberChunkReplayConfig&,
+    FiberEvaluationControl&, size_t workers = 4, size_t contextsPerWorker = 8,
+    double reverseIntervalBase = 0);
+
 } // namespace vc::fiber_tracer

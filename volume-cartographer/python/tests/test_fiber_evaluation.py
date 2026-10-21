@@ -135,3 +135,97 @@ def test_reverse_batch_matches_serial(inputs):
     batch = cache.replay_many([ft.EvaluationCase(points)], normals, cfg,
                              ft.EvaluationControl(), reverse_interval_base=32)
     assert evaluation.replay_dict(serial) == evaluation.replay_dict(batch[0])
+
+
+@pytest.mark.parametrize("reverse_interval", [0, 32])
+def test_beam_batch_callable_and_serial(inputs, reverse_interval):
+    field, normals = handles(inputs)
+    trace = trace_config()
+    trace.width_relative_tolerance = .4
+    replay = ft.ChunkReplayConfig()
+    points = np.array([[16., 16., 16.], [220., 16., 16.]])
+    cases = [ft.EvaluationCase(points), ft.EvaluationCase(points[::-1].copy()),
+             ft.EvaluationCase(points, end_arc_base=100)]
+    serial = [ft.beam_replay(field, normals, normals, trace, c, replay, reverse_interval) for c in cases]
+    control = ft.EvaluationControl()
+    batch = ft.beam_replay_many(field, normals, normals, trace, cases, replay, control, 2, 2, reverse_interval)
+    assert list(map(evaluation.replay_dict, batch)) == list(map(evaluation.replay_dict, serial))
+    assert control.status()["completed"] == 3
+    cfg = config(inputs)
+    cfg.update(backend="beam", reverse_interval_base=reverse_interval, trace=trace.to_dict(), replay={})
+    del cfg["chunks"], cfg["chunk_cache"]
+    report = evaluation.evaluate(cfg, base_directory=inputs)
+    assert [{k: v for k, v in row.items() if k != "id"} for row in report["cases"]] == list(
+        map(evaluation.replay_dict, serial[:2]))
+    assert report["failure_count"] == 0
+
+
+def test_beam_cancel_waiting_for_publication(inputs):
+    received = threading.Event()
+    with Coordinator(lambda *args: received.set()) as server:
+        field, normals = handles(inputs)
+        client = bridge(server)
+        field.set_live_bridge(client, "beam")
+        control = ft.EvaluationControl()
+        case = ft.EvaluationCase(np.array([[16., 16., 16.], [220., 16., 16.]]))
+        with ThreadPoolExecutor(1) as pool:
+            future = pool.submit(ft.beam_replay_many, field, normals, normals, trace_config(),
+                                 [case] * 4, ft.ChunkReplayConfig(), control, 1, 4)
+            assert received.wait(5)
+            control.cancel("cancel beam")
+            with pytest.raises(RuntimeError, match="cancel beam"):
+                future.result(timeout=5)
+        assert control.status()["finished"] and control.status()["completed"] == 0
+        client.cancel("close")
+
+
+def test_reference_selection_preserves_spans_and_direction(inputs):
+    annotation = dict(type="vc3d_fiber", version=1, optimization_mode="native_fiber_trace3d",
+                      line_points=[[0, 16, 16], [16, 16, 16], [100, 16, 16], [220, 16, 16], [240, 16, 16]],
+                      control_points=[[16, 16, 16], [220, 16, 16]])
+    cases, plan = evaluation.reference_cases(annotation, "a")
+    assert len(cases) == 2
+    assert plan["eligible_length_base_voxels"] == 204
+    assert [row["reason"] for row in plan["excluded"]] == ["extrapolated", "extrapolated"]
+    assert cases[0]["points_base_xyz"] == cases[1]["points_base_xyz"][::-1]
+    annotation["evaluation_direction"] = "reverse"
+    assert len(evaluation.reference_cases(annotation, "a")[0]) == 1
+    path = inputs / "fiber.json"
+    path.write_text(json.dumps(annotation))
+    cfg = config(inputs)
+    cfg["cases"] = [dict(id="a", fiber_path="fiber.json")]
+    result = evaluation.evaluate(cfg, base_directory=inputs)
+    assert [r["id"] for r in result["cases"]] == ["a/run0/reverse"]
+    assert result["reference_selection"][0]["sha256"]
+    annotation["optimization_mode"] = "lasagna"
+    assert evaluation.reference_cases(annotation, "a")[0] == []
+    annotation["control_points"][0][0] += .01
+    with pytest.raises(RuntimeError, match="exact line point"):
+        evaluation.reference_cases(annotation, "a")
+
+
+def test_reference_selection_splits_at_lasagna_spans():
+    # Valid annotation metadata, not a second implementation of selection.
+    config = dict(step_voxels=1, cone_angle_degrees=30, cone_angle_step_degrees=5,
+        cone_grid_size=3, beam_width=1, beam_prune_distance_voxels=1, beam_lookahead_steps=0,
+        smoothness_weight=0, smoothness_normal_weight=0, smoothness_tangent_weight=0,
+        smoothness_free_angle_degrees=0, cumulative_smoothness_steps=0,
+        cumulative_smoothness_tangent_weight=0, initial_free_angle_degrees=0,
+        max_step_factor=3, meeting_accept_max_error_ratio=.1, endpoint_accept_threshold_base_voxels=20)
+    def metadata(mode):
+        return dict(optimizer="native_fiber_trace3d", metadata_version=3, tracer_version=2,
+            interp_goal=mode, interp_mode=mode, metric=None, msg="", normal_manifest="", fiber_manifest="",
+            trace_to_base_scale=1, meeting_error_base_voxels=None, meeting_error_ratio=None,
+            meeting_source="", failure_code="", failure_detail="", lasagna_failure_code="",
+            lasagna_failure_detail="", config=config)
+    points = [[i * 10, 0, 0] for i in range(6)]
+    controls = [dict(position=p, segment_to_next=metadata(mode))
+                for p, mode in zip(points[1:4], ["cspline", "lasagna", "cspline"])]
+    controls.append(dict(position=points[4]))
+    annotation = dict(type="vc3d_fiber", version=3, optimization_mode="native_fiber_trace3d",
+                      line_points=points, control_points=controls)
+    cases, plan = evaluation.reference_cases(annotation, "mixed")
+    assert len(cases) == 4
+    assert [r["line_indices"] for r in plan["runs"]] == [[1, 2], [3, 4]]
+    assert plan["eligible_length_base_voxels"] == 20
+    assert [e["reason"] for e in plan["excluded"]] == ["extrapolated", "extrapolated", "lasagna"]

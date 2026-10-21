@@ -2298,7 +2298,8 @@ template <typename LossAt>
     const FiberTraceProgressCallback& progress,
     std::string phase,
     std::optional<double> traceLengthLimitVoxels = std::nullopt,
-    const std::function<bool(const cv::Vec3d&, double, int)>& committedStep = {})
+    const std::function<bool(const cv::Vec3d&, double, int)>& committedStep = {},
+    double* observedWidthMean = nullptr)
 {
     auto request = inputRequest;
     const TraceVec start = toTraceVec(request.startPoint);
@@ -2440,6 +2441,7 @@ template <typename LossAt>
             throw std::logic_error("fiber trace attempted to retract a committed prefix");
         for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
             if (updateWidth) addWidth((*it)->point);
+            if (observedWidthMean) *observedWidthMean = request.config.widthReferenceMean;
             observedPath = *it;
             if (committedStep && !committedStep(toVec3d(observedPath->point),
                     observedPath->cumulativeLoss, static_cast<int>(observedPath->length - 1)))
@@ -5417,6 +5419,23 @@ FiberTraceOneWayResult traceFiberExtrapolation(
         "extrapolation",
         distanceVoxels,
         committedStep);
+}
+
+std::string traceFiberReplaySegment(const FiberPredictionSource& predictions,
+    const FiberTraceOneWayRequest& request, int maximumSteps,
+    const vc::lasagna::NormalSampler& normals, const FiberTraceProgressCallback& progress,
+    const std::function<bool(const cv::Vec3d&, double, int)>& observe, double& widthMean)
+{
+    validateTraceConfig(request.config);
+    if (maximumSteps <= 0) throw std::invalid_argument("replay maximum steps must be positive");
+    requireNormalSamplerForNormalAwareSmoothness(request.config, &normals);
+    try {
+        return traceOneWayCore(predictions, request, &normals, progress, "replay",
+            double(maximumSteps) * request.config.stepVoxels, observe, &widthMean).reason;
+    } catch (const std::invalid_argument& e) {
+        if (std::string_view(e.what()) != "fiber trace start point has no valid prediction direction") throw;
+        return "invalid_initial_prediction";
+    }
 }
 
 double effectiveEndpointAcceptThresholdBaseVoxels(const FiberTraceConfig& config,
