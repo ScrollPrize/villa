@@ -77,6 +77,7 @@ class FiberTrace3DCudaBatchPipeline:
         self._paused = False
         self._submit_lock = threading.Lock()
         self._closed = False
+        self._terminal_result: object | None = None
         self.max_pinned_bytes = 0
         self._thread = threading.Thread(
             target=self._run,
@@ -179,8 +180,12 @@ class FiberTrace3DCudaBatchPipeline:
         if self._closed:
             raise RuntimeError("CUDA batch preparation pipeline is closed")
         wait_started = time.perf_counter()
-        result = self._results.get()
-        self._available.release()
+        result = self._terminal_result
+        if result is None:
+            result = self._results.get()
+            self._available.release()
+            if result is _PREPARATION_END or isinstance(result, _PreparationFailure):
+                self._terminal_result = result
         queue_wait_ms = (time.perf_counter() - wait_started) * 1000.0
         if result is _PREPARATION_END:
             raise StopIteration
@@ -248,3 +253,5 @@ class FiberTrace3DCudaBatchPipeline:
                 self._results.get_nowait()
             except queue.Empty:
                 break
+        # A cached failure traceback can retain pinned/device batches.
+        self._terminal_result = None

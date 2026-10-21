@@ -331,21 +331,31 @@ def materialize_targets(
 ) -> FiberTrace3DBatch:
     """Create sparse direction and dense presence targets from compact metadata."""
 
+    output_stride = int(output_stride)
+    if output_stride <= 0:
+        raise ValueError("output_stride must be > 0")
+    if (batch.normalization_counts is not None
+            and batch.normalization_output_stride != output_stride):
+        raise ValueError(
+            "normalization counts do not match output_stride; "
+            "rerun MacroBatchTargetSource for the complete optimizer batch"
+        )
+    input_shape = tuple(int(v) for v in batch.volume.shape[-3:])
+    patch_shape = tuple((size + output_stride - 1) // output_stride for size in input_shape)
+    target_shape = (int(batch.volume.shape[0]), 1, *patch_shape)
     if (
-        batch.direction_indices_bzyx is not None
+        batch.target_output_stride == output_stride
+        and batch.direction_indices_bzyx is not None
         and batch.direction_target_sparse is not None
         and batch.direction_weight_sparse is not None
         and batch.presence_target is not None
         and batch.presence_mask is not None
+        and tuple(batch.presence_target.shape) == target_shape
+        and tuple(batch.presence_mask.shape) == target_shape
     ):
         return batch
 
     device = batch.volume.device
-    output_stride = int(output_stride)
-    if output_stride <= 0:
-        raise ValueError("output_stride must be > 0")
-    input_shape = tuple(int(v) for v in batch.volume.shape[-3:])
-    patch_shape = tuple((size + output_stride - 1) // output_stride for size in input_shape)
     if output_stride == 1:
         geometry_batch = batch
     else:
@@ -479,6 +489,7 @@ def materialize_targets(
     profile_timings.update(timings)
     return replace(
         batch,
+        target_output_stride=output_stride,
         direction_target=None,
         direction_weight=None,
         direction_mask=None,

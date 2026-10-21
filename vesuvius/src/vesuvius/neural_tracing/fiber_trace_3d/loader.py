@@ -404,8 +404,11 @@ class FiberTrace3DBatch:
     deferred_blur_kernels: tuple[_BlurKernels3D | None, ...] | None = None
     profile_timings_ms: dict[str, float] | None = None
 
-    # Local effective-batch target counts, prepared before model forward.
+    # Local effective-batch counts and their lattice, prepared before model forward.
     normalization_counts: torch.Tensor | None = None
+    # Cached targets retain their lattice even when different strides share a shape.
+    target_output_stride: int | None = None
+    normalization_output_stride: int | None = None
 
     def to(
         self,
@@ -414,6 +417,8 @@ class FiberTrace3DBatch:
         non_blocking: bool = False,
     ) -> "FiberTrace3DBatch":
         return FiberTrace3DBatch(
+            target_output_stride=self.target_output_stride,
+            normalization_output_stride=self.normalization_output_stride,
             normalization_counts=None if self.normalization_counts is None else self.normalization_counts.to(device, non_blocking=non_blocking),
             volume=self.volume.to(device, non_blocking=non_blocking),
             valid_mask=self.valid_mask.to(device, non_blocking=non_blocking),

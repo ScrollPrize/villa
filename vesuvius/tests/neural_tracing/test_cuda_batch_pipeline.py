@@ -1,8 +1,10 @@
 """Async preparation extraction: CPU lifecycle plus opt-in manager-owned CUDA."""
 from dataclasses import fields, replace
+import gc
 import os
 import threading
 import time
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +22,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.sample_pipeline import (
 )
 from vesuvius.neural_tracing.fiber_trace_3d.queued_batches import QueuedBatchView
 from vesuvius.neural_tracing.fiber_trace_3d.targets import materialize_targets
+from vesuvius.neural_tracing.fiber_trace_3d.train import _slice_batch
 
 
 def _wait(predicate):
@@ -77,6 +80,53 @@ def test_default_target_stride_is_exactly_stride_one():
     raw = loader.load_batch(0)
     _same_tensors(materialize_targets(raw, loader.config),
                   materialize_targets(raw, loader.config, output_stride=1))
+
+
+@pytest.mark.parametrize("real_data", [False, True], ids=["cpu", "paris4"])
+@pytest.mark.parametrize("strides", [(1, 2), (4, 1), (9, 10)])
+def test_materialized_targets_follow_requested_stride(tmp_path, real_data, strides):
+    loader = _real_paris4_loader(tmp_path) if real_data else _loader(augment_enabled=False)
+    raw = loader.load_batch(0, sample_mode="flat")
+    if not real_data:
+        # Both strides 9 and 10 produce a 2-cubed output, but this CP moves cells.
+        raw = replace(raw, cp_local_zyx=torch.full_like(raw.cp_local_zyx, 9),
+                      target_modes=torch.full_like(raw.target_modes, _TARGET_MODE_CP_ONLY))
+    config = replace(loader.config, presence_radius_voxels=0.1) if not real_data else loader.config
+    first_stride, second_stride = strides
+    first = materialize_targets(raw, config, output_stride=first_stride)
+    expected = materialize_targets(raw, config, output_stride=second_stride)
+    if strides == (9, 10):
+        assert first.presence_target.shape == expected.presence_target.shape
+        assert not torch.equal(first.presence_target, expected.presence_target)
+    actual = materialize_targets(first, config, output_stride=second_stride)
+    _same_tensors(actual, expected)
+    assert actual.target_output_stride == second_stride
+    assert actual.valid_mask is raw.valid_mask
+    assert first.target_output_stride == first_stride
+    assert materialize_targets(actual, config, output_stride=second_stride) is actual
+    # Batches created before stride metadata existed must be rebuilt as well.
+    _same_tensors(materialize_targets(replace(first, target_output_stride=None), config,
+                                     output_stride=second_stride), expected)
+
+
+@pytest.mark.parametrize("stride", [0, -1])
+def test_cached_targets_validate_stride(stride):
+    loader = _loader(augment_enabled=False)
+    batch = materialize_targets(loader.load_batch(0), loader.config)
+    with pytest.raises(ValueError, match="output_stride"):
+        materialize_targets(batch, loader.config, output_stride=stride)
+
+
+def test_target_stride_metadata_survives_transfer_slice_and_pin(monkeypatch):
+    loader = _loader(augment_enabled=False)
+    batch = materialize_targets(loader.load_batch(0), loader.config, output_stride=2)
+    counts = torch.tensor([12., 2., 2.])
+    batch = replace(batch, normalization_counts=counts, normalization_output_stride=2)
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda value: value.clone())
+    for copy in (batch.to("cpu"), _slice_batch(batch, 0, 1), batch.pin_memory()):
+        assert copy.target_output_stride == copy.normalization_output_stride == 2
+        torch.testing.assert_close(copy.normalization_counts, counts, rtol=0, atol=0)
+        assert materialize_targets(copy, loader.config, output_stride=2) is copy
 
 
 class _Source:
@@ -172,10 +222,62 @@ def test_async_pipeline_propagates_failure_and_closes(fake_cuda, monkeypatch, st
         with pytest.raises(RuntimeError, match="preparation failed") as error:
             next(pipeline)
         assert error.value.__cause__ is failure
+        original_get = pipeline._results.get
+        def terminal_get(block=True, timeout=None):
+            assert not block, "terminal iterator tried to wait for another result"
+            return original_get(block=block, timeout=timeout)
+        monkeypatch.setattr(pipeline._results, "get", terminal_get)
+        for _ in range(3):
+            with pytest.raises(RuntimeError, match="preparation failed") as repeated:
+                next(pipeline)
+            assert repeated.value.__cause__ is failure
     finally:
         pipeline.close()
     assert source.closed and not pipeline._thread.is_alive()
     assert source.released == (0 if stage == "source" else 1)
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_terminal_state_repeats_after_buffered_batches(fake_cuda, monkeypatch, failure):
+    loader = _loader(augment_enabled=False)
+    cause = ValueError("failure after buffered batches")
+    class Source(_Source):
+        def __next__(self):
+            if failure and self.admitted == self.count:
+                raise cause
+            return super().__next__()
+    source = Source(loader.load_batch(0), count=2)
+    pipeline = module.FiberTrace3DCudaBatchPipeline(source, config=loader.config,
+        device=torch.device("cuda:0"), output_stride=1, depth=3)
+    try:
+        pipeline._thread.join(timeout=10)
+        assert not pipeline._thread.is_alive()
+        for index in range(2):
+            assert next(pipeline).stream_indices.tolist() == [index] * loader.config.batch_size
+        for attempt in range(4):
+            if attempt == 1:
+                original_get = pipeline._results.get
+                def terminal_get(block=True, timeout=None):
+                    assert not block, "terminal iterator tried to wait for another result"
+                    return original_get(block=block, timeout=timeout)
+                monkeypatch.setattr(pipeline._results, "get", terminal_get)
+                monkeypatch.setattr(pipeline._available, "release",
+                                    lambda: pytest.fail("terminal replay released another credit"))
+            if failure:
+                with pytest.raises(RuntimeError, match="preparation failed") as error:
+                    next(pipeline)
+                assert error.value.__cause__ is cause
+            else:
+                with pytest.raises(StopIteration):
+                    next(pipeline)
+    finally:
+        # close() legitimately wakes the producer's semaphore.
+        monkeypatch.undo()
+        pipeline.close()
+        pipeline.close()
+    assert source.closed and source.released == 2
+    with pytest.raises(RuntimeError, match="closed"):
+        next(pipeline)
 
 
 def test_close_unblocks_a_waiting_source(fake_cuda):
@@ -196,6 +298,33 @@ def test_close_unblocks_a_waiting_source(fake_cuda):
     assert entered.wait(5)
     pipeline.close()
     assert not pipeline._thread.is_alive()
+
+
+def test_close_releases_cached_failure_traceback(fake_cuda):
+    payload_refs = []
+    class Payload:
+        pass
+    class Source(_Source):
+        def __next__(self):
+            payload = Payload()
+            payload_refs.append(weakref.ref(payload))
+            raise ValueError("preparation with owned payload")
+    source = Source(None)
+    pipeline = module.FiberTrace3DCudaBatchPipeline(source, config=None,
+        device=torch.device("cuda:0"), output_stride=1)
+    def consume_failure():
+        with pytest.raises(RuntimeError, match="preparation failed"):
+            next(pipeline)
+    try:
+        consume_failure()
+        pipeline._thread.join(timeout=10)
+        assert not pipeline._thread.is_alive()
+        gc.collect()
+        assert payload_refs[0]() is not None
+    finally:
+        pipeline.close()
+    gc.collect()
+    assert payload_refs[0]() is None
 
 
 @pytest.mark.parametrize("stride", [1, 2, 4])

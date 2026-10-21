@@ -66,6 +66,11 @@ device with a storage-free final-shaped image, and attaches the aggregate local
 geometry, never the actual CT image, and never calls a model. Deferred image
 augmentation cannot change these counts. Target construction in the real CUDA
 preparation path uses the same output stride and masks.
+Staged counts carry `normalization_output_stride`; target preparation rejects
+counts from another stride (or counts without stride metadata). To change the
+stride, rerun `MacroBatchTargetSource` for the complete optimizer batch. Restaging
+discards old counts and computes new aggregate counts before any model forward;
+rematerializing one microbatch cannot reconstruct those aggregate counts.
 
 ```python
 staged = MacroBatchTargetSource(

@@ -119,6 +119,32 @@ def test_macro_batch_owns_all_tensor_storage_before_release(tmp_path):
     prepass.close()
 
 
+@pytest.mark.parametrize("materialized", [False, True])
+def test_stride_change_requires_complete_normalization_prepass(tmp_path, materialized):
+    config, raw, parts = _raw_pair(tmp_path)
+    first = _prepass(_Source(parts), config, stride=1)
+    try:
+        staged = [next(first), next(first)]
+    finally:
+        first.close()
+    if materialized:
+        staged = [materialize_targets(batch, config) for batch in staged]
+    for batch in staged:
+        with pytest.raises(ValueError, match="complete optimizer batch"):
+            materialize_targets(batch, config, output_stride=2)
+    # Restaging clears the obsolete counts, rebuilding the whole logical batch.
+    second = _prepass(_Source(staged), config, stride=2)
+    expected = target_normalization_counts(materialize_targets(raw, config, output_stride=2))
+    try:
+        for _ in range(2):
+            batch = next(second)
+            targets = materialize_targets(batch, config, output_stride=2)
+            assert targets.target_output_stride == targets.normalization_output_stride == 2
+            torch.testing.assert_close(targets.normalization_counts, expected, rtol=0, atol=0)
+    finally:
+        second.close()
+
+
 def test_prepass_releases_on_shape_and_geometry_errors_and_closes(tmp_path):
     config, raw, parts = _raw_pair(tmp_path)
     source = _Source([raw])

@@ -60,8 +60,10 @@ class MacroBatchTargetSource:
                 try:
                     # Queue views release/reuse their slots on next(); take
                     # ownership before returning credits, including geometry.
-                    batch = replace(raw, **{name: value.clone() for name, value in vars(raw).items()
-                                           if isinstance(value, torch.Tensor)})
+                    # Counts belong to this prepass's complete batch and stride.
+                    batch = replace(raw, normalization_counts=None, normalization_output_stride=None,
+                                    **{name: value.clone() for name, value in vars(raw).items()
+                                       if name != "normalization_counts" and isinstance(value, torch.Tensor)})
                 finally:
                     self.source.release_current()
                 if batch.volume.shape[0] != size:
@@ -69,7 +71,9 @@ class MacroBatchTargetSource:
                 counts += self.prepare_geometry(lambda: self._counts(batch))
                 prepared.append(batch)
             local_counts = counts.cpu()
-            self.pending = [replace(batch, normalization_counts=local_counts) for batch in reversed(prepared)]
+            self.pending = [replace(batch, normalization_counts=local_counts,
+                                    normalization_output_stride=int(self.output_stride))
+                            for batch in reversed(prepared)]
         return self.pending.pop()
 
     def _counts(self, batch):

@@ -2139,6 +2139,8 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
         if sparse_tangent is not None:
             sparse_tangent = sparse_tangent[sparse_mask]
     return FiberTrace3DBatch(
+        target_output_stride=batch.target_output_stride,
+        normalization_output_stride=batch.normalization_output_stride,
         normalization_counts=batch.normalization_counts,
         volume=batch.volume[start:stop],
         valid_mask=batch.valid_mask[start:stop],

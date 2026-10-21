@@ -65,6 +65,9 @@ the GPU cohort before acknowledging resource release.
 paused/semaphore-blocked preparation, joins the thread and drops prepared
 batches. It is idempotent. Exceptions in source loading, pinning or target
 creation are propagated to the consumer with their original cause.
+Exhaustion is permanent: every subsequent `next()` raises `StopIteration`.
+After a preparation failure, subsequent calls repeat that failure with its
+original cause. In both cases callers must still call `close()` for cleanup.
 
 ## Output lattices
 
@@ -73,6 +76,10 @@ coarse strides. Input tensors, coordinates and sample identities remain in the
 original input lattice. Only target tensors/indices are produced on the output
 lattice. Coarse validity is conservative: a cell containing any invalid input
 voxel is excluded. Partial edge cells use ceiling-sized output shapes.
+Materialized batches carry `target_output_stride`. Repeated calls at the same
+stride reuse complete targets; changing stride rebuilds targets from the original
+geometry and validity mask, even if the rounded output shape is unchanged.
+Stride metadata is preserved by transfer, pinning and batch slicing.
 
 The builder does not resize the model. A caller requesting stride greater than
 one must use a model producing the corresponding output lattice. The existing
