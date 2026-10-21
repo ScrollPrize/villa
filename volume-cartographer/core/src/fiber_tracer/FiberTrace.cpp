@@ -3793,7 +3793,11 @@ public:
         std::vector<FiberPredictionChunkDependency> dependencies;
         for (const auto* binding : bindings)
             for (const auto& key : vc::lasagna::lasagnaRegionChunkKeys(*binding, lo, hi))
-                dependencies.push_back({binding->path, {key.iz, key.iy, key.ix}});
+                // Region keys are clipped to the nonnegative dataset bounds.
+                dependencies.push_back({binding->path, {
+                    static_cast<uint32_t>(key.iz),
+                    static_cast<uint32_t>(key.iy),
+                    static_cast<uint32_t>(key.ix)}});
         std::sort(dependencies.begin(), dependencies.end(), [](const auto& a, const auto& b) {
             return a.arrayPath != b.arrayPath ? a.arrayPath < b.arrayPath : a.indexZYX < b.indexZYX;
         });

@@ -399,8 +399,14 @@ TEST_CASE("pinned prediction regions publish once and sample auxiliary data conc
     const auto dataset=fixture.dataset();
     FiberPredictionField field(dataset,auxiliaryOptions()), other(dataset,auxiliaryOptions());
     int calls=0;
-    field.setReadinessGate([&](const auto& dependencies) {++calls; CHECK(dependencies.size()==6);});
-    auto region=field.pinRegion({0,0,0},{1,1,1});
+    field.setReadinessGate([&](const auto& dependencies) {
+        ++calls;
+        CHECK(dependencies.size()==6);
+        for (const auto& dependency : dependencies)
+            CHECK((dependency.indexZYX == std::array<uint32_t,3>{0,0,0}));
+    });
+    // Negative crop bounds must not wrap signed keys into unsigned indices.
+    auto region=field.pinRegion({-1,-1,-1},{1,1,1});
     CHECK(calls==1);
     std::vector<float> widths;
     CHECK_THROWS(field.sampleWidths({{.5f,.5f,.5f}},widths,*region)); // seal before sharing
