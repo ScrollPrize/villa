@@ -805,9 +805,13 @@ private:
     // interiorOptimized: computed by the caller BEFORE it marks the session
     // Unoptimized (an optimized interior with nothing pending may be solved
     // span by span; anything else solves the whole line).
+    // owedOnFailure: the goals are committed (saved), so a solve that cannot
+    // start leaves whole-line work queued (a later partial or
+    // global-goals-only pass must not certify the untouched span).
     bool launchGoalSolve(LineAnnotationSession& session,
                          const std::vector<size_t>& dirtyRanks,
-                         bool interiorOptimized);
+                         bool interiorOptimized,
+                         bool owedOnFailure);
     // The session's open-tail policy (lone end breaks, kollesis ends) or the
     // tail distances changed and no solve covers it yet: mark Unoptimized and,
     // in auto mode, re-trace the tails (a tails-only solve, or a whole-line

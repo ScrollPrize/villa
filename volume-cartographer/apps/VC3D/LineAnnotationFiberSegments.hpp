@@ -434,9 +434,10 @@ int replaceRayTails(vc::lasagna::LineModel& line,
 // applyGapSpanPolicy (span tags AND the gap goal policy) runs on every list
 // the edit changed, so a peer's descriptors agree with the initiating
 // session's. The outcome tells the caller what to invalidate: whether the
-// live list's tail policy changed, which gap spans formed or dissolved there
-// (their goals changed), and whether a snapshot's tail policy or goals
-// changed (a later rollback must not restore it as optimized).
+// live list's tail policy changed, which gap span TAGS formed or dissolved
+// there (a transition that changes the goal unless it already was the
+// policy's), and whether a snapshot's tail policy or goals changed (a later
+// rollback must not restore it as optimized).
 // The control of `controls` that stands for the one at `point`: the NEAREST
 // within the position tolerance (pointsApproximatelyEqual), so an exact twin
 // wins over a distinct visit that merely passes within tolerance (a line

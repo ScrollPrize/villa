@@ -11409,6 +11409,10 @@ bool LineAnnotationController::startCommittedGoalSolve(
     // save/close finalization covers an Unoptimized session.
     setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
     if (!ensureDatasetForSession(session)) {
+        // The goal is saved but its span is unsolved: owe a whole-line pass
+        // so no later partial or global-goals-only solve (a mode switch)
+        // certifies the span with its old geometry.
+        session.solveQueue.addPending({}, true);
         return false;
     }
     // Nothing to roll back but geometry: the controls snapshot is the
@@ -11416,7 +11420,8 @@ bool LineAnnotationController::startCommittedGoalSolve(
     session.controlPointsBeforeModeChange = session.controlPoints;
     return launchGoalSolve(session,
                            vc3d::line_annotation::lineOrderSpanRanks(session.controlPoints, owners),
-                           interiorOptimized);
+                           interiorOptimized,
+                           true);
 }
 
 void LineAnnotationController::refreshTailsAfterTailPolicyChange(
@@ -11847,13 +11852,15 @@ bool LineAnnotationController::applySegmentInterpolationGoals(
     }
     return launchGoalSolve(session,
                            vc3d::line_annotation::lineOrderSpanRanks(session.controlPoints, changed),
-                           interiorOptimized);
+                           interiorOptimized,
+                           false);
 }
 
 bool LineAnnotationController::launchGoalSolve(
     LineAnnotationSession& session,
     const std::vector<size_t>& dirtyRanks,
-    bool interiorOptimized)
+    bool interiorOptimized,
+    bool owedOnFailure)
 {
     session.optimizedLineBeforeModeChange = session.optimizedLine;
     session.branchesBeforeModeChange = session.branches;
@@ -11878,6 +11885,10 @@ bool LineAnnotationController::launchGoalSolve(
             session.branchesBeforeModeChange.reset();
         }
         consumeRollbackInvalidation(session);
+        if (owedOnFailure) {
+            // Committed goals with unsolved spans: see startCommittedGoalSolve.
+            session.solveQueue.addPending({}, true);
+        }
         return false;
     }
     return true;

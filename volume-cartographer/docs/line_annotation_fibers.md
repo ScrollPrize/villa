@@ -270,7 +270,9 @@ gap forms, global when it dissolves while still cspline) is applied in the
 same write that saves the break tag, so the file, the pane and its peers
 carry the goal together; the re-solve that follows rolls back geometry only
 when it fails or cannot start (a refused dataset leaves the session
-Unoptimized for the save/close finalization). The same fiber open
+Unoptimized and owing a whole-line pass, so no later partial or
+global-goals-only solve certifies the span before it is bridged; save/close
+finalizes it). The same fiber open
 in another pane receives the tag together with the span tags and the gap goal
 policy, so a save from that pane cannot regress a goal; that pane starts no
 new solve of its own but is marked Unoptimized (save/close finalizes it) and
