@@ -95,8 +95,9 @@ bottom/right. XYZ and all channels resize together, preserving exact scalar
 bytes, component counts, NaN payloads and signed zero. Newly exposed cells use
 the supplied fills, including cells that had been cropped away earlier.
 
-Geometry revision descriptors expose `grid_origin=[row,column]`. The tile grid
-stays fixed in these coordinates across non-aligned left/top changes. Logical
+Geometry revision descriptors expose `grid_origin=[row,column]`. The origin
+tracks these coordinates across non-aligned left/top changes; each checkpoint
+tiles the resulting logical grid anew. Logical
 anchor coordinates map as `new_index = old_index - resize_offset`. The caller
 must explicitly update, remove, retain, or preserve affected relationships.
 Origin changes invalidate positional applicability even if coordinates happen

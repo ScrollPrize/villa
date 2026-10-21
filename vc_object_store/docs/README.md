@@ -262,7 +262,7 @@ with checksum verification and a 256 MiB decoded limit. Current heads use a
 chunk overlay; historical reads reconstruct from snapshots or reverse a shorter
 current suffix. Inherited channels reuse immutable array references. Only changed
 payloads are rewritten, but manifest/bounds bookkeeping can scale with chunk
-count and historical reads with history length. There are no automatic geometry
+count and historical reads with history length. There are no automatic periodic geometry
 checkpoints or pruning. Long-held SQLite readers can retain old WAL pages.
 Structural changes publish chunk snapshots and restart the delta chain; subsequent
 coordinate edits continue using deltas. Structural operations can read and assemble
@@ -344,15 +344,3 @@ saves do not explicitly fsync, so durability differs. Rendering, deformation,
 relationship repair and concurrent access are excluded. Repeat `--segment` or
 `--radius` for more inputs; `--per-point` submits one range per vertex. Output
 must not exist. Successful native runs remove temporary data.
-
-To measure sparse edit persistence after a structural checkpoint on real tifxyz
-data, use the native benchmark's `checkpoint` mode (the work directory must not
-exist):
-
-```sh
-build/bin/bench_object_edits /data/real-segment /tmp/post-resize-edits 5.75 1000 2 checkpoint
-```
-
-This publishes a same-shape structural checkpoint before timing edits. Reports
-include scoped native phase timings, payload writes, durable commit latency,
-DB/WAL growth and exact current/base/middle/previous read verification.
