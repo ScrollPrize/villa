@@ -3109,6 +3109,21 @@ LineAnnotationController::prepareFiberMapAutoLink(uint64_t fiberIdA,
                                                   uint64_t fiberIdB,
                                                   const std::string& fileNameB)
 {
+    if (fiberIdA == fiberIdB) {
+        FiberMapAutoLinkOutcome outcome;
+        outcome.ok = false;
+        outcome.message = tr("Select two different fibers.");
+        return outcome;
+    }
+    return prepareAutoLinkParticipants({{fiberIdA, fileNameA}, {fiberIdB, fileNameB}},
+                                       std::nullopt);
+}
+
+LineAnnotationController::FiberMapAutoLinkOutcome
+LineAnnotationController::prepareAutoLinkParticipants(
+    const std::vector<AutoLinkParticipant>& participants,
+    const std::optional<std::string>& keepSurfaceName)
+{
     FiberMapAutoLinkOutcome outcome;
     const auto refuse = [&outcome](const QString& message) {
         outcome.ok = false;
@@ -3126,24 +3141,30 @@ LineAnnotationController::prepareFiberMapAutoLink(uint64_t fiberIdA,
         }
         return nullptr;
     };
-    if (fiberIdA == fiberIdB) {
-        return refuse(tr("Select two different fibers."));
-    }
-    const StoredFiber* a = resolve(fiberIdA, fileNameA);
-    const StoredFiber* b = resolve(fiberIdB, fileNameB);
-    if (!a || !b) {
-        return refuse(tr("One of the fibers is no longer loaded; press Update."));
-    }
-    if (a->readOnly || b->readOnly) {
-        return refuse(tr("%1 is read-only.").arg(fiberDisplayName(a->readOnly ? a->id : b->id)));
+    std::vector<uint64_t> participantIds;
+    for (const AutoLinkParticipant& participant : participants) {
+        const StoredFiber* fiber = resolve(participant.fiberId, participant.fileName);
+        if (!fiber) {
+            return refuse(tr("One of the fibers is no longer loaded; press Update."));
+        }
+        if (fiber->readOnly) {
+            return refuse(tr("%1 is read-only.").arg(fiberDisplayName(fiber->id)));
+        }
+        participantIds.push_back(fiber->id);
     }
     for (const auto& pane : _panes) {
         if (pane.session && pane.session->taskState == LineAnnotationSession::TaskState::Running) {
             return refuse(tr("Line optimization is already running."));
         }
     }
-    const auto isParticipant = [fiberIdA, fiberIdB](const LineAnnotationSession& session) {
-        return session.fiberId == fiberIdA || session.fiberId == fiberIdB;
+    const auto isParticipant = [participantIds](const LineAnnotationSession& session) {
+        return std::find(participantIds.begin(), participantIds.end(), session.fiberId) !=
+               participantIds.end();
+    };
+    // The one pane that stays (the dialog the link is made from): never
+    // finalized, retired or counted as still open.
+    const auto kept = [&keepSurfaceName](const std::string& surfaceName) {
+        return keepSurfaceName && *keepSurfaceName == surfaceName;
     };
 
     // The active volume is an input of every scale a finalization resolves
@@ -3158,7 +3179,10 @@ LineAnnotationController::prepareFiberMapAutoLink(uint64_t fiberIdA,
     // opening another fiber does it - but ONLY those: an unrelated dialog
     // stays open and unsaved, so it neither bumps the fiber generation
     // (which would make the map stale for nothing) nor loses its place.
-    if (!prepareForUserFacingLineAnnotationOpen(stillValid, isParticipant)) {
+    const auto finalizeFilter = [&isParticipant, &kept](const LineAnnotationSession& session) {
+        return isParticipant(session) && !kept(session.surfaceName);
+    };
+    if (!prepareForUserFacingLineAnnotationOpen(stillValid, finalizeFilter)) {
         return refuse(tr("Could not finalize the open line annotation."));
     }
     if (!alive) {
@@ -3180,7 +3204,7 @@ LineAnnotationController::prepareFiberMapAutoLink(uint64_t fiberIdA,
         }
     };
     for (const auto& pane : _panes) {
-        if (pane.session && isParticipant(*pane.session)) {
+        if (pane.session && isParticipant(*pane.session) && !kept(pane.surfaceName)) {
             addRetire(pane.surfaceName);
         }
     }
@@ -3274,7 +3298,7 @@ LineAnnotationController::prepareFiberMapAutoLink(uint64_t fiberIdA,
     // Every retiring pane is closed: the flags of the (now unowned)
     // sessions stay as the closes read them.
     retired = true;
-    closeIntersectionInspectionForRetiredFibers({fiberIdA, fiberIdB});
+    closeIntersectionInspectionForRetiredFibers(participantIds);
     if (!alive) {
         return refuse(tr("The annotation controller went away."));
     }
@@ -3288,7 +3312,7 @@ LineAnnotationController::prepareFiberMapAutoLink(uint64_t fiberIdA,
         return refuse(tr("The annotation controller went away."));
     }
     for (const auto& pane : _panes) {
-        if (pane.session && isParticipant(*pane.session)) {
+        if (pane.session && isParticipant(*pane.session) && !kept(pane.surfaceName)) {
             return refuse(tr("A session of %1 is still open.")
                               .arg(fiberDisplayNameFromFileName(pane.session->fiberFileName)));
         }
@@ -3404,6 +3428,435 @@ std::optional<QString> LineAnnotationController::linkStoredControlPoints(StoredF
     refreshBranchLineViews(localId);
     refreshBranchLineViews(farId);
     return std::nullopt;
+}
+
+std::optional<QString> LineAnnotationController::placePreparedControl(
+    AutoLinkPlacement& placement,
+    const AutoLinkPlacementContext& context)
+{
+    // The automatic link's placement of ONE new control on a session that
+    // the caller prepared (makeIntersectionLineSession, the solve backends,
+    // the real line model): the geometric prepare + splice, the pre-solve
+    // identity validation, the synchronous span re-optimization validated
+    // before it is applied, the save, the read-back of the in-memory commit
+    // and the drain. Every yield is followed by the caller's checks through
+    // `context`. placement.placed records a committed control (a refusal
+    // after it must say the control was kept), placement.storedIndex the
+    // control's stored index on success, placement.ownRecord the stored
+    // record as re-resolved after the save. Returns the refusal message.
+    namespace la = vc3d::line_annotation;
+    namespace al = vc3d::fiber_map::autolink;
+    const QPointer<LineAnnotationController> alive(this);
+        LineAnnotationSession& session = *placement.session;
+        const size_t countBefore = session.controlPoints.size();
+        std::vector<cv::Vec3d> currentLinePoints;
+        currentLinePoints.reserve(session.optimizedLine.points.size());
+        for (const auto& point : session.optimizedLine.points) {
+            currentLinePoints.push_back(point.position);
+        }
+        const auto cumulativeArclengths =
+            vc3d::fiber_slice::cumulativePolylineArclengths(currentLinePoints);
+        std::vector<double> controlLinePositions;
+        controlLinePositions.reserve(session.controlPoints.size());
+        for (const auto& control : session.controlPoints) {
+            controlLinePositions.push_back(control.linePosition);
+        }
+        la::PreparedControlPointEdit prepared;
+        try {
+            GeometricControlPointEdit edit;
+            edit.linePosition = placement.choice.linePosition;
+            edit.point = placement.choice.point;
+            edit.segmentLength = initialLineDiscretization(
+                std::max(2, vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT * 2))
+                .segmentLength;
+            prepared = applyGeometricControlPointEdit(session, currentLinePoints,
+                                                      cumulativeArclengths,
+                                                      controlLinePositions, edit);
+        } catch (const std::exception& ex) {
+            return (tr("Could not place a control point on %1: %2")
+                                     .arg(placement.name, QString::fromStdString(ex.what())));
+        }
+        // Pre-solve identity validation on the spliced session: nothing has
+        // been published yet, so a violation simply discards the session.
+        const auto validateControls =
+            [&](const std::vector<la::LineControlPoint>& controls,
+                const std::vector<cv::Vec3d>& line,
+                bool checkOptimizedIndex) -> std::optional<QString> {
+            if (controls.size() != countBefore + 1) {
+                return tr("placing the control point changed the control count of %1")
+                    .arg(placement.name);
+            }
+            std::vector<cv::Vec3d> positions;
+            positions.reserve(controls.size());
+            for (const auto& control : controls) {
+                positions.push_back(control.volumePoint);
+            }
+            const auto ordered = la::orderedControlPointLineIndices(positions, line);
+            if (!ordered || ordered->size() != controls.size()) {
+                return tr("the control points of %1 no longer resolve in line order")
+                    .arg(placement.name);
+            }
+            for (size_t i = 0; i + 1 < ordered->size(); ++i) {
+                if ((*ordered)[i] >= (*ordered)[i + 1]) {
+                    return tr("the control points of %1 no longer resolve in line order")
+                        .arg(placement.name);
+                }
+            }
+            // The nearest-vertex rule every consumer of this geometry uses
+            // (the splice, the span optimizer, the next load's session) must
+            // agree with the ordered scan for every control, on the spliced
+            // line AND on the solved line.
+            for (size_t i = 0; i < controls.size(); ++i) {
+                if (vc3d::fiber_slice::nearestLinePointIndex(line, positions[i]) != (*ordered)[i]) {
+                    return tr("%1 passes through one of its control points twice")
+                        .arg(placement.name);
+                }
+            }
+            if (checkOptimizedIndex) {
+                for (size_t i = 0; i < controls.size(); ++i) {
+                    if (controls[i].optimizedIndex < 0 ||
+                        static_cast<size_t>(controls[i].optimizedIndex) != (*ordered)[i]) {
+                        return tr("%1 passes through one of its control points twice")
+                            .arg(placement.name);
+                    }
+                }
+            }
+            size_t placedCount = 0;
+            for (size_t i = 0; i < positions.size(); ++i) {
+                if (pointsApproximatelyEqual(positions[i], placement.choice.point)) {
+                    ++placedCount;
+                }
+            }
+            if (placedCount != 1) {
+                return tr("the new control point of %1 is not unique").arg(placement.name);
+            }
+            return std::nullopt;
+        };
+        {
+            std::vector<cv::Vec3d> splicedLine;
+            splicedLine.reserve(session.optimizedLine.points.size());
+            for (const auto& point : session.optimizedLine.points) {
+                splicedLine.push_back(point.position);
+            }
+            if (const auto error = validateControls(session.controlPoints, splicedLine, true)) {
+                return (tr("Could not place a control point: %1.").arg(*error));
+            }
+            if (prepared.replacementIndex >= session.controlPoints.size() ||
+                !pointsApproximatelyEqual(session.controlPoints[prepared.replacementIndex].volumePoint,
+                                          placement.choice.point)) {
+                return (tr("Could not place a control point on %1.").arg(placement.name));
+            }
+        }
+        // Backends again (a fiber-follow service can have stopped during the
+        // other fiber's save drain), then the solve, result only.
+        if (!ensureSessionSolveBackends(session, [&]() { return context.checkAndResolve(true); })) {
+            return (tr("Could not prepare the solve for %1.").arg(placement.name));
+        }
+        if (!context.checkAndResolve(true)) {
+            return (context.changedMessage);
+        }
+        OptimizationTaskResult task = runFiberModeSolveSynchronously(
+            session, prepared.dirtySegmentIndices, "fiber_auto_link_span_opt");
+        if (!task.ok) {
+            return (tr("Re-optimization of %1 failed: %2")
+                                     .arg(placement.name, QString::fromStdString(task.error)));
+        }
+        {
+            std::vector<cv::Vec3d> solvedLine;
+            solvedLine.reserve(task.result.line.points.size());
+            for (const auto& point : task.result.line.points) {
+                solvedLine.push_back(point.position);
+            }
+            // The solver's own indices must agree with the ordered scan and
+            // the nearest-vertex rule as well: applyOptimizationTaskResult
+            // trusts them.
+            if (const auto error = validateControls(task.controlPoints, solvedLine, true)) {
+                return (tr("Re-optimization of %1 was rejected: %2")
+                                         .arg(placement.name, *error));
+            }
+        }
+        // Committed from here: the ordinary landing publishes the geometry
+        // and syncs linked peers.
+        if (!applyOptimizationTaskResult(session, std::move(task), false,
+                                         SessionOptimizationState::Optimized,
+                                         "fiber_auto_link_span_opt", false)) {
+            return (tr("Could not apply the re-optimization of %1.").arg(placement.name));
+        }
+        if (!alive) {
+            return (context.changedMessage);
+        }
+        const auto snapshot = makeStoredFiberSessionSnapshot(session);
+        if (prepared.replacementIndex >= snapshot.storedIndexForSessionIndex.size()) {
+            return (tr("Could not place a control point on %1.").arg(placement.name));
+        }
+        const int storedIndex = snapshot.storedIndexForSessionIndex[prepared.replacementIndex];
+        const uint64_t failuresBefore = _fiberSaveFailureCount;
+        // The other participant, as it is now: the save's notifications can
+        // yield, and an edit landing on it meanwhile would be overwritten
+        // by its own detached session later. Compared after the save; a
+        // change is a refusal (the generation alone cannot tell this
+        // operation's own bumps from an edit).
+        const std::optional<nlohmann::json> otherBefore =
+            context.otherSnapshot ? context.otherSnapshot() : std::nullopt;
+        saveSessionAsFiber(session);
+        // The save's failure paths are modal: lifetime first, then the
+        // save's own outcome (reported as such, before any identity verdict
+        // could hide it), then identity and the stored fiber.
+        if (!alive) {
+            return (context.changedMessage);
+        }
+        // The in-memory commit, read back before any verdict: the save
+        // updates the fiber list synchronously and then publishes summaries,
+        // which can yield (the metrics dataset picker), so a refusal from
+        // here on - a write failure delivered meanwhile, an edit of the other
+        // fiber - must already say that this control is retained.
+        // This side alone is resolved for the read-back: the other
+        // participant may be gone by now (a queued delete during the yield),
+        // which is a refusal of its own below, not a reason to forget that
+        // this control was committed.
+        if (StoredFiber* own = context.resolveOwn ? context.resolveOwn() : nullptr) {
+            placement.ownRecord = own;
+            if (storedIndex >= 0 &&
+                static_cast<size_t>(storedIndex) < own->controlPoints.size() &&
+                pointsApproximatelyEqual(own->controlPoints[static_cast<size_t>(storedIndex)],
+                                         placement.choice.point)) {
+                placement.placed = true;
+            }
+        }
+        const auto writeFailedMessage = [&placement]() {
+            return tr("The new control point of %1 could not be written to disk; "
+                      "the loaded fibers may differ from the files - reload the "
+                      "project before further edits.")
+                .arg(placement.name);
+        };
+        if (_fiberSaveFailureCount != failuresBefore) {
+            // Placed in memory but not on disk is the reload case; a save
+            // that failed before updating the fiber list changed nothing.
+            return (placement.placed ? writeFailedMessage()
+                                             : tr("Could not save %1.").arg(placement.name));
+        }
+        if (!context.checkAndResolve(false)) {
+            return (context.changedMessage);
+        }
+        if (context.otherSnapshot) {
+            const std::optional<nlohmann::json> otherAfter = context.otherSnapshot();
+            if (otherAfter != otherBefore) {
+                return (tr("%1 changed while %2 was being saved; nothing more was done.")
+                            .arg(context.otherName, placement.name));
+            }
+        }
+        *context.expectedGeneration = fiberDataGeneration();
+        if (!placement.placed) {
+            return (tr("The new control point of %1 was not found after saving.")
+                                     .arg(placement.name));
+        }
+        // The drain: a save's completion bumps nothing, so the generation
+        // captured right after this operation's own mutation must hold
+        // throughout (any edit meanwhile is a refusal). A failed write is
+        // reported before the identity verdict.
+        waitForFiberSaves(context.identityOnly);
+        if (!alive) {
+            return (context.changedMessage);
+        }
+        if (_fiberSaveFailureCount != failuresBefore) {
+            return (writeFailedMessage());
+        }
+        if (!context.checkAndResolve(true)) {
+            return (context.changedMessage);
+        }
+        placement.storedIndex = storedIndex;
+        return std::nullopt;
+}
+
+LineAnnotationController::AutoLinkChoiceSource
+LineAnnotationController::choiceSourceFromStoredFiber(const StoredFiber& fiber) const
+{
+    namespace la = vc3d::line_annotation;
+    AutoLinkChoiceSource source;
+    source.linePoints = &fiber.linePoints;
+    source.controls = la::storedControlPointPositions(fiber.controlPoints);
+    source.linked.resize(fiber.controlPoints.size(), false);
+    source.kollesisTerminations.resize(fiber.controlPoints.size(), false);
+    for (size_t c = 0; c < fiber.controlPoints.size(); ++c) {
+        source.linked[c] = controlPointHasBranchLink(fiber.branches, c);
+        source.kollesisTerminations[c] =
+            la::hasControlPointTag(fiber.controlPoints[c].tags, la::kKollesisTerminationTag);
+    }
+    // Gap spans in stored order: the span descriptor of the lower control
+    // carries the tag.
+    for (size_t c = 0; c + 1 < fiber.controlPoints.size(); ++c) {
+        if (la::spanIsGap(fiber.controlPoints[c].segmentToNext)) {
+            source.gapSpans.emplace_back(c, c + 1);
+        }
+    }
+    return source;
+}
+
+std::optional<QString> LineAnnotationController::planAutoLinkChoices(
+    std::array<AutoLinkChoiceSide, 2>& sides,
+    double* passDistance) const
+{
+    // The automatic link's choices over plain data (line points, control
+    // positions, linked flags, tags, gap spans - base voxels), so a stored
+    // fiber and a live session feed the same rule: the ordered-scan /
+    // nearest-vertex agreement, the closest 3D pass inside the windows, a
+    // control per side (reused within reuseVx when unlinked, else placed).
+    namespace la = vc3d::line_annotation;
+    namespace al = vc3d::fiber_map::autolink;
+    for (AutoLinkChoiceSide& side : sides) {
+        const std::vector<cv::Vec3d>& linePoints = *side.source.linePoints;
+        if (linePoints.size() < 2) {
+            return tr("%1 has no line to link on.").arg(side.name);
+        }
+        const auto ordered = la::orderedControlPointLineIndices(side.source.controls, linePoints);
+        if (!ordered || ordered->size() != side.source.controls.size()) {
+            return tr("The control points of %1 do not resolve in line order.").arg(side.name);
+        }
+        // The shared placement machinery (splice, span optimizer) resolves
+        // controls by nearest vertex; it is only correct where that agrees
+        // with the loader's ordered scan.
+        for (size_t c = 0; c < side.source.controls.size(); ++c) {
+            if (vc3d::fiber_slice::nearestLinePointIndex(linePoints, side.source.controls[c]) !=
+                (*ordered)[c]) {
+                return tr("%1 passes through one of its control points twice.").arg(side.name);
+            }
+        }
+        side.orderedIndex = *ordered;
+        side.cumulative = vc3d::fiber_slice::cumulativePolylineArclengths(linePoints);
+    }
+    al::FiberSide sideA{sides[0].source.linePoints, &sides[0].cumulative,
+                        sides[0].anchorPosition, sides[0].windowVx};
+    al::FiberSide sideB{sides[1].source.linePoints, &sides[1].cumulative,
+                        sides[1].anchorPosition, sides[1].windowVx};
+    const auto pass = al::findClosestPass(sideA, sideB);
+    if (!pass) {
+        return tr("Could not find where the fibers pass each other.");
+    }
+    const auto focusBounds = _state ? _state->activeFocusBounds() : std::nullopt;
+    for (size_t s = 0; s < 2; ++s) {
+        AutoLinkChoiceSide& side = sides[s];
+        al::ControlChoiceInput input;
+        input.linePoints = side.source.linePoints;
+        input.cumulative = &side.cumulative;
+        input.controlLineIndex = side.orderedIndex;
+        input.linked = side.source.linked;
+        input.kollesisTerminations = side.source.kollesisTerminations;
+        input.gapSpans = side.source.gapSpans;
+        if (focusBounds) {
+            input.inFocusBounds = [bounds = *focusBounds](const cv::Vec3d& p) {
+                return contains_point(bounds, p);
+            };
+            input.focusBox = std::make_pair(
+                cv::Vec3d(focusBounds->low[0], focusBounds->low[1], focusBounds->low[2]),
+                cv::Vec3d(focusBounds->high[0], focusBounds->high[1], focusBounds->high[2]));
+        }
+        input.passPosition = s == 0 ? pass->positionA : pass->positionB;
+        input.windowLo = s == 0 ? pass->windowLoA : pass->windowLoB;
+        input.windowHi = s == 0 ? pass->windowHiA : pass->windowHiB;
+        input.reuseVx = side.reuseVx;
+        input.minSpacingVx = kMinimumControlPointSpacingBaseVoxels;
+        side.choice = al::chooseControlPoint(input);
+        if (side.choice.kind == al::ControlChoice::Kind::Refused) {
+            return tr("No place for a control point on %1: %2")
+                .arg(side.name, QString::fromStdString(side.choice.reason));
+        }
+    }
+    if (passDistance) {
+        *passDistance = pass->distance;
+    }
+    return std::nullopt;
+}
+
+void LineAnnotationController::withdrawTrackedLink(const TrackedLinkEndpoints& tracked,
+                                                  uint64_t packageGeneration,
+                                                  uint64_t loadSequence)
+{
+    // The withdrawal of an installed automatic link whose pair save did not
+    // write both files: every copy of the link (the stored records, queued
+    // save snapshots, open sessions' live branches and armed rollback
+    // copies) is removed, matched by the tracked endpoint positions (every
+    // position each endpoint has held since the install) and the two
+    // fibers' identity - never by review state or index. Only under the
+    // identity the operation started with.
+    namespace la = vc3d::line_annotation;
+    const QPointer<LineAnnotationController> alive(this);
+    const auto isThisLink = [&](const FiberBranchRef& branch, bool fromA) {
+        const uint64_t farId = fromA ? tracked.fiberIdB : tracked.fiberIdA;
+        const std::string& farFile = fromA ? tracked.fileB : tracked.fileA;
+        const bool hereHeld = fromA ? tracked.heldA(branch.controlPointPosition)
+                                    : tracked.heldB(branch.controlPointPosition);
+        const bool thereHeld = fromA ? tracked.heldB(branch.branchControlPointPosition)
+                                     : tracked.heldA(branch.branchControlPointPosition);
+        return !branch.adjacent &&
+               la::sameFiberIdentity(branch.branchFiberId, branch.branchFileName, farId, farFile) &&
+               hereHeld && thereHeld;
+    };
+    // Only under the identity this operation started with: another
+    // package or a reloaded fiber list is not this operation's to edit.
+    if (_packageGeneration != packageGeneration || _fiberLoadSequence != loadSequence) {
+        return;
+    }
+    for (StoredFiber& fiber : _fibers) {
+        if (fiber.id == tracked.fiberIdA && fiber.fileName == tracked.fileA) {
+            std::erase_if(fiber.branches, [&](const FiberBranchRef& b) { return isThisLink(b, true); });
+        } else if (fiber.id == tracked.fiberIdB && fiber.fileName == tracked.fileB) {
+            std::erase_if(fiber.branches, [&](const FiberBranchRef& b) { return isThisLink(b, false); });
+        }
+    }
+    // A save queued meanwhile (a peer sync of either fiber) carries a
+    // snapshot with the refs: it must not write the withdrawn link back.
+    for (FiberSaveJob& job : _pendingFiberSaveJobs) {
+        for (FiberSaveSnapshot& snapshot : job.snapshots) {
+            if (snapshot.fiber.id == tracked.fiberIdA && snapshot.fiber.fileName == tracked.fileA) {
+                std::erase_if(snapshot.fiber.branches,
+                              [&](const FiberBranchRef& b) { return isThisLink(b, true); });
+            } else if (snapshot.fiber.id == tracked.fiberIdB && snapshot.fiber.fileName == tracked.fileB) {
+                std::erase_if(snapshot.fiber.branches,
+                              [&](const FiberBranchRef& b) { return isThisLink(b, false); });
+            }
+        }
+    }
+    // A session of either fiber opened during the drain copied the refs:
+    // it must not save the withdrawn link back - neither from its live
+    // branches nor from an armed rollback copy (a goal-change solve's
+    // branchesBeforeModeChange, a collapse rollback) that a later
+    // failure restores wholesale.
+    for (auto& pane : _panes) {
+        if (!pane.session) {
+            continue;
+        }
+        auto& session = *pane.session;
+        std::optional<bool> localIsA;
+        if (la::sameFiberIdentity(session.fiberId, session.fiberFileName, tracked.fiberIdA, tracked.fileA)) {
+            localIsA = true;
+        } else if (la::sameFiberIdentity(session.fiberId, session.fiberFileName, tracked.fiberIdB,
+                                         tracked.fileB)) {
+            localIsA = false;
+        }
+        if (!localIsA) {
+            continue;
+        }
+        const auto scrub = [&](std::vector<FiberBranchRef>& branches) {
+            std::erase_if(branches,
+                          [&](const FiberBranchRef& b) { return isThisLink(b, *localIsA); });
+        };
+        scrub(session.branches);
+        if (session.branchesBeforeModeChange) {
+            scrub(*session.branchesBeforeModeChange);
+        }
+        if (session.controlPointCollapseRollback) {
+            scrub(session.controlPointCollapseRollback->branches);
+        }
+    }
+    invalidateFiberAlignmentMetrics(tracked.fiberIdA, true);
+    invalidateFiberAlignmentMetrics(tracked.fiberIdB, true);
+    emitFiberSummaries();
+    // The summaries can yield (the dock's metrics picker).
+    if (!alive) {
+        return;
+    }
+    refreshBranchLineViews(tracked.fiberIdA);
+    refreshBranchLineViews(tracked.fiberIdB);
 }
 
 LineAnnotationController::FiberMapAutoLinkOutcome
@@ -3592,76 +4045,22 @@ LineAnnotationController::autoLinkFibers(const FiberMapAutoLinkEndpoint& a,
 
     // Step 1: choices first (a reuse-only link needs no backend).
     const auto planChoices = [&]() -> std::optional<QString> {
-        for (Side& side : sides) {
-            const StoredFiber& fiber = *side.fiber;
-            if (fiber.linePoints.size() < 2) {
-                return tr("%1 has no line to link on.").arg(side.name);
-            }
-            const std::vector<cv::Vec3d> controls = la::storedControlPointPositions(fiber.controlPoints);
-            const auto ordered = la::orderedControlPointLineIndices(controls, fiber.linePoints);
-            if (!ordered || ordered->size() != controls.size()) {
-                return tr("The control points of %1 do not resolve in line order.").arg(side.name);
-            }
-            // The shared placement machinery (splice, span optimizer) resolves
-            // controls by nearest vertex; it is only correct where that agrees
-            // with the loader's ordered scan.
-            for (size_t c = 0; c < controls.size(); ++c) {
-                if (vc3d::fiber_slice::nearestLinePointIndex(fiber.linePoints, controls[c]) !=
-                    (*ordered)[c]) {
-                    return tr("%1 passes through one of its control points twice.").arg(side.name);
-                }
-            }
-            side.orderedIndex = *ordered;
-            side.cumulative = vc3d::fiber_slice::cumulativePolylineArclengths(fiber.linePoints);
-        }
-        al::FiberSide sideA{&sides[0].fiber->linePoints, &sides[0].cumulative,
-                            sides[0].endpoint->linePosition, sides[0].windowVx};
-        al::FiberSide sideB{&sides[1].fiber->linePoints, &sides[1].cumulative,
-                            sides[1].endpoint->linePosition, sides[1].windowVx};
-        const auto pass = al::findClosestPass(sideA, sideB);
-        if (!pass) {
-            return tr("Could not find where the fibers pass each other.");
-        }
-        const auto focusBounds = _state ? _state->activeFocusBounds() : std::nullopt;
+        std::array<AutoLinkChoiceSide, 2> choiceSides;
         for (size_t s = 0; s < 2; ++s) {
-            Side& side = sides[s];
-            const StoredFiber& fiber = *side.fiber;
-            al::ControlChoiceInput input;
-            input.linePoints = &fiber.linePoints;
-            input.cumulative = &side.cumulative;
-            input.controlLineIndex = side.orderedIndex;
-            input.linked.resize(fiber.controlPoints.size(), false);
-            input.kollesisTerminations.resize(fiber.controlPoints.size(), false);
-            for (size_t c = 0; c < fiber.controlPoints.size(); ++c) {
-                input.linked[c] = controlPointHasBranchLink(fiber.branches, c);
-                input.kollesisTerminations[c] = la::hasControlPointTag(
-                    fiber.controlPoints[c].tags, la::kKollesisTerminationTag);
-            }
-            // Gap spans in stored order: the span descriptor of the lower
-            // control carries the tag.
-            for (size_t c = 0; c + 1 < fiber.controlPoints.size(); ++c) {
-                if (la::spanIsGap(fiber.controlPoints[c].segmentToNext)) {
-                    input.gapSpans.emplace_back(c, c + 1);
-                }
-            }
-            if (focusBounds) {
-                input.inFocusBounds = [bounds = *focusBounds](const cv::Vec3d& p) {
-                    return contains_point(bounds, p);
-                };
-                input.focusBox = std::make_pair(
-                    cv::Vec3d(focusBounds->low[0], focusBounds->low[1], focusBounds->low[2]),
-                    cv::Vec3d(focusBounds->high[0], focusBounds->high[1], focusBounds->high[2]));
-            }
-            input.passPosition = s == 0 ? pass->positionA : pass->positionB;
-            input.windowLo = s == 0 ? pass->windowLoA : pass->windowLoB;
-            input.windowHi = s == 0 ? pass->windowHiA : pass->windowHiB;
-            input.reuseVx = side.reuseVx;
-            input.minSpacingVx = kMinimumControlPointSpacingBaseVoxels;
-            side.choice = al::chooseControlPoint(input);
-            if (side.choice.kind == al::ControlChoice::Kind::Refused) {
-                return tr("No place for a control point on %1: %2")
-                    .arg(side.name, QString::fromStdString(side.choice.reason));
-            }
+            choiceSides[s].name = sides[s].name;
+            choiceSides[s].source = choiceSourceFromStoredFiber(*sides[s].fiber);
+            choiceSides[s].anchorPosition = sides[s].endpoint->linePosition;
+            choiceSides[s].windowVx = sides[s].windowVx;
+            choiceSides[s].reuseVx = sides[s].reuseVx;
+        }
+        double passDistance = 0.0;
+        if (const auto error = planAutoLinkChoices(choiceSides, &passDistance)) {
+            return error;
+        }
+        for (size_t s = 0; s < 2; ++s) {
+            sides[s].orderedIndex = std::move(choiceSides[s].orderedIndex);
+            sides[s].cumulative = std::move(choiceSides[s].cumulative);
+            sides[s].choice = choiceSides[s].choice;
         }
         // Two reused controls that are already linked to each other: refuse
         // now, before any mutation.
@@ -3677,7 +4076,7 @@ LineAnnotationController::autoLinkFibers(const FiberMapAutoLinkEndpoint& a,
                 }
             }
         }
-        outcome.message = tr("3D gap %1 vx").arg(pass->distance, 0, 'f', 1);
+        outcome.message = tr("3D gap %1 vx").arg(passDistance, 0, 'f', 1);
         return std::nullopt;
     };
     if (const auto error = planChoices()) {
@@ -3726,232 +4125,45 @@ LineAnnotationController::autoLinkFibers(const FiberMapAutoLinkEndpoint& a,
         }
     }
 
-    // Step 4: placement, A then B.
+    // Step 4: placement, A then B (placePreparedControl: the map's Step 4
+    // over the session Steps 2-3 prepared).
     for (Side& side : sides) {
         if (side.choice.kind == al::ControlChoice::Kind::Reuse) {
             side.linkedControlIndex = side.choice.controlIndex;
             continue;
         }
-        LineAnnotationSession& session = *side.session;
-        const size_t countBefore = session.controlPoints.size();
-        std::vector<cv::Vec3d> currentLinePoints;
-        currentLinePoints.reserve(session.optimizedLine.points.size());
-        for (const auto& point : session.optimizedLine.points) {
-            currentLinePoints.push_back(point.position);
-        }
-        const auto cumulativeArclengths =
-            vc3d::fiber_slice::cumulativePolylineArclengths(currentLinePoints);
-        std::vector<double> controlLinePositions;
-        controlLinePositions.reserve(session.controlPoints.size());
-        for (const auto& control : session.controlPoints) {
-            controlLinePositions.push_back(control.linePosition);
-        }
-        la::PreparedControlPointEdit prepared;
-        try {
-            GeometricControlPointEdit edit;
-            edit.linePosition = side.choice.linePosition;
-            edit.point = side.choice.point;
-            edit.segmentLength = initialLineDiscretization(
-                std::max(2, vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT * 2))
-                .segmentLength;
-            prepared = applyGeometricControlPointEdit(session, currentLinePoints,
-                                                      cumulativeArclengths,
-                                                      controlLinePositions, edit);
-        } catch (const std::exception& ex) {
-            return refuseKeeping(tr("Could not place a control point on %1: %2")
-                                     .arg(side.name, QString::fromStdString(ex.what())));
-        }
-        // Pre-solve identity validation on the spliced session: nothing has
-        // been published yet, so a violation simply discards the session.
-        const auto validateControls =
-            [&](const std::vector<la::LineControlPoint>& controls,
-                const std::vector<cv::Vec3d>& line,
-                bool checkOptimizedIndex) -> std::optional<QString> {
-            if (controls.size() != countBefore + 1) {
-                return tr("placing the control point changed the control count of %1")
-                    .arg(side.name);
-            }
-            std::vector<cv::Vec3d> positions;
-            positions.reserve(controls.size());
-            for (const auto& control : controls) {
-                positions.push_back(control.volumePoint);
-            }
-            const auto ordered = la::orderedControlPointLineIndices(positions, line);
-            if (!ordered || ordered->size() != controls.size()) {
-                return tr("the control points of %1 no longer resolve in line order")
-                    .arg(side.name);
-            }
-            for (size_t i = 0; i + 1 < ordered->size(); ++i) {
-                if ((*ordered)[i] >= (*ordered)[i + 1]) {
-                    return tr("the control points of %1 no longer resolve in line order")
-                        .arg(side.name);
-                }
-            }
-            // The nearest-vertex rule every consumer of this geometry uses
-            // (the splice, the span optimizer, the next load's session) must
-            // agree with the ordered scan for every control, on the spliced
-            // line AND on the solved line.
-            for (size_t i = 0; i < controls.size(); ++i) {
-                if (vc3d::fiber_slice::nearestLinePointIndex(line, positions[i]) != (*ordered)[i]) {
-                    return tr("%1 passes through one of its control points twice")
-                        .arg(side.name);
-                }
-            }
-            if (checkOptimizedIndex) {
-                for (size_t i = 0; i < controls.size(); ++i) {
-                    if (controls[i].optimizedIndex < 0 ||
-                        static_cast<size_t>(controls[i].optimizedIndex) != (*ordered)[i]) {
-                        return tr("%1 passes through one of its control points twice")
-                            .arg(side.name);
-                    }
-                }
-            }
-            size_t placedCount = 0;
-            for (size_t i = 0; i < positions.size(); ++i) {
-                if (pointsApproximatelyEqual(positions[i], side.choice.point)) {
-                    ++placedCount;
-                }
-            }
-            if (placedCount != 1) {
-                return tr("the new control point of %1 is not unique").arg(side.name);
-            }
-            return std::nullopt;
-        };
-        {
-            std::vector<cv::Vec3d> splicedLine;
-            splicedLine.reserve(session.optimizedLine.points.size());
-            for (const auto& point : session.optimizedLine.points) {
-                splicedLine.push_back(point.position);
-            }
-            if (const auto error = validateControls(session.controlPoints, splicedLine, true)) {
-                return refuseKeeping(tr("Could not place a control point: %1.").arg(*error));
-            }
-            if (prepared.replacementIndex >= session.controlPoints.size() ||
-                !pointsApproximatelyEqual(session.controlPoints[prepared.replacementIndex].volumePoint,
-                                          side.choice.point)) {
-                return refuseKeeping(tr("Could not place a control point on %1.").arg(side.name));
-            }
-        }
-        // Backends again (a fiber-follow service can have stopped during the
-        // other fiber's save drain), then the solve, result only.
-        if (!ensureSessionSolveBackends(session, [&]() { return checkAndResolve(true); })) {
-            return refuseKeeping(tr("Could not prepare the solve for %1.").arg(side.name));
-        }
-        if (!checkAndResolve(true)) {
-            return refuseKeeping(changedMessage);
-        }
-        OptimizationTaskResult task = runFiberModeSolveSynchronously(
-            session, prepared.dirtySegmentIndices, "fiber_auto_link_span_opt");
-        if (!task.ok) {
-            return refuseKeeping(tr("Re-optimization of %1 failed: %2")
-                                     .arg(side.name, QString::fromStdString(task.error)));
-        }
-        {
-            std::vector<cv::Vec3d> solvedLine;
-            solvedLine.reserve(task.result.line.points.size());
-            for (const auto& point : task.result.line.points) {
-                solvedLine.push_back(point.position);
-            }
-            // The solver's own indices must agree with the ordered scan and
-            // the nearest-vertex rule as well: applyOptimizationTaskResult
-            // trusts them.
-            if (const auto error = validateControls(task.controlPoints, solvedLine, true)) {
-                return refuseKeeping(tr("Re-optimization of %1 was rejected: %2")
-                                         .arg(side.name, *error));
-            }
-        }
-        // Committed from here: the ordinary landing publishes the geometry
-        // and syncs linked peers.
-        if (!applyOptimizationTaskResult(session, std::move(task), false,
-                                         SessionOptimizationState::Optimized,
-                                         "fiber_auto_link_span_opt", false)) {
-            return refuseKeeping(tr("Could not apply the re-optimization of %1.").arg(side.name));
-        }
-        if (!alive) {
-            return refuse(changedMessage);
-        }
-        const auto snapshot = makeStoredFiberSessionSnapshot(session);
-        if (prepared.replacementIndex >= snapshot.storedIndexForSessionIndex.size()) {
-            return refuseKeeping(tr("Could not place a control point on %1.").arg(side.name));
-        }
-        const int storedIndex = snapshot.storedIndexForSessionIndex[prepared.replacementIndex];
-        const uint64_t failuresBefore = _fiberSaveFailureCount;
-        // The other participant, as it is now: the save's notifications can
-        // yield, and an edit landing on it meanwhile would be overwritten
-        // by its own detached session later. Compared after the save; a
-        // change is a refusal (the generation alone cannot tell this
-        // operation's own bumps from an edit).
         const Side& other = &side == &sides[0] ? sides[1] : sides[0];
-        nlohmann::json otherBefore = fiberToJson(*other.fiber);
-        otherBefore.erase("generation");
-        saveSessionAsFiber(session);
-        // The save's failure paths are modal: lifetime first, then the
-        // save's own outcome (reported as such, before any identity verdict
-        // could hide it), then identity and the stored fiber.
-        if (!alive) {
-            return refuse(changedMessage);
-        }
-        // The in-memory commit, read back before any verdict: the save
-        // updates the fiber list synchronously and then publishes summaries,
-        // which can yield (the metrics dataset picker), so a refusal from
-        // here on - a write failure delivered meanwhile, an edit of the other
-        // fiber - must already say that this control is retained.
-        // This side alone is resolved for the read-back: the other
-        // participant may be gone by now (a queued delete during the yield),
-        // which is a refusal of its own below, not a reason to forget that
-        // this control was committed.
-        if (StoredFiber* own = resolve(side.endpoint->fiberId, side.endpoint->fileName)) {
-            side.fiber = own;
-            if (storedIndex >= 0 &&
-                static_cast<size_t>(storedIndex) < own->controlPoints.size() &&
-                pointsApproximatelyEqual(own->controlPoints[static_cast<size_t>(storedIndex)],
-                                         side.choice.point)) {
-                side.placed = true;
+        AutoLinkPlacement placement;
+        placement.session = side.session;
+        placement.choice = side.choice;
+        placement.name = side.name;
+        AutoLinkPlacementContext context;
+        context.checkAndResolve = [&](bool includeGeneration) { return checkAndResolve(includeGeneration); };
+        context.identityOnly = [&]() { return identityOnly(); };
+        context.resolveOwn = [&]() { return resolve(side.endpoint->fiberId, side.endpoint->fileName); };
+        context.otherSnapshot = [&]() -> std::optional<nlohmann::json> {
+            if (!other.fiber) {
+                return std::nullopt;
             }
-        }
-        const auto writeFailedMessage = [&side]() {
-            return tr("The new control point of %1 could not be written to disk; "
-                      "the loaded fibers may differ from the files - reload the "
-                      "project before further edits.")
-                .arg(side.name);
+            nlohmann::json snapshot = fiberToJson(*other.fiber);
+            snapshot.erase("generation");
+            return snapshot;
         };
-        if (_fiberSaveFailureCount != failuresBefore) {
-            // Placed in memory but not on disk is the reload case; a save
-            // that failed before updating the fiber list changed nothing.
-            return refuseKeeping(side.placed ? writeFailedMessage()
-                                             : tr("Could not save %1.").arg(side.name));
-        }
-        if (!checkAndResolve(false)) {
-            return refuseKeeping(changedMessage);
-        }
-        {
-            nlohmann::json otherAfter = fiberToJson(*other.fiber);
-            otherAfter.erase("generation");
-            if (otherAfter != otherBefore) {
-                return refuseKeeping(tr("%1 changed while %2 was being saved; nothing more was done.")
-                                         .arg(other.name, side.name));
-            }
-        }
-        expectedGeneration = fiberDataGeneration();
-        if (!side.placed) {
-            return refuseKeeping(tr("The new control point of %1 was not found after saving.")
-                                     .arg(side.name));
-        }
-        // The drain: a save's completion bumps nothing, so the generation
-        // captured right after this operation's own mutation must hold
-        // throughout (any edit meanwhile is a refusal). A failed write is
-        // reported before the identity verdict.
-        waitForFiberSaves(identityOnly);
+        context.otherName = other.name;
+        context.expectedGeneration = &expectedGeneration;
+        context.changedMessage = changedMessage;
+        const auto error = placePreparedControl(placement, context);
+        side.placed = placement.placed;
         if (!alive) {
             return refuse(changedMessage);
         }
-        if (_fiberSaveFailureCount != failuresBefore) {
-            return refuseKeeping(writeFailedMessage());
+        if (placement.ownRecord) {
+            side.fiber = placement.ownRecord;
         }
-        if (!checkAndResolve(true)) {
-            return refuseKeeping(changedMessage);
+        if (error) {
+            return refuseKeeping(*error);
         }
-        side.linkedControlIndex = storedIndex;
+        side.linkedControlIndex = placement.storedIndex;
     }
 
     // Step 5: the link, on the stored fibers, and its pair save drained
@@ -4028,73 +4240,7 @@ LineAnnotationController::autoLinkFibers(const FiberMapAutoLinkEndpoint& a,
                hereHeld && thereHeld;
     };
     const auto removeInstalledLink = [&]() {
-        // Only under the identity this operation started with: another
-        // package or a reloaded fiber list is not this operation's to edit.
-        if (!alive || _packageGeneration != packageGeneration ||
-            _fiberLoadSequence != loadSequence) {
-            return;
-        }
-        for (StoredFiber& fiber : _fibers) {
-            if (fiber.id == fiberIdA && fiber.fileName == fileA) {
-                std::erase_if(fiber.branches, [&](const FiberBranchRef& b) { return isThisLink(b, true); });
-            } else if (fiber.id == fiberIdB && fiber.fileName == fileB) {
-                std::erase_if(fiber.branches, [&](const FiberBranchRef& b) { return isThisLink(b, false); });
-            }
-        }
-        // A save queued meanwhile (a peer sync of either fiber) carries a
-        // snapshot with the refs: it must not write the withdrawn link back.
-        for (FiberSaveJob& job : _pendingFiberSaveJobs) {
-            for (FiberSaveSnapshot& snapshot : job.snapshots) {
-                if (snapshot.fiber.id == fiberIdA && snapshot.fiber.fileName == fileA) {
-                    std::erase_if(snapshot.fiber.branches,
-                                  [&](const FiberBranchRef& b) { return isThisLink(b, true); });
-                } else if (snapshot.fiber.id == fiberIdB && snapshot.fiber.fileName == fileB) {
-                    std::erase_if(snapshot.fiber.branches,
-                                  [&](const FiberBranchRef& b) { return isThisLink(b, false); });
-                }
-            }
-        }
-        // A session of either fiber opened during the drain copied the refs:
-        // it must not save the withdrawn link back - neither from its live
-        // branches nor from an armed rollback copy (a goal-change solve's
-        // branchesBeforeModeChange, a collapse rollback) that a later
-        // failure restores wholesale.
-        for (auto& pane : _panes) {
-            if (!pane.session) {
-                continue;
-            }
-            auto& session = *pane.session;
-            std::optional<bool> localIsA;
-            if (la::sameFiberIdentity(session.fiberId, session.fiberFileName, fiberIdA, fileA)) {
-                localIsA = true;
-            } else if (la::sameFiberIdentity(session.fiberId, session.fiberFileName, fiberIdB,
-                                             fileB)) {
-                localIsA = false;
-            }
-            if (!localIsA) {
-                continue;
-            }
-            const auto scrub = [&](std::vector<FiberBranchRef>& branches) {
-                std::erase_if(branches,
-                              [&](const FiberBranchRef& b) { return isThisLink(b, *localIsA); });
-            };
-            scrub(session.branches);
-            if (session.branchesBeforeModeChange) {
-                scrub(*session.branchesBeforeModeChange);
-            }
-            if (session.controlPointCollapseRollback) {
-                scrub(session.controlPointCollapseRollback->branches);
-            }
-        }
-        invalidateFiberAlignmentMetrics(fiberIdA, true);
-        invalidateFiberAlignmentMetrics(fiberIdB, true);
-        emitFiberSummaries();
-        // The summaries can yield (the dock's metrics picker).
-        if (!alive) {
-            return;
-        }
-        refreshBranchLineViews(fiberIdA);
-        refreshBranchLineViews(fiberIdB);
+        withdrawTrackedLink(tracked, packageGeneration, loadSequence);
     };
     waitForFiberSaves(identityOnly);
     if (!alive) {
@@ -9274,7 +9420,10 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         return;
     }
 
-    auto& session = *pane->session;
+    // Owned for the duration: the preparation below yields, and the pane
+    // is re-resolved by name afterwards (it can be erased meanwhile).
+    const std::shared_ptr<LineAnnotationSession> owned = pane->session;
+    auto& session = *owned;
     // Control-point edits deliberately do NOT refuse while a solve is in
     // flight: the session is mutated immediately, the in-flight solve is
     // superseded (epoch bump + cooperative cancel), and one solve over the
@@ -9287,14 +9436,11 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
             toVec3d(volumePoint), session.suppressErrorDialogs)) {
         return;
     }
-    // A debounced autosave still holds the LAST landing's geometry; once
-    // this edit mutates the session it can never be saved (the flush refuses
-    // unoptimized sessions), so persist it first, like the synchronous
-    // per-landing save used to.
-    if (session.autoSaveScheduled) {
-        flushSessionAutoSave(session.surfaceName);
+    if (!prepareSessionForControlPlacement(surfaceName, owned, {})) {
+        return;
     }
-    if (!ensureDatasetForSession(session)) {
+    pane = paneForSurface(surfaceName);
+    if (!pane || pane->session != owned) {
         return;
     }
 
@@ -9399,7 +9545,73 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         }
     }
 
-    const bool manualDisplayNormal = displayNormal.has_value();
+    GeometricControlPointEdit edit;
+    edit.linePosition = linePosition;
+    edit.point = clicked;
+    edit.nearbyControlIndices = nearbyControlIndices;
+    edit.displayNormal = displayNormal;
+    edit.manualDisplayNormal = displayNormal.has_value();
+    edit.direction = direction;
+    (void)placeControlInSession(surfaceName, owned, currentLinePoints, cumulativeArclengths,
+                                controlLinePositions, std::move(edit), {});
+}
+
+bool LineAnnotationController::prepareSessionForControlPlacement(
+    const std::string& surfaceName,
+    const std::shared_ptr<LineAnnotationSession>& owned,
+    const std::function<bool()>& stillValid)
+{
+    // The yields that precede a placement's geometry capture, in the order
+    // the interactive handler always ran them: a debounced autosave still
+    // holds the LAST landing's geometry and could never be saved once the
+    // edit mutates the session (the flush refuses unoptimized sessions), so
+    // it is persisted first; then the Lasagna dataset (a picker). After
+    // each, lifetime, validity and the pane (by name) are re-checked: the
+    // caller captures its geometry only after this returns true.
+    const QPointer<LineAnnotationController> alive(this);
+    LineAnnotationSession& session = *owned;
+    const auto paneIntact = [this, &surfaceName, &owned]() {
+        auto* pane = paneForSurface(surfaceName);
+        return pane && pane->session == owned;
+    };
+    if (session.autoSaveScheduled) {
+        flushSessionAutoSave(session.surfaceName);
+        if (!alive || (stillValid && !stillValid()) || !paneIntact()) {
+            return false;
+        }
+    }
+    if (!ensureDatasetForSession(session, true, stillValid)) {
+        return false;
+    }
+    if (!alive || (stillValid && !stillValid()) || !paneIntact()) {
+        return false;
+    }
+    return true;
+}
+
+std::optional<size_t> LineAnnotationController::placeControlInSession(
+    const std::string& surfaceName,
+    const std::shared_ptr<LineAnnotationSession>& owned,
+    const std::vector<cv::Vec3d>& currentLinePoints,
+    const std::vector<double>& cumulativeArclengths,
+    const std::vector<double>& controlLinePositions,
+    GeometricControlPointEdit edit,
+    const std::function<bool()>& stillValid)
+{
+    // The placement tail shared by the interactive handler (which computed
+    // edit.nearbyControlIndices from its click) and the automatic link
+    // (which passes an explicitly empty collapse set): rollback capture,
+    // the geometric prepare + splice, branch-metadata sync and saves, the
+    // dialog overlays, the span-solve dispatch (auto mode) or the view
+    // materialization (manual mode), debug json. Returns the index of the
+    // placed (or replacing) control in the session, nullopt when nothing
+    // was placed (the error was shown here).
+    const QPointer<LineAnnotationController> alive(this);
+    auto* pane = paneForSurface(surfaceName);
+    if (!pane || pane->session != owned) {
+        return std::nullopt;
+    }
+    LineAnnotationSession& session = *owned;
 
     const std::vector<vc3d::line_annotation::LineControlPoint> previousControls =
         session.controlPoints;
@@ -9414,7 +9626,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
     // only come from the nearby set, so the copy is taken only when one is
     // possible.
     std::optional<vc::lasagna::LineModel> previousLine;
-    if (nearbyControlIndices.size() > 1) {
+    if (edit.nearbyControlIndices.size() > 1) {
         previousLine = session.optimizedLine;
     }
     const bool autoReoptimize =
@@ -9433,14 +9645,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         const int initialCenterlineLengthVx = pane->dialog
             ? std::max(2, pane->dialog->extrapolationDistanceVx() * 2)
             : vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT * 2;
-        GeometricControlPointEdit edit;
-        edit.linePosition = linePosition;
-        edit.point = clicked;
-        edit.nearbyControlIndices = nearbyControlIndices;
         edit.segmentLength = initialLineDiscretization(initialCenterlineLengthVx).segmentLength;
-        edit.displayNormal = displayNormal;
-        edit.manualDisplayNormal = manualDisplayNormal;
-        edit.direction = direction;
         prepared = applyGeometricControlPointEdit(session, currentLinePoints,
                                                   cumulativeArclengths,
                                                   controlLinePositions, edit);
@@ -9448,7 +9653,7 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         showError(tr("Could not update line control point: %1")
                       .arg(QString::fromStdString(ex.what())),
                   session.suppressErrorDialogs);
-        return;
+        return std::nullopt;
     }
     const bool editedExistingControl = !prepared.collapsedOldIndices.empty();
     const size_t collapsedControlCount = prepared.collapsedOldIndices.size();
@@ -9607,11 +9812,20 @@ void LineAnnotationController::handleGeneratedControlPoint(const std::string& su
         // intersection query works against a display whose geometry no
         // longer matches the session. (While a superseded solve is still
         // running, its landing refreshes the views instead.)
-        (void)materializeGeneratedViews(session);
+        materializeGeneratedViews(session, stillValid);
+        // The materialization can show a modal (a normal reset): lifetime
+        // and validity first, then the pane by name.
+        if (!alive || (stillValid && !stillValid())) {
+            return std::nullopt;
+        }
+        pane = paneForSurface(surfaceName);
+        if (!pane || pane->session != owned) {
+            return std::nullopt;
+        }
     }
     syncDialogLineSolveActivity(session);
+    return prepared.replacementIndex;
 }
-
 std::optional<uint64_t> LineAnnotationController::createLinkedSeedFiber(
     const LinkedSeedParent& parent,
     const cv::Vec3d& seedPoint,
@@ -10016,7 +10230,10 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
     if (!pane || !pane->session) {
         return;
     }
-    auto& session = *pane->session;
+    // Owned for the duration: the autosave flush below yields, and the pane
+    // is re-resolved by name afterwards.
+    const std::shared_ptr<LineAnnotationSession> owned = pane->session;
+    auto& session = *owned;
     if (session.fiberDeleted) {
         // The fiber was deleted underneath this session; a structural edit
         // would be persisted as a new file under the deleted name.
@@ -10031,6 +10248,10 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
     // Cross-fiber operation: make sure no participating fiber's newest
     // geometry is still session-only behind a debounced autosave.
     flushAllPendingSessionAutoSaves();
+    pane = paneForSurface(surfaceName);
+    if (!pane || pane->session != owned) {
+        return;
+    }
     if (controlPointIndex >= session.controlPoints.size()) {
         return;
     }
@@ -10081,11 +10302,61 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
         showError(tr("The link candidate is already linked; unlink it first."));
         return;
     }
-    const cv::Vec3d farPoint = farIt->controlPoints[static_cast<size_t>(*farControlIndex)];
+    if (const auto error = linkSessionControlToStoredControl(
+            surfaceName, owned, controlPointIndex, farIt->id, *farControlIndex,
+            candidate.adjacent, /*autoLink=*/false, {})) {
+        showError(*error);
+        return;
+    }
+    _linkCandidate.reset();
+}
+
+std::optional<QString> LineAnnotationController::linkSessionControlToStoredControl(
+    const std::string& surfaceName,
+    const std::shared_ptr<LineAnnotationSession>& owned,
+    size_t controlPointIndex,
+    uint64_t farFiberId,
+    int farControlIndex,
+    bool adjacent,
+    bool autoLink,
+    const std::function<bool()>& stillValid)
+{
+    // The link of a SESSION control point to a stored fiber's control point,
+    // shared by the link-candidate menu (adjacent or ordinary, human pending)
+    // and the automatic link made from a fiber-intersection marker
+    // (ordinary, automatic). The session-side ref carries the session index
+    // (the stored index is read back from the serialized fiber), the
+    // reciprocal is written onto the far record, the pair save scheduled,
+    // the fiber list updated. On a synchronous failure BOTH refs are removed
+    // again. The summary publication can yield (the dock's metrics picker):
+    // lifetime and validity are checked after it and the pane re-resolved
+    // by name before its overlays are refreshed.
+    const QPointer<LineAnnotationController> alive(this);
+    LineAnnotationSession& session = *owned;
+    const auto findFarFiber = [this, farFiberId]() {
+        return std::find_if(_fibers.begin(), _fibers.end(),
+                            [farFiberId](const StoredFiber& fiber) {
+                                return fiber.id == farFiberId;
+                            });
+    };
+    auto farIt = findFarFiber();
+    if (farIt == _fibers.end()) {
+        return tr("The linked fiber no longer exists.");
+    }
+    if (controlPointIndex >= session.controlPoints.size() || farControlIndex < 0 ||
+        static_cast<size_t>(farControlIndex) >= farIt->controlPoints.size()) {
+        return tr("A control point index is out of range.");
+    }
+    if (controlPointHasBranchLink(session.branches, controlPointIndex)) {
+        return tr("This control point is already linked; unlink it first.");
+    }
+    if (controlPointHasBranchLink(farIt->branches, static_cast<size_t>(farControlIndex))) {
+        return tr("The other control point is already linked; unlink it first.");
+    }
+    const cv::Vec3d farPoint = farIt->controlPoints[static_cast<size_t>(farControlIndex)];
     const cv::Vec3d localPoint = session.controlPoints[controlPointIndex].volumePoint;
     if (!finitePoint(localPoint) || !finitePoint(farPoint)) {
-        showError(tr("Could not determine finite endpoints for the link."));
-        return;
+        return tr("Could not determine finite endpoints for the link.");
     }
     const cv::Vec3d fallbackDirection = normalizedOrZero(farPoint - localPoint);
     const cv::Vec3d localDirection = endpointTangentFromLinePoints(
@@ -10097,16 +10368,15 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
         farPoint,
         -fallbackDirection);
     if (!finiteDirection(localDirection) || !finiteDirection(farDirection)) {
-        showError(tr("Could not determine finite link directions between the control points."));
-        return;
+        return tr("Could not determine finite link directions between the control points.");
     }
 
     // Session-indexed on this side; the stored index is read back from the
     // serialized fiber below.
     const FiberBranchRef localRef = vc3d::line_annotation::makeBranchRef(
         static_cast<int>(controlPointIndex), localPoint, localDirection,
-        farIt->id, farIt->fileName, *farControlIndex, farPoint, farDirection,
-        /*pending=*/true, candidate.adjacent, /*autoLink=*/false);
+        farIt->id, farIt->fileName, farControlIndex, farPoint, farDirection,
+        /*pending=*/true, adjacent, autoLink);
 
     const auto duplicateLocal = std::find_if(
         session.branches.begin(),
@@ -10117,13 +10387,24 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
                    branch.branchControlPointIndex == localRef.branchControlPointIndex;
         });
     if (duplicateLocal != session.branches.end()) {
-        showError(tr("These control points are already linked."));
-        return;
+        return tr("These control points are already linked.");
     }
     session.branches.push_back(localRef);
 
     const uint64_t localFiberId = session.fiberId;
-    const uint64_t farFiberId = farIt->id;
+    const auto removeLocalRef = [&session, &localRef]() {
+        session.branches.erase(
+            std::remove_if(session.branches.begin(),
+                           session.branches.end(),
+                           [&localRef](const FiberBranchRef& branch) {
+                               return branch.branchFiberId == localRef.branchFiberId &&
+                                      branch.controlPointIndex == localRef.controlPointIndex &&
+                                      branch.branchControlPointIndex ==
+                                          localRef.branchControlPointIndex;
+                           }),
+            session.branches.end());
+    };
+    std::optional<FiberBranchRef> pushedReciprocal;
     try {
         StoredFiber localFiber = storedFiberFromSession(session);
         const auto storedLocalBranch = std::find_if(
@@ -10158,6 +10439,7 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
             });
         if (duplicateFar == farIt->branches.end()) {
             farIt->branches.push_back(reciprocal);
+            pushedReciprocal = reciprocal;
         }
         const StoredFiber farFiber = *farIt;
         scheduleFiberPairSave(localFiber, farFiber);
@@ -10176,17 +10458,22 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
             *localIt = std::move(localFiber);
         }
     } catch (const std::exception& ex) {
-        session.branches.erase(
-            std::remove_if(session.branches.begin(),
-                           session.branches.end(),
-                           [&localRef](const FiberBranchRef& branch) {
-                               return branch.branchFiberId == localRef.branchFiberId &&
-                                      branch.controlPointIndex == localRef.controlPointIndex &&
-                                      branch.branchControlPointIndex ==
-                                          localRef.branchControlPointIndex;
-                           }),
-            session.branches.end());
-        if (pane->dialog) {
+        // Both refs go: the session's, and the reciprocal already written
+        // onto the far record (a one-sided ref would fail the next load's
+        // reciprocity check).
+        removeLocalRef();
+        if (pushedReciprocal) {
+            if (auto far = findFarFiber(); far != _fibers.end()) {
+                const FiberBranchRef& r = *pushedReciprocal;
+                std::erase_if(far->branches, [&r](const FiberBranchRef& branch) {
+                    return branch.adjacent == r.adjacent &&
+                           branch.branchFiberId == r.branchFiberId &&
+                           branch.controlPointIndex == r.controlPointIndex &&
+                           branch.branchControlPointIndex == r.branchControlPointIndex;
+                });
+            }
+        }
+        if (auto* pane = paneForSurface(surfaceName); pane && pane->session == owned && pane->dialog) {
             pane->dialog->setGeneratedBranchOverlayData(
                 controlMarkersForSession(session),
                 generatedBranchLinePointsForSession(session),
@@ -10194,17 +10481,19 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
                 true,
                 generatedSpanAlignmentMetricsForSession(session));
         }
-        showError(tr("Could not save linked fibers: %1")
-                      .arg(QString::fromStdString(ex.what())));
-        return;
+        return tr("Could not save linked fibers: %1").arg(QString::fromStdString(ex.what()));
     }
 
-    _linkCandidate.reset();
     session.fiberMetricsMatchStoredFiber = true;
     invalidateFiberAlignmentMetrics(localFiberId, true);
     invalidateFiberAlignmentMetrics(farFiberId, true);
     emitFiberSummaries();
-    if (pane->dialog) {
+    // The summaries can yield (the dock's metrics picker): the link is made
+    // and saved whatever happens now; only the refresh waits on validity.
+    if (!alive || (stillValid && !stillValid())) {
+        return std::nullopt;
+    }
+    if (auto* pane = paneForSurface(surfaceName); pane && pane->session == owned && pane->dialog) {
         pane->dialog->setGeneratedBranchOverlayData(
             controlMarkersForSession(session),
             generatedBranchLinePointsForSession(session),
@@ -10213,25 +10502,8 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
             generatedSpanAlignmentMetricsForSession(session));
     }
     refreshBranchLineViews(localFiberId);
+    return std::nullopt;
 }
-
-// ---------------------------------------------------------------------------
-// Structural edits: merge two fibers into one, split one into two.
-//
-// Phase A (the menu callback) validates, captures the participants by
-// identity and position, runs the one modal it needs, and schedules phase B
-// on a clean stack. Phase B drains the save queue, re-resolves everything,
-// plans on stored snapshots (LineAnnotationStructuralEdits.hpp), redirects
-// the peers' links, canonicalizes and validates the whole batch, checks the
-// graph the next load will see, and commits with ONE runFiberSaveJob (new
-// files + redirected peers as payloads, originals as retirements). Only
-// after that commit is the prebuilt memory state installed, with swaps and
-// flag writes that cannot throw. A failure anywhere before the commit leaves
-// disk and memory as they were; the save job restores disk on its own
-// failure. The re-fit that follows is ordinary and its outcome does not
-// change the committed graph.
-// ---------------------------------------------------------------------------
-
 bool LineAnnotationController::structuralEditParticipantAllowed(
     const std::filesystem::path& sourceRoot,
     const std::string& fileName,
@@ -15585,8 +15857,10 @@ vc::fiber_tracer::FiberDisplayField LineAnnotationController::displayFieldForSes
         displayPoints, orientedNormals, displayControlPositions, manualNormals, controlDirections);
 }
 
-bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& session)
+bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& session,
+                                                         const std::function<bool()>& stillValid)
 {
+    const QPointer<LineAnnotationController> alive(this);
     session.inspectionFrameOnly = std::any_of(
         session.optimizedLine.points.begin(), session.optimizedLine.points.end(),
         [](const auto& point) { return point.sampledNormal.reason == "display frame only"; });
@@ -15637,6 +15911,11 @@ bool LineAnnotationController::materializeGeneratedViews(LineAnnotationSession& 
         saveFiberDisplayAnnotations(session);
         showError(tr("Normal offset reset to 0 for %1 control points because their stored normals could not be projected into the cross-section plane.")
                       .arg(session.displayField.resetControls.size()), session.suppressErrorDialogs);
+        // The warning is modal: nothing of the controller or the session is
+        // touched, and nothing published, unless both are still valid.
+        if (!alive || (stillValid && !stillValid())) {
+            return false;
+        }
     }
     const bool hasManualNormals = std::any_of(session.controlPoints.begin(), session.controlPoints.end(),
         [](const auto& control) { return control.displayNormal.has_value(); });
