@@ -838,9 +838,13 @@ private:
     // Sets the interpolation goal of the spans owned by `owners` and starts
     // the re-solve, with the mode-change rollback of the menu's goal change.
     // Returns false (nothing changed) when every span already has the goal.
+    // goalsCommitted: the goals follow a committed tag edit (the gap policy)
+    // rather than a menu choice, so a failed solve keeps them (the controls
+    // snapshot is taken after they are set; the geometry snapshot before).
     bool applySegmentInterpolationGoals(LineAnnotationSession& session,
                                         const std::vector<size_t>& owners,
-                                        vc3d::line_annotation::SegmentInterpolationGoal goal);
+                                        vc3d::line_annotation::SegmentInterpolationGoal goal,
+                                        bool goalsCommitted = false);
     // adjacent: designate the point as an ADJACENT link candidate (see
     // LinkCandidate::adjacent) rather than an ordinary one.
     void handleGeneratedControlPointLinkCandidate(const std::string& surfaceName,

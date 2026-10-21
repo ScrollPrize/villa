@@ -785,11 +785,22 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     const std::vector<cv::Vec3d> referenceTrace =
         coordinates.baseToTrace(request.linePointsBase);
 
+    // A control's own index is authoritative when it names its vertex on
+    // the input line (every solve and landing keeps it so); the coordinate
+    // search is the fallback for controls without one (a fresh seed, a
+    // reopened file). A straight tail can revisit a control's coordinate
+    // exactly (a folded fiber), which the search alone could not tell apart.
     std::vector<size_t> originalControlIndices;
     originalControlIndices.reserve(request.controlPoints.size());
     for (const auto& control : request.controlPoints) {
+        const bool indexNamesVertex = control.optimizedIndex >= 0 &&
+            control.optimizedIndex < static_cast<int>(request.linePointsBase.size()) &&
+            pointsApproximatelyEqual(
+                request.linePointsBase[static_cast<size_t>(control.optimizedIndex)],
+                control.volumePoint);
         originalControlIndices.push_back(
-            nearestPointIndex(request.linePointsBase, control.volumePoint));
+            indexNamesVertex ? static_cast<size_t>(control.optimizedIndex)
+                             : nearestPointIndex(request.linePointsBase, control.volumePoint));
     }
     for (size_t index = 1; index < originalControlIndices.size(); ++index) {
         if (originalControlIndices[index] <= originalControlIndices[index - 1]) {

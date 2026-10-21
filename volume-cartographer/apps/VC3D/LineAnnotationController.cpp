@@ -1820,6 +1820,7 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
         // (the reinit does); otherwise the outer vertices are resolved on
         // the result with a direction-aware nearest scan.
         std::optional<std::vector<int>> optimizerControlIndices;
+        bool optimizerIndicesInLineOrder = false;
         if (forceFullOptimization && initialLinePoints.size() >= 2 && task.controlPoints.size() >= 2) {
             std::vector<int> fixedIndices;
             fixedIndices.reserve(task.controlPoints.size());
@@ -1851,7 +1852,10 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
                 return task;
             }
             if (reinitialized.fixedPointIndices.size() == task.controlPoints.size()) {
+                // Reported in LINE order (the reinit sorts its controls);
+                // mapped back to the task's control slots below.
                 optimizerControlIndices = reinitialized.fixedPointIndices;
+                optimizerIndicesInLineOrder = true;
             }
             task.result = std::move(reinitialized.optimization);
         } else if (!forceFullOptimization && initialLinePoints.size() >= 2) {
@@ -1876,6 +1880,11 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
                 ? "existing-line+global"
                 : "existing-line+local";
             const int initialPointCount = static_cast<int>(initialLinePoints.size());
+            // The existing-line optimizer keeps these indices (the control
+            // positions were written onto the line at them above).
+            if (fixedIndices.size() == task.controlPoints.size()) {
+                optimizerControlIndices = fixedIndices;
+            }
             task.result = optimizer.optimizeExistingLine(std::move(initialLinePoints),
                                                          std::move(fixedIndices),
                                                          displayFrameAnchorIndex,
@@ -1914,14 +1923,19 @@ LineAnnotationController::OptimizationTaskResult optimizeLineWithSampler(
                 resultPoints.push_back(point.position);
             }
             std::vector<int> resolved(task.controlPoints.size(), 0);
-            if (optimizerControlIndices) {
+            if (optimizerControlIndices && optimizerIndicesInLineOrder) {
+                for (size_t rank = 0; rank < order.size(); ++rank) {
+                    resolved[order[rank]] = (*optimizerControlIndices)[rank];
+                }
+            } else if (optimizerControlIndices) {
                 resolved = *optimizerControlIndices;
             } else {
+                // Only the seed branch (one fresh control): first match.
                 for (size_t rank = 0; rank < order.size(); ++rank) {
                     const size_t i = order[rank];
                     resolved[i] = static_cast<int>(vc3d::line_annotation::nearestLineIndex(
                         resultPoints, task.controlPoints[i].volumePoint,
-                        rank + 1 == order.size()
+                        order.size() > 1 && rank + 1 == order.size()
                             ? vc3d::line_annotation::NearestTie::Last
                             : vc3d::line_annotation::NearestTie::First));
                 }
@@ -11371,7 +11385,7 @@ bool LineAnnotationController::reconcileGapGoalsAfterBreakEdit(
         }
         return !owners.empty() &&
             applySegmentInterpolationGoals(
-                session, owners, vc3d::line_annotation::SegmentInterpolationGoal::Cspline);
+                session, owners, vc3d::line_annotation::SegmentInterpolationGoal::Cspline, true);
     }
     // A dissolved gap span returns to the global goal, but only when it still
     // carries the spline the gap gave it: an explicit choice made since is
@@ -11384,7 +11398,7 @@ bool LineAnnotationController::reconcileGapGoalsAfterBreakEdit(
     }
     return !owners.empty() &&
         applySegmentInterpolationGoals(
-            session, owners, vc3d::line_annotation::SegmentInterpolationGoal::Global);
+            session, owners, vc3d::line_annotation::SegmentInterpolationGoal::Global, true);
 }
 
 void LineAnnotationController::refreshTailsAfterTailPolicyChange(
@@ -11773,7 +11787,8 @@ void LineAnnotationController::handleGeneratedSegmentInterpolationGoal(
 bool LineAnnotationController::applySegmentInterpolationGoals(
     LineAnnotationSession& session,
     const std::vector<size_t>& owners,
-    vc3d::line_annotation::SegmentInterpolationGoal goal)
+    vc3d::line_annotation::SegmentInterpolationGoal goal,
+    bool goalsCommitted)
 {
     if (session.taskState == LineAnnotationSession::TaskState::Running) {
         showError(tr("Line optimization is already running."),
@@ -11815,7 +11830,9 @@ bool LineAnnotationController::applySegmentInterpolationGoals(
     if (!ensureDatasetForSession(session))
         return false;
 
-    session.controlPointsBeforeModeChange = session.controlPoints;
+    if (!goalsCommitted) {
+        session.controlPointsBeforeModeChange = session.controlPoints;
+    }
     session.optimizedLineBeforeModeChange = session.optimizedLine;
     session.branchesBeforeModeChange = session.branches;
     for (const size_t owner : changed) {
@@ -11827,6 +11844,12 @@ bool LineAnnotationController::applySegmentInterpolationGoals(
             metadata->message = "lasagna";
         }
         metadata->interpGoal = goal;
+    }
+    if (goalsCommitted) {
+        // The tag that made these spans gaps is saved and mirrored into the
+        // other panes together with this goal: a failed solve must restore
+        // the geometry, not the goal, or the panes and the file disagree.
+        session.controlPointsBeforeModeChange = session.controlPoints;
     }
     // A dirty-span solve certifies the rest of the interior as it stands:
     // only from an optimized interior with nothing owed. Otherwise (an

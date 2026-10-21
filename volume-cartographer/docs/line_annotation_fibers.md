@@ -257,10 +257,13 @@ session is marked Unoptimized and, in Auto-reoptimize mode, its tails are
 re-traced (a tails-only solve, or a whole-line one when work was already
 queued); in manual mode the next reoptimization or the save/close
 finalization applies it. Changing either menu distance marks the session
-Unoptimized, requests a whole-line solve (started at once in Auto-reoptimize
-mode, queued otherwise) and invalidates an armed collapse/mode rollback
-snapshot (a later restore lands Unoptimized rather than as the snapshot's
-state). The same fiber open
+Unoptimized and starts a whole-line solve in Auto-reoptimize mode (in manual
+mode the change waits for the next reoptimization or save/close; a change
+made while a solve runs queues a whole-line pass behind it), and invalidates
+an armed collapse/mode rollback snapshot (a later restore lands Unoptimized
+rather than as the snapshot's state). A gap goal that follows a committed
+break tag survives a failed solve (only the geometry is rolled back), so the
+panes and the file keep agreeing on it. The same fiber open
 in another pane receives the tag together with the span tags and the gap goal
 policy, so a save from that pane cannot regress a goal; that pane starts no
 new solve of its own but is marked Unoptimized (save/close finalizes it) and
@@ -846,8 +849,9 @@ continuation direction. Each retained fallback emits a terminal warning
 containing `side`, the full `reason`, `trace_points`, and `source`
 (`trace_result` or `exception`). Completed length-based tails and accepted
 data-edge truncation do not emit this warning. A side whose end control is a
-lone break or a kollesis termination is neither traced nor grown: it is a
-straight ray of the break extrapolation distance (`Break extrapolation` menu
+lone break or a kollesis termination publishes a straight ray of the break
+extrapolation distance in place of whatever tail the solver grew, and the
+tracer is never called for it (`Break extrapolation` menu
 row, `lineAnnotation/break_extrapolation_distance_vx`, default 400, clamped to
 100..1000000 everywhere it is read), in every global mode. A single control
 whose both sides are rays traces nothing and needs no inference inputs (nor

@@ -7272,6 +7272,7 @@ TEST_CASE("Fiber mode single control: tags switch both tails between rays and or
         const auto plain = optimizeFiberWithNativeFallback(request);
         CHECK(calls == 2);
         CHECK(plain.nativeExtrapolations == 2);
+        checkControlsNameTheirVertices(plain);
         tagControl(request.controlPoints.front(), kBreakTag);
         calls = 0;
         const auto result = optimizeFiberWithNativeFallback(request);
@@ -7347,6 +7348,7 @@ TEST_CASE("Model-only fiber: rays replace the model's tails and cancellation is 
         CHECK(traces == 0);
         CHECK(result.rayExtrapolations == 2);
         REQUIRE(result.optimization.line.points.size() == 7);
+        checkControlsNameTheirVertices(result);
         CHECK(result.controlPoints.front().optimizedIndex == 3);
         CHECK(result.optimization.line.points.front().position == cv::Vec3d(7, 20, 30));
         CHECK(result.optimization.line.points.back().position == cv::Vec3d(13, 20, 30));
@@ -7394,8 +7396,9 @@ TEST_CASE("Model-only fiber: rays replace the model's tails and cancellation is 
             };
             CHECK_THROWS_AS(optimizeFiberWithNativeFallback(request), vc::lasagna::LineOptimizationCancelled);
             CHECK(builds == 1);
-            // A trace that sets the flag: the ray on the other side and the
-            // rebuild never happen.
+            // A trace that sets the flag: the line rebuild and the model
+            // reconstruction never happen (the rays were built before the
+            // traces; nothing is published).
             cancel.store(false);
             auto request2 = baseRequest(builds, traces);
             if (twoControls) {
@@ -7456,8 +7459,9 @@ TEST_CASE("Empty dirty set re-traces only the tails")
         request.controlPoints[i].segmentToNext->message = "cspline";
     }
     // The first span is an explicit model trace whose fake bends the line
-    // off the straight spline reconstruction: a re-solve of the interior
-    // would call the fake again and straighten it.
+    // off any spline reconstruction: a re-solve of the interior would call
+    // the fake again (the call counter catches it) and a spline would lose
+    // the bend.
     request.controlPoints[0].segmentToNext->interpGoal = SegmentInterpolationGoal::Trace;
     int segmentCalls = 0;
     request.externalSegment = [&segmentCalls](const auto& span) {
@@ -7531,6 +7535,36 @@ TEST_CASE("Empty dirty set re-traces only the tails")
     }
     CHECK(tailLengthPast(tails.optimization.line, b, false) == doctest::Approx(4.0));
     CHECK(tailLengthPast(tails.optimization.line, a, true) == doctest::Approx(8.0));
+}
+
+TEST_CASE("A control's own index wins over a coordinate search on the input line")
+{
+    using namespace vc3d::line_annotation;
+    FiberModeNormalSampler normals;
+    FiberModeOptimizationRequest request;
+    request.baseNormalSampler = &normals;
+    request.globalMode = FiberOptimizationMode::Lasagna;
+    // A head ray that revisits the tail control's coordinate exactly: the
+    // line starts with a copy of (16,0,0), which a coordinate search would
+    // resolve the tail control to.
+    request.linePointsBase = straightLine(-8, 24, 4);
+    request.linePointsBase.front() = cv::Vec3d(16.0, 0.0, 0.0);
+    request.controlPoints = {{2.0, {0.0, 0.0, 0.0}, true, 2}, {6.0, {16.0, 0.0, 0.0}, false, 6}};
+    request.controlPoints.front().segmentToNext.emplace();
+    request.controlPoints.front().segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
+    request.lasagnaConfig.segmentsPerSide = 2;
+    request.lasagnaConfig.segmentLength = 4.0;
+    request.lasagnaConfig.maxIterations = 20;
+    request.lasagnaConfig.printSolverProgress = false;
+    request.extrapolationDistanceBaseVoxels = 8.0;
+    request.dirtySegments = std::vector<size_t>{};
+    const auto result = optimizeFiberWithNativeFallback(request);
+    checkControlsNameTheirVertices(result);
+    CHECK(result.controlPoints.back().volumePoint == cv::Vec3d(16, 0, 0));
+    // Without a usable index the coordinate search resolves the duplicate
+    // and the strict order check rejects the request.
+    request.controlPoints.back().optimizedIndex = -1;
+    CHECK_THROWS_AS(optimizeFiberWithNativeFallback(request), std::runtime_error);
 }
 
 TEST_CASE("Placing beyond a lone end break tags the new control")

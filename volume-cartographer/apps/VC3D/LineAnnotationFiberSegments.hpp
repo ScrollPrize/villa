@@ -404,8 +404,8 @@ enum class NearestTie { First, Last };
 // (negated on the head side, as the tracer does), else the line's own end
 // tangent (endpoint minus its inward neighbour). Ray points take
 // sampledNormal from `sampler` when one is given. Returns the index shift
-// applied to every retained point (newIndex = oldIndex + shift), like
-// replaceOpenTailsWithNative. Throws std::invalid_argument on bad indices
+// applied to every retained point (newIndex = oldIndex + shift), like the
+// solver's replaceOpenTails. Throws std::invalid_argument on bad indices
 // or a line too short to give a tangent.
 int replaceRayTails(vc::lasagna::LineModel& line,
                     int firstControl,
