@@ -492,11 +492,14 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         if (control.hasPendingLinks) {
             style = control.hasSameHvPendingLinks ? sameHvPendingBranchControlPointStyle
                                                   : pendingBranchControlPointStyle;
-            // An unreviewed automatic link: same colours, dashed outline. A
-            // tagged point keeps its tag ring and gets a separate dashed
-            // link ring instead (autoPendingLinkRingStyle below).
-            if (linkedMarkerDashed(true, control.hasAutoPendingLinks) &&
-                !drawsTagRing(control)) {
+            // An unreviewed automatic link: same colours, paler fill, dashed
+            // outline. A tagged point keeps its tag ring and gets a separate
+            // dashed link ring instead (autoPendingLinkRingStyle below).
+            const bool automatic = linkedMarkerDashed(true, control.hasAutoPendingLinks);
+            if (automatic) {
+                style.brushColor.setAlpha(autoPendingFillAlpha(style.brushColor.alpha()));
+            }
+            if (automatic && !drawsTagRing(control)) {
                 style.penStyle = Qt::DashLine;
             }
         } else if (control.hasBranches) {

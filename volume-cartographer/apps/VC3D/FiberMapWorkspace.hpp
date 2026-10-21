@@ -530,6 +530,35 @@ private:
     // "Link A and B" in flight: the menu entry is disabled and a delete
     // refuses, like _deleteInFlight the other way round.
     bool _autoLinkInFlight = false;
+    // A "Link A and B" that had to save an open annotation of one of its
+    // fibers first (phase B moved the fiber generation, so the map it was
+    // clicked on is stale): the request waits for the automatic Update and
+    // runs again by itself from publishRebuild when the rebuilt map draws
+    // both fibers exactly as the click saw them; a rebuilt map that draws
+    // them differently asks for Link again instead, because the click
+    // would then name geometry that no longer exists. Dropped by any other
+    // user action on the map (a click, a tree row, a new Link, a delete, a
+    // layout clear); a pressed Update keeps it, it is the rebuild it waits
+    // for.
+    struct AutoLinkResume {
+        uint64_t subjectId = 0;
+        uint64_t otherId = 0;
+        QPointF scenePos;
+        vc3d::fiber_map::PlacedFiber subject;
+        vc3d::fiber_map::PlacedFiber other;
+    };
+    std::optional<AutoLinkResume> _autoLinkResume;
+    // Bumped by every cancellation: the queued callback a publication hands
+    // the request to carries the token it was queued under and starts
+    // nothing when the token moved (a click between the publication and
+    // the callback must cancel the resume, not only the waiting request).
+    uint64_t _autoLinkResumeToken = 0;
+    void cancelAutoLinkResume();
+    void resumeAutoLinkAfterPublish();
+    // Same drawn geometry: the runs (flags, points, arclengths) and the
+    // control-point positions the locator reads.
+    [[nodiscard]] static bool sameDrawnFiber(const vc3d::fiber_map::PlacedFiber& a,
+                                             const vc3d::fiber_map::PlacedFiber& b);
     // Fibers currently carrying the subtle network emphasis, so the next
     // selection change can restore exactly them.
     std::vector<uint64_t> _networkEmphasized;

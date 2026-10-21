@@ -1,5 +1,7 @@
 #include "FiberOverlayController.hpp"
 
+#include "../LineAnnotationGeneratedViews.hpp"
+
 #include "OverlayBatchItem.hpp"
 
 #include "../volume_viewers/VolumeViewerBase.hpp"
@@ -260,6 +262,11 @@ void FiberOverlayController::collectPrimitives(VolumeViewerBase* viewer,
                 style.brushColor = mark.sameHv ? QColor(255, 140, 0, 175) : QColor(210, 95, 255, 175);
             }
             const QColor linkPen = style.penColor;
+            if (automatic) {
+                // The pale automatic fill (the shared rule), tagged or not.
+                style.brushColor.setAlpha(
+                    vc3d::line_annotation::autoPendingFillAlpha(style.brushColor.alpha()));
+            }
             style.penColor.setAlphaF(style.penColor.alphaF() * opacity);
             style.brushColor.setAlphaF(style.brushColor.alphaF() * opacity);
             style.penWidth = 2.0;

@@ -2224,7 +2224,8 @@ void LineAnnotationController::launchFromViewerAtPoint(CChunkedVolumeViewer* vie
 }
 
 bool LineAnnotationController::prepareForUserFacingLineAnnotationOpen(
-    const std::function<bool()>& stillValid)
+    const std::function<bool()>& stillValid,
+    const std::function<bool(const LineAnnotationSession&)>& only)
 {
     const QPointer<LineAnnotationController> alive(this);
     struct DialogRecord {
@@ -2237,6 +2238,11 @@ bool LineAnnotationController::prepareForUserFacingLineAnnotationOpen(
     dialogs.reserve(_panes.size());
     for (const auto& pane : _panes) {
         if (!pane.dialog) {
+            continue;
+        }
+        // With a filter, a dialog without a session has nothing to decide
+        // on and stays; without one every dialog goes, as before.
+        if (only && (!pane.session || !only(*pane.session))) {
             continue;
         }
         dialogs.push_back({pane.surfaceName, pane.dialog, pane.session});
@@ -3077,8 +3083,10 @@ LineAnnotationController::prepareFiberMapAutoLink(uint64_t fiberIdA,
                _fiberLoadSequence == loadSequence && _state && _state->currentVolume() == volume;
     };
     // D8: dialogs of either fiber are finalized, saved and closed exactly as
-    // opening another fiber does it (this finalizes EVERY dialog session).
-    if (!prepareForUserFacingLineAnnotationOpen(stillValid)) {
+    // opening another fiber does it - but ONLY those: an unrelated dialog
+    // stays open and unsaved, so it neither bumps the fiber generation
+    // (which would make the map stale for nothing) nor loses its place.
+    if (!prepareForUserFacingLineAnnotationOpen(stillValid, isParticipant)) {
         return refuse(tr("Could not finalize the open line annotation."));
     }
     if (!alive) {

@@ -356,6 +356,18 @@ QPen cosmeticPen(const QColor& color, qreal width)
 
 // Dotted, for the gap spans and the break rims: distinct from the
 // interpolated dash by form, from every fiber colour by hue.
+// The pale fill of an automatic pending endpoint (dashed look): the
+// shared autoPendingFillAlpha rule on whatever alpha the dot would have had.
+QColor endpointFill(const QColor& fill, bool automaticDashed)
+{
+    if (!automaticDashed) {
+        return fill;
+    }
+    QColor pale = fill;
+    pale.setAlpha(vc3d::line_annotation::autoPendingFillAlpha(fill.alpha()));
+    return pale;
+}
+
 QPen dashedPen(const QColor& color, qreal width)
 {
     QPen pen = cosmeticPen(color, width);
@@ -1125,6 +1137,9 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
                 if (fiberId == 0 && !errorExtent.isValid()) {
                     return;
                 }
+                // Choosing a row is moving on from a waiting Link (before the
+                // stale gate below, which returns on the map it waits for).
+                cancelAutoLinkResume();
                 // The same gate the scene click and the control-point menu use;
                 // acting on a map whose dependencies moved is showing a wrong
                 // picture, not a late one. Evaluated here and applied on the next
@@ -1628,6 +1643,7 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     _latchedReason.clear();
     // The fibers the message was about are gone with the layout.
     _operationStatus.clear();
+    cancelAutoLinkResume();
     if (_tree) {
         _tree->clear();
     }
@@ -2446,6 +2462,8 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
             selectFiberRow(_highlightedFiber);
         }
     }
+    // A Link that waited for this rebuild (see _autoLinkResume).
+    resumeAutoLinkAfterPublish();
     const qint64 publishMs = publishTimer.elapsed();
     Logger()->info(
         "fiber map rebuild: GUI stalls snapshot {} ms + publish {} ms · "
@@ -2923,6 +2941,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
             // compounds, where the dots overlap, to about the palette's own.
             QColor fill = look.fill;
             fill.setAlpha(kLinkEndpointFillAlpha);
+            fill = endpointFill(fill, autoDashed);
             auto* dot = new ScaledDot(QBrush(fill),
                                       kollesis   ? cosmeticPen(kollesisColor(245), kKollesisRimWidthPx)
                                       : breakTag ? dottedPen(breakColor(245), kKollesisRimWidthPx)
@@ -3075,7 +3094,8 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
                 // would have - selection and deselection then agree.
                 const auto look = endpointLook(fiber.id, static_cast<int>(i));
                 const bool automatic = look && look->anyAuto;
-                auto* dot = new ScaledDot(automatic ? QBrush(look->fill) : fill,
+                auto* dot = new ScaledDot(
+                    automatic ? QBrush(endpointFill(look->fill, look->dashed)) : fill,
                                           kollesis ? rim : breakRim, crossingDotRadius,
                                           kMinCrossingDotPx, kMaxCrossingDotPx,
                                           crossingDotBounds, /*triangle=*/look && look->adjacent);
@@ -3525,13 +3545,16 @@ uint64_t FiberMapWorkspace::fiberAt(const QPointF& scenePos) const
 
 void FiberMapWorkspace::handleSceneClick(const QPointF& scenePos, Qt::KeyboardModifiers modifiers)
 {
+    // Any click on the map is the user moving on from the last operation -
+    // before the stale gate, so a click on the stale map a Link is waiting
+    // to be rebuilt still cancels that Link.
+    cancelAutoLinkResume();
     // A stale map's runtime ids may name different fibers than they did when it
     // was built, so it stops responding until rebuilt.
     if (refreshStaleState()) {
         return;
     }
     const uint64_t fiberId = fiberAt(scenePos);
-    // Any click on the map is the user moving on from the last operation.
     clearOperationStatus();
     std::vector<uint64_t> selection;
     if (modifiers.testFlag(Qt::ShiftModifier)) {
@@ -3932,6 +3955,7 @@ std::optional<FiberMapWorkspace::EndpointLook> FiberMapWorkspace::endpointLook(
 
 void FiberMapWorkspace::setHighlightedFiber(uint64_t fiberId)
 {
+    cancelAutoLinkResume();
     clearOperationStatus();
     setSelectedFibers(fiberId != 0 ? std::vector<uint64_t>{fiberId} : std::vector<uint64_t>{});
 }
@@ -4048,7 +4072,7 @@ void FiberMapWorkspace::drawControlPointDots(uint64_t fiberId)
         }
         if (kollesis || breakTag) {
             if (look && (placedNonSuspectLink || anyAuto)) {
-                fill = QBrush(look->fill);
+                fill = QBrush(endpointFill(look->fill, autoDashed));
             } else {
                 fill = QBrush(Qt::NoBrush);
             }
@@ -4058,7 +4082,7 @@ void FiberMapWorkspace::drawControlPointDots(uint64_t fiberId)
             // An untagged endpoint with an automatic link: the pending
             // palette (fill and outline), dashed only when every pending
             // link is automatic - a mixed point stays solid in the palette.
-            fill = QBrush(look->fill);
+            fill = QBrush(endpointFill(look->fill, autoDashed));
             rim = autoDashed ? dashedPen(look->pen, 1.0) : cosmeticPen(look->pen, 1.0);
         }
         auto* dot = new ScaledDot(fill, rim,
@@ -4270,14 +4294,96 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
     menu.exec(globalPos);
 }
 
+bool FiberMapWorkspace::sameDrawnFiber(const vc3d::fiber_map::PlacedFiber& a,
+                                       const vc3d::fiber_map::PlacedFiber& b)
+{
+    if (a.id != b.id || a.fileName != b.fileName || a.runs.size() != b.runs.size() ||
+        a.controlPoints != b.controlPoints) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.runs.size(); ++i) {
+        const vc3d::fiber_map::Run& ra = a.runs[i];
+        const vc3d::fiber_map::Run& rb = b.runs[i];
+        if (ra.traced != rb.traced || ra.gap != rb.gap || ra.damaged != rb.damaged ||
+            ra.firstControl != rb.firstControl || ra.lastControl != rb.lastControl ||
+            ra.points != rb.points || ra.arclengths != rb.arclengths) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void FiberMapWorkspace::resumeAutoLinkAfterPublish()
+{
+    if (!_autoLinkResume || !_layoutBuilt || !_controller || _autoLinkInFlight ||
+        _deleteInFlight) {
+        return;
+    }
+    // Only a layout that is fresh against the dependencies of this moment
+    // can be linked on: a publication that landed inside phase B followed by
+    // another change (the umbilicus file, a setting) leaves _entries stale
+    // while the next automatic Update is still to come. The request stays
+    // and this runs again from that publication.
+    const vc3d::fiber_map::FiberMapDependencies dependencies = layoutDependencies();
+    if (vc3d::fiber_map::staleVerdictFor(dependencies, currentDependencies(),
+                                         /*layoutBuilt=*/true, QString())
+            .action != StaleVerdict::Action::Fresh) {
+        return;
+    }
+    const AutoLinkResume resume = std::move(*_autoLinkResume);
+    _autoLinkResume.reset();
+    const auto subject = _entries.constFind(resume.subjectId);
+    const auto other = _entries.constFind(resume.otherId);
+    if (subject == _entries.constEnd() || other == _entries.constEnd() ||
+        !sameDrawnFiber(subject->fiber, resume.subject) ||
+        !sameDrawnFiber(other->fiber, resume.other)) {
+        // The saved work moved one of the fibers on the map: the click no
+        // longer names a meeting on it.
+        setOperationStatus(tr("Saved the open line annotation; the rebuilt map draws the "
+                              "fibers differently — choose Link again"));
+        Logger()->warn("Fiber map auto-link: the rebuilt map draws the fibers differently; "
+                       "not resumed");
+        return;
+    }
+    // Deferred exactly like the menu's trigger, against the dependencies the
+    // published layout was built from (phase A's capture): the resumed
+    // start re-verifies them against the current ones first.
+    const QPointer<FiberMapWorkspace> self(this);
+    const uint64_t token = _autoLinkResumeToken;
+    QMetaObject::invokeMethod(
+        this,
+        [self, resume, dependencies, token]() {
+            if (!self || self->_autoLinkResumeToken != token) {
+                // Cancelled between the publication and this callback.
+                return;
+            }
+            Logger()->info("Fiber map auto-link: resumed after the map update");
+            self->startAutoLink(resume.subjectId, resume.otherId, resume.scenePos, dependencies);
+        },
+        Qt::QueuedConnection);
+}
+
+void FiberMapWorkspace::cancelAutoLinkResume()
+{
+    const bool waiting = _autoLinkResume.has_value();
+    _autoLinkResume.reset();
+    ++_autoLinkResumeToken;
+    if (waiting) {
+        // The line promised the link would continue by itself; it will not.
+        clearOperationStatus();
+    }
+}
+
 void FiberMapWorkspace::startAutoLink(uint64_t subjectId, uint64_t otherId, QPointF scenePos,
                                       const vc3d::fiber_map::FiberMapDependencies& menuDependencies)
 {
     // Three phases on one queued callback, every one guarded:
     //  B. the controller finalizes, saves and closes every live session of
-    //     the two fibers and drains the saves; if that moved the fiber
-    //     generation the map is stale and the automatic Update is armed -
-    //     the user chooses Link again on the rebuilt map (the pair stays
+    //     the two fibers (only those) and drains the saves; if that moved
+    //     the fiber generation the map is stale and the automatic Update is
+    //     armed - the request is kept (_autoLinkResume) and run again from
+    //     publishRebuild when the rebuilt map draws both fibers as the click
+    //     saw them, else the user chooses Link again (the pair stays
     //     selected);
     //  C. the meeting of the two DRAWN fibers nearest the click, inverted
     //     exactly to a position on each fiber's stored line points;
@@ -4288,8 +4394,13 @@ void FiberMapWorkspace::startAutoLink(uint64_t subjectId, uint64_t otherId, QPoi
     if (!_controller || _autoLinkInFlight || _deleteInFlight) {
         return;
     }
-    // A new attempt supersedes the last one's message.
+    // A new attempt supersedes the last one's message and any waiting resume.
+    cancelAutoLinkResume();
     clearOperationStatus();
+    // The request's token: a click or a row chosen inside phase B's drains
+    // bumps it, and that is this request cancelled - nothing is stored or
+    // continued after preparation then.
+    const uint64_t requestToken = _autoLinkResumeToken;
     const QPointer<FiberMapWorkspace> self(this);
     const QPointer<LineAnnotationController> controller(_controller);
     const auto fresh = [self, menuDependencies]() {
@@ -4329,6 +4440,10 @@ void FiberMapWorkspace::startAutoLink(uint64_t subjectId, uint64_t otherId, QPoi
         markStale(tr("Fibers changed — press Update"));
         return;
     }
+    // The geometry the click was made on, by value, before phase B's yields
+    // (a publication can land inside them): what a resume compares against.
+    const vc3d::fiber_map::PlacedFiber subjectAtClick = _entries.constFind(subjectId)->fiber;
+    const vc3d::fiber_map::PlacedFiber otherAtClick = _entries.constFind(otherId)->fiber;
     _autoLinkInFlight = true;
     QGuiApplication::setOverrideCursor(Qt::WaitCursor);
     // Whatever path leaves this function, the flag and the cursor are
@@ -4359,12 +4474,40 @@ void FiberMapWorkspace::startAutoLink(uint64_t subjectId, uint64_t otherId, QPoi
         bail(prepared.message);
         return;
     }
-    if (!fresh()) {
-        // A session had unsaved work: the map must be rebuilt before a
-        // meeting can be located on it. The automatic Update is already
-        // armed by the generation bump; the selection restore keeps the pair.
-        bail(tr("Saved the open line annotation; the map is updating — choose Link again"));
+    if (_autoLinkResumeToken != requestToken) {
+        bail(tr("The link was cancelled by the click on the map"));
         refreshStaleState();
+        return;
+    }
+    if (!fresh()) {
+        // A session of one of the fibers was saved: the map must be rebuilt
+        // before a meeting can be located on it. The automatic Update is
+        // already armed by the generation bump and the selection restore
+        // keeps the pair; the request itself waits for the publication
+        // (resumeAutoLinkAfterPublish), which runs it again when both
+        // fibers still draw as they did under the click. A publication
+        // that already landed inside phase B's yields is taken up now.
+        _autoLinkResume = AutoLinkResume{subjectId, otherId, scenePos, subjectAtClick, otherAtClick};
+        bail(tr("Saved the open line annotation; the map is updating and the link continues by itself"));
+        refreshStaleState();
+        if (!self) {
+            return;
+        }
+        if (_layoutBuilt &&
+            vc3d::fiber_map::staleVerdictFor(layoutDependencies(), currentDependencies(),
+                                             /*layoutBuilt=*/true, QString())
+                    .action == StaleVerdict::Action::Fresh) {
+            // Queued: this operation is still in flight here (the scope guard
+            // releases _autoLinkInFlight on return), and the helper refuses
+            // while it is.
+            QMetaObject::invokeMethod(
+                this, [self]() {
+                    if (self) {
+                        self->resumeAutoLinkAfterPublish();
+                    }
+                },
+                Qt::QueuedConnection);
+        }
         return;
     }
 
@@ -4541,6 +4684,7 @@ void FiberMapWorkspace::confirmAndDeleteFiber(
         return;
     }
     _deleteInFlight = true;
+    cancelAutoLinkResume();
     clearOperationStatus();
     // The confirmation is modeless (open(), not exec()): a nested loop with a
     // parented dialog would be undefined if the workspace were torn down

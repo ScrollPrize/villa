@@ -1889,6 +1889,16 @@ inline bool linkedMarkerDashed(bool drawsPending, bool autoPending)
     return drawsPending && autoPending;
 }
 
+// The fill of an automatic pending marker (every point linkedMarkerDashed
+// says yes to, tagged or not) is thinned to two fifths of the pending
+// palette's fill alpha: on a small marker the dashed outline alone does not
+// tell it from a human-made pending link at a glance, the paler fill does.
+// Shared by every renderer so the two looks agree everywhere.
+[[nodiscard]] inline int autoPendingFillAlpha(int pendingFillAlpha)
+{
+    return (pendingFillAlpha * 2) / 5;
+}
+
 // The kollesis-termination ring colour: the ordinary control-point yellow.
 // The tag is told apart by form, not hue: a tagged point draws as a hollow
 // yellow ring (a linked one keeps its link-state fill inside the ring).

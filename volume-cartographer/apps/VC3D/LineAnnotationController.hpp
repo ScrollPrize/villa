@@ -732,7 +732,13 @@ private:
     void cleanupSurfaceName(const std::string& surfaceName);
     // stillValid (optional): forwarded to each session's finalization and
     // checked after each save (both can yield); false makes it return false.
-    bool prepareForUserFacingLineAnnotationOpen(const std::function<bool()>& stillValid = {});
+    // only (optional): finalizes, saves and closes just the dialogs whose
+    // session satisfies it (the Fiber Map's auto-link: the two fibers being
+    // linked), leaving every other dialog open and unsaved; unset walks
+    // every dialog, as opening another fiber does.
+    bool prepareForUserFacingLineAnnotationOpen(
+        const std::function<bool()>& stillValid = {},
+        const std::function<bool(const LineAnnotationSession&)>& only = {});
     bool launchSession(SourceKind sourceKind,
                        const std::string& surfaceName,
                        std::shared_ptr<Surface> sourceSurface,

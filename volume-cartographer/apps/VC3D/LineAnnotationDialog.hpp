@@ -96,6 +96,11 @@ public:
         // pending point gets next to its tag ring.
         QGraphicsPathItem* autoPendingBranchControlPoints = nullptr;
         QGraphicsPathItem* sameHvAutoPendingBranchControlPoints = nullptr;
+        // The TAGGED automatic pending point's marker: the pale fill under
+        // its tag ring with the pending outline solid (the tag ring covers
+        // it), beside the separate dashed link ring below.
+        QGraphicsPathItem* autoPendingTaggedBranchControlPoints = nullptr;
+        QGraphicsPathItem* sameHvAutoPendingTaggedBranchControlPoints = nullptr;
         QGraphicsPathItem* autoPendingLinkRings = nullptr;
         QGraphicsPathItem* sameHvAutoPendingLinkRings = nullptr;
         // Hollow yellow rings of kollesis-tagged points, drawn over whichever

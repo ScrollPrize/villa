@@ -301,10 +301,13 @@ With two fibers selected, Ctrl+right-click on either of them (its line or one
 of its dots) adds **Link <this> and <other>** to the menu, above Delete. It:
 
 1. finalizes, saves and closes any open Line Annotation of either fiber (what
-   opening another fiber does), and every dialog-less session of them (the
-   intersection inspection included), saving each first. If that saved
-   something the map is stale; it updates by itself and the status line asks
-   you to choose Link again on the rebuilt map (the pair stays selected);
+   opening another fiber does; annotations of other fibers stay open), and
+   every dialog-less session of them (the intersection inspection included),
+   saving each first. If that saved something the map is stale: it updates
+   by itself and the link continues on the rebuilt map without a second
+   gesture, as long as both fibers still draw where the click saw them. If
+   the saved work moved one of them on the map, the status line asks you to
+   choose Link again (the pair stays selected);
 2. finds where the two fibers meet on the map: the drawn crossing nearest the
    click, or, when the drawn lines never cross, their closest approach if it
    is within 1 mm on the map (otherwise the link is refused). That point is
@@ -331,10 +334,10 @@ the link is withdrawn from the loaded fibers (every copy, including an edit's
 synced moves of its endpoints during the wait) and the status line says so.
 
 A pending automatic link is an ordinary pending link whose control-point
-markers draw with a DASHED outline in the pending colours (blue, or the orange
-same-H/V warning palette) everywhere a linked point is drawn: the cut views and
-strips (both renderers), the overview bar, the slice-view rings and the Fiber
-Map dots. A tagged point (kollesis termination, break) keeps its tag ring and
+markers draw with a DASHED outline and a paler (more transparent) fill in the
+pending colours (blue, or the orange same-H/V warning palette) everywhere a
+linked point is drawn: the cut views and strips (both renderers), the overview
+bar, the slice-view rings and the Fiber Map dots. A tagged point (kollesis termination, break) keeps its tag ring and
 gets a separate dashed ring just outside it. The rule for a point carrying
 several links: dashed only when every pending link on it is automatic; a
 human-made pending link outranks. The control-point menu's approve entry reads

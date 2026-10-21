@@ -640,7 +640,11 @@ protected:
                 continue;
             }
             const qreal x = xForFraction(dot.fraction);
-            QPen edgePen = dot.edge ? QPen(*dot.edge, 1.5) : QPen(dot.color.darker(150), 1.0);
+            // The default edge is the fill's darker shade at full opacity:
+            // an automatic pending dot's pale fill keeps a legible outline.
+            QColor edgeBase = dot.color;
+            edgeBase.setAlpha(255);
+            QPen edgePen = dot.edge ? QPen(*dot.edge, 1.5) : QPen(edgeBase.darker(150), 1.0);
             if (dot.dottedEdge) {
                 edgePen.setStyle(Qt::DotLine);
             } else if (dot.dashedEdge) {
@@ -5411,6 +5415,8 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         !_fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints ||
         !_fastCurrentCutOverlayItems.autoPendingBranchControlPoints ||
         !_fastCurrentCutOverlayItems.sameHvAutoPendingBranchControlPoints ||
+        !_fastCurrentCutOverlayItems.autoPendingTaggedBranchControlPoints ||
+        !_fastCurrentCutOverlayItems.sameHvAutoPendingTaggedBranchControlPoints ||
         !_fastCurrentCutOverlayItems.autoPendingLinkRings ||
         !_fastCurrentCutOverlayItems.sameHvAutoPendingLinkRings ||
         !_fastCurrentCutOverlayItems.kollesisRings ||
@@ -5506,13 +5512,38 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             item->setBrush(brush);
             item->setZValue(z);
         };
+        // The pale automatic fill (autoPendingFillAlpha, the shared rule).
+        QColor autoPendingFill = pendingBranchControlBrush.color();
+        autoPendingFill.setAlpha(
+            vc3d::line_annotation::autoPendingFillAlpha(autoPendingFill.alpha()));
+        const QBrush autoPendingBranchControlBrush(autoPendingFill);
+        QColor sameHvAutoPendingFill = sameHvPendingBranchControlBrush.color();
+        sameHvAutoPendingFill.setAlpha(
+            vc3d::line_annotation::autoPendingFillAlpha(sameHvAutoPendingFill.alpha()));
+        const QBrush sameHvAutoPendingBranchControlBrush(sameHvAutoPendingFill);
         _fastCurrentCutOverlayItems.autoPendingBranchControlPoints = new QGraphicsPathItem();
         makeDashed(_fastCurrentCutOverlayItems.autoPendingBranchControlPoints,
-                   pendingBranchControlPen, pendingBranchControlBrush, 162.51);
+                   pendingBranchControlPen, autoPendingBranchControlBrush, 162.51);
         _fastCurrentCutOverlayItems.sameHvAutoPendingBranchControlPoints =
             new QGraphicsPathItem();
         makeDashed(_fastCurrentCutOverlayItems.sameHvAutoPendingBranchControlPoints,
-                   sameHvPendingBranchControlPen, sameHvPendingBranchControlBrush, 162.51);
+                   sameHvPendingBranchControlPen, sameHvAutoPendingBranchControlBrush, 162.51);
+        // Tagged automatic points: the same pale fill with the solid pending
+        // outline (the tag ring above replaces it), as the shared renderer.
+        _fastCurrentCutOverlayItems.autoPendingTaggedBranchControlPoints =
+            new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.autoPendingTaggedBranchControlPoints->setPen(
+            pendingBranchControlPen);
+        _fastCurrentCutOverlayItems.autoPendingTaggedBranchControlPoints->setBrush(
+            autoPendingBranchControlBrush);
+        _fastCurrentCutOverlayItems.autoPendingTaggedBranchControlPoints->setZValue(162.5);
+        _fastCurrentCutOverlayItems.sameHvAutoPendingTaggedBranchControlPoints =
+            new QGraphicsPathItem();
+        _fastCurrentCutOverlayItems.sameHvAutoPendingTaggedBranchControlPoints->setPen(
+            sameHvPendingBranchControlPen);
+        _fastCurrentCutOverlayItems.sameHvAutoPendingTaggedBranchControlPoints->setBrush(
+            sameHvAutoPendingBranchControlBrush);
+        _fastCurrentCutOverlayItems.sameHvAutoPendingTaggedBranchControlPoints->setZValue(162.5);
         _fastCurrentCutOverlayItems.autoPendingLinkRings = new QGraphicsPathItem();
         makeDashed(_fastCurrentCutOverlayItems.autoPendingLinkRings,
                    pendingBranchControlPen, QBrush(Qt::NoBrush), 162.8);
@@ -5607,6 +5638,8 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints,
             _fastCurrentCutOverlayItems.autoPendingBranchControlPoints,
             _fastCurrentCutOverlayItems.sameHvAutoPendingBranchControlPoints,
+            _fastCurrentCutOverlayItems.autoPendingTaggedBranchControlPoints,
+            _fastCurrentCutOverlayItems.sameHvAutoPendingTaggedBranchControlPoints,
             _fastCurrentCutOverlayItems.autoPendingLinkRings,
             _fastCurrentCutOverlayItems.sameHvAutoPendingLinkRings,
             _fastCurrentCutOverlayItems.kollesisRings,
@@ -5671,6 +5704,8 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     QPainterPath sameHvPendingBranchControlPath;
     QPainterPath autoPendingBranchControlPath;
     QPainterPath sameHvAutoPendingBranchControlPath;
+    QPainterPath autoPendingTaggedBranchControlPath;
+    QPainterPath sameHvAutoPendingTaggedBranchControlPath;
     QPainterPath autoPendingLinkRingPath;
     QPainterPath sameHvAutoPendingLinkRingPath;
     QPainterPath kollesisRingPath;
@@ -5757,6 +5792,10 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             if (dashed && !tagged) {
                 addLinkedMarker(control.hasSameHvPendingLinks ? sameHvAutoPendingBranchControlPath
                                                               : autoPendingBranchControlPath);
+            } else if (dashed) {
+                addLinkedMarker(control.hasSameHvPendingLinks
+                                    ? sameHvAutoPendingTaggedBranchControlPath
+                                    : autoPendingTaggedBranchControlPath);
             } else {
                 addLinkedMarker(control.hasSameHvPendingLinks ? sameHvPendingBranchControlPath
                                                               : pendingBranchControlPath);
@@ -5779,6 +5818,10 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         autoPendingBranchControlPath);
     _fastCurrentCutOverlayItems.sameHvAutoPendingBranchControlPoints->setPath(
         sameHvAutoPendingBranchControlPath);
+    _fastCurrentCutOverlayItems.autoPendingTaggedBranchControlPoints->setPath(
+        autoPendingTaggedBranchControlPath);
+    _fastCurrentCutOverlayItems.sameHvAutoPendingTaggedBranchControlPoints->setPath(
+        sameHvAutoPendingTaggedBranchControlPath);
     _fastCurrentCutOverlayItems.autoPendingLinkRings->setPath(autoPendingLinkRingPath);
     _fastCurrentCutOverlayItems.sameHvAutoPendingLinkRings->setPath(
         sameHvAutoPendingLinkRingPath);
@@ -6812,6 +6855,11 @@ void LineAnnotationDialog::rebuildOverviewBarLayout()
         const bool autoPending = !control.isLinkCandidate && control.hasPendingLinks &&
             vc3d::line_annotation::linkedMarkerDashed(true, control.hasAutoPendingLinks);
         const QColor pendingColor = dot.color;
+        if (autoPending) {
+            // The pale automatic fill (the shared rule); the edge and the
+            // separate ring keep the full pending colour.
+            dot.color.setAlpha(vc3d::line_annotation::autoPendingFillAlpha(255));
+        }
         if (autoPending && !(control.isKollesisTermination || control.isBreak)) {
             dot.dashedEdge = true;
         }
