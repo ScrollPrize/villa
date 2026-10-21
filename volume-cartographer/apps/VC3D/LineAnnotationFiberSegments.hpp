@@ -389,8 +389,22 @@ struct FiberModeOptimizationRequest {
     // Ordinary line annotation retains open geometry outside the controls.
     // Spiral 2D annotation uses the controls as inclusive bounds.
     bool retainOpenTails = true;
+    // CT + model session: no Lasagna initialization, normal field or fallback.
+    // The builder supplies measured model/CT normals after geometry is complete.
+    std::function<vc::lasagna::LineModel(const std::vector<cv::Vec3d>&)> modelLineBuilder;
     std::function<void(const FiberExtrapolationFallbackDiagnostic&)>
         extrapolationFallbackCallback;
+    // Optional tracing backend replacing the native prediction-field tracer
+    // (predictions + traceNormalSampler) for open-tail extrapolation and Trace
+    // spans, with the native result types, in trace coordinates. Line
+    // Annotation's fiber-follow model sets both. history: the current line in
+    // travel order, ending at the trace start; direction: outward.
+    std::function<vc::fiber_tracer::FiberTraceOneWayResult(
+        const std::vector<cv::Vec3d>& history, const cv::Vec3d& direction, double distance)>
+        externalExtrapolation;
+    std::function<vc::fiber_tracer::FiberTraceSegmentResult(
+        const vc::fiber_tracer::FiberTraceSegmentRequest& request)>
+        externalSegment;
     // Cooperative cancellation (see LineOptimizationConfig::cancelFlag):
     // when set and it becomes true, optimizeFiberWithNativeFallback throws
     // vc::lasagna::LineOptimizationCancelled at the next checkpoint instead

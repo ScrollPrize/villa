@@ -63,6 +63,7 @@ enum class GeneratedControlPointContextResult {
     None,
     Handled,
     NewLineAnnotationRequested,
+    NewModelLineAnnotationRequested,
 };
 
 enum class GeneratedCurrentLineMarkerState {

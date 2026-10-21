@@ -2,6 +2,8 @@
 #include <doctest/doctest.h>
 
 #include "CState.hpp"
+#include "vc/core/types/Volume.hpp"
+#include <QTemporaryDir>
 #include "FiberSliceGeometry.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberNaming.hpp"
@@ -1456,7 +1458,15 @@ TEST_CASE("Ribbons retain ordinary QuadSurface rendering and picking after origi
 
 TEST_CASE("focus bounds state distinguishes configured and active bounds")
 {
+    QTemporaryDir directory;
+    REQUIRE(directory.isValid());
+    Volume::ZarrCreateOptions options;
+    options.shapeZYX = {64, 64, 64};
+    options.compressor = "none";
+    auto volume = Volume::New(directory.path().toStdString(), options);
+    REQUIRE(volume);
     CState state;
+    state.setCurrentVolume(volume);
     int changes = 0;
     QObject::connect(&state, &CState::focusBoundsChanged, [&changes]() {
         ++changes;
@@ -1487,6 +1497,21 @@ TEST_CASE("focus bounds state distinguishes configured and active bounds")
     CHECK(changes == 3);
     state.clearFocusBounds();
     CHECK(changes == 3);
+}
+
+TEST_CASE("focus bounds require a volume coordinate frame")
+{
+    CState state;
+    int changes = 0;
+    QObject::connect(&state, &CState::focusBoundsChanged, [&changes]() {
+        ++changes;
+    });
+    const auto revision = state.focusBoundsRevision();
+    state.setFocusBounds({{10.0f, 15.0f, 25.0f}, {20.0f, 30.0f, 40.0f}});
+    CHECK_FALSE(state.focusBounds());
+    CHECK_FALSE(state.activeFocusBounds());
+    CHECK(state.focusBoundsRevision() == revision);
+    CHECK(changes == 0);
 }
 
 TEST_CASE("focus bounds trim only open line tails and rebase indices")
@@ -5062,6 +5087,14 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     strictRoot["optimization_mode"] = "native_fiber_trace3d";
     strictRoot["line_points"] = {{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}};
     CHECK_NOTHROW(vc::fiber_tracer::parseVc3dFiberJson(strictRoot, "test fiber"));
+    strictRoot["uuid"] = vc::util::newUuid();
+    CHECK(vc::fiber_tracer::parseVc3dFiberJson(strictRoot, "test fiber").uuid ==
+          strictRoot.at("uuid").get<std::string>());
+    auto invalidUuid = strictRoot;
+    invalidUuid["uuid"] = "fiber_filename";
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::parseVc3dFiberJson(invalidUuid, "test fiber"),
+        std::runtime_error);
     auto missingMode = strictRoot;
     missingMode.erase("optimization_mode");
     CHECK_THROWS_AS(
@@ -5428,6 +5461,115 @@ TEST_CASE("fiber mode truncates extrapolation at an invalid prediction edge")
     const auto& points = result.optimization.line.points;
     CHECK(points.front().position[0] == doctest::Approx(-8.0));
     CHECK(points.back().position[0] == doctest::Approx(4.0));
+}
+
+TEST_CASE("fiber follow grows outward from both ends using only the annotated history")
+{
+    FiberModeNormalSampler normals;
+    for (const bool singleControl : {true, false}) {
+        vc3d::line_annotation::FiberModeOptimizationRequest request;
+        request.controlPoints = {{2.0, {0.0, 0.0, 0.0}, true, 2}};
+        request.controlPoints.front().direction = cv::Vec3d{1.0, 0.0, 0.0};
+        if (!singleControl) {
+            request.controlPoints.push_back({6.0, {16.0, 0.0, 0.0}, false, 6});
+            request.controlPoints.back().direction = cv::Vec3d{1.0, 0.0, 0.0};
+            request.controlPoints.front().segmentToNext.emplace();
+            request.controlPoints.front().segmentToNext->interpGoal =
+                vc3d::line_annotation::SegmentInterpolationGoal::Cspline;
+        }
+        for (int x = -8; x <= 24; x += 4)
+            request.linePointsBase.push_back({double(x), 0.0, 0.0});
+        request.baseNormalSampler = &normals;
+        request.extrapolationDistanceBaseVoxels = 8.0;
+        request.traceToBaseScale = 2.0;
+        request.lasagnaConfig.segmentsPerSide = 2;
+        request.lasagnaConfig.segmentLength = 4.0;
+        request.lasagnaConfig.maxIterations = 20;
+        request.lasagnaConfig.printSolverProgress = false;
+        int calls = 0;
+        request.externalExtrapolation = [&](const auto& history, const auto& direction, double distance) {
+            const bool left = calls++ == 0;
+            REQUIRE(!history.empty());
+            CHECK(distance == doctest::Approx(4.0));
+            CHECK(direction[0] == doctest::Approx(left ? -1.0 : 1.0));
+            CHECK(history.back()[0] == doctest::Approx(left || singleControl ? 0.0 : 8.0));
+            if (singleControl) {
+                CHECK(history.size() == 1);
+            } else {
+                REQUIRE(history.size() > 2);
+                CHECK(history.front()[0] == doctest::Approx(left ? 8.0 : 0.0));
+                for (size_t i = 1; i < history.size(); ++i) {
+                    CHECK((history[i] - history[i-1]).dot(direction) > 0.0);
+                    CHECK(history[i][0] >= -1.0e-8);
+                    CHECK(history[i][0] <= 8.0 + 1.0e-8);
+                }
+            }
+            vc::fiber_tracer::FiberTraceOneWayResult result;
+            result.points = {history.back(), history.back() + direction * distance};
+            result.reachedTraceLength = true;
+            result.reason = "fiber_follow: max_len";
+            return result;
+        };
+        const auto result = vc3d::line_annotation::optimizeFiberWithNativeFallback(std::move(request));
+        CHECK(calls == 2);
+        CHECK(result.nativeExtrapolations == 2);
+        CHECK(result.optimization.line.points.front().position[0] == doctest::Approx(-8.0));
+        CHECK(result.optimization.line.points.back().position[0] == doctest::Approx(singleControl ? 8.0 : 24.0));
+    }
+}
+
+TEST_CASE("fiber follow span history retains interior points and excludes the open tail")
+{
+    FiberModeNormalSampler normals;
+    vc3d::line_annotation::FiberModeOptimizationRequest request;
+    for (int x = -8; x <= 40; x += 4)
+        request.linePointsBase.push_back({double(x), 0.0, 0.0});
+    request.controlPoints = {{2.0, {0.0, 0.0, 0.0}, true, 2},
+                             {6.0, {16.0, 0.0, 0.0}, false, 6},
+                             {10.0, {32.0, 0.0, 0.0}, false, 10}};
+    for (size_t i = 0; i < 2; ++i) {
+        request.controlPoints[i].segmentToNext.emplace();
+        request.controlPoints[i].segmentToNext->interpGoal = vc3d::line_annotation::SegmentInterpolationGoal::Trace;
+        request.controlPoints[i].direction = cv::Vec3d{1.0, 0.0, 0.0};
+    }
+    request.baseNormalSampler = &normals;
+    request.extrapolationDistanceBaseVoxels = 0.0;
+    request.lasagnaConfig.segmentLength = 4.0;
+    request.lasagnaConfig.maxIterations = 20;
+    request.lasagnaConfig.printSolverProgress = false;
+    bool singleSpan = false;
+    SUBCASE("continue outward using the interior span as history") {}
+    SUBCASE("first new control before the seed") {
+        singleSpan = true;
+        request.controlPoints.resize(2);
+        request.controlPoints[0].isSeed = false;
+        request.controlPoints[1].isSeed = true;
+    }
+    int calls = 0;
+    request.externalSegment = [&](const auto& span) {
+        const bool reverse = calls == 0;
+        const double end = singleSpan ? 16.0 : 32.0;
+        CHECK(span.referenceLine.front()[0] == doctest::Approx(reverse ? end : 0.0));
+        CHECK(span.startIndex == (singleSpan ? 0 : 4));
+        CHECK(span.targetIndex == (singleSpan ? 4 : 8));
+        REQUIRE(span.startDirection);
+        CHECK((*span.startDirection)[0] == doctest::Approx(reverse ? -1.0 : 1.0));
+        for (size_t i = 0; i <= span.startIndex; ++i)
+            CHECK(span.referenceLine[i][0] == doctest::Approx(reverse ? end - double(i * 4) : double(i * 4)));
+        ++calls;
+        vc::fiber_tracer::FiberTraceSegmentResult result;
+        result.accepted = true;
+        result.fusedLine.assign(span.referenceLine.begin() + span.startIndex,
+                                span.referenceLine.begin() + span.targetIndex + 1);
+        return result;
+    };
+    const auto result = vc3d::line_annotation::optimizeFiberWithNativeFallback(std::move(request));
+    CHECK(calls == (singleSpan ? 1 : 2));
+    CHECK(result.nativeSegments == (singleSpan ? 1 : 2));
+    CHECK(result.optimization.line.points.front().position[0] == doctest::Approx(0.0));
+    CHECK(result.optimization.line.points.back().position[0] == doctest::Approx(singleSpan ? 16.0 : 32.0));
+    for (size_t i = 1; i < result.optimization.line.points.size(); ++i)
+        CHECK(result.optimization.line.points[i].position[0] > result.optimization.line.points[i-1].position[0]);
 }
 
 TEST_CASE("fiber mode reports no-progress extrapolation fallback reasons")
@@ -6496,5 +6638,117 @@ TEST_CASE("Strip control column: revision-gated arc lengths agree with the build
     for (const double position : {0.0, 1.0, 1.5, 2.0}) {
         CHECK(generatedStripControlGridColumn(control(position, position * 5.0, 5), scaledMap) ==
               doctest::Approx(scaledMap.originalPositionToStripGridColumn(position)).epsilon(1e-6));
+    }
+}
+
+TEST_CASE("model-only fiber seed and edits need no Lasagna dataset")
+{
+    using namespace vc3d::line_annotation;
+    FiberModeOptimizationRequest request;
+    request.controlPoints = {{1.0, {10.0, 20.0, 30.0}, true, 1}};
+    request.linePointsBase = {{9.0, 20.0, 30.0}, {10.0, 20.0, 30.0}, {11.0, 20.0, 30.0}};
+    request.extrapolationDistanceBaseVoxels = 8.0;
+    int normalBuilds = 0;
+    request.modelLineBuilder = [&](const auto& points) {
+        ++normalBuilds;
+        vc::lasagna::LineModel line;
+        for (const auto& p : points) {
+            vc::lasagna::LinePoint point;
+            point.position = p;
+            point.sampledNormal.normal = {0.0, 1.0, 0.0};
+            point.sampledNormal.valid = point.valid = true;
+            line.points.push_back(point);
+        }
+        line.displayFrameAnchorIndex = int(points.size() / 2);
+        return line;
+    };
+    request.externalExtrapolation = [](const auto& history, const auto& direction, double distance) {
+        vc::fiber_tracer::FiberTraceOneWayResult result;
+        result.points = {history.back(), history.back() + direction / cv::norm(direction) * distance};
+        result.reason = "fiber_follow: max_len";
+        result.reachedTraceLength = true;
+        return result;
+    };
+    request.externalSegment = [](const auto& span) {
+        vc::fiber_tracer::FiberTraceSegmentResult result;
+        result.accepted = true;
+        const auto start = span.referenceLine.at(span.startIndex);
+        const auto end = span.referenceLine.at(span.targetIndex);
+        result.fusedLine = {start, (start + end) * 0.5, end};
+        result.reason = "fiber_follow: target_plane";
+        return result;
+    };
+    SUBCASE("seed grows both directions and retains measured normals") {
+        const auto result = optimizeFiberWithNativeFallback(request);
+        CHECK(normalBuilds == 1);
+        CHECK(result.lasagnaFallbackExtrapolations == 0);
+        REQUIRE(result.optimization.line.points.size() == 3);
+        CHECK(result.optimization.line.points.front().position == cv::Vec3d(2, 20, 30));
+        CHECK(result.optimization.line.points.back().position == cv::Vec3d(18, 20, 30));
+        CHECK(result.controlPoints.front().optimizedIndex == 1);
+        CHECK(result.optimization.line.points[1].sampledNormal.normal == cv::Vec3d(0, 1, 0));
+    }
+    SUBCASE("no progress is an error, not a fabricated seed line") {
+        request.externalExtrapolation = [](const auto& history, const auto&, double) {
+            vc::fiber_tracer::FiberTraceOneWayResult result;
+            result.points = {history.back()};
+            result.reason = "fiber_follow: confidence";
+            return result;
+        };
+        CHECK_THROWS_WITH_AS(optimizeFiberWithNativeFallback(request),
+            doctest::Contains("Fiber follow made no progress from the seed; try another seed or lower confidence."), std::runtime_error);
+        CHECK(normalBuilds == 0);
+    }
+    SUBCASE("model errors propagate without Lasagna fallback") {
+        request.externalExtrapolation = [](const auto&, const auto&, double) -> vc::fiber_tracer::FiberTraceOneWayResult {
+            throw std::runtime_error("model socket failed");
+        };
+        CHECK_THROWS_WITH_AS(optimizeFiberWithNativeFallback(request), doctest::Contains("model socket failed"), std::runtime_error);
+    }
+    SUBCASE("one confident tail is enough and the empty tail is removed") {
+        auto trace = request.externalExtrapolation;
+        request.externalExtrapolation = [trace](const auto& history, const auto& direction, double distance) {
+            auto result = trace(history, direction, distance);
+            if (direction[0] < 0) {
+                result.points.resize(1);
+                result.reachedTraceLength = false;
+                result.reason = "fiber_follow: confidence";
+            }
+            return result;
+        };
+        const auto result = optimizeFiberWithNativeFallback(request);
+        REQUIRE(result.optimization.line.points.size() == 2);
+        CHECK(result.optimization.line.points.front().position == cv::Vec3d(10, 20, 30));
+        CHECK(result.controlPoints.front().optimizedIndex == 0);
+    }
+    SUBCASE("control edits trace and preserve exact control indices") {
+        request.controlPoints.push_back({2.0, {11.0, 20.0, 30.0}, false, 2});
+        request.controlPoints.front().segmentToNext.emplace();
+        request.controlPoints.front().segmentToNext->interpGoal = SegmentInterpolationGoal::Trace;
+        SUBCASE("accepted span") {
+            const auto result = optimizeFiberWithNativeFallback(request);
+            CHECK(result.nativeSegments == 1);
+            CHECK(normalBuilds == 1);
+            CHECK(result.lasagnaFallbackSegments == 0);
+            for (const auto& control : result.controlPoints)
+                CHECK(result.optimization.line.points.at(control.optimizedIndex).position == control.volumePoint);
+        }
+        SUBCASE("missed control is reported") {
+            request.externalSegment = [](const auto&) {
+                vc::fiber_tracer::FiberTraceSegmentResult result;
+                result.reason = "fiber_follow: missed target";
+                return result;
+            };
+            CHECK_THROWS_WITH_AS(optimizeFiberWithNativeFallback(request),
+                doctest::Contains("Fiber follow could not connect the controls: fiber_follow: missed target"), std::runtime_error);
+        }
+        SUBCASE("bounded spline still uses model normals") {
+            request.controlPoints.front().segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
+            request.retainOpenTails = false;
+            const auto result = optimizeFiberWithNativeFallback(request);
+            CHECK(normalBuilds == 1);
+            CHECK(result.optimization.line.points.front().position == request.controlPoints.front().volumePoint);
+            CHECK(result.optimization.line.points.back().position == request.controlPoints.back().volumePoint);
+        }
     }
 }

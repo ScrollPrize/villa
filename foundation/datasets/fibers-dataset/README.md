@@ -9,7 +9,6 @@ To set up the environment, run the following commands:
 ```bash
 conda env create -f environment.yml
 conda activate fibers-dataset
-vesuvius.accept_terms --yes
 ```
 
 Copy your WebKnossos Auth Token into a `token.txt` file in this folder.

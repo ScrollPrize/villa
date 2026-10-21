@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from lasagna.manager.config import ManagerConfig
+from lasagna.manager.fiberlets import _fiberlet_inventory_digest
 from lasagna.manager.open_data import (
     INCOMPLETE_MARKER,
     S3ObjectStore,
@@ -125,6 +128,26 @@ def test_model_creation_offset_is_normalized_to_utc(
         resolve_model_id(config, {"model": {"sha256": digest}})
 
 
+def test_model_identifier_must_match_trusted_snapshot(tmp_path, monkeypatch):
+    path = tmp_path / "best.pt"
+    path.write_bytes(b"checkpoint")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    record = replace(_snapshot_record(path, digest), model_identifier="owner/model")
+    records = [record]
+    monkeypatch.setattr("lasagna.manager.open_data.index_snapshots", lambda *_args, **_kwargs: records)
+    config = ManagerConfig(snapshot_dirs=(str(tmp_path),), cache_dir=str(tmp_path / "cache"))
+    model = {"sha256": digest, "model_identifier": "owner/model"}
+    assert resolve_model_id(config, {"model": model}) == "20260801084232-lasagna"
+    with pytest.raises(ValueError, match="model_identifier"):
+        resolve_model_id(config, {"model": {**model, "model_identifier": "owner/wrong"}})
+    records[:] = [replace(record, model_identifier=None)]
+    with pytest.raises(ValueError, match="model_identifier"):
+        resolve_model_id(config, {"model": model})
+    records[:] = [record, replace(record, model_identifier="owner/conflict")]
+    with pytest.raises(ValueError, match="conflicting identity"):
+        resolve_model_id(config, {"model": model})
+
+
 def test_model_resolution_accepts_byte_identical_checkpoint_aliases(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -234,6 +257,83 @@ def _completed_run(
     return config, run
 
 
+def _completed_fiberlet_run(tmp_path: Path) -> tuple[ManagerConfig, Path]:
+    output = tmp_path / "outputs"
+    run = output / "fiberlet-run"
+    bundle = run / "artifacts"
+    dataset_name = "fiberlet-run.fiberlets.zarr"
+    dataset = bundle / dataset_name
+    array = dataset / "fiberlets" / ".zarray"
+    array.parent.mkdir(parents=True, exist_ok=True)
+    array.write_text(json.dumps({
+        "zarr_format": 2, "dtype": "|O", "dimension_separator": "/",
+    }), encoding="utf-8")
+    (dataset / ".zgroup").write_text("{}", encoding="utf-8")
+    (dataset / ".zattrs").write_text(json.dumps({
+        "vc_format": "fiberlet_dataset",
+        "format_version": 3,
+        "dataset_kind": "published",
+        "build_state": "complete",
+        "expected_chunk_count": 0,
+        "expected_chunk_digest": _fiberlet_inventory_digest([]),
+    }), encoding="utf-8")
+    atomic_json(bundle / "fiberlets.json", {
+        "schema_version": 1,
+        "artifact_kind": "fiberlets",
+        "status": "completed",
+        "run_uuid": "fiberlet-uuid",
+        "source": {
+            "sample_id": "PHerc0001", "volume_id": "20260101000001",
+            "license": {"name": "CC BY-NC 4.0"},
+        },
+        "dependencies": {},
+        "artifacts": [{
+            "kind": "fiberlet-zarr", "path": dataset_name,
+            "metadata_sha256": hashlib.sha256(
+                (dataset / ".zattrs").read_bytes()
+            ).hexdigest(),
+        }],
+    })
+    atomic_json(run / "metadata.json", {
+        "run_uuid": "fiberlet-uuid", "run_name": "fiberlet-run",
+        "job_kind": "fiberlet", "active_lifecycle_phase": "fiberlet_preprocess",
+        "artifact_kind": "fiberlets", "status": "completed",
+        "artifacts": {
+            "root": "artifacts", "provenance": "artifacts/fiberlets.json",
+            "dataset": f"artifacts/{dataset_name}",
+        },
+        "lifecycle": {
+            "fiberlet_preprocess": "completed", "staging_upload": "not_started",
+            "atlas_ingest": "not_started", "atlas_publication": "not_started",
+        },
+    })
+    return ManagerConfig(
+        output_dir=str(output), cache_dir=str(tmp_path / "cache"),
+        atlas_dir=str(tmp_path / "atlas"), upload_staging_s3="s3://stage/prefix",
+    ), run
+
+
+def test_fiberlet_upload_streams_tree_in_distinct_namespace(tmp_path: Path) -> None:
+    config, _run = _completed_fiberlet_run(tmp_path)
+    plan = validate_inference(config, "fiberlet-run")
+    assert plan.prefix == "prefix/fiberlets/fiberlet-uuid"
+    assert plan.model_id is None
+    assert plan.files is None
+
+    class TreeStore(FakeStore):
+        def put_tree(self, prefix: str, bundle: Path) -> None:
+            self.events.append(("tree", f"{prefix}:{bundle.name}"))
+
+        def put_file(self, _key: str, _path: Path) -> None:
+            raise AssertionError("streamed Fiberlet upload must not enumerate files")
+
+    store = TreeStore()
+    assert stage_upload(plan, store) == "s3://stage/prefix/fiberlets/fiberlet-uuid/"
+    assert store.events[0] == ("bytes", f"{plan.prefix}/{INCOMPLETE_MARKER}")
+    assert store.events[1] == ("tree", f"{plan.prefix}:artifacts")
+    assert store.events[-1] == ("delete", f"{plan.prefix}/{INCOMPLETE_MARKER}")
+
+
 def test_validate_requires_completed_cc_bundle_and_model(tmp_path: Path) -> None:
     config, _run = _completed_run(tmp_path)
     assert not (Path(config.cache_dir) / "snapshots" / "index.json").exists()
@@ -335,16 +435,20 @@ def test_upload_updates_independent_lifecycle_and_calls_ingester(
     }
 
 
-def test_atlas_preflight_failure_happens_before_staging(tmp_path: Path) -> None:
-    config, _run = _completed_run(tmp_path)
+@pytest.mark.parametrize("fiberlet", [False, True])
+def test_atlas_preflight_failure_happens_before_staging(tmp_path: Path, fiberlet: bool) -> None:
+    config, run = (_completed_fiberlet_run if fiberlet else _completed_run)(tmp_path)
     store = FakeStore()
+    before = (run / "metadata.json").read_bytes()
+    message = "unsupported Fiberlet format" if fiberlet else "unknown Atlas model"
 
     def reject(**_kwargs):
-        raise ValueError("unknown Atlas model")
+        raise ValueError(message)
 
-    with pytest.raises(ValueError, match="unknown Atlas model"):
+    with pytest.raises(ValueError, match=message):
         upload_inference(
-            config, "fiber-run", store=store, validator=reject,
+            config, run.name, store=store, validator=reject,
             ingester=lambda **_kwargs: pytest.fail("ingest called"),
         )
     assert store.events == []
+    assert (run / "metadata.json").read_bytes() == before

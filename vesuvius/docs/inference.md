@@ -6,7 +6,7 @@ The Vesuvius tooling exposes three command-line stages plus a convenience orches
 2. `vesuvius.blend_logits` — merge overlapping patches with Gaussian weighting.
 3. `vesuvius.finalize_outputs` — convert logits into probabilities or masks and build a multiscale Zarr.
 
-All commands honour local paths and remote storage backed by `fsspec` (for example S3). Run `vesuvius.accept_terms --yes` before accessing remote scroll volumes.
+All commands honour local paths and remote storage backed by `fsspec` (for example S3). Remote scroll volumes are covered by the [data licence](../README.md#data-licence).
 
 ## Stage 1 — `vesuvius.predict`
 

@@ -16,8 +16,16 @@ import zarr
 from vesuvius.ink_detection.config import InkDataConfig
 from vesuvius.ink_detection.data.dataset import InkDataset, flat_z_window_bbox
 from vesuvius.ink_detection.data.geometry import (
+    StoredResolutionIndex,
+    catmull_rom_vertex_mask,
+    filter_support_bands,
     filter_support_components,
+    maybe_select_flat_pixels,
+    native_tifxyz_pyramid_params,
+    paste_bands,
+    project_labels_and_supervision,
     read_tifxyz_on_flat_grid,
+    select_flat_pixel_bands_via_stored_resolution,
     select_flat_pixels_via_stored_resolution,
 )
 from vesuvius.ink_detection.data.patch_cache import (
@@ -39,6 +47,7 @@ from vesuvius.ink_detection.data.segment import (
     parse_label_asset_path,
 )
 from vesuvius.ink_detection.types import Patch, Segment
+from vesuvius.tifxyz import Tifxyz
 from vesuvius.ink_detection.volume_io import (
     open_volume,
     read_bbox_with_padding,
@@ -637,6 +646,55 @@ def test_ragged_tifxyz_pyramid_refines_to_exact_flat_grid():
     np.testing.assert_array_equal(
         support, np.array([[[2.0, 3.0, 3.0]]], dtype=np.float32)
     )
+    indexed = select_flat_pixels_via_stored_resolution(
+        tifxyz,
+        (2, 3, 3, 3, 4, 4),
+        coarse_native_pad=1,
+        coarse_positions_zyx=tifxyz.stored_positions_zyx,
+        coarse_valid=np.ones((4, 4), dtype=bool),
+        native_coordinate_scale=0.25,
+        flat_grid_stride=4,
+        coarse_index=StoredResolutionIndex(
+            tifxyz.stored_positions_zyx,
+            np.ones((4, 4), dtype=bool),
+            native_coordinate_scale=0.25,
+        ),
+    )
+    assert indexed[0] == support_bbox
+    np.testing.assert_array_equal(indexed[1], support)
+    np.testing.assert_array_equal(indexed[2], support_valid)
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.25])
+def test_stored_resolution_index_matches_full_grid_scan(scale):
+    # A wavy sheet with NaN holes and invalid points; the index must return the
+    # exact window a scan of the whole stored grid returns, including misses.
+    rng = np.random.default_rng(7)
+    height, width = 70, 90
+    rows, columns = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+    positions = np.stack(
+        [
+            40 + 6 * np.sin(columns / 9.0) + rng.normal(0, 0.5, (height, width)),
+            2.0 * rows + rng.normal(0, 0.5, (height, width)),
+            2.0 * columns,
+        ],
+        axis=-1,
+    ).astype(np.float32)
+    positions[rng.random((height, width)) < 0.05] = np.nan
+    positions[rng.random((height, width)) < 0.05] = -1
+    valid = np.isfinite(positions).all(axis=-1) & (positions >= 0).all(axis=-1)
+    scaled = positions * scale if scale != 1.0 else positions
+    extent = np.array([60, 150, 190]) * scale
+    for tile in (1, 16, 32, 128):
+        index = StoredResolutionIndex(
+            positions, valid, native_coordinate_scale=scale, tile=tile
+        )
+        for _ in range(200):
+            start = rng.integers(-10, extent.astype(int))
+            stop = start + rng.integers(1, (extent / 3).astype(int) + 2)
+            bbox = (*start.tolist(), *stop.tolist())
+            expected = maybe_select_flat_pixels(scaled, valid, bbox)
+            assert index.window(bbox) == (None if expected is None else expected[0])
 
 
 def test_patch_bbox_seeds_only_its_connected_support_component():
@@ -666,6 +724,399 @@ def test_patch_bbox_seeds_only_its_connected_support_component():
     np.testing.assert_array_equal(
         kept_supervision, np.array([[1, 0]], dtype=np.uint8)
     )
+
+
+def _spiral_tifxyz(
+    rng, scale: float, *, shift: float = 0.0, non_finite: bool = True
+) -> Tifxyz:
+    # A sheet wound several times around an axis, with invalid and non-finite
+    # stored points, as a real Tifxyz (Catmull-Rom full resolution).
+    step = 1.0 / scale
+    height, width = round(120 * scale), round(1800 * scale)
+    rows, columns = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+    start, pitch = 30.0 + shift, 25.0 / (2 * np.pi)
+    theta = (np.sqrt(start**2 + 2 * pitch * columns * step) - start) / pitch
+    radius = start + pitch * theta
+    x = 140 + radius * np.cos(theta) + rng.normal(0, 0.3, theta.shape)
+    y = 140 + radius * np.sin(theta) + rng.normal(0, 0.3, theta.shape)
+    z = 10 + rows * step + 3 * np.sin(columns / 7.0) + rng.normal(0, 0.3, theta.shape)
+    x, y, z = (values.astype(np.float32) for values in (x, y, z))
+    for _ in range(3):
+        row, column = rng.integers(0, height), rng.integers(0, width)
+        hole = slice(row, row + 2), slice(column, column + 4)
+        x[hole] = y[hole] = z[hole] = -1.0
+    if non_finite:
+        x[rng.integers(0, height), rng.integers(0, width)] = np.nan
+    return Tifxyz(_x=x, _y=y, _z=z, _scale=(scale, scale)).use_full_resolution()
+
+
+def _rippled_tifxyz(rng, scale: float) -> Tifxyz:
+    # A sheet with diagonal ripples: a thin crop meets it in slanted stripes
+    # whose bounding boxes overlap.
+    step = 1.0 / scale
+    height = width = round(240 * scale)
+    rows, columns = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+    x = 20 + columns * step + rng.normal(0, 0.2, rows.shape)
+    y = 20 + rows * step + rng.normal(0, 0.2, rows.shape)
+    z = 80 + 40 * np.sin((rows + columns) * step / 26.0)
+    x, y, z = (values.astype(np.float32) for values in (x, y, z))
+    return Tifxyz(_x=x, _y=y, _z=z, _scale=(scale, scale)).use_full_resolution()
+
+
+def _spiral_selection(tifxyz, resolution: int) -> dict:
+    stride, coordinate_scale, coarse_pad = native_tifxyz_pyramid_params(resolution)
+    coarse = np.asarray(tifxyz.get_zyxs(stored_resolution=True), dtype=np.float32)
+    coarse_valid = np.isfinite(coarse).all(axis=-1) & (coarse >= 0).all(axis=-1)
+    return dict(
+        coarse_native_pad=coarse_pad,
+        coarse_positions_zyx=coarse,
+        coarse_valid=coarse_valid,
+        native_coordinate_scale=coordinate_scale,
+        flat_grid_stride=stride,
+        required=False,
+        coarse_index=StoredResolutionIndex(
+            coarse, coarse_valid, native_coordinate_scale=coordinate_scale
+        ),
+    )
+
+
+def _random_spiral_crop(rng, coordinate_scale: float = 1.0, *, slab: bool = False):
+    if slab:  # thin in z, wide in y and x
+        start = rng.integers((50, 20, 20), (110, 120, 120))
+        size = rng.integers((4, 80, 80), (12, 140, 140))
+    else:
+        start = rng.integers((0, 0, 0), (130, 240, 240))
+        size = rng.integers(8, 70, 3)
+    start = (start * coordinate_scale).astype(int)
+    size = np.maximum(2, (size * coordinate_scale).astype(int))
+    return (*start.tolist(), *(start + size).tolist())
+
+
+@pytest.mark.parametrize(
+    ("surface", "resolution", "scale"),
+    [
+        (_spiral_tifxyz, 0, 0.1),
+        (_spiral_tifxyz, 0, 0.05),
+        (_spiral_tifxyz, 2, 0.1),
+        (_spiral_tifxyz, 1, 0.25),
+        (_rippled_tifxyz, 0, 0.25),
+        (_rippled_tifxyz, 1, 0.25),
+    ],
+)
+def test_support_bands_hold_exactly_the_points_of_the_whole_window(
+    surface, resolution, scale
+):
+    # Crops through a spiral meet several windings; the bands must hold the same
+    # in-crop points, with the same positions, as the one window spanning them.
+    # Thin slabs through a rippled sheet meet it in slanted stripes whose boxes
+    # overlap, which must end up in one band.
+    rng = np.random.default_rng(11)
+    tifxyz = surface(rng, scale)
+    selection = _spiral_selection(tifxyz, resolution)
+    vertex_mask = catmull_rom_vertex_mask(tifxyz)
+    several = 0
+    for _ in range(50):
+        crop = _random_spiral_crop(
+            rng, selection["native_coordinate_scale"], slab=surface is _rippled_tifxyz
+        )
+        whole = select_flat_pixels_via_stored_resolution(tifxyz, crop, **selection)
+        bands = select_flat_pixel_bands_via_stored_resolution(
+            tifxyz, crop, vertex_mask=vertex_mask, **selection
+        )
+        assert (whole is None) == (not bands)
+        if whole is None:
+            continue
+        bbox, positions, valid = whole
+        boxes = [band[0] for band in bands]
+        assert bbox == (
+            min(box[0] for box in boxes),
+            max(box[1] for box in boxes),
+            min(box[2] for box in boxes),
+            max(box[3] for box in boxes),
+        )
+        np.testing.assert_array_equal(
+            paste_bands(boxes, [band[2] for band in bands], bbox, fill=False), valid
+        )
+        np.testing.assert_array_equal(
+            paste_bands(boxes, [band[1] for band in bands], bbox, fill=np.nan)[valid],
+            positions[valid],
+        )
+        for index, a in enumerate(boxes):
+            for b in boxes[index + 1 :]:
+                assert max(b[0] - a[1], a[0] - b[1], b[2] - a[3], a[2] - b[3]) >= 1
+        several += len(bands) > 1
+        (window,) = select_flat_pixel_bands_via_stored_resolution(
+            tifxyz, crop, **selection
+        )
+        assert window[0] == bbox
+        np.testing.assert_array_equal(window[2], valid)
+    if surface is _spiral_tifxyz:
+        assert several >= 5
+
+
+def test_support_filter_drops_native_components_without_supervision():
+    # Flat neighbours on two sheets that are apart in the volume: only the
+    # supervised sheet is kept, although the flat grid connects them.
+    positions = np.array(
+        [[[0, 0, 0], [0, 0, 1], [0, 5, 2], [0, 5, 3]]], dtype=np.float32
+    )
+    supervision = np.array([[1, 0, 0, 0]], dtype=np.uint8)
+    kept_bbox, keep = filter_support_bands(
+        [((0, 1, 0, 4), positions, np.ones((1, 4), dtype=bool))],
+        [supervision],
+        crop_bbox_zyx=(0, 0, 0, 1, 6, 4),
+        patch_bbox_zyx=(0, 0, 0, 1, 1, 4),
+        max_supervision_grid_distance=None,
+    )
+    assert kept_bbox == (0, 1, 0, 2)
+    np.testing.assert_array_equal(keep[0], np.array([[True, True, False, False]]))
+
+
+def _flat_normals(tifxyz, bbox):
+    nx, ny, nz = tifxyz.get_normals(*bbox)
+    return np.stack([nz, ny, nx], axis=-1).astype(np.float32)
+
+
+@pytest.mark.parametrize("max_distance", [None, 0.0, 3.0, 64.0])
+def test_support_filter_and_projection_per_band_match_the_whole_window(max_distance):
+    rng = np.random.default_rng(5)
+    tifxyz = _spiral_tifxyz(rng, 0.1)
+    selection = _spiral_selection(tifxyz, 0)
+    vertex_mask = catmull_rom_vertex_mask(tifxyz)
+    several = dropped = 0
+    for _ in range(40):
+        crop = _random_spiral_crop(rng)
+        whole = select_flat_pixels_via_stored_resolution(tifxyz, crop, **selection)
+        if whole is None:
+            continue
+        bbox, positions, valid = whole
+        bands = select_flat_pixel_bands_via_stored_resolution(
+            tifxyz, crop, vertex_mask=vertex_mask, **selection
+        )
+        boxes = [band[0] for band in bands]
+        supervision = rng.random(valid.shape) < rng.choice([0.0, 0.001, 0.02, 0.9])
+        supervision = supervision.astype(np.uint8)
+        labels = (rng.random(valid.shape) < 0.3).astype(np.uint8)
+
+        def in_band(flat, box):
+            return flat[
+                box[0] - bbox[0] : box[1] - bbox[0], box[2] - bbox[2] : box[3] - bbox[2]
+            ]
+
+        # Mostly a patch on one of the bands, sometimes one that misses them all.
+        rows, columns = np.nonzero(valid)
+        point = rng.integers(len(rows)) if rng.random() < 0.75 else None
+        patch_y0 = bbox[0] - 60 if point is None else bbox[0] + int(rows[point]) - 10
+        patch_x0 = bbox[2] - 60 if point is None else bbox[2] + int(columns[point]) - 10
+        filtering = dict(
+            crop_bbox_zyx=crop,
+            patch_bbox_zyx=(
+                0,
+                patch_y0,
+                patch_x0,
+                1,
+                patch_y0 + int(rng.integers(11, 40)),
+                patch_x0 + int(rng.integers(11, 40)),
+            ),
+            max_supervision_grid_distance=max_distance,
+        )
+        expected_bbox, _, expected_valid, _, _ = filter_support_components(
+            support_bbox_yx=bbox,
+            positions_zyx=positions,
+            valid_mask=valid,
+            inklabels_flat=labels,
+            supervision_flat=supervision,
+            **filtering,
+        )
+        kept_bbox, keep = filter_support_bands(
+            bands, [in_band(supervision, box) for box in boxes], **filtering
+        )
+        assert kept_bbox == expected_bbox
+        np.testing.assert_array_equal(
+            paste_bands(boxes, keep, kept_bbox, fill=False), expected_valid
+        )
+        several += len(bands) > 1
+        dropped += np.count_nonzero(expected_valid) < np.count_nonzero(valid)
+
+        projecting = dict(
+            crop_bbox_zyx=crop, label_half_thickness=3.0, background_half_thickness=2.0
+        )
+        expected_labels, expected_supervision = project_labels_and_supervision(
+            positions_zyx=positions,
+            valid_mask=valid & (supervision > 0),
+            inklabels_flat=labels,
+            supervision_flat=supervision,
+            normals_zyx=_flat_normals(tifxyz, bbox),
+            **projecting,
+        )
+        band_labels = np.zeros_like(expected_labels)
+        band_supervision = np.zeros_like(expected_supervision)
+        for box, band_positions, band_valid in bands:
+            projected = project_labels_and_supervision(
+                positions_zyx=band_positions,
+                valid_mask=band_valid & (in_band(supervision, box) > 0),
+                inklabels_flat=in_band(labels, box),
+                supervision_flat=in_band(supervision, box),
+                normals_zyx=_flat_normals(tifxyz, box),
+                **projecting,
+            )
+            np.maximum(band_labels, projected[0], out=band_labels)
+            np.maximum(band_supervision, projected[1], out=band_supervision)
+        np.testing.assert_array_equal(band_labels, expected_labels)
+        np.testing.assert_array_equal(band_supervision, expected_supervision)
+    assert several >= 5 and dropped >= 3
+
+
+@pytest.mark.parametrize("max_distance", [None, 0.0, 2.0, 5.0, 64.0])
+def test_filter_support_bands_matches_one_window_when_bands_are_close(max_distance):
+    # A sheet cut into strips by narrow gaps: seeds of one strip are within reach
+    # of its neighbours, so strips must be filtered together where it matters.
+    rng = np.random.default_rng(23)
+    dropped = 0
+    for _ in range(60):
+        height, width = int(rng.integers(6, 30)), int(rng.integers(20, 90))
+        rows, columns = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+        positions = np.stack(
+            [3.0 + rows, 12 + 6 * np.sin(columns / 5.0), 2 + 0.7 * columns], axis=-1
+        ).astype(np.float32)
+        valid = rng.random((height, width)) < 0.9
+        cuts = np.zeros(width, dtype=bool)
+        for start in rng.integers(1, width - 1, int(rng.integers(1, 5))):
+            cuts[start : min(width - 1, start + int(rng.integers(1, 7)))] = True
+        valid[:, cuts] = False
+        edges = np.flatnonzero(np.diff(np.concatenate([[1], cuts, [1]]).astype(int)))
+        bbox = (40, 40 + height, 100, 100 + width)
+        strips = [
+            (slice(None), slice(int(left), int(right)))
+            for left, right in zip(edges[::2], edges[1::2])
+        ]
+        boxes = [
+            (bbox[0], bbox[1], bbox[2] + strip[1].start, bbox[2] + strip[1].stop)
+            for strip in strips
+        ]
+        supervision = rng.random((height, width)) < rng.choice([0.0, 0.01, 0.1, 0.9])
+        supervision = supervision.astype(np.uint8)
+        patch_x0 = bbox[2] + int(rng.integers(-10, width))
+        crop_stop = int(rng.integers(8, 40)), 24, int(rng.integers(20, 70))
+        filtering = dict(
+            crop_bbox_zyx=(0, 0, 0, *crop_stop),
+            patch_bbox_zyx=(0, bbox[0], patch_x0, 1, bbox[1], patch_x0 + 12),
+            max_supervision_grid_distance=max_distance,
+        )
+        expected_bbox, _, expected_valid, _, _ = filter_support_components(
+            support_bbox_yx=bbox,
+            positions_zyx=positions,
+            valid_mask=valid,
+            inklabels_flat=supervision,
+            supervision_flat=supervision,
+            **filtering,
+        )
+        bands = [
+            (box, positions[strip], valid[strip]) for box, strip in zip(boxes, strips)
+        ]
+        kept_bbox, keep = filter_support_bands(
+            bands, [supervision[strip] for strip in strips], **filtering
+        )
+        assert kept_bbox == expected_bbox
+        np.testing.assert_array_equal(
+            paste_bands(boxes, keep, kept_bbox, fill=False), expected_valid
+        )
+        dropped += np.count_nonzero(expected_valid) < np.count_nonzero(valid)
+    assert dropped >= 10
+
+
+@pytest.mark.parametrize(
+    ("mode", "resolution"),
+    [("full_3d", 0), ("full_3d_single_wrap", 0), ("full_3d", 1)],
+)
+def test_native_samples_are_the_same_with_and_without_bands(
+    tmp_path, monkeypatch, mode, resolution
+):
+    # Two spiral segments on one volume: samples assembled from per-band support
+    # must equal the samples assembled from the window spanning the bands.
+    rng = np.random.default_rng(3)
+    config = InkDataConfig.from_mapping(
+        {
+            "mode": mode,
+            "patch_size": [56, 56, 56],
+            "patch_overlap": 0.25,
+            "patch_min_labeled_coverage": 0.0,
+            "image_normalization": "none",
+            "full_3d": {"projection_half_thickness": 3 << resolution},
+            "datasets": [
+                {
+                    "segments_path": str(tmp_path),
+                    "volume_path": "volume",
+                    "volume_scale": resolution,
+                }
+            ],
+        }
+    )
+    stride = 1 << resolution
+    volume_shape = (140 // stride + 1, 280 // stride + 1, 280 // stride + 1)
+    arrays = {"volume": rng.integers(0, 255, volume_shape, dtype=np.uint8)}
+    segments, surfaces = [], {}
+    for name, shift in (("base", 0.0), ("other", 9.0)):
+        tifxyz = _spiral_tifxyz(rng, 0.1, shift=shift, non_finite=False)
+        flat_shape = tuple(-(-size // stride) for size in tifxyz.full_resolution_shape)
+        arrays[f"{name}-ink"] = (rng.random((1, *flat_shape)) < 0.3).astype(np.uint8)
+        arrays[f"{name}-supervision"] = (rng.random((1, *flat_shape)) < 0.6).astype(
+            np.uint8
+        )
+        segment = Segment(
+            config,
+            config.datasets[0],
+            0,
+            name,
+            tmp_path / name,
+            name,
+            "volume",
+            Path(f"{name}-ink"),
+            Path(f"{name}-supervision"),
+        )
+        segments.append(segment)
+        surfaces[str(segment.segment_dir)] = tifxyz
+    flat_height, flat_width = arrays["base-ink"].shape[1:]
+    patches = [
+        Patch(segments[0], (0, y, x, 56, y + 56, x + 56))
+        for y in (0, flat_height - 56)
+        for x in range(0, flat_width - 56, 150)
+    ]
+
+    def dataset(banded: bool) -> InkDataset:
+        dataset = InkDataset(
+            config, do_augmentations=False, patches=patches, segments=segments
+        )
+        dataset._tifxyz_cache.update(surfaces)
+        if not banded:
+            dataset._vertex_mask_cache.update(dict.fromkeys(surfaces))
+        monkeypatch.setattr(
+            dataset, "_open", lambda path, resolution: arrays[str(path)]
+        )
+        return dataset
+
+    banded, whole = dataset(True), dataset(False)
+    band_counts = []
+    select = banded._support_bands
+
+    def counted(segment, crop_bbox, *, required):
+        bands = select(segment, crop_bbox, required=required)
+        band_counts.append(len(bands))
+        return bands
+
+    monkeypatch.setattr(banded, "_support_bands", counted)
+    produced = 0
+    for patch in patches:
+        expected, sample = whole._native_sample(patch), banded._native_sample(patch)
+        assert (expected is None) == (sample is None)
+        if sample is None:
+            continue
+        produced += 1
+        assert sample.keys() == expected.keys()
+        for key, value in sample.items():
+            assert torch.equal(value, expected[key]), key
+        assert sample["supervision_mask"].any()
+    assert produced >= 5 and max(band_counts) > 1
 
 
 @pytest.mark.parametrize(

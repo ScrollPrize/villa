@@ -107,12 +107,14 @@ struct ChunkRequestScheduler::Impl {
     struct Location {
         enum class Kind {
             Interactive,
+            Foreground,
             Background,
             Maintenance,
         };
 
         Kind kind = Kind::Background;
         GuiQueue::iterator gui;
+        BackgroundQueue::iterator foreground;
         BackgroundQueue::iterator background;
         MaintenanceQueue::iterator maintenance;
     };
@@ -280,6 +282,8 @@ struct ChunkRequestScheduler::Impl {
             return;
         if (found->second.kind == Location::Kind::Interactive)
             gui.erase(found->second.gui);
+        else if (found->second.kind == Location::Kind::Foreground)
+            foreground.erase(found->second.foreground);
         else if (found->second.kind == Location::Kind::Maintenance)
             maintenance.erase(found->second.maintenance);
         else
@@ -291,6 +295,8 @@ struct ChunkRequestScheduler::Impl {
     {
         if (location.kind == Location::Kind::Interactive)
             return *location.gui;
+        if (location.kind == Location::Kind::Foreground)
+            return *location.foreground;
         if (location.kind == Location::Kind::Maintenance)
             return *location.maintenance;
         return *location.background;
@@ -299,7 +305,10 @@ struct ChunkRequestScheduler::Impl {
     void insertLocked(const std::shared_ptr<Item>& item)
     {
         Location location;
-        if (item->priority.interactive) {
+        if (item->priority.foreground) {
+            location.kind = Location::Kind::Foreground;
+            location.foreground = foreground.insert(item).first;
+        } else if (item->priority.interactive) {
             location.kind = Location::Kind::Interactive;
             location.gui = gui.insert(item).first;
         } else if (item->priority.maintenance) {
@@ -314,20 +323,28 @@ struct ChunkRequestScheduler::Impl {
 
     std::shared_ptr<Item> popLocked()
     {
-        const bool chooseGui = !gui.empty() &&
+        const bool chooseInteractive = (!gui.empty() || !foreground.empty()) &&
             (background.empty() || consecutiveInteractive < interactiveBurst);
         std::shared_ptr<Item> item;
-        if (chooseGui) {
-            auto it = gui.begin();
-            item = *it;
-            gui.erase(it);
+        if (chooseInteractive) {
+            if (!foreground.empty() && (gui.empty() || preferForeground)) {
+                auto it = foreground.begin();
+                item = *it;
+                foreground.erase(it);
+                preferForeground = false;
+            } else {
+                auto it = gui.begin();
+                item = *it;
+                gui.erase(it);
+                preferForeground = true;
+            }
             ++consecutiveInteractive;
         } else if (!background.empty()) {
             auto it = background.begin();
             item = *it;
             background.erase(it);
             consecutiveInteractive = 0;
-        } else if (gui.empty() && !maintenance.empty()) {
+        } else if (gui.empty() && foreground.empty() && !maintenance.empty()) {
             auto it = maintenance.begin();
             item = *it;
             maintenance.erase(it);
@@ -346,20 +363,20 @@ struct ChunkRequestScheduler::Impl {
             // pre-Delta3D path. The encoding choice is process-lifetime
             // state, so workers specialize once at startup instead of paying
             // a mode check for every selected cache task.
-            return (!gui.empty() || !background.empty() ||
+            return (!gui.empty() || !foreground.empty() || !background.empty() ||
                     !maintenance.empty()) &&
                    activeCount.load(std::memory_order_acquire) <
                        admissionLimit;
         } else {
             std::size_t effectiveAdmission = admissionLimit;
             const bool onlyBulkMaintenance =
-                gui.empty() && background.empty() && !maintenance.empty() &&
+                gui.empty() && foreground.empty() && background.empty() && !maintenance.empty() &&
                 (*maintenance.begin())->priority.reserveForegroundSlot;
             if (onlyBulkMaintenance && admissionLimit > 1) {
                 effectiveAdmission = std::max<std::size_t>(
                     1, admissionLimit - maintenanceReservedSlots);
             }
-            return (!gui.empty() || !background.empty() ||
+            return (!gui.empty() || !foreground.empty() || !background.empty() ||
                     !maintenance.empty()) &&
                    activeCount.load(std::memory_order_acquire) <
                        effectiveAdmission;
@@ -887,7 +904,7 @@ struct ChunkRequestScheduler::Impl {
                     return stop.stop_requested() ||
                            canSelectLocked<ReserveMaintenanceCapacity>();
                 });
-                if (stop.stop_requested() && gui.empty() && background.empty() &&
+                if (stop.stop_requested() && gui.empty() && foreground.empty() && background.empty() &&
                     maintenance.empty())
                     return;
             }
@@ -896,7 +913,7 @@ struct ChunkRequestScheduler::Impl {
                 // the publisher updates queued items through reprioritize().
                 std::lock_guard selectionLock(selectionGate->impl_->mutex);
                 std::unique_lock lock(mutex);
-                if (stop.stop_requested() && gui.empty() && background.empty() &&
+                if (stop.stop_requested() && gui.empty() && foreground.empty() && background.empty() &&
                     maintenance.empty())
                     return;
                 if (!canSelectLocked<ReserveMaintenanceCapacity>())
@@ -905,7 +922,7 @@ struct ChunkRequestScheduler::Impl {
                 if (!item)
                     continue;
                 if (staleLocked(*item)) {
-                    if (gui.empty() && background.empty() && maintenance.empty() &&
+                    if (gui.empty() && foreground.empty() && background.empty() && maintenance.empty() &&
                         activeCount.load(std::memory_order_acquire) == 0) {
                         idleCv.notify_all();
                     }
@@ -922,7 +939,7 @@ struct ChunkRequestScheduler::Impl {
             activeCount.fetch_sub(1, std::memory_order_release);
             std::lock_guard lock(mutex);
             cv.notify_all();
-            if (gui.empty() && background.empty() && maintenance.empty() &&
+            if (gui.empty() && foreground.empty() && background.empty() && maintenance.empty() &&
                 activeCount.load(std::memory_order_acquire) == 0) {
                 idleCv.notify_all();
             }
@@ -941,6 +958,7 @@ struct ChunkRequestScheduler::Impl {
     std::condition_variable cv;
     std::condition_variable idleCv;
     GuiQueue gui;
+    BackgroundQueue foreground;
     BackgroundQueue background;
     MaintenanceQueue maintenance;
     std::unordered_map<TaskId, Location> locations;
@@ -952,6 +970,7 @@ struct ChunkRequestScheduler::Impl {
     std::atomic_size_t activeCount{0};
     std::uint64_t nextSequence = 0;
     std::size_t consecutiveInteractive = 0;
+    bool preferForeground = false;
     const std::size_t interactiveBurst;
     const std::size_t maximumWorkers;
     const std::size_t maintenanceReservedSlots;
@@ -1079,7 +1098,7 @@ bool ChunkRequestScheduler::cancel(TaskId id)
     if (impl_->locations.find(id) == impl_->locations.end())
         return false;
     impl_->eraseLocked(id);
-    if (impl_->gui.empty() && impl_->background.empty() &&
+    if (impl_->gui.empty() && impl_->foreground.empty() && impl_->background.empty() &&
         impl_->maintenance.empty() &&
         impl_->activeCount.load(std::memory_order_acquire) == 0) {
         impl_->idleCv.notify_all();
@@ -1104,7 +1123,7 @@ void ChunkRequestScheduler::cancelGroupBefore(TaskGroup group,
             ++it;
         }
     }
-    if (impl_->gui.empty() && impl_->background.empty() &&
+    if (impl_->gui.empty() && impl_->foreground.empty() && impl_->background.empty() &&
         impl_->maintenance.empty() &&
         impl_->activeCount.load(std::memory_order_acquire) == 0) {
         impl_->idleCv.notify_all();
@@ -1312,7 +1331,7 @@ void ChunkRequestScheduler::waitIdle()
 {
     std::unique_lock lock(impl_->mutex);
     impl_->idleCv.wait(lock, [&] {
-        return impl_->gui.empty() && impl_->background.empty() &&
+        return impl_->gui.empty() && impl_->foreground.empty() && impl_->background.empty() &&
                impl_->maintenance.empty() &&
                impl_->activeCount.load(std::memory_order_acquire) == 0;
     });
