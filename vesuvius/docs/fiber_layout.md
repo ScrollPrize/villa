@@ -54,6 +54,20 @@ curves are not evaluated at a fractional distribution center, and old saved
 geometry is not silently reinterpreted. Reference alignment is global, not a
 per-fiber fit. Ordered evidence and family conventions are persisted.
 
+
+`fiber_gt_constraint_score.run(settings)` can build cross-reference event caches
+as well as consume them. For construction, supply `configs`, `gt_root`,
+`extract_template`, `orient_template` and `output_root`; optionally set
+`native_binary` to the built `vc_fiber_constraints`. `events_only: true`
+writes `cross_events.json`; `prepare_only: true` stops after native extraction.
+The frozen GT normal sweep is sampled through `fiber_curve_bank`;
+no surface reconstruction is required. With `frozen_event_cache`, the existing
+scorer reuses those events. Input hashes prevent incompatible cache reuse.
+
+`fiber_enclosure_width_init.fit_enclosure_widths` retains the constrained
+least-squares width initialization from opposite-sign H/V enclosure crossings,
+using measured phases/arclength and caller-supplied integer labels.
+
 ## Minimum flow and splitting
 
 `fiber_min_flow.solve` accepts explicit node/edge arrays, targets, weights and
