@@ -2,7 +2,7 @@ import numpy as np
 import torch
 
 import geom_utils
-from devices import fit_device
+from devices import fit_device, float_hi
 
 
 def get_spiral_yxs(num_windings, dr_per_winding, inter_point_spacing, group_by_winding=False, device=None):
@@ -20,14 +20,14 @@ def get_spiral_yxs(num_windings, dr_per_winding, inter_point_spacing, group_by_w
     # ...so should have (K + 0.5) * dr_per_winding * 2 * pi / inter_point_spacing steps
     # can construct these thetas directly, then r's via formula
 
-    # The angles are built in float64: in float32 the winding offset k * 2 * pi takes the mantissa, and at
-    # winding 250 sin and cos times a radius of 4000 voxels move a node by up to half a voxel.
-    # Only the positions are cast back to the default dtype.
+    # The angles are built in float_hi (float64 except on MPS or under FIT_SPIRAL_MAX_PRECISION_FLOAT=32):
+    # in float32 the winding offset k * 2 * pi takes the mantissa, and at winding 250 sin and cos times a
+    # radius of 4000 voxels move a node by up to half a voxel. Only the positions are cast back to the default dtype.
     thetas = [
         winding_idx * 2 * torch.pi + torch.arange(
             0, 2 * np.pi,
             step=inter_point_spacing / (winding_idx + 0.5) / float(dr_per_winding),
-            device=device, dtype=torch.float64,
+            device=device, dtype=float_hi(device),
         )
         for winding_idx in range(num_windings)
     ]
