@@ -339,6 +339,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [Ink detection validation harness](https://github.com/khj1222/vesuvius-challenge) by khj1222. The ink-detection tutorial trains with no held-out data, so improvements cannot be told apart from noise. This generates a `_validation_mask` for a labeled segment by holding out whole annotated regions (splitting by pixels cuts letters in half), scores predictions inside it (threshold sweep, DRD / pseudo-F-measure, per-region breakdown), sweeps checkpoints, and runs k-fold. Also includes a native-Windows walkthrough of the tutorial.
 
+- [first-letters-survey](https://github.com/Bullo27/first-letters-survey) by Matteo Bulloni. `fls.py` goes from a First Letters scroll to `ink_9um` maps on a freshly grown patch in one command (a seed on the m7 surface prediction inside the scan mask, the tracer and parameters of VC3D's GrowPatch, a native-resolution render, both depth directions), streaming from the open-data bucket. Includes a survey of the 21 scrolls on the First Letters list without catalog segments (65 patches, 971 cm², no letters found) and a calibration, planned before inference, on PHerc0841, a scroll the models never saw: the ink shows only at blob level on the team's surfaces and automatically grown patches leave the text-bearing sheet, so a null from this pipeline says little.
+
 #### 📦 Materials
 
 - [Scroll 1 Ink Labels](https://discord.com/channels/1079907749569237093/1223849912467460116). Nicola Bodill produced more accurate labels for ink detection based on the prediction of the Grand Prize winner model
