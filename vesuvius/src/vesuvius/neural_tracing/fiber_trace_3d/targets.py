@@ -492,6 +492,29 @@ def materialize_targets(
     )
 
 
+def target_normalization_counts(batch: FiberTrace3DBatch, *, conditioned: bool = False) -> torch.Tensor:
+    """Target-only counts matching the masked ordinary/conditioned loss groups.
+
+    Direction counts channel elements, presence counts nonempty patch/query
+    groups (not voxels). No predictions or image values are consulted.
+    """
+    require_materialized_targets(batch)
+    indices = batch.direction_indices_bzyx
+    positive_mask = batch.presence_mask[
+        indices[:, 0], 0, indices[:, 1], indices[:, 2], indices[:, 3]
+    ]
+    queries = 2 if conditioned else 1
+    negative_mask = batch.presence_mask
+    if not conditioned:
+        negative_mask = negative_mask & (batch.presence_target <= 0.5)
+    return torch.stack((
+        batch.presence_target.new_tensor(indices.shape[0] * 6 * queries, dtype=torch.float32),
+        batch.presence_target.new_tensor(torch.unique(indices[positive_mask, 0]).numel() * queries,
+                                        dtype=torch.float32),
+        negative_mask.flatten(1).any(dim=1).sum().float() * queries,
+    ))
+
+
 def require_materialized_targets(batch: FiberTrace3DBatch) -> None:
     missing = [
         name

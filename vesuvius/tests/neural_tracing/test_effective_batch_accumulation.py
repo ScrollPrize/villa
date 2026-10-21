@@ -16,7 +16,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.gradient_accumulation import (
 )
 from vesuvius.neural_tracing.fiber_trace_3d.loss_statistics import LossStatistics
 from vesuvius.neural_tracing.fiber_trace_3d.sample_pipeline import VirtualBatchSampleIndex
-from vesuvius.neural_tracing.fiber_trace_3d.targets import materialize_targets
+from vesuvius.neural_tracing.fiber_trace_3d.targets import materialize_targets, target_normalization_counts
 from vesuvius.neural_tracing.fiber_trace_3d.train import compute_losses, _slice_batch
 
 
@@ -231,33 +231,12 @@ def test_distributed_mismatch_fails_on_every_rank_without_hanging(tmp_path):
 
 
 def _fiber_counts(batch):
-    indices = batch.direction_indices_bzyx
-    positive = batch.presence_mask[
-        indices[:, 0], 0, indices[:, 1], indices[:, 2], indices[:, 3]]
-    return torch.stack((batch.volume.new_tensor(6 * len(indices)),
-        batch.volume.new_tensor(torch.unique(indices[positive, 0]).numel()),
-        ((batch.presence_target <= .5) & batch.presence_mask).flatten(1).any(dim=1).sum().float()))
+    return target_normalization_counts(batch)
 
 
 def _fiber_statistics(output, batch):
-    # Test adapter only: obtain component means from the unchanged production
-    # loss, using target-only masks to isolate its positive/background terms.
-    # This does not introduce a second production loss implementation.
-    options = dict(direction_weight=1., presence_weight=1.)
-    losses = compute_losses(output, batch, **options)
-    positive = compute_losses(output, replace(batch,
-        presence_mask=batch.presence_mask & (batch.presence_target > .5)), **options)
-    negative = compute_losses(output, replace(batch,
-        presence_mask=batch.presence_mask & (batch.presence_target <= .5)), **options)
-    dc, pc, nc = _fiber_counts(batch).unbind()
-    n = output.new_tensor(len(batch.direction_indices_bzyx))
-    return LossStatistics(direction_sum=losses["direction"] * dc, direction_count=dc,
-        positive_presence_sum=positive["presence"] * pc, positive_presence_count=pc,
-        negative_presence_sum=negative["presence"] * nc, negative_presence_count=nc,
-        angle_sum=losses["angle_mean_deg"] * n, angle_count=n,
-        branch0_sum=losses["branch0_fraction"] * n,
-        branch1_sum=losses["branch1_fraction"] * n, branch_count=n,
-        selected_score_sum=losses["selected_score_mean"] * n, selected_score_count=n)
+    return compute_losses(output, batch, direction_weight=1., presence_weight=1.,
+                          _return_statistics=True)
 
 
 def _pointwise_fiber_model(device):

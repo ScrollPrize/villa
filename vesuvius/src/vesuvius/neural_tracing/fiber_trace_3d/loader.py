@@ -404,6 +404,9 @@ class FiberTrace3DBatch:
     deferred_blur_kernels: tuple[_BlurKernels3D | None, ...] | None = None
     profile_timings_ms: dict[str, float] | None = None
 
+    # Local effective-batch target counts, prepared before model forward.
+    normalization_counts: torch.Tensor | None = None
+
     def to(
         self,
         device: torch.device | str,
@@ -411,6 +414,7 @@ class FiberTrace3DBatch:
         non_blocking: bool = False,
     ) -> "FiberTrace3DBatch":
         return FiberTrace3DBatch(
+            normalization_counts=None if self.normalization_counts is None else self.normalization_counts.to(device, non_blocking=non_blocking),
             volume=self.volume.to(device, non_blocking=non_blocking),
             valid_mask=self.valid_mask.to(device, non_blocking=non_blocking),
             cp_local_zyx=self.cp_local_zyx.to(device, non_blocking=non_blocking),
@@ -480,6 +484,7 @@ class FiberTrace3DBatch:
 
         return replace(
             self,
+            normalization_counts=pin(self.normalization_counts),
             volume=pin(self.volume),
             valid_mask=pin(self.valid_mask),
             cp_local_zyx=pin(self.cp_local_zyx),

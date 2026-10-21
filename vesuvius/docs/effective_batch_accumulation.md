@@ -5,9 +5,10 @@ existing one-backward utility extracted from `3a4a7b2c1`. It accumulates a fixed
 logical optimizer batch while allowing different microbatch sizes and rank
 counts, without accumulating a separate model-sized gradient bank per loss.
 
-This is a library extraction, not a switch of the current training CLI. Full
-geometry-count staging, model/loss integration and cooperative worker lifecycle
-remain subsequent stages. No existing model defaults or loss behavior change.
+This is a library extraction, not a switch of the current training CLI. The
+production loss-statistics API and geometry-count staging are included; wiring
+the training loop and cooperative worker lifecycle remain subsequent stages.
+No model defaults, sampling policy or loss objective changes.
 The old component-by-component multiple-backward implementation is not included.
 
 ## Target-only normalization
@@ -28,6 +29,66 @@ the supervised channel-element count for its weighted squared-error sum. Counts
 must use the same validity/mask and empty-group conventions as their numerators.
 Do not substitute patch size, dense-volume size, nominal batch size or an
 approximate count for the actual target support.
+
+`targets.target_normalization_counts(batch, conditioned=False)` provides those
+counts from materialized targets. It respects validity and presence masks. With
+conditioned queries, both positive queries contribute direction/positive
+groups and both dense queries contribute background groups, including positives
+as in the existing conditioned objective. Counts do not inspect predictions.
+
+`train.compute_losses(..., _return_statistics=True)` and
+`train.compute_conditioned_losses(..., _return_statistics=True)` expose the
+actual differentiable numerators from the shared production calculation. They
+do not reconstruct sums by re-running masked loss functions. Without that
+option they return the existing seven metric keys, using the shared
+`_finalize_loss_statistics` helper. Ordinary multi-branch loss remains available
+through the existing default API, but its statistics option raises because
+routing can change group counts based on predictions. No embedding loss is
+introduced by this stage.
+
+Sums and direction counts use FP32 even when conditioned model outputs are
+BF16. Otherwise the BF16 count representation can round a valid integer (for
+example, 2,952 to 2,944) and disagree with the target prepass. Model forward and
+elementwise error processing retain their configured precision. FP32 reduction
+can change last-bit rounding relative to the former mean reductions; it does
+not change the objective or weaken the exact count check.
+
+## Geometry-only effective-batch staging
+
+`sample_pipeline.MacroBatchTargetSource` wraps a leased CPU batch source before
+`FiberTrace3DCudaBatchPipeline`. Supply the local microbatch sizes for one
+complete optimizer update. It takes owned CPU copies of all tensor fields
+before releasing source credits, reuses `materialize_targets` on the training
+device with a storage-free final-shaped image, and attaches the aggregate local
+`normalization_counts` to every microbatch. The prepass transfers validity and
+geometry, never the actual CT image, and never calls a model. Deferred image
+augmentation cannot change these counts. Target construction in the real CUDA
+preparation path uses the same output stride and masks.
+
+```python
+staged = MacroBatchTargetSource(
+    cpu_batches, config=loader_config, device=device, output_stride=output_stride,
+    batch_sizes=local_microbatch_sizes, conditioned=False,
+)
+prepared = FiberTrace3DCudaBatchPipeline(
+    staged, config=loader_config, device=device, output_stride=output_stride,
+    value_augmentation_suffix="all",
+)
+```
+
+CPU storage is bounded by one local optimizer batch, in addition to the
+underlying queue and CUDA preparation window. Staged batches own their storage;
+`release_current()` is therefore a no-op. `close()` closes the source and clears
+staging. The source's `prepare_geometry(operation)` hook lets a future
+cooperative caller delimit the geometry work; it defaults to calling the
+operation directly. This hook is not a new manager integration.
+
+This wrapper requires at least one local microbatch and a finite source must
+end at a complete optimizer-update boundary. A rank with no samples bypasses
+the wrapper and supplies zero counts while participating in accumulation
+collectives. Do not change sample membership, refinement geometry or target
+settings between the count prepass and forward. Counts are preserved through
+batch slicing, pinning and transfer.
 
 For each component `c`, the update gradient is:
 
@@ -86,9 +147,8 @@ GroupNorm and other genuinely per-sample normalization can be used.
 extraction stage. It rejects embedding and ordinary multi-branch training modes
 pending their later compatible loss extraction. It does not change existing
 inference support or silently disable an already-supported training CLI mode.
-Conditioned models are not rejected by configuration; the caller must supply
-their corresponding target-only query counts/statistics. This stage does not
-wire a conditioned loss adapter into the trainer either.
+Conditioned counts/statistics are available through the production API above;
+the current trainer loop is not yet wired to bounded accumulation.
 
 ## Validation
 
@@ -99,14 +159,18 @@ autocast, packing/reporting and all-rank count mismatch failure:
 
 ```bash
 cd vesuvius
-python -m pytest -q tests/neural_tracing/test_effective_batch_accumulation.py -k 'not cuda'
+python -m pytest -q tests/neural_tracing/test_effective_batch_accumulation.py \
+  tests/neural_tracing/test_macro_batch_targets.py -k 'not cuda'
 ```
 
 Real-data cases use the actual Paris4 annotation/CT fixture described in
 [asynchronous preparation](async_training_preparation.md). A small seven-channel
 pointwise head isolates accumulation behavior from architecture/convergence.
-The test adapter obtains direction, positive and background terms from the
-unchanged production loss, rather than adding another production loss function.
+The tests consume the actual production statistics, rather than reconstructing
+them through a test-only loss adapter. An independent per-patch formula verifies
+the ordinary loss and gradients; conditioned cases exercise the existing query
+semantics. Prepass tests cover masks, empty groups, strides 1/2/4, owned queue
+slots, errors, repeated updates, exact FP32/BF16 counts and transfer metadata.
 Two AdamW updates are compared with the full-batch gradient and parameters.
 
 CUDA cases require an externally acquired GPU-manager reservation and UUID mask
@@ -114,12 +178,19 @@ for **two** GPUs, with `FIBER_COOPERATIVE_TEST_GPUS` set before child launch:
 
 ```bash
 FIBER_ASYNC_CUDA_TEST=1 python -m pytest -q -s \
-  tests/neural_tracing/test_effective_batch_accumulation.py -k cuda
+  tests/neural_tracing/test_effective_batch_accumulation.py \
+  tests/neural_tracing/test_macro_batch_targets.py -k cuda
 ```
 
 They check real Paris4 microbatch accumulation and NCCL reductions with unequal
-and zero-work ranks. CPU distributed checks use Gloo. No external data are
+and zero-work ranks, ordinary/conditioned prepass gradients and two AdamW updates
+at strides 1/2/4, and count transfer through asynchronous GPU augmentation.
+CPU distributed checks use Gloo. No external data are
 modified or downloaded. Gradient/optimizer comparisons retain the source FP32
 rounding tolerances; cross-device accumulation order is not bit-identical.
 No full-trainer convergence or throughput result is claimed by this utility
-extraction alone.
+extraction alone. Loss statistics/finalization are extracted from `dca6d0f2b`
+and target staging from `3a4a7b2c1`, adapted to retain this branch's masks. The
+shared count helper uses those same masked group conventions. Tests expose and
+fix the source's inherited BF16 conditioned count rounding; no unrelated newer
+losses, dataset changes or manager code are imported.

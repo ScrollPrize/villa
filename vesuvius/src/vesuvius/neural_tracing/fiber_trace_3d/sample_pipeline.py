@@ -27,6 +27,66 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
 from vesuvius.neural_tracing.ordered_sample_pipeline import (
     OrderedTwoStageSamplePipeline,
 )
+from .targets import materialize_targets, target_normalization_counts
+
+
+class MacroBatchTargetSource:
+    """Bounded host staging and geometry-only normalization prepass.
+
+    The value augmentation suffix changes images only. Reuse the real target
+    voxelizer on the training device with a storage-free final-shape image view.
+    Never transfer the real image or run the model in this prepass.
+    """
+
+    def __init__(self, source, *, config, device, output_stride, batch_sizes, conditioned=False):
+        self.source, self.config = source, config
+        self.device, self.output_stride = device, output_stride
+        self.batch_sizes = tuple(batch_sizes)
+        self.conditioned = conditioned
+        if not self.batch_sizes or any(n <= 0 for n in self.batch_sizes):
+            raise ValueError("target source requires nonempty local microbatches")
+        self.pending = []
+        self.prepare_geometry = lambda operation: operation()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self.pending:
+            prepared = []
+            counts = torch.zeros(3)
+            for size in self.batch_sizes:
+                raw = next(self.source)
+                try:
+                    # Queue views release/reuse their slots on next(); take
+                    # ownership before returning credits, including geometry.
+                    batch = replace(raw, **{name: value.clone() for name, value in vars(raw).items()
+                                           if isinstance(value, torch.Tensor)})
+                finally:
+                    self.source.release_current()
+                if batch.volume.shape[0] != size:
+                    raise RuntimeError("target prepass microbatch differs from canonical partition")
+                counts += self.prepare_geometry(lambda: self._counts(batch))
+                prepared.append(batch)
+            local_counts = counts.cpu()
+            self.pending = [replace(batch, normalization_counts=local_counts) for batch in reversed(prepared)]
+        return self.pending.pop()
+
+    def _counts(self, batch):
+        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=False):
+            # Preserve validity: this extracted stage still has masked targets.
+            geometry = replace(batch, volume=torch.empty(0)).to(self.device)
+            geometry = replace(geometry, volume=torch.empty(1, device=self.device).expand(
+                len(batch.volume), 1, *self.config.patch_shape_zyx))
+            targets = materialize_targets(geometry, self.config, output_stride=self.output_stride)
+            return target_normalization_counts(targets, conditioned=self.conditioned).cpu()
+
+    def release_current(self):
+        pass  # Returned batches own storage, not shared-slot leases.
+
+    def close(self):
+        self.source.close()
+        self.pending.clear()
 
 
 @dataclass(frozen=True)

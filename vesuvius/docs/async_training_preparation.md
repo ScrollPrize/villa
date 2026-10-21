@@ -9,8 +9,9 @@ This extraction does not switch the training CLI to a new loading path, change
 augmentation parameters, or alter model/loss behavior. Optional
 [GPU value augmentation](gpu_value_augmentation.md) can run on the preparation
 stream. [Fixed effective-batch accumulation](effective_batch_accumulation.md)
-provides the one-backward utility and canonical batch mapping. Geometry-count
-staging and the later trainer integration remain separate stages. The current
+provides the one-backward utility, canonical batch mapping and
+`MacroBatchTargetSource` geometry-only count prepass. The later training-loop
+and cooperative lifecycle integration remain separate stages. The current
 mask-aware CPU augmentation is unchanged.
 
 ## API and ownership
