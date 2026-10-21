@@ -462,8 +462,9 @@ void SegmentationApprovalMaskPanel::restoreSettings(QSettings& settings)
     _approvalMaskOpacity = settings.value(segmentation::APPROVAL_MASK_OPACITY, _approvalMaskOpacity).toInt();
     _approvalMaskOpacity = std::clamp(_approvalMaskOpacity, 0, 100);
     const QString colorName = settings.value(segmentation::APPROVAL_BRUSH_COLOR, _approvalBrushColor.name()).toString();
-    if (QColor::isValidColorName(colorName)) {
-        _approvalBrushColor = QColor::fromString(colorName);
+    const QColor color(colorName);
+    if (color.isValid()) {
+        _approvalBrushColor = color;
     }
     _showApprovalMask = settings.value(segmentation::SHOW_APPROVAL_MASK, _showApprovalMask).toBool();
 

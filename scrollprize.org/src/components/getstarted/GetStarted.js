@@ -130,7 +130,7 @@ export function GetStarted() {
               flattened. We call it <em>virtual unwrapping</em>.
             </p>
             <p className="vc-gs-body">
-              Below is real data from PHerc. Paris 4, and the same sheet you
+              Below is real data from PHerc. Paris. 4, and the same sheet you
               read the word from in Part 1. {coarse ? "Tap" : "Click"} where
               the scroll pulses to open a cross-section. Every thin bright line in it is one layer of
               the rolled-up sheet. Follow a single layer with your dots and

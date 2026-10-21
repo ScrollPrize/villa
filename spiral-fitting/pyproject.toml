@@ -4,12 +4,9 @@ version = "0.1.0"
 description = "Code and helpers to fit a canonical archimedean spiral to deformed scrolls"
 requires-python = ">=3.14"
 dependencies = [
-    "brook-cu12>=0.1.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "click>=8.4.2",
     "connected-components-3d>=4.0.0",
     "crackle-codec>=0.42.0",
-    "cucim-cu12>=26.8.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "cupy-cuda12x>=14.2.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     "einops>=0.8.2",
     "imageio>=2.37.3",
     "kimimaro[all]>=5.8.1; sys_platform != 'linux' or platform_machine != 'x86_64'",
@@ -51,6 +48,17 @@ cpu = ["kimimaro[all]>=5.8.1"]
 
 [dependency-groups]
 dev = ["pytest>=9.1.1"]
+# NVIDIA-only GPU backend of extract_surface_tracks.py. Installed by a plain
+# `uv sync` (see default-groups). `--no-group cuda` skips it, but torch still comes from
+# the cu128 index in [tool.uv.sources]; on ROCm use the README recipe ("Creating the Spiral Python environment").
+cuda = [
+    "brook-cu12>=0.1.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "cucim-cu12>=26.8.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "cupy-cuda12x>=14.2.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+
+[tool.uv]
+default-groups = ["dev", "cuda"]
 
 [tool.uv.sources]
 torch = [

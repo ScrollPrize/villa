@@ -54,7 +54,7 @@ class ObservationBuilder:
         x = dict(fine=self.crop_images(items,vol,self.cfg.fine,pool),seed=stack('visible_seed'),
                  seed_mask=stack('visible_seed_mask'),seed_age=stack('visible_seed_age'),
                  seed_tangent=stack('visible_seed_tangent'))
-        x.update(path_geometry_inputs(items))
+        x.update(path_geometry_inputs(items, pool=getattr(self, 'geometry_pool', None)))
         # Recorded replay frames have unknown quality unless it was supplied;
         # do not count them as newly successful CT estimates.
         quality = [item.get('ct_frame_diagnostics', {}) for item in items]

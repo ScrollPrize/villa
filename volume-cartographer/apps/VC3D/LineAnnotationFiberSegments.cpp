@@ -1,4 +1,5 @@
 #include "LineAnnotationFiberSegments.hpp"
+#include "LineAnnotationFiberLinks.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
 
 #include "vc/lasagna/NormalAlignment.hpp"
@@ -392,7 +393,8 @@ void appendFiberModeReport(FiberModeOptimizationResult& output)
             << " cspline_fallback_segments=" << output.csplineFallbackSegments
             << " native_extrapolations=" << output.nativeExtrapolations
             << " lasagna_fallback_extrapolations="
-            << output.lasagnaFallbackExtrapolations;
+            << output.lasagnaFallbackExtrapolations
+            << " ray_extrapolations=" << output.rayExtrapolations;
     output.optimization.report.message = message.str();
 }
 
@@ -429,15 +431,22 @@ void reportExtrapolationFallback(
     request.extrapolationFallbackCallback(diagnostic);
 }
 
-// Returns the index shift the tail replacement applied to every point in
-// [firstControl, lastControl]: newIndex = oldIndex + shift. Callers must
-// shift their control-point indices by it so the indices keep naming the
-// controls' exact line vertices.
-int replaceOpenTailsWithNative(
+enum class TailAction { Ray, Trace, Keep };
+
+// Replaces the open tails of the solved line, each side by its action: Ray
+// (OpenTailPolicy side: a straight ray of breakExtrapolationDistanceBaseVoxels,
+// no tracer), Trace (native global mode: the prediction tracer or the
+// external model, with today's acceptance and fallbacks), Keep (Lasagna
+// global mode: the tail the Lasagna solver grew). Returns the index shift
+// applied to every point in [firstControl, lastControl]: newIndex = oldIndex
+// + shift. Callers must shift their control-point indices by it so the
+// indices keep naming the controls' exact line vertices.
+int replaceOpenTails(
     const FiberModeOptimizationRequest& request,
     const vc::fiber_tracer::FiberTraceCoordinateAdapter& coordinates,
     int firstControl,
     int lastControl,
+    OpenTailPolicy policy,
     FiberModeOptimizationResult& output)
 {
     std::vector<cv::Vec3d> finalPoints;
@@ -450,20 +459,69 @@ int replaceOpenTailsWithNative(
         throw std::runtime_error(
             "Lasagna fallback returned invalid endpoint control indices");
     }
+    const auto throwIfCancelled = [&request] {
+        if (request.cancelFlag &&
+            request.cancelFlag->load(std::memory_order_relaxed)) {
+            throw vc::lasagna::LineOptimizationCancelled();
+        }
+    };
+    throwIfCancelled();
+    const bool traceMode =
+        request.globalMode == FiberOptimizationMode::NativeFiberTrace3d;
+    const auto actionFor = [traceMode](bool ray) {
+        return ray ? TailAction::Ray : (traceMode ? TailAction::Trace : TailAction::Keep);
+    };
+    const TailAction leftAction = actionFor(policy.headRay);
+    const TailAction rightAction = actionFor(policy.tailRay);
 
+    // Keep: the solver's own tails.
     std::vector<cv::Vec3d> leftTail(
         finalPoints.begin(), finalPoints.begin() + firstControl + 1);
     std::vector<cv::Vec3d> rightTail(
         finalPoints.begin() + lastControl, finalPoints.end());
-    if (request.extrapolationDistanceBaseVoxels == 0.0) {
-        leftTail = {finalPoints[static_cast<size_t>(firstControl)]};
-        rightTail = {finalPoints[static_cast<size_t>(lastControl)]};
-    } else {
+
+    if (leftAction != TailAction::Keep || rightAction != TailAction::Keep) {
         if (firstControl + 1 >= static_cast<int>(finalPoints.size()) ||
             lastControl == 0) {
             throw std::runtime_error(
                 "Lasagna fallback did not provide both endpoint directions");
         }
+    }
+    const auto outwardDirection = [&](int endpoint, int inner, bool left) {
+        auto direction=finalPoints[size_t(endpoint)]-finalPoints[size_t(inner)];
+        const auto& annotated=left ?
+            request.controlPoints.front().direction : request.controlPoints.back().direction;
+        if (annotated) direction=left ? -*annotated : *annotated;
+        return direction;
+    };
+    const double raySpacing = std::max(0.1, request.lasagnaConfig.segmentLength);
+    if (leftAction == TailAction::Ray) {
+        const auto ray = rayTailPoints(
+            finalPoints[static_cast<size_t>(firstControl)],
+            outwardDirection(firstControl, firstControl + 1, true),
+            request.breakExtrapolationDistanceBaseVoxels,
+            raySpacing);
+        leftTail.assign(ray.rbegin(), ray.rend());
+        leftTail.push_back(finalPoints[static_cast<size_t>(firstControl)]);
+        ++output.rayExtrapolations;
+    }
+    if (rightAction == TailAction::Ray) {
+        const auto ray = rayTailPoints(
+            finalPoints[static_cast<size_t>(lastControl)],
+            outwardDirection(lastControl, lastControl - 1, false),
+            request.breakExtrapolationDistanceBaseVoxels,
+            raySpacing);
+        rightTail = {finalPoints[static_cast<size_t>(lastControl)]};
+        rightTail.insert(rightTail.end(), ray.begin(), ray.end());
+        ++output.rayExtrapolations;
+    }
+
+    const bool traceLeft = leftAction == TailAction::Trace;
+    const bool traceRight = rightAction == TailAction::Trace;
+    if ((traceLeft || traceRight) && request.extrapolationDistanceBaseVoxels == 0.0) {
+        if (traceLeft) leftTail = {finalPoints[static_cast<size_t>(firstControl)]};
+        if (traceRight) rightTail = {finalPoints[static_cast<size_t>(lastControl)]};
+    } else if (traceLeft || traceRight) {
         if (request.cancelFlag &&
             request.cancelFlag->load(std::memory_order_relaxed)) {
             throw vc::lasagna::LineOptimizationCancelled();
@@ -471,10 +529,9 @@ int replaceOpenTailsWithNative(
         const double extrapolationTrace = coordinates.baseDistanceToTrace(
             request.extrapolationDistanceBaseVoxels);
         const auto traceTail = [&](int endpoint, int inner, bool left) {
-            auto direction=finalPoints[size_t(endpoint)]-finalPoints[size_t(inner)];
+            const auto direction = outwardDirection(endpoint, inner, left);
             const auto& annotated=left ?
                 request.controlPoints.front().direction : request.controlPoints.back().direction;
-            if (annotated) direction=left ? -*annotated : *annotated;
             if (request.externalExtrapolation) {
                 // Only the annotated interval is observed history. Opposite
                 // extrapolated tails are predictions, not evidence for the
@@ -494,72 +551,79 @@ int replaceOpenTailsWithNative(
                 request.traceConfig,
                 request.traceNormalSampler, {}, annotated.has_value());
         };
-        std::optional<vc::fiber_tracer::FiberTraceOneWayResult> left;
-        std::string leftException;
-        try {
-            left = traceTail(firstControl, firstControl + 1, true);
-        } catch (const std::exception& ex) {
-            leftException = ex.what();
-            left.reset();
-        } catch (...) {
-            leftException = "unknown native fiber extrapolation exception";
-            left.reset();
-        }
-        if (left && usableNativeExtrapolation(*left)) {
-            leftTail = coordinates.traceToBase(left->points);
-            leftTail.front() = finalPoints[static_cast<size_t>(firstControl)];
-            std::reverse(leftTail.begin(), leftTail.end());
-            ++output.nativeExtrapolations;
-        } else {
-            reportExtrapolationFallback(
-                request,
-                FiberExtrapolationFallbackDiagnostic::Side::Left,
-                left,
-                leftException);
-            if (request.modelLineBuilder) {
-                if (!leftException.empty()) throw std::runtime_error(leftException);
-                leftTail = {finalPoints[static_cast<size_t>(firstControl)]};
+        if (traceLeft) {
+            std::optional<vc::fiber_tracer::FiberTraceOneWayResult> left;
+            std::string leftException;
+            try {
+                left = traceTail(firstControl, firstControl + 1, true);
+            } catch (const std::exception& ex) {
+                leftException = ex.what();
+                left.reset();
+            } catch (...) {
+                leftException = "unknown native fiber extrapolation exception";
+                left.reset();
+            }
+            if (left && usableNativeExtrapolation(*left)) {
+                leftTail = coordinates.traceToBase(left->points);
+                leftTail.front() = finalPoints[static_cast<size_t>(firstControl)];
+                std::reverse(leftTail.begin(), leftTail.end());
+                ++output.nativeExtrapolations;
             } else {
-                ++output.lasagnaFallbackExtrapolations;
+                reportExtrapolationFallback(
+                    request,
+                    FiberExtrapolationFallbackDiagnostic::Side::Left,
+                    left,
+                    leftException);
+                if (request.modelLineBuilder) {
+                    if (!leftException.empty()) throw std::runtime_error(leftException);
+                    leftTail = {finalPoints[static_cast<size_t>(firstControl)]};
+                } else {
+                    ++output.lasagnaFallbackExtrapolations;
+                }
             }
         }
-        // Re-check between the two traces: each can be a long prediction
-        // walk, and a solve superseded during the left one should not still
-        // pay for the right one.
-        if (request.cancelFlag &&
-            request.cancelFlag->load(std::memory_order_relaxed)) {
-            throw vc::lasagna::LineOptimizationCancelled();
-        }
-        std::optional<vc::fiber_tracer::FiberTraceOneWayResult> right;
-        std::string rightException;
-        try {
-            right = traceTail(lastControl, lastControl - 1, false);
-        } catch (const std::exception& ex) {
-            rightException = ex.what();
-            right.reset();
-        } catch (...) {
-            rightException = "unknown native fiber extrapolation exception";
-            right.reset();
-        }
-        if (right && usableNativeExtrapolation(*right)) {
-            rightTail = coordinates.traceToBase(right->points);
-            rightTail.front() = finalPoints[static_cast<size_t>(lastControl)];
-            ++output.nativeExtrapolations;
-        } else {
-            reportExtrapolationFallback(
-                request,
-                FiberExtrapolationFallbackDiagnostic::Side::Right,
-                right,
-                rightException);
-            if (request.modelLineBuilder) {
-                if (!rightException.empty()) throw std::runtime_error(rightException);
-                rightTail = {finalPoints[static_cast<size_t>(lastControl)]};
+        if (traceRight) {
+            // Re-check between the two traces: each can be a long prediction
+            // walk, and a solve superseded during the left one should not
+            // still pay for the right one.
+            if (request.cancelFlag &&
+                request.cancelFlag->load(std::memory_order_relaxed)) {
+                throw vc::lasagna::LineOptimizationCancelled();
+            }
+            std::optional<vc::fiber_tracer::FiberTraceOneWayResult> right;
+            std::string rightException;
+            try {
+                right = traceTail(lastControl, lastControl - 1, false);
+            } catch (const std::exception& ex) {
+                rightException = ex.what();
+                right.reset();
+            } catch (...) {
+                rightException = "unknown native fiber extrapolation exception";
+                right.reset();
+            }
+            if (right && usableNativeExtrapolation(*right)) {
+                rightTail = coordinates.traceToBase(right->points);
+                rightTail.front() = finalPoints[static_cast<size_t>(lastControl)];
+                ++output.nativeExtrapolations;
             } else {
-                ++output.lasagnaFallbackExtrapolations;
+                reportExtrapolationFallback(
+                    request,
+                    FiberExtrapolationFallbackDiagnostic::Side::Right,
+                    right,
+                    rightException);
+                if (request.modelLineBuilder) {
+                    if (!rightException.empty()) throw std::runtime_error(rightException);
+                    rightTail = {finalPoints[static_cast<size_t>(lastControl)]};
+                } else {
+                    ++output.lasagnaFallbackExtrapolations;
+                }
             }
         }
     }
 
+    // A trace may have set the flag; the rebuild below samples normals for
+    // the whole line and must not run for a superseded solve.
+    throwIfCancelled();
     std::vector<cv::Vec3d> combined;
     combined.reserve(leftTail.size() + finalPoints.size() + rightTail.size());
     combined.insert(combined.end(), leftTail.begin(), leftTail.end());
@@ -619,6 +683,11 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         throw std::invalid_argument(
             "extrapolation distance must be finite and non-negative");
     }
+    if (!(request.breakExtrapolationDistanceBaseVoxels > 0.0) ||
+        !std::isfinite(request.breakExtrapolationDistanceBaseVoxels)) {
+        throw std::invalid_argument(
+            "break extrapolation distance must be finite and positive");
+    }
 
     if (request.cancelFlag) {
         request.lasagnaConfig.cancelFlag = request.cancelFlag;
@@ -643,12 +712,22 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         }
     }
     request.controlPoints.back().segmentToNext.reset();
+    // Which open tails become straight rays (lone end breaks, kollesis
+    // ends); read from the sorted controls and their span tags.
+    const OpenTailPolicy tailPolicy = openTailPolicyForControls(request.controlPoints);
+    const bool traceGlobalMode =
+        request.globalMode == FiberOptimizationMode::NativeFiberTrace3d;
+    // Lasagna mode keeps the solver's own tails unless a side is a ray; the
+    // native mode always replaces both (trace or ray).
+    const bool replaceTails = request.retainOpenTails &&
+        (traceGlobalMode || tailPolicy.any());
 
     const vc::fiber_tracer::FiberTraceCoordinateAdapter coordinates(
         request.traceToBaseScale);
     request.traceConfig.traceToBaseScale = request.traceToBaseScale;
     FiberModeOptimizationResult output;
     if (request.controlPoints.size() == 1) {
+        throwIfCancelled();
         auto config = request.lasagnaConfig;
         cv::Vec3d tangent = lineTangentAtPosition(
             request.linePointsBase, request.controlPoints.front().linePosition);
@@ -681,20 +760,33 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         for (const auto& point : output.optimization.line.points) {
             baselinePoints.push_back(point.position);
         }
-        const int controlIndex = static_cast<int>(nearestPointIndex(
-            baselinePoints, request.controlPoints.front().volumePoint));
+        // The optimizer anchors its seed line at the seed: that index is
+        // authoritative when it names the seed vertex (a seed line can
+        // revisit the seed's coordinate on a folded normal field).
+        const int anchor = output.optimization.line.displayFrameAnchorIndex;
+        const bool anchorIsSeed = anchor >= 0 &&
+            anchor < static_cast<int>(baselinePoints.size()) &&
+            pointsApproximatelyEqual(baselinePoints[static_cast<size_t>(anchor)],
+                                     request.controlPoints.front().volumePoint);
+        const int controlIndex = anchorIsSeed
+            ? anchor
+            : static_cast<int>(nearestPointIndex(
+                  baselinePoints, request.controlPoints.front().volumePoint));
         request.controlPoints.front().optimizedIndex = controlIndex;
         request.controlPoints.front().linePosition =
             static_cast<double>(controlIndex);
-        if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d &&
-            request.retainOpenTails) {
-            const int shift = replaceOpenTailsWithNative(
-                request, coordinates, controlIndex, controlIndex, output);
+        if (replaceTails) {
+            const int shift = replaceOpenTails(
+                request, coordinates, controlIndex, controlIndex, tailPolicy, output);
             request.controlPoints.front().optimizedIndex += shift;
             request.controlPoints.front().linePosition +=
                 static_cast<double>(shift);
         }
+        throwIfCancelled();
         finishModelLine(output);
+        // The model builder is a long callback too: a solve cancelled during
+        // it must not complete.
+        throwIfCancelled();
         appendFiberModeReport(output);
         output.controlPoints = std::move(request.controlPoints);
         return output;
@@ -703,11 +795,40 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
     const std::vector<cv::Vec3d> referenceTrace =
         coordinates.baseToTrace(request.linePointsBase);
 
+    // A control's own index fields are authoritative when they name its
+    // vertex on the input line (every solve and landing keeps them so):
+    // optimizedIndex first, then an integral linePosition. The coordinate
+    // search is the fallback for controls without one (a fresh seed, a
+    // reopened file), restricted to the line AFTER the previous control so
+    // the controls resolve in line order: a straight tail can revisit a
+    // control's coordinate exactly (a folded fiber), which an unrestricted
+    // search could not tell apart.
     std::vector<size_t> originalControlIndices;
     originalControlIndices.reserve(request.controlPoints.size());
+    const auto namesVertex = [&request](double index, const cv::Vec3d& point) {
+        return std::isfinite(index) && index >= 0.0 &&
+            index == std::floor(index) &&
+            index < static_cast<double>(request.linePointsBase.size()) &&
+            pointsApproximatelyEqual(request.linePointsBase[static_cast<size_t>(index)], point);
+    };
     for (const auto& control : request.controlPoints) {
-        originalControlIndices.push_back(
-            nearestPointIndex(request.linePointsBase, control.volumePoint));
+        const size_t searchFrom = originalControlIndices.empty()
+            ? 0
+            : originalControlIndices.back() + 1;
+        if (namesVertex(static_cast<double>(control.optimizedIndex), control.volumePoint)) {
+            originalControlIndices.push_back(static_cast<size_t>(control.optimizedIndex));
+        } else if (namesVertex(control.linePosition, control.volumePoint)) {
+            originalControlIndices.push_back(static_cast<size_t>(control.linePosition));
+        } else if (searchFrom < request.linePointsBase.size()) {
+            const std::vector<cv::Vec3d> rest(
+                request.linePointsBase.begin() + static_cast<std::ptrdiff_t>(searchFrom),
+                request.linePointsBase.end());
+            originalControlIndices.push_back(
+                searchFrom + nearestPointIndex(rest, control.volumePoint));
+        } else {
+            originalControlIndices.push_back(
+                nearestPointIndex(request.linePointsBase, control.volumePoint));
+        }
     }
     for (size_t index = 1; index < originalControlIndices.size(); ++index) {
         if (originalControlIndices[index] <= originalControlIndices[index - 1]) {
@@ -1138,10 +1259,9 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         request.controlPoints[index].linePosition =
             static_cast<double>(reinitialized.fixedPointIndices[index]);
     }
-    if (request.globalMode == FiberOptimizationMode::NativeFiberTrace3d &&
-        request.retainOpenTails) {
-        const int shift = replaceOpenTailsWithNative(
-            request, coordinates, firstControl, lastControl, output);
+    if (replaceTails) {
+        const int shift = replaceOpenTails(
+            request, coordinates, firstControl, lastControl, tailPolicy, output);
         for (auto& control : request.controlPoints) {
             control.optimizedIndex += shift;
             control.linePosition += static_cast<double>(shift);
@@ -1188,7 +1308,9 @@ FiberModeOptimizationResult optimizeFiberWithNativeFallback(
         if (request.baseNormalSampler)
             line.points.back().sampledNormal = request.baseNormalSampler->sampleNormal(line.points.back().position);
     }
+    throwIfCancelled();
     finishModelLine(output);
+    throwIfCancelled();
     appendFiberModeReport(output);
     output.controlPoints = std::move(request.controlPoints);
     return output;
@@ -1575,6 +1697,352 @@ std::vector<std::pair<size_t, size_t>> gapSpansForControls(
         }
     }
     return spans;
+}
+
+namespace {
+
+template <typename Control>
+bool controlHasTag(const Control& control, const char* tag)
+{
+    return hasControlPointTag(control.tags, tag);
+}
+
+// Ray side rule shared by both policy overloads: `end` is the end control,
+// `adjacentOwner` the control owning the one span that touches it (null for
+// a single control).
+template <typename Control>
+bool endIsRaySide(const Control& end, const Control* adjacentOwner)
+{
+    if (controlHasTag(end, kKollesisTerminationTag)) {
+        return true;
+    }
+    if (!controlHasTag(end, kBreakTag)) {
+        return false;
+    }
+    return !adjacentOwner || !spanIsGap(adjacentOwner->segmentToNext);
+}
+
+std::vector<size_t> lineOrder(const std::vector<LineControlPoint>& controls)
+{
+    std::vector<size_t> order;
+    order.reserve(controls.size());
+    for (size_t i = 0; i < controls.size(); ++i) {
+        if (std::isfinite(controls[i].linePosition)) {
+            order.push_back(i);
+        }
+    }
+    std::stable_sort(order.begin(), order.end(), [&controls](size_t a, size_t b) {
+        return controls[a].linePosition < controls[b].linePosition;
+    });
+    return order;
+}
+
+// Lone end break test for appendedControlToTagAsBreak: a break, not a
+// kollesis, whose one adjacent span (if any) is not a gap.
+template <typename Control>
+bool endIsLoneBreak(const Control& end, const Control* adjacentOwner)
+{
+    return controlHasTag(end, kBreakTag) &&
+        !controlHasTag(end, kKollesisTerminationTag) &&
+        (!adjacentOwner || !spanIsGap(adjacentOwner->segmentToNext));
+}
+
+}  // namespace
+
+OpenTailPolicy openTailPolicyForControls(const std::vector<LineControlPoint>& controls)
+{
+    OpenTailPolicy policy;
+    const std::vector<size_t> order = lineOrder(controls);
+    if (order.empty()) {
+        return policy;
+    }
+    const LineControlPoint& head = controls[order.front()];
+    const LineControlPoint& tail = controls[order.back()];
+    // The head's adjacent span is the one it owns; the tail's is owned by the
+    // control before it in line order.
+    const LineControlPoint* headSpanOwner = order.size() >= 2 ? &head : nullptr;
+    const LineControlPoint* tailSpanOwner =
+        order.size() >= 2 ? &controls[order[order.size() - 2]] : nullptr;
+    policy.headRay = endIsRaySide(head, headSpanOwner);
+    policy.tailRay = endIsRaySide(tail, tailSpanOwner);
+    return policy;
+}
+
+OpenTailPolicy openTailPolicyForControls(const std::vector<StoredControlPoint>& controls)
+{
+    OpenTailPolicy policy;
+    if (controls.empty()) {
+        return policy;
+    }
+    const StoredControlPoint* headSpanOwner =
+        controls.size() >= 2 ? &controls.front() : nullptr;
+    const StoredControlPoint* tailSpanOwner =
+        controls.size() >= 2 ? &controls[controls.size() - 2] : nullptr;
+    policy.headRay = endIsRaySide(controls.front(), headSpanOwner);
+    policy.tailRay = endIsRaySide(controls.back(), tailSpanOwner);
+    return policy;
+}
+
+bool singleControlRayOnly(const std::vector<LineControlPoint>& controls)
+{
+    if (controls.size() != 1) {
+        return false;
+    }
+    const OpenTailPolicy policy = openTailPolicyForControls(controls);
+    return policy.headRay && policy.tailRay;
+}
+
+std::vector<size_t> lineOrderSpanRanks(const std::vector<LineControlPoint>& controls,
+                                       const std::vector<size_t>& owners)
+{
+    const std::vector<size_t> order = lineOrder(controls);
+    std::vector<size_t> rankOf(controls.size(), controls.size());
+    for (size_t rank = 0; rank < order.size(); ++rank) {
+        rankOf[order[rank]] = rank;
+    }
+    std::vector<size_t> ranks;
+    for (const size_t owner : owners) {
+        if (owner >= controls.size() || rankOf[owner] + 1 >= order.size()) {
+            continue;
+        }
+        ranks.push_back(rankOf[owner]);
+    }
+    std::sort(ranks.begin(), ranks.end());
+    ranks.erase(std::unique(ranks.begin(), ranks.end()), ranks.end());
+    return ranks;
+}
+
+std::optional<size_t> appendedControlToTagAsBreak(
+    const std::vector<LineControlPoint>& previousControls,
+    const PreparedControlPointEdit& prepared)
+{
+    if (!prepared.collapsedOldIndices.empty() || previousControls.empty() ||
+        prepared.controlPoints.size() < 2 ||
+        prepared.replacementIndex >= prepared.controlPoints.size()) {
+        return std::nullopt;
+    }
+    const std::vector<size_t> order = lineOrder(previousControls);
+    if (order.empty()) {
+        return std::nullopt;
+    }
+    const size_t last = prepared.controlPoints.size() - 1;
+    const LineControlPoint* previousEnd = nullptr;
+    const LineControlPoint* previousSpanOwner = nullptr;
+    const LineControlPoint* neighbour = nullptr;
+    if (prepared.replacementIndex == last) {
+        previousEnd = &previousControls[order.back()];
+        previousSpanOwner =
+            order.size() >= 2 ? &previousControls[order[order.size() - 2]] : nullptr;
+        neighbour = &prepared.controlPoints[last - 1];
+    } else if (prepared.replacementIndex == 0) {
+        previousEnd = &previousControls[order.front()];
+        previousSpanOwner = order.size() >= 2 ? previousEnd : nullptr;
+        neighbour = &prepared.controlPoints[1];
+    } else {
+        return std::nullopt;
+    }
+    // The prepared list carries copies of the previous controls: the control
+    // the new one attaches to must be the previous end itself.
+    if (!pointsApproximatelyEqual(neighbour->volumePoint, previousEnd->volumePoint)) {
+        return std::nullopt;
+    }
+    if (!endIsLoneBreak(*previousEnd, previousSpanOwner)) {
+        return std::nullopt;
+    }
+    return prepared.replacementIndex;
+}
+
+size_t nearestLineIndex(const std::vector<cv::Vec3d>& points,
+                        const cv::Vec3d& target,
+                        NearestTie tie)
+{
+    if (points.empty()) {
+        throw std::invalid_argument("cannot resolve a control point on an empty line");
+    }
+    size_t best = 0;
+    double bestDistance = std::numeric_limits<double>::infinity();
+    for (size_t i = 0; i < points.size(); ++i) {
+        const double distance = cv::norm(points[i] - target);
+        if (distance < bestDistance ||
+            (tie == NearestTie::Last && distance == bestDistance)) {
+            bestDistance = distance;
+            best = i;
+        }
+    }
+    return best;
+}
+
+std::vector<cv::Vec3d> rayTailPoints(const cv::Vec3d& endpoint,
+                                     const cv::Vec3d& direction,
+                                     double distance,
+                                     double spacing)
+{
+    if (!(distance > 0.0) || !std::isfinite(distance)) {
+        throw std::invalid_argument("ray tail distance must be finite and positive");
+    }
+    if (!(spacing > 0.0) || !std::isfinite(spacing)) {
+        throw std::invalid_argument("ray tail spacing must be finite and positive");
+    }
+    const double length = cv::norm(direction);
+    if (!(length > 1.0e-12) || !std::isfinite(length) ||
+        !std::isfinite(endpoint[0]) || !std::isfinite(endpoint[1]) ||
+        !std::isfinite(endpoint[2])) {
+        throw std::invalid_argument("ray tail needs a finite endpoint and a non-zero direction");
+    }
+    const cv::Vec3d unit = direction * (1.0 / length);
+    const int samples = std::max(1, static_cast<int>(std::ceil(distance / spacing)));
+    std::vector<cv::Vec3d> points;
+    points.reserve(static_cast<size_t>(samples));
+    for (int k = 1; k <= samples; ++k) {
+        const double along = k == samples ? distance : std::min(distance, k * spacing);
+        points.push_back(endpoint + unit * along);
+    }
+    return points;
+}
+
+int replaceRayTails(vc::lasagna::LineModel& line,
+                    int firstControl,
+                    int lastControl,
+                    OpenTailPolicy policy,
+                    const std::optional<cv::Vec3d>& headDirection,
+                    const std::optional<cv::Vec3d>& tailDirection,
+                    double distance,
+                    double spacing,
+                    const vc::lasagna::NormalSampler* sampler)
+{
+    const int count = static_cast<int>(line.points.size());
+    if (firstControl < 0 || lastControl < firstControl || lastControl >= count) {
+        throw std::invalid_argument("ray tail replacement got invalid control indices");
+    }
+    if (!policy.any()) {
+        return 0;
+    }
+    if (firstControl + 1 >= count || lastControl == 0) {
+        throw std::invalid_argument("ray tail replacement needs a line with a tangent at each end");
+    }
+    const auto rayPoints = [&](int endpoint, int inner, bool left,
+                               const std::optional<cv::Vec3d>& annotated) {
+        cv::Vec3d direction = line.points[static_cast<size_t>(endpoint)].position -
+            line.points[static_cast<size_t>(inner)].position;
+        if (annotated) {
+            direction = left ? -*annotated : *annotated;
+        }
+        std::vector<vc::lasagna::LinePoint> ray;
+        for (const auto& position : rayTailPoints(
+                 line.points[static_cast<size_t>(endpoint)].position, direction, distance, spacing)) {
+            vc::lasagna::LinePoint point;
+            point.position = position;
+            if (sampler) {
+                point.sampledNormal = sampler->sampleNormal(position);
+            }
+            ray.push_back(std::move(point));
+        }
+        return ray;
+    };
+    std::vector<vc::lasagna::LinePoint> combined;
+    combined.reserve(line.points.size() + 2 * static_cast<size_t>(std::ceil(distance / spacing)) + 2);
+    int shift = 0;
+    if (policy.headRay) {
+        auto ray = rayPoints(firstControl, firstControl + 1, true, headDirection);
+        combined.insert(combined.end(), ray.rbegin(), ray.rend());
+        shift = static_cast<int>(ray.size()) - firstControl;
+    } else {
+        combined.insert(combined.end(), line.points.begin(),
+                        line.points.begin() + firstControl);
+    }
+    combined.insert(combined.end(), line.points.begin() + firstControl,
+                    line.points.begin() + lastControl + 1);
+    if (policy.tailRay) {
+        auto ray = rayPoints(lastControl, lastControl - 1, false, tailDirection);
+        combined.insert(combined.end(), ray.begin(), ray.end());
+    } else {
+        combined.insert(combined.end(), line.points.begin() + lastControl + 1,
+                        line.points.end());
+    }
+    const int anchor = line.displayFrameAnchorIndex;
+    line.displayFrameAnchorIndex = anchor >= firstControl && anchor <= lastControl
+        ? anchor + shift
+        : static_cast<int>(combined.size() / 2);
+    line.segmentSamples.clear();
+    line.points = std::move(combined);
+    return shift;
+}
+
+const LineControlPoint* nearestControlAtPoint(
+    const std::vector<LineControlPoint>& controls, const cv::Vec3d& point)
+{
+    const LineControlPoint* best = nullptr;
+    double bestDistance = std::numeric_limits<double>::infinity();
+    for (const auto& control : controls) {
+        if (!pointsApproximatelyEqual(control.volumePoint, point)) {
+            continue;
+        }
+        const double distance = cv::norm(control.volumePoint - point);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            best = &control;
+        }
+    }
+    return best;
+}
+
+LineControlPoint* nearestControlAtPoint(std::vector<LineControlPoint>& controls,
+                                        const cv::Vec3d& point)
+{
+    const auto& constControls = controls;
+    return const_cast<LineControlPoint*>(nearestControlAtPoint(constControls, point));
+}
+
+MirroredControlEditOutcome applyMirroredControlPointEdit(
+    std::vector<LineControlPoint>& live,
+    std::vector<LineControlPoint>* beforeModeChange,
+    std::vector<LineControlPoint>* collapseRollback,
+    const cv::Vec3d& editedPoint,
+    const std::function<bool(LineControlPoint&)>& edit)
+{
+    MirroredControlEditOutcome outcome;
+    // The control that stands for the edited one: the NEAREST within the
+    // position tolerance, so an exact twin wins over a distinct visit that
+    // merely passes within tolerance (a line that revisits its own
+    // coordinates).
+    const auto applyTo = [&edit, &editedPoint](std::vector<LineControlPoint>& controls) {
+        if (auto* control = nearestControlAtPoint(controls, editedPoint)) {
+            return edit(*control);
+        }
+        return false;
+    };
+    const auto goalsOf = [](const std::vector<LineControlPoint>& controls) {
+        std::vector<SegmentInterpolationGoal> goals;
+        goals.reserve(controls.size());
+        for (const auto& control : controls) {
+            goals.push_back(control.segmentToNext ? control.segmentToNext->interpGoal
+                                                  : SegmentInterpolationGoal::Global);
+        }
+        return goals;
+    };
+    const OpenTailPolicy livePolicyBefore = openTailPolicyForControls(live);
+    if (applyTo(live)) {
+        outcome.changed = true;
+        outcome.liveSync = applyGapSpanPolicy(live);
+        outcome.livePolicyChanged = openTailPolicyForControls(live) != livePolicyBefore;
+    }
+    for (auto* snapshot : {beforeModeChange, collapseRollback}) {
+        if (!snapshot) {
+            continue;
+        }
+        const OpenTailPolicy policyBefore = openTailPolicyForControls(*snapshot);
+        const auto goalsBefore = goalsOf(*snapshot);
+        if (!applyTo(*snapshot)) {
+            continue;
+        }
+        outcome.changed = true;
+        (void)applyGapSpanPolicy(*snapshot);
+        if (openTailPolicyForControls(*snapshot) != policyBefore ||
+            goalsOf(*snapshot) != goalsBefore) {
+            outcome.snapshotChanged = true;
+        }
+    }
+    return outcome;
 }
 
 std::vector<std::string> controlPointTagsFromJson(const nlohmann::json& json)

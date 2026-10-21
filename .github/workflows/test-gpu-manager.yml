@@ -1,0 +1,56 @@
+name: Cooperative GPU manager
+
+on:
+  pull_request:
+    paths:
+      - "gpu_manager/**"
+      - ".github/workflows/test-gpu-manager.yml"
+  push:
+    branches: [main]
+    paths:
+      - "gpu_manager/**"
+      - ".github/workflows/test-gpu-manager.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest]
+        python: ["3.11", "3.14"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install standalone test dependencies
+        run: python -m pip install -e './gpu_manager[test]'
+      - name: Test CPU-only protocol and process lifecycle
+        run: python -m pytest -q gpu_manager/tests --durations=10 --basetemp=/tmp/vgm-tests
+
+  torch-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      OPENBLAS_NUM_THREADS: "1"
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install CPU-only integration dependencies
+        run: |
+          python -m pip install -e './gpu_manager[test]'
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - name: Require Torch and Gloo, then test tensor handoff and failure cleanup
+        run: |
+          python -c "import torch.distributed as d; assert d.is_available() and d.is_gloo_available()"
+          python -m pytest -q gpu_manager/tests -m torch --durations=10 --basetemp=/tmp/vgm-tests

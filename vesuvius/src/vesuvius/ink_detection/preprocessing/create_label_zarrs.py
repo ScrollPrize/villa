@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import logging
 from multiprocessing.process import BaseProcess
 import os
 from pathlib import Path
@@ -25,6 +26,8 @@ from vesuvius.label_zarr import (
     pyramid_shapes,
 )
 from vesuvius.utils.cli import HyphenUnderscoreParser
+
+LOGGER = logging.getLogger(__name__)
 
 
 STREAM_BLOCK_SIZE = 1024
@@ -177,13 +180,49 @@ def _normalized_2d_shape(
     return int(dimensions[0]), int(dimensions[1])
 
 
+def _image_page_count(tif: tifffile.TiffFile) -> int:
+    """Number of full-resolution pages, ignoring pyramid reduced-image IFDs.
+
+    Call it before ``tif.asarray()``/``tif.series``: those may switch
+    ``tif.pages`` to lightweight frames, which carry no ``subfiletype``.
+    """
+    return sum(
+        1 for page in tif.pages if not (int(getattr(page, "subfiletype", 0)) & 1)
+    )
+
+
+def _warn_extra_pages(path: Path, page_count: int) -> None:
+    """Say so when only the first page of a multi-page TIFF is converted."""
+    if page_count > 1:
+        ignored = "page 2 is" if page_count == 2 else f"pages 2-{page_count} are"
+        LOGGER.warning(
+            "%s has %d pages; converting page 1 only (%s ignored). "
+            "Export a single-page image if that is not what you meant.",
+            path,
+            page_count,
+            ignored,
+        )
+
+
 def load_image(path: Path) -> np.ndarray:
-    """Read a TIFF or PNG as one contiguous two-dimensional array."""
+    """Read a TIFF or PNG as one contiguous two-dimensional array.
+
+    A multi-page TIFF is read as its first page. Loading it whole would
+    stack the pages into a ``(pages, height, width)`` array and the channel
+    squeeze below would then mistake the page axis for height (#1738).
+    """
     if path.suffix.lower() in {".tif", ".tiff"}:
         with tifffile.TiffFile(path) as tif:
-            series = tif.series[0] if tif.series else None
-            axes = str(series.axes) if series is not None else ""
-            image = np.asarray(tif.asarray())
+            page_count = _image_page_count(tif)
+            _warn_extra_pages(path, page_count)
+            if page_count > 1:
+                page = tif.pages[0]
+                axes = str(page.axes)
+                image = page.asarray()
+            else:
+                series = tif.series[0] if tif.series else None
+                axes = str(series.axes) if series is not None else ""
+                image = tif.asarray()
     else:
         axes = ""
         image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
@@ -340,6 +379,9 @@ def _get_streamable_tiff_metadata(
             # Tiled input streamed before this change, unconditionally. Leave
             # that exactly as it was: every extra condition here is a tiled
             # file that regresses to the in-memory path it was exempt from.
+            # Streaming reads page 1 only; say so for a multi-page file, as
+            # the in-memory path does.
+            _warn_extra_pages(path, _image_page_count(tif))
             return (
                 _normalized_2d_shape(page.shape, page.axes, path),
                 np.dtype(page.dtype),
@@ -348,12 +390,9 @@ def _get_streamable_tiff_metadata(
         # Striped input is what this change adds. The two conditions below
         # apply only to it.
         if len(tif.pages) != 1:
-            # The rest of this module -- _normalize_to_2d,
-            # _normalized_2d_shape, _create_ome_zarr_datasets(image_shape:
-            # tuple[int, int]) -- is built for a single flat 2D label image.
-            # A genuine multi-page file already produces silently wrong output
-            # on the in-memory path today, independent of this change; that is
-            # a separate bug and this PR does not touch it.
+            # Streaming is wired for one IFD. A striped file with more than
+            # one falls through to load_image, which converts page 1 and
+            # warns about the rest (#1738).
             return None
         if page.compression not in _STREAMABLE_COMPRESSIONS:
             # Some codecs (notably old-style JPEG, compression 6) need

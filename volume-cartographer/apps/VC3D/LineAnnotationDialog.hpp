@@ -158,6 +158,9 @@ public:
     ReoptimizationMode reoptimizationMode() const;
     int initialCenterlineLengthVx() const;
     int extrapolationDistanceVx() const;
+    // Applied value of the "Break extrapolation" menu row (base voxels): the
+    // straight ray past a lone break point or a kollesis termination.
+    int breakExtrapolationDistanceVx() const;
     int maxControlPointExtrapolationDistanceVx() const;
     vc3d::line_annotation::FiberOptimizationMode fiberOptimizationMode() const;
     void setFiberOptimizationMode(vc3d::line_annotation::FiberOptimizationMode mode);
@@ -316,6 +319,7 @@ signals:
     void lasagnaDatasetSelectionChanged(const std::string& location);
     void fiberInferenceDatasetSelectionChanged(const std::string& location);
     void extrapolationDistanceChanged(int distanceVx);
+    void breakExtrapolationDistanceChanged(int distanceVx);
 
 protected:
     void closeEvent(QCloseEvent* event) override;
@@ -621,10 +625,12 @@ private:
     void updateFiberWidthCursor(CChunkedVolumeViewer* viewer, std::optional<QPointF> scenePoint);
     void refreshFiberWidthCursors();
     QSpinBox* _extrapolationDistanceSpin = nullptr;
+    QSpinBox* _breakExtrapolationDistanceSpin = nullptr;
     // Values committed via the menu rows' Apply buttons; the spinboxes hold
     // uncommitted edits until then (and revert when the menu reopens).
     int _appliedInitialCenterlineLengthVx = 0;
     int _appliedExtrapolationDistanceVx = 0;
+    int _appliedBreakExtrapolationDistanceVx = 0;
     QSpinBox* _maxControlPointExtrapolationDistanceSpin = nullptr;
     QLabel* _fiberNameLabel = nullptr;
     QPointer<QLabel> _optimizationStatusLabel;

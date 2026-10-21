@@ -5,6 +5,7 @@ import time
 from dataclasses import replace
 
 import torch
+import torch.nn.functional as F
 
 from vesuvius.neural_tracing.fiber_trace_3d.direction import (
     encode_lasagna_direction_3x2,
@@ -51,6 +52,8 @@ def _presence_loss_mask(
     patch_shape: tuple[int, int, int],
     config: FiberTrace3DConfig,
     target_modes: torch.Tensor | None = None,
+    coordinate_scale: int = 1,
+    input_shape: tuple[int, int, int] | None = None,
 ) -> torch.Tensor:
     presence_mask = valid_mask.clone()
     edge_margin = config.presence_negative_edge_margin_voxels
@@ -58,18 +61,32 @@ def _presence_loss_mask(
         edge_margin = int(math.ceil(max(config.augment_shift_zyx)))
     if edge_margin > 0:
         device = valid_mask.device
-        z = torch.arange(patch_shape[0], device=device)
-        y = torch.arange(patch_shape[1], device=device)
-        x = torch.arange(patch_shape[2], device=device)
-        zz, yy, xx = torch.meshgrid(z, y, x, indexing="ij")
-        interior = (
-            (zz >= edge_margin)
-            & (zz < patch_shape[0] - edge_margin)
-            & (yy >= edge_margin)
-            & (yy < patch_shape[1] - edge_margin)
-            & (xx >= edge_margin)
-            & (xx < patch_shape[2] - edge_margin)
-        )
+        if int(coordinate_scale) == 1:
+            z = torch.arange(patch_shape[0], device=device)
+            y = torch.arange(patch_shape[1], device=device)
+            x = torch.arange(patch_shape[2], device=device)
+            zz, yy, xx = torch.meshgrid(z, y, x, indexing="ij")
+            interior = (
+                (zz >= edge_margin)
+                & (zz < patch_shape[0] - edge_margin)
+                & (yy >= edge_margin)
+                & (yy < patch_shape[1] - edge_margin)
+                & (xx >= edge_margin)
+                & (xx < patch_shape[2] - edge_margin)
+            )
+        else:
+            if input_shape is None:
+                raise ValueError("input_shape is required for coarse presence masks")
+            axes = []
+            for output_size, input_size in zip(patch_shape, input_shape):
+                start = torch.arange(output_size, device=device) * int(coordinate_scale)
+                end = torch.clamp(start + int(coordinate_scale), max=int(input_size))
+                axes.append((start >= int(edge_margin)) & (end <= int(input_size) - int(edge_margin)))
+            interior = (
+                axes[0][:, None, None]
+                & axes[1][None, :, None]
+                & axes[2][None, None, :]
+            )
         interior = interior.view(1, 1, *patch_shape)
         if target_modes is None:
             presence_mask = presence_mask & interior
@@ -139,6 +156,8 @@ def _materialize_dense_line_indices(
     patch_shape: tuple[int, int, int],
     positive: torch.Tensor,
     validate: bool,
+    coordinate_scale: int = 1,
+    input_shape: tuple[int, int, int] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
     device = batch.volume.device
     starts = batch.target_segment_starts_zyx.to(device=device, dtype=torch.float32)
@@ -195,13 +214,14 @@ def _materialize_dense_line_indices(
     t = step_index.view(1, -1) / denom
     points = starts.view(-1, 1, 3) + t.unsqueeze(-1) * delta.view(-1, 1, 3)
     coords = torch.round(points).to(dtype=torch.long)
+    bounds_shape = patch_shape if input_shape is None else input_shape
     in_bounds = (
         (coords[..., 0] >= 0)
-        & (coords[..., 0] < int(patch_shape[0]))
+        & (coords[..., 0] < int(bounds_shape[0]))
         & (coords[..., 1] >= 0)
-        & (coords[..., 1] < int(patch_shape[1]))
+        & (coords[..., 1] < int(bounds_shape[1]))
         & (coords[..., 2] >= 0)
-        & (coords[..., 2] < int(patch_shape[2]))
+        & (coords[..., 2] < int(bounds_shape[2]))
     )
     point_mask = step_mask & in_bounds
     if not bool(point_mask.any()):
@@ -213,6 +233,8 @@ def _materialize_dense_line_indices(
 
     b = sample_ids.view(-1, 1).expand(-1, max_steps)[point_mask]
     zyx = coords[point_mask]
+    if int(coordinate_scale) > 1:
+        zyx = torch.div(zyx, int(coordinate_scale), rounding_mode="floor")
     tangents = delta.view(-1, 1, 3).expand(-1, max_steps, 3)[point_mask]
     indices = torch.cat([b.view(-1, 1), zyx], dim=1)
     indices, tangents = _unique_indices_and_tangents(
@@ -230,25 +252,117 @@ def _materialize_dense_line_indices(
     )
 
 
+def _coarse_valid_mask(valid_mask: torch.Tensor, output_stride: int) -> torch.Tensor:
+    invalid = (~valid_mask.to(dtype=torch.bool)).to(dtype=torch.float32)
+    return F.max_pool3d(
+        invalid,
+        kernel_size=int(output_stride),
+        stride=int(output_stride),
+        ceil_mode=True,
+    ) == 0.0
+
+
+def _materialize_coarse_cp_only_sample(
+    *,
+    batch: FiberTrace3DBatch,
+    coarse_valid_mask: torch.Tensor,
+    sample_index: int,
+    patch_shape: tuple[int, int, int],
+    input_shape: tuple[int, int, int],
+    output_stride: int,
+    radius: float,
+    positive: torch.Tensor,
+    direction_indices: list[torch.Tensor],
+    direction_tangents: list[torch.Tensor],
+) -> int:
+    device = batch.volume.device
+    cp = batch.cp_local_zyx[sample_index].to(device=device, dtype=torch.float32)
+    lo = torch.ceil(cp - float(radius)).to(dtype=torch.long)
+    hi = torch.floor(cp + float(radius)).to(dtype=torch.long)
+    axes = [
+        torch.arange(
+            max(0, int(lo[axis].item())),
+            min(int(input_shape[axis]) - 1, int(hi[axis].item())) + 1,
+            device=device,
+        )
+        for axis in range(3)
+    ]
+    if all(int(axis.numel()) > 0 for axis in axes):
+        zz, yy, xx = torch.meshgrid(*axes, indexing="ij")
+        source = torch.stack([zz, yy, xx], dim=-1).reshape(-1, 3)
+        source = source[
+            torch.sum((source.to(dtype=torch.float32) - cp.view(1, 3)) ** 2, dim=1)
+            <= float(radius) ** 2
+        ]
+    else:
+        source = torch.empty((0, 3), dtype=torch.long, device=device)
+    if int(source.shape[0]) == 0:
+        nearest = torch.round(cp).to(dtype=torch.long)
+        limits = torch.tensor(input_shape, dtype=torch.long, device=device) - 1
+        source = torch.minimum(torch.maximum(nearest, torch.zeros_like(nearest)), limits).view(1, 3)
+    coarse = torch.div(source, int(output_stride), rounding_mode="floor")
+    linear = (coarse[:, 0] * patch_shape[1] + coarse[:, 1]) * patch_shape[2] + coarse[:, 2]
+    order = torch.argsort(linear, stable=True)
+    keep = torch.ones_like(order, dtype=torch.bool)
+    keep[1:] = linear[order][1:] != linear[order][:-1]
+    coarse = coarse[order[keep]]
+    valid = coarse_valid_mask[
+        sample_index, 0, coarse[:, 0], coarse[:, 1], coarse[:, 2]
+    ]
+    coarse = coarse[valid]
+    if int(coarse.shape[0]) == 0:
+        return 0
+    positive[sample_index, coarse[:, 0], coarse[:, 1], coarse[:, 2]] = True
+    batch_column = torch.full(
+        (int(coarse.shape[0]), 1), sample_index, dtype=torch.long, device=device
+    )
+    direction_indices.append(torch.cat([batch_column, coarse], dim=1))
+    tangent = batch.target_tangent_zyx[sample_index].to(device=device, dtype=torch.float32)
+    direction_tangents.append(tangent.view(1, 3).expand(int(coarse.shape[0]), 3))
+    return int(coarse.shape[0])
+
+
 def materialize_targets(
     batch: FiberTrace3DBatch,
     config: FiberTrace3DConfig,
     *,
     profile: bool = False,
+    output_stride: int = 1,
 ) -> FiberTrace3DBatch:
     """Create sparse direction and dense presence targets from compact metadata."""
 
+    output_stride = int(output_stride)
+    if output_stride <= 0:
+        raise ValueError("output_stride must be > 0")
+    if (batch.normalization_counts is not None
+            and batch.normalization_output_stride != output_stride):
+        raise ValueError(
+            "normalization counts do not match output_stride; "
+            "rerun MacroBatchTargetSource for the complete optimizer batch"
+        )
+    input_shape = tuple(int(v) for v in batch.volume.shape[-3:])
+    patch_shape = tuple((size + output_stride - 1) // output_stride for size in input_shape)
+    target_shape = (int(batch.volume.shape[0]), 1, *patch_shape)
     if (
-        batch.direction_indices_bzyx is not None
+        batch.target_output_stride == output_stride
+        and batch.direction_indices_bzyx is not None
         and batch.direction_target_sparse is not None
         and batch.direction_weight_sparse is not None
         and batch.presence_target is not None
         and batch.presence_mask is not None
+        and tuple(batch.presence_target.shape) == target_shape
+        and tuple(batch.presence_mask.shape) == target_shape
     ):
         return batch
 
     device = batch.volume.device
-    patch_shape = tuple(int(v) for v in batch.volume.shape[-3:])
+    if output_stride == 1:
+        geometry_batch = batch
+    else:
+        geometry_batch = replace(
+            batch,
+            valid_mask=_coarse_valid_mask(batch.valid_mask, output_stride),
+        )
     radius = float(config.presence_radius_voxels)
     radius2 = radius * radius
     timings: dict[str, float] = {}
@@ -269,10 +383,12 @@ def materialize_targets(
         timings["target_gpu_alloc_ms"] = (time.perf_counter() - start) * 1000.0
     line_start = time.perf_counter()
     line_indices, line_tangents, line_segments, line_points = _materialize_dense_line_indices(
-        batch=batch,
+        batch=geometry_batch,
         patch_shape=patch_shape,
         positive=positive,
         validate=bool(profile),
+        coordinate_scale=output_stride,
+        input_shape=input_shape,
     )
     if int(line_indices.shape[0]) > 0:
         direction_indices.append(line_indices)
@@ -286,18 +402,32 @@ def materialize_targets(
     cp_start = time.perf_counter()
     cp_direction_points = 0
     for sample_index in range(int(batch.volume.shape[0])):
-        mode = int(batch.target_modes[sample_index])
+        mode = int(geometry_batch.target_modes[sample_index])
         if mode == _TARGET_MODE_CP_ONLY:
-            cp_direction_points += _materialize_cp_only_sample(
-                batch=batch,
-                sample_index=sample_index,
-                grid=grid,
-                patch_shape=patch_shape,
-                radius2=radius2,
-                positive=positive,
-                direction_indices=direction_indices,
-                direction_tangents=direction_tangents,
-            )
+            if output_stride == 1:
+                cp_direction_points += _materialize_cp_only_sample(
+                    batch=geometry_batch,
+                    sample_index=sample_index,
+                    grid=grid,
+                    patch_shape=patch_shape,
+                    radius2=radius2,
+                    positive=positive,
+                    direction_indices=direction_indices,
+                    direction_tangents=direction_tangents,
+                )
+            else:
+                cp_direction_points += _materialize_coarse_cp_only_sample(
+                    batch=batch,
+                    coarse_valid_mask=geometry_batch.valid_mask,
+                    sample_index=sample_index,
+                    patch_shape=patch_shape,
+                    input_shape=input_shape,
+                    output_stride=output_stride,
+                    radius=radius,
+                    positive=positive,
+                    direction_indices=direction_indices,
+                    direction_tangents=direction_tangents,
+                )
         elif mode == _TARGET_MODE_DENSE_LINE:
             continue
         else:
@@ -338,10 +468,12 @@ def materialize_targets(
         timings["target_direction_encode_ms"] = (time.perf_counter() - encode_start) * 1000.0
     mask_start = time.perf_counter()
     presence_mask = _presence_loss_mask(
-        batch.valid_mask.to(dtype=torch.bool),
+        geometry_batch.valid_mask.to(dtype=torch.bool),
         patch_shape=patch_shape,
         config=config,
         target_modes=batch.target_modes,
+        coordinate_scale=output_stride,
+        input_shape=input_shape,
     )
     if profile:
         _sync_if_cuda(device)
@@ -357,6 +489,7 @@ def materialize_targets(
     profile_timings.update(timings)
     return replace(
         batch,
+        target_output_stride=output_stride,
         direction_target=None,
         direction_weight=None,
         direction_mask=None,
@@ -368,6 +501,29 @@ def materialize_targets(
         presence_mask=presence_mask,
         profile_timings_ms=profile_timings if profile_timings else batch.profile_timings_ms,
     )
+
+
+def target_normalization_counts(batch: FiberTrace3DBatch, *, conditioned: bool = False) -> torch.Tensor:
+    """Target-only counts matching the masked ordinary/conditioned loss groups.
+
+    Direction counts channel elements, presence counts nonempty patch/query
+    groups (not voxels). No predictions or image values are consulted.
+    """
+    require_materialized_targets(batch)
+    indices = batch.direction_indices_bzyx
+    positive_mask = batch.presence_mask[
+        indices[:, 0], 0, indices[:, 1], indices[:, 2], indices[:, 3]
+    ]
+    queries = 2 if conditioned else 1
+    negative_mask = batch.presence_mask
+    if not conditioned:
+        negative_mask = negative_mask & (batch.presence_target <= 0.5)
+    return torch.stack((
+        batch.presence_target.new_tensor(indices.shape[0] * 6 * queries, dtype=torch.float32),
+        batch.presence_target.new_tensor(torch.unique(indices[positive_mask, 0]).numel() * queries,
+                                        dtype=torch.float32),
+        negative_mask.flatten(1).any(dim=1).sum().float() * queries,
+    ))
 
 
 def require_materialized_targets(batch: FiberTrace3DBatch) -> None:

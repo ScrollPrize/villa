@@ -13,7 +13,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import pytest
 import tifffile
 import zarr
 
@@ -151,11 +150,3 @@ def test_multi_sample_tiff_load_image_first_channel(tmp_path):
 
     assert loaded.shape == (3, 2)
     assert np.array_equal(loaded, image[..., 0])
-
-
-@pytest.mark.parametrize("shape", [(2, 3, 4, 5), (3, 4, 5, 6)])
-def test_non_flat_label_image_is_rejected(tmp_path, shape):
-    source = tmp_path / "label.tif"
-    tifffile.imwrite(source, np.zeros(shape, dtype=np.uint8), photometric="minisblack")
-    with pytest.raises(ValueError, match="Expected a 2D image"):
-        load_image(source)
