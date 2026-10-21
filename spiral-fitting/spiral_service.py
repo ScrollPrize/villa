@@ -72,10 +72,11 @@ from fit_session import (API_VERSION, EDITABLE_PCL_ROLES, FIT_INPUT_CATALOG,
                          SessionState, SpiralInputPaths, default_user_cache_dir,
                          input_source_enabled, pcl_input_enabled,
                          winding_inference_enabled, load_scroll_spec,
+                         scroll_spec_config_defaults,
                          parse_session_request, resolve_dataset_root,
                          validate_session_request)
 from checkpoint_migrations import tolerate_config
-from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config,
+from config import (CHECKPOINT_MODEL_SHAPE_KEYS, Config, describe_catalog,
                     filter_known_config_keys, rebuild_stage)
 from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
@@ -832,7 +833,23 @@ class ServiceState:
         return response
 
     def configuration_catalog(self):
-        return {**self._base(), **self.config_catalog}
+        # Descriptions are re-read per request, so edited text reaches a
+        # client when it reconnects, without restarting the service.
+        catalog = {**self._base(), **describe_catalog(self.config_catalog)}
+        generic = self.config_catalog["defaults"]
+        scroll_defaults = scroll_spec_config_defaults(self.scroll_spec, generic)
+        if scroll_defaults:
+            # The panel seeds its form from these, so a winding count in
+            # spiral-scroll.json reaches interactive fits as it reaches the
+            # CLI. A preset still holding the generic value inherits it; one
+            # that chose its own value keeps it.
+            catalog["defaults"] = {**generic, **scroll_defaults}
+            catalog["presets"] = {
+                name: {**preset, **{
+                    key: value for key, value in scroll_defaults.items()
+                    if preset.get(key) == generic.get(key)}}
+                for name, preset in self.config_catalog["presets"].items()}
+        return catalog
 
     def dataset(self):
         return {**self._base(), **self.dataset_resolution.to_dict(),
@@ -1195,6 +1212,10 @@ class ServiceState:
 
     def _begin_build(self, paths, run, preview, scroll):
         """Publish ``Loading`` and construct the runtime off the HTTP thread."""
+        # The build binds the workspace's unchanged baseline identities while
+        # it loads, so the replay after it does not relink the whole fit.
+        workspace = self.editing_workspace
+        bindings = workspace.build_bindings() if workspace is not None else []
         with self.lock:
             if self._building:
                 raise ApiError(HTTPStatus.CONFLICT,
@@ -1219,17 +1240,19 @@ class ServiceState:
             self._session_error = None
             self.status_generation += 1
             session_id = self.session_id
+            if workspace is not None:
+                workspace.note_build_bindings(self.session_generation, bindings)
         self._start_background(
             target=self._build,
             args=(session_id, previous, paths, run,
-                  preview, scroll),
+                  preview, scroll, bindings),
             name="spiral-session-build", daemon=True)
         self._start_background(
             target=self._refresh_pcl_artifacts,
             name="spiral-pcl-artifact-publish", daemon=True)
 
     def _build(self, session_id, previous, paths, run,
-               preview, scroll):
+               preview, scroll, bindings=()):
         """Close the old resident session, then construct the new one.
 
         A rebuild is an all-rank teardown and reconstruction: the previous
@@ -1246,7 +1269,8 @@ class ServiceState:
             from spiral_runtime import create_session
             session = create_session(
                 paths, run, preview, scroll, self._status_changed,
-                gpu_ids=self.gpu_ids, event_callback=self._session_event)
+                gpu_ids=self.gpu_ids, event_callback=self._session_event,
+                input_bindings=bindings)
         except BaseException as exc:
             self._fail_session(session_id, _cause(exc))
             return

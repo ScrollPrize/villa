@@ -186,10 +186,70 @@ class _NativeCrossingProgress:
         self.completed = 0
 
 
+_SQLITE_MAGIC = b'SQLite format 3\x00'
+
+
+def _is_sqlite_dbm(path):
+    # dbm.sqlite3 (the default dbm backend since Python 3.13) writes a plain
+    # SQLite file; dbm.whichdb() cannot identify it on interpreters that lack
+    # the dbm.sqlite3 module.
+    try:
+        with open(path, 'rb') as stream:
+            return stream.read(len(_SQLITE_MAGIC)) == _SQLITE_MAGIC
+    except OSError:
+        return False
+
+
+class _SQLiteTrackDBM:
+    """Read-only view of a dbm.sqlite3 store for interpreters without dbm.sqlite3.
+
+    Uses the same single-table schema as CPython's Lib/dbm/sqlite3.py
+    (``Dict(key BLOB, value BLOB)``) and only the read operations the track
+    loaders need.
+    """
+
+    def __init__(self, path):
+        import sqlite3
+        uri = Path(os.path.abspath(path)).as_uri() + '?mode=ro'
+        self._connection = sqlite3.connect(uri, uri=True)
+
+    def keys(self):
+        return [key for (key,) in self._connection.execute('SELECT key FROM Dict')]
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            key = key.encode()
+        row = self._connection.execute(
+            'SELECT value FROM Dict WHERE key = CAST(? AS BLOB)', (key,)).fetchone()
+        if row is None:
+            raise KeyError(key)
+        return row[0]
+
+    def __len__(self):
+        return self._connection.execute('SELECT COUNT(key) FROM Dict').fetchone()[0]
+
+    def close(self):
+        self._connection.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+
+def open_tracks_dbm(path):
+    """Open a tracks DBM read-only, including SQLite-backed stores on Python < 3.13."""
+    text = os.fspath(path)
+    if not dbm.whichdb(text) and _is_sqlite_dbm(text):
+        return _SQLiteTrackDBM(text)
+    return dbm.open(text, 'r')
+
+
 def normalize_tracks_dbm_path(path):
     """Return the logical DBM path, accepting a common ``.db`` backing path."""
     text = os.fspath(path)
-    if dbm.whichdb(text):
+    if dbm.whichdb(text) or _is_sqlite_dbm(text):
         return text
     if text.endswith('.db') and dbm.whichdb(text[:-3]):
         return text[:-3]
@@ -226,6 +286,36 @@ def _tracks_db_signature(path):
     return sorted(result)
 
 
+def _db_signatures_match(stored, expected):
+    """Compare a stored DBM signature with the current one.
+
+    Signatures are ``(name, size, mtime_ns)`` per backing file. Downloads and
+    copies routinely lose the sub-second part of mtime (HTTP Last-Modified has
+    one-second resolution), which made every cache shipped alongside a dataset
+    look stale after download even though name and size matched. Name and size
+    must match exactly. mtime must match exactly, except that when one side is
+    a whole second (a copy that dropped the sub-second part) the seconds must
+    match. Two nanosecond mtimes still have to agree, so an edit within the
+    same second on a local file is still detected.
+    """
+    if not isinstance(stored, list) or len(stored) != len(expected):
+        return False
+    try:
+        for item, want in zip(stored, expected):
+            if not isinstance(item, (list, tuple)) or len(item) != 3:
+                return False
+            if item[0] != want[0] or int(item[1]) != int(want[1]):
+                return False
+            have, need = int(item[2]), int(want[2])
+            if have != need:
+                truncated = have % 1_000_000_000 == 0 or need % 1_000_000_000 == 0
+                if not truncated or have // 1_000_000_000 != need // 1_000_000_000:
+                    return False
+    except (TypeError, ValueError):
+        return False                        # malformed metadata (e.g. null entries): treat as stale
+    return True
+
+
 def track_store_path(path):
     """Return the conventional packed-store directory beside a tracks DBM."""
     return Path(normalize_tracks_dbm_path(path) + TRACK_STORE_SUFFIX)
@@ -250,7 +340,7 @@ def write_packed_track_store(
     tortuosity_batches = []
     point_count = 0
     try:
-        with (dbm.open(logical, 'r') as database,
+        with (open_tracks_dbm(logical) as database,
               (temporary / 'coordinates.i32').open('wb') as coordinate_stream):
             keys = sorted(database.keys())
             for key_ordinal, key in enumerate(tqdm(
@@ -384,7 +474,7 @@ def _load_packed_track_collection(path, z_lo=None, z_hi=None, warn=True):
         if metadata.get('version') != TRACK_STORE_VERSION:
             raise ValueError('unsupported packed track-store version')
         expected = [list(item) for item in _tracks_db_signature(path)]
-        if metadata.get('source_db_signature') != expected:
+        if not _db_signatures_match(metadata.get('source_db_signature'), expected):
             raise ValueError('source DBM changed after the packed store was written')
         result = native.load(
             os.fspath(store),
@@ -417,7 +507,7 @@ def _packed_store_if_current(path):
         if metadata.get('version') != TRACK_STORE_VERSION:
             return None
         expected = [list(item) for item in _tracks_db_signature(path)]
-        if metadata.get('source_db_signature') != expected:
+        if not _db_signatures_match(metadata.get('source_db_signature'), expected):
             return None
         return store
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
@@ -452,7 +542,7 @@ def load_tracks_from_dbm(
     tracks = []
     families = []
     source_ids = []
-    with dbm.open(path, 'r') as db:
+    with open_tracks_dbm(path) as db:
         keys = db.keys()
         if progress is not None:
             progress.begin(
@@ -537,7 +627,7 @@ def load_tracks_from_dbm(
 def _iter_tracks_from_dbm(path, z_lo=None, z_hi=None, show_progress=True):
     """Yield native voxel tracks in stable source-id order, one DBM key at a time."""
     path = normalize_tracks_dbm_path(path)
-    with dbm.open(path, 'r') as database:
+    with open_tracks_dbm(path) as database:
         keys = sorted(database.keys())
         for key_ordinal, key in enumerate(tqdm(
                 keys, desc='streaming tracks', disable=not show_progress)):
@@ -1190,7 +1280,7 @@ def _write_disk_crossing_index(
             z_lo=z_lo, z_hi=z_hi, show_progress=show_progress)
     with (open(coordinates_path, 'wb') as coordinate_stream,
           open(packed_path, 'wb') as packed_stream,
-          dbm.open(path, 'r') as database):
+          open_tracks_dbm(path) as database):
         keys = sorted(database.keys())
         for key_ordinal, key in enumerate(tqdm(
                 keys, desc='staging track keys', unit='keys',
@@ -1636,7 +1726,7 @@ def load_track_crossing_cache(path, warn=True, expected_z_range=None):
                 raise ValueError(
                     f"unsupported version {metadata.get('version')!r}")
             expected_signature = [list(item) for item in _tracks_db_signature(path)]
-            if metadata.get('db_signature') != expected_signature:
+            if not _db_signatures_match(metadata.get('db_signature'), expected_signature):
                 raise ValueError('tracks DBM has changed since the cache was built')
             if (expected_z_range is not None
                     and metadata.get('z_range', [None, None])

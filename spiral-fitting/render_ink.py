@@ -39,6 +39,7 @@ import json
 import glob
 import shutil
 import subprocess
+import uuid
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -246,12 +247,13 @@ def flatten_mesh(concat_path, tifxyz2obj_bin, flatboi_bin, obj2tifxyz_bin, uv_li
 
 
 def set_tifxyz_id(tifxyz_path, new_id):
-    """Rewrite a tifxyz meta.json's uuid/name to new_id. lasagna's fit2tifxyz stamps them
-    with the output folder name (`flatten.tifxyz`); we want the winding-range id instead."""
+    """Stamp a freshly produced tifxyz as a new surface: meta.json `name` becomes new_id
+    (the winding-range folder name, replacing lasagna's scratch `flatten.tifxyz`) and
+    `uuid` a fresh random identity, never derived from the name."""
     meta_path = os.path.join(tifxyz_path, 'meta.json')
     with open(meta_path, 'r') as f:
         meta = json.load(f)
-    meta['uuid'] = new_id
+    meta['uuid'] = str(uuid.uuid4())
     meta['name'] = new_id
     with open(meta_path, 'w') as f:
         json.dump(meta, f, indent=2)

@@ -23,6 +23,7 @@
 #include <QGraphicsItem>
 #include <QGraphicsLineItem>
 #include <QGraphicsPathItem>
+#include "FiberMapFocusBounds.hpp"
 #include <QGraphicsPixmapItem>
 #include <QGraphicsPolygonItem>
 #include <QPolygonF>
@@ -474,6 +475,31 @@ std::vector<QImage> colourGapTiles(const vc3d::fiber_map::gaps::GapField& field,
 // The three run styles are mutually exclusive: a gap run is neither traced
 // nor interpolated for drawing purposes.
 enum class RunKind { Traced, Interpolated, Gap, Damaged };
+
+class FocusPathItem : public QGraphicsPathItem
+{
+public:
+    using QGraphicsPathItem::QGraphicsPathItem;
+    void setFocusPaths(std::optional<vc3d::fiber_map::FocusPaths> paths)
+    {
+        _paths = std::move(paths);
+        update();
+    }
+    void paint(QPainter* painter, const QStyleOptionGraphicsItem* option, QWidget* widget) override
+    {
+        if (!_paths) {
+            QGraphicsPathItem::paint(painter, option, widget);
+            return;
+        }
+        auto dimPen = pen();
+        const auto color = dimPen.color();
+        dimPen.setColor(QColor(color.red() / 2, color.green() / 2, color.blue() / 2, color.alpha()));
+        painter->strokePath(_paths->outside, dimPen);
+        painter->strokePath(_paths->inside, pen());
+    }
+private:
+    std::optional<vc3d::fiber_map::FocusPaths> _paths;
+};
 
 RunKind runKind(const vc3d::fiber_map::Run& run)
 {
@@ -1977,6 +2003,7 @@ void FiberMapWorkspace::hideEvent(QHideEvent* event)
 void FiberMapWorkspace::showEvent(QShowEvent* event)
 {
     QMainWindow::showEvent(event);
+    if (_focusBoundsDirty) updateFocusBounds();
     if (_stalePollTimer) {
         _stalePollTimer->start();
     }
@@ -2728,25 +2755,30 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         const QColor color = fiberColor(entry.fiber.hvTag, theme);
         const QPainterPath tracedPath = pathForRuns(entry.fiber, RunKind::Traced);
         if (!tracedPath.isEmpty()) {
-            entry.tracedItem = _scene->addPath(tracedPath, cosmeticPen(color, kTracedWidth));
+            entry.tracedItem = new FocusPathItem(tracedPath);
+            entry.tracedItem->setPen(cosmeticPen(color, kTracedWidth));
+            _scene->addItem(entry.tracedItem);
             entry.tracedItem->setZValue(kFiberZ);
         }
         const QPainterPath interpolatedPath = pathForRuns(entry.fiber, RunKind::Interpolated);
         if (!interpolatedPath.isEmpty()) {
-            entry.interpolatedItem = _scene->addPath(
-                interpolatedPath,
-                interpolatedPen(tint(color, theme.surface, 0.45), kInterpolatedWidth));
+            entry.interpolatedItem = new FocusPathItem(interpolatedPath);
+            entry.interpolatedItem->setPen(interpolatedPen(tint(color, theme.surface, 0.45), kInterpolatedWidth));
+            _scene->addItem(entry.interpolatedItem);
             entry.interpolatedItem->setZValue(kFiberZ);
         }
         const QPainterPath gapPath = pathForRuns(entry.fiber, RunKind::Gap);
         if (!gapPath.isEmpty()) {
-            entry.gapItem = _scene->addPath(gapPath, gapPen(gapLineColor(255), kTracedWidth));
+            entry.gapItem = new FocusPathItem(gapPath);
+            entry.gapItem->setPen(gapPen(gapLineColor(255), kTracedWidth));
+            _scene->addItem(entry.gapItem);
             entry.gapItem->setZValue(kFiberZ);
         }
         const QPainterPath damagedPath = pathForRuns(entry.fiber, RunKind::Damaged);
         if (!damagedPath.isEmpty()) {
-            entry.damagedItem =
-                _scene->addPath(damagedPath, gapPen(damagedColor(255), kTracedWidth));
+            entry.damagedItem = new FocusPathItem(damagedPath);
+            entry.damagedItem->setPen(gapPen(damagedColor(255), kTracedWidth));
+            _scene->addItem(entry.damagedItem);
             entry.damagedItem->setZValue(kFiberZ);
         }
 
@@ -2805,6 +2837,8 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         const uint64_t fiberId = entry.fiber.id;
         _entries.insert(fiberId, std::move(entry));
     }
+
+    updateFocusBounds();
 
     for (const vc3d::fiber_map::PlacedLink& link : _layout.links) {
         const QPointF a(sceneXOf(link.a.x()), -link.a.y());
@@ -3408,6 +3442,41 @@ void FiberMapWorkspace::clearControlPointDots()
     _controlPointDots.clear();
 }
 
+void FiberMapWorkspace::setFocusBounds(std::optional<Rect3D> bounds)
+{
+    if ((!bounds && !_focusBounds) || (bounds && _focusBounds &&
+        bounds->low == _focusBounds->low && bounds->high == _focusBounds->high)) return;
+    _focusBounds = std::move(bounds);
+    _focusBoundsDirty = true;
+    if (isVisible()) updateFocusBounds();
+}
+
+void FiberMapWorkspace::updateFocusBounds()
+{
+    for (auto& entry : _entries) {
+        const std::array<QGraphicsPathItem*, 5> items{
+            entry.tracedItem, entry.interpolatedItem, entry.gapItem, entry.damagedItem, entry.glowItem};
+        std::array<vc3d::fiber_map::FocusPaths, 5> paths;
+        if (_focusBounds) {
+            for (std::size_t i = 0; i < entry.fiber.runs.size(); ++i) {
+                auto split = vc3d::fiber_map::focusRunPaths(entry.fiber, i, *_focusBounds);
+                auto& path = paths[static_cast<std::size_t>(runKind(entry.fiber.runs[i]))];
+                path.inside.addPath(split.inside);
+                path.outside.addPath(split.outside);
+                paths.back().inside.addPath(split.inside);
+                paths.back().outside.addPath(split.outside);
+            }
+        }
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            if (auto* item = dynamic_cast<FocusPathItem*>(items[i])) {
+                item->setFocusPaths(_focusBounds
+                    ? std::optional{std::move(paths[i])} : std::nullopt);
+            }
+        }
+    }
+    _focusBoundsDirty = false;
+}
+
 void FiberMapWorkspace::paintFiberEmphasis(FiberEntry& entry,
                                            FiberEmphasis emphasis)
 {
@@ -3452,9 +3521,11 @@ void FiberMapWorkspace::paintFiberEmphasis(FiberEntry& entry,
             }
             QColor glow = color;
             glow.setAlpha(kNetworkGlowAlpha);
-            entry.glowItem =
-                _scene->addPath(path, cosmeticPen(glow, kNetworkGlowWidthPx));
+            entry.glowItem = new FocusPathItem(path);
+            entry.glowItem->setPen(cosmeticPen(glow, kNetworkGlowWidthPx));
+            _scene->addItem(entry.glowItem);
             entry.glowItem->setZValue(kNetworkGlowZ);
+            if (_focusBounds) updateFocusBounds();
         }
     } else if (entry.glowItem != nullptr) {
         _scene->removeItem(entry.glowItem);

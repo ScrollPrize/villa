@@ -15,11 +15,26 @@ this repository (developed and maintained by the Vesuvius Challenge team).
 The original Volume Cartographer is a general purpose toolkit for virtual unwrapping, while this version is specialized for the frontier challenges of the Herculaneum papyri.
 
 ### Installation Instructions
-Due to a complex set of dependencies, it is *highly* recommended to use the docker image. We host an up-to-date image on the [github container registry](https://github.com/ScrollPrize/villa/pkgs/container/villa%2Fvolume-cartographer) which can be pulled with a simple command :
+Due to a complex set of dependencies, it is *highly* recommended to use a prebuilt package: the release downloads described below (Linux, Windows, macOS) or the docker image. We host an image on the [github container registry](https://github.com/ScrollPrize/villa/pkgs/container/villa%2Fvolume-cartographer) which can be pulled with a simple command :
 
 ```bash
 docker pull ghcr.io/scrollprize/villa/volume-cartographer:edge
 ```
+
+The `edge` and `main` image tags currently carry the build of 2026-05-13 (see [#1588](https://github.com/ScrollPrize/villa/issues/1588)); the `latest` release downloads are rebuilt from `main`.
+
+#### Linux
+
+A self-contained `VC3D-<version>-linux-x86_64.AppImage` (VC3D plus the `vc_*` command-line tools, with all dependencies bundled) is attached to each [GitHub release](https://github.com/ScrollPrize/villa/releases). Make it executable and pass the program to run as the first argument:
+
+```bash
+chmod +x VC3D-*-linux-x86_64.AppImage
+./VC3D-*-linux-x86_64.AppImage VC3D                      # the GUI
+./VC3D-*-linux-x86_64.AppImage list                      # the bundled tools
+./VC3D-*-linux-x86_64.AppImage vc_render_tifxyz --help   # one of the command-line tools
+```
+
+[scripts/appimage/README.md](scripts/appimage/README.md) lists what the host must provide and describes symlink dispatch and how the AppImage is built.
 
 To install VC3D and all command-line tools from source on a recent Debian-family
 Linux distribution using APT:

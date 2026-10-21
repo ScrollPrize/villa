@@ -1,14 +1,18 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import tempfile
 from typing import Any, Iterable, Mapping
 
 from .config import ManagerConfig
+
+
+IDENTITY_SUFFIX = ".identity.json"
 
 
 @dataclass(frozen=True)
@@ -34,6 +38,7 @@ class SnapshotRecord:
     task: str
     output_schema: dict[str, Any] | None
     code_revision: str | None
+    model_identifier: str | None = None
 
 
 def discover_snapshot_paths(roots: Iterable[Path]) -> list[tuple[str, Path]]:
@@ -91,6 +96,213 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _manager_checkpoint_identities(config: ManagerConfig) -> dict[str, str]:
+    """Read identities controlled by the manager and keyed by exact bytes."""
+    root = config.resolved_path("model_dir", required=True)
+    assert root is not None
+    identities: dict[str, str] = {}
+    if not root.is_dir():
+        return identities
+    for path in sorted(root.glob(f"*/snapshots/*.pt{IDENTITY_SUFFIX}")):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as error:
+            raise ValueError(f"invalid manager snapshot identity: {path}") from error
+        if not isinstance(value, dict) or value.get("schema_version") != 1:
+            raise ValueError(f"unsupported manager snapshot identity: {path}")
+        digest = str(value.get("sha256") or "").lower()
+        identifier = str(value.get("model_identifier") or "").strip()
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError(f"invalid checkpoint SHA-256 in {path}")
+        if not identifier or any(character.isspace() for character in identifier):
+            raise ValueError(f"invalid model_identifier in {path}")
+        checkpoint = Path(str(path)[:-len(IDENTITY_SUFFIX)])
+        if not checkpoint.is_file():
+            raise ValueError(f"manager identity has no checkpoint: {path}")
+        previous = identities.get(digest)
+        if previous is not None and previous != identifier:
+            raise ValueError(
+                f"checkpoint SHA-256 {digest} has conflicting manager identifiers: "
+                f"{previous!r} and {identifier!r}"
+            )
+        identities[digest] = identifier
+    return identities
+
+
+def _with_manager_identity(
+    record: SnapshotRecord, identities: Mapping[str, str],
+) -> SnapshotRecord:
+    identifier = identities.get(record.sha256.lower())
+    if identifier is None:
+        return record
+    if record.model_identifier and record.model_identifier != identifier:
+        raise ValueError(
+            f"checkpoint {record.path} embeds model identifier "
+            f"{record.model_identifier!r}, but the manager registers {identifier!r}"
+        )
+    return replace(record, model_identifier=record.model_identifier or identifier)
+
+
+def _deduplicate_snapshot_copies(
+    config: ManagerConfig, records: Iterable[SnapshotRecord],
+) -> list[SnapshotRecord]:
+    """Prefer manager-owned bytes for byte-identical logical snapshots."""
+    root = config.resolved_path("model_dir", required=True)
+    assert root is not None
+    root = root.resolve()
+    grouped: dict[str, list[SnapshotRecord]] = {}
+    for record in records:
+        grouped.setdefault(record.selector, []).append(record)
+    selected: list[SnapshotRecord] = []
+    for selector, copies in grouped.items():
+        if len(copies) == 1 or len({record.sha256 for record in copies}) != 1:
+            selected.extend(copies)
+            continue
+        owned = []
+        for record in copies:
+            try:
+                Path(record.path).resolve().relative_to(root)
+            except ValueError:
+                continue
+            owned.append(record)
+        selected.append(sorted(owned or copies, key=lambda record: record.path)[0])
+    return selected
+
+
+def import_snapshot(
+    config: ManagerConfig,
+    source: str | Path,
+    *,
+    model_identifier: str,
+    run: str | None = None,
+) -> SnapshotRecord:
+    """Copy a checkpoint into manager storage and bind its bytes to an ID."""
+    source_path = Path(source).expanduser().resolve()
+    if not source_path.is_file():
+        raise FileNotFoundError(f"snapshot does not exist: {source_path}")
+    if source_path.suffix != ".pt":
+        raise ValueError("snapshot import requires a .pt checkpoint")
+    identifier = model_identifier.strip()
+    if not identifier or any(character.isspace() for character in identifier):
+        raise ValueError("model_identifier must be a non-empty identifier without whitespace")
+    inferred_run = source_path.parent.parent.name if source_path.parent.name == "snapshots" else ""
+    run_name = str(run or inferred_run).strip()
+    if not run_name or run_name in {".", ".."} or Path(run_name).name != run_name:
+        raise ValueError("cannot infer a safe run name; pass --run NAME")
+
+    root = config.resolved_path("model_dir", required=True)
+    assert root is not None
+    destination = root / run_name / "snapshots" / source_path.name
+    sidecar = destination.with_name(destination.name + IDENTITY_SUFFIX)
+    digest = _sha256(source_path)
+
+    if destination.exists():
+        if not destination.is_file() or _sha256(destination) != digest:
+            raise FileExistsError(f"different checkpoint already exists: {destination}")
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+        try:
+            with source_path.open("rb") as reader, os.fdopen(fd, "wb") as writer:
+                shutil.copyfileobj(reader, writer, length=8 * 1024 * 1024)
+                writer.flush()
+                os.fsync(writer.fileno())
+            if _sha256(Path(temporary)) != digest:
+                raise OSError("copied checkpoint SHA-256 does not match source")
+            os.replace(temporary, destination)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+    if sidecar.exists():
+        existing = json.loads(sidecar.read_text(encoding="utf-8"))
+        if existing.get("sha256") != digest or existing.get("model_identifier") != identifier:
+            raise ValueError(f"snapshot identity conflicts with existing sidecar: {sidecar}")
+    _atomic_json(sidecar, {
+        "schema_version": 1,
+        "sha256": digest,
+        "model_identifier": identifier,
+    })
+    matches = [
+        record for record in index_snapshots(config)
+        if Path(record.path) == destination.resolve()
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(f"imported snapshot was not indexed exactly once: {destination}")
+    return matches[0]
+
+
+def _atlas_checkpoint_identities(config: ManagerConfig) -> dict[str, dict[str, str | None]]:
+    """Index registered Atlas models by their exact checkpoint digest."""
+    atlas_dir = config.resolved_path("atlas_dir")
+    if atlas_dir is None:
+        return {}
+    models_dir = atlas_dir / "data" / "models"
+    if not models_dir.is_dir():
+        return {}
+    identities: dict[str, dict[str, str | None]] = {}
+    for path in sorted(models_dir.rglob("*.json")):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        properties = _mapping(value.get("properties"))
+        digest = str(properties.get("snapshot_sha256") or "").lower()
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            continue
+        model_id = str(value.get("id") or "")
+        if not model_id:
+            raise ValueError(f"Atlas model with checkpoint SHA-256 has no id: {path}")
+        creation = _mapping(value.get("creation"))
+        identifier = properties.get("model_identifier")
+        if identifier is not None and (not isinstance(identifier, str) or not identifier.strip()):
+            raise ValueError(f"Atlas model has invalid model_identifier: {path}")
+        identity = {
+            "atlas_model_id": model_id,
+            "model_creation_utc": str(creation.get("date")) if creation.get("date") else None,
+            "model_identifier": identifier.strip() if isinstance(identifier, str) else None,
+        }
+        previous = identities.get(digest)
+        if previous is not None and previous != identity:
+            raise ValueError(
+                f"multiple Atlas models claim checkpoint SHA-256 {digest}: "
+                f"{previous['atlas_model_id']!r} and {model_id!r}"
+            )
+        identities[digest] = identity
+    return identities
+
+
+def _with_atlas_identity(
+    record: SnapshotRecord,
+    identities: Mapping[str, Mapping[str, str | None]],
+) -> SnapshotRecord:
+    identity = identities.get(record.sha256.lower())
+    if identity is None:
+        return record
+    atlas_model_id = identity.get("atlas_model_id")
+    if record.atlas_model_id and record.atlas_model_id[:14] != str(atlas_model_id)[:14]:
+        raise ValueError(
+            f"checkpoint {record.path} embeds Atlas model {record.atlas_model_id!r}, "
+            f"but its SHA-256 is registered as {atlas_model_id!r}"
+        )
+    model_identifier = identity.get("model_identifier")
+    if record.model_identifier and model_identifier and record.model_identifier != model_identifier:
+        raise ValueError(
+            f"checkpoint {record.path} embeds model identifier {record.model_identifier!r}, "
+            f"but Atlas registers {model_identifier!r}"
+        )
+    return replace(
+        record,
+        atlas_model_id=str(atlas_model_id),
+        model_creation_utc=record.model_creation_utc or identity.get("model_creation_utc"),
+        model_identifier=record.model_identifier or model_identifier,
+    )
 
 
 def _mapping(value: Any) -> Mapping[str, Any]:
@@ -178,6 +390,11 @@ def _extract(path: Path, run: str, stat: os.stat_result) -> SnapshotRecord:
     if metric_name is None and top.get("val_loss") is not None:
         metric_name = "validation/loss"
     atlas_model_id = atlas.get("model_id") or config.get("atlas_model_id") or top.get("atlas_model_id")
+    model_identifier = (
+        atlas.get("model_identifier")
+        or config.get("model_identifier")
+        or top.get("model_identifier")
+    )
     record = SnapshotRecord(
         backend=backend,
         run=run,
@@ -202,6 +419,7 @@ def _extract(path: Path, run: str, stat: os.stat_result) -> SnapshotRecord:
         task="lasagna",
         output_schema=output_schema,
         code_revision=str(top.get("code_revision") or config.get("code_revision")) if (top.get("code_revision") or config.get("code_revision")) else None,
+        model_identifier=str(model_identifier) if model_identifier else None,
     )
     return record
 
@@ -214,6 +432,8 @@ def index_snapshots(
 ) -> list[SnapshotRecord]:
     cache_path = _cache_path(config)
     cache = _load_cache(cache_path)
+    manager_identities = _manager_checkpoint_identities(config)
+    atlas_identities = _atlas_checkpoint_identities(config)
     updated: dict[str, dict[str, Any]] = {}
     records: list[SnapshotRecord] = []
     for run, path in discover_snapshot_paths(config.resolved_snapshot_dirs()):
@@ -226,16 +446,24 @@ def index_snapshots(
             continue
         else:
             record = _extract(path, run, stat)
+        # Cache only checkpoint-owned metadata. Atlas registration is projected
+        # on every scan so registry edits take effect without touching weights.
         updated[key] = asdict(record)
-        records.append(record)
+        record = _with_manager_identity(record, manager_identities)
+        records.append(_with_atlas_identity(record, atlas_identities))
     if not cached_only and write_cache:
         _atomic_json(cache_path, {"schema_version": 1, "entries": updated})
+    records = _deduplicate_snapshot_copies(config, records)
     return sorted(records, key=lambda record: (record.run, record.checkpoint, record.path))
 
 
-def completion_snapshot_candidates(config: ManagerConfig) -> list[tuple[str, str]]:
+def completion_snapshot_candidates(
+    config: ManagerConfig, *, backend: str | None = None,
+) -> list[tuple[str, str]]:
     """Discover every checkpoint cheaply, enriching candidates from the index."""
     cache = _load_cache(_cache_path(config))
+    manager_identities = _manager_checkpoint_identities(config)
+    atlas_identities = _atlas_checkpoint_identities(config)
     candidates: dict[str, str] = {}
     for run, path in discover_snapshot_paths(config.resolved_snapshot_dirs()):
         try:
@@ -253,6 +481,10 @@ def completion_snapshot_candidates(config: ManagerConfig) -> list[tuple[str, str
             except TypeError:
                 pass
             else:
+                record = _with_manager_identity(record, manager_identities)
+                record = _with_atlas_identity(record, atlas_identities)
+                if backend is not None and record.backend != backend:
+                    continue
                 candidates[record.selector] = (
                     f"step {record.step}" if record.step is not None else "snapshot"
                 )

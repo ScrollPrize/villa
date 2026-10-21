@@ -20,6 +20,7 @@
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
+#include "vc/core/util/Uuid.hpp"
 
 namespace vc3d::line_annotation {
 
@@ -56,6 +57,7 @@ struct StoredFiber {
     double width = 0.0;
     double widthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
     uint64_t id = 0;
+    std::string uuid = vc::util::newUuid();
     std::string username;
     std::string startedAt;
     uint64_t sequence = 0;

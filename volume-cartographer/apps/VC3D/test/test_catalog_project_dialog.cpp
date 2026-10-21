@@ -21,6 +21,80 @@ class CatalogProjectDialogTest : public QObject
 {
     Q_OBJECT
 private slots:
+    void attachRepresentations()
+    {
+        OpenDataManifest manifest;
+        OpenDataSample sample;
+        sample.id = "test";
+        OpenDataVolume volume;
+        volume.id = "scan";
+        const QStringList types{"ink-detection-3d-zarr", "ink_detection_3d_zarr",
+            "surface-prediction-zarr", "lasagna", "normal-grids", "surface-prediction-mesh"};
+        for (const auto& type : types) {
+            OpenDataArtifact artifact;
+            artifact.type = type.toStdString();
+            artifact.resolvedUrl = "https://example.invalid/" + artifact.type;
+            artifact.sourcePath = "predictions/fibers/" + artifact.type;
+            artifact.sourceCoordinateLevel = 2;
+            volume.artifacts.push_back(artifact);
+        }
+        auto unresolved = volume.artifacts.front();
+        unresolved.resolvedUrl.clear();
+        volume.artifacts.push_back(unresolved);
+        auto invalidNormal = volume.artifacts[4];
+        invalidNormal.levelParameterPresent = true;
+        invalidNormal.sourceCoordinateLevel.reset();
+        volume.artifacts.push_back(invalidNormal);
+        sample.volumes.push_back(volume);
+        manifest.samples.push_back(sample);
+        OpenDataCatalogWindow catalog(manifest);
+        int predictions = 0;
+        catalog.setAttachPredictionHandler([&](const OpenDataSample& selected,
+                const OpenDataResourceSelection& selection) {
+            QCOMPARE(selected.id, sample.id);
+            QCOMPARE(selected.volumes.front().id, volume.id);
+            QVERIFY(selection.rawVolumeIds.has_value());
+            QVERIFY(selection.rawVolumeIds->empty());
+            QVERIFY(selection.representations.has_value());
+            QCOMPARE(selection.representations->size(), std::size_t(1));
+            const auto ref = selection.representations->front();
+            QCOMPARE(ref.volumeIndex, std::size_t(0));
+            QCOMPARE(ref.artifactIndex, std::size_t(predictions));
+            QCOMPARE(ref.kind, OpenDataRepresentationKind::Prediction);
+            const auto& artifact = selected.volumes.at(ref.volumeIndex).artifacts.at(ref.artifactIndex);
+            QCOMPARE(artifact.sourceCoordinateLevel.value(), 2);
+            QCOMPARE(QString::fromStdString(artifact.resolvedUrl),
+                "https://example.invalid/" + types[predictions]);
+            ++predictions;
+        });
+        for (auto* table : catalog.findChildren<QTableWidget*>()) {
+            if (table->horizontalHeaderItem(0)->text() == "Sample ID")
+                table->setCurrentCell(0, 0);
+        }
+        auto* table = catalog.findChild<QTableWidget*>("catalogRepresentations");
+        auto* button = catalog.findChild<QPushButton*>("attachCatalogRepresentation");
+        QVERIFY(table);
+        QVERIFY(button);
+        QCOMPARE(table->rowCount(), 8);
+        QSignalSpy volumes(&catalog, &OpenDataCatalogWindow::attachVolumeRequested);
+        QSignalSpy lasagna(&catalog, &OpenDataCatalogWindow::attachLasagnaRequested);
+        QSignalSpy normals(&catalog, &OpenDataCatalogWindow::attachNormalGridsRequested);
+        for (int row = 0; row < table->rowCount(); ++row) {
+            table->setCurrentCell(row, 0);
+            QCOMPARE(button->isEnabled(), row < 5);
+            button->click();
+        }
+        QCOMPARE(predictions, 3);
+        QCOMPARE(volumes.count(), 0); // Predictions must not take the URL-only path.
+        QCOMPARE(lasagna.count(), 1);
+        QCOMPARE(lasagna.at(0).at(1).toBool(), true);
+        QCOMPARE(normals.count(), 1);
+        QCOMPARE(normals.at(0).at(0).toString(), QString("test"));
+        QCOMPARE(normals.at(0).at(1).toString(), QString("scan"));
+        QCOMPARE(normals.at(0).at(3).toInt(), 2);
+        QCOMPARE(normals.at(0).at(4).toBool(), true);
+    }
+
     void openAndCancel()
     {
         QTemporaryDir temp(QDir::current().filePath("catalog-dialog-XXXXXX"));

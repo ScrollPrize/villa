@@ -287,7 +287,7 @@ std::vector<std::byte> makeBytes(std::size_t n, std::byte v = std::byte{99});
 ChunkResult waitForResolved(ChunkCache& c, int level, int iz, int iy, int ix,
                             std::chrono::milliseconds timeout = std::chrono::seconds{2});
 
-TEST_CASE("budget denial skips persistence but downloaded ChunkCache data remains usable")
+TEST_CASE("asynchronous disk eviction leaves downloaded ChunkCache data usable")
 {
     auto root = tmpDir("budget_denied");
     auto budget = vc::render::PersistentZarrCacheBudget::configure(
@@ -309,6 +309,7 @@ TEST_CASE("budget denial skips persistence but downloaded ChunkCache data remain
     REQUIRE(result.bytes);
     CHECK((*result.bytes)[0] == std::byte{0x2a});
     cache->waitForPersistentWrites();
+    budget->waitForIdle();
     CHECK_FALSE(fs::exists(root / "volume" / "level_0" / "0" / "0" / "0.bin"));
     CHECK(budget->stats().managedBytes == 0);
     fs::remove_all(root);
@@ -989,7 +990,7 @@ TEST_CASE("Delta3D disk budget accounts the final encoded payload size")
     fs::remove_all(root);
 }
 
-TEST_CASE("failed Delta3D publication leaves rendering usable and no raw fallback")
+TEST_CASE("Delta3D eviction leaves rendering usable and no raw fallback")
 {
     const auto root = tmpDir("delta3d_write_failure");
     auto budget = vc::render::PersistentZarrCacheBudget::configure(
@@ -1011,6 +1012,7 @@ TEST_CASE("failed Delta3D publication leaves rendering usable and no raw fallbac
     REQUIRE(rendered.bytes);
     CHECK(*rendered.bytes == expected);
     cache->waitForPersistentWrites();
+    budget->waitForIdle();
 
     const auto chunkDir = root / "volume" / "0";
     CHECK_FALSE(fs::exists(chunkDir / "0.0.0"));

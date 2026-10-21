@@ -406,7 +406,7 @@ def _sample_patch_batch(key, patches, sampling_probabilities, num_to_sample,
         return (ijs_gpu, idx_gpu, slice_zyxs_gpu, node_ids_gpu,
                 sample_mask_gpu)
 
-    if prefetch.prefetch_enabled() and torch.cuda.is_available():
+    if prefetch.prefetch_enabled() and torch.device(patch_atlas.device).type == 'cuda':
         pf = prefetch.get_prefetcher()
         rng = pf.np_rng(key)
         return pf.pop_or_run((key, id(crossing_map), num_to_sample,

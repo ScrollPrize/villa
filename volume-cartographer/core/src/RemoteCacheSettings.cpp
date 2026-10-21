@@ -1,4 +1,5 @@
 #include "vc/core/util/RemoteCacheSettings.hpp"
+#include "vc/core/util/GlobalCacheRoot.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -199,6 +200,11 @@ fs::path settingsFilePath()
 fs::path remoteCachePath()
 {
     static const fs::path active = [] {
+        // Preserve the explicit host override used by headless fiber tools.
+        // Without it, use the shared upstream INI settings and mount defaults.
+        if (fs::exists(vc::core::util::vc3dConfigDirectory() / "cache.json")) {
+            return ensureWritableDirectory(vc::core::util::globalCacheRoot());
+        }
         if (auto configured = configuredRemoteCachePath(settingsFilePath());
             !configured.empty()) {
             return ensureWritableDirectory(std::move(configured));

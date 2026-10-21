@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "utils/Json.hpp"
+#include "vc/core/util/Rect3D.hpp"
 
 class Volume;
 class Segmentation;
@@ -184,6 +185,12 @@ public:
     void clearSelectedFiberInferenceDataset();
     [[nodiscard]] std::filesystem::path selectedFiberInferenceDatasetPath() const;
 
+    // Viewer bbox in volume coordinates; disabling retains the saved limits.
+    [[nodiscard]] std::optional<Rect3D> focusBounds() const { return focusBounds_; }
+    [[nodiscard]] bool focusBoundsEnabled() const { return focusBoundsEnabled_; }
+    // Bounds are source annotation-frame XYZ, never current-volume voxel units.
+    void setFocusBounds(std::optional<Rect3D> bounds, bool enabled);
+
     // The project's umbilicus polyline, if one has been attached explicitly.
     // Declaring it here removes the ambiguity of searching directories for
     // umbilicus.json when a project references several packages.
@@ -260,6 +267,8 @@ private:
     std::optional<std::string> selectedLasagnaDataset_;
     std::optional<std::string> selectedFiberInferenceDataset_;
     std::optional<std::string> umbilicus_;
+    std::optional<Rect3D> focusBounds_;
+    bool focusBoundsEnabled_ = false;
 
     std::map<std::string, std::shared_ptr<Volume>> loadedVolumes_;
     std::map<std::string, std::vector<std::string>> volumeTagsByID_;

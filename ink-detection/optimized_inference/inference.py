@@ -234,7 +234,10 @@ def preprocess_layers(
         src = LayersSource(layers, start_z=start_z, end_z=end_z)
         h, w, c = src.shape
         if c != CFG.in_chans:
-            logger.warning(f"Model expects {CFG.in_chans} channels, got {c}")
+            raise ValueError(
+                f"Model expects {CFG.in_chans} channels but the layer source provides {c} "
+                f"(z-range [{src._start_z}, {src._end_z})); check START_LAYER/END_LAYER"
+            )
 
         mask_desc = f"{fragment_mask.shape}" if fragment_mask is not None else "None"
         logger.info(f"Prepared layers source: shape={src.shape}, mask={mask_desc}, reverse={is_reverse_segment}")
