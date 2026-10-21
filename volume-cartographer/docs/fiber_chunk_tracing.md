@@ -82,8 +82,65 @@ are retained, and the reference is never used to guide route continuations.
 Tracing normals and evaluation normals have separate explicit coordinate
 scales. Progress callbacks report route steps with shared replay context.
 
-Full-volume orchestration, Python bindings and experimental refinement/conflict
+Full-volume/live-inference orchestration and experimental refinement/conflict
 filters are not part of this layer.
+
+## Python
+
+The same implementation is available in `vc.fiber_trace`. Dataset handles are
+retained by `ChunkCache`; it copies both configurations at construction. Native
+construction, routing and replay release the GIL. Multiple Python threads may
+request chunks from the same cache, sharing in-flight builds. Returned NumPy
+arrays own their data and remain valid after the cache or result is destroyed.
+Input point/metric arrays must be contiguous CPU float64 arrays.
+
+```python
+import numpy as np
+from vc import fiber_trace as ft
+
+field = ft.open_prediction_field("predictions.lasagna.json", scaledown_power=0,
+                                 enable_width=True)
+normals = ft.open_normal_sampler("normals.lasagna.json", field.trace_to_base_scale)
+trace = ft.TraceConfig(step_voxels=16 / field.trace_to_base_scale,
+                       trace_to_base_scale=field.trace_to_base_scale,
+                       replay_presence_cutoff=0.1,
+                       replay_presence_modulated=True,
+                       width_relative_tolerance=0.4, width_cosine_weight=True)
+chunks = ft.ChunkConfig()
+chunks.join_width_weight = True
+cache = ft.ChunkCache(field, normals, trace, chunks, "chunk-path-cache",
+                     "immutable-model-and-normal-dataset-identity")
+paths = cache.get([0, 0, 0])  # XYZ key; paths.lines_base is a list of arrays
+
+# reference_xyz is the application's (N,3) polyline in base voxels.
+evaluation = ft.ChunkReplayConfig()
+result = cache.replay(np.ascontiguousarray(reference_xyz, dtype=np.float64),
+                      normals, evaluation, reverse_interval_base=0)
+for segment in result.segments:
+    print(segment.termination_reason, segment.points_base.shape)
+print(len(result.failures), result.seed_search_skipped_base, result.filtered_stops)
+```
+
+Width sampling is opt-in; omit `enable_width` and keep width tolerance/join
+weight disabled for models without a width channel. The source identity must
+identify immutable model, volume, normal data and coordinate transforms, not
+just a generic model name. Existing callers of `open_prediction_field` retain
+their previous behavior by default.
+
+`cache.route(center_base, direction, metric, maximum_distance_base,
+maximum_steps)` traces without GT evaluation. `metric` is the positive-definite
+3x3 ellipsoid matrix; the result dictionary contains `points_base`, `reason`
+and typed `joins`. Points exclude the initial snap, available as
+`joins[0].match.point_base` when a path was found. Native cached routes do not
+retain cumulative beam losses; replay's cumulative losses are consequently zero.
+
+Replay accepts separate evaluation normals, optional begin/end base arclengths,
+and `reverse_interval_base`. Zero disables reverse checks. A positive interval
+uses the existing native reverse verifier and the replay acceptance radii;
+rejected spans appear in `filtered_stops` rather than ordinary failures.
+The Python wrapper does not add a worker pool, prediction readiness callback or
+arbitrary Python scheduler/observer callbacks. Such live orchestration remains
+separate from this offline API.
 
 ## Validation
 
@@ -92,6 +149,10 @@ With an existing native CMake build:
 ```sh
 cmake --build <build> --target test_fiber_chunk_trace -j 8
 <build>/bin/test_fiber_chunk_trace
+cmake --build <build> --target vc_fiber_trace -j 8
+python -m pytest volume-cartographer/python/tests/test_fiber_trace.py \
+  volume-cartographer/python/tests/test_fiber_chunk_trace.py \
+  --vc-build-python <build>/python
 ```
 
 Tests cover deterministic parallel construction, non-winning boundary branches,
