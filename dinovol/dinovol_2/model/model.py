@@ -223,14 +223,8 @@ class PointDenseHead(nn.Module):
             return 2
         return 1 if num_skips == 2 else 0
 
-    def _sample_fpn_points(
-        self,
-        token_grid: torch.Tensor,
-        skips: list[torch.Tensor],
-        point_coordinates: torch.Tensor,
-        input_shape: Tuple[int, ...],
-    ) -> torch.Tensor:
-        """Run top-down 3D FPN refinement and sample the target point coordinates (no checkpointing)."""
+    def fpn_grid(self, token_grid: torch.Tensor, skips: list[torch.Tensor]) -> torch.Tensor:
+        """Run top-down 3D FPN refinement; returns a [B, D, H, W, fpn_dim] grid (no checkpointing)."""
         dtype = token_grid.dtype
         coarser_skips = skips[self._fpn_skip_start:]
         x = self.fpn_in(token_grid.permute(0, 4, 1, 2, 3).contiguous())
@@ -240,8 +234,18 @@ class PointDenseHead(nn.Module):
                 x = F.interpolate(x, size=target_size, mode="trilinear", align_corners=False)
             x = x + lateral(skip.to(dtype))
             x = x + refine(x)
-        fpn_grid = x.permute(0, 2, 3, 4, 1).contiguous()
-        return sample_grid_points(fpn_grid, point_coordinates, input_shape).to(dtype)
+        return x.permute(0, 2, 3, 4, 1).contiguous()
+
+    def _sample_fpn_points(
+        self,
+        token_grid: torch.Tensor,
+        skips: list[torch.Tensor],
+        point_coordinates: torch.Tensor,
+        input_shape: Tuple[int, ...],
+    ) -> torch.Tensor:
+        """Run top-down 3D FPN refinement and sample the target point coordinates (no checkpointing)."""
+        fpn_grid = self.fpn_grid(token_grid, skips)
+        return sample_grid_points(fpn_grid, point_coordinates, input_shape).to(token_grid.dtype)
 
     def forward_points(
         self,
@@ -260,15 +264,28 @@ class PointDenseHead(nn.Module):
             skip_points = [
                 sample_grid_points(level.permute(0, 2, 3, 4, 1), point_coordinates, input_shape) for level in skips
             ]
+        return {**self.readout(tokens, skip_points, fpn_pts, dtype=dtype), "tokens": tokens}
+
+    def readout(
+        self,
+        tokens: torch.Tensor,
+        skip_points: list[torch.Tensor],
+        fpn_points: torch.Tensor,
+        *,
+        dtype: torch.dtype,
+    ) -> dict[str, torch.Tensor]:
+        """Shared trunk and readouts from point-sampled tokens, skips and fpn_norm-ed FPN features.
+
+        dtype is the token grid's dtype, which the skip and token features are cast to.
+        """
         skip_parts = [norm(points.to(dtype)) for norm, points in zip(self.skip_norms, skip_points)]
         tokens_cast = tokens.to(dtype)
         trunk = self.trunk_norm(
-            self.mlp(torch.cat([tokens_cast, *skip_parts, fpn_pts], dim=-1)) + self.token_shortcut(tokens_cast)
+            self.mlp(torch.cat([tokens_cast, *skip_parts, fpn_points], dim=-1)) + self.token_shortcut(tokens_cast)
         )
         return {
             "dense": F.normalize(self.obj_proj(trunk).float(), dim=-1),
             "ink": F.normalize(self.ink_proj(trunk).float(), dim=-1),
-            "tokens": tokens,
         }
 
     def forward(self, tokens: torch.Tensor, skips: torch.Tensor) -> torch.Tensor:

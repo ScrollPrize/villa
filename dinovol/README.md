@@ -1096,6 +1096,60 @@ Workflow:
 
 The widget rebuilds the teacher backbone from the saved checkpoint config, computes a patch embedding grid only inside the active bbox for the selected OME-Zarr scale, and limits the PCA and cosine-similarity outputs to that same crop. The dock widget opens on the bottom of the napari window.
 
+## Embedding a volume region
+
+`dinovol_2/eval/embed_volume.py` embeds a z slab (optionally restricted in y/x)
+with a checkpoint's teacher backbone and writes a zarr v2 group (channel-last,
+Zstd) with three outputs:
+
+| Array | Grid step | Values |
+| --- | --- | --- |
+| `tokens` | patch size | blended backbone `x_norm_patchtokens` |
+| `tokens_unit` | patch size | the same tokens L2-normalized (dot product = cosine) |
+| `dense` | `--dense-stride` voxels | `PointDenseHead` object embedding, unit length |
+| `ink` | `--dense-stride` voxels | `PointDenseHead` ink embedding, unit length |
+
+```bash
+.venv/bin/python -m dinovol_2.eval.embed_volume \
+  --checkpoint /mnt/raid_nvme/dinovol_ckpts/checkpoint_step_640000.pt \
+  --volume s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/ \
+  --level 2 --cache-dir /mnt/raid_nvme/volume_cache --z-start 14000 --depth 192 \
+  --output outputs/PHercParis4_L2_z14000-14192.zarr
+```
+
+Tiles use the training global crop size (192³ for the 640k checkpoint) on one
+global lattice per axis: tile `k` starts at `k*stride - margin`, and contributes
+on `[k*stride, k*stride + stride + ramp)` with linear ramps whose overlaps sum to
+one. The `margin` voxels at each face are context only. Every output is
+therefore a fixed blend of the tiles covering its global position: any slab or
+y/x range reproduces the same values (`--y-range`/`--x-range` select whole
+lattice cells). Margin and ramp default to `tile/6` (32 voxels, stride 96): with
+the 640k checkpoint, token agreement with a centered view is 0.88 at a tile face
+and 0.98 six tokens in. Larger `--tile` values run (RoPE is trained with
+coordinate rescaling), but the embedding itself changes with tile size: at the
+same voxel, 192³ and 384³ tiles agree at cosine 0.71 (tokens) and 0.70 (dense),
+and the drift does not converge up to 448³. Keep one tile size for outputs
+that will be compared; the default matches training.
+
+Volume reads and normalization use vc_reader. Training normalized each crop with
+its own statistics, which would make adjacent tiles disagree, so the
+checkpoint's scheme is applied with fixed statistics. They come from the nonzero
+voxels of every 8th chunk along each axis of the whole volume. Robust
+normalization clips only the upper percentile, so masked zeros stay below scroll
+air. The statistics are saved in `.zattrs`. Pass that file to
+`--normalization-stats` to reuse them for other slabs. Outputs whose patch or
+stride block has no nonzero voxel are not embedded (zero vectors, chunks not
+written), and tiles without such outputs are skipped.
+
+`--dtype int8` (default) stores a symmetric per-vector quantization:
+`value = q * <name>_scale`. On real tiles it keeps cosine similarity ≥ 0.9998
+against fp32; `--dtype float16` stores values directly. `read_embeddings(path,
+name, selection)` returns dequantized float32 arrays. To add `tokens_unit` to a
+group written without it, run `.venv/bin/python -m dinovol_2.eval.embed_volume
+--add-unit-tokens <group.zarr>`. It derives the array from the stored `tokens`
+(cosine ≥ 0.99999 against computing it during the run). At `--dense-stride 1` the
+full PHercParis4 level-2 slab is roughly 345 GB (dense 220, ink 120, tokens 3).
+
 ## Extending the training method
 
 `dinovol_2.pretrain` is the CLI. `training/trainer.py` owns iteration, AMP,

@@ -33,6 +33,10 @@ automatically when a CUDA compiler is found; otherwise the build is CPU-only.
 Discovery includes standard toolkit locations such as `/usr/local/cuda`.
 For a toolkit elsewhere, set `CUDACXX=/path/to/nvcc`.
 
+Native builds require CMake 3.25.2 or newer for CUDA C++20 support with NVCC
+12 and newer. Python package builds automatically obtain a suitable CMake
+in the isolated build environment if the system version is too old.
+
 To force a CPU-only build, use:
 
 ```bash

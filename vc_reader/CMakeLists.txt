@@ -1,4 +1,5 @@
-cmake_minimum_required(VERSION 3.20)
+# CMake 3.25.2 adds CUDA C++20 compiler flags for NVCC 12 and newer.
+cmake_minimum_required(VERSION 3.25.2)
 project(vc_reader_extensions LANGUAGES CXX)
 
 # C++ read path for vc_reader (module vc_reader._reader), built by

@@ -676,16 +676,7 @@ def _evaluate_dense_head_grid(
         raise ValueError(f"unsupported dense head embedding_source {embedding_source!r}")
 
     dtype = token_grid.dtype
-    coarser_skips = skips[dense_head._fpn_skip_start:]
-    x = dense_head.fpn_in(token_grid.permute(0, 4, 1, 2, 3).contiguous())
-    for skip, lateral, refine in zip(reversed(coarser_skips), dense_head.fpn_laterals, dense_head.fpn_refines):
-        target_size = skip.shape[2:]
-        if x.shape[2:] != target_size:
-            x = F.interpolate(x, size=target_size, mode="trilinear", align_corners=False)
-        x = x + lateral(skip.to(dtype))
-        x = x + refine(x)
-    fpn_grid = x.permute(0, 2, 3, 4, 1).contiguous()
-    del x
+    fpn_grid = dense_head.fpn_grid(token_grid, skips)
     skip_grids = [level.permute(0, 2, 3, 4, 1) for level in skips]
 
     grid_shape = tuple(max(1, int(size) // int(st)) for size, st in zip(spatial_shape, stride))
@@ -698,7 +689,6 @@ def _evaluate_dense_head_grid(
     zz, yy, xx = torch.meshgrid(*axes, indexing="ij")
     all_points = torch.stack([zz, yy, xx], dim=-1).reshape(-1, 3)
 
-    proj = dense_head.ink_proj if embedding_source == "ink" else dense_head.obj_proj
     out_dim = int(dense_head.ink_dim if embedding_source == "ink" else dense_head.out_dim)
     total_points = int(all_points.shape[0])
     out_flat = np.empty((total_points, out_dim), dtype=np.float32)
@@ -708,16 +698,8 @@ def _evaluate_dense_head_grid(
         pts = all_points[start:stop].unsqueeze(0)
         tokens = sample_grid_points(token_grid, pts, spatial_shape)
         fpn_pts = dense_head.fpn_norm(sample_grid_points(fpn_grid, pts, spatial_shape).to(dtype))
-        skip_parts = [
-            norm(sample_grid_points(sg, pts, spatial_shape).to(dtype))
-            for norm, sg in zip(dense_head.skip_norms, skip_grids)
-        ]
-        tokens_cast = tokens.to(dtype)
-        trunk = dense_head.trunk_norm(
-            dense_head.mlp(torch.cat([tokens_cast, *skip_parts, fpn_pts], dim=-1))
-            + dense_head.token_shortcut(tokens_cast)
-        )
-        emb = F.normalize(proj(trunk).float(), dim=-1).squeeze(0)
+        skip_pts = [sample_grid_points(sg, pts, spatial_shape) for sg in skip_grids]
+        emb = dense_head.readout(tokens, skip_pts, fpn_pts, dtype=dtype)[embedding_source].squeeze(0)
         out_flat[start:stop] = emb.detach().cpu().numpy()
 
     return out_flat.reshape(*grid_shape, out_dim)

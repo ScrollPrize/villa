@@ -10,3 +10,6 @@ wheels/
 .venv
 /.idea
 /dinovol_2/eval/data/fibers
+
+# Embedding outputs
+/outputs/
