@@ -6,9 +6,10 @@ It wraps a CPU batch source and prepares a bounded number of future batches on
 a dedicated CUDA stream while the caller trains on the preceding batch.
 
 This extraction does not switch the training CLI to a new loading path, change
-augmentation parameters, or alter model/loss behavior. GPU value augmentation,
-effective-batch accumulation and the later trainer integration are separate
-extraction stages. The current mask-aware CPU augmentation remains unchanged.
+augmentation parameters, or alter model/loss behavior. Optional
+[GPU value augmentation](gpu_value_augmentation.md) can run on the preparation
+stream. Effective-batch accumulation and the later trainer integration remain
+separate extraction stages. The current mask-aware CPU augmentation is unchanged.
 
 ## API and ownership
 
@@ -40,6 +41,11 @@ tensors are recorded on the consumer's current stream before returning them.
 `depth` bounds preparation credits. In addition to the batch held by the caller,
 at most `depth` future batches may be prepared or under preparation. Depth is
 not a worker count or a global training batch-size setting.
+
+Sources may defer `blur` or `all` value augmentation. Pass the same mode as
+`value_augmentation_suffix` to the CUDA wrapper; it calls the shared deferred
+dispatcher between H2D and target creation, with autocast explicitly disabled.
+Batch timing separates transfer, value augmentation and target creation.
 
 `FiberTrace3DBatch.to(..., non_blocking=True)`, `pin_memory()` and
 `record_stream(stream)` share the existing batch field definitions. CPU target
@@ -73,8 +79,9 @@ training CLI still uses its unchanged default stride-one path.
 
 Batch transfer helpers, the asynchronous stage and stride-aware target builder
 come from `3f0aeecaa` (following `66f3134b7`'s output-lattice support). The
-index-less CUDA device resolution fix comes from the later frozen development
-source `2192cc5ac`. The stage now has a separate importable module; no second
+index-less CUDA device resolution fix and shared deferred dispatcher come from
+the later frozen development source `2192cc5ac`. The GPU suffix extends the
+stage with the existing `29a7289c5` implementation. The stage now has a separate importable module; no second
 preparation implementation is added to the trainer.
 
 CPU tests cover unchanged target defaults, coarse CP placement, conservative

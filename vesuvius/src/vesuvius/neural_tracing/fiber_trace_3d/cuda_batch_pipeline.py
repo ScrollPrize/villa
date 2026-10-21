@@ -10,7 +10,7 @@ from typing import Any
 import torch
 
 from .loader import FiberTrace3DBatch
-from .sample_pipeline import FiberTrace3DTrainingBatchPipeline
+from .sample_pipeline import FiberTrace3DTrainingBatchPipeline, apply_deferred_batch_augmentation
 from .targets import materialize_targets
 
 
@@ -20,6 +20,7 @@ class _CudaPreparedBatch:
     pinned_batch: FiberTrace3DBatch
     transfer_started: torch.cuda.Event
     transfer_finished: torch.cuda.Event
+    augmentation_finished: torch.cuda.Event
     preparation_finished: torch.cuda.Event
     queued_at: float
     source_wait_ms: float
@@ -54,6 +55,7 @@ class FiberTrace3DCudaBatchPipeline:
         device: torch.device,
         output_stride: int,
         depth: int = 2,
+        value_augmentation_suffix: str | None = None,
     ) -> None:
         if device.type != "cuda":
             raise ValueError("CUDA batch preparation requires a CUDA device")
@@ -66,6 +68,7 @@ class FiberTrace3DCudaBatchPipeline:
                        if device.index is None else device)
         self.output_stride = int(output_stride)
         self.depth = int(depth)
+        self.value_augmentation_suffix = value_augmentation_suffix
         self.stream = torch.cuda.Stream(device=self.device)
         self._results: queue.Queue[object] = queue.Queue()
         self._available = threading.Semaphore(self.depth)
@@ -101,10 +104,15 @@ class FiberTrace3DCudaBatchPipeline:
                 with torch.cuda.device(self.device), torch.cuda.stream(self.stream):
                     transfer_started = torch.cuda.Event(enable_timing=True)
                     transfer_finished = torch.cuda.Event(enable_timing=True)
+                    augmentation_finished = torch.cuda.Event(enable_timing=True)
                     preparation_finished = torch.cuda.Event(enable_timing=True)
                     transfer_started.record(self.stream)
                     device_batch = pinned.to(self.device, non_blocking=True)
                     transfer_finished.record(self.stream)
+                    with torch.autocast(device_type="cuda", enabled=False):
+                        device_batch = apply_deferred_batch_augmentation(
+                            device_batch, self.config, mode=self.value_augmentation_suffix)
+                    augmentation_finished.record(self.stream)
                     device_batch = materialize_targets(
                         device_batch,
                         self.config,
@@ -117,6 +125,7 @@ class FiberTrace3DCudaBatchPipeline:
                     pinned_batch=pinned,
                     transfer_started=transfer_started,
                     transfer_finished=transfer_finished,
+                    augmentation_finished=augmentation_finished,
                     preparation_finished=preparation_finished,
                     queued_at=time.perf_counter(),
                     source_wait_ms=0.0,
@@ -183,7 +192,10 @@ class FiberTrace3DCudaBatchPipeline:
         result.preparation_finished.synchronize()
         ready_wait_ms = (time.perf_counter() - ready_wait_started) * 1000.0
         transfer_ms = result.transfer_started.elapsed_time(result.transfer_finished)
-        target_ms = result.transfer_finished.elapsed_time(result.preparation_finished)
+        augmentation_ms = result.transfer_finished.elapsed_time(
+            result.augmentation_finished
+        )
+        target_ms = result.augmentation_finished.elapsed_time(result.preparation_finished)
         current_stream = torch.cuda.current_stream(self.device)
         result.batch.record_stream(current_stream)
         profile_timings = dict(result.batch.profile_timings_ms or {})
@@ -196,6 +208,7 @@ class FiberTrace3DCudaBatchPipeline:
             cuda_pipeline_exposed_queue_wait_ms=float(queue_wait_ms),
             cuda_pipeline_exposed_event_wait_ms=float(ready_wait_ms),
             cuda_pipeline_transfer_ms=float(transfer_ms),
+            cuda_pipeline_value_augmentation_ms=float(augmentation_ms),
             cuda_pipeline_target_ms=float(target_ms),
             cuda_pipeline_pinned_bytes=float(result.pinned_bytes),
         )

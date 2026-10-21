@@ -49,6 +49,7 @@ _REMOTE_PREFIXES = ("http://", "https://", "s3://")
 _TARGET_MODE_CP_ONLY = 0
 _TARGET_MODE_DENSE_LINE = 1
 DEFAULT_VOLUME_CACHE_MEMORY_MIB = 512.0
+_FULL_VALID_MASK_CACHE: dict[tuple[int, ...], np.ndarray] = {}
 
 
 @dataclass(frozen=True)
@@ -148,6 +149,17 @@ class _Augment3DParams:
 
 
 @dataclass(frozen=True)
+class _DirectGaussianKernel3D:
+    dense_zyx: np.ndarray
+
+
+@dataclass(frozen=True)
+class _BlurKernels3D:
+    isotropic_1d: np.ndarray | None
+    directional_zyx: _DirectGaussianKernel3D | None
+
+
+@dataclass(frozen=True)
 class _GeometryMaps3D:
     backward_source_zyx: torch.Tensor | None
     params: _Augment3DParams
@@ -203,6 +215,7 @@ class FiberTrace3DRawSample:
     augmentation: _Augment3DParams
     load_wall_ms: float
     load_cpu_ms: float
+    blur_kernels: _BlurKernels3D | None = None
 
 
 @dataclass(frozen=True)
@@ -222,6 +235,7 @@ class FiberTrace3DSharedTensorSlots:
         slot_count: int,
         patch_shape_zyx: tuple[int, int, int],
         stream_index_map: Any = None,
+        volume_dtype: torch.dtype = torch.float32,
     ) -> None:
         if int(slot_count) <= 0:
             raise ValueError("slot_count must be positive")
@@ -229,7 +243,7 @@ class FiberTrace3DSharedTensorSlots:
         self.slot_count = int(slot_count)
         self.stream_index_map = stream_index_map
         shape = (self.slot_count, 1, *(int(v) for v in patch_shape_zyx))
-        self.volumes = torch.empty(shape, dtype=torch.float32).share_memory_()
+        self.volumes = torch.empty(shape, dtype=volume_dtype).share_memory_()
         self.valid_masks = torch.empty(shape, dtype=torch.bool).share_memory_()
         self.generations = torch.full(
             (self.slot_count,), -1, dtype=torch.int64
@@ -386,6 +400,8 @@ class FiberTrace3DBatch:
     direction_tangent_sparse_zyx: torch.Tensor | None = None
     presence_target: torch.Tensor | None = None
     presence_mask: torch.Tensor | None = None
+    deferred_augmentation_params: tuple[_Augment3DParams, ...] | None = None
+    deferred_blur_kernels: tuple[_BlurKernels3D | None, ...] | None = None
     profile_timings_ms: dict[str, float] | None = None
 
     def to(
@@ -449,6 +465,8 @@ class FiberTrace3DBatch:
             presence_mask=None
             if self.presence_mask is None
             else self.presence_mask.to(device, non_blocking=non_blocking),
+            deferred_augmentation_params=self.deferred_augmentation_params,
+            deferred_blur_kernels=self.deferred_blur_kernels,
             profile_timings_ms=self.profile_timings_ms,
         )
 
@@ -497,6 +515,8 @@ def collate_fiber_trace_3d_samples(
     *,
     volume_batch: torch.Tensor | None = None,
     valid_mask_batch: torch.Tensor | None = None,
+    deferred_augmentation_params: tuple[_Augment3DParams, ...] | None = None,
+    deferred_blur_kernels: tuple[_BlurKernels3D | None, ...] | None = None,
     profile: bool = False,
     total_start: float | None = None,
     cpu_total_start: float | None = None,
@@ -545,6 +565,10 @@ def collate_fiber_trace_3d_samples(
     assert valid_mask_batch is not None
     if int(volume_batch.shape[0]) != len(samples) or int(valid_mask_batch.shape[0]) != len(samples):
         raise ValueError("prebuilt batch tensors do not match sample count")
+    if deferred_blur_kernels is not None and len(deferred_blur_kernels) != len(samples):
+        raise ValueError("deferred blur-kernel count does not match sample count")
+    if deferred_augmentation_params is not None and len(deferred_augmentation_params) != len(samples):
+        raise ValueError("deferred augmentation-parameter count does not match sample count")
     return FiberTrace3DBatch(
         volume=volume_batch,
         valid_mask=valid_mask_batch,
@@ -576,6 +600,8 @@ def collate_fiber_trace_3d_samples(
         target_segment_bbox_lo_zyx=segment_bbox_lo,
         target_segment_bbox_hi_zyx=segment_bbox_hi,
         target_tangent_zyx=torch.stack([sample.target_tangent_zyx for sample in samples]),
+        deferred_augmentation_params=deferred_augmentation_params,
+        deferred_blur_kernels=deferred_blur_kernels,
         profile_timings_ms={
             **(timings or {}),
             "batch_stack_ms": (time.perf_counter() - stack_start) * 1000.0,
@@ -1405,7 +1431,7 @@ def _native_value_blur(
 
 def _native_value_transform(
     volume: torch.Tensor,
-    valid_mask: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
     *,
     normalization: str,
     contrast: float,
@@ -1413,6 +1439,15 @@ def _native_value_transform(
     gamma: float,
     backend: str,
 ) -> tuple[torch.Tensor | None, bool]:
+    if valid_mask is None:
+        # The complete-patch recipe shares the native transform with legacy
+        # mask-aware callers; reuse its immutable all-valid compatibility mask.
+        shape = tuple(int(value) for value in volume.shape)
+        full_patch = _FULL_VALID_MASK_CACHE.get(shape)
+        if full_patch is None:
+            full_patch = np.ones(shape, dtype=bool)
+            _FULL_VALID_MASK_CACHE[shape] = full_patch
+        valid_mask = torch.from_numpy(full_patch)
     eligible = (
         volume.device.type == "cpu"
         and volume.dtype == torch.float32
@@ -1584,6 +1619,520 @@ def apply_value_augmentation_3d(
     )
     record("value_final_mask_ms", started)
     return result
+
+
+def _perpendicular_basis_zyx(axis_zyx: np.ndarray) -> np.ndarray:
+    """Return an orthonormal ZYX basis with the requested principal axis first."""
+    axis = np.asarray(axis_zyx, dtype=np.float64)
+    norm = float(np.linalg.norm(axis))
+    if not math.isfinite(norm) or norm <= 1.0e-12:
+        raise ValueError("anisotropic blur axis must be finite and nonzero")
+    along = axis / norm
+    reference = (
+        np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
+        if abs(float(along[0])) > 0.9
+        else np.asarray([1.0, 0.0, 0.0], dtype=np.float64)
+    )
+    across_a = np.cross(along, reference)
+    across_a /= max(float(np.linalg.norm(across_a)), 1.0e-12)
+    across_b = np.cross(along, across_a)
+    across_b /= max(float(np.linalg.norm(across_b)), 1.0e-12)
+    return np.stack([along, across_a, across_b], axis=1)
+
+
+def _gaussian_kernel_1d(sigma: float) -> np.ndarray | None:
+    """Build one normalized, truncated 1D Gaussian in FP64, then cast to FP32."""
+    sigma = float(sigma)
+    if not math.isfinite(sigma) or sigma < 0.0:
+        raise ValueError("isotropic blur sigma must be finite and nonnegative")
+    if sigma == 0.0:
+        return None
+    radius = int(math.ceil(3.0 * sigma))
+    coordinates = np.arange(-radius, radius + 1, dtype=np.float64)
+    weights = np.exp(-0.5 * (coordinates / sigma) ** 2)
+    weights /= float(weights.sum())
+    return np.ascontiguousarray(weights, dtype=np.float32)
+
+
+def _directional_gaussian_kernel_3d(
+    params: _Augment3DParams,
+) -> _DirectGaussianKernel3D | None:
+    """Build one normalized directional-only discrete 3D Gaussian."""
+    if params.anisotropic_blur_axis_zyx is None:
+        return None
+    basis = _perpendicular_basis_zyx(params.anisotropic_blur_axis_zyx)
+    sigmas = np.asarray(
+        [
+            float(params.anisotropic_blur_sigma_along),
+            float(params.anisotropic_blur_sigma_across),
+            float(params.anisotropic_blur_sigma_across),
+        ],
+        dtype=np.float64,
+    )
+    if not np.isfinite(sigmas).all() or bool((sigmas < 0.0).any()):
+        raise ValueError("blur sigmas must be finite and nonnegative")
+    if bool((sigmas <= 0.0).all()):
+        return None
+
+    principal_radii = np.ceil(3.0 * sigmas).astype(np.int64)
+    world_radii = np.ceil(np.abs(basis) @ principal_radii).astype(np.int64)
+    axes = [
+        np.arange(-int(radius), int(radius) + 1, dtype=np.float64)
+        for radius in world_radii
+    ]
+    zz, yy, xx = np.meshgrid(*axes, indexing="ij")
+    offsets = np.stack([zz, yy, xx], axis=-1)
+    principal = offsets @ basis
+    inside = np.ones(offsets.shape[:-1], dtype=bool)
+    exponent = np.zeros(offsets.shape[:-1], dtype=np.float64)
+    for component in range(3):
+        radius = int(principal_radii[component])
+        coordinate = principal[..., component]
+        inside &= np.abs(coordinate) <= float(radius) + 1.0e-7
+        sigma = float(sigmas[component])
+        if sigma > 0.0:
+            exponent += (coordinate / sigma) ** 2
+        else:
+            inside &= np.abs(coordinate) <= 1.0e-7
+    weights = np.where(inside, np.exp(-0.5 * exponent), 0.0)
+    total = float(weights.sum())
+    if not math.isfinite(total) or total <= 0.0:
+        raise RuntimeError("direct Gaussian kernel has no finite support")
+    dense = np.ascontiguousarray(weights / total, dtype=np.float32)
+    return _DirectGaussianKernel3D(dense)
+
+
+def _build_blur_kernels_3d(params: _Augment3DParams) -> _BlurKernels3D:
+    return _BlurKernels3D(
+        isotropic_1d=_gaussian_kernel_1d(params.blur_sigma),
+        directional_zyx=_directional_gaussian_kernel_3d(params),
+    )
+
+
+def _apply_isotropic_kernels_3d(
+    volume: torch.Tensor,
+    kernels_1d: tuple[np.ndarray | None, ...],
+) -> torch.Tensor:
+    """Apply independently weighted isotropic kernels as three grouped 1D passes."""
+    if volume.ndim != 5 or int(volume.shape[1]) != 1:
+        raise ValueError("isotropic Gaussian blur expects Bx1xZxYxX volumes")
+    batch = int(volume.shape[0])
+    if len(kernels_1d) != batch:
+        raise ValueError("isotropic Gaussian kernel count does not match batch size")
+    active = [kernel for kernel in kernels_1d if kernel is not None]
+    if not active:
+        return volume
+    lengths = [int(kernel.size) for kernel in active]
+    if any(length <= 0 or length % 2 == 0 for length in lengths):
+        raise ValueError("isotropic Gaussian kernels must have positive odd lengths")
+    max_length = max(lengths)
+    weights_1d = torch.zeros(
+        (batch, max_length),
+        dtype=volume.dtype,
+        device=volume.device,
+    )
+    center = max_length // 2
+    for sample_index, kernel in enumerate(kernels_1d):
+        if kernel is None:
+            weights_1d[sample_index, center] = 1.0
+            continue
+        tensor = torch.as_tensor(
+            np.asarray(kernel, dtype=np.float32),
+            dtype=volume.dtype,
+            device=volume.device,
+        )
+        start = (max_length - int(tensor.numel())) // 2
+        weights_1d[sample_index, start : start + int(tensor.numel())] = tensor
+    result = volume.transpose(0, 1)
+    radius = max_length // 2
+    for axis in range(3):
+        shape = [batch, 1, 1, 1, 1]
+        shape[axis + 2] = max_length
+        weights = weights_1d.reshape(shape)
+        padding = [0, 0, 0, 0, 0, 0]
+        pair = 2 * (2 - axis)
+        padding[pair : pair + 2] = [radius, radius]
+        result = F.conv3d(
+            F.pad(result, tuple(padding), mode="replicate"),
+            weights,
+            groups=batch,
+        )
+    return result.transpose(0, 1)
+
+
+def _directional_kernel_groups(
+    kernels_zyx: tuple[_DirectGaussianKernel3D | None, ...],
+    *,
+    max_padding_ratio: float = 1.25,
+) -> list[list[int]]:
+    """Deterministically form small rectangular-convolution groups."""
+    shapes = {
+        index: tuple(int(value) for value in kernel.dense_zyx.shape)
+        for index, kernel in enumerate(kernels_zyx)
+        if kernel is not None
+    }
+    if any(any(value <= 0 or value % 2 == 0 for value in shape) for shape in shapes.values()):
+        raise ValueError("directional Gaussian kernels must have positive odd ZYX shapes")
+    order = sorted(shapes, key=lambda index: (-math.prod(shapes[index]), index))
+    groups: list[list[int]] = []
+    for sample_index in order:
+        best: tuple[float, int] | None = None
+        for group_index, group in enumerate(groups):
+            members = [*group, sample_index]
+            common = tuple(max(shapes[index][axis] for index in members) for axis in range(3))
+            ratio = len(members) * math.prod(common) / sum(
+                math.prod(shapes[index]) for index in members
+            )
+            candidate = (ratio, group_index)
+            if ratio <= max_padding_ratio and (best is None or candidate < best):
+                best = candidate
+        if best is None:
+            groups.append([sample_index])
+        else:
+            groups[best[1]].append(sample_index)
+    return groups
+
+
+def _apply_directional_kernels_3d(
+    volume: torch.Tensor,
+    kernels_zyx: tuple[_DirectGaussianKernel3D | None, ...],
+    *,
+    max_padding_ratio: float = 1.25,
+) -> torch.Tensor:
+    """Apply greedily grouped rectangular directional kernels."""
+    if volume.ndim != 5 or int(volume.shape[1]) != 1:
+        raise ValueError("directional Gaussian blur expects Bx1xZxYxX volumes")
+    if len(kernels_zyx) != int(volume.shape[0]):
+        raise ValueError("directional Gaussian kernel count does not match batch size")
+    groups = _directional_kernel_groups(
+        kernels_zyx,
+        max_padding_ratio=max_padding_ratio,
+    )
+    if not groups:
+        return volume
+    result = volume.clone()
+    for group in groups:
+        indices = torch.as_tensor(group, dtype=torch.long, device=volume.device)
+        selected = volume.index_select(0, indices)
+        kernels = [kernels_zyx[index] for index in group]
+        assert all(kernel is not None for kernel in kernels)
+        max_shape = tuple(
+            max(int(kernel.dense_zyx.shape[axis]) for kernel in kernels if kernel is not None)
+            for axis in range(3)
+        )
+        weights = torch.zeros(
+            (len(group), 1, *max_shape),
+            dtype=volume.dtype,
+            device=volume.device,
+        )
+        for local_index, kernel in enumerate(kernels):
+            assert kernel is not None
+            tensor = torch.as_tensor(kernel.dense_zyx, dtype=volume.dtype, device=volume.device)
+            starts = tuple((max_shape[axis] - int(tensor.shape[axis])) // 2 for axis in range(3))
+            slices = tuple(
+                slice(starts[axis], starts[axis] + int(tensor.shape[axis]))
+                for axis in range(3)
+            )
+            weights[(local_index, 0, *slices)] = tensor
+        rz, ry, rx = (value // 2 for value in max_shape)
+        filtered = F.conv3d(
+            F.pad(selected.transpose(0, 1), (rx, rx, ry, ry, rz, rz), mode="replicate"),
+            weights,
+            groups=len(group),
+        ).transpose(0, 1)
+        result.index_copy_(0, indices, filtered)
+    return result
+
+
+def _apply_blur_kernels_3d(
+    volume: torch.Tensor,
+    kernels: tuple[_BlurKernels3D | None, ...],
+    *,
+    max_directional_padding_ratio: float = 1.25,
+) -> torch.Tensor:
+    if len(kernels) != int(volume.shape[0]):
+        raise ValueError("blur-kernel descriptor count does not match batch size")
+    isotropic = tuple(None if item is None else item.isotropic_1d for item in kernels)
+    directional = tuple(None if item is None else item.directional_zyx for item in kernels)
+    return _apply_directional_kernels_3d(
+        _apply_isotropic_kernels_3d(volume, isotropic),
+        directional,
+        max_padding_ratio=max_directional_padding_ratio,
+    )
+
+
+def _normalize_complete_image(volume: torch.Tensor, mode: str) -> torch.Tensor:
+    mode_l = str(mode).lower()
+    if mode_l in {"none", "raw", "identity"}:
+        return volume
+    if mode_l == "zscore":
+        return (volume - volume.mean()) / volume.std(unbiased=False).clamp_min(1.0e-6)
+    if mode_l == "minmax":
+        lo = volume.min()
+        hi = volume.max()
+        return (volume - lo) / (hi - lo).clamp_min(1.0e-6)
+    raise ValueError(f"unsupported image_normalization {mode!r}")
+
+
+def _apply_value_augmentation_prefix_3d(
+    config: FiberTrace3DConfig,
+    volume: torch.Tensor,
+    params: _Augment3DParams,
+    *,
+    profile_timings_ms: dict[str, float] | None = None,
+) -> torch.Tensor:
+    """Apply complete-patch normalization and the prefix through seeded noise."""
+    def record(name: str, started: float) -> None:
+        if profile_timings_ms is not None:
+            profile_timings_ms[name] = (time.perf_counter() - started) * 1000.0
+
+    volume = volume.float()
+    backend = str(config.value_augmentation_backend)
+    contrast = float(params.contrast) if config.augment_enabled else 1.0
+    brightness = float(params.brightness) if config.augment_enabled else 0.0
+    gamma = float(params.gamma) if config.augment_enabled else 1.0
+    started = time.perf_counter()
+    native_out, value_transform_native_used = _native_value_transform(
+        volume,
+        normalization=config.image_normalization,
+        contrast=contrast,
+        brightness=brightness,
+        gamma=gamma,
+        backend=backend,
+    )
+    if native_out is not None:
+        out = native_out
+        record("value_native_transform_ms", started)
+    else:
+        out = _normalize_complete_image(volume, config.image_normalization)
+        record("value_normalize_ms", started)
+        started = time.perf_counter()
+        if contrast != 1.0:
+            center = out.mean()
+            out = (out - center) * contrast + center
+        record("value_contrast_ms", started)
+        started = time.perf_counter()
+        if brightness != 0.0:
+            out = out + brightness
+        record("value_brightness_ms", started)
+        started = time.perf_counter()
+        if gamma != 1.0:
+            lo = out.min()
+            hi = out.max()
+            scaled = ((out - lo) / (hi - lo).clamp_min(1.0e-6)).clamp(0.0, 1.0)
+            out = torch.pow(scaled, gamma) * (hi - lo) + lo
+        record("value_gamma_ms", started)
+    if profile_timings_ms is not None:
+        profile_timings_ms["value_native_transform_used"] = float(
+            value_transform_native_used
+        )
+    if not config.augment_enabled:
+        return out
+    started = time.perf_counter()
+    if params.noise_std > 0.0:
+        gen = torch.Generator(device=out.device)
+        gen.manual_seed(_stable_seed(config.seed, "value_noise", params.stream_index) % (2**63 - 1))
+        out = out + torch.randn(out.shape, generator=gen, device=out.device) * float(params.noise_std)
+    record("value_noise_ms", started)
+    return out
+
+
+def _apply_value_augmentation_suffix_3d(
+    out: torch.Tensor,
+    params: _Augment3DParams,
+    *,
+    blur_kernels: _BlurKernels3D | None = None,
+    profile_timings_ms: dict[str, float] | None = None,
+) -> torch.Tensor:
+    """Apply the direct discrete Gaussian blur; no final validity mask exists."""
+    started = time.perf_counter()
+    kernels = _build_blur_kernels_3d(params) if blur_kernels is None else blur_kernels
+    result = _apply_blur_kernels_3d(
+        out.view(1, 1, *out.shape),
+        (kernels,),
+    )[0, 0]
+    if profile_timings_ms is not None:
+        profile_timings_ms["value_direct_blur_ms"] = (
+            time.perf_counter() - started
+        ) * 1000.0
+    return result
+
+
+def apply_complete_value_augmentation_3d(
+    config: FiberTrace3DConfig,
+    volume: torch.Tensor,
+    params: _Augment3DParams,
+    *,
+    profile_timings_ms: dict[str, float] | None = None,
+) -> torch.Tensor:
+    """Apply the canonical mask-free value-augmentation chain."""
+    out = _apply_value_augmentation_prefix_3d(
+        config,
+        volume,
+        params,
+        profile_timings_ms=profile_timings_ms,
+    )
+    if not config.augment_enabled:
+        return out
+    return _apply_value_augmentation_suffix_3d(
+        out,
+        params,
+        profile_timings_ms=profile_timings_ms,
+    )
+
+
+def apply_value_augmentation_suffix_batch_3d(
+    volume: torch.Tensor,
+    kernels: tuple[_BlurKernels3D | None, ...],
+) -> torch.Tensor:
+    """Apply already-constructed sequential blur kernels to a device batch."""
+    return _apply_blur_kernels_3d(volume, kernels)
+
+
+def apply_value_augmentation_batch_3d(
+    config: FiberTrace3DConfig,
+    volume: torch.Tensor,
+    params: tuple[_Augment3DParams, ...],
+    kernels: tuple[_BlurKernels3D | None, ...],
+) -> torch.Tensor:
+    """Apply the complete post-sampling value chain to one device batch."""
+    if volume.ndim != 5 or int(volume.shape[1]) != 1:
+        raise ValueError("batched value augmentation expects Bx1xZxYxX volumes")
+    volume = volume.float()
+    batch = int(volume.shape[0])
+    if len(params) != batch or len(kernels) != batch:
+        raise ValueError("batched value augmentation descriptor count mismatch")
+    reduce_dims = (1, 2, 3, 4)
+    mode = str(config.image_normalization).lower()
+    zscore_mean: torch.Tensor | None = None
+    zscore_std: torch.Tensor | None = None
+    source_lo: torch.Tensor | None = None
+    source_hi: torch.Tensor | None = None
+    if mode in {"none", "raw", "identity"}:
+        out = volume
+    elif mode == "zscore":
+        variance, zscore_mean = torch.var_mean(
+            volume,
+            dim=reduce_dims,
+            correction=0,
+            keepdim=True,
+        )
+        zscore_std = variance.sqrt().clamp_min_(1.0e-6)
+        out = volume.sub(zscore_mean).div_(zscore_std)
+    elif mode == "minmax":
+        lo = volume.amin(dim=reduce_dims, keepdim=True)
+        hi = volume.amax(dim=reduce_dims, keepdim=True)
+        out = (volume - lo) / (hi - lo).clamp_min(1.0e-6)
+    else:
+        raise ValueError(f"unsupported image_normalization {config.image_normalization!r}")
+
+    if config.augment_enabled:
+        shape = (batch, 1, 1, 1, 1)
+        needs_contrast = any(item.contrast != 1.0 for item in params)
+        needs_brightness = any(item.brightness != 0.0 for item in params)
+        needs_gamma = any(item.gamma != 1.0 for item in params)
+        if needs_gamma and mode == "zscore":
+            source_lo = volume.amin(dim=reduce_dims, keepdim=True)
+            source_hi = volume.amax(dim=reduce_dims, keepdim=True)
+        if needs_contrast:
+            contrast = torch.as_tensor(
+                [item.contrast for item in params], dtype=out.dtype, device=out.device
+            ).view(shape)
+            center = (
+                torch.zeros_like(zscore_mean)
+                if mode == "zscore" and zscore_mean is not None
+                else out.mean(dim=reduce_dims, keepdim=True)
+            )
+            out = (out - center) * contrast + center
+        else:
+            contrast = torch.ones(shape, dtype=out.dtype, device=out.device)
+        if needs_brightness:
+            brightness = torch.as_tensor(
+                [item.brightness for item in params], dtype=out.dtype, device=out.device
+            ).view(shape)
+            out = out + brightness
+        else:
+            brightness = torch.zeros(shape, dtype=out.dtype, device=out.device)
+        if needs_gamma:
+            gamma = torch.as_tensor(
+                [item.gamma for item in params], dtype=out.dtype, device=out.device
+            ).view(shape)
+            if (
+                mode == "zscore"
+                and source_lo is not None
+                and source_hi is not None
+                and zscore_mean is not None
+                and zscore_std is not None
+            ):
+                endpoint_a = (source_lo - zscore_mean) / zscore_std * contrast + brightness
+                endpoint_b = (source_hi - zscore_mean) / zscore_std * contrast + brightness
+                lo = torch.minimum(endpoint_a, endpoint_b)
+                hi = torch.maximum(endpoint_a, endpoint_b)
+            else:
+                lo = out.amin(dim=reduce_dims, keepdim=True)
+                hi = out.amax(dim=reduce_dims, keepdim=True)
+            span = (hi - lo).clamp_min(1.0e-6)
+            scaled = ((out - lo) / span).clamp(0.0, 1.0)
+            out = torch.pow(scaled, gamma) * span + lo
+
+        if any(item.noise_std > 0.0 for item in params):
+            noise_parts: list[torch.Tensor] = []
+            for item in params:
+                if item.noise_std <= 0.0:
+                    noise_parts.append(torch.zeros_like(out[0]))
+                    continue
+                generator = torch.Generator(device=out.device)
+                generator.manual_seed(
+                    _stable_seed(config.seed, "value_noise", item.stream_index) % (2**63 - 1)
+                )
+                noise_parts.append(
+                    torch.randn(
+                        out[0].shape,
+                        generator=generator,
+                        device=out.device,
+                        dtype=out.dtype,
+                    ) * float(item.noise_std)
+                )
+            out = out + torch.stack(noise_parts, dim=0)
+    return _apply_blur_kernels_3d(out, kernels) if config.augment_enabled else out
+
+
+def prepare_fiber_trace_3d_cuda_suffix(
+    config: FiberTrace3DConfig,
+    raw: FiberTrace3DRawSample,
+    *,
+    profile: bool = False,
+    mode: str = "blur",
+) -> FiberTrace3DRawSample:
+    """Prepare descriptors for blur-only or complete CUDA value augmentation."""
+    if mode not in {"blur", "all"}:
+        raise ValueError("CUDA value augmentation mode must be 'blur' or 'all'")
+    started = time.perf_counter()
+    cpu_started = time.process_time()
+    sample = raw.sample
+    timings = dict(sample.profile_timings_ms or {}) if profile else None
+    volume = sample.volume
+    if mode == "blur":
+        volume = _apply_value_augmentation_prefix_3d(
+            config,
+            sample.volume[0],
+            raw.augmentation,
+            profile_timings_ms=timings,
+        ).view_as(sample.volume)
+    kernel_started = time.perf_counter()
+    kernels = _build_blur_kernels_3d(raw.augmentation) if config.augment_enabled else None
+    if profile:
+        assert timings is not None
+        timings["value_kernel_build_ms"] = (time.perf_counter() - kernel_started) * 1000.0
+        timings["value_cpu_prefix_ms"] = (time.perf_counter() - started) * 1000.0
+        timings["value_cpu_prefix_cpu_ms"] = (
+            time.process_time() - cpu_started
+        ) * 1000.0
+    return replace(
+        raw,
+        sample=replace(sample, volume=volume, profile_timings_ms=timings),
+        blur_kernels=kernels,
+    )
 
 
 def augment_fiber_trace_3d_raw_sample(
