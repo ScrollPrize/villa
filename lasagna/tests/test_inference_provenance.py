@@ -104,3 +104,30 @@ def test_bundle_is_backend_neutral_and_self_contained_after_move(tmp_path: Path,
     validated = validate_portable_bundle(moved)
     assert validated["artifact_kind"] == artifact_kind
     assert all(not Path(item["path"]).is_absolute() for item in validated["artifacts"])
+
+
+@pytest.mark.parametrize("durable", [None, True, False])
+def test_atomic_json_optional_durability_preserves_atomic_replace(tmp_path, monkeypatch, durable):
+    import lasagna.inference_provenance as provenance
+    synced = []
+    monkeypatch.setattr(provenance.os, "fsync", lambda fd: synced.append(fd))
+    path = tmp_path / "control.json"
+    path.write_text('{"old": true}')
+    kwargs = {} if durable is None else {"durable": durable}
+    provenance.atomic_write(path, {"complete": True}, **kwargs)
+    assert json.loads(path.read_text()) == {"complete": True}
+    assert len(synced) == (0 if durable is False else 1)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["control.json"]
+
+
+def test_atomic_json_durability_failure_keeps_previous_file(tmp_path, monkeypatch):
+    import lasagna.inference_provenance as provenance
+    def fail(fd):
+        raise OSError("injected fsync failure")
+    monkeypatch.setattr(provenance.os, "fsync", fail)
+    path = tmp_path / "control.json"
+    path.write_text('{"old": true}')
+    with pytest.raises(OSError, match="injected"):
+        provenance.atomic_write(path, {"complete": True})
+    assert json.loads(path.read_text()) == {"old": True}
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["control.json"]
