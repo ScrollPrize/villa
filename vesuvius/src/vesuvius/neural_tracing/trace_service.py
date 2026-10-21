@@ -26,6 +26,66 @@ def _print_json_log(label, payload):
     print(f"[trace_service] {label}: {body}", flush=True)
 
 
+def _sockaddr_un(path):
+    import ctypes
+
+    class SockaddrUn(ctypes.Structure):
+        _fields_ = [("sun_family", ctypes.c_ushort), ("sun_path", ctypes.c_char * 108)]
+
+    raw = os.fsencode(path)
+    if len(raw) >= 108:  # sun_path holds 107 bytes and the terminating NUL
+        raise OSError(f"socket path is too long for AF_UNIX ({len(raw)} bytes, at most 107): {path}")
+    return SockaddrUn(1, raw)
+
+
+def _unix_listen(path):
+    """A listening AF_UNIX stream socket at ``path``. CPython on Windows has no socket.AF_UNIX, but Winsock has AF_UNIX
+    stream sockets (VC3D's client uses them), so there the bind goes through ws2_32."""
+    if hasattr(socket, "AF_UNIX"):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.bind(path)
+    else:
+        import ctypes
+
+        sock = socket.socket(1, socket.SOCK_STREAM)  # 1 = AF_UNIX
+        address = _sockaddr_un(path)
+        ws2 = ctypes.windll.ws2_32
+        if ws2.bind(ctypes.c_size_t(sock.fileno()), ctypes.byref(address), ctypes.sizeof(address)):
+            error = ws2.WSAGetLastError()
+            sock.close()
+            raise OSError(f"cannot bind {path}: WSA error {error}")
+    sock.listen(1)
+    return sock
+
+
+def _unix_accept(sock):
+    if hasattr(socket, "AF_UNIX"):
+        return sock.accept()[0]
+    import ctypes
+
+    ws2 = ctypes.windll.ws2_32
+    ws2.accept.restype = ctypes.c_size_t
+    handle = ws2.accept(ctypes.c_size_t(sock.fileno()), None, None)
+    if handle == ctypes.c_size_t(-1).value:
+        raise OSError(f"accept failed: WSA error {ws2.WSAGetLastError()}")
+    return socket.socket(1, socket.SOCK_STREAM, 0, handle)
+
+
+def _parent_alive(pid):
+    """A check that process ``pid`` (VC3D) still runs. POSIX: it is still our parent. Windows: a venv's python.exe is a
+    launcher that starts the real interpreter, so os.getppid() is the launcher and never VC3D; wait on a handle to
+    ``pid`` instead, opened once so that a reused pid cannot pass for VC3D."""
+    if os.name != "nt":
+        return lambda: os.getppid() == pid
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    return lambda: bool(handle) and kernel32.WaitForSingleObject(handle, 0) == 0x102  # WAIT_TIMEOUT: still running
+
+
 @click.command()
 @click.option(
     "--checkpoint_path",
@@ -67,13 +127,18 @@ def serve(checkpoint_path, volume_zarr, volume_scale, socket_path, parent_pid, n
     if parent_pid is not None and int(parent_pid) > 1:
         parent_pid = int(parent_pid)
 
+        parent_alive = _parent_alive(parent_pid)
+
         def parent_watchdog():
             while True:
-                if os.getppid() != parent_pid:
-                    print(
-                        f"parent process {parent_pid} is gone (current ppid={os.getppid()}); exiting.",
-                        flush=True,
-                    )
+                if not parent_alive():
+                    try:
+                        print(
+                            f"parent process {parent_pid} is gone (current ppid={os.getppid()}); exiting.",
+                            flush=True,
+                        )
+                    except OSError:  # the parent held the read end of our stdout pipe; it went with the parent
+                        pass
                     os._exit(0)
                 time.sleep(1.0)
 
@@ -82,15 +147,13 @@ def serve(checkpoint_path, volume_zarr, volume_scale, socket_path, parent_pid, n
     socket_path = Path(socket_path)
     if socket_path.exists():
         os.unlink(socket_path)
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.bind(str(socket_path))
-    sock.listen(1)
+    sock = _unix_listen(str(socket_path))
 
     print(f"neural-tracing service listening on {socket_path}", flush=True)
 
     try:
         while True:
-            conn, _ = sock.accept()
+            conn = _unix_accept(sock)
             try:
                 handle_connection(conn, lambda request: process_request(request, state))
             except Exception as exc:
