@@ -20,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -31,6 +32,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include <thread>
 #include <type_traits>
 
 static_assert(std::is_same_v<decltype(vc::fiber_tracer::FiberletPathConfig::longitudinalStepPredictionVoxels), float>);
@@ -106,6 +108,57 @@ public:
     }
 
     mutable size_t calls = 0;
+};
+
+// Exercise the contract of a mutable stored source while forwarding actual
+// queries to an immutable graph. Slow queries expose overlapping expansion.
+class SerialReplayGraphSource final : public vc::fiber_tracer::FiberletReplayGraphSource
+{
+public:
+    explicit SerialReplayGraphSource(const vc::fiber_tracer::FiberletGraph& graph)
+        : source_(graph) {}
+
+    float predictionToBaseScale() const noexcept override { return source_.predictionToBaseScale(); }
+    int anchorCellSizePredictionVoxels() const noexcept override { return source_.anchorCellSizePredictionVoxels(); }
+    float maximumJoinAngleDegrees() const noexcept override { return source_.maximumJoinAngleDegrees(); }
+    std::vector<vc::fiber_tracer::FiberletReplaySourceAnchor> anchorsNearReference(
+        const vc::fiber_tracer::PolylineArcGeometry& reference, double begin, double end, double radius) const override
+    { return source_.anchorsNearReference(reference, begin, end, radius); }
+    std::vector<vc::fiber_tracer::DirectedFiberletStorageId> outgoing(
+        const vc::fiber_tracer::FiberletStorageKey& anchor) const override
+    { return source_.outgoing(anchor); }
+    vc::fiber_tracer::FiberletReplaySourceArc arc(
+        const vc::fiber_tracer::DirectedFiberletStorageId& id) const override
+    { const Query query(*this); return source_.arc(id); }
+    vc::fiber_tracer::FiberletReplayOutgoingArcView outgoingArcs(
+        const vc::fiber_tracer::FiberletStorageKey& anchor) const override
+    { const Query query(*this); return source_.outgoingArcs(anchor); }
+    vc::fiber_tracer::FiberletReplaySourceCostProfile costProfile(
+        const vc::fiber_tracer::DirectedFiberletStorageId& id) const override
+    { return source_.costProfile(id); }
+    std::vector<cv::Vec3d> routePoints(
+        const vc::fiber_tracer::DirectedFiberletStorageId& id) const override
+    { return source_.routePoints(id); }
+    std::optional<vc::fiber_tracer::FiberletReplaySourceTransition> transition(
+        const vc::fiber_tracer::FiberletReplaySourceArc& incoming,
+        const vc::fiber_tracer::FiberletReplaySourceArc& outgoing) const override
+    { const Query query(*this); return source_.transition(incoming, outgoing); }
+
+    mutable std::atomic<bool> overlappingQueries{false};
+
+private:
+    struct Query {
+        explicit Query(const SerialReplayGraphSource& source) : source_(source)
+        {
+            if (source_.activeQueries_.fetch_add(1) != 0)
+                source_.overlappingQueries = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ~Query() { --source_.activeQueries_; }
+        const SerialReplayGraphSource& source_;
+    };
+    mutable std::atomic<size_t> activeQueries_{0};
+    vc::fiber_tracer::FiberletImmutableReplayGraphSource source_;
 };
 
 vc::fiber_tracer::LoadedFiberAnchorArtifact twoAnchorArtifact(
@@ -1968,6 +2021,87 @@ TEST_CASE("exact rolling fiberlet beam evaluates only its selected checkpoint pr
     CHECK(replay.failures.front().referenceArcBase > 1.0);
 }
 
+TEST_CASE("fiberlet replay serializes sources that forbid concurrent queries")
+{
+    auto report = graphPathReport();
+    addGraphPath(report, 0, 1, {{0, 0, 0}, {1, 0, 0}}, 0.0);
+    addGraphPath(report, 0, 10, {{0, 0, 0}, {1, 0.1F, 0}}, 1.0);
+    addGraphPath(report, 1, 2, {{1, 0, 0}, {2, 0, 0}}, 0.0);
+    addGraphPath(report, 10, 11, {{1, 0.1F, 0}, {2, 0.1F, 0}}, 1.0);
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+    for (const size_t searchWidth : {size_t{0}, size_t{4}}) {
+        SerialReplayGraphSource source(graph);
+        REQUIRE_FALSE(source.supportsConcurrentQueries());
+        vc::fiber_tracer::FiberletGraphReplayConfig config;
+        config.searchWidth = searchWidth;
+        config.beamWidth = 2;
+        config.beamStepDistanceBaseVoxels = 1.0;
+        config.lookaheadDistanceBaseVoxels = 2.0;
+        config.errorThresholdBaseVoxels = 1.0;
+        config.recordDecisionDiagnostics = true;
+        const auto serial = vc::fiber_tracer::traceFiberletGraphReplay(
+            source, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config);
+        REQUIRE(serial.failures.empty());
+        auto expected = vc::fiber_tracer::fiberletGraphReplayJson(serial, config);
+        config.expansionThreads = 4;
+        const auto parallelRequest = vc::fiber_tracer::traceFiberletGraphReplay(
+            source, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config);
+        expected["config"]["expansion_threads"] = config.expansionThreads;
+        CHECK(vc::fiber_tracer::fiberletGraphReplayJson(parallelRequest, config) == expected);
+        CHECK_FALSE(source.overlappingQueries.load());
+    }
+}
+
+TEST_CASE("immutable replay CSR retains joins when input edges are unsorted")
+{
+    using namespace vc::fiber_tracer;
+    auto report = graphPathReport();
+    addGraphPath(report, 0, 1, {{0, 0, 0}, {1, 0, 0}}, 0.0);
+    addGraphPath(report, 1, 2, {{1, 0, 0}, {2, 0, 0}}, 0.0);
+    addGraphPath(report, 2, 3, {{2, 0, 0}, {3, 0, 0}}, 0.0);
+    addGraphPath(report, 1, 4, {{1, 0, 0}, {2, 1, 0}}, 0.0);
+    const auto graph = buildFiberletGraph(report);
+    const FiberletImmutableReplayGraphSource original(graph);
+    std::vector<FiberletReplaySourceAnchor> anchors;
+    for (size_t index = 0; index < 4; ++index)
+        anchors.push_back({{{0, 0, static_cast<std::int64_t>(index)}, 0}, {static_cast<float>(index), 0, 0}});
+    anchors.push_back({{{0, 0, 4}, 0}, {2, 1, 0}});
+    std::vector<FiberletImmutableReplayEdge> edges;
+    std::array<DirectedFiberletStorageId, 3> forward;
+    for (size_t index = 0; index < forward.size(); ++index)
+        forward[index] = {{anchors[index].id, anchors[index + 1].id}, false};
+    const DirectedFiberletStorageId branch{{anchors[1].id, anchors[4].id}, false};
+    // Input order is C, A, branch, B. Remapping reverses the outgoing ordering
+    // in A's row as well as moving the incoming rows. Reverse arcs stay paired.
+    for (const auto& id : {forward[2], forward[0], branch, forward[1]})
+        edges.push_back({original.arc(id), original.costProfile(id), original.routePoints(id)});
+    FiberletImmutableReplayTransitionCsr csr;
+    csr.offsets = {0, 0, 1, 3, 3, 3, 4, 5, 6};
+    csr.entries = {{7, {32.0F}}, {4, {14.0F}}, {6, {11.0F}},
+                   {3, {41.0F}}, {0, {23.0F}}, {3, {21.0F}}};
+    const FiberletImmutableReplayGraphSource remapped(
+        1.0F, 1, 45.0F, anchors, edges, csr);
+    const auto checkJoin = [&](DirectedFiberletStorageId incoming, DirectedFiberletStorageId outgoing, float cost) {
+        const auto join = remapped.transition(remapped.arc(incoming), remapped.arc(outgoing));
+        REQUIRE(join.has_value());
+        CHECK(join->cost.total() == doctest::Approx(cost));
+    };
+    checkJoin(forward[0], forward[1], 11.0F);
+    checkJoin(forward[0], branch, 14.0F);
+    checkJoin(forward[1], forward[2], 23.0F);
+    auto reverse = forward;
+    for (auto& id : reverse)
+        id.reverse = true;
+    checkJoin(reverse[2], reverse[1], 32.0F);
+    checkJoin(reverse[1], reverse[0], 21.0F);
+    auto reverseBranch = branch;
+    reverseBranch.reverse = true;
+    checkJoin(reverseBranch, reverse[0], 41.0F);
+    CHECK_FALSE(remapped.transition(remapped.arc(forward[0]), remapped.arc(forward[2])).has_value());
+    csr.offsets[2] = csr.entries.size() + 1;
+    CHECK_THROWS_AS(FiberletImmutableReplayGraphSource(1.0F, 1, 45.0F, anchors, edges, csr), std::invalid_argument);
+}
+
 TEST_CASE("rolling fiberlet beam expansion is deterministic across threads")
 {
     auto report = graphPathReport();
@@ -2180,6 +2314,25 @@ TEST_CASE("fiberlet graph replay uses the Lasagna ellipsoid for seeds and route 
     const auto normal = vc::fiber_tracer::traceFiberletGraphReplay(graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config);
     REQUIRE_FALSE(normal.failures.empty());
     CHECK(normal.failures.front().reason == "no_usable_seed_for_remaining_reference");
+}
+
+TEST_CASE("fiberlet replay seed broad phase includes the larger normal radius")
+{
+    auto report = graphPathReport();
+    addGraphPath(report, 0, 1, {{0, 0.75F, 0}, {2, 0.75F, 0}}, 0.0);
+    const auto graph = vc::fiber_tracer::buildFiberletGraph(report);
+    vc::fiber_tracer::FiberletGraphReplayConfig config;
+    config.errorThresholdBaseVoxels = 1.0;
+    config.tangentialThresholdFactor = 0.5;
+    const auto replay = vc::fiber_tracer::traceFiberletGraphReplay(
+        graph, {{0, 0, 0}, {2, 0, 0}}, replayYNormals(), 1.0, config);
+    REQUIRE(replay.failures.empty());
+    REQUIRE(replay.segments.size() == 1);
+    REQUIRE_FALSE(replay.segments.front().matches.empty());
+    const auto& seed = replay.segments.front().matches.front().thresholdMeasurement;
+    CHECK(seed.localNormalValid);
+    CHECK(seed.euclideanErrorBaseVoxels == doctest::Approx(0.75));
+    CHECK(seed.thresholdErrorRatio == doctest::Approx(0.75));
 }
 
 TEST_CASE("fiberlet graph replay clips a failure edge then records an uncovered tail")

@@ -2330,6 +2330,21 @@ FiberletImmutableReplayGraphSource::FiberletImmutableReplayGraphSource(
     std::vector<FiberletReplaySourceAnchor> anchors,
     std::vector<FiberletImmutableReplayEdge> edges,
     std::vector<FiberletReplaySourceTransition> transitions)
+    : FiberletImmutableReplayGraphSource(
+          predictionToBaseScale, anchorCellSizePredictionVoxels,
+          maximumJoinAngleDegrees, std::move(anchors), std::move(edges),
+          std::move(transitions), nullptr)
+{
+}
+
+FiberletImmutableReplayGraphSource::FiberletImmutableReplayGraphSource(
+    float predictionToBaseScale,
+    int anchorCellSizePredictionVoxels,
+    float maximumJoinAngleDegrees,
+    std::vector<FiberletReplaySourceAnchor> anchors,
+    std::vector<FiberletImmutableReplayEdge> edges,
+    std::vector<FiberletReplaySourceTransition> transitions,
+    FiberletImmutableReplayTransitionCsr* transitionCsr)
     : impl_(std::make_unique<Impl>())
 {
     if (!(predictionToBaseScale > 0.0F) ||
@@ -2355,6 +2370,24 @@ FiberletImmutableReplayGraphSource::FiberletImmutableReplayGraphSource(
                 "immutable Fiberlet replay graph contains duplicate anchors");
         }
         impl_->anchors.push_back({std::move(anchor), 0, 0});
+    }
+    if (edges.size() > std::numeric_limits<std::uint32_t>::max() / 2) {
+        throw std::invalid_argument(
+            "immutable Fiberlet replay graph has too many directed arcs");
+    }
+    // Retain the caller's numeric CSR arc identities across canonical sorting.
+    // Only indices are copied; the potentially large route payloads move once.
+    std::vector<size_t> originalEdgeIndices;
+    if (transitionCsr != nullptr && !std::is_sorted(edges.begin(), edges.end(),
+            [](const auto& left, const auto& right) {
+                return left.arc.id.fiberlet < right.arc.id.fiberlet;
+            })) {
+        originalEdgeIndices.resize(edges.size());
+        std::iota(originalEdgeIndices.begin(), originalEdgeIndices.end(), 0);
+        std::sort(originalEdgeIndices.begin(), originalEdgeIndices.end(),
+                  [&](size_t left, size_t right) {
+                      return edges[left].arc.id.fiberlet < edges[right].arc.id.fiberlet;
+                  });
     }
     std::sort(edges.begin(), edges.end(), [](const auto& left, const auto& right) {
         return left.arc.id.fiberlet < right.arc.id.fiberlet;
@@ -2445,17 +2478,73 @@ FiberletImmutableReplayGraphSource::FiberletImmutableReplayGraphSource(
             });
     }
     impl_->edges = std::move(edges);
+    if (transitionCsr != nullptr) {
+        auto& csr = *transitionCsr;
+        const size_t directedArcCount = impl_->edges.size() * 2;
+        if (csr.offsets.size() != directedArcCount + 1 ||
+            csr.offsets.front() != 0 || csr.offsets.back() != csr.entries.size()) {
+            throw std::invalid_argument(
+                "immutable Fiberlet replay transition CSR shape is invalid");
+        }
+        for (size_t incoming = 0; incoming < directedArcCount; ++incoming) {
+            const size_t begin = csr.offsets[incoming];
+            const size_t end = csr.offsets[incoming + 1];
+            if (begin > end || end > csr.entries.size()) {
+                throw std::invalid_argument(
+                    "immutable Fiberlet replay transition CSR offsets are invalid");
+            }
+            std::optional<std::uint32_t> previousOutgoing;
+            for (size_t index = begin; index < end; ++index) {
+                const auto& transition = csr.entries[index];
+                if (transition.outgoingArc >= directedArcCount ||
+                    (previousOutgoing && transition.outgoingArc <= *previousOutgoing)) {
+                    throw std::invalid_argument(
+                        "immutable Fiberlet replay transition CSR entries are invalid");
+                }
+                validateReplayCost(
+                    transition.cost,
+                    "immutable Fiberlet replay transition cost is invalid");
+                previousOutgoing = transition.outgoingArc;
+            }
+        }
+        // Materialized chunk graphs already use canonical order. Keep their
+        // compact transition tables without allocating a second copy.
+        if (originalEdgeIndices.empty()) {
+            impl_->transitionOffsets = std::move(csr.offsets);
+            impl_->transitions = std::move(csr.entries);
+            return;
+        }
+        std::vector<std::uint32_t> sortedEdgeIndices(originalEdgeIndices.size());
+        for (size_t sorted = 0; sorted < originalEdgeIndices.size(); ++sorted)
+            sortedEdgeIndices[originalEdgeIndices[sorted]] = static_cast<std::uint32_t>(sorted);
+        const auto remapArc = [&](size_t arc) -> std::uint32_t {
+            return sortedEdgeIndices[arc / 2] * 2 + arc % 2;
+        };
+        impl_->transitionOffsets.assign(directedArcCount + 1, 0);
+        for (size_t incoming = 0; incoming < directedArcCount; ++incoming)
+            impl_->transitionOffsets[remapArc(incoming) + 1] = csr.offsets[incoming + 1] - csr.offsets[incoming];
+        std::partial_sum(
+            impl_->transitionOffsets.begin(), impl_->transitionOffsets.end(),
+            impl_->transitionOffsets.begin());
+        impl_->transitions.resize(csr.entries.size());
+        for (size_t incoming = 0; incoming < directedArcCount; ++incoming) {
+            size_t target = impl_->transitionOffsets[remapArc(incoming)];
+            for (size_t index = csr.offsets[incoming]; index < csr.offsets[incoming + 1]; ++index) {
+                const auto& transition = csr.entries[index];
+                impl_->transitions[target++] = {remapArc(transition.outgoingArc), transition.cost};
+            }
+            auto begin = impl_->transitions.begin() + static_cast<std::ptrdiff_t>(impl_->transitionOffsets[remapArc(incoming)]);
+            std::sort(begin, impl_->transitions.begin() + static_cast<std::ptrdiff_t>(target),
+                      [](const auto& left, const auto& right) { return left.outgoingArc < right.outgoingArc; });
+        }
+        return;
+    }
     struct IndexedTransition {
         std::uint32_t incoming = 0;
         std::uint32_t outgoing = 0;
         FiberletPathCost cost;
         std::optional<size_t> diagnosticIndex;
     };
-    if (impl_->edges.size() * 2 >
-        std::numeric_limits<std::uint32_t>::max()) {
-        throw std::invalid_argument(
-            "immutable Fiberlet replay graph has too many directed arcs");
-    }
     std::vector<IndexedTransition> indexedTransitions;
     indexedTransitions.reserve(transitions.size());
     for (const auto& transition : transitions) {
@@ -2513,41 +2602,8 @@ FiberletImmutableReplayGraphSource::FiberletImmutableReplayGraphSource(
           maximumJoinAngleDegrees,
           std::move(anchors),
           std::move(edges),
-          std::vector<FiberletReplaySourceTransition>{})
+          std::vector<FiberletReplaySourceTransition>{}, &transitions)
 {
-    const size_t directedArcCount = impl_->edges.size() * 2;
-    if (transitions.offsets.size() != directedArcCount + 1 ||
-        transitions.offsets.front() != 0 ||
-        transitions.offsets.back() != transitions.entries.size()) {
-        throw std::invalid_argument(
-            "immutable Fiberlet replay transition CSR shape is invalid");
-    }
-    for (size_t incoming = 0; incoming < directedArcCount; ++incoming) {
-        const size_t begin = transitions.offsets[incoming];
-        const size_t end = transitions.offsets[incoming + 1];
-        if (begin > end || end > transitions.entries.size()) {
-            throw std::invalid_argument(
-                "immutable Fiberlet replay transition CSR offsets are invalid");
-        }
-        std::uint32_t previousOutgoing = 0;
-        bool first = true;
-        for (size_t index = begin; index < end; ++index) {
-            const auto& transition = transitions.entries[index];
-            if (transition.outgoingArc >= directedArcCount ||
-                (!first && transition.outgoingArc <= previousOutgoing)) {
-                throw std::invalid_argument(
-                    "immutable Fiberlet replay transition CSR entries are invalid");
-            }
-            validateReplayCost(
-                transition.cost,
-                "immutable Fiberlet replay transition cost is invalid");
-            previousOutgoing = transition.outgoingArc;
-            first = false;
-        }
-    }
-    impl_->transitionOffsets = std::move(transitions.offsets);
-    impl_->transitions = std::move(transitions.entries);
-    impl_->transitionDiagnosticIndices.clear();
 }
 
 FiberletImmutableReplayGraphSource::FiberletImmutableReplayGraphSource(
@@ -3036,7 +3092,8 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
     if (!std::isfinite(config.tangentialThresholdFactor) || config.tangentialThresholdFactor <= 0 ||
         !std::isfinite(config.excursionGraceBaseVoxels) || config.excursionGraceBaseVoxels < 0)
         throw std::invalid_argument("invalid fiberlet replay ellipse/grace");
-    const double seedBroadPhaseBase = config.tangentialThresholdFactor * config.errorThresholdBaseVoxels;
+    const double seedBroadPhaseBase =
+        std::max(1.0, config.tangentialThresholdFactor) * config.errorThresholdBaseVoxels;
     std::set<FiberletStorageKey> consumedNodes;
     std::map<FiberletStorageKey, size_t> nodeIndices;
     std::map<FiberletStorageId, size_t> candidateIndices;
@@ -3122,9 +3179,11 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
         });
     };
     std::unique_ptr<utils::ThreadPool> exactExpansionPool;
+    const size_t expansionThreads =
+        graph.supportsConcurrentQueries() ? config.expansionThreads : 1;
     if (config.searchWidth == 0)
         exactExpansionPool =
-            std::make_unique<utils::ThreadPool>(config.expansionThreads);
+            std::make_unique<utils::ThreadPool>(expansionThreads);
 
     double resetArc = config.referenceBeginArcBase;
     for (size_t iteration = 0; iteration < maximumSegments && resetArc < referenceEndArcBase - kReplayEpsilon; ++iteration) {
@@ -3456,7 +3515,7 @@ FiberletGraphReplayResult traceFiberletGraphReplay(
                     initialDirection,
                     config.beamWidth,
                     config.searchWidth,
-                    config.expansionThreads,
+                    expansionThreads,
                     maximumGeneratedStates,
                     geometricCost,
                     searchStats);

@@ -478,6 +478,8 @@ struct FiberletImmutableReplayTransition {
 
 struct FiberletImmutableReplayTransitionCsr {
     // One range per directed incoming arc. The final offset equals entries.size().
+    // Numeric arcs refer to the supplied edge order: 2 * edge index + reverse.
+    // Each incoming range must have strictly increasing outgoing arc indices.
     std::vector<size_t> offsets;
     std::vector<FiberletImmutableReplayTransition> entries;
 };
@@ -546,6 +548,14 @@ public:
         const FiberletReplaySourceArc& outgoing) const override;
 
 private:
+    FiberletImmutableReplayGraphSource(
+        float predictionToBaseScale,
+        int anchorCellSizePredictionVoxels,
+        float maximumJoinAngleDegrees,
+        std::vector<FiberletReplaySourceAnchor> anchors,
+        std::vector<FiberletImmutableReplayEdge> edges,
+        std::vector<FiberletReplaySourceTransition> transitions,
+        FiberletImmutableReplayTransitionCsr* transitionCsr);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
