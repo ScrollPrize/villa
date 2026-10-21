@@ -73,7 +73,10 @@ applies to keyboard holds: hover first, then `vc3d_key(key="A", hold_ms=...)`.
 A `vc3d_key(action="press")` stays down until a matching `action="release"`
 or until its `hold_ms` (10 s by default) runs out, and keys are also released
 if the MCP connection drops; `vc3d_get_state` lists held keys in `heldKeys`.
-Prefer the typed tool whenever one exists.
+A key that opens a dialog or menu has it answered as Escape would (listed in
+`dismissed`), and so is any dialog a person at the window opens during that
+call. Keys and wheel turns need a visible viewer: switch to its workspace
+first. Prefer the typed tool whenever one exists.
 
 ## 7. Fiber tracing (`vc3d_fiber_launch` + a fiber workspace pane)
 

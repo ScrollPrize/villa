@@ -717,10 +717,28 @@ def check_canvas_input(sock_path: str, client: BridgeClient, results: Results) -
             None,
         )
         ok = ok and wheel.get("notches") == 1.0 and before is not None and after != before
+        # A pane on a hidden workspace is refused, so its zoom cannot change
+        # where nobody sees it.
+        hidden = "no spiral pane"
+        spiral = [v for v in state.get("viewers", [])
+                  if v.get("workspace") == "spiral" and v.get("kind") == "chunked"]
+        if spiral:
+            try:
+                client.call(
+                    "canvas.wheel",
+                    {"viewer": spiral[0]["viewerId"], "position": {"x": 5, "y": 5},
+                     "space": "scene", "deltaY": 120},
+                    timeout=RPC_TIMEOUT,
+                )
+                ok = False
+                hidden = "hidden pane accepted"
+            except BridgeError as error:
+                ok = ok and error.code == -32009
+                hidden = f"hidden pane code={error.code}"
         results.record(
             "canvas_wheel_zoom",
             ok,
-            f"{detail}; scale {before} -> {after}; accepted={wheel.get('accepted')}",
+            f"{detail}; scale {before} -> {after}; accepted={wheel.get('accepted')}; {hidden}",
         )
     except Exception as error:  # noqa: BLE001
         results.record("canvas_wheel_zoom", False, f"{type(error).__name__}: {error}")

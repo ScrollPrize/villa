@@ -169,8 +169,11 @@ click into it would, so shortcuts scoped to the viewer match; afterwards it
 returns to the widget that had it, unless the key moved it. A synthesized
 press leaves its modifiers in `QGuiApplication::keyboardModifiers()`, which
 item views and other code read, so after keys are released the bridge resets
-that value to the modifiers of the keys still held. Wheel deltas use Qt angle
-units, 120 per notch.
+that value to the modifiers of the keys still held. A key's event text is
+the key's own character, without a keyboard layout: `Shift+1` carries the text
+`1`, not `!`. Shortcuts match on the key and modifiers, so they are not
+affected; a widget that reads the event text gets the unshifted character.
+Wheel deltas use Qt angle units, 120 per notch.
 
 Synthesized events bypass Qt's modal blocking, so `canvas.key` and
 `canvas.wheel` return -32009 with `data.window` (`class`, `title`) while a
@@ -379,12 +382,15 @@ dialog.
   every modal dialog or menu shown while the key is delivered, whatever
   opened it, so a message box raised at that moment by a background tool
   finishing (such as its completion or error box) is answered too and is
-  listed in `dismissed`. Native dialogs are switched off for the call
+  listed in `dismissed`. So is a dialog or menu that a person using the
+  window opens during the call. Native dialogs are switched off for the call
   (`Qt::AA_DontUseNativeDialogs`, an application-wide attribute, restored
   afterwards), so file pickers are Qt dialogs. Requests from any client, the
   bridge's key-release timers, and its queued state checks that come due
   meanwhile wait until the call ends.
-- `canvas.wheel` rejects a zero `deltaY`. It requires a current volume and,
+- `canvas.wheel` rejects a zero `deltaY`. The viewer must be visible (-32009
+  otherwise), so a wheel never changes the zoom or slice of a pane on a
+  hidden workspace. It requires a current volume and,
   for volume-space positions, a point on the viewer's current view. Partial
   notches accumulate in the view as they do for a smooth-scrolling mouse.
 - `viewer.rotate` accepts normalized plane spellings and supports relative or

@@ -290,6 +290,14 @@ QJsonObject AgentBridgeServer::handleCanvasWheel(const QJsonValue& params)
 
     VolumeViewerBase* viewer = resolveViewer(p.value("viewer"));
     CChunkedVolumeViewer* chunked = requireChunkedViewer(viewer);
+    if (!chunked->graphicsView()->isVisible()) {
+        // A viewer on a hidden workspace would change its zoom or slice
+        // where nobody sees it.
+        QJsonObject data;
+        data["viewerId"] = viewerIdFor(viewer);
+        data["detail"] = "the viewer is not visible; switch to its workspace first";
+        throw AgentBridgeError{-32009, "Viewer not visible", data};
+    }
     if (!chunked->currentVolume())
         throw AgentBridgeError{-32001, "No volume loaded", {}};
     requireNoBlockingWindow();
