@@ -15,6 +15,10 @@ Writes under ``--out``:
 ``--stage-only`` stages the top crops without asking anything, for reviewing in
 ``hole_viewer.py --root-dir OUT/fix_in`` (its Review panel writes the same two CSVs).
 
+``--export-training DIR`` turns ``verdicts.csv`` into training examples: one ``.npz``
+per verdict with the CT, label and hole-mask cube around the hole and the verdict,
+plus ``index.csv``. The cubes are ``2*--half`` voxels on a side.
+
 Next step after a review session (from ``vesuvius/``)::
 
   python src/vesuvius/scripts/fix_holes.py --in-dir OUT/fix_in --veto OUT/veto.csv \\
@@ -98,6 +102,44 @@ def stage_ranked(data: Path, audit: Path, out: Path, limit: Optional[int] = None
     return staged
 
 
+def _cube(arr: np.ndarray, center, half: int) -> np.ndarray:
+    """``2*half`` cube around ``center``, zero-padded where it leaves the array."""
+    out = np.zeros((2 * half,) * 3, arr.dtype)
+    lo = [int(c) - half for c in center]
+    src = tuple(slice(max(l, 0), min(l + 2 * half, n)) for l, n in zip(lo, arr.shape))
+    dst = tuple(slice(s.start - l, s.stop - l) for s, l in zip(src, lo))
+    out[dst] = arr[src]
+    return out
+
+
+def export_training(data: Path, audit: Path, out: Path, dest: Path, half: int = 16) -> List[dict]:
+    """Write one ``.npz`` (ct, label, mask, center_zyx, verdict) per verdict and ``index.csv``.
+
+    This is the labelled set a FILL/CUT model would train on: the reviewer's call with the
+    CT it was made from. Nothing is trained here; the export only keeps the pairs.
+    """
+    rows = list(load_verdicts(out / "verdicts.csv").values())
+    dest.mkdir(parents=True, exist_ok=True)
+    index, cache = [], {}
+    for i, r in enumerate(rows):
+        crop = r["crop"]
+        if crop not in cache:
+            cache[crop] = (tifffile.imread(data / "images" / f"{crop}.tif"),
+                           tifffile.imread(data / "labels" / f"{crop}.tif"),
+                           tifffile.imread(audit / f"{crop}.hole_mask.tif"))
+        center = json.loads(r["center_zyx"])
+        name = f"{crop}_{i:04d}.npz"
+        np.savez_compressed(dest / name, ct=_cube(cache[crop][0], center, half),
+                            label=_cube(cache[crop][1], center, half), mask=_cube(cache[crop][2], center, half),
+                            center_zyx=np.array(center), verdict=r["verdict"])
+        index.append({"file": name, **r})
+    with open(dest / "index.csv", "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=["file", *FIELDS])
+        w.writeheader()
+        w.writerows(index)
+    return index
+
+
 def render_hole(data: Path, audit: Path, crop: str, hole: dict, png: Path, half: int) -> Path:
     from vesuvius.image_proc.run.label_topology_audit import hole_tiles
 
@@ -176,9 +218,15 @@ def main(argv=None):
     ap.add_argument("--half", type=int, default=32, help="half-width of each slice in voxels")
     ap.add_argument("--stage-only", action="store_true",
                     help="stage the top crops into OUT/fix_in for hole_viewer.py and ask nothing")
+    ap.add_argument("--export-training", type=Path, metavar="DIR",
+                    help="write OUT/verdicts.csv as training cubes (.npz + index.csv) into DIR and ask nothing")
     a = ap.parse_args(argv)
     if not (a.audit / "ranked.csv").exists():
         ap.error(f"{a.audit}/ranked.csv missing: run vesuvius.label_topology_audit --batch first")
+    if a.export_training:
+        n = export_training(a.data, a.audit, a.out, a.export_training, max(a.half // 2, 8))
+        print(f"exported {len(n)} verdict cubes to {a.export_training}")
+        return
     if a.stage_only:
         staged = stage_ranked(a.data, a.audit, a.out, a.limit)
         print(f"staged {len(staged)} crops in {a.out / 'fix_in'}; open with "

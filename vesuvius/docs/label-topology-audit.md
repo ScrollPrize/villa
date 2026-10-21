@@ -124,6 +124,12 @@ python src/vesuvius/scripts/hole_viewer.py --root-dir review/fix_in --suffix1 _s
 python src/vesuvius/scripts/fix_holes.py --in-dir review/fix_in --veto review/veto.csv \
   --ignore-value 2 --method close --closing-kernel 2
 
+# 3b. optional: keep the verdicts as training examples (CT + label + hole-mask cube
+#    around each hole with the FILL/CUT call), for a model that learns the reviewer's
+#    calls once there are enough of them. Nothing is trained here.
+python src/vesuvius/scripts/review_holes.py --data DATA_DIR --audit audit_out --out review \
+  --export-training review/train
+
 # 4. count again; this sees filled holes but not a fill that welded two sheets,
 #    so look at the added voxels on the CT for anything you did not review
 vesuvius.label_topology_audit --label DATA_DIR/labels/sample_00340.tif \
@@ -241,7 +247,8 @@ sheets.
   repairing individual crops. The viewer's Review panel records fill/cut calls
   on the staged holes and shows the CT under the label when one is staged.
 - `scripts/review_holes.py` walks the audit's ranked holes, records fill/cut calls
-  and writes the veto list and the folder layout the two scripts above read.
+  and writes the veto list and the folder layout the two scripts above read;
+  `--export-training` turns the verdicts into labelled cubes.
 - This audit is the dataset-level pass that runs before them:
   - it adds cavities, fusion, junction and thickness checks
   - it separates holes on crop faces from interior ones

@@ -94,3 +94,22 @@ def test_stage_only_lays_out_what_hole_viewer_reads(tmp_path):
     # a second staging run must not duplicate the order entry
     review_holes.stage_ranked(data, audit, out)
     assert (out / "fix_in" / "order.txt").read_text().split() == ["crop_1"]
+
+
+def test_export_training_keeps_each_verdict_with_the_ct_it_was_made_from(tmp_path):
+    """A FILL/CUT model trains on the reviewer's call plus the CT around the hole; the
+    export must centre the cube on the hole and carry the verdict unchanged."""
+    data, audit = _dataset(tmp_path)
+    out = tmp_path / "rev"
+    answers = iter(["c", "f"])
+    review_holes.review(data, audit, out, lambda png, p: next(answers))
+    dest = tmp_path / "train"
+    review_holes.main(["--data", str(data), "--audit", str(audit), "--out", str(out),
+                       "--export-training", str(dest), "--half", "16"])
+    rows = list(csv.DictReader(open(dest / "index.csv")))
+    assert [r["verdict"] for r in rows] == ["CUT", "FILL"]
+    ex = np.load(dest / rows[0]["file"])
+    assert ex["ct"].shape == ex["label"].shape == ex["mask"].shape == (16, 16, 16)
+    assert str(ex["verdict"]) == "CUT" and list(ex["center_zyx"]) == [10, 30, 30]
+    assert ex["mask"][8, 8, 8] == 1 and ex["label"][8, 8, 8] == 0     # cube centred on the hole
+    assert ex["label"][8, 0, 0] == 1                                     # sheet around it

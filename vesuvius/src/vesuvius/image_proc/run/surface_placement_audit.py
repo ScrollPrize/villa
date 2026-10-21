@@ -302,7 +302,7 @@ def cell_ids(P: np.ndarray, size: float = 32.0) -> np.ndarray:
     return c[:, 0] * 10**10 + c[:, 1] * 10**5 + c[:, 2]
 
 
-def worst_cells(P: np.ndarray, off: np.ndarray, valid: np.ndarray, patch: np.ndarray,
+def worst_cells(P: np.ndarray, N: np.ndarray, off: np.ndarray, valid: np.ndarray, patch: np.ndarray,
                 threshold: float = 2.0, min_points: int = 30, limit: int = 50) -> list[dict[str, Any]]:
     """The 32-voxel cells whose median offset exceeds ``threshold``, worst first.
 
@@ -319,8 +319,10 @@ def worst_cells(P: np.ndarray, off: np.ndarray, valid: np.ndarray, patch: np.nda
             continue
         med = float(np.median(s))
         if abs(med) > threshold:
-            out.append({"center_zyx": [float(v) for v in P[sel].mean(0)], "n": int(len(s)),
-                        "median_offset": med})
+            n = N[sel].mean(0)
+            out.append({"center_zyx": [float(v) for v in P[sel].mean(0)],
+                        "normal_zyx": [float(v) for v in n / (np.linalg.norm(n) + 1e-12)],
+                        "n": int(len(s)), "median_offset": med})
     out.sort(key=lambda c: -abs(c["median_offset"]))
     return out[:limit]
 
@@ -330,10 +332,12 @@ def write_point_collection(path: str, name: str, cells: Sequence[dict[str, Any]]
 
     One collection named ``name``, one point per cell in VC3D's x, y, z order and the
     surface's own coordinate frame; ``creation_time`` is the rank so the widget lists the
-    worst cell first. Loads from the Point Collections panel in VC3D.
+    worst cell first. Loads from the Point Collections panel in VC3D. ``cells`` are the
+    ``worst_cells`` dicts, and ``placement_edits.py`` reads the same file back.
     """
     points = {str(i): {"p": [c["center_zyx"][2], c["center_zyx"][1], c["center_zyx"][0]],
-                       "creation_time": i, "wind_a": None}
+                       "creation_time": i, "wind_a": None,
+                       "audit": {k: c[k] for k in ("normal_zyx", "n", "median_offset") if k in c}}
               for i, c in enumerate(cells)}
     doc = {"vc_pointcollections_json_version": "1",
            "collections": {"0": {"name": name, "points": points,
@@ -734,12 +738,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                             "" if not valid[i] else f"{off[i]:.2f}",
                             "" if not np.isfinite(contrast[i]) else f"{contrast[i]:.1f}", int(valid[i])])
         if a.worst_cells:
-            cells = worst_cells(P, off, valid, patch, limit=a.worst_cells)
+            cells = worst_cells(P, N, off, valid, patch, limit=a.worst_cells)
             with open(os.path.join(a.out, f"{name}.worst_cells.csv"), "w", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["rank", "z", "y", "x", "n", "median_offset"])
+                w.writerow(["rank", "z", "y", "x", "nz", "ny", "nx", "n", "median_offset"])
                 for i, c in enumerate(cells, 1):
-                    w.writerow([i, *(f"{v:.1f}" for v in c["center_zyx"]), c["n"], f"{c['median_offset']:+.2f}"])
+                    w.writerow([i, *(f"{v:.1f}" for v in c["center_zyx"]), *(f"{v:.3f}" for v in c["normal_zyx"]),
+                                c["n"], f"{c['median_offset']:+.2f}"])
             write_point_collection(os.path.join(a.out, f"{name}.worst_cells.json"),
                                    f"placement_audit {name}", cells)
             m["n_worst_cells"] = len(cells)

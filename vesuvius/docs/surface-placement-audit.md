@@ -102,7 +102,17 @@ surfaces with the same normal convention.
   back onto the sheet or regrow there, and rerun the audit with the same
   `--seed` to see the cell leave the list. The points are in the surface's own
   coordinate frame, so a surface audited at a downscaled level needs that
-  level open in VC3D.
+  level open in VC3D. Each point also carries the cell's normal, point count
+  and median offset under an `audit` key, which VC3D ignores.
+- Keeping the edits: `scripts/placement_edits.py --before SEG --after SEG_EDITED
+  --cells <name>.worst_cells.json --out DIR [--volume CT]` writes, per worst
+  cell, how far the grid points moved along the cell's normal next to the
+  offset the audit had measured (`edits.csv`), with the before and after points
+  and a CT cube (`edits.npz`). A correct edit shows a shift equal to the
+  measured offset. These pairs are the training data for a model that learns
+  where annotators put the surface; nothing is trained here, and a regrown
+  segment (different grid shape) is refused because its points no longer
+  correspond.
 
 It measures distance to the nearest density peak, not winding identity: a
 surface that jumped cleanly onto the neighbouring sheet reads as well placed.
