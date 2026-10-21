@@ -1549,5 +1549,142 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertTrue(torch.allclose(center_after, center_before, rtol=1.0e-6, atol=1.0e-6))
 
 
+class FlattenReportingTest(unittest.TestCase):
+	# Distinct values and weights expose swapped columns and missing weighting.
+	INITIAL_COMPONENTS = {
+		"flatten_sdir": 1.25,
+		"flatten_map_step": 2.5,
+		"flatten_avg_offset": 3.75,
+		"flatten_orient": 5.0,
+	}
+	LOSS_WEIGHTS = {
+		"flatten_sdir": 2.0,
+		"flatten_map_step": 0.1,
+		"flatten_avg_offset": 3.0,
+		"flatten_orient": 10.0,
+	}
+	REPORT_COLUMNS = {
+		"flatten_sdir": ("f_sdir", "f_sdirW"),
+		"flatten_map_step": ("f_mstep", "f_mstpW"),
+		"flatten_avg_offset": ("f_avg", "f_avgW"),
+		"flatten_orient": ("f_orient", "f_oriW"),
+	}
+
+	def _parse_status_rows(self, printed: mock.Mock) -> list[tuple[int, dict[str, float]]]:
+		lines = [str(call.args[0]).split() for call in printed.call_args_list if call.args]
+		header = next((line for line in lines if line[:3] == ["step", "loss", "it/s"]), None)
+		self.assertIsNotNone(header, "Optimizer did not print a status header")
+		rows = []
+		for fields in lines:
+			if not fields or fields[0] != "stage0":
+				continue
+			step = int(fields[1].split("/")[0])
+			columns = header[1:]
+			if step == 0:
+				# The initial row has no measured iteration rate.
+				columns.remove("it/s")
+			values = fields[2:]
+			self.assertEqual(len(columns), len(values), f"Malformed status row at step {step}")
+			rows.append((step, dict(zip(columns, map(float, values), strict=True))))
+		self.assertTrue(rows, "Optimizer did not print any status rows")
+		return rows
+
+	def _run_reporting(
+		self, *, device: str, steps: int | str, status_interval: int, auto_stop_step: int | None,
+	) -> list[tuple[int, dict[str, float]]]:
+		model = _make_flatten_model(
+			_flat_grid(6, 7), mesh_step=1, flatten_direction="forward", device=torch.device(device),
+		)
+		stage_args = {
+			"compile_flatten": True,
+			"compile_flatten_backend": "eager",
+			"compile_flatten_combined": True,
+			"flatten_diagnostics": False,
+			"flatten_max_update": 0.0,
+			"status_interval": status_interval,
+		}
+		if auto_stop_step is not None:
+			# With lr=0, the first eligible convergence check sees an unchanged loss.
+			stage_args.update(
+				auto_steps_min=auto_stop_step, auto_steps_max=auto_stop_step + 1, auto_steps_window=1,
+			)
+		stages = optimizer.load_stages_cfg({
+			"args": {"model-init": "flatten"},
+			"base": self.LOSS_WEIGHTS,
+			"stages": [{
+				"name": "flatten", "steps": steps, "lr": 0.0,
+				"params": ["map_flatten_ms"], "args": stage_args,
+			}],
+		})
+		real_loss_parts = opt_loss_flatten.flatten_combined_loss_parts
+		evaluation_step = 0
+
+		def loss_with_changing_components(**kwargs):
+			nonlocal evaluation_step
+			parts = real_loss_parts(**kwargs)
+			# Keep the real differentiable loss; vary its reported components to detect stale values.
+			components = [
+				part.new_tensor(initial_value + evaluation_step)
+				for part, initial_value in zip(parts[1:], self.INITIAL_COMPONENTS.values(), strict=True)
+			]
+			evaluation_step += 1
+			return (parts[0], *components)
+
+		try:
+			with (
+				mock.patch.object(
+					opt_loss_flatten, "flatten_combined_loss_parts", side_effect=loss_with_changing_components,
+				),
+				mock.patch("builtins.print") as printed,
+			):
+				optimizer.optimize(
+					model=model, data=fit._dummy_flatten_data(), stages=stages,
+					snapshot_interval=0, snapshot_fn=lambda **_: None, progress_fn=lambda **_: None,
+				)
+			rows = self._parse_status_rows(printed)
+			self.assertEqual(evaluation_step, rows[-1][0] + 1)
+			return rows
+		finally:
+			opt_loss_flatten.configure(diagnostics=True, orient_min_det=0.0, reset_history=True)
+			opt_loss_flatten.configure_compile(enabled=False)
+
+	def _assert_reports(
+		self, *, steps: int | str, status_interval: int, expected_steps: list[int],
+		auto_stop_step: int | None = None,
+	) -> None:
+		devices = ["cpu"]
+		if torch.cuda.is_available():
+			devices.append("cuda")
+		if torch.backends.mps.is_available():
+			devices.append("mps")
+		for device in devices:
+			with self.subTest(device=device):
+				rows = self._run_reporting(
+					device=device, steps=steps, status_interval=status_interval, auto_stop_step=auto_stop_step,
+				)
+				self.assertEqual([step for step, _ in rows], expected_steps)
+				for step, reported in rows:
+					for component, (raw_column, weighted_column) in self.REPORT_COLUMNS.items():
+						with self.subTest(step=step, component=component):
+							expected_value = self.INITIAL_COMPONENTS[component] + step
+							expected_contribution = expected_value * self.LOSS_WEIGHTS[component]
+							self.assertAlmostEqual(reported[raw_column], expected_value, places=4)
+							self.assertAlmostEqual(reported[weighted_column], expected_contribution, places=4)
+
+	def test_reports_every_iteration_when_requested(self) -> None:
+		self._assert_reports(steps=3, status_interval=1, expected_steps=[0, 1, 2, 3])
+
+	def test_periodic_reports_include_first_and_final_steps(self) -> None:
+		self._assert_reports(steps=5, status_interval=2, expected_steps=[0, 1, 2, 4, 5])
+
+	def test_disabled_periodic_reporting_keeps_first_and_final_steps(self) -> None:
+		self._assert_reports(steps=5, status_interval=0, expected_steps=[0, 1, 5])
+
+	def test_auto_stop_reports_current_components_between_intervals(self) -> None:
+		self._assert_reports(
+			steps="auto", status_interval=3, auto_stop_step=4, expected_steps=[0, 1, 3, 4],
+		)
+
+
 if __name__ == "__main__":
 	unittest.main()
