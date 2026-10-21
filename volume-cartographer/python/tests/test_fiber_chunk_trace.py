@@ -173,6 +173,45 @@ def test_real_paris4_chunk_replay(tmp_path):
     replay = ft.ChunkReplayConfig()
     replay.tangential_threshold_factor = 2
     result = cache.replay(line, normal, replay, end_arc_base=256)
+    if hasattr(ft, "EvaluationControl") and ft.case_queue_supported():
+        from vc.fiber_evaluation import replay_dict
+        control = ft.EvaluationControl()
+        queued = cache.replay_many([ft.EvaluationCase(line, end_arc_base=256)] * 2,
+                                  normal, replay, control, workers=2, contexts_per_worker=2)
+        assert control.status()["completed"] == 2
+        assert all(replay_dict(r) == replay_dict(result) for r in queued)
+        from vc.fiber_evaluation import evaluate, CHUNK_KEYS
+        report = evaluate(dict(version=1, prediction_manifest=manifest,
+            normal_manifest=normal_manifest, source_identity="paris4-binding-test",
+            chunk_cache=str(tmp_path / "cache"), enable_width=True,
+            trace=t.to_dict(), chunks={key: getattr(c, key) for key in CHUNK_KEYS},
+            replay=dict(tangential_threshold_factor=2),
+            cases=[dict(id="paris4-forward", points_base_xyz=line.tolist(), end_arc_base=256)]))
+        assert {k: v for k, v in report["cases"][0].items() if k != "id"} == replay_dict(result)
+        print("Paris4 queued evaluation: 2 cases exactly equal to serial replay")
+        direct_case = ft.EvaluationCase(line, end_arc_base=256)
+        direct = ft.beam_replay(field, normal, normal, t, direct_case, replay)
+        batch = ft.beam_replay_many(field, normal, normal, t, [direct_case] * 2,
+                                   replay, ft.EvaluationControl(), 2, 2)
+        assert all(replay_dict(r) == replay_dict(direct) for r in batch)
+        # Shared annotation selector retains exact source coordinates and arcs.
+        from vc.fiber_evaluation import reference_cases
+        selected, plan = reference_cases(fiber, "paris4")
+        assert selected and plan["eligible_length_base_voxels"] > 256
+        direct_report = evaluate(dict(version=1, backend="beam", prediction_manifest=manifest,
+            normal_manifest=normal_manifest, source_identity="paris4-direct", enable_width=True,
+            trace=t.to_dict(), replay=dict(tangential_threshold_factor=2),
+            cases=[dict(id="paris4", points_base_xyz=line.tolist(), end_arc_base=256)]))
+        assert {k: v for k, v in direct_report["cases"][0].items() if k != "id"} == replay_dict(direct)
+        from vc.fiber_evaluation_vis import render_html, write_gallery
+        assert render_html(direct_report).count('<svg ') == 3
+        if directory := os.environ.get("VC_TEST_EVALUATION_GALLERY"):
+            write_gallery(direct_report, Path(directory) / "paris4-beam.html")
+            write_gallery(report, Path(directory) / "paris4-chunk.html")
+            (Path(directory) / "paris4-beam.json").write_text(json.dumps(direct_report))
+            print(f"Paris4 offline geometry galleries: {directory}")
+        print(f"Paris4 direct beam: batch/callable exactly serial; {len(direct.segments)} segments, "
+              f"{len(direct.failures)} failures; {len(selected)} selected directions")
     assert len(result.segments) == 1
     assert result.failures == []
     assert result.completed_reference_arc_base == 256

@@ -675,6 +675,15 @@ struct CandidateScoreDebug {
     const std::function<bool(const cv::Vec3d&, double, int)>& committedStep = {},
     const std::vector<cv::Vec3d>& initialStepDirections = {});
 
+// Evaluation adapter: length-bounded beam tracing towards the reference end,
+// with committed-point observation (no target-plane snapping). widthMean is
+// updated before observation so reverse checks use the same committed state.
+[[nodiscard]] std::string traceFiberReplaySegment(
+    const FiberPredictionSource&, const FiberTraceOneWayRequest&, int maximumSteps,
+    const vc::lasagna::NormalSampler&, const FiberTraceProgressCallback&,
+    const std::function<bool(const cv::Vec3d&, double, int)>& committedStep,
+    double& widthMean);
+
 // Fraction of a segment's start-to-target distance that bounds the endpoint
 // acceptance threshold for that segment. The fixed threshold
 // (endpointAcceptThresholdBaseVoxels, 20 vx by default) is right for long

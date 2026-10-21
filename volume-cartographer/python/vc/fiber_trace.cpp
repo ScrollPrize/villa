@@ -28,6 +28,8 @@
 #include "vc/fiber_tracer/FiberChunkTrace.hpp"
 #include "vc/fiber_tracer/FiberLiveBridge.hpp"
 #include "vc/fiber_tracer/FiberCaseQueue.hpp"
+#include "vc/fiber_tracer/FiberEvaluation.hpp"
+#include "vc/fiber_tracer/FiberJson.hpp"
 #include <atomic>
 #include "vc/fiber_tracer/FiberReverseConsistency.hpp"
 #include "vc/lasagna/Dataset.hpp"
@@ -395,12 +397,8 @@ ft::FiberReplayTraceResult chunkReplay(ChunkCacheHandle& self,const PointsIn& po
 {
     const auto reference=ft::makePolylineArcGeometry(toPoints(points,"reference_base"));
     const auto c=config;
-    ft::ReplayConsistencyPolicy policy;policy.intervalBase=reverseInterval;
-    if(reverseInterval>0) policy.verify=[&](const auto& path) {
-        const auto geometry=ft::makePolylineArcGeometry(path);
-        return ft::verifyFiberReverseSpan(*self.predictions.field,*self.normals.sampler,self.trace,
-            geometry,geometry.length(),c.errorThresholdBase,c.errorThresholdBase*c.tangentialThresholdFactor)<=1e-12;
-    };
+    const auto policy=ft::fiberChunkReplayConsistency(*self.predictions.field,*self.normals.sampler,
+                                                    self.trace,c,reverseInterval);
     nb::gil_scoped_release release;
     return ft::traceFiberChunkReferenceReplay(self.cache,*self.predictions.field,self.trace,
         self.predictions.scales.traceToBaseScale,*self.normals.sampler,reference,begin,end.value_or(reference.length()),
@@ -411,6 +409,34 @@ ft::FiberReplayTraceResult chunkReplay(ChunkCacheHandle& self,const PointsIn& po
 
 NB_MODULE(fiber_trace, m)
 {
+    m.def("reference_plan_json", [](const std::string& text) {
+        return ft::vc3dEvaluationReferencePlan(
+            ft::parseVc3dFiberJson(nlohmann::json::parse(text), "reference"), "reference").dump();
+    }, "annotation_json"_a);
+    m.def("beam_replay", [](const PredictionFieldHandle& field, const NormalSamplerHandle& normals,
+        const NormalSamplerHandle& evaluationNormals, const ft::FiberTraceConfig& config,
+        const ft::FiberEvaluationCase& input, const ft::FiberChunkReplayConfig& replay, double interval) {
+        const auto trace = checkedConfig(field, config, &normals);
+        const auto c = input;
+        const auto r = replay;
+        nb::gil_scoped_release release;
+        return ft::replayFiberBeamCase(*field.field, trace, field.scales.traceToBaseScale,
+            *normals.sampler, *evaluationNormals.sampler, evaluationNormals.workingToBaseScale, c, r, interval);
+    }, "field"_a, "normals"_a, "evaluation_normals"_a, "trace"_a, "case"_a, "replay"_a,
+       "reverse_interval_base"_a=0.);
+    m.def("beam_replay_many", [](const PredictionFieldHandle& field, const NormalSamplerHandle& normals,
+        const NormalSamplerHandle& evaluationNormals, const ft::FiberTraceConfig& config,
+        const std::vector<ft::FiberEvaluationCase>& input, const ft::FiberChunkReplayConfig& replay,
+        ft::FiberEvaluationControl& control, size_t workers, size_t contexts, double interval) {
+        const auto trace = checkedConfig(field, config, &normals);
+        const auto cases = input;
+        const auto r = replay;
+        nb::gil_scoped_release release;
+        return ft::evaluateFiberBeamCases(*field.field, trace, field.scales.traceToBaseScale,
+            *normals.sampler, *evaluationNormals.sampler, evaluationNormals.workingToBaseScale,
+            cases, r, control, workers, contexts, interval);
+    }, "field"_a, "normals"_a, "evaluation_normals"_a, "trace"_a, "cases"_a, "replay"_a,
+       "control"_a, "workers"_a=4, "contexts_per_worker"_a=8, "reverse_interval_base"_a=0.);
     m.doc() = "Python bindings for the Volume Cartographer native fiber beam tracer";
 
     nb::class_<ft::FiberChunkTraceConfig>(m,"ChunkConfig")
@@ -580,6 +606,20 @@ NB_MODULE(fiber_trace, m)
         .def("get",&ChunkCacheHandle::get,"key_xyz"_a)
         .def("get_many",&ChunkCacheHandle::getMany,"keys_xyz"_a,"workers"_a=4,"contexts_per_worker"_a=8,
              "Bounded native cases; ordered results, cooperative publication and cache waits.")
+        .def("replay_many", [](ChunkCacheHandle& self, const std::vector<ft::FiberEvaluationCase>& cases,
+                              const NormalSamplerHandle& normals, const ft::FiberChunkReplayConfig& config,
+                              ft::FiberEvaluationControl& control, size_t workers, size_t contexts,
+                              double reverseInterval) {
+            // Copy while holding the GIL, so Python mutations cannot race work.
+            const auto copiedCases = cases;
+            const auto copiedConfig = config;
+            nb::gil_scoped_release release;
+            return ft::evaluateFiberChunkCases(self.cache, *self.predictions.field, self.trace,
+                self.predictions.scales.traceToBaseScale, *self.normals.sampler, *normals.sampler,
+                normals.workingToBaseScale, copiedCases, copiedConfig, control, workers, contexts, reverseInterval);
+        }, "cases"_a, "evaluation_normals"_a, "config"_a, "control"_a,
+           "workers"_a=4, "contexts_per_worker"_a=8, "reverse_interval_base"_a=0.,
+           "Ordered batch replay; poll/cancel control from another thread. Raises after joining on failure.")
         .def("route",&chunkRoute,"center_base"_a,"direction"_a,"metric"_a.noconvert(),
              "maximum_distance_base"_a,"maximum_steps"_a,
              "Return committed suffix points (excluding initial snap), reason and join diagnostics.")
@@ -588,6 +628,24 @@ NB_MODULE(fiber_trace, m)
              "Shared reference replay; optional reverse checks use the configured acceptance radii.");
 
     m.def("case_queue_supported",&ft::FiberCaseQueue::supported);
+
+    nb::class_<ft::FiberEvaluationCase>(m,"EvaluationCase")
+        .def("__init__", [](ft::FiberEvaluationCase* self, const PointsIn& points,
+                            double begin, const std::optional<double>& end) {
+            new (self) ft::FiberEvaluationCase{toPoints(points,"reference_base"), begin, end};
+        }, "reference_base"_a.noconvert(), "begin_arc_base"_a=0., "end_arc_base"_a=nb::none());
+    nb::class_<ft::FiberEvaluationControl>(m,"EvaluationControl")
+        .def(nb::init<>())
+        .def("cancel", &ft::FiberEvaluationControl::cancel, "reason"_a="fiber evaluation cancelled",
+             nb::call_guard<nb::gil_scoped_release>())
+        .def("status", [](const ft::FiberEvaluationControl& self) {
+            const auto s = self.status();
+            nb::dict out;
+            out["total"] = s.total; out["completed"] = s.completed;
+            out["started"] = s.started; out["finished"] = s.finished;
+            out["cancelled"] = s.cancelled; out["error"] = s.error;
+            return out;
+        });
 
     nb::class_<ft::FiberTraceConfig>(m, "TraceConfig")
         .def("__init__", [](ft::FiberTraceConfig* self, nb::kwargs kwargs) {
