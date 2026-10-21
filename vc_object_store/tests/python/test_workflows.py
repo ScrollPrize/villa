@@ -167,14 +167,15 @@ def test_checked_relationships_lifecycle_graph_and_sync(db, tmp_path):
 
 
 def test_stable_ids_annotations_splice_and_coordinate_backfill(db):
+    label = {'label': 'A', 'note': 'x' * 70000}
     uid = db.upsert_object(dict(kind='point_collection', meta={'source': {
-        'point_attributes': [{'label': 'A'}, {'label': 'B'}]}}))
+        'point_attributes': [label, {'label': 'B'}]}}))
     first = db.put_geometry(uid, PointCollection([10, 20], [[1, 2, 3], [4, 5, 6]]))
     with db.write(expected_revisions=heads(db, uid)) as tx:
         second = tx.edit_geometry_sequence(uid, dict(array='points', start=1, erase_count=0,
             parts=[dict(count=1, ids=[30], data=struct.pack('<3d', 7, 8, 9), annotations=[{'label': 'C'}])]), first)
         tx.backfill_geometry_coordinates(uid, {'scale_factor': 4})
-    assert db.geometry_point_annotations(second, 'points') == [{'label': 'A'}, {'label': 'C'}, {'label': 'B'}]
+    assert db.geometry_point_annotations(second, 'points') == [label, {'label': 'C'}, {'label': 'B'}]
     assert db.read_geometry_array(second, 'point_ids') == struct.pack('<3q', 10, 30, 20)
     assert db.object(uid)['meta']['coordinates'] == {'volume_uuid': None, 'scale_factor': 4}
     before = db.current_object_revision(uid)
@@ -194,6 +195,9 @@ def test_stable_ids_annotations_splice_and_coordinate_backfill(db):
         third = edit.commit()
         assert view.point(30) == [7, 8, 9]
     assert db.read_geometry_array(third, 'points')[24:48] == struct.pack('<3d', 10, 11, 12)
+    with ObjectStore.create(db.path + '.peer', author='peer') as peer:
+        assert db.synchronize(peer)['applied']
+        assert peer.geometry_point_annotations(third, 'points') == [label, {'label': 'C'}, {'label': 'B'}]
 
 
 @pytest.mark.parametrize('damage', ['payload', 'manifest', 'missing_chunk'])
