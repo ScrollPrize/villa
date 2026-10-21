@@ -6979,6 +6979,52 @@ def test_native_3d_trace2cp_scaled_inference_downsamples_cached_field() -> None:
     assert float(presence[0].item()) == pytest.approx(0.4)
 
 
+
+def test_native_3d_trace2cp_composes_native_and_residual_scaledown() -> None:
+    class NativeStrideAdapter(_NativeTraceTestPredictionAdapter):
+        native_output_stride = 2
+
+    class NativeStrideModel(torch.nn.Module):
+        def forward(self, volume: torch.Tensor) -> torch.Tensor:
+            coarse = torch.nn.functional.avg_pool3d(volume, kernel_size=2, stride=2)
+            return coarse.expand(-1, 7, -1, -1, -1).contiguous()
+
+    record = _native_trace_record(np.ones((16, 16, 16), dtype=np.float32))
+    cache = NativeTraceFieldCache(
+        record=record,
+        prediction_adapter=NativeStrideAdapter(),
+        model=NativeStrideModel(),
+        patch_shape_zyx=(8, 8, 8),
+        core_margin_voxels=0,
+        inference_scaledown_power=2,
+        device=torch.device("cpu"),
+    )
+
+    block = cache._infer_block(np.asarray([0, 0, 0], dtype=np.int64))
+
+    assert cache.native_output_stride == 2
+    assert cache.residual_inference_scaledown == 2
+    assert block.output_czyx.shape == (7, 2, 2, 2)
+    assert block.valid_mask_zyx.shape == (2, 2, 2)
+
+
+def test_native_3d_trace2cp_rejects_total_stride_below_native_stride() -> None:
+    adapter = _NativeTraceTestPredictionAdapter()
+    adapter.native_output_stride = 4
+    record = _native_trace_record(np.ones((16, 16, 16), dtype=np.float32))
+
+    with pytest.raises(ValueError, match="positive multiple"):
+        NativeTraceFieldCache(
+            record=record,
+            prediction_adapter=adapter,
+            model=torch.nn.Identity(),
+            patch_shape_zyx=(8, 8, 8),
+            core_margin_voxels=2,
+            inference_scaledown_power=1,
+            device=torch.device("cpu"),
+        )
+
+
 def test_native_3d_trace2cp_inference_blur_runs_after_scaledown_before_crop() -> None:
     class OnesSampler:
         blocking = True
