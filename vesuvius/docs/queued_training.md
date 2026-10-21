@@ -292,7 +292,4 @@ above; they exercise two-rank to one-rank resize and native coarse output.
 These tests do not override NCCL transport settings. The real automatic-startup
 test also runs the unmodified production worker factory in a fresh CPU-only
 supervisor, calibrates using real updates, then continues under an adaptive
-registration. This exercises default-transport training on two granted GPUs.
-Device-pair-specific diagnostic transport overrides are
-not part of either the test adapter or production defaults. Runtime validation
-on one device pair does not establish other pairs or CUDA/NCCL combinations.
+registration. This exercises the production defaults on two granted GPUs.
