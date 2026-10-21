@@ -168,7 +168,7 @@ bool SegmentationLineTool::applyStroke(const std::vector<cv::Vec3f>& stroke)
     const auto editedVerts = _editManager->editedVertices();
 
     // Capture delta for undo before applyPreview() clears edited vertices
-    (void)_module.captureUndoDelta();
+    const bool undoCaptured = _module.captureUndoDelta();
 
     // Auto-approve edited regions before applyPreview() clears them
     auto* overlay = _module.overlay();
@@ -176,7 +176,7 @@ bool SegmentationLineTool::applyStroke(const std::vector<cv::Vec3f>& stroke)
         if (!editedVerts.empty()) {
             // Line tool has no single drag center - use nullopt
             const auto filteredVerts = _module.filterVerticesForAutoApproval(editedVerts, std::nullopt);
-            _module.performAutoApproval(filteredVerts);
+            _module.performAutoApproval(filteredVerts, undoCaptured);
         }
     }
 

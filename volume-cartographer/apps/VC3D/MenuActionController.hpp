@@ -92,6 +92,10 @@ public:
     // True while any sample open is in flight.
     bool openDataSampleOpenInFlight() const;
 
+public slots:
+    // Enables Edit > Undo and Edit > Redo; wired to the segmentation history.
+    void setUndoRedoAvailable(bool canUndo, bool canRedo);
+
 private slots:
     void newProject();
     void saveProjectAs();
@@ -133,6 +137,8 @@ signals:
     void mergePatchFromMenuRequested();
     void growTrackPatchesFromMenuRequested();
     void openDataCatalogVisibilityChanged(bool visible);
+    void undoRequested();
+    void redoRequested();
 
 private:
     QStringList loadRecentPaths() const;
@@ -227,6 +233,8 @@ private:
     QAction* _growTrackPatchesAct{nullptr};
     QAction* _materializeOpenDataFolderAct{nullptr};
     QAction* _recalculateFiberScoresAct{nullptr};
+    QAction* _undoAct{nullptr};
+    QAction* _redoAct{nullptr};
 
     QPointer<QDialog> _keybindsDialog;
     QPointer<vc3d::opendata::OpenDataCatalogWindow> _openDataCatalogDialog;

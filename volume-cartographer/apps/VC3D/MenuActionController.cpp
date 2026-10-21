@@ -217,6 +217,24 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     connect(_growTrackPatchesAct, &QAction::triggered,
             this, &MenuActionController::growTrackPatchesFromMenuRequested);
 
+    // No shortcuts on these two: the viewers handle the keys (Manual Add and
+    // other tools give them their own meaning), and the macOS menu bar would
+    // take a menu shortcut whatever its context. The tooltip names the key; a
+    // status tip would stay in the status bar after a hover.
+    _undoAct = new QAction(QObject::tr("&Undo Segmentation Edit"), this);
+    _undoAct->setObjectName(QStringLiteral("actionUndoSegmentationEdit"));
+    _undoAct->setToolTip(QObject::tr("Undo the last segmentation edit (%1 in the viewers)")
+                             .arg(QKeySequence(QKeySequence::Undo).toString(QKeySequence::NativeText)));
+    _undoAct->setEnabled(false);
+    connect(_undoAct, &QAction::triggered, this, &MenuActionController::undoRequested);
+
+    _redoAct = new QAction(QObject::tr("&Redo Segmentation Edit"), this);
+    _redoAct->setObjectName(QStringLiteral("actionRedoSegmentationEdit"));
+    _redoAct->setToolTip(QObject::tr("Redo the last undone segmentation edit (%1 in the viewers)")
+                             .arg(QKeySequence(QKeySequence::Redo).toString(QKeySequence::NativeText)));
+    _redoAct->setEnabled(false);
+    connect(_redoAct, &QAction::triggered, this, &MenuActionController::redoRequested);
+
     _materializeOpenDataFolderAct = new QAction(
         QObject::tr("Create/Fetch All Segments for Current Folder"), this);
     connect(_materializeOpenDataFolderAct, &QAction::triggered, this,
@@ -258,6 +276,9 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addAction(_exitAct);
 
     _editMenu = new QMenu(QObject::tr("&Edit"), qWindow);
+    _editMenu->setToolTipsVisible(true);
+    _editMenu->addAction(_undoAct);
+    _editMenu->addAction(_redoAct);
 
     _viewMenu = new QMenu(QObject::tr("&View"), qWindow);
     qWindow->populateDockToggleMenu(_viewMenu);
@@ -296,6 +317,16 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     menuBar->addMenu(_helpMenu);
 
     refreshRecentMenu();
+}
+
+void MenuActionController::setUndoRedoAvailable(bool canUndo, bool canRedo)
+{
+    if (_undoAct) {
+        _undoAct->setEnabled(canUndo);
+    }
+    if (_redoAct) {
+        _redoAct->setEnabled(canRedo);
+    }
 }
 
 void MenuActionController::ensureRecentActions()
