@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <limits>
 #include <string>
+#include <utility>
 
 #include <QJsonArray>
 #include <QJsonObject>
@@ -12,6 +13,7 @@
 #include <opencv2/core.hpp>
 
 #include "agent_bridge/AgentBridgeCommandError.hpp"
+#include "agent_bridge/AgentBridgeEditSettings.hpp"
 #include "agent_bridge/AgentBridgeInput.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
 #include "agent_bridge/AgentBridgeMethod.hpp"
@@ -469,6 +471,53 @@ int main()
         CHECK(agentBridgeCaptureArea(100, 0, 5, 5, target).isEmpty());
         CHECK(agentBridgeCaptureArea(std::numeric_limits<int>::max(), 0, 5, 5, target).isEmpty());
         CHECK(agentBridgeCaptureArea(0, 0, 0, 5, target).isEmpty());
+    }
+
+    // segmentation.set_settings zRange: a bound left out keeps the panel's
+    // value, a request may not invert the range, and the panel's own bounds
+    // are taken back even when its spin boxes hold min above max.
+    {
+        using Bounds = std::pair<int, int>;
+        expectNoThrow("zRange-one-bound-min", [&] {
+            CHECK(agentBridgeZRangeUpdate(QJsonObject{{"enabled", false}, {"min", 3}}, 0, 10) ==
+                  Bounds(3, 10));
+        });
+        expectNoThrow("zRange-one-bound-max", [&] {
+            CHECK(agentBridgeZRangeUpdate(QJsonObject{{"enabled", false}, {"max", 3}}, 0, 0) ==
+                  Bounds(0, 3));
+        });
+        expectNoThrow("zRange-equal-bounds", [&] {
+            CHECK(agentBridgeZRangeUpdate(QJsonObject{{"min", 5}, {"max", 5}}, 0, 0) ==
+                  Bounds(5, 5));
+        });
+        expectNoThrow("zRange-enabled-only", [&] {
+            CHECK(agentBridgeZRangeUpdate(QJsonObject{{"enabled", true}}, 4, 9) == Bounds(4, 9));
+        });
+        // A fresh settings store starts at [0, 0], so min alone cannot rise.
+        expectParamError("zRange-one-bound-min-above-kept-max", "zRange", [&] {
+            agentBridgeZRangeUpdate(QJsonObject{{"enabled", false}, {"min", 3}}, 0, 0);
+        });
+        expectParamError("zRange-inverted", "zRange", [&] {
+            agentBridgeZRangeUpdate(QJsonObject{{"enabled", true}, {"min", 10}, {"max", 2}}, 0, 0);
+        });
+        // The panel holds [500, 0] after a user raises min first; get_settings
+        // reports that, and passing it back, or only toggling enabled, works.
+        expectNoThrow("zRange-panel-inverted-echo", [&] {
+            CHECK(agentBridgeZRangeUpdate(
+                      QJsonObject{{"enabled", true}, {"min", 500}, {"max", 0}}, 500, 0) ==
+                  Bounds(500, 0));
+        });
+        expectNoThrow("zRange-panel-inverted-enabled-only", [&] {
+            CHECK(agentBridgeZRangeUpdate(QJsonObject{{"enabled", false}}, 500, 0) ==
+                  Bounds(500, 0));
+        });
+        expectNoThrow("zRange-panel-inverted-repaired", [&] {
+            CHECK(agentBridgeZRangeUpdate(QJsonObject{{"enabled", true}, {"max", 1500}}, 500, 0) ==
+                  Bounds(500, 1500));
+        });
+        expectParamError("zRange-panel-inverted-changed", "zRange", [&] {
+            agentBridgeZRangeUpdate(QJsonObject{{"enabled", true}, {"min", 600}}, 500, 0);
+        });
     }
 
     if (g_failures == 0) {

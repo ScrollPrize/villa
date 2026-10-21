@@ -1,4 +1,5 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
+#include "agent_bridge/AgentBridgeEditSettings.hpp"
 
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -10,6 +11,7 @@
 #include <cmath>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "CWindow.hpp"
@@ -265,14 +267,14 @@ QJsonObject AgentBridgeServer::handleSegmentationSetSettings(const QJsonValue& p
         config.weight = field.value("weight").toDouble(1.0);
         directionFields.push_back(config);
     }
-    // A Z range given with one bound keeps the other field's value.
+    // A Z range given with one bound keeps the other field's value; the
+    // panel's own bounds are taken back even when its spin boxes hold them
+    // in the wrong order.
     const QJsonObject zRange = p.value("zRange").toObject();
     const auto [currentZMin, currentZMax] = widget->correctionsZBounds();
-    const int zMin = zRange.value("min").toInt(currentZMin);
-    const int zMax = zRange.value("max").toInt(currentZMax);
-    if (p.contains("zRange") && zMin > zMax) {
-        throwParam(QStringLiteral("zRange"), QStringLiteral("zRange.min must not exceed zRange.max"));
-    }
+    const auto [zMin, zMax] = p.contains("zRange")
+        ? agentBridgeZRangeUpdate(zRange, currentZMin, currentZMax)
+        : std::pair<int, int>{currentZMin, currentZMax};
 
     // The growth volume is the one change that can still be refused (the
     // panel may not offer a volume the project has), so it goes first.

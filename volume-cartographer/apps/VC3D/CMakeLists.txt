@@ -337,6 +337,7 @@ set(srcs
     agent_bridge/AgentBridgeCommandError.hpp
     agent_bridge/AgentBridgeAccessible.cpp
     agent_bridge/AgentBridgeAccessible.hpp
+    agent_bridge/AgentBridgeEditSettings.hpp
     agent_bridge/AgentBridgeInput.hpp
     agent_bridge/AgentBridgeInternal.hpp
     agent_bridge/AgentBridgeKeyboard.cpp
