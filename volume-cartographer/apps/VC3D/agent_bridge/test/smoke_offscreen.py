@@ -248,6 +248,8 @@ def check_rpc_describe(
         "viewer.get_overlay",
         "viewer.set_overlay",
         "viewer.list_overlay_volumes",
+        "viewer.get_ink_overlay",
+        "viewer.set_ink_overlay",
         "viewer.set_intersects",
     }
     try:
