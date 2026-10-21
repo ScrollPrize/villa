@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-import time
+import queue
 import threading
-
-import torch
+import time
 import warnings
 from typing import Any, Callable
+
+import torch
 
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     FiberTrace3DBatch,
@@ -27,70 +28,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
 from vesuvius.neural_tracing.ordered_sample_pipeline import (
     OrderedTwoStageSamplePipeline,
 )
-from .targets import materialize_targets, target_normalization_counts
-
-
-class MacroBatchTargetSource:
-    """Bounded host staging and geometry-only normalization prepass.
-
-    The value augmentation suffix changes images only. Reuse the real target
-    voxelizer on the training device with a storage-free final-shape image view.
-    Never transfer the real image or run the model in this prepass.
-    """
-
-    def __init__(self, source, *, config, device, output_stride, batch_sizes, conditioned=False):
-        self.source, self.config = source, config
-        self.device, self.output_stride = device, output_stride
-        self.batch_sizes = tuple(batch_sizes)
-        self.conditioned = conditioned
-        if not self.batch_sizes or any(n <= 0 for n in self.batch_sizes):
-            raise ValueError("target source requires nonempty local microbatches")
-        self.pending = []
-        self.prepare_geometry = lambda operation: operation()
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        if not self.pending:
-            prepared = []
-            counts = torch.zeros(3)
-            for size in self.batch_sizes:
-                raw = next(self.source)
-                try:
-                    # Queue views release/reuse their slots on next(); take
-                    # ownership before returning credits, including geometry.
-                    # Counts belong to this prepass's complete batch and stride.
-                    batch = replace(raw, normalization_counts=None, normalization_output_stride=None,
-                                    **{name: value.clone() for name, value in vars(raw).items()
-                                       if name != "normalization_counts" and isinstance(value, torch.Tensor)})
-                finally:
-                    self.source.release_current()
-                if batch.volume.shape[0] != size:
-                    raise RuntimeError("target prepass microbatch differs from canonical partition")
-                counts += self.prepare_geometry(lambda: self._counts(batch))
-                prepared.append(batch)
-            local_counts = counts.cpu()
-            self.pending = [replace(batch, normalization_counts=local_counts,
-                                    normalization_output_stride=int(self.output_stride))
-                            for batch in reversed(prepared)]
-        return self.pending.pop()
-
-    def _counts(self, batch):
-        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=False):
-            # Preserve validity: this extracted stage still has masked targets.
-            geometry = replace(batch, volume=torch.empty(0)).to(self.device)
-            geometry = replace(geometry, volume=torch.empty(1, device=self.device).expand(
-                len(batch.volume), 1, *self.config.patch_shape_zyx))
-            targets = materialize_targets(geometry, self.config, output_stride=self.output_stride)
-            return target_normalization_counts(targets, conditioned=self.conditioned).cpu()
-
-    def release_current(self):
-        pass  # Returned batches own storage, not shared-slot leases.
-
-    def close(self):
-        self.source.close()
-        self.pending.clear()
+from vesuvius.neural_tracing.fiber_trace_3d.targets import materialize_targets, target_normalization_counts
 
 
 @dataclass(frozen=True)
@@ -287,7 +225,11 @@ class FiberTrace3DAugmentOperation:
     def __call__(self, raw: FiberTrace3DRawSample) -> FiberTrace3DSample | FiberTrace3DRawSample:
         if self.defer_cuda_suffix:
             return prepare_fiber_trace_3d_cuda_suffix(
-                self.config, raw, profile=self.profile, mode=self.defer_cuda_suffix)
+                self.config,
+                raw,
+                profile=self.profile,
+                mode=self.defer_cuda_suffix,
+            )
         return augment_fiber_trace_3d_raw_sample(
             self.config,
             raw,
@@ -303,7 +245,10 @@ class FiberTrace3DAugmentFactory:
 
     def __call__(self) -> FiberTrace3DAugmentOperation:
         return FiberTrace3DAugmentOperation(
-            _pipeline_config(self.config_path), self.profile, self.defer_cuda_suffix)
+            _pipeline_config(self.config_path),
+            self.profile,
+            self.defer_cuda_suffix,
+        )
 
 
 @dataclass(frozen=True)
@@ -417,7 +362,8 @@ class FiberTrace3DSampleQueue:
             banks.append(FiberTrace3DSharedTensorSlots(
                 start_index=0, slot_count=slot_count, patch_shape_zyx=config.patch_shape_zyx,
                 stream_index_map=self.descriptors,
-                volume_dtype=torch.uint8 if source.defer_cuda_value_augmentation == "all" else torch.float32))
+                volume_dtype=torch.uint8 if source.defer_cuda_value_augmentation == "all" else torch.float32,
+                embedding_stride=config.embedding.output_stride if config.embedding.enabled else 0))
         self.transport = _RoutedTransport(tuple(banks), self.descriptors)
         factory_args = (tuple(self.sources.values()), self.descriptors)
         self.pipeline = OrderedTwoStageSamplePipeline(
@@ -470,9 +416,9 @@ class FiberTrace3DSampleQueue:
                 return None
             source_id = self.descriptors.descriptor(ticket[0])[0]
             source = self.sources[self.names[source_id]]
-            volumes, masks = self.transport.batch_tensors(list(ticket), allow_wrap=True)
             return collate_pipeline_results(
-                [self._ready[index] for index in ticket], volumes, masks,
+                [self._ready[index] for index in ticket],
+                self.transport.batch_tensors(list(ticket), allow_wrap=True),
                 defer_cuda_value_augmentation=source.defer_cuda_value_augmentation,
                 profile=self.profile, total_start=time.perf_counter())
 
@@ -491,7 +437,7 @@ class FiberTrace3DSampleQueue:
         self._owned.clear()
 
 
-def collate_pipeline_results(results, volumes, masks, *, defer_cuda_value_augmentation=None,
+def collate_pipeline_results(results, volumes, *, defer_cuda_value_augmentation=None,
                              profile=False, total_start=None, cpu_start=None, wall_start_ns=None):
     """Shared collation for rank-local and persistent canonical sample owners."""
     samples = []
@@ -522,29 +468,11 @@ def collate_pipeline_results(results, volumes, masks, *, defer_cuda_value_augmen
             sample = replace(sample, profile_timings_ms=timings)
         samples.append(sample)
     return collate_fiber_trace_3d_samples(
-        samples, volume_batch=volumes, valid_mask_batch=masks,
+        samples, volume_batch=volumes,
         deferred_augmentation_params=tuple(deferred_params) if defer_cuda_value_augmentation is not None else None,
         deferred_blur_kernels=tuple(deferred_kernels) if defer_cuda_value_augmentation is not None else None,
         profile=profile, total_start=total_start, cpu_total_start=cpu_start, wall_start_ns=wall_start_ns,
     )
-
-
-def apply_deferred_batch_augmentation(batch, config, *, mode):
-    """Complete the same deferred value transform for training/evaluation/views.
-
-    Call after transfer, under disabled autocast. The mode is explicit because
-    suffix-only batches also retain augmentation parameters for reproducibility.
-    """
-    if batch.deferred_blur_kernels is None:
-        return batch
-    if mode == "all":
-        if batch.deferred_augmentation_params is None:
-            raise RuntimeError("CUDA augmentation parameters are missing")
-        volume = apply_value_augmentation_batch_3d(config, batch.volume,
-            batch.deferred_augmentation_params, batch.deferred_blur_kernels)
-    else:
-        volume = apply_value_augmentation_suffix_batch_3d(batch.volume, batch.deferred_blur_kernels)
-    return replace(batch, volume=volume, deferred_augmentation_params=None, deferred_blur_kernels=None)
 
 
 class FiberTrace3DTrainingBatchPipeline:
@@ -566,6 +494,9 @@ class FiberTrace3DTrainingBatchPipeline:
         sample_mode: str,
         profile: bool,
         defer_cuda_value_augmentation: str | None = None,
+        batch_sizes: tuple[int, ...] | None = None,
+        single_core_load: bool = False,
+        embedding_stride: int = 0,
     ) -> None:
         if int(batch_count) <= 0:
             raise ValueError("batch_count must be positive")
@@ -574,15 +505,27 @@ class FiberTrace3DTrainingBatchPipeline:
         if int(initial_in_flight) < int(batch_size):
             raise ValueError("initial_in_flight must be at least one batch")
         self.batch_size = int(batch_size)
+        self.batch_sizes = (self.batch_size,) if batch_sizes is None else tuple(batch_sizes)
+        if not self.batch_sizes or any(type(size) is not int or not 0 < size <= self.batch_size for size in self.batch_sizes):
+            raise ValueError("batch_sizes must be a nonempty pattern within batch_size")
+        if int(batch_count) % len(self.batch_sizes):
+            raise ValueError("batch_count must cover whole batch-size patterns")
+        self._batch_count, self._batch_ordinal = int(batch_count), 0
+        self._variable_batches = batch_sizes is not None
         self.profile = bool(profile)
         self.defer_cuda_value_augmentation = defer_cuda_value_augmentation
         self._leased: list[int] = []
         self.transport = FiberTrace3DSharedTensorSlots(
+            embedding_stride=embedding_stride,
             start_index=0,
             slot_count=int(slot_count),
             patch_shape_zyx=patch_shape_zyx,
             stream_index_map=index_map,
-            volume_dtype=torch.uint8 if self.defer_cuda_value_augmentation == "all" else torch.float32,
+            volume_dtype=(
+                torch.uint8
+                if self.defer_cuda_value_augmentation == "all"
+                else torch.float32
+            ),
         )
         self.pipeline = OrderedTwoStageSamplePipeline(
             stage1_factory=FiberTrace3DLoadFactory(
@@ -591,11 +534,15 @@ class FiberTrace3DTrainingBatchPipeline:
                 sample_mode,
                 index_map=index_map,
                 profile=profile,
+                single_core=single_core_load,
             ),
-            stage2_factory=FiberTrace3DAugmentFactory(config_path, profile=profile,
-                defer_cuda_suffix=self.defer_cuda_value_augmentation),
+            stage2_factory=FiberTrace3DAugmentFactory(
+                config_path,
+                profile=profile,
+                defer_cuda_suffix=self.defer_cuda_value_augmentation,
+            ),
             start_index=0,
-            item_count=int(batch_count) * self.batch_size,
+            item_count=(int(batch_count) // len(self.batch_sizes)) * sum(self.batch_sizes),
             stage1_workers=0,
             stage2_workers=0,
             raw_queue_capacity=max(self.batch_size, min(int(slot_count), int(workers))),
@@ -614,20 +561,24 @@ class FiberTrace3DTrainingBatchPipeline:
     def __next__(self) -> FiberTrace3DBatch:
         if self._leased:
             raise RuntimeError("previous Fiber3D pipeline batch was not released")
+        if self._batch_ordinal >= self._batch_count:
+            raise StopIteration
+        take = self.batch_sizes[self._batch_ordinal % len(self.batch_sizes)]
         total_start = time.perf_counter()
         cpu_start = time.process_time()
         wall_start_ns = time.time_ns()
         results = [
             self.pipeline.next_ordered(release_credit=False)
-            for _ in range(self.batch_size)
+            for _ in range(take)
         ]
         indices = [int(result.index) for result in results]
-        volumes, masks = self.transport.batch_tensors(indices)
+        volumes = self.transport.batch_tensors(indices, allow_wrap=self._variable_batches)
         batch = collate_pipeline_results(
-            results, volumes, masks, profile=self.profile, total_start=total_start,
-            defer_cuda_value_augmentation=self.defer_cuda_value_augmentation,
-            cpu_start=cpu_start, wall_start_ns=wall_start_ns)
+            results, volumes, defer_cuda_value_augmentation=self.defer_cuda_value_augmentation,
+            profile=self.profile, total_start=total_start, cpu_start=cpu_start, wall_start_ns=wall_start_ns,
+        )
         self._leased = indices
+        self._batch_ordinal += 1
         return batch
 
     def release_current(self) -> None:
@@ -638,3 +589,86 @@ class FiberTrace3DTrainingBatchPipeline:
     def close(self) -> None:
         self.release_current()
         self.pipeline.close()
+
+
+def apply_deferred_batch_augmentation(batch, config, *, mode):
+    """Complete the same deferred value transform for training/evaluation/views.
+
+    Call after transfer, under disabled autocast. The mode is explicit because
+    suffix-only batches also retain augmentation parameters for reproducibility.
+    """
+    if batch.deferred_blur_kernels is None:
+        return batch
+    if mode == "all":
+        if batch.deferred_augmentation_params is None:
+            raise RuntimeError("CUDA augmentation parameters are missing")
+        volume = apply_value_augmentation_batch_3d(config, batch.volume,
+            batch.deferred_augmentation_params, batch.deferred_blur_kernels)
+    else:
+        volume = apply_value_augmentation_suffix_batch_3d(batch.volume, batch.deferred_blur_kernels)
+    return replace(batch, volume=volume, deferred_augmentation_params=None, deferred_blur_kernels=None)
+
+
+class MacroBatchTargetSource:
+    """Bounded host staging and geometry-only normalization prepass.
+
+    The value augmentation suffix changes images only. Reuse the real target
+    voxelizer on the training device with a storage-free final-shape image view.
+    Never transfer the real image or run the model in this prepass.
+    """
+
+    def __init__(self, source, *, config, device, output_stride, batch_sizes, conditioned=False):
+        self.source, self.config = source, config
+        self.device, self.output_stride = device, output_stride
+        self.batch_sizes = tuple(batch_sizes)
+        self.conditioned = conditioned
+        if not self.batch_sizes or any(n <= 0 for n in self.batch_sizes):
+            raise ValueError("target source requires nonempty local microbatches")
+        self.pending = []
+        self.prepare_geometry = lambda operation: operation()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if not self.pending:
+            prepared = []
+            counts = None
+            for size in self.batch_sizes:
+                raw = next(self.source)
+                try:
+                    # Queue views release/reuse their slots on next(); take
+                    # ownership before returning credits, including geometry.
+                    batch = replace(raw, normalization_counts=None, normalization_output_stride=None,
+                                    **{name: value.clone() for name, value in vars(raw).items()
+                                       if name != 'normalization_counts' and isinstance(value, torch.Tensor)},
+                                    embedding_geometry=None if raw.embedding_geometry is None else tuple(
+                                        None if item is None else replace(item, eligible=item.eligible.clone())
+                                        for item in raw.embedding_geometry))
+                finally:
+                    self.source.release_current()
+                if batch.volume.shape[0] != size:
+                    raise RuntimeError("target prepass microbatch differs from canonical partition")
+                batch_counts = self.prepare_geometry(lambda: self._counts(batch))
+                counts = batch_counts.clone() if counts is None else counts + batch_counts
+                prepared.append(batch)
+            local_counts = counts.cpu()
+            self.pending = [replace(batch, normalization_counts=local_counts,
+                                    normalization_output_stride=int(self.output_stride))
+                            for batch in reversed(prepared)]
+        return self.pending.pop()
+
+    def _counts(self, batch):
+        with torch.no_grad(), torch.autocast(device_type=self.device.type, enabled=False):
+            geometry = replace(batch, volume=torch.empty(0), valid_mask=None).to(self.device)
+            geometry = replace(geometry, volume=torch.empty(1, device=self.device).expand(
+                len(batch.volume), 1, *self.config.patch_shape_zyx))
+            targets = materialize_targets(geometry, self.config, output_stride=self.output_stride)
+            return target_normalization_counts(targets, conditioned=self.conditioned, config=self.config).cpu()
+
+    def release_current(self):
+        pass  # Returned batches own storage, not shared-slot leases.
+
+    def close(self):
+        self.source.close()
+        self.pending.clear()

@@ -15,7 +15,8 @@ import signal
 import time
 
 from .cooperative_resources import MemoryCalibration
-from .training_state import config_fingerprint
+from .training_state import checkpoint_sources, config_fingerprint
+from .training_trace_benchmark import run_job
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,10 @@ class LaunchSettings:
     slots: int
     initial: int
     queue_depth: int
+
+    @property
+    def disconnect_grace_seconds(self):
+        return None if self.calibration is None and self.request['exclusive'] else 60
 
 
 def launch_settings(raw, *, socket=None):
@@ -68,7 +73,9 @@ def launch_settings(raw, *, socket=None):
     if slots < batch:
         raise ValueError("sample_pipeline_slots must fit one effective batch")
     workers = min(workers, positive(request.get("max_cpu_cores"), "max_cpu_cores"))
-    gpu_count = positive(request.get("max_gpus"), "max_gpus")
+    positive(request.get("max_gpus"), "max_gpus")
+    # world_size in calibration rows is provenance. The measured per-device
+    # budgets (including reserve) determine microbatch size on every replica.
     if calibration is not None and calibration.microbatch_for(positive(request.get("min_vram_bytes_per_gpu"), "min_vram_bytes_per_gpu")) < 1:
         raise ValueError("minimum VRAM request cannot fit a measured microbatch")
     if training.get("sync_batchnorm", False) or training.get("ddp_broadcast_buffers", False):
@@ -89,6 +96,7 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
     from villa_gpu_manager.stop_guard import StopGuard
     from .cooperative_cohort import FiberCohort
     from .cooperative_logging import WriterHub
+    from .cooperative_maintenance import MaintenanceMailbox
     from .sample_broker import CanonicalSampleBroker
     from .loader import load_config
     from .train import _load_raw_config, _make_summary_writer, _training_cuda_value_augmentation
@@ -103,7 +111,7 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
     settings = launch_settings(raw, socket=socket)
     fingerprint = config_fingerprint(raw)
     training = raw.get("training", {})
-    resume = resume_checkpoint or training.get("resume") or raw.get("resume")
+    resume, _initialize_from = checkpoint_sources(raw, resume_checkpoint)
     start_step = 0
     if resume is not None:
         # Same trusted checkpoint assumption as the ordinary trainer. Do not
@@ -113,14 +121,23 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         del checkpoint
     if not 0 <= start_step < settings.max_steps:
         raise ValueError("resume step must precede max_steps")
+    from .run_layout import resolve_run_date
     overrides = {
         "bounded_gradient_accumulation": True, "sync_batchnorm": False,
         "ddp_broadcast_buffers": False,
         "device": "cuda:0",
         "sample_axis_logging": True,
-        "run_datestr": str(training.get("run_datestr") or datetime.now().strftime("%Y%m%d_%H%M%S")),
+        "run_datestr": resolve_run_date(raw),
         "test_hang_diagnostics_enabled": bool(test_hang_diagnostics or training.get("test_hang_diagnostics_enabled", False)),
     }
+    from .train import _resolve_run_layout
+    from .reviewed_trace_selection import reconcile_completed_attempts
+    run_dir, snapshot_dir = _resolve_run_layout(
+        raw, date_str_override=overrides["run_datestr"]
+    )
+    reconciled = reconcile_completed_attempts(run_dir, snapshot_dir)
+    for path in reconciled:
+        print(f"fiber cooperative: reconciled completed reviewed trace {path}", flush=True)
     broker = None
     startup = None
     startup_complete = False
@@ -129,12 +146,17 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         from .memory_calibration import StartupMemoryCalibration
         target = min(int(raw.get("batch_size", training.get("batch_size", 16))),
                      max(1, settings.batch_size // settings.request["max_gpus"]))
-        startup = StartupMemoryCalibration(fingerprint, target_microbatch=target)
-        overrides["evaluation_microbatch_size"] = 1
+        group_size = 2 if raw.get("embedding", {}).get("paired_patches", False) else 1
+        target = max(group_size, target // group_size * group_size)
+        startup = StartupMemoryCalibration(fingerprint, target_microbatch=target, sample_group_size=group_size)
+        overrides["evaluation_microbatch_size"] = group_size
     elif any(row.get("evaluation_microbatch_size") == 1
              for row in training["cooperative"]["memory_calibration"]["observations"]):
         overrides["evaluation_microbatch_size"] = 1
+    elif raw.get("embedding", {}).get("paired_patches", False):
+        overrides["evaluation_microbatch_size"] = 2
     hub = WriterHub(_make_summary_writer)
+    maintenance_mailbox = MaintenanceMailbox()
 
     def observe_startup(rows, progress):
         nonlocal startup_complete, startup_run_done
@@ -182,14 +204,15 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
             startup_microbatch_size=startup.microbatch_size if startup is not None else None,
             startup_reserve_bytes=startup.reserve_bytes if startup is not None else 4 * 1024**3,
             on_startup_observation=observe_startup if startup is not None else None,
-            on_process_start=stop_guard.register)
+            on_process_start=stop_guard.register,
+            maintenance_mailbox=maintenance_mailbox)
         return cohort
 
     client = Client(settings.socket)
     supervisor = Supervisor(client, label=str(training.get("run_name", config_path.stem)),
         request=settings.request, cohort_factory=cohort_factory, dispose_state=lambda state: state.close(),
         pausable=startup is None, adaptable=startup is None,
-        disconnect_grace_seconds=None if startup is not None and settings.request["exclusive"] else 60)
+        disconnect_grace_seconds=settings.disconnect_grace_seconds)
     interrupted = False
     stop_guard = StopGuard()
 
@@ -201,6 +224,154 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
 
     previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGINT, signal.SIGTERM)}
     last_status = None
+    maintenance_future = None
+    maintenance_thread = None
+    maintenance_cancel = None
+    maintenance_owner = None
+    maintenance_token = None
+    maintenance_attempt = None
+    maintenance_attempt_index = 0
+
+    def grant_key(grant):
+        return (
+            int(grant["cpu_cores"]),
+            tuple(sorted((str(gpu), int(vram)) for gpu, vram in grant["gpus"].items())),
+        )
+
+    def applied_ownership_token():
+        task = client.task
+        if (not supervisor.connected or supervisor.cohort is None
+                or supervisor.status != "running" or not isinstance(task, dict)
+                or task.get("phase") != "applied"):
+            return None
+        return client.epoch, supervisor.generation, grant_key(supervisor.grant)
+
+    def owner_is_current():
+        return (
+            maintenance_owner is not None
+            and supervisor.cohort is maintenance_owner
+            and maintenance_owner.maintenance_ready
+            and maintenance_token == (
+                client.epoch, supervisor.generation, grant_key(supervisor.grant)
+            )
+        )
+
+    def start_reviewed_trace(request, token):
+        nonlocal maintenance_future, maintenance_thread, maintenance_cancel
+        nonlocal maintenance_owner, maintenance_token, maintenance_attempt
+        nonlocal maintenance_attempt_index
+        from .train import _reviewed_trace_test_config
+        from .reviewed_trace_selection import freeze_raw_checkpoint
+        trace = _reviewed_trace_test_config(training)
+        if trace is None:
+            raise RuntimeError("reviewed trace boundary has no configured test")
+        step = int(request["step"])
+        checkpoint = snapshot_dir / "current.pt"
+        if not checkpoint.is_file():
+            checkpoint = snapshot_dir / "best.pt"
+        if not checkpoint.is_file():
+            raise RuntimeError(f"reviewed trace checkpoint is missing: {checkpoint}")
+        root = run_dir / "reviewed_trace_test"
+        output = root / f"step_{step:08d}"
+        if output.exists():
+            raise RuntimeError(f"reviewed trace result already exists: {output}")
+        maintenance_attempt_index += 1
+        attempt = root / f".step_{step:08d}.attempt-{os.getpid()}-{maintenance_attempt_index}"
+        attempt.mkdir(parents=True, exist_ok=False)
+        frozen = attempt / "evaluated_raw.pt"
+        checkpoint_sha256 = freeze_raw_checkpoint(
+            checkpoint, frozen, step=step,
+            samples_seen=int(request["samples_seen"]),
+        )
+        job = {
+            "step": step,
+            "samples_seen": int(request["samples_seen"]),
+            "checkpoint": str(frozen),
+            "checkpoint_sha256": checkpoint_sha256,
+            "output_root": str(attempt),
+            "template": str(Path(trace["template"]).expanduser().resolve()),
+            "split_root": str(Path(trace["split_root"]).expanduser().resolve()),
+            "native_binary": str(Path(trace["native_binary"]).expanduser().resolve()),
+            "devices": ",".join(str(index) for index in range(len(supervisor.grant["gpus"]))),
+            "gpu_grant": dict(sorted(supervisor.grant["gpus"].items())),
+            # This process remains inside the existing manager task's process
+            # tree and uses its unchanged grant. It must not register a second
+            # overlapping task.
+            "inherited_manager_grant": True,
+        }
+        job_path = attempt / "job.json"
+        job_path.write_text(json.dumps(job, indent=2) + "\n")
+        from concurrent.futures import Future
+        import threading
+        maintenance_cancel = threading.Event()
+        maintenance_future = Future()
+        maintenance_owner = supervisor.cohort
+        maintenance_token = token
+        maintenance_attempt = attempt
+        maintenance_mailbox.begin_attempt(request, token)
+        factory = maintenance_owner.resident_worker_factory(maintenance_cancel)
+        future = maintenance_future
+        def evaluate():
+            try:
+                future.set_result(run_job(job_path, worker_factory=factory,
+                                          cancel_event=maintenance_cancel,
+                                          on_process_start=stop_guard.register))
+            except BaseException as error:
+                future.set_exception(error)
+        maintenance_thread = threading.Thread(target=evaluate, name="training-trace")
+        maintenance_thread.start()
+        print(f"fiber cooperative: resident reviewed trace started step={step} "
+              f"output={attempt} generation={token[1]}", flush=True)
+
+    def finish_reviewed_trace(request):
+        nonlocal maintenance_future, maintenance_attempt, maintenance_owner, maintenance_token
+        from .reviewed_trace_selection import finalize_attempt
+        maintenance_future.result()
+        maintenance_thread.join()
+        output = maintenance_attempt
+        canonical = output.parent / f"step_{int(request['step']):08d}"
+        metrics, selection, output = finalize_attempt(output, snapshot_dir, canonical=canonical)
+        if hub.writer is not None:
+            for key in ("restarts_forward", "restarts_reverse", "restarts_combined",
+                        "reference_mm_forward", "reference_mm_reverse", "reference_mm_combined",
+                        "implied_mean_mm_forward", "implied_mean_mm_reverse",
+                        "implied_mean_mm_combined", "wall_seconds"):
+                hub.writer.add_scalar(f"reviewed_trace/{key}", metrics[key], int(request["samples_seen"]))
+            for key, value in metrics.items():
+                if key.startswith('retained_'):
+                    hub.writer.add_scalar(f'reviewed_trace/{key}', value, int(request['samples_seen']))
+            hub.writer.flush()
+        print(f"fiber cooperative: reviewed trace complete step={request['step']} "
+              f"combined_restarts={metrics['restarts_combined']} "
+              f"best_reviewed_trace={selection['best_restarts_combined']} "
+              f"selected={selection['selected']}", flush=True)
+        maintenance_mailbox.end_attempt(maintenance_token)
+        maintenance_mailbox.complete(request)
+        maintenance_owner.finish_maintenance()
+        maintenance_future = maintenance_attempt = maintenance_owner = maintenance_token = None
+
+    def cancel_reviewed_trace(reason):
+        nonlocal maintenance_future, maintenance_attempt, maintenance_owner, maintenance_token
+        if maintenance_future is None:
+            return
+        maintenance_cancel.set()
+        if not maintenance_future.done():
+            return
+        maintenance_thread.join()
+        # The callable's finally block has joined all tile workers and cleaned
+        # prediction buffers before ownership can be released.
+        try:
+            maintenance_future.result()
+        except BaseException as error:
+            print(f"fiber cooperative: cancelled trace: {type(error).__name__}: {error}", flush=True)
+        if maintenance_attempt is not None and maintenance_attempt.exists():
+            (maintenance_attempt / "evaluated_raw.pt").unlink(missing_ok=True)
+            maintenance_attempt.rename(maintenance_attempt.with_name(
+                maintenance_attempt.name + f".revoked-{time.time_ns()}"))
+        maintenance_mailbox.end_attempt(maintenance_token)
+        maintenance_owner.finish_maintenance()
+        maintenance_future = maintenance_attempt = maintenance_owner = maintenance_token = None
+        print(f"fiber cooperative: reviewed trace deferred reason={reason}; request remains pending", flush=True)
     try:
         while True:
             stop_guard.check()
@@ -210,6 +381,19 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
                 except Exception as error:
                     supervisor.fail(error)
             supervisor.tick()
+            request = maintenance_mailbox.request
+            if maintenance_future is not None:
+                if not owner_is_current() or maintenance_cancel.is_set():
+                    cancel_reviewed_trace("manager allocation changed")
+                elif maintenance_future.done():
+                    finish_reviewed_trace(request)
+            request = maintenance_mailbox.request
+            if (request is not None and maintenance_future is None
+                    and supervisor.cohort is not None):
+                supervisor.cohort.begin_maintenance()
+                token = applied_ownership_token()
+                if supervisor.cohort.maintenance_ready and token is not None:
+                    start_reviewed_trace(request, token)
             status = (supervisor.status, supervisor.generation)
             if status != last_status:
                 reason = (client.task or {}).get("reason")
@@ -253,6 +437,12 @@ def run_cooperative_training(config_path, *, socket=None, resume_checkpoint=None
         # in reverse order: workers must join before their CPU resources close.
         if not stop_guard.stopping:
             stop_guard.stop()
+        if maintenance_future is not None:
+            maintenance_cancel.set()
+            if supervisor.cohort is not None:
+                supervisor.cohort.gpu.abort()
+            maintenance_thread.join()
+            cancel_reviewed_trace("training supervisor stopping")
         with ExitStack() as cleanup:
             cleanup.callback(stop_guard.close)
             for sig, handler in previous.items():

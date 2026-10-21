@@ -14,11 +14,12 @@ import numpy as np
 import pytest
 import torch
 
+from tests.neural_tracing.oriented_blur_reference import _anisotropic_blur_3d
 from tests.neural_tracing.test_fiber_trace_3d import _loader, _loader_with_mapping, _straight_fiber
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import Vc3dCoordinateSampler
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     FiberTrace3DConfig, FiberTrace3DLoader, FiberTrace3DSharedTensorSlots, config_from_mapping, load_config,
-    _anisotropic_blur_3d, _gaussian_kernel1d, _normalize_image,
+    _gaussian_kernel1d, _normalize_image,
     collate_fiber_trace_3d_samples,
 )
 from vesuvius.neural_tracing.fiber_trace_3d.sample_pipeline import (
@@ -192,8 +193,8 @@ def test_preprocessing_defaults_and_explicit_selection(tmp_path, selection):
     if selection is None:
         configs.append(FiberTrace3DConfig(datasets=tuple(raw["datasets"])))
     for config in configs:
-        assert config.geometry_backend == (selection or "eager")
-        assert config.value_augmentation_backend == (selection or "torch")
+        assert config.geometry_backend == (selection or "auto")
+        assert config.value_augmentation_backend == (selection or "auto")
 
 
 def test_real_paris4_default_preprocessing_ignores_native_availability(tmp_path, monkeypatch):
@@ -209,7 +210,6 @@ def test_real_paris4_default_preprocessing_ignores_native_availability(tmp_path,
     _assert_same_batch(actual, expected)
     assert actual.profile_timings_ms["geometry_native_used"] == 0
     assert actual.profile_timings_ms["value_native_transform_used"] == 0
-    assert actual.profile_timings_ms["value_anisotropic_native_used"] == 0
 
 
 @pytest.mark.parametrize("url,expected", (
@@ -338,7 +338,6 @@ def test_split_raw_and_value_augmentation_matches_composed_sample() -> None:
         assert getattr(staged, name) == getattr(combined, name)
     for name in (
         "volume",
-        "valid_mask",
         "cp_local_zyx",
         "crop_origin_zyx",
         "target_segment_starts_zyx",
@@ -348,6 +347,7 @@ def test_split_raw_and_value_augmentation_matches_composed_sample() -> None:
         "target_tangent_zyx",
     ):
         assert torch.equal(getattr(staged, name), getattr(combined, name)), name
+    assert staged.valid_mask is combined.valid_mask is None
     assert staged.profile_timings_ms is None
 
 
@@ -362,7 +362,7 @@ def test_shared_tensor_slots_round_trip_and_reject_stale_generation() -> None:
     payload = slots.encode(5, raw, final=False)
     restored = slots.decode(5, payload, final=False)
     assert torch.equal(restored.sample.volume, raw.sample.volume)
-    assert torch.equal(restored.sample.valid_mask, raw.sample.valid_mask)
+    assert restored.sample.valid_mask is raw.sample.valid_mask is None
     assert restored.sample.volume.data_ptr() == slots.volumes[0].data_ptr()
     assert torch.equal(restored.sample.target_tangent_zyx, raw.sample.target_tangent_zyx)
 
@@ -384,9 +384,8 @@ def test_shared_tensor_slots_expose_zero_copy_contiguous_batch() -> None:
         raw = loader.load_raw_sample(index)
         slots.encode(index, raw, final=False)
         expected.append(raw.sample.volume)
-    volumes, masks = slots.batch_tensors([3, 4])
+    volumes = slots.batch_tensors([3, 4])
     assert volumes.shape == (2, 1, 8, 8, 8)
-    assert masks.shape == (2, 1, 8, 8, 8)
     assert volumes.data_ptr() == slots.volumes[0].data_ptr()
     assert torch.equal(volumes[0], expected[0])
     assert torch.equal(volumes[1], expected[1])
@@ -630,7 +629,7 @@ def test_native_geometry_preserves_sampled_patch() -> None:
     native = _loader_with_mapping({**common, "geometry_backend": "native"})
     eager_raw = eager.load_raw_sample(2, profile=True)
     native_raw = native.load_raw_sample(2, profile=True)
-    assert torch.equal(native_raw.sample.valid_mask, eager_raw.sample.valid_mask)
+    assert native_raw.sample.valid_mask is eager_raw.sample.valid_mask is None
     difference = torch.abs(
         native_raw.sample.volume.to(torch.int16)
         - eager_raw.sample.volume.to(torch.int16)
@@ -835,8 +834,8 @@ def test_native_anisotropic_blur_validates_input_and_zero_sigma() -> None:
 def test_value_augmentation_backend_selection(monkeypatch: pytest.MonkeyPatch) -> None:
     import vc.volume
 
-    if not hasattr(vc.volume, "anisotropic_blur_3d"):
-        pytest.skip("volume-cartographer binding lacks native anisotropic blur")
+    if not hasattr(vc.volume, "fiber3d_value_transform"):
+        pytest.skip("volume-cartographer binding lacks native value transform")
     common = {
         "patch_shape_zyx": [17, 15, 13],
         "augment_blur_sigma": 0.5,
@@ -852,18 +851,15 @@ def test_value_augmentation_backend_selection(monkeypatch: pytest.MonkeyPatch) -
     native_unprofiled = native_loader.augment_raw_sample(raw, profile=False)
     assert native_sample.profile_timings_ms is not None
     assert native_sample.profile_timings_ms["value_native_transform_used"] == 1.0
-    assert native_sample.profile_timings_ms["value_isotropic_native_used"] == 1.0
-    assert native_sample.profile_timings_ms["value_anisotropic_native_used"] == 1.0
     assert torch.equal(native_sample.volume, native_unprofiled.volume)
 
-    monkeypatch.delattr(vc.volume, "anisotropic_blur_3d")
+    monkeypatch.delattr(vc.volume, "fiber3d_value_transform")
     auto_loader = _loader_with_mapping(
         {**common, "value_augmentation_backend": "auto"}
     )
     auto_sample = auto_loader.augment_raw_sample(raw, profile=True)
     assert auto_sample.profile_timings_ms is not None
-    assert auto_sample.profile_timings_ms["value_isotropic_native_used"] == 0.0
-    assert auto_sample.profile_timings_ms["value_anisotropic_native_used"] == 0.0
+    assert auto_sample.profile_timings_ms["value_native_transform_used"] == 0.0
     explicit_loader = _loader_with_mapping(
         {**common, "value_augmentation_backend": "native"}
     )

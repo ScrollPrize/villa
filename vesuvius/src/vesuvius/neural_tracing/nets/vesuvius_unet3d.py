@@ -401,6 +401,23 @@ class PixelShuffle3dUpsample(nn.Module):
         )
 
 
+class Trilinear3dUpsample(nn.Module):
+    """Shared channel projection then resize; decoder blocks provide spatial convs."""
+
+    def __init__(self, input_channels, output_channels, scale_factor, *, conv_op, bias):
+        super().__init__()
+        self.scale = tuple(maybe_convert_scalar_to_list(conv_op, scale_factor))
+        self.proj = conv_op(input_channels, output_channels, 1, bias=bias)
+
+    def forward(self, x, size=None):
+        x = self.proj(x)
+        size = tuple(size) if size is not None else tuple(
+            n * s for n, s in zip(x.shape[-3:], self.scale))
+        if tuple(x.shape[-3:]) == size:
+            return x
+        return F.interpolate(x, size=size, mode='trilinear', align_corners=False)
+
+
 class Encoder(nn.Module):
     """3D U-Net Encoder with BasicBlockD residual blocks and timestep conditioning."""
     def __init__(self,
@@ -561,9 +578,9 @@ class Decoder(nn.Module):
             f"n_conv_per_stage must have {n_stages_encoder - 1} entries"
 
         upsample_mode = str(upsample_mode).lower()
-        if upsample_mode not in {'transpose', 'pixelshuffle'}:
+        if upsample_mode not in {'transpose', 'pixelshuffle', 'trilinear'}:
             raise ValueError(
-                "upsample_mode must be 'transpose' or 'pixelshuffle', "
+                "upsample_mode must be 'transpose', 'pixelshuffle' or 'trilinear', "
                 f"got {upsample_mode!r}"
             )
         self.upsample_mode = upsample_mode
@@ -587,8 +604,9 @@ class Decoder(nn.Module):
             input_features_skip = encoder.output_channels[-(s + 1)]
             stride_for_transpconv = encoder.strides[-s]
             
-            if self.upsample_mode == 'pixelshuffle':
-                transpconvs.append(PixelShuffle3dUpsample(
+            if self.upsample_mode in {'pixelshuffle', 'trilinear'}:
+                upsample_class = PixelShuffle3dUpsample if self.upsample_mode == 'pixelshuffle' else Trilinear3dUpsample
+                transpconvs.append(upsample_class(
                     input_features_below,
                     input_features_skip,
                     stride_for_transpconv,
@@ -635,8 +653,9 @@ class Decoder(nn.Module):
         # lower-resolution models stop at an encoder skip and do not construct
         # the omitted high-resolution upsampling work.
         if self.output_stride == 1:
-            if self.upsample_mode == 'pixelshuffle':
-                self.final_transpconv = PixelShuffle3dUpsample(
+            if self.upsample_mode in {'pixelshuffle', 'trilinear'}:
+                upsample_class = PixelShuffle3dUpsample if self.upsample_mode == 'pixelshuffle' else Trilinear3dUpsample
+                self.final_transpconv = upsample_class(
                     encoder.output_channels[0],
                     encoder.output_channels[0],
                     encoder.strides[0],
@@ -659,7 +678,8 @@ class Decoder(nn.Module):
         seg_outputs = []
         
         for s in range(len(self.stages)):
-            x = self.transpconvs[s](lres_input)
+            x = (self.transpconvs[s](lres_input, size=skips[-(s + 2)].shape[-3:])
+                 if self.upsample_mode == 'trilinear' else self.transpconvs[s](lres_input))
             x = torch.cat((x, skips[-(s + 2)]), 1)
             x = self.stages[s](x, time_emb)
             

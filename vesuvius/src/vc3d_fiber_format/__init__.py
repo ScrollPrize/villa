@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
@@ -121,6 +121,18 @@ def _points(raw: Any, *, label: str) -> tuple[tuple[float, float, float], ...]:
             _number(value, label=f"{label}[{index}]") for value in point
         ))
     return tuple(result)
+
+
+def serialize_segment_metadata(segment: FiberTraceSegmentMetadata) -> dict[str, Any]:
+    """Inverse of the canonical V3 parser; derived outcome is not serialized."""
+    result = asdict(segment)
+    result.pop("outcome")
+    tags = result.pop("tags", ())
+    if tags:
+        result["tags"] = list(tags)
+    result.update(optimizer="native_fiber_trace3d", metadata_version=3, tracer_version=2)
+    parse_segment_metadata(result, version=4 if tags else 3)
+    return result
 
 
 def parse_segment_metadata(raw: Any, *, version: int = 3) -> FiberTraceSegmentMetadata:
@@ -282,8 +294,16 @@ def parse_vc3d_fiber_format(
         positions: list[Any] = []
         parsed_segments: list[FiberTraceSegmentMetadata | None] = []
         for index, control in enumerate(raw_controls):
-            if not isinstance(control, dict) or not set(control) <= {"position", "segment_to_next", "tags"}:
-                raise ValueError("version-3/4 control points must contain only position, segment_to_next and tags")
+            if not isinstance(control, dict) or not set(control) <= {
+                "position", "segment_to_next", "tags", "direction", "display_normal", "display_normal_source"
+            }:
+                raise ValueError("version-3/4 control point contains unknown fields")
+            # Validate editor hints without changing reference geometry or span eligibility.
+            for key in ("direction", "display_normal"):
+                if key in control:
+                    _points([control[key]], label=f"control point {key}")
+            if "display_normal_source" in control and not isinstance(control["display_normal_source"], str):
+                raise ValueError("control point display_normal_source must be a string")
             if "position" not in control:
                 raise ValueError("version-3/4 control point is missing position")
             # Optional per-control-point tags (VC3D writes e.g. "kollesis_termination",

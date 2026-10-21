@@ -181,6 +181,7 @@ def test_runtime_cohort_does_not_create_vram_monitor(monkeypatch, tmp_path):
             events.append("join")
     monkeypatch.setattr(process_cohort, "ProcessCohort", Gated)
     monkeypatch.setattr(processes, "NvidiaMonitor", lambda *a, **k: pytest.fail("normal-training telemetry"))
+    (tmp_path / "unused").write_text("{}")
     broker = SimpleNamespace(frontier=0, effective_batch_size=5, dataset_metadata={})
     cal = MemoryCalibration(10, 10, 0, 0, 0, 1, ((1, 20),))
     cohort = cooperative_cohort.FiberCohort(config_path=tmp_path / "unused",
@@ -207,6 +208,7 @@ def test_calibration_constructor_failure_reaps_gated_workers(monkeypatch, tmp_pa
     def fail(*a, **kw):
         raise RuntimeError("monitor failed")
     monkeypatch.setattr(processes, "NvidiaMonitor", fail)
+    (tmp_path / "unused").write_text("{}")
     broker = SimpleNamespace(frontier=0, effective_batch_size=5, dataset_metadata={})
     with pytest.raises(RuntimeError, match="monitor failed"):
         cooperative_cohort.FiberCohort(config_path=tmp_path / "unused",
@@ -913,7 +915,7 @@ def test_real_paris4_coarse_output_supervision_and_visualization(tmp_path, strid
     state, writer, boundaries = _finish(path, physical=(2,))
     assert state["progress"]["step"] == 1
     assert boundaries[-1] == (1, "update")
-    assert torch.isfinite(torch.as_tensor(writer.scalars[("train/loss_total", 1)]))
+    assert torch.isfinite(torch.as_tensor(writer.scalars[("train/loss_total", 5)]))
     model = build_fiber_trace_3d_model(raw)
     # Native output avoids constructing unused high-resolution decoder stages.
     assert len(model.net.decoder.stages) == 2 - {1: 0, 2: 1, 4: 2}[stride]

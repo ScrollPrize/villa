@@ -24,6 +24,8 @@ from vesuvius.neural_tracing.fiber_trace_3d.training_state import cpu_clone
 def _config(tmp_path, *, device="cpu", depth=0, mode=None, start=0):
     raw = asdict(_real_paris4_loader(tmp_path).config)
     raw.pop("config_dir")
+    # output_stride is derived from the model, not an embedding setting.
+    raw["embedding"].pop("output_stride")
     raw["test_datasets"] = copy.deepcopy(raw["datasets"])
     raw["model"] = {"features_per_stage": [2, 4], "normalization": "none"}
     raw["training"] = {
