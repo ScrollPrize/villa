@@ -9,6 +9,7 @@
 #include <QWidget>
 
 #include "CWindow.hpp"
+#include "StatusDockPanelHost.hpp"
 
 // ---------------------------------------------------------------------------
 // ui.inspect: a read-only view of the main window through Qt's accessibility
@@ -60,6 +61,14 @@ QDockWidget* AgentBridgeServer::findDock(const QString& objectName) const
 }
 
 
+QWidget* AgentBridgeServer::dockBarPage(const QDockWidget* dock) const
+{
+    if (!_window || !_window->_statusDockPanelHost || !dock)
+        return nullptr;
+    return _window->_statusDockPanelHost->panelPage(dock);
+}
+
+
 QJsonArray AgentBridgeServer::docksJson() const
 {
     QJsonArray docks;
@@ -71,8 +80,11 @@ QJsonArray AgentBridgeServer::docksJson() const
         QJsonObject entry;
         entry["objectName"] = dock->objectName();
         entry["title"] = dockTitle(dock);
-        entry["visible"] = dock->isVisible();
+        // A dock in the bottom dock bar shows its content on a panel page.
+        QWidget* page = dockBarPage(dock);
+        entry["visible"] = page ? page->isVisible() : dock->isVisible();
         entry["floating"] = dock->isFloating();
+        entry["dockBar"] = page != nullptr;
         const QString workspace = workspaceIdFor(dock);
         entry["workspace"] = workspace.isEmpty() ? QJsonValue(QJsonValue::Null)
                                                  : QJsonValue(workspace);
@@ -104,8 +116,13 @@ QJsonObject AgentBridgeServer::handleUiInspect(const QJsonValue& params)
         }
         rootWidget = focus;
     } else if (splitAgentBridgeTarget(root, &kind, &name)) {
-        rootWidget = kind == QLatin1String("dock") ? static_cast<QWidget*>(findDock(name))
-                                                   : workspacePage(name);
+        if (kind == QLatin1String("dock")) {
+            QDockWidget* dock = findDock(name);
+            QWidget* page = dockBarPage(dock);
+            rootWidget = page ? page : static_cast<QWidget*>(dock);
+        } else {
+            rootWidget = workspacePage(name);
+        }
         if (!rootWidget) {
             QJsonObject data;
             data["kind"] = kind;

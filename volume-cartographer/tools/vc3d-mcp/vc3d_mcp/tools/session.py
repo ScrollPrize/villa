@@ -72,7 +72,9 @@ async def vc3d_screenshot(
     capture part of it; clipped to the target, -32602 when entirely outside.
     reveal: when the target is hidden (another workspace tab, or a closed
     dock), switch to its workspace and show its dock just for this capture,
-    then put the tab, the dock layout and keyboard focus back. A viewer
+    then put the tab, the dock layout and keyboard focus back. A dock in the
+    bottom dock bar is captured as its panel: reveal opens that panel and
+    then reopens or closes the panel as it was. A viewer
     revealed this way may still be drawing its tiles, so its image can lag;
     the person at the screen sees a brief switch. A target in a hidden
     floating dock is refused (-32009) rather than opened as a window.
@@ -124,7 +126,9 @@ async def vc3d_inspect_ui(
 
     root: "window" (the whole main window), "dock:<objectName>" (one dock;
     the result's "docks" list gives every dock's objectName, title,
-    visibility and workspace), "workspace:<id>" (one workspace tab, such as
+    visibility, whether it lives in the bottom dock bar ("dockBar", read
+    through its panel, open or not) and workspace), "workspace:<id>" (one
+    workspace tab, such as
     "workspace:spiral"), or "focused" (the widget with keyboard focus).
     depth: levels below root to expand (0..64, default 8); deeper nodes carry
     "childrenOmitted": true. Unnamed layout containers are skipped, so

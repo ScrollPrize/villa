@@ -794,12 +794,28 @@ def check_ui_inspect(client: BridgeClient, results: Results) -> None:
         if not window.get("docks"):
             failures.append("no docks listed")
         visible_docks = [d for d in window.get("docks", []) if d.get("visible")]
-        if visible_docks:
+        if visible_docks and not visible_docks[0].get("dockBar"):
             dock_name = visible_docks[0]["objectName"]
             dock, _ = client.call(
                 "ui.inspect", {"root": f"dock:{dock_name}"}, timeout=RPC_TIMEOUT)
             if dock.get("tree", {}).get("objectName") != dock_name:
                 failures.append(f"dock root={dock.get('tree')}")
+        # The Segmentation dock lives in the bottom dock bar: its QDockWidget
+        # is an empty shell, so dock:dockWidgetSegmentation must read the
+        # panel page that holds its controls.
+        bar = {d.get("objectName"): d for d in window.get("docks", []) if d.get("dockBar")}
+        if "dockWidgetSegmentation" not in bar:
+            failures.append(f"Segmentation dock not in the dock bar: {sorted(bar)[:6]}")
+        else:
+            seg, _ = client.call(
+                "ui.inspect",
+                {"root": "dock:dockWidgetSegmentation", "depth": 64, "includeHidden": True},
+                timeout=RPC_TIMEOUT,
+            )
+            seg_nodes = list(_walk_nodes(seg.get("tree", {})))
+            if not any(n.get("role") == "SpinBox" and "value" in n for n in seg_nodes):
+                failures.append(
+                    f"Segmentation dock read {len(seg_nodes)} nodes, no spin box value")
         main, _ = client.call(
             "ui.inspect",
             {"root": "workspace:main", "depth": 64, "includeHidden": True},
@@ -847,7 +863,7 @@ def check_ui_inspect(client: BridgeClient, results: Results) -> None:
     results.record(
         "ui_inspect",
         not failures,
-        "window, dock and workspace roots read; redaction held" if not failures
+        "window, dock, dock bar and workspace roots read; redaction held" if not failures
         else "; ".join(failures[:4]),
     )
 
@@ -887,6 +903,31 @@ def check_screenshot_targets(client: BridgeClient, results: Results) -> None:
         visible = [d for d in docks.get("docks", []) if d.get("visible")]
         if visible:
             capture({"target": f"dock:{visible[0]['objectName']}"})
+        # A closed dock in the bottom dock bar, revealed twice: the second
+        # reveal of the same dock is where showing and hiding its empty dock
+        # shell used to take the dock off the bar (-32009 from then on).
+        closed = [d["objectName"] for d in docks.get("docks", [])
+                  if d.get("dockBar") and not d.get("visible")]
+        if not closed:
+            failures.append("no closed dock-bar dock to reveal")
+        else:
+            name = ("dockWidgetSegmentation" if "dockWidgetSegmentation" in closed
+                    else closed[0])
+            for attempt in (1, 2):
+                shot = capture({"target": f"dock:{name}", "reveal": True})
+                if (shot.get("revealed") is not True or shot.get("width", 0) < 64
+                        or shot.get("height", 0) < 64):
+                    failures.append(f"dock-bar reveal {attempt} of {name}: {shot}")
+            after, _ = client.call("ui.inspect", {"depth": 0}, timeout=RPC_TIMEOUT)
+            entry = next((d for d in after.get("docks", []) if d.get("objectName") == name), {})
+            if entry.get("visible") or not entry.get("dockBar"):
+                failures.append(f"{name} after reveal: {entry}")
+            try:
+                capture({"target": f"dock:{name}"})
+                failures.append(f"closed panel of {name} captured without reveal")
+            except BridgeError as error:
+                if error.code != -32009:
+                    failures.append(f"closed panel of {name}: code={error.code}")
         try:
             capture({"target": "dock:noSuchDock"})
             failures.append("unknown dock captured")
@@ -909,7 +950,7 @@ def check_screenshot_targets(client: BridgeClient, results: Results) -> None:
     results.record(
         "screenshot_targets",
         not failures,
-        "region, dock, workspace and reveal captures behaved" if not failures
+        "region, dock, dock bar, workspace and reveal captures behaved" if not failures
         else "; ".join(failures[:4]),
     )
 

@@ -376,8 +376,8 @@ dialog.
 
 `ui.inspect` returns a read-only tree rooted at `window`, `focused`,
 `dock:<objectName>`, or `workspace:<id>`, plus the list of docks
-(`objectName`, `title`, `visible`, `floating`, `workspace`) and the
-workspaces. The tree is read from Qt's accessibility interfaces, the model a
+(`objectName`, `title`, `visible`, `floating`, `dockBar`, `workspace`) and
+the workspaces. The tree is read from Qt's accessibility interfaces, the model a
 screen reader uses, so roles, names, values, and states are Qt's own. Nodes
 report `role` (a `QAccessible::Role` name such as `SpinBox` or
 `EditableText`), `path`, `enabled`, `visible`, and where they apply `class`,
@@ -398,6 +398,12 @@ is; they are not a stable contract.
 - Other top-level windows, including dialogs such as Settings, are never
   entered. A floating dock is read through `dock:<objectName>`. `focused`
   requires the focus widget to belong to the main window (-32007 otherwise).
+- Most docks of the main workspace live in the bottom dock bar: their
+  `QDockWidget` is an empty hidden shell and their content sits on the panel
+  that opens above the dock's bar button. For these `dockBar` is true,
+  `visible` says whether that panel is open on this dock, and
+  `dock:<objectName>` reads the panel page (title row and content), open or
+  not.
 - A text entry (line edit, text edit, editable combo box) reports no value
   when its echo mode hides input or when its name, row label, placeholder,
   tooltip, or object name names a credential (password, passphrase, secret,
@@ -498,9 +504,13 @@ is; they are not a stable contract.
   It then hides those docks, restores the layout of their main windows,
   returns to the previous tab the same way, and gives keyboard focus back,
   also when the capture fails. A target inside a hidden floating dock returns
-  -32009, because showing it would open a separate window. `revealed` in the
-  result reports whether anything was switched or shown; a revealed viewer
-  may still be loading tiles.
+  -32009, because showing it would open a separate window. A dock in the
+  bottom dock bar is captured as its panel page; reveal opens that panel the
+  way its bar button does and afterwards reopens the panel that was open
+  before, or closes it. It never shows the empty dock shell, so the dock
+  keeps its bar button. A dock closed from the bar returns -32009.
+  `revealed` in the result reports whether anything was switched, shown or
+  opened; a revealed viewer may still be loading tiles.
 - Entries and labels that `ui.inspect` would withhold (see Inspection) are
   painted over in the image; `masked` counts them. This applies to every
   target, the whole window included, so a label showing a URL with a signed

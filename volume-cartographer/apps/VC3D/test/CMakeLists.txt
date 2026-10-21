@@ -162,6 +162,29 @@ vc_register_ctest(unified_browser_dialog test_unified_browser_dialog)
 set_tests_properties(unified_browser_dialog PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+add_executable(test_status_dock_panel_host
+    test_status_dock_panel_host.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/StatusDockPanelHost.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/StatusDockPanelHost.hpp)
+
+set_target_properties(test_status_dock_panel_host PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_status_dock_panel_host PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_status_dock_panel_host PRIVATE
+    vc_core
+    Qt6::Core
+    Qt6::Test
+    Qt6::Widgets)
+
+add_test(NAME status_dock_panel_host COMMAND test_status_dock_panel_host)
+vc_register_test_target(test_status_dock_panel_host)
+vc_register_ctest(status_dock_panel_host test_status_dock_panel_host)
+set_tests_properties(status_dock_panel_host PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 add_executable(test_spiral_reload_comparison
     test_spiral_reload_comparison.cpp)
 

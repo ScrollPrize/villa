@@ -175,6 +175,10 @@ private:
     // ui.inspect reports (AgentBridgeHandlers_ui.cpp).
     QDockWidget* findDock(const QString& objectName) const;
     QJsonArray docksJson() const;
+    // The panel page of a dock kept in the bottom dock bar
+    // (StatusDockPanelHost), where its content lives while the QDockWidget
+    // itself stays an empty hidden shell; nullptr for any other dock.
+    QWidget* dockBarPage(const QDockWidget* dock) const;
 
     // --- Observation (AgentBridgeObservation.cpp) ---
     // state.get's snapshot and revision, and the state.changed notification.

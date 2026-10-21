@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "CWindow.hpp"
+#include "StatusDockPanelHost.hpp"
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
@@ -904,8 +905,9 @@ QJsonObject AgentBridgeServer::handleSegmentsFetch(const QJsonValue& params)
 namespace {
 
 // What screenshot.capture's reveal changed: the workspace tab it left, the
-// keyboard focus it may have moved, the docks it showed, and the layout of
-// each main window that owns one of those docks.
+// keyboard focus it may have moved, the docks it showed, the layout of each
+// main window that owns one of those docks, and the dock bar panel it opened
+// with the panel that was open before.
 struct RevealRecord {
     bool tabSwitched = false;
     QString previousWorkspace;
@@ -913,8 +915,10 @@ struct RevealRecord {
     QPointer<QWidget> previousFocus;
     std::vector<QPointer<QDockWidget>> shownDocks;
     std::vector<std::pair<QPointer<QMainWindow>, QByteArray>> layouts;
+    QPointer<StatusDockPanelHost> dockBar;
+    QPointer<QDockWidget> previousPanel;
 
-    bool changed() const { return tabSwitched || !shownDocks.empty(); }
+    bool changed() const { return tabSwitched || !shownDocks.empty() || !dockBar.isNull(); }
 
     void showDock(QDockWidget* dock)
     {
@@ -939,13 +943,24 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     const bool reveal = p.value("reveal").toBool(false);
 
     QWidget* widget = nullptr;
+    // A dock kept in the bottom dock bar is captured through its panel page.
+    QDockWidget* barDock = nullptr;
     QString kind;
     QString name;
     if (target.isEmpty() || target == QLatin1String("window")) {
         widget = _window;
     } else if (splitAgentBridgeTarget(target, &kind, &name)) {
-        widget = kind == QLatin1String("dock") ? static_cast<QWidget*>(findDock(name))
-                                               : workspacePage(name);
+        if (kind == QLatin1String("dock")) {
+            QDockWidget* dock = findDock(name);
+            if (QWidget* page = dockBarPage(dock)) {
+                widget = page;
+                barDock = dock;
+            } else {
+                widget = dock;
+            }
+        } else {
+            widget = workspacePage(name);
+        }
         if (!widget) {
             QJsonObject data;
             data["kind"] = kind;
@@ -974,6 +989,12 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     RevealRecord revealed;
     QTabWidget* tabs = _window ? _window->_workspaceTabs : nullptr;
     auto restoreReveal = [&]() {
+        if (revealed.dockBar) {
+            if (revealed.previousPanel)
+                revealed.dockBar->expandDock(revealed.previousPanel);
+            else
+                revealed.dockBar->collapsePanel();
+        }
         for (auto it = revealed.shownDocks.rbegin(); it != revealed.shownDocks.rend(); ++it) {
             if (*it)
                 (*it)->hide();
@@ -997,7 +1018,23 @@ QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
     QRect area;
     int masked = 0;
     try {
-        if (reveal && !widget->isVisible()) {
+        if (reveal && !widget->isVisible() && barDock) {
+            // A dock in the bottom dock bar: open its panel as its bar button
+            // does. Its QDockWidget is an empty shell, and showing and hiding
+            // that shell would take the dock off the bar.
+            StatusDockPanelHost* bar = _window->_statusDockPanelHost;
+            revealed.previousFocus = _window->focusWidget();
+            revealed.previousPanel = bar->expandedDock();
+            if (!bar->expandDock(barDock)) {
+                QJsonObject data;
+                data["detail"] = QStringLiteral(
+                    "the dock \"%1\" has been closed, so it has no button in the "
+                    "dock bar to open").arg(barDock->objectName());
+                throw AgentBridgeError{-32009, "Capture target not revealable", data};
+            }
+            revealed.dockBar = bar;
+            QCoreApplication::sendPostedEvents(nullptr, QEvent::LayoutRequest);
+        } else if (reveal && !widget->isVisible()) {
             // Showing a hidden floating dock would open a window on the
             // person's desktop; refuse before changing anything.
             for (QWidget* w = widget; w && w != _window; w = w->parentWidget()) {
