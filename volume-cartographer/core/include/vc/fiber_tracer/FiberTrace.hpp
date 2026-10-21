@@ -440,6 +440,8 @@ struct FiberTraceOneWayRequest {
     // Default initialDirection is only a prediction-selection hint.
     // Explicit annotations fix the signed first step instead.
     bool fixInitialDirection = false;
+    // Oldest to newest directional prior; does not add points or consume steps.
+    std::vector<cv::Vec3d> initialStepDirections;
 };
 
 struct FiberTraceOneWayResult {
@@ -622,7 +624,12 @@ struct CandidateScoreDebug {
     const FiberTraceConfig& config,
     const vc::lasagna::NormalSampler* normalSampler = nullptr,
     const FiberTraceProgressCallback& progress = {},
-    bool fixInitialDirection = false);
+    bool fixInitialDirection = false,
+    // Trace-coordinate point, cumulative loss and one-based step. Returning
+    // false stops after this point. Only irrevocable points are reported,
+    // excluding the seed, before optional final length clipping.
+    const std::function<bool(const cv::Vec3d&, double, int)>& committedStep = {},
+    const std::vector<cv::Vec3d>& initialStepDirections = {});
 
 // Fraction of a segment's start-to-target distance that bounds the endpoint
 // acceptance threshold for that segment. The fixed threshold

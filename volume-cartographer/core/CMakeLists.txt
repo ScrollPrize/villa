@@ -223,6 +223,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberLocalScoring.cpp
     src/fiber_tracer/FiberPaths.cpp
     src/fiber_tracer/FiberReplayMetric.cpp
+    src/fiber_tracer/FiberReverseConsistency.cpp
     src/fiber_tracer/PolylineGeometry.cpp
     src/fiber_tracer/FiberletStorage.cpp
     src/fiber_tracer/FiberletDataset.cpp
