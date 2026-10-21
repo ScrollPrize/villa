@@ -1,49 +1,30 @@
 # vc_object_store
 
-A SQLite object database for geometry, revisioned metadata, and relationships.
-Includes native ingestion/export, spatial queries, relationship detectors, C++
-command-line tools, and a Python package. Storage and detectors build without
-volume-cartographer or Qt. CT-based detectors link vc_reader's C++ reader and
-structure-tensor normal implementation.
+A SQLite object database for geometry, revisioned metadata, and graph-like relationships for geometry data (meshes, pointlines, points) within the Vesuvius Challenge. The purpose of this database is to replace the current use of files for most vc workflows and centralize geometry object storage and metadata (including graph edges) and address the issue of carrying "provenence" or history of a given object. Allowing database views at timestamps provides the ability to simply timestamp when something such as a spiral fit is created and having later access to exactly the state of the object store at that time, removing any need for copied data or revision history stored at separate metadata files.  
 
-Shared C++ and Python geometry types represent point collections, fibers,
-tracks and patches independently of files and object identity. Snapshot views
-provide typed, bounded reads and checked sparse edits. See the
-[geometry API](docs/typed-geometry.md) for examples and lifetime rules.
+The object store imports geometry files (tifxyz, pcl, fiber, track) and stores them as binary chunks or tiles using sqlite blob storage. Once objects are imported, the object store contains tooling to discover geometric relationships between these objects and stores this edge information as traversable object metadata. The primary types of edges indicate that the linked objects lie on the same winding: 
 
-## Build
+- Patch to Patch
+- Fiber to Patch 
+- Fiber to Fiber
+- Track to Patch 
+- Track to Track
 
-Build from a villa checkout, with `vc_reader` beside this directory:
+PCL to Patch edges can be absolute winding, relative winding, or same-winding (which is the same as relative with a 0 delta along `wind_a`)
 
-```sh
-cmake -S . -B build -GNinja -DCMAKE_BUILD_TYPE=RelWithDebInfo
-ninja -C build
+Modifications to geometry are stored as the delta to the previous iteration and contain a timestamp. If the object requires modifications to its shape a "checkpoint" is created, and any later deltas for history refer to this checkpoint. "Point-in-time" database views can be recovered by simply providing the timestamp 
+
+```python
+view = store.revision_read_view_at(timestamp_us)
+
+view["objects"]       # Historical object records and geometry revision references
+view["relationships"] # Recorded relationships, with applicability flags
+view["selection"]     # Object UUID → selected revision UUID
 ```
 
-Dependencies: C++20 (C++23 for Python bindings), SQLite with R-tree support,
-OpenSSL Crypto, zstd, nlohmann-json, OpenCV core,
-libtiff and OpenMP. The native reader additionally needs libcurl, c-blosc and
-VC-Delta3D; its CMake build fetches the pinned codec if no installed package is
-available. `VC_OBJECT_STORE_READER_SOURCE` selects a different reader checkout.
+The object store can be used in place of tifxyz files, fiber jsons, track crossings/dbm files, and pcl jsons in any workflow where these are used and edit history is desired. The store contains the information necessary for any tool which works with these files to instead use the db. The object store can export these files after revision if this is needed. 
 
-For the storage library alone, disable `VC_OBJECT_STORE_BUILD_ADAPTERS` and
-`VC_OBJECT_STORE_BUILD_TOOLS`. This does not configure the reader or require
-OpenCV, TIFF, OpenMP, Python, or Qt.
-
-For Python, configure with `-DVC_OBJECT_STORE_BUILD_PYTHON=ON` and
-`-DPython_EXECUTABLE=/path/to/python`. The selected environment needs nanobind,
-NumPy, and pytest for the Python tests. Python 3.14+ is supported.
-
-```sh
-ninja -C build
-PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python \
-  /path/to/python -m pytest -q tests/python
-```
-
-Python packaging uses scikit-build-core. Build wheels from this monorepo checkout;
-the sibling native reader sources are required at build time. The installed wheel
-contains the native reader library, and does not require VC or a Python reader
-installation. CMake installation installs the CLIs, headers, and native libraries.
+The db has fast spatial queries through a persisted r-tree backed index with optional in-memory views for repeated queries. 
 
 ## Use
 
@@ -52,7 +33,6 @@ from vc_object_store import ObjectStore
 
 with ObjectStore.create("objects.vcobj", author="reviewer") as store:
     report = store.ingest_geometry_source("patch", "/data/patch")
-    assert not report["problems"], report["problems"]
 ```
 
 ```sh
