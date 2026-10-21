@@ -20,12 +20,16 @@ The normal training CLI's replacement by the latest unified owner is deferred
 until its GPU preparation and effective-batch dependencies are extracted;
 the old trainer has not been rewritten as an alternative integration.
 
-`geometry_backend` selects `auto`, `native` or `eager`. Native CPU generation
-fuses affine/inverse-smooth coordinates and validity using `vc.volume`;
+`geometry_backend` defaults to `eager`; `value_augmentation_backend` defaults to
+`torch`, preserving unchanged-config preprocessing independently of which
+native binding is installed. `geometry_backend` selects `auto`, `native` or
+`eager`. Native CPU generation fuses affine/inverse-smooth coordinates and
+validity using `vc.volume`;
 eager generation remains the reference and non-CPU fallback. `geometry_tile_depth`
 can bound the eager temporary grid. `value_augmentation_backend` selects
 `auto`, `native` or `torch`. Explicit native selection reports a missing or
-ineligible binding as an error; auto may use the existing fallback. Rebuild
+ineligible binding as an error; explicit `auto` selection may use the existing
+fallback and is therefore installation-dependent. Rebuild
 `vc_volume` to expose all three [native kernels](../../volume-cartographer/docs/native_training_kernels.md).
 
 Value operations keep the existing order: mask-aware normalization, contrast,
@@ -41,6 +45,10 @@ native cache before opening volumes and force one I/O, decode and sampling
 worker. Native CPU compute and Torch workers are single-threaded. Separate
 loader processes retain their own caches; this API does not imply a cross-process
 decoded cache.
+
+Remote VC3D volumes use the process-wide cache root configured by VC3D, just
+as before this extraction. The sampler's legacy `cache_root` argument is not a
+per-volume override for this backend; `Volume.open_url` accepts only the URL.
 
 The shared tensor bank keeps large volumes **and validity masks** out of queue
 payloads; only metadata and generation-checked descriptors cross the queues.

@@ -400,6 +400,9 @@
   or Torch backend without changing augmentation order or mask statistics.
 - Reusable 3D sample preparation exposes explicit native/eager geometry and
   native/Torch value backends, plus native I/O/decode/sampling thread knobs.
+  Defaults remain eager geometry and Torch value preparation; native and auto
+  require explicit selection so unchanged configs do not change preprocessing
+  with the installed binding.
   A source-tagged bounded worker owner retains per-source parsed loaders and
   shares generation-checked volume/mask slots between train and test views. Canonical
   sample IDs seed augmentation; queue ordinals never change sample semantics.

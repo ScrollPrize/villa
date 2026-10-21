@@ -1,8 +1,13 @@
 """CPU loading regressions extracted from ea829d388, plus shared-source integration."""
 from dataclasses import fields, replace
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
+import threading
 import time
 
 import numpy as np
@@ -12,7 +17,7 @@ import torch
 from tests.neural_tracing.test_fiber_trace_3d import _loader, _loader_with_mapping, _straight_fiber
 from vesuvius.neural_tracing.fiber_trace_2d.sampling import Vc3dCoordinateSampler
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
-    FiberTrace3DLoader, FiberTrace3DSharedTensorSlots, config_from_mapping,
+    FiberTrace3DConfig, FiberTrace3DLoader, FiberTrace3DSharedTensorSlots, config_from_mapping, load_config,
     _anisotropic_blur_3d, _gaussian_kernel1d, _normalize_image,
     collate_fiber_trace_3d_samples,
 )
@@ -101,7 +106,7 @@ def test_failed_sample_surfaces_and_owner_stops_without_leaking_slots():
     assert owner.pipeline.closed
 
 
-def test_real_paris4_loader_queue_matches_serial_native_path(tmp_path):
+def _real_paris4_loader(tmp_path):
     volume = os.environ.get("VC_QUEUE_TEST_VOLUME")
     fiber = os.environ.get("VC_QUEUE_TEST_FIBER")
     if not volume or not fiber:
@@ -144,7 +149,12 @@ def test_real_paris4_loader_queue_matches_serial_native_path(tmp_path):
         "augment_smooth_displacement_amplitude_zyx": [1., .75, .5],
         "augment_smooth_displacement_probability": 1.,
     })
-    loader = FiberTrace3DLoader(config)
+    return FiberTrace3DLoader(config)
+
+
+def test_real_paris4_loader_queue_matches_serial_native_path(tmp_path):
+    loader = _real_paris4_loader(tmp_path)
+    config = loader.config
     # Test uses the actual annotation at the selected local pyramid lattice,
     # not a translated synthetic line. No normals/manifests are fetched.
     raw = loader.load_raw_sample(0, sample_mode="flat", profile=True)
@@ -167,7 +177,112 @@ def test_real_paris4_loader_queue_matches_serial_native_path(tmp_path):
             owner.release(ticket)
     finally:
         owner.close()
-    print(f"real Paris4 queue: {fiber}; {volume}; exact train/test/train batches")
+    print(f"real Paris4 queue: {os.environ['VC_QUEUE_TEST_FIBER']}; "
+          f"{os.environ['VC_QUEUE_TEST_VOLUME']}; exact train/test/train batches")
+
+
+@pytest.mark.parametrize("selection", (None, "native", "auto"))
+def test_preprocessing_defaults_and_explicit_selection(tmp_path, selection):
+    raw = {"datasets": [{"base_volume_path": "unused", "fiber_paths": []}]}
+    if selection is not None:
+        raw.update(geometry_backend=selection, value_augmentation_backend=selection)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(raw))
+    configs = [config_from_mapping(raw), load_config(path)]
+    if selection is None:
+        configs.append(FiberTrace3DConfig(datasets=tuple(raw["datasets"])))
+    for config in configs:
+        assert config.geometry_backend == (selection or "eager")
+        assert config.value_augmentation_backend == (selection or "torch")
+
+
+def test_real_paris4_default_preprocessing_ignores_native_availability(tmp_path, monkeypatch):
+    import vc.volume
+
+    native_loader = _real_paris4_loader(tmp_path)
+    config = replace(native_loader.config, geometry_backend="eager", value_augmentation_backend="torch")
+    loader = FiberTrace3DLoader(config)
+    expected = loader.load_batch(0, sample_mode="flat", profile=True)
+    for name in ("generate_fiber3d_coords", "fiber3d_value_transform", "anisotropic_blur_3d"):
+        monkeypatch.delattr(vc.volume, name, raising=False)
+    actual = FiberTrace3DLoader(config).load_batch(0, sample_mode="flat", profile=True)
+    _assert_same_batch(actual, expected)
+    assert actual.profile_timings_ms["geometry_native_used"] == 0
+    assert actual.profile_timings_ms["value_native_transform_used"] == 0
+    assert actual.profile_timings_ms["value_anisotropic_native_used"] == 0
+
+
+@pytest.mark.parametrize("url,expected", (
+    ("http://example.invalid/ct.zarr", "http://example.invalid/ct.zarr"),
+    ("https://example.invalid/ct.zarr", "https://example.invalid/ct.zarr"),
+    ("s3://example-bucket/ct.zarr", "https://example-bucket.s3.amazonaws.com/ct.zarr"),
+))
+@pytest.mark.parametrize("cache_root", (None, "legacy-cache-suggestion"))
+def test_remote_sampler_uses_one_argument_open_url(monkeypatch, url, expected, cache_root):
+    import vc.volume
+
+    calls = []
+    sentinel = object()
+
+    class Volume:
+        @staticmethod
+        def open_url(url):
+            calls.append(url)
+            return sentinel
+
+    monkeypatch.setattr(vc.volume, "Volume", Volume)
+    sampler = Vc3dCoordinateSampler(url, level=0, cache_root=cache_root)
+    assert sampler.volume is sentinel
+    assert calls == [expected]
+
+
+def test_real_paris4_http_sampler_matches_local_binding(tmp_path):
+    # Serve actual cached CT; no public network or AWS authentication required.
+    loader = _real_paris4_loader(tmp_path)
+    root = Path(loader.config.datasets[0]["base_volume_path"])
+    cache_config = tmp_path / "vc-settings"
+    cache_config.mkdir()
+    cache = tmp_path / "remote-cache"
+    (cache_config / "cache.json").write_text(json.dumps({"version": 1, "root": str(cache)}))
+
+    class QuietHandler(SimpleHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), partial(QuietHandler, directory=str(root.parent)))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        # Isolate the process-wide cache before the native runtime opens it.
+        result = subprocess.run([sys.executable, "-c", """
+import json, sys
+import numpy as np
+from pathlib import Path
+from vesuvius.neural_tracing.fiber_trace_2d.sampling import Vc3dCoordinateSampler
+root, url, fiber, cache = sys.argv[1:]
+point = np.asarray(json.loads(Path(fiber).read_text())["control_points"][0]["position"], np.float32)
+coords = (point[::-1] * .5).reshape(1, 1, 3)
+valid = np.ones((1, 1), dtype=bool)
+options = dict(level=0, cache_root="legacy-unused", sample_threads=1,
+               io_threads=1, decode_threads=1, cache_budget_bytes=64 * 1024**2)
+local = Vc3dCoordinateSampler(root, **options).sample_coords(coords, valid)
+remote = Vc3dCoordinateSampler(url, **options)
+actual = remote.sample_coords(coords, valid)
+assert Path(remote.volume.remote_cache_root) == Path(cache)
+assert local.valid_mask.all() and np.count_nonzero(local.image)
+np.testing.assert_array_equal(actual.valid_mask, local.valid_mask)
+np.testing.assert_array_equal(actual.image, local.image)
+print("actual Paris4 HTTP/local samples identical; cache isolated")
+""", str(root), f"http://127.0.0.1:{server.server_port}/{root.name}",
+            os.environ["VC_QUEUE_TEST_FIBER"], str(cache)],
+            env={**os.environ, "VC3D_CONFIG_DIR": str(cache_config), "AWS_EC2_METADATA_DISABLED": "true"},
+            capture_output=True, text=True, timeout=45)
+        assert result.returncode == 0, result.stdout + result.stderr
+        print(result.stdout.strip())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 def _queue(slots=4):
     loader = _loader_with_mapping({"augment_enabled": False, "batch_size": 2,
@@ -472,7 +587,7 @@ def test_geometry_auto_prefers_native_and_falls_back_for_stale_binding(
 
     if not hasattr(vc.volume, "generate_fiber3d_coords"):
         pytest.skip("volume-cartographer binding lacks native Fiber3D geometry")
-    loader = _loader_with_mapping({})
+    loader = _loader_with_mapping({"geometry_backend": "auto"})
     record, _record_index, cp_index = loader.descriptor_for_sample_index(0)
     params = loader._sample_augment_params(record, cp_index, 0)
     native_timings: dict[str, float] = {}

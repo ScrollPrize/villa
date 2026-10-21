@@ -85,8 +85,8 @@ class FiberTrace3DConfig:
     augment_anisotropic_blur_roll_degrees: float = 0.0
     round_source_to_chunk_boundaries: bool = True
     geometry_tile_depth: int = 0
-    geometry_backend: str = "auto"
-    value_augmentation_backend: str = "auto"
+    geometry_backend: str = "eager"
+    value_augmentation_backend: str = "torch"
     prefetch_workers: int = 16
     prefetch_sampler_workers: int = 2
     volume_cache_dir: str | None = None
@@ -701,9 +701,9 @@ def load_config(path: str | Path) -> FiberTrace3DConfig:
         ),
         round_source_to_chunk_boundaries=bool(raw.get("round_source_to_chunk_boundaries", True)),
         geometry_tile_depth=int(raw.get("geometry_tile_depth", 0)),
-        geometry_backend=str(raw.get("geometry_backend", "auto")).lower(),
+        geometry_backend=str(raw.get("geometry_backend", "eager")).lower(),
         value_augmentation_backend=str(
-            raw.get("value_augmentation_backend", "auto")
+            raw.get("value_augmentation_backend", "torch")
         ).lower(),
         prefetch_workers=_parse_worker_count(raw.get("prefetch_workers", 16), key="prefetch_workers"),
         prefetch_sampler_workers=_parse_worker_count(
@@ -3185,9 +3185,9 @@ def config_from_mapping(raw: dict[str, Any], *, config_dir: Path | None = None) 
         image_normalization=str(raw.get("image_normalization", "zscore")),
         round_source_to_chunk_boundaries=bool(raw.get("round_source_to_chunk_boundaries", True)),
         geometry_tile_depth=int(raw.get("geometry_tile_depth", 0)),
-        geometry_backend=str(raw.get("geometry_backend", "auto")).lower(),
+        geometry_backend=str(raw.get("geometry_backend", "eager")).lower(),
         value_augmentation_backend=str(
-            raw.get("value_augmentation_backend", "auto")
+            raw.get("value_augmentation_backend", "torch")
         ).lower(),
         prefetch_workers=int(raw.get("prefetch_workers", 16)),
         prefetch_sampler_workers=_parse_worker_count(
