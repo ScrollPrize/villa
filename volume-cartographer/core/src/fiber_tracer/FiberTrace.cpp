@@ -3703,22 +3703,52 @@ public:
         }
     }
 
+    std::vector<const vc::lasagna::LasagnaChannelBinding*> regionBindings() const
+    {
+        std::vector<const vc::lasagna::LasagnaChannelBinding*> bindings;
+        for (const auto& option : options_)
+            for (const auto* binding : {&option.presence, &option.nx, &option.ny})
+                bindings.push_back(binding);
+        for (const auto& binding : embeddings_) bindings.push_back(&binding);
+        for (const auto& binding : width_) bindings.push_back(&binding);
+        return bindings;
+    }
+
+    std::shared_ptr<vc::render::PinnedChunkRegion> pinRegion(
+        const cv::Vec3d& lo, const cv::Vec3d& hi) const
+    {
+        for (int axis = 0; axis < 3; ++axis)
+            if (!std::isfinite(lo[axis]) || !std::isfinite(hi[axis]) || lo[axis] > hi[axis])
+                throw std::invalid_argument("invalid prediction pinning bounds");
+        const auto bindings = regionBindings();
+        std::vector<FiberPredictionChunkDependency> dependencies;
+        for (const auto* binding : bindings)
+            for (const auto& key : vc::lasagna::lasagnaRegionChunkKeys(*binding, lo, hi))
+                dependencies.push_back({binding->path, {key.iz, key.iy, key.ix}});
+        std::sort(dependencies.begin(), dependencies.end(), [](const auto& a, const auto& b) {
+            return a.arrayPath != b.arrayPath ? a.arrayPath < b.arrayPath : a.indexZYX < b.indexZYX;
+        });
+        dependencies.erase(std::unique(dependencies.begin(), dependencies.end()), dependencies.end());
+        if (readinessGate_ && !dependencies.empty()) readinessGate_(dependencies);
+        auto region = std::make_shared<vc::render::PinnedChunkRegion>();
+        for (const auto* binding : bindings) vc::lasagna::pinLasagnaRegion(*region, *binding, lo, hi);
+        region->markReady(this);
+        return region;
+    }
+
+    void requirePinnedOwner(const vc::render::PinnedChunkRegion& region) const
+    {
+        if (!region.ready(this))
+            throw std::invalid_argument("pinned region was not prepared by this prediction field");
+    }
+
     void setReadinessGate(FiberPredictionReadinessGate gate)
     {
         readinessGroups_.clear();
         if (gate) {
-            std::vector<const vc::lasagna::LasagnaChannelBinding*> bindings;
-            for (const auto& option : options_) {
-                for (const auto* binding : {&option.presence, &option.nx, &option.ny})
-                    bindings.push_back(binding);
-            }
             // Embeddings can belong to a different inference publication group.
             // Waiting for the prediction channels alone does not prove readiness.
-            for (const auto& binding : embeddings_)
-                bindings.push_back(&binding);
-            for (const auto& binding : width_)
-                bindings.push_back(&binding);
-            for (const auto* binding : bindings) {
+            for (const auto* binding : regionBindings()) {
                 auto group = std::find_if(readinessGroups_.begin(), readinessGroups_.end(), [&](const auto& candidate) {
                     // Exact equality: readiness must not merge near-but-different grids.
                     return candidate.binding.spacing == binding->spacing &&
@@ -3813,19 +3843,21 @@ public:
     }
 
     void sampleEmbeddings(const std::vector<cv::Vec3f>& points,
-                          std::vector<std::vector<float>>& values) const
+                          std::vector<std::vector<float>>& values,
+                          const vc::render::PinnedChunkRegion* region = nullptr) const
     {
         if (embeddings_.empty())
             throw std::runtime_error("embedding sampling was not enabled for prediction field");
-        vc::lasagna::sampleLasagnaVectorBatch(embeddings_, points, values);
+        vc::lasagna::sampleLasagnaVectorBatch(embeddings_, points, values, true, nullptr, region);
     }
 
-    void sampleWidths(const std::vector<cv::Vec3f>& points, std::vector<float>& widths) const
+    void sampleWidths(const std::vector<cv::Vec3f>& points, std::vector<float>& widths,
+                      const vc::render::PinnedChunkRegion* region = nullptr) const
     {
         if (width_.empty())
             throw std::runtime_error("width sampling was not enabled for prediction field");
         std::vector<std::vector<float>> values;
-        vc::lasagna::sampleLasagnaVectorBatch(width_, points, values, false, &options_.front().presence);
+        vc::lasagna::sampleLasagnaVectorBatch(width_, points, values, false, &options_.front().presence, region);
         widths.resize(values.size());
         for (size_t i = 0; i < values.size(); ++i)
             widths[i] = values[i].empty() ? 0 : values[i][0];
@@ -4077,7 +4109,8 @@ public:
         void* visitorContext,
         vc::lasagna::LasagnaCornerPointVisitor visitor,
         int lookaheadDepth,
-        FiberTraceProfile* profile) const
+        FiberTraceProfile* profile,
+        const vc::render::PinnedChunkRegion* region) const
     {
         std::vector<const vc::lasagna::LasagnaChannelCornerSampler*> samplers;
         if (!groupedCornerSamplersWithNormals(normalSampler, samplers))
@@ -4091,7 +4124,8 @@ public:
                 visitorContext,
                 visitor,
                 parallelThreads,
-                profile != nullptr);
+                profile != nullptr,
+                region);
         } catch (const std::invalid_argument&) {
             return false;
         }
@@ -4938,6 +4972,26 @@ void FiberPredictionField::setReadinessGate(FiberPredictionReadinessGate gate)
     impl_->setReadinessGate(std::move(gate));
 }
 
+std::shared_ptr<vc::render::PinnedChunkRegion> FiberPredictionField::pinRegion(
+    const cv::Vec3d& lo, const cv::Vec3d& hi) const
+{
+    return impl_->pinRegion(lo, hi);
+}
+
+void FiberPredictionField::sampleWidths(const std::vector<cv::Vec3f>& points,
+    std::vector<float>& widths, const vc::render::PinnedChunkRegion& region) const
+{
+    impl_->requirePinnedOwner(region);
+    impl_->sampleWidths(points, widths, &region);
+}
+
+void FiberPredictionField::sampleEmbeddings(const std::vector<cv::Vec3f>& points,
+    std::vector<std::vector<float>>& embeddings, const vc::render::PinnedChunkRegion& region) const
+{
+    impl_->requirePinnedOwner(region);
+    impl_->sampleEmbeddings(points, embeddings, &region);
+}
+
 FiberPredictionField::FiberPredictionField(const vc::lasagna::LasagnaDataset& dataset,
     const FiberPredictionFieldOptions& options)
     : impl_(std::make_unique<Impl>(dataset, options.maxCachedBytes, options.bindingMode,
@@ -5067,9 +5121,11 @@ bool FiberPredictionField::visitCornerBatchWithNormals(
     void* visitorContext,
     vc::lasagna::LasagnaCornerPointVisitor visitor,
     int lookaheadDepth,
-    FiberTraceProfile* profile) const
+    FiberTraceProfile* profile,
+    const vc::render::PinnedChunkRegion* pinnedRegion) const
 {
-    impl_->awaitPoints(volumePoints, profile);
+    if (pinnedRegion) impl_->requirePinnedOwner(*pinnedRegion);
+    else impl_->awaitPoints(volumePoints, profile);
     return impl_->visitCornerBatchWithNormals(
         normalSampler,
         volumePoints,
@@ -5077,7 +5133,8 @@ bool FiberPredictionField::visitCornerBatchWithNormals(
         visitorContext,
         visitor,
         lookaheadDepth,
-        profile);
+        profile,
+        pinnedRegion);
 }
 
 FiberPredictionSample FiberPredictionField::sample(

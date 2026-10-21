@@ -363,6 +363,16 @@ public:
     // Configure before concurrent sampling; empty keeps offline behavior.
     // The gate may be called concurrently and must not sample this field itself.
     void setReadinessGate(FiberPredictionReadinessGate gate);
+    // Await publication, then retain all prediction/auxiliary payloads in this
+    // inclusive working-coordinate box. Add other channels, seal, then share.
+    // Keep this field alive for the lifetime of the region.
+    [[nodiscard]] std::shared_ptr<vc::render::PinnedChunkRegion> pinRegion(
+        const cv::Vec3d& lo, const cv::Vec3d& hi) const;
+    void sampleWidths(const std::vector<cv::Vec3f>& points, std::vector<float>& widths,
+                      const vc::render::PinnedChunkRegion& region) const;
+    void sampleEmbeddings(const std::vector<cv::Vec3f>& points,
+                          std::vector<std::vector<float>>& embeddings,
+                          const vc::render::PinnedChunkRegion& region) const;
     FiberPredictionField(const vc::lasagna::LasagnaDataset& dataset,
                          const FiberPredictionFieldOptions& options);
     void sampleWidths(const std::vector<cv::Vec3f>& points, std::vector<float>& widths) const override;
@@ -415,7 +425,8 @@ public:
         void* visitorContext,
         vc::lasagna::LasagnaCornerPointVisitor visitor,
         int lookaheadDepth,
-        FiberTraceProfile* profile) const;
+        FiberTraceProfile* profile,
+        const vc::render::PinnedChunkRegion* pinnedRegion = nullptr) const;
     [[nodiscard]] FiberPredictionSample sample(
         const cv::Vec3d& volumePoint,
         const cv::Vec3d& referenceDirection) const override;

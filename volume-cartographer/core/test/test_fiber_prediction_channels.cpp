@@ -376,4 +376,102 @@ TEST_CASE("real cached fiber samples are identical with publication gating") {
     CHECK(dependencies>0);
     std::cout << "Real Paris4 readiness: " << points.size() << " points, " << dependencies
               << " dependencies in one gate; offline/live samples exact\n";
+    cv::Vec3d lo=points.front(),hi=lo;
+    std::vector<cv::Vec3f> floatPoints;
+    for (const auto& p : points) {
+        for (int axis=0;axis<3;++axis) {lo[axis]=std::min(lo[axis],p[axis]);hi[axis]=std::max(hi[axis],p[axis]);}
+        floatPoints.emplace_back(p[0],p[1],p[2]);
+    }
+    auto region=gated.pinRegion(lo,hi);
+    CHECK(calls==2);
+    region->seal();
+    std::vector<float> expectedWidths,actualWidths;
+    offline.sampleWidths(floatPoints,expectedWidths);
+    gated.sampleWidths(floatPoints,actualWidths,*region);
+    CHECK(actualWidths==expectedWidths);
+    CHECK(calls==2);
+    CHECK(region->bytes()>0);
+    std::cout << "Real Paris4 pinned widths exact; retained bytes=" << region->bytes() << '\n';
+}
+
+TEST_CASE("pinned prediction regions publish once and sample auxiliary data concurrently") {
+    Fixture fixture; fixture.auxiliary();
+    const auto dataset=fixture.dataset();
+    FiberPredictionField field(dataset,auxiliaryOptions()), other(dataset,auxiliaryOptions());
+    int calls=0;
+    field.setReadinessGate([&](const auto& dependencies) {++calls; CHECK(dependencies.size()==6);});
+    auto region=field.pinRegion({0,0,0},{1,1,1});
+    CHECK(calls==1);
+    std::vector<float> widths;
+    CHECK_THROWS(field.sampleWidths({{.5f,.5f,.5f}},widths,*region)); // seal before sharing
+    region->seal();
+    CHECK_THROWS(other.sampleWidths({{.5f,.5f,.5f}},widths,*region));
+    std::vector<std::future<void>> workers;
+    for (int i=0;i<4;++i) workers.push_back(std::async(std::launch::async,[&] {
+        std::vector<float> w;
+        std::vector<std::vector<float>> e;
+        field.sampleWidths({{.5f,.5f,.5f}},w,*region);
+        field.sampleEmbeddings({{.5f,.5f,.5f}},e,*region);
+        if (w.at(0)!=20 || std::abs(e.at(0).at(0)-std::sqrt(.5))>1e-6)
+            throw std::runtime_error("pinned samples differ");
+    }));
+    for (auto& worker:workers) worker.get();
+    CHECK(calls==1);
+    CHECK(region->bytes()>0);
+    CHECK_THROWS(field.pinRegion({1,0,0},{0,0,0}));
+    CHECK_THROWS(field.pinRegion({0,0,0},{std::numeric_limits<double>::infinity(),0,0}));
+    field.setReadinessGate([](const auto&) {throw std::runtime_error("cancelled");});
+    CHECK_THROWS(field.pinRegion({0,0,0},{1,1,1}));
+}
+
+TEST_CASE("explicit pinned fused visitor matches ordinary corners") {
+    Fixture fixture; fixture.auxiliary();
+    fixture.channel<uint8_t>("grad_mag",std::vector<uint8_t>(8,255),utils::ZarrDtype::uint8);
+    const auto dataset=fixture.dataset();
+    FiberPredictionField field(dataset,auxiliaryOptions());
+    vc::lasagna::LasagnaNormalSampler normals(dataset);
+    const std::vector<cv::Vec3f> points{{.5f,.5f,.5f},{.7f,.4f,.3f}};
+    struct Results {
+        std::array<std::vector<std::array<uint8_t,8>>,2> corners;
+        std::array<cv::Vec3f,2> fractions;
+        std::array<bool,2> valid;
+    } expected,actual;
+    const auto visitor=+[](void* ptr,size_t i,const cv::Vec3f& f,bool valid,
+                          std::span<const std::array<uint8_t,8>> corners) {
+        auto& out=*static_cast<Results*>(ptr);
+        out.corners[i].assign(corners.begin(),corners.end());out.fractions[i]=f;out.valid[i]=valid;
+    };
+    REQUIRE(field.visitCornerBatchWithNormals(normals,points,1,&expected,visitor,1,nullptr));
+    int calls=0;
+    field.setReadinessGate([&](const auto&) {++calls;});
+    auto region=field.pinRegion({0,0,0},{1,1,1});
+    normals.pinRegion(*region,{0,0,0},{1,1,1});
+    region->seal();
+    REQUIRE(field.visitCornerBatchWithNormals(normals,points,4,&actual,visitor,1,nullptr,region.get()));
+    CHECK(actual.corners==expected.corners);
+    CHECK(actual.fractions==expected.fractions);
+    CHECK(actual.valid==expected.valid);
+    CHECK(calls==1);
+}
+
+TEST_CASE("pinned sampling outside retained chunks fails instead of fetching") {
+    Fixture fixture; fixture.auxiliary();
+    for (const auto* name : {"presence","nx","ny","width"}) {
+        fs::remove_all(fixture.path/name);
+        utils::ZarrMetadata metadata;
+        metadata.version=utils::ZarrVersion::v2;
+        metadata.shape={8,8,8};metadata.chunks={2,2,2};
+        metadata.dtype=std::string(name)=="width" ? utils::ZarrDtype::float32 : utils::ZarrDtype::uint8;
+        metadata.fill_value=0;metadata.compressor_id.clear();
+        (void)utils::ZarrArray::create(fixture.path/name,metadata);
+    }
+    FiberPredictionFieldOptions options;options.enableWidth=true;
+    FiberPredictionField field(fixture.dataset(),options);
+    int calls=0;
+    field.setReadinessGate([&](const auto&) {++calls;});
+    auto region=field.pinRegion({0,0,0},{0,0,0});
+    region->seal();
+    std::vector<float> widths;
+    CHECK_THROWS_AS(field.sampleWidths({{6,6,6}},widths,*region),vc::render::PinnedRegionMiss);
+    CHECK(calls==1);
 }
