@@ -36,12 +36,28 @@ struct FiberMapRulerModel {
     double extentBottomSceneY = 0.0;
     double extentLeftSceneX = 0.0;
     double extentRightSceneX = 0.0;
+    // The kollesis seams (FiberMapKollesis.hpp), ascending in scene x: a
+    // tick each on the kollesis band, and between neighbours the sheet
+    // length. Empty hides the band.
+    struct KollesisMark {
+        // Scene x of the seam.
+        double xVx = 0.0;
+        // Sheet length to the next mark (voxels); NaN on the last.
+        double toNextVx = 0.0;
+        // Predicted from the sheet-length statistics rather than tagged.
+        bool predicted = false;
+    };
+    std::vector<KollesisMark> kollesis;
 };
 
 struct FiberMapRulerStyle {
     QColor background;
     QColor ink;
     QColor tick;
+    // The kollesis band's ticks (the map's kollesis yellow), and the ticks
+    // and lengths of predicted seams (the map's prediction amber).
+    QColor accent;
+    QColor accentPredicted;
 };
 
 // One axis of the Fiber Map, painted as an overlay in the view's foreground
@@ -54,6 +70,9 @@ struct FiberMapRulerStyle {
 //   SheetDistance - distance along the sheet from winding 0 (below the
 //                   floor); this is the scene x itself
 //   Height        - scroll height above the volume floor (left of the map)
+//   Kollesis      - a tick per kollesis seam and the sheet length between
+//                   neighbours (above the ceiling, stacked outside the
+//                   winding band; absent while the model has no seams)
 // The distance modes label in physical units when the voxel size is known and
 // in voxels otherwise; the tick step comes from a 1-2-5 ladder so that ticks
 // stay a readable distance apart at any zoom.
@@ -61,16 +80,27 @@ class FiberMapRuler
 {
 public:
     enum class Edge { Top, Left, Bottom };
-    enum class Mode { Windings, SheetDistance, Height };
+    enum class Mode { Windings, SheetDistance, Height, Kollesis };
 
     // Band thickness across the edge, in device-independent pixels.
     static int thicknessFor(Edge edge);
 
-    FiberMapRuler(QGraphicsView* view, Edge edge, Mode mode);
+    // stackLevel: how many bands sit between this one and the extent edge
+    // (0: against the edge). Bands on one edge stack outward from the map.
+    FiberMapRuler(QGraphicsView* view, Edge edge, Mode mode, int stackLevel = 0);
 
     void setModel(FiberMapRulerModel model);
     void setStyle(const FiberMapRulerStyle& style);
     void setFont(const QFont& font);
+    // How many bands with content stack outside this one on its edge, so
+    // that once the extent edge scrolls off and the stack clamps to the
+    // viewport the outer bands keep their place beyond this one.
+    void setStackDepth(int depth);
+    // Whether the band has anything to show for the current model (a
+    // kollesis band with no seams has not, and takes no room).
+    [[nodiscard]] bool hasContent() const;
+    [[nodiscard]] Edge edge() const { return _edge; }
+    [[nodiscard]] Mode mode() const { return _mode; }
 
     // Where the band lies for the current transform, in viewport
     // coordinates: against the extent edge when that is inside the viewport,
@@ -90,6 +120,7 @@ private:
     void paintWindings(QPainter& painter, const QRect& band);
     void paintSheetDistance(QPainter& painter, const QRect& band);
     void paintHeight(QPainter& painter, const QRect& band);
+    void paintKollesis(QPainter& painter, const QRect& band);
     // The unit caption at the far end of the band; returns the rect it took so
     // labels can stay clear of it.
     QRect paintCaption(QPainter& painter, const QRect& band, const QString& caption);
@@ -97,6 +128,8 @@ private:
     QGraphicsView* _view = nullptr;
     Edge _edge;
     Mode _mode;
+    int _stackLevel = 0;
+    int _stackDepth = 0;
     FiberMapRulerModel _model;
     FiberMapRulerStyle _style;
     QFont _font;

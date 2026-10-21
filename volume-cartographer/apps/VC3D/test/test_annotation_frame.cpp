@@ -39,6 +39,37 @@ class TestAnnotationFrame : public QObject
     Q_OBJECT
 
 private slots:
+    void focusBoundsSurvivePyramidSwitchAndRestore()
+    {
+        const auto full = deriveAnnotationFrame(
+            kSourceUm, 0, std::nullopt, std::nullopt, kSourceDims);
+        const auto level2 = deriveAnnotationFrame(
+            kSourceUm * 4, 2, std::nullopt, std::nullopt, dimsAtLevel(2));
+        const auto tagged = deriveAnnotationFrame(
+            kSourceUm * 4, 0, 4.0, kSourceUm, dimsAtLevel(2));
+        const Rect3D original{{10, 20, 30}, {100, 200, 300}};
+        const auto saved = vc3d::annotation::focusBoundsInAnnotationFrame(original, level2);
+        QVERIFY(saved.has_value());
+        QVERIFY(saved->low == cv::Vec3f(40, 80, 120));
+        QVERIFY(saved->high == cv::Vec3f(400, 800, 1200));
+        // Restoring on L0 must not interpret the saved L2 voxels as L0 voxels.
+        const auto restored = vc3d::annotation::focusBoundsInVolume(saved, full);
+        QVERIFY(restored.has_value());
+        QVERIFY(restored->low == saved->low);
+        QVERIFY(restored->high == saved->high);
+        for (const auto& frame : {level2, tagged}) {
+            const auto back = vc3d::annotation::focusBoundsInVolume(saved, frame);
+            QVERIFY(back.has_value());
+            QVERIFY(back->low == original.low);
+            QVERIFY(back->high == original.high);
+            const auto mapBounds = vc3d::annotation::focusBoundsInAnnotationFrame(back, frame);
+            QVERIFY(mapBounds->low == saved->low);
+            QVERIFY(mapBounds->high == saved->high);
+        }
+        QVERIFY(!vc3d::annotation::focusBoundsInVolume(saved, AnnotationFrame{}));
+        QVERIFY(!vc3d::annotation::focusBoundsInAnnotationFrame(original, AnnotationFrame{}));
+    }
+
     // A store sitting at its own level 0 with no tags is already the annotated
     // frame, so nothing is scaled.
     void plainStoreIsItsOwnFrame()

@@ -2,6 +2,7 @@
 #include "vc/core/util/S3AuthFallback.hpp"
 
 #include "utils/http_fetch.hpp"
+#include "utils/sftp_fetch.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -248,23 +249,34 @@ void defaultFetch(const std::string& sourceLocation,
                   bool discoverAwsCredentials)
 {
     const auto endpoint = vc::resolveRemoteUrl(sourceLocation);
-    auto details = makeRemoteClientDetails(
-        endpoint, explicitAuth, discoverAwsCredentials);
     auto anonymousDetails = makeRemoteClientDetails(
         endpoint, vc::HttpAuth{}, false);
-    utils::HttpClient authenticatedClient(std::move(details.config));
     utils::HttpClient anonymousClient(std::move(anonymousDetails.config));
-    vc::S3AuthFallback fallback(details.isS3, details.credentialsLoaded);
+    vc::DeferredAwsAuth deferredAuth(
+        explicitAuth,
+        endpoint.useAwsSigv4 && discoverAwsCredentials,
+        endpoint.awsRegion);
+    std::optional<RemoteClientDetails> authenticatedDetails;
+    std::unique_ptr<utils::HttpClient> authenticatedClient;
+    vc::S3AuthFallback fallback(
+        endpoint.useAwsSigv4, deferredAuth.available());
     auto result = fallback.request([&](bool anonymous) {
-        return anonymous
-            ? anonymousClient.get(endpoint.httpsUrl)
-            : authenticatedClient.get(endpoint.httpsUrl);
+        if (anonymous)
+            return anonymousClient.get(endpoint.httpsUrl);
+        if (!authenticatedClient) {
+            authenticatedDetails = makeRemoteClientDetails(
+                endpoint, deferredAuth.resolve(), false);
+            authenticatedClient = std::make_unique<utils::HttpClient>(
+                std::move(authenticatedDetails->config));
+        }
+        return authenticatedClient->get(endpoint.httpsUrl);
     });
     if (!result.response.ok()) {
+        const auto& failureDetails = result.usedAnonymous || !authenticatedDetails
+            ? anonymousDetails
+            : *authenticatedDetails;
         std::string message = fetchFailureMessage(
-            sourceLocation, endpoint,
-            result.usedAnonymous ? anonymousDetails : details,
-            result.response);
+            sourceLocation, endpoint, failureDetails, result.response);
         if (result.anonymousFailure) {
             message += " anonymous_attempt_http=" +
                 std::to_string(result.anonymousFailure->status_code);
@@ -314,6 +326,7 @@ std::string remoteFileCacheSource(std::string_view sourceLocation)
 {
     const auto suffix = sourceLocation.find_first_of("?#");
     auto source = std::string(sourceLocation.substr(0, suffix));
+    if (utils::is_sftp_url(source)) source = utils::canonical_sftp_url(source);
     while (!source.empty() && source.back() == '/')
         source.pop_back();
     if (source.empty())
@@ -348,12 +361,14 @@ std::filesystem::path remoteFileCachePath(std::string_view sourceLocation)
     const auto authority = std::string_view(source).substr(
         authorityStart,
         pathStart == std::string::npos ? std::string::npos : pathStart - authorityStart);
-    if (!validComponent(authority))
+    const auto cacheAuthority = utils::is_sftp_url(source)
+        ? utils::sftp_cache_authority(source) : std::string(authority);
+    if (!validComponent(cacheAuthority))
         throw std::invalid_argument("remote file cache source has an invalid authority");
 
     std::filesystem::path result = "remote_sources";
     result /= scheme;
-    result /= authority;
+    result /= cacheAuthority;
     if (pathStart == std::string::npos || pathStart + 1 == source.size())
         throw std::invalid_argument("remote file cache source requires an object path");
     std::string_view remaining(source.data() + pathStart + 1,

@@ -93,7 +93,7 @@ public:
     };
 
     struct FetchConcurrency {
-        // Number of physical source-read workers owned by this service.
+        // Number of physical remote-download workers owned by this service.
         std::size_t workerCapacity = 16;
         // Fixed admission limit, or the upper adaptive bound.
         std::size_t maxConcurrentReads = 16;
@@ -105,6 +105,10 @@ public:
         std::size_t decodedByteCapacity = 512ULL * 1024ULL * 1024ULL;
         std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget;
         FetchConcurrency fetchConcurrency;
+        std::size_t probeWorkerCapacity = 32;
+        std::size_t decodeWorkerCapacity = 8;
+        // Independent local encoded-source I/O; never network-adaptive.
+        std::size_t localReadWorkers = 16;
         std::optional<AdaptiveDownloadState> initialAdaptiveDownloadState;
         // Startup-only selection for remote-volume persistent caches. Sources
         // acquired from this service cannot change representation in place.
@@ -130,14 +134,21 @@ public:
         double fillValue,
         ChunkDtype dtype,
         ChunkCacheOptions options = {});
-    // Changes service-wide source-read admission in place. Running and queued
+    // Changes service-wide remote-download admission in place. Running and queued
     // work is neither cancelled nor restarted.
     void configureFetchConcurrency(std::size_t maxConcurrentReads,
                                    bool adaptive);
+    // Changes decoded-chunk work admission on the existing fixed worker pool.
+    // Running and queued work is retained.
+    void configureDecodeConcurrency(std::size_t maxConcurrentDecodes);
     // Changes the global decoded RAM ceiling in place. Sources and queued or
     // running work are preserved; reductions evict only decoded LRU entries.
     void configureDecodedByteCapacity(std::size_t decodedByteCapacity);
     FetchConcurrency fetchConcurrency() const;
+    std::size_t decodeConcurrency() const;
+    std::size_t probeWorkerCapacity() const;
+    std::size_t decodeWorkerCapacity() const;
+    std::size_t localReadWorkers() const noexcept;
     PersistentCacheEncoding persistentCacheEncoding() const noexcept;
     std::size_t sourceCount() const;
     bool invalidateSource(std::string_view sourceIdentity);
@@ -182,6 +193,9 @@ public:
     };
 
     struct Stats {
+        // Bytes retained by this source, before aggregation into the shared
+        // service budget.
+        std::size_t localDecodedBytes = 0;
         std::size_t decodedBytes = 0;
         std::size_t decodedByteCapacity = 0;
         std::size_t persistentCacheBytes = 0;
@@ -198,6 +212,13 @@ public:
         std::size_t remoteFetchesInFlight = 0;
         double remoteDownloadBytesPerSecond = 0.0;
         std::size_t pendingDecodeTasks = 0;
+        // Cumulative actual codec work. Cache hits containing already-decoded
+        // bytes do not increment these counters.
+        std::uint64_t decodeAttempts = 0;
+        std::uint64_t decodedChunks = 0;
+        std::uint64_t decodeInputBytes = 0;
+        std::uint64_t decodedChunkBytes = 0;
+        std::uint64_t decodeNanoseconds = 0;
         // Unresolved chunk requests (queued or executing), indexed by pyramid
         // level. Persistent-cache probes count while the requested chunk is
         // still unavailable to rendering.
@@ -249,6 +270,8 @@ public:
                             const ChunkRequestContext& request) override;
     ChunkResult getChunkIfCached(int level, int iz, int iy, int ix) override;
     ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override;
+    ChunkResult getChunkBlocking(int level, int iz, int iy, int ix,
+                                 const ChunkRequestContext& request) override;
     void prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset = 0) override;
     void prefetchChunks(const std::vector<ChunkKey>& keys,
                         bool wait,
@@ -280,6 +303,10 @@ public:
 
     Stats stats() const;
     void invalidate();
+    // Cancel this cache's queued tasks and wait for its private service stages
+    // and persistent writes to drain. Directly constructed generated caches
+    // own their service, so this cannot drain unrelated volume work.
+    void cancelPendingAndWait();
     void waitForPersistentWrites() const;
     // Finish queued/running chunk requests and their writes without invalidating
     // them. Call after the producer stops submitting requests, before shutdown.
@@ -350,6 +377,7 @@ private:
     struct Entry {
         EntryStatus status = EntryStatus::InFlight;
         std::shared_ptr<const std::vector<std::byte>> bytes;
+        std::shared_ptr<const DecodedChunkPayload> payload;
         std::string error;
         std::size_t decodedBytes = 0;
         bool persisted = false;
@@ -363,6 +391,7 @@ private:
         std::uint64_t decodeTaskId = 0;
         std::uint64_t budgetTouch = 0;
         bool backgroundDemand = false;
+        bool foregroundDemand = false;
         std::unordered_map<std::uint64_t, ViewDemandSlot> viewDemands;
         std::list<ChunkKey>::iterator lruIt;
     };
@@ -528,6 +557,7 @@ private:
         std::uint64_t nextSourceTransferSerial_ = 1;
         std::weak_ptr<ChunkRequestScheduler> probeScheduler_;
         std::weak_ptr<ChunkRequestScheduler> fetchScheduler_;
+        std::weak_ptr<ChunkRequestScheduler> localReadScheduler_;
         std::weak_ptr<ChunkRequestScheduler> decodeScheduler_;
         std::shared_ptr<ChunkRequestSelectionGate> schedulerSelectionGate_;
         std::shared_ptr<std::atomic<std::uint64_t>> activeViewId_;
@@ -551,6 +581,11 @@ private:
         std::atomic<std::int64_t> persistentCacheBytes_{0};
         std::atomic_bool persistentCacheScanInFlight_{false};
         std::atomic_size_t persistentWritesInFlight_{0};
+        std::atomic<std::uint64_t> decodeAttempts_{0};
+        std::atomic<std::uint64_t> decodedChunks_{0};
+        std::atomic<std::uint64_t> decodeInputBytes_{0};
+        std::atomic<std::uint64_t> decodedChunkBytes_{0};
+        std::atomic<std::uint64_t> decodeNanoseconds_{0};
         std::shared_ptr<PersistentZarrCacheBudget> persistentBudget_;
         std::shared_ptr<void> persistentLease_;
         std::string persistentCacheWarning_;
@@ -600,9 +635,16 @@ private:
         FetchContext context,
         std::shared_ptr<ChunkFetchResult> fetched,
         std::shared_ptr<PersistenceOperation> persistence = {});
+    static void recordDecodeMeasurement(
+        const std::shared_ptr<State>& state,
+        std::chrono::steady_clock::time_point started,
+        std::size_t inputBytes,
+        const ChunkFetchResult& result) noexcept;
     static void queueRemoteFetch(const std::shared_ptr<State>& state,
                                  const ChunkKey& key,
                                  FetchContext context);
+    static std::shared_ptr<ChunkRequestScheduler> sourceScheduler(
+        const State& state, const IChunkFetcher& fetcher);
     static void joinSourceTransferLocked(
         const std::shared_ptr<State>& state,
         const ChunkKey& key,
