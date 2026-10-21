@@ -58,7 +58,10 @@ vesuvius.surface_placement_audit --surface seg_a.obj seg_b/ --volume ct.zarr \
 `<name>.json` with the metrics below, `<name>.samples.csv` with one row per
 sample (`z y x nz ny nx patch offset contrast valid`, so the offsets can be
 loaded into a viewer at their positions), `aggregate.csv` with one row per
-surface, and `<name>.png` with `--plot` (offset as colour in two projections).
+surface, `<name>.png` with `--plot` (offset as colour in two projections),
+and the worst cells: `<name>.worst_cells.csv` (rank, centre `z y x`, points,
+median offset, worst first) plus `<name>.worst_cells.json`, the same cells as
+a VC3D point collection (`--worst-cells N`, default 50, 0 disables).
 
 | metric | meaning |
 | --- | --- |
@@ -76,6 +79,7 @@ surface, and `<name>.png` with `--plot` (offset as colour in two projections).
 | `sheet_fwhm_median` | half-maximum width of the located sheet, voxels |
 | `contrast_median` | median profile range |
 | `n_patches`, `patch_offset_*`, `patch_abs_gt_2_frac` | median offset per 32-voxel cell (30+ valid points): quantiles, range, and the share of cells more than 2 voxels off |
+| `n_worst_cells` | cells written to `<name>.worst_cells.*` (those more than 2 voxels off, capped at `--worst-cells`) |
 | `snap_remeasure_sd`, `snap_remeasure_abs_gt_2_frac` | control: each valid point moved to its located peak and measured again; the spread left is the precision of the peak location, not of the surface (0.5 voxels on Scroll 1) |
 | `tangent_absdiff_median_{2,4,8}`, `tangent_corr_{2,4,8}` | a second point 2, 4 and 8 voxels away in the tangent plane: median absolute difference of the two offsets, and their correlation. Agreement at 2 and disagreement at 8 means the surface misses the sheet at a scale below its own triangles; agreement at all three means a displaced surface |
 
@@ -93,6 +97,12 @@ surfaces with the same normal convention.
   with `--seed` fixed so the same points are measured.
 - Ranking the public segments of a scroll by how well they sit on the sheet,
   with `aggregate.csv`.
+- Fixing a segment in VC3D: load `<name>.worst_cells.json` in the Point
+  Collections panel, step through the points (worst first), pull the surface
+  back onto the sheet or regrow there, and rerun the audit with the same
+  `--seed` to see the cell leave the list. The points are in the surface's own
+  coordinate frame, so a surface audited at a downscaled level needs that
+  level open in VC3D.
 
 It measures distance to the nearest density peak, not winding identity: a
 surface that jumped cleanly onto the neighbouring sheet reads as well placed.

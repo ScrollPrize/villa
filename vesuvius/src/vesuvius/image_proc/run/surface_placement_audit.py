@@ -45,7 +45,7 @@ METRICS = (
     "offset_abs_gt_1_frac", "offset_abs_gt_2_frac", "offset_abs_gt_3_frac", "offset_at_limit_frac",
     "off_sheet_frac", "sheet_fwhm_median", "contrast_median",
     "n_patches", "patch_offset_q25", "patch_offset_median", "patch_offset_q75",
-    "patch_offset_range", "patch_abs_gt_2_frac",
+    "patch_offset_range", "patch_abs_gt_2_frac", "n_worst_cells",
     "snap_remeasure_sd", "snap_remeasure_abs_gt_2_frac",
     "tangent_absdiff_median_2", "tangent_absdiff_median_4", "tangent_absdiff_median_8",
     "tangent_corr_2", "tangent_corr_4", "tangent_corr_8",
@@ -300,6 +300,46 @@ def cell_ids(P: np.ndarray, size: float = 32.0) -> np.ndarray:
     """Spatial patch id: the ``size``-voxel cell each point falls in."""
     c = np.floor(P / size).astype(np.int64)
     return c[:, 0] * 10**10 + c[:, 1] * 10**5 + c[:, 2]
+
+
+def worst_cells(P: np.ndarray, off: np.ndarray, valid: np.ndarray, patch: np.ndarray,
+                threshold: float = 2.0, min_points: int = 30, limit: int = 50) -> list[dict[str, Any]]:
+    """The 32-voxel cells whose median offset exceeds ``threshold``, worst first.
+
+    Each entry carries the cell's mean sampled position (``center_zyx``), its sample count and
+    its median offset, so an annotator can go to the spot and pull the surface back on the
+    sheet. Cells with fewer than ``min_points`` valid samples are not judged, as in
+    ``summarize``.
+    """
+    out = []
+    for k in np.unique(patch[valid]):
+        sel = valid & (patch == k)
+        s = off[sel]
+        if len(s) < min_points:
+            continue
+        med = float(np.median(s))
+        if abs(med) > threshold:
+            out.append({"center_zyx": [float(v) for v in P[sel].mean(0)], "n": int(len(s)),
+                        "median_offset": med})
+    out.sort(key=lambda c: -abs(c["median_offset"]))
+    return out[:limit]
+
+
+def write_point_collection(path: str, name: str, cells: Sequence[dict[str, Any]]) -> None:
+    """Write cells as a VC3D point collection (``vc_pointcollections_json_version`` 1).
+
+    One collection named ``name``, one point per cell in VC3D's x, y, z order and the
+    surface's own coordinate frame; ``creation_time`` is the rank so the widget lists the
+    worst cell first. Loads from the Point Collections panel in VC3D.
+    """
+    points = {str(i): {"p": [c["center_zyx"][2], c["center_zyx"][1], c["center_zyx"][0]],
+                       "creation_time": i, "wind_a": None}
+              for i, c in enumerate(cells)}
+    doc = {"vc_pointcollections_json_version": "1",
+           "collections": {"0": {"name": name, "points": points,
+                                 "metadata": {"winding_is_absolute": False}, "color": [1.0, 0.0, 0.0]}}}
+    with open(path, "w") as f:
+        json.dump(doc, f, indent=1)
 
 
 def tangent_points(P: np.ndarray, N: np.ndarray, radius: float, rng: np.random.Generator) -> np.ndarray:
@@ -618,6 +658,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cache", metavar="DIR", help="keep every CT chunk read under DIR (.npy per chunk); "
                    "reruns against the same volume read from disk instead of the server")
     p.add_argument("--plot", action="store_true")
+    p.add_argument("--worst-cells", type=int, default=50, metavar="N",
+                   help="write up to N cells whose median offset exceeds 2 voxels, worst first, as "
+                        "<name>.worst_cells.csv and a VC3D point collection <name>.worst_cells.json "
+                        "(0 disables)")
     p.add_argument("--fail-on", action="append", default=[], metavar="METRIC=MAX",
                    help="exit 2 if any surface exceeds MAX for METRIC (e.g. offset_abs_gt_2_frac=0.5)")
     return p
@@ -689,6 +733,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                             f"{N[i,0]:.4f}", f"{N[i,1]:.4f}", f"{N[i,2]:.4f}", int(patch[i]),
                             "" if not valid[i] else f"{off[i]:.2f}",
                             "" if not np.isfinite(contrast[i]) else f"{contrast[i]:.1f}", int(valid[i])])
+        if a.worst_cells:
+            cells = worst_cells(P, off, valid, patch, limit=a.worst_cells)
+            with open(os.path.join(a.out, f"{name}.worst_cells.csv"), "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["rank", "z", "y", "x", "n", "median_offset"])
+                for i, c in enumerate(cells, 1):
+                    w.writerow([i, *(f"{v:.1f}" for v in c["center_zyx"]), c["n"], f"{c['median_offset']:+.2f}"])
+            write_point_collection(os.path.join(a.out, f"{name}.worst_cells.json"),
+                                   f"placement_audit {name}", cells)
+            m["n_worst_cells"] = len(cells)
         if a.plot:
             plot(P, off, valid, os.path.join(a.out, f"{name}.png"), name)
         rows.append(m)

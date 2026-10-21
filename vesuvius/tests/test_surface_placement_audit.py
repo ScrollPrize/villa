@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 
 import numpy as np
 import pytest
@@ -448,3 +449,25 @@ def test_profile_grid_is_symmetric_and_bounded():
     _, t, _ = spa.read_profiles(vol, P, N, half=8, step=1.5, sigma=1.0, workers=1)
     assert t.min() >= -8 and t.max() <= 8 and 0.0 in t
     assert np.allclose(t, -t[::-1])
+
+
+def test_worst_cells_point_collection_names_the_off_sheet_cells_in_vc3d_order(tmp_path, ct):
+    """An annotator fixes placement cell by cell in VC3D, so the export must name only the
+    cells that are off the sheet, worst first, with points in VC3D's x,y,z order."""
+    pts = grid_points(30.0, n=40, lo=4, hi=60)
+    pts[pts[:, 0] >= 32, 2] = 34.0                 # x >= 32 half sits 4 voxels above the sheet
+    obj = str(tmp_path / "half.obj")
+    write_obj(obj, pts, np.tile([0.0, 0.0, 1.0], (len(pts), 1)))
+    rc, out, rows = run(tmp_path, ct, [obj], "--samples", "4000", "--worst-cells", "10")
+    cells = list(csv.DictReader(open(os.path.join(out, "half.worst_cells.csv"))))
+    assert cells and all(float(c["x"]) >= 32 for c in cells)
+    meds = [abs(float(c["median_offset"])) for c in cells]
+    assert meds == sorted(meds, reverse=True) and min(meds) > 2
+    doc = json.load(open(os.path.join(out, "half.worst_cells.json")))
+    assert doc["vc_pointcollections_json_version"] == "1"
+    (col,) = doc["collections"].values()
+    assert col["name"] == "placement_audit half"
+    p0 = col["points"]["0"]["p"]
+    assert p0[0] == pytest.approx(float(cells[0]["x"]), abs=0.1)
+    assert p0[2] == pytest.approx(34.0, abs=1.0)        # z last, the shifted half
+    assert int(rows[0]["n_worst_cells"]) == len(cells)
