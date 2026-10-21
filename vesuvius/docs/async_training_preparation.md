@@ -8,8 +8,10 @@ a dedicated CUDA stream while the caller trains on the preceding batch.
 This extraction does not switch the training CLI to a new loading path, change
 augmentation parameters, or alter model/loss behavior. Optional
 [GPU value augmentation](gpu_value_augmentation.md) can run on the preparation
-stream. Effective-batch accumulation and the later trainer integration remain
-separate extraction stages. The current mask-aware CPU augmentation is unchanged.
+stream. [Fixed effective-batch accumulation](effective_batch_accumulation.md)
+provides the one-backward utility and canonical batch mapping. Geometry-count
+staging and the later trainer integration remain separate stages. The current
+mask-aware CPU augmentation is unchanged.
 
 ## API and ownership
 
