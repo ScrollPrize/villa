@@ -10,6 +10,27 @@ import numpy as np
 from torch.utils.data import Sampler
 
 
+def split_labeled_indices(labeled_indices, train_fraction, min_train_size):
+    """Split a shuffled labeled pool into disjoint train and validation lists."""
+    train_fraction = float(train_fraction)
+    if not 0.0 <= train_fraction <= 1.0:
+        raise ValueError(
+            f"tr_val_split must be between 0 and 1, got {train_fraction}."
+        )
+
+    split = int(np.floor(train_fraction * len(labeled_indices)))
+    train_indices = list(labeled_indices[:split])
+    val_indices = list(labeled_indices[split:])
+    if len(train_indices) < min_train_size:
+        raise ValueError(
+            "Internal train/validation split leaves too few labeled training "
+            f"samples: need at least {min_train_size}, have "
+            f"{len(train_indices)}. Increase tr_val_split or provide more "
+            "labeled samples."
+        )
+    return train_indices, val_indices
+
+
 class TwoStreamBatchSampler(Sampler):
     """
     Iterate two sets of indices
