@@ -105,6 +105,13 @@ struct FiberTraceConfig {
     double endpointAcceptThresholdBaseVoxels = 20.0;
     double traceToBaseScale = 1.0;
     std::optional<double> baseVoxelSizeUm;
+    // Opt-in cosine-distance cost, added to the ordinary per-step loss.
+    double embeddingWeight = 0.0;
+    double embeddingHistorySpacingBaseVoxels = 32.0;
+    double embeddingHistoryWindowBaseVoxels = 256.0;
+    int embeddingHistoryCount = 8;
+    std::string embeddingHistoryFalloff = "uniform";
+    std::string embeddingReferenceMode = "mean"; // mean or best in the bounded history
     FiberTraceProfile* profile = nullptr;
 };
 
