@@ -3703,6 +3703,86 @@ public:
         }
     }
 
+    void setReadinessGate(FiberPredictionReadinessGate gate)
+    {
+        readinessGroups_.clear();
+        if (gate) {
+            std::vector<const vc::lasagna::LasagnaChannelBinding*> bindings;
+            for (const auto& option : options_) {
+                for (const auto* binding : {&option.presence, &option.nx, &option.ny})
+                    bindings.push_back(binding);
+            }
+            // Embeddings can belong to a different inference publication group.
+            // Waiting for the prediction channels alone does not prove readiness.
+            for (const auto& binding : embeddings_)
+                bindings.push_back(&binding);
+            for (const auto& binding : width_)
+                bindings.push_back(&binding);
+            for (const auto* binding : bindings) {
+                auto group = std::find_if(readinessGroups_.begin(), readinessGroups_.end(), [&](const auto& candidate) {
+                    // Exact equality: readiness must not merge near-but-different grids.
+                    return candidate.binding.spacing == binding->spacing &&
+                        candidate.binding.shapeZYX == binding->shapeZYX && candidate.binding.chunksZYX == binding->chunksZYX;
+                });
+                if (group == readinessGroups_.end()) {
+                    ReadinessGroup entry{*binding, *binding, {binding->path}};
+                    entry.levelBinding.spacing = 1.0;
+                    readinessGroups_.push_back(std::move(entry));
+                } else {
+                    group->paths.push_back(binding->path);
+                }
+            }
+        }
+        readinessGate_ = std::move(gate);
+    }
+
+    void awaitPoint(const cv::Vec3d& point) const
+    {
+        if (readinessGate_) awaitPoints(std::vector<cv::Vec3d>{point});
+    }
+
+    template <typename Point>
+    void awaitPoints(const std::vector<Point>& points, FiberTraceProfile* profile = nullptr) const
+    {
+        if (!readinessGate_ || points.empty()) return;
+        const auto planStart = profile ? TraceClock::now() : TraceClock::time_point{};
+        std::vector<FiberPredictionChunkDependency> dependencies;
+        std::vector<vc::lasagna::LasagnaChannelChunkKey> keys;
+        for (const auto& group : readinessGroups_) {
+            keys.clear();
+            for (const auto& p : points) {
+                vc::lasagna::appendLasagnaInterpolationChunkKeys(group.binding, cv::Vec3d(p[0], p[1], p[2]), keys);
+                // The optimized visitor divides float points by FLOAT
+                // spacing. Plan that exact coordinate too, using the same
+                // existing cube planner in level space. Promoting the
+                // original point to double alone misses boundary corners.
+                const cv::Vec3f levelPoint = cv::Vec3f(p[0], p[1], p[2]) / static_cast<float>(group.binding.spacing);
+                vc::lasagna::appendLasagnaInterpolationChunkKeys(group.levelBinding,
+                    cv::Vec3d(levelPoint[0], levelPoint[1], levelPoint[2]), keys);
+            }
+            vc::lasagna::deduplicateLasagnaChunkKeysInPlace(keys);
+            for (const auto& path : group.paths)
+                for (const auto& key : keys)
+                    dependencies.push_back({path, {key.z, key.y, key.x}});
+        }
+        std::sort(dependencies.begin(), dependencies.end(), [](const auto& a, const auto& b) {
+            return a.arrayPath != b.arrayPath ? a.arrayPath < b.arrayPath : a.indexZYX < b.indexZYX;
+        });
+        dependencies.erase(std::unique(dependencies.begin(), dependencies.end()), dependencies.end());
+        if (profile) {
+            profile->readinessPlanSeconds += elapsedSeconds(planStart);
+            profile->readinessPlanPoints += points.size();
+            profile->readinessPlanDependencies += dependencies.size();
+        }
+        if (!dependencies.empty()) readinessGate_(dependencies);
+    }
+
+    void requireOfflineStoredGrid() const
+    {
+        if (readinessGate_)
+            throw std::logic_error("stored-grid scan APIs require a completed offline prediction cache");
+    }
+
     [[nodiscard]] vc::lasagna::NormalPrefetchReport prefetchSamples(
         const std::vector<cv::Vec3d>& volumePoints) const
     {
@@ -4765,6 +4845,7 @@ public:
     {
         (void)storedGridInfo();
         const auto& option = options_[*canonicalOptionIndex_];
+        awaitStoredIndices(option, indicesZYX);
         samples.assign(indicesZYX.size(), {});
         const auto sampleOne = [&](size_t index, auto& resolvers) {
             const auto& zyx = indicesZYX[index];
@@ -4803,6 +4884,7 @@ public:
     {
         (void)storedGridInfo();
         const auto& option = options_[*canonicalOptionIndex_];
+        awaitStoredIndices(option, indicesZYX);
         samples.assign(indicesZYX.size(), {});
         const auto sampleOne = [&](size_t index, auto& presenceResolver) {
             const cv::Vec3d point = storedGridPoint(option, indicesZYX[index]);
@@ -4818,6 +4900,21 @@ public:
 
 private:
     std::vector<Option> options_;
+    void awaitStoredIndices(const Option& option,
+                            const std::vector<std::array<size_t, 3>>& indices) const
+    {
+        if (!readinessGate_) return;
+        std::vector<cv::Vec3d> points;
+        points.reserve(indices.size());
+        for (const auto& index : indices) points.push_back(storedGridPoint(option, index));
+        awaitPoints(points);
+    }
+    struct ReadinessGroup {
+        vc::lasagna::LasagnaChannelBinding binding, levelBinding;
+        std::vector<std::filesystem::path> paths;
+    };
+    std::vector<ReadinessGroup> readinessGroups_;
+    FiberPredictionReadinessGate readinessGate_;
     std::vector<vc::lasagna::LasagnaChannelBinding> embeddings_;
     std::vector<vc::lasagna::LasagnaChannelBinding> width_;
     bool sourceScaleExplicit_ = false;
@@ -4836,6 +4933,11 @@ FiberPredictionField::FiberPredictionField(
 
 FiberPredictionField::~FiberPredictionField() = default;
 
+void FiberPredictionField::setReadinessGate(FiberPredictionReadinessGate gate)
+{
+    impl_->setReadinessGate(std::move(gate));
+}
+
 FiberPredictionField::FiberPredictionField(const vc::lasagna::LasagnaDataset& dataset,
     const FiberPredictionFieldOptions& options)
     : impl_(std::make_unique<Impl>(dataset, options.maxCachedBytes, options.bindingMode,
@@ -4844,12 +4946,14 @@ FiberPredictionField::FiberPredictionField(const vc::lasagna::LasagnaDataset& da
 void FiberPredictionField::sampleWidths(const std::vector<cv::Vec3f>& points,
                                         std::vector<float>& widths) const
 {
+    impl_->awaitPoints(points);
     impl_->sampleWidths(points, widths);
 }
 
 void FiberPredictionField::sampleEmbeddings(const std::vector<cv::Vec3f>& points,
                                            std::vector<std::vector<float>>& embeddings) const
 {
+    impl_->awaitPoints(points);
     impl_->sampleEmbeddings(points, embeddings);
 }
 
@@ -4864,6 +4968,7 @@ FiberPredictionGridInfo FiberPredictionField::storedGridInfo() const
 
 FiberPresenceChunkScanReport FiberPredictionField::scanStoredPresenceChunks(int parallelThreads) const
 {
+    impl_->requireOfflineStoredGrid();
     return impl_->scanStoredPresenceChunks(parallelThreads);
 }
 
@@ -4882,6 +4987,7 @@ void FiberPredictionField::sampleStoredPresenceBatch(
 vc::lasagna::NormalPrefetchReport FiberPredictionField::prefetchSamples(
     const std::vector<cv::Vec3d>& volumePoints) const
 {
+    impl_->awaitPoints(volumePoints);
     return impl_->prefetchSamples(volumePoints);
 }
 
@@ -4891,6 +4997,9 @@ void FiberPredictionField::sampleBatch(
     int parallelThreads,
     std::vector<FiberPredictionSample>& samples) const
 {
+    if (volumePoints.size() != referenceDirections.size())
+        throw std::invalid_argument("fiber prediction batch points and reference directions size mismatch");
+    impl_->awaitPoints(volumePoints);
     impl_->sampleBatch(
         volumePoints,
         referenceDirections,
@@ -4906,6 +5015,9 @@ void FiberPredictionField::sampleBatch(
     std::vector<FiberPredictionSample>& samples,
     FiberTraceProfile* profile) const
 {
+    if (volumePoints.size() != referenceDirections.size())
+        throw std::invalid_argument("fiber prediction batch points and reference directions size mismatch");
+    impl_->awaitPoints(volumePoints, profile);
     impl_->sampleBatch(
         volumePoints,
         referenceDirections,
@@ -4921,6 +5033,9 @@ void FiberPredictionField::sampleBatch(
     std::vector<FiberPredictionSample>& samples,
     FiberTraceProfile* profile) const
 {
+    if (volumePoints.size() != referenceDirections.size())
+        throw std::invalid_argument("fiber prediction batch points and reference directions size mismatch");
+    impl_->awaitPoints(volumePoints, profile);
     impl_->sampleBatch(
         volumePoints,
         referenceDirections,
@@ -4936,6 +5051,7 @@ bool FiberPredictionField::sampleCornerBatchWithNormals(
     vc::lasagna::LasagnaCornerBatch* cornerScratch,
     FiberTraceProfile* profile) const
 {
+    impl_->awaitPoints(volumePoints, profile);
     return impl_->sampleCornerBatchWithNormals(
         normalSampler,
         volumePoints,
@@ -4953,6 +5069,7 @@ bool FiberPredictionField::visitCornerBatchWithNormals(
     int lookaheadDepth,
     FiberTraceProfile* profile) const
 {
+    impl_->awaitPoints(volumePoints, profile);
     return impl_->visitCornerBatchWithNormals(
         normalSampler,
         volumePoints,
@@ -4967,6 +5084,7 @@ FiberPredictionSample FiberPredictionField::sample(
     const cv::Vec3d& volumePoint,
     const cv::Vec3d& referenceDirection) const
 {
+    impl_->awaitPoint(volumePoint);
     return impl_->sample(volumePoint, referenceDirection);
 }
 
