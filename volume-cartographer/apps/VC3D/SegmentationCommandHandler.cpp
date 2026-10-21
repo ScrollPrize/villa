@@ -6035,8 +6035,14 @@ bool SegmentationCommandHandler::restoreSurfaceFromBackupImpl(const QString& seg
         }
     }
 
-    // The state being replaced becomes the newest backup first, so a restore
-    // can itself be undone from the same menu.
+    // With backups on, the state being replaced becomes the newest backup
+    // first, so a restore can itself be undone from the same menu; a full
+    // ring drops its oldest slot for it and the other slots move down by one.
+    // With backups off (QuadSurface::backupCount() is 0), or before the
+    // segment has its first x.tif, the snapshot does nothing and the
+    // replaced state is not kept.
+    const bool keepsReplaced = QuadSurface::backupCount() > 0 &&
+                               fs::exists(segmentDir / "x.tif");
     QString restoreError;
     const int copiedCount = vc3d::segment_files::restoreBackupFiles(
         backupDir, segmentDir,
@@ -6089,7 +6095,10 @@ bool SegmentationCommandHandler::restoreSurfaceFromBackupImpl(const QString& seg
             }
 
             emit statusMessage(
-                tr("Restored '%1' from backup %2 (%3 files)")
+                (keepsReplaced
+                     ? tr("Restored '%1' from backup %2 (%3 files); the replaced "
+                          "state is now the newest backup")
+                     : tr("Restored '%1' from backup %2 (%3 files)"))
                    .arg(segmentId).arg(backupIndex).arg(copiedCount),
                 5000);
         }
