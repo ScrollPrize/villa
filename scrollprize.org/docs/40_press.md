@@ -36,18 +36,25 @@ hide_table_of_contents: true
   />
 </head>
 
-import TOCInline from '@theme/TOCInline';
+import { PressContacts, PressFacts, PressMedia } from '@site/src/components/Press';
 
 # Press
 
-For press and media inquiries, please email [press@scrollprize.org](mailto:press@scrollprize.org).
+<PressContacts />
 
-To keep our public messaging accurate and consistent, only Vesuvius Challenge's Project Lead and co-founders are authorized to initiate contact with press and media on the project's behalf. You can find out who currently holds these roles on our [team page](/#team).
+## About Vesuvius Challenge
 
-We read every message and will do our best to get back to you.
+Vesuvius Challenge is an open science research organization reading the carbonized Herculaneum scrolls.
+Buried by the eruption of Mount Vesuvius in 79 AD, the scrolls are too fragile to open and unroll; we read them instead with high-resolution X-ray CT scans and AI, virtually unwrapping each sheet and recovering its ink.
+The work is done both by our in-house team of researchers and by a lively community, competing for monthly prizes anyone can enter.
+In 2023, the Grand Prize was awarded for the first passages ever read from inside a sealed scroll; in 2026, PHerc. 1667 became the [first Herculaneum scroll read end to end](/firstscroll).
 
-***
+<PressFacts />
 
-<TOCInline
-  toc={toc}
-/>
+## Images & videos
+
+Below is a representative selection of images and videos.
+Everything on this site is licensed [CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) unless otherwise noted, so you are welcome to use these or any other image on the site, with the credit "Vesuvius Challenge".
+For other uses or higher-resolution originals, email [press@scrollprize.org](mailto:press@scrollprize.org).
+
+<PressMedia />

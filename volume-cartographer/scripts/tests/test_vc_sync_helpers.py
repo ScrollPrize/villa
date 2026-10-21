@@ -541,20 +541,51 @@ class TestAutoMerge:
         stashed = [f for _, _, fs_ in os.walk(stash_root) for f in fs_]
         assert stashed == []  # probing writes nothing
 
-    def test_dry_run_reports_reason_without_base(self, manager):
+    @pytest.mark.parametrize('local_uuid', [None, test_fiber_merge.FIBER_UUID_A])
+    def test_uuid_adoption_without_base_is_deferred(self, manager, monkeypatch,
+                                                   local_uuid):
+        local = self.fiber([0, 0, 0, 0])
+        remote = {**copy.deepcopy(local), 'uuid': test_fiber_merge.FIBER_UUID_B}
+        if local_uuid is not None:
+            local['uuid'] = local_uuid
+        path, local_path, info = self.setup_scenario(
+            manager, monkeypatch, local, local, remote)
+        monkeypatch.setattr(manager, '_load_base', lambda *args: None)
+        before = open(local_path).read()
+
+        dry = manager._attempt_auto_merge(path, info, s3_info(10, 'opaque'),
+                                         dry_run=True)
+        assert dry['merged_doc']['uuid'] == remote['uuid']
+        assert open(local_path).read() == before
+        assert not os.path.exists(manager._merge_tmp_path(path, '.remote'))
+
+        plan = manager._attempt_auto_merge(path, info, s3_info(10, 'opaque'))
+        assert plan['merged_doc']['uuid'] == remote['uuid']
+        assert open(local_path).read() == before
+        manager._apply_pending_merges([(path, plan)])
+        assert json.load(open(local_path))['uuid'] == remote['uuid']
+
+    def test_dry_run_reports_reason_without_base(self, manager, monkeypatch):
         doc = TestLinkConsistency.fiber('n.json', TestLinkConsistency.CPS_A)
         path = 'fibers/n.json'
         write_local(manager, path, json.dumps(doc))
+        remote = {**copy.deepcopy(doc), 'tags': ['remote edit']}
+        monkeypatch.setattr(manager, '_fetch_remote_json', lambda p: (remote, None))
         info = local_info(manager, path)
         outcome = manager._attempt_auto_merge(path, info, s3_info(10, 'opaque-1'),
                                               dry_run=True)
         assert outcome == {'reason': 'no merge base'}
         assert manager._attempt_auto_merge(path, info, s3_info(10, 'opaque-1')) is None
 
-    def test_conflicting_merge_stashes_all_three(self, manager, monkeypatch):
+    @pytest.mark.parametrize('migrated_uuids', [False, True])
+    def test_conflicting_merge_stashes_all_three(self, manager, monkeypatch,
+                                               migrated_uuids):
         base = self.fiber([0, 0, 0, 0])
         local = self.fiber([0, 5, 0, 0], generation=2)   # both move CP1
         remote = self.fiber([0, -5, 0, 0], generation=2)
+        if migrated_uuids:
+            local['uuid'] = test_fiber_merge.FIBER_UUID_A
+            remote['uuid'] = test_fiber_merge.FIBER_UUID_B
         path, local_path, info = self.setup_scenario(
             manager, monkeypatch, base, local, remote)
         before = open(local_path).read()

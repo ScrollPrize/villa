@@ -9,6 +9,7 @@
 #include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "VCSettings.hpp"
+#include "PythonExecutable.hpp"
 #include "ViewerManager.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
@@ -42,11 +43,14 @@
 #include <QPainterPath>
 #include <QPen>
 #include <QProgressBar>
+#include <QPlainTextEdit>
 #include <QRect>
 #include <QResizeEvent>
 #include <QScopeGuard>
 #include <QSignalBlocker>
 #include <QSettings>
+#include <QFileDialog>
+#include <QFileInfo>
 #include <QShortcut>
 #include <QSizePolicy>
 #include <QSplitter>
@@ -773,6 +777,76 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _fiberInferenceDatasetMenu->setToolTipsVisible(true);
     _fiberInferenceDatasetMenu->menuAction()->setToolTip(
         tr("Select the fiber inference dataset used for line annotation."));
+    {
+        // Fiber model backend: the neural fiber-follow model (a vesuvius
+        // checkpoint, run by the Python environment VC3D was started from)
+        // instead of the native tracer, for extrapolation and traced spans.
+        auto* fiberFollowMenu = annotationMenu->addMenu(tr("Fiber follow model"));
+        fiberFollowMenu->setToolTipsVisible(true);
+        _fiberFollowEnabledAction = fiberFollowMenu->addAction(tr("Use for the Fiber model"));
+        _fiberFollowEnabledAction->setCheckable(true);
+        _fiberFollowEnabledAction->setToolTip(
+            tr("Trace and extrapolate Fiber model lines with the fiber-follow model. "
+               "Uses the default Hugging Face model unless a checkpoint override is selected."));
+        connect(_fiberFollowEnabledAction, &QAction::toggled, this, [this](bool checked) {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            settings.setValue(vc3d::settings::line_annotation::FIBER_FOLLOW_ENABLED, checked);
+            updateFiberFollowMenu();
+            emit fiberFollowSettingsChanged();
+        });
+        auto* confidenceRow = new QWidget(fiberFollowMenu);
+        auto* confidenceLayout = new QHBoxLayout(confidenceRow);
+        confidenceLayout->setContentsMargins(12, 4, 12, 4);
+        confidenceLayout->addWidget(new QLabel(tr("Confidence"), confidenceRow));
+        _fiberFollowConfidenceSpin = new QDoubleSpinBox(confidenceRow);
+        _fiberFollowConfidenceSpin->setObjectName(QStringLiteral("fiberFollowConfidenceSpin"));
+        _fiberFollowConfidenceSpin->setRange(0.0, 1.0);
+        _fiberFollowConfidenceSpin->setDecimals(2);
+        _fiberFollowConfidenceSpin->setSingleStep(0.05);
+        _fiberFollowConfidenceSpin->setKeyboardTracking(false);
+        _fiberFollowConfidenceSpin->setToolTip(tr("Minimum confidence for subsequent model traces. Lower values allow longer, less certain traces."));
+        confidenceLayout->addWidget(_fiberFollowConfidenceSpin);
+        auto* confidenceAction = new QWidgetAction(fiberFollowMenu);
+        confidenceAction->setDefaultWidget(confidenceRow);
+        fiberFollowMenu->addAction(confidenceAction);
+        connect(_fiberFollowConfidenceSpin, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            settings.setValue(vc3d::settings::line_annotation::FIBER_FOLLOW_CONFIDENCE, value);
+            emit fiberFollowConfidenceChanged();
+        });
+        _fiberFollowCheckpointAction = fiberFollowMenu->addAction(tr("Checkpoint…"));
+        connect(_fiberFollowCheckpointAction, &QAction::triggered, this, [this]() {
+            chooseFiberFollowCheckpoint();
+        });
+        auto* defaultCheckpoint = fiberFollowMenu->addAction(tr("Use default Hugging Face model"));
+        connect(defaultCheckpoint, &QAction::triggered, this, [this]() {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            settings.remove(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT);
+            updateFiberFollowMenu();
+            emit fiberFollowSettingsChanged();
+        });
+        _fiberFollowPythonAction = fiberFollowMenu->addAction(tr("Python…"));
+        connect(_fiberFollowPythonAction, &QAction::triggered, this, [this]() {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            const QString current = vc3d::pythonExecutableForServices(
+                settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_PYTHON).toString());
+            const QString path = QFileDialog::getOpenFileName(
+                this, tr("Python for the fiber-follow model"), current, tr("All files (*)"));
+            if (path.isEmpty()) {
+                return;
+            }
+            settings.setValue(vc3d::settings::line_annotation::FIBER_FOLLOW_PYTHON, path);
+            updateFiberFollowMenu();
+            emit fiberFollowSettingsChanged();
+        });
+        auto* autoPython = fiberFollowMenu->addAction(tr("Use VC3D's Python environment"));
+        connect(autoPython, &QAction::triggered, this, [this]() {
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            settings.remove(vc3d::settings::line_annotation::FIBER_FOLLOW_PYTHON);
+            updateFiberFollowMenu();
+            emit fiberFollowSettingsChanged();
+        });
+    }
     annotationMenu->addSeparator();
     // Length / Extrapolation live in the menu as embedded label+spinbox rows
     // (QWidgetAction); editing them does not close the menu. Spinbox edits are
@@ -926,6 +1000,7 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
             });
 
     rebuildDatasetMenus();
+    updateFiberFollowMenu();
 
     auto* toggleVolumeOverlay = annotationMenu->addAction(tr("Toggle volume overlay"));
     toggleVolumeOverlay->setShortcut(QKeySequence(Qt::CTRL | Qt::Key_Space));
@@ -1064,6 +1139,40 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     _fiberNameLabel->installEventFilter(this);
     buttonLayout->addWidget(_fiberNameLabel, 1);
     _layout->addWidget(buttonRow, 0);
+    _fiberTraceStatus = new QWidget(content);
+    _fiberTraceStatus->setObjectName(QStringLiteral("fiberTraceStatus"));
+    auto* traceLayout = new QVBoxLayout(_fiberTraceStatus);
+    traceLayout->setContentsMargins(8, 4, 8, 4);
+    auto* traceRow = new QHBoxLayout;
+    _fiberTraceProgress = new QProgressBar(_fiberTraceStatus);
+    _fiberTraceProgress->setRange(0, 0);
+    _fiberTraceProgress->setFixedWidth(80);
+    _fiberTraceProgress->setTextVisible(false);
+    traceRow->addWidget(_fiberTraceProgress);
+    _fiberTraceStatusText = new QLabel(_fiberTraceStatus);
+    _fiberTraceStatusText->setTextFormat(Qt::PlainText);
+    _fiberTraceStatusText->setWordWrap(true);
+    _fiberTraceStatusText->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    traceRow->addWidget(_fiberTraceStatusText, 1);
+    auto* traceDetailsButton = new QToolButton(_fiberTraceStatus);
+    traceDetailsButton->setText(tr("Details"));
+    traceDetailsButton->setCheckable(true);
+    traceRow->addWidget(traceDetailsButton);
+    traceLayout->addLayout(traceRow);
+    _fiberTraceDetails = new QPlainTextEdit(_fiberTraceStatus);
+    _fiberTraceDetails->setReadOnly(true);
+    _fiberTraceDetails->setMaximumBlockCount(500);
+    _fiberTraceDetails->setMaximumHeight(140);
+    _fiberTraceDetails->hide();
+    traceLayout->addWidget(_fiberTraceDetails);
+    connect(traceDetailsButton, &QToolButton::toggled, _fiberTraceDetails, &QWidget::setVisible);
+    _fiberTraceTimer = new QTimer(this);
+    _fiberTraceTimer->setInterval(1000);
+    connect(_fiberTraceTimer, &QTimer::timeout, this, [this]() {
+        setFiberTraceProgress(_fiberTraceSummary);
+    });
+    _fiberTraceStatus->hide();
+    _layout->addWidget(_fiberTraceStatus, 0);
     installGeneratedViewShortcuts();
 
     _mdiArea = new QMdiArea(content);
@@ -1144,6 +1253,69 @@ void LineAnnotationDialog::setFiberInferenceDatasetOptions(
     _fiberInferenceDatasetOptions = std::move(options);
     _selectedFiberInferenceDatasetLocation = selectedLocation;
     rebuildDatasetMenus();
+}
+
+void LineAnnotationDialog::chooseFiberFollowCheckpoint()
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QString current = settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT).toString();
+    const QString path = QFileDialog::getOpenFileName(
+        this, tr("Fiber-follow checkpoint"), current.isEmpty() ? QString() : QFileInfo(current).absolutePath(),
+        tr("Checkpoints (*.pt *.pth);;All files (*)"));
+    if (path.isEmpty()) {
+        return;
+    }
+    settings.setValue(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT, path);
+    updateFiberFollowMenu();
+    emit fiberFollowSettingsChanged();
+}
+
+void LineAnnotationDialog::setModelOnlySession(bool enabled)
+{
+    _modelOnlySession = enabled;
+    updateFiberFollowMenu();
+}
+
+void LineAnnotationDialog::updateFiberFollowMenu()
+{
+    if (!_fiberFollowEnabledAction) {
+        return;
+    }
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    namespace keys = vc3d::settings::line_annotation;
+    const QString checkpoint = settings.value(keys::FIBER_FOLLOW_CHECKPOINT).toString();
+    const bool enabled = _modelOnlySession || settings.value(keys::FIBER_FOLLOW_ENABLED, keys::FIBER_FOLLOW_ENABLED_DEFAULT).toBool();
+    _fiberFollowEnabledAction->setEnabled(!_modelOnlySession);
+    _fiberFollowEnabledAction->setText(_modelOnlySession
+        ? tr("Enabled for this model annotation session") : tr("Use for the Fiber model"));
+    if (_fiberFollowConfidenceSpin) {
+        QSignalBlocker block(_fiberFollowConfidenceSpin);
+        _fiberFollowConfidenceSpin->setValue(settings.value(keys::FIBER_FOLLOW_CONFIDENCE,
+            keys::FIBER_FOLLOW_CONFIDENCE_DEFAULT).toDouble());
+    }
+    {
+        QSignalBlocker block(_fiberFollowEnabledAction);
+        _fiberFollowEnabledAction->setChecked(enabled);
+    }
+    _fiberFollowCheckpointAction->setText(checkpoint.isEmpty()
+        ? tr("Checkpoint: default (Hugging Face)…")
+        : tr("Checkpoint: %1…").arg(QFileInfo(checkpoint).fileName()));
+    _fiberFollowCheckpointAction->setToolTip(checkpoint.isEmpty()
+        ? tr("Uses the service's default Hugging Face model. Click to choose a local checkpoint override.")
+        : checkpoint);
+    const QString configured = settings.value(keys::FIBER_FOLLOW_PYTHON).toString();
+    const QString python = vc3d::pythonExecutableForServices(configured);
+    _fiberFollowPythonAction->setText(configured.isEmpty()
+        ? tr("Python: %1 (VC3D's environment)…").arg(python)
+        : tr("Python: %1…").arg(python));
+    if (_fiberOptimizationCombo) {
+        const int index = _fiberOptimizationCombo->findData(
+            static_cast<int>(vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d));
+        if (index >= 0) {
+            _fiberOptimizationCombo->setItemText(
+                index, enabled ? tr("Fiber model (fiber follow)") : tr("Fiber model"));
+        }
+    }
 }
 
 void LineAnnotationDialog::rebuildDatasetMenus()
@@ -1589,7 +1761,7 @@ void LineAnnotationDialog::setOptimizationBusy(bool busy, bool blockInput)
     }
     updateOptimizationOverlayGeometry();
     const bool showOverlay = busy && blockInput;
-    const bool showBadge = busy && !blockInput;
+    const bool showBadge = busy && !blockInput && !_fiberTraceRunning;
     _optimizationOverlay->setVisible(showOverlay);
     _optimizationBadge->setVisible(showBadge);
     if (showOverlay) {
@@ -1604,6 +1776,43 @@ void LineAnnotationDialog::setOptimizationStatus(bool optimized)
 {
     _optimizationStatusOptimized = optimized;
     updateOptimizationStatusIndicator();
+}
+
+void LineAnnotationDialog::setFiberTraceStatus(const QString& summary, const QString& details,
+                                               bool running, bool warning)
+{
+    if (running && !_fiberTraceRunning)
+        _fiberTraceElapsed.start();
+    _fiberTraceRunning = running;
+    if (running)
+        _fiberTraceTimer->start();
+    else
+        _fiberTraceTimer->stop();
+    _fiberTraceProgress->setVisible(running);
+    if (!details.isNull())
+        _fiberTraceDetails->setPlainText(details);
+    _fiberTraceStatus->setStyleSheet(warning
+        ? QStringLiteral("#fiberTraceStatus { background: rgba(210, 125, 20, 65); }")
+        : QStringLiteral("#fiberTraceStatus { background: rgba(50, 130, 180, 35); }"));
+    setFiberTraceProgress(summary);
+    _fiberTraceStatus->show();
+    if (running && _optimizationBadge)
+        _optimizationBadge->hide();
+}
+
+void LineAnnotationDialog::setFiberTraceProgress(const QString& summary)
+{
+    _fiberTraceSummary = summary;
+    const QString visibleSummary = summary.section('\n', 0, 0).left(300);
+    _fiberTraceStatusText->setText(_fiberTraceRunning
+        ? tr("%1 — %2 s elapsed%3").arg(visibleSummary).arg(_fiberTraceElapsed.elapsed() / 1000)
+              .arg(_lineSolvePending ? tr("; edits queued") : QString())
+        : visibleSummary);
+}
+
+void LineAnnotationDialog::appendFiberTraceDetail(const QString& detail)
+{
+    _fiberTraceDetails->appendPlainText(detail);
 }
 
 void LineAnnotationDialog::setLineSolveActivity(bool running, bool pending)

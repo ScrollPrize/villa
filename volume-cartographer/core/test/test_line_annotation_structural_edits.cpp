@@ -184,7 +184,9 @@ TEST_CASE("merge: every orientation combination writes loader-clean links (incid
     for (const bool clickAtStart : {false, true}) {
         for (const bool candidateAtEnd : {false, true}) {
             auto a = makeFiber(1, "a.json", 0.0, 0.0);
+            a.modelOnly = clickAtStart;
             auto b = makeFiber(2, "b.json", 100.0, 0.0);
+            b.modelOnly = candidateAtEnd;
             auto p = makeFiber(3, "p.json", 0.0, 50.0);
             auto q = makeFiber(4, "q.json", 100.0, 50.0);
             link(a, 1, p, 2);
@@ -208,6 +210,9 @@ TEST_CASE("merge: every orientation combination writes loader-clean links (incid
             REQUIRE(fixed.graph.size() == 3);
             const auto& merged = fixed.graph[0];
             CHECK(merged.controlPoints.size() == 10);
+            CHECK(merged.modelOnly == (clickAtStart || candidateAtEnd));
+            if (merged.modelOnly)
+                CHECK(merged.optimizationMode == vc3d::line_annotation::FiberOptimizationMode::NativeFiberTrace3d);
             CHECK(merged.branches.size() == 4);
             CHECK(merged.coordinateBaseShapeZYX == a.coordinateBaseShapeZYX);
             CHECK(std::find(merged.tags.begin(), merged.tags.end(),
@@ -280,6 +285,7 @@ TEST_CASE("split: links on both sides of the cut land on the right half with cle
 {
     for (const bool linkHalves : {false, true}) {
         auto parent = makeFiber(1, "parent.json", 0.0, 0.0, 6);  // 7 control points
+        parent.modelOnly = linkHalves;
         auto p = makeFiber(2, "p.json", 0.0, 50.0);
         auto q = makeFiber(3, "q.json", 100.0, 50.0);
         link(parent, 2, p, 1);   // becomes the prefix's LAST control point
@@ -291,6 +297,8 @@ TEST_CASE("split: links on both sides of the cut land on the right half with cle
             parent, 2, identity(10, "prefix.json"), identity(11, "suffix.json"), linkHalves, &error);
         REQUIRE_MESSAGE(plan.has_value(), error);
         CHECK(plan->prefix.controlPoints.size() == 3);
+        CHECK(plan->prefix.modelOnly == parent.modelOnly);
+        CHECK(plan->suffix.modelOnly == parent.modelOnly);
         CHECK(plan->suffix.controlPoints.size() == 4);
         CHECK(plan->prefix.coordinateBaseShapeZYX == parent.coordinateBaseShapeZYX);
 

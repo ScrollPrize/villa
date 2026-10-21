@@ -891,15 +891,94 @@ def load_flat_inference_state(
     return model.load_state_dict(state, strict=False)
 
 
+class ProbabilityMeanEnsemble(nn.Module):
+    """Average member sigmoid probabilities and return them as logits.
+
+    Returning ``logit(mean(sigmoid(member)))`` keeps the downstream sigmoid,
+    mirror-TTA, and overlap-add path unchanged while the blended output is the
+    mean member probability.
+    """
+
+    def __init__(self, members: Sequence[nn.Module], *, eps: float = 1e-6) -> None:
+        super().__init__()
+        if len(members) < 2:
+            raise ValueError("An ensemble requires at least two member models")
+        self.members = nn.ModuleList(members)
+        self.eps = float(eps)
+
+    def forward(self, image_BCZYX: torch.Tensor) -> torch.Tensor:
+        probability_sum: torch.Tensor | None = None
+        for member in self.members:
+            probabilities = member(image_BCZYX).float().sigmoid()
+            if probability_sum is not None and (
+                probabilities.shape != probability_sum.shape
+            ):
+                raise ValueError(
+                    "Ensemble members produced different logits shapes: "
+                    f"{tuple(probability_sum.shape)} vs {tuple(probabilities.shape)}"
+                )
+            probability_sum = (
+                probabilities
+                if probability_sum is None
+                else probability_sum + probabilities
+            )
+        assert probability_sum is not None
+        return torch.logit(probability_sum / float(len(self.members)), eps=self.eps)
+
+
+def resolve_checkpoint_paths(args: argparse.Namespace) -> list[Path]:
+    """Return the primary checkpoint followed by any ensemble members."""
+
+    extra = getattr(args, "ensemble_checkpoint", None) or ()
+    return [Path(args.checkpoint), *(Path(path) for path in extra)]
+
+
 def configure_model(args: argparse.Namespace) -> ConfiguredModel:
+    """Rebuild flat model(s) and one shared preprocessing contract."""
+
+    checkpoints = resolve_checkpoint_paths(args)
+    members = [
+        configure_single_model(checkpoint, amp_dtype=args.amp_dtype)
+        for checkpoint in checkpoints
+    ]
+    if len(members) == 1:
+        return members[0]
+    reference = members[0]
+    contract = ("patch_size", "input_depth", "preprocessing", "amp_dtype")
+    for checkpoint, member in zip(checkpoints[1:], members[1:]):
+        mismatched = [
+            f"{field}={getattr(member, field)!r} (expected "
+            f"{getattr(reference, field)!r})"
+            for field in contract
+            if getattr(member, field) != getattr(reference, field)
+        ]
+        if mismatched:
+            raise ValueError(
+                f"Ensemble checkpoint {str(checkpoint)!r} is incompatible with "
+                f"{str(checkpoints[0])!r}: " + ", ".join(mismatched)
+            )
+    LOGGER.info(
+        "Averaging probabilities of %d checkpoints: %s",
+        len(members),
+        ", ".join(str(path) for path in checkpoints),
+    )
+    return replace(
+        reference,
+        model=ProbabilityMeanEnsemble([member.model for member in members]).eval(),
+    )
+
+
+def configure_single_model(
+    checkpoint: Path, *, amp_dtype: str
+) -> ConfiguredModel:
     """Rebuild one strict flat model and preprocessing contract from checkpoint."""
 
-    payload = load_checkpoint(args.checkpoint)
+    payload = load_checkpoint(checkpoint)
     if not isinstance(payload, Mapping) or not isinstance(
         payload.get("config"), Mapping
     ):
         raise ValueError(
-            f"Inference checkpoint {str(args.checkpoint)!r} requires a config mapping"
+            f"Inference checkpoint {str(checkpoint)!r} requires a config mapping"
         )
     config = InkConfig.from_mapping(payload["config"])
     if config.data.mode != "flat":
@@ -907,14 +986,14 @@ def configure_model(args: argparse.Namespace) -> ConfiguredModel:
             f"Flat inference requires checkpoint mode='flat', got {config.data.mode!r}"
         )
     selected_state, state = select_inference_weights(
-        payload, source=args.checkpoint
+        payload, source=checkpoint
     )
     base_model = make_model(config)
     incompatibility = load_flat_inference_state(base_model, state)
     LOGGER.info(
         "Loaded %s weights from %s (missing_keys=%d unexpected_keys=%d)",
         selected_state,
-        args.checkpoint,
+        checkpoint,
         len(incompatibility.missing_keys),
         len(incompatibility.unexpected_keys),
     )
@@ -933,7 +1012,7 @@ def configure_model(args: argparse.Namespace) -> ConfiguredModel:
         patch_size=crop_y,
         input_depth=crop_z,
         preprocessing=flat_preprocessing_from_config(config.data.normalization),
-        amp_dtype=resolve_amp_dtype(args.amp_dtype, payload, args.checkpoint),
+        amp_dtype=resolve_amp_dtype(amp_dtype, payload, checkpoint),
     )
 
 
@@ -1208,7 +1287,10 @@ def infer_folder(
             raise FileNotFoundError(f"No segment directories found under {folder}")
     else:
         segment_dirs = [folder]
+    checkpoint_count = len(resolve_checkpoint_paths(args))
     checkpoint_stem = Path(args.checkpoint).stem
+    if checkpoint_count > 1:
+        checkpoint_stem = f"{checkpoint_stem}_ens{checkpoint_count}"
     date = datetime.now().strftime("%d%m%y")
     prefix = f"{args.output_prefix}_" if args.output_prefix else ""
     ran_count = 0
@@ -1303,6 +1385,17 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("output_tiff", nargs="?", type=Path)
     parser.add_argument("--folder", type=Path)
     parser.add_argument("--checkpoint-path", type=Path)
+    parser.add_argument(
+        "--ensemble-checkpoint",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Additional checkpoint whose probabilities are averaged with the "
+            "primary checkpoint before blending. Repeatable; every member must "
+            "share patch size, input depth, preprocessing, and AMP dtype."
+        ),
+    )
     parser.add_argument("--output-prefix", default="")
     parser.add_argument("--mask-path", type=Path)
     parser.add_argument("--resolution", default="0")

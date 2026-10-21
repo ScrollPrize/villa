@@ -584,7 +584,7 @@ class InteractiveFitSession:
                  preview: SpiralPreviewConfig, scroll: ScrollSpec,
                  status_callback=None, publishes_outputs=True,
                  event_callback=None, rank=0, world_size=1, local_rank=0,
-                 rendezvous=None) -> None:
+                 rendezvous=None, input_bindings=None) -> None:
         # Who this session is in the job, passed in explicitly by whoever
         # spawned it. Nothing here reads RANK/WORLD_SIZE from the
         # environment; the DistributedContext is built from these values on
@@ -598,6 +598,9 @@ class InteractiveFitSession:
         # exists; until then nothing resolves a configuration.
         self._dist_world_size = self.world_size
         self.paths = paths
+        # Editing-workspace adoption records bound before the first
+        # derivation; the service skips replaying them after the build.
+        self.input_bindings = tuple(input_bindings or ())
         self.run_config = run
         self.scroll = scroll
         self.preview_config = preview
@@ -871,7 +874,8 @@ class InteractiveFitSession:
                 cache_dir=self.paths.cache_directory,
                 storage_backend=self.run_config.storage_backend,
                 render_volume_scale=self.run_config.render_volume_scale,
-                dist_context=dist_context)
+                dist_context=dist_context,
+                input_bindings=self.input_bindings)
             context.check_cuda_ready()
             context.load_host_inputs()
             context.resolve_output_path()
@@ -2245,7 +2249,8 @@ class InteractiveFitSession:
 
 
 def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
-                                preview, scroll, commands, events):
+                                preview, scroll, commands, events,
+                                input_bindings=None):
     """Own one CUDA rank and adapt queue commands to InteractiveFitSession.
 
     ``context`` is the (rank, world_size, local_rank) identity assigned by the
@@ -2269,7 +2274,8 @@ def _distributed_session_worker(context, gpu_id, rendezvous, paths, run,
             paths, run, preview, scroll, publish_status,
             publishes_outputs=(rank == 0),
             rank=rank, world_size=context.world_size,
-            local_rank=context.local_rank, rendezvous=rendezvous)
+            local_rank=context.local_rank, rendezvous=rendezvous,
+            input_bindings=input_bindings)
         while True:
             barrier, command_id, name, arguments = commands.get()
             try:
@@ -2369,7 +2375,8 @@ class DistributedInteractiveFitSession:
     """
 
     def __init__(self, paths, run, preview, scroll, gpu_ids,
-                 status_callback=None, event_callback=None):
+                 status_callback=None, event_callback=None,
+                 input_bindings=None):
         from ddp_helpers import DistributedContext
 
         self._init_coordinator_state(gpu_ids, status_callback, event_callback)
@@ -2389,7 +2396,8 @@ class DistributedInteractiveFitSession:
                                          local_rank=0),
                       gpu_id, self._rendezvous.endpoint,
                       paths, run, preview, scroll,
-                      self._commands[rank], self._events),
+                      self._commands[rank], self._events,
+                      tuple(input_bindings or ())),
                 name=f"spiral-gpu-{gpu_id}",
             )
             for rank, gpu_id in enumerate(self._gpu_ids)
@@ -2866,12 +2874,13 @@ class DistributedInteractiveFitSession:
 
 
 def create_session(paths, run, preview, scroll, status_callback=None,
-                   gpu_ids=(0,), event_callback=None):
+                   gpu_ids=(0,), event_callback=None, input_bindings=None):
     gpu_ids = tuple(gpu_ids)
     if len(gpu_ids) == 1:
         return InteractiveFitSession(paths, run, preview, scroll,
                                      status_callback,
-                                     event_callback=event_callback)
+                                     event_callback=event_callback,
+                                     input_bindings=input_bindings)
     return DistributedInteractiveFitSession(
         paths, run, preview, scroll, gpu_ids, status_callback,
-        event_callback=event_callback)
+        event_callback=event_callback, input_bindings=input_bindings)
