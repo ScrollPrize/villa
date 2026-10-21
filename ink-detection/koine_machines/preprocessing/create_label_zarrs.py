@@ -189,10 +189,22 @@ def _normalized_2d_shape(shape: Sequence[int], source_path: Path) -> tuple[int, 
     return int(squeezed[0]), int(squeezed[1])
 
 
+def _require_single_page_tiff(tif: tifffile.TiffFile, path: Path) -> None:
+    """Reject TIFF stacks before a page axis can be mistaken for image data."""
+    page_count = len(tif.pages)
+    if page_count != 1:
+        raise ValueError(
+            f"{path} is a multi-page TIFF ({page_count} pages); "
+            "create_label_zarrs expects one 2D label image per file"
+        )
+
+
 def load_image(path: Path) -> np.ndarray:
     suffix = path.suffix.lower()
     if suffix in {".tif", ".tiff"}:
-        image = tifffile.imread(path)
+        with tifffile.TiffFile(path) as tif:
+            _require_single_page_tiff(tif, path)
+            image = tif.pages[0].asarray()
     else:
         image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
 
@@ -395,6 +407,7 @@ def _get_tiled_tiff_metadata(path: Path) -> tuple[tuple[int, int], np.dtype] | N
         return None
 
     with tifffile.TiffFile(path) as tif:
+        _require_single_page_tiff(tif, path)
         page = tif.pages[0]
         if not page.is_tiled:
             return None
