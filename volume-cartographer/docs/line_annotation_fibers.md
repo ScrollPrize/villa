@@ -90,8 +90,9 @@ it: the click, the `/` and `0` keys and the current-position marker all treat
 that region as blocked (red marker), and a merge whose join side is a tagged end
 is refused. Remove the tag to extend or merge. The toggle itself is refused
 while a solve is running or pending for the session (its rollback would
-restore the pre-edit points). The extrapolated tail still draws past a tagged
-end. Tags belong to the point, not its span: they survive a
+restore the pre-edit points). The open tail past a tagged end is a short
+straight ray (see "Short tails past breaks and kollesis ends" below), not the
+model's extrapolation. Tags belong to the point, not its span: they survive a
 click that replaces the point, a split, a reverse and a merge (union of both
 points' tags), and go with a deleted point. Loaders reject any other
 control-point field, so a tagged fiber does not load on builds older than this
@@ -215,6 +216,72 @@ hand edit) is healed on load and saved back as version 4 under the same
 stale-file guard as the adjacent-link heal. Every pair of consecutive break
 points is therefore a gap; to keep a span between two breaks open, place
 another control point between them.
+
+### Short tails past breaks and kollesis ends
+
+An end control point (first or last in line order; a single control is both)
+that is a **lone break**, a break whose one adjacent span is not a gap span,
+or that carries `kollesis_termination`, gets a short straight tail instead of
+the global mode's extrapolation: a ray along the line's end tangent (a
+direction annotation on the point wins, negated on the head side as for the
+tracer), `Break extrapolation` base voxels long (hamburger menu row, default
+400, at least 100), sampled at the Lasagna segment length. The papyrus past a
+break is damaged or hard to follow, and the fiber tracers hunt for signal in
+it and loop back onto the fiber; a kollesis end terminates the fiber. The rule
+applies in every global mode (native prediction tracer, fiber-follow model,
+Lasagna, and the Lasagna seed optimizer), in the asynchronous solves and in
+the save/close finalization alike, which now finalizes a single control
+through the same fiber-mode path as the asynchronous solves so that removing
+the tag regrows the ordinary tails. The gap is read from the span tag: a break
+that closes a gap span is the far edge of the damage, so the fiber continues
+past it with the ordinary extrapolation. The tail is ordinary open-tail
+geometry (clipped from the other fibers' overlays and excluded from the
+length of a fiber with two or more controls as before; a single control's
+length counts its whole line, rays included); the solve report counts it as
+`ray_extrapolations`.
+
+Placing a control point beyond a lone end break (a pure append on the ray, or
+a prepend before a lone head break; the `/` and `0` keys and the strips go
+through the same handler) tags the NEW point `break` as well, so the span
+between them is a gap span at once: closed to placement, bridged by a cubic
+spline (the gap goal policy), never traced. The old break keeps its tag, the
+new point is now a gap-closing break and gets the ordinary extrapolation, so
+tracing resumes from it. A click that collapses onto the end point, an
+interior insert, and placement beyond an untagged or gap-closing end are not
+affected. Placement beyond a kollesis end is refused as before.
+
+Toggling `break` or `kollesis_termination` on an end point, or forming or
+dissolving a gap at one from the span menu, changes the tail policy. When the
+committed tags changed a span's goal (a gap formed on a span that was not yet
+cspline, or dissolved from one still cspline), those spans are re-solved at
+once in either reoptimization mode, which re-traces the tails too. When no
+goal changed (a gap formed on a span already cspline, a lone end break
+toggled, a kollesis end tagged) the session is marked Unoptimized and, in
+Auto-reoptimize mode, its tails are re-traced (a tails-only solve, or a
+whole-line one when the interior was not optimized or work was already
+queued); in manual mode the next reoptimization or the save/close
+finalization applies it. Changing either menu distance marks the session
+Unoptimized and starts a whole-line solve in Auto-reoptimize mode (in manual
+mode the change waits for the next reoptimization or save/close; a change
+made while a solve runs queues a whole-line pass behind it), and invalidates
+an armed collapse/mode rollback snapshot (a later restore lands Unoptimized
+rather than as the snapshot's state). The gap goal policy (cspline when a
+gap forms, global when it dissolves while still cspline) is applied in the
+same write that saves the break tag, so the file, the pane and its peers
+carry the goal together; the re-solve that follows rolls back geometry only
+when it fails or cannot start (a refused dataset leaves the session
+Unoptimized and owing a whole-line pass, so no later partial or
+global-goals-only solve certifies the span before it is bridged; save/close
+finalizes it). The same fiber open
+in another pane receives the tag together with the span tags and the gap goal
+policy, so a save from that pane cannot regress a goal; that pane starts no
+new solve of its own but is marked Unoptimized (save/close finalizes it) and
+owed a whole-line pass, and a solve already running there is superseded and
+its successor dispatched or, in manual mode, kept queued. A landing that still owes queued work publishes as Unoptimized
+so the autosave never persists it and save/close finalizes it; a solve that
+fails while the interior is not optimized owes a whole-line pass again for
+the next dispatch, and a goal change or tail refresh from such an interior
+solves the whole line rather than certifying provisional spans.
 
 A gap span is closed to placement: the click, the `/` and `0` keys and the
 current-position marker (cut views, strips, overview bar and the
@@ -630,8 +697,9 @@ combo box has the keyboard.
 
 The toolbar's hamburger menu owns Auto-reoptimize, Reinit reoptimization,
 Show as mesh, the Lasagna/Fiber dataset submenus, embedded spinbox rows for
-the initial centerline length and the base-voxel extrapolation distance,
-Mirror cursor across panes, and Reset views. Mirror cursor across panes drives
+the initial centerline length, the base-voxel extrapolation distance and the
+break extrapolation (the ray length past a lone break or a kollesis end, see
+above), Mirror cursor across panes, and Reset views. Mirror cursor across panes drives
 the shared cursor cross between the four generated panes: on by default,
 remembered between sessions, and independent of the global "Sync cursor across
 views" setting, so unchecking it keeps the cross in the hovered pane even while
@@ -789,4 +857,16 @@ Lasagna tail adjacent to a successful native span uses the same hard
 continuation direction. Each retained fallback emits a terminal warning
 containing `side`, the full `reason`, `trace_points`, and `source`
 (`trace_result` or `exception`). Completed length-based tails and accepted
-data-edge truncation do not emit this warning.
+data-edge truncation do not emit this warning. A side whose end control is a
+lone break or a kollesis termination publishes a straight ray of the break
+extrapolation distance in place of whatever tail the solver grew, and the
+tracer is never called for it (`Break extrapolation` menu
+row, `lineAnnotation/break_extrapolation_distance_vx`, default 400, clamped to
+100..1000000 everywhere it is read), in every global mode. A single control
+whose both sides are rays traces nothing and needs no inference inputs (nor
+the fiber-follow service in a normal-backed session). A single control with
+a traced side under the native prediction tracer (fiber-follow off) whose
+session holds no trace inputs finalizes synchronously as Lasagna for that one
+solve instead of opening a dataset picker (the session's persisted mode is
+untouched); model sessions and fiber-follow sessions ensure their service as
+before.

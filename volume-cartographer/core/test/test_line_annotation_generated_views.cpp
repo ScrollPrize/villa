@@ -6752,3 +6752,1013 @@ TEST_CASE("model-only fiber seed and edits need no Lasagna dataset")
         }
     }
 }
+
+
+// ---------------------------------------------------------------------------
+// Open-tail policy: straight rays past lone end breaks and kollesis ends.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+using vc3d::line_annotation::LineControlPoint;
+using vc3d::line_annotation::OpenTailPolicy;
+
+LineControlPoint tailControl(double x, bool seed = false)
+{
+    return LineControlPoint(x, cv::Vec3d(x, 0.0, 0.0), seed, static_cast<int>(x));
+}
+
+void tagControl(LineControlPoint& control, const char* tag)
+{
+    vc3d::line_annotation::setControlPointTag(control.tags, tag, true);
+}
+
+void giveSpan(LineControlPoint& owner, const char* spanTag = nullptr)
+{
+    owner.segmentToNext.emplace();
+    if (spanTag) {
+        vc3d::line_annotation::setSpanTag(owner.segmentToNext, spanTag, true);
+    }
+}
+
+std::vector<cv::Vec3d> straightLine(int fromX, int toX, int step)
+{
+    std::vector<cv::Vec3d> points;
+    for (int x = fromX; x <= toX; x += step) {
+        points.push_back({double(x), 0.0, 0.0});
+    }
+    return points;
+}
+
+// Every returned control names its exact vertex through BOTH index fields.
+void checkControlsNameTheirVertices(const vc3d::line_annotation::FiberModeOptimizationResult& result)
+{
+    const auto& points = result.optimization.line.points;
+    for (const auto& control : result.controlPoints) {
+        REQUIRE(control.optimizedIndex >= 0);
+        REQUIRE(control.optimizedIndex < int(points.size()));
+        CHECK(control.linePosition == doctest::Approx(double(control.optimizedIndex)));
+        CHECK(cv::norm(points[size_t(control.optimizedIndex)].position - control.volumePoint) < 1e-9);
+    }
+}
+
+double tailLengthPast(const vc::lasagna::LineModel& line, int controlIndex, bool head)
+{
+    const auto& points = line.points;
+    const cv::Vec3d cp = points[static_cast<size_t>(controlIndex)].position;
+    const cv::Vec3d end = head ? points.front().position : points.back().position;
+    return cv::norm(end - cp);
+}
+
+}  // namespace
+
+TEST_CASE("Open tail policy: lone end breaks and kollesis ends are ray sides")
+{
+    using namespace vc3d::line_annotation;
+    std::vector<LineControlPoint> controls{tailControl(0.0, true), tailControl(10.0), tailControl(20.0)};
+    giveSpan(controls[0]);
+    giveSpan(controls[1]);
+    CHECK(openTailPolicyForControls(controls) == OpenTailPolicy{false, false});
+
+    SUBCASE("a lone end break on either side") {
+        tagControl(controls[2], kBreakTag);
+        CHECK(openTailPolicyForControls(controls) == OpenTailPolicy{false, true});
+        tagControl(controls[0], kBreakTag);
+        CHECK(openTailPolicyForControls(controls) == OpenTailPolicy{true, true});
+    }
+    SUBCASE("interior tags change nothing") {
+        tagControl(controls[1], kBreakTag);
+        CHECK(openTailPolicyForControls(controls) == OpenTailPolicy{false, false});
+        controls[1].tags.clear();
+        tagControl(controls[1], kKollesisTerminationTag);
+        CHECK(openTailPolicyForControls(controls) == OpenTailPolicy{false, false});
+    }
+    SUBCASE("a kollesis end is a ray side") {
+        tagControl(controls[2], kKollesisTerminationTag);
+        CHECK(openTailPolicyForControls(controls) == OpenTailPolicy{false, true});
+        tagControl(controls[0], kKollesisTerminationTag);
+        CHECK(openTailPolicyForControls(controls) == OpenTailPolicy{true, true});
+    }
+    SUBCASE("a break that closes a gap keeps the ordinary tail: the SPAN tag decides") {
+        tagControl(controls[1], kBreakTag);
+        tagControl(controls[2], kBreakTag);
+        // Both ends tagged but no span tag (an inconsistent list): still lone.
+        CHECK(openTailPolicyForControls(controls) == OpenTailPolicy{false, true});
+        setSpanTag(controls[1].segmentToNext, kGapSpanTag, true);
+        CHECK(openTailPolicyForControls(controls) == OpenTailPolicy{false, false});
+        // The head reads its own span.
+        tagControl(controls[0], kBreakTag);
+        CHECK(openTailPolicyForControls(controls) == OpenTailPolicy{true, false});
+        setSpanTag(controls[0].segmentToNext, kGapSpanTag, true);
+        CHECK(openTailPolicyForControls(controls) == OpenTailPolicy{false, false});
+    }
+    SUBCASE("line-position order, not vector order") {
+        tagControl(controls[2], kBreakTag);
+        std::vector<LineControlPoint> shuffled{controls[2], controls[0], controls[1]};
+        CHECK(openTailPolicyForControls(shuffled) == OpenTailPolicy{false, true});
+        std::vector<LineControlPoint> withNan = shuffled;
+        withNan.push_back(tailControl(99.0));
+        withNan.back().linePosition = std::numeric_limits<double>::quiet_NaN();
+        tagControl(withNan.back(), kKollesisTerminationTag);
+        CHECK(openTailPolicyForControls(withNan) == OpenTailPolicy{false, true});
+    }
+    SUBCASE("a single control is both ends") {
+        std::vector<LineControlPoint> single{tailControl(5.0, true)};
+        CHECK(openTailPolicyForControls(single) == OpenTailPolicy{false, false});
+        CHECK(!singleControlRayOnly(single));
+        tagControl(single[0], kBreakTag);
+        CHECK(openTailPolicyForControls(single) == OpenTailPolicy{true, true});
+        CHECK(singleControlRayOnly(single));
+        single[0].tags.clear();
+        tagControl(single[0], kKollesisTerminationTag);
+        CHECK(singleControlRayOnly(single));
+        tagControl(controls[0], kBreakTag);
+        tagControl(controls[2], kBreakTag);
+        CHECK(!singleControlRayOnly(controls));
+    }
+    SUBCASE("stored controls read index order") {
+        std::vector<vc3d::line_annotation::StoredControlPoint> stored;
+        for (const auto& control : controls) {
+            stored.emplace_back(control.volumePoint);
+            stored.back().segmentToNext = control.segmentToNext;
+        }
+        CHECK(openTailPolicyForControls(stored) == OpenTailPolicy{false, false});
+        setControlPointTag(stored[2].tags, kBreakTag, true);
+        CHECK(openTailPolicyForControls(stored) == OpenTailPolicy{false, true});
+        setControlPointTag(stored[1].tags, kBreakTag, true);
+        setSpanTag(stored[1].segmentToNext, kGapSpanTag, true);
+        CHECK(openTailPolicyForControls(stored) == OpenTailPolicy{false, false});
+        setControlPointTag(stored[0].tags, kKollesisTerminationTag, true);
+        CHECK(openTailPolicyForControls(stored) == OpenTailPolicy{true, false});
+    }
+}
+
+TEST_CASE("Ray tail points: spacing, clamped last sample, validation")
+{
+    using namespace vc3d::line_annotation;
+    const auto ray = rayTailPoints({0, 0, 0}, {2, 0, 0}, 10.0, 4.0);
+    REQUIRE(ray.size() == 3);
+    CHECK(ray[0] == cv::Vec3d(4, 0, 0));
+    CHECK(ray[1] == cv::Vec3d(8, 0, 0));
+    CHECK(ray[2] == cv::Vec3d(10, 0, 0));
+    const auto exact = rayTailPoints({1, 1, 1}, {0, -1, 0}, 8.0, 4.0);
+    REQUIRE(exact.size() == 2);
+    CHECK(exact.back() == cv::Vec3d(1, -7, 1));
+    const auto shorter = rayTailPoints({0, 0, 0}, {0, 0, 1}, 3.0, 4.0);
+    REQUIRE(shorter.size() == 1);
+    CHECK(shorter[0] == cv::Vec3d(0, 0, 3));
+    CHECK_THROWS_AS(rayTailPoints({0, 0, 0}, {1, 0, 0}, 0.0, 4.0), std::invalid_argument);
+    CHECK_THROWS_AS(rayTailPoints({0, 0, 0}, {1, 0, 0}, -1.0, 4.0), std::invalid_argument);
+    CHECK_THROWS_AS(rayTailPoints({0, 0, 0}, {1, 0, 0}, 4.0, 0.0), std::invalid_argument);
+    CHECK_THROWS_AS(rayTailPoints({0, 0, 0}, {0, 0, 0}, 4.0, 1.0), std::invalid_argument);
+    CHECK_THROWS_AS(rayTailPoints({0, 0, 0}, {1, 0, 0},
+                                  std::numeric_limits<double>::quiet_NaN(), 1.0),
+                    std::invalid_argument);
+}
+
+TEST_CASE("Nearest line index resolves a revisited coordinate by side")
+{
+    using namespace vc3d::line_annotation;
+    std::vector<cv::Vec3d> points = straightLine(0, 8, 1);
+    points[6] = points[4];  // the line revisits P4 at index 6
+    CHECK(nearestLineIndex(points, {2, 0, 0}, NearestTie::First) == 2);
+    CHECK(nearestLineIndex(points, {2, 0, 0}, NearestTie::Last) == 2);
+    CHECK(nearestLineIndex(points, {4, 0, 0}, NearestTie::First) == 4);
+    CHECK(nearestLineIndex(points, {4, 0, 0}, NearestTie::Last) == 6);
+    CHECK(nearestLineIndex(points, {4.4, 0, 0}, NearestTie::Last) == 6);
+    CHECK_THROWS_AS(nearestLineIndex({}, {0, 0, 0}, NearestTie::First), std::invalid_argument);
+}
+
+TEST_CASE("Ray tail replacement keeps the controlled range and shifts indices")
+{
+    using namespace vc3d::line_annotation;
+    FiberModeNormalSampler sampler({0.0, 1.0, 0.0});
+    const auto makeLine = []() {
+        vc::lasagna::LineModel line;
+        for (int x = 0; x <= 6; ++x) {
+            vc::lasagna::LinePoint point;
+            point.position = {double(x), double(x) * 0.5, 0.0};
+            point.sampledNormal.normal = {0.0, 0.0, 1.0};
+            point.sampledNormal.valid = true;
+            line.points.push_back(point);
+        }
+        line.displayFrameAnchorIndex = 3;
+        return line;
+    };
+    SUBCASE("tail ray only: head untouched byte for byte") {
+        auto line = makeLine();
+        const auto original = makeLine();
+        const int shift = replaceRayTails(line, 2, 4, OpenTailPolicy{false, true},
+                                          std::nullopt, std::nullopt, 2.0, 1.0, &sampler);
+        CHECK(shift == 0);
+        REQUIRE(line.points.size() == 5 + 2);
+        for (size_t i = 0; i <= 4; ++i) {
+            CHECK(line.points[i].position == original.points[i].position);
+            CHECK(line.points[i].sampledNormal.normal == original.points[i].sampledNormal.normal);
+        }
+        const cv::Vec3d tangent = cv::normalize(cv::Vec3d(1.0, 0.5, 0.0));
+        CHECK(cv::norm(line.points[5].position - (original.points[4].position + tangent)) < 1e-9);
+        CHECK(cv::norm(line.points[6].position - (original.points[4].position + tangent * 2.0)) < 1e-9);
+        CHECK(line.points[6].sampledNormal.normal == cv::Vec3d(0.0, 1.0, 0.0));
+        CHECK(line.displayFrameAnchorIndex == 3);
+    }
+    SUBCASE("head ray: reversed, annotated direction negated, index shift") {
+        auto line = makeLine();
+        const auto original = makeLine();
+        const int shift = replaceRayTails(line, 2, 4, OpenTailPolicy{true, false},
+                                          cv::Vec3d(0.0, 0.0, 2.0), std::nullopt, 3.0, 1.0, nullptr);
+        CHECK(shift == 1);  // 3 ray points replace the 2 head points
+        REQUIRE(line.points.size() == 3 + 5);
+        CHECK(line.points[0].position == original.points[2].position + cv::Vec3d(0, 0, -3));
+        CHECK(line.points[2].position == original.points[2].position + cv::Vec3d(0, 0, -1));
+        CHECK(line.points[3].position == original.points[2].position);
+        CHECK(line.points.back().position == original.points.back().position);
+        CHECK(line.displayFrameAnchorIndex == 4);
+    }
+    SUBCASE("both rays on a single control") {
+        auto line = makeLine();
+        const int shift = replaceRayTails(line, 3, 3, OpenTailPolicy{true, true},
+                                          std::nullopt, std::nullopt, 1.5, 1.0, nullptr);
+        CHECK(shift == -1);
+        REQUIRE(line.points.size() == 5);
+        CHECK(line.points[2].position == cv::Vec3d(3.0, 1.5, 0.0));
+        CHECK(cv::norm(line.points.front().position - line.points[2].position) == doctest::Approx(1.5));
+        CHECK(cv::norm(line.points.back().position - line.points[2].position) == doctest::Approx(1.5));
+    }
+    SUBCASE("no ray side is a no-op") {
+        auto line = makeLine();
+        CHECK(replaceRayTails(line, 2, 4, OpenTailPolicy{}, std::nullopt, std::nullopt, 2.0, 1.0, nullptr) == 0);
+        CHECK(line.points.size() == 7);
+    }
+    SUBCASE("invalid indices and a tangent-less line throw") {
+        auto line = makeLine();
+        CHECK_THROWS_AS(replaceRayTails(line, 5, 4, OpenTailPolicy{true, true}, std::nullopt, std::nullopt, 2.0, 1.0, nullptr),
+                        std::invalid_argument);
+        vc::lasagna::LineModel single;
+        single.points.push_back(line.points.front());
+        CHECK_THROWS_AS(replaceRayTails(single, 0, 0, OpenTailPolicy{true, true}, std::nullopt, std::nullopt, 2.0, 1.0, nullptr),
+                        std::invalid_argument);
+    }
+}
+
+TEST_CASE("Fiber mode open tails: rays past lone breaks in every backend")
+{
+    using namespace vc3d::line_annotation;
+    FiberModeNormalSampler normals;
+    const auto baseRequest = [&]() {
+        FiberModeOptimizationRequest request;
+        request.baseNormalSampler = &normals;
+        request.linePointsBase = straightLine(-8, 24, 4);
+        request.controlPoints = {{2.0, {0.0, 0.0, 0.0}, true, 2}, {6.0, {16.0, 0.0, 0.0}, false, 6}};
+        request.controlPoints.front().segmentToNext.emplace();
+        request.controlPoints.front().segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
+        request.extrapolationDistanceBaseVoxels = 8.0;
+        request.breakExtrapolationDistanceBaseVoxels = 6.0;
+        request.lasagnaConfig.segmentsPerSide = 2;
+        request.lasagnaConfig.segmentLength = 4.0;
+        request.lasagnaConfig.maxIterations = 20;
+        request.lasagnaConfig.printSolverProgress = false;
+        return request;
+    };
+    const auto checkRay = [](const FiberModeOptimizationResult& result, bool head, double length) {
+        checkControlsNameTheirVertices(result);
+        const int index = head ? result.controlPoints.front().optimizedIndex
+                               : result.controlPoints.back().optimizedIndex;
+        const auto& points = result.optimization.line.points;
+        const auto& cp = head ? result.controlPoints.front() : result.controlPoints.back();
+        CHECK(tailLengthPast(result.optimization.line, index, head) == doctest::Approx(length));
+        // The expected direction is computed independently of the ray: the
+        // annotated direction (negated on the head) when there is one, else
+        // outward from the inward neighbour on the retained line.
+        const int step = head ? -1 : 1;
+        cv::Vec3d expected = cp.direction
+            ? (head ? -*cp.direction : *cp.direction)
+            : cp.volumePoint - points[size_t(index - step)].position;
+        expected = cv::normalize(expected);
+        int samples = 0;
+        for (int i = index + step; i >= 0 && i < int(points.size()); i += step) {
+            ++samples;
+            const cv::Vec3d offset = points[size_t(i)].position - cp.volumePoint;
+            const double along = offset.dot(expected);
+            CHECK(along > 0.0);
+            CHECK(cv::norm(offset - expected * along) < 1e-6);
+        }
+        CHECK(samples >= 1);
+    };
+
+    SUBCASE("Lasagna mode keeps the solver's tail on the other side") {
+        for (const int side : {0, 1, 2}) {
+            auto request = baseRequest();
+            request.globalMode = FiberOptimizationMode::Lasagna;
+            // The reinit regrows FIVE left-tail samples where the input had
+            // two, so only its own index map (not the stitch-time indices)
+            // names the control vertices; and the controls arrive shuffled.
+            request.lasagnaConfig.segmentsPerSide = 5;
+            std::swap(request.controlPoints[0], request.controlPoints[1]);
+            auto plain = optimizeFiberWithNativeFallback(request);
+            CHECK(plain.rayExtrapolations == 0);
+            checkControlsNameTheirVertices(plain);
+            CHECK(plain.controlPoints.front().optimizedIndex >= 5);
+            // (sorted by the solver: front is the head control again)
+            if (side != 1) tagControl(request.controlPoints[0], kBreakTag);
+            if (side != 0) tagControl(request.controlPoints[1], kBreakTag);
+            auto result = optimizeFiberWithNativeFallback(request);
+            checkControlsNameTheirVertices(result);
+            CHECK(result.rayExtrapolations == (side == 2 ? 2 : 1));
+            // The controlled range is the same geometry.
+            const int a = result.controlPoints.front().optimizedIndex;
+            const int b = result.controlPoints.back().optimizedIndex;
+            const int pa = plain.controlPoints.front().optimizedIndex;
+            const int pb = plain.controlPoints.back().optimizedIndex;
+            REQUIRE(b - a == pb - pa);
+            for (int i = 0; i <= b - a; ++i) {
+                CHECK(cv::norm(result.optimization.line.points[size_t(a + i)].position -
+                               plain.optimization.line.points[size_t(pa + i)].position) < 1e-9);
+            }
+            if (side != 1) {
+                checkRay(result, false, 6.0);
+            } else {
+                CHECK(int(result.optimization.line.points.size()) - 1 - b ==
+                      int(plain.optimization.line.points.size()) - 1 - pb);
+            }
+            if (side != 0) {
+                checkRay(result, true, 6.0);
+            } else {
+                CHECK(a == pa);
+            }
+        }
+    }
+    SUBCASE("native mode with an external tracer: the model is asked only for trace sides") {
+        for (const int side : {0, 1, 2}) {
+            auto request = baseRequest();
+            request.globalMode = FiberOptimizationMode::NativeFiberTrace3d;
+            int calls = 0;
+            std::vector<double> directions;
+            request.externalExtrapolation = [&](const auto& history, const auto& direction, double distance) {
+                ++calls;
+                directions.push_back(direction[0]);
+                vc::fiber_tracer::FiberTraceOneWayResult result;
+                result.points = {history.back(), history.back() + direction / cv::norm(direction) * distance};
+                result.reason = "fiber_follow: max_len";
+                result.reachedTraceLength = true;
+                return result;
+            };
+            int fallbacks = 0;
+            request.extrapolationFallbackCallback = [&](const auto&) { ++fallbacks; };
+            if (side != 1) tagControl(request.controlPoints.back(), kBreakTag);
+            if (side != 0) tagControl(request.controlPoints.front(), kBreakTag);
+            const auto result = optimizeFiberWithNativeFallback(request);
+            CHECK(fallbacks == 0);
+            CHECK(result.rayExtrapolations == (side == 2 ? 2 : 1));
+            CHECK(result.nativeExtrapolations == (side == 2 ? 0 : 1));
+            CHECK(calls == (side == 2 ? 0 : 1));
+            if (side == 0) CHECK(directions.front() < 0.0);
+            if (side == 1) CHECK(directions.front() > 0.0);
+            if (side != 1) checkRay(result, false, 6.0);
+            if (side != 0) checkRay(result, true, 6.0);
+            if (side == 0) CHECK(tailLengthPast(result.optimization.line, result.controlPoints.front().optimizedIndex, true) == doctest::Approx(8.0));
+            if (side == 1) CHECK(tailLengthPast(result.optimization.line, result.controlPoints.back().optimizedIndex, false) == doctest::Approx(8.0));
+        }
+    }
+    SUBCASE("an annotated direction, not the line tangent, aims the ray") {
+        auto request = baseRequest();
+        request.globalMode = FiberOptimizationMode::Lasagna;
+        tagControl(request.controlPoints.front(), kBreakTag);
+        tagControl(request.controlPoints.back(), kBreakTag);
+        request.controlPoints.front().direction = cv::Vec3d(0.0, 0.0, 1.0);
+        request.controlPoints.back().direction = cv::Vec3d(0.0, 1.0, 0.0);
+        const auto result = optimizeFiberWithNativeFallback(request);
+        CHECK(result.rayExtrapolations == 2);
+        checkRay(result, true, 6.0);
+        checkRay(result, false, 6.0);
+        const auto& points = result.optimization.line.points;
+        CHECK(cv::norm(points.front().position - (cv::Vec3d(0, 0, 0) + cv::Vec3d(0, 0, -6))) < 1e-9);
+        CHECK(cv::norm(points.back().position - (cv::Vec3d(16, 0, 0) + cv::Vec3d(0, 6, 0))) < 1e-9);
+    }
+    SUBCASE("three shuffled controls with a head ray: every control keeps its vertex") {
+        auto request = baseRequest();
+        request.globalMode = FiberOptimizationMode::Lasagna;
+        request.linePointsBase = straightLine(-8, 40, 4);
+        request.controlPoints = {{10.0, {32.0, 0.0, 0.0}, false, 10},
+                                 {2.0, {0.0, 0.0, 0.0}, true, 2},
+                                 {6.0, {16.0, 0.0, 0.0}, false, 6}};
+        request.controlPoints[1].segmentToNext.emplace();
+        request.controlPoints[1].segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
+        request.controlPoints[2].segmentToNext.emplace();
+        request.controlPoints[2].segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
+        tagControl(request.controlPoints[1], kBreakTag);
+        const auto result = optimizeFiberWithNativeFallback(request);
+        REQUIRE(result.controlPoints.size() == 3);
+        CHECK(result.rayExtrapolations == 1);
+        checkRay(result, true, 6.0);
+        CHECK(result.controlPoints[1].volumePoint == cv::Vec3d(16, 0, 0));
+        CHECK(result.controlPoints[0].optimizedIndex < result.controlPoints[1].optimizedIndex);
+        CHECK(result.controlPoints[1].optimizedIndex < result.controlPoints[2].optimizedIndex);
+    }
+    SUBCASE("a trace side that fails keeps its Lasagna fallback; the ray side never reports") {
+        auto request = baseRequest();
+        request.globalMode = FiberOptimizationMode::NativeFiberTrace3d;
+        request.externalExtrapolation = [](const auto& history, const auto&, double) {
+            vc::fiber_tracer::FiberTraceOneWayResult result;
+            result.points = {history.back()};
+            result.reason = "fiber_follow: confidence";
+            return result;
+        };
+        std::vector<FiberExtrapolationFallbackDiagnostic::Side> sides;
+        request.extrapolationFallbackCallback = [&](const auto& diagnostic) { sides.push_back(diagnostic.side); };
+        tagControl(request.controlPoints.back(), kBreakTag);
+        const auto result = optimizeFiberWithNativeFallback(request);
+        REQUIRE(sides.size() == 1);
+        CHECK(sides.front() == FiberExtrapolationFallbackDiagnostic::Side::Left);
+        CHECK(result.lasagnaFallbackExtrapolations == 1);
+        CHECK(result.rayExtrapolations == 1);
+        checkRay(result, false, 6.0);
+        CHECK(result.controlPoints.front().optimizedIndex > 0);
+    }
+    SUBCASE("independent distances: extrapolation 0 leaves the trace side at its endpoint") {
+        auto request = baseRequest();
+        request.globalMode = FiberOptimizationMode::NativeFiberTrace3d;
+        request.extrapolationDistanceBaseVoxels = 0.0;
+        int calls = 0;
+        request.externalExtrapolation = [&](const auto& history, const auto& direction, double distance) {
+            ++calls;
+            vc::fiber_tracer::FiberTraceOneWayResult result;
+            result.points = {history.back(), history.back() + direction * distance};
+            result.reachedTraceLength = true;
+            return result;
+        };
+        tagControl(request.controlPoints.back(), kBreakTag);
+        const auto result = optimizeFiberWithNativeFallback(request);
+        CHECK(calls == 0);
+        CHECK(result.controlPoints.front().optimizedIndex == 0);
+        checkRay(result, false, 6.0);
+    }
+    SUBCASE("the break distance is validated") {
+        for (const double bad : {0.0, -1.0, std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::infinity()}) {
+            auto request = baseRequest();
+            request.globalMode = FiberOptimizationMode::Lasagna;
+            request.breakExtrapolationDistanceBaseVoxels = bad;
+            CHECK_THROWS_AS(optimizeFiberWithNativeFallback(request), std::invalid_argument);
+        }
+    }
+    SUBCASE("a tagged end with retainOpenTails=false is untouched") {
+        auto request = baseRequest();
+        request.globalMode = FiberOptimizationMode::Lasagna;
+        request.retainOpenTails = false;
+        const auto plain = optimizeFiberWithNativeFallback(request);
+        tagControl(request.controlPoints.back(), kBreakTag);
+        tagControl(request.controlPoints.front(), kKollesisTerminationTag);
+        const auto result = optimizeFiberWithNativeFallback(request);
+        CHECK(result.rayExtrapolations == 0);
+        REQUIRE(result.optimization.line.points.size() == plain.optimization.line.points.size());
+        for (size_t i = 0; i < plain.optimization.line.points.size(); ++i) {
+            CHECK(result.optimization.line.points[i].position == plain.optimization.line.points[i].position);
+        }
+    }
+}
+
+TEST_CASE("Fiber mode single control: tags switch both tails between rays and ordinary tails")
+{
+    using namespace vc3d::line_annotation;
+    FiberModeNormalSampler normals;
+    const auto baseRequest = [&]() {
+        FiberModeOptimizationRequest request;
+        request.baseNormalSampler = &normals;
+        request.linePointsBase = straightLine(-8, 8, 4);
+        request.controlPoints = {{2.0, {0.0, 0.0, 0.0}, true, 2}};
+        request.controlPoints.front().direction = cv::Vec3d{1.0, 0.0, 0.0};
+        request.extrapolationDistanceBaseVoxels = 8.0;
+        request.breakExtrapolationDistanceBaseVoxels = 5.0;
+        request.lasagnaConfig.segmentsPerSide = 2;
+        request.lasagnaConfig.segmentLength = 4.0;
+        request.lasagnaConfig.maxIterations = 20;
+        request.lasagnaConfig.printSolverProgress = false;
+        return request;
+    };
+    const auto bothTails = [](const FiberModeOptimizationResult& result) {
+        checkControlsNameTheirVertices(result);
+        const int index = result.controlPoints.front().optimizedIndex;
+        CHECK(result.optimization.line.points[size_t(index)].position == cv::Vec3d(0, 0, 0));
+        return std::make_pair(tailLengthPast(result.optimization.line, index, true),
+                              tailLengthPast(result.optimization.line, index, false));
+    };
+    SUBCASE("Lasagna mode") {
+        for (const char* tag : {kBreakTag, kKollesisTerminationTag}) {
+            auto request = baseRequest();
+            request.globalMode = FiberOptimizationMode::Lasagna;
+            // A stored line already carrying rays (the untagged solve after a
+            // tag was removed) regrows ordinary tails from the control.
+            request.linePointsBase = {{-5, 0, 0}, {0, 0, 0}, {5, 0, 0}};
+            const auto plain = optimizeFiberWithNativeFallback(request);
+            CHECK(plain.rayExtrapolations == 0);
+            const auto [plainHead, plainTail] = bothTails(plain);
+            CHECK(plainHead > 5.0);
+            CHECK(plainTail > 5.0);
+            tagControl(request.controlPoints.front(), tag);
+            const auto result = optimizeFiberWithNativeFallback(request);
+            CHECK(result.rayExtrapolations == 2);
+            const auto [head, tail] = bothTails(result);
+            CHECK(head == doctest::Approx(5.0));
+            CHECK(tail == doctest::Approx(5.0));
+            // Annotated direction: the head ray points along -x, the tail +x.
+            CHECK(result.optimization.line.points.front().position[0] == doctest::Approx(-5.0));
+            CHECK(result.optimization.line.points.back().position[0] == doctest::Approx(5.0));
+        }
+    }
+    SUBCASE("native mode with an external tracer") {
+        auto request = baseRequest();
+        request.globalMode = FiberOptimizationMode::NativeFiberTrace3d;
+        int calls = 0;
+        request.externalExtrapolation = [&](const auto& history, const auto& direction, double distance) {
+            ++calls;
+            vc::fiber_tracer::FiberTraceOneWayResult result;
+            result.points = {history.back(), history.back() + direction / cv::norm(direction) * distance};
+            result.reason = "fiber_follow: max_len";
+            result.reachedTraceLength = true;
+            return result;
+        };
+        const auto plain = optimizeFiberWithNativeFallback(request);
+        CHECK(calls == 2);
+        CHECK(plain.nativeExtrapolations == 2);
+        checkControlsNameTheirVertices(plain);
+        tagControl(request.controlPoints.front(), kBreakTag);
+        calls = 0;
+        const auto result = optimizeFiberWithNativeFallback(request);
+        CHECK(calls == 0);
+        CHECK(result.rayExtrapolations == 2);
+        const auto [head, tail] = bothTails(result);
+        CHECK(head == doctest::Approx(5.0));
+        CHECK(tail == doctest::Approx(5.0));
+    }
+    SUBCASE("native mode without any trace inputs: a ray-only control never enters the tracer") {
+        auto request = baseRequest();
+        request.globalMode = FiberOptimizationMode::NativeFiberTrace3d;
+        request.predictions = nullptr;
+        request.traceNormalSampler = nullptr;
+        request.extrapolationDistanceBaseVoxels = 1200.0;
+        tagControl(request.controlPoints.front(), kBreakTag);
+        REQUIRE(singleControlRayOnly(request.controlPoints));
+        const auto result = optimizeFiberWithNativeFallback(request);
+        CHECK(result.rayExtrapolations == 2);
+        CHECK(result.nativeExtrapolations == 0);
+        const auto [head, tail] = bothTails(result);
+        CHECK(head == doctest::Approx(5.0));
+        CHECK(tail == doctest::Approx(5.0));
+    }
+}
+
+TEST_CASE("Model-only fiber: rays replace the model's tails and cancellation is honoured")
+{
+    using namespace vc3d::line_annotation;
+    const auto baseRequest = [](int& builds, int& traces) {
+        FiberModeOptimizationRequest request;
+        request.controlPoints = {{1.0, {10.0, 20.0, 30.0}, true, 1}};
+        request.linePointsBase = {{9.0, 20.0, 30.0}, {10.0, 20.0, 30.0}, {11.0, 20.0, 30.0}};
+        request.extrapolationDistanceBaseVoxels = 8.0;
+        request.breakExtrapolationDistanceBaseVoxels = 3.0;
+        request.lasagnaConfig.segmentLength = 1.0;
+        request.modelLineBuilder = [&builds](const auto& points) {
+            ++builds;
+            vc::lasagna::LineModel line;
+            for (const auto& p : points) {
+                vc::lasagna::LinePoint point;
+                point.position = p;
+                line.points.push_back(point);
+            }
+            line.displayFrameAnchorIndex = int(points.size() / 2);
+            return line;
+        };
+        request.externalExtrapolation = [&traces](const auto& history, const auto& direction, double distance) {
+            ++traces;
+            vc::fiber_tracer::FiberTraceOneWayResult result;
+            result.points = {history.back(), history.back() + direction / cv::norm(direction) * distance};
+            result.reason = "fiber_follow: max_len";
+            result.reachedTraceLength = true;
+            return result;
+        };
+        request.externalSegment = [](const auto& span) {
+            vc::fiber_tracer::FiberTraceSegmentResult result;
+            result.accepted = true;
+            const auto start = span.referenceLine.at(span.startIndex);
+            const auto end = span.referenceLine.at(span.targetIndex);
+            result.fusedLine = {start, (start + end) * 0.5, end};
+            result.reason = "fiber_follow: target_plane";
+            return result;
+        };
+        return request;
+    };
+    SUBCASE("single control: both rays, the model is never asked") {
+        int builds = 0, traces = 0;
+        auto request = baseRequest(builds, traces);
+        tagControl(request.controlPoints.front(), kBreakTag);
+        const auto result = optimizeFiberWithNativeFallback(request);
+        CHECK(builds == 1);
+        CHECK(traces == 0);
+        CHECK(result.rayExtrapolations == 2);
+        REQUIRE(result.optimization.line.points.size() == 7);
+        checkControlsNameTheirVertices(result);
+        CHECK(result.controlPoints.front().optimizedIndex == 3);
+        CHECK(result.optimization.line.points.front().position == cv::Vec3d(7, 20, 30));
+        CHECK(result.optimization.line.points.back().position == cv::Vec3d(13, 20, 30));
+    }
+    SUBCASE("two controls: head ray, tail ray, both") {
+        for (const int side : {0, 1, 2}) {
+            int builds = 0, traces = 0;
+            auto request = baseRequest(builds, traces);
+            request.linePointsBase = {{9, 20, 30}, {10, 20, 30}, {11, 20, 30}, {12, 20, 30}, {13, 20, 30}};
+            request.controlPoints.push_back({3.0, {12.0, 20.0, 30.0}, false, 3});
+            request.controlPoints.front().segmentToNext.emplace();
+            request.controlPoints.front().segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
+            if (side != 1) tagControl(request.controlPoints.back(), kBreakTag);
+            if (side != 0) tagControl(request.controlPoints.front(), kBreakTag);
+            const auto result = optimizeFiberWithNativeFallback(request);
+            CHECK(builds == 1);
+            CHECK(traces == (side == 2 ? 0 : 1));
+            CHECK(result.rayExtrapolations == (side == 2 ? 2 : 1));
+            const auto& points = result.optimization.line.points;
+            const int a = result.controlPoints.front().optimizedIndex;
+            const int b = result.controlPoints.back().optimizedIndex;
+            CHECK(points[size_t(a)].position == cv::Vec3d(10, 20, 30));
+            CHECK(points[size_t(b)].position == cv::Vec3d(12, 20, 30));
+            CHECK(tailLengthPast(result.optimization.line, a, true) == doctest::Approx(side == 0 ? 8.0 : 3.0));
+            CHECK(tailLengthPast(result.optimization.line, b, false) == doctest::Approx(side == 1 ? 8.0 : 3.0));
+        }
+    }
+    SUBCASE("cancellation raised inside the model builder or a trace completes nothing") {
+        for (const bool twoControls : {false, true}) {
+            int builds = 0, traces = 0;
+            auto request = baseRequest(builds, traces);
+            if (twoControls) {
+                request.linePointsBase = {{9, 20, 30}, {10, 20, 30}, {11, 20, 30}, {12, 20, 30}, {13, 20, 30}};
+                request.controlPoints.push_back({3.0, {12.0, 20.0, 30.0}, false, 3});
+                request.controlPoints.front().segmentToNext.emplace();
+                request.controlPoints.front().segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
+            }
+            tagControl(request.controlPoints.back(), kBreakTag);
+            std::atomic<bool> cancel{false};
+            request.cancelFlag = &cancel;
+            auto build = request.modelLineBuilder;
+            request.modelLineBuilder = [&cancel, build](const auto& points) {
+                cancel.store(true);
+                return build(points);
+            };
+            CHECK_THROWS_AS(optimizeFiberWithNativeFallback(request), vc::lasagna::LineOptimizationCancelled);
+            CHECK(builds == 1);
+            // A trace that sets the flag: the line rebuild and the model
+            // reconstruction never happen (the rays were built before the
+            // traces; nothing is published).
+            cancel.store(false);
+            auto request2 = baseRequest(builds, traces);
+            if (twoControls) {
+                request2 = request;
+                request2.modelLineBuilder = build;
+                // Head traces, tail is a ray.
+            }
+            // A single control tagged break would be a ray on both sides and
+            // trace nothing: leave it untagged so its first trace sets the flag.
+            request2.cancelFlag = &cancel;
+            request2.externalExtrapolation = [&cancel](const auto& history, const auto& direction, double distance) {
+                cancel.store(true);
+                vc::fiber_tracer::FiberTraceOneWayResult result;
+                result.points = {history.back(), history.back() + direction / cv::norm(direction) * distance};
+                result.reason = "fiber_follow: max_len";
+                result.reachedTraceLength = true;
+                return result;
+            };
+            builds = 0;
+            CHECK_THROWS_AS(optimizeFiberWithNativeFallback(request2), vc::lasagna::LineOptimizationCancelled);
+            CHECK(builds == 0);
+        }
+    }
+    SUBCASE("an already-cancelled request completes nothing") {
+        for (const bool twoControls : {false, true}) {
+            int builds = 0, traces = 0;
+            auto request = baseRequest(builds, traces);
+            if (twoControls) {
+                request.linePointsBase = {{9, 20, 30}, {10, 20, 30}, {11, 20, 30}, {12, 20, 30}, {13, 20, 30}};
+                request.controlPoints.push_back({3.0, {12.0, 20.0, 30.0}, false, 3});
+                request.controlPoints.front().segmentToNext.emplace();
+                request.controlPoints.front().segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
+            }
+            tagControl(request.controlPoints.front(), kBreakTag);
+            std::atomic<bool> cancel{true};
+            request.cancelFlag = &cancel;
+            CHECK_THROWS_AS(optimizeFiberWithNativeFallback(request), vc::lasagna::LineOptimizationCancelled);
+            CHECK(builds == 0);
+            CHECK(traces == 0);
+        }
+    }
+}
+
+TEST_CASE("Empty dirty set re-traces only the tails")
+{
+    using namespace vc3d::line_annotation;
+    FiberModeNormalSampler normals;
+    FiberModeOptimizationRequest request;
+    request.baseNormalSampler = &normals;
+    request.globalMode = FiberOptimizationMode::NativeFiberTrace3d;
+    request.linePointsBase = straightLine(-8, 40, 4);
+    request.controlPoints = {{2.0, {0.0, 0.0, 0.0}, true, 2},
+                             {6.0, {16.0, 0.0, 0.0}, false, 6},
+                             {10.0, {32.0, 0.0, 0.0}, false, 10}};
+    for (size_t i = 0; i < 2; ++i) {
+        request.controlPoints[i].segmentToNext.emplace();
+        request.controlPoints[i].segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
+        request.controlPoints[i].segmentToNext->message = "cspline";
+    }
+    // The first span is an explicit model trace whose fake bends the line
+    // off any spline reconstruction: a re-solve of the interior would call
+    // the fake again (the call counter catches it) and a spline would lose
+    // the bend.
+    request.controlPoints[0].segmentToNext->interpGoal = SegmentInterpolationGoal::Trace;
+    int segmentCalls = 0;
+    request.externalSegment = [&segmentCalls](const auto& span) {
+        ++segmentCalls;
+        vc::fiber_tracer::FiberTraceSegmentResult result;
+        result.accepted = true;
+        const auto start = span.referenceLine.at(span.startIndex);
+        const auto end = span.referenceLine.at(span.targetIndex);
+        result.fusedLine = {start, (start + end) * 0.5 + cv::Vec3d(0.0, 3.0, 0.0), end};
+        result.reason = "fiber_follow: target_plane";
+        return result;
+    };
+    setSpanTag(request.controlPoints[1].segmentToNext, kDamagedSpanTag, true);
+    request.extrapolationDistanceBaseVoxels = 8.0;
+    request.breakExtrapolationDistanceBaseVoxels = 4.0;
+    request.lasagnaConfig.segmentsPerSide = 2;
+    request.lasagnaConfig.segmentLength = 4.0;
+    request.lasagnaConfig.maxIterations = 20;
+    request.lasagnaConfig.printSolverProgress = false;
+    request.externalExtrapolation = [](const auto& history, const auto& direction, double distance) {
+        vc::fiber_tracer::FiberTraceOneWayResult result;
+        result.points = {history.back(), history.back() + direction / cv::norm(direction) * distance};
+        result.reason = "fiber_follow: max_len";
+        result.reachedTraceLength = true;
+        return result;
+    };
+    const auto full = optimizeFiberWithNativeFallback(request);
+    REQUIRE(full.controlPoints.size() == 3);
+    CHECK(segmentCalls == 1);
+    CHECK(full.nativeSegments == 1);
+    checkControlsNameTheirVertices(full);
+    {
+        const int a = full.controlPoints[0].optimizedIndex;
+        const int b = full.controlPoints[1].optimizedIndex;
+        REQUIRE(b - a == 2);
+        CHECK(full.optimization.line.points[size_t(a + 1)].position == cv::Vec3d(8.0, 3.0, 0.0));
+    }
+    segmentCalls = 0;
+
+    // Re-solve nothing but the tails, from the solved line, with the last
+    // control now a lone break.
+    FiberModeOptimizationRequest again = request;
+    again.controlPoints = full.controlPoints;
+    again.linePointsBase.clear();
+    for (const auto& point : full.optimization.line.points) again.linePointsBase.push_back(point.position);
+    tagControl(again.controlPoints.back(), kBreakTag);
+    again.dirtySegments = std::vector<size_t>{};
+    const auto tails = optimizeFiberWithNativeFallback(again);
+    CHECK(segmentCalls == 0);
+    CHECK(tails.nativeSegments == 0);
+    CHECK(tails.rayExtrapolations == 1);
+    CHECK(tails.nativeExtrapolations == 1);
+    checkControlsNameTheirVertices(tails);
+    CHECK(tails.optimization.line.points[size_t(tails.controlPoints[0].optimizedIndex + 1)].position ==
+          cv::Vec3d(8.0, 3.0, 0.0));
+    const int a = tails.controlPoints.front().optimizedIndex;
+    const int b = tails.controlPoints.back().optimizedIndex;
+    const int fa = full.controlPoints.front().optimizedIndex;
+    const int fb = full.controlPoints.back().optimizedIndex;
+    REQUIRE(b - a == fb - fa);
+    for (int i = 0; i <= b - a; ++i) {
+        CHECK(tails.optimization.line.points[size_t(a + i)].position ==
+              full.optimization.line.points[size_t(fa + i)].position);
+    }
+    for (size_t i = 0; i < 2; ++i) {
+        REQUIRE(tails.controlPoints[i].segmentToNext);
+        CHECK(tails.controlPoints[i].segmentToNext->interpGoal == full.controlPoints[i].segmentToNext->interpGoal);
+        CHECK(tails.controlPoints[i].segmentToNext->interpMode == full.controlPoints[i].segmentToNext->interpMode);
+        CHECK(tails.controlPoints[i].segmentToNext->tags == full.controlPoints[i].segmentToNext->tags);
+        CHECK(tails.controlPoints[i].segmentToNext->message == full.controlPoints[i].segmentToNext->message);
+    }
+    CHECK(tailLengthPast(tails.optimization.line, b, false) == doctest::Approx(4.0));
+    CHECK(tailLengthPast(tails.optimization.line, a, true) == doctest::Approx(8.0));
+}
+
+TEST_CASE("A control's own index wins over a coordinate search on the input line")
+{
+    using namespace vc3d::line_annotation;
+    FiberModeNormalSampler normals;
+    FiberModeOptimizationRequest request;
+    request.baseNormalSampler = &normals;
+    request.globalMode = FiberOptimizationMode::Lasagna;
+    // The line revisits the tail control's coordinate BETWEEN the controls
+    // (index 4 is a copy of (16,0,0) at index 6): a coordinate search, even
+    // one restricted to the line after the head, resolves the tail control
+    // to index 4 and loses the controlled vertices 5-6.
+    request.linePointsBase = straightLine(-8, 24, 4);
+    request.linePointsBase[4] = cv::Vec3d(16.0, 0.0, 0.0);
+    request.controlPoints = {{2.0, {0.0, 0.0, 0.0}, true, 2}, {6.0, {16.0, 0.0, 0.0}, false, 6}};
+    request.controlPoints.front().segmentToNext.emplace();
+    request.controlPoints.front().segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
+    request.lasagnaConfig.segmentsPerSide = 2;
+    request.lasagnaConfig.segmentLength = 4.0;
+    request.lasagnaConfig.maxIterations = 20;
+    request.lasagnaConfig.printSolverProgress = false;
+    request.extrapolationDistanceBaseVoxels = 8.0;
+    request.dirtySegments = std::vector<size_t>{};
+    const auto interval = [](const FiberModeOptimizationResult& result) {
+        checkControlsNameTheirVertices(result);
+        return result.controlPoints.back().optimizedIndex - result.controlPoints.front().optimizedIndex;
+    };
+    // optimizedIndex names the vertex: the whole controlled interval (4
+    // segments) is kept.
+    CHECK(interval(optimizeFiberWithNativeFallback(request)) == 4);
+    // An integral linePosition that names the vertex serves as well.
+    request.controlPoints.back().optimizedIndex = -1;
+    CHECK(interval(optimizeFiberWithNativeFallback(request)) == 4);
+    // Without either, the order-restricted coordinate search takes the first
+    // match after the head: the duplicate, and the interval shrinks to 2.
+    request.controlPoints.back().linePosition = 6.5;
+    CHECK(interval(optimizeFiberWithNativeFallback(request)) == 2);
+    // A duplicate BEFORE the head is never chosen by the restricted search.
+    request.linePointsBase = straightLine(-8, 24, 4);
+    request.linePointsBase.front() = cv::Vec3d(16.0, 0.0, 0.0);
+    CHECK(interval(optimizeFiberWithNativeFallback(request)) == 4);
+}
+
+TEST_CASE("Line-order span ranks drop owners without a successor")
+{
+    using namespace vc3d::line_annotation;
+    std::vector<LineControlPoint> controls{tailControl(20.0), tailControl(0.0, true), tailControl(10.0)};
+    CHECK(lineOrderSpanRanks(controls, {1}) == std::vector<size_t>{0});
+    CHECK(lineOrderSpanRanks(controls, {2}) == std::vector<size_t>{1});
+    CHECK(lineOrderSpanRanks(controls, {0}).empty());
+    CHECK(lineOrderSpanRanks(controls, {2, 1, 2, 7}) == std::vector<size_t>{0, 1});
+    controls[2].linePosition = std::numeric_limits<double>::quiet_NaN();
+    CHECK(lineOrderSpanRanks(controls, {1}) == std::vector<size_t>{0});
+    CHECK(lineOrderSpanRanks(controls, {2}).empty());
+}
+
+TEST_CASE("Placing beyond a lone end break tags the new control")
+{
+    using namespace vc3d::line_annotation;
+    const std::vector<cv::Vec3d> linePoints = straightLine(0, 40, 1);
+    const auto makeControls = []() {
+        std::vector<LineControlPoint> controls{tailControl(10.0, true), tailControl(20.0), tailControl(30.0)};
+        giveSpan(controls[0]);
+        giveSpan(controls[1]);
+        return controls;
+    };
+    const auto prepare = [&](const std::vector<LineControlPoint>& controls, std::vector<size_t> collapsed,
+                             double position) {
+        return prepareGeometricControlPointEdit(linePoints, controls, std::move(collapsed), position,
+                                                cv::Vec3d(position, 0.5, 0.0), 4.0);
+    };
+    SUBCASE("append beyond a lone break") {
+        auto controls = makeControls();
+        tagControl(controls[2], kBreakTag);
+        const auto prepared = prepare(controls, {}, 38.0);
+        REQUIRE(prepared.replacementIndex == 3);
+        CHECK(appendedControlToTagAsBreak(controls, prepared) == std::optional<size_t>{3});
+        // The prepared list is post-insertion: it never qualifies as the
+        // pre-edit snapshot.
+        CHECK(!appendedControlToTagAsBreak(prepared.controlPoints, prepared));
+    }
+    SUBCASE("append beyond an untagged end or a kollesis end") {
+        auto controls = makeControls();
+        CHECK(!appendedControlToTagAsBreak(controls, prepare(controls, {}, 38.0)));
+        tagControl(controls[2], kKollesisTerminationTag);
+        CHECK(!appendedControlToTagAsBreak(controls, prepare(controls, {}, 38.0)));
+    }
+    SUBCASE("append beyond a break that closes a gap") {
+        auto controls = makeControls();
+        tagControl(controls[1], kBreakTag);
+        tagControl(controls[2], kBreakTag);
+        setSpanTag(controls[1].segmentToNext, kGapSpanTag, true);
+        CHECK(!appendedControlToTagAsBreak(controls, prepare(controls, {}, 38.0)));
+        // Without the span tag the pair is read as a lone break.
+        setSpanTag(controls[1].segmentToNext, kGapSpanTag, false);
+        CHECK(appendedControlToTagAsBreak(controls, prepare(controls, {}, 38.0)) == std::optional<size_t>{3});
+    }
+    SUBCASE("a collapse onto the end and an interior insert do not qualify") {
+        auto controls = makeControls();
+        tagControl(controls[2], kBreakTag);
+        const auto collapsed = prepare(controls, {2}, 30.4);
+        CHECK(!collapsed.collapsedOldIndices.empty());
+        CHECK(!appendedControlToTagAsBreak(controls, collapsed));
+        const auto interior = prepare(controls, {}, 15.0);
+        CHECK(interior.replacementIndex == 1);
+        CHECK(!appendedControlToTagAsBreak(controls, interior));
+    }
+    SUBCASE("prepend before a lone head break") {
+        auto controls = makeControls();
+        tagControl(controls[0], kBreakTag);
+        const auto prepared = prepare(controls, {}, 2.0);
+        REQUIRE(prepared.replacementIndex == 0);
+        CHECK(appendedControlToTagAsBreak(controls, prepared) == std::optional<size_t>{0});
+        setSpanTag(controls[0].segmentToNext, kGapSpanTag, true);
+        tagControl(controls[1], kBreakTag);
+        CHECK(!appendedControlToTagAsBreak(controls, prepare(controls, {}, 2.0)));
+    }
+    SUBCASE("the pre-edit list may be out of line order") {
+        auto controls = makeControls();
+        tagControl(controls[2], kBreakTag);
+        std::vector<LineControlPoint> shuffled{controls[2], controls[0], controls[1]};
+        const auto prepared = prepare(shuffled, {}, 38.0);
+        REQUIRE(prepared.replacementIndex == 3);
+        CHECK(appendedControlToTagAsBreak(shuffled, prepared) == std::optional<size_t>{3});
+    }
+    SUBCASE("a single lone break control") {
+        std::vector<LineControlPoint> single{tailControl(20.0, true)};
+        tagControl(single[0], kBreakTag);
+        CHECK(appendedControlToTagAsBreak(single, prepare(single, {}, 30.0)) == std::optional<size_t>{1});
+        CHECK(appendedControlToTagAsBreak(single, prepare(single, {}, 10.0)) == std::optional<size_t>{0});
+    }
+}
+
+TEST_CASE("Mirrored control edits report tail-policy and goal changes per list")
+{
+    using namespace vc3d::line_annotation;
+    const auto makeControls = []() {
+        std::vector<LineControlPoint> controls{tailControl(0.0, true), tailControl(10.0), tailControl(20.0)};
+        giveSpan(controls[0]);
+        giveSpan(controls[1]);
+        return controls;
+    };
+    const auto setBreak = [](LineControlPoint& control) {
+        return setControlPointTag(control.tags, kBreakTag, true);
+    };
+    SUBCASE("end break changes the live policy, no goal") {
+        auto live = makeControls();
+        auto snapshot = makeControls();
+        const auto outcome = applyMirroredControlPointEdit(live, &snapshot, nullptr, {20, 0, 0}, setBreak);
+        CHECK(outcome.changed);
+        CHECK(outcome.livePolicyChanged);
+        CHECK(!outcome.liveSync.changed());
+        CHECK(outcome.snapshotChanged);
+        CHECK(hasControlPointTag(live[2].tags, kBreakTag));
+        CHECK(hasControlPointTag(snapshot[2].tags, kBreakTag));
+    }
+    SUBCASE("an interior gap changes a live goal but no end policy") {
+        auto live = makeControls();
+        tagControl(live[1], kBreakTag);
+        const auto outcome = applyMirroredControlPointEdit(live, nullptr, nullptr, {20, 0, 0}, setBreak);
+        CHECK(outcome.changed);
+        CHECK(!outcome.livePolicyChanged);
+        CHECK(outcome.liveSync.formed == std::vector<size_t>{1});
+        CHECK(spanIsGap(live[1].segmentToNext));
+        CHECK(live[1].segmentToNext->interpGoal == SegmentInterpolationGoal::Cspline);
+        CHECK(!outcome.snapshotChanged);
+    }
+    SUBCASE("a control that exists only in a snapshot") {
+        auto live = makeControls();
+        auto rollback = makeControls();
+        rollback.push_back(tailControl(30.0));
+        giveSpan(rollback[2]);
+        const auto outcome = applyMirroredControlPointEdit(live, nullptr, &rollback, {30, 0, 0}, setBreak);
+        CHECK(outcome.changed);
+        CHECK(!outcome.livePolicyChanged);
+        CHECK(!outcome.liveSync.changed());
+        CHECK(outcome.snapshotChanged);
+        CHECK(!hasControlPointTag(live[2].tags, kBreakTag));
+        CHECK(hasControlPointTag(rollback[3].tags, kBreakTag));
+    }
+    SUBCASE("a gap that forms only in a snapshot changes its goal there") {
+        for (const bool viaModeChange : {true, false}) {
+            auto live = makeControls();
+            tagControl(live[2], kBreakTag);  // already a break: the live edit is a no-op
+            auto snapshot = makeControls();
+            tagControl(snapshot[1], kBreakTag);
+            const auto outcome = applyMirroredControlPointEdit(
+                live, viaModeChange ? &snapshot : nullptr, viaModeChange ? nullptr : &snapshot,
+                {20, 0, 0}, setBreak);
+            CHECK(outcome.changed);
+            CHECK(!outcome.livePolicyChanged);
+            CHECK(!outcome.liveSync.changed());
+            CHECK(outcome.snapshotChanged);
+            CHECK(spanIsGap(snapshot[1].segmentToNext));
+            CHECK(snapshot[1].segmentToNext->interpGoal == SegmentInterpolationGoal::Cspline);
+            CHECK(!spanIsGap(live[1].segmentToNext));
+        }
+    }
+    SUBCASE("dissolving a gap while still cspline returns it to global") {
+        auto live = makeControls();
+        tagControl(live[1], kBreakTag);
+        tagControl(live[2], kBreakTag);
+        applyGapSpanPolicy(live);
+        REQUIRE(live[1].segmentToNext->interpGoal == SegmentInterpolationGoal::Cspline);
+        const auto outcome = applyMirroredControlPointEdit(
+            live, nullptr, nullptr, {20, 0, 0},
+            [](LineControlPoint& control) { return setControlPointTag(control.tags, kBreakTag, false); });
+        CHECK(outcome.liveSync.dissolved == std::vector<size_t>{1});
+        CHECK(live[1].segmentToNext->interpGoal == SegmentInterpolationGoal::Global);
+        CHECK(!outcome.livePolicyChanged);
+    }
+    SUBCASE("no match anywhere") {
+        auto live = makeControls();
+        const auto outcome = applyMirroredControlPointEdit(live, nullptr, nullptr, {99, 0, 0}, setBreak);
+        CHECK(!outcome.changed);
+    }
+}

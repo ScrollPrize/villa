@@ -881,6 +881,8 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
                 vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX,
                 vc3d::settings::line_annotation::EXTRAPOLATION_DISTANCE_VX_DEFAULT)
                 .toInt();
+        _appliedBreakExtrapolationDistanceVx =
+            vc3d::settings::line_annotation::breakExtrapolationDistanceVx(settings);
     }
     _initialCenterlineLengthSpin = new QSpinBox;
     _initialCenterlineLengthSpin->setObjectName(
@@ -935,13 +937,45 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
         extrapolationApply->setEnabled(false);
         emit extrapolationDistanceChanged(_appliedExtrapolationDistanceVx);
     });
+    _breakExtrapolationDistanceSpin = new QSpinBox;
+    _breakExtrapolationDistanceSpin->setObjectName(
+        QStringLiteral("lineAnnotationBreakExtrapolationDistanceSpinBox"));
+    _breakExtrapolationDistanceSpin->setRange(
+        vc3d::settings::line_annotation::BREAK_EXTRAPOLATION_DISTANCE_VX_MIN,
+        vc3d::settings::line_annotation::BREAK_EXTRAPOLATION_DISTANCE_VX_MAX);
+    _breakExtrapolationDistanceSpin->setSingleStep(100);
+    _breakExtrapolationDistanceSpin->setSuffix(tr(" vx"));
+    _breakExtrapolationDistanceSpin->setToolTip(
+        tr("Length of the straight ray generated beyond a lone break point or a "
+           "kollesis termination, instead of the model's extrapolation."));
+    _breakExtrapolationDistanceSpin->setValue(_appliedBreakExtrapolationDistanceVx);
+    _appliedBreakExtrapolationDistanceVx = _breakExtrapolationDistanceSpin->value();
+    auto* breakExtrapolationApply =
+        addSpinBoxMenuRow(tr("Break extrapolation"), _breakExtrapolationDistanceSpin);
+    connect(_breakExtrapolationDistanceSpin,
+            qOverload<int>(&QSpinBox::valueChanged),
+            this,
+            [this, breakExtrapolationApply](int value) {
+                breakExtrapolationApply->setEnabled(value != _appliedBreakExtrapolationDistanceVx);
+            });
+    connect(breakExtrapolationApply, &QPushButton::clicked, this, [this, breakExtrapolationApply]() {
+        _appliedBreakExtrapolationDistanceVx = _breakExtrapolationDistanceSpin->value();
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::line_annotation::BREAK_EXTRAPOLATION_DISTANCE_VX,
+                          _appliedBreakExtrapolationDistanceVx);
+        breakExtrapolationApply->setEnabled(false);
+        emit breakExtrapolationDistanceChanged(_appliedBreakExtrapolationDistanceVx);
+    });
     // Reopening the menu discards uncommitted edits (setValue back to the
     // applied values also re-disables the Apply buttons via valueChanged).
-    connect(annotationMenu, &QMenu::aboutToShow, this, [this, lengthApply, extrapolationApply]() {
+    connect(annotationMenu, &QMenu::aboutToShow, this,
+            [this, lengthApply, extrapolationApply, breakExtrapolationApply]() {
         _initialCenterlineLengthSpin->setValue(_appliedInitialCenterlineLengthVx);
         _extrapolationDistanceSpin->setValue(_appliedExtrapolationDistanceVx);
+        _breakExtrapolationDistanceSpin->setValue(_appliedBreakExtrapolationDistanceVx);
         lengthApply->setEnabled(false);
         extrapolationApply->setEnabled(false);
+        breakExtrapolationApply->setEnabled(false);
     });
     annotationMenu->addSeparator();
     _mirrorCursorAction = annotationMenu->addAction(tr("Mirror cursor across panes"));
@@ -1212,6 +1246,11 @@ int LineAnnotationDialog::initialCenterlineLengthVx() const
 int LineAnnotationDialog::extrapolationDistanceVx() const
 {
     return _appliedExtrapolationDistanceVx;
+}
+
+int LineAnnotationDialog::breakExtrapolationDistanceVx() const
+{
+    return _appliedBreakExtrapolationDistanceVx;
 }
 
 vc3d::line_annotation::FiberOptimizationMode
@@ -1722,6 +1761,9 @@ void LineAnnotationDialog::setOptimizationBusy(bool busy, bool blockInput)
     }
     if (_extrapolationDistanceSpin) {
         _extrapolationDistanceSpin->setEnabled(!busy);
+    }
+    if (_breakExtrapolationDistanceSpin) {
+        _breakExtrapolationDistanceSpin->setEnabled(!busy);
     }
     auto* content = centralWidget();
     if (!content) {
