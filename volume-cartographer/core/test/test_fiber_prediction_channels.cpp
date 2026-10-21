@@ -184,7 +184,7 @@ TEST_CASE("real prediction cache remains identical through old and options const
     std::cout << "Compared prediction field constructors at " << count << " real anchor positions\n";
 }
 
-TEST_CASE("embedding scoring preserves the fused normal corner path") {
+TEST_CASE("auxiliary scoring preserves the fused normal corner path") {
     Fixture fixture; fixture.auxiliary();
     fixture.channel<uint8_t>("grad_mag", std::vector<uint8_t>(8,255), utils::ZarrDtype::uint8);
     const auto dataset=fixture.dataset();
@@ -195,6 +195,9 @@ TEST_CASE("embedding scoring preserves the fused normal corner path") {
     config.beamWidth=3;
     config.beamPruneDistanceVoxels=0;
     config.embeddingWeight=.3;
+    config.widthRelativeTolerance=.4;
+    config.widthReferenceMean=22;
+    config.widthCosineWeight=true;
     config.parallelThreads=1;
     const auto serial=traceFiberExtrapolation(field,{.5,.5,.5},{0,0,1},.2,config,&normals);
     config.parallelThreads=4;

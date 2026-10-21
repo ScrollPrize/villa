@@ -112,6 +112,11 @@ struct FiberTraceConfig {
     int embeddingHistoryCount = 8;
     std::string embeddingHistoryFalloff = "uniform";
     std::string embeddingReferenceMode = "mean"; // mean or best in the bounded history
+    // Zero disables width sampling/gating. Width units must match sampleWidths.
+    double widthRelativeTolerance = 0.0;
+    bool widthCosineWeight = false;
+    double widthReferenceMean = 0.0; // positive: fixed reference, zero: committed mean
+    double initialWidthMean = 0.0; // optional seed for the committed mean
     FiberTraceProfile* profile = nullptr;
 };
 
@@ -448,6 +453,8 @@ struct FiberTraceOneWayResult {
     std::optional<cv::Vec3d> selectedTargetPlaneCrossing;
     double selectedTargetPlaneErrorVoxels =
         std::numeric_limits<double>::infinity();
+    double widthMean = 0.0;
+    uint64_t widthSamples = 0;
 };
 
 struct FiberTraceSegmentResult {
