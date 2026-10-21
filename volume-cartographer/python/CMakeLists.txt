@@ -28,6 +28,8 @@ configure_file(vc/__init__.py
 )
 configure_file(vc/fiber_evaluation.py "${CMAKE_CURRENT_BINARY_DIR}/vc/fiber_evaluation.py" COPYONLY)
 install(FILES vc/fiber_evaluation.py DESTINATION vc)
+configure_file(vc/fiber_evaluation_vis.py "${CMAKE_CURRENT_BINARY_DIR}/vc/fiber_evaluation_vis.py" COPYONLY)
+install(FILES vc/fiber_evaluation_vis.py DESTINATION vc)
 configure_file(vc/compression/__init__.py
     "${CMAKE_CURRENT_BINARY_DIR}/vc/compression/__init__.py"
     COPYONLY

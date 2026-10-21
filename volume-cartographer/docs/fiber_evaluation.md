@@ -7,7 +7,7 @@ unload or GPU allocation. It is suitable for an existing application's evaluatio
 phase, including a caller that already owns a demand-inference producer.
 
 This extracts the shared evaluation orchestrator and CP-bounded reference
-selection. It does not include dataset splits, parameter sweeps, visualization,
+selection. It does not include dataset splits, parameter sweeps, CT strip rendering,
 fiberlet/skeleton evaluation or model construction. The
 input schema is new and deliberately smaller than the experimental `replay-set`
 CLI; old experimental configs are not silently accepted.
@@ -47,6 +47,35 @@ the system temporary directory. Existing output is unchanged on failure.
 ```sh
 python -m vc.fiber_evaluation evaluation.json results.json
 ```
+
+### Offline result gallery
+
+Add `--html gallery.html` to write a geometry gallery after evaluation, or render
+an existing result with no native/GPU work:
+
+```sh
+python -m vc.fiber_evaluation_vis results.json gallery.html
+```
+
+The callable equivalent is `vc.fiber_evaluation_vis.write_gallery(report, path)`.
+It creates one self-contained HTML file with XY/XZ/YZ SVG projections for each
+directed case: gray reference, blue retained trace segments, red reference
+failure locations, plus failure reasons, threshold ratios and reported metrics.
+Restart/filter gaps remain separate polylines. Axis scales are equal within
+each panel; depth is collapsed. Values are base voxels, never implicit mm.
+The full submitted reference is shown; the tested arc interval is stated beside
+it. Filtered stops and failures remain separate, and directions are not pooled
+into an experimental combined score. Empty evaluations are supported.
+
+Results retain the exact submitted/selected reference geometry in `references`,
+so rendering never reloads potentially changed annotation files. Older results
+without this field are rejected, not silently reconstructed. HTML text is
+escaped, coordinates must be finite, and output is atomically replaced only
+after successful rendering. JSON and HTML are separate artifacts: if optional
+HTML output fails, the completed JSON remains usable. No external assets or
+JavaScript are required. This is a geometric result inspection, **not** the
+normal-aligned CT/presence strip renderer; that larger shared renderer remains
+with the fiberlet visualization extraction. Rendering does not alter metrics.
 
 Example configuration (replace paths, identity and points with your data):
 
@@ -247,6 +276,7 @@ With an existing native build and its Python environment:
 cmake --build <build> --target vc_fiber_trace -j 8
 python -m pytest volume-cartographer/python/tests/test_fiber_evaluation.py \
   volume-cartographer/python/tests/test_fiber_live_evaluation.py \
+  volume-cartographer/python/tests/test_fiber_evaluation_vis.py \
   volume-cartographer/python/tests/test_fiber_chunk_trace.py \
   --vc-build-python <build>/python
 ```

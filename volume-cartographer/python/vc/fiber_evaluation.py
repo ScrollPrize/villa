@@ -10,9 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 import copy
 import hashlib
 import json
-import os
 from pathlib import Path
-import tempfile
 
 import numpy as np
 
@@ -233,6 +231,7 @@ def evaluate(config, *, base_directory=".", control=None, progress=None):
             public_config["live_endpoint"].pop("token", None)
         return dict(format="vc_chunk_evaluation" if backend == "chunk" else "vc_beam_evaluation",
                     version=1, config=public_config, reference_selection=selection,
+                    references=[dict(id=item["id"], points_base_xyz=item["points_base_xyz"]) for item in selected],
                     cases=rows, failure_count=sum(len(row["failures"]) for row in rows),
                     filtered_stop_count=sum(len(row["filtered_stops"]) for row in rows),
                     retained_trace_length_base=sum(row["retained_trace_length_base"] for row in rows))
@@ -245,7 +244,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--html", type=Path, help="optional offline geometry gallery")
     args = parser.parse_args(argv)
+    if args.html is not None and args.html.resolve() == args.output.resolve():
+        parser.error("JSON and HTML output paths must differ")
     # All input is read once, before starting native work.
     config = json.loads(args.config.read_text())
     previous = None
@@ -257,18 +259,10 @@ def main(argv=None):
             previous = status
 
     result = evaluate(config, base_directory=args.config.resolve().parent, progress=progress)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", dir=args.output.parent,
-                                         prefix=args.output.name + ".", suffix=".tmp", delete=False) as stream:
-            temporary = Path(stream.name)
-            json.dump(result, stream, allow_nan=False)
-            stream.write("\n")
-        os.replace(temporary, args.output)
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    from .fiber_evaluation_vis import atomic_write_text, write_gallery
+    atomic_write_text(args.output, json.dumps(result, allow_nan=False) + "\n")
+    if args.html is not None:
+        write_gallery(result, args.html)
     return 0
 
 

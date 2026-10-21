@@ -203,6 +203,13 @@ def test_real_paris4_chunk_replay(tmp_path):
             trace=t.to_dict(), replay=dict(tangential_threshold_factor=2),
             cases=[dict(id="paris4", points_base_xyz=line.tolist(), end_arc_base=256)]))
         assert {k: v for k, v in direct_report["cases"][0].items() if k != "id"} == replay_dict(direct)
+        from vc.fiber_evaluation_vis import render_html, write_gallery
+        assert render_html(direct_report).count('<svg ') == 3
+        if directory := os.environ.get("VC_TEST_EVALUATION_GALLERY"):
+            write_gallery(direct_report, Path(directory) / "paris4-beam.html")
+            write_gallery(report, Path(directory) / "paris4-chunk.html")
+            (Path(directory) / "paris4-beam.json").write_text(json.dumps(direct_report))
+            print(f"Paris4 offline geometry galleries: {directory}")
         print(f"Paris4 direct beam: batch/callable exactly serial; {len(direct.segments)} segments, "
               f"{len(direct.failures)} failures; {len(selected)} selected directions")
     assert len(result.segments) == 1
