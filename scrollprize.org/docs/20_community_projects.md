@@ -411,6 +411,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
 
 - [ARGUS](https://github.com/Cinder-Covenant/ARGUS): an independent local workbench that keeps every result tied to its physical scroll, source data, model and evidence receipt, and refuses when identities or inputs do not match. Runnable example ([docs/PUBLIC_RUN.md](https://github.com/Cinder-Covenant/ARGUS/blob/main/docs/PUBLIC_RUN.md)): `argus run pherc0139-w016-ink9um-control` acquires a bounded crop of public PHerc0139 data and scores Villa's released `ink_9um` checkpoint as a held-out control; a run without a single-use authorisation, or with a replayed one, is refused. Uses Villa's tools as providers, ships no CT data or model weights, Apache-2.0. By DarthCeltic and clexious
 
+- [Vesuvius models on AMD GPUs (ROCm)](https://github.com/slchicoineau-creator/vesuvius-amd-rocm): how to run villa's 3-D models (neural-tracing Copy, lasagna, the v8-in, canonical 2.4 µm and Hecate ink models) on AMD GPUs. It lists the ROCm settings that matter and ships `conv3d_fast.py`, a drop-in that rewrites 3x3x3 Conv3d as 2-D taps so RDNA4 (gfx1201) cards avoid MIOpen's slow 3-D path: 2.8-7x per layer, 1.7-4x for the ink models where it is offered. Each fast mode is offered only where it passed a pre-registered check against stock on real PHerc0841 data; an equivalence checker lets you test your own model. MIT. By Chris Thomas (Baz248) and Sebastien Chicoineau
+
 ### 📦 Materials
 
 - [CT scanning campfire scrolls](https://dl.ash2txt.org/community-uploads/waynewaynehello/) Ahron Wayne replicated the carbonization process of a papyrus scroll and scanned it with his personal CT scanner
