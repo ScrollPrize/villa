@@ -56,6 +56,17 @@ class SurfaceTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError,'explicit'):
                     reader.read((0,0,0),(1,1,1))
 
+    def test_render_step_samples_every_step_th_uv_pixel(self):
+        for backend in self.backends():
+            with self.subTest(backend=backend),open_sample(self.reference,{'ink':self.label},backend=backend) as reader:
+                full=reader.render_surface(self.surface,(1,0),(7,9),offsets_um=(0,1))
+                strided=reader.render_surface(self.surface,(1,0),(3,5),offsets_um=(0,1),step=(3,2))
+                np.testing.assert_array_equal(host(strided['image'].data),host(full['image'].data)[:,:,::3,::2])
+                np.testing.assert_array_equal(host(strided['ink'].data),host(full['ink'].data)[:,::3,::2])
+                self.assertEqual(strided.metadata['surface']['uv_step'],(3,2))
+                with self.assertRaisesRegex(ValueError,'step'):
+                    reader.render_surface(self.surface,(1,0),(1,1),step=0)
+
     def test_projection_crop_padding_thickness_and_tiling(self):
         results=[]
         for backend in self.backends():

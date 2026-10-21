@@ -283,12 +283,16 @@ class SampleReader(SamplingEngine):
                         result[name].masks[mask] = array
             return results
 
-    def render_surface(self, surface, start, size, *, offsets_um=(0,)):
-        """Sample physical-offset layers over a YX patch in full-resolution surface UV."""
+    def render_surface(self, surface, start, size, *, offsets_um=(0,), step=1):
+        """Sample physical-offset layers over a YX patch in full-resolution surface UV.
+
+        ``step`` (an integer or YX pair) samples every step-th UV pixel: output pixel
+        (row, col) is UV ``start + (row*step_y, col*step_x)``, so ``size`` counts output pixels.
+        """
         from .surface import render_surface
         self._ready()
         with self._lock:
-            return render_surface(self, surface, start, size, offsets_um)
+            return render_surface(self, surface, start, size, offsets_um, step)
 
     def project_surface(self, surface, start, size, *, label_target, thickness_um=0, padding_um=0):
         """Use a label YX patch to bound a crop, then project its sheet across it.

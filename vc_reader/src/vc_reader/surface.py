@@ -312,9 +312,17 @@ def _check_budget(reader, shape, surface_shape=None):
                           'increase surface_output_bytes or use iter_project_surface')
 
 
-def render_surface(reader, surface, start, size, offsets):
+def _step(step):
+    step = (step, step) if isinstance(step, int) else tuple(step)
+    if len(step) != 2 or any(type(v) is not int or v <= 0 for v in step):
+        raise ValueError('step must be a positive integer or a YX pair of positive integers')
+    return step
+
+
+def render_surface(reader, surface, start, size, offsets, step=1):
     import numpy as np
     start,size = _region(start,size)
+    step = _step(step)
     offsets = tuple(float(v) for v in offsets)
     if not offsets or any(not math.isfinite(v) for v in offsets):
         raise ValueError('offsets_um must be nonempty and finite')
@@ -327,7 +335,7 @@ def render_surface(reader, surface, start, size, offsets):
                               (surface.sample_id,surface.volume_id))
     destination = reader._reference_map.inverse() @ between @ surface.xyz_to_volume @ _scale(surface.spacing_um).inverse()
     result = SampleResult({}, dict(reader.metadata or {}))
-    result.metadata['surface'] = dict(id=surface.id,uv_start=start,uv_size=size,offsets_um=offsets,
+    result.metadata['surface'] = dict(id=surface.id,uv_start=start,uv_size=size,uv_step=step,offsets_um=offsets,
         coordinate_frame=(surface.sample_id,surface.volume_id),reference_frame=reader._reference_frame,
         array_to_level0=reader._reference_map.matrix)
     n = math.prod(size)
@@ -345,7 +353,8 @@ def render_surface(reader, surface, start, size, offsets):
                               for k,t in target['companions'].items()}
     for first in range(0,n,8192):
         index=np.arange(first,min(first+8192,n))
-        uv=np.column_stack((index%size[1],index//size[1])).astype(np.float32)
+        # Output pixel (row, col) samples UV (start + row*step_y, start + col*step_x).
+        uv=np.column_stack((index%size[1]*step[1],index//size[1]*step[0])).astype(np.float32)
         uv_origin=(start[1],start[0],0)
         points,support,point_base=geom.sample(uv,offsets,destination,uv_origin)
         for name,target in {**reader._targets,**targets}.items():

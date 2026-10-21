@@ -53,9 +53,14 @@ OUTPUT_VALUES = {
     "ink": "unit-norm blended embedding",
 }
 DTYPES = ("int8", "float16")
+# Per-output storage: int8 with a per-vector scale array, int8 at a fixed 1/127 scale (unit vectors only;
+# keeps trilinear interpolation of the stored values linear), or plain floats.
+STORAGE = {"int8": (np.int8, True, None), "unit8": (np.int8, False, 1 / 127), "float16": (np.float16, False, None),
+           "float32": (np.float32, False, None)}
 FORMAT = "dinovol-embeddings/1"
 DENSE_POINT_CHUNK_SIZE = 262_144
 CHUNK_BYTES = 16 << 20
+NEED_MARGIN = 16  # voxels of need() context around a column: covers the token dilation
 
 
 # ---------------------------------------------------------------------------
@@ -152,8 +157,14 @@ def statistics_from_histogram(histogram: np.ndarray) -> dict[str, float]:
             "mad_clipped": mad, "robust_scale": scale}
 
 
-def sample_volume_histogram(reader, *, chunk_stride: int = 8, batch: int = 32) -> tuple[np.ndarray, int]:
-    """Histogram of nonzero values over every ``chunk_stride``-th chunk along each axis."""
+def sample_volume_histogram(reader, *, chunk_stride: int = 8, batch: int = 32,
+                            skip_missing: bool = False) -> tuple[np.ndarray, int]:
+    """Histogram of nonzero values over every ``chunk_stride``-th chunk along each axis.
+
+    skip_missing: leave out chunks an offline reader has not cached (CacheMissError); the count
+    returned is then the number of chunks actually read.
+    """
+    from vc_reader.reader import CacheMissError
     dtype = np.dtype(reader.dtype)
     if dtype.kind not in "ui" or dtype.itemsize > 2:
         raise ValueError(f"volume-wide statistics need 8/16-bit integer data, got {dtype}; "
@@ -162,13 +173,26 @@ def sample_volume_histogram(reader, *, chunk_stride: int = 8, batch: int = 32) -
     grid = [range(0, int(size), chunk * chunk_stride) for size, chunk in zip(reader.shape, chunks)]
     starts = [(z, y, x) for z in grid[0] for y in grid[1] for x in grid[2]]
     histogram = np.zeros(1 << (8 * dtype.itemsize), dtype=np.int64)
+    read = 0
     for i in tqdm(range(0, len(starts), batch), desc="normalization sample", unit="batch"):
         regions = [(start, chunks) for start in starts[i:i + batch]]
-        for block in reader.read_regions(regions):
+        try:
+            blocks = reader.read_regions(regions)
+        except CacheMissError:
+            if not skip_missing:
+                raise
+            blocks = []
+            for region in regions:
+                try:
+                    blocks.append(reader.read_region(*region))
+                except CacheMissError:
+                    pass
+        for block in blocks:
+            read += 1
             values = block[block != 0]
             if values.size:
                 histogram += np.bincount(values.ravel().astype(np.int64), minlength=histogram.size)
-    return histogram, len(starts)
+    return histogram, read
 
 
 def global_normalization(scheme: str, statistics: dict[str, float] | None,
@@ -198,13 +222,18 @@ def global_normalization(scheme: str, statistics: dict[str, float] | None,
 # Output storage
 
 
-def _chunk_shape(shape: Sequence[int], cell: int, itemsize: int) -> tuple[int, ...]:
-    """Chunks tile every lattice cell exactly, so each cell write touches whole chunks."""
-    z = min(int(shape[0]), 64)
+def _chunk_shape(shape: Sequence[int], cell: int, itemsize: int, *, z_cell: bool = False) -> tuple[int, ...]:
+    """Chunks tile every lattice cell exactly, so each cell write touches whole chunks.
+
+    z_cell: also align z chunks to cells (arrays spanning the volume, written slab by slab).
+    """
+    z = cell if z_cell else min(int(shape[0]), 64)
     yx = cell
     channels = int(shape[3]) if len(shape) == 4 else 1
     while z * yx * yx * channels * itemsize > CHUNK_BYTES and yx % 2 == 0:
         yx //= 2
+        if z_cell and z % 2 == 0:
+            z //= 2
     return (z, yx, yx, *shape[3:])
 
 
@@ -231,10 +260,13 @@ class ZarrGroupWriter:
         self.pool = concurrent.futures.ThreadPoolExecutor(workers)
         self.pending: list[concurrent.futures.Future] = []
 
-    def create(self, name: str, shape: Sequence[int], chunks: Sequence[int], dtype) -> None:
+    def create(self, name: str, shape: Sequence[int], chunks: Sequence[int], dtype,
+               attrs: dict[str, Any] | None = None) -> None:
         dtype = np.dtype(dtype)
         root = self.path / name
         root.mkdir(exist_ok=True)
+        if attrs:
+            (root / ".zattrs").write_text(json.dumps(attrs, indent=2))
         meta = {"zarr_format": 2, "shape": [int(v) for v in shape], "chunks": [int(v) for v in chunks],
                 "dtype": dtype.str, "fill_value": 0, "compressor": self.codec.get_config(),
                 "filters": None, "order": "C", "dimension_separator": "/"}
@@ -289,6 +321,10 @@ def read_embeddings(path: str | Path, name: str, selection: Any = ...) -> np.nda
     from vc_reader.reader import open_zarr
 
     values = open_zarr(str(Path(path) / name)).read(selection).astype(np.float32)
+    attrs_path = Path(path) / name / ".zattrs"
+    value_scale = json.loads(attrs_path.read_text()).get("value_scale") if attrs_path.exists() else None
+    if value_scale is not None:
+        values *= np.float32(value_scale)
     if not (Path(path) / f"{name}_scale").exists():
         return values
     return values * open_zarr(str(Path(path) / f"{name}_scale")).read(selection).astype(np.float32)[..., None]
@@ -306,10 +342,17 @@ class OutputSpec:
 
 
 def quantize(values: torch.Tensor, valid: torch.Tensor, dtype: str) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Zero invalid vectors; int8 uses a symmetric per-vector absmax scale stored as float16."""
+    """Zero invalid vectors; int8 uses a symmetric per-vector absmax scale stored as float16.
+
+    unit8 stores unit vectors as round(127 * value) with no scale array.
+    """
     values = torch.where(valid[..., None], values, 0)
     if dtype == "float16":
         return values.half(), None
+    if dtype == "float32":
+        return values.float(), None
+    if dtype == "unit8":
+        return (values * 127).round().clamp(-127, 127).to(torch.int8), None
     scale = (values.abs().amax(-1) / 127).half()
     divisor = torch.where(scale > 0, scale.float(), 1)[..., None]
     return (values / divisor).round().clamp(-127, 127).to(torch.int8), scale
@@ -318,7 +361,9 @@ def quantize(values: torch.Tensor, valid: torch.Tensor, dtype: str) -> tuple[tor
 class RegionEmbedder:
     def __init__(self, reader, loaded: LoadedBackbone, *, transforms: list, outputs: Sequence[str],
                  dense_stride: int, lattice: Sequence[AxisLattice], dtype: str = "int8",
+                 dtypes: dict[str, str] | None = None,
                  amp_dtype: torch.dtype = torch.bfloat16, point_chunk_size: int = DENSE_POINT_CHUNK_SIZE):
+        """dtypes overrides the storage (a STORAGE key) of individual outputs."""
         self.reader, self.loaded, self.device = reader, loaded, loaded.device
         self.backbone, self.dense_head = loaded.backbone, loaded.dense_head
         self.lattice, self.dtype, self.amp_dtype = tuple(lattice), dtype, amp_dtype
@@ -346,6 +391,10 @@ class RegionEmbedder:
         if self.dense_head is not None:
             channels.update(dense=int(self.dense_head.out_dim), ink=int(self.dense_head.ink_dim))
         self.outputs = tuple(name for name in OUTPUT_NAMES if name in outputs)
+        self.dtypes = {name: (dtypes or {}).get(name, dtype) for name in self.outputs}
+        for name, storage in self.dtypes.items():
+            if storage not in STORAGE or (storage == "unit8" and name == "tokens"):
+                raise ValueError(f"{name}: unsupported storage {storage!r}")
         # Accumulated grids; tokens_unit is written from the tokens accumulator.
         accumulated = {"tokens" if name == "tokens_unit" else name for name in self.outputs}
         self.specs = [OutputSpec(name, patch if name == "tokens" else (dense_stride,) * 3, channels[name])
@@ -358,22 +407,32 @@ class RegionEmbedder:
 
     def output_shape(self, spec: OutputSpec, z_range: tuple[int, int]) -> tuple[int, ...]:
         shape = self.reader.shape
-        return ((z_range[1] - z_range[0]) // spec.step[0], -(-int(shape[1]) // spec.step[1]),
+        return (-(-(z_range[1] - z_range[0]) // spec.step[0]), -(-int(shape[1]) // spec.step[1]),
                 -(-int(shape[2]) // spec.step[2]), spec.channels)
 
-    def chunk_shape(self, spec: OutputSpec, z_range: tuple[int, int], itemsize: int) -> tuple[int, ...]:
+    def chunk_shape(self, spec: OutputSpec, z_range: tuple[int, int], itemsize: int,
+                    z_cell: bool = False) -> tuple[int, ...]:
         cell = self.lattice[1].stride // spec.step[1]
-        return _chunk_shape(self.output_shape(spec, z_range), cell, itemsize)
+        return _chunk_shape(self.output_shape(spec, z_range), cell, itemsize, z_cell=z_cell)
 
-    def arrays(self, z_range: tuple[int, int]) -> list[tuple[str, OutputSpec, tuple[int, ...], tuple[int, ...]]]:
+    def arrays(self, z_range: tuple[int, int], *, z_cell: bool = False):
         """(name, spec, shape, chunks) of every written output, excluding int8 scales."""
         specs = {spec.name: spec for spec in self.specs}
-        itemsize = np.dtype(self.dtype).itemsize
         result = []
         for name in self.outputs:
             spec = specs["tokens" if name == "tokens_unit" else name]
-            result.append((name, spec, self.output_shape(spec, z_range), self.chunk_shape(spec, z_range, itemsize)))
+            itemsize = np.dtype(STORAGE[self.dtypes[name]][0]).itemsize
+            result.append((name, spec, self.output_shape(spec, z_range),
+                           self.chunk_shape(spec, z_range, itemsize, z_cell)))
         return result
+
+    def create_arrays(self, sink, z_range: tuple[int, int], *, z_cell: bool = False) -> None:
+        """Create every output (and int8 scale) array in sink for outputs covering z_range."""
+        for name, spec, shape, chunks in self.arrays(z_range, z_cell=z_cell):
+            dtype, scaled, value_scale = STORAGE[self.dtypes[name]]
+            sink.create(name, shape, chunks, dtype, attrs={"value_scale": value_scale} if value_scale else None)
+            if scaled:
+                sink.create(f"{name}_scale", shape[:3], chunks[:3], np.float16)
 
     def _axis_weights(self, axis: int, lo: int, n: int, step: int, origin: int) -> torch.Tensor:
         # Weights at output block centers [lo + i*step + step/2] relative to the tile origin.
@@ -384,8 +443,19 @@ class RegionEmbedder:
 
     @torch.inference_mode()
     def run(self, sink, *, z_range: tuple[int, int], y_range: tuple[int, int] | None = None,
-            x_range: tuple[int, int] | None = None, progress: bool = True) -> dict[str, int]:
+            x_range: tuple[int, int] | None = None, progress: bool = True, need=None,
+            array_z_range: tuple[int, int] | None = None, read: str = "band") -> dict[str, int]:
+        """Embed z_range (cells overlapping y/x_range) into sink.
+
+        need(z0, z1, y0, x0, size, margin) -> bool tensor or None: the voxels to embed over
+        [z0-margin, z1+margin) x [y0-margin, y0+size+margin) x (same for x), or None when there are
+        none. It must be a fixed function of global position so overlapping columns agree.
+        array_z_range: global z extent of the output arrays (default z_range); writes past its end
+        are clipped, so slabs may overhang the volume.
+        read: "band" reads a full-width row of columns at once, "column" one column at a time.
+        """
         z0, z1 = (int(v) for v in z_range)
+        array_z_range = tuple(int(v) for v in (array_z_range or z_range))
         steps = [spec.step for spec in self.specs]
         if z1 <= z0 or any(z0 % s[0] or z1 % s[0] for s in steps):
             raise ValueError(f"z range {z_range} must be non-empty and aligned to {[s[0] for s in steps]}")
@@ -403,6 +473,8 @@ class RegionEmbedder:
                       lx.origin(cols.stop - 1) + lx.tile - lx.origin(cols.start))
 
         def read_band(ky):
+            if read == "column":
+                return None
             return self.reader.read_region((band_z0, ly.origin(ky), lx.origin(cols.start)), band_shape)
 
         stats = {"columns": 0, "tiles": 0, "skipped_tiles": 0, "skipped_columns": 0, "cells_written": 0}
@@ -417,14 +489,27 @@ class RegionEmbedder:
                 next_top: dict[int, dict[str, torch.Tensor]] = {}
                 left: dict[str, torch.Tensor] | None = None
                 for kx in cols:
-                    offset = (kx - cols.start) * lx.stride
-                    column = band[:, :, offset:offset + lx.tile]
+                    need_mask = None
+                    if need is not None:
+                        need_mask = need(z0, z1, ky * ly.stride, kx * lx.stride, ly.support, NEED_MARGIN)
+                        if need_mask is None:
+                            stats["skipped_columns"] += 1
+                            left = None
+                            bar.update(1)
+                            continue
+                    if read == "column":
+                        column = self.reader.read_region((band_z0, ly.origin(ky), lx.origin(kx)),
+                                                         (band_shape[0], ly.tile, lx.tile))
+                    else:
+                        offset = (kx - cols.start) * lx.stride
+                        column = band[:, :, offset:offset + lx.tile]
                     box = (ly.stride if ky < cells_y.start else 0, ly.stride if ky == cells_y.stop - 1 else ly.support,
                            lx.stride if kx < cells_x.start else 0, lx.stride if kx == cells_x.stop - 1 else lx.support)
-                    acc, valid = self._embed_column(column, band_z0, (z0, z1), ky, kx, box, tiles_z, stats)
+                    acc, valid = self._embed_column(column, band_z0, (z0, z1), ky, kx, box, tiles_z, stats,
+                                                    need_mask)
                     if acc is not None:
                         self._finish_column(sink, acc, valid, (z0, z1), ky, kx, cells_y, cells_x,
-                                            top.get(kx), left, next_top, stats)
+                                            top.get(kx), left, next_top, stats, array_z_range)
                         left = {spec.name: acc[spec.name][:, :ly.stride // spec.step[1], lx.stride // spec.step[2]:]
                                 for spec in self.specs}
                     else:
@@ -436,8 +521,14 @@ class RegionEmbedder:
         bar.close()
         return stats
 
-    def _embed_column(self, column: np.ndarray, band_z0: int, z_range, ky: int, kx: int, box, tiles_z, stats):
-        """Blend all z tiles of one (ky, kx) column; accumulators cover ROI z x the yx support."""
+    def _embed_column(self, column: np.ndarray, band_z0: int, z_range, ky: int, kx: int, box, tiles_z, stats,
+                      need_mask=None):
+        """Blend all z tiles of one (ky, kx) column; accumulators cover ROI z x the yx support.
+
+        need_mask covers that region plus NEED_MARGIN voxels on every side: dense outputs are embedded
+        where it is set, tokens within one token of it (their trilinear support), always only where
+        the volume is nonzero.
+        """
         z0, z1 = z_range
         lz, ly, lx = self.lattice
         y_lo, y_hi, x_lo, x_hi = box
@@ -445,17 +536,37 @@ class RegionEmbedder:
                      lx.margin + x_lo:lx.margin + x_hi]
         if not roi.any():
             return None, None
-        stats["columns"] += 1
         raw = torch.from_numpy(np.ascontiguousarray(column)).to(self.device, non_blocking=True)
-        image = self.pipeline.batch({"image": raw[None, None]}, seeds=[0], device=self.device)["image"][0, 0]
         nonzero = raw[z0 - band_z0:z1 - band_z0, ly.margin:ly.margin + ly.support,
                       lx.margin:lx.margin + lx.support] != 0
         needed = torch.zeros_like(nonzero)
         needed[:, y_lo:y_hi, x_lo:x_hi] = True
-        acc, valid = {}, {}
+        valid = {}
+        m = NEED_MARGIN
+        for spec in self.specs:
+            base = nonzero & needed
+            if need_mask is None:
+                valid[spec.name] = F.max_pool3d(base[None].to(torch.float16), spec.step)[0] > 0
+                continue
+            inner = need_mask[m:m + nonzero.shape[0], m:m + nonzero.shape[1], m:m + nonzero.shape[2]]
+            if spec.name == "tokens":
+                # Tokens whose patch, or a neighboring token's, holds needed voxels: the margin makes
+                # this dilation agree between columns that share an overlap.
+                pooled = F.max_pool3d(need_mask[None].to(torch.float16), spec.step)
+                near = F.max_pool3d(pooled, 3, stride=1, padding=1)[0] > 0
+                t = [m // s for s in spec.step]
+                near = near[t[0]:t[0] + nonzero.shape[0] // spec.step[0], t[1]:t[1] + nonzero.shape[1] // spec.step[1],
+                            t[2]:t[2] + nonzero.shape[2] // spec.step[2]]
+                valid[spec.name] = (F.max_pool3d(base[None].to(torch.float16), spec.step)[0] > 0) & near
+            else:
+                valid[spec.name] = F.max_pool3d((base & inner)[None].to(torch.float16), spec.step)[0] > 0
+        if not any(v.any() for v in valid.values()):
+            return None, None
+        stats["columns"] += 1
+        image = self.pipeline.batch({"image": raw[None, None]}, seeds=[0], device=self.device)["image"][0, 0]
+        acc = {}
         for spec in self.specs:
             grid = tuple(n // s for n, s in zip(nonzero.shape, spec.step))
-            valid[spec.name] = F.max_pool3d((nonzero & needed)[None].to(torch.float16), spec.step)[0] > 0
             acc[spec.name] = torch.zeros((*grid, spec.channels + (spec.name == "tokens")), device=self.device)
         coarse = max(self.specs, key=lambda s: s.step[0])
         point_specs = [spec for spec in self.specs if spec.name != "tokens"]
@@ -527,7 +638,8 @@ class RegionEmbedder:
                     target = acc[spec.name].view(-1, spec.channels)
                     target.index_add_(0, rows, readout[spec.name][0].float() * w)
 
-    def _finish_column(self, sink, acc, valid, z_range, ky, kx, cells_y, cells_x, top, left, next_top, stats):
+    def _finish_column(self, sink, acc, valid, z_range, ky, kx, cells_y, cells_x, top, left, next_top, stats,
+                       array_z_range):
         """Finalize cell (ky, kx) and hand the overlap strips to the cells below and right."""
         ly, lx = self.lattice[1:]
         for spec in self.specs:
@@ -560,13 +672,16 @@ class RegionEmbedder:
             shape = self.output_shape(spec, z_range)
             y0, x0 = ky * sy, kx * sx
             ny, nx = min(sy, shape[1] - y0), min(sx, shape[2] - x0)
+            zi = (z_range[0] - array_z_range[0]) // spec.step[0]
+            nz = min((z_range[1] - z_range[0]) // spec.step[0],
+                     -(-(array_z_range[1] - array_z_range[0]) // spec.step[0]) - zi)
             for name, values in written.items():
                 if name not in self.outputs:
                     continue
-                data, scale = quantize(values, ok, self.dtype)
-                sink.write(name, (0, y0, x0), data[:, :ny, :nx].cpu().numpy())
+                data, scale = quantize(values, ok, self.dtypes[name])
+                sink.write(name, (zi, y0, x0), data[:nz, :ny, :nx].cpu().numpy())
                 if scale is not None:
-                    sink.write(f"{name}_scale", (0, y0, x0), scale[:, :ny, :nx].cpu().numpy())
+                    sink.write(f"{name}_scale", (zi, y0, x0), scale[:nz, :ny, :nx].cpu().numpy())
         if ky in cells_y and kx in cells_x:
             stats["cells_written"] += 1
 
@@ -703,10 +818,8 @@ def main(argv=None) -> None:
         "outputs": {},
     }
     sink = ZarrGroupWriter(args.output, attrs=attrs, overwrite=args.overwrite)
+    embedder.create_arrays(sink, z_range)
     for name, spec, shape, chunks in embedder.arrays(z_range):
-        sink.create(name, shape, chunks, args.dtype)
-        if args.dtype == "int8":
-            sink.create(f"{name}_scale", shape[:3], chunks[:3], np.float16)
         attrs["outputs"][name] = {
             "shape_zyxc": list(shape), "step_zyx": list(spec.step),
             "origin_zyx": [z_range[0], 0, 0],

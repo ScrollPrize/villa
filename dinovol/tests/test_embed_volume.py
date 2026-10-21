@@ -254,6 +254,40 @@ class RegionEmbedderTests(unittest.TestCase):
             err = np.abs(got[name].astype(np.float32)[valid] - want[name][valid])
             self.assertLess(err.mean(), 2e-3, name)
 
+    def test_sparse_need_mask_reproduces_the_full_run(self):
+        full, _ = self.embed((0, 120))
+        volume = self.volume
+        need = np.zeros(volume.shape, bool)
+        zz, yy, xx = np.indices(volume.shape)
+        need[np.abs(yy + 0.4 * xx - 0.3 * zz - 80) < 2.5] = True  # an oblique sheet
+
+        def need_fn(z0, z1, y0, x0, size, margin):
+            lo, hi = np.array([z0 - margin, y0 - margin, x0 - margin]), np.array([z1 + margin, y0 + size + margin, x0 + size + margin])
+            out = np.zeros(hi - lo, bool)
+            a, b = np.maximum(lo, 0), np.minimum(hi, volume.shape)
+            if np.any(a >= b):
+                return None
+            out[tuple(slice(i - l, j - l) for i, j, l in zip(a, b, lo))] = need[tuple(slice(i, j) for i, j in zip(a, b))]
+            return torch.from_numpy(out).cuda() if out.any() else None
+
+        embedder = self.embedder()
+        shapes = {}
+        for name, _, shape, _ in embedder.arrays((0, 120)):
+            shapes[name] = (shape, np.float16)
+        sink = MemorySink(shapes)
+        for z0 in (0, 72):  # two slabs, the second overhanging the volume
+            embedder.run(sink, z_range=(z0, z0 + 72), need=need_fn, array_z_range=(0, 120), read="column",
+                         progress=False)
+        for name, step in (("dense", 2), ("ink", 2), ("tokens_unit", 8)):
+            got, want = sink.arrays[name].astype(np.float32), full[name].astype(np.float32)
+            written = np.abs(got).sum(-1) > 0
+            self.assertGreater(written.sum(), 50, name)
+            np.testing.assert_allclose(got[written], want[written], rtol=0, atol=2e-3, err_msg=name)
+            if name != "tokens_unit":
+                blocks = need.reshape(120 // step, step, 110 // step, step, 100 // step, step).any(axis=(1, 3, 5))
+                expected = blocks & (np.abs(want).sum(-1) > 0)
+                np.testing.assert_array_equal(written, expected, err_msg=name)
+
     def test_masked_voxels_are_not_embedded(self):
         arrays, _ = self.embed((32, 64), dense_stride=1)
         nonzero = self.volume[32:64] != 0
