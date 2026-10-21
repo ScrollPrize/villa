@@ -502,8 +502,9 @@ is; they are not a stable contract.
   result reports whether anything was switched or shown; a revealed viewer
   may still be loading tiles.
 - Entries and labels that `ui.inspect` would withhold (see Inspection) are
-  painted over in the image; `masked` counts them. Other content is captured
-  as shown.
+  painted over in the image; `masked` counts them. This applies to every
+  target, the whole window included, so a label showing a URL with a signed
+  query is painted over too. Other content is captured as shown.
 - A target smaller than 8 logical pixels on a side returns -32009.
 
 ### Segmentation editing
