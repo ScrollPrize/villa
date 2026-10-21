@@ -5,9 +5,9 @@
 namespace vc3d::keybinds {
 
 namespace {
-constexpr const char* kSectionFileMenu = "File Menu";
-constexpr const char* kSectionViewMenu = "View Menu";
-constexpr const char* kSectionHelpMenu = "Help Menu";
+constexpr const char* kSectionFileMenu = "File";
+constexpr const char* kSectionViewMenu = "View";
+constexpr const char* kSectionHelpMenu = "Help";
 constexpr const char* kSectionViewerControls = "Viewer Controls";
 constexpr const char* kSectionNavigation = "Navigation";
 constexpr const char* kSectionLasagnaWorkspace = "Lasagna Workspace";
