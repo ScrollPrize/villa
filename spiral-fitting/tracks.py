@@ -1809,28 +1809,33 @@ def _aggregate_dt_track_losses(track_losses, across_p):
 
 
 def _build_track_flat_bundle(tracks, device):
-    valid_track_indices = [i for i, track in enumerate(tracks) if len(track) >= 2]
+    if isinstance(tracks, PackedTrackCollection):
+        valid_np = np.flatnonzero(tracks.selected_lengths >= 2)
+        valid_track_indices = valid_np.tolist()
+    else:
+        valid_track_indices = [i for i, track in enumerate(tracks) if len(track) >= 2]
     if not valid_track_indices:
         return None, torch.zeros(0, dtype=torch.int64), valid_track_indices
 
-    pairs = [
-        (
-            np.asarray(tracks[i], dtype=np.float32),
-            np.zeros(len(tracks[i]), dtype=np.float32),
-        )
-        for i in valid_track_indices
-    ]
-    lengths_np = np.fromiter((len(z) for z, _ in pairs), dtype=np.int64, count=len(pairs))
-    starts_np = np.empty(len(pairs) + 1, dtype=np.int64)
-    starts_np[0] = 0
-    np.cumsum(lengths_np, out=starts_np[1:])
+    if isinstance(tracks, PackedTrackCollection):
+        valid_tracks = tracks if len(valid_np) == len(tracks) else tracks.subset(valid_np)
+        zyxs_flat, starts_np = valid_tracks.materialize()
+        zyxs_flat = np.asarray(zyxs_flat[starts_np[0]:starts_np[-1]], dtype=np.float32)
+        starts_np = starts_np - starts_np[0]
+        lengths_np = np.diff(starts_np)
+    else:
+        track_zyxs = [np.asarray(tracks[i], dtype=np.float32) for i in valid_track_indices]
+        lengths_np = np.fromiter((len(z) for z in track_zyxs), dtype=np.int64, count=len(track_zyxs))
+        starts_np = np.empty(len(track_zyxs) + 1, dtype=np.int64)
+        starts_np[0] = 0
+        np.cumsum(lengths_np, out=starts_np[1:])
+        zyxs_flat = np.concatenate(track_zyxs, axis=0)
     total = int(starts_np[-1])
     if total == 0:
         return None, torch.from_numpy(lengths_np), valid_track_indices
 
-    zyxs_flat = np.concatenate([z for z, _ in pairs], axis=0).astype(np.float32, copy=False)
-    windings_flat = np.concatenate([w for _, w in pairs], axis=0).astype(np.float32, copy=False)
-    strip_id_np = np.repeat(np.arange(len(pairs), dtype=np.int64), lengths_np)
+    windings_flat = np.zeros(total, dtype=np.float32)
+    strip_id_np = np.repeat(np.arange(len(lengths_np), dtype=np.int64), lengths_np)
     flat = {
         'zyxs': torch.from_numpy(zyxs_flat).to(device=device),
         'windings': torch.from_numpy(windings_flat).to(device=device),
@@ -1945,7 +1950,7 @@ def _mode_winding_per_track(track_id, winding_idx_per_point, num_tracks, device)
     return mode_winding_per_track
 
 
-def _track_satisfaction_from_target(ctx, target_normalised_per_track):
+def _track_satisfaction_from_target(ctx, target_normalised_per_track, return_per_point=True):
     dr = ctx['dr']
     device = ctx['device']
     num_tracks = ctx['num_tracks']
@@ -1967,28 +1972,35 @@ def _track_satisfaction_from_target(ctx, target_normalised_per_track):
         target_shifted = target_normalised + windings * dr
         spiral_in_band = (unwrapped_shifted - target_shifted).abs() <= spiral_tolerance
 
+        # Only points already in the spiral band can be satisfied, so the
+        # inverse transform (the expensive part) is run on those alone.
+        in_band = torch.nonzero(spiral_in_band, as_tuple=True)[0]
+        theta_b = theta[in_band]
         target_radii = radius_from_unwrapped_shifted(
-            theta, target_shifted, adjustments, dr,
+            theta_b, target_shifted[in_band], adjustments[in_band], dr,
         )
         target_spiral_zyxs = torch.stack([
-            spiral_zyxs[..., 0],
-            torch.sin(theta) * target_radii,
-            torch.cos(theta) * target_radii,
+            spiral_zyxs[in_band, 0],
+            torch.sin(theta_b) * target_radii,
+            torch.cos(theta_b) * target_radii,
         ], dim=-1)
         target_scroll_zyxs = transform_in_chunks(target_spiral_zyxs, slice_to_spiral_transform.inv)
-        scan_distances = torch.linalg.norm(target_scroll_zyxs - zyxs, dim=-1)
-        scan_in_band = scan_distances <= scan_tolerance
+        scan_distances = torch.linalg.norm(target_scroll_zyxs - zyxs[in_band], dim=-1)
 
-        satisfied = spiral_in_band & scan_in_band
+        satisfied = torch.zeros_like(spiral_in_band)
+        satisfied[in_band] = scan_distances <= scan_tolerance
         satisfied_counts_dev = torch.zeros(num_tracks, dtype=torch.int64, device=device)
         satisfied_counts_dev.scatter_add_(0, track_id, satisfied.to(torch.int64))
         satisfied_counts = satisfied_counts_dev.cpu()
-        per_point_satisfaction = list(torch.split(satisfied.cpu(), lengths_cpu.tolist()))
+        per_point_satisfaction = (
+            list(torch.split(satisfied.cpu(), lengths_cpu.tolist())) if return_per_point else [])
 
     return satisfied_counts, per_point_satisfaction
 
 
-def get_track_satisfied_counts(slice_to_spiral_transform, dr_per_winding, tracks, metrics_config):
+def get_track_satisfied_counts(slice_to_spiral_transform, dr_per_winding, tracks, metrics_config,
+                               return_per_point=True):
+    # With return_per_point=False the per-point satisfaction list is returned empty ([]).
     device = dr_per_winding.device
     if not tracks:
         empty = torch.zeros(0, dtype=torch.int64)
@@ -2017,7 +2029,8 @@ def get_track_satisfied_counts(slice_to_spiral_transform, dr_per_winding, tracks
         mode_winding_per_track = _mode_winding_per_track(track_id, winding_idx_per_point, num_tracks, device)
         target_normalised_per_track = mode_winding_per_track.to(dr.dtype) * dr
 
-    satisfied_counts, per_point_satisfaction = _track_satisfaction_from_target(ctx, target_normalised_per_track)
+    satisfied_counts, per_point_satisfaction = _track_satisfaction_from_target(
+        ctx, target_normalised_per_track, return_per_point=return_per_point)
     return (
         valid_track_indices_t,
         satisfied_counts,
@@ -2033,6 +2046,7 @@ def get_track_satisfied_counts_in_chunks(slice_to_spiral_transform, dr_per_windi
         chunk = tracks[start:start + chunk_size]
         _, sat, tot, _, _ = get_track_satisfied_counts(
             slice_to_spiral_transform, dr_per_winding, chunk, metrics_config,
+            return_per_point=False,
         )
         sat_parts.append(sat)
         tot_parts.append(tot)
