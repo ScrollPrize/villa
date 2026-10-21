@@ -23,6 +23,11 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
 
+from vesuvius.neural_tracing.fiber_trace_3d.loss_statistics import LossStatistics as _LossStatistics
+from vesuvius.neural_tracing.fiber_trace_3d.training_state import (
+    model_optimizer_payload, restore_model_optimizer,
+)
+
 from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     DEFAULT_VOLUME_CACHE_MEMORY_MIB,
     FiberTrace3DBatch,
@@ -741,7 +746,7 @@ def _safe_probability_bce(
         )
 
 
-def _mean_over_nonempty_groups(
+def _nonempty_group_statistics(
     group_sum: torch.Tensor,
     group_count: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -751,9 +756,105 @@ def _mean_over_nonempty_groups(
         group_sum / group_count.clamp_min(1.0),
         torch.zeros_like(group_sum),
     )
-    valid_count = valid.to(dtype=group_sum.dtype).sum()
-    mean = group_mean.sum() / valid_count.clamp_min(1.0)
-    return mean, valid_count
+    return group_mean.sum(), valid.to(dtype=group_sum.dtype).sum()
+
+
+def _finalize_loss_statistics(
+    statistics: _LossStatistics,
+    *,
+    direction_weight: float,
+    presence_weight: float,
+    positive_query_weight: float = 1.0,
+    negative_query_weight: float = 1.0,
+    distributed: "_DistributedConfig | None" = None,
+) -> dict[str, torch.Tensor]:
+    names = (
+        "direction",
+        "positive_presence",
+        "negative_presence",
+        "angle",
+        "branch0",
+        "branch1",
+        "selected_score",
+    )
+    local_pairs = {
+        "direction": (statistics.direction_sum, statistics.direction_count),
+        "positive_presence": (
+            statistics.positive_presence_sum,
+            statistics.positive_presence_count,
+        ),
+        "negative_presence": (
+            statistics.negative_presence_sum,
+            statistics.negative_presence_count,
+        ),
+        "angle": (statistics.angle_sum, statistics.angle_count),
+        "branch0": (statistics.branch0_sum, statistics.branch_count),
+        "branch1": (statistics.branch1_sum, statistics.branch_count),
+        "selected_score": (
+            statistics.selected_score_sum,
+            statistics.selected_score_count,
+        ),
+    }
+    global_values: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+    world_size = 1
+    if distributed is not None and distributed.enabled:
+        world_size = int(distributed.world_size)
+        packed = torch.stack(
+            [
+                value.detach().to(dtype=torch.float32).reshape(())
+                for name in names
+                for value in local_pairs[name]
+            ]
+        )
+        dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+        global_values = {
+            name: (packed[index * 2], packed[index * 2 + 1])
+            for index, name in enumerate(names)
+        }
+
+    def ratio(name: str) -> torch.Tensor:
+        local_sum, local_count = local_pairs[name]
+        if not global_values:
+            return local_sum / local_count.clamp_min(1.0)
+        global_sum, global_count = global_values[name]
+        denominator = global_count.clamp_min(1.0)
+        differentiable = local_sum * (float(world_size) / denominator)
+        value = global_sum / denominator
+        return differentiable + (
+            value.to(dtype=differentiable.dtype) - differentiable.detach()
+        )
+
+    direction_loss = ratio("direction")
+    positive_presence_loss = ratio("positive_presence")
+    negative_presence_loss = ratio("negative_presence")
+    positive_count = (
+        global_values["positive_presence"][1]
+        if global_values
+        else statistics.positive_presence_count
+    )
+    negative_count = (
+        global_values["negative_presence"][1]
+        if global_values
+        else statistics.negative_presence_count
+    )
+    presence_loss = (
+        float(positive_query_weight)
+        * positive_presence_loss
+        * (positive_count > 0.0).to(dtype=positive_presence_loss.dtype)
+        + float(negative_query_weight)
+        * negative_presence_loss
+        * (negative_count > 0.0).to(dtype=negative_presence_loss.dtype)
+    )
+    total = float(direction_weight) * direction_loss + float(presence_weight) * presence_loss
+    return {
+        "total": total,
+        "direction": direction_loss,
+        "presence": presence_loss,
+        "angle_mean_deg": ratio("angle"),
+        "branch0_fraction": ratio("branch0"),
+        "branch1_fraction": ratio("branch1"),
+        "selected_score_mean": ratio("selected_score"),
+    }
 
 
 def _enforce_two_branch_min_fraction(
@@ -1019,16 +1120,26 @@ def compute_losses(
     direction_weight: float,
     presence_weight: float,
     branch_selection_mode: str = "eval_voxel",
-) -> dict[str, torch.Tensor]:
+    _return_statistics: bool = False,
+) -> dict[str, torch.Tensor] | _LossStatistics:
     require_materialized_targets(batch)
     assert batch.direction_indices_bzyx is not None
     assert batch.direction_target_sparse is not None
     assert batch.direction_weight_sparse is not None
     assert batch.presence_target is not None
     assert batch.presence_mask is not None
+    output_shape = tuple(int(v) for v in output.shape[-3:])
+    target_shape = tuple(int(v) for v in batch.presence_target.shape[-3:])
+    if output_shape != target_shape:
+        raise ValueError(
+            f"model output shape {output_shape} does not match target shape {target_shape}"
+        )
     pred_dirs = direction_outputs(output)
     pred_presences = presence_outputs(output)
     branch_count = int(pred_dirs.shape[1])
+    if _return_statistics and branch_count != 1:
+        raise ValueError("target-only loss statistics require one direction branch; "
+                         "multi-branch routing has prediction-dependent counts")
     indices = batch.direction_indices_bzyx.to(dtype=torch.long)
     if int(indices.shape[0]) > 0:
         pred_sparse = pred_dirs[
@@ -1079,18 +1190,17 @@ def compute_losses(
         pred_selected = pred_sparse[row_index, selected_branch]
         direction_error = (pred_selected - batch.direction_target_sparse) ** 2
         direction_error = direction_error * batch.direction_weight_sparse
-        direction_loss = direction_error.mean()
+        direction_sum = direction_error.float().sum()
+        direction_count = direction_error.new_tensor(direction_error.numel(), dtype=torch.float32)
         selected_axis = pred_axis[row_index, selected_branch]
         agreement = torch.abs(torch.sum(selected_axis * target_axis, dim=-1)).clamp(0.0, 1.0)
-        angle_mean_deg = torch.rad2deg(torch.acos(agreement)).mean()
+        angle_values = torch.rad2deg(torch.acos(agreement))
+        angle_sum = angle_values.sum()
+        angle_count = angle_values.new_tensor(angle_values.numel())
         selected_presence = pred_presence_sparse[row_index, selected_branch]
-        positive_presence_mask = batch.presence_mask[
-            indices[:, 0],
-            0,
-            indices[:, 1],
-            indices[:, 2],
-            indices[:, 3],
-        ]
+        positive_mask_f = batch.presence_mask[
+            indices[:, 0], 0, indices[:, 1], indices[:, 2], indices[:, 3]
+        ].to(dtype=torch.float32)
         positive_presence_bce = _safe_probability_bce(
             selected_presence.clamp(1.0e-6, 1.0 - 1.0e-6),
             torch.ones_like(selected_presence),
@@ -1098,7 +1208,6 @@ def compute_losses(
         )
         branch_patch_count = int(pred_presences.shape[0]) * branch_count
         positive_group_index = indices[:, 0] * branch_count + selected_branch
-        positive_mask_f = positive_presence_mask.to(dtype=positive_presence_bce.dtype)
         positive_group_sum = torch.zeros(
             (branch_patch_count,),
             dtype=positive_presence_bce.dtype,
@@ -1110,30 +1219,38 @@ def compute_losses(
             positive_group_index,
             positive_presence_bce * positive_mask_f,
         )
-        positive_group_count.scatter_add_(0, positive_group_index, positive_mask_f)
-        positive_presence_loss, positive_presence_group_count = _mean_over_nonempty_groups(
+        positive_group_count.scatter_add_(
+            0,
+            positive_group_index,
+            positive_mask_f,
+        )
+        positive_presence_sum, positive_presence_group_count = _nonempty_group_statistics(
             positive_group_sum,
             positive_group_count,
         )
-        selected_score_mean = score[row_index, selected_branch].mean()
-        branch0_fraction = (selected_branch == 0).to(dtype=torch.float32).mean()
-        branch1_fraction = (
-            (selected_branch == 1).to(dtype=torch.float32).mean()
-            if branch_count > 1
-            else selected_branch.to(dtype=torch.float32).sum() * 0.0
-        )
+        selected_scores = score[row_index, selected_branch]
+        selected_score_sum = selected_scores.sum()
+        selected_score_count = selected_scores.new_tensor(selected_scores.numel())
+        branch_count_stat = selected_scores.new_tensor(selected_branch.numel())
+        branch0_sum = (selected_branch == 0).to(dtype=selected_scores.dtype).sum()
+        branch1_sum = (selected_branch == 1).to(dtype=selected_scores.dtype).sum()
     else:
-        direction_loss = pred_dirs.sum() * 0.0
-        angle_mean_deg = pred_dirs.sum() * 0.0
-        positive_presence_loss = pred_presences.sum() * 0.0
+        zero = pred_dirs.sum() * 0.0
+        direction_sum = zero
+        direction_count = zero.detach()
+        angle_sum = zero
+        angle_count = zero.detach()
+        positive_presence_sum = pred_presences.sum() * 0.0
         positive_presence_group_count = torch.zeros(
             (),
             dtype=pred_presences.dtype,
             device=pred_presences.device,
         )
-        selected_score_mean = pred_presences.sum() * 0.0
-        branch0_fraction = pred_presences.sum() * 0.0
-        branch1_fraction = pred_presences.sum() * 0.0
+        selected_score_sum = pred_presences.sum() * 0.0
+        selected_score_count = zero.detach()
+        branch0_sum = pred_presences.sum() * 0.0
+        branch1_sum = pred_presences.sum() * 0.0
+        branch_count_stat = zero.detach()
 
     presence_target = batch.presence_target.unsqueeze(1).expand_as(pred_presences)
     presence_mask = batch.presence_mask.unsqueeze(1).expand_as(pred_presences)
@@ -1148,26 +1265,32 @@ def compute_losses(
         dim=(2, 3, 4, 5)
     ).reshape(-1)
     negative_group_count = negative_mask_f.sum(dim=(2, 3, 4, 5)).reshape(-1)
-    negative_presence_loss, negative_presence_group_count = _mean_over_nonempty_groups(
+    negative_presence_sum, negative_presence_group_count = _nonempty_group_statistics(
         negative_group_sum,
         negative_group_count,
     )
-    has_positive = (positive_presence_group_count > 0.0).to(dtype=pred_presences.dtype)
-    has_negative = (negative_presence_group_count > 0.0).to(dtype=pred_presences.dtype)
-    presence_loss = (
-        positive_presence_loss * has_positive
-        + negative_presence_loss * has_negative
+    statistics = _LossStatistics(
+        direction_sum=direction_sum,
+        direction_count=direction_count,
+        positive_presence_sum=positive_presence_sum,
+        positive_presence_count=positive_presence_group_count,
+        negative_presence_sum=negative_presence_sum,
+        negative_presence_count=negative_presence_group_count,
+        angle_sum=angle_sum,
+        angle_count=angle_count,
+        branch0_sum=branch0_sum,
+        branch1_sum=branch1_sum,
+        branch_count=branch_count_stat,
+        selected_score_sum=selected_score_sum,
+        selected_score_count=selected_score_count,
     )
-    total = float(direction_weight) * direction_loss + float(presence_weight) * presence_loss
-    return {
-        "total": total,
-        "direction": direction_loss,
-        "presence": presence_loss,
-        "angle_mean_deg": angle_mean_deg,
-        "branch0_fraction": branch0_fraction,
-        "branch1_fraction": branch1_fraction,
-        "selected_score_mean": selected_score_mean,
-    }
+    if _return_statistics:
+        return statistics
+    return _finalize_loss_statistics(
+        statistics,
+        direction_weight=direction_weight,
+        presence_weight=presence_weight,
+    )
 
 
 def compute_conditioned_losses(
@@ -1179,7 +1302,8 @@ def compute_conditioned_losses(
     perpendicular_jitter_degrees: float = 45.0,
     positive_query_weight: float = 1.0,
     negative_query_weight: float = 1.0,
-) -> dict[str, torch.Tensor]:
+    _return_statistics: bool = False,
+) -> dict[str, torch.Tensor] | _LossStatistics:
     require_materialized_targets(batch)
     assert batch.direction_indices_bzyx is not None
     assert batch.direction_target_sparse is not None
@@ -1243,7 +1367,9 @@ def compute_conditioned_losses(
             dtype=direction_error.dtype,
             device=direction_error.device,
         )[:, None, :]
-        direction_loss = direction_error.mean(dim=(0, 2)).mean()
+        # BF16 cannot represent every target count; reduce statistics in FP32.
+        direction_sum = direction_error.float().sum()
+        direction_count = direction_error.new_tensor(direction_error.numel(), dtype=torch.float32)
         pred_axis = decode_lasagna_direction_3x2_analytic(pred_dirs.reshape(-1, 6)).reshape(
             int(indices.shape[0]),
             positive_query_count,
@@ -1253,20 +1379,17 @@ def compute_conditioned_losses(
             0.0,
             1.0,
         )
-        angle_mean_deg = torch.rad2deg(torch.acos(agreement)).mean()
-        positive_presence_mask = batch.presence_mask.to(device=zero_output.device)[
-            indices[:, 0],
-            0,
-            indices[:, 1],
-            indices[:, 2],
-            indices[:, 3],
-        ]
+        angle_values = torch.rad2deg(torch.acos(agreement))
+        angle_sum = angle_values.sum()
+        angle_count = angle_values.new_tensor(angle_values.numel())
         positive_presence_bce = _safe_probability_bce(
             pred_presence.clamp(1.0e-6, 1.0 - 1.0e-6),
             torch.ones_like(pred_presence),
             reduction="none",
         )
-        positive_mask_f = positive_presence_mask[:, None].to(dtype=positive_presence_bce.dtype)
+        positive_mask_f = batch.presence_mask.to(device=zero_output.device)[
+            indices[:, 0], 0, indices[:, 1], indices[:, 2], indices[:, 3]
+        ][:, None].to(dtype=positive_presence_bce.dtype)
         group_index = (
             indices[:, 0, None] * positive_query_count
             + torch.arange(
@@ -1291,30 +1414,33 @@ def compute_conditioned_losses(
             group_index.reshape(-1),
             positive_mask_f.expand_as(positive_presence_bce).reshape(-1),
         )
-        positive_presence_loss, positive_presence_group_count = _mean_over_nonempty_groups(
+        positive_presence_sum, positive_presence_group_count = _nonempty_group_statistics(
             positive_group_sum,
             positive_group_count,
         )
-        selected_score_mean = (agreement * pred_presence.clamp(0.0, 1.0)).mean()
-        branch0_fraction = torch.full(
-            (),
-            0.5,
-            dtype=pred_presence.dtype,
-            device=pred_presence.device,
-        )
-        branch1_fraction = torch.full_like(branch0_fraction, 0.5)
+        selected_scores = agreement * pred_presence.clamp(0.0, 1.0)
+        selected_score_sum = selected_scores.sum()
+        selected_score_count = selected_scores.new_tensor(selected_scores.numel())
+        branch_count_stat = selected_scores.new_tensor(selected_scores.numel())
+        branch0_sum = branch_count_stat * 0.5
+        branch1_sum = branch_count_stat * 0.5
     else:
-        direction_loss = zero_output.sum() * 0.0
-        angle_mean_deg = zero_output.sum() * 0.0
-        positive_presence_loss = zero_output.sum() * 0.0
+        zero = zero_output.sum() * 0.0
+        direction_sum = zero
+        direction_count = zero.detach()
+        angle_sum = zero
+        angle_count = zero.detach()
+        positive_presence_sum = zero
         positive_presence_group_count = torch.zeros(
             (),
             dtype=zero_output.dtype,
             device=zero_output.device,
         )
-        selected_score_mean = zero_output.sum() * 0.0
-        branch0_fraction = zero_output.sum() * 0.0
-        branch1_fraction = zero_output.sum() * 0.0
+        selected_score_sum = zero
+        selected_score_count = zero.detach()
+        branch0_sum = zero
+        branch1_sum = zero
+        branch_count_stat = zero.detach()
 
     negative_presence = torch.stack(
         [zero_output[:, 6:7], random_output[:, 6:7]],
@@ -1332,36 +1458,40 @@ def compute_conditioned_losses(
         reduction="none",
     )
     negative_mask_f = batch.presence_mask.to(
-        device=negative_presence_bce.device,
-        dtype=negative_presence_bce.dtype,
+        device=negative_presence_bce.device, dtype=negative_presence_bce.dtype
     )[:, None].expand_as(negative_presence_bce)
     negative_group_sum = (negative_presence_bce * negative_mask_f).sum(
         dim=(2, 3, 4, 5)
     ).reshape(-1)
     negative_group_count = negative_mask_f.sum(dim=(2, 3, 4, 5)).reshape(-1)
-    negative_presence_loss, negative_presence_group_count = _mean_over_nonempty_groups(
+    negative_presence_sum, negative_presence_group_count = _nonempty_group_statistics(
         negative_group_sum,
         negative_group_count,
     )
-    has_positive = (positive_presence_group_count > 0.0).to(dtype=zero_output.dtype)
-    has_negative = (negative_presence_group_count > 0.0).to(dtype=zero_output.dtype)
-    positive_component = (
-        float(positive_query_weight) * positive_presence_loss * has_positive
+    statistics = _LossStatistics(
+        direction_sum=direction_sum,
+        direction_count=direction_count,
+        positive_presence_sum=positive_presence_sum,
+        positive_presence_count=positive_presence_group_count,
+        negative_presence_sum=negative_presence_sum,
+        negative_presence_count=negative_presence_group_count,
+        angle_sum=angle_sum,
+        angle_count=angle_count,
+        branch0_sum=branch0_sum,
+        branch1_sum=branch1_sum,
+        branch_count=branch_count_stat,
+        selected_score_sum=selected_score_sum,
+        selected_score_count=selected_score_count,
     )
-    negative_component = (
-        float(negative_query_weight) * negative_presence_loss * has_negative
+    if _return_statistics:
+        return statistics
+    return _finalize_loss_statistics(
+        statistics,
+        direction_weight=direction_weight,
+        presence_weight=presence_weight,
+        positive_query_weight=positive_query_weight,
+        negative_query_weight=negative_query_weight,
     )
-    presence_loss = positive_component + negative_component
-    total = float(direction_weight) * direction_loss + float(presence_weight) * presence_loss
-    return {
-        "total": total,
-        "direction": direction_loss,
-        "presence": presence_loss,
-        "angle_mean_deg": angle_mean_deg,
-        "branch0_fraction": branch0_fraction,
-        "branch1_fraction": branch1_fraction,
-        "selected_score_mean": selected_score_mean,
-    }
 
 
 def _save_snapshot(
@@ -1377,15 +1507,12 @@ def _save_snapshot(
 ) -> None:
     snapshot_model = _unwrap_model(model)
     payload = {
-        "model": snapshot_model.state_dict(),
-        "optimizer": optimizer.state_dict(),
+        **model_optimizer_payload(snapshot_model, optimizer, grad_scaler),
         "step": int(step),
         "config": _json_safe(config),
         "metric": metric,
         "metric_name": metric_name,
     }
-    if _grad_scaler_enabled(grad_scaler):
-        payload["grad_scaler"] = grad_scaler.state_dict()
     torch.save(payload, path)
 
 
@@ -1415,18 +1542,10 @@ def _load_snapshot(
     map_location: torch.device | str = "cpu",
 ) -> int:
     payload = torch.load(path, map_location=map_location)
-    state = payload.get("model", payload)
-    model.load_state_dict(state)
+    restore_model_optimizer(payload, model=model, optimizer=optimizer, grad_scaler=grad_scaler)
     if optimizer is not None and isinstance(payload, dict) and "optimizer" in payload:
-        optimizer.load_state_dict(payload["optimizer"])
         if optimizer_hparams is not None:
             _apply_optimizer_hparams(optimizer, optimizer_hparams)
-    if (
-        _grad_scaler_enabled(grad_scaler)
-        and isinstance(payload, dict)
-        and "grad_scaler" in payload
-    ):
-        grad_scaler.load_state_dict(payload["grad_scaler"])
     return int(payload.get("step", 0)) if isinstance(payload, dict) else 0
 
 
@@ -2020,6 +2139,9 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
         if sparse_tangent is not None:
             sparse_tangent = sparse_tangent[sparse_mask]
     return FiberTrace3DBatch(
+        target_output_stride=batch.target_output_stride,
+        normalization_output_stride=batch.normalization_output_stride,
+        normalization_counts=batch.normalization_counts,
         volume=batch.volume[start:stop],
         valid_mask=batch.valid_mask[start:stop],
         cp_local_zyx=batch.cp_local_zyx[start:stop],
