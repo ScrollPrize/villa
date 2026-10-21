@@ -173,6 +173,22 @@ def test_real_paris4_chunk_replay(tmp_path):
     replay = ft.ChunkReplayConfig()
     replay.tangential_threshold_factor = 2
     result = cache.replay(line, normal, replay, end_arc_base=256)
+    if hasattr(ft, "EvaluationControl") and ft.case_queue_supported():
+        from vc.fiber_evaluation import replay_dict
+        control = ft.EvaluationControl()
+        queued = cache.replay_many([ft.EvaluationCase(line, end_arc_base=256)] * 2,
+                                  normal, replay, control, workers=2, contexts_per_worker=2)
+        assert control.status()["completed"] == 2
+        assert all(replay_dict(r) == replay_dict(result) for r in queued)
+        from vc.fiber_evaluation import evaluate, CHUNK_KEYS
+        report = evaluate(dict(version=1, prediction_manifest=manifest,
+            normal_manifest=normal_manifest, source_identity="paris4-binding-test",
+            chunk_cache=str(tmp_path / "cache"), enable_width=True,
+            trace=t.to_dict(), chunks={key: getattr(c, key) for key in CHUNK_KEYS},
+            replay=dict(tangential_threshold_factor=2),
+            cases=[dict(id="paris4-forward", points_base_xyz=line.tolist(), end_arc_base=256)]))
+        assert {k: v for k, v in report["cases"][0].items() if k != "id"} == replay_dict(result)
+        print("Paris4 queued evaluation: 2 cases exactly equal to serial replay")
     assert len(result.segments) == 1
     assert result.failures == []
     assert result.completed_reference_arc_base == 256
