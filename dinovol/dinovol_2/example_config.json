@@ -8,14 +8,16 @@
   "wandb_resume": "allow",
   "wandb_run_id": null,
   "volume_auth": "/path/to/some/credentials.json",
-  "lr": 2.5e-5,
-  "min_lr": 1e-6,
+  "lr": 2.5e-05,
+  "lr_schedule": "constant",
+  "koleo_distributed": true,
+  "min_lr": 1e-06,
   "weight_decay": 0.04,
-  "weight_decay_end": 0.2,
+  "weight_decay_end": 0.04,
   "patch_embed_lr_mult": 0.2,
   "freeze_last_layer_steps": 1250,
   "momentum_teacher": 0.994,
-  "final_momentum_teacher": 1.0,
+  "final_momentum_teacher": 0.994,
   "warmup_teacher_temp": 0.04,
   "teacher_temp": 0.07,
   "warmup_teacher_temp_steps": 37500,
@@ -30,7 +32,10 @@
   "eval_task_decoder_type": "simple",
   "batch_size": 2,
   "model": {
-    "model_type": "v2",
+    "model_type": "v3",
+    "rope_type": "axial",
+    "untie_cls_and_patch_norms": false,
+    "untie_global_and_local_cls_norm": true,
     "embedding_type": "default",
     "global_crops_size": [
       96,
@@ -92,14 +97,14 @@
       "output_dir": "./dinov2_base_pretrain/",
       "resume": true,
       "auto_resume": true,
-      "lr": 2.5e-5,
-      "min_lr": 1e-6,
+      "lr": 2.5e-05,
+      "min_lr": 1e-06,
       "weight_decay": 0.04,
-      "weight_decay_end": 0.2,
+      "weight_decay_end": 0.04,
       "patch_embed_lr_mult": 0.2,
       "freeze_last_layer_steps": 1250,
       "momentum_teacher": 0.994,
-      "final_momentum_teacher": 1.0,
+      "final_momentum_teacher": 0.994,
       "warmup_teacher_temp": 0.04,
       "teacher_temp": 0.07,
       "warmup_teacher_temp_steps": 37500,
@@ -108,7 +113,7 @@
       "max_iterations": 1000000,
       "batch_size": 2,
       "model": {
-        "model_type": "v2",
+        "model_type": "v3",
         "embedding_type": "default",
         "global_crops_size": [
           96,
@@ -119,7 +124,10 @@
           48,
           48,
           48
-        ]
+        ],
+        "rope_type": "axial",
+        "untie_cls_and_patch_norms": false,
+        "untie_global_and_local_cls_norm": true
       },
       "gram": {
         "enabled": false,
@@ -149,14 +157,19 @@
             "volume_scale": 0
           }
         ]
-      }
+      },
+      "lr_schedule": "constant",
+      "koleo_distributed": true,
+      "koleo_loss_group_size": 16
     },
     "gram_refinement": {
       "output_dir": "./dinov2_gram_refinement/",
       "resume": false,
       "auto_resume": false,
-      "lr": 1.25e-5,
-      "min_lr": 1.25e-5,
+      "lr": 1.25e-05,
+      "lr_schedule": "constant",
+      "warmup_steps": 0,
+      "min_lr": 1.25e-05,
       "weight_decay": 0.04,
       "weight_decay_end": 0.04,
       "patch_embed_lr_mult": 0.2,
@@ -170,7 +183,7 @@
       "max_iterations": 10000,
       "batch_size": 2,
       "model": {
-        "model_type": "v2",
+        "model_type": "v3",
         "embedding_type": "default",
         "global_crops_size": [
           96,
@@ -183,7 +196,10 @@
           48
         ],
         "pretrained_weights": "/path/to/base_pretrain/checkpoint_step_010000.pt",
-        "pretrained_backbone_only": false
+        "pretrained_backbone_only": false,
+        "rope_type": "axial",
+        "untie_cls_and_patch_norms": false,
+        "untie_global_and_local_cls_norm": true
       },
       "gram": {
         "enabled": true,
@@ -219,14 +235,18 @@
             "volume_scale": 0
           }
         ]
-      }
+      },
+      "koleo_distributed": true,
+      "koleo_loss_group_size": 16
     },
     "hr_adaptation": {
       "output_dir": "./dinov2_hr_adaptation/",
       "resume": false,
       "auto_resume": false,
-      "lr": 1.25e-5,
-      "min_lr": 1.25e-5,
+      "lr": 1.25e-05,
+      "lr_schedule": "constant",
+      "warmup_steps": 0,
+      "min_lr": 1.25e-05,
       "weight_decay": 0.04,
       "weight_decay_end": 0.04,
       "patch_embed_lr_mult": 0.2,
@@ -240,7 +260,7 @@
       "max_iterations": 10000,
       "batch_size": 1,
       "model": {
-        "model_type": "v2",
+        "model_type": "v3",
         "embedding_type": "default",
         "global_crops_size": [
           96,
@@ -253,7 +273,10 @@
           48
         ],
         "pretrained_weights": "/path/to/gram_refinement/checkpoint_step_010000.pt",
-        "pretrained_backbone_only": false
+        "pretrained_backbone_only": false,
+        "rope_type": "axial",
+        "untie_cls_and_patch_norms": false,
+        "untie_global_and_local_cls_norm": true
       },
       "gram": {
         "enabled": true,
@@ -337,7 +360,10 @@
             "volume_scale": 0
           }
         ]
-      }
+      },
+      "koleo_distributed": true,
+      "koleo_loss_group_size": 16
     }
-  }
+  },
+  "koleo_loss_group_size": 16
 }

@@ -158,6 +158,7 @@ else()
     option(VC_BUILD_APPS  "Build app executables (vc_*, VC3D)"           ON)
 endif()
 option(VC_BUILD_UI_TRACER  "Build Qt UI/tracer helper libraries"         ${VC_BUILD_APPS})
+option(VC_BUILD_FIBERLETS "Build the vc_fiberlets command-line processor" ${VC_BUILD_APPS})
 
 # ---- Toolchain --------------------------------------------------------------
 foreach(_path "$ENV{HOME}/miniconda3" "$ENV{HOME}/anaconda3")
@@ -792,7 +793,7 @@ endif()
 # (static/interface/PCH helper targets are skipped — they aren't needed at
 # runtime). The vc_runtime component keeps this isolated from unrelated
 # dependency install rules (e.g. libigl's CMake config exports).
-set(_vc_install_dirs core utils libs/c3d)
+set(_vc_install_dirs core utils libs/c3d libs/volcomp)
 if(VC_BUILD_APPS)
     list(APPEND _vc_install_dirs apps apps/VC3D)
 endif()
@@ -850,6 +851,9 @@ if(VC_TESTING)
         test_lasagna_manifest
         test_lasagna_project_volumes
         test_fiber_trace3d
+        test_fiber_anchors
+        test_fiberlet_paths
+        test_fiberlet_storage
         test_open_data_manifest
         test_lasagna_line_optimizer
         test_lasagna_line_view_surfaces
@@ -981,3 +985,6 @@ if(VC_TESTING)
             COMMENT "Running clang source-based coverage")
     endif()
 endif()
+
+# Windows (MinGW): UTF-8 application manifest in every executable (#1979).
+include(cmake/WindowsUtf8Manifest.cmake)

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import atexit
-from collections import deque
+from collections import deque, OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from functools import wraps
 import json
+import itertools
+import mmap
 import multiprocessing as mp
 from multiprocessing import shared_memory
 import os
@@ -28,6 +30,7 @@ import zarr
 
 try:
 	from omezarr_pyramid import (
+		_limit_zarr_codec_threads,
 		_single_threaded_native_runtime,
 		build_normal_omezarr_pyramid,
 		build_scalar_omezarr_pyramid,
@@ -35,6 +38,7 @@ try:
 	)
 except ImportError:
 	from lasagna.omezarr_pyramid import (
+		_limit_zarr_codec_threads,
 		_single_threaded_native_runtime,
 		build_normal_omezarr_pyramid,
 		build_scalar_omezarr_pyramid,
@@ -91,15 +95,281 @@ class _FlushGroupDescriptor:
 	weight: "_MmapBandDescriptor"
 
 
+@dataclass
+class _FlushBatchState:
+	batch_id: int
+	plans: tuple[_FlushGroupDescriptor, ...]
+	tasks: deque["_FlushProcessTask"]
+	inflight: set[int]
+	completed_ids: set[int]
+	work_s: float
+	written_by_sd: dict[int, int]
+	task_sd: dict[int, int]
+
+	@property
+	def complete(self) -> bool:
+		return not self.tasks and not self.inflight
+
+
+@dataclass
+class _ZBandState:
+	z: int
+	next_z: int
+	first_sequence: int
+	expected: int
+	generated: int = 0
+	committed: int = 0
+
+	@property
+	def end_sequence(self) -> int:
+		return self.first_sequence + self.expected
+
+	def validate_complete(self) -> None:
+		if self.generated != self.expected or self.committed != self.expected:
+			raise RuntimeError(
+				f"incomplete Z band z={self.z}: generated={self.generated} "
+				f"committed={self.committed} expected={self.expected}"
+			)
+
+
+class _SlotLedger:
+	"""Single-owner lifecycle for shared input/result slots."""
+
+	def __init__(self, count: int):
+		self._count = int(count)
+		self._owners: dict[tuple[str, int], tuple[int, int, str]] = {}
+
+	def acquire(self, kind: str, slot: int, *, band: int, sequence: int, stage: str) -> None:
+		key = (str(kind), int(slot))
+		if key in self._owners:
+			raise RuntimeError(f"shared {kind} slot {slot} already owned by {self._owners[key]}")
+		if not 0 <= int(slot) < self._count:
+			raise RuntimeError(f"invalid shared {kind} slot {slot}")
+		self._owners[key] = (int(band), int(sequence), str(stage))
+
+	def transition(self, kind: str, slot: int, *, band: int, sequence: int, stage: str) -> None:
+		key = (str(kind), int(slot))
+		expected = (int(band), int(sequence))
+		owner = self._owners.get(key)
+		if owner is None or owner[:2] != expected:
+			raise RuntimeError(
+				f"shared {kind} slot {slot} transition for {expected} conflicts with owner {owner}"
+			)
+		self._owners[key] = (expected[0], expected[1], str(stage))
+
+	def release(self, kind: str, slot: int, *, band: int, sequence: int) -> None:
+		key = (str(kind), int(slot))
+		expected = (int(band), int(sequence))
+		owner = self._owners.get(key)
+		if owner is None or owner[:2] != expected:
+			raise RuntimeError(
+				f"shared {kind} slot {slot} release for {expected} conflicts with owner {owner}"
+			)
+		del self._owners[key]
+
+	def validate_all_free(self) -> None:
+		if self._owners:
+			raise RuntimeError(f"shared slots still owned at Z-band boundary: {self._owners}")
+
+	def snapshot(self) -> dict[tuple[str, int], tuple[int, int, str]]:
+		return dict(self._owners)
+
+
+_FRONTIER_NEEDS_GPU_STATUSES = frozenset(("fetching", "awaiting_read", "reading", "ready"))
+
+
+def _effective_accumulation_frontier(
+	events: Mapping[int, Mapping[str, Any]], frontier_sequence: int,
+) -> tuple[int, tuple[int, ...]]:
+	"""Return the first canonical event not already resolved as a sparse skip."""
+	sequence = int(frontier_sequence)
+	skipped: list[int] = []
+	while events.get(sequence, {}).get("status") == "done_skip":
+		skipped.append(sequence)
+		sequence += 1
+	return sequence, tuple(skipped)
+
+
+def _frontier_slot_reservation(
+	events: Mapping[int, Mapping[str, Any]], frontier_sequence: int,
+) -> int:
+	"""Reserve one shared slot pair until the accumulation frontier enters GPU."""
+	effective, _skipped = _effective_accumulation_frontier(events, frontier_sequence)
+	event = events.get(effective)
+	if event is None:
+		return 0
+	return int(str(event.get("status", "unknown")) in _FRONTIER_NEEDS_GPU_STATUSES)
+
+
+def _shared_slot_pair_available(
+	*, events: Mapping[int, Mapping[str, Any]], frontier_sequence: int,
+	sequence: int, free_input_count: int, free_result_count: int,
+) -> bool:
+	"""Admit later GPU work only while the frontier's slot pair stays free."""
+	if int(free_input_count) <= 0 or int(free_result_count) <= 0:
+		return False
+	effective, _skipped = _effective_accumulation_frontier(events, frontier_sequence)
+	reservation = _frontier_slot_reservation(events, frontier_sequence)
+	if int(sequence) == effective or not reservation:
+		return True
+	return int(free_input_count) > reservation and int(free_result_count) > reservation
+
+
+def _frontier_capacity_deadlock(
+	*, events: Mapping[int, Mapping[str, Any]], frontier_sequence: int,
+	free_inputs: Sequence[int], free_results: Sequence[int],
+	slot_owners: Mapping[tuple[str, int], tuple[int, int, str]],
+) -> str | None:
+	"""Describe the canonical-frontier/result-slot circular wait, if present."""
+	effective, skipped = _effective_accumulation_frontier(events, frontier_sequence)
+	frontier = events.get(effective)
+	if (
+		frontier is None
+		or str(frontier.get("status", "unknown")) not in _FRONTIER_NEEDS_GPU_STATUSES
+		or free_results
+	):
+		return None
+	result_owners = {
+		int(slot): owner for (kind, slot), owner in slot_owners.items() if kind == "result"
+	}
+	if not result_owners or any(
+		int(owner[1]) <= effective or str(owner[2]) not in ("gpu-provisional", "gpu", "gpu-result")
+		for owner in result_owners.values()
+	):
+		return None
+	owner_stages: dict[str, int] = {}
+	for owner in result_owners.values():
+		stage = str(owner[2])
+		owner_stages[stage] = owner_stages.get(stage, 0) + 1
+	return (
+		"canonical-frontier capacity invariant violation: "
+		f"raw_frontier={int(frontier_sequence)} effective_frontier={effective} "
+		f"skipped_prefix={list(skipped)} status={frontier.get('status')} "
+		f"free_inputs={len(free_inputs)} free_results=0 "
+		f"result_owner_stages={owner_stages} result_owners={result_owners} "
+		f"slots={dict(slot_owners)}"
+	)
+
+
+def _coordinator_wait_stage(
+	*, statuses: Mapping[str, int], reads: int, accumulator_tasks: int,
+	slot_owners: Mapping[tuple[str, int], tuple[int, int, str]],
+) -> str | None:
+	"""Identify the producer that can advance a quiescent coordinator state."""
+	if int(statuses.get("assigned", 0)) > 0:
+		return "gpu"
+	if int(accumulator_tasks) > 0:
+		return "accumulator"
+	if int(reads) > 0 or int(statuses.get("fetching", 0)) > 0:
+		return "reader"
+	if slot_owners and int(statuses.get("ready", 0)) > 0:
+		# Ready input can be blocked only by a slot still owned by GPU/accumulation.
+		owner_stages = {owner[2] for owner in slot_owners.values()}
+		if "gpu" in owner_stages:
+			return "gpu"
+		if "gpu-result" in owner_stages or "accumulating" in owner_stages:
+			return "accumulator"
+	if any(int(count) > 0 for count in statuses.values()):
+		raise RuntimeError(
+			"shared tiled coordinator is quiescent with unresolved work and no "
+			f"producer: statuses={dict(statuses)} reads={int(reads)} "
+			f"accumulator_tasks={int(accumulator_tasks)} slots={dict(slot_owners)}"
+		)
+	return None
+
+
 @dataclass(frozen=True)
 class _MmapBandDescriptor:
 	paths: tuple[str, ...]
 	shape_zyx: tuple[int, int, int]
 	dtype: str = "float32"
+	chunk_side: int = 0  # zero: existing circular-Z layout; positive: full-volume bricks
+	prefault: bool = False
+	# Storage-axis-0 sizes for each sparse file shard. Paths are channel-major:
+	# all shards for channel zero, then all shards for channel one, and so on.
+	# Empty retains the historical one-file-per-channel representation.
+	shard_axis0_sizes: tuple[int, ...] = ()
+
+	def __post_init__(self):
+		if self.chunk_side < 0:
+			raise ValueError("negative mmap chunk side")
+		if self.prefault and not self.chunk_side:
+			raise ValueError("writable prefault requires chunk-major layout")
+		if not self.paths:
+			raise ValueError("mmap descriptor requires at least one path")
+		if self.shard_axis0_sizes:
+			if (any(type(size) is not int or size <= 0 for size in self.shard_axis0_sizes)
+					or sum(int(size) for size in self.shard_axis0_sizes) != self.storage_shape[0]
+					or len(self.paths) % len(self.shard_axis0_sizes)
+					or len(set(self.paths)) != len(self.paths)):
+				raise ValueError("invalid mmap axis-0 shards")
+
+	@property
+	def storage_shape(self) -> tuple[int, ...]:
+		if not self.chunk_side:
+			return self.shape_zyx
+		b = self.chunk_side
+		return tuple((n + b - 1) // b for n in self.shape_zyx) + (b, b, b)
 
 	@property
 	def ring_depth(self) -> int:
 		return int(self.shape_zyx[0])
+
+	@property
+	def shard_sizes(self) -> tuple[int, ...]:
+		return self.shard_axis0_sizes or (int(self.storage_shape[0]),)
+
+	@property
+	def shard_count(self) -> int:
+		return len(self.shard_sizes)
+
+	@property
+	def channel_count(self) -> int:
+		return len(self.paths) // self.shard_count
+
+	def shard_path(self, channel: int, shard: int) -> str:
+		if not 0 <= int(channel) < self.channel_count or not 0 <= int(shard) < self.shard_count:
+			raise ValueError("invalid mmap channel/shard")
+		return self.paths[int(channel) * self.shard_count + int(shard)]
+
+	def shard_storage_shape(self, shard: int) -> tuple[int, ...]:
+		return (int(self.shard_sizes[int(shard)]), *self.storage_shape[1:])
+
+
+class _BoundedMmapCache:
+	"""Per-worker LRU of mmap shards; eviction happens only between helper calls."""
+
+	def __init__(self, max_open: int = 8):
+		if int(max_open) < 1:
+			raise ValueError("mmap cache capacity must be positive")
+		self.max_open = int(max_open)
+		self._arrays = OrderedDict()
+
+	def get(self, path):
+		array = self._arrays.pop(path, None)
+		if array is not None:
+			self._arrays[path] = array
+		return array
+
+	def __setitem__(self, path, array):
+		previous = self._arrays.pop(path, None)
+		if previous is not None and previous is not array:
+			previous._mmap.close()
+		while len(self._arrays) >= self.max_open:
+			_, evicted = self._arrays.popitem(last=False)
+			evicted._mmap.close()
+		self._arrays[path] = array
+
+	def __len__(self):
+		return len(self._arrays)
+
+	def values(self):
+		return self._arrays.values()
+
+	def close(self):
+		while self._arrays:
+			_, array = self._arrays.popitem(last=False)
+			array._mmap.close()
 
 
 @dataclass(frozen=True)
@@ -131,6 +401,39 @@ class _AccumulateProcessTask:
 	dirty_products: tuple[str, ...]
 	accumulators: tuple[tuple[str, _MmapBandDescriptor], ...]
 	weight: _MmapBandDescriptor
+	# Demand inference keeps one immutable blend-weight template shared by all
+	# result slots.  Whole-volume inference retains the legacy in-slot weight.
+	weight_spec: "_SharedSlotSpec | None" = None
+	arena_key: tuple[str, ChunkOriginZYX] | None = None
+
+
+@dataclass(frozen=True)
+class _AccumulatorRecordSpec:
+	nbytes: int
+	layouts: tuple["_SharedArrayLayout", ...]
+
+
+@dataclass(frozen=True)
+class _ArenaPublishTask:
+	request_id: int
+	arena_key: tuple[str, ChunkOriginZYX]
+	publication_slot: int
+	generation: int
+	publication_spec: "_SharedSlotSpec"
+
+
+@dataclass(frozen=True)
+class _AccumulateProcessBatch:
+	"""One IPC unit containing same-tile contributions owned by one worker."""
+
+	batch_id: int
+	event_seq: int
+	tasks: tuple[_AccumulateProcessTask, ...]
+
+	def __post_init__(self):
+		if (not self.tasks or any(task.event_seq != self.event_seq for task in self.tasks)
+				or any(task.result_slot != self.tasks[0].result_slot for task in self.tasks)):
+			raise ValueError("invalid accumulator task batch")
 
 
 @dataclass(frozen=True)
@@ -341,7 +644,7 @@ class ModelAdapter(Protocol):
 		...
 
 	def run_tile_inference(self, model: Any, tile: torch.Tensor, *, device: torch.device) -> Any:
-		"""Run one normalized tile through the model and return raw model output."""
+		"""Run normalized B,1,D,H,W input; opt-in batching must preserve B in products."""
 		...
 
 	def product_tensors_from_output(self, raw_output: Any) -> Mapping[str, torch.Tensor]:
@@ -426,6 +729,23 @@ def _downscaled_tile_clip(local_pos: int, sd: int, tile_down: int, out_size: int
 	src0 = max(0, -start)
 	src1 = src0 + (dst1 - dst0)
 	return dst0, dst1, src0, src1
+
+
+def blend_ramp(length: int, border: int, overlap: int) -> np.ndarray:
+	"""Shared tile blend weights for sequential and arbitrary-demand admission."""
+	pad = max(0, int(border))
+	ramp = np.zeros(length, dtype=np.float32)
+	core_start, core_end = min(pad, length), max(min(pad, length), length - pad)
+	core_len = core_end - core_start
+	if core_len <= 0:
+		return ramp
+	core = np.ones(core_len, dtype=np.float32)
+	ov = min(max(0, int(overlap) - 2 * pad), core_len // 2)
+	if ov:
+		edges = np.linspace(0.0, 1.0, ov + 1, dtype=np.float32)[1:]
+		core[:ov], core[-ov:] = edges, edges[::-1]
+	ramp[core_start:core_end] = core
+	return ramp
 
 
 def _build_tile_positions(size: int, tile: int, stride: int) -> list[int]:
@@ -810,6 +1130,55 @@ def _atomic_zarr_write(omezarr_path: str, level: int,
 	If n_levels > 0, also invalidates coarser pyramid chunks that depend on the written data."""
 	sep = _omezarr_dim_sep(omezarr_path, level)
 	level_path = os.path.join(omezarr_path, str(level))
+	# Fast path for the inference publisher: it always hands us one complete,
+	# aligned logical Zarr chunk.  Encoding that chunk directly preserves the
+	# Zarr-v2 bytes while avoiding a temporary array, metadata copy/open, slice
+	# machinery and recursive cleanup for every channel.
+	zarray_path = os.path.join(level_path, ".zarray")
+	try:
+		with open(zarray_path, encoding="utf-8") as handle:
+			metadata = json.load(handle)
+		chunks = tuple(int(value) for value in metadata["chunks"])
+		dtype = np.dtype(metadata["dtype"])
+		shape = tuple(int(value) for value in metadata["shape"])
+		region_shape = (int(z1-z0), int(y1-y0), int(x1-x0))
+		direct = (
+			metadata.get("zarr_format") == 2
+			and metadata.get("order", "C") == "C"
+			and metadata.get("filters") in (None, [])
+			and len(chunks) == 3
+			and (z0 % chunks[0], y0 % chunks[1], x0 % chunks[2]) == (0, 0, 0)
+			and all(0 < extent <= chunk for extent, chunk in zip(region_shape, chunks))
+			and (z1, y1, x1) == tuple(min(start + chunk, size)
+				for start, chunk, size in zip((z0, y0, x0), chunks, shape))
+			and tuple(np.asarray(data).shape) == region_shape
+		)
+	except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+		direct = False
+	if direct:
+		fill_value = metadata.get("fill_value", 0)
+		if fill_value is None:
+			fill_value = 0
+		chunk = np.full(chunks, fill_value, dtype=dtype)
+		chunk[tuple(slice(0, extent) for extent in region_shape)] = np.asarray(data, dtype=dtype)
+		compressor = metadata.get("compressor")
+		payload = chunk.tobytes(order="C") if compressor is None else numcodecs.get_codec(compressor).encode(chunk)
+		iz, iy, ix = z0 // chunks[0], y0 // chunks[1], x0 // chunks[2]
+		destination = Path(_zarr_chunk_path(level_path, sep, iz, iy, ix))
+		destination.parent.mkdir(parents=True, exist_ok=True)
+		temporary = destination.with_name(
+			f".tmp.{destination.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+		)
+		try:
+			with temporary.open("xb") as handle:
+				handle.write(payload)
+			if n_levels > 0:
+				_invalidate_pyramid_chunks(omezarr_path, level, n_levels, iz, iy, ix)
+			os.replace(temporary, destination)
+		finally:
+			temporary.unlink(missing_ok=True)
+		return
+
 	out_dir = os.path.dirname(omezarr_path)
 	zarr_name = os.path.basename(omezarr_path)
 	tmp_path = os.path.join(
@@ -824,7 +1193,10 @@ def _atomic_zarr_write(omezarr_path: str, level: int,
 		if not os.path.isfile(zarray_dst) and os.path.isfile(zarray_src):
 			shutil.copy2(zarray_src, zarray_dst)
 
-		tmp_arr = zarr.open(tmp_path, mode="r+")
+		# Persist computed fill chunks too: absence is not durable completion.
+		write_options = ({"config": {"write_empty_chunks": True}}
+			if int(zarr.__version__.split(".")[0]) >= 3 else {"write_empty_chunks": True})
+		tmp_arr = zarr.open(tmp_path, mode="r+", **write_options)
 		tmp_arr[z0:z1, y0:y1, x0:x1] = data
 
 		for cz in range(z0, z1, chunk_size):
@@ -984,19 +1356,43 @@ def _eta_from_processed_rate(time_sum: float, processed: int, remaining: int) ->
 	return max(0.0, float(time_sum) / float(processed) * float(remaining))
 
 
+def _predict3d_tile_eta(progress: Mapping[str, Any]) -> float | None:
+	"""Estimate inference ETA while preserving the observed empty-tile ratio.
+
+	Resume-complete tiles are deliberately excluded from the observation.  They
+	describe durable output state, not input sparsity, and are commonly clustered
+	at the beginning of a resumed run.  Extrapolating them would therefore make a
+	resume ETA collapse just before inference reaches unfinished output.
+	"""
+	processed = int(progress.get("tiles_processed", 0))
+	empty = int(progress.get("tiles_skipped_empty", 0))
+	remaining = max(0, int(progress.get(
+		"tiles_remaining_est",
+		max(0, int(progress.get("tiles_total", 0)) - int(progress.get("tiles_done", 0))),
+	)))
+	if remaining == 0:
+		return 0.0 if processed > 0 else None
+	observed_clean_tiles = processed + empty
+	if processed <= 0 or observed_clean_tiles <= 0:
+		return None
+	# Each observed clean-run candidate consumed tile_time_sum / observed_clean_tiles
+	# on average: expensive processed tiles contribute wall time while empty tiles
+	# contribute to the denominator.  This is equivalent to applying the observed
+	# empty fraction to the remaining candidate count.
+	return max(
+		0.0,
+		float(progress.get("tile_time_sum", 0.0))
+		/ float(observed_clean_tiles)
+		* float(remaining),
+	)
+
+
 def _predict3d_overall_eta(progress: dict | None) -> str:
 	if progress is None:
 		return ""
 	eta = 0.0
 	have_rate = False
-	tile_eta = _eta_from_processed_rate(
-		float(progress.get("tile_time_sum", 0.0)),
-		int(progress.get("tiles_processed", 0)),
-		int(progress.get(
-			"tiles_remaining_est",
-			max(0, int(progress.get("tiles_total", 0)) - int(progress.get("tiles_done", 0))),
-		)),
-	)
+	tile_eta = _predict3d_tile_eta(progress)
 	if tile_eta is not None:
 		eta += tile_eta
 		have_rate = True
@@ -1035,11 +1431,7 @@ def _predict3d_progress_line(progress: dict) -> str:
 	done = int(progress.get("tiles_done", 0))
 	processed = int(progress.get("tiles_processed", 0))
 	tile_time_sum = float(progress.get("tile_time_sum", 0.0))
-	tile_eta = _eta_from_processed_rate(
-		tile_time_sum,
-		processed,
-		int(progress.get("tiles_remaining_est", max(0, total - done))),
-	)
+	tile_eta = _predict3d_tile_eta(progress)
 	if tile_eta is None:
 		eta_text = "--:--"
 	else:
@@ -1095,13 +1487,13 @@ class _Predict3dProgressEmitter:
 		self._last_done = 0
 		self._line_open = False
 
-	def emit(self, status: str, *, done: int, total: int) -> None:
+	def emit(self, status: str, *, done: int, total: int, force: bool = False) -> None:
 		now = float(self._clock())
 		changed = int(done) != self._last_done
 		self._last_done = int(done)
-		if not changed:
+		if not changed and not force:
 			return
-		if int(done) >= int(total) or now - self._last_history >= self._history_seconds:
+		if force or int(done) >= int(total) or now - self._last_history >= self._history_seconds:
 			print(("\r" if self._line_open else "") + status, flush=True)
 			self._line_open = False
 			self._last_refresh = now
@@ -1188,6 +1580,7 @@ def _create_omezarr(
 	chunk: int,
 	channel_name: str,
 	compressor: str = DEFAULT_OME_COMPRESSOR,
+	dtype: Any = np.uint8,
 ) -> zarr.Group:
 	"""Create an OME-Zarr group with pyramid level arrays."""
 	codec = _omezarr_compressor(compressor)
@@ -1203,7 +1596,7 @@ def _create_omezarr(
 			g.create_array(
 				str(lv), shape=sh,
 				chunks=chunks,
-				dtype=np.uint8, fill_value=0, overwrite=True,
+				dtype=dtype, fill_value=0, overwrite=True,
 				compressor=codec,
 				chunk_key_encoding={"name": "v2", "separator": "/"},
 			)
@@ -1212,7 +1605,7 @@ def _create_omezarr(
 				g.create_dataset(
 					str(lv), shape=sh,
 					chunks=chunks,
-					dtype=np.uint8, fill_value=0, overwrite=True,
+					dtype=dtype, fill_value=0, overwrite=True,
 					compressor=codec,
 					dimension_separator="/",
 				)
@@ -1220,7 +1613,7 @@ def _create_omezarr(
 				g.create_dataset(
 					str(lv), shape=sh,
 					chunks=chunks,
-					dtype=np.uint8, fill_value=0, overwrite=True,
+					dtype=dtype, fill_value=0, overwrite=True,
 					compressor=codec,
 				)
 		datasets.append({
@@ -1249,6 +1642,7 @@ def _open_or_create_omezarr(
 	chunk: int,
 	channel_name: str,
 	compressor: str = DEFAULT_OME_COMPRESSOR,
+	dtype: Any = np.uint8,
 ) -> zarr.Group:
 	"""Open existing OME-Zarr group or create a new one."""
 	if os.path.exists(path):
@@ -1256,6 +1650,8 @@ def _open_or_create_omezarr(
 			g = zarr.open_group(str(path), mode="r+")
 			expected = _omezarr_level_shape(base_shape_zyx, first_level)
 			arr = g[str(first_level)]
+			if np.dtype(arr.dtype) != np.dtype(dtype):
+				raise ValueError(f"{path} dtype {arr.dtype} does not match requested {np.dtype(dtype)}")
 			if tuple(int(v) for v in arr.shape) == expected:
 				import json as _json
 				zarray_path = os.path.join(path, str(first_level), ".zarray")
@@ -1296,7 +1692,7 @@ def _open_or_create_omezarr(
 	print(f"[predict3d] creating new {os.path.basename(path)} "
 		  f"(levels {first_level}-{n_levels-1})", flush=True)
 	return _create_omezarr(
-		path, base_shape_zyx, first_level, n_levels, chunk, channel_name, compressor,
+		path, base_shape_zyx, first_level, n_levels, chunk, channel_name, compressor, dtype,
 	)
 
 
@@ -1321,6 +1717,7 @@ def create_product_omezarr_groups(
 				int(ome_chunk),
 				channel.name,
 				ome_compressor,
+				product.dtype,
 			)
 	return groups
 
@@ -1937,6 +2334,82 @@ class _SharedSlotSpec:
 	shm_name: str
 	nbytes: int
 	layouts: tuple[_SharedArrayLayout, ...]
+	mmap_path: str | None = None
+	mmap_offset: int = 0
+
+
+class _FileMappedSlot:
+	"""One fixed slot in a reusable regular-file-backed mmap pool."""
+
+	def __init__(self, path: str, offset: int, nbytes: int):
+		self.name = ""
+		self.path = str(path)
+		self.offset = int(offset)
+		self.nbytes = int(nbytes)
+		self._fd = os.open(self.path, os.O_RDWR)
+		self._mapping = mmap.mmap(
+			self._fd, self.nbytes, access=mmap.ACCESS_WRITE, offset=self.offset)
+		self.buf = self._mapping
+
+	def close(self) -> None:
+		if self._mapping is not None:
+			self._mapping.close()
+			self._mapping = None
+		if self._fd is not None:
+			os.close(self._fd)
+			self._fd = None
+
+
+class _FileMappedSlotPool:
+	"""Sparse fixed slot file whose pages can be shared by spawned workers."""
+
+	def __init__(self, directory, *, count: int, size: int, prefix: str):
+		directory = Path(directory)
+		directory.mkdir(parents=True, exist_ok=True)
+		granularity = int(mmap.ALLOCATIONGRANULARITY)
+		self.slot_bytes = int(size)
+		self.stride = ((self.slot_bytes + granularity - 1) // granularity) * granularity
+		self._anonymous_fd = None
+		# Keep the backing file out of the namespace from the moment it is
+		# created.  Spawned workers can still open the parent-owned descriptor
+		# through /proc while the pool is alive.  The named fallback is needed
+		# on filesystems/platforms without O_TMPFILE.
+		if sys.platform.startswith("linux") and hasattr(os, "O_TMPFILE"):
+			try:
+				fd = os.open(directory, os.O_RDWR | os.O_TMPFILE, 0o600)
+				self._anonymous_fd = fd
+				path = f"/proc/{os.getpid()}/fd/{fd}"
+			except OSError:
+				fd, path = tempfile.mkstemp(prefix=prefix, suffix=".mmap", dir=directory)
+		else:
+			fd, path = tempfile.mkstemp(prefix=prefix, suffix=".mmap", dir=directory)
+		self.path = Path(path)
+		self.count = int(count)
+		try:
+			os.ftruncate(fd, self.count * self.stride)
+		except BaseException:
+			os.close(fd)
+			self._anonymous_fd = None
+			if self.path.parent == directory:
+				self.path.unlink(missing_ok=True)
+			raise
+		if self._anonymous_fd is None:
+			os.close(fd)
+
+	def handles(self) -> list[_FileMappedSlot]:
+		return [_FileMappedSlot(str(self.path), index * self.stride, self.slot_bytes)
+			for index in range(self.count)]
+
+	def specs(self, layouts) -> tuple[_SharedSlotSpec, ...]:
+		return tuple(_SharedSlotSpec("", self.slot_bytes, tuple(layouts),
+			str(self.path), index * self.stride) for index in range(self.count))
+
+	def close(self) -> None:
+		if self._anonymous_fd is not None:
+			os.close(self._anonymous_fd)
+			self._anonymous_fd = None
+		else:
+			self.path.unlink(missing_ok=True)
 
 
 def _packed_layouts(entries: Iterable[tuple[str, tuple[int, ...], Any]]) -> tuple[tuple[_SharedArrayLayout, ...], int]:
@@ -1950,7 +2423,7 @@ def _packed_layouts(entries: Iterable[tuple[str, tuple[int, ...], Any]]) -> tupl
 	return tuple(layouts), max(1, ((offset + 63) // 64) * 64)
 
 
-def _slot_array(shm: shared_memory.SharedMemory, layout: _SharedArrayLayout) -> np.ndarray:
+def _slot_array(shm, layout: _SharedArrayLayout) -> np.ndarray:
 	return np.ndarray(layout.shape, dtype=np.dtype(layout.dtype), buffer=shm.buf, offset=layout.offset)
 
 
@@ -1959,6 +2432,12 @@ def _attach_shared_memory(name: str) -> shared_memory.SharedMemory:
 		return shared_memory.SharedMemory(name=name, create=False, track=False)
 	except TypeError:  # Python < 3.13
 		return shared_memory.SharedMemory(name=name, create=False)
+
+
+def _attach_slot(spec: _SharedSlotSpec):
+	if spec.mmap_path is not None:
+		return _FileMappedSlot(spec.mmap_path, spec.mmap_offset, spec.nbytes)
+	return _attach_shared_memory(spec.shm_name)
 
 
 def _create_shared_slots(count: int, size: int) -> list[shared_memory.SharedMemory]:
@@ -1975,8 +2454,12 @@ def _create_shared_slots(count: int, size: int) -> list[shared_memory.SharedMemo
 
 
 def _limit_native_worker_threads():
-	for name in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+	for name in (
+		"OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS",
+		"NUMEXPR_NUM_THREADS", "BLOSC_NTHREADS",
+	):
 		os.environ[name] = "1"
+	_limit_zarr_codec_threads()
 	try:
 		torch.set_num_threads(1)
 		torch.set_num_interop_threads(1)
@@ -1989,29 +2472,114 @@ def _limit_native_worker_threads():
 		return None
 
 
+def _mmap_populate_write_advice():
+	if not sys.platform.startswith("linux") or not hasattr(mmap.mmap, "madvise"):
+		raise RuntimeError("accumulator prefault requires Linux MADV_POPULATE_WRITE support")
+	# Linux UAPI value; Python builds against older headers may omit the name.
+	return getattr(mmap, "MADV_POPULATE_WRITE", 23)
+
+
+def _prefault_mmap_brick(array, view, descriptor):
+	"""Populate one whole writable brick once per owner mapping; timed with its add."""
+	brick_bytes = descriptor.chunk_side ** 3 * array.dtype.itemsize
+	offset = view.__array_interface__["data"][0] - array.__array_interface__["data"][0]
+	offset = offset // brick_bytes * brick_bytes
+	seen = getattr(array, "_demand_prefaulted_offsets", None)
+	if seen is None:
+		seen = array._demand_prefaulted_offsets = set()
+	if offset in seen:
+		return
+	start = offset // mmap.PAGESIZE * mmap.PAGESIZE
+	end = min(array.nbytes, ((offset + brick_bytes + mmap.PAGESIZE - 1) // mmap.PAGESIZE) * mmap.PAGESIZE)
+	# Full files use offset=0; the view can cover only a small part of the brick.
+	if array.offset != 0:
+		raise ValueError("prefault requires a zero-offset full-file mmap")
+	try:
+		array._mmap.madvise(_mmap_populate_write_advice(), start, end - start)
+	except OSError as error:
+		raise RuntimeError(f"MADV_POPULATE_WRITE failed for accumulator brick: {error}") from error
+	seen.add(offset)  # Failed/partial advice must not suppress a retry.
+
+
+def _chunk_major_views(array, descriptor, bounds, *, axis0_index_offset=0, relative_origin=None):
+	"""Yield 3D brick views and matching region-relative slices, shared by read/add."""
+	b = descriptor.chunk_side
+	starts, stops = bounds[::2], bounds[1::2]
+	relative_origin = starts if relative_origin is None else tuple(relative_origin)
+	if b <= 0 or any(not 0 <= lo <= hi <= n for lo, hi, n in zip(starts, stops, descriptor.shape_zyx)):
+		raise ValueError("invalid chunk-major region")
+	if any(lo == hi for lo, hi in zip(starts, stops)):
+		return
+	for index in itertools.product(*(range(lo // b, (hi - 1) // b + 1) for lo, hi in zip(starts, stops))):
+		origin = tuple(i * b for i in index)
+		lo = tuple(max(a, o) for a, o in zip(starts, origin))
+		hi = tuple(min(a, o + b) for a, o in zip(stops, origin))
+		local = tuple(slice(a - o, z - o) for a, z, o in zip(lo, hi, origin))
+		relative = tuple(slice(a - o, z - o) for a, z, o in zip(lo, hi, relative_origin))
+		storage_index = (index[0] - int(axis0_index_offset), *index[1:])
+		yield array[storage_index + local], relative
+
+
+def _mmap_shard(descriptor, channel, shard, mode, cache):
+	path = descriptor.shard_path(channel, shard)
+	array = cache.get(path)
+	if array is None:
+		array = np.memmap(path, dtype=np.dtype(descriptor.dtype), mode=mode,
+			shape=descriptor.shard_storage_shape(shard))
+		cache[path] = array
+	return array
+
+
+def _axis0_shards(descriptor):
+	start = 0
+	for shard, size in enumerate(descriptor.shard_sizes):
+		yield shard, start, int(size)
+		start += int(size)
+
+
 def _read_mmap_band_chunk(
 	descriptor: _MmapBandDescriptor,
 	channel: int,
 	z0: int, z1: int, y0: int, y1: int, x0: int, x1: int,
 	cache: dict[str, np.memmap],
 ) -> np.ndarray:
-	path = descriptor.paths[int(channel)]
-	arr = cache.get(path)
-	if arr is None:
-		arr = np.memmap(
-			path, dtype=np.dtype(descriptor.dtype), mode="r",
-			shape=descriptor.shape_zyx,
-		)
-		cache[path] = arr
+	if not 0 <= int(channel) < descriptor.channel_count:
+		raise ValueError("invalid mmap channel")
 	out = np.zeros((z1-z0, y1-y0, x1-x0), dtype=np.float32)
+	if descriptor.chunk_side:
+		b = descriptor.chunk_side
+		for shard, storage_start, storage_size in _axis0_shards(descriptor):
+			logical_start = storage_start * b
+			logical_stop = min((storage_start + storage_size) * b, descriptor.shape_zyx[0])
+			lo, hi = max(int(z0), logical_start), min(int(z1), logical_stop)
+			if lo >= hi:
+				continue
+			arr = _mmap_shard(descriptor, channel, shard, "r", cache)
+			for view, relative in _chunk_major_views(
+					arr, descriptor, (lo, hi, y0, y1, x0, x1),
+					axis0_index_offset=storage_start, relative_origin=(z0, y0, x0)):
+				out[relative] = view
+		return out
 	offset = 0
 	logical = int(z0)
 	while logical < int(z1):
 		physical = logical % descriptor.ring_depth
-		length = min(int(z1) - logical, descriptor.ring_depth - physical)
-		out[offset:offset+length] = arr[physical:physical+length, y0:y1, x0:x1]
-		offset += length
-		logical += length
+		wrap_length = min(int(z1) - logical, descriptor.ring_depth - physical)
+		remaining = wrap_length
+		while remaining:
+			for shard, storage_start, storage_size in _axis0_shards(descriptor):
+				if storage_start <= physical < storage_start + storage_size:
+					break
+			else:
+				raise ValueError("physical mmap index outside shards")
+			length = min(remaining, storage_start + storage_size - physical)
+			arr = _mmap_shard(descriptor, channel, shard, "r", cache)
+			out[offset:offset+length] = arr[
+				physical-storage_start:physical-storage_start+length, y0:y1, x0:x1]
+			offset += length
+			logical += length
+			physical += length
+			remaining -= length
 	return out
 
 
@@ -2032,7 +2600,12 @@ def _accumulator_native_module():
 def _add_accumulator_view(destination: np.ndarray, source: np.ndarray) -> str:
 	"""Add float32 source into an f16/f32 destination, using native code when installed."""
 	module = _accumulator_native_module()
-	if module:
+	if module and destination.strides[-1] == destination.dtype.itemsize:
+		# Pyramid downsampling can return a strided X view. The native kernel
+		# accepts strided Z/Y rows, but requires contiguous values within X.
+		# Copying the source preserves exact values and per-add f16 rounding.
+		if source.strides[-1] != source.dtype.itemsize:
+			source = np.ascontiguousarray(source)
 		module.add_inplace(destination, source)
 		return str(module.backend())
 	# NumPy is the portable no-extension fallback.  For float16 destinations it
@@ -2048,23 +2621,48 @@ def _add_mmap_band_chunk(
 	source: np.ndarray,
 	cache: dict[str, np.memmap],
 ) -> str:
-	path = descriptor.paths[int(channel)]
-	arr = cache.get(path)
-	if arr is None:
-		arr = np.memmap(path, dtype=np.dtype(descriptor.dtype), mode="r+", shape=descriptor.shape_zyx)
-		cache[path] = arr
+	if not 0 <= int(channel) < descriptor.channel_count:
+		raise ValueError("invalid mmap channel")
+	if descriptor.chunk_side:
+		backend = "numpy"
+		b = descriptor.chunk_side
+		for shard, storage_start, storage_size in _axis0_shards(descriptor):
+			logical_start = storage_start * b
+			logical_stop = min((storage_start + storage_size) * b, descriptor.shape_zyx[0])
+			lo, hi = max(int(z0), logical_start), min(int(z1), logical_stop)
+			if lo >= hi:
+				continue
+			arr = _mmap_shard(descriptor, channel, shard, "r+", cache)
+			for view, relative in _chunk_major_views(
+					arr, descriptor, (lo, hi, y0, y1, x0, x1),
+					axis0_index_offset=storage_start, relative_origin=(z0, y0, x0)):
+				if descriptor.prefault:
+					_prefault_mmap_brick(arr, view, descriptor)
+				backend = _add_accumulator_view(view, source[relative])
+		return backend
 	offset = 0
 	logical = int(z0)
 	backend = "numpy"
 	while logical < int(z1):
 		physical = logical % descriptor.ring_depth
-		length = min(int(z1) - logical, descriptor.ring_depth - physical)
-		backend = _add_accumulator_view(
-			arr[physical:physical + length, y0:y1, x0:x1],
-			source[offset:offset + length],
-		)
-		offset += length
-		logical += length
+		wrap_length = min(int(z1) - logical, descriptor.ring_depth - physical)
+		remaining = wrap_length
+		while remaining:
+			for shard, storage_start, storage_size in _axis0_shards(descriptor):
+				if storage_start <= physical < storage_start + storage_size:
+					break
+			else:
+				raise ValueError("physical mmap index outside shards")
+			length = min(remaining, storage_start + storage_size - physical)
+			arr = _mmap_shard(descriptor, channel, shard, "r+", cache)
+			backend = _add_accumulator_view(
+				arr[physical-storage_start:physical-storage_start+length, y0:y1, x0:x1],
+				source[offset:offset + length],
+			)
+			offset += length
+			logical += length
+			physical += length
+			remaining -= length
 	return backend
 
 
@@ -2075,46 +2673,142 @@ def _stable_accumulator_owner(sd: int, origin: ChunkOriginZYX, worker_count: int
 	return int(value % int(worker_count))
 
 
-def _accumulate_process_main(worker_index: int, task_queue, result_queue) -> None:
+def _record_array(record: np.ndarray, layout: _SharedArrayLayout) -> np.ndarray:
+	return np.ndarray(layout.shape, dtype=np.dtype(layout.dtype), buffer=record,
+		offset=layout.offset)
+
+
+def _execute_accumulate_process_task(task, shms, mmaps, arena=None, record_spec=None) -> str:
+	"""Shared task executor for whole-volume and demand accumulation workers."""
+	result_key = (task.result_spec.shm_name, task.result_spec.mmap_path,
+		task.result_spec.mmap_offset)
+	shm = shms.get(result_key)
+	if shm is None:
+		shm = _attach_slot(task.result_spec)
+		shms[result_key] = shm
+	layouts = {layout.name: layout for layout in task.result_spec.layouts}
+	weight_spec = task.result_spec if task.weight_spec is None else task.weight_spec
+	weight_shm = shms.get(weight_spec.shm_name)
+	if weight_shm is None:
+		weight_shm = _attach_shared_memory(weight_spec.shm_name)
+		shms[weight_spec.shm_name] = weight_shm
+	weight_layouts = {layout.name: layout for layout in weight_spec.layouts}
+	lz0, lz1, ly0, ly1, lx0, lx1 = task.destination
+	pz0, pz1, py0, py1, px0, px1 = task.source
+	weight = _slot_array(weight_shm, weight_layouts[f"weight:{task.sd}"])[pz0:pz1, py0:py1, px0:px1]
+	if task.arena_key is not None:
+		if arena is None or record_spec is None:
+			raise RuntimeError("arena accumulation task without an owner arena")
+		record = arena.mutable_record(task.arena_key, create=True)
+		try:
+			record_layouts = {layout.name: layout for layout in record_spec.layouts}
+			destination = (slice(lz0, lz1), slice(ly0, ly1), slice(lx0, lx1))
+			backend = _add_accumulator_view(
+				_record_array(record, record_layouts["weight"])[destination], weight)
+			for name in task.dirty_products:
+				product = _slot_array(shm, layouts[f"product:{name}"])
+				for channel in range(int(product.shape[0])):
+					backend = _add_accumulator_view(
+						_record_array(record, record_layouts[f"product:{name}:{channel}"])[destination],
+						product[channel, pz0:pz1, py0:py1, px0:px1])
+			return backend
+		finally:
+			arena.record_mutated(task.arena_key)
+	backend = _add_mmap_band_chunk(
+		task.weight, 0, lz0, lz1, ly0, ly1, lx0, lx1, weight, mmaps,
+	)
+	accumulators = dict(task.accumulators)
+	for name in task.dirty_products:
+		product = _slot_array(shm, layouts[f"product:{name}"])
+		for channel in range(int(product.shape[0])):
+			backend = _add_mmap_band_chunk(
+				accumulators[name], channel,
+				lz0, lz1, ly0, ly1, lx0, lx1,
+				product[channel, pz0:pz1, py0:py1, px0:px1], mmaps,
+			)
+	return backend
+
+
+def _accumulate_process_main(worker_index: int, task_queue, result_queue,
+		record_spec=None, hot_slots=None, spill_segment_slots=256, scratch_dir=None,
+		spill_request_queue=None, spill_response_queue=None,
+		spill_segment_stride=None) -> None:
+	# Emit the active Python frame for fatal native/mmap faults instead of
+	# leaving the coordinator with only a negative child exit code.
+	import faulthandler
+	faulthandler.enable(all_threads=True)
 	_native_limits = _limit_native_worker_threads()
 	shms: dict[str, shared_memory.SharedMemory] = {}
-	mmaps: dict[str, np.memmap] = {}
+	mmaps = _BoundedMmapCache()
+	arena = None
 	try:
+		if record_spec is not None:
+			from lasagna.chunk_accumulator_arena import ChunkAccumulatorArena
+			arena_arguments = {}
+			if spill_request_queue is not None:
+				def acquire_spill_slot():
+					spill_request_queue.put(("acquire", worker_index, -1))
+					response = spill_response_queue.get()
+					kind, value = response[:2]
+					if kind != "slot":
+						raise RuntimeError(f"spill arena allocation failed: {value}")
+					return value, response[2]
+				def release_spill_slot(slot):
+					spill_request_queue.put(("release", worker_index, int(slot)))
+				arena_arguments = {
+					"spill_slot_acquire": acquire_spill_slot,
+					"spill_slot_release": release_spill_slot,
+					"spill_segment_stride": spill_segment_stride,
+				}
+			arena = ChunkAccumulatorArena(scratch_dir, record_bytes=record_spec.nbytes,
+				hot_slots=int(hot_slots), spill_segment_slots=spill_segment_slots,
+				**arena_arguments)
+			if spill_request_queue is not None:
+				result_queue.put(("arena_attached", worker_index))
 		while True:
-			task = task_queue.get()
-			if task is None:
+			item = task_queue.get()
+			if item is None:
 				break
 			started = time.perf_counter()
 			try:
-				shm = shms.get(task.result_spec.shm_name)
-				if shm is None:
-					shm = _attach_shared_memory(task.result_spec.shm_name)
-					shms[task.result_spec.shm_name] = shm
-				layouts = {layout.name: layout for layout in task.result_spec.layouts}
-				lz0, lz1, ly0, ly1, lx0, lx1 = task.destination
-				pz0, pz1, py0, py1, px0, px1 = task.source
-				weight = _slot_array(shm, layouts[f"weight:{task.sd}"])[pz0:pz1, py0:py1, px0:px1]
-				backend = _add_mmap_band_chunk(
-					task.weight, 0, lz0, lz1, ly0, ly1, lx0, lx1, weight, mmaps,
-				)
-				accumulators = dict(task.accumulators)
-				for name in task.dirty_products:
-					product = _slot_array(shm, layouts[f"product:{name}"])
-					for channel in range(int(product.shape[0])):
-						backend = _add_mmap_band_chunk(
-							accumulators[name], channel,
-							lz0, lz1, ly0, ly1, lx0, lx1,
-							product[channel, pz0:pz1, py0:py1, px0:px1], mmaps,
-						)
-				result_queue.put(("result", task.task_id, task.event_seq, worker_index, backend, time.perf_counter() - started))
+				if isinstance(item, _ArenaPublishTask):
+					publication_shm = shms.get(item.publication_spec.shm_name)
+					if publication_shm is None:
+						publication_shm = _attach_shared_memory(item.publication_spec.shm_name)
+						shms[item.publication_spec.shm_name] = publication_shm
+					destination = np.ndarray((record_spec.nbytes,), np.uint8,
+						buffer=publication_shm.buf)
+					location = arena.snapshot_and_release(item.arena_key, destination)
+					result_queue.put(("publish_snapshot", item.request_id, item.publication_slot,
+						item.generation, worker_index, location, time.perf_counter() - started,
+						arena.telemetry()))
+				elif isinstance(item, _AccumulateProcessBatch):
+					backends = {
+						_execute_accumulate_process_task(task, shms, mmaps, arena, record_spec)
+						for task in item.tasks
+					}
+					result_queue.put((
+						"batch_result", item.batch_id, item.event_seq, worker_index,
+						",".join(sorted(backends)), time.perf_counter() - started,
+						len(item.tasks), arena.telemetry() if arena is not None else {},
+					))
+				else:
+					backend = _execute_accumulate_process_task(item, shms, mmaps, arena, record_spec)
+					result_queue.put((
+						"result", item.task_id, item.event_seq, worker_index, backend,
+						time.perf_counter() - started,
+					))
 			except BaseException as exc:
-				result_queue.put(("error", task.task_id, task.event_seq, worker_index, type(exc).__name__, str(exc)))
+				kind = "batch_error" if isinstance(item, _AccumulateProcessBatch) else "error"
+				identifier = item.batch_id if isinstance(item, _AccumulateProcessBatch) else getattr(item, "task_id", getattr(item, "request_id", -1))
+				event_seq = item.event_seq if hasattr(item, "event_seq") else -1
+				result_queue.put((kind, identifier, event_seq, worker_index,
+					type(exc).__name__, str(exc)))
 				break
 	finally:
-		for arr in mmaps.values():
-			mmap_obj = getattr(arr, "_mmap", None)
-			if mmap_obj is not None:
-				mmap_obj.close()
+		if arena is not None:
+			arena.close()
+		mmaps.close()
 		for shm in shms.values():
 			shm.close()
 
@@ -2174,7 +2868,7 @@ def _flush_process_main(
 	result_queue,
 ) -> None:
 	_native_limits = _limit_native_worker_threads()
-	cache: dict[str, np.memmap] = {}
+	cache = _BoundedMmapCache()
 	try:
 		while True:
 			task = task_queue.get()
@@ -2192,10 +2886,75 @@ def _flush_process_main(
 				))
 				break
 	finally:
-		for arr in cache.values():
-			mmap_obj = getattr(arr, "_mmap", None)
-			if mmap_obj is not None:
-				mmap_obj.close()
+		cache.close()
+
+
+def _ready_inference_batch(work_queue, first, max_batch_size):
+	"""Take available descriptors only; never wait to fill a model batch."""
+	batch = [first]
+	stop = False
+	while len(batch) < max_batch_size:
+		try:
+			item = work_queue.get_nowait()
+		except queue.Empty:
+			break
+		if item is None:
+			stop = True
+			break
+		batch.append(item)
+	return batch, stop
+
+
+def _blend_weights_by_scale(
+	blend_ramp: np.ndarray,
+	native_output_stride: int,
+	scales: Iterable[int],
+	*,
+	device: torch.device,
+) -> dict[int, torch.Tensor]:
+	"""Build the canonical deterministic blend weights used by all schedulers."""
+	ramp_t = torch.as_tensor(blend_ramp, dtype=torch.float32, device=device)
+	w_full = ramp_t[:, None, None] * ramp_t[None, :, None] * ramp_t[None, None, :]
+	w_native = (
+		_pyrdown3d(w_full.unsqueeze(0), factor=native_output_stride).squeeze(0)
+		if native_output_stride > 1 else w_full
+	)
+	return {
+		sd: (
+			_pyrdown3d(w_native.unsqueeze(0), factor=sd // native_output_stride).squeeze(0)
+			if sd > native_output_stride else w_native
+		)
+		for sd in sorted(set(int(value) for value in scales))
+	}
+
+
+def _copy_tensor_to_shared_array(destination: np.ndarray, source: torch.Tensor) -> None:
+	"""Copy directly into a shared NumPy allocation without a temporary CPU tensor."""
+	target = torch.from_numpy(destination)
+	if tuple(target.shape) != tuple(source.shape) or target.dtype != source.dtype:
+		raise ValueError("shared result layout does not match inference tensor")
+	target.copy_(source)
+
+
+def _resident_tile_inference(model_adapter, model, tile, device, batch_cap=None):
+	"""Keep resident training state; reduce only the inference batch on OOM."""
+	try:
+		return model_adapter.run_tile_inference(model, tile, device=device)
+	except torch.cuda.OutOfMemoryError:
+		if tile.shape[0] == 1:
+			raise RuntimeError("resident trace cannot fit one inference tile alongside training state "
+				"in the current VRAM grant") from None
+	# Outside the exception handler so failed-forward activations are released.
+	if device.type == "cuda":
+		torch.cuda.empty_cache()
+	middle = tile.shape[0] // 2
+	if batch_cap is not None:
+		batch_cap[0] = min(batch_cap[0], middle)
+	print(f"[predict3d] resident trace VRAM: splitting inference batch {tile.shape[0]}", flush=True)
+	left = _resident_tile_inference(model_adapter, model, tile[:middle], device, batch_cap)
+	right = _resident_tile_inference(model_adapter, model, tile[middle:], device, batch_cap)
+	from torch.utils._pytree import tree_map
+	return tree_map(lambda a, b: torch.cat((a, b), dim=0), left, right)
 
 
 def _multi_gpu_worker_main(
@@ -2206,78 +2965,120 @@ def _multi_gpu_worker_main(
 	tile_size: int,
 	blend_ramp: np.ndarray,
 	product_scales: Mapping[str, int],
+	native_output_stride: int,
 	input_specs: tuple[_SharedSlotSpec, ...],
 	result_specs: tuple[_SharedSlotSpec, ...],
 	work_queue,
 	result_queue,
 	profile_pipeline: bool = False,
+	max_batch_size: int = 1,
+	report_batches: bool = False,
+	resident_model: torch.nn.Module | None = None,
 ) -> None:
-	"""Persistent spawned GPU worker; queues carry descriptors only."""
-	_native_limits = _limit_native_worker_threads()
+	"""Shared worker for serial-tile and dynamic-batch descriptor schedulers."""
+	if type(max_batch_size) is not int or max_batch_size < 1:
+		raise ValueError("max_batch_size must be a positive integer")
+	_native_limits = _limit_native_worker_threads() if resident_model is None else None
+	previous_modes = [(module, module.training) for module in resident_model.modules()] if resident_model is not None else []
 	device = torch.device(device_text)
+	budget = os.environ.get('FIBER_INFERENCE_VRAM_BUDGET_BYTES')
+	adaptive_cap = [max_batch_size]
+	if budget is not None and device.type == 'cuda':
+		# Existing cap is the48GiB profile; a smaller grant reduces the first
+		# attempt, then OOM feedback lowers subsequent batches if necessary.
+		adaptive_cap[0] = max(1, min(max_batch_size, max_batch_size * int(budget) // (48 << 30)))
 	if device.type == "cuda":
 		torch.cuda.set_device(device)
-	inputs = [_attach_shared_memory(spec.shm_name) for spec in input_specs]
-	results = [_attach_shared_memory(spec.shm_name) for spec in result_specs]
+	inputs = [_attach_slot(spec) for spec in input_specs]
+	results = [_attach_slot(spec) for spec in result_specs]
 	try:
-		model = model_adapter.load_model(device=device)
+		model = model_adapter.load_model(device=device) if resident_model is None else resident_model
+		if resident_model is not None and model_state is not None:
+			raise ValueError("resident inference must not replace training weights")
 		if model_state is not None:
 			prepare_state_load = getattr(model_adapter, "prepare_model_for_state_load", None)
 			if prepare_state_load is not None:
 				prepare_state_load(model, model_state, device=device)
 			model.load_state_dict(model_state, strict=True)
 		model.eval()
-		ramp_t = torch.as_tensor(blend_ramp, dtype=torch.float32, device=device)
-		w_full = ramp_t[:, None, None] * ramp_t[None, :, None] * ramp_t[None, None, :]
-		weights_by_scale = {
-			sd: (_pyrdown3d(w_full.unsqueeze(0), factor=sd).squeeze(0) if sd > 1 else w_full)
-			for sd in sorted(set(int(value) for value in product_scales.values()))
-		}
+		weights_by_scale = _blend_weights_by_scale(
+			blend_ramp, native_output_stride,
+			(*product_scales.values(), native_output_stride), device=device,
+		)
+		w_native = weights_by_scale[native_output_stride]
+		expected_native_shape = tuple(int(value) for value in w_native.shape)
 		while True:
 			task = work_queue.get()
 			if task is None:
 				break
-			seq, coord, input_slot, result_slot, needed_names = task
+			batch, stop = _ready_inference_batch(work_queue, task, adaptive_cap[0])
+			seq, coord = task[:2]
 			started = time.perf_counter()
 			try:
 				profile = {} if profile_pipeline else None
-				input_layout = input_specs[input_slot].layouts[0]
-				tile_np = _slot_array(inputs[input_slot], input_layout)
 				cuda_events = {}
+				input_cuda_events = {"h2d": [], "cuda_convert": []}
 				if profile is not None and device.type == "cuda":
-					for name in ("h2d", "cuda_convert", "adapter_preprocess", "model_inference", "output"):
+					for name in ("adapter_preprocess", "model_inference", "output"):
 						cuda_events[name] = (
 							torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True),
 						)
-				if device.type == "cuda":
-					source = torch.from_numpy(tile_np).unsqueeze(0).unsqueeze(0)
-					if cuda_events:
-						cuda_events["h2d"][0].record()
-					stage_started = time.perf_counter()
-					compact = source.to(device)
-					if profile is not None:
-						profile["compact_h2d_wall_s"] = time.perf_counter() - stage_started
-						cuda_events["h2d"][1].record()
-					# Pageable shared-memory H2D is synchronous, so this slot is now reusable.
-					result_queue.put(("input_released", seq, input_slot, worker_index))
-					if cuda_events:
-						cuda_events["cuda_convert"][0].record()
-					stage_started = time.perf_counter()
-					if compact.dtype == torch.uint16:
-						tile = torch.div(compact.to(torch.int32), 257, rounding_mode="floor").to(torch.float32).div_(255.0)
-					elif compact.dtype == torch.uint8:
-						tile = compact.to(torch.float32).div_(255.0)
+				# Keep integer conversion independent for mixed uint8/uint16
+				# sources. Do not retain B separate float tiles plus a cat copy.
+				tile = None
+				for index, item in enumerate(batch):
+					seq, coord, input_slot, result_slot, needed_names = item[:5]
+					input_layout = input_specs[input_slot].layouts[0]
+					if len(item) == 6:
+						input_dtype = np.dtype(item[5])
+						if input_dtype not in (np.dtype("uint8"), np.dtype("uint16")):
+							raise TypeError("unsupported demand tile dtype")
+						input_layout = replace(input_layout, dtype=input_dtype.str)
+						if input_layout.offset + input_layout.nbytes > input_specs[input_slot].nbytes:
+							raise ValueError("demand tile exceeds its shared slot")
+					tile_np = _slot_array(inputs[input_slot], input_layout)
+					if device.type == "cuda":
+						source = torch.from_numpy(tile_np).unsqueeze(0).unsqueeze(0)
+						if cuda_events:
+							for name in input_cuda_events:
+								input_cuda_events[name].append((torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)))
+							input_cuda_events["h2d"][-1][0].record()
+						stage_started = time.perf_counter()
+						compact = source.to(device)
+						if profile is not None:
+							profile["compact_h2d_wall_s"] = profile.get("compact_h2d_wall_s", 0.0) + time.perf_counter() - stage_started
+						if cuda_events:
+							input_cuda_events["h2d"][-1][1].record()
+						# Synchronous pageable H2D finished reading the shared
+						# input. Subsequent conversion uses GPU-owned compact.
+						result_queue.put(("input_released", seq, input_slot, worker_index))
+						if cuda_events:
+							input_cuda_events["cuda_convert"][-1][0].record()
+						stage_started = time.perf_counter()
+						if compact.dtype == torch.uint16:
+							converted = torch.div(compact.to(torch.int32), 257, rounding_mode="floor").to(torch.float32).div_(255.0)
+						elif compact.dtype == torch.uint8:
+							converted = compact.to(torch.float32).div_(255.0)
+						else:
+							raise TypeError(f"predict3d input must be uint8 or uint16, got {tile_np.dtype}")
+						if profile is not None:
+							profile["cuda_convert_submit_wall_s"] = profile.get("cuda_convert_submit_wall_s", 0.0) + time.perf_counter() - stage_started
+						del compact, source
 					else:
-						raise TypeError(f"predict3d input must be uint8 or uint16, got {tile_np.dtype}")
-					if profile is not None:
-						profile["cuda_convert_submit_wall_s"] = time.perf_counter() - stage_started
-						cuda_events["cuda_convert"][1].record()
-				else:
-					stage_started = time.perf_counter()
-					tile = _input_tile_to_device(tile_np, device)
-					if profile is not None:
-						profile["cpu_convert_wall_s"] = time.perf_counter() - stage_started
-					result_queue.put(("input_released", seq, input_slot, worker_index))
+						stage_started = time.perf_counter()
+						converted = _input_tile_to_device(tile_np, device)
+						if profile is not None:
+							profile["cpu_convert_wall_s"] = profile.get("cpu_convert_wall_s", 0.0) + time.perf_counter() - stage_started
+						result_queue.put(("input_released", seq, input_slot, worker_index))
+					if len(batch) == 1:
+						tile = converted
+					else:
+						if tile is None:
+							tile = torch.empty((len(batch), *converted.shape[1:]), dtype=converted.dtype, device=device)
+						tile[index:index + 1].copy_(converted)
+					del converted
+					if cuda_events:
+						input_cuda_events["cuda_convert"][-1][1].record()
 				preprocess = getattr(model_adapter, "preprocess_tile", None)
 				if cuda_events:
 					cuda_events["adapter_preprocess"][0].record()
@@ -2291,7 +3092,8 @@ def _multi_gpu_worker_main(
 						cuda_events["model_inference"][0].record()
 				stage_started = time.perf_counter()
 				with torch.inference_mode():
-					raw_output = model_adapter.run_tile_inference(model, tile, device=device)
+					raw_output = (model_adapter.run_tile_inference(model, tile, device=device)
+						if resident_model is None and budget is None else _resident_tile_inference(model_adapter, model, tile, device, adaptive_cap))
 				if profile is not None:
 					profile["model_inference_submit_wall_s"] = time.perf_counter() - stage_started
 					if cuda_events:
@@ -2299,17 +3101,35 @@ def _multi_gpu_worker_main(
 						cuda_events["output"][0].record()
 				stage_started = time.perf_counter()
 				tensors = model_adapter.product_tensors_from_output(raw_output)
-				layouts = {layout.name: layout for layout in result_specs[result_slot].layouts}
-				needed_scales = sorted({int(product_scales[name]) for name in needed_names})
-				for sd in needed_scales:
-					weight = weights_by_scale[sd]
-					_slot_array(results[result_slot], layouts[f"weight:{sd}"])[:] = weight.detach().cpu().numpy()
-				for name in needed_names:
-					sd = int(product_scales[name])
-					weighted = tensors[name][0] * w_full
-					if sd > 1:
-						weighted = _pyrdown3d(weighted, factor=sd)
-					_slot_array(results[result_slot], layouts[f"product:{name}"])[:] = weighted.detach().cpu().numpy()
+				# Validate every item before publishing any result descriptor.
+				for name in {name for item in batch for name in item[4]}:
+					observed_shape = tuple(int(value) for value in tensors[name].shape[-3:])
+					if tensors[name].shape[0] != len(batch) or observed_shape != expected_native_shape:
+						raise ValueError(
+							f"product {name!r} batch/native tile shape {tuple(tensors[name].shape)} "
+							f"does not match batch {len(batch)}, native stride {native_output_stride}, "
+							f"expected shape {expected_native_shape}"
+						)
+				for index, item in enumerate(batch):
+					result_slot, needed_names = item[3:5]
+					layouts = {layout.name: layout for layout in result_specs[result_slot].layouts}
+					for sd in sorted({int(product_scales[name]) for name in needed_names}):
+						weight_name = f"weight:{sd}"
+						if weight_name in layouts:
+							_copy_tensor_to_shared_array(
+								_slot_array(results[result_slot], layouts[weight_name]),
+								weights_by_scale[sd],
+							)
+					for name in needed_names:
+						sd = int(product_scales[name])
+						weighted = tensors[name][index] * w_native
+						remaining_scaledown = sd // native_output_stride
+						if remaining_scaledown > 1:
+							weighted = _pyrdown3d(weighted, factor=remaining_scaledown)
+						_copy_tensor_to_shared_array(
+							_slot_array(results[result_slot], layouts[f"product:{name}"]), weighted,
+						)
+						del weighted
 				if profile is not None:
 					profile["output_and_d2h_wall_s"] = time.perf_counter() - stage_started
 					if cuda_events:
@@ -2318,21 +3138,38 @@ def _multi_gpu_worker_main(
 				if device.type == "cuda":
 					torch.cuda.synchronize(device)
 				finished = time.perf_counter()
+				elapsed = finished - started
 				if profile is not None:
 					profile["terminal_sync_wall_s"] = finished - sync_started
-					profile["worker_total_wall_s"] = finished - started
+					profile["worker_total_wall_s"] = elapsed
 					for name, (event_start, event_end) in cuda_events.items():
 						profile[f"{name}_cuda_s"] = event_start.elapsed_time(event_end) / 1000.0
-					result_queue.put((
-						"result", seq, coord, result_slot, tuple(needed_names), worker_index,
-						finished - started, profile, finished,
-					))
-				else:
-					result_queue.put(("result", seq, coord, result_slot, tuple(needed_names), worker_index, finished - started))
+					for name, pairs in input_cuda_events.items():
+						if pairs:
+							profile[f"{name}_cuda_s"] = sum(start.elapsed_time(end) for start, end in pairs) / 1000.0
+					# Preserve the existing per-tile aggregate accounting.
+					profile = {name: value / len(batch) for name, value in profile.items()}
+					profile["batch_size"] = len(batch)
+				if report_batches:
+					result_queue.put(("batch", worker_index, {
+						"size": len(batch), "seconds": elapsed,
+						"cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else 0,
+						"cuda_peak_reserved_bytes": torch.cuda.max_memory_reserved(device) if device.type == "cuda" else 0,
+					}))
+				for item in batch:
+					seq, coord, _, result_slot, needed_names = item[:5]
+					result = ("result", seq, coord, result_slot, tuple(needed_names), worker_index, elapsed / len(batch))
+					result_queue.put((*result, profile, finished) if profile is not None else result)
+				# No previous-batch tensors may inflate the next forward peak.
+				del tile, tensors, raw_output
+				if stop:
+					break
 			except BaseException as exc:
 				result_queue.put(("error", seq, coord, worker_index, type(exc).__name__, str(exc)))
 				break
 	finally:
+		for module, training in previous_modes:
+			module.training = training
 		for shm in inputs + results:
 			shm.close()
 
@@ -2455,6 +3292,15 @@ def run_tiled_inference_3d(
 		p.name: max(1, int(p.inference_scaledown or 1))
 		for p in products
 	}
+	native_output_stride = int(getattr(model_adapter, "native_output_stride", 1))
+	if native_output_stride <= 0:
+		raise ValueError("model adapter native_output_stride must be > 0")
+	for product_name, sd in scales.items():
+		if int(sd) % native_output_stride:
+			raise ValueError(
+				f"product {product_name!r} inference_scaledown={sd} is not divisible by "
+				f"native model output stride {native_output_stride}"
+			)
 	if isinstance(output_scaledown_base, Mapping):
 		input_scales = set()
 		for product in products:
@@ -2493,28 +3339,19 @@ def run_tiled_inference_3d(
 		tile_size=tile_size, stride=stride, border=pad, scaledown_multiple=sd_max,
 	)
 
-	def _blend_ramp(length: int) -> np.ndarray:
-		ramp = np.zeros(length, dtype=np.float32)
-		core_start, core_end = min(pad, length), max(min(pad, length), length - pad)
-		core_len = core_end - core_start
-		if core_len <= 0:
-			return ramp
-		core = np.ones(core_len, dtype=np.float32)
-		ov = min(max(0, int(overlap) - 2 * pad), core_len // 2)
-		if ov:
-			edges = np.linspace(0.0, 1.0, ov + 1, dtype=np.float32)[1:]
-			core[:ov], core[-ov:] = edges, edges[::-1]
-		ramp[core_start:core_end] = core
-		return ramp
-
-	r = _blend_ramp(int(tile_size))
+	r = blend_ramp(int(tile_size), pad, int(overlap))
 	w_full = None
+	w_native = None
 	w_by_scale = None
 	if not parallel:
 		w_full = torch.from_numpy(r[:, None, None] * r[None, :, None] * r[None, None, :]).to(device)
+		w_native = (
+			_pyrdown3d(w_full.unsqueeze(0), factor=native_output_stride).squeeze(0)
+			if native_output_stride > 1 else w_full
+		)
 		w_by_scale = {
-			sd: (_pyrdown3d(w_full.unsqueeze(0), factor=sd).squeeze(0).cpu().numpy()
-				 if sd > 1 else w_full.cpu().numpy())
+			sd: (_pyrdown3d(w_native.unsqueeze(0), factor=sd // native_output_stride).squeeze(0).cpu().numpy()
+				 if sd > native_output_stride else w_native.cpu().numpy())
 			for sd in sorted(set(scales.values()))
 		}
 	groups: dict[int, dict[str, Any]] = {}
@@ -2607,7 +3444,13 @@ def run_tiled_inference_3d(
 			)
 		return bool(cache[origin])
 
-	def _needed_chunks(sd: int, g: dict[str, Any], reg: RegionZYX) -> dict[ChunkOriginZYX, tuple[OutputProductSpec, ...]]:
+	def _needed_chunks(
+		sd: int,
+		g: dict[str, Any],
+		reg: RegionZYX,
+		*,
+		outcome: dict[str, int] | None = None,
+	) -> dict[ChunkOriginZYX, tuple[OutputProductSpec, ...]]:
 		shape = g["full_shape"]
 		needed: dict[ChunkOriginZYX, tuple[OutputProductSpec, ...]] = {}
 		for origin in _iter_chunk_origins_for_region(*reg, g["oc"], shape):
@@ -2616,10 +3459,16 @@ def run_tiled_inference_3d(
 				if not output_adapter.product_chunk_complete(p, chunk_origin_zyx=origin)
 			)
 			if not missing:
+				if outcome is not None:
+					outcome["complete"] = outcome.get("complete", 0) + 1
 				g["resume_origins"].add(origin)
 			elif _chunk_supported(sd, g, origin):
+				if outcome is not None:
+					outcome["supported"] = outcome.get("supported", 0) + 1
 				needed[origin] = missing
 			else:
+				if outcome is not None:
+					outcome["unsupported"] = outcome.get("unsupported", 0) + 1
 				g["unsupported_origins"].add(origin)
 		return needed
 
@@ -2654,15 +3503,16 @@ def run_tiled_inference_3d(
 					return True
 		return False
 
-	def _tile_work(tz: int, ty: int, tx: int) -> tuple[str, ...]:
+	def _tile_work(tz: int, ty: int, tx: int) -> tuple[tuple[str, ...], str | None]:
 		bounds = _tile_input_bounds(tz, ty, tx)
 		has_source = (
 			live_cache.region_has_remote_chunks(bounds)
 			if live_cache is not None else _input_has_chunks(input_dir, *bounds)
 		)
 		if not has_source:
-			return ()
+			return (), "empty"
 		needed_names: set[str] = set()
+		outcome: dict[str, int] = {}
 		for sd, g in groups.items():
 			Zo, Yo, Xo = g["shape"]
 			ts = tile_size // sd
@@ -2674,9 +3524,15 @@ def run_tiled_inference_3d(
 				max(oy0, oy0 + clips[1][0] - b), min(oy1, oy0 + clips[1][1] - b),
 				max(ox0, ox0 + clips[2][0] - b), min(ox1, ox0 + clips[2][1] - b),
 			)
-			for missing in _needed_chunks(sd, g, reg).values():
+			for missing in _needed_chunks(sd, g, reg, outcome=outcome).values():
 				needed_names.update(product.name for product in missing)
-		return tuple(sorted(needed_names))
+		if needed_names:
+			return tuple(sorted(needed_names)), None
+		# An incomplete but unsupported output is a sparse/empty skip.  Only a tile
+		# whose relevant output is entirely complete is a resume skip.
+		if outcome.get("unsupported", 0) > 0 or not outcome:
+			return (), "empty"
+		return (), "resume"
 
 	def _accumulate_group(
 		sd: int, g: dict[str, Any], product_np: Mapping[str, np.ndarray],
@@ -2824,7 +3680,7 @@ def run_tiled_inference_3d(
 	flush_task_queue = None
 	flush_result_queue = None
 	flush_processes: list[Any] = []
-	pending_flush: dict[str, Any] | None = None
+	pending_flush: _FlushBatchState | None = None
 	flush_batch_id = 0
 	flush_work_total = 0.0
 	flush_wait_total = 0.0
@@ -2851,7 +3707,10 @@ def run_tiled_inference_3d(
 				for index in range(int(flush_workers)):
 					process = flush_ctx.Process(
 						target=_flush_process_main,
-						args=(index, model_adapter, output_adapter, flush_task_queue, flush_result_queue),
+					args=(
+						index, model_adapter, output_adapter, flush_task_queue,
+						flush_result_queue,
+					),
 						name=f"predict3d-flush-{index}", daemon=True,
 					)
 					process.start()
@@ -2867,7 +3726,7 @@ def run_tiled_inference_3d(
 		flush_processes = started
 		print(
 			f"[predict3d] flush processes={len(flush_processes)} ipc_window={window} "
-			"native_threads_per_worker=1", flush=True,
+			"native_threads_per_worker=1 blosc_threads_per_worker=1", flush=True,
 		)
 
 	def _check_flush_workers() -> None:
@@ -2897,21 +3756,21 @@ def run_tiled_inference_3d(
 	def _handle_flush_message(message: tuple[Any, ...]) -> None:
 		if pending_flush is None:
 			raise RuntimeError(f"flush result arrived without a pending batch: {message}")
-		if int(message[1]) != int(pending_flush["batch_id"]):
+		if int(message[1]) != int(pending_flush.batch_id):
 			raise RuntimeError(f"unexpected flush batch result: {message}")
 		task_id = int(message[2])
-		if task_id not in pending_flush["inflight"]:
+		if task_id not in pending_flush.inflight:
 			raise RuntimeError(f"unexpected or duplicate flush task result: {message}")
-		pending_flush["inflight"].remove(task_id)
+		pending_flush.inflight.remove(task_id)
 		if message[0] == "error":
 			raise RuntimeError(
 				f"flush worker {message[3]} failed task {task_id}: {message[4]}: {message[5]}"
 			)
 		if message[0] != "result":
 			raise RuntimeError(f"unknown flush worker message: {message}")
-		pending_flush["completed"] += 1
-		pending_flush["written_by_sd"][pending_flush["task_sd"][task_id]] += int(message[4])
-		pending_flush["work_s"] += float(message[5])
+		pending_flush.completed_ids.add(task_id)
+		pending_flush.written_by_sd[pending_flush.task_sd[task_id]] += int(message[4])
+		pending_flush.work_s += float(message[5])
 
 	def _pump_pending_flush(*, block: bool) -> bool:
 		if pending_flush is None:
@@ -2920,14 +3779,14 @@ def run_tiled_inference_3d(
 			return True
 		made_progress = False
 		window = max(1, 2 * int(flush_workers))
-		while pending_flush["tasks"] and len(pending_flush["inflight"]) < window:
-			task = pending_flush["tasks"][0]
+		while pending_flush.tasks and len(pending_flush.inflight) < window:
+			task = pending_flush.tasks[0]
 			try:
 				flush_task_queue.put_nowait(task)
 			except queue.Full:
 				break
-			pending_flush["tasks"].popleft()
-			pending_flush["inflight"].add(task.task_id)
+			pending_flush.tasks.popleft()
+			pending_flush.inflight.add(task.task_id)
 			made_progress = True
 		while True:
 			try:
@@ -2936,14 +3795,17 @@ def run_tiled_inference_3d(
 				break
 			made_progress = True
 			_handle_flush_message(message)
-		if block and not made_progress and (pending_flush["tasks"] or pending_flush["inflight"]):
+		if block and not made_progress and not pending_flush.complete:
 			try:
 				message = flush_result_queue.get(timeout=0.05)
 			except queue.Empty:
 				_check_flush_workers()
 			else:
 				_handle_flush_message(message)
-		return not pending_flush["tasks"] and not pending_flush["inflight"]
+		complete = pending_flush.complete
+		if complete:
+			_finalize_pending_flush()
+		return complete
 
 	def _shutdown_flush_workers(*, terminate: bool) -> None:
 		nonlocal flush_processes, flush_task_queue, flush_result_queue
@@ -2973,36 +3835,20 @@ def run_tiled_inference_3d(
 		flush_task_queue = None
 		flush_result_queue = None
 
-	def _complete_pending_flush() -> None:
+	def _finalize_pending_flush() -> None:
 		nonlocal pending_flush, flush_work_total, flush_wait_total, flush_chunks_total
 		if pending_flush is None:
 			return
-		wait_started = time.perf_counter()
-		if int(flush_workers) > 0:
-			while not _pump_pending_flush(block=True):
-				pass
-		else:
-			cache: dict[str, np.memmap] = {}
-			try:
-				for task in tuple(pending_flush["tasks"]):
-					_batch, task_id, written, elapsed = _execute_flush_process_task(
-						task, model_adapter, output_adapter, cache,
-					)
-					pending_flush["completed"] += 1
-					pending_flush["written_by_sd"][task.sd] += int(written)
-					pending_flush["work_s"] += float(elapsed)
-				pending_flush["tasks"].clear()
-			finally:
-				for arr in cache.values():
-					mmap_obj = getattr(arr, "_mmap", None)
-					if mmap_obj is not None:
-						mmap_obj.close()
-		flush_wait_total += time.perf_counter() - wait_started
-		flush_work_total += float(pending_flush["work_s"])
-		flush_chunks_total += int(pending_flush["completed"])
+		if not pending_flush.complete:
+			raise RuntimeError(
+				f"cannot finalize incomplete flush batch {pending_flush.batch_id}: "
+				f"queued={len(pending_flush.tasks)} inflight={len(pending_flush.inflight)}"
+			)
+		flush_work_total += float(pending_flush.work_s)
+		flush_chunks_total += len(pending_flush.completed_ids)
 		completed_batch = pending_flush
 		pending_flush = None
-		for plan in completed_batch["plans"]:
+		for plan in completed_batch.plans:
 			sd, g = plan.sd, groups[plan.sd]
 			b, oc = g["b"], g["oc"]
 			oz0, oy0, ox0, oz1, oy1, ox1 = g["region"]
@@ -3042,13 +3888,40 @@ def run_tiled_inference_3d(
 			print(
 				f"[predict3d] flush complete sd={sd} z={oz0 + plan.flush_to - b} "
 				f"dirty_chunks={len(plan.chunks)} "
-				f"products_written={completed_batch['written_by_sd'][sd]} "
+				f"products_written={completed_batch.written_by_sd[sd]} "
 				f"unsupported={len(g['unsupported_origins'])} resume={len(g['resume_origins'])} "
 				f"touched={g['touched_bytes'] / 1024**2:.2f}MiB "
 				f"cleared={g['cleared_bytes'] / 1024**2:.2f}MiB "
 				f"elapsed={time.perf_counter()-plan.submitted_at:.2f}s",
 				flush=True,
 			)
+
+	def _complete_pending_flush() -> None:
+		nonlocal pending_flush, flush_wait_total
+		if pending_flush is None:
+			return
+		wait_started = time.perf_counter()
+		if int(flush_workers) > 0:
+			while pending_flush is not None:
+				_pump_pending_flush(block=True)
+		else:
+			cache: dict[str, np.memmap] = {}
+			try:
+				while pending_flush.tasks:
+					task = pending_flush.tasks.popleft()
+					_batch, task_id, written, elapsed = _execute_flush_process_task(
+						task, model_adapter, output_adapter, cache,
+					)
+					pending_flush.completed_ids.add(task_id)
+					pending_flush.written_by_sd[task.sd] += int(written)
+					pending_flush.work_s += float(elapsed)
+			finally:
+				for arr in cache.values():
+					mmap_obj = getattr(arr, "_mmap", None)
+					if mmap_obj is not None:
+						mmap_obj.close()
+			_finalize_pending_flush()
+		flush_wait_total += time.perf_counter() - wait_started
 
 	def _advance_flushes(complete_padded: int) -> None:
 		nonlocal pending_flush, flush_batch_id, flush_started_at
@@ -3068,12 +3941,12 @@ def run_tiled_inference_3d(
 		if flush_started_at is None:
 			flush_started_at = time.perf_counter()
 		tasks = _make_flush_tasks(plans, flush_batch_id)
-		pending_flush = {
-			"batch_id": flush_batch_id, "plans": plans, "tasks": tasks,
-			"inflight": set(), "completed": 0, "work_s": 0.0,
-			"written_by_sd": {sd: 0 for sd in groups},
-			"task_sd": {task.task_id: task.sd for task in tasks},
-		}
+		pending_flush = _FlushBatchState(
+			batch_id=flush_batch_id, plans=plans, tasks=tasks,
+			inflight=set(), completed_ids=set(), work_s=0.0,
+			written_by_sd={sd: 0 for sd in groups},
+			task_sd={task.task_id: task.sd for task in tasks},
+		)
 		if int(flush_workers) <= 0:
 			_complete_pending_flush()
 		else:
@@ -3081,28 +3954,60 @@ def run_tiled_inference_3d(
 
 	total = len(z_positions) * len(y_positions) * len(x_positions)
 	done = processed = skipped = 0
+	skipped_empty = skipped_resume = 0
 	tile_time = 0.0
 	t0 = time.time()
+	eta_started_at: float | None = None
 	if progress is not None:
-		progress.update(tiles_total=total, tiles_done=0, tiles_processed=0, tiles_skipped=0, tile_time_sum=0.0, tiles_remaining_est=total)
+		progress.update(
+			tiles_total=total, tiles_done=0, tiles_processed=0, tiles_skipped=0,
+			tiles_skipped_empty=0, tiles_skipped_resume=0,
+			tile_time_sum=0.0, tiles_remaining_est=total,
+		)
 		if live_cache is not None:
 			progress["live_cache"] = live_cache.snapshot()
 	print(_predict3d_progress_line(progress) if progress is not None else f"[predict3d] 0/{total} tiles", flush=True)
 	progress_emitter = _Predict3dProgressEmitter()
 	try:
-		def _record_commit(*, was_processed: bool, elapsed: float, row_end: bool, next_tz: int) -> None:
-			nonlocal done, processed, skipped, tile_time
+		def _record_commit(
+			*,
+			was_processed: bool,
+			elapsed: float,
+			row_end: bool,
+			next_tz: int,
+			skip_reason: str | None = None,
+		) -> None:
+			nonlocal done, processed, skipped, skipped_empty, skipped_resume
+			nonlocal tile_time, eta_started_at
 			done += 1
 			if was_processed:
+				if skip_reason is not None:
+					raise ValueError(f"processed tile cannot have skip_reason={skip_reason!r}")
 				processed += 1
+				if eta_started_at is None:
+					eta_started_at = time.time() - (max(0.0, float(elapsed)) if parallel else 0.0)
 				# Parallel ETA is based on observed committed throughput, not the
 				# sum of overlapping per-GPU durations (which would overestimate by
 				# approximately the worker count).
-				tile_time = time.time() - t0 if parallel else tile_time + float(elapsed)
+				tile_time = time.time() - eta_started_at if parallel else tile_time + float(elapsed)
 			else:
 				skipped += 1
+				if skip_reason == "empty":
+					skipped_empty += 1
+					if eta_started_at is None:
+						eta_started_at = time.time()
+					if parallel:
+						tile_time = time.time() - eta_started_at
+				elif skip_reason == "resume":
+					skipped_resume += 1
+				else:
+					raise ValueError(f"skipped tile requires known skip_reason, got {skip_reason!r}")
 			if progress is not None:
-				progress.update(tiles_done=done, tiles_processed=processed, tiles_skipped=skipped, tile_time_sum=tile_time, tiles_remaining_est=total-done)
+				progress.update(
+					tiles_done=done, tiles_processed=processed, tiles_skipped=skipped,
+					tiles_skipped_empty=skipped_empty, tiles_skipped_resume=skipped_resume,
+					tile_time_sum=tile_time, tiles_remaining_est=total-done,
+				)
 				if live_cache is not None:
 					progress["live_cache"] = live_cache.snapshot()
 			status = _predict3d_progress_line(progress) if progress is not None else f"[predict3d] {done}/{total} tiles"
@@ -3120,7 +4025,7 @@ def run_tiled_inference_3d(
 
 		if not parallel:
 			_start_flush_workers()
-			assert w_full is not None and w_by_scale is not None
+			assert w_full is not None and w_native is not None and w_by_scale is not None
 			serial_reader = None
 			serial_pending: deque[dict[str, Any]] = deque()
 			serial_source = iter(_iter_canonical_tile_events(z_positions, y_positions, x_positions, Zp))
@@ -3152,7 +4057,7 @@ def run_tiled_inference_3d(
 							coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz,
 						)
 						if not _tile_may_need_output(tz, ty, tx):
-							event.update(status="done_skip", needed=())
+							event.update(status="done_skip", needed=(), skip_reason="resume")
 						else:
 							event.update(
 								status="fetching",
@@ -3168,7 +4073,7 @@ def run_tiled_inference_3d(
 							return False
 						task.result()
 						tz, ty, tx = event["coord"]
-						event["needed"] = _tile_work(tz, ty, tx)
+						event["needed"], event["skip_reason"] = _tile_work(tz, ty, tx)
 						event["status"] = "awaiting_read" if event["needed"] else "done_skip"
 						return True
 
@@ -3222,19 +4127,25 @@ def run_tiled_inference_3d(
 						tz, ty, tx, row_end, next_tz = next(serial_source)
 					except StopIteration:
 						return None
-					needed = _tile_work(tz, ty, tx)
+					needed, skip_reason = _tile_work(tz, ty, tx)
 					tile_np = None if not needed else _read_tile_zarr(
 						zarr_arr, volume_shape, (z0, y0, x0), tz, ty, tx, tile_size, pad,
 					)
-					return dict(coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz, needed=needed, tile=tile_np)
+					return dict(
+						coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz,
+						needed=needed, skip_reason=skip_reason, tile=tile_np,
+					)
 				while not serial_source_done and len(serial_pending) < int(prefetch_tiles_per_gpu):
 					try:
 						tz, ty, tx, row_end, next_tz = next(serial_source)
 					except StopIteration:
 						serial_source_done = True
 						break
-					needed = _tile_work(tz, ty, tx)
-					event = dict(coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz, needed=needed)
+					needed, skip_reason = _tile_work(tz, ty, tx)
+					event = dict(
+						coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz,
+						needed=needed, skip_reason=skip_reason,
+					)
 					if needed:
 						event["read_task"] = serial_reader.submit(
 							volume_shape=volume_shape, crop_offset=(z0, y0, x0), coord=(tz, ty, tx),
@@ -3256,7 +4167,10 @@ def run_tiled_inference_3d(
 					row_end, next_tz, needed_names = event["row_end"], event["next_tz"], event["needed"]
 					_pump_pending_flush(block=False)
 					if not needed_names:
-						_record_commit(was_processed=False, elapsed=0.0, row_end=row_end, next_tz=next_tz)
+						_record_commit(
+							was_processed=False, elapsed=0.0, row_end=row_end,
+							next_tz=next_tz, skip_reason=event["skip_reason"],
+						)
 						continue
 					tile_t0 = time.time()
 					if serial_reader is None:
@@ -3286,12 +4200,22 @@ def run_tiled_inference_3d(
 								f"nan={nan_count}/{diagnostic.numel()} dtype={diagnostic.dtype}", flush=True,
 							)
 					tensors = model_adapter.product_tensors_from_output(raw_output)
+					expected_native_shape = tuple(int(value) for value in w_native.shape)
+					for name in needed_names:
+						observed_shape = tuple(int(value) for value in tensors[name].shape[-3:])
+						if observed_shape != expected_native_shape:
+							raise ValueError(
+								f"product {name!r} native tile shape {observed_shape} does not match "
+								f"model native output stride {native_output_stride} expected shape "
+								f"{expected_native_shape}"
+							)
 					prepared_products = {}
 					for name in needed_names:
 						sd = scales[name]
-						weighted = tensors[name][0] * w_full
-						if sd > 1:
-							weighted = _pyrdown3d(weighted, factor=sd)
+						weighted = tensors[name][0] * w_native
+						remaining_scaledown = sd // native_output_stride
+						if remaining_scaledown > 1:
+							weighted = _pyrdown3d(weighted, factor=remaining_scaledown)
 						prepared_products[name] = weighted.detach().cpu().numpy()
 					for sd, group in groups.items():
 						_accumulate_group(sd, group, prepared_products, w_by_scale[sd], tz, ty, tx)
@@ -3362,7 +4286,8 @@ def run_tiled_inference_3d(
 					target=_multi_gpu_worker_main,
 					args=(
 						index, str(worker_device), model_adapter, worker_state, tile_size, r,
-						scales, input_specs, result_specs, work_queues[index], result_queue,
+						scales, native_output_stride, input_specs, result_specs,
+						work_queues[index], result_queue,
 						bool(profile_pipeline),
 					),
 					name=f"predict3d-{worker_device}", daemon=True,
@@ -3427,6 +4352,16 @@ def run_tiled_inference_3d(
 				else:
 					executor = ThreadPoolExecutor(max_workers=reader_count, thread_name_prefix="predict3d-read")
 			except BaseException:
+				for task_queue in accum_queues:
+					try:
+						task_queue.put_nowait(None)
+					except queue.Full:
+						pass
+				for process in accum_processes:
+					process.join(timeout=5.0)
+					if process.is_alive():
+						process.terminate()
+						process.join(timeout=5.0)
 				for work_queue in work_queues:
 					try:
 						work_queue.put_nowait(None)
@@ -3437,11 +4372,6 @@ def run_tiled_inference_3d(
 					if worker.is_alive():
 						worker.terminate()
 						worker.join(timeout=5.0)
-				for work_queue in work_queues:
-					work_queue.close()
-					work_queue.join_thread()
-				result_queue.close()
-				result_queue.join_thread()
 				for shm in input_shms + result_shms:
 					shm.close()
 					shm.unlink()
@@ -3454,12 +4384,24 @@ def run_tiled_inference_3d(
 			)
 			free_inputs = list(range(_slot_count - 1, -1, -1))
 			free_results = list(range(_slot_count - 1, -1, -1))
+			slot_ledger = _SlotLedger(_slot_count)
+			gpu_outstanding: list[dict[int, dict[str, Any]]] = [dict() for _ in workers]
+			accum_outstanding: list[dict[int, int]] = [dict() for _ in accum_processes]
 			events: dict[int, dict[str, Any]] = {}
 			futures: dict[Any, int] = {}
-			event_iter = iter(_iter_canonical_tile_events(z_positions, y_positions, x_positions, Zp))
+			band_index = -1
+			active_band: _ZBandState | None = None
+			band_iter: Iterator[tuple[int, int]] = iter(())
+			band_source_done = True
 			source_done = False
+			cache_descriptor_source = (
+				iter(_iter_canonical_tile_events(z_positions, y_positions, x_positions, Zp))
+				if live_cache is not None else None
+			)
+			cache_descriptor_done = live_cache is None
+			cache_backlog: deque[tuple[int, dict[str, Any]]] = deque()
+			active_event_window = max(_slot_count, _prefetch_window)
 			next_sequence = next_commit = next_accum_dispatch = 0
-			accum_dispatch_z: int | None = None
 			next_worker = 0
 			gpu_counts = [0 for _ in workers]
 			gpu_time_sums = [0.0 for _ in workers]
@@ -3496,12 +4438,83 @@ def run_tiled_inference_3d(
 				arr = _read_tile_zarr(zarr_arr, volume_shape, (z0, y0, x0), *coord, tile_size, pad)
 				return arr, time.perf_counter() - started
 
+			def _submit_read(seq: int, event: dict[str, Any]) -> None:
+				"""Submit one materialized tile to the unchanged bounded reader stage."""
+				nonlocal read_submitted
+				tz, ty, tx = event["coord"]
+				event["status"] = "reading"
+				if tensorstore_reader is not None:
+					task = tensorstore_reader.submit(
+						volume_shape=volume_shape, crop_offset=(z0, y0, x0),
+						coord=(tz, ty, tx), tile_size=tile_size, border=pad,
+						profile=bool(profile_pipeline),
+					)
+					event["read_task"] = task
+					futures[id(task)] = int(seq)
+				else:
+					event["read_submitted_at"] = time.perf_counter()
+					future = executor.submit(_read_coord, (tz, ty, tx))
+					if profile_pipeline:
+						future.add_done_callback(
+							lambda _future, current=event: current.__setitem__(
+								"read_completed_at", time.perf_counter(),
+							)
+						)
+					event["read_task"] = future
+					futures[future] = int(seq)
+				read_submitted += 1
+
 			def _handle_gpu_message(message: tuple[Any, ...]) -> None:
-				if message[0] == "input_released":
-					free_inputs.append(int(message[2]))
-				elif message[0] == "result":
+				if not isinstance(message, tuple) or not message:
+					raise RuntimeError(f"GPU result queue received malformed message: {message!r}")
+				kind = message[0]
+				expected_lengths = {"input_released": 4, "result": (7, 9), "error": 6}
+				expected = expected_lengths.get(kind)
+				if expected is None or (
+					isinstance(expected, int) and len(message) != expected
+				) or (
+					isinstance(expected, tuple) and len(message) not in expected
+				):
+					raise RuntimeError(
+						f"GPU result queue received malformed {kind!r} message: {message!r}"
+					)
+				source_worker = int(message[3] if kind in ("input_released", "error") else message[5])
+				if not 0 <= source_worker < len(gpu_outstanding):
+					raise RuntimeError(f"GPU result names invalid worker {source_worker}: {message}")
+				seq = int(message[1])
+				owner = gpu_outstanding[source_worker].get(seq)
+				if owner is None:
+					raise RuntimeError(
+						f"GPU worker {source_worker} returned foreign or duplicate sequence {seq}; "
+						f"outstanding={sorted(gpu_outstanding[source_worker])}"
+					)
+				if kind == "input_released":
+					slot = int(message[2])
+					if owner["input_released"] or slot != int(owner["input_slot"]):
+						raise RuntimeError(
+							f"GPU worker {source_worker} returned invalid input slot {slot} for "
+							f"sequence {seq}: owner={owner}"
+						)
+					event = events.get(seq)
+					if event is None:
+						raise RuntimeError(f"input slot {slot} released for unknown event {seq}")
+					slot_ledger.release("input", slot, band=int(event["band"]), sequence=seq)
+					free_inputs.append(slot)
+					owner["input_released"] = True
+				elif kind == "result":
 					_, seq, _coord, _slot, _names, worker_index, elapsed, *profile_tail = message
+					seq = int(seq)
+					if not owner["input_released"] or int(_slot) != int(owner["result_slot"]):
+						raise RuntimeError(
+							f"GPU worker {source_worker} returned invalid result for sequence {seq}: "
+							f"slot={_slot} owner={owner}"
+						)
+					gpu_outstanding[source_worker].pop(seq)
 					events[int(seq)]["status"] = "done_result"
+					slot_ledger.transition(
+						"result", int(_slot), band=int(events[int(seq)]["band"]),
+						sequence=int(seq), stage="gpu-result",
+					)
 					events[int(seq)]["gpu_elapsed"] = float(elapsed)
 					gpu_counts[int(worker_index)] += 1
 					gpu_time_sums[int(worker_index)] += float(elapsed)
@@ -3518,8 +4531,9 @@ def run_tiled_inference_3d(
 						for name, value in stage_values.items():
 							sums[name] = sums.get(name, 0.0) + float(value)
 							maxima[name] = max(maxima.get(name, 0.0), float(value))
-				elif message[0] == "error":
+				elif kind == "error":
 					_, seq, coord, worker_index, kind, detail = message
+					gpu_outstanding[source_worker].pop(int(seq))
 					raise RuntimeError(
 						f"multi-GPU worker {worker_index} failed at tile {coord} "
 						f"seq={seq}: {kind}: {detail}"
@@ -3529,7 +4543,18 @@ def run_tiled_inference_3d(
 
 			def _handle_accum_message(message: tuple[Any, ...]) -> None:
 				nonlocal accum_work_sum
+				if not isinstance(message, tuple) or len(message) != 6 or message[0] not in ("result", "error"):
+					raise RuntimeError(f"accumulator result queue received malformed message: {message!r}")
 				task_id = int(message[1])
+				source_worker = int(message[3])
+				if not 0 <= source_worker < len(accum_outstanding):
+					raise RuntimeError(f"accumulator result names invalid worker {source_worker}: {message}")
+				event_seq = accum_outstanding[source_worker].pop(task_id, None)
+				if event_seq is None or int(event_seq) != int(message[2]):
+					raise RuntimeError(
+						f"accumulator worker {source_worker} returned foreign or duplicate task "
+						f"{task_id}: event={message[2]} outstanding={accum_outstanding[source_worker]}"
+					)
 				metadata = accum_pending.pop(task_id, None)
 				if metadata is None:
 					raise RuntimeError(f"unexpected or duplicate accumulator result: {message}")
@@ -3553,24 +4578,47 @@ def run_tiled_inference_3d(
 				event = events[int(message[2])]
 				event["accum_remaining"] -= 1
 				if event["accum_remaining"] == 0:
-					free_results.append(event["result_slot"])
+					result_slot = int(event["result_slot"])
+					slot_ledger.release(
+						"result", result_slot, band=int(event["band"]), sequence=int(message[2]),
+					)
+					free_results.append(result_slot)
 					event["status"] = "done_accum"
 
-			def _pump_accumulator_results() -> bool:
+			def _pump_gpu_results(*, timeout: float = 0.0) -> bool:
+				progressed = False
+				while True:
+					try:
+						message = (
+							result_queue.get(timeout=float(timeout))
+							if not progressed and float(timeout) > 0.0
+							else result_queue.get_nowait()
+						)
+					except queue.Empty:
+						break
+					_handle_gpu_message(message)
+					progressed = True
+				return progressed
+
+			def _pump_accumulator_results(*, timeout: float = 0.0) -> bool:
 				if accum_result_queue is None:
 					return False
 				progressed = False
 				while True:
 					try:
-						message = accum_result_queue.get_nowait()
+						message = (
+							accum_result_queue.get(timeout=float(timeout))
+							if not progressed and float(timeout) > 0.0
+							else accum_result_queue.get_nowait()
+						)
 					except queue.Empty:
 						break
 					_handle_accum_message(message)
 					progressed = True
 				return progressed
 
-			def _dispatch_accumulator_event(seq: int, event: dict[str, Any]) -> None:
-				nonlocal accum_task_id, accum_queue_wait, accum_started_at
+			def _prepare_accumulator_event(seq: int, event: dict[str, Any]) -> None:
+				nonlocal accum_started_at
 				result_slot = int(event["result_slot"])
 				plans = []
 				for sd, group in groups.items():
@@ -3578,61 +4626,183 @@ def run_tiled_inference_3d(
 						sd, group, result_slot, result_specs[result_slot], result_shms[result_slot], *event["coord"],
 					))
 				if not plans:
+					slot_ledger.release(
+						"result", result_slot, band=int(event["band"]), sequence=int(seq),
+					)
 					free_results.append(result_slot)
 					event["status"] = "done_accum"
 					return
 				event["accum_remaining"] = len(plans)
 				event["status"] = "accumulating"
+				event["accum_to_submit"] = deque(plans)
+				slot_ledger.transition(
+					"result", result_slot, band=int(event["band"]), sequence=int(seq),
+					stage="accumulating",
+				)
 				if accum_started_at is None:
 					accum_started_at = time.perf_counter()
-				for task_template, metadata in plans:
+
+			def _pump_accumulator_submissions(seq: int, event: dict[str, Any]) -> bool:
+				nonlocal accum_task_id, accum_queue_wait
+				pending = event.get("accum_to_submit")
+				if not pending:
+					return False
+				progressed = False
+				while pending:
+					task_template, metadata = pending[0]
 					task = replace(task_template, task_id=accum_task_id, event_seq=int(seq))
-					accum_pending[accum_task_id] = metadata
 					owner = _stable_accumulator_owner(task.sd, task.origin, len(accum_queues))
+					if len(accum_outstanding[owner]) >= 2:
+						break
 					wait_started = time.perf_counter()
-					while True:
-						try:
-							accum_queues[owner].put(task, timeout=0.01)
-							break
-						except queue.Full:
-							_pump_accumulator_results()
-							for index, process in enumerate(accum_processes):
-								if not process.is_alive() and process.exitcode is not None:
-									raise RuntimeError(f"accumulator worker {index} exited with code {process.exitcode}")
+					try:
+						accum_queues[owner].put_nowait(task)
+					except queue.Full:
+						break
 					accum_queue_wait += time.perf_counter() - wait_started
+					pending.popleft()
+					accum_pending[accum_task_id] = metadata
+					accum_outstanding[owner][accum_task_id] = int(seq)
 					accum_task_id += 1
+					progressed = True
+				if not pending:
+					event.pop("accum_to_submit", None)
+				return progressed
+
+			def _validate_worker_ownership() -> None:
+				gpu_sequences: dict[int, int] = {}
+				for worker_index, outstanding in enumerate(gpu_outstanding):
+					for seq, owner in outstanding.items():
+						if seq in gpu_sequences:
+							raise RuntimeError(
+								f"GPU sequence {seq} is owned by workers "
+								f"{gpu_sequences[seq]} and {worker_index}"
+							)
+						gpu_sequences[seq] = worker_index
+						event = events.get(seq)
+						if event is None or event.get("status") != "assigned":
+							raise RuntimeError(
+								f"GPU worker {worker_index} owns sequence {seq} without an "
+								f"assigned event: {event}"
+							)
+						if int(event.get("worker", -1)) != worker_index:
+							raise RuntimeError(
+								f"GPU sequence {seq} event claims worker {event.get('worker')} "
+								f"but worker {worker_index} owns it"
+							)
+						if (
+							int(event.get("input_slot", -1)) != int(owner["input_slot"])
+							or int(event.get("result_slot", -1)) != int(owner["result_slot"])
+						):
+							raise RuntimeError(
+								f"GPU sequence {seq} slot ownership mismatch: event={event} owner={owner}"
+							)
+				assigned_sequences = {
+					int(seq) for seq, event in events.items() if event.get("status") == "assigned"
+				}
+				if assigned_sequences != set(gpu_sequences):
+					raise RuntimeError(
+						f"GPU ownership mismatch: assigned={sorted(assigned_sequences)} "
+						f"outstanding={sorted(gpu_sequences)}"
+					)
+
+				accumulator_tasks: dict[int, int] = {}
+				for worker_index, outstanding in enumerate(accum_outstanding):
+					for task_id, event_seq in outstanding.items():
+						if task_id in accumulator_tasks:
+							raise RuntimeError(
+								f"accumulator task {task_id} is owned by multiple workers"
+							)
+						accumulator_tasks[task_id] = int(event_seq)
+				pending_task_ids = {int(task_id) for task_id in accum_pending}
+				if pending_task_ids != set(accumulator_tasks):
+					raise RuntimeError(
+						f"accumulator ownership mismatch: pending={sorted(pending_task_ids)} "
+						f"outstanding={accumulator_tasks}"
+					)
 
 			try:
 				while not source_done or events:
 					_pump_pending_flush(block=False)
 					made_progress = _pump_accumulator_results()
-					for index, process in enumerate(accum_processes):
-						if not process.is_alive() and process.exitcode is not None:
-							raise RuntimeError(
-								f"accumulator worker {index} exited unexpectedly with code {process.exitcode}"
-							)
-					while not source_done and len(events) < _materialization_window:
-						try:
-							tz, ty, tx, row_end, next_tz = next(event_iter)
-						except StopIteration:
+					if band_source_done and not events:
+						if active_band is not None:
+							active_band.validate_complete()
+							if futures or accum_pending or any(gpu_outstanding) or any(accum_outstanding):
+								raise RuntimeError(
+									f"Z band z={active_band.z} completed with outstanding "
+									f"reads={len(futures)} gpu={gpu_outstanding} "
+									f"accumulator_tasks={accum_outstanding}"
+								)
+							slot_ledger.validate_all_free()
+						band_index += 1
+						if band_index >= len(z_positions):
 							source_done = True
 							break
-						event = dict(coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz)
-						if live_cache is not None:
+						tz = int(z_positions[band_index])
+						next_tz = int(z_positions[band_index + 1]) if band_index + 1 < len(z_positions) else int(Zp)
+						active_band = _ZBandState(
+							z=tz, next_z=next_tz, first_sequence=next_commit,
+							expected=len(y_positions) * len(x_positions),
+						)
+						band_iter = iter((int(ty), int(tx)) for ty in y_positions for tx in x_positions)
+						band_source_done = False
+						made_progress = True
+					assert active_band is not None
+					if live_cache is not None:
+						while not cache_descriptor_done and len(cache_backlog) < _materialization_window:
+							try:
+								tz, ty, tx, row_end, next_tz = next(cache_descriptor_source)
+							except StopIteration:
+								cache_descriptor_done = True
+								break
+							event = dict(
+								coord=(tz, ty, tx), row_end=row_end, next_tz=next_tz, band=int(tz),
+							)
 							if not _tile_may_need_output(tz, ty, tx):
-								event.update(status="done_skip", needed=())
+								event.update(status="done_skip", needed=(), skip_reason="resume")
 							else:
 								event.update(
 									status="fetching",
 									cache_task=live_cache.request_region(_tile_input_bounds(tz, ty, tx)),
 								)
-						else:
-							needed_names = _tile_work(tz, ty, tx)
+							cache_backlog.append((next_sequence, event))
+							next_sequence += 1
+							made_progress = True
+						while len(events) < active_event_window and cache_backlog:
+							seq, event = cache_backlog[0]
+							if int(event["band"]) != active_band.z:
+								break
+							cache_backlog.popleft()
+							events[seq] = event
+							active_band.generated += 1
+							made_progress = True
+						band_source_done = active_band.generated == active_band.expected
+					else:
+						while not band_source_done and len(events) < active_event_window:
+							try:
+								ty, tx = next(band_iter)
+							except StopIteration:
+								band_source_done = True
+								break
+							tz = active_band.z
+							row_end = active_band.generated + 1 == active_band.expected
+							event = dict(
+								coord=(tz, ty, tx), row_end=row_end, next_tz=active_band.next_z,
+								band=active_band.z,
+							)
+							needed_names, skip_reason = _tile_work(tz, ty, tx)
 							event["needed"] = needed_names
-							event["status"] = "awaiting_read" if needed_names else "done_skip"
-						events[next_sequence] = event
-						next_sequence += 1
-						made_progress = True
+							event["skip_reason"] = skip_reason
+							event["status"] = "reading" if needed_names else "done_skip"
+							events[next_sequence] = event
+							if needed_names:
+								# Preserve the pre-live-fetch path: discovering a normal local
+								# tile submits its read atomically in the same scheduler pass.
+								_submit_read(next_sequence, event)
+							next_sequence += 1
+							active_band.generated += 1
+							made_progress = True
 					for event in events.values():
 						if event.get("status") != "fetching":
 							continue
@@ -3641,7 +4811,7 @@ def run_tiled_inference_3d(
 							continue
 						cache_task.result()
 						tz, ty, tx = event["coord"]
-						event["needed"] = _tile_work(tz, ty, tx)
+						event["needed"], event["skip_reason"] = _tile_work(tz, ty, tx)
 						event["status"] = "awaiting_read" if event["needed"] else "done_skip"
 						made_progress = True
 					for seq, event in events.items():
@@ -3649,26 +4819,7 @@ def run_tiled_inference_3d(
 							break
 						if event.get("status") != "awaiting_read":
 							continue
-						tz, ty, tx = event["coord"]
-						event["status"] = "reading"
-						if tensorstore_reader is not None:
-							task = tensorstore_reader.submit(
-								volume_shape=volume_shape, crop_offset=(z0, y0, x0),
-								coord=(tz, ty, tx), tile_size=tile_size, border=pad,
-								profile=bool(profile_pipeline),
-							)
-							event["read_task"] = task
-							futures[id(task)] = seq
-						else:
-							event["read_submitted_at"] = time.perf_counter()
-							future = executor.submit(_read_coord, (tz, ty, tx))
-							if profile_pipeline:
-								future.add_done_callback(
-									lambda _future, current=event: current.__setitem__("read_completed_at", time.perf_counter())
-								)
-							event["read_task"] = future
-							futures[future] = seq
-						read_submitted += 1
+						_submit_read(seq, event)
 						made_progress = True
 					read_live_highwater = max(read_live_highwater, len(futures))
 					for future_key, seq in list(futures.items()):
@@ -3710,36 +4861,64 @@ def run_tiled_inference_3d(
 						read_ready_highwater, sum(1 for event in events.values() if event["status"] == "ready")
 					)
 					for seq, event in events.items():
-						if event["status"] != "ready" or not free_inputs or not free_results:
+						if event["status"] != "ready":
+							continue
+						if not _shared_slot_pair_available(
+							events=events, frontier_sequence=next_accum_dispatch,
+							sequence=seq, free_input_count=len(free_inputs),
+							free_result_count=len(free_results),
+						):
 							continue
 						worker_index = None
 						for attempt in range(len(workers)):
 							candidate = (next_worker + attempt) % len(workers)
-							if not work_queues[candidate].full():
+							if len(gpu_outstanding[candidate]) < int(slots_per_gpu):
 								worker_index = candidate
 								break
 						if worker_index is None:
 							break
 						input_slot = free_inputs.pop()
 						result_slot = free_results.pop()
+						slot_ledger.acquire(
+							"input", input_slot, band=int(event["band"]), sequence=int(seq), stage="gpu-provisional",
+						)
+						slot_ledger.acquire(
+							"result", result_slot, band=int(event["band"]), sequence=int(seq), stage="gpu-provisional",
+						)
 						if pipeline_profile is not None and event.get("read_completed_at") is not None:
 							ready_wait = max(0.0, time.perf_counter() - float(event["read_completed_at"]))
 							pipeline_profile["ready_to_assign_sum_s"] += ready_wait
 							pipeline_profile["ready_to_assign_max_s"] = max(pipeline_profile["ready_to_assign_max_s"], ready_wait)
 						copy_started = time.perf_counter()
-						np.copyto(
-							_slot_array(input_shms[input_slot], _input_layouts[0]),
-							event["tile"], casting="no",
-						)
-						input_copy_time += time.perf_counter() - copy_started
 						try:
+							np.copyto(
+								_slot_array(input_shms[input_slot], _input_layouts[0]),
+								event["tile"], casting="no",
+							)
 							work_queues[worker_index].put_nowait((
 								seq, event["coord"], input_slot, result_slot, event["needed"],
 							))
 						except queue.Full:
+							slot_ledger.release(
+								"input", input_slot, band=int(event["band"]), sequence=int(seq),
+							)
+							slot_ledger.release(
+								"result", result_slot, band=int(event["band"]), sequence=int(seq),
+							)
 							free_inputs.append(input_slot)
 							free_results.append(result_slot)
 							continue
+						input_copy_time += time.perf_counter() - copy_started
+						slot_ledger.transition(
+							"input", input_slot, band=int(event["band"]), sequence=int(seq), stage="gpu",
+						)
+						slot_ledger.transition(
+							"result", result_slot, band=int(event["band"]), sequence=int(seq), stage="gpu",
+						)
+						gpu_outstanding[worker_index][int(seq)] = {
+							"input_slot": int(input_slot), "result_slot": int(result_slot),
+							"input_released": False,
+						}
 						event.pop("tile", None)
 						event["input_slot"] = input_slot
 						event["result_slot"] = result_slot
@@ -3747,33 +4926,26 @@ def run_tiled_inference_3d(
 						event["worker"] = worker_index
 						next_worker = (worker_index + 1) % len(workers)
 						made_progress = True
-					while True:
-						try:
-							message = result_queue.get_nowait()
-						except queue.Empty:
-							break
-						made_progress = True
-						_handle_gpu_message(message)
+					made_progress = _pump_gpu_results() or made_progress
 					_pump_accumulator_results()
-					# Dispatch completed GPU results canonically.  A new Z row waits
-					# for prior accumulation acknowledgements so ring generations and
-					# flush frontiers remain bounded exactly as in the serial path.
+					# Prepare and submit accumulator work canonically. Queue pressure
+					# yields to the other stages instead of monopolizing the coordinator.
 					while next_accum_dispatch in events:
 						event = events[next_accum_dispatch]
 						if event["status"] == "done_skip":
 							next_accum_dispatch += 1
 							made_progress = True
 							continue
-						if event["status"] != "done_result":
-							break
-						current_z = int(event["coord"][0])
-						if (
-							accum_dispatch_z is not None and current_z != accum_dispatch_z
-							and next_commit < next_accum_dispatch
-						):
+						if event["status"] not in ("done_result", "accumulating"):
 							break
 						if int(accumulator_workers) > 0:
-							_dispatch_accumulator_event(next_accum_dispatch, event)
+							if event["status"] == "done_result":
+								_prepare_accumulator_event(next_accum_dispatch, event)
+							if event["status"] == "accumulating":
+								submitted = _pump_accumulator_submissions(next_accum_dispatch, event)
+								made_progress = submitted or made_progress
+								if event.get("accum_to_submit"):
+									break
 						else:
 							layouts = {layout.name: layout for layout in result_specs[event["result_slot"]].layouts}
 							result_shm = result_shms[event["result_slot"]]
@@ -3781,23 +4953,36 @@ def run_tiled_inference_3d(
 							for sd, group in groups.items():
 								weight = _slot_array(result_shm, layouts[f"weight:{sd}"])
 								_accumulate_group(sd, group, prepared, weight, *event["coord"])
-							free_results.append(event["result_slot"])
+							result_slot = int(event["result_slot"])
+							slot_ledger.release(
+								"result", result_slot, band=int(event["band"]),
+								sequence=int(next_accum_dispatch),
+							)
+							free_results.append(result_slot)
 							event["status"] = "done_accum"
-						accum_dispatch_z = current_z
 						next_accum_dispatch += 1
 						made_progress = True
 					commit_started = time.perf_counter()
 					while next_commit in events and events[next_commit]["status"] in ("done_skip", "done_accum"):
 						event = events.pop(next_commit)
 						if event["status"] == "done_skip":
-							_record_commit(was_processed=False, elapsed=0.0, row_end=event["row_end"], next_tz=event["next_tz"])
+							_record_commit(
+								was_processed=False, elapsed=0.0, row_end=event["row_end"],
+								next_tz=event["next_tz"], skip_reason=event["skip_reason"],
+							)
 						else:
 							_record_commit(was_processed=True, elapsed=event["gpu_elapsed"], row_end=event["row_end"], next_tz=event["next_tz"])
+						if active_band is None or int(event["band"]) != active_band.z:
+							raise RuntimeError(
+								f"event {next_commit} committed outside active Z band: "
+								f"event_band={event['band']} active={None if active_band is None else active_band.z}"
+							)
+						active_band.committed += 1
 						next_commit += 1
 						made_progress = True
 					commit_time += time.perf_counter() - commit_started
 					can_accept_input = bool(free_inputs and free_results) and any(
-						not work_queue.full() for work_queue in work_queues
+						len(outstanding) < int(slots_per_gpu) for outstanding in gpu_outstanding
 					)
 					has_ready_input = any(event["status"] == "ready" for event in events.values())
 					has_pending_input = any(
@@ -3810,16 +4995,59 @@ def run_tiled_inference_3d(
 					elif starve_started is not None:
 						input_starve_time += time.perf_counter() - starve_started
 						starve_started = None
+					_validate_worker_ownership()
 					for index, worker in enumerate(workers):
 						if not worker.is_alive() and worker.exitcode is not None:
-							raise RuntimeError(f"multi-GPU worker {index} exited unexpectedly with code {worker.exitcode}")
+							raise RuntimeError(
+								f"multi-GPU worker {index} exited unexpectedly with code "
+								f"{worker.exitcode}; outstanding={gpu_outstanding[index]}"
+							)
+					for index, process in enumerate(accum_processes):
+						if not process.is_alive() and process.exitcode is not None:
+							raise RuntimeError(
+								f"accumulator worker {index} exited unexpectedly with code "
+								f"{process.exitcode}; outstanding={accum_outstanding[index]}"
+							)
 					if not made_progress:
+						statuses: dict[str, int] = {}
+						for event in events.values():
+							status = str(event.get("status", "unknown"))
+							statuses[status] = statuses.get(status, 0) + 1
+						capacity_deadlock = _frontier_capacity_deadlock(
+							events=events, frontier_sequence=next_accum_dispatch,
+							free_inputs=free_inputs, free_results=free_results,
+							slot_owners=slot_ledger.snapshot(),
+						)
+						if capacity_deadlock is not None:
+							raise RuntimeError(capacity_deadlock)
 						try:
-							message = result_queue.get(timeout=0.05)
-						except queue.Empty:
-							pass
-						else:
-							_handle_gpu_message(message)
+							wait_stage = _coordinator_wait_stage(
+								statuses=statuses, reads=len(futures),
+								accumulator_tasks=len(accum_pending),
+								slot_owners=slot_ledger.snapshot(),
+							)
+						except RuntimeError as exc:
+							flush_state = None if pending_flush is None else {
+								"batch": pending_flush.batch_id,
+								"queued": len(pending_flush.tasks),
+								"inflight": len(pending_flush.inflight),
+								"completed": len(pending_flush.completed_ids),
+							}
+							worker_state = [
+								(index, worker.pid, worker.is_alive(), worker.exitcode)
+								for index, worker in enumerate(workers)
+							]
+							raise RuntimeError(
+								f"{exc}; band={active_band} next_commit={next_commit} "
+								f"next_accum={next_accum_dispatch} flush={flush_state} "
+								f"workers={worker_state}"
+							) from exc
+						if wait_stage == "gpu":
+							_pump_gpu_results(timeout=0.05)
+						elif wait_stage == "accumulator":
+							_pump_accumulator_results(timeout=0.05)
+						elif wait_stage == "reader":
+							time.sleep(0.01)
 				if starve_started is not None:
 					input_starve_time += time.perf_counter() - starve_started
 				accum_wall = 0.0 if accum_started_at is None else time.perf_counter() - accum_started_at
@@ -3882,6 +5110,10 @@ def run_tiled_inference_3d(
 					cache_task = event.get("cache_task")
 					if cache_task is not None:
 						cache_task.cancel()
+				for _seq, event in cache_backlog:
+					cache_task = event.get("cache_task")
+					if cache_task is not None:
+						cache_task.cancel()
 				if tensorstore_reader is not None:
 					tensorstore_reader.cancel(
 						event["read_task"] for event in events.values()
@@ -3925,6 +5157,11 @@ def run_tiled_inference_3d(
 					shm.unlink()
 		_complete_pending_flush()
 		_shutdown_flush_workers(terminate=False)
+		# Tile completion can precede asynchronous publication. Refresh once the
+		# final flush is acknowledged even though the tile count is unchanged.
+		if progress is not None:
+			progress_emitter.emit(_predict3d_progress_line(progress),
+				done=int(progress["tiles_done"]), total=int(progress["tiles_total"]), force=True)
 		progress_emitter.finish_line()
 		flush_wall = 0.0 if flush_started_at is None else time.perf_counter() - flush_started_at
 		flush_rate = 0.0 if flush_wall <= 0.0 else flush_chunks_total / flush_wall

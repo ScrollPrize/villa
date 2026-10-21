@@ -16,6 +16,22 @@ def test_code_commit_is_full_git_hash() -> None:
     assert set(value) <= set("0123456789abcdef")
 
 
+@pytest.mark.parametrize("name", ["/inference.json", "../inference.json", "nested/../../inference.json"])
+def test_bundle_rejects_nonportable_provenance_name(tmp_path: Path, name: str) -> None:
+    with pytest.raises(ValueError, match="relative path"):
+        validate_portable_bundle(tmp_path, provenance_name=name)
+
+
+def test_bundle_accepts_named_fiberlet_provenance(tmp_path: Path) -> None:
+    (tmp_path / "fiberlets.zarr").mkdir()
+    document = {
+        "status": "completed", "artifact_kind": "fiberlets",
+        "artifacts": [{"kind": "fiberlet-zarr", "path": "fiberlets.zarr"}],
+    }
+    (tmp_path / "fiberlets.json").write_text(json.dumps(document))
+    assert validate_portable_bundle(tmp_path, provenance_name="fiberlets.json") == document
+
+
 def test_code_commit_accepts_packaged_build_revision(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("VILLA_CODE_COMMIT", "a" * 40)
     assert code_commit(Path("/outside/checkout")) == "a" * 40

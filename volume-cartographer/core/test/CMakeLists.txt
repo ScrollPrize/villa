@@ -66,6 +66,12 @@ endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
 
+vc_add_test(NAME test_sampling_wait_profile)
+add_test(NAME test_sampling_wait_profile_enabled
+    COMMAND ${CMAKE_COMMAND} -E env VC_SAMPLING_WAIT_PROFILE=1
+        $<TARGET_FILE:test_sampling_wait_profile>)
+vc_register_ctest(test_sampling_wait_profile_enabled test_sampling_wait_profile)
+
 vc_add_test(NAME test_fiber_collection LIBS doctest::doctest vc_fiber_collection)
 
 vc_add_test(NAME test_omp_thread_point_collection)
@@ -220,11 +226,14 @@ vc_add_test(NAME test_segmentation_lasagna_panel_ui
     DEFS VC_TEST_DISABLE_LASAGNA_DISCOVERY VC_TEST_DISABLE_LASAGNA_DIALOGS)
 
 qt6_wrap_cpp(spiral_config_profile_editor_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.hpp)
+qt6_wrap_cpp(spiral_descriptions_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/SpiralDescriptions.hpp)
 vc_add_test(NAME test_spiral_config_profile_editor
     SOURCES test_spiral_config_profile_editor.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/SpiralConfigProfileEditor.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/SpiralDescriptions.cpp
             ${spiral_config_profile_editor_moc}
+            ${spiral_descriptions_moc}
             ${collapsible_settings_group_moc}
     LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
@@ -278,6 +287,22 @@ vc_add_test(NAME test_lasagna_maxflow_graph LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_fiber_trace3d
     LIBS doctest::doctest vc_fiber_tracer
     DEFS VC_TESTING)
+vc_add_test(NAME test_fiber_anchors LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_prediction_channels LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_replay_metric LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_embedding_scoring LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_width_scoring LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_reverse_consistency LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_reference_replay_core LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_chunk_trace LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiberlet_storage LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiberlet_paths LIBS doctest::doctest vc_fiber_tracer DEFS VC_TESTING)
+if(TARGET test_fiberlet_paths AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    # The inline optimized/reference kernels assert bitwise operation-order
+    # equality. Do not let the compiler contract just one expression into FMA.
+    # This affects the comparison harness only, not production code.
+    target_compile_options(test_fiberlet_paths PRIVATE -ffp-contract=off)
+endif()
 
 # Qt-free data/IO layer.
 vc_add_test(NAME test_point_collections)
@@ -339,6 +364,20 @@ if(VC_RUN_E2E)
     # CTest runs reliably regardless of the working directory.
     set_tests_properties(test_merge_e2e_small PROPERTIES
         ENVIRONMENT "VC_RUN_E2E=1;VC_MERGE_TIFXYZ_BIN=$<TARGET_FILE:vc_merge_tifxyz>")
+endif()
+
+# End-to-end test that spawns the built vc_obj2tifxyz_legacy on two synthetic
+# plane meshes (clean, and with 3% stretched triangles) and checks the output
+# cell size under the three scale methods (median, mean, manual). Opt-in via
+# VC_RUN_E2E=1.
+add_executable(test_obj2tifxyz_legacy_scale test_obj2tifxyz_legacy_scale.cpp)
+target_link_libraries(test_obj2tifxyz_legacy_scale PRIVATE doctest::doctest vc_core)
+vc_register_test_target(test_obj2tifxyz_legacy_scale)
+if(VC_RUN_E2E)
+    add_test(NAME test_obj2tifxyz_legacy_scale COMMAND test_obj2tifxyz_legacy_scale)
+    vc_register_ctest(test_obj2tifxyz_legacy_scale test_obj2tifxyz_legacy_scale)
+    set_tests_properties(test_obj2tifxyz_legacy_scale PROPERTIES
+        ENVIRONMENT "VC_RUN_E2E=1;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>")
 endif()
 
 add_executable(bench_volume_sample bench_volume_sample.cpp)
@@ -662,19 +701,17 @@ if(VC_RUN_RENDER_BENCHMARKS)
 
                 set(_gate "${_case_dir}/checked.json")
                 set(_gate_command
-                    $<TARGET_FILE:bench_thread_sync_replay>
-                    evaluate-render
+                    ${Python3_EXECUTABLE}
+                    "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
+                    collect-evaluate --reuse-capture
+                    --valgrind "${VC_VALGRIND_EXECUTABLE}"
+                    --benchmark $<TARGET_FILE:bench_render_synthetic>
+                    --replay $<TARGET_FILE:bench_thread_sync_replay>
                     --fixture ${_fixture}
                     --scenario ${_scenario}
-                    --callgrind-prefix "${_callgrind_prefix}"
-                    --callgrind-metadata "${_callgrind_metadata}"
+                    --case-dir "${_case_dir}"
                     --model "${_render_valgrind_ci_model}"
-                    --reference "${_render_valgrind_ci_reference}"
-                    --output "${_gate}")
-                if(_fixture STREQUAL "parallel")
-                    list(APPEND _gate_command
-                        --callgrind-scheduler "${_callgrind_scheduler}")
-                endif()
+                    --reference "${_render_valgrind_ci_reference}")
                 add_custom_command(
                     OUTPUT "${_gate}"
                     BYPRODUCTS "${_case_dir}/checked.failed.json"
@@ -683,6 +720,7 @@ if(VC_RUN_RENDER_BENCHMARKS)
                         "${_evaluation}"
                         "${_callgrind_stamp}"
                         bench_thread_sync_replay
+                        "${PROJECT_SOURCE_DIR}/scripts/run_render_valgrind_ci.py"
                         "${_render_valgrind_ci_model}"
                         "${_render_valgrind_ci_reference}"
                     VERBATIM)
@@ -782,6 +820,21 @@ vc_add_test(NAME test_surface_patch_index)
 vc_add_test(NAME test_tiff_merge)
 
 vc_add_test(NAME test_http_fetch_errors)
+vc_add_test(NAME test_global_cache_root)
+vc_add_test(NAME test_sftp_fetch LIBS doctest::doctest vc_core Qt6::Core)
+if(VC_BUILD_PYTHON)
+    find_package(Python REQUIRED COMPONENTS Interpreter)
+    add_dependencies(test_sftp_fetch vc_volume)
+    add_test(NAME python_sftp_volume
+        COMMAND "${CMAKE_COMMAND}" -E env
+            "PYTHONPATH=${CMAKE_BINARY_DIR}/python"
+            "PYTHONNOUSERSITE=1"
+            "${Python_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/python/tests/test_sftp_volume.py"
+            --ssh-fixture "$<TARGET_FILE:test_sftp_fetch>"
+            --work-dir "${CMAKE_CURRENT_BINARY_DIR}")
+    set_tests_properties(python_sftp_volume PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 200)
+    vc_register_ctest(python_sftp_volume test_sftp_fetch)
+endif()
 
 # Live S3: stages PHerc 0172 level 5 to a local zarr dir, then exercises
 # the NormalGridGenerate library API against it. Soft-skips on network.

@@ -6,7 +6,7 @@ The Vesuvius tooling exposes three command-line stages plus a convenience orches
 2. `vesuvius.blend_logits` — merge overlapping patches with Gaussian weighting.
 3. `vesuvius.finalize_outputs` — convert logits into probabilities or masks and build a multiscale Zarr.
 
-All commands honour local paths and remote storage backed by `fsspec` (for example S3). Run `vesuvius.accept_terms --yes` before accessing remote scroll volumes.
+All commands honour local paths and remote storage backed by `fsspec` (for example S3). Remote scroll volumes are covered by the [data licence](../README.md#data-licence).
 
 ## Stage 1 — `vesuvius.predict`
 
@@ -34,6 +34,7 @@ vesuvius.predict \
 | `--tta_type` / `--disable_tta` | Choose `rotation` (default) or `mirroring`, or disable test-time augmentation.
 | `--num_parts` / `--part_id` | Partition inference so multiple machines can process different chunks.
 | `--bbox` | Restrict inference to a region of interest: `"z0:z1,y0:y1,x0:x1"` in global voxel coordinates, half-open. Omit a bound to reach the volume edge (`"1000:1400,:,2000:"`). See [Region-of-interest inference](#region-of-interest-inference).
+| `--chunk_cache_mb` | Keep up to this many MB of fetched input chunks in an in-memory LRU cache (zarr 3), so overlapping patches do not download the same chunks again. Each DataLoader worker keeps its own cache. Default `0` (off).
 | `--overlap` | Fractional patch overlap (0–1, default `0.5`).
 | `--batch_size` | Inference batch size (default `1`).
 | `--patch_size` | Override the model patch size using a comma-separated list (e.g. `192,192,192`).

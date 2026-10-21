@@ -7,18 +7,16 @@ import torch.nn.functional as F
 
 import flow_grad_smoothing
 import flow_triton
+from geom_utils import grid_sample_border
 
 
 def sample_field(normalised_zyx, field_for_grid_sample):
     # normalised_zyx :: *, zyx in [0, 1]; field_for_grid_sample :: zyx, z, y, x
     orig_shape = normalised_zyx.shape
     zyx = (normalised_zyx * 2. - 1.).view(1, -1, 1, 1, 3)
-    field_samples = F.grid_sample(
-        input=field_for_grid_sample[None],
-        grid=zyx.flip(-1),
-        align_corners=True,
-        mode='bilinear',
-        padding_mode='border',
+    field_samples = grid_sample_border(
+        field_for_grid_sample[None],
+        zyx.flip(-1),
     )  # 1, zyx, n, 1, 1
     return field_samples.squeeze(0).squeeze(-2).squeeze(-1).T.view(*orig_shape[:-1], 3)  # *, zyx
 

@@ -133,6 +133,9 @@ struct Run {
     int firstControl = -1;
     int lastControl = -1;
     std::vector<QPointF> points;
+    // Original annotation-frame positions at the same arclength samples.
+    // Display-only, never used by the winding/layout solve.
+    std::vector<cv::Vec3d> worldPoints;
 };
 
 struct PlacedFiber {
@@ -149,6 +152,7 @@ struct PlacedFiber {
     std::vector<bool> kollesisTerminations;
     // Parallel to controlPoints: the point carries the break tag (same rule).
     std::vector<bool> breaks;
+    std::vector<cv::Vec3d> controlWorldPoints;
 };
 
 // The points to DRAW for fiber.runs[runIndex]: the run's own points, except
@@ -158,6 +162,8 @@ struct PlacedFiber {
 // underneath them. Runs away from every gap or damaged span are unchanged.
 [[nodiscard]] std::vector<QPointF> displayRunPoints(const PlacedFiber& fiber,
                                                     std::size_t runIndex);
+[[nodiscard]] std::vector<cv::Vec3d> displayRunWorldPoints(const PlacedFiber& fiber,
+                                                        std::size_t runIndex);
 
 struct PlacedLink {
     uint64_t fiberA = 0;
