@@ -111,8 +111,14 @@ python src/vesuvius/scripts/review_holes.py --data DATA_DIR --audit audit_out --
 #    writes review/verdicts.csv (every call), review/veto.csv (the CUT holes, in the
 #    format fix_holes.py --veto reads), review/tiles/<crop>_<n>.png, and
 #    review/fix_in/<crop>/ (label + hole mask, the layout fix_holes.py --in-dir reads)
-#    For a hole the three slices cannot settle, scroll it in 3D with the napari
-#    viewer, which opens the same folder: python src/vesuvius/scripts/hole_viewer.py --root-dir review/fix_in
+
+# 2b. or review in 3D: stage the top crops (label, hole mask, CT, hole list, rank
+#    order) and open them in the napari viewer. Its Review panel steps through the
+#    located holes (Next hole jumps to the slice and centres on the hole), and the
+#    Fill / Cut / Unclear buttons write the same verdicts.csv and veto.csv as 2.
+#    Crops come up worst first; the next crop loads when the current one is done.
+python src/vesuvius/scripts/review_holes.py --data DATA_DIR --audit audit_out --out review --stage-only --limit 20
+python src/vesuvius/scripts/hole_viewer.py --root-dir review/fix_in --suffix1 _surf.tif
 
 # 3. fill the remaining holes, leaving the CUT ones open
 python src/vesuvius/scripts/fix_holes.py --in-dir review/fix_in --veto review/veto.csv \
@@ -232,7 +238,8 @@ sheets.
 - `scripts/detect_holes.py` computes the same per-component Betti numbers and
   localizes holes with persistent homology. It writes hole masks.
 - `scripts/hole_viewer.py` and `scripts/fix_holes.py` are for inspecting and
-  repairing individual crops.
+  repairing individual crops. The viewer's Review panel records fill/cut calls
+  on the staged holes and shows the CT under the label when one is staged.
 - `scripts/review_holes.py` walks the audit's ranked holes, records fill/cut calls
   and writes the veto list and the folder layout the two scripts above read.
 - This audit is the dataset-level pass that runs before them:

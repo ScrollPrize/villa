@@ -10,6 +10,10 @@ Writes under ``--out``:
   verdicts.csv   crop,center_zyx,voxels,interior,verdict   (every call)
   veto.csv       crop,center_zyx                           (CUT rows, for ``fix_holes.py --veto``)
   fix_in/<crop>/<crop>_surf.tif + hole_mask.tif            (reviewed crops, ``fix_holes.py --in-dir`` layout)
+  fix_in/<crop>/<crop>_img.tif + holes.json, fix_in/order.txt (CT, hole list and rank order for hole_viewer.py)
+
+``--stage-only`` stages the top crops without asking anything, for reviewing in
+``hole_viewer.py --root-dir OUT/fix_in`` (its Review panel writes the same two CSVs).
 
 Next step after a review session (from ``vesuvius/``)::
 
@@ -73,7 +77,25 @@ def stage_crop(data: Path, audit: Path, out: Path, crop: str) -> Path:
     if not mask.exists():
         sys.exit(f"{mask} missing: rerun the audit with --hole-masks")
     shutil.copyfile(mask, d / "hole_mask.tif")
+    img = data / "images" / f"{crop}.tif"
+    if img.exists():
+        shutil.copyfile(img, d / f"{crop}_img.tif")
+    (d / "holes.json").write_text(json.dumps(crop_holes(audit, crop)))
+    order = out / "fix_in" / "order.txt"
+    seen = order.read_text().split() if order.exists() else []
+    if crop not in seen:
+        order.write_text("\n".join(seen + [crop]) + "\n")
     return d
+
+
+def stage_ranked(data: Path, audit: Path, out: Path, limit: Optional[int] = None) -> List[str]:
+    """Stage the top ``limit`` crops of ranked.csv that have located holes, in rank order."""
+    staged = []
+    for crop in ranked_crops(audit)[:limit]:
+        if crop_holes(audit, crop):
+            stage_crop(data, audit, out, crop)
+            staged.append(crop)
+    return staged
 
 
 def render_hole(data: Path, audit: Path, crop: str, hole: dict, png: Path, half: int) -> Path:
@@ -152,9 +174,16 @@ def main(argv=None):
     ap.add_argument("--out", type=Path, required=True, help="where verdicts.csv, veto.csv, tiles/, fix_in/ go")
     ap.add_argument("--limit", type=int, default=None, help="review only the top N crops of ranked.csv")
     ap.add_argument("--half", type=int, default=32, help="half-width of each slice in voxels")
+    ap.add_argument("--stage-only", action="store_true",
+                    help="stage the top crops into OUT/fix_in for hole_viewer.py and ask nothing")
     a = ap.parse_args(argv)
     if not (a.audit / "ranked.csv").exists():
         ap.error(f"{a.audit}/ranked.csv missing: run vesuvius.label_topology_audit --batch first")
+    if a.stage_only:
+        staged = stage_ranked(a.data, a.audit, a.out, a.limit)
+        print(f"staged {len(staged)} crops in {a.out / 'fix_in'}; open with "
+              f"hole_viewer.py --root-dir {a.out / 'fix_in'} --suffix1 _surf.tif")
+        return
     v = review(a.data, a.audit, a.out, ask_terminal, a.limit, a.half)
     n = {k: sum(1 for r in v.values() if r["verdict"] == k) for k in VERDICTS.values()}
     print(f"{len(v)} verdicts ({n}); veto list: {a.out / 'veto.csv'}; staged crops: {a.out / 'fix_in'}")

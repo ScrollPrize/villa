@@ -76,3 +76,21 @@ def test_resume_skips_answered_holes_and_quit_keeps_them(tmp_path):
     review_holes.review(data, audit, out2, lambda png, p: next(answers))
     assert fix_holes._load_veto(out2 / "veto.csv") == {"crop_1": [(10, 30, 30)]}
     assert (out2 / "fix_in" / "crop_1" / "hole_mask.tif").exists()
+
+
+def test_stage_only_lays_out_what_hole_viewer_reads(tmp_path):
+    """--stage-only must give hole_viewer.py the CT, the hole list and the rank order,
+    on top of the fix_holes.py layout, without asking a single question."""
+    data, audit = _dataset(tmp_path)
+    out = tmp_path / "rev"
+    review_holes.main(["--data", str(data), "--audit", str(audit), "--out", str(out), "--stage-only", "--limit", "5"])
+    d = out / "fix_in" / "crop_1"
+    assert (d / "crop_1_surf.tif").exists() and (d / "hole_mask.tif").exists()
+    assert tifffile.imread(d / "crop_1_img.tif").shape == (20, 40, 40)
+    holes = json.loads((d / "holes.json").read_text())
+    assert [h["center_zyx"] for h in holes] == [[10, 30, 30], [10, 10, 10]]   # interior first
+    assert (out / "fix_in" / "order.txt").read_text().split() == ["crop_1"]
+    assert not (out / "verdicts.csv").exists()
+    # a second staging run must not duplicate the order entry
+    review_holes.stage_ranked(data, audit, out)
+    assert (out / "fix_in" / "order.txt").read_text().split() == ["crop_1"]

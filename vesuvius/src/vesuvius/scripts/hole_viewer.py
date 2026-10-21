@@ -11,6 +11,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -27,6 +28,7 @@ import cc3d
 
 from detect_holes import compute_component_topology, localize_holes
 from fix_holes import _fix_2d_hole_fill, _fix_morph_close, _fix_alpha_wrap
+import review_holes
 
 
 # ---------------------------------------------------------------------------
@@ -39,6 +41,9 @@ class State:
     current_index: int = 0
     args: Optional[argparse.Namespace] = None
     _saved_ignore_mask: Optional[np.ndarray] = None
+    holes: List[dict] = field(default_factory=list)   # located holes of the current folder (holes.json)
+    hole_index: int = -1
+    verdicts: dict = field(default_factory=dict)
 
 
 STATE = State()
@@ -80,13 +85,23 @@ def load_folder(viewer: napari.Viewer, index: int) -> None:
         print(f"[WARN] No file matching suffix1 '{args.suffix1}' in {folder}")
 
     # --- suffix2: Labels layer ---
-    path2 = _find_file_by_suffix(folder, args.suffix2)
+    path2 = _find_file_by_suffix(folder, args.suffix2) if args.suffix2 else None
     if path2 is not None:
         data2 = tiff.imread(str(path2))
         viewer.add_labels(data2, name=args.suffix2, metadata={"source_path": str(path2)})
-    else:
+    elif args.suffix2:
         print(f"[WARN] No file matching suffix2 '{args.suffix2}' in {folder}")
 
+    # --- CT image under the labels (review_holes.py stages it as <crop>_img.tif) ---
+    img_path = _find_file_by_suffix(folder, args.image_suffix) if args.image_suffix else None
+    if img_path is not None:
+        viewer.add_image(tiff.imread(str(img_path)), name="ct", colormap="gray", blending="additive")
+        viewer.layers.move(len(viewer.layers) - 1, 0)
+
+    holes_path = folder / "holes.json"
+    STATE.holes = json.loads(holes_path.read_text()) if holes_path.exists() else []
+    STATE.hole_index = -1
+    _update_review_label()
     _update_nav_label()
 
 
@@ -545,14 +560,98 @@ def make_ignore_widget(viewer: napari.Viewer) -> Container:
 # CLI & main
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Review widget: fill / cut / unclear per located hole, written for fix_holes.py --veto
+# ---------------------------------------------------------------------------
+
+_review_label = Label(value="—")
+
+
+def _review_out() -> Path:
+    return STATE.args.review_out or STATE.args.root_dir.parent
+
+
+def _hole_key(h: dict):
+    return STATE.folders[STATE.current_index].name, json.dumps(h["center_zyx"])
+
+
+def _update_review_label() -> None:
+    n = len(STATE.holes)
+    if STATE.hole_index < 0 or n == 0:
+        done = sum(1 for h in STATE.holes if _hole_key(h) in STATE.verdicts) if STATE.folders else 0
+        _review_label.value = f"{n} located holes, {done} answered" if n else "no holes.json in this folder"
+        return
+    h = STATE.holes[STATE.hole_index]
+    v = STATE.verdicts.get(_hole_key(h), {}).get("verdict", "-")
+    tag = "interior" if h.get("interior") else "crop face"
+    _review_label.value = (f"hole {STATE.hole_index + 1}/{n}: zyx {h['center_zyx']}, "
+                           f"{h['voxels']} vox, {tag}, verdict {v}")
+
+
+def _show_hole(viewer: napari.Viewer, index: int) -> None:
+    STATE.hole_index = index
+    z, y, x = STATE.holes[index]["center_zyx"]
+    viewer.dims.set_current_step(0, int(z))
+    viewer.camera.center = (float(z), float(y), float(x))
+    viewer.camera.zoom = max(viewer.camera.zoom, 6.0)
+    existing = [l for l in viewer.layers if l.name == "current hole"]
+    for l in existing:
+        viewer.layers.remove(l)
+    viewer.add_points(np.array([[z, y, x]], float), name="current hole", size=6,
+                      face_color="transparent", border_color="red")
+    _update_review_label()
+
+
+def _next_unanswered(start: int) -> int:
+    for k in range(len(STATE.holes)):
+        i = (start + k) % len(STATE.holes)
+        if _hole_key(STATE.holes[i]) not in STATE.verdicts:
+            return i
+    return (start + 1) % len(STATE.holes)
+
+
+def _on_verdict(viewer: napari.Viewer, verdict: str) -> None:
+    if STATE.hole_index < 0:
+        return
+    h = STATE.holes[STATE.hole_index]
+    crop, centre = _hole_key(h)
+    STATE.verdicts[(crop, centre)] = {"crop": crop, "center_zyx": centre, "voxels": h["voxels"],
+                                      "interior": int(bool(h.get("interior"))), "verdict": verdict}
+    review_holes.write_outputs(_review_out(), STATE.verdicts)
+    if all(_hole_key(x) in STATE.verdicts for x in STATE.holes):
+        _update_review_label()
+        if STATE.current_index < len(STATE.folders) - 1:
+            load_folder(viewer, STATE.current_index + 1)
+            if STATE.holes:
+                _show_hole(viewer, _next_unanswered(0))
+        return
+    _show_hole(viewer, _next_unanswered(STATE.hole_index + 1))
+
+
+def make_review_widget(viewer: napari.Viewer) -> Container:
+    btn_next = PushButton(text="Next hole")
+    btn_fill = PushButton(text="Fill (label gap)")
+    btn_cut = PushButton(text="Cut (leave open)")
+    btn_unclear = PushButton(text="Unclear")
+    btn_next.changed.connect(lambda: STATE.holes and _show_hole(viewer, _next_unanswered(STATE.hole_index + 1)))
+    btn_fill.changed.connect(lambda: _on_verdict(viewer, "FILL"))
+    btn_cut.changed.connect(lambda: _on_verdict(viewer, "CUT"))
+    btn_unclear.changed.connect(lambda: _on_verdict(viewer, "UNCLEAR"))
+    return Container(widgets=[btn_next, btn_fill, btn_cut, btn_unclear, _review_label], labels=False)
+
+
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Napari viewer/editor for hole detection & repair.")
     ap.add_argument("--root-dir", type=Path, required=True,
                     help="Folder containing sample subfolders.")
     ap.add_argument("--suffix1", type=str, required=True,
                     help="Filename suffix for the label layer (editable).")
-    ap.add_argument("--suffix2", type=str, required=True,
-                    help="Filename suffix for the image layer.")
+    ap.add_argument("--suffix2", type=str, default=None,
+                    help="Filename suffix for a second label layer (optional).")
+    ap.add_argument("--image-suffix", type=str, default="_img.tif",
+                    help="Filename suffix of the CT image layer (default: _img.tif, as review_holes.py stages it).")
+    ap.add_argument("--review-out", type=Path, default=None,
+                    help="Where the Review panel writes verdicts.csv and veto.csv (default: parent of --root-dir).")
     ap.add_argument("--fg-value", type=int, default=1,
                     help="Foreground label value (default: 1).")
     ap.add_argument("--ignore-value", type=int, default=2,
@@ -573,10 +672,15 @@ def main() -> None:
     folders = sorted([p for p in root.iterdir() if p.is_dir()])
     if not folders:
         raise FileNotFoundError(f"No subfolders found in {root}")
+    order = root / "order.txt"            # rank order written by review_holes.py (worst crop first)
+    if order.exists():
+        rank = {name: i for i, name in enumerate(order.read_text().split())}
+        folders.sort(key=lambda p: (rank.get(p.name, len(rank)), p.name))
 
     STATE.folders = folders
     STATE.current_index = 0
     STATE.args = args
+    STATE.verdicts = review_holes.load_verdicts(_review_out() / "verdicts.csv")
 
     viewer = napari.Viewer()
 
@@ -585,6 +689,7 @@ def main() -> None:
 
     # Dock widgets
     viewer.window.add_dock_widget(make_nav_widget(viewer), area="right", name="Navigation")
+    viewer.window.add_dock_widget(make_review_widget(viewer), area="right", name="Review")
     viewer.window.add_dock_widget(make_save_widget(viewer), area="right", name="Save")
     viewer.window.add_dock_widget(make_detect_holes_widget(viewer), area="right", name="Detect Holes")
     viewer.window.add_dock_widget(make_fix_holes_widget(viewer), area="right", name="Fix Holes")
