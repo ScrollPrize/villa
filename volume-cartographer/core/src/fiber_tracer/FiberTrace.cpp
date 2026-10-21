@@ -547,6 +547,13 @@ void requireNormalSamplerForNormalAwareSmoothness(
 
 void validateTraceConfig(const FiberTraceConfig& config)
 {
+    if (!std::isfinite(config.replayPresenceCutoff) || config.replayPresenceCutoff < 0 || config.replayPresenceCutoff > 1)
+        throw std::invalid_argument("presence cutoff must be in [0,1]");
+    if (config.committedBounds)
+        for (int a=0; a<3; ++a)
+            if (!std::isfinite((*config.committedBounds)[0][a]) || !std::isfinite((*config.committedBounds)[1][a]) ||
+                (*config.committedBounds)[0][a] >= (*config.committedBounds)[1][a])
+                throw std::invalid_argument("invalid committed trace bounds");
     if (!std::isfinite(config.widthRelativeTolerance) || config.widthRelativeTolerance < 0 ||
         !std::isfinite(config.widthReferenceMean) || config.widthReferenceMean < 0 ||
         !std::isfinite(config.initialWidthMean) || config.initialWidthMean < 0)
@@ -793,7 +800,38 @@ struct CandidateScore {
     float selectedPresence = 0.0f;
     bool valid = false;
     std::vector<float> embedding;
+    float modulatedPresence = 0;
+    bool presenceRejected = false;
 };
+
+FiberPredictionSample sampleTracePrediction(const FiberPredictionSource& source,
+    const cv::Vec3d& point, const cv::Vec3d& direction, const FiberTraceConfig& config)
+{
+    if (const auto* field=dynamic_cast<const FiberPredictionField*>(&source); field && config.pinnedRegion)
+        return field->sample(point,direction,*config.pinnedRegion);
+    return source.sample(point,direction);
+}
+
+void sampleTraceWidths(const FiberPredictionSource& source, const std::vector<cv::Vec3f>& points,
+    std::vector<float>& values, const FiberTraceConfig& config)
+{
+    if (const auto* field=dynamic_cast<const FiberPredictionField*>(&source); field && config.pinnedRegion)
+        field->sampleWidths(points,values,*config.pinnedRegion);
+    else source.sampleWidths(points,values);
+}
+
+void filterCandidatePresence(CandidateScore& score, const FiberTraceConfig& config,
+    const FiberPredictionSource& predictions, const TraceVec& point, const TraceVec& direction)
+{
+    if (!score.valid || config.replayPresenceCutoff <= 0) return;
+    float presence=score.modulatedPresence;
+    if (!config.replayPresenceModulated) {
+        presence=0;
+        for (const auto& option : sampleTracePrediction(predictions,toVec3d(point),toVec3d(direction),config).options)
+            if (option.valid && std::isfinite(option.presence)) presence=std::max(presence,option.presence);
+    }
+    if (!(presence>=config.replayPresenceCutoff)) {score.valid=false;score.presenceRejected=true;}
+}
 
 void addEmbeddingScore(CandidateScore& score, const std::vector<float>& vector,
     const BeamState& parent, const TraceVec& point, const FiberTraceConfig& config)
@@ -997,6 +1035,7 @@ void buildCandidateTasksForOrderedParents(
     }
 
     float bestLoss = std::numeric_limits<float>::infinity();
+    float bestPresence = 0;
     for (const auto& option : candidateSample.options) {
         if (!option.valid)
             continue;
@@ -1024,11 +1063,10 @@ void buildCandidateTasksForOrderedParents(
                 smoothNormal,
                 smoothNormalValid,
                 config);
-        if (loss < bestLoss)
-            bestLoss = loss;
+        if (loss < bestLoss) {bestLoss = loss;bestPresence = score;}
     }
     return {bestLoss, selectedCurrent.direction, selectedCurrent.presence,
-            std::isfinite(bestLoss)};
+            std::isfinite(bestLoss), {}, bestPresence};
 }
 
 void decodePredictionAndNormalCornerPoint(
@@ -1114,6 +1152,7 @@ void decodePredictionAndNormalCornerPoint(
     float bestAlignmentScore = -std::numeric_limits<float>::infinity();
     ScoredDirection selectedCurrent;
     float bestLoss = std::numeric_limits<float>::infinity();
+    float bestPresence = 0;
     for (size_t optionIndex = 0; optionIndex < optionCount; ++optionIndex) {
         const size_t volume = optionIndex * 3;
         TraceVec direction = vc::lasagna::interpolateLasagnaCompactAxisCorners(
@@ -1157,14 +1196,13 @@ void decodePredictionAndNormalCornerPoint(
                 smoothNormal,
                 smoothNormalValid,
                 config);
-        if (loss < bestLoss)
-            bestLoss = loss;
+        if (loss < bestLoss) {bestLoss = loss;bestPresence = score;}
     }
     return {
         bestLoss,
         selectedCurrent.direction,
         selectedCurrent.presence,
-        std::isfinite(bestLoss)};
+        std::isfinite(bestLoss), {}, bestPresence};
 }
 
 [[nodiscard]] CandidateScore candidateLossFromCorners(
@@ -1198,7 +1236,7 @@ void decodePredictionAndNormalCornerPoint(
     float presenceScale = 1.0f)
 {
     const auto candidateSample =
-        predictions.sample(toVec3d(candidatePoint), toVec3d(candidateDirection));
+        sampleTracePrediction(predictions, toVec3d(candidatePoint), toVec3d(candidateDirection), config);
     vc::lasagna::NormalSample normalSample;
     const vc::lasagna::NormalSample* normal = nullptr;
     if (normalAwareSmoothnessEnabled(config) && normalSampler != nullptr) {
@@ -1326,7 +1364,7 @@ void sampleCandidateNormals(
     std::vector<std::vector<float>> embeddingSamples;
     std::vector<float> presenceScales;
     if (config.widthRelativeTolerance > 0) {
-        predictions.sampleWidths(candidatePoints, presenceScales);
+        sampleTraceWidths(predictions, candidatePoints, presenceScales, config);
         if (presenceScales.size() != tasks.size())
             throw std::runtime_error("invalid width batch size");
         for (float& value : presenceScales)
@@ -1334,7 +1372,9 @@ void sampleCandidateNormals(
                 config.widthRelativeTolerance, config.widthCosineWeight);
     }
     if (config.embeddingWeight > 0) {
-        predictions.sampleEmbeddings(candidatePoints, embeddingSamples);
+        if (const auto* field=dynamic_cast<const FiberPredictionField*>(&predictions); field && config.pinnedRegion)
+            field->sampleEmbeddings(candidatePoints,embeddingSamples,*config.pinnedRegion);
+        else predictions.sampleEmbeddings(candidatePoints, embeddingSamples);
         if (embeddingSamples.size() != tasks.size())
             throw std::runtime_error("invalid embedding batch size");
     }
@@ -1353,6 +1393,7 @@ void sampleCandidateNormals(
             if (config.embeddingWeight > 0)
                 addEmbeddingScore(scores[index], embeddingSamples[index], beams[task.beamIndex],
                     candidatePoints[index], config);
+            filterCandidatePresence(scores[index],config,predictions,candidatePoints[index],task.direction);
             storeScoredFrontierCandidate(
                 frontierOutput,
                 beams,
@@ -1383,6 +1424,7 @@ void sampleCandidateNormals(
         size_t optionCount;
         const std::vector<std::vector<float>>* embeddings;
         const std::vector<float>* presenceScales;
+        const FiberPredictionSource* predictions;
     } cornerContext{
         &beams,
         &tasks,
@@ -1392,7 +1434,7 @@ void sampleCandidateNormals(
         frontierOutput,
         field ? field->optionCount() : 0,
         &embeddingSamples,
-        &presenceScales};
+        &presenceScales, &predictions};
     const auto scoreCornerPoint = +[](
         void* rawContext,
         size_t pointIndex,
@@ -1418,6 +1460,7 @@ void sampleCandidateNormals(
         if (context.config->embeddingWeight > 0)
             addEmbeddingScore(score, (*context.embeddings)[pointIndex],
                 (*context.beams)[task.beamIndex], (*context.candidatePoints)[pointIndex], *context.config);
+        filterCandidatePresence(score,*context.config,*context.predictions,(*context.candidatePoints)[pointIndex],task.direction);
         storeScoredFrontierCandidate(
             context.frontierOutput,
             *context.beams,
@@ -1436,7 +1479,8 @@ void sampleCandidateNormals(
             &cornerContext,
             scoreCornerPoint,
             lookaheadDepth,
-            profile);
+            profile,
+            config.pinnedRegion);
     if (fusedCornerScoring) {
         if (profile != nullptr)
             profile->predictionBatchSeconds += elapsedSeconds(predictionStart);
@@ -1506,6 +1550,7 @@ void sampleCandidateNormals(
         if (config.embeddingWeight > 0)
             addEmbeddingScore(scores[index], embeddingSamples[index], beams[task.beamIndex],
                 candidatePoints[index], config);
+        filterCandidatePresence(scores[index],config,predictions,candidatePoints[index],task.direction);
         storeScoredFrontierCandidate(
             frontierOutput,
             beams,
@@ -2262,7 +2307,7 @@ template <typename LossAt>
         request.config.widthReferenceMean == 0;
     const auto addWidth = [&](const TraceVec& point) {
         std::vector<float> sampled;
-        predictions.sampleWidths({point}, sampled);
+        sampleTraceWidths(predictions,{point},sampled,request.config);
         if (sampled.size() != 1)
             throw std::runtime_error("invalid committed width sample count");
         width.add(sampled.front());
@@ -2318,10 +2363,10 @@ template <typename LossAt>
         throw std::invalid_argument(
             "fiber trace start point has no valid prediction direction");
     }
-    if (request.fixInitialDirection &&
+    if ((request.fixInitialDirection || request.config.preserveInitialDirection) &&
         !vc::fiber_tracer::displayUnit(request.initialDirection))
         throw std::invalid_argument("fixed initial direction must be finite and nonzero");
-    const TraceVec startDirection = request.fixInitialDirection
+    const TraceVec startDirection = (request.fixInitialDirection || request.config.preserveInitialDirection)
         ? referenceStartDirection : startPrediction.direction;
 
     const float distance = traceLengthLimitVoxels.has_value()
@@ -2541,6 +2586,12 @@ template <typename LossAt>
             const auto& tasks = *tasksPtr;
             const auto& scores = *scoresPtr;
 
+            if (request.config.replayPresenceCutoff>0 &&
+                std::none_of(scores.begin(),scores.end(),[](const auto& s){return s.valid;})) {
+                const bool rejected=std::any_of(scores.begin(),scores.end(),[](const auto& s){return s.presenceRejected;});
+                return finish(lastValidState,false,rejected ? "presence_cutoff" : "no_valid_candidates");
+            }
+
             if (finalLookaheadGeneration) {
                 auto& frontier = scoringScratch.frontierCandidates;
                 const auto bestReachedIndex =
@@ -2681,6 +2732,22 @@ template <typename LossAt>
                 profile->pruneSeconds += elapsedSeconds(pruneStart);
         }
         stepIndex += std::max(1, advanced);
+
+        // Bound every surviving branch, not only the winning path. One full
+        // lookahead is allowed outside; never expand an exiting survivor again.
+        if (request.config.committedBounds && !beams.empty()) {
+            bool crossed=false;
+            for (const auto& beam:beams) {
+                for (auto p=beam.path; p && p!=observedPath; p=p->previous) {
+                    for (int a=0;a<3;++a)
+                        crossed |= p->point[a]<(*request.config.committedBounds)[0][a] ||
+                                   p->point[a]>=(*request.config.committedBounds)[1][a];
+                    if (crossed) break;
+                }
+                if (crossed) break;
+            }
+            if (crossed) return finish(*std::min_element(beams.begin(),beams.end(),beamSearchLess),false,"chunk_boundary");
+        }
 
         if (updateWidth || committedStep) {
             auto common = lastValidState.path;
@@ -3506,6 +3573,8 @@ double FiberTraceCoordinateAdapter::traceDistanceToBase(
         throw std::invalid_argument("trace distance must not be NaN");
     return distanceTraceVoxels * traceToBaseScale;
 }
+
+void validateFiberTraceConfig(const FiberTraceConfig& config) { validateTraceConfig(config); }
 
 FiberPredictionTraceScales resolveFiberPredictionTraceScales(
     const vc::lasagna::LasagnaDatasetManifest& manifest,
@@ -4694,7 +4763,8 @@ public:
 
     [[nodiscard]] FiberPredictionSample sample(
         const cv::Vec3d& volumePoint,
-        const cv::Vec3d& referenceDirection) const
+        const cv::Vec3d& referenceDirection,
+        const vc::render::PinnedChunkRegion* region = nullptr) const
     {
         FiberPredictionSample out;
         out.options.reserve(options_.size());
@@ -4716,9 +4786,9 @@ public:
                     option.ny, volumePoint);
             }
             vc::lasagna::LasagnaLocalChunkResolver presenceResolver(
-                option.presence);
-            vc::lasagna::LasagnaLocalChunkResolver nxResolver(option.nx);
-            vc::lasagna::LasagnaLocalChunkResolver nyResolver(option.ny);
+                option.presence, region);
+            vc::lasagna::LasagnaLocalChunkResolver nxResolver(option.nx, region);
+            vc::lasagna::LasagnaLocalChunkResolver nyResolver(option.ny, region);
             presenceResolver.resolve(presenceRequest);
             nxResolver.resolve(nxRequest);
             nyResolver.resolve(nyRequest);
@@ -4976,6 +5046,13 @@ std::shared_ptr<vc::render::PinnedChunkRegion> FiberPredictionField::pinRegion(
     const cv::Vec3d& lo, const cv::Vec3d& hi) const
 {
     return impl_->pinRegion(lo, hi);
+}
+
+FiberPredictionSample FiberPredictionField::sample(const cv::Vec3d& point,
+    const cv::Vec3d& direction, const vc::render::PinnedChunkRegion& region) const
+{
+    impl_->requirePinnedOwner(region);
+    return impl_->sample(point,direction,&region);
 }
 
 void FiberPredictionField::sampleWidths(const std::vector<cv::Vec3f>& points,
