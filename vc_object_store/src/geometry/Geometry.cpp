@@ -139,6 +139,25 @@ void applyEdgeDecisions(ObjectStore& store, WriteTxn& txn, sqlite3* db,
     }
 }
 
+void writeRevision(sqlite3* db, const ObjectStore& store, const ObjectRecord& object,
+    const std::string& uuid, const GeometryRevision* parent, const std::string& hash, const std::string& text)
+{
+    Statement revision(db, "INSERT INTO geometry_revisions VALUES(?,?,?,?,?,?,?,?,?)");
+    revision.bindBlob(1, parseUuid(uuid)); revision.bindBlob(2, parseUuid(object.uuid));
+    if (parent) revision.bindBlob(3, parseUuid(parent->uuid)); else revision.bindNull(3);
+    revision.bind(4, hash); revision.bind(5, text); revision.bind(6, object.generation + 1);
+    revision.bind(7, store.author()); revision.bind(8, nowIsoUtc()); revision.bind(9, store.hostname());
+    revision.stepDone();
+}
+
+void stampGeometry(sqlite3* db, const ObjectStore& store, const std::string& objectUuid,
+                   int64_t id, const std::string& hash)
+{
+    stampContentChange(db, store.author(), store.hostname(), "objects", id, parseUuid(objectUuid), "geometry");
+    Statement update(db, "UPDATE objects SET storage_kind='sqlite',data_generation=generation,data_checksum=? WHERE id=?");
+    update.bind(1, hash); update.bind(2, id); update.stepDone();
+}
+
 void writeArrays(sqlite3* db, const std::string& revisionUuid,
                  const std::vector<GeometryArray>& arrays, const nlohmann::json& manifest)
 {
@@ -228,11 +247,7 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
 
     Savepoint savepoint(db);
     const auto revisionUuid = util::newUuid();
-    Statement revision(db, "INSERT INTO geometry_revisions VALUES(?,?,?,?,?,?,?,?,?)");
-    revision.bindBlob(1, parseUuid(revisionUuid)); revision.bindBlob(2, parseUuid(objectUuid));
-    if (current) revision.bindBlob(3, parseUuid(current->uuid)); else revision.bindNull(3);
-    revision.bind(4, contentHash); revision.bind(5, manifestText); revision.bind(6, object->generation + 1);
-    revision.bind(7, author()); revision.bind(8, nowIsoUtc()); revision.bind(9, hostname()); revision.stepDone();
+    writeRevision(db, *this, *object, revisionUuid, current ? &*current : nullptr, contentHash, manifestText);
     writeArrays(db, revisionUuid, data.arrays, manifest);
 
     detail::clearGeometryMaterialization(db, objectUuid);
@@ -240,9 +255,7 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
     head.bindBlob(1, parseUuid(objectUuid)); head.bindBlob(2, parseUuid(revisionUuid)); head.stepDone();
     const auto id = *objectIdByUuid(db, parseUuid(objectUuid));
     detail::indexGeometryBounds(db, id, revisionUuid, data);
-    stampContentChange(db, author(), hostname(), "objects", id, parseUuid(objectUuid), "geometry");
-    Statement update(db, "UPDATE objects SET storage_kind='sqlite',data_generation=generation,data_checksum=? WHERE id=?");
-    update.bind(1, contentHash); update.bind(2, id); update.stepDone();
+    stampGeometry(db, *this, objectUuid, id, contentHash);
     applyEdgeDecisions(*this, txn, db, affected, decisions);
     savepoint.release();
     return revisionUuid;
@@ -381,17 +394,12 @@ std::string detail::publishStructuralSnapshot(ObjectStore& store, WriteTxn& txn,
     const auto uuid=util::newUuid(); const auto id=*objectIdByUuid(db,parseUuid(objectUuid));
     const auto text=manifest.dump(), hash=hashText(text);
     if (geometryWork) geometryWork->manifestBytesWritten += text.size();
-    Statement revision(db,"INSERT INTO geometry_revisions VALUES(?,?,?,?,?,?,?,?,?)");
-    revision.bindBlob(1,parseUuid(uuid)); revision.bindBlob(2,parseUuid(objectUuid)); revision.bindBlob(3,parseUuid(current->uuid));
-    revision.bind(4,hash); revision.bind(5,text); revision.bind(6,object.generation+1);
-    revision.bind(7,store.author()); revision.bind(8,nowIsoUtc()); revision.bind(9,store.hostname()); revision.stepDone();
+    writeRevision(db, store, object, uuid, &*current, hash, text);
     writeArrays(db,uuid,data.arrays,manifest); clearGeometryMaterialization(db,objectUuid);
     indexGeometryBounds(db,id,uuid,data);
     Statement head(db,"UPDATE geometry_heads SET revision_uuid=? WHERE object_uuid=?");
     head.bindBlob(1,parseUuid(uuid)); head.bindBlob(2,parseUuid(objectUuid)); head.stepDone();
-    stampContentChange(db,store.author(),store.hostname(),"objects",id,parseUuid(objectUuid),"geometry");
-    Statement update(db,"UPDATE objects SET storage_kind='sqlite',data_generation=generation,data_checksum=? WHERE id=?");
-    update.bind(1,hash); update.bind(2,id); update.stepDone();
+    stampGeometry(db, store, objectUuid, id, hash);
     if (manifest.at("kind")=="point_collection" && changedIds && changedIds->first=="point_ids")
         updateSourcePointIdentities(db,objectUuid,current->uuid,uuid,manifest,changedIds->second);
     applyEdgeDecisions(store,txn,db,affected,decisions);
@@ -432,10 +440,7 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
     descriptor["delta"] = encoded.description;
     const auto text = descriptor.dump(), hash = hashText(plan->manifest.dump()), uuid = util::newUuid();
     Savepoint savepoint(db);
-    Statement revision(db, "INSERT INTO geometry_revisions VALUES(?,?,?,?,?,?,?,?,?)");
-    revision.bindBlob(1, parseUuid(uuid)); revision.bindBlob(2, parseUuid(objectUuid)); revision.bindBlob(3, parseUuid(current.uuid));
-    revision.bind(4, hash); revision.bind(5, text); revision.bind(6, object.generation+1);
-    revision.bind(7, author()); revision.bind(8, nowIsoUtc()); revision.bind(9, hostname()); revision.stepDone();
+    writeRevision(db, *this, object, uuid, &current, hash, text);
     Statement payload(db, "INSERT INTO geometry_deltas VALUES(?,?,?)");
     payload.bindBlob(1, parseUuid(uuid));
     check(sqlite3_bind_blob64(payload.value, 2, encoded.bytes.data(), encoded.bytes.size(), SQLITE_TRANSIENT), db);
@@ -457,9 +462,7 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
     head.bindBlob(1, parseUuid(uuid)); head.bindBlob(2, parseUuid(objectUuid)); head.stepDone();
     const auto id = *objectIdByUuid(db, parseUuid(objectUuid));
     updateEditedGeometryBounds(db, id, uuid, edits);
-    stampContentChange(db, author(), hostname(), "objects", id, parseUuid(objectUuid), "geometry");
-    Statement update(db, "UPDATE objects SET storage_kind='sqlite',data_generation=generation,data_checksum=? WHERE id=?");
-    update.bind(1, hash); update.bind(2, id); update.stepDone();
+    stampGeometry(db, *this, objectUuid, id, hash);
     applyEdgeDecisions(*this, txn, db, affected, decisions);
     savepoint.release();
     return uuid;
@@ -529,19 +532,14 @@ std::string ObjectStore::updateSurfaceChannels(WriteTxn& txn, const std::string&
     const auto object = *objectByUuid(txn, objectUuid);
     const auto uuid = util::newUuid(), text = manifest.dump(), hash = hashText(text);
     Savepoint savepoint(db);
-    Statement revision(db, "INSERT INTO geometry_revisions VALUES(?,?,?,?,?,?,?,?,?)");
-    revision.bindBlob(1, parseUuid(uuid)); revision.bindBlob(2, parseUuid(objectUuid)); revision.bindBlob(3, parseUuid(current->uuid));
-    revision.bind(4, hash); revision.bind(5, text); revision.bind(6, object.generation+1);
-    revision.bind(7, author()); revision.bind(8, nowIsoUtc()); revision.bind(9, hostname()); revision.stepDone();
+    writeRevision(db, *this, object, uuid, &*current, hash, text);
     writeArrays(db, uuid, channels, manifest);
     clearGeometryMaterialization(db, objectUuid);
     Statement head(db, "UPDATE geometry_heads SET revision_uuid=? WHERE object_uuid=?");
     head.bindBlob(1, parseUuid(uuid)); head.bindBlob(2, parseUuid(objectUuid)); head.stepDone();
     const auto id = *objectIdByUuid(db, parseUuid(objectUuid));
     updateEditedGeometryBounds(db, id, uuid, {});
-    stampContentChange(db, author(), hostname(), "objects", id, parseUuid(objectUuid), "geometry");
-    Statement update(db, "UPDATE objects SET storage_kind='sqlite',data_generation=generation,data_checksum=? WHERE id=?");
-    update.bind(1, hash); update.bind(2, id); update.stepDone();
+    stampGeometry(db, *this, objectUuid, id, hash);
     applyEdgeDecisions(*this, txn, db, affected, decisions);
     savepoint.release();
     return uuid;

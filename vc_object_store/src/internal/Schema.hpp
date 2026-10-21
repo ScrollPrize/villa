@@ -2,7 +2,8 @@
 #include "internal/Database.hpp"
 #include "internal/Spatial.hpp"
 namespace vc::objects::detail {
-const char* kObjectSchema = R"SQL(CREATE TABLE objects(
+void createSchema(sqlite3* db) {
+    exec(db, R"SQL(CREATE TABLE objects(
   id INTEGER PRIMARY KEY,
   uuid BLOB NOT NULL UNIQUE,
   kind TEXT NOT NULL CHECK(length(kind)>0),
@@ -53,8 +54,8 @@ CREATE TABLE journal(
   approval_state TEXT, approved_by TEXT, approved_at TEXT, approved_host TEXT, approved_generation INTEGER
 );
 CREATE INDEX journal_record ON journal(record_uuid, seq);
-)SQL";
-const char* kEdgeSchema = R"SQL(CREATE TABLE edges(
+
+CREATE TABLE edges(
   id INTEGER PRIMARY KEY,
   uuid BLOB NOT NULL UNIQUE,
   a_id INTEGER NOT NULL REFERENCES objects(id) ON DELETE RESTRICT,
@@ -82,8 +83,21 @@ CREATE TABLE edge_tags(
   tag TEXT NOT NULL, PRIMARY KEY(edge_id, tag)
 );
 CREATE INDEX edge_tags_tag ON edge_tags(tag);
-)SQL";
-const char* kObjectGeometrySchema = R"SQL(CREATE TABLE geometry_chunks(
+
+CREATE INDEX edges_kind_approval_uuid ON edges(kind,approval_state,uuid);
+CREATE INDEX edges_kind_uuid ON edges(kind,uuid);
+CREATE INDEX edges_kind_id ON edges(kind,id);
+CREATE INDEX fibers_family_length ON fibers(family,length DESC,object_id);
+CREATE INDEX fibers_length ON fibers(length DESC,object_id);
+CREATE INDEX tracks_family_length ON tracks(family,length DESC,object_id);
+CREATE INDEX tracks_length ON tracks(length DESC,object_id);
+
+CREATE TABLE edge_geometry_bindings(
+  edge_id INTEGER PRIMARY KEY REFERENCES edges(id) ON DELETE CASCADE,
+  a_revision BLOB, b_revision BLOB
+);
+
+CREATE TABLE geometry_chunks(
   hash TEXT PRIMARY KEY CHECK(length(hash)=64),
   data BLOB NOT NULL CHECK(length(data)>0 AND length(data)<=1048576)
 );
@@ -122,16 +136,7 @@ CREATE TRIGGER geometry_revision_chunks_immutable_update BEFORE UPDATE ON geomet
   BEGIN SELECT RAISE(ABORT,'geometry chunk references are immutable'); END;
 CREATE TRIGGER geometry_revision_chunks_immutable_delete BEFORE DELETE ON geometry_revision_chunks
   BEGIN SELECT RAISE(ABORT,'geometry chunk references are retained'); END;
-)SQL";
-const char* kEdgeGeometrySchema = R"SQL(
-CREATE TABLE edge_geometry_bindings(
-  edge_id INTEGER PRIMARY KEY REFERENCES edges(id) ON DELETE CASCADE,
-  a_revision BLOB, b_revision BLOB
-);
-)SQL";
-// Immutable history stores only delta payloads. The materialization is a
-// replaceable overlay on the last explicit snapshot, never another checkpoint.
-const char* kGeometryDeltaSchema = R"SQL(
+
 CREATE TABLE geometry_deltas(
   revision_uuid BLOB PRIMARY KEY REFERENCES geometry_revisions(uuid),
   data BLOB NOT NULL,
@@ -152,14 +157,11 @@ CREATE TABLE geometry_current_chunks(
   hash TEXT NOT NULL, data BLOB NOT NULL,
   PRIMARY KEY(object_uuid,array_name,chunk_index)
 );
-)SQL";
-const char* kSyncSchema = R"SQL(
+
 CREATE TABLE sync_replica(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid TEXT NOT NULL);
 CREATE TABLE sync_baselines(seq INTEGER PRIMARY KEY AUTOINCREMENT, peer TEXT NOT NULL,
     token TEXT NOT NULL, state TEXT NOT NULL CHECK(json_valid(state)), UNIQUE(peer,token));
-)SQL";
-// Baselines contain a digest; changed records are versioned separately.
-const char* kIncrementalSyncSchema = R"SQL(
+
 CREATE INDEX sync_baselines_peer_seq ON sync_baselines(peer,seq);
 CREATE TABLE sync_baseline_records(
     peer TEXT NOT NULL, record_uuid TEXT NOT NULL,
@@ -171,29 +173,9 @@ CREATE TABLE sync_baseline_cursors(
     baseline_seq INTEGER PRIMARY KEY REFERENCES sync_baselines(seq) ON DELETE CASCADE,
     journal_seq INTEGER NOT NULL, geometry_seq INTEGER NOT NULL
 );
-)SQL";
-void createSyncSchema(sqlite3* db) {
-    exec(db, kSyncSchema);
-    exec(db, kIncrementalSyncSchema);
-    Statement id(db, "INSERT INTO sync_replica VALUES(1,?)"); id.bind(1, util::newUuid()); id.stepDone();
-}
-const char* kConsumerQueryIndexes = R"SQL(
-CREATE INDEX edges_kind_approval_uuid ON edges(kind,approval_state,uuid);
-CREATE INDEX edges_kind_uuid ON edges(kind,uuid);
-CREATE INDEX edges_kind_id ON edges(kind,id);
-CREATE INDEX fibers_family_length ON fibers(family,length DESC,object_id);
-CREATE INDEX fibers_length ON fibers(length DESC,object_id);
-CREATE INDEX tracks_family_length ON tracks(family,length DESC,object_id);
-CREATE INDEX tracks_length ON tracks(length DESC,object_id);
-)SQL";
-void createSchema(sqlite3* db) {
-    exec(db, kObjectSchema);
-    exec(db, kEdgeSchema);
-    exec(db, kConsumerQueryIndexes);
-    exec(db, kEdgeGeometrySchema);
-    exec(db, kObjectGeometrySchema);
-    exec(db, kGeometryDeltaSchema);
-    createSyncSchema(db);
+)SQL");
+    Statement replica(db, "INSERT INTO sync_replica VALUES(1,?)");
+    replica.bind(1, util::newUuid()); replica.stepDone();
     detail::createSpatialSchema(db);
     exec(db, "CREATE TABLE store_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid BLOB NOT NULL UNIQUE CHECK(length(uuid)=16));");
     Statement id(db, "INSERT INTO store_identity VALUES(1,?)");

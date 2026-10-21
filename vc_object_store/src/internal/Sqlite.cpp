@@ -200,11 +200,7 @@ std::string Statement::text(int c) const
 
 std::optional<std::string> Statement::optText(int c) const
 {
-    if (isNull(c)) return std::nullopt;
-    if (readRequest) requestBytes(sqlite3_column_bytes(value, c), &FiberRegionStats::metadataBytes);
-    const auto* p = sqlite3_column_text(value, c);
-    return std::optional<std::string>(std::in_place,
-        p ? reinterpret_cast<const char*>(p) : "", p ? size_t(sqlite3_column_bytes(value, c)) : 0);
+    return isNull(c) ? std::nullopt : std::optional(text(c));
 }
 
 std::array<unsigned char, 16> Statement::blob16(int c) const

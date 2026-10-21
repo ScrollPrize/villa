@@ -300,10 +300,7 @@ neither latency nor allocator memory. There is no continuation/coverage cache.
 
 ## Validation and benchmarks
 
-[Build instructions](../README.md#build) include CTest and pytest commands. The
-maintained tests, helpers, benchmarks and validation scripts together are capped
-at 1,500 physical lines. Focus tests on cross-feature workflows and storage/work
-invariants; extend cases with parameterization instead of parallel test suites.
+[Build instructions](../README.md#build) include CTest and pytest commands.
 
 ```sh
 build/bin/bench_source_import 5

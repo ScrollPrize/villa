@@ -204,7 +204,7 @@ void detail::expectHistory(sqlite3* db, const RevisionSelection& expected)
             throw std::runtime_error("object history: expected revision conflict for " + uuid);
         Statement s(db, "INSERT INTO history_expected VALUES(?,?)");
         s.bind(1, uuid);
-        if (wanted) s.bind(2, *wanted); else s.bindNull(2);
+        s.bind(2, wanted);
         s.stepDone();
     }
 }
@@ -429,7 +429,7 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
         Statement insert(db, "INSERT INTO object_revisions(uuid,object_uuid,parent_uuid,geometry_uuid,"
             "metadata_delta,metadata_complete,published_at_us) VALUES(?,?,?,?,?,?,?)");
         insert.bind(1, p.uuid); insert.bind(2, object);
-        if (p.parent) insert.bind(3, *p.parent); else insert.bindNull(3);
+        insert.bind(3, p.parent);
         if (p.geometry) insert.bindBlob(4, parseUuid(*p.geometry)); else insert.bindNull(4);
         insert.bind(5, p.delta.dump()); insert.bind(6, int64_t(1));
         insert.bind(7, publishedAtUs); insert.stepDone();
@@ -470,8 +470,8 @@ void detail::publishHistory(sqlite3* db, bool importedBindings)
             Statement s(db, "INSERT INTO relationship_revisions VALUES(?,?,?,?,?,?,?)");
             s.bind(1, edge.version); s.bind(2, edge.uuid); s.bind(3, edgeToJson(*edge.record, nullptr, false).dump());
             s.bind(4, aPin); s.bind(5, bPin);
-            if (edge.aGeometry) s.bind(6, *edge.aGeometry); else s.bindNull(6);
-            if (edge.bGeometry) s.bind(7, *edge.bGeometry); else s.bindNull(7);
+            s.bind(6, edge.aGeometry);
+            s.bind(7, edge.bGeometry);
             s.stepDone();
             const auto a = metadata(db, aPin);
             const auto b = metadata(db, bPin);

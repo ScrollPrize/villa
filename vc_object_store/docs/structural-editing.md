@@ -129,18 +129,3 @@ Structural checkpoints start new chains without removing earlier history. There
 are no automatic periodic checkpoints or pruning. Spatial queries use ordinary
 chunk/region bounds, including crossing segments. Synchronization transfers and
 verifies snapshots, deltas and referenced metadata payloads.
-
-## Validation and measurement
-
-See the [build/test commands](../README.md#build). Native regressions check a 1000 × 1000 surface with
-1,000 sparse edits after resizing, chunk reuse, and exact current/historical reads. Run `build/bin/bench_structural_edits 5`
-for the synthetic scaling benchmark: full replacement versus append/insertion and
-right growth, with zero/eight relationships and initialization reported separately.
-
-Each measured edit includes expected-head reads, checked publication, durable
-commit; full replacement includes caller preparation. Inputs
-span 1,000–100,000 points, 128–1,024-square surfaces and an 80-append history.
-Reports include mean/min/median/max latency, payload/manifest work, SQLite
-steps and exclusive scoped phase times. Counters measure logical work, not disk
-traffic; SQLite PROFILE times are statement lifetimes. These fixtures do not
-establish real-scroll viewer latency.

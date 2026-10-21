@@ -29,23 +29,12 @@ TiffParams getTiffParams(int cvType) {
     }
 }
 
-// Fill tile buffer with padding value
 void fillTileBuffer(std::vector<uint8_t>& buf, int cvType, float padValue) {
-    switch (cvType) {
-        case CV_8UC1:
-            std::fill(buf.begin(), buf.end(), static_cast<uint8_t>(0));
-            break;
-        case CV_16UC1:
-            std::fill(reinterpret_cast<uint16_t*>(buf.data()),
-                     reinterpret_cast<uint16_t*>(buf.data() + buf.size()),
-                     static_cast<uint16_t>(0));
-            break;
-        case CV_32FC1:
-            std::fill(reinterpret_cast<float*>(buf.data()),
-                     reinterpret_cast<float*>(buf.data() + buf.size()),
-                     padValue);
-            break;
-    }
+    if (cvType == CV_32FC1)
+        std::fill(reinterpret_cast<float*>(buf.data()),
+                  reinterpret_cast<float*>(buf.data() + buf.size()), padValue);
+    else
+        std::fill(buf.begin(), buf.end(), uint8_t(0));
 }
 
 // Convert image to target type with value scaling
@@ -56,31 +45,20 @@ cv::Mat convertWithScaling(const cv::Mat& img, int targetType) {
     cv::Mat result;
     const int srcType = img.type();
 
-    // Scaling factors for full-range conversion
-    if (srcType == CV_8UC1 && targetType == CV_16UC1) {
-        img.convertTo(result, CV_16UC1, 257.0);  // 255 * 257 = 65535
-    } else if (srcType == CV_8UC1 && targetType == CV_32FC1) {
-        img.convertTo(result, CV_32FC1, 1.0 / 255.0);
-    } else if (srcType == CV_16UC1 && targetType == CV_8UC1) {
-        img.convertTo(result, CV_8UC1, 1.0 / 257.0);
-    } else if (srcType == CV_16UC1 && targetType == CV_32FC1) {
-        img.convertTo(result, CV_32FC1, 1.0 / 65535.0);
-    } else if (srcType == CV_32FC1 && targetType == CV_8UC1) {
-        img.convertTo(result, CV_8UC1, 255.0);
-    } else if (srcType == CV_32FC1 && targetType == CV_16UC1) {
-        img.convertTo(result, CV_16UC1, 65535.0);
-    } else {
-        throw std::runtime_error("Unsupported type conversion");
-    }
+    double scale;
+    if (srcType == CV_8UC1 && targetType == CV_16UC1) scale = 257.0;
+    else if (srcType == CV_8UC1 && targetType == CV_32FC1) scale = 1.0 / 255.0;
+    else if (srcType == CV_16UC1 && targetType == CV_8UC1) scale = 1.0 / 257.0;
+    else if (srcType == CV_16UC1 && targetType == CV_32FC1) scale = 1.0 / 65535.0;
+    else if (srcType == CV_32FC1 && targetType == CV_8UC1) scale = 255.0;
+    else if (srcType == CV_32FC1 && targetType == CV_16UC1) scale = 65535.0;
+    else throw std::runtime_error("Unsupported type conversion");
+    img.convertTo(result, targetType, scale);
 
     return result;
 }
 
 } // anonymous namespace
-
-// ============================================================================
-// writeTiff implementation
-// ============================================================================
 
 void writeTiff(const std::filesystem::path& outPath, const cv::Mat& img, int cvType, uint32_t tileW, uint32_t tileH, float padValue, uint16_t compression, float dpi)
 {
@@ -89,7 +67,6 @@ void writeTiff(const std::filesystem::path& outPath, const cv::Mat& img, int cvT
     if (img.channels() != 1)
         throw std::runtime_error("Expected single-channel image for " + outPath.string());
 
-    // Determine output type and convert if necessary
     const int outType = (cvType < 0) ? img.type() : cvType;
     const cv::Mat outImg = convertWithScaling(img, outType);
 
@@ -101,7 +78,8 @@ void writeTiff(const std::filesystem::path& outPath, const cv::Mat& img, int cvT
         static_cast<std::uint64_t>(W) * H * params.elemSize;
     const char* mode = pixelBytes > 0xffff0000ULL ? "w8" : "w";
 
-    TIFF* tf = TIFFOpen(outPath.string().c_str(), mode);
+    std::unique_ptr<TIFF, decltype(&TIFFClose)> file(TIFFOpen(outPath.string().c_str(), mode), TIFFClose);
+    TIFF* tf = file.get();
     if (!tf)
         throw std::runtime_error("Failed to open TIFF for writing: " + outPath.string());
 
@@ -125,63 +103,44 @@ void writeTiff(const std::filesystem::path& outPath, const cv::Mat& img, int cvT
         TIFFSetField(tf, TIFFTAG_ROWSPERSTRIP, H);
         for (uint32_t y = 0; y < H; ++y) {
             const uint8_t* row = outImg.ptr<uint8_t>(static_cast<int>(y));
-            if (TIFFWriteScanline(tf, const_cast<uint8_t*>(row), y, 0) < 0) {
-                TIFFClose(tf);
+            if (TIFFWriteScanline(tf, const_cast<uint8_t*>(row), y, 0) < 0)
                 throw std::runtime_error("TIFFWriteScanline failed at row " +
                                         std::to_string(y) + " in " + outPath.string());
-            }
         }
+    } else {
+        TIFFSetField(tf, TIFFTAG_TILEWIDTH,       tileW);
+        TIFFSetField(tf, TIFFTAG_TILELENGTH,      tileH);
 
-        if (!TIFFWriteDirectory(tf)) {
-            TIFFClose(tf);
-            throw std::runtime_error("TIFFWriteDirectory failed for " + outPath.string());
-        }
-        TIFFClose(tf);
-        return;
-    }
+        const size_t tileBytes = static_cast<size_t>(tileW) * tileH * params.elemSize;
+        std::vector<uint8_t> tileBuf(tileBytes);
 
-    TIFFSetField(tf, TIFFTAG_TILEWIDTH,       tileW);
-    TIFFSetField(tf, TIFFTAG_TILELENGTH,      tileH);
+        for (uint32_t y0 = 0; y0 < H; y0 += tileH) {
+            const uint32_t dy = std::min(tileH, H - y0);
+            for (uint32_t x0 = 0; x0 < W; x0 += tileW) {
+                const uint32_t dx = std::min(tileW, W - x0);
 
-    const size_t tileBytes = static_cast<size_t>(tileW) * tileH * params.elemSize;
-    std::vector<uint8_t> tileBuf(tileBytes);
+                fillTileBuffer(tileBuf, outType, padValue);
 
-    for (uint32_t y0 = 0; y0 < H; y0 += tileH) {
-        const uint32_t dy = std::min(tileH, H - y0);
-        for (uint32_t x0 = 0; x0 < W; x0 += tileW) {
-            const uint32_t dx = std::min(tileW, W - x0);
+                for (uint32_t ty = 0; ty < dy; ++ty) {
+                    const uint8_t* src = outImg.ptr<uint8_t>(static_cast<int>(y0 + ty)) + x0 * params.elemSize;
+                    std::memcpy(tileBuf.data() + ty * tileW * params.elemSize,
+                               src,
+                               dx * params.elemSize);
+                }
 
-            // Fill with padding
-            fillTileBuffer(tileBuf, outType, padValue);
-
-            // Copy actual data
-            for (uint32_t ty = 0; ty < dy; ++ty) {
-                const uint8_t* src = outImg.ptr<uint8_t>(static_cast<int>(y0 + ty)) + x0 * params.elemSize;
-                std::memcpy(tileBuf.data() + ty * tileW * params.elemSize,
-                           src,
-                           dx * params.elemSize);
-            }
-
-            const ttile_t tileIndex = TIFFComputeTile(tf, x0, y0, 0, 0);
-            if (TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(), static_cast<tmsize_t>(tileBytes)) < 0) {
-                TIFFClose(tf);
-                throw std::runtime_error("TIFFWriteEncodedTile failed at tile (" +
-                                        std::to_string(x0) + "," + std::to_string(y0) +
-                                        ") in " + outPath.string());
+                const ttile_t tileIndex = TIFFComputeTile(tf, x0, y0, 0, 0);
+                if (TIFFWriteEncodedTile(tf, tileIndex, tileBuf.data(), static_cast<tmsize_t>(tileBytes)) < 0) {
+                    throw std::runtime_error("TIFFWriteEncodedTile failed at tile (" +
+                                            std::to_string(x0) + "," + std::to_string(y0) +
+                                            ") in " + outPath.string());
+                }
             }
         }
     }
 
-    if (!TIFFWriteDirectory(tf)) {
-        TIFFClose(tf);
+    if (!TIFFWriteDirectory(tf))
         throw std::runtime_error("TIFFWriteDirectory failed for " + outPath.string());
-    }
-    TIFFClose(tf);
 }
-
-// ============================================================================
-// isReadableTiff
-// ============================================================================
 
 namespace {
 

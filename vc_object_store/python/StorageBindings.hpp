@@ -318,35 +318,40 @@ struct PyObjectStore {
         db.reset();
     }
 
-    template <typename Fn>
-    auto withRead(Fn&& fn)
+    template <bool ReleaseGil = false, typename Fn>
+    auto withStore(Fn&& fn)
     {
         require();
         auto lease = db;
-        auto& g = *lease;
-        auto txn = g.read();
-        return fn(g, txn);
+        if constexpr (ReleaseGil) {
+            nb::gil_scoped_release release;
+            return fn(*lease);
+        } else return fn(*lease);
     }
+
+    template <bool ReleaseGil = false, typename Fn>
+    auto withRead(Fn&& fn)
+    {
+        return withStore<ReleaseGil>([&](auto& store) {
+            auto txn = store.read();
+            return fn(store, txn);
+        });
+    }
+
     template <bool ReleaseGil = false, typename Fn>
     auto withWrite(Fn&& fn)
     {
-        require();
-        auto lease = db;
-        auto write = [&] {
-            auto txn = lease->write();
+        return withStore<ReleaseGil>([&](auto& store) {
+            auto txn = store.write();
             if constexpr (std::is_void_v<std::invoke_result_t<Fn, vo::ObjectStore&, vo::WriteTxn&>>) {
-                fn(*lease, txn);
+                fn(store, txn);
                 txn.commit();
             } else {
-                auto result = fn(*lease, txn);
+                auto result = fn(store, txn);
                 txn.commit();
                 return result;
             }
-        };
-        if constexpr (ReleaseGil) {
-            nb::gil_scoped_release release;
-            return write();
-        } else return write();
+        });
     }
 
 };

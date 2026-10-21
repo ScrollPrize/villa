@@ -29,12 +29,6 @@ std::optional<std::array<double, 6>> readBbox(const Statement& s, int firstCol);
 
 void bindBbox(Statement& s, int firstIdx, const std::optional<std::array<double, 6>>& box);
 
-FiberDetail readFiberDetail(const Statement& d);
-
-PatchDetail readPatchDetail(const Statement& d);
-
-TrackDetail readTrackDetail(const Statement& d);
-
 ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details = true);
 
 std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const ObjectFields& fields = std::nullopt);

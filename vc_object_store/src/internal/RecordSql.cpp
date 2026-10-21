@@ -1,4 +1,5 @@
 #include "internal/RecordSql.hpp"
+#include "internal/RecordFields.hpp"
 #include "internal/GeometryCoordinates.hpp"
 
 namespace vc::objects::detail {
@@ -92,41 +93,39 @@ void bindBbox(Statement& s, int firstIdx, const std::optional<std::array<double,
     }
 }
 
-FiberDetail readFiberDetail(const Statement& d)
+namespace {
+template<class T> T readDetail(const Statement& row)
 {
-    FiberDetail f;
-    f.family = d.text(0);
-    f.manualFamily = d.i64(1) != 0;
-    f.controlPointCount = d.i64(2);
-    f.linePointCount = d.i64(3);
-    f.length = d.f64(4);
-    f.width = d.f64(5);
-    f.widthGapFraction = d.f64(6);
-    f.optimizationMode = d.text(7);
-    f.bbox = readBbox(d, 8);
-    return f;
+    T result;
+    int column = 0;
+    detailFields(result, [&](const char*, auto& value) {
+        using Field = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<Field, std::string>) value = row.text(column++);
+        else if constexpr (std::is_same_v<Field, double>) value = row.f64(column++);
+        else if constexpr (std::is_integral_v<Field>) value = row.i64(column++);
+        else if constexpr (std::is_same_v<Field, std::array<double, 2>>) {
+            value = {row.f64(column), row.f64(column + 1)};
+            column += 2;
+        } else {
+            value = readBbox(row, column);
+            column += 6;
+        }
+    });
+    return result;
 }
 
-PatchDetail readPatchDetail(const Statement& d)
+template<class Visit> void detailTables(Visit visit)
 {
-    PatchDetail p;
-    p.gridWidth = d.i64(0);
-    p.gridHeight = d.i64(1);
-    p.scale = {d.f64(2), d.f64(3)};
-    p.bbox = readBbox(d, 4);
-    return p;
+    visit("fiber", "fibers", "family,manual_family,control_point_count,line_point_count,length,width,"
+        "width_gap_fraction,optimization_mode,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z",
+        &ObjectRecord::fiber, readDetail<FiberDetail>, 14);
+    visit("patch", "patches", "grid_width,grid_height,scale,scale_y,"
+        "bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z",
+        &ObjectRecord::patch, readDetail<PatchDetail>, 10);
+    visit("track", "tracks", "dataset_ref,external_key,family,point_count,length,"
+        "bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z",
+        &ObjectRecord::track, readDetail<TrackDetail>, 11);
 }
-
-TrackDetail readTrackDetail(const Statement& d)
-{
-    TrackDetail t;
-    t.datasetRef = d.text(0);
-    t.externalKey = d.text(1);
-    t.family = d.text(2);
-    t.pointCount = d.i64(3);
-    t.length = d.f64(4);
-    t.bbox = readBbox(d, 5);
-    return t;
 }
 
 ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details)
@@ -149,29 +148,13 @@ ObjectRecord readObjectRow(sqlite3* db, const Statement& s, bool details)
         tags.bind(1, id);
         while (tags.row()) rec.tags.push_back(tags.text(0));
     }
-    if (rec.kind == "fiber") {
-        Statement d(db, "SELECT family,manual_family,control_point_count,line_point_count,length,width,"
-                        "width_gap_fraction,optimization_mode,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z "
-                        "FROM fibers WHERE object_id=?");
-        d.bind(1, id);
-        if (d.row()) {
-            rec.fiber = readFiberDetail(d);
-        }
-    } else if (rec.kind == "patch") {
-        Statement d(db, "SELECT grid_width,grid_height,scale,scale_y,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z "
-                        "FROM patches WHERE object_id=?");
-        d.bind(1, id);
-        if (d.row()) {
-            rec.patch = readPatchDetail(d);
-        }
-    } else if (rec.kind == "track") {
-        Statement d(db, "SELECT dataset_ref,external_key,family,point_count,length,bbox_min_x,bbox_min_y,bbox_min_z,"
-                        "bbox_max_x,bbox_max_y,bbox_max_z FROM tracks WHERE object_id=?");
-        d.bind(1, id);
-        if (d.row()) {
-            rec.track = readTrackDetail(d);
-        }
-    }
+    detailTables([&](const char* kind, const char* table, const char* columns, auto member, auto read, int) {
+        if (rec.kind != kind) return;
+        static const auto sql = std::string("SELECT ") + columns + " FROM " + table + " WHERE object_id=?";
+        Statement detail(db, sql);
+        detail.bind(1, id);
+        if (detail.row()) rec.*member = read(detail);
+    });
     return rec;
 }
 
@@ -196,25 +179,14 @@ std::vector<ObjectRecord> readObjectRows(sqlite3* db, Statement& rows, const Obj
         tags.bind(1, selection);
         while (tags.row()) result.at(positions.at(tags.i64(0))).tags.push_back(tags.text(1));
     }
-    if (kinds.contains("fiber") && wants(fields, "fiber")) {
-        Statement detail(db, "SELECT family,manual_family,control_point_count,line_point_count,length,width,"
-                        "width_gap_fraction,optimization_mode,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z "
-                        " ,object_id FROM fibers WHERE object_id IN (SELECT value FROM json_each(?))");
+    detailTables([&](const char* kind, const char* table, const char* columns, auto member, auto read, int idColumn) {
+        if (!kinds.contains(kind) || !wants(fields, kind)) return;
+        static const auto sql = std::string("SELECT ") + columns + ",object_id FROM " + table +
+            " WHERE object_id IN (SELECT value FROM json_each(?))";
+        Statement detail(db, sql);
         detail.bind(1, selection);
-        while (detail.row()) result.at(positions.at(detail.i64(14))).fiber = readFiberDetail(detail);
-    }
-    if (kinds.contains("patch") && wants(fields, "patch")) {
-        Statement detail(db, "SELECT grid_width,grid_height,scale,scale_y,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z "
-                        " ,object_id FROM patches WHERE object_id IN (SELECT value FROM json_each(?))");
-        detail.bind(1, selection);
-        while (detail.row()) result.at(positions.at(detail.i64(10))).patch = readPatchDetail(detail);
-    }
-    if (kinds.contains("track") && wants(fields, "track")) {
-        Statement detail(db, "SELECT dataset_ref,external_key,family,point_count,length,bbox_min_x,bbox_min_y,bbox_min_z,"
-                        "bbox_max_x,bbox_max_y,bbox_max_z  ,object_id FROM tracks WHERE object_id IN (SELECT value FROM json_each(?))");
-        detail.bind(1, selection);
-        while (detail.row()) result.at(positions.at(detail.i64(11))).track = readTrackDetail(detail);
-    }
+        while (detail.row()) result.at(positions.at(detail.i64(idColumn))).*member = read(detail);
+    });
     return result;
 }
 
@@ -229,12 +201,10 @@ std::optional<int64_t> objectIdByUuid(sqlite3* db, const std::array<unsigned cha
 namespace {
 void validateObjectDetail(const ObjectRecord& rec)
 {
-    if (rec.fiber && rec.kind != "fiber")
-        throw std::runtime_error("object store: fiber detail on object of kind " + rec.kind);
-    if (rec.patch && rec.kind != "patch")
-        throw std::runtime_error("object store: patch detail on object of kind " + rec.kind);
-    if (rec.track && rec.kind != "track")
-        throw std::runtime_error("object store: track detail on object of kind " + rec.kind);
+    objectDetails(rec, [&](const char* kind, const auto& detail) {
+        if (detail && rec.kind != kind)
+            throw std::runtime_error(std::string("object store: ") + kind + " detail on object of kind " + rec.kind);
+    });
 }
 }
 
@@ -245,33 +215,31 @@ void writeObjectDetail(sqlite3* db, int64_t id, const ObjectRecord& rec)
         del.bind(1, id);
         del.stepDone();
     }
-    if (rec.fiber) {
-        Statement s(db, "INSERT INTO fibers(object_id,family,manual_family,control_point_count,line_point_count,length,width,"
-                        "width_gap_fraction,optimization_mode,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z) "
-                        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-        const auto& f = *rec.fiber;
-        s.bind(1, id); s.bind(2, f.family); s.bind(3, int64_t(f.manualFamily ? 1 : 0));
-        s.bind(4, f.controlPointCount); s.bind(5, f.linePointCount); s.bind(6, f.length);
-        s.bind(7, f.width); s.bind(8, f.widthGapFraction); s.bind(9, f.optimizationMode);
-        bindBbox(s, 10, f.bbox);
-        s.stepDone();
-    } else if (rec.patch) {
-        Statement s(db, "INSERT INTO patches(object_id,grid_width,grid_height,scale,scale_y,bbox_min_x,bbox_min_y,bbox_min_z,"
-                        "bbox_max_x,bbox_max_y,bbox_max_z) VALUES(?,?,?,?,?,?,?,?,?,?,?)");
-        const auto& p = *rec.patch;
-        s.bind(1, id); s.bind(2, p.gridWidth); s.bind(3, p.gridHeight);
-        s.bind(4, p.scale[0]); s.bind(5, p.scale[1]);
-        bindBbox(s, 6, p.bbox);
-        s.stepDone();
-    } else if (rec.track) {
-        Statement s(db, "INSERT INTO tracks(object_id,dataset_ref,external_key,family,point_count,length,bbox_min_x,bbox_min_y,"
-                        "bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)");
-        const auto& t = *rec.track;
-        s.bind(1, id); s.bind(2, t.datasetRef); s.bind(3, t.externalKey); s.bind(4, t.family);
-        s.bind(5, t.pointCount); s.bind(6, t.length);
-        bindBbox(s, 7, t.bbox);
-        s.stepDone();
-    }
+    bool written = false;
+    detailTables([&](const char*, const char* table, const char* columns, auto member, auto, int count) {
+        const auto& detail = rec.*member;
+        if (written || !detail) return;
+        static const auto sql = [&] {
+            std::string query = std::string("INSERT INTO ") + table + "(object_id," + columns + ") VALUES(?";
+            for (int i = 0; i < count; ++i) query += ",?";
+            return query + ")";
+        }();
+        Statement row(db, sql);
+        row.bind(1, id);
+        int next = 2;
+        detailFields(*detail, [&](const char*, const auto& value) {
+            using Field = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<Field, bool>) row.bind(next++, int64_t(value));
+            else if constexpr (std::is_same_v<Field, std::array<double, 2>>)
+                for (auto axis : value) row.bind(next++, axis);
+            else if constexpr (std::is_same_v<Field, std::optional<std::array<double, 6>>>) {
+                bindBbox(row, next, value);
+                next += 6;
+            } else row.bind(next++, value);
+        });
+        row.stepDone();
+        written = true;
+    });
 }
 
 void writeTags(sqlite3* db, const char* table, const char* idColumn, int64_t id, const std::vector<std::string>& tags)
@@ -299,10 +267,10 @@ void restoreCommon(sqlite3* db, const char* table, const RecordCommon& rec)
     s.bind(2, rec.createdBy); s.bind(3, rec.createdAt); s.bind(4, rec.createdHost);
     s.bind(5, rec.changedBy); s.bind(6, rec.changedAt); s.bind(7, rec.changedHost);
     s.bind(8, rec.approvalState);
-    if (rec.approvedBy) s.bind(9, *rec.approvedBy); else s.bindNull(9);
-    if (rec.approvedAt) s.bind(10, *rec.approvedAt); else s.bindNull(10);
-    if (rec.approvedHost) s.bind(11, *rec.approvedHost); else s.bindNull(11);
-    if (rec.approvedGeneration) s.bind(12, *rec.approvedGeneration); else s.bindNull(12);
+    s.bind(9, rec.approvedBy);
+    s.bind(10, rec.approvedAt);
+    s.bind(11, rec.approvedHost);
+    s.bind(12, rec.approvedGeneration);
     s.bindBlob(13, parseUuid(rec.uuid));
     s.stepDone();
 }
@@ -365,7 +333,7 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
                         "format_version=?,storage_kind=?,storage_ref=?,data_generation=?,data_checksum=?,meta=? WHERE id=?");
         s.bind(1, rec.name); s.bind(2, generation); s.bind(3, author); s.bind(4, now); s.bind(5, host);
         s.bind(6, rec.formatVersion); s.bind(7, rec.storageKind); s.bind(8, rec.storageRef); s.bind(9, rec.dataGeneration);
-        if (rec.dataChecksum) s.bind(10, *rec.dataChecksum); else s.bindNull(10);
+        s.bind(10, rec.dataChecksum);
         s.bind(11, rec.meta); s.bind(12, id);
         s.stepDone();
     } else {
@@ -382,7 +350,7 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
         if (preserveRecord && rec.approvedHost) s.bind(14, *rec.approvedHost); else s.bindNull(14);
         if (preserveRecord && rec.approvedGeneration) s.bind(15, *rec.approvedGeneration); else s.bindNull(15);
         s.bind(16, rec.formatVersion); s.bind(17, rec.storageKind); s.bind(18, rec.storageRef); s.bind(19, rec.dataGeneration);
-        if (rec.dataChecksum) s.bind(20, *rec.dataChecksum); else s.bindNull(20);
+        s.bind(20, rec.dataChecksum);
         s.bind(21, rec.meta);
         s.stepDone();
         id = sqlite3_last_insert_rowid(db);

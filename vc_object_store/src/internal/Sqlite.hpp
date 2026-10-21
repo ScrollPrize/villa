@@ -28,6 +28,9 @@ public:
     void bind(int i, int64_t v);
     void bind(int i, double v);
     void bind(int i, const std::string& v);
+    template<class T> void bind(int i, const std::optional<T>& value) {
+        if (value) bind(i, *value); else bindNull(i);
+    }
     void bindNull(int i);
     void bindBlob(int i, const std::array<unsigned char, 16>& v);
     bool row();

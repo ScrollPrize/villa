@@ -3,6 +3,15 @@
 
 namespace vc::objects {
 using namespace detail;
+namespace {
+std::pair<const char*, int64_t> recordLocation(sqlite3* db, const std::array<unsigned char, 16>& bytes, const std::string& uuid)
+{
+    if (auto id = objectIdByUuid(db, bytes)) return {"objects", *id};
+    if (auto id = edgeIdByUuid(db, bytes)) return {"edges", *id};
+    throw std::runtime_error("object store: record not found: " + uuid);
+}
+}
+
 void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, const std::string& state)
 {
     if (state != "pending" && state != "approved" && state != "rejected")
@@ -12,18 +21,8 @@ void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, cons
     if (state == "approved" && edgeByUuid(txn, recordUuid) && edgeGeometryState(txn, recordUuid).stale)
         throw std::runtime_error("object store: explicitly update the relationship before approving stale geometry");
     const auto bytes = parseUuid(recordUuid);
-    const char* table = nullptr;
-    int64_t id = 0;
-    int64_t generation = 0;
-    if (auto oid = objectIdByUuid(db, bytes)) {
-        table = "objects";
-        id = *oid;
-    } else if (auto eid = edgeIdByUuid(db, bytes)) {
-        table = "edges";
-        id = *eid;
-    } else {
-        throw std::runtime_error("object store: record not found: " + recordUuid);
-    }
+    const auto [table, id] = recordLocation(db, bytes, recordUuid);
+    int64_t generation;
     {
         Statement cur(db, std::string("SELECT generation FROM ") + table + " WHERE id=?");
         cur.bind(1, id);
@@ -56,17 +55,7 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
     if (key.empty()) throw std::runtime_error("object store: meta key must be non-empty");
     const auto path = jsonPathForKey(key);
     const auto bytes = parseUuid(recordUuid);
-    const char* table = nullptr;
-    int64_t id = 0;
-    if (auto oid = objectIdByUuid(db, bytes)) {
-        table = "objects";
-        id = *oid;
-    } else if (auto eid = edgeIdByUuid(db, bytes)) {
-        table = "edges";
-        id = *eid;
-    } else {
-        throw std::runtime_error("object store: record not found: " + recordUuid);
-    }
+    const auto [table, id] = recordLocation(db, bytes, recordUuid);
     // Compare JSON values, not their spelling. Missing and explicit null are
     // distinct; removing a missing key is also a no-op. Keep approval/history
     // untouched when an autosave submits the same logical value.

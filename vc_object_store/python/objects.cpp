@@ -54,16 +54,9 @@ auto readMethod()
 {
     return []<class R, class... Args>(R (vo::ObjectStore::*)(const vo::Txn&, Args...) const) {
         return [](PyObjectStore& self, Args... args) {
-            auto read = [&] { return self.withRead([&](auto& db, auto& txn) { return (db.*Method)(txn, args...); }); };
-            if constexpr (ReleaseGil) {
-                auto result = [&] {
-                    self.require();
-                    auto lease = self.db;
-                    nb::gil_scoped_release release;
-                    return read();
-                }();
-                return toPy(result);
-            } else return toPy(read());
+            return toPy(self.withRead<ReleaseGil>([&](auto& db, auto& txn) {
+                return (db.*Method)(txn, args...);
+            }));
         };
     }(Method);
 }
@@ -328,8 +321,7 @@ NB_MODULE(_native, m)
                 if (nb::len(row) != 3) throw std::invalid_argument("metadata updates must be (uuid,key,value) triples");
                 batch.push_back({nb::cast<std::string>(row[0]), nb::cast<std::string>(row[1]), jsonDumps(row[2])});
             }
-            auto lease = self.db; self.require(); nb::gil_scoped_release release;
-            self.withWrite([&](auto& db, auto& txn) {
+            self.withWrite<true>([&](auto& db, auto& txn) {
                 for (const auto& update : batch) db.setMeta(txn, update.uuid, update.key, update.value);
                 return 0;
             });
@@ -348,11 +340,11 @@ NB_MODULE(_native, m)
                     d["hostname"] = e.hostname;
                     d["timestamp"] = e.timestamp;
                     d["change_kind"] = e.changeKind;
-                    d["approval_state"] = e.approvalState ? nb::object(pyStr(*e.approvalState)) : nb::none();
-                    d["approved_by"] = e.approvedBy ? nb::object(pyStr(*e.approvedBy)) : nb::none();
-                    d["approved_at"] = e.approvedAt ? nb::object(pyStr(*e.approvedAt)) : nb::none();
-                    d["approved_host"] = e.approvedHost ? nb::object(pyStr(*e.approvedHost)) : nb::none();
-                    d["approved_generation"] = e.approvedGeneration ? nb::object(nb::int_(*e.approvedGeneration)) : nb::none();
+                    d["approval_state"] = e.approvalState;
+                    d["approved_by"] = e.approvedBy;
+                    d["approved_at"] = e.approvedAt;
+                    d["approved_host"] = e.approvedHost;
+                    d["approved_generation"] = e.approvedGeneration;
                     out.append(d);
                 }
                 return out;
@@ -371,11 +363,9 @@ NB_MODULE(_native, m)
              nb::arg("byte_offset") = 0, nb::arg("byte_count") = std::nullopt)
         .def("read_geometry_arrays", [](PyObjectStore& self, const std::vector<std::string>& revisions,
                                        const std::string& name) {
-            std::shared_ptr<vo::PackedGeometryArray> packed;
-            { auto lease = self.db; self.require(); nb::gil_scoped_release release;
-              packed = std::make_shared<vo::PackedGeometryArray>(self.withRead([&](auto& db, auto& txn) {
-                  return db.readGeometryArrays(txn, revisions, name); })); }
-            return PyPackedGeometryArray{std::move(packed)};
+            return PyPackedGeometryArray{self.withRead<true>([&](auto& db, auto& txn) {
+                return std::make_shared<vo::PackedGeometryArray>(db.readGeometryArrays(txn, revisions, name));
+            })};
         }, nb::arg("revision_uuids"), nb::arg("array_name"),
            "Read homogeneous arrays into one verified packed buffer with row offsets.")
         .def("read_geometry_rectangle", readMethod<&vo::ObjectStore::readGeometryRectangle, true>(), nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("row"), nb::arg("column"),
@@ -386,22 +376,23 @@ NB_MODULE(_native, m)
              nb::arg("ranges"))
         .def("ingest_registered_geometry", [](PyObjectStore& self, const std::optional<std::filesystem::path>& root,
                                              const std::vector<std::string>& uuids) {
-            vo::GeometryIngestReport result;
-            { auto lease = self.db; self.require(); nb::gil_scoped_release release; result = vo::ingestRegisteredGeometry(self.require(), root, uuids, {}); }
-            return geometryReportToPy(result);
+            return geometryReportToPy(self.withStore<true>([&](auto& db) {
+                return vo::ingestRegisteredGeometry(db, root, uuids, {});
+            }));
         }, nb::arg("dataset_root") = std::nullopt, nb::arg("object_uuids") = std::vector<std::string>{})
         .def("ingest_geometry_source", [](PyObjectStore& self, const std::string& kind, const std::filesystem::path& source,
                                          const nb::dict& context) {
-            vo::GeometryIngestReport result;
             const auto declarations = jsonDumps(context);
-            { auto lease = self.db; self.require(); nb::gil_scoped_release release; result = vo::ingestGeometrySource(self.require(), kind, source, {}, declarations); }
-            return geometryReportToPy(result);
+            return geometryReportToPy(self.withStore<true>([&](auto& db) {
+                return vo::ingestGeometrySource(db, kind, source, {}, declarations);
+            }));
         }, nb::arg("kind"), nb::arg("source"), nb::arg("coordinate_context") = nb::dict())
         .def("export_geometry", [](PyObjectStore& self, const std::string& object,
                                    const std::filesystem::path& destination,
                                    const std::optional<std::string>& revision, bool overwrite) {
-            auto lease = self.db; self.require(); nb::gil_scoped_release release;
-            return vo::exportGeometry(self.require(), object, destination, revision, overwrite);
+            return self.withStore<true>([&](auto& db) {
+                return vo::exportGeometry(db, object, destination, revision, overwrite);
+            });
         }, nb::arg("object_uuid"), nb::arg("destination"), nb::arg("revision_uuid") = std::nullopt,
            nb::arg("overwrite") = false,
            "Export one immutable revision to native files; return its UUID. Does not modify the store.")
@@ -421,9 +412,7 @@ NB_MODULE(_native, m)
             selection.endpointUuids = endpoints; selection.bothEndpoints = both;
             selection.tag = tag; selection.limit = limit; selection.afterUuid = after; selection.includeRetired = includeRetired;
             selection.adjacent = adjacent; selection.applicableOnly = applicableOnly;
-            std::vector<vo::EdgeRecord> records;
-            { auto lease = self.db; self.require(); nb::gil_scoped_release release;
-              records = self.withRead([&](auto& db, auto& txn) { return db.selectEdges(txn, selection, fields); }); }
+            const auto records = self.withRead<true>([&](auto& db, auto& txn) { return db.selectEdges(txn, selection, fields);); }
             const std::set<std::string> projection = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
             nb::list out; for (const auto& record : records) out.append(edgeToPy(record, fields ? &projection : nullptr));
             return out;
@@ -466,9 +455,7 @@ NB_MODULE(_native, m)
             vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset, bbox};
             selection.family = family; selection.minLength = minLength; selection.orderBy = orderBy;
             selection.afterUuid = afterUuid; selection.afterLength = afterLength; selection.includeRetired = includeRetired;
-            std::vector<vo::ObjectRecord> records;
-            { auto lease = self.db; self.require(); nb::gil_scoped_release release;
-              records = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.selectObjects(txn, selection, fields); }); }
+            const auto records = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.selectObjects(txn, selection, fields);); }
             const std::set<std::string> selected = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
             nb::list result;
             for (const auto& record : records) result.append(objectToPy(record, fields ? &selected : nullptr));
@@ -488,9 +475,7 @@ NB_MODULE(_native, m)
             const std::optional<std::string>& family, const std::optional<double>& minLength, bool includeRetired) {
             vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset, bbox};
             selection.family = family; selection.minLength = minLength; selection.includeRetired = includeRetired;
-            std::vector<vo::SpatialRegion> regions;
-            { auto lease = self.db; self.require(); nb::gil_scoped_release release;
-              regions = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.spatialRegions(txn, selection); }); }
+            const auto regions = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.spatialRegions(txn, selection);); }
             nb::list result;
             for (const auto& r : regions) {
                 nb::dict row; row["object_uuid"] = r.objectUuid; row["kind"] = r.kind;
@@ -560,14 +545,9 @@ NB_MODULE(_native, m)
                     else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(value);
                     else throw std::runtime_error("link_point_collections_to_patches: unknown parameter '" + key + "'");
                 }
-                vc::object_links::DetectorReport report;
-                auto lease = self.db;
-                auto& db = self.require();
-                {
-                    nb::gil_scoped_release release;
-                    report = vc::object_links::linkPointCollectionsToPatches(db, p);
-                }
-                return detectorReportToPy(report);
+                return detectorReportToPy(self.withStore<true>([&](auto& db) {
+                    return vc::object_links::linkPointCollectionsToPatches(db, p);
+                }));
             },
             nb::arg("kwargs"),
             "Link regular PCL points to patches using Spiral's largest-area/nearest-named-pair rules. "
@@ -600,10 +580,9 @@ NB_MODULE(_native, m)
                     else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(val);
                     else throw std::runtime_error("link_patch_overlaps: unknown parameter '" + key + "'");
                 }
-                vc::object_links::DetectorReport rep;
-                { auto lease = self.db; self.require(); nb::gil_scoped_release release;
-                  rep = vc::object_links::linkPatchOverlaps(*lease, p); }
-                return detectorReportToPy(rep);
+                return detectorReportToPy(self.withStore<true>([&](auto& db) {
+                    return vc::object_links::linkPatchOverlaps(db, p);
+                }));
             },
             "Run patch-overlap discovery using stored geometry; patch_uuids optionally selects objects. "
             "kwargs mirror PatchOverlapParams (tolerance, min_minor_spread, ...).")
@@ -624,14 +603,9 @@ NB_MODULE(_native, m)
                     else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(value);
                     else throw std::runtime_error("link_tracks_to_tracks: unknown parameter '" + key + "'");
                 }
-                vc::object_links::DetectorReport report;
-                auto lease = self.db;
-                auto& db = self.require();
-                {
-                    nb::gil_scoped_release release;
-                    report = vc::object_links::linkTracksToTracks(db, p);
-                }
-                return detectorReportToPy(report);
+                return detectorReportToPy(self.withStore<true>([&](auto& db) {
+                    return vc::object_links::linkTracksToTracks(db, p);
+                }));
             },
             nb::arg("kwargs"),
             "Discover crossings from stored tracks, optionally selected by track_uuids and dataset_ref. "
@@ -648,14 +622,9 @@ NB_MODULE(_native, m)
                     else if (!setLinePatchParameter(p, key, val))
                         throw std::runtime_error("link_tracks_to_patches: unknown parameter '" + key + "'");
                 }
-                vc::object_links::DetectorReport report;
-                auto lease = self.db;
-                auto& db = self.require();
-                {
-                    nb::gil_scoped_release release;
-                    report = vc::object_links::linkTracksToPatches(db, ctVolume, p);
-                }
-                return detectorReportToPy(report);
+                return detectorReportToPy(self.withStore<true>([&](auto& db) {
+                    return vc::object_links::linkTracksToPatches(db, ctVolume, p);
+                }));
             },
             nb::arg("ct_volume") = "", nb::arg("kwargs"),
             "Link stored tracks to stored patches; select with track_uuids and patch_uuids. "
@@ -674,10 +643,9 @@ NB_MODULE(_native, m)
                     else if (!setLinePatchParameter(p, key, val))
                         throw std::runtime_error("link_fibers_to_patches: unknown parameter '" + key + "'");
                 }
-                vc::object_links::DetectorReport report;
-                { auto lease = self.db; self.require(); nb::gil_scoped_release release;
-                  report = vc::object_links::linkFibersToPatches(*lease, ctVolume, p); }
-                return detectorReportToPy(report);
+                return detectorReportToPy(self.withStore<true>([&](auto& db) {
+                    return vc::object_links::linkFibersToPatches(db, ctVolume, p);
+                }));
             },
             nb::arg("ct_volume") = "", nb::arg("kwargs"),
             "Link stored fibers to stored patches; select with fiber_uuids and patch_uuids. "
