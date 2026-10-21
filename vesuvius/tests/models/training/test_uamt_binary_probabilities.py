@@ -84,6 +84,7 @@ def _load_target():
         "two_stream_batch_sampler"
     )
     sampler.TwoStreamBatchSampler = object
+    sampler.split_labeled_indices = lambda *args, **kwargs: ([], [])
     install(sampler.__name__, sampler)
 
     name = "uamt_binary_probability_target"
