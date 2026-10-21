@@ -3334,6 +3334,15 @@ struct GeneratedControlPointContextMenuOptions {
     std::function<void(size_t, cv::Vec3f)> linkWithCandidate;
     std::function<void(size_t, cv::Vec3f)> mergeWithCandidate;
     std::function<void(uint64_t, cv::Vec3f)> openNearbyAnnotation;
+    // "Link <current> and <other>" on a fiber-intersection X (the automatic
+    // link made from inside the annotation): the current fiber's id (0 for a
+    // never-saved session: no entry), the dialog's anchor rule (the position
+    // of the open fiber's DRAWN line nearest a scene point, with the line
+    // revision it was computed on; nullopt = no visible pass, entry
+    // disabled) and the request (fiber, X point, anchor, revision).
+    uint64_t currentFiberId = 0;
+    std::function<std::optional<std::pair<double, uint64_t>>(const QPointF&)> nearestVisibleLinePosition;
+    std::function<void(uint64_t, cv::Vec3f, double, uint64_t)> linkNearbyFiber;
     // --- Span menu (strip viewers only: a Ctrl+right-click on the centre
     // line away from every control point). Each takes the two controls of
     // the span, in line-position order. The interpolation goal lives here

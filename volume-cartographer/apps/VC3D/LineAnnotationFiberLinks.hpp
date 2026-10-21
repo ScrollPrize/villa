@@ -266,6 +266,80 @@ inline FiberBranchRef reciprocalBranchRef(const FiberBranchRef& ref,
     return reciprocal;
 }
 
+// The facts the automatic link's choice step needs about one fiber's
+// controls, as plain data in base voxels: positions, which are linked (an
+// ordinary or adjacent branch ref names the control), which carry the
+// kollesis termination tag, and the gap spans as (lower, upper) control
+// pairs. One builder over the generic shape (a session: positions, refs,
+// tags, per-span gap flags) and one over a stored record, so the two
+// representations of the same fiber produce identical facts - and the
+// chooser's control index is the index in the given order (a session's own
+// index for a session).
+struct AutoLinkChoiceFacts {
+    std::vector<cv::Vec3d> controls;
+    std::vector<bool> linked;
+    std::vector<bool> kollesisTerminations;
+    std::vector<std::pair<std::size_t, std::size_t>> gapSpans;
+    bool operator==(const AutoLinkChoiceFacts& other) const
+    {
+        if (controls.size() != other.controls.size() || linked != other.linked ||
+            kollesisTerminations != other.kollesisTerminations || gapSpans != other.gapSpans) {
+            return false;
+        }
+        for (std::size_t i = 0; i < controls.size(); ++i) {
+            if (controls[i] != other.controls[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+inline bool branchLinkOnControl(const std::vector<FiberBranchRef>& branches, std::size_t index)
+{
+    return std::any_of(branches.begin(), branches.end(), [index](const FiberBranchRef& branch) {
+        return branch.controlPointIndex == static_cast<int>(index);
+    });
+}
+
+inline AutoLinkChoiceFacts autoLinkChoiceFacts(
+    const std::vector<cv::Vec3d>& controls,
+    const std::vector<FiberBranchRef>& branches,
+    const std::vector<std::vector<std::string>>& tagsPerControl,
+    const std::vector<bool>& spanIsGapPerSpan)
+{
+    AutoLinkChoiceFacts facts;
+    facts.controls = controls;
+    facts.linked.resize(controls.size(), false);
+    facts.kollesisTerminations.resize(controls.size(), false);
+    for (std::size_t c = 0; c < controls.size(); ++c) {
+        facts.linked[c] = branchLinkOnControl(branches, c);
+        facts.kollesisTerminations[c] =
+            c < tagsPerControl.size() && hasControlPointTag(tagsPerControl[c], kKollesisTerminationTag);
+    }
+    // Gap spans in control order: the span descriptor of the lower control
+    // carries the tag.
+    for (std::size_t c = 0; c + 1 < controls.size(); ++c) {
+        if (c < spanIsGapPerSpan.size() && spanIsGapPerSpan[c]) {
+            facts.gapSpans.emplace_back(c, c + 1);
+        }
+    }
+    return facts;
+}
+
+inline AutoLinkChoiceFacts autoLinkChoiceFactsFromStoredFiber(const StoredFiber& fiber)
+{
+    std::vector<std::vector<std::string>> tags;
+    std::vector<bool> gaps;
+    tags.reserve(fiber.controlPoints.size());
+    for (const auto& control : fiber.controlPoints) {
+        tags.push_back(control.tags);
+        gaps.push_back(spanIsGap(control.segmentToNext));
+    }
+    return autoLinkChoiceFacts(storedControlPointPositions(fiber.controlPoints), fiber.branches,
+                               tags, gaps);
+}
+
 // The one marker rule for a control point carrying several links: it draws
 // as an AUTOMATIC pending point (dashed) only when it has at least one
 // pending link and every pending link on it is automatic - a human-made

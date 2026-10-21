@@ -145,6 +145,7 @@ class TestFiberMapAutoLink : public QObject
 
 private slots:
     void nearestLinePositionFoot();
+    void chooserRespectsLinkedAndGapFacts();
     // The arclength the layout resampled on is what unrolledLineArclengths
     // recomputes from the stored inputs, bitwise, and every drawn sample's
     // arclength is one of that parameterisation.
@@ -827,6 +828,45 @@ void TestFiberMapAutoLink::nearestLinePositionFoot()
     const auto single = autolink::nearestLinePosition({cv::Vec3d{1, 1, 1}}, cv::Vec3d{0, 0, 0});
     QVERIFY(single.has_value());
     QCOMPARE(*single, 0.0);
+}
+
+void TestFiberMapAutoLink::chooserRespectsLinkedAndGapFacts()
+{
+    // The facts a session or a stored record hand the chooser (built by the
+    // shared autoLinkChoiceFacts builders, tested for parity in the
+    // generated-views test): a linked control is never reused, a gap span is
+    // closed to placement, and the reported index is the index in the given
+    // control order (a session's own index for a session).
+    std::vector<cv::Vec3d> line;
+    for (int i = 0; i <= 200; ++i) {
+        line.emplace_back(static_cast<double>(i), 0.0, 0.0);
+    }
+    const auto cumulative = autolink::cumulativeArclengths(line);
+    autolink::ControlChoiceInput input;
+    input.linePoints = &line;
+    input.cumulative = &cumulative;
+    // Controls at 20, 100 (linked) and 180; a gap span 100-180.
+    input.controlLineIndex = {20, 100, 180};
+    input.linked = {false, true, false};
+    input.kollesisTerminations = {false, false, false};
+    input.gapSpans = {{1, 2}};
+    input.passPosition = 100.3;
+    input.windowLo = 60.0;
+    input.windowHi = 140.0;
+    input.reuseVx = 5.0;
+    input.minSpacingVx = 8.0;
+    const auto placed = autolink::chooseControlPoint(input);
+    // The linked control at 100 is NOT reused; a new control is placed
+    // clear of it and outside the gap span (below 100).
+    QVERIFY(placed.kind == autolink::ControlChoice::Kind::Place);
+    QVERIFY(placed.linePosition < 100.0 - 8.0 + 1e-9);
+    QVERIFY(placed.linePosition >= 60.0);
+    // With the control at 100 unlinked it is reused, by its index in the
+    // given order.
+    input.linked = {false, false, false};
+    const auto reused = autolink::chooseControlPoint(input);
+    QVERIFY(reused.kind == autolink::ControlChoice::Kind::Reuse);
+    QCOMPARE(reused.controlIndex, 1);
 }
 
 QTEST_APPLESS_MAIN(TestFiberMapAutoLink)

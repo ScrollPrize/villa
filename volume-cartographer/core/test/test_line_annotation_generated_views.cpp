@@ -11,6 +11,7 @@
 #include "LineAnnotationFiberSegments.hpp"
 #include "vc/lasagna/LineSpline.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
+#include "LineAnnotationFiberLinks.hpp"
 #include "LineAnnotationShiftScroll.hpp"
 #include "vc/fiber_tracer/FiberJson.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
@@ -7822,5 +7823,50 @@ TEST_CASE("Nearest drawn line position: the foot on the nearest drawn, non-tail 
         CHECK_FALSE(nearestDrawnLinePosition(one, scene(one), std::nullopt, QPointF(0, 0)).has_value());
         CHECK_FALSE(nearestDrawnLinePosition(square, scene(square), std::nullopt, QPointF(kNan, 0)).has_value());
     }
+}
+
+TEST_CASE("Auto-link choice facts: a stored record and a session-shaped view of the same fiber agree")
+{
+    using vc3d::line_annotation::autoLinkChoiceFacts;
+    using vc3d::line_annotation::autoLinkChoiceFactsFromStoredFiber;
+    using vc3d::line_annotation::FiberBranchRef;
+    using vc3d::line_annotation::StoredFiber;
+    // Three controls: the middle one linked to another fiber, the last one a
+    // kollesis termination, a gap span between the middle and the last.
+    StoredFiber fiber;
+    fiber.id = 7;
+    fiber.fileName = "a.json";
+    for (int i = 0; i < 3; ++i) {
+        fiber.controlPoints.emplace_back(cv::Vec3d(10.0 * i, 1.0, 2.0));
+    }
+    vc3d::line_annotation::setControlPointTag(fiber.controlPoints[2].tags,
+                                              vc3d::line_annotation::kKollesisTerminationTag, true);
+    fiber.controlPoints[1].segmentToNext = vc3d::line_annotation::FiberTraceSegmentMetadata{};
+    vc3d::line_annotation::setControlPointTag(fiber.controlPoints[1].segmentToNext->tags,
+                                              vc3d::line_annotation::kGapSpanTag, true);
+    FiberBranchRef link;
+    link.controlPointIndex = 1;
+    link.branchFiberId = 9;
+    link.branchFileName = "b.json";
+    link.branchControlPointIndex = 0;
+    fiber.branches.push_back(link);
+
+    const auto stored = autoLinkChoiceFactsFromStoredFiber(fiber);
+    // The session-shaped view: positions, the same refs, per-control tags,
+    // per-span gap flags - what choiceSourceFromSession hands the builder.
+    const std::vector<cv::Vec3d> positions{{0, 1, 2}, {10, 1, 2}, {20, 1, 2}};
+    const std::vector<std::vector<std::string>> tags{
+        {}, {}, {std::string(vc3d::line_annotation::kKollesisTerminationTag)}};
+    const std::vector<bool> gaps{false, true, false};
+    const auto session = autoLinkChoiceFacts(positions, fiber.branches, tags, gaps);
+    CHECK(stored == session);
+    REQUIRE(stored.controls.size() == 3);
+    CHECK(stored.linked == std::vector<bool>{false, true, false});
+    CHECK(stored.kollesisTerminations == std::vector<bool>{false, false, true});
+    REQUIRE(stored.gapSpans.size() == 1);
+    CHECK(stored.gapSpans[0] == std::pair<std::size_t, std::size_t>{1, 2});
+    // The control index the chooser reports is the index in this order: the
+    // session's own index for a session.
+    CHECK(stored.controls[1] == cv::Vec3d(10, 1, 2));
 }
 

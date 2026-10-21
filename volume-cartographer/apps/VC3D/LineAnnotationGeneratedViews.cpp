@@ -1270,6 +1270,10 @@ const GeneratedOverlay::FiberIntersectionMarker* nearbyFiberIntersection(
 // fiber marker under it.
 struct ClickLocationActions {
     QAction* openNearbyAnnotation = nullptr;
+    QAction* linkNearbyFiber = nullptr;
+    // The anchor (and its line revision) captured BEFORE the menu opens: the
+    // geometry can be replaced while the menu is up.
+    std::optional<std::pair<double, uint64_t>> linkAnchor;
     QAction* newLineAnnotation = nullptr;
     QAction* newModelLineAnnotation = nullptr;
     QAction* newLinkedLineAnnotation = nullptr;
@@ -1284,6 +1288,28 @@ struct ClickLocationActions {
             openNearbyAnnotation = menu.addAction(
                 QWidget::tr("Go to nearby annotation (%1)")
                     .arg(fiberName(nearbyIntersection->fiberId)));
+        }
+        // Directly under it: the automatic link to the marker's fiber, as
+        // the Fiber Map makes it, anchored on the open fiber's drawn line.
+        if (options.linkNearbyFiber && nearbyIntersection && options.currentFiberId != 0 &&
+            nearbyIntersection->fiberId != options.currentFiberId) {
+            const QPointF intersectionScene =
+                options.viewer->volumeToScene(nearbyIntersection->point);
+            linkAnchor = options.nearestVisibleLinePosition && finiteScenePoint(intersectionScene)
+                ? options.nearestVisibleLinePosition(intersectionScene)
+                : std::nullopt;
+            linkNearbyFiber = menu.addAction(
+                QWidget::tr("Link %1 and %2")
+                    .arg(fiberName(options.currentFiberId),
+                         fiberName(nearbyIntersection->fiberId)));
+            if (!linkAnchor) {
+                linkNearbyFiber->setEnabled(false);
+                linkNearbyFiber->setToolTip(
+                    QWidget::tr("No pass of this fiber is visible near the marker, or the view "
+                                "is still updating."));
+                // QMenu shows action tooltips only when asked to.
+                menu.setToolTipsVisible(true);
+            }
         }
     }
 
@@ -1328,6 +1354,12 @@ struct ClickLocationActions {
         }
         if (openNearbyAnnotation && selected == openNearbyAnnotation && nearbyIntersection) {
             options.openNearbyAnnotation(nearbyIntersection->fiberId, nearbyIntersection->point);
+            return GeneratedControlPointContextResult::Handled;
+        }
+        if (linkNearbyFiber && selected == linkNearbyFiber && linkNearbyFiber->isEnabled() &&
+            nearbyIntersection && linkAnchor) {
+            options.linkNearbyFiber(nearbyIntersection->fiberId, nearbyIntersection->point,
+                                    linkAnchor->first, linkAnchor->second);
             return GeneratedControlPointContextResult::Handled;
         }
         return std::nullopt;

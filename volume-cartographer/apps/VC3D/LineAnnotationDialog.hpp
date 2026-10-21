@@ -157,7 +157,8 @@ public:
         const vc3d::line_annotation::GeneratedLinkCandidateMenuState& linkCandidateState = {},
         const vc3d::line_annotation::GeneratedLinkCandidateMenuState& mergeCandidateState = {},
         const vc3d::line_annotation::GeneratedLinkCandidateMenuState& newLinkedToCandidateState = {},
-        std::function<QString(uint64_t)> fiberDisplayNameForId = {});
+        std::function<QString(uint64_t)> fiberDisplayNameForId = {},
+        uint64_t currentFiberId = 0);
     const std::vector<Pane>& panes() const { return _panes; }
     ReoptimizationMode reoptimizationMode() const;
     int initialCenterlineLengthVx() const;
@@ -288,6 +289,14 @@ signals:
                                              size_t secondControlPointIndex,
                                              bool enabled);
     void generatedNearbyAnnotationOpenRequested(uint64_t fiberId, cv::Vec3f volumePoint);
+    // "Link <current> and <other>" on a fiber-intersection X: the marker's
+    // fiber and point (viewer volume grid), the anchor on the open fiber's
+    // drawn line and the line revision it was computed on.
+    void generatedNearbyFiberLinkRequested(const std::string& surfaceName,
+                                           uint64_t fiberId,
+                                           cv::Vec3f intersectionPoint,
+                                           double anchorLinePosition,
+                                           uint64_t anchorLineRevision);
     void generatedControlPointUnlinkRequested(const std::string& surfaceName,
                                               size_t controlPointIndex,
                                               uint64_t branchFiberId,
@@ -364,6 +373,22 @@ private:
                                CChunkedVolumeViewer* viewer,
                                const GeneratedOverlay& overlay);
     double linePositionFromStripScene(CChunkedVolumeViewer* viewer, const QPointF& scenePoint) const;
+    // The position of the open fiber's DRAWN line nearest a scene point of
+    // this pane, with the line revision it was computed on: a strip's centre
+    // row (the point's column), the side cut's windowed projection (the
+    // nearest drawn, non-tail segment), the current cut's one visible pass
+    // (the cut position). nullopt while the pane shows a held frame or when
+    // nothing of the line is drawn near the point.
+    std::optional<std::pair<double, uint64_t>> nearestVisibleLinePosition(
+        CChunkedVolumeViewer* viewer, const QPointF& scenePoint) const;
+    // The side cut's overlay as updateGeneratedDynamicOverlaysFast draws it
+    // (the cross-slice overlay, the line windowed to half a wrap, the tail
+    // range from the plane-near controls), without the cursor marker; one
+    // builder for the refresh and for nearestVisibleLinePosition.
+    GeneratedOverlay sideCutOverlayFor(
+        const GeneratedViews& views,
+        const vc3d::line_annotation::GeneratedControlPointLinePositionIndex& controlIndex,
+        double linePosition) const;
     // Coalesced entry point for the mouse-follow path: stores the latest line position and
     // applies it at most once per ~render tick via _lineUpdateTimer, so a burst of mouse-move
     // events collapses into a single (potentially O(N)) plane/overlay rebuild instead of one

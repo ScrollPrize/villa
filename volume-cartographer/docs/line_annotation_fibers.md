@@ -428,6 +428,30 @@ is refused ("A merge, split or link is in progress"). If the pair save fails,
 the link is withdrawn from the loaded fibers (every copy, including an edit's
 synced moves of its endpoints during the wait) and the status line says so.
 
+### Linking from a fiber-intersection X
+
+Inside an open Line Annotation, Ctrl+right-click on the yellow X of another
+fiber's intersection (in the current cut, the side cut or a strip) and choose
+**Link <this fiber> and <that fiber>**, directly under "Go to nearby
+annotation". It makes the same pending automatic link as the Fiber Map does,
+with the open fiber's control point anchored at the pass of its DRAWN line
+nearest to the X in that view (a strip: the X's column; the side cut: the
+nearest drawn segment of the windowed projection; the current cut: the one
+visible pass, the cut position) and the other fiber's at the X itself; from
+those two anchors the same ±5 mm closest-pass search and 1 mm reuse rule
+decide the two control points. Differences from the map:
+
+- this annotation stays open: its new control point is placed exactly like a
+  manual placement (asynchronous span re-optimization, autosave, the same
+  placement limit), and the link is made right after the placement;
+- the OTHER fiber's open annotation or dialog-less sessions are saved and
+  closed first (the map's rule for both fibers, applied to that one);
+- the entry is disabled while the view is still updating or no pass of this
+  fiber is drawn near the marker, and absent for a never-saved annotation.
+
+Failures are reported in the usual error dialog with the map's wording; a
+control point already committed before a refusal is kept, unlinked.
+
 A pending automatic link is an ordinary pending link drawn in its own
 palette: bright cyan (#20f0ff), or light pink (#ffa8d8) for a same-H/V link,
 instead of the pending blue / orange - solid markers like every other link
