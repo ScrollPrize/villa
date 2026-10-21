@@ -104,12 +104,20 @@ def test_export_training_keeps_each_verdict_with_the_ct_it_was_made_from(tmp_pat
     answers = iter(["c", "f"])
     review_holes.review(data, audit, out, lambda png, p: next(answers))
     dest = tmp_path / "train"
+    (data / "pred").mkdir()
+    pred = np.zeros((20, 40, 40), np.uint8)
+    pred[10] = 1                                   # the model drew the sheet with no holes
+    tifffile.imwrite(data / "pred" / "crop_1.tif", pred)
     review_holes.main(["--data", str(data), "--audit", str(audit), "--out", str(out),
-                       "--export-training", str(dest), "--half", "16"])
+                       "--export-training", str(dest), "--half", "16", "--predictions", str(data / "pred"),
+                       "--reviewer", "tester"])
     rows = list(csv.DictReader(open(dest / "index.csv")))
+    prov = json.loads((dest / "provenance.json").read_text())
+    assert prov["reviewer"] == "tester" and prov["n"] == 2 and prov["cube"] == 16
     assert [r["verdict"] for r in rows] == ["CUT", "FILL"]
     ex = np.load(dest / rows[0]["file"])
     assert ex["ct"].shape == ex["label"].shape == ex["mask"].shape == (16, 16, 16)
     assert str(ex["verdict"]) == "CUT" and list(ex["center_zyx"]) == [10, 30, 30]
     assert ex["mask"][8, 8, 8] == 1 and ex["label"][8, 8, 8] == 0     # cube centred on the hole
     assert ex["label"][8, 0, 0] == 1                                     # sheet around it
+    assert ex["pred"][8, 8, 8] == 1 and ex["label"][8, 8, 8] == 0        # model drew it, label did not

@@ -3,6 +3,7 @@ did there, so an edit becomes a training example: a correct drag must read as a 
 equal to the offset the audit measured, and untouched cells must read as unmoved.
 """
 import csv
+import json
 import numpy as np
 import pytest
 import tifffile
@@ -43,6 +44,20 @@ def test_drag_onto_the_sheet_reads_as_the_measured_offset(tmp_path):
         assert int(r["n_moved"]) == int(r["n"])
     arrs = np.load(tmp_path / "edits" / "edits.npz")
     assert arrs["ct_1"].shape == (16, 16, 16) and arrs["after_1"].shape == arrs["before_1"].shape
+    prov = json.loads((tmp_path / "edits" / "provenance.json").read_text())
+    assert prov["before"] == before and prov["audit"]["surface"] == "before" and prov["editor"]
+    # --all-cells adds the on-sheet cells the audit never flagged, so the set has negatives,
+    # and --prediction stores the model's surface next to the CT
+    tifffile.imwrite(tmp_path / "pred.tif", (sheet_volume() > 100).astype(np.uint8))
+    placement_edits.main(["--before", before, "--after", after, "--cells", str(out / "before.worst_cells.json"),
+                          "--out", str(tmp_path / "all"), "--all-cells", "--volume", str(ct),
+                          "--prediction", str(tmp_path / "pred.tif")])
+    rows = list(csv.DictReader(open(tmp_path / "all" / "edits.csv")))
+    left = [r for r in rows if r["flagged"] == "0"]
+    assert left and all(float(r["x"]) < 32 and int(r["n_moved"]) == 0 for r in left)
+    assert all(float(r["x"]) >= 32 for r in rows if r["flagged"] == "1")
+    arrs = np.load(tmp_path / "all" / "edits.npz")
+    assert arrs["pred_1"].shape == arrs["ct_1"].shape == (48, 48, 48) and arrs["pred_1"].max() == 1
     # no edit at all: every cell reads as unmoved
     placement_edits.main(["--before", before, "--after", before, "--cells", str(out / "before.worst_cells.json"),
                           "--out", str(tmp_path / "same")])

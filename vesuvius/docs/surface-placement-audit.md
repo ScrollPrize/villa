@@ -108,11 +108,14 @@ surfaces with the same normal convention.
   --cells <name>.worst_cells.json --out DIR [--volume CT]` writes, per worst
   cell, how far the grid points moved along the cell's normal next to the
   offset the audit had measured (`edits.csv`), with the before and after points
-  and a CT cube (`edits.npz`). A correct edit shows a shift equal to the
-  measured offset. These pairs are the training data for a model that learns
-  where annotators put the surface; nothing is trained here, and a regrown
-  segment (different grid shape) is refused because its points no longer
-  correspond.
+  and a 48-voxel CT cube (`edits.npz`), with `--prediction` the surface
+  model's output as a second cube, and `provenance.json` (inputs, editor,
+  the audit's settings, time). A correct edit shows a shift equal to the
+  measured offset. `--all-cells` adds the cells the audit did not flag, so
+  the set also holds what a human looked at and left alone. These pairs are
+  the training data for a model that learns where annotators put the
+  surface; nothing is trained here, and a regrown segment (different grid
+  shape) is refused because its points no longer correspond.
 
 It measures distance to the nearest density peak, not winding identity: a
 surface that jumped cleanly onto the neighbouring sheet reads as well placed.

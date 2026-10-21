@@ -17,7 +17,10 @@ Writes under ``--out``:
 
 ``--export-training DIR`` turns ``verdicts.csv`` into training examples: one ``.npz``
 per verdict with the CT, label and hole-mask cube around the hole and the verdict,
-plus ``index.csv``. The cubes are ``2*--half`` voxels on a side.
+plus ``index.csv`` and ``provenance.json`` (inputs, reviewer, time). The cubes are
+``--half`` voxels on a side. ``--predictions DIR`` adds the surface model's output
+(``DIR/<crop>.tif``) as a ``pred`` cube, so each example holds what the model drew, what
+the label says, and what the reviewer called.
 
 Next step after a review session (from ``vesuvius/``)::
 
@@ -26,9 +29,11 @@ Next step after a review session (from ``vesuvius/``)::
 """
 import argparse
 import csv
+import getpass
 import json
 import shutil
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -112,11 +117,14 @@ def _cube(arr: np.ndarray, center, half: int) -> np.ndarray:
     return out
 
 
-def export_training(data: Path, audit: Path, out: Path, dest: Path, half: int = 16) -> List[dict]:
-    """Write one ``.npz`` (ct, label, mask, center_zyx, verdict) per verdict and ``index.csv``.
+def export_training(data: Path, audit: Path, out: Path, dest: Path, half: int = 16,
+                    predictions: Optional[Path] = None, reviewer: str = "") -> List[dict]:
+    """Write one ``.npz`` (ct, label, mask, center_zyx, verdict, pred with ``predictions``)
+    per verdict, plus ``index.csv`` and ``provenance.json``.
 
     This is the labelled set a FILL/CUT model would train on: the reviewer's call with the
-    CT it was made from. Nothing is trained here; the export only keeps the pairs.
+    CT it was made from, and the surface model's own output there when ``predictions`` holds
+    ``<crop>.tif`` per crop. Nothing is trained here; the export only keeps the pairs.
     """
     rows = list(load_verdicts(out / "verdicts.csv").values())
     dest.mkdir(parents=True, exist_ok=True)
@@ -124,19 +132,26 @@ def export_training(data: Path, audit: Path, out: Path, dest: Path, half: int = 
     for i, r in enumerate(rows):
         crop = r["crop"]
         if crop not in cache:
-            cache[crop] = (tifffile.imread(data / "images" / f"{crop}.tif"),
-                           tifffile.imread(data / "labels" / f"{crop}.tif"),
-                           tifffile.imread(audit / f"{crop}.hole_mask.tif"))
+            vols = {"ct": tifffile.imread(data / "images" / f"{crop}.tif"),
+                    "label": tifffile.imread(data / "labels" / f"{crop}.tif"),
+                    "mask": tifffile.imread(audit / f"{crop}.hole_mask.tif")}
+            if predictions is not None:
+                vols["pred"] = tifffile.imread(predictions / f"{crop}.tif")
+            cache[crop] = vols
         center = json.loads(r["center_zyx"])
         name = f"{crop}_{i:04d}.npz"
-        np.savez_compressed(dest / name, ct=_cube(cache[crop][0], center, half),
-                            label=_cube(cache[crop][1], center, half), mask=_cube(cache[crop][2], center, half),
-                            center_zyx=np.array(center), verdict=r["verdict"])
+        np.savez_compressed(dest / name, center_zyx=np.array(center), verdict=r["verdict"],
+                            **{k: _cube(v, center, half) for k, v in cache[crop].items()})
         index.append({"file": name, **r})
     with open(dest / "index.csv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=["file", *FIELDS])
         w.writeheader()
         w.writerows(index)
+    prov = {"data": str(data), "audit": str(audit), "verdicts": str(out / "verdicts.csv"),
+            "predictions": str(predictions) if predictions else None, "cube": 2 * half,
+            "reviewer": reviewer, "n": len(index),
+            "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    (dest / "provenance.json").write_text(json.dumps(prov, indent=1))
     return index
 
 
@@ -220,11 +235,15 @@ def main(argv=None):
                     help="stage the top crops into OUT/fix_in for hole_viewer.py and ask nothing")
     ap.add_argument("--export-training", type=Path, metavar="DIR",
                     help="write OUT/verdicts.csv as training cubes (.npz + index.csv) into DIR and ask nothing")
+    ap.add_argument("--predictions", type=Path, metavar="DIR",
+                    help="with --export-training: surface model output per crop (DIR/<crop>.tif), stored as pred")
+    ap.add_argument("--reviewer", default=getpass.getuser(), help="who made the calls (provenance)")
     a = ap.parse_args(argv)
     if not (a.audit / "ranked.csv").exists():
         ap.error(f"{a.audit}/ranked.csv missing: run vesuvius.label_topology_audit --batch first")
     if a.export_training:
-        n = export_training(a.data, a.audit, a.out, a.export_training, max(a.half // 2, 8))
+        n = export_training(a.data, a.audit, a.out, a.export_training, max(a.half // 2, 8),
+                            a.predictions, a.reviewer)
         print(f"exported {len(n)} verdict cubes to {a.export_training}")
         return
     if a.stage_only:

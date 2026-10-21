@@ -127,8 +127,11 @@ python src/vesuvius/scripts/fix_holes.py --in-dir review/fix_in --veto review/ve
 # 3b. optional: keep the verdicts as training examples (CT + label + hole-mask cube
 #    around each hole with the FILL/CUT call), for a model that learns the reviewer's
 #    calls once there are enough of them. Nothing is trained here.
+#    --predictions DIR adds the surface model's output per crop (DIR/<crop>.tif) as a
+#    pred cube, so each example holds what the model drew, the label, and the call;
+#    provenance.json records inputs, reviewer and time.
 python src/vesuvius/scripts/review_holes.py --data DATA_DIR --audit audit_out --out review \
-  --export-training review/train
+  --export-training review/train --predictions predictions/
 
 # 4. count again; this sees filled holes but not a fill that welded two sheets,
 #    so look at the added voxels on the CT for anything you did not review
