@@ -171,6 +171,20 @@ def test_single_channel_uncertainty_is_binary_entropy(target):
     )
 
 
+def test_single_channel_uncertainty_clamps_in_fp32(target):
+    trainer = target.TrainUncertaintyAwareMeanTeacher(_manager(), verbose=False)
+    trainer.ema_model = _ConstantTeacher(20.0)
+    inputs = torch.zeros((1, 1, 2), dtype=torch.float16)
+
+    uncertainty, probability = trainer._compute_uncertainty(
+        inputs, nullcontext()
+    )
+
+    assert probability.dtype == torch.float16
+    assert uncertainty.dtype == torch.float32
+    assert torch.isfinite(uncertainty).all()
+
+
 def test_binary_max_confidence_uses_distance_from_half_per_voxel(target):
     trainer = target.TrainUncertaintyAwareMeanTeacher(
         _manager(aggregation="max_confidence"), verbose=False

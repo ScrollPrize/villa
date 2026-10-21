@@ -457,7 +457,9 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
         # Compute entropy as uncertainty measure. A one-channel head stores a
         # Bernoulli foreground probability, so include both p and (1 - p).
         if mean_pred.shape[1] == 1:
-            safe_pred = mean_pred.clamp(min=1e-6, max=1.0 - 1e-6)
+            # Clamp in fp32 so highly confident low-precision predictions are
+            # not rounded back to the clamp endpoints before taking logs.
+            safe_pred = mean_pred.float().clamp(min=1e-6, max=1.0 - 1e-6)
             uncertainty = -(
                 safe_pred * torch.log(safe_pred)
                 + (1.0 - safe_pred) * torch.log1p(-safe_pred)
