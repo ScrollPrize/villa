@@ -116,6 +116,15 @@ surfaces with the same normal convention.
   the training data for a model that learns where annotators put the
   surface; nothing is trained here, and a regrown segment (different grid
   shape) is refused because its points no longer correspond.
+- Choosing between tracers: `--candidate NAME=SEG` (repeatable, same grid as
+  `--before`, which is always one candidate) adds per cell the distance from
+  the human's final surface to each candidate (`dist_<name>`), with
+  `--volume` each candidate's own measured offset there (`off_<name>`),
+  `chosen` (the candidate the human ended nearest to) and `audit_pick` (the
+  one the audit would rank best). The audit itself is one measurement, not a
+  predictor; this is how several surface models, or a third party's tracer
+  passed as one more candidate, get compared against the human's pick, and
+  the pick is the label a tracer-choosing model would train on.
 
 It measures distance to the nearest density peak, not winding identity: a
 surface that jumped cleanly onto the neighbouring sheet reads as well placed.

@@ -20,6 +20,15 @@ so a 32-voxel cell fits inside it whatever its alignment.
 
 A correct edit shows ``median_shift`` close to ``median_offset``: the surface moved by the
 distance the audit measured. Rerun the audit on ``--after`` to confirm the cell is gone.
+
+Several tracers of the same region: ``--candidate NAME=TIFXYZ`` (repeatable, same grid as
+``--before``; ``before`` is always a candidate) adds per cell the distance from the human's
+final surface to each candidate (``dist_<name>``), the audit's own measured offset of each
+candidate there with ``--volume`` (``off_<name>``), ``chosen`` (the candidate the human's
+surface ended nearest to) and ``audit_pick`` (the candidate the audit would rank best).
+Where the two disagree the human saw something the peak rule did not, or the reverse;
+both are what a model that chooses between tracers would train on. A third party's tracer
+joins by passing its output as one more candidate.
 """
 import argparse
 import csv
@@ -28,7 +37,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -96,8 +105,42 @@ def cell_edits(before: np.ndarray, after: np.ndarray, ok: np.ndarray, cells: Lis
         shift = disp @ np.asarray(c["normal_zyx"])
         out.append({**c, "n": int(sel.sum()), "median_shift": float(np.median(shift)),
                     "n_moved": int((np.linalg.norm(disp, axis=1) > moved_min).sum()),
-                    "before": before[sel], "after": after[sel]})
+                    "before": before[sel], "after": after[sel], "sel": sel})
     return out
+
+
+def candidate_scores(after: np.ndarray, cands: Dict[str, tuple], edits: List[Dict], sel_of: Dict[int, np.ndarray],
+                     vol=None, prof: Optional[dict] = None, workers: int = 8) -> None:
+    """Per cell: distance of the human's surface to each candidate, the audit's offset of each
+    candidate there, and which candidate each of the two picks."""
+    offs = {}
+    if vol is not None:
+        from vesuvius.image_proc.run.surface_placement_audit import nearest_peak, read_profiles
+
+        prof = prof or {}
+        union = np.zeros(after.shape[:2], bool)
+        for s in sel_of.values():
+            union |= s
+        for name, (P, ok, N) in cands.items():
+            pick = union & ok & np.isfinite(N).all(-1)
+            pr, t, _ = read_profiles(vol, P[pick], N[pick], prof.get("half", 8.0), prof.get("step", 0.5),
+                                     prof.get("sigma", 1.0), workers=workers)
+            off, _, valid = nearest_peak(pr, t, prof.get("min_contrast", 8.0), prof.get("min_prominence", 0.15))
+            full = np.full(after.shape[:2], np.nan)
+            full[pick] = np.where(valid, off, np.nan)
+            offs[name] = full
+    for e in edits:
+        sel = sel_of[e["rank"]]
+        for name, (P, ok, _) in cands.items():
+            both = sel & ok
+            e[f"dist_{name}"] = float(np.median(np.linalg.norm(after[both] - P[both], axis=-1))) if both.any() else np.nan
+            if name in offs:
+                o = offs[name][sel]
+                e[f"off_{name}"] = float(np.nanmedian(o)) if np.isfinite(o).any() else np.nan
+        dists = {n: e[f"dist_{n}"] for n in cands if np.isfinite(e[f"dist_{n}"])}
+        e["chosen"] = min(dists, key=dists.get) if dists else ""
+        oks = {n: abs(e[f"off_{n}"]) for n in offs if np.isfinite(e.get(f"off_{n}", np.nan))}
+        e["audit_pick"] = min(oks, key=oks.get) if oks else ""
 
 
 def ct_cube(vol, center, half: int) -> np.ndarray:
@@ -123,6 +166,9 @@ def main(argv=None):
     ap.add_argument("--half", type=int, default=24, help="half-width of the CT and prediction cubes")
     ap.add_argument("--all-cells", action="store_true", help="also export the cells the audit did not flag")
     ap.add_argument("--editor", default=getpass.getuser(), help="who made the edits (provenance)")
+    ap.add_argument("--candidate", action="append", default=[], metavar="NAME=TIFXYZ",
+                    help="another tracer's output of the same grid; repeatable")
+    ap.add_argument("--workers", type=int, default=8)
     a = ap.parse_args(argv)
     before, ok_b, N = grid_points(a.before)
     after, ok_a, _ = grid_points(a.after)
@@ -141,26 +187,49 @@ def main(argv=None):
         for key, src in (("ct", a.volume), ("pred", a.prediction)):
             if src:
                 vols[key] = open_volume(src, a.level)
+    audit_json = a.cells.with_name(a.cells.name.replace(".worst_cells.json", ".json"))
+    audit = json.loads(audit_json.read_text()) if audit_json.exists() else None
+    cands = {"before": (before, ok_b, N)}
+    for spec in a.candidate:
+        name, _, path = spec.partition("=")
+        if not path or name in cands:
+            sys.exit(f"--candidate needs NAME=TIFXYZ with a new name: {spec}")
+        Pc, okc, Nc = grid_points(path)
+        if Pc.shape != before.shape:
+            sys.exit(f"candidate {name}: grid shape {Pc.shape[:2]} differs from --before {before.shape[:2]}")
+        cands[name] = (Pc, okc, Nc)
+    extra = []
+    if len(cands) > 1:
+        candidate_scores(after, cands, edits, {e["rank"]: e["sel"] for e in edits}, vols.get("ct"),
+                         audit, a.workers)
+        extra = [f"dist_{n}" for n in cands] + ([f"off_{n}" for n in cands] if "ct" in vols else []) \
+            + ["chosen", "audit_pick"]
     with open(a.out / "edits.csv", "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["rank", "z", "y", "x", "n", "median_offset", "median_shift", "n_moved", "flagged"])
+        w.writerow(["rank", "z", "y", "x", "n", "median_offset", "median_shift", "n_moved", "flagged", *extra])
         for e in edits:
             w.writerow([e["rank"], *(f"{v:.1f}" for v in e["center_zyx"]), e["n"],
                         f"{e.get('median_offset', float('nan')):+.2f}", f"{e['median_shift']:+.2f}",
-                        e["n_moved"], e["flagged"]])
+                        e["n_moved"], e["flagged"],
+                        *(f"{e[k]:+.2f}" if isinstance(e[k], float) else e[k] for k in extra)])
             arrays[f"before_{e['rank']}"] = e["before"]
             arrays[f"after_{e['rank']}"] = e["after"]
+            for name, (Pc, _, _) in cands.items():
+                if name != "before":
+                    arrays[f"cand_{name}_{e['rank']}"] = Pc[e["sel"]]
             for key, vol in vols.items():
                 arrays[f"{key}_{e['rank']}"] = ct_cube(vol, e["center_zyx"], a.half)
     np.savez_compressed(a.out / "edits.npz", **arrays)
-    audit_json = a.cells.with_name(a.cells.name.replace(".worst_cells.json", ".json"))
     prov = {"before": a.before, "after": a.after, "cells": str(a.cells), "volume": a.volume,
             "prediction": a.prediction, "level": a.level, "half": a.half, "all_cells": a.all_cells,
             "editor": a.editor, "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "audit": json.loads(audit_json.read_text()) if audit_json.exists() else None}
+            "candidates": {n: s for n, _, s in (spec.partition("=") for spec in a.candidate)}, "audit": audit}
     (a.out / "provenance.json").write_text(json.dumps(prov, indent=1))
     moved = sum(1 for e in edits if e["n_moved"])
     print(f"{len(edits)} cells ({sum(e['flagged'] for e in edits)} flagged), {moved} edited; {a.out / 'edits.csv'}")
+    if extra and "ct" in vols:
+        agree = sum(1 for e in edits if e["chosen"] and e["chosen"] == e["audit_pick"])
+        print(f"human and audit pick the same candidate in {agree}/{len(edits)} cells")
 
 
 if __name__ == "__main__":

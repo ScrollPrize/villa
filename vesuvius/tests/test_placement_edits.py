@@ -63,3 +63,31 @@ def test_drag_onto_the_sheet_reads_as_the_measured_offset(tmp_path):
                           "--out", str(tmp_path / "same")])
     assert all(int(r["n_moved"]) == 0 and abs(float(r["median_shift"])) < 1e-6
                for r in csv.DictReader(open(tmp_path / "same" / "edits.csv")))
+
+
+def test_candidates_record_which_tracer_the_human_and_the_audit_each_pick(tmp_path):
+    """With several tracers of one region, the export must say per cell which candidate the
+    human's final surface sits on and which the audit would rank best; those two labels are
+    what a tracer-choosing model trains on."""
+    ct = tmp_path / "ct.tif"
+    tifffile.imwrite(ct, sheet_volume())
+    before = _seg(tmp_path / "before", 34.0)        # tracer A: right half 4 above the sheet
+    on = _seg(tmp_path / "on", 30.0)                # tracer B: on the sheet
+    under = _seg(tmp_path / "under", 26.0)          # tracer C: 4 below
+    out = tmp_path / "audit"
+    spa.main(["--surface", before, "--volume", str(ct), "--out", str(out), "--samples", "4000",
+              "--seed", "1", "--workers", "1", "--worst-cells", "10"])
+    placement_edits.main(["--before", before, "--after", on, "--cells", str(out / "before.worst_cells.json"),
+                          "--out", str(tmp_path / "edits"), "--volume", str(ct), "--workers", "1",
+                          "--candidate", f"B={on}", "--candidate", f"C={under}"])
+    rows = list(csv.DictReader(open(tmp_path / "edits" / "edits.csv")))
+    assert rows
+    for r in rows:
+        assert r["chosen"] == "B" and r["audit_pick"] == "B"
+        assert float(r["dist_B"]) < 0.01 < float(r["dist_before"]) and abs(float(r["off_B"])) < 0.6
+        assert abs(float(r["off_before"])) == pytest.approx(4.0, abs=0.6)
+        assert abs(float(r["off_C"])) == pytest.approx(4.0, abs=0.6)
+    arrs = np.load(tmp_path / "edits" / "edits.npz")
+    assert arrs["cand_C_1"].shape == arrs["before_1"].shape
+    prov = json.loads((tmp_path / "edits" / "provenance.json").read_text())
+    assert prov["candidates"] == {"B": on, "C": under}
