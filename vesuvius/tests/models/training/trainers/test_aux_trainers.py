@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 from types import SimpleNamespace
 
@@ -8,6 +9,11 @@ from vesuvius.models.training.trainers.auxiliary import (
     StructureTensorTrainer,
     InplaneDirectionTrainer,
     NearestComponentTrainer,
+    AuxiliaryTrainer,
+)
+from vesuvius.models.training.cli import (
+    _build_base_trainer,
+    _configured_auxiliary_target_names,
 )
 
 
@@ -100,6 +106,74 @@ def test_nearest_component_trainer_injects_aux():
     aux = augmented["ink_nearest"]
     assert aux.shape[0] == 3  # 2 direction + 1 distance in 2D
     assert torch.isfinite(aux).all()
+
+
+def test_unified_auxiliary_trainer_injects_multiple_task_types():
+    mgr = _make_mgr("ink_dt", "distance_transform", {"distance_type": "inside"})
+    mgr.targets["ink_normals"] = {
+        "auxiliary_task": True,
+        "task_type": "surface_normals",
+        "source_target": "ink",
+    }
+    trainer = AuxiliaryTrainer(mgr=mgr, verbose=False)
+    samples = [_base_sample((8, 8)), _base_sample((8, 8))]
+    batch = {
+        "image": torch.stack([sample["image"] for sample in samples]),
+        "ink": torch.stack([sample["ink"] for sample in samples]),
+    }
+
+    augmented = trainer._prepare_batch(batch, is_training=True)
+
+    assert augmented["ink_dt"].shape == (2, 1, 8, 8)
+    assert augmented["ink_normals"].shape == (2, 2, 8, 8)
+    assert torch.equal(augmented["ink"], batch["ink"])
+    assert augmented["image"].data_ptr() == batch["image"].data_ptr()
+    assert augmented["ink"].data_ptr() == batch["ink"].data_ptr()
+    assert augmented["regression_keys"] == ["ink_dt", "ink_normals"]
+    assert torch.isfinite(augmented["ink_dt"]).all()
+    assert torch.isfinite(augmented["ink_normals"]).all()
+
+
+def test_unified_auxiliary_trainer_rejects_unknown_task_type():
+    mgr = _make_mgr("unknown", "not_a_task")
+
+    with pytest.raises(ValueError, match="Unsupported auxiliary task types: not_a_task"):
+        AuxiliaryTrainer(mgr=mgr, verbose=False)
+
+
+def test_unified_auxiliary_trainer_rejects_missing_source_target():
+    mgr = _make_mgr("ink_dt", "distance_transform", {"distance_type": "inside"})
+    trainer = AuxiliaryTrainer(mgr=mgr, verbose=False)
+    batch = {"image": torch.zeros((1, 1, 8, 8))}
+
+    with pytest.raises(ValueError, match="every sample must provide"):
+        trainer._prepare_batch(batch, is_training=True)
+
+
+def test_base_trainer_selection_activates_configured_auxiliary_targets():
+    mgr = _make_mgr("ink_dt", "distance_transform", {"distance_type": "inside"})
+
+    assert _configured_auxiliary_target_names(mgr) == ["ink_dt"]
+    assert isinstance(_build_base_trainer(mgr, verbose=False), AuxiliaryTrainer)
+
+
+def test_base_trainer_selection_is_unchanged_without_auxiliary_targets():
+    mgr = SimpleNamespace(
+        gpu_ids=None,
+        use_ddp=False,
+        targets={"ink": {"auxiliary_task": False}},
+    )
+
+    assert _configured_auxiliary_target_names(mgr) == []
+    assert type(_build_base_trainer(mgr, verbose=False)).__name__ == "_BaseTrainer"
+
+
+def test_base_trainer_selection_rejects_on_device_auxiliary_augmentation():
+    mgr = _make_mgr("ink_dt", "distance_transform", {"distance_type": "inside"})
+    mgr.augment_on_device = True
+
+    with pytest.raises(ValueError, match="augment_on_device=true"):
+        _build_base_trainer(mgr, verbose=False)
 
 
 def test_aux_trainer_loss_value_passes_source_predictions():

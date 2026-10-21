@@ -133,7 +133,10 @@ auxiliary_tasks:
         weight: 1.0
 ```
 
-During training the dataset computes distance transforms from the `ink` labels; you do not need to save additional volumes unless you want complete control over the tensors.
+During training the auxiliary trainer computes distance transforms from the
+`ink` patches; you do not need to save additional volumes. The dataset loads
+only the primary labels and deliberately filters auxiliary targets out of disk
+I/O.
 
 ## Dataset Parameters Worth Tuning
 
@@ -177,4 +180,4 @@ Watch the log for messages about missing targets, unlabeled patches, or normaliz
 | Binary segmentation | One label file per volume with `{0, 1}` values | `out_channels: 1`, `activation: sigmoid` | Any positive voxel counts as foreground |
 | Multi-class segmentation | Single label map with integer class IDs | `out_channels: N`, `activation: softmax`, CE/Dice losses | Provide sequential integers `[0, N-1]` |
 | Multi-task | Separate label file per target | Multiple entries in `dataset_config.targets` | Targets share the same image volume |
-| Auxiliary regression | Primary label only | Configure under `auxiliary_tasks` | Auxiliary tensors are derived automatically |
+| Auxiliary regression | Primary label only | Configure under `auxiliary_tasks` | The auxiliary trainer derives tensors per patch |
