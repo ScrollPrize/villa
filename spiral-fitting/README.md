@@ -400,7 +400,7 @@ This also builds Spiral's native helpers as `vc_spiral.spiral_sampling`,
 same modules build with serial kernels when it does not.
 
 or with conda/pip, install `torch` for your CUDA version and then
-`pip install -e .` from `spiral-fitting/`.
+`pip install -e . --group cuda` from `spiral-fitting/` (pip 25.1 or newer).
 
 On Linux x86-64, `uv sync` installs `brook-cu12`, CuPy and cuCIM for the GPU
 backend of `extract_surface_tracks.py` instead of Kimimaro, its CPU backend;
