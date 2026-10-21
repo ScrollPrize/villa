@@ -137,7 +137,7 @@ class RegionEmbedderTests(unittest.TestCase):
     def embedder(self, *, dense_stride=2, dtype="float16", outputs=("tokens", "tokens_unit", "dense", "ink")):
         return RegionEmbedder(self.reader, self.loaded, transforms=self.transforms, outputs=outputs,
                               dense_stride=dense_stride, lattice=[AxisLattice(48, 8, 8)] * 3, dtype=dtype,
-                              point_chunk_size=4096)
+                              point_chunk_size=1024)
 
     def embed(self, z_range, *, y_range=None, x_range=None, dense_stride=2, dtype="float16"):
         embedder = self.embedder(dense_stride=dense_stride, dtype=dtype)

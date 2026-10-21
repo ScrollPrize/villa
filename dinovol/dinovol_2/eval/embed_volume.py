@@ -58,7 +58,7 @@ DTYPES = ("int8", "float16")
 STORAGE = {"int8": (np.int8, True, None), "unit8": (np.int8, False, 1 / 127), "float16": (np.float16, False, None),
            "float32": (np.float32, False, None)}
 FORMAT = "dinovol-embeddings/1"
-DENSE_POINT_CHUNK_SIZE = 262_144
+DENSE_POINT_CHUNK_SIZE = 32_768  # every dense-head call is padded to exactly this many points
 CHUNK_BYTES = 16 << 20
 NEED_MARGIN = 16  # voxels of need() context around a column: covers the token dilation
 
@@ -622,21 +622,27 @@ class RegionEmbedder:
         weight = (lz.weights(coords[:, 0] + 0.5) * ly.weights(coords[:, 1] + 0.5) * lx.weights(coords[:, 2] + 0.5))
         input_shape = tuple(lat.tile for lat in self.lattice)
         head = self.dense_head
+        # Fixed-size calls keep GEMM shapes, hence kernels, independent of how many points a tile has,
+        # so each point's embedding does not depend on the requested region (bf16 kernels otherwise
+        # vary with the batch size on some GPUs).
+        n = coords.shape[0]
+        chunk = self.point_chunk_size
+        padded = torch.cat([coords, coords[-1:].expand(-n % chunk, 3)]) if n % chunk else coords
         with torch.autocast(self.device.type, dtype=self.amp_dtype):
             grid = token_grid[None]
             fpn_grid = head.fpn_grid(grid, skips)
             skip_grids = [level.permute(0, 2, 3, 4, 1) for level in skips]
-            for begin in range(0, coords.shape[0], self.point_chunk_size):
-                points = coords[None, begin:begin + self.point_chunk_size]
+            for begin in range(0, n, chunk):
+                points = padded[None, begin:begin + chunk]
                 fpn = head.fpn_norm(sample_grid_points(fpn_grid, points, input_shape).to(grid.dtype))
                 readout = head.readout(sample_grid_points(grid, points, input_shape),
                                        [sample_grid_points(g, points, input_shape) for g in skip_grids],
                                        fpn, dtype=grid.dtype)
-                w = weight[begin:begin + self.point_chunk_size, None]
-                rows = flat[begin:begin + self.point_chunk_size]
+                w = weight[begin:begin + chunk, None]
+                rows = flat[begin:begin + chunk]
                 for spec in specs:
                     target = acc[spec.name].view(-1, spec.channels)
-                    target.index_add_(0, rows, readout[spec.name][0].float() * w)
+                    target.index_add_(0, rows, readout[spec.name][0, :len(rows)].float() * w)
 
     def _finish_column(self, sink, acc, valid, z_range, ky, kx, cells_y, cells_x, top, left, next_top, stats,
                        array_z_range):
