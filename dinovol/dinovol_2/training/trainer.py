@@ -38,6 +38,13 @@ class Trainer:
     def __init__(self, config: Mapping[str, Any], *, method=None) -> None:
         self.config = normalize_config(config)
         self.runtime_config = self.config["runtime"]
+        num_threads = self.runtime_config.get("num_threads")
+        if num_threads is not None:
+            if isinstance(num_threads, bool) or not isinstance(num_threads, int) or num_threads < 1:
+                raise ValueError("runtime.num_threads must be a positive integer or null")
+            # Apply before model construction and CPU crop assembly. This controls
+            # PyTorch intra-op parallelism, independently of DataLoader workers.
+            torch.set_num_threads(num_threads)
         self.optimizer_config = self.config["optimizer"]
         self.data_config = self.config["data"]
         distributed_config = resolve_distributed_config(self.runtime_config)
@@ -592,9 +599,13 @@ class Trainer:
         batch_size = int(batch["batch_size"])
         n_global_views = int(batch["n_global_views"])
         sample_count = min(batch_size, self.monitor_batch_size)
-        index = torch.tensor([view * batch_size + sample for view in range(n_global_views) for sample in range(sample_count)])
+        global_crops = batch["collated_global_crops"]
+        index = torch.tensor(
+            [view * batch_size + sample for view in range(n_global_views) for sample in range(sample_count)],
+            dtype=torch.long, device=global_crops.device,
+        )
         return {
-            "collated_global_crops": batch["collated_global_crops"].index_select(0, index),
+            "collated_global_crops": global_crops.index_select(0, index),
             "n_global_views": n_global_views,
             "batch_size": sample_count,
         }

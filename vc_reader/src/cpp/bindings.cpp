@@ -129,6 +129,24 @@ NB_MODULE(_reader, m)
     // still referenced at exit; that is not a leak worth reporting.
     nb::set_leak_warnings(false);
 
+    m.def("_encode_delta3d_verified", [](nb::bytes input, const std::vector<int>& shape,
+                                         std::size_t itemsize) {
+        if (shape.size() != 3)
+            throw std::invalid_argument("Delta3D needs three chunk dimensions");
+        const auto* data = reinterpret_cast<const std::uint8_t*>(input.c_str());
+        const auto size = input.size();
+        std::vector<std::uint8_t> encoded;
+        {
+            nb::gil_scoped_release release;
+            encoded = vcr::encode_delta3d(data, size, {shape[0], shape[1], shape[2]}, itemsize);
+            std::vector<std::uint8_t> decoded(size);
+            vcr::decode(vcr::Codec::Delta3d, encoded.data(), encoded.size(), decoded.data(), size);
+            if (std::memcmp(data, decoded.data(), size))
+                throw std::runtime_error("Delta3D round-trip verification failed");
+        }
+        return nb::bytes(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+    }, "input"_a, "shape"_a, "itemsize"_a);
+
     // C++ exceptions with a Python meaning: offline cache misses and refused requests.
     nb::register_exception_translator([](const std::exception_ptr& p, void*) {
         try {

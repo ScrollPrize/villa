@@ -63,6 +63,55 @@ class TrainingTests(unittest.TestCase):
     def setUp(self):
         random.seed(15); np.random.seed(15); torch.manual_seed(15)
 
+    def test_runtime_num_threads_applies_before_model_setup(self):
+        self.addCleanup(torch.set_num_threads, torch.get_num_threads())
+        with tempfile.TemporaryDirectory() as folder:
+            config = dict(runtime=dict(device='cpu', use_amp=False, output_dir=folder,
+                                       max_iterations=1, num_threads=1))
+
+            def build(*args, **kwargs):
+                self.assertEqual(torch.get_num_threads(), 1)
+                return RegressionMethod()
+
+            with patch('dinovol_2.training.trainer.build_method', side_effect=build):
+                trainer = Trainer(config)
+            self.assertEqual(trainer.runtime_config['num_threads'], 1)
+            self.assertTrue(np.isfinite(trainer.train_step(torch.randn(2, 3), 0)['loss']))
+
+    def test_runtime_num_threads_unset_preserves_current_setting(self):
+        with tempfile.TemporaryDirectory() as folder:
+            for setting in ({}, {'num_threads': None}):
+                with self.subTest(setting=setting), patch('torch.set_num_threads') as set_threads:
+                    Trainer(dict(device='cpu', output_dir=folder, max_iterations=1,
+                                 runtime=setting), method=RegressionMethod())
+                    set_threads.assert_not_called()
+
+    def test_runtime_num_threads_rejects_invalid_values_before_setup(self):
+        for value in (0, -1, 1.5, True, '2'):
+            with self.subTest(value=value), patch('dinovol_2.training.trainer.build_method') as build:
+                with self.assertRaisesRegex(ValueError, 'runtime.num_threads'):
+                    Trainer({'runtime': {'num_threads': value}})
+                build.assert_not_called()
+
+    def test_monitor_subset_preserves_device_and_view_order(self):
+        devices = ['cpu', *[f'cuda:{i}' for i in range(torch.cuda.device_count())]]
+        with tempfile.TemporaryDirectory() as folder:
+            trainer = Trainer(dict(device='cpu', output_dir=folder, max_iterations=1,
+                                   monitor_batch_size=5), method=RegressionMethod())
+            for device in devices:
+                for batch_size, expected_rows in ((7, [0, 1, 2, 3, 4, 7, 8, 9, 10, 11]),
+                                                  (3, [0, 1, 2, 3, 4, 5])):
+                    with self.subTest(device=device, batch_size=batch_size):
+                        crops = torch.arange(2 * batch_size, device=device, dtype=torch.float32)
+                        crops = crops[:, None, None, None, None].expand(-1, 1, 2, 3, 4).clone()
+                        subset = trainer._monitor_subset(dict(collated_global_crops=crops,
+                                                              batch_size=batch_size, n_global_views=2))
+                        self.assertEqual(subset['collated_global_crops'].device, crops.device)
+                        self.assertEqual(subset['batch_size'], min(batch_size, 5))
+                        self.assertEqual(subset['n_global_views'], 2)
+                        torch.testing.assert_close(subset['collated_global_crops'].cpu(),
+                                                   crops.cpu()[expected_rows], rtol=0, atol=0)
+
     def test_teacher_free_method_and_accumulation(self):
         with tempfile.TemporaryDirectory() as folder:
             first = RegressionMethod()

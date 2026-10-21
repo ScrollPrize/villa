@@ -215,9 +215,10 @@ class CudaPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             write_array(root / 'volume', np.random.default_rng(5).integers(1, 255, (40,)*3, dtype=np.uint8))
-            config = dict(device='cuda', batch_size=2, num_workers=0, max_iterations=5,
+            config = dict(device='cuda', batch_size=2, num_workers=0, max_iterations=3,
                 output_dir=str(root / 'output'), use_amp=True, amp_dtype='bfloat16', compile=False,
-                ibot_targets='cross_view', monitor_batch_size=2, freeze_last_layer_steps=0,
+                ibot_targets='cross_view', monitor_batch_size=2, train_monitor_every_n=1,
+                freeze_last_layer_steps=0,
                 warmup_steps=0, lr=1e-4, lr_schedule='constant',
                 model=dict(model_type='v3', embed_dim=96, depth=2, num_heads=4,
                     global_crops_size=[16]*3, local_crops_size=[8]*3, patch_size=[4]*3,
@@ -238,6 +239,12 @@ class CudaPipelineTests(unittest.TestCase):
                 second = trainer.build_monitor_batch(seed=7)
                 self.assertTrue(first['collated_global_crops'].is_cuda)
                 torch.testing.assert_close(first['collated_global_crops'], second['collated_global_crops'], rtol=0, atol=0)
+                trainer.fit()
+                from PIL import Image
+                for step in (1, 2):
+                    image_path = trainer.monitor_dir / f'monitor_step_{step:06d}.jpg'
+                    with Image.open(image_path) as image:
+                        image.verify()
             finally:
                 trainer._close_dataloader(loader)
                 trainer._close_auxiliary_datasets()

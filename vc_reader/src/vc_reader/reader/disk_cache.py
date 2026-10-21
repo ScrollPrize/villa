@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import configparser
 import json
-import math
 import os
 import threading
 import warnings
@@ -203,17 +202,6 @@ def is_lossless_codec(config: dict | None) -> bool:
     return int(config.get("quant", 1) or 1) <= 1
 
 
-def _metadata_equal(left, right) -> bool:
-    """Compare JSON metadata, including normalized floating NaN fill values."""
-    if isinstance(left, dict) and isinstance(right, dict):
-        return left.keys() == right.keys() and all(_metadata_equal(left[k], right[k]) for k in left)
-    if isinstance(left, list) and isinstance(right, list):
-        return len(left) == len(right) and all(_metadata_equal(a, b) for a, b in zip(left, right))
-    if isinstance(left, float) and isinstance(right, float) and math.isnan(left) and math.isnan(right):
-        return True
-    return left == right
-
-
 def _same_array(stored: dict, source: ArrayMeta, *, ignore_codec: bool) -> bool:
     d = source.dtype
     try:
@@ -262,20 +250,14 @@ def _decoded_layer(root: Path, source: ArrayMeta, url: str, create: bool, compre
         atomic_write(root / ".zattrs", json.dumps(record, indent=1).encode())
         atomic_write(root / ".zarray", json.dumps(stored, indent=1).encode())
         return CacheLayer("decoded", str(root), ArrayMeta.from_zarray(stored))
-    record = (_read_json(root / ".zattrs") or {}).get("vc_reader")
-    if record is not None:  # ours: uncompressed or Delta3D, as its .zarray says
-        comp = stored.get("compressor")
-        ok = (_metadata_equal(record.get("source_zarray"), dict(source.raw)) and not stored.get("filters")
-              and (comp is None or comp.get("id") == DELTA3D_ID))
-        if ok and not allow_lossy and not is_lossless_codec(comp):
-            return None
-    else:  # written by another tool (vesuvius): usable if it holds the same decoded array
-        ok = (stored.get("compressor") is None and not stored.get("filters")
-              and (stored.get("order") or "C") == "C" and _same_array(stored, source, ignore_codec=True))
-    if not ok:
+    array = ArrayMeta.from_zarray(stored)
+    array.codec_id  # Validate the codec, filters, and storage order we actually read.
+    if not _same_array(stored, source, ignore_codec=True):
         raise ValueError(f"disk cache {root} holds a different array than {url} "
                          "(the remote .zarray changed?); delete that cache directory to refill it")
-    return CacheLayer("decoded", str(root), ArrayMeta.from_zarray(stored), allow_lossy=allow_lossy)
+    if not allow_lossy and not is_lossless_codec(stored.get("compressor")):
+        return None
+    return CacheLayer("decoded", str(root), array, allow_lossy=allow_lossy)
 
 
 def delta3d_zarray(source: ArrayMeta) -> dict:
@@ -468,10 +450,14 @@ def open_layers(
                 if writer is None:
                     raise ValueError(f"bounded cache {target} is lossy; use a different cache directory")
                 layers.append(writer)
+            if writer.stored.codec_id not in ('', DELTA3D_ID):
+                return layers, None
             writer.budget_root = str(root)
             return layers, writer
         if layers:
-            return layers, layers[0]
+            writer = next((layer for layer in layers if layer.kind != 'decoded'
+                           or layer.stored.codec_id in ('', DELTA3D_ID)), None)
+            return layers, writer
         if not roots:
             return layers, None
         created = _decoded_layer(Path(decoded_cache_path(roots[0], url)), source, url, create=True,

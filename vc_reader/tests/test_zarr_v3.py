@@ -205,7 +205,10 @@ class V3RemoteTests(RemoteFixtureCase):
         with ZarrReader.open(url, cache_dir=self.cache) as reader:
             np.testing.assert_array_equal(reader[:], [[1., 2.], [np.nan, np.nan]])
         attrs.write_bytes(saved)
-        for change in (dict(fill_value=0), dict(shape=[3, 2]), dict(attributes={'changed': True})):
+        (path/'zarr.json').write_text(json.dumps(dict(metadata, attributes={'changed': True})))
+        with ZarrReader.open(url, cache_dir=self.cache) as reader:
+            np.testing.assert_array_equal(reader[:], [[1., 2.], [np.nan, np.nan]])
+        for change in (dict(fill_value=0), dict(shape=[3, 2])):
             (path/'zarr.json').write_text(json.dumps(dict(metadata, **change)))
             with self.assertRaisesRegex(ValueError, 'holds a different array'):
                 ZarrReader.open(url, cache_dir=self.cache)

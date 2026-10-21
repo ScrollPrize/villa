@@ -19,6 +19,11 @@ def main(argv=None):
     parser.add_argument('--metadata', default=DEFAULT_METADATA_URL)
     parser.add_argument('--refresh', action='store_true')
     commands = parser.add_subparsers(dest='command', required=True)
+    compress = commands.add_parser('compress-cache', help='losslessly compress downloaded Zarr cache chunks in place')
+    compress.add_argument('root', help='local cache root, Zarr group, or array')
+    compress.add_argument('--workers', type=int, default=8)
+    compress.add_argument('--dry-run', action='store_true', help='inventory only; do not write files')
+    compress.add_argument('--report', help='write per-array before/after byte counts as JSON')
     samples = commands.add_parser('samples', help='list scrolls and fragments')
     samples.add_argument('--type', choices=('scroll', 'fragment'))
     scrolls = commands.add_parser('scrolls', help='list scrolls')
@@ -35,6 +40,10 @@ def main(argv=None):
             p.add_argument('--resolve', action='store_true', help='verify candidates against storage headers')
     args = parser.parse_args(argv)
     try:
+        if args.command == 'compress-cache':
+            from .reader.cache_conversion import compress_cache
+            compress_cache(args.root, workers=args.workers, dry_run=args.dry_run, report=args.report)
+            return 0
         catalog = Catalog.load(args.metadata, refresh=args.refresh)
         if args.command in ('samples', 'scrolls'):
             values = catalog.scrolls if args.command == 'scrolls' else catalog.samples
@@ -65,7 +74,10 @@ def main(argv=None):
                 rows.extend([a.id, a.artifact_kind, a.volume.id if a.volume else None,
                              a.segment.id if a.segment else None, a.label_set, a.source.storage.location] for a in values)
         print(_table(rows))
-    except (VcReaderError, ValueError, OSError) as error:
+    except KeyboardInterrupt:
+        print('vc-reader: interrupted; completed array conversions are retained', file=sys.stderr)
+        return 130
+    except (VcReaderError, ValueError, OSError, RuntimeError) as error:
         print(f'vc-reader: {error}', file=sys.stderr)
         return 1
     return 0

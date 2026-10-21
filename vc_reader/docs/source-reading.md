@@ -223,3 +223,44 @@ sampling and its CPU/CUDA equality checks are documented in
 
 See the [reader and pipeline benchmarks](../benchmarks/README.md#reader-and-pipeline-benchmarks)
 for throughput measurements and cache controls.
+
+## Compressing downloaded caches
+
+Stop training, prefetching, and every other reader/writer using the target cache
+before running this command. Keep them stopped until it finishes:
+
+```bash
+vc-reader compress-cache /path/to/volume_cache --dry-run
+vc-reader compress-cache /path/to/volume_cache --workers 8 --report /tmp/compression.json
+```
+
+The target can be a cache root, Zarr group, or individual array. The command
+converts only existing uncompressed, unfiltered C-order 3D uint8/uint16 Zarr v2
+chunks to lossless VC-Delta3D (`quant=1`). It preserves attributes and missing
+chunk markers, skips already compressed arrays, and never downloads absent
+chunks. Values and their declared byte order are preserved exactly.
+Report sizes count chunk payload bytes, including padded edge voxels;
+allocated output bytes are also recorded separately.
+
+Each array is converted into a sibling staging directory with bounded parallel
+workers. Every chunk is decoded and compared exactly with its input; the written
+payload is read back and checked. The public reader checks a stored chunk, and
+source file signatures are checked again before an atomic directory exchange.
+The original is removed only after the verified array is published. Allow free
+space for one extra uncompressed array plus 1 GiB. Linux and macOS filesystems
+must support atomic directory exchange. Byte-budgeted caches and consolidated
+Zarr metadata are rejected to avoid stale accounting or codec metadata.
+
+Ctrl+C or a conversion error before publication leaves the original array
+intact and removes staging output. A forced kill can leave a hidden
+`.<level>.delta3d-*` directory: before publication it holds partial output;
+after publication it holds the raw original. Inspect the visible array's
+`.zarray` before removing such an orphan. Completed arrays are skipped when
+rerunning the command. Concurrent readers are not protected by the final source
+check: they can retain old codec metadata, so stopping them is required.
+
+Cache discovery uses the stored array metadata and supported codec, without
+requiring provenance attributes or an exact copy of the source's metadata.
+Shape, dtype, fill value, and chunk layout must match the requested array.
+Blosc, Zstd, and LZW caches can be read; cache appends require raw or Delta3D
+storage. Lossy Delta3D still requires `allow_lossy_cache=True`.

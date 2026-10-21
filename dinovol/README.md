@@ -57,18 +57,24 @@ below also retain their legacy flat spelling for compatibility.
 `dinovol_2/configs/pretrain_8_9um_heads32768.json` uses only volume data:
 surface/fiber predictions, metadata meshes, and auxiliary object losses are
 disabled. Its sampling mask is derived from the volume itself.
-This recipe uses a 384-wide backbone, two `16×384×384` global crops and four
-`16×128×128` local crops (Z, Y, X), with `16×8×8` patches: 2,304 global tokens
-and 256 local tokens. The CNN strides are `[2,1,1]`, then three `[2,2,2]`
-stages. The source sampling window is `24×576×576`; random resized crop scales
+Despite its original filename, this recipe now uses only the next coarser
+resolution: level 1 for native 8–9 µm scans and level 3 for roughly 2.4 µm
+scans. All 39 entries have doubled `pixel_size_um` (15.82–19.208 µm across
+the scans); the original level-0/2 entries are replaced. The occupancy/mask
+level remains 5, and prefetch selects the new training levels automatically.
+This recipe uses a 384-wide backbone, two `16×192×192` global crops and four
+`16×64×64` local crops (Z, Y, X), with `16×8×8` patches: 576 global tokens
+and 64 local tokens. The CNN strides are `[2,1,1]`, then three `[2,2,2]`
+stages. The source sampling window is `24×288×288`; random resized crop scales
 remain unchanged. Its output directory identifies the new crop and patch sizes
 and CNN initialization. This recipe starts a fresh run (`resume` and
 `auto_resume` are false), initializing the CNN stem and stages from
 `/mnt/raid_nvme/dinovol_ckpts/teacher_615k.pt`. The final CNN projection,
 transformer, and heads start randomly initialized; optimizer and schedules
 start at step zero. Enable auto-resume when restarting this new run.
-A short RTX 5090 check of this architecture with random initialization at
-batch 12 with two accumulation
+A short RTX 5090 check with larger `16×384×384` global and `16×128×128`
+local crops, the same embedding, and random initialization at batch 12 with
+two accumulation
 microbatches measured 16.12 GiB peak allocated VRAM and 1.58 s mean per optimizer
 step (three measured steps after three warmups, BF16, compilation and
 checkpointing enabled). It used synthetic volume data passed through the crop
@@ -77,9 +83,79 @@ AdamW, and EMA. Timings exclude data loading, augmentation, monitoring, and
 compilation; this checks feasibility, not training quality or maximum batch size.
 `data.dataset.volume_cache_dir` is `/mnt/raid_nvme/volume_cache`; the reader
 appends `s3/vesuvius-challenge-open-data/<volume path>/<level>/`, reuses existing
-cached chunks, and fetches missing chunks into the same layout. Keep the S3
+cached chunks, and fetches missing chunks into the same layout. Newly created
+training caches use lossless VC-Delta3D compression (`quant=1`), including
+occupancy/mask levels. Existing caches retain their recorded format. Keep the S3
 volume URLs so partial caches can be filled. Remote metadata is still checked
 when opening a volume.
+
+To prefetch the configured volume levels, run from the repository root:
+
+```bash
+# Metadata only: report chunk counts and dense, uncompressed size.
+.venv/bin/python -m dinovol_2.prefetch_volumes \
+  --config dinovol_2/configs/pretrain_8_9um_heads32768.json --dry-run
+
+# Fill the same cache used by training, with lossless compression for new stores.
+.venv/bin/python -m dinovol_2.prefetch_volumes \
+  --config dinovol_2/configs/pretrain_8_9um_heads32768.json \
+  --connections 32 --compress-cache
+```
+
+To keep a progress log that can be followed later, add `--log-file PATH`.
+This appends output and timestamped progress lines instead of terminal bars;
+`--log-interval` controls the update interval in seconds (default 30). The log
+includes per-level counts, percentage, rate, ETA, GETs, fetched bytes, and exit
+status. Completed counts include cached and absent chunks, so the rate and ETA
+measure planned positions processed, not only downloads.
+
+```bash
+.venv/bin/python -m dinovol_2.prefetch_volumes \
+  --config dinovol_2/configs/pretrain_8_9um_heads32768.json \
+  --connections 64 --compress-cache --log-file /tmp/prefetch.log
+# In another terminal:
+tail -f /tmp/prefetch.log
+```
+
+All configured occupancy/mask levels (level 5 in this recipe) are cached first,
+across every selected volume. The script then reads those cached volumes in
+bounded slabs and selects training-level chunks overlapping their nonzero mask,
+with a one-coarse-voxel boundary margin. Filtering is enabled by default. Each
+volume reports its selected/skipped chunk counts and has a progress bar sized
+to the selected chunks. No labels are downloaded.
+
+`--mask-padding N` changes that boundary margin; `--no-mask-filter` restores
+full-level downloads. A coarse zero is a heuristic, not proof that finer data
+is absent: skipped chunks are never recorded as missing, and training can fetch
+them normally. This is a nonzero occupancy mask, not the closed/eroded sampling
+envelope used by `object_mask`. Some selected chunks may still be absent.
+`--dry-run` reads metadata only and reports **unfiltered** sizes; filtered counts
+require the coarse cache to be populated and read. Size estimates include cached
+data and absent chunks, and are not download or compressed disk-size predictions.
+Configs without an occupancy level fall back to full training-level downloads.
+
+`--scope occupancy` stops after the coarse levels; `--scope training` includes
+the coarse prerequisites when filtering is enabled. Repeat
+`--sample-id ID` to select individual datasets. `--cache-dir` overrides the
+cache root (the directory above `s3/`).
+Direct execution from `dinovol_2/` also works:
+`python prefetch_volumes.py --config configs/pretrain_8_9um_heads32768.json --connections 32 --compress-cache`.
+It imports the current checkout even when an older package copy is installed.
+
+Downloads use vc_reader's cache-aware scheduler with a configurable connection
+limit and a bounded queue (`--batch-chunks`, default 512). The progress bar counts
+completed chunk positions, including cache hits and cached absent-chunk markers;
+its GET and fetched-byte counters refer to the current level. Interrupt and rerun
+the same command to resume: completed chunks are reused. Remote metadata is still
+checked when opening stores.
+
+`--compress-cache` uses vc_reader's native lossless `vc-delta3d` codec for newly
+created 3D uint8/uint16 stores. Training reads these automatically with identical
+voxel values. Existing stores retain their current codec, including raw caches;
+this option does not convert existing stores. Omit the flag for new raw stores.
+Cache path structure remains unchanged. Local HTTP regression tests cover cache
+reuse, missing chunks, failed-download recovery, dry-run behavior, and Delta3D
+round trips (`python -m unittest discover -s tests -p 'test_prefetch_volumes.py'`).
 
 [`dinovol_2/configs/pretrain_8_9um.json`](dinovol_2/configs/pretrain_8_9um.json)
 is a standalone pretraining config with 128³ global crops and 64³ local crops.
@@ -194,6 +270,13 @@ The recipe uses these throughput and memory settings. Defaults are noted below:
 - `backbone.deeper_embed_batch_chunk_size: 1` (default): embed one view at a time
   through the CNN to lower peak VRAM, while preserving every view. Set `null`
   to embed the whole batch together.
+- `runtime.num_threads` (optional positive integer): set PyTorch CPU intra-op
+  threads before model and data-loader setup. This is independent of
+  `data.num_workers`; omitted or `null` retains the current PyTorch setting.
+  `pretrain_8_9um_heads32768.json` uses `num_threads: 1` to avoid excessive
+  threading overhead when stacking raw crops, and CNN batch chunk size 4.
+  Run it with the usual `python pretrain.py configs/pretrain_8_9um_heads32768.json`
+  from `dinovol_2/`; no `OMP_NUM_THREADS` environment variable is needed.
 - `fused_optimizer`: fused CUDA AdamW.
 - `cuda_expandable_segments`: the CUDA caching allocator uses expandable
   segments, avoiding fragmentation-driven cache flushes near full memory.
