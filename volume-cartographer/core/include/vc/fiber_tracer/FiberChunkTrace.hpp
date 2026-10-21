@@ -2,6 +2,7 @@
 
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/fiber_tracer/PolylineGeometry.hpp"
+#include "vc/fiber_tracer/FiberReferenceReplayCore.hpp"
 #include <future>
 #include <map>
 #include <mutex>
@@ -54,6 +55,7 @@ using FiberChunkWait=std::function<void(const std::function<bool()>&)>;
 class FiberChunkTraceCache {
 public:
     FiberChunkTraceCache(FiberChunkTraceConfig,std::filesystem::path output,std::string sourceIdentity);
+    [[nodiscard]] const FiberChunkTraceConfig& config() const noexcept { return config_; }
     [[nodiscard]] std::shared_ptr<const FiberChunkPaths> get(const std::array<int,3>&,
         const FiberPredictionSource&,const FiberTraceConfig&,const vc::lasagna::NormalSampler&,
         double traceToBaseScale,const FiberChunkParallelFor& parallelFor={},const FiberChunkWait& wait={});
@@ -82,5 +84,42 @@ struct FiberChunkInitialRegion {
     const FiberChunkTraceConfig&,bool initial,const FiberChunkInitialRegion* region=nullptr,
     const std::function<std::vector<float>(const std::vector<cv::Vec3d>&)>& widths={},
     double widthTolerance=.4);
+
+// Immutable chunks in base XYZ. The provider must return the requested key and
+// remain synchronous. Use a cache.get adapter for on-demand construction.
+using FiberChunkProvider=std::function<std::shared_ptr<const FiberChunkPaths>(const std::array<int,3>&)>;
+struct FiberChunkRouteJoin {
+    std::array<int,3> key{};
+    FiberChunkMatch match;
+    bool initial=false;
+    double spliceDistanceBase=0;
+};
+using FiberChunkJoinObserver=std::function<void(const FiberChunkRouteJoin&)>;
+
+// Follows actual cached suffixes, not a resampled reference. The initial snap
+// and backward matching context are not emitted. The caller owns the seed.
+// This extracted route policy requires 16-base-voxel tracing steps.
+[[nodiscard]] std::string traceFiberChunkRoute(
+    const FiberChunkProvider&,const FiberChunkTraceConfig&,const FiberPredictionSource&,
+    const FiberTraceConfig&,double traceToBaseScale,const FiberChunkInitialRegion&,
+    const cv::Vec3d& direction,double maximumDistanceBase,int maximumSteps,
+    const ReplayPointObserver&,const FiberChunkJoinObserver& joins={});
+
+struct FiberChunkReplayConfig {
+    double errorThresholdBase=20, excursionGraceBase=0, tangentialThresholdFactor=4;
+    double matchRefineSteps=1;
+};
+// Uses the shared reference replay protocol. A supplied nextSeed policy is
+// preserved and snapped to a cached path. Otherwise search reference positions
+// in 16-base-voxel increments for an initial cached path. Other consistency
+// callbacks (including reverse checks) are passed through unchanged.
+[[nodiscard]] FiberReplayTraceResult traceFiberChunkReferenceReplay(
+    FiberChunkTraceCache&,const FiberPredictionSource&,const FiberTraceConfig&,
+    double traceToBaseScale,const vc::lasagna::NormalSampler& tracingNormals,
+    const PolylineArcGeometry& reference,double startArcBase,double endArcBase,
+    const vc::lasagna::NormalSampler& evaluationNormals,double normalWorkingToBaseScale,
+    const FiberChunkReplayConfig& = {},const FiberChunkParallelFor& = {},const FiberChunkWait& = {},
+    const FiberTraceProgressCallback& = {},const FiberReplayFailureCallback& = {},
+    const ReplayConsistencyPolicy& = {},const FiberChunkJoinObserver& = {});
 
 } // namespace vc::fiber_tracer

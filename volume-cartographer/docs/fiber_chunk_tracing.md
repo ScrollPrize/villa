@@ -52,10 +52,38 @@ its lifetime; callers should scope it to their workload.
 overlap with the history, distance and direction tolerances, and optionally
 predicted-width compatibility. Initial matching uses a positive-definite
 ellipsoid metric. Continuations require at least 16 base voxels of remaining
-path. The result identifies the line, orientation, segment and arc position;
-the caller owns route advancement, stopping and replay metrics. A full-volume
-driver, Python bindings and experimental refinement/conflict filters are not
-part of this layer.
+path. The result identifies the line, orientation, segment and arc position.
+
+## Routes and reference replay
+
+`traceFiberChunkRoute` follows those matched suffixes across chunk boundaries.
+Supply a synchronous chunk provider (typically an adapter to `cache.get`) and
+an observer for committed points. It uses the established 16-base-voxel route
+policy and rejects other step sizes. Backward context is used only for overlap
+matching, not emitted or counted as travelled distance. The initial point is
+snapped inside the supplied ellipsoid, not connected by a synthetic segment.
+
+Nonzero continuation gaps are checked at spacing no greater than two base
+voxels using direction-modulated presence and optional width compatibility.
+Join diagnostics expose the selected path and splice distance. Presence and
+invalid-width terminal stops remain stops even beside a chunk face. Cycle,
+no-progress, observer, step and distance limits prevent unbounded traversal;
+the final point is clipped when necessary to respect the distance budget.
+
+`traceFiberChunkReferenceReplay` connects this route to
+`traceReferenceReplayCore`, which remains responsible for matching, metrics,
+failure accounting and resets. It constructs the initial ellipsoid from the
+same anisotropic acceptance metric and snaps the initial recorded point too.
+By default, restart search checks reference positions every 16 base voxels for
+a cached path; callers can supply their prediction-derived seed search in
+`ReplayConsistencyPolicy::nextSeed`. Absent paths count as skipped reference
+length rather than fictitious traces. Reverse-check and acceptance callbacks
+are retained, and the reference is never used to guide route continuations.
+Tracing normals and evaluation normals have separate explicit coordinate
+scales. Progress callbacks report route steps with shared replay context.
+
+Full-volume orchestration, Python bindings and experimental refinement/conflict
+filters are not part of this layer.
 
 ## Validation
 
@@ -72,3 +100,14 @@ invalid settings and oriented/width-aware overlap matching. An optional real-dat
 case uses `VC_TEST_WIDTH_MANIFEST`, `VC_TEST_WIDTH_FIBER` and
 `VC_TEST_REVERSE_NORMAL_MANIFEST`: cached predictions and normals plus a fiber
 JSON whose first control point selects the test chunk. No GPU inference runs.
+
+Route regressions also cover forward/reverse joins, observer and exact distance
+limits, semantic stops, unsupported splices, invalid widths, reference resets,
+skipped seed locations and consistency callbacks. A GCC13 Release check on
+Paris4 reviewed piece `0039_anon_20260815T025206849_000041_run0.json`, prediction
+checkpoint prefix `a56e9dc2`, produced 17 maxima and 10 paths in the seed chunk.
+Construction was exactly equal with serial/parallel work and pins on/off.
+Reference replay over 256 base voxels selected four chunk paths and returned
+one segment with zero failures; disk-cache replay reproduced the points and
+termination reasons exactly. This is a correctness check, not a tracing-quality
+benchmark or a performance claim. macOS/arm64 have not been validated locally.

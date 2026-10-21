@@ -26,6 +26,9 @@ public:
     mutable std::atomic<int> fail{0};
     bool low=false;
     bool supportsConcurrentSampling() const noexcept override {return true;}
+    void sampleWidths(const std::vector<cv::Vec3f>& points,std::vector<float>& out) const override {
+        out.assign(points.size(),std::numeric_limits<float>::quiet_NaN());
+    }
     FiberPredictionSample sample(const cv::Vec3d& p,const cv::Vec3d&) const override {
         ++calls;
         if(fail.exchange(0)) throw std::runtime_error("transient input failure");
@@ -175,6 +178,117 @@ TEST_CASE("real Paris4 chunk construction roundtrips with identical parallel pat
     c.pinSamplingRegion=true;
     FiberChunkTraceCache disk(c,temp.path,"real-cache-test");
     CHECK(disk.get(key,source,t,normals,1)->lines==a->lines);
+    const auto full=makePolylineArcGeometry(fiber.linePointsXyzBase);
+    const double begin=full.vertexArcs.at(fiber.controlPointLineIndices.front());
+    const auto reference=makePolylineArcGeometry(slicePolylineArc(full,begin,begin+256));
+    FiberChunkReplayConfig replay;replay.errorThresholdBase=20;replay.tangentialThresholdFactor=2;
+    size_t joins=0;
+    const auto first=traceFiberChunkReferenceReplay(cache,source,t,1,normals,reference,0,reference.length(),
+        normals,1,replay,{},{},{},{},{},[&](const auto&){++joins;});
+    const auto second=traceFiberChunkReferenceReplay(disk,source,t,1,normals,reference,0,reference.length(),normals,1,replay);
+    REQUIRE(!first.segments.empty());CHECK(joins>0);
+    CHECK(first.completedReferenceArcBase==reference.length());
+    REQUIRE(first.segments.size()==second.segments.size());
+    CHECK(first.failures.size()==second.failures.size());
+    for(size_t i=0;i<first.segments.size();++i) {
+        CHECK(first.segments[i].tracePointsBase==second.segments[i].tracePointsBase);
+        CHECK(first.segments[i].terminationReason==second.segments[i].terminationReason);
+    }
+    std::cout<<"Real Paris4 chunk replay: length="<<reference.length()<<" segments="<<first.segments.size()
+             <<" failures="<<first.failures.size()<<" joins="<<joins<<"; disk reload exact\n";
     std::cout<<"Real Paris4 chunk: maxima="<<a->maxima<<" seeds="<<a->seeds<<" paths="<<a->lines.size()
              <<"; serial/parallel/unpinned/disk paths exact\n";
+}
+
+TEST_CASE("chunk route joins suffixes both ways and respects distance and observer budgets") {
+    Tubes source;auto t=traceConfig();t.stepVoxels=16;
+    auto c=chunkConfig();c.coreBase=64;c.haloBase=32;
+    std::vector<std::array<int,3>> keys;
+    FiberChunkProvider provider=[&](const std::array<int,3>& key) {
+        keys.push_back(key);auto p=std::make_shared<FiberChunkPaths>();p->key=key;
+        p->lo={key[0]*64.-32,-32,-32};p->hi={key[0]*64.+96,96,96};
+        p->lines.emplace_back();
+        for(int i=0;i<=8;++i) p->lines.back().push_back({p->lo[0]+16*i,8,8});
+        p->endReasons.push_back({"chunk_boundary","chunk_boundary"});return p;
+    };
+    FiberChunkInitialRegion region;region.center={0,8,8};
+    for(int sign:{-1,1}) {
+        keys.clear();std::vector<cv::Vec3d> points;size_t joins=0;
+        auto reason=traceFiberChunkRoute(provider,c,source,t,1,region,{double(sign),0,0},200,100,
+            [&](const auto& p,double,int step){CHECK(step==int(points.size()+1));points.push_back(p);return true;},
+            [&](const auto& j){CHECK(j.spliceDistanceBase==0);++joins;});
+        CHECK(reason=="chunk_length_limit");REQUIRE(!points.empty());CHECK(points.back()[0]==sign*200);
+        CHECK(joins>=2);CHECK(keys.size()==joins);
+        double last=0;for(const auto& p:points) {CHECK(sign*p[0]>sign*last);last=p[0];}
+    }
+    int observed=0;keys.clear();
+    CHECK(traceFiberChunkRoute(provider,c,source,t,1,region,{1,0,0},200,2,
+        [&](const auto&,double,int){++observed;return true;})=="chunk_length_limit");
+    CHECK(observed==2);CHECK(keys.size()==1);
+    observed=0;
+    CHECK(traceFiberChunkRoute(provider,c,source,t,1,region,{1,0,0},200,100,
+        [&](const auto&,double,int){++observed;return false;})=="observer_stop");
+    CHECK(observed==1);
+    const FiberChunkProvider missing=[](const auto& key){
+        auto chunk=std::make_shared<FiberChunkPaths>();chunk->key=key;
+        chunk->lo={-32,-32,-32};chunk->hi={96,96,96};return chunk;
+    };
+    CHECK(traceFiberChunkRoute(missing,c,source,t,1,region,{1,0,0},200,100,
+        [](const auto&,double,int){return true;})=="chunk_no_initial_path");
+    t.stepVoxels=8;
+    CHECK_THROWS(traceFiberChunkRoute(provider,c,source,t,1,region,{1,0,0},200,100,
+        [](const auto&,double,int){return true;}));
+}
+
+TEST_CASE("chunk route preserves semantic stops and rejects unsupported splices") {
+    Tubes source;auto t=traceConfig();t.stepVoxels=16;
+    auto c=chunkConfig();c.coreBase=64;c.haloBase=32;
+    FiberChunkInitialRegion region;region.center={0,8,8};
+    std::string terminal="presence_cutoff";int requested=0;
+    FiberChunkProvider provider=[&](const std::array<int,3>& key) {
+        ++requested;auto p=std::make_shared<FiberChunkPaths>();p->key=key;
+        p->lo={key[0]*64.-32,-32,-32};p->hi={key[0]*64.+96,96,96};
+        const double y=key[0]==0?8:10;
+        p->lines.emplace_back();for(int i=0;i<=8;++i) p->lines.back().push_back({p->lo[0]+16*i,y,8});
+        p->endReasons.push_back({terminal,terminal});return p;
+    };
+    const auto observe=[](const auto&,double,int){return true;};
+    for(const auto* reason:{"presence_cutoff","invalid_width"}) {
+        terminal=reason;requested=0;
+        CHECK(traceFiberChunkRoute(provider,c,source,t,1,region,{1,0,0},300,100,observe)==reason);
+        CHECK(requested==1);
+    }
+    terminal="chunk_boundary";source.low=true;
+    CHECK(traceFiberChunkRoute(provider,c,source,t,1,region,{1,0,0},300,100,observe)=="chunk_unsupported_splice");
+    source.low=false;t.widthRelativeTolerance=.4;
+    const auto invalidWidth=traceFiberChunkRoute(provider,c,source,t,1,region,{1,0,0},300,100,observe);
+    CHECK(invalidWidth=="chunk_invalid_splice_width");
+}
+
+TEST_CASE("chunk reference replay shares resets metrics and reverse checks") {
+    Temp tmp;Tubes source;Normal normals;auto c=chunkConfig();c.coreBase=64;c.haloBase=32;
+    auto t=traceConfig();t.stepVoxels=16;
+    FiberChunkTraceCache cache(c,tmp.path,"tube-replay");
+    const auto reference=makePolylineArcGeometry({{0,8,8},{240,8,8}});
+    FiberChunkReplayConfig config;config.errorThresholdBase=2;
+    ReplayConsistencyPolicy policy;policy.intervalBase=32;int checks=0;
+    policy.verify=[&](const auto& points){CHECK(points.size()>1);++checks;return true;};
+    const auto result=traceFiberChunkReferenceReplay(cache,source,t,1,normals,reference,0,240,normals,1,
+        config,{},{},{},{},policy);
+    CHECK(result.completedReferenceArcBase==240);CHECK(result.failures.empty());CHECK(checks>0);
+    REQUIRE(result.segments.size()==1);CHECK(result.segments[0].tracePointsBase.front()==cv::Vec3d(0,8,8));
+    const auto endpoint=result.segments[0].tracePointsBase.back();
+    // Retain the actual cached vertex (grid starts at x=4), not a point
+    // fabricated at the GT endpoint. The shared metric projects it to arc240.
+    CHECK(endpoint==cv::Vec3d(244,8,8));
+    CHECK(result.segments[0].endReferenceArcBase==240);
+    // A tiny acceptance region with no cached path must skip seeds, not emit a
+    // fabricated bridge from reference geometry to a distant fiber.
+    const auto absent=makePolylineArcGeometry({{0,0,0},{64,0,0}});
+    const auto empty=traceFiberChunkReferenceReplay(cache,source,t,1,normals,absent,0,64,normals,1,config);
+    CHECK(empty.segments.empty());CHECK(empty.seedSearchSkippedBase==64);
+    const auto bent=makePolylineArcGeometry({{0,8,8},{96,8,8},{144,40,8},{240,40,8}});
+    const auto reset=traceFiberChunkReferenceReplay(cache,source,t,1,normals,bent,0,bent.length(),normals,1,config);
+    CHECK(!reset.failures.empty());CHECK(reset.segments.size()>1);
+    CHECK(reset.completedReferenceArcBase==bent.length());
 }

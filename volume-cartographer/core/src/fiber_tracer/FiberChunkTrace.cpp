@@ -341,6 +341,8 @@ FiberChunkMatch matchFiberChunkPaths(const FiberChunkPaths& chunk,const std::vec
     FiberChunkMatch bestMatch;
     if(history.empty()) return bestMatch;
     for(const auto& p:history) if(!finite(p)) throw std::invalid_argument("nonfinite chunk history");
+    for(const auto& line:chunk.lines) for(const auto& p:line)
+        if(!finite(p)) throw std::invalid_argument("nonfinite chunk path");
     if(initial) {
         if(!region||!finite(region->center)) throw std::invalid_argument("initial chunk match requires an ellipse");
         const auto& m=region->metric;
