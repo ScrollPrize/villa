@@ -109,8 +109,8 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
         if (entry.object.kind != "point_collection") continue;
         const auto origin = entry.source.value("origin", entry.object.storageRef);
         const auto& extras = entry.source.at("point_attributes");
-        Statement ids(connection,"SELECT point_id FROM source_points WHERE object_uuid=? ORDER BY point_offset");
-        ids.bindBlob(1,parseUuid(entry.object.uuid));
+        Statement ids(connection,"SELECT point_id FROM source_points WHERE object_uuid=? ORDER BY point_offset",
+            parseUuid(entry.object.uuid));
         size_t i=0;
         while(ids.row()) {
             const auto point=ids.i64(0);

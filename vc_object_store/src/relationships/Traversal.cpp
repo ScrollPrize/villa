@@ -21,8 +21,7 @@ std::vector<std::string> ObjectStore::neighbours(const Txn& txn, const std::stri
         ") e JOIN objects o ON o.id=e.neighbour";
     if (neighbourKind) sql += " WHERE o.kind=?3";
     sql += " ORDER BY e.id";
-    Statement rows(db, sql);
-    rows.bind(1, *id);
+    Statement rows(db, sql, *id);
     if (edgeKind) rows.bind(2, *edgeKind);
     if (neighbourKind) rows.bind(3, *neighbourKind);
     std::vector<std::string> out;
@@ -85,8 +84,7 @@ std::vector<int64_t> traverse(sqlite3* db, const std::string& startUuid, int max
     if (!objectIdByUuid(db, startBytes))
         throw std::runtime_error("object store: object not found: " + startUuid);
     if (!includeRetired) {
-        Statement active(db, "SELECT 1 FROM objects WHERE uuid=? AND " + activeObjectSql("objects.id"));
-        active.bindBlob(1, startBytes);
+        Statement active(db, "SELECT 1 FROM objects WHERE uuid=? AND " + activeObjectSql("objects.id"), startBytes);
         if (!active.row()) return {};
     }
     // Probe the endpoint indexes only for nodes reached by this traversal.
@@ -122,8 +120,8 @@ std::vector<int64_t> traverse(sqlite3* db, const std::string& startUuid, int max
 
 std::vector<std::string> uuidList(sqlite3* db, const std::vector<int64_t>& ids)
 {
-    Statement rows(db, "SELECT id,uuid FROM objects WHERE id IN (SELECT value FROM json_each(?))");
-    rows.bind(1, nlohmann::json(ids).dump());
+    Statement rows(db, "SELECT id,uuid FROM objects WHERE id IN (SELECT value FROM json_each(?))",
+        nlohmann::json(ids).dump());
     std::unordered_map<int64_t, std::string> uuids;
     while (rows.row()) uuids.emplace(rows.i64(0), formatUuid(rows.blob16(1)));
     std::vector<std::string> result;

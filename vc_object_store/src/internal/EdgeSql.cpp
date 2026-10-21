@@ -97,8 +97,7 @@ void bindAnchor(Statement& s, int firstIdx, const Anchor& a)
 
 std::string uuidTextByObjectId(sqlite3* db, int64_t id)
 {
-    Statement s(db, "SELECT uuid FROM objects WHERE id=?");
-    s.bind(1, id);
+    Statement s(db, "SELECT uuid FROM objects WHERE id=?", id);
     if (!s.row()) throw std::runtime_error("object store: dangling edge endpoint id");
     return formatUuid(s.blob16(0));
 }
@@ -122,8 +121,7 @@ EdgeRecord readEdgeRow(sqlite3* db, const Statement& s, bool details, const Obje
     if (!details) return rec;
     rec.aUuid = uuidTextByObjectId(db, aId);
     rec.bUuid = uuidTextByObjectId(db, bId);
-    Statement tags(db, "SELECT tag FROM edge_tags WHERE edge_id=? ORDER BY tag");
-    tags.bind(1, id);
+    Statement tags(db, "SELECT tag FROM edge_tags WHERE edge_id=? ORDER BY tag", id);
     while (tags.row()) rec.tags.push_back(tags.text(0));
     return rec;
 }
@@ -142,8 +140,7 @@ std::vector<EdgeRecord> readEdgeRows(sqlite3* db, Statement& rows, const ObjectF
     const auto selection = ids.dump();
     Statement endpoints(db, "SELECT e.id,a.uuid,b.uuid FROM edges e "
         "JOIN objects a ON a.id=e.a_id JOIN objects b ON b.id=e.b_id "
-        "WHERE e.id IN (SELECT value FROM json_each(?))");
-    endpoints.bind(1, selection);
+        "WHERE e.id IN (SELECT value FROM json_each(?))", selection);
     while (endpoints.row()) {
         auto& edge = result.at(positions.at(endpoints.i64(0)));
         edge.aUuid = formatUuid(endpoints.blob16(1));
@@ -151,8 +148,7 @@ std::vector<EdgeRecord> readEdgeRows(sqlite3* db, Statement& rows, const ObjectF
     }
     if (wants(fields, "tags")) {
         Statement tags(db, "SELECT edge_id,tag FROM edge_tags "
-            "WHERE edge_id IN (SELECT value FROM json_each(?)) ORDER BY edge_id,tag");
-        tags.bind(1, selection);
+            "WHERE edge_id IN (SELECT value FROM json_each(?)) ORDER BY edge_id,tag", selection);
         while (tags.row()) result.at(positions.at(tags.i64(0))).tags.push_back(tags.text(1));
     }
     return result;
@@ -187,11 +183,8 @@ std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::strin
                     "changed_host,approval_state,approved_by,approved_at,approved_host,approved_generation,"
                     "a_anchor_x,a_anchor_y,a_anchor_z,a_dir_x,a_dir_y,a_dir_z,"
                     "b_anchor_x,b_anchor_y,b_anchor_z,b_dir_x,b_dir_y,b_dir_z,meta,a_dependencies,b_dependencies) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
-    s.bindBlob(1, parseUuid(rec.uuid));
-    s.bind(2, *aId); s.bind(3, *bId); s.bind(4, rec.kind); s.bind(5, int64_t(1));
-    s.bind(6, author); s.bind(7, now); s.bind(8, host);
-    s.bind(9, author); s.bind(10, now); s.bind(11, host);
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", parseUuid(rec.uuid),
+        *aId, *bId, rec.kind, int64_t(1), author, now, host, author, now, host);
     const std::string state = preserveRecord ? rec.approvalState : "pending";
     s.bind(12, state.empty() ? std::string("pending") : state);
     if (preserveRecord && rec.approvedBy) s.bind(13, *rec.approvedBy); else s.bindNull(13);
@@ -205,11 +198,10 @@ std::string addEdgeImpl(sqlite3* db, const std::string& author, const std::strin
     s.bind(31, dependenciesToJson(rec.bAnchor).dump());
     s.stepDone();
     const int64_t id = sqlite3_last_insert_rowid(db);
-    Statement binding(db, "INSERT INTO edge_geometry_bindings(edge_id,a_revision,b_revision) VALUES(?,"
+    execute(db, "INSERT INTO edge_geometry_bindings(edge_id,a_revision,b_revision) VALUES(?,"
         "(SELECT revision_uuid FROM geometry_heads WHERE object_uuid=?),"
-        "(SELECT revision_uuid FROM geometry_heads WHERE object_uuid=?))");
-    binding.bind(1, id); binding.bindBlob(2, parseUuid(rec.aUuid)); binding.bindBlob(3, parseUuid(rec.bUuid));
-    binding.stepDone();
+        "(SELECT revision_uuid FROM geometry_heads WHERE object_uuid=?))", id, parseUuid(rec.aUuid),
+        parseUuid(rec.bUuid));
     writeTags(db, "edge_tags", "edge_id", id, rec.tags);
     if (preserveRecord) restoreCommon(db, "edges", rec);
     appendJournal(db, author, host, parseUuid(rec.uuid), preserveRecord ? rec.generation : 1, preserveRecord ? importOperation : "add_edge");

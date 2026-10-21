@@ -22,16 +22,15 @@ CREATE TABLE edge_lifecycle_bindings(
 
 void detail::readLifecycle(sqlite3* db, int64_t id, ObjectRecord& record)
 {
-    Statement s(db, "SELECT retired,epoch FROM object_lifecycle WHERE object_id=?");
-    s.bind(1, id);
+    Statement s(db, "SELECT retired,epoch FROM object_lifecycle WHERE object_id=?", id);
     if (s.row()) { record.retired = s.i64(0); record.lifecycleEpoch = s.text(1); }
 }
 
 void detail::writeLifecycle(sqlite3* db, int64_t id, const ObjectRecord& record)
 {
-    Statement s(db, "INSERT INTO object_lifecycle VALUES(?,?,?) ON CONFLICT(object_id) "
-        "DO UPDATE SET retired=excluded.retired,epoch=excluded.epoch");
-    s.bind(1, id); s.bind(2, int64_t(record.retired)); s.bind(3, record.lifecycleEpoch); s.stepDone();
+    execute(db, "INSERT INTO object_lifecycle VALUES(?,?,?) ON CONFLICT(object_id) "
+        "DO UPDATE SET retired=excluded.retired,epoch=excluded.epoch", id, int64_t(record.retired),
+        record.lifecycleEpoch);
 }
 
 std::string detail::activeObjectSql(const std::string& id)
@@ -50,8 +49,8 @@ std::string detail::activeEdgeSql()
 
 std::pair<std::string, std::string> detail::lifecycleBinding(sqlite3* db, const EdgeRecord& edge)
 {
-    Statement s(db, "SELECT a_epoch,b_epoch FROM edge_lifecycle_bindings WHERE edge_id=(SELECT id FROM edges WHERE uuid=?)");
-    s.bindBlob(1, parseUuid(edge.uuid));
+    Statement s(db, "SELECT a_epoch,b_epoch FROM edge_lifecycle_bindings WHERE edge_id=(SELECT id FROM edges WHERE uuid=?)",
+        parseUuid(edge.uuid));
     return s.row() ? std::pair{s.text(0), s.text(1)} : std::pair<std::string, std::string>{};
 }
 
@@ -65,9 +64,9 @@ bool detail::lifecycleBindingMatches(sqlite3* db, const EdgeRecord& edge)
 
 void detail::bindLifecycle(sqlite3* db, const EdgeRecord& edge, const std::string& aEpoch, const std::string& bEpoch)
 {
-    Statement s(db, "INSERT INTO edge_lifecycle_bindings VALUES(?,?,?) ON CONFLICT(edge_id) "
-        "DO UPDATE SET a_epoch=excluded.a_epoch,b_epoch=excluded.b_epoch");
-    s.bind(1, *edgeIdByUuid(db, parseUuid(edge.uuid))); s.bind(2, aEpoch); s.bind(3, bEpoch); s.stepDone();
+    execute(db, "INSERT INTO edge_lifecycle_bindings VALUES(?,?,?) ON CONFLICT(edge_id) "
+        "DO UPDATE SET a_epoch=excluded.a_epoch,b_epoch=excluded.b_epoch", *edgeIdByUuid(db, parseUuid(edge.uuid)),
+        aEpoch, bEpoch);
 }
 
 namespace {
@@ -118,12 +117,11 @@ void ObjectStore::restoreObject(WriteTxn& txn, const std::string& uuid,
         // needs to rebuild the current spatial/materialized views.
         clearGeometryMaterialization(db, uuid);
         if (source->geometryRevision) {
-            Statement s(db, "INSERT INTO geometry_heads VALUES(?,?) ON CONFLICT(object_uuid) "
-                "DO UPDATE SET revision_uuid=excluded.revision_uuid");
-            s.bindBlob(1, parseUuid(uuid)); s.bindBlob(2, parseUuid(*source->geometryRevision)); s.stepDone();
+            execute(db, "INSERT INTO geometry_heads VALUES(?,?) ON CONFLICT(object_uuid) "
+                "DO UPDATE SET revision_uuid=excluded.revision_uuid", parseUuid(uuid),
+                parseUuid(*source->geometryRevision));
         } else {
-            Statement s(db, "DELETE FROM geometry_heads WHERE object_uuid=?");
-            s.bindBlob(1, parseUuid(uuid)); s.stepDone();
+            execute(db, "DELETE FROM geometry_heads WHERE object_uuid=?", parseUuid(uuid));
         }
     }
     auto restored = source->record;
@@ -133,9 +131,8 @@ void ObjectStore::restoreObject(WriteTxn& txn, const std::string& uuid,
     writeLifecycle(db, id, restored);
     if (oldGeometry != source->geometryRevision && source->geometryRevision) {
         const auto geometry = geometryRevision(txn, *source->geometryRevision);
-        Statement s(db, "UPDATE objects SET storage_kind='sqlite',storage_ref=?,data_checksum=?,data_generation=? WHERE id=?");
-        s.bind(1, source->record.storageRef); s.bind(2, geometry->contentHash);
-        s.bind(3, geometry->objectGeneration); s.bind(4, id); s.stepDone();
+        execute(db, "UPDATE objects SET storage_kind='sqlite',storage_ref=?,data_checksum=?,data_generation=? WHERE id=?",
+            source->record.storageRef, geometry->contentHash, geometry->objectGeneration, id);
     }
     if (oldGeometry != source->geometryRevision) refreshGeometryBounds(db, uuid);
     appendJournal(db, author(), hostname(), parseUuid(uuid), objectByUuid(txn, uuid)->generation, "restore");

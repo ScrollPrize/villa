@@ -64,9 +64,9 @@ auto readMethod()
 template<auto Method, class T = PyObjectStore>
 auto writeMethod()
 {
-    return []<class... Args>(void (vo::ObjectStore::*)(vo::WriteTxn&, Args...)) {
+    return []<class R, class... Args>(R (vo::ObjectStore::*)(vo::WriteTxn&, Args...)) {
         return [](T& self, Args... args) {
-            self.withWrite([&](auto& db, auto& txn) { (db.*Method)(txn, args...); });
+            return self.withWrite([&](auto& db, auto& txn) { return (db.*Method)(txn, args...); });
         };
     }(Method);
 }
@@ -111,9 +111,7 @@ nb::dict detectorReportToPy(const vc::object_links::DetectorReport& rep)
     d["edges_updated"] = rep.edgesUpdated;
     d["edges_skipped_existing"] = rep.edgesSkippedExisting;
     d["stale_removed"] = rep.staleRemoved;
-    nb::list problems;
-    for (const auto& p : rep.problems) problems.append(pyStr(p));
-    d["problems"] = problems;
+    d["problems"] = rep.problems;
     return d;
 }
 
@@ -221,12 +219,12 @@ void bindMutations(nb::class_<T>& cls)
             const auto edges = self.withRead([&](vo::ObjectStore& db, const vo::Txn& txn) {
                 return db.affectedGeometryEditEdges(txn, uuid, edits, expected);
             });
-            nb::list result; for (const auto& edge : edges) result.append(edgeToPy(edge)); return result;
+            return toPy(edges);
         }, nb::arg("object_uuid"), nb::arg("edits"), nb::arg("expected_revision"))
         .def("affected_geometry_edges", [](T& self, const std::string& uuid, const nb::object& input) {
             const auto data = geometryInputFromPy(input);
             auto edges = self.withRead([&](vo::ObjectStore& db, const vo::Txn& txn) { return db.affectedGeometryEdges(txn, uuid, data); });
-            nb::list result; for (const auto& edge : edges) result.append(edgeToPy(edge)); return result;
+            return toPy(edges);
         }, nb::arg("object_uuid"), nb::arg("geometry"))
         .def("repair_edge_geometry", [](T& self, const nb::dict& input) {
             const auto repair = repairFromPy(input);
@@ -412,7 +410,7 @@ NB_MODULE(_native, m)
             selection.endpointUuids = endpoints; selection.bothEndpoints = both;
             selection.tag = tag; selection.limit = limit; selection.afterUuid = after; selection.includeRetired = includeRetired;
             selection.adjacent = adjacent; selection.applicableOnly = applicableOnly;
-            const auto records = self.withRead<true>([&](auto& db, auto& txn) { return db.selectEdges(txn, selection, fields);); }
+            const auto records = self.withRead<true>([&](auto& db, auto& txn) { return db.selectEdges(txn, selection, fields); });
             const std::set<std::string> projection = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
             nb::list out; for (const auto& record : records) out.append(edgeToPy(record, fields ? &projection : nullptr));
             return out;
@@ -455,7 +453,7 @@ NB_MODULE(_native, m)
             vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset, bbox};
             selection.family = family; selection.minLength = minLength; selection.orderBy = orderBy;
             selection.afterUuid = afterUuid; selection.afterLength = afterLength; selection.includeRetired = includeRetired;
-            const auto records = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.selectObjects(txn, selection, fields);); }
+            const auto records = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.selectObjects(txn, selection, fields); });
             const std::set<std::string> selected = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
             nb::list result;
             for (const auto& record : records) result.append(objectToPy(record, fields ? &selected : nullptr));
@@ -475,7 +473,7 @@ NB_MODULE(_native, m)
             const std::optional<std::string>& family, const std::optional<double>& minLength, bool includeRetired) {
             vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset, bbox};
             selection.family = family; selection.minLength = minLength; selection.includeRetired = includeRetired;
-            const auto regions = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.spatialRegions(txn, selection);); }
+            const auto regions = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.spatialRegions(txn, selection); });
             nb::list result;
             for (const auto& r : regions) {
                 nb::dict row; row["object_uuid"] = r.objectUuid; row["kind"] = r.kind;
@@ -703,19 +701,11 @@ NB_MODULE(_native, m)
             const bool failed = nb::len(args) > 0 && !args[0].is_none();
             self.exit(failed);
         })
-        .def("retire_object", [](PyObjectWriteTxn& self, const std::string& uuid) {
-            self.owner->require().retireObject(self.require(), uuid);
-        }, nb::arg("uuid"))
-        .def("restore_object", [](PyObjectWriteTxn& self, const std::string& uuid,
-                                  const std::optional<std::string>& source) {
-            self.owner->require().restoreObject(self.require(), uuid, source);
-        }, nb::arg("uuid"), nb::arg("source_revision") = std::nullopt)
-        .def("retain_relationship", [](PyObjectWriteTxn& self, const std::string& uuid) {
-            self.owner->require().retainRelationship(self.require(), uuid);
-        }, nb::arg("edge_uuid"))
-        .def("keep_recorded_relationship", [](PyObjectWriteTxn& self, const std::string& uuid) {
-            self.owner->require().keepRecordedRelationship(self.require(), uuid);
-        }, nb::arg("edge_uuid"))
+        .def("retire_object", writeMethod<&vo::ObjectStore::retireObject, PyObjectWriteTxn>(), nb::arg("uuid"))
+        .def("restore_object", writeMethod<&vo::ObjectStore::restoreObject, PyObjectWriteTxn>(),
+             nb::arg("uuid"), nb::arg("source_revision") = std::nullopt)
+        .def("retain_relationship", writeMethod<&vo::ObjectStore::retainRelationship, PyObjectWriteTxn>(), nb::arg("edge_uuid"))
+        .def("keep_recorded_relationship", writeMethod<&vo::ObjectStore::keepRecordedRelationship, PyObjectWriteTxn>(), nb::arg("edge_uuid"))
         .def("update_edge", [](PyObjectWriteTxn& self, const nb::dict& record) {
             self.owner->require().updateEdge(self.require(), edgeFromPy(record));
         })

@@ -173,7 +173,7 @@ FiberRegionResult ObjectStore::fiberRegion(const ReadTxn& txn, const FiberSlice&
             for(int i=0;i<6;++i)candidates.bind(i+1,bounds[i]);
             candidates.bind(7,options.minLength);
             if(options.family)candidates.bind(8,*options.family);else candidates.bindNull(8);
-            if(selected)candidates.bindBlob(9,parseUuid(*selected));
+            if(selected)candidates.bind(9,parseUuid(*selected));
             while(candidates.row()) {
                 requestWork(&FiberRegionStats::candidateVisits);
                 process(formatUuid(candidates.blob16(0)),candidates.i64(1),formatUuid(candidates.blob16(2)),candidates.text(3));

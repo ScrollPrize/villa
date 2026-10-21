@@ -44,8 +44,7 @@ std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& opt
         "LEFT JOIN edge_geometry_bindings b ON b.edge_id=e.id "
         "JOIN objects a ON a.id=e.a_id JOIN objects z ON z.id=e.b_id "
         "LEFT JOIN geometry_heads ha ON ha.object_uuid=a.uuid LEFT JOIN geometry_heads hb ON hb.object_uuid=z.uuid "
-        "WHERE e.id IN (" + members + ")");
-    states.bind(1, included.dump());
+        "WHERE e.id IN (" + members + ")", included.dump());
     if (!options.selection.edgeKinds.empty()) states.bind(2, nlohmann::json(options.selection.edgeKinds).dump());
     std::map<std::string, EdgeGeometryState> geometryStates;
     while (states.row()) {
@@ -58,8 +57,8 @@ std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& opt
         if (state.aRevision != revision(3) || state.bRevision != revision(4)) state = edgeGeometryState(txn, id);
         geometryStates.emplace(id, std::move(state));
     }
-    Statement edges(db, "SELECT " + projectedEdgeColumns(edgeFields) + " FROM edges WHERE id IN (" + members + ") ORDER BY uuid");
-    edges.bind(1, included.dump());
+    Statement edges(db, "SELECT " + projectedEdgeColumns(edgeFields) + " FROM edges WHERE id IN (" + members + ") ORDER BY uuid",
+        included.dump());
     if (!options.selection.edgeKinds.empty()) edges.bind(2, nlohmann::json(options.selection.edgeKinds).dump());
     for (const auto& edge : readEdgeRows(db, edges, edgeFields)) {
         auto record = edgeToJson(edge, fields.empty() ? nullptr : &fields);

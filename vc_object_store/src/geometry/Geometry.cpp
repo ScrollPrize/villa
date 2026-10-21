@@ -33,8 +33,8 @@ constexpr const char* geometryColumns = "uuid,object_uuid,parent_uuid,content_ha
 std::optional<GeometryRevision> ObjectStore::geometryRevision(const Txn& txn, const std::string& revisionUuid) const
 {
     (void)connection(txn);
-    Statement s(static_cast<sqlite3*>(connection(txn)), std::string("SELECT ") + geometryColumns + " FROM geometry_revisions WHERE uuid=?");
-    s.bindBlob(1, parseUuid(revisionUuid));
+    Statement s(static_cast<sqlite3*>(connection(txn)), std::string("SELECT ") + geometryColumns + " FROM geometry_revisions WHERE uuid=?",
+        parseUuid(revisionUuid));
     return s.row() ? std::optional(readGeometryRevision(s)) : std::nullopt;
 }
 
@@ -48,8 +48,8 @@ std::optional<GeometryRevision> ObjectStore::currentGeometry(const Txn& txn, con
 std::vector<GeometryRevision> ObjectStore::geometryHistory(const Txn& txn, const std::string& objectUuid) const
 {
     (void)connection(txn);
-    Statement s(static_cast<sqlite3*>(connection(txn)), std::string("SELECT ") + geometryColumns + " FROM geometry_revisions WHERE object_uuid=? ORDER BY object_generation");
-    s.bindBlob(1, parseUuid(objectUuid));
+    Statement s(static_cast<sqlite3*>(connection(txn)), std::string("SELECT ") + geometryColumns + " FROM geometry_revisions WHERE object_uuid=? ORDER BY object_generation",
+        parseUuid(objectUuid));
     std::vector<GeometryRevision> result;
     while (s.row()) result.push_back(readGeometryRevision(s));
     return result;
@@ -142,9 +142,9 @@ void applyEdgeDecisions(ObjectStore& store, WriteTxn& txn, sqlite3* db,
 void writeRevision(sqlite3* db, const ObjectStore& store, const ObjectRecord& object,
     const std::string& uuid, const GeometryRevision* parent, const std::string& hash, const std::string& text)
 {
-    Statement revision(db, "INSERT INTO geometry_revisions VALUES(?,?,?,?,?,?,?,?,?)");
-    revision.bindBlob(1, parseUuid(uuid)); revision.bindBlob(2, parseUuid(object.uuid));
-    if (parent) revision.bindBlob(3, parseUuid(parent->uuid)); else revision.bindNull(3);
+    Statement revision(db, "INSERT INTO geometry_revisions VALUES(?,?,?,?,?,?,?,?,?)", parseUuid(uuid),
+        parseUuid(object.uuid));
+    if (parent) revision.bind(3, parseUuid(parent->uuid)); else revision.bindNull(3);
     revision.bind(4, hash); revision.bind(5, text); revision.bind(6, object.generation + 1);
     revision.bind(7, store.author()); revision.bind(8, nowIsoUtc()); revision.bind(9, store.hostname());
     revision.stepDone();
@@ -154,8 +154,8 @@ void stampGeometry(sqlite3* db, const ObjectStore& store, const std::string& obj
                    int64_t id, const std::string& hash)
 {
     stampContentChange(db, store.author(), store.hostname(), "objects", id, parseUuid(objectUuid), "geometry");
-    Statement update(db, "UPDATE objects SET storage_kind='sqlite',data_generation=generation,data_checksum=? WHERE id=?");
-    update.bind(1, hash); update.bind(2, id); update.stepDone();
+    execute(db, "UPDATE objects SET storage_kind='sqlite',data_generation=generation,data_checksum=? WHERE id=?", hash,
+        id);
 }
 
 void writeArrays(sqlite3* db, const std::string& revisionUuid,
@@ -178,8 +178,7 @@ void writeArrays(sqlite3* db, const std::string& revisionUuid,
                 std::memcmp(sqlite3_column_blob(verify.value, 0), bytes.data(), bytes.size()) != 0)
                 throw std::runtime_error("geometry: corrupt or colliding payload hash");
             if (geometryWork) geometryWork->readBytes[array.name] += bytes.size();
-            reference.reset(); reference.bindBlob(1, parseUuid(revisionUuid)); reference.bind(2, array.name);
-            reference.bind(3, static_cast<int64_t>(index)); reference.bind(4, hash); reference.stepDone();
+            reference.run(parseUuid(revisionUuid), array.name, static_cast<int64_t>(index), hash);
         });
     }
 
@@ -251,8 +250,8 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
     writeArrays(db, revisionUuid, data.arrays, manifest);
 
     detail::clearGeometryMaterialization(db, objectUuid);
-    Statement head(db, "INSERT INTO geometry_heads VALUES(?,?) ON CONFLICT(object_uuid) DO UPDATE SET revision_uuid=excluded.revision_uuid");
-    head.bindBlob(1, parseUuid(objectUuid)); head.bindBlob(2, parseUuid(revisionUuid)); head.stepDone();
+    execute(db, "INSERT INTO geometry_heads VALUES(?,?) ON CONFLICT(object_uuid) DO UPDATE SET revision_uuid=excluded.revision_uuid",
+        parseUuid(objectUuid), parseUuid(revisionUuid));
     const auto id = *objectIdByUuid(db, parseUuid(objectUuid));
     detail::indexGeometryBounds(db, id, revisionUuid, data);
     stampGeometry(db, *this, objectUuid, id, contentHash);
@@ -397,8 +396,7 @@ std::string detail::publishStructuralSnapshot(ObjectStore& store, WriteTxn& txn,
     writeRevision(db, store, object, uuid, &*current, hash, text);
     writeArrays(db,uuid,data.arrays,manifest); clearGeometryMaterialization(db,objectUuid);
     indexGeometryBounds(db,id,uuid,data);
-    Statement head(db,"UPDATE geometry_heads SET revision_uuid=? WHERE object_uuid=?");
-    head.bindBlob(1,parseUuid(uuid)); head.bindBlob(2,parseUuid(objectUuid)); head.stepDone();
+    execute(db,"UPDATE geometry_heads SET revision_uuid=? WHERE object_uuid=?", parseUuid(uuid), parseUuid(objectUuid));
     stampGeometry(db, store, objectUuid, id, hash);
     if (manifest.at("kind")=="point_collection" && changedIds && changedIds->first=="point_ids")
         updateSourcePointIdentities(db,objectUuid,current->uuid,uuid,manifest,changedIds->second);
@@ -429,8 +427,7 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
     const auto affected = affectedEdges(*this, txn, objectUuid, current, plan->after);
     const auto decisions = validateEdgeEdits(*this, txn, db, objectUuid, plan->after, affected, edgeEdits);
     auto encoded = encodeGeometryDelta(plan->changes);
-    Statement old(db, "SELECT manifest FROM geometry_revisions WHERE uuid=?");
-    old.bindBlob(1, parseUuid(current.uuid)); old.row();
+    Statement old(db, "SELECT manifest FROM geometry_revisions WHERE uuid=?", parseUuid(current.uuid)); old.row();
     const auto previous = loadGeometryManifest(db, current.uuid, old.text(0), current.contentHash);
     encoded.description["base"] = previous.contains("delta") ? previous.at("delta").at("base") : nlohmann::json(current.uuid);
     encoded.description["parent_hash"] = current.contentHash;
@@ -441,10 +438,7 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
     const auto text = descriptor.dump(), hash = hashText(plan->manifest.dump()), uuid = util::newUuid();
     Savepoint savepoint(db);
     writeRevision(db, *this, object, uuid, &current, hash, text);
-    Statement payload(db, "INSERT INTO geometry_deltas VALUES(?,?,?)");
-    payload.bindBlob(1, parseUuid(uuid));
-    check(sqlite3_bind_blob64(payload.value, 2, encoded.bytes.data(), encoded.bytes.size(), SQLITE_TRANSIENT), db);
-    payload.bind(3, hashText(text)); payload.stepDone();
+    execute(db, "INSERT INTO geometry_deltas VALUES(?,?,?)", parseUuid(uuid), encoded.bytes, hashText(text));
     // A snapshot head has no mutable overlay. Delta heads preserve unchanged
     // overlay chunks; replacing changed rows never retains full old tiles.
     if (!previous.contains("delta")) clearGeometryMaterialization(db, objectUuid);
@@ -452,14 +446,12 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
         "DO UPDATE SET hash=excluded.hash,data=excluded.data");
     for (const auto& change : plan->changes) {
         const auto& bytes = plan->modified.at(change.key);
-        put.reset(); put.bindBlob(1, parseUuid(objectUuid)); put.bind(2, change.key.first); put.bind(3, change.key.second); put.bind(4, change.afterHash);
-        check(sqlite3_bind_blob64(put.value, 5, bytes.data(), bytes.size(), SQLITE_TRANSIENT), db); put.stepDone();
+        put.run(parseUuid(objectUuid), change.key.first, change.key.second, change.afterHash, bytes);
     }
-    Statement materialized(db, "INSERT INTO geometry_materializations VALUES(?,?,?) ON CONFLICT(object_uuid) "
-        "DO UPDATE SET revision_uuid=excluded.revision_uuid,manifest=excluded.manifest");
-    materialized.bindBlob(1, parseUuid(objectUuid)); materialized.bindBlob(2, parseUuid(uuid)); materialized.bind(3, plan->manifest.dump()); materialized.stepDone();
-    Statement head(db, "UPDATE geometry_heads SET revision_uuid=? WHERE object_uuid=?");
-    head.bindBlob(1, parseUuid(uuid)); head.bindBlob(2, parseUuid(objectUuid)); head.stepDone();
+    execute(db, "INSERT INTO geometry_materializations VALUES(?,?,?) ON CONFLICT(object_uuid) "
+        "DO UPDATE SET revision_uuid=excluded.revision_uuid,manifest=excluded.manifest", parseUuid(objectUuid),
+        parseUuid(uuid), plan->manifest.dump());
+    execute(db, "UPDATE geometry_heads SET revision_uuid=? WHERE object_uuid=?", parseUuid(uuid), parseUuid(objectUuid));
     const auto id = *objectIdByUuid(db, parseUuid(objectUuid));
     updateEditedGeometryBounds(db, id, uuid, edits);
     stampGeometry(db, *this, objectUuid, id, hash);
@@ -535,8 +527,7 @@ std::string ObjectStore::updateSurfaceChannels(WriteTxn& txn, const std::string&
     writeRevision(db, *this, object, uuid, &*current, hash, text);
     writeArrays(db, uuid, channels, manifest);
     clearGeometryMaterialization(db, objectUuid);
-    Statement head(db, "UPDATE geometry_heads SET revision_uuid=? WHERE object_uuid=?");
-    head.bindBlob(1, parseUuid(uuid)); head.bindBlob(2, parseUuid(objectUuid)); head.stepDone();
+    execute(db, "UPDATE geometry_heads SET revision_uuid=? WHERE object_uuid=?", parseUuid(uuid), parseUuid(objectUuid));
     const auto id = *objectIdByUuid(db, parseUuid(objectUuid));
     updateEditedGeometryBounds(db, id, uuid, {});
     stampGeometry(db, *this, objectUuid, id, hash);

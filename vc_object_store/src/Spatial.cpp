@@ -80,15 +80,13 @@ void writeBounds(sqlite3* db, int64_t objectId, const std::optional<Bounds>& bou
                  const std::optional<std::string>& revision)
 {
     if (!bounds) {
-        Statement remove(db, "DELETE FROM object_bounds WHERE object_id=?");
-        remove.bind(1, objectId); remove.stepDone(); return;
+        execute(db, "DELETE FROM object_bounds WHERE object_id=?", objectId); return;
     }
     validateBounds(*bounds);
     Statement put(db, "INSERT INTO object_bounds VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(object_id) DO UPDATE SET "
         "revision_uuid=excluded.revision_uuid,min_x=excluded.min_x,min_y=excluded.min_y,min_z=excluded.min_z,"
-        "max_x=excluded.max_x,max_y=excluded.max_y,max_z=excluded.max_z");
-    put.bind(1, objectId);
-    if (revision) put.bindBlob(2, parseUuid(*revision)); else put.bindNull(2);
+        "max_x=excluded.max_x,max_y=excluded.max_y,max_z=excluded.max_z", objectId);
+    if (revision) put.bind(2, parseUuid(*revision)); else put.bindNull(2);
     for (size_t i = 0; i < 6; ++i) put.bind(int(i) + 3, (*bounds)[i]);
     put.stepDone();
 }
@@ -135,8 +133,8 @@ void indexGeometry(sqlite3* db, int64_t objectId, const std::string& revision,
     std::map<RegionKey, Region> previous;
     {
         Statement old(db, "SELECT id,array_name,row_start,col_start,row_count,col_count,"
-            "min_x,min_y,min_z,max_x,max_y,max_z FROM spatial_regions WHERE object_id=? AND array_name!=''");
-        old.bind(1, objectId);
+            "min_x,min_y,min_z,max_x,max_y,max_z FROM spatial_regions WHERE object_id=? AND array_name!=''",
+            objectId);
         while (old.row()) {
             Region r{old.i64(0), old.i64(4), old.i64(5), {}};
             for (int i = 0; i < 6; ++i) r.bounds[i] = old.f64(i + 6);
@@ -236,8 +234,8 @@ void indexGeometryBounds(sqlite3* db, int64_t objectId, const std::string& revis
 
 void refreshGeometryBounds(sqlite3* db, const std::string& objectUuid)
 {
-    Statement head(db, "SELECT o.id,h.revision_uuid FROM objects o JOIN geometry_heads h ON h.object_uuid=o.uuid WHERE o.uuid=?");
-    head.bindBlob(1, parseUuid(objectUuid));
+    Statement head(db, "SELECT o.id,h.revision_uuid FROM objects o JOIN geometry_heads h ON h.object_uuid=o.uuid WHERE o.uuid=?",
+        parseUuid(objectUuid));
     if (!head.row()) return;
     const auto revision = formatUuid(head.blob16(1));
     GeometryReader reader(db, revision);
@@ -296,8 +294,7 @@ void updateEditedGeometryBounds(sqlite3* db, int64_t objectId, const std::string
         writer.update(name, row, col, rows, cols, bounds.bounds);
     }
     Statement total(db, "SELECT min(min_x),min(min_y),min(min_z),max(max_x),max(max_y),max(max_z) "
-                        "FROM spatial_regions WHERE object_id=? AND array_name!=''");
-    total.bind(1, objectId); total.row();
+                        "FROM spatial_regions WHERE object_id=? AND array_name!=''", objectId); total.row();
     std::optional<Bounds> bounds;
     if (!total.isNull(0)) {
         bounds.emplace();

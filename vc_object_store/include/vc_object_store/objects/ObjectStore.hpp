@@ -17,11 +17,8 @@
 
 namespace vc::objects {
 
-// Typed detail fields are editable source/import annotations. Counts, lengths,
-// dimensions and boxes are summaries captured at ingestion, not live views of
-// managed geometry. Use currentGeometry() for current array shapes/patch scale,
-// and selectObjects()/spatialRegions() for revision-consistent spatial bounds.
-// putGeometry() deliberately does not overwrite these annotations.
+// Editable ingestion summaries; putGeometry() leaves them unchanged. For live
+// shapes/scale use currentGeometry(); for bounds use selectObjects()/spatialRegions().
 struct FiberDetail {
     std::string family;          // "H", "V", or "" (unset)
     bool manualFamily = false;
@@ -50,9 +47,7 @@ struct TrackDetail {
     std::optional<std::array<double, 6>> bbox;
 };
 
-// Fields shared by every record (object or edge). Library-managed
-// fields (generation, stamps, approval) are read-only to callers:
-// values set on input structs are ignored on write.
+// Generation, stamps and approval are library-managed and ignored on write.
 struct RecordCommon {
     std::string uuid;  // canonical text; empty on create = mint a new one
     std::string kind;  // required, non-empty
@@ -93,12 +88,10 @@ struct PointReference {
 struct Anchor {
     std::optional<std::array<double, 3>> position;
     std::optional<std::array<double, 3>> direction;
-    // Exact geometry dependencies, including any neighbours used by a
-    // direction/interpolated anchor. Empty means unknown, not independent.
+    // Include interpolation/direction neighbours. Empty means unknown dependencies.
     std::vector<PointReference> points;
     bool wholeGeometry = false; // explicit object-wide relationship
-    // Top-level ordinary metadata keys that affect this relationship.
-    // Changing these requires an explicit retain/update/remove decision.
+    // Dependent top-level metadata keys; edits require explicit relationship decisions.
     std::vector<std::string> metadataKeys;
     // Whole named surface channels, including presence, layout and values.
     std::vector<std::string> channels;
@@ -127,9 +120,8 @@ struct ObjectRevision {
     ObjectRecord record;
 };
 
-// Shared edges are owned by both endpoints. Adding, changing or removing one
-// revises both objects in the same transaction. Unchanged membership is inherited.
-// Pins never follow heads: resolve aRevision/bRevision with objectRevision().
+// Edge changes revise both endpoints atomically; unchanged membership is inherited.
+// Pins are immutable objectRevision() UUIDs, never moving heads.
 struct RelationshipRevision {
     std::string uuid;
     EdgeRecord record;
@@ -139,8 +131,7 @@ struct RelationshipRevision {
 
 struct SelectedRelationship {
     RelationshipRevision relationship;
-    // Both selected endpoints must contain this version and its declared
-    // dependencies must still match. Unrelated metadata edits remain applicable.
+    // Both selected endpoints contain this version and its dependencies still match.
     bool applicable = false;
 };
 
@@ -202,9 +193,8 @@ struct EdgeSelection {
     bool applicableOnly = false;
 };
 
-// Compact topology read from one store transaction. No separate persistent
-// representation. Parallel edges retain identity; each has two CSR incidences,
-// including self-links. Node order follows the object selection.
+// Snapshot topology in selection order. Every edge, including self/parallel edges,
+// retains its identity and has two CSR incidences.
 struct GraphReadView {
     std::vector<std::string> objectUuids, edgeUuids;
     std::vector<std::optional<std::string>> geometryRevisions;
@@ -230,10 +220,9 @@ struct PackedGeometryArray {
     std::vector<uint64_t> offsets{0};
     std::vector<uint8_t> data;
 };
-// A conservative candidate, not an exact geometry hit. start/shape index
-// vertices (excluding XYZ); adjacent surface tiles and polyline blocks share
-// their boundary vertices. Empty arrayName/start/shape denotes an external
-// object's annotated box. Bounds and revision come from the same snapshot.
+// Conservative bounds from one snapshot. start/shape index vertices, excluding XYZ;
+// adjacent tiles/blocks share boundary vertices. Empty arrayName/start/shape means
+// an external object's annotated box.
 struct SpatialRegion {
     std::string objectUuid, kind, arrayName;
     std::optional<std::string> revisionUuid;
@@ -302,9 +291,7 @@ struct EdgeGeometryState {
     bool stale = false;
 };
 
-// A repair computed from one read snapshot. Anchors and revisions use the
-// stored edge's a/b order (edgeByUuid), not caller-selected endpoint order.
-// Null revisions explicitly mean the endpoint has no managed geometry.
+// Snapshot repair in edgeByUuid() endpoint order. Null revisions mean no geometry.
 struct EdgeGeometryRepair {
     std::string edgeUuid;
     int64_t expectedGeneration = 0;
@@ -342,26 +329,22 @@ public:
     // Typed, bounded geometry reads. Include store/GeometryViews.hpp to use.
     GeometrySnapshot geometrySnapshot();
     WriteTxn write();
-    // Optimistic action: check every supplied head before making changes and
-    // require an expectation for every modified object and relationship endpoint.
-    // One commit publishes one object revision per changed object. Any missing
-    // expectation or conflict rolls back the ENTIRE transaction, even if caught.
-    // Use this overload for edits prepared outside the writer transaction.
+    // Check supplied heads before editing; require every changed object/endpoint.
+    // Commit publishes one revision per changed object. Missing expectations or
+    // conflicts abort the whole transaction, even if caught.
     WriteTxn write(const RevisionSelection& expected);
     std::optional<ObjectRevision> currentObjectRevision(const Txn&, const std::string& objectUuid) const;
     std::optional<ObjectRevision> objectRevision(const Txn&, const std::string& revisionUuid) const;
     std::vector<ObjectRevision> objectHistory(const Txn&, const std::string& objectUuid) const;
-    // Latest revision of each live object at or before this publication time.
-    // All objects changed by an action have the same timestamp; no partial action
-    // can be selected. Empty before the first publication. Deletions are excluded.
+    // Latest live revisions at/before this time; actions are indivisible.
+    // Empty before the first publication; excludes deletions.
     RevisionSelection revisionSelectionAt(const Txn&, int64_t publishedAtUs, bool includeRetired = false) const;
     std::vector<RelationshipRevision> recordedRelationships(const Txn&, const std::string& objectRevisionUuid) const;
     // Explicit, closed selection: omitted endpoints are not selected. null
     // selects the latest head (unlike write(), where null expects absence).
     std::vector<SelectedRelationship> relationshipsAt(const Txn&, const RevisionSelection&) const;
-    // Explicitly validate and retain an existing relationship against the
-    // resulting endpoint state, including metadataKeys. Call after endpoint edits.
-    // Domain-specific meaning is the caller's decision; the store checks anchors.
+    // After endpoint edits, validate anchors/metadataKeys and retain the relationship.
+    // The caller decides domain meaning.
     void retainRelationship(WriteTxn&, const std::string& edgeUuid);
     // Keep historical pins after an endpoint edit without asserting that the
     // relationship applies to the edited endpoint. Current queries may be stale.
@@ -382,9 +365,8 @@ public:
     // Clears sync history; synchronize with the original before editing either copy.
     std::string forkReplica();
 
-    // Objects. upsertObject creates (minting a UUID when record.uuid is
-    // empty) or updates by UUID; updates bump generation, restamp
-    // changed_*, reset approval, and journal. Returns the UUID.
+    // Create/update by UUID (mint one if empty). Updates bump generation, stamp
+    // changed_*, reset approval and journal. Returns the UUID.
     std::string upsertObject(WriteTxn& txn, const ObjectRecord& record);
     std::optional<ObjectRecord> objectByUuid(const Txn& txn, const std::string& uuid) const;
     std::vector<ObjectRecord> objectsByKind(const Txn& txn, const std::string& kind,
@@ -400,19 +382,16 @@ public:
                        const std::optional<std::string>& sourceRevision = std::nullopt);
     void deleteObject(WriteTxn& txn, const std::string& uuid);  // fails while edges or retained geometry reference it
 
-    // Immutable geometry. A null expectedRevision means "expect no geometry";
-    // pass the current revision UUID to replace it. Stale writers fail, even
-    // when their proposed bytes match. Identical current content is a no-op.
-    // Every affected edge requires an explicit retain/update/remove decision.
-    // The write is savepoint-protected. Identical content is always a no-op.
+    // Savepoint-protected replacement; null expectedRevision expects no geometry.
+    // Stale writers fail; identical current content is a no-op. Every affected
+    // edge requires an explicit retain/update/remove decision.
     std::string putGeometry(WriteTxn& txn, const std::string& objectUuid,
                             const GeometryData& data,
                             const std::optional<std::string>& expectedRevision = std::nullopt,
                             const std::vector<GeometryEdgeEdit>& edgeEdits = {},
                             const GeometryStorageOptions& storage = {});
-    // Preview the relationships whose declared point dependencies change.
-    // Unknown dependencies are included and require update (with explicit
-    // dependencies) or removal. Does not publish geometry or modify edges.
+    // Preview changed point dependencies without writing. Unknown dependencies
+    // require explicit update or removal.
     std::vector<EdgeRecord> affectedGeometryEdges(const Txn&, const std::string& objectUuid,
                                                 const GeometryData&) const;
     // Sparse, lossless, compressed edits. One call publishes one revision in
@@ -443,9 +422,8 @@ public:
     PackedGeometryArray readGeometryArrays(const Txn&, const std::vector<std::string>& revisionUuids,
         const std::string& arrayName) const;
 
-    // Add/replace only supplied channels; remove named channels. Never resize
-    // points or read/rehash unchanged arrays. Uses ordinary geometry/object
-    // revision checks and relationship decisions. "points" is reserved.
+    // Add/replace/remove channels with checked revisions and relationship decisions.
+    // Never resize points or read/rehash unchanged arrays. "points" is reserved.
     std::string updateSurfaceChannels(WriteTxn&, const std::string& objectUuid,
         const std::vector<GeometryArray>& channels, const std::vector<std::string>& remove,
         const std::string& expectedRevision, const std::vector<GeometryEdgeEdit>& edgeEdits = {});
@@ -480,9 +458,7 @@ public:
     std::vector<std::vector<uint8_t>> readGeometryRectangles(const Txn&, const std::string& revisionUuid,
         const std::string& arrayName, const std::vector<std::array<int64_t, 4>>& rectangles) const;
 
-    // Approval: one generic call for objects and edges. Stamps the
-    // current generation without bumping it. State must be
-    // "pending", "approved" or "rejected".
+    // Stamp current generation without bumping it: pending, approved or rejected.
     void setApproval(WriteTxn& txn, const std::string& recordUuid, const std::string& state);
 
     // Open-ended metadata: single-key atomic updates via SQLite JSON1.
@@ -498,10 +474,8 @@ public:
     std::vector<JournalEntry> journalSince(const Txn& txn, int64_t afterSeq) const;
 
     EdgeGeometryState edgeGeometryState(const Txn& txn, const std::string& edgeUuid) const;
-    // Publish corrected anchors and exact checked revision bindings together.
-    // Reject changed edge generations or endpoint heads, even for a no-op.
-    // Preserves other edge metadata, resets approval, and journals one change.
-    // Savepoint-protected; identical anchors/bindings are a complete no-op.
+    // Atomically repair anchors/bindings, checking edge generation and endpoint heads.
+    // Preserves other metadata, resets approval and journals. Identical input is a no-op.
     void repairEdgeGeometry(WriteTxn&, const EdgeGeometryRepair&);
 
 
@@ -534,13 +508,9 @@ public:
                                         const std::optional<std::string>& neighbourKind = std::nullopt, bool includeRetired = false,
                                         std::optional<bool> adjacent = std::nullopt, bool applicableOnly = false) const;
 
-    // Indexed traversal, filtered by edgeKindFilter when non-empty. An explicit
-    // adjacent=false selects same-winding fiber links and always excludes
-    // adjacent links. applicableOnly requires a ReadTxn and checks latest heads.
-    // When
-    // cancel is given and becomes true, the traversal aborts with a
-    // "cancelled" runtime_error (SQLite progress handler during SQL,
-    // checked each BFS step in memory); safe to set from another thread.
+    // Indexed traversal; empty edgeKindFilter means all kinds. adjacent=false
+    // excludes adjacent fiber links. applicableOnly requires ReadTxn/latest heads.
+    // Setting cancel from another thread aborts SQL/BFS with a "cancelled" runtime_error.
     std::vector<std::string> componentOf(const Txn& txn, const std::string& objectUuid,
                                          const std::vector<std::string>& edgeKindFilter = {},
                                          const std::atomic_bool* cancel = nullptr, bool includeRetired = false,
@@ -567,15 +537,10 @@ public:
     std::string exportJson(const Txn&, const JsonExportOptions& = {}) const;
     void importJson(WriteTxn&, const std::string&);
 
-    // Resolve a file-backed patch/fiber/point_collection by its source UUID.
-    // First verify storageRef against meta.json or the source JSON, then search
-    // datasetRoot recursively if the hint is stale. The default root is
-    // the DB directory; an explicit root also rebases relative hints.
-    // Returns an absolute path, or nullopt for unknown/unsupported/missing
-    // objects. Throws on ambiguous fallback matches or traversal errors.
-    // Discovery skips hidden directories and Zarr stores, does not follow
-    // directory symlinks, and reads JSON only (no geometry). No DB writes
-    // or persistent cache: subsequent calls see renamed/replaced files.
+    // Resolve patch/fiber/point_collection source UUIDs: verify storageRef, then
+    // search datasetRoot (default: DB directory; also rebases relative hints).
+    // Read JSON only; skip hidden/Zarr directories and directory symlinks. No cache
+    // or writes. Return an absolute path or nullopt; ambiguity/traversal errors throw.
     std::optional<std::filesystem::path> resolveStoragePath(
         const Txn& txn, const std::string& objectUuid,
         const std::optional<std::filesystem::path>& datasetRoot = std::nullopt) const;

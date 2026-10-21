@@ -24,14 +24,13 @@ void ObjectStore::setApproval(WriteTxn& txn, const std::string& recordUuid, cons
     const auto [table, id] = recordLocation(db, bytes, recordUuid);
     int64_t generation;
     {
-        Statement cur(db, std::string("SELECT generation FROM ") + table + " WHERE id=?");
-        cur.bind(1, id);
+        Statement cur(db, std::string("SELECT generation FROM ") + table + " WHERE id=?", id);
         (void)cur.row();
         generation = cur.i64(0);
     }
     Statement s(db, std::string("UPDATE ") + table +
-                        " SET approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_generation=? WHERE id=?");
-    s.bind(1, state);
+                        " SET approval_state=?,approved_by=?,approved_at=?,approved_host=?,approved_generation=? WHERE id=?",
+        state);
     if (state == "pending") {
         s.bindNull(2); s.bindNull(3); s.bindNull(4); s.bindNull(5);
     } else {
@@ -60,8 +59,7 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
     // distinct; removing a missing key is also a no-op. Keep approval/history
     // untouched when an autosave submits the same logical value.
     {
-        Statement current(db, std::string("SELECT meta FROM ") + table + " WHERE id=?");
-        current.bind(1, id);
+        Statement current(db, std::string("SELECT meta FROM ") + table + " WHERE id=?", id);
         (void)current.row();
         const auto meta = nlohmann::json::parse(current.text(0));
         const auto found = meta.find(key);
@@ -72,16 +70,10 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
         }
     }
     if (jsonValue) {
-        Statement s(db, std::string("UPDATE ") + table + " SET meta=json_set(meta,?,json(?)) WHERE id=?");
-        s.bind(1, path);
-        s.bind(2, *jsonValue);
-        s.bind(3, id);
-        s.stepDone();
+        execute(db, std::string("UPDATE ") + table + " SET meta=json_set(meta,?,json(?)) WHERE id=?", path, *jsonValue,
+            id);
     } else {
-        Statement s(db, std::string("UPDATE ") + table + " SET meta=json_remove(meta,?) WHERE id=?");
-        s.bind(1, path);
-        s.bind(2, id);
-        s.stepDone();
+        execute(db, std::string("UPDATE ") + table + " SET meta=json_remove(meta,?) WHERE id=?", path, id);
     }
     stampContentChange(db, author, host, table, id, bytes, "meta");
     savepoint.release();
@@ -111,8 +103,8 @@ std::vector<JournalEntry> ObjectStore::journalSince(const Txn& txn, int64_t afte
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Statement s(db, "SELECT seq,record_uuid,generation,author,hostname,timestamp,change_kind,"
-                    "approval_state,approved_by,approved_at,approved_host,approved_generation FROM journal WHERE seq>? ORDER BY seq");
-    s.bind(1, afterSeq);
+                    "approval_state,approved_by,approved_at,approved_host,approved_generation FROM journal WHERE seq>? ORDER BY seq",
+        afterSeq);
     std::vector<JournalEntry> out;
     while (s.row()) {
         JournalEntry e;

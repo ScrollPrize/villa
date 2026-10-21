@@ -37,8 +37,7 @@ void applyObjects(ObjectStore& store, WriteTxn& txn, const Json& before, const J
         if (object(record) && !merged.contains(id)) store.deleteObject(txn, id);
     // Release track identity constraints for all changed records before restoring details.
     for (const auto& [id, record] : merged.items()) if (object(record) && record != at(before, id)) {
-        Statement remove(db, "DELETE FROM tracks WHERE object_id=(SELECT id FROM objects WHERE uuid=?)");
-        remove.bindBlob(1, parseUuid(id)); remove.stepDone();
+        execute(db, "DELETE FROM tracks WHERE object_id=(SELECT id FROM objects WHERE uuid=?)", parseUuid(id));
     }
     for (const auto& [id, record] : merged.items()) if (object(record) && record != at(before, id)) {
         auto value = objectFromJson(record); commonFromJson(record, value);
@@ -51,18 +50,18 @@ void applyHeadsAndEdges(ObjectStore& store, WriteTxn& txn, const Json& before, c
     auto* db = ObjectStoreImplAccess::conn(txn);
     for (const auto& [id, record] : merged.items()) if (object(record) && record != at(before, id)) {
         if (head(record) != nullptr) {
-            Statement put(db, "INSERT INTO geometry_heads VALUES(?,?) ON CONFLICT(object_uuid) DO UPDATE SET revision_uuid=excluded.revision_uuid");
-            put.bindBlob(1, parseUuid(id)); put.bindBlob(2, parseUuid(head(record).get<std::string>())); put.stepDone();
+            execute(db, "INSERT INTO geometry_heads VALUES(?,?) ON CONFLICT(object_uuid) DO UPDATE SET revision_uuid=excluded.revision_uuid",
+                parseUuid(id), parseUuid(head(record).get<std::string>()));
             if (head(record) != head(at(before, id))) {
                 detail::materializeGeometry(db, id, head(record).get<std::string>());
                 detail::refreshGeometryBounds(db, id);
             }
         }
-        Statement storage(db, "UPDATE objects SET storage_kind=?,storage_ref=?,data_generation=?,data_checksum=? WHERE uuid=?");
-        storage.bind(1, record.at("storage_kind").get<std::string>()); storage.bind(2, record.at("storage_ref").get<std::string>());
-        storage.bind(3, record.at("data_generation").get<int64_t>());
+        Statement storage(db, "UPDATE objects SET storage_kind=?,storage_ref=?,data_generation=?,data_checksum=? WHERE uuid=?",
+            record.at("storage_kind").get<std::string>(), record.at("storage_ref").get<std::string>(),
+            record.at("data_generation").get<int64_t>());
         if (record.contains("data_checksum")) storage.bind(4, record.at("data_checksum").get<std::string>()); else storage.bindNull(4);
-        storage.bindBlob(5, parseUuid(id)); storage.stepDone();
+        storage.bind(5, parseUuid(id)); storage.stepDone();
     }
     for (const auto& [id, record] : merged.items()) if (!object(record) && record != at(before, id)) {
         auto edge = edgeFromJson(record);
@@ -74,9 +73,9 @@ void applyHeadsAndEdges(ObjectStore& store, WriteTxn& txn, const Json& before, c
         const auto bindings = record.value("geometry_bindings", Json::object());
         const auto a = bindings.value(swap ? "b" : "a", Json()), b = bindings.value(swap ? "a" : "b", Json());
         Statement put(db, "UPDATE edge_geometry_bindings SET a_revision=?,b_revision=? WHERE edge_id=(SELECT id FROM edges WHERE uuid=?)");
-        if (a.is_null()) put.bindNull(1); else put.bindBlob(1, parseUuid(a.get<std::string>()));
-        if (b.is_null()) put.bindNull(2); else put.bindBlob(2, parseUuid(b.get<std::string>()));
-        put.bindBlob(3, parseUuid(id)); put.stepDone();
+        if (a.is_null()) put.bindNull(1); else put.bind(1, parseUuid(a.get<std::string>()));
+        if (b.is_null()) put.bindNull(2); else put.bind(2, parseUuid(b.get<std::string>()));
+        put.bind(3, parseUuid(id)); put.stepDone();
     }
 }
 }
@@ -89,7 +88,7 @@ std::string ObjectStore::replicaUuid(const Txn& txn) const {
 std::string ObjectStore::forkReplica() {
     auto txn = write(); auto* db = static_cast<sqlite3*>(connection(txn));
     const auto id = util::newUuid();
-    Statement set(db, "UPDATE sync_replica SET uuid=? WHERE singleton=1"); set.bind(1, id); set.stepDone();
+    execute(db, "UPDATE sync_replica SET uuid=? WHERE singleton=1", id);
     exec(db, "DELETE FROM sync_baselines"); txn.commit(); return id;
 }
 SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& options)
@@ -154,8 +153,8 @@ SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& option
                      r.value("lifecycle_epoch", "") != (b.is_object() ? b.value("lifecycle_epoch", "") : ""))) {
                     for (auto* db : {localDb, remoteDb}) {
                         Statement edges(db, "SELECT uuid FROM edges WHERE a_id=(SELECT id FROM objects WHERE uuid=?1) "
-                                            "OR b_id=(SELECT id FROM objects WHERE uuid=?1)");
-                        edges.bindBlob(1, parseUuid(id));
+                                            "OR b_id=(SELECT id FROM objects WHERE uuid=?1)",
+                            parseUuid(id));
                         while (edges.row()) ids.insert(formatUuid(edges.blob16(0)));
                     }
                 }

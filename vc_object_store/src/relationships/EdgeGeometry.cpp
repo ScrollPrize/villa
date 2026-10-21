@@ -42,10 +42,10 @@ void ObjectStore::repairEdgeGeometry(WriteTxn& txn, const EdgeGeometryRepair& re
     bindAnchor(anchors, 1, a); bindAnchor(anchors, 7, b);
     anchors.bind(13, dependenciesToJson(a).dump()); anchors.bind(14, dependenciesToJson(b).dump());
     anchors.bind(15, id); anchors.stepDone();
-    Statement binding(db, "INSERT INTO edge_geometry_bindings VALUES(?,?,?) ON CONFLICT(edge_id) DO UPDATE SET a_revision=excluded.a_revision,b_revision=excluded.b_revision");
-    binding.bind(1, id);
-    if (aRevision) binding.bindBlob(2, parseUuid(*aRevision)); else binding.bindNull(2);
-    if (bRevision) binding.bindBlob(3, parseUuid(*bRevision)); else binding.bindNull(3);
+    Statement binding(db, "INSERT INTO edge_geometry_bindings VALUES(?,?,?) ON CONFLICT(edge_id) DO UPDATE SET a_revision=excluded.a_revision,b_revision=excluded.b_revision",
+        id);
+    if (aRevision) binding.bind(2, parseUuid(*aRevision)); else binding.bindNull(2);
+    if (bRevision) binding.bind(3, parseUuid(*bRevision)); else binding.bindNull(3);
     binding.stepDone();
     stampContentChange(db, author(), hostname(), "edges", id, parseUuid(repair.edgeUuid), "geometry_repaired");
     recordRelationshipValidation(db, normalized);
@@ -59,8 +59,8 @@ EdgeGeometryState ObjectStore::edgeGeometryState(const Txn& txn, const std::stri
     auto* db = static_cast<sqlite3*>(connection(txn));
     const auto edge = edgeByUuid(txn, edgeUuid);
     if (!edge) throw std::invalid_argument("geometry: edge not found");
-    Statement binding(db, "SELECT b.a_revision,b.b_revision FROM edge_geometry_bindings b JOIN edges e ON e.id=b.edge_id WHERE e.uuid=?");
-    binding.bindBlob(1, parseUuid(edgeUuid));
+    Statement binding(db, "SELECT b.a_revision,b.b_revision FROM edge_geometry_bindings b JOIN edges e ON e.id=b.edge_id WHERE e.uuid=?",
+        parseUuid(edgeUuid));
     EdgeGeometryState result;
     if (binding.row()) {
         if (!binding.isNull(0)) result.aRevision = formatUuid(binding.blob16(0));

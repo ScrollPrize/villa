@@ -32,7 +32,8 @@ CREATE INDEX geometry_dependencies_edge ON geometry_edge_dependencies(edge_id);
 }
 std::vector<EdgeRecord> structuralEdgeCandidates(sqlite3* db,const std::string& uuid,const std::string& array,const std::vector<int64_t>& ids) {
     const auto object=*objectIdByUuid(db,parseUuid(uuid));std::set<int64_t> candidates;
-    Statement global(db,"SELECT edge_id FROM geometry_edge_dependencies WHERE object_id=? AND array_name='' AND point_id=-1");global.bind(1,object);
+    Statement global(db,"SELECT edge_id FROM geometry_edge_dependencies WHERE object_id=? AND array_name='' AND point_id=-1",
+        object);
     while(global.row())candidates.insert(global.i64(0));
     Statement points(db,"SELECT edge_id FROM geometry_edge_dependencies WHERE object_id=? AND array_name=? AND point_id=?");
     for(auto id:ids) {points.reset();points.bind(1,object);points.bind(2,array);points.bind(3,id);while(points.row())candidates.insert(points.i64(0));}

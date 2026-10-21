@@ -22,15 +22,13 @@ struct SharedBaseline {
 
 SharedBaseline sharedBaseline(sqlite3* local, sqlite3* remote, const std::string& localPeer, const std::string& remotePeer) {
     SharedBaseline result;
-    Statement ours(local, "SELECT seq,token FROM sync_baselines WHERE peer=? ORDER BY seq DESC");
-    ours.bind(1, localPeer);
+    Statement ours(local, "SELECT seq,token FROM sync_baselines WHERE peer=? ORDER BY seq DESC", localPeer);
     Statement theirs(remote, "SELECT seq,state FROM sync_baselines WHERE peer=? AND token=?");
     while (ours.row()) {
         theirs.reset(); theirs.bind(1, remotePeer); theirs.bind(2, ours.text(1));
         if (!theirs.row()) continue;
         result.localSeq = ours.i64(0); result.remoteSeq = theirs.i64(0); result.token = ours.text(1);
-        Statement state(local, "SELECT state FROM sync_baselines WHERE seq=?");
-        state.bind(1, result.localSeq); (void)state.row();
+        Statement state(local, "SELECT state FROM sync_baselines WHERE seq=?", result.localSeq); (void)state.row();
         result.state = Json::parse(state.text(0));
         if (result.state != Json::parse(theirs.text(1))) throw std::runtime_error("sync: inconsistent shared baseline");
         if (!result.state.at("digest").is_string()) throw std::runtime_error("sync: invalid baseline digest");
@@ -38,8 +36,7 @@ SharedBaseline sharedBaseline(sqlite3* local, sqlite3* remote, const std::string
         if (digest.size() != 64 || digest.find_first_not_of("0123456789abcdef") != std::string::npos)
             throw std::runtime_error("sync: invalid baseline digest");
         auto cursor = [](sqlite3* db, int64_t seq) {
-            Statement row(db, "SELECT journal_seq,geometry_seq FROM sync_baseline_cursors WHERE baseline_seq=?");
-            row.bind(1, seq);
+            Statement row(db, "SELECT journal_seq,geometry_seq FROM sync_baseline_cursors WHERE baseline_seq=?", seq);
             if (!row.row()) throw std::runtime_error("sync: missing baseline cursor");
             return SyncCursor{row.i64(0), row.i64(1)};
         };
@@ -52,15 +49,13 @@ SharedBaseline sharedBaseline(sqlite3* local, sqlite3* remote, const std::string
 
 Json baselineRecord(sqlite3* db, const std::string& peer, int64_t seq, const std::string& id) {
     Statement row(db, "SELECT state FROM sync_baseline_records WHERE peer=? AND record_uuid=? AND baseline_seq<=? "
-                      "ORDER BY baseline_seq DESC LIMIT 1");
-    row.bind(1, peer); row.bind(2, id); row.bind(3, seq);
+                      "ORDER BY baseline_seq DESC LIMIT 1", peer, id, seq);
     return row.row() ? Json::parse(row.text(0)) : Json();
 }
 
 void changedRecords(sqlite3* db, SyncCursor after, std::set<std::string>& ids) {
     Statement rows(db, "SELECT DISTINCT record_uuid FROM journal WHERE seq>? UNION "
-                       "SELECT object_uuid FROM geometry_revisions WHERE rowid>?");
-    rows.bind(1, after.journal); rows.bind(2, after.geometry);
+                       "SELECT object_uuid FROM geometry_revisions WHERE rowid>?", after.journal, after.geometry);
     while (rows.row()) ids.insert(formatUuid(rows.blob16(0)));
 }
 
@@ -74,8 +69,8 @@ Json syncRecord(ObjectStore& store, const Txn& txn, const std::string& id) {
     if (const auto edge = store.edgeByUuid(txn, id)) {
         auto record = edgeToJson(*edge); record["record_type"] = "edges";
         Statement binding(ObjectStoreImplAccess::conn(txn), "SELECT a_revision,b_revision FROM edge_geometry_bindings "
-                                                          "WHERE edge_id=(SELECT id FROM edges WHERE uuid=?)");
-        binding.bindBlob(1, parseUuid(id));
+                                                          "WHERE edge_id=(SELECT id FROM edges WHERE uuid=?)",
+            parseUuid(id));
         if (!binding.row()) throw std::runtime_error("sync: missing edge geometry binding");
         const bool swap = record["a"] != edge->aUuid;
         const auto epochs = lifecycleBinding(ObjectStoreImplAccess::conn(txn), *edge);
@@ -94,9 +89,9 @@ void identityPeers(sqlite3* db, const Json& record, std::set<std::string>& ids) 
     if (record.is_null()) return;
     if (record.at("record_type") == "objects") {
         if (!record.contains("track") || record["track"]["external_key"] == "") return;
-        Statement rows(db, "SELECT o.uuid FROM tracks t JOIN objects o ON o.id=t.object_id WHERE dataset_ref=? AND external_key=?");
-        rows.bind(1, record["track"]["dataset_ref"].get<std::string>());
-        rows.bind(2, record["track"]["external_key"].get<std::string>());
+        Statement rows(db, "SELECT o.uuid FROM tracks t JOIN objects o ON o.id=t.object_id WHERE dataset_ref=? AND external_key=?",
+            record["track"]["dataset_ref"].get<std::string>(),
+            record["track"]["external_key"].get<std::string>());
         while (rows.row()) ids.insert(formatUuid(rows.blob16(0)));
     } else {
         auto a = objectIdByUuid(db, parseUuid(record.at("a"))), b = objectIdByUuid(db, parseUuid(record.at("b")));
@@ -104,8 +99,8 @@ void identityPeers(sqlite3* db, const Json& record, std::set<std::string>& ids) 
         auto aa = dependenciesToJson(anchorFromJson(record.at("a_anchor"))).dump();
         auto ba = dependenciesToJson(anchorFromJson(record.at("b_anchor"))).dump();
         if (*a > *b || (*a == *b && ba < aa)) { std::swap(a, b); std::swap(aa, ba); }
-        Statement rows(db, "SELECT uuid FROM edges WHERE kind=? AND a_id=? AND b_id=? AND a_dependencies=? AND b_dependencies=?");
-        rows.bind(1, record.at("kind").get<std::string>()); rows.bind(2, *a); rows.bind(3, *b); rows.bind(4, aa); rows.bind(5, ba);
+        Statement rows(db, "SELECT uuid FROM edges WHERE kind=? AND a_id=? AND b_id=? AND a_dependencies=? AND b_dependencies=?",
+            record.at("kind").get<std::string>(), *a, *b, aa, ba);
         while (rows.row()) ids.insert(formatUuid(rows.blob16(0)));
     }
 }
@@ -125,23 +120,20 @@ void toggleDigest(std::string& digest, const Json& record) {
 
 void saveBaseline(sqlite3* db, const std::string& peer, const std::string& token, const std::string& digest,
                   const Json& merged, std::set<std::string> ids, bool full) {
-    Statement latest(db, "SELECT coalesce(max(seq),0) FROM sync_baselines WHERE peer=?");
-    latest.bind(1, peer); (void)latest.row(); const auto previous = latest.i64(0);
+    Statement latest(db, "SELECT coalesce(max(seq),0) FROM sync_baselines WHERE peer=?", peer); (void)latest.row(); const auto previous = latest.i64(0);
     if (full) {
-        Statement known(db, "SELECT DISTINCT record_uuid FROM sync_baseline_records WHERE peer=?");
-        known.bind(1, peer); while (known.row()) ids.insert(known.text(0));
+        Statement known(db, "SELECT DISTINCT record_uuid FROM sync_baseline_records WHERE peer=?", peer); while (known.row()) ids.insert(known.text(0));
     }
-    Statement row(db, "INSERT INTO sync_baselines(peer,token,state) VALUES(?,?,?)");
-    row.bind(1, peer); row.bind(2, token); row.bind(3, Json{{"digest", digest}}.dump()); row.stepDone();
+    execute(db, "INSERT INTO sync_baselines(peer,token,state) VALUES(?,?,?)", peer, token,
+        Json{{"digest", digest}}.dump());
     const auto seq = sqlite3_last_insert_rowid(db);
     Statement change(db, "INSERT INTO sync_baseline_records VALUES(?,?,?,?)");
     for (const auto& id : ids) {
         const auto value = merged.value(id, Json());
         if (value == baselineRecord(db, peer, previous, id)) continue;
-        change.reset(); change.bind(1, peer); change.bind(2, id); change.bind(3, int64_t(seq)); change.bind(4, value.dump()); change.stepDone();
+        change.run(peer, id, int64_t(seq), value.dump());
     }
     const auto cursor = syncCursor(db);
-    Statement mark(db, "INSERT INTO sync_baseline_cursors VALUES(?,?,?)");
-    mark.bind(1, int64_t(seq)); mark.bind(2, cursor.journal); mark.bind(3, cursor.geometry); mark.stepDone();
+    execute(db, "INSERT INTO sync_baseline_cursors VALUES(?,?,?)", int64_t(seq), cursor.journal, cursor.geometry);
 }
 } // namespace vc::objects::detail

@@ -153,10 +153,13 @@ void Statement::bind(int i, double v)
 void Statement::bind(int i, const std::string& v)
 { check(sqlite3_bind_text(value, i, v.c_str(), int(v.size()), SQLITE_TRANSIENT), db_, "bind"); }
 
+void Statement::bind(int i, std::span<const uint8_t> bytes)
+{ check(sqlite3_bind_blob64(value, i, bytes.data(), bytes.size(), SQLITE_TRANSIENT), db_, "bind"); }
+
 void Statement::bindNull(int i)
 { check(sqlite3_bind_null(value, i), db_, "bind"); }
 
-void Statement::bindBlob(int i, const std::array<unsigned char, 16>& v)
+void Statement::bind(int i, const std::array<unsigned char, 16>& v)
 {
     check(sqlite3_bind_blob(value, i, v.data(), 16, SQLITE_TRANSIENT), db_, "bind");
 }

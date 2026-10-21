@@ -174,12 +174,10 @@ CREATE TABLE sync_baseline_cursors(
     journal_seq INTEGER NOT NULL, geometry_seq INTEGER NOT NULL
 );
 )SQL");
-    Statement replica(db, "INSERT INTO sync_replica VALUES(1,?)");
-    replica.bind(1, util::newUuid()); replica.stepDone();
+    execute(db, "INSERT INTO sync_replica VALUES(1,?)", util::newUuid());
     detail::createSpatialSchema(db);
     exec(db, "CREATE TABLE store_identity(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid BLOB NOT NULL UNIQUE CHECK(length(uuid)=16));");
-    Statement id(db, "INSERT INTO store_identity VALUES(1,?)");
-    id.bindBlob(1, parseUuid(util::newUuid())); id.stepDone();
+    execute(db, "INSERT INTO store_identity VALUES(1,?)", parseUuid(util::newUuid()));
     exec(db, "CREATE TRIGGER store_identity_immutable_update BEFORE UPDATE ON store_identity "
              "BEGIN SELECT RAISE(ABORT,'store identity is immutable'); END;"
              "CREATE TRIGGER store_identity_immutable_delete BEFORE DELETE ON store_identity "

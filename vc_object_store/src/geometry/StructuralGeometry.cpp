@@ -12,7 +12,7 @@ void checked(sqlite3* db) {
     if (!activeStatementPools.at(db)->checkedAction) throw std::runtime_error("structural editing requires write(expected revisions)");
 }
 void requireSource(sqlite3* db,const std::string& uuid) {
-    Statement required(db,"INSERT OR IGNORE INTO history_required VALUES(?)"); required.bind(1,uuid); required.stepDone();
+    execute(db,"INSERT OR IGNORE INTO history_required VALUES(?)", uuid);
 }
 std::string idArray(const std::string& kind,const std::string& name) {
     if (kind=="point_collection" && name=="points") return "point_ids";
@@ -108,7 +108,8 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
             originalIds=idsOf(reader,idsName,oldCount);
             if(!state.contains("allocated"))for(auto id:originalIds)allocated.put(id,true);
             // Restoration must not allow a previously allocated ID to be reused.
-            Statement latest(db,"SELECT manifest FROM geometry_revisions WHERE object_uuid=? ORDER BY object_generation DESC,rowid DESC LIMIT 1");latest.bindBlob(1,parseUuid(uuid));
+            Statement latest(db,"SELECT manifest FROM geometry_revisions WHERE object_uuid=? ORDER BY object_generation DESC,rowid DESC LIMIT 1",
+                parseUuid(uuid));
             if(latest.row()) {
                 const auto tip=Json::parse(latest.text(0));
                 if(tip.contains("sequences")&&tip.at("sequences").contains(edit.array)&&tip.at("sequences").at(edit.array).contains("allocated")&&

@@ -50,7 +50,7 @@ TEST_CASE("structural snapshots restart compact delta history on a million-point
     {auto tx=f.store.write(f.expected(id));revision=f.store.resizeSurface(tx,id,resize,revision);tx.commit();}
     const auto checkpoint=revision;
     {auto tx=f.store.write();revision=f.store.editGeometry(tx,id,{{"points",0,detail::scalarBytes<float>(std::array<float,1>{42})}},revision);tx.commit();}
-    {auto tx=f.store.read();detail::Statement s(ObjectStoreImplAccess::conn(tx),"SELECT manifest FROM geometry_revisions WHERE uuid=?");s.bindBlob(1,detail::parseUuid(revision));s.row();
+    {auto tx=f.store.read();detail::Statement s(ObjectStoreImplAccess::conn(tx),"SELECT manifest FROM geometry_revisions WHERE uuid=?");s.bind(1,detail::parseUuid(revision));s.row();
         CHECK(nlohmann::json::parse(s.text(0)).at("delta").at("base")==checkpoint);
         CHECK(f.store.readGeometryArray(tx,checkpoint,"points")==detail::scalarBytes<float>(points));}
 }

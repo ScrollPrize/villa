@@ -24,8 +24,7 @@ nlohmann::json loadGeometryManifest(sqlite3* db, const std::string& revision,
     if (geometryWork) geometryWork->manifestBytesRead += text.size();
     auto manifest = nlohmann::json::parse(text);
     if (!manifest.contains("delta")) return verifiedGeometryManifest(text, contentHash);
-    Statement checksum(db, "SELECT manifest_hash FROM geometry_deltas WHERE revision_uuid=?");
-    checksum.bindBlob(1, parseUuid(revision));
+    Statement checksum(db, "SELECT manifest_hash FROM geometry_deltas WHERE revision_uuid=?", parseUuid(revision));
     if (!checksum.row() || hashText(text) != checksum.text(0) ||
         manifest.at("delta").at("version") != 1 || manifest.at("delta").at("result_hash") != contentHash)
         throw std::runtime_error("geometry delta: corrupt or unsupported revision manifest");
@@ -68,14 +67,12 @@ std::vector<GeometryChunkChange> decodeGeometryDelta(sqlite3* db, const std::str
     if (d.at("version") != 1 || rawSize <= 0 || uint64_t(rawSize) > maxDeltaBytes)
         throw std::runtime_error("geometry delta: unsupported encoding or invalid size");
     if (readRequest) {
-        Statement size(db, "SELECT length(data) FROM geometry_deltas WHERE revision_uuid=?");
-        size.bindBlob(1, parseUuid(revision));
+        Statement size(db, "SELECT length(data) FROM geometry_deltas WHERE revision_uuid=?", parseUuid(revision));
         if (!size.row()) throw std::runtime_error("geometry delta: missing payload");
         requestBytes(size.i64(0), &FiberRegionStats::payloadBytes);
         requestBytes(rawSize, &FiberRegionStats::reconstructedBytes);
     }
-    Statement payload(db, "SELECT data FROM geometry_deltas WHERE revision_uuid=?");
-    payload.bindBlob(1, parseUuid(revision));
+    Statement payload(db, "SELECT data FROM geometry_deltas WHERE revision_uuid=?", parseUuid(revision));
     if (!payload.row()) throw std::runtime_error("geometry delta: missing payload");
     auto bytes = std::span(static_cast<const uint8_t*>(sqlite3_column_blob(payload.value, 0)),
                           size_t(sqlite3_column_bytes(payload.value, 0)));
@@ -137,13 +134,11 @@ void applyGeometryDelta(std::vector<uint8_t>& bytes, const GeometryChunkChange& 
 }
 void clearGeometryMaterialization(sqlite3* db, const std::string& object) {
     for (const auto* table : {"geometry_current_chunks", "geometry_materializations"}) {
-        Statement remove(db, std::string("DELETE FROM ") + table + " WHERE object_uuid=?");
-        remove.bindBlob(1, parseUuid(object)); remove.stepDone();
+        execute(db, std::string("DELETE FROM ") + table + " WHERE object_uuid=?", parseUuid(object));
     }
 }
 void materializeGeometry(sqlite3* db, const std::string& object, const std::string& revision) {
-    Statement row(db, "SELECT manifest,content_hash FROM geometry_revisions WHERE uuid=?");
-    row.bindBlob(1, parseUuid(revision));
+    Statement row(db, "SELECT manifest,content_hash FROM geometry_revisions WHERE uuid=?", parseUuid(revision));
     if (!row.row()) throw std::runtime_error("geometry: missing revision");
     const auto descriptor = loadGeometryManifest(db, revision, row.text(0), row.text(1));
     clearGeometryMaterialization(db, object);
@@ -157,10 +152,9 @@ void materializeGeometry(sqlite3* db, const std::string& object, const std::stri
             const std::string hash = a.at("chunks").at(index);
             if (hash == base.manifest().at("arrays").at(name).at("chunks").at(index).get<std::string>()) continue;
             auto bytes = reader.chunk(name, index);
-            insert.reset(); insert.bindBlob(1, parseUuid(object)); insert.bind(2, name); insert.bind(3, index); insert.bind(4, hash);
-            check(sqlite3_bind_blob64(insert.value, 5, bytes.data(), bytes.size(), SQLITE_TRANSIENT), db); insert.stepDone();
+            insert.run(parseUuid(object), name, index, hash, bytes);
         }
-    Statement put(db, "INSERT INTO geometry_materializations VALUES(?,?,?)");
-    put.bindBlob(1, parseUuid(object)); put.bindBlob(2, parseUuid(revision)); put.bind(3, manifest.dump()); put.stepDone();
+    execute(db, "INSERT INTO geometry_materializations VALUES(?,?,?)", parseUuid(object), parseUuid(revision),
+        manifest.dump());
 }
 }

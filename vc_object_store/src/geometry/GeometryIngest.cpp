@@ -62,9 +62,9 @@ void publishBatch(ObjectStore& db, std::vector<Prepared> batch,
         if(!incoming.insert(p.object.uuid).second)
             throw std::runtime_error("duplicate object UUID in import: "+p.object.uuid);
         const auto existing=db.objectByUuid(write,p.object.uuid);
-        detail::Statement history(connection,"SELECT 1 FROM geometry_revisions WHERE object_uuid=? LIMIT 1");
-        history.bindBlob(1,detail::parseUuid(p.object.uuid));
-        detail::Statement prior(connection,"SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1"); prior.bind(1,p.object.uuid);
+        detail::Statement history(connection,"SELECT 1 FROM geometry_revisions WHERE object_uuid=? LIMIT 1",
+            detail::parseUuid(p.object.uuid));
+        detail::Statement prior(connection,"SELECT 1 FROM object_revisions WHERE object_uuid=? LIMIT 1", p.object.uuid);
         if(registeredInitial ? (!existing || existing->retired || history.row()) : (existing.has_value() || prior.row()))
             throw std::runtime_error("object already exists or was previously imported; re-import is unsupported: "+p.object.uuid);
     }
