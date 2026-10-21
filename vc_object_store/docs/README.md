@@ -37,7 +37,7 @@ aliases and moved files are different namespaces. Import only new collections
 at that path to extend a document. Only active owners resolve links; duplicate
 active identities fail. Derived identity indexes are maintained through
 edits, restoration and sync. Replacement can scan all affected IDs;
-ordinary resolution reads only referenced chunks or identity-tree entries.
+ordinary resolution reads only referenced chunks or metadata-snapshot buckets.
 
 Native export selects an immutable revision and stages output before publication;
 `overwrite=False` protects existing destinations. It rejects auxiliary arrays.
@@ -264,7 +264,9 @@ current suffix. Inherited channels reuse immutable array references. Only change
 payloads are rewritten, but manifest/bounds bookkeeping can scale with chunk
 count and historical reads with history length. There are no automatic geometry
 checkpoints or pruning. Long-held SQLite readers can retain old WAL pages.
-Full `put_geometry` replacements and structural edits have separate contracts.
+Structural changes publish chunk snapshots and restart the delta chain; subsequent
+coordinate edits continue using deltas. Structural operations can read and assemble
+the full geometry. Full `put_geometry` replacements have a separate contract.
 
 ## Bounded oriented fiber browsing
 
@@ -300,7 +302,7 @@ revision identity from one snapshot; each Python call starts a fresh snapshot.
 | --- | ---: | --- |
 | `output_byte_budget` | 8 MiB | 24 bytes per appended XYZ; a new run needs 48 |
 | `processing_byte_budget` | 64 MiB | Payload, verification, metadata, reconstruction and cache bytes |
-| `candidate_work_budget` | 1,000,000 | Candidate/block visits, tree visits and segment tests |
+| `candidate_work_budget` | 1,000,000 | Candidate/block visits and segment tests |
 | `sql_step_budget` | 10,000,000 | SQLite VM instructions, including rejected probes |
 | `max_unit_bytes` | 1 MiB | Largest admitted processing operation |
 
@@ -313,7 +315,7 @@ valid but imply no spatial coverage. Invalid input/corruption raises.
 
 `FiberRegionCancellation.cancel()` may run from another Python thread; queries
 release the GIL. C++ callbacks inspect stats, must not re-enter the store, and
-propagate exceptions. Checks occur at SQL steps, candidate/tree visits, admitted
+propagate exceptions. Checks occur at SQL steps, candidate visits, admitted
 units and segment tests. Hash/JSON/decompression units are indivisible; neither
 SQLite instructions nor OS waits have wall-clock bounds. Budgets guarantee
 neither latency nor allocator memory. There is no continuation/coverage cache.
@@ -342,3 +344,15 @@ saves do not explicitly fsync, so durability differs. Rendering, deformation,
 relationship repair and concurrent access are excluded. Repeat `--segment` or
 `--radius` for more inputs; `--per-point` submits one range per vertex. Output
 must not exist. Successful native runs remove temporary data.
+
+To measure sparse edit persistence after a structural checkpoint on real tifxyz
+data, use the native benchmark's `checkpoint` mode (the work directory must not
+exist):
+
+```sh
+build/bin/bench_object_edits /data/real-segment /tmp/post-resize-edits 5.75 1000 2 checkpoint
+```
+
+This publishes a same-shape structural checkpoint before timing edits. Reports
+include scoped native phase timings, payload writes, durable commit latency,
+DB/WAL growth and exact current/base/middle/previous read verification.

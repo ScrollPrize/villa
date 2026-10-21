@@ -122,10 +122,9 @@ std::vector<SpatialRegion> ObjectStore::spatialRegions(const Txn& txn, const Obj
     detail::validateBounds(*selection.bbox);
     if (selection.offset < 0 || (selection.limit && *selection.limit < 0))
         throw std::invalid_argument("selection limit and offset must be nonnegative");
-    auto candidates=selection;candidates.offset=0;candidates.limit.reset();
     if (const auto lease = activeStatementPools.find(db); lease != activeStatementPools.end())
         if (const auto& cache = lease->second->spatialCache)
-            if (auto result = cache->query(db, candidates)) return detail::refineIndexedRegions(db,*result,selection);
+            if (auto result = cache->query(db, selection)) return *result;
     const auto filter = objectFilter(db, selection);
     // CROSS JOIN preserves the R-tree-first plan even with a kind filter.
     std::string sql = std::string("SELECT ") + detail::regionColumns + " FROM spatial_regions_rtree r "
@@ -137,10 +136,10 @@ std::vector<SpatialRegion> ObjectStore::spatialRegions(const Txn& txn, const Obj
         detail::spatialOverlapSql(int(filter.parameters.size()) + 1) +
         " ORDER BY o.uuid,b.array_name,b.row_start,b.col_start LIMIT ? OFFSET ?";
     Statement rows(db, sql);
-    bindSelection(rows, filter, candidates);
+    bindSelection(rows, filter, selection);
     std::vector<SpatialRegion> result;
     while (rows.row()) result.push_back(detail::readSpatialRegion(rows));
-    return detail::refineIndexedRegions(db,result,selection);
+    return result;
 }
 
 } // namespace vc::objects

@@ -1,7 +1,7 @@
 #include "imports/SourceIdentityIndex.hpp"
 #include "geometry/GeometryReader.hpp"
 #include "geometry/GeometrySnapshot.hpp"
-#include "geometry/PersistentTree.hpp"
+#include "geometry/SequenceMetadata.hpp"
 
 namespace vc::objects::detail {
 namespace {
@@ -113,7 +113,7 @@ void updateSourcePointIdentities(sqlite3* db, const std::string& object,
         if(identityGet(db,identities,id).is_null()) {
             Statement erase(db,"DELETE FROM source_points WHERE object_uuid=? AND point_id=?");
             erase.bindBlob(1,parseUuid(object)); erase.bind(2,id); erase.stepDone();
-        } else putPoint(db,object,origin,id,-1); // Shared sequences resolve through their identity tree, never this offset.
+        } else putPoint(db,object,origin,id,-1); // Managed sequences resolve through their metadata snapshot, never this offset.
     }
     Statement update(db,"UPDATE source_collections SET revision_uuid=? WHERE object_uuid=?");
     update.bindBlob(1,parseUuid(revision)); update.bindBlob(2,parseUuid(object)); update.stepDone();

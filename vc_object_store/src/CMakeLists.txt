@@ -29,7 +29,7 @@ add_library(vc_objects STATIC
     geometry/GeometryViews.cpp
     imports/SourceIdentityIndex.cpp
     geometry/DependencyIndex.cpp
-    geometry/PersistentTree.cpp
+    geometry/SequenceMetadata.cpp
     geometry/SharedGeometry.cpp
     geometry/StructuralGeometry.cpp
     geometry/Geometry.cpp

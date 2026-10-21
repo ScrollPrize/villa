@@ -1,6 +1,5 @@
 #include "geometry/GeometryReader.hpp"
 #include "geometry/GeometryDelta.hpp"
-#include "geometry/SharedGeometry.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -184,10 +183,6 @@ std::vector<uint8_t> GeometryReader::chunk(const std::string& name, int64_t inde
 void GeometryReader::visitChunk(const std::string& name, int64_t index,
     const std::function<void(std::span<const uint8_t>)>& visit)
 {
-    if (sharedArray(manifest_.at("arrays").at(name))) {
-        const auto size=layouts_.at(name).chunkBytes(index);
-        const auto bytes=read(name,index*geometryChunkSize,size); visit(bytes); return;
-    }
     const ChunkKey key{name, index};
     auto found = chunks_.find(key);
     if (found != chunks_.end()) {
@@ -298,9 +293,7 @@ std::vector<uint8_t> GeometryReader::read(const std::string& name, int64_t offse
     const int64_t size = count.value_or(length - offset);
     if (size < 0 || size > length - offset) throw std::out_of_range("geometry: invalid byte count");
     requestBytes(size, &FiberRegionStats::reconstructedBytes);
-    if (sharedArray(manifest_.at("arrays").at(name)))
-        return readSharedArray(db_,manifest_.at("arrays").at(name),name,offset,size);
-    std::vector<uint8_t> result(static_cast<size_t>(size));
+    std::vector<uint8_t> result(size);
     if (!size) return result;
     if (offset == 0 && size == length) {
         for (int64_t index = 0; index < layout.chunkCount(); ++index)
@@ -353,11 +346,6 @@ std::vector<std::vector<uint8_t>> GeometryReader::ranges(const std::string& name
     const auto found = layouts_.find(name);
     if (found == layouts_.end()) throw std::invalid_argument("geometry: array not found: " + name);
     const auto& layout = found->second;
-    if (sharedArray(manifest_.at("arrays").at(name))) {
-        std::vector<std::vector<uint8_t>> result;
-        for (const auto& range : ranges) result.push_back(read(name,range[0],range[1]));
-        return result;
-    }
     struct Copy { size_t output; int64_t source, destination, count; };
     std::map<int64_t, std::vector<Copy>> plan;
     std::vector<std::vector<uint8_t>> result;
@@ -418,7 +406,6 @@ std::vector<uint8_t> GeometryReader::rectangle(const std::string& name, int64_t 
     if (row < 0 || column < 0 || rows < 0 || columns < 0 || row > shape[0] || column > shape[1] ||
         rows > shape[0] - row || columns > shape[1] - column)
         throw std::out_of_range("geometry: invalid rectangle");
-    if (sharedArray(array)) return readSharedRectangle(db_,array,name,row,column,rows,columns);
     const auto pixelBytes = surfacePixelBytes(array.at("dtype"), shape);
     std::vector<uint8_t> result(static_cast<size_t>(rows * columns * pixelBytes));
     if (!rows || !columns) return result;
@@ -490,7 +477,7 @@ PackedGeometryArray ObjectStore::readGeometryArrays(const Txn& txn,
         while (manifests.row()) {
             if (manifests.isNull(1)) throw std::invalid_argument("geometry: revision not found");
             auto manifest = loadGeometryManifest(db, revisions[begin + size_t(manifests.i64(0))], manifests.text(2), manifests.text(1));
-            if (manifest.contains("delta") || (manifest.at("arrays").contains(name) && (manifest.at("arrays").at(name).contains("source_revision") || sharedArray(manifest.at("arrays").at(name))))) {
+            if (manifest.contains("delta") || (manifest.at("arrays").contains(name) && manifest.at("arrays").at(name).contains("source_revision"))) {
                 // Snapshot-only batches keep the SQL fast path below. Mixed
                 // batches use the same verified reader as all other APIs.
                 PackedGeometryArray packed;

@@ -3,7 +3,7 @@
 #include "geometry/GeometrySnapshot.hpp"
 #include <functional>
 #include "geometry/GeometryReader.hpp"
-#include "geometry/PersistentTree.hpp"
+#include "geometry/SequenceMetadata.hpp"
 #include "imports/SourceIdentityIndex.hpp"
 
 namespace vc::objects::detail {
@@ -23,12 +23,31 @@ struct DependencyGeometry {
     std::shared_ptr<PointIndex> pointIndex = std::make_shared<PointIndex>();
 };
 
+// Identity metadata is fixed between structural checkpoints. Coordinates are
+// always read from the selected/proposed revision, including sparse deltas.
+inline void bindSequenceIdentities(DependencyGeometry& geometry,sqlite3* db,const nlohmann::json& manifest) {
+    if(!manifest.contains("sequences"))return;
+    const auto states=manifest.at("sequences");
+    for(const auto& [name,state]:states.items())if(state.contains("identities"))
+        geometry.identityArrays.insert(name=="points"?"point_ids":"control_point_ids");
+    geometry.identity=[db,states,read=geometry.read,arrays=geometry.arrays](const std::string& name,int64_t id)->std::optional<std::vector<uint8_t>> {
+        const auto array=name=="point_ids"?"points":"control_points";
+        if(!states.contains(array)||!states.at(array).contains("identities"))return std::nullopt;
+        const auto point=identityGet(db,states.at(array).at("identities"),id);
+        if(point.is_null())return std::nullopt;
+        const int64_t row=point.at("row");
+        if(row<0||row>=arrays.at(array).shape[0])throw std::runtime_error("invalid identity row");
+        const auto stride=geometryByteLength(arrays.at(array).dtype,{3});
+        return read(array,row*stride,stride);
+    };
+}
+
 // Nested helpers in a publication/repair share revision readers. The cache is
 // confined to this operation, not the connection or a future transaction.
 using DependencyCache = std::map<std::pair<const Txn*, std::string>, DependencyGeometry>;
 inline thread_local DependencyCache* activeDependencies = nullptr;
 class DependencyScope {
-    TreeCacheScope trees_;
+    MetadataCacheScope metadata_;
     std::unique_ptr<DependencyCache> owned_;
 public:
     DependencyScope() {
@@ -53,18 +72,8 @@ inline DependencyGeometry dependencyGeometry(const ObjectStore& db, const Txn& t
         auto descriptor = a; descriptor.erase("source_revision");
         result.fingerprints[name] = descriptor.dump();
     }
-    if (reader->manifest().contains("sequences")) {
-        for(const auto& [name,state]:reader->manifest().at("sequences").items())if(state.contains("identities"))
-            result.identityArrays.insert(name=="points"?"point_ids":"control_point_ids");
-        auto* connection=ObjectStoreImplAccess::conn(txn);
-        result.identity=[reader,connection](const std::string& name,int64_t id)->std::optional<std::vector<uint8_t>> {
-            const auto array=name=="point_ids"?"points":"control_points";
-            const auto& states=reader->manifest().at("sequences");
-            if(!states.contains(array)||!states.at(array).contains("identities"))return std::nullopt;
-            const auto point=identityGet(connection,states.at(array).at("identities"),id);
-            return point.is_null()?std::nullopt:std::optional(point.at("bytes").get<std::vector<uint8_t>>());
-        };
-    }
+    result.read = [reader](const auto& name, auto offset, auto count) { return reader->read(name,offset,count); };
+    bindSequenceIdentities(result,ObjectStoreImplAccess::conn(txn),reader->manifest());
     auto* connection=ObjectStoreImplAccess::conn(txn);
     if (revision.kind=="point_collection" && !result.identityArrays.contains("point_ids") &&
         indexedSourceRevision(connection,revision.objectUuid,revision.uuid)) {
@@ -75,9 +84,6 @@ inline DependencyGeometry dependencyGeometry(const ObjectStore& db, const Txn& t
             return reader->read("points",*offset*24,24);
         };
     }
-    result.read = [reader](const auto& name, auto offset, auto count) {
-        return reader->read(name, offset, count);
-    };
     if (activeDependencies) {
         if (activeDependencies->size() == 8) activeDependencies->erase(activeDependencies->begin());
         activeDependencies->emplace(key, result);

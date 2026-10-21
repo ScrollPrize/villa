@@ -31,7 +31,7 @@ struct FiberRegionStats {
     uint64_t outputBytes = 0, processingBytes = 0;
     uint64_t payloadBytes = 0, verifiedBytes = 0, metadataBytes = 0;
     uint64_t reconstructedBytes = 0, cacheBytes = 0;
-    uint64_t candidateWork = 0, candidateVisits = 0, treeVisits = 0, segmentTests = 0, sqlSteps = 0;
+    uint64_t candidateWork = 0, candidateVisits = 0, segmentTests = 0, sqlSteps = 0;
 };
 struct FiberVisibleRun {
     std::string objectUuid, revisionUuid, arrayName, family;

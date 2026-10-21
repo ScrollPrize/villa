@@ -3,7 +3,7 @@
 #include "geometry/GeometryInternal.hpp"
 #include "geometry/GeometryDelta.hpp"
 #include "geometry/SharedGeometry.hpp"
-#include "geometry/PersistentTree.hpp"
+#include "geometry/SequenceMetadata.hpp"
 
 namespace vc::objects::detail {
 namespace {
@@ -66,8 +66,7 @@ void transferGeometry(sqlite3* source, sqlite3* destination, const std::string& 
         std::map<std::string, GeometryLayout> layouts;
         for (const auto& [name, array] : parsed.at("arrays").items()) {
             const auto layout = geometryLayout(array);
-            if (array.contains("tree")) { transferTree(source,destination,array.at("tree")); expected += !array.at("tree").is_null(); }
-            else if (!array.contains("source_revision")) expected += layout.chunkCount();
+            if (!array.contains("source_revision")) expected += layout.chunkCount();
             else {
                 GeometryReader inherited(destination, array.at("source_revision").get<std::string>(), false);
                 auto original = inherited.manifest().at("arrays").at(name);
@@ -77,15 +76,14 @@ void transferGeometry(sqlite3* source, sqlite3* destination, const std::string& 
             layouts.emplace(name, layout);
         }
         if(parsed.contains("sequences"))for(const auto& state:parsed.at("sequences"))
-            for(const auto* field:{"identities","allocated","annotation_tree"})if(state.contains(field))transferTree(source,destination,state.at(field));
+            for(const auto* field:{"identities","allocated","annotations"})if(state.contains(field))transferMetadata(source,destination,state.at(field));
         while (chunks.row()) {
             ++count;
             const auto* data = static_cast<const uint8_t*>(sqlite3_column_blob(chunks.value, 3));
             const auto size = sqlite3_column_bytes(chunks.value, 3);
             const auto& a=parsed.at("arrays").at(chunks.text(0));
-            const bool shared=sharedArray(a);
-            const auto hash=shared ? a.at("tree").at("hash") : a.at("chunks").at(chunks.i64(1));
-            if ((!shared && size != layouts.at(chunks.text(0)).chunkBytes(chunks.i64(1))) ||
+            const auto hash=a.at("chunks").at(chunks.i64(1));
+            if (size != layouts.at(chunks.text(0)).chunkBytes(chunks.i64(1)) ||
                 geometryHash(std::span(data, size)) != chunks.text(2) || hash != chunks.text(2))
                 throw std::runtime_error("sync: corrupt geometry chunk");
             Statement old(destination, "SELECT hash,data FROM geometry_chunks WHERE hash=?"); old.bind(1, chunks.text(2));

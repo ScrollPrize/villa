@@ -15,8 +15,4 @@ void setSpatialBounds(sqlite3*, int64_t objectId, const std::optional<Bounds>&,
                       const std::optional<std::string>& revision = std::nullopt);
 void refreshGeometryBounds(sqlite3*, const std::string& objectUuid);
 void createSpatialSchema(sqlite3*);
-class GeometryReader;
-void visitIndexedRegions(sqlite3*, const SpatialRegion&, const Bounds&, GeometryReader&,
-                         const std::function<void(const SpatialRegion&)>&);
-std::vector<SpatialRegion> refineIndexedRegions(sqlite3*, const std::vector<SpatialRegion>&, const ObjectSelection&);
 }

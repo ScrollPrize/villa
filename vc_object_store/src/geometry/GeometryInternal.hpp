@@ -128,14 +128,6 @@ inline GeometryLayout geometryLayout(const nlohmann::json& array, bool checkChun
     result.length = geometryByteLength(array.at("dtype"), shape);
     if (result.length != array.at("byte_length").get<int64_t>())
         throw std::runtime_error("geometry: inconsistent array byte length");
-    if (array.contains("tree")) {
-        const auto& root=array.at("tree");
-        if (!root.is_null() && (root.at("hash").get<std::string>().size()!=64 || root.at("height").get<int>()<1 || root.at("height").get<int>()>96))
-            throw std::runtime_error("geometry: invalid indexed root");
-        if (!array.contains("tile_size") && (root.is_null()?0:root.at("size").get<int64_t>())!=result.length)
-            throw std::runtime_error("geometry: indexed array length mismatch");
-        return result;
-    }
     if (array.contains("storage")) {
         const auto& storage = array.at("storage");
         if (storage.at("version") != 1 || storage.at("layout") != "tiles" ||

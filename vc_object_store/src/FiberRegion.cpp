@@ -1,7 +1,7 @@
+#include "geometry/GeometryReader.hpp"
 #include "internal/Database.hpp"
 #include "internal/Spatial.hpp"
 #include "internal/ReadRequest.hpp"
-#include "geometry/PersistentTree.hpp"
 #include "geometry/ArrayBytes.hpp"
 #include "vc_object_store/geometry/SegmentClip.hpp"
 #include <exception>
@@ -96,7 +96,6 @@ FiberRegionResult ObjectStore::fiberRegion(const ReadTxn& txn, const FiberSlice&
     FiberRegionResult result;
     ReadRequest request{options, result, cancel};
     RequestScope scope(db, request);
-    TreeCacheScope treeCache;
     auto process = [&](const std::string& uuid, int64_t id, const std::string& revision, const std::string& family) {
         GeometryReader reader(db, revision);
         const auto& arrays = reader.manifest().at("arrays");
@@ -137,19 +136,18 @@ FiberRegionResult ObjectStore::fiberRegion(const ReadTxn& txn, const FiberSlice&
             }
             nextSegment=std::max(nextSegment,end);
         };
-        // Indexed regions are emitted in segment order, including structural
-        // seams. Legacy regions overlap by one vertex, never by a segment.
+        // Regions overlap by one vertex, never by a segment.
         Statement regions(db, "SELECT b.array_name,b.row_start,b.row_count,b.min_x,b.min_y,b.min_z,b.max_x,b.max_y,b.max_z "
             "FROM spatial_regions b WHERE b.object_id=?7 AND b.array_name=?8 "
             "AND b.max_x>=?1 AND b.max_y>=?2 AND b.max_z>=?3 AND b.min_x<=?4 AND b.min_y<=?5 AND b.min_z<=?6 ORDER BY b.row_start");
         for(int i=0;i<6;++i)regions.bind(i+1,bounds[i]);
-        regions.bind(7,id);regions.bind(8,array.contains("tree") ? "@tree:"+name : name);
+        regions.bind(7,id);regions.bind(8,name);
         while(regions.row()) {
             requestWork(&FiberRegionStats::candidateVisits);
             SpatialRegion region;region.objectUuid=uuid;region.kind="fiber";region.revisionUuid=revision;
             region.arrayName=regions.text(0);region.start={regions.i64(1)};region.shape={regions.i64(2)};
             for(int i=0;i<6;++i)region.bbox[i]=regions.f64(i+3);
-            visitIndexedRegions(db,region,bounds,reader,appendRegion);
+            appendRegion(region);
         }
         if (hit && options.maximumFibers && result.intersectingFibers==options.maximumFibers)
             request.stop(FiberRegionStop::FiberLimit);

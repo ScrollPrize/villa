@@ -342,6 +342,7 @@ std::shared_ptr<SparseGeometryEdit> prepareEdit(const ObjectStore& store, const 
         }
         return result;
     };
+    bindSequenceIdentities(plan->after,ObjectStoreImplAccess::conn(txn),plan->manifest);
     return plan;
 }
 }
@@ -354,93 +355,38 @@ std::vector<EdgeRecord> ObjectStore::affectedGeometryEditEdges(const Txn& txn, c
     DependencyScope scope;
     const auto current=currentGeometry(txn,objectUuid);
     if (!current || current->uuid!=formatUuid(parseUuid(expected))) historyConflict(ObjectStoreImplAccess::conn(txn),"geometry: current revision changed; reload before committing");
-    GeometryReader reader(txn,current->uuid);
-    bool shared=false; for (const auto& a:reader.manifest().at("arrays")) shared |= sharedArray(a);
-    if (shared) {
-        auto after=dependencyGeometry(*this,txn,*current);
-        // Preview overlays only the requested bytes, without writing payloads.
-        for (const auto& edit:edits) {
-            const auto& a=reader.manifest().at("arrays").at(edit.array);
-            const auto scalar=geometryByteLength(a.at("dtype"),{1});
-            const int64_t length=a.at("byte_length");
-            if (edit.elementOffset<0 || edit.elementOffset>length/scalar || edit.bytes.size()%scalar || edit.bytes.size()>uint64_t(length-edit.elementOffset*scalar))
-                throw std::invalid_argument("geometry: invalid edit range");
-            after.fingerprints.erase(edit.array);
-        }
-        const auto baseRead=after.read;
-        const auto arrays=after.arrays;
-        after.read=[baseRead,arrays,edits](const std::string& name,int64_t offset,int64_t count) {
-            auto bytes=baseRead(name,offset,count);
-            for (const auto& edit:edits) if (edit.array==name) {
-                const auto start=edit.elementOffset*geometryByteLength(arrays.at(name).dtype,{1});
-                const auto begin=std::max(offset,start),end=std::min(offset+count,start+int64_t(edit.bytes.size()));
-                if (begin<end) std::memcpy(bytes.data()+begin-offset,edit.bytes.data()+begin-start,end-begin);
-            }
-            return bytes;
-        };
-        if(after.identity) {
-            using IdentityEdits=std::map<std::pair<std::string,int64_t>,std::vector<uint8_t>>;
-            auto changed=std::make_shared<IdentityEdits>();
-            for(const auto& edit:edits) {
-                if(edit.array=="point_ids"||edit.array=="control_point_ids")throw std::invalid_argument("stable identities require structural edits");
-                const std::string ids=edit.array=="points"?"point_ids":"control_point_ids";
-                if(edit.bytes.empty()||!after.identityArrays.contains(ids)||(edit.array!="points"&&edit.array!="control_points"))continue;
-                const auto scalar=geometryByteLength(arrays.at(edit.array).dtype,{1});
-                const auto first=edit.elementOffset/3,last=(edit.elementOffset+int64_t(edit.bytes.size())/scalar-1)/3;
-                std::vector<int64_t> values(last-first+1);copyScalars<int64_t>(baseRead(ids,first*8,values.size()*8),values);
-                for(size_t i=0;i<values.size();++i)(*changed)[{ids,values[i]}]=after.read(edit.array,(first+i)*3*scalar,3*scalar);
-            }
-            const auto original=after.identity;
-            after.identity=[changed,original](const std::string& name,int64_t id)->std::optional<std::vector<uint8_t>> {
-                const auto found=changed->find({name,id});return found==changed->end()?original(name,id):std::optional(found->second);
-            };
-        }
-        return affectedEdges(*this,txn,objectUuid,current,after);
-    }
     const auto plan = prepareEdit(*this, txn, objectUuid, expected, edits);
     if (plan->changes.empty()) return {};
     return affectedEdges(*this, txn, objectUuid, currentGeometry(txn, objectUuid), plan->after);
 }
 
-std::string detail::publishSharedGeometry(ObjectStore& store, WriteTxn& txn, const std::string& objectUuid,
-    nlohmann::json manifest, const std::string& expected, const std::vector<GeometryEdgeEdit>& edgeEdits,
+std::string detail::publishStructuralSnapshot(ObjectStore& store, WriteTxn& txn, const std::string& objectUuid,
+    const GeometryData& data, nlohmann::json previous, const std::string& expected, const std::vector<GeometryEdgeEdit>& edgeEdits,
     const std::optional<std::pair<std::string,std::vector<int64_t>>>& changedIds)
 {
-    GeometryPhase phase("detail::publishSharedGeometry");
+    GeometryPhase phase("detail::publishStructuralSnapshot");
     auto* db=ObjectStoreImplAccess::conn(txn);
     DependencyScope scope;
     const auto current=store.currentGeometry(txn,objectUuid);
     if (!current || current->uuid != formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
-    DependencyGeometry after; after.kind=manifest.at("kind"); after.attributes=manifest.at("attributes").dump();
+    auto manifest=geometryManifest(data,revisionPatchTileSize(txn,*current));
+    for(const auto* field:{"sequences","grid_origin"})if(previous.contains(field))manifest[field]=previous.at(field);
+    auto after=dependencyGeometry(data);
     after.gridOrigin=manifest.value("grid_origin",std::array<int64_t,2>{0,0});
-    for (const auto& [name,a] : manifest.at("arrays").items()) {
-        after.arrays.emplace(name,GeometryArrayInfo{name,a.at("dtype"),a.at("shape"),a.at("byte_length")});
-        after.fingerprints[name]=a.dump();
-    }
-    if(manifest.contains("sequences"))for(const auto& [name,state]:manifest.at("sequences").items())if(state.contains("identities"))
-        after.identityArrays.insert(name=="points"?"point_ids":"control_point_ids");
-    if(manifest.contains("sequences")) after.identity=[db,manifest](const std::string& name,int64_t id)->std::optional<std::vector<uint8_t>> {
-        const auto array=name=="point_ids"?"points":"control_points";
-        const auto& states=manifest.at("sequences");
-        if(!states.contains(array)||!states.at(array).contains("identities"))return std::nullopt;
-        const auto point=identityGet(db,states.at(array).at("identities"),id);
-        return point.is_null()?std::nullopt:std::optional(point.at("bytes").get<std::vector<uint8_t>>());
-    };
-    after.read=[db,manifest](const auto& name,auto offset,auto count) { return readSharedArray(db,manifest.at("arrays").at(name),name,offset,count); };
+    for(const auto& [name,a]:manifest.at("arrays").items())after.fingerprints[name]=a.dump();
+    bindSequenceIdentities(after,db,manifest);
     const auto affected=affectedEdges(store,txn,objectUuid,current,after,changedIds);
     const auto decisions=validateEdgeEdits(store,txn,db,objectUuid,after,affected,edgeEdits);
     const auto object=*store.objectByUuid(txn,objectUuid);
     const auto uuid=util::newUuid(); const auto id=*objectIdByUuid(db,parseUuid(objectUuid));
-    indexSharedGeometry(db,id,current->uuid,manifest);
     const auto text=manifest.dump(), hash=hashText(text);
     if (geometryWork) geometryWork->manifestBytesWritten += text.size();
     Statement revision(db,"INSERT INTO geometry_revisions VALUES(?,?,?,?,?,?,?,?,?)");
     revision.bindBlob(1,parseUuid(uuid)); revision.bindBlob(2,parseUuid(objectUuid)); revision.bindBlob(3,parseUuid(current->uuid));
     revision.bind(4,hash); revision.bind(5,text); revision.bind(6,object.generation+1);
     revision.bind(7,store.author()); revision.bind(8,nowIsoUtc()); revision.bind(9,store.hostname()); revision.stepDone();
-    referenceSharedArrays(db,uuid,manifest); clearGeometryMaterialization(db,objectUuid);
-    Statement boundsRevision(db,"UPDATE object_bounds SET revision_uuid=? WHERE object_id=?");
-    boundsRevision.bindBlob(1,parseUuid(uuid)); boundsRevision.bind(2,id); boundsRevision.stepDone();
+    writeArrays(db,uuid,data.arrays,manifest); clearGeometryMaterialization(db,objectUuid);
+    indexGeometryBounds(db,id,uuid,data);
     Statement head(db,"UPDATE geometry_heads SET revision_uuid=? WHERE object_uuid=?");
     head.bindBlob(1,parseUuid(uuid)); head.bindBlob(2,parseUuid(objectUuid)); head.stepDone();
     stampContentChange(db,store.author(),store.hostname(),"objects",id,parseUuid(objectUuid),"geometry");
@@ -459,35 +405,12 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
     auto* db = static_cast<sqlite3*>(connection(txn));
     const auto objectUuid = formatUuid(parseUuid(objectId));
     DependencyScope scope;
-    const auto currentShared=currentGeometry(txn,objectUuid);
-    if (!currentShared || currentShared->uuid!=formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
-    GeometryReader sharedReader(txn,currentShared->uuid);
+    const auto currentRevision=currentGeometry(txn,objectUuid);
+    if (!currentRevision || currentRevision->uuid!=formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
     const auto source=nlohmann::json::parse(objectByUuid(txn,objectUuid)->meta).value("source",nlohmann::json::object());
     for (const auto& edit:edits) if ((edit.array=="point_ids" || edit.array=="control_point_ids") && !edit.bytes.empty() &&
         (source.contains("point_attributes") || identityManaged(db,objectUuid)))
         throw std::invalid_argument("annotated point identities require structural editing");
-    bool shared=false; for (const auto& a : sharedReader.manifest().at("arrays")) shared |= sharedArray(a);
-    if (shared) {
-        Savepoint savepoint(db);
-        auto manifest=sharedReader.manifest();
-        for (const auto& edit : edits) {
-            if (edit.array=="point_ids" || edit.array=="control_point_ids")
-                throw std::invalid_argument("stable identities require structural edits");
-            editSharedArray(db,manifest,edit);
-        }
-        bool changed=false;
-        for (const auto& edit:edits) {
-            const auto scalar=geometryByteLength(manifest.at("arrays").at(edit.array).at("dtype"),{1});
-            const auto offset=edit.elementOffset*scalar;
-            changed |= readSharedArray(db,manifest.at("arrays").at(edit.array),edit.array,offset,edit.bytes.size()) != sharedReader.read(edit.array,offset,edit.bytes.size());
-        }
-        if (!changed) {
-            if (!edgeEdits.empty()) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
-            return currentShared->uuid; // discard temporary payloads with the savepoint
-        }
-        const auto revision=publishSharedGeometry(*this,txn,objectUuid,manifest,expected,edgeEdits);
-        savepoint.release(); return revision;
-    }
     const auto plan = prepareEdit(*this, txn, objectUuid, expected, edits);
     const auto current = *currentGeometry(txn, objectUuid);
     if (plan->changes.empty()) {
@@ -554,22 +477,6 @@ std::string ObjectStore::updateSurfaceChannels(WriteTxn& txn, const std::string&
         historyConflict(db, "geometry: current revision changed; reload before committing");
     if (current->kind != "patch") throw std::invalid_argument("surface channels require a patch");
     auto reader = std::make_shared<GeometryReader>(txn, current->uuid);
-    if (sharedArray(reader->manifest().at("arrays").at("points"))) {
-        Savepoint savepoint(db); auto manifest=reader->manifest(); auto& arrays=manifest.at("arrays");
-        const auto grid=arrays.at("points").at("shape").get<std::vector<int64_t>>();
-        std::set<std::string> seen;
-        for (const auto& name : remove) {
-            if (name=="points" || !seen.insert(name).second || !arrays.erase(name)) throw std::invalid_argument("invalid surface channel removal");
-        }
-        for (const auto& channel : channels) {
-            if (channel.name=="points" || !seen.insert(channel.name).second) throw std::invalid_argument("invalid surface channel name");
-            validateSurfaceChannel(channel,grid);
-            arrays[channel.name]=indexedSurfaceArray(db,channel,arrays.at("points").at("tile_size"),
-                manifest.value("grid_origin",std::array<int64_t,2>{0,0}));
-        }
-        const auto uuid=publishSharedGeometry(*this,txn,objectUuid,manifest,expected,edgeEdits);
-        savepoint.release(); return uuid;
-    }
     const auto original = reader->manifest();
     auto manifest = original;
     auto& arrays = manifest.at("arrays");

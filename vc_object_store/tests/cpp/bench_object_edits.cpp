@@ -1,6 +1,7 @@
 // Persistence benchmark on real tifxyz segments. Never writes to the input.
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "spatial/PatchGrid.hpp"
+#include "geometry/GeometryInternal.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <chrono>
@@ -41,7 +42,7 @@ struct Cleanup {
 
 int main(int argc, char** argv) try {
     if (argc == 2 && std::string(argv[1]) == "--help") {
-        std::cout << "bench_object_edits SEGMENT NEW_WORK_DIR RADIUS DB_EDITS FILE_SAVES [per-point]\n"
+        std::cout << "bench_object_edits SEGMENT NEW_WORK_DIR RADIUS DB_EDITS FILE_SAVES [per-point|checkpoint]\n"
                      "Uses 64 deterministic brush centers, alternating +/- XYZ translations.\n"
                      "Reports milliseconds; verifies full current/base/middle geometry bytes.\n";
         return 0;
@@ -51,6 +52,7 @@ int main(int argc, char** argv) try {
     const double radius = std::stod(argv[3]);
     const int count = std::stoi(argv[4]), saves = std::stoi(argv[5]);
     const bool perPoint = argc == 7 && std::string(argv[6]) == "per-point";
+    const bool checkpoint = argc == 7 && std::string(argv[6]) == "checkpoint";
     if (!std::isfinite(radius) || radius < 1 || radius > 512 || count < 2 || saves < 2)
         throw std::runtime_error("Invalid radius or repetition count");
     const int extent = static_cast<int>(std::ceil(radius));
@@ -120,6 +122,11 @@ int main(int argc, char** argv) try {
         uid = db.upsertObject(w, object);
         revision = db.putGeometry(w, uid, data); w.commit();
     }
+    if (checkpoint) {
+        RevisionSelection heads; { auto r=db.read(); heads[uid]=db.currentObjectRevision(r,uid)->uuid; }
+        auto w=db.write(heads);
+        revision=db.resizeSurface(w,uid,{0,0,rows,cols,{{"points","<f4",{1,1,3},std::vector<uint8_t>(12)}}},revision); w.commit();
+    }
     const auto first = revision;
     db.checkpoint();
     const auto initialBytes = fileBytes(db.path());
@@ -127,6 +134,7 @@ int main(int argc, char** argv) try {
     std::string middleRevision, previousRevision;
     std::vector<double> queueTimes, packTimes, editTimes, commitTimes, totalTimes;
     uintmax_t maxWal = 0;
+    detail::GeometryWork workCounters;
     for (int i = 0; i < count; ++i) {
         auto start = Clock::now();
         auto changes = updates(current, i);
@@ -135,6 +143,7 @@ int main(int argc, char** argv) try {
         auto edits = pack(changes);
         packTimes.push_back(ms(start));
         start = Clock::now();
+        detail::GeometryWorkScope workScope(workCounters);
         auto w = db.write();
         revision = db.editGeometry(w, uid, edits, revision);
         editTimes.push_back(ms(start));
@@ -162,7 +171,6 @@ int main(int argc, char** argv) try {
     db.checkpoint();
     const auto growth = fileBytes(db.path()) - initialBytes;
 
-    // Compare durable database edits with rewriting all three XYZ TIFFs.
     std::vector<double> fileTimes;
     auto* filePoints = surface.rawPointsPtr();
     for (int i = 0; i < saves; ++i) {
@@ -178,6 +186,7 @@ int main(int argc, char** argv) try {
         throw std::runtime_error("File save verification failed");
     const int window = std::min(count / 2, 100);
     Json output = {
+        {"checkpoint",checkpoint}, {"phase_ns",workCounters.phaseNanoseconds}, {"payload_written",workCounters.writtenBytes},
         {"source", source.string()}, {"shape", {rows, cols, 3}}, {"radius", radius},
         {"packing", perPoint ? "per-point" : "contiguous-runs"}, {"points", stats(pointsCounts)},
         {"tiles", stats(tileCounts)}, {"queue_ms", stats(queueTimes)}, {"pack_ms", stats(packTimes)},

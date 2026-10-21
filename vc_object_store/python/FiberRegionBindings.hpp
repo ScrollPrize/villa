@@ -51,7 +51,6 @@ inline nb::dict fiberRegionFromPy(PyObjectStore& self, const vo::FiberSlice& sli
     stats["cache_bytes"] = s.cacheBytes;
     stats["candidate_work"] = s.candidateWork;
     stats["candidate_visits"] = s.candidateVisits;
-    stats["tree_visits"] = s.treeVisits;
     stats["segment_tests"] = s.segmentTests;
     stats["sql_steps"] = s.sqlSteps;
     nb::list runs;

@@ -20,7 +20,7 @@ struct Fixture {
         for(int i=0;i<6000;++i)f.controlPoints.push_back({double(i),0,0});
         revision=store.putGeometry(w,id,vc::geometry::encode(f));w.commit();
     }
-    void indexed() {
+    void checkpoint() {
         RevisionSelection expected;
         {auto r=store.read();expected={{id,store.currentObjectRevision(r,id)->uuid}};}
         auto w=store.write(expected);GeometrySequenceEdit edit;edit.array="control_points";edit.start=3000;
@@ -30,12 +30,11 @@ struct Fixture {
 };
 FiberSlice all() {FiberSlice s;s.localBounds={-1,-1,-1,7000,1,1};return s;}
 }
-TEST_CASE("cancellation reaches SQL tree payload verification and clipping and leaves snapshot usable") {
-    Fixture f;f.indexed();auto r=f.store.read();
+TEST_CASE("cancellation reaches SQL payload verification and clipping and leaves snapshot usable") {
+    Fixture f;f.checkpoint();auto r=f.store.read();
     const std::vector<FiberRegionCancel> cancellations{
         [](const auto& s){return s.sqlSteps>=10;},
         [](const auto& s){return s.candidateVisits>=1;},
-        [](const auto& s){return s.treeVisits>=2;},
         [](const auto& s){return s.payloadBytes>=10000;},
         [](const auto& s){return s.verifiedBytes>=10000;},
         [](const auto& s){return s.segmentTests>=5;},
@@ -58,7 +57,7 @@ TEST_CASE("strict allowances count cache hits rejected segments and processing s
     auto limited=f.store.fiberRegion(r,all(),o);
     CHECK(limited.stop==FiberRegionStop::CandidateBudget);
     CHECK(limited.stats.candidateWork==10);
-    CHECK(limited.stats.candidateVisits+limited.stats.treeVisits+limited.stats.segmentTests==10);
+    CHECK(limited.stats.candidateVisits+limited.stats.segmentTests==10);
     o=FiberRegionOptions{};o.sqlStepBudget=150;
     limited=f.store.fiberRegion(r,all(),o);
     CHECK(limited.stop==FiberRegionStop::SqlBudget);CHECK(limited.stats.sqlSteps==150);

@@ -60,8 +60,8 @@ form the baseline; this does not reconstruct identities lost in earlier legacy
 full replacements. IDs are unique within a sequence; merging colliding source
 ID namespaces requires an application decision.
 
-Annotations are stored by ID in immutable indexed trees, separately from array
-order; each geometry manifest retains the roots. `geometry_point_annotations(revision_uuid, array_name)` returns
+Annotations are stored by ID in immutable metadata snapshots, separately from array
+order; geometry manifests reference those snapshots. `geometry_point_annotations(revision_uuid, array_name)` returns
 annotations aligned with that revision's sequence. The first structural edit
 moves the corresponding legacy `meta.source` positional annotation field into
 this representation. Existing native PCL export resolves annotations through
@@ -108,37 +108,39 @@ rectangles. Consumers do not need to interpret shared storage.
 
 ## Storage and cost
 
-The first structural edit converts chunk snapshots/annotations in work proportional
-to the geometry. Later sequence splices path-copy immutable AVL ropes with bounded
-leaves; surface edits update persistent tile maps in stable grid coordinates.
-Unchanged subtrees and payloads are shared. Reads descend trees rather than replaying
-revision chains. Identity indexes retain deleted-ID allocation ledgers through
-restoration; annotations remain associated with IDs independently of row order.
+Every structural edit publishes a complete chunk snapshot of the resulting
+geometry. Unchanged content-addressed chunks are reused. Subsequent coordinate
+edits store compressed byte deltas against that snapshot and update a replaceable
+current-state cache. They do not retain a full changed tile per revision.
 
-Work scales with new data, changed boundaries, tree paths and affected relationships.
-Reversal, complete annotation transforms, retracing and full reads can process their
-entire inputs. Spatial queries refine coarse array bounds through tree bounds and
-paginate afterward; seams conservatively cover crossing segments. The per-operation
-tree cache is bounded by an 8 MiB charge. There is no background compaction or
-numerical approximation. Large annotations use separately chunked immutable blobs.
+Structural edits read and assemble the resulting arrays, so their time and peak
+memory scale with geometry size. Non-aligned growth, cropping and sequence
+insertions can change many chunk boundaries and reduce chunk reuse. This favors
+frequent coordinate edits and occasional structural changes.
 
-Only schema 13 is supported; earlier development stores must be recreated.
-Synchronization transfers
-and verifies new nodes/payloads while reusing existing subtrees. It does not copy the
-complete object metadata/relationship timeline; use a database copy for that.
+Point-ID row mappings, annotations and allocation ledgers use flat metadata
+snapshots with 128-entry buckets. Structural changes rebuild their indexes;
+coordinate deltas share them unchanged and resolve coordinates from the selected
+revision. Large annotations use separately chunked immutable blobs. There is no
+persistent geometry or metadata tree.
+
+Historical reads reconstruct deltas within the selected snapshot's chain.
+Structural checkpoints start new chains without removing earlier history. There
+are no automatic periodic checkpoints or pruning. Spatial queries use ordinary
+chunk/region bounds, including crossing segments. Synchronization transfers and
+verifies snapshots, deltas and referenced metadata payloads.
 
 ## Validation and measurement
 
-See the [build/test commands](../README.md#build). Native regressions check bounded
-payload, identity, relationship and spatial work for large appends, annotated
-insertions and narrow/wide surface growth. Run `build/bin/bench_structural_edits 5`
+See the [build/test commands](../README.md#build). Native regressions check a 1000 × 1000 surface with
+1,000 sparse edits after resizing, chunk reuse, and exact current/historical reads. Run `build/bin/bench_structural_edits 5`
 for the synthetic scaling benchmark: full replacement versus append/insertion and
 right growth, with zero/eight relationships and initialization reported separately.
 
 Each measured edit includes expected-head reads, checked publication, durable
 commit; full replacement includes caller preparation. Inputs
 span 1,000–100,000 points, 128–1,024-square surfaces and an 80-append history.
-Reports include mean/min/median/max latency, payload/tree/manifest work, SQLite
+Reports include mean/min/median/max latency, payload/manifest work, SQLite
 steps and exclusive scoped phase times. Counters measure logical work, not disk
 traffic; SQLite PROFILE times are statement lifetimes. These fixtures do not
 establish real-scroll viewer latency.
