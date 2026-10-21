@@ -57,6 +57,7 @@ set_target_properties(vc_core vc_lasagna utils utils_c3d_codec c3d utils_volcomp
 nanobind_add_module(vc_volume
     NOMINSIZE
     vc/volume.cpp
+    vc/normal_sampler.cpp
 )
 set_target_properties(vc_volume PROPERTIES
     OUTPUT_NAME volume
@@ -65,7 +66,7 @@ set_target_properties(vc_volume PROPERTIES
     # site-packages root one level up, so search both.
     INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
 )
-target_link_libraries(vc_volume PRIVATE vc_core)
+target_link_libraries(vc_volume PRIVATE vc_core vc_lasagna)
 target_compile_features(vc_volume PRIVATE cxx_std_23)
 
 nanobind_add_module(vc_surface_index
@@ -124,6 +125,11 @@ install(TARGETS vc_volume vc_surface_index vc_grid_raycast vc_fiber_trace
     RUNTIME DESTINATION vc
 )
 install(FILES vc/__init__.py DESTINATION vc)
+install(FILES vc/fiberlets_cli.py DESTINATION vc)
+if(TARGET vc_fiberlets)
+    install(TARGETS vc_fiberlets RUNTIME DESTINATION vc/bin)
+endif()
+configure_file(vc/fiberlets_cli.py "${CMAKE_CURRENT_BINARY_DIR}/vc/fiberlets_cli.py" COPYONLY)
 install(FILES vc/compression/__init__.py DESTINATION vc/compression)
 install(FILES
     vc/compression/vcz1.py

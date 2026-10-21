@@ -265,7 +265,7 @@ void FileWatcherService::processSegmentUpdate(const std::string& dirName, const 
         return;
     }
 
-    std::string segmentId = segmentName; // UUID = directory name
+    std::string segmentId = segmentName; // segment id = directory name
 
     // Check if the segment exists
     auto seg = _state->vpkg()->segmentation(segmentId);

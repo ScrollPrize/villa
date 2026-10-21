@@ -69,6 +69,7 @@ volume-cartographer/AGENTS.md
 /spiral-fitting/plans
 /volume-cartographer/scripts/spiral/out
 /spiral-fitting/.claude
+dinovol/cufile.log
 /vesuvius/src/vesuvius/neural_tracing/tracers/fibers/datasets/automated_fiber_volumes
 /vesuvius/src/vesuvius/neural_tracing/tracers/fibers/plans
 /vesuvius/src/vesuvius/neural_tracing/tracers/sheets/output
@@ -79,3 +80,6 @@ volume-cartographer/AGENTS.md
 # Local Claude Code settings
 **/.claude/settings.local.json
 /vesuvius/src/vesuvius/neural_tracing/tracers/fibers/evaluation/audit
+/spiral-fitting/experiments
+/vc_reader/benchmarks/results
+*.csv

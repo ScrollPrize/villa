@@ -12,15 +12,8 @@ def trilinear_weight(fz, fy, fx, dz, dy, dx):
 
 
 @numba.njit(cache=True, fastmath=False, inline="always")
-def _scalar_point(p, raw, start_zyx, pos, frame, grid):
-    ga, gb, gc = grid[p, 0], grid[p, 1], grid[p, 2]
-    wx = pos[0] + frame[0, 0] * ga + frame[0, 1] * gb + frame[0, 2] * gc
-    wy = pos[1] + frame[1, 0] * ga + frame[1, 1] * gb + frame[1, 2] * gc
-    wz = pos[2] + frame[2, 0] * ga + frame[2, 1] * gb + frame[2, 2] * gc
-    qz = wz - start_zyx[0]
-    qy = wy - start_zyx[1]
-    qx = wx - start_zyx[2]
-    # trilinear (zeros outside)
+def _scalar_point(raw, qz, qy, qx):
+    """Trilinear CT/255 at block coordinates (zeros outside the block)."""
     z0 = int(np.floor(qz))
     y0 = int(np.floor(qy))
     x0 = int(np.floor(qx))
@@ -41,12 +34,10 @@ def _scalar_point(p, raw, start_zyx, pos, frame, grid):
         zz = z0 + dz
         if zz < 0 or zz >= S0:
             continue
-        wz_ = fz if dz else 1.0 - fz
         for dy in range(2):
             yy = y0 + dy
             if yy < 0 or yy >= S1:
                 continue
-            wy_ = fy if dy else 1.0 - fy
             for dx in range(2):
                 xx = x0 + dx
                 if xx < 0 or xx >= S2:
@@ -57,14 +48,48 @@ def _scalar_point(p, raw, start_zyx, pos, frame, grid):
 
 
 @numba.njit(cache=True, fastmath=False, nogil=True)
-def _sample_scalar(raw, start, pos, frame, grid, out):
-    for p in range(len(grid)):
-        out[p] = _scalar_point(p, raw, start, pos, frame, grid)
+def _sample_scalar(raw, start, pos, frame, lc, vc, fc, out):
+    """Crop point (fc[i], vc[j], lc[k]) at world pos + frame @ (lc[k], vc[j], fc[i]), summed in that order. Each
+    frame*coordinate product depends on one axis, so it is formed once per axis value rather than per point (the
+    same products and sums: identical values)."""
+    A = np.empty((len(lc), 3))
+    B = np.empty((len(vc), 3))
+    C = np.empty((len(fc), 3))
+    for r in range(3):
+        for k in range(len(lc)):
+            A[k, r] = frame[r, 0] * lc[k]
+        for j in range(len(vc)):
+            B[j, r] = frame[r, 1] * vc[j]
+        for i in range(len(fc)):
+            C[i, r] = frame[r, 2] * fc[i]
+    p = 0
+    for i in range(len(fc)):
+        for j in range(len(vc)):
+            for k in range(len(lc)):
+                wx = pos[0] + A[k, 0] + B[j, 0] + C[i, 0]
+                wy = pos[1] + A[k, 1] + B[j, 1] + C[i, 1]
+                wz = pos[2] + A[k, 2] + B[j, 2] + C[i, 2]
+                out[p] = _scalar_point(raw, wz - start[0], wy - start[1], wx - start[2])
+                p += 1
 
 
-def sample_scalar_crop(raw, start_zyx, pos, frame, grid_flat, out):
-    """Write the scalar channel directly, with identical interpolation and no history."""
+def sample_scalar_crop(raw, start_zyx, pos, frame, crop, out):
+    """Write the scalar channel of ``crop`` (a CropSpec, local grid ``geometry.crop_local_grid``) directly, with
+    identical interpolation and no history."""
     if raw.shape[0] != 1:
         raise ValueError('The fused sampler reads one scalar channel')
+    lc, vc, fc = _crop_axes(crop)
     _sample_scalar(raw, np.asarray(start_zyx, np.float64), np.asarray(pos, np.float64),
-                   np.asarray(frame, np.float64), grid_flat, out.reshape(-1))
+                   np.asarray(frame, np.float64), lc, vc, fc, out.reshape(-1))
+
+
+_AXES_CACHE: dict = {}
+
+
+def _crop_axes(crop):
+    """The crop's lateral, vertical and forward coordinates (float64), as ``crop_local_grid`` places them."""
+    axes = _AXES_CACHE.get(crop)
+    if axes is None:
+        axes = _AXES_CACHE[crop] = tuple(np.ascontiguousarray(a, np.float64) for a in
+                                         (crop.lateral_coords, crop.vertical_coords, crop.forward_coords))
+    return axes

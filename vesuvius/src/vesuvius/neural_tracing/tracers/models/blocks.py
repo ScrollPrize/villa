@@ -35,9 +35,11 @@ class CropCNN(nn.Module):
     Linear of the channels) or 'crop' (one token per crop, (B, dim): an optional 1x1 conv to ``bottleneck`` channels
     with the same norm and activation, then flatten and a Linear; needs the ``crop`` size, which must divide by 2 per
     stride-2 stage). ``features`` and ``tokens`` run the two halves separately, for models that read the feature map
-    as well. ``in_channels``: input channels of the crop (default one, e.g. CT)."""
+    as well. ``in_channels``: input channels of the crop (default one, e.g. CT). ``context`` > 0: a stride-2 residual
+    block of that many channels on the last stage's map, upsampled (trilinear) to it and added through a 1x1
+    convolution that starts at zero: about twice the receptive field for an eighth of a stage's positions."""
     def __init__(self, channels, strides, blocks, *, stem=False, norm='instance', activation='relu', conv_bias='first',
-                 head=None, dim=None, crop=None, bottleneck=0, in_channels=1):
+                 head=None, dim=None, crop=None, bottleneck=0, in_channels=1, context=0):
         super().__init__()
         if conv_bias not in ('first', 'all') or head not in (None, 'cells', 'crop') or (head and not dim):
             raise ValueError(f'CropCNN: conv_bias {conv_bias!r}, head {head!r}, dim {dim!r}')
@@ -55,6 +57,12 @@ class CropCNN(nn.Module):
             for index, (i, c, s, n) in enumerate(zip(inputs, channels, strides, blocks)))
         self.head_kind = head
         width = channels[-1]
+        if context:
+            self.context_stage = StackedResidualBlocks(n_blocks=1, input_channels=width, output_channels=context,
+                                                       initial_stride=2, conv_bias=conv_bias == 'all', **options)
+            self.context_fuse = nn.Conv3d(context, width, 1)
+            nn.init.zeros_(self.context_fuse.weight)
+            nn.init.zeros_(self.context_fuse.bias)
         if head == 'cells':
             self.head = nn.Linear(width, dim)
         elif head == 'crop':
@@ -70,6 +78,9 @@ class CropCNN(nn.Module):
         x = self.stem(image) if hasattr(self, 'stem') else image
         for stage in self.stages:
             x = stage(x)
+        if hasattr(self, 'context_stage'):
+            context = F.interpolate(self.context_stage(x), size=x.shape[2:], mode='trilinear', align_corners=False)
+            x = x+self.context_fuse(context)
         return x
 
     def tokens(self, features):

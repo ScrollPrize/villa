@@ -2,6 +2,8 @@
 #include <doctest/doctest.h>
 
 #include "CState.hpp"
+#include "vc/core/types/Volume.hpp"
+#include <QTemporaryDir>
 #include "FiberSliceGeometry.hpp"
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberNaming.hpp"
@@ -1456,7 +1458,15 @@ TEST_CASE("Ribbons retain ordinary QuadSurface rendering and picking after origi
 
 TEST_CASE("focus bounds state distinguishes configured and active bounds")
 {
+    QTemporaryDir directory;
+    REQUIRE(directory.isValid());
+    Volume::ZarrCreateOptions options;
+    options.shapeZYX = {64, 64, 64};
+    options.compressor = "none";
+    auto volume = Volume::New(directory.path().toStdString(), options);
+    REQUIRE(volume);
     CState state;
+    state.setCurrentVolume(volume);
     int changes = 0;
     QObject::connect(&state, &CState::focusBoundsChanged, [&changes]() {
         ++changes;
@@ -1487,6 +1497,21 @@ TEST_CASE("focus bounds state distinguishes configured and active bounds")
     CHECK(changes == 3);
     state.clearFocusBounds();
     CHECK(changes == 3);
+}
+
+TEST_CASE("focus bounds require a volume coordinate frame")
+{
+    CState state;
+    int changes = 0;
+    QObject::connect(&state, &CState::focusBoundsChanged, [&changes]() {
+        ++changes;
+    });
+    const auto revision = state.focusBoundsRevision();
+    state.setFocusBounds({{10.0f, 15.0f, 25.0f}, {20.0f, 30.0f, 40.0f}});
+    CHECK_FALSE(state.focusBounds());
+    CHECK_FALSE(state.activeFocusBounds());
+    CHECK(state.focusBoundsRevision() == revision);
+    CHECK(changes == 0);
 }
 
 TEST_CASE("focus bounds trim only open line tails and rebase indices")
@@ -5062,6 +5087,14 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     strictRoot["optimization_mode"] = "native_fiber_trace3d";
     strictRoot["line_points"] = {{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}};
     CHECK_NOTHROW(vc::fiber_tracer::parseVc3dFiberJson(strictRoot, "test fiber"));
+    strictRoot["uuid"] = vc::util::newUuid();
+    CHECK(vc::fiber_tracer::parseVc3dFiberJson(strictRoot, "test fiber").uuid ==
+          strictRoot.at("uuid").get<std::string>());
+    auto invalidUuid = strictRoot;
+    invalidUuid["uuid"] = "fiber_filename";
+    CHECK_THROWS_AS(
+        vc::fiber_tracer::parseVc3dFiberJson(invalidUuid, "test fiber"),
+        std::runtime_error);
     auto missingMode = strictRoot;
     missingMode.erase("optimization_mode");
     CHECK_THROWS_AS(

@@ -9,6 +9,8 @@ centred on level-0 coordinate ``(i + 0.5) * 2**level - 0.5`` (mean-pooled pyrami
 """
 from __future__ import annotations
 
+from collections import OrderedDict
+
 import torch
 import torch.nn.functional as F
 
@@ -129,16 +131,32 @@ class GPUChunkCache:
         self.pool = torch.zeros((slots+1)*self.size, dtype=torch.uint8, device=self.device)  # slot 0: zeros
         # 0 = zeros or not resident; int64, so slot offsets into the pool are int64 (coordinates stay int32)
         self.table = torch.zeros(self.grid, dtype=torch.int64, device=self.device)
+        self.bounds = torch.tensor(self.ct.shape, device=self.device, dtype=torch.int32)
         self.resident = {}  # chunk key -> slot (0 for chunks absent from the store), in LRU order
+        # Empty chunks occupy no slot and must not lengthen every eviction scan.
+        # This is the same LRU order restricted to occupied slots.
+        self.occupied = OrderedDict()
         self.free = list(range(slots, 0, -1))
         self.loads = 0
         self.grids = {}  # crop spec -> local (u, v, f) sample offsets on the device
+
+    def grow_slots(self, slots):
+        """Increase capacity between crop calls without invalidating resident slots."""
+        current = self.pool.numel()//self.size-1
+        if slots <= current:
+            return
+        pool = torch.empty((slots+1)*self.size, dtype=self.pool.dtype, device=self.device)
+        pool[:self.pool.numel()].copy_(self.pool)
+        self.pool = pool
+        self.free = list(range(slots, current, -1))+self.free
 
     def _ensure(self, keys, pool=None):
         keys = sorted(keys)
         for k in keys:
             if k in self.resident:
                 self.resident[k] = self.resident.pop(k)  # most recent last
+                if self.resident[k]:
+                    self.occupied.move_to_end(k)
         missing = [k for k in keys if k not in self.resident]
         if not missing:
             return
@@ -149,10 +167,11 @@ class GPUChunkCache:
                 self.resident[k] = 0
                 continue
             if not self.free:
-                victim = next((v for v in self.resident if v not in need and self.resident[v]), None)
+                victim = next((v for v in self.occupied if v not in need), None)
                 if victim is None:
                     raise RuntimeError('GPU chunk cache too small for one row group; raise slots or lower rows')
                 slot = self.resident.pop(victim)
+                del self.occupied[victim]
                 self.table[victim] = 0
                 self.free.append(slot)
             slot = self.free.pop()
@@ -160,6 +179,7 @@ class GPUChunkCache:
                 self.device, non_blocking=True)
             self.table[k] = slot
             self.resident[k] = slot
+            self.occupied[k] = None
             self.loads += 1
         # resident-but-unused keys of absent chunks stay mapped to slot 0, like non-resident ones
 
@@ -184,18 +204,27 @@ class GPUChunkCache:
         scale = float(getattr(vol, 'input_scale', 1.))
         local = self._local(crop)
         out = torch.empty((len(items), 1)+tuple(local.shape[:3]), dtype=torch.float32, device=self.device)
-        bounds = torch.tensor(self.ct.shape, device=self.device, dtype=torch.int32)
+        if not items:
+            return zscore_crops(out)
+        # Stage the small metadata arrays once for the whole call. Previously
+        # three blocking .to() calls per row group serialized every gather.
+        pos = np.stack([np.asarray(i['pos'], np.float64) for i in items])*scale
+        anchor = np.floor(pos)
+        frames = np.stack([np.asarray(i['frame'], np.float64) for i in items])*scale
+        def transfer(array):
+            tensor = torch.from_numpy(array)
+            if self.device.type == 'cuda':
+                tensor = tensor.pin_memory()
+            return tensor.to(self.device, non_blocking=True)
+        relatives = transfer((pos-anchor).astype(np.float32))
+        frames = transfer(frames.astype(np.float32))
+        anchors = transfer(anchor[:, ::-1].astype(np.int32).copy())
         for r0 in range(0, len(items), self.rows):
             part = items[r0:r0+self.rows]
             self._ensure(self._keys(part, crop, scale), pool)
             # float32 offsets from each row's integer anchor (consumer GPUs run float64 at a small fraction of float32)
-            pos = np.stack([np.asarray(i['pos'], np.float64) for i in part])*scale
-            anchor = np.floor(pos)
-            frame = np.stack([np.asarray(i['frame'], np.float64) for i in part])*scale
-            rel = torch.from_numpy((pos-anchor).astype(np.float32)).to(self.device)
-            frame = torch.from_numpy(frame.astype(np.float32)).to(self.device)
-            anchor = torch.from_numpy(anchor[:, ::-1].astype(np.int32).copy()).to(self.device)
-            out[r0:r0+len(part), 0] = _gather_trilinear(self.pool, self.table, anchor, rel, frame, local, bounds,
+            take = slice(r0, r0+len(part))
+            out[take, 0] = _gather_trilinear(self.pool, self.table, anchors[take], relatives[take], frames[take], local, self.bounds,
                                                         self.shifts)
         return zscore_crops(out)
 
