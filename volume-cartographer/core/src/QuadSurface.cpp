@@ -243,6 +243,59 @@ void replaceDirectoryContents(const std::filesystem::path& source,
 }
 #endif
 
+#ifndef _WIN32
+// Moves the named subfolders from `from` back to `to`. Used when a save fails
+// after keepSubdirectories() so the existing segment directory is unchanged.
+void moveSubdirectoriesBack(const std::vector<std::filesystem::path>& names,
+                            const std::filesystem::path& from,
+                            const std::filesystem::path& to)
+{
+    for (const auto& name : names) {
+        std::error_code ec;
+        std::filesystem::rename(from / name, to / name, ec);
+        if (ec) {
+            Logger()->error("could not move subfolder {} back to {}: {}",
+                            (from / name).string(), to.string(), ec.message());
+        }
+    }
+}
+
+// A segment directory can hold subfolders that are not part of the tifxyz
+// data, such as the ink-detections/ folder VC3D downloads for catalog
+// segments, or label zarrs. writeDataToDirectory() does not recreate them, so
+// move each one into the new generation before the old directory is replaced
+// and deleted. Both paths share a parent, so each move is a rename. Returns
+// the moved names; on failure it moves them back and throws before anything
+// has been deleted.
+std::vector<std::filesystem::path> keepSubdirectories(
+    const std::filesystem::path& previous, const std::filesystem::path& next)
+{
+    std::vector<std::filesystem::path> names;
+    for (const auto& entry : std::filesystem::directory_iterator(previous)) {
+        const auto name = entry.path().filename();
+        if (!entry.is_directory() || name == kSaveRollbackDir ||
+            std::filesystem::exists(next / name)) {
+            continue;
+        }
+        names.push_back(name);
+    }
+
+    std::vector<std::filesystem::path> moved;
+    for (const auto& name : names) {
+        std::error_code ec;
+        std::filesystem::rename(previous / name, next / name, ec);
+        if (ec) {
+            moveSubdirectoriesBack(moved, next, previous);
+            throw std::runtime_error("could not keep subfolder " +
+                                     (previous / name).string() + ": " +
+                                     ec.message());
+        }
+        moved.push_back(name);
+    }
+    return moved;
+}
+#endif
+
 void normalizeMaskChannel(cv::Mat& mask)
 {
     if (mask.empty()) {
@@ -2612,6 +2665,21 @@ void QuadSurface::saveWithUuid(const std::filesystem::path &path_, const std::st
         }
     }
 
+#ifndef _WIN32
+    // The replace below deletes the old directory, so move its subfolders
+    // into the new generation first. Windows replaces files in place and
+    // leaves subfolders where they are.
+    std::vector<std::filesystem::path> keptSubdirectories;
+    if (force_overwrite && std::filesystem::exists(final_path)) {
+        try {
+            keptSubdirectories = keepSubdirectories(final_path, temp_path);
+        } catch (...) {
+            path = original_path; // Restore on error
+            throw;
+        }
+    }
+#endif
+
     // Atomically move the saved data to the final location
     bool replacedExisting = false;
     if (force_overwrite && std::filesystem::exists(final_path)) {
@@ -2624,6 +2692,7 @@ void QuadSurface::saveWithUuid(const std::filesystem::path &path_, const std::st
                 std::filesystem::rename(temp_path, final_path);
                 replacedExisting = true;
             } else {
+                moveSubdirectoriesBack(keptSubdirectories, temp_path, final_path);
                 path = original_path; // Restore on error
                 const std::error_code ec(err, std::generic_category());
                 throw std::runtime_error("atomic exchange failed for " + temp_path.string() +
