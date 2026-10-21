@@ -257,6 +257,34 @@ def roi_size_from_config(config: dict[str, Any]) -> int:
     return roi_y
 
 
+def _batched_quantile(values: torch.Tensor, q: float) -> torch.Tensor:
+    # torch.quantile rejects inputs above 16M elements; fall back to one row at a time.
+    if values.numel() <= 16_000_000:
+        return torch.quantile(values, q, dim=1)
+    return torch.stack([torch.quantile(row, q) for row in values])
+
+
+def normalize_robust_batch(images: torch.Tensor) -> torch.Tensor:
+    """Batched torch port of vesuvius normalize_robust, one sample at a time along dim 0.
+
+    Same math as the numpy version (linear quantiles like np.percentile/np.median, MAD scale,
+    std and range fallbacks), so the output matches the CPU path.
+    """
+    shape = images.shape
+    values = images.reshape(shape[0], -1).float()
+    std = values.std(dim=1, unbiased=False)
+    low = _batched_quantile(values, 0.01)
+    high = _batched_quantile(values, 0.99)
+    values = torch.maximum(torch.minimum(values, high[:, None]), low[:, None])
+    median = _batched_quantile(values, 0.5)
+    mad = 1.4826 * _batched_quantile((values - median[:, None]).abs(), 0.5)
+    fallback = torch.where(std.abs() >= 1e-6, std.abs(), (high - low).abs() / 2)
+    fallback = torch.where(fallback >= 1e-6, fallback, torch.ones_like(fallback))
+    scale = torch.where(torch.isfinite(mad) & (mad >= 1e-6), mad, fallback)
+    out = (values - median[:, None]) / scale[:, None]
+    return torch.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).reshape(shape)
+
+
 def inference_depth_from_config(config: dict[str, Any]) -> int:
     patch_size = config.get("crop_size", config.get("patch_size"))
     if isinstance(patch_size, (list, tuple)) and len(patch_size) == 3:
@@ -443,6 +471,24 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "Overlap-add importance window. 'auto' selects constant without "
             "overlap, Hann otherwise."
+        ),
+    )
+    parser.add_argument(
+        "--roi-size",
+        type=int,
+        default=None,
+        help=(
+            "Sliding-window size in pixels. Default: the checkpoint's training crop. "
+            "The network is unchanged; fully convolutional models accept a larger window "
+            "(e.g. 384 for a 128 px checkpoint, with --stride 256)."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-normalize",
+        action="store_true",
+        help=(
+            "Run tifxyz_robust normalization on the GPU per batch instead of in the CPU "
+            "DataLoader workers. Same output; removes the CPU bottleneck on GPU machines."
         ),
     )
     parser.add_argument("--layer-start", type=int, default=None)
@@ -1067,12 +1113,16 @@ class OmeZarrBlockDataset(Dataset):
         blocks: Sequence[Block],
         patch_size: int,
         preprocessing: str = "legacy_uint8",
+        defer_robust_normalization: bool = False,
     ):
         self.reader = reader
         self.blocks = list(blocks)
         self.patch_h = int(patch_size)
         self.patch_w = int(patch_size)
         self.preprocessing = str(preprocessing)
+        # When True, tifxyz_robust patches are returned raw (uint8) and normalized on the device
+        # by run_block_inference; the workers then skip the expensive per-patch CPU step.
+        self.defer_robust_normalization = bool(defer_robust_normalization)
 
     def __len__(self) -> int:
         return len(self.blocks)
@@ -1084,7 +1134,9 @@ class OmeZarrBlockDataset(Dataset):
         # an all-zero patch to non-zero values, which would defeat the skip.
         nonempty = int(patch.any())
         patch = np.moveaxis(patch, -1, 0)
-        if self.preprocessing == "tifxyz_robust":
+        if self.preprocessing == "tifxyz_robust" and self.defer_robust_normalization:
+            patch = np.ascontiguousarray(patch)
+        elif self.preprocessing == "tifxyz_robust":
             from vesuvius.image_proc.intensity.normalization import normalize_robust
 
             patch = normalize_robust(patch)
@@ -1471,6 +1523,7 @@ def run_block_inference(
     amp_dtype: torch.dtype | None = None,
     tta_axes: Sequence[int] = (),
     tta_batch_size: int | None = None,
+    normalize_on_device: bool = False,
 ) -> None:
     autocast_enabled = bool(amp and device.type == "cuda")
     logged_resize = False
@@ -1513,6 +1566,9 @@ def run_block_inference(
             images = images[keep]
             meta = meta[keep]
             images = images.to(device, non_blocking=True)
+            if normalize_on_device:
+                with torch.autocast(device_type=device.type, enabled=False):
+                    images = normalize_robust_batch(images)
             if tta_axes:
                 probs_t, logged_resize = predict_with_mirror_tta(
                     model,
@@ -1635,7 +1691,7 @@ def infer_single_zarr(
         height, width, depth = volume_shape
         spatial_chunk_h, spatial_chunk_w, _ = volume_chunks
 
-    roi_size = int(configured_model.roi_size)
+    roi_size = int(args.roi_size) if args.roi_size else int(configured_model.roi_size)
     patch_size = roi_size
     patch_stride = resolve_patch_stride(
         patch_size=patch_size,
@@ -1738,11 +1794,15 @@ def infer_single_zarr(
     )
     LOGGER.info("Selected %d patches for inference.", len(blocks))
 
+    normalize_on_device = bool(args.gpu_normalize) and device.type == "cuda" and configured_model.preprocessing == "tifxyz_robust"
+    if bool(args.gpu_normalize) and not normalize_on_device:
+        LOGGER.info("--gpu-normalize ignored (needs CUDA and tifxyz_robust preprocessing).")
     dataset = OmeZarrBlockDataset(
         reader=reader,
         blocks=blocks,
         patch_size=patch_size,
         preprocessing=configured_model.preprocessing,
+        defer_robust_normalization=normalize_on_device,
     )
     effective_batch_size = int(args.batch_size) * max(1, len(requested_gpu_ids))
     if len(requested_gpu_ids) > 1:
@@ -1813,6 +1873,7 @@ def infer_single_zarr(
                 amp_dtype=configured_model.amp_dtype,
                 tta_axes=tta_axes,
                 tta_batch_size=args.tta_batch_size,
+                normalize_on_device=normalize_on_device,
             )
             accumulator.flush_remaining()
         else:
