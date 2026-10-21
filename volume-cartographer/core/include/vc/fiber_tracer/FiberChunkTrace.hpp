@@ -30,8 +30,9 @@ struct FiberChunkPaths {
     size_t maxima=0,seeds=0;
 };
 
-// Synchronous: invoke each index exactly once; join every job before returning
-// or throwing. Never retain the callback. Empty means serial execution.
+// Synchronous: on success invoke each index exactly once; join every admitted
+// job before returning or throwing. Failure may cancel not-yet-started jobs.
+// Never retain the callback. Empty means serial execution.
 using FiberChunkParallelFor=std::function<void(size_t,const std::function<void(size_t)>&)>;
 // Optional cooperative scheduler wait. Return only when ready() is true, or
 // throw on cancellation. Empty uses the shared future's ordinary blocking wait.

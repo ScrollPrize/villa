@@ -164,6 +164,12 @@ def test_real_paris4_chunk_replay(tmp_path):
     t.cone_angle_degrees, t.cone_angle_step_degrees = 25, 15
     t.width_relative_tolerance, t.width_cosine_weight = .4, True
     cache = ft.ChunkCache(field, normal, t, c, str(tmp_path / "cache"), "paris4-binding-test")
+    if hasattr(ft, "case_queue_supported") and ft.case_queue_supported():
+        key = np.floor(line[0] / c.core_base).astype(int).tolist()
+        built = cache.get_many([key, key], workers=2, contexts_per_worker=2)
+        assert built[0].seeds > 0
+        for a, b in zip(built[0].lines_base, built[1].lines_base, strict=True):
+            np.testing.assert_array_equal(a, b)
     replay = ft.ChunkReplayConfig()
     replay.tangential_threshold_factor = 2
     result = cache.replay(line, normal, replay, end_arc_base=256)

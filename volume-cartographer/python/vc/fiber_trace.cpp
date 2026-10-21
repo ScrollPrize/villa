@@ -26,6 +26,9 @@
 
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/fiber_tracer/FiberChunkTrace.hpp"
+#include "vc/fiber_tracer/FiberLiveBridge.hpp"
+#include "vc/fiber_tracer/FiberCaseQueue.hpp"
+#include <atomic>
 #include "vc/fiber_tracer/FiberReverseConsistency.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
@@ -119,6 +122,13 @@ struct PredictionFieldHandle {
     std::unique_ptr<ft::FiberPredictionField> field;
     ft::FiberPredictionTraceScales scales;
     std::string location;
+};
+
+struct LiveBridgeHandle {
+    std::shared_ptr<ft::FiberLiveBridge> bridge;
+    LiveBridgeHandle(int port, const std::string& token, int timeout, bool heartbeat)
+        : bridge(std::make_shared<ft::FiberLiveBridge>(nlohmann::json{
+              {"port",port},{"token",token},{"timeout_seconds",timeout},{"heartbeat_wait",heartbeat}})) {}
 };
 
 struct NormalSamplerHandle {
@@ -336,6 +346,22 @@ struct ChunkCacheHandle {
         nb::gil_scoped_release release;
         return {cache.get(key,*predictions.field,trace,*normals.sampler,predictions.scales.traceToBaseScale)};
     }
+    std::vector<ChunkPathsHandle> getMany(const std::vector<std::array<int,3>>& keys,
+                                         size_t workers,size_t contexts) {
+        if(trace.parallelThreads!=1)
+            throw std::invalid_argument("get_many requires parallel_threads=1; the case queue owns parallelism");
+        std::vector<ChunkPathsHandle> result(keys.size());
+        nb::gil_scoped_release release;
+        std::atomic<size_t> next{0};
+        ft::FiberCaseQueue queue(workers,keys.size(),[&] {
+            const size_t index=next.fetch_add(1);
+            result[index].paths=cache.get(keys[index],*predictions.field,trace,*normals.sampler,
+                predictions.scales.traceToBaseScale,ft::FiberCaseQueue::parallelFor,
+                [](const auto& ready) { ft::FiberCaseQueue::await(ready); });
+        },contexts);
+        queue.join();
+        return result;
+    }
 };
 
 nb::dict chunkRoute(ChunkCacheHandle& self,Vec3 center,Vec3 direction,
@@ -485,7 +511,40 @@ NB_MODULE(fiber_trace, m)
     m.def("decode_directions", &decodeDirections, "nx"_a.noconvert(), "ny"_a.noconvert(),
           "Decode flat uint8 nx/ny arrays to unit xyz axes; missing bytes give zero axes.");
 
+    nb::class_<LiveBridgeHandle>(m, "LiveBridge")
+        .def(nb::init<int,const std::string&,int,bool>(),
+             "port"_a,"token"_a,"timeout_seconds"_a=600,"heartbeat_wait"_a=false,
+             nb::call_guard<nb::gil_scoped_release>())
+        .def("cancel", [](LiveBridgeHandle& h,const std::string& reason) { h.bridge->cancel(reason); },
+             "reason"_a="cancelled", nb::call_guard<nb::gil_scoped_release>())
+        .def("check_active", [](LiveBridgeHandle& h) { h.bridge->checkActive(); },
+             nb::call_guard<nb::gil_scoped_release>())
+        .def("wait", [](LiveBridgeHandle& h,const std::string& source,size_t caseIndex,
+                       double remaining,const std::vector<std::string>& paths,
+                       const std::vector<std::array<uint32_t,3>>& indices) {
+            if(paths.size()!=indices.size()) throw std::invalid_argument("paths and indices sizes differ");
+            std::vector<ft::FiberPredictionChunkDependency> chunks;
+            for(size_t i=0;i<paths.size();++i) chunks.push_back({paths[i],indices[i]});
+            nb::gil_scoped_release release;
+            h.bridge->await(source,caseIndex,remaining,chunks);
+        }, "source"_a,"case_index"_a,"remaining_base_voxels"_a,"array_paths"_a,"indices_zyx"_a);
+
     nb::class_<PredictionFieldHandle>(m, "PredictionField")
+        .def("set_live_bridge", [](PredictionFieldHandle& field,const LiveBridgeHandle& h,
+                                   const std::string& source,size_t caseIndex,double remaining,size_t capacity) {
+            if(source.empty() || !std::isfinite(remaining) || remaining<0)
+                throw std::invalid_argument("invalid live source or remaining distance");
+            auto readiness=std::make_shared<ft::FiberCaseReadiness>(capacity);
+            field.field->setReadinessGate([bridge=h.bridge,readiness,source,caseIndex,remaining](const auto& chunks) {
+                readiness->await(chunks,[&](const auto& missing) {
+                    auto wait=[&] { bridge->await(source,caseIndex,remaining,missing); };
+                    if(auto* permit=ft::FiberConstructionCpuPermit::current()) permit->suspend(wait);
+                    else wait();
+                },[&] { bridge->checkActive(); });
+            });
+        }, "bridge"_a,"source"_a,"case_index"_a=0,"remaining_base_voxels"_a=0,
+           "proof_cache_capacity"_a=4096,
+           "Attach before sampling. The field retains this session; no Python callbacks run during native work.")
         .def_prop_ro("trace_to_base_scale",
                      [](const PredictionFieldHandle& self) { return self.scales.traceToBaseScale; })
         .def_prop_ro("prediction_to_base_scale",
@@ -519,12 +578,16 @@ NB_MODULE(fiber_trace, m)
              "field"_a,"normal_sampler"_a,"trace_config"_a,"chunk_config"_a,"output_directory"_a,"source_identity"_a,
              nb::keep_alive<1,2>(),nb::keep_alive<1,3>())
         .def("get",&ChunkCacheHandle::get,"key_xyz"_a)
+        .def("get_many",&ChunkCacheHandle::getMany,"keys_xyz"_a,"workers"_a=4,"contexts_per_worker"_a=8,
+             "Bounded native cases; ordered results, cooperative publication and cache waits.")
         .def("route",&chunkRoute,"center_base"_a,"direction"_a,"metric"_a.noconvert(),
              "maximum_distance_base"_a,"maximum_steps"_a,
              "Return committed suffix points (excluding initial snap), reason and join diagnostics.")
         .def("replay",&chunkReplay,"reference_base"_a.noconvert(),"evaluation_normals"_a,"config"_a,
              "begin_arc_base"_a=0.,"end_arc_base"_a=nb::none(),"reverse_interval_base"_a=0.,
              "Shared reference replay; optional reverse checks use the configured acceptance radii.");
+
+    m.def("case_queue_supported",&ft::FiberCaseQueue::supported);
 
     nb::class_<ft::FiberTraceConfig>(m, "TraceConfig")
         .def("__init__", [](ft::FiberTraceConfig* self, nb::kwargs kwargs) {
