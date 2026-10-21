@@ -302,7 +302,7 @@ def _distributed_worker(rank, path, rendezvous, device):
     torch.set_num_threads(1)
     torch.manual_seed(151)
 
-    def initialize(config):
+    def initialize(config, *, init_method=None):
         if config.device.type == "cuda":
             torch.cuda.set_device(config.device)
         dist.init_process_group(config.backend, init_method=rendezvous, rank=rank,
