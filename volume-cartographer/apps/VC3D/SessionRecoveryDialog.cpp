@@ -144,7 +144,11 @@ void SessionRecoveryDialog::recover()
     }
     const bool copied = _recovery && _recovery->writeNow();
     _claim.reset();
-    QString status = tr("Recovered %1 from the previous session.").arg(pointsText(_session));
+    // The points are back in memory only; a normal quit deletes this
+    // session's copy, so say how to keep them.
+    QString status = tr("Recovered %1 from the previous session. Save them with Save in the Point "
+                        "Collections dock to keep them.")
+                         .arg(pointsText(_session));
     if (copied) {
         SessionRecovery::discard(_session);
     } else {

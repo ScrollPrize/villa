@@ -154,6 +154,22 @@ QFileInfoList sessionFolders(const QString& directory)
                                          QDir::Dirs | QDir::NoDotAndDotDot | QDir::NoSymLinks);
 }
 
+// A folder that another VC3D may be creating right now: it has no record yet
+// and changed in the last minute. begin() makes the folder before it takes
+// the lock, so in between such a folder looks like a crashed session's.
+// Pruning and listing leave it alone, and do not even try its lock, which
+// would make that VC3D's begin() fail.
+constexpr int kFreshFolderSeconds = 60;
+
+bool mayBeStarting(const QFileInfo& folder)
+{
+    if (QFileInfo::exists(QDir(folder.absoluteFilePath()).filePath(kRecordFile))) {
+        return false;
+    }
+    const QDateTime changed = folder.lastModified();
+    return changed.isValid() && changed.secsTo(QDateTime::currentDateTime()) < kFreshFolderSeconds;
+}
+
 SessionRecovery::LeftoverSession readLeftover(const QString& directory)
 {
     SessionRecovery::LeftoverSession session;
@@ -437,7 +453,8 @@ std::vector<SessionRecovery::LeftoverSession> SessionRecovery::leftoverSessions(
     const QFileInfoList folders = sessionFolders(_directory);
     for (const QFileInfo& folder : folders) {
         const QString directory = folder.absoluteFilePath();
-        if (directory == QFileInfo(_sessionDir).absoluteFilePath() || heldByRunningSession(directory)) {
+        if (directory == QFileInfo(_sessionDir).absoluteFilePath() || mayBeStarting(folder) ||
+            heldByRunningSession(directory)) {
             continue;
         }
         LeftoverSession session = readLeftover(directory);
@@ -457,7 +474,8 @@ void SessionRecovery::pruneLeftovers()
     const QFileInfoList folders = sessionFolders(_directory);
     for (const QFileInfo& folder : folders) {
         const QString directory = folder.absoluteFilePath();
-        if (directory == QFileInfo(_sessionDir).absoluteFilePath() || heldByRunningSession(directory)) {
+        if (directory == QFileInfo(_sessionDir).absoluteFilePath() || mayBeStarting(folder) ||
+            heldByRunningSession(directory)) {
             continue;
         }
         const LeftoverSession session = readLeftover(directory);

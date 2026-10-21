@@ -92,7 +92,9 @@ public:
     [[nodiscard]] static const QStringList& temporaryCollections();
 
     // Sessions that ended without a clean exit and left points to recover,
-    // newest first. Sessions of running VC3D instances are skipped.
+    // newest first. Sessions of running VC3D instances are skipped, and so
+    // are folders less than a minute old without a record, which another
+    // VC3D may be creating.
     [[nodiscard]] std::vector<LeftoverSession> leftoverSessions() const;
 
     // Takes a leftover session's lock, so no other VC3D offers it while this

@@ -23,9 +23,12 @@
 
 #include "VCSettings.hpp"
 
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <memory>
+#include <system_error>
 
 #ifdef Q_OS_UNIX
 #include <sys/stat.h>
@@ -685,6 +688,8 @@ private slots:
         QCOMPARE(window.calls.at(1),
                  QStringLiteral("segment %1 with 1 points; copy 1 points for segment %1; old copy gone").arg(kSegment));
         QVERIFY(window.calls.at(2).contains("Recovered 1 point"));
+        // The points are only in memory now; the message says how to keep them.
+        QVERIFY(window.calls.at(2).contains("Save in the Point Collections dock"));
         QCOMPARE(live.getPoints("corrections").size(), std::size_t{1});
         QCOMPARE(live.getPoints("segment corrections").size(), std::size_t{1});
         QVERIFY(session.leftoverSessions().empty());
@@ -830,6 +835,37 @@ private slots:
         QVERIFY(SessionRecovery::restorePoints(leftovers.front(), &restored));
         QCOMPARE(restored.getAllCollections().size(), std::size_t{1});
         QCOMPARE(restored.getPoints("my points").size(), std::size_t{1});
+    }
+
+    void folderAnotherVC3DIsCreatingIsLeftAlone()
+    {
+        // begin() makes its folder before it takes the lock. A second VC3D
+        // starting at that moment must not prune the folder, or the first one
+        // runs without recovery.
+        QTemporaryDir root;
+        const QString starting = QDir(root.path()).filePath("session-starting");
+        QVERIFY(QDir().mkpath(starting));
+        // The same, but from a start long ago that never got further.
+        const QString stale = QDir(root.path()).filePath("session-stale");
+        QVERIFY(QDir().mkpath(stale));
+        std::error_code error;
+        std::filesystem::last_write_time(QFile::encodeName(stale).toStdString(),
+                                         std::filesystem::file_time_type::clock::now() - std::chrono::minutes(5),
+                                         error);
+        QVERIFY(!error);
+
+        SessionRecovery session(root.path());
+        QVERIFY(session.begin(nullptr));
+        QVERIFY(session.leftoverSessions().empty());
+        QVERIFY(QFileInfo::exists(starting));
+        QVERIFY(!QFileInfo::exists(QDir(starting).filePath("session.lock")));
+        QVERIFY(!QFileInfo::exists(stale));
+        session.markCleanExit();
+
+        // The starting VC3D can still take its lock.
+        SessionRecovery::LeftoverSession other;
+        other.directory = starting;
+        QVERIFY(SessionRecovery::claim(other));
     }
 
     void pruningAndDiscardNeverFollowALink()
