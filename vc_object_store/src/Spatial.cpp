@@ -1,0 +1,373 @@
+#include "internal/Database.hpp"
+#include "internal/Spatial.hpp"
+#include "geometry/GeometryReader.hpp"
+#include "geometry/ArrayBytes.hpp"
+#include <bit>
+#include <tuple>
+
+namespace vc::objects::detail {
+nlohmann::json coordinateBounds(std::span<const uint8_t> bytes,const std::string& dtype,bool patch) {
+    GeometryPhase phase("coordinateBounds");
+    std::optional<std::array<double,6>> result;
+    auto scan=[&]<class T>() {
+        if (bytes.size()%(3*sizeof(T))) throw std::runtime_error("unaligned coordinate array");
+        for (size_t offset=0;offset<bytes.size();offset+=3*sizeof(T)) {
+            std::array<T,3> point; copyScalars<T>(bytes.subspan(offset,3*sizeof(T)),point);
+            const double x=point[0],y=point[1],z=point[2];
+            if (!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)||(patch&&x==-1&&z<=0)) continue;
+            if(!result)result=std::array<double,6>{x,y,z,x,y,z};
+            else for(size_t axis=0;axis<3;++axis) {(*result)[axis]=std::min((*result)[axis],double(point[axis]));(*result)[axis+3]=std::max((*result)[axis+3],double(point[axis]));}
+        }
+    };
+    if (dtype=="<f8") scan.template operator()<double>();
+    else if (dtype=="<f4") scan.template operator()<float>();
+    else if (dtype=="<i4") scan.template operator()<int32_t>();
+    else throw std::runtime_error("unsupported coordinate dtype");
+    return result?nlohmann::json(*result):nlohmann::json();
+}
+void validateBounds(const Bounds& bounds)
+{
+    for (int axis = 0; axis < 3; ++axis)
+        if (!std::isfinite(bounds[axis]) || !std::isfinite(bounds[axis + 3]) || bounds[axis] > bounds[axis + 3])
+            throw std::invalid_argument("spatial bounds must be finite, ordered minXYZ,maxXYZ coordinates");
+}
+
+std::string spatialOverlapSql(int firstParameter)
+{
+    std::string sql;
+    for (int axis = 0; axis < 3; ++axis) {
+        const auto low = "?" + std::to_string(firstParameter + axis);
+        const auto high = "?" + std::to_string(firstParameter + axis + 3);
+        const std::string coordinate(1, "xyz"[axis]);
+        if (axis) sql += " AND ";
+        sql += "r.max_" + coordinate + ">=max(-1e30,min(1e30," + low + ")) AND r.min_" + coordinate +
+            "<=max(-1e30,min(1e30," + high + ")) AND b.max_" + coordinate + ">=" + low +
+            " AND b.min_" + coordinate + "<=" + high;
+    }
+    return sql;
+}
+
+std::optional<Bounds> recordBounds(const ObjectRecord& object)
+{
+    if (object.kind == "fiber" && object.fiber) return object.fiber->bbox;
+    if (object.kind == "patch" && object.patch) return object.patch->bbox;
+    if (object.kind == "track" && object.track) return object.track->bbox;
+    return std::nullopt;
+}
+
+namespace {
+struct BoundsBuilder {
+    std::optional<Bounds> bounds;
+    void merge(const Bounds& b) {
+        if (!bounds) bounds = b;
+        else for (size_t axis = 0; axis < 3; ++axis) {
+            (*bounds)[axis] = std::min((*bounds)[axis], b[axis]);
+            (*bounds)[axis + 3] = std::max((*bounds)[axis + 3], b[axis + 3]);
+        }
+    }
+    void append(std::span<const uint8_t> bytes, const std::string& dtype, bool patch) {
+        const auto value=coordinateBounds(bytes,dtype,patch);
+        if(!value.is_null())merge(value.get<Bounds>());
+    }
+};
+bool coordinates(const std::string& kind, const std::string& name) {
+    return kind == "fiber" ? name == "line_points" || name == "control_points" : name == "points";
+}
+}
+
+namespace {
+void writeBounds(sqlite3* db, int64_t objectId, const std::optional<Bounds>& bounds,
+                 const std::optional<std::string>& revision)
+{
+    if (!bounds) {
+        execute(db, "DELETE FROM object_bounds WHERE object_id=?", objectId); return;
+    }
+    validateBounds(*bounds);
+    Statement put(db, "INSERT INTO object_bounds VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(object_id) DO UPDATE SET "
+        "revision_uuid=excluded.revision_uuid,min_x=excluded.min_x,min_y=excluded.min_y,min_z=excluded.min_z,"
+        "max_x=excluded.max_x,max_y=excluded.max_y,max_z=excluded.max_z", objectId);
+    if (revision) put.bind(2, parseUuid(*revision)); else put.bindNull(2);
+    for (size_t i = 0; i < 6; ++i) put.bind(int(i) + 3, (*bounds)[i]);
+    put.stepDone();
+}
+
+// Starts/counts exclude the final XYZ axis. Patches use rows and columns;
+// one-dimensional arrays use row_start/count and zero column values.
+struct Region {
+    int64_t id = 0, rows = 0, columns = 0;
+    Bounds bounds;
+};
+using RegionKey = std::tuple<std::string, int64_t, int64_t>;
+
+class RegionWriter {
+public:
+    RegionWriter(sqlite3* db, int64_t objectId) : objectId_(objectId),
+        put_(db, "INSERT INTO spatial_regions(object_id,array_name,row_start,col_start,row_count,col_count,"
+            "min_x,min_y,min_z,max_x,max_y,max_z) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(object_id,array_name,row_start,col_start) DO UPDATE SET "
+            "row_count=excluded.row_count,col_count=excluded.col_count,min_x=excluded.min_x,min_y=excluded.min_y,"
+            "min_z=excluded.min_z,max_x=excluded.max_x,max_y=excluded.max_y,max_z=excluded.max_z"),
+        remove_(db, "DELETE FROM spatial_regions WHERE object_id=? AND array_name=? AND row_start=? AND col_start=?") {}
+    void update(const std::string& name, int64_t row, int64_t col, int64_t rows, int64_t cols,
+                const std::optional<Bounds>& bounds) {
+        auto& statement = bounds ? put_ : remove_;
+        statement.reset(); statement.bind(1, objectId_); statement.bind(2, name); statement.bind(3, row); statement.bind(4, col);
+        if (bounds) {
+            statement.bind(5, rows); statement.bind(6, cols);
+            for (int i = 0; i < 6; ++i) statement.bind(i+7, (*bounds)[i]);
+        }
+        statement.stepDone();
+    }
+private:
+    int64_t objectId_;
+    Statement put_, remove_;
+};
+
+template<class Read, class ReadRectangle>
+void indexGeometry(sqlite3* db, int64_t objectId, const std::string& revision,
+                   const std::string& kind, const std::vector<GeometryArrayInfo>& arrays, Read&& read, ReadRectangle&& readRectangle, bool tiledPatch = false)
+{
+    // Reuse unchanged entries rather than churning the R-tree on every edit.
+    // Revision identity belongs to the object's head, so unchanged blocks do
+    // not need a write just because a different block changed.
+    std::map<RegionKey, Region> previous;
+    {
+        Statement old(db, "SELECT id,array_name,row_start,col_start,row_count,col_count,"
+            "min_x,min_y,min_z,max_x,max_y,max_z FROM spatial_regions WHERE object_id=? AND array_name!=''",
+            objectId);
+        while (old.row()) {
+            Region r{old.i64(0), old.i64(4), old.i64(5), {}};
+            for (int i = 0; i < 6; ++i) r.bounds[i] = old.f64(i + 6);
+            previous.emplace(RegionKey{old.text(1), old.i64(2), old.i64(3)}, r);
+        }
+    }
+    RegionWriter writer(db, objectId);
+    BoundsBuilder total;
+    auto emit = [&](const std::string& name, int64_t row, int64_t col, int64_t rows, int64_t cols,
+                    const BoundsBuilder& builder) {
+        if (geometryWork) ++geometryWork->spatialRows;
+        if (!builder.bounds) return;
+        const auto& box = *builder.bounds;
+        total.merge(box);
+        auto old = previous.find({name, row, col});
+        const bool unchanged = old != previous.end() && old->second.rows == rows && old->second.columns == cols
+            && old->second.bounds == box;
+        if (old != previous.end()) previous.erase(old);
+        if (unchanged) return;
+        writer.update(name, row, col, rows, cols, builder.bounds);
+    };
+    for (const auto& a : arrays) if (coordinates(kind, a.name)) {
+        const int64_t stride = a.dtype == "<f8" ? 24 : 12;
+        if (kind == "patch") {
+            const auto rows = a.shape.at(0), cols = a.shape.at(1);
+            if (!rows || !cols) continue;
+            constexpr int64_t cells = 32;
+            const int64_t tileColumns = (std::max<int64_t>(1, cols - 1) + cells - 1) / cells;
+            for (int64_t row = 0; row < std::max<int64_t>(1, rows - 1); row += cells) {
+                const int64_t height = std::min(cells + 1, rows - row);
+                std::vector<BoundsBuilder> tiles(static_cast<size_t>(tileColumns));
+                if (tiledPatch) {
+                    // Tiled payloads are visited as rectangles, once per region.
+                    for (int64_t t = 0; t < tileColumns; ++t) {
+                        const auto col = t * cells, width = std::min(cells + 1, cols - col);
+                        tiles[t].append(readRectangle(a.name, row, col, height, width), a.dtype, true);
+                    }
+                } else {
+                    // Linear and in-memory arrays need row-major traversal:
+                    // tile-major reads on a wide linear patch would repeatedly
+                    // fetch dozens of 1 MiB chunks for each small region.
+                    for (int64_t y = row; y < row + height; ++y)
+                        for (int64_t t = 0; t < tileColumns; ++t) {
+                            const auto col = t * cells, width = std::min(cells + 1, cols - col);
+                            tiles[t].append(read(a.name, (y * cols + col) * stride, width * stride), a.dtype, true);
+                        }
+                }
+                for (int64_t t = 0; t < tileColumns; ++t)
+                    emit(a.name, row, t * cells, height, std::min(cells + 1, cols - t * cells), tiles[t]);
+            }
+        } else {
+            const int64_t points = a.shape.at(0);
+            const bool line = kind == "fiber" || kind == "track";
+            constexpr int64_t block = 256;
+            const auto end = line ? std::max<int64_t>(1, points - 1) : points;
+            for (int64_t start = 0; points && start < end; start += block) {
+                const int64_t count = std::min(block + (line ? 1 : 0), points - start);
+                BoundsBuilder bounds;
+                bounds.append(read(a.name, start * stride, count * stride), a.dtype, false);
+                emit(a.name, start, 0, count, 0, bounds);
+            }
+        }
+    }
+    Statement remove(db, "DELETE FROM spatial_regions WHERE id=?");
+    for (const auto& [key, region] : previous) {
+        remove.bind(1, region.id); remove.stepDone(); remove.reset();
+    }
+    writeBounds(db, objectId, total.bounds, revision);
+}
+}
+
+void setSpatialBounds(sqlite3* db, int64_t objectId, const std::optional<Bounds>& bounds,
+                      const std::optional<std::string>& revision)
+{
+    writeBounds(db, objectId, bounds, revision);
+}
+
+void indexGeometryBounds(sqlite3* db, int64_t objectId, const std::string& revision, const GeometryData& geometry)
+{
+    std::vector<GeometryArrayInfo> arrays;
+    std::map<std::string, const GeometryArray*> data;
+    for (const auto& a : geometry.arrays) {
+        arrays.push_back({a.name, a.dtype, a.shape, static_cast<int64_t>(a.bytes.size())});
+        data.emplace(a.name, &a);
+    }
+    indexGeometry(db, objectId, revision, geometry.kind, arrays,
+        [&](const std::string& name, int64_t offset, int64_t count) {
+            return std::span<const uint8_t>(data.at(name)->bytes).subspan(offset, count);
+        }, [&](const std::string& name, int64_t row, int64_t col, int64_t rows, int64_t cols) {
+            const auto& a = *data.at(name);
+            std::vector<uint8_t> bytes(rows * cols * 12);
+            for (int64_t y = 0; y < rows; ++y)
+                std::memcpy(bytes.data() + y * cols * 12, a.bytes.data() + ((row + y) * a.shape[1] + col) * 12, cols * 12);
+            return bytes;
+        });
+}
+
+void refreshGeometryBounds(sqlite3* db, const std::string& objectUuid)
+{
+    Statement head(db, "SELECT o.id,h.revision_uuid FROM objects o JOIN geometry_heads h ON h.object_uuid=o.uuid WHERE o.uuid=?",
+        parseUuid(objectUuid));
+    if (!head.row()) return;
+    const auto revision = formatUuid(head.blob16(1));
+    GeometryReader reader(db, revision);
+    const auto& manifest = reader.manifest();
+    std::vector<GeometryArrayInfo> arrays;
+    for (const auto& [name, a] : manifest.at("arrays").items())
+        arrays.push_back({name, a.at("dtype"), a.at("shape").get<std::vector<int64_t>>(), a.at("byte_length")});
+    indexGeometry(db, head.i64(0), revision, manifest.at("kind").get<std::string>(), arrays,
+        [&](const std::string& name, int64_t offset, int64_t count) { return reader.read(name, offset, count); },
+        [&](const std::string& name, int64_t row, int64_t col, int64_t rows, int64_t cols) {
+            return reader.rectangle(name, row, col, rows, cols);
+        }, manifest.at("kind") == "patch" && manifest.at("arrays").at("points").contains("storage"));
+}
+
+void updateEditedGeometryBounds(sqlite3* db, int64_t objectId, const std::string& revision,
+                                const std::vector<GeometryArrayEdit>& edits)
+{
+    GeometryReader reader(db, revision);
+    const auto& manifest = reader.manifest();
+    const std::string kind = manifest.at("kind");
+    std::set<RegionKey> dirty;
+    for (const auto& edit : edits) {
+        if (edit.bytes.empty() || !coordinates(kind, edit.array)) continue;
+        const auto& a = manifest.at("arrays").at(edit.array);
+        const auto shape = a.at("shape").get<std::vector<int64_t>>();
+        const auto scalar = geometryByteLength(a.at("dtype"), {1});
+        const auto first = edit.elementOffset / 3;
+        const auto last = (edit.elementOffset + int64_t(edit.bytes.size() / scalar) - 1) / 3;
+        for (auto point = first; point <= last; ++point) {
+            if (kind == "patch") {
+                const auto row = point / shape[1], col = point % shape[1];
+                for (auto r : {row / 32 * 32, row > 0 && row % 32 == 0 ? row - 32 : row / 32 * 32})
+                    for (auto c : {col / 32 * 32, col > 0 && col % 32 == 0 ? col - 32 : col / 32 * 32})
+                        if (r < std::max<int64_t>(1, shape[0]-1) && c < std::max<int64_t>(1, shape[1]-1))
+                            dirty.emplace(edit.array, r, c);
+            } else {
+                const bool line = kind == "fiber" || kind == "track";
+                const auto end = line ? std::max<int64_t>(1, shape[0]-1) : shape[0];
+                const auto start = point / 256 * 256;
+                if (start < end) dirty.emplace(edit.array, start, 0);
+                if (line && point && point % 256 == 0) dirty.emplace(edit.array, point-256, 0);
+            }
+        }
+    }
+    RegionWriter writer(db, objectId);
+    for (const auto& [name, row, col] : dirty) {
+        const auto& a = manifest.at("arrays").at(name);
+        const auto shape = a.at("shape").get<std::vector<int64_t>>();
+        const std::string dtype = a.at("dtype");
+        const auto rows = std::min<int64_t>(kind == "patch" ? 33 : kind == "point_collection" ? 256 : 257, shape[0]-row);
+        const auto cols = kind == "patch" ? std::min<int64_t>(33, shape[1]-col) : 0;
+        BoundsBuilder bounds;
+        const auto stride = geometryByteLength(dtype, {3});
+        bounds.append(kind == "patch" ? reader.rectangle(name, row, col, rows, cols) : reader.read(name, row*stride, rows*stride),
+                      dtype, kind == "patch");
+        writer.update(name, row, col, rows, cols, bounds.bounds);
+    }
+    Statement total(db, "SELECT min(min_x),min(min_y),min(min_z),max(max_x),max(max_y),max(max_z) "
+                        "FROM spatial_regions WHERE object_id=? AND array_name!=''", objectId); total.row();
+    std::optional<Bounds> bounds;
+    if (!total.isNull(0)) {
+        bounds.emplace();
+        for (int i = 0; i < 6; ++i) (*bounds)[i] = total.f64(i);
+    }
+    writeBounds(db, objectId, bounds, revision);
+}
+
+namespace {
+void createRegionSchema(sqlite3* db)
+{
+    // One shared float R-tree holds both whole-object summaries and geometry
+    // regions. Exact double bounds eliminate outward-rounding false positives.
+    exec(db, R"SQL(
+CREATE TABLE spatial_regions(
+  id INTEGER PRIMARY KEY,
+  object_id INTEGER NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
+  array_name TEXT NOT NULL,
+  row_start INTEGER NOT NULL DEFAULT 0,col_start INTEGER NOT NULL DEFAULT 0,
+  row_count INTEGER NOT NULL DEFAULT 0,col_count INTEGER NOT NULL DEFAULT 0,
+  min_x REAL NOT NULL,min_y REAL NOT NULL,min_z REAL NOT NULL,
+  max_x REAL NOT NULL,max_y REAL NOT NULL,max_z REAL NOT NULL,
+  UNIQUE(object_id,array_name,row_start,col_start)
+);
+CREATE VIRTUAL TABLE spatial_regions_rtree USING rtree(id,min_x,max_x,min_y,max_y,min_z,max_z);
+CREATE TRIGGER spatial_regions_insert AFTER INSERT ON spatial_regions BEGIN
+  INSERT INTO spatial_regions_rtree VALUES(new.id,
+    max(-1e30,min(1e30,new.min_x)),max(-1e30,min(1e30,new.max_x)),
+    max(-1e30,min(1e30,new.min_y)),max(-1e30,min(1e30,new.max_y)),
+    max(-1e30,min(1e30,new.min_z)),max(-1e30,min(1e30,new.max_z)));
+END;
+CREATE TRIGGER spatial_regions_update AFTER UPDATE ON spatial_regions BEGIN
+  DELETE FROM spatial_regions_rtree WHERE id=old.id;
+  INSERT INTO spatial_regions_rtree VALUES(new.id,
+    max(-1e30,min(1e30,new.min_x)),max(-1e30,min(1e30,new.max_x)),
+    max(-1e30,min(1e30,new.min_y)),max(-1e30,min(1e30,new.max_y)),
+    max(-1e30,min(1e30,new.min_z)),max(-1e30,min(1e30,new.max_z)));
+END;
+CREATE TRIGGER spatial_regions_delete AFTER DELETE ON spatial_regions BEGIN
+  DELETE FROM spatial_regions_rtree WHERE id=old.id;
+END;
+CREATE TRIGGER object_bounds_insert AFTER INSERT ON object_bounds BEGIN
+  INSERT INTO spatial_regions(object_id,array_name,min_x,min_y,min_z,max_x,max_y,max_z)
+    VALUES(new.object_id,'',new.min_x,new.min_y,new.min_z,new.max_x,new.max_y,new.max_z);
+END;
+CREATE TRIGGER object_bounds_update AFTER UPDATE ON object_bounds
+WHEN old.min_x!=new.min_x OR old.min_y!=new.min_y OR old.min_z!=new.min_z
+  OR old.max_x!=new.max_x OR old.max_y!=new.max_y OR old.max_z!=new.max_z BEGIN
+  UPDATE spatial_regions SET min_x=new.min_x,min_y=new.min_y,min_z=new.min_z,
+    max_x=new.max_x,max_y=new.max_y,max_z=new.max_z WHERE object_id=new.object_id AND array_name='';
+END;
+CREATE TRIGGER object_bounds_delete AFTER DELETE ON object_bounds BEGIN
+  DELETE FROM spatial_regions WHERE object_id=old.object_id AND array_name='';
+END;
+)SQL");
+}
+}
+
+void createSpatialSchema(sqlite3* db)
+{
+    // Exact double bounds remain authoritative. SQLite's float R-tree is only
+    // the broad phase. Saturation preserves ordering for very large doubles;
+    // queries apply the same saturation and then recheck exact double bounds.
+    exec(db, R"SQL(
+CREATE TABLE object_bounds(
+  object_id INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,
+  revision_uuid BLOB REFERENCES geometry_revisions(uuid),
+  min_x REAL NOT NULL,min_y REAL NOT NULL,min_z REAL NOT NULL,
+  max_x REAL NOT NULL,max_y REAL NOT NULL,max_z REAL NOT NULL
+);
+CREATE INDEX objects_kind_uuid ON objects(kind,uuid);
+)SQL");
+    createRegionSchema(db);
+}
+
+}

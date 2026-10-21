@@ -1,11 +1,5 @@
 #pragma once
 #include "normal.hpp"
-#ifdef VC_READER_CUDA
-#include "../cuda_buffer.hpp"
-namespace vcr::sheet_normal {
-device::Storage cuda(const void* image,bool floating,const float* centers,std::size_t batch,int device,device::Storage output={});
-}
-#endif
 namespace vcr::sheet_normal {
 template<class A> inline bool validate(A image,std::size_t batch) {
     auto dt=image.dtype();
