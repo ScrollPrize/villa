@@ -54,6 +54,9 @@ struct FiberTraceProfile {
     double startSampleSeconds = 0.0;
     double taskBuildSeconds = 0.0;
     double predictionBatchSeconds = 0.0;
+    double readinessPlanSeconds = 0.0;
+    size_t readinessPlanPoints = 0;
+    size_t readinessPlanDependencies = 0;
     double predictionPrepareSeconds = 0.0;
     double predictionPrefetchSeconds = 0.0;
     double predictionAssignSeconds = 0.0;
@@ -337,6 +340,17 @@ public:
         const cv::Vec3d& referenceDirection) const = 0;
 };
 
+struct FiberPredictionChunkDependency {
+    std::filesystem::path arrayPath;
+    std::array<uint32_t, 3> indexZYX{};
+    bool operator==(const FiberPredictionChunkDependency&) const = default;
+};
+
+// Runs before sampling reads or cache locks. Return only after every requested
+// chunk's coherent product is published; throw on cancellation or failure.
+using FiberPredictionReadinessGate =
+    std::function<void(const std::vector<FiberPredictionChunkDependency>&)>;
+
 struct FiberPredictionFieldOptions {
     FiberPredictionFieldBindingMode bindingMode = FiberPredictionFieldBindingMode::TraceOptions;
     size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL;
@@ -346,6 +360,9 @@ struct FiberPredictionFieldOptions {
 
 class FiberPredictionField final : public FiberPredictionSource {
 public:
+    // Configure before concurrent sampling; empty keeps offline behavior.
+    // The gate may be called concurrently and must not sample this field itself.
+    void setReadinessGate(FiberPredictionReadinessGate gate);
     FiberPredictionField(const vc::lasagna::LasagnaDataset& dataset,
                          const FiberPredictionFieldOptions& options);
     void sampleWidths(const std::vector<cv::Vec3f>& points, std::vector<float>& widths) const override;
