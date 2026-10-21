@@ -694,6 +694,9 @@ static int run_main(int argc, char *argv[])
                   << "Set \"thread_limit\" in the params JSON (VC3D uses 1) or "
                   << "OMP_NUM_THREADS to cap it." << std::endl;
     }
+    if (rng_seed && omp_get_max_threads() > 1)
+        std::cout << "WARNING: --rng-seed is only repeatable single-threaded, but running with " << omp_get_max_threads()
+                  << " threads; set \"thread_limit\": 1 or OMP_NUM_THREADS=1." << std::endl;
 
     std::unique_ptr<QuadSurface> resume_surf;
     if (mode == "resume") {
