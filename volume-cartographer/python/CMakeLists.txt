@@ -13,6 +13,14 @@ endif()
 
 find_package(nanobind CONFIG REQUIRED)
 
+# Mach-O has no $ORIGIN; @loader_path is its equivalent. Two-entry rpaths are
+# CMake lists so macOS gets one LC_RPATH each (Linux still joins them with ':').
+if(APPLE)
+    set(VC_PY_RPATH_ORIGIN "@loader_path")
+else()
+    set(VC_PY_RPATH_ORIGIN "$ORIGIN")
+endif()
+
 configure_file(vc/__init__.py
     "${CMAKE_CURRENT_BINARY_DIR}/vc/__init__.py"
     COPYONLY
@@ -45,13 +53,13 @@ nanobind_add_module(vc_lasagna_amgx
 
 set_target_properties(vc_lasagna_amgx PROPERTIES
     OUTPUT_NAME vc_lasagna_amgx
-    INSTALL_RPATH "$ORIGIN"
+    INSTALL_RPATH "${VC_PY_RPATH_ORIGIN}"
 )
 
 target_link_libraries(vc_lasagna_amgx PRIVATE vc_lasagna)
 
 set_target_properties(vc_core vc_lasagna utils utils_c3d_codec c3d utils_volcomp_codec volcomp PROPERTIES
-    INSTALL_RPATH "$ORIGIN"
+    INSTALL_RPATH "${VC_PY_RPATH_ORIGIN}"
 )
 
 nanobind_add_module(vc_volume
@@ -64,7 +72,7 @@ set_target_properties(vc_volume PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
     # Modules live in vc/ but libvc_core.so etc. install to the
     # site-packages root one level up, so search both.
-    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
+    INSTALL_RPATH "${VC_PY_RPATH_ORIGIN};${VC_PY_RPATH_ORIGIN}/.."
 )
 target_link_libraries(vc_volume PRIVATE vc_core vc_lasagna)
 target_compile_features(vc_volume PRIVATE cxx_std_23)
@@ -76,7 +84,7 @@ set_target_properties(vc_surface_index PROPERTIES
     OUTPUT_NAME surface_index
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
     # See vc_volume above: libs are one dir up in site-packages root.
-    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
+    INSTALL_RPATH "${VC_PY_RPATH_ORIGIN};${VC_PY_RPATH_ORIGIN}/.."
 )
 target_link_libraries(vc_surface_index PRIVATE vc_core)
 target_compile_features(vc_surface_index PRIVATE cxx_std_23)
@@ -88,7 +96,7 @@ nanobind_add_module(vc_grid_raycast
 set_target_properties(vc_grid_raycast PROPERTIES
     OUTPUT_NAME grid_raycast
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
-    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
+    INSTALL_RPATH "${VC_PY_RPATH_ORIGIN};${VC_PY_RPATH_ORIGIN}/.."
 )
 target_link_libraries(vc_grid_raycast PRIVATE OpenMP::OpenMP_CXX)
 target_compile_features(vc_grid_raycast PRIVATE cxx_std_23)
@@ -103,11 +111,11 @@ nanobind_add_module(vc_fiber_trace
 set_target_properties(vc_fiber_trace PROPERTIES
     OUTPUT_NAME fiber_trace
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/vc"
-    INSTALL_RPATH "$ORIGIN:$ORIGIN/.."
+    INSTALL_RPATH "${VC_PY_RPATH_ORIGIN};${VC_PY_RPATH_ORIGIN}/.."
 )
 target_link_libraries(vc_fiber_trace PRIVATE vc_fiber_tracer)
 target_compile_features(vc_fiber_trace PRIVATE cxx_std_23)
-set_target_properties(vc_fiber_tracer PROPERTIES INSTALL_RPATH "$ORIGIN")
+set_target_properties(vc_fiber_tracer PROPERTIES INSTALL_RPATH "${VC_PY_RPATH_ORIGIN}")
 
 install(TARGETS vc_lasagna_amgx
     LIBRARY DESTINATION .
