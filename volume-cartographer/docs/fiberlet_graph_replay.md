@@ -48,8 +48,9 @@ non-concurrent query support and must explicitly opt in for parallel queries.
 This API is synchronous. Progress/failure callbacks execute within the replay
 call; it does not start processes, reserve GPUs or reload experiment configs.
 The storage adapter below connects the same search to stored and generated
-chunks. Whole-crop seeding/coverage, graph visualization and experimental
-layout/consensus algorithms remain separate. Format-3 encoding is unchanged.
+chunks. Crop seeding/coverage is described below; graph visualization and
+experimental layout/consensus algorithms remain separate. Format-3 encoding
+is unchanged.
 
 ## Stored and on-demand graph sources
 
@@ -98,7 +99,74 @@ for lexicographic endpoint ownership across chunk boundaries. Optional wait
 executors must synchronously complete the supplied wait and be configured
 before queries start. Stored replay is blocking and conservatively reports
 non-concurrent query support; do not enable parallel expansion for this adapter.
-Immutable materialization for parallel crop tracing is a subsequent layer.
+Use immutable materialization below for parallel crop tracing.
+
+## Crop tracing without a reference line
+
+`vc/fiber_tracer/FiberletCropTrace.hpp` provides callable graph and dense
+crop backends. Both start from canonical anchors, trace in both directions,
+clip at the first crop exit and suppress covered seeds using normal/tangential
+distance and sign-agnostic direction agreement. They do not use a GT line.
+
+```cpp
+FiberletCropTraceConfig crop;
+crop.minimumBaseXYZ = minimumBaseXYZ;
+crop.maximumBaseXYZ = maximumBaseXYZ;
+crop.parallelThreads = 4;
+const auto search = fiberletCropTraceSearchBox(crop);
+auto materialized = source.materializeBaseBoxForSeeds(
+    search.minimumBaseXYZ, search.maximumBaseXYZ,
+    crop.minimumBaseXYZ, crop.maximumBaseXYZ, 4);
+auto traced = traceFiberletCrop(
+    *materialized.graph, materialized.insideAnchors, normals,
+    normalWorkingToBaseScale, crop);
+```
+
+The graph box includes lookahead outside the output crop. Materialization
+retains incident edges and their exterior endpoints, but does not allow joins
+at exterior endpoints. It preserves degree-zero seeds and stored geometry,
+cost profiles and join costs. Loading reuses the existing chunk adapter;
+only join construction is parallel. Irrelevant halo edges are filtered before
+resolving their endpoints. Required missing/corrupt data still fails explicitly.
+The returned immutable graph owns its data independently of chunk-cache leases.
+
+Seeds are ordered by decreasing presence, then stable storage key. A bounded
+window computes candidates concurrently and commits in that same order.
+Coverage, output geometry and cost are deterministic across worker counts;
+speculative-work counts and timing are not. Custom sources/samplers that do
+not support concurrent access automatically run serially. Progress callbacks
+run on the calling thread. Limits on attempts, accepted lines and graph search
+states are explicit configuration fields.
+
+The dense backend uses the existing production beam tracer:
+
+```cpp
+crop.reverseConsistency = true;
+auto traced = traceDenseBeamCrop(
+    predictions, anchors, predictionToBaseScale, normals, denseConfig, crop);
+```
+
+Here normal sampling uses `denseConfig.traceToBaseScale`; prediction-grid,
+trace and base coordinates are distinct. Forward/backward checking reuses the
+shared consistency implementation, optionally checks prefixes, and returns
+independent retained pieces with original-seed provenance. Results report
+reverse attempts/failures and skipped base-voxel length. Optional accepted-trace
+stopping uses indexed segments and revalidates speculative candidates at commit.
+
+Backend restrictions are explicit, not silently ignored:
+
+| Option | Fiberlet graph | Dense beam |
+|---|---|---|
+| Bidirectional tracing / seed coverage | Yes | Yes |
+| Forward/backward consistency / prefix checks | Rejected | Yes |
+| Stop at previously covered anchors | Yes | Rejected |
+| Stop at accepted trace segments | Rejected | Yes |
+| Graph ambiguity / stored-cost-density threshold | Yes | Rejected |
+
+`importFiberCropLines` clips external polylines without connecting reentry
+gaps. Imported zero costs mean “unavailable”, not perfect quality.
+These APIs do not reserve GPUs, start inference processes or write artifacts;
+the caller owns source readiness, output publication and visualization.
 
 ## Tests
 
@@ -122,4 +190,17 @@ Also build/run `test_fiberlet_storage` for cross-chunk leases, on-demand reuse,
 published endpoint independence and metadata recovery. Its optional
 `VC_TEST_STORED_GRAPH` fixture is a read-only cache directory containing
 `anchors.zarr` and `fiberlets.zarr` with Paris4 chunk `12/44/20`; the test
-checks reconstructed geometry and exact reversal without generation.
+checks reconstructed geometry and exact reversal without generation. With
+`VC_TEST_GRAPH_NORMALS` and `VC_TEST_GRAPH_PREDICTIONS`, it also compares
+serial/four-worker graph crop and dense consistency-filtered crop results.
+These are mechanical equivalence checks, not annotated accuracy benchmarks.
+
+Build `test_fiberlet_crop_trace` as well, then run the three suites:
+
+```sh
+ctest --test-dir build --output-on-failure -R '^test_fiberlet_(paths|storage|crop_trace)$'
+```
+
+Crop regressions cover bidirectional starts, crop exits, deterministic parallel
+coverage, ordered failures, search-state limits, ambiguity, quality rejection,
+dense accepted-trace stopping, scale conversion, reverse gaps and imported runs.

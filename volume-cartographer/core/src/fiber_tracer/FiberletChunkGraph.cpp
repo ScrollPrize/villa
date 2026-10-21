@@ -23,6 +23,27 @@ namespace vc::fiber_tracer
 namespace
 {
 
+float vectorLength(const cv::Vec3f& value);
+
+FiberletReplaySourceCostProfile storedRouteCostProfile(const FiberletRouteLease& route)
+{
+    FiberletReplaySourceCostProfile result;
+    result.segmentLengthsPredictionVoxels.reserve(
+        route.pointsPredictionXYZ.size() - 1);
+    for (std::size_t index = 1;
+         index < route.pointsPredictionXYZ.size(); ++index) {
+        const float length = vectorLength(
+            route.pointsPredictionXYZ[index] -
+            route.pointsPredictionXYZ[index - 1]);
+        if (!(length > 0.0F) || !std::isfinite(length))
+            throw std::runtime_error(
+                "stored Fiberlet route segment length is invalid");
+        result.segmentLengthsPredictionVoxels.push_back(length);
+    }
+    result.segmentCostDensities = route.route.segmentCostDensities;
+    return result;
+}
+
 std::int64_t floorDiv(std::int64_t numerator, std::int64_t denominator)
 {
     if (denominator <= 0)
@@ -1004,20 +1025,7 @@ FiberletStoredReplayGraphSource::costProfile(
     if (loaded.status != FiberletGraphQueryStatus::Ready)
         throw std::runtime_error(
             "stored Fiberlet cost profile failed: " + loaded.error);
-    FiberletReplaySourceCostProfile result;
-    result.segmentLengthsPredictionVoxels.reserve(
-        loaded.value.pointsPredictionXYZ.size() - 1);
-    for (std::size_t index = 1;
-         index < loaded.value.pointsPredictionXYZ.size(); ++index) {
-        const float length = vectorLength(
-            loaded.value.pointsPredictionXYZ[index] -
-            loaded.value.pointsPredictionXYZ[index - 1]);
-        if (!(length > 0.0F) || !std::isfinite(length))
-            throw std::runtime_error(
-                "stored Fiberlet route segment length is invalid");
-        result.segmentLengthsPredictionVoxels.push_back(length);
-    }
-    result.segmentCostDensities = loaded.value.route.segmentCostDensities;
+    auto result = storedRouteCostProfile(loaded.value);
     if (id.reverse) {
         std::reverse(
             result.segmentLengthsPredictionVoxels.begin(),
@@ -1064,4 +1072,148 @@ FiberletStoredReplayGraphSource::metadata() const noexcept
     return dataset_->metadata();
 }
 
+
+FiberletMaterializedReplayGraph
+FiberletStoredReplayGraphSource::materializeBaseBox(
+    const cv::Vec3d& minimum, const cv::Vec3d& maximum,
+    std::size_t parallelThreads) const
+{
+    return materializeBaseBoxForSeeds(
+        minimum, maximum, minimum, maximum, parallelThreads);
+}
+
+FiberletMaterializedReplayGraph
+FiberletStoredReplayGraphSource::materializeBaseBoxForSeeds(
+    const cv::Vec3d& minimum, const cv::Vec3d& maximum,
+    const cv::Vec3d& seedMinimum, const cv::Vec3d& seedMaximum,
+    std::size_t parallelThreads) const
+{
+    if (parallelThreads == 0)
+        throw std::invalid_argument("fiberlet materialization needs positive worker count");
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(seedMinimum[axis]) ||
+            !std::isfinite(seedMaximum[axis]) ||
+            !(seedMaximum[axis] > seedMinimum[axis]) ||
+            !(seedMinimum[axis] >= minimum[axis]) ||
+            !(seedMaximum[axis] <= maximum[axis]))
+            throw std::invalid_argument("fiberlet seed box must be inside the graph box");
+    }
+    const auto inside = [](const cv::Vec3d& p, const cv::Vec3d& lo, const cv::Vec3d& hi) {
+        return p[0] >= lo[0] && p[0] < hi[0] &&
+               p[1] >= lo[1] && p[1] < hi[1] &&
+               p[2] >= lo[2] && p[2] < hi[2];
+    };
+    const float scale = predictionToBaseScale();
+    const auto seeds = anchorsInBaseBox(minimum, maximum, 16);
+    FiberletMaterializedReplayGraph result;
+    std::map<FiberletStorageKey, FiberletStoredAnchor> anchors;
+    std::set<FiberletStorageKey> insideKeys;
+    std::vector<FiberletStorageKey> keys;
+    for (const auto& seed : seeds) {
+        anchors.emplace(seed.key, seed);
+        insideKeys.insert(seed.key);
+        keys.push_back(seed.key);
+        if (inside(cv::Vec3d(seed.positionPredictionXYZ * scale), seedMinimum, seedMaximum))
+            result.insideAnchors.push_back(seed);
+    }
+
+    // Read each prefix owner once. Filter before resolving geometry so unrelated
+    // sparse halo tuples cannot force unavailable endpoint/route dependencies.
+    std::set<FiberletStorageId> ids;
+    for (const auto& owner : chunks_.incidentPrefixChunks(keys)) {
+        const auto prefixes = chunks_.prefixesInChunk(owner, true);
+        if (prefixes.status != FiberletGraphQueryStatus::Ready)
+            throw std::runtime_error("fiberlet materialization prefixes: " + prefixes.error);
+        for (const auto& prefix : prefixes.value.payloadLease->prefixes) {
+            if (insideKeys.contains(prefix.id.first) || insideKeys.contains(prefix.id.second)) {
+                if (!ids.insert(prefix.id).second)
+                    throw std::runtime_error("fiberlet materialization duplicate edge");
+            }
+        }
+    }
+    if (ids.size() > std::numeric_limits<std::uint32_t>::max() / 2)
+        throw std::overflow_error("too many directed fiberlet arcs to materialize");
+
+    std::vector<FiberletImmutableReplayEdge> edges;
+    std::vector<FiberletReplaySourceArc> arcs;
+    std::map<FiberletStorageKey, std::vector<std::size_t>> outgoing;
+    edges.reserve(ids.size());
+    arcs.reserve(ids.size() * 2);
+    for (const auto& id : ids) {
+        // These shared accessors handle both generated anchor views and format 3
+        // embedded endpoints. Do not bypass them with direct owner-chunk loads.
+        const auto edge = chunks_.edge(id, true);
+        if (edge.status != FiberletGraphQueryStatus::Ready)
+            throw std::runtime_error("fiberlet materialization edge: " + edge.error);
+        const auto route = chunks_.route(id, true);
+        if (route.status != FiberletGraphQueryStatus::Ready)
+            throw std::runtime_error("fiberlet materialization route: " + route.error);
+        for (const auto& anchor : {edge.value.firstAnchor, edge.value.secondAnchor}) {
+            const auto [found, inserted] = anchors.emplace(anchor.key, anchor);
+            if (!inserted && cv::norm(found->second.positionPredictionXYZ -
+                                     anchor.positionPredictionXYZ) * scale > 1.e-5)
+                throw std::runtime_error("fiberlet materialization inconsistent endpoint");
+        }
+        auto forward = directedStoredArc(edge.value, {id, false}, scale);
+        auto reverse = directedStoredArc(edge.value, {id, true}, scale);
+        outgoing[forward.source].push_back(arcs.size());
+        arcs.push_back(forward);
+        outgoing[reverse.source].push_back(arcs.size());
+        arcs.push_back(reverse);
+        std::vector<cv::Vec3d> points;
+        points.reserve(route.value.pointsPredictionXYZ.size());
+        for (const auto& point : route.value.pointsPredictionXYZ)
+            points.emplace_back(point * scale);
+        edges.push_back({forward, storedRouteCostProfile(route.value), std::move(points)});
+    }
+
+    // Once materialized, joins are CPU-only calculations over fixed anchors.
+    // Per-input slots preserve canonical order regardless of worker completion.
+    std::vector<std::vector<FiberletImmutableReplayTransition>> transitions(arcs.size());
+    std::vector<std::exception_ptr> failures(arcs.size());
+    const auto build = [&](std::size_t incoming) {
+        try {
+            const auto& arc = arcs[incoming];
+            if (!insideKeys.contains(arc.target))
+                return;
+            const auto found = outgoing.find(arc.target);
+            if (found == outgoing.end())
+                return;
+            for (const auto next : found->second) {
+                const auto transition = chunks_.transitionCostAtAnchor(
+                    arc, arcs[next], anchors.at(arc.target), maximumJoinAngleDegrees_);
+                if (transition.status != FiberletGraphQueryStatus::Ready)
+                    throw std::runtime_error("fiberlet materialization join: " + transition.error);
+                if (transition.value)
+                    transitions[incoming].push_back({
+                        static_cast<std::uint32_t>(next), *transition.value});
+            }
+        } catch (...) {
+            failures[incoming] = std::current_exception();
+        }
+    };
+    if (parallelThreads > 1 && !arcs.empty()) {
+        utils::ThreadPool pool(std::min(parallelThreads, arcs.size()));
+        pool.run_indexed_batch(arcs.size(), build);
+    } else {
+        for (std::size_t i = 0; i < arcs.size(); ++i)
+            build(i);
+    }
+    FiberletImmutableReplayTransitionCsr csr;
+    csr.offsets.push_back(0);
+    for (std::size_t i = 0; i < arcs.size(); ++i) {
+        if (failures[i])
+            std::rethrow_exception(failures[i]);
+        csr.entries.insert(csr.entries.end(), transitions[i].begin(), transitions[i].end());
+        csr.offsets.push_back(csr.entries.size());
+    }
+    std::vector<FiberletReplaySourceAnchor> positions;
+    positions.reserve(anchors.size());
+    for (const auto& [key, anchor] : anchors)
+        positions.push_back({key, cv::Vec3d(anchor.positionPredictionXYZ * scale)});
+    result.graph = std::make_shared<FiberletImmutableReplayGraphSource>(
+        scale, anchorCellSizePredictionVoxels(), maximumJoinAngleDegrees_,
+        std::move(positions), std::move(edges), std::move(csr));
+    return result;
+}
 } // namespace vc::fiber_tracer

@@ -221,6 +221,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberAxisTensor.cpp
     src/fiber_tracer/FiberGraph.cpp
     src/fiber_tracer/FiberletChunkGraph.cpp
+    src/fiber_tracer/FiberletCropTrace.cpp
     src/fiber_tracer/FiberLocalScoring.cpp
     src/fiber_tracer/FiberPaths.cpp
     src/fiber_tracer/FiberReplayMetric.cpp

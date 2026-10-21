@@ -163,6 +163,11 @@ private:
 
 // Blocking stored-graph adapter. Missing sparse chunks are empty; all edge,
 // route, and transition interpretation remains owned by FiberletChunkGraphSource.
+struct FiberletMaterializedReplayGraph {
+    std::shared_ptr<FiberletImmutableReplayGraphSource> graph;
+    std::vector<FiberletStoredAnchor> insideAnchors;
+};
+
 class FiberletStoredReplayGraphSource final : public FiberletReplayGraphSource
 {
 public:
@@ -205,6 +210,19 @@ public:
         const cv::Vec3d& maximumBaseXYZ,
         std::size_t prefetchWindow = 0) const;
     [[nodiscard]] const FiberletDatasetMetadata& metadata() const noexcept;
+
+    // Include all edges incident to anchors in the half-open graph box and
+    // their outside endpoints, but no joins at outside endpoints. The seed
+    // box is separately bounded so lookahead may extend beyond the output crop.
+    // Loading uses the source's existing cache; the returned graph owns its
+    // geometry and supports concurrent, cache-independent queries.
+    [[nodiscard]] FiberletMaterializedReplayGraph materializeBaseBox(
+        const cv::Vec3d& minimumBaseXYZ, const cv::Vec3d& maximumBaseXYZ,
+        std::size_t parallelThreads = 1) const;
+    [[nodiscard]] FiberletMaterializedReplayGraph materializeBaseBoxForSeeds(
+        const cv::Vec3d& minimumBaseXYZ, const cv::Vec3d& maximumBaseXYZ,
+        const cv::Vec3d& seedMinimumBaseXYZ, const cv::Vec3d& seedMaximumBaseXYZ,
+        std::size_t parallelThreads = 1) const;
 
 private:
     std::shared_ptr<FiberletChunkDataset> dataset_;
