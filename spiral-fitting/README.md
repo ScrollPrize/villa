@@ -399,6 +399,22 @@ Kimimaro with `uv sync --extra cpu` (with pip: `pip install -e '.[cpu]'`), and
 pass `--extra cpu` on later syncs too, since a plain `uv sync` removes it again.
 Other platforms get Kimimaro by default.
 
+On AMD GPUs (ROCm, Linux x86-64) the CUDA-only packages are not needed and
+`uv sync` would pull the CUDA 12 build of PyTorch, so create the environment
+with a ROCm PyTorch build and without the `cuda` dependency group instead. The
+Kimimaro CPU backend of `extract_surface_tracks.py` is used (`--backend cpu`):
+
+```sh
+cd spiral-fitting
+uv venv --python 3.14
+uv pip install --index-url https://download.pytorch.org/whl/rocm7.2 "torch>=2.11,<2.13"
+uv pip install -e '.[cpu]'
+.venv/bin/python -c 'import torch; print(torch.version.hip, torch.cuda.is_available())'
+```
+
+Use `.venv/bin/python` (or `uv run --no-sync`) afterwards: a plain `uv sync`
+or `uv run` would reinstall the CUDA build of torch and the `cuda` group.
+
 ### Resident sparse field pools
 
 Normals and gradient magnitude samples are served by fully

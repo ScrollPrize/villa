@@ -155,7 +155,7 @@ that service directly before or during use:
 |-------------|-------------|
 | `vc::render::processChunkCacheService()` | Return the process-lifetime regular cache service |
 | `configureDecodedByteCapacity(bytes)` | Change the global decoded RAM ceiling in place |
-| `configureFetchConcurrency(count, adaptive)` | Change global source-read admission in place |
+| `configureFetchConcurrency(count, adaptive)` | Change global remote-download admission in place; local source reads retain their independent 16-worker default |
 
 Python exposes the equivalent module-level functions
 `vc.set_chunk_cache_budget(bytes)` and

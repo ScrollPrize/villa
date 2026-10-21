@@ -70,8 +70,6 @@ struct PreparedNormalPoint {
     LasagnaCubeRequest ny;
 };
 
-} // namespace
-
 double requiredPositiveManifestDouble(
     const LasagnaDatasetManifest& manifest,
     const char* key)
@@ -89,16 +87,63 @@ double requiredPositiveManifestDouble(
     return value;
 }
 
+} // namespace
+
+void validateLasagnaNormalDatasetStructure(const LasagnaDataset& dataset)
+{
+    const auto& manifest = dataset.manifest();
+    if (!manifest.baseShapeZYX.has_value())
+        throw std::invalid_argument("normal manifest must declare base_shape_zyx");
+    requiredPositiveManifestDouble(manifest, "grad_mag_encode_scale");
+    requiredPositiveManifestDouble(manifest, "grad_mag_factor");
+
+    const auto nx = bindLasagnaChannel(manifest, "nx");
+    const auto ny = bindLasagnaChannel(manifest, "ny");
+    const auto gradMag = bindLasagnaChannel(manifest, "grad_mag");
+    const auto validate = [&](const LasagnaChannelBinding& binding,
+                              std::string_view channel) {
+        if (binding.group == nullptr || binding.group->channels.size() != 1) {
+            throw std::invalid_argument(
+                "normal channel '" + std::string(channel) +
+                "' must use its own 3D Lasagna group");
+        }
+        const double baseSpacing =
+            static_cast<double>(binding.group->scaleFactor()) *
+            manifest.sourceToBase;
+        if (!lasagnaChannelShapeCompatible(
+                *manifest.baseShapeZYX,
+                baseSpacing,
+                binding.shapeZYX,
+                binding.chunksZYX)) {
+            throw std::invalid_argument(
+                "normal channel '" + std::string(channel) +
+                "' shape is incompatible with base_shape_zyx and scale");
+        }
+    };
+    validate(nx, "nx");
+    validate(ny, "ny");
+    validate(gradMag, "grad_mag");
+    const double nxBaseSpacing = nx.spacing * manifest.workingToBaseScale;
+    const double nyBaseSpacing = ny.spacing * manifest.workingToBaseScale;
+    if (nx.shapeZYX != ny.shapeZYX ||
+        std::abs(nxBaseSpacing - nyBaseSpacing) >
+            1.0e-12 * std::max({1.0, std::abs(nxBaseSpacing),
+                                std::abs(nyBaseSpacing)})) {
+        throw std::invalid_argument(
+            "normal nx and ny channels must have matching shape and base scale");
+    }
+}
+
 class LasagnaNormalSampler::Impl {
 public:
-    Impl(const LasagnaDataset& dataset, LasagnaNormalSamplerOptions options)
+    bool masksInvalidCorners() const noexcept { return maskInvalidCorners_; }
+    Impl(const LasagnaDataset& dataset)
         : gradMagDecodeScale_(
               requiredPositiveManifestDouble(dataset.manifest(), "grad_mag_encode_scale") /
               requiredPositiveManifestDouble(dataset.manifest(), "grad_mag_factor"))
-        , options_(options)
-        , cache_(sharedLasagnaChannelChunkCache(options.maxCachedBytes))
     {
         const LasagnaDatasetManifest& manifest = dataset.manifest();
+        maskInvalidCorners_ = manifest.raw.value("mask_invalid_normal_corners", false);
         auto nxFuture = std::async(std::launch::async,
             [&manifest]() { return bindLasagnaChannel(manifest, "nx"); });
         auto nyFuture = std::async(std::launch::async,
@@ -108,6 +153,12 @@ public:
         nx_ = nxFuture.get();
         ny_ = nyFuture.get();
         gradMag_ = gradMagFuture.get();
+
+        if (maskInvalidCorners_ &&
+            (!sameLasagnaSamplingGrid(gradMag_, nx_) ||
+             !sameLasagnaSamplingGrid(gradMag_, ny_))) {
+            throw std::invalid_argument("masked normal channels must share the validity sampling grid");
+        }
 
         if (sameLasagnaSamplingGrid(gradMag_, nx_) &&
             sameLasagnaSamplingGrid(gradMag_, ny_)) {
@@ -129,7 +180,7 @@ public:
 
     [[nodiscard]] std::optional<double> sampleWindingDensity(const cv::Vec3d& volumePoint) const
     {
-        const auto gradMag = sampleLasagnaChannel(gradMag_, *cache_, volumePoint);
+        const auto gradMag = sampleLasagnaChannel(gradMag_, volumePoint);
         if (!gradMag.has_value() || *gradMag < 0.0) {
             return std::nullopt;
         }
@@ -141,7 +192,7 @@ public:
         if (!predDt_.has_value()) {
             return std::nullopt;
         }
-        return sampleLasagnaChannel(*predDt_, *cache_, volumePoint);
+        return sampleLasagnaChannel(*predDt_, volumePoint);
     }
 
     [[nodiscard]] bool hasPredDtChannel() const
@@ -186,7 +237,7 @@ public:
 
     [[nodiscard]] NormalSample sampleNormal(const cv::Vec3d& volumePoint) const
     {
-        const auto gradMag = sampleLasagnaChannel(gradMag_, *cache_, volumePoint);
+        const auto gradMag = sampleLasagnaChannel(gradMag_, volumePoint);
         if (!gradMag.has_value()) {
             return {{0.0, 0.0, 0.0}, false, "missing Lasagna grad_mag sample"};
         }
@@ -194,7 +245,7 @@ public:
             return {{0.0, 0.0, 0.0}, false, "Lasagna grad_mag sample is zero"};
         }
 
-        const auto normal = sampleLasagnaCompactAxisTensor(nx_, ny_, *cache_, volumePoint);
+        const auto normal = sampleLasagnaCompactAxisTensor(nx_, ny_, volumePoint, maskInvalidCorners_ ? &gradMag_ : nullptr);
         if (!normal.has_value()) {
             return {{0.0, 0.0, 0.0}, false, "missing Lasagna nx/ny sample"};
         }
@@ -206,7 +257,7 @@ public:
 
     [[nodiscard]] NormalSampleWithDerivative sampleNormalWithDerivative(const cv::Vec3d& volumePoint) const
     {
-        const auto gradMag = sampleLasagnaChannel(gradMag_, *cache_, volumePoint);
+        const auto gradMag = sampleLasagnaChannel(gradMag_, volumePoint);
         if (!gradMag.has_value()) {
             return {{{0.0, 0.0, 0.0}, false, "missing Lasagna grad_mag sample"},
                     cv::Matx33d::zeros(),
@@ -218,7 +269,7 @@ public:
                     false};
         }
 
-        const auto normal = sampleLasagnaCompactAxisTensor(nx_, ny_, *cache_, volumePoint);
+        const auto normal = sampleLasagnaCompactAxisTensor(nx_, ny_, volumePoint, maskInvalidCorners_ ? &gradMag_ : nullptr);
         if (!normal.has_value()) {
             return {{{0.0, 0.0, 0.0}, false, "missing Lasagna nx/ny sample"},
                     cv::Matx33d::zeros(),
@@ -253,7 +304,7 @@ public:
             appendLasagnaInterpolationChunkKeys(ny_, point, nyKeys);
         }
 
-        std::vector<LasagnaChannelChunkCache::PrefetchRequest> requests;
+        std::vector<LasagnaPrefetchRequest> requests;
         requests.reserve(gradMagKeys.size() + nxKeys.size() + nyKeys.size());
         const size_t keyCount = std::max({
             gradMagKeys.size(), nxKeys.size(), nyKeys.size()});
@@ -269,7 +320,7 @@ public:
             }
         }
         (void)withDerivative;
-        return cache_->prefetchInterleaved(requests);
+        return vc::lasagna::prefetchLasagnaChunks(requests);
     }
 
     [[nodiscard]] std::array<const LasagnaChannelCornerSampler*, 3>
@@ -305,7 +356,8 @@ public:
                 return;
             }
             const cv::Vec3f normal = interpolateLasagnaCompactAxisCorners(
-                nxCorners[index], nyCorners[index]);
+                nxCorners[index].values, nyCorners[index].values,
+                maskInvalidCorners_ ? validLasagnaCornerWeights(lasagnaCornerWeights(nxCorners[index].fractionXYZ),gradMagCorners[index].values) : lasagnaCornerWeights(nxCorners[index].fractionXYZ));
             samples[index] = {normal, normal.dot(normal) > 1.0e-12f};
         };
 #ifdef _OPENMP
@@ -355,7 +407,8 @@ public:
                 corners.values[firstVolume + 1][index], fraction, true};
             const LasagnaCornerSample ny{
                 corners.values[firstVolume + 2][index], fraction, true};
-            const cv::Vec3f normal = interpolateLasagnaCompactAxisCorners(nx, ny);
+            const cv::Vec3f normal = interpolateLasagnaCompactAxisCorners(nx.values, ny.values,
+                maskInvalidCorners_ ? validLasagnaCornerWeights(lasagnaCornerWeights(fraction),gradMag.values) : lasagnaCornerWeights(fraction));
             samples[index] = {normal, normal.dot(normal) > 1.0e-12f};
         };
 #ifdef _OPENMP
@@ -429,9 +482,8 @@ public:
             return report;
         }
 
-        const size_t readWorkers = lasagnaReadWorkersPerChannel();
         const size_t batchWorkers =
-            normalBatchWorkerCount(volumePoints.size(), parallelThreads, readWorkers);
+            normalBatchWorkerCount(volumePoints.size(), parallelThreads, lasagnaReadWorkersPerChannel());
         const bool sharedSpatialGrid =
             sameLasagnaSamplingGrid(gradMag_, nx_) &&
             sameLasagnaSamplingGrid(gradMag_, ny_);
@@ -479,7 +531,8 @@ public:
                 return;
             }
             const cv::Vec3f normal = interpolateLasagnaCompactAxisCorners(
-                nxCorners[index], nyCorners[index]);
+                nxCorners[index].values, nyCorners[index].values,
+                maskInvalidCorners_ ? validLasagnaCornerWeights(lasagnaCornerWeights(nxCorners[index].fractionXYZ),gradMagCorners[index].values) : lasagnaCornerWeights(nxCorners[index].fractionXYZ));
             if (normal.dot(normal) <= 1.0e-12f) {
                 samples[index] = {{{0.0, 0.0, 0.0}, false, "degenerate Lasagna normal sample"},
                                   cv::Matx33d::zeros(),
@@ -609,18 +662,18 @@ public:
             deduplicateLasagnaChunkKeysInPlace(nyKeys);
         }
 
-        LasagnaChannelChunkCache::ResolvedChunkMap gradMagChunks;
-        LasagnaChannelChunkCache::ResolvedChunkMap nxChunks;
-        LasagnaChannelChunkCache::ResolvedChunkMap nyChunks;
+        LasagnaResolvedChunks gradMagChunks;
+        LasagnaResolvedChunks nxChunks;
+        LasagnaResolvedChunks nyChunks;
         auto gradMagPrefetch = std::async(std::launch::async, [&]() {
-            return cache_->prefetchResolved(
-                gradMag_, *gradMag_.array, gradMagKeys, readWorkers, gradMagChunks);
+            return vc::lasagna::resolveLasagnaChunks(
+                gradMag_, gradMagKeys, gradMagChunks);
         });
         auto nxPrefetch = std::async(std::launch::async, [&]() {
-            return cache_->prefetchResolved(nx_, *nx_.array, nxKeys, readWorkers, nxChunks);
+            return vc::lasagna::resolveLasagnaChunks(nx_, nxKeys, nxChunks);
         });
         auto nyPrefetch = std::async(std::launch::async, [&]() {
-            return cache_->prefetchResolved(ny_, *ny_.array, nyKeys, readWorkers, nyChunks);
+            return vc::lasagna::resolveLasagnaChunks(ny_, nyKeys, nyChunks);
         });
         const NormalPrefetchReport gradMagReport = gradMagPrefetch.get();
         const NormalPrefetchReport nxReport = nxPrefetch.get();
@@ -671,7 +724,8 @@ public:
                 return;
             }
 
-            const auto normal = sampleLasagnaCompactAxisTensor(nx_, ny_, point.nx, point.ny);
+            const auto normal = sampleLasagnaCompactAxisTensor(nx_, ny_, point.nx, point.ny,
+                maskInvalidCorners_ ? &gradMag_ : nullptr, maskInvalidCorners_ ? &point.gradMag : nullptr);
             if (!normal.has_value()) {
                 samples[index] = {{{0.0, 0.0, 0.0}, false, "missing Lasagna nx/ny sample"},
                                   cv::Matx33d::zeros(),
@@ -747,27 +801,43 @@ public:
         return report;
     }
 
+    void pinRegion(vc::render::PinnedChunkRegion& region,const cv::Vec3d& lo,const cv::Vec3d& hi) const
+    {
+        for(const auto* b:{&nx_,&ny_,&gradMag_}) pinLasagnaRegion(region,*b,lo,hi);
+        if(predDt_) pinLasagnaRegion(region,*predDt_,lo,hi);
+    }
 private:
     LasagnaChannelBinding nx_;
     LasagnaChannelBinding ny_;
     LasagnaChannelBinding gradMag_;
     std::optional<LasagnaChannelBinding> predDt_;
+    bool maskInvalidCorners_ = false;
     double gradMagDecodeScale_ = 1000.0;
-    LasagnaNormalSamplerOptions options_;
-    std::shared_ptr<LasagnaChannelChunkCache> cache_;
     std::unique_ptr<LasagnaChannelCornerSampler> gradMagCorners_;
     std::unique_ptr<LasagnaChannelCornerSampler> nxCorners_;
     std::unique_ptr<LasagnaChannelCornerSampler> nyCorners_;
 };
 
 LasagnaNormalSampler::LasagnaNormalSampler(
-    const LasagnaDataset& dataset,
-    LasagnaNormalSamplerOptions options)
-    : impl_(std::make_unique<Impl>(dataset, options))
+    const LasagnaDataset& dataset)
+    : impl_(std::make_unique<Impl>(dataset))
 {
 }
 
 LasagnaNormalSampler::~LasagnaNormalSampler() = default;
+
+LasagnaNormalSampler::LasagnaNormalSampler(
+    const LasagnaDataset& dataset, LasagnaNormalSamplerOptions options)
+    : LasagnaNormalSampler(dataset)
+{
+    vc::render::processChunkCacheService()->configureDecodedByteCapacity(options.maxCachedBytes);
+}
+
+void LasagnaNormalSampler::pinRegion(vc::render::PinnedChunkRegion& region,
+    const cv::Vec3d& lo,const cv::Vec3d& hi) const
+{
+    impl_->pinRegion(region,lo,hi);
+}
 
 LasagnaNormalSampler::LasagnaNormalSampler(LasagnaNormalSampler&&) noexcept = default;
 
@@ -841,6 +911,11 @@ NormalBatchReport LasagnaNormalSampler::sampleNormalBatch(
     std::vector<FloatNormalSample>& samples) const
 {
     return impl_->sampleNormalBatch(volumePoints, parallelThreads, samples);
+}
+
+bool LasagnaNormalSampler::masksInvalidCorners() const noexcept
+{
+    return impl_->masksInvalidCorners();
 }
 
 std::array<const LasagnaChannelCornerSampler*, 3>

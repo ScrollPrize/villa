@@ -11,7 +11,12 @@ import pytest
 
 import lasagna.manager.cli as manager_cli
 from lasagna.manager import catalog
-from lasagna.manager.catalog import CatalogCache, get_catalog, index_volumes, resolve_volume
+import lasagna.manager.completion as manager_completion
+import lasagna.manager.fiberlets as manager_fiberlets
+from lasagna.manager.catalog import (
+    CatalogCache, get_catalog, index_lasagna_predictions, index_volumes,
+    normal_predictions_for_volume, resolve_lasagna_prediction, resolve_volume,
+)
 from lasagna.manager.cli import (
     COMMANDS, _completion_script, _expand_command, _render_volume_table,
     _resolve_token, _rewrite_contextual_help, main,
@@ -20,6 +25,10 @@ from lasagna.manager.completion import (
     canonical_executable, contextual_candidates, install_bash_completion, provider_id,
 )
 from lasagna.manager.config import ManagerConfig, initialize_config, load_config
+from lasagna.manager.fiberlets import (
+    _resolve_binary, finalize_fiberlet_provenance, launch_fiberlet, resolve_fiberlet_inputs,
+    resume_fiberlet,
+)
 from lasagna.manager.prefetch import (
     build_prefetch_request, execute_prefetch_request, prefetch_volume,
     volume_cache_root,
@@ -28,7 +37,7 @@ from lasagna.manager.runner import main as runner_main
 from lasagna.manager.runs import atomic_json, launch_inference, read_runs, reconcile_runs
 from lasagna.manager.snapshots import (
     completion_snapshot_candidates, discover_snapshot_paths, index_snapshots,
-    resolve_snapshot,
+    import_snapshot, resolve_snapshot,
 )
 from lasagna.manager.tmux import Tmux
 
@@ -36,6 +45,7 @@ from lasagna.manager.tmux import Tmux
 def configured(tmp_path: Path, *, snapshot_dirs=(), output=True, venv=True) -> ManagerConfig:
     return ManagerConfig(
         snapshot_dirs=tuple(str(path) for path in snapshot_dirs),
+        model_dir=str(tmp_path / "models"),
         cache_dir=str(tmp_path / "cache"),
         output_dir=str(tmp_path / "outputs") if output else "",
         venv=str(tmp_path / "venv") if venv else "",
@@ -76,6 +86,156 @@ def sample_catalog() -> dict:
     }
 
 
+def prediction_catalog() -> CatalogCache:
+    document = sample_catalog()
+    document["samples"]["PHerc0001"]["volumes"]["one"]["properties"]["shape"] = [100, 80, 59]
+    document["models"] = {
+        "20260419180421": {
+            "properties": {
+                "architecture": "unet", "task": "lasagna",
+                "output_channels": ["cos", "grad_mag", "nx", "ny"],
+            },
+        },
+        "20260801084232": {
+            "properties": {
+                "architecture": "fiber3d/unet", "task": "lasagna",
+                "output_channels": ["presence", "nx", "ny"],
+            },
+        },
+    }
+    volume = document["samples"]["PHerc0001"]["volumes"]["one"]
+    volume["data"].extend([
+        {
+            "type": "lasagna", "parameters": {"model_id": "20260419180421", "level": 2},
+            "creation_info": {"lasagna_version": 2, "source_to_base": 1.0},
+            "origins": [{
+                "path": "PHerc0001/representations/predictions/lasagna/normals/",
+                "access_roots": [
+                    {"type": "s3", "url": "s3://private", "usage": "write"},
+                    {"type": "s3", "url": "s3://public", "usage": "PUBLIC-READ"},
+                ],
+            }],
+        },
+        {
+            "type": "lasagna", "parameters": {"model_id": "20260801084232", "level": 1},
+            "origins": [{
+                "path": "PHerc0001/representations/predictions/fibers/fibers/",
+                "access_roots": [{"type": "s3", "url": "s3://public", "usage": "public-read"}],
+            }],
+        },
+    ])
+    return CatalogCache(
+        document, {"sha256": "c" * 64, "fetched_at": "2026-08-23T00:00:00Z"},
+    )
+
+
+def test_catalog_indexes_lasagna_prediction_roles_from_exact_models():
+    records = index_lasagna_predictions(prediction_catalog())
+    normal = normal_predictions_for_volume(
+        records, sample_id="PHerc0001", volume_id="20260101000001",
+    )
+    assert [record.selector for record in normal] == ["atlas:20260419180421@L2"]
+    assert normal[0].s3_url == "s3://public/PHerc0001/representations/predictions/lasagna/normals/"
+    assert normal[0].artifact_url == (
+        "https://public.s3.us-east-1.amazonaws.com/"
+        "PHerc0001/representations/predictions/lasagna/normals"
+    )
+    assert normal[0].lasagna_version == 2
+    assert normal[0].source_to_base == 1.0
+    fiber = next(record for record in records if record.role == "fiber")
+    assert fiber.selector == "atlas:20260801084232@L1"
+    assert resolve_lasagna_prediction(
+        records, "atlas:20260419", sample_id="PHerc0001",
+        volume_id="20260101000001",
+    ) == normal[0]
+
+
+@pytest.mark.parametrize("scheme,region", [("s3", "us-east-1"), ("s3+eu-west-1", "eu-west-1")])
+def test_published_normal_discovery_skips_http_root_and_preserves_region(monkeypatch, scheme, region):
+    cache = prediction_catalog()
+    volume = cache.document["samples"]["PHerc0001"]["volumes"]["one"]
+    entry = next(item for item in volume["data"] if item.get("parameters", {}).get("model_id") == "20260419180421")
+    entry["origins"][0]["access_roots"] = [
+        {"url": "https://example.org", "usage": "public-read"},
+        {"url": f"{scheme}://public", "usage": "public-read"},
+    ]
+    record = next(item for item in index_lasagna_predictions(cache) if item.role == "normal")
+    calls = []
+    def listing(bucket, prefix, **kwargs):
+        calls.append((bucket, prefix, kwargs))
+        return [prefix + "normal.lasagna.json"]
+    monkeypatch.setattr("lasagna.scripts.download_omezarr.list_s3_prefix", listing)
+    assert manager_fiberlets._discover_published_manifest(record) == (
+        f"https://public.s3.{region}.amazonaws.com/"
+        "PHerc0001/representations/predictions/lasagna/normals/normal.lasagna.json")
+    assert calls[0][0] == "public"
+    assert calls[0][2] == {"anon": True, "region": region}
+
+
+def test_published_normal_rejects_absolute_http_origin_even_with_s3_root():
+    cache = prediction_catalog()
+    volume = cache.document["samples"]["PHerc0001"]["volumes"]["one"]
+    entry = next(item for item in volume["data"] if item.get("parameters", {}).get("model_id") == "20260419180421")
+    entry["origins"][0]["path"] = "https://example.org/normals"
+    record = next(item for item in index_lasagna_predictions(cache) if item.model_id == "20260419180421")
+    assert "no usable S3" in record.validation_error
+
+
+def test_fiberlet_inventory_streams_numeric_order_and_preserves_digest(tmp_path):
+    keys = [(10, 0, 2), (2, 10, 0), (2, 2, 10), (2, 2, 2)]
+    for z, y, x in keys:
+        path = tmp_path / "fiberlets" / str(z) / str(y) / str(x)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"chunk")
+    (tmp_path / "fiberlets" / ".zarray").write_text("{}")
+    inventory = manager_fiberlets._fiberlet_inventory(tmp_path)
+    assert iter(inventory) is inventory
+    assert list(inventory) == sorted(keys)
+    # Independent original byte-stream implementation guards wire compatibility.
+    canonical = "".join(f"{z}/{y}/{x}\n" for z, y, x in sorted(keys)).encode()
+    encoded = bytearray()
+    mask = (1 << 64) - 1
+    for lane in range(4):
+        value = 14695981039346656037 ^ (0x9E3779B97F4A7C15 * (lane + 1) & mask)
+        for byte in canonical:
+            value = ((value ^ byte) * 1099511628211) & mask
+        encoded.extend(value.to_bytes(8, "little"))
+    assert manager_fiberlets._fiberlet_inventory_summary(
+        manager_fiberlets._fiberlet_inventory(tmp_path)) == (len(keys), "fnv256:" + encoded.hex())
+
+
+@pytest.mark.parametrize("key", ["01/2/3", "1/2", "1/2/3/4", "1/a/3"])
+def test_fiberlet_inventory_rejects_noncanonical_keys(tmp_path, key):
+    path = tmp_path / "fiberlets" / key
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"bad")
+    with pytest.raises(ValueError, match="Fiberlet"):
+        list(manager_fiberlets._fiberlet_inventory(tmp_path))
+
+
+def test_fiberlet_inventory_does_not_visit_later_subtrees_before_yielding(tmp_path):
+    first = tmp_path / "fiberlets" / "0" / "0" / "0"
+    first.parent.mkdir(parents=True)
+    first.write_bytes(b"chunk")
+    later = tmp_path / "fiberlets" / "1" / "invalid"
+    later.parent.mkdir(parents=True)
+    later.write_bytes(b"bad")
+    inventory = manager_fiberlets._fiberlet_inventory(tmp_path)
+    assert next(inventory) == (0, 0, 0)
+    with pytest.raises(ValueError, match="invalid chunk key"):
+        next(inventory)
+
+
+def test_fiberlet_inventory_rejects_symlink_directories(tmp_path):
+    array = tmp_path / "fiberlets"
+    array.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (array / "0").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="invalid chunk key"):
+        list(manager_fiberlets._fiberlet_inventory(tmp_path))
+
+
 def test_config_init_round_trip_and_no_overwrite(tmp_path, monkeypatch):
     path = tmp_path / "cfg" / "config.toml"
     monkeypatch.setenv("LAS_MANAGER_CONFIG", str(path))
@@ -83,12 +243,17 @@ def test_config_init_round_trip_and_no_overwrite(tmp_path, monkeypatch):
     loaded = load_config()
     assert loaded.catalog_max_age_seconds == 3600
     assert loaded.snapshot_dirs == ()
+    assert loaded.model_dir == "~/.local/share/las_manager/models"
     assert loaded.atlas_dir == ""
     assert loaded.upload_staging_s3 == ""
+    assert loaded.fiberlet_binary == ""
+    assert loaded.fiberlet_threads == 32
+    assert loaded.fiberlet_params == ()
     assert loaded.params == (
         "--tile-size", "512", "--border", "32", "--overlap", "96",
         "--devices", "all",
     )
+    assert loaded.lasagna_params == ("--devices", "all")
     assert loaded.rclone_params == (
         "--s3-provider", "AWS", "--s3-env-auth", "--transfers", "512",
         "--buffer-size", "2M", "--size-only", "--fast-list", "-P",
@@ -101,17 +266,18 @@ def test_config_init_round_trip_and_no_overwrite(tmp_path, monkeypatch):
 def test_relative_config_paths_resolve_from_config_location(tmp_path, monkeypatch):
     path = tmp_path / "cfg" / "config.toml"
     path.parent.mkdir()
-    path.write_text('cache_dir = "../cache"\nsnapshot_dirs = ["../runs"]\n', encoding="utf-8")
+    path.write_text('cache_dir = "../cache"\nmodel_dir = "../models"\nsnapshot_dirs = ["../runs"]\n', encoding="utf-8")
     monkeypatch.setenv("LAS_MANAGER_CONFIG", str(path))
     loaded = load_config()
     assert loaded.resolved_path("cache_dir") == tmp_path / "cache"
-    assert loaded.resolved_snapshot_dirs() == (tmp_path / "runs",)
+    assert loaded.resolved_snapshot_dirs() == (tmp_path / "models", tmp_path / "runs")
 
 
-def test_config_params_are_string_array(tmp_path):
+@pytest.mark.parametrize("name", ["params", "lasagna_params"])
+def test_config_params_are_string_array(tmp_path, name):
     path = tmp_path / "config.toml"
-    path.write_text('params = ["--devices", 8]\n', encoding="utf-8")
-    with pytest.raises(ValueError, match="params must be an array of strings"):
+    path.write_text(f'{name} = ["--devices", 8]\n', encoding="utf-8")
+    with pytest.raises(ValueError, match=rf"{name} must be an array of strings"):
         load_config(path)
 
 
@@ -122,10 +288,28 @@ def test_config_rclone_params_are_string_array(tmp_path):
         load_config(path)
 
 
+@pytest.mark.parametrize("value", ["0", "-1", "true", '"128"'])
+def test_config_fiberlet_threads_must_be_positive_integer(tmp_path, value):
+    path = tmp_path / "config.toml"
+    path.write_text(f"fiberlet_threads = {value}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="fiberlet_threads must be a positive integer"):
+        load_config(path)
+
+
 def test_command_unique_prefix_and_ambiguity():
     assert _expand_command(["sn", "l"]) == ["snapshot", "ls"]
+    assert _expand_command(["sn", "i"]) == ["snapshot", "import"]
     assert _expand_command(["con", "sh"]) == ["config", "show"]
-    assert _expand_command(["f"]) == ["fetch"]
+    with pytest.raises(ValueError, match="ambiguous"):
+        _expand_command(["f"])
+    assert _expand_command(["fe"]) == ["fetch"]
+    assert _expand_command(["fiberl", "ru"]) == ["fiberlet", "run"]
+    assert _expand_command(["las-i", "model", "volume"]) == [
+        "las-inference", "model", "volume",
+    ]
+    assert _expand_command(["fiber-i", "model", "volume"]) == [
+        "fiber-inference", "model", "volume",
+    ]
     assert _expand_command(["completion", "ins"]) == ["completion", "install"]
     with pytest.raises(ValueError, match="ambiguous"):
         _resolve_token("f", ("fetch", "foo"))
@@ -356,6 +540,7 @@ def test_contextual_completion_commands_options_and_values(tmp_path, monkeypatch
     assert values(["volume", "ls", "--backend=f"]) == []
     assert values(["snapshot", "ls", "--backend", "f"]) == ["fiber3d"]
     assert values(["snapshot", "ls", "--backend=f"]) == ["--backend=fiber3d"]
+    assert "--model-identifier" in values(["snapshot", "import", "checkpoint.pt", "--"])
     assert "--sample" in values(["volume", "ls", "--"])
     assert "PHerc0001" in values(["volume", "ls", "--sample", ""])
     assert "--format=uint8" in values(["volume", "ls", "--format="])
@@ -485,6 +670,51 @@ def test_snapshot_completion_rescans_uncached_files_without_loading_them(tmp_pat
     assert values == ["new-run/best.pt"]
 
 
+def test_snapshot_import_copies_bytes_and_binds_identifier_by_sha256(tmp_path):
+    torch = pytest.importorskip("torch")
+    source = tmp_path / "training" / "run-a" / "snapshots" / "best.pt"
+    source.parent.mkdir(parents=True)
+    torch.save({
+        "model": {"weight": torch.ones(1)},
+        "config": {"model_3d": {"output_channels": 4}},
+    }, source)
+    config = configured(tmp_path, snapshot_dirs=(tmp_path / "training",))
+
+    record = import_snapshot(
+        config, source, model_identifier="scrollprize/lasagna-fiber",
+    )
+
+    destination = tmp_path / "models" / "run-a" / "snapshots" / "best.pt"
+    sidecar = destination.with_name("best.pt.identity.json")
+    assert destination.read_bytes() == source.read_bytes()
+    assert record.path == str(destination.resolve())
+    assert record.model_identifier == "scrollprize/lasagna-fiber"
+    assert record.sha256 == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert json.loads(sidecar.read_text()) == {
+        "schema_version": 1,
+        "sha256": record.sha256,
+        "model_identifier": "scrollprize/lasagna-fiber",
+    }
+    # Identity projection is independent of the cached checkpoint metadata,
+    # and the managed copy wins over its byte-identical configured source.
+    indexed = index_snapshots(config)
+    assert len(indexed) == 1
+    assert indexed[0].path == str(destination.resolve())
+    assert indexed[0].model_identifier == "scrollprize/lasagna-fiber"
+
+
+def test_snapshot_import_rejects_identifier_conflict(tmp_path):
+    torch = pytest.importorskip("torch")
+    source = tmp_path / "run-a" / "snapshots" / "best.pt"
+    source.parent.mkdir(parents=True)
+    torch.save({"model": {"weight": torch.ones(1)}, "config": {}}, source)
+    config = configured(tmp_path)
+    import_snapshot(config, source, model_identifier="owner/model-a")
+
+    with pytest.raises(ValueError, match="conflicts with existing sidecar"):
+        import_snapshot(config, source, model_identifier="owner/model-b")
+
+
 def test_lasagna_snapshot_discovery_is_namespaced_and_extracts_metadata(tmp_path):
     torch = pytest.importorskip("torch")
     snapshots = tmp_path / "runs" / "las-run" / "snapshots"
@@ -509,6 +739,61 @@ def test_lasagna_snapshot_discovery_is_namespaced_and_extracts_metadata(tmp_path
     assert record.metric_value == 0.125
     assert record.precision_policy == "fp16"
     assert record.atlas_model_id == "20260806123000"
+
+
+def test_snapshot_identity_is_enriched_from_exact_atlas_checkpoint_hash(tmp_path):
+    torch = pytest.importorskip("torch")
+    run_name = "20260419_180421_conthr_1e-5_warp_2um_noss_dist"
+    snapshots = tmp_path / "runs" / run_name / "snapshots"
+    snapshots.mkdir(parents=True)
+    checkpoint = snapshots / "model_current.pt"
+    torch.save({
+        "state_dict": {"shared_encoder.stages.0.weight": torch.ones(1)},
+        "patch_size": 192,
+        "precision": "bf16",
+    }, checkpoint)
+    digest = hashlib.sha256(checkpoint.read_bytes()).hexdigest()
+    atlas = tmp_path / "atlas"
+    model_path = atlas / "data" / "models" / "lasagna" / "unet" / "model.json"
+    model_path.parent.mkdir(parents=True)
+    model_path.write_text(json.dumps({
+        "id": "20260419180421",
+        "creation": {"date": "2026-04-19T18:04:21Z", "process": "model_training"},
+        "properties": {
+            "architecture": "unet", "task": "lasagna",
+            "model_identifier": "scrollprize/lasagna",
+            "snapshot_sha256": digest,
+        },
+    }), encoding="utf-8")
+    python = tmp_path / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+    config = replace(
+        configured(tmp_path, snapshot_dirs=(tmp_path / "runs",)),
+        atlas_dir=str(atlas),
+    )
+
+    record = index_snapshots(config)[0]
+    assert record.atlas_model_id == "20260419180421"
+    assert record.model_creation_utc == "2026-04-19T18:04:21Z"
+    assert record.model_identifier == "scrollprize/lasagna"
+    assert [value for value, _ in contextual_candidates(
+        config, ["las-inference", ""],
+    )] == [record.selector]
+    assert contextual_candidates(config, ["fiber-inference", ""]) == []
+
+    volume = index_volumes(CatalogCache(
+        sample_catalog(), {"sha256": "digest", "fetched_at": "now"},
+    ))[0]
+    run_dir = launch_inference(
+        config, record, volume, 2,
+        original_argv=["inference", "run"], tmux=FakeTmux(),
+    )
+    context = json.loads((run_dir / "provenance_context.json").read_text())
+    assert context["model"]["atlas_model_id"] == "20260419180421"
+    assert context["model"]["model_identifier"] == "scrollprize/lasagna"
+    assert context["model"]["sha256"] == digest
+    assert context["model"]["snapshot"] == f"{run_name}/snapshots/model_current.pt"
 
 
 def test_cli_config_init_and_volume_list(tmp_path, monkeypatch, capsys):
@@ -574,17 +859,403 @@ class FakeTmux:
         return window_id == "@99"
 
 
+def _completed_prediction_run(
+    config: ManagerConfig, *, name: str, kind: str, channels: list[str],
+    sample_id: str = "PHerc0001", volume_id: str = "20260101000001",
+) -> Path:
+    run_dir = Path(config.output_dir) / name
+    artifacts = run_dir / "artifacts"
+    artifacts.mkdir(parents=True)
+    manifest = artifacts / f"{name}.lasagna.json"
+    manifest.write_text(json.dumps({
+        "version": 2,
+        "source_to_base": 1.0,
+        "base_shape_zyx": [100, 80, 60],
+        "groups": {
+            channel: {
+                "zarr": f"{channel}.ome.zarr/2",
+                "scaledown": 2,
+                "channels": [channel],
+            }
+            for channel in channels
+        },
+    }), encoding="utf-8")
+    atomic_json(artifacts / "inference.json", {
+        "schema_version": 1,
+        "artifact_kind": kind,
+        "status": "completed",
+        "run_uuid": f"{name}-uuid",
+        "source": {
+            "sample_id": sample_id,
+            "volume_id": volume_id,
+            "license": {"name": "CC BY-NC 4.0"},
+            "requested_group": 1,
+        },
+        "source_scale": {
+            "requested_group": 1,
+            "base_shape_zyx": [100, 80, 60],
+            "source_to_base_factor": 2,
+        },
+        "inference": {"crop_xyzwhd_base": None},
+        "model": {
+            "atlas_model_id": f"{name}-model", "run": f"{name}-training",
+            "snapshot": f"{name}-training/snapshots/best.pt",
+            "sha256": "a" * 64,
+        },
+        "artifacts": [{"kind": "manifest", "path": manifest.name}],
+    })
+    atomic_json(run_dir / "metadata.json", {
+        "run_uuid": f"{name}-uuid", "run_name": name,
+        "job_kind": "inference", "active_lifecycle_phase": "inference",
+        "artifact_kind": kind, "status": "completed",
+        "created_at": "2026-08-23T00:00:00Z",
+        "artifacts": {
+            "root": "artifacts", "provenance": "artifacts/inference.json",
+        },
+        "lifecycle": {"inference": "completed"},
+    })
+    return run_dir
+
+
+@pytest.mark.parametrize("broken", ["partial", "legacy", "missing", "extra"])
+def test_published_fiberlet_inventory_rejects_incomplete_output(tmp_path, broken):
+    dataset = tmp_path / "published.zarr"
+    array = dataset / "fiberlets"
+    array.mkdir(parents=True)
+    attrs = {
+        "vc_format": "fiberlet_dataset", "format_version": 3,
+        "dataset_kind": "published", "build_state": "complete",
+        "expected_chunk_count": 0,
+        "expected_chunk_digest": manager_fiberlets._fiberlet_inventory_digest([]),
+    }
+    atomic_json(dataset / ".zgroup", {"zarr_format": 2})
+    atomic_json(array / ".zarray", {
+        "zarr_format": 2, "dtype": "|O", "dimension_separator": "/",
+    })
+    if broken == "partial":
+        attrs["build_state"] = "partial"
+    elif broken == "legacy":
+        attrs.update(format_version=2, dataset_kind="combined")
+    elif broken == "missing":
+        attrs["expected_chunk_count"] = 1
+    else:
+        (array / "0" / "0").mkdir(parents=True)
+        (array / "0" / "0" / "0").write_bytes(b"extra")
+    atomic_json(dataset / ".zattrs", attrs)
+    with pytest.raises(ValueError):
+        manager_fiberlets.validate_published_fiberlet_dataset(dataset)
+
+
+def test_fiberlet_launch_uses_shared_runner_and_portable_source_identity(tmp_path):
+    python = tmp_path / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+    binary = tmp_path / "bin" / "vc_fiberlets"
+    binary.parent.mkdir()
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    config = replace(
+        configured(tmp_path), fiberlet_binary=str(binary),
+        fiberlet_threads=32,
+    )
+    _completed_prediction_run(
+        config, name="fiber-source", kind="fiber3d-prediction",
+        channels=["presence", "nx", "ny"],
+    )
+    _completed_prediction_run(
+        config, name="normal-source", kind="lasagna", channels=["grad_mag", "nx", "ny"],
+    )
+    fake = FakeTmux()
+    run_dir = launch_fiberlet(
+        config, "fiber-source", "normal-source",
+        original_argv=["fiberlet", "run", "fiber-source", "normal-source"],
+        extra_args=("--threads", "8"), tmux=fake,
+    )
+    record = json.loads((run_dir / "metadata.json").read_text())
+    command = json.loads((run_dir / "command.json").read_text())
+    context = json.loads((run_dir / "source_context.json").read_text())
+    assert record["job_kind"] == "fiberlet"
+    assert record["active_lifecycle_phase"] == "fiberlet_preprocess"
+    assert fake.created[0][2][1:3] == ["-m", "lasagna.manager.runner"]
+    assert command["resolved_argv"][:2] == [str(binary), "preprocess-volume"]
+    assert command["resolved_argv"][-4:] == ["--threads", "32", "--threads", "8"]
+    assert str(run_dir / "cache") in command["resolved_argv"][command["resolved_argv"].index("--anchor-cache") + 1]
+    assert str(run_dir / "cache") in command["resolved_argv"][command["resolved_argv"].index("--fiberlet-cache") + 1]
+    assert str(run_dir / "cache") not in json.dumps(context)
+    assert "manifest_path" not in json.dumps(context)
+    assert context["source_volume"] == {
+        "sample_id": "PHerc0001", "volume_id": "20260101000001",
+        "base_shape_zyx": [100, 80, 60],
+    }
+    dataset = run_dir / "artifacts" / f"{record['run_name']}.fiberlets.zarr"
+    dataset.mkdir()
+    atomic_json(dataset / ".zattrs", {
+        "vc_format": "fiberlet_dataset", "dataset_kind": "published",
+        "format_version": 3, "build_state": "complete",
+        "expected_chunk_count": 0,
+        "expected_chunk_digest": manager_fiberlets._fiberlet_inventory_digest([]),
+        "dataset_fingerprint": "b" * 64,
+        "algorithm_fingerprint": "fnv1a64:0123456789abcdef",
+        "processing": {"contract_version": 2},
+        "sources": {
+            "source_volume": {
+                "sample_id": "PHerc0001",
+                "volume_id": "20260101000001",
+                "base_shape_zyx": [100, 80, 60],
+            },
+            **{
+                name: {
+                    "run_uuid": dependency["run_uuid"],
+                    "manifest_sha256": dependency["manifest_sha256"],
+                }
+                for name, dependency in record["dependencies"].items()
+            },
+        },
+    })
+    (dataset / ".zgroup").write_text("{}", encoding="utf-8")
+    array = dataset / "fiberlets" / ".zarray"
+    array.parent.mkdir()
+    atomic_json(array, {
+        "zarr_format": 2, "dtype": "|O", "dimension_separator": "/",
+    })
+    finalize_fiberlet_provenance(run_dir, record)
+    portable = json.loads((run_dir / "artifacts" / "fiberlets.json").read_text())
+    assert portable["artifact_kind"] == "fiberlets"
+    assert portable["artifacts"] == [{
+        "kind": "fiberlet-zarr", "path": f"{record['run_name']}.fiberlets.zarr",
+        "metadata_sha256": hashlib.sha256((dataset / ".zattrs").read_bytes()).hexdigest(),
+    }]
+    assert str(tmp_path) not in json.dumps(portable)
+
+    record.update(status="interrupted", ended_at="2026-08-23T01:00:00Z")
+    record["lifecycle"]["fiberlet_preprocess"] = "interrupted"
+    atomic_json(run_dir / "metadata.json", record)
+    resumed_tmux = FakeTmux()
+    assert resume_fiberlet(config, record["run_name"], tmux=resumed_tmux) == run_dir
+    resumed_command = json.loads((run_dir / "command.json").read_text())
+    assert resumed_command == command
+    assert resumed_tmux.created[0][2][1:3] == ["-m", "lasagna.manager.runner"]
+
+
+def test_fiberlet_launch_auto_resolves_and_caches_published_normals(
+    tmp_path, monkeypatch,
+):
+    python = tmp_path / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+    binary = tmp_path / "bin" / "vc_fiberlets"
+    binary.parent.mkdir()
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    config = replace(configured(tmp_path), fiberlet_binary=str(binary))
+    _completed_prediction_run(
+        config, name="fiber-source", kind="fiber3d-prediction",
+        channels=["presence", "nx", "ny"],
+    )
+    manifest_bytes = json.dumps({
+        "version": 2, "source_to_base": 1.0,
+        "base_shape_zyx": [100, 80, 60],
+        "groups": {
+            channel: {
+                "zarr": f"{channel}.ome.zarr/4", "scaledown": 4,
+                "channels": [channel],
+            }
+            for channel in ("grad_mag", "nx", "ny")
+        },
+    }).encode()
+    monkeypatch.setattr(
+        manager_fiberlets, "_discover_published_manifest",
+        lambda record: record.artifact_url + "/normals.lasagna.json",
+    )
+    descriptor_bytes = json.dumps({
+        "zarr_format": 2, "shape": [7, 5, 4], "chunks": [64, 64, 64],
+        "dtype": "|u1", "compressor": None, "fill_value": 0,
+        "filters": None, "order": "C",
+    }).encode()
+    monkeypatch.setattr(
+        manager_fiberlets, "_remote_bytes",
+        lambda url: descriptor_bytes if url.endswith("/.zarray") else manifest_bytes,
+    )
+    fake = FakeTmux()
+    run_dir = launch_fiberlet(
+        config, "fiber-source", original_argv=["fiberlet", "run", "fiber-source"],
+        tmux=fake, catalog_cache=prediction_catalog(),
+    )
+    record = json.loads((run_dir / "metadata.json").read_text())
+    command = json.loads((run_dir / "command.json").read_text())
+    normal = record["dependencies"]["normal_prediction"]
+    assert normal["dependency_kind"] == "atlas"
+    assert "run_uuid" not in normal
+    assert normal["model_id"] == "20260419180421"
+    assert normal["requested_group"] == 2
+    assert normal["manifest_url"].endswith("/normals.lasagna.json")
+    normal_path = Path(command["resolved_argv"][command["resolved_argv"].index("--normal-manifest") + 1])
+    assert normal_path.is_file()
+    marker = json.loads((normal_path.parent / "lasagna-remote.json").read_text())
+    assert marker == {
+        "anonymous": True,
+        "artifact_url": (
+            "https://public.s3.us-east-1.amazonaws.com/"
+            "PHerc0001/representations/predictions/lasagna/normals"
+        ),
+        "base_shape_zyx": [100, 80, 59],
+        "lasagna_version": 2,
+        "manifest_file": "normals.lasagna.json",
+        "model_id": "20260419180421",
+        "sample_id": "PHerc0001",
+        "source_coordinate_level": 2,
+        "source_to_base": 1.0,
+        "version": 1,
+        "volume_id": "20260101000001",
+    }
+    assert normal_path.parent.parts[-5:-1] == (
+        "open_data", "lasagna", "PHerc0001", "20260101000001",
+    )
+    assert normal_path.parent.name == "27d9b3140a5e2d02"
+    assert "--remote-cache-dir" not in command["resolved_argv"]
+
+    marker["anonymous"] = False
+    marker["source_coordinate_level"] = 99
+    atomic_json(normal_path.parent / "lasagna-remote.json", marker)
+    atlas_record = normal_predictions_for_volume(
+        index_lasagna_predictions(prediction_catalog()),
+        sample_id="PHerc0001", volume_id="20260101000001",
+    )[0]
+    manager_fiberlets._published_dependency(config, atlas_record)
+    upgraded = json.loads((normal_path.parent / "lasagna-remote.json").read_text())
+    assert upgraded["anonymous"] is True
+    assert upgraded["source_coordinate_level"] == 2
+
+    atomic_json(normal_path.parent / "lasagna-remote.json", {})
+    with pytest.raises(ValueError, match="does not match catalogue identity"):
+        manager_fiberlets._published_dependency(config, atlas_record)
+    atomic_json(normal_path.parent / "lasagna-remote.json", upgraded)
+
+    record.update(status="interrupted", ended_at="2026-08-23T01:00:00Z")
+    record["lifecycle"]["fiberlet_preprocess"] = "interrupted"
+    atomic_json(run_dir / "metadata.json", record)
+    assert resume_fiberlet(config, record["run_name"], tmux=FakeTmux()) == run_dir
+
+
+def test_fiberlet_auto_normal_reports_missing_publication(tmp_path):
+    config = configured(tmp_path)
+    _completed_prediction_run(
+        config, name="fiber-source", kind="fiber3d-prediction",
+        channels=["presence", "nx", "ny"],
+    )
+    empty = CatalogCache(sample_catalog(), {"sha256": "d" * 64})
+    with pytest.raises(ValueError, match="no published regular Lasagna normal.*grad_mag/nx/ny"):
+        resolve_fiberlet_inputs(config, "fiber-source", catalog_cache=empty)
+
+
+def test_fiberlet_completion_includes_cached_published_normal(tmp_path, monkeypatch):
+    config = configured(tmp_path)
+    _completed_prediction_run(
+        config, name="fiber-source", kind="fiber3d-prediction",
+        channels=["presence", "nx", "ny"],
+    )
+    monkeypatch.setattr(
+        manager_completion, "_cached_catalog", lambda _config: prediction_catalog(),
+    )
+    candidates = dict(contextual_candidates(
+        config, ["fiberlet", "run", "fiber-source", ""],
+    ))
+    assert candidates["atlas:20260419180421@L2"].startswith("published normals")
+
+
+def test_fiberlet_binary_prefers_configured_venv_install(tmp_path, monkeypatch):
+    binary = tmp_path / "venv" / "bin" / "vc_fiberlets"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", "")
+
+    assert _resolve_binary(configured(tmp_path)) == binary.resolve()
+
+
+def test_fiberlet_inputs_reject_different_source_volumes(tmp_path):
+    config = configured(tmp_path)
+    _completed_prediction_run(
+        config, name="fiber-source", kind="fiber3d-prediction",
+        channels=["presence", "nx", "ny"],
+    )
+    _completed_prediction_run(
+        config, name="normal-source", kind="lasagna", channels=["grad_mag", "nx", "ny"],
+        volume_id="other",
+    )
+    with pytest.raises(ValueError, match="same source volume_id"):
+        resolve_fiberlet_inputs(config, "fiber-source", "normal-source")
+
+
+def test_fiberlet_completion_filters_inputs_by_role(tmp_path):
+    config = configured(tmp_path)
+    _completed_prediction_run(
+        config, name="fiber-source", kind="fiber3d-prediction",
+        channels=["presence", "nx", "ny"],
+    )
+    _completed_prediction_run(
+        config, name="normal-source", kind="lasagna", channels=["grad_mag", "nx", "ny"],
+    )
+    first = [value for value, _ in contextual_candidates(config, ["fiberlet", "run", ""])]
+    second = [
+        value for value, _ in contextual_candidates(
+            config, ["fiberlet", "run", "fiber-source", ""],
+        )
+    ]
+    assert first == ["fiber-source"]
+    assert second == ["normal-source"]
+
+
+def test_fiberlet_launch_rejects_manager_owned_native_options(tmp_path):
+    binary = tmp_path / "vc_fiberlets"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    binary.chmod(0o755)
+    config = replace(configured(tmp_path), fiberlet_binary=str(binary))
+    _completed_prediction_run(
+        config, name="fiber-source", kind="fiber3d-prediction",
+        channels=["presence", "nx", "ny"],
+    )
+    _completed_prediction_run(
+        config, name="normal-source", kind="lasagna", channels=["grad_mag", "nx", "ny"],
+    )
+    with pytest.raises(ValueError, match="manager-owned.*--anchor-cache"):
+        launch_fiberlet(
+            config, "fiber-source", "normal-source",
+            original_argv=["fiberlet", "run"],
+            extra_args=("--anchor-cache=/tmp/not-manager-owned",),
+            tmux=FakeTmux(),
+        )
+
+
 def _snapshot_and_config(tmp_path: Path):
     torch = pytest.importorskip("torch")
     snapshots = tmp_path / "runs" / "run one" / "snapshots"
     snapshots.mkdir(parents=True)
     checkpoint = snapshots / "best model.pt"
-    torch.save({"model": {"w": torch.ones(1)}, "step": 8, "config": {"patch_shape_zyx": [64, 64, 64]}}, checkpoint)
+    torch.save({
+        "model": {"w": torch.ones(1)}, "step": 8,
+        "model_identifier": "test-owner/test-model",
+        "config": {"patch_shape_zyx": [64, 64, 64]},
+    }, checkpoint)
     python = tmp_path / "venv" / "bin" / "python"
     python.parent.mkdir(parents=True)
     python.write_text("", encoding="utf-8")
     config = configured(tmp_path, snapshot_dirs=(tmp_path / "runs",))
     return config, index_snapshots(config)[0]
+
+
+def test_launch_refuses_snapshot_without_model_identifier(tmp_path):
+    config, snapshot = _snapshot_and_config(tmp_path)
+    snapshot = replace(snapshot, model_identifier=None)
+    volume = index_volumes(CatalogCache(
+        sample_catalog(), {"sha256": "digest", "fetched_at": "now"},
+    ))[0]
+    with pytest.raises(ValueError, match="snapshot import.*model-identifier"):
+        launch_inference(
+            config, snapshot, volume, 1,
+            original_argv=["inference", "run"], tmux=FakeTmux(),
+        )
+    assert not (tmp_path / "outputs").exists()
 
 
 def test_launch_writes_backend_neutral_record_and_argv(tmp_path):
@@ -743,7 +1414,7 @@ def test_lasagna_launch_reuses_shared_run_and_tmux_workflow(tmp_path):
     run_dir = launch_inference(
         config, snapshot, volume, 1,
         original_argv=["inference", "run", snapshot.selector, volume.selector, "1"],
-        extra_args=["--devices", "all"], tmux=fake,
+        tmux=fake,
     )
     metadata = json.loads((run_dir / "metadata.json").read_text())
     command = json.loads((run_dir / "command.json").read_text())["resolved_argv"]
@@ -755,6 +1426,9 @@ def test_lasagna_launch_reuses_shared_run_and_tmux_workflow(tmp_path):
     assert "--provenance-context" in command
     assert "--no-download" in command
     assert command[-2:] == ["--devices", "all"]
+    assert "--tile-size" not in command
+    assert "--border" not in command
+    assert "--overlap" not in command
     assert fake.created[0][2][1:3] == ["-m", "lasagna.manager.runner"]
 
 
@@ -779,12 +1453,13 @@ def test_inference_run_returns_after_detached_launch_without_foreground_prefetch
 
     monkeypatch.setattr(manager_cli, "launch_inference", fake_launch)
     assert main([
-        "inference", "run", snapshot.selector, volume.selector, "2",
+        "inference", "run", snapshot.selector, volume.selector,
         "--download-workers", "511",
     ]) == 0
     assert capsys.readouterr().out.strip() == str(tmp_path / "reserved-run")
     assert calls[0][1]["prefetch"] is True
     assert calls[0][1]["download_workers"] == 511
+    assert calls[0][0][3] == 2
     assert main([
         "inference", "run", snapshot.selector, volume.selector, "2",
         "--no-prefetch", "--download-workers", "333",
@@ -792,6 +1467,44 @@ def test_inference_run_returns_after_detached_launch_without_foreground_prefetch
     capsys.readouterr()
     assert calls[1][1]["prefetch"] is False
     assert calls[1][1]["download_workers"] == 333
+
+
+def test_backend_alias_commands_require_snapshot_and_force_backend(
+    tmp_path, monkeypatch, capsys,
+):
+    config, fiber_snapshot = _snapshot_and_config(tmp_path)
+    lasagna_snapshot = fiber_snapshot.__class__(**{
+        **fiber_snapshot.__dict__,
+        "backend": "lasagna",
+        "selector": "lasagna/run one/best model.pt",
+        "architecture": "lasagna_3d",
+    })
+    cache = CatalogCache(sample_catalog(), {"sha256": "digest", "fetched_at": "now"})
+    volume = index_volumes(cache)[0]
+    calls = []
+    monkeypatch.setattr(manager_cli, "load_config", lambda: config)
+    monkeypatch.setattr(manager_cli, "get_catalog", lambda _config: cache)
+    monkeypatch.setattr(
+        manager_cli, "index_snapshots", lambda _config: [fiber_snapshot, lasagna_snapshot],
+    )
+
+    def fake_launch(_config, snapshot, _volume, scale, **kwargs):
+        calls.append((snapshot.backend, scale, kwargs))
+        return tmp_path / f"{snapshot.backend}-run"
+
+    monkeypatch.setattr(manager_cli, "launch_inference", fake_launch)
+    assert main([
+        "las-inference", lasagna_snapshot.selector, volume.selector,
+    ]) == 0
+    assert calls[-1][:2] == ("lasagna", 2)
+    assert main([
+        "fiber-inference", fiber_snapshot.selector, volume.selector, "1",
+    ]) == 0
+    assert calls[-1][:2] == ("fiber3d", 1)
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit):
+        manager_cli._parser().parse_args(["las-inference", volume.selector])
 
 
 def test_reconcile_marks_dead_running_record_interrupted(tmp_path):
@@ -949,9 +1662,10 @@ def test_runner_rejects_zero_exit_without_completed_provenance(tmp_path):
         "resolved_argv": [sys.executable, "-c", "raise SystemExit(0)"]
     })
 
-    assert runner_main([str(run_dir)]) == 0
+    assert runner_main([str(run_dir)]) == 1
     metadata = json.loads((run_dir / "metadata.json").read_text())
     assert metadata["status"] == "failed"
+    assert metadata["exit_code"] == 1
     assert metadata["lifecycle"]["inference"] == "failed"
     assert "was not created" in metadata["completion_error"]
 
