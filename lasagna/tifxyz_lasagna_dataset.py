@@ -354,9 +354,9 @@ def build_patch_chains(patch, max_wraps: int) -> dict:
         seg_path = getattr(seg, "path", None)
         from pathlib import Path as _P
         seg_name = _P(seg_path).name if seg_path is not None else ""
+        # Winding ids come from the segment directory name only; meta.json
+        # uuid is an opaque random identity and never encodes a winding.
         wrap_ids = _extract_wrap_ids(seg_name)
-        if not wrap_ids:
-            wrap_ids = _extract_wrap_ids(getattr(seg, "uuid", ""))
         wrap_stats.append({
             "wrap_idx": wrap_idx,
             "segment_idx": int(wrap["segment_idx"]),

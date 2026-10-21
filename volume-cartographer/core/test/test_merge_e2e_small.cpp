@@ -113,13 +113,15 @@ TEST_CASE("vc_merge_tifxyz end-to-end on a synthetic 2-cell grid")
         QuadSurface a(makePlane(16, 16, 0), cv::Vec2f(1.f, 1.f));
         a.path = dirA;
         a.id   = nameA;
-        a.save(dirA.string(), nameA, /*force_overwrite=*/false);
+        a.meta["uuid"] = nameA;
+        a.save(dirA.string(), /*force_overwrite=*/false);
     }
     {
         QuadSurface b(makePlane(16, 16, 8), cv::Vec2f(1.f, 1.f));
         b.path = dirB;
         b.id   = nameB;
-        b.save(dirB.string(), nameB, /*force_overwrite=*/false);
+        b.meta["uuid"] = nameB;
+        b.save(dirB.string(), /*force_overwrite=*/false);
     }
 
     const fs::path mj = root / "merge.json";

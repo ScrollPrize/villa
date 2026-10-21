@@ -42,6 +42,7 @@
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
 #include "vc/core/util/ScrollUmbilicus.hpp"
+#include "vc/core/util/Uuid.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
@@ -82,6 +83,9 @@ public:
         bool focusBoundsApplied = false;
         std::string error;
         std::string eventName;
+        QString fiberTraceSummary;
+        QString fiberTraceDetails;
+        bool fiberTraceWarning = false;
     };
 
     // One fiber's polyline as the side-strip intersection query consumes
@@ -126,7 +130,14 @@ public:
         std::string name;
         int controlPointCount = 0;
         int linePointCount = 0;
+        // The whole stored line, open tails included: what the atlas search
+        // and the agent bridge measure arclengths against.
         double lengthVx = 0.0;
+        // The line between the outermost control points (the sum of the
+        // spans; nothing when they all sit on one line point), what the
+        // panels show as the fiber's length; the whole line with fewer than
+        // two finite control points.
+        double annotatedLengthVx = 0.0;
         AlignmentMetrics alignment;
         std::vector<SpanSummary> spans;
         double hvZDistance = 0.0;
@@ -319,12 +330,19 @@ public:
     bool canLaunchFromViewer(const CChunkedVolumeViewer* viewer) const;
     void launchFromViewerAtPoint(CChunkedVolumeViewer* viewer,
                                  const QPointF& scenePoint,
-                                 bool replaceOwningAnnotation = true);
+                                 bool replaceOwningAnnotation = true,
+                                 bool modelOnly = false);
     void openFiber(uint64_t fiberId);
     // Opens a fiber imported from an Automated Fiber Volume, fitting the whole
     // line in both strips. A Lasagna dataset is optional. Errors are returned
     // through error instead of dialogs.
     LineAnnotationDialog* openCollectionFiber(uint64_t fiberId, QString* error = nullptr);
+    // Opens a fiber annotation (with line_points) read-only, without adding it
+    // to the package: nothing is written, optimized or edited, and the fiber
+    // is forgotten when its view closes. key identifies the source fiber
+    // (reopening the same key while its view is open reuses that view).
+    LineAnnotationDialog* openFiberReadOnly(const nlohmann::json& fiber, const std::string& key,
+                                            QString* error = nullptr);
     void openFiberAtControlPoint(uint64_t fiberId, int controlPointIndex);
     void openFiberAtLinePointIndex(uint64_t fiberId, int linePointIndex);
     void openFiberSpan(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
@@ -408,6 +426,10 @@ public:
     [[nodiscard]] uint64_t fiberIdForFilePath(const std::filesystem::path& path) const;
     // First loaded filename match; use the full path when sources may overlap.
     [[nodiscard]] uint64_t fiberIdForFileName(const std::string& fileName) const;
+    // The loaded fiber a line annotation dialog is editing, or 0 when the
+    // dialog is not one of this controller's panes or its fiber has no
+    // stored file yet (a new, unsaved fiber).
+    [[nodiscard]] uint64_t fiberIdForDialog(const LineAnnotationDialog* dialog) const;
     // Whether the fiber with this runtime id is loaded under this file name
     // (a caller that captured both before a yield checks they still agree).
     [[nodiscard]] bool hasLoadedFiber(uint64_t fiberId, const std::string& fileName) const;
@@ -427,10 +449,10 @@ public:
     // their interactive counterparts are used in connect().
 
     // Writes a vc3d_fiber_collection bundle without opening a dialog.
-    bool exportFibersToPath(const std::filesystem::path& path, double scale,
+    bool exportFibersToPath(const std::filesystem::path& path,
                             QString* errorMessage = nullptr, int* exportedCount = nullptr);
     // Imports a fiber JSON, bundle, or directory without opening a dialog.
-    bool importFibersFromPath(const std::filesystem::path& path, double scale,
+    bool importFibersFromPath(const std::filesystem::path& path,
                               QString* errorMessage = nullptr,
                               int* importedCount = nullptr, int* skippedCount = nullptr);
     // Adds one unlinked vc3d_fiber to the package without reloading the other
@@ -871,6 +893,11 @@ private:
     void setSessionOptimizationState(LineAnnotationSession& session,
                                      SessionOptimizationState state);
     void refreshSessionOptimizationStatus(const LineAnnotationSession& session);
+    // Tells the pane's dialog whether a solve is running and whether edits
+    // are queued (the overview bar's settled-layout gate).
+    void syncDialogLineSolveActivity(const LineAnnotationSession& session);
+    // Source of LineControlPoint::identity (see controlMarkersForSession).
+    mutable uint64_t _nextControlIdentity = 1;
     bool placementAllowedByFocusBounds(const cv::Vec3d& point,
                                        bool suppressErrorDialogs) const;
     bool applyOptimizationTaskResult(LineAnnotationSession& session,
@@ -900,6 +927,16 @@ private:
                                          bool retraceAll,
                                          std::optional<std::vector<size_t>> dirtySegments = std::nullopt,
                                          bool globalGoalsOnly = false) const;
+    // Fiber model backend: the neural fiber-follow model when enabled
+    // (Line Annotation menu); else the native tracer.
+    [[nodiscard]] static bool fiberFollowEnabled();
+    // GUI thread: starts the fiber-follow service if needed; false (error
+    // shown unless headless) when it cannot run.
+    bool ensureFiberFollowService(bool headless, LineAnnotationDialog* dialog = nullptr);
+    // Points the request's tail extrapolation and Trace spans at the running
+    // fiber-follow service. familyHint: "H", "V" or empty (from the direction).
+    void installFiberFollowTracer(vc3d::line_annotation::FiberModeOptimizationRequest& request,
+                                  const QString& familyHint) const;
     // Drops the cached scroll umbilicus and everything describing it, so the next
     // use resolves again.
     void invalidateScrollUmbilicus();
@@ -977,6 +1014,7 @@ private:
                                                              int activeStart = -1,
                                                              int activeEnd = -1) const;
     void loadFibersForCurrentPackage();
+    void saveLoadedFiberMetadata(StoredFiber& fiber);
     // Drop fibers that are the same fiber seen through several sources (or
     // identical geometry under another name); records link aliases so branch
     // links written against a dropped copy still resolve to the survivor.
@@ -1035,6 +1073,7 @@ private:
     // fiberBaseShapeManifestCandidates). nullopt when none can be resolved.
     [[nodiscard]] std::optional<std::array<std::size_t, 3>>
         resolveStoredFiberCoordinateBaseShape(const StoredFiber& fiber) const;
+    void retainStoredFiberCoordinateBaseShape(StoredFiber& fiber) const;
     [[nodiscard]] std::optional<std::array<std::size_t, 3>>
         fiberManifestBaseShape(const std::string& location) const;
     [[nodiscard]] std::filesystem::path relativeFiberPath(const StoredFiber& fiber) const;
@@ -1099,8 +1138,6 @@ private:
     [[nodiscard]] bool controlPointHasBranch(const LineAnnotationSession& session,
                                              int controlPointIndex) const;
     std::vector<uint64_t> syncBranchEndpointPositions(LineAnnotationSession& session);
-    [[nodiscard]] static double lineLengthVx(const std::vector<cv::Vec3d>& points);
-    static void scaleStoredFiber(StoredFiber& fiber, double scale);
     [[nodiscard]] static vc::lasagna::LineModel lineModelFromPoints(
         const std::vector<cv::Vec3d>& points,
         const vc::lasagna::NormalSampler* normalSampler);
@@ -1127,8 +1164,8 @@ private:
     void scheduleSessionAutoSave(LineAnnotationSession& session);
     void flushSessionAutoSave(const std::string& surfaceName);
     void flushAllPendingSessionAutoSaves();
-    [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber, double scale = 1.0) const;
-    void saveFiberNow(const StoredFiber& fiber) const;
+    [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber) const;
+    void saveFiberNow(StoredFiber& fiber) const;
     void scheduleFiberSave(const StoredFiber& fiber);
     void scheduleFiberPairSave(const StoredFiber& first, const StoredFiber& second);
     void scheduleFiberSaveSnapshots(std::vector<FiberSaveSnapshot> snapshots,
@@ -1140,10 +1177,9 @@ private:
                             bool showErrors,
                             std::vector<std::shared_ptr<FiberSaveBatchTracker>> batches);
     void waitForFiberSaves();
-    [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber) const;
+    [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber);
     [[nodiscard]] static nlohmann::json fiberSaveSnapshotToJson(
-        const FiberSaveSnapshot& snapshot,
-        double scale = 1.0);
+        const FiberSaveSnapshot& snapshot);
     // A link entry a load dropped from a stored record (neutralized, removed
     // by a repair, or stripped by the lenient parser). Fields a stripped
     // entry did not parse stay unset; a descriptor without a target matches
@@ -1353,6 +1389,7 @@ private:
     // This covers those pre-publication continuations only; the loader is
     // not otherwise reentrant-safe.
     uint64_t _fiberLoadSequence = 0;
+    std::unordered_set<uint64_t> _pendingCoordinateShapeSaves;
     std::deque<FiberSaveJob> _pendingFiberSaveJobs;
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;

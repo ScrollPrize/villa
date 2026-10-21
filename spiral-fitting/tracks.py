@@ -186,10 +186,70 @@ class _NativeCrossingProgress:
         self.completed = 0
 
 
+_SQLITE_MAGIC = b'SQLite format 3\x00'
+
+
+def _is_sqlite_dbm(path):
+    # dbm.sqlite3 (the default dbm backend since Python 3.13) writes a plain
+    # SQLite file; dbm.whichdb() cannot identify it on interpreters that lack
+    # the dbm.sqlite3 module.
+    try:
+        with open(path, 'rb') as stream:
+            return stream.read(len(_SQLITE_MAGIC)) == _SQLITE_MAGIC
+    except OSError:
+        return False
+
+
+class _SQLiteTrackDBM:
+    """Read-only view of a dbm.sqlite3 store for interpreters without dbm.sqlite3.
+
+    Uses the same single-table schema as CPython's Lib/dbm/sqlite3.py
+    (``Dict(key BLOB, value BLOB)``) and only the read operations the track
+    loaders need.
+    """
+
+    def __init__(self, path):
+        import sqlite3
+        uri = Path(os.path.abspath(path)).as_uri() + '?mode=ro'
+        self._connection = sqlite3.connect(uri, uri=True)
+
+    def keys(self):
+        return [key for (key,) in self._connection.execute('SELECT key FROM Dict')]
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            key = key.encode()
+        row = self._connection.execute(
+            'SELECT value FROM Dict WHERE key = CAST(? AS BLOB)', (key,)).fetchone()
+        if row is None:
+            raise KeyError(key)
+        return row[0]
+
+    def __len__(self):
+        return self._connection.execute('SELECT COUNT(key) FROM Dict').fetchone()[0]
+
+    def close(self):
+        self._connection.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+
+def open_tracks_dbm(path):
+    """Open a tracks DBM read-only, including SQLite-backed stores on Python < 3.13."""
+    text = os.fspath(path)
+    if not dbm.whichdb(text) and _is_sqlite_dbm(text):
+        return _SQLiteTrackDBM(text)
+    return dbm.open(text, 'r')
+
+
 def normalize_tracks_dbm_path(path):
     """Return the logical DBM path, accepting a common ``.db`` backing path."""
     text = os.fspath(path)
-    if dbm.whichdb(text):
+    if dbm.whichdb(text) or _is_sqlite_dbm(text):
         return text
     if text.endswith('.db') and dbm.whichdb(text[:-3]):
         return text[:-3]
@@ -250,7 +310,7 @@ def write_packed_track_store(
     tortuosity_batches = []
     point_count = 0
     try:
-        with (dbm.open(logical, 'r') as database,
+        with (open_tracks_dbm(logical) as database,
               (temporary / 'coordinates.i32').open('wb') as coordinate_stream):
             keys = sorted(database.keys())
             for key_ordinal, key in enumerate(tqdm(
@@ -452,7 +512,7 @@ def load_tracks_from_dbm(
     tracks = []
     families = []
     source_ids = []
-    with dbm.open(path, 'r') as db:
+    with open_tracks_dbm(path) as db:
         keys = db.keys()
         if progress is not None:
             progress.begin(
@@ -537,7 +597,7 @@ def load_tracks_from_dbm(
 def _iter_tracks_from_dbm(path, z_lo=None, z_hi=None, show_progress=True):
     """Yield native voxel tracks in stable source-id order, one DBM key at a time."""
     path = normalize_tracks_dbm_path(path)
-    with dbm.open(path, 'r') as database:
+    with open_tracks_dbm(path) as database:
         keys = sorted(database.keys())
         for key_ordinal, key in enumerate(tqdm(
                 keys, desc='streaming tracks', disable=not show_progress)):
@@ -1190,7 +1250,7 @@ def _write_disk_crossing_index(
             z_lo=z_lo, z_hi=z_hi, show_progress=show_progress)
     with (open(coordinates_path, 'wb') as coordinate_stream,
           open(packed_path, 'wb') as packed_stream,
-          dbm.open(path, 'r') as database):
+          open_tracks_dbm(path) as database):
         keys = sorted(database.keys())
         for key_ordinal, key in enumerate(tqdm(
                 keys, desc='staging track keys', unit='keys',

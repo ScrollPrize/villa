@@ -1,5 +1,32 @@
 find_package(Qt6 REQUIRED COMPONENTS Concurrent Core Network Test Widgets)
 
+add_executable(test_surface_transform_name test_surface_transform_name.cpp)
+target_include_directories(test_surface_transform_name PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_surface_transform_name PRIVATE Qt6::Core)
+add_test(NAME surface_transform_name COMMAND test_surface_transform_name)
+vc_register_test_target(test_surface_transform_name)
+vc_register_ctest(surface_transform_name test_surface_transform_name)
+
+add_executable(test_volume_path_labels test_volume_path_labels.cpp
+    ../elements/VolumeSelector.cpp ../elements/VolumeSelector.hpp)
+set_target_properties(test_volume_path_labels PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_volume_path_labels PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_volume_path_labels PRIVATE Qt6::Widgets Qt6::Test)
+add_test(NAME volume_path_labels COMMAND test_volume_path_labels)
+set_tests_properties(volume_path_labels PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+vc_register_test_target(test_volume_path_labels)
+vc_register_ctest(volume_path_labels test_volume_path_labels)
+
+add_executable(test_surface_render_policy test_surface_render_policy.cpp)
+set_target_properties(test_surface_render_policy PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_surface_render_policy PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_surface_render_policy PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME surface_render_policy COMMAND test_surface_render_policy)
+vc_register_test_target(test_surface_render_policy)
+vc_register_ctest(surface_render_policy test_surface_render_policy)
+
 add_executable(test_catalog_project_dialog
     test_catalog_project_dialog.cpp
     ../OpenDataCatalogWindow.cpp
@@ -360,10 +387,12 @@ set_target_properties(test_fiber_network_layout PROPERTIES
 
 target_include_directories(test_fiber_network_layout PRIVATE
     ${PROJECT_SOURCE_DIR}/apps/VC3D
+    ${PROJECT_SOURCE_DIR}/core/include
     ${OpenCV_INCLUDE_DIRS})
 
 target_link_libraries(test_fiber_network_layout PRIVATE
     Qt6::Core
+    Qt6::Gui
     Qt6::Test)
 
 add_test(NAME fiber_network_layout COMMAND test_fiber_network_layout)
@@ -561,6 +590,43 @@ target_link_libraries(test_fiber_map_ruler_math PRIVATE
 add_test(NAME fiber_map_ruler_math COMMAND test_fiber_map_ruler_math)
 vc_register_test_target(test_fiber_map_ruler_math)
 vc_register_ctest(fiber_map_ruler_math test_fiber_map_ruler_math)
+
+add_executable(test_fiber_length_display
+    test_fiber_length_display.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberLengthDisplay.hpp)
+
+set_target_properties(test_fiber_length_display PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_length_display PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_fiber_length_display PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_length_display COMMAND test_fiber_length_display)
+vc_register_test_target(test_fiber_length_display)
+vc_register_ctest(fiber_length_display test_fiber_length_display)
+
+add_executable(test_fiber_map_kollesis
+    test_fiber_map_kollesis.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapKollesis.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapKollesis.hpp)
+
+set_target_properties(test_fiber_map_kollesis PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_map_kollesis PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_fiber_map_kollesis PRIVATE
+    Qt6::Core
+    Qt6::Test)
+
+add_test(NAME fiber_map_kollesis COMMAND test_fiber_map_kollesis)
+vc_register_test_target(test_fiber_map_kollesis)
+vc_register_ctest(fiber_map_kollesis test_fiber_map_kollesis)
 
 add_executable(test_line_annotation_fiber_deletion
     test_line_annotation_fiber_deletion.cpp

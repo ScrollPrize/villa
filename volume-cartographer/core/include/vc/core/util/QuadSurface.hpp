@@ -377,9 +377,28 @@ public:
     // ptr-space stores (col - center.x*scale.x, row - center.y*scale.y, 0).
     [[nodiscard]] cv::Vec2f ptrToGrid(const cv::Vec3f& ptr) const;
 
-    void save(const std::filesystem::path &path, const std::string &uuid, bool force_overwrite = false);
+    // Save under this surface's persistent object UUID (meta["uuid"]),
+    // minting one when meta has none. Use for in-place edits, renames and
+    // replicas of the same object. The directory name is never the identity.
     void save(const std::filesystem::path &path, bool force_overwrite = false);
+    // Save as a new object: always assigns a fresh object UUID first. Use for
+    // copies and derived outputs whose meta was taken from another surface.
+    // Removes catalog representation lookup metadata from the local copy.
+    void saveAsNew(const std::filesystem::path &path, bool force_overwrite = false);
+    // Save an edit of the surface read from `source`: writing back over
+    // `source` is an in-place edit (save), any other destination is a new
+    // object (saveAsNew).
+    void saveEdited(const std::filesystem::path &source,
+                    const std::filesystem::path &dest,
+                    bool force_overwrite = false);
+    // The object UUID is never passed alongside a path: set meta["uuid"]
+    // explicitly for a known identity. Deleted so a name argument cannot
+    // silently convert to force_overwrite.
+    void save(const std::filesystem::path&, const char*, bool = false) = delete;
+    void save(const std::filesystem::path&, const std::string&, bool = false) = delete;
     void save_meta();
+    // meta["uuid"], or empty when the surface has no persistent identity yet.
+    [[nodiscard]] std::string objectUuid() const;
     Rect3D bbox();
 
     bool isLoaded() const { return !_needsLoad; }
@@ -562,6 +581,8 @@ private:
 
     // Write surface data to directory without modifying state. skipChannel can be used to exclude a channel.
     void writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel = "");
+    void saveWithUuid(const std::filesystem::path& path, const std::string& uuid, bool force_overwrite);
+    std::string objectUuidOrNew() const;
     // Write a single ancillary channel as dir/<name>.tif.
     void writeChannelFile(const std::filesystem::path& dir, const std::string& name, const cv::Mat& mat);
     // Flag for lazy loading - true if points need to be loaded from path
