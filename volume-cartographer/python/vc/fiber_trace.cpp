@@ -26,6 +26,7 @@
 
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/fiber_tracer/FiberChunkTrace.hpp"
+#include "vc/fiber_tracer/FiberLiveBridge.hpp"
 #include "vc/fiber_tracer/FiberReverseConsistency.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
@@ -119,6 +120,13 @@ struct PredictionFieldHandle {
     std::unique_ptr<ft::FiberPredictionField> field;
     ft::FiberPredictionTraceScales scales;
     std::string location;
+};
+
+struct LiveBridgeHandle {
+    std::shared_ptr<ft::FiberLiveBridge> bridge;
+    LiveBridgeHandle(int port, const std::string& token, int timeout, bool heartbeat)
+        : bridge(std::make_shared<ft::FiberLiveBridge>(nlohmann::json{
+              {"port",port},{"token",token},{"timeout_seconds",timeout},{"heartbeat_wait",heartbeat}})) {}
 };
 
 struct NormalSamplerHandle {
@@ -485,7 +493,38 @@ NB_MODULE(fiber_trace, m)
     m.def("decode_directions", &decodeDirections, "nx"_a.noconvert(), "ny"_a.noconvert(),
           "Decode flat uint8 nx/ny arrays to unit xyz axes; missing bytes give zero axes.");
 
+    nb::class_<LiveBridgeHandle>(m, "LiveBridge")
+        .def(nb::init<int,const std::string&,int,bool>(),
+             "port"_a,"token"_a,"timeout_seconds"_a=600,"heartbeat_wait"_a=false,
+             nb::call_guard<nb::gil_scoped_release>())
+        .def("cancel", [](LiveBridgeHandle& h,const std::string& reason) { h.bridge->cancel(reason); },
+             "reason"_a="cancelled", nb::call_guard<nb::gil_scoped_release>())
+        .def("check_active", [](LiveBridgeHandle& h) { h.bridge->checkActive(); },
+             nb::call_guard<nb::gil_scoped_release>())
+        .def("wait", [](LiveBridgeHandle& h,const std::string& source,size_t caseIndex,
+                       double remaining,const std::vector<std::string>& paths,
+                       const std::vector<std::array<uint32_t,3>>& indices) {
+            if(paths.size()!=indices.size()) throw std::invalid_argument("paths and indices sizes differ");
+            std::vector<ft::FiberPredictionChunkDependency> chunks;
+            for(size_t i=0;i<paths.size();++i) chunks.push_back({paths[i],indices[i]});
+            nb::gil_scoped_release release;
+            h.bridge->await(source,caseIndex,remaining,chunks);
+        }, "source"_a,"case_index"_a,"remaining_base_voxels"_a,"array_paths"_a,"indices_zyx"_a);
+
     nb::class_<PredictionFieldHandle>(m, "PredictionField")
+        .def("set_live_bridge", [](PredictionFieldHandle& field,const LiveBridgeHandle& h,
+                                   const std::string& source,size_t caseIndex,double remaining,size_t capacity) {
+            if(source.empty() || !std::isfinite(remaining) || remaining<0)
+                throw std::invalid_argument("invalid live source or remaining distance");
+            auto readiness=std::make_shared<ft::FiberCaseReadiness>(capacity);
+            field.field->setReadinessGate([bridge=h.bridge,readiness,source,caseIndex,remaining](const auto& chunks) {
+                readiness->await(chunks,[&](const auto& missing) {
+                    bridge->await(source,caseIndex,remaining,missing);
+                },[&] { bridge->checkActive(); });
+            });
+        }, "bridge"_a,"source"_a,"case_index"_a=0,"remaining_base_voxels"_a=0,
+           "proof_cache_capacity"_a=4096,
+           "Attach before sampling. The field retains this session; no Python callbacks run during native work.")
         .def_prop_ro("trace_to_base_scale",
                      [](const PredictionFieldHandle& self) { return self.scales.traceToBaseScale; })
         .def_prop_ro("prediction_to_base_scale",
