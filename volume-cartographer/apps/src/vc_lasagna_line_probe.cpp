@@ -5,13 +5,12 @@
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/lasagna/LineViewBuilder.hpp"
 #include "vc/lasagna/NormalAlignment.hpp"
-#include "vc/core/render/ChunkedPlaneSampler.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfaceTexture.hpp"
 
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
-#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
@@ -32,8 +31,10 @@
 
 namespace {
 
+using vc::core::util::renderCoordsTextureFineToCoarse;
+using vc::core::util::writeUncompressedTextureTiff;
+
 constexpr double kEpsilon = 1.0e-12;
-constexpr int kTiffCompressionNone = 1;
 
 cv::Vec3d normalizedOrZero(const cv::Vec3d& v)
 {
@@ -1225,65 +1226,6 @@ void writeSurfaceObj(const QuadSurface& surface,
     }
 }
 
-cv::Mat renderCoordsTexture(const cv::Mat_<cv::Vec3f>& baseCoords,
-                            Volume& textureVolume,
-                            int textureLevel,
-                            int renderScale,
-                            const char* label)
-{
-    if (baseCoords.empty()) {
-        throw std::runtime_error("surface has no points for texture rendering");
-    }
-    renderScale = std::max(1, renderScale);
-    cv::Mat_<cv::Vec3f> coords;
-    if (renderScale == 1) {
-        coords = baseCoords.clone();
-    } else {
-        cv::resize(baseCoords,
-                   coords,
-                   cv::Size(baseCoords.cols * renderScale, baseCoords.rows * renderScale),
-                   0.0,
-                   0.0,
-                   cv::INTER_LINEAR);
-    }
-
-    vc::render::IChunkedArray* cache = textureVolume.chunkedCache();
-    if (!cache) {
-        throw std::runtime_error("texture volume has no chunk cache");
-    }
-    if (cache->dtype() != vc::render::ChunkDtype::UInt8) {
-        throw std::runtime_error(
-            "line probe strip rendering uses the VC3D uint8 chunk sampler; "
-            "choose a uint8 texture zarr");
-    }
-
-    cv::Mat_<uint8_t> sampled(coords.rows, coords.cols, uint8_t(0));
-    cv::Mat_<uint8_t> coverage(coords.rows, coords.cols, uint8_t(0));
-    const vc::render::ChunkedPlaneSampler::Options options(vc::Sampling::Trilinear, 32);
-    const int startLevel = std::clamp(textureLevel, 0, cache->numLevels() - 1);
-
-    for (int level = startLevel; level < cache->numLevels(); ++level) {
-        std::vector<vc::render::ChunkKey> keys =
-            vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
-                *cache, level, coords, coverage, options);
-        if (!keys.empty()) {
-            cache->prefetchChunks(keys, true);
-        }
-    }
-
-    const auto stats = vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-        *cache, startLevel, coords, sampled, coverage, options);
-    const int covered = cv::countNonZero(coverage);
-    const int total = coverage.rows * coverage.cols;
-    std::cout << label << ": start_level=" << startLevel
-              << " render_scale=" << renderScale
-              << " size=" << sampled.cols << "x" << sampled.rows
-              << " covered=" << covered << "/" << total
-              << " requested_chunks=" << stats.requestedChunks
-              << " error_chunks=" << stats.errorChunks << '\n';
-    return sampled;
-}
-
 cv::Mat renderSurfaceTexture(const QuadSurface& surface,
                              Volume& textureVolume,
                              int textureLevel,
@@ -1293,14 +1235,12 @@ cv::Mat renderSurfaceTexture(const QuadSurface& surface,
     if (!points || points->empty()) {
         throw std::runtime_error("surface has no points for texture rendering");
     }
-    return renderCoordsTexture(*points,
+    return renderCoordsTextureFineToCoarse(*points,
                                textureVolume,
                                textureLevel,
                                renderScale,
                                "Strip texture sampling");
 }
-
-void writeTif(const std::filesystem::path& path, const cv::Mat& image);
 
 vc::lasagna::LineModel lineModelSliceFromFixedIndices(
     const vc::lasagna::LineModel& line,
@@ -1361,7 +1301,7 @@ void writePartialSideSliceObjOutput(const vc::lasagna::LineModel& line,
 
     const cv::Mat sideSliceTexture =
         renderSurfaceTexture(*surfaces.lineSideSlice, textureVolume, textureLevel, renderScale);
-    writeTif(outputDir / "partial_side_slice.tif", sideSliceTexture);
+    writeUncompressedTextureTiff(outputDir / "partial_side_slice.tif", sideSliceTexture);
     writeSurfaceMtl(outputDir / "partial_side_slice.mtl",
                     "partial_side_slice_texture",
                     "partial_side_slice.tif");
@@ -1369,20 +1309,6 @@ void writePartialSideSliceObjOutput(const vc::lasagna::LineModel& line,
                     outputDir / "partial_side_slice.obj",
                     "partial_side_slice_texture",
                     "partial_side_slice.mtl");
-}
-
-void writeTif(const std::filesystem::path& path, const cv::Mat& image)
-{
-    if (image.empty()) {
-        throw std::runtime_error("cannot write empty image: " + path.string());
-    }
-    const std::vector<int> params{
-        cv::IMWRITE_TIFF_COMPRESSION,
-        kTiffCompressionNone,
-    };
-    if (!cv::imwrite(path.string(), image, params)) {
-        throw std::runtime_error("failed to write image: " + path.string());
-    }
 }
 
 void writeReinitDebugObjOutput(
@@ -1400,12 +1326,12 @@ void writeReinitDebugObjOutput(
         const PlaneSliceBasis basis = fitControlPointPlaneSlice(controlPoints);
         const cv::Mat_<cv::Vec3f> planeCoords =
             makePlaneSliceGrid(basis, 32.0, renderScale);
-        const cv::Mat planeTexture = renderCoordsTexture(planeCoords,
+        const cv::Mat planeTexture = renderCoordsTextureFineToCoarse(planeCoords,
                                                          *textureVolume,
                                                          textureLevel,
                                                          renderScale,
                                                          "Control plane texture sampling");
-        writeTif(outputDir / "control_plane_slice.tif", planeTexture);
+        writeUncompressedTextureTiff(outputDir / "control_plane_slice.tif", planeTexture);
         writeSurfaceMtl(outputDir / "control_plane_slice.mtl",
                         "control_plane_slice_texture",
                         "control_plane_slice.tif");
@@ -1509,11 +1435,11 @@ void writeStripImages(const vc::lasagna::LineModel& line,
 {
     ensureDirectory(outputDir);
     const RenderedStrips strips = renderLineViewStrips(line, textureVolume, textureLevel, renderScale);
-    writeTif(outputDir / "line_surface.tif", strips.lineSurface);
-    writeTif(outputDir / "line_surface_overlay.tif",
+    writeUncompressedTextureTiff(outputDir / "line_surface.tif", strips.lineSurface);
+    writeUncompressedTextureTiff(outputDir / "line_surface_overlay.tif",
              makeStripOverlay(strips.lineSurface, fixedIndices, renderScale));
-    writeTif(outputDir / "side_slice.tif", strips.lineSideSlice);
-    writeTif(outputDir / "side_slice_overlay.tif",
+    writeUncompressedTextureTiff(outputDir / "side_slice.tif", strips.lineSideSlice);
+    writeUncompressedTextureTiff(outputDir / "side_slice_overlay.tif",
              makeStripOverlay(strips.lineSideSlice, fixedIndices, renderScale));
 }
 
@@ -1536,8 +1462,8 @@ void writeLineViewObjOutput(const vc::lasagna::LineModel& line,
         renderSurfaceTexture(*surfaces.lineSurface, textureVolume, textureLevel, renderScale);
     const cv::Mat sideSliceTexture =
         renderSurfaceTexture(*surfaces.lineSideSlice, textureVolume, textureLevel, renderScale);
-    writeTif(outputDir / "line_surface.tif", lineSurfaceTexture);
-    writeTif(outputDir / "side_slice.tif", sideSliceTexture);
+    writeUncompressedTextureTiff(outputDir / "line_surface.tif", lineSurfaceTexture);
+    writeUncompressedTextureTiff(outputDir / "side_slice.tif", sideSliceTexture);
 
     writeSurfaceMtl(outputDir / "line_surface.mtl",
                     "line_surface_texture",
