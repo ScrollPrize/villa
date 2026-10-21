@@ -1,5 +1,6 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
+#include <ceres/ceres.h>
 
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -1231,6 +1232,30 @@ TEST_CASE("LineOptimizer rejects conflicting control-point direction constraints
 
 TEST_CASE("LineOptimizer reports the actual Ceres candidate failure")
 {
+    // Ask the linked Ceres version for this failure's diagnostic. Its wording
+    // changed between releases; we still require the optimizer to preserve the
+    // complete solver message for both candidates.
+    struct InvalidJacobianCost final : ceres::SizedCostFunction<1, 1> {
+        bool Evaluate(double const* const*, double* residuals,
+                      double** jacobians) const override
+        {
+            residuals[0] = 0.0;
+            if (jacobians && jacobians[0]) {
+                jacobians[0][0] = std::numeric_limits<double>::quiet_NaN();
+            }
+            return true;
+        }
+    };
+    double parameter = 0.0;
+    ceres::Problem problem;
+    problem.AddResidualBlock(new InvalidJacobianCost, nullptr, &parameter);
+    ceres::Solver::Options options;
+    options.logging_type = ceres::SILENT;
+    ceres::Solver::Summary expectedFailure;
+    ceres::Solve(options, &problem, &expectedFailure);
+    REQUIRE(expectedFailure.termination_type == ceres::FAILURE);
+    REQUIRE_FALSE(expectedFailure.message.empty());
+
     InvalidDerivativeNormalSampler sampler;
     vc::lasagna::LineOptimizer optimizer(sampler);
     vc::lasagna::LineOptimizationConfig config;
@@ -1255,7 +1280,9 @@ TEST_CASE("LineOptimizer reports the actual Ceres candidate failure")
         linePoints, controls, {0, 3}, 0, config);
 
     REQUIRE(result.failed);
-    CHECK(result.failureReason.find("Initial residual and Jacobian") !=
+    CHECK(result.failureReason.find("left=\"" + expectedFailure.message + "\"") !=
+          std::string::npos);
+    CHECK(result.failureReason.find("right=\"" + expectedFailure.message + "\"") !=
           std::string::npos);
     CHECK(result.failureReason.find("dots:") == std::string::npos);
 }

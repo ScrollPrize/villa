@@ -187,22 +187,22 @@ void TestFiberMapGapField::invalidParametersThrow()
     addVertical(layout, 100.0, 0.0, 500.0);
     GapFieldParams params;
     params.cellVx = 0.0;
-    QVERIFY_THROWS_EXCEPTION(std::invalid_argument, buildGapField(layout, params));
+    QVERIFY_EXCEPTION_THROWN(buildGapField(layout, params), std::invalid_argument);
     params = GapFieldParams{};
     params.saturationVx = std::numeric_limits<double>::infinity();
-    QVERIFY_THROWS_EXCEPTION(std::invalid_argument, buildGapField(layout, params));
+    QVERIFY_EXCEPTION_THROWN(buildGapField(layout, params), std::invalid_argument);
     params = GapFieldParams{};
     params.acrossWeight = -1.0;
-    QVERIFY_THROWS_EXCEPTION(std::invalid_argument, buildGapField(layout, params));
+    QVERIFY_EXCEPTION_THROWN(buildGapField(layout, params), std::invalid_argument);
     params = GapFieldParams{};
     params.maxFoldWindings = -1;
-    QVERIFY_THROWS_EXCEPTION(std::invalid_argument, buildGapField(layout, params));
+    QVERIFY_EXCEPTION_THROWN(buildGapField(layout, params), std::invalid_argument);
     params = GapFieldParams{};
     params.maxCells = 0;
-    QVERIFY_THROWS_EXCEPTION(std::invalid_argument, buildGapField(layout, params));
+    QVERIFY_EXCEPTION_THROWN(buildGapField(layout, params), std::invalid_argument);
     params = GapFieldParams{};
     params.fadeWindings = 0;
-    QVERIFY_THROWS_EXCEPTION(std::invalid_argument, buildGapField(layout, params));
+    QVERIFY_EXCEPTION_THROWN(buildGapField(layout, params), std::invalid_argument);
 }
 
 void TestFiberMapGapField::unachievableBudgetThrows()
@@ -214,7 +214,7 @@ void TestFiberMapGapField::unachievableBudgetThrows()
     params.saturationVx = 8000.0;
     for (const std::size_t budget : {std::size_t(1), std::size_t(2), std::size_t(3), std::size_t(4)}) {
         params.maxCells = budget;
-        QVERIFY_THROWS_EXCEPTION(std::invalid_argument, buildGapField(layout, params));
+        QVERIFY_EXCEPTION_THROWN(buildGapField(layout, params), std::invalid_argument);
     }
 }
 
