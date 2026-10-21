@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <cstring>
 #include <cmath>
+#include <tuple>
 
 #if defined(__unix__) || defined(__APPLE__)
 #include <arpa/inet.h>
@@ -26,7 +27,7 @@ public:
     std::mutex mutex, sendMutex;
     std::condition_variable changed;
     std::map<size_t, std::shared_ptr<Waiter>> waiting;
-    using ChunkKey = std::pair<std::string, std::array<uint32_t, 3>>;
+    using ChunkKey = std::tuple<std::string, std::string, std::array<uint32_t, 3>>;
     std::set<ChunkKey> ready;
     std::string error;
     std::atomic<bool> cancelled{false};
@@ -197,7 +198,7 @@ public:
             auto lock = awaitLock(profile);
             if (!error.empty()) throw std::runtime_error(error);
             for (const auto& chunk : chunks) {
-                ChunkKey key{chunk.arrayPath.string(), chunk.indexZYX};
+                ChunkKey key{source, chunk.arrayPath.string(), chunk.indexZYX};
                 if (!ready.contains(key)) missing.push_back(std::move(key));
             }
             if (missing.empty()) return;
@@ -205,7 +206,7 @@ public:
             waiting.emplace(request, state); // registration precedes send: no lost ready event
         }
         nlohmann::json dependencies = nlohmann::json::array();
-        for (const auto& [path, index] : missing)
+        for (const auto& [sourceId, path, index] : missing)
             dependencies.push_back({{"array", path}, {"index_zyx", index}});
         try {
             send({{"version", 1}, {"type", "demand"}, {"request_id", request},

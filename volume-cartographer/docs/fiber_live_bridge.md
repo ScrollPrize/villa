@@ -35,7 +35,9 @@ An empty cancellation reason uses a nonempty default error.
 The optional `remaining_base_voxels` value on `set_live_bridge` is a fixed
 coordinator scheduling hint, not a dynamically updated route distance.
 `proof_cache_capacity=4096` bounds the field-local proof cache. The bridge has
-a shared 100,000-key proof cache. Eviction only requests another acknowledgement;
+a shared 100,000-key proof cache keyed by source, array path and chunk index.
+Identical array paths in different sources require independent acknowledgements.
+Eviction only requests another acknowledgement;
 it does not invalidate prediction payloads or imply that inference must repeat.
 For direct requests, `bridge.wait(source, case_index, remaining_base_voxels,
 array_paths, indices_zyx)` uses one array path and one ZYX index per dependency.

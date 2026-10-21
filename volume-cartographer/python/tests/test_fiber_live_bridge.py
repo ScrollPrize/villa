@@ -98,6 +98,35 @@ def test_concurrent_acknowledgements_and_proof_cache():
             client.wait("prediction", 0, 0, [], [])
 
 
+def test_publication_proofs_are_scoped_to_source():
+    pending = threading.Event()
+    def respond(server, connection, request):
+        if request["source"] == "first":
+            server.ready(connection, request)
+        else:
+            pending.set()  # The second dataset is not published yet.
+    with Coordinator(respond) as server:
+        client = bridge(server)
+        def demand(source):
+            client.wait(source, 0, 256, ["presence/0"], [[0, 0, 0]])
+        demand("first")
+        demand("first")
+        assert len(server.requests) == 1
+        with ThreadPoolExecutor(1) as pool:
+            second = pool.submit(demand, "second")
+            try:
+                assert pending.wait(3), "first source proof incorrectly satisfied second source"
+                assert not second.done()
+                server.ready(server.connection, server.requests[-1])
+                second.result(timeout=3)
+            finally:
+                if not second.done():
+                    client.cancel("test cleanup")
+        demand("second")
+        demand("first")
+        assert [r["source"] for r in server.requests] == ["first", "second"]
+
+
 def test_heartbeat_keeps_wait_alive_but_does_not_publish():
     received = threading.Event()
     def respond(server, connection, request):
