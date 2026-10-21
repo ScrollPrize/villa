@@ -55,6 +55,9 @@ struct InputLink {
     // Two explicit refs of one pair disagreeing (true here, false there) is
     // reported as PlacedLink::adjacentDisagrees.
     bool adjacentExplicit = true;
+    // An unreviewed automatic link (FiberBranchRef::autoLink): the map draws
+    // its endpoints dashed. ORed on dedup under `pending && !adjacent`.
+    bool autoLink = false;
 };
 
 struct InputFiber {
@@ -133,6 +136,11 @@ struct Run {
     int firstControl = -1;
     int lastControl = -1;
     std::vector<QPointF> points;
+    // Parallel to points: each drawn sample's raw unrolled arclength (the
+    // parameterisation buildFiberGeometry resampled on; see
+    // unrolledLineArclengths), so a point on the drawn curve can be mapped
+    // back to a position on the fiber's source line points.
+    std::vector<double> arclengths;
 };
 
 struct PlacedFiber {
@@ -149,6 +157,14 @@ struct PlacedFiber {
     std::vector<bool> kollesisTerminations;
     // Parallel to controlPoints: the point carries the break tag (same rule).
     std::vector<bool> breaks;
+    // Parallel to controlPoints: each control's raw unrolled arclength (what
+    // controlPoints were read off the curve at).
+    std::vector<double> controlArclength;
+    // The unroll this fiber was drawn with (x = (thetaScale * theta +
+    // offsetRad) * rRef), kept so unrolledLineArclengths can reproduce the
+    // raw arclength of its source line points exactly.
+    double thetaScale = 1.0;
+    double offsetRad = 0.0;
 };
 
 // The points to DRAW for fiber.runs[runIndex]: the run's own points, except
@@ -182,6 +198,9 @@ struct PlacedLink {
     // ordinary): the annotation is inconsistent between the two files. Always
     // suspect, constrains nothing; the sync merge arbitrates.
     bool adjacentDisagrees = false;
+    // An unreviewed automatic link (InputLink::autoLink, ORed on dedup):
+    // drawn with dashed endpoint markers in the pending colours.
+    bool autoLink = false;
 };
 
 struct WindingMark {
@@ -623,5 +642,45 @@ private:
     const std::vector<cv::Vec3f>& umbilicusCenters,
     const GlobalLayoutParams& params);
 [[nodiscard]] ContentDigest digestGlobalResult(const GlobalResult& result);
+
+// The review state of one link endpoint (a control point of a fiber), from
+// EVERY link of the inputs - the layout drops links to fibers it cannot
+// place, the markers must not. pending wins over approved; autoPending only
+// when every pending link on the point is automatic (a human pending link
+// outranks); sameHv is the same-orientation warning of the winning state
+// (both tags known and equal); adjacent = any adjacent link (triangle).
+struct EndpointReview {
+    bool linked = false;
+    bool pending = false;
+    bool autoPending = false;
+    bool anyAuto = false;
+    bool sameHv = false;
+    bool adjacent = false;
+};
+struct EndpointKey {
+    uint64_t fiberId = 0;
+    int controlIndex = -1;
+    bool operator<(const EndpointKey& other) const
+    {
+        return fiberId != other.fiberId ? fiberId < other.fiberId
+                                        : controlIndex < other.controlIndex;
+    }
+};
+[[nodiscard]] std::map<EndpointKey, EndpointReview> aggregateEndpointReviews(
+    const std::vector<InputFiber>& fibers);
+
+// The raw unrolled arclength of a fiber's source line points - the same
+// array buildFiberGeometry resamples on (bitwise: same umbilicus
+// interpolation, atan2, unwrapping, unroll and cumulative sum). thetaScale,
+// offsetRad and rRefVx are the fiber's PlacedFiber values and
+// GlobalResult::rRefVx; umbilicusCenters are the ones the layout was built
+// with. Lets a drawn point (Run::arclengths) be inverted to a source line
+// position without the layout retaining per-point data.
+[[nodiscard]] std::vector<double> unrolledLineArclengths(
+    const std::vector<cv::Vec3d>& linePoints,
+    const std::vector<cv::Vec3f>& umbilicusCenters,
+    double thetaScale,
+    double offsetRad,
+    double rRefVx);
 
 } // namespace vc3d::fiber_map

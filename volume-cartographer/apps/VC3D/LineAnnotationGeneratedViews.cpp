@@ -457,6 +457,24 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
     const auto drawsTagRing = [&](const GeneratedOverlay::ControlPointMarker& control) {
         return drawsKollesisRing(control) || drawsBreakRing(control);
     };
+    // The separate dashed link ring of a TAGGED automatic pending point: the
+    // tag ring (kollesis / break) keeps the marker's outline, so the link
+    // state gets its own glyph two units outside it (the fast current-cut
+    // renderer and the overview bar draw the same pair).
+    const auto drawsAutoPendingLinkRing = [&](const GeneratedOverlay::ControlPointMarker& control) {
+        return control.hasPendingLinks && !control.isLinkCandidate &&
+               linkedMarkerDashed(true, control.hasAutoPendingLinks) && drawsTagRing(control);
+    };
+    auto autoPendingLinkRingStyle = [&](const GeneratedOverlay::ControlPointMarker& control)
+        -> ViewerOverlayControllerBase::OverlayStyle {
+        ViewerOverlayControllerBase::OverlayStyle style = control.hasSameHvPendingLinks
+            ? sameHvPendingBranchControlPointStyle
+            : pendingBranchControlPointStyle;
+        style.brushColor = Qt::transparent;
+        style.penStyle = Qt::DashLine;
+        style.z += 0.3;
+        return style;
+    };
     // Triangle instead of circle: an adjacent-winding link on the point, or
     // the point designated as an adjacent link candidate (a split candidate
     // keeps its own red circle).
@@ -474,6 +492,13 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
         if (control.hasPendingLinks) {
             style = control.hasSameHvPendingLinks ? sameHvPendingBranchControlPointStyle
                                                   : pendingBranchControlPointStyle;
+            // An unreviewed automatic link: same colours, dashed outline. A
+            // tagged point keeps its tag ring and gets a separate dashed
+            // link ring instead (autoPendingLinkRingStyle below).
+            if (linkedMarkerDashed(true, control.hasAutoPendingLinks) &&
+                !drawsTagRing(control)) {
+                style.penStyle = Qt::DashLine;
+            }
         } else if (control.hasBranches) {
             style = control.hasSameHvBranches ? sameHvBranchControlPointStyle
                                               : branchControlPointStyle;
@@ -741,6 +766,15 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                         primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
                             controlScene, radius, true, controlStyleForMarker(control)});
                     }
+                    if (drawsAutoPendingLinkRing(control)) {
+                        // The strip's tagged automatic point: the same
+                        // separate dashed link ring as the cut views, scaled
+                        // to the strip's marker size.
+                        // Clear of the tag stroke (2.5 wide) with the ring's
+                        // own width (2): centre at radius + 3.
+                        primitives.push_back(ViewerOverlayControllerBase::CirclePrimitive{
+                            controlScene, radius + 3.0, true, autoPendingLinkRingStyle(control)});
+                    }
                 }
             }
             for (const auto& predSnap : overlay.predSnapPoints) {
@@ -844,9 +878,17 @@ std::string applyGeneratedOverlay(CChunkedVolumeViewer* viewer,
                         generatedTriangleMarkerPath(controlScene, radius),
                         controlStyleForMarker(control)});
                 }
+                if (drawsAutoPendingLinkRing(control)) {
+                    addVolumePointMarker(control.point, radius + 3.0,
+                                         autoPendingLinkRingStyle(control));
+                }
                 continue;
             }
             addVolumePointMarker(control.point, radius, controlStyleForMarker(control));
+            if (drawsAutoPendingLinkRing(control)) {
+                addVolumePointMarker(control.point, radius + 3.0,
+                                     autoPendingLinkRingStyle(control));
+            }
         }
     }
 
@@ -1607,14 +1649,23 @@ GeneratedControlPointContextResult showGeneratedControlPointContextMenu(
                 }
             };
         std::vector<GeneratedOverlay::ControlPointMarker::BranchLink> pendingLinks;
+        std::vector<GeneratedOverlay::ControlPointMarker::BranchLink> autoPendingLinks;
         std::vector<GeneratedOverlay::ControlPointMarker::BranchLink> approvedLinks;
         for (const auto& branch : selectedControl.branchLinks) {
-            (branch.pending ? pendingLinks : approvedLinks).push_back(branch);
+            (branch.pending ? (branch.autoLink ? autoPendingLinks : pendingLinks)
+                            : approvedLinks)
+                .push_back(branch);
         }
         addPendingChangeActions(approveActions,
                                 pendingLinks,
                                 QWidget::tr("Approve link to %1 / CP %2"),
                                 QWidget::tr("Approve link"));
+        // An unreviewed automatic link (the Fiber Map's "Link A and B") says
+        // so in its approve entry; approving it makes an ordinary approved link.
+        addPendingChangeActions(approveActions,
+                                autoPendingLinks,
+                                QWidget::tr("Approve auto link to %1 / CP %2"),
+                                QWidget::tr("Approve auto link"));
         addPendingChangeActions(markPendingActions,
                                 approvedLinks,
                                 QWidget::tr("Mark link as pending (%1 / CP %2)"),

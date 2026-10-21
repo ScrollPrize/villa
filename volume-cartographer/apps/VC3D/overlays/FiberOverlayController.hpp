@@ -13,13 +13,27 @@ class FiberOverlayController final : public ViewerOverlayControllerBase
     Q_OBJECT
 
 public:
+    // The look of one linked control point, as the Line Annotation views
+    // draw it: state 0 none, 1 pending, 2 approved, 3 pending automatic
+    // (pending colours, dashed outline); sameHv = the orange same-H/V
+    // warning palette; the point tags keep their ring (yellow kollesis,
+    // dotted amber break) and an automatic point then gets a separate
+    // dashed ring; adjacent = triangle instead of circle.
+    struct PointLinkMark {
+        uint8_t state = 0;
+        bool sameHv = false;
+        bool kollesisTermination = false;
+        bool breakTag = false;
+        bool adjacent = false;
+    };
     struct Chain {
         uint64_t id = 0;
         std::vector<cv::Vec3f> points;
         // Color-group representative when "show linked" is active; 0 = use id.
         uint64_t colorId = 0;
-        // Parallel to points (may be empty): 0 none, 1 pending link, 2 approved.
-        std::vector<uint8_t> pointLinkStates;
+        // Parallel to points (may be empty): the linked control points'
+        // marks (PointLinkMark), state 0 for an unlinked point.
+        std::vector<PointLinkMark> pointLinkMarks;
     };
 
     explicit FiberOverlayController(QObject* parent = nullptr);

@@ -506,6 +506,12 @@ public:
         std::optional<QColor> edge;
         // Dotted edge (the break ring).
         bool dottedEdge = false;
+        // Dashed edge: an unreviewed automatic pending link on an untagged
+        // point (the cut views' dashed outline).
+        bool dashedEdge = false;
+        // A tagged automatic pending point keeps its tag edge and gets this
+        // separate dashed ring, two units outside, in the pending colour.
+        std::optional<QColor> linkRing;
         qreal radius = 4.5;
         // Adjacent-winding link (or adjacent candidate): drawn as a triangle.
         bool triangle = false;
@@ -637,6 +643,8 @@ protected:
             QPen edgePen = dot.edge ? QPen(*dot.edge, 1.5) : QPen(dot.color.darker(150), 1.0);
             if (dot.dottedEdge) {
                 edgePen.setStyle(Qt::DotLine);
+            } else if (dot.dashedEdge) {
+                edgePen.setStyle(Qt::DashLine);
             }
             painter.setPen(edgePen);
             painter.setBrush(dot.color);
@@ -645,6 +653,13 @@ protected:
                     QPointF(x, midY), dot.radius));
             } else {
                 painter.drawEllipse(QPointF(x, midY), dot.radius, dot.radius);
+            }
+            if (dot.linkRing) {
+                QPen ringPen(*dot.linkRing, 1.5);
+                ringPen.setStyle(Qt::DashLine);
+                painter.setPen(ringPen);
+                painter.setBrush(Qt::NoBrush);
+                painter.drawEllipse(QPointF(x, midY), dot.radius + 2.0, dot.radius + 2.0);
             }
         }
     }
@@ -5394,6 +5409,10 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         !_fastCurrentCutOverlayItems.pendingBranchControlPoints ||
         !_fastCurrentCutOverlayItems.sameHvBranchControlPoints ||
         !_fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints ||
+        !_fastCurrentCutOverlayItems.autoPendingBranchControlPoints ||
+        !_fastCurrentCutOverlayItems.sameHvAutoPendingBranchControlPoints ||
+        !_fastCurrentCutOverlayItems.autoPendingLinkRings ||
+        !_fastCurrentCutOverlayItems.sameHvAutoPendingLinkRings ||
         !_fastCurrentCutOverlayItems.kollesisRings ||
         !_fastCurrentCutOverlayItems.breakRings ||
         !_fastCurrentCutOverlayItems.fiberIntersections ||
@@ -5476,6 +5495,30 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
         _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints->setBrush(
             sameHvPendingBranchControlBrush);
         _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints->setZValue(162.5);
+
+        // Unreviewed automatic pending links: the two pending palettes with a
+        // dashed outline (untagged points), and a dashed hollow ring for
+        // tagged points, drawn outside their tag ring.
+        const auto makeDashed = [](QGraphicsPathItem* item, QPen pen, const QBrush& brush,
+                                   qreal z) {
+            pen.setStyle(Qt::DashLine);
+            item->setPen(pen);
+            item->setBrush(brush);
+            item->setZValue(z);
+        };
+        _fastCurrentCutOverlayItems.autoPendingBranchControlPoints = new QGraphicsPathItem();
+        makeDashed(_fastCurrentCutOverlayItems.autoPendingBranchControlPoints,
+                   pendingBranchControlPen, pendingBranchControlBrush, 162.51);
+        _fastCurrentCutOverlayItems.sameHvAutoPendingBranchControlPoints =
+            new QGraphicsPathItem();
+        makeDashed(_fastCurrentCutOverlayItems.sameHvAutoPendingBranchControlPoints,
+                   sameHvPendingBranchControlPen, sameHvPendingBranchControlBrush, 162.51);
+        _fastCurrentCutOverlayItems.autoPendingLinkRings = new QGraphicsPathItem();
+        makeDashed(_fastCurrentCutOverlayItems.autoPendingLinkRings,
+                   pendingBranchControlPen, QBrush(Qt::NoBrush), 162.8);
+        _fastCurrentCutOverlayItems.sameHvAutoPendingLinkRings = new QGraphicsPathItem();
+        makeDashed(_fastCurrentCutOverlayItems.sameHvAutoPendingLinkRings,
+                   sameHvPendingBranchControlPen, QBrush(Qt::NoBrush), 162.8);
 
         // Same look as controlStyleForMarker's kollesis branch in the shared
         // renderer: ring only, above every link-state fill.
@@ -5562,6 +5605,10 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             _fastCurrentCutOverlayItems.pendingBranchControlPoints,
             _fastCurrentCutOverlayItems.sameHvBranchControlPoints,
             _fastCurrentCutOverlayItems.sameHvPendingBranchControlPoints,
+            _fastCurrentCutOverlayItems.autoPendingBranchControlPoints,
+            _fastCurrentCutOverlayItems.sameHvAutoPendingBranchControlPoints,
+            _fastCurrentCutOverlayItems.autoPendingLinkRings,
+            _fastCurrentCutOverlayItems.sameHvAutoPendingLinkRings,
             _fastCurrentCutOverlayItems.kollesisRings,
             _fastCurrentCutOverlayItems.breakRings,
             _fastCurrentCutOverlayItems.fiberIntersections,
@@ -5622,6 +5669,10 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
     QPainterPath pendingBranchControlPath;
     QPainterPath sameHvBranchControlPath;
     QPainterPath sameHvPendingBranchControlPath;
+    QPainterPath autoPendingBranchControlPath;
+    QPainterPath sameHvAutoPendingBranchControlPath;
+    QPainterPath autoPendingLinkRingPath;
+    QPainterPath sameHvAutoPendingLinkRingPath;
     QPainterPath kollesisRingPath;
     QPainterPath breakRingPath;
     const double lineRadius =
@@ -5697,8 +5748,24 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             }
         };
         if (control.hasPendingLinks) {
-            addLinkedMarker(control.hasSameHvPendingLinks ? sameHvPendingBranchControlPath
-                                                          : pendingBranchControlPath);
+            // The dashed outline of an automatic pending point belongs to an
+            // untagged marker; a tagged one keeps its tag ring and gets the
+            // separate dashed link ring (linkedMarkerDashed, shared rule).
+            const bool tagged = control.isKollesisTermination || control.isBreak;
+            const bool dashed = vc3d::line_annotation::linkedMarkerDashed(
+                true, control.hasAutoPendingLinks);
+            if (dashed && !tagged) {
+                addLinkedMarker(control.hasSameHvPendingLinks ? sameHvAutoPendingBranchControlPath
+                                                              : autoPendingBranchControlPath);
+            } else {
+                addLinkedMarker(control.hasSameHvPendingLinks ? sameHvPendingBranchControlPath
+                                                              : pendingBranchControlPath);
+            }
+            if (dashed && tagged) {
+                (control.hasSameHvPendingLinks ? sameHvAutoPendingLinkRingPath
+                                               : autoPendingLinkRingPath)
+                    .addEllipse(scenePoint, baseRadius + 5.0, baseRadius + 5.0);
+            }
         } else if (control.hasBranches) {
             addLinkedMarker(control.hasSameHvBranches ? sameHvBranchControlPath
                                                       : branchControlPath);
@@ -5708,6 +5775,13 @@ void LineAnnotationDialog::updateGeneratedDynamicOverlaysFast(bool updateCurrent
             controlPath.addEllipse(scenePoint, 10.0, 10.0);
         }
     }
+    _fastCurrentCutOverlayItems.autoPendingBranchControlPoints->setPath(
+        autoPendingBranchControlPath);
+    _fastCurrentCutOverlayItems.sameHvAutoPendingBranchControlPoints->setPath(
+        sameHvAutoPendingBranchControlPath);
+    _fastCurrentCutOverlayItems.autoPendingLinkRings->setPath(autoPendingLinkRingPath);
+    _fastCurrentCutOverlayItems.sameHvAutoPendingLinkRings->setPath(
+        sameHvAutoPendingLinkRingPath);
     _fastCurrentCutOverlayItems.controlPoints->setPath(controlPath);
     _fastCurrentCutOverlayItems.seedPoints->setPath(seedPath);
     _fastCurrentCutOverlayItems.linkCandidatePoints->setPath(linkCandidatePath);
@@ -6733,6 +6807,14 @@ void LineAnnotationDialog::rebuildOverviewBarLayout()
         dot.radius = control.isSeed ? 6.0 : 4.5;
         dot.triangle = control.isAdjacentLinkCandidate ||
                        (control.hasAdjacentLinks && !control.isLinkCandidate);
+        // Automatic pending point: dashed edge on an untagged dot, a separate
+        // dashed ring in the pending colour on a tagged one (set below).
+        const bool autoPending = !control.isLinkCandidate && control.hasPendingLinks &&
+            vc3d::line_annotation::linkedMarkerDashed(true, control.hasAutoPendingLinks);
+        const QColor pendingColor = dot.color;
+        if (autoPending && !(control.isKollesisTermination || control.isBreak)) {
+            dot.dashedEdge = true;
+        }
         if (control.isKollesisTermination && !control.isLinkCandidate) {
             // As in the cut views: a hollow yellow ring when unlinked, the
             // link fill inside a yellow ring when linked.
@@ -6749,6 +6831,9 @@ void LineAnnotationDialog::rebuildOverviewBarLayout()
             dot.edge = vc3d::line_annotation::generatedBreakColor(255);
             dot.dottedEdge = true;
             dot.radius += 1.0;
+        }
+        if (autoPending && (control.isKollesisTermination || control.isBreak)) {
+            dot.linkRing = pendingColor;
         }
         dots.push_back(dot);
     }

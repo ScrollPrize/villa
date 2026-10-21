@@ -209,7 +209,7 @@ void FiberOverlayController::collectPrimitives(VolumeViewerBase* viewer,
         const uint64_t colorId =
             (_showLinked && chain.colorId != 0) ? chain.colorId : chain.id;
         const PointChainStyle style = fiberStyle(fiberColor(colorId), _viewDistance);
-        const bool needsRings = _showLinked && !chain.pointLinkStates.empty();
+        const bool needsRings = _showLinked && !chain.pointLinkMarks.empty();
         if (!needsRings) {
             renderPointChain(viewer, builder, chain.points, style);
             continue;
@@ -238,24 +238,68 @@ void FiberOverlayController::collectPrimitives(VolumeViewerBase* viewer,
                 continue;
             }
             const std::size_t sourceIndex = filtered.sourceIndices[i];
-            if (sourceIndex >= chain.pointLinkStates.size()) {
+            if (sourceIndex >= chain.pointLinkMarks.size()) {
                 continue;
             }
-            const uint8_t state = chain.pointLinkStates[sourceIndex];
-            if (state == 0) {
+            const PointLinkMark& mark = chain.pointLinkMarks[sourceIndex];
+            if (mark.state == 0) {
                 continue;
             }
-            const bool pending = state == 1;
+            // The Line Annotation GUI's palettes: blue / purple for H-V
+            // links, the orange warning pair for same-H/V links, pending vs
+            // approved; an automatic pending point draws dashed.
+            const bool pending = mark.state == 1 || mark.state == 3;
+            const bool automatic = mark.state == 3;
+            const bool tagged = mark.kollesisTermination || mark.breakTag;
             OverlayStyle style;
-            style.penColor = pending ? QColor(80, 150, 255, 245)
-                                     : QColor(210, 95, 255, 245);
-            style.brushColor = pending ? QColor(80, 150, 255, 175)
-                                       : QColor(210, 95, 255, 175);
+            if (pending) {
+                style.penColor = mark.sameHv ? QColor(255, 190, 120, 245) : QColor(80, 150, 255, 245);
+                style.brushColor = mark.sameHv ? QColor(255, 190, 120, 175) : QColor(80, 150, 255, 175);
+            } else {
+                style.penColor = mark.sameHv ? QColor(255, 140, 0, 245) : QColor(210, 95, 255, 245);
+                style.brushColor = mark.sameHv ? QColor(255, 140, 0, 175) : QColor(210, 95, 255, 175);
+            }
+            const QColor linkPen = style.penColor;
             style.penColor.setAlphaF(style.penColor.alphaF() * opacity);
             style.brushColor.setAlphaF(style.brushColor.alphaF() * opacity);
             style.penWidth = 2.0;
+            if (automatic && !tagged) {
+                style.penStyle = Qt::DashLine;
+            }
+            if (tagged) {
+                // The tag ring replaces the outline, the link fill stays.
+                style.penColor = mark.kollesisTermination ? QColor(255, 230, 0, 245)
+                                                          : QColor(255, 190, 60, 245);
+                style.penColor.setAlphaF(style.penColor.alphaF() * opacity);
+                style.penWidth = 2.5;
+                style.penStyle = mark.breakTag ? Qt::DotLine : Qt::SolidLine;
+            }
             style.z = 95.0;
-            builder.addPoint(filtered.scenePoints[i], 6.25, style);
+            const qreal radius = tagged ? 7.25 : 6.25;
+            const QPointF& center = filtered.scenePoints[i];
+            if (mark.adjacent) {
+                QPainterPath triangle;
+                const qreal r = radius;
+                triangle.moveTo(center.x(), center.y() - r);
+                triangle.lineTo(center.x() + r * 0.8660254, center.y() + r * 0.5);
+                triangle.lineTo(center.x() - r * 0.8660254, center.y() + r * 0.5);
+                triangle.closeSubpath();
+                builder.addPainterPath(triangle, style);
+            } else {
+                builder.addPoint(center, radius, style);
+            }
+            if (automatic && tagged) {
+                // The separate dashed link ring of a tagged automatic point,
+                // clear of the tag stroke.
+                OverlayStyle ring;
+                ring.penColor = linkPen;
+                ring.penColor.setAlphaF(ring.penColor.alphaF() * opacity);
+                ring.brushColor = Qt::transparent;
+                ring.penWidth = 2.0;
+                ring.penStyle = Qt::DashLine;
+                ring.z = 95.1;
+                builder.addPoint(center, radius + 3.5, ring);
+            }
         }
     }
 }

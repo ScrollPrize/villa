@@ -84,6 +84,8 @@ struct GeneratedOverlay {
             bool pending = false;
             // Adjacent-winding link (FiberBranchRef::adjacent).
             bool adjacent = false;
+            // Unreviewed automatic link (FiberBranchRef::autoLink).
+            bool autoLink = false;
         };
 
         size_t controlIndex = std::numeric_limits<size_t>::max();
@@ -103,6 +105,9 @@ struct GeneratedOverlay {
         bool hasDamagedToNext = false;
         bool hasBranches = false;
         bool hasPendingLinks = false;
+        // Every pending link on this point is an unreviewed automatic link
+        // (autoPendingMarker): the pending marker draws with a dashed outline.
+        bool hasAutoPendingLinks = false;
         // Same-orientation links (H-H / V-V) render in the orange warning
         // palette; H-V links keep the default blue/purple. Set by the
         // controller, which owns the fiber HV state.
@@ -1874,6 +1879,15 @@ struct GeneratedLinkCandidateMenuState {
 // pending, orange same-H/V approved, light orange same-H/V pending.
 // Defined in the .cpp: this header is also compiled into QtCore-only tests.
 [[nodiscard]] QColor generatedLinkStateColor(bool pending, bool sameHv, int alpha);
+
+// Marker outline rule shared by every renderer (generated views, the fast
+// current-cut path, the overview bar, the slice overlay, the Fiber Map):
+// dashed iff the point draws in a pending colour AND is an automatic pending
+// point (ControlPointMarker::hasAutoPendingLinks, autoPendingMarker).
+inline bool linkedMarkerDashed(bool drawsPending, bool autoPending)
+{
+    return drawsPending && autoPending;
+}
 
 // The kollesis-termination ring colour: the ordinary control-point yellow.
 // The tag is told apart by form, not hue: a tagged point draws as a hollow

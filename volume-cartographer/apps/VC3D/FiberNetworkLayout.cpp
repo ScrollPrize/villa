@@ -111,10 +111,12 @@ std::vector<double> arclengths(const std::vector<QPointF>& points)
 // independent of the very uneven raw point spacing. Returns the arclength grid
 // alongside the smoothed points so positions at any raw arclength can be read
 // back and land exactly on the drawn curve.
-void smoothPolyline(const std::vector<QPointF>& points, double sigma, double step,
+// sRaw is the caller's arclengths(points): one array parameterises the
+// resampling, the control read-back and the inversion back to line points.
+void smoothPolyline(const std::vector<QPointF>& points, const std::vector<double>& sRaw,
+                    double sigma, double step,
                     std::vector<double>& sOut, std::vector<QPointF>& qOut)
 {
-    const std::vector<double> sRaw = arclengths(points);
     const double total = sRaw.empty() ? 0.0 : sRaw.back();
     // The unsmoothed fallback also covers parameters that cannot be resampled
     // sanely: non-finite lengths, and steps so small the sample count would
@@ -236,6 +238,41 @@ UmbilicusInterp interpolateUmbilicus(const std::vector<cv::Vec3f>& umbilicusCent
     return interp;
 }
 
+// Fiber-local unwrapped theta of every line point about the z-interpolated
+// umbilicus: the one definition prepareFiber and unrolledLineArclengths share.
+std::vector<double> unwrappedThetaLine(const std::vector<cv::Vec3d>& linePoints,
+                                       const UmbilicusInterp& umbilicus,
+                                       std::vector<double>* radiusOut)
+{
+    std::vector<double> raw(linePoints.size());
+    if (radiusOut) {
+        radiusOut->resize(linePoints.size());
+    }
+    for (std::size_t i = 0; i < linePoints.size(); ++i) {
+        const cv::Vec3d& point = linePoints[i];
+        const double dx = point[0] - interpolate(point[2], umbilicus.z, umbilicus.x);
+        const double dy = point[1] - interpolate(point[2], umbilicus.z, umbilicus.y);
+        raw[i] = std::atan2(dy, dx);
+        if (radiusOut) {
+            (*radiusOut)[i] = std::sqrt(dx * dx + dy * dy);
+        }
+    }
+    return unwrapAngles(raw);
+}
+
+// The drawn plane: x = (thetaScale * theta + offsetRad) * rRef, y = z.
+std::vector<QPointF> unrollLinePoints(const std::vector<double>& thetaLine,
+                                      const std::vector<cv::Vec3d>& linePoints,
+                                      double thetaScale, double offsetRad, double rRefVx)
+{
+    std::vector<QPointF> unrolled(linePoints.size());
+    for (std::size_t i = 0; i < linePoints.size(); ++i) {
+        unrolled[i] = QPointF((thetaScale * thetaLine[i] + offsetRad) * rRefVx,
+                              linePoints[i][2]);
+    }
+    return unrolled;
+}
+
 // A fiber unrolled about the umbilicus; angles are fiber-local until the
 // whole-turn offset is applied.
 struct PreparedFiber {
@@ -259,16 +296,7 @@ PreparedFiber prepareFiber(const InputFiber& fiber, const UmbilicusInterp& umbil
 {
     PreparedFiber entry;
     entry.input = &fiber;
-    std::vector<double> raw(fiber.linePoints.size());
-    entry.radius.resize(fiber.linePoints.size());
-    for (std::size_t i = 0; i < fiber.linePoints.size(); ++i) {
-        const cv::Vec3d& point = fiber.linePoints[i];
-        const double dx = point[0] - interpolate(point[2], umbilicus.z, umbilicus.x);
-        const double dy = point[1] - interpolate(point[2], umbilicus.z, umbilicus.y);
-        raw[i] = std::atan2(dy, dx);
-        entry.radius[i] = std::sqrt(dx * dx + dy * dy);
-    }
-    entry.thetaLine = unwrapAngles(raw);
+    entry.thetaLine = unwrappedThetaLine(fiber.linePoints, umbilicus, &entry.radius);
     entry.controlLineIndex.resize(fiber.controlPoints.size());
     for (std::size_t i = 0; i < fiber.controlPoints.size(); ++i) {
         double best = std::numeric_limits<double>::infinity();
@@ -298,6 +326,8 @@ struct LinkRecord {
     // both at once is a disagreement between the two files.
     bool anyAdjacent = false;
     bool anyExplicitOrdinary = false;
+    // Any ref said automatic; kept under `pending && !adjacent`.
+    bool autoLink = false;
     bool disagrees() const { return anyAdjacent && anyExplicitOrdinary; }
 };
 
@@ -347,6 +377,8 @@ struct FiberGeometry {
     std::vector<QPointF> samples;
     std::vector<double> controlArclength;
     std::vector<QPointF> controlPoints;
+    double thetaScale = 1.0;
+    double offsetRad = 0.0;
 };
 
 struct NetworkDraft {
@@ -433,14 +465,23 @@ std::vector<LinkRecord> collectValidLinks(
             const bool explicitOrdinary = !link.adjacent && link.adjacentExplicit;
             if (!inserted.second) {
                 LinkRecord& seen = links[inserted.first->second];
+                // Automatic only if every pending contributor is automatic:
+                // a human pending ref outranks (the controller's dedup and
+                // the markers decide the same way).
+                const bool thisAuto = link.autoLink && link.pending && !link.adjacent;
+                const bool humanPending = (seen.pending && !seen.autoLink) ||
+                                          (link.pending && !thisAuto);
                 seen.pending |= link.pending;
                 seen.adjacent |= link.adjacent;
                 seen.anyAdjacent |= link.adjacent;
                 seen.anyExplicitOrdinary |= explicitOrdinary;
+                seen.autoLink = seen.pending && !humanPending && (seen.autoLink || thisAuto) &&
+                                !seen.adjacent;
                 continue;
             }
             links.push_back(LinkRecord{member, ia, other, ib, 0.0, link.pending, link.adjacent,
-                                       link.adjacent, explicitOrdinary});
+                                       link.adjacent, explicitOrdinary,
+                                       link.autoLink && link.pending && !link.adjacent});
         }
     }
     std::sort(links.begin(), links.end(),
@@ -562,15 +603,14 @@ FiberGeometry buildFiberGeometry(const PreparedFiber& entry, double thetaScale,
                                  double resampleStepVx)
 {
     const InputFiber& fiber = *entry.input;
-    std::vector<QPointF> unrolled(fiber.linePoints.size());
-    for (std::size_t i = 0; i < fiber.linePoints.size(); ++i) {
-        unrolled[i] = QPointF((thetaScale * entry.thetaLine[i] + offsetRad) * rRefVx,
-                              fiber.linePoints[i][2]);
-    }
+    const std::vector<QPointF> unrolled =
+        unrollLinePoints(entry.thetaLine, fiber.linePoints, thetaScale, offsetRad, rRefVx);
 
     FiberGeometry geo;
+    geo.thetaScale = thetaScale;
+    geo.offsetRad = offsetRad;
     const std::vector<double> rawArclength = arclengths(unrolled);
-    smoothPolyline(unrolled, sigmaVx, resampleStepVx, geo.sampleArclength,
+    smoothPolyline(unrolled, rawArclength, sigmaVx, resampleStepVx, geo.sampleArclength,
                    geo.samples);
     std::vector<double> sampleX(geo.samples.size());
     std::vector<double> sampleY(geo.samples.size());
@@ -623,6 +663,9 @@ PlacedFiber makePlacedFiber(const InputFiber& fiber, const FiberGeometry& geo)
     placedFiber.label = fiber.label;
     placedFiber.hvTag = fiber.hvTag;
     placedFiber.controlPoints = geo.controlPoints;
+    placedFiber.controlArclength = geo.controlArclength;
+    placedFiber.thetaScale = geo.thetaScale;
+    placedFiber.offsetRad = geo.offsetRad;
     // Per-point flags are copied only when they line up with the controls; a
     // mismatched vector is ignored rather than read misaligned.
     const auto copyPointFlags = [&](const std::vector<bool>& flags, std::vector<bool>& out) {
@@ -667,6 +710,7 @@ PlacedFiber makePlacedFiber(const InputFiber& fiber, const FiberGeometry& geo)
             whole.firstControl = 0;
             whole.lastControl = static_cast<int>(spanCount);
             whole.points = geo.samples;
+            whole.arclengths = geo.sampleArclength;
             placedFiber.runs.push_back(std::move(whole));
         }
         return placedFiber;
@@ -698,6 +742,9 @@ PlacedFiber makePlacedFiber(const InputFiber& fiber, const FiberGeometry& geo)
             run.lastControl = static_cast<int>(j + 1);
             run.points.assign(geo.samples.begin() + static_cast<std::ptrdiff_t>(from),
                               geo.samples.begin() + static_cast<std::ptrdiff_t>(to));
+            run.arclengths.assign(
+                geo.sampleArclength.begin() + static_cast<std::ptrdiff_t>(from),
+                geo.sampleArclength.begin() + static_cast<std::ptrdiff_t>(to));
             placedFiber.runs.push_back(std::move(run));
         }
         k = j + 1;
@@ -1039,6 +1086,7 @@ Result buildLayout(const std::vector<InputFiber>& fibers,
             placedLink.turnErr = link.turnErr;
             placedLink.pending = link.pending;
             placedLink.adjacent = link.adjacent;
+            placedLink.autoLink = link.autoLink;
             placedLink.adjacentUnpaired = adjacentUnpaired(
                 link.adjacent, ordered[link.a]->hvTag, ordered[link.b]->hvTag);
             placedLink.adjacentDisagrees = link.disagrees();
@@ -1856,6 +1904,7 @@ GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
         placedLink.turnErr = solve.linkTurnErrors[l];
         placedLink.pending = link.pending;
         placedLink.adjacent = link.adjacent;
+        placedLink.autoLink = link.autoLink;
         placedLink.adjacentUnpaired =
             adjacentUnpaired(link.adjacent, ordered[link.a]->hvTag, ordered[link.b]->hvTag);
         placedLink.adjacentDisagrees = link.disagrees();
@@ -2208,6 +2257,7 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
             hashU64(digest, link.pending ? 1 : 0);
             hashU64(digest, link.adjacent ? 1 : 0);
             hashU64(digest, link.adjacentExplicit ? 1 : 0);
+            hashU64(digest, link.autoLink ? 1 : 0);
         }
     }
     hashDouble(digest, params.suspectTurns);
@@ -2311,12 +2361,22 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
                 hashDouble(digest, point.x());
                 hashDouble(digest, point.y());
             }
+            hashU64(digest, run.arclengths.size());
+            for (const double s : run.arclengths) {
+                hashDouble(digest, s);
+            }
         }
         hashU64(digest, fiber.fiber.controlPoints.size());
         for (const QPointF& point : fiber.fiber.controlPoints) {
             hashDouble(digest, point.x());
             hashDouble(digest, point.y());
         }
+        hashU64(digest, fiber.fiber.controlArclength.size());
+        for (const double s : fiber.fiber.controlArclength) {
+            hashDouble(digest, s);
+        }
+        hashDouble(digest, fiber.fiber.thetaScale);
+        hashDouble(digest, fiber.fiber.offsetRad);
         hashU64(digest, fiber.fiber.kollesisTerminations.size());
         for (const bool tagged : fiber.fiber.kollesisTerminations) {
             hashU64(digest, tagged ? 1 : 0);
@@ -2342,6 +2402,7 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
         hashU64(digest, link.adjacent ? 1 : 0);
         hashU64(digest, link.adjacentUnpaired ? 1 : 0);
         hashU64(digest, link.adjacentDisagrees ? 1 : 0);
+        hashU64(digest, link.autoLink ? 1 : 0);
     }
     hashU64(digest, result.windings.size());
     for (const WindingMark& mark : result.windings) {
@@ -2419,6 +2480,67 @@ ContentDigest digestGlobalResult(const GlobalResult& result)
         hashU64(digest, static_cast<uint64_t>(fiber.hvTag));
     }
     return digest;
+}
+
+std::map<EndpointKey, EndpointReview> aggregateEndpointReviews(
+    const std::vector<InputFiber>& fibers)
+{
+    std::unordered_map<uint64_t, char> tagById;
+    tagById.reserve(fibers.size());
+    for (const InputFiber& fiber : fibers) {
+        tagById[fiber.id] = fiber.hvTag;
+    }
+    struct Accumulator {
+        bool pending = false;
+        bool humanPending = false;
+        bool anyAuto = false;
+        bool sameHvPending = false;
+        bool sameHvApproved = false;
+        bool adjacent = false;
+    };
+    std::map<EndpointKey, Accumulator> accumulators;
+    for (const InputFiber& fiber : fibers) {
+        for (const InputLink& link : fiber.links) {
+            if (link.controlPointIndex < 0) {
+                continue;
+            }
+            Accumulator& acc = accumulators[EndpointKey{fiber.id, link.controlPointIndex}];
+            const bool automatic = link.autoLink && link.pending && !link.adjacent;
+            acc.pending = acc.pending || link.pending;
+            acc.humanPending = acc.humanPending || (link.pending && !automatic);
+            acc.anyAuto = acc.anyAuto || automatic;
+            acc.adjacent = acc.adjacent || link.adjacent;
+            const auto other = tagById.find(link.branchFiberId);
+            const bool sameHv = other != tagById.end() && fiber.hvTag != '?' &&
+                                other->second != '?' && other->second == fiber.hvTag;
+            if (sameHv) {
+                (link.pending ? acc.sameHvPending : acc.sameHvApproved) = true;
+            }
+        }
+    }
+    std::map<EndpointKey, EndpointReview> reviews;
+    for (const auto& [key, acc] : accumulators) {
+        EndpointReview review;
+        review.linked = true;
+        review.pending = acc.pending;
+        review.autoPending = acc.pending && acc.anyAuto && !acc.humanPending;
+        review.anyAuto = acc.anyAuto;
+        review.sameHv = acc.pending ? acc.sameHvPending : acc.sameHvApproved;
+        review.adjacent = acc.adjacent;
+        reviews[key] = review;
+    }
+    return reviews;
+}
+
+std::vector<double> unrolledLineArclengths(const std::vector<cv::Vec3d>& linePoints,
+                                           const std::vector<cv::Vec3f>& umbilicusCenters,
+                                           double thetaScale,
+                                           double offsetRad,
+                                           double rRefVx)
+{
+    const UmbilicusInterp umbilicus = interpolateUmbilicus(umbilicusCenters);
+    const std::vector<double> thetaLine = unwrappedThetaLine(linePoints, umbilicus, nullptr);
+    return arclengths(unrollLinePoints(thetaLine, linePoints, thetaScale, offsetRad, rRefVx));
 }
 
 } // namespace vc3d::fiber_map

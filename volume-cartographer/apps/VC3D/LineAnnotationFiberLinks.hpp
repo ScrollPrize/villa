@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
 #include <opencv2/core/types.hpp>
 
 #include "FiberSliceGeometry.hpp"
@@ -161,6 +162,131 @@ inline cv::Vec3d endpointTangentFromLinePoints(const std::vector<cv::Vec3d>& lin
     return finiteDirection(fallback) ? normalizedOrZero(fallback) : cv::Vec3d{0.0, 0.0, 0.0};
 }
 
+// Review-state invariant of FiberBranchRef: an automatic link is a pending,
+// ordinary (non-adjacent) link. Applied at every boundary a ref crosses.
+inline void normalizeBranchRefReviewState(FiberBranchRef& ref)
+{
+    ref.autoLink = ref.autoLink && ref.pending && !ref.adjacent;
+}
+
+// The review state of two refs of ONE link combined (a dedup, a collapse
+// of two control points): pending if either is pending; automatic only if
+// every PENDING contributor is automatic (a human pending link outranks,
+// an approved contributor says nothing about it); never adjacent-automatic.
+struct CombinedReviewState {
+    bool pending = false;
+    bool autoLink = false;
+};
+inline CombinedReviewState combineReviewStates(bool pendingA, bool autoA,
+                                               bool pendingB, bool autoB,
+                                               bool adjacent)
+{
+    CombinedReviewState state;
+    state.pending = pendingA || pendingB;
+    const bool humanPending = (pendingA && !autoA) || (pendingB && !autoB);
+    state.autoLink = state.pending && !humanPending && (autoA || autoB) && !adjacent;
+    return state;
+}
+
+// The two JSON review-state keys of a link entry: "pending" and, only with
+// it and only on an ordinary link, "auto". Written true-or-absent, never
+// false (the same convention fiber_merge.py's snap_flag keeps).
+inline void writeBranchReviewStateJson(nlohmann::json& entry, const FiberBranchRef& ref)
+{
+    if (!ref.pending) {
+        return;
+    }
+    entry["pending"] = true;
+    if (ref.autoLink && !ref.adjacent) {
+        entry["auto"] = true;
+    }
+}
+
+struct BranchReviewState {
+    bool pending = false;
+    bool autoLink = false;
+};
+
+inline BranchReviewState readBranchReviewStateJson(const nlohmann::json& entry, bool adjacent)
+{
+    BranchReviewState state;
+    state.pending = entry.value("pending", false);
+    state.autoLink = state.pending && !adjacent && entry.value("auto", false);
+    return state;
+}
+
+// Field assembly of a directed link entry and of its reciprocal. Callers
+// supply the directions (the candidate path uses endpointTangentFromLinePoints
+// with the pair's fallback, the seed path keeps its requested direction).
+inline FiberBranchRef makeBranchRef(int localIndex,
+                                    const cv::Vec3d& localPoint,
+                                    const cv::Vec3d& localDirection,
+                                    uint64_t farFiberId,
+                                    const std::string& farFileName,
+                                    int farIndex,
+                                    const cv::Vec3d& farPoint,
+                                    const cv::Vec3d& farDirection,
+                                    bool pending,
+                                    bool adjacent,
+                                    bool autoLink)
+{
+    FiberBranchRef ref;
+    ref.controlPointIndex = localIndex;
+    ref.branchFiberId = farFiberId;
+    ref.branchControlPointIndex = farIndex;
+    ref.branchFileName = farFileName;
+    ref.controlPointDirection = localDirection;
+    ref.branchControlPointDirection = farDirection;
+    ref.controlPointPosition = localPoint;
+    ref.branchControlPointPosition = farPoint;
+    ref.pending = pending;
+    ref.adjacent = adjacent;
+    ref.autoLink = autoLink;
+    normalizeBranchRefReviewState(ref);
+    return ref;
+}
+
+inline FiberBranchRef reciprocalBranchRef(const FiberBranchRef& ref,
+                                          uint64_t ownerFiberId,
+                                          const std::string& ownerFileName)
+{
+    FiberBranchRef reciprocal;
+    reciprocal.controlPointIndex = ref.branchControlPointIndex;
+    reciprocal.branchFiberId = ownerFiberId;
+    reciprocal.branchControlPointIndex = ref.controlPointIndex;
+    reciprocal.branchFileName = ownerFileName;
+    reciprocal.controlPointDirection = ref.branchControlPointDirection;
+    reciprocal.branchControlPointDirection = ref.controlPointDirection;
+    reciprocal.controlPointPosition = ref.branchControlPointPosition;
+    reciprocal.branchControlPointPosition = ref.controlPointPosition;
+    reciprocal.pending = ref.pending;
+    reciprocal.adjacent = ref.adjacent;
+    reciprocal.autoLink = ref.autoLink;
+    normalizeBranchRefReviewState(reciprocal);
+    return reciprocal;
+}
+
+// The one marker rule for a control point carrying several links: it draws
+// as an AUTOMATIC pending point (dashed) only when it has at least one
+// pending link and every pending link on it is automatic - a human-made
+// pending link outranks. Works over any range of items with `pending` and
+// `autoLink` members (FiberBranchRef, the overlay BranchLink, ...).
+template<class Links>
+bool autoPendingMarker(const Links& links)
+{
+    bool anyPending = false;
+    for (const auto& link : links) {
+        if (!link.pending) {
+            continue;
+        }
+        anyPending = true;
+        if (!link.autoLink) {
+            return false;
+        }
+    }
+    return anyPending;
+}
+
 // Save-time canonicalization of a batch of snapshots (any type with a
 // `StoredFiber fiber` member): local link endpoints are re-resolved on the
 // fiber's own control points and their directions recomputed from its line;
@@ -190,6 +316,7 @@ void canonicalizeFiberSaveSnapshots(std::vector<Snapshot>& snapshots)
                 branch.controlPointPosition =
                     snapshot.fiber.controlPoints[static_cast<std::size_t>(*localIndex)];
             }
+            normalizeBranchRefReviewState(branch);
             branch.controlPointDirection =
                 endpointTangentFromLinePoints(snapshot.fiber.linePoints,
                                               branch.controlPointPosition,
@@ -270,7 +397,10 @@ void canonicalizeFiberSaveSnapshots(std::vector<Snapshot>& snapshots)
             reciprocal->branchControlPointPosition = branch.controlPointPosition;
             reciprocal->controlPointDirection = branch.branchControlPointDirection;
             reciprocal->branchControlPointDirection = branch.controlPointDirection;
+            // Review state follows the snapshot being saved, both flags.
             reciprocal->pending = branch.pending;
+            reciprocal->autoLink = branch.autoLink;
+            normalizeBranchRefReviewState(*reciprocal);
         }
     }
 }

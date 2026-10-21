@@ -500,6 +500,31 @@ add_test(NAME fiber_global_layout COMMAND test_fiber_global_layout)
 vc_register_test_target(test_fiber_global_layout)
 vc_register_ctest(fiber_global_layout test_fiber_global_layout)
 
+add_executable(test_fiber_map_auto_link
+    test_fiber_map_auto_link.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapAutoLink.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapAutoLink.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberNetworkLayout.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberWindingSolver.hpp)
+
+set_target_properties(test_fiber_map_auto_link PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_fiber_map_auto_link PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D
+    ${OpenCV_INCLUDE_DIRS})
+
+target_link_libraries(test_fiber_map_auto_link PRIVATE
+    Qt6::Core
+    Qt6::Test
+    opencv_core)
+
+add_test(NAME fiber_map_auto_link COMMAND test_fiber_map_auto_link)
+vc_register_test_target(test_fiber_map_auto_link)
+vc_register_ctest(fiber_map_auto_link test_fiber_map_auto_link)
+
 add_executable(test_fiber_map_gap_field
     test_fiber_map_gap_field.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/FiberMapGapField.cpp
