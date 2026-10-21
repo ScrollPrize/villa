@@ -19,24 +19,11 @@ std::vector<uint8_t> readSharedPayload(sqlite3* db, const std::string& name, con
     if (geometryPayloadHash(name, bytes) != hash) throw std::runtime_error("geometry: corrupt shared payload");
     return bytes;
 }
-namespace {
-constexpr int64_t blockSize = 64 * 1024;
-void append(Json& out, Json part) {
-    if (!part.at("length").get<int64_t>()) return;
-    if (!out.empty() && out.back().at("hash") == part.at("hash") &&
-        out.back().at("offset").get<int64_t>() + out.back().at("length").get<int64_t>() == part.at("offset").get<int64_t>())
-    {
-        out.back()["length"] = out.back().at("length").get<int64_t>() + part.at("length").get<int64_t>();
-        out.back().erase("bounds"); out.back().erase("bounds_count");
-    }
-    else out.push_back(std::move(part));
-}
-}
 bool identityManaged(sqlite3* db,const std::string& object) {
     Statement latest(db,"SELECT json_type(manifest,'$.sequences') FROM geometry_revisions WHERE object_uuid=? ORDER BY object_generation DESC,rowid DESC LIMIT 1");
     latest.bindBlob(1,parseUuid(object)); return latest.row() && !latest.isNull(0);
 }
-bool sharedArray(const Json& a) { return a.contains("tree") || a.contains("blocks") || a.contains("tiles"); }
+bool sharedArray(const Json& a) { return a.contains("tree"); }
 std::string storeSharedPayload(sqlite3* db, const std::string& name, std::span<const uint8_t> bytes) {
     GeometryPhase phase("storeSharedPayload");
     const auto hash = geometryPayloadHash(name, bytes);
@@ -50,104 +37,19 @@ std::string storeSharedPayload(sqlite3* db, const std::string& name, std::span<c
         throw std::runtime_error("geometry: corrupt or colliding shared payload");
     return hash;
 }
-Json sharedBlocks(sqlite3* db, const std::string& name, std::span<const uint8_t> bytes) {
-    auto out = Json::array();
-    for (size_t offset = 0; offset < bytes.size(); offset += blockSize) {
-        const auto part = bytes.subspan(offset, std::min<size_t>(blockSize, bytes.size()-offset));
-        out.push_back({{"hash", storeSharedPayload(db, name, part)}, {"offset", 0}, {"length", part.size()}});
-    }
-    return out;
-}
-Json sharedDescriptor(sqlite3* db, GeometryReader& reader, const std::string& name) {
-    auto a = reader.manifest().at("arrays").at(name);
-    if (sharedArray(a)) return a;
-    const auto layout = geometryLayout(a);
-    auto entries = Json::array();
-    for (int64_t i = 0; i < layout.chunkCount(); ++i) {
-        const std::string hash = a.at("chunks").at(i);
-        Statement exists(db, "SELECT 1 FROM geometry_chunks WHERE hash=?"); exists.bind(1, hash);
-        if (!exists.row()) storeSharedPayload(db, name, reader.chunk(name, i));
-        if (layout.tile) {
-            const auto [r,c,h,w] = layout.rectangle(i);
-            entries.push_back({{"hash", hash}, {"row", r}, {"column", c}, {"rows", h}, {"columns", w}});
-        } else entries.push_back({{"hash", hash}, {"offset", 0}, {"length", layout.chunkBytes(i)}});
-    }
-    a.erase("chunks"); a.erase("source_revision"); a.erase("storage");
-    a[layout.tile ? "tiles" : "blocks"] = std::move(entries);
-    if (layout.tile) a["tile_size"] = layout.tile;
-    return a;
-}
-Json sliceSharedBlocks(const Json& blocks, int64_t offset, int64_t count) {
-    if (offset < 0 || count < 0) throw std::invalid_argument("geometry: invalid block slice");
-    auto result = Json::array();
-    int64_t cursor = 0, copied = 0;
-    for (const auto& b : blocks) {
-        requestWork(&FiberRegionStats::candidateVisits);
-        const auto size = b.at("length").get<int64_t>();
-        if (size < 0 || cursor > INT64_MAX-size) throw std::runtime_error("geometry: invalid shared block length");
-        const auto begin = std::max(offset, cursor), end = std::min(offset + count, cursor + size);
-        if (begin < end) {
-            auto part = b; part["offset"] = b.at("offset").get<int64_t>() + begin-cursor; part["length"] = end-begin;
-            if (begin != cursor || end != cursor+size) { part.erase("bounds"); part.erase("bounds_count"); }
-            append(result, std::move(part)); copied += end-begin;
-        }
-        cursor += size;
-    }
-    if (copied != count) throw std::out_of_range("geometry: shared slice out of range");
-    if (!result.empty()) result.back().erase("bounds");
-    return result;
-}
 std::vector<uint8_t> readSharedArray(sqlite3* db, const Json& a, const std::string& name, int64_t offset, int64_t count) {
     const auto length = a.at("byte_length").get<int64_t>();
     if (offset < 0 || count < 0 || offset > length || count > length-offset)
         throw std::out_of_range("geometry: shared read out of range");
-    if (a.contains("tree") && !a.contains("tile_size")) return treeBytes(db,a.at("tree"),name,offset,count);
-    if (a.contains("tree")) {
-        const auto shape=a.at("shape").get<std::vector<int64_t>>();
-        const auto rowBytes=shape[1]*surfacePixelBytes(a.at("dtype"),shape);
-        std::vector<uint8_t> out; out.reserve(count);
-        while (count) {
-            const auto r=offset/rowBytes, start=offset%rowBytes, n=std::min(count,rowBytes-start);
-            const auto pixel=surfacePixelBytes(a.at("dtype"),shape);
-            const auto bytes=readSharedRectangle(db,a,name,r,start/pixel,1,(start%pixel+n+pixel-1)/pixel);
-            out.insert(out.end(),bytes.begin()+start%pixel,bytes.begin()+start%pixel+n); offset+=n; count-=n;
-        } return out;
-    }
-    std::vector<uint8_t> out(static_cast<size_t>(count));
-    if (!count) return out;
-    // Cache only chunks touched by this bounded request.
-    std::map<std::string, std::vector<uint8_t>> loaded;
-    auto get = [&](const Json& b) -> const std::vector<uint8_t>& {
-        const std::string hash = b.at("hash"); auto found = loaded.find(hash);
-        if (found == loaded.end()) found = loaded.emplace(hash, readSharedPayload(db, name, hash)).first;
-        else requestBytes(found->second.size(), &FiberRegionStats::cacheBytes);
-        return found->second;
-    };
-    if (a.contains("blocks")) {
-        int64_t copied = 0;
-        for (const auto& b : sliceSharedBlocks(a.at("blocks"), offset, count)) {
-            const auto& bytes = get(b); const auto start = b.at("offset").get<int64_t>(), size = b.at("length").get<int64_t>();
-            if (start < 0 || uint64_t(start) > bytes.size() || uint64_t(size) > bytes.size()-start)
-                throw std::runtime_error("geometry: corrupt shared block range");
-            std::memcpy(out.data()+copied, bytes.data()+start, size); copied += size;
-        }
-    } else {
-        const auto shape = a.at("shape").get<std::vector<int64_t>>();
-        const auto pixel = surfacePixelBytes(a.at("dtype"), shape), rowBytes = shape[1]*pixel;
-        int64_t copied = 0;
-        for (const auto& t : a.at("tiles")) {
-            const auto r=t.at("row").get<int64_t>(), c=t.at("column").get<int64_t>(), h=t.at("rows").get<int64_t>(), w=t.at("columns").get<int64_t>();
-            if (r < 0 || c < 0 || h <= 0 || w <= 0 || r > shape[0]-h || c > shape[1]-w)
-                throw std::runtime_error("geometry: corrupt shared tile rectangle");
-            for (auto y=std::max(r, offset/rowBytes); y<std::min(r+h, (offset+count-1)/rowBytes+1); ++y) {
-                const auto base=y*rowBytes+c*pixel, begin=std::max(offset,base), end=std::min(offset+count,base+w*pixel);
-                if (begin >= end) continue;
-                const auto& bytes=get(t);
-                if (int64_t(bytes.size()) != h*w*pixel) throw std::runtime_error("geometry: corrupt shared tile size");
-                std::memcpy(out.data()+begin-offset, bytes.data()+(y-r)*w*pixel+begin-base,end-begin); copied+=end-begin;
-            }
-        }
-        if (copied != count) throw std::runtime_error("geometry: incomplete shared tile coverage");
+    if (!a.contains("tile_size")) return treeBytes(db,a.at("tree"),name,offset,count);
+    const auto shape=a.at("shape").get<std::vector<int64_t>>();
+    const auto rowBytes=shape[1]*surfacePixelBytes(a.at("dtype"),shape);
+    std::vector<uint8_t> out; out.reserve(count);
+    while (count) {
+        const auto r=offset/rowBytes, start=offset%rowBytes, n=std::min(count,rowBytes-start);
+        const auto pixel=surfacePixelBytes(a.at("dtype"),shape);
+        const auto bytes=readSharedRectangle(db,a,name,r,start/pixel,1,(start%pixel+n+pixel-1)/pixel);
+        out.insert(out.end(),bytes.begin()+start%pixel,bytes.begin()+start%pixel+n); offset+=n; count-=n;
     }
     return out;
 }
@@ -159,7 +61,7 @@ std::vector<uint8_t> readSharedRectangle(sqlite3* db, const Json& a, const std::
     const auto pixel=surfacePixelBytes(a.at("dtype"),shape);
     std::vector<uint8_t> out(rows*columns*pixel);
     if (!rows || !columns) return out;
-    if (a.contains("tree") && a.contains("tile_size")) {
+    if (a.contains("tile_size")) {
         const auto origin=a.at("origin").get<std::array<int64_t,2>>(); const int64_t tile=a.at("tile_size");
         auto floor=[&](int64_t x) { auto q=x/tile; if(x%tile<0)--q; return q*tile; };
         const auto top=row+origin[0],left=column+origin[1]; int64_t copied=0;
@@ -174,54 +76,21 @@ std::vector<uint8_t> readSharedRectangle(sqlite3* db, const Json& a, const std::
             copied+=(rb-rt)*(cr-cl)*pixel;
         }
         if(copied!=int64_t(out.size())) throw std::runtime_error("incomplete indexed surface rectangle");
-    } else if (a.contains("blocks") || a.contains("tree")) {
+    } else {
         for (int64_t r=0;r<rows;++r) {
             const auto bytes=readSharedArray(db,a,name,((row+r)*shape[1]+column)*pixel,columns*pixel);
             std::memcpy(out.data()+r*columns*pixel,bytes.data(),bytes.size());
         }
-    } else {
-        int64_t copied=0;
-        for (const auto& t:a.at("tiles")) {
-            const int64_t r=t.at("row"),c=t.at("column"),h=t.at("rows"),w=t.at("columns");
-            const auto top=std::max(row,r),bottom=std::min(row+rows,r+h),left=std::max(column,c),right=std::min(column+columns,c+w);
-            if (top>=bottom || left>=right) continue;
-            const auto bytes=readSharedPayload(db,name,t.at("hash"));
-            if (int64_t(bytes.size())!=h*w*pixel) throw std::runtime_error("geometry: corrupt shared tile size");
-            for (auto y=top;y<bottom;++y) std::memcpy(out.data()+((y-row)*columns+left-column)*pixel,
-                bytes.data()+((y-r)*w+left-c)*pixel,(right-left)*pixel);
-            copied+=(bottom-top)*(right-left)*pixel;
-        }
-        if (copied!=int64_t(out.size())) throw std::runtime_error("geometry: incomplete shared tile coverage");
     }
     return out;
-}
-void normalizeSharedBlocks(sqlite3* db, const std::string& name, Json& a) {
-    auto blocks = Json::array(); for (const auto& b : a.at("blocks")) append(blocks, b);
-    a["blocks"] = std::move(blocks);
-    // At most two blocks per 64 KiB plus 64 edit fragments. Compaction produces
-    // direct payload references; no history chain is traversed by future reads.
-    const auto limit = 64 + 2*(a.at("byte_length").get<int64_t>()/blockSize+1);
-    if (a.at("blocks").size() > size_t(limit)) {
-        if (geometryWork) ++geometryWork->compactions;
-        const auto bytes=readSharedArray(db,a,name,0,a.at("byte_length"));
-        a["blocks"]=sharedBlocks(db,name,bytes);
-    }
 }
 void referenceSharedArrays(sqlite3* db, const std::string& revision, const Json& manifest) {
     Statement ref(db,"INSERT INTO geometry_revision_chunks VALUES(?,?,?,?)");
     for (const auto& [name,a] : manifest.at("arrays").items()) {
-        int64_t i=0;
-        if (a.contains("tree")) {
-            if (!a.at("tree").is_null()) {
-                ref.reset(); ref.bindBlob(1,parseUuid(revision)); ref.bind(2,name); ref.bind(3,int64_t(0)); ref.bind(4,a.at("tree").at("hash").get<std::string>()); ref.stepDone();
-                if (geometryWork) ++geometryWork->manifestEntries;
-            }
-            continue;
-        }
-        for (const auto& b : a.at(a.contains("blocks") ? "blocks" : "tiles")) {
-            ref.reset(); ref.bindBlob(1,parseUuid(revision)); ref.bind(2,name); ref.bind(3,i++); ref.bind(4,b.at("hash").get<std::string>()); ref.stepDone();
-            if (geometryWork) ++geometryWork->manifestEntries;
-        }
+        if (a.at("tree").is_null()) continue;
+        ref.reset(); ref.bindBlob(1,parseUuid(revision)); ref.bind(2,name); ref.bind(3,int64_t(0));
+        ref.bind(4,a.at("tree").at("hash").get<std::string>()); ref.stepDone();
+        if (geometryWork) ++geometryWork->manifestEntries;
     }
 }
 void editSharedArray(sqlite3* db, Json& manifest, const GeometryArrayEdit& edit) {
@@ -231,7 +100,7 @@ void editSharedArray(sqlite3* db, Json& manifest, const GeometryArrayEdit& edit)
         throw std::invalid_argument("geometry: invalid shared edit range");
     if (edit.bytes.empty()) return;
     const auto offset=edit.elementOffset*scalar;
-    if (a.contains("tree") && !a.contains("tile_size")) {
+    if (!a.contains("tile_size")) {
         const bool coordinates=edit.array=="points" || edit.array=="control_points" || edit.array=="line_points";
         const auto stride=coordinates?3*scalar:scalar;
         // Replacing scalar ranges includes complete boundary points in the new
@@ -254,7 +123,7 @@ void editSharedArray(sqlite3* db, Json& manifest, const GeometryArrayEdit& edit)
                 state["identities"]=identityPut(db,state.at("identities"),values[i],point);
             }
         }
-    } else if (a.contains("tree")) {
+    } else {
         const auto shape=a.at("shape").get<std::vector<int64_t>>(); const auto pixel=surfacePixelBytes(a.at("dtype"),shape);
         const auto origin=a.at("origin").get<std::array<int64_t,2>>(); const int64_t tile=a.at("tile_size");
         auto floor=[&](int64_t x) {auto q=x/tile;if(x%tile<0)--q;return q*tile;};
@@ -278,26 +147,6 @@ void editSharedArray(sqlite3* db, Json& manifest, const GeometryArrayEdit& edit)
             a["tree"]=treePut(db,a.at("tree"),key,treeLeaf(db,t,1,edit.array=="points"?coordinateBounds(bytes,a.at("dtype"),true):Json(),false,key));
         }
         if(edit.array=="points")a["tree"]=tileHalos(db,a.at("tree"),tile,changedTiles);
-    } else if (a.contains("blocks")) {
-        auto parts=sliceSharedBlocks(a.at("blocks"),0,offset);
-        for (auto& b : sharedBlocks(db,edit.array,edit.bytes)) parts.push_back(std::move(b));
-        for (auto& b : sliceSharedBlocks(a.at("blocks"),offset+edit.bytes.size(),length-offset-edit.bytes.size())) parts.push_back(std::move(b));
-        a["blocks"]=std::move(parts); normalizeSharedBlocks(db,edit.array,a);
-    } else {
-        const auto shape=a.at("shape").get<std::vector<int64_t>>(); const auto pixel=surfacePixelBytes(a.at("dtype"),shape);
-        const int64_t end=offset+edit.bytes.size();
-        for (auto& t : a.at("tiles")) {
-            const int64_t r=t.at("row"),c=t.at("column"),h=t.at("rows"),w=t.at("columns");
-            std::vector<uint8_t> bytes;
-            for (auto y=r;y<r+h;++y) {
-                const auto base=(y*shape[1]+c)*pixel, begin=std::max(offset,base), stop=std::min(end,base+w*pixel);
-                if (begin>=stop) continue;
-                if (bytes.empty()) bytes=readSharedPayload(db,edit.array,t.at("hash"));
-                if (int64_t(bytes.size()) != h*w*pixel) throw std::runtime_error("geometry: corrupt shared tile");
-                std::memcpy(bytes.data()+(y-r)*w*pixel+begin-base,edit.bytes.data()+begin-offset,stop-begin);
-            }
-            if (!bytes.empty()) { t["hash"]=storeSharedPayload(db,edit.array,bytes); t.erase("bounds"); }
-        }
     }
 }
 }

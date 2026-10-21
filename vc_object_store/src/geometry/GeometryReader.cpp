@@ -259,7 +259,7 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
             const auto* p = static_cast<const uint8_t*>(sqlite3_column_blob(chunk.value, 0));
             if (geometryWork) geometryWork->readBytes[name] += sqlite3_column_bytes(chunk.value, 0);
             owned.assign(p, p + sqlite3_column_bytes(chunk.value, 0)); storedHash = chunk.text(1);
-            verifyGeometryChunk(owned, storedHash, storedHash, expectedSize, name);
+            if (!deltas_.empty()) verifyGeometryChunk(owned, storedHash, storedHash, expectedSize, name);
         }
         for (const auto& [id, delta] : deltas_) {
             bool touched = false;
@@ -283,7 +283,7 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
         chunks_.erase(old); recency_.pop_front();
     }
     recency_.push_back(key);
-    auto inserted = chunks_.emplace(key, CachedChunk{std::vector<uint8_t>(bytes.begin(), bytes.end()), std::prev(recency_.end())}).first;
+    auto inserted = chunks_.emplace(key, CachedChunk{std::move(owned), std::prev(recency_.end())}).first;
     cachedBytes_ += bytes.size();
     visit(inserted->second.bytes);
 }

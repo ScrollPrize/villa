@@ -163,7 +163,6 @@ SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& option
         }
     } else {
         local = snapshot(*this, localTxn); remote = snapshot(peer, remoteTxn);
-        base = shared.state;
         for (const auto* state : {&base, &local, &remote}) for (const auto& item : state->items()) ids.insert(item.key());
         report.planToken = hash(Json{{"local_replica", report.localReplica}, {"remote_replica", report.remoteReplica},
             {"local", local}, {"remote", remote}, {"base", base}}.dump());
@@ -265,8 +264,8 @@ SyncReport ObjectStore::synchronize(ObjectStore& peer, const SyncOptions& option
             throw std::runtime_error("sync: applied state differs from merge; both transactions rolled back");
     // Validate/materialize both local history publications before either store
     // commits. Sync merges current records, not the peer's historical timeline.
-    detail::publishHistory(localDb, false, true);
-    detail::publishHistory(remoteDb, false, true);
+    detail::publishHistory(localDb, true);
+    detail::publishHistory(remoteDb, true);
     std::string digest = shared.incremental ? shared.state.at("digest").get<std::string>() : std::string(64, '0');
     if (shared.incremental) {
         for (const auto& [id, record] : base.items()) toggleDigest(digest, record);

@@ -8,12 +8,12 @@ using namespace detail;
 void detail::createLifecycleSchema(sqlite3* db)
 {
     exec(db, R"SQL(
-CREATE TABLE IF NOT EXISTS object_lifecycle(
+CREATE TABLE object_lifecycle(
   object_id INTEGER PRIMARY KEY REFERENCES objects(id) ON DELETE CASCADE,
   retired INTEGER NOT NULL CHECK(retired IN (0,1)), epoch TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS retired_objects ON object_lifecycle(retired,object_id);
-CREATE TABLE IF NOT EXISTS edge_lifecycle_bindings(
+CREATE INDEX retired_objects ON object_lifecycle(retired,object_id);
+CREATE TABLE edge_lifecycle_bindings(
   edge_id INTEGER PRIMARY KEY REFERENCES edges(id) ON DELETE CASCADE,
   a_epoch TEXT NOT NULL, b_epoch TEXT NOT NULL
 );
@@ -22,7 +22,6 @@ CREATE TABLE IF NOT EXISTS edge_lifecycle_bindings(
 
 void detail::readLifecycle(sqlite3* db, int64_t id, ObjectRecord& record)
 {
-    if (pragmaInt(db, "user_version") < 10) return;
     Statement s(db, "SELECT retired,epoch FROM object_lifecycle WHERE object_id=?");
     s.bind(1, id);
     if (s.row()) { record.retired = s.i64(0); record.lifecycleEpoch = s.text(1); }
@@ -30,22 +29,19 @@ void detail::readLifecycle(sqlite3* db, int64_t id, ObjectRecord& record)
 
 void detail::writeLifecycle(sqlite3* db, int64_t id, const ObjectRecord& record)
 {
-    if (pragmaInt(db, "user_version") < 10) return;
     Statement s(db, "INSERT INTO object_lifecycle VALUES(?,?,?) ON CONFLICT(object_id) "
         "DO UPDATE SET retired=excluded.retired,epoch=excluded.epoch");
     s.bind(1, id); s.bind(2, int64_t(record.retired)); s.bind(3, record.lifecycleEpoch); s.stepDone();
 }
 
-std::string detail::activeObjectSql(sqlite3* db, const std::string& id)
+std::string detail::activeObjectSql(const std::string& id)
 {
-    if (pragmaInt(db, "user_version") < 10) return "1";
     return "NOT EXISTS(SELECT 1 FROM object_lifecycle lc WHERE lc.object_id=" + id + " AND lc.retired=1)";
 }
 
-std::string detail::activeEdgeSql(sqlite3* db)
+std::string detail::activeEdgeSql()
 {
-    if (pragmaInt(db, "user_version") < 10) return "1";
-    return activeObjectSql(db, "edges.a_id") + " AND " + activeObjectSql(db, "edges.b_id") +
+    return activeObjectSql("edges.a_id") + " AND " + activeObjectSql("edges.b_id") +
         " AND coalesce((SELECT a_epoch FROM edge_lifecycle_bindings WHERE edge_id=edges.id),'')="
         "coalesce((SELECT epoch FROM object_lifecycle WHERE object_id=edges.a_id),'')"
         " AND coalesce((SELECT b_epoch FROM edge_lifecycle_bindings WHERE edge_id=edges.id),'')="
@@ -54,7 +50,6 @@ std::string detail::activeEdgeSql(sqlite3* db)
 
 std::pair<std::string, std::string> detail::lifecycleBinding(sqlite3* db, const EdgeRecord& edge)
 {
-    if (pragmaInt(db, "user_version") < 10) return {};
     Statement s(db, "SELECT a_epoch,b_epoch FROM edge_lifecycle_bindings WHERE edge_id=(SELECT id FROM edges WHERE uuid=?)");
     s.bindBlob(1, parseUuid(edge.uuid));
     return s.row() ? std::pair{s.text(0), s.text(1)} : std::pair<std::string, std::string>{};
@@ -70,7 +65,6 @@ bool detail::lifecycleBindingMatches(sqlite3* db, const EdgeRecord& edge)
 
 void detail::bindLifecycle(sqlite3* db, const EdgeRecord& edge, const std::string& aEpoch, const std::string& bEpoch)
 {
-    if (pragmaInt(db, "user_version") < 10) return;
     Statement s(db, "INSERT INTO edge_lifecycle_bindings VALUES(?,?,?) ON CONFLICT(edge_id) "
         "DO UPDATE SET a_epoch=excluded.a_epoch,b_epoch=excluded.b_epoch");
     s.bind(1, *edgeIdByUuid(db, parseUuid(edge.uuid))); s.bind(2, aEpoch); s.bind(3, bEpoch); s.stepDone();

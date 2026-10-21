@@ -340,17 +340,6 @@ END;
 }
 }
 
-void migrateSpatialRegions(sqlite3* db)
-{
-    exec(db, "DROP TRIGGER object_bounds_insert; DROP TRIGGER object_bounds_update; "
-        "DROP TRIGGER object_bounds_delete; DROP TABLE object_bounds_rtree;");
-    createRegionSchema(db);
-    exec(db, "INSERT INTO spatial_regions(object_id,array_name,min_x,min_y,min_z,max_x,max_y,max_z) "
-        "SELECT object_id,'',min_x,min_y,min_z,max_x,max_y,max_z FROM object_bounds;");
-    Statement heads(db, "SELECT object_uuid FROM geometry_heads");
-    while (heads.row()) refreshGeometryBounds(db, formatUuid(heads.blob16(0)));
-}
-
 void createSpatialSchema(sqlite3* db)
 {
     // Exact double bounds remain authoritative. SQLite's float R-tree is only
@@ -368,22 +357,6 @@ CREATE INDEX objects_kind_uuid ON objects(kind,uuid);
     createRegionSchema(db);
 }
 
-void backfillSpatialBounds(sqlite3* db)
-{
-    // Registered external objects retain their annotated bounds. Managed
-    // geometry always wins, including empty geometries with no spatial extent.
-    for (const auto* table : {"fibers", "patches", "tracks"}) {
-        Statement rows(db, std::string("SELECT object_id,bbox_min_x,bbox_min_y,bbox_min_z,bbox_max_x,bbox_max_y,bbox_max_z FROM ") + table + " WHERE bbox_min_x IS NOT NULL");
-        while (rows.row()) {
-            Bounds box;
-            bool complete = true;
-            for (int i = 0; i < 6; ++i) { complete &= !rows.isNull(i + 1); box[i] = rows.f64(i + 1); }
-            if (complete) setSpatialBounds(db, rows.i64(0), box);
-        }
-    }
-    Statement heads(db, "SELECT object_uuid FROM geometry_heads");
-    while (heads.row()) refreshGeometryBounds(db, formatUuid(heads.blob16(0)));
-}
 }
 
 // Structural layouts keep conservative per-block bounds in their immutable
@@ -395,79 +368,22 @@ void indexSharedGeometry(sqlite3* db, int64_t objectId, const std::string& revis
 {
     GeometryPhase phase("indexSharedGeometry");
     const std::string kind=manifest.at("kind");
-    bool indexed=true; for(const auto& a:manifest.at("arrays"))indexed &= a.contains("tree");
-    if(indexed) {
-        // The immutable tree carries the fine-grained bounds. SQL stores one
-        // coarse candidate per coordinate array, independent of object size.
-        Statement cleanup(db,"DELETE FROM spatial_regions WHERE object_id=? AND array_name!='' AND array_name NOT LIKE '@tree:%'");
-        cleanup.bind(1,objectId);cleanup.stepDone();
-        RegionWriter writer(db,objectId); BoundsBuilder total;
-        for(const auto& [name,a]:manifest.at("arrays").items())if(coordinates(kind,name)) {
-            const auto& root=a.at("tree");std::optional<Bounds> bounds;
-            if(!root.is_null()&&!root.at("bounds").is_null())bounds=root.at("bounds").get<Bounds>();
-            const auto shape=a.at("shape").get<std::vector<int64_t>>();
-            writer.update("@tree:"+name,0,0,shape[0],kind=="patch"?shape[1]:0,bounds);
-            if(bounds)total.merge(*bounds);
-            if(geometryWork)++geometryWork->spatialRows;
-        }
-        writeBounds(db,objectId,total.bounds,revision);return;
-    }
-
-    Statement remove(db,"DELETE FROM spatial_regions WHERE object_id=? AND array_name!=''");
-    remove.bind(1,objectId); remove.stepDone();
+    // The immutable tree carries the fine-grained bounds. SQL stores one
+    // coarse candidate per coordinate array, independent of object size.
+    Statement cleanup(db,"DELETE FROM spatial_regions WHERE object_id=? AND array_name!='' AND array_name NOT LIKE '@tree:%'");
+    cleanup.bind(1,objectId);cleanup.stepDone();
     RegionWriter writer(db,objectId); BoundsBuilder total;
-    for (auto& [name,a] : manifest.at("arrays").items()) {
-        if (!coordinates(kind,name)) continue;
+    for(const auto& [name,a]:manifest.at("arrays").items())if(coordinates(kind,name)) {
+        const auto& root=a.at("tree");std::optional<Bounds> bounds;
+        if(!root.is_null()&&!root.at("bounds").is_null())bounds=root.at("bounds").get<Bounds>();
         const auto shape=a.at("shape").get<std::vector<int64_t>>();
-        const std::string dtype=a.at("dtype"); const auto stride=geometryByteLength(dtype,{3});
-        if (a.contains("blocks")) {
-            int64_t offset=0;
-            for (auto& b : a.at("blocks")) {
-                const int64_t length=b.at("length");
-                const auto begin=offset/stride, end=std::min(shape[0],(offset+length+stride-1)/stride);
-                BoundsBuilder bounds;
-                // Bounds cover complete points intersecting this block. A line
-                // region also includes the next point to cover crossing spans.
-                const auto count=std::min(shape[0]-begin,end-begin+(kind!="point_collection"));
-                if (b.contains("bounds") && b.contains("bounds_count") && b.at("bounds_count")==count) {
-                    if (!b.at("bounds").is_null()) bounds.merge(b.at("bounds").get<Bounds>());
-                } else {
-                    bounds.append(readSharedArray(db,a,name,begin*stride,count*stride),dtype,false);
-                    b["bounds"]=bounds.bounds ? nlohmann::json(*bounds.bounds) : nlohmann::json(); b["bounds_count"]=count;
-                }
-                if (bounds.bounds) { total.merge(*bounds.bounds); writer.update(name,begin,0,count,0,bounds.bounds); }
-                offset+=length;
-                if (geometryWork) ++geometryWork->spatialRows;
-            }
-        } else {
-            // Each tile's stored bounds cover its own vertices. For triangles
-            // crossing tile boundaries, include neighbours conservatively.
-            for (auto& t : a.at("tiles")) if (!t.contains("bounds")) {
-                auto temporary=a; temporary["tiles"]=nlohmann::json::array({t});
-                const int64_t r=t.at("row"), c=t.at("column"), h=t.at("rows"), w=t.at("columns");
-                BoundsBuilder bounds;
-                bounds.append(readSharedRectangle(db,temporary,name,r,c,h,w),dtype,true);
-                t["bounds"]=bounds.bounds ? nlohmann::json(*bounds.bounds) : nlohmann::json();
-            }
-            std::map<std::pair<int64_t,int64_t>, const nlohmann::json*> neighbours;
-            const int64_t tile=a.at("tile_size");
-            const auto origin=manifest.value("grid_origin",std::array<int64_t,2>{0,0});
-            auto cell=[&](int64_t n) { auto q=n/tile; if (n%tile<0) --q; return q; };
-            for (const auto& t:a.at("tiles")) neighbours[{cell(origin[0]+t.at("row").get<int64_t>()),cell(origin[1]+t.at("column").get<int64_t>())}]=&t;
-            for (const auto& t : a.at("tiles")) {
-                const int64_t r=t.at("row"),c=t.at("column"),h=t.at("rows"),w=t.at("columns");
-                BoundsBuilder bounds;
-                for (int dr=-1;dr<=1;++dr) for (int dc=-1;dc<=1;++dc) {
-                    const auto found=neighbours.find({cell(origin[0]+r)+dr,cell(origin[1]+c)+dc});
-                    if (found!=neighbours.end() && !found->second->at("bounds").is_null()) bounds.merge(found->second->at("bounds").get<Bounds>());
-                }
-                if (bounds.bounds) { total.merge(*bounds.bounds); writer.update(name,r,c,std::min(h+1,shape[0]-r),std::min(w+1,shape[1]-c),bounds.bounds); }
-                if (geometryWork) ++geometryWork->spatialRows;
-            }
-        }
+        writer.update("@tree:"+name,0,0,shape[0],kind=="patch"?shape[1]:0,bounds);
+        if(bounds)total.merge(*bounds);
+        if(geometryWork)++geometryWork->spatialRows;
     }
     writeBounds(db,objectId,total.bounds,revision);
 }
+
 void visitIndexedRegions(sqlite3* db, const SpatialRegion& candidate, const Bounds& bounds,
                          GeometryReader& reader, const std::function<void(const SpatialRegion&)>& emit) {
     auto overlaps=[&](const nlohmann::json& box) {

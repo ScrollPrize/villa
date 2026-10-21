@@ -40,7 +40,7 @@ SelectionFilter objectFilter(sqlite3* db, const ObjectSelection& selection)
         connected.insert(ids.begin(), ids.end());
     }
     SelectionFilter filter;
-    if (!selection.includeRetired) filter.sql = " AND " + activeObjectSql(db, "o.id");
+    if (!selection.includeRetired) filter.sql = " AND " + activeObjectSql("o.id");
     auto bind = [&](const std::string& clause, const std::string& value) {
         filter.sql += clause; filter.parameters.push_back(value);
     };
@@ -96,13 +96,7 @@ std::unique_ptr<Statement> detail::objectSelectionQuery(sqlite3* db, const Objec
     std::string sql = "SELECT " + columns + " FROM " + from + " WHERE 1" + filter.sql;
     if (selection.bbox) {
         detail::validateBounds(*selection.bbox);
-        const auto version = pragmaInt(db, "user_version");
-        if (version < 4)
-            throw std::runtime_error("spatial queries require schema 4; open the store writable once to migrate");
-        if (version == 4) // Read-only compatibility with the original object index.
-            sql += " AND o.id IN (SELECT b.object_id FROM object_bounds_rtree r CROSS JOIN object_bounds b ON b.object_id=r.object_id WHERE ";
-        else
-            sql += " AND o.id IN (SELECT b.object_id FROM spatial_regions_rtree r CROSS JOIN spatial_regions b ON b.id=r.id WHERE b.array_name='' AND ";
+        sql += " AND o.id IN (SELECT b.object_id FROM spatial_regions_rtree r CROSS JOIN spatial_regions b ON b.id=r.id WHERE b.array_name='' AND ";
         sql += detail::spatialOverlapSql(int(filter.parameters.size()) + 1) + ")";
     }
     sql += std::string(" ORDER BY ") + (selection.orderBy == "length_desc" ? "d.length DESC,o.uuid" : "o.uuid") + " LIMIT ? OFFSET ?";
@@ -132,8 +126,6 @@ std::vector<SpatialRegion> ObjectStore::spatialRegions(const Txn& txn, const Obj
     if (const auto lease = activeStatementPools.find(db); lease != activeStatementPools.end())
         if (const auto& cache = lease->second->spatialCache)
             if (auto result = cache->query(db, candidates)) return detail::refineIndexedRegions(db,*result,selection);
-    if (pragmaInt(db, "user_version") < 5)
-        throw std::runtime_error("spatial regions require schema 5; open the store writable once to migrate");
     const auto filter = objectFilter(db, selection);
     // CROSS JOIN preserves the R-tree-first plan even with a kind filter.
     std::string sql = std::string("SELECT ") + detail::regionColumns + " FROM spatial_regions_rtree r "

@@ -470,7 +470,6 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
     if (shared) {
         Savepoint savepoint(db);
         auto manifest=sharedReader.manifest();
-        for (auto& [name,a] : manifest.at("arrays").items()) a=sharedDescriptor(db,sharedReader,name);
         for (const auto& edit : edits) {
             if (edit.array=="point_ids" || edit.array=="control_point_ids")
                 throw std::invalid_argument("stable identities require structural edits");
@@ -565,12 +564,8 @@ std::string ObjectStore::updateSurfaceChannels(WriteTxn& txn, const std::string&
         for (const auto& channel : channels) {
             if (channel.name=="points" || !seen.insert(channel.name).second) throw std::invalid_argument("invalid surface channel name");
             validateSurfaceChannel(channel,grid);
-            arrays[channel.name]={{"dtype",channel.dtype},{"shape",channel.shape},{"byte_length",channel.bytes.size()},
-                {"blocks",sharedBlocks(db,channel.name,channel.bytes)}};
-            if(arrays.at("points").contains("tree")) {
-                arrays[channel.name]["tile_size"]=arrays.at("points").at("tile_size");
-                arrays[channel.name]=indexedDescriptor(db,arrays[channel.name],channel.name,false,true,manifest.value("grid_origin",std::array<int64_t,2>{0,0}));
-            }
+            arrays[channel.name]=indexedSurfaceArray(db,channel,arrays.at("points").at("tile_size"),
+                manifest.value("grid_origin",std::array<int64_t,2>{0,0}));
         }
         const auto uuid=publishSharedGeometry(*this,txn,objectUuid,manifest,expected,edgeEdits);
         savepoint.release(); return uuid;

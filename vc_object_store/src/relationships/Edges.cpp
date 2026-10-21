@@ -86,7 +86,7 @@ std::vector<EdgeRecord> ObjectStore::edgesOf(const Txn& txn, const std::string& 
     auto id = objectIdByUuid(db, parseUuid(objectUuid));
     if (!id) throw std::runtime_error("object store: object not found: " + objectUuid);
     Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE (a_id=? OR b_id=?)" +
-        (includeRetired ? std::string() : " AND " + activeEdgeSql(db)) + " ORDER BY id");
+        (includeRetired ? std::string() : " AND " + activeEdgeSql()) + " ORDER BY id");
     s.bind(1, *id);
     s.bind(2, *id);
     return readEdgeRows(db, s);
@@ -96,7 +96,7 @@ std::vector<EdgeRecord> ObjectStore::edgesByKind(const Txn& txn, const std::stri
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Statement s(db, std::string("SELECT ") + kEdgeCols + " FROM edges WHERE kind=?" +
-        (includeRetired ? std::string() : " AND " + activeEdgeSql(db)) + " ORDER BY id");
+        (includeRetired ? std::string() : " AND " + activeEdgeSql()) + " ORDER BY id");
     s.bind(1, edgeKind);
     return readEdgeRows(db, s);
 }
@@ -108,7 +108,7 @@ std::unique_ptr<Statement> detail::edgeSelectionQuery(sqlite3* db, const EdgeSel
     const bool candidates = endpointIds || selection.endpointUuids || selection.uuids || selection.tag;
     std::string sql = "SELECT " + columns + " FROM edges" +
         (candidates ? " NOT INDEXED" : "") + " WHERE 1";
-    if (!selection.includeRetired) sql += " AND " + activeEdgeSql(db);
+    if (!selection.includeRetired) sql += " AND " + activeEdgeSql();
     sql += fiberAdjacencySql(selection.adjacent);
     std::vector<std::string> parameters;
     auto parameter = [&](const std::string& value) {

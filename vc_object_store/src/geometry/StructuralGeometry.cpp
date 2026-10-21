@@ -39,16 +39,10 @@ Json annotations(ObjectStore const& store,const Txn& txn,const GeometryRevision&
         if(state.contains("annotation_tree")) {
             result=Json::array();treeWalk(db,state.at("annotation_tree"),[&](const auto& v){for(const auto& a:v)result.push_back(unpackAnnotation(db,a));});return result;
         }
-        if(state.contains("identities")) {
-            const auto values=idsOf(reader,ids,count);
-            std::unordered_map<std::string,Json> buckets;
-            treeEntries(db,state.at("identities"),[&](const auto& ref,const auto& value){buckets.emplace(ref.at("first").template get<std::string>(),value);});
-            for(size_t i=0;i<values.size();++i)result[i]=unpackAnnotation(db,buckets.at(identityKey(values[i])).at(std::to_string(values[i]%128)).at("annotation"));
-            return result;
-        }
-        if (ids.empty()) return state.at("annotations");
         const auto values=idsOf(reader,ids,count);
-        for (size_t i=0;i<values.size();++i) result[i]=state.at("annotations").value(std::to_string(values[i]),Json::object());
+        std::unordered_map<std::string,Json> buckets;
+        treeEntries(db,state.at("identities"),[&](const auto& ref,const auto& value){buckets.emplace(ref.at("first").template get<std::string>(),value);});
+        for(size_t i=0;i<values.size();++i)result[i]=unpackAnnotation(db,buckets.at(identityKey(values[i])).at(std::to_string(values[i]%128)).at("annotation"));
         return result;
     }
     const auto key=revision.kind=="point_collection" ? "point_attributes" : name+"_attributes";
@@ -67,15 +61,6 @@ Json annotations(ObjectStore const& store,const Txn& txn,const GeometryRevision&
     if (!result.is_array() || result.size()!=size_t(count)) throw std::invalid_argument("point annotations must match the sequence");
     for (const auto& a:result) if (!a.is_object() && !a.is_null()) throw std::invalid_argument("invalid point annotation");
     return result;
-}
-void allocatedIds(const Json& state,std::set<int64_t>& used) {
-    // Read the first structural encoding as well as compact inclusive ranges.
-    if (state.contains("used_ids")) for (const auto& id:state.at("used_ids")) used.insert(id.get<int64_t>());
-    if (state.contains("allocated_ranges")) for (const auto& range:state.at("allocated_ranges")) {
-        const int64_t first=range.at(0),last=range.at(1);
-        if (first<0 || last<first) throw std::runtime_error("invalid point allocation range");
-        for (int64_t id=first;;++id) { used.insert(id); if (id==last) break; }
-    }
 }
 bool directional(const Json& value) {return annotationDirectional(value);}
 int64_t floorTile(int64_t value,int64_t tile) { auto q=value/tile; if (value%tile<0) --q; return q*tile; }
@@ -100,7 +85,7 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
             throw std::invalid_argument("invalid structural sequence array");
         GeometryReader reader(txn,current->uuid); auto manifest=reader.manifest();
         for (auto& [name,a]:manifest.at("arrays").items())
-            a=indexedDescriptor(db,sharedDescriptor(db,reader,name),name,name=="points"||name=="control_points"||name=="line_points");
+            a=indexedDescriptor(db,reader,name,name=="points"||name=="control_points"||name=="line_points");
         auto& a=manifest.at("arrays").at(edit.array); const int64_t oldCount=a.at("shape").at(0);
         const auto stride=geometryByteLength(a.at("dtype"),{3}); const std::string dtype=a.at("dtype");
         if (edit.start<0 || edit.eraseCount<0 || edit.start>oldCount || edit.eraseCount>oldCount-edit.start) throw std::out_of_range("sequence span out of range");
@@ -136,8 +121,6 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
                     buckets[key][slot]={{"bytes",std::vector<uint8_t>(bytes.begin()+i*stride,bytes.begin()+(i+1)*stride)},{"annotation",packAnnotation(db,attrs.at(i))}};
                     allocated[key][slot]=true;
                 }
-                std::set<int64_t> legacyUsed; allocatedIds(state,legacyUsed);
-                for(auto id:legacyUsed) allocated[identityKey(id)][std::to_string(id%128)]=true;
                 std::vector<Tree> leaves,ledger;
                 for(const auto& [key,bucket]:buckets) {
                     bool spans=false;for(const auto& v:bucket)spans|=v.at("annotation").at("span_fields").get<bool>();
@@ -181,7 +164,7 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
                 const auto& descriptor=source.manifest().at("arrays").at(edit.array); const int64_t n=descriptor.at("shape").at(0);
                 if(part.start<0||part.count<0||part.start>n||part.count>n-part.start) throw std::out_of_range("sequence source span out of range");
                 if(descriptor.at("dtype")!=dtype) throw std::invalid_argument("sequence source layout mismatch");
-                auto indexed=indexedDescriptor(db,sharedDescriptor(db,source,edit.array),edit.array,true);
+                auto indexed=indexedDescriptor(db,source,edit.array,true);
                 partCoords=byteSlice(db,indexed.at("tree"),edit.array,dtype,part.start*stride,part.count*stride,true);
                 if(!idsName.empty()) {
                     if(source.manifest().at("arrays").contains(idsName)) {
@@ -285,7 +268,7 @@ std::string ObjectStore::resizeSurface(WriteTxn& txn,const std::string& objectId
         for (const auto& fill:resize.fill) if (!fills.emplace(fill.name,fill).second) throw std::invalid_argument("duplicate fill channel");
         if (fills.size()!=manifest.at("arrays").size()) throw std::invalid_argument("explicit fill required for every surface array");
         for (auto& [name,a]:manifest.at("arrays").items()) {
-            auto old=indexedDescriptor(db,sharedDescriptor(db,reader,name),name,name=="points",true,origin);
+            auto old=indexedDescriptor(db,reader,name,name=="points",true,origin);
             const auto shape=a.at("shape").get<std::vector<int64_t>>();
             auto newShape=shape; newShape[0]=resize.rows; newShape[1]=resize.columns;
             const auto length=geometryByteLength(a.at("dtype"),newShape), pixel=surfacePixelBytes(a.at("dtype"),shape);

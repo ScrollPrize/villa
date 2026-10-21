@@ -67,7 +67,6 @@ void transferGeometry(sqlite3* source, sqlite3* destination, const std::string& 
         for (const auto& [name, array] : parsed.at("arrays").items()) {
             const auto layout = geometryLayout(array);
             if (array.contains("tree")) { transferTree(source,destination,array.at("tree")); expected += !array.at("tree").is_null(); }
-            else if (sharedArray(array)) expected += array.at(array.contains("blocks") ? "blocks" : "tiles").size();
             else if (!array.contains("source_revision")) expected += layout.chunkCount();
             else {
                 GeometryReader inherited(destination, array.at("source_revision").get<std::string>(), false);
@@ -85,7 +84,7 @@ void transferGeometry(sqlite3* source, sqlite3* destination, const std::string& 
             const auto size = sqlite3_column_bytes(chunks.value, 3);
             const auto& a=parsed.at("arrays").at(chunks.text(0));
             const bool shared=sharedArray(a);
-            const auto hash=a.contains("tree") ? a.at("tree").at("hash") : shared ? a.at(a.contains("blocks") ? "blocks" : "tiles").at(chunks.i64(1)).at("hash") : a.at("chunks").at(chunks.i64(1));
+            const auto hash=shared ? a.at("tree").at("hash") : a.at("chunks").at(chunks.i64(1));
             if ((!shared && size != layouts.at(chunks.text(0)).chunkBytes(chunks.i64(1))) ||
                 geometryHash(std::span(data, size)) != chunks.text(2) || hash != chunks.text(2))
                 throw std::runtime_error("sync: corrupt geometry chunk");

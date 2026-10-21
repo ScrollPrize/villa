@@ -158,8 +158,7 @@ CREATE TABLE sync_replica(singleton INTEGER PRIMARY KEY CHECK(singleton=1), uuid
 CREATE TABLE sync_baselines(seq INTEGER PRIMARY KEY AUTOINCREMENT, peer TEXT NOT NULL,
     token TEXT NOT NULL, state TEXT NOT NULL CHECK(json_valid(state)), UNIQUE(peer,token));
 )SQL";
-// Version 3 retains legacy baseline snapshots for interrupted-sync recovery.
-// New baselines contain a digest; their changed records are versioned separately.
+// Baselines contain a digest; changed records are versioned separately.
 const char* kIncrementalSyncSchema = R"SQL(
 CREATE INDEX sync_baselines_peer_seq ON sync_baselines(peer,seq);
 CREATE TABLE sync_baseline_records(
@@ -179,13 +178,13 @@ void createSyncSchema(sqlite3* db) {
     Statement id(db, "INSERT INTO sync_replica VALUES(1,?)"); id.bind(1, util::newUuid()); id.stepDone();
 }
 const char* kConsumerQueryIndexes = R"SQL(
-CREATE INDEX IF NOT EXISTS edges_kind_approval_uuid ON edges(kind,approval_state,uuid);
-CREATE INDEX IF NOT EXISTS edges_kind_uuid ON edges(kind,uuid);
-CREATE INDEX IF NOT EXISTS edges_kind_id ON edges(kind,id);
-CREATE INDEX IF NOT EXISTS fibers_family_length ON fibers(family,length DESC,object_id);
-CREATE INDEX IF NOT EXISTS fibers_length ON fibers(length DESC,object_id);
-CREATE INDEX IF NOT EXISTS tracks_family_length ON tracks(family,length DESC,object_id);
-CREATE INDEX IF NOT EXISTS tracks_length ON tracks(length DESC,object_id);
+CREATE INDEX edges_kind_approval_uuid ON edges(kind,approval_state,uuid);
+CREATE INDEX edges_kind_uuid ON edges(kind,uuid);
+CREATE INDEX edges_kind_id ON edges(kind,id);
+CREATE INDEX fibers_family_length ON fibers(family,length DESC,object_id);
+CREATE INDEX fibers_length ON fibers(length DESC,object_id);
+CREATE INDEX tracks_family_length ON tracks(family,length DESC,object_id);
+CREATE INDEX tracks_length ON tracks(length DESC,object_id);
 )SQL";
 void createSchema(sqlite3* db) {
     exec(db, kObjectSchema);

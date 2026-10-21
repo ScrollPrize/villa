@@ -56,7 +56,7 @@ TEST_CASE("channel mutations read and hash only the affected payload")
     CHECK(work.hashedBytes["points"] == 0);
     CHECK(work.hashedBytes["generations"] == 0);
     CHECK(work.readBytes["approval"] == 4*32*32*3);
-    CHECK(work.hashedBytes["approval"] == 4*4*32*32*3);
+    CHECK(work.hashedBytes["approval"] == 3*4*32*32*3);
     work = {};
     // Preserve the previously edited approval by reference when another
     // channel is added, including when its head is a sparse delta.

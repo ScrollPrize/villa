@@ -33,9 +33,6 @@ SharedBaseline sharedBaseline(sqlite3* local, sqlite3* remote, const std::string
         state.bind(1, result.localSeq); (void)state.row();
         result.state = Json::parse(state.text(0));
         if (result.state != Json::parse(theirs.text(1))) throw std::runtime_error("sync: inconsistent shared baseline");
-        // Legacy version-2 snapshots have no cursor. One full merge establishes
-        // the new representation; old tokens remain available for recovery.
-        if (!result.state.contains("digest")) break;
         if (!result.state.at("digest").is_string()) throw std::runtime_error("sync: invalid baseline digest");
         const auto digest = result.state.at("digest").get<std::string>();
         if (digest.size() != 64 || digest.find_first_not_of("0123456789abcdef") != std::string::npos)
@@ -70,11 +67,6 @@ void changedRecords(sqlite3* db, SyncCursor after, std::set<std::string>& ids) {
 Json syncRecord(ObjectStore& store, const Txn& txn, const std::string& id) {
     if (const auto object = store.objectByUuid(txn, id)) {
         auto record = objectToJson(*object); record["record_type"] = "objects";
-        // Keep pre-lifecycle records byte-compatible with retained v9 sync
-        // baselines; absent fields have exactly these defaults.
-        if (!object->retired && object->lifecycleEpoch.empty()) {
-            record.erase("retired"); record.erase("lifecycle_epoch");
-        }
         if (const auto geometry = store.currentGeometry(txn, id))
             record["geometry"] = {{"revision_uuid", geometry->uuid}, {"content_hash", geometry->contentHash}};
         return record;

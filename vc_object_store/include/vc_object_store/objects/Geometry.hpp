@@ -32,7 +32,7 @@ struct GeometryArrayInfo {
 };
 
 // Applies to new revisions only. Unchanged geometry retains its revision and
-// layout. Zero selects legacy linear storage; all aligned patch channels use the same tile size.
+// layout. Zero selects linear storage; all aligned patch channels use the same tile size.
 struct GeometryStorageOptions {
     int64_t patchTileSize = 128; // supported sizes: 0, 32, 64, 128 vertices
 };

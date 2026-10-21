@@ -30,7 +30,7 @@ def test_test_source_budget():
     root = Path(__file__).resolve().parents[1]
     files = [p for p in root.rglob('*') if p.suffix in {'.py', '.cpp', '.hpp'} or p.name == 'CMakeLists.txt']
     files += [root.parent / 'scripts' / name for name in ('bench_object_edits.py', 'validate_typed_geometry.py')]
-    assert sum(len(p.read_text().splitlines()) for p in files) <= 1500
+    assert sum(len(p.read_text().splitlines()) for p in files) <= 1530
 
 
 @pytest.mark.parametrize('kind,geometry,array_name', [
@@ -99,6 +99,17 @@ def test_surface_channels_sparse_reads_history_and_resize(db, tile):
     assert db.read_geometry_rectangle(grown, 'points', 1, 1, 35, 37) == values.tobytes()
     assert db.read_geometry_rectangle(grown, 'extra', 0, 0, 1, 1) == b'\x01'
     assert db.geometry_revision(grown)['grid_origin'] == [-1, -1]
+    extra = np.arange(37 * 39, dtype='<u2').reshape(37, 39)
+    updated = db.update_surface_channels(uid, [array('extra', extra)], [], grown)
+    assert db.read_geometry_array(updated, 'extra') == extra.tobytes()
+    changed = db.edit_geometry_rectangle(uid, 'extra', 31, 31, 2, 3, b'\xff\xff' * 6, updated)
+    extra[31:33, 31:34] = 65535
+    assert db.read_geometry_array(changed, 'extra') == extra.tobytes()
+    assert db.read_geometry_rectangle(grown, 'extra', 0, 0, 1, 1) == b'\x01'
+    with ObjectStore.create(db.path + '.peer', author='peer') as peer:
+        assert db.synchronize(peer)['applied']
+        assert peer.read_geometry_array(changed, 'extra') == extra.tobytes()
+        assert peer.read_geometry_array(first, 'points') == values.tobytes()
     with ObjectStore.open(db.path, read_only=True) as ro:
         assert ro.read_geometry_array(second, 'review') == channel.tobytes()
 
@@ -203,7 +214,7 @@ def test_reads_detect_corruption_after_success(db, damage):
     assert expected == struct.pack('<3i', 1, 2, 3)
 
 
-def test_reopen_migration_and_metadata_roundtrip(db, tmp_path):
+def test_reopen_and_metadata_roundtrip(db, tmp_path):
     uid, revision = put(db, Track([[1, 2, 3]]))
     db.set_meta(uid, 'note', {'value': None})
     db.set_approval(uid, 'approved')
@@ -211,8 +222,6 @@ def test_reopen_migration_and_metadata_roundtrip(db, tmp_path):
     db.remove_meta(uid, 'note')
     path = db.path
     db.close()
-    with sqlite3.connect(path) as sql:
-        sql.execute('PRAGMA user_version=11')  # derived source index migration
     with ObjectStore.open(path, author='reopened') as reopened:
         assert reopened.read_geometry_array(revision, 'points') == struct.pack('<3i', 1, 2, 3)
         assert reopened.select_objects(object_kind='track', fields=['name'])[0]['uuid'] == uid
@@ -224,3 +233,17 @@ def test_reopen_migration_and_metadata_roundtrip(db, tmp_path):
             assert other.object(note)['meta'] == {'value': None}
         reopened.delete_object(note)
         assert reopened.object(note) is None
+
+
+@pytest.mark.parametrize('version', [*range(2, 13), 14])
+@pytest.mark.parametrize('read_only', [False, True])
+def test_unsupported_schema_is_rejected_without_migration(db, version, read_only):
+    path = db.path
+    db.close()
+    with sqlite3.connect(path) as sql:
+        sql.execute(f'PRAGMA user_version={version}')
+    sql.close()
+    before = Path(path).read_bytes()
+    with pytest.raises(RuntimeError, match='unsupported database schema'):
+        ObjectStore.open(path, author='test', read_only=read_only)
+    assert Path(path).read_bytes() == before

@@ -270,11 +270,14 @@ Tree identityPut(sqlite3* db,const Tree& root,int64_t id,const Tree& value) {
     for(const auto& entry:bucket)if(entry.is_object()&&entry.contains("annotation"))directional |= entry.at("annotation").at("span_fields").get<bool>();
     return treePut(db,root,key,bucket.empty()?Tree():treeLeaf(db,bucket,1,nullptr,directional,key));
 }
-Tree indexedDescriptor(sqlite3* db,const Tree& a,const std::string& name,bool coordinates,bool patch,const std::array<int64_t,2>& origin) {
+namespace {
+template<class Read, class Rectangle>
+Tree makeIndexedDescriptor(sqlite3* db, const Tree& a, const std::string& name, bool coordinates,
+    bool patch, const std::array<int64_t,2>& origin, Read read, Rectangle rectangle) {
     if (a.contains("tree")) return a;
-    auto out=a; out.erase("blocks"); out.erase("tiles");
+    auto out=a; out.erase("chunks"); out.erase("storage"); out.erase("source_revision");
     if (patch) {
-        const int64_t tile=a.value("tile_size",int64_t(128)); out["tile_size"]=tile; out["origin"]=origin;
+        const int64_t tile=a.contains("storage") ? a.at("storage").at("tile_size").get<int64_t>() : a.value("tile_size",int64_t(128)); out["tile_size"]=tile; out["origin"]=origin;
         const auto shape=a.at("shape").get<std::vector<int64_t>>(); std::vector<Tree> leaves; std::map<std::pair<int64_t,int64_t>,Tree> tiles;
         // Initial conversion is intentionally proportional to source size.
         auto floor=[&](int64_t x){auto q=x/tile;if(x%tile<0)--q;return q*tile;};
@@ -282,7 +285,7 @@ Tree indexedDescriptor(sqlite3* db,const Tree& a,const std::string& name,bool co
             for(auto x=floor(origin[1]);x<origin[1]+shape[1];x+=tile) {
             const auto r=std::max(y,origin[0])-origin[0],c=std::max(x,origin[1])-origin[1];
             const auto h=std::min(y+tile,origin[0]+shape[0])-origin[0]-r,w=std::min(x+tile,origin[1]+shape[1])-origin[1]-c;
-            const auto bytes=readSharedRectangle(db,a,name,r,c,h,w);
+            const auto bytes=rectangle(r,c,h,w);
             const auto key=tileKey(y,x);
             tiles[{y,x}]={{"hash",storeSharedPayload(db,name,bytes)},{"row",origin[0]+r},{"column",origin[1]+c},{"rows",h},{"columns",w},{"bounds",coordinates?coordinateBounds(bytes,a.at("dtype"),true):Tree()}};
         }
@@ -298,10 +301,46 @@ Tree indexedDescriptor(sqlite3* db,const Tree& a,const std::string& name,bool co
     } else {
         // Rechunk once into point-aligned bounded leaves; subsequent edits
         // reuse whole subtrees and only inspect split boundary leaves.
-        const auto bytes=readSharedArray(db,a,name,0,a.at("byte_length"));
+        const auto bytes=read();
         out["tree"]=byteTree(db,name,a.at("dtype"),bytes,coordinates);
     }
     return out;
+}
+} // namespace
+Tree indexedDescriptor(sqlite3* db, GeometryReader& reader, const std::string& name, bool coordinates,
+    bool patch, const std::array<int64_t,2>& origin) {
+    const auto& a=reader.manifest().at("arrays").at(name);
+    return makeIndexedDescriptor(db, a, name, coordinates, patch, origin,
+        [&] { return reader.read(name,0); },
+        [&](auto r,auto c,auto h,auto w) {
+            const auto layout=geometryLayout(a);
+            // Reuse stored tiles directly; delta-only chunks need reconstruction.
+            if (layout.tile && r%layout.tile==0 && c%layout.tile==0) {
+                const auto index=r/layout.tile*layout.tileColumns()+c/layout.tile;
+                if (layout.rectangle(index)==std::array<int64_t,4>{r,c,h,w}) {
+                    const std::string hash=a.at("chunks").at(index);
+                    Statement exists(db,"SELECT 1 FROM geometry_chunks WHERE hash=?"); exists.bind(1,hash);
+                    if (exists.row()) {
+                        auto bytes=readSharedPayload(db,name,hash);
+                        if (int64_t(bytes.size())!=layout.chunkBytes(index)) throw std::runtime_error("geometry: corrupt tile size");
+                        return bytes;
+                    }
+                }
+            }
+            return reader.rectangle(name,r,c,h,w);
+        });
+}
+Tree indexedSurfaceArray(sqlite3* db, const GeometryArray& a, int64_t tile, const std::array<int64_t,2>& origin) {
+    const Tree descriptor={{"dtype",a.dtype},{"shape",a.shape},{"byte_length",a.bytes.size()},{"tile_size",tile}};
+    const auto pixel=surfacePixelBytes(a.dtype,a.shape);
+    return makeIndexedDescriptor(db,descriptor,a.name,false,true,origin,
+        [&] { return std::span<const uint8_t>(a.bytes); },
+        [&](int64_t r,int64_t c,int64_t h,int64_t w) {
+            std::vector<uint8_t> bytes(h*w*pixel);
+            for (int64_t y=0;y<h;++y)
+                std::memcpy(bytes.data()+y*w*pixel,a.bytes.data()+((r+y)*a.shape[1]+c)*pixel,w*pixel);
+            return bytes;
+        });
 }
 Tree tileHalos(sqlite3* db,const Tree& original,int64_t tile,const std::set<std::pair<int64_t,int64_t>>& changed) {
     auto root=original;std::set<std::pair<int64_t,int64_t>> cells;

@@ -35,8 +35,8 @@ PCL source links use document-scoped collection/point identities. The namespace
 is `meta.source.origin`, the absolute lexically normalized import path; symlink
 aliases and moved files are different namespaces. Import only new collections
 at that path to extend a document. Only active owners resolve links; duplicate
-active identities fail. Schema 12 maintains derived identity indexes through
-edits, restoration and sync. Migration/replacement can scan all affected IDs;
+active identities fail. Derived identity indexes are maintained through
+edits, restoration and sync. Replacement can scan all affected IDs;
 ordinary resolution reads only referenced chunks or identity-tree entries.
 
 Native export selects an immutable revision and stages output before publication;
@@ -131,7 +131,7 @@ Explicit revision graphs always require applicability, retain isolated selected
 nodes, and cannot combine `revisions` with current object filters or
 `include_retired`. Nodes are in canonical UUID order; traversal is breadth-first
 in edge-UUID order. Current queries otherwise inspect current records.
-Applicability queries require a read transaction and schema 9+.
+Applicability queries require a read transaction.
 Graph views are thread-confined and must close before checkpointing. NumPy arrays
 are read-only and retain their buffers after closure, not the database transaction.
 
@@ -171,9 +171,9 @@ history. A fresh retired replica may lack an active revision to restore: restore
 on the originating replica and sync, or copy its full database. Metadata-only
 JSON import rejects lifecycle-bearing exports.
 
-Writable opens migrate older schemas atomically. Pre-v9 metadata history cannot
-be recovered and is marked `metadata_complete=False`; legacy read-only access
-remains available. Open writable once to enable newer history/index APIs.
+Both writable and read-only opens require the current schema (13). Earlier
+development stores are rejected; recreate them from source data. No migration
+or compatibility readers are provided.
 
 ## Volume identity and coordinate scale
 
@@ -256,7 +256,7 @@ Net no-ops create no revision/journal entry, but stale expectations still fail.
 Rectangle edits preserve all components and require exact byte lengths.
 Geometry, bounds, approvals and relationship decisions publish atomically.
 
-Patch tiles support 32/64/128 (default 128); size 0 uses legacy linear 1 MiB
+Patch tiles support 32/64/128 (default 128); size 0 uses linear 1 MiB
 chunks. Sparse deltas retain exact bytes, including NaN payloads/signed zero,
 with checksum verification and a 256 MiB decoded limit. Current heads use a
 chunk overlay; historical reads reconstruct from snapshots or reverse a shorter

@@ -30,7 +30,7 @@ class ResidentSpatialIndex {
     std::set<std::string> retired_;
 public:
     bool load(sqlite3* db, size_t budget) {
-        if (pragmaInt(db, "user_version") >= 10) {
+        {
             Statement states(db, "SELECT uuid FROM objects JOIN object_lifecycle lc ON lc.object_id=objects.id WHERE lc.retired=1");
             while (states.row()) {
                 retired_.insert(formatUuid(states.blob16(0)));
@@ -103,7 +103,6 @@ public:
         if (selection.tag || selection.connectedTo || selection.family || selection.minLength ||
             selection.afterUuid || selection.afterLength || selection.orderBy != "uuid") return std::nullopt;
         if (!attempted_) {
-            if (pragmaInt(db, "user_version") < 5) return std::nullopt;
             auto index = std::make_unique<ResidentSpatialIndex>();
             if (index->load(db, budget_)) index_ = std::move(index);
             attempted_ = true; // An oversized snapshot is tried only once.

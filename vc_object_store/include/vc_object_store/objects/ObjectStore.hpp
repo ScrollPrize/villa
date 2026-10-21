@@ -118,10 +118,10 @@ struct ObjectRevision {
     std::string uuid, objectUuid;
     std::optional<std::string> parentUuid, geometryRevision;
     int64_t sequence = 0;
-    // False only for migration baselines: pre-v9 metadata history did not exist.
+    // False for sync baselines whose original metadata history was not copied.
     bool metadataComplete = true;
     // UTC Unix microseconds assigned once per atomic publication, monotonically
-    // increasing within this store. Missing only for untimed migration baselines.
+    // increasing within this store. Missing only for untimed sync baselines.
     std::optional<int64_t> publishedAtUs;
     bool deleted = false;
     ObjectRecord record;
@@ -470,7 +470,7 @@ public:
         const std::string& arrayName) const;
 
     // Dense row-major rectangle from any aligned patch array. Exact
-    // bytes; handles tiled and legacy layouts. Coordinates/counts are vertices.
+    // bytes; handles tiled and linear layouts. Coordinates/counts are vertices.
     // Rectangle/range reads may reuse verified bytes on a pooled reader until
     // its next snapshot observes a commit. Writes always use fresh readers.
     std::vector<uint8_t> readGeometryRectangle(const Txn&, const std::string& revisionUuid,

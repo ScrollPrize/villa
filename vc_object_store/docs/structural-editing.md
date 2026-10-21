@@ -108,7 +108,7 @@ rectangles. Consumers do not need to interpret shared storage.
 
 ## Storage and cost
 
-The first structural edit converts legacy layouts/annotations in work proportional
+The first structural edit converts chunk snapshots/annotations in work proportional
 to the geometry. Later sequence splices path-copy immutable AVL ropes with bounded
 leaves; surface edits update persistent tile maps in stable grid coordinates.
 Unchanged subtrees and payloads are shared. Reads descend trees rather than replaying
@@ -122,8 +122,8 @@ paginate afterward; seams conservatively cover crossing segments. The per-operat
 tree cache is bounded by an 8 MiB charge. There is no background compaction or
 numerical approximation. Large annotations use separately chunked immutable blobs.
 
-Schema 11 gates this representation. Writable migration preserves old revisions
-and payloads until conversion; older binaries reject it. Synchronization transfers
+Only schema 13 is supported; earlier development stores must be recreated.
+Synchronization transfers
 and verifies new nodes/payloads while reusing existing subtrees. It does not copy the
 complete object metadata/relationship timeline; use a database copy for that.
 
@@ -136,7 +136,7 @@ for the synthetic scaling benchmark: full replacement versus append/insertion an
 right growth, with zero/eight relationships and initialization reported separately.
 
 Each measured edit includes expected-head reads, checked publication, durable
-commit and local compaction; full replacement includes caller preparation. Inputs
+commit; full replacement includes caller preparation. Inputs
 span 1,000–100,000 points, 128–1,024-square surfaces and an 80-append history.
 Reports include mean/min/median/max latency, payload/tree/manifest work, SQLite
 steps and exclusive scoped phase times. Counters measure logical work, not disk

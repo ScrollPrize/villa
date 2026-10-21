@@ -13,7 +13,7 @@ std::vector<std::string> ObjectStore::neighbours(const Txn& txn, const std::stri
     if (!id) throw std::runtime_error("object store: object not found: " + objectUuid);
     if (applicableOnly) requirePublishedGraphRead(txn);
     const std::string filter = fiberAdjacencySql(adjacentFilter) + (edgeKind ? std::string(" AND kind=?2") : "") +
-        (includeRetired ? "" : " AND " + activeEdgeSql(db));
+        (includeRetired ? "" : " AND " + activeEdgeSql());
     // Filter before deduplication: a rejected parallel edge must not hide a
     // later applicable edge to the same neighbour. Preserve first-edge order.
     std::string sql = "SELECT o.uuid,e.uuid FROM (SELECT id,uuid,b_id AS neighbour FROM edges INDEXED BY edges_a WHERE a_id=?1" + filter +
@@ -85,7 +85,7 @@ std::vector<int64_t> traverse(sqlite3* db, const std::string& startUuid, int max
     if (!objectIdByUuid(db, startBytes))
         throw std::runtime_error("object store: object not found: " + startUuid);
     if (!includeRetired) {
-        Statement active(db, "SELECT 1 FROM objects WHERE uuid=? AND " + activeObjectSql(db, "objects.id"));
+        Statement active(db, "SELECT 1 FROM objects WHERE uuid=? AND " + activeObjectSql("objects.id"));
         active.bindBlob(1, startBytes);
         if (!active.row()) return {};
     }
@@ -99,7 +99,7 @@ std::vector<int64_t> traverse(sqlite3* db, const std::string& startUuid, int max
         filter += ")";
     }
     filter += fiberAdjacencySql(adjacentFilter);
-    if (!includeRetired) filter += " AND " + activeEdgeSql(db);
+    if (!includeRetired) filter += " AND " + activeEdgeSql();
     // Each UNION arm uses an endpoint-leading index even without ANALYZE.
     std::string sql = "SELECT id,b_id,uuid FROM edges INDEXED BY edges_a WHERE a_id=?1" + filter +
         " UNION SELECT id,a_id,uuid FROM edges INDEXED BY edges_b WHERE b_id=?1" + filter + " ORDER BY id";

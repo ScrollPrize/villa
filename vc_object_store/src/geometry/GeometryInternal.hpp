@@ -136,48 +136,6 @@ inline GeometryLayout geometryLayout(const nlohmann::json& array, bool checkChun
             throw std::runtime_error("geometry: indexed array length mismatch");
         return result;
     }
-    if (array.contains("blocks") || array.contains("tiles")) {
-        if (array.contains("blocks") && array.contains("tiles")) throw std::runtime_error("geometry: ambiguous shared layout");
-        auto hash=[](const nlohmann::json& entry) {
-            const auto value=entry.at("hash").get<std::string>();
-            if (value.size()!=64 || value.find_first_not_of("0123456789abcdef")!=std::string::npos)
-                throw std::runtime_error("geometry: invalid shared hash");
-        };
-        if (array.contains("blocks")) {
-            int64_t total=0;
-            if (!array.at("blocks").is_array()) throw std::runtime_error("geometry: invalid shared blocks");
-            for (const auto& block:array.at("blocks")) {
-                hash(block); const int64_t offset=block.at("offset"), length=block.at("length");
-                if (offset<0 || offset>int64_t(geometryChunkSize) || length<=0 || length>int64_t(geometryChunkSize)-offset || length>result.length-total)
-                    throw std::runtime_error("geometry: invalid shared block range");
-                total+=length;
-            }
-            if (total!=result.length) throw std::runtime_error("geometry: incomplete shared blocks");
-        } else {
-            const auto pixel=surfacePixelBytes(array.at("dtype"),shape);
-            const int64_t tile=array.at("tile_size"); validatePatchTileSize(tile);
-            if (!tile || !array.at("tiles").is_array()) throw std::runtime_error("geometry: invalid shared tiles");
-            std::map<int64_t,std::pair<int64_t,std::map<int64_t,int64_t>>> bands;
-            for (const auto& t:array.at("tiles")) {
-                hash(t); const int64_t r=t.at("row"),c=t.at("column"),h=t.at("rows"),w=t.at("columns");
-                if (r<0 || c<0 || h<=0 || w<=0 || h>tile || w>tile || r>shape[0]-h || c>shape[1]-w || h*w>int64_t(geometryChunkSize)/pixel)
-                    throw std::runtime_error("geometry: invalid shared tile rectangle");
-                auto& band=bands[r];
-                if ((band.first && band.first!=h) || !band.second.emplace(c,w).second) throw std::runtime_error("geometry: overlapping shared tiles");
-                band.first=h;
-            }
-            int64_t row=0;
-            for (const auto& [r,band]:bands) {
-                if (r!=row) throw std::runtime_error("geometry: incomplete shared tile rows");
-                int64_t col=0;
-                for (const auto& [c,w]:band.second) { if (c!=col) throw std::runtime_error("geometry: incomplete shared tile columns"); col+=w; }
-                if (col!=shape[1]) throw std::runtime_error("geometry: incomplete shared tile columns");
-                row+=band.first;
-            }
-            if (shape[1] && row!=shape[0]) throw std::runtime_error("geometry: incomplete shared tile rows");
-        }
-        return result;
-    }
     if (array.contains("storage")) {
         const auto& storage = array.at("storage");
         if (storage.at("version") != 1 || storage.at("layout") != "tiles" ||

@@ -30,8 +30,9 @@ void treeEntries(sqlite3*, const Tree&, const std::function<void(const Tree&,con
 void treeWalk(sqlite3*, const Tree&, const std::function<void(const Tree&)>&);
 Tree mergeTreeBounds(const Tree&, const Tree&);
 Tree coordinateBounds(std::span<const uint8_t>, const std::string&, bool patch);
-Tree indexedDescriptor(sqlite3*, const Tree&, const std::string& name, bool coordinates, bool patch=false,
+Tree indexedDescriptor(sqlite3*, GeometryReader&, const std::string& name, bool coordinates, bool patch=false,
                        const std::array<int64_t,2>& origin={0,0});
+Tree indexedSurfaceArray(sqlite3*, const GeometryArray&, int64_t tile, const std::array<int64_t,2>& origin);
 Tree byteTree(sqlite3*, const std::string&, const std::string&, std::span<const uint8_t>, bool coordinates);
 Tree byteSlice(sqlite3*, const Tree&, const std::string&, const std::string&, int64_t, int64_t, bool coordinates);
 Tree byteJoin(sqlite3*, const Tree&, const Tree&, const std::string&, const std::string&, bool coordinates);

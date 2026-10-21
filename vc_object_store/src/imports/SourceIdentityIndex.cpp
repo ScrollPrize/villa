@@ -21,42 +21,40 @@ Json idsDescriptor(GeometryReader& reader) {
 }
 void createSourceIdentityIndex(sqlite3* db) {
     exec(db,R"SQL(
-CREATE TABLE IF NOT EXISTS source_collections(
+CREATE TABLE source_collections(
  object_uuid BLOB PRIMARY KEY REFERENCES objects(uuid) ON DELETE CASCADE,
  origin TEXT NOT NULL, collection_id TEXT NOT NULL, revision_uuid BLOB NOT NULL
 );
-CREATE INDEX IF NOT EXISTS source_collection_identity ON source_collections(origin,collection_id);
-CREATE TABLE IF NOT EXISTS source_points(
+CREATE INDEX source_collection_identity ON source_collections(origin,collection_id);
+CREATE TABLE source_points(
  object_uuid BLOB NOT NULL REFERENCES source_collections(object_uuid) ON DELETE CASCADE,
  point_id INTEGER NOT NULL, origin TEXT NOT NULL, point_offset INTEGER NOT NULL,
  PRIMARY KEY(object_uuid,point_id)
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS source_point_identity ON source_points(origin,point_id);
-CREATE TABLE IF NOT EXISTS source_identity_dirty(
+CREATE INDEX source_point_identity ON source_points(origin,point_id);
+CREATE TABLE source_identity_dirty(
  object_uuid BLOB PRIMARY KEY REFERENCES objects(uuid) ON DELETE CASCADE
 ) WITHOUT ROWID;
-CREATE TRIGGER IF NOT EXISTS source_identity_object_insert AFTER INSERT ON objects
+CREATE TRIGGER source_identity_object_insert AFTER INSERT ON objects
  WHEN new.kind='point_collection' BEGIN
  INSERT OR IGNORE INTO source_identity_dirty VALUES(new.uuid); END;
-CREATE TRIGGER IF NOT EXISTS source_identity_object_update AFTER UPDATE OF meta,storage_ref,kind ON objects
+CREATE TRIGGER source_identity_object_update AFTER UPDATE OF meta,storage_ref,kind ON objects
  WHEN (new.kind='point_collection' OR old.kind='point_collection') AND
  (new.kind IS NOT old.kind OR
  json_extract(new.meta,'$.source.origin') IS NOT json_extract(old.meta,'$.source.origin') OR
  json_extract(new.meta,'$.source.source_collection_id') IS NOT json_extract(old.meta,'$.source.source_collection_id') OR
  (json_extract(new.meta,'$.source.origin') IS NULL AND new.storage_ref IS NOT old.storage_ref)) BEGIN
  INSERT OR IGNORE INTO source_identity_dirty VALUES(new.uuid); END;
-CREATE TRIGGER IF NOT EXISTS source_identity_head_insert AFTER INSERT ON geometry_heads
+CREATE TRIGGER source_identity_head_insert AFTER INSERT ON geometry_heads
  WHEN (SELECT kind FROM objects WHERE uuid=new.object_uuid)='point_collection' BEGIN
  INSERT OR IGNORE INTO source_identity_dirty VALUES(new.object_uuid); END;
-CREATE TRIGGER IF NOT EXISTS source_identity_head_update AFTER UPDATE ON geometry_heads
+CREATE TRIGGER source_identity_head_update AFTER UPDATE ON geometry_heads
  WHEN (SELECT kind FROM objects WHERE uuid=new.object_uuid)='point_collection' BEGIN
  INSERT OR IGNORE INTO source_identity_dirty VALUES(new.object_uuid); END;
-CREATE TRIGGER IF NOT EXISTS source_identity_head_delete AFTER DELETE ON geometry_heads
+CREATE TRIGGER source_identity_head_delete AFTER DELETE ON geometry_heads
  WHEN EXISTS(SELECT 1 FROM objects WHERE uuid=old.object_uuid AND kind='point_collection') BEGIN
  INSERT OR IGNORE INTO source_identity_dirty VALUES(old.object_uuid); END;
-INSERT OR IGNORE INTO source_identity_dirty SELECT uuid FROM objects WHERE kind='point_collection';
 )SQL");
-    refreshSourceIdentityIndex(db);
 }
 void refreshSourceIdentityIndex(sqlite3* db) {
     GeometryPhase phase("sourceIdentityIndex");
@@ -140,7 +138,6 @@ std::optional<std::string> sourceCollection(sqlite3* db, const std::string& orig
     return result;
 }
 bool indexedSourceRevision(sqlite3* db, const std::string& object, const std::string& revision) {
-    if(pragmaInt(db,"user_version")<12) return false;
     Statement s(db,"SELECT 1 FROM source_collections WHERE object_uuid=? AND revision_uuid=?");
     s.bindBlob(1,parseUuid(object)); s.bindBlob(2,parseUuid(revision)); return s.row();
 }

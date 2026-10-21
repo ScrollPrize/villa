@@ -191,8 +191,6 @@ CREATE TABLE history_validated_edges(uuid TEXT PRIMARY KEY, a_meta TEXT NOT NULL
                 mark("history_dirty_objects", "SELECT o.uuid FROM objects o JOIN edges e "
                 "ON o.id=e.a_id OR o.id=e.b_id WHERE e.id=" + row + ".edge_id"));
     }
-    exec(db, "INSERT INTO history_dirty_objects SELECT uuid FROM objects;"
-             "INSERT INTO history_dirty_edges SELECT uuid FROM edges;");
 }
 
 void detail::expectHistory(sqlite3* db, const RevisionSelection& expected)
@@ -243,7 +241,7 @@ void detail::recordRelationshipValidation(sqlite3* db, const EdgeRecord& edge, b
     }
 }
 
-void detail::publishHistory(sqlite3* db, bool migration, bool importedBindings)
+void detail::publishHistory(sqlite3* db, bool importedBindings)
 {
     GeometryPhase phase("detail::publishHistory");
     if (const auto pool = activeStatementPools.find(db); pool != activeStatementPools.end() && pool->second->actionConflict)
@@ -433,7 +431,7 @@ void detail::publishHistory(sqlite3* db, bool migration, bool importedBindings)
         insert.bind(1, p.uuid); insert.bind(2, object);
         if (p.parent) insert.bind(3, *p.parent); else insert.bindNull(3);
         if (p.geometry) insert.bindBlob(4, parseUuid(*p.geometry)); else insert.bindNull(4);
-        insert.bind(5, p.delta.dump()); insert.bind(6, int64_t(!migration));
+        insert.bind(5, p.delta.dump()); insert.bind(6, int64_t(1));
         insert.bind(7, publishedAtUs); insert.stepDone();
         Statement setHead(db, "INSERT INTO object_heads VALUES(?,?) ON CONFLICT(object_uuid) DO UPDATE SET revision_uuid=excluded.revision_uuid");
         setHead.bind(1, object); setHead.bind(2, p.uuid); setHead.stepDone();
@@ -448,9 +446,9 @@ void detail::publishHistory(sqlite3* db, bool migration, bool importedBindings)
         if (geometry) s.bindBlob(2, parseUuid(*geometry)); else s.bindNull(2);
         while (s.row())
             if (!epoch || metadata(db, s.text(0)).value("lifecycle_epoch", "") == *epoch) return s.text(0);
-        if (!migration && !importedBindings)
+        if (!importedBindings)
             throw std::runtime_error("object history: relationship binding has no object revision");
-        // Old stores and current-state sync imports can supply older geometry
+        // Current-state sync imports can supply older geometry
         // without its object history. Preserve that binding with an explicitly
         // incomplete, untimed baseline, never fabricated historical metadata.
         const auto uuid = util::newUuid();
@@ -602,8 +600,6 @@ void detail::requirePublishedGraphRead(const Txn& txn)
     const auto pool = activeStatementPools.find(db);
     if (pool == activeStatementPools.end() || !pool->second->readSnapshot)
         throw std::invalid_argument("applicability graph queries require a read transaction");
-    if (pragmaInt(db, "user_version") < 9)
-        throw std::runtime_error("applicability graph queries require object history; open writable once to migrate");
 }
 
 bool detail::currentRelationshipApplicable(const ObjectStore& store, const Txn& txn,

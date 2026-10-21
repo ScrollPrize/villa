@@ -38,7 +38,7 @@ std::string ObjectStore::exportJson(const Txn& txn, const JsonExportOptions& opt
     std::string members = "SELECT e.id FROM json_each(?1) selected CROSS JOIN edges e INDEXED BY edges_a "
         "WHERE e.a_id=selected.value AND e.b_id IN (SELECT value FROM json_each(?1))";
     if (!options.selection.includeRetired)
-        members += " AND e.id IN (SELECT id FROM edges WHERE " + activeEdgeSql(db) + ")";
+        members += " AND e.id IN (SELECT id FROM edges WHERE " + activeEdgeSql() + ")";
     if (!options.selection.edgeKinds.empty()) members += " AND e.kind IN (SELECT value FROM json_each(?2))";
     Statement states(db, "SELECT e.uuid,b.a_revision,b.b_revision,ha.revision_uuid,hb.revision_uuid FROM edges e "
         "LEFT JOIN edge_geometry_bindings b ON b.edge_id=e.id "

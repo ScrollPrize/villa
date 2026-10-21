@@ -65,8 +65,9 @@ build/bin/vc_object_links --db objects.vcobj --author "$USER" \
 ```
 
 See the [API guide](docs/README.md) for checked revisions, geometry reads and
-edits, graph snapshots, spatial queries, and synchronization. Existing database
-files keep their schema and revision semantics. Detector distances and scale
+edits, graph snapshots, spatial queries, and synchronization. Only the current
+database schema (13) is supported; recreate earlier development stores from
+source data. Detector distances and scale
 options remain in working voxels. CT normals use uint8 Zarr data with complete
 109³ support. Native CT opening supports local and anonymous HTTP/S3 arrays and
 pyramid levels; credentials and disk-cache configuration are not exposed by this

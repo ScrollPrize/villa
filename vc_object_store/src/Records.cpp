@@ -21,7 +21,7 @@ std::vector<ObjectRecord> ObjectStore::objectsByKind(const Txn& txn, const std::
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     std::string sql = std::string("SELECT ") + kObjectCols + " FROM objects WHERE kind=?";
-    if (!includeRetired) sql += " AND " + activeObjectSql(db, "objects.id");
+    if (!includeRetired) sql += " AND " + activeObjectSql("objects.id");
     if (approvalState) sql += " AND approval_state=?";
     sql += " ORDER BY id";
     Statement s(db, sql);
@@ -34,7 +34,7 @@ int64_t ObjectStore::objectCount(const Txn& txn, const std::string& kind, bool i
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
     Statement s(db, "SELECT count(*) FROM objects WHERE kind=?" +
-        (includeRetired ? std::string() : " AND " + activeObjectSql(db, "objects.id")));
+        (includeRetired ? std::string() : " AND " + activeObjectSql("objects.id")));
     s.bind(1, kind);
     (void)s.row();
     return s.i64(0);
@@ -48,7 +48,7 @@ std::vector<ObjectRecord> ObjectStore::objectsByTag(const Txn& txn, const std::s
                     "o.changed_host,o.approval_state,o.approved_by,o.approved_at,o.approved_host,o.approved_generation,o.format_version,"
                     "o.storage_kind,o.storage_ref,o.data_generation,o.data_checksum,o.meta FROM objects o "
                     "JOIN object_tags t INDEXED BY object_tags_tag ON t.object_id=o.id WHERE t.tag=?" +
-                    (includeRetired ? std::string() : " AND " + activeObjectSql(db, "o.id")) + " ORDER BY o.id");
+                    (includeRetired ? std::string() : " AND " + activeObjectSql("o.id")) + " ORDER BY o.id");
     s.bind(1, tag);
     return readObjectRows(db, s);
 }
