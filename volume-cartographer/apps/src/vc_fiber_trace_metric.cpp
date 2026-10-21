@@ -1,3 +1,4 @@
+#include "FiberTraceEvaluationCli.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/LasagnaNormalSampler.hpp"
@@ -336,6 +337,10 @@ void clearProgressLine()
 int main(int argc, char** argv)
 {
     try {
+        if (argc > 1 && (std::string_view(argv[1]) == "replay-set" ||
+                         std::string_view(argv[1]) == "replay-references" ||
+                         std::string_view(argv[1]) == "render-replay"))
+            return runFiberTraceEvaluationCli(argc, argv);
         const CliOptions options = parseArgs(argc, argv);
 
         vc::lasagna::LasagnaDatasetOpenOptions datasetOptions;

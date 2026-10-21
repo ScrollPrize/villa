@@ -75,30 +75,115 @@ private:
     FiberEvaluationControl& control_;
 };
 
-FiberReplayTraceResult replayFiberBeamCase(
+std::optional<PolylineArcSample> findFiberReplayRestartSeed(
+    const FiberPredictionSource& predictions, const FiberTraceConfig& trace, double scale,
+    const vc::lasagna::NormalSampler& normalSampler, double normalWorkingToBaseScale,
+    const PolylineArcGeometry& reference, double fromArc, double endArcBase,
+    double nominalStepBase)
+{
+    const double grid = scale;
+    const double minDot = std::cos(25.0 * std::acos(-1.0) / 180.0);
+    for (double arc = fromArc; arc < endArcBase; arc += nominalStepBase) {
+        auto ref = samplePolylineArc(reference, arc);
+        const auto tangent = ref.tangent / cv::norm(ref.tangent);
+        const auto normal = normalSampler.sampleNormal(ref.point / normalWorkingToBaseScale);
+        cv::Vec3d u = normal.valid ? normal.normal : cv::Vec3d(0, 0, 1);
+        u -= tangent * u.dot(tangent);
+        if (cv::norm(u) < 1e-6) {
+            u = cv::Vec3d(0, 1, 0) - tangent * tangent[1];
+            if (cv::norm(u) < 1e-6) u = cv::Vec3d(1, 0, 0) - tangent * tangent[0];
+        }
+        u /= cv::norm(u);
+        const cv::Vec3d v = tangent.cross(u);
+        const auto sample = [&](const cv::Vec3d& point) {
+            FiberPredictionSampleOption best;
+            for (const auto& option : predictions.sample(point / grid, tangent).options)
+                if (option.valid && option.presence > best.presence) best = option;
+            return best;
+        };
+        std::optional<PolylineArcSample> chosen;
+        double bestDistance = std::numeric_limits<double>::infinity();
+        for (int i = -int(std::ceil(10 / grid)); i <= int(std::ceil(10 / grid)); ++i)
+            for (int j = -int(std::ceil(20 / grid)); j <= int(std::ceil(20 / grid)); ++j) {
+                const cv::Vec3d point = ref.point + grid * (i * u + j * v);
+                const auto distance = measureFiberReplayThreshold(point, ref.point,
+                    normalSampler, normalWorkingToBaseScale, 10, 2);
+                if (fiberReplayThresholdExceeded(distance, 10)) continue;
+                const auto value = sample(point);
+                cv::Vec3d dir(value.direction);
+                if (!value.valid || value.presence <= 0 || value.presence < trace.replayPresenceCutoff || cv::norm(dir) <= 1.0e-12) continue;
+                dir /= cv::norm(dir);
+                const double dot = dir.dot(tangent);
+                if (std::abs(dot) < minDot) continue;
+                bool peak = true, strict = false;
+                for (int a = -1; a <= 1; ++a) for (int b = -1; b <= 1; ++b) {
+                    if (!a && !b) continue;
+                    const double other = sample(point + grid * (a * u + b * v)).presence;
+                    if (other > value.presence) peak = false;
+                    if (other < value.presence) strict = true;
+                }
+                if (peak && strict && distance.thresholdErrorRatio < bestDistance) {
+                    bestDistance = distance.thresholdErrorRatio;
+                    chosen = ref;
+                    chosen->point = point;
+                    chosen->tangent = dot < 0 ? -dir : dir;
+                }
+            }
+        if (chosen) return chosen;
+    }
+    return std::nullopt;
+}
+
+static FiberReplayTraceResult replayBeamCase(
     const FiberPredictionSource& predictions, const FiberTraceConfig& trace, double scale,
     const vc::lasagna::NormalSampler& tracingNormals,
     const vc::lasagna::NormalSampler& evaluationNormals, double normalScale,
     const FiberEvaluationCase& c, const FiberChunkReplayConfig& config,
-    double reverseInterval, const FiberTraceProgressCallback& progress)
+    double reverseInterval, const FiberTraceProgressCallback& progress, bool trainingProtocol)
 {
     const FiberTraceCoordinateAdapter coordinates(scale);
     validateFiberTraceConfig(trace);
     const auto reference = makePolylineArcGeometry(c.referenceBase);
     const double end = c.endArcBase.value_or(reference.length());
-    auto policy = fiberChunkReplayConsistency(predictions, tracingNormals, trace, config, reverseInterval);
+    const double interval = !trainingProtocol || reverseInterval > 0 ? reverseInterval : trace.replayReverseIntervalBase;
+    auto policy = fiberChunkReplayConsistency(predictions, tracingNormals, trace, config, interval);
+    policy.toStart = trainingProtocol && trace.replayReverseToStart;
+    policy.allEndpoints = trainingProtocol && trace.replayReverseAllEndpoints;
     policy.nextSeed = [&](double arc) -> std::optional<PolylineArcSample> {
         if (arc >= end) return std::nullopt;
         return samplePolylineArc(reference, arc);
     };
     double widthMean = trace.widthReferenceMean;
-    if (reverseInterval > 0) policy.verify = [&](const auto& points) {
+    float committedModulatedPresence = std::numeric_limits<float>::quiet_NaN();
+    if (trainingProtocol && trace.replayPresenceCutoff > 0) {
+        policy.acceptPoint = [&](const cv::Vec3d& point, const cv::Vec3d& previous) {
+            if (trace.replayPresenceModulated) {
+                if (!std::isfinite(committedModulatedPresence))
+                    throw std::logic_error("missing committed modulated presence");
+                return committedModulatedPresence >= trace.replayPresenceCutoff;
+            }
+            const auto direction = point - previous;
+            float presence = 0;
+            for (const auto& option : predictions.sample(coordinates.baseToTrace(point), direction).options)
+                if (option.valid && std::isfinite(option.presence)) presence = std::max(presence, option.presence);
+            return presence >= trace.replayPresenceCutoff;
+        };
+    }
+    if (trainingProtocol && (interval > 0 || policy.acceptPoint)) {
+        policy.nextSeed = [&](double arc) {
+            return findFiberReplayRestartSeed(predictions, trace, scale, evaluationNormals,
+                normalScale, reference, arc, end, trace.stepVoxels * scale);
+        };
+    }
+    if (interval > 0) policy.verify = [&](const auto& points) {
         auto reverse = trace;
         reverse.traceToBaseScale = scale;
         if (reverse.widthRelativeTolerance > 0) reverse.widthReferenceMean = widthMean;
         const auto path = makePolylineArcGeometry(points);
         return verifyFiberReverseSpan(predictions, tracingNormals, reverse, path, path.length(),
-            config.errorThresholdBase, config.errorThresholdBase * config.tangentialThresholdFactor) <= 1e-12;
+            trainingProtocol ? trace.replayReverseNormalRadiusBase : config.errorThresholdBase,
+            trainingProtocol ? trace.replayReverseTangentialRadiusBase : config.errorThresholdBase * config.tangentialThresholdFactor,
+            trainingProtocol ? trace.replayReverseHistorySteps : 0) <= 1e-12;
     };
     const ReplaySegmentRunner run = [&](const PolylineArcSample& seed, double remaining,
         int maximumSteps, const ReplayPointObserver& observe, const FiberTraceProgressCallback& report) {
@@ -108,17 +193,40 @@ FiberReplayTraceResult replayFiberBeamCase(
         request.initialDirection = seed.tangent;
         request.budgetSpanVoxels = remaining / scale;
         request.config = trace;
+        if (trainingProtocol) request.config.replayPresenceCutoff = 0;
         request.config.traceToBaseScale = scale;
         widthMean = trace.widthReferenceMean;
         return traceFiberReplaySegment(predictions, request, maximumSteps, tracingNormals, report,
             [&](const auto& point, double loss, int step) {
                 return observe(coordinates.traceToBase(point), loss, step);
-            }, widthMean);
+            }, widthMean, &committedModulatedPresence);
     };
     return traceReferenceReplayCore(reference, c.beginArcBase, end, trace.stepVoxels * scale,
         trace.maxStepFactor, config.errorThresholdBase, config.excursionGraceBase,
         config.tangentialThresholdFactor, config.matchRefineSteps, evaluationNormals,
         normalScale, run, progress, {}, policy);
+}
+
+FiberReplayTraceResult replayFiberBeamCase(
+    const FiberPredictionSource& predictions, const FiberTraceConfig& trace, double scale,
+    const vc::lasagna::NormalSampler& tracingNormals,
+    const vc::lasagna::NormalSampler& evaluationNormals, double normalScale,
+    const FiberEvaluationCase& c, const FiberChunkReplayConfig& config,
+    double reverseInterval, const FiberTraceProgressCallback& progress)
+{
+    return replayBeamCase(predictions, trace, scale, tracingNormals, evaluationNormals,
+        normalScale, c, config, reverseInterval, progress, false);
+}
+
+FiberReplayTraceResult replayFiberTrainingCase(
+    const FiberPredictionSource& predictions, const FiberTraceConfig& trace, double scale,
+    const vc::lasagna::NormalSampler& tracingNormals,
+    const vc::lasagna::NormalSampler& evaluationNormals, double normalScale,
+    const FiberEvaluationCase& c, const FiberChunkReplayConfig& config,
+    const FiberTraceProgressCallback& progress)
+{
+    return replayBeamCase(predictions, trace, scale, tracingNormals, evaluationNormals,
+        normalScale, c, config, 0, progress, true);
 }
 
 static std::vector<FiberReplayTraceResult> evaluateCases(

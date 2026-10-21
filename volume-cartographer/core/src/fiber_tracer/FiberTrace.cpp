@@ -744,6 +744,7 @@ struct BeamState {
         std::shared_ptr<const PathNode> previous;
         size_t length = 1;
         float cumulativeLoss = 0.0f;
+        float modulatedPresence = 0.0f;
     };
 
     std::shared_ptr<const PathNode> path;
@@ -764,11 +765,12 @@ struct BeamState {
 [[nodiscard]] std::shared_ptr<const BeamState::PathNode> appendBeamPathPoint(
     std::shared_ptr<const BeamState::PathNode> previous,
     const TraceVec& point,
-    float cumulativeLoss = 0.0f)
+    float cumulativeLoss = 0.0f, float modulatedPresence = 0.0f)
 {
     auto node = std::make_shared<BeamState::PathNode>();
     node->point = point;
     node->cumulativeLoss = cumulativeLoss;
+    node->modulatedPresence = modulatedPresence;
     node->previous = std::move(previous);
     node->length = node->previous ? node->previous->length + 1 : 1;
     return node;
@@ -1909,7 +1911,7 @@ void updateTargetPlaneCrossings(
     const CandidateScore& score = scores[candidateIndex];
     const BeamState& parent = parents[task.beamIndex];
     BeamState out = parent;
-    out.path = appendBeamPathPoint(parent.path, candidate.point, candidate.loss);
+    out.path = appendBeamPathPoint(parent.path, candidate.point, candidate.loss, score.modulatedPresence);
     out.previousStepDirection = task.direction;
     out.currentSampleDirection = score.selectedCurrentDirection;
     out.historyDirection = updateHistoryDirection(
@@ -2299,7 +2301,7 @@ template <typename LossAt>
     std::string phase,
     std::optional<double> traceLengthLimitVoxels = std::nullopt,
     const std::function<bool(const cv::Vec3d&, double, int)>& committedStep = {},
-    double* observedWidthMean = nullptr)
+    double* observedWidthMean = nullptr, float* committedModulatedPresence = nullptr)
 {
     auto request = inputRequest;
     const TraceVec start = toTraceVec(request.startPoint);
@@ -2443,6 +2445,7 @@ template <typename LossAt>
             if (updateWidth) addWidth((*it)->point);
             if (observedWidthMean) *observedWidthMean = request.config.widthReferenceMean;
             observedPath = *it;
+            if (committedModulatedPresence) *committedModulatedPresence = observedPath->modulatedPresence;
             if (committedStep && !committedStep(toVec3d(observedPath->point),
                     observedPath->cumulativeLoss, static_cast<int>(observedPath->length - 1)))
                 return false;
@@ -5424,14 +5427,15 @@ FiberTraceOneWayResult traceFiberExtrapolation(
 std::string traceFiberReplaySegment(const FiberPredictionSource& predictions,
     const FiberTraceOneWayRequest& request, int maximumSteps,
     const vc::lasagna::NormalSampler& normals, const FiberTraceProgressCallback& progress,
-    const std::function<bool(const cv::Vec3d&, double, int)>& observe, double& widthMean)
+    const std::function<bool(const cv::Vec3d&, double, int)>& observe, double& widthMean,
+    float* committedModulatedPresence)
 {
     validateTraceConfig(request.config);
     if (maximumSteps <= 0) throw std::invalid_argument("replay maximum steps must be positive");
     requireNormalSamplerForNormalAwareSmoothness(request.config, &normals);
     try {
         return traceOneWayCore(predictions, request, &normals, progress, "replay",
-            double(maximumSteps) * request.config.stepVoxels, observe, &widthMean).reason;
+            double(maximumSteps) * request.config.stepVoxels, observe, &widthMean, committedModulatedPresence).reason;
     } catch (const std::invalid_argument& e) {
         if (std::string_view(e.what()) != "fiber trace start point has no valid prediction direction") throw;
         return "invalid_initial_prediction";

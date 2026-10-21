@@ -7,6 +7,10 @@
 #include <opencv2/core/mat.hpp>
 class Volume;
 namespace vc::fiber_tracer {
+[[nodiscard]] nlohmann::json fiberReplayTraceJson(const FiberReplayTraceResult&, double normalThresholdBaseVoxels);
+[[nodiscard]] FiberReplayTraceResult fiberReplayTraceFromJson(const nlohmann::json&);
+void writeFiberReplayTraceArtifacts(const std::filesystem::path&, const std::vector<cv::Vec3d>&,
+    const FiberReplayTraceResult&, double normalThresholdBaseVoxels, const nlohmann::json& provenance);
 struct FiberReplayStripTextureSource {
     std::string locator;
     std::array<int, 3> shapeZYX{};

@@ -124,6 +124,13 @@ struct FiberTraceConfig {
     // selected option's direction/width-modulated presence, before smoothness.
     double replayPresenceCutoff = 0.0;
     bool replayPresenceModulated = false;
+    // Existing reference-replay consistency controls; zero interval disables them.
+    double replayReverseIntervalBase = 0.0;
+    double replayReverseNormalRadiusBase = 20.0;
+    double replayReverseTangentialRadiusBase = 40.0;
+    bool replayReverseToStart = false;
+    bool replayReverseAllEndpoints = false;
+    int replayReverseHistorySteps = 0;
     bool preserveInitialDirection = false; // history prior, not a forced step
     // Stop the entire frontier after any surviving branch exits this box.
     std::optional<std::array<cv::Vec3d, 2>> committedBounds;
@@ -682,7 +689,7 @@ struct CandidateScoreDebug {
     const FiberPredictionSource&, const FiberTraceOneWayRequest&, int maximumSteps,
     const vc::lasagna::NormalSampler&, const FiberTraceProgressCallback&,
     const std::function<bool(const cv::Vec3d&, double, int)>& committedStep,
-    double& widthMean);
+    double& widthMean, float* committedModulatedPresence = nullptr);
 
 // Fraction of a segment's start-to-target distance that bounds the endpoint
 // acceptance threshold for that segment. The fixed threshold

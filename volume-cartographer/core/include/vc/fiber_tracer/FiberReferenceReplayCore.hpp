@@ -45,6 +45,8 @@ struct FiberReplayTraceSegment {
 };
 
 struct FiberReplayTraceResult {
+    bool graphGeometry = false;
+    std::string geometryBackend;
     // [rejected-window begin, detection arc, next seed/end arc], base voxels.
     std::vector<std::array<double, 3>> filteredStops;
     size_t reverseChecks = 0;
