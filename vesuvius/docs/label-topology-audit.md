@@ -80,28 +80,54 @@ be finite. A batch may leave reports for earlier valid crops if a later crop fai
 
 ## Workflow: from a dataset to fixed crops
 
-`ranked.csv` works as a proofreading queue: look at the top rows first, and fix
-or drop those crops only after inspecting the supporting label and CT evidence.
+`ranked.csv` is a proofreading queue. Each row is one crop, worst first, with a
+`reason` built from its counts, for example
+`26 interior or unlocated holes, 3 cavities, 6 junction clusters, 26 holes incl. crop faces`.
+The phrases, in the order that decides the rank:
+
+| phrase | meaning |
+| --- | --- |
+| `interior or unlocated holes` | holes through the sheet away from the crop faces, plus holes too wide to locate; the ones most worth a look |
+| `cavities` | enclosed hollows inside a labelled slab |
+| `fused components` | components that fall into several large pieces after a 1-voxel erosion: two sheets labelled as one |
+| `junction clusters` | places where the label is not locally planar: merged sheets or bridges |
+| `holes incl. crop faces` | all holes, including those cut by a crop face (often an artefact of the crop, not the label) |
+
+A hole is a label gap to fill, or a real feature to leave alone: a tear in the
+papyrus, or the pocket between two sheets that were labelled as one slab. On the
+33 holes we checked by hand in the top-ranked Kaggle crops, 19 were the second
+kind, so filling the queue blindly welds sheets more often than it repairs them.
+The review step below records that call per hole.
 
 ```bash
-# 1. audit the dataset, write hole tiles and hole masks
-vesuvius.label_topology_audit --batch DATA_DIR --plot --hole-masks --out audit_out
+# 1. audit the dataset; write hole masks (and, optionally, contact sheets with --plot)
+vesuvius.label_topology_audit --batch DATA_DIR --hole-masks --out audit_out
 
-# 2. open audit_out/ranked.csv; look at <crop>.holes.png for the top crops
+# 2. review the located holes worst crop first; each hole is shown as three
+#    orthogonal CT slices with the label in green and the hole in red, and you
+#    answer f (fill), c (cut: leave open), u (unclear), s (skip) or q (quit).
+#    Resumable; holes already answered are not shown again.
+python src/vesuvius/scripts/review_holes.py --data DATA_DIR --audit audit_out --out review --limit 20
+#    writes review/verdicts.csv (every call), review/veto.csv (the CUT holes, in the
+#    format fix_holes.py --veto reads), review/tiles/<crop>_<n>.png, and
+#    review/fix_in/<crop>/ (label + hole mask, the layout fix_holes.py --in-dir reads)
+#    For a hole the three slices cannot settle, scroll it in 3D with the napari
+#    viewer, which opens the same folder: python src/vesuvius/scripts/hole_viewer.py --root-dir review/fix_in
 
-# 3. fill the located holes with scripts/fix_holes.py, which expects
-#    IN/<crop>/<crop>_surf.tif next to IN/<crop>/hole_mask.tif
-mkdir -p fix_in/sample_00340
-cp DATA_DIR/labels/sample_00340.tif fix_in/sample_00340/sample_00340_surf.tif
-cp audit_out/sample_00340.hole_mask.tif fix_in/sample_00340/hole_mask.tif
-# (run from vesuvius/; add --fg-value if your surface value is not 1)
-python src/vesuvius/scripts/fix_holes.py --in-dir fix_in --ignore-value 2 --method 2d_hole_fill
+# 3. fill the remaining holes, leaving the CUT ones open
+python src/vesuvius/scripts/fix_holes.py --in-dir review/fix_in --veto review/veto.csv \
+  --ignore-value 2 --method close --closing-kernel 2
 
-# 4. compare topology counts, then inspect added voxels against CT;
-#    this report alone does not establish that a repair is physically correct
+# 4. count again; this sees filled holes but not a fill that welded two sheets,
+#    so look at the added voxels on the CT for anything you did not review
 vesuvius.label_topology_audit --label DATA_DIR/labels/sample_00340.tif \
-  --after fix_in/sample_00340/sample_00340_surf_2d_hole_fill.tif --out audit_out
+  --after review/fix_in/sample_00340/sample_00340_surf_closed_k2.tif --out audit_out
 ```
+
+Without the review step, `fix_holes.py` fills every located hole. On the Kaggle
+crops `--method close --closing-kernel 2` is the safer blind default (it filled
+0 of the 19 holes that had to stay open, and 6 of 11 that needed filling);
+`2d_hole_fill` closed 8 of the 19.
 
 ## Metrics
 
@@ -207,6 +233,8 @@ sheets.
   localizes holes with persistent homology. It writes hole masks.
 - `scripts/hole_viewer.py` and `scripts/fix_holes.py` are for inspecting and
   repairing individual crops.
+- `scripts/review_holes.py` walks the audit's ranked holes, records fill/cut calls
+  and writes the veto list and the folder layout the two scripts above read.
 - This audit is the dataset-level pass that runs before them:
   - it adds cavities, fusion, junction and thickness checks
   - it separates holes on crop faces from interior ones
