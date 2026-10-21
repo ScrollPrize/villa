@@ -85,3 +85,5 @@ dinovol/cufile.log
 /vc_object_store/docs/benchmarks
 /vc_reader/benchmarks/results
 *.csv
+/vc_object_store/build-core
+/vc_object_store/docs/benchmarks
