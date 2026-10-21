@@ -9,6 +9,7 @@
 
 #include <nlohmann/json.hpp>
 #include <opencv2/core/types.hpp>
+#include "vc/core/util/Uuid.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
 
 namespace vc::fiber_tracer
@@ -17,6 +18,7 @@ struct Vc3dFiberJson {
     double width = 0.0;
     double widthGapFraction = kDefaultFiberWidthGapFraction;
     int version = 1;
+    std::string uuid;
     std::string optimizationMode = "lasagna";
     std::vector<cv::Vec3d> linePoints;
     std::vector<cv::Vec3d> controlPoints;
@@ -259,6 +261,13 @@ inline Vc3dFiberJson parseVc3dFiberJson(const nlohmann::json& root,
         throw std::runtime_error(context + " is not a vc3d_fiber JSON object");
 
     Vc3dFiberJson fiber;
+    if (root.contains("uuid")) {
+        if (!root.at("uuid").is_string() ||
+            !vc::util::isUuid(root.at("uuid").get<std::string>())) {
+            throw std::runtime_error(context + " has an invalid uuid");
+        }
+        fiber.uuid = root.at("uuid").get<std::string>();
+    }
     fiber.width = fiberWidthFromJson(root);
     fiber.widthGapFraction = fiberWidthGapFromJson(root);
     fiber.version = root.value("version", 1);
@@ -289,6 +298,73 @@ inline Vc3dFiberJson parseVc3dFiberJson(const nlohmann::json& root,
             fiber.segmentMetadata[index] = controls.at(index).at("segment_to_next");
     }
     return fiber;
+}
+
+inline std::vector<size_t> vc3dControlPointLineIndices(const Vc3dFiberJson& fiber,
+                                                     const std::string& context)
+{
+    if (fiber.linePoints.size() < 2 || fiber.controlPoints.size() < 2)
+        throw std::runtime_error("fiber needs at least two line/control points: " + context);
+    std::vector<size_t> indices;
+    for (const auto& cp : fiber.controlPoints) {
+        const auto found = std::find(fiber.linePoints.begin(), fiber.linePoints.end(), cp);
+        if (found == fiber.linePoints.end())
+            throw std::runtime_error("control point is not an exact line point; refusing to guess: " + context);
+        const size_t index = size_t(found - fiber.linePoints.begin());
+        if (!indices.empty() && index <= indices.back())
+            throw std::runtime_error("control points are not strictly increasing along line: " + context);
+        indices.push_back(index);
+    }
+    return indices;
+}
+
+// Canonical selection is shared by replay-set and its reference-prefetch export.
+// Each run retains original line coordinates/arcs; gaps never become edges.
+inline nlohmann::json vc3dEvaluationReferencePlan(const Vc3dFiberJson& fiber,
+                                                const std::string& context)
+{
+    const auto indices = vc3dControlPointLineIndices(fiber, context);
+    std::vector<double> arcs(fiber.linePoints.size(), 0);
+    for (size_t i = 1; i < arcs.size(); ++i)
+        arcs[i] = arcs[i - 1] + cv::norm(fiber.linePoints[i] - fiber.linePoints[i - 1]);
+    nlohmann::json result{{"policy", "cp-bounded-no-lasagna-v1"},
+        {"original_length_base_voxels", arcs.back()}, {"eligible_length_base_voxels", 0.0},
+        {"runs", nlohmann::json::array()}, {"excluded", nlohmann::json::array()},
+        {"cp_spans", nlohmann::json::array()}};
+    const auto exclude = [&](size_t begin, size_t end, const char* reason) {
+        if (end > begin) result["excluded"].push_back({{"line_indices", {begin, end}},
+            {"original_arcs_base", {arcs[begin], arcs[end]}}, {"reason", reason}});
+    };
+    exclude(0, indices.front(), "extrapolated");
+    exclude(indices.back(), fiber.linePoints.size() - 1, "extrapolated");
+    std::optional<size_t> begin;
+    const auto finish = [&](size_t end) {
+        if (!begin) return;
+        const double length = arcs[end] - arcs[*begin];
+        if (!(length > 0)) throw std::runtime_error("degenerate eligible run: " + context);
+        nlohmann::json points = nlohmann::json::array();
+        for (size_t i = *begin; i <= end; ++i) {
+            const auto& p = fiber.linePoints[i]; points.push_back({p[0], p[1], p[2]});
+        }
+        result["runs"].push_back({{"run_index", result["runs"].size()},
+            {"line_indices", {*begin, end}}, {"original_arcs_base", {arcs[*begin], arcs[end]}},
+            {"length_base_voxels", length}, {"points_base_xyz", std::move(points)}});
+        result["eligible_length_base_voxels"] = result["eligible_length_base_voxels"].get<double>() + length;
+        begin.reset();
+    };
+    for (size_t i = 0; i + 1 < indices.size(); ++i) {
+        const auto mode = fiber.version >= 3 ? fiber.segmentMetadata.at(i).at("interp_mode").get<std::string>()
+            : fiber.optimizationMode;
+        result["cp_spans"].push_back({{"control_point_indices", {i, i + 1}},
+            {"line_indices", {indices[i], indices[i + 1]}}, {"actual_interp_mode", mode},
+            {"eligible", mode != "lasagna"}});
+        if (mode == "lasagna") {
+            finish(indices[i]); exclude(indices[i], indices[i + 1], "lasagna");
+        } else if (!begin) begin = indices[i];
+    }
+    finish(indices.back());
+    result["status"] = result["runs"].empty() ? "excluded" : "eligible";
+    return result;
 }
 
 // VC3D's rule for the span tags derived from point tags, at the JSON level

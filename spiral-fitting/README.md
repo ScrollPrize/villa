@@ -30,6 +30,21 @@ AGENTS_AGENT_MODE=1 PYTHONPATH=spiral-fitting spiral-fitting/.venv/bin/python -c
 
 See [NVIDIA's DGX Spark memory guidance](https://docs.nvidia.com/dgx/dgx-spark/known-issues.html).
 
+## Running without CUDA
+
+Fits run on CUDA whenever it is available. Without it they run on Apple's MPS
+backend, and without that on the CPU; `FIT_SPIRAL_DEVICE=cuda|mps|cpu` (or `cuda:1`)
+picks one explicitly (`devices.py`). A distributed (torchrun) fit needs CUDA or
+the CPU: torch.distributed has no MPS backend. The Triton kernels are CUDA only, so MPS and the
+CPU use the PyTorch paths, and the CUDA startup check is skipped.
+
+MPS has no float64. Device tensors that are float64 on CUDA take their dtype
+from `devices.float_hi()`, which is float32 on MPS;
+`FIT_SPIRAL_MAX_PRECISION_FLOAT=32` applies the same cap on every device, for
+comparing a CPU run with an MPS one. `get_ink_metrics.py --device` picks the
+nnU-Net device; without it the folds take CUDA, else MPS, else the CPU, whatever
+the fitting variables say.
+
 ## Editing input snapshots
 
 The service snapshots patch directories, fiber JSON files and point collections
@@ -130,6 +145,16 @@ throws `RuntimeError: lasagna z-ROI [...] is empty` if the mismatch is
 large enough to push the requested z-range outside the (wrongly-scaled)
 store bounds.
 
+Optional `num_windings`: the scroll's winding count, where someone has
+estimated it (an integer of at least 2). It replaces the generic default of
+both `shell_outer_winding_idx` and `model_gap_expander_num_windings`, which is
+Scroll 1's count (130). The exporter writes windings up to
+`shell_outer_winding_idx`, so on a scroll with fewer windings the generic
+value exports windings that lie outside the papyrus. It is a default rather
+than a fact the scroll owns: `FIT_SPIRAL_CONFIG_OVERRIDES` and the Spiral panel
+still override it, and `model_gap_expander_capacity_windings` is raised to
+`num_windings + 3` only when the count would not otherwise fit.
+
 Example (PHerc0826, where group `"2"` is a 4x downsample for this scroll
 specifically):
 
@@ -204,6 +229,24 @@ looks for `umbilicus.json` in the checkpoint's ancestors, in
 layouts, pass `--umbilicus /path/to/umbilicus.json`. Use `--lasagna-dir` if
 the Lasagna repository is not in its standard sibling or `~/villa` location.
 An existing output path is never overwritten.
+
+## Hover descriptions (descriptions.json)
+
+The text VC3D shows when hovering a Spiral tab control or a setting in the
+Spiral Configuration window lives in `descriptions.json`, not in code:
+
+- `config` is keyed by configuration key. The service attaches each entry to
+  the `/configuration` catalog as the field's `description`, re-reading the
+  file per request, so an edit shows after VC3D reconnects. A new
+  configuration key needs an entry here; `tests/test_config.py` fails on a
+  missing or stale key.
+- `panel` is keyed by the control ids registered with `describe(...)` in
+  VC3D's `SpiralPanel.cpp`. VC3D reads this section from the copy beside the
+  `spiral_service.py` it would launch (the same lookup, including
+  `SPIRAL_SERVICE_PATH`) and reloads it as soon as the file changes. A panel id
+  without an entry falls back to the `config` entry of the same name.
+
+Plain text only; a newline starts a new line in the tooltip.
 
 ## Flow stages
 
@@ -357,7 +400,7 @@ This also builds Spiral's native helpers as `vc_spiral.spiral_sampling`,
 same modules build with serial kernels when it does not.
 
 or with conda/pip, install `torch` for your CUDA version and then
-`pip install -e .` from `spiral-fitting/`.
+`pip install -e . --group cuda` from `spiral-fitting/` (pip 25.1 or newer).
 
 On Linux x86-64, `uv sync` installs `brook-cu12`, CuPy and cuCIM for the GPU
 backend of `extract_surface_tracks.py` instead of Kimimaro, its CPU backend;
@@ -365,6 +408,22 @@ on a machine without an NVIDIA GPU of compute capability 8.0 or newer, add
 Kimimaro with `uv sync --extra cpu` (with pip: `pip install -e '.[cpu]'`), and
 pass `--extra cpu` on later syncs too, since a plain `uv sync` removes it again.
 Other platforms get Kimimaro by default.
+
+On AMD GPUs (ROCm, Linux x86-64) the CUDA-only packages are not needed and
+`uv sync` would pull the CUDA 12 build of PyTorch, so create the environment
+with a ROCm PyTorch build and without the `cuda` dependency group instead. The
+Kimimaro CPU backend of `extract_surface_tracks.py` is used (`--backend cpu`):
+
+```sh
+cd spiral-fitting
+uv venv --python 3.14
+uv pip install --index-url https://download.pytorch.org/whl/rocm7.2 "torch>=2.11,<2.13"
+uv pip install -e '.[cpu]'
+.venv/bin/python -c 'import torch; print(torch.version.hip, torch.cuda.is_available())'
+```
+
+Use `.venv/bin/python` (or `uv run --no-sync`) afterwards: a plain `uv sync`
+or `uv run` would reinstall the CUDA build of torch and the `cuda` group.
 
 ### Resident sparse field pools
 

@@ -1144,9 +1144,19 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight, mgr=None):
         )
     
     elif name == 'MemoryEfficientSoftDiceLoss':
-        # Standalone memory efficient dice loss
+        # Standalone memory efficient dice loss. The network returns logits
+        # during training, so default to sigmoid (as DC_and_BCE_loss does);
+        # an explicit null keeps the raw input.
+        apply_nonlin = loss_config.get('apply_nonlin', 'sigmoid')
+        if apply_nonlin == 'sigmoid':
+            apply_nonlin = torch.sigmoid
+        elif apply_nonlin is not None and not callable(apply_nonlin):
+            raise ValueError(
+                f"MemoryEfficientSoftDiceLoss: unsupported apply_nonlin {apply_nonlin!r}; "
+                "expected 'sigmoid', null or a callable"
+            )
         base_loss = MemoryEfficientSoftDiceLoss(
-            apply_nonlin=loss_config.get('apply_nonlin', None),
+            apply_nonlin=apply_nonlin,
             batch_dice=loss_config.get('batch_dice', False),
             do_bg=loss_config.get('do_bg', True),
             smooth=loss_config.get('smooth', 1.),

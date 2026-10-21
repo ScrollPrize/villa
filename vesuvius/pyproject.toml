@@ -61,6 +61,7 @@ models = [
     # vc3d bindings imported by vesuvius.neural_tracing. Not on PyPI, so it must stay
     # out of the base dependencies to keep `pip install vesuvius[volume-only]` working.
     "volume-cartographer",
+    "villa-gpu-manager",
     "numba>=0.60.0",
     "batchgenerators>=0.25.1",
     "batchgeneratorsv2",
@@ -152,6 +153,7 @@ all = [
     "dynamic-network-architectures>=0.3.1",
     "nnunetv2",
     "volume-cartographer",  # monorepo-only, see the note in [project.optional-dependencies.models]
+    "villa-gpu-manager",
     "batchgenerators>=0.25.1",
     "batchgeneratorsv2",
     "einops>=0.8.1",
@@ -207,7 +209,6 @@ all = [
 Homepage = "https://github.com/ScrollPrize/villa"
 
 [project.scripts]
-"vesuvius.accept_terms" = "vesuvius.install.accept_terms:main"
 "vesuvius.predict" = "vesuvius.models.run.inference:main"
 "vesuvius.blend_logits" = "vesuvius.models.run.blending:main"
 "vesuvius.blend_and_finalize" = "vesuvius.models.run.blending:blend_and_finalize_main"
@@ -239,9 +240,6 @@ vesuvius = [
     "tifxyz_label_transfer/docs/*.md",
 ]
 
-[tool.setuptools.cmdclass]
-install = "vesuvius.install.custom_install.CustomInstallCommand"
-
 [tool.setuptools.dynamic]
 version = {attr = "vesuvius._version.VERSION"}
 
@@ -256,6 +254,7 @@ url = "https://pypi.nvidia.com"
 
 [tool.uv.sources]
 volume-cartographer = { path = "../volume-cartographer", editable = true }
+villa-gpu-manager = { path = "../gpu_manager", editable = true }
 cucim-cu13 = { index = "nvidia" }
 batchgeneratorsv2 = { path = "../segmentation/models/batchgeneratorsv2" }
 nnunetv2 = { path = "../segmentation/models/arch/nnunet" }

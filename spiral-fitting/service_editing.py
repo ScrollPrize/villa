@@ -41,6 +41,8 @@ class EditingWorkspace:
         self.commit_selections = {}
         self.lifecycle_started = {}
         self.resident_generation = None
+        # generation -> {input id: revision} bound by that resident build.
+        self.build_bound = {}
         self.reviewed_bases = {}
         self.uploads = UploadManager(UploadEnvironment(
             lock=threading.RLock(), output_root=lambda: self.root,
@@ -595,36 +597,68 @@ class EditingWorkspace:
         return self.coordinator.execute(request.get('command_id'), 'resolve_conflict', request, perform,
             recoverable=lambda exc: isinstance(exc, TimeoutError))
 
+    def build_bindings(self):
+        """Adoption records for the unchanged baseline a new build loads.
+
+        The build binds these identities before its one derivation, so
+        replay_resident() need not relink the whole fit just to adopt them.
+        """
+        if not self.seeded:
+            return []
+        revisions = tuple(revision for revision in self.catalog.desired()
+                          if self.catalog.entry(revision.id).persisted == revision.number)
+        records = self._records(revisions)
+        for record in records:
+            record['adopt'] = True
+        return records
+
+    def note_build_bindings(self, generation, records):
+        """Record what the resident build for ``generation`` bound at load."""
+        self.build_bound[generation] = {
+            str(record['id']): record['revision'] for record in records}
+
     def replay_resident(self, generation):
         """Bind baseline identities and replay desired revisions after a rebuild.
 
         Adoption shares resident geometry for unchanged baseline inputs and
         retains disabled inputs without requiring them to participate.
+        Revisions the build already bound (see build_bindings) are not sent
+        again; when nothing else is desired the resident is not touched.
         """
         if self.resident_generation == generation:
             return {'applied': True}
         revisions = self.catalog.desired()
-        if not revisions:
+        bound = self.build_bound.get(generation, {})
+        pending = tuple(revision for revision in revisions
+                        if bound.get(revision.id) != revision.number)
+        if not pending:
+            if revisions:
+                self.catalog.reset_applied()
+                self.catalog.mark_applied(revisions)
+            self.build_bound.pop(generation, None)
             self.resident_generation = generation
             return {'applied': True}
-        records = self._records(revisions)
-        for record, revision in zip(records, revisions):
+        records = self._records(pending)
+        for record, revision in zip(records, pending):
             record['adopt'] = self.catalog.entry(revision.id).persisted == revision.number
         result = self.resident().apply_input_changes(f'rebuild:{generation}', records)
         if result.get('applied'):
             self.catalog.reset_applied()
             self.catalog.mark_applied(revisions)
+            self.build_bound.pop(generation, None)
             self.resident_generation = generation
         else:
-            self.catalog.record_error(revisions, 'apply', json.dumps(result.get('errors', {})))
+            self.catalog.record_error(pending, 'apply', json.dumps(result.get('errors', {})))
         return result
 
     def close(self):
         def cleanup():
             with storage_lock(self.root.parent):
                 remove_workspace(self.root)
-                owner_lock_path(self.root).unlink(missing_ok=True)
+                # Release before unlink: an open lock handle holds its
+                # file on Windows, and storage_lock fences reclaimers.
                 self._owner_lock.release()
+                owner_lock_path(self.root).unlink(missing_ok=True)
             self.lease.close()
             self.catalog = Catalog()
             self.uploads.uploads.clear()

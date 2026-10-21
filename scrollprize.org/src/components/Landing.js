@@ -8,7 +8,7 @@ import BeforeAfter from "./BeforeAfter";
 import LatestPosts from "./LatestPosts";
 import {
   creators,
-  projectLead,
+  projectLeads,
   sponsors,
   team,
   partners,
@@ -16,8 +16,9 @@ import {
 
 /* ==========================================================================
    Landing — "Obsidian Minimal" restyle (WP1).
-   One card recipe (.vc-card), one accent (--vc-accent), no gradient text,
-   no box shadows. Layout/skin lives in src/css/landing.css.
+   No boxed sections: content sits on the page, divided by hairlines; only
+   media and the hero countdown are framed. One accent (--vc-accent), no
+   gradient text, no box shadows. Layout/skin lives in src/css/landing.css.
    ========================================================================== */
 
 const usd = new Intl.NumberFormat("en-US", {
@@ -27,325 +28,221 @@ const usd = new Intl.NumberFormat("en-US", {
 });
 
 /* ---------------------------------------------------------------------------
-   Story content (JSX-heavy, so it stays here; pure data lives in
-   landingData.js). One media element per chapter.
+   Our story beats: `line` is the headline sentence, `more` the follow-up,
+   `media` one image or clip per beat.
 --------------------------------------------------------------------------- */
 
 const storyImage = (src, alt) => (
-  <img
-    src={src}
-    alt={alt}
-    loading="lazy"
-    decoding="async"
-    className="vc-media vc-story__media"
-  />
+  <img src={src} alt={alt} loading="lazy" decoding="async" className="vc-media" />
 );
 
-const stories = ({ unrollVideo }) => [
+/* Muted looping clip; plays on mount unless the viewer prefers reduced
+   motion, in which case the poster stays. */
+const StoryVideo = ({ sources, poster, title }) => {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    autoPlay(ref);
+  }, []);
+  return (
+    <video
+      ref={ref}
+      playsInline
+      loop
+      muted
+      preload="metadata"
+      poster={poster}
+      title={title}
+      aria-label={title}
+      className="vc-media"
+    >
+      {sources.map(([src, type]) => (
+        <source src={src} type={type} key={src} />
+      ))}
+    </video>
+  );
+};
+
+const storyBeats = [
   {
     date: "79 AD",
-    text: "Mount Vesuvius erupts.",
-    anchor: "vesuvius",
-    description: (
+    id: "vesuvius",
+    line: (
       <>
-        <p>
-          In Herculaneum, twenty meters of hot mud and ash bury an enormous
-          villa once owned by the father-in-law of Julius Caesar. Inside, there
-          is a vast library of papyrus scrolls.
-        </p>
-        <p>
-          The scrolls are carbonized by the heat of the volcanic debris. But
-          they are also preserved. For centuries, as virtually every ancient
-          text exposed to the air decays and disappears, the library of the
-          Villa of the Papyri waits underground, intact.
-        </p>
+        Vesuvius erupts, burying a villa and its library of papyrus scrolls
+        under twenty meters of ash.
       </>
+    ),
+    more: (
+      <>
+        The scrolls are carbonized by the heat, but also preserved. For
+        centuries, as almost every other ancient text decays, the library of
+        the Villa of the Papyri waits underground, intact.
+      </>
+    ),
+    media: storyImage("/img/landing/vesuvius.webp", "Mount Vesuvius"),
+  },
+  {
+    date: "1750",
+    line: (
+      <>
+        The villa is rediscovered. Early attempts to open the scrolls destroy
+        many; hundreds remain unopened.
+      </>
+    ),
+    more: (
+      <>
+        A farmworker digging a well strikes a marble pavement. Excavations
+        unearth hundreds of scrolls, too fragile to unroll. More than six
+        hundred remain unread.
+      </>
+    ),
+    media: storyImage("/img/landing/scroll.webp", "Carbonized Herculaneum scroll"),
+    credit: true,
+  },
+  {
+    date: "2015",
+    line: (
+      <>
+        Dr. Brent Seales's team virtually unwraps the En-Gedi scroll with X-ray
+        tomography.
+      </>
+    ),
+    more: (
+      <>
+        Their work goes on to show that the elusive carbon ink of the
+        Herculaneum scrolls can also be detected, laying the foundation for
+        Vesuvius Challenge.
+      </>
+    ),
+    media: (
+      <StoryVideo
+        sources={[["/img/landing/engedi5.webm", "video/webm"]]}
+        poster="/img/landing/engedi5.webp"
+        title="Virtual unwrapping of the En-Gedi scroll"
+      />
+    ),
+    credit: true,
+  },
+  {
+    date: "2023",
+    line: (
+      <>
+        Vesuvius Challenge launches; within a year,{" "}
+        <a href="/grandprize">the Grand Prize is claimed</a>.
+      </>
+    ),
+    more: (
+      <>
+        Teams recover four passages of 140 characters from a sealed scroll,
+        the first text ever read from inside one.
+      </>
+    ),
+    media: (
+      <div className="vc-strip__pan">
+        <img
+          src="/img/landing/scroll-full-min.webp"
+          alt="Herculaneum scroll panorama"
+          loading="lazy"
+          decoding="async"
+        />
+      </div>
     ),
   },
   {
-    date: "1750 AD",
-    text: "A farmer discovers the buried villa.",
-    description: (
+    date: "2026",
+    line: (
       <>
-        <p>
-          While digging a well, an Italian farmworker encounters a marble
-          pavement. Excavations unearth beautiful statues and frescoes – and
-          hundreds of scrolls. Carbonized and ashen, they are extremely
-          fragile. But the temptation to open them is great; if read, they
-          would significantly increase the corpus of literature we have from
-          antiquity.
-        </p>
-        <p>
-          Early attempts to open the scrolls unfortunately destroy many of
-          them. A few are painstakingly unrolled by a monk over several
-          decades, and they are found to contain philosophical texts written in
-          Greek. More than six hundred remain unopened and unreadable.
-        </p>
-        {storyImage("/img/landing/scroll.webp", "Carbonized Herculaneum scroll")}
-        <p className="text-sm opacity-60 mt-2">
-          © EduceLab/University of Kentucky.
-        </p>
+        PHerc. 1667 becomes the first Herculaneum
+        scroll <a href="/firstscroll">read end to end</a>.
       </>
     ),
-  },
-  {
-    date: "2015 AD",
-    text: "Dr. Brent Seales pioneers virtual unwrapping.",
-    description: (
+    more: (
       <>
-        <p>
-          Using X-ray tomography and computer vision, a team led by Dr. Brent
-          Seales at the University of Kentucky reads the En-Gedi scroll without
-          opening it. Discovered in the Dead Sea region of Israel, the scroll
-          is found to contain text from the book of Leviticus.
-        </p>
-        <p>
-          Virtual unwrapping has since emerged as a growing field with multiple
-          successes. Their work went on to show the elusive carbon ink of the
-          Herculaneum scrolls can also be detected using X-ray tomography,
-          laying the foundation for Vesuvius Challenge.
-        </p>
-        <video
-          playsInline
-          loop
-          muted
-          preload="metadata"
-          title="Virtual unwrapping of the En-Gedi scroll"
-          aria-label="Virtual unwrapping of the En-Gedi scroll"
-          className="vc-media vc-story__media"
-          poster="/img/landing/engedi5.webp"
-          ref={unrollVideo}
-        >
-          <source src="/img/landing/engedi5.webm" type="video/webm" />
-        </video>
-        <p className="text-sm opacity-60 mt-2">
-          Virtual unwrapping of the En-Gedi scroll. © EduceLab/University of Kentucky.
-        </p>
+        Hundreds more remain sealed, and reading them needs unwrapping that is
+        faster and more automated. That's the{" "}
+        <a href="/prizes#2027-grand-prize">$1M Grand Prize</a>.
       </>
     ),
-  },
-  {
-    date: "2023 AD",
-    text: "A remarkable breakthrough.",
-    description: (
-      <>
-        <p>
-          Vesuvius Challenge launched in March 2023 with a Grand Prize for
-          the first team to recover four passages of 140 characters from a
-          Herculaneum scroll. Within a year,{" "}
-          <a href="/grandprize">the prize was claimed</a>. The quest was
-          just beginning.
-        </p>
-        <div className="vc-media vc-panorama">
-          <img
-            src="/img/landing/scroll-full-min.webp"
-            alt="Herculaneum scroll panorama"
-            loading="lazy"
-            decoding="async"
-          />
-        </div>
-      </>
+    media: (
+      <StoryVideo
+        sources={[
+          ["/img/firstscroll/hero-reveal.webm", "video/webm"],
+          ["/img/firstscroll/hero-reveal.mp4", "video/mp4"],
+        ]}
+        poster="/img/firstscroll/hero-poster.webp"
+        title="PHerc. 1667 being virtually unwrapped"
+      />
     ),
   },
 ];
 
-/* --------------------------------------------------------------------------
-   Small presentational pieces
--------------------------------------------------------------------------- */
-
-const Story = ({ story, index }) => (
-  <article
-    id={`story-section-${index}`}
-    className="vc-story"
-    aria-labelledby={story.anchor || `story-title-${index}`}
-  >
-    <p className="vc-kicker vc-story__kicker">{story.date}</p>
-    <Heading
-      as="h2"
-      id={story.anchor || `story-title-${index}`}
-      className="vc-story__title"
-    >
-      {story.text}
-    </Heading>
-    <div className="vc-story__body">{story.description}</div>
-  </article>
+const StoryCredit = () => (
+  <p className="vc-strip__credit">
+    © EduceLab/University of Kentucky
+  </p>
 );
 
-/* Open-prize board — data-driven from docs/34_prizes.md frontmatter via
-   plugins/prizes-data.js. Dense competition-platform rows: ember amount,
-   title + hook, cadence. Whole row links into /prizes. */
-const OpenPrizeRow = ({ prize }) => (
-  <a
-    href={prize.href}
-    className={`vc-open-row${prize.featured ? " vc-open-row--featured" : ""}`}
-  >
-    <span className="vc-open-row__amount vc-nums">
-      {usd.format(prize.amount)}
-      {prize.unit && (
-        <span className="vc-open-row__unit">{prize.unit}</span>
-      )}
-    </span>
-    <span className="vc-open-row__body">
-      <span className="vc-open-row__title">{prize.title}</span>
-      <span className="vc-open-row__hook">{prize.hook}</span>
-      {prize.tiers && (
-        <span className="vc-open-row__tiers" aria-label="Prize tiers">
-          {prize.tiers.map((tier) => (
-            <span className="vc-chip vc-open-row__tier" key={tier.name}>
-              {tier.name}{" "}
-              <span className="vc-nums vc-open-row__tier-amt">
-                {usd.format(tier.amount)}
-              </span>
-            </span>
-          ))}
-        </span>
-      )}
-    </span>
-    <span className="vc-open-row__meta">{prize.cadence}</span>
-  </a>
-);
-
-const OpenPrizeBoard = ({ prizes }) => {
-  if (!prizes.length) return null;
-  const total = prizes.reduce((sum, p) => sum + p.amount, 0);
+/* Timeline strip: dates ticked off the header rule, one shared text + media panel.
+   Opens on 79 AD so the eruption is the first thing shown. */
+const StoryStrip = () => {
+  const [active, setActive] = useState(0);
+  const beat = storyBeats[active];
   return (
-    <div className="vc-card vc-card--flush vc-open-board">
-      <div className="vc-open-board__head">
-        <span className="vc-label">Currently open</span>
-        <span className="vc-open-board__total vc-nums">
-          {usd.format(total)} prize pool
-        </span>
+    <div className="vc-strip">
+      <div className="vc-strip__dates" role="tablist" aria-label="Timeline">
+        {storyBeats.map((b, i) => (
+          <button
+            type="button"
+            role="tab"
+            aria-selected={i === active}
+            className={`vc-strip__date vc-nums${
+              i === active ? " is-active" : ""
+            }`}
+            onClick={() => setActive(i)}
+            key={b.date}
+          >
+            {b.date}
+          </button>
+        ))}
       </div>
-      {prizes.map((p) => (
-        <OpenPrizeRow prize={p} key={p.id || p.title} />
-      ))}
+      <div className="vc-strip__stage">
+        <button
+          type="button"
+          className="vc-strip__arrow"
+          aria-label="Previous"
+          disabled={active === 0}
+          onClick={() => setActive(active - 1)}
+        >
+          ‹
+        </button>
+        <div className="vc-strip__panel" role="tabpanel">
+          <div className="vc-strip__text">
+            <p className="vc-strip__line">{beat.line}</p>
+            <p className="vc-strip__more">{beat.more}</p>
+          </div>
+          <div className="vc-strip__media" key={beat.date}>
+            {beat.media}
+            {beat.credit && <StoryCredit />}
+          </div>
+        </div>
+        <button
+          type="button"
+          className="vc-strip__arrow"
+          aria-label="Next"
+          disabled={active === storyBeats.length - 1}
+          onClick={() => setActive(active + 1)}
+        >
+          ›
+        </button>
+      </div>
     </div>
   );
 };
 
 /* --------------------------------------------------------------------------
-   2027 Grand Prize sticker — $1,000,000 announcement, landing page only.
-   Advertises the TOTAL open prize pool (bigger number than any single
-   prize), computed from the prizes-page frontmatter; the whole card links
-   to /prizes. Enters after a small scroll (or a short delay on desktop,
-   where the bottom-center pill can't collide with the hero CTAs); steps
-   aside while the footer or the Open Prizes board is on screen; dismissible
-   with a 44px close button, persisted in localStorage (SSR-safe: window
-   access only inside effects). Toggle with SHOW_PRIZE_STICKER.
+   Small presentational pieces
 -------------------------------------------------------------------------- */
-const SHOW_PRIZE_STICKER = true;
-const PRIZE_STICKER_DISMISS_KEY = "vcPrizePoolDismissed";
-
-function PrizePoolSticker({ total }) {
-  const [shown, setShown] = useState(false);
-  const [dismissed, setDismissed] = useState(false);
-  const [yielding, setYielding] = useState(false);
-
-  useEffect(() => {
-    if (typeof window === "undefined") return undefined;
-    try {
-      if (window.localStorage.getItem(PRIZE_STICKER_DISMISS_KEY) === "1") {
-        setDismissed(true);
-        return undefined;
-      }
-    } catch (e) {
-      // Storage unavailable (privacy mode) — still show; dismissal just
-      // won't persist across visits.
-    }
-    let revealed = false;
-    let timer = null;
-    const onScroll = () => {
-      if (window.scrollY > 240) reveal();
-    };
-    const reveal = () => {
-      if (revealed) return;
-      revealed = true;
-      window.removeEventListener("scroll", onScroll);
-      if (timer) window.clearTimeout(timer);
-      setShown(true);
-    };
-    window.addEventListener("scroll", onScroll, { passive: true });
-    // Desktop-only delay fallback: on phones the sticker waits for a scroll
-    // so it can never pop over the hero CTAs at the bottom of the first view.
-    if (window.matchMedia("(min-width: 769px)").matches) {
-      timer = window.setTimeout(reveal, 3000);
-    }
-    onScroll(); // already scrolled (deep link / restored position)
-    return () => {
-      window.removeEventListener("scroll", onScroll);
-      if (timer) window.clearTimeout(timer);
-    };
-  }, []);
-
-  // Step aside while a footer is visible (links stay uncovered) or while
-  // the Open Prizes board is on screen (no point advertising the $1M row
-  // the visitor is already looking at — and on phones the bar would cover
-  // that very row).
-  useEffect(() => {
-    if (
-      typeof window === "undefined" ||
-      typeof IntersectionObserver === "undefined"
-    )
-      return undefined;
-    const watched = Array.from(document.querySelectorAll("footer")).concat(
-      Array.from(
-        document.querySelectorAll('section[aria-labelledby="open-prizes"]')
-      )
-    );
-    if (!watched.length) return undefined;
-    const onScreen = new Set();
-    const observer = new IntersectionObserver((entries) => {
-      entries.forEach((entry) => {
-        if (entry.isIntersecting) onScreen.add(entry.target);
-        else onScreen.delete(entry.target);
-      });
-      setYielding(onScreen.size > 0);
-    });
-    watched.forEach((el) => observer.observe(el));
-    return () => observer.disconnect();
-  }, []);
-
-  if (!SHOW_PRIZE_STICKER || dismissed) return null;
-  const interactive = shown && !yielding;
-  return (
-    <div
-      className={`vc-gp2027${shown ? " vc-gp2027--in" : ""}${
-        yielding ? " vc-gp2027--yield" : ""
-      }`}
-      role="complementary"
-      aria-label="Open prize pool announcement"
-      aria-hidden={!interactive}
-    >
-      <a
-        href="/prizes"
-        className="vc-gp2027__card"
-        tabIndex={interactive ? 0 : -1}
-      >
-        <span className="vc-label vc-gp2027__kicker">Open prize pool</span>
-        <span className="vc-gp2027__amount vc-nums">{usd.format(total)}</span>
-        <span className="vc-gp2027__hint">
-          From monthly awards to the $1,000,000 Grand Prize&nbsp;→
-        </span>
-      </a>
-      <button
-        type="button"
-        className="vc-gp2027__close"
-        aria-label="Dismiss the open prize pool announcement"
-        tabIndex={interactive ? 0 : -1}
-        onClick={() => {
-          setDismissed(true);
-          try {
-            window.localStorage.setItem(PRIZE_STICKER_DISMISS_KEY, "1");
-          } catch (e) {
-            // Best effort — session-only dismissal.
-          }
-        }}
-      >
-        ×
-      </button>
-    </div>
-  );
-}
 
 const SponsorAvatar = ({ sponsor }) => {
   if (!sponsor.image) {
@@ -411,40 +308,72 @@ const SponsorList = ({ list }) => {
       {!expanded && folded > 0 && (
         <button
           type="button"
-          className="vc-btn-outline vc-sponsors__more"
+          className="vc-team-tabs__tab vc-sponsors__more"
+          aria-expanded={false}
           onClick={() => setExpanded(true)}
         >
-          Show more ({folded})
+          Show more
+          <span className="vc-team-tabs__arrow" aria-hidden="true">
+            ▾
+          </span>
         </button>
       )}
     </>
   );
 };
 
-/* Team group — plain by default; `collapsible` folds advisor/alumni lists
-   behind an expander so the lower page stays short (content preserved). */
-const TeamGroup = ({ title, list, collapsible }) => {
-  const people = list.map((t, i) => <PersonLink link={t} key={i} />);
-  if (collapsible) {
-    return (
-      <details className="vc-team__group vc-collapse">
-        <summary className="vc-collapse__summary">
-          <span className="vc-collapse__heading">
-            <span className="vc-collapse__title vc-team__group-title">
-              {title}
-              <span className="vc-collapse__count"> ({list.length})</span>
-            </span>
-          </span>
-          <span className="vc-collapse__arrow" aria-hidden="true">▾</span>
-        </summary>
-        <div className="vc-collapse__body">{people}</div>
-      </details>
-    );
-  }
+const TeamGroup = ({ title, list }) => (
+  <div className="vc-team__group">
+    <h3>{title}</h3>
+    {list.map((t, i) => (
+      <PersonLink link={t} key={i} />
+    ))}
+  </div>
+);
+
+/* Secondary team lists as tabs: at most one open, its people flowing across
+   the full width below the tab row. All closed by default to keep the page
+   short; clicking the open tab closes it. */
+const TeamTabs = ({ groups }) => {
+  const [active, setActive] = useState(null);
   return (
-    <div className="vc-team__group">
-      <h3>{title}</h3>
-      {people}
+    <div className="vc-team-tabs">
+      <div
+        className={`vc-team-tabs__row${active !== null ? " has-open" : ""}`}
+        role="tablist"
+      >
+        {groups.map((g, i) => (
+          <button
+            type="button"
+            role="tab"
+            id={`team-tab-${i}`}
+            aria-selected={active === i}
+            aria-controls={`team-panel-${i}`}
+            className={`vc-team-tabs__tab${active === i ? " is-active" : ""}`}
+            onClick={() => setActive(active === i ? null : i)}
+            key={g.title}
+          >
+            {g.title}
+            <span className="vc-team-tabs__arrow" aria-hidden="true">
+              ▾
+            </span>
+          </button>
+        ))}
+      </div>
+      {groups.map((g, i) => (
+        <div
+          role="tabpanel"
+          id={`team-panel-${i}`}
+          aria-labelledby={`team-tab-${i}`}
+          className="vc-team-tabs__panel"
+          hidden={active !== i}
+          key={g.title}
+        >
+          {g.list.map((t, k) => (
+            <PersonLink link={t} key={k} />
+          ))}
+        </div>
+      ))}
     </div>
   );
 };
@@ -462,51 +391,50 @@ const PersonLink = ({ link }) => (
   </div>
 );
 
-const ChallengeBox = ({
+/* Open problem column: framed before/after slider, title, short pitch, then the
+   prizes that pay for solving it (amounts from docs/34_prizes.md
+   frontmatter). */
+const ProblemCard = ({
   title,
   titleHref,
+  beforeImage,
+  afterImage,
   children,
-  skills,
+  prizes,
   linkText,
   href,
-  media,
-  bounty,
 }) => (
-  <div className="vc-card vc-problem">
+  <div className="vc-problem">
+    <BeforeAfter
+      beforeImage={beforeImage}
+      afterImage={afterImage}
+      className="vc-problem__slider"
+      hint
+    />
     <div className="vc-problem__text">
-      <h3 className="vc-problem__title">
-        {titleHref ? (
-          <a
-            href={titleHref}
-            className="text-inherit hover:underline hover:text-inherit"
-          >
-            {title}
-          </a>
-        ) : (
-          title
-        )}
-      </h3>
-      <div className="vc-problem__body">{children}</div>
-      {skills && (
-        <div className="vc-chips" aria-label="Related skills">
-          {skills.map((skill) => (
-            <span className="vc-chip" key={skill}>
-              {skill}
-            </span>
+      <a href={titleHref} className="vc-problem__head">
+        <h3 className="vc-problem__title">{title}</h3>
+        <p className="vc-problem__body">{children}</p>
+      </a>
+      <div className="vc-problem__foot">
+        <div className="vc-problem__prizes">
+          {prizes.map((p) => (
+            <p className="vc-problem__line" key={p.id}>
+              <a href={p.href} className="vc-problem__prize">
+                Win the{" "}
+                <strong className="vc-nums">{usd.format(p.amount)}</strong>{" "}
+                {p.title}
+              </a>
+            </p>
           ))}
         </div>
-      )}
-      {bounty && (
-        <a href={bounty.href} className="vc-problem__bounty">
-          <span className="vc-label">Solve it, win</span>
-          <span className="vc-problem__bounty-text">{bounty.text}</span>
-        </a>
-      )}
-      <a href={href} className="vc-cta">
-        {linkText}
-      </a>
+        <p className="vc-problem__line">
+          <a href={href} className="vc-problem__link">
+            {linkText}
+          </a>
+        </p>
+      </div>
     </div>
-    <div className="vc-problem__media">{media}</div>
   </div>
 );
 
@@ -528,10 +456,6 @@ export function Landing() {
   const { siteConfig } = useDocusaurusContext();
   const canonicalUrl = `${siteConfig?.url ?? ""}${siteConfig?.baseUrl ?? "/"}`;
 
-  // EMBARGO FLAG — local preview only. Keep false in any online commit/deploy;
-  // flip to true on 2026-06-25 (Naples press conference) to launch publicly.
-  const SHOW_BREAKING = true;
-
   useBrokenLinks().collectAnchor("sponsors");
   useBrokenLinks().collectAnchor("partners");
   useBrokenLinks().collectAnchor("our-story");
@@ -552,9 +476,15 @@ export function Landing() {
     );
   }, []);
 
+  // The two "Led by" names swap order at random on each page load so
+  // neither is billed first. The server render keeps data order; the coin
+  // flip runs after mount to avoid a hydration mismatch.
+  const [leads, setLeads] = useState(projectLeads);
+  useEffect(() => {
+    if (Math.random() < 0.5) setLeads([...projectLeads].reverse());
+  }, []);
+
   const heroVideo = useRef(null);
-  const revealVideo = useRef(null);
-  const unrollVideo = useRef(null);
 
   useEffect(() => {
     if (typeof window === "undefined") return;
@@ -570,34 +500,9 @@ export function Landing() {
       v.load();
       autoPlay(heroVideo);
     };
-    // The reveal card's unrolling video: desktop-only (phones keep the 29 KB
-    // end-frame poster), data-saver-aware, plays ONCE and holds on its final
-    // frame — the fully-read scroll.
-    const rv = revealVideo.current;
-    const enableReveal = () => {
-      if (!rv) return;
-      if (!window.matchMedia("(min-width: 997px)").matches) return;
-      if (navigator.connection?.saveData) return;
-      const sources = rv.querySelectorAll("source[data-src]");
-      if (!sources.length || sources[0].src) return;
-      // Swap to the first-frame poster so playback is monotonic (rolled →
-      // unrolls once → holds); the end-frame poster stays for poster-only
-      // contexts (mobile, reduced-motion, data-saver).
-      rv.poster = "/img/firstscroll/hero-reveal-start-960.webp";
-      sources.forEach((s) => {
-        s.src = s.dataset.src;
-      });
-      rv.load();
-      autoPlay(revealVideo);
-    };
-    const enableAll = () => {
-      enableVideo();
-      enableReveal();
-    };
     if ("requestIdleCallback" in window)
-      window.requestIdleCallback(enableAll, { timeout: 1200 });
-    else setTimeout(enableAll, 600);
-    autoPlay(unrollVideo);
+      window.requestIdleCallback(enableVideo, { timeout: 1200 });
+    else setTimeout(enableVideo, 600);
   }, []);
 
   // Open prizes are sourced from docs/34_prizes.md frontmatter at build time
@@ -605,12 +510,9 @@ export function Landing() {
   const { prizes: openPrizes = [] } = usePluginData("prizes-data") || {};
   const { awardedTotal = 0 } = usePluginData("winners-data") || {};
   const { counts = {} } = usePluginData("atlas-data") || {};
-  const openPrizeTotal = openPrizes.reduce((sum, p) => sum + p.amount, 0);
   const openById = Object.fromEntries(openPrizes.map((p) => [p.id, p]));
   const grandPrize2027 = openById["grand-prize-2027"];
   const firstLetters = openById["first-letters-2027"];
-  const firstTitle = openById["first-title"];
-  const progressPrizes = openById["progress-prizes"];
 
   return (
     <>
@@ -628,14 +530,6 @@ export function Landing() {
           rel="preload"
           as="image"
           href="/img/landing/vesuvius.webp"
-          fetchpriority="high"
-        />
-        {/* Reveal-card poster (desktop hero right column) */}
-        <link
-          rel="preload"
-          as="image"
-          href="/img/firstscroll/hero-reveal-end-960.webp"
-          media="(min-width: 997px)"
           fetchpriority="high"
         />
         {/* OpenGraph/Twitter */}
@@ -700,13 +594,18 @@ export function Landing() {
             <div className="vc-hero__grid">
               <div className="vc-hero__main">
                 <Heading as="h1" id="home-hero-title" className="vc-hero__title">
-                  Resurrect an ancient library from the ashes of a volcano.
+                  Resurrecting an ancient library from the ashes of a volcano.
                 </Heading>
-                <p className="vc-hero__tagline">Win Prizes. Make History.</p>
+                <p className="vc-hero__tagline">
+                  Buried in 79 AD, now being revealed.
+                </p>
                 <p className="vc-hero__intro">
-                  Vesuvius Challenge is a machine learning, computer vision, and
-                  geometry competition that is <a href="/firstscroll">reading</a>{" "}
-                  the carbonized Herculaneum scrolls without opening them.
+                  Vesuvius Challenge is an open science research organization{" "}
+                  <a href="/firstscroll">reading</a> the carbonized Herculaneum
+                  scrolls without unrolling them. <strong>Anyone can help</strong>:
+                  we run a{" "}
+                  <a href="/prizes">$2M competition</a>, with prizes every
+                  month.
                 </p>
                 <div className="vc-hero__ctas">
                   <a className="vc-btn" href="/get_started">
@@ -748,317 +647,95 @@ export function Landing() {
                 )}
               </div>
             </div>
-
-            <div className="vc-stat-strip vc-hero__stats">
-                {openPrizes.length > 0 && (
-                  <a className="vc-stat vc-stat--link" href="#open-prizes">
-                    <span className="vc-stat__value">
-                      {usd.format(openPrizeTotal)}
-                    </span>
-                    <span className="vc-stat__label">open prize pool</span>
-                  </a>
-                )}
-                {awardedTotal > 0 && (
-                  <a className="vc-stat vc-stat--link" href="/winners">
-                    <span className="vc-stat__value">
-                      {usd.format(awardedTotal)}
-                    </span>
-                    <span className="vc-stat__label">already awarded</span>
-                  </a>
-                )}
-                <a className="vc-stat vc-stat--link" href="/data_browser">
-                  <span className="vc-stat__value">
-                    {(counts.scrolls ?? 35) + (counts.fragments ?? 10)}
-                  </span>
-                  <span className="vc-stat__label">scrolls &amp; fragments scanned</span>
-                </a>
-                <a className="vc-stat vc-stat--link" href="/data_browser">
-                  <span className="vc-stat__value">1</span>
-                  <span className="vc-stat__label">scroll fully read</span>
-                </a>
-              </div>
           </div>
         </section>
 
-        {/* News teasers (LatestPosts internals are compressed by WP2) */}
+        {/* News — latest Substack posts, text only */}
         <section
           className="vc-section vc-section--tight"
-          aria-label="Latest updates"
+          aria-labelledby="news"
         >
           <div className="container mx-auto">
-            <a
-              className="vc-updates__head"
-              href="https://scrollprize.substack.com"
-            >
-              News — from our Substack
-            </a>
-            <div className="vc-newsbar">
-              {/* The unwrap payoff: PHerc. 1667 unrolling into readable Greek.
-                  Poster = the video's final frame, so poster-only contexts
-                  (mobile, reduced-motion, data-saver) still get the reveal. */}
-              {SHOW_BREAKING && (
-                <a href="/firstscroll" className="vc-newsbar__feature">
-                  <video
-                    playsInline
-                    muted
-                    preload="none"
-                    title="PHerc. 1667 virtually unwrapping into readable Greek"
-                    poster="/img/firstscroll/hero-reveal-end-960.webp"
-                    className="vc-newsbar__media"
-                    ref={revealVideo}
-                  >
-                    <source
-                      data-src="/img/firstscroll/hero-reveal.webm"
-                      type="video/webm"
-                    />
-                    <source
-                      data-src="/img/firstscroll/hero-reveal.mp4"
-                      type="video/mp4"
-                    />
-                  </video>
-                  <span className="vc-newsbar__feature-title">
-                    We read an entire scroll&nbsp;→
-                  </span>
-                </a>
-              )}
-              <LatestPosts />
+            <div className="vc-h2-row vc-updates__row">
+              <Heading as="h2" id="news" className="vc-h2">
+                News
+              </Heading>
+              <a
+                href="https://scrollprize.substack.com"
+                className="vc-cta vc-h2-row__action"
+              >
+                More on Substack
+              </a>
             </div>
+            <LatestPosts />
           </div>
         </section>
 
         {/* ------------------------------------------------------------------
-            Open problems — two before/after sliders (Virtual Unwrapping,
-            Ink Detection) + "Targets" strip (the merged "What We're
-            Building Towards").
+            Open problems — one card per problem, each carrying the prizes
+            that pay for it; progress prizes and the full rules below.
         ------------------------------------------------------------------ */}
         <section className="vc-section" aria-labelledby="open-problems">
           <div className="container mx-auto">
-            <Heading as="h2" id="open-problems" className="vc-h2">
-              Open problems
-            </Heading>
+            <div className="vc-h2-row">
+              <Heading as="h2" id="open-problems" className="vc-h2">
+                Open problems &amp; prizes
+              </Heading>
+              <a href="/prizes" className="vc-cta vc-h2-row__action">
+                All prizes and rules
+              </a>
+            </div>
             <div className="vc-problems">
-              <ChallengeBox
+              <ProblemCard
                 title="Virtual Unwrapping"
                 titleHref="/2026_open_problems#2-unwrapping-turning-disconnected-voxels-into-a-surface"
-                linkText="Current Path"
+                beforeImage="/img/data/raw_pred.png"
+                afterImage="/img/data/patches.png"
+                prizes={[
+                  grandPrize2027 && { ...grandPrize2027, title: "Grand Prize" },
+                ].filter(Boolean)}
+                linkText="Learn about the current path"
                 href="/tutorial_spiral"
-                bounty={
-                  (grandPrize2027 || progressPrizes) && {
-                    href: (grandPrize2027 || progressPrizes).href,
-                    text: (
-                      <>
-                        {grandPrize2027 && (
-                          <>
-                            <strong className="vc-nums">
-                              {usd.format(grandPrize2027.amount)}
-                            </strong>{" "}
-                            {grandPrize2027.title}
-                          </>
-                        )}
-                        {grandPrize2027 && progressPrizes && " · "}
-                        {progressPrizes && (
-                          <>
-                            <strong className="vc-nums">
-                              {usd.format(progressPrizes.amount)}
-                            </strong>{" "}
-                            {progressPrizes.unit} in {progressPrizes.title}
-                          </>
-                        )}
-                        &nbsp;→
-                      </>
-                    ),
-                  }
-                }
-                skills={[
-                  "geometry processing",
-                  "3D computer vision",
-                  "optimization",
-                  "C++",
-                ]}
-                media={
-                  <BeforeAfter
-                    beforeImage="/img/data/raw_pred.png"
-                    afterImage="/img/data/patches.png"
-                  />
-                }
               >
-                <p>
-                  A CT scan yields voxels, not columns: the writing surface
-                  must be segmented, meshed, and flattened. The pipeline
-                  fails where adjacent sheets are densely packed, or tear.
-                  Tracing remains semi-automated. Fully automating it is an
-                  open problem.
-                </p>
-              </ChallengeBox>
+                We can trace a scroll's surface, but where sheets are crushed
+                or torn it still needs human help. Help us make it fully
+                automatic.
+              </ProblemCard>
 
-              <ChallengeBox
+              <ProblemCard
                 title="Ink Detection"
                 titleHref="/2026_open_problems#3-ink-recovery-reading-the-scrolls"
-                linkText="Find a Letter"
+                beforeImage="/img/ink/51002_crop/32.jpg"
+                afterImage="/img/ink/51002_crop/prediction.jpg"
+                prizes={[
+                  firstLetters && { ...firstLetters, title: "First Letters Prizes" },
+                ].filter(Boolean)}
+                linkText="Learn how to find a letter"
                 href="/tutorial5"
-                bounty={
-                  firstLetters &&
-                  firstTitle && {
-                    href: firstLetters.href,
-                    text: (
-                      <>
-                        <strong className="vc-nums">
-                          {usd.format(firstLetters.amount)}
-                        </strong>{" "}
-                        {firstLetters.title} ·{" "}
-                        <strong className="vc-nums">
-                          {usd.format(firstTitle.amount)}
-                        </strong>{" "}
-                        {firstTitle.title}&nbsp;→
-                      </>
-                    ),
-                  }
-                }
-                skills={[
-                  "machine learning",
-                  "computer vision",
-                  "domain generalization",
-                ]}
-                media={
-                  <BeforeAfter
-                    beforeImage="/img/ink/51002_crop/32.jpg"
-                    afterImage="/img/ink/51002_crop/prediction.jpg"
-                  />
-                }
               >
-                <p>
-                  Carbon ink is nearly indistinguishable from papyrus in
-                  X-ray CT. Models train on fragments with visible ink and
-                  infer it inside sealed scrolls; iterative pseudo-labeling
-                  bootstraps legibility. Ink has surfaced on 9 of the 45 scanned
-                  scrolls and fragments, not always legibly. Generalization is the open
-                  problem.
-                </p>
-              </ChallengeBox>
+                We can see ink in some scrolls, but models trained on one
+                rarely transfer to the next. Help us make them work on every
+                scroll.
+              </ProblemCard>
             </div>
           </div>
         </section>
 
         {/* ------------------------------------------------------------------
-            Open prizes — dense board fed by the prizes page frontmatter
-            (plugins/prizes-data.js). Sits directly above Open problems:
-            the money first, then the problems it pays for.
-        ------------------------------------------------------------------ */}
-        <section className="vc-section" aria-labelledby="open-prizes">
-          <div className="container mx-auto">
-            <Heading as="h2" id="open-prizes" className="vc-h2">
-              Open prizes
-            </Heading>
-            <OpenPrizeBoard prizes={openPrizes} />
-            <a href="/prizes" className="vc-cta">
-              Rules and details
-            </a>
-          </div>
-        </section>
-
-
-        {/* ------------------------------------------------------------------
-            Our story — five beats on one hairline timeline. The 2026 chapter
-            carries the open prizes (merged per audit §4).
+            Our story — 79 AD to 2026 on one timeline strip; the 2026 beat
+            links on to the open prizes.
         ------------------------------------------------------------------ */}
         <section className="vc-section" aria-labelledby="our-story">
           <div className="container mx-auto">
-            <Heading as="h2" id="our-story" className="vc-h2">
-              Our story
-            </Heading>
-            <div className="vc-timeline">
-              {(() => {
-                const allStories = stories({ unrollVideo });
-                const EARLY_COUNT = 3; // 79 AD, 1750, 2015 — the pre-Challenge backstory
-                const early = allStories.slice(0, EARLY_COUNT);
-                const recent = allStories.slice(EARLY_COUNT);
-                return (
-                  <>
-                    <details className="vc-collapse vc-story-history">
-                      <summary className="vc-collapse__summary">
-                        <span className="vc-collapse__heading">
-                          <span className="vc-collapse__title">
-                            The backstory
-                          </span>
-                          <span className="vc-collapse__hint">
-                            79 AD – 2015 AD · how we got here
-                          </span>
-                        </span>
-                        <span className="vc-collapse__arrow" aria-hidden="true">
-                          ▾
-                        </span>
-                      </summary>
-                      <div className="vc-collapse__body">
-                        {early.map((s, index) => (
-                          <Story story={s} key={s.date} index={index} />
-                        ))}
-                      </div>
-                    </details>
-                    {recent.map((s, index) => (
-                      <Story
-                        story={s}
-                        key={s.date}
-                        index={index + EARLY_COUNT}
-                      />
-                    ))}
-                  </>
-                );
-              })()}
-
-              <article
-                className="vc-story"
-                aria-labelledby="the-challenge-continues"
-              >
-                <p className="vc-kicker vc-story__kicker">2026 AD</p>
-                <Heading
-                  as="h2"
-                  id="the-challenge-continues"
-                  className="vc-story__title"
-                >
-                  The first scroll is read.
-                </Heading>
-                <div className="vc-story__body">
-                  <p>
-                    In 2026, <a href="/firstscroll">PHerc. 1667</a> became
-                    the first Herculaneum scroll to be virtually unwrapped and
-                    read end to end. The challenge now moves onto its next
-                    stage: reading multiple entire scrolls.
-                  </p>
-                  <div className="vc-media">
-                    <BeforeAfter
-                      beforeImage="/img/firstscroll/hero-reveal-start-960-crop.webp"
-                      afterImage="/img/firstscroll/hero-reveal-end-960-crop.webp"
-                      altBefore="PHerc. 1667 as a sealed CT scan, before virtual unwrapping"
-                      altAfter="The unwrapped writing surface of PHerc. 1667, showing columns of ancient Greek text"
-                      className="aspect-[20/7] h-auto"
-                    />
-                  </div>
-                  <a href="/prizes" className="vc-cta">
-                    See all open prizes
-                  </a>
-                </div>
-              </article>
-            </div>
-          </div>
-        </section>
-
-        {/* ------------------------------------------------------------------
-            Sponsors — every donor in one list, smaller gifts behind "Show more".
-        ------------------------------------------------------------------ */}
-        <section className="vc-section" aria-labelledby="sponsors">
-          <div className="container mx-auto">
             <div className="vc-h2-row">
-              <Heading as="h2" id="sponsors" className="vc-h2">
-                Sponsors
+              <Heading as="h2" id="our-story" className="vc-h2">
+                Our story
               </Heading>
-              <a
-                href="https://donate.stripe.com/aEUg101vt9eN8gM144"
-                className="vc-btn-outline vc-h2-row__action"
-              >
-                Donate
+              <a href="/winners" className="vc-cta vc-h2-row__action">
+                All milestones
               </a>
             </div>
-            <SponsorList list={[...sponsors].sort(sponsorOrder)} />
+            <StoryStrip />
           </div>
         </section>
 
@@ -1073,6 +750,17 @@ export function Landing() {
             </Heading>
             <div className="vc-credits">
               <div className="vc-credits__group">
+                <p className="vc-label vc-credits__label">Led by</p>
+                {leads.map((l) => (
+                  <div className="vc-person" key={l.name}>
+                    <a href={l.href} className="vc-person__name">
+                      {l.name}
+                    </a>
+                    <span className="vc-person__role">{l.title}</span>
+                  </div>
+                ))}
+              </div>
+              <div className="vc-credits__group">
                 <p className="vc-label vc-credits__label">Created by</p>
                 {creators.map((c) => (
                   <div className="vc-person" key={c.name}>
@@ -1085,32 +773,41 @@ export function Landing() {
                   </div>
                 ))}
               </div>
-              <div className="vc-credits__group">
-                <p className="vc-label vc-credits__label">Led by</p>
-                <div className="vc-person">
-                  <a href={projectLead.href} className="vc-person__name">
-                    {projectLead.name}
-                  </a>
-                  <span className="vc-person__role">{projectLead.title}</span>
-                </div>
-              </div>
             </div>
             <div className="vc-team">
-              <TeamGroup title="Tech Team" list={team.challenge} />
+              <TeamGroup title="Technical Team" list={team.challenge} />
               <TeamGroup title="Papyrology Team" list={team.papyrology} />
               <TeamGroup title="Annotation Team" list={team.annotation} />
-              <TeamGroup
-                title="EduceLab Team (Partners)"
-                list={team.educe}
-                collapsible
-              />
-              <TeamGroup title="Advisors & Alumni" list={team.alumni} collapsible />
-              <TeamGroup
-                title="Papyrology Advisors"
-                list={team.papyrologyAdvisors}
-                collapsible
-              />
             </div>
+            {/* Secondary lists as tabs below the columns; the open one spans
+                the full width. */}
+            <TeamTabs
+              groups={[
+                { title: "Advisors & Alumni", list: team.alumni },
+                { title: "Papyrology Advisors", list: team.papyrologyAdvisors },
+                { title: "EduceLab Team (Partners)", list: team.educe },
+              ]}
+            />
+          </div>
+        </section>
+
+        {/* ------------------------------------------------------------------
+            Sponsors — every donor in one list, smaller gifts behind "Show more".
+        ------------------------------------------------------------------ */}
+        <section className="vc-section" aria-labelledby="sponsors">
+          <div className="container mx-auto">
+            <div className="vc-h2-row">
+              <Heading as="h2" id="sponsors" className="vc-h2">
+                Sponsors
+              </Heading>
+              <a
+                href="https://donate.stripe.com/aEUg101vt9eN8gM144"
+                className="vc-cta vc-h2-row__action"
+              >
+                Make a donation
+              </a>
+            </div>
+            <SponsorList list={[...sponsors].sort(sponsorOrder)} />
           </div>
         </section>
 
@@ -1142,9 +839,6 @@ export function Landing() {
             </div>
           </div>
         </section>
-
-        {/* $1,000,000 · 2027 Grand Prize floating teaser (landing only). */}
-        <PrizePoolSticker total={openPrizeTotal} />
       </div>
     </>
   );

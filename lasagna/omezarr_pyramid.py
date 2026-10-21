@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 
 import numpy as np
+import numcodecs
 from threadpoolctl import threadpool_limits
 import zarr
 
@@ -22,6 +23,7 @@ _NATIVE_THREAD_ENV = (
 	"BLIS_NUM_THREADS",
 	"VECLIB_MAXIMUM_THREADS",
 	"NUMEXPR_NUM_THREADS",
+	"BLOSC_NTHREADS",
 )
 _PYRAMID_WORKER_THREAD_LIMIT = None
 
@@ -31,10 +33,22 @@ def _set_native_thread_env_one() -> None:
 		os.environ[name] = "1"
 
 
+def _limit_zarr_codec_threads() -> None:
+	"""Prevent each process from creating its own wide Zarr/codec thread pools."""
+	config = getattr(zarr, "config", None)
+	if config is not None:
+		config.set({"async.concurrency": 1, "threading.max_workers": 1})
+	try:
+		numcodecs.blosc.set_nthreads(1)
+	except (AttributeError, RuntimeError):
+		pass
+
+
 def _pyramid_worker_init() -> None:
 	"""Keep native numerical runtimes single-threaded for this worker's life."""
 	global _PYRAMID_WORKER_THREAD_LIMIT
 	_set_native_thread_env_one()
+	_limit_zarr_codec_threads()
 	_PYRAMID_WORKER_THREAD_LIMIT = threadpool_limits(limits=1)
 
 

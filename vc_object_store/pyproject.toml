@@ -1,0 +1,20 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.10.2"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "vc-object-store"
+version = "0.1.0"
+description = "Revisioned geometry, metadata, and relationship storage"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = ["numpy"]
+license = {text = "MIT"}
+
+[tool.scikit-build]
+cmake.version = ">=3.22"
+wheel.packages = []
+
+[tool.scikit-build.cmake.define]
+VC_OBJECT_STORE_BUILD_PYTHON = "ON"
+VC_OBJECT_STORE_BUILD_TOOLS = "OFF"

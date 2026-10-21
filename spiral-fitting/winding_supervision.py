@@ -18,6 +18,10 @@ from sample_spiral import get_theta_and_radii, unwrap_shifted_radii
 ARTIFACT_TYPE = "winding_inference_crossings"
 FORMAT_VERSION = 1
 
+# A ray whose distance from the umbilicus falls by more than half of its
+# crossing span, between its first and last crossing, runs inward overall.
+INWARD_RAY_TREND = -0.5
+
 
 def _canonical_digest(value) -> str:
     encoded = json.dumps(
@@ -46,10 +50,51 @@ def _load_array(root: Path, description: dict, *, verify: bool) -> np.ndarray:
     return value
 
 
-class WindingInferenceStore:
-    """Flat ragged crossing rays copied once to the fitting device."""
+def ray_orientation(origin, step, crossing_t, offset, z_to_umbilicus_yx):
+    """Per-ray sign that turns crossing levels into outward winding steps.
 
-    def __init__(self, path, device, *, verify=True, z_range=None):
+    The winding model's phase increases along the ray axis by construction
+    (winding_targets canonicalizes it), so crossing_level counts sheet
+    passages along +t whichever way the ray points. The exporter orients
+    each ray toward winding w+1 at its seed, but that orientation is
+    sometimes wrong: the ray then runs toward the umbilicus, its levels
+    count up while the true winding counts down, and every pair on it has a
+    target of the wrong sign. Such rays are recognised by their radius
+    falling over the whole crossing span, and get -1; all others keep +1.
+    """
+    origin = np.asarray(origin, dtype=np.float64)
+    step = np.asarray(step, dtype=np.float64)
+    crossing_t = np.asarray(crossing_t, dtype=np.float64)
+    offset = np.asarray(offset, dtype=np.int64)
+    sign = np.ones(len(origin), dtype=np.float32)
+    first = offset[:-1]
+    last = offset[1:] - 1
+    rays = np.flatnonzero(last > first)
+    if not len(rays):
+        return sign
+
+    def radius(t):
+        points = origin[rays] + t[:, None] * step[rays]
+        centre = np.asarray(z_to_umbilicus_yx(points[:, 0]), dtype=np.float64)
+        return np.linalg.norm(points[:, 1:] - centre, axis=-1)
+
+    t_first = crossing_t[first[rays]]
+    t_last = crossing_t[last[rays]]
+    span = (t_last - t_first) * np.linalg.norm(step[rays], axis=-1)
+    trend = (radius(t_last) - radius(t_first)) / np.maximum(span, 1e-9)
+    sign[rays[trend < INWARD_RAY_TREND]] = -1.0
+    return sign
+
+
+class WindingInferenceStore:
+    """Flat ragged crossing rays copied once to the fitting device.
+
+    With ``z_to_umbilicus_yx`` each ray is oriented once at load (see
+    ray_orientation), so pair targets are signed outward winding differences.
+    """
+
+    def __init__(self, path, device, *, verify=True, z_range=None,
+                 z_to_umbilicus_yx=None):
         self.path = str(Path(path).resolve())
         root = Path(self.path)
         manifest_path = root / "manifest.json"
@@ -118,8 +163,16 @@ class WindingInferenceStore:
         if int(offset_np[-1]) != len(t_np) or len(t_np) != len(level_np):
             raise ValueError("winding-inference crossing arrays disagree")
 
+        if z_to_umbilicus_yx is not None:
+            orientation_np = ray_orientation(
+                origin_np, step_np, t_np, offset_np, z_to_umbilicus_yx)
+        else:
+            orientation_np = np.ones(len(origin_np), dtype=np.float32)
+        self.num_inward_rays = int((orientation_np < 0).sum())
+
         device = torch.device(device)
         self.origin = torch.from_numpy(origin_np).to(device)
+        self.orientation = torch.from_numpy(orientation_np).to(device)
         self.step = torch.from_numpy(step_np).to(device)
         self.offset = torch.from_numpy(offset_np).to(device)
         self.crossing_t = torch.from_numpy(t_np).to(device)
@@ -224,12 +277,15 @@ class WindingInferenceStore:
         levels = self.crossing_level[flat]
         return {
             "points": points,
-            "target": (levels[:, 1] - levels[:, 0]).to(torch.float32),
+            "target": (levels[:, 1] - levels[:, 0]).to(torch.float32)
+            * self.orientation[ray],
         }
 
 
-def load_winding_inference_store(path, device, *, verify=True, z_range=None):
-    return WindingInferenceStore(path, device, verify=verify, z_range=z_range)
+def load_winding_inference_store(path, device, *, verify=True, z_range=None,
+                                 z_to_umbilicus_yx=None):
+    return WindingInferenceStore(path, device, verify=verify, z_range=z_range,
+                                 z_to_umbilicus_yx=z_to_umbilicus_yx)
 
 
 def _component_residual(
@@ -250,7 +306,7 @@ def _component_residual(
         & (sample_pairs[..., 0] < float(z_end))
         & torch.isfinite(sample_pairs).all(dim=-1)
         & torch.isfinite(spiral_pairs).all(dim=-1)
-    ).all(dim=-1) & torch.isfinite(predicted) & (target > 0) & shell_pair_valid
+    ).all(dim=-1) & torch.isfinite(predicted) & (target != 0) & shell_pair_valid
     return predicted - target, valid
 
 

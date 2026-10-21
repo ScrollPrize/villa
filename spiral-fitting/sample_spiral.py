@@ -2,9 +2,14 @@ import numpy as np
 import torch
 
 import geom_utils
+from devices import fit_device, float_hi
 
 
-def get_spiral_yxs(num_windings, dr_per_winding, inter_point_spacing, group_by_winding=False, device='cuda'):
+def get_spiral_yxs(num_windings, dr_per_winding, inter_point_spacing, group_by_winding=False, device=None):
+
+    # The device defaults to the fit device: CUDA when it is available, as before.
+    if device is None:
+        device = fit_device()
 
     # Note this is not differentiable wrt dr_per_winding nor inter_point_spacing!
 
@@ -15,18 +20,22 @@ def get_spiral_yxs(num_windings, dr_per_winding, inter_point_spacing, group_by_w
     # ...so should have (K + 0.5) * dr_per_winding * 2 * pi / inter_point_spacing steps
     # can construct these thetas directly, then r's via formula
 
+    # The angles are built in float_hi (float64 except on MPS or under FIT_SPIRAL_MAX_PRECISION_FLOAT=32):
+    # in float32 the winding offset k * 2 * pi takes the mantissa, and at winding 250 sin and cos times a
+    # radius of 4000 voxels move a node by up to half a voxel. Only the positions are cast back to the default dtype.
     thetas = [
         winding_idx * 2 * torch.pi + torch.arange(
             0, 2 * np.pi,
             step=inter_point_spacing / (winding_idx + 0.5) / float(dr_per_winding),
-            device=device
+            device=device, dtype=float_hi(device),
         )
         for winding_idx in range(num_windings)
     ]
     radii = [dr_per_winding * thetas_for_winding / (2 * torch.pi) for thetas_for_winding in thetas]
 
     yxs = [
-        torch.stack([torch.sin(thetas_for_winding), torch.cos(thetas_for_winding)], dim=-1) * radii_for_winding[:, None]
+        (torch.stack([torch.sin(thetas_for_winding), torch.cos(thetas_for_winding)], dim=-1)
+         * radii_for_winding[:, None]).to(torch.get_default_dtype())
         for thetas_for_winding, radii_for_winding in zip(thetas, radii)
     ]
 

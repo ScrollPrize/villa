@@ -1,6 +1,9 @@
 #pragma once
 
+#include <QSettings>
 #include <QString>
+
+#include <algorithm>
 
 #include <filesystem>
 
@@ -298,6 +301,28 @@ namespace line_annotation {
     constexpr int INITIAL_CENTERLINE_LENGTH_VX_DEFAULT = 2400;
     constexpr auto EXTRAPOLATION_DISTANCE_VX = "lineAnnotation/extrapolation_distance_vx";
     constexpr int EXTRAPOLATION_DISTANCE_VX_DEFAULT = 1200;
+    // Length of the straight ray generated past a lone break point or a
+    // kollesis termination instead of the mode's extrapolation (base voxels).
+    // The dialog row and every non-dialog reader clamp to [MIN, MAX].
+    constexpr auto BREAK_EXTRAPOLATION_DISTANCE_VX = "lineAnnotation/break_extrapolation_distance_vx";
+    constexpr int BREAK_EXTRAPOLATION_DISTANCE_VX_DEFAULT = 400;
+    constexpr int BREAK_EXTRAPOLATION_DISTANCE_VX_MIN = 100;
+    constexpr int BREAK_EXTRAPOLATION_DISTANCE_VX_MAX = 1000000;
+    constexpr int clampBreakExtrapolationDistanceVx(int value) noexcept
+    {
+        return std::clamp(value, BREAK_EXTRAPOLATION_DISTANCE_VX_MIN,
+                          BREAK_EXTRAPOLATION_DISTANCE_VX_MAX);
+    }
+    // The persisted value, clamped; the default when the key is absent or
+    // not an integer. `settings` must be the VC3D ini store
+    // (QSettings(settingsFilePath(), QSettings::IniFormat)).
+    inline int breakExtrapolationDistanceVx(const QSettings& settings)
+    {
+        bool ok = false;
+        const int value = settings.value(BREAK_EXTRAPOLATION_DISTANCE_VX,
+                                         BREAK_EXTRAPOLATION_DISTANCE_VX_DEFAULT).toInt(&ok);
+        return clampBreakExtrapolationDistanceVx(ok ? value : BREAK_EXTRAPOLATION_DISTANCE_VX_DEFAULT);
+    }
     // Maximum base-voxel polyline arclength for control-point extrapolation.
     // Keep the existing persisted key for settings compatibility.
     constexpr auto MAX_CONTROL_POINT_DISTANCE_VX = "lineAnnotation/max_control_point_distance_vx";
@@ -320,6 +345,17 @@ namespace line_annotation {
     constexpr auto CURRENT_CUT_ZOOM = "lineAnnotation/current_cut_zoom";
     constexpr auto SIDE_CUT_ZOOM = "lineAnnotation/side_cut_zoom";
     constexpr auto STRIP_ZOOMS = "lineAnnotation/strip_zooms";
+    // Fiber model backend: the neural fiber-follow model (a vesuvius
+    // checkpoint, served by FiberFollowService) instead of the native
+    // prediction-field tracer, for open-tail extrapolation and Trace spans.
+    constexpr auto FIBER_FOLLOW_ENABLED = "lineAnnotation/fiber_follow_enabled";
+    constexpr bool FIBER_FOLLOW_ENABLED_DEFAULT = false;
+    constexpr auto FIBER_FOLLOW_CONFIDENCE = "lineAnnotation/fiber_follow_confidence";
+    constexpr double FIBER_FOLLOW_CONFIDENCE_DEFAULT = 0.5;
+    // Empty: the service's default Hugging Face model; otherwise a local checkpoint override.
+    constexpr auto FIBER_FOLLOW_CHECKPOINT = "lineAnnotation/fiber_follow_checkpoint";
+    // Empty: the Python environment VC3D was started from.
+    constexpr auto FIBER_FOLLOW_PYTHON = "lineAnnotation/fiber_follow_python";
 }
 
 // -----------------------------------------------------------------------------

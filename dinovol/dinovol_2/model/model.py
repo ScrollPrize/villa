@@ -16,20 +16,31 @@ import torch.nn.functional as F
 from torch import nn
 from torch.nn.init import trunc_normal_
 from torch.nn.utils.parametrizations import weight_norm
+from torch.utils.checkpoint import checkpoint
 
 from dinovol_2.model.dinov2_eva import Eva, EvaWithChunking
+from dinovol_2.ops.point_embeddings import sample_grid_points
 from dinovol_2.model.rope import MixedRopePositionEmbedding, RopePositionEmbedding
 
 
 _BACKBONE_DEFAULTS = {
+    "attention_type": "full",
+    "attention_backend": None,
     "input_channels": 1,
     "global_crops_size": (256, 256, 256),
     "local_crops_size": None,
     "embed_dim": 864,
     "patch_size": (16, 16, 16),
     "embedding_type": "default",
-    "deeper_embed_patch_chunk_size": None,
     "deeper_embed_batch_chunk_size": 1,
+    "deeper_embed_stage_channels": None,
+    "deeper_embed_stage_strides": None,
+    "deeper_embed_stem_channels": None,
+    "deeper_embed_stem_type": None,
+    "deeper_embed_depth_per_level": None,
+    "deeper_embed_use_stem": True,
+    "deeper_embed_final_projection": True,
+    "deeper_embed_channels_last": False,
     "depth": 24,
     "num_heads": 16,
     "qkv_bias": True,
@@ -46,19 +57,30 @@ _BACKBONE_DEFAULTS = {
     "use_abs_pos_emb": False,
     "use_rot_pos_emb": True,
     "num_reg_tokens": 4,
+    "untie_cls_and_patch_norms": False,
+    "untie_global_and_local_cls_norm": False,
     "grad_checkpointing": False,
     "block_chunks": 0,
 }
 
 _BACKBONE_DEFAULTS_V2 = {
+    "attention_type": "full",
+    "attention_backend": None,
     "input_channels": 1,
     "global_crops_size": (256, 256, 256),
     "local_crops_size": None,
     "embed_dim": 864,
     "patch_size": (16, 16, 16),
     "embedding_type": "default",
-    "deeper_embed_patch_chunk_size": None,
     "deeper_embed_batch_chunk_size": 1,
+    "deeper_embed_stage_channels": None,
+    "deeper_embed_stage_strides": None,
+    "deeper_embed_stem_channels": None,
+    "deeper_embed_stem_type": None,
+    "deeper_embed_depth_per_level": None,
+    "deeper_embed_use_stem": True,
+    "deeper_embed_final_projection": True,
+    "deeper_embed_channels_last": False,
     "depth": 24,
     "num_heads": 16,
     "qkv_bias": True,
@@ -75,8 +97,19 @@ _BACKBONE_DEFAULTS_V2 = {
     "use_abs_pos_emb": False,
     "use_rot_pos_emb": True,
     "num_reg_tokens": 4,
+    "untie_cls_and_patch_norms": False,
+    "untie_global_and_local_cls_norm": False,
     "grad_checkpointing": False,
     "block_chunks": 0,
+}
+
+_BACKBONE_DEFAULTS_V3 = {
+    **_BACKBONE_DEFAULTS_V2,
+    "qkv_bias": False,
+    # Effective SwiGLU width: DINOv3's ffn_ratio=3 includes a 2/3 adjustment.
+    "mlp_ratio": 2.0,
+    "scale_mlp": False,
+    "untie_global_and_local_cls_norm": True,
 }
 
 _ROPE_KWARG_CONFIG_KEYS = {
@@ -139,6 +172,8 @@ _HEAD_OUT_DIM_DEFAULTS = {
 
 def _resolve_backbone_defaults(config: Mapping[str, Any]) -> Mapping[str, Any]:
     model_type = config.get("model_type")
+    if isinstance(model_type, str) and model_type.strip().lower() == "v3":
+        return _BACKBONE_DEFAULTS_V3
     if isinstance(model_type, str) and model_type.strip().lower() == "v2":
         return _BACKBONE_DEFAULTS_V2
     return _BACKBONE_DEFAULTS
@@ -226,6 +261,8 @@ def _resolve_rope_impl(
 
 
 def _materialize_backbone_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    if config.get("deeper_embed_patch_chunk_size") is not None:
+        raise ValueError("Spatial CNN chunking is no longer supported; use deeper_embed_batch_chunk_size instead.")
     backbone_defaults = _resolve_backbone_defaults(config)
     backbone_config = {key: config.get(key, default) for key, default in backbone_defaults.items()}
     if "num_reg_tokens" not in config and "num_register_tokens" in config:
@@ -364,11 +401,135 @@ class DINOHead(nn.Module):
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, apply_last_layer: bool = True) -> torch.Tensor:
         x = self.mlp(x)
         eps = 1e-6 if x.dtype == torch.float16 else 1e-12
         x = F.normalize(x, dim=-1, p=2, eps=eps)
+        if not apply_last_layer:
+            return x
         return self.last_layer(x)
+
+
+class PointDenseHead(nn.Module):
+    """Per-point embedding via a 3D top-down FPN refinement neck and factored linear readouts.
+
+    Coarse ViT patch tokens are progressively upsampled in 3D and fused with CNN skip
+    feature maps using 3x3x3 residual convolutions so high-level semantics spatially gate
+    fine local boundaries before point interpolation. A shared trunk feature h(x) then
+    projects into two separate linear readouts:
+      - `dense`: object instance subspace (sheets and fibers, within-crop)
+      - `ink`: semantic ink subspace (cross-view and cross-batch)
+    """
+
+    def __init__(
+        self,
+        token_dim: int,
+        skip_channels: Tuple[int, ...],
+        hidden_dim: int = 256,
+        out_dim: int = 64,
+        ink_dim: int = 32,
+        fpn_dim: Optional[int] = None,
+    ):
+        super().__init__()
+        self.token_dim = int(token_dim)
+        self.skip_channels = tuple(int(channels) for channels in skip_channels)
+        self.hidden_dim = int(hidden_dim)
+        self.out_dim = int(out_dim)
+        self.ink_dim = int(ink_dim)
+        resolved_fpn_dim = int(fpn_dim) if fpn_dim is not None else max(16, min(64, self.hidden_dim // 4))
+        self.fpn_dim = resolved_fpn_dim
+
+        # Top-down 3D FPN over the 16^3 -> 32^3 CNN skip grids so 128^3 and 64^3 grids
+        # are only indexed by sample_grid_points and freed before iBOT backward.
+        fpn_skips = self.skip_channels[2:] if len(self.skip_channels) > 2 else self.skip_channels[1:]
+        if not fpn_skips:
+            fpn_skips = self.skip_channels
+        self._fpn_skip_start = max(0, len(self.skip_channels) - len(fpn_skips))
+        self.fpn_in = nn.Conv3d(self.token_dim, self.fpn_dim, kernel_size=1)
+        self.fpn_laterals = nn.ModuleList(
+            nn.Conv3d(ch, self.fpn_dim, kernel_size=1) for ch in reversed(fpn_skips)
+        )
+        self.fpn_refines = nn.ModuleList(
+            nn.Sequential(
+                nn.Conv3d(self.fpn_dim, self.fpn_dim, kernel_size=3, padding=1, groups=max(1, self.fpn_dim // 8)),
+                nn.GELU(),
+                nn.Conv3d(self.fpn_dim, self.fpn_dim, kernel_size=1),
+            )
+            for _ in fpn_skips
+        )
+        self.fpn_norm = nn.LayerNorm(self.fpn_dim)
+
+        # Point-sampled CNN skips + token + refined 3D FPN feature -> shared trunk h(x).
+        self.skip_norms = nn.ModuleList(nn.LayerNorm(channels) for channels in self.skip_channels)
+        in_features = self.token_dim + sum(self.skip_channels) + self.fpn_dim
+        self.mlp = nn.Sequential(
+            nn.Linear(in_features, self.hidden_dim),
+            nn.GELU(),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
+            nn.GELU(),
+        )
+        self.token_shortcut = nn.Linear(self.token_dim, self.hidden_dim)
+        self.trunk_norm = nn.LayerNorm(self.hidden_dim)
+
+        # Separate linear readouts so sheet identity and ink presence never collide.
+        self.obj_proj = nn.Linear(self.hidden_dim, self.out_dim)
+        self.ink_proj = nn.Linear(self.hidden_dim, self.ink_dim)
+
+    def _sample_fpn_points(
+        self,
+        token_grid: torch.Tensor,
+        skips: list[torch.Tensor],
+        point_coordinates: torch.Tensor,
+        input_shape: Tuple[int, ...],
+    ) -> torch.Tensor:
+        """Run top-down 3D FPN refinement and sample the target point coordinates (no checkpointing)."""
+        dtype = token_grid.dtype
+        coarser_skips = skips[self._fpn_skip_start:]
+        x = self.fpn_in(token_grid.permute(0, 4, 1, 2, 3).contiguous())
+        for skip, lateral, refine in zip(reversed(coarser_skips), self.fpn_laterals, self.fpn_refines):
+            target_size = skip.shape[2:]
+            if x.shape[2:] != target_size:
+                x = F.interpolate(x, size=target_size, mode="trilinear", align_corners=False)
+            x = x + lateral(skip.to(dtype))
+            x = x + refine(x)
+        fpn_grid = x.permute(0, 2, 3, 4, 1).contiguous()
+        return sample_grid_points(fpn_grid, point_coordinates, input_shape).to(dtype)
+
+    def forward_points(
+        self,
+        token_grid: torch.Tensor,
+        skips: list[torch.Tensor],
+        point_coordinates: torch.Tensor,
+        input_shape: Tuple[int, ...],
+    ) -> dict[str, torch.Tensor]:
+        dtype = token_grid.dtype
+        tokens = sample_grid_points(token_grid, point_coordinates, input_shape)
+        fpn_pts = self.fpn_norm(self._sample_fpn_points(token_grid, skips, point_coordinates, input_shape))
+        skip_parts = [
+            norm(sample_grid_points(level.permute(0, 2, 3, 4, 1), point_coordinates, input_shape).to(dtype))
+            for norm, level in zip(self.skip_norms, skips)
+        ]
+        tokens_cast = tokens.to(dtype)
+        trunk = self.trunk_norm(
+            self.mlp(torch.cat([tokens_cast, *skip_parts, fpn_pts], dim=-1)) + self.token_shortcut(tokens_cast)
+        )
+        return {
+            "dense": F.normalize(self.obj_proj(trunk).float(), dim=-1),
+            "ink": F.normalize(self.ink_proj(trunk).float(), dim=-1),
+            "tokens": tokens,
+        }
+
+    def forward(self, tokens: torch.Tensor, skips: torch.Tensor) -> torch.Tensor:
+        """Fallback point-only forward when pre-sampled tokens and skip features are passed."""
+        dtype = tokens.dtype
+        parts = [tokens] + [
+            norm(level) for norm, level in zip(self.skip_norms, skips.split(self.skip_channels, dim=-1))
+        ]
+        zeros_fpn = tokens.new_zeros(*tokens.shape[:-1], self.fpn_dim)
+        trunk = self.trunk_norm(
+            self.mlp(torch.cat([*parts, zeros_fpn], dim=-1)) + self.token_shortcut(tokens.to(dtype))
+        )
+        return F.normalize(self.obj_proj(trunk).float(), dim=-1)
 
 
 class DinoVitStudentTeacher(nn.Module):
@@ -378,6 +539,11 @@ class DinoVitStudentTeacher(nn.Module):
         super().__init__()
         self.config = dict(config)
         student_backbone = self._build_backbone(self.config)
+        # dense_head: point heads for the object losses (see pretrain.object_losses).
+        self.dense_config = dict(self.config.get("dense_head") or {})
+        self.dense_enabled = bool(self.dense_config.get("enabled", False))
+        if self.dense_enabled:
+            student_backbone.return_embed_skips = True
         teacher_backbone = deepcopy(student_backbone)
 
         student_modules = {
@@ -390,6 +556,9 @@ class DinoVitStudentTeacher(nn.Module):
             "dino_head": self._build_head("dino"),
             "ibot_head": self._build_head("ibot", fallback_prefix="dino"),
         }
+        if self.dense_enabled:
+            for modules in (student_modules, teacher_modules):
+                modules.update(self._build_dense_heads(student_backbone))
 
         self.student = nn.ModuleDict(student_modules)
         self.teacher = nn.ModuleDict(teacher_modules)
@@ -458,6 +627,28 @@ class DinoVitStudentTeacher(nn.Module):
             out_dim=int(out_dim),
             **kwargs,
         )
+
+    def _build_dense_heads(self, backbone: nn.Module) -> dict[str, nn.Module]:
+        token_dim = int(backbone.embed_dim)
+        hidden_dim = int(self.dense_config.get("hidden_dim", 256))
+        out_dim = int(self.dense_config.get("out_dim", 64))
+        ink_dim = int(self.dense_config.get("ink_dim", min(32, out_dim)))
+        fpn_dim = self.dense_config.get("fpn_dim")
+        return {
+            "dense_head": PointDenseHead(
+                token_dim,
+                backbone.down_projection.skip_channels,
+                hidden_dim=hidden_dim,
+                out_dim=out_dim,
+                ink_dim=ink_dim,
+                fpn_dim=int(fpn_dim) if fpn_dim is not None else None,
+            ),
+            "region_head": nn.Sequential(
+                nn.Linear(token_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, int(self.dense_config.get("region_dim", 128))),
+            ),
+        }
 
     def _freeze_teacher(self) -> None:
         for parameter in self.teacher.parameters():
@@ -547,8 +738,10 @@ class DinoVitStudentTeacher(nn.Module):
     def update_teacher(self, momentum: float) -> None:
         if not 0.0 <= momentum <= 1.0:
             raise ValueError(f"EMA momentum must be in [0, 1], got {momentum}")
-        for student_param, teacher_param in zip(self.student.parameters(), self.teacher.parameters()):
-            teacher_param.data.mul_(momentum).add_(student_param.data, alpha=1.0 - momentum)
+        teacher_params = [parameter.data for parameter in self.teacher.parameters()]
+        student_params = [parameter.data for parameter in self.student.parameters()]
+        torch._foreach_mul_(teacher_params, momentum)
+        torch._foreach_add_(teacher_params, student_params, alpha=1.0 - momentum)
 
     @staticmethod
     def _apply_head(head: nn.Module, tokens: torch.Tensor) -> torch.Tensor:
@@ -622,6 +815,37 @@ class DinoVitStudentTeacher(nn.Module):
         )
         return cls_projections, patch_projections
 
+    def _structured_global_outputs(
+        self,
+        branch: nn.ModuleDict,
+        global_outputs: Mapping[str, torch.Tensor],
+        mask_indices_list: torch.Tensor,
+        n_masked_patches: Optional[int],
+        masked_patch_features: bool,
+        masked_source_tokens: Optional[torch.Tensor] = None,
+    ) -> dict[str, Mapping[str, torch.Tensor] | torch.Tensor]:
+        """masked_source_tokens: tokens to select the masked ones from, if not the patch tokens."""
+        global_outputs = dict(global_outputs)
+        cls_projections = self.project_cls_tokens(branch, global_outputs["cls_tokens"])
+        outputs: dict[str, Mapping[str, torch.Tensor] | torch.Tensor] = {
+            "global": global_outputs,
+            "global_cls_projections": cls_projections,
+        }
+        masked_tokens = self.select_masked_patch_tokens(
+            global_outputs["patch_tokens"] if masked_source_tokens is None else masked_source_tokens,
+            mask_indices_list=mask_indices_list,
+            n_masked_patches=n_masked_patches,
+        )
+        if masked_patch_features:
+            # Normalized iBOT bottleneck features and the last-layer weight; the loss
+            # forms the [n_masked, out_dim] logits chunk by chunk. Reading the weight
+            # here keeps its parameters inside the (DDP) forward pass.
+            outputs["global_masked_patch_features"] = branch.ibot_head(masked_tokens, apply_last_layer=False)
+            outputs["ibot_last_layer_weight"] = branch.ibot_head.last_layer.weight
+        else:
+            outputs["global_masked_patch_projections"] = self.project_patch_tokens(branch, masked_tokens)
+        return outputs
+
     def _format_branch_outputs(
         self,
         branch: nn.ModuleDict,
@@ -637,6 +861,8 @@ class DinoVitStudentTeacher(nn.Module):
             "cls_tokens": cls_tokens,
             "patch_tokens": backbone_outputs["x_norm_patchtokens"],
         }
+        if "embed_skips" in backbone_outputs:
+            outputs["embed_skips"] = backbone_outputs["embed_skips"]
         if project_cls_tokens:
             outputs["cls_projections"] = self.project_cls_tokens(branch, cls_tokens)
         if project_patch_tokens:
@@ -671,6 +897,39 @@ class DinoVitStudentTeacher(nn.Module):
             project_patch_tokens=project_patch_tokens,
         )
 
+    @staticmethod
+    def _cross_view_tokens(
+        branch: nn.ModuleDict,
+        patch_tokens: torch.Tensor,
+        coordinates: torch.Tensor,
+        rows: torch.Tensor,
+        input_shape: Tuple[int, ...],
+    ) -> torch.Tensor:
+        """Patch tokens of view rows[r] interpolated at coordinates[r] (input voxels), [rows, P, C]."""
+        token_shape = tuple(size // patch for size, patch in zip(input_shape, branch.backbone.patch_size))
+        token_grid = patch_tokens.reshape(patch_tokens.shape[0], *token_shape, patch_tokens.shape[-1])
+        # Coordinates outside the view (tokens without a counterpart, left out of the
+        # loss by the trainer) are clamped to the border by the sampler.
+        return sample_grid_points(token_grid[rows], coordinates.float(), input_shape).to(patch_tokens.dtype)
+
+    def _point_features(
+        self,
+        branch: nn.ModuleDict,
+        outputs: dict[str, Any],
+        point_coordinates: torch.Tensor,
+        input_shape: Tuple[int, ...],
+    ) -> dict[str, torch.Tensor]:
+        """Dense/ink embeddings and interpolated tokens at [views*batch, P, 3] view coordinates.
+
+        The embedding skips are dropped from `outputs` afterwards so their memory is
+        released (the teacher's) or left to autograd (the student's).
+        """
+        skips = outputs.pop("embed_skips")
+        patch_tokens = outputs["patch_tokens"]
+        token_shape = tuple(size // patch for size, patch in zip(input_shape, branch.backbone.patch_size))
+        token_grid = patch_tokens.reshape(patch_tokens.shape[0], *token_shape, patch_tokens.shape[-1])
+        return branch.dense_head.forward_points(token_grid, skips, point_coordinates, input_shape)
+
     def forward(
         self,
         student_input: torch.Tensor,
@@ -684,44 +943,20 @@ class DinoVitStudentTeacher(nn.Module):
         return_teacher: bool = True,
         project_student_patch_tokens: bool = False,
         project_teacher_patch_tokens: bool = False,
+        masked_patch_features: bool = False,
+        point_coordinates: Optional[torch.Tensor] = None,
+        teacher_target_coordinates: Optional[torch.Tensor] = None,
+        teacher_target_rows: Optional[torch.Tensor] = None,
     ) -> dict[str, Mapping[str, torch.Tensor] | dict[str, Mapping[str, torch.Tensor] | torch.Tensor]]:
+        """teacher_target_coordinates [rows, tokens, 3] and teacher_target_rows [rows]: when
+        given, the teacher's iBOT features for masked token t of row r are read at
+        teacher_target_coordinates[r, t] in the view of row teacher_target_rows[r]
+        (cross-view targets) instead of at the same token of the same view."""
         project_cls_tokens = mask_indices_list is None
-        student_outputs = self._forward_branch(
-            self.student,
-            student_input,
-            masks=student_masks,
-            project_cls_tokens=project_cls_tokens,
-            project_patch_tokens=project_student_patch_tokens and mask_indices_list is None,
-            view_kind="global",
-        )
-        if mask_indices_list is None:
-            outputs: dict[str, Mapping[str, torch.Tensor] | dict[str, Mapping[str, torch.Tensor] | torch.Tensor]] = {
-                "student": student_outputs
-            }
-        else:
-            student_global = dict(student_outputs)
-            student_global_cls, student_patch = self.project_global_cls_and_masked_patch_tokens(
-                self.student,
-                student_global["cls_tokens"],
-                student_global["patch_tokens"],
-                mask_indices_list,
-                n_masked_patches=n_masked_patches,
-            )
-            structured_student_outputs: dict[str, Mapping[str, torch.Tensor] | torch.Tensor] = {
-                "global": student_global,
-                "global_cls_projections": student_global_cls,
-                "global_masked_patch_projections": student_patch,
-            }
-            if local_student_input is not None:
-                structured_student_outputs["local"] = self._forward_branch(
-                    self.student,
-                    local_student_input,
-                    masks=None,
-                    project_cls_tokens=True,
-                    view_kind="local",
-                )
-            outputs = {"student": structured_student_outputs}
-
+        input_shape = tuple(int(size) for size in student_input.shape[2:])
+        # The teacher runs first: its no-grad intermediates are then freed before the
+        # student's saved activations accumulate, which lowers peak memory.
+        teacher_result = None
         if return_teacher:
             teacher_source = student_input if teacher_input is None else teacher_input
             with torch.no_grad():
@@ -733,21 +968,65 @@ class DinoVitStudentTeacher(nn.Module):
                     project_patch_tokens=project_teacher_patch_tokens and mask_indices_list is None,
                     view_kind="global",
                 )
+                teacher_points = None
+                if point_coordinates is not None and "embed_skips" in teacher_outputs:
+                    teacher_points = self._point_features(self.teacher, teacher_outputs, point_coordinates, input_shape)
+                teacher_outputs.pop("embed_skips", None)
                 if mask_indices_list is None:
-                    outputs["teacher"] = teacher_outputs
+                    teacher_result = teacher_outputs
                 else:
-                    teacher_global = dict(teacher_outputs)
-                    teacher_global_cls, teacher_patch = self.project_global_cls_and_masked_patch_tokens(
+                    target_tokens = None
+                    if teacher_target_coordinates is not None:
+                        target_tokens = self._cross_view_tokens(
+                            self.teacher, teacher_outputs["patch_tokens"], teacher_target_coordinates,
+                            teacher_target_rows, input_shape,
+                        )
+                    teacher_result = self._structured_global_outputs(
                         self.teacher,
-                        teacher_global["cls_tokens"],
-                        teacher_global["patch_tokens"],
+                        teacher_outputs,
                         mask_indices_list,
-                        n_masked_patches=n_masked_patches,
+                        n_masked_patches,
+                        masked_patch_features,
+                        masked_source_tokens=target_tokens,
                     )
-                    teacher_structured_outputs: dict[str, Mapping[str, torch.Tensor] | torch.Tensor] = {
-                        "global": teacher_global,
-                        "global_cls_projections": teacher_global_cls,
-                        "global_masked_patch_projections": teacher_patch,
-                    }
-                    outputs["teacher"] = teacher_structured_outputs
+        student_outputs = self._forward_branch(
+            self.student,
+            student_input,
+            masks=student_masks,
+            project_cls_tokens=project_cls_tokens,
+            project_patch_tokens=project_student_patch_tokens and mask_indices_list is None,
+            view_kind="global",
+        )
+        student_points = None
+        if point_coordinates is not None and "embed_skips" in student_outputs:
+            student_points = self._point_features(self.student, student_outputs, point_coordinates, input_shape)
+        student_outputs.pop("embed_skips", None)
+        if mask_indices_list is None:
+            outputs: dict[str, Mapping[str, torch.Tensor] | dict[str, Mapping[str, torch.Tensor] | torch.Tensor]] = {
+                "student": student_outputs
+            }
+        else:
+            structured_student_outputs = self._structured_global_outputs(
+                self.student,
+                student_outputs,
+                mask_indices_list,
+                n_masked_patches,
+                masked_patch_features,
+            )
+            if local_student_input is not None:
+                structured_student_outputs["local"] = self._forward_branch(
+                    self.student,
+                    local_student_input,
+                    masks=None,
+                    project_cls_tokens=True,
+                    view_kind="local",
+                )
+            outputs = {"student": structured_student_outputs}
+
+        if teacher_result is not None:
+            outputs["teacher"] = teacher_result
+        if student_points is not None:
+            outputs["student"]["object_points"] = student_points
+        if teacher_result is not None and teacher_points is not None:
+            outputs["teacher"]["object_points"] = teacher_points
         return outputs
