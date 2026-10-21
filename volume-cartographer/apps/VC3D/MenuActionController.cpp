@@ -5,6 +5,7 @@
 #include "UnifiedBrowserDialog.hpp"
 #include "OpenDataCatalogWindow.hpp"
 #include "OpenDataLasagna.hpp"
+#include "OpenDataNormalGrids.hpp"
 #include "OpenDataSampleProject.hpp"
 #include "ProjectFiberPaths.hpp"
 #include "ProjectCreationDefaults.hpp"
@@ -518,6 +519,46 @@ void MenuActionController::showOpenDataCatalog()
             this, &MenuActionController::showAttachRemoteZarrDialog);
     connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachLasagnaRequested,
             this, &MenuActionController::attachCatalogLasagna);
+    dialog->setAttachPredictionHandler([this](const vc3d::opendata::OpenDataSample& sample,
+            const vc3d::opendata::OpenDataResourceSelection& selection) {
+        if (!_window || !_window->_state || !_window->_state->vpkg()) {
+            QMessageBox::information(_window, tr("No project"), tr("Open or create a project first."));
+            return;
+        }
+        try {
+            const auto result = vc3d::opendata::attachOpenDataSampleVolumes(
+                *_window->_state->vpkg(), sample, &selection);
+            _window->refreshCurrentVolumePackageUi(QString(), true);
+            if (result.failedVolumes) {
+                QStringList messages;
+                for (const auto& message : result.messages)
+                    messages.push_back(QString::fromStdString(message));
+                QMessageBox::warning(_window, tr("Attach incomplete"), messages.join('\n'));
+            }
+        } catch (const std::exception& e) {
+            QMessageBox::warning(_window, tr("Attach failed"), QString::fromUtf8(e.what()));
+        }
+    });
+    connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachNormalGridsRequested,
+            this, [this](const QString& sample, const QString& volume, const QString& url,
+                         int level, bool explicitLevel) {
+        if (!_window || !_window->_state || !_window->_state->vpkg()) {
+            QMessageBox::information(_window, tr("No project"), tr("Open or create a project first."));
+            return;
+        }
+        try {
+            const vc3d::opendata::OpenDataNormalGridsInfo info{
+                sample.toStdString(), volume.toStdString(), url.toStdString(), level, explicitLevel};
+            if (!vc3d::opendata::attachStreamingNormalGridsEntry(
+                    *_window->_state->vpkg(), info, vc3d::remoteCachePathFs())) {
+                QMessageBox::warning(_window, tr("Attach failed"), tr("Could not attach normal grids."));
+                return;
+            }
+            _window->refreshCurrentVolumePackageUi(QString(), true);
+        } catch (const std::exception& e) {
+            QMessageBox::warning(_window, tr("Attach failed"), QString::fromUtf8(e.what()));
+        }
+    });
     dialog->setOpenSampleHandler([this](const vc3d::opendata::OpenDataSample& sample) {
         return openOpenDataSample(sample);
     });
@@ -1527,7 +1568,7 @@ void MenuActionController::surfaceFromSelection()
         std::string newId = _window->_state->activeSurfaceId() + std::string("_sel_") + ts.toStdString() + std::string("_") + std::to_string(idx++);
         std::filesystem::path outDir = parentDir / newId;
         try {
-            filtered->save(outDir.string(), newId);
+            filtered->saveAsNew(outDir);
             created++;
         } catch (const std::exception& e) {
             _window->showStatusBarMessage(QObject::tr("Failed to save selection: ") + e.what(), 5000);

@@ -3962,7 +3962,7 @@ void saveAtlasBaseMeshCopy(const QuadSurface& surface,
         }
         copy.setChannel(name, channel.clone());
     }
-    copy.save(targetDir, true);
+    copy.saveAsNew(targetDir, true);
 }
 
 AtlasCoveredSize mappedObjectCoveredAtlasSize(const Atlas& atlas,

@@ -1,0 +1,243 @@
+from __future__ import annotations
+
+import copy
+import json
+from pathlib import Path
+import unittest
+import weakref
+
+import torch
+from torch import nn
+
+from dinovol_2.model.dinov2_eva import EvaBlock
+from dinovol_2.model.model import DinoVitStudentTeacher, _materialize_backbone_config
+from dinovol_2.model.patch_encode_decode import PatchEmbedDeeper
+
+
+class CNNEmbeddingTests(unittest.TestCase):
+    def test_no_grad_embedding_retains_stage_outputs_only_when_requested(self):
+        encoder = PatchEmbedDeeper(
+            patch_size=(4, 4, 4), input_channels=1, embed_dim=12,
+            stage_channels=(4, 8, 12), stage_strides=(1, 2, 2),
+            stem_channels=4, stem_type="conv",
+        ).eval()
+        refs, alive_at_projection = [], []
+        handles = [stage.register_forward_hook(lambda module, args, output: refs.append(weakref.ref(output)))
+                   for stage in encoder.stages]
+        handles.append(encoder.final_proj.register_forward_pre_hook(
+            lambda module, args: alive_at_projection.extend(ref() is not None for ref in refs)))
+        x = torch.randn(1, 1, 8, 8, 8)
+        try:
+            with torch.no_grad():
+                tokens = encoder(x, return_skips=False)
+                self.assertEqual(alive_at_projection, [False, False, True])
+                refs.clear()
+                alive_at_projection.clear()
+                tokens_with_skips, skips = encoder(x, return_skips=True)
+                self.assertEqual(alive_at_projection, [True, True, True])
+                self.assertEqual(len(skips), 2)
+                torch.testing.assert_close(tokens, tokens_with_skips, rtol=0, atol=0)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+    def test_embedding_skips_avoid_single_chunk_copies_and_preserve_gradients(self):
+        for chunk_size in (None, 1, 2, 4):
+            with self.subTest(chunk_size=chunk_size):
+                torch.manual_seed(23)
+                backbone = DinoVitStudentTeacher._build_backbone({
+                    "model_type": "v2", "embed_dim": 12, "num_heads": 2, "depth": 1,
+                    "global_crops_size": [8] * 3, "local_crops_size": [8] * 3,
+                    "patch_size": [4] * 3, "embedding_type": "deeper",
+                    "deeper_embed_stage_channels": [4, 8, 12],
+                    "deeper_embed_stage_strides": [1, 2, 2],
+                    "deeper_embed_depth_per_level": [1, 1, 1],
+                    "deeper_embed_final_projection": True,
+                    "deeper_embed_batch_chunk_size": chunk_size,
+                })
+                reference = copy.deepcopy(backbone.down_projection)
+                x = torch.randn(2, 1, 8, 8, 8, requires_grad=True)
+                ref_x = x.detach().clone().requires_grad_()
+                raw_outputs = []
+                handle = backbone.down_projection.register_forward_hook(
+                    lambda module, args, output: raw_outputs.append(output))
+                skips = []
+                try:
+                    tokens = backbone._down_project_with_skips(x, skips)
+                finally:
+                    handle.remove()
+                if chunk_size != 1:
+                    self.assertEqual(len(raw_outputs), 1)
+                    self.assertIs(tokens, raw_outputs[0][0])
+                    for skip, original in zip(skips, raw_outputs[0][1]):
+                        self.assertIs(skip, original)
+                chunks = ref_x.split(chunk_size) if chunk_size is not None and chunk_size < 2 else (ref_x,)
+                ref_outputs = [reference(chunk, return_skips=True) for chunk in chunks]
+                ref_tokens = torch.cat([output[0] for output in ref_outputs])
+                ref_skips = [torch.cat(level) for level in zip(*(output[1] for output in ref_outputs))]
+                for actual, expected in zip([tokens, *skips], [ref_tokens, *ref_skips]):
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                sum(t.square().mean() for t in [tokens, *skips]).backward()
+                sum(t.square().mean() for t in [ref_tokens, *ref_skips]).backward()
+                torch.testing.assert_close(x.grad, ref_x.grad, rtol=0, atol=0)
+                for actual, expected in zip(backbone.down_projection.parameters(), reference.parameters()):
+                    torch.testing.assert_close(actual.grad, expected.grad, rtol=0, atol=0)
+
+    def test_rotary_attention_checkpointing_matches_direct_gradients(self):
+        for chunks in (0, 2, 4):
+            with self.subTest(block_chunks=chunks):
+                torch.manual_seed(29)
+                model = DinoVitStudentTeacher._build_backbone({
+                    "model_type": "v3", "embed_dim": 36, "num_heads": 3, "depth": 4,
+                    "global_crops_size": [8] * 3, "local_crops_size": [8] * 3,
+                    "patch_size": [4] * 3, "grad_checkpointing": True,
+                    "block_chunks": chunks, "drop_path_rate": 0.0,
+                })
+                reference = copy.deepcopy(model)
+                reference.grad_checkpointing = False
+                x = torch.randn(1, 1, 8, 8, 8)
+                # Both paths must see the same training-time RoPE augmentation.
+                rng_state = torch.get_rng_state()
+                actual = model(x)["x_norm_patchtokens"]
+                torch.set_rng_state(rng_state)
+                expected = reference(x)["x_norm_patchtokens"]
+                torch.testing.assert_close(actual, expected)
+                weights = torch.randn_like(actual)
+                (actual * weights).sum().backward()
+                (expected * weights).sum().backward()
+                for parameter, ref_parameter in zip(model.parameters(), reference.parameters()):
+                    if ref_parameter.grad is None:
+                        self.assertIsNone(parameter.grad)
+                    else:
+                        torch.testing.assert_close(parameter.grad, ref_parameter.grad)
+
+    def test_recipe_architecture_forward_backward_and_reload(self):
+        torch.manual_seed(23)
+        recipe = Path(__file__).resolve().parents[1] / "dinovol_2/configs/pretrain_8_9um.json"
+        recipe_config = json.loads(recipe.read_text())
+        config = dict(recipe_config["model"])
+        self.assertEqual(config["global_crops_size"], [128] * 3)
+        self.assertEqual(config["local_crops_size"], [64] * 3)
+        self.assertEqual(recipe_config["dataset"]["global_crop_size"], config["global_crops_size"])
+        self.assertEqual(recipe_config["dataset"]["local_crop_size"], config["local_crops_size"])
+        self.assertEqual(recipe_config["dataset"]["num_global_crops"], 2)
+        self.assertEqual(recipe_config["dataset"]["num_local_crops"], 4)
+        self.assertEqual(recipe_config["batch_size"], 12)
+        self.assertEqual(recipe_config["grad_accumulation_steps"], 2)
+        resolved = _materialize_backbone_config(config)
+        self.assertEqual(resolved["embed_dim"], 480)
+        self.assertEqual(resolved["num_heads"], 10)
+        self.assertEqual(resolved["depth"], 10)
+        self.assertEqual(resolved["attention_type"], "full")
+        self.assertEqual(resolved["rope_type"], "mixed")
+        self.assertEqual(resolved["mlp_ratio"], 7.2)
+        self.assertTrue(resolved["grad_checkpointing"])
+        self.assertEqual(resolved["patch_size"], (8, 8, 8))
+        self.assertEqual(resolved["deeper_embed_stage_channels"], [32, 64, 128, 256])
+        self.assertEqual(resolved["deeper_embed_stage_strides"], [1, 2, 2, 2])
+        self.assertEqual(resolved["deeper_embed_depth_per_level"], [1, 2, 2, 1])
+        self.assertTrue(resolved["deeper_embed_use_stem"])
+        self.assertEqual(resolved["deeper_embed_stem_channels"], 32)
+        self.assertTrue(resolved["deeper_embed_final_projection"])
+        # Keep the recipe's architecture, but use a small crop for CPU validation.
+        config.update(global_crops_size=[32] * 3, local_crops_size=[32] * 3)
+        backbone = DinoVitStudentTeacher._build_backbone(config).eval()
+        blocks = [module for module in backbone.modules() if isinstance(module, EvaBlock)]
+        self.assertEqual(len(blocks), 10)
+        for block in blocks:
+            self.assertEqual(block.attention_type, "full")
+            self.assertEqual(len(block.axial_attns), 0)
+            self.assertEqual(block.attn.num_heads, 10)
+            self.assertEqual(block.mlp.fc1.in_features, 480)
+            self.assertEqual(block.mlp.fc1.out_features, 6912)  # Two 3456-wide SwiGLU branches.
+            self.assertEqual(block.mlp.fc2.in_features, 3456)
+            self.assertEqual(block.mlp.fc2.out_features, 480)
+        encoder = backbone.down_projection
+        stem_convs = [module for module in encoder.stem.modules() if isinstance(module, nn.Conv3d)]
+        self.assertEqual(len(stem_convs), 1)
+        self.assertEqual((stem_convs[0].in_channels, stem_convs[0].out_channels), (1, 32))
+        self.assertEqual(stem_convs[0].kernel_size, (3, 3, 3))
+        self.assertEqual(stem_convs[0].stride, (1, 1, 1))
+        # The last stage is projected to the embedding width by a 1x1x1 convolution.
+        self.assertIsInstance(encoder.final_proj, nn.Conv3d)
+        self.assertEqual((encoder.final_proj.in_channels, encoder.final_proj.out_channels), (256, 480))
+        self.assertEqual(encoder.final_proj.kernel_size, (1, 1, 1))
+        self.assertEqual([len(stage.blocks) for stage in encoder.stages], [1, 2, 2, 1])
+        for module in encoder.modules():
+            if isinstance(module, nn.Conv3d):
+                self.assertEqual(module.padding_mode, "zeros")
+
+        shapes = []
+        handles = [stage.register_forward_hook(lambda module, args, output: shapes.append(tuple(output.shape)))
+                   for stage in [encoder.stem, *encoder.stages]]
+        try:
+            x = torch.randn(1, 1, 32, 32, 32, requires_grad=True)
+            masks = torch.zeros(1, 64, dtype=torch.bool)
+            masks[:, ::3] = True
+            features = backbone(x, masks=masks)
+        finally:
+            for handle in handles:
+                handle.remove()
+        self.assertEqual(shapes, [(1, 32, 32, 32, 32), (1, 32, 32, 32, 32),
+                                  (1, 64, 16, 16, 16), (1, 128, 8, 8, 8),
+                                  (1, 256, 4, 4, 4)])
+        tokens = features["x_norm_patchtokens"]
+        self.assertEqual(tuple(tokens.shape), (1, 64, 480))
+        self.assertEqual(tuple(features["x_norm_clstoken"].shape), (1, 480))
+        (tokens * torch.randn_like(tokens)).sum().backward()
+        self.assertIsNotNone(stem_convs[0].weight.grad)
+        self.assertTrue(torch.isfinite(stem_convs[0].weight.grad).all())
+        self.assertGreater(stem_convs[0].weight.grad.abs().sum().item(), 0)
+        for stage in encoder.stages:
+            gradient = stage.blocks[0].conv1.conv.weight.grad
+            self.assertIsNotNone(gradient)
+            self.assertTrue(torch.isfinite(gradient).all())
+            self.assertGreater(gradient.abs().sum().item(), 0)
+        self.assertEqual(x.grad[:, :, :8, :8, :8].count_nonzero().item(), 0)
+        self.assertGreater(x.grad.abs().sum().item(), 0)
+
+        # Rebuild through the same serialized configuration used by checkpoints.
+        serialized_config = json.loads(json.dumps(_materialize_backbone_config(config)))
+        restored = DinoVitStudentTeacher._build_backbone(serialized_config).eval()
+        restored.load_state_dict(backbone.state_dict(), strict=True)
+        with torch.no_grad():
+            restored_features = restored(x.detach(), masks=masks)
+        torch.testing.assert_close(restored_features["x_norm_patchtokens"], tokens.detach())
+
+    def test_explicit_strides_preserve_legacy_layout_and_support_anisotropic_grids(self):
+        kwargs = dict(patch_size=(4, 4, 4), input_channels=1, embed_dim=24, base_features=4)
+        legacy = PatchEmbedDeeper(**kwargs).eval()
+        explicit = PatchEmbedDeeper(**kwargs, stage_strides=(2, 2), stem_channels=4,
+                                   stem_type="residual").eval()
+        explicit.load_state_dict(legacy.state_dict(), strict=True)
+        x = torch.randn(1, 1, 8, 8, 8)
+        with torch.no_grad():
+            torch.testing.assert_close(legacy(x), explicit(x), rtol=0, atol=0)
+            anisotropic = PatchEmbedDeeper(
+                patch_size=(2, 4, 8), input_channels=1, embed_dim=24,
+                stage_channels=(4, 8, 16, 24),
+                stage_strides=((1, 1, 1), (1, 2, 2), (2, 2, 2), (1, 1, 2)),
+                stem_channels=4, stem_type="conv", final_projection=False,
+            ).eval()
+            self.assertEqual(tuple(anisotropic(torch.randn(1, 1, 8, 8, 16)).shape), (1, 24, 4, 2, 2))
+
+    def test_projection_free_configuration_validation(self):
+        for kwargs, message in (
+            ({"stage_strides": (1, 2)}, "product must equal patch_size"),
+            ({"stage_strides": ((2, 2), 2)}, "each spatial axis"),
+            ({"stage_strides": (0, 2)}, "each spatial axis"),
+            ({"stem_channels": 0}, "positive integer"),
+            ({"stem_type": "unknown"}, "stem_type"),
+            ({"stage_channels": (8, 16), "final_projection": False}, "must equal embed_dim"),
+            ({"stage_channels": (8,)}, "positive channel counts"),
+            ({"stage_channels": (8, 0)}, "positive channel counts"),
+            ({"depth_per_level": (2, 0)}, "must be positive"),
+            ({"stage_channels": (8, 24), "final_projection": False, "embed_proj_3x3x3": True},
+             "requires final_projection"),
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, message):
+                PatchEmbedDeeper(patch_size=(4, 4, 4), embed_dim=24, **kwargs)
+
+
+if __name__ == "__main__":
+    unittest.main()
