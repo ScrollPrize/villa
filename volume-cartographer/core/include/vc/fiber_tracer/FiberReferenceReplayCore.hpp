@@ -26,6 +26,10 @@ struct FiberReplayFailure {
     std::optional<cv::Vec3d> evaluatorPointBase;
     std::optional<size_t> segmentPointIndex;
     std::optional<FiberReplayThresholdMeasurement> thresholdMeasurement;
+    // Optional graph provenance; absent for direct/chunk tracing.
+    std::optional<size_t> candidateIndex;
+    std::optional<size_t> candidatePathPointIndex;
+    std::optional<size_t> arcIndex;
 };
 
 struct FiberReplayTraceSegment {

@@ -58,6 +58,9 @@ public:
 
     FiberletStorageCodecConfig config;
     std::vector<FiberletStoredPrefix> prefixes;
+    // Format-3 owner chunk's complete endpoint table. Not a global anchor list:
+    // referenced anchors must not become duplicate seeds in anchorsInChunk().
+    std::shared_ptr<const FiberletAnchorChunkPayload> endpoints;
 
 private:
     [[nodiscard]] const FiberletStorageKey& endpoint(

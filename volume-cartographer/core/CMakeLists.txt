@@ -16,6 +16,7 @@ set_target_properties(vc_fiber_collection PROPERTIES POSITION_INDEPENDENT_CODE O
 add_library(vc_core
         src/AtomicFile.cpp
         src/TexturedMesh.cpp
+        src/SurfaceTexture.cpp
         src/GridStore.cpp
         src/NormalGridVolume.cpp
         src/normalgridtools.cpp
@@ -220,6 +221,8 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberAnchorFinalEvaluation.cpp
     src/fiber_tracer/FiberAxisTensor.cpp
     src/fiber_tracer/FiberGraph.cpp
+    src/fiber_tracer/FiberletChunkGraph.cpp
+    src/fiber_tracer/FiberletCropTrace.cpp
     src/fiber_tracer/FiberLocalScoring.cpp
     src/fiber_tracer/FiberPaths.cpp
     src/fiber_tracer/FiberReplayMetric.cpp
@@ -229,6 +232,8 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberChunkRoute.cpp
     src/fiber_tracer/FiberLiveBridge.cpp
     src/fiber_tracer/FiberEvaluation.cpp
+    src/fiber_tracer/FiberReplayVisualization.cpp
+    src/fiber_tracer/FiberletCropVisualization.cpp
     src/fiber_tracer/FiberCaseQueue.cpp
     src/fiber_tracer/PolylineGeometry.cpp
     src/fiber_tracer/FiberletStorage.cpp
