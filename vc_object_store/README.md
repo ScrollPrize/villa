@@ -65,18 +65,14 @@ build/bin/vc_object_links --db objects.vcobj --author "$USER" \
 ```
 
 See the [API guide](docs/README.md) for checked revisions, geometry reads and
-edits, graph snapshots, spatial queries, and synchronization. Only the current
-database schema (13) is supported; recreate earlier development stores from
-source data. Detector distances and scale
-options remain in working voxels. CT normals use uint8 Zarr data with complete
+edits, graph snapshots, spatial queries, and synchronization. Detector distances
+and scale options use working voxels. CT normals use uint8 Zarr data with complete
 109³ support. Native CT opening supports local and anonymous HTTP/S3 arrays and
 pyramid levels; credentials and disk-cache configuration are not exposed by this
-adapter. The supported codecs are vc_reader's current codecs; `vcz1` is not
-supported.
+adapter. Codec support follows vc_reader.
 
 Surface proximity queries use the store's resident bounds index and exact
-triangles. Bounds are not quantized, so queries near tile boundaries can find
-valid hits that VC's rounded bounding boxes previously omitted.
+triangles. Bounds are not quantized.
 
 Tests are self-contained and do not require the volume-cartographer checkout or
 its fixture data.

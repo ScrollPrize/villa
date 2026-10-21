@@ -10,14 +10,6 @@ inline bool hasGeometryCoordinates(const std::string& kind)
 {
     return kind == "point_collection" || kind == "patch" || kind == "fiber" || kind == "track";
 }
-inline constexpr const char* legacyCoordinateFields[] = {
-    "vc_open_data_coordinate_space",
-    "vc_open_data_source_path",
-    "vc_open_data_source_coordinate_level",
-    "vc_open_data_source_coordinate_scale_factor",
-    "vc_open_data_source_original_resolution",
-};
-
 // The only persistent coordinate declarations are volume UUID and the factor
 // mapping source-volume voxels to the geometry's annotation coordinates.
 inline CoordinateJson geometryCoordinates(CoordinateJson value)
@@ -68,8 +60,6 @@ inline CoordinateJson mergeGeometryCoordinates(const CoordinateJson& a, const Co
     return result;
 }
 
-// Decode native document/collection declarations. Legacy fields are input-only:
-// retain only the exact scale, never infer a volume or a scale from other fields.
 inline CoordinateJson sourceGeometryCoordinates(const CoordinateJson& source)
 {
     if (!source.is_object())
@@ -78,16 +68,11 @@ inline CoordinateJson sourceGeometryCoordinates(const CoordinateJson& source)
     CoordinateJson flat = CoordinateJson::object();
     for (const auto* key : {"volume_uuid", "scale_factor"})
         if (source.contains(key)) flat[key] = source[key];
-    result = mergeGeometryCoordinates(result, flat);
-    constexpr auto legacyScale = "vc_open_data_source_coordinate_scale_factor";
-    if (source.contains(legacyScale))
-        result = mergeGeometryCoordinates(result, {{"scale_factor", source[legacyScale]}});
-    return result;
+    return mergeGeometryCoordinates(result, flat);
 }
 
 inline void eraseSourceGeometryCoordinates(CoordinateJson& source)
 {
-    for (const auto* key : legacyCoordinateFields) source.erase(key);
     for (const auto* key : {"coordinates", "volume_uuid", "scale_factor"}) source.erase(key);
 }
 } // namespace vc::objects::detail

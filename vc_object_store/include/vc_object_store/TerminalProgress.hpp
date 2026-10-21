@@ -19,7 +19,6 @@
 #endif
 
 namespace vc::objects::util {
-// Extracted from vc_zarr_download_region's terminal progress renderer.
 inline std::string progressBar(std::uint64_t done, std::uint64_t total)
 {
     constexpr int width = 24;

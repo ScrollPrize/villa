@@ -13,7 +13,7 @@ std::array<double, 2> scaleFromJson(const nlohmann::json& value)
 {
     std::array<double, 2> scale{};
     if (value.is_number()) {
-        scale.fill(value.get<double>());  // v1 scalar scales were isotropic
+        scale.fill(value.get<double>());
     } else if (value.is_array() && value.size() == 2) {
         scale = {value.at(0).get<double>(), value.at(1).get<double>()};
     } else {

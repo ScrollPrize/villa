@@ -1,15 +1,4 @@
 #include "linking/StoredGeometry.hpp"
-// Patch-overlap detector for vc_object_links.
-//
-// Pair acceptance follows spiral-fitting's patch_merger (merging-patches
-// branch): correspondences harvested by 3D proximity, a two-point
-// RANSAC over 2D rigid/reflected poses between the patches'
-// parameterizations gated on 3D tangent-frame agreement, Huber-weighted
-// refits, principal-axis spread gates on the inliers (major = overlap
-// length, minor = overlap "thickness"), and a dense 3D agreement check
-// under the fitted pose. Accepted pairs become pending graph edges via
-// commitCandidates(); no merged geometry is produced here.
-
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 
 #include <algorithm>

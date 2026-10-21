@@ -105,7 +105,7 @@ void updateSourcePointIdentities(sqlite3* db, const std::string& object,
     const std::vector<int64_t>& changed) {
     Statement state(db,"SELECT s.origin FROM source_collections s JOIN objects o ON o.uuid=s.object_uuid WHERE s.object_uuid=? AND s.revision_uuid=? AND s.origin=coalesce(json_extract(o.meta,'$.source.origin'),o.storage_ref) AND s.collection_id=json_extract(o.meta,'$.source.source_collection_id')");
     state.bindBlob(1,parseUuid(object)); state.bindBlob(2,parseUuid(previous));
-    if(!state.row()) return; // New/unindexed source: normal publication backfill.
+    if(!state.row()) return; // The source index is created at publication.
     const auto origin=state.text(0);
     const auto& identities=manifest.at("sequences").at("points").at("identities");
     for(auto id:std::set<int64_t>(changed.begin(),changed.end())) {

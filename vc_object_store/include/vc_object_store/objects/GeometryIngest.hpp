@@ -4,8 +4,7 @@
 
 namespace vc::objects {
 struct GeometryIngestReport {
-    // unchanged is retained for report compatibility and is always zero.
-    int64_t ingested = 0, unchanged = 0, edgesImported = 0;
+    int64_t ingested = 0, edgesImported = 0;
     std::vector<std::string> problems;
 };
 
@@ -31,10 +30,4 @@ GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& ki
     const std::filesystem::path& source, const util::ProgressCallback& progress = {},
     const std::string& coordinateContext = "{}");
 
-// Read only coordinate declarations (no XYZ decoding) for explicit backfill.
-// Returns JSON {volume_uuid, scale_factor}; conflicts throw. Context is the same
-// two-field JSON object accepted by ingestion. Supports point_collection, fiber,
-// and patch sources; packed tracks have no coordinate declarations.
-std::string readGeometrySourceCoordinates(const std::string& kind, const std::filesystem::path& source,
-    const std::string& objectUuid, const std::string& coordinateContext = "{}");
 } // namespace vc::objects

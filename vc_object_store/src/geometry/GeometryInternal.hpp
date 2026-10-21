@@ -85,7 +85,7 @@ inline void verifyGeometryChunk(std::span<const uint8_t> bytes, const std::strin
         throw std::runtime_error("geometry: corrupt payload chunk");
 }
 // Storage layout is independent of logical geometry format_version. Missing
-// storage metadata denotes the original contiguous 1 MiB chunk representation.
+// storage metadata denotes contiguous 1 MiB chunks.
 struct GeometryLayout {
     int64_t length = 0, rows = 0, cols = 0, tile = 0, pixelBytes = 0;
     int64_t tileColumns() const { return cols / tile + (cols % tile != 0); }

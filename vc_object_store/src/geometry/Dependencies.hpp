@@ -188,7 +188,7 @@ inline bool dependenciesChanged(const Anchor& anchor, const DependencyGeometry& 
     };
     for (const auto& channel : anchor.channels) if (changed(channel)) return true;
     if (anchor.wholeGeometry || anchor.points.empty()) {
-        // Whole geometry includes every array; unknown legacy dependencies
+        // Whole geometry includes every array; unspecified dependencies
         // remain conservative. Explicit point anchors depend only on their
         // declared points and optional channels.
         std::set<std::string> names;

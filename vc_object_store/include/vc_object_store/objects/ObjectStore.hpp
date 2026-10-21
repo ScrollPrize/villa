@@ -196,7 +196,7 @@ struct EdgeSelection {
     std::optional<std::string> afterUuid; // exclusive, UUID-ordered cursor
     bool includeRetired = false; // includes lifecycle-inactive recorded edges
     // nullopt: all kinds; false/true: ordinary/adjacent fiber_branch only.
-    // A missing adjacent metadata flag is an ordinary legacy fiber branch.
+    // A missing adjacent metadata flag is an ordinary fiber branch.
     std::optional<bool> adjacent;
     // Shared membership/dependencies against latest heads. Requires a ReadTxn.
     bool applicableOnly = false;
@@ -494,13 +494,6 @@ public:
     // Both bump generation and reset approval, like any content change.
     void setMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key, const std::string& jsonValue);
     void removeMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key);
-
-    // Fill unknown meta.coordinates volume_uuid/scale_factor from declarations
-    // (JSON object) and any old source annotations, rejecting known conflicts.
-    // Requires write(RevisionSelection). Removes legacy coordinate fields from
-    // current source metadata, preserving other annotations and all history.
-    void backfillGeometryCoordinates(WriteTxn&, const std::string& objectUuid,
-        const std::string& declarations = "{}");
 
     std::vector<JournalEntry> journalSince(const Txn& txn, int64_t afterSeq) const;
 

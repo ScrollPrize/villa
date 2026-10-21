@@ -175,8 +175,8 @@ void indexGeometry(sqlite3* db, int64_t objectId, const std::string& revision,
                         tiles[t].append(readRectangle(a.name, row, col, height, width), a.dtype, true);
                     }
                 } else {
-                    // Legacy and in-memory arrays need row-major traversal:
-                    // tile-major reads on a wide legacy patch would repeatedly
+                    // Linear and in-memory arrays need row-major traversal:
+                    // tile-major reads on a wide linear patch would repeatedly
                     // fetch dozens of 1 MiB chunks for each small region.
                     for (int64_t y = row; y < row + height; ++y)
                         for (int64_t t = 0; t < tileColumns; ++t) {

@@ -68,12 +68,12 @@ auto readMethod()
     }(Method);
 }
 
-template<auto Method>
+template<auto Method, class T = PyObjectStore>
 auto writeMethod()
 {
     return []<class... Args>(void (vo::ObjectStore::*)(vo::WriteTxn&, Args...)) {
-        return [](PyObjectStore& self, Args... args) {
-            self.withWrite([&](auto& db, auto& txn) { (db.*Method)(txn, args...); return 0; });
+        return [](T& self, Args... args) {
+            self.withWrite([&](auto& db, auto& txn) { (db.*Method)(txn, args...); });
         };
     }(Method);
 }
@@ -160,20 +160,91 @@ bool setLinePatchParameter(vc::object_links::LinePatchParams& p, const std::stri
     return true;
 }
 
+template<class T>
+void bindMutations(nb::class_<T>& cls)
+{
+    cls
+        .def(
+            "upsert_object",
+            [](T& self, const nb::dict& rec) {
+                return self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) { return g.upsertObject(t, objectFromPy(rec)); });
+            },
+            nb::arg("record"), "Create or update an object from a dict; returns its uuid.")
+        .def(
+            "add_edge",
+            [](T& self, const nb::dict& rec) {
+                return self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) { return g.addEdge(t, edgeFromPy(rec)); });
+            },
+            nb::arg("record"), "Create an edge from a dict (keys: a, b, kind, anchors, tags, meta); returns uuid.")
+        .def("remove_edge", writeMethod<&vo::ObjectStore::removeEdge, T>(),
+             nb::arg("uuid"))
+        .def("set_approval", writeMethod<&vo::ObjectStore::setApproval, T>(),
+             nb::arg("uuid"), nb::arg("state"), "state: 'pending', 'approved' or 'rejected' (objects and edges).")
+        .def(
+            "set_meta",
+            [](T& self, const std::string& uuid, const std::string& key, const nb::object& value) {
+                const std::string json = jsonDumps(value);
+                self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) {
+                    g.setMeta(t, uuid, key, json);
+                });
+            },
+            nb::arg("uuid"), nb::arg("key"), nb::arg("value").none(), "Set one open-ended metadata key (any JSON value).")
+        .def("remove_meta", writeMethod<&vo::ObjectStore::removeMeta, T>(),
+             nb::arg("uuid"), nb::arg("key"))
+        .def("put_geometry", [](T& self, const std::string& uuid, const nb::object& input,
+                               const std::optional<std::string>& expected, const nb::list& choices, int64_t patchTileSize) {
+            const auto data = geometryInputFromPy(input);
+            const auto edits = edgeEditsFromPy(choices);
+            return self.template withWrite<true>([&](vo::ObjectStore& db, vo::WriteTxn& txn) { return db.putGeometry(txn, uuid, data, expected, edits, vo::GeometryStorageOptions{patchTileSize}); });
+        }, nb::arg("object_uuid"), nb::arg("geometry"), nb::arg("expected_revision") = std::nullopt,
+           nb::arg("edge_edits") = nb::list(), nb::arg("patch_tile_size") = vo::GeometryStorageOptions{}.patchTileSize)
+        .def("edit_geometry", [](T& self, const std::string& uuid, const nb::list& input,
+                                const std::string& expected, const nb::list& choices) {
+            const auto edits = geometryEditsFromPy(input);
+            const auto edges = edgeEditsFromPy(choices);
+            return self.template withWrite<true>([&](vo::ObjectStore& db, vo::WriteTxn& txn) {
+                return db.editGeometry(txn, uuid, edits, expected, edges);
+            });
+        }, nb::arg("object_uuid"), nb::arg("edits"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
+        .def("update_surface_channels", [](T& self, const std::string& uuid, const nb::list& channels,
+                                           const std::vector<std::string>& remove, const std::string& expected, const nb::list& choices) {
+            nb::dict input; input["kind"] = "patch"; input["arrays"] = channels;
+            const auto data = geometryFromPy(input); const auto edges = edgeEditsFromPy(choices);
+            return self.template withWrite<true>([&](auto& db, auto& txn) { return db.updateSurfaceChannels(txn, uuid, data.arrays, remove, expected, edges); });
+        }, nb::arg("object_uuid"), nb::arg("channels"), nb::arg("remove"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
+        .def("edit_geometry_rectangle", [](T& self, const std::string& uuid, const std::string& name,
+                                          int64_t row, int64_t column, int64_t rows, int64_t columns,
+                                          const nb::bytes& data, const std::string& expected, const nb::list& choices) {
+            const auto* p = reinterpret_cast<const uint8_t*>(data.c_str());
+            const std::vector<uint8_t> bytes(p, p + data.size()); const auto edges = edgeEditsFromPy(choices);
+            return self.template withWrite<true>([&](auto& db, auto& txn) {
+                return db.editGeometryRectangle(txn, uuid, name, row, column, rows, columns, bytes, expected, edges);
+            });
+        }, nb::arg("object_uuid"), nb::arg("array_name"), nb::arg("row"), nb::arg("column"), nb::arg("rows"), nb::arg("columns"),
+           nb::arg("data"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
+        .def("affected_geometry_edit_edges", [](T& self, const std::string& uuid,
+                                                const nb::list& input, const std::string& expected) {
+            const auto edits = geometryEditsFromPy(input);
+            const auto edges = self.withRead([&](vo::ObjectStore& db, const vo::Txn& txn) {
+                return db.affectedGeometryEditEdges(txn, uuid, edits, expected);
+            });
+            nb::list result; for (const auto& edge : edges) result.append(edgeToPy(edge)); return result;
+        }, nb::arg("object_uuid"), nb::arg("edits"), nb::arg("expected_revision"))
+        .def("affected_geometry_edges", [](T& self, const std::string& uuid, const nb::object& input) {
+            const auto data = geometryInputFromPy(input);
+            auto edges = self.withRead([&](vo::ObjectStore& db, const vo::Txn& txn) { return db.affectedGeometryEdges(txn, uuid, data); });
+            nb::list result; for (const auto& edge : edges) result.append(edgeToPy(edge)); return result;
+        }, nb::arg("object_uuid"), nb::arg("geometry"))
+        .def("repair_edge_geometry", [](T& self, const nb::dict& input) {
+            const auto repair = repairFromPy(input);
+            self.withWrite([&](vo::ObjectStore& db, vo::WriteTxn& txn) { db.repairEdgeGeometry(txn, repair);  });
+        }, nb::arg("repair"), "Atomically publish anchors and checked revisions; reject changed endpoints or edge generation.");
+}
+
 }  // namespace
 
 NB_MODULE(_native, m)
 {
-    m.def("read_geometry_source_coordinates",
-        [](const std::string& kind, const std::filesystem::path& source,
-           const std::string& uuid, const nb::dict& context) {
-            const auto declarations = jsonDumps(context);
-            std::string result;
-            { nb::gil_scoped_release release;
-              result = vo::readGeometrySourceCoordinates(kind, source, uuid, declarations); }
-            return jsonLoads(result);
-        }, nb::arg("kind"), nb::arg("source"), nb::arg("object_uuid"),
-           nb::arg("coordinate_context") = nb::dict());
     nb::class_<vc::CtSheetNormalSampler>(m, "CtSheetNormalSampler")
         .def(nb::init<const std::filesystem::path&, int, double>(),
              nb::arg("ct_volume"), nb::arg("level") = 0, nb::arg("working_to_ct_scale") = 1.0)
@@ -194,7 +265,7 @@ NB_MODULE(_native, m)
     bindFiberRegion(m);
     bindTypedGeometry(m); // Shared C++ geometry and revision-pinned views.
 
-    nb::class_<PyObjectStore>(m, "ObjectStore")
+    auto store = nb::class_<PyObjectStore>(m, "ObjectStore")
         .def_static("create", &PyObjectStore::create, nb::arg("path"), nb::arg("author"),
                     nb::arg("hostname") = std::nullopt, nb::arg("reader_pool_size") = 4,
                     nb::arg("geometry_cache_bytes") = 16 * 1024 * 1024,
@@ -218,12 +289,6 @@ NB_MODULE(_native, m)
         .def_prop_ro("path", [](PyObjectStore& self) { return self.require().path().string(); })
         .def_prop_ro("hostname", [](PyObjectStore& self) { return self.require().hostname(); })
         .def_prop_ro("author", [](PyObjectStore& self) { return self.require().author(); })
-        .def(
-            "upsert_object",
-            [](PyObjectStore& self, const nb::dict& rec) {
-                return self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) { return self.upsertObjectIn(g, t, rec); });
-            },
-            nb::arg("record"), "Create or update an object from a dict; returns its uuid.")
         .def("object", readMethod<&vo::ObjectStore::objectByUuid>(),
              nb::arg("uuid"))
         .def("objects_by_kind", readMethod<&vo::ObjectStore::objectsByKind>(),
@@ -234,15 +299,7 @@ NB_MODULE(_native, m)
              nb::arg("tag"), nb::arg("include_retired") = false)
         .def("delete_object", writeMethod<&vo::ObjectStore::deleteObject>(),
              nb::arg("uuid"))
-        .def(
-            "add_edge",
-            [](PyObjectStore& self, const nb::dict& rec) {
-                return self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) { return self.addEdgeIn(g, t, rec); });
-            },
-            nb::arg("record"), "Create an edge from a dict (keys: a, b, kind, anchors, tags, meta); returns uuid.")
         .def("edge", readMethod<&vo::ObjectStore::edgeByUuid>(),
-             nb::arg("uuid"))
-        .def("remove_edge", writeMethod<&vo::ObjectStore::removeEdge>(),
              nb::arg("uuid"))
         .def("edges_of", readMethod<&vo::ObjectStore::edgesOf>(),
              nb::arg("uuid"), nb::arg("include_retired") = false)
@@ -263,18 +320,6 @@ NB_MODULE(_native, m)
              },
              nb::arg("uuid"), nb::arg("max_depth"), nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("include_retired") = false,
              nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false)
-        .def("set_approval", writeMethod<&vo::ObjectStore::setApproval>(),
-             nb::arg("uuid"), nb::arg("state"), "state: 'pending', 'approved' or 'rejected' (objects and edges).")
-        .def(
-            "set_meta",
-            [](PyObjectStore& self, const std::string& uuid, const std::string& key, const nb::object& value) {
-                const std::string json = jsonDumps(value);
-                self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) {
-                    g.setMeta(t, uuid, key, json);
-                    return 0;
-                });
-            },
-            nb::arg("uuid"), nb::arg("key"), nb::arg("value").none(), "Set one open-ended metadata key (any JSON value).")
         .def("set_meta_many", [](PyObjectStore& self, const nb::list& updates) {
             struct Update { std::string uuid, key, value; };
             std::vector<Update> batch;
@@ -289,8 +334,6 @@ NB_MODULE(_native, m)
                 return 0;
             });
         }, nb::arg("updates"), "Apply metadata triples atomically in one durable transaction.")
-        .def("remove_meta", writeMethod<&vo::ObjectStore::removeMeta>(),
-             nb::arg("uuid"), nb::arg("key"))
         .def(
             "journal_since",
             [](PyObjectStore& self, int64_t afterSeq) {
@@ -315,54 +358,6 @@ NB_MODULE(_native, m)
                 return out;
             },
             nb::arg("after_seq") = 0)
-        .def("put_geometry", [](PyObjectStore& self, const std::string& uuid, const nb::object& input,
-                               const std::optional<std::string>& expected, const nb::list& choices, int64_t patchTileSize) {
-            const auto data = geometryInputFromPy(input);
-            const auto edits = edgeEditsFromPy(choices);
-            auto lease = self.db; self.require(); nb::gil_scoped_release release;
-            return self.withWrite([&](vo::ObjectStore& db, vo::WriteTxn& txn) { return db.putGeometry(txn, uuid, data, expected, edits, vo::GeometryStorageOptions{patchTileSize}); });
-        }, nb::arg("object_uuid"), nb::arg("geometry"), nb::arg("expected_revision") = std::nullopt,
-           nb::arg("edge_edits") = nb::list(), nb::arg("patch_tile_size") = vo::GeometryStorageOptions{}.patchTileSize)
-        .def("edit_geometry", [](PyObjectStore& self, const std::string& uuid, const nb::list& input,
-                                const std::string& expected, const nb::list& choices) {
-            const auto edits = geometryEditsFromPy(input);
-            const auto edges = edgeEditsFromPy(choices);
-            auto lease = self.db; self.require(); nb::gil_scoped_release release;
-            return self.withWrite([&](vo::ObjectStore& db, vo::WriteTxn& txn) {
-                return db.editGeometry(txn, uuid, edits, expected, edges);
-            });
-        }, nb::arg("object_uuid"), nb::arg("edits"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
-        .def("update_surface_channels", [](PyObjectStore& self, const std::string& uuid, const nb::list& channels,
-                                           const std::vector<std::string>& remove, const std::string& expected, const nb::list& choices) {
-            nb::dict input; input["kind"] = "patch"; input["arrays"] = channels;
-            const auto data = geometryFromPy(input); const auto edges = edgeEditsFromPy(choices);
-            auto lease = self.db; self.require(); nb::gil_scoped_release release;
-            return self.withWrite([&](auto& db, auto& txn) { return db.updateSurfaceChannels(txn, uuid, data.arrays, remove, expected, edges); });
-        }, nb::arg("object_uuid"), nb::arg("channels"), nb::arg("remove"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
-        .def("edit_geometry_rectangle", [](PyObjectStore& self, const std::string& uuid, const std::string& name,
-                                          int64_t row, int64_t column, int64_t rows, int64_t columns,
-                                          const nb::bytes& data, const std::string& expected, const nb::list& choices) {
-            const auto* p = reinterpret_cast<const uint8_t*>(data.c_str());
-            const std::vector<uint8_t> bytes(p, p + data.size()); const auto edges = edgeEditsFromPy(choices);
-            auto lease = self.db; self.require(); nb::gil_scoped_release release;
-            return self.withWrite([&](auto& db, auto& txn) {
-                return db.editGeometryRectangle(txn, uuid, name, row, column, rows, columns, bytes, expected, edges);
-            });
-        }, nb::arg("object_uuid"), nb::arg("array_name"), nb::arg("row"), nb::arg("column"), nb::arg("rows"), nb::arg("columns"),
-           nb::arg("data"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
-        .def("affected_geometry_edit_edges", [](PyObjectStore& self, const std::string& uuid,
-                                                const nb::list& input, const std::string& expected) {
-            const auto edits = geometryEditsFromPy(input);
-            const auto edges = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
-                return db.affectedGeometryEditEdges(txn, uuid, edits, expected);
-            });
-            nb::list result; for (const auto& edge : edges) result.append(edgeToPy(edge)); return result;
-        }, nb::arg("object_uuid"), nb::arg("edits"), nb::arg("expected_revision"))
-        .def("affected_geometry_edges", [](PyObjectStore& self, const std::string& uuid, const nb::object& input) {
-            const auto data = geometryInputFromPy(input);
-            auto edges = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.affectedGeometryEdges(txn, uuid, data); });
-            nb::list result; for (const auto& edge : edges) result.append(edgeToPy(edge)); return result;
-        }, nb::arg("object_uuid"), nb::arg("geometry"))
         .def("geometry_point_annotations", [](PyObjectStore& self,const std::string& revision,const std::string& array) {
             return jsonLoads(self.withRead([&](vo::ObjectStore& db,vo::ReadTxn& txn) { return db.geometryPointAnnotations(txn,revision,array); }));
         },nb::arg("revision_uuid"),nb::arg("array_name"))
@@ -414,10 +409,6 @@ NB_MODULE(_native, m)
             const auto state = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.edgeGeometryState(txn, uuid); });
             nb::dict result; result["a_revision"] = state.aRevision; result["b_revision"] = state.bRevision; result["stale"] = state.stale; return result;
         }, nb::arg("edge_uuid"))
-        .def("repair_edge_geometry", [](PyObjectStore& self, const nb::dict& input) {
-            const auto repair = repairFromPy(input);
-            self.withWrite([&](vo::ObjectStore& db, vo::WriteTxn& txn) { db.repairEdgeGeometry(txn, repair); return 0; });
-        }, nb::arg("repair"), "Atomically publish anchors and checked revisions; reject changed endpoints or edge generation.")
         .def("resolve_storage_path", readMethod<&vo::ObjectStore::resolveStoragePath>(), nb::arg("uuid"),
              nb::arg("dataset_root") = std::nullopt,
              "Find a patch/fiber by source UUID, verifying the saved path before searching the dataset root.")
@@ -735,7 +726,7 @@ NB_MODULE(_native, m)
             nb::arg("expected_revisions") = std::nullopt, nb::keep_alive<0, 1>(),
             "Batch write transaction context manager: 'with db.write() as w: w.upsert_object(...)'");
 
-    nb::class_<PyObjectWriteTxn>(m, "WriteTransaction")
+    auto writer = nb::class_<PyObjectWriteTxn>(m, "WriteTransaction")
         .def("__enter__", [](nb::object self) {
             nb::cast<PyObjectWriteTxn&>(self).enter();
             return self;
@@ -751,9 +742,6 @@ NB_MODULE(_native, m)
                                   const std::optional<std::string>& source) {
             self.owner->require().restoreObject(self.require(), uuid, source);
         }, nb::arg("uuid"), nb::arg("source_revision") = std::nullopt)
-        .def("repair_edge_geometry", [](PyObjectWriteTxn& self, const nb::dict& input) {
-            self.owner->require().repairEdgeGeometry(self.require(), repairFromPy(input));
-        }, nb::arg("repair"))
         .def("retain_relationship", [](PyObjectWriteTxn& self, const std::string& uuid) {
             self.owner->require().retainRelationship(self.require(), uuid);
         }, nb::arg("edge_uuid"))
@@ -763,64 +751,12 @@ NB_MODULE(_native, m)
         .def("update_edge", [](PyObjectWriteTxn& self, const nb::dict& record) {
             self.owner->require().updateEdge(self.require(), edgeFromPy(record));
         })
-        .def("remove_edge", [](PyObjectWriteTxn& self, const std::string& uuid) {
-            self.owner->require().removeEdge(self.require(), uuid);
-        })
-        .def("remove_meta", [](PyObjectWriteTxn& self, const std::string& uuid, const std::string& key) {
-            self.owner->require().removeMeta(self.require(), uuid, key);
-        })
-        .def("put_geometry", [](PyObjectWriteTxn& self, const std::string& uuid, const nb::object& input,
-                               const std::optional<std::string>& expected, const nb::list& choices, int64_t patchTileSize) {
-            const auto data = geometryInputFromPy(input);
-            return self.owner->require().putGeometry(self.require(), uuid, data, expected, edgeEditsFromPy(choices), vo::GeometryStorageOptions{patchTileSize});
-        }, nb::arg("object_uuid"), nb::arg("geometry"), nb::arg("expected_revision") = std::nullopt,
-           nb::arg("edge_edits") = nb::list(), nb::arg("patch_tile_size") = vo::GeometryStorageOptions{}.patchTileSize)
-        .def("edit_geometry", [](PyObjectWriteTxn& self, const std::string& uuid, const nb::list& input,
-                                const std::string& expected, const nb::list& choices) {
-            return self.owner->require().editGeometry(self.require(), uuid, geometryEditsFromPy(input), expected, edgeEditsFromPy(choices));
-        }, nb::arg("object_uuid"), nb::arg("edits"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
         .def("edit_geometry_sequence", [](PyObjectWriteTxn& self,const std::string& uuid,const nb::dict& input,const std::string& expected,const nb::list& choices) {
             return self.owner->require().editGeometrySequence(self.require(),uuid,sequenceEditFromPy(input),expected,edgeEditsFromPy(choices));
         },nb::arg("object_uuid"),nb::arg("edit"),nb::arg("expected_revision"),nb::arg("edge_edits")=nb::list())
         .def("resize_surface", [](PyObjectWriteTxn& self,const std::string& uuid,const nb::dict& input,const std::string& expected,const nb::list& choices) {
             return self.owner->require().resizeSurface(self.require(),uuid,surfaceResizeFromPy(input),expected,edgeEditsFromPy(choices));
-        },nb::arg("object_uuid"),nb::arg("resize"),nb::arg("expected_revision"),nb::arg("edge_edits")=nb::list())
-        .def("update_surface_channels", [](PyObjectWriteTxn& self, const std::string& uuid, const nb::list& channels,
-                                           const std::vector<std::string>& remove, const std::string& expected, const nb::list& choices) {
-            nb::dict input; input["kind"] = "patch"; input["arrays"] = channels;
-            const auto data = geometryFromPy(input); const auto edges = edgeEditsFromPy(choices);
-            return self.owner->require().updateSurfaceChannels(self.require(), uuid, data.arrays, remove, expected, edges);
-        }, nb::arg("object_uuid"), nb::arg("channels"), nb::arg("remove"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
-        .def("edit_geometry_rectangle", [](PyObjectWriteTxn& self, const std::string& uuid, const std::string& name,
-                                          int64_t row, int64_t column, int64_t rows, int64_t columns,
-                                          const nb::bytes& data, const std::string& expected, const nb::list& choices) {
-            const auto* p = reinterpret_cast<const uint8_t*>(data.c_str());
-            const std::vector<uint8_t> bytes(p, p + data.size()); const auto edges = edgeEditsFromPy(choices);
-            return self.owner->require().editGeometryRectangle(self.require(), uuid, name, row, column, rows, columns, bytes, expected, edges);
-        }, nb::arg("object_uuid"), nb::arg("array_name"), nb::arg("row"), nb::arg("column"), nb::arg("rows"), nb::arg("columns"),
-           nb::arg("data"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
-        .def("affected_geometry_edit_edges", [](PyObjectWriteTxn& self, const std::string& uuid,
-                                                const nb::list& input, const std::string& expected) {
-            const auto edges = self.owner->require().affectedGeometryEditEdges(self.require(), uuid, geometryEditsFromPy(input), expected);
-            nb::list result; for (const auto& edge : edges) result.append(edgeToPy(edge)); return result;
-        }, nb::arg("object_uuid"), nb::arg("edits"), nb::arg("expected_revision"))
-        .def("affected_geometry_edges", [](PyObjectWriteTxn& self, const std::string& uuid, const nb::object& input) {
-            const auto edges = self.owner->require().affectedGeometryEdges(self.require(), uuid, geometryInputFromPy(input));
-            nb::list result; for (const auto& edge : edges) result.append(edgeToPy(edge)); return result;
-        }, nb::arg("object_uuid"), nb::arg("geometry"))
-        .def("upsert_object",
-             [](PyObjectWriteTxn& self, const nb::dict& rec) { return self.owner->upsertObjectIn(self.owner->require(), self.require(), rec); })
-        .def("add_edge",
-             [](PyObjectWriteTxn& self, const nb::dict& rec) { return self.owner->addEdgeIn(self.owner->require(), self.require(), rec); })
-        .def("set_meta",
-             [](PyObjectWriteTxn& self, const std::string& uuid, const std::string& key, const nb::object& value) {
-                 self.owner->require().setMeta(self.require(), uuid, key, jsonDumps(value));
-             }, nb::arg("uuid"), nb::arg("key"), nb::arg("value").none())
-        .def("backfill_geometry_coordinates",
-             [](PyObjectWriteTxn& self, const std::string& uuid, const nb::dict& declarations) {
-                 self.owner->require().backfillGeometryCoordinates(self.require(), uuid, jsonDumps(declarations));
-             }, nb::arg("uuid"), nb::arg("declarations") = nb::dict())
-        .def("set_approval", [](PyObjectWriteTxn& self, const std::string& uuid, const std::string& state) {
-            self.owner->require().setApproval(self.require(), uuid, state);
-        });
+        },nb::arg("object_uuid"),nb::arg("resize"),nb::arg("expected_revision"),nb::arg("edge_edits")=nb::list());
+    bindMutations(store);
+    bindMutations(writer);
 }

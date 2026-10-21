@@ -4,7 +4,7 @@ namespace vc::objects::detail {
 std::string fiberAdjacencySql(std::optional<bool> adjacent)
 {
     if (!adjacent) return {};
-    // Only JSON booleans (or the legacy missing flag) describe this relation.
+    // Only JSON booleans (or an absent flag) describe this relation.
     return " AND kind='fiber_branch' AND coalesce(json_type(meta,'$.adjacent'),'false')='" +
         std::string(*adjacent ? "true" : "false") + "'";
 }

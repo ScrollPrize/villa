@@ -27,7 +27,7 @@ Ingestion is **one-time**. Existing UUIDs (even unchanged or retired), duplicate
 and missing/ambiguous source-link targets fail. Fiber directories and PCL
 documents publish atomically; packed tracks use per-track transactions and can
 report partial success. Track identity is dataset reference plus external key.
-Always inspect `problems`; the compatibility field `unchanged` is always zero.
+Always inspect `problems`.
 `ingest_registered_geometry` loads placeholders only if they have no geometry
 history, preserving unrelated metadata. Use store edits for subsequent changes.
 
@@ -110,7 +110,7 @@ or domain-specific validity remains the caller's responsibility.
 
 **Same-winding queries must pass `adjacent=False`.** On `select_edges`,
 `neighbours`, `component`, `reachable_within` and `graph_read`, it selects ordinary
-`fiber_branch` edges, including legacy branches without the flag. `True` selects
+`fiber_branch` edges, including branches without the flag. `True` selects
 adjacent branches; `None` does not filter. Explicit filters exclude other edge
 kinds and malformed flags before traversal, including parallel edges.
 `applicable_only=True` additionally checks current shared membership/dependencies;
@@ -171,10 +171,6 @@ history. A fresh retired replica may lack an active revision to restore: restore
 on the originating replica and sync, or copy its full database. Metadata-only
 JSON import rejects lifecycle-bearing exports.
 
-Both writable and read-only opens require the current schema (13). Earlier
-development stores are rejected; recreate them from source data. No migration
-or compatibility readers are provided.
-
 ## Volume identity and coordinate scale
 
 Geometry objects use `meta.coordinates = {"volume_uuid": ..., "scale_factor": ...}`.
@@ -188,26 +184,8 @@ rejects unknown keys; positive 64-bit integers stay exact.
 
 Native object/document/collection declarations, flat `volume_uuid`/`scale_factor`
 fields and `ingest_geometry_source(..., coordinate_context={...})` must agree
-where known. Packed tracks use context. Legacy
-`vc_open_data_source_coordinate_scale_factor` maps to scale on input; all five
-legacy `vc_open_data_*` coordinate fields are removed from newly imported source
-metadata. Other legacy fields supply no inferred values.
-
-```python
-from vc_object_store import read_geometry_source_coordinates
-
-head = store.current_object_revision(uid)["uuid"]
-values = read_geometry_source_coordinates("point_collection", source, uid)
-with store.write(expected_revisions={uid: head}) as tx:
-    tx.backfill_geometry_coordinates(uid, values)
-```
-
-The source reader checks identity without decoding geometry; fiber files and
-patch directories are also supported. Backfill requires checked writes, fills
-unknown values only, preserves annotations, removes current legacy fields, and
-aborts the action on a conflict even if caught. Omit declarations to use a legacy
-scale in `meta.source`. History stays unchanged. Anchors dependent on the frame
-must declare `metadata_keys=["coordinates"]` and receive explicit edit decisions.
+where known. Packed tracks use context. Set coordinates with `set_meta`; dependent
+anchors declare `metadata_keys=["coordinates"]`.
 
 ## Arrays, surface channels and sparse edits
 

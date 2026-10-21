@@ -29,6 +29,13 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
     impl->options.readerPoolSize = std::max(1, options.readerPoolSize);
     impl->hostname = options.hostnameOverride.value_or(detectHostname());
 
+    auto validate = [&](sqlite3* db) {
+        if (pragmaInt(db, "application_id") != kApplicationId)
+            throw std::runtime_error("object store: unsupported database format: " + path.string());
+        if (pragmaInt(db, "user_version") != kSchemaVersion)
+            throw std::runtime_error("object store: unsupported database schema: " + path.string());
+    };
+
     if (create) {
         std::error_code ec;
         if (std::filesystem::exists(path) && std::filesystem::file_size(path, ec) > 0)
@@ -50,17 +57,11 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
             exec(impl->writer, "ROLLBACK;");
             throw;
         }
-    } else {
-        if (!options.readOnly) {
-            impl->writer = openConnection(path, SQLITE_OPEN_READWRITE, options, false);
-            if (pragmaInt(impl->writer, "application_id") != kApplicationId)
-                throw std::runtime_error("object store: unsupported database format: " + path.string());
-            const auto version = pragmaInt(impl->writer, "user_version");
-            if (version != kSchemaVersion)
-                throw std::runtime_error("object store: unsupported database schema; recreate the store from source data");
-            exec(impl->writer, "PRAGMA journal_mode=WAL;");
-            exec(impl->writer, "PRAGMA synchronous=FULL;");
-        }
+    } else if (!options.readOnly) {
+        impl->writer = openConnection(path, SQLITE_OPEN_READWRITE, options, false);
+        validate(impl->writer);
+        exec(impl->writer, "PRAGMA journal_mode=WAL;");
+        exec(impl->writer, "PRAGMA synchronous=FULL;");
     }
 
     // WAL readers need write access to the -shm file, so pooled readers
@@ -71,13 +72,7 @@ std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::
         sqlite3* conn = openConnection(path, readerFlags, options, true);
         impl->readerPool.push_back(conn);
         impl->statementPools.emplace(conn, std::make_unique<StatementPool>());
-        if (options.readOnly) {
-            if (pragmaInt(conn, "application_id") != kApplicationId)
-                throw std::runtime_error("object store: unsupported database format: " + path.string());
-            const auto version = pragmaInt(conn, "user_version");
-            if (version != kSchemaVersion)
-                throw std::runtime_error("object store: unsupported database schema; recreate the store from source data: " + path.string());
-        }
+        if (options.readOnly) validate(conn);
     }
     if (impl->writer) impl->statementPools.emplace(impl->writer, std::make_unique<StatementPool>());
     return impl;

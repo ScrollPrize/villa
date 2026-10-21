@@ -1,11 +1,16 @@
 #include "internal/RecordJson.hpp"
+#include "internal/RecordFields.hpp"
 #include "vc_object_store/Uuid.hpp"
 
 namespace vc::objects::detail {
-nlohmann::json bboxToJson(const std::optional<std::array<double, 6>>& box)
-{
-    if (!box) return nullptr;
-    return {(*box)[0], (*box)[1], (*box)[2], (*box)[3], (*box)[4], (*box)[5]};
+namespace {
+template<class T> nlohmann::json fieldJson(const T& value) { return value; }
+template<class T> nlohmann::json fieldJson(const std::optional<T>& value) {
+    return value ? nlohmann::json(*value) : nlohmann::json();
+}
+template<class T> void readDetailField(const nlohmann::json& value, T& field) { value.get_to(field); }
+void readDetailField(const nlohmann::json& value, std::array<double, 2>& field) { field = scaleFromJson(value); }
+void readDetailField(const nlohmann::json& value, std::optional<std::array<double, 6>>& field) { field = bboxFromJson(value); }
 }
 
 bool includeField(const std::set<std::string>* fields, const char* key)
@@ -16,16 +21,10 @@ bool includeField(const std::set<std::string>* fields, const char* key)
 nlohmann::json commonToJson(const RecordCommon& r, const std::set<std::string>* fields)
 {
     nlohmann::json j{{"uuid", r.uuid}, {"kind", r.kind}};
-    auto put = [&](const char* key, const auto& value) { if (includeField(fields, key)) j[key] = value; };
-    put("generation", r.generation);
-    put("created_by", r.createdBy); put("created_at", r.createdAt); put("created_host", r.createdHost);
-    put("changed_by", r.changedBy); put("changed_at", r.changedAt); put("changed_host", r.changedHost);
-    put("tags", r.tags); put("approval_state", r.approvalState);
+    commonFields(r, [&](const char* key, const auto& value) {
+        if (includeField(fields, key)) j[key] = fieldJson(value);
+    });
     if (includeField(fields, "meta")) j["meta"] = nlohmann::json::parse(r.meta);
-    put("approved_by", r.approvedBy ? nlohmann::json(*r.approvedBy) : nlohmann::json());
-    put("approved_at", r.approvedAt ? nlohmann::json(*r.approvedAt) : nlohmann::json());
-    put("approved_host", r.approvedHost ? nlohmann::json(*r.approvedHost) : nlohmann::json());
-    put("approved_generation", r.approvedGeneration ? nlohmann::json(*r.approvedGeneration) : nlohmann::json());
     return j;
 }
 
@@ -60,28 +59,15 @@ nlohmann::json objectToJson(const ObjectRecord& r, const std::set<std::string>* 
     nlohmann::json j = commonToJson(r, fields);
     if (includeField(fields, "retired")) j["retired"] = r.retired;
     if (includeField(fields, "lifecycle_epoch")) j["lifecycle_epoch"] = r.lifecycleEpoch;
-    if (includeField(fields, "name")) j["name"] = r.name;
-    if (includeField(fields, "format_version")) j["format_version"] = r.formatVersion;
-    if (includeField(fields, "storage_kind")) j["storage_kind"] = r.storageKind;
-    if (includeField(fields, "storage_ref")) j["storage_ref"] = r.storageRef;
-    if (includeField(fields, "data_generation")) j["data_generation"] = r.dataGeneration;
+    objectFields(r, [&](const char* key, const auto& value) {
+        if (includeField(fields, key)) j[key] = value;
+    });
     if (r.dataChecksum && includeField(fields, "data_checksum")) j["data_checksum"] = *r.dataChecksum;
-    if (r.fiber && includeField(fields, "fiber")) {
-        j["fiber"] = {{"family", r.fiber->family}, {"manual_family", r.fiber->manualFamily},
-                      {"control_point_count", r.fiber->controlPointCount}, {"line_point_count", r.fiber->linePointCount},
-                      {"length", r.fiber->length}, {"width", r.fiber->width},
-                      {"width_gap_fraction", r.fiber->widthGapFraction}, {"optimization_mode", r.fiber->optimizationMode},
-                      {"bbox", bboxToJson(r.fiber->bbox)}};
-    }
-    if (r.patch && includeField(fields, "patch")) {
-        j["patch"] = {{"grid_width", r.patch->gridWidth}, {"grid_height", r.patch->gridHeight},
-                      {"scale", r.patch->scale}, {"bbox", bboxToJson(r.patch->bbox)}};
-    }
-    if (r.track && includeField(fields, "track")) {
-        j["track"] = {{"dataset_ref", r.track->datasetRef}, {"external_key", r.track->externalKey},
-                      {"family", r.track->family}, {"point_count", r.track->pointCount},
-                      {"length", r.track->length}, {"bbox", bboxToJson(r.track->bbox)}};
-    }
+    objectDetails(r, [&](const char* key, const auto& detail) {
+        if (!detail || !includeField(fields, key)) return;
+        auto& value = j[key];
+        detailFields(*detail, [&](const char* name, const auto& field) { value[name] = fieldJson(field); });
+    });
     return j;
 }
 
@@ -90,51 +76,22 @@ ObjectRecord objectFromJson(const nlohmann::json& j)
     ObjectRecord r;
     r.uuid = j.value("uuid", "");
     r.kind = j.value("kind", "");
-    r.name = j.value("name", "");
     r.retired = j.value("retired", false);
     r.lifecycleEpoch = j.value("lifecycle_epoch", "");
-    r.formatVersion = j.value("format_version", int64_t(0));
-    r.storageKind = j.value("storage_kind", "");
-    r.storageRef = j.value("storage_ref", "");
-    r.dataGeneration = j.value("data_generation", int64_t(0));
+    objectFields(r, [&](const char* key, auto& field) { field = j.value(key, field); });
     if (j.contains("data_checksum") && j.at("data_checksum").is_string()) r.dataChecksum = j.at("data_checksum").get<std::string>();
     if (j.contains("tags")) r.tags = j.at("tags").get<std::vector<std::string>>();
     if (j.contains("meta")) r.meta = j.at("meta").dump();
     r.approvalState = j.value("approval_state", "pending");
-    if (j.contains("fiber")) {
-        const auto& f = j.at("fiber");
-        FiberDetail d;
-        d.family = f.value("family", "");
-        d.manualFamily = f.value("manual_family", false);
-        d.controlPointCount = f.value("control_point_count", int64_t(0));
-        d.linePointCount = f.value("line_point_count", int64_t(0));
-        d.length = f.value("length", 0.0);
-        d.width = f.value("width", 0.0);
-        d.widthGapFraction = f.value("width_gap_fraction", 0.2);
-        d.optimizationMode = f.value("optimization_mode", "");
-        if (f.contains("bbox")) d.bbox = bboxFromJson(f.at("bbox"));
-        r.fiber = d;
-    }
-    if (j.contains("patch")) {
-        const auto& p = j.at("patch");
-        PatchDetail d;
-        d.gridWidth = p.value("grid_width", int64_t(0));
-        d.gridHeight = p.value("grid_height", int64_t(0));
-        d.scale = scaleFromJson(p.value("scale", nlohmann::json(0.0)));
-        if (p.contains("bbox")) d.bbox = bboxFromJson(p.at("bbox"));
-        r.patch = d;
-    }
-    if (j.contains("track")) {
-        const auto& t = j.at("track");
-        TrackDetail d;
-        d.datasetRef = t.value("dataset_ref", "");
-        d.externalKey = t.value("external_key", "");
-        d.family = t.value("family", "");
-        d.pointCount = t.value("point_count", int64_t(0));
-        d.length = t.value("length", 0.0);
-        if (t.contains("bbox")) d.bbox = bboxFromJson(t.at("bbox"));
-        r.track = d;
-    }
+    objectDetails(r, [&](const char* key, auto& detail) {
+        if (!j.contains(key)) return;
+        detail.emplace();
+        const auto& value = j.at(key);
+        if (!value.is_object()) throw std::invalid_argument("object detail must be an object");
+        detailFields(*detail, [&](const char* name, auto& field) {
+            if (value.contains(name)) readDetailField(value.at(name), field);
+        });
+    });
     return r;
 }
 

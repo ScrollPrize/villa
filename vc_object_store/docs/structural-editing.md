@@ -55,18 +55,17 @@ Sampled `line_points` and tracks have no stable point IDs.
 A point deleted from an identity-managed sequence cannot be recreated as new
 rows using its old ID. An explicit slice of its historical revision can restore
 it. The allocation ledger also survives selection of an older geometry through
-lifecycle restoration. Before the first structural edit, legacy IDs/annotations
-form the baseline; this does not reconstruct identities lost in earlier legacy
-full replacements. IDs are unique within a sequence; merging colliding source
-ID namespaces requires an application decision.
+lifecycle restoration. The first structural edit establishes the ID/annotation
+baseline from the current geometry. IDs are unique within a sequence; merging
+colliding source ID namespaces requires an application decision.
 
 Annotations are stored by ID in immutable metadata snapshots, separately from array
 order; geometry manifests reference those snapshots. `geometry_point_annotations(revision_uuid, array_name)` returns
 annotations aligned with that revision's sequence. The first structural edit
-moves the corresponding legacy `meta.source` positional annotation field into
+moves the corresponding `meta.source` positional annotation field into
 this representation. Existing native PCL export resolves annotations through
 IDs, preventing the same-length label-swap problem. Low-level ID edits/full
-replacements of annotated legacy collections are rejected; after structural
+replacements of annotated collections are rejected; after structural
 management begins, full `put_geometry` replacement is rejected. Use structural
 splices or the existing sparse coordinate edit API.
 

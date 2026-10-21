@@ -4,6 +4,8 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <type_traits>
+#include <utility>
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
@@ -17,6 +19,7 @@
 #include "vc_object_store/objects/GeometryExport.hpp"
 #include "internal/Anchors.hpp"
 #include "internal/JsonFields.hpp"
+#include "internal/RecordFields.hpp"
 
 namespace nb = nanobind;
 namespace vo = vc::objects;
@@ -44,43 +47,21 @@ int64_t getInt(const nb::dict& d, const char* key, int64_t fallback = 0)
     return has(d, key) ? nb::cast<int64_t>(d[key]) : fallback;
 }
 
-double getFloat(const nb::dict& d, const char* key, double fallback = 0.0)
-{
-    return has(d, key) ? nb::cast<double>(d[key]) : fallback;
-}
-
-bool getBool(const nb::dict& d, const char* key, bool fallback = false)
-{
-    return has(d, key) ? nb::cast<bool>(d[key]) : fallback;
-}
-
 std::vector<std::string> getTags(const nb::dict& d)
 {
-    std::vector<std::string> out;
+    std::vector<std::string> result;
     if (has(d, "tags"))
-        for (nb::handle t : d["tags"])
-            out.push_back(nb::cast<std::string>(t));
-    return out;
+        for (nb::handle tag : d["tags"]) result.push_back(nb::cast<std::string>(tag));
+    return result;
 }
 
-std::optional<std::array<double, 6>> getBbox(const nb::dict& d)
-{
-    if (!has(d, "bbox")) return std::nullopt;
-    nb::sequence seq = nb::cast<nb::sequence>(d["bbox"]);
-    if (nb::len(seq) != 6)
-        throw std::runtime_error("bbox must have 6 numbers");
-    std::array<double, 6> box{};
-    for (int i = 0; i < 6; ++i) box[size_t(i)] = nb::cast<double>(seq[i]);
-    return box;
+template<class T> void readDetailField(const nb::handle& value, T& field) { field = nb::cast<T>(value); }
+void readDetailField(const nb::handle& value, std::array<double, 2>& field) {
+    field = vo::detail::scaleFromJson(nb::isinstance<nb::float_>(value) || nb::isinstance<nb::int_>(value)
+        ? nlohmann::json(nb::cast<double>(value)) : nlohmann::json(nb::cast<std::array<double, 2>>(value)));
 }
-
-nb::object bboxToPy(const std::optional<std::array<double, 6>>& box)
-{
-    if (!box) return nb::none();
-    nb::list out;
-    for (double v : *box) out.append(v);
-    return out;
-}
+template<class T> const T& detailFieldToPy(const T& value) { return value; }
+nb::tuple detailFieldToPy(const std::array<double, 2>& value) { return nb::make_tuple(value[0], value[1]); }
 
 vo::Anchor anchorFromPy(const nb::handle& obj)
 {
@@ -136,23 +117,9 @@ void commonToPy(nb::dict& d, const vo::RecordCommon& r, const std::set<std::stri
     auto include = [&](const char* name) { return !fields || fields->contains(name); };
     d["uuid"] = r.uuid;
     d["kind"] = r.kind;
-    if (include("generation")) d["generation"] = r.generation;
-    if (include("created_by")) d["created_by"] = r.createdBy;
-    if (include("created_at")) d["created_at"] = r.createdAt;
-    if (include("created_host")) d["created_host"] = r.createdHost;
-    if (include("changed_by")) d["changed_by"] = r.changedBy;
-    if (include("changed_at")) d["changed_at"] = r.changedAt;
-    if (include("changed_host")) d["changed_host"] = r.changedHost;
-    if (include("approval_state")) d["approval_state"] = r.approvalState;
-    if (include("approved_by")) d["approved_by"] = r.approvedBy ? nb::object(pyStr(*r.approvedBy)) : nb::none();
-    if (include("approved_at")) d["approved_at"] = r.approvedAt ? nb::object(pyStr(*r.approvedAt)) : nb::none();
-    if (include("approved_host")) d["approved_host"] = r.approvedHost ? nb::object(pyStr(*r.approvedHost)) : nb::none();
-    if (include("approved_generation")) d["approved_generation"] = r.approvedGeneration ? nb::object(nb::int_(*r.approvedGeneration)) : nb::none();
-    if (include("tags")) {
-        nb::list tags;
-        for (const auto& t : r.tags) tags.append(pyStr(t));
-        d["tags"] = tags;
-    }
+    vo::detail::commonFields(r, [&](const char* key, const auto& value) {
+        if (include(key)) d[key] = value;
+    });
     if (include("meta")) d["meta"] = jsonLoads(r.meta);
 }
 
@@ -163,43 +130,16 @@ nb::dict objectToPy(const vo::ObjectRecord& r, const std::set<std::string>* fiel
     commonToPy(d, r, fields);
     if (include("retired")) d["retired"] = r.retired;
     if (include("lifecycle_epoch")) d["lifecycle_epoch"] = r.lifecycleEpoch;
-    if (include("name")) d["name"] = r.name;
-    if (include("format_version")) d["format_version"] = r.formatVersion;
-    if (include("storage_kind")) d["storage_kind"] = r.storageKind;
-    if (include("storage_ref")) d["storage_ref"] = r.storageRef;
-    if (include("data_generation")) d["data_generation"] = r.dataGeneration;
-    if (include("data_checksum")) d["data_checksum"] = r.dataChecksum ? nb::object(pyStr(*r.dataChecksum)) : nb::none();
-    if (r.fiber && include("fiber")) {
-        nb::dict f;
-        f["family"] = r.fiber->family;
-        f["manual_family"] = r.fiber->manualFamily;
-        f["control_point_count"] = r.fiber->controlPointCount;
-        f["line_point_count"] = r.fiber->linePointCount;
-        f["length"] = r.fiber->length;
-        f["width"] = r.fiber->width;
-        f["width_gap_fraction"] = r.fiber->widthGapFraction;
-        f["optimization_mode"] = r.fiber->optimizationMode;
-        f["bbox"] = bboxToPy(r.fiber->bbox);
-        d["fiber"] = f;
-    }
-    if (r.patch && include("patch")) {
-        nb::dict p;
-        p["grid_width"] = r.patch->gridWidth;
-        p["grid_height"] = r.patch->gridHeight;
-        p["scale"] = nb::make_tuple(r.patch->scale[0], r.patch->scale[1]);
-        p["bbox"] = bboxToPy(r.patch->bbox);
-        d["patch"] = p;
-    }
-    if (r.track && include("track")) {
-        nb::dict t;
-        t["dataset_ref"] = r.track->datasetRef;
-        t["external_key"] = r.track->externalKey;
-        t["family"] = r.track->family;
-        t["point_count"] = r.track->pointCount;
-        t["length"] = r.track->length;
-        t["bbox"] = bboxToPy(r.track->bbox);
-        d["track"] = t;
-    }
+    vo::detail::objectFields(r, [&](const char* key, const auto& value) {
+        if (include(key)) d[key] = value;
+    });
+    if (include("data_checksum")) d["data_checksum"] = r.dataChecksum;
+    vo::detail::objectDetails(r, [&](const char* key, const auto& detail) {
+        if (!detail || !include(key)) return;
+        nb::dict value;
+        vo::detail::detailFields(*detail, [&](const char* name, const auto& field) { value[name] = detailFieldToPy(field); });
+        d[key] = value;
+    });
     return d;
 }
 
@@ -208,54 +148,20 @@ vo::ObjectRecord objectFromPy(const nb::dict& d)
     vo::ObjectRecord r;
     r.uuid = getStr(d, "uuid");
     r.kind = getStr(d, "kind");
-    r.name = getStr(d, "name");
-    r.formatVersion = getInt(d, "format_version");
-    r.storageKind = getStr(d, "storage_kind");
-    r.storageRef = getStr(d, "storage_ref");
-    r.dataGeneration = getInt(d, "data_generation");
+    vo::detail::objectFields(r, [&](const char* key, auto& field) {
+        if (has(d, key)) field = nb::cast<std::remove_cvref_t<decltype(field)>>(d[key]);
+    });
     if (has(d, "data_checksum")) r.dataChecksum = nb::cast<std::string>(d["data_checksum"]);
     r.tags = getTags(d);
     if (has(d, "meta")) r.meta = jsonDumps(d["meta"]);
-    if (has(d, "fiber")) {
-        const nb::dict f = nb::cast<nb::dict>(d["fiber"]);
-        vo::FiberDetail det;
-        det.family = getStr(f, "family");
-        det.manualFamily = getBool(f, "manual_family");
-        det.controlPointCount = getInt(f, "control_point_count");
-        det.linePointCount = getInt(f, "line_point_count");
-        det.length = getFloat(f, "length");
-        det.width = getFloat(f, "width");
-        det.widthGapFraction = getFloat(f, "width_gap_fraction", 0.2);
-        det.optimizationMode = getStr(f, "optimization_mode");
-        det.bbox = getBbox(f);
-        r.fiber = det;
-    }
-    if (has(d, "patch")) {
-        const nb::dict p = nb::cast<nb::dict>(d["patch"]);
-        vo::PatchDetail det;
-        det.gridWidth = getInt(p, "grid_width");
-        det.gridHeight = getInt(p, "grid_height");
-        if (has(p, "scale")) {
-            const nb::object scale = p["scale"];
-            const auto value = nb::isinstance<nb::float_>(scale) || nb::isinstance<nb::int_>(scale)
-                ? nlohmann::json(nb::cast<double>(scale))
-                : nlohmann::json(nb::cast<std::array<double, 2>>(scale));
-            det.scale = vo::detail::scaleFromJson(value);
-        }
-        det.bbox = getBbox(p);
-        r.patch = det;
-    }
-    if (has(d, "track")) {
-        const nb::dict t = nb::cast<nb::dict>(d["track"]);
-        vo::TrackDetail det;
-        det.datasetRef = getStr(t, "dataset_ref");
-        det.externalKey = getStr(t, "external_key");
-        det.family = getStr(t, "family");
-        det.pointCount = getInt(t, "point_count");
-        det.length = getFloat(t, "length");
-        det.bbox = getBbox(t);
-        r.track = det;
-    }
+    vo::detail::objectDetails(r, [&](const char* key, auto& detail) {
+        if (!has(d, key)) return;
+        detail.emplace();
+        const auto value = nb::cast<nb::dict>(d[key]);
+        vo::detail::detailFields(*detail, [&](const char* name, auto& field) {
+            if (has(value, name)) readDetailField(value[name], field);
+        });
+    });
     return r;
 }
 
@@ -342,7 +248,7 @@ nb::dict geometryToPy(const vo::GeometryRevision& r)
 nb::dict geometryReportToPy(const vo::GeometryIngestReport& r)
 {
     nb::dict result;
-    result["edges_imported"] = r.edgesImported; result["ingested"] = r.ingested; result["unchanged"] = r.unchanged; result["problems"] = r.problems;
+    result["edges_imported"] = r.edgesImported; result["ingested"] = r.ingested; result["problems"] = r.problems;
     return result;
 }
 
@@ -421,26 +327,28 @@ struct PyObjectStore {
         auto txn = g.read();
         return fn(g, txn);
     }
-    template <typename Fn>
+    template <bool ReleaseGil = false, typename Fn>
     auto withWrite(Fn&& fn)
     {
         require();
         auto lease = db;
-        auto& g = *lease;
-        auto txn = g.write();
-        auto result = fn(g, txn);
-        txn.commit();
-        return result;
+        auto write = [&] {
+            auto txn = lease->write();
+            if constexpr (std::is_void_v<std::invoke_result_t<Fn, vo::ObjectStore&, vo::WriteTxn&>>) {
+                fn(*lease, txn);
+                txn.commit();
+            } else {
+                auto result = fn(*lease, txn);
+                txn.commit();
+                return result;
+            }
+        };
+        if constexpr (ReleaseGil) {
+            nb::gil_scoped_release release;
+            return write();
+        } else return write();
     }
 
-    std::string upsertObjectIn(vo::ObjectStore& g, vo::WriteTxn& txn, const nb::dict& rec)
-    {
-        return g.upsertObject(txn, objectFromPy(rec));
-    }
-    std::string addEdgeIn(vo::ObjectStore& g, vo::WriteTxn& txn, const nb::dict& rec)
-    {
-        return g.addEdge(txn, edgeFromPy(rec));
-    }
 };
 
 // Batch write transaction usable as a context manager:
@@ -475,6 +383,12 @@ struct PyObjectWriteTxn {
             lease.reset();
         }
     }
+    template <typename Fn>
+    auto withRead(Fn&& fn) { return fn(owner->require(), require()); }
+
+    template <bool ReleaseGil = false, typename Fn>
+    auto withWrite(Fn&& fn) { return withRead(std::forward<Fn>(fn)); }
+
 };
 
 

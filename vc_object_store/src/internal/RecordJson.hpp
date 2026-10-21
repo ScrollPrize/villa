@@ -4,8 +4,6 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include <set>
 namespace vc::objects::detail {
-nlohmann::json bboxToJson(const std::optional<std::array<double, 6>>& box);
-
 bool includeField(const std::set<std::string>* fields, const char* key);
 
 nlohmann::json commonToJson(const RecordCommon& r, const std::set<std::string>* fields = nullptr);
