@@ -3037,6 +3037,8 @@ def _slice_batch(batch: FiberTrace3DBatch, start: int, stop: int) -> FiberTrace3
             sparse_normal = sparse_normal[sparse_mask]
     return FiberTrace3DBatch(
         target_output_stride=batch.target_output_stride,
+        normalization_output_stride=batch.normalization_output_stride,
+        normalization_counts=batch.normalization_counts,
         coarse_geometry=None if batch.coarse_geometry is None else batch.coarse_geometry[start:stop],
         presence_target_mode=batch.presence_target_mode,
         annotation_targets=None if batch.annotation_targets is None else batch.annotation_targets[start:stop],

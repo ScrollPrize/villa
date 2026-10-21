@@ -229,19 +229,20 @@ def test_consumer_metadata_allows_only_allocation_local_changes(tmp_path):
     assert metadata.for_config(config).config.datasets is not metadata.config.datasets
 
 
-def test_default_cuda_launch_uses_manager_without_fallback(monkeypatch):
+def test_default_cuda_launch_uses_manager_without_fallback(monkeypatch, tmp_path):
     from vesuvius.neural_tracing.fiber_trace_3d import cooperative_training
-    monkeypatch.setattr(train, "_load_raw_config", lambda _: {"training": {"device": "cuda"}})
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({"training": {"device": "cuda"}}))
     monkeypatch.setattr(train, "training_units", lambda *a, **k: pytest.fail("unmanaged fallback"))
     def managed(*a, **kw):
         assert kw["socket"] is None
         raise ValueError("manager unavailable")
     monkeypatch.setattr(cooperative_training, "run_cooperative_training", managed)
     with pytest.raises(ValueError, match="manager unavailable"):
-        train.run_training("example.json")
+        train.run_training(config)
     monkeypatch.setenv("WORLD_SIZE", "2")
-    with pytest.raises(SystemExit, match="starts its GPU processes itself"):
-        train.run_training("example.json")
+    with pytest.raises(SystemExit, match="manager supervisor launches GPU workers"):
+        train.run_training(config)
 
 
 def test_normal_worker_never_reads_allocator_usage(monkeypatch):
