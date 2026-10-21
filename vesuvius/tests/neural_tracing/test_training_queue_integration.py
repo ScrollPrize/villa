@@ -193,7 +193,7 @@ def _trainer_equivalence(tmp_path, monkeypatch, *, device="cpu", depth=0, mode=N
     # Init consumes exactly the same RNG as the serial oracle; input sampling
     # has its own canonical per-sample seeds and cannot depend on worker order.
     torch.manual_seed(151)
-    train.run_training(path, resume_checkpoint=resume)
+    train.run_training(path, resume_checkpoint=resume, unmanaged=True)
     assert writer.closed and writer.flushes
     assert len(observed_batches) == 4
     assert rows.keys() == expected_rows.keys()
@@ -268,7 +268,7 @@ def test_real_paris4_trainer_failure_closes_shared_workers_and_writer(tmp_path, 
 
     monkeypatch.setattr(train, "_forward_loss_tensors", fail)
     with pytest.raises(RuntimeError, match="injected trainer failure"):
-        train.run_training(path)
+        train.run_training(path, unmanaged=True)
     assert writer.closed
     assert len(queues) == 1
     assert not queues[0]._owned
@@ -309,7 +309,7 @@ def _distributed_worker(rank, path, rendezvous, device):
                                 world_size=2, timeout=timedelta(seconds=60))
 
     train._distributed_init = initialize
-    train.run_training(path)
+    train.run_training(path, unmanaged=True)
 
 
 def _distributed_equivalence(tmp_path, device, test_count):
@@ -372,7 +372,7 @@ def test_real_paris4_open_ended_training_keeps_lazy_queue_and_closes_on_error(tm
 
     monkeypatch.setattr(train, "_forward_loss_tensors", stop)
     with pytest.raises(RuntimeError, match="stop open-ended run"):
-        train.run_training(path)
+        train.run_training(path, unmanaged=True)
     assert processed == [(0, 1), (2, 3), (4, 5)]
     _assert_workers_exited(queues[0])
 
@@ -394,4 +394,4 @@ def test_invalid_preparation_options_fail_before_worker_start(tmp_path, monkeypa
     monkeypatch.setattr(train, "load_config", lambda _: None)
     monkeypatch.setattr(train, "FiberTrace3DLoader", lambda _: pytest.fail("started loader"))
     with pytest.raises(ValueError, match=match):
-        train.run_training(tmp_path / "unused.json")
+        train.run_training(tmp_path / "unused.json", unmanaged=True)

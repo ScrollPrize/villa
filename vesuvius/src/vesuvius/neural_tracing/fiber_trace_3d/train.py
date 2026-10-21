@@ -474,8 +474,9 @@ def _torchrun_world_size_from_env(env: dict[str, str] | None = None) -> int:
 def _require_single_process_cli_mode(mode_name: str) -> None:
     if _torchrun_world_size_from_env() > 1:
         raise SystemExit(
-            f"{mode_name} is single-process only. Run normal training under torchrun, "
-            "or run this subcommand without torchrun/WORLD_SIZE>1."
+            f"{mode_name} is single-process only. Launch managed training directly; "
+            "it starts its GPU processes itself. Run this subcommand without "
+            "torchrun/WORLD_SIZE>1."
         )
 
 
@@ -1508,6 +1509,55 @@ def compute_conditioned_losses(
     )
 
 
+@dataclass(frozen=True)
+class _SampleProgress:
+    start_update: int
+    start_samples: int
+    global_batch_size: int
+
+    def at(self, update: int) -> int:
+        return self.start_samples + (int(update) - self.start_update) * self.global_batch_size
+
+
+class _SampleAxisWriter:
+    """Translate update-based logging calls at the TensorBoard boundary only."""
+
+    def __init__(self, writer: Any, progress: _SampleProgress):
+        self.writer = writer
+        self.progress = progress
+
+    def add_scalar(self, tag, value, global_step, **kwargs):
+        return self.writer.add_scalar(tag, value, self.progress.at(global_step), **kwargs)
+
+    def add_image(self, tag, value, global_step, **kwargs):
+        return self.writer.add_image(tag, value, self.progress.at(global_step), **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self.writer, name)
+
+
+def _resume_sample_count(metadata: dict[str, Any], update: int, override: Any = None) -> int:
+    if override is not None:
+        count = int(override)
+    elif metadata.get("samples_seen") is not None:
+        count = int(metadata["samples_seen"])
+    elif int(update) == 0:
+        count = 0
+    else:
+        batch = metadata.get("optimizer_global_batch_size")
+        if batch is None:
+            batch = metadata.get("config", {}).get("training", {}).get("optimizer_global_batch_size")
+        if batch is None or int(batch) <= 0:
+            raise ValueError(
+                "Legacy checkpoint has no global sample count/batch size; set "
+                "training.resume_samples_seen to its cumulative training sample count"
+            )
+        count = int(update) * int(batch)
+    if count < 0:
+        raise ValueError("resumed sample count must be nonnegative")
+    return count
+
+
 def _save_snapshot(
     path: Path,
     *,
@@ -1518,6 +1568,7 @@ def _save_snapshot(
     config: dict[str, Any],
     metric: float | None,
     metric_name: str | None = None,
+    samples_seen: int | None = None,
 ) -> None:
     snapshot_model = _unwrap_model(model)
     payload = {
@@ -1527,6 +1578,9 @@ def _save_snapshot(
         "metric": metric,
         "metric_name": metric_name,
     }
+    if samples_seen is not None:
+        payload["samples_seen"] = int(samples_seen)
+        payload["optimizer_global_batch_size"] = int(config["training"]["optimizer_global_batch_size"])
     torch.save(payload, path)
 
 
@@ -1805,7 +1859,8 @@ def _infer_trace2cp_fields_3d(
             output = output.float()
             fields = project_3d_output_to_trace2cp_fields(
                 output,
-                tile_coords - start.reshape(1, 1, 3).astype(np.float32),
+                (tile_coords - start.reshape(1, 1, 3).astype(np.float32))
+                / float(getattr(_unwrap_model(model), "output_stride", 1)),
                 tile_valid,
                 frame_x_xyz=frame_x[y0:y1, x0:x1],
                 frame_y_xyz=frame_y[y0:y1, x0:x1],
@@ -1970,6 +2025,7 @@ def _evaluate_dense_loss_rows(
 ) -> list[tuple[int, dict[str, float]]]:
     model.eval()
     batch_size = int(loader.config.batch_size)
+    output_stride = int(getattr(_unwrap_model(model), "output_stride", 1))
     if microbatch_size is not None and (type(microbatch_size) is not int or microbatch_size < 1):
         raise ValueError("test microbatch_size must be positive")
     load_device = torch.device("cpu") if microbatch_size is not None else device
@@ -2025,7 +2081,7 @@ def _evaluate_dense_loss_rows(
             )
         targets_started = time.monotonic()
         if microbatch_size is None:
-            batch = materialize_targets(batch, loader.config)
+            batch = materialize_targets(batch, loader.config, output_stride=output_stride)
         if diagnostics is not None:
             diagnostics.marker(
                 "dense-test-targets-end",
@@ -2070,7 +2126,7 @@ def _evaluate_dense_loss_rows(
             statistics = None
             for offset in range(0, take, microbatch_size):
                 physical = _slice_batch(batch, offset, min(take, offset + microbatch_size)).to(device)
-                physical = materialize_targets(physical, loader.config)
+                physical = materialize_targets(physical, loader.config, output_stride=output_stride)
                 with _autocast_context(mixed_precision):
                     part = _forward_loss_statistics(model, physical,
                         conditioned_loss_options=conditioned_loss_options, training_loss=False)
@@ -2329,7 +2385,17 @@ def run_training(
     *,
     resume_checkpoint: str | Path | None = None,
     test_hang_diagnostics: bool = False,
+    manager_socket: str | None = None,
+    unmanaged: bool = False,
 ) -> None:
+    if unmanaged and manager_socket is not None:
+        raise ValueError("--unmanaged and --manager-socket cannot be combined")
+    raw = _load_raw_config(config_path) if not unmanaged else {}
+    if not unmanaged and str(raw.get("training", {}).get("device", "auto")).split(":")[0] != "cpu":
+        _require_single_process_cli_mode("managed training")
+        from .cooperative_training import run_cooperative_training
+        return run_cooperative_training(config_path, socket=manager_socket,
+            resume_checkpoint=resume_checkpoint, test_hang_diagnostics=test_hang_diagnostics)
     units = training_units(config_path, resume_checkpoint=resume_checkpoint,
                            test_hang_diagnostics=test_hang_diagnostics)
     try:
@@ -2349,6 +2415,10 @@ def training_units(
     batch_source: Any | None = None,
     summary_writer_factory: Any | None = None,
     distributed_init_method: str | None = None,
+    training_overrides: dict[str, Any] | None = None,
+    dataset_metadata: dict | None = None,
+    yield_initialized: bool = False,
+    on_failure: Any | None = None,
 ):
     """Yield only at completed updates or logical test groups.
 
@@ -2357,7 +2427,10 @@ def training_units(
     This is the existing shared loop, not a manager or a second trainer.
     """
     raw_config = _load_raw_config(config_path)
-    loader_config = load_config(config_path)
+    if training_overrides:
+        raw_config.setdefault("training", {}).update(training_overrides)
+    loader_config = (config_from_mapping(raw_config, config_dir=Path(config_path).resolve().parent)
+                     if training_overrides else load_config(config_path))
     training = dict(raw_config.get("training", {}))
     source_fingerprint = config_fingerprint(raw_config)
     bounded_accumulation = training.get("bounded_gradient_accumulation", False)
@@ -2407,7 +2480,14 @@ def training_units(
     target_source = None
     cuda_batch_pipeline = None
     train_iterator = None
-    loader = FiberTrace3DLoader(loader_config)
+    def dataset(name, config):
+        if dataset_metadata is None:
+            return FiberTrace3DLoader(config)
+        if name not in dataset_metadata:
+            raise ValueError(f"persistent dataset metadata missing source {name}")
+        return dataset_metadata[name].for_config(config)
+
+    loader = dataset("train", loader_config)
     test_loader = None
     if raw_config.get("test_datasets"):
         test_raw = _make_test_loader_raw_config(raw_config, training)
@@ -2415,7 +2495,7 @@ def training_units(
             test_raw,
             config_dir=Path(config_path).resolve().parent,
         )
-        test_loader = FiberTrace3DLoader(test_config)
+        test_loader = dataset("test", test_config)
     trace2cp_cfg = _trace2cp_3d_config(raw_config)
     trace2cp_loader = (
         _make_trace2cp_geometry_loader(raw_config, trace2cp_cfg)
@@ -2426,6 +2506,7 @@ def training_units(
     if "initialization_seed" in training:
         torch.manual_seed(int(training["initialization_seed"]))
     raw_model = build_fiber_trace_3d_model(raw_config)
+    output_stride = int(getattr(raw_model, "output_stride", 1))
     if _distributed_should_use_sync_batchnorm(distributed):
         raw_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(raw_model)
     raw_model = raw_model.to(device)
@@ -2610,6 +2691,18 @@ def training_units(
         or handoff_progress["sample_frontier"] != start_step * optimizer_global_batch_size
     ):
         raise ValueError("handoff canonical sample frontier/effective batch mismatch")
+    sample_progress = _SampleProgress(start_step,
+        int((handoff_progress or {}).get("samples_seen", start_step * optimizer_global_batch_size)),
+        optimizer_global_batch_size)
+    sample_axis = bool(training.get("sample_axis_logging", False))
+    if sample_axis and handoff_progress is None and resume:
+        metadata = torch.load(resume, map_location="cpu", weights_only=False)
+        sample_progress = _SampleProgress(start_step,
+            _resume_sample_count(metadata, start_step, training.get("resume_samples_seen")),
+            optimizer_global_batch_size)
+        del metadata
+    if sample_axis and writer is not None:
+        writer = _SampleAxisWriter(writer, sample_progress)
     scalar_interval = int(training.get("scalar_log_interval", 100))
     checkpoint_interval = int(training.get("checkpoint_interval", 100))
     kept_snapshot_interval = int(training.get("kept_snapshot_interval", 10000))
@@ -2676,7 +2769,8 @@ def training_units(
             progress={"step": step, "effective_batch_size": optimizer_global_batch_size,
                       "sample_frontier": step * optimizer_global_batch_size,
                       "best_metric": best_metric, "run_datestr": str(run_datestr),
-                      "pending_test": pending_test, "config_fingerprint": source_fingerprint},
+                      "pending_test": pending_test, "config_fingerprint": source_fingerprint,
+                      "samples_seen": sample_progress.at(step)},
         )
 
     if distributed.is_main:
@@ -2828,7 +2922,8 @@ def training_units(
                     vis_batch = captured_test_batches.get(0)
                     if vis_batch is None:
                         raise RuntimeError("rank 0 did not retain global test batch 0 for visualization")
-                    vis_batch = materialize_targets(vis_batch.to(device), test_loader.config)
+                    vis_batch = materialize_targets(vis_batch.to(device), test_loader.config,
+                                                    output_stride=output_stride)
                     diagnostics.marker("test-visualization-reuse-batch", step=step, batch=0)
                     diagnostics.marker("test-visualization-forward-image-begin", step=step)
                     _write_3d_sample_sheet(
@@ -2931,7 +3026,8 @@ def training_units(
         for path in destinations:
             if distributed.is_main:
                 _save_snapshot(path, model=raw_model, optimizer=optimizer, step=test_step,
-                    config=raw_config, metric=metric, metric_name=metric_name, grad_scaler=grad_scaler)
+                    config=raw_config, metric=metric, metric_name=metric_name, grad_scaler=grad_scaler,
+                    samples_seen=sample_progress.at(test_step) if sample_axis else None)
             _distributed_barrier(distributed)
 
     try:
@@ -2947,6 +3043,13 @@ def training_units(
                                                         distributed.rank, start_step),
                 optimizer_microbatch_takes, pipeline_batch_count), limit=0)
         initial_metric, initial_metric_name = None, None
+        if yield_initialized:
+            # Startup readiness restores resources/state only. All scheduled
+            # tests and optimizer work run as ordinary interruptible units.
+            if handoff is None and pending_test is None:
+                pending_test = {"step": start_step, "initial": True, "rows": [],
+                                "captured_batch": None, "elapsed": 0.0}
+            yield TrainingBoundary(start_step, False, capture_boundary, "initialized")
         if handoff is None or pending_test is not None:
             is_initial = pending_test["initial"] if pending_test is not None else True
             initial_metric, initial_metric_name = yield from run_configured_tests(start_step, initial=is_initial)
@@ -2961,6 +3064,7 @@ def training_units(
                     model=raw_model, optimizer=optimizer, step=start_step,
                     config=raw_config, metric=best_metric,
                     metric_name=initial_metric_name, grad_scaler=grad_scaler,
+                    samples_seen=sample_progress.at(start_step) if sample_axis else None,
                 )
         _distributed_barrier(distributed)
         # If a handoff interrupted a periodic test, finish its normal snapshot
@@ -2971,14 +3075,14 @@ def training_units(
         train_iterator = batch_source if batch_source is not None else queued_train
         if bounded_accumulation and optimizer_microbatch_count > 0:
             target_source = MacroBatchTargetSource(
-                train_iterator, config=loader.config, device=device, output_stride=1,
+                train_iterator, config=loader.config, device=device, output_stride=output_stride,
                 batch_sizes=optimizer_microbatch_takes,
                 conditioned=_model_uses_conditioned_decoder(raw_model))
             train_iterator = target_source
         if cuda_batch_depth > 0 and optimizer_microbatch_count > 0:
             cuda_batch_pipeline = FiberTrace3DCudaBatchPipeline(
                 train_iterator, config=loader.config, device=device,
-                output_stride=1, depth=cuda_batch_depth,
+                output_stride=output_stride, depth=cuda_batch_depth,
                 value_augmentation_suffix=cuda_value_augmentation,
             )
             train_iterator = cuda_batch_pipeline
@@ -3015,7 +3119,8 @@ def training_units(
                         step, batch_size=loader.config.batch_size, config=distributed))
                 next_batch, next_load, next_wait, next_transfer, next_target = _next_training_batch(
                     iterator=train_iterator, loader=loader, sample_index=sample_index,
-                    sample_index_limit=sample_index_limit, sample_mode="random", device=device)
+                    sample_index_limit=sample_index_limit, sample_mode="random", device=device,
+                    output_stride=output_stride)
                 load_ms += next_load
                 wait_ms += next_wait
                 to_device_ms += next_transfer
@@ -3065,7 +3170,7 @@ def training_units(
 
             if distributed.is_main and (step <= 100 or step % scalar_interval == 0):
                 print(
-                    f"step={step} loss_total={losses['total']:.6f} "
+                    f"samples={sample_progress.at(step)} update={step} loss_total={losses['total']:.6f} "
                     f"loss_direction={losses['direction']:.6f} "
                     f"loss_presence={losses['presence']:.6f} "
                     f"angle_mean_deg={losses['angle_mean_deg']:.2f} "
@@ -3117,6 +3222,12 @@ def training_units(
 
             save_test_snapshots(step, test_metric, test_metric_name)
             yield TrainingBoundary(step, max_steps is not None and step >= max_steps, capture_boundary)
+    except Exception:
+        # Notify the owner before a local collective teardown waits for peers.
+        if on_failure is not None:
+            import traceback
+            on_failure(traceback.format_exc())
+        raise
     finally:
         # Reverse ownership order: wake the preparation reader before joining
         # workers. Call every cleanup even if a preceding close raises.
@@ -3819,7 +3930,10 @@ def _make_train_sample_3d_sheet(
     volume = batch.volume[0, 0].detach().cpu().numpy()
     valid = batch.valid_mask[0, 0].detach().cpu().numpy().astype(bool)
     supervised_presence = F.max_pool3d(
-        batch.presence_target[0:1],
+        F.interpolate(batch.presence_target[0:1], size=volume.shape,
+                      mode="trilinear", align_corners=False)
+        if tuple(batch.presence_target.shape[2:]) != tuple(volume.shape)
+        else batch.presence_target[0:1],
         kernel_size=3,
         stride=1,
         padding=1,
@@ -4066,6 +4180,9 @@ def _write_3d_sample_sheet(
             else:
                 vis_output = model(batch.volume[:take])
         vis_output = vis_output.float()
+        if tuple(vis_output.shape[2:]) != tuple(batch.volume.shape[2:]):
+            vis_output = F.interpolate(vis_output, size=batch.volume.shape[2:],
+                                       mode="trilinear", align_corners=False)
     if diagnostics is not None:
         diagnostics.marker("sample-sheet-forward-complete", step=step, tag=tag)
     _diagnostic_cuda_synchronize(
@@ -4577,6 +4694,7 @@ def _next_training_batch(
     device: torch.device,
     profile_targets: bool = False,
     prepare_targets: bool = True,
+    output_stride: int = 1,
 ) -> tuple[FiberTrace3DBatch, float, float, float, float]:
     wait_start = time.perf_counter()
     if iterator is None:
@@ -4590,7 +4708,7 @@ def _next_training_batch(
         if not prepare_targets:
             return batch, wait_ms, wait_ms, 0.0, 0.0
         target_start = time.perf_counter()
-        batch = materialize_targets(batch, loader.config, profile=profile_targets)
+        batch = materialize_targets(batch, loader.config, profile=profile_targets, output_stride=output_stride)
         if profile_targets and device.type == "cuda":
             torch.cuda.synchronize(device)
         target_ms = (time.perf_counter() - target_start) * 1000.0
@@ -4622,7 +4740,7 @@ def _next_training_batch(
     if not prepare_targets:
         return batch, wait_ms + to_device_ms, wait_ms, to_device_ms, 0.0
     target_start = time.perf_counter()
-    batch = materialize_targets(batch, loader.config, profile=profile_targets)
+    batch = materialize_targets(batch, loader.config, profile=profile_targets, output_stride=output_stride)
     if profile_targets and device.type == "cuda":
         torch.cuda.synchronize(device)
     target_ms = (time.perf_counter() - target_start) * 1000.0
@@ -4902,6 +5020,9 @@ def main() -> None:
     parser.add_argument("--trace2cp-step-px", type=float, default=None)
     parser.add_argument("--trace2cp-rf-margin-px", type=float, default=None)
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument("--manager-socket", type=str, default=None)
+    parser.add_argument("--unmanaged", action="store_true",
+                        help="explicitly bypass GPU manager handling for debugging only")
     parser.add_argument(
         "--test-hang-diagnostics",
         action="store_true",
@@ -4909,6 +5030,8 @@ def main() -> None:
     )
     args = parser.parse_args()
     auxiliary_mode = args.prefetch or args.trace2cp_vis or args.benchmark
+    if args.unmanaged and (args.manager_socket is not None or auxiliary_mode):
+        parser.error("--unmanaged cannot be combined with --manager-socket or auxiliary modes")
     if args.test_hang_diagnostics and auxiliary_mode:
         raise SystemExit("--test-hang-diagnostics is supported only for normal training")
     if args.prefetch:
@@ -4945,6 +5068,8 @@ def main() -> None:
             args.config,
             resume_checkpoint=args.resume,
             test_hang_diagnostics=bool(args.test_hang_diagnostics),
+            manager_socket=args.manager_socket,
+            unmanaged=bool(args.unmanaged),
         )
 
 

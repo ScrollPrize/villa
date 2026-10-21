@@ -183,6 +183,11 @@ class FiberTrace3DPredictAdapter:
     ) -> None:
         self.checkpoint = None if checkpoint is None else Path(checkpoint)
         self.config = _config_from_checkpoint(config, self.checkpoint)
+        self.native_output_stride = int(
+            _model_cfg_from_raw(self.config).get("output_stride", 1)
+        )
+        if self.native_output_stride <= 0:
+            raise ValueError("model_3d.output_stride must be > 0")
         self.recurrent_steps = _recurrent_steps_from_config(
             self.config,
             recurrent_steps,
