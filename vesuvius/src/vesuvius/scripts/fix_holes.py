@@ -319,6 +319,38 @@ def _list_subfolders(root: Path) -> List[Path]:
     return sorted([p for p in root.iterdir() if p.is_dir()])
 
 
+def _load_veto(path: Optional[Path]) -> dict:
+    """CSV with columns crop,center_zyx (e.g. the audit's errata list) -> {crop: [(z, y, x), ...]}."""
+    import csv, json
+    out: dict = {}
+    if path is None:
+        return out
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            out.setdefault(row["crop"], []).append(tuple(json.loads(row["center_zyx"])))
+    return out
+
+
+def _apply_veto(hole_mask: np.ndarray, centers, max_dist: float = 8.0) -> Tuple[np.ndarray, int]:
+    """Drop the 26-connected hole-mask component nearest each vetoed centre (within max_dist voxels)."""
+    if not centers:
+        return hole_mask, 0
+    lbl, n = ndi.label(hole_mask.astype(bool), structure=np.ones((3, 3, 3), bool))
+    if n == 0:
+        return hole_mask, 0
+    cents = np.asarray(ndi.center_of_mass(np.ones(lbl.shape, bool), lbl, range(1, n + 1)))
+    drop = set()
+    for c in centers:
+        d = np.linalg.norm(cents - np.asarray(c, dtype=float), axis=1)
+        k = int(np.argmin(d))
+        if d[k] <= max_dist:
+            drop.add(k + 1)
+    if not drop:
+        return hole_mask, 0
+    keep = ~np.isin(lbl, sorted(drop))
+    return hole_mask.astype(bool) & keep, len(drop)
+
+
 def _process_folder(
     folder: Path,
     *,
@@ -332,6 +364,7 @@ def _process_folder(
     alpha: float,
     iters: int,
     mask_dilate: int,
+    veto_centers=None,
 ) -> Tuple[bool, str]:
     hole_path = folder / hole_mask_name
     if not hole_path.exists():
@@ -346,6 +379,8 @@ def _process_folder(
 
     if label.shape != hole_mask.shape:
         return False, f"[WARN] Shape mismatch in {folder}: label {label.shape} vs hole_mask {hole_mask.shape}"
+
+    hole_mask, n_veto = _apply_veto(hole_mask, veto_centers or [])
 
     before_n = _count_components_26(
         label,
@@ -399,6 +434,8 @@ def _process_folder(
     out_path = folder / out_name
     tiff.imwrite(str(out_path), fixed.astype(label.dtype))
     ok_msg = f"[OK] Wrote {out_path}"
+    if n_veto:
+        ok_msg = f"[VETO] {n_veto} hole(s) left open in {folder.name} | " + ok_msg
     if msg:
         ok_msg = msg + " | " + ok_msg
     return True, ok_msg
@@ -432,6 +469,10 @@ def parse_args() -> argparse.Namespace:
                     help="Number of iterations of the selected method (default: 1).")
     ap.add_argument("--suffix", type=str, default=None,
                     help="Suffix for output file (default depends on method).")
+    ap.add_argument("--veto", type=Path, default=None,
+                    help="CSV with columns crop,center_zyx: holes to leave open (e.g. the audit's errata list "
+                         "filtered to CUT verdicts). The hole-mask component nearest each centre, within 8 voxels, "
+                         "is removed before any method runs.")
     ap.add_argument("--workers", type=int, default=0,
                     help="Number of parallel workers (0=sequential).")
     return ap.parse_args()
@@ -479,6 +520,8 @@ def main() -> None:
         if int(args.iters) > 1:
             suffix = f"{suffix}_x{int(args.iters)}"
 
+    veto = _load_veto(args.veto)
+
     if args.workers and args.workers > 0:
         from concurrent.futures import ProcessPoolExecutor
         with ProcessPoolExecutor(max_workers=args.workers) as ex:
@@ -496,6 +539,7 @@ def main() -> None:
                     alpha=float(args.alpha),
                     iters=int(args.iters),
                     mask_dilate=int(args.mask_dilate),
+                    veto_centers=veto.get(folder.name),
                 )
                 for folder in subfolders
             ]
@@ -517,6 +561,7 @@ def main() -> None:
                 alpha=float(args.alpha),
                 iters=int(args.iters),
                 mask_dilate=int(args.mask_dilate),
+                veto_centers=veto.get(folder.name),
             )
             if msg:
                 print(msg)
