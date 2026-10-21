@@ -727,8 +727,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         m.update({"surface": name, "source": src, "volume": a.volume, "n_vertices": int(n_vert),
                   "n_no_normal": n_no_normal, **grid, "half": a.half, "step": a.step, "sigma": a.sigma,
                   "min_contrast": a.min_contrast, "min_prominence": a.min_prominence})
-        with open(os.path.join(a.out, f"{name}.json"), "w") as f:
-            json.dump(m, f, indent=1)
         with open(os.path.join(a.out, f"{name}.samples.csv"), "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["z", "y", "x", "nz", "ny", "nx", "patch", "offset", "contrast", "valid"])
@@ -748,6 +746,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             write_point_collection(os.path.join(a.out, f"{name}.worst_cells.json"),
                                    f"placement_audit {name}", cells)
             m["n_worst_cells"] = len(cells)
+        with open(os.path.join(a.out, f"{name}.json"), "w") as f:
+            json.dump(m, f, indent=1)
         if a.plot:
             plot(P, off, valid, os.path.join(a.out, f"{name}.png"), name)
         rows.append(m)

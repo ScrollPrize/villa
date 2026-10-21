@@ -121,7 +121,12 @@ surfaces with the same normal convention.
   the human's final surface to each candidate (`dist_<name>`), with
   `--volume` each candidate's own measured offset there (`off_<name>`),
   `chosen` (the candidate the human ended nearest to) and `audit_pick` (the
-  one the audit would rank best). The audit itself is one measurement, not a
+  one with the smallest median absolute offset, `aoff_<name>`, so opposite
+  errors inside a cell do not cancel; a candidate with valid peaks on fewer
+  than a quarter of the cell's points, or fewer than 10, abstains). With
+  `--all-cells --volume` the unflagged cells get their own measured
+  `median_offset` and `n_valid`, because "not flagged" only means absent
+  from the capped worst-cells list, not on the sheet. The audit itself is one measurement, not a
   predictor; this is how several surface models, or a third party's tracer
   passed as one more candidate, get compared against the human's pick, and
   the pick is the label a tracer-choosing model would train on.

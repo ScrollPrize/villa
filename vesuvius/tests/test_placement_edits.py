@@ -84,6 +84,7 @@ def test_candidates_record_which_tracer_the_human_and_the_audit_each_pick(tmp_pa
     assert rows
     for r in rows:
         assert r["chosen"] == "B" and r["audit_pick"] == "B"
+        assert int(r["nvalid_B"]) > 0 and float(r["aoff_before"]) == pytest.approx(4.0, abs=0.6)
         assert float(r["dist_B"]) < 0.01 < float(r["dist_before"]) and abs(float(r["off_B"])) < 0.6
         assert abs(float(r["off_before"])) == pytest.approx(4.0, abs=0.6)
         assert abs(float(r["off_C"])) == pytest.approx(4.0, abs=0.6)
@@ -91,3 +92,43 @@ def test_candidates_record_which_tracer_the_human_and_the_audit_each_pick(tmp_pa
     assert arrs["cand_C_1"].shape == arrs["before_1"].shape
     prov = json.loads((tmp_path / "edits" / "provenance.json").read_text())
     assert prov["candidates"] == {"B": on, "C": under}
+
+
+def test_all_cells_measures_the_unflagged_cells_instead_of_calling_them_on_sheet(tmp_path):
+    """The point collection holds at most 50 cells, so "not flagged" cannot mean "on the
+    sheet". With --volume the export must measure the unflagged cells itself: an off-sheet
+    cell past the limit must show its true offset, not a blank that reads as a negative."""
+    ct = tmp_path / "ct.tif"
+    tifffile.imwrite(ct, sheet_volume())
+    before = _seg(tmp_path / "before", 34.0)
+    out = tmp_path / "audit"
+    spa.main(["--surface", before, "--volume", str(ct), "--out", str(out), "--samples", "4000",
+              "--seed", "1", "--workers", "1", "--worst-cells", "1"])      # keep only the single worst
+    placement_edits.main(["--before", before, "--after", before, "--cells", str(out / "before.worst_cells.json"),
+                          "--out", str(tmp_path / "edits"), "--volume", str(ct), "--workers", "1", "--all-cells"])
+    rows = list(csv.DictReader(open(tmp_path / "edits" / "edits.csv")))
+    assert sum(int(r["flagged"]) for r in rows) == 1
+    off_right = [abs(float(r["median_offset"])) for r in rows if not int(r["flagged"]) and float(r["x"]) >= 32]
+    off_left = [abs(float(r["median_offset"])) for r in rows if not int(r["flagged"]) and float(r["x"]) < 32]
+    assert off_right and all(o == pytest.approx(4.0, abs=0.6) for o in off_right)
+    assert off_left and all(o < 0.6 for o in off_left)
+
+
+def test_audit_pick_ranks_on_absolute_offset_so_opposite_errors_do_not_cancel():
+    """A candidate 4 voxels above the sheet on one side of a cell and 4 below on the other
+    has a signed median near 0; ranking on that would call it better than a candidate a
+    steady 1 voxel off. audit_pick must rank on the median absolute offset."""
+    ct = sheet_volume()
+    a = np.array([[[30.0, 24, 24], [30.0, 24, 25], [30.0, 25, 24], [30.0, 25, 25]]] * 3).reshape(3, 4, 3)
+    n = np.zeros_like(a)
+    n[..., 0] = 1
+    ok = np.ones((3, 4), bool)
+    split = a.copy()
+    split[..., 0] = np.array([26, 26, 34, 34])
+    steady = a.copy()
+    steady[..., 0] = 31
+    e = [{"rank": 1}]
+    placement_edits.candidate_scores(a, {"split": (split, ok, n), "steady": (steady, ok, n)}, e, {1: ok},
+                                     ct, {}, workers=1, min_support=1)
+    assert e[0]["audit_pick"] == "steady" and e[0]["chosen"] == "steady"
+    assert abs(e[0]["off_split"]) < 1 and e[0]["aoff_split"] == pytest.approx(4.0, abs=0.6)
