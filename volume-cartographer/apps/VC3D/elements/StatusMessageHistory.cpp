@@ -31,7 +31,7 @@ void StatusMessageHistory::add(const QString& text, const QDateTime& time)
     if (trimmed.isEmpty()) {
         return;
     }
-    if (!_entries.empty() && repeats(_entries.back().text, trimmed)) {
+    if (!_entries.empty() && countsOn(_entries.back(), trimmed, time)) {
         _entries.back().time = time;
         _entries.back().text = trimmed;
         ++_entries.back().repeats;
@@ -46,6 +46,15 @@ void StatusMessageHistory::add(const QString& text, const QDateTime& time)
 bool StatusMessageHistory::repeats(const QString& a, const QString& b)
 {
     return a == b || withoutNumbers(a) == withoutNumbers(b);
+}
+
+bool StatusMessageHistory::countsOn(const Entry& last, const QString& text, const QDateTime& time)
+{
+    if (last.text == text) {
+        return true;
+    }
+    const qint64 gap = last.time.msecsTo(time);
+    return gap >= 0 && gap <= kNumberRepeatWindowMs && repeats(last.text, text);
 }
 
 QString StatusMessageHistory::formatEntry(const Entry& entry)

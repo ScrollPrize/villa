@@ -9,10 +9,12 @@
 
 class QMenu;
 
-// Recent status bar messages, oldest first. A message repeated back to back,
-// or one that differs from the one before only in its numbers (a radius
-// readout while the mouse wheel turns), is counted on that entry, which keeps
-// the newest text, instead of being stored again.
+// Recent status bar messages, oldest first. A message repeated back to back
+// is counted on that entry instead of being stored again. So is one that
+// differs from the one before only in its numbers and comes within
+// kNumberRepeatWindowMs of it (a radius readout while the mouse wheel turns);
+// the entry then keeps the newest text. Messages further apart stay separate,
+// so two segment ids selected a few seconds apart are two entries.
 class StatusMessageHistory
 {
 public:
@@ -22,6 +24,8 @@ public:
         QString text;
         int repeats{1};
     };
+
+    static constexpr qint64 kNumberRepeatWindowMs = 2000;
 
     explicit StatusMessageHistory(std::size_t capacity = 200);
 
@@ -33,6 +37,10 @@ public:
     static QString formatEntry(const Entry& entry);
     // Whether b repeats a: the same text, or the same apart from its numbers.
     static bool repeats(const QString& a, const QString& b);
+    // Whether text, arriving at time, is counted on the entry last: the same
+    // text at any time, or the same apart from its numbers within
+    // kNumberRepeatWindowMs of the entry's last appearance.
+    static bool countsOn(const Entry& last, const QString& text, const QDateTime& time);
     // One formatted line per message, newest first.
     [[nodiscard]] QString toPlainText() const;
 

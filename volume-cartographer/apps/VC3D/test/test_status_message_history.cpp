@@ -64,6 +64,38 @@ private slots:
                                                QStringLiteral("Line brush radius: 4 steps")));
     }
 
+    void keepsNumberOnlyChangesApartWhenSlow()
+    {
+        // Two segments selected seconds apart are two events, not a repeat.
+        StatusMessageHistory history;
+        const QDateTime start(QDate(2026, 10, 18), QTime(9, 0, 0));
+        history.add(QStringLiteral("Selected segment 20231210121321"), start);
+        history.add(QStringLiteral("Selected segment 20231221180251"), start.addSecs(5));
+        QCOMPARE(history.entries().size(), std::size_t{2});
+        QCOMPARE(history.entries().front().text, QStringLiteral("Selected segment 20231210121321"));
+        QCOMPARE(history.entries().back().repeats, 1);
+
+        history.add(QStringLiteral("HTTP 404"), start.addSecs(10));
+        history.add(QStringLiteral("HTTP 500"), start.addSecs(13));
+        QCOMPARE(history.entries().size(), std::size_t{4});
+
+        // The window runs from the last message of a burst, so a long wheel
+        // turn stays one entry.
+        history.add(QStringLiteral("Push/Pull radius: 4 steps"), start.addSecs(20));
+        history.add(QStringLiteral("Push/Pull radius: 5 steps"), start.addMSecs(21500));
+        history.add(QStringLiteral("Push/Pull radius: 6 steps"), start.addSecs(23));
+        QCOMPARE(history.entries().size(), std::size_t{5});
+        QCOMPARE(history.entries().back().repeats, 3);
+
+        // An exact repeat is counted however late it comes.
+        history.add(QStringLiteral("Push/Pull radius: 6 steps"), start.addSecs(300));
+        QCOMPARE(history.entries().size(), std::size_t{5});
+        QCOMPARE(history.entries().back().repeats, 4);
+        // A time going backwards (a clock change) never merges numbers.
+        history.add(QStringLiteral("Push/Pull radius: 7 steps"), start);
+        QCOMPARE(history.entries().size(), std::size_t{6});
+    }
+
     void buttonShowsOnlyAnIcon()
     {
         StatusMessageHistoryButton button;
