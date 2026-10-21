@@ -327,11 +327,14 @@ struct GapSpanSync {
 };
 GapSpanSync syncGapSpanTags(std::vector<LineControlPoint>& controls);
 bool syncGapSpanTags(std::vector<StoredControlPoint>& controls);
-// syncGapSpanTags plus the gap goal policy for a structural edit that is
-// about to re-solve anyway: a span whose gap formed takes the cubic-spline
-// goal, one whose gap dissolved while still cspline returns to global (any
-// other goal is left alone). The break toggle applies the same policy through
-// the controller's goal path so it can start the re-solve itself.
+// syncGapSpanTags plus the gap goal policy: a span whose gap formed takes
+// the cubic-spline goal, one whose gap dissolved while still cspline returns
+// to global (any other goal is left alone). Applied by every structural edit
+// before its re-solve, and by the tag persist together with the break tag
+// (the controller then re-solves the spans whose goals actually changed
+// through startCommittedGoalSolve). The returned sync names the TAG
+// transitions; a formed gap whose goal was already cspline is a transition
+// without a goal change.
 GapSpanSync applyGapSpanPolicy(std::vector<LineControlPoint>& controls);
 // The same for stored controls (a merge's or split's result, held in memory
 // before it is saved): pairs by index, returns whether anything changed.

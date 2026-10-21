@@ -251,10 +251,14 @@ interior insert, and placement beyond an untagged or gap-closing end are not
 affected. Placement beyond a kollesis end is refused as before.
 
 Toggling `break` or `kollesis_termination` on an end point, or forming or
-dissolving a gap at one from the span menu, changes the tail policy; when the
-edit changed no interpolation goal (which starts a re-solve of its own) the
-session is marked Unoptimized and, in Auto-reoptimize mode, its tails are
-re-traced (a tails-only solve, or a whole-line one when work was already
+dissolving a gap at one from the span menu, changes the tail policy. When the
+committed tags changed a span's goal (a gap formed on a span that was not yet
+cspline, or dissolved from one still cspline), those spans are re-solved at
+once in either reoptimization mode, which re-traces the tails too. When no
+goal changed (a gap formed on a span already cspline, a lone end break
+toggled, a kollesis end tagged) the session is marked Unoptimized and, in
+Auto-reoptimize mode, its tails are re-traced (a tails-only solve, or a
+whole-line one when the interior was not optimized or work was already
 queued); in manual mode the next reoptimization or the save/close
 finalization applies it. Changing either menu distance marks the session
 Unoptimized and starts a whole-line solve in Auto-reoptimize mode (in manual

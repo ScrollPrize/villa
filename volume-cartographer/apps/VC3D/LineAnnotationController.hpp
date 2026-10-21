@@ -767,16 +767,16 @@ private:
     // same edit on the matching control of every other pane showing this
     // fiber (and their rollback snapshots), and the overlay refreshes.
     // Returns false when nothing changed or the edit was refused.
-    // gapSync (optional out): the gap spans the edit formed or dissolved in
-    // this session, whose goals the gap policy changed WITH the tag (saved
-    // in the same file write, mirrored into the peers); the caller re-solves
-    // them (finishBreakEdit).
+    // changedGoalOwners (optional out): the owners whose span GOAL the gap
+    // policy changed with the tag (saved in the same file write, mirrored
+    // into the peers); the caller re-solves those spans (finishBreakEdit). A
+    // gap that formed on a span already cspline changes no goal.
     using ControlPointEdit = std::function<bool(vc3d::line_annotation::LineControlPoint&)>;
     bool applyControlPointEditAndPersist(const std::string& surfaceName,
                                          size_t controlPointIndex,
                                          const QString& pendingSolveMessage,
                                          const ControlPointEdit& edit,
-                                         vc3d::line_annotation::GapSpanSync* gapSync = nullptr);
+                                         std::vector<size_t>* changedGoalOwners = nullptr);
     // Whether adding `tag` to the control (or the matching control of any
     // other pane showing this fiber, or of their rollback snapshots) would
     // combine the kollesis and break tags.
@@ -790,7 +790,7 @@ private:
                                       const char* tag,
                                       bool enabled,
                                       const QString& pendingSolveMessage,
-                                      vc3d::line_annotation::GapSpanSync* gapSync = nullptr);
+                                      std::vector<size_t>* changedGoalOwners = nullptr);
     // Re-solves the spans owned by `owners` whose goals a committed tag edit
     // changed (gap formed -> cspline, dissolved -> global): the goals are
     // already saved and mirrored, so nothing is rolled back but geometry.
@@ -802,8 +802,12 @@ private:
     // Shared launch of a goal re-solve: geometry snapshot, dirty ranks (or
     // the whole line when the interior is not certified), rollback when the
     // solve cannot start. The controls snapshot must already be armed.
+    // interiorOptimized: computed by the caller BEFORE it marks the session
+    // Unoptimized (an optimized interior with nothing pending may be solved
+    // span by span; anything else solves the whole line).
     bool launchGoalSolve(LineAnnotationSession& session,
-                         const std::vector<size_t>& dirtyRanks);
+                         const std::vector<size_t>& dirtyRanks,
+                         bool interiorOptimized);
     // The session's open-tail policy (lone end breaks, kollesis ends) or the
     // tail distances changed and no solve covers it yet: mark Unoptimized and,
     // in auto mode, re-trace the tails (a tails-only solve, or a whole-line

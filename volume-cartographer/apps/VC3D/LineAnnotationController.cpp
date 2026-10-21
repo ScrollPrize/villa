@@ -11045,7 +11045,7 @@ bool LineAnnotationController::applyControlPointEditAndPersist(
     size_t controlPointIndex,
     const QString& pendingSolveMessage,
     const ControlPointEdit& edit,
-    vc3d::line_annotation::GapSpanSync* gapSync)
+    std::vector<size_t>* changedGoalOwners)
 {
     auto* pane = paneForSurface(surfaceName);
     if (!pane || !pane->session) {
@@ -11091,9 +11091,26 @@ bool LineAnnotationController::applyControlPointEditAndPersist(
     // peers mirrored below all read the gap, and its cubic-spline goal, from
     // the span; the goal is part of the committed edit, not of the solve
     // that follows (a refused or failed solve rolls back geometry only).
-    const auto gapSpanSync = vc3d::line_annotation::applyGapSpanPolicy(session.controlPoints);
-    if (gapSync) {
-        *gapSync = gapSpanSync;
+    const auto goalsOf = [](const std::vector<vc3d::line_annotation::LineControlPoint>& controls) {
+        std::vector<vc3d::line_annotation::SegmentInterpolationGoal> goals;
+        goals.reserve(controls.size());
+        for (const auto& control : controls) {
+            goals.push_back(control.segmentToNext
+                                ? control.segmentToNext->interpGoal
+                                : vc3d::line_annotation::SegmentInterpolationGoal::Global);
+        }
+        return goals;
+    };
+    const auto goalsBefore = goalsOf(session.controlPoints);
+    (void)vc3d::line_annotation::applyGapSpanPolicy(session.controlPoints);
+    if (changedGoalOwners) {
+        changedGoalOwners->clear();
+        const auto goalsAfter = goalsOf(session.controlPoints);
+        for (size_t i = 0; i < goalsAfter.size(); ++i) {
+            if (goalsAfter[i] != goalsBefore[i]) {
+                changedGoalOwners->push_back(i);
+            }
+        }
     }
 
     // The tag is fiber content: persist and mirror into the loaded fiber so
@@ -11169,8 +11186,8 @@ bool LineAnnotationController::applyControlPointEditAndPersist(
         // A running or rolled-back task in that pane restores these
         // snapshots wholesale; they must carry the tag too or the rollback
         // would undo it. The span tags and the gap goal policy follow in
-        // every list the edit changed, so no later save from that pane can
-        // regress a goal the initiating pane's reconcile applied.
+        // every list the edit changed, exactly as in the initiating pane's
+        // persist, so no later save from that pane can regress a goal.
         const auto outcome = vc3d::line_annotation::applyMirroredControlPointEdit(
             other.controlPoints,
             other.controlPointsBeforeModeChange ? &*other.controlPointsBeforeModeChange : nullptr,
@@ -11237,7 +11254,7 @@ bool LineAnnotationController::setControlPointTagAndPersist(
     const char* tag,
     bool enabled,
     const QString& pendingSolveMessage,
-    vc3d::line_annotation::GapSpanSync* gapSync)
+    std::vector<size_t>* changedGoalOwners)
 {
     auto* pane = paneForSurface(surfaceName);
     if (!pane || !pane->session) {
@@ -11261,7 +11278,7 @@ bool LineAnnotationController::setControlPointTagAndPersist(
         [tag, enabled](vc3d::line_annotation::LineControlPoint& control) {
             return vc3d::line_annotation::setControlPointTag(control.tags, tag, enabled);
         },
-        gapSync);
+        changedGoalOwners);
 }
 
 bool LineAnnotationController::controlPointTagConflictsAcrossPanes(
@@ -11382,6 +11399,11 @@ bool LineAnnotationController::startCommittedGoalSolve(
     if (owners.empty() || session.taskState == LineAnnotationSession::TaskState::Running) {
         return false;
     }
+    // Read before the state changes below: an optimized interior with
+    // nothing pending may be solved span by span.
+    const bool interiorOptimized =
+        session.optimizationState == SessionOptimizationState::Optimized &&
+        !session.solveQueue.hasPending();
     // The goals changed with the tag and are saved: whatever happens below,
     // the geometry no longer matches them until a solve lands, and the
     // save/close finalization covers an Unoptimized session.
@@ -11393,7 +11415,8 @@ bool LineAnnotationController::startCommittedGoalSolve(
     // current list, goals included.
     session.controlPointsBeforeModeChange = session.controlPoints;
     return launchGoalSolve(session,
-                           vc3d::line_annotation::lineOrderSpanRanks(session.controlPoints, owners));
+                           vc3d::line_annotation::lineOrderSpanRanks(session.controlPoints, owners),
+                           interiorOptimized);
 }
 
 void LineAnnotationController::refreshTailsAfterTailPolicyChange(
@@ -11551,9 +11574,8 @@ void LineAnnotationController::handleGeneratedSpanSetGap(
     // the tail policy can change without any goal change (the far end is an
     // end control).
     std::vector<size_t> changedGapOwners;
-    const auto collect = [&changedGapOwners](const vc3d::line_annotation::GapSpanSync& sync) {
-        changedGapOwners.insert(changedGapOwners.end(), sync.formed.begin(), sync.formed.end());
-        changedGapOwners.insert(changedGapOwners.end(), sync.dissolved.begin(), sync.dissolved.end());
+    const auto collect = [&changedGapOwners](const std::vector<size_t>& owners) {
+        changedGapOwners.insert(changedGapOwners.end(), owners.begin(), owners.end());
     };
     const auto policyBefore = vc3d::line_annotation::openTailPolicyForControls(session.controlPoints);
     const auto finish = qScopeGuard([this, surfaceName, &changedGapOwners, policyBefore]() {
@@ -11585,13 +11607,13 @@ void LineAnnotationController::handleGeneratedSpanSetGap(
                                                           vc3d::line_annotation::kBreakTag)) {
                 continue;
             }
-            vc3d::line_annotation::GapSpanSync sync;
+            std::vector<size_t> owners;
             if (!setControlPointTagAndPersist(surfaceName, end,
                                               vc3d::line_annotation::kBreakTag, true,
-                                              pendingMessage, &sync)) {
+                                              pendingMessage, &owners)) {
                 return;
             }
-            collect(sync);
+            collect(owners);
         }
     } else {
         // Remove the break only from ends no other gap span depends on.
@@ -11610,13 +11632,13 @@ void LineAnnotationController::handleGeneratedSpanSetGap(
                                                            vc3d::line_annotation::kBreakTag)) {
                 continue;
             }
-            vc3d::line_annotation::GapSpanSync sync;
+            std::vector<size_t> owners;
             if (!setControlPointTagAndPersist(surfaceName, end,
                                               vc3d::line_annotation::kBreakTag, false,
-                                              pendingMessage, &sync)) {
+                                              pendingMessage, &owners)) {
                 return;
             }
-            collect(sync);
+            collect(owners);
         }
     }
 }
@@ -11732,18 +11754,14 @@ void LineAnnotationController::handleGeneratedControlPointSetBreak(
                   session.suppressErrorDialogs);
         return;
     }
-    vc3d::line_annotation::GapSpanSync sync;
-    if (setControlPointTagAndPersist(
-            surfaceName,
-            controlPointIndex,
-            vc3d::line_annotation::kBreakTag,
-            enabled,
-            tr("A line optimization is pending; wait for it to finish before "
-               "changing the break."),
-            &sync)) {
-        changedGapOwners.insert(changedGapOwners.end(), sync.formed.begin(), sync.formed.end());
-        changedGapOwners.insert(changedGapOwners.end(), sync.dissolved.begin(), sync.dissolved.end());
-    }
+    (void)setControlPointTagAndPersist(
+        surfaceName,
+        controlPointIndex,
+        vc3d::line_annotation::kBreakTag,
+        enabled,
+        tr("A line optimization is pending; wait for it to finish before "
+           "changing the break."),
+        &changedGapOwners);
 }
 
 void LineAnnotationController::handleGeneratedSegmentInterpolationGoal(
@@ -11812,6 +11830,9 @@ bool LineAnnotationController::applySegmentInterpolationGoals(
     if (!ensureDatasetForSession(session))
         return false;
 
+    const bool interiorOptimized =
+        session.optimizationState == SessionOptimizationState::Optimized &&
+        !session.solveQueue.hasPending();
     // A menu choice: rolled back with the geometry when the solve fails.
     session.controlPointsBeforeModeChange = session.controlPoints;
     for (const size_t owner : changed) {
@@ -11825,22 +11846,22 @@ bool LineAnnotationController::applySegmentInterpolationGoals(
         metadata->interpGoal = goal;
     }
     return launchGoalSolve(session,
-                           vc3d::line_annotation::lineOrderSpanRanks(session.controlPoints, changed));
+                           vc3d::line_annotation::lineOrderSpanRanks(session.controlPoints, changed),
+                           interiorOptimized);
 }
 
 bool LineAnnotationController::launchGoalSolve(
     LineAnnotationSession& session,
-    const std::vector<size_t>& dirtyRanks)
+    const std::vector<size_t>& dirtyRanks,
+    bool interiorOptimized)
 {
     session.optimizedLineBeforeModeChange = session.optimizedLine;
     session.branchesBeforeModeChange = session.branches;
     // A dirty-span solve certifies the rest of the interior as it stands:
-    // only from an optimized interior with nothing owed. Otherwise (an
-    // incomplete landing whose successor failed, provisional spans, queued
-    // work) the goal change solves the whole line.
-    const bool interiorOptimized =
-        session.optimizationState == SessionOptimizationState::Optimized &&
-        !session.solveQueue.hasPending();
+    // only from an optimized interior with nothing owed (interiorOptimized,
+    // read by the caller before any state change). Otherwise (an incomplete
+    // landing whose successor failed, provisional spans, queued work) the
+    // goal change solves the whole line.
     setSessionOptimizationState(session, SessionOptimizationState::Unoptimized);
     startFiberModeOptimization(session, true,
                                interiorOptimized ? std::optional(dirtyRanks) : std::nullopt);

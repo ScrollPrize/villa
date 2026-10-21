@@ -7050,11 +7050,20 @@ TEST_CASE("Fiber mode open tails: rays past lone breaks in every backend")
         for (const int side : {0, 1, 2}) {
             auto request = baseRequest();
             request.globalMode = FiberOptimizationMode::Lasagna;
+            // The reinit regrows FIVE left-tail samples where the input had
+            // two, so only its own index map (not the stitch-time indices)
+            // names the control vertices; and the controls arrive shuffled.
+            request.lasagnaConfig.segmentsPerSide = 5;
+            std::swap(request.controlPoints[0], request.controlPoints[1]);
             auto plain = optimizeFiberWithNativeFallback(request);
             CHECK(plain.rayExtrapolations == 0);
-            if (side != 1) tagControl(request.controlPoints.back(), kBreakTag);
-            if (side != 0) tagControl(request.controlPoints.front(), kBreakTag);
+            checkControlsNameTheirVertices(plain);
+            CHECK(plain.controlPoints.front().optimizedIndex >= 5);
+            // (sorted by the solver: front is the head control again)
+            if (side != 1) tagControl(request.controlPoints[0], kBreakTag);
+            if (side != 0) tagControl(request.controlPoints[1], kBreakTag);
             auto result = optimizeFiberWithNativeFallback(request);
+            checkControlsNameTheirVertices(result);
             CHECK(result.rayExtrapolations == (side == 2 ? 2 : 1));
             // The controlled range is the same geometry.
             const int a = result.controlPoints.front().optimizedIndex;
@@ -7544,11 +7553,12 @@ TEST_CASE("A control's own index wins over a coordinate search on the input line
     FiberModeOptimizationRequest request;
     request.baseNormalSampler = &normals;
     request.globalMode = FiberOptimizationMode::Lasagna;
-    // A head ray that revisits the tail control's coordinate exactly: the
-    // line starts with a copy of (16,0,0), which a coordinate search would
-    // resolve the tail control to.
+    // The line revisits the tail control's coordinate BETWEEN the controls
+    // (index 4 is a copy of (16,0,0) at index 6): a coordinate search, even
+    // one restricted to the line after the head, resolves the tail control
+    // to index 4 and loses the controlled vertices 5-6.
     request.linePointsBase = straightLine(-8, 24, 4);
-    request.linePointsBase.front() = cv::Vec3d(16.0, 0.0, 0.0);
+    request.linePointsBase[4] = cv::Vec3d(16.0, 0.0, 0.0);
     request.controlPoints = {{2.0, {0.0, 0.0, 0.0}, true, 2}, {6.0, {16.0, 0.0, 0.0}, false, 6}};
     request.controlPoints.front().segmentToNext.emplace();
     request.controlPoints.front().segmentToNext->interpGoal = SegmentInterpolationGoal::Cspline;
@@ -7558,18 +7568,24 @@ TEST_CASE("A control's own index wins over a coordinate search on the input line
     request.lasagnaConfig.printSolverProgress = false;
     request.extrapolationDistanceBaseVoxels = 8.0;
     request.dirtySegments = std::vector<size_t>{};
-    const auto result = optimizeFiberWithNativeFallback(request);
-    checkControlsNameTheirVertices(result);
-    CHECK(result.controlPoints.back().volumePoint == cv::Vec3d(16, 0, 0));
+    const auto interval = [](const FiberModeOptimizationResult& result) {
+        checkControlsNameTheirVertices(result);
+        return result.controlPoints.back().optimizedIndex - result.controlPoints.front().optimizedIndex;
+    };
+    // optimizedIndex names the vertex: the whole controlled interval (4
+    // segments) is kept.
+    CHECK(interval(optimizeFiberWithNativeFallback(request)) == 4);
     // An integral linePosition that names the vertex serves as well.
     request.controlPoints.back().optimizedIndex = -1;
-    checkControlsNameTheirVertices(optimizeFiberWithNativeFallback(request));
-    // Without either, the coordinate search is restricted to the line after
-    // the previous control, so the duplicate at index 0 is never chosen.
+    CHECK(interval(optimizeFiberWithNativeFallback(request)) == 4);
+    // Without either, the order-restricted coordinate search takes the first
+    // match after the head: the duplicate, and the interval shrinks to 2.
     request.controlPoints.back().linePosition = 6.5;
-    const auto searched = optimizeFiberWithNativeFallback(request);
-    checkControlsNameTheirVertices(searched);
-    CHECK(searched.controlPoints.front().optimizedIndex < searched.controlPoints.back().optimizedIndex);
+    CHECK(interval(optimizeFiberWithNativeFallback(request)) == 2);
+    // A duplicate BEFORE the head is never chosen by the restricted search.
+    request.linePointsBase = straightLine(-8, 24, 4);
+    request.linePointsBase.front() = cv::Vec3d(16.0, 0.0, 0.0);
+    CHECK(interval(optimizeFiberWithNativeFallback(request)) == 4);
 }
 
 TEST_CASE("Line-order span ranks drop owners without a successor")
