@@ -28,6 +28,56 @@ nb::dict relationshipRevisionToPy(const vo::RelationshipRevision& revision)
     return d;
 }
 
+// Convert native results after the transaction (and any GIL release) ends.
+nb::object toPy(const vo::ObjectRecord& value) { return objectToPy(value); }
+nb::object toPy(const vo::EdgeRecord& value) { return edgeToPy(value); }
+nb::object toPy(const vo::GeometryRevision& value) { return geometryToPy(value); }
+nb::object toPy(const vo::ObjectRevision& value) { return objectRevisionToPy(value); }
+nb::object toPy(const vo::RelationshipRevision& value) { return relationshipRevisionToPy(value); }
+nb::bytes toPy(const std::vector<uint8_t>& value) {
+    return nb::bytes(reinterpret_cast<const char*>(value.data()), value.size());
+}
+template<class T> T toPy(T value) { return value; }
+std::vector<std::string> toPy(std::vector<std::string> value) { return value; }
+std::optional<std::filesystem::path> toPy(std::optional<std::filesystem::path> value) { return value; }
+template<class T> nb::object toPy(const std::optional<T>& value) {
+    return value ? toPy(*value) : nb::none();
+}
+template<class T> nb::list toPy(const std::vector<T>& values) {
+    nb::list result;
+    for (const auto& value : values) result.append(toPy(value));
+    return result;
+}
+
+template<auto Method, bool ReleaseGil = false>
+auto readMethod()
+{
+    return []<class R, class... Args>(R (vo::ObjectStore::*)(const vo::Txn&, Args...) const) {
+        return [](PyObjectStore& self, Args... args) {
+            auto read = [&] { return self.withRead([&](auto& db, auto& txn) { return (db.*Method)(txn, args...); }); };
+            if constexpr (ReleaseGil) {
+                auto result = [&] {
+                    self.require();
+                    auto lease = self.db;
+                    nb::gil_scoped_release release;
+                    return read();
+                }();
+                return toPy(result);
+            } else return toPy(read());
+        };
+    }(Method);
+}
+
+template<auto Method>
+auto writeMethod()
+{
+    return []<class... Args>(void (vo::ObjectStore::*)(vo::WriteTxn&, Args...)) {
+        return [](PyObjectStore& self, Args... args) {
+            self.withWrite([&](auto& db, auto& txn) { (db.*Method)(txn, args...); return 0; });
+        };
+    }(Method);
+}
+
 nb::dict revisionViewToPy(vo::ObjectStore& db, const vo::Txn& txn, const vo::RevisionSelection& selection)
 {
     const auto relationships = db.relationshipsAt(txn, selection);
@@ -174,88 +224,31 @@ NB_MODULE(_native, m)
                 return self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) { return self.upsertObjectIn(g, t, rec); });
             },
             nb::arg("record"), "Create or update an object from a dict; returns its uuid.")
-        .def(
-            "object",
-            [](PyObjectStore& self, const std::string& uuid) -> nb::object {
-                auto rec = self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.objectByUuid(t, uuid); });
-                return rec ? nb::object(objectToPy(*rec)) : nb::none();
-            },
-            nb::arg("uuid"))
-        .def(
-            "objects_by_kind",
-            [](PyObjectStore& self, const std::string& kind, const std::optional<std::string>& approvalState, bool includeRetired) {
-                auto recs = self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.objectsByKind(t, kind, approvalState, includeRetired); });
-                nb::list out;
-                for (const auto& r : recs) out.append(objectToPy(r));
-                return out;
-            },
-            nb::arg("kind"), nb::arg("approval_state") = std::nullopt, nb::arg("include_retired") = false)
-        .def("object_count", [](PyObjectStore& self, const std::string& kind, bool includeRetired) {
-            return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.objectCount(txn, kind, includeRetired); });
-        }, nb::arg("kind"), nb::arg("include_retired") = false)
-        .def(
-            "objects_by_tag",
-            [](PyObjectStore& self, const std::string& tag, bool includeRetired) {
-                auto recs = self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.objectsByTag(t, tag, includeRetired); });
-                nb::list out;
-                for (const auto& r : recs) out.append(objectToPy(r));
-                return out;
-            },
-            nb::arg("tag"), nb::arg("include_retired") = false)
-        .def(
-            "delete_object",
-            [](PyObjectStore& self, const std::string& uuid) {
-                self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) {
-                    g.deleteObject(t, uuid);
-                    return 0;
-                });
-            },
-            nb::arg("uuid"))
+        .def("object", readMethod<&vo::ObjectStore::objectByUuid>(),
+             nb::arg("uuid"))
+        .def("objects_by_kind", readMethod<&vo::ObjectStore::objectsByKind>(),
+             nb::arg("kind"), nb::arg("approval_state") = std::nullopt, nb::arg("include_retired") = false)
+        .def("object_count", readMethod<&vo::ObjectStore::objectCount>(), nb::arg("kind"),
+             nb::arg("include_retired") = false)
+        .def("objects_by_tag", readMethod<&vo::ObjectStore::objectsByTag>(),
+             nb::arg("tag"), nb::arg("include_retired") = false)
+        .def("delete_object", writeMethod<&vo::ObjectStore::deleteObject>(),
+             nb::arg("uuid"))
         .def(
             "add_edge",
             [](PyObjectStore& self, const nb::dict& rec) {
                 return self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) { return self.addEdgeIn(g, t, rec); });
             },
             nb::arg("record"), "Create an edge from a dict (keys: a, b, kind, anchors, tags, meta); returns uuid.")
-        .def(
-            "edge",
-            [](PyObjectStore& self, const std::string& uuid) -> nb::object {
-                auto rec = self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.edgeByUuid(t, uuid); });
-                return rec ? nb::object(edgeToPy(*rec)) : nb::none();
-            },
-            nb::arg("uuid"))
-        .def(
-            "remove_edge",
-            [](PyObjectStore& self, const std::string& uuid) {
-                self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) {
-                    g.removeEdge(t, uuid);
-                    return 0;
-                });
-            },
-            nb::arg("uuid"))
-        .def(
-            "edges_of",
-            [](PyObjectStore& self, const std::string& uuid, bool includeRetired) {
-                auto recs = self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.edgesOf(t, uuid, includeRetired); });
-                nb::list out;
-                for (const auto& e : recs) out.append(edgeToPy(e));
-                return out;
-            },
-            nb::arg("uuid"), nb::arg("include_retired") = false)
-        .def(
-            "edges_by_kind",
-            [](PyObjectStore& self, const std::string& kind, bool includeRetired) {
-                auto recs = self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.edgesByKind(t, kind, includeRetired); });
-                nb::list out;
-                for (const auto& e : recs) out.append(edgeToPy(e));
-                return out;
-            },
-            nb::arg("edge_kind"), nb::arg("include_retired") = false)
-        .def("neighbours",
-             [](PyObjectStore& self, const std::string& uuid, const std::optional<std::string>& edgeKind,
-                const std::optional<std::string>& neighbourKind, bool includeRetired, std::optional<bool> adjacent, bool applicableOnly) {
-                 return self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) { return g.neighbours(t, uuid, edgeKind, neighbourKind, includeRetired, adjacent, applicableOnly); });
-             },
+        .def("edge", readMethod<&vo::ObjectStore::edgeByUuid>(),
+             nb::arg("uuid"))
+        .def("remove_edge", writeMethod<&vo::ObjectStore::removeEdge>(),
+             nb::arg("uuid"))
+        .def("edges_of", readMethod<&vo::ObjectStore::edgesOf>(),
+             nb::arg("uuid"), nb::arg("include_retired") = false)
+        .def("edges_by_kind", readMethod<&vo::ObjectStore::edgesByKind>(),
+             nb::arg("edge_kind"), nb::arg("include_retired") = false)
+        .def("neighbours", readMethod<&vo::ObjectStore::neighbours>(),
              nb::arg("uuid"), nb::arg("edge_kind") = std::nullopt, nb::arg("neighbour_kind") = std::nullopt, nb::arg("include_retired") = false,
              nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false)
         .def("component",
@@ -270,15 +263,8 @@ NB_MODULE(_native, m)
              },
              nb::arg("uuid"), nb::arg("max_depth"), nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("include_retired") = false,
              nb::arg("adjacent") = std::nullopt, nb::arg("applicable_only") = false)
-        .def(
-            "set_approval",
-            [](PyObjectStore& self, const std::string& uuid, const std::string& state) {
-                self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) {
-                    g.setApproval(t, uuid, state);
-                    return 0;
-                });
-            },
-            nb::arg("uuid"), nb::arg("state"), "state: 'pending', 'approved' or 'rejected' (objects and edges).")
+        .def("set_approval", writeMethod<&vo::ObjectStore::setApproval>(),
+             nb::arg("uuid"), nb::arg("state"), "state: 'pending', 'approved' or 'rejected' (objects and edges).")
         .def(
             "set_meta",
             [](PyObjectStore& self, const std::string& uuid, const std::string& key, const nb::object& value) {
@@ -303,15 +289,8 @@ NB_MODULE(_native, m)
                 return 0;
             });
         }, nb::arg("updates"), "Apply metadata triples atomically in one durable transaction.")
-        .def(
-            "remove_meta",
-            [](PyObjectStore& self, const std::string& uuid, const std::string& key) {
-                self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) {
-                    g.removeMeta(t, uuid, key);
-                    return 0;
-                });
-            },
-            nb::arg("uuid"), nb::arg("key"))
+        .def("remove_meta", writeMethod<&vo::ObjectStore::removeMeta>(),
+             nb::arg("uuid"), nb::arg("key"))
         .def(
             "journal_since",
             [](PyObjectStore& self, int64_t afterSeq) {
@@ -387,25 +366,14 @@ NB_MODULE(_native, m)
         .def("geometry_point_annotations", [](PyObjectStore& self,const std::string& revision,const std::string& array) {
             return jsonLoads(self.withRead([&](vo::ObjectStore& db,vo::ReadTxn& txn) { return db.geometryPointAnnotations(txn,revision,array); }));
         },nb::arg("revision_uuid"),nb::arg("array_name"))
-        .def("current_geometry", [](PyObjectStore& self, const std::string& uuid) -> nb::object {
-            const auto revision = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.currentGeometry(txn, uuid); });
-            return revision ? nb::object(geometryToPy(*revision)) : nb::none();
-        }, nb::arg("object_uuid"))
-        .def("geometry_revision", [](PyObjectStore& self, const std::string& uuid) -> nb::object {
-            const auto revision = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.geometryRevision(txn, uuid); });
-            return revision ? nb::object(geometryToPy(*revision)) : nb::none();
-        }, nb::arg("revision_uuid"))
-        .def("geometry_history", [](PyObjectStore& self, const std::string& uuid) {
-            const auto revisions = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.geometryHistory(txn, uuid); });
-            nb::list result; for (const auto& r : revisions) result.append(geometryToPy(r)); return result;
-        }, nb::arg("object_uuid"))
-        .def("read_geometry_array", [](PyObjectStore& self, const std::string& uuid, const std::string& name,
-                                      int64_t offset, const std::optional<int64_t>& count) {
-            std::vector<uint8_t> bytes;
-            { auto lease = self.db; self.require(); nb::gil_scoped_release release;
-              bytes = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.readGeometryArray(txn, uuid, name, offset, count); }); }
-            return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-        }, nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("byte_offset") = 0, nb::arg("byte_count") = std::nullopt)
+        .def("current_geometry", readMethod<&vo::ObjectStore::currentGeometry>(),
+             nb::arg("object_uuid"))
+        .def("geometry_revision", readMethod<&vo::ObjectStore::geometryRevision>(),
+             nb::arg("revision_uuid"))
+        .def("geometry_history", readMethod<&vo::ObjectStore::geometryHistory>(),
+             nb::arg("object_uuid"))
+        .def("read_geometry_array", readMethod<&vo::ObjectStore::readGeometryArray, true>(), nb::arg("revision_uuid"), nb::arg("array_name"),
+             nb::arg("byte_offset") = 0, nb::arg("byte_count") = std::nullopt)
         .def("read_geometry_arrays", [](PyObjectStore& self, const std::vector<std::string>& revisions,
                                        const std::string& name) {
             std::shared_ptr<vo::PackedGeometryArray> packed;
@@ -415,35 +383,12 @@ NB_MODULE(_native, m)
             return PyPackedGeometryArray{std::move(packed)};
         }, nb::arg("revision_uuids"), nb::arg("array_name"),
            "Read homogeneous arrays into one verified packed buffer with row offsets.")
-        .def("read_geometry_rectangle", [](PyObjectStore& self, const std::string& uuid, const std::string& name,
-                                           int64_t row, int64_t column, int64_t rows, int64_t columns) {
-            std::vector<uint8_t> bytes;
-            { auto lease = self.db; self.require(); nb::gil_scoped_release release;
-              bytes = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
-                  return db.readGeometryRectangle(txn, uuid, name, row, column, rows, columns); }); }
-            return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-        }, nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("row"), nb::arg("column"),
-           nb::arg("rows"), nb::arg("columns"), "Read a dense row-major patch rectangle, preserving native dtype and component bytes.")
-        .def("read_geometry_rectangles", [](PyObjectStore& self, const std::string& uuid, const std::string& name,
-                                            const std::vector<std::array<int64_t, 4>>& rectangles) {
-            std::vector<std::vector<uint8_t>> values;
-            { auto lease = self.db; self.require(); nb::gil_scoped_release release;
-              values = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
-                  return db.readGeometryRectangles(txn, uuid, name, rectangles); }); }
-            nb::list out;
-            for (const auto& bytes : values) out.append(nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
-            return out;
-        }, nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("rectangles"),
-           "Read [row,column,rows,columns] rectangles in order, sharing verified chunks.")
-        .def("read_geometry_ranges", [](PyObjectStore& self, const std::string& uuid, const std::string& name,
-                                        const std::vector<std::array<int64_t, 2>>& ranges) {
-            std::vector<std::vector<uint8_t>> values;
-            { auto lease = self.db; self.require(); nb::gil_scoped_release release;
-              values = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.readGeometryRanges(txn, uuid, name, ranges); }); }
-            nb::list out;
-            for (const auto& bytes : values) out.append(nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
-            return out;
-        }, nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("ranges"))
+        .def("read_geometry_rectangle", readMethod<&vo::ObjectStore::readGeometryRectangle, true>(), nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("row"), nb::arg("column"),
+             nb::arg("rows"), nb::arg("columns"), "Read a dense row-major patch rectangle, preserving native dtype and component bytes.")
+        .def("read_geometry_rectangles", readMethod<&vo::ObjectStore::readGeometryRectangles, true>(), nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("rectangles"),
+             "Read [row,column,rows,columns] rectangles in order, sharing verified chunks.")
+        .def("read_geometry_ranges", readMethod<&vo::ObjectStore::readGeometryRanges, true>(), nb::arg("revision_uuid"), nb::arg("array_name"),
+             nb::arg("ranges"))
         .def("ingest_registered_geometry", [](PyObjectStore& self, const std::optional<std::filesystem::path>& root,
                                              const std::vector<std::string>& uuids) {
             vo::GeometryIngestReport result;
@@ -473,13 +418,8 @@ NB_MODULE(_native, m)
             const auto repair = repairFromPy(input);
             self.withWrite([&](vo::ObjectStore& db, vo::WriteTxn& txn) { db.repairEdgeGeometry(txn, repair); return 0; });
         }, nb::arg("repair"), "Atomically publish anchors and checked revisions; reject changed endpoints or edge generation.")
-        .def("resolve_storage_path",
-             [](PyObjectStore& self, const std::string& uuid,
-                const std::optional<std::filesystem::path>& datasetRoot) {
-                 return self.withRead([&](vo::ObjectStore& g, vo::ReadTxn& t) {
-                     return g.resolveStoragePath(t, uuid, datasetRoot);
-                 });
-             }, nb::arg("uuid"), nb::arg("dataset_root") = std::nullopt,
+        .def("resolve_storage_path", readMethod<&vo::ObjectStore::resolveStoragePath>(), nb::arg("uuid"),
+             nb::arg("dataset_root") = std::nullopt,
              "Find a patch/fiber by source UUID, verifying the saved path before searching the dataset root.")
         .def("checkpoint", [](PyObjectStore& self) { self.require().checkpoint(); })
         .def("select_edges", [](PyObjectStore& self, const std::optional<std::string>& kind,
@@ -582,9 +522,7 @@ NB_MODULE(_native, m)
         }, nb::arg("object_kind") = std::nullopt, nb::arg("tag") = std::nullopt,
            nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("connected_to") = std::nullopt,
            nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("fields") = std::vector<std::string>{}, nb::arg("include_retired") = false)
-        .def_prop_ro("replica_uuid", [](PyObjectStore& self) {
-            return self.withRead([](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.replicaUuid(txn); });
-        })
+        .def_prop_ro("replica_uuid", readMethod<&vo::ObjectStore::replicaUuid>())
         .def("fork_replica", [](PyObjectStore& self) {
             self.require();
             if (self.db.use_count() != 1) throw std::runtime_error("fork_replica requires an idle store");
@@ -610,15 +548,8 @@ NB_MODULE(_native, m)
             result["conflicts"] = conflicts; return result;
         }, nb::arg("peer"), nb::arg("dry_run") = false,
            nb::arg("resolutions") = std::map<std::string, std::string>{}, nb::arg("expected_plan") = std::nullopt)
-        .def(
-            "import_json",
-            [](PyObjectStore& self, const std::string& jsonText) {
-                self.withWrite([&](vo::ObjectStore& g, vo::WriteTxn& t) {
-                    g.importJson(t, jsonText);
-                    return 0;
-                });
-            },
-            nb::arg("json_text"))
+        .def("import_json", writeMethod<&vo::ObjectStore::importJson>(),
+             nb::arg("json_text"))
         .def(
             "link_point_collections_to_patches",
             [](PyObjectStore& self, const nb::kwargs& kwargs) {
@@ -760,29 +691,15 @@ NB_MODULE(_native, m)
             nb::arg("ct_volume") = "", nb::arg("kwargs"),
             "Link stored fibers to stored patches; select with fiber_uuids and patch_uuids. "
             "vc_reader supplies CT normals. Optional cache_directory stores disposable strips.")
-        .def_prop_ro("uuid", [](PyObjectStore& self) {
-            return self.withRead([](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.uuid(txn); });
-        })
-        .def("current_object_revision", [](PyObjectStore& self, const std::string& uuid) -> nb::object {
-            const auto revision = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.currentObjectRevision(txn, uuid); });
-            return revision ? nb::object(objectRevisionToPy(*revision)) : nb::none();
-        }, nb::arg("object_uuid"))
-        .def("object_revision", [](PyObjectStore& self, const std::string& uuid) -> nb::object {
-            const auto revision = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.objectRevision(txn, uuid); });
-            return revision ? nb::object(objectRevisionToPy(*revision)) : nb::none();
-        }, nb::arg("revision_uuid"))
-        .def("object_history", [](PyObjectStore& self, const std::string& uuid) {
-            const auto revisions = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.objectHistory(txn, uuid); });
-            nb::list result;
-            for (const auto& revision : revisions) result.append(objectRevisionToPy(revision));
-            return result;
-        }, nb::arg("object_uuid"))
-        .def("recorded_relationships", [](PyObjectStore& self, const std::string& uuid) {
-            const auto revisions = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.recordedRelationships(txn, uuid); });
-            nb::list result;
-            for (const auto& revision : revisions) result.append(relationshipRevisionToPy(revision));
-            return result;
-        }, nb::arg("object_revision_uuid"))
+        .def_prop_ro("uuid", readMethod<&vo::ObjectStore::uuid>())
+        .def("current_object_revision", readMethod<&vo::ObjectStore::currentObjectRevision>(),
+             nb::arg("object_uuid"))
+        .def("object_revision", readMethod<&vo::ObjectStore::objectRevision>(),
+             nb::arg("revision_uuid"))
+        .def("object_history", readMethod<&vo::ObjectStore::objectHistory>(),
+             nb::arg("object_uuid"))
+        .def("recorded_relationships", readMethod<&vo::ObjectStore::recordedRelationships>(),
+             nb::arg("object_revision_uuid"))
         .def("relationships_at", [](PyObjectStore& self, const vo::RevisionSelection& selection) {
             const auto revisions = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.relationshipsAt(txn, selection); });
             nb::list result;
@@ -799,9 +716,8 @@ NB_MODULE(_native, m)
             });
         }, nb::arg("selection"),
            "Resolve selected objects, metadata, geometry references and relationship applicability in one read snapshot.")
-        .def("revision_selection_at", [](PyObjectStore& self, int64_t time, bool includeRetired) {
-            return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.revisionSelectionAt(txn, time, includeRetired); });
-        }, nb::arg("published_at_us"), nb::arg("include_retired") = false)
+        .def("revision_selection_at", readMethod<&vo::ObjectStore::revisionSelectionAt>(), nb::arg("published_at_us"),
+             nb::arg("include_retired") = false)
         .def("revision_read_view_at", [](PyObjectStore& self, int64_t time, bool includeRetired) {
             return self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) {
                 return revisionViewToPy(db, txn, db.revisionSelectionAt(txn, time, includeRetired));
