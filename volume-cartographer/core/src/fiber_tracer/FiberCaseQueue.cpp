@@ -1,6 +1,11 @@
 #if defined(__APPLE__) && !defined(_XOPEN_SOURCE)
 #define _XOPEN_SOURCE 700
 #endif
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+// ucontext requires X/Open declarations, but guarded anonymous stacks also
+// need Darwin extensions hidden by the corresponding strict POSIX mode.
+#define _DARWIN_C_SOURCE 1
+#endif
 #include "vc/fiber_tracer/FiberCaseQueue.hpp"
 #include <atomic>
 #include <algorithm>
