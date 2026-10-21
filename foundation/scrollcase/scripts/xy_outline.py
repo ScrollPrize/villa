@@ -73,26 +73,23 @@ def occupancy_grid(
     return grid, origin
 
 
-def trace_outlines(grid: np.ndarray, origin: np.ndarray, cell: float) -> list[np.ndarray]:
-    """Closed boundary polylines of the occupied region, largest first, CCW."""
-    labels, n = ndimage.label(grid)
-    outlines = []
-    for i in range(1, n + 1):
-        gen = contourpy.contour_generator(
-            z=(labels == i).astype(float), line_type=contourpy.LineType.Separate
-        )
-        lines = gen.lines(0.5)
-        # Holes are filled, so the component has a single (outer) boundary.
-        line = max(lines, key=len)
-        # contourpy returns (column, row) = (ix, iy) grid coordinates.
-        pts = line * cell + origin
-        if np.allclose(pts[0], pts[-1]):
-            pts = pts[:-1]
-        if polygon_area(pts) < 0:
-            pts = pts[::-1]
-        outlines.append(pts)
-    outlines.sort(key=polygon_area, reverse=True)
-    return outlines
+def trace_outline(grid: np.ndarray, origin: np.ndarray, cell: float) -> np.ndarray:
+    """Closed CCW boundary polyline of the occupied region, which must be connected."""
+    _, n = ndimage.label(grid)
+    if n != 1:
+        raise ValueError(f"projection has {n} separate pieces, expected 1")
+    gen = contourpy.contour_generator(
+        z=grid.astype(float), line_type=contourpy.LineType.Separate
+    )
+    # Holes are filled and the grid is padded, so there is a single closed line.
+    (line,) = gen.lines(0.5)
+    # contourpy returns (column, row) = (ix, iy) grid coordinates.
+    pts = line * cell + origin
+    if np.allclose(pts[0], pts[-1]):
+        pts = pts[:-1]
+    if polygon_area(pts) < 0:
+        pts = pts[::-1]
+    return pts
 
 
 def polygon_area(pts: np.ndarray) -> float:
@@ -115,17 +112,15 @@ def perimeter(pts: np.ndarray) -> float:
     return float(np.linalg.norm(pts - np.roll(pts, -1, axis=0), axis=1).sum())
 
 
-def write_csv(path: Path, scroll_id: str, outlines: list[np.ndarray]) -> None:
-    """Write the outline points, one row per point."""
+def write_csv(path: Path, outline: np.ndarray) -> None:
+    """Write the outline points in order, one row per point."""
     with path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["scroll_id", "contour", "point", "x_mm", "y_mm"])
-        for c, pts in enumerate(outlines):
-            for p, (x, y) in enumerate(pts):
-                writer.writerow([scroll_id, c, p, f"{x:.3f}", f"{y:.3f}"])
+        writer.writerow(["x_mm", "y_mm"])
+        writer.writerows([f"{x:.3f}", f"{y:.3f}"] for x, y in outline)
 
 
-def plot_outline(ax, mesh, grid, origin, cell, outlines, scroll_id) -> None:
+def plot_outline(ax, mesh, grid, origin, cell, outline, scroll_id) -> None:
     """Draw the occupancy grid, mesh footprint coloured by z, and outline."""
     h, w = grid.shape
     extent = [
@@ -148,20 +143,17 @@ def plot_outline(ax, mesh, grid, origin, cell, outlines, scroll_id) -> None:
     sc = ax.scatter(
         v[order, 0], v[order, 1], c=v[order, 2], s=0.3, cmap=blues, linewidths=0
     )
-    for pts in outlines:
-        loop = np.vstack([pts, pts[:1]])
-        ax.plot(loop[:, 0], loop[:, 1], color="#c0392b", lw=1)
-        ax.plot(pts[:, 0], pts[:, 1], "o", ms=2, color="#c0392b")
+    loop = np.vstack([outline, outline[:1]])
+    ax.plot(loop[:, 0], loop[:, 1], color="#c0392b", lw=1)
+    ax.plot(outline[:, 0], outline[:, 1], "o", ms=2, color="#c0392b")
     ax.axhline(0, color="#888", lw=0.5)
     ax.axvline(0, color="#888", lw=0.5)
     ax.set_aspect("equal")
     ax.set_xlabel("x (mm)")
     ax.set_ylabel("y (mm)")
-    n_pts = sum(len(p) for p in outlines)
-    area = sum(polygon_area(p) for p in outlines)
     ax.set_title(
-        f"{scroll_id}: {len(outlines)} contour(s), {n_pts} pts, "
-        f"area {area:.0f} mm², z {v[:, 2].min():.1f}–{v[:, 2].max():.1f} mm",
+        f"{scroll_id}: {len(outline)} pts, "
+        f"area {polygon_area(outline):.0f} mm², z {v[:, 2].min():.1f}–{v[:, 2].max():.1f} mm",
         fontsize=9,
     )
     return sc
@@ -189,25 +181,24 @@ def main() -> None:
         if not mesh.is_watertight:
             print(f"warning: {stl} is not watertight; holes in the projection are filled anyway")
         grid, origin = occupancy_grid(mesh, args.cell, args.margin)
-        outlines = [resample_closed(p, args.step) for p in trace_outlines(grid, origin, args.cell)]
-        write_csv(args.output / f"{scroll_id}_xy_outline.csv", scroll_id, outlines)
+        outline = resample_closed(trace_outline(grid, origin, args.cell), args.step)
+        write_csv(args.output / f"{scroll_id}_xy_outline.csv", outline)
 
         fig, ax = plt.subplots(figsize=(7, 7))
-        sc = plot_outline(ax, mesh, grid, origin, args.cell, outlines, scroll_id)
+        sc = plot_outline(ax, mesh, grid, origin, args.cell, outline, scroll_id)
         fig.colorbar(sc, ax=ax, shrink=0.6, label="vertex z (mm)")
         fig.savefig(args.output / f"{scroll_id}_xy_outline.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
-        results.append((scroll_id, mesh, grid, origin, outlines))
-        lengths = ", ".join(f"{perimeter(p):.1f}" for p in outlines)
-        print(f"{scroll_id}: {len(outlines)} contour(s), perimeter {lengths} mm")
+        results.append((scroll_id, mesh, grid, origin, outline))
+        print(f"{scroll_id}: {len(outline)} points, perimeter {perimeter(outline):.1f} mm")
 
     n = len(results)
     cols = int(np.ceil(np.sqrt(n)))
     rows = int(np.ceil(n / cols))
     fig, axes = plt.subplots(rows, cols, figsize=(5 * cols, 5 * rows), squeeze=False)
-    for ax, (scroll_id, mesh, grid, origin, outlines) in zip(axes.flat, results):
-        plot_outline(ax, mesh, grid, origin, args.cell, outlines, scroll_id)
+    for ax, (scroll_id, mesh, grid, origin, outline) in zip(axes.flat, results):
+        plot_outline(ax, mesh, grid, origin, args.cell, outline, scroll_id)
     for ax in axes.flat[n:]:
         ax.axis("off")
     fig.tight_layout()
