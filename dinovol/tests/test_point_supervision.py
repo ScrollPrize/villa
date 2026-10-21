@@ -332,21 +332,24 @@ class PointPipelineTests(unittest.TestCase):
             trainer._close_dataloader(loader)
             trainer._close_auxiliary_datasets()
 
-    def test_deeper_embedding_halo_alignment(self) -> None:
+    def test_point_coordinates_use_crop_coordinates_directly(self) -> None:
         config = self._dataset_config()
-        config["global_view_size"] = [24, 24, 24]
         dataset = SSLZarrDataset(config, do_augmentations=False)
         try:
-            self.assertGreater(dataset.global_view_size[0], 16)
-            halo = torch.tensor(dataset.global_point_crop_offset)
             coordinates, types = dataset._filter_and_cap_view_points(
-                torch.stack((halo + 1.25, halo + 14.0)),
+                torch.tensor([[1.25] * 3, [14.0] * 3]),
                 torch.tensor([0, 1]),
             )
             torch.testing.assert_close(coordinates, torch.tensor([[1.25] * 3, [14.0] * 3]))
             self.assertEqual(types.tolist(), [0, 1])
         finally:
             dataset.close()
+
+    def test_obsolete_expanded_view_sizes_are_rejected(self) -> None:
+        config = self._dataset_config()
+        config["global_view_size"] = [24, 24, 24]
+        with self.assertRaisesRegex(ValueError, "global_view_size is no longer supported"):
+            SSLZarrDataset(config, do_augmentations=False)
 
 
 class PointLossTests(unittest.TestCase):

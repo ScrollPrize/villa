@@ -23,7 +23,7 @@ from gap_parameterization import (
     lower_bounded_dr,
     lower_bounded_gap,
 )
-from geom_utils import expm_2x2, interp1d
+from geom_utils import expm_2x2, grid_sample_border, interp1d
 from sample_spiral import get_bounding_windings, get_theta_and_radii
 
 
@@ -194,12 +194,9 @@ class GapExpandingTransform(pyro.distributions.transforms.Transform):
         winding_coords_normalised = (
             winding_coords / winding_first_logit_idx[-1] * 2 - 1)
         z_normalised = (z - self.min_z) / (self.max_z - self.min_z) * 2 - 1
-        return F.grid_sample(
+        return grid_sample_border(
             self._get_pinned_scaled_logits(),
             torch.stack([winding_coords_normalised, z_normalised[..., None].expand(*theta.shape, num_windings)], dim=-1).view(1, -1, num_windings, 2),
-            mode='bilinear',
-            padding_mode='border',
-            align_corners=True,
         ).squeeze(1).squeeze(0).view(*theta.shape, num_windings)
 
     def get_native_log_gaps(self, winding_idx, theta, z):
@@ -321,11 +318,11 @@ class VaryingLinearTransform(pyro.distributions.transforms.Transform):
             logits = logits.view(*input_zyx.shape[:-1], 2, 2)
         else:
             normalised_zs = (zs.view(-1) - self.min_z) / (self.max_z - self.min_z) * 2 - 1
-            logits = F.grid_sample(
+            # grid_sample_border is F.grid_sample everywhere but MPS, which
+            # has no grid_sample backward.
+            logits = grid_sample_border(
                 rearrange(self.logits, 'z r c -> 1 (r c) z 1'),
                 torch.stack([torch.zeros_like(normalised_zs), normalised_zs], dim=-1)[None, None],
-                padding_mode='border',
-                align_corners=True
             ).squeeze(2).squeeze(0).T.view(*input_zyx.shape[:-1], 2, 2)
         if inverse:
             logits = -logits

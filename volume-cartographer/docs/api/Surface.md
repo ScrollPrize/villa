@@ -83,8 +83,9 @@ QuadSurface(cv::Mat_<cv::Vec3f>* points, const cv::Vec2f& scale);
 
 | Method | Description |
 |--------|-------------|
-| `save(path, uuid, force_overwrite)` | Saves to a directory with x.tif, y.tif, z.tif and meta.json |
-| `save(path, force_overwrite)` | Saves using the directory name as uuid |
+| `save(path, force_overwrite)` | Saves to a directory with x.tif, y.tif, z.tif and meta.json, under the surface's persistent object UUID (`meta["uuid"]`, minted if unset; never derived from the directory name) |
+| `saveAsNew(path, force_overwrite)` | Saves as a new object with a fresh object UUID (copies and derived outputs) |
+| `saveEdited(source, dest, force_overwrite)` | Saves an edit of the surface read from `source`: in-place if `dest` is `source`, otherwise as a new object |
 | `save_meta()` | Saves only the meta.json file |
 | `saveOverwrite()` | Overwrites the surface at its current path |
 | `saveSnapshot(maxBackups)` | Creates a backup in the volpkg's `backups/` directory |

@@ -19,8 +19,13 @@
 
 #include <omp.h>
 
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <optional>
@@ -32,6 +37,37 @@ using shape = std::vector<size_t>;
 
 
 using Json = utils::Json;
+
+// The tracer's Ceres solves go through CHOLMOD, whose BLAS calls land in the
+// process-wide OpenBLAS pool. The pthreads build of OpenBLAS sizes that pool
+// from the core count when the library is loaded and the idle workers
+// spin-wait (sched_yield) between jobs; the tracer issues many small
+// factorizations, so on an N-core machine the pool burns N-1 cores for
+// nothing, and neither thread_limit nor omp_set_num_threads() reaches it.
+// Measured on a 14C/28T Xeon: thread_limit=1 took 189 CPU-s for 16.6 s of
+// wall with the pool and 13 CPU-s / 12.7 s with it capped. VC3D's
+// "Create Segment (GrowPatch)" runs this tool with thread_limit 1 and does
+// not set OMP_NUM_THREADS, so it gets the full pool too (40 generations on a
+// remote volume: 1705 CPU-s uncapped, 226 capped).
+// Only the thread count is capped. Retiring the workers as well
+// (blas_shutdown(), which VCAppMain.cpp calls for VC3D itself) made this tool
+// crash in the exit handlers after the surface had been saved, and saved no
+// measurable CPU on top of the cap. An explicit OPENBLAS_NUM_THREADS /
+// GOTO_NUM_THREADS in the environment wins: OpenBLAS already honoured it.
+static void cap_blas_thread_pool()
+{
+#ifndef _WIN32
+    if (std::getenv("OPENBLAS_NUM_THREADS") || std::getenv("GOTO_NUM_THREADS"))
+        return;
+    const int omp_threads = omp_get_max_threads();
+    if (auto fn = reinterpret_cast<void (*)(int)>(dlsym(RTLD_DEFAULT, "openblas_set_num_threads")))
+        fn(1);
+    // OpenMP builds of OpenBLAS up to 0.3.0 forwarded the call above to
+    // omp_set_num_threads(); the tracer's own thread count stays as it was.
+    if (omp_get_max_threads() != omp_threads)
+        omp_set_num_threads(omp_threads);
+#endif
+}
 
 static bool is_remote_volume_path(const std::string& path)
 {
@@ -201,7 +237,35 @@ static auto load_direction_fields(Json const&params, std::filesystem::path const
     return direction_fields;
 }
 
+// A remote chunk fetch that fails after its retries ends in a std::runtime_error. run_main catches
+// it only around tracer(), so elsewhere, as at the seed point, it would abort the process. Catch
+// what reaches main here (a throw inside an OpenMP loop may not), report it and exit non-zero, as
+// #1817 does for vc_render_tifxyz. run_main is main's old body, moved unchanged.
+static int run_main(int argc, char *argv[]);
+
 int main(int argc, char *argv[])
+{
+    // First, before anything can issue a BLAS call.
+    cap_blas_thread_pool();
+
+    try {
+        return run_main(argc, argv);
+    } catch (const std::exception& e) {
+        // An HTTP status error carries the server's response body in its message; for a 503 that is
+        // a whole HTML page. Keep the first line, as #1817 does for vc_render_tifxyz.
+        std::string what = e.what();
+        if (auto nl = what.find('\n'); nl != std::string::npos) {
+            what.erase(nl);
+            while (!what.empty() && (what.back() == '\r' || what.back() == ' '))
+                what.pop_back();
+            what += " [...]";
+        }
+        std::cerr << "\nError: " << what << std::endl;
+        return EXIT_FAILURE;
+    }
+}
+
+static int run_main(int argc, char *argv[])
 {
     std::filesystem::path vol_path, tgt_dir, params_path, resume_path, correct_path;
     cv::Vec3d origin;
@@ -637,16 +701,16 @@ int main(int argc, char *argv[])
     if (mode == "expansion")
         meta_params["seed_overlap"] = count_overlap;
 
-    std::string uuid;
+    std::string seg_name;
     std::filesystem::path seg_dir;
     if (!segment_name.empty()) {
         // Use target-dir directly with custom segment name
-        uuid = segment_name;
+        seg_name = segment_name;
         seg_dir = tgt_dir;
     } else {
         // Default: create timestamped subfolder
-        uuid = name_prefix + time_str();
-        seg_dir = tgt_dir / uuid;
+        seg_name = name_prefix + time_str();
+        seg_dir = tgt_dir / seg_name;
     }
 
     //
@@ -1447,7 +1511,7 @@ int main(int argc, char *argv[])
         add_target_context(neighbor_meta, vol_path);
 
         out_surf->meta = neighbor_meta;
-        out_surf->save(out_dir, uuid_local, true);
+        out_surf->saveAsNew(out_dir, true);
 
         // Done
         return EXIT_SUCCESS;
@@ -1488,7 +1552,7 @@ int main(int argc, char *argv[])
     }
 
     std::cout << "saving " << seg_dir.string() << std::endl;
-    surf->save(seg_dir, uuid, true);
+    surf->saveAsNew(seg_dir, true);
     surf->path = seg_dir;
 
     if (mode == "expansion" && !skip_overlap_check) {

@@ -26,6 +26,10 @@ ViewerTransformsPanel::ViewerTransformsPanel(QWidget* parent)
         tr("Ignore any loaded or volume affine and apply scale only."));
     layout->addWidget(_scaleOnly);
 
+    _noResample = new QCheckBox(tr("Don't resample (scale only)"), this);
+    _noResample->setToolTip(tr("Keep the grid dimensions and scale grid spacing with coordinates. Uses the current volume's shape as the destination shape."));
+    layout->addWidget(_noResample);
+
     _invert = new QCheckBox(tr("Invert Affine"), this);
     _invert->setToolTip(
         tr("Invert the loaded affine. Ignored when no affine transform is loaded."));
@@ -60,6 +64,7 @@ ViewerTransformsPanel::ViewerTransformsPanel(QWidget* parent)
 
     connect(_preview, &QCheckBox::toggled, this, &ViewerTransformsPanel::previewToggled);
     connect(_scaleOnly, &QCheckBox::toggled, this, &ViewerTransformsPanel::stateChanged);
+    connect(_noResample, &QCheckBox::toggled, this, &ViewerTransformsPanel::stateChanged);
     connect(_invert, &QCheckBox::toggled, this, &ViewerTransformsPanel::stateChanged);
     connect(_scale, QOverload<int>::of(&QSpinBox::valueChanged),
             this, [this](int) { emit stateChanged(); });
@@ -82,6 +87,11 @@ bool ViewerTransformsPanel::invertChecked() const
     return _invert && _invert->isChecked();
 }
 
+bool ViewerTransformsPanel::noResampleChecked() const
+{
+    return scaleOnlyChecked() && _noResample->isChecked();
+}
+
 int ViewerTransformsPanel::scaleValue() const
 {
     return _scale ? _scale->value() : 1;
@@ -102,6 +112,7 @@ void ViewerTransformsPanel::setPreviewChecked(bool checked, bool blockSignals)
 
 void ViewerTransformsPanel::applyUiState(const UiState& state)
 {
+    _noResample->setEnabled(state.sourceAvailable && !state.editingEnabled && state.scaleOnly);
     if (_preview) {
         _preview->setEnabled(state.previewAvailable);
     }
