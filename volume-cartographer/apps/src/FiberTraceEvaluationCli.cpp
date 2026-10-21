@@ -31,7 +31,6 @@
 #include <numeric>
 #include <optional>
 #include <set>
-#include <syncstream>
 #include <thread>
 #include <unordered_map>
 #include <opencv2/imgcodecs.hpp>
@@ -891,6 +890,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     std::atomic<size_t> next{0}, completed{0};
     std::atomic<bool> failed{false};
     std::mutex errorMutex;
+    std::mutex progressMutex;
     std::exception_ptr error;
     const auto start = std::chrono::steady_clock::now();
     std::vector<std::jthread> pool;
@@ -968,7 +968,8 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                             nextProfile = now + std::chrono::seconds(10);
                             auto profile = caseProfileJson(index, std::chrono::duration<double>(now - caseStart).count(), readinessProfile, traceProfile);
                             profile["remaining_base_voxels"] = remaining.load();
-                            std::osyncstream(std::cout) << "trace-profile " << profile.dump() << std::endl;
+                            std::lock_guard lock(progressMutex);
+                            std::cout << "trace-profile " << profile.dump() << std::endl;
                         }
                     });
                 }();
@@ -1013,9 +1014,11 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                     caseRemaining[index].store(0);
                     std::vector<cv::Vec3d>().swap(item.points);
                     const auto done = ++completed;
-                    if (done % 100 == 0)
-                        std::osyncstream(std::cout) << "trial progress=" << done << '/' << cases.size()
+                    if (done % 100 == 0) {
+                        std::lock_guard lock(progressMutex);
+                        std::cout << "trial progress=" << done << '/' << cases.size()
                             << " skipped=" << skippedTrials.load() << std::endl;
+                    }
                     return;
                 }
                 if (profileTracing)
@@ -1079,7 +1082,8 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 FiberReferenceReplayCase replayCase{item.fiber, item.run, item.reverse, item.points, item.length};
                 outcomes[index] = measureFiberReferenceReplayOutcome(replayCase, replay);
                 caseRemaining[index].store(0);
-                std::osyncstream(std::cout) << "replay progress=" << ++completed << '/' << cases.size()
+                std::lock_guard lock(progressMutex);
+                std::cout << "replay progress=" << ++completed << '/' << cases.size()
                     << " case=" << index << " source=" << source.id << " reverse=" << item.reverse
                     << '\n'; // Counts are reported by the shared episode metrics.
             }
@@ -1092,7 +1096,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
     };
     std::unique_ptr<FiberCaseQueue> caseQueue;
     if (queuedCases) {
-        std::osyncstream(std::cout) << "live case queue: cases=" << cases.size()
+        std::cout << "live case queue: cases=" << cases.size()
             << " workers=" << workers << std::endl;
         // Each reusable coroutine drains the shared atomic case queue.
         caseQueue = std::make_unique<FiberCaseQueue>(workers,

@@ -44,7 +44,8 @@ void verifyFiberConstraintDatabaseMeasurements(const std::filesystem::path& path
     const vc::fiber_tracer::FiberTraceConstraintReport& report)
 {
     sqlite3* raw=nullptr;
-    const int opened=sqlite3_open_v2(path.c_str(),&raw,SQLITE_OPEN_READONLY,nullptr);
+    const auto name=path.u8string();
+    const int opened=sqlite3_open_v2(reinterpret_cast<const char*>(name.c_str()),&raw,SQLITE_OPEN_READONLY,nullptr);
     std::unique_ptr<sqlite3,decltype(&sqlite3_close)> db(raw,sqlite3_close);
     if(opened!=SQLITE_OK)throw std::runtime_error("Cannot open comparison database");
     sqlite3_stmt* stmt=nullptr;
@@ -65,12 +66,14 @@ nlohmann::json writeFiberConstraintDatabase(
     const vc::lasagna::LasagnaNormalSampler& normals, int threads, const Json& metadata)
 {
     const auto start=std::chrono::steady_clock::now();
-    const auto temporary=std::filesystem::path(output.string()+".partial");
+    auto temporary=output;
+    temporary += ".partial";
     if(std::filesystem::exists(output) || std::filesystem::exists(temporary))
         throw std::runtime_error("Refusing to overwrite constraint database or partial file");
     std::filesystem::create_directories(output.parent_path());
     sqlite3* raw=nullptr;
-    const int opened=sqlite3_open_v2(temporary.c_str(),&raw,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE,nullptr);
+    const auto name=temporary.u8string();
+    const int opened=sqlite3_open_v2(reinterpret_cast<const char*>(name.c_str()),&raw,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE,nullptr);
     std::unique_ptr<sqlite3,decltype(&sqlite3_close)> db(raw,sqlite3_close);
     if(opened!=SQLITE_OK)throw std::runtime_error("Cannot create constraint database");
     const auto check=[&](int rc){if(rc!=SQLITE_OK && rc!=SQLITE_DONE)throw std::runtime_error(sqlite3_errmsg(db.get()));};
@@ -160,13 +163,15 @@ nlohmann::json orientFiberConstraintDatabase(
     const auto started=Clock::now();
     if(!std::isfinite(sampleSpacing) || sampleSpacing<=0. || threads<1 || lines.size()!=sourceIds.size())
         throw std::invalid_argument("Invalid normal orientation sampling configuration");
-    const auto partial=std::filesystem::path(output.string()+".partial");
+    auto partial=output;
+    partial += ".partial";
     if(std::filesystem::exists(output) || std::filesystem::exists(partial))
         throw std::runtime_error("Refusing to overwrite oriented database or partial output");
     using Database=std::unique_ptr<sqlite3,decltype(&sqlite3_close)>;
     using Statement=std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)>;
     const auto open=[](const auto& path,int flags) {
-        sqlite3* raw=nullptr; const int rc=sqlite3_open_v2(path.c_str(),&raw,flags,nullptr);
+        const auto name=path.u8string();
+        sqlite3* raw=nullptr; const int rc=sqlite3_open_v2(reinterpret_cast<const char*>(name.c_str()),&raw,flags,nullptr);
         Database db(raw,sqlite3_close);
         if(rc!=SQLITE_OK)throw std::runtime_error("Cannot open constraint database: "+path.string());
         return db;

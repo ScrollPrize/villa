@@ -83,7 +83,7 @@ def test_build_real_gt_cache_from_scratch_and_score(tmp_path):
         pytest.skip('set FIBER_GT_ROOT and VC_CONSTRAINT_TEST_BINARY for fresh native extraction')
     gt = Path(gt_path)
     # Copy configuration only. All source AFVs, solves and databases stay read-only.
-    local_gt = tmp_path / 'gt'
+    local_gt = tmp_path / 'gt-π-纤维'
     (local_gt / 'uv_whole').mkdir(parents=True)
     config = json.loads((gt / 'uv_whole/config.json').read_text())
     (local_gt / 'uv_whole/solution.npz').symlink_to(gt / 'uv_whole/solution.npz')
@@ -101,6 +101,14 @@ def test_build_real_gt_cache_from_scratch_and_score(tmp_path):
     extraction_path = local_gt / 'prepare_extraction.json'
     extraction_path.write_text(json.dumps(extraction))
     run_native_constraints(extraction_path, dict(native_binary=binary))
+    # Exercise the read-only SQLite audit too, with a non-ASCII database path.
+    audit = dict(extraction, compare_database=extraction['database'],
+                 output=str(local_gt / 'audit.json'))
+    del audit['database']
+    audit_path = local_gt / 'audit_config.json'
+    audit_path.write_text(json.dumps(audit))
+    run_native_constraints(audit_path, dict(native_binary=binary))
+    assert json.loads(Path(audit['output']).read_text())['all_measurements_match_database']
     orientation = json.loads((local_gt / 'orient_config.json').read_text())
     orientation.update(database=str(local_gt / 'oriented.sqlite'),
                        output=str(local_gt / 'oriented.json'),
@@ -112,7 +120,7 @@ def test_build_real_gt_cache_from_scratch_and_score(tmp_path):
     (local_gt / 'uv_whole/config.json').write_text(json.dumps(config))
     candidate = tmp_path / 'candidate.json'
     candidate.write_text(json.dumps(dict(fiber_uv_layout=config)))
-    root = tmp_path / 'cross'
+    root = tmp_path / 'cross-π-纤维'
     settings = dict(output_root=str(root), configs=[str(candidate)], gt_root=str(local_gt),
                     extract_template=str(local_gt / 'extract_config.json'),
                     orient_template=str(local_gt / 'orient_config.json'),
