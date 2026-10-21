@@ -534,7 +534,7 @@ int main(int argc, char* argv[])
 
         try {
             QuadSurface out(crop, scale);
-            out.save(out_path.string(), name.str(), false);
+            out.saveAsNew(out_path, false);
         } catch (const std::exception& e) {
             std::cerr << "error writing " << out_path << ": " << e.what() << "\n";
             return EXIT_FAILURE;

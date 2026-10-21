@@ -1,4 +1,5 @@
 #include "CWindow.hpp"
+#include "VolumeComboTooltip.hpp"
 #include "FiberLengthDisplay.hpp"
 #include "VolumeDisplayNames.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
@@ -2804,7 +2805,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         if (stats.lowSpace) {
             const double freeGiB = static_cast<double>(stats.freeBytes) /
                                    (1024.0 * 1024.0 * 1024.0);
-            const QString text = tr("Low disk space: %1 GiB free; remote Zarr cache growth is paused.")
+            const QString text = tr("Low disk space: %1 GiB free. Cache cleanup runs asynchronously; downloads continue and cache writes may fail if the disk fills.")
                                      .arg(freeGiB, 0, 'f', 1);
             _persistentCacheLowSpaceLabel->setText(QStringLiteral("⚠ ") + text);
             _persistentCacheLowSpaceLabel->show();
@@ -3733,6 +3734,10 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             _lineAnnotationController->canLaunchFromViewer(viewer) &&
                             viewer->sampleSceneVolume(scenePoint).has_value());
 
+                        QAction* modelLineAnnotationAction = menu.addAction(tr("New 2D line annotation (model)"));
+                        modelLineAnnotationAction->setObjectName(QStringLiteral("model2dLineAnnotationAction"));
+                        modelLineAnnotationAction->setEnabled(newLineAnnotationAction->isEnabled());
+
                         QAction* createGrowPatchAction = menu.addAction(tr("Create Segment (GrowPatch)"));
                         createGrowPatchAction->setEnabled(validVolumePoint &&
                                                           _segmentationCommandHandler &&
@@ -3942,6 +3947,9 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             newLineAnnotationAction->isEnabled() &&
                             _lineAnnotationController) {
                             _lineAnnotationController->launchFromViewerAtPoint(viewer, scenePoint);
+                        } else if (selected == modelLineAnnotationAction &&
+                                   modelLineAnnotationAction->isEnabled() && _lineAnnotationController) {
+                            _lineAnnotationController->launchFromViewerAtPoint(viewer, scenePoint, true, true);
                         }
                     });
             viewer->setProperty("vc_annotation_context_bound", true);
@@ -9475,13 +9483,15 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     bool preferredVolumeFound = false;
     const bool hasOpenDataSegments = packageHasOpenDataSegments(*_state->vpkg());
     const auto volumeIds = vc3d::orderedDisplayVolumeIds(*_state->vpkg());
+    const auto volumeSuffixes = vc3d::volumeDisplaySuffixes(*_state->vpkg());
     for (const auto& id : volumeIds) {
         try {
             auto vol = _state->vpkg()->volume(id);
             const QString idStr = QString::fromStdString(id);
             const QString nameStr = QString::fromStdString(vol->name());
             const QString label = vc3d::volumeDisplayLabel(*_state->vpkg(), id,
-                nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr));
+                nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr),
+                volumeSuffixes.value(idStr));
 
             orderedIds.push_back(idStr);
             volumeEntries.append({idStr, label});
@@ -9564,10 +9574,12 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
         for (const auto& [id, label] : volumeEntries) {
             selector->addItem(label, QVariant(id));
             const int row = selector->count() - 1;
+            const auto sourcePath = vc3d::volumeDisplayPath(*_state->vpkg(), id.toStdString());
+            selector->setItemData(row, sourcePath, Qt::ToolTipRole);
             if (openDataVolumesWithoutSegments.find(id) != openDataVolumesWithoutSegments.end()) {
                 selector->setItemData(row, QBrush(QColor(245, 124, 0)), Qt::ForegroundRole);
                 selector->setItemData(row,
-                                      tr("No segment transform is available for this volume."),
+                                      sourcePath + QStringLiteral("\n") + tr("No segment transform is available for this volume."),
                                       Qt::ToolTipRole);
             }
         }
@@ -9579,6 +9591,7 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
             const int activeIndex = selector->findData(activeCandidate);
             selector->setCurrentIndex(activeIndex >= 0 ? activeIndex : 0);
         }
+        vc3d::refreshVolumeComboTooltip(selector);
     }
 
     QString activeId;
@@ -10536,6 +10549,16 @@ void CWindow::onManualLocationChanged()
 
 void CWindow::refreshFocusBoundsUi()
 {
+    if (_fiberMapWorkspace) {
+        auto bounds = _state ? _state->activeFocusBounds() : std::nullopt;
+        if (bounds && _state) {
+            // Viewer bounds index the current volume; map geometry indexes
+            // the annotation frame (which can be a different pyramid base).
+            bounds = vc3d::annotation::focusBoundsInAnnotationFrame(
+                bounds, _state->annotationFrame());
+        }
+        _fiberMapWorkspace->setFocusBounds(bounds);
+    }
     if (!ui.chkFocusBBox || !ui.focusBBoxMin || !ui.focusBBoxMax) {
         return;
     }

@@ -347,6 +347,7 @@ struct FiberGeometry {
     std::vector<QPointF> samples;
     std::vector<double> controlArclength;
     std::vector<QPointF> controlPoints;
+    std::vector<cv::Vec3d> worldSamples;
 };
 
 struct NetworkDraft {
@@ -609,6 +610,14 @@ FiberGeometry buildFiberGeometry(const PreparedFiber& entry, double thetaScale,
     geo.samples.erase(geo.samples.begin(),
                       geo.samples.begin() +
                           static_cast<std::ptrdiff_t>(clipBegin));
+    geo.worldSamples.resize(geo.samples.size());
+    std::vector<double> component(fiber.linePoints.size());
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < component.size(); ++i)
+            component[i] = fiber.linePoints[i][axis];
+        for (std::size_t i = 0; i < geo.worldSamples.size(); ++i)
+            geo.worldSamples[i][axis] = interpolate(geo.sampleArclength[i], rawArclength, component);
+    }
     return geo;
 }
 
@@ -623,6 +632,7 @@ PlacedFiber makePlacedFiber(const InputFiber& fiber, const FiberGeometry& geo)
     placedFiber.label = fiber.label;
     placedFiber.hvTag = fiber.hvTag;
     placedFiber.controlPoints = geo.controlPoints;
+    placedFiber.controlWorldPoints = fiber.controlPoints;
     // Per-point flags are copied only when they line up with the controls; a
     // mismatched vector is ignored rather than read misaligned.
     const auto copyPointFlags = [&](const std::vector<bool>& flags, std::vector<bool>& out) {
@@ -667,6 +677,7 @@ PlacedFiber makePlacedFiber(const InputFiber& fiber, const FiberGeometry& geo)
             whole.firstControl = 0;
             whole.lastControl = static_cast<int>(spanCount);
             whole.points = geo.samples;
+            whole.worldPoints = geo.worldSamples;
             placedFiber.runs.push_back(std::move(whole));
         }
         return placedFiber;
@@ -698,6 +709,8 @@ PlacedFiber makePlacedFiber(const InputFiber& fiber, const FiberGeometry& geo)
             run.lastControl = static_cast<int>(j + 1);
             run.points.assign(geo.samples.begin() + static_cast<std::ptrdiff_t>(from),
                               geo.samples.begin() + static_cast<std::ptrdiff_t>(to));
+            run.worldPoints.assign(geo.worldSamples.begin() + static_cast<std::ptrdiff_t>(from),
+                                   geo.worldSamples.begin() + static_cast<std::ptrdiff_t>(to));
             placedFiber.runs.push_back(std::move(run));
         }
         k = j + 1;
@@ -816,19 +829,21 @@ ContentDigest combineDigests(uint64_t seed,
 
 } // namespace
 
-std::vector<QPointF> displayRunPoints(const PlacedFiber& fiber, std::size_t runIndex)
+template<typename Point>
+static std::vector<Point> trimDisplayRun(const PlacedFiber& fiber, std::size_t runIndex,
+                                         std::vector<Point> points,
+                                         const std::vector<Point>& controls)
 {
     if (runIndex >= fiber.runs.size()) {
         return {};
     }
     const Run& run = fiber.runs[runIndex];
-    std::vector<QPointF> points = run.points;
     if (points.size() < 2) {
         return points;
     }
-    const auto control = [&fiber](int index) -> const QPointF* {
-        return index >= 0 && static_cast<std::size_t>(index) < fiber.controlPoints.size()
-            ? &fiber.controlPoints[static_cast<std::size_t>(index)]
+    const auto control = [&controls](int index) -> const Point* {
+        return index >= 0 && static_cast<std::size_t>(index) < controls.size()
+            ? &controls[static_cast<std::size_t>(index)]
             : nullptr;
     };
     // The overlap is exactly one sample at each end: the sample before the
@@ -843,16 +858,28 @@ std::vector<QPointF> displayRunPoints(const PlacedFiber& fiber, std::size_t runI
     const bool previousStyled = runIndex > 0 && styled(fiber.runs[runIndex - 1]);
     const bool nextStyled = runIndex + 1 < fiber.runs.size() && styled(fiber.runs[runIndex + 1]);
     if (styled(run) || previousStyled) {
-        if (const QPointF* first = control(run.firstControl)) {
+        if (const Point* first = control(run.firstControl)) {
             points.front() = *first;
         }
     }
     if (styled(run) || nextStyled) {
-        if (const QPointF* last = control(run.lastControl)) {
+        if (const Point* last = control(run.lastControl)) {
             points.back() = *last;
         }
     }
     return points;
+}
+
+std::vector<QPointF> displayRunPoints(const PlacedFiber& fiber, std::size_t runIndex)
+{
+    if (runIndex >= fiber.runs.size()) return {};
+    return trimDisplayRun(fiber, runIndex, fiber.runs[runIndex].points, fiber.controlPoints);
+}
+
+std::vector<cv::Vec3d> displayRunWorldPoints(const PlacedFiber& fiber, std::size_t runIndex)
+{
+    if (runIndex >= fiber.runs.size()) return {};
+    return trimDisplayRun(fiber, runIndex, fiber.runs[runIndex].worldPoints, fiber.controlWorldPoints);
 }
 
 std::vector<const winding::PairDetections*> GlobalLayoutCache::cachedDetections() const

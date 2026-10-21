@@ -1,5 +1,33 @@
 # VC3D Line Annotation Fibers
 
+## Fiber coordinate shape
+
+Every saved fiber includes `coordinate_base_shape_zyx`, the dimensions of the
+grid its stored points index. New viewer annotations record the active volume's
+exact shape; linked fibers inherit the parent session's shape and display scale.
+Headless inference annotations require the inference manifest's `base_shape_zyx`.
+These are coordinate-frame dimensions, not necessarily the scan's finest grid.
+Opening older unstamped fibers first uses their recorded/selected inference
+manifest; without one, their existing unscaled active-volume interpretation is
+recorded on save. Saving without a valid shape fails rather than omitting it.
+Once resolved, this shape is retained in the loaded fiber and its open sessions
+before saves are queued. Changing the active volume or inference dataset does
+not reinterpret previously resolved geometry.
+Package loading happens before volume activation. Load-time metadata writes
+(including assigning a missing UUID) that cannot yet resolve a coordinate shape
+are deferred until a volume becomes active. The already generated in-memory UUID
+is preserved during that wait; existing UUIDs are not replaced. Deferred writes
+are discarded on a fiber reload/package change, and this retry does not enable
+writes withheld for unresolved branch-link issues.
+
+Import and export preserve stored coordinates and `coordinate_base_shape_zyx`
+unchanged. There is no import/export scale control or API parameter; the shape
+determines the display conversion into the active volume. Agent requests that
+still supply `scale` are rejected. Old collection-level `scale` metadata is not
+applied; it described a transform already baked into the exported points.
+Previously scaled exports with inconsistent shape metadata need correction
+at their source; they cannot be repaired unambiguously on import.
+
 ## CP direction annotations
 
 Shift-drag near an existing CP in either strip to edit its forward direction.
@@ -437,13 +465,25 @@ The main window's **BBox** checkbox beneath **Focus** enables an annotation
 focus region. The adjacent minimum and maximum fields use inclusive absolute
 base-volume `x, y, z` coordinates. An unset box starts at the current volume
 extent; edited coordinates are normalized and clamped to that extent. The box
-is session-only, survives volume/channel changes in the current package, and is
-cleared when the project is replaced or closed.
+is stored per project together with its enabled state. UI fields and viewer
+mask APIs use the current volume's voxel coordinates, but `focus_bounds` in
+the project JSON uses the source annotation grid (`coordinate_frame:
+"annotation"`). The same frame derivation used by the Fiber Map supplies the
+conversion: exact catalog coordinate factors take precedence, and untagged
+rebased volumes use their pyramid-base factor. Bounds are converted on read,
+not repeatedly rewritten on volume changes, so switching pyramid levels or
+reopening with another preferred level preserves the region. With no usable
+volume frame, the mask is unavailable; stored bounds are retained. Bounds with
+an unspecified storage frame are rejected rather than silently misinterpreted.
+Disabling the box preserves its limits; switching projects restores that
+project's bounds and closing clears them.
 
 When enabled, ordinary plane views and all line-annotation cut/strip views show
 the area outside the box at half brightness. The dimming is applied after base
 and attached-volume composition and does not dim control markers. The main
-segmentation surface view is not covered by this version of the feature.
+segmentation surface view is also masked using its generated 3D coordinates.
+The 2D Fiber Map clips its strokes against the same box in annotation
+coordinates, without altering the underlying fibers or layout.
 
 New seeds, linked branch seeds, and control points must be inside the active
 box. Existing controls remain valid outside it, so a saved seed-only fiber can
