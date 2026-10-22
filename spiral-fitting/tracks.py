@@ -58,6 +58,18 @@ def _load_native_track_store():
         return None
 
 
+def _flatten_tracks(tracks):
+    """Concatenate ragged (n_i, 3) tracks into float32 points plus int64 offsets."""
+    lengths = np.fromiter(
+        (len(track) for track in tracks), dtype=np.int64, count=len(tracks))
+    offsets = np.empty(len(lengths) + 1, dtype=np.int64)
+    offsets[0] = 0
+    np.cumsum(lengths, out=offsets[1:])
+    flat = np.concatenate(
+        [np.asarray(track, dtype=np.float32) for track in tracks], axis=0)
+    return flat, offsets
+
+
 class PackedTrackCollection:
     """A ragged track collection backed by a few contiguous native arrays."""
 
@@ -130,13 +142,7 @@ class PackedTrackCollection:
                 if workers is None else int(workers))
             return (np.asarray(result['coordinates']),
                     np.asarray(result['offsets']))
-        tracks = [self[index] for index in range(len(self))]
-        lengths = np.fromiter(
-            (len(track) for track in tracks), dtype=np.int64, count=len(tracks))
-        offsets = np.empty(len(lengths) + 1, dtype=np.int64)
-        offsets[0] = 0
-        np.cumsum(lengths, out=offsets[1:])
-        return np.concatenate(tracks, axis=0), offsets
+        return _flatten_tracks([self[index] for index in range(len(self))])
 
     def as_packed_polylines(self):
         """Return contiguous coordinates and offsets for bulk geometry output."""
@@ -1811,41 +1817,33 @@ def _aggregate_dt_track_losses(track_losses, across_p):
 def _build_track_flat_bundle(tracks, device):
     if isinstance(tracks, PackedTrackCollection):
         valid_np = np.flatnonzero(tracks.selected_lengths >= 2)
-        valid_track_indices = valid_np.tolist()
     else:
-        valid_track_indices = [i for i, track in enumerate(tracks) if len(track) >= 2]
-    if not valid_track_indices:
-        return None, torch.zeros(0, dtype=torch.int64), valid_track_indices
+        valid_np = np.fromiter(
+            (i for i, track in enumerate(tracks) if len(track) >= 2), dtype=np.int64)
+    if valid_np.size == 0:
+        return None, valid_np
 
     if isinstance(tracks, PackedTrackCollection):
         valid_tracks = tracks if len(valid_np) == len(tracks) else tracks.subset(valid_np)
         zyxs_flat, starts_np = valid_tracks.materialize()
+        # May alias tracks.coordinates (identity materialize); treat zyxs_flat as read-only.
         zyxs_flat = np.asarray(zyxs_flat[starts_np[0]:starts_np[-1]], dtype=np.float32)
         starts_np = starts_np - starts_np[0]
-        lengths_np = np.diff(starts_np)
     else:
-        track_zyxs = [np.asarray(tracks[i], dtype=np.float32) for i in valid_track_indices]
-        lengths_np = np.fromiter((len(z) for z in track_zyxs), dtype=np.int64, count=len(track_zyxs))
-        starts_np = np.empty(len(track_zyxs) + 1, dtype=np.int64)
-        starts_np[0] = 0
-        np.cumsum(lengths_np, out=starts_np[1:])
-        zyxs_flat = np.concatenate(track_zyxs, axis=0)
+        zyxs_flat, starts_np = _flatten_tracks([tracks[i] for i in valid_np])
+    lengths_np = np.diff(starts_np)
     total = int(starts_np[-1])
-    if total == 0:
-        return None, torch.from_numpy(lengths_np), valid_track_indices
 
-    windings_flat = np.zeros(total, dtype=np.float32)
     strip_id_np = np.repeat(np.arange(len(lengths_np), dtype=np.int64), lengths_np)
     flat = {
         'zyxs': torch.from_numpy(zyxs_flat).to(device=device),
-        'windings': torch.from_numpy(windings_flat).to(device=device),
         'strip_id': torch.from_numpy(strip_id_np).to(device=device),
         'starts': torch.from_numpy(starts_np).to(device=device),
         'lengths': torch.from_numpy(lengths_np).to(device=device),
         'lengths_cpu': torch.from_numpy(lengths_np),
         'total': total,
     }
-    return flat, flat['lengths_cpu'], valid_track_indices
+    return flat, valid_np
 
 
 def _build_track_spiral_context(slice_to_spiral_transform, dr_per_winding, flat, num_tracks, metrics_config):
@@ -1853,10 +1851,6 @@ def _build_track_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
     scan_tolerance = metrics_config['satisfaction_distance_tolerance']
     dr = dr_per_winding.detach()
     device = dr_per_winding.device
-
-    if flat is None or flat['total'] == 0:
-        lengths_cpu = flat['lengths_cpu'] if flat is not None else torch.zeros(num_tracks, dtype=torch.int64)
-        return None, lengths_cpu, num_tracks
 
     chunk = 65536
 
@@ -1869,7 +1863,6 @@ def _build_track_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
         return torch.cat(pieces, dim=0)
 
     zyxs = flat['zyxs']
-    windings = flat['windings']
     track_id = flat['strip_id']
     starts = flat['starts']
     lengths = flat['lengths']
@@ -1893,7 +1886,6 @@ def _build_track_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
         else:
             adjustments = torch.zeros_like(shifted_radii)
         unwrapped_shifted = shifted_radii + adjustments
-        normalised_radii = unwrapped_shifted - windings * dr
 
     return {
         'spiral_tolerance': spiral_tolerance,
@@ -1904,15 +1896,13 @@ def _build_track_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
         'slice_to_spiral_transform': slice_to_spiral_transform,
         'transform_in_chunks': transform_in_chunks,
         'zyxs': zyxs,
-        'windings': windings,
         'track_id': track_id,
         'lengths_cpu': lengths_cpu,
         'spiral_zyxs': spiral_zyxs,
         'theta': theta,
         'adjustments': adjustments,
         'unwrapped_shifted': unwrapped_shifted,
-        'normalised_radii': normalised_radii,
-    }, lengths_cpu, num_tracks
+    }
 
 
 def _mode_winding_per_track(track_id, winding_idx_per_point, num_tracks, device):
@@ -1955,7 +1945,6 @@ def _track_satisfaction_from_target(ctx, target_normalised_per_track, return_per
     device = ctx['device']
     num_tracks = ctx['num_tracks']
     track_id = ctx['track_id']
-    windings = ctx['windings']
     theta = ctx['theta']
     adjustments = ctx['adjustments']
     unwrapped_shifted = ctx['unwrapped_shifted']
@@ -1968,8 +1957,8 @@ def _track_satisfaction_from_target(ctx, target_normalised_per_track, return_per
     slice_to_spiral_transform = ctx['slice_to_spiral_transform']
 
     with torch.no_grad():
-        target_normalised = target_normalised_per_track[track_id]
-        target_shifted = target_normalised + windings * dr
+        # Tracks carry no winding offset, so the normalised target is the shifted one.
+        target_shifted = target_normalised_per_track[track_id]
         spiral_in_band = (unwrapped_shifted - target_shifted).abs() <= spiral_tolerance
 
         # Only points already in the spiral band can be satisfied, so the
@@ -1993,39 +1982,36 @@ def _track_satisfaction_from_target(ctx, target_normalised_per_track, return_per
         satisfied_counts_dev.scatter_add_(0, track_id, satisfied.to(torch.int64))
         satisfied_counts = satisfied_counts_dev.cpu()
         per_point_satisfaction = (
-            list(torch.split(satisfied.cpu(), lengths_cpu.tolist())) if return_per_point else [])
+            list(torch.split(satisfied.cpu(), lengths_cpu.tolist())) if return_per_point else None)
 
     return satisfied_counts, per_point_satisfaction
 
 
 def get_track_satisfied_counts(slice_to_spiral_transform, dr_per_winding, tracks, metrics_config,
                                return_per_point=True):
-    # With return_per_point=False the per-point satisfaction list is returned empty ([]).
+    # With return_per_point=False the per-point satisfaction slot is None.
     device = dr_per_winding.device
     if not tracks:
         empty = torch.zeros(0, dtype=torch.int64)
         return empty, empty, empty, [], empty
 
-    flat, lengths_cpu, valid_track_indices = _build_track_flat_bundle(tracks, device)
-    if not valid_track_indices:
+    flat, valid_np = _build_track_flat_bundle(tracks, device)
+    if flat is None:
         empty = torch.zeros(0, dtype=torch.int64)
         return empty, empty, empty, [], empty
 
-    num_tracks = len(valid_track_indices)
-    ctx, lengths_cpu, num_tracks = _build_track_spiral_context(
+    num_tracks = len(valid_np)
+    ctx = _build_track_spiral_context(
         slice_to_spiral_transform, dr_per_winding, flat, num_tracks, metrics_config,
     )
-    valid_track_indices_t = torch.tensor(valid_track_indices, dtype=torch.int64)
-    if ctx is None:
-        per_point = [torch.zeros([int(n.item())], dtype=torch.bool) for n in lengths_cpu]
-        return valid_track_indices_t, torch.zeros(num_tracks, dtype=torch.int64), lengths_cpu.clone(), per_point, torch.zeros(num_tracks, dtype=torch.int64)
+    lengths_cpu = ctx['lengths_cpu']
+    valid_track_indices_t = torch.from_numpy(valid_np)
 
     dr = ctx['dr']
     track_id = ctx['track_id']
-    normalised_radii = ctx['normalised_radii']
 
     with torch.no_grad():
-        winding_idx_per_point = torch.round(normalised_radii / dr).to(torch.int64)
+        winding_idx_per_point = torch.round(ctx['unwrapped_shifted'] / dr).to(torch.int64)
         mode_winding_per_track = _mode_winding_per_track(track_id, winding_idx_per_point, num_tracks, device)
         target_normalised_per_track = mode_winding_per_track.to(dr.dtype) * dr
 
@@ -2337,14 +2323,7 @@ def prepare_main_phase_tracks(
         flat_zyx_np = np.asarray(flat_zyx_np, dtype=np.float32)
         input_offsets = np.asarray(packed_offsets, dtype=np.int64)
     else:
-        input_lengths = np.fromiter(
-            (len(track) for track in working_tracks),
-            dtype=np.int64, count=len(working_tracks))
-        input_offsets = np.empty(len(input_lengths) + 1, dtype=np.int64)
-        input_offsets[0] = 0
-        np.cumsum(input_lengths, out=input_offsets[1:])
-        flat_zyx_np = np.concatenate(
-            [t.astype(np.float32) for t in working_tracks], axis=0)
+        flat_zyx_np, input_offsets = _flatten_tracks(working_tracks)
     keep_np = _track_points_far_from_anchors_mask(
         flat_zyx_np, anchor_tree, exclusion_radius, progress=progress)
     num_tracks_orig = len(working_tracks)
