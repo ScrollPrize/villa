@@ -45,6 +45,26 @@ def test_average_rounds_down_below_half(tmp_path):
     np.testing.assert_array_equal(out, np.full((2, 2, 2), 10, dtype=np.uint8))
 
 
+@pytest.mark.parametrize(
+    "dtype, low, expected",
+    [
+        (np.uint8, 10, 10),       # mean 10.5: tie between 10 (even) and 11 -> 10
+        (np.uint8, 11, 12),       # mean 11.5: tie between 11 and 12 (even) -> 12
+        (np.uint8, 250, 250),     # mean 250.5 -> 250 (even), near the top of the range
+        (np.uint8, 251, 252),     # mean 251.5 -> 252 (even)
+        (np.uint16, 1000, 1000),  # mean 1000.5 -> 1000 (even)
+        (np.uint16, 1001, 1002),  # mean 1001.5 -> 1002 (even)
+        (np.uint16, 65530, 65530),  # mean 65530.5 -> 65530 (even)
+        (np.uint16, 65531, 65532),  # mean 65531.5 -> 65532 (even)
+    ],
+)
+def test_average_exact_half_ties_round_to_even(tmp_path, dtype, low, expected):
+    # Seven `low` voxels and one `low + 4`: block sum 8 * low + 4, an exact .5 mean.
+    # np.rint rounds half to even, so the tie goes to whichever neighbour is even.
+    out = _run(tmp_path, _blocks(dtype, low, low + 4))
+    np.testing.assert_array_equal(out, np.full((2, 2, 2), expected, dtype=dtype))
+
+
 def test_average_saturated_uint8_stays_255(tmp_path):
     out = _run(tmp_path, np.full((4, 4, 4), 255, dtype=np.uint8))
     np.testing.assert_array_equal(out, np.full((2, 2, 2), 255, dtype=np.uint8))
