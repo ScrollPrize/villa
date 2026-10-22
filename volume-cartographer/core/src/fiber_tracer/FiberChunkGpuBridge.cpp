@@ -6,7 +6,7 @@
 #include <thread>
 #include <fstream>
 #include <iostream>
-#include <syncstream>
+#include <mutex>
 #if defined(__unix__) || defined(__APPLE__)
 #include <dlfcn.h>
 #endif
@@ -181,7 +181,13 @@ void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& sourc
                 if(line.size()>=2){out->lines.push_back(std::move(line));out->endReasons.push_back({reasons.at(bw["reason"].get<int>()),reasons.at(fw["reason"].get<int>())});}
             }
             out->timings["total_seconds"]=elapsed();
-            std::osyncstream(std::cout)<<"chunk-trace GPU built "<<key[0]<<','<<key[1]<<','<<key[2]<<" device="<<result["device"]<<" seeds="<<seeds.size()<<" paths="<<out->lines.size()<<" seconds="<<elapsed()<<std::endl;
+            // libc++ on macOS does not provide std::osyncstream yet.
+            // Keep progress lines intact across concurrent chunk workers.
+            static std::mutex outputMutex;
+            {
+                std::lock_guard lock(outputMutex);
+                std::cout<<"chunk-trace GPU built "<<key[0]<<','<<key[1]<<','<<key[2]<<" device="<<result["device"]<<" seeds="<<seeds.size()<<" paths="<<out->lines.size()<<" seconds="<<elapsed()<<std::endl;
+            }
         }
 
 }
