@@ -88,10 +88,7 @@ std::string fiberRevisionJson(const ObjectStore& db,const Txn& txn,const std::st
     const auto revision=db.objectRevision(txn,objectRevision);
     if(!revision || revision->record.kind!="fiber" || !revision->geometryRevision)
         throw std::runtime_error("Fiber object revision has no geometry");
-    const auto metadata = Json::parse(revision->record.meta);
-    auto source=metadata.value("source",Json::object());
-    for (const auto* key : {"coordinates", "coordinate_binding"})
-        if (metadata.contains(key)) source[key] = metadata.at(key);
+    auto source=Json::parse(revision->record.meta).value("source",Json::object());
     for(const auto* name:{"control_points","line_points"}) {
         const auto attrs=Json::parse(db.geometryPointAnnotations(txn,*revision->geometryRevision,name));
         const auto key=std::string(name)+"_attributes";
@@ -123,7 +120,7 @@ std::map<std::string, std::string> fiberNetworkJson(
         if (!pin) throw std::invalid_argument("Fiber export requires explicit object revision pins");
         const auto revision = db.objectRevision(txn, *pin);
         if (!revision || revision->objectUuid != uuid || revision->record.kind != "fiber" ||
-            revision->deleted || revision->record.retired || !revision->geometryRevision)
+            revision->deleted || (!revision->record.retired && !revision->geometryRevision))
             throw std::invalid_argument("Invalid fiber export revision for " + uuid);
         revisions.emplace(uuid, *revision);
     }
@@ -142,10 +139,12 @@ std::map<std::string, std::string> fiberNetworkJson(
     }
     std::set<std::string> included;
     std::vector<std::string> pending = roots;
-    if (pending.empty()) for (const auto& [uuid, revision] : revisions) pending.push_back(uuid);
+    if (pending.empty()) for (const auto& [uuid, revision] : revisions)
+        if (!revision.record.retired) pending.push_back(uuid);
     while (!pending.empty()) {
         auto uuid = std::move(pending.back()); pending.pop_back();
-        if (!revisions.contains(uuid)) throw std::invalid_argument("Unknown fiber export root " + uuid);
+        if (!revisions.contains(uuid) || revisions.at(uuid).record.retired)
+            throw std::invalid_argument("Unknown active fiber export root " + uuid);
         if (!included.insert(uuid).second) continue;
         for (const auto& peer : neighbours[uuid]) pending.push_back(peer);
     }
@@ -158,6 +157,11 @@ std::map<std::string, std::string> fiberNetworkJson(
         const auto& revision = revisions.at(uuid);
         FiberExport fiber;
         fiber.document = Json::parse(fiberRevisionJson(db, txn, revision.uuid, byteBudget));
+        const auto metadata = Json::parse(revision.record.meta);
+        for (const auto* key : {"coordinates", "coordinate_binding"}) {
+            fiber.document.erase(key);
+            if (metadata.contains(key)) fiber.document[key] = metadata.at(key);
+        }
         fiber.document["name"] = revision.record.name;
         fiber.document["filename"] = uuid + ".json";
         fiber.document["branches"] = Json::array();

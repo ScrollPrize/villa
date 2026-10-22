@@ -674,6 +674,7 @@ private slots:
             cv::Vec3f(0.0f, 0.0f, 0.0f), cv::Vec3f(0.0f, 0.0f, 1.0f)));
 
         FiberOverlayController controller;
+        controller.setCoordinateScaleResolver([](uint64_t, VolumeViewerBase*) { return std::optional<double>{1.0}; });
         controller.attachViewer(&viewer);
         controller.setChains({
             FiberOverlayController::Chain{1, {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}}},
@@ -715,14 +716,14 @@ private slots:
             cv::Vec3f(0.0f, 0.0f, 0.0f), cv::Vec3f(0.0f, 0.0f, 1.0f)));
 
         FiberOverlayController controller;
+        controller.setCoordinateScaleResolver([](uint64_t, VolumeViewerBase*) { return std::optional<double>{1.0}; });
         controller.attachViewer(&viewer);
-        controller.setViewerBaseToViewerFactor(&viewer, 0.25);
+        controller.setCoordinateScaleResolver([](uint64_t, VolumeViewerBase*) { return std::optional<double>{0.25}; });
         controller.setChains({
             FiberOverlayController::Chain{7, {{0, 0, 0}, {4, 0, 0}, {8, 0, 0}}},
         });
         controller.setVisible(true);
 
-        QCOMPARE(controller.viewerBaseToViewerFactor(&viewer), 0.25);
         QVERIFY(std::abs(viewer.scene().itemsBoundingRect().center().x() - 11.0) < 0.75);
         const auto hit = controller.hitTestControlPoint(
             &viewer, QPointF{11.0, 2.0}, 1.0);
@@ -730,12 +731,39 @@ private slots:
         QCOMPARE(hit->fiberId, uint64_t{7});
         QCOMPARE(hit->controlPointIndex, 1);
 
-        controller.setViewerBaseToViewerFactor(&viewer, 0.5);
+        controller.setCoordinateScaleResolver([](uint64_t, VolumeViewerBase*) { return std::optional<double>{0.5}; });
         QVERIFY(std::abs(viewer.scene().itemsBoundingRect().center().x() - 21.0) < 0.75);
         const auto movedHit = controller.hitTestControlPoint(
             &viewer, QPointF{21.0, 2.0}, 1.0);
         QVERIFY(movedHit.has_value());
         QCOMPARE(movedHit->controlPointIndex, 1);
+    }
+
+    void fiberOverlayFiltersUnboundObjectsAndScalesEachHitIndependently()
+    {
+        FakeViewer viewer;
+        viewer.graphicsView()->resize(800, 600);
+        viewer.setSurfaceSceneTransform(10.0, QPointF{});
+        viewer.setCurrentSurface(std::make_shared<PlaneSurface>(
+            cv::Vec3f(0,0,0), cv::Vec3f(0,0,1)));
+        FiberOverlayController controller;
+        controller.attachViewer(&viewer);
+        controller.setCoordinateScaleResolver([](uint64_t id, VolumeViewerBase*) -> std::optional<double> {
+            if (id == 1) return .25;
+            if (id == 2) return .5;
+            return {};
+        });
+        controller.setChains({{1, {{4,0,0},{8,0,0}}}, {2, {{4,8,0},{8,8,0}}}, {3, {{100,0,0},{104,0,0}}}});
+        controller.setVisible(true);
+        const auto first = controller.hitTestControlPoint(&viewer, {10,0}, 1.0);
+        const auto second = controller.hitTestControlPoint(&viewer, {20,40}, 1.0);
+        QVERIFY(first && first->fiberId == 1 && first->controlPointIndex == 0);
+        QVERIFY(second && second->fiberId == 2 && second->controlPointIndex == 0);
+        QVERIFY(!controller.hitTestControlPoint(&viewer, {1000,0}, 1.0));
+        QVERIFY(viewer.scene().itemsBoundingRect().right() < 100.0);
+        controller.setCoordinateScaleResolver([](uint64_t, VolumeViewerBase*) -> std::optional<double> { return {}; });
+        QVERIFY(!controller.hitTestControlPoint(&viewer, {10,0}, 1.0));
+        QVERIFY(viewer.scene().items().empty());
     }
 
     void fiberOverlayUsesTheOwningWorkspacePatchIndex()
@@ -762,6 +790,7 @@ private slots:
         viewer.setCurrentSurface(spiralSurface);
 
         FiberOverlayController controller;
+        controller.setCoordinateScaleResolver([](uint64_t, VolumeViewerBase*) { return std::optional<double>{1.0}; });
         controller.bindToViewerManager(&mainManager);
         controller.attachViewer(&viewer, &spiralManager);
         controller.setChains({

@@ -158,6 +158,8 @@ QString SpiralServiceManager::logicalInputId(const QString& kind, const QString&
                                              const QString& role, const QString& targetCollection,
                                              const QString& sourceIdentity)
 {
+    // Fiber input identity is the object UUID supplied by the store exporter.
+    if (kind == QStringLiteral("fiber")) return alias;
     if (_inputDrafts.contains(alias)) return alias;
     const QString key = kind + QLatin1Char(':') + role + QLatin1Char(':') + alias
         + QLatin1Char(':') + sourceIdentity;
@@ -170,7 +172,7 @@ QString SpiralServiceManager::logicalInputId(const QString& kind, const QString&
             ? !sourceIdentity.isEmpty() && input.value(QStringLiteral("source")).toString() == sourceIdentity
                 && !targetCollection.isEmpty() && input.value(QStringLiteral("role")).toString() == role
                 && QString::number(input.value(QStringLiteral("collection_id")).toInteger()) == targetCollection
-            : (kind == QStringLiteral("fiber") ? source.completeBaseName() : source.fileName()) == alias;
+            : source.fileName() == alias;
         if (match) return _inputAliases[key] = it.key();
     }
     if (kind == QStringLiteral("pcl") && !targetCollection.isEmpty()) return {};

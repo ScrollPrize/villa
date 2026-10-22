@@ -23,7 +23,6 @@
 #include <opencv2/core/types.hpp>
 
 #include "FiberSliceGeometry.hpp"
-#include "LineAnnotationFiberDeletion.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationStoredFiber.hpp"
 
@@ -132,16 +131,16 @@ inline bool branchDirectionsCompatible(const cv::Vec3d& a,
     return std::abs(std::abs(na.dot(nb)) - 1.0) <= tolerance;
 }
 
-// Runtime ids are unique across every registered source and stable across
-// reloads (FiberRuntimeIds). Once both sides have one, do not let an equal
-// filename in another source create a false match. Filename matching remains
-// the legacy/on-load fallback. The rule is sameFiberIdentity, shared with the
-// deletion helpers and the branch synchronizers.
-inline bool branchReferencesFiber(const FiberBranchRef& branch,
-                                  uint64_t fiberId,
-                                  const std::string& fileName)
+// Runtime handles identify UUIDs within the attached store. Unresolved handles
+// never match; display names are labels only.
+inline bool sameFiberIdentity(uint64_t a, uint64_t b)
 {
-    return sameFiberIdentity(branch.branchFiberId, branch.branchFileName, fiberId, fileName);
+    return a != 0 && a == b;
+}
+
+inline bool branchReferencesFiber(const FiberBranchRef& branch, uint64_t fiberId)
+{
+    return sameFiberIdentity(branch.branchFiberId, fiberId);
 }
 
 // Forward difference at the line position; the loader, the save-time
@@ -190,7 +189,7 @@ void canonicalizeFiberSaveSnapshots(std::vector<Snapshot>& snapshots)
 {
     auto findSnapshotForBranch = [&snapshots](const FiberBranchRef& branch) -> Snapshot* {
         for (auto& snapshot : snapshots) {
-            if (branchReferencesFiber(branch, snapshot.fiber.id, snapshot.fiber.fileName)) {
+            if (branchReferencesFiber(branch, snapshot.fiber.id)) {
                 return &snapshot;
             }
         }
@@ -256,9 +255,7 @@ void canonicalizeFiberSaveSnapshots(std::vector<Snapshot>& snapshots)
                 target->fiber.branches.end(),
                 [&snapshot, &branch](const FiberBranchRef& candidate) {
                     return candidate.adjacent == branch.adjacent &&
-                           branchReferencesFiber(candidate,
-                                                 snapshot.fiber.id,
-                                                 snapshot.fiber.fileName) &&
+                           branchReferencesFiber(candidate, snapshot.fiber.id) &&
                            (candidate.controlPointIndex ==
                                 branch.branchControlPointIndex ||
                             pointsApproximatelyEqual(candidate.controlPointPosition,
@@ -333,7 +330,7 @@ void validateFiberSaveSnapshots(const std::vector<Snapshot>& snapshots)
 
     auto findSnapshotForBranch = [&snapshots](const FiberBranchRef& branch) -> const Snapshot* {
         for (const auto& snapshot : snapshots) {
-            if (branchReferencesFiber(branch, snapshot.fiber.id, snapshot.fiber.fileName)) {
+            if (branchReferencesFiber(branch, snapshot.fiber.id)) {
                 return &snapshot;
             }
         }
@@ -373,9 +370,7 @@ void validateFiberSaveSnapshots(const std::vector<Snapshot>& snapshots)
                 target->fiber.branches.end(),
                 [&snapshot, &branch](const FiberBranchRef& candidate) {
                     return candidate.adjacent == branch.adjacent &&
-                           branchReferencesFiber(candidate,
-                                                 snapshot.fiber.id,
-                                                 snapshot.fiber.fileName) &&
+                           branchReferencesFiber(candidate, snapshot.fiber.id) &&
                            candidate.controlPointIndex == branch.branchControlPointIndex &&
                            candidate.branchControlPointIndex == branch.controlPointIndex &&
                            pointsApproximatelyEqual(candidate.controlPointPosition,

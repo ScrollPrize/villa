@@ -37,7 +37,6 @@ void applyIdentity(StoredFiber& fiber, const NewFiberIdentity& identity)
     fiber.startedAt = identity.startedAt;
     fiber.sequence = identity.sequence;
     fiber.fileName = identity.fileName;
-    fiber.sourceRoot = identity.sourceRoot;
     fiber.generation = 1;
 }
 
@@ -82,16 +81,16 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
     // endpoints; anything else connecting these fibers blocks the merge, and
     // an adjacent-winding link between the endpoints cannot become one fiber.
     const auto isPairLink = [&](const FiberBranchRef& branch, uint64_t otherId,
-                                const std::string& otherFile, int localIdx, int otherIdx) {
-        return branchReferencesFiber(branch, otherId, otherFile) &&
+                                int localIdx, int otherIdx) {
+        return branchReferencesFiber(branch, otherId) &&
                branch.controlPointIndex == localIdx &&
                branch.branchControlPointIndex == otherIdx;
     };
     for (const auto& branch : clicked.branches) {
-        if (!branchReferencesFiber(branch, far.id, far.fileName)) {
+        if (!branchReferencesFiber(branch, far.id)) {
             continue;
         }
-        if (!isPairLink(branch, far.id, far.fileName, clickedIndex, candidateIndex)) {
+        if (!isPairLink(branch, far.id, clickedIndex, candidateIndex)) {
             fail(error, "These fibers are linked elsewhere; unlink first.");
             return std::nullopt;
         }
@@ -102,10 +101,10 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
         }
     }
     for (const auto& branch : far.branches) {
-        if (!branchReferencesFiber(branch, clicked.id, clicked.fileName)) {
+        if (!branchReferencesFiber(branch, clicked.id)) {
             continue;
         }
-        if (!isPairLink(branch, clicked.id, clicked.fileName, candidateIndex, clickedIndex)) {
+        if (!isPairLink(branch, clicked.id, candidateIndex, clickedIndex)) {
             fail(error, "These fibers are linked elsewhere; unlink first.");
             return std::nullopt;
         }
@@ -190,7 +189,7 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
     // left as stored; the batch canonicalization recomputes them from the
     // merged line (the incident: a copied direction on a reversed line).
     for (const auto& branch : clicked.branches) {
-        if (branchReferencesFiber(branch, far.id, far.fileName) || branch.controlPointIndex < 0) {
+        if (branchReferencesFiber(branch, far.id) || branch.controlPointIndex < 0) {
             continue;
         }
         FiberBranchRef moved = branch;
@@ -198,7 +197,7 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
         merged.branches.push_back(std::move(moved));
     }
     for (const auto& branch : far.branches) {
-        if (branchReferencesFiber(branch, clicked.id, clicked.fileName) ||
+        if (branchReferencesFiber(branch, clicked.id) ||
             branch.controlPointIndex < 0) {
             continue;
         }
@@ -320,7 +319,7 @@ std::optional<std::size_t> redirectBranchRefs(std::vector<FiberBranchRef>& refs,
     for (std::size_t i = 0; i < refs.size(); ++i) {
         const FiberBranchRef& ref = refs[i];
         for (const auto& source : sources) {
-            if (!branchReferencesFiber(ref, source.id, source.fileName)) {
+            if (!branchReferencesFiber(ref, source.id)) {
                 continue;
             }
             if (!source.stored || !source.map) {

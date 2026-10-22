@@ -67,7 +67,6 @@ struct StoredFiber {
     std::string startedAt;
     uint64_t sequence = 0;
     std::string fileName;
-    std::filesystem::path sourceRoot;
     uint64_t generation = 1;
     std::vector<StoredControlPoint> controlPoints;
     std::vector<cv::Vec3d> linePoints;

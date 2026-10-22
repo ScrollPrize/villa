@@ -8,7 +8,7 @@
 // linked fiber" on its peers (the cascade that erased 451 of 473 PHerc0139
 // fibers on 2026-09-30).
 //
-// Fiber is any type with `fileName`, `sourceRoot`, `controlPoints`,
+// Fiber is any type with `fileName`, `controlPoints`,
 // `linePoints` and `branches` (a vector of FiberBranchRef) members.
 
 #include <algorithm>

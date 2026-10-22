@@ -15,7 +15,6 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core/types.hpp>
 
-#include "LineAnnotationAdjacentLinks.hpp"
 #include "LineAnnotationFiberLinkValidation.hpp"
 #include "LineAnnotationFiberLinks.hpp"
 #include "LineAnnotationStoredFiber.hpp"
@@ -32,7 +31,6 @@ using vc3d::line_annotation::StoredFiber;
 
 namespace {
 
-const std::filesystem::path kSource{"/proj/fibers"};
 
 // Snapshot type with the one member the batch helpers need.
 struct Snapshot {
@@ -46,7 +44,6 @@ StoredFiber makeFiber(uint64_t id, const std::string& name, double x0, double y0
     StoredFiber fiber;
     fiber.id = id;
     fiber.fileName = name;
-    fiber.sourceRoot = kSource;
     const int n = spans * 4 + 1;
     for (int i = 0; i < n; ++i) {
         const double t = static_cast<double>(i);
@@ -91,7 +88,7 @@ void link(StoredFiber& a, int ia, StoredFiber& b, int ib, bool adjacent = false)
 
 std::string sourceKey(const StoredFiber& fiber, const std::string& fileName)
 {
-    return (fiber.sourceRoot / fileName).lexically_normal().string();
+    return fileName;
 }
 
 bool reciprocal(const StoredFiber& fiber, const FiberBranchRef& branch,
@@ -123,7 +120,6 @@ NewFiberIdentity identity(uint64_t id, const std::string& file)
     out.startedAt = "20260930T120000000";
     out.sequence = id;
     out.fileName = file;
-    out.sourceRoot = kSource;
     return out;
 }
 

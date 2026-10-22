@@ -80,6 +80,17 @@ relationship APIs. Update any catalog summaries used by the application in the
 same checked transaction as the geometry edit, and explicitly decide how affected
 relationships apply. There is no separate fiber repository or collection layer.
 
+For native fiber transport, `fiberNetworkJson(store, txn, selection, roots)`
+exports pinned geometry together with its applicable `fiber_branch` edges. Supply
+explicit object revision pins for every endpoint, including retired endpoints
+needed to resolve applicability. Empty roots exports all active selected fibers;
+otherwise the exporter includes their complete linked components. The result is
+keyed by object UUID, uses `UUID.json` references, and keeps display names separate.
+It resolves stable control-point anchors to positional wire indices and emits
+reciprocal ordinary/adjacent branches with approval state and edge UUIDs. Coordinate
+identity and bindings accompany each object. `fiberRevisionJson` remains the
+geometry/annotation-only codec for consumers that read relationships separately.
+
 Object revisions capture metadata, geometry identity and relationship membership.
 `current_object_revision`, `object_revision`, and `object_history` expose them;
 `current_geometry`, `geometry_revision`, and `geometry_history` expose geometry.

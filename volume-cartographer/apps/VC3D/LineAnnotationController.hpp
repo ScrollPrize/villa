@@ -345,10 +345,7 @@ public:
     void openFiberAtLinePointIndex(uint64_t fiberId, int linePointIndex);
     void openFiberSpan(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
     void deleteFiber(uint64_t fiberId);
-    // Deletes the requested fibers' files and drops them from the package.
-    // Returns what was done in terms of the file names captured before the
-    // save drain (see LineAnnotationFiberDeletion.hpp): a fiber can vanish,
-    // or the package can change, while the drain yields to the event loop.
+    // Retire the selected object UUIDs and remove their links in one checked action.
     vc3d::line_annotation::FiberDeleteOutcome deleteFibers(std::vector<uint64_t> fiberIds);
     void renameFiberFile(uint64_t fiberId);
     void importFibers();
@@ -1090,7 +1087,6 @@ private:
     void reoptimizeMergedFibers(const std::vector<std::string>& fiberFileNames);
     void emitFiberSummaries();
     void addKnownFiberTags(const std::vector<std::string>& tags);
-    [[nodiscard]] std::filesystem::path primaryFiberSourceRoot() const;
     // Base grid the fiber's stored geometry lives in: the shape stored in the
     // fiber itself, else the manifest its trace spans recorded, else the
     // package's selected fiber-inference dataset (see
@@ -1101,7 +1097,6 @@ private:
     [[nodiscard]] std::optional<std::array<std::size_t, 3>>
         fiberManifestBaseShape(const std::string& location) const;
     [[nodiscard]] std::filesystem::path relativeFiberPath(const StoredFiber& fiber) const;
-    [[nodiscard]] std::filesystem::path fiberPath(const StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path currentVolpkgRoot() const;
     [[nodiscard]] std::vector<std::string> atlasPathKeysForFiber(const StoredFiber& fiber) const;
     [[nodiscard]] std::optional<std::filesystem::path> resolveAtlasFiberPath(
@@ -1507,7 +1502,6 @@ private:
         int secondHint = -1;
         uint64_t farId = 0;
         std::string farFileName;
-        std::filesystem::path farSourceRoot;
         cv::Vec3d farPoint{0.0, 0.0, 0.0};
         int farHint = -1;
         vc3d::line_annotation::FiberOptimizationMode mode =
@@ -1536,28 +1530,9 @@ private:
     // any step that allocates, so a caller catching an exception knows
     // whether "nothing was changed" is still true.
     StructuralEditOutcome commitStructuralEdit(StructuralEditRequest request, bool* committed);
-    // Entries the current load dropped from stored records (neutralize or
-    // repair): the same entries are removed from open sessions, including
-    // their armed rollback copies, so no session writes a one-way link back.
-
-    // Removes from every open session (its live branches and its armed
-    // rollback copies) the entries in `dropped` that the session's own
-    // record in `records` no longer holds, matched on every field the
-    // descriptor knows.
-
     bool structuralEditPreflight(uint64_t packageGeneration, uint64_t loadSequence,
                                  std::string* error);
-    [[nodiscard]] bool structuralEditParticipantAllowed(const std::filesystem::path& sourceRoot,
-                                                        const std::string& fileName,
-                                                        std::string* error) const;
-    // Files that may still reference an original although no record in the
-    // write set does: flagged records outside the write set (their file
-    // holds entries the record dropped at load) and files hidden by the
-    // source dedupe (their links are in no record at all). Read raw, so the
-    // lenient parser cannot hide an entry a second time; references resolve
-    // the way the loader resolves them (owner source root + basename,
-    // through the alias table).
-
+    [[nodiscard]] bool objectStoreEditingAvailable(std::string* error) const;
     // Deduplicates the deferred re-optimization prompt across reentrant
     // fiber (re)loads.
     bool _reoptimizationPromptPending = false;

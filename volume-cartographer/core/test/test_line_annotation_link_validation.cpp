@@ -13,7 +13,6 @@
 
 #include <opencv2/core/types.hpp>
 
-#include "LineAnnotationAdjacentLinks.hpp"
 #include "LineAnnotationFiberLinkValidation.hpp"
 #include "LineAnnotationFiberLinks.hpp"
 #include "LineAnnotationStoredFiber.hpp"
@@ -25,7 +24,6 @@ using vc3d::line_annotation::StoredFiber;
 
 namespace {
 
-const std::filesystem::path kSource{"/proj/fibers"};
 
 // A fiber whose line is a polyline with a visible kink at every control
 // point (so a stale direction is detectable), control points every 4 line
@@ -34,7 +32,6 @@ StoredFiber makeFiber(const std::string& name, double xOffset, double yOffset)
 {
     StoredFiber fiber;
     fiber.fileName = name;
-    fiber.sourceRoot = kSource;
     for (int i = 0; i < 17; ++i) {
         const double t = static_cast<double>(i);
         // Alternating slope every 4 points: a kink at every control point.
@@ -77,7 +74,7 @@ void link(StoredFiber& a, int ia, StoredFiber& b, int ib, bool adjacent = false)
 
 std::string sourceKey(const StoredFiber& fiber, const std::string& fileName)
 {
-    return (fiber.sourceRoot / fileName).lexically_normal().string();
+    return fileName;
 }
 
 bool reciprocal(const StoredFiber& fiber, const FiberBranchRef& branch,

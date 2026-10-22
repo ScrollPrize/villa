@@ -51,7 +51,9 @@ int main() try {
         for (const auto& objectUuid : {a,b,isolated}) {
             ObjectRecord record; record.uuid = objectUuid; record.kind = "fiber";
             record.name = "same name"; record.formatVersion = 4;
-            record.meta = Json{{"coordinates",{{"volume_uuid",uuid},{"scale_factor",4.0}}}}.dump();
+            record.meta = Json{{"coordinates",{{"volume_uuid",uuid},{"scale_factor",4.0}}},
+                {"source",{{"coordinates",{{"scale_factor",8.0}}},
+                           {"coordinate_binding",{{"active_volume_id","stale"}}}}}}.dump();
             db.upsertObject(txn, record); db.putGeometry(txn, objectUuid, vc::geometry::encode(geometry));
         }
         EdgeRecord edge; edge.kind = "fiber_branch"; edge.aUuid = a; edge.bUuid = b;
@@ -76,18 +78,31 @@ int main() try {
         require(second["branches"][0]["branch_file"] == a+".json" && second["branches"][0]["control_point_index"] == 0, "reciprocal orientation exported");
         require(first["adjacent_branches"][0]["edge_uuid"] == adjacent && first["adjacent_branches"][0]["pending"].get<bool>(), "adjacent pending edge preserved separately");
         require(first["coordinates"]["scale_factor"] == 4.0, "coordinate binding exported");
+        require(!first.contains("coordinate_binding"), "source annotations cannot restore an absent binding");
         mustFail([&] { fiberNetworkJson(db,txn,{{a,networkPins.at(a)}}); });
         mustFail([&] { fiberNetworkJson(db,txn,{{a,{}}}); });
         mustFail([&] { fiberNetworkJson(db,txn,networkPins,{a},1); });
     });
     session.act(attachment, networkPins, [&](auto& db, auto& txn) { db.removeEdge(txn,ordinary); });
+    RevisionSelection currentNetworkPins;
     session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
         require(fiberNetworkJson(db,txn,networkPins,{a}) == exported, "pinned topology survives later edge deletion");
         auto current = networkPins;
         for (auto& [objectUuid, pin] : current) pin = db.currentObjectRevision(txn,objectUuid)->uuid;
+        currentNetworkPins = current;
         const auto now = fiberNetworkJson(db,txn,current,{a});
         require(Json::parse(now.at(a))["branches"].empty(), "current export observes edge deletion");
         require(Json::parse(now.at(a))["adjacent_branches"].size() == 1, "parallel adjacent edge survives");
+    });
+    session.act(attachment, currentNetworkPins, [&](auto& db, auto& txn) {
+        db.retireObject(txn, b);
+        db.keepRecordedRelationship(txn, adjacent);
+    });
+    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+        for (auto& [objectUuid, pin] : currentNetworkPins) pin = db.currentObjectRevision(txn,objectUuid)->uuid;
+        const auto now = fiberNetworkJson(db,txn,currentNetworkPins,{a});
+        require(now.size() == 1 && Json::parse(now.at(a))["adjacent_branches"].empty(), "retired endpoints and inactive edges are not transported");
+        require(fiberNetworkJson(db,txn,networkPins,{a}) == exported, "historical network remains independent of current lifecycle");
     });
     std::cout << "fiber codec and checked commit receipt passed\n";
 } catch(const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }

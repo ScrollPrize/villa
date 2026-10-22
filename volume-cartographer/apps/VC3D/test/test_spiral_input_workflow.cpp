@@ -35,6 +35,31 @@ class SpiralInputWorkflowTests : public QObject {
         return {};
     }
 private slots:
+    void fiberDraftsUseObjectUuidsForUpdatesAndRetirement() {
+        QTemporaryDir root;
+        SpiralServiceManager client;
+        const QString a = "12345678-1234-1234-1234-123456789abc";
+        const QString b = "12345678-1234-1234-1234-123456789abd";
+        const auto aPath = root.filePath(a + ".json"), bPath = root.filePath(b + ".json");
+        write(aPath, QJsonDocument(QJsonObject{{"type","vc3d_fiber"},{"uuid",a},{"name","same name"},
+            {"branches",QJsonArray{QJsonObject{{"branch_file",b+".json"},{"control_point_index",0},{"branch_control_point_index",1}}}}}).toJson());
+        write(bPath, QJsonDocument(QJsonObject{{"type","vc3d_fiber"},{"uuid",b},{"name","same name"}}).toJson());
+        client.stageJsonInput("fiber", aPath, a);
+        client.stageJsonInput("fiber", bPath, b);
+        QVERIFY(client._inputDrafts.contains(a));
+        QVERIFY(client._inputDrafts.contains(b));
+        QCOMPARE(client._inputDrafts.size(), 2);
+        const auto first = client._inputDrafts[a]->snapshot();
+        const auto captured = document(first.content.manifest.value("path").toString());
+        QCOMPARE(captured.value("branches").toArray()[0].toObject().value("branch_file").toString(), b+".json");
+        client.stageJsonInput("fiber", aPath, a);
+        QCOMPARE(client._inputDrafts.size(), 2);
+        QVERIFY(client._inputDrafts[a]->snapshot().localRevision > first.localRevision);
+        client.removeInputDraft(a);
+        QVERIFY(client._inputDrafts[a]->deleted());
+        QVERIFY(!client._inputDrafts[b]->deleted());
+    }
+
     void pclEditsResolveSourceDocument() {
         SpiralServiceManager client;
         const QJsonObject first{{"id", "a"}, {"kind", "pcl"}, {"role", "same_winding"},

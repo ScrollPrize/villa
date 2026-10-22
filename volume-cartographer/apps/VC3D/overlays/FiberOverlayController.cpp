@@ -77,8 +77,10 @@ FiberOverlayController::chainsForViewer(VolumeViewerBase* viewer) const
     const auto found = _transformedChains.find(viewer);
     if (found != _transformedChains.end() && _transformedVolumes.at(viewer) == volume)
         return found->second;
+    // Cached projections refer to the old transformed storage and volume frame.
+    clearPointChainProjectionCache();
     auto transformed = vc3d::boundFiberChains(_chains, [&](uint64_t id) {
-        return _coordinateScale && volume ? _coordinateScale(id, viewer) : std::nullopt;
+        return _coordinateScale ? _coordinateScale(id, viewer) : std::nullopt;
     });
     _transformedVolumes[viewer] = volume;
     return _transformedChains.insert_or_assign(viewer, std::move(transformed)).first->second;
