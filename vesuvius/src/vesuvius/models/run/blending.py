@@ -378,6 +378,41 @@ def generate_gaussian_map(patch_size: tuple, sigma_scale: float = 8.0, dtype=np.
     return gaussian_map_np
 
 
+def _write_blended_chunk(output_store, chunk_info, chunk_logits, chunk_weights, num_classes,
+                         finalize_config=None, epsilon=1e-8):
+    """Normalise one chunk's weighted logit sum and write it to the output store.
+
+    `chunk_logits` (C, Z, Y, X) holds sum(w * logits) and `chunk_weights` (Z, Y, X) holds
+    sum(w); `chunk_logits` is divided in place. With `finalize_config` the chunk is
+    finalized (softmax + uint8) before writing, otherwise it is written as float16 logits.
+    """
+    z_start, z_end = chunk_info['z_start'], chunk_info['z_end']
+    y_start, y_end = chunk_info['y_start'], chunk_info['y_end']
+    x_start, x_end = chunk_info['x_start'], chunk_info['x_end']
+    output_slice = (
+        slice(None),
+        slice(z_start, z_end),
+        slice(y_start, y_end),
+        slice(x_start, x_end)
+    )
+
+    # Divide in place: voxels with weight==0 had no contributions so
+    # chunk_logits is already 0 there, and `where=...` leaves them untouched.
+    weights_b = chunk_weights[np.newaxis, :, :, :]
+    np.divide(chunk_logits, weights_b + epsilon,
+              out=chunk_logits, where=weights_b > 0)
+
+    if finalize_config is not None:
+        from vesuvius.models.run.finalize_outputs import apply_finalization
+        result, is_empty = apply_finalization(chunk_logits, num_classes, finalize_config)
+        if not is_empty:
+            # Finalized output may have different channel count than blended logits;
+            # the channel slice is open so it matches the finalized shape.
+            output_store[output_slice] = result
+    else:
+        output_store[output_slice] = chunk_logits.astype(np.float16)
+
+
 # --- Worker Process State ---
 _worker_state = {}
 
@@ -513,35 +548,8 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
             patches_processed += 1
 
     if patches_processed > 0:
-        output_slice = (
-            slice(None),
-            slice(z_start, z_end),
-            slice(y_start, y_end),
-            slice(x_start, x_end)
-        )
-
-        # Divide in place: voxels with weight==0 had no contributions so
-        # chunk_logits is already 0 there, and `where=...` leaves them untouched.
-        weights_b = chunk_weights[np.newaxis, :, :, :]
-        np.divide(chunk_logits, weights_b + epsilon,
-                  out=chunk_logits, where=weights_b > 0)
-
-        finalize_config = _worker_state.get('finalize_config')
-        if finalize_config is not None:
-            from vesuvius.models.run.finalize_outputs import apply_finalization
-            result, is_empty = apply_finalization(chunk_logits, num_classes, finalize_config)
-            if not is_empty:
-                # Finalized output may have different channel count than blended logits;
-                # write using slices that match the finalized shape.
-                finalized_slice = (
-                    slice(None),
-                    slice(z_start, z_end),
-                    slice(y_start, y_end),
-                    slice(x_start, x_end)
-                )
-                output_store[finalized_slice] = result
-        else:
-            output_store[output_slice] = chunk_logits.astype(np.float16)
+        _write_blended_chunk(output_store, chunk_info, chunk_logits, chunk_weights, num_classes,
+                             _worker_state.get('finalize_config'), epsilon)
 
     return {
         'chunk': chunk_info,
@@ -584,6 +592,58 @@ def calculate_chunks(volume_shape, output_chunks=None, z_range=None):
                 })
 
     return chunks
+
+
+def _blend_output_chunks(patch_size, chunk_size):
+    # we use the patch size as the default chunk size throughout the pipeline
+    # so that the chunk size is consistent , to avoid partial chunk read/writes
+    # given that we write the logits with aligned chunk/patch size, we continue that here
+    if chunk_size is None or any(c == 0 for c in (chunk_size if chunk_size else [0, 0, 0])):
+        return (1, patch_size[0], patch_size[1], patch_size[2])
+    return (1, *chunk_size)
+
+
+def create_blend_output(output_path, original_volume_shape, num_classes, patch_size, chunk_size=None,
+                        compression_level=1, finalize_config=None, verbose=True):
+    """Create the blended (or blended and finalized) output array and return its chunks."""
+    if finalize_config is not None:
+        from vesuvius.models.run.finalize_outputs import compute_finalized_shape
+        output_shape = compute_finalized_shape(original_volume_shape, num_classes, finalize_config)
+        output_dtype = np.uint8
+        print(f"  Finalized output shape: {output_shape}")
+    else:
+        output_shape = (num_classes, *original_volume_shape)  # (C, D, H, W)
+        output_dtype = np.float16
+
+    output_chunks = _blend_output_chunks(patch_size, chunk_size)
+    if verbose:
+        print(f"  Using chunk_size {output_chunks[1:]}" + ("" if chunk_size else " based directly on patch_size"))
+
+    if compression_level > 0:
+        compressor = numcodecs.Blosc(
+            cname='zstd',
+            clevel=compression_level,
+            shuffle=numcodecs.blosc.SHUFFLE
+        )
+    else:
+        compressor = None
+
+    print(f"Creating final output store: {output_path}")
+    print(f"  Shape: {output_shape}, Chunks: {output_chunks}")
+    open_zarr(
+        path=output_path,
+        mode='w',
+        storage_options={'anon': False} if output_path.startswith('s3://') else None,
+        verbose=verbose,
+        shape=output_shape,
+        chunks=output_chunks,
+        compressor=compressor,
+        dtype=output_dtype,
+        fill_value=0,
+        write_empty_chunks=False
+    )
+    return output_chunks
+
 
 # --- Main Merging Function ---
 def merge_inference_outputs(
@@ -714,62 +774,15 @@ def merge_inference_outputs(
             finalize_config.is_multi_task = part0_logits_store.attrs.get('is_multi_task', False)
             finalize_config.target_info = part0_logits_store.attrs.get('target_info', None)
 
-        from vesuvius.models.run.finalize_outputs import compute_finalized_shape
-        output_shape = compute_finalized_shape(original_volume_shape, num_classes, finalize_config)
-        output_dtype = np.uint8
         print(f"Fused blend+finalize mode: {finalize_config.mode}, threshold={finalize_config.threshold}")
-        print(f"  Finalized output shape: {output_shape}")
-    else:
-        output_shape = (num_classes, *original_volume_shape)  # (C, D, H, W)
-        output_dtype = np.float16
-
-    # we use the patch size as the default chunk size throughout the pipeline
-    # so that the chunk size is consistent , to avoid partial chunk read/writes
-    # given that we write the logits with aligned chunk/patch size, we continue that here
-    if chunk_size is None or any(c == 0 for c in (chunk_size if chunk_size else [0, 0, 0])):
-
-        output_chunks = (
-            1,
-            patch_size[0],  # z
-            patch_size[1],  # y
-            patch_size[2]   # x
-        )
-        if verbose:
-            print(f"  Using chunk_size {output_chunks[1:]} based directly on patch_size")
-    else:
-        output_chunks = (1, *chunk_size)
-        if verbose:
-            print(f"  Using specified chunk_size {chunk_size}")
-
-
-    if compression_level > 0:
-        compressor = numcodecs.Blosc(
-            cname='zstd',
-            clevel=compression_level,
-            shuffle=numcodecs.blosc.SHUFFLE
-        )
-    else:
-        compressor = None
 
     # --- 3. Create or Open Output Arrays ---
     if global_part_id == 0:
         # Part 0 creates the arrays
-        print(f"Creating final output store: {output_path}")
-        print(f"  Shape: {output_shape}, Chunks: {output_chunks}")
-
-        open_zarr(
-            path=output_path,
-            mode='w',
-            storage_options={'anon': False} if output_path.startswith('s3://') else None,
-            verbose=verbose,
-            shape=output_shape,
-            chunks=output_chunks,
-            compressor=compressor,
-            dtype=output_dtype,
-            fill_value=0,
-            write_empty_chunks=False
-        )
+        output_chunks = create_blend_output(output_path, original_volume_shape, num_classes, patch_size,
+                                            chunk_size, compression_level, finalize_config, verbose)
     else:
+        output_chunks = _blend_output_chunks(patch_size, chunk_size)
         # Other parts wait for part 0 to create the arrays, then open them in r+ mode
         print(f"Waiting for part 0 to create output arrays...")
 
