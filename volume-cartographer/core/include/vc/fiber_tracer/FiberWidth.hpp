@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include "vc/fiber_tracer/detail/PortableTraceMath.hpp"
 
 namespace vc::fiber_tracer {
 
@@ -24,11 +25,6 @@ inline float fiberWidthPresenceScale(double width, double mean, double tolerance
     if (tolerance == 0) return 1;
     if (!std::isfinite(mean) || mean <= 0 || !std::isfinite(tolerance) || tolerance <= 0)
         throw std::invalid_argument("invalid width reference/tolerance");
-    // Outside-volume/invalid candidate samples carry no presence evidence.
-    if (!std::isfinite(width) || width <= 0) return 0;
-    const double distance = std::abs(width / mean - 1) / tolerance;
-    if (cosine)
-        return distance >= 1 ? 0.f : static_cast<float>(std::cos(1.57079632679489661923 * distance));
-    return static_cast<float>(std::clamp(1 - distance, 0., 1.));
+    return portable::widthPresenceScale(width, mean, tolerance, cosine);
 }
 }

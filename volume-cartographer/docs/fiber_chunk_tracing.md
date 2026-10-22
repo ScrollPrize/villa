@@ -1,9 +1,11 @@
-# CPU chunk-based fiber tracing
+# Chunk-based fiber tracing
 
 `vc/fiber_tracer/FiberChunkTrace.hpp` provides reusable native primitives for
 building, caching and matching overlapping local fiber paths. It builds on the
 existing beam tracer and explicit prediction-region pinning, not a separate
-tracing implementation. This API does not launch inference or allocate GPUs.
+tracing implementation. It does not launch inference or acquire GPU-manager
+grants. CPU construction remains the default; the optional CUDA plugin uses
+only the devices already granted to its caller. See [recovery notes](trace_recovery.md).
 
 ## Coordinates and construction
 
@@ -82,8 +84,9 @@ are retained, and the reference is never used to guide route continuations.
 Tracing normals and evaluation normals have separate explicit coordinate
 scales. Progress callbacks report route steps with shared replay context.
 
-Full-volume/live-inference orchestration and experimental refinement/conflict
-filters are not part of this layer.
+Full-volume/live-inference orchestration remains separate. Optional native
+seed refinement, CUDA online fixed-plane refinement and load-time conflict
+filtering are described in [recovery notes](trace_recovery.md).
 
 ## Python
 
@@ -164,11 +167,9 @@ JSON whose first control point selects the test chunk. No GPU inference runs.
 
 Route regressions also cover forward/reverse joins, observer and exact distance
 limits, semantic stops, unsupported splices, invalid widths, reference resets,
-skipped seed locations and consistency callbacks. A GCC13 Release check on
-Paris4 reviewed piece `0039_anon_20260815T025206849_000041_run0.json`, prediction
-checkpoint prefix `a56e9dc2`, produced 17 maxima and 10 paths in the seed chunk.
-Construction was exactly equal with serial/parallel work and pins on/off.
-Reference replay over 256 base voxels selected four chunk paths and returned
-one segment with zero failures; disk-cache replay reproduced the points and
-termination reasons exactly. This is a correctness check, not a tracing-quality
-benchmark or a performance claim. macOS/arm64 have not been validated locally.
+skipped seed locations and consistency callbacks. The opt-in real-data test
+compares serial/parallel construction, pins on/off, and disk-cache replay for
+identical points and termination reasons. Record input identities and measured
+results with the external experiment, not in this reusable usage guide.
+This is a correctness check, not a tracing-quality benchmark or a performance
+claim. macOS/arm64 have not been validated locally.

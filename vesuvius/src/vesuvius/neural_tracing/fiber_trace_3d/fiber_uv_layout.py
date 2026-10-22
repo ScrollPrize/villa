@@ -1027,18 +1027,22 @@ def solve(config):
     if config.get('bucket_shared_phase',False) and (not anchored(config) or not config.get('bucket_position_split',False)):
         raise ValueError('Shared-phase topology requires shared-anchor bucket position split')
     if config.get('loss_weight_search'):
-        raise ValueError('Experiment dispatch is not part of the reusable solver')
+        from .fiber_uv_weight_search import run as search_weights
+        return search_weights(config)
     if config.get('bucket_position_split',False) and config.get('assignment_update')=='cost_target':
         raise ValueError('Bucket position split is not supported by cost_target updates')
     if config.get('distributed_suite'):
-        raise ValueError('Experiment dispatch is not part of the reusable solver')
+        from .fiber_uv_distributed import launch_suite
+        return launch_suite(config)
     if config.get('experiment_matrix'):
-        raise ValueError('Experiment dispatch is not part of the reusable solver')
+        from .fiber_normal_sign import solve_tensor_matrix
+        return solve_tensor_matrix(config,'vesuvius.neural_tracing.fiber_trace_3d.fiber_uv_layout')
     if int(config.get('distributed_world_size',1))>1 and '_distributed_rank' not in config:
         from .fiber_uv_distributed import launch
         return launch(config)
     if config.get('benchmark_pair_fusion'):
-        raise ValueError('Experiment dispatch is not part of the reusable solver')
+        from .fiber_uv_pair_benchmark import benchmark
+        return benchmark(config)
     if config.get('assignment_update')=='cost_target':
         if config.get('constraint_class_balance',False):
             raise ValueError('Class balancing is not supported by cost_target updates')
@@ -1442,7 +1446,8 @@ def run(config):
         if refinement.get('enabled',True) and any(config.get(key) for key in ('loss_weight_search','experiment_matrix','distributed_suite','diagnostic_benchmark')):
             raise ValueError('Automatic surface refinement requires a single main solve')
     if config.get('diagnostic_benchmark'):
-        raise ValueError('Experiment dispatch is not part of the reusable solver')
+        from .fiber_uv_diagnostic_benchmark import run
+        return run(config)
     if config.get('assignment_update')!='cost_target':
         validate_joint_rejection(config)
         config=dict(config,rejection_warmup=0,rejection_weighting=config.get('rejection_weighting','fixed'))

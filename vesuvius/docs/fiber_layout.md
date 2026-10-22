@@ -2,8 +2,10 @@
 
 This extracts the existing AFV-to-constraint and fiber-layout implementations.
 Inputs and earlier stage solutions are immutable; preparation records source
-identities, hashes and coordinate conventions. Experiment matrices, run-specific
-configs/data and layout-to-Lasagna surface reconstruction are not included.
+identities, hashes and coordinate conventions. Preparation, search, experiment
+matrices, diagnostics and tifxyz surface export are documented in
+[fiber-layout workflows](fiber_workflows.md). Run-specific configs and data are
+external; portable usage samples are included.
 
 ## Native fixed evidence
 
@@ -53,6 +55,7 @@ see [the N/U coordinate contract](fiber_layout_coordinates.md). Integer-label
 curves are not evaluated at a fractional distribution center, and old saved
 geometry is not silently reinterpreted. Reference alignment is global, not a
 per-fiber fit. Ordered evidence and family conventions are persisted.
+An [initialization-width prior must not be reintroduced](fiber_layout_no_width_prior.md).
 
 
 `fiber_gt_constraint_score.run(settings)` can build cross-reference event caches
