@@ -26,7 +26,8 @@ Actions:
 - `prepare` (default): validate/configure inputs and write a provenance manifest;
   no GPU probing or allocation.
 - `validate-reference`: re-score the three historical checkpoints, checking
-  signs/counts, L1/correctness, checkpoint hashes, objective and GT retention
+  signs/counts, L1/correctness, checkpoint hashes, the complete saved final
+  scientific record (including every loss term), and GT retention
   against recorded reports. No GPU allocation.
 - `run`: validate historical scoring, launch three fresh solves concurrently,
   score each result, and write `comparison.json` and `report.md`.
@@ -58,8 +59,18 @@ is used when configured, otherwise runtime settings must supply a VRAM budget.
 The launcher acquires resources before CUDA work and releases them afterwards.
 There is no benchmark option to bypass the manager. Busy GPUs wait for a grant;
 the benchmark does not modify other jobs' reservations.
+Before launching any arm, all three device identifiers are resolved together
+to physical UUIDs using the managed launcher's visibility rules. Aliases for the
+same GPU are rejected. Canonical lanes are saved in `resolved_devices.json` and
+passed to the children without changing the scientific configs. CPU-only actions
+do not probe GPUs.
 
 Input/config/source hashes are recorded and checked again at completion.
+This includes each historical solve's config, checkpoint, summary, and referenced
+tensor cache, even when different from the fresh solve's tensors. Historical
+validation checks every saved final field except elapsed `seconds`; changing
+component losses while preserving their total is an error. These checks validate
+saved records; they do not recompute the optimization objective from a checkpoint.
 Outputs include resolved configs, a manifest, per-arm logs/reports, live status,
 the full metrics JSON, and a compact old/new table. Nonexclusive timings are
 operational solve times, **not isolated throughput measurements**.
@@ -126,3 +137,15 @@ recorded perpendicular/parallel scores and sign counts (L1/correctness tolerance
 1e-10). Summed perpendicular signs: 38; selectable GT retained length: 95.315808%;
 rank score: 39.867469; summed perpendicular L1: 1.023098. This checks the scoring
 API against real checkpoints, **not** convergence of new solves on main.
+
+Review-fix validation (2026-10-22): all 14 recorded final loss terms and all
+other final scientific fields match for each of the three historical checkpoints.
+The same scores above are reproduced with the stricter checks. Auditing the
+170/171/170 source settings and the solver's prepared configs found no scientific
+setting changes versus the historical executed configs; differences are output
+paths, GPU lanes/labels, and code-provenance metadata. The L-BFGS, geometry and
+loss implementations were also compared against the historical solver revision
+`4a35bf9e18c3` (and the last experiment branch `d8f8c3595`): objective calculations
+are unchanged. Changes in the merged entrypoint modules concern launch dispatch,
+moved imports and removal of experiment-only dispatch/audits. No fresh GPU solve
+was run for this review-fix check.

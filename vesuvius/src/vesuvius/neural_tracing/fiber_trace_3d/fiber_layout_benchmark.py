@@ -20,6 +20,7 @@ from .fiber_gt_constraint_score import (
     arrays, piece_at, event_residuals, enabled_l1, gt_solve_width_metrics)
 from .fiber_uv_arc_phase import event_arc_points
 from .fiber_winding_order import order_margin
+from .managed_evaluation import resolve_gpu_uuids
 from lasagna.inference_provenance import atomic_write, sha256_file
 
 ARMS = ('free', 'joint', 'selectable')
@@ -111,7 +112,25 @@ def validate_expected(result, expected):
                                        expected['score']['gt_' + kind][metric], rtol=0, atol=1e-10)
     if result['solution_sha256'] != expected['solution_sha256']:
         raise ValueError('Historical checkpoint changed')
-    np.testing.assert_allclose(result['final']['loss'], expected['final']['loss'], rtol=0, atol=1e-10)
+    # Compare the complete scientific record, not just a total that can conceal
+    # cancelling changes in individual terms. Only elapsed time is operational.
+    def compare(actual, recorded, path):
+        if isinstance(recorded, dict):
+            if not isinstance(actual, dict) or actual.keys() != recorded.keys():
+                raise ValueError(f'Historical {path} fields changed')
+            for key in recorded:
+                compare(actual[key], recorded[key], f'{path}.{key}')
+        elif isinstance(recorded, list):
+            if not isinstance(actual, list) or len(actual) != len(recorded):
+                raise ValueError(f'Historical {path} entries changed')
+            for index, (a, b) in enumerate(zip(actual, recorded)):
+                compare(a, b, f'{path}[{index}]')
+        elif isinstance(recorded, (int, float)) and not isinstance(recorded, bool):
+            np.testing.assert_allclose(actual, recorded, rtol=0, atol=1e-10, err_msg=path)
+        elif actual != recorded:
+            raise ValueError(f'Historical {path} changed')
+    compare({k: v for k, v in result['final'].items() if k != 'seconds'},
+            {k: v for k, v in expected['final'].items() if k != 'seconds'}, 'final')
     if result['retention'] is not None:
         gt = expected['gt_enablement']
         total = sum(x['length_vx'] for x in gt)
@@ -164,6 +183,10 @@ def prepare(settings, runtime):
     for arm, spec in settings['arms'].items():
         for key in ('solver_config', 'events', 'expected_report'):
             track(spec[key])
+        historical = Path(spec['historical_solve'])
+        for name in ('config.json', 'solution.npz', 'summary.json'):
+            track(historical / name)
+        track(read(historical / 'config.json')['tensor_cache'])
         original = read(Path(spec['solver_config']))
         cfg = dict(original.get('fiber_implicit_winding', original))
         # Input paths in solver configs follow the existing solver API: absolute.
@@ -213,12 +236,13 @@ def validate_reference(settings, root):
     return result
 
 
-def launch_arm(arm, root):
+def launch_arm(arm, root, device):
     """The solver's managed entrypoint owns acquisition, lifetime and release."""
     environment = dict(os.environ)
     environment['PYTHONPATH'] = os.pathsep.join(
         [str(Path(__file__).resolve().parents[3]), environment.get('PYTHONPATH', '')])
-    command = [sys.executable, '-m', SOLVER_MODULE, '--config', str(root / (arm + '.json'))]
+    command = [sys.executable, '-m', SOLVER_MODULE, '--config', str(root / (arm + '.json')),
+               '--devices', device]
     with (root / (arm + '.log')).open('w') as log:
         subprocess.run(command, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True)
 
@@ -257,6 +281,7 @@ def run(settings, runtime, action='run'):
         return dict(prepared=True, output_root=str(root))
     previous = validate_reference(settings, root)
     if action == 'validate-reference':
+        prepare(settings, runtime)
         return dict(validated=True, ranking=previous['ranking'])
     started, results = time.monotonic(), {}
     def publish(state, **extra):
@@ -267,9 +292,14 @@ def run(settings, runtime, action='run'):
             # Fail before starting any arm rather than mix fresh and stale runs.
             if any((root / a / 'solve').exists() for a in ARMS):
                 raise FileExistsError('Existing solve output; use score or a new output root')
+            # Resolve all lanes together so ordinal/UUID aliases cannot share
+            # one physical GPU. Keep CPU-only actions entirely probe-free.
+            devices = resolve_gpu_uuids(','.join(str(runtime['devices'][a]) for a in ARMS))
+            resolved = dict(zip(ARMS, devices))
+            atomic_write(root / 'resolved_devices.json', resolved, durable=False)
             publish('running')
             with ThreadPoolExecutor(max_workers=3) as pool:
-                jobs = {pool.submit(launch_arm, a, root): a for a in ARMS}
+                jobs = {pool.submit(launch_arm, a, root, resolved[a]): a for a in ARMS}
                 for future in as_completed(jobs):
                     arm = jobs[future]
                     future.result()
