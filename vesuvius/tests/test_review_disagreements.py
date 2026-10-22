@@ -201,8 +201,8 @@ def test_decoy_verdicts_are_scored_by_kind_and_never_exported(tmp_path):
     rows = rd.score(out)
     by = {(r["kind"], r["rank"]): r for r in rows}
     assert by[("candidate", "1")]["SHEET"] == 1 and by[("candidate", "2")]["SHEET"] == 1
-    assert by[("decoy_covered", "1")]["SHEET"] == 1 and by[("decoy_covered", "2")]["SHEET"] == 1
-    assert sum(r["NOT"] for r in rows if r["kind"] == "decoy_off") == 0   # odd decoys=1 gives covered only
+    assert by[("decoy_covered", "1")]["SHEET"] == 1                 # one decoy per crop still alternates kinds
+    assert by[("decoy_off", "2")]["NOT"] == 1 and ("decoy_off", "1") not in by
     index = rd.export_training(data, pred, out, tmp_path / "train", min_vox=30)
     assert {r["crop"] for r in index} == {"crop_a", "crop_b"} and len(index) == 2
 

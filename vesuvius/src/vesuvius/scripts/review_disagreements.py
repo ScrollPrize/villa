@@ -135,9 +135,10 @@ def rank_crops(data: Path, predictions: Path, tol: float = 3.0, min_vox: int = 2
 
 
 def decoy_points(label: np.ndarray, pred: np.ndarray, tol: float, ignore_value: int, n: int,
-                 rng: np.random.Generator, margin: int = 8) -> List[Tuple[str, Tuple[int, int, int]]]:
+                 rng: np.random.Generator, margin: int = 8, start: int = 0) -> List[Tuple[str, Tuple[int, int, int]]]:
     """``n`` control points alternating ``decoy_covered`` (label and model both sheet) and
-    ``decoy_off`` (farther than ``tol`` from both), at least ``margin`` voxels from the faces."""
+    ``decoy_off`` (farther than ``tol`` from both), at least ``margin`` voxels from the faces.
+    ``start`` continues the alternation across crops so one decoy per crop still gives both kinds."""
     valid = label != ignore_value
     covered = (label == 1) & (pred == 1) & valid
     off = (ndimage.distance_transform_edt(label != 1) > tol) & (ndimage.distance_transform_edt(pred != 1) > tol) & valid
@@ -146,7 +147,7 @@ def decoy_points(label: np.ndarray, pred: np.ndarray, tol: float, ignore_value: 
     pools = {"decoy_covered": np.argwhere(covered & inner), "decoy_off": np.argwhere(off & inner)}
     out = []
     for i in range(n):
-        kind = KINDS[1 + i % 2]
+        kind = KINDS[1 + (start + i) % 2]
         pool = pools[kind]
         if len(pool) == 0:
             continue
@@ -203,7 +204,7 @@ def stage(data: Path, predictions: Path, out: Path, tol: float = 3.0, min_vox: i
     for start in (ranks or [1]):
         picked += [(i + 1, rows[i]) for i in range(start - 1, min(len(rows), (start - 1) + (limit or len(rows))))]
     rng = np.random.default_rng(seed)
-    keys, flat, cache = [], [], {}
+    keys, flat, cache, n_decoy = [], [], {}, 0
 
     def load(crop):
         if crop not in cache:
@@ -220,9 +221,10 @@ def stage(data: Path, predictions: Path, out: Path, tol: float = 3.0, min_vox: i
                          "pred_far_frac": r["pred_far_frac"], "kind": "candidate", "rank": rank})
             if decoys:
                 _, label, pred = load(r["crop"])
-                for kind, pt in decoy_points(label, pred, tol, ignore_value, decoys, rng):
+                for kind, pt in decoy_points(label, pred, tol, ignore_value, decoys, rng, start=n_decoy):
                     keys.append({"crop": r["crop"], "center_zyx": _zyx(pt), "marker_zyx": _zyx(pt), "size": 0,
                                  "pred_far_frac": r["pred_far_frac"], "kind": kind, "rank": rank})
+                    n_decoy += 1
     if decoys:
         random.Random(seed).shuffle(keys)
     for i, k in enumerate(keys, 1):
