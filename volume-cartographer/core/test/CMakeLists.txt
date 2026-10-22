@@ -959,6 +959,7 @@ vc_add_test(NAME test_affine_transform_surface)
 
 vc_add_test(NAME test_quadsurface_more)
 vc_add_test(NAME test_quadsurface_smooth)
+vc_add_test(NAME test_quadsurface_linear_normals)
 
 vc_add_test(NAME test_surface_cache_dependencies)
 
