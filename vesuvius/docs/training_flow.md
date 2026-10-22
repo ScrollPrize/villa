@@ -427,12 +427,16 @@ How it works in code:
 
 Important notes and current behavior:
 - The auxiliary trainer generates ground-truth tensors for every supported task
-  per patch from the `source_target` labels. Other trainer selections reject
-  configurations containing auxiliary targets instead of silently training
-  zero-loss heads.
+  per patch from the `source_target` labels. CLI selections other than
+  `--trainer base` reject configurations containing auxiliary targets instead
+  of silently training zero-loss heads.
 - Auxiliary target generation currently requires the default dataset-side
   augmentation path (`tr_config.augment_on_device: false`) so vector and tensor
   targets are derived after geometric augmentation.
+- Direct Python callers must instantiate `AuxiliaryTrainer` explicitly and
+  keep `mgr.augment_on_device = False`. Automatic trainer selection and the
+  augmentation guard belong to the CLI; constructing `BaseTrainer` directly
+  does not generate auxiliary targets or enforce these CLI checks.
 - Auxiliary losses that are self-supervised or use only predictions (e.g., `NormalSmoothnessLoss`) also work and can be masked using `source_pred` passed through `compute_auxiliary_loss`.
 - Precomputed auxiliary labels are not loaded by the standard dataset path.
 

@@ -15,6 +15,7 @@ from vesuvius.models.training.cli import (
     _build_base_trainer,
     _configured_auxiliary_target_names,
 )
+from vesuvius.models.training.train import BaseTrainer
 
 
 def _make_mgr(aux_target_name: str, task_type: str, extra: dict | None = None):
@@ -165,7 +166,7 @@ def test_base_trainer_selection_is_unchanged_without_auxiliary_targets():
     )
 
     assert _configured_auxiliary_target_names(mgr) == []
-    assert type(_build_base_trainer(mgr, verbose=False)).__name__ == "_BaseTrainer"
+    assert type(_build_base_trainer(mgr, verbose=False)) is BaseTrainer
 
 
 def test_base_trainer_selection_rejects_on_device_auxiliary_augmentation():
