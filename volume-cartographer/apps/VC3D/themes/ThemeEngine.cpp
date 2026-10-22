@@ -28,6 +28,16 @@
 namespace vc3d::theme {
 namespace {
 
+// QColor::fromString needs Qt 6.4; VC3D also builds with Qt 6.2.
+QColor parseColor(const QString& value)
+{
+#if QT_VERSION >= QT_VERSION_CHECK(6, 4, 0)
+    return QColor::fromString(value);
+#else
+    return QColor(value);
+#endif
+}
+
 constexpr int kMaxImportFiles = 200;
 constexpr qint64 kMaxImportBytes = 32LL * 1024 * 1024;
 // Icon folders for a theme's earlier colors are kept this long, in case
@@ -63,7 +73,7 @@ const QStringList& engineTokenNames()
 
 bool isColor(const QString& value)
 {
-    return !value.isEmpty() && QColor::fromString(value).isValid();
+    return !value.isEmpty() && parseColor(value).isValid();
 }
 
 // "#aarrggbb", which Qt reads with the alpha first, unlike CSS.
@@ -117,7 +127,7 @@ QString quoted(const QString& text)
 
 QString alphaFirstWarning(const QString& where, const QString& value)
 {
-    const QColor color = QColor::fromString(value);
+    const QColor color = parseColor(value);
     return QStringLiteral("%1 %2 is read as %3 at %4% opacity: Qt puts the alpha first (#aarrggbb)")
         .arg(where, quoted(value), color.name(QColor::HexRgb))
         .arg(qRound(color.alphaF() * 100.0));
@@ -248,7 +258,7 @@ void parsePaletteGroup(const QJsonObject& object, QMap<QPalette::ColorRole, QCol
         }
         if (isAlphaFirstColor(value))
             problems->append({file, alphaFirstWarning(QStringLiteral("%1.%2").arg(where, it.key()), value), true});
-        roles->insert(*role, QColor::fromString(value));
+        roles->insert(*role, parseColor(value));
     }
 }
 
@@ -1023,7 +1033,7 @@ ThemePalette derivePalette(const QMap<QString, QString>& tokens)
         const QString value = tokens.value(QLatin1String(token));
         if (!isColor(value))
             return std::nullopt;
-        return QColor::fromString(value);
+        return parseColor(value);
     };
     const auto set = [&](QMap<QPalette::ColorRole, QColor>& group, QPalette::ColorRole role,
                          const char* token) {
@@ -1226,7 +1236,7 @@ QString ensureThemeIcons(const QMap<QString, QString>& tokens, const QString& ca
             QDir(staging).removeRecursively();
             return {};
         }
-        const QColor color = QColor::fromString(value);
+        const QColor color = parseColor(value);
         for (const int scale : {1, 2}) {
             const QString file = QDir(staging).filePath(
                 scale == 1 ? QStringLiteral("%1.png").arg(QLatin1String(recipe.name))
