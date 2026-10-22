@@ -117,6 +117,14 @@ def _cube(arr: np.ndarray, center, half: int) -> np.ndarray:
     return out
 
 
+def write_trainer_pair(dest: Path, stem: str, ct: np.ndarray, label: np.ndarray, target: str) -> None:
+    """Write one example in the villa trainer layout: ``images/<stem>.tif`` and ``labels/<stem>_<target>.tif``."""
+    (dest / "images").mkdir(parents=True, exist_ok=True)
+    (dest / "labels").mkdir(parents=True, exist_ok=True)
+    tifffile.imwrite(dest / "images" / f"{stem}.tif", ct)
+    tifffile.imwrite(dest / "labels" / f"{stem}_{target}.tif", label)
+
+
 def export_training(data: Path, audit: Path, out: Path, dest: Path, half: int = 16,
                     predictions: Optional[Path] = None, reviewer: str = "",
                     target: str = "surface", ignore_value: int = 2) -> List[dict]:
@@ -131,8 +139,7 @@ def export_training(data: Path, audit: Path, out: Path, dest: Path, half: int = 
     ``<crop>.tif`` per crop. Nothing is trained here; the export only keeps the pairs.
     """
     rows = list(load_verdicts(out / "verdicts.csv").values())
-    (dest / "images").mkdir(parents=True, exist_ok=True)
-    (dest / "labels").mkdir(exist_ok=True)
+    dest.mkdir(parents=True, exist_ok=True)
     index, cache = [], {}
     for i, r in enumerate(rows):
         crop = r["crop"]
@@ -153,8 +160,7 @@ def export_training(data: Path, audit: Path, out: Path, dest: Path, half: int = 
             corrected[hole] = 1
         elif r["verdict"] != "CUT":
             corrected[hole] = ignore_value
-        tifffile.imwrite(dest / "images" / f"{stem}.tif", cubes["ct"])
-        tifffile.imwrite(dest / "labels" / f"{stem}_{target}.tif", corrected)
+        write_trainer_pair(dest, stem, cubes["ct"], corrected, target)
         index.append({"file": f"{stem}.npz", **r})
     with open(dest / "index.csv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=["file", *FIELDS])
