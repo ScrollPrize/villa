@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import itertools
 import logging
 import math
@@ -46,8 +47,9 @@ from vesuvius.ink_detection.models.checkpoint import (
 )
 from vesuvius.ink_detection.models.model import make_model
 from vesuvius.ink_detection.volume_io import (
+    open_vc_reader,
     open_volume,
-    read_bbox_with_padding,
+    read_bboxes_with_padding,
 )
 from vesuvius.label_zarr import create_v2_array, open_v2_group
 from vesuvius.utils.cli import HyphenUnderscoreParser
@@ -149,6 +151,14 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--max-target-chunks", type=int, default=None)
     parser.add_argument("--cache-dir", type=Path, default=None)
     parser.add_argument("--cache-max-gb", type=float, default=None)
+    parser.add_argument("--reader", choices=("zarr", "vc_reader"), default="zarr")
+    parser.add_argument("--reader-connections", type=int, default=32)
+    parser.add_argument(
+        "--reader-memory-cache-mb",
+        type=int,
+        default=512,
+        help="vc_reader memory cache per DataLoader worker",
+    )
     parser.add_argument("--log-level", default="INFO")
     args = parser.parse_args(argv)
     checks = (
@@ -156,6 +166,15 @@ def parse_args(argv: Sequence[str] | None = None):
         (args.num_workers >= 0, "--num-workers must be >= 0"),
         (args.prefetch_factor > 0, "--prefetch-factor must be positive"),
         (args.downsample_workers > 0, "--downsample-workers must be positive"),
+        (args.reader_connections > 0, "--reader-connections must be positive"),
+        (
+            args.reader_memory_cache_mb >= 0,
+            "--reader-memory-cache-mb must be >= 0",
+        ),
+        (
+            args.reader != "vc_reader" or importlib.util.find_spec("vc_reader.reader"),
+            "--reader vc_reader needs the vc_reader package (villa/vc_reader)",
+        ),
         (
             args.tta_batch_size is None or args.tta_batch_size > 0,
             "--tta-batch-size must be positive",
@@ -849,7 +868,12 @@ class NativePatchDataset(Dataset):
         config,
         cache_dir=None,
         cache_max_gb=None,
+        reader="zarr",
+        reader_connections=32,
+        reader_memory_cache_mb=512,
     ) -> None:
+        if reader not in {"zarr", "vc_reader"}:
+            raise ValueError(f"reader must be 'zarr' or 'vc_reader', got {reader!r}")
         self.tifxyz_dir = Path(tifxyz_dir)
         self.volume_path = str(volume_path)
         self.resolution = str(resolution)
@@ -859,6 +883,9 @@ class NativePatchDataset(Dataset):
         self.normalization = config.data.normalization
         self.cache_dir = cache_dir
         self.cache_max_gb = cache_max_gb
+        self.reader = reader
+        self.reader_connections = int(reader_connections)
+        self.reader_memory_cache_mb = int(reader_memory_cache_mb)
         (
             self.flat_grid_stride,
             self.native_coordinate_scale,
@@ -883,6 +910,15 @@ class NativePatchDataset(Dataset):
         return state
 
     def _ensure_volume(self):
+        if self._volume is None and self.reader == "vc_reader":
+            self._volume = open_vc_reader(
+                self.volume_path,
+                self.resolution,
+                cache_dir=self.cache_dir,
+                cache_max_gb=self.cache_max_gb,
+                memory_cache_mb=self.reader_memory_cache_mb,
+                connections=self.reader_connections,
+            )
         if self._volume is None:
             self._volume = _open_shared_volume(
                 self.volume_path,
@@ -949,15 +985,28 @@ class NativePatchDataset(Dataset):
         )
 
     def __getitem__(self, index: int):
-        patch = self.patches[int(index)]
-        starts = (int(patch.z0), int(patch.y0), int(patch.x0))
-        stops = tuple(
-            starts[axis] + self.patch_size_zyx[axis] for axis in range(3)
+        return self.__getitems__([index])[0]
+
+    def __getitems__(self, indices):
+        """DataLoader batch fetch; a vc_reader volume reads the batch in one call."""
+        bboxes = []
+        for index in indices:
+            patch = self.patches[int(index)]
+            starts = (int(patch.z0), int(patch.y0), int(patch.x0))
+            stops = tuple(
+                starts[axis] + self.patch_size_zyx[axis] for axis in range(3)
+            )
+            bboxes.append((*starts, *stops))
+        reads = read_bboxes_with_padding(
+            self._ensure_volume(), bboxes, fill_value=0
         )
-        bbox = (*starts, *stops)
-        crop, valid_slices = read_bbox_with_padding(
-            self._ensure_volume(), bbox, fill_value=0
-        )
+        return [
+            self._sample(bbox, crop, valid_slices)
+            for bbox, (crop, valid_slices) in zip(bboxes, reads)
+        ]
+
+    def _sample(self, bbox, crop, valid_slices):
+        starts = bbox[:3]
         crop = crop.astype(np.float32, copy=False)
         if valid_slices is not None:
             crop[valid_slices] = normalize_image(
@@ -1175,6 +1224,9 @@ def run_command(args) -> int:
         config=config,
         cache_dir=args.cache_dir,
         cache_max_gb=args.cache_max_gb,
+        reader=args.reader,
+        reader_connections=args.reader_connections,
+        reader_memory_cache_mb=args.reader_memory_cache_mb,
     )
     run_native_inference(
         args=args,
