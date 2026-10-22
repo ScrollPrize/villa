@@ -220,6 +220,12 @@ void StatusDockPanelHost::addDock(QDockWidget* dock)
     item.page = page;
     item.button = button;
     item.pinButton = pin;
+    item.openAction = new QAction(dock->windowTitle(), this);
+    connect(item.openAction, &QAction::triggered, this, [this, dock]() {
+        if (Item* openedItem = itemForDock(dock)) {
+            openItem(*openedItem);
+        }
+    });
     _items.push_back(item);
     _stack->addWidget(page);
     _barLayout->insertWidget(std::max(0, _barLayout->count() - 1), button);
@@ -431,6 +437,14 @@ bool StatusDockPanelHost::eventFilter(QObject* watched, QEvent* event)
     return QWidget::eventFilter(watched, event);
 }
 
+QAction* StatusDockPanelHost::openAction(QDockWidget* dock) const
+{
+    const auto it = std::find_if(_items.begin(), _items.end(), [dock](const Item& item) {
+        return item.dock == dock;
+    });
+    return it == _items.end() ? nullptr : it->openAction.data();
+}
+
 StatusDockPanelHost::Item* StatusDockPanelHost::itemForDock(QDockWidget* dock)
 {
     auto it = std::find_if(_items.begin(), _items.end(), [dock](const Item& item) {
@@ -466,6 +480,22 @@ void StatusDockPanelHost::toggleItem(Item& item)
     } else {
         expandItem(item);
     }
+}
+
+void StatusDockPanelHost::openItem(Item& item)
+{
+    if (!item.visibleInBar) {
+        setItemVisibleInBar(item, true);
+    }
+    if (item.detached) {
+        if (item.dock) {
+            item.dock->show();
+            item.dock->raise();
+            item.dock->activateWindow();
+        }
+        return;
+    }
+    expandItem(item);
 }
 
 void StatusDockPanelHost::expandItem(Item& item)

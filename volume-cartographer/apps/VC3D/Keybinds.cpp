@@ -5,10 +5,12 @@
 namespace vc3d::keybinds {
 
 namespace {
-constexpr const char* kSectionFileMenu = "File Menu";
-constexpr const char* kSectionViewMenu = "View Menu";
+constexpr const char* kSectionFileMenu = "File";
+constexpr const char* kSectionViewMenu = "View";
+constexpr const char* kSectionHelpMenu = "Help";
 constexpr const char* kSectionViewerControls = "Viewer Controls";
 constexpr const char* kSectionNavigation = "Navigation";
+constexpr const char* kSectionLasagnaWorkspace = "Lasagna Workspace";
 constexpr const char* kSectionSegments = "Segments";
 constexpr const char* kSectionSurfaceTags = "Surface Tags";
 constexpr const char* kSectionSegEditing = "Segmentation Editing";
@@ -47,6 +49,30 @@ QString formatSequence(const QKeySequence& sequence)
 
 namespace shortcuts {
 // Add new keybind definitions here, then list them in buildKeybindsHelpText() if they should be user-visible.
+const ShortcutDef CommandPalette{
+    "command_palette",
+    kSectionHelpMenu,
+    "Search and run commands (command palette)",
+    ShortcutKind::Text,
+    "Ctrl+K",
+    QKeySequence::Open
+};
+const ShortcutDef OpenLasagnaWorkspace{
+    "open_lasagna_workspace",
+    kSectionLasagnaWorkspace,
+    "Open the Lasagna workspace",
+    ShortcutKind::Text,
+    "Ctrl+L",
+    QKeySequence::Open
+};
+const ShortcutDef RepeatLasagnaAction{
+    "repeat_lasagna_action",
+    kSectionLasagnaWorkspace,
+    "Repeat the last Lasagna action",
+    ShortcutKind::Text,
+    "Ctrl+Shift+L",
+    QKeySequence::Open
+};
 const ShortcutDef OpenVolpkg{
     "open_volpkg",
     kSectionFileMenu,
@@ -497,6 +523,8 @@ QKeySequence sequenceFor(const KeyPressDef& def)
 QString buildKeybindsHelpText()
 {
     const HelpEntry kHelpEntries[] = {
+        { kSectionHelpMenu, shortcuts::CommandPalette.description, HelpKeyType::Shortcut, &shortcuts::CommandPalette, nullptr, nullptr },
+
         { kSectionFileMenu, shortcuts::OpenVolpkg.description, HelpKeyType::Shortcut, &shortcuts::OpenVolpkg, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::AxisAlignedSlices.description, HelpKeyType::Shortcut, &shortcuts::AxisAlignedSlices, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::SurfaceNormals.description, HelpKeyType::Shortcut, &shortcuts::SurfaceNormals, nullptr, nullptr },
@@ -517,6 +545,9 @@ QString buildKeybindsHelpText()
 
         { kSectionNavigation, keypress::CenterFocusOnCursor.description, HelpKeyType::KeyPress, nullptr, &keypress::CenterFocusOnCursor, nullptr },
         { kSectionNavigation, keypress::RecenterFocus.description, HelpKeyType::KeyPress, nullptr, &keypress::RecenterFocus, nullptr },
+
+        { kSectionLasagnaWorkspace, shortcuts::OpenLasagnaWorkspace.description, HelpKeyType::Shortcut, &shortcuts::OpenLasagnaWorkspace, nullptr, nullptr },
+        { kSectionLasagnaWorkspace, shortcuts::RepeatLasagnaAction.description, HelpKeyType::Shortcut, &shortcuts::RepeatLasagnaAction, nullptr, nullptr },
 
         { kSectionSegments, shortcuts::CycleNextSegment.description, HelpKeyType::Shortcut, &shortcuts::CycleNextSegment, nullptr, nullptr },
         { kSectionSegments, shortcuts::CyclePrevSegment.description, HelpKeyType::Shortcut, &shortcuts::CyclePrevSegment, nullptr, nullptr },

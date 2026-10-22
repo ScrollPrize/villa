@@ -110,6 +110,7 @@ private slots:
     void attachRemoteZarr();
     void showSettingsDialog();
     void showAboutDialog();
+    void showCommandPalette();
     void showKeybindings();
     void resetSegmentationViews();
     void toggleConsoleOutput();
@@ -138,6 +139,8 @@ private:
     QStringList loadRecentPaths() const;
     void saveRecentPaths(const QStringList& paths);
     void ensureRecentActions();
+    // Gives every menu action a stable id in the window's command catalog.
+    void registerCommands();
 
     QStringList loadRecentRemoteUrls() const;
     void saveRecentRemoteUrls(const QStringList& urls);
@@ -198,6 +201,7 @@ private:
     QAction* _saveProjectAsAct{nullptr};
     QAction* _attachVolumeAct{nullptr};
     QAction* _attachSegmentsAct{nullptr};
+    QAction* _openFiberVolumeAct{nullptr};
     QAction* _attachNormalGridAct{nullptr};
     QAction* _attachUmbilicusAct{nullptr};
     QAction* _detachUmbilicusAct{nullptr};
@@ -212,6 +216,7 @@ private:
     std::array<QAction*, kMaxRecentVolpkg> _recentActs{};
     QAction* _settingsAct{nullptr};
     QAction* _exitAct{nullptr};
+    QAction* _commandPaletteAct{nullptr};
     QAction* _keybindsAct{nullptr};
     QAction* _aboutAct{nullptr};
     QAction* _resetViewsAct{nullptr};

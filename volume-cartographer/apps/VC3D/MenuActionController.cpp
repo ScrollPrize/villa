@@ -21,6 +21,8 @@
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
 #include "Keybinds.hpp"
+#include "CommandCatalog.hpp"
+#include "CommandPalette.hpp"
 #include "FileWatcherService.hpp"
 #include "LineAnnotationController.hpp"
 
@@ -173,6 +175,13 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _exitAct = new QAction(qWindow->style()->standardIcon(QStyle::SP_DialogCloseButton), QObject::tr("E&xit..."), this);
     connect(_exitAct, &QAction::triggered, this, &MenuActionController::exitApplication);
 
+    _commandPaletteAct = new QAction(QObject::tr("Command &Palette..."), this);
+    _commandPaletteAct->setShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CommandPalette));
+    // Application-wide like the window's other keyboard shortcuts, so the
+    // palette also opens from the workspaces and floating docks.
+    _commandPaletteAct->setShortcutContext(Qt::ApplicationShortcut);
+    connect(_commandPaletteAct, &QAction::triggered, this, &MenuActionController::showCommandPalette);
+
     _keybindsAct = new QAction(QObject::tr("&Keybinds"), this);
     connect(_keybindsAct, &QAction::triggered, this, &MenuActionController::showKeybindings);
 
@@ -230,7 +239,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachVolumeAct);
     _fileMenu->addAction(_attachSegmentsAct);
-    _fileMenu->addAction(QObject::tr("Open Automated Fiber Volume…"), this, [qWindow]() {
+    _openFiberVolumeAct = _fileMenu->addAction(QObject::tr("Open Automated Fiber Volume…"), this, [qWindow]() {
         // macOS hides the native file-type selector when there is only one filter.
         const auto path = QFileDialog::getOpenFileName(qWindow, QObject::tr("Open Automated Fiber Volume (.afv)"),
                                                      {}, QObject::tr("Automated Fiber Volume (*.afv);;All files (*)"));
@@ -285,6 +294,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _selectionMenu->addAction(_selectionClearAct);
 
     _helpMenu = new QMenu(QObject::tr("&Help"), qWindow);
+    _helpMenu->addAction(_commandPaletteAct);
     _helpMenu->addAction(_keybindsAct);
     _helpMenu->addAction(_aboutAct);
 
@@ -295,6 +305,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     menuBar->addMenu(_selectionMenu);
     menuBar->addMenu(_helpMenu);
 
+    registerCommands();
     refreshRecentMenu();
 }
 
@@ -1424,6 +1435,61 @@ void MenuActionController::showAboutDialog()
                     "discord: https://discord.com/channels/1079907749569237093/1243576621722767412\n\n"
                     "Commit: %1")
             .arg(commitText));
+}
+
+void MenuActionController::registerCommands()
+{
+    CommandCatalog* catalog = _window ? _window->commandCatalog() : nullptr;
+    if (!catalog) {
+        return;
+    }
+
+    const QString file = QObject::tr("File");
+    catalog->add(QStringLiteral("new_project"), _newProjectAct, file);
+    catalog->add(QString::fromUtf8(vc3d::keybinds::shortcuts::OpenVolpkg.id), _openAct, file);
+    catalog->add(QStringLiteral("save_project_as"), _saveProjectAsAct, file);
+    catalog->add(QStringLiteral("attach_volume"), _attachVolumeAct, file);
+    catalog->add(QStringLiteral("attach_segments"), _attachSegmentsAct, file);
+    catalog->add(QStringLiteral("open_fiber_volume"), _openFiberVolumeAct, file);
+    catalog->add(QStringLiteral("attach_normal_grid"), _attachNormalGridAct, file);
+    catalog->add(QStringLiteral("attach_umbilicus"), _attachUmbilicusAct, file);
+    catalog->add(QStringLiteral("detach_umbilicus"), _detachUmbilicusAct, file);
+    catalog->add(QStringLiteral("attach_lasagna_manifest"), _attachLasagnaManifestAct, file);
+    catalog->add(QStringLiteral("attach_remote_lasagna_manifest"), _attachRemoteLasagnaManifestAct, file);
+    catalog->add(QStringLiteral("detach_entry"), _detachEntryAct, file);
+    catalog->add(QStringLiteral("attach_remote_zarr"), _attachRemoteZarrAct, file);
+    catalog->add(QStringLiteral("open_data_catalog"), _openDataCatalogAct, file);
+    catalog->add(QStringLiteral("settings"), _settingsAct, file);
+    catalog->add(QStringLiteral("exit"), _exitAct, file);
+
+    const QString view = QObject::tr("View");
+    catalog->add(QStringLiteral("sync_cursor"), _mirrorCursorAct, view);
+    catalog->add(QStringLiteral("reset_segmentation_views"), _resetViewsAct, view);
+    catalog->add(QStringLiteral("show_console_output"), _showConsoleAct, view);
+
+    const QString actions = QObject::tr("Actions");
+    catalog->add(QStringLiteral("draw_bbox"), _drawBBoxAct, actions);
+    catalog->add(QStringLiteral("materialize_open_data_folder"), _materializeOpenDataFolderAct, actions);
+    catalog->add(QStringLiteral("merge_tifxyz"), _mergeTifxyzAct, actions);
+    catalog->add(QStringLiteral("patch_tifxyz"), _mergePatchAct, actions);
+    catalog->add(QStringLiteral("grow_track_patches"), _growTrackPatchesAct, actions);
+    catalog->add(QStringLiteral("rotate_surface"), _rotateSurfaceAct, QObject::tr("Transforms"));
+
+    const QString selection = QObject::tr("Selection");
+    catalog->add(QStringLiteral("surface_from_selection"), _surfaceFromSelectionAct, selection);
+    catalog->add(QStringLiteral("clear_selection"), _selectionClearAct, selection);
+
+    const QString help = QObject::tr("Help");
+    catalog->add(QString::fromUtf8(vc3d::keybinds::shortcuts::CommandPalette.id), _commandPaletteAct, help);
+    catalog->add(QStringLiteral("keybinds"), _keybindsAct, help);
+    catalog->add(QStringLiteral("about"), _aboutAct, help);
+}
+
+void MenuActionController::showCommandPalette()
+{
+    if (_window) {
+        CommandPalette::open(_window->commandCatalog(), vc3d::settingsFilePath(), _window);
+    }
 }
 
 void MenuActionController::showKeybindings()

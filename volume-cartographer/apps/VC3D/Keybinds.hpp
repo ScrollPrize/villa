@@ -29,6 +29,9 @@ struct KeyPressDef {
 };
 
 namespace shortcuts {
+extern const ShortcutDef CommandPalette;
+extern const ShortcutDef OpenLasagnaWorkspace;
+extern const ShortcutDef RepeatLasagnaAction;
 extern const ShortcutDef OpenVolpkg;
 extern const ShortcutDef AxisAlignedSlices;
 extern const ShortcutDef SurfaceNormals;
