@@ -107,7 +107,7 @@ and [Apple file cloning support](https://developer.apple.com/documentation/found
 configuration needs from that dataset and what the dataset has, then exits
 0 when a fit can start and 1 when it cannot. It reads the dataset only: no
 GPU, no fit, no download, so it answers before `uv sync` has a CUDA device
-to talk to and before the rest of a 90 GB dataset has finished arriving.
+to talk to and before the rest of a 177 GB dataset has finished arriving.
 
 ```
 $ python fit_spiral.py --dataset ./spiral_datasets/phercparis4 --check
@@ -247,6 +247,50 @@ The packer only iterates over chunk files that exist, so a store that holds only
 the z chunk rows of your fit window packs correctly; rows outside it read back
 as no-data. Pass `--ct <scroll zarr> --ct-group <group>` to drop bricks outside
 the CT mask.
+
+### Which sidecars a default fit reads
+
+The published `spiral_datasets/PHercParis4` ships three packed sidecars under
+`lasagna_inputs/` and no `.ome.zarr` stores. A default configuration opens one
+of them; the other two only matter for configurations that are off by default.
+Sizes are as served by `dl.ash2txt.org` on 2026-10-22, in decimal GB.
+
+| Sidecar | Size | Read when | Default |
+| --- | --- | --- | --- |
+| `las_008_nx.ome.zarr.respool_g4_pair/` (nx+ny) | 10.2 GB | `input_use_normals` is on and `loss_weight_dense_normals` > 0 | read |
+| `las_008_grad_mag.ome.zarr.respool_g4/` | 5.1 GB | `dense_spacing_mode` is `grad_mag` | not read (`winding_model`) |
+| `las_008_surf_sdt.ome.zarr.respool_g1/` | 35.0 GB | never: no input in `FIT_INPUT_CATALOG` names it | not read |
+
+So the 50.5 GB `lasagna_inputs/` folder contributes 10.2 GB to a default fit.
+The same holds for the rest of the dataset: `tracks/` (50.3 GB) is only opened
+with `input_use_tracks`, `fiber_directions.npz` (2.7 GB) only with
+`input_use_fiber_directions`, and `fibers.afv` (11.1 GB), `fiber_strips/`
+(40.8 GB) and `patch_normals/` (14.9 GB) are not inputs `fit_spiral.py` opens
+(the `fibers` input is a directory of fiber JSONs).
+`fit_spiral.py --dataset <root> --check` prints the same classification for
+your own configuration (see "Checking a dataset before fitting").
+
+To fetch only what a default fit needs, add include filters to the tutorial's
+rclone command. Everything a default `fit_spiral.py` or VC3D session opens on
+PHercParis4 is about 13 GB instead of the full 177 GB (the 89,237 patch
+directories were sized from a random sample of 200; everything else is
+exact):
+
+```sh
+rclone copy :http: ./spiral_datasets/phercparis4 \
+    --http-url https://dl.ash2txt.org/datasets/spiral_datasets/PHercParis4/ \
+    --include "/*.json" \
+    --include "/verified_patches/**" \
+    --include "/outer_shell/**" \
+    --include "/winding_inference/**" \
+    --include "/lasagna_inputs/las_008_nx.ome.zarr.respool_g4_pair/**" \
+    --transfers 32 -P
+```
+
+Re-running without the filters resumes into the same tree, so a partial
+download can be completed later if you switch on tracks or `grad_mag`. The
+sizes above were first measured by Jon Marrs
+([#1655](https://github.com/ScrollPrize/villa/issues/1655)).
 
 ## Sweep runner output
 
