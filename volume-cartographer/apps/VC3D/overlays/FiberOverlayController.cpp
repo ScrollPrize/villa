@@ -1,5 +1,7 @@
 #include "FiberOverlayController.hpp"
 
+#include "../LineAnnotationGeneratedViews.hpp"
+
 #include "OverlayBatchItem.hpp"
 
 #include "../volume_viewers/VolumeViewerBase.hpp"
@@ -209,7 +211,7 @@ void FiberOverlayController::collectPrimitives(VolumeViewerBase* viewer,
         const uint64_t colorId =
             (_showLinked && chain.colorId != 0) ? chain.colorId : chain.id;
         const PointChainStyle style = fiberStyle(fiberColor(colorId), _viewDistance);
-        const bool needsRings = _showLinked && !chain.pointLinkStates.empty();
+        const bool needsRings = _showLinked && !chain.pointLinkMarks.empty();
         if (!needsRings) {
             renderPointChain(viewer, builder, chain.points, style);
             continue;
@@ -238,24 +240,52 @@ void FiberOverlayController::collectPrimitives(VolumeViewerBase* viewer,
                 continue;
             }
             const std::size_t sourceIndex = filtered.sourceIndices[i];
-            if (sourceIndex >= chain.pointLinkStates.size()) {
+            if (sourceIndex >= chain.pointLinkMarks.size()) {
                 continue;
             }
-            const uint8_t state = chain.pointLinkStates[sourceIndex];
-            if (state == 0) {
+            const PointLinkMark& mark = chain.pointLinkMarks[sourceIndex];
+            if (mark.state == 0) {
                 continue;
             }
-            const bool pending = state == 1;
+            // The Line Annotation GUI's palettes (generatedLinkStateColor):
+            // blue / purple for H-V links, the orange warning pair for
+            // same-H/V links, pending vs approved, cyan / pink for an
+            // automatic pending point.
+            const bool pending = mark.state == 1 || mark.state == 3;
+            const bool automatic = mark.state == 3;
+            const bool tagged = mark.kollesisTermination || mark.breakTag;
+            // (linkStateRgb: this overlay's test target links no generated-views
+            // source, so the inline table rather than its QColor form.)
+            const vc3d::line_annotation::LinkStateRgb rgb =
+                vc3d::line_annotation::linkStateRgb(pending, mark.sameHv, automatic);
             OverlayStyle style;
-            style.penColor = pending ? QColor(80, 150, 255, 245)
-                                     : QColor(210, 95, 255, 245);
-            style.brushColor = pending ? QColor(80, 150, 255, 175)
-                                       : QColor(210, 95, 255, 175);
+            style.penColor = QColor(rgb.r, rgb.g, rgb.b, 245);
+            style.brushColor = QColor(rgb.r, rgb.g, rgb.b, 175);
             style.penColor.setAlphaF(style.penColor.alphaF() * opacity);
             style.brushColor.setAlphaF(style.brushColor.alphaF() * opacity);
             style.penWidth = 2.0;
+            if (tagged) {
+                // The tag ring replaces the outline, the link fill stays.
+                style.penColor = mark.kollesisTermination ? QColor(255, 230, 0, 245)
+                                                          : QColor(255, 190, 60, 245);
+                style.penColor.setAlphaF(style.penColor.alphaF() * opacity);
+                style.penWidth = 2.5;
+                style.penStyle = mark.breakTag ? Qt::DotLine : Qt::SolidLine;
+            }
             style.z = 95.0;
-            builder.addPoint(filtered.scenePoints[i], 6.25, style);
+            const qreal radius = tagged ? 7.25 : 6.25;
+            const QPointF& center = filtered.scenePoints[i];
+            if (mark.adjacent) {
+                QPainterPath triangle;
+                const qreal r = radius;
+                triangle.moveTo(center.x(), center.y() - r);
+                triangle.lineTo(center.x() + r * 0.8660254, center.y() + r * 0.5);
+                triangle.lineTo(center.x() - r * 0.8660254, center.y() + r * 0.5);
+                triangle.closeSubpath();
+                builder.addPainterPath(triangle, style);
+            } else {
+                builder.addPoint(center, radius, style);
+            }
         }
     }
 }

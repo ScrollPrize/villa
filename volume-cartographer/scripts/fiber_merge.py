@@ -851,6 +851,33 @@ def _stripped_array_conflicts(base_doc, local_doc, remote_doc):
             if (message := legacy_regression(doc, base_doc))]
 
 
+def normalize_auto_flag(entry, kind='branches'):
+    """VC3D's review-state invariant for the automatic-link mark: `auto`
+    (a link made by the Fiber Map's "Link A and B", not yet reviewed) is
+    only ever true together with `pending`, and only on an ordinary link.
+    Drops the key where the invariant does not hold; returns True when the
+    entry changed."""
+    if not isinstance(entry, dict) or 'auto' not in entry:
+        return False
+    if (bool(entry.get('auto', False)) and bool(entry.get('pending', False))
+            and kind == 'branches'):
+        return False
+    entry.pop('auto', None)
+    return True
+
+
+def normalize_auto_flags(doc):
+    """normalize_auto_flag over both branch arrays of a document (the
+    merge shortcuts return a side's document as-is; its stray marks are
+    dropped like the entry-wise merge drops them)."""
+    changed = False
+    for kind in BRANCH_ARRAYS:
+        for entry in _branches_of(doc, kind):
+            if normalize_auto_flag(entry, kind):
+                changed = True
+    return changed
+
+
 def merge_branches(base_doc, local_doc, remote_doc, prefer_local, kind='branches'):
     """Base-aware set merge of structured link entries. Additions from
     either side survive; untouched-here-but-gone-there means deletion;
@@ -887,7 +914,9 @@ def merge_branches(base_doc, local_doc, remote_doc, prefer_local, kind='branches
             # the base, so it reads as an addition and survives even if the
             # other side deleted the original. Kept deliberately: a moved
             # link is indistinguishable from a re-created one.
-            merged.append(copy.deepcopy(entry))
+            kept = copy.deepcopy(entry)
+            normalize_auto_flag(kept, kind)
+            merged.append(kept)
             stats['links_added_%s' % side_name] += 1
             return
         # A re-link in the other array replaces the original, including its
@@ -902,7 +931,9 @@ def merge_branches(base_doc, local_doc, remote_doc, prefer_local, kind='branches
             notes.append(f"link to {entry.get('branch_file', '?')} deleted on "
                          f"{'remote' if side_name == 'local' else 'local'}")
             return
-        merged.append(copy.deepcopy(entry))
+        kept = copy.deepcopy(entry)
+        normalize_auto_flag(kept, kind)
+        merged.append(kept)
         notes.append(f"kept link to {entry.get('branch_file', '?')} modified "
                      f"on {side_name} but deleted on the other side")
         stats['links_kept'] += 1
@@ -936,7 +967,30 @@ def merge_branches(base_doc, local_doc, remote_doc, prefer_local, kind='branches
                              "re-flagged as pending")
             else:
                 stats['links_approved'] += 1
-        merged.append(copy.deepcopy(chosen))
+        # The chosen entry carries its own review state; an approval (or an
+        # adjacent kind) cannot keep the automatic mark.
+        kept = copy.deepcopy(chosen)
+        if local_pending == remote_pending and local_pending:
+            # Both still pending but the automatic mark differs: the side
+            # that changed it relative to the base wins (a human review
+            # that cleared it, or a re-link that set it), independently of
+            # which side is newer; without a base the human state wins.
+            local_auto = bool(local_entry.get('auto', False))
+            remote_auto = bool(remote_entry.get('auto', False))
+            if local_auto != remote_auto:
+                if base_entry is not None:
+                    base_auto = bool(base_entry.get('auto', False))
+                    winner = local_auto if local_auto != base_auto else remote_auto
+                else:
+                    winner = False
+                if winner:
+                    kept['auto'] = True
+                else:
+                    kept.pop('auto', None)
+                notes.append(f"link to {_branch_target(chosen) or '?'}: automatic mark "
+                             f"{'kept' if winner else 'cleared'} (base-aware)")
+        normalize_auto_flag(kept, kind)
+        merged.append(kept)
         stats['links_kept'] += 1
 
     for i, remote_entry in enumerate(remote_entries):
@@ -1240,6 +1294,7 @@ def merge_fibers(base, local, remote):
         merged = keep_uuid(lineage_version(copy.deepcopy(local)))
         merged.setdefault('width_gap_fraction', 0.2)
         normal_defaults(merged)
+        normalize_auto_flags(merged)
         result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(local),
                       notes=(["remote side unchanged; kept local"]
@@ -1250,6 +1305,7 @@ def merge_fibers(base, local, remote):
         merged = keep_uuid(lineage_version(copy.deepcopy(remote)))
         merged.setdefault('width_gap_fraction', 0.2)
         normal_defaults(merged)
+        normalize_auto_flags(merged)
         result.update(ok=True, merged=merged,
                       peer_files=short_circuit_peers(remote),
                       notes=["local side unchanged; took remote"])
@@ -1448,6 +1504,8 @@ def merge_fibers(base, local, remote):
                      "VC3D recomputes it on load")
     for kind in BRANCH_ARRAYS:
         entries = merged_branches[kind] + opaque_branches[kind]
+        for entry in entries:
+            normalize_auto_flag(entry, kind)
         if not entries and all(kind not in doc for doc in (local, remote)):
             # Neither content side carried the array and the merge produced
             # nothing for it: writing one would turn "a legacy writer saved
@@ -1553,6 +1611,14 @@ def _refresh_pair_links_kind(a_doc, b_doc, a_name, b_name, base_doc, kind):
         return out
     a_cps, a_line = a['control_points'], a['line_points']
     b_cps, b_line = b['control_points'], b['line_points']
+    # The invariant holds for every entry the refresh writes back, the
+    # pair's and the unrelated ones alike.
+    for entry in _branches_of(a, kind):
+        if normalize_auto_flag(entry, kind):
+            out['a_changed'] = True
+    for entry in _branches_of(b, kind):
+        if normalize_auto_flag(entry, kind):
+            out['b_changed'] = True
     a_entries = links_to(a, b_name, kind)
     if a_entries and (len(a_line) < 2 or len(b_line) < 2):
         out['conflicts'].append(
@@ -1590,6 +1656,14 @@ def _refresh_pair_links_kind(a_doc, b_doc, a_name, b_name, base_doc, kind):
     def snap_pending(entry, desired, doc_flag):
         snap_flag(entry, 'pending', desired, doc_flag)
 
+    def snap_auto(entry, source, doc_flag):
+        # Mirrors VC3D: the automatic mark follows `pending` onto the
+        # reciprocal, under the invariant (pending, ordinary kind only).
+        snap_flag(entry, 'auto',
+                  bool(source.get('pending', False)) and
+                  bool(source.get('auto', False)) and kind == 'branches',
+                  doc_flag)
+
     used_reciprocals = []
     for entry in a_entries:
         local_index = resolve_cp_index(a_cps, entry['control_point_position'])
@@ -1606,6 +1680,8 @@ def _refresh_pair_links_kind(a_doc, b_doc, a_name, b_name, base_doc, kind):
         pb = _cp_position(b_cps[far_index])
         da = endpoint_tangent(a_line, pa)
         db = endpoint_tangent(b_line, pb)
+        if normalize_auto_flag(entry, kind):
+            out['a_changed'] = True
 
         set_field(entry, 'control_point_index', local_index, 'a_changed')
         snap_position(entry, 'control_point_position', pa, 'a_changed')
@@ -1638,6 +1714,8 @@ def _refresh_pair_links_kind(a_doc, b_doc, a_name, b_name, base_doc, kind):
             }
             if entry.get('pending', False):
                 reciprocal['pending'] = True
+                if entry.get('auto', False) and kind == 'branches':
+                    reciprocal['auto'] = True
             b[kind] = _branches_of(b, kind) + [reciprocal]
             out['b_changed'] = True
             out['notes'].append(f"restored reciprocal link {b_name} -> {a_name}")
@@ -1654,6 +1732,7 @@ def _refresh_pair_links_kind(a_doc, b_doc, a_name, b_name, base_doc, kind):
             # Review state stays in lockstep on both refs, as VC3D keeps it.
             snap_pending(reciprocal, bool(entry.get('pending', False)),
                          'b_changed')
+            snap_auto(reciprocal, entry, 'b_changed')
 
     # Pairs present in the base but absent from merged A were deleted by
     # the merge: mirror the deletion. Unrelated B->A entries (pairs A never
