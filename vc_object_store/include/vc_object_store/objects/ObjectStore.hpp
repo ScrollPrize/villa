@@ -386,9 +386,10 @@ public:
                        const std::optional<std::string>& sourceRevision = std::nullopt);
     void deleteObject(WriteTxn& txn, const std::string& uuid);  // fails while edges or retained geometry reference it
 
-    // Savepoint-protected replacement; null expectedRevision expects no geometry.
-    // Stale writers fail; identical current content is a no-op. Every affected
-    // edge requires an explicit retain/update/remove decision.
+    // Create geometry, or replace a patch; sequences use structural/sparse edits.
+    // Creation consumes source point annotations into the immutable revision.
+    // Null expectedRevision expects no geometry; stale writers fail. Every
+    // affected edge requires an explicit retain/update/remove decision.
     std::string putGeometry(WriteTxn& txn, const std::string& objectUuid,
                             const GeometryData& data,
                             const std::optional<std::string>& expectedRevision = std::nullopt,

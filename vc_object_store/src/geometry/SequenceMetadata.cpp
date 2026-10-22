@@ -1,4 +1,6 @@
 #include "geometry/SequenceMetadata.hpp"
+#include "geometry/SequenceIdentity.hpp"
+#include "geometry/ArrayBytes.hpp"
 
 namespace vc::objects::detail {
 namespace {
@@ -75,6 +77,40 @@ SharedJson MetadataSnapshot::save() {
     dirty_.clear();return buckets_.empty()?SharedJson():saveJson(db_,buckets_);
 }
 SharedJson identityGet(sqlite3* db,const SharedJson& root,int64_t id) {return MetadataSnapshot(db,root).get(id);}
+SharedJson initialSequences(sqlite3* db, const GeometryData& data, SharedJson& source) {
+    auto sequences = SharedJson::object();
+    if (data.kind == "patch") return sequences;
+    for (const auto& array : data.arrays) {
+        if (array.name != "points" && array.name != "control_points" && array.name != "line_points") continue;
+        const auto count = array.shape.at(0);
+        const auto key = data.kind == "point_collection" ? "point_attributes" : array.name + "_attributes";
+        const auto attrs = source.value(key, SharedJson());
+        if (!attrs.is_null() && (!attrs.is_array() || attrs.size() != size_t(count))) throw std::invalid_argument("point annotations must match rows");
+        const auto idsName = sequenceIdArray(data.kind, array.name);
+        std::vector<int64_t> ids;
+        if (!idsName.empty()) {
+            const auto idArray = std::find_if(data.arrays.begin(), data.arrays.end(), [&](const auto& a) { return a.name == idsName; });
+            if (idArray == data.arrays.end()) throw std::invalid_argument("sequence requires stable IDs: " + idsName);
+            ids.resize(count); copyScalars<int64_t>(idArray->bytes, ids);
+        }
+        MetadataSnapshot metadata(db), allocated(db);
+        for (int64_t row = 0; row < count; ++row) {
+            const auto attr = attrs.is_null() ? SharedJson::object() : attrs.at(row);
+            if (!attr.is_object() && !attr.is_null()) throw std::invalid_argument("invalid point annotation");
+            if (idsName.empty()) {
+                if (!attr.is_object() || !attr.empty()) metadata.put(row, packAnnotation(db, attr));
+            } else {
+                if (ids[row] < 0 || !allocated.get(ids[row]).is_null()) throw std::invalid_argument("duplicate or negative point ID");
+                metadata.put(ids[row], SharedJson{{"row",row},{"annotation",packAnnotation(db,attr)}});
+                allocated.put(ids[row], true);
+            }
+        }
+        sequences[array.name] = idsName.empty() ? SharedJson{{"annotations",metadata.save()}}
+            : SharedJson{{"identities",metadata.save()},{"allocated",allocated.save()}};
+        source.erase(key);
+    }
+    return sequences;
+}
 bool annotationDirectional(const SharedJson& value) {
     if(value.is_object())for(const auto& [key,item]:value.items())
         if(key=="segment_to_next"||key.find("direction")!=std::string::npos||key.find("tangent")!=std::string::npos||annotationDirectional(item))return true;

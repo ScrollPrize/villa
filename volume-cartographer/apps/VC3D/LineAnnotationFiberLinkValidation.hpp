@@ -19,26 +19,13 @@ struct BranchLinkValidationIssue {
     std::string reason;
 };
 
-// `sourceKey(fiber, fileName)` keys a fiber file within its source root,
-// `linkKey(fiber, branchFileName)` resolves a branch target to such a key
-// (the controller routes dedupe aliases through it), `reciprocal(fiber,
-// branch, candidate)` is the reciprocity predicate (reciprocalBranchRefMatches
-// with the shared position/direction tolerances).
-template<class Fiber, class SourceKey, class LinkKey, class Reciprocal>
+template<class Fiber, class Reciprocal>
 std::vector<BranchLinkValidationIssue> collectFiberBranchIssues(
-    const std::vector<Fiber>& fibers,
-    SourceKey sourceKey,
-    LinkKey linkKey,
-    Reciprocal reciprocal)
+    const std::vector<Fiber>& fibers, Reciprocal reciprocal)
 {
     std::vector<BranchLinkValidationIssue> issues;
-    std::unordered_map<std::string, std::size_t> indexByFileName;
-    indexByFileName.reserve(fibers.size());
-    for (std::size_t i = 0; i < fibers.size(); ++i) {
-        if (!fibers[i].fileName.empty()) {
-            indexByFileName[sourceKey(fibers[i], fibers[i].fileName)] = i;
-        }
-    }
+    std::unordered_map<uint64_t, std::size_t> indexById;
+    for (std::size_t i = 0; i < fibers.size(); ++i) indexById.emplace(fibers[i].id, i);
 
     for (std::size_t fiberIndex = 0; fiberIndex < fibers.size(); ++fiberIndex) {
         const Fiber& fiber = fibers[fiberIndex];
@@ -74,13 +61,8 @@ std::vector<BranchLinkValidationIssue> collectFiberBranchIssues(
                     continue;
                 }
             }
-            if (branch.branchFileName.empty()) {
-                addIssue("missing branch_file");
-                continue;
-            }
-            const auto targetIndex = indexByFileName.find(
-                linkKey(fiber, branch.branchFileName));
-            if (targetIndex == indexByFileName.end()) {
+            const auto targetIndex = indexById.find(branch.branchFiberId);
+            if (targetIndex == indexById.end()) {
                 addIssue("missing linked fiber");
                 continue;
             }

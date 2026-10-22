@@ -31,6 +31,8 @@ namespace {
 StoredFiber makeFiber(const std::string& name, double xOffset, double yOffset)
 {
     StoredFiber fiber;
+    static uint64_t nextId = 1;
+    fiber.id = nextId++;
     fiber.fileName = name;
     for (int i = 0; i < 17; ++i) {
         const double t = static_cast<double>(i);
@@ -53,6 +55,7 @@ void link(StoredFiber& a, int ia, StoredFiber& b, int ib, bool adjacent = false)
     ab.controlPointIndex = ia;
     ab.branchControlPointIndex = ib;
     ab.branchFileName = b.fileName;
+    ab.branchFiberId = b.id;
     ab.controlPointPosition = a.controlPoints[static_cast<std::size_t>(ia)];
     ab.branchControlPointPosition = b.controlPoints[static_cast<std::size_t>(ib)];
     ab.controlPointDirection = endpointTangentFromLinePoints(a.linePoints, ab.controlPointPosition);
@@ -63,6 +66,7 @@ void link(StoredFiber& a, int ia, StoredFiber& b, int ib, bool adjacent = false)
     ba.controlPointIndex = ib;
     ba.branchControlPointIndex = ia;
     ba.branchFileName = a.fileName;
+    ba.branchFiberId = a.id;
     ba.controlPointPosition = ab.branchControlPointPosition;
     ba.branchControlPointPosition = ab.controlPointPosition;
     ba.controlPointDirection = ab.branchControlPointDirection;
@@ -70,11 +74,6 @@ void link(StoredFiber& a, int ia, StoredFiber& b, int ib, bool adjacent = false)
     ba.adjacent = adjacent;
     a.branches.push_back(ab);
     b.branches.push_back(ba);
-}
-
-std::string sourceKey(const StoredFiber& fiber, const std::string& fileName)
-{
-    return fileName;
 }
 
 bool reciprocal(const StoredFiber& fiber, const FiberBranchRef& branch,
@@ -93,9 +92,7 @@ bool reciprocal(const StoredFiber& fiber, const FiberBranchRef& branch,
 std::vector<BranchLinkValidationIssue> collect(const std::vector<StoredFiber>& fibers)
 {
     return vc3d::line_annotation::collectFiberBranchIssues(
-        fibers, sourceKey,
-        [](const StoredFiber& fiber, const std::string& name) { return sourceKey(fiber, name); },
-        reciprocal);
+        fibers, reciprocal);
 }
 
 std::size_t totalEntries(const std::vector<StoredFiber>& fibers)

@@ -61,5 +61,40 @@ int main() try {
             updateGeometryArrays(db,txn,uuid,target,initialGeometry);
         }); });
     }
+    // Structural safety must survive the convenience edit API, including a
+    // caller catching the error and trying to commit the surrounding action.
+    const auto uuid = util::newUuid();
+    vc::geometry::Fiber original{{{0,0,0},{1,0,0}},{{0,0,0},{1,0,0}},{10,20}};
+    std::string initial;
+    auto pins = session.act(attachment, {{uuid,{}}}, [&](auto& db, auto& txn) {
+        ObjectRecord object; object.uuid = uuid; object.kind = "fiber";
+        object.meta = R"({"source":{"control_points_attributes":[{"segment_to_next":{"direction":[1,0,0]}},{}],"line_points_attributes":[{"label":"sample"},{}]}})";
+        db.upsertObject(txn, object); initial = db.putGeometry(txn, uuid, vc::geometry::encode(original));
+        require(!Json::parse(db.objectByUuid(txn, uuid)->meta).at("source").contains("control_points_attributes"), "creation consumes initial annotations");
+    });
+    auto reverse = original;
+    std::reverse(reverse.controlPoints.begin(), reverse.controlPoints.end());
+    std::reverse(reverse.controlPointIds.begin(), reverse.controlPointIds.end());
+    mustFail([&] { session.act(attachment, pins, [&](auto& db, auto& txn) {
+        mustFail([&] { updateGeometryArrays(db, txn, uuid, vc::geometry::encode(reverse), initial); });
+    }); });
+    auto partial = original;
+    partial.controlPoints[0][0] = 9; // This sparse update precedes the failing resize.
+    partial.linePoints.push_back({2,0,0});
+    mustFail([&] { session.act(attachment, pins, [&](auto& db, auto& txn) {
+        mustFail([&] { updateGeometryArrays(db, txn, uuid, vc::geometry::encode(partial), initial); });
+        require(db.currentGeometry(txn, uuid)->uuid == initial, "failed helper rolls back every array");
+    }); });
+    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+        require(db.currentGeometry(txn, uuid)->uuid == initial, "caught failures cannot partially commit");
+    });
+    session.act(attachment, pins, [&](auto& db, auto& txn) {
+        const auto head = updateGeometryArrays(db, txn, uuid, vc::geometry::encode(reverse), initial,
+            {{"control_points", R"([{"segment_to_next":{"direction":[-1,0,0]}},{}])"}});
+        require(Json::parse(db.geometryPointAnnotations(txn, head, "control_points"))[0]["segment_to_next"]["direction"][0] == -1,
+            "explicit directional transform is preserved");
+        require(Json::parse(db.geometryPointAnnotations(txn, initial, "control_points"))[0]["segment_to_next"]["direction"][0] == 1,
+            "initial annotations remain immutable");
+    });
     std::cout << "generic geometry editing and coordinates passed\n";
 } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

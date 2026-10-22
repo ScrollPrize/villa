@@ -33,7 +33,7 @@ bool reciprocalBranchRefMatches(const Fiber& fiber, const Branch& branch,
                                 DirectionsCompatible directionsCompatible)
 {
     return candidate.adjacent == branch.adjacent &&
-           candidate.branchFileName == fiber.fileName &&
+           candidate.branchFiberId == fiber.id &&
            candidate.controlPointIndex == branch.branchControlPointIndex &&
            candidate.branchControlPointIndex == branch.controlPointIndex &&
            pointsEqual(candidate.controlPointPosition, branch.branchControlPointPosition) &&

@@ -10,12 +10,13 @@ namespace {
 using Json = nlohmann::json;
 struct Points {
     std::vector<double> xyz;
+    std::vector<int64_t> ids;
     Anchor anchor(int64_t index) const {
         const auto offset = index;
         if (offset < 0 || static_cast<size_t>(offset) >= xyz.size() / 3)
             throw std::runtime_error("source branch control point index out of range");
         Anchor result;
-        result.points.push_back({"control_points", {index}});
+        result.points.push_back({"control_point_ids", {ids.at(index)}});
         result.position = {xyz[3*offset], xyz[3*offset+1], xyz[3*offset+2]};
         return result;
     }
@@ -36,7 +37,8 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
             throw std::runtime_error("source relationship endpoint needs stored fiber geometry: " + id);
         GeometrySnapshot snapshot; snapshot.revision = *revision;
         snapshot.arrays["control_points"] = db.readGeometryArray(txn, revision->uuid, "control_points");
-        Points p; p.xyz = snapshot.values<double>("control_points");
+        snapshot.arrays["control_point_ids"] = db.readGeometryArray(txn, revision->uuid, "control_point_ids");
+        Points p; p.xyz = snapshot.values<double>("control_points"); p.ids = snapshot.values<int64_t>("control_point_ids");
         return points.emplace(id, std::move(p)).first->second;
     };
     int64_t inserted = 0;

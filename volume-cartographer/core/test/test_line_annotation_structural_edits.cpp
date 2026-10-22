@@ -86,11 +86,6 @@ void link(StoredFiber& a, int ia, StoredFiber& b, int ib, bool adjacent = false)
     b.branches.push_back(ba);
 }
 
-std::string sourceKey(const StoredFiber& fiber, const std::string& fileName)
-{
-    return fileName;
-}
-
 bool reciprocal(const StoredFiber& fiber, const FiberBranchRef& branch,
                 const FiberBranchRef& candidate)
 {
@@ -107,9 +102,7 @@ bool reciprocal(const StoredFiber& fiber, const FiberBranchRef& branch,
 std::vector<BranchLinkValidationIssue> collect(const std::vector<StoredFiber>& fibers)
 {
     return vc3d::line_annotation::collectFiberBranchIssues(
-        fibers, sourceKey,
-        [](const StoredFiber& fiber, const std::string& name) { return sourceKey(fiber, name); },
-        reciprocal);
+        fibers, reciprocal);
 }
 
 NewFiberIdentity identity(uint64_t id, const std::string& file)
@@ -388,10 +381,10 @@ TEST_CASE("graph check: a dangling reference to a retired original blocks, unrel
     REQUIRE(plan);
     // p was NOT redirected (the controller forgot a peer): it still names a.
     std::vector<StoredFiber> graph{plan->merged, p, u, v};
-    const std::unordered_set<std::string> batch{sourceKey(a, "m.json")};
-    const std::unordered_set<std::string> retired{sourceKey(a, "a.json"), sourceKey(b, "b.json")};
+    const std::unordered_set<uint64_t> batch{plan->merged.id};
+    const std::unordered_set<uint64_t> retired{a.id, b.id};
     const auto check = vc3d::line_annotation::checkStructuralEditGraph(
-        graph, batch, retired, collect, sourceKey);
+        graph, batch, retired, collect);
     // Both ends of the forgotten redirect block: the merged fiber's entry
     // has no reciprocal under its new name, and p's entry names a retired
     // file. The u-v defect is reported but does not block.

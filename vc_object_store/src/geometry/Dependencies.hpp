@@ -26,7 +26,7 @@ struct DependencyGeometry {
 // Identity metadata is fixed between structural checkpoints. Coordinates are
 // always read from the selected/proposed revision, including sparse deltas.
 inline void bindSequenceIdentities(DependencyGeometry& geometry,sqlite3* db,const nlohmann::json& manifest) {
-    if(!manifest.contains("sequences"))return;
+    if(geometry.kind == "patch") return;
     const auto states=manifest.at("sequences");
     for(const auto& [name,state]:states.items())if(state.contains("identities"))
         geometry.identityArrays.insert(name=="points"?"point_ids":"control_point_ids");
@@ -74,16 +74,6 @@ inline DependencyGeometry dependencyGeometry(const ObjectStore& db, const Txn& t
     }
     result.read = [reader](const auto& name, auto offset, auto count) { return reader->read(name,offset,count); };
     bindSequenceIdentities(result,ObjectStoreImplAccess::conn(txn),reader->manifest());
-    auto* connection=ObjectStoreImplAccess::conn(txn);
-    if (revision.kind=="point_collection" && !result.identityArrays.contains("point_ids") &&
-        indexedSourceRevision(connection,revision.objectUuid,revision.uuid)) {
-        result.identityArrays.insert("point_ids");
-        result.identity=[reader,connection,object=revision.objectUuid](const std::string&,int64_t id)->std::optional<std::vector<uint8_t>> {
-            const auto offset=indexedSourcePointOffset(connection,object,id);
-            if(!offset || *offset<0) return std::nullopt;
-            return reader->read("points",*offset*24,24);
-        };
-    }
     if (activeDependencies) {
         if (activeDependencies->size() == 8) activeDependencies->erase(activeDependencies->begin());
         activeDependencies->emplace(key, result);

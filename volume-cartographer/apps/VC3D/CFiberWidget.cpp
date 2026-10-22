@@ -572,7 +572,7 @@ QAction* CFiberWidget::createShowFiberSliceAction(QObject* parent)
 
 QAction* CFiberWidget::createRenameFiberFileAction(QObject* parent)
 {
-    auto* action = new QAction(tr("Rename JSON file..."), parent);
+    auto* action = new QAction(tr("Rename fiber..."), parent);
     action->setObjectName(QStringLiteral("renameFiberFileAction"));
     action->setEnabled(canRenameFiberFile());
     connect(action, &QAction::triggered, this, [this]() {

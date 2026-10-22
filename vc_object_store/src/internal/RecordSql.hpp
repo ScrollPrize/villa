@@ -53,5 +53,7 @@ void stampContentChange(sqlite3* db, const std::string& author, const std::strin
 
 std::string jsonPathForKey(const std::string& key);
 
+void validateGeometrySourceMetadata(sqlite3*, const std::string& objectUuid, const nlohmann::json& source);
+
 std::optional<std::string> geometryHead(sqlite3* db, const std::string& objectUuid);
 } // namespace vc::objects::detail

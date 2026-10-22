@@ -8,7 +8,7 @@
 // The controller's job is reduced to: pick the participants, run the
 // planner, redirect the peers' refs with redirectBranchRefs, run the batch
 // through canonicalizeFiberSaveSnapshots + validateFiberSaveSnapshots and
-// checkStructuralEditGraph, and commit it with ONE runFiberSaveJob (new
+// checkStructuralEditGraph, and commit it in one checked store action (new
 // files + redirected peers as payloads, originals as retirements).
 
 #include <cstddef>
@@ -139,18 +139,12 @@ struct StructuralGraphCheck {
     std::vector<BranchLinkValidationIssue> unrelated;
 };
 
-// Runs the loader's own issue collector over the graph the next load will
-// see (untouched records + batch records, originals removed) and splits the
-// result. `batchKeys` / `retiredKeys` are the source-qualified keys the
-// collector's sourceKey produces for the batch files and the retired
-// originals; `sourceKey(fiber, fileName)` must be the same callback the
-// collector uses.
-template<class Collect, class SourceKey>
+// Classify issues by the identities changed or retired in this action.
+template<class Collect>
 StructuralGraphCheck checkStructuralEditGraph(const std::vector<StoredFiber>& graph,
-                                              const std::unordered_set<std::string>& batchKeys,
-                                              const std::unordered_set<std::string>& retiredKeys,
-                                              Collect collect,
-                                              SourceKey sourceKey)
+                                              const std::unordered_set<uint64_t>& batchKeys,
+                                              const std::unordered_set<uint64_t>& retiredKeys,
+                                              Collect collect)
 {
     StructuralGraphCheck check;
     for (const auto& issue : collect(graph)) {
@@ -158,10 +152,9 @@ StructuralGraphCheck checkStructuralEditGraph(const std::vector<StoredFiber>& gr
             continue;
         }
         const StoredFiber& owner = graph[issue.fiberIndex];
-        bool blocking = batchKeys.count(sourceKey(owner, owner.fileName)) != 0;
+        bool blocking = batchKeys.count(owner.id) != 0;
         if (!blocking && issue.branchIndex < owner.branches.size()) {
-            const std::string targetKey =
-                sourceKey(owner, owner.branches[issue.branchIndex].branchFileName);
+            const auto targetKey = owner.branches[issue.branchIndex].branchFiberId;
             blocking = batchKeys.count(targetKey) != 0 || retiredKeys.count(targetKey) != 0;
         }
         (blocking ? check.blocking : check.unrelated).push_back(issue);

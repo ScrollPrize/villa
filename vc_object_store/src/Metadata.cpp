@@ -83,6 +83,8 @@ void mutateMeta(sqlite3* db, const std::string& author, const std::string& host,
 
 void ObjectStore::setMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key, const std::string& jsonValue)
 {
+    if (key == "source")
+        validateGeometrySourceMetadata(static_cast<sqlite3*>(connection(txn)), recordUuid, nlohmann::json::parse(jsonValue));
     if (key == "coordinates") {
         const auto object = objectByUuid(txn, recordUuid);
         if (object && hasGeometryCoordinates(object->kind)) {

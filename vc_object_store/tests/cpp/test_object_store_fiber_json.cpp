@@ -9,7 +9,7 @@ using Json = nlohmann::json;
 int main() try {
     const auto uuid = util::newUuid();
     Json root{{"type","vc3d_fiber"},{"uuid",uuid},{"version",4},{"name","same name"},
-        {"width",5.5},{"tags",{"reviewed"}},
+        {"control_point_ids",{0,1}},{"width",5.5},{"tags",{"reviewed"}},
         {"control_points",Json::array({Json{{"position",{1.25,2,3}},{"direction",{1,0,0}},{"tags",{"break"}},{"segment_to_next",{{"goal","global"}}}},
                                       Json{{"position",{5.25,2,3}}}})},
         {"line_points",{{1.25,2,3},{5.25,2,3}}}, {"hv_classification",{{"manual_tag","H"}}}};
@@ -48,7 +48,7 @@ int main() try {
     auto external = ObjectStore::open(path, options);
     { auto txn = external.write(receipt); external.setMeta(txn,uuid,"external","true");
       auto changed = source; changed["control_points_attributes"][0]["tags"] = {"changed"};
-      external.setMeta(txn, uuid, "source", changed.dump()); txn.commit();
+      mustFail([&] { external.setMeta(txn, uuid, "source", changed.dump()); }); txn.commit();
       require(txn.committedRevisions().at(uuid) != receipt.at(uuid), "external commit produces different pin"); }
     session.read(attachment,[&](const auto& db,const auto& txn,const auto&) {
         require(db.objectRevision(txn,*receipt.at(uuid))->record.meta.find("external") == std::string::npos, "receipt is immutable after external commit");

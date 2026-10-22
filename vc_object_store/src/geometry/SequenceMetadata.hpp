@@ -29,5 +29,7 @@ SharedJson identityGet(sqlite3*,const SharedJson&,int64_t);
 SharedJson packAnnotation(sqlite3*,const SharedJson&);
 SharedJson unpackAnnotation(sqlite3*,const SharedJson&);
 bool annotationDirectional(const SharedJson&);
+// Initial sequence state. Source annotations are consumed only at creation.
+SharedJson initialSequences(sqlite3*, const GeometryData&, SharedJson& source);
 void transferMetadata(sqlite3* source,sqlite3* destination,const SharedJson&);
 }

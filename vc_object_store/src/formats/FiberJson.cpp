@@ -11,7 +11,7 @@
 
 namespace vc::objects {
 using Json = nlohmann::json;
-size_t fiberBranchControlIndex(const std::vector<int64_t>& controlIds, size_t controlCount, const Anchor& anchor)
+size_t fiberBranchControlIndex(const std::vector<int64_t>& controlIds, const Anchor& anchor)
 {
         if (anchor.points.size() != 1 || anchor.points.front().index.size() != 1)
             throw std::runtime_error("Fiber branch must identify one control point");
@@ -20,8 +20,7 @@ size_t fiberBranchControlIndex(const std::vector<int64_t>& controlIds, size_t co
         if (point.array == "control_point_ids") {
             const auto found = std::find(controlIds.begin(), controlIds.end(), id);
             if (found != controlIds.end()) return size_t(found - controlIds.begin());
-        } else if (point.array == "control_points" && id >= 0 &&
-                   uint64_t(id) < controlCount) return size_t(id);
+        }
         throw std::runtime_error("Fiber branch control point is absent from selected geometry");
 }
 
@@ -48,7 +47,9 @@ FiberDocument decodeFiberJson(const std::string& text)
         }
     }
     const auto control = detail::fiberPoints(root, "control_points"), line = detail::fiberPoints(root, "line_points");
-    p.geometry = vc::geometry::encode(vc::geometry::Fiber{control, line});
+    p.geometry = vc::geometry::encode(vc::geometry::Fiber{control, line,
+        root.value("control_point_ids", std::vector<int64_t>{})});
+    root.erase("control_point_ids");
     FiberDetail f;
     f.controlPointCount = control.size(); f.linePointCount = line.size();
     f.length = vc::geometry::polylineLength(line.empty() ? control : line);
@@ -84,6 +85,7 @@ std::string encodeFiberJson(const std::string& uuid, const GeometryData& data,
     attributes["uuid"] = uuid;
     attributes["type"] = "vc3d_fiber";
     attributes["version"] = 4;
+    attributes["control_point_ids"] = geometry.controlPointIds;
     for (const auto* name : {"control_points", "line_points"}) {
         const auto& values = std::string_view(name) == "control_points" ? geometry.controlPoints : geometry.linePoints;
         const auto key = std::string(name) + "_attributes";
@@ -121,12 +123,7 @@ namespace detail {
 Json fiberMetadata(const ObjectStore& db, const Txn& txn, const ObjectRecord& record, const GeometryRevision& geometry)
 {
     auto source = geometryTransferMetadata(Json::parse(record.meta));
-    GeometryReader reader(txn, geometry.uuid);
-    const auto sequences = reader.manifest().value("sequences", Json::object());
     for (const auto* name : {"control_points", "line_points"}) {
-        // Sequence annotations belong to immutable geometry; plain arrays use
-        // the selected object revision's source annotations, never the live head.
-        if (!sequences.contains(name)) continue;
         const auto attrs = Json::parse(db.geometryPointAnnotations(txn, geometry.uuid, name));
         const auto key = std::string(name) + "_attributes";
         if (std::any_of(attrs.begin(), attrs.end(), [](const auto& a) { return !a.is_null() && !a.empty(); })) source[key] = attrs;
@@ -155,15 +152,13 @@ Json fiberBranchJson(const ObjectStore& db, const Txn& txn, const EdgeRecord& ed
     const auto endpoint = [&](const GeometryRevision& geometry, const Anchor& anchor) {
         GeometrySnapshot snapshot;
         std::vector<int64_t> ids;
-        size_t count = 0;
         for (const auto& array : geometry.arrays) {
-            if (array.name == "control_points") count = array.shape.at(0);
             if (array.name == "control_point_ids") {
                 snapshot.arrays[array.name] = db.readGeometryArray(txn, geometry.uuid, array.name);
                 ids = snapshot.values<int64_t>(array.name);
             }
         }
-        const auto index = fiberBranchControlIndex(ids, count, anchor);
+        const auto index = fiberBranchControlIndex(ids, anchor);
         const auto bytes = pointValue(dependencyGeometry(db, txn, geometry), anchor.points.front());
         if (!bytes) throw std::runtime_error("Fiber branch control point is missing");
         snapshot.arrays["point"] = *bytes;

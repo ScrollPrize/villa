@@ -59,16 +59,8 @@ int64_t detail::ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vecto
     for (auto& p : batch) {
         const auto existing = db.objectByUuid(write, p.object.uuid);
         normalizeMetadata(p, coordinateContext);
-        if (!existing) db.upsertObject(write, p.object);
-        db.putGeometry(write, p.object.uuid, p.geometry);
-        // Ingestion no longer needs these arrays; release them before the
-        // next object and the topology import allocate their workspaces.
-        p.geometry.arrays.clear();
-        sources.push_back({p.object, std::move(p.source)});
-        auto record = *db.objectByUuid(write, p.object.uuid);
+        auto record = existing.value_or(p.object);
         auto metadata = Json::parse(record.meta);
-        // First geometry loading seeds source fields, preserving unrelated
-        // placeholder metadata and rejecting conflicting coordinate declarations.
         const auto incoming = Json::parse(p.object.meta);
         metadata["source"] = incoming["source"];
         if (incoming.contains("coordinate_binding")) metadata["coordinate_binding"] = incoming.at("coordinate_binding");
@@ -79,6 +71,9 @@ int64_t detail::ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vecto
         if (p.object.patch) record.patch = p.object.patch;
         if (p.object.track) record.track = p.object.track;
         db.upsertObject(write, record);
+        db.putGeometry(write, p.object.uuid, p.geometry);
+        p.geometry.arrays.clear();
+        sources.push_back({p.object, std::move(p.source)});
 
     }
     return detail::importSourceRelationships(db, write, sources);

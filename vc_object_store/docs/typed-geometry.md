@@ -24,7 +24,7 @@ conversion check invariants.
 | Type | Fields | Operations |
 | --- | --- | --- |
 | `PointCollection` | int64 `ids`, float64 XYZ `points` | `point(id)`, `indexOf(id)`, validation |
-| `Fiber` | float64 XYZ `controlPoints`, `linePoints` | Polyline length, validation |
+| `Fiber` | float64 XYZ `controlPoints`, `linePoints`; int64 `controlPointIds` | Polyline length, validation |
 | `Track` | int32 XYZ `points` | Polyline length, validation |
 | `Patch` | `rows`, `columns`, column/row `scale`, float32 XYZ `points` | Vertex access, validity, validation |
 
@@ -163,3 +163,16 @@ measurements describe current geometry. Generic arrays retain their stored names
 dtypes and byte order. See the [build/test commands](../README.md#build).
 
 Native directory export currently requires Linux `renameat2`.
+
+Sequence geometry (fibers, point collections, tracks) is created once with
+`putGeometry` / `put_geometry`. Initial per-point annotations supplied in source
+metadata are consumed into that geometry revision. Read them with
+`geometryPointAnnotations` / `geometry_point_annotations`; edit them through
+sequence operations, alongside the points they describe. Fiber controls and
+point collections have stable IDs from creation. Fiber JSON transfer preserves
+`control_point_ids` and allocates IDs when a new input omits them.
+
+C++ callers with owned arrays can use `updateGeometryArrays` for all geometry
+kinds. It delegates to sparse and structural edits in one checked transaction.
+Directional reorderings require explicitly transformed annotations. A failed
+update rolls back all its arrays and prevents the enclosing action from committing.

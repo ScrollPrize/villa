@@ -6,6 +6,7 @@
 #include "geometry/GeometryDelta.hpp"
 #include "internal/History.hpp"
 #include "geometry/SharedGeometry.hpp"
+#include "geometry/SequenceMetadata.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -213,18 +214,15 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
     const auto expected = expectedRevision ? std::optional(formatUuid(parseUuid(*expectedRevision))) : std::nullopt;
     if ((current ? std::optional(current->uuid) : std::nullopt) != expected)
         historyConflict(db, "geometry: current revision changed; reload before committing");
-    if (current) {
-        GeometryReader existing(txn,current->uuid);
-        if (existing.manifest().contains("sequences") || identityManaged(db,objectUuid))
-            throw std::invalid_argument("identity-managed sequences require structural or sparse edits");
-        const auto source=nlohmann::json::parse(object->meta).value("source",nlohmann::json::object());
-        if (current->kind=="point_collection" && source.contains("point_attributes")) {
-            const auto ids=std::find_if(data.arrays.begin(),data.arrays.end(),[](const auto& a) { return a.name=="point_ids"; });
-            if (ids!=data.arrays.end() && ids->bytes!=existing.read("point_ids",0))
-                throw std::invalid_argument("annotated point identities require structural editing");
-        }
+    if (current && data.kind != "patch")
+        throw std::invalid_argument("sequences require structural or sparse edits");
+    Savepoint savepoint(db);
+    auto source = nlohmann::json::parse(object->meta).value("source", nlohmann::json::object());
+    auto manifest = detail::geometryManifest(data, storage.patchTileSize);
+    if (data.kind != "patch") {
+        manifest["sequences"] = initialSequences(db, data, source);
+        setMeta(txn, objectUuid, "source", source.dump());
     }
-    const auto manifest = detail::geometryManifest(data, storage.patchTileSize);
     const auto manifestText = manifest.dump();
     if (geometryWork) geometryWork->manifestBytesWritten += manifestText.size();
     const auto contentHash = detail::geometryHash(std::span(reinterpret_cast<const uint8_t*>(manifestText.data()), manifestText.size()));
@@ -238,15 +236,15 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
     }
     if (unchanged) {
         if (!edgeEdits.empty()) throw std::invalid_argument("geometry is unchanged; edit relationships directly");
+        savepoint.release();
         return current->uuid;
     }
     const auto after = detail::dependencyGeometry(data);
     const auto affected = affectedEdges(*this, txn, object->uuid, current, after);
     const auto decisions = validateEdgeEdits(*this, txn, db, object->uuid, after, affected, edgeEdits);
 
-    Savepoint savepoint(db);
     const auto revisionUuid = util::newUuid();
-    writeRevision(db, *this, *object, revisionUuid, current ? &*current : nullptr, contentHash, manifestText);
+    writeRevision(db, *this, *objectByUuid(txn, objectUuid), revisionUuid, current ? &*current : nullptr, contentHash, manifestText);
     writeArrays(db, revisionUuid, data.arrays, manifest);
 
     detail::clearGeometryMaterialization(db, objectUuid);
@@ -413,9 +411,7 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
     DependencyScope scope;
     const auto currentRevision=currentGeometry(txn,objectUuid);
     if (!currentRevision || currentRevision->uuid!=formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
-    const auto source=nlohmann::json::parse(objectByUuid(txn,objectUuid)->meta).value("source",nlohmann::json::object());
-    for (const auto& edit:edits) if ((edit.array=="point_ids" || edit.array=="control_point_ids") && !edit.bytes.empty() &&
-        (source.contains("point_attributes") || identityManaged(db,objectUuid)))
+    for (const auto& edit:edits) if ((edit.array=="point_ids" || edit.array=="control_point_ids") && !edit.bytes.empty())
         throw std::invalid_argument("annotated point identities require structural editing");
     const auto plan = prepareEdit(*this, txn, objectUuid, expected, edits);
     const auto current = *currentGeometry(txn, objectUuid);

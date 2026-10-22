@@ -1348,34 +1348,6 @@ generatedControlMarkers(
     return markers;
 }
 
-std::vector<vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker>
-generatedBranchLinkMarkers(const std::vector<LineAnnotationController::FiberBranchRef>& branches,
-                           double fiberBaseToVolumeScale)
-{
-    std::vector<vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker> markers;
-    markers.reserve(branches.size());
-    for (const auto& branch : branches) {
-        if (!finitePoint(branch.controlPointPosition) ||
-            !finitePoint(branch.branchControlPointPosition) ||
-            !finiteDirection(branch.controlPointDirection) ||
-            !finiteDirection(branch.branchControlPointDirection)) {
-            continue;
-        }
-        vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker marker;
-        marker.linkedFiberId = branch.branchFiberId;
-        marker.localControlPoint = toVec3f(branch.controlPointPosition);
-        marker.linkedControlPoint = toVec3f(branch.branchControlPointPosition);
-        marker.localDirection = toVec3f(normalizedOrZero(branch.controlPointDirection));
-        marker.linkedDirection =
-            toVec3f(normalizedOrZero(branch.branchControlPointDirection));
-        marker.planePoint = marker.linkedControlPoint;
-        marker.estimated = false;
-        vc3d::line_annotation::scaleGeneratedMarkerForVolume(
-            marker, fiberBaseToVolumeScale);
-        markers.push_back(marker);
-    }
-    return markers;
-}
 
 void remapBranchControlPointIndices(
     const std::vector<vc3d::line_annotation::LineControlPoint>& oldControls,
@@ -1963,6 +1935,37 @@ void applyFocusBoundsToOptimizationTask(
 }
 
 } // namespace
+
+std::vector<vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker>
+LineAnnotationController::generatedBranchLinkMarkers(const std::vector<LineAnnotationController::FiberBranchRef>& branches,
+                           double fiberBaseToVolumeScale) const
+{
+    std::vector<vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker> markers;
+    markers.reserve(branches.size());
+    for (const auto& branch : branches) {
+        const auto linkedScale = fiberCoordinateScaleForVolume(branch.branchFiberId, _state ? _state->currentVolume() : nullptr);
+        if (!linkedScale) continue;
+        if (!finitePoint(branch.controlPointPosition) ||
+            !finitePoint(branch.branchControlPointPosition) ||
+            !finiteDirection(branch.controlPointDirection) ||
+            !finiteDirection(branch.branchControlPointDirection)) {
+            continue;
+        }
+        vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker marker;
+        marker.linkedFiberId = branch.branchFiberId;
+        marker.localControlPoint = toVec3f(branch.controlPointPosition);
+        marker.linkedControlPoint = toVec3f(branch.branchControlPointPosition);
+        marker.localDirection = toVec3f(normalizedOrZero(branch.controlPointDirection));
+        marker.linkedDirection =
+            toVec3f(normalizedOrZero(branch.branchControlPointDirection));
+        marker.planePoint = marker.linkedControlPoint;
+        marker.estimated = false;
+        vc3d::line_annotation::scaleGeneratedMarkerForVolume(
+            marker, fiberBaseToVolumeScale, *linkedScale);
+        markers.push_back(marker);
+    }
+    return markers;
+}
 
 LineAnnotationController::LineAnnotationController(CState* state,
                                                    ViewerManager* viewerManager,
@@ -3299,12 +3302,12 @@ vc3d::line_annotation::FiberDeleteOutcome LineAnnotationController::deleteFibers
             outcome.deletedIds.push_back(fiber.id);
         }
         // Retired UUIDs remain in history; old workers cannot recreate them.
-        onVolumePackageChanged({});
+        refreshChangedStoreFibers();
         for (const auto& fiber : retired) emit fiberRetired(QString::fromStdString(fiber.uuid));
         emit fibersDeleted(outcome.deletedIds);
     } catch (const std::exception& error) {
         outcome.error = error.what(); outcome.aborted = true;
-        onVolumePackageChanged({});
+        refreshChangedStoreFibers();
         showError(tr("Could not retire fibers: %1").arg(QString::fromUtf8(error.what())));
     }
     return outcome;
@@ -3321,9 +3324,13 @@ void LineAnnotationController::renameFiberFile(uint64_t fiberId)
     if (!accepted || name.isEmpty()) return;
     try {
         StoredFiber renamed = original; renamed.fileName = name.toStdString()+".json";
-        saveFiberNow(renamed);
+        commitFibers({&renamed});
         // Names are labels; UUIDs and runtime handles survive a rename.
-        onVolumePackageChanged({});
+        for (const auto& pane : _panes) if (pane.session && pane.session->fiberId == fiberId) {
+            pane.session->fiberFileName = renamed.fileName;
+            if (pane.dialog) pane.dialog->setFiberDisplayName(fiberDisplayNameFromFileName(renamed.fileName));
+        }
+        emitFiberSummaries();
     } catch (const std::exception& error) {
         showError(tr("Could not rename fiber: %1").arg(QString::fromUtf8(error.what())));
     }
@@ -3580,7 +3587,7 @@ void LineAnnotationController::setFiberManualHvTag(uint64_t fiberId, const QStri
     it->manualHvTag = manualTag;
 
     try {
-        scheduleFiberSave(*it);
+        commitFibers({&*it});
     } catch (const std::exception& ex) {
         it->manualHvTag = previousManualTag;
         for (const auto& pane : _panes) {
@@ -3634,7 +3641,7 @@ void LineAnnotationController::setFiberTag(uint64_t fiberId, const QString& tag,
     }
 
     try {
-        scheduleFiberSave(*it);
+        commitFibers({&*it});
     } catch (const std::exception& ex) {
         it->tags = previousTags;
         for (const auto& pane : _panes) {
@@ -3709,7 +3716,7 @@ void LineAnnotationController::recalculateFiberHvClassification(uint64_t fiberId
         vc3d::line_annotation::storedControlPointPositions(it->controlPoints));
 
     try {
-        scheduleFiberSave(*it);
+        commitFibers({&*it});
     } catch (const std::exception& ex) {
         it->hvClassification = previousClassification;
         showError(tr("Could not save fiber %1: %2")
@@ -3734,7 +3741,7 @@ void LineAnnotationController::recalculateAllFiberHvClassifications()
             vc3d::line_annotation::storedControlPointPositions(fiber.controlPoints));
 
         try {
-            scheduleFiberSave(fiber);
+            commitFibers({&fiber});
             changed = true;
         } catch (const std::exception& ex) {
             fiber.hvClassification = previousClassification;
@@ -7292,101 +7299,82 @@ void LineAnnotationController::onSurfaceChanged(std::string name,
 
 void LineAnnotationController::refreshChangedStoreFibers()
 {
-    std::vector<std::string> retry;
-    for (const auto& pane : _panes) if (pane.session && pane.session->storePin &&
-        (pane.session->watcher || pane.session->solveQueue.hasPending()))
-        retry.push_back(pane.session->fiberUuid);
-    onVolumePackageChanged({});
-    for (const auto& uuid : retry) {
+    const auto connection = _state ? _state->objectStoreSession() : nullptr;
+    const auto attachment = connection ? connection->attachment() : std::nullopt;
+    if (!attachment) return;
+    std::vector<uint64_t> changed;
+    std::map<std::string, bool> reopen;
+    connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
+        auto stale = [&](const auto& pin) {
+            if (!pin || pin->attachment != *attachment) return true;
+            const auto head = db.currentObjectRevision(txn, pin->object.objectUuid);
+            return !head || head->uuid != pin->objectRevision || head->record.retired;
+        };
+        for (const auto& fiber : _fibers)
+            if (stale(fiber.storePin)) changed.push_back(fiber.id);
+        for (const auto& pane : _panes) if (pane.session && pane.session->storePin && stale(pane.session->storePin)) {
+            changed.push_back(pane.session->fiberId);
+            reopen[pane.session->fiberUuid] = pane.session->watcher || pane.session->solveQueue.hasPending();
+        }
+    });
+    discardFiberPanes(changed);
+    loadFibersForCurrentPackage();
+    for (const auto& [uuid, retry] : reopen) {
         const auto id = fiberIdForUuid(uuid);
-        if (!id || !fiberCoordinateScale(id,false)) continue;
+        if (!id || !fiberCoordinateScale(id, false)) continue;
         openFiber(id);
-        for (const auto& pane : _panes) if (pane.session && pane.session->fiberUuid == uuid) {
-            startFiberModeOptimization(*pane.session,false);
+        if (retry) for (const auto& pane : _panes) if (pane.session && pane.session->fiberUuid == uuid) {
+            startFiberModeOptimization(*pane.session, false);
             break;
         }
     }
+    refreshBranchLineViews();
+}
+
+void LineAnnotationController::discardFiberPanes(const std::vector<uint64_t>& fiberIds)
+{
+    closeIntersectionInspectionForRetiredFibers(fiberIds);
+    std::vector<PaneRecord> removed, kept;
+    // Remove records before closing dialogs: close and surface signals re-enter.
+    for (auto& pane : _panes) {
+        const auto id = pane.session ? pane.session->fiberId : uint64_t(0);
+        (std::find(fiberIds.begin(), fiberIds.end(), id) != fiberIds.end() ? removed : kept)
+            .push_back(std::move(pane));
+    }
+    _panes = std::move(kept);
+    for (auto& pane : removed) {
+        if (pane.session) {
+            if (pane.session->runningSolveCancel) pane.session->runningSolveCancel->store(true);
+            pane.session->solveQueue.shutdown();
+            if (pane.session->watcher) {
+                auto* watcher = pane.session->watcher.data();
+                disconnect(watcher, nullptr, this, nullptr);
+                connect(watcher, &QFutureWatcher<OptimizationTaskResult>::finished, watcher, &QObject::deleteLater);
+                pane.session->watcher = nullptr;
+            }
+        }
+        if (pane.dialog) {
+            pane.dialog->setCloseAfterFinalizationAllowed(true);
+            pane.dialog->close();
+        }
+        if (_state) {
+            _state->setSurface(pane.surfaceName, nullptr);
+            if (pane.session) for (const auto& name : pane.session->generatedSurfaceNames)
+                _state->setSurface(name, nullptr);
+        }
+    }
+    invalidateSideStripQueries();
+    _pendingSideStripIntersectionRequests.clear();
+    _sideStripReuseCache.clear();
+    _sideStripSessionSnapshotCache.clear();
 }
 
 void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg> /*pkg*/)
 {
-    // Sessions belong to the package they were traced in. Left in place, the
-    // new project's first volume selection bumps the orientation epoch and the
-    // refresh pass rebuilds their generated views against the new project --
-    // resurrecting surfaces from the old one -- and a pane closed later would
-    // auto-save the old session's fiber into the new package's paths. Torn
-    // down here, and deliberately *without* the save that a normal pane close
-    // performs: by the time this handler runs the current package is already
-    // the new one, so that save is exactly the wrong-target write this exists
-    // to prevent. A session's work was persisted into its own package by the
-    // save-on-mutation paths while it was being edited.
-    if (_intersectionInspection) {
-        cleanupIntersectionInspectionSurfaces();
-        _intersectionInspection.reset();
-    }
-    std::vector<PaneRecord> panes;
-    // Swapped out first: setSurface() and the dialog closes below re-enter
-    // this controller through surfaceChanged and paneClosed, and no iterator
-    // over _panes may be live when they do.
-    panes.swap(_panes);
-    for (auto& pane : panes) {
-        if (pane.dialog) {
-            // Defensive net only: the project-open flows call
-            // prepareForPackageSwitch() first, which closes these through the
-            // finalize/save path while their package is still active. A dialog
-            // still open here belongs to a package that is already gone, so it
-            // is closed without saving — WA_DeleteOnClose deletes it — rather
-            // than left visible but disconnected from any session.
-            pane.dialog->setCloseAfterFinalizationAllowed(true);
-            pane.dialog->close();
-        }
-        if (pane.session) {
-            // The orphaned solve's result has no session to land in; ask it
-            // to stop now so it frees its solve-pool slot for the new
-            // package instead of running to completion unobserved, and shut
-            // the queue so nothing re-dispatches. Without the cancel the
-            // destructor's teardown loop could not reach it either — the
-            // pane record is dropped from _panes below.
-            if (pane.session->runningSolveCancel) {
-                pane.session->runningSolveCancel->store(true);
-            }
-            pane.session->solveQueue.shutdown();
-        }
-        if (pane.session && pane.session->watcher) {
-            auto* watcher = pane.session->watcher.data();
-            disconnect(watcher, nullptr, this, nullptr);
-            connect(watcher,
-                    &QFutureWatcher<OptimizationTaskResult>::finished,
-                    watcher,
-                    &QObject::deleteLater);
-            pane.session->watcher = nullptr;
-        }
-    }
-    // A side-strip intersection computed for the old package must not deliver
-    // into the new one.
-    invalidateSideStripQueries();
-    _pendingSideStripIntersectionRequests.clear();
-    _sideStripReuseCache.clear();
-    // Session-cache entries are keyed by runtime fiber ids, which are
-    // assigned per package: an entry surviving the switch could collide with
-    // a different fiber in the new package.
-    _sideStripSessionSnapshotCache.clear();
-    if (_state) {
-        for (const auto& pane : panes) {
-            _state->setSurface(pane.surfaceName, nullptr);
-            if (pane.session) {
-                for (const auto& name : pane.session->generatedSurfaceNames) {
-                    _state->setSurface(name, nullptr);
-                }
-            }
-        }
-    }
-    // The volume-reselection guard must not carry an id across packages: two
-    // projects can name a volume identically.
+    std::vector<uint64_t> ids{0};
+    for (const auto& pane : _panes) if (pane.session) ids.push_back(pane.session->fiberId);
+    discardFiberPanes(ids);
     _lastVolumeChangedId.clear();
-    // Dropped outright rather than left to the frame comparison: two projects can
-    // sit in one directory with identical grids, so both halves of the cache key
-    // can match while the umbilicus file behind them differs.
     ++_packageGeneration;
     invalidateScrollUmbilicus();
     loadFibersForCurrentPackage();
@@ -7989,7 +7977,7 @@ std::optional<uint64_t> LineAnnotationController::createLinkedSeedFiber(
 
         StoredFiber linkedFiber = storedFiberFromSession(*linkedSeedRecord);
         const uint64_t linkedFiberId = linkedFiber.id;
-        scheduleFiberPairSave(parentFiber, linkedFiber);
+        commitFibers({&parentFiber, &linkedFiber});
 
         auto upsertFiber = [this](StoredFiber fiber) {
             auto it = std::find_if(
@@ -8394,7 +8382,13 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
         showError(tr("Could not determine finite endpoints for the link."));
         return;
     }
-    const cv::Vec3d fallbackDirection = normalizedOrZero(farPoint - localPoint);
+    const auto farScale = fiberCoordinateScaleForVolume(farIt->id, _state ? _state->currentVolume() : nullptr);
+    if (!farScale) {
+        showError(tr("Bind the linked fiber to the active volume before linking."));
+        return;
+    }
+    const cv::Vec3d fallbackDirection = normalizedOrZero(
+        farPoint * (*farScale / session.fiberBaseToVolumeScale) - localPoint);
     const cv::Vec3d localDirection = endpointTangentFromLinePoints(
         linePointPositions(session.optimizedLine),
         localPoint,
@@ -8481,7 +8475,7 @@ void LineAnnotationController::handleGeneratedControlPointLinkWithCandidate(
             farIt->branches.push_back(reciprocal);
         }
         StoredFiber farFiber = *farIt;
-        scheduleFiberPairSave(localFiber, farFiber);
+        commitFibers({&localFiber, &farFiber});
 
         auto localIt = std::find_if(
             _fibers.begin(),
@@ -8820,8 +8814,8 @@ LineAnnotationController::commitStructuralEdit(StructuralEditRequest request, bo
         batch.push_back(makeFiberSaveSnapshot(peer));
     }
     try {
-        canonicalizeFiberSaveSnapshots(batch);
-        validateFiberSaveSnapshots(batch);
+        vc3d::line_annotation::canonicalizeFiberSaveSnapshots(batch);
+        vc3d::line_annotation::validateFiberSaveSnapshots(batch);
     } catch (const std::exception& ex) {
         return fail(std::string{"the result would not load back: "} + ex.what());
     }
@@ -8829,22 +8823,14 @@ LineAnnotationController::commitStructuralEdit(StructuralEditRequest request, bo
     // 4. The graph the next load sees: untouched records + the batch, the
     //    originals gone. Any issue touching the batch or a retired original
     //    aborts; defects between untouched records are the loader prompt's.
-    const auto sourceKey = [](const StoredFiber& fiber, const std::string& fileName) {
-        return fiber.uuid;
-    };
-    std::unordered_set<std::string> batchKeys;
-    std::unordered_set<std::string> retiredKeys;
-    for (const auto& snapshot : batch) {
-        batchKeys.insert(sourceKey(snapshot.fiber, snapshot.fiber.fileName));
-    }
-    for (const auto& original : request.originals) {
-        retiredKeys.insert(sourceKey(original, original.fileName));
-    }
+    std::unordered_set<uint64_t> batchKeys, retiredKeys;
+    for (const auto& snapshot : batch) batchKeys.insert(snapshot.fiber.id);
+    for (const auto& original : request.originals) retiredKeys.insert(original.id);
     std::vector<StoredFiber> graph;
     graph.reserve(_fibers.size() + request.newFibers.size());
     for (const auto& fiber : _fibers) {
         if (isOriginal(fiber.id) ||
-            batchKeys.count(sourceKey(fiber, fiber.fileName)) != 0) {
+            batchKeys.count(fiber.id) != 0) {
             continue;
         }
         graph.push_back(fiber);
@@ -8852,23 +8838,11 @@ LineAnnotationController::commitStructuralEdit(StructuralEditRequest request, bo
     for (const auto& snapshot : batch) {
         graph.push_back(snapshot.fiber);
     }
-    auto validationGraph=graph;
-    std::unordered_map<uint64_t,std::string> uuidById;
-    for(const auto& fiber:graph) uuidById[fiber.id]=fiber.uuid;
-    for(auto& fiber:validationGraph) {
-        fiber.fileName=fiber.uuid;
-        for(auto& branch:fiber.branches) {
-            const auto target=uuidById.find(branch.branchFiberId);
-            if(target==uuidById.end()) return fail("A structural edit retained a missing branch endpoint");
-            branch.branchFileName=target->second;
-        }
-    }
-    const auto identityKey=[](const StoredFiber&,const std::string& uuid) {return uuid;};
     const auto check = la::checkStructuralEditGraph(
-        validationGraph, batchKeys, retiredKeys,
+        graph, batchKeys, retiredKeys,
         [&](const std::vector<StoredFiber>& current) {
-            return la::collectFiberBranchIssues(current,identityKey,identityKey,isReciprocalBranchRef);
-        }, identityKey);
+            return la::collectFiberBranchIssues(current, isReciprocalBranchRef);
+        });
     for (const auto& issue : check.unrelated) {
         Logger()->warn("Structural edit: pre-existing link issue left alone: {}: {}",
                        fiberErrorName(graph[issue.fiberIndex].fileName), issue.reason);
@@ -8891,10 +8865,9 @@ LineAnnotationController::commitStructuralEdit(StructuralEditRequest request, bo
     //    allocates.
     std::vector<StoredFiber> replacement;
     replacement.reserve(_fibers.size() + request.newFibers.size());
-    const auto batchRecord = [&batch, &sourceKey](const StoredFiber& fiber) -> const StoredFiber* {
+    const auto batchRecord = [&batch](const StoredFiber& fiber) -> const StoredFiber* {
         for (const auto& snapshot : batch) {
-            if (sourceKey(snapshot.fiber, snapshot.fiber.fileName) ==
-                sourceKey(fiber, fiber.fileName)) {
+            if (snapshot.fiber.id == fiber.id) {
                 return &snapshot.fiber;
             }
         }
@@ -8919,10 +8892,6 @@ LineAnnotationController::commitStructuralEdit(StructuralEditRequest request, bo
         retiredUuids.push_back(original.uuid);
         retiredIds.push_back(original.id);
     }
-    std::vector<std::pair<uint64_t, uint64_t>> savedIds;
-    for (const auto& snapshot : batch) {
-        savedIds.emplace_back(snapshot.fiberId, snapshot.generation);
-    }
     const bool candidateOnOriginal =
         _linkCandidate && std::any_of(request.originals.begin(), request.originals.end(),
                                       [this](const StoredFiber& original) {
@@ -8932,9 +8901,10 @@ LineAnnotationController::commitStructuralEdit(StructuralEditRequest request, bo
     // Geometry, topology, summaries and retirement publish in one checked action.
     try {
         commitFiberStoreAction(batch, request.originals);
-        for (auto& fiber : replacement)
-            for (const auto& snapshot : batch)
-                if (fiber.uuid == snapshot.fiber.uuid) fiber = snapshot.fiber;
+        for (auto& fiber : replacement) {
+            for (const auto& current : _fibers) if (current.uuid == fiber.uuid) fiber.storePin = current.storePin;
+            for (const auto& snapshot : batch) if (fiber.uuid == snapshot.fiber.uuid) fiber = snapshot.fiber;
+        }
     } catch (const std::exception& error) {
         return fail(error.what());
     }
@@ -8976,15 +8946,13 @@ LineAnnotationController::commitStructuralEdit(StructuralEditRequest request, bo
         for (std::size_t i = 0; i < request.newFibers.size(); ++i) {
             outcome.writtenFileNames.push_back(batch[i].fiber.fileName);
         }
-        for (const auto& [id, generation] : savedIds) {
-            emit fiberSaved(id, generation);
-        }
+        applyCommittedFibers(batch);
         for (const auto& uuid : retiredUuids) emit fiberRetired(QString::fromStdString(uuid));
         for (const uint64_t id : retiredIds) {
             invalidateFiberAlignmentMetrics(id, false);
         }
         for (std::size_t i = 0; i < request.newFibers.size(); ++i) {
-            invalidateFiberAlignmentMetrics(batch[i].fiberId, true);
+            invalidateFiberAlignmentMetrics(batch[i].fiber.id, true);
         }
         emit fibersDeleted(retiredIds);
         emitFiberSummaries();
@@ -9240,16 +9208,7 @@ void LineAnnotationController::commitFiberMerge(StructuralEditCapture capture)
         }
         const auto outcome = commitStructuralEdit(std::move(request), &committed);
         if (!outcome.ok) {
-            if (outcome.recoveryRequired) {
-                Logger()->warn("Merge failed and the files were not fully restored: {}",
-                               outcome.error);
-                showError(tr("The merge failed and the fiber files could not be fully "
-                             "restored:\n%1\nReload the project before continuing.")
-                              .arg(QString::fromStdString(outcome.error)),
-                          capture.suppressErrors);
-            } else {
-                abort(QString::fromStdString(outcome.error));
-            }
+            abort(QString::fromStdString(outcome.error));
             return;
         }
         if (!outcome.warning.empty()) {
@@ -9454,16 +9413,7 @@ void LineAnnotationController::commitFiberSplit(StructuralEditCapture capture)
         request.consumedSessions.push_back(parentSession);
         const auto outcome = commitStructuralEdit(std::move(request), &committed);
         if (!outcome.ok) {
-            if (outcome.recoveryRequired) {
-                Logger()->warn("Split failed and the files were not fully restored: {}",
-                               outcome.error);
-                showError(tr("The split failed and the fiber files could not be fully "
-                             "restored:\n%1\nReload the project before continuing.")
-                              .arg(QString::fromStdString(outcome.error)),
-                          capture.suppressErrors);
-            } else {
-                abort(QString::fromStdString(outcome.error));
-            }
+            abort(QString::fromStdString(outcome.error));
             return;
         }
         if (!outcome.warning.empty()) {
@@ -9547,7 +9497,7 @@ void LineAnnotationController::handleGeneratedControlPointUnlink(
 
     try {
         StoredFiber localFiber = storedFiberFromSession(session);
-        scheduleFiberSave(localFiber);
+        commitFibers({&localFiber});
         auto localIt = std::find_if(
             _fibers.begin(),
             _fibers.end(),
@@ -9669,7 +9619,7 @@ void LineAnnotationController::handleGeneratedControlPointSetLinkPending(
 
     try {
         StoredFiber localFiber = storedFiberFromSession(session);
-        scheduleFiberSave(localFiber);
+        commitFibers({&localFiber});
         auto localIt = std::find_if(
             _fibers.begin(),
             _fibers.end(),
@@ -10421,7 +10371,7 @@ bool LineAnnotationController::applyControlPointEditAndPersist(
         if (localIndex == _fibers.size()) {
             _fibers.reserve(_fibers.size() + 1);
         }
-        scheduleFiberSave(localFiber);
+        commitFibers({&localFiber});
         if (localIndex == _fibers.size()) {
             _fibers.push_back(std::move(localFiber));
         } else {
@@ -14205,7 +14155,7 @@ void LineAnnotationController::reoptimizeMergedFibers(
             stripReoptimizationTag(it->tags);
 
             try {
-                scheduleFiberSave(*it);
+                commitFibers({&*it});
                 scheduledTagOnlySave = true;
             } catch (const std::exception& ex) {
 
@@ -14400,7 +14350,7 @@ std::map<std::string, fs::path> LineAnnotationController::fiberTransportPaths(
             selection[object.uuid] = db.currentObjectRevision(txn, object.uuid)->uuid;
         documents = vc::objects::fiberNetworkJson(db, txn, selection, roots);
     });
-    return vc3d::materializeObjectDocuments(_fiberTransportDirectory, *attachment, documents);
+    return vc3d::materializeJsonDocuments(_fiberTransportDirectory, *attachment, documents);
 }
 
 std::optional<LineAnnotationController::ResolvedFiberOptimizationInputs>
@@ -14626,11 +14576,11 @@ void LineAnnotationController::optimizeAndSaveFiberHeadless(
                             fiber.controlPoints));
                     const uint64_t id = fiber.id;
                     std::vector<FiberSaveSnapshot> snapshots{makeFiberSaveSnapshot(fiber)};
-                    snapshots.front().coordinateIdentity.update(creationBinding);
-                    commitFiberStoreAction(snapshots);fiber=std::move(snapshots.front().fiber);
-                    _fibers.push_back(std::move(fiber));
+                    snapshots.front().fiber.coordinateIdentity.update(creationBinding);
+                    commitFiberStoreAction(snapshots);
+                    _fibers.push_back(snapshots.front().fiber);
+                    applyCommittedFibers(snapshots);
                     emitFiberSummaries();
-                    emit fiberSaved(id, 1);
                     refreshBranchLineViews(id);
                     if (completion) completion(true, {}, id);
                 } catch (const std::exception& ex) {
@@ -14905,14 +14855,15 @@ LineAnnotationController::generatedBranchLinePointsForSession(
         if (branch.branchFiberId == 0 || !seenFiberIds.insert(branch.branchFiberId).second) {
             continue;
         }
+        const auto scale = fiberCoordinateScaleForVolume(branch.branchFiberId, _state ? _state->currentVolume() : nullptr);
+        if (!scale) continue;
         std::vector<cv::Vec3d> linePoints = linePointsForFiber(branch.branchFiberId);
         if (linePoints.size() >= 2) {
             auto displayed = generatedLinePoints(linePoints);
-            if (!approximatelyEqual(session.fiberBaseToVolumeScale, 1.0)) {
-                const float scale =
-                    static_cast<float>(session.fiberBaseToVolumeScale);
+            if (!approximatelyEqual(*scale, 1.0)) {
+                const float factor = static_cast<float>(*scale);
                 for (auto& point : displayed) {
-                    point *= scale;
+                    point *= factor;
                 }
             }
             branches.push_back(std::move(displayed));
@@ -15323,7 +15274,9 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
         }
         vc::atlas::FiberSideStripLineQuery query;
         query.fiberId = branch.branchFiberId;
-        query.point = branch.branchControlPointPosition;
+        const auto linkedScale = fiberCoordinateScaleForVolume(branch.branchFiberId, _state->currentVolume());
+        if (!linkedScale) continue;
+        query.point = branch.branchControlPointPosition * (*linkedScale / pane->session->fiberBaseToVolumeScale);
         query.direction = normalizedOrZero(branch.branchControlPointDirection);
         query.connectorStart = branch.controlPointPosition;
         request.branchLinks.push_back(query);
@@ -16002,7 +15955,8 @@ void LineAnnotationController::scheduleBranchMetadataSaves(
     }
     // Geometry and both endpoints of each shared link publish in one action.
     if (!snapshots.empty()) {
-        scheduleFiberSaveSnapshots(std::move(snapshots));
+        commitFiberStoreAction(snapshots);
+    applyCommittedFibers(snapshots);
         ++_fiberDataGeneration;
     }
 }
@@ -16781,7 +16735,7 @@ void LineAnnotationController::saveFiberDisplayAnnotations(LineAnnotationSession
         }
         ++updated.generation;
         try {
-            scheduleFiberSave(updated);
+            commitFibers({&updated});
             *it = std::move(updated);
         } catch (const std::exception& ex) {
             showError(tr("Could not save fiber display annotations: %1").arg(QString::fromUtf8(ex.what())), session.suppressErrorDialogs);
@@ -16871,71 +16825,24 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
             session.stripReviewedTagOnSave = false;
         }
         ensureSessionFiberIdentity(session);
-        // A session opened and closed without a material change must not
-        // save: an unedited pane otherwise rewrites its file, queues a save
-        // job, and bumps _fiberDataGeneration - which reads as "Fibers
-        // changed" to every derived view (the Fiber Map's stale gates above
-        // all) on nothing more than opening a fiber. The decision runs
-        // BEFORE the branch-metadata sync mutates anything: a session that
-        // serializes identically to its stored fiber - which was itself
-        // synced when it was last saved - has nothing for the sync to
-        // propagate either, so skipping the whole tail is safe and the
-        // comparison can never be confused by the sync's side effects.
-        // Equality is judged on the serializer's own output, so every
-        // persisted field participates by construction; only the generation
-        // counter, which the snapshot bumps unconditionally, is excluded.
-        {
-            const StoredFiber candidate =
-                makeStoredFiberSessionSnapshot(session).fiber;
-            auto storedIt = std::find_if(
-                _fibers.begin(), _fibers.end(),
-                [&candidate](const StoredFiber& existing) {
-                    return existing.uuid == candidate.uuid;
-                });
-            if (storedIt == _fibers.end()) {
-                storedIt = std::find_if(
-                    _fibers.begin(), _fibers.end(),
-                    [&candidate](const StoredFiber& existing) {
-                        return existing.id == candidate.id;
-                    });
-            }
-            if (storedIt != _fibers.end()) {
-                nlohmann::json before = fiberToJson(*storedIt);
-                nlohmann::json after = fiberToJson(candidate);
-                before.erase("generation");
-                after.erase("generation");
-                if (before == after) {
-                    Logger()->info(
-                        "line annotation: unchanged session for {}; skipping save",
-                        candidate.fileName);
-                    return;
-                }
-                // Not a no-op: name the first differing field, so a session
-                // that SHOULD have been a no-op (opened and closed untouched)
-                // but keeps re-saving is diagnosable from the log.
-                std::string differing = "<structure>";
-                for (const auto& [key, value] : before.items()) {
-                    if (!after.contains(key)) {
-                        differing = key + " (removed)";
-                        break;
-                    }
-                    if (after.at(key) != value) {
-                        differing = key;
-                        break;
-                    }
-                }
-                if (differing == "<structure>") {
-                    for (const auto& [key, value] : after.items()) {
-                        if (!before.contains(key)) {
-                            differing = key + " (added)";
-                            break;
-                        }
-                    }
-                }
-                Logger()->info(
-                    "line annotation: session for {} differs at '{}'; saving",
-                    candidate.fileName, differing);
-            }
+        const auto candidate = makeStoredFiberSessionSnapshot(session).fiber;
+        const auto stored = std::find_if(_fibers.begin(), _fibers.end(), [&](const auto& fiber) {
+            return fiber.uuid == candidate.uuid;
+        });
+        if (stored != _fibers.end()) {
+            ensureFiberLines(*stored);
+            const auto sameBranch = [](const auto& a, const auto& b) {
+                return a.branchFiberId == b.branchFiberId && a.controlPointIndex == b.controlPointIndex &&
+                    a.branchControlPointIndex == b.branchControlPointIndex && a.pending == b.pending && a.adjacent == b.adjacent &&
+                    a.controlPointPosition == b.controlPointPosition && a.branchControlPointPosition == b.branchControlPointPosition &&
+                    a.controlPointDirection == b.controlPointDirection && a.branchControlPointDirection == b.branchControlPointDirection;
+            };
+            if (stored->fileName == candidate.fileName && stored->tags == candidate.tags &&
+                stored->width == candidate.width && stored->widthGapFraction == candidate.widthGapFraction &&
+                stored->optimizationMode == candidate.optimizationMode && stored->manualHvTag == candidate.manualHvTag &&
+                stored->controlPoints == candidate.controlPoints && stored->linePoints == candidate.linePoints &&
+                std::equal(stored->branches.begin(), stored->branches.end(), candidate.branches.begin(), candidate.branches.end(), sameBranch) &&
+                fiberSourceMetadata(*stored) == fiberSourceMetadata(candidate)) return;
         }
         const BranchMetadataSyncResult branchSync =
             syncLinkedBranchMetadataAfterFiberModification(session);
@@ -16962,7 +16869,6 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         // the fiber unwritten forever.
         std::vector<FiberSaveSnapshot> snapshots;
         snapshots.push_back(makeFiberSaveSnapshot(fiber));
-        std::vector<StoredFiber> linkedFibersToCommit;
         for (const uint64_t linkedFiberId : branchSync.affectedFiberIds) {
             if (linkedFiberId == savedFiberId) {
                 continue;
@@ -16979,7 +16885,6 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
                 }
                 StoredFiber linkedFiber = storedFiberFromSession(*pane.session);
                 snapshots.push_back(makeFiberSaveSnapshot(linkedFiber));
-                linkedFibersToCommit.push_back(std::move(linkedFiber));
                 addedOpenPaneSnapshot = true;
                 break;
             }
@@ -16996,46 +16901,12 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
                 snapshots.push_back(makeFiberSaveSnapshot(*linkedIt));
             }
         }
-        canonicalizeFiberSaveSnapshots(snapshots);
-        validateFiberSaveSnapshots(snapshots);
         commitFiberStoreAction(snapshots);
-        fiber = snapshots.front().fiber;
-        if (session.watcher && session.storePin != fiber.storePin) session.solveQueue.noteSessionMutated();
-        session.storePin = fiber.storePin;
-        const auto ordering = storedIndexMapForSessionControls(session.controlPoints);
-        for (size_t i=0; i<ordering.size(); ++i)
-            if (ordering[i] >= 0) session.controlPoints[i].storeId = fiber.controlPoints.at(ordering[i]).storeId;
-        for (auto& linked : linkedFibersToCommit)
-            for (const auto& saved : snapshots) if (saved.fiber.uuid == linked.uuid) linked = saved.fiber;
-        for (const auto& saved : snapshots) emit fiberSaved(saved.fiberId, saved.generation);
-
-        // Publish working views only after the checked action commits.
-        auto it = std::find_if(_fibers.begin(), _fibers.end(), [&fiber](const StoredFiber& existing) {
-            return existing.id == fiber.id;
-        });
-        if (it == _fibers.end()) {
-            it = std::find_if(_fibers.begin(), _fibers.end(), [&fiber](const StoredFiber& existing) {
-                return existing.uuid == fiber.uuid;
-            });
+        for (const auto& saved : snapshots) {
+            if (std::none_of(_fibers.begin(), _fibers.end(), [&](const auto& current) { return current.uuid == saved.fiber.uuid; }))
+                _fibers.push_back(saved.fiber);
         }
-        if (it == _fibers.end()) {
-            _fibers.push_back(std::move(fiber));
-        } else {
-            *it = std::move(fiber);
-        }
-        for (auto& linkedFiber : linkedFibersToCommit) {
-            auto linkedIt = std::find_if(
-                _fibers.begin(),
-                _fibers.end(),
-                [&linkedFiber](const StoredFiber& candidate) {
-                    return candidate.uuid == linkedFiber.uuid;
-                });
-            if (linkedIt == _fibers.end()) {
-                _fibers.push_back(std::move(linkedFiber));
-            } else {
-                *linkedIt = std::move(linkedFiber);
-            }
-        }
+        applyCommittedFibers(snapshots);
         invalidateFiberAlignmentMetrics(savedFiberId, true);
         addKnownFiberTags(session.fiberTags);
         for (const auto& pane : _panes) {
@@ -17046,154 +16917,35 @@ void LineAnnotationController::saveSessionAsFiber(LineAnnotationSession& session
         emitFiberSummaries();
         refreshBranchLineViews(savedFiberId);
     } catch (const std::exception& ex) {
-        // Counted like an asynchronous write failure: callers that gate
-        // destructive follow-ups on _fiberSaveFailureCount around a
-        // waitForFiberSaves() flush must see a save that died before it could
-        // even queue a job, or they would proceed as though it had succeeded.
+        // Destructive follow-ups check this count before proceeding.
         ++_fiberSaveFailureCount;
         showError(tr("Could not save fiber: %1").arg(QString::fromStdString(ex.what())),
                   session.suppressErrorDialogs);
     }
 }
 
-nlohmann::json LineAnnotationController::fiberToJson(const StoredFiber& fiber) const
+nlohmann::json LineAnnotationController::fiberSourceMetadata(const StoredFiber& fiber)
 {
-    ensureFiberLines(fiber);
-    StoredFiber serialized = fiber;
-    serialized.coordinateBaseShapeZYX = fiber.coordinateBaseShapeZYX;
-    auto branchFileNameForId = [this](uint64_t fiberId) -> std::string {
-        for (const auto& storedFiber : _fibers) {
-            if (storedFiber.id == fiberId) {
-                return storedFiber.fileName;
-            }
-        }
-        for (const auto& pane : _panes) {
-            if (pane.session && pane.session->fiberId == fiberId) {
-                return pane.session->fiberFileName;
-            }
-        }
-        return {};
-    };
-    for (auto& branch : serialized.branches) {
-        if (branch.branchFileName.empty()) {
-            branch.branchFileName = branchFileNameForId(branch.branchFiberId);
-        }
+    nlohmann::json source = {{"username", fiber.username}, {"started_at", fiber.startedAt},
+        {"sequence", fiber.sequence}, {"model_only", fiber.modelOnly},
+        {"hv_classification", {
+            {"z_distance", fiber.hvClassification.zDistance},
+            {"control_point_length", fiber.hvClassification.fiberLength},
+            {"horizontal_score", fiber.hvClassification.horizontalScore},
+            {"vertical_score", fiber.hvClassification.verticalScore},
+            {"automatic_tag", vc3d::line_annotation::fiberHvTagToString(fiber.hvClassification.automaticTag)},
+            {"automatic_certainty", fiber.hvClassification.automaticCertainty}}}};
+    if (fiber.coordinateBaseShapeZYX) source["coordinate_base_shape_zyx"] = *fiber.coordinateBaseShapeZYX;
+    auto controls = fiber.controlPoints;
+    if (!controls.empty()) controls.back().segmentToNext.reset();
+    vc3d::line_annotation::syncGapSpanTags(controls);
+    auto& annotations = source["control_points_attributes"] = nlohmann::json::array();
+    for (const auto& point : controls) {
+        auto annotation = vc3d::line_annotation::storedControlPointToJson(point);
+        annotation.erase("position");
+        annotations.push_back(std::move(annotation));
     }
-
-    FiberSaveSnapshot snapshot;
-    snapshot.fiber = std::move(serialized);
-    snapshot.coordinateIdentity = fiber.coordinateIdentity;
-    if ((!snapshot.fiber.storePin || snapshot.fiber.storePin->objectRevision.empty()) && snapshot.coordinateIdentity.empty())
-        copyCoordinateIdentityToJson(snapshot.coordinateIdentity, coordinateIdentityForState(_state));
-    return fiberSaveSnapshotToJson(snapshot);
-}
-
-nlohmann::json LineAnnotationController::fiberSaveSnapshotToJson(
-    const FiberSaveSnapshot& snapshot, bool annotationsOnly)
-{
-    StoredFiber serialized = snapshot.fiber;
-    // StoredFiber and sessions mint a uuid at construction, so this only
-    // guards a fiber whose identity was somehow cleared: never write a
-    // present-but-empty uuid, which parseVc3dFiberJson rejects on load.
-    if (serialized.uuid.empty()) {
-        serialized.uuid = vc::util::newUuid();
-    }
-
-    nlohmann::json root = nlohmann::json::object();
-    root["type"] = "vc3d_fiber";
-    root["version"] = vc3d::line_annotation::kFiberFormatVersion;
-    root["uuid"] = serialized.uuid;
-    root["username"] = serialized.username;
-    root["started_at"] = serialized.startedAt;
-    root["sequence"] = serialized.sequence;
-    root["filename"] = serialized.fileName;
-    root["generation"] = serialized.generation;
-    if (serialized.modelOnly) root["model_only"] = true;
-    root["optimization_mode"] =
-        vc3d::line_annotation::fiberOptimizationModeToString(serialized.optimizationMode);
-    if (serialized.coordinateBaseShapeZYX) root["coordinate_base_shape_zyx"] = *serialized.coordinateBaseShapeZYX;
-    root["tags"] = serialized.tags;
-    if (serialized.width > 0) root["width"] = serialized.width;
-    root["width_gap_fraction"] = serialized.widthGapFraction;
-    root["hv_classification"] = {
-        {"z_distance", serialized.hvClassification.zDistance},
-        {"control_point_length", serialized.hvClassification.fiberLength},
-        {"horizontal_score", serialized.hvClassification.horizontalScore},
-        {"vertical_score", serialized.hvClassification.verticalScore},
-        {"automatic_tag", vc3d::line_annotation::fiberHvTagToString(serialized.hvClassification.automaticTag)},
-        {"automatic_certainty", serialized.hvClassification.automaticCertainty},
-        {"manual_tag", serialized.manualHvTag},
-    };
-    root["branches"] = nlohmann::json::array();
-    root[kAdjacentBranchesJsonKey] = nlohmann::json::array();
-    if (!annotationsOnly) for (const auto& branch : serialized.branches) {
-        if (branch.controlPointIndex < 0 || branch.branchFiberId == 0) {
-            continue;
-        }
-        if (branch.branchControlPointIndex < 0) {
-            throw std::runtime_error("Branch link is missing a target control point index");
-        }
-        if (!finiteDirection(branch.controlPointDirection) ||
-            !finiteDirection(branch.branchControlPointDirection)) {
-            throw std::runtime_error(
-                "Branch link is missing finite endpoint directions");
-        }
-        if (!finitePoint(branch.controlPointPosition) ||
-            !finitePoint(branch.branchControlPointPosition)) {
-            throw std::runtime_error("Branch link is missing endpoint control point positions");
-        }
-        nlohmann::json branchJson = {
-            {"control_point_index", branch.controlPointIndex},
-            {"branch_fiber_id", branch.branchFiberId},
-            {"branch_control_point_index", branch.branchControlPointIndex},
-            {"control_point_direction", pointToJson(normalizedOrZero(
-                                            branch.controlPointDirection))},
-            {"branch_control_point_direction", pointToJson(normalizedOrZero(
-                                                   branch.branchControlPointDirection))},
-            {"control_point_position", pointToJson(branch.controlPointPosition)},
-            {"branch_control_point_position", pointToJson(branch.branchControlPointPosition)},
-        };
-        const std::string branchFileName = fs::path(branch.branchFileName).filename().string();
-        if (branchFileName.empty()) {
-            throw std::runtime_error("Branch link is missing branch_file");
-        }
-        branchJson["branch_file"] = branchFileName;
-        if (!branch.edgeUuid.empty()) branchJson["edge_uuid"] = branch.edgeUuid;
-        if (branch.pending) {
-            branchJson["pending"] = true;
-        }
-        root[branch.adjacent ? kAdjacentBranchesJsonKey : "branches"]
-            .push_back(std::move(branchJson));
-    }
-    if (!serialized.controlPoints.empty())
-        serialized.controlPoints.back().segmentToNext.reset();
-    // Every file VC3D writes has its gap span tags in step with its break
-    // point tags, whatever path produced the controls (split, merge,
-    // reverse, an edit whose session sync was skipped).
-    vc3d::line_annotation::syncGapSpanTags(serialized.controlPoints);
-    const auto controlKey = annotationsOnly ? "control_points_attributes" : "control_points";
-    root[controlKey] = nlohmann::json::array();
-    for (const auto& point : serialized.controlPoints) {
-        auto entry = vc3d::line_annotation::storedControlPointToJson(point);
-        if (annotationsOnly) entry.erase("position");
-        root[controlKey].push_back(std::move(entry));
-    }
-    if (!annotationsOnly) {
-        root["line_points"] = nlohmann::json::array();
-        for (const auto& point : serialized.linePoints) root["line_points"].push_back(pointToJson(point));
-    }
-    if (snapshot.coordinateIdentity.is_object()) {
-        root.update(snapshot.coordinateIdentity);
-    }
-    return root;
-}
-
-void LineAnnotationController::saveFiberNow(StoredFiber& fiber)
-{
-    if (fiber.readOnly) throw std::runtime_error("Object store is attached read-only");
-    std::vector<FiberSaveSnapshot> snapshots{makeFiberSaveSnapshot(fiber)};
-    commitFiberStoreAction(snapshots);
-    fiber = std::move(snapshots.front().fiber);
+    return source;
 }
 
 LineAnnotationController::FiberSaveSnapshot
@@ -17201,13 +16953,8 @@ LineAnnotationController::makeFiberSaveSnapshot(const StoredFiber& fiber)
 {
     ensureFiberLines(fiber);
     FiberSaveSnapshot snapshot;
-    snapshot.fiberId = fiber.id;
-    snapshot.generation = fiber.generation;
-    snapshot.path = fiber.uuid;
     snapshot.fiber = fiber;
-    snapshot.coordinateIdentity = fiber.coordinateIdentity;
-    // Pin the frame before queuing, not on completion: another metadata save
-    // may be requested while this snapshot is still being written.
+    // Preserve the stored coordinate frame in the owned edit.
     const auto stored = std::find_if(_fibers.begin(), _fibers.end(),
         [&fiber](const StoredFiber& candidate) {
             return candidate.id == fiber.id && candidate.uuid == fiber.uuid;
@@ -17220,32 +16967,14 @@ LineAnnotationController::makeFiberSaveSnapshot(const StoredFiber& fiber)
     } else {
         retainStoredFiberCoordinateBaseShape(snapshot.fiber);
     }
-    auto branchFileNameForId = [this](uint64_t fiberId) -> std::string {
-        for (const auto& storedFiber : _fibers) {
-            if (storedFiber.id == fiberId) {
-                return storedFiber.fileName;
-            }
-        }
-        for (const auto& pane : _panes) {
-            if (pane.session && pane.session->fiberId == fiberId) {
-                return pane.session->fiberFileName;
-            }
-        }
-        return {};
-    };
-    for (auto& branch : snapshot.fiber.branches) {
-        if (branch.branchFileName.empty()) {
-            branch.branchFileName = branchFileNameForId(branch.branchFiberId);
-        }
-    }
-    if ((!snapshot.fiber.storePin || snapshot.fiber.storePin->objectRevision.empty()) && snapshot.coordinateIdentity.empty())
-        copyCoordinateIdentityToJson(snapshot.coordinateIdentity, coordinateIdentityForState(_state));
+    if ((!snapshot.fiber.storePin || snapshot.fiber.storePin->objectRevision.empty()) && snapshot.fiber.coordinateIdentity.empty())
+        copyCoordinateIdentityToJson(snapshot.fiber.coordinateIdentity, coordinateIdentityForState(_state));
     if ((!fiber.storePin || fiber.storePin->objectRevision.empty()) && _state && _state->currentVolume()) {
         for (const auto& pane : _panes) if (pane.session && pane.session->fiberUuid == fiber.uuid) {
             const auto volume = _state->currentVolume();
             const double scale = pane.session->fiberBaseToVolumeScale;
             if (!(scale > 0) || !std::isfinite(scale)) throw std::runtime_error("Unknown fiber creation frame");
-            snapshot.coordinateIdentity.update(coordinateBindingForVolume(*volume,1.0/scale));
+            snapshot.fiber.coordinateIdentity.update(coordinateBindingForVolume(*volume,1.0/scale));
             break;
         }
     }
@@ -17254,63 +16983,40 @@ LineAnnotationController::makeFiberSaveSnapshot(const StoredFiber& fiber)
     return snapshot;
 }
 
-void LineAnnotationController::canonicalizeFiberSaveSnapshots(
-    std::vector<FiberSaveSnapshot>& snapshots) const
+void LineAnnotationController::commitFibers(std::initializer_list<StoredFiber*> fibers)
 {
-    vc3d::line_annotation::canonicalizeFiberSaveSnapshots(snapshots);
-}
-
-void LineAnnotationController::validateFiberSaveSnapshots(
-    const std::vector<FiberSaveSnapshot>& snapshots) const
-{
-    vc3d::line_annotation::validateFiberSaveSnapshots(snapshots);
-}
-
-void LineAnnotationController::scheduleFiberSave(StoredFiber& fiber)
-{
-    auto saved=scheduleFiberSaveSnapshots({makeFiberSaveSnapshot(fiber)});
-    if(!saved.empty()) fiber=saved.front().fiber;
-}
-
-void LineAnnotationController::scheduleFiberPairSave(StoredFiber& first,
-                                                     StoredFiber& second)
-{
-    if (first.uuid == second.uuid) {
-        scheduleFiberSave(first);
-        return;
-    }
     std::vector<FiberSaveSnapshot> snapshots;
-    snapshots.reserve(2);
-    snapshots.push_back(makeFiberSaveSnapshot(first));
-    snapshots.push_back(makeFiberSaveSnapshot(second));
-    auto saved=scheduleFiberSaveSnapshots(std::move(snapshots));
-    if(saved.size()==2) { first=saved[0].fiber; second=saved[1].fiber; }
-}
-
-std::vector<LineAnnotationController::FiberSaveSnapshot> LineAnnotationController::scheduleFiberSaveSnapshots(
-    std::vector<FiberSaveSnapshot> snapshots,
-    bool showErrors)
-{
-    std::erase_if(snapshots, [](const auto& snapshot) { return snapshot.fiber.readOnly; });
-    if (snapshots.empty()) return {};
-    canonicalizeFiberSaveSnapshots(snapshots);
-    validateFiberSaveSnapshots(snapshots);
+    for (const auto* fiber : fibers)
+        if (std::none_of(snapshots.begin(), snapshots.end(), [&](const auto& saved) { return saved.fiber.uuid == fiber->uuid; }))
+            snapshots.push_back(makeFiberSaveSnapshot(*fiber));
     try {
         commitFiberStoreAction(snapshots);
-        for (const auto& snapshot : snapshots) {
-            for (auto& fiber : _fibers) if (fiber.uuid == snapshot.fiber.uuid) fiber = snapshot.fiber;
-            for (auto& pane : _panes) if (pane.session && pane.session->fiberUuid == snapshot.fiber.uuid) {
-                if (pane.session->watcher && pane.session->storePin != snapshot.fiber.storePin)
-                    pane.session->solveQueue.noteSessionMutated();
-                pane.session->storePin = snapshot.fiber.storePin;
-            }
-            emit fiberSaved(snapshot.fiberId, snapshot.generation);
-        }
+        for (auto* fiber : fibers) for (const auto& saved : snapshots)
+            if (fiber->uuid == saved.fiber.uuid) *fiber = saved.fiber;
+        applyCommittedFibers(snapshots);
     } catch (...) {
         ++_fiberSaveFailureCount;
         throw;
     }
-    return snapshots;
+}
+
+void LineAnnotationController::applyCommittedFibers(const std::vector<FiberSaveSnapshot>& snapshots)
+{
+    for (const auto& snapshot : snapshots)
+        for (auto& fiber : _fibers) if (fiber.uuid == snapshot.fiber.uuid) fiber = snapshot.fiber;
+    for (auto& pane : _panes) if (pane.session) {
+        auto& session = *pane.session;
+        const auto saved = std::find_if(_fibers.begin(), _fibers.end(), [&](const auto& fiber) { return fiber.uuid == session.fiberUuid; });
+        if (saved == _fibers.end()) continue;
+        if (session.watcher && session.storePin != saved->storePin) session.solveQueue.noteSessionMutated();
+        session.storePin = saved->storePin;
+        const auto ordering = storedIndexMapForSessionControls(session.controlPoints);
+        for (size_t i = 0; i < ordering.size(); ++i)
+            if (ordering[i] >= 0 && size_t(ordering[i]) < saved->controlPoints.size() &&
+                session.controlPoints[i].volumePoint == saved->controlPoints[ordering[i]])
+                session.controlPoints[i].storeId = saved->controlPoints[ordering[i]].storeId;
+    }
+    for (const auto& snapshot : snapshots) emit fiberSaved(snapshot.fiber.id, snapshot.fiber.generation);
 }
 
 void LineAnnotationController::waitForFiberSaves()
@@ -17476,7 +17182,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
                             fiber.readOnly = true;
                             fiber.editorError = error.what();
                         }
-                        cp.storeId = geometry.controlPointIds.empty() ? int64_t(i) : geometry.controlPointIds.at(i);
+                        cp.storeId = geometry.controlPointIds.at(i);
                         fiber.controlPoints.push_back(std::move(cp));
                     }
                     for (const auto& point : geometry.linePoints)
@@ -17498,7 +17204,7 @@ void LineAnnotationController::loadFibersForCurrentPackage()
                         const auto index = [](const StoredFiber& fiber, const Anchor& anchor) {
                             std::vector<int64_t> ids;
                             for (const auto& cp : fiber.controlPoints) ids.push_back(cp.storeId);
-                            return fiberBranchControlIndex(ids, fiber.controlPoints.size(), anchor);
+                            return fiberBranchControlIndex(ids, anchor);
                         };
                         const auto ai = index(a, edge.aAnchor), bi = index(b, edge.bAnchor);
                         const auto append = [&](StoredFiber& local, const StoredFiber& target, size_t i, size_t j,
@@ -17553,6 +17259,8 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
     if (!attachment) throw std::runtime_error("Attach an object store before editing fibers");
     // Working copies receive allocated IDs only after the database commits.
     auto edits = snapshots;
+    vc3d::line_annotation::canonicalizeFiberSaveSnapshots(edits);
+    vc3d::line_annotation::validateFiberSaveSnapshots(edits);
     RevisionSelection expected;
     auto expect = [&](const StoredFiber& fiber) {
         if (fiber.storePin && fiber.storePin->attachment != *attachment)
@@ -17611,13 +17319,12 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
             record.formatVersion = vc3d::line_annotation::kFiberFormatVersion;
             auto meta = Json::parse(record.meta);
             if (!current) for (const auto* key : {"coordinates", "coordinate_binding"})
-                if (snapshot.coordinateIdentity.contains(key)) meta[key] = snapshot.coordinateIdentity.at(key);
+                if (snapshot.fiber.coordinateIdentity.contains(key)) meta[key] = snapshot.fiber.coordinateIdentity.at(key);
             fiber.coordinateIdentity = Json::object();
             for (const auto* key : {"coordinates", "coordinate_binding"})
                 if (meta.contains(key)) fiber.coordinateIdentity[key] = meta.at(key);
             auto source = meta.value("source", Json::object());
-            auto incoming = fiberSaveSnapshotToJson(snapshot, true);
-            for (const auto* key : {"branches", "adjacent_branches", "coordinates", "coordinate_binding"}) incoming.erase(key);
+            auto incoming = fiberSourceMetadata(fiber);
             source.erase("control_points_attributes"); source.erase("line_points_attributes");
             source.update(incoming, true);
             source.erase("branches"); source.erase("adjacent_branches");
@@ -17653,9 +17360,6 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                 geometryHeads[fiber.uuid] = revision;
                 // Sequence annotations are immutable and live with geometry.
                 source.erase("control_points_attributes"); source.erase("line_points_attributes");
-                // Plain (pre-sequence) arrays still use source annotations.
-                for (const auto* name : {"control_points", "line_points"})
-                    source[std::string(name)+"_attributes"] = Json::parse(db.geometryPointAnnotations(txn, head->uuid, name));
                 meta["source"] = source; record.meta = meta.dump(); db.upsertObject(txn, record);
             }
         }
@@ -17671,9 +17375,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                     Anchor a;
                     const auto& cp = fiber.controlPoints.at(index);
                     a.position = {cp[0],cp[1],cp[2]}; a.direction = {direction[0],direction[1],direction[2]};
-                    const auto geometry = db.currentGeometry(txn, fiber.uuid);
-                    const bool hasIds = geometry && std::any_of(geometry->arrays.begin(),geometry->arrays.end(),[](const auto& array) { return array.name == "control_point_ids"; });
-                    a.points = {{hasIds ? "control_point_ids" : "control_points", {hasIds ? cp.storeId : int64_t(index)}}}; return a;
+                    a.points = {{"control_point_ids", {cp.storeId}}}; return a;
                 };
                 EdgeRecord edge; edge.uuid = branch.edgeUuid; edge.kind = "fiber_branch";
                 edge.aUuid = local.uuid; edge.bUuid = target.uuid;
@@ -17717,8 +17419,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         auto& fiber = snapshot.fiber;
         fiber.storePin = PinnedObject{*attachment, {attachment->storeUuid, fiber.uuid},
                                      *committed.at(fiber.uuid), geometryHeads.at(fiber.uuid)};
-        snapshot.coordinateIdentity = fiber.coordinateIdentity;
-        _fiberIdsByUuid[attachment->storeUuid + "/" + fiber.uuid] = fiber.id;
+            _fiberIdsByUuid[attachment->storeUuid + "/" + fiber.uuid] = fiber.id;
     }
     snapshots = std::move(edits);
     for (auto& fiber : _fibers) if (fiber.storePin && committed.contains(fiber.uuid) && committed.at(fiber.uuid))

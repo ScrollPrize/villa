@@ -204,11 +204,9 @@ inline nlohmann::json geometryManifest(const GeometryData& data, int64_t patchTi
     if (data.kind == "fiber") {
         require("control_points", "<f8", 2, true);
         require("line_points", "<f8", 2, true);
-        if (arrays.contains("control_point_ids")) {
-            require("control_point_ids", "<i8", 1, false);
-            if (arrays["control_point_ids"]["shape"][0] != arrays["control_points"]["shape"][0])
-                throw std::invalid_argument("geometry: control IDs and coordinates differ in length");
-        }
+        require("control_point_ids", "<i8", 1, false);
+        if (arrays["control_point_ids"]["shape"][0] != arrays["control_points"]["shape"][0])
+            throw std::invalid_argument("geometry: control IDs and coordinates differ in length");
     }
     if (data.kind == "track") require("points", "<i4", 2, true);
     if (data.kind == "point_collection") {

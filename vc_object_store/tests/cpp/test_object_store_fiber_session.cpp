@@ -98,7 +98,9 @@ int main() try
     session.act(attachment, {{source,{}}}, [&](auto& store, auto& txn) {
         const auto original = *store.objectByUuid(txn, a);
         ObjectRecord record; record.uuid = source; record.kind = "fiber";
-        record.name = original.name; record.meta = original.meta; record.fiber = original.fiber;
+        record.name = original.name; record.fiber = original.fiber;
+        record.meta = Json{{"source", {{"control_points_attributes", Json::parse(store.geometryPointAnnotations(
+            txn, store.currentGeometry(txn, a)->uuid, "control_points"))}}}}.dump();
         store.upsertObject(txn, record);
         store.putGeometry(txn, source, vc::geometry::encode(geometry));
     });

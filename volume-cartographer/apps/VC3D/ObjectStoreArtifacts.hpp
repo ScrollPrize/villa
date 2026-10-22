@@ -11,7 +11,8 @@
 namespace vc3d {
 // Immutable JSON transport artifacts. Ownership controls lifetime, attachment
 // identity prevents reuse across store switches, and content determines reuse.
-inline std::map<std::string, std::filesystem::path> materializeObjectDocuments(
+// File/directory formats such as tifxyz use the native geometry exporter.
+inline std::map<std::string, std::filesystem::path> materializeJsonDocuments(
     std::shared_ptr<QTemporaryDir>& temporary, const vc::objects::AttachmentIdentity& attachment,
     const std::map<std::string, std::string>& documents)
 {

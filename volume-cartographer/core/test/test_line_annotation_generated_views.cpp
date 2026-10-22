@@ -5619,9 +5619,9 @@ TEST_CASE("Generated markers map every position into the downsampled viewer")
         branch.localDirection = {1, 0, 0};
         branch.linkedDirection = {0, 1, 0};
         branch.linkedFiberId = 42;
-        scaleGeneratedMarkerForVolume(branch, scale);
+        scaleGeneratedMarkerForVolume(branch, scale, scale * 2);
         CHECK(branch.localControlPoint == cv::Vec3f(120, 240, 360) * scale);
-        CHECK(branch.linkedControlPoint == cv::Vec3f(160, 280, 400) * scale);
+        CHECK(branch.linkedControlPoint == cv::Vec3f(160, 280, 400) * (scale * 2));
         CHECK(branch.planePoint == branch.linkedControlPoint);
         CHECK(branch.localDirection == cv::Vec3f(1, 0, 0));
         CHECK(branch.linkedDirection == cv::Vec3f(0, 1, 0));

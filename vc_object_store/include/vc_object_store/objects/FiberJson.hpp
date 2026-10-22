@@ -4,7 +4,7 @@
 namespace vc::objects {
 // Native wire/file codec only. Identity, transactions, history and relationships
 // remain ObjectStore operations. Source annotations contain no coordinate arrays.
-size_t fiberBranchControlIndex(const std::vector<int64_t>& controlIds, size_t controlCount, const Anchor&);
+size_t fiberBranchControlIndex(const std::vector<int64_t>& controlIds, const Anchor&);
 
 struct FiberDocument {
     ObjectRecord object;

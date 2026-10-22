@@ -574,13 +574,7 @@ private:
         std::vector<int> storedIndexForSessionIndex;
     };
 
-    struct FiberSaveSnapshot {
-        uint64_t fiberId = 0;
-        uint64_t generation = 0;
-        std::filesystem::path path;
-        StoredFiber fiber;
-        nlohmann::json coordinateIdentity = nlohmann::json::object();
-    };
+    struct FiberSaveSnapshot { StoredFiber fiber; };
 
     using BranchLinkValidationIssue = vc3d::line_annotation::BranchLinkValidationIssue;
 
@@ -1149,23 +1143,16 @@ private:
     void scheduleSessionAutoSave(LineAnnotationSession& session);
     void flushSessionAutoSave(const std::string& surfaceName);
     void flushAllPendingSessionAutoSaves();
-    [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber) const;
-    void saveFiberNow(StoredFiber& fiber);
+    [[nodiscard]] static nlohmann::json fiberSourceMetadata(const StoredFiber& fiber);
     friend int runObjectStoreControllerTests();
     std::unordered_map<std::string, uint64_t> _fiberIdsByUuid;
     mutable std::shared_ptr<QTemporaryDir> _fiberTransportDirectory;
     void commitFiberStoreAction(std::vector<FiberSaveSnapshot>& snapshots,
                                const std::vector<StoredFiber>& retired = {});
-    void scheduleFiberSave(StoredFiber& fiber);
-    void scheduleFiberPairSave(StoredFiber& first, StoredFiber& second);
-    std::vector<FiberSaveSnapshot> scheduleFiberSaveSnapshots(std::vector<FiberSaveSnapshot> snapshots,
-                                    bool showErrors = true);
-    void canonicalizeFiberSaveSnapshots(std::vector<FiberSaveSnapshot>& snapshots) const;
-    void validateFiberSaveSnapshots(const std::vector<FiberSaveSnapshot>& snapshots) const;
+    void commitFibers(std::initializer_list<StoredFiber*> fibers);
+    void applyCommittedFibers(const std::vector<FiberSaveSnapshot>& snapshots);
     void waitForFiberSaves();
     [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber);
-    [[nodiscard]] static nlohmann::json fiberSaveSnapshotToJson(
-        const FiberSaveSnapshot& snapshot, bool annotationsOnly = false);
 
     [[nodiscard]] static std::vector<ControlSpanRecord> controlSpansForFiber(
         const StoredFiber& fiber);
@@ -1212,6 +1199,9 @@ private:
     // saveOpenFibersHeadless.
     [[nodiscard]] StoredFiber fiberInVolumeCoordinates(const StoredFiber& fiber) const;
     void refreshChangedStoreFibers();
+    void discardFiberPanes(const std::vector<uint64_t>& fiberIds);
+    std::vector<vc3d::line_annotation::GeneratedOverlay::BranchLinkMarker> generatedBranchLinkMarkers(
+        const std::vector<FiberBranchRef>& branches, double localScale) const;
     void saveOpenFibersCore();
     void cleanupIntersectionInspectionSurfaces();
     // Tears down the intersection-inspection workspace when one of its
@@ -1433,7 +1423,6 @@ private:
     };
     struct StructuralEditOutcome {
         bool ok = false;
-        bool recoveryRequired = false;
         // ok, but a notification after the commit threw: views may be stale.
         std::string warning;
         std::string error;

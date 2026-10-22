@@ -281,11 +281,11 @@ struct GeneratedSpanAlignmentMetric {
 // Positions cross from the stored fiber grid to the viewer grid together;
 // directions and line indices are independent of that uniform scale.
 inline void scaleGeneratedMarkerForVolume(GeneratedOverlay::BranchLinkMarker& marker,
-                                          double scale)
+                                          double localScale, double linkedScale)
 {
-    marker.localControlPoint *= static_cast<float>(scale);
-    marker.linkedControlPoint *= static_cast<float>(scale);
-    marker.planePoint *= static_cast<float>(scale);
+    marker.localControlPoint *= static_cast<float>(localScale);
+    marker.linkedControlPoint *= static_cast<float>(linkedScale);
+    marker.planePoint *= static_cast<float>(linkedScale);
 }
 
 inline void scaleGeneratedMarkerForVolume(GeneratedOverlay::PredSnapMarker& marker,

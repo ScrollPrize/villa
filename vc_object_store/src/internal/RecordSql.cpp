@@ -249,6 +249,13 @@ void restoreCommon(sqlite3* db, const char* table, const RecordCommon& rec)
         rec.approvedGeneration, parseUuid(rec.uuid));
 }
 
+void validateGeometrySourceMetadata(sqlite3* db, const std::string& uuid, const nlohmann::json& source)
+{
+    for (const auto* key : {"point_attributes", "control_points_attributes", "line_points_attributes", "points_attributes"})
+        if (source.contains(key) && geometryHead(db, uuid))
+            throw std::invalid_argument("point annotations belong to geometry; use sequence editing");
+}
+
 std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::string& host, const ObjectRecord& input,
                              bool preserveRecord, const char* importOperation)
 {
@@ -272,6 +279,7 @@ std::string upsertObjectImpl(sqlite3* db, const std::string& author, const std::
             meta["coordinates"] = geometryCoordinates(meta["coordinates"]);
         else if (!preserveRecord && !objectIdByUuid(db, uuid))
             meta["coordinates"] = geometryCoordinates(nlohmann::json::object());
+        validateGeometrySourceMetadata(db, rec.uuid, meta.value("source", nlohmann::json::object()));
         rec.meta = meta.dump();
     }
     const auto bounds = detail::recordBounds(rec);
