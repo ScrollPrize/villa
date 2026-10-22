@@ -459,7 +459,68 @@ NB_MODULE(fiber_trace, m)
         .def_rw("join_minimum_base",&ft::FiberChunkTraceConfig::joinMinimumBase)
         .def_rw("join_width_weight",&ft::FiberChunkTraceConfig::joinWidthWeight)
         .def_rw("pin_sampling_region",&ft::FiberChunkTraceConfig::pinSamplingRegion)
-        .def_rw("max_grid_samples",&ft::FiberChunkTraceConfig::maxGridSamples);
+        .def_rw("max_grid_samples",&ft::FiberChunkTraceConfig::maxGridSamples)
+        .def_rw("initial_alignment_power",&ft::FiberChunkTraceConfig::initialAlignmentPower)
+        .def_rw("initial_normal_radius_base",&ft::FiberChunkTraceConfig::initialNormalRadiusBase)
+        .def_rw("initial_tangential_radius_base",&ft::FiberChunkTraceConfig::initialTangentialRadiusBase)
+        .def_rw("joint_join_score",&ft::FiberChunkTraceConfig::jointJoinScore)
+        .def_rw("join_weights",&ft::FiberChunkTraceConfig::joinWeights)
+        .def_rw("conflict_normal_base",&ft::FiberChunkTraceConfig::conflictNormalBase)
+        .def_rw("conflict_tangent_base",&ft::FiberChunkTraceConfig::conflictTangentBase)
+        .def_rw("conflict_agreement_base",&ft::FiberChunkTraceConfig::conflictAgreementBase)
+        .def_rw("conflict_separation_base",&ft::FiberChunkTraceConfig::conflictSeparationBase)
+        .def_rw("cache_only",&ft::FiberChunkTraceConfig::cacheOnly)
+        .def_rw("refine_seed",&ft::FiberChunkTraceConfig::refineSeed)
+        .def_rw("seed_movement_base",&ft::FiberChunkTraceConfig::seedMovementBase)
+        .def_rw("gpu_library",&ft::FiberChunkTraceConfig::gpuLibrary)
+        .def_rw("gpu_devices",&ft::FiberChunkTraceConfig::gpuDevices)
+        .def_rw("online_refine_iterations",&ft::FiberChunkTraceConfig::onlineRefineIterations)
+        .def_rw("online_refine_window",&ft::FiberChunkTraceConfig::onlineRefineWindow)
+        .def_rw("online_refine_epsilon_base",&ft::FiberChunkTraceConfig::onlineRefineEpsilonBase)
+        .def_rw("online_refine_step_base",&ft::FiberChunkTraceConfig::onlineRefineStepBase)
+        .def_rw("online_refine_cap_base",&ft::FiberChunkTraceConfig::onlineRefineCapBase)
+        .def("to_json",[](const ft::FiberChunkTraceConfig& c){return ft::fiberChunkConfigJson(c).dump();})
+        .def_static("from_json",[](const std::string& j){return ft::fiberChunkConfigFromJson(nlohmann::json::parse(j));});
+    m.def("chunk_cache_specification",[](const ft::FiberChunkTraceConfig& c,const ft::FiberTraceConfig& t,double scale,const std::string& identity) {
+        return ft::fiberChunkCacheSpecification(c,t,scale,identity).dump();
+    },"chunk"_a,"trace"_a,"trace_to_base"_a,"source_identity"_a);
+    m.def("load_chunk_paths",[](const std::string& path) {
+        nb::gil_scoped_release release;
+        return ChunkPathsHandle{ft::loadFiberChunkPaths(path)};
+    },"path"_a);
+    m.def("build_chunk_paths",[](const PredictionFieldHandle& field,const NormalSamplerHandle& normals,
+                                 const ft::FiberTraceConfig& t,const ft::FiberChunkTraceConfig& c,
+                                 const std::array<int,3>& key,size_t workers) {
+        if(workers<1)throw std::invalid_argument("workers must be positive");
+        const auto trace=checkedConfig(field,t,&normals);
+        const auto config=c;
+        if(trace.parallelThreads!=1 || config.cacheOnly)
+            throw std::invalid_argument("uncached construction requires parallel_threads=1 and cache_only=false");
+        std::shared_ptr<ft::FiberChunkPaths> paths;
+        {nb::gil_scoped_release release;
+         ft::FiberCaseQueue queue(workers,1,[&]{
+             paths=ft::buildFiberChunkPaths(key,*field.field,trace,*normals.sampler,config,
+                 field.scales.traceToBaseScale,ft::FiberCaseQueue::parallelFor,
+                 [](const auto& ready){ft::FiberCaseQueue::await(ready);});
+         });queue.join();}
+        return ChunkPathsHandle{paths};
+    },"field"_a,"normals"_a,"trace"_a,"config"_a,"key_xyz"_a,"workers"_a=1);
+    m.def("filter_chunk_paths",[](const ChunkPathsHandle& paths,const ft::FiberChunkTraceConfig& c,
+                                 const NormalSamplerHandle& normals,double scale,size_t workers) {
+        if(workers<1)throw std::invalid_argument("workers must be positive");
+        auto copy=std::make_shared<ft::FiberChunkPaths>(*paths.paths);
+        const auto config=c;
+        std::string report;
+        {nb::gil_scoped_release release;
+         if(workers==1)report=ft::filterFiberChunkConflicts(*copy,config,*normals.sampler,scale).dump();
+         else {
+             ft::FiberCaseQueue queue(workers,1,[&]{
+                 report=ft::filterFiberChunkConflicts(*copy,config,*normals.sampler,scale,ft::FiberCaseQueue::parallelFor).dump();
+             });
+             queue.join();
+         }}
+        return nb::make_tuple(ChunkPathsHandle{copy},report);
+    },"paths"_a,"config"_a,"normals"_a,"trace_to_base"_a,"workers"_a=1);
     nb::class_<ft::FiberChunkReplayConfig>(m,"ChunkReplayConfig")
         .def(nb::init<>())
         .def_rw("error_threshold_base",&ft::FiberChunkReplayConfig::errorThresholdBase)
@@ -472,6 +533,7 @@ NB_MODULE(fiber_trace, m)
         .def_prop_ro("hi_base",[](const ChunkPathsHandle& s){return fromVec(s.paths->hi);})
         .def_prop_ro("maxima",[](const ChunkPathsHandle& s){return s.paths->maxima;})
         .def_prop_ro("seeds",[](const ChunkPathsHandle& s){return s.paths->seeds;})
+        .def_prop_ro("timings_json",[](const ChunkPathsHandle& s){return s.paths->timings.dump();})
         .def_prop_ro("end_reasons",[](const ChunkPathsHandle& s){return s.paths->endReasons;})
         .def_prop_ro("lines_base",[](const ChunkPathsHandle& s){
             nb::list lines;for(const auto& line:s.paths->lines) lines.append(pointsArray(line));return lines;

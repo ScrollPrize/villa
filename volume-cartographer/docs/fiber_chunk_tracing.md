@@ -1,9 +1,11 @@
-# CPU chunk-based fiber tracing
+# Chunk-based fiber tracing
 
 `vc/fiber_tracer/FiberChunkTrace.hpp` provides reusable native primitives for
 building, caching and matching overlapping local fiber paths. It builds on the
 existing beam tracer and explicit prediction-region pinning, not a separate
-tracing implementation. This API does not launch inference or allocate GPUs.
+tracing implementation. It does not launch inference or acquire GPU-manager
+grants. CPU construction remains the default; the optional CUDA plugin uses
+only the devices already granted to its caller. See [recovery notes](trace_recovery.md).
 
 ## Coordinates and construction
 
@@ -82,8 +84,9 @@ are retained, and the reference is never used to guide route continuations.
 Tracing normals and evaluation normals have separate explicit coordinate
 scales. Progress callbacks report route steps with shared replay context.
 
-Full-volume/live-inference orchestration and experimental refinement/conflict
-filters are not part of this layer.
+Full-volume/live-inference orchestration remains separate. Optional native
+seed refinement, CUDA online fixed-plane refinement and load-time conflict
+filtering are described in [recovery notes](trace_recovery.md).
 
 ## Python
 
