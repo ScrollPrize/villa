@@ -27,6 +27,17 @@ public:
     QWidget* takeBarWidget();
     void addDock(QDockWidget* dock);
 
+    // A dock added here is an empty, hidden QDockWidget; its content sits on
+    // a page of the panel that opens above its bar button. panelPage() is
+    // that page (nullptr when the dock is not here or is detached).
+    // expandedDock() is the dock whose panel is open. expandDock() opens a
+    // dock's panel as its bar button does (false when the dock is detached
+    // or closed from the bar); collapsePanel() closes the open panel.
+    QWidget* panelPage(const QDockWidget* dock) const;
+    QDockWidget* expandedDock() const;
+    bool expandDock(QDockWidget* dock);
+    void collapsePanel();
+
 protected:
     bool eventFilter(QObject* watched, QEvent* event) override;
 

@@ -1,4 +1,5 @@
 #include "ToolDialogs.hpp"
+#include "MergeTifxyzInputs.hpp"
 
 #include "VCSettings.hpp"
 #include "elements/JsonProfileEditor.hpp"
@@ -1948,32 +1949,6 @@ QPair<int, int> defaultGridShape(int n)
     return {std::max(1, rows), std::max(1, cols)};
 }
 
-QString alphaFirst(const QStringList& names)
-{
-    QString out;
-    for (const auto& n : names) {
-        if (n.isEmpty()) continue;
-        if (out.isEmpty() || n < out) out = n;
-    }
-    return out;
-}
-
-QString resolveOutputName(const QString& volpkgDir, const QString& base)
-{
-    if (volpkgDir.isEmpty() || base.isEmpty()) return base;
-    namespace fs = std::filesystem;
-    const fs::path paths = fs::path(volpkgDir.toStdString()) / "paths";
-    auto exists = [&](const std::string& name) {
-        return fs::exists(paths / name);
-    };
-    if (!exists(base.toStdString())) return base;
-    for (int v = 2; v < 1000; ++v) {
-        QString candidate = base + QStringLiteral("_v%1").arg(v);
-        if (!exists(candidate.toStdString())) return candidate;
-    }
-    return base + QStringLiteral("_v?");
-}
-
 }
 
 MergeTifxyzDialog::MergeTifxyzDialog(QWidget* parent,
@@ -2291,91 +2266,35 @@ QStringList MergeTifxyzDialog::collectGridNames() const
     return out;
 }
 
+vc3d::merge_tifxyz::Grid MergeTifxyzDialog::collectGridRows() const
+{
+    vc3d::merge_tifxyz::Grid rows;
+    for (int r = 0; r < tblGrid_->rowCount(); ++r) {
+        QStringList row;
+        for (int c = 0; c < tblGrid_->columnCount(); ++c) {
+            auto* it = tblGrid_->item(r, c);
+            row << (it ? it->text().trimmed() : QString());
+        }
+        rows << row;
+    }
+    return rows;
+}
+
 QString MergeTifxyzDialog::buildMergeJsonText() const
 {
-    const int rows = tblGrid_->rowCount();
-    const int cols = tblGrid_->columnCount();
-
-    // Whitespace-delimited string rows can't represent interior empty
-    // cells -- the parser splits the row on whitespace and looks each
-    // token up as a directory under <paths_dir>, so a literal "" token
-    // would be searched for as the directory `""` and the run would
-    // fail. Switch to JSON array rows (with `null` for empty cells)
-    // whenever the grid has any blank, which is the form gmResolveGrid
-    // already handles. Solid grids keep the more compact string form.
-    bool hasEmpty = false;
-    for (int r = 0; r < rows && !hasEmpty; ++r) {
-        for (int c = 0; c < cols; ++c) {
-            auto* it = tblGrid_->item(r, c);
-            if (!it || it->text().trimmed().isEmpty()) {
-                hasEmpty = true;
-                break;
-            }
-        }
-    }
-
-    QString out;
-    out += QStringLiteral("{\n  \"rows\": [\n");
-
-    if (hasEmpty) {
-        for (int r = 0; r < rows; ++r) {
-            QStringList cells;
-            cells.reserve(cols);
-            for (int c = 0; c < cols; ++c) {
-                auto* it = tblGrid_->item(r, c);
-                const QString name = it ? it->text().trimmed() : QString();
-                if (name.isEmpty()) {
-                    cells << QStringLiteral("null");
-                } else {
-                    cells << QStringLiteral("\"") + name + QLatin1Char('"');
-                }
-            }
-            out += QStringLiteral("    [")
-                 + cells.join(QStringLiteral(", "))
-                 + QLatin1Char(']');
-            if (r + 1 < rows) out += QLatin1Char(',');
-            out += QLatin1Char('\n');
-        }
-    } else {
-        // Pad each cell so visual columns line up in the preview.
-        QVector<int> widths(cols, 0);
-        for (int r = 0; r < rows; ++r) {
-            for (int c = 0; c < cols; ++c) {
-                auto* it = tblGrid_->item(r, c);
-                int w = it ? static_cast<int>(it->text().trimmed().size()) : 0;
-                if (w > widths[c]) widths[c] = w;
-            }
-        }
-        for (int r = 0; r < rows; ++r) {
-            QStringList tokens;
-            tokens.reserve(cols);
-            for (int c = 0; c < cols; ++c) {
-                auto* it = tblGrid_->item(r, c);
-                const QString name = it ? it->text().trimmed() : QString();
-                tokens << name.leftJustified(std::max(widths[c], 1), ' ');
-            }
-            out += QStringLiteral("    \"")
-                 + tokens.join(' ').trimmed()
-                 + QLatin1Char('"');
-            if (r + 1 < rows) out += QLatin1Char(',');
-            out += QLatin1Char('\n');
-        }
-    }
-
-    out += QStringLiteral("  ]\n}\n");
-    return out;
+    return vc3d::merge_tifxyz::gridJsonText(collectGridRows());
 }
 
 void MergeTifxyzDialog::rebuildPreview()
 {
     lblPreview_->setText(buildMergeJsonText());
     QStringList names = collectGridNames();
-    QString af = alphaFirst(names);
+    QString af = vc3d::merge_tifxyz::alphaFirst(names);
     if (af.isEmpty()) {
         lblOutName_->setText(tr("(grid is empty)"));
     } else {
         const QString base = af + QStringLiteral("_merged");
-        const QString name = resolveOutputName(_volpkgDir, base);
+        const QString name = vc3d::merge_tifxyz::resolveOutputName(_volpkgDir, base);
         lblOutName_->setText(QStringLiteral("%1/paths/%2/")
             .arg(_volpkgDir, name));
     }
@@ -2417,79 +2336,22 @@ int     MergeTifxyzDialog::ompThreads() const {
 
 void MergeTifxyzDialog::accept()
 {
-    // --- validate grid -----------------------------------------------------
-    QStringList names = collectGridNames();
-    QStringList unique;
-    int nonEmpty = 0;
-    for (const auto& n : names) {
-        if (n.isEmpty()) continue;
-        ++nonEmpty;
-        if (!unique.contains(n)) unique << n;
-    }
-    if (unique.size() < 2) {
-        QMessageBox::warning(this, tr("Merge TIFXYZ"),
-            tr("Merge requires at least 2 distinct surfaces in the grid; "
-               "currently %1.").arg(unique.size()));
+    const vc3d::merge_tifxyz::Grid rows = collectGridRows();
+    const QString invalid = vc3d::merge_tifxyz::validate(
+        rows, _availableSegments, _pathsDir, refSurface(),
+        spMin_->value(), spMax_->value());
+    if (!invalid.isEmpty()) {
+        QMessageBox::warning(this, tr("Merge TIFXYZ"), invalid);
         return;
     }
-    QSet<QString> avail(_availableSegments.begin(), _availableSegments.end());
-    QStringList missing;
-    for (const auto& n : unique) {
-        if (!avail.contains(n)) missing << n;
-    }
-    if (!missing.isEmpty()) {
-        QMessageBox::warning(this, tr("Merge TIFXYZ"),
-            tr("These names are not present under %1:\n  %2")
-                .arg(_pathsDir, missing.join(QLatin1String(", "))));
-        return;
-    }
-    for (const auto& n : unique) {
-        if (n.contains(QRegularExpression("\\s"))) {
-            QMessageBox::warning(this, tr("Merge TIFXYZ"),
-                tr("Surface name '%1' contains whitespace; the merge.json "
-                   "format does not support that. Rename the surface first.")
-                    .arg(n));
-            return;
-        }
-    }
-    if (spMin_->value() >= spMax_->value()) {
-        QMessageBox::warning(this, tr("Merge TIFXYZ"),
-            tr("RANSAC min threshold must be strictly less than max."));
-        return;
-    }
-    const QString ref = refSurface();
-    if (!ref.isEmpty() && !unique.contains(ref)) {
-        QMessageBox::warning(this, tr("Merge TIFXYZ"),
-            tr("Reference '%1' is not in the grid.").arg(ref));
-        return;
-    }
-    (void)nonEmpty;
 
-    // --- write merge.json --------------------------------------------------
-    if (_volpkgDir.isEmpty()) {
-        QMessageBox::critical(this, tr("Merge TIFXYZ"),
-            tr("No volpkg directory available; cannot write merge.json."));
+    QString error;
+    const QString mergeJsonPath = vc3d::merge_tifxyz::writeMergeJson(_volpkgDir, rows, &error);
+    if (mergeJsonPath.isEmpty()) {
+        QMessageBox::critical(this, tr("Merge TIFXYZ"), error);
         return;
     }
-    namespace fs = std::filesystem;
-    const fs::path af   = fs::path(alphaFirst(names).toStdString());
-    const QString stem  = QString::fromStdString(af.string()) + QStringLiteral("_merged");
-    const QString outName = resolveOutputName(_volpkgDir, stem);
-    const fs::path mj   = fs::path(_volpkgDir.toStdString()) /
-                          (outName.toStdString() + ".merge.json");
-    try {
-        std::ofstream f(mj);
-        if (!f) throw std::runtime_error("ofstream failed to open " + mj.string());
-        const QString text = buildMergeJsonText();
-        const std::string s = text.toStdString();
-        f.write(s.data(), static_cast<std::streamsize>(s.size()));
-        if (!f) throw std::runtime_error("ofstream write failed for " + mj.string());
-    } catch (const std::exception& e) {
-        QMessageBox::critical(this, tr("Merge TIFXYZ"),
-            tr("Failed to write merge.json: %1").arg(QString::fromUtf8(e.what())));
-        return;
-    }
-    _mergeJsonPath = QString::fromStdString(mj.string());
+    _mergeJsonPath = mergeJsonPath;
 
     updateSessionFromUI();
     QDialog::accept();

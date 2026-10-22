@@ -27,6 +27,9 @@ public:
 
     // Getters
     [[nodiscard]] std::vector<SegmentationDirectionFieldConfig> directionFieldConfigs() const;
+    // Replaces the list, as adding and removing entries in the panel would,
+    // and saves it. Invalid entries (no path) are dropped.
+    void setDirectionFieldConfigs(const std::vector<SegmentationDirectionFieldConfig>& configs);
 
     // Group accessor (for expand/collapse state persistence by coordinator)
     CollapsibleSettingsGroup* directionFieldGroup() const { return _groupDirectionField; }

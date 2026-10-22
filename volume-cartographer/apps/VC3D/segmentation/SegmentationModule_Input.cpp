@@ -89,10 +89,7 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
     if (_manualAddMode) {
         if (!event->isAutoRepeat()) {
             const bool undoRequested =
-                event->matches(vc3d::keybinds::standard::Undo) ||
-                (event->key() == vc3d::keybinds::keypress::SegmentationUndo.key &&
-                 (event->modifiers() & vc3d::keybinds::keypress::SegmentationUndo.modifiers) ==
-                     vc3d::keybinds::keypress::SegmentationUndo.modifiers);
+                vc3d::keybinds::historyRequestFor(*event) == vc3d::keybinds::HistoryRequest::Undo;
             if (undoRequested) {
                 if (undoManualAddPlaneConstraint()) {
                     event->accept();
@@ -185,14 +182,10 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
     }
 
     if (!event->isAutoRepeat()) {
-        const bool undoRequested =
-            event->matches(vc3d::keybinds::standard::Undo) ||
-            (event->key() == vc3d::keybinds::keypress::SegmentationUndo.key &&
-             (event->modifiers() & vc3d::keybinds::keypress::SegmentationUndo.modifiers) ==
-                 vc3d::keybinds::keypress::SegmentationUndo.modifiers);
-        if (undoRequested) {
-            if (restoreUndoSnapshot()) {
-                emit statusMessageRequested(tr("Undid last segmentation change."), kStatusShort);
+        const auto historyRequest = vc3d::keybinds::historyRequestFor(*event);
+        if (historyRequest != vc3d::keybinds::HistoryRequest::None) {
+            const bool stepped = historyRequest == vc3d::keybinds::HistoryRequest::Redo ? redo() : undo();
+            if (stepped) {
                 event->accept();
                 return true;
             }

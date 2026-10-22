@@ -9,6 +9,7 @@
 #include <chrono>
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <map>
 #include <memory>
@@ -131,7 +132,8 @@ public:
     // If useRectangle is false, paints a circle using radiusSteps
     // If isAutoApproval is true, marks this as auto-approval from surface edit (for separate undo)
     // brushColor specifies the RGB color to paint (only used when paintValue > 0)
-    void paintApprovalMaskDirect(const std::vector<std::pair<int, int>>& gridPositions,
+    // Returns the id of the undo entry recorded for this paint, or 0 if nothing was painted
+    std::uint64_t paintApprovalMaskDirect(const std::vector<std::pair<int, int>>& gridPositions,
                                   float radiusSteps,
                                   uint8_t paintValue,
                                   const QColor& brushColor,
@@ -155,12 +157,12 @@ public:
     // Undo support for approval mask painting
     // Undo the last paint stroke (repaints with inverse value)
     bool undoLastApprovalMaskPaint();
-    // Undo the last auto-approval entry (from surface edits) - does not undo manual brush strokes
-    bool undoLastAutoApproval();
+    // Undo the auto-approval recorded under id (returned by paintApprovalMaskDirect for a
+    // surface edit), keeping what it replaced so redoAutoApproval(id) can paint it again
+    bool undoAutoApproval(std::uint64_t id);
+    bool redoAutoApproval(std::uint64_t id);
     // Check if there are any undo operations available
     [[nodiscard]] bool canUndoApprovalMaskPaint() const;
-    // Check if there are any auto-approval undo operations available
-    [[nodiscard]] bool canUndoAutoApproval() const;
     // Clear all undo history (e.g., when applying changes to disk)
     void clearApprovalMaskUndoHistory();
 
@@ -259,10 +261,19 @@ private:
         QImage savedRegion;    // Copy of the saved image region before painting (for unapprovals)
         QPoint topLeft;        // Position of the saved region in the full image
         bool isAutoApproval{false};  // True if this was auto-approval from surface edit
+        std::uint64_t id{0};   // Links an auto-approval to its segmentation undo entry
     };
     std::deque<ApprovalMaskUndoEntry> _approvalMaskUndoStack;
-    // Match segmentation undo history size to keep auto-approval undo in sync.
-    static constexpr size_t kMaxUndoEntries = 10;
+    // Auto-approvals undone with their segmentation edit, for redo. Cleared by any new paint.
+    std::deque<ApprovalMaskUndoEntry> _autoApprovalRedoStack;
+    std::uint64_t _nextApprovalUndoId{1};
+
+    ApprovalMaskUndoEntry copyApprovalRegion(QPoint topLeft, QSize size) const;
+    void restoreApprovalRegion(const ApprovalMaskUndoEntry& entry);
+    bool swapApprovalRegion(std::deque<ApprovalMaskUndoEntry>& from,
+                            std::deque<ApprovalMaskUndoEntry>& to,
+                            std::uint64_t id);
+    static void trimApprovalUndoStack(std::deque<ApprovalMaskUndoEntry>& stack);
 
     // Surface holding pending (composed-but-unsaved) approval edits, for the
     // boundary flush before a segment switch / close.

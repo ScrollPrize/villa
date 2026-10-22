@@ -1,5 +1,6 @@
 #include "agent_bridge/AgentBridgeServer.hpp"
 #include "agent_bridge/AgentBridgeInternal.hpp"
+#include "agent_bridge/AgentBridgeUi.hpp"
 
 #include <QBuffer>
 #include <QByteArray>
@@ -398,21 +399,25 @@ QJsonObject AgentBridgeServer::handleLasagnaRepeatLast(const QJsonValue&)
 QJsonObject AgentBridgeServer::handleWorkspaceSwitch(const QJsonValue& params)
 {
     const QJsonObject p = params.toObject();
-    const QString name = p.value("name").toString();
+    const QString id = canonicalWorkspaceId(p.value("name").toString());
 
     CState* state = _window ? _window->_state : nullptr;
     if (!state || !state->hasVpkg())
         throw AgentBridgeError{-32000, "No volume package loaded", {}};
 
-    if (name == QLatin1String("main")) {
-        _window->switchToMainWorkspace();
-    } else if (name == QLatin1String("lasagna")) {
-        _window->switchToLasagnaWorkspace();
-    } else {
-        _window->switchToFiberSliceWorkspace();
+    if (!workspacePage(id)) {
+        QJsonObject data;
+        data["kind"] = "workspace";
+        data["id"] = id;
+        throw AgentBridgeError{-32007, "Workspace not available", data};
     }
 
+    const QString previous = currentWorkspaceId();
+    setCurrentWorkspace(id);
+
     QJsonObject result;
-    result["workspace"] = name;
+    result["workspace"] = id;
+    result["previous"] = previous.isEmpty() ? QJsonValue(QJsonValue::Null)
+                                            : QJsonValue(previous);
     return result;
 }

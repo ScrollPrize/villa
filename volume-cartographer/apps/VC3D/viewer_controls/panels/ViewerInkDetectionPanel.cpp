@@ -65,7 +65,9 @@ ViewerInkDetectionPanel::ViewerInkDetectionPanel(ViewerManager* viewerManager, Q
         connect(overlay, &InkDetectionOverlayController::availableDetectionsChanged,
                 this, &ViewerInkDetectionPanel::populateDetections);
         connect(overlay, &InkDetectionOverlayController::selectionChanged,
-                this, &ViewerInkDetectionPanel::updateControlState);
+                this, &ViewerInkDetectionPanel::syncSelection);
+        connect(overlay, &InkDetectionOverlayController::colormapChanged,
+                this, &ViewerInkDetectionPanel::syncColormap);
         connect(overlay, &InkDetectionOverlayController::opacityChanged, this, [this](int opacity) {
             if (_opacitySlider) {
                 const QSignalBlocker blocker(_opacitySlider);
@@ -166,6 +168,34 @@ void ViewerInkDetectionPanel::populateDetections()
     }
     _detectionCombo->setCurrentIndex(selectedIndex);
     updateControlState();
+}
+
+void ViewerInkDetectionPanel::syncSelection()
+{
+    // Selections made outside the combo (another caller of the controller)
+    // move the combo too.
+    auto* overlay = _viewerManager ? _viewerManager->inkDetectionOverlay() : nullptr;
+    if (overlay && _detectionCombo) {
+        const int index = _detectionCombo->findData(
+            QString::fromStdString(overlay->selectedPath().string()));
+        if (index >= 0 && index != _detectionCombo->currentIndex()) {
+            const QSignalBlocker blocker(_detectionCombo);
+            _detectionCombo->setCurrentIndex(index);
+        }
+    }
+    updateControlState();
+}
+
+void ViewerInkDetectionPanel::syncColormap(const QString& colormapId)
+{
+    if (!_colormapCombo) {
+        return;
+    }
+    const int index = _colormapCombo->findData(colormapId);
+    if (index >= 0 && index != _colormapCombo->currentIndex()) {
+        const QSignalBlocker blocker(_colormapCombo);
+        _colormapCombo->setCurrentIndex(index);
+    }
 }
 
 void ViewerInkDetectionPanel::populateColormaps()

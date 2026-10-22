@@ -3,6 +3,8 @@
 #include <QKeySequence>
 #include <QString>
 
+class QKeyEvent;
+
 namespace vc3d::keybinds {
 
 enum class ShortcutKind {
@@ -60,6 +62,7 @@ extern const KeyPressDef ApprovalPaintToggle;
 extern const KeyPressDef UnapprovalPaintToggle;
 extern const KeyPressDef ApprovalUndo;
 extern const KeyPressDef SegmentationUndo;
+extern const KeyPressDef SegmentationRedo;
 extern const KeyPressDef ManualAddToggle;
 extern const KeyPressDef LineDrawHold;
 extern const KeyPressDef GrowSegmentation;
@@ -94,11 +97,22 @@ extern const KeyPressDef PageUp;
 
 namespace standard {
 constexpr QKeySequence::StandardKey Undo = QKeySequence::Undo;
+constexpr QKeySequence::StandardKey Redo = QKeySequence::Redo;
 constexpr QKeySequence::StandardKey Open = QKeySequence::Open;
 } // namespace standard
 
 QKeySequence sequenceFor(const ShortcutDef& def);
 QKeySequence sequenceFor(const KeyPressDef& def);
+
+enum class HistoryRequest {
+    None,
+    Undo,
+    Redo
+};
+
+// Classifies a key press as undo, redo or neither. Redo is tested first: the
+// undo test also accepts extra modifiers, so it would take Ctrl+Shift+Z.
+HistoryRequest historyRequestFor(const QKeyEvent& event);
 
 QString buildKeybindsHelpText();
 

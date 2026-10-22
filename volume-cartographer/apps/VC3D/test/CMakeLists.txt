@@ -72,6 +72,29 @@ vc_register_ctest(intersection_layer_item test_intersection_layer_item)
 set_tests_properties(intersection_layer_item PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
+add_executable(test_status_message_history
+    test_status_message_history.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/StatusMessageHistory.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/StatusMessageHistory.hpp)
+
+set_target_properties(test_status_message_history PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_status_message_history PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_status_message_history PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Test
+    Qt6::Widgets)
+
+add_test(NAME status_message_history COMMAND test_status_message_history)
+vc_register_test_target(test_status_message_history)
+vc_register_ctest(status_message_history test_status_message_history)
+set_tests_properties(status_message_history PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 add_executable(test_spiral_input_draft test_spiral_input_draft.cpp)
 set_target_properties(test_spiral_input_draft PROPERTIES
     AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
@@ -160,6 +183,62 @@ add_test(NAME unified_browser_dialog COMMAND test_unified_browser_dialog)
 vc_register_test_target(test_unified_browser_dialog)
 vc_register_ctest(unified_browser_dialog test_unified_browser_dialog)
 set_tests_properties(unified_browser_dialog PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+# The VCCollection shim is not built into a library; compile it and its MOC here.
+qt6_wrap_cpp(session_recovery_vccollection_moc
+    ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+
+add_executable(test_session_recovery
+    test_session_recovery.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionRecovery.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionRecovery.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionRecoveryDialog.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SessionRecoveryDialog.hpp
+    ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
+    ${session_recovery_vccollection_moc})
+
+set_target_properties(test_session_recovery PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_session_recovery PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_session_recovery PRIVATE
+    vc_core
+    Qt6::Concurrent
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Test
+    Qt6::Widgets)
+
+add_test(NAME session_recovery COMMAND test_session_recovery)
+vc_register_test_target(test_session_recovery)
+vc_register_ctest(session_recovery test_session_recovery)
+set_tests_properties(session_recovery PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 60)
+
+add_executable(test_status_dock_panel_host
+    test_status_dock_panel_host.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/StatusDockPanelHost.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/StatusDockPanelHost.hpp)
+
+set_target_properties(test_status_dock_panel_host PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_status_dock_panel_host PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_status_dock_panel_host PRIVATE
+    vc_core
+    Qt6::Core
+    Qt6::Test
+    Qt6::Widgets)
+
+add_test(NAME status_dock_panel_host COMMAND test_status_dock_panel_host)
+vc_register_test_target(test_status_dock_panel_host)
+vc_register_ctest(status_dock_panel_host test_status_dock_panel_host)
+set_tests_properties(status_dock_panel_host PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 add_executable(test_spiral_reload_comparison
@@ -258,6 +337,30 @@ add_test(NAME spiral_point_collection_edit COMMAND test_spiral_point_collection_
 vc_register_test_target(test_spiral_point_collection_edit)
 vc_register_ctest(spiral_point_collection_edit test_spiral_point_collection_edit)
 set_tests_properties(spiral_point_collection_edit PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_executable(test_segmentation_undo_history
+    test_segmentation_undo_history.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/segmentation/SegmentationUndoHistory.hpp)
+
+set_target_properties(test_segmentation_undo_history PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+
+target_include_directories(test_segmentation_undo_history PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+
+target_link_libraries(test_segmentation_undo_history PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Test
+    opencv_core)
+
+add_test(NAME segmentation_undo_history COMMAND test_segmentation_undo_history)
+vc_register_test_target(test_segmentation_undo_history)
+vc_register_ctest(segmentation_undo_history test_segmentation_undo_history)
+set_tests_properties(segmentation_undo_history PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 
 add_executable(test_spiral_preview_provenance
@@ -714,3 +817,33 @@ add_test(NAME spiral_brush_patch COMMAND test_spiral_brush_patch)
 vc_register_test_target(test_spiral_brush_patch)
 vc_register_ctest(spiral_brush_patch test_spiral_brush_patch)
 set_tests_properties(spiral_brush_patch PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_executable(test_merge_tifxyz_inputs
+    test_merge_tifxyz_inputs.cpp
+    ../MergeTifxyzInputs.cpp ../MergeTifxyzInputs.hpp)
+set_target_properties(test_merge_tifxyz_inputs PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_merge_tifxyz_inputs PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_merge_tifxyz_inputs PRIVATE Qt6::Core Qt6::Test)
+add_test(NAME merge_tifxyz_inputs COMMAND test_merge_tifxyz_inputs)
+vc_register_test_target(test_merge_tifxyz_inputs)
+vc_register_ctest(merge_tifxyz_inputs test_merge_tifxyz_inputs)
+
+add_executable(test_segment_files
+    test_segment_files.cpp
+    ../SegmentFiles.cpp ../SegmentFiles.hpp)
+set_target_properties(test_segment_files PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_segment_files PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_segment_files PRIVATE Qt6::Core Qt6::Test utils)
+add_test(NAME segment_files COMMAND test_segment_files)
+vc_register_test_target(test_segment_files)
+vc_register_ctest(segment_files test_segment_files)
+
+add_executable(test_project_locations
+    test_project_locations.cpp
+    ../ProjectLocations.cpp ../ProjectLocations.hpp)
+set_target_properties(test_project_locations PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_project_locations PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_project_locations PRIVATE Qt6::Core Qt6::Test vc_core)
+add_test(NAME project_locations COMMAND test_project_locations)
+vc_register_test_target(test_project_locations)
+vc_register_ctest(project_locations test_project_locations)

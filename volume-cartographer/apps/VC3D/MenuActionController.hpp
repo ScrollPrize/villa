@@ -92,6 +92,10 @@ public:
     // True while any sample open is in flight.
     bool openDataSampleOpenInFlight() const;
 
+public slots:
+    // Enables Edit > Undo and Edit > Redo; wired to the segmentation history.
+    void setUndoRedoAvailable(bool canUndo, bool canRedo);
+
 private slots:
     void newProject();
     void saveProjectAs();
@@ -133,6 +137,8 @@ signals:
     void mergePatchFromMenuRequested();
     void growTrackPatchesFromMenuRequested();
     void openDataCatalogVisibilityChanged(bool visible);
+    void undoRequested();
+    void redoRequested();
 
 private:
     QStringList loadRecentPaths() const;
@@ -146,7 +152,6 @@ private:
     void attachRemoteZarrUrl(const QString& url);
     void beginLasagnaManifestAttachment(bool remote, const QString& initialUrl = {}, bool fiber = false);
     void attachCatalogLasagna(const QString& artifactUrl, bool fiber);
-    struct LasagnaAttachTaskResult;
     bool openOpenDataSample(const vc3d::opendata::OpenDataSample& sample,
                             bool interactive = true,
                             const vc3d::opendata::OpenDataResourceSelection* selection = nullptr,
@@ -227,6 +232,8 @@ private:
     QAction* _growTrackPatchesAct{nullptr};
     QAction* _materializeOpenDataFolderAct{nullptr};
     QAction* _recalculateFiberScoresAct{nullptr};
+    QAction* _undoAct{nullptr};
+    QAction* _redoAct{nullptr};
 
     QPointer<QDialog> _keybindsDialog;
     QPointer<vc3d::opendata::OpenDataCatalogWindow> _openDataCatalogDialog;
@@ -235,5 +242,4 @@ private:
     std::shared_ptr<std::atomic<bool>> _openDataPrefillCancelFlag;
     // True from launch until the finished slot runs; prevents overlapping opens.
     bool _openDataSampleOpenInFlight{false};
-    bool _lasagnaAttachmentInFlight{false};
 };

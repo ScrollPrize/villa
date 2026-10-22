@@ -773,6 +773,19 @@
             </property>
            </widget>
           </item>
+          <item row="7" column="2">
+           <widget class="QCheckBox" name="chkSessionRecovery">
+            <property name="text">
+             <string>Keep a crash recovery copy of points</string>
+            </property>
+            <property name="toolTip">
+             <string>Keep a copy of the point collections, the open project and the segment next to VC3D.ini, and offer to restore them after a crash. Takes effect at the next start.</string>
+            </property>
+            <property name="checked">
+             <bool>true</bool>
+            </property>
+           </widget>
+          </item>
           <item row="8" column="0">
            <widget class="QLabel" name="labelViewerSurfaceCache">
             <property name="text">

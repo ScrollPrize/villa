@@ -191,6 +191,20 @@ class ToolLayerTest(unittest.IsolatedAsyncioTestCase):
             self.fake_server.received_requests[-1]["params"]["maxDim"], 1024
         )
 
+    async def test_vc3d_screenshot_dock_region_reveal_reach_the_wire(self) -> None:
+        region = {"x": 0, "y": 10, "width": 200, "height": 100}
+        await vc3d_screenshot(target="dock:dockWidgetSegmentation", region=region, reveal=True)
+        params = self.fake_server.received_requests[-1]["params"]
+        self.assertEqual(params["target"], "dock:dockWidgetSegmentation")
+        self.assertEqual(params["region"], region)
+        self.assertIs(params["reveal"], True)
+
+    async def test_vc3d_screenshot_defaults_omit_region_and_do_not_reveal(self) -> None:
+        await vc3d_screenshot(target="workspace:spiral")
+        params = self.fake_server.received_requests[-1]["params"]
+        self.assertNotIn("region", params)
+        self.assertIs(params["reveal"], False)
+
     async def test_vc3d_screenshot_missing_base64_falls_back_to_dict(self) -> None:
         # Bridge returns no image bytes for an inline capture -> fall back to
         # the raw dict rather than crashing on decode.

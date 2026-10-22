@@ -81,6 +81,27 @@ TEST_CASE("resolveLocalPath: absolute, relative+base, file:// prefix")
     CHECK(bare == fs::path("rel/path"));
 }
 
+TEST_CASE("sameLocation: relative, normalized and linked spellings")
+{
+    auto root = tmpDir("same_location");
+    fs::create_directories(root / "grids" / "g1");
+    const auto absolute = (root / "grids" / "g1").string();
+
+    CHECK(vc::project::sameLocation(absolute, "grids/g1", root));
+    CHECK(vc::project::sameLocation(absolute, absolute + "/", root));
+    CHECK(vc::project::sameLocation(absolute, (root / "grids" / "x" / ".." / "g1").string(), root));
+    CHECK_FALSE(vc::project::sameLocation(absolute, "grids/g2", root));
+    CHECK_FALSE(vc::project::sameLocation(absolute, "s3://bucket/grids/g1", root));
+    CHECK(vc::project::sameLocation("s3://bucket/v.zarr", "s3://bucket/v.zarr", root));
+
+    std::error_code ec;
+    fs::create_directory_symlink(root / "grids" / "g1", root / "link", ec);
+    if (!ec)
+        CHECK(vc::project::sameLocation(absolute, (root / "link").string(), root));
+
+    fs::remove_all(root);
+}
+
 TEST_CASE("validateLocation: empty location is rejected")
 {
     CHECK_FALSE(validateLocation(Category::Volumes, "").empty());

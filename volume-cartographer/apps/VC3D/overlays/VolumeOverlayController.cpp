@@ -147,6 +147,7 @@ VolumeOverlayController::State VolumeOverlayController::state() const
         .intensityAsAlpha = _overlayIntensityAsAlpha,
         .maxDisplayedResolution = _overlayMaxDisplayedResolution,
         .composite = currentCompositeSettings(),
+        .samplingMethod = _overlaySamplingMethod,
     };
 }
 
@@ -184,6 +185,8 @@ VolumeOverlayController::apply(const Update& update)
             setMaxDisplayedResolution(*update.maxDisplayedResolution);
         if (update.composite)
             setComposite(*update.composite);
+        if (update.samplingMethod)
+            setSamplingMethod(*update.samplingMethod);
     }
     if (!wasSuspended)
         saveState();
@@ -1180,11 +1183,10 @@ void VolumeOverlayController::handleSamplingMethodChanged(int index)
         return;
     }
 
-    setSamplingMethod(static_cast<vc::Sampling>(
-        _ui.samplingMethodSelect->itemData(index).toInt()));
-    if (!_suspendPersistence) {
-        saveState();
-    }
+    Update update;
+    update.samplingMethod = static_cast<vc::Sampling>(
+        _ui.samplingMethodSelect->itemData(index).toInt());
+    apply(update);
 }
 
 void VolumeOverlayController::handleIntensityAsAlphaChanged(bool enabled)

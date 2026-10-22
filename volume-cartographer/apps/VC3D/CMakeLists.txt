@@ -20,6 +20,10 @@ set(srcs
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
+    SessionRecovery.cpp
+    SessionRecovery.hpp
+    SessionRecoveryDialog.cpp
+    SessionRecoveryDialog.hpp
     RenderBenchRecorder.cpp
     RenderBenchRecorder.hpp
     RenderBenchReplay.cpp
@@ -116,6 +120,8 @@ set(srcs
     elements/RangeSlider.hpp
     elements/ViewerStatsBar.cpp
     elements/ViewerStatsBar.hpp
+    elements/StatusMessageHistory.cpp
+    elements/StatusMessageHistory.hpp
     elements/DownloadQueueStats.cpp
     elements/DownloadQueueStats.hpp
     elements/DownloadQueueDebugOverlay.cpp
@@ -217,6 +223,10 @@ set(srcs
     MenuActionController.hpp
     VolumeAttachmentController.cpp
     VolumeAttachmentController.hpp
+    ProjectAttachmentController.cpp
+    ProjectAttachmentController.hpp
+    ProjectLocations.cpp
+    ProjectLocations.hpp
     UnifiedBrowserDialog.cpp
     UnifiedBrowserDialog.hpp
     segmentation/SegmentationModule.cpp
@@ -289,6 +299,10 @@ set(srcs
     CommandLineToolRunner.hpp
     ToolDialogs.cpp
     ToolDialogs.hpp
+    MergeTifxyzInputs.cpp
+    MergeTifxyzInputs.hpp
+    SegmentFiles.cpp
+    SegmentFiles.hpp
     ConsoleOutputWidget.cpp
     ConsoleOutputWidget.hpp
     CPointCollectionWidget.cpp
@@ -313,22 +327,39 @@ set(srcs
     agent_bridge/AgentBridgeMethods_atlas.cpp
     agent_bridge/AgentBridgeMethods_canvas.cpp
     agent_bridge/AgentBridgeMethods_editing.cpp
+    agent_bridge/AgentBridgeMethods_editsettings.cpp
     agent_bridge/AgentBridgeMethods_fiber.cpp
     agent_bridge/AgentBridgeMethods_flatten.cpp
     agent_bridge/AgentBridgeMethods_jobs.cpp
     agent_bridge/AgentBridgeMethods_lasagna.cpp
     agent_bridge/AgentBridgeMethods_points.cpp
+    agent_bridge/AgentBridgeMethods_project.cpp
     agent_bridge/AgentBridgeMethods_seeding.cpp
+    agent_bridge/AgentBridgeMethods_segmentops.cpp
     agent_bridge/AgentBridgeMethods_session.cpp
     agent_bridge/AgentBridgeMethods_surfaceops.cpp
     agent_bridge/AgentBridgeMethods_viewer.cpp
+    agent_bridge/AgentBridgeMethods_viewerdisplay.cpp
     agent_bridge/AgentBridgeMethods_wrap.cpp
     agent_bridge/AgentBridgeCommandError.hpp
+    agent_bridge/AgentBridgeAccessible.cpp
+    agent_bridge/AgentBridgeAccessible.hpp
+    agent_bridge/AgentBridgeEditSettings.hpp
+    agent_bridge/AgentBridgeInput.hpp
     agent_bridge/AgentBridgeInternal.hpp
+    agent_bridge/AgentBridgeKeyboard.cpp
+    agent_bridge/AgentBridgeKeyboard.hpp
+    agent_bridge/AgentBridgeObservation.cpp
+    agent_bridge/AgentBridgeObservation.hpp
+    agent_bridge/AgentBridgeUi.hpp
+    agent_bridge/AgentBridgeWorkspaces.cpp
     agent_bridge/AgentBridgeJobs.cpp
     agent_bridge/AgentBridgeHandlers_catalog.cpp
     agent_bridge/AgentBridgeHandlers_session.cpp
     agent_bridge/AgentBridgeHandlers_editing.cpp
+    agent_bridge/AgentBridgeHandlers_editsettings.cpp
+    agent_bridge/AgentBridgeHandlers_input.cpp
+    agent_bridge/AgentBridgeHandlers_ui.cpp
     agent_bridge/AgentBridgeHandlers_wrap.cpp
     agent_bridge/AgentBridgeHandlers_atlas.cpp
     agent_bridge/AgentBridgeHandlers_fiber.cpp
@@ -338,7 +369,10 @@ set(srcs
     agent_bridge/AgentBridgeHandlers_points.cpp
     agent_bridge/AgentBridgeHandlers_review.cpp
     agent_bridge/AgentBridgeHandlers_viewer.cpp
+    agent_bridge/AgentBridgeHandlers_viewerdisplay.cpp
     agent_bridge/AgentBridgeHandlers_surfaceops.cpp
+    agent_bridge/AgentBridgeHandlers_segmentops.cpp
+    agent_bridge/AgentBridgeHandlers_project.cpp
 )
 
 if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)

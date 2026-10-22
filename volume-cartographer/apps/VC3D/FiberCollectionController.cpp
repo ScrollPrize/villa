@@ -333,11 +333,7 @@ FiberCollectionController::FiberCollectionController(CState* state, ViewerManage
             selectFiber(id, !lineAnnotationActive_, lineAnnotationActive_);
     });
     connect(along_, &QSlider::valueChanged, this, &FiberCollectionController::navigate);
-    connect(detach_, &QPushButton::clicked, this, [this]() {
-        const auto file = attachmentPath();
-        clear();
-        QFile::remove(file);
-    });
+    connect(detach_, &QPushButton::clicked, this, [this]() { detachCollection(); });
     connect(state_, &CState::volumeChanged, this, [this]() { volumeChanged(); });
     connect(state_, &CState::volumeClosing, this, [this]() { clear(); });
     bindToViewerManager(manager);
@@ -446,22 +442,61 @@ void FiberCollectionController::volumeChanged()
     }
     projectChanged();
 }
-void FiberCollectionController::openCollection(const QString& path, bool persist, const std::string& expectedUuid)
+FiberCollectionController::OpenRefusal FiberCollectionController::openRefusal() const
+{
+    if (!state_->currentVolume() || !state_->vpkg())
+        return OpenRefusal::NoVolume;
+    if (!vc3d::opendata::coordinateIdentityForVolume(*state_->vpkg(), state_->currentVolumeId()))
+        return OpenRefusal::NoCoordinateIdentity;
+    return OpenRefusal::None;
+}
+bool FiberCollectionController::detachCollection()
+{
+    const auto file = attachmentPath();
+    const bool attached = enabled_ || (!file.isEmpty() && QFile::exists(file));
+    clear();
+    if (!file.isEmpty())
+        QFile::remove(file);
+    return attached;
+}
+bool FiberCollectionController::saveAttachmentRecord()
+{
+    const auto file = attachmentPath();
+    if (!enabled_ || file.isEmpty())
+        return false;
+    const auto base = std::filesystem::path(file.toStdString()).parent_path();
+    std::error_code ec;
+    auto relative = std::filesystem::relative(path_.toStdString(), base, ec);
+    Json attachment = {{"version", 1}, {"path", ec ? path_.toStdString() : relative.string()}, {"uuid", uuid_}};
+    QSaveFile out(file);
+    if (!out.open(QIODevice::WriteOnly) || out.write(attachment.dump().c_str()) < 0 || !out.commit())
+        return false;
+    attachment_ = file;
+    return true;
+}
+quint64 FiberCollectionController::openCollection(const QString& path, bool persist, const std::string& expectedUuid)
 {
     clear();
+    const quint64 openId = revision_;
     // Restoring the project's attachment leaves the dock as the user left it.
     if (persist)
         dock_->show();
-    if (!state_->currentVolume() || !state_->vpkg()) {
-        status_->setText(tr("Open the CT volume first."));
-        return;
+    const QString absolutePath = QFileInfo(path).absoluteFilePath();
+    auto refuse = [&](const QString& message) {
+        status_->setText(message);
+        emit collectionOpened(openId, absolutePath, false, message, false);
+        return openId;
+    };
+    switch (openRefusal()) {
+    case OpenRefusal::NoVolume:
+        return refuse(tr("Open the CT volume first."));
+    case OpenRefusal::NoCoordinateIdentity:
+        return refuse(tr("This volume has no verified coordinate identity. Attach a volume with coordinate metadata first."));
+    case OpenRefusal::None:
+        break;
     }
     const auto identity = vc3d::opendata::coordinateIdentityForVolume(*state_->vpkg(), state_->currentVolumeId());
-    if (!identity) {
-        status_->setText(tr("This volume has no verified coordinate identity. Attach a volume with coordinate metadata first."));
-        return;
-    }
-    path_ = QFileInfo(path).absoluteFilePath();
+    path_ = absolutePath;
     const auto file = path_.toStdString();
     const auto rev = revision_;
     status_->setText(tr("Opening volume…"));
@@ -484,11 +519,14 @@ void FiberCollectionController::openCollection(const QString& path, bool persist
                 throw std::runtime_error("Automated Fiber Volume and CT coordinate frames do not match.");
             return info;
         },
-        [this, rev, identity, persist](const Outcome<Json>& result) {
-            if (rev != revision_)
+        [this, rev, identity, persist, openedPath = path_](const Outcome<Json>& result) {
+            if (rev != revision_) {
+                emit collectionOpened(rev, openedPath, false, tr("Superseded by another open or close."), false);
                 return;
+            }
             if (!result.error.isEmpty()) {
                 status_->setText(result.error);
+                emit collectionOpened(rev, openedPath, false, result.error, false);
                 return;
             }
             nativeToViewer_ = 1.0 / double(identity->sourceCoordinateScaleFactor);
@@ -504,18 +542,17 @@ void FiberCollectionController::openCollection(const QString& path, bool persist
             detach_->setEnabled(true);
             status_->setToolTip(path_ + "\n" + QString::fromStdString(uuid_));
             status_->setText(tr("%1 fibers · native geometry · read only").arg(result.value.at("fiber_count").get<int64_t>()));
-            if (persist && !attachmentPath().isEmpty()) {
-                const auto base = std::filesystem::path(attachmentPath().toStdString()).parent_path();
-                std::error_code ec;
-                auto relative = std::filesystem::relative(path_.toStdString(), base, ec);
-                Json attachment = {{"version", 1}, {"path", ec ? path_.toStdString() : relative.string()}, {"uuid", uuid_}};
-                QSaveFile out(attachmentPath());
-                if (!out.open(QIODevice::WriteOnly) || out.write(attachment.dump().c_str()) < 0 || !out.commit())
-                    status_->setText(tr("Volume opened; its attachment to the project could not be saved."));
+            QString message = status_->text();
+            const bool saved = persist && saveAttachmentRecord();
+            if (persist && !saved) {
+                message = tr("Volume opened; its attachment to the project could not be saved.");
+                status_->setText(message);
             }
             listPage(true);
             invalidate();
+            emit collectionOpened(rev, path_, true, message, saved);
         });
+    return openId;
 }
 void FiberCollectionController::invalidate()
 {

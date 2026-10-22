@@ -17,6 +17,7 @@
 #include "elements/VolumeSelector.hpp"
 #include "AlphaCompRefineRequest.hpp"
 #include "CommandLaunchError.hpp"
+#include "SegmentFiles.hpp"
 // Full definition needed: RenderSegmentParams stores a
 // CommandLineToolRunner::RenderOutputFormat (nested enum) by value.
 #include "CommandLineToolRunner.hpp"
@@ -58,6 +59,8 @@ public:
         QString resumeOptMode{QStringLiteral("local")};
         int pass2OmpThreads{1};
         bool copyOut{true};
+        bool interactive{true};     // false => silent passes, no dialogs
+        bool cancelled{false};      // set by cancelNeighborCopy
         QSet<QString> baselineEntries;
         std::unique_ptr<QTemporaryFile> pass1JsonFile;
         std::unique_ptr<QTemporaryFile> pass2JsonFile;
@@ -147,6 +150,81 @@ public:
 
     using AlphaCompRefineParams = AlphaCompRefineRequest;
 
+    // Arguments accepted by startNeighborCopy; defaults match the dialog.
+    struct NeighborCopyParams {
+        QString     volumeId;                 // empty => current volume
+        QString     outputDir;                // empty => <volpkg>/paths; relative =>
+                                              // against the volpkg root
+        int         neighborMaxDistance{200};
+        int         neighborMinClearance{4};
+        bool        neighborFill{true};
+        int         neighborInterpWindow{5};
+        int         generations{2};
+        int         neighborSpikeWindow{2};
+        int         resumeLocalOptStep{20};
+        int         resumeLocalOptRadius{40};
+        int         resumeLocalMaxIters{1000};
+        bool        resumeLocalDenseQr{false};
+        int         pass2OmpThreads{1};       // >= 1
+        QJsonObject pass2ParamOverrides;      // merged over the pass-2 tracer params
+    };
+
+    // Arguments accepted by startConvertToObj. Options the dialog shows but
+    // the conversion does not pass to vc_tifxyz2obj are omitted.
+    struct ConvertToObjParams {
+        QString objPath;          // empty => <segment>/<segment id>.obj
+        bool    normalizeUV{false};
+        bool    alignGrid{false};
+        int     ompThreads{-1};   // -1 => runner default
+        bool    overwrite{true};  // false => an existing OBJ file is refused
+    };
+
+    // Arguments accepted by startMergeTifxyz; RANSAC defaults match the dialog.
+    struct MergeTifxyzParams {
+        QVector<QStringList> grid;            // row-major segment names; "" is a hole
+        QString refSurface;                   // empty => largest valid-cell count
+        int     ransacIters{3000};
+        double  ransacMinThresh{5.0};
+        double  ransacMaxThresh{10.0};
+        double  ransacMadK{3.0};
+        int     ransacSeed{0};
+        int     anchorCap{0};
+        int     stripCols{0};
+        int     ompThreads{-1};               // -1 => runner default
+    };
+
+    // Arguments accepted by startMergePatch; defaults match the dialog.
+    struct MergePatchParams {
+        QString parentId;                     // overwritten in place
+        QString childId;
+        bool    explicitRoles{false};         // false => vc_merge_patch picks the
+                                              // parent by valid-cell count
+        int     borderCells{16};
+        int     blendCells{6};
+        int     idwK{4};
+        int     ransacIters{3000};
+        double  ransacMinThresh{5.0};
+        double  ransacMaxThresh{10.0};
+        double  ransacMadK{3.0};
+        int     ransacSeed{0};
+        int     anchorCap{0};
+        int     ompThreads{-1};               // -1 => runner default
+    };
+
+    // Arguments accepted by startRasterizeSegments.
+    struct RasterizeParams {
+        int chunkSize{128};       // isotropic chunk size, 1..4096
+        int zMin{0};              // level-0 Z min, >= 0
+        int zMax{-1};             // level-0 Z max (exclusive); -1 => volume end
+    };
+
+    // Segments accepted for rasterization by startRasterizeSegments.
+    struct RasterizeLaunch {
+        QString     outputPath;   // final labels_<timestamp>.zarr under volumes/
+        QStringList segmentIds;   // tifxyz segments passed to the tool
+        QStringList skippedIds;   // requested ids without tifxyz meshes
+    };
+
     // --- Construction ---
 
     explicit SegmentationCommandHandler(QWidget* parentWidget,
@@ -220,6 +298,16 @@ signals:
      * with an empty message denotes a user cancel.
      */
     void flattenJobFinished(bool success, QString message, QString outputPath);
+
+    /**
+     * Emitted once when a segment operation that post-processes command-line
+     * tool output reaches its terminal state, after that post-processing.
+     * Emitted for interactive and dialog-free launches. `kind` names the
+     * operation ("rasterize", "neighbor_copy", "merge", "patch"); `outputPath`
+     * is the produced artifact on success.
+     */
+    void segmentOperationFinished(QString kind, bool success, QString message,
+                                  QString outputPath);
 
 public slots:
     void onRenderSegment(const std::string& segmentId);
@@ -326,6 +414,81 @@ public:
                               CommandLaunchError* error = nullptr,
                               QString* resolvedOutputDir = nullptr);
 
+    /// Dialog-free OBJ conversion launch (vc_tifxyz2obj). The interactive slot
+    /// gathers the same params from its dialog. Completion is observable via
+    /// CommandLineToolRunner::toolFinished, whose output path is the OBJ file.
+    /// On success `resolvedObjPath` receives the OBJ file path when provided.
+    bool startConvertToObj(const std::string& segmentId,
+                           const ConvertToObjParams& params,
+                           CommandLaunchError* error = nullptr,
+                           QString* resolvedObjPath = nullptr);
+
+    /// Dialog-free rasterize launch (vc_tifxyz2zarr_sparse). Requested ids
+    /// without tifxyz meshes are skipped as in the interactive slot; at least
+    /// one must remain. Completion, including the rename into volumes/ and the
+    /// metadata update, is reported by segmentOperationFinished("rasterize").
+    bool startRasterizeSegments(const QStringList& segmentIds,
+                                const RasterizeParams& params,
+                                CommandLaunchError* error = nullptr,
+                                RasterizeLaunch* launch = nullptr);
+
+    /// Dialog-free neighbor copy (two vc_grow_seg_from_seed passes). The
+    /// interactive slot gathers the same params from its dialog. Completion,
+    /// after the second pass, is reported by
+    /// segmentOperationFinished("neighbor_copy"). On success
+    /// `resolvedOutputDir` receives the output directory when provided.
+    bool startNeighborCopy(const QString& segmentId,
+                           bool copyOut,
+                           const NeighborCopyParams& params,
+                           CommandLaunchError* error = nullptr,
+                           QString* resolvedOutputDir = nullptr);
+
+    /// Dialog-free vc_merge_tifxyz launch: validates the grid like the dialog,
+    /// writes its merge.json next to the segments directory and starts the
+    /// tool. Completion, after the surface list is reloaded, is reported by
+    /// segmentOperationFinished("merge") with the new segment folder.
+    bool startMergeTifxyz(const MergeTifxyzParams& params,
+                          CommandLaunchError* error = nullptr,
+                          QString* mergeJsonPath = nullptr);
+
+    /// Dialog-free vc_merge_patch launch. The parent tifxyz is overwritten in
+    /// place; the tool keeps a rotating backup ring of the parent first.
+    /// Completion is reported by segmentOperationFinished("patch").
+    bool startMergePatch(const MergePatchParams& params,
+                         CommandLaunchError* error = nullptr);
+
+    /// The segment's rotating backups, as the context menu's "Reload from
+    /// Backup" entries offer them. Empty when the segment or its backups are
+    /// missing.
+    std::vector<vc3d::segment_files::Backup> listSurfaceBackups(const QString& segmentId) const;
+
+    /// Dialog-free core of onReloadFromBackup: replaces the segment's files
+    /// with every file of the backup slot and reloads it. The state being
+    /// replaced is snapshotted as the newest backup first; if that snapshot
+    /// fails nothing is restored. Failures via `errorMessage`; `copiedFiles`
+    /// receives the number of files restored.
+    bool restoreSurfaceFromBackup(const QString& segmentId,
+                                  int backupIndex,
+                                  QString* errorMessage = nullptr,
+                                  int* copiedFiles = nullptr);
+
+    /// Dialog-free core of onMoveSegmentToPaths: unloads a traces/ segment and
+    /// moves its folder to paths/. A paths/ segment of the same name is
+    /// refused unless `replaceExisting`; `destinationExists` reports whether
+    /// there was one. Failures via `errorMessage`; `newPath` receives the
+    /// destination folder.
+    bool moveSegmentToPaths(const QString& segmentId,
+                            bool replaceExisting,
+                            QString* errorMessage = nullptr,
+                            QString* newPath = nullptr,
+                            bool* destinationExists = nullptr);
+
+    /// Cancels a running neighbor copy, including the hop between its passes:
+    /// a running pass's process is terminated and a queued second pass does
+    /// not start. The copy ends with segmentOperationFinished("neighbor_copy",
+    /// false, "Neighbor copy cancelled."). Returns false when none is running.
+    bool cancelNeighborCopy();
+
     /// Dialog-free core of onCropSurfaceToValidRegion (the interactive slot wraps
     /// this). Crops the surface grid to its tightest valid bounds, writes it in
     /// place, and refreshes metrics; failures via `errorMessage` (never a dialog)
@@ -335,6 +498,21 @@ public:
     /// channel-size mismatch, and save failures.
     bool cropSurfaceToValidRegion(const std::string& segmentId,
                                   QString* errorMessage = nullptr);
+
+    /// Grid transforms offered by the segment context menu's Flip and Rotate
+    /// entries. The "Normals (H Flip)" entry is FlipV.
+    enum class SurfaceTransform { FlipU, FlipV, Rotate90 };
+
+    /// Dialog-free core of onFlipSurface / onRotateSurface. Applies the
+    /// transform, saves the segment in place and refreshes the shared surface
+    /// state; failures via `errorMessage` (never a dialog). Failure sentences:
+    /// "No volume package or volume loaded", "Invalid segment or segment not
+    /// loaded", "Could not prepare a managed working copy", and save failures.
+    /// A failed save leaves the in-memory surface transformed, matching the
+    /// interactive slots.
+    bool transformSurface(const std::string& segmentId,
+                          SurfaceTransform transform,
+                          QString* errorMessage = nullptr);
 
     /// Dialog-free core of onRenameSurface: renames the segment folder + meta.json
     /// UUID from `oldId` to `newName`, keeping the editing guard, name validation
@@ -400,6 +578,10 @@ private:
                                     const GrowPatchSeedParams& params,
                                     bool interactive,
                                     CommandLaunchError* error);
+    bool transformSurfaceImpl(const std::string& segmentId,
+                              SurfaceTransform transform,
+                              bool interactive,
+                              QString* errorMessage);
     bool startAlphaCompRefineImpl(const std::string& segmentId,
                                   const AlphaCompRefineParams& params,
                                   bool interactive,
@@ -407,6 +589,47 @@ private:
                                   QString* resolvedOutputDir);
     static QJsonObject alphaCompRefineParamsJson(
         const AlphaCompRefineParams& params);
+    bool startNeighborCopyImpl(const QString& segmentId,
+                               bool copyOut,
+                               const NeighborCopyParams& params,
+                               bool interactive,
+                               CommandLaunchError* error,
+                               QString* resolvedOutputDir);
+    void finishNeighborCopy(bool success, const QString& message,
+                            const QString& outputPath);
+    bool launchMergeTifxyz(const QString& mergeJsonPath,
+                           const QString& pathsDir,
+                           const MergeTifxyzParams& params,
+                           bool interactive);
+    bool launchMergePatch(const QString& parentPath,
+                          const QString& childPath,
+                          const MergePatchParams& params,
+                          bool interactive);
+    // The newest directory under `pathsDir` named like a vc_merge_tifxyz
+    // output that is not in `baselineEntries`; empty when none.
+    static QString findNewMergedSegment(const QString& pathsDir,
+                                        const QSet<QString>& baselineEntries);
+    bool restoreSurfaceFromBackupImpl(const QString& segmentId,
+                                      int backupIndex,
+                                      bool interactive,
+                                      QString* errorMessage,
+                                      int* copiedFiles);
+    bool moveSegmentToPathsImpl(const QString& segmentId,
+                                bool replaceExisting,
+                                bool interactive,
+                                QString* errorMessage,
+                                QString* newPath,
+                                bool* destinationExists);
+    bool launchConvertToObj(const QString& tifxyzPath,
+                            const ConvertToObjParams& params,
+                            CommandLineToolRunner::ExecutionOptions options);
+    // Interactive launches ask for the parameters when `params` is empty and
+    // present refusals as the menu always has.
+    bool startRasterizeSegmentsImpl(const QStringList& segmentIds,
+                                    const std::optional<RasterizeParams>& params,
+                                    bool interactive,
+                                    CommandLaunchError* error,
+                                    RasterizeLaunch* launch);
 
     /**
      * Resolve a segment launch's output directory: the surface's own parent

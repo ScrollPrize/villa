@@ -24,6 +24,7 @@ block forever.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -31,6 +32,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -240,12 +242,15 @@ def check_rpc_describe(
         "viewer.center_on_point",
         "viewer.zoom",
         "viewer.rotate",
+        "viewer.reset",
         "viewer.set_axis_aligned_slices",
         "viewer.get_render_settings",
         "viewer.set_render_settings",
         "viewer.get_overlay",
         "viewer.set_overlay",
         "viewer.list_overlay_volumes",
+        "viewer.get_ink_overlay",
+        "viewer.set_ink_overlay",
         "viewer.set_intersects",
     }
     try:
@@ -296,10 +301,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 120
-            and coverage.get("registered") == 120
+            and coverage.get("described") == 141
+            and coverage.get("registered") == 141
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 120
+            and len(snapshot["methods"]) == 141
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:
@@ -472,6 +477,555 @@ def check_canvas_normalization(client: BridgeClient, results: Results) -> None:
             False,
             f"{type(error).__name__}: {error}",
         )
+
+
+def check_viewer_registry(client: BridgeClient, results: Results) -> None:
+    """Viewers of every viewer manager are addressable by id, and a slot name
+    resolves to the main window's own viewer first."""
+    try:
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        viewers = state.get("viewers", [])
+        ids = [v.get("viewerId") for v in viewers]
+        segmentation = [
+            v.get("viewerId") for v in viewers if v.get("surfName") == "segmentation"
+        ]
+        centered, _ = client.call(
+            "viewer.center_on_point",
+            {"point": {"x": 8, "y": 8, "z": 8}},
+            timeout=RPC_TIMEOUT,
+        )
+        unresolved = []
+        for viewer in viewers:
+            if viewer.get("kind") != "chunked":
+                continue
+            # Resolution, not rendering: a zoom by 1.0 must reach every pane.
+            try:
+                client.call(
+                    "viewer.zoom",
+                    {"viewer": viewer.get("viewerId"), "factor": 1.0},
+                    timeout=RPC_TIMEOUT,
+                )
+            except BridgeError as error:
+                unresolved.append(f"{viewer.get('viewerId')}: {error.code}")
+        ok = (
+            len(ids) == len(set(ids))
+            and bool(segmentation)
+            and centered.get("viewerId") == segmentation[0]
+            and not unresolved
+        )
+        results.record(
+            "viewer_registry",
+            ok,
+            f"viewers={len(ids)} segmentation={segmentation} "
+            f"default={centered.get('viewerId')} unresolved={unresolved}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record("viewer_registry", False, f"{type(error).__name__}: {error}")
+
+
+def wait_held(client: BridgeClient, key: str, held: bool,
+              timeout: float = 5.0) -> tuple[bool, float]:
+    """Poll state.get until key is (or is no longer) in heldKeys.
+
+    Returns whether that happened within timeout and the monotonic time it
+    was seen, so checks do not depend on how fast the bridge handles a
+    request on a slow runner.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        keys = [k.get("key") for k in state.get("heldKeys", [])]
+        seen = time.monotonic()
+        if (key in keys) == held:
+            return True, seen
+        if seen >= deadline:
+            return False, seen
+        time.sleep(0.05)
+
+
+def check_canvas_input(sock_path: str, client: BridgeClient, results: Results) -> None:
+    """canvas.key and canvas.wheel reach the viewer through real Qt events."""
+    failures: list[str] = []
+    try:
+        client.call("workspace.switch", {"name": "main"}, timeout=RPC_TIMEOUT)
+        tap, _ = client.call("canvas.key", {"key": "Escape"}, timeout=RPC_TIMEOUT)
+        if (tap.get("key") != "Esc" or tap.get("heldKeys") != []
+                or "accepted" not in tap or tap.get("dismissed") != []):
+            failures.append(f"tap={tap}")
+        pressed, _ = client.call(
+            "canvas.key", {"key": "Shift", "action": "press"}, timeout=RPC_TIMEOUT)
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        held_in_state = [k.get("key") for k in state.get("heldKeys", [])]
+        released, _ = client.call(
+            "canvas.key", {"key": "Shift", "action": "release"}, timeout=RPC_TIMEOUT)
+        if pressed.get("heldKeys") != ["Shift"] or released.get("heldKeys") != []:
+            failures.append(f"press={pressed} release={released}")
+        if pressed.get("holdMs") != 10000 or held_in_state != ["Shift"]:
+            failures.append(f"press limit={pressed.get('holdMs')} state={held_in_state}")
+        if released.get("wasHeld") is not True:
+            failures.append(f"release wasHeld={released.get('wasHeld')}")
+        # A press with a short limit is released without a release call.
+        client.call(
+            "canvas.key", {"key": "F23", "action": "press", "holdMs": 100},
+            timeout=RPC_TIMEOUT)
+        released_in_time, _ = wait_held(client, "F23", held=False)
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        if not released_in_time or state.get("heldKeys") != []:
+            failures.append(f"press limit kept {state.get('heldKeys')}")
+        started = time.monotonic()
+        held, _ = client.call(
+            "canvas.key", {"key": "F24", "holdMs": 200}, timeout=RPC_TIMEOUT)
+        elapsed = time.monotonic() - started
+        if held.get("holdMs") != 200 or held.get("heldKeys") != [] or elapsed < 0.19:
+            failures.append(f"hold={held} elapsed={elapsed:.3f}")
+        # A hold's timer releases only its own press: release the held key
+        # early and press it again, and the new press outlives the old timer.
+        hold_result: dict = {}
+
+        def hold() -> None:
+            try:
+                hold_result["value"], _ = client.call(
+                    "canvas.key", {"key": "F20", "holdMs": 800}, timeout=RPC_TIMEOUT)
+            except Exception as error:  # noqa: BLE001
+                hold_result["error"] = f"{type(error).__name__}: {error}"
+
+        holder = threading.Thread(target=hold, daemon=True)
+        holder.start()
+        # Release only once the bridge holds the key, however long the
+        # request took to arrive; the hold's timer started before this.
+        hold_seen, held_at = wait_held(client, "F20", held=True)
+        if not hold_seen:
+            failures.append("hold of F20 never reached heldKeys")
+        client.call("canvas.key", {"key": "F20", "action": "release"}, timeout=RPC_TIMEOUT)
+        client.call(
+            "canvas.key", {"key": "F20", "action": "press", "holdMs": 5000},
+            timeout=RPC_TIMEOUT)
+        holder.join(timeout=RPC_TIMEOUT)
+        # Look again after the first hold's 800 ms timer has fired.
+        time.sleep(max(0.0, held_at + 1.3 - time.monotonic()))
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        still_held = [k.get("key") for k in state.get("heldKeys", [])]
+        client.call("canvas.key", {"key": "F20", "action": "release"}, timeout=RPC_TIMEOUT)
+        if (hold_result.get("value", {}).get("releasedEarly") is not True
+                or still_held != ["F20"]):
+            failures.append(f"hold serial: hold={hold_result} held after={still_held}")
+        # Tapping a key this connection holds is refused.
+        client.call("canvas.key", {"key": "F22", "action": "press"}, timeout=RPC_TIMEOUT)
+        try:
+            client.call("canvas.key", {"key": "F22"}, timeout=RPC_TIMEOUT)
+            failures.append("tap of a held key accepted")
+        except BridgeError as error:
+            if error.code != -32009:
+                failures.append(f"tap of a held key code={error.code}")
+        client.call("canvas.key", {"key": "F22", "action": "release"}, timeout=RPC_TIMEOUT)
+        # A viewer on a hidden workspace is refused: its key would reach the
+        # focused widget's shortcuts instead.
+        spiral = [v for v in state.get("viewers", [])
+                  if v.get("workspace") == "spiral" and v.get("kind") == "chunked"]
+        if spiral:
+            try:
+                client.call(
+                    "canvas.key", {"key": "Escape", "viewer": spiral[0]["viewerId"]},
+                    timeout=RPC_TIMEOUT)
+                failures.append("key to a hidden viewer accepted")
+            except BridgeError as error:
+                if error.code != -32009:
+                    failures.append(f"hidden viewer code={error.code}")
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"{type(error).__name__}: {error}")
+    for params, param in (
+        ({"key": "A,B"}, "key"),
+        ({"key": "A", "action": "release", "holdMs": 10}, "holdMs"),
+        ({"key": "A", "holdMs": 60001}, "holdMs"),
+    ):
+        ok, detail = expect_param_error(client, "canvas.key", params, param)
+        if not ok:
+            failures.append(f"{params}: {detail}")
+    results.record(
+        "canvas_key",
+        not failures,
+        "tap, press/release, press limit and hold delivered" if not failures
+        else "; ".join(failures[:4]),
+    )
+
+    # A key whose shortcut opens a modal dialog (Ctrl+O opens the project
+    # browser) gets the dialog answered, while another client's requests
+    # wait for the call instead of running inside the dialog's event loop.
+    failures = []
+    other = None
+    try:
+        before, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        other = BridgeClient(sock_path, connect_timeout=RPC_TIMEOUT)
+        stop = threading.Event()
+        pings: list[str] = []
+
+        def ping_loop() -> None:
+            while not stop.is_set():
+                try:
+                    other.call("ping", {}, timeout=RPC_TIMEOUT)
+                    pings.append("ok")
+                except Exception as error:  # noqa: BLE001
+                    pings.append(f"{type(error).__name__}: {error}")
+                    return
+
+        pinger = threading.Thread(target=ping_loop, daemon=True)
+        pinger.start()
+        opened = []
+        for _ in range(3):
+            result, _ = client.call("canvas.key", {"key": "Ctrl+O"}, timeout=RPC_TIMEOUT)
+            opened.extend(result.get("dismissed", []))
+            if any(not {"class", "title", "answer"} <= set(entry) for entry in opened):
+                failures.append(f"dismissed={opened}")
+        stop.set()
+        pinger.join(timeout=RPC_TIMEOUT)
+        after, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        if after.get("vpkg") != before.get("vpkg"):
+            failures.append(f"project changed: {after.get('vpkg')}")
+        if not pings or any(p != "ok" for p in pings):
+            failures.append(f"pings={pings[-3:]}")
+        detail = f"dismissed={[(e.get('class'), e.get('answer')) for e in opened]} pings={len(pings)}"
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"{type(error).__name__}: {error}")
+        detail = ""
+    finally:
+        if other is not None:
+            other.close()
+    results.record(
+        "canvas_key_dialog",
+        not failures,
+        detail if not failures else "; ".join(failures[:4]),
+    )
+
+    try:
+        ok, detail = expect_param_error(
+            client,
+            "canvas.wheel",
+            {"viewer": "xy plane", "position": {"x": 5, "y": 5}, "space": "scene",
+             "deltaY": 0},
+            "deltaY",
+        )
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        before = next(
+            (v["scale"] for v in state.get("viewers", []) if v.get("surfName") == "xy plane"),
+            None,
+        )
+        wheel, _ = client.call(
+            "canvas.wheel",
+            {"viewer": "xy plane", "position": {"x": 5, "y": 5}, "space": "scene",
+             "deltaY": 120},
+            timeout=RPC_TIMEOUT,
+        )
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        after = next(
+            (v["scale"] for v in state.get("viewers", []) if v.get("surfName") == "xy plane"),
+            None,
+        )
+        ok = ok and wheel.get("notches") == 1.0 and before is not None and after != before
+        # A pane on a hidden workspace is refused, so its zoom cannot change
+        # where nobody sees it.
+        hidden = "no spiral pane"
+        spiral = [v for v in state.get("viewers", [])
+                  if v.get("workspace") == "spiral" and v.get("kind") == "chunked"]
+        if spiral:
+            try:
+                client.call(
+                    "canvas.wheel",
+                    {"viewer": spiral[0]["viewerId"], "position": {"x": 5, "y": 5},
+                     "space": "scene", "deltaY": 120},
+                    timeout=RPC_TIMEOUT,
+                )
+                ok = False
+                hidden = "hidden pane accepted"
+            except BridgeError as error:
+                ok = ok and error.code == -32009
+                hidden = f"hidden pane code={error.code}"
+        results.record(
+            "canvas_wheel_zoom",
+            ok,
+            f"{detail}; scale {before} -> {after}; accepted={wheel.get('accepted')}; {hidden}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record("canvas_wheel_zoom", False, f"{type(error).__name__}: {error}")
+
+
+def check_state_changes(sock_path: str, client: BridgeClient, results: Results) -> None:
+    """A change made by one client reaches another as state.changed."""
+    observer = None
+    try:
+        observer = BridgeClient(sock_path, connect_timeout=RPC_TIMEOUT)
+        before, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        client.call("workspace.switch", {"name": "lasagna"}, timeout=RPC_TIMEOUT)
+        note = observer.wait_for_notification(
+            "state.changed",
+            predicate=lambda p: "workspace" in p.get("changed", []),
+            timeout=5.0,
+        )
+        after, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        client.call("workspace.switch", {"name": "main"}, timeout=RPC_TIMEOUT)
+        ok = (
+            isinstance(before.get("revision"), int)
+            and after.get("revision", -1) > before.get("revision", 0)
+            and note.get("revision", -1) <= after.get("revision", -1)
+        )
+        results.record(
+            "state_changed_notification",
+            ok,
+            f"revision {before.get('revision')} -> {after.get('revision')}; note={note}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "state_changed_notification", False, f"{type(error).__name__}: {error}")
+    finally:
+        if observer is not None:
+            observer.close()
+
+
+def _walk_nodes(node: dict):
+    yield node
+    for child in node.get("children", []):
+        yield from _walk_nodes(child)
+
+
+def check_ui_inspect(client: BridgeClient, results: Results) -> None:
+    """ui.inspect reads panels through Qt's accessibility tree and never
+    reports a redacted value."""
+    failures: list[str] = []
+    try:
+        window, _ = client.call("ui.inspect", {"depth": 3}, timeout=RPC_TIMEOUT)
+        tree = window.get("tree", {})
+        if tree.get("class") != "CWindow" or tree.get("role") != "Window":
+            failures.append(f"window root={tree.get('class')}/{tree.get('role')}")
+        if not window.get("docks"):
+            failures.append("no docks listed")
+        visible_docks = [d for d in window.get("docks", []) if d.get("visible")]
+        if visible_docks and not visible_docks[0].get("dockBar"):
+            dock_name = visible_docks[0]["objectName"]
+            dock, _ = client.call(
+                "ui.inspect", {"root": f"dock:{dock_name}"}, timeout=RPC_TIMEOUT)
+            if dock.get("tree", {}).get("objectName") != dock_name:
+                failures.append(f"dock root={dock.get('tree')}")
+        # The Segmentation dock lives in the bottom dock bar: its QDockWidget
+        # is an empty shell, so dock:dockWidgetSegmentation must read the
+        # panel page that holds its controls.
+        bar = {d.get("objectName"): d for d in window.get("docks", []) if d.get("dockBar")}
+        if "dockWidgetSegmentation" not in bar:
+            failures.append(f"Segmentation dock not in the dock bar: {sorted(bar)[:6]}")
+        else:
+            seg, _ = client.call(
+                "ui.inspect",
+                {"root": "dock:dockWidgetSegmentation", "depth": 64, "includeHidden": True},
+                timeout=RPC_TIMEOUT,
+            )
+            seg_nodes = list(_walk_nodes(seg.get("tree", {})))
+            if not any(n.get("role") == "SpinBox" and "value" in n for n in seg_nodes):
+                failures.append(
+                    f"Segmentation dock read {len(seg_nodes)} nodes, no spin box value")
+        main, _ = client.call(
+            "ui.inspect",
+            {"root": "workspace:main", "depth": 64, "includeHidden": True},
+            timeout=RPC_TIMEOUT,
+        )
+        nodes = list(_walk_nodes(main.get("tree", {})))
+        if any("role" not in n for n in nodes):
+            failures.append("a node has no role")
+        if not any(n.get("viewerId") for n in nodes):
+            failures.append("no viewer pane reported a viewerId")
+        if not any(n.get("role") == "SpinBox" and "value" in n for n in nodes):
+            failures.append("no spin box value read")
+        # Spiral's API key entry (password echo, labeled "API key") is read
+        # from a workspace that is not current, and withheld.
+        spiral, _ = client.call(
+            "ui.inspect",
+            {"root": "workspace:spiral", "depth": 64, "includeHidden": True},
+            timeout=RPC_TIMEOUT,
+        )
+        nodes += list(_walk_nodes(spiral.get("tree", {})))
+        leaked = [
+            n for n in nodes
+            if n.get("redacted") and n.get("role") == "EditableText" and "value" in n
+        ]
+        api_keys = [
+            n for n in nodes
+            if n.get("role") == "EditableText" and n.get("name") == "API key"
+        ]
+        if leaked:
+            failures.append(f"redaction leaked: {leaked[:1]}")
+        if not api_keys or any("value" in n or not n.get("redacted") for n in api_keys):
+            failures.append(f"API key entries={api_keys}")
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"{type(error).__name__}: {error}")
+    for params, param in (({"root": "bogus"}, "root"), ({"depth": 65}, "depth")):
+        ok, detail = expect_param_error(client, "ui.inspect", params, param)
+        if not ok:
+            failures.append(f"{params}: {detail}")
+    try:
+        client.call("ui.inspect", {"root": "dock:noSuchDock"}, timeout=RPC_TIMEOUT)
+        failures.append("unknown dock did not fail")
+    except BridgeError as error:
+        if error.code != -32007:
+            failures.append(f"unknown dock code={error.code}")
+    results.record(
+        "ui_inspect",
+        not failures,
+        "window, dock, dock bar and workspace roots read; redaction held" if not failures
+        else "; ".join(failures[:4]),
+    )
+
+
+def check_screenshot_targets(client: BridgeClient, results: Results) -> None:
+    """Dock and workspace targets, regions, and reveal with restore."""
+    failures: list[str] = []
+
+    def capture(params: dict) -> dict:
+        result, _ = client.call("screenshot.capture", params, timeout=RPC_TIMEOUT)
+        result.pop("base64", None)
+        return result
+
+    try:
+        client.call("workspace.switch", {"name": "main"}, timeout=RPC_TIMEOUT)
+        part = capture({"target": "window",
+                        "region": {"x": 0, "y": 0, "width": 64, "height": 32}})
+        if (part.get("region") != {"x": 0, "y": 0, "width": 64, "height": 32}
+                or part.get("width", 0) < 64):
+            failures.append(f"region={part}")
+        main = capture({"target": "workspace:main"})
+        if main.get("revealed") is not False or not isinstance(main.get("masked"), int):
+            failures.append(
+                f"current workspace revealed={main.get('revealed')} masked={main.get('masked')}")
+        try:
+            capture({"target": "workspace:lasagna"})
+            failures.append("hidden workspace captured without reveal")
+        except BridgeError as error:
+            if error.code != -32009:
+                failures.append(f"hidden workspace code={error.code}")
+        hidden = capture({"target": "workspace:lasagna", "reveal": True})
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        current = (state.get("workspace") or {}).get("current")
+        if hidden.get("revealed") is not True or current != "main":
+            failures.append(f"reveal={hidden.get('revealed')} restored={current}")
+        docks, _ = client.call("ui.inspect", {"depth": 0}, timeout=RPC_TIMEOUT)
+        visible = [d for d in docks.get("docks", []) if d.get("visible")]
+        if visible:
+            capture({"target": f"dock:{visible[0]['objectName']}"})
+        # A closed dock in the bottom dock bar, revealed twice: the second
+        # reveal of the same dock is where showing and hiding its empty dock
+        # shell used to take the dock off the bar (-32009 from then on).
+        closed = [d["objectName"] for d in docks.get("docks", [])
+                  if d.get("dockBar") and not d.get("visible")]
+        if not closed:
+            failures.append("no closed dock-bar dock to reveal")
+        else:
+            name = ("dockWidgetSegmentation" if "dockWidgetSegmentation" in closed
+                    else closed[0])
+            for attempt in (1, 2):
+                shot = capture({"target": f"dock:{name}", "reveal": True})
+                if (shot.get("revealed") is not True or shot.get("width", 0) < 64
+                        or shot.get("height", 0) < 64):
+                    failures.append(f"dock-bar reveal {attempt} of {name}: {shot}")
+            after, _ = client.call("ui.inspect", {"depth": 0}, timeout=RPC_TIMEOUT)
+            entry = next((d for d in after.get("docks", []) if d.get("objectName") == name), {})
+            if entry.get("visible") or not entry.get("dockBar"):
+                failures.append(f"{name} after reveal: {entry}")
+            try:
+                capture({"target": f"dock:{name}"})
+                failures.append(f"closed panel of {name} captured without reveal")
+            except BridgeError as error:
+                if error.code != -32009:
+                    failures.append(f"closed panel of {name}: code={error.code}")
+        try:
+            capture({"target": "dock:noSuchDock"})
+            failures.append("unknown dock captured")
+        except BridgeError as error:
+            if error.code != -32007:
+                failures.append(f"unknown dock code={error.code}")
+        spiral = [v for v in state.get("viewers", []) if v.get("workspace") == "spiral"]
+        if spiral:
+            capture({"target": spiral[0]["viewerId"], "reveal": True, "maxDim": 256})
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"{type(error).__name__}: {error}")
+    ok, detail = expect_param_error(
+        client,
+        "screenshot.capture",
+        {"region": {"x": 100000, "y": 0, "width": 8, "height": 8}},
+        "region",
+    )
+    if not ok:
+        failures.append(f"outside region: {detail}")
+    results.record(
+        "screenshot_targets",
+        not failures,
+        "region, dock, dock bar, workspace and reveal captures behaved" if not failures
+        else "; ".join(failures[:4]),
+    )
+
+
+# Every workspace id in tab order (AgentBridgeUi.hpp's agentBridgeWorkspaceIds,
+# set as each tab page's "workspaceId" property in CWindow's constructor).
+WORKSPACE_IDS = (
+    "main",
+    "lasagna",
+    "atlas",
+    "fiber-slice",
+    "intersections",
+    "spiral",
+    "fiber-map",
+)
+
+
+def check_workspaces(client: BridgeClient, results: Results) -> None:
+    """workspace.switch reaches every tab, each id is present in this build,
+    and the original fiber_slice spelling still works."""
+    failures: list[str] = []
+    try:
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        available = [
+            entry.get("id") for entry in (state.get("workspace") or {}).get("available", [])
+        ]
+        # Exactly the bridge's ids, in tab order: a tab added to CWindow must
+        # be added to agentBridgeWorkspaceIds() too.
+        if available != list(WORKSPACE_IDS):
+            failures.append(f"available={available}")
+        previous = None
+        for workspace_id in WORKSPACE_IDS:
+            result, _ = client.call(
+                "workspace.switch", {"name": workspace_id}, timeout=RPC_TIMEOUT)
+            after, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+            current = (after.get("workspace") or {}).get("current")
+            if result.get("workspace") != workspace_id or current != workspace_id:
+                failures.append(f"{workspace_id}: result={result} current={current}")
+            if previous is not None and result.get("previous") != previous:
+                failures.append(f"{workspace_id}: previous={result.get('previous')}")
+            previous = workspace_id
+        legacy, _ = client.call(
+            "workspace.switch", {"name": "fiber_slice"}, timeout=RPC_TIMEOUT)
+        if legacy.get("workspace") != "fiber-slice":
+            failures.append(f"fiber_slice alias -> {legacy}")
+        client.call("workspace.switch", {"name": "main"}, timeout=RPC_TIMEOUT)
+    except Exception as error:  # noqa: BLE001
+        failures.append(f"{type(error).__name__}: {error}")
+    results.record(
+        "workspace_switch_all",
+        not failures,
+        "every workspace switched in tab order" if not failures else "; ".join(failures[:4]),
+    )
+
+    try:
+        state, _ = client.call("state.get", {}, timeout=RPC_TIMEOUT)
+        viewers = state.get("viewers", [])
+        shaped = all("workspace" in v and "visible" in v for v in viewers)
+        main_viewers = [v for v in viewers if v.get("workspace") == "main"]
+        spiral = [v for v in viewers if v.get("workspace") == "spiral"]
+        visible_main = [v for v in main_viewers if v.get("visible")]
+        ok = shaped and bool(visible_main) and not any(v.get("visible") for v in spiral)
+        results.record(
+            "viewers_every_manager",
+            ok,
+            f"viewers={len(viewers)} main={len(main_viewers)} "
+            f"visible main={len(visible_main)} spiral={len(spiral)}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "viewers_every_manager", False, f"{type(error).__name__}: {error}")
 
 
 def check_project_create(
@@ -1133,6 +1687,639 @@ def check_segments_attach(
             False,
             f"unexpected {type(error).__name__}: {error}",
         )
+
+
+SMOKE_SEGMENT_ID = "20241113080880"
+
+
+def smoke_segment_dir(root: Path) -> Path:
+    """The tifxyz fixture check_segments_attach copies into the project."""
+    return root / "user-segments" / SMOKE_SEGMENT_ID
+
+
+def file_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def expect_bridge_error(
+    client: BridgeClient,
+    method: str,
+    params: object,
+    code: int,
+) -> tuple[bool, str]:
+    """Calls `method`; expects a BridgeError with the given code."""
+    try:
+        result, _ = client.call(method, params, timeout=RPC_TIMEOUT)
+        return False, f"expected {code}, got result keys={list(result)[:6]}"
+    except BridgeError as error:
+        return error.code == code, f"code={error.code} message={error.message}"
+    except Exception as error:  # noqa: BLE001
+        return False, f"unexpected {type(error).__name__}: {error}"
+
+
+def check_segment_transform(client: BridgeClient, results: Results, root: Path) -> None:
+    ok, detail = expect_param_error(
+        client,
+        "segment.transform",
+        {"segmentId": SMOKE_SEGMENT_ID, "op": "flip_w"},
+        "op",
+    )
+    results.record("segment_transform_rejects_unknown_op", ok, detail)
+    ok, detail = expect_bridge_error(
+        client,
+        "segment.transform",
+        {"segmentId": "no-such-segment", "op": "flip_u"},
+        -32007,
+    )
+    results.record("segment_transform_unknown_segment", ok, detail)
+    ok, detail = expect_param_error(
+        client,
+        "segment.transform",
+        {"segmentId": SMOKE_SEGMENT_ID, "op": "rotate90"},
+        "confirm",
+    )
+    results.record("segment_transform_rotate_requires_confirm", ok, detail)
+
+    # The first save may re-encode the fixture's TIFFs, so compare saved
+    # states: four flips give A, B, A, B with A != B.
+    x_tif = smoke_segment_dir(root) / "x.tif"
+    try:
+        digests = []
+        replies = []
+        for _ in range(4):
+            reply, _ = client.call(
+                "segment.transform",
+                {"segmentId": SMOKE_SEGMENT_ID, "op": "flip_u"},
+                timeout=RPC_TIMEOUT,
+            )
+            replies.append(reply)
+            digests.append(file_digest(x_tif))
+        ok = (
+            all(
+                reply == {
+                    "transformed": True,
+                    "segmentId": SMOKE_SEGMENT_ID,
+                    "op": "flip_u",
+                }
+                for reply in replies
+            )
+            and digests[0] == digests[2]
+            and digests[1] == digests[3]
+            and digests[0] != digests[1]
+        )
+        results.record(
+            "segment_transform_flip_roundtrip",
+            ok,
+            f"replies={replies[0]} digests={[d[:12] for d in digests]}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record(
+            "segment_transform_flip_roundtrip",
+            False,
+            f"{type(error).__name__}: {error}",
+        )
+
+
+def check_segment_export(client: BridgeClient, results: Results, root: Path) -> None:
+    ok, detail = expect_param_error(
+        client,
+        "segment.export_obj",
+        {"segmentId": SMOKE_SEGMENT_ID, "outputPath": "relative/seg.obj"},
+        "outputPath",
+    )
+    results.record("segment_export_obj_requires_absolute_obj_path", ok, detail)
+    ok, detail = expect_param_error(
+        client,
+        "segment.rasterize",
+        {"segmentIds": [SMOKE_SEGMENT_ID], "zMin": 10, "zMax": 10},
+        "zMax",
+    )
+    results.record("segment_rasterize_rejects_empty_z_range", ok, detail)
+    ok, detail = expect_bridge_error(
+        client,
+        "segment.rasterize",
+        {"segmentIds": [SMOKE_SEGMENT_ID, "no-such-segment"]},
+        -32007,
+    )
+    results.record("segment_rasterize_unknown_segment", ok, detail)
+
+    obj_path = root / "exports" / f"{SMOKE_SEGMENT_ID}.obj"
+    params = {"segmentId": SMOKE_SEGMENT_ID, "outputPath": str(obj_path)}
+    try:
+        result, _ = client.call("segment.export_obj", params, timeout=RPC_TIMEOUT)
+        status = wait_for_job(client, result["jobId"], timeout=120.0)
+        ok = (
+            result.get("outputPath") == str(obj_path)
+            and status.get("state") == "succeeded"
+            and status.get("outputPath") == str(obj_path)
+            and obj_path.is_file()
+        )
+        results.record("segment_export_obj_job", ok, f"result={result} status={status}")
+    except BridgeError as error:
+        # A build without vc_tifxyz2obj reports the missing tool explicitly.
+        results.record("segment_export_obj_job", error.code == -32006,
+                       f"code={error.code} message={error.message}")
+        return
+    except Exception as error:  # noqa: BLE001
+        results.record("segment_export_obj_job", False,
+                       f"{type(error).__name__}: {error}")
+        return
+    if obj_path.is_file():
+        ok, detail = expect_bridge_error(client, "segment.export_obj", params, -32005)
+        results.record("segment_export_obj_refuses_existing_file", ok, detail)
+
+
+def check_segment_tool_operations(client: BridgeClient, results: Results) -> None:
+    ok, detail = expect_bridge_error(
+        client,
+        "segment.neighbor_copy",
+        {"segmentId": SMOKE_SEGMENT_ID, "direction": "out",
+         "volumeId": "no-such-volume"},
+        -32007,
+    )
+    results.record("segment_neighbor_copy_unknown_volume", ok, detail)
+    ok, detail = expect_param_error(
+        client,
+        "segments.merge",
+        {"segmentIds": [SMOKE_SEGMENT_ID]},
+        "segmentIds",
+    )
+    results.record("segments_merge_needs_two_segments", ok, detail)
+    ok, detail = expect_param_error(
+        client,
+        "segments.merge",
+        {"grid": [[SMOKE_SEGMENT_ID, "initial-segment"]],
+         "ransacMinThresh": 10, "ransacMaxThresh": 5},
+        "ransacMinThresh",
+    )
+    results.record("segments_merge_rejects_inverted_thresholds", ok, detail)
+    ok, detail = expect_bridge_error(
+        client,
+        "segments.merge",
+        {"segmentIds": [SMOKE_SEGMENT_ID, "no-such-segment"]},
+        -32007,
+    )
+    results.record("segments_merge_unknown_segment", ok, detail)
+    ok, detail = expect_param_error(
+        client,
+        "segments.patch",
+        {"segmentIds": [SMOKE_SEGMENT_ID, SMOKE_SEGMENT_ID], "confirm": True},
+        "segmentIds",
+    )
+    results.record("segments_patch_needs_two_distinct_segments", ok, detail)
+    ok, detail = expect_param_error(
+        client,
+        "segments.patch",
+        {"segmentIds": [SMOKE_SEGMENT_ID, "initial-segment"]},
+        "confirm",
+    )
+    results.record("segments_patch_requires_confirm", ok, detail)
+
+
+def check_segment_backups(client: BridgeClient, results: Results, root: Path) -> None:
+    """Seeds backup slot 0 by hand, changes the segment, then restores it."""
+    segment = smoke_segment_dir(root)
+    backups = root / "backups" / segment.name
+    slot = backups / "0"
+    try:
+        slot.mkdir(parents=True, exist_ok=True)
+        for item in segment.iterdir():
+            if item.is_file():
+                shutil.copy2(item, slot / item.name)
+        backup_digest = file_digest(slot / "x.tif")
+        client.call(
+            "segment.transform",
+            {"segmentId": SMOKE_SEGMENT_ID, "op": "flip_u"},
+            timeout=RPC_TIMEOUT,
+        )
+        changed_digest = file_digest(segment / "x.tif")
+    except Exception as error:  # noqa: BLE001
+        results.record("segment_restore_backup_roundtrip", False,
+                       f"setup {type(error).__name__}: {error}")
+        return
+
+    try:
+        client.call(
+            "segment.restore_backup",
+            {"segmentId": SMOKE_SEGMENT_ID, "index": 0},
+            timeout=RPC_TIMEOUT,
+        )
+        results.record("segment_restore_backup_lists_without_confirm", False,
+                       "restore ran without confirm")
+    except BridgeError as error:
+        available = error.data.get("available") or []
+        ok = (
+            error.code == -32602
+            and error.data.get("param") == "confirm"
+            and [entry.get("index") for entry in available] == [0]
+            and file_digest(segment / "x.tif") == changed_digest
+        )
+        results.record("segment_restore_backup_lists_without_confirm", ok,
+                       f"code={error.code} available={available}")
+    ok, detail = expect_bridge_error(
+        client,
+        "segment.restore_backup",
+        {"segmentId": SMOKE_SEGMENT_ID, "index": 9, "confirm": True},
+        -32007,
+    )
+    results.record("segment_restore_backup_unknown_index", ok, detail)
+
+    try:
+        restored, _ = client.call(
+            "segment.restore_backup",
+            {"segmentId": SMOKE_SEGMENT_ID, "index": 0, "confirm": True},
+            timeout=RPC_TIMEOUT,
+        )
+        listed = [entry.get("index") for entry in restored.get("backups", [])]
+        snapshot = backups / "1" / "x.tif"
+        ok = (
+            restored.get("restored") is True
+            and changed_digest != backup_digest
+            and file_digest(segment / "x.tif") == backup_digest
+            and listed == [0, 1]
+            and snapshot.is_file()
+            and file_digest(snapshot) == changed_digest
+        )
+        results.record(
+            "segment_restore_backup_roundtrip",
+            ok,
+            f"restored={restored} digests backup={backup_digest[:12]} "
+            f"changed={changed_digest[:12]} now={file_digest(segment / 'x.tif')[:12]}",
+        )
+    except Exception as error:  # noqa: BLE001
+        results.record("segment_restore_backup_roundtrip", False,
+                       f"{type(error).__name__}: {error}")
+
+    ok, detail = expect_bridge_error(
+        client,
+        "segments.move_to_paths",
+        {"segmentId": SMOKE_SEGMENT_ID, "confirm": True},
+        -32009,
+    )
+    results.record("segments_move_to_paths_needs_traces_directory", ok, detail)
+
+
+def project_document(path: Path) -> dict:
+    return json.loads(path.read_text())
+
+
+def entry_locations(document: dict, key: str) -> list[str]:
+    return [
+        entry.get("location") if isinstance(entry, dict) else entry
+        for entry in document.get(key, [])
+    ]
+
+
+def check_project_attachments(
+    client: BridgeClient,
+    results: Results,
+    root: Path,
+    volpkg: Path,
+) -> None:
+    umbilicus = root / "umbilicus.json"
+    umbilicus.write_text(json.dumps(
+        [{"z": z, "y": 8.0, "x": 8.0} for z in (0.0, 8.0, 15.0)]))
+    grid = root / "grids" / "ng"
+    for plane in ("xy", "xz", "yz"):
+        (grid / plane).mkdir(parents=True, exist_ok=True)
+    (grid / "metadata.json").write_text(json.dumps({}))
+
+    def attach(kind: str, location: str) -> dict:
+        reply, _ = client.call(
+            "project.attach", {"kind": kind, "location": location},
+            timeout=RPC_TIMEOUT)
+        return reply
+
+    ok, detail = expect_param_error(
+        client, "project.attach",
+        {"kind": "normal_grid", "location": "relative/grids"}, "location")
+    results.record("project_attach_requires_absolute_path", ok, detail)
+    ok, detail = expect_bridge_error(
+        client, "project.attach",
+        {"kind": "normal_grid", "location": "S3://bucket/grids"}, -32007)
+    results.record("project_attach_refuses_remote_normal_grid", ok, detail)
+
+    try:
+        first = attach("umbilicus", str(umbilicus))
+        again = attach("umbilicus", str(root / "grids" / ".." / "umbilicus.json"))
+        grid_first = attach("normal_grid", str(grid))
+        grid_again = attach("normal_grid", str(grid) + os.sep)
+        document = project_document(volpkg)
+        ok = (
+            first.get("attached") is True
+            and again.get("alreadyAttached") is True
+            and again.get("location") == first.get("location")
+            and document.get("umbilicus") == str(umbilicus)
+            and grid_first.get("attached") is True
+            and grid_again.get("alreadyAttached") is True
+            and entry_locations(document, "normal_grids").count(str(grid)) == 1
+        )
+        results.record(
+            "project_attach_idempotent_across_spellings", ok,
+            f"umbilicus={first}/{again} grid={grid_first}/{grid_again}")
+    except Exception as error:  # noqa: BLE001
+        results.record("project_attach_idempotent_across_spellings", False,
+                       f"{type(error).__name__}: {error}")
+
+    # Reopen: the attachments come back from the project file.
+    try:
+        client.call("volume.open", {"path": str(volpkg)}, timeout=RPC_TIMEOUT)
+        umbilicus_reopened = attach("umbilicus", str(umbilicus))
+        grid_reopened = attach("normal_grid", str(grid))
+        ok = (
+            umbilicus_reopened.get("alreadyAttached") is True
+            and grid_reopened.get("alreadyAttached") is True
+        )
+        results.record("project_attachments_survive_reopen", ok,
+                       f"umbilicus={umbilicus_reopened} grid={grid_reopened}")
+    except Exception as error:  # noqa: BLE001
+        results.record("project_attachments_survive_reopen", False,
+                       f"{type(error).__name__}: {error}")
+
+    ok, detail = expect_param_error(
+        client, "project.detach", {"kind": "umbilicus"}, "confirm")
+    results.record("project_detach_requires_confirm", ok, detail)
+    ok, detail = expect_bridge_error(
+        client, "project.detach",
+        {"kind": "normal_grid", "location": str(root / "missing"), "confirm": True},
+        -32007)
+    results.record("project_detach_unknown_entry", ok, detail)
+    try:
+        grid_detached, _ = client.call(
+            "project.detach",
+            {"kind": "normal_grid", "location": str(grid) + os.sep, "confirm": True},
+            timeout=RPC_TIMEOUT)
+        umbilicus_detached, _ = client.call(
+            "project.detach", {"kind": "umbilicus", "confirm": True},
+            timeout=RPC_TIMEOUT)
+        document = project_document(volpkg)
+        ok = (
+            grid_detached.get("detached") is True
+            and grid_detached.get("location") == str(grid)
+            and str(grid) not in entry_locations(document, "normal_grids")
+            and umbilicus_detached.get("detached") is True
+            and not document.get("umbilicus")
+            and grid.is_dir()
+            and umbilicus.is_file()
+        )
+        results.record("project_detach_by_any_spelling", ok,
+                       f"grid={grid_detached} umbilicus={umbilicus_detached}")
+    except Exception as error:  # noqa: BLE001
+        results.record("project_detach_by_any_spelling", False,
+                       f"{type(error).__name__}: {error}")
+
+    # Save As continues the session on the copy, like the File menu.
+    copy = root / "copy.volpkg.json"
+    try:
+        saved, _ = client.call("project.save_as", {"path": str(copy)},
+                               timeout=RPC_TIMEOUT)
+        ok, detail = expect_bridge_error(
+            client, "project.save_as", {"path": str(copy)}, -32005)
+        attach("umbilicus", str(umbilicus))
+        ok = (
+            ok
+            and saved.get("saved") is True
+            and saved.get("path") == str(copy)
+            and project_document(copy).get("umbilicus") == str(umbilicus)
+            and not project_document(volpkg).get("umbilicus")
+        )
+        results.record("project_save_as_switches_to_copy", ok,
+                       f"saved={saved} {detail}")
+    except Exception as error:  # noqa: BLE001
+        results.record("project_save_as_switches_to_copy", False,
+                       f"{type(error).__name__}: {error}")
+    finally:
+        try:
+            client.call("volume.open", {"path": str(volpkg)}, timeout=RPC_TIMEOUT)
+        except Exception as error:  # noqa: BLE001
+            results.record("project_reopen_original", False,
+                           f"{type(error).__name__}: {error}")
+
+
+def check_ink_overlay(client: BridgeClient, results: Results) -> None:
+    try:
+        state, _ = client.call("viewer.get_ink_overlay", {"refresh": True},
+                               timeout=RPC_TIMEOUT)
+        ok = (
+            isinstance(state.get("available"), list)
+            and 0.0 <= state.get("opacity", -1) <= 1.0
+            and "" in state.get("colormaps", [])
+        )
+        results.record("viewer_get_ink_overlay", ok, f"state={state}")
+    except Exception as error:  # noqa: BLE001
+        results.record("viewer_get_ink_overlay", False,
+                       f"{type(error).__name__}: {error}")
+        return
+    ok, detail = expect_bridge_error(
+        client, "viewer.set_ink_overlay", {"path": "/no/such/detection.png"}, -32007)
+    results.record("viewer_set_ink_overlay_unknown_path", ok, detail)
+    ok, detail = expect_param_error(
+        client, "viewer.set_ink_overlay", {"colormap": "no-such-map"}, "colormap")
+    results.record("viewer_set_ink_overlay_unknown_colormap", ok, detail)
+    try:
+        before = state.get("opacity")
+        revision = client.call("state.get", {}, timeout=RPC_TIMEOUT)[0].get("revision", 0)
+        changed, _ = client.call(
+            "viewer.set_ink_overlay",
+            {"opacity": 0.25, "flipHorizontal": True},
+            timeout=RPC_TIMEOUT,
+        )
+        try:
+            # The notification is written before the response.
+            note = client.wait_for_notification(
+                "state.changed",
+                predicate=lambda p: ("overlay" in p.get("changed", [])
+                                     and p.get("revision", -1) > revision),
+                timeout=5.0,
+            )
+            results.record("viewer_set_ink_overlay_state_changed", True, f"note={note}")
+        except TimeoutError as error:
+            results.record("viewer_set_ink_overlay_state_changed", False, str(error))
+        restored, _ = client.call(
+            "viewer.set_ink_overlay",
+            {"opacity": before, "flipHorizontal": state.get("flipHorizontal")},
+            timeout=RPC_TIMEOUT,
+        )
+        ok = (
+            changed.get("opacity") == 0.25
+            and changed.get("flipHorizontal") is True
+            and restored.get("opacity") == before
+        )
+        results.record("viewer_set_ink_overlay_round_trip", ok,
+                       f"changed={changed} restored={restored}")
+    except Exception as error:  # noqa: BLE001
+        results.record("viewer_set_ink_overlay_round_trip", False,
+                       f"{type(error).__name__}: {error}")
+
+
+def check_viewer_display_settings(client: BridgeClient, results: Results) -> None:
+    ok, detail = expect_param_error(client, "viewer.reset", {"fit": "bogus"}, "fit")
+    results.record("viewer_reset_rejects_unknown_fit", ok, detail)
+    try:
+        offset, _ = client.call(
+            "viewer.reset", {"fit": "none", "zOffset": 3}, timeout=RPC_TIMEOUT)
+        reset, _ = client.call("viewer.reset", {}, timeout=RPC_TIMEOUT)
+        ok = (
+            offset.get("fit") == "none"
+            and offset.get("zOffset") == 3
+            and reset.get("fit") == "surface"
+            and reset.get("zOffset") == 0
+            and isinstance(reset.get("viewer"), str)
+            and reset.get("scale", 0) > 0
+        )
+        results.record("viewer_reset", ok, f"offset={offset} reset={reset}")
+    except Exception as error:  # noqa: BLE001
+        results.record("viewer_reset", False, f"{type(error).__name__}: {error}")
+
+    ok, detail = expect_param_error(
+        client, "viewer.set_render_settings",
+        {"focusBounds": {"min": {"x": 0, "y": 0, "z": 0}}},
+        "focusBounds")
+    results.record("render_settings_focus_bounds_needs_both", ok, detail)
+    ok, detail = expect_param_error(
+        client, "viewer.set_render_settings",
+        {"focusBounds": {"min": {"x": 5, "y": 0, "z": 0},
+                         "max": {"x": 1, "y": 4, "z": 4}}},
+        "focusBounds")
+    results.record("render_settings_focus_bounds_ordered", ok, detail)
+    ok, detail = expect_param_error(
+        client, "viewer.set_render_settings",
+        {"composite": {"method": "median"}}, "composite.method")
+    results.record("render_settings_composite_method_enum", ok, detail)
+    try:
+        before, _ = client.call("viewer.get_render_settings", {}, timeout=RPC_TIMEOUT)
+        changed, _ = client.call(
+            "viewer.set_render_settings",
+            {
+                # The smoke volume is 16 voxels on each side.
+                "focusBounds": {"enabled": True,
+                                "min": {"x": 1.4, "y": 1, "z": 1},
+                                "max": {"x": 100, "y": 4, "z": 4}},
+                "composite": {"method": "mean", "layersFront": 3,
+                              "planes": {"xz": True}},
+                "volumetric": {"lighting": 0.5},
+                "axisOverlays": not before.get("axisOverlays"),
+            },
+            timeout=RPC_TIMEOUT,
+        )
+        client.call(
+            "viewer.set_render_settings",
+            {
+                "focusBounds": {"enabled": False},
+                "composite": before.get("composite", {}),
+                "volumetric": before.get("volumetric", {}),
+                "axisOverlays": before.get("axisOverlays"),
+            },
+            timeout=RPC_TIMEOUT,
+        )
+        focus = changed.get("focusBounds", {})
+        composite = changed.get("composite", {})
+        ok = (
+            focus.get("enabled") is True
+            and focus.get("min") == {"x": 1, "y": 1, "z": 1}
+            and focus.get("max") == {"x": 15, "y": 4, "z": 4}
+            and composite.get("method") == "mean"
+            and composite.get("layersFront") == 3
+            and composite.get("planes", {}).get("xz") is True
+            and changed.get("volumetric", {}).get("lighting") == 0.5
+            and changed.get("axisOverlays") is (not before.get("axisOverlays"))
+        )
+        results.record("render_settings_docks_round_trip", ok,
+                       f"focus={focus} composite={composite} "
+                       f"volumetric={changed.get('volumetric')}")
+    except Exception as error:  # noqa: BLE001
+        results.record("render_settings_docks_round_trip", False,
+                       f"{type(error).__name__}: {error}")
+    try:
+        overlay, _ = client.call("viewer.get_overlay", {}, timeout=RPC_TIMEOUT)
+        original = overlay.get("interpolation")
+        target = "trilinear" if original != "trilinear" else "nearest"
+        changed, _ = client.call(
+            "viewer.set_overlay", {"interpolation": target},
+            timeout=RPC_TIMEOUT)
+        client.call("viewer.set_overlay", {"interpolation": original},
+                    timeout=RPC_TIMEOUT)
+        ok = original in ("nearest", "trilinear") and changed.get("interpolation") == target
+        results.record("overlay_interpolation_round_trip", ok,
+                       f"original={original} changed={changed.get('interpolation')}")
+    except Exception as error:  # noqa: BLE001
+        results.record("overlay_interpolation_round_trip", False,
+                       f"{type(error).__name__}: {error}")
+
+
+def check_segmentation_settings(client: BridgeClient, results: Results) -> None:
+    try:
+        settings, _ = client.call("segmentation.get_settings", {}, timeout=RPC_TIMEOUT)
+        z_range = settings.get("zRange", {})
+        ok = (
+            {"drag", "line", "pushPull", "growthMethod", "patchTracer",
+             "approvalMask"} <= set(settings)
+            and "umbilicus_path" not in settings.get("patchTracer", {})
+            and {"enabled", "min", "max"} <= set(z_range)
+            and settings.get("growthMethod") != "manual_add"
+            and 0.0 <= settings.get("approvalMask", {}).get("opacity", -1) <= 1.0
+        )
+        results.record("segmentation_get_settings", ok, f"keys={sorted(settings)}")
+    except Exception as error:  # noqa: BLE001
+        results.record("segmentation_get_settings", False,
+                       f"{type(error).__name__}: {error}")
+        return
+    try:
+        # get_settings feeds back into set_settings unchanged.
+        echoed, _ = client.call("segmentation.set_settings", settings, timeout=RPC_TIMEOUT)
+        radius = settings["drag"]["radius"]
+        target = radius + 1.0
+        # A bound left out keeps its value. A fresh settings store starts at
+        # [0, 0], where min alone cannot rise, so max is raised alone first
+        # and min then rises alone below it.
+        z_min = settings["zRange"]["min"]
+        z_max = max(z_min, settings["zRange"]["max"]) + 3
+        widened, _ = client.call(
+            "segmentation.set_settings",
+            {"zRange": {"enabled": False, "max": z_max}},
+            timeout=RPC_TIMEOUT,
+        )
+        changed, _ = client.call(
+            "segmentation.set_settings",
+            {"drag": {"radius": target}, "zRange": {"enabled": False, "min": z_min + 3}},
+            timeout=RPC_TIMEOUT,
+        )
+        restored, _ = client.call(
+            "segmentation.set_settings",
+            {"drag": {"radius": radius}, "zRange": settings["zRange"]},
+            timeout=RPC_TIMEOUT,
+        )
+        ok = (
+            echoed["drag"] == settings["drag"]
+            and echoed["zRange"] == settings["zRange"]
+            and widened["zRange"] == {"enabled": False, "min": z_min, "max": z_max}
+            and changed["drag"]["radius"] == target
+            and changed["zRange"] == {"enabled": False, "min": z_min + 3, "max": z_max}
+            and restored["drag"]["radius"] == radius
+            and restored["zRange"] == settings["zRange"]
+        )
+        results.record("segmentation_set_settings_round_trip", ok,
+                       f"widened={widened['zRange']} "
+                       f"changed={changed['drag']} {changed['zRange']} "
+                       f"restored={restored['drag']} {restored['zRange']}")
+    except Exception as error:  # noqa: BLE001
+        results.record("segmentation_set_settings_round_trip", False,
+                       f"{type(error).__name__}: {error}")
+    ok, detail = expect_param_error(
+        client, "segmentation.set_settings",
+        {"patchTracer": {"no_such_parameter": 1}}, "patchTracer")
+    results.record("segmentation_set_settings_unknown_patch_key", ok, detail)
+    ok, detail = expect_bridge_error(
+        client, "segmentation.set_settings",
+        {"growthVolumeId": "no-such-volume"}, -32007)
+    results.record("segmentation_set_settings_unknown_volume", ok, detail)
+    ok, detail = expect_param_error(
+        client, "segmentation.set_settings",
+        {"zRange": {"enabled": True, "min": 10, "max": 2}}, "zRange")
+    results.record("segmentation_set_settings_z_range_order", ok, detail)
+    ok, detail = expect_bridge_error(
+        client, "segmentation.approval_mask.undo", {}, -32009)
+    results.record("approval_mask_undo_requires_mode", ok, detail)
 
 
 def check_open_data_editable_copy(
@@ -1829,9 +3016,24 @@ def main() -> int:
             check_viewer_normalization(client, results)
             require_running(proc, results, "viewer normalization")
             check_canvas_normalization(client, results)
+            check_viewer_registry(client, results)
+            check_workspaces(client, results)
+            check_canvas_input(sock_path, client, results)
+            require_running(proc, results, "canvas input")
+            check_state_changes(sock_path, client, results)
+            check_ui_inspect(client, results)
+            check_screenshot_targets(client, results)
 
             check_volume_attach(client, results, tmp_path, volpkg)
             check_segments_attach(client, results, tmp_path, volpkg)
+            check_segment_transform(client, results, tmp_path)
+            check_segment_export(client, results, tmp_path)
+            check_segment_tool_operations(client, results)
+            check_segment_backups(client, results, tmp_path)
+            check_project_attachments(client, results, tmp_path, volpkg)
+            check_ink_overlay(client, results)
+            check_viewer_display_settings(client, results)
+            check_segmentation_settings(client, results)
             check_open_data_editable_copy(client, results, tmp_path, volpkg)
             check_c4(client, results, str(volpkg), str(broken_volpkg))
             check_legacy_fiber_uuid(client, results, str(legacy_fiber_volpkg),

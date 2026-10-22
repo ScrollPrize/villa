@@ -176,18 +176,52 @@ void AgentBridgeServer::registerSessionHandlers()
         },
         [this](const QJsonValue& p) { return handleSegmentsReview(p); });
 
+    auto regionCoordinate = [](const QString& name, double minimum) {
+        AgentBridgeParam param = Params::requiredInteger(name);
+        param.minimum = minimum;
+        return param;
+    };
     registerMethod(
         {
             .name = QStringLiteral("screenshot.capture"),
             .params = {
+                // "window", a viewer id or slot, "dock:<objectName>", or
+                // "workspace:<id>".
                 Params::optionalString(QStringLiteral("target"), QStringLiteral("window")),
                 Params::optionalString(QStringLiteral("filePath")),
                 Params::optionalInteger(QStringLiteral("maxDim")),
+                Params::optionalObject(
+                    QStringLiteral("region"),
+                    {
+                        regionCoordinate(QStringLiteral("x"), 0),
+                        regionCoordinate(QStringLiteral("y"), 0),
+                        regionCoordinate(QStringLiteral("width"), 1),
+                        regionCoordinate(QStringLiteral("height"), 1),
+                    }),
+                Params::optionalBoolean(QStringLiteral("reveal"), false),
             },
-            .errors = {-32602, -32002, -32009, -32005},
+            .errors = {-32602, -32002, -32007, -32009, -32005},
             .mcp = mcp(QStringLiteral("vc3d_screenshot"), true),
         },
         [this](const QJsonValue& p) { return handleScreenshotCapture(p); });
+
+    AgentBridgeParam inspectDepth =
+        Params::optionalInteger(QStringLiteral("depth"), 8);
+    inspectDepth.minimum = 0;
+    inspectDepth.maximum = 64;
+    registerMethod(
+        {
+            .name = QStringLiteral("ui.inspect"),
+            .params = {
+                // "window", "focused", "dock:<objectName>" or "workspace:<id>".
+                Params::optionalString(QStringLiteral("root"), QStringLiteral("window")),
+                inspectDepth,
+                Params::optionalBoolean(QStringLiteral("includeHidden"), false),
+            },
+            .errors = {-32602, -32007, -32010},
+            .mcp = mcp(QStringLiteral("vc3d_inspect_ui"), true),
+        },
+        [this](const QJsonValue& p) { return handleUiInspect(p); });
 
     registerMethod(
         {
