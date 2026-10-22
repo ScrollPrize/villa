@@ -1,0 +1,88 @@
+"""Restored entry points stay portable and delegate to the shared algorithms."""
+import ast
+import importlib
+import inspect
+import json
+from pathlib import Path
+import pytest
+from vesuvius.neural_tracing.fiber_trace_3d import fiber_workflows as workflows
+
+
+def test_every_workflow_import_resolves():
+    tree=ast.parse(inspect.getsource(workflows))
+    for node in ast.walk(tree):
+        if isinstance(node,ast.ImportFrom) and node.level==1:
+            if node.module is None:
+                for name in node.names:importlib.import_module('.'+name.name,workflows.__package__)
+                continue
+            module=importlib.import_module('.'+node.module,workflows.__package__)
+            for name in node.names:assert hasattr(module,name.name),(node.module,name.name)
+
+
+def test_restored_modules_import():
+    root=Path(workflows.__file__).parent
+    for path in sorted(root.glob('fiber_*.py')):
+        importlib.import_module('.'+path.stem,workflows.__package__)
+
+
+def test_dispatch_calls_preparation_without_changing_settings(monkeypatch):
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_selected_dataset_eval as selected
+    supplied={'output_root':'unused','parameters':{'rejection_cost':2.5}}
+    monkeypatch.setattr(selected,'run',lambda cfg:cfg)
+    assert workflows.run({'fiber_selected_dataset_eval':supplied}) is supplied
+
+
+def test_trial_override_delegates_through_same_workflow(tmp_path,monkeypatch):
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_selected_dataset_eval as selected
+    path=tmp_path/'recipe.json'
+    path.write_text(json.dumps({'fiber_selected_dataset_eval':{'parameters':{'lr':.1,'width_lr':2},'output_root':'old'}}))
+    monkeypatch.setattr(selected,'run',lambda cfg:cfg)
+    result=workflows.run({'fiber_solver_trial':{'recipe':str(path),'output_root':'new','parameters':{'lr':.05}}})
+    assert result=={'parameters':{'lr':.05,'width_lr':2},'output_root':'new'}
+
+
+def test_dispatch_rejects_ambiguous_or_unknown_tasks():
+    with pytest.raises(ValueError,match='exactly one'):workflows.run({'a':{},'b':{}})
+    with pytest.raises(ValueError,match='Unknown'):workflows.run({'unknown':{}})
+
+
+def test_shared_helpers_not_reimplemented():
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_current_gt_solve as gt
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_enclosure_width_init as enclosure
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_curve_bank as curves
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_surface as surface
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_winding_order as order
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_density_sign_report as report
+    assert gt.enclosure_brackets is enclosure.enclosure_brackets
+    assert surface.CurveBank is curves.CurveBank
+    assert report.ordering is order.ordering
+
+
+def test_native_exporter_uses_standalone_command(monkeypatch):
+    from vesuvius.neural_tracing.fiber_trace_3d import constraint_extraction as native
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_native_workflow import resolve_command
+    monkeypatch.setattr(native.shutil,'which',lambda name:'/bin/exporter' if name=='custom-exporter' else None)
+    assert resolve_command({'binary':'vc_fiber_trace_chunk','args':['afv-constraints','input.json']},
+        {'native_binary':'custom-exporter'})==['/bin/exporter','input.json']
+
+
+def test_native_input_regression_can_be_run_first(tmp_path,monkeypatch):
+    from vesuvius.neural_tracing.fiber_trace_3d import constraint_extraction as native
+    calls=[]
+    monkeypatch.setattr(native,'resolve_native_binary',lambda name,settings:name)
+    monkeypatch.setattr(native.subprocess,'run',lambda command,**kwargs:calls.append(command))
+    native.run_native_constraints(tmp_path/'extract.json',{'native_regression_binary':'test_fiber_trace_winding_bp'})
+    assert calls==[['test_fiber_trace_winding_bp'],['vc_fiber_constraints',str(tmp_path/'extract.json')]]
+
+
+def test_usage_examples_do_not_depend_on_local_experiments():
+    root=Path(__file__).parents[1]/'docs/examples/fiber_workflows'
+    for path in root.glob('*.json'):
+        text=path.read_text();json.loads(text)
+        assert '/home/hendrik' not in text and 'global-fiber-sgd/' not in text,path
+
+
+def test_reviewed_json_requires_explicit_scan_identity(tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_json_solve import convert
+    with pytest.raises(TypeError,match='expected_manifest_tokens'):
+        convert(tmp_path,tmp_path/'source.afv',tmp_path/'out.afv')

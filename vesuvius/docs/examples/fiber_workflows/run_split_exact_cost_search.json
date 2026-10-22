@@ -1,0 +1,106 @@
+{
+  "fiber_split_weight_search": {
+    "base_config": "/configs/fiber-layout/base.json",
+    "dataset": "/data/fiber-layout/selected",
+    "baseline_root": "/data/fiber-layout/prepared",
+    "gt_root": "/data/fiber-layout/gt",
+    "output_root": "/data/fiber-layout/search/run_split_exact_cost_search",
+    "reuse_roots": [],
+    "wait_for_reports": [],
+    "background": false,
+    "accepted_improvements": null,
+    "devices": [
+      "0",
+      "1"
+    ],
+    "initial_parameters": {
+      "split_target_length_vx": 0,
+      "split_min_perpendicular": 4,
+      "continuation_weight": 10,
+      "rejection_cost": 2.5,
+      "rejection_perpendicular_cost": 0,
+      "rejection_parallel_cost": 0,
+      "rejection_continuation_cost": 0
+    },
+    "weights": [
+      "split_target_length_vx",
+      "rejection_cost",
+      "rejection_perpendicular_cost",
+      "rejection_parallel_cost",
+      "rejection_continuation_cost",
+      "continuation_weight",
+      "split_min_perpendicular"
+    ],
+    "bounds": {
+      "split_target_length_vx": [
+        0,
+        16000
+      ],
+      "split_min_perpendicular": [
+        1,
+        32
+      ],
+      "continuation_weight": [
+        0,
+        10000
+      ],
+      "rejection_cost": [
+        0,
+        10000
+      ],
+      "rejection_perpendicular_cost": [
+        0,
+        10000
+      ],
+      "rejection_parallel_cost": [
+        0,
+        10000
+      ],
+      "rejection_continuation_cost": [
+        0,
+        10000
+      ]
+    },
+    "absolute_values": {
+      "split_target_length_vx": [
+        0,
+        2000,
+        4000,
+        8000
+      ],
+      "rejection_cost": [
+        0,
+        0.25,
+        1.25,
+        2.5,
+        5,
+        10
+      ],
+      "rejection_perpendicular_cost": [
+        0,
+        0.01,
+        0.1,
+        0.5,
+        2
+      ],
+      "rejection_parallel_cost": [
+        0,
+        0.01,
+        0.1,
+        0.5
+      ],
+      "rejection_continuation_cost": [
+        0,
+        0.01,
+        0.1,
+        0.5
+      ],
+      "continuation_weight": [
+        0,
+        0.1,
+        1,
+        100
+      ]
+    }
+  }
+}
