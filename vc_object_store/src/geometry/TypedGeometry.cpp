@@ -155,12 +155,11 @@ Geometry decode(const objects::GeometryData& data)
     } else if (data.kind == "fiber") {
         result = Fiber{xyzValues<double>(require(data, "control_points", "<f8", 2).bytes),
             xyzValues<double>(require(data, "line_points", "<f8", 2).bytes)};
-        {
-            auto& fiber=std::get<Fiber>(result);
-            const auto& ids=require(data,"control_point_ids","<i8",1);
-            fiber.controlPointIds.resize(ids.bytes.size()/8); copyScalars<int64_t>(ids.bytes,fiber.controlPointIds);
-            PointCollection{fiber.controlPointIds,fiber.controlPoints}.validate();
-        }
+        auto& fiber = std::get<Fiber>(result);
+        const auto& ids = require(data, "control_point_ids", "<i8", 1);
+        fiber.controlPointIds.resize(ids.bytes.size() / 8);
+        copyScalars<int64_t>(ids.bytes, fiber.controlPointIds);
+        PointCollection{fiber.controlPointIds, fiber.controlPoints}.validate();
     } else if (data.kind == "track") {
         result = Track{xyzValues<int32_t>(require(data, "points", "<i4", 2).bytes)};
     } else if (data.kind == "patch") {

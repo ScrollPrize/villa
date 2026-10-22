@@ -75,16 +75,22 @@ int main() try {
     auto reverse = original;
     std::reverse(reverse.controlPoints.begin(), reverse.controlPoints.end());
     std::reverse(reverse.controlPointIds.begin(), reverse.controlPointIds.end());
+    bool rejected = false;
     mustFail([&] { session.act(attachment, pins, [&](auto& db, auto& txn) {
-        mustFail([&] { updateGeometryArrays(db, txn, uuid, vc::geometry::encode(reverse), initial); });
+        try { updateGeometryArrays(db, txn, uuid, vc::geometry::encode(reverse), initial); }
+        catch (const std::exception&) { rejected = true; }
     }); });
+    require(rejected, "directional reorder requires an explicit transform");
     auto partial = original;
     partial.controlPoints[0][0] = 9; // This sparse update precedes the failing resize.
     partial.linePoints.push_back({2,0,0});
+    rejected = false;
     mustFail([&] { session.act(attachment, pins, [&](auto& db, auto& txn) {
-        mustFail([&] { updateGeometryArrays(db, txn, uuid, vc::geometry::encode(partial), initial); });
+        try { updateGeometryArrays(db, txn, uuid, vc::geometry::encode(partial), initial); }
+        catch (const std::exception&) { rejected = true; }
         require(db.currentGeometry(txn, uuid)->uuid == initial, "failed helper rolls back every array");
     }); });
+    require(rejected, "annotated sample resize requires an explicit transform");
     session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
         require(db.currentGeometry(txn, uuid)->uuid == initial, "caught failures cannot partially commit");
     });

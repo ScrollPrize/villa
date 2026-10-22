@@ -196,7 +196,6 @@ inline bool dependenciesChanged(const Anchor& anchor, const DependencyGeometry& 
             auto identity=[&](const DependencyGeometry& geometry) -> std::optional<int64_t> {
                 const auto index=point.index[0];
                 if (index<0 || index>=geometry.arrays.at("control_points").shape[0]) return std::nullopt;
-                if (!geometry.arrays.contains("control_point_ids")) return index;
                 const auto bytes=geometry.read("control_point_ids",index*8,8);
                 std::array<int64_t,1> value; copyScalars<int64_t>(bytes,value); return value[0];
             };

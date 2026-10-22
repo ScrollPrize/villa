@@ -13,15 +13,15 @@ namespace vc::objects {
 using Json = nlohmann::json;
 size_t fiberBranchControlIndex(const std::vector<int64_t>& controlIds, const Anchor& anchor)
 {
-        if (anchor.points.size() != 1 || anchor.points.front().index.size() != 1)
-            throw std::runtime_error("Fiber branch must identify one control point");
-        const auto& point = anchor.points.front();
-        const auto id = point.index.front();
-        if (point.array == "control_point_ids") {
-            const auto found = std::find(controlIds.begin(), controlIds.end(), id);
-            if (found != controlIds.end()) return size_t(found - controlIds.begin());
-        }
-        throw std::runtime_error("Fiber branch control point is absent from selected geometry");
+    if (anchor.points.size() != 1 || anchor.points.front().index.size() != 1)
+        throw std::runtime_error("Fiber branch must identify one control point");
+    const auto& point = anchor.points.front();
+    const auto id = point.index.front();
+    if (point.array == "control_point_ids") {
+        const auto found = std::find(controlIds.begin(), controlIds.end(), id);
+        if (found != controlIds.end()) return size_t(found - controlIds.begin());
+    }
+    throw std::runtime_error("Fiber branch control point is absent from selected geometry");
 }
 
 FiberDocument decodeFiberJson(const std::string& text)

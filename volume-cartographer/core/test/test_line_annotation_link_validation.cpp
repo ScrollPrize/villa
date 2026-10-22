@@ -184,3 +184,13 @@ TEST_CASE("link validation: reversed line orientation is what breaks a copied di
     const cv::Vec3d onReversed = vc3d::line_annotation::endpointTangentFromLinePoints(reversed, point);
     CHECK_FALSE(vc3d::line_annotation::branchDirectionsCompatible(forward, onReversed));
 }
+
+TEST_CASE("link validation: labels are independent of object identity")
+{
+    auto fibers = makeNetwork();
+    for (auto& fiber : fibers) {
+        fiber.fileName = "duplicate.json";
+        for (auto& branch : fiber.branches) branch.branchFileName.clear();
+    }
+    CHECK(collect(fibers).empty());
+}

@@ -1348,7 +1348,6 @@ generatedControlMarkers(
     return markers;
 }
 
-
 void remapBranchControlPointIndices(
     const std::vector<vc3d::line_annotation::LineControlPoint>& oldControls,
     const std::vector<vc3d::line_annotation::LineControlPoint>& newControls,
@@ -7371,6 +7370,10 @@ void LineAnnotationController::discardFiberPanes(const std::vector<uint64_t>& fi
 
 void LineAnnotationController::onVolumePackageChanged(std::shared_ptr<VolumePkg> /*pkg*/)
 {
+    if (_intersectionInspection) {
+        cleanupIntersectionInspectionSurfaces();
+        _intersectionInspection.reset();
+    }
     std::vector<uint64_t> ids{0};
     for (const auto& pane : _panes) if (pane.session) ids.push_back(pane.session->fiberId);
     discardFiberPanes(ids);
@@ -17325,9 +17328,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
                 if (meta.contains(key)) fiber.coordinateIdentity[key] = meta.at(key);
             auto source = meta.value("source", Json::object());
             auto incoming = fiberSourceMetadata(fiber);
-            source.erase("control_points_attributes"); source.erase("line_points_attributes");
             source.update(incoming, true);
-            source.erase("branches"); source.erase("adjacent_branches");
             int64_t nextId = source.value("next_control_point_id", int64_t(0));
             for (const auto& cp : fiber.controlPoints) nextId = std::max(nextId, cp.storeId + 1);
             std::set<int64_t> ids;
@@ -17356,10 +17357,9 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
             } else {
                 const auto revision = updateGeometryArrays(db, txn, fiber.uuid, dataToSave, head->uuid,
                     {{"control_points", source.at("control_points_attributes").dump()}}, decisions);
-                head = db.geometryRevision(txn, revision);
                 geometryHeads[fiber.uuid] = revision;
                 // Sequence annotations are immutable and live with geometry.
-                source.erase("control_points_attributes"); source.erase("line_points_attributes");
+                source.erase("control_points_attributes");
                 meta["source"] = source; record.meta = meta.dump(); db.upsertObject(txn, record);
             }
         }
@@ -17419,7 +17419,7 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         auto& fiber = snapshot.fiber;
         fiber.storePin = PinnedObject{*attachment, {attachment->storeUuid, fiber.uuid},
                                      *committed.at(fiber.uuid), geometryHeads.at(fiber.uuid)};
-            _fiberIdsByUuid[attachment->storeUuid + "/" + fiber.uuid] = fiber.id;
+        _fiberIdsByUuid[attachment->storeUuid + "/" + fiber.uuid] = fiber.id;
     }
     snapshots = std::move(edits);
     for (auto& fiber : _fibers) if (fiber.storePin && committed.contains(fiber.uuid) && committed.at(fiber.uuid))
