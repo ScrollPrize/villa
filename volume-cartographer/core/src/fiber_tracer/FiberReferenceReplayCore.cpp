@@ -98,6 +98,7 @@ FiberReplayTraceResult traceReferenceReplayCore(
         bool filtered = false;
         bool presenceFiltered = false;
         bool rejectedObservedPoint = false;
+        bool stopScoreFiltered = false;
         size_t checkedPoint = 0;
         size_t checkedMatches = 0;
         double checkedArc = segmentStartArc;
@@ -221,10 +222,12 @@ FiberReplayTraceResult traceReferenceReplayCore(
             start, endArcBase - segmentStartArc, maximumSteps, observe,
             segmentProgress);
 
-        if (terminationReason == "invalid_width" || terminationReason == "presence_cutoff" || terminationReason == "width_cutoff") {
+        if (terminationReason == "invalid_width" || terminationReason == "presence_cutoff" ||
+            terminationReason == "width_cutoff" || terminationReason == "stop_score") {
             if (!consistency.nextSeed) throw std::logic_error("invalid-width filtering requires restart search");
             filtered = true;
             presenceFiltered = true;
+            stopScoreFiltered = terminationReason == "stop_score";
         }
 
         if (excursion.outsideTravel) distanceFailed = true;
@@ -277,7 +280,8 @@ FiberReplayTraceResult traceReferenceReplayCore(
             segment.cumulativeLosses.resize(checkedPoint + 1);
             segment.matches.resize(checkedMatches);
             segment.endReferenceArcBase = checkedArc;
-            segment.terminationReason = presenceFiltered ? "presence_filtered" : "reverse_consistency_filtered";
+            segment.terminationReason = stopScoreFiltered && presenceFiltered ? "stop_score_filtered"
+                : presenceFiltered ? "presence_filtered" : "reverse_consistency_filtered";
             result.segments.push_back(std::move(segment));
             const double searchArc = std::max(detectedArc, segmentStartArc) + nominalStepBase;
             if (searchArc < endArcBase) predictedSeed = findSeed(searchArc);

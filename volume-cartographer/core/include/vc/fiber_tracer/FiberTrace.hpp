@@ -139,6 +139,12 @@ struct FiberTraceConfig {
     // Opt-in direct CPU eligibility, independent of the width-weighted objective.
     bool replayPresenceIgnoreWidth = false;
     double widthHardRelativeTolerance = 0.0; // zero disabled; inclusive relative deviation
+    // Opt-in stop score (beam tracer only); all-zero weights disable it. Before
+    // each committed step the trace ends with reason "stop_score" when
+    // bias + weights . [presence, axis agreement, lateral rival] > 0
+    // (features: fiberStopScoreFeatures).
+    std::array<double, 3> stopScoreWeights{0.0, 0.0, 0.0};
+    double stopScoreBias = 0.0;
     // Existing reference-replay consistency controls; zero interval disables them.
     double replayReverseIntervalBase = 0.0;
     double replayReverseNormalRadiusBase = 20.0;
@@ -751,6 +757,25 @@ struct CandidateScoreDebug {
     const std::function<bool(const cv::Vec3d&, double, int)>& committedStep = {},
     const std::vector<cv::Vec3d>& initialStepDirections = {},
     double* observedWidthMean = nullptr);
+
+// Point-only features of the opt-in stop score at a committed trace point,
+// with the step from previous as its tangent (trace voxels; nonzero step):
+// presence is the strongest valid option's presence, axisAgreement is
+// |cos| between that option's direction and the step, lateralRival is the
+// strongest valid presence 8, 16 or 24 base voxels to the side (four
+// directions perpendicular to the step) minus presence.
+struct FiberStopScoreFeatures {
+    double presence = 0.0;
+    double axisAgreement = 0.0;
+    double lateralRival = 0.0;
+};
+[[nodiscard]] FiberStopScoreFeatures fiberStopScoreFeatures(
+    const FiberPredictionSource& predictions, const cv::Vec3d& point,
+    const cv::Vec3d& previous, double traceToBaseScale);
+[[nodiscard]] bool fiberStopScoreEnabled(const FiberTraceConfig& config);
+// bias + weights . features; the trace stops where this is positive.
+[[nodiscard]] double fiberStopScore(const FiberTraceConfig& config,
+                                    const FiberStopScoreFeatures& features);
 
 // Evaluation adapter: length-bounded beam tracing towards the reference end,
 // with committed-point observation (no target-plane snapping). widthMean is
