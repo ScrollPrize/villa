@@ -433,7 +433,7 @@ void transformSurfacePoints(QuadSurface* surface,
             && (std::abs(spacingScaleX - 1.0) > 1e-4 || std::abs(spacingScaleY - 1.0) > 1e-4)) {
             surface->resample(static_cast<float>(spacingScaleX),
                               static_cast<float>(spacingScaleY),
-                              cv::INTER_LINEAR);
+                              cv::INTER_LINEAR, /*pointGrid=*/true);
             surface->_scale = originalScale;
             surface->invalidateCache();
         }

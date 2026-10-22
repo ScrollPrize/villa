@@ -12,6 +12,7 @@
 
 #include <opencv2/core.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <memory>
 #include <optional>
@@ -246,6 +247,26 @@ TEST_CASE("transformSurfacePoints with sentinel points leaves them as sentinels"
     auto* p = qs.rawPointsPtr();
     REQUIRE(p);
     CHECK((*p)(1, 1)[0] == -1.f);
+}
+
+TEST_CASE("transformSurfacePoints regrid keeps node j on source parameter j / k")
+{
+    // A 40 x 40 unit plane scaled by k is regridded back to unit spacing (round(40 k) nodes per
+    // axis). Node j must land at j voxels. The pixel centre rule puts it at j - 0.5 (k - 1), that is
+    // 0.5 (1 - 1/k) source cells off. The last k nodes are skipped: they clamp at the far edge.
+    for (double k : {2.0, 4.0}) {
+        QuadSurface qs(makePlanarGrid(40, 40), cv::Vec2f(1.f, 1.f));
+        transformSurfacePoints(&qs, 1.0, scaleMatrix(k), 1.0);
+        auto* p = qs.rawPointsPtr();
+        REQUIRE(p);
+        REQUIRE(p->cols == static_cast<int>(std::lround(40 * k)));
+        const int n = p->cols - static_cast<int>(k);
+        double worst = 0.0;
+        for (int r = 0; r < n; ++r)
+            for (int c = 0; c < n; ++c)
+                worst = std::max({worst, std::abs(double((*p)(r, c)[0]) - c), std::abs(double((*p)(r, c)[1]) - r)});
+        CHECK_MESSAGE(worst < 1e-3, "k " << k << ": worst node offset " << worst << " voxels");
+    }
 }
 
 TEST_CASE("refreshTransformedSurfaceState writes bbox + scale into meta")

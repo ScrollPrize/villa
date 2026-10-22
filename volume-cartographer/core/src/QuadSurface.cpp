@@ -399,7 +399,8 @@ LazySurfaceGeometry readLazySurfaceGeometry(const std::filesystem::path& path,
 
 cv::Mat_<cv::Vec3f> resamplePointsLinearPreservingInvalids(
     const cv::Mat_<cv::Vec3f>& points,
-    const cv::Size& newSize)
+    const cv::Size& newSize,
+    float c = 0.5f)  // 0.5: pixel centres (image rule); 0: node 0 stays on node 0 (point grid)
 {
     cv::Mat_<cv::Vec3f> resampled(newSize.height, newSize.width,
                                   cv::Vec3f(-1.0f, -1.0f, -1.0f));
@@ -417,7 +418,7 @@ cv::Mat_<cv::Vec3f> resamplePointsLinearPreservingInvalids(
     std::vector<int> x0v(newSize.width), x1v(newSize.width);
     std::vector<float> fxv(newSize.width);
     for (int dstX = 0; dstX < newSize.width; ++dstX) {
-        float srcX = (static_cast<float>(dstX) + 0.5f) * xScale - 0.5f;
+        float srcX = (static_cast<float>(dstX) + c) * xScale - c;
         srcX = std::clamp(srcX, 0.0f, static_cast<float>(points.cols - 1));
         const int x0 = static_cast<int>(std::floor(srcX));
         x0v[dstX] = x0;
@@ -427,7 +428,7 @@ cv::Mat_<cv::Vec3f> resamplePointsLinearPreservingInvalids(
 
     #pragma omp parallel for schedule(static)
     for (int dstY = 0; dstY < newSize.height; ++dstY) {
-        float srcY = (static_cast<float>(dstY) + 0.5f) * yScale - 0.5f;
+        float srcY = (static_cast<float>(dstY) + c) * yScale - c;
         srcY = std::clamp(srcY, 0.0f, static_cast<float>(points.rows - 1));
         const int y0 = static_cast<int>(std::floor(srcY));
         const int y1 = std::min(y0 + 1, points.rows - 1);
@@ -3364,7 +3365,7 @@ void QuadSurface::resample(float factor, int interpolation)
     resample(factor, factor, interpolation);
 }
 
-void QuadSurface::resample(float factor_x, float factor_y, int interpolation)
+void QuadSurface::resample(float factor_x, float factor_y, int interpolation, bool pointGrid)
 {
     ensureLoaded();
     if (!_points || _points->empty()) {
@@ -3386,7 +3387,7 @@ void QuadSurface::resample(float factor_x, float factor_y, int interpolation)
     // Resample points without blending across invalid markers.
     cv::Mat_<cv::Vec3f> resampledMat;
     if (interpolation == cv::INTER_LINEAR) {
-        resampledMat = resamplePointsLinearPreservingInvalids(*_points, newSize);
+        resampledMat = resamplePointsLinearPreservingInvalids(*_points, newSize, pointGrid ? 0.0f : 0.5f);
     } else {
         cv::resize(*_points, resampledMat, newSize, 0, 0, interpolation);
     }
