@@ -1488,6 +1488,9 @@ std::string serialize_zarray(const ZarrMetadata& meta) {
     } else if (meta.compressor_id == "volcomp") {
         s += "  \"compressor\": {\"id\": \"volcomp\", \"q\": "
              + std::to_string(meta.codec_q.value_or(8.0f)) + "},\n";
+    } else if (meta.compressor_id == "volcodec_ng") {
+        // Lossless, no parameters.
+        s += "  \"compressor\": {\"id\": \"volcodec_ng\"},\n";
     } else {
         // zstd, gzip, zlib, bz2, ...
         s += "  \"compressor\": {\"id\": \"" + meta.compressor_id + "\", \"level\": "

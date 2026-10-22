@@ -32,3 +32,12 @@ target_compile_features(utils_volcomp_codec PUBLIC cxx_std_23)
 target_link_libraries(utils_volcomp_codec PUBLIC volcomp)
 target_compile_definitions(utils_volcomp_codec PUBLIC UTILS_HAS_VOLCOMP_CODEC=1)
 set_target_properties(utils_volcomp_codec PROPERTIES AUTOMOC OFF AUTORCC OFF AUTOUIC OFF)
+
+add_library(utils_volcodec_ng_codec src/volcodec_ng_codec.cpp)
+target_include_directories(utils_volcodec_ng_codec PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+target_compile_features(utils_volcodec_ng_codec PUBLIC cxx_std_23)
+target_link_libraries(utils_volcodec_ng_codec PUBLIC volcodec_ng)
+target_compile_definitions(utils_volcodec_ng_codec PUBLIC UTILS_HAS_VOLCODEC_NG_CODEC=1)
+set_target_properties(utils_volcodec_ng_codec PROPERTIES AUTOMOC OFF AUTORCC OFF AUTOUIC OFF)

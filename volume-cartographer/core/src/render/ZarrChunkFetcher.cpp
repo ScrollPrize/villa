@@ -261,6 +261,8 @@ public:
             persistEncodedExtension_ = ".c3d";
         else if (array_->stores_chunks_with_codec("volcomp"))
             persistEncodedExtension_ = ".volcomp";
+        else if (array_->stores_chunks_with_codec("volcodec_ng"))
+            persistEncodedExtension_ = ".volcodec_ng";
         else if (array_->stores_chunks_with_codec(vc::kDelta3dCodecName) ||
                  array_->stores_chunks_with_codec(vc::kVcz1CodecName))
             persistEncodedExtension_ = vc::kCompressedCacheExtension;
