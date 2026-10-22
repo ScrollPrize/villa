@@ -33,7 +33,7 @@ public:
     ~FiberCollectionController() override;
     QDockWidget* dock() const { return dock_; }
     void setLineAnnotationActive(bool active);
-    void openCollection(const QString& path, bool persist = true, const std::string& expectedUuid = {});
+    void openCollection(const QString& path);
     // Selects the trace under a plain left click that no native tool, collection
     // point or fiber annotation used. Returns true if a trace was selected.
     bool handleVolumeClick(Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
@@ -71,9 +71,7 @@ private:
     QPushButton* next_{};
     QPushButton* openAnnotation_{};
     QPushButton* detach_{};
-    QString path_, attachment_;
-    std::string uuid_, coordinateSpace_;
-    double sourceResolution_{};
+    std::string uuid_;
     int64_t totalFibers_{};
     bool annotationBusy_{false};
     bool lineAnnotationActive_{false};
@@ -108,5 +106,4 @@ private:
     void navigate(int index);
     void request(VolumeViewerBase* viewer, const Slice& slice);
     std::optional<Slice> slice(VolumeViewerBase* viewer) const;
-    QString attachmentPath() const;
 };

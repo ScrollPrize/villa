@@ -9,6 +9,7 @@
 
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <array>
+#include <nlohmann/json.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -57,6 +58,7 @@ struct FiberBranchRef {
 
 struct StoredFiber {
     std::optional<vc::objects::PinnedObject> storePin;
+    nlohmann::json coordinateIdentity = nlohmann::json::object();
     double width = 0.0;
     double widthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
     uint64_t id = 0;
@@ -83,17 +85,6 @@ struct StoredFiber {
     // shape so a downsampled active volume can display them correctly.
     std::optional<std::array<std::size_t, 3>> coordinateBaseShapeZYX;
     bool needsSave = false;
-    // The file's write time as of the READ that produced this record
-    // (loadFiberFile), so a save decided from that read - the adjacent
-    // link heal - can tell a file the sync replaced in the meantime and
-    // leave it alone (the next load heals again). Unset for fibers not
-    // read from disk.
-    std::optional<std::filesystem::file_time_type> loadedWriteTime;
-    // Presence at read time, including an explicitly empty array. Only
-    // a missing array permits restoring adjacent refs from peers.
-    bool adjacentBranchesPresent = true;
-    // healOneSidedAdjacentLinks marked this record for saving.
-    bool adjacentHealed = false;
     // Load put the gap span tags in step with the break point tags (a
     // version-3 file, or one edited by hand); saved back under the same
     // stale-file guard as the adjacent heal.

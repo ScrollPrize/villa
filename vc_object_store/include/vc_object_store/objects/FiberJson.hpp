@@ -17,4 +17,11 @@ std::string encodeFiberJson(const std::string& objectUuid, const GeometryData&,
 // selected object revision. Relationship topology is read separately by callers.
 std::string fiberRevisionJson(const ObjectStore&, const Txn&, const std::string& objectRevision,
                              uint64_t byteBudget = 64 * 1024 * 1024);
+// Export an explicitly pinned fiber graph. Empty roots exports the selection;
+// otherwise exports the connected components containing roots. Applicable
+// fiber_branch edges become reciprocal native branch entries, addressed by
+// UUID.json. Names remain labels. The byte budget applies to each fiber.
+std::map<std::string, std::string> fiberNetworkJson(
+    const ObjectStore&, const Txn&, const RevisionSelection&,
+    const std::vector<std::string>& roots = {}, uint64_t byteBudget = 64 * 1024 * 1024);
 }

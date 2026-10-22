@@ -2652,9 +2652,6 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                     if (_fiberOverlay && viewer) {
                         _fiberOverlay->attachViewer(
                             viewer, _spiralWorkspace->viewerManager());
-                        _fiberOverlay->setViewerBaseToViewerFactor(
-                            viewer, _spiralWorkspace->fiberBaseToPreviewFactor()
-                                        .value_or(1.0));
                     }
                 });
         for (auto* viewer : _spiralWorkspace->viewerManager()->baseViewers()) {
@@ -2669,17 +2666,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             if (_surfacePanel) _surfacePanel->setSpiralFitAvailable(active);
             if (_fiberWidget) _fiberWidget->setSpiralFitAvailable(active);
         });
-        connect(_spiralWorkspace,
-                &SpiralWorkspace::fiberBaseToPreviewFactorChanged,
-                this, [this](double factor, bool valid) {
-                    if (!_fiberOverlay || !_spiralWorkspace ||
-                        !_spiralWorkspace->viewerManager()) return;
-                    const double applied = valid ? factor : 1.0;
-                    _spiralWorkspace->viewerManager()->forEachBaseViewer(
-                        [this, applied](VolumeViewerBase* viewer) {
-                            _fiberOverlay->setViewerBaseToViewerFactor(viewer, applied);
-                        });
-                });
+
     }
     _lineAnnotationController = std::make_unique<LineAnnotationController>(_state,
                                                                            _viewerManager.get(),
@@ -2711,16 +2698,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             [this](uint64_t fiberId, uint64_t generation) {
                 _fiberIntersectionCache.pruneFiber(fiberId);
                 scheduleAtlasSearchDockRefresh();
-                if (_spiralWorkspace && _lineAnnotationController) {
-                    const auto path = _lineAnnotationController->fiberTransportPath(fiberId);
-                    if (!path.empty())
-                        _spiralWorkspace->noteTrackedFiberSaved(
-                            generation, QString::fromStdString(path.string()));
-                }
+
             });
-    connect(_lineAnnotationController.get(), &LineAnnotationController::fiberFileRemoved,
+    connect(_lineAnnotationController.get(), &LineAnnotationController::fiberRetired,
             this, [this](const QString& path) {
-                if (_spiralWorkspace) _spiralWorkspace->noteFiberRemoved(path);
+                if (_spiralWorkspace) _spiralWorkspace->noteFiberRetired(path);
             });
     connect(_lineAnnotationController.get(),
             &LineAnnotationController::fibersDeleted,
@@ -2845,36 +2827,13 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             [this](VolumeViewerBase* viewer) {
                 _fiberOverlay->attachViewer(
                     viewer, _spiralWorkspace->viewerManager());
-                _fiberOverlay->setViewerBaseToViewerFactor(
-                    viewer, _spiralWorkspace->fiberBaseToPreviewFactor()
-                                .value_or(1.0));
             });
     }
-    const auto updateMainFiberViewerScales = [this]() {
-        double factor = 1.0;
-        if (_state && _state->vpkg()) {
-            if (const auto identity = vc3d::opendata::coordinateIdentityForVolume(
-                    *_state->vpkg(), _state->currentVolumeId())) {
-                factor = 1.0 / static_cast<double>(
-                    identity->sourceCoordinateScaleFactor);
-            }
-        }
-        if (_fiberOverlay && _viewerManager) {
-            _viewerManager->forEachBaseViewer([this, factor](VolumeViewerBase* viewer) {
-                _fiberOverlay->setViewerBaseToViewerFactor(viewer, factor);
-            });
-        }
-    };
-    updateMainFiberViewerScales();
-    connect(_state, &CState::volumeChanged, this,
-            [updateMainFiberViewerScales](const std::shared_ptr<Volume>&,
-                                          const std::string&) {
-                updateMainFiberViewerScales();
-            });
-    connect(_viewerManager.get(), &ViewerManager::baseViewerCreated, this,
-            [this, updateMainFiberViewerScales](VolumeViewerBase*) {
-                updateMainFiberViewerScales();
-            });
+    _fiberOverlay->setCoordinateScaleResolver([this](uint64_t id, VolumeViewerBase* viewer) {
+        return _lineAnnotationController->fiberCoordinateScaleForVolume(id, viewer->currentVolume());
+    });
+    connect(_state, &CState::volumeChanged, _fiberOverlay.get(), &FiberOverlayController::invalidateCoordinates);
+    connect(_state, &CState::objectStoreChanged, _fiberOverlay.get(), &FiberOverlayController::invalidateCoordinates);
 
     _rawPointsOverlay = std::make_unique<RawPointsOverlayController>(_state, this);
     _viewerManager->setRawPointsOverlay(_rawPointsOverlay.get());
@@ -8172,15 +8131,7 @@ void CWindow::CreateWidgets(void)
                         if (!_spiralWorkspace || !_lineAnnotationController) {
                             return;
                         }
-                        for (uint64_t fiberId : fiberIds) {
-                            const auto path = _lineAnnotationController->fiberTransportPath(fiberId);
-                            if (path.empty()) {
-                                showStatusBarMessage(tr("Fiber %1 has no committed object-store revision").arg(fiberId), 5000);
-                                continue;
-                            }
-                            _spiralWorkspace->addFiberToCurrentFit(
-                                QString::fromStdString(path.string()));
-                        }
+                        _spiralWorkspace->addFibersToCurrentFit(fiberIds);
                     });
             connect(widget,
                     &CFiberWidget::fiberSliceRequested,

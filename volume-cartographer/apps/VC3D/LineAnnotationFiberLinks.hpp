@@ -29,6 +29,23 @@
 
 namespace vc3d::line_annotation {
 
+template<class Fiber, class Branch, class PointsEqual, class DirectionsCompatible>
+bool reciprocalBranchRefMatches(const Fiber& fiber, const Branch& branch,
+                                const Branch& candidate, PointsEqual pointsEqual,
+                                DirectionsCompatible directionsCompatible)
+{
+    return candidate.adjacent == branch.adjacent &&
+           candidate.branchFileName == fiber.fileName &&
+           candidate.controlPointIndex == branch.branchControlPointIndex &&
+           candidate.branchControlPointIndex == branch.controlPointIndex &&
+           pointsEqual(candidate.controlPointPosition, branch.branchControlPointPosition) &&
+           pointsEqual(candidate.branchControlPointPosition, branch.controlPointPosition) &&
+           directionsCompatible(candidate.controlPointDirection,
+                                branch.branchControlPointDirection) &&
+           directionsCompatible(candidate.branchControlPointDirection,
+                                branch.controlPointDirection);
+}
+
 inline constexpr double kLinkEpsilon = 1.0e-12;
 
 inline bool finitePoint(const cv::Vec3d& v)

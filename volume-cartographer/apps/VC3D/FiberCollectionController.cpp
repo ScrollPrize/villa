@@ -119,10 +119,6 @@ void background(QObject* parent, Work work, Done done)
 }  // namespace
 
 struct FiberCollectionController::View {
-    // One in-flight query per view; successive workers reuse its connection/LRU.
-    // Capturing this context keeps it alive if the collection/view is detached.
-    struct Reader {};
-    std::shared_ptr<Reader> reader;
     std::optional<Slice> requested, displayed, coverageSlice;
     std::optional<Bounds> coverage, pendingBounds;
     std::vector<vc::fibers::Block> blocks;
@@ -378,10 +374,7 @@ void FiberCollectionController::clear()
     openAnnotation_->setEnabled(false);
     selected_ = 0;
     pendingAnnotation_ = 0;
-    path_.clear();
-    attachment_.clear();
     uuid_.clear();
-    coordinateSpace_.clear();
     for (auto& [v, s] : views_) {
         if (s->cancelled)
             s->cancelled->store(true);
@@ -392,7 +385,6 @@ void FiberCollectionController::clear()
         s->coverage.reset();
         s->coverageSlice.reset();
         s->pendingBounds.reset();
-        s->reader.reset();
         s->dirty = true;
     }
     catalogPending_ = false;
@@ -402,10 +394,6 @@ void FiberCollectionController::clear()
     status_->setText(tr("No Object Store Fibers open."));
     selection_->clear();
     refreshAll();
-}
-QString FiberCollectionController::attachmentPath() const
-{
-    return {};
 }
 void FiberCollectionController::projectChanged()
 {
@@ -448,7 +436,7 @@ void FiberCollectionController::volumeChanged()
 {
     projectChanged();
 }
-void FiberCollectionController::openCollection(const QString& path, bool persist, const std::string& expectedUuid)
+void FiberCollectionController::openCollection(const QString& path)
 {
     try {
         state_->attachObjectStore(path,qEnvironmentVariable("USER",qEnvironmentVariable("USERNAME","vc3d")));
@@ -503,7 +491,6 @@ void FiberCollectionController::listPage(bool reset)
     const double minMm = minLength_->value();
     const double min = minMm / nativeVoxelMm_;
     const auto family = familyFilter();
-    const auto path = path_.toStdString();
     catalogBusy_ = true;
     next_->setEnabled(false);
     background<std::vector<vc::fibers::Summary>>(
@@ -599,7 +586,6 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
     along_->setEnabled(false);
     openAnnotation_->setEnabled(false);
     selection_->setText(tr("Loading fiber #%1…").arg(id));
-    const auto path = path_.toStdString();
     background<vc::fibers::Summary>(
         this,
         [connection=state_->objectStoreSession(),pin=pins_.at(id),id,factor=coordinateFactors_.contains(id) ? coordinateFactors_.at(id) : -1]() {
@@ -654,7 +640,6 @@ void FiberCollectionController::navigate(int index)
     const auto id = selected_;
     const auto rev = revision_;
     const auto token = navigationRevision_;
-    const auto path = path_.toStdString();
     background<Point>(
         this,
         [connection=state_->objectStoreSession(),pin=pins_.at(id),index]() {
@@ -763,13 +748,10 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
     auto cancel = std::make_shared<std::atomic_bool>(false);
     v.cancelled = cancel;
     const auto rev = revision_;
-    const auto path = path_.toStdString();
     const double min = minLength_->value() / nativeVoxelMm_;
     const auto family = familyFilter();
     const auto maximum = maxDisplayed_->value();
     const auto selected = selected_;
-    if (!v.reader) v.reader = std::make_shared<View::Reader>();
-    const auto reader = v.reader;
     v.pendingBounds = s.box;
     background<RegionResult>(
         this,

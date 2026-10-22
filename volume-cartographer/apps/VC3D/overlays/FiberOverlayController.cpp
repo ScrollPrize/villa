@@ -1,4 +1,5 @@
 #include "FiberOverlayController.hpp"
+#include "FiberOverlayCoordinates.hpp"
 
 #include "OverlayBatchItem.hpp"
 
@@ -40,6 +41,7 @@ void FiberOverlayController::setChains(std::vector<Chain> chains)
 {
     clearPointChainProjectionCache();
     _transformedChains.clear();
+    _transformedVolumes.clear();
     _chains = std::move(chains);
     if (_chains.empty()) {
         _visible = false;
@@ -47,32 +49,23 @@ void FiberOverlayController::setChains(std::vector<Chain> chains)
     refreshAll();
 }
 
-void FiberOverlayController::setViewerBaseToViewerFactor(
-    VolumeViewerBase* viewer, double factor)
+void FiberOverlayController::setCoordinateScaleResolver(CoordinateScaleResolver resolver)
 {
-    if (!viewer || !(factor > 0.0) || !std::isfinite(factor)) {
-        return;
-    }
-    const auto found = _viewerFactors.find(viewer);
-    if (found != _viewerFactors.end() && found->second == factor) {
-        return;
-    }
-    _viewerFactors[viewer] = factor;
-    _transformedChains.erase(viewer);
-    clearPointChainProjectionCache();
-    refreshViewer(viewer);
+    _coordinateScale = std::move(resolver);
+    invalidateCoordinates();
 }
 
-double FiberOverlayController::viewerBaseToViewerFactor(
-    VolumeViewerBase* viewer) const
+void FiberOverlayController::invalidateCoordinates()
 {
-    const auto found = _viewerFactors.find(viewer);
-    return found == _viewerFactors.end() ? 1.0 : found->second;
+    _transformedChains.clear();
+    _transformedVolumes.clear();
+    clearPointChainProjectionCache();
+    refreshAll();
 }
 
 void FiberOverlayController::detachViewer(VolumeViewerBase* viewer)
 {
-    _viewerFactors.erase(viewer);
+    _transformedVolumes.erase(viewer);
     _transformedChains.erase(viewer);
     ViewerOverlayControllerBase::detachViewer(viewer);
 }
@@ -80,22 +73,15 @@ void FiberOverlayController::detachViewer(VolumeViewerBase* viewer)
 const std::vector<FiberOverlayController::Chain>&
 FiberOverlayController::chainsForViewer(VolumeViewerBase* viewer) const
 {
-    const double factor = viewerBaseToViewerFactor(viewer);
-    if (factor == 1.0) {
-        return _chains;
-    }
-    if (auto found = _transformedChains.find(viewer);
-        found != _transformedChains.end()) {
+    const auto volume = viewer->currentVolume();
+    const auto found = _transformedChains.find(viewer);
+    if (found != _transformedChains.end() && _transformedVolumes.at(viewer) == volume)
         return found->second;
-    }
-    std::vector<Chain> transformed = _chains;
-    const float scale = static_cast<float>(factor);
-    for (auto& chain : transformed) {
-        for (auto& point : chain.points) {
-            point *= scale;
-        }
-    }
-    return _transformedChains.emplace(viewer, std::move(transformed)).first->second;
+    auto transformed = vc3d::boundFiberChains(_chains, [&](uint64_t id) {
+        return _coordinateScale && volume ? _coordinateScale(id, viewer) : std::nullopt;
+    });
+    _transformedVolumes[viewer] = volume;
+    return _transformedChains.insert_or_assign(viewer, std::move(transformed)).first->second;
 }
 
 void FiberOverlayController::setViewDistance(double distance)

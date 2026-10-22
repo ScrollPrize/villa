@@ -46,16 +46,6 @@ vc_register_ctest(catalog_project_dialog test_catalog_project_dialog)
 set_tests_properties(catalog_project_dialog PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
 
-add_executable(test_line_annotation_adjacent_links test_line_annotation_adjacent_links.cpp)
-set_target_properties(test_line_annotation_adjacent_links PROPERTIES
-    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
-target_include_directories(test_line_annotation_adjacent_links PRIVATE
-    ${PROJECT_SOURCE_DIR}/apps/VC3D)
-target_link_libraries(test_line_annotation_adjacent_links PRIVATE Qt6::Core Qt6::Test)
-add_test(NAME line_annotation_adjacent_links COMMAND test_line_annotation_adjacent_links)
-vc_register_test_target(test_line_annotation_adjacent_links)
-vc_register_ctest(line_annotation_adjacent_links test_line_annotation_adjacent_links)
-
 add_executable(test_intersection_layer_item
     test_intersection_layer_item.cpp
     ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/IntersectionLayerItem.cpp

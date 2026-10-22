@@ -3,6 +3,7 @@
 #include "vc_object_store/Uuid.hpp"
 #include "formats/FiberInput.hpp"
 #include <algorithm>
+#include <set>
 
 namespace vc::objects {
 using Json = nlohmann::json;
@@ -87,7 +88,10 @@ std::string fiberRevisionJson(const ObjectStore& db,const Txn& txn,const std::st
     const auto revision=db.objectRevision(txn,objectRevision);
     if(!revision || revision->record.kind!="fiber" || !revision->geometryRevision)
         throw std::runtime_error("Fiber object revision has no geometry");
-    auto source=Json::parse(revision->record.meta).value("source",Json::object());
+    const auto metadata = Json::parse(revision->record.meta);
+    auto source=metadata.value("source",Json::object());
+    for (const auto* key : {"coordinates", "coordinate_binding"})
+        if (metadata.contains(key)) source[key] = metadata.at(key);
     for(const auto* name:{"control_points","line_points"}) {
         const auto attrs=Json::parse(db.geometryPointAnnotations(txn,*revision->geometryRevision,name));
         const auto key=std::string(name)+"_attributes";
@@ -108,6 +112,105 @@ std::string fiberRevisionJson(const ObjectStore& db,const Txn& txn,const std::st
         }
     }
     return encodeFiberJson(revision->objectUuid,db.readGeometryData(txn,*revision->geometryRevision,byteBudget),source.dump());
+}
+
+std::map<std::string, std::string> fiberNetworkJson(
+    const ObjectStore& db, const Txn& txn, const RevisionSelection& selection,
+    const std::vector<std::string>& roots, uint64_t byteBudget)
+{
+    std::map<std::string, ObjectRevision> revisions;
+    for (const auto& [uuid, pin] : selection) {
+        if (!pin) throw std::invalid_argument("Fiber export requires explicit object revision pins");
+        const auto revision = db.objectRevision(txn, *pin);
+        if (!revision || revision->objectUuid != uuid || revision->record.kind != "fiber" ||
+            revision->deleted || revision->record.retired || !revision->geometryRevision)
+            throw std::invalid_argument("Invalid fiber export revision for " + uuid);
+        revisions.emplace(uuid, *revision);
+    }
+    std::vector<EdgeRecord> edges;
+    std::map<std::string, std::vector<std::string>> neighbours;
+    for (const auto& selected : db.relationshipsAt(txn, selection)) {
+        const auto& edge = selected.relationship.record;
+        if (edge.kind != "fiber_branch") continue;
+        // An omitted endpoint must never silently remove a branch constraint.
+        if (!revisions.contains(edge.aUuid) || !revisions.contains(edge.bUuid))
+            throw std::invalid_argument("Fiber export selection is missing a branch endpoint");
+        if (!selected.applicable) continue;
+        edges.push_back(edge);
+        neighbours[edge.aUuid].push_back(edge.bUuid);
+        neighbours[edge.bUuid].push_back(edge.aUuid);
+    }
+    std::set<std::string> included;
+    std::vector<std::string> pending = roots;
+    if (pending.empty()) for (const auto& [uuid, revision] : revisions) pending.push_back(uuid);
+    while (!pending.empty()) {
+        auto uuid = std::move(pending.back()); pending.pop_back();
+        if (!revisions.contains(uuid)) throw std::invalid_argument("Unknown fiber export root " + uuid);
+        if (!included.insert(uuid).second) continue;
+        for (const auto& peer : neighbours[uuid]) pending.push_back(peer);
+    }
+    struct FiberExport {
+        Json document;
+        std::vector<int64_t> controlIds;
+    };
+    std::map<std::string, FiberExport> fibers;
+    for (const auto& uuid : included) {
+        const auto& revision = revisions.at(uuid);
+        FiberExport fiber;
+        fiber.document = Json::parse(fiberRevisionJson(db, txn, revision.uuid, byteBudget));
+        fiber.document["name"] = revision.record.name;
+        fiber.document["filename"] = uuid + ".json";
+        fiber.document["branches"] = Json::array();
+        fiber.document["adjacent_branches"] = Json::array();
+        const auto geometry = db.geometryRevision(txn, *revision.geometryRevision);
+        if (std::any_of(geometry->arrays.begin(), geometry->arrays.end(),
+                       [](const auto& array) { return array.name == "control_point_ids"; })) {
+            const auto data = db.readGeometryArray(txn, *revision.geometryRevision, "control_point_ids");
+            for (size_t i = 0; i < data.size(); i += 8) {
+                uint64_t id = 0;
+                for (size_t byte = 0; byte < 8; ++byte) id |= uint64_t(data[i + byte]) << (8 * byte);
+                fiber.controlIds.push_back(static_cast<int64_t>(id));
+            }
+        }
+        fibers.emplace(uuid, std::move(fiber));
+    }
+    const auto controlIndex = [](const FiberExport& fiber, const Anchor& anchor) -> size_t {
+        if (anchor.points.size() != 1 || anchor.points.front().index.size() != 1)
+            throw std::runtime_error("Fiber branch must identify one control point");
+        const auto& point = anchor.points.front();
+        const auto id = point.index.front();
+        if (point.array == "control_point_ids") {
+            const auto found = std::find(fiber.controlIds.begin(), fiber.controlIds.end(), id);
+            if (found != fiber.controlIds.end()) return size_t(found - fiber.controlIds.begin());
+        } else if (point.array == "control_points" && id >= 0 &&
+                   uint64_t(id) < fiber.document.at("control_points").size()) return size_t(id);
+        throw std::runtime_error("Fiber branch control point is absent from selected geometry");
+    };
+    for (const auto& edge : edges) {
+        if (!included.contains(edge.aUuid)) continue;
+        auto& a = fibers.at(edge.aUuid); auto& b = fibers.at(edge.bUuid);
+        const auto ai = controlIndex(a, edge.aAnchor), bi = controlIndex(b, edge.bAnchor);
+        const auto append = [&](FiberExport& local, const FiberExport& target,
+                                size_t i, size_t j, const Anchor& own, const Anchor& other) {
+            if (!own.direction || !other.direction)
+                throw std::runtime_error("Fiber branch endpoint direction is missing");
+            const auto position = [](const Json& point) { return point.is_object() ? point.at("position") : point; };
+            Json branch{{"edge_uuid", edge.uuid},
+                        {"branch_file", target.document.at("filename")},
+                        {"control_point_index", i}, {"branch_control_point_index", j},
+                        {"control_point_position", position(local.document.at("control_points").at(i))},
+                        {"branch_control_point_position", position(target.document.at("control_points").at(j))},
+                        {"control_point_direction", *own.direction}, {"branch_control_point_direction", *other.direction},
+                        {"pending", edge.approvalState != "approved"}};
+            const bool adjacent = Json::parse(edge.meta).value("adjacent", false);
+            local.document[adjacent ? "adjacent_branches" : "branches"].push_back(std::move(branch));
+        };
+        append(a, b, ai, bi, edge.aAnchor, edge.bAnchor);
+        append(b, a, bi, ai, edge.bAnchor, edge.aAnchor);
+    }
+    std::map<std::string, std::string> result;
+    for (auto& [uuid, fiber] : fibers) result.emplace(uuid, fiber.document.dump());
+    return result;
 }
 
 }

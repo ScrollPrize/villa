@@ -283,7 +283,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     connect(_state,&CState::objectStoreChanged,this,[this](const vc::objects::StoreSessionEvent& event) {
         if(event.kind==vc::objects::StoreSessionEvent::Kind::Attachment) {
             cancelLineAnnotationDraft();
-            _trackedFiberUuids.clear();
+            _trackedFiberPaths.clear();
         }
     });
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
@@ -435,7 +435,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
             });
     connect(_service, &SpiralServiceManager::inputWorkspaceReleased, this, [this]() {
         cancelLineAnnotationDraft();
-        _trackedFiberUuids.clear();
+        _trackedFiberPaths.clear();
         _managedPatchCopies.clear();
     });
     connect(_service, &SpiralServiceManager::inputEditorRequested, this,
@@ -795,9 +795,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 _previewBaseShapeZYX.reset();
                 _fiberBaseShapeZYX.reset();
                 _previewToFiberBaseScale.reset();
-                _fiberBaseToPreviewFactor.reset();
                 _previewCoordinateError.clear();
-                emit fiberBaseToPreviewFactorChanged(1.0, false);
                 _previewComponents.clear();
                 _previewWindingIds.release();
                 _previewRunDiffImagePath.clear();
@@ -1098,7 +1096,10 @@ void SpiralWorkspace::updateSurfaceIntersections()
 
 void SpiralWorkspace::setLineAnnotationController(LineAnnotationController* controller)
 {
+    if (_lineAnnotationController) disconnect(_lineAnnotationController, nullptr, this, nullptr);
     _lineAnnotationController = controller;
+    if (controller) connect(controller, &LineAnnotationController::fibersChanged,
+                            this, &SpiralWorkspace::refreshTrackedFibers);
 }
 
 bool SpiralWorkspace::isFlattenedViewer(const VolumeViewerBase* viewer) const
@@ -1246,19 +1247,16 @@ void SpiralWorkspace::updatePreviewCoordinateScale()
 {
     _fiberBaseShapeZYX.reset();
     _previewToFiberBaseScale.reset();
-    _fiberBaseToPreviewFactor.reset();
     _previewCoordinateError.clear();
     if (!_previewBaseShapeZYX) {
         _previewCoordinateError = tr(
             "Spiral preview metadata has no base_shape_zyx; publish a new preview");
-        emit fiberBaseToPreviewFactorChanged(1.0, false);
         return;
     }
     QString error;
     const auto fiberShape = resolveFiberBaseShape(&error);
     if (!fiberShape) {
         _previewCoordinateError = error;
-        emit fiberBaseToPreviewFactorChanged(1.0, false);
         return;
     }
     try {
@@ -1266,13 +1264,10 @@ void SpiralWorkspace::updatePreviewCoordinateScale()
             *_previewBaseShapeZYX, *fiberShape, 5);
         _fiberBaseShapeZYX = fiberShape;
         _previewToFiberBaseScale = previewToFiber;
-        _fiberBaseToPreviewFactor = 1.0 / previewToFiber;
-        emit fiberBaseToPreviewFactorChanged(*_fiberBaseToPreviewFactor, true);
     } catch (const std::exception& ex) {
         _previewCoordinateError = tr(
             "Spiral preview and fiber base shapes are incompatible: %1")
                                       .arg(QString::fromUtf8(ex.what()));
-        emit fiberBaseToPreviewFactorChanged(1.0, false);
     }
 }
 
@@ -1471,37 +1466,52 @@ void SpiralWorkspace::addPatchToCurrentFit(
     _service->applyInputDrafts();
 }
 
-void SpiralWorkspace::addFiberToCurrentFit(const QString& fiberJsonPath)
+void SpiralWorkspace::addFibersToCurrentFit(const std::vector<uint64_t>& fiberIds)
 {
-    if (!_service) return;
-    const auto inputId = vc3d::spiralFiberInputId(fiberJsonPath);
-    if (inputId.isEmpty()) return;
-    _trackedFiberUuids.insert(inputId);
-    _service->stageJsonInput(QStringLiteral("fiber"), fiberJsonPath, inputId);
-    _service->applyInputDrafts();
-}
-
-void SpiralWorkspace::noteTrackedFiberSaved(uint64_t, const QString& fiberJsonPath)
-{
-    if (!_service || !hasActiveSpiralSession()) return;
-    const auto uuid=vc3d::spiralFiberInputId(fiberJsonPath);
-    if (!_trackedFiberUuids.contains(uuid)) return;
-    const QString inputId = vc3d::spiralFiberInputId(fiberJsonPath);
-    if (!inputId.isEmpty())
-        _service->stageJsonInput(QStringLiteral("fiber"), fiberJsonPath, inputId);
-}
-
-void SpiralWorkspace::noteFiberRemoved(const QString& path)
-{
-    if (!_service) return;
-    const auto alias = QFileInfo(path).completeBaseName();
-    for (const auto& value : _service->inputDraftStatus()) {
-        const auto input = value.toObject();
-        if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("fiber")
-            && (QFileInfo(input.value(QStringLiteral("source")).toString()).completeBaseName() == alias
-                || input.value(QStringLiteral("name")).toString() == alias))
-            _service->removeInputDraft(input.value(QStringLiteral("id")).toString());
+    if (!_service || !_lineAnnotationController || fiberIds.empty()) return;
+    try {
+        const auto paths = _lineAnnotationController->fiberTransportPaths(fiberIds);
+        for (const auto& [uuid, path] : paths) {
+            const auto id = QString::fromStdString(uuid);
+            const auto source = QString::fromStdString(path.string());
+            _trackedFiberPaths[id] = source;
+            _service->stageJsonInput(QStringLiteral("fiber"), source, id);
+        }
+        // All linked endpoints are staged before applying the input set.
+        _service->applyInputDrafts();
+    } catch (const std::exception& error) {
+        statusBar()->showMessage(QString::fromUtf8(error.what()), 15000);
     }
+}
+
+void SpiralWorkspace::refreshTrackedFibers()
+{
+    if (!_service || !_lineAnnotationController || _trackedFiberPaths.isEmpty()) return;
+    std::vector<uint64_t> ids;
+    for (const auto& uuid : _trackedFiberPaths.keys()) {
+        const auto id = _lineAnnotationController->fiberIdForUuid(uuid.toStdString());
+        if (id) ids.push_back(id);
+        else noteFiberRetired(uuid);
+    }
+    if (ids.empty()) return;
+    try {
+        for (const auto& [uuid, path] : _lineAnnotationController->fiberTransportPaths(ids)) {
+            const auto id = QString::fromStdString(uuid);
+            const auto source = QString::fromStdString(path.string());
+            if (_trackedFiberPaths.value(id) == source) continue;
+            _trackedFiberPaths[id] = source;
+            _service->stageJsonInput(QStringLiteral("fiber"), source, id);
+        }
+    } catch (const std::exception& error) {
+        statusBar()->showMessage(QString::fromUtf8(error.what()), 15000);
+    }
+}
+
+void SpiralWorkspace::noteFiberRetired(const QString& objectUuid)
+{
+    if (!_service) return;
+    _trackedFiberPaths.remove(objectUuid);
+    _service->removeInputDraft(objectUuid);
 }
 
 bool SpiralWorkspace::stageManagedPatchRemoval(const std::shared_ptr<QuadSurface>& surface)

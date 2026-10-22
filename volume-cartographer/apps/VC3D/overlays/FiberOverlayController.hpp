@@ -3,10 +3,13 @@
 #include "ViewerOverlayControllerBase.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <unordered_map>
 #include <vector>
+
+class Volume;
 
 class FiberOverlayController final : public ViewerOverlayControllerBase
 {
@@ -29,11 +32,9 @@ public:
     void setVisible(bool visible);
     void setViewDistance(double distance);
     void setShowLinked(bool show);
-    // Fiber geometry is canonical L0. This factor converts it into the
-    // coordinate space consumed by one viewer before both projection and hit
-    // testing. Main viewers default to identity; Spiral uses 0.25 (L2).
-    void setViewerBaseToViewerFactor(VolumeViewerBase* viewer, double factor);
-    [[nodiscard]] double viewerBaseToViewerFactor(VolumeViewerBase* viewer) const;
+    using CoordinateScaleResolver = std::function<std::optional<double>(uint64_t, VolumeViewerBase*)>;
+    void setCoordinateScaleResolver(CoordinateScaleResolver resolver);
+    void invalidateCoordinates();
     void detachViewer(VolumeViewerBase* viewer) override;
     [[nodiscard]] bool showLinked() const { return _showLinked; }
     [[nodiscard]] bool isVisible() const { return _visible; }
@@ -69,7 +70,8 @@ private:
         VolumeViewerBase* viewer) const;
 
     std::vector<Chain> _chains;
-    std::unordered_map<VolumeViewerBase*, double> _viewerFactors;
+    CoordinateScaleResolver _coordinateScale;
+    mutable std::unordered_map<VolumeViewerBase*, std::shared_ptr<Volume>> _transformedVolumes;
     mutable std::unordered_map<VolumeViewerBase*, std::vector<Chain>>
         _transformedChains;
     std::unique_ptr<PersistentItems> _persistentItems;

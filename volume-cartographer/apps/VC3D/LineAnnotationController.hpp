@@ -384,6 +384,7 @@ public:
     uint64_t fiberIdForUuid(const std::string& uuid) const;
     std::optional<vc::objects::PinnedObject> fiberPin(uint64_t id) const;
     std::optional<double> fiberCoordinateScale(uint64_t id, bool prompt = false);
+    [[nodiscard]] std::optional<double> fiberCoordinateScaleForVolume(uint64_t fiberId, const std::shared_ptr<Volume>& volume) const;
     [[nodiscard]] FiberMapSnapshot fiberMapSnapshot() const;
     // Resolves the package's umbilicus for a status line only; nothing is
     // cached, so call it on user-visible state changes rather than per frame.
@@ -491,7 +492,7 @@ public:
     void setCurrentAtlasDirectory(std::optional<std::filesystem::path> atlasDir);
 
     // Temporary native transport artifact from a pinned committed revision.
-    [[nodiscard]] std::filesystem::path fiberTransportPath(uint64_t fiberId) const;
+    [[nodiscard]] std::map<std::string, std::filesystem::path> fiberTransportPaths(const std::vector<uint64_t>& fiberIds) const;
 
     [[nodiscard]] std::optional<ResolvedFiberOptimizationInputs>
         resolveFiberOptimizationInputs(
@@ -526,7 +527,7 @@ signals:
         LineAnnotationController::FiberSummary::AlignmentMetrics alignment,
         std::vector<LineAnnotationController::FiberSummary::AlignmentMetrics> spanAlignments);
     void fiberSaved(uint64_t fiberId, uint64_t generation);
-    void fiberFileRemoved(const QString& path);
+    void fiberRetired(const QString& objectUuid);
     void fibersDeleted(std::vector<uint64_t> fiberIds);
     void atlasCreated(std::filesystem::path atlasDir);
 
@@ -1110,7 +1111,6 @@ private:
                               LineAnnotationSession& session,
                               const std::filesystem::path& atlasDir);
     [[nodiscard]] uint64_t nextFiberId() const;
-    void forgetFiberRuntimeBinding(uint64_t fiberId);
     [[nodiscard]] uint64_t nextFiberSequenceForUsername(const std::string& username) const;
     [[nodiscard]] std::string currentFiberUsername() const;
     [[nodiscard]] static std::string currentFiberDateTimeString();
@@ -1144,10 +1144,6 @@ private:
         const std::vector<FiberBranchRef>* previousBranches = nullptr);
     void scheduleBranchMetadataSaves(const std::vector<uint64_t>& fiberIds,
                                      uint64_t excludedFiberId = 0);
-    void syncBranchFiberFileRename(uint64_t fiberId,
-                                   const std::string& oldFileName,
-                                   const std::string& newFileName);
-    void removeBranchLinksToFiber(uint64_t fiberId, const std::string& fileName);
     // Hook internals; do not call directly from mutation sites.
     void syncReciprocalBranchControlPointReferences(const LineAnnotationSession& session);
     [[nodiscard]] bool confirmLinkedControlPointEdit(const LineAnnotationSession& session,
@@ -1226,7 +1222,7 @@ private:
         const std::filesystem::path& path,
         std::vector<std::string>* branchErrors = nullptr,
         std::vector<DroppedLinkEntry>* stripped = nullptr) const;
-    [[nodiscard]] // Reads and parses one fiber file, stamping StoredFiber::loadedWriteTime
+    [[nodiscard]] // Reads one explicit fiber transfer document
     // from before the read; branchErrors, when given, collects per-branch
     // load problems the way loadFiberJson reports them.
     std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path,

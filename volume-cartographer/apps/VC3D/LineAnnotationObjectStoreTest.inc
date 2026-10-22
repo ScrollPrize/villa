@@ -1,5 +1,6 @@
 #include <iostream>
 #include <QApplication>
+#include "overlays/FiberOverlayCoordinates.hpp"
 // Built only with VC_TESTING. Runs the actual controller publication path.
 int runObjectStoreControllerTests()
 {
@@ -43,6 +44,47 @@ int runObjectStoreControllerTests()
         controller.commitFiberStoreAction(batch);
         controller.loadFibersForCurrentPackage();a=resolve(a.uuid);b=resolve(b.uuid);
         require(a.branches.size()==1 && b.branches.size()==1,"shared branch roundtrip");
+        const auto transferPaths = controller.fiberTransportPaths({a.id});
+        require(transferPaths.size() == 2, "transport includes both linked endpoints");
+        auto readDocument = [](const auto& file) { std::ifstream input(file); return nlohmann::json::parse(input); };
+        const auto aWire = readDocument(transferPaths.at(a.uuid));
+        const auto bWire = readDocument(transferPaths.at(b.uuid));
+        require(aWire["branches"][0]["branch_file"] == b.uuid + ".json", "transport serializes branch target UUID");
+        require(bWire["branches"][0]["branch_file"] == a.uuid + ".json", "transport serializes reciprocal branch");
+        require(aWire["name"] == bWire["name"] && aWire["filename"] != bWire["filename"], "same-name fibers have distinct transport identities");
+        {
+            QTemporaryDir transfers;
+            const auto bundle = fs::path(transfers.path().toStdString()) / "network.json";
+            QString error; int exported = 0;
+            require(controller.exportFibersToPath(bundle, &error, &exported) && exported == 2, "export linked same-name fibers");
+            const auto target = fs::path(transfers.path().toStdString()) / "target.vcobj";
+            { auto db = ObjectStore::create(target, options); }
+            CState destination;
+            Controller imported(&destination, nullptr, nullptr, nullptr);
+            imported._errorDialogsSuppressed = true;
+            destination.attachObjectStore(QString::fromStdString(target.string()), "roundtrip-test");
+            int count = 0;
+            if (!imported.importFibersFromPath(bundle, &error, &count)) throw std::runtime_error(error.toStdString());
+            require(count == 2 && imported._fibers.size() == 2, "duplicate display names import by UUID");
+            for (const auto& fiber : imported._fibers) {
+                require(fiber.fileName == "same_name.json", "display name survives transfer");
+                require(fiber.branches.size() == 1, "shared branch survives transfer");
+                require(fiber.branches.front().edgeUuid == a.branches.front().edgeUuid, "edge UUID survives transfer");
+            }
+        }
+        struct OverlayChain { uint64_t id; std::vector<cv::Vec3f> points; std::vector<int> links; };
+        const std::vector<OverlayChain> chains{{1, {{8,16,24}}, {2}}, {2, {{8,16,24}}, {1}}, {3, {{8,16,24}}, {}}};
+        const auto visible = vc3d::boundFiberChains(chains, [](uint64_t id) -> std::optional<double> {
+            if (id == 1) return .25;
+            if (id == 2) return .5;
+            return {};
+        });
+        require(visible.size() == 2 && visible[0].points[0] == cv::Vec3f(2,4,6) &&
+                visible[1].points[0] == cv::Vec3f(4,8,12), "each overlay uses its own binding and excludes unbound fibers");
+        require(visible[0].id == 1 && visible[0].links == chains[0].links, "transformed hit-test identity and link markers remain aligned");
+        std::vector<std::string> retiredNotifications;
+        QObject::connect(&controller, &Controller::fiberRetired, &controller,
+            [&](const QString& uuid) { retiredNotifications.push_back(uuid.toStdString()); });
         const auto edge=a.branches.front().edgeUuid;
         a.controlPoints[0][0]=-1; a.linePoints[0][0]=-1;
         batch={controller.makeFiberSaveSnapshot(a)};
@@ -73,6 +115,7 @@ int runObjectStoreControllerTests()
         require(conflict,"stale controller edits reject");
         controller.loadFibersForCurrentPackage();a=resolve(a.uuid);
         auto outcome=controller.deleteFibers({a.id});require(outcome.deletedIds.size()==1,"retire through controller");
+        require(retiredNotifications == std::vector<std::string>{a.uuid}, "retirement publishes object UUID");
         {
         auto db=ObjectStore::open(path,options);auto txn=db.read();
         require(db.objectByUuid(txn,a.uuid)->retired,"retirement persisted");
@@ -139,7 +182,7 @@ int runObjectStoreControllerTests()
             const auto saved=std::get<vc::geometry::Fiber>(vc::geometry::decode(db.readGeometryData(txn,*savedPin->geometryRevision)));
             require(saved.controlPoints[0][0]==live->controlPoints[0].volumePoint[0],"manual edit survives independent read");
         }
-        const auto artifact=controller.fiberTransportPath(merged.id);
+        const auto artifact=controller.fiberTransportPaths({merged.id}).at(merged.uuid);
         require(std::filesystem::exists(artifact) && controller.fiberIdForFilePath(artifact)==merged.id,"pinned Spiral transport retains UUID");
         {
             CState child(nullptr,false,&state);
