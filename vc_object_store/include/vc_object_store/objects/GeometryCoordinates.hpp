@@ -3,8 +3,9 @@
 #include "vc_object_store/Uuid.hpp"
 #include <nlohmann/json.hpp>
 #include <cmath>
+#include <optional>
 
-namespace vc::objects::detail {
+namespace vc::objects {
 using CoordinateJson = nlohmann::json;
 inline bool hasGeometryCoordinates(const std::string& kind)
 {
@@ -75,4 +76,27 @@ inline void eraseSourceGeometryCoordinates(CoordinateJson& source)
 {
     for (const auto* key : {"coordinates", "volume_uuid", "scale_factor"}) source.erase(key);
 }
-} // namespace vc::objects::detail
+// Authoritative object metadata wins over any historical source declarations.
+// This is shared by every native exporter; absence never resurrects source data.
+inline CoordinateJson geometryTransferMetadata(const CoordinateJson& metadata)
+{
+    auto source = metadata.value("source", CoordinateJson::object());
+    eraseSourceGeometryCoordinates(source);
+    source.erase("coordinate_binding");
+    source["coordinates"] = geometryCoordinates(metadata.value("coordinates", CoordinateJson::object()));
+    if (metadata.contains("coordinate_binding")) source["coordinate_binding"] = metadata.at("coordinate_binding");
+    return source;
+}
+
+// Convert stored XYZ to voxels of exactly the declared volume. Unknown frames
+// remain unknown; names, dimensions, and resolution cannot establish identity.
+inline std::optional<double> geometryScaleToVolume(const CoordinateJson& metadata, const std::string& volumeUuid)
+{
+    const auto coordinates = geometryCoordinates(metadata.value("coordinates", CoordinateJson::object()));
+    if (coordinates["volume_uuid"].is_null() || coordinates["scale_factor"].is_null() ||
+        coordinates["volume_uuid"] != util::canonicalUuid(volumeUuid)) return std::nullopt;
+    const double scale = 1.0 / coordinates["scale_factor"].get<double>();
+    if (!std::isfinite(scale) || scale <= 0) throw std::invalid_argument("geometry coordinate conversion is not representable");
+    return scale;
+}
+} // namespace vc::objects

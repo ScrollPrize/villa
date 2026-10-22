@@ -83,6 +83,48 @@ int runObjectStoreControllerTests()
             }
         }
         {
+            QTemporaryDir directory;
+            const auto target = fs::path(directory.path().toStdString()) / "service.vcobj";
+            { auto db = ObjectStore::create(target, options); }
+            CState destination;
+            Controller imported(&destination, nullptr, nullptr, nullptr);
+            imported._errorDialogsSuppressed = true;
+            destination.attachObjectStore(QString::fromStdString(target.string()), "service-import-test");
+            SpiralWorkspace workspace(&destination);
+            workspace.setLineAnnotationController(&imported);
+            auto* service = workspace.findChild<SpiralServiceManager*>();
+            service->inputEditorRequested(QJsonObject{{"kind", "fiber"}, {"id", QString::fromStdString(a.uuid)}},
+                QString::fromStdString(transferPaths.at(a.uuid).string()));
+            require(imported._fibers.size() == 2 && service->inputDraftStatus().size() == 2,
+                    "service-only component is imported into attached store before editing");
+            auto document = aWire;
+            const auto uuid = vc::util::newUuid(); document["uuid"] = uuid;
+            document["branches"] = nlohmann::json::array(); document["adjacent_branches"] = nlohmann::json::array();
+            document.erase("optimization_mode"); document["custom_annotation"] = {{"note", "retain"}};
+            const auto volumeUuid = vc::util::newUuid();
+            document["coordinates"] = {{"volume_uuid", volumeUuid}, {"scale_factor", 4}};
+            document["coordinate_binding"] = {{"active_volume_id", "display"}};
+            QString error;
+            const auto id = imported.importFiberJson(document, "optional-mode.json", &error);
+            if (!id) throw std::runtime_error(error.toStdString());
+            auto found = std::find_if(imported._fibers.begin(), imported._fibers.end(), [&](const auto& fiber) { return fiber.id == id; });
+            require(found != imported._fibers.end() && !found->readOnly && found->controlPoints.size() == 3,
+                    "absent optional optimization mode keeps geometry editable");
+            const auto bundle = fs::path(directory.path().toStdString()) / "export.json";
+            require(imported.exportFibersToPath(bundle, &error), "shared UI exporter accepts absent mode");
+            const auto exportedDocument = readDocument(bundle);
+            for (const auto& entry : exportedDocument.at("point_collections")) if (entry.at("uuid") == uuid) {
+                require(!entry.contains("optimization_mode"), "export does not invent absent mode");
+                require(entry.at("custom_annotation") == document.at("custom_annotation"), "UI export preserves unknown source annotations");
+                require(entry.at("coordinates") == document.at("coordinates"), "UI export preserves authoritative coordinates");
+                require(entry.at("coordinate_binding") == document.at("coordinate_binding"), "binding travels with coordinates");
+            }
+            auto edited = *found; edited.tags.push_back("edited"); imported.scheduleFiberSave(edited);
+            const auto paths = imported.fiberTransportPaths({id});
+            require(readDocument(paths.at(uuid)).at("custom_annotation") == document.at("custom_annotation"),
+                    "editing preserves unknown source annotations");
+        }
+        {
             SpiralWorkspace workspace(&state);
             workspace.setLineAnnotationController(&controller);
             auto* service = workspace.findChild<SpiralServiceManager*>();
@@ -301,7 +343,7 @@ int runObjectStoreControllerTests()
             bool rejected = false; try { controller.commitFiberStoreAction(pending); } catch (...) { rejected = true; }
             require(rejected, "read-only controller cannot publish changes");
             auto transfer = controller.fiberToJson(controlsOnly); transfer["version"] = 1;
-            rejected = false; try { (void)controller.loadFiberJson(transfer, "legacy.json"); } catch (...) { rejected = true; }
+            rejected = false; try { (void)vc::objects::decodeFiberJson(transfer.dump()); } catch (...) { rejected = true; }
             require(rejected, "legacy file import is rejected without repair");
             state.detachObjectStore();
         }
@@ -323,6 +365,10 @@ int runObjectStoreControllerTests()
                 controller._errorDialogsSuppressed=true;
                 require(factor && *factor==0.25,"explicit scale-2 binding persists");
                 fiber=resolve(fiber.uuid);
+                auto mismatched = fiber.coordinateIdentity;
+                mismatched["coordinates"]["volume_uuid"] = vc::util::newUuid();
+                require(!vc3d::geometryScaleForVolume(mismatched, *state.currentVolume()),
+                        "matching display ID cannot override conflicting volume UUID");
                 const auto display = controller.fiberInVolumeCoordinates(fiber);
                 require(display.controlPoints.front() == fiber.controlPoints.front() * .25 && display.linePoints.front() == fiber.linePoints.front() * .25, "display geometry uses explicit binding");
                 require(resolve(fiber.uuid).linePoints == fiber.linePoints, "display transform does not change stored geometry");

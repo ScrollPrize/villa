@@ -263,7 +263,7 @@ def parse_vc3d_fiber_format(
         raise ValueError("version-3/4 vc3d_fiber is missing type")
     validate_fiber_uuid(obj, label=label)
 
-    if version >= 3 and "optimization_mode" not in obj:
+    if version == 3 and "optimization_mode" not in obj:
         raise ValueError("version-3/4 vc3d_fiber is missing optimization_mode")
     optimization_mode = obj.get("optimization_mode", "lasagna")
     if not isinstance(optimization_mode, str) or optimization_mode not in {
@@ -282,8 +282,21 @@ def parse_vc3d_fiber_format(
         positions: list[Any] = []
         parsed_segments: list[FiberTraceSegmentMetadata | None] = []
         for index, control in enumerate(raw_controls):
-            if not isinstance(control, dict) or not set(control) <= {"position", "segment_to_next", "tags"}:
-                raise ValueError("version-3/4 control points must contain only position, segment_to_next and tags")
+            allowed = {"position", "segment_to_next", "tags"}
+            if version == 4:
+                allowed.update({"direction", "display_normal", "display_normal_source"})
+            if not isinstance(control, dict) or not set(control) <= allowed:
+                raise ValueError("unsupported control point fields")
+            for field in ("direction", "display_normal"):
+                if field in control:
+                    vector = _points([control[field]], label=f"control point {field}")[0]
+                    if not any(vector):
+                        raise ValueError(f"control point {field} must be nonzero")
+            if "display_normal_source" in control and (
+                "display_normal" not in control or control["display_normal_source"] not in
+                {"manual", "interpolated", "unknown"}
+            ):
+                raise ValueError("invalid control point display_normal_source")
             if "position" not in control:
                 raise ValueError("version-3/4 control point is missing position")
             # Optional per-control-point tags (VC3D writes e.g. "kollesis_termination",
@@ -300,9 +313,13 @@ def parse_vc3d_fiber_format(
                 parsed_segments.append(None)
             else:
                 if "segment_to_next" not in control:
-                    raise ValueError("a non-final control point is missing segment_to_next")
-                parsed_segments.append(
-                    parse_segment_metadata(control["segment_to_next"], version=version))
+                    if version == 3:
+                        raise ValueError("a non-final control point is missing segment_to_next")
+                    # Current typed geometry need not have tracing provenance.
+                    parsed_segments.append(None)
+                else:
+                    parsed_segments.append(
+                        parse_segment_metadata(control["segment_to_next"], version=version))
         control_points = _points(positions, label=f"{label} control_points")
         segments = tuple(parsed_segments)
 

@@ -686,10 +686,11 @@ def artifact_state(workspace):
     state.close()
 
 
-def add_artifact_fiber(ws, name, branches=()):
+def add_artifact_fiber(ws, name, branches=(), adjacent_branches=()):
     source = ws.root / f'{name}.json'
     source.write_text(json.dumps({'type': 'vc3d_fiber', 'version': 1,
-                                 'points': [], 'branches': list(branches)}))
+                                 'points': [], 'branches': list(branches),
+                                 'adjacent_branches': list(adjacent_branches)}))
     identity = InputIdentity(str(uuid4()), 'fiber', str(ws.dataset / 'fibers' / source.name))
     ws.catalog.register_base(identity, Content.from_json({'path': str(source)}))
     return identity.id
@@ -739,10 +740,11 @@ def test_editor_artifact_failed_attempt_can_retry(artifact_state, monkeypatch, f
     assert state.input_content_artifact(first, 1) == result
 
 
-def test_editor_artifact_follows_transitive_pending_links_and_exact_revision(artifact_state):
+@pytest.mark.parametrize('branch_kind', ['branches', 'adjacent_branches'])
+def test_editor_artifact_follows_transitive_pending_links_and_exact_revision(artifact_state, branch_kind):
     state = artifact_state
     ws = state.editing_workspace
-    first = add_artifact_fiber(ws, 'first', [{'branch_file': 'peer.json', 'pending': True}])
+    first = add_artifact_fiber(ws, 'first', **{branch_kind: [{'branch_file': 'peer.json', 'pending': True}]})
     peer = add_artifact_fiber(ws, 'peer', [{'branch_file': 'last.json'}])
     add_artifact_fiber(ws, 'last', [{'branch_file': 'first.json'}])
     unrelated = add_artifact_fiber(ws, 'unrelated')

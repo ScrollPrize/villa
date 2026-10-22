@@ -1166,9 +1166,6 @@ private:
     [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber);
     [[nodiscard]] static nlohmann::json fiberSaveSnapshotToJson(
         const FiberSaveSnapshot& snapshot, bool annotationsOnly = false);
-    [[nodiscard]] std::optional<StoredFiber> loadFiberJson(
-        const nlohmann::json& root, const std::filesystem::path& path) const;
-    [[nodiscard]] std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path) const;
 
     [[nodiscard]] static std::vector<ControlSpanRecord> controlSpansForFiber(
         const StoredFiber& fiber);

@@ -227,8 +227,27 @@ rejects unknown keys; positive 64-bit integers stay exact.
 
 Native object/document/collection declarations, flat `volume_uuid`/`scale_factor`
 fields and `ingest_geometry_source(..., coordinate_context={...})` must agree
-where known. Packed tracks use context. Set coordinates with `set_meta`; dependent
-anchors declare `metadata_keys=["coordinates"]`.
+where known. Packed tracks read declarations from `metadata.json` as well as
+explicit context. Every native exporter carries authoritative `meta.coordinates`,
+including unknown values, rather than resurrecting declarations in `meta.source`.
+An explicit `coordinate_binding` travels alongside them. Export→import preserves
+the frame without an out-of-band context argument. Set coordinates with `set_meta`;
+dependent anchors declare `metadata_keys=["coordinates"]`.
+
+C++ consumers share normalization, conflict checking, transfer metadata and exact
+volume matching through `objects/GeometryCoordinates.hpp`. A display name or
+matching grid dimensions cannot override a mismatched volume UUID.
+
+`ingestGeometryBatch` takes decoded objects, geometry and source annotations and
+inserts them and their native relationships in the caller's transaction. Duplicate,
+existing and retired identities are errors; this is not a refresh operation.
+`updateGeometryArrays` accepts desired typed arrays, the expected geometry revision,
+optional transformed annotations, and a caller-supplied relationship decision
+callback. It uses sparse coordinate edits and stable-ID sequence operations for
+fibers/PCLs/tracks, and sparse channel edits for unchanged patch grids. Omitted
+annotations follow stable IDs; resizing an annotated sequence without IDs requires
+explicit transformed annotations. Grid/channel schema changes retain their dedicated
+surface APIs. These helpers do not introduce another history or editing model.
 
 ## Arrays, surface channels and sparse edits
 

@@ -46,7 +46,9 @@ int main() try {
     });
     require(receipt.size() == 1 && receipt.at(uuid).has_value(), "commit returns exact new pin");
     auto external = ObjectStore::open(path, options);
-    { auto txn = external.write(receipt); external.setMeta(txn,uuid,"external","true"); txn.commit();
+    { auto txn = external.write(receipt); external.setMeta(txn,uuid,"external","true");
+      auto changed = source; changed["control_points_attributes"][0]["tags"] = {"changed"};
+      external.setMeta(txn, uuid, "source", changed.dump()); txn.commit();
       require(txn.committedRevisions().at(uuid) != receipt.at(uuid), "external commit produces different pin"); }
     session.read(attachment,[&](const auto& db,const auto& txn,const auto&) {
         require(db.objectRevision(txn,*receipt.at(uuid))->record.meta.find("external") == std::string::npos, "receipt is immutable after external commit");

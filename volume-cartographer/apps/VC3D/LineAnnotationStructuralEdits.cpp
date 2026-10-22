@@ -1,8 +1,6 @@
 #include "LineAnnotationStructuralEdits.hpp"
 
 #include <algorithm>
-#include <cstring>
-#include <filesystem>
 
 #include <nlohmann/json.hpp>
 
@@ -363,55 +361,6 @@ std::optional<std::size_t> redirectBranchRefs(std::vector<FiberBranchRef>& refs,
         ref.branchControlPointIndex = target.controlPointIndex;
     }
     return resolved.size();
-}
-
-std::vector<std::string> referencedFiberFileNames(const nlohmann::json& root)
-{
-    std::vector<std::string> names;
-    if (!root.is_object()) {
-        return names;
-    }
-    for (const char* kind : {"branches", "adjacent_branches"}) {
-        const auto it = root.find(kind);
-        if (it == root.end() || !it->is_array()) {
-            continue;
-        }
-        for (const auto& entry : *it) {
-            if (!entry.is_object()) {
-                continue;
-            }
-            const auto file = entry.find("branch_file");
-            if (file == entry.end() || !file->is_string()) {
-                continue;
-            }
-            const std::string name =
-                std::filesystem::path(file->get<std::string>()).filename().string();
-            if (!name.empty()) {
-                names.push_back(name);
-            }
-        }
-    }
-    return names;
-}
-
-std::string fiberGeometryKey(const std::vector<StoredControlPoint>& controls,
-                             const std::vector<cv::Vec3d>& linePoints)
-{
-    if (controls.empty() && linePoints.empty()) return {};
-    std::string key;
-    key.reserve(sizeof(uint64_t) + (controls.size() + linePoints.size()) * 3 * sizeof(uint64_t));
-    auto appendPoint = [&key](const cv::Vec3d& point) {
-        for (int axis = 0; axis < 3; ++axis) {
-            uint64_t bits = 0;
-            std::memcpy(&bits, &point[axis], sizeof(bits));
-            key.append(reinterpret_cast<const char*>(&bits), sizeof(bits));
-        }
-    };
-    const uint64_t controlCount = controls.size();
-    key.append(reinterpret_cast<const char*>(&controlCount), sizeof(controlCount));
-    for (const auto& control : controls) appendPoint(control);
-    for (const auto& point : linePoints) appendPoint(point);
-    return key;
 }
 
 }  // namespace vc3d::line_annotation

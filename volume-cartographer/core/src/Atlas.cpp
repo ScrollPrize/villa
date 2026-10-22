@@ -1,3 +1,4 @@
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include "vc_object_store/geometry/Geometry.hpp"
 #include <vc_object_store/objects/FiberJson.hpp>
 #include <vc_object_store/geometry/Geometry.hpp>
@@ -316,6 +317,10 @@ nlohmann::json storedFiberDocument(const FiberMapping& mapping,
         // The transport geometry is in atlas coordinates; its original grid
         // dimensions no longer describe the serialized coordinates.
         result.erase("coordinate_base_shape_zyx");
+        auto coordinates = vc::objects::geometryCoordinates(result.value("coordinates", nlohmann::json::object()));
+        if (!coordinates["scale_factor"].is_null())
+            coordinates["scale_factor"] = coordinates["scale_factor"].get<double>() * mapping.storeToAtlasScale;
+        result["coordinates"] = vc::objects::geometryCoordinates(std::move(coordinates));
     }
     return result;
 }

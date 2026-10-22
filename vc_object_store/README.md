@@ -30,8 +30,10 @@ The C++ `ObjectStoreSession` accepts writable or read-only attachments. Read-onl
 sessions reject actions before invoking their callbacks. VC3D calls the database's
 object, geometry, relationship and retirement APIs directly inside `act`, with
 explicit revision expectations. A split creates two objects and retires the
-original in one transaction. No fiber-specific or generic edit publisher is
-required. The database owns revision history and synchronization.
+original in one transaction. `updateGeometryArrays` shares sparse array/sequence
+updates across geometry kinds; `ingestGeometryBatch` shares one-time ingestion
+of decoded geometry and native topology. Both run inside the caller’s transaction
+and retain the database’s existing revision and relationship checks.
 
 Fiber JSON is an explicit transfer format: readers require version 4 and UUIDs.
 Typed database geometry exports in that format, including control-only fibers.

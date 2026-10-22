@@ -3018,7 +3018,7 @@ TEST_CASE("Atlas pins read and export historical store fibers without source fil
     auto store=std::make_shared<ObjectStoreSession>();const auto attachment=store->attach(dbPath,options);
     std::string geometry;
     const auto receipt=store->act(attachment,{{uuid,{}}},[&](auto& db,auto& txn) {
-        auto record=doc.object;record.meta=nlohmann::json{{"source",nlohmann::json::parse(doc.source)}}.dump();
+        auto record=doc.object;record.meta=nlohmann::json{{"source",nlohmann::json::parse(doc.source)}, {"coordinates",{{"volume_uuid",uuid},{"scale_factor",4}}}}.dump();
         db.upsertObject(txn,record);geometry=db.putGeometry(txn,uuid,doc.geometry);
     });
     atlas.fibers.front().storePin=PinnedObject{attachment,{attachment.storeUuid,uuid},*receipt.at(uuid),geometry};
@@ -3040,6 +3040,7 @@ TEST_CASE("Atlas pins read and export historical store fibers without source fil
         auto outgoing=vc::atlas::loadLasagnaAtlasExport(pinnedDir, root, store);
         REQUIRE(outgoing.objects.size()==1);artifact=outgoing.objects.front().fiberPath;
         CHECK(nlohmann::json::parse(readText(artifact))["line_points"]==native["line_points"]);
+        CHECK(nlohmann::json::parse(readText(artifact))["coordinates"] == nlohmann::json{{"volume_uuid",uuid},{"scale_factor",2.0}});
         CHECK(fs::is_regular_file(artifact));
     }
     CHECK_FALSE(fs::exists(artifact));

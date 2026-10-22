@@ -449,12 +449,20 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     _managedPatchCopies[path] = id;
                     emit patchEditorRequested(id, path);
                 } else if (kind == QStringLiteral("fiber") && _lineAnnotationController) {
-                    const auto fiber = _lineAnnotationController->fiberIdForFilePath(path.toStdString());
+                    auto fiber = _lineAnnotationController->fiberIdForFilePath(path.toStdString());
+                    if (!fiber) {
+                        QString error;
+                        if (!_lineAnnotationController->importFibersFromPath(path.toStdString(), &error)) {
+                            statusBar()->showMessage(tr("Cannot import service fiber: %1").arg(error), 15000);
+                            return;
+                        }
+                        fiber = _lineAnnotationController->fiberIdForFilePath(path.toStdString());
+                    }
                     if (fiber) {
                         stageFiberInputs({fiber});
                         _lineAnnotationController->openFiber(fiber);
                     }
-                    else statusBar()->showMessage(tr("This service fiber is not in the attached object store."), 15000);
+                    else statusBar()->showMessage(tr("The imported fiber could not be opened."), 15000);
                 } else if (kind == QStringLiteral("pcl")) {
                     const auto role = vc3d::spiral::pclRoleFromName(input.value(QStringLiteral("role")).toString());
                     QFile file(path);
@@ -476,6 +484,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                 }
             });
     connect(_service, &SpiralServiceManager::inputDraftDiscarded, this, [this](const QString& alias) {
+        _trackedFiberPaths.remove(alias);
         _brush->discardDraft(alias);
         _pendingBrushPatches.remove(alias);
         _pendingPointCollectionPaths.remove(alias);

@@ -134,7 +134,9 @@ void track(const Snapshot& s, const Json& attributes, const fs::path& path)
     auto field = [&](size_t offset, uint64_t value, int size) { for (int i = 0; i < size; ++i) header[offset+i] = static_cast<uint8_t>(value >> (8*i)); };
     field(8, 1, 4); field(12, 64, 4); field(16, 1, 8); field(24, count, 8);
     writeArray(path / "header.bin", std::move(header));
-    writeJson(path / "metadata.json", {{"version", 1}, {"track_count", 1}, {"point_count", count},
+    auto metadata = attributes;
+    metadata.update(Json{{"version", 1}, {"track_count", 1}, {"point_count", count},
         {"graph_object_uuid", s.revision.objectUuid}, {"graph_revision_uuid", s.revision.uuid}});
+    writeJson(path / "metadata.json", metadata);
 }
 }

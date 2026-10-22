@@ -29,10 +29,13 @@ add_library(vc_objects STATIC
     sync/Synchronize.cpp
     sync/GeometryTransfer.cpp
     geometry/GeometryViews.cpp
+    imports/SourceRelationships.cpp
+    geometry/GeometryIngestBatch.cpp
     imports/SourceIdentityIndex.cpp
     geometry/DependencyIndex.cpp
     geometry/SequenceMetadata.cpp
     geometry/SharedGeometry.cpp
+    geometry/GeometryEdits.cpp
     geometry/StructuralGeometry.cpp
     geometry/Geometry.cpp
     geometry/GeometryDelta.cpp
@@ -48,7 +51,7 @@ if(TARGET SQLite3::SQLite3)
 else()
     target_link_libraries(vc_objects PUBLIC SQLite::SQLite3)
 endif()
-target_link_libraries(vc_objects PUBLIC vc_geometry PRIVATE nlohmann_json::nlohmann_json OpenSSL::Crypto zstd::libzstd)
+target_link_libraries(vc_objects PUBLIC vc_geometry nlohmann_json::nlohmann_json PRIVATE OpenSSL::Crypto zstd::libzstd)
 target_compile_features(vc_objects PUBLIC cxx_std_20)
 add_library(vc_object_store::vc_objects ALIAS vc_objects)
 add_library(vc_object_store::vc_geometry ALIAS vc_geometry)
@@ -78,7 +81,7 @@ add_library(vc_object_formats STATIC Tiff.cpp MemMap.cpp PackedTrackStore.cpp sp
 target_include_directories(vc_object_formats PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(vc_object_formats PUBLIC opencv_core TIFF::TIFF PRIVATE nlohmann_json::nlohmann_json)
 target_compile_features(vc_object_formats PUBLIC cxx_std_20)
-add_library(vc_object_geometry STATIC geometry/GeometryIngest.cpp geometry/GeometryExport.cpp geometry/SourceMetadata.cpp imports/SourceRelationships.cpp
+add_library(vc_object_geometry STATIC geometry/GeometryIngest.cpp geometry/GeometryExport.cpp geometry/SourceMetadata.cpp
     formats/GeometryInput.cpp formats/FiberInput.cpp formats/PatchInput.cpp
     formats/PointCollectionInput.cpp formats/TrackInput.cpp formats/GeometryOutput.cpp)
 target_include_directories(vc_object_geometry PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

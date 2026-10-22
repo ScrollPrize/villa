@@ -46,15 +46,21 @@ def test_owned_views_native_export_and_one_time_ingest(db, tmp_path, kind, geome
         view.load()
     coordinates = {'volume_uuid': '12345678-1234-1234-1234-123456789abc', 'scale_factor': 2**60 + 1}
     db.set_meta(uid, 'coordinates', coordinates)
+    binding = {'active_volume_id': 'display-only', 'shape_zyx': [8, 9, 10]}
+    db.set_meta(uid, 'coordinate_binding', binding)
+    db.set_meta(uid, 'source', {'coordinates': {'scale_factor': 7}, 'volume_uuid': 'stale', 'coordinate_binding': {'active_volume_id': 'stale'}, 'retained_note': 'native'})
     output = tmp_path / 'native'
     assert db.export_geometry(uid, output) == revision
     with pytest.raises((RuntimeError, ValueError)):
         db.export_geometry(uid, output)
     with ObjectStore.create(str(tmp_path / 'import.vcobj'), author='import') as other:
-        report = other.ingest_geometry_source(kind, output, coordinate_context=coordinates)
+        report = other.ingest_geometry_source(kind, output)
         assert not report['problems'] and report['ingested'] == 1
         imported = other.objects_by_kind(kind)[0]['uuid']
         assert other.object(imported)['meta']['coordinates'] == coordinates
+        assert other.object(imported)['meta']['coordinate_binding'] == binding
+        assert other.object(imported)['meta']['source']['retained_note'] == 'native'
+        assert 'coordinates' not in other.object(imported)['meta']['source']
         current = other.current_geometry(imported)['uuid']
         expected = raw if kind != 'point_collection' else np.asarray(geometry.points, dtype='<f8')[np.argsort(geometry.ids)].tobytes()
         assert other.read_geometry_array(current, array_name) == expected
@@ -273,3 +279,41 @@ def test_record_fields_and_transaction_bindings(db, kind, detail):
         with db.write() as tx:
             tx.upsert_object(dict(kind=kind, **{kind: {'bbox': [1, 2]}}))
     assert db.object_count(kind) == 1
+
+
+def test_fiber_branch_transfer_preserves_identity_approval_and_stable_ids(db, tmp_path):
+    import json
+    import uuid
+    ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+    edge_uuid = str(uuid.uuid4())
+    for uid in ids:
+        db.upsert_object(dict(uuid=uid, kind='fiber', name='same name'))
+        geometry = Fiber([[1, 2, 3], [4, 5, 6]], [[1, 2, 3], [4, 5, 6]])
+        geometry.control_point_ids = [90, 10]
+        db.put_geometry(uid, geometry)
+    anchor = lambda ident, position: dict(points=[dict(array='control_point_ids', index=[ident])],
+                                        position=position, direction=[1, 0, 0])
+    db.add_edge(dict(uuid=edge_uuid, kind='fiber_branch', a=ids[0], b=ids[1],
+                    a_anchor=anchor(10, [4, 5, 6]), b_anchor=anchor(90, [1, 2, 3])))
+    db.set_approval(edge_uuid, 'approved')
+    directory = tmp_path / 'fibers'
+    directory.mkdir()
+    for uid in ids:
+        db.export_geometry(uid, directory / (uid + '.json'))
+    first = json.loads((directory / (ids[0] + '.json')).read_text())
+    branch = first['branches'][0]
+    assert branch['edge_uuid'] == edge_uuid and branch['pending'] is False
+    assert branch['control_point_index'] == 1 and branch['branch_control_point_index'] == 0
+    assert branch['target_uuid'] == ids[1]
+    assert 'optimization_mode' not in first
+    with ObjectStore.create(str(tmp_path / 'imported.vcobj'), author='test') as other:
+        report = other.ingest_geometry_source('fiber', directory)
+        assert report == dict(ingested=2, edges_imported=1, problems=[])
+        edge = other.edges_by_kind('fiber_branch')[0]
+        assert edge['uuid'] == edge_uuid and edge['approval_state'] == 'approved'
+    # Conflicting reciprocal declarations must roll back the whole batch.
+    first['branches'][0]['pending'] = True
+    (directory / (ids[0] + '.json')).write_text(json.dumps(first))
+    with ObjectStore.create(str(tmp_path / 'conflict.vcobj'), author='test') as other:
+        assert other.ingest_geometry_source('fiber', directory)['problems']
+        assert other.object_count('fiber') == 0

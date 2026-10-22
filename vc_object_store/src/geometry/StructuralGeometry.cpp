@@ -1,5 +1,6 @@
 #include "geometry/SharedGeometry.hpp"
 #include "geometry/SequenceMetadata.hpp"
+#include "geometry/SequenceIdentity.hpp"
 #include "geometry/GeometrySnapshot.hpp"
 #include "internal/History.hpp"
 #include <numeric>
@@ -13,11 +14,6 @@ void checked(sqlite3* db) {
 }
 void requireSource(sqlite3* db,const std::string& uuid) {
     execute(db,"INSERT OR IGNORE INTO history_required VALUES(?)", uuid);
-}
-std::string idArray(const std::string& kind,const std::string& name) {
-    if (kind=="point_collection" && name=="points") return "point_ids";
-    if (kind=="fiber" && name=="control_points") return "control_point_ids";
-    return {};
 }
 std::vector<int64_t> idsOf(GeometryReader& reader,const std::string& ids,int64_t count) {
     std::vector<int64_t> values(count);
@@ -33,7 +29,7 @@ Json annotations(ObjectStore const& store,const Txn& txn,const GeometryRevision&
     auto result=Json(std::vector<Json>(count,Json::object()));
     if (reader.manifest().contains("sequences") && reader.manifest().at("sequences").contains(name)) {
         const auto& state=reader.manifest().at("sequences").at(name);
-        const auto ids=idArray(revision.kind,name);
+        const auto ids=sequenceIdArray(revision.kind,name);
         auto* db=ObjectStoreImplAccess::conn(txn);
         MetadataSnapshot snapshot(db,state.at(ids.empty()?"annotations":"identities"));
         const auto values=ids.empty()?std::vector<int64_t>():idsOf(reader,ids,count);
@@ -99,7 +95,7 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
         const auto& a=manifest.at("arrays").at(edit.array); const int64_t oldCount=a.at("shape").at(0);
         const auto stride=geometryByteLength(a.at("dtype"),{3}); const std::string dtype=a.at("dtype");
         if (edit.start<0 || edit.eraseCount<0 || edit.start>oldCount || edit.eraseCount>oldCount-edit.start) throw std::out_of_range("sequence span out of range");
-        const auto idsName=idArray(current->kind,edit.array);
+        const auto idsName=sequenceIdArray(current->kind,edit.array);
         const auto oldAttrs=annotations(*this,txn,*current,reader,edit.array);
         auto state=manifest.value("sequences",Json::object()).value(edit.array,Json::object());
         MetadataSnapshot allocated(db,state.value("allocated",Json()));

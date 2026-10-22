@@ -52,17 +52,24 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
                     Json::parse(current.meta).value("adjacent", false) != Json::parse(edge.meta).value("adjacent", false))
                     throw std::runtime_error("conflicting ordinary/adjacent fiber branch declarations: " +
                                              edge.aUuid + " <-> " + edge.bUuid);
+                if (edge.kind == "fiber_branch" &&
+                    ((!edge.uuid.empty() && edge.uuid != current.uuid) || edge.approvalState != current.approvalState ||
+                     (forward ? current.aAnchor.direction != edge.aAnchor.direction || current.bAnchor.direction != edge.bAnchor.direction
+                              : current.bAnchor.direction != edge.aAnchor.direction || current.aAnchor.direction != edge.bAnchor.direction)))
+                    throw std::runtime_error("conflicting reciprocal fiber branch declarations");
                 return; // Consistent reciprocal declarations represent one edge.
             }
         }
-        db.addEdge(txn, edge); ++inserted;
+        const auto uuid = db.addEdge(txn, edge);
+        if (edge.approvalState != "pending") db.setApproval(txn, uuid, edge.approvalState);
+        ++inserted;
     };
     // Resolve source filenames only during ingestion; stored edges always use UUIDs.
     std::map<std::string, std::set<std::string>> fiberNames;
     if (std::any_of(sources.begin(),sources.end(),[](const auto& s) { return s.object.kind=="fiber"; }))
     for (const auto& object : db.objectsByKind(txn, "fiber")) {
         fiberNames[std::filesystem::path(object.storageRef).filename().string()].insert(object.uuid);
-        fiberNames[object.name + ".json"].insert(object.uuid);
+        fiberNames[object.uuid + ".json"].insert(object.uuid);
     }
     for (const auto& entry : sources)
         if (entry.object.kind == "fiber")
@@ -80,6 +87,8 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
                     target = *found->second.begin();
                 }
                 EdgeRecord edge; edge.kind = "fiber_branch";
+                if (branch.contains("edge_uuid")) edge.uuid = util::canonicalUuid(branch.at("edge_uuid").get<std::string>());
+                edge.approvalState = branch.value("pending", false) ? "pending" : "approved";
                 edge.aUuid = entry.object.uuid; edge.bUuid = target;
                 edge.aAnchor = load(edge.aUuid).anchor(branch.at("control_point_index").get<int64_t>());
                 edge.bAnchor = load(edge.bUuid).anchor(branch.at("branch_control_point_index").get<int64_t>());

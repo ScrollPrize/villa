@@ -1,5 +1,5 @@
 #include "internal/RecordSql.hpp"
-#include "internal/GeometryCoordinates.hpp"
+#include "vc_object_store/objects/GeometryCoordinates.hpp"
 
 namespace vc::objects {
 using namespace detail;
