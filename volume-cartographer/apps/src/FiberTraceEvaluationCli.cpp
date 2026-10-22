@@ -1000,7 +1000,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                             std::lock_guard lock(progressMutex);
                             std::cout << "trace-profile " << profile.dump() << std::endl;
                         }
-                    });
+                    }, config.value("prediction_based_seeding", false));
                 }();
                 auto provenance = source.provenance;
                 provenance["source_id"] = source.id;

@@ -49,6 +49,7 @@ CHUNK_KEYS = (
     "conflict_agreement_base",
     "conflict_separation_base",
     "cache_only",
+    "presence_peak_restarts",
     "refine_seed",
     "seed_movement_base",
     "gpu_library",

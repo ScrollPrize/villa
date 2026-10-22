@@ -25,6 +25,7 @@ struct FiberChunkTraceConfig {
     double conflictNormalBase=0, conflictTangentBase=0; // zero disables
     double conflictAgreementBase=64, conflictSeparationBase=32;
     bool cacheOnly=false; // never construct a missing chunk
+    bool presencePeakRestarts=false; // historical aligned-peak seed policy, including no-path stops
     // Construction/backend options are part of construction cache identity.
     bool refineSeed=false;
     double seedMovementBase=0;

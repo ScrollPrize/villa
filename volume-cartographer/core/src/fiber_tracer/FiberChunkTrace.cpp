@@ -445,6 +445,7 @@ nlohmann::json fiberChunkConfigJson(const FiberChunkTraceConfig& c) {
         {"conflict_agreement_base",c.conflictAgreementBase},
         {"conflict_separation_base",c.conflictSeparationBase},
         {"cache_only",c.cacheOnly},
+        {"presence_peak_restarts",c.presencePeakRestarts},
         {"refine_seed",c.refineSeed},
         {"seed_movement_base",c.seedMovementBase},
         {"gpu_library",c.gpuLibrary},
@@ -488,6 +489,7 @@ FiberChunkTraceConfig fiberChunkConfigFromJson(const Json& j) {
     if(j.contains("conflict_agreement_base"))j.at("conflict_agreement_base").get_to(c.conflictAgreementBase);
     if(j.contains("conflict_separation_base"))j.at("conflict_separation_base").get_to(c.conflictSeparationBase);
     if(j.contains("cache_only"))j.at("cache_only").get_to(c.cacheOnly);
+    if(j.contains("presence_peak_restarts"))j.at("presence_peak_restarts").get_to(c.presencePeakRestarts);
     if(j.contains("refine_seed"))j.at("refine_seed").get_to(c.refineSeed);
     if(j.contains("seed_movement_base"))j.at("seed_movement_base").get_to(c.seedMovementBase);
     if(j.contains("gpu_library"))j.at("gpu_library").get_to(c.gpuLibrary);

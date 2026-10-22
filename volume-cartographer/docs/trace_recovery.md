@@ -42,6 +42,12 @@ TraceConfig step sizes remain in trace coordinates. New features default off.
   `conflict_separation_base`); sampling 8, angle gate 25°, endpoint guard 16.
   Conflicting paths keep their IDs but are emptied in the filtered view.
 - `cache_only`: reject absent construction chunks; never silently retrace them.
+- `presence_peak_restarts`: select the historical aligned local presence peak
+  before matching a cached path, including explicit no-initial-path stops.
+  Default false retains the generic cached-path seed search. For direct native
+  `replay-set`, the corresponding top-level option is `prediction_based_seeding`.
+  Peak selection rejects invalid/nonpositive width when width modulation is
+  enabled, rather than selecting a seed that the first trace step cannot use.
 - `gpu_library`, `gpu_devices`: explicit plugin and granted visible device count.
 - `online_refine_iterations`: 0 disables; positive refines after each commit.
   Window 0 includes the whole committed path, positive values limit its tail.
@@ -67,6 +73,24 @@ For the native CLI, `vc_fiber_trace_metric replay-set --config evaluation.json`
 accepts `backend: "chunk-beam"`, `chunk_trace` settings, and per-source
 `chunk_cache` and `prediction_identity`. Beam remains supported unchanged.
 No GPU is needed to replay existing paths against cached prediction chunks.
+
+Forward replay retains candidate presence filtering inside beam selection;
+committed-step checks alone cannot prevent infeasible speculative candidates
+from displacing feasible paths. Reverse consistency checks retain width and
+direction scoring but do not inherit the forward presence cutoff: they measure
+geometric reversibility.
+
+The optional `benchmark_fiber_chunk_cuda --device-tests` runs standalone CUDA
+selector and two-stage tracing regressions without a dataset. Run it with
+`compute-sanitizer --tool memcheck --error-exitcode 9` inside a granted GPU job.
+It must be built with optimization as well as tested with real cold-cache
+inputs; host-only scoring tests cannot validate device memory safety.
+
+The CUDA winner reduction synchronizes after all warps snapshot its shared
+winner, before the next reduction reuses scratch. Its scoring helper takes the
+immutable parameter block by reference: the previous second by-value copy
+caused invalid local-memory reads in optimized CUDA 12.8/H100 execution at the
+second expansion. Keep the device regression in addition to host math tests.
 
 Old experimental chunk files without main's specification need **explicit
 provenance attestation**, not an unchecked compatibility switch:

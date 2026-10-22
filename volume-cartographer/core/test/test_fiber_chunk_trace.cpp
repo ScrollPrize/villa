@@ -1,6 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 #include "vc/fiber_tracer/FiberChunkTrace.hpp"
+#include "vc/fiber_tracer/FiberEvaluation.hpp"
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -287,10 +288,34 @@ TEST_CASE("chunk reference replay shares resets metrics and reverse checks") {
     const auto absent=makePolylineArcGeometry({{0,0,0},{64,0,0}});
     const auto empty=traceFiberChunkReferenceReplay(cache,source,t,1,normals,absent,0,64,normals,1,config);
     CHECK(empty.segments.empty());CHECK(empty.seedSearchSkippedBase==64);
+    // Historical replay first selects a prediction peak, and records a no-path
+    // stop if the stricter cached-path ellipse cannot match it. Default mode
+    // above continues to skip such starts, preserving main's generic behavior.
+    auto historical=c;historical.presencePeakRestarts=true;
+    FiberChunkTraceCache peakCache(historical,tmp.path,"tube-replay");
+    const auto peakResult=traceFiberChunkReferenceReplay(peakCache,source,t,1,normals,
+        absent,0,64,normals,1,config);
+    REQUIRE(!peakResult.failures.empty());
+    CHECK(peakResult.failures.front().reason=="chunk_no_initial_path");
+    CHECK(peakResult.segments.front().tracePointsBase.front()!=cv::Vec3d(0,0,0));
     const auto bent=makePolylineArcGeometry({{0,8,8},{96,8,8},{144,40,8},{240,40,8}});
     const auto reset=traceFiberChunkReferenceReplay(cache,source,t,1,normals,bent,0,bent.length(),normals,1,config);
     CHECK(!reset.failures.empty());CHECK(reset.segments.size()>1);
     CHECK(reset.completedReferenceArcBase==bent.length());
+}
+
+TEST_CASE("prediction based beam replay seeds the first segment at a peak") {
+    Tubes source;Normal normal;auto trace=traceConfig();
+    FiberEvaluationCase input{{{0,7,8},{64,7,8}}};
+    FiberChunkReplayConfig config;config.errorThresholdBase=20;
+    const auto replay=replayFiberTrainingCase(source,trace,1,normal,normal,1,input,config,{},true);
+    REQUIRE(!replay.segments.empty());
+    CHECK(replay.segments.front().tracePointsBase.front()==cv::Vec3d(0,8,8));
+    const auto reference=makePolylineArcGeometry(input.referenceBase);
+    trace.widthRelativeTolerance=.4;
+    // This source has valid presence/directions but invalid widths. A width-
+    // modulated trace must never select such a peak as its starting point.
+    CHECK_FALSE(findFiberReplayRestartSeed(source,trace,1,normal,1,reference,0,64,16));
 }
 
 TEST_CASE("Recovered conflict filter rejects branching partners, not duplicates") {
