@@ -78,12 +78,7 @@ struct Atlas {
     std::vector<FiberMapping> fibers;
 
     void save(const std::filesystem::path& atlasDir) const;
-    static Atlas load(const std::filesystem::path& atlasDir);
     static Atlas load(const std::filesystem::path& atlasDir,
-                      const std::filesystem::path& volpkgRoot);
-    static Atlas load(const std::filesystem::path& atlasDir,
-                      const std::filesystem::path& volpkgRoot,
-                      const std::filesystem::path& fiberPathRoot,
                       std::shared_ptr<vc::objects::ObjectStoreSession> store = {});
 };
 
@@ -342,7 +337,6 @@ std::vector<AtlasDirectoryInfo> discoverAtlasDirectories(
 LasagnaAtlasExport loadLasagnaAtlasExport(
     const std::filesystem::path& atlasDir,
     const std::filesystem::path& volpkgRoot = {},
-    const std::filesystem::path& fiberPathRoot = {},
     std::shared_ptr<vc::objects::ObjectStoreSession> store = {});
 std::filesystem::path uniqueAtlasDirectory(const std::filesystem::path& volpkgRoot,
                                            const std::string& baseName);

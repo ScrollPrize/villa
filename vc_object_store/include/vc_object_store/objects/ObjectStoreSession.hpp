@@ -54,10 +54,11 @@ public:
     ObjectStoreSession(const ObjectStoreSession&) = delete;
     ObjectStoreSession& operator=(const ObjectStoreSession&) = delete;
 
-    // Existing writable database only. Validation failure preserves the attachment.
+    // Existing database only; read-only attachments reject all actions. Validation failure preserves the attachment.
     AttachmentIdentity attach(const std::filesystem::path&, const OpenOptions&);
     void detach();
     std::optional<AttachmentIdentity> attachment() const;
+    bool writable() const;
     bool current(const AttachmentIdentity&) const;
 
     void read(const AttachmentIdentity&, const Read&);

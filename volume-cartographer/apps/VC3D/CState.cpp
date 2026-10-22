@@ -214,10 +214,11 @@ CState::~CState()
     if (!_objectStoreOwner) { try { _objectStoreSession->detach(); } catch (...) {} }
 }
 
-void CState::attachObjectStore(const QString& path, const QString& author)
+void CState::attachObjectStore(const QString& path, const QString& author, bool readOnly)
 {
     vc::objects::OpenOptions options;
     options.author = author.toStdString();
+    options.readOnly = readOnly;
     _objectStoreSession->attach(path.toStdString(), options);
     pollObjectStoreChanges();
 }

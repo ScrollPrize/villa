@@ -1506,7 +1506,7 @@ AtlasSearchSigningContext prepareAtlasSearchSigningContext(
         if (progressCallback) {
             progressCallback(vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface, 0, total);
         }
-        context.atlas = vc::atlas::Atlas::load(*atlasDir, {}, {}, store);
+        context.atlas = vc::atlas::Atlas::load(*atlasDir, store);
         if (progressCallback) {
             progressCallback(vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface, 1, total);
         }
@@ -5065,7 +5065,7 @@ void CWindow::refreshAtlasOverviewDocks()
         for (const auto& atlasInfo : vc::atlas::discoverAtlasDirectories(volpkgRoot)) {
             const std::filesystem::path& atlasDir = atlasInfo.path;
             try {
-                const auto atlas = vc::atlas::Atlas::load(atlasDir, {}, {}, store);
+                const auto atlas = vc::atlas::Atlas::load(atlasDir, store);
                 auto* item = new QTreeWidgetItem(tree);
                 item->setText(0, QString::fromStdString(atlas.metadata.name));
                 item->setData(0, Qt::UserRole, QString::fromStdString(atlasDir.string()));
@@ -5169,9 +5169,7 @@ void CWindow::updateAtlasFiberDocks()
                 ? std::filesystem::path(vpkg->getVolpkgDirectory())
                 : vpkg->path().parent_path();
         }
-        atlas = volpkgRoot.empty()
-            ? vc::atlas::Atlas::load(*_currentAtlasDir, {}, {}, store)
-            : vc::atlas::Atlas::load(*_currentAtlasDir, volpkgRoot, {}, store);
+        atlas = vc::atlas::Atlas::load(*_currentAtlasDir, store);
     } catch (const std::exception& ex) {
         if (label) {
             label->setText(tr("Atlas: %1 (could not load: %2)")
@@ -5299,20 +5297,17 @@ void CWindow::scheduleAtlasSearchDockRefresh()
 void CWindow::updateAtlasSearchDocks()
 {
     const auto store = _state->objectStoreSession();
-    const auto snapshots = _lineAnnotationController
-        ? _lineAnnotationController->fiberSnapshotsFromStorage()
-        : std::vector<vc::atlas::FiberPolyline>{};
+    const bool hasSnapshots = _lineAnnotationController && !_lineAnnotationController->fiberSummaries().empty();
     int savedFiberCount = 0;
     QString atlasLoadError;
     if (_currentAtlasDir) {
         try {
-            const vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_currentAtlasDir, {}, {}, store);
+            const vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_currentAtlasDir, store);
             savedFiberCount = static_cast<int>(atlas.fibers.size());
         } catch (const std::exception& ex) {
             atlasLoadError = QString::fromStdString(ex.what());
         }
     }
-    const bool hasSnapshots = !snapshots.empty();
     const bool atlasUsable = _currentAtlasDir.has_value() && atlasLoadError.isEmpty();
     const QString atlasName = _currentAtlasDir
         ? QString::fromStdString(_currentAtlasName.empty()
@@ -5994,7 +5989,7 @@ bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchPa
     bool haveAtlas = false;
     if (_currentAtlasDir) {
         try {
-            atlas = vc::atlas::Atlas::load(*_currentAtlasDir, {}, {}, store);
+            atlas = vc::atlas::Atlas::load(*_currentAtlasDir, store);
             haveAtlas = true;
         } catch (const std::exception& ex) {
             return fail(tr("Could not load selected atlas: %1")
@@ -6673,7 +6668,7 @@ void CWindow::updateAtlasSearchPreviewCandidates()
     }
 
     try {
-        vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_currentAtlasDir, {}, {}, store);
+        vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_currentAtlasDir, store);
         const std::filesystem::path basePath = *_currentAtlasDir / atlas.metadata.baseMeshPath;
         QuadSurface baseSurface(basePath);
         const auto* points = baseSurface.rawPointsPtr();
@@ -6844,7 +6839,7 @@ void CWindow::requestAtlasSearchPreviewLine(int sortedResultIndex)
         sortedResultIndex
     ]() -> std::optional<AtlasOverlayController::SearchPreviewFiber> {
         try {
-            vc::atlas::Atlas atlas = vc::atlas::Atlas::load(atlasDir, {}, {}, store);
+            vc::atlas::Atlas atlas = vc::atlas::Atlas::load(atlasDir, store);
             const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
             auto baseSurface = std::make_shared<QuadSurface>(basePath);
             const auto* points = baseSurface->rawPointsPtr();
@@ -6953,7 +6948,7 @@ void CWindow::loadAndDisplayAtlas(const std::filesystem::path& atlasDir)
     const std::filesystem::path volpkgRoot = vpkg->path().empty()
         ? std::filesystem::path(vpkg->getVolpkgDirectory())
         : vpkg->path().parent_path();
-    auto atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot, {}, store);
+    auto atlas = vc::atlas::Atlas::load(atlasDir, store);
     vc::lasagna::LasagnaDataset dataset =
         vc::lasagna::LasagnaDataset::open(
             manifestPath,
@@ -6961,7 +6956,7 @@ void CWindow::loadAndDisplayAtlas(const std::filesystem::path& atlasDir)
                 resolvedLasagna->workingToBaseScale});
     vc::lasagna::LasagnaNormalSampler sampler(dataset);
     (void)vc::atlas::ensureAtlasPredSnapAttachments(atlasDir, volpkgRoot, sampler, store);
-    atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot, {}, store);
+    atlas = vc::atlas::Atlas::load(atlasDir, store);
     _currentAtlasDir = atlasDir;
     _currentAtlasName = atlas.metadata.name;
     if (_lineAnnotationController) {
@@ -7970,6 +7965,7 @@ void CWindow::CreateWidgets(void)
                     fiber.linkedFiberCount,
                     fiber.pendingLinkCount,
                     traceState,
+                    fiber.detailsLoaded,
                 });
             }
             _fiberLengthVxById.clear();
@@ -7997,7 +7993,7 @@ void CWindow::CreateWidgets(void)
             }
 
             std::vector<FiberOverlayController::Chain> chains;
-            for (const auto& snapshot : _lineAnnotationController->fiberSnapshots()) {
+            for (const auto& snapshot : _lineAnnotationController->fiberSnapshots(false)) {
                 if (snapshot.controlPoints.empty()) {
                     continue;
                 }
@@ -8036,6 +8032,10 @@ void CWindow::CreateWidgets(void)
             }
             updateAtlasFiberDocks();
         };
+        for (auto* widget : {_fiberWidget, _fiberSliceWidget}) if (widget) {
+            connect(widget, &CFiberWidget::fiberDetailsRequested, _lineAnnotationController.get(),
+                &LineAnnotationController::loadFiberDetails, Qt::QueuedConnection);
+        }
         auto updateFiberMetricRows =
             [this, toFiberWidgetAlignment](
                 uint64_t fiberId,

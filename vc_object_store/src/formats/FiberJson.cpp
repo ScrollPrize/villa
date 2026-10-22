@@ -7,6 +7,20 @@
 
 namespace vc::objects {
 using Json = nlohmann::json;
+size_t fiberBranchControlIndex(const std::vector<int64_t>& controlIds, size_t controlCount, const Anchor& anchor)
+{
+        if (anchor.points.size() != 1 || anchor.points.front().index.size() != 1)
+            throw std::runtime_error("Fiber branch must identify one control point");
+        const auto& point = anchor.points.front();
+        const auto id = point.index.front();
+        if (point.array == "control_point_ids") {
+            const auto found = std::find(controlIds.begin(), controlIds.end(), id);
+            if (found != controlIds.end()) return size_t(found - controlIds.begin());
+        } else if (point.array == "control_points" && id >= 0 &&
+                   uint64_t(id) < controlCount) return size_t(id);
+        throw std::runtime_error("Fiber branch control point is absent from selected geometry");
+}
+
 FiberDocument decodeFiberJson(const std::string& text)
 {
     auto root = Json::parse(text);
@@ -178,22 +192,10 @@ std::map<std::string, std::string> fiberNetworkJson(
         }
         fibers.emplace(uuid, std::move(fiber));
     }
-    const auto controlIndex = [](const FiberExport& fiber, const Anchor& anchor) -> size_t {
-        if (anchor.points.size() != 1 || anchor.points.front().index.size() != 1)
-            throw std::runtime_error("Fiber branch must identify one control point");
-        const auto& point = anchor.points.front();
-        const auto id = point.index.front();
-        if (point.array == "control_point_ids") {
-            const auto found = std::find(fiber.controlIds.begin(), fiber.controlIds.end(), id);
-            if (found != fiber.controlIds.end()) return size_t(found - fiber.controlIds.begin());
-        } else if (point.array == "control_points" && id >= 0 &&
-                   uint64_t(id) < fiber.document.at("control_points").size()) return size_t(id);
-        throw std::runtime_error("Fiber branch control point is absent from selected geometry");
-    };
     for (const auto& edge : edges) {
         if (!included.contains(edge.aUuid)) continue;
         auto& a = fibers.at(edge.aUuid); auto& b = fibers.at(edge.bUuid);
-        const auto ai = controlIndex(a, edge.aAnchor), bi = controlIndex(b, edge.bAnchor);
+        const auto ai = fiberBranchControlIndex(a.controlIds, a.document.at("control_points").size(), edge.aAnchor), bi = fiberBranchControlIndex(b.controlIds, b.document.at("control_points").size(), edge.bAnchor);
         const auto append = [&](FiberExport& local, const FiberExport& target,
                                 size_t i, size_t j, const Anchor& own, const Anchor& other) {
             if (!own.direction || !other.direction)

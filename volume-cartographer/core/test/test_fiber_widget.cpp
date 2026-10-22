@@ -571,6 +571,19 @@ int main(int argc, char** argv)
     require(widget.orderedFiberIds() == std::vector<uint64_t>({12, 13, 11}),
             "Descending interp sort should order predictions, mixed, legacy");
 
+    {
+        CFiberWidget lazy;
+        CFiberWidget::FiberEntry pending; pending.id = 99; pending.fileName = "deferred.json";
+        pending.controlPointCount = 3; pending.linePointCount = 100; pending.detailsLoaded = false;
+        lazy.setFibers({pending});
+        auto* tree = lazy.findChild<QTreeView*>();
+        require(tree && tree->model()->rowCount(tree->model()->index(0,0)) == 1, "Deferred span geometry retains an expand arrow");
+        uint64_t requested = 0;
+        QObject::connect(&lazy, &CFiberWidget::fiberDetailsRequested, &lazy, [&](uint64_t id) { requested = id; });
+        tree->expand(tree->model()->index(0,0));
+        require(requested == 99, "Expanding a deferred fiber requests only its geometry");
+    }
+
     QThreadPool::globalInstance()->waitForDone();
     return 0;
 }

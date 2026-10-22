@@ -156,6 +156,7 @@ public:
         // Interpolation provenance of the stored geometry (see deriveTraceState).
         vc3d::line_annotation::FiberTraceState traceState =
             vc3d::line_annotation::FiberTraceState::Legacy;
+        bool detailsLoaded = true;
     };
 
     // Read-only network snapshot for the Fiber Map workspace: every loaded
@@ -170,10 +171,7 @@ public:
         // Mirrors FiberBranchRef::adjacent: the endpoints are one winding
         // apart (V inside H), which the map's winding solve honours.
         bool adjacent = false;
-        // The containing JSON array states the kind explicitly, so
-        // two refs of one pair with different kinds are a real disagreement.
-        // Missing adjacent arrays are healed before load-time validation.
-        bool adjacentExplicit = true;
+
     };
 
     struct FiberMapFiber {
@@ -267,8 +265,8 @@ public:
     // branches must go through the private session paths that call
     // syncLinkedBranchMetadataAfterFiberModification().
     // Adjacent links have the same entry schema as ordinary branches, in a
-    // separate top-level array. Always written, even empty: absence means a
-    // legacy writer, while an empty array is a deliberate absence of links.
+    // separate top-level array in explicit transfer JSON. Store links carry
+    // their kind on a single shared edge.
     static constexpr const char* kAdjacentBranchesJsonKey = "adjacent_branches";
 
     using FiberBranchRef = vc3d::line_annotation::FiberBranchRef;
@@ -378,6 +376,7 @@ public:
                                               const QPointF& scenePoint,
                                               const QPoint& globalPos);
     [[nodiscard]] std::vector<FiberSummary> fiberSummaries() const;
+    void loadFiberDetails(uint64_t fiberId);
     uint64_t fiberIdForUuid(const std::string& uuid) const;
     std::optional<vc::objects::PinnedObject> fiberPin(uint64_t id) const;
     std::optional<double> fiberCoordinateScale(uint64_t id, bool prompt = false);
@@ -438,7 +437,7 @@ public:
     // "unsaved fiber"; resolved at menu time so renames show immediately.
     [[nodiscard]] QString fiberDisplayNameForId(uint64_t fiberId) const;
     [[nodiscard]] std::vector<std::string> knownFiberTags() const;
-    [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshots() const;
+    [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshots(bool includeLines = true) const;
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshotsFromStorage();
     [[nodiscard]] std::vector<FiberSnapshotWithPath> fiberSnapshotsFromStorageWithPaths();
     [[nodiscard]] std::optional<uint64_t> fiberIdForAtlasPath(
@@ -1044,22 +1043,9 @@ private:
                                                              int activeStart = -1,
                                                              int activeEnd = -1) const;
     void loadFibersForCurrentPackage();
-    // Drop fibers that are the same fiber seen through several sources (or
-    // identical geometry under another name); records link aliases so branch
-    // links written against a dropped copy still resolve to the survivor.
-
-    // Restore adjacent reciprocals only into files whose array was absent.
-    // Run before cross-file validation so an old save cannot remove the
-    // whole network as missing its reciprocals. A present array is untouched.
-
-    // The heal's save must not overwrite a file that changed on disk since it
-    // was READ (a concurrent sync download): stale when the write time moved,
-    // and, failing closed, when it cannot be read.
-
-    // `candidate` (a ref on the linked fiber) is the reciprocal of `branch`
-    // (a ref on `fiber`): the same two control points named from the other
-    // side, positions and directions agreeing. The one predicate for pairing
-    // refs across files, shared by the load-time validation and the heal.
+    void ensureFiberLines(const StoredFiber&) const;
+    void ensureAllFiberLines() const;
+    // Match reciprocal references by control identities, positions and directions.
     [[nodiscard]] static bool isReciprocalBranchRef(const StoredFiber& fiber,
                                                     const FiberBranchRef& branch,
                                                     const FiberBranchRef& candidate);
@@ -1193,44 +1179,11 @@ private:
     void waitForFiberSaves();
     [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber);
     [[nodiscard]] static nlohmann::json fiberSaveSnapshotToJson(
-        const FiberSaveSnapshot& snapshot);
-    // A link entry a load dropped from a stored record (neutralized, removed
-    // by a repair, or stripped by the lenient parser). Fields a stripped
-    // entry did not parse stay unset; a descriptor without a target matches
-    // nothing.
-    struct DroppedLinkEntry {
-        std::filesystem::path ownerSourceRoot;
-        std::string ownerFileName;
-        std::string targetFileName;
-        bool adjacent = false;
-        std::optional<int> localIndex;
-        std::optional<cv::Vec3d> controlPointPosition;
-        std::optional<cv::Vec3d> branchControlPointPosition;
-        // The whole array of this kind was unreadable (not an array): every
-        // entry of the kind is unaccounted for.
-        bool wholeKind = false;
-    };
-    // `stripped` (optional, lenient mode only) receives one descriptor per
-    // link entry the parser discarded, with whatever fields it could read.
+        const FiberSaveSnapshot& snapshot, bool annotationsOnly = false);
     [[nodiscard]] std::optional<StoredFiber> loadFiberJson(
-        const nlohmann::json& root,
-        const std::filesystem::path& path,
-        std::vector<std::string>* branchErrors = nullptr,
-        std::vector<DroppedLinkEntry>* stripped = nullptr) const;
-    [[nodiscard]] // Reads one explicit fiber transfer document
-    // from before the read; branchErrors, when given, collects per-branch
-    // load problems the way loadFiberJson reports them.
-    std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path,
-                                             std::vector<std::string>* branchErrors = nullptr,
-                                             std::vector<DroppedLinkEntry>* stripped = nullptr) const;
+        const nlohmann::json& root, const std::filesystem::path& path) const;
+    [[nodiscard]] std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path) const;
 
-    // Drops the offending entries (and, through the fixed point, their
-    // reciprocals) in memory without touching the files; marks the fibers
-    // whose record now differs from disk. Returns the number of entries
-    // dropped.
-
-    // `writtenFiles` receives the source-qualified keys of the records
-    // saveFiberNow completed (a stale-skipped or failed write is not in it).
     [[nodiscard]] static std::vector<ControlSpanRecord> controlSpansForFiber(
         const StoredFiber& fiber);
     // Generation-keyed cache in front of controlSpansForFiber for GUI-thread
@@ -1274,6 +1227,7 @@ private:
     std::filesystem::path createAtlasFromFiberCore(uint64_t fiberId);
     // Shared worker and write barrier for saveOpenFibers /
     // saveOpenFibersHeadless.
+    [[nodiscard]] StoredFiber fiberInVolumeCoordinates(const StoredFiber& fiber) const;
     void refreshChangedStoreFibers();
     void saveOpenFibersCore();
     void cleanupIntersectionInspectionSurfaces();
@@ -1428,20 +1382,6 @@ private:
         _sideStripStoredSnapshotCache;
     mutable std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>
         _sideStripSessionSnapshotCache;
-    // Per-file cache behind fiberSnapshotsFromStorageWithPaths(): parsing a
-    // fiber JSON is the expensive step, so a file is reparsed only when its
-    // (size, mtime) token changes - the same metadata-token idiom as
-    // umbilicusFingerprint(), with the same caveat about a same-size rewrite
-    // inside one timestamp tick. CWindow refreshes the atlas search docks on
-    // every fiberSaved, which used to re-parse every fiber file in the
-    // package (seconds at ~666 fibers) ON THE GUI THREAD per save.
-    struct StorageSnapshotCacheEntry {
-        std::filesystem::file_time_type mtime{};
-        std::uintmax_t size = 0;
-        FiberSnapshotWithPath snapshot;
-    };
-    mutable std::map<std::filesystem::path, StorageSnapshotCacheEntry>
-        _storageSnapshotCache;
     // Resolved manifest location -> base_shape_zyx. Opening a fiber session
     // re-reads the manifest otherwise; successes only, so a failed (moved or
     // remote) location is retried next time.
@@ -1475,9 +1415,6 @@ private:
         vc3d::line_annotation::FiberOptimizationMode)>
         _mergeModePicker;
     bool _errorDialogsSuppressed = false;
-    // deleteFibers is running (it yields to the event loop while draining
-    // saves); a second delete meanwhile is refused.
-    bool _deletingFibers = false;
     // A merge or split from its menu callback to the end of its commit; the
     // second one refuses, and deletes/renames/imports refuse meanwhile.
     bool _structuralEditInProgress = false;

@@ -22,35 +22,13 @@ private slots:
             QVERIFY(error.isEmpty());
         });
 
-        batch.finishScheduling();
+        batch.finish();
         QCOMPARE(calls, 1);
-        batch.finishScheduling();
+        batch.finish();
         QCOMPARE(calls, 1);
     }
 
-    void waitsForEveryJob()
-    {
-        int calls = 0;
-        bool success = true;
-        QString error;
-        FiberSaveBatchTracker batch([&](bool ok, const QString& detail) {
-            ++calls;
-            success = ok;
-            error = detail;
-        });
-
-        batch.addJob();
-        batch.addJob();
-        batch.finishScheduling();
-        batch.finishJob();
-        QCOMPARE(calls, 0);
-        batch.finishJob(QStringLiteral("write failed"));
-        QCOMPARE(calls, 1);
-        QVERIFY(!success);
-        QCOMPARE(error, QStringLiteral("write failed"));
-    }
-
-    void combinesSchedulingAndWorkerErrors()
+    void combinesPublicationErrors()
     {
         int calls = 0;
         QString error;
@@ -61,10 +39,9 @@ private slots:
         });
 
         batch.addError(QStringLiteral("validation failed"));
-        batch.addJob();
-        batch.finishJob(QStringLiteral("write failed"));
+        batch.addError(QStringLiteral("write failed"));
         QCOMPARE(calls, 0);
-        batch.finishScheduling();
+        batch.finish();
         QCOMPARE(calls, 1);
         QCOMPARE(error, QStringLiteral("validation failed\nwrite failed"));
     }

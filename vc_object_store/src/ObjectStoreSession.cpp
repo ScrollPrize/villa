@@ -6,6 +6,7 @@ struct ObjectStoreSession::Attachment {
     explicit Attachment(ObjectStore value) : store(std::move(value)) {}
     ObjectStore store;
     AttachmentIdentity identity;
+    bool writable = true;
     std::atomic_bool cancelled{false};
     int64_t journalPosition = 0; // guarded by journal_
 };
@@ -19,12 +20,12 @@ ObjectStoreSession::~ObjectStoreSession()
 
 AttachmentIdentity ObjectStoreSession::attach(const std::filesystem::path& path, const OpenOptions& options)
 {
-    if (options.readOnly) throw std::invalid_argument("attachment must be writable");
     std::lock_guard transition(transition_);
     auto next = std::make_shared<Attachment>(ObjectStore::open(path, options));
     // Exercise write access without changing records. Opening a read connection
     // successfully is not sufficient validation for an editing session.
-    { auto writable = next->store.write(RevisionSelection{}); writable.commit(); }
+    next->writable = !options.readOnly;
+    if (next->writable) { auto writable = next->store.write(RevisionSelection{}); writable.commit(); }
     {
         auto txn = next->store.read();
         next->identity.storeUuid = next->store.uuid(txn);
@@ -73,6 +74,12 @@ std::optional<AttachmentIdentity> ObjectStoreSession::attachment() const
     return attached_->identity;
 }
 
+bool ObjectStoreSession::writable() const
+{
+    std::lock_guard lock(mutex_);
+    return accepting_ && attached_ && attached_->writable;
+}
+
 bool ObjectStoreSession::current(const AttachmentIdentity& identity) const
 {
     std::lock_guard lock(mutex_);
@@ -85,6 +92,7 @@ std::shared_ptr<ObjectStoreSession::Attachment> ObjectStoreSession::acquire(
     std::lock_guard lock(mutex_);
     if (!accepting_ || !attached_ || attached_->identity != identity)
         throw std::runtime_error("object-store attachment is missing or superseded");
+    if (write && !attached_->writable) throw std::runtime_error("Object store is attached read-only");
     ++(write ? writers_ : readers_);
     return attached_;
 }

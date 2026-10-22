@@ -69,7 +69,9 @@ struct StoredFiber {
     std::string fileName;
     uint64_t generation = 1;
     std::vector<StoredControlPoint> controlPoints;
-    std::vector<cv::Vec3d> linePoints;
+    mutable std::vector<cv::Vec3d> linePoints;
+    mutable bool linePointsLoaded = true;
+    std::optional<vc::objects::FiberDetail> catalogDetail;
     // Stored snapshots only. Live-session branch metadata must be converted
     // through storedFiberFromSession()/saveSessionAsFiber() so the central
     // hook can remap linked control-point indices before serialization.
@@ -83,20 +85,9 @@ struct StoredFiber {
     // stored. New Spiral-created fibers record the fiber manifest's L0
     // shape so a downsampled active volume can display them correctly.
     std::optional<std::array<std::size_t, 3>> coordinateBaseShapeZYX;
-    bool needsSave = false;
-    // Load put the gap span tags in step with the break point tags (a
-    // version-3 file, or one edited by hand); saved back under the same
-    // stale-file guard as the adjacent heal.
-    bool gapHealed = false;
-    // The load dropped one or more of this record's link entries in memory
-    // only (the user kept the files unchanged): the file on disk still
-    // holds them. Structural edits consult this before trusting the record
-    // as the on-disk truth.
-    bool linkEntriesDroppedAtLoad = false;
-    // Shown read-only from an Automated Fiber Volume: held in memory only for
-    // its view (never written, listed, linked or optimized) and dropped when
-    // that view closes.
+    // Inspection of a read-only object-store attachment.
     bool readOnly = false;
+    std::string editorError;
 };
 
 }  // namespace vc3d::line_annotation

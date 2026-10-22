@@ -1,7 +1,7 @@
 #pragma once
 
 #include "overlays/ViewerOverlayControllerBase.hpp"
-#include "vc/core/types/FiberCollection.hpp"
+#include "vc/core/types/FiberView.hpp"
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <QPointF>
 #include <QPointer>
@@ -96,7 +96,7 @@ private:
     void startPendingAnnotation();
     void finishAnnotationRequest();
     void watchAnnotationRender(class LineAnnotationDialog* dialog, int64_t id, uint64_t token);
-    void projectChanged();
+    void projectChanged(bool preserveSelection = false);
     void volumeChanged();
     void listPage(bool reset);
     vc::fibers::FamilyFilter familyFilter() const;

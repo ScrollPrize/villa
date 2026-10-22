@@ -7,7 +7,6 @@
 #include "OpenDataLasagna.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataSampleProject.hpp"
-#include "ProjectFiberPaths.hpp"
 #include "ProjectCreationDefaults.hpp"
 #include "OpenDataVolumePrefill.hpp"
 #include "CWindow.hpp"
@@ -246,6 +245,15 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
         } catch (const std::exception& error) {
             QMessageBox::critical(qWindow, QObject::tr("Cannot attach object store"),
                 QString::fromUtf8(error.what()));
+        }
+    });
+    _fileMenu->addAction(QObject::tr("Attach Read-only Object Store..."), this, [qWindow]() {
+        const auto path = QFileDialog::getOpenFileName(qWindow, QObject::tr("Attach Read-only Object Store"),
+            {}, QObject::tr("Object store (*.vcobj);;All files (*)"));
+        if (path.isEmpty()) return;
+        try { qWindow->_state->attachObjectStore(path, {}, true); }
+        catch (const std::exception& error) {
+            QMessageBox::critical(qWindow, QObject::tr("Cannot attach object store"), QString::fromUtf8(error.what()));
         }
     });
     auto* detachStore = _fileMenu->addAction(QObject::tr("Detach Object Store"), this, [qWindow]() {
@@ -1785,7 +1793,7 @@ void MenuActionController::newProject()
     // autosave, and save() then writes the full JSON including the name.
     pkg->setName(base.toStdString());
     try {
-        std::filesystem::create_directories(vc3d::projectFiberDirectory(file.toStdString()));
+
         pkg->save(std::filesystem::path(file.toStdString()));
     } catch (const std::exception& e) {
         QMessageBox::warning(_window, QObject::tr("New Project failed"), QString::fromUtf8(e.what()));

@@ -45,7 +45,7 @@ public:
 
     // One session for all object kinds; controllers share this handle.
     std::shared_ptr<vc::objects::ObjectStoreSession> objectStoreSession() const { return _objectStoreSession; }
-    void attachObjectStore(const QString& path, const QString& author);
+    void attachObjectStore(const QString& path, const QString& author, bool readOnly = false);
     void detachObjectStore();
     void pollObjectStoreChanges();
 

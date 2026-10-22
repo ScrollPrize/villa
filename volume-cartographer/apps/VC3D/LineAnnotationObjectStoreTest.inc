@@ -27,10 +27,18 @@ int runObjectStoreControllerTests()
         const auto first = a.storePin;
         controller.loadFibersForCurrentPackage();
         require(controller._fibers.size()==2,"load both fibers with same name");
+        require(std::none_of(controller._fibers.begin(), controller._fibers.end(), [](const auto& fiber) { return fiber.linePointsLoaded; }), "catalog does not materialize dense lines");
+        (void)controller.fiberSummaries(); (void)controller.fiberSnapshots(false);
+        require(std::none_of(controller._fibers.begin(), controller._fibers.end(), [](const auto& fiber) { return fiber.linePointsLoaded; }), "catalog and control overlays keep line geometry lazy");
+        controller.loadFiberDetails(controller._fibers[0].id);
+        require(controller._fibers[0].linePointsLoaded && !controller._fibers[1].linePointsLoaded, "expanding a fiber loads only its dense geometry");
+        const auto details = controller.fiberSummaries();
+        const auto detail = std::find_if(details.begin(),details.end(),[&](const auto& summary) { return summary.id == controller._fibers[0].id; });
+        require(detail != details.end() && detail->spans.size() == 2 && detail->annotatedLengthVx == 20.0, "on-demand spans retain exact lengths and control ranges");
         require(controller._fibers[0].id != controller._fibers[1].id,"UUID runtime identity");
         auto resolve = [&](const std::string& uuid) {
             const auto it = std::find_if(controller._fibers.begin(),controller._fibers.end(),[&](const auto& f) { return f.uuid==uuid; });
-            if (it == controller._fibers.end()) throw std::runtime_error("fiber missing"); return *it;
+            if (it == controller._fibers.end()) throw std::runtime_error("fiber missing"); controller.ensureFiberLines(*it); return *it;
         };
         a=resolve(a.uuid);b=resolve(b.uuid);
         Controller::FiberBranchRef link;
@@ -134,6 +142,8 @@ int runObjectStoreControllerTests()
         batch.front().coordinateIdentity["coordinates"]=frame;
         controller.commitFiberStoreAction(batch);parent=batch.front().fiber;
         controller.loadFibersForCurrentPackage();parent=resolve(parent.uuid);
+        require(controller.fiberToJson(parent).at("coordinates") == frame, "current transfer format preserves explicit coordinate identity");
+        require(controller.fiberToJson(parent).at("version") == 4, "current transfer format is independent of source ingestion version");
         const auto identity=[&](const char* name) {la::NewFiberIdentity result;result.id=controller.nextFiberId();result.username="test";result.startedAt="20260101";result.sequence=result.id;result.fileName=name;return result;};
         std::string error;
         const auto split=la::planFiberSplit(parent,1,identity("prefix.json"),identity("suffix.json"),true,&error);
@@ -191,11 +201,37 @@ int runObjectStoreControllerTests()
         require(state.objectStoreSession()->attachment().has_value(),"secondary destruction keeps main attachment");
         state.detachObjectStore();
         require(controller._fibers.empty(),"detach clears views");
+        {
+            // Store-valid control-only geometry must not empty the editor catalog.
+            auto db = ObjectStore::open(path, options);
+            ObjectRecord object; object.uuid = vc::util::newUuid(); object.kind = "fiber"; object.name = "controls-only";
+            auto txn = db.write({{object.uuid,{}}});
+            object.formatVersion = 1;
+            db.upsertObject(txn, object);
+            db.putGeometry(txn, object.uuid, vc::geometry::encode(vc::geometry::Fiber{{{0,0,0},{1,0,0}}, {}}));
+            txn.commit();
+            ObjectRecord missing; missing.uuid = vc::util::newUuid(); missing.kind = "fiber"; missing.name = "geometry-pending";
+            { auto pending = db.write({{missing.uuid,{}}}); db.upsertObject(pending,missing); pending.commit(); }
+            state.attachObjectStore(QString::fromStdString(path.string()), {}, true);
+            const auto unavailable = std::find_if(controller._fibers.begin(),controller._fibers.end(),[&](const auto& fiber) { return fiber.uuid == missing.uuid; });
+            require(unavailable != controller._fibers.end() && !unavailable->editorError.empty(), "unavailable geometry stays in catalog without blocking other fibers");
+            require(controller._fibers.size() >= 2, "control-only record preserves the full catalog");
+            const auto controlsOnly = resolve(object.uuid);
+            require(controlsOnly.controlPoints.size() == 2 && controlsOnly.linePoints.empty(), "control-only geometry preserved without synthesizing lines");
+            require(controller.fiberSummaries().size() == controller._fibers.size(), "read-only store fibers remain listed");
+            auto pending = std::vector<Controller::FiberSaveSnapshot>{controller.makeFiberSaveSnapshot(controlsOnly)};
+            bool rejected = false; try { controller.commitFiberStoreAction(pending); } catch (...) { rejected = true; }
+            require(rejected, "read-only controller cannot publish changes");
+            auto transfer = controller.fiberToJson(controlsOnly); transfer["version"] = 1;
+            rejected = false; try { (void)controller.loadFiberJson(transfer, "legacy.json"); } catch (...) { rejected = true; }
+            require(rejected, "legacy file import is rejected without repair");
+            state.detachObjectStore();
+        }
         if(const char* smoke=std::getenv("VC3D_OBJECT_STORE_SMOKE_DB")) {
             state.attachObjectStore(QString::fromUtf8(smoke),"vc3d-real-smoke");
             require(!controller._fibers.empty(),"real database catalog loads");
             const size_t count=controller._fibers.size();
-            auto fiber=controller._fibers.front();
+            auto fiber=resolve(controller._fibers.front().uuid);
             if(const char* ct=std::getenv("VC3D_OBJECT_STORE_SMOKE_CT")) {
                 state.setCurrentVolume(Volume::New(ct));
                 require(!controller.fiberCoordinateScale(fiber.id,false),"unbound real fiber requires explicit assignment");
@@ -209,6 +245,9 @@ int runObjectStoreControllerTests()
                 controller._errorDialogsSuppressed=true;
                 require(factor && *factor==0.25,"explicit scale-2 binding persists");
                 fiber=resolve(fiber.uuid);
+                const auto display = controller.fiberInVolumeCoordinates(fiber);
+                require(display.controlPoints.front() == fiber.controlPoints.front() * .25 && display.linePoints.front() == fiber.linePoints.front() * .25, "display geometry uses explicit binding");
+                require(resolve(fiber.uuid).linePoints == fiber.linePoints, "display transform does not change stored geometry");
                 const auto point=fiber.controlPoints.front()*(*factor);
                 Array3D<uint8_t> crop({2,2,2});
                 require(state.currentVolume()->readZYX(crop,{int(point[2]),int(point[1]),int(point[0])}),"read real CT at scale 2");

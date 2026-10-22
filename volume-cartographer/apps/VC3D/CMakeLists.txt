@@ -385,7 +385,7 @@ target_link_libraries(VC3D
     $<$<BOOL:${mimalloc_FOUND}>:mimalloc>
     vc_core
     vc_object_store::vc_objects
-    vc_fiber_collection
+    vc_fiber_view
     vc_atlas
     vc_lasagna
     vc_fiber_tracer

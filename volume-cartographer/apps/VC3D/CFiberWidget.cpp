@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <set>
 #include <unordered_map>
 #include <utility>
@@ -237,6 +238,7 @@ void CFiberWidget::setupUi()
     auto* layout = new QVBoxLayout(mainWidget);
 
     _totalLengthLabel = new QLabel(mainWidget);
+    connect(_totalLengthLabel, &QLabel::linkActivated, this, [this] { emit fiberDetailsRequested(0); });
     _totalLengthLabel->setObjectName(QStringLiteral("fiberTotalLengthLabel"));
     _totalLengthLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     _totalLengthLabel->setToolTip(
@@ -620,6 +622,7 @@ double CFiberWidget::totalLengthVx() const
 {
     double total = 0.0;
     for (const auto& fiber : _fibers) {
+        if (!fiber.detailsLoaded || !std::isfinite(fiber.lengthVx)) return std::numeric_limits<double>::quiet_NaN();
         if (std::isfinite(fiber.lengthVx)) {
             total += fiber.lengthVx;
         }
@@ -685,6 +688,10 @@ void CFiberWidget::refreshLengthDisplays()
 void CFiberWidget::updateTotalLengthLabel()
 {
     if (!_totalLengthLabel) {
+        return;
+    }
+    if (std::any_of(_fibers.begin(), _fibers.end(), [](const auto& fiber) { return !fiber.detailsLoaded; })) {
+        _totalLengthLabel->setText(tr("Total fiber length: <a href=\"load\">calculate</a> (%1 fibers)").arg(_fibers.size()));
         return;
     }
     _totalLengthLabel->setText(
@@ -791,9 +798,9 @@ void CFiberWidget::rebuildModel()
         QStandardItem* root = row[kNameColumn];
         const bool wasExpanded =
             _treeView && expandedFibers.find(fiber.id) != expandedFibers.end();
-        if (wasExpanded) {
+        if (wasExpanded && fiber.detailsLoaded) {
             buildSpanChildRows(root, fiber);
-        } else if (!fiber.spans.empty()) {
+        } else if (!fiber.spans.empty() || (!fiber.detailsLoaded && fiber.controlPointCount >= 2)) {
             // Placeholder keeps the expand arrow; the real span rows (the
             // bulk of the model) are built on first expansion.
             QStandardItem* placeholder = readOnlyItem(QString());
@@ -861,6 +868,10 @@ void CFiberWidget::ensureSpanChildrenBuilt(const QModelIndex& index)
     const auto fiberIt = std::find_if(
         _fibers.begin(), _fibers.end(),
         [fiberId](const FiberEntry& fiber) { return fiber.id == fiberId; });
+    if (fiberIt != _fibers.end() && !fiberIt->detailsLoaded) {
+        emit fiberDetailsRequested(fiberId);
+        return;
+    }
     root->removeRows(0, 1);
     if (fiberIt != _fibers.end()) {
         buildSpanChildRows(root, *fiberIt);
@@ -931,6 +942,11 @@ void CFiberWidget::sortFibers()
         return ascending ? lhs < rhs : lhs > rhs;
     };
     std::stable_sort(_fibers.begin(), _fibers.end(), [&](const FiberEntry& lhs, const FiberEntry& rhs) {
+        if (column == kLengthColumn) {
+            const bool a = std::isfinite(lhs.lengthVx), b = std::isfinite(rhs.lengthVx);
+            if (a != b) return a;
+            if (!a) return lhs.id < rhs.id;
+        }
         bool different = false;
         bool less = false;
         switch (column) {
@@ -1057,6 +1073,8 @@ void CFiberWidget::selectFibers(const std::vector<uint64_t>& fiberIds)
 
     const auto selected = selectedFiberIds();
     _selectedFiberId = selected.size() == 1 ? selected.front() : 0;
+    for (const auto& fiber : _fibers) if (fiber.id == _selectedFiberId && !fiber.detailsLoaded)
+        emit fiberDetailsRequested(fiber.id);
     if (_deleteButton) {
         _deleteButton->setEnabled(!selected.empty());
     }
@@ -1073,6 +1091,8 @@ void CFiberWidget::onSelectionChanged()
 {
     const auto selected = selectedFiberIds();
     _selectedFiberId = selected.size() == 1 ? selected.front() : 0;
+    for (const auto& fiber : _fibers) if (fiber.id == _selectedFiberId && !fiber.detailsLoaded)
+        emit fiberDetailsRequested(fiber.id);
     _deleteButton->setEnabled(!selected.empty());
     updateClassificationUi();
 }

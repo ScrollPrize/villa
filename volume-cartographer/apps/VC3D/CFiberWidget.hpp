@@ -77,6 +77,7 @@ public:
         int linkedFiberCount = 0;
         int pendingLinkCount = 0;
         TraceState traceState = TraceState::Legacy;
+        bool detailsLoaded = true;
     };
 
     explicit CFiberWidget(QWidget* parent = nullptr);
@@ -117,6 +118,7 @@ public:
     [[nodiscard]] double fiberViewDistance() const;
 
 signals:
+    void fiberDetailsRequested(uint64_t fiberId);
     void fiberOpenRequested(uint64_t fiberId);
     void deleteFibersRequested(std::vector<uint64_t> fiberIds);
     void manualHvTagChanged(uint64_t fiberId, QString tag);

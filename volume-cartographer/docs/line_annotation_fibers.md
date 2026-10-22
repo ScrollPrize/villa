@@ -1,32 +1,41 @@
 # VC3D Line Annotation Fibers
 
-## Fiber coordinate shape
+## Storage and coordinates
 
-Every saved fiber includes `coordinate_base_shape_zyx`, the dimensions of the
-grid its stored points index. New viewer annotations record the active volume's
-exact shape; linked fibers inherit the parent session's shape and display scale.
-Headless inference annotations require the inference manifest's `base_shape_zyx`.
-These are coordinate-frame dimensions, not necessarily the scan's finest grid.
-Opening older unstamped fibers first uses their recorded/selected inference
-manifest; without one, their existing unscaled active-volume interpretation is
-recorded on save. Saving without a valid shape fails rather than omitting it.
-Once resolved, this shape is retained in the loaded fiber and its open sessions
-before saves are queued. Changing the active volume or inference dataset does
-not reinterpret previously resolved geometry.
-Package loading happens before volume activation. Load-time metadata writes
-(including assigning a missing UUID) that cannot yet resolve a coordinate shape
-are deferred until a volume becomes active. The already generated in-memory UUID
-is preserved during that wait; existing UUIDs are not replaced. Deferred writes
-are discarded on a fiber reload/package change, and this retry does not enable
-writes withheld for unresolved branch-link issues.
+Attach an existing `.vcobj` database with **File → Attach Object Store**.
+**Attach Read-only Object Store** supports browsing without permitting writes.
+Fiber geometry, annotations, relationships and retirement are published atomically
+by `vc_object_store::publishFiberEdits`. VC3D retains pinned working snapshots.
+The catalog reads control geometry and metadata; dense line geometry is loaded
+on demand. Selecting or expanding a fiber loads its exact span details; unloaded
+lengths display as unknown. The total-length calculate link loads all span details. Closing a read-only view does not remove its catalog entry.
 
-Import and export preserve stored coordinates and `coordinate_base_shape_zyx`
-unchanged. There is no import/export scale control or API parameter; the shape
-determines the display conversion into the active volume. Agent requests that
-still supply `scale` are rejected. Old collection-level `scale` metadata is not
-applied; it described a transform already baked into the exported points.
-Previously scaled exports with inconsistent shape metadata need correction
-at their source; they cannot be repaired unambiguously on import.
+Each fiber's explicit coordinate binding determines its transform into the active
+volume. Unbound fibers remain listed but are excluded from spatial overlays and
+search until bound. Slice, intersection, map and point-collection views apply the
+same per-fiber transform. Stored geometry and solver coordinates remain unchanged.
+`coordinate_base_shape_zyx`, when present, describes the stored coordinate grid.
+
+Import/export is an explicit transfer operation. VC3D imports current **version 4**
+`vc3d_fiber` JSON with UUIDs and exports that format. There is no implicit file
+migration, filename identity inference, gap repair, branch stripping, project
+fiber-folder lookup or `.afv` backend. Store records load directly from typed
+geometry and relationships, independently of their original ingestion format.
+Control-only fibers remain in the catalog. Import/export does not rescale points.
+
+Atlas mappings require object-store revision pins. The atlas inspection,
+constraint export and pred-snap rebuild tools accept `--object-store PATH` and
+open that database read-only. Native JSON needed by external processing tools is
+materialized explicitly from pinned revisions into temporary transfer files.
+
+Example build and checks (existing configured Ninja build):
+
+```sh
+ninja -C build VC3D test_atlas vc_atlas_inspect vc_atlas_constraints_export vc_atlas_pred_snap_rebuild
+QT_QPA_PLATFORM=offscreen build/bin/VC3D --test-object-store
+build/bin/test_atlas
+build/bin/vc_atlas_inspect /path/to/atlas --object-store /path/to/objects.vcobj
+```
 
 ## CP direction annotations
 
@@ -65,21 +74,10 @@ the cross-section plane normal. Existing auto/manual optimization scheduling is
 retained; edits dirty adjacent spans and connected spline runs follow the normal
 optimization path. Saved display-normal corrections remain separate.
 
-VC3D writes line annotations as `vc3d_fiber` JSON, currently **version 4**.
-Version 3 stores `control_points` as objects with a required `position`. Every
-non-final control point owns a required `segment_to_next` descriptor for its
-span to control point `i+1`; the final control point cannot contain
-`segment_to_next`. Version 4 is version 3 plus an optional `tags` array of
-strings on each span descriptor, written only when non-empty, so a span
-without tags serializes exactly as in version 3. A version-3 span carrying
-`tags` is rejected, so the version is a true signal of what a file may
-contain. Every loader (the core strict loader, VC3D, the python format
-package, `fiber_merge`) accepts versions 1, 3 and 4; VC3D writes 4, and so
-does the lasagna line probe for a re-optimized result (its plain `--output`
-copy still copies the validated input as-is, whatever its version). The merge tool treats 3 and 4 as one lineage (a v3 base
-with v4 sides is the normal state after an upgrade, not a conflict) and
-writes the merge as version 4 when any side is 4. Builds older than version 4
-refuse to load a version-4 file. A control point
+VC3D's explicit transfer format is `vc3d_fiber` JSON **version 4**.
+Control points are objects with a required `position`. Every non-final control
+point owns a `segment_to_next` descriptor; the final control point has none.
+Span descriptors may carry an optional `tags` array. A control point
 may also carry an optional `tags` array of strings, written only when non-empty;
 the one tag today is `kollesis_termination`, set from the control point's
 Ctrl+right-click menu ("Kollesis termination", a toggle) to mark where the fiber

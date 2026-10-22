@@ -6,7 +6,6 @@
 #include "Keybinds.hpp"
 #include "SpiralPanel.hpp"
 #include "SpiralBrushController.hpp"
-#include "SpiralFiberRevisionUpload.hpp"
 #include "SpiralServiceManager.hpp"
 #include "SpiralMinimap.hpp"
 #include "SurfaceOverlayColors.hpp"

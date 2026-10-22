@@ -431,7 +431,7 @@ std::vector<LinkRecord> collectValidLinks(
                 seen.emplace(here < there ? std::make_pair(here, there)
                                           : std::make_pair(there, here),
                              links.size());
-            const bool explicitOrdinary = !link.adjacent && link.adjacentExplicit;
+            const bool explicitOrdinary = !link.adjacent;
             if (!inserted.second) {
                 LinkRecord& seen = links[inserted.first->second];
                 seen.pending |= link.pending;
@@ -2234,7 +2234,6 @@ ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
                                 link.branchControlPointIndex)));
             hashU64(digest, link.pending ? 1 : 0);
             hashU64(digest, link.adjacent ? 1 : 0);
-            hashU64(digest, link.adjacentExplicit ? 1 : 0);
         }
     }
     hashDouble(digest, params.suspectTurns);

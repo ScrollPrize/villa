@@ -2,7 +2,6 @@
 
 #include "LineAnnotationController.hpp"
 #include "SpiralPclRole.hpp"
-#include "SpiralFiberRevisionUpload.hpp"
 
 #include <QMainWindow>
 #include <QFutureWatcher>
@@ -299,5 +298,4 @@ private:
     bool _draftPreparationFailed = false;
     // Keyed by Spiral input id (the fiber file stem), never by runtime
     // fiber id: runtime ids are reassigned whenever the fiber list reloads.
-    using TrackedFiber = vc3d::SpiralTrackedFiber;
 };

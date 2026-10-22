@@ -51,10 +51,7 @@ struct InputLink {
     // adjacentUnpaired), reported suspect and given no constraint. ORed on
     // dedup like pending.
     bool adjacent = false;
-    // The ref stated its kind explicitly (the containing JSON array).
-    // Two explicit refs of one pair disagreeing (true here, false there) is
-    // reported as PlacedLink::adjacentDisagrees.
-    bool adjacentExplicit = true;
+
 };
 
 struct InputFiber {

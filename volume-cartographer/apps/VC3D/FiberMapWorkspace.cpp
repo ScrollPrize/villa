@@ -1904,8 +1904,7 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
                                                link.branchFiberId,
                                                link.branchControlPointIndex,
                                                link.pending,
-                                               link.adjacent,
-                                               link.adjacentExplicit});
+                                               link.adjacent});
             }
             inputs.push_back(std::move(input));
         }

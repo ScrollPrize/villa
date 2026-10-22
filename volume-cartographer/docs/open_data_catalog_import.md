@@ -7,10 +7,9 @@ and Select all/Select none also work. Set the project name and destination
 `.volpkg.json`, then choose **Create and Open**. Existing files require confirmation;
 the currently open project cannot be overwritten through this action.
 
-Creation also makes `fibers/<sanitized project JSON filename>/` beside the JSON,
-even for an empty project. Copy fiber JSON files into that directory. For example,
-`My Project.volpkg.json` uses `fibers/My_Project.volpkg.json/`. File -> New Project
-creates the same directory. Existing files there are preserved.
+Fibers live in an explicitly attached object store (`.vcobj`). Project creation
+does not create a fiber directory. Use File → Attach Object Store, then the
+explicit fiber import command for current-format transfer JSON.
 
 An empty selection creates an empty project. Open Sample still uses the existing
 full-sample workflow. The selective path never loads the cached full-sample project.

@@ -65,6 +65,7 @@ function(vc_add_test)
 endfunction()
 
 vc_add_test(NAME test_smoke LIBS doctest::doctest)
+vc_add_test(NAME test_fiber_view LIBS doctest::doctest vc_fiber_view)
 
 vc_add_test(NAME test_sampling_wait_profile)
 add_test(NAME test_sampling_wait_profile_enabled
@@ -72,7 +73,6 @@ add_test(NAME test_sampling_wait_profile_enabled
         $<TARGET_FILE:test_sampling_wait_profile>)
 vc_register_ctest(test_sampling_wait_profile_enabled test_sampling_wait_profile)
 
-vc_add_test(NAME test_fiber_collection LIBS doctest::doctest vc_fiber_collection)
 
 vc_add_test(NAME test_omp_thread_point_collection)
 

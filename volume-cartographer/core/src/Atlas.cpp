@@ -1,3 +1,4 @@
+#include "vc_object_store/geometry/Geometry.hpp"
 #include <vc_object_store/objects/FiberJson.hpp>
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/Uuid.hpp>
@@ -290,20 +291,6 @@ nlohmann::json readJsonFile(const fs::path& path)
     return nlohmann::json::parse(in);
 }
 
-FiberInput loadSourceFiberInput(const fs::path& fiberPath,
-                                const fs::path& fiberRelativePath)
-{
-    const auto root = readJsonFile(fiberPath);
-    const auto parsed = vc::fiber_tracer::parseVc3dFiberJson(
-        root, fiberPath.string());
-    FiberInput input;
-    input.fiberPath = fiberRelativePath;
-    input.controlPoints = parsed.controlPoints;
-    input.linePoints = parsed.linePoints;
-    validateFiberInputControlPoints(input);
-    return input;
-}
-
 nlohmann::json storedFiberDocument(const FiberMapping& mapping,
     const std::shared_ptr<vc::objects::ObjectStoreSession>& store)
 {
@@ -332,14 +319,29 @@ nlohmann::json storedFiberDocument(const FiberMapping& mapping,
     }
     return result;
 }
-FiberInput loadMappedFiberInput(const FiberMapping& mapping,const fs::path& fallback,
+FiberInput loadMappedFiberInput(const FiberMapping& mapping,
     const std::shared_ptr<vc::objects::ObjectStoreSession>& store)
 {
-    if(!mapping.storePin) return loadSourceFiberInput(fallback,mapping.fiberPath);
-    const auto parsed=vc::fiber_tracer::parseVc3dFiberJson(storedFiberDocument(mapping,store),mapping.storePin->object.objectUuid);
-    FiberInput input;input.fiberPath=mapping.fiberPath;input.storePin=mapping.storePin;input.storeToAtlasScale=mapping.storeToAtlasScale;
-    input.controlPoints=parsed.controlPoints;input.linePoints=parsed.linePoints;
-    validateFiberInputControlPoints(input);return input;
+    if (!store || !mapping.storePin) throw std::runtime_error("Atlas fiber requires an object store revision pin");
+    const auto attachment = store->attachment();
+    const auto& pin = *mapping.storePin;
+    if (!attachment || attachment->storeUuid != pin.object.storeUuid)
+        throw std::runtime_error("Atlas references a different object store");
+    if (!(mapping.storeToAtlasScale > 0) || !std::isfinite(mapping.storeToAtlasScale))
+        throw std::runtime_error("Invalid stored atlas coordinate transform");
+    FiberInput input;
+    input.fiberPath = mapping.fiberPath; input.storePin = mapping.storePin;
+    input.storeToAtlasScale = mapping.storeToAtlasScale;
+    store->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
+        const auto revision = db.objectRevision(txn, pin.objectRevision);
+        if (!revision || revision->objectUuid != pin.object.objectUuid || revision->geometryRevision != pin.geometryRevision || !pin.geometryRevision)
+            throw std::runtime_error("Atlas fiber revision is unavailable");
+        const auto geometry = std::get<vc::geometry::Fiber>(vc::geometry::decode(db.readGeometryData(txn, *pin.geometryRevision)));
+        for (const auto& p : geometry.controlPoints) input.controlPoints.push_back(cv::Vec3d{p[0],p[1],p[2]} * mapping.storeToAtlasScale);
+        for (const auto& p : geometry.linePoints) input.linePoints.push_back(cv::Vec3d{p[0],p[1],p[2]} * mapping.storeToAtlasScale);
+    });
+    validateFiberInputControlPoints(input);
+    return input;
 }
 
 void validateMappingControlAnchorsAgainstFiber(const FiberMapping& mapping,
@@ -397,39 +399,6 @@ fs::path resolveAtlasRelativePath(const fs::path& atlasDir,
         return (volpkgRoot / jsonPath).lexically_normal();
     }
     return (atlasDir / jsonPath).lexically_normal();
-}
-
-fs::path resolveAtlasFiberPath(const fs::path& atlasDir,
-                               const fs::path& volpkgRoot,
-                               const fs::path& fiberPathRoot,
-                               const fs::path& jsonPath)
-{
-    if (jsonPath.empty() || jsonPath.is_absolute() || fiberPathRoot.empty()) {
-        return resolveAtlasRelativePath(atlasDir, volpkgRoot, jsonPath);
-    }
-
-    std::vector<fs::path> candidates;
-    candidates.push_back((fiberPathRoot / jsonPath).lexically_normal());
-
-    auto relativeIt = jsonPath.begin();
-    if (relativeIt != jsonPath.end() && relativeIt->string() == "fibers") {
-        fs::path withoutFibers;
-        ++relativeIt;
-        for (; relativeIt != jsonPath.end(); ++relativeIt) {
-            withoutFibers /= *relativeIt;
-        }
-        if (!withoutFibers.empty()) {
-            candidates.push_back((fiberPathRoot / withoutFibers).lexically_normal());
-        }
-    }
-
-    candidates.push_back((fiberPathRoot / jsonPath.filename()).lexically_normal());
-    for (const auto& candidate : candidates) {
-        if (fs::is_regular_file(candidate)) {
-            return candidate;
-        }
-    }
-    return candidates.front();
 }
 
 std::vector<fs::path> sortedAtlasFiberMappingFiles(const fs::path& atlasDir)
@@ -490,7 +459,8 @@ Atlas loadAtlasContextForRebuild(const fs::path& atlasDir)
         FiberMapping mapping;
         mapping.storePin = atlasObjectPin(root);
         mapping.storeToAtlasScale = root.value("store_to_atlas_scale",1.0);
-        mapping.fiberPath = mapping.storePin ? fs::path(mapping.storePin->object.storeUuid)/mapping.storePin->object.objectUuid : fs::path(root.value("fiber_path",std::string{}));
+        if (!mapping.storePin) throw std::runtime_error("Atlas fiber mapping requires an object store revision pin");
+        mapping.fiberPath = fs::path(mapping.storePin->object.storeUuid)/mapping.storePin->object.objectUuid;
         mapping.windingOffset = 0;
         for (const auto& anchor : root.value("line_anchors", nlohmann::json::array())) {
             mapping.lineAnchors.push_back(anchorFromJson(anchor));
@@ -1083,7 +1053,7 @@ void Atlas::save(const fs::path& atlasDir) const
         root["type"] = "vc3d_atlas_fiber_mapping";
         root["version"] = kFiberMappingVersion;
         if (fiber.storePin) { root["object"] = atlasObjectPinJson(*fiber.storePin); root["store_to_atlas_scale"]=fiber.storeToAtlasScale; }
-        else root["fiber_path"] = fiber.fiberPath.generic_string();
+        else throw std::runtime_error("Atlas fiber mapping requires an object store revision pin");
         root["line_anchors"] = nlohmann::json::array();
         for (const auto& anchor : fiber.lineAnchors) {
             root["line_anchors"].push_back(anchorJson(anchor));
@@ -1099,19 +1069,7 @@ void Atlas::save(const fs::path& atlasDir) const
     }
 }
 
-Atlas Atlas::load(const fs::path& atlasDir)
-{
-    return Atlas::load(atlasDir, inferVolpkgRootFromAtlasDir(atlasDir));
-}
-
-Atlas Atlas::load(const fs::path& atlasDir, const fs::path& volpkgRootIn)
-{
-    return Atlas::load(atlasDir, volpkgRootIn, {});
-}
-
 Atlas Atlas::load(const fs::path& atlasDir,
-                  const fs::path& volpkgRootIn,
-                  const fs::path& fiberPathRoot,
     std::shared_ptr<vc::objects::ObjectStoreSession> store)
 {
     Atlas atlas;
@@ -1172,7 +1130,8 @@ Atlas Atlas::load(const fs::path& atlasDir,
             FiberMapping mapping;
             mapping.storePin = atlasObjectPin(root);
         mapping.storeToAtlasScale = root.value("store_to_atlas_scale",1.0);
-        mapping.fiberPath = mapping.storePin ? fs::path(mapping.storePin->object.storeUuid)/mapping.storePin->object.objectUuid : fs::path(root.value("fiber_path",std::string{}));
+        if (!mapping.storePin) throw std::runtime_error("Atlas fiber mapping requires an object store revision pin");
+        mapping.fiberPath = fs::path(mapping.storePin->object.storeUuid)/mapping.storePin->object.objectUuid;
             mapping.windingOffset = 0;
             for (const auto& anchor : root.value("line_anchors", nlohmann::json::array())) {
                 mapping.lineAnchors.push_back(anchorFromJson(anchor));
@@ -1184,23 +1143,7 @@ Atlas Atlas::load(const fs::path& atlasDir,
                 throw std::runtime_error("atlas fiber mapping " + mappingPath.string() +
                                          " references missing fiber path; rebuild required");
             }
-            const fs::path volpkgRoot = volpkgRootIn.empty()
-                ? inferVolpkgRootFromAtlasDir(atlasDir)
-                : volpkgRootIn;
-            if (!mapping.storePin && volpkgRoot.empty() && fiberPathRoot.empty()) {
-                throw std::runtime_error("cannot validate atlas fiber mapping " +
-                                         mappingPath.string() +
-                                         " without a volume package root; rebuild required");
-            }
-            const fs::path fiberPath = resolveAtlasFiberPath(
-                atlasDir, volpkgRoot, fiberPathRoot, mapping.fiberPath);
-            if (!mapping.storePin && !fs::is_regular_file(fiberPath)) {
-                throw std::runtime_error("atlas fiber mapping " + mappingPath.string() +
-                                         " references missing fiber path: " +
-                                         mapping.fiberPath.generic_string() +
-                                         "; rebuild required");
-            }
-            const FiberInput sourceFiber = loadMappedFiberInput(mapping, fiberPath, store);
+            const FiberInput sourceFiber = loadMappedFiberInput(mapping, store);
             validateMappingControlAnchorsAgainstFiber(mapping, sourceFiber, mappingPath);
             atlas.fibers.push_back(std::move(mapping));
         }
@@ -1282,9 +1225,7 @@ Atlas rebuildAtlasFromSourceFibers(const fs::path& atlasDir,
         if (oldMapping.fiberPath.empty()) {
             throw std::runtime_error("cannot rebuild atlas mapping with missing fiber path");
         }
-        const fs::path fiberPath = resolveAtlasRelativePath(
-            atlasDir, volpkgRoot, oldMapping.fiberPath);
-        const FiberInput input = loadMappedFiberInput(oldMapping, fiberPath, store);
+        const FiberInput input = loadMappedFiberInput(oldMapping, store);
         rebuilt.fibers.push_back(
             mapFiberToBaseSurface(input, baseSurface, baseIndex, normalSampler, options));
         rebuiltInputs.push_back(input);
@@ -2160,7 +2101,7 @@ AtlasPredSnapAttachmentReport ensureAtlasPredSnapAttachments(
         throw std::runtime_error("cannot generate atlas pred-snap attachments without a volume package root");
     }
 
-    Atlas atlas = Atlas::load(atlasDir, volpkgRoot, {}, store);
+    Atlas atlas = Atlas::load(atlasDir, store);
     if (atlas.metadata.baseMeshPath.empty()) {
         throw std::runtime_error("cannot generate atlas pred-snap attachments without base_mesh_path");
     }
@@ -2179,9 +2120,7 @@ AtlasPredSnapAttachmentReport ensureAtlasPredSnapAttachments(
         const fs::path attachmentPath =
             atlasPredSnapAttachmentPath(atlasDir, mapping.fiberPath);
         const bool existed = fs::exists(attachmentPath);
-        const fs::path fiberPath =
-            resolveAtlasRelativePath(atlasDir, volpkgRoot, mapping.fiberPath);
-        const FiberInput input = loadMappedFiberInput(mapping, fiberPath, store);
+        const FiberInput input = loadMappedFiberInput(mapping, store);
         (void)ensureAtlasPredSnapSet(atlasDir, input, mapping, baseSurface, sampler);
         if (!existed && fs::exists(attachmentPath)) {
             ++report.attachmentsCreated;
@@ -3109,7 +3048,7 @@ AtlasSnapPreparedCandidates prepareAtlasPredSnapCandidates(
     std::cerr << "[atlas-snap] loading atlas=" << atlasDir.string()
               << " volpkg_root=" << volpkgRoot.string()
               << std::endl;
-    Atlas atlas = Atlas::load(atlasDir, volpkgRoot, {}, store);
+    Atlas atlas = Atlas::load(atlasDir, store);
     std::cerr << "[atlas-snap] loaded atlas"
               << " fibers=" << atlas.fibers.size()
               << " links=" << atlas.links.size()
@@ -3150,7 +3089,7 @@ AtlasSnapPreparedCandidates prepareAtlasPredSnapCandidates(
                   << mapping.fiberPath.generic_string()
                   << " controls=" << mapping.controlAnchors.size()
                   << std::endl;
-        const FiberInput input = loadMappedFiberInput(mapping, fiberPath, store);
+        const FiberInput input = loadMappedFiberInput(mapping, store);
         AtlasPredSnapSet set = ensureAtlasPredSnapSet(atlasDir,
                                                       input,
                                                       mapping,
@@ -3714,7 +3653,6 @@ std::vector<AtlasDirectoryInfo> discoverAtlasDirectories(const fs::path& volpkgR
 
 LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
                                           const fs::path& volpkgRootIn,
-                                          const fs::path& fiberPathRoot,
     std::shared_ptr<vc::objects::ObjectStoreSession> store)
 {
     if (atlasDir.empty() || !fs::is_directory(atlasDir)) {
@@ -3729,7 +3667,7 @@ LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
     exportData.volpkgRoot = volpkgRootIn.empty()
         ? inferVolpkgRootFromAtlasDir(atlasDir)
         : volpkgRootIn;
-    exportData.atlas = Atlas::load(atlasDir, exportData.volpkgRoot, fiberPathRoot, store);
+    exportData.atlas = Atlas::load(atlasDir, store);
     exportData.baseRelativePath = exportData.atlas.metadata.baseMeshPath;
     if (exportData.baseRelativePath.empty()) {
         throw std::runtime_error("Atlas metadata is missing base_mesh_path.");
@@ -3793,20 +3731,12 @@ LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
             throw std::runtime_error("Atlas mapping " + mappingFiles[i].string() +
                                      " references missing fiber path: ");
         }
-        const fs::path fiberPath = resolveAtlasFiberPath(
-            atlasDir, exportData.volpkgRoot, fiberPathRoot, mapping.fiberPath);
-        if (!mapping.storePin && !fs::is_regular_file(fiberPath)) {
-            throw std::runtime_error("Atlas mapping " + mappingFiles[i].string() +
-                                     " references missing fiber path: " +
-                                     mapping.fiberPath.generic_string());
-        }
-        const FiberInput sourceFiber = loadMappedFiberInput(mapping, fiberPath, store);
+        const FiberInput sourceFiber = loadMappedFiberInput(mapping, store);
         validateMappingControlAnchorsAgainstFiber(mapping, sourceFiber, mappingFiles[i]);
 
         LasagnaAtlasObject object;
         object.id = mapping.fiberPath.generic_string();
-        object.fiberPath = fiberPath;
-        if(mapping.storePin) {
+        {
             if(!exportData.transportDirectory) {
                 const auto temp=fs::temp_directory_path()/("vc-atlas-"+vc::objects::util::newUuid());
                 fs::create_directory(temp);

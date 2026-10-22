@@ -335,7 +335,9 @@ FiberCollectionController::FiberCollectionController(CState* state, ViewerManage
     connect(detach_, &QPushButton::clicked, this, [this]() {
         state_->detachObjectStore();
     });
-    connect(state_, &CState::objectStoreChanged, this, [this] { projectChanged(); });
+    connect(state_, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
+        projectChanged(event.kind == vc::objects::StoreSessionEvent::Kind::Committed);
+    });
     connect(state_, &CState::volumeChanged, this, [this]() { volumeChanged(); });
     connect(state_, &CState::volumeClosing, this, [this]() { clear(); });
     bindToViewerManager(manager);
@@ -395,9 +397,10 @@ void FiberCollectionController::clear()
     selection_->clear();
     refreshAll();
 }
-void FiberCollectionController::projectChanged()
+void FiberCollectionController::projectChanged(bool preserveSelection)
 {
-    clear();
+    if (!preserveSelection) clear();
+    else ++revision_;
     pins_.clear();
     const auto connection=state_->objectStoreSession();
     const auto attachment=connection->attachment();
@@ -428,6 +431,10 @@ void FiberCollectionController::projectChanged()
         if(!(nativeVoxelMm_>0)) throw std::runtime_error("The active volume has no resolution");
         totalFibers_=pins_.size();enabled_=true;detach_->setEnabled(true);
         listPage(true);invalidate();
+        if (preserveSelection && selected_ > 0) {
+            if (pins_.contains(selected_)) selectFiber(selected_, false, false);
+            else { selected_ = 0; along_->setEnabled(false); openAnnotation_->setEnabled(false); selection_->clear(); }
+        }
         if(unbound) status_->setText(tr("%1 fibers need coordinate binding. Open a fiber to assign its volume and scale.").arg(unbound));
     } catch(const std::exception& e) { status_->setText(QString::fromUtf8(e.what())); }
 
@@ -569,6 +576,7 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
 {
     if (!enabled_ || id <= 0 || !pins_.contains(id))
         return;
+    const std::optional<int> previousIndex = selected_ == id && !focusView ? std::optional(along_->value()) : std::nullopt;
     selected_ = id;
     ++navigationRevision_;
     pendingIndex_.reset();
@@ -597,7 +605,7 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
                 row.pointCount=object.fiber->linePointCount ? object.fiber->linePointCount : object.fiber->controlPointCount;
             });row.length=factor>0 ? row.length*factor : -1;return row;
         },
-        [this, token, rev, focusView, openAnnotation](const Outcome<vc::fibers::Summary>& result) {
+        [this, token, rev, focusView, openAnnotation, previousIndex](const Outcome<vc::fibers::Summary>& result) {
             if (rev != revision_ || token != selectionRevision_)
                 return;
             if (!result.error.isEmpty()) {
@@ -612,7 +620,7 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
                 tr("#%1 · %2 points · %3 mm\nFollow the complete stored fiber with the slider.").arg(s.id).arg(s.pointCount).arg(s.length * nativeVoxelMm_, 0, 'f', 2));
             const QSignalBlocker block(along_);
             along_->setRange(0, int(std::min<int64_t>(s.pointCount - 1, std::numeric_limits<int>::max())));
-            const int centerIndex = along_->maximum() / 2;
+            const int centerIndex = previousIndex ? std::clamp(*previousIndex, 0, along_->maximum()) : along_->maximum() / 2;
             along_->setValue(centerIndex);
             along_->setEnabled(true);
             openAnnotation_->setEnabled(annotations_ != nullptr);

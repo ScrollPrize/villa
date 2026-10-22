@@ -29,8 +29,17 @@ int main() try
     require(!std::filesystem::exists(directory.path / "absent.vcobj"), "attach must not create");
     require(session.current(identity), "failed replacement preserved old attachment");
     auto readonly = options; readonly.readOnly = true;
-    mustFail([&] { session.attach(path, readonly); });
-    require(session.current(identity), "read-only replacement preserved attachment");
+    identity = session.attach(path, readonly);
+    require(!session.writable(), "read-only attachment reports access mode");
+    session.read(identity, [&](const auto& store, const auto& txn, const auto&) {
+        require(store.objectByUuid(txn, a).has_value(), "read-only attachment reads objects");
+    });
+    bool callbackRan = false;
+    mustFail([&] { session.act(identity, {}, [&](auto&, auto&) { callbackRan = true; }); });
+    require(!callbackRan, "read-only actions rejected before callback");
+    identity = session.attach(path, options);
+    session.takeEvents();
+    require(session.writable(), "writable reattachment");
 
     auto heads = [&] {
         RevisionSelection result;

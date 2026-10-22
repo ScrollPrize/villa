@@ -26,6 +26,13 @@ The object store can be used in place of tifxyz files, fiber jsons, track crossi
 
 The db has fast spatial queries through a persisted r-tree backed index with optional in-memory views for repeated queries. 
 
+The C++ `ObjectStoreSession` accepts writable or read-only attachments. Read-only
+sessions reject actions before invoking their callbacks. `publishFiberEdits` in
+`objects/FiberEdit.hpp` publishes typed fiber geometry, tracing annotations,
+shared branches and retirement atomically, with explicit revision expectations.
+It returns committed pins and stable control/edge IDs; rejected edits leave the
+caller's payload unchanged. VC3D uses this API for fiber persistence.
+
 ## Use
 
 ```python

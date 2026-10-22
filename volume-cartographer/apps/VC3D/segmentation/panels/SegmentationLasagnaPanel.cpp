@@ -476,7 +476,7 @@ bool buildAtlasRequestArtifacts(const std::filesystem::path& atlasDir,
     }
     vc::atlas::LasagnaAtlasExport atlasExport;
     try {
-        atlasExport = vc::atlas::loadLasagnaAtlasExport(atlasDir, volpkgRootIn, {}, store);
+        atlasExport = vc::atlas::loadLasagnaAtlasExport(atlasDir, volpkgRootIn, store);
     } catch (const std::exception& ex) {
         if (error) {
             *error = QString::fromStdString(ex.what());
