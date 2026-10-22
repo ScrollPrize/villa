@@ -82,6 +82,25 @@ add_test(NAME spiral_input_draft COMMAND test_spiral_input_draft)
 vc_register_test_target(test_spiral_input_draft)
 vc_register_ctest(spiral_input_draft test_spiral_input_draft)
 
+add_executable(test_settings_filter
+    test_settings_filter.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SettingsFilter.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SettingsFilter.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/VCSettings.ui)
+# The test also filters the real VCSettings.ui form.
+set_target_properties(test_settings_filter PROPERTIES
+    AUTOMOC ON AUTOUIC ON AUTORCC OFF
+    AUTOUIC_SEARCH_PATHS ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_include_directories(test_settings_filter PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_settings_filter PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Test Qt6::Widgets)
+add_test(NAME settings_filter COMMAND test_settings_filter)
+vc_register_test_target(test_settings_filter)
+vc_register_ctest(settings_filter test_settings_filter)
+set_tests_properties(settings_filter PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 add_executable(test_line_annotation_coordinate_scale
     test_line_annotation_coordinate_scale.cpp)
 
@@ -102,6 +121,49 @@ vc_register_test_target(test_line_annotation_coordinate_scale)
 vc_register_ctest(line_annotation_coordinate_scale
     test_line_annotation_coordinate_scale)
 
+add_executable(test_command_catalog
+    test_command_catalog.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandCatalog.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandCatalog.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/StatusDockPanelHost.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/StatusDockPanelHost.hpp)
+set_target_properties(test_command_catalog PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_command_catalog PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+# StatusDockPanelHost reads the VC3D settings through vc_core.
+target_link_libraries(test_command_catalog PRIVATE
+    vc_core Qt6::Core Qt6::Gui Qt6::Test Qt6::Widgets)
+add_test(NAME command_catalog COMMAND test_command_catalog)
+vc_register_test_target(test_command_catalog)
+vc_register_ctest(command_catalog test_command_catalog)
+set_tests_properties(command_catalog PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
+add_executable(test_command_palette
+    test_command_palette.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandPalette.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandPalette.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandCatalog.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandCatalog.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.hpp)
+set_target_properties(test_command_palette PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+# VCSettings.hpp includes a vc_core header.
+target_include_directories(test_command_palette PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D
+    ${PROJECT_SOURCE_DIR}/core/include)
+target_link_libraries(test_command_palette PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Test Qt6::Widgets)
+add_test(NAME command_palette COMMAND test_command_palette)
+vc_register_test_target(test_command_palette)
+vc_register_ctest(command_palette test_command_palette)
+set_tests_properties(command_palette PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 add_executable(test_surface_rotation_transform
     test_surface_rotation_transform.cpp)
 
@@ -120,6 +182,31 @@ add_test(NAME surface_rotation_transform COMMAND test_surface_rotation_transform
 vc_register_test_target(test_surface_rotation_transform)
 vc_register_ctest(surface_rotation_transform test_surface_rotation_transform)
 
+add_executable(test_keybinds_sheet
+    test_keybinds_sheet.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/KeybindsSheet.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/KeybindsSheet.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandCatalog.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/CommandCatalog.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SettingsFilter.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/SettingsFilter.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.hpp)
+set_target_properties(test_keybinds_sheet PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_keybinds_sheet PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D)
+# The test reads the keybind definitions to check that the help lists them.
+target_compile_definitions(test_keybinds_sheet PRIVATE
+    VC3D_KEYBINDS_SOURCE="${PROJECT_SOURCE_DIR}/apps/VC3D/Keybinds.cpp")
+target_link_libraries(test_keybinds_sheet PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Test Qt6::Widgets)
+add_test(NAME keybinds_sheet COMMAND test_keybinds_sheet)
+vc_register_test_target(test_keybinds_sheet)
+vc_register_ctest(keybinds_sheet test_keybinds_sheet)
+set_tests_properties(keybinds_sheet PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+
 add_executable(test_vc_settings
     test_vc_settings.cpp)
 
@@ -137,6 +224,39 @@ target_link_libraries(test_vc_settings PRIVATE
 add_test(NAME vc_settings COMMAND test_vc_settings)
 vc_register_test_target(test_vc_settings)
 vc_register_ctest(vc_settings test_vc_settings)
+
+add_executable(test_theme_engine
+    test_theme_engine.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/themes/ClassicTheme.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/themes/ClassicTheme.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/themes/ThemeEngine.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/themes/ThemeEngine.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/themes/ThemeManager.cpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/themes/ThemeManager.hpp
+    ${PROJECT_SOURCE_DIR}/apps/VC3D/themes/themes.qrc)
+
+set_target_properties(test_theme_engine PROPERTIES
+    AUTOMOC ON AUTOUIC OFF AUTORCC ON)
+
+target_include_directories(test_theme_engine PRIVATE
+    ${PROJECT_SOURCE_DIR}/apps/VC3D
+    ${PROJECT_SOURCE_DIR}/core/include)
+
+target_compile_definitions(test_theme_engine PRIVATE
+    VC3D_THEME_EXAMPLES_DIR="${PROJECT_SOURCE_DIR}/apps/VC3D/themes/examples"
+    VC3D_THEME_DOCS="${PROJECT_SOURCE_DIR}/docs/vc3d_themes.md")
+
+target_link_libraries(test_theme_engine PRIVATE
+    Qt6::Core
+    Qt6::Gui
+    Qt6::Test
+    Qt6::Widgets)
+
+add_test(NAME theme_engine COMMAND test_theme_engine)
+vc_register_test_target(test_theme_engine)
+vc_register_ctest(theme_engine test_theme_engine)
+set_tests_properties(theme_engine PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 60)
 
 add_executable(test_unified_browser_dialog
     test_unified_browser_dialog.cpp

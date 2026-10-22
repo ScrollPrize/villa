@@ -21,8 +21,12 @@
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
 #include "Keybinds.hpp"
+#include "CommandCatalog.hpp"
+#include "CommandPalette.hpp"
+#include "KeybindsSheet.hpp"
 #include "FileWatcherService.hpp"
 #include "LineAnnotationController.hpp"
+#include "themes/ThemeManager.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -38,6 +42,7 @@
 #include "vc/lasagna/ProjectVolumes.hpp"
 
 #include <QAction>
+#include <QActionGroup>
 #include <QApplication>
 #include <QClipboard>
 #include <QFutureWatcher>
@@ -46,12 +51,10 @@
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QDialog>
-#include <QDialogButtonBox>
 #include <QDir>
 #include <QEventLoop>
 #include <QFileDialog>
 #include <QFileInfo>
-#include <QLabel>
 #include <QLineEdit>
 #include <QMainWindow>
 #include <QMetaObject>
@@ -63,17 +66,16 @@
 #include <QPointer>
 #include <QProcess>
 #include <QProgressDialog>
-#include <QScrollArea>
 #include <QSignalBlocker>
 #include <QStringList>
 #include <QSettings>
 #include <QStyle>
 #include <QTemporaryDir>
+#include <QTextDocument>
 #include <QTreeWidget>
 #include <QTimer>
 #include <QTreeWidgetItem>
 #include <QUrl>
-#include <QVBoxLayout>
 
 #include "utils/Json.hpp"
 
@@ -87,6 +89,10 @@
 namespace
 {
 constexpr int kMaxStoredRemoteUrls = 10;
+// A theme switch restyles every widget, which takes a second or two with a
+// project open. The delay lets the menu close and the wait cursor and status
+// note show first.
+constexpr int kThemeApplyDelayMs = 50;
 bool isAuthError(const QString& msg);
 
 } // namespace
@@ -173,6 +179,13 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _exitAct = new QAction(qWindow->style()->standardIcon(QStyle::SP_DialogCloseButton), QObject::tr("E&xit..."), this);
     connect(_exitAct, &QAction::triggered, this, &MenuActionController::exitApplication);
 
+    _commandPaletteAct = new QAction(QObject::tr("Command &Palette..."), this);
+    _commandPaletteAct->setShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CommandPalette));
+    // Application-wide like the window's other keyboard shortcuts, so the
+    // palette also opens from the workspaces and floating docks.
+    _commandPaletteAct->setShortcutContext(Qt::ApplicationShortcut);
+    connect(_commandPaletteAct, &QAction::triggered, this, &MenuActionController::showCommandPalette);
+
     _keybindsAct = new QAction(QObject::tr("&Keybinds"), this);
     connect(_keybindsAct, &QAction::triggered, this, &MenuActionController::showKeybindings);
 
@@ -230,7 +243,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachVolumeAct);
     _fileMenu->addAction(_attachSegmentsAct);
-    _fileMenu->addAction(QObject::tr("Open Automated Fiber Volume…"), this, [qWindow]() {
+    _openFiberVolumeAct = _fileMenu->addAction(QObject::tr("Open Automated Fiber Volume…"), this, [qWindow]() {
         // macOS hides the native file-type selector when there is only one filter.
         const auto path = QFileDialog::getOpenFileName(qWindow, QObject::tr("Open Automated Fiber Volume (.afv)"),
                                                      {}, QObject::tr("Automated Fiber Volume (*.afv);;All files (*)"));
@@ -266,6 +279,12 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _viewMenu->addAction(_resetViewsAct);
     _viewMenu->addSeparator();
     _viewMenu->addAction(_showConsoleAct);
+    _viewMenu->addSeparator();
+    _themeMenu = new QMenu(QObject::tr("&Theme"), _viewMenu);
+    _themeMenu->setToolTipsVisible(true);
+    connect(_themeMenu, &QMenu::aboutToShow, this, &MenuActionController::rebuildThemeMenu);
+    rebuildThemeMenu();
+    _viewMenu->addMenu(_themeMenu);
 
     _actionsMenu = new QMenu(QObject::tr("&Actions"), qWindow);
     _actionsMenu->addAction(_drawBBoxAct);
@@ -285,6 +304,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _selectionMenu->addAction(_selectionClearAct);
 
     _helpMenu = new QMenu(QObject::tr("&Help"), qWindow);
+    _helpMenu->addAction(_commandPaletteAct);
     _helpMenu->addAction(_keybindsAct);
     _helpMenu->addAction(_aboutAct);
 
@@ -295,7 +315,197 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     menuBar->addMenu(_selectionMenu);
     menuBar->addMenu(_helpMenu);
 
+    registerCommands();
     refreshRecentMenu();
+}
+
+void MenuActionController::rebuildThemeMenu()
+{
+    if (!_themeMenu) {
+        return;
+    }
+    _themeMenu->clear();
+    delete _themeActions;
+    _themeActions = new QActionGroup(_themeMenu);
+    _themeActions->setExclusive(true);
+
+    // Built-in themes first, then the user's, sorted by name.
+    bool separated = false;
+    for (const auto& info : vc3d::theme::ThemeManager::instance().themes()) {
+        if (info.source != QLatin1String("builtin") && !separated) {
+            _themeMenu->addSeparator();
+            separated = true;
+        }
+        QString label = info.name;
+        label.replace("&", "&&");
+        auto* action = _themeMenu->addAction(label);
+        action->setCheckable(true);
+        action->setChecked(info.active);
+        action->setActionGroup(_themeActions);
+        QStringList tip;
+        if (!info.author.isEmpty()) {
+            tip << QObject::tr("By %1").arg(info.author);
+        }
+        if (!info.description.isEmpty()) {
+            tip << info.description;
+        }
+        if (!info.path.isEmpty() && !info.path.startsWith(':')) {
+            tip << QDir::toNativeSeparators(info.path);
+        }
+        // Theme text comes from files people share, so it is never rich text.
+        action->setToolTip(Qt::convertFromPlainText(tip.join('\n')));
+        const QString id = info.id;
+        connect(action, &QAction::triggered, this, [this, id]() { applyTheme(id); });
+    }
+
+    _themeMenu->addSeparator();
+    _themeMenu->addAction(QObject::tr("Import Theme File..."), this, &MenuActionController::importThemeFile);
+    _themeMenu->addAction(QObject::tr("Import Theme Folder..."), this,
+                          &MenuActionController::importThemeFolder);
+    _themeMenu->addAction(QObject::tr("Export Current Theme as Template..."), this,
+                          &MenuActionController::exportTheme);
+    _themeMenu->addAction(QObject::tr("Open Themes Folder"), this,
+                          &MenuActionController::openThemesFolder);
+    _themeMenu->addAction(QObject::tr("Reload Themes"), this, &MenuActionController::reloadThemes);
+}
+
+void MenuActionController::applyTheme(const QString& id)
+{
+    auto& themes = vc3d::theme::ThemeManager::instance();
+    const auto* listed = themes.registry().find(id);
+    const QString name = listed ? listed->name : id;
+    if (_window) {
+        _window->showStatusBarMessage(QObject::tr("Applying %1...").arg(name));
+    }
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    QTimer::singleShot(kThemeApplyDelayMs, this, [this, id, name]() {
+        QString error;
+        const bool applied = vc3d::theme::ThemeManager::instance().setTheme(id, true, &error);
+        QApplication::restoreOverrideCursor();
+        if (_window) {
+            _window->showStatusBarMessage(applied ? QObject::tr("Theme: %1").arg(name) : QString(), 3000);
+        }
+        if (!applied) {
+            QMessageBox::warning(_window, QObject::tr("Theme"),
+                                 QObject::tr("The theme could not be applied:\n\n%1").arg(error));
+        }
+    });
+}
+
+void MenuActionController::importThemeFile()
+{
+    const QString path = QFileDialog::getOpenFileName(
+        _window, QObject::tr("Import Theme File"), QString(),
+        QObject::tr("VC3D themes (*.vc3dtheme);;All files (*)"));
+    if (!path.isEmpty()) {
+        importThemeFrom(path);
+    }
+}
+
+void MenuActionController::importThemeFolder()
+{
+    const QString path = QFileDialog::getExistingDirectory(
+        _window, QObject::tr("Import Theme Folder (the folder that holds theme.vc3dtheme)"));
+    if (!path.isEmpty()) {
+        importThemeFrom(path);
+    }
+}
+
+void MenuActionController::importThemeFrom(const QString& path)
+{
+    auto& themes = vc3d::theme::ThemeManager::instance();
+    auto outcome = themes.importTheme(path, false);
+    if (!outcome.ok && outcome.alreadyExists) {
+        const auto answer = QMessageBox::question(
+            _window, QObject::tr("Import Theme"),
+            QObject::tr("A theme with the id \"%1\" is already installed. Replace it?").arg(outcome.id));
+        if (answer != QMessageBox::Yes) {
+            return;
+        }
+        outcome = themes.importTheme(path, true);
+    }
+    if (!outcome.ok) {
+        QMessageBox::warning(_window, QObject::tr("Import Theme"),
+                             QObject::tr("The theme was not imported:\n\n%1")
+                                 .arg(vc3d::theme::formatProblems(outcome.problems)));
+        return;
+    }
+    // Later edits belong in the installed copy, which is the file VC3D watches.
+    QString message = QObject::tr("Installed as %1. Edit that file to see your changes live.")
+                          .arg(QDir::toNativeSeparators(outcome.installedPath));
+    if (!outcome.problems.isEmpty()) {
+        message += QObject::tr("\n\nWarnings:\n%1").arg(vc3d::theme::formatProblems(outcome.problems));
+    }
+    QMessageBox::information(_window, QObject::tr("Import Theme"), message);
+    applyTheme(outcome.id);
+}
+
+void MenuActionController::exportTheme()
+{
+    auto& themes = vc3d::theme::ThemeManager::instance();
+    const QString folder = themes.userThemesDirectory();
+    QDir().mkpath(folder);
+    QString name = vc3d::theme::normalizeThemeId(themes.currentTheme().name + QStringLiteral(" copy"));
+    // The dialog adds the suffix itself, so its overwrite question covers the
+    // file that is written.
+    QFileDialog dialog(_window, QObject::tr("Export Current Theme as Template"),
+                       QDir(folder).filePath(name + QStringLiteral(".vc3dtheme")),
+                       QObject::tr("VC3D themes (*.vc3dtheme)"));
+    dialog.setAcceptMode(QFileDialog::AcceptSave);
+    dialog.setDefaultSuffix(QStringLiteral("vc3dtheme"));
+    if (dialog.exec() != QDialog::Accepted || dialog.selectedFiles().isEmpty()) {
+        return;
+    }
+    QString path = dialog.selectedFiles().constFirst();
+    if (!path.endsWith(QStringLiteral(".vc3dtheme"), Qt::CaseInsensitive)) {
+        // A name with another suffix, such as ocean.json.
+        path += QStringLiteral(".vc3dtheme");
+        if (QFileInfo::exists(path) &&
+            QMessageBox::question(_window, QObject::tr("Export Theme"),
+                                  QObject::tr("%1 already exists. Replace it?")
+                                      .arg(QDir::toNativeSeparators(path))) != QMessageBox::Yes) {
+            return;
+        }
+    }
+    QString error;
+    vc3d::theme::ThemeProblems warnings;
+    if (!themes.exportTheme(path, QString(), &error, &warnings)) {
+        QMessageBox::warning(_window, QObject::tr("Export Theme"), error);
+        return;
+    }
+    themes.reloadThemes();
+    const QString id = vc3d::theme::normalizeThemeId(QFileInfo(path).completeBaseName());
+    const auto* listed = themes.registry().find(id);
+    QString message;
+    if (listed && QFileInfo(listed->filePath) == QFileInfo(path)) {
+        message = QObject::tr("Wrote %1.\n\nIt is listed in View > Theme. Pick it, then edit the file: "
+                              "each save shows at once.").arg(QDir::toNativeSeparators(path));
+    } else {
+        message = QObject::tr("Wrote %1.\n\nEdit its name and colors, then install it with View > Theme > "
+                              "Import Theme File..., or try it with VC3D --theme <file>.")
+                      .arg(QDir::toNativeSeparators(path));
+    }
+    if (!warnings.isEmpty()) {
+        message += QObject::tr("\n\nWarnings:\n%1").arg(vc3d::theme::formatProblems(warnings));
+    }
+    QMessageBox::information(_window, QObject::tr("Export Theme"), message);
+}
+
+void MenuActionController::openThemesFolder()
+{
+    const QString folder = vc3d::theme::ThemeManager::instance().userThemesDirectory();
+    QDir().mkpath(folder);
+    QDesktopServices::openUrl(QUrl::fromLocalFile(folder));
+}
+
+void MenuActionController::reloadThemes()
+{
+    const auto problems = vc3d::theme::ThemeManager::instance().reloadThemes();
+    if (!problems.isEmpty()) {
+        QMessageBox::warning(_window, QObject::tr("Reload Themes"),
+                             QObject::tr("Some themes have problems:\n\n%1")
+                                 .arg(vc3d::theme::formatProblems(problems)));
+    }
 }
 
 void MenuActionController::ensureRecentActions()
@@ -1426,6 +1636,61 @@ void MenuActionController::showAboutDialog()
             .arg(commitText));
 }
 
+void MenuActionController::registerCommands()
+{
+    CommandCatalog* catalog = _window ? _window->commandCatalog() : nullptr;
+    if (!catalog) {
+        return;
+    }
+
+    const QString file = QObject::tr("File");
+    catalog->add(QStringLiteral("new_project"), _newProjectAct, file);
+    catalog->add(QString::fromUtf8(vc3d::keybinds::shortcuts::OpenVolpkg.id), _openAct, file);
+    catalog->add(QStringLiteral("save_project_as"), _saveProjectAsAct, file);
+    catalog->add(QStringLiteral("attach_volume"), _attachVolumeAct, file);
+    catalog->add(QStringLiteral("attach_segments"), _attachSegmentsAct, file);
+    catalog->add(QStringLiteral("open_fiber_volume"), _openFiberVolumeAct, file);
+    catalog->add(QStringLiteral("attach_normal_grid"), _attachNormalGridAct, file);
+    catalog->add(QStringLiteral("attach_umbilicus"), _attachUmbilicusAct, file);
+    catalog->add(QStringLiteral("detach_umbilicus"), _detachUmbilicusAct, file);
+    catalog->add(QStringLiteral("attach_lasagna_manifest"), _attachLasagnaManifestAct, file);
+    catalog->add(QStringLiteral("attach_remote_lasagna_manifest"), _attachRemoteLasagnaManifestAct, file);
+    catalog->add(QStringLiteral("detach_entry"), _detachEntryAct, file);
+    catalog->add(QStringLiteral("attach_remote_zarr"), _attachRemoteZarrAct, file);
+    catalog->add(QStringLiteral("open_data_catalog"), _openDataCatalogAct, file);
+    catalog->add(QStringLiteral("settings"), _settingsAct, file);
+    catalog->add(QStringLiteral("exit"), _exitAct, file);
+
+    const QString view = QObject::tr("View");
+    catalog->add(QStringLiteral("sync_cursor"), _mirrorCursorAct, view);
+    catalog->add(QStringLiteral("reset_segmentation_views"), _resetViewsAct, view);
+    catalog->add(QStringLiteral("show_console_output"), _showConsoleAct, view);
+
+    const QString actions = QObject::tr("Actions");
+    catalog->add(QStringLiteral("draw_bbox"), _drawBBoxAct, actions);
+    catalog->add(QStringLiteral("materialize_open_data_folder"), _materializeOpenDataFolderAct, actions);
+    catalog->add(QStringLiteral("merge_tifxyz"), _mergeTifxyzAct, actions);
+    catalog->add(QStringLiteral("patch_tifxyz"), _mergePatchAct, actions);
+    catalog->add(QStringLiteral("grow_track_patches"), _growTrackPatchesAct, actions);
+    catalog->add(QStringLiteral("rotate_surface"), _rotateSurfaceAct, QObject::tr("Transforms"));
+
+    const QString selection = QObject::tr("Selection");
+    catalog->add(QStringLiteral("surface_from_selection"), _surfaceFromSelectionAct, selection);
+    catalog->add(QStringLiteral("clear_selection"), _selectionClearAct, selection);
+
+    const QString help = QObject::tr("Help");
+    catalog->add(QString::fromUtf8(vc3d::keybinds::shortcuts::CommandPalette.id), _commandPaletteAct, help);
+    catalog->add(QStringLiteral("keybinds"), _keybindsAct, help);
+    catalog->add(QStringLiteral("about"), _aboutAct, help);
+}
+
+void MenuActionController::showCommandPalette()
+{
+    if (_window) {
+        CommandPalette::open(_window->commandCatalog(), vc3d::settingsFilePath(), _window);
+    }
+}
+
 void MenuActionController::showKeybindings()
 {
     if (!_window) {
@@ -1438,34 +1703,8 @@ void MenuActionController::showKeybindings()
         return;
     }
 
-    _keybindsDialog = new QDialog(_window);
+    _keybindsDialog = new KeybindsSheet(_window->commandCatalog(), _window);
     _keybindsDialog->setAttribute(Qt::WA_DeleteOnClose);
-    _keybindsDialog->setWindowTitle(QObject::tr("Keybindings for Volume Cartographer"));
-
-    auto* layout = new QVBoxLayout(_keybindsDialog);
-    auto* scrollArea = new QScrollArea(_keybindsDialog);
-    scrollArea->setWidgetResizable(true);
-
-    auto* content = new QWidget(scrollArea);
-    auto* contentLayout = new QVBoxLayout(content);
-    auto* label = new QLabel(content);
-    label->setTextFormat(Qt::PlainText);
-    label->setText(vc3d::keybinds::buildKeybindsHelpText());
-    label->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    label->setWordWrap(false);
-    contentLayout->addWidget(label);
-    contentLayout->addStretch();
-    content->setLayout(contentLayout);
-
-    scrollArea->setWidget(content);
-    layout->addWidget(scrollArea);
-
-    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok, _keybindsDialog);
-    connect(buttons, &QDialogButtonBox::accepted, _keybindsDialog, &QDialog::accept);
-    layout->addWidget(buttons);
-
-    _keybindsDialog->resize(640, 520);
-    _keybindsDialog->setMinimumHeight(360);
     _keybindsDialog->show();
     _keybindsDialog->raise();
     _keybindsDialog->activateWindow();

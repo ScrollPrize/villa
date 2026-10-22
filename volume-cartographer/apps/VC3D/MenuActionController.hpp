@@ -16,6 +16,7 @@
 #include <functional>
 
 class QAction;
+class QActionGroup;
 class QDialog;
 class QMenu;
 class QMenuBar;
@@ -110,6 +111,7 @@ private slots:
     void attachRemoteZarr();
     void showSettingsDialog();
     void showAboutDialog();
+    void showCommandPalette();
     void showKeybindings();
     void resetSegmentationViews();
     void toggleConsoleOutput();
@@ -121,6 +123,12 @@ private slots:
     void beginRotateSurfaceTransform();
     void materializeCurrentOpenDataSegmentFolder();
     void exitApplication();
+    void rebuildThemeMenu();
+    void importThemeFile();
+    void importThemeFolder();
+    void exportTheme();
+    void openThemesFolder();
+    void reloadThemes();
 
 signals:
     // Emitted when the user picks Actions -> Merge tifxyz... CWindow
@@ -135,9 +143,14 @@ signals:
     void openDataCatalogVisibilityChanged(bool visible);
 
 private:
+    void applyTheme(const QString& id);
+    void importThemeFrom(const QString& path);
+
     QStringList loadRecentPaths() const;
     void saveRecentPaths(const QStringList& paths);
     void ensureRecentActions();
+    // Gives every menu action a stable id in the window's command catalog.
+    void registerCommands();
 
     QStringList loadRecentRemoteUrls() const;
     void saveRecentRemoteUrls(const QStringList& urls);
@@ -193,11 +206,14 @@ private:
     QMenu* _selectionMenu{nullptr};
     QMenu* _helpMenu{nullptr};
     QMenu* _recentMenu{nullptr};
+    QMenu* _themeMenu{nullptr};
+    QPointer<QActionGroup> _themeActions;
 
     QAction* _newProjectAct{nullptr};
     QAction* _saveProjectAsAct{nullptr};
     QAction* _attachVolumeAct{nullptr};
     QAction* _attachSegmentsAct{nullptr};
+    QAction* _openFiberVolumeAct{nullptr};
     QAction* _attachNormalGridAct{nullptr};
     QAction* _attachUmbilicusAct{nullptr};
     QAction* _detachUmbilicusAct{nullptr};
@@ -212,6 +228,7 @@ private:
     std::array<QAction*, kMaxRecentVolpkg> _recentActs{};
     QAction* _settingsAct{nullptr};
     QAction* _exitAct{nullptr};
+    QAction* _commandPaletteAct{nullptr};
     QAction* _keybindsAct{nullptr};
     QAction* _aboutAct{nullptr};
     QAction* _resetViewsAct{nullptr};

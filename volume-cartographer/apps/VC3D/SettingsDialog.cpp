@@ -1,5 +1,6 @@
 #include "SettingsDialog.hpp"
 
+#include "SettingsFilter.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
 #include "vc/core/render/ChunkCache.hpp"
@@ -141,6 +142,14 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
     connect(btnHelpDisplayOpacity, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpDisplayOpacity->toolTip()); });
     connect(btnHelpPreloadedSlices, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpPreloadedSlices->toolTip()); });
     connect(btnHelpRamCacheSize, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpRamCacheSize->toolTip()); });
+
+    // Type to show only the matching settings.
+    auto* noMatch = new QLabel(tr("No settings match the filter."), this);
+    noMatch->setAlignment(Qt::AlignCenter);
+    auto* filter = vc3d::settings_filter::createFilterField(this, noMatch);
+    mainVBox->insertWidget(0, filter);
+    mainVBox->insertWidget(1, noMatch);
+    filter->setFocus();
 }
 
 void SettingsDialog::setupCacheActionControls()
