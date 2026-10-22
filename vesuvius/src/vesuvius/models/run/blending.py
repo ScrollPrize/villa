@@ -6,7 +6,7 @@ import time
 import traceback
 import warnings
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 import fsspec
 import numcodecs
@@ -605,7 +605,10 @@ def _blend_output_chunks(patch_size, chunk_size):
 
 def create_blend_output(output_path, original_volume_shape, num_classes, patch_size, chunk_size=None,
                         compression_level=1, finalize_config=None, verbose=True):
-    """Create the blended (or blended and finalized) output array and return its chunks."""
+    """Create the blended (or blended and finalized) output array and return its chunks.
+
+    Shared by `merge_inference_outputs` and `InMemoryBlender`, so both write the same layout.
+    """
     if finalize_config is not None:
         from vesuvius.models.run.finalize_outputs import compute_finalized_shape
         output_shape = compute_finalized_shape(original_volume_shape, num_classes, finalize_config)
@@ -644,6 +647,128 @@ def create_blend_output(output_path, original_volume_shape, num_classes, patch_s
     )
     return output_chunks
 
+
+class InMemoryBlender:
+    """Gaussian-blend patch logits in RAM while inference produces them.
+
+    The staged pipeline writes every patch's logits to disk (`vesuvius.predict`), reads them
+    back to blend (`vesuvius.blend_logits` / `vesuvius.blend_and_finalize`) and only then
+    finalizes. When the region being predicted fits in memory, this class keeps the two running
+    sums that blending needs, sum(w * logits) and sum(w), over the extent the patches cover, and
+    `write()` produces the same output array that `merge_inference_outputs` would.
+
+    Patches are weighted exactly like `process_chunk` weights the float16 logits it reads back,
+    and all-zero (skipped) patches add no weight, as there. Where several patches overlap, the
+    float32 sums are accumulated in the order `add()` is called rather than in the order the
+    chunked blend visits them, which can move a value by one float32 rounding step.
+    """
+
+    def __init__(self, patch_coords, patch_size, num_classes, volume_shape, sigma_scale=8.0):
+        self.patch_size = tuple(int(p) for p in patch_size)
+        self.num_classes = int(num_classes)
+        self.volume_shape = tuple(int(v) for v in volume_shape)
+        self.coords = np.asarray(patch_coords, dtype=np.int64).reshape(-1, 3)
+        self.origin, self.shape = self.extent(self.coords, self.patch_size, self.volume_shape)
+        self.gaussian = generate_gaussian_map(self.patch_size, sigma_scale=sigma_scale)[0]
+        self.logits = np.zeros((self.num_classes, *self.shape), dtype=np.float32)
+        self.weights = np.zeros(self.shape, dtype=np.float32)
+        self.patches_added = 0
+        self.patches_skipped_empty = 0
+        self._scratch = None
+
+    @staticmethod
+    def extent(patch_coords, patch_size, volume_shape):
+        """Origin and shape of the volume region the patches cover, clipped to the volume."""
+        coords = np.asarray(patch_coords, dtype=np.int64).reshape(-1, 3)
+        if len(coords) == 0:
+            return (0, 0, 0), (0, 0, 0)
+        lo = np.maximum(coords.min(axis=0), 0)
+        hi = np.minimum(coords.max(axis=0) + np.asarray(patch_size), np.asarray(volume_shape))
+        return tuple(int(v) for v in lo), tuple(int(v) for v in np.maximum(hi - lo, 0))
+
+    @classmethod
+    def required_bytes(cls, patch_coords, patch_size, num_classes, volume_shape):
+        """Memory the float32 sums take: one array per class plus the weights."""
+        _, shape = cls.extent(patch_coords, patch_size, volume_shape)
+        return (int(num_classes) + 1) * 4 * int(np.prod(shape, dtype=np.int64))
+
+    def add(self, patch_index, patch_logits):
+        """Accumulate one patch, (C, pZ, pY, pX), placed at `patch_coords[patch_index]`.
+
+        Not thread-safe: call it from one thread at a time, in a fixed order, so the sums are
+        reproducible (`vesuvius.predict` uses a single writer thread).
+        """
+        if not np.any(patch_logits != 0):
+            self.patches_skipped_empty += 1
+            return
+        start = self.coords[patch_index] - np.asarray(self.origin)
+        canvas, patch = [], []
+        for s, p, n in zip(start.tolist(), self.patch_size, self.shape):
+            lo, hi = max(s, 0), min(s + p, n)
+            if hi <= lo:
+                return
+            canvas.append(slice(lo, hi))
+            patch.append(slice(lo - s, hi - s))
+        weight = self.gaussian[tuple(patch)]
+        # Same float32 product as process_chunk computes, written into a reused buffer.
+        if self._scratch is None:
+            self._scratch = np.empty((self.num_classes, *self.patch_size), dtype=np.float32)
+        weighted = self._scratch[(slice(None), *(slice(0, s.stop - s.start) for s in patch))]
+        np.multiply(patch_logits[(slice(None), *patch)], weight[np.newaxis], out=weighted)
+        self.logits[(slice(None), *canvas)] += weighted
+        self.weights[tuple(canvas)] += weight
+        self.patches_added += 1
+
+    def __setitem__(self, patch_index, patch_logits):
+        """`blender[i] = logits` adds a patch, so the blender can stand in for the logits store."""
+        self.add(patch_index, patch_logits)
+
+    def write(self, output_path, chunk_size=None, compression_level=1, finalize_config=None,
+              verbose=True, epsilon=1e-8, num_workers=None):
+        """Normalise, optionally finalize, and write every chunk that received a patch.
+
+        Chunks are disjoint, so they are finalized and written by `num_workers` threads
+        (default: the CPUs this process may use, at most 8; each thread holds one chunk's copy).
+        """
+        output_chunks = create_blend_output(output_path, self.volume_shape, self.num_classes, self.patch_size,
+                                            chunk_size, compression_level, finalize_config, verbose)
+        output_store = open_zarr(output_path, mode='r+',
+                                 storage_options={'anon': False} if output_path.startswith('s3://') else None)
+        steps = output_chunks[1:]
+        ranges = [range((o // c) * c, o + n, c) for o, n, c in zip(self.origin, self.shape, steps)]
+        starts = [(z0, y0, x0) for z0 in ranges[0] for y0 in ranges[1] for x0 in ranges[2]]
+
+        def write_chunk(start):
+            chunk = [(a, min(a + c, v)) for a, c, v in zip(start, steps, self.volume_shape)]
+            # Overlap of the chunk with the canvas, in chunk and in canvas coordinates.
+            in_chunk, in_canvas = [], []
+            for (a, b), o, n in zip(chunk, self.origin, self.shape):
+                lo, hi = max(a, o), min(b, o + n)
+                in_chunk.append(slice(lo - a, hi - a))
+                in_canvas.append(slice(lo - o, hi - o))
+            chunk_weights = np.zeros([b - a for a, b in chunk], dtype=np.float32)
+            chunk_weights[tuple(in_chunk)] = self.weights[tuple(in_canvas)]
+            if not np.any(chunk_weights > 0):
+                return False
+            chunk_logits = np.zeros((self.num_classes, *chunk_weights.shape), dtype=np.float32)
+            chunk_logits[(slice(None), *in_chunk)] = self.logits[(slice(None), *in_canvas)]
+            chunk_info = {'z_start': chunk[0][0], 'z_end': chunk[0][1],
+                          'y_start': chunk[1][0], 'y_end': chunk[1][1],
+                          'x_start': chunk[2][0], 'x_end': chunk[2][1]}
+            _write_blended_chunk(output_store, chunk_info, chunk_logits, chunk_weights,
+                                 self.num_classes, finalize_config, epsilon)
+            return True
+
+        if num_workers is None:
+            # process_cpu_count (Python 3.13+) honours CPU affinity, e.g. a Slurm allocation.
+            usable = getattr(os, 'process_cpu_count', os.cpu_count)() or 1
+            num_workers = min(8, usable)
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            written = sum(executor.map(write_chunk, starts))
+        if verbose:
+            print(f"Blended {self.patches_added} patches in memory ({self.patches_skipped_empty} empty) "
+                  f"and wrote {written} chunks to {output_path}")
+        return output_path
 
 # --- Main Merging Function ---
 def merge_inference_outputs(
