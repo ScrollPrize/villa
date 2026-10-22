@@ -186,7 +186,7 @@ vc::objects::PinnedObject fixturePin(const std::shared_ptr<vc::objects::ObjectSt
     std::string geometry;
     const auto receipt = store->act(attachment, {{document.object.uuid,{}}}, [&](auto& db, auto& txn) {
         auto object = document.object;
-        object.meta = nlohmann::json{{"source",nlohmann::json::parse(document.source)}}.dump();
+        object.meta = nlohmann::json{{"source",document.source}}.dump();
         db.upsertObject(txn, object); geometry = db.putGeometry(txn, object.uuid, document.geometry);
     });
     return {attachment,{attachment.storeUuid,document.object.uuid},*receipt.at(document.object.uuid),geometry};
@@ -3018,7 +3018,7 @@ TEST_CASE("Atlas pins read and export historical store fibers without source fil
     auto store=std::make_shared<ObjectStoreSession>();const auto attachment=store->attach(dbPath,options);
     std::string geometry;
     const auto receipt=store->act(attachment,{{uuid,{}}},[&](auto& db,auto& txn) {
-        auto record=doc.object;record.meta=nlohmann::json{{"source",nlohmann::json::parse(doc.source)}, {"coordinates",{{"volume_uuid",uuid},{"scale_factor",4}}}}.dump();
+        auto record=doc.object;record.meta=nlohmann::json{{"source",doc.source}, {"coordinates",{{"volume_uuid",uuid},{"scale_factor",4}}}}.dump();
         db.upsertObject(txn,record);geometry=db.putGeometry(txn,uuid,doc.geometry);
     });
     atlas.fibers.front().storePin=PinnedObject{attachment,{attachment.storeUuid,uuid},*receipt.at(uuid),geometry};

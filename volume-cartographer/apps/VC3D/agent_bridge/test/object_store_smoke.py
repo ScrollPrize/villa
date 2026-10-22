@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Exercise real VC3D attachment and immediate edits on a disposable database copy.
+"""Exercise VC3D attachment, transfer and immediate edits on a disposable database.
 
 Requires the vc_object_store Python extension in PYTHONPATH. The input database
 must contain at least one fiber; neither it nor the user's settings are modified.
+Without --database, create a current-format fixture and check lazy span details.
 """
 import argparse
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -19,14 +21,23 @@ from vc_object_store import ObjectStore
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--vc3d', required=True)
-    parser.add_argument('--database', required=True, type=Path)
+    parser.add_argument('--database', type=Path)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='vc3d-store-bridge-') as temporary:
         root = Path(temporary)
         database = root / 'smoke.vcobj'
-        with sqlite3.connect(args.database.resolve().as_uri() + '?mode=ro', uri=True) as source:
-            with sqlite3.connect(database) as target:
-                source.backup(target)
+        if args.database:
+            with sqlite3.connect(args.database.resolve().as_uri() + '?mode=ro', uri=True) as source:
+                with sqlite3.connect(database) as target:
+                    source.backup(target)
+        else:
+            fixture = root / 'fiber.json'
+            fixture.write_text(json.dumps(dict(type='vc3d_fiber', version=4,
+                uuid='12345678-1234-1234-1234-123456789abc', name='span details',
+                control_points=[dict(position=[x, 1, 1]) for x in (1, 3, 5)],
+                line_points=[[x, 1, 1] for x in range(1, 6)])))
+            with ObjectStore.create(str(database), author='bridge-fixture') as store:
+                assert not store.ingest_geometry_source('fiber', fixture)['problems']
         with ObjectStore.open(str(database), read_only=True) as store:
             count = len(store.objects_by_kind('fiber'))
         assert count > 0, 'The smoke fixture must contain fibers'
@@ -67,6 +78,13 @@ def main():
 
         process, client, fibers = launch(1)
         try:
+            if not args.database:
+                assert len(fibers[0]['spans']) == 2, 'Fresh fiber.list must include span details before any edit'
+            exported = root / 'export.json'
+            client.call('fiber.export', {'path': str(exported)})
+            with ObjectStore.create(str(root / 'roundtrip.vcobj'), author='bridge-roundtrip') as store:
+                report = store.ingest_geometry_source('fiber', exported)
+                assert not report['problems'] and report['ingested'] == count, report
             fiber_id = fibers[0]['fiberId']
             client.call('fiber.set_tag', {'fiberId': fiber_id, 'tag': tag, 'enabled': True})
             with ObjectStore.open(str(database), read_only=True) as store:

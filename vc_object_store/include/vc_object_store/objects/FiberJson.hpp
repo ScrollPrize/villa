@@ -1,17 +1,12 @@
 #pragma once
-#include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/GeometryIngest.hpp"
 
 namespace vc::objects {
 // Native wire/file codec only. Identity, transactions, history and relationships
 // remain ObjectStore operations. Source annotations contain no coordinate arrays.
 size_t fiberBranchControlIndex(const std::vector<int64_t>& controlIds, const Anchor&);
 
-struct FiberDocument {
-    ObjectRecord object;
-    GeometryData geometry;
-    std::string source;
-};
-FiberDocument decodeFiberJson(const std::string& json);
+GeometrySource decodeFiberJson(const std::string& json);
 // Encode already pinned geometry and annotations; does not read moving heads.
 std::string encodeFiberJson(const std::string& objectUuid, const GeometryData&,
                             const std::string& sourceAnnotations);

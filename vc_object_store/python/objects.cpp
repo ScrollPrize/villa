@@ -391,9 +391,9 @@ NB_MODULE(_native, m)
             return self.withStore<true>([&](auto& db) {
                 return vo::exportGeometry(db, object, destination, revision, overwrite);
             });
-        }, nb::arg("object_uuid"), nb::arg("destination"), nb::arg("revision_uuid") = std::nullopt,
+        }, nb::arg("object_uuid"), nb::arg("destination"), nb::arg("object_revision_uuid") = std::nullopt,
            nb::arg("overwrite") = false,
-           "Export one immutable revision to native files; return its UUID. Does not modify the store.")
+           "Export an object revision to native files; return its geometry revision UUID. Does not modify the store.")
         .def("edge_geometry_state", [](PyObjectStore& self, const std::string& uuid) {
             const auto state = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.edgeGeometryState(txn, uuid); });
             nb::dict result; result["a_revision"] = state.aRevision; result["b_revision"] = state.bRevision; result["stale"] = state.stale; return result;

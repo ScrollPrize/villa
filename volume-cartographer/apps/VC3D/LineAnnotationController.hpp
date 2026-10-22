@@ -375,7 +375,7 @@ public:
     bool showGeneratedControlPointContextMenu(CChunkedVolumeViewer* viewer,
                                               const QPointF& scenePoint,
                                               const QPoint& globalPos);
-    [[nodiscard]] std::vector<FiberSummary> fiberSummaries() const;
+    [[nodiscard]] std::vector<FiberSummary> fiberSummaries(bool includeDetails = false) const;
     void loadFiberDetails(uint64_t fiberId);
     uint64_t fiberIdForUuid(const std::string& uuid) const;
     std::optional<vc::objects::PinnedObject> fiberPin(uint64_t id) const;

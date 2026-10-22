@@ -1,5 +1,5 @@
 #include "vc_object_store/objects/GeometryEdits.hpp"
-#include "vc_object_store/geometry/Geometry.hpp"
+#include "geometry/GeometryInternal.hpp"
 #include "geometry/SequenceIdentity.hpp"
 #include "geometry/ArrayLayout.hpp"
 #include "geometry/GeometrySnapshot.hpp"
@@ -20,6 +20,9 @@ std::vector<int64_t> pointIds(const GeometryData& data, const std::string& name,
     std::vector<int64_t> ids(count);
     if (const auto* array = findArray(data, name)) detail::copyScalars<int64_t>(array->bytes, ids);
     else throw std::invalid_argument("sequence requires stable IDs: " + name);
+    std::set<int64_t> unique;
+    for (auto id : ids) if (id < 0 || !unique.insert(id).second)
+        throw std::invalid_argument("sequence IDs must be nonnegative and unique");
     return ids;
 }
 }
@@ -34,7 +37,7 @@ std::string updateGeometryArrays(ObjectStore& db, WriteTxn& txn, const std::stri
         // Even a no-op must check the caller's pin.
         auto head = db.editGeometry(txn, uuid, {}, expected);
         auto data = db.readGeometryData(txn, head);
-        (void)vc::geometry::decode(desired);
+        (void)detail::geometrySchema(desired);
         if (data.kind != desired.kind || data.formatVersion != desired.formatVersion ||
             data.coordinateSystem != desired.coordinateSystem || Json::parse(data.attributes) != Json::parse(desired.attributes))
             throw std::invalid_argument("array updates require unchanged geometry schema and attributes");
@@ -47,7 +50,8 @@ std::string updateGeometryArrays(ObjectStore& db, WriteTxn& txn, const std::stri
             if (!findArray(desired, array.name))
                 throw std::invalid_argument("array updates cannot remove arrays");
         for (const auto& [name, value] : annotations)
-            if (!findArray(desired, name) || desired.kind == "patch" || identityArrays.contains(name))
+            if (!findArray(desired, name) || (desired.kind == "fiber" ? name != "control_points" && name != "line_points"
+                : desired.kind == "patch" || name != "points"))
                 throw std::invalid_argument("invalid sequence annotations: " + name);
         auto decisions = [&](const std::vector<EdgeRecord>& edges) {
             return decide ? decide(edges) : std::vector<GeometryEdgeEdit>{};
@@ -60,7 +64,9 @@ std::string updateGeometryArrays(ObjectStore& db, WriteTxn& txn, const std::stri
             auto old = *previous;
             const auto scalarBytes = detail::geometryByteLength(target.dtype, {1});
             const auto idsName = detail::sequenceIdArray(desired.kind, target.name);
-            if (desired.kind != "patch") {
+            const bool sequence = desired.kind == "fiber" ? target.name == "control_points" || target.name == "line_points"
+                : desired.kind != "patch" && target.name == "points";
+            if (sequence) {
                 const size_t count = target.shape.at(0), oldCount = old.shape.at(0);
                 const auto oldIds = idsName.empty() ? std::vector<int64_t>{} : pointIds(data, idsName, oldCount);
                 const auto newIds = idsName.empty() ? std::vector<int64_t>{} : pointIds(desired, idsName, count);
@@ -107,7 +113,7 @@ std::string updateGeometryArrays(ObjectStore& db, WriteTxn& txn, const std::stri
                     old = *findArray(data, target.name);
                 }
             } else if (target.shape != old.shape) {
-                throw std::invalid_argument("use surface resize operations to change a patch grid");
+                throw std::invalid_argument("array updates cannot resize a grid or auxiliary array");
             }
             std::vector<GeometryArrayEdit> edits;
             // Coalesce consecutive changed scalars, preserving exact encoded bytes.

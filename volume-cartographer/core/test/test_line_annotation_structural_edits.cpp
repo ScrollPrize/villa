@@ -249,17 +249,20 @@ TEST_CASE("merge: consumes exactly the endpoint pair link and refuses other shap
             a, 4, b, 0, FiberOptimizationMode::Lasagna, identity(9, "m.json"), &error));
         CHECK(error.find("adjacent") != std::string::npos);
     }
-    SUBCASE("coordinate domains must agree")
+    SUBCASE("authoritative coordinate frames must agree; advisory bindings may differ")
     {
-        a.coordinateBaseShapeZYX = std::array<std::size_t, 3>{10, 20, 30};
+        a.coordinateIdentity = {{"coordinates", {{"volume_uuid", "12345678-1234-1234-1234-123456789abc"}, {"scale_factor", 2}}}};
         CHECK_FALSE(vc3d::line_annotation::planFiberMerge(
             a, 4, b, 0, FiberOptimizationMode::Lasagna, identity(9, "m.json"), &error));
         CHECK(error.find("coordinate") != std::string::npos);
-        b.coordinateBaseShapeZYX = a.coordinateBaseShapeZYX;
-        const auto plan = vc3d::line_annotation::planFiberMerge(
-            a, 4, b, 0, FiberOptimizationMode::Lasagna, identity(9, "m.json"), &error);
-        REQUIRE(plan);
-        CHECK(plan->merged.coordinateBaseShapeZYX == a.coordinateBaseShapeZYX);
+        b.coordinateIdentity = a.coordinateIdentity;
+        a.coordinateIdentity["coordinate_binding"] = {{"active_volume_id", "renamed"}};
+        a.coordinateBaseShapeZYX = std::array<std::size_t, 3>{10, 20, 30};
+        REQUIRE(vc3d::line_annotation::planFiberMerge(
+            a, 4, b, 0, FiberOptimizationMode::Lasagna, identity(9, "m.json"), &error));
+        b.coordinateIdentity["coordinates"]["scale_factor"] = 4;
+        CHECK_FALSE(vc3d::line_annotation::planFiberMerge(
+            a, 4, b, 0, FiberOptimizationMode::Lasagna, identity(9, "m.json"), &error));
     }
     SUBCASE("kollesis termination at the join refuses")
     {

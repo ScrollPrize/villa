@@ -1,5 +1,5 @@
 #include "vc/core/types/FiberView.hpp"
-#include <algorithm>
+#include <vc_object_store/geometry/SegmentClip.hpp>
 
 namespace vc::fibers {
 Point ViewRegion::project(const Point& point) const
@@ -27,23 +27,7 @@ bool ViewRegion::contains(const ViewRegion& other) const
 
 bool clipSegment(const Point& a, const Point& b, const Bounds& box, double& lo, double& hi)
 {
-    lo = 0;
-    hi = 1;
-    for (int i = 0; i < 3; ++i) {
-        const double d = b[i] - a[i];
-        if (d == 0) {
-            if (a[i] < box.lower[i] || a[i] > box.upper[i])
-                return false;
-        } else {
-            double x = (box.lower[i] - a[i]) / d, y = (box.upper[i] - a[i]) / d;
-            if (x > y)
-                std::swap(x, y);
-            lo = std::max(lo, x);
-            hi = std::min(hi, y);
-            if (lo > hi)
-                return false;
-        }
-    }
-    return true;
+    return vc::geometry::clipSegment(a, b,
+        {box.lower[0], box.lower[1], box.lower[2], box.upper[0], box.upper[1], box.upper[2]}, lo, hi);
 }
 }

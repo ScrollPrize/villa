@@ -108,10 +108,10 @@ the ID array but not the coordinate array. Full materialization is explicit:
 `view.load()` returns the owned type. Large patches should use `readTile()` /
 `read_tile()` instead.
 
-Snapshots pin a consistent database state at creation. Views and editors keep
+Snapshots pin a consistent database state at creation. Views keep
 that snapshot alive even if the snapshot variable goes out of scope. Explicit
 `snapshot.close()` (also Python context-manager exit) invalidates all its views
-and editors and releases the reader. Snapshots are thread-confined and consume
+and releases the reader. Snapshots are thread-confined and consume
 one slot in the store's reader pool; close them promptly.
 
 A C++ snapshot borrowing `ObjectStore&` must finish before the store is moved or
@@ -121,35 +121,29 @@ snapshots. Returned owned geometry remains valid after snapshot closure.
 
 ## Checked edits and relationships
 
+Views are read-only. Use the existing checked store transaction for mutations;
+there is no separate typed editor or commit path.
+
 ```python
+import struct
 with store.geometry_snapshot() as snapshot:
     collection = snapshot.point_collection(collection_uuid)
-    edit = collection.edit()
-    edit.move_point(42, [10, 20, 30])
-    affected = edit.affected_relationships()
-    # This example applies when no relationships depend on the edited point.
-    assert not affected
-    new_revision = edit.commit()
+    with store.write(expected_revisions={collection_uuid: collection.object_revision}) as tx:
+        new_revision = tx.edit_geometry(collection_uuid, [dict(
+            array="points", element_offset=0, data=struct.pack("<3d", 10, 20, 30)
+        )], collection.revision["uuid"])
     # collection still reads the original revision.
 ```
 
-Editors provide `movePoint`, `moveControlPoint`, `moveLinePoint`,
-`moveTrackPoint` and `moveVertex` (snake_case in Python). Calls check the geometry
-kind, indices, IDs and values before recording a sparse change. No database
-mutation occurs until `commit()`. Repeated changes apply in call order.
+The transaction checks the pinned object and geometry revisions, including for
+no-ops. Affected relationships require explicit retain, update, remove or keep
+recorded decisions through `edit_geometry(edge_edits=...)`; include the affected
+endpoints in the transaction's expected revisions. No relationship meaning is
+inferred by the geometry layer.
 
-Commit checks both the object revision and geometry revision observed by the
-view. Concurrent geometry, metadata or relationship changes therefore conflict,
-including on proposed no-ops. Successful edits preserve the existing sparse
-storage, history and numerical behavior. An editor can commit once; a rejected
-relationship decision leaves the database unchanged and can be corrected before
-retrying.
-
-Affected relationships require the existing explicit `GeometryEdgeEdit`
-decisions: retain, update, remove or keep recorded. `commit(edge_edits=...)` in
-Python accepts the same decision dictionaries as `edit_geometry()`. Other
-relationship endpoints are also checked against the editor's snapshot.
-No relationship meaning is inferred by the geometry layer.
+C++ clients applying full desired arrays can use `updateGeometryArrays`: it
+uses these same sparse and structural transactions, preserves auxiliary
+channels and exact scalar bytes, and accepts explicit annotation transforms.
 
 For adding/removing/reordering points or changing dimensions, use
 [structural edits](structural-editing.md). Full `put_geometry` replacement remains

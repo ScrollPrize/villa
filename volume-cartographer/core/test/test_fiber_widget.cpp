@@ -7,6 +7,7 @@
 #include <QDoubleSpinBox>
 #include <QHeaderView>
 #include <QLineEdit>
+#include <QLabel>
 #include <QMetaObject>
 #include <QPushButton>
 #include <QScrollBar>
@@ -576,6 +577,13 @@ int main(int argc, char** argv)
         CFiberWidget::FiberEntry pending; pending.id = 99; pending.fileName = "deferred.json";
         pending.controlPointCount = 3; pending.linePointCount = 100; pending.detailsLoaded = false;
         lazy.setFibers({pending});
+        bool hasLoadLink = false;
+        for (auto* label : lazy.findChildren<QLabel*>()) if (label->text().contains("href=")) {
+            hasLoadLink = true;
+            require(label->textInteractionFlags().testFlag(Qt::LinksAccessibleByMouse), "Deferred length link is clickable");
+        }
+        require(hasLoadLink, "Deferred geometry offers a length-loading link");
+
         auto* tree = lazy.findChild<QTreeView*>();
         require(tree && tree->model()->rowCount(tree->model()->index(0,0)) == 1, "Deferred span geometry retains an expand arrow");
         uint64_t requested = 0;

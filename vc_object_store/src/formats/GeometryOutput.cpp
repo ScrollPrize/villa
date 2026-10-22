@@ -1,4 +1,3 @@
-#include "vc_object_store/objects/FiberJson.hpp"
 #include "formats/GeometryOutput.hpp"
 #include "formats/TrackInput.hpp"
 #include "vc_object_store/Tiff.hpp"
@@ -40,13 +39,6 @@ Json pointAttributes(Json& attributes, const std::string& key, size_t count)
         if (!item.is_null() && !item.is_object()) throw std::runtime_error("invalid " + key);
     attributes.erase(key);
     return result;
-}
-void fiber(const Snapshot& s, Json attributes, const fs::path& path)
-{
-    GeometryData data; data.kind = "fiber";
-    for (const auto& array : s.revision.arrays)
-        data.arrays.push_back({array.name, array.dtype, array.shape, s.arrays.at(array.name)});
-    writeJson(path, Json::parse(encodeFiberJson(s.revision.objectUuid, data, attributes.dump())));
 }
 void collection(const Snapshot& s, Json attributes, const fs::path& path)
 {

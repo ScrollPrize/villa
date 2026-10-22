@@ -28,9 +28,9 @@ int main() try {
             "typed control-only geometry exports current transfer format");
     require(doc.object.uuid == uuid && doc.object.fiber->length == 4, "native summaries");
     require(doc.object.fiber->family == "H" && doc.object.tags == std::vector<std::string>{"reviewed"}, "native metadata");
-    const auto source = Json::parse(doc.source);
+    const auto source = doc.source;
     require(!source.contains("control_points") && !source.contains("line_points"), "no duplicate geometry in annotations");
-    require(Json::parse(encodeFiberJson(uuid, doc.geometry, doc.source)) == root, "lossless shared native codec");
+    require(Json::parse(encodeFiberJson(uuid, doc.geometry, doc.source.dump())) == root, "lossless shared native codec");
     auto invalid = root; invalid["control_points"][0]["position"] = {1,2,3,4};
     mustFail([&] { decodeFiberJson(invalid.dump()); });
     invalid = source; invalid["control_points_attributes"] = Json::array();

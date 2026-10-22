@@ -39,7 +39,7 @@ active identities fail. Derived identity indexes are maintained through
 edits, restoration and sync. Replacement can scan all affected IDs;
 ordinary resolution reads only referenced chunks or metadata-snapshot buckets.
 
-Native export selects an immutable revision and stages output before publication;
+Native export selects an immutable object revision and stages output before publication;
 `overwrite=False` protects existing destinations. It rejects auxiliary arrays.
 Directory export currently requires Linux `renameat2`. Metadata-only
 `export_json` supports filters and field projection; it is not a geometry backup.
@@ -380,3 +380,17 @@ Python-enabled build, use its Python interpreter and point to its module directo
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python \
   /path/to/python -m pytest tests/python -q
 ```
+
+VC3D and CLI imports share `prepareGeometrySource` and the checked batch ingest.
+Fibers accept current version-4 documents and version-1 fiber collections;
+branch endpoints require `target_uuid`. `branch_file` only locates a missing
+peer's transport file. No older-format repair or database migration is performed.
+Native export's `--revision` / Python `object_revision_uuid` pins an object
+revision, including its metadata and relationship snapshot, and returns its
+geometry revision UUID.
+
+Native format clients link `vc_object_store::vc_object_geometry`. Set
+`VC_OBJECT_STORE_BUILD_ADAPTERS=ON` and `VC_OBJECT_STORE_BUILD_LINKING=OFF`
+for import/export without relationship detectors or their CT reader dependency.
+VC3D uses this configuration; the standalone tools/Python build keeps detectors
+on by default. The existing OpenCV/TIFF dependencies supply native formats.

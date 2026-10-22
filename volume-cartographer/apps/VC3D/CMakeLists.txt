@@ -382,7 +382,7 @@ target_link_libraries(VC3D
     # mimalloc first so its symbols win malloc/free resolution.
     $<$<BOOL:${mimalloc_FOUND}>:mimalloc>
     vc_core
-    vc_object_store::vc_objects
+    vc_object_store::vc_object_geometry
     vc_fiber_view
     vc_atlas
     vc_lasagna

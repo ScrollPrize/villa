@@ -1,4 +1,5 @@
 #include "imports/SourceRelationships.hpp"
+#include "vc_object_store/Uuid.hpp"
 #include "geometry/GeometrySnapshot.hpp"
 #include "geometry/Dependencies.hpp"
 #include "imports/SourceIdentityIndex.hpp"
@@ -66,28 +67,11 @@ int64_t importSourceRelationships(ObjectStore& db, WriteTxn& txn, const std::vec
         if (edge.approvalState != "pending") db.setApproval(txn, uuid, edge.approvalState);
         ++inserted;
     };
-    // Resolve source filenames only during ingestion; stored edges always use UUIDs.
-    std::map<std::string, std::set<std::string>> fiberNames;
-    if (std::any_of(sources.begin(),sources.end(),[](const auto& s) { return s.object.kind=="fiber"; }))
-    for (const auto& object : db.objectsByKind(txn, "fiber")) {
-        fiberNames[std::filesystem::path(object.storageRef).filename().string()].insert(object.uuid);
-        fiberNames[object.uuid + ".json"].insert(object.uuid);
-    }
-    for (const auto& entry : sources)
-        if (entry.object.kind == "fiber")
-            fiberNames[std::filesystem::path(entry.object.storageRef).filename().string()].insert(entry.object.uuid);
     for (const auto& entry : sources) {
         if (entry.object.kind != "fiber") continue;
         for (const auto* key : {"branches", "adjacent_branches"}) {
             for (const auto& branch : entry.source.value(key, Json::array())) {
-                auto target = branch.value("target_uuid", std::string());
-                if (target.empty()) {
-                    const auto file = std::filesystem::path(branch.at("branch_file").get<std::string>()).filename().string();
-                    const auto found = fiberNames.find(file);
-                    if (found == fiberNames.end() || found->second.size() != 1)
-                        throw std::runtime_error("missing or ambiguous branch target: " + file + "; ingest connected fibers together or supply target_uuid");
-                    target = *found->second.begin();
-                }
+                const auto target = util::canonicalUuid(branch.at("target_uuid").get<std::string>());
                 EdgeRecord edge; edge.kind = "fiber_branch";
                 if (branch.contains("edge_uuid")) edge.uuid = util::canonicalUuid(branch.at("edge_uuid").get<std::string>());
                 edge.approvalState = branch.value("pending", false) ? "pending" : "approved";

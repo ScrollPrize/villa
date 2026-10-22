@@ -3,6 +3,7 @@ configure_file(src/Version.cpp.in Version.cpp)
 add_library(vc_fiber_view STATIC src/FiberView.cpp)
 target_include_directories(vc_fiber_view PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(vc_fiber_view PUBLIC cxx_std_20)
+target_link_libraries(vc_fiber_view PUBLIC vc_object_store::vc_geometry)
 set_target_properties(vc_fiber_view PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(vc_core

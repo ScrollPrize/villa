@@ -24,13 +24,13 @@ size_t fiberBranchControlIndex(const std::vector<int64_t>& controlIds, const Anc
     throw std::runtime_error("Fiber branch control point is absent from selected geometry");
 }
 
-FiberDocument decodeFiberJson(const std::string& text)
+GeometrySource decodeFiberJson(const std::string& text)
 {
     auto root = Json::parse(text);
     if (root.value("type", "") != "vc3d_fiber") throw std::runtime_error("expected vc3d_fiber JSON");
     if (root.value("version", int64_t(0)) != 4)
         throw std::runtime_error("Fiber transfer requires version 4");
-    FiberDocument p;
+    GeometrySource p;
     p.object.uuid = util::canonicalUuid(root.at("uuid").get<std::string>());
     p.object.kind = "fiber";
     p.object.name = root.value("name", std::string{});
@@ -74,7 +74,7 @@ FiberDocument decodeFiberJson(const std::string& text)
         if (std::any_of(extras.begin(), extras.end(), [](const auto& e) { return !e.is_null() && !e.empty(); }))
             root[std::string(key) + "_attributes"] = std::move(extras);
     }
-    p.source = root.dump();
+    p.source = std::move(root);
     return p;
 }
 std::string encodeFiberJson(const std::string& uuid, const GeometryData& data,
@@ -185,7 +185,7 @@ std::map<std::string, std::string> fiberNetworkJson(
         if (!pin) throw std::invalid_argument("Fiber export requires explicit object revision pins");
         const auto revision = db.objectRevision(txn, *pin);
         if (!revision || revision->objectUuid != uuid || revision->record.kind != "fiber" ||
-            revision->deleted || (!revision->record.retired && !revision->geometryRevision))
+            revision->deleted)
             throw std::invalid_argument("Invalid fiber export revision for " + uuid);
         revisions.emplace(uuid, *revision);
     }

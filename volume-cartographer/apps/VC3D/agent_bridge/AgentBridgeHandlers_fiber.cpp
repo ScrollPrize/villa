@@ -216,7 +216,7 @@ QJsonObject AgentBridgeServer::handleFiberList(const QJsonValue&)
     LineAnnotationController* ctrl = fiberController();
 
     QJsonArray fibers;
-    for (const auto& s : ctrl->fiberSummaries()) {
+    for (const auto& s : ctrl->fiberSummaries(true)) {
         QJsonObject f;
         f["fiberId"] = QString::number(s.id);
         f["name"] = QString::fromStdString(s.name);

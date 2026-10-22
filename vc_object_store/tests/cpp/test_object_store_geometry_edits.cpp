@@ -61,6 +61,31 @@ int main() try {
             updateGeometryArrays(db,txn,uuid,target,initialGeometry);
         }); });
     }
+    // Auxiliary channels and non-finite payload bits belong to the generic
+    // store schema even when owned, typed geometry cannot represent them.
+    {
+        const auto id = util::newUuid();
+        auto first = vc::geometry::encode(vc::geometry::Patch{1,2,{1,1},{{1,2,3},{4,5,6}}});
+        first.arrays.push_back({"review", "<u2", {1,2}, {1,0,2,0}});
+        first.arrays[0].bytes[0] = 0x45; first.arrays[0].bytes[1] = 0x23;
+        first.arrays[0].bytes[2] = 0xc1; first.arrays[0].bytes[3] = 0x7f; // NaN payload
+        std::string initial, updated;
+        auto pins = session.act(attachment, {{id,{}}}, [&](auto& db, auto& txn) {
+            ObjectRecord object; object.uuid = id; object.kind = "patch";
+            db.upsertObject(txn, object); initial = db.putGeometry(txn, id, first);
+        });
+        auto target = first; target.arrays.back().bytes = {3,0,4,0};
+        pins = session.act(attachment, pins, [&](auto& db, auto& txn) {
+            updated = updateGeometryArrays(db, txn, id, target, initial);
+            require(db.readGeometryArray(txn, updated, "review") == target.arrays.back().bytes, "auxiliary edits use sparse store updates");
+            require(db.readGeometryArray(txn, updated, "points") == first.arrays[0].bytes, "exact non-finite bits survive channel edits");
+            require(db.readGeometryArray(txn, initial, "review") == first.arrays.back().bytes, "channel history remains immutable");
+        });
+        auto malformed = target; malformed.arrays.back().bytes.pop_back();
+        mustFail([&] { session.act(attachment, pins, [&](auto& db, auto& txn) {
+            updateGeometryArrays(db, txn, id, malformed, updated);
+        }); });
+    }
     // Structural safety must survive the convenience edit API, including a
     // caller catching the error and trying to commit the surrounding action.
     const auto uuid = util::newUuid();

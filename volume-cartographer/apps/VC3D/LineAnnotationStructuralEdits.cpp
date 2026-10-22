@@ -3,6 +3,7 @@
 #include <algorithm>
 
 #include <nlohmann/json.hpp>
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
 
 namespace vc3d::line_annotation {
 
@@ -112,12 +113,15 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
             return std::nullopt;
         }
     }
-    if (clicked.coordinateIdentity != far.coordinateIdentity) {
+    try {
+        using namespace vc::objects;
+        const auto a = geometryCoordinates(clicked.coordinateIdentity.value("coordinates", nlohmann::json::object()));
+        const auto b = geometryCoordinates(far.coordinateIdentity.value("coordinates", nlohmann::json::object()));
+        // Advisory bindings (volume labels, dimensions) do not define a frame.
+        if (a != b) throw std::invalid_argument("different coordinate frames");
+        (void)mergeGeometryCoordinates(a, b); // Also check exact mixed integer/float scales.
+    } catch (const std::exception&) {
         fail(error, "Cannot merge fibers from different coordinate frames");
-        return std::nullopt;
-    }
-    if (clicked.coordinateBaseShapeZYX != far.coordinateBaseShapeZYX) {
-        fail(error, "Cannot merge: the fibers are stored in different coordinate domains.");
         return std::nullopt;
     }
 

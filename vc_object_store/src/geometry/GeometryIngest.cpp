@@ -58,6 +58,15 @@ void problem(GeometryIngestReport& report, const std::string& label, const std::
 }
 }
 
+std::vector<GeometrySource> prepareGeometrySource(const std::string& kind, const fs::path& source,
+    const std::vector<std::string>& availableUuids)
+{
+    if (kind == "fiber") return formats::fibers(source, availableUuids);
+    if (kind == "patch") return {patch(source)};
+    if (kind == "point_collection") return collections(source);
+    throw std::invalid_argument("unsupported batch geometry kind: " + kind);
+}
+
 GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::optional<fs::path>& datasetRoot,
     const std::vector<std::string>& objectUuids, const util::ProgressCallback& progress)
 {
@@ -178,18 +187,9 @@ GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& ki
                 // Pin registration expectations while reading files. Ingestion
                 // rechecks duplicate identities under the writer lock.
                 auto read = db.read();
-                if (kind == "patch") batch.push_back(patch(source));
-                else if (kind == "fiber") {
-                    if (fs::is_directory(source)) {
-                        std::vector<fs::path> files;
-                        for (const auto& entry : fs::directory_iterator(source))
-                            if (entry.is_regular_file() && entry.path().extension() == ".json") files.push_back(entry.path());
-                        std::sort(files.begin(), files.end());
-                        for (const auto& file : files) if (readJson(file).value("type", "") == "vc3d_fiber") batch.push_back(fiber(file));
-                    } else batch.push_back(fiber(source));
-                }
-                else if (kind == "point_collection") batch = collections(source);
-                else throw std::runtime_error("unsupported geometry kind: " + kind);
+                std::vector<std::string> available;
+                for (const auto& object : db.objectsByKind(read, kind)) available.push_back(object.uuid);
+                batch = prepareGeometrySource(kind, source, available);
                 for (const auto& p : batch) expectations[p.object.uuid] = expectedAt(db, read, p.object.uuid);
             }
             ingestBatch(db, std::move(batch), expectations, report, coordinateContext);

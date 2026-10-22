@@ -3386,7 +3386,6 @@ bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
     }
     try {
         using namespace vc::objects;
-        using Json = nlohmann::json;
         const auto connection = _state->objectStoreSession();
         const auto attachment = *connection->attachment();
         RevisionSelection expected;
@@ -3397,63 +3396,9 @@ bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
                 expected[object.uuid] = db.currentObjectRevision(txn, object.uuid)->uuid;
             }
         });
-        std::vector<GeometrySource> batch;
-        std::set<std::string> incoming;
-        const auto add = [&](const Json& document, const fs::path& path) {
-            auto decoded = decodeFiberJson(document.dump());
-            if (!incoming.insert(decoded.object.uuid).second)
-                throw std::runtime_error("Duplicate fiber UUID in import");
-            if (decoded.object.name.empty()) decoded.object.name = path.stem().string();
-            decoded.object.storageKind = "file"; decoded.object.storageRef = fs::absolute(path).string();
-            expected[decoded.object.uuid] = std::nullopt;
-            batch.push_back({std::move(decoded.object), std::move(decoded.geometry), Json::parse(decoded.source)});
-        };
-        const auto read = [](const fs::path& path) {
-            std::ifstream input(path);
-            if (!input) throw std::runtime_error("Cannot read " + path.string());
-            return Json::parse(input);
-        };
-        if (fs::is_directory(importPath)) {
-            std::vector<fs::path> files;
-            for (const auto& entry : fs::directory_iterator(importPath))
-                if (entry.is_regular_file() && entry.path().extension() == ".json") files.push_back(entry.path());
-            std::sort(files.begin(), files.end());
-            for (const auto& path : files) {
-                const auto document = read(path);
-                if (document.is_object() && document.value("type", "") == "vc3d_fiber") add(document, path);
-            }
-        } else {
-            const auto root = read(importPath);
-            if (root.is_object() && root.value("type", "") == "vc3d_fiber") {
-                add(root, importPath);
-                // A service artifact is a current-format connected component.
-                // Import missing peers once; existing store identities stay authoritative.
-                for (size_t i = 0; i < batch.size(); ++i) for (const auto* key : {"branches", "adjacent_branches"}) {
-                    auto branches = batch[i].source.value(key, Json::array());
-                    for (auto& branch : branches) {
-                        auto target = branch.value("target_uuid", std::string{});
-                        if (!target.empty()) target = util::canonicalUuid(target);
-                        if (!target.empty() && (existing.contains(target) || incoming.contains(target))) continue;
-                        const auto file = fs::path(branch.at("branch_file").get<std::string>()).filename();
-                        const auto peerPath = importPath.parent_path() / file;
-                        const auto peer = read(peerPath);
-                        const auto peerUuid = util::canonicalUuid(peer.at("uuid").get<std::string>());
-                        if (!target.empty() && target != peerUuid) throw std::runtime_error("Branch target UUID does not match its artifact");
-                        branch["target_uuid"] = peerUuid;
-                        if (!existing.contains(peerUuid) && !incoming.contains(peerUuid)) add(peer, peerPath);
-                    }
-                    batch[i].source[key] = std::move(branches);
-                }
-            } else {
-                const Json* entries = root.is_array() ? &root : nullptr;
-                if (root.is_object() && root.value("type", "") == "vc3d_fiber_collection" && root.value("version", 0) == 1)
-                    entries = &root.at("point_collections");
-                if (!entries || !entries->is_array()) throw std::runtime_error("Expected current fiber JSON or fiber collection");
-                for (const auto& document : *entries)
-                    add(document, importPath.parent_path() / fs::path(document.at("uuid").get<std::string>() + ".json"));
-            }
-        }
-        if (batch.empty()) throw std::runtime_error("No fibers were found");
+        auto batch = prepareGeometrySource("fiber", importPath,
+            std::vector<std::string>(existing.begin(), existing.end()));
+        for (const auto& source : batch) expected[source.object.uuid] = std::nullopt;
         const auto count = batch.size();
         connection->act(attachment, expected, [&](auto& db, auto& txn) { ingestGeometryBatch(db, txn, std::move(batch)); });
         loadFibersForCurrentPackage();
@@ -3474,7 +3419,7 @@ uint64_t LineAnnotationController::importFiberJson(const nlohmann::json& root,
         if (!_state || !_state->objectStoreSession()->attachment())
             throw std::runtime_error("Attach an object store before importing fibers");
         auto decoded = vc::objects::decodeFiberJson(root.dump());
-        auto source = nlohmann::json::parse(decoded.source);
+        const auto& source = decoded.source;
         if (!source.value("branches", nlohmann::json::array()).empty() ||
             !source.value("adjacent_branches", nlohmann::json::array()).empty())
             throw std::runtime_error("Linked fibers can only be imported with Import Fibers");
@@ -3482,7 +3427,7 @@ uint64_t LineAnnotationController::importFiberJson(const nlohmann::json& root,
         if (decoded.object.name.empty()) decoded.object.name = fs::path(fileName).stem().string();
         const auto connection = _state->objectStoreSession();
         connection->act(*connection->attachment(), {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-            vc::objects::ingestGeometryBatch(db, txn, {{std::move(decoded.object), std::move(decoded.geometry), std::move(source)}});
+            vc::objects::ingestGeometryBatch(db, txn, {std::move(decoded)});
         });
         loadFibersForCurrentPackage();
         return fiberIdForUuid(uuid);
@@ -6565,8 +6510,9 @@ void LineAnnotationController::loadFiberDetails(uint64_t fiberId)
     }
 }
 
-std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fiberSummaries() const
+std::vector<LineAnnotationController::FiberSummary> LineAnnotationController::fiberSummaries(bool includeDetails) const
 {
+    if (includeDetails) ensureAllFiberLines();
     // Connected-component sizes over the branch-link graph (union-find), so the
     // panel can show how many fibers are chained together through links.
     std::unordered_map<uint64_t, size_t> indexById;

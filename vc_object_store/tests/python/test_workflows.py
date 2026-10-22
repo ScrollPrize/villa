@@ -183,9 +183,9 @@ def test_stable_ids_annotations_splice_and_coordinates(db):
     with db.geometry_snapshot() as snapshot:
         view = snapshot.point_collection(uid)
         assert view.point(30) == [7, 8, 9]
-        edit = view.edit()
-        edit.move_point(30, [10, 11, 12])
-        third = edit.commit()
+        with db.write(expected_revisions={uid: view.object_revision}) as tx:
+            third = tx.edit_geometry(uid, [dict(array="points", element_offset=3,
+                data=struct.pack("<3d", 10, 11, 12))], view.revision["uuid"])
         assert view.point(30) == [7, 8, 9]
     assert db.read_geometry_array(third, 'points')[24:48] == struct.pack('<3d', 10, 11, 12)
     with ObjectStore.create(db.path + '.peer', author='peer') as peer:
@@ -317,3 +317,74 @@ def test_fiber_branch_transfer_preserves_identity_approval_and_stable_ids(db, tm
     with ObjectStore.create(str(tmp_path / 'conflict.vcobj'), author='test') as other:
         assert other.ingest_geometry_source('fiber', directory)['problems']
         assert other.object_count('fiber') == 0
+
+
+def test_fiber_collection_and_linked_file_import_use_uuid_endpoints(db, tmp_path):
+    import json
+    import uuid
+    a, b = str(uuid.uuid4()), str(uuid.uuid4())
+    def fiber(uid, target, filename):
+        return dict(type='vc3d_fiber', version=4, uuid=uid, name='same label',
+                    control_point_ids=[10, 20], control_points=[{'position': [0, 0, 0]}, {'position': [1, 0, 0]}],
+                    line_points=[[0, 0, 0], [1, 0, 0]], branches=[dict(
+                        target_uuid=target, branch_file=filename, control_point_index=0,
+                        branch_control_point_index=0, control_point_position=[0, 0, 0],
+                        branch_control_point_position=[0, 0, 0], control_point_direction=[1, 0, 0],
+                        branch_control_point_direction=[1, 0, 0])])
+    first, second = fiber(a, b, 'peer.json'), fiber(b, a, 'root.json')
+    root = tmp_path / 'root.json'
+    root.write_text(json.dumps(first))
+    (tmp_path / 'peer.json').write_text(json.dumps(second))
+    result = db.ingest_geometry_source('fiber', root)
+    assert not result['problems'] and result['ingested'] == 2 and result['edges_imported'] == 1
+    # Exported UUID-addressed documents can be bundled without their original files.
+    documents = []
+    for uid in (a, b):
+        output = tmp_path / (uid + '.json')
+        db.export_geometry(uid, output)
+        documents.append(json.loads(output.read_text()))
+    db.upsert_object(dict(kind="fiber", name="unrelated pending geometry"))
+    historical_pin = db.current_object_revision(a)['uuid']
+    with db.write(expected_revisions=heads(db, a, b)) as tx:
+        tx.remove_edge(documents[0]['branches'][0]['edge_uuid'])
+    historical = tmp_path / 'historical-graph.json'
+    db.export_geometry(a, historical, object_revision_uuid=historical_pin)
+    assert json.loads(historical.read_text()) == documents[0]
+    current = tmp_path / 'current-graph.json'
+    db.export_geometry(a, current)
+    assert not json.loads(current.read_text())['branches']
+    collection = tmp_path / 'collection.json'
+    collection.write_text(json.dumps(dict(type='vc3d_fiber_collection', version=1, point_collections=documents)))
+    with ObjectStore.create(str(tmp_path / 'roundtrip.vcobj'), author='test') as other:
+        result = other.ingest_geometry_source('fiber', collection)
+        assert not result['problems'] and result['ingested'] == 2 and result['edges_imported'] == 1
+    # No filename-based endpoint repair, even when both files are available.
+    del first['branches'][0]['target_uuid']
+    root.write_text(json.dumps(first))
+    with ObjectStore.create(str(tmp_path / 'invalid.vcobj'), author='test') as other:
+        assert other.ingest_geometry_source('fiber', root)['problems']
+        assert other.object_count('fiber') == 0
+    collection.write_text(json.dumps(documents))
+    with ObjectStore.create(str(tmp_path / 'bare.vcobj'), author='test') as other:
+        assert other.ingest_geometry_source('fiber', collection)['problems']
+        assert other.object_count('fiber') == 0
+
+
+@pytest.mark.parametrize('kind,geometry', [
+    ('fiber', Fiber([[1, 2, 3], [4, 5, 6]], [])),
+    ('point_collection', PointCollection([42, 7], [[1, 2, 3], [4, 5, 6]])),
+])
+def test_native_export_pins_object_metadata_and_geometry(db, tmp_path, kind, geometry):
+    import json
+    uid, first_geometry = put(db, geometry, kind)
+    db.set_meta(uid, 'coordinates', {'scale_factor': 2})
+    before = db.current_object_revision(uid)['uuid']
+    db.set_meta(uid, 'coordinates', {'scale_factor': 4})
+    output = tmp_path / 'historical.json'
+    assert db.export_geometry(uid, output, object_revision_uuid=before) == first_geometry
+    doc = json.loads(output.read_text())
+    if kind == 'point_collection':
+        doc = next(iter(doc['collections'].values()))
+    assert doc['coordinates']['scale_factor'] == 2
+    with pytest.raises(RuntimeError, match='object revision'):
+        db.export_geometry(uid, tmp_path / 'wrong.json', object_revision_uuid=first_geometry)

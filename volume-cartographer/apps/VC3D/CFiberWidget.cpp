@@ -240,7 +240,7 @@ void CFiberWidget::setupUi()
     _totalLengthLabel = new QLabel(mainWidget);
     connect(_totalLengthLabel, &QLabel::linkActivated, this, [this] { emit fiberDetailsRequested(0); });
     _totalLengthLabel->setObjectName(QStringLiteral("fiberTotalLengthLabel"));
-    _totalLengthLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _totalLengthLabel->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::LinksAccessibleByMouse);
     _totalLengthLabel->setToolTip(
         tr("Sum of the listed fibers' line lengths. Centimetres when the "
            "annotation frame's voxel size is known, otherwise voxels."));
