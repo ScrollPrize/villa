@@ -173,7 +173,8 @@ def fake_cuda(monkeypatch):
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(torch.cuda, "current_stream", lambda device: None)
     monkeypatch.setattr(FiberTrace3DBatch, "pin_memory", lambda batch: replace(batch,
-        volume=batch.volume.clone(), valid_mask=batch.valid_mask.clone()))
+        volume=batch.volume.clone(),
+        valid_mask=None if batch.valid_mask is None else batch.valid_mask.clone()))
     monkeypatch.setattr(FiberTrace3DBatch, "to", lambda batch, device, **kwargs: batch)
 
 
@@ -403,24 +404,23 @@ def test_cuda_real_shared_train_test_train_keeps_cpu_workers(tmp_path):
     print("Paris4 asynchronous train/test/train: exact batches, partial ring wraps, persistent CPU PIDs")
 
 
-# Target-stride regressions extracted unchanged from3f0aeecaa.
+# Target-stride regressions for the canonical mask-free target pipeline.
 def test_materialize_targets_uses_native_coarse_lattice_without_losing_cp() -> None:
     loader = _loader(augment_enabled=False)
     raw = loader.load_batch(0)
     coarse = materialize_targets(raw, loader.config, output_stride=4)
 
     assert coarse.presence_target is not None
-    assert coarse.presence_mask is not None
+    assert coarse.presence_mask is None
     assert coarse.direction_indices_bzyx is not None
     assert coarse.presence_target.shape[-3:] == (4, 4, 4)
-    assert coarse.presence_mask.shape[-3:] == (4, 4, 4)
     assert int(coarse.direction_indices_bzyx.shape[0]) > 0
     assert torch.all(coarse.direction_indices_bzyx[:, 1:] >= 0)
     assert torch.all(coarse.direction_indices_bzyx[:, 1:] < 4)
     assert float(coarse.presence_target.sum()) > 0.0
 
 
-def test_native_coarse_targets_use_ceil_shape_and_conservative_validity() -> None:
+def test_native_coarse_targets_use_ceil_shape_without_validity_mask() -> None:
     loader = _loader(augment_enabled=False)
     raw = loader.load_batch(0)
     batch_size = int(raw.volume.shape[0])
@@ -442,9 +442,8 @@ def test_native_coarse_targets_use_ceil_shape_and_conservative_validity() -> Non
     coarse = materialize_targets(raw, config, output_stride=4)
 
     assert coarse.presence_target.shape[-3:] == (3, 3, 3)
-    assert not bool(coarse.presence_mask[0, 0, 0, 0, 0])
-    assert bool(coarse.presence_mask[0, 0, 1, 1, 1])
-    assert not bool(coarse.presence_mask[0, 0, 2, 2, 2])
+    assert coarse.presence_mask is None
+    assert coarse.presence_target[0, 0, 0, 0, 0] > 0.5
     assert tuple(coarse.direction_indices_bzyx.shape[1:]) == (4,)
 
 

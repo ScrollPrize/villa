@@ -49,6 +49,17 @@ private:
     FiberEvaluationControl&, size_t workers = 4, size_t contextsPerWorker = 8,
     double reverseIntervalBase = 0);
 
+// Existing training-benchmark protocol: committed-point presence filtering,
+// prediction-aligned restart seeds and separately configured reverse radii.
+// Uses the same beam/replay implementation, without changing the ordinary
+// callable evaluator's candidate filtering or reference-point restart policy.
+[[nodiscard]] FiberReplayTraceResult replayFiberTrainingCase(
+    const FiberPredictionSource&, const FiberTraceConfig&, double traceToBaseScale,
+    const vc::lasagna::NormalSampler& tracingNormals,
+    const vc::lasagna::NormalSampler& evaluationNormals, double normalWorkingToBaseScale,
+    const FiberEvaluationCase&, const FiberChunkReplayConfig&,
+    const FiberTraceProgressCallback& = {});
+
 // Direct beam backend, without building/caching chunk paths. Same reference
 // metric and scheduler; starts/restarts at the selected reference point.
 [[nodiscard]] FiberReplayTraceResult replayFiberBeamCase(

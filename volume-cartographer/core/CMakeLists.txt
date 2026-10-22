@@ -14,6 +14,7 @@ target_compile_features(vc_fiber_collection PUBLIC cxx_std_20)
 set_target_properties(vc_fiber_collection PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 add_library(vc_core
+        src/PolylineObj.cpp
         src/AtomicFile.cpp
         src/TexturedMesh.cpp
         src/SurfaceTexture.cpp
@@ -216,6 +217,15 @@ add_library(vc_atlas
 target_link_libraries(vc_atlas PUBLIC vc_core vc_lasagna PRIVATE Ceres::ceres)
 
 add_library(vc_fiber_tracer
+    src/fiber_tracer/FiberReferenceReplayBenchmark.cpp
+    src/fiber_tracer/BinaryBeliefPropagation.cpp
+    src/fiber_tracer/FiberTraceSeed.cpp
+    src/fiber_tracer/FiberTraceBeliefPropagation.cpp
+    src/fiber_tracer/FiberTraceConstraints.cpp
+    src/fiber_tracer/FiberTraceWindingBeliefPropagation.cpp
+    src/fiber_tracer/FiberTraceWindingLeastSquares.cpp
+    src/fiber_tracer/FiberTraceWindingOrderedCuts.cpp
+    src/fiber_tracer/LasagnaNormalAlignment.cpp
     src/fiber_tracer/FiberAnchors.cpp
     src/fiber_tracer/FiberAnchorObjectives.cpp
     src/fiber_tracer/FiberAnchorFinalEvaluation.cpp
@@ -243,7 +253,7 @@ add_library(vc_fiber_tracer
     src/fiber_tracer/FiberletPipeline.cpp
     src/fiber_tracer/FiberTrace.cpp
 )
-target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna)
+target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna PRIVATE Eigen3::Eigen Ceres::ceres)
 if(VC_TESTING)
     target_compile_definitions(vc_fiber_tracer PRIVATE VC_TESTING)
 endif()

@@ -1,12 +1,18 @@
-"""CPU-only sample partitioning and native worker cache initialization."""
+"""CPU-only resource planning for cooperative Fiber training.
+
+No Torch import: this module is safe in a supervisor that must never own CUDA.
+Memory observations must include initialization, optimizer, preparation and test
+peaks, not just activations. No estimate is supplied implicitly.
+"""
 
 from dataclasses import dataclass
+
 
 def configure_cuda_memory_budget(allowance, reserve, device=0):
     """Worker-only allocator limit, shared by production and calibration.
 
     Leave reserve outside PyTorch for the context/NCCL. Driver-visible usage is
-    measured during calibration only; this allocator limit is not a driver quota.
+    checked by the supervisor too; PyTorch's limit alone is not a driver quota.
     """
     if type(allowance) is not int or type(reserve) is not int or not 0 <= reserve < allowance:
         raise ValueError("VRAM grant must exceed its nonnegative driver reserve")
@@ -15,6 +21,18 @@ def configure_cuda_memory_budget(allowance, reserve, device=0):
     torch.cuda.set_per_process_memory_fraction(min(1.0, (allowance - reserve) / properties.total_memory), device)
     return properties
 
+
+def initialize_worker_volume_cache(raw):
+    """Initialize actual native worker counts before the first cache operation."""
+    if "datasets" in raw and not raw["datasets"]:
+        return
+    from vc import volume
+    initialize = getattr(volume, "initialize_chunk_cache", None)
+    if initialize is None:
+        raise RuntimeError("cooperative loading needs rebuilt vc.volume with initialize_chunk_cache")
+    from .loader import _parse_volume_cache_memory_mib
+    mib = _parse_volume_cache_memory_mib(raw.get("volume_cache_memory_mib"))
+    initialize(int(mib * 1024**2), 1, 1, 1)
 
 
 def partition_offsets(effective_batch_size, weights):
@@ -39,9 +57,14 @@ class EffectiveBatchSampleIndex:
     microbatch_sizes: tuple[int, ...]
     rank: int
     start_step: int = 0
+    group_size: int = 1
 
     def __post_init__(self):
         partition_offsets(self.effective_batch_size, self.microbatch_sizes)
+        if (type(self.group_size) is not int or self.group_size < 1 or
+                self.effective_batch_size % self.group_size or
+                any(s % self.group_size for s in self.microbatch_sizes)):
+            raise ValueError("effective batch and microbatches must contain whole sample groups")
         if type(self.rank) is not int or not 0 <= self.rank < len(self.microbatch_sizes):
             raise ValueError("invalid partition rank")
         if type(self.start_step) is not int or self.start_step < 0:
@@ -49,7 +72,8 @@ class EffectiveBatchSampleIndex:
 
     @property
     def bounds(self):
-        offsets = partition_offsets(self.effective_batch_size, self.microbatch_sizes)
+        offsets = tuple(v * self.group_size for v in
+                        partition_offsets(self.effective_batch_size // self.group_size, self.microbatch_sizes))
         return offsets[self.rank:self.rank + 2]
 
     @property
@@ -68,18 +92,6 @@ class EffectiveBatchSampleIndex:
             raise ValueError("invalid local sample index (or zero-work rank)")
         step, offset = divmod(index, self.local_samples)
         return (self.start_step + step) * self.effective_batch_size + self.bounds[0] + offset
-
-def initialize_worker_volume_cache(raw):
-    """Initialize actual native worker counts before the first cache operation."""
-    if "datasets" in raw and not raw["datasets"]:
-        return
-    from vc import volume
-    initialize = getattr(volume, "initialize_chunk_cache", None)
-    if initialize is None:
-        raise RuntimeError("cooperative loading needs rebuilt vc.volume with initialize_chunk_cache")
-    from .loader import _parse_volume_cache_memory_mib
-    mib = _parse_volume_cache_memory_mib(raw.get("volume_cache_memory_mib"))
-    initialize(int(mib * 1024**2), 1, 1, 1)
 
 
 @dataclass(frozen=True)
