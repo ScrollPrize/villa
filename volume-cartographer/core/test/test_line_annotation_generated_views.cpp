@@ -675,7 +675,7 @@ TEST_CASE("Display normal provenance survives storage replacement and reversal")
     using namespace vc3d::line_annotation;
     const nlohmann::json input{{"position",{1,2,3}}, {"display_normal",{0,1,0}},
                                {"display_normal_source","interpolated"}};
-    const auto stored=storedControlPointFromJson(input,3);
+    const auto stored=storedControlPointFromJson(input,4);
     CHECK(stored.displayNormalSource == "interpolated");
     CHECK(storedControlPointToJson(stored).at("display_normal_source") == "interpolated");
     CHECK(reversedStoredControlPoints({stored}).front().displayNormalSource == "interpolated");
@@ -685,11 +685,11 @@ TEST_CASE("Display normal provenance survives storage replacement and reversal")
     const auto replacement=collapseControlPointsAtClick({cp},{0},0,{2,2,3});
     CHECK(replacement.controlPoints.front().displayNormalSource == "interpolated");
     auto legacy=input; legacy.erase("display_normal_source");
-    CHECK(storedControlPointFromJson(legacy,3).displayNormalSource == "unknown");
+    CHECK(storedControlPointFromJson(legacy,4).displayNormalSource == "unknown");
     auto manual=input; manual["display_normal_source"]="manual";
-    CHECK(storedControlPointFromJson(manual,3).displayNormalSource == "manual");
+    CHECK(storedControlPointFromJson(manual,4).displayNormalSource == "manual");
     manual.erase("display_normal");
-    CHECK_THROWS(storedControlPointFromJson(manual,3));
+    CHECK_THROWS(storedControlPointFromJson(manual,4));
 }
 
 TEST_CASE("Cross section center drag translates without changing width or orientation")
@@ -803,7 +803,7 @@ TEST_CASE("New control points inherit the existing interpolated display correcti
         stored.displayNormal = created.displayNormal;
         stored.displayNormalSource = created.displayNormalSource;
         stored.direction = created.direction;
-        const auto restored = storedControlPointFromJson(storedControlPointToJson(stored), 3);
+        const auto restored = storedControlPointFromJson(storedControlPointToJson(stored), 4);
         REQUIRE(restored.direction);
         REQUIRE(restored.displayNormal);
         CHECK(cv::norm(*restored.direction - *created.direction) < 1e-9);
@@ -877,7 +877,7 @@ TEST_CASE("Fiber display metadata validates and survives CP roundtrip and revers
     vc3d::line_annotation::StoredControlPoint cp;
     cp.displayNormal = cv::Vec3d(0, 1, 0);
     const auto json = vc3d::line_annotation::storedControlPointToJson(cp);
-    const auto restored = vc3d::line_annotation::storedControlPointFromJson(json, 3);
+    const auto restored = vc3d::line_annotation::storedControlPointFromJson(json, 4);
     REQUIRE(restored.displayNormal.has_value());
     CHECK(cv::norm(*restored.displayNormal - *cp.displayNormal) < 1e-6);
     const auto reversed = vc3d::line_annotation::reversedStoredControlPoints({cp, cp});
@@ -1057,41 +1057,6 @@ std::vector<std::filesystem::path> recoveryFilesIn(const std::filesystem::path& 
 
 } // namespace
 
-TEST_CASE("fiber file name identity parsing round-trips canonical names")
-{
-    using vc3d::line_annotation::fiberFileName;
-    using vc3d::line_annotation::parsedFiberFileNameIdentity;
-
-    const auto simple = parsedFiberFileNameIdentity(
-        fiberFileName("kb", "20260719T194751553", 553));
-    REQUIRE(simple.has_value());
-    CHECK(simple->username == "kb");
-    CHECK(simple->startedAt == "20260719T194751553");
-    CHECK(simple->sequence == 553);
-
-    // Usernames may contain underscores; the stem parses from the right.
-    const auto underscored = parsedFiberFileNameIdentity(
-        fiberFileName("team_alpha", "20260101T000000000", 7));
-    REQUIRE(underscored.has_value());
-    CHECK(underscored->username == "team_alpha");
-    CHECK(underscored->sequence == 7);
-
-    // Sequences above the padded width still round-trip.
-    const auto wide = parsedFiberFileNameIdentity(
-        fiberFileName("dj", "20260101T000000000", 1234567));
-    REQUIRE(wide.has_value());
-    CHECK(wide->sequence == 1234567);
-
-    // Non-canonical names carry no identity.
-    CHECK_FALSE(parsedFiberFileNameIdentity("horizontal_bundle_03.json"));
-    CHECK_FALSE(parsedFiberFileNameIdentity("kb_20260719T194751553_000553"));
-    CHECK_FALSE(parsedFiberFileNameIdentity("kb_20260719_000553.json"));
-    CHECK_FALSE(parsedFiberFileNameIdentity("kb_2026071?T194751553_000553.json"));
-    CHECK_FALSE(parsedFiberFileNameIdentity("_20260719T194751553_000553.json"));
-    CHECK_FALSE(parsedFiberFileNameIdentity("kb_20260719T194751553_.json"));
-    CHECK_FALSE(parsedFiberFileNameIdentity(".json"));
-}
-
 TEST_CASE("generated display tangent sign is independent of stored point order")
 {
     using vc3d::line_annotation::generatedDisplayTangentSign;
@@ -1260,14 +1225,14 @@ TEST_CASE("CP direction editing preserves the unedited component and round trips
     vc3d::line_annotation::StoredControlPoint cp;
     cp.direction=*edited;
     auto json=vc3d::line_annotation::storedControlPointToJson(cp);
-    const auto loaded=vc3d::line_annotation::storedControlPointFromJson(json,3);
+    const auto loaded=vc3d::line_annotation::storedControlPointFromJson(json,4);
     REQUIRE(loaded.direction);
     CHECK(cv::norm(*loaded.direction-*edited)<1e-9);
     const auto reversedControls=vc3d::line_annotation::reversedStoredControlPoints({cp});
     REQUIRE(reversedControls.front().direction);
     CHECK(cv::norm(*reversedControls.front().direction+*edited)<1e-9);
     json["direction"]={0,0,0};
-    CHECK_THROWS(vc3d::line_annotation::storedControlPointFromJson(json,3));
+    CHECK_THROWS(vc3d::line_annotation::storedControlPointFromJson(json,4));
 }
 
 TEST_CASE("Spline uses signed annotated interior tangents")
@@ -4744,7 +4709,7 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     control.segmentToNext = metadata;
 
     const auto json = vc3d::line_annotation::storedControlPointToJson(control);
-    const auto parsed = vc3d::line_annotation::storedControlPointFromJson(json, 3);
+    const auto parsed = vc3d::line_annotation::storedControlPointFromJson(json, 4);
     REQUIRE(parsed.segmentToNext.has_value());
     CHECK(parsed[0] == doctest::Approx(1.0));
     CHECK(parsed.segmentToNext->normalManifestLocation ==
@@ -4761,7 +4726,7 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     auto obsoleteMetadataJson = json;
     obsoleteMetadataJson["segment_to_next"]["metadata_version"] = 2;
     CHECK_THROWS_AS(
-        vc3d::line_annotation::storedControlPointFromJson(obsoleteMetadataJson, 3),
+        vc3d::line_annotation::storedControlPointFromJson(obsoleteMetadataJson, 4),
         std::runtime_error);
     CHECK_THROWS_AS(
         vc3d::line_annotation::storedControlPointFromJson(json, 2),
@@ -4785,17 +4750,17 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
              nlohmann::json{{"position", {4.0, 5.0, 6.0}}},
          })}};
     CHECK_NOTHROW(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
-        sharedReaderRoot, "control_points", 3, "test fiber"));
+        sharedReaderRoot, "control_points", 4, "test fiber"));
     CHECK_THROWS_AS(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
         sharedReaderRoot, "control_points", 2, "test fiber"),
         std::runtime_error);
 
     nlohmann::json strictRoot = sharedReaderRoot;
     strictRoot["type"] = "vc3d_fiber";
-    strictRoot["version"] = 3;
+    strictRoot["version"] = 4;
     strictRoot["optimization_mode"] = "native_fiber_trace3d";
     strictRoot["line_points"] = {{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}};
-    CHECK_NOTHROW(vc::fiber_tracer::parseVc3dFiberJson(strictRoot, "test fiber"));
+    CHECK_THROWS_AS(vc::fiber_tracer::parseVc3dFiberJson(strictRoot, "test fiber"), std::runtime_error);
     strictRoot["uuid"] = vc::util::newUuid();
     CHECK(vc::fiber_tracer::parseVc3dFiberJson(strictRoot, "test fiber").uuid ==
           strictRoot.at("uuid").get<std::string>());
@@ -4806,14 +4771,20 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
         std::runtime_error);
     auto missingMode = strictRoot;
     missingMode.erase("optimization_mode");
-    CHECK_THROWS_AS(
-        vc::fiber_tracer::parseVc3dFiberJson(missingMode, "test fiber"),
-        std::runtime_error);
+    CHECK_NOTHROW(vc::fiber_tracer::parseVc3dFiberJson(missingMode, "test fiber"));
     auto missingDescriptor = strictRoot;
     missingDescriptor["control_points"][0].erase("segment_to_next");
-    CHECK_THROWS_AS(
-        vc::fiber_tracer::parseVc3dFiberJson(missingDescriptor, "test fiber"),
-        std::runtime_error);
+    CHECK_NOTHROW(vc::fiber_tracer::parseVc3dFiberJson(missingDescriptor, "test fiber"));
+    for (int version : {1, 2, 3}) {
+        auto old = strictRoot; old["version"] = version;
+        CHECK_THROWS_AS(vc::fiber_tracer::parseVc3dFiberJson(old, "old fiber"), std::runtime_error);
+    }
+    auto versionless = strictRoot; versionless.erase("version");
+    CHECK_THROWS_AS(vc::fiber_tracer::parseVc3dFiberJson(versionless, "old fiber"), std::runtime_error);
+    missingDescriptor["line_points"] = nlohmann::json::array();
+    const auto controlsOnly = vc::fiber_tracer::parseVc3dFiberJson(missingDescriptor, "control-only fiber");
+    CHECK(controlsOnly.controlPoints.size() == 2);
+    CHECK(controlsOnly.linePoints.empty());
     const auto regeneratedLasagna =
         vc::fiber_tracer::makeLasagnaSegmentMetadataJson(
             "trace",
@@ -5716,7 +5687,7 @@ TEST_CASE("control point tags round trip and travel with the point")
     const auto json = storedControlPointToJson(tagged);
     REQUIRE(json.contains("tags"));
     CHECK(json["tags"] == nlohmann::json::array({"kollesis_termination"}));
-    const auto parsed = storedControlPointFromJson(json, 3);
+    const auto parsed = storedControlPointFromJson(json, 4);
     CHECK(parsed.tags == tagged.tags);
     CHECK(setControlPointTag(tagged.tags, kKollesisTerminationTag, false));
     CHECK(tagged.tags.empty());
@@ -5725,23 +5696,23 @@ TEST_CASE("control point tags round trip and travel with the point")
     // Normalised on read: trimmed, blanks dropped, unique, sorted.
     const nlohmann::json messy{{"position", {1.0, 2.0, 3.0}},
                                {"tags", {" b ", "a", "", "a"}}};
-    CHECK(storedControlPointFromJson(messy, 3).tags ==
+    CHECK(storedControlPointFromJson(messy, 4).tags ==
           std::vector<std::string>{"a", "b"});
     const nlohmann::json notArray{{"position", {1.0, 2.0, 3.0}},
                                   {"tags", "kollesis_termination"}};
-    CHECK_THROWS_AS(storedControlPointFromJson(notArray, 3), std::runtime_error);
+    CHECK_THROWS_AS(storedControlPointFromJson(notArray, 4), std::runtime_error);
     const nlohmann::json notStrings{{"position", {1.0, 2.0, 3.0}}, {"tags", {1}}};
-    CHECK_THROWS_AS(storedControlPointFromJson(notStrings, 3), std::runtime_error);
+    CHECK_THROWS_AS(storedControlPointFromJson(notStrings, 4), std::runtime_error);
     // Any other per-point field is still rejected.
     const nlohmann::json unknown{{"position", {1.0, 2.0, 3.0}},
                                  {"kollesis_termination", true}};
-    CHECK_THROWS_AS(storedControlPointFromJson(unknown, 3), std::runtime_error);
+    CHECK_THROWS_AS(storedControlPointFromJson(unknown, 4), std::runtime_error);
 
     // The shared core reader (atlas, tracer CLI, inspect tools) accepts the
     // field and rejects the same malformed shapes.
     const nlohmann::json root = {{"control_points", nlohmann::json::array({json})}};
     CHECK_NOTHROW(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
-        root, "control_points", 3, "test fiber"));
+        root, "control_points", 4, "test fiber"));
     const nlohmann::json badTags = {{"control_points", nlohmann::json::array({notStrings})}};
     CHECK_THROWS_AS(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
                         badTags, "control_points", 3, "test fiber"),
@@ -5861,10 +5832,10 @@ TEST_CASE("break tags make gap spans between consecutive tagged points")
     const auto json = storedControlPointToJson(stored);
     REQUIRE(json.contains("tags"));
     CHECK(json["tags"] == nlohmann::json::array({"break"}));
-    CHECK(storedControlPointFromJson(json, 3).tags == std::vector<std::string>{"break"});
+    CHECK(storedControlPointFromJson(json, 4).tags == std::vector<std::string>{"break"});
     const nlohmann::json root = {{"control_points", nlohmann::json::array({json})}};
     CHECK_NOTHROW(vc::fiber_tracer::vc3dFiberPointArrayFromJson(
-        root, "control_points", 3, "test fiber"));
+        root, "control_points", 4, "test fiber"));
     CHECK(!controlPointTagsConflict(stored.tags));
     CHECK(controlPointTagsConflict(
         mergedControlPointTags(stored.tags, {kKollesisTerminationTag})));

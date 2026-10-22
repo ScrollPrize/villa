@@ -139,7 +139,6 @@
 #include "WrapAnnotationWidget.hpp"
 #include "AtlasControlPointsDock.hpp"
 #include "CFiberWidget.hpp"
-#include "FiberAnnotationController.hpp"
 #include "overlays/FiberOverlayController.hpp"
 #include "FiberCollectionController.hpp"
 #include "LineAnnotationController.hpp"
@@ -2741,14 +2740,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             configureChunkedViewerConnections(chunkedViewer);
         }
     });
-    // Fiber annotation gets first refusal on volume clicks, then Automated
-    // Fiber Volume picking, before the shared Ctrl+click-to-focus policy runs.
+    // Automated Fiber Volume picking precedes the shared focus policy.
     _viewerManager->setVolumeClickInterceptor(
-        [this](const cv::Vec3f& volLoc, const cv::Vec3f& normal, Surface* surf,
+        [this](const cv::Vec3f&, const cv::Vec3f&, Surface*,
                Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
-            return (_fiberController &&
-                    _fiberController->handleVolumeClick(volLoc, normal, surf, button, modifiers)) ||
-                   (_fiberCollection && !(_segmentationModule && _segmentationModule->editingEnabled()) &&
+            return (_fiberCollection && !(_segmentationModule && _segmentationModule->editingEnabled()) &&
                     _fiberCollection->handleVolumeClick(button, modifiers));
         });
     connect(_viewerManager.get(), &ViewerManager::surfaceActivationRequested,
@@ -7815,11 +7811,6 @@ void CWindow::CreateWidgets(void)
     connect(_point_collection_widget, &CPointCollectionWidget::collectionSelectionCleared,
             _segmentationModule.get(), &SegmentationModule::clearSelectedAnnotationCollection);
 
-    // Create fiber annotation controller and dock
-    _fiberController = std::make_unique<FiberAnnotationController>(
-        _state, _state->pointCollection(), this);
-    _fiberController->setMdiArea(_fiberSliceMdiArea);
-
     _fiberWidget = new CFiberWidget(this);
     _fiberWidget->setObjectName("fiberDock");
     _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _fiberWidget);
@@ -8171,12 +8162,6 @@ void CWindow::CreateWidgets(void)
                     updateFiberLengthUnits();
                 });
     }
-    connect(_fiberController.get(), &FiberAnnotationController::crosshairModeChanged,
-            this, &CWindow::onFiberCrosshairModeChanged);
-    connect(_fiberController.get(), &FiberAnnotationController::requestFiberViewers,
-            this, &CWindow::onFiberViewersRequested);
-    connect(_fiberController.get(), &FiberAnnotationController::annotationFinished,
-            this, &CWindow::onFiberAnnotationFinished);
 
     ensureDockWidgetFeatures(_fiberWidget);
     connect(_fiberWidget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
@@ -8526,16 +8511,6 @@ void CWindow::CreateWidgets(void)
 // Create actions
 void CWindow::keyPressEvent(QKeyEvent* event)
 {
-    // Let fiber controller handle Escape first
-    if (event->key() == Qt::Key_Escape && _fiberController && _fiberController->handleEscape()) {
-        event->accept();
-        return;
-    }
-
-    // Fiber animation (P key)
-    if (_fiberController && _fiberController->handleKeyPress(event))
-        return;
-
     if (event->key() == vc3d::keybinds::keypress::ToggleVolumeOverlay.key &&
         event->modifiers() == vc3d::keybinds::keypress::ToggleVolumeOverlay.modifiers) {
         toggleVolumeOverlayVisibility();
@@ -11347,89 +11322,4 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, std::optional<vc::Poi
     }
 
     showStatusBarMessage(tr("Focused & aligned view to %1 points").arg(pts.size()), 3000);
-}
-
-// ---- Fiber annotation slots -------------------------------------------------
-
-void CWindow::onNewFiberRequested()
-{
-    if (_fiberController) {
-        _fiberController->beginNewFiber();
-    }
-}
-
-void CWindow::onFiberCrosshairModeChanged(bool active)
-{
-    if (!_viewerManager) return;
-    _viewerManager->forEachBaseViewer([active](VolumeViewerBase* v) {
-        if (v->graphicsView()) {
-            v->graphicsView()->setCursor(active ? Qt::CrossCursor : Qt::ArrowCursor);
-        }
-    });
-}
-
-void CWindow::onFiberViewersRequested()
-{
-    if (!_fiberController) return;
-
-    constexpr int N = FiberAnnotationController::kNumViews;
-    QMdiArea* targetMdiArea = _fiberSliceMdiArea ? _fiberSliceMdiArea : mdiArea;
-    if (!targetMdiArea) {
-        return;
-    }
-
-    QMdiSubWindow* subWindows[N] = {};
-
-    for (int i = 0; i < N; ++i) {
-        QString title = (i == 0) ? tr("Fiber Ref") : tr("Fiber Annotate");
-
-        auto* baseViewer = newConnectedViewer(
-            FiberAnnotationController::fiberSurfaceName(i), title, targetMdiArea);
-        auto* viewer = baseViewer
-            ? qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject())
-            : nullptr;
-        if (!viewer) continue;
-
-        _fiberController->setFiberViewer(i, viewer);
-
-        // Isolate from segmentation module and global focus POI
-        disconnect(_state, &CState::poiChanged, viewer, &CTiledVolumeViewer::onPOIChanged);
-        if (_segmentationModule)
-            disconnect(viewer, nullptr, _segmentationModule.get(), nullptr);
-
-        // Only the last view (annotation) handles clicks
-        if (i == N - 1) {
-            connect(viewer, &CTiledVolumeViewer::sendVolumeClicked,
-                    _fiberController.get(), &FiberAnnotationController::onAnnotationViewerClicked);
-        }
-
-        if (_state->currentVolume())
-            viewer->OnVolumeChanged(_state->currentVolume());
-
-        subWindows[i] = qobject_cast<QMdiSubWindow*>(viewer->parentWidget());
-        if (subWindows[i])
-            subWindows[i]->show();
-    }
-
-    // Layout: 2 columns × 1 row — ref on the left, annotate on the right.
-    QRect area = targetMdiArea->contentsRect();
-    int colW = area.width() / 2;
-    int rowH = area.height();
-
-    for (int i = 0; i < N; ++i) {
-        if (!subWindows[i]) continue;
-        int x = area.x() + i * colW;
-        int y = area.y();
-        subWindows[i]->setGeometry(x, y, colW, rowH);
-    }
-}
-
-void CWindow::onFiberAnnotationFinished(uint64_t fiberId)
-{
-    if (_fiberWidget) {
-        _fiberWidget->selectFiber(fiberId);
-    }
-    if (_fiberSliceWidget) {
-        _fiberSliceWidget->selectFiber(fiberId);
-    }
 }

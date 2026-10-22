@@ -1,5 +1,7 @@
 #include <iostream>
 #include <QApplication>
+#include "SpiralWorkspace.hpp"
+#include "SpiralServiceManager.hpp"
 #include "overlays/FiberOverlayCoordinates.hpp"
 // Built only with VC_TESTING. Runs the actual controller publication path.
 int runObjectStoreControllerTests()
@@ -80,6 +82,33 @@ int runObjectStoreControllerTests()
                 require(fiber.branches.front().edgeUuid == a.branches.front().edgeUuid, "edge UUID survives transfer");
             }
         }
+        {
+            SpiralWorkspace workspace(&state);
+            workspace.setLineAnnotationController(&controller);
+            auto* service = workspace.findChild<SpiralServiceManager*>();
+            require(service, "Spiral service exists");
+            require(workspace.stageFiberInputs({a.id}), "stage a newly saved fiber");
+            auto rows = service->inputDraftStatus();
+            require(rows.size() == 2, "staging includes linked fibers");
+            for (const auto& row : rows)
+                require(row.toObject()["applied_revision"].toInteger() == 0, "staging does not apply to fit");
+            workspace.refreshTrackedFibers();
+            require(service->inputDraftStatus() == rows, "unchanged fibers are not restaged");
+            // Reopening a service input registers it even in a fresh workspace.
+            SpiralWorkspace reopened(&state);
+            reopened.setLineAnnotationController(&controller);
+            auto* reopenedService = reopened.findChild<SpiralServiceManager*>();
+            reopenedService->inputEditorRequested(QJsonObject{{"kind", "fiber"}, {"id", QString::fromStdString(a.uuid)}},
+                QString::fromStdString(transferPaths.at(a.uuid).string()));
+            require(reopenedService->inputDraftStatus().size() == 2, "reopened service fibers are tracked");
+            auto changed = a; changed.tags.push_back("spiral-draft-edit");
+            controller.scheduleFiberSave(changed);
+            workspace.refreshTrackedFibers(); reopened.refreshTrackedFibers();
+            require(service->inputDraftStatus() != rows, "saved edits refresh tracked drafts");
+            for (const auto& row : service->inputDraftStatus())
+                require(row.toObject()["applied_revision"].toInteger() == 0, "refresh does not auto-apply");
+        }
+        a = resolve(a.uuid); b = resolve(b.uuid);
         struct OverlayChain { uint64_t id; std::vector<cv::Vec3f> points; std::vector<int> links; };
         const std::vector<OverlayChain> chains{{1, {{8,16,24}}, {2}}, {2, {{8,16,24}}, {1}}, {3, {{8,16,24}}, {}}};
         const auto visible = vc3d::boundFiberChains(chains, [](uint64_t id) -> std::optional<double> {
@@ -93,6 +122,20 @@ int runObjectStoreControllerTests()
         std::vector<std::string> retiredNotifications;
         QObject::connect(&controller, &Controller::fiberRetired, &controller,
             [&](const QString& uuid) { retiredNotifications.push_back(uuid.toStdString()); });
+        {
+            auto invalid = a;
+            invalid.controlPoints.front()[0] -= 2;
+            invalid.linePoints.front()[0] -= 2;
+            invalid.branches.front().controlPointIndex = 999;
+            auto failed = std::vector<Controller::FiberSaveSnapshot>{controller.makeFiberSaveSnapshot(invalid)};
+            bool rejected = false;
+            try { controller.commitFiberStoreAction(failed); } catch (...) { rejected = true; }
+            require(rejected, "invalid relationship rejects after geometry edits start");
+            require(failed.front().fiber.storePin->objectRevision == invalid.storePin->objectRevision, "failed transaction leaves working pins unchanged");
+            auto db = ObjectStore::open(path, options); auto txn = db.read();
+            require(db.currentObjectRevision(txn, a.uuid)->uuid == a.storePin->objectRevision,
+                    "failed relationship rolls back geometry and metadata");
+        }
         const auto edge=a.branches.front().edgeUuid;
         a.controlPoints[0][0]=-1; a.linePoints[0][0]=-1;
         batch={controller.makeFiberSaveSnapshot(a)};
@@ -132,6 +175,23 @@ int runObjectStoreControllerTests()
         }
 
         namespace la=vc3d::line_annotation;
+        {
+            Controller::StoredFiber firstSeed;
+            firstSeed.id = controller.nextFiberId(); firstSeed.fileName = "duplicate-seed.json";
+            firstSeed.controlPoints.emplace_back(cv::Vec3d{1,2,3});
+            firstSeed.tags = {la::kNeedsReoptimizationTag};
+            auto secondSeed = firstSeed;
+            secondSeed.id = controller.nextFiberId(); secondSeed.uuid = vc::util::newUuid();
+            std::vector<Controller::FiberSaveSnapshot> seeds{
+                controller.makeFiberSaveSnapshot(firstSeed), controller.makeFiberSaveSnapshot(secondSeed)};
+            controller.commitFiberStoreAction(seeds);
+            controller.loadFibersForCurrentPackage();
+            controller.reoptimizeMergedFibers({secondSeed.id});
+            controller.loadFibersForCurrentPackage();
+            require(resolve(firstSeed.uuid).tags == firstSeed.tags, "same-name non-target keeps reoptimization tag");
+            require(resolve(secondSeed.uuid).tags.empty(), "reoptimization selects exact runtime identity");
+        }
+
         Controller::StoredFiber parent;
         parent.id=controller.nextFiberId(); parent.fileName="parent.json";
         parent.username="test"; parent.startedAt="20260101"; parent.sequence=3;
@@ -219,6 +279,24 @@ int runObjectStoreControllerTests()
             const auto controlsOnly = resolve(object.uuid);
             require(controlsOnly.controlPoints.size() == 2 && controlsOnly.linePoints.empty(), "control-only geometry preserved without synthesizing lines");
             require(controller.fiberSummaries().size() == controller._fibers.size(), "read-only store fibers remain listed");
+            QTemporaryDir transferDir;
+            const auto transferPath = fs::path(transferDir.path().toStdString()) / "controls.json";
+            const auto exportedControls = controller.fiberToJson(controlsOnly);
+            require(!exportedControls["control_points"][0].contains("segment_to_next"), "export does not invent tracing provenance");
+            writeJsonAtomic(transferPath, exportedControls);
+            const auto target = fs::path(transferDir.path().toStdString()) / "controls.vcobj";
+            { auto targetDb = ObjectStore::create(target, options); }
+            CState destination;
+            Controller imported(&destination, nullptr, nullptr, nullptr);
+            imported._errorDialogsSuppressed = true;
+            destination.attachObjectStore(QString::fromStdString(target.string()), "control-only-roundtrip");
+            QString importError; int importedCount = 0;
+            if (!imported.importFibersFromPath(transferPath, &importError, &importedCount))
+                throw std::runtime_error(importError.toStdString());
+            require(importedCount == 1, "control-only transfer imports");
+            imported.ensureAllFiberLines();
+            require(imported._fibers.front().controlPoints.size() == 2 && imported._fibers.front().linePoints.empty(),
+                    "control-only transfer preserves geometry without synthesizing a line");
             auto pending = std::vector<Controller::FiberSaveSnapshot>{controller.makeFiberSaveSnapshot(controlsOnly)};
             bool rejected = false; try { controller.commitFiberStoreAction(pending); } catch (...) { rejected = true; }
             require(rejected, "read-only controller cannot publish changes");

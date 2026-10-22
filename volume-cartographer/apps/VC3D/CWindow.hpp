@@ -103,7 +103,6 @@ static constexpr int VOLPKG_MIN_VERSION = 1;
 
 //forward declaration to avoid circular inclusion as CommandLineToolRunner needs CWindow.hpp
 class CommandLineToolRunner;
-class FiberAnnotationController;
 class SegmentationModule;
 class SurfacePanelController;
 class MenuActionController;
@@ -372,10 +371,6 @@ private slots:
     void onSharedCacheStatsChanged(const QStringList& items);
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
     void onConvertPointToAnchor(vc::PointRef point);
-    void onNewFiberRequested();
-    void onFiberCrosshairModeChanged(bool active);
-    void onFiberViewersRequested();
-    void onFiberAnnotationFinished(uint64_t fiberId);
     void refreshVolumeSelectionUi(const QString& preferredVolumeId = QString());
     void refreshSegmentationDirectoryDropdown();
     void applySegmentFolderSelection(bool reloadSurfaces);
@@ -404,7 +399,6 @@ private:
     WrapAnnotationWidget* _wrapAnnotationWidget{nullptr};
     CFiberWidget* _fiberWidget{nullptr};
     CFiberWidget* _fiberSliceWidget{nullptr};
-    std::unique_ptr<FiberAnnotationController> _fiberController;
 
     SurfaceTreeWidget *treeWidgetSurfaces;
     QPushButton *btnReloadSurfaces;

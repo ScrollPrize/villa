@@ -4,8 +4,10 @@
 
 Attach an existing `.vcobj` database with **File → Attach Object Store**.
 **Attach Read-only Object Store** supports browsing without permitting writes.
-Fiber geometry, annotations, relationships and retirement are published atomically
-by `vc_object_store::publishFiberEdits`. VC3D retains pinned working snapshots.
+VC3D edits geometry, annotations, relationships and retirement directly through
+the database APIs in one `ObjectStoreSession::act` transaction. Splits create two
+objects and retire the original in that transaction. VC3D retains pinned working
+snapshots; the database owns revision history and synchronization.
 The catalog reads control geometry and metadata; dense line geometry is loaded
 on demand. Selecting or expanding a fiber loads its exact span details; unloaded
 lengths display as unknown. The total-length calculate link loads all span details. Closing a read-only view does not remove its catalog entry.
@@ -21,7 +23,12 @@ Import/export is an explicit transfer operation. VC3D imports current **version 
 migration, filename identity inference, gap repair, branch stripping, project
 fiber-folder lookup or `.afv` backend. Store records load directly from typed
 geometry and relationships, independently of their original ingestion format.
-Control-only fibers remain in the catalog. Import/export does not rescale points.
+Control-only fibers remain in the catalog and round-trip through import/export
+without generating line points. Import/export does not rescale points.
+
+Spiral stages newly drawn and reopened fibers, including their linked endpoints,
+as input drafts. Subsequent edits refresh those drafts; applying them to the fit
+remains an explicit action. Fiber identity is the object UUID, not its display name.
 
 Atlas mappings require object-store revision pins. The atlas inspection,
 constraint export and pred-snap rebuild tools accept `--object-store PATH` and
@@ -133,13 +140,13 @@ The annotation toolbar has **Fiber width** (base voxels; 0 means unset) and
 the same arclength radius as CP replacement, and is disabled outside that radius.
 Setting an angle to zero removes its manual normal.
 
-Version-3 JSON stores optional top-level `width`, always-written top-level
+Version-4 transfer JSON stores optional top-level `width`, always-written top-level
 `width_gap_fraction` (default 0.2), and optional per-control-point
 `display_normal: [x,y,z]` and `display_normal_source`. The source is `manual`
 for explicit angle/edge-drag edits, `interpolated` for inheritance on CP
 creation, and `unknown` for older normals without provenance. Training should
 select only `manual`. Normal and provenance travel together through saving,
-replacement, reversal, split/merge, optimization and remote three-way sync.
+replacement, reversal, split/merge and optimization.
 Clearing a normal omits both fields. The normal is the baked world-space unit normal,
 not an angle. The gap is a dimensionless fraction between 0 and 1; missing
 values load as 0.2 and are explicitly written on the next save. Existing values
@@ -176,12 +183,11 @@ overlay through the main window's shared toggle action. **Space** continues to
 toggle cross-view mouse-follow. The annotation menu also exposes the overlay
 toggle. This is independent of width/normal guide visibility.
 
-Edits use the ordinary queued fiber save/sync path without retracing or changing
+Edits commit through the database without retracing or changing
 review tags. CP metadata follows CP movement, reversal and split; each split
 inherits width and gap. Joining fibers uses the clicked fiber's nonzero width
-and its gap, otherwise the other fiber's width and gap. Three-way sync merges
-width, gap and per-CP normal changes
-independently of span refits; divergent edits and edits to removed CPs conflict.
+and its gap, otherwise the other fiber's width and gap. Database revision
+checks reject stale edits before any changes are committed.
 
 The former cross-section polygon/line editor and `cross_sections` storage are
 removed. Old records are not migrated and are omitted when rewriting a fiber.
@@ -470,8 +476,8 @@ unlink, approve or mark pending); the point tags (kollesis termination,
 break); new annotations at the click; and the corrections reset.
 
 The top-level `optimization_mode` is either `lasagna` or
-`native_fiber_trace3d`. It is required in version 3; only legacy version-1
-files may omit it and default to `lasagna`. The mode
+`native_fiber_trace3d`. It defaults to `lasagna` when a typed geometry export
+has no optimization annotations. The mode
 selects extrapolation and resolves CP spans whose persisted `interp_goal` is
 `global`. A segment goal is `global`, `cspline`, `lasagna`, or `trace`; its
 `interp_mode` is the actual producer of the stored geometry and is one of
@@ -717,10 +723,8 @@ UI like any other tag: the fiber panel's tag checkboxes and the Line
 Annotation toolbar's tag pills, where `reviewed` is pinned first and always
 offered even in a volpkg where no fiber carries it yet. The only
 programmatic change is the mode-switch strip described above; ordinary
-control-point edits, merges, and splits never touch it, and
-`scripts/fiber_merge.py` treats it as a plain tag under the usual
-three-way tag merge. `scripts/vc_sync.py hfsync` publishes gated on it
-(`reviewed` is its default `--tag`), so the tag doubles as the publish gate.
+control-point edits, merges, and splits never touch it. It has no publishing
+side effects.
 
 The fiber panel's `interp` column shows the interpolation provenance per
 fiber — `legacy` (no trace spans), `predictions` (trace spans, native mode),
@@ -786,53 +790,22 @@ the reconstructed exact public manifest URL, never its local cache path.
 Strip labels prefix the actual mode as `C`, `L`, or `T`, then display
 the metric and message. Labels are laid out in viewport pixels, remain visible
 while any part of their span intersects the view, and use a deterministic
-second row when one row cannot avoid overlap. Legacy version-1 fibers remain
-readable and acquire explicit version-3 descriptors on the next save. The
-unpublished file version 2 and its pre-v3 descriptor schemas are unsupported.
-This does not affect the current `tracer_version: 2` stored inside a version-3
-segment descriptor.
+second row when one row cannot avoid overlap.
 
-All v3 readers validate this complete contract before using even geometry-only
-data. VC3D, native CLI tools, Atlas, Lasagna, Spiral, Python training loaders,
-and sync reject a missing mode, a missing non-final descriptor, a descriptor on
-the final CP, malformed config, or inconsistent mode diagnostics. They never
-repair, normalize, tag, or rewrite invalid v3 input. Sync routes it to the
-manual conflict workflow and keeps local, remote, and base files unchanged.
+Transfer readers accept only version 4 with explicit UUIDs. Tracing annotations
+are optional for typed geometry; when present, descriptors and their diagnostics
+are validated. A descriptor on the final control point is invalid. Evaluation
+that depends on trace provenance requires the per-span descriptors.
 
-## Sync Conflict Handling
+## Database persistence
 
-`scripts/vc_sync.py` compares local and S3 content with the last successfully
-synced shadow copy. When both versions changed, `scripts/fiber_merge.py`
-performs a three-way merge. Version-3 fibers are divided into complete stored
-span results: each result contains its dense CP-to-CP line slice and the
-starting CP's complete `segment_to_next` descriptor. Geometry and metadata are
-never merged field by field or selected by generation.
+VC3D uses the database's checked transactions, geometry edit APIs, relationships
+and retirement. It does not maintain merge bases, reconcile remote fiber JSONs,
+or publish fibers to Hugging Face. S3/SFTP fiber merging and one-off fiber tag
+migration scripts have been retired. Generic file transfers remain available
+through `scripts/vc_sync.py`.
 
-A span run changed on only one side is retained verbatim, and identical
-two-sided results converge. Separate local and remote changes can be combined
-only when at least one complete base span between them is unchanged on both
-sides. Adjacent edits, different edits to the same run, overlapping topology
-changes, missing ordered CP/line anchors, and inexact joins are conflicts.
-`optimization_mode` follows the same base-aware policy: one changed side wins,
-equal changes converge, and different two-sided changes conflict.
-
-An ambiguous merge does not modify the fiber. The sync tool stores local,
-remote, and base copies under `.s3sync-conflicts/` and asks whether to keep the
-complete local version, keep the complete remote version, or skip. Those
-questions are asked before the link-consistency planning of the other
-conflicts: a decided file ([l]ocal or [r]emote) is a known source the planner
-can plan its linked neighbours against, so their auto-merges land in the same
-run; only a skipped file blocks the neighbours that depend on it, which are
-then asked about in turn. A merge that dropped its link to a peer deleted on
-both sides (or pending local deletion) needs no reciprocal fix and is not
-treated as a dangling link. `--dry-run` reports content-merge eligibility only;
-link consistency is assessed in a real run. Existing
-base-aware tag, branch-link, reciprocal-peer, and manual-HV-tag handling runs
-only after geometry merges cleanly. Version-1 fibers retain the older merge
-behavior, including the CP-polyline `needs_reoptimization`
-fallback for disjoint geometry edits.
-
-`vc_lasagna_line_probe --reopt` and `--reinit-reopt` write a coherent new v3
+`vc_lasagna_line_probe --reopt` and `--reinit-reopt` write a coherent version-4
 Lasagna result: exact CP positions and existing goals are retained, actual span
 modes become `lasagna`, the input normal manifest and per-span maximum normal
 alignment error are recorded, trace-only diagnostics are cleared, and geometry

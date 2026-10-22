@@ -1050,10 +1050,6 @@ private:
                                                     const FiberBranchRef& branch,
                                                     const FiberBranchRef& candidate);
 
-    // Fibers merged by the sync tool (scripts/fiber_merge.py) carry a
-    // needs_reoptimization tag; on load VC3D offers to re-fit their lines.
-    // Declining keeps the tag so the next load asks again.
-    void promptReoptimizationForMergedFibers();
     // Modal guard before a fiber optimization-mode switch re-optimizes the
     // line; returns false when the user cancels. Suppressed (agent-driven)
     // sessions proceed without prompting.
@@ -1068,20 +1064,10 @@ private:
             const LineAnnotationSession& session,
             vc3d::line_annotation::FiberOptimizationMode clickedMode,
             vc3d::line_annotation::FiberOptimizationMode candidateMode);
-    // fileNames, not runtime ids: a fiber can be deleted, and the package
-    // can change, while the prompt's modal spins.
-    void reoptimizeMergedFibers(const std::vector<std::string>& fiberFileNames);
+    void reoptimizeMergedFibers(const std::vector<uint64_t>& fiberIds);
     void emitFiberSummaries();
     void addKnownFiberTags(const std::vector<std::string>& tags);
-    // Base grid the fiber's stored geometry lives in: the shape stored in the
-    // fiber itself, else the manifest its trace spans recorded, else the
-    // package's selected fiber-inference dataset (see
-    // fiberBaseShapeManifestCandidates). nullopt when none can be resolved.
-    [[nodiscard]] std::optional<std::array<std::size_t, 3>>
-        resolveStoredFiberCoordinateBaseShape(const StoredFiber& fiber) const;
     void retainStoredFiberCoordinateBaseShape(StoredFiber& fiber) const;
-    [[nodiscard]] std::optional<std::array<std::size_t, 3>>
-        fiberManifestBaseShape(const std::string& location) const;
     [[nodiscard]] std::filesystem::path relativeFiberPath(const StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path currentVolpkgRoot() const;
     [[nodiscard]] std::vector<std::string> atlasPathKeysForFiber(const StoredFiber& fiber) const;
@@ -1382,11 +1368,6 @@ private:
         _sideStripStoredSnapshotCache;
     mutable std::unordered_map<uint64_t, SideStripSnapshotCacheEntry>
         _sideStripSessionSnapshotCache;
-    // Resolved manifest location -> base_shape_zyx. Opening a fiber session
-    // re-reads the manifest otherwise; successes only, so a failed (moved or
-    // remote) location is retried next time.
-    mutable std::unordered_map<std::string, std::array<std::size_t, 3>>
-        _fiberManifestBaseShapeCache;
     // See cachedControlSpansForFiber: keyed by fiber id, valid while the
     // fiber's save generation and the package generation match.
     struct ControlSpanCacheEntry {

@@ -450,7 +450,10 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
                     emit patchEditorRequested(id, path);
                 } else if (kind == QStringLiteral("fiber") && _lineAnnotationController) {
                     const auto fiber = _lineAnnotationController->fiberIdForFilePath(path.toStdString());
-                    if (fiber) _lineAnnotationController->openFiber(fiber);
+                    if (fiber) {
+                        stageFiberInputs({fiber});
+                        _lineAnnotationController->openFiber(fiber);
+                    }
                     else statusBar()->showMessage(tr("This service fiber is not in the attached object store."), 15000);
                 } else if (kind == QStringLiteral("pcl")) {
                     const auto role = vc3d::spiral::pclRoleFromName(input.value(QStringLiteral("role")).toString());
@@ -1442,6 +1445,7 @@ void SpiralWorkspace::finalizeLineAnnotationDraft()
                 return;
             }
             self->cancelLineAnnotationDraft();
+            self->stageFiberInputs({fiberId});
             if (self->_lineAnnotationController)
                 self->_lineAnnotationController->openFiber(fiberId);
             self->statusBar()->showMessage(
@@ -1467,19 +1471,25 @@ void SpiralWorkspace::addPatchToCurrentFit(
 
 void SpiralWorkspace::addFibersToCurrentFit(const std::vector<uint64_t>& fiberIds)
 {
-    if (!_service || !_lineAnnotationController || fiberIds.empty()) return;
+    if (stageFiberInputs(fiberIds)) _service->applyInputDrafts();
+}
+
+bool SpiralWorkspace::stageFiberInputs(const std::vector<uint64_t>& fiberIds)
+{
+    if (!_service || !_lineAnnotationController || fiberIds.empty()) return false;
     try {
         const auto paths = _lineAnnotationController->fiberTransportPaths(fiberIds);
         for (const auto& [uuid, path] : paths) {
             const auto id = QString::fromStdString(uuid);
             const auto source = QString::fromStdString(path.string());
+            if (_trackedFiberPaths.value(id) == source) continue;
             _trackedFiberPaths[id] = source;
             _service->stageJsonInput(QStringLiteral("fiber"), source, id);
         }
-        // All linked endpoints are staged before applying the input set.
-        _service->applyInputDrafts();
+        return true;
     } catch (const std::exception& error) {
         statusBar()->showMessage(QString::fromUtf8(error.what()), 15000);
+        return false;
     }
 }
 
@@ -1492,18 +1502,7 @@ void SpiralWorkspace::refreshTrackedFibers()
         if (id) ids.push_back(id);
         else noteFiberRetired(uuid);
     }
-    if (ids.empty()) return;
-    try {
-        for (const auto& [uuid, path] : _lineAnnotationController->fiberTransportPaths(ids)) {
-            const auto id = QString::fromStdString(uuid);
-            const auto source = QString::fromStdString(path.string());
-            if (_trackedFiberPaths.value(id) == source) continue;
-            _trackedFiberPaths[id] = source;
-            _service->stageJsonInput(QStringLiteral("fiber"), source, id);
-        }
-    } catch (const std::exception& error) {
-        statusBar()->showMessage(QString::fromUtf8(error.what()), 15000);
-    }
+    stageFiberInputs(ids);
 }
 
 void SpiralWorkspace::noteFiberRetired(const QString& objectUuid)

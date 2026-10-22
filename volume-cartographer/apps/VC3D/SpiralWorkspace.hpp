@@ -64,6 +64,7 @@ public:
     void addPatchToCurrentFit(const QString& tifxyzDirectory,
                               const std::shared_ptr<QuadSurface>& surface = {});
     void addFibersToCurrentFit(const std::vector<uint64_t>& fiberIds);
+    bool stageFiberInputs(const std::vector<uint64_t>& fiberIds);
     void refreshTrackedFibers();
     void noteFiberRetired(const QString& objectUuid);
     bool stageManagedPatchRemoval(const std::shared_ptr<QuadSurface>& surface);

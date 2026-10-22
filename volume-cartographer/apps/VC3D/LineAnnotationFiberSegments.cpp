@@ -1394,11 +1394,8 @@ FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json
         "meeting_error_base_voxels", "meeting_error_ratio",
         "meeting_source", "failure_code", "failure_detail",
         "lasagna_failure_code", "lasagna_failure_detail", "config"};
-    // Span tags arrived with format version 4; a version-3 span carrying
-    // them is an unknown field, so the version stays a true signal.
-    if (fiberVersion >= 4) {
-        segmentKeys.insert("tags");
-    }
+    if (fiberVersion != 4) throw std::runtime_error("Fiber transfer requires version 4");
+    segmentKeys.insert("tags");
     rejectUnknownKeys(json, segmentKeys, "segment_to_next");
 
     FiberTraceSegmentMetadata metadata;
@@ -2085,11 +2082,8 @@ nlohmann::json storedControlPointToJson(const StoredControlPoint& control)
 
 StoredControlPoint storedControlPointFromJson(const nlohmann::json& json, int fiberVersion)
 {
-    if (fiberVersion == 1) {
-        return StoredControlPoint{pointFromJson(json)};
-    }
-    if ((fiberVersion != 3 && fiberVersion != 4) || !json.is_object()) {
-        throw std::runtime_error("version-3/4 control point entries must be objects");
+    if (fiberVersion != 4 || !json.is_object()) {
+        throw std::runtime_error("version-4 control point entries must be objects");
     }
     rejectUnknownKeys(json, {"position", "segment_to_next", "tags", "display_normal", "display_normal_source", "direction"}, "control point");
     StoredControlPoint control{pointFromJson(json.at("position"))};

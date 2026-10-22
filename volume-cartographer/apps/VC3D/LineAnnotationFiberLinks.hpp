@@ -5,8 +5,7 @@
 // and the loader's link validation can share ONE definition of "these two
 // link entries agree" and be unit-tested without the controller.
 //
-// Numeric contract (mirrored by scripts/fiber_merge.py's loader port; do not
-// change without changing both): positions agree within 1e-6, directions
+// Numeric contract: positions agree within 1e-6, directions
 // agree when |dot| is within 1e-5 of 1, the tangent at a control point is the
 // forward difference at its nearest line point.
 
@@ -297,22 +296,14 @@ void canonicalizeFiberSaveSnapshots(std::vector<Snapshot>& snapshots)
 template<class Snapshot>
 void validateFiberSaveSnapshots(const std::vector<Snapshot>& snapshots)
 {
-    // Geometry guard for every snapshot, linked or not: the v3 loader (and
+    // Geometry guard for every snapshot, linked or not: the traced-fiber loader (and
     // split/merge planning) requires control points to be an exact ordered
     // subset of line_points. A violation here means a session was serialized
     // before its geometry was finalized by a solve; writing it would produce
     // a fiber that fails to load. Refuse the save instead.
     for (const auto& snapshot : snapshots) {
-        if (snapshot.fiber.controlPoints.empty()) {
+        if (snapshot.fiber.controlPoints.empty() || snapshot.fiber.linePoints.empty()) {
             continue;
-        }
-        if (snapshot.fiber.linePoints.empty()) {
-            // Control points with no line at all cannot satisfy the subset
-            // contract either; the loader would reject the file.
-            throw std::runtime_error(
-                fiberErrorName(snapshot.fiber.fileName) +
-                ": control points present but line_points is empty; the "
-                "fiber was not finalized before saving");
         }
         if (!orderedControlPointLineIndices(
                 storedControlPointPositions(snapshot.fiber.controlPoints),

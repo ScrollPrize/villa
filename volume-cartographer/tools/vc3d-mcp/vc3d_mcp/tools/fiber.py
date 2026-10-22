@@ -76,7 +76,7 @@ async def vc3d_fiber_launch(
 
 @mcp.tool()
 async def vc3d_fiber_list() -> dict[str, Any]:
-    """List saved fibers of the open volume package: fiberId (string), name,
+    """List fibers of the attached object store: fiberId (string), name,
     control/line point counts, length, automatic/manual HV tags, tags, and
     per-span summaries; plus knownTags (every tag in use)."""
     return await _call("fiber.list", {})
@@ -174,6 +174,7 @@ async def vc3d_fiber_import(path: str) -> dict[str, Any]:
     """Import fibers from `path`: a single vc3d_fiber JSON, a
     vc3d_fiber_collection bundle, or a directory of fiber JSONs (headless; no
     dialog). Coordinates and grid shapes are preserved. Imported fibers are
-    saved into the package's fibers directory and the fiber list reloads.
+    committed to the attached writable object store. Only version-4 fibers with
+    explicit UUIDs are accepted; the fiber list reloads after the transaction.
     Returns {"imported", "skipped"}."""
     return await _call("fiber.import", {"path": path})

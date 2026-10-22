@@ -114,6 +114,10 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
             return std::nullopt;
         }
     }
+    if (clicked.coordinateIdentity != far.coordinateIdentity) {
+        fail(error, "Cannot merge fibers from different coordinate frames");
+        return std::nullopt;
+    }
     if (clicked.coordinateBaseShapeZYX != far.coordinateBaseShapeZYX) {
         fail(error, "Cannot merge: the fibers are stored in different coordinate domains.");
         return std::nullopt;
@@ -184,6 +188,7 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
     merged.hvClassification =
         classifyFiberHv(storedControlPointPositions(merged.controlPoints));
     merged.coordinateBaseShapeZYX = clicked.coordinateBaseShapeZYX;
+    merged.coordinateIdentity = clicked.coordinateIdentity;
     // Third-party links only: the pair link between the merge endpoints is
     // consumed, and other mutual links were rejected above. Directions are
     // left as stored; the batch canonicalization recomputes them from the
@@ -237,6 +242,7 @@ std::optional<SplitPlanResult> planFiberSplit(const StoredFiber& parent,
         half.optimizationMode = parent.optimizationMode;
         half.modelOnly = parent.modelOnly;
         half.coordinateBaseShapeZYX = parent.coordinateBaseShapeZYX;
+        half.coordinateIdentity = parent.coordinateIdentity;
     };
     StoredFiber& prefix = result.prefix;
     StoredFiber& suffix = result.suffix;

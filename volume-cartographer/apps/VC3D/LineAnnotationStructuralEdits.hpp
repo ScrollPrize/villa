@@ -31,8 +31,7 @@
 namespace vc3d::line_annotation {
 
 // Set on a fiber whose line was assembled from pieces (merge join span,
-// split halves without their extrapolation tails) and awaits a re-fit; the
-// literal is duplicated in scripts/fiber_merge.py (REOPTIMIZE_TAG).
+// split halves without their extrapolation tails) and awaits a re-fit.
 inline constexpr const char* kNeedsReoptimizationTag = "needs_reoptimization";
 
 // Identity of a fiber the edit creates: allocated by the controller (runtime

@@ -25,16 +25,20 @@ FiberDocument decodeFiberJson(const std::string& text)
 {
     auto root = Json::parse(text);
     if (root.value("type", "") != "vc3d_fiber") throw std::runtime_error("expected vc3d_fiber JSON");
+    if (root.value("version", int64_t(0)) != 4)
+        throw std::runtime_error("Fiber transfer requires version 4");
     FiberDocument p;
     p.object.uuid = util::canonicalUuid(root.at("uuid").get<std::string>());
     p.object.kind = "fiber";
     p.object.name = root.value("name", std::string{});
-    p.object.formatVersion = root.value("version", int64_t(1));
+    p.object.formatVersion = 4;
     p.object.tags = root.value("tags", std::vector<std::string>{});
     for (const char* key : {"control_points", "line_points"}) {
         if (!root.contains(key)) continue;
         if (!root.at(key).is_array()) throw std::runtime_error("invalid fiber point array");
         for (const auto& entry : root.at(key)) {
+            if (std::string_view(key) == "control_points" && !entry.is_object())
+                throw std::runtime_error("Fiber control points require position objects");
             const auto& xyz = entry.is_object() ? entry.at("position") : entry;
             if (!xyz.is_array() || xyz.size() != 3) throw std::runtime_error("fiber points require exactly three XYZ coordinates");
         }
@@ -75,6 +79,7 @@ std::string encodeFiberJson(const std::string& uuid, const GeometryData& data,
     auto attributes = Json::parse(source);
     attributes["uuid"] = uuid;
     attributes["type"] = "vc3d_fiber";
+    attributes["version"] = 4;
     for (const auto* name : {"control_points", "line_points"}) {
         const auto& values = std::string_view(name) == "control_points" ? geometry.controlPoints : geometry.linePoints;
         const auto key = std::string(name) + "_attributes";
@@ -88,7 +93,7 @@ std::string encodeFiberJson(const std::string& uuid, const GeometryData& data,
                 throw std::runtime_error("invalid " + key);
             Json xyz = values[i];
             if ((!extras.is_null() && extras[i].is_object()) ||
-                (std::string_view(name) == "control_points" && attributes.value("version", 1) >= 3)) {
+                std::string_view(name) == "control_points") {
                 auto entry = !extras.is_null() && extras[i].is_object() ? extras[i] : Json::object();
                 entry["position"] = std::move(xyz); points.push_back(std::move(entry));
             } else points.push_back(std::move(xyz));
@@ -110,7 +115,7 @@ std::string fiberRevisionJson(const ObjectStore& db,const Txn& txn,const std::st
         else source.erase(key);
     }
     source.erase("branches"); source.erase("adjacent_branches");
-    source["version"]=revision->record.formatVersion;
+    source["version"]=4;
     source["tags"]=revision->record.tags;
     if(revision->record.fiber) {
         source["width"]=revision->record.fiber->width;

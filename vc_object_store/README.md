@@ -27,11 +27,15 @@ The object store can be used in place of tifxyz files, fiber jsons, track crossi
 The db has fast spatial queries through a persisted r-tree backed index with optional in-memory views for repeated queries. 
 
 The C++ `ObjectStoreSession` accepts writable or read-only attachments. Read-only
-sessions reject actions before invoking their callbacks. `publishFiberEdits` in
-`objects/FiberEdit.hpp` publishes typed fiber geometry, tracing annotations,
-shared branches and retirement atomically, with explicit revision expectations.
-It returns committed pins and stable control/edge IDs; rejected edits leave the
-caller's payload unchanged. VC3D uses this API for fiber persistence.
+sessions reject actions before invoking their callbacks. VC3D calls the database's
+object, geometry, relationship and retirement APIs directly inside `act`, with
+explicit revision expectations. A split creates two objects and retires the
+original in one transaction. No fiber-specific or generic edit publisher is
+required. The database owns revision history and synchronization.
+
+Fiber JSON is an explicit transfer format: readers require version 4 and UUIDs.
+Typed database geometry exports in that format, including control-only fibers.
+There is no old-format migration or compatibility reader.
 
 ## Use
 

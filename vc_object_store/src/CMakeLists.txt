@@ -26,7 +26,6 @@ add_library(vc_objects STATIC
     Queries.cpp
     Spatial.cpp
     FiberRegion.cpp
-    FiberEdit.cpp
     sync/Synchronize.cpp
     sync/GeometryTransfer.cpp
     geometry/GeometryViews.cpp

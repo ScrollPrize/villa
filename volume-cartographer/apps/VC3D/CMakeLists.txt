@@ -291,8 +291,6 @@ set(srcs
     CPointCollectionWidget.cpp
     CFiberWidget.cpp
     CFiberWidget.hpp
-    FiberAnnotationController.cpp
-    FiberAnnotationController.hpp
     elements/COutlinedTextItem.hpp
     elements/COutlinedTextItem.cpp
     volume_viewers/CChunkedVolumeViewer.cpp

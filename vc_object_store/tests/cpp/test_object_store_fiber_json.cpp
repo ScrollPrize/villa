@@ -14,6 +14,18 @@ int main() try {
                                       Json{{"position",{5.25,2,3}}}})},
         {"line_points",{{1.25,2,3},{5.25,2,3}}}, {"hv_classification",{{"manual_tag","H"}}}};
     const auto doc = decodeFiberJson(root.dump());
+    for (const int version : {1, 2, 3}) {
+        auto legacy = root; legacy["version"] = version;
+        mustFail([&] { decodeFiberJson(legacy.dump()); });
+    }
+    auto versionless = root; versionless.erase("version");
+    mustFail([&] { decodeFiberJson(versionless.dump()); });
+    auto oldControls = root; oldControls["control_points"] = {{1.25,2,3},{5.25,2,3}};
+    mustFail([&] { decodeFiberJson(oldControls.dump()); });
+    const auto controlOnlyGeometry = vc::geometry::encode(vc::geometry::Fiber{{{1,2,3},{4,5,6}}, {}});
+    const auto controlOnly = decodeFiberJson(encodeFiberJson(uuid, controlOnlyGeometry, "{}"));
+    require(controlOnly.object.formatVersion == 4 && controlOnly.object.fiber->linePointCount == 0,
+            "typed control-only geometry exports current transfer format");
     require(doc.object.uuid == uuid && doc.object.fiber->length == 4, "native summaries");
     require(doc.object.fiber->family == "H" && doc.object.tags == std::vector<std::string>{"reviewed"}, "native metadata");
     const auto source = Json::parse(doc.source);

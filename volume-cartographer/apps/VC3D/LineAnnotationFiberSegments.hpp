@@ -250,9 +250,8 @@ struct StoredControlPoint : cv::Vec3d {
     explicit StoredControlPoint(const cv::Vec3d& position) : cv::Vec3d(position) {}
 };
 
-// Ordinary free-form fiber tag carrying the human review verdict; also the
-// default publish gate of scripts/vc_sync.py hfsync — keep the literal in
-// sync. A toolbar interpolation-mode switch strips it on the save after a
+// Ordinary free-form fiber tag carrying the human review verdict.
+// A toolbar interpolation-mode switch strips it on the save after a
 // successful re-optimization; nothing else touches it programmatically.
 inline constexpr const char* kReviewedTag = "reviewed";
 
@@ -553,8 +552,7 @@ struct FiberModeOptimizationResult {
     FiberModeOptimizationRequest request);
 
 [[nodiscard]] nlohmann::json fiberTraceSegmentMetadataToJson(const FiberTraceSegmentMetadata& metadata);
-// fiberVersion: the file's vc3d_fiber version; span tags are accepted from
-// version 4 on and rejected as an unknown field before that.
+// Only the current fiber transfer format (version 4) is accepted.
 [[nodiscard]] FiberTraceSegmentMetadata fiberTraceSegmentMetadataFromJson(const nlohmann::json& json,
                                                                           int fiberVersion = kFiberFormatVersion);
 [[nodiscard]] nlohmann::json storedControlPointToJson(const StoredControlPoint& control);
