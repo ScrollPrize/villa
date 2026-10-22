@@ -1817,22 +1817,21 @@ def _aggregate_dt_track_losses(track_losses, across_p):
 def _build_track_flat_bundle(tracks, device):
     if isinstance(tracks, PackedTrackCollection):
         valid_np = np.flatnonzero(tracks.selected_lengths >= 2)
+        if valid_np.size == 0:
+            return None, valid_np
+        valid_tracks = tracks if len(valid_np) == len(tracks) else tracks.subset(valid_np)
+        zyxs_flat, starts_np = valid_tracks.materialize()
+        zyxs_flat = np.asarray(zyxs_flat[starts_np[0]:starts_np[-1]], dtype=np.float32)
+        # May alias tracks.coordinates (identity materialize), so forbid writes through it.
+        zyxs_flat.flags.writeable = False
+        starts_np = starts_np - starts_np[0]
     else:
         valid_np = np.fromiter(
             (i for i, track in enumerate(tracks) if len(track) >= 2), dtype=np.int64)
-    if valid_np.size == 0:
-        return None, valid_np
-
-    if isinstance(tracks, PackedTrackCollection):
-        valid_tracks = tracks if len(valid_np) == len(tracks) else tracks.subset(valid_np)
-        zyxs_flat, starts_np = valid_tracks.materialize()
-        # May alias tracks.coordinates (identity materialize); treat zyxs_flat as read-only.
-        zyxs_flat = np.asarray(zyxs_flat[starts_np[0]:starts_np[-1]], dtype=np.float32)
-        starts_np = starts_np - starts_np[0]
-    else:
+        if valid_np.size == 0:
+            return None, valid_np
         zyxs_flat, starts_np = _flatten_tracks([tracks[i] for i in valid_np])
     lengths_np = np.diff(starts_np)
-    total = int(starts_np[-1])
 
     strip_id_np = np.repeat(np.arange(len(lengths_np), dtype=np.int64), lengths_np)
     flat = {
@@ -1841,7 +1840,6 @@ def _build_track_flat_bundle(tracks, device):
         'starts': torch.from_numpy(starts_np).to(device=device),
         'lengths': torch.from_numpy(lengths_np).to(device=device),
         'lengths_cpu': torch.from_numpy(lengths_np),
-        'total': total,
     }
     return flat, valid_np
 
@@ -1867,24 +1865,21 @@ def _build_track_spiral_context(slice_to_spiral_transform, dr_per_winding, flat,
     starts = flat['starts']
     lengths = flat['lengths']
     lengths_cpu = flat['lengths_cpu']
-    total = flat['total']
 
     with torch.no_grad():
         spiral_zyxs = transform_in_chunks(zyxs, slice_to_spiral_transform)
         theta, _, shifted_radii = get_theta_and_radii(spiral_zyxs[..., 1:], dr_per_winding)
 
-        if total > 1:
-            same_track = track_id[1:] == track_id[:-1]
-            step_adj = get_theta_crossing_step_adjustments(theta, dr)
-            step_adj = torch.where(same_track, step_adj, torch.zeros_like(step_adj))
-            cumsum_inner = torch.cumsum(step_adj, dim=0)
-            cumsum_flat = torch.cat([
-                torch.zeros(1, device=device, dtype=cumsum_inner.dtype),
-                cumsum_inner,
-            ], dim=0)
-            adjustments = cumsum_flat - cumsum_flat[starts[:-1][track_id]]
-        else:
-            adjustments = torch.zeros_like(shifted_radii)
+        # Every track has >= 2 points, so there is always at least one step.
+        same_track = track_id[1:] == track_id[:-1]
+        step_adj = get_theta_crossing_step_adjustments(theta, dr)
+        step_adj = torch.where(same_track, step_adj, torch.zeros_like(step_adj))
+        cumsum_inner = torch.cumsum(step_adj, dim=0)
+        cumsum_flat = torch.cat([
+            torch.zeros(1, device=device, dtype=cumsum_inner.dtype),
+            cumsum_inner,
+        ], dim=0)
+        adjustments = cumsum_flat - cumsum_flat[starts[:-1][track_id]]
         unwrapped_shifted = shifted_radii + adjustments
 
     return {
@@ -1964,20 +1959,20 @@ def _track_satisfaction_from_target(ctx, target_normalised_per_track, return_per
         # Only points already in the spiral band can be satisfied, so the
         # inverse transform (the expensive part) is run on those alone.
         in_band = torch.nonzero(spiral_in_band, as_tuple=True)[0]
-        theta_b = theta[in_band]
-        target_radii = radius_from_unwrapped_shifted(
-            theta_b, target_shifted[in_band], adjustments[in_band], dr,
-        )
-        target_spiral_zyxs = torch.stack([
-            spiral_zyxs[in_band, 0],
-            torch.sin(theta_b) * target_radii,
-            torch.cos(theta_b) * target_radii,
-        ], dim=-1)
-        target_scroll_zyxs = transform_in_chunks(target_spiral_zyxs, slice_to_spiral_transform.inv)
-        scan_distances = torch.linalg.norm(target_scroll_zyxs - zyxs[in_band], dim=-1)
-
         satisfied = torch.zeros_like(spiral_in_band)
-        satisfied[in_band] = scan_distances <= scan_tolerance
+        if in_band.numel() > 0:
+            theta_b = theta[in_band]
+            target_radii = radius_from_unwrapped_shifted(
+                theta_b, target_shifted[in_band], adjustments[in_band], dr,
+            )
+            target_spiral_zyxs = torch.stack([
+                spiral_zyxs[in_band, 0],
+                torch.sin(theta_b) * target_radii,
+                torch.cos(theta_b) * target_radii,
+            ], dim=-1)
+            target_scroll_zyxs = transform_in_chunks(target_spiral_zyxs, slice_to_spiral_transform.inv)
+            scan_distances = torch.linalg.norm(target_scroll_zyxs - zyxs[in_band], dim=-1)
+            satisfied[in_band] = scan_distances <= scan_tolerance
         satisfied_counts_dev = torch.zeros(num_tracks, dtype=torch.int64, device=device)
         satisfied_counts_dev.scatter_add_(0, track_id, satisfied.to(torch.int64))
         satisfied_counts = satisfied_counts_dev.cpu()
@@ -1991,14 +1986,10 @@ def get_track_satisfied_counts(slice_to_spiral_transform, dr_per_winding, tracks
                                return_per_point=True):
     # With return_per_point=False the per-point satisfaction slot is None.
     device = dr_per_winding.device
-    if not tracks:
-        empty = torch.zeros(0, dtype=torch.int64)
-        return empty, empty, empty, [], empty
-
-    flat, valid_np = _build_track_flat_bundle(tracks, device)
+    flat, valid_np = _build_track_flat_bundle(tracks, device) if tracks else (None, None)
     if flat is None:
         empty = torch.zeros(0, dtype=torch.int64)
-        return empty, empty, empty, [], empty
+        return empty, empty, empty, ([] if return_per_point else None), empty
 
     num_tracks = len(valid_np)
     ctx = _build_track_spiral_context(
