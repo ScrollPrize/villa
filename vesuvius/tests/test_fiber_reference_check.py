@@ -10,7 +10,7 @@ def fixture():
              source_id=np.arange(4),family=np.array([0,1,0,1]),direction=np.ones(4),
              a=np.array([0]),b=np.array([0]),events=np.array([0]))
     metrics={f:{k:dict(mean=0.,p95=0.,max=0.) for k in ('length_percent','angle_degrees')} for f in ('H','V')}
-    meta=dict(v_tolerance_vx=1.,affine_tolerance=.1,
+    meta=dict(v_tolerance_vx=1.,affine_tolerance=.1,winding_tolerance=.1,meeting_tolerance_vx=1.,
               limits={f:{k:dict(mean=1.,p95=1.,max=1.) for k in ('length_percent','angle_degrees')} for f in ('H','V')})
     for f in metrics:metrics[f]['reversals']=0
     c={k:v for k,v in ref.items() if k not in ('consensus','scale')}
@@ -42,6 +42,13 @@ def test_small_global_distortion_allowed_large_scale_rejected():
     assert evaluate(c,r,m)['passed']
     c['layers']['bucket']*=2
     assert not evaluate(c,r,m)['checks']['global_distortion']
+
+
+def test_tolerances_come_from_reference_metadata():
+    c,r,m=fixture();c['layers']['bucket'][:3,0]+=.3
+    assert not evaluate(c,r,m)['checks']['winding']
+    m['winding_tolerance']=.4
+    assert evaluate(c,r,m)['checks']['winding']
 
 
 def test_explicit_exclusion_does_not_influence_alignment_or_confidence():

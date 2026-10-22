@@ -167,6 +167,9 @@ def run(config):
     if 'fiber_density_sign_report' in config:
         from .fiber_density_sign_report import run as run_sign_report
         return run_sign_report(config['fiber_density_sign_report'])
+    if 'fiber_sign_rejection_report' in config:
+        from .fiber_sign_rejection_report import run as rejection_report
+        return rejection_report(config['fiber_sign_rejection_report'])
     if 'fiber_implicit_match_report' in config:
         from .fiber_implicit_match_report import run as run_implicit_report
         return run_implicit_report(config['fiber_implicit_match_report'])

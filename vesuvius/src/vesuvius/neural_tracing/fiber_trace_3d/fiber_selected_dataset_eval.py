@@ -21,13 +21,13 @@ def remap_events(events,d):
 
 
 def initialization_config(template, config, output, initial=None):
-    """Reuse historical stage hyperparameters, never its data/state/provenance."""
+    """Reuse caller-supplied stage hyperparameters, never its data/state/provenance."""
     result={k:v for k,v in template.items() if not (
         k.startswith(('reference_', 'fixed_reference', 'executed_')) or
         k.endswith('_sha256') or k in ('code_provenance','initial_solution','soft_samples'))}
     for key in ('tensor_cache','afv','umbilicus','devices','gpu_manager','layout_mode','filter_constraint_families'):
         result[key]=config[key]
-    result.update(output_root=str(output),log_every=100)
+    result.update(output_root=str(output))
     if initial is not None:result['initial_solution']=str(initial)
     return result
 
@@ -133,7 +133,7 @@ def run(settings):
         if key.startswith('reference_') or key.startswith('fixed_reference'):
             config.pop(key)
     config.update(tensor_cache=str(root/'tensors.npz'),output_root=str(root/'solve'),
-        initial_solution=str(root/'init/solution.npz'),devices=settings.get('devices','0'),log_every=100,
+        initial_solution=str(root/'init/solution.npz'),devices=settings.get('devices',config.get('devices','0')),
         layout_mode='shared_anchor',filter_constraint_families=True)
     config['gpu_manager']=dict(config['gpu_manager'],label='selected-dataset-gt-free')
     # Only radial geometry, no candidate supervised solution or fitted widths.
@@ -194,7 +194,7 @@ def run(settings):
             raise ValueError('Initialization identity mismatch')
         stages.append(dict(model=stage['model'],final=stage_summary['final'],solution_sha256=sha256_file(previous)))
     if previous is not None:config['initial_solution']=str(previous)
-    initialization=('soft -> sigma0.5 density -> tuned density; reset Adam per stage' if stages else
+    initialization=(' -> '.join(stage['model'] for stage in stages)+' -> fiber_implicit_winding; fresh optimizer per stage' if stages else
                     'fresh radial; scaled joint L-BFGS' if config.get('optimizer_kind')=='scaled_lbfgs' else
                     'fresh radial; reset Adam')
     atomic_write(root/'solve_config.json',{'fiber_implicit_winding':config},durable=False)

@@ -6,6 +6,16 @@ import pytest
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_gt_inpainting import score_cohorts
 
 
+def test_deformation_settings_are_caller_supplied(tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_gt_inpainting import deformation_config
+    solved=dict(output_root='prior',lr=.07,event_offset_anchor_weight=3,steps=42)
+    settings=dict(deformation_parameters={'event_offset_anchor_weight':.4,'event_offset_merge_distance':0})
+    cfg=deformation_config(solved,settings,tmp_path)
+    assert cfg['event_offset_anchor_weight']==.4
+    assert cfg['event_offset_merge_distance']==0
+    assert cfg['lr']==.07 and cfg['steps']==42
+
+
 @pytest.mark.parametrize('parallel', [True, False])
 @pytest.mark.parametrize('enabled', [True, False])
 def test_empty_and_rejected_cohorts(parallel, enabled):

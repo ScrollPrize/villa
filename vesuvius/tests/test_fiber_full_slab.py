@@ -1,5 +1,24 @@
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_full_slab import clean_config
 import numpy as np
+import pytest
+
+
+@pytest.mark.parametrize('scale',[0,-1,float('inf'),float('nan')])
+def test_reference_scale_rejects_invalid_units(scale):
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_full_slab import reference_scale
+    with pytest.raises(ValueError):reference_scale({'reference_xyz_scale':scale})
+
+
+def test_reference_scale_is_explicit_and_preserved():
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_full_slab import reference_scale
+    with pytest.raises(KeyError):reference_scale({})
+    assert reference_scale({'reference_xyz_scale':2.5})==2.5
+
+
+def test_projection_workflows_reject_missing_scale_before_io():
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_anchored_dataset as anchored, fiber_full_slab as slab
+    for run in (anchored.run,slab.run,slab.run_progress,slab.run_soft_trial):
+        with pytest.raises(KeyError,match='reference_xyz_scale'):run({})
 
 
 def test_no_inherited_gt_or_initialization():
@@ -18,14 +37,14 @@ def test_density_reference_metric_uses_map_not_legacy_logits(monkeypatch):
     sol=dict(state=np.array([[0.,.2,0.,4.],[1.,.2,0.,4.]]),widths=np.full(4,100.))
     sample=dict(owner=np.array([0,0,1,1]),arc=np.array([0.,1.,0.,1.]),
                 weight=np.full(4,.5),offset=np.array([0,2,4]),chosen_winding=np.array([10.,11.]))
-    result=reference_metrics(d,sol,{},sample,'/unused')
+    result=reference_metrics(d,sol,{},sample,'/unused',xyz_scale=1)
     assert result['global_offset']==10
     assert result['mean_absolute_winding_error']==0
     assert result['within_two_windings_percent']==100
     assert result['occupied_anchor_widths']['mean_normalized_factor']==1
     sol['state'][0,0]=.4
-    continuous=reference_metrics(d,sol,{},sample,'/unused',continuous=True)
-    mapped=reference_metrics(d,sol,{},sample,'/unused')
+    continuous=reference_metrics(d,sol,{},sample,'/unused',xyz_scale=1,continuous=True)
+    mapped=reference_metrics(d,sol,{},sample,'/unused',xyz_scale=1)
     assert mapped['mean_absolute_winding_error']==0
     assert continuous['mean_absolute_winding_error']==.5
 
@@ -34,7 +53,7 @@ def test_soft_trial_preserves_init_and_only_changes_requested_settings():
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_full_slab import soft_trial_config
     original=dict(initial_solution='init',soft_samples='samples',tensor_cache='tensors',
         tensor_sha256='t',samples_sha256='s',gpu_manager={'exclusive':False,'cpu_cores':4},
-        lr=.07348469228349533,rejection_cost=20,width_prior=0,width_smooth=.01,
+        lr=.02,rejection_cost=20,width_prior=0,width_smooth=.01,
         cavity_winding_sigma=True,winding_sigma=.5,soft_pair_weight=1,probability_pair_weight=.3,
         sign_violation_weight=30,steps=1000,batch_size=32768)
     cfg=soft_trial_config(original,dict(output_root='out',devices='2',width_lr=200))

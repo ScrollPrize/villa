@@ -118,8 +118,6 @@ def run_density(settings):
 
     root = Path(settings['output_root']); root.mkdir(parents=True, exist_ok=True)
     base = json.loads(Path(settings['base_config']).read_text())['fiber_implicit_winding']
-    if base.get('learned_winding_sigma') or base.get('v_offset_match_weight') or base.get('u_offset_match_weight'):
-        raise ValueError('Density search requires fixed sigma and no endpoint offsets')
     initial = {name: float(base[name]) for name in settings['weights']}
     if not all(math.isfinite(v) and v > 0 for v in initial.values()):
         raise ValueError('Positive finite baseline weights required')
@@ -154,7 +152,7 @@ def run_density(settings):
         if row['key']!=configuration_key(row['weights']) or row['key']!=trial.name:
             raise ValueError('Cached trial key mismatch')
         summary=json.loads((trial/'summary.json').read_text())
-        expected=dict(base,**row['weights'],output_root=str(trial),log_every=1000)
+        expected=dict(base,**row['weights'],output_root=str(trial))
         for name,value in expected.items():
             if name not in ('devices','gpu_manager') and summary['config'].get(name)!=value:
                 raise ValueError('Cached trial configuration mismatch: '+name)
@@ -172,7 +170,7 @@ def run_density(settings):
         device=lanes.get()
         try:
             trial=root/'trials'/key; trial.mkdir(parents=True,exist_ok=True)
-            child=dict(base,**values,devices=device,output_root=str(trial),log_every=1000)
+            child=dict(base,**values,devices=device,output_root=str(trial))
             child['gpu_manager']=dict(base['gpu_manager'],exclusive=False,label='density-search-'+key)
             config_path=trial/'input.json'
             atomic_write(config_path,{'fiber_implicit_winding':child},durable=False)

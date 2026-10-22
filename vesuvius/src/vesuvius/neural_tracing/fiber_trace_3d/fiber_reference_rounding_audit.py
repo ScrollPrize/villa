@@ -51,8 +51,7 @@ def run(settings):
     for spec in settings['solves']:
         root=Path(spec['root']);cfg=read(root/'solve/config.json')
         sol=arrays(root/'solve/solution.npz');d=arrays(cfg['tensor_cache'])
-        event_path=root/'gt_events.json'
-        if not event_path.exists():event_path=root.parent/'free/gt_events.json'
+        event_path=Path(spec.get('events',root/'gt_events.json'))
         events=remap_events(read(event_path),d)
         for field in ('source_id','start','end','family'):
             if not np.array_equal(sol[field],d[field]):raise ValueError('Solution identity mismatch')
@@ -110,7 +109,7 @@ def run(settings):
             for name,mask in [('perpendicular',~par),('parallel',par)]}
         row=dict(name=spec['name'],root=str(root),original=original,comparison=results,
             matched_events=len(ev),enabled_matched_events=int(en.sum()),flow_total_events=len(flow),
-            gt7_events=sum(e['gt_source']==7 for e in events),
+            excluded_reference_events=sum(e['gt_source'] not in offsets for e in events),
             definition='Enabled mask unchanged; one global integer gauge. Continuous plus rounded residual diagnostic; integer endpoint chart uses flow seam/targets. No re-solving.')
         rows.append(row)
         for p in (root/'solve/solution.npz',root/'solve/config.json',event_path,flowroot/'gt_events.csv',flowroot/'metrics.json'):
@@ -122,8 +121,9 @@ def run(settings):
         print(spec['name'],json.dumps({k:v['rows']['perpendicular'] for k,v in results.items() if 'rows' in v}),flush=True)
     atomic_write(out/'results.json',dict(results=rows,hashes=hashes),durable=False)
     report=['# Saved-solution reference and rounding audit','',
-        'No solves or enabled masks changed. Original full-event scores are reproduced before changing protocols. Comparisons exclude GT7 and use events present in both datasets, matched by source IDs and endpoint arc lengths (event IDs differ across datasets). Earlier 6/0 runs have a smaller cohort; do not compare raw counts across cohorts.', '',
-        'Old fitted reference: bbox_gt_solve_v3/uv_whole/solution.npz. Enclosure reference: gt_winding_reference.json, GT1–6 offsets 9,0,4,3,5,7; GT7 excluded.', '',
+        'No solves or enabled masks changed. Original full-event scores are reproduced before changing protocols. Comparisons use reference IDs provided in the offset map and events present in both datasets, matched by source IDs and endpoint arc lengths. Compare counts only on matching cohorts.', '',
+        'Fitted reference: '+str(gt/'uv_whole/solution.npz')+'. Alternative reference: '+str(settings['reference'])+'.', '',
+        'Reference fiber offsets: '+json.dumps(offsets,sort_keys=True)+'.', '',
         'Continuous uses the existing continuous measured-distance target. Integer uses endpoint quantization floor(q+0.25) in the min-flow seam chart, its measured integer target and connector seam crossings. This is not merely rounding residuals and is not a re-solved integer assignment. Each protocol uses one global integer alignment, never per-component alignment. Correct means residual rounds to zero; sign checks use continuous half-turn leeway or integer topology respectively.', '',
         '|Solution|Reference/protocol|Class|Events|L1|Correct %|Sign errors|Sign %|Max|',
         '|---|---|---|---:|---:|---:|---:|---:|---:|']
@@ -134,7 +134,7 @@ def run(settings):
                 r=result['rows'][kind]
                 report.append(f"|{row['name']}|{protocol}|{kind}|{r['events']}|{r['l1']:.3f}|{r['correct_percent']:.2f}|{r['sign_errors']}|{r['sign_percent']:.2f}|{r['max_abs']:.3f}|")
     report+=['','## Min-flow on each solution’s enabled event cohort','',
-        'Published min-flow assignments, using its single global gauge. No GT-selectable equivalent exists: its splittable-GT mode is not selectable GT. The selectable row below therefore compares against forced intact GT, not an equivalent experiment.','',
+        'Supplied min-flow assignments, using their single global gauge. Cohort matching does not imply identical optimization protocols; consult the supplied run configurations.','',
         '|SGD cohort|Class|Events|Min-flow L1|Min-flow sign errors|','|---|---|---:|---:|---:|']
     for row in rows:
         for kind,r in row['comparison']['flow_same_enabled_cohort'].items():

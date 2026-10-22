@@ -16,19 +16,22 @@ from .fiber_selected_dataset_eval import remap_events
 def run(settings):
     dataset=Path(settings['dataset']);root=Path(settings['output_root'])
     root.mkdir(parents=True,exist_ok=True)
-    print('Waiting for completed round-10 selection/export',flush=True)
-    while not (dataset/'summary.json').exists():time.sleep(2)
-    selected=json.loads((dataset/'summary.json').read_text())
-    if selected['rounds']!=10 or selected['termination']!='user_requested_round_stop':
-        raise ValueError('Expected user-stopped round-10 export')
+    if settings.get('wait_for_dataset',False):
+        print('Waiting for completed dataset export',flush=True)
+        while not (dataset/'summary.json').exists():time.sleep(2)
+    # Completion and artifact validity matter, not which expansion round or
+    # stopping rule produced the caller's dataset.
+    json.loads((dataset/'summary.json').read_text())
     cfg=clean_config(json.loads(Path(settings['base_config']).read_text())['fiber_implicit_winding'])
-    cfg.update(json.loads(Path(settings['optimum']).read_text())['parameters'])
+    if settings.get('optimum'):
+        cfg.update(json.loads(Path(settings['optimum']).read_text())['parameters'])
+    cfg.update(settings.get('parameters',{}))
     for key in ('force_keep_source_ids','force_keep_fibers','freeze_source_ids','freeze_widths'):
         cfg.pop(key,None)
     cfg['gpu_manager']=dict(cfg['gpu_manager'],exclusive=False)
-    cfg['save_diagnostic_checkpoints']=False
-    paths=[Path(settings['base_config']),Path(settings['optimum']),dataset/'summary.json',
+    paths=[Path(settings['base_config']),dataset/'summary.json',
            dataset/'tensors.npz',dataset/'selected.afv',dataset/'cross/cross_events.json',Path(__file__)]
+    if settings.get('optimum'):paths.append(Path(settings['optimum']))
     signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths})
     manifest=root/'inputs.json'
     if manifest.exists() and json.loads(manifest.read_text())!=signature:raise ValueError('Changed paired inputs')

@@ -23,14 +23,11 @@ def markdown_report(rows):
         return f'{n}/{total} ({100*n/total:.3f}%)' if total else '0/0 (n/a)'
 
     text = ['# Sign weight versus disabling cost', '',
-            'Fresh radial initialization; seed0; 1000updates; cavity cap8; sign threshold0.',
             'Only sign weight and disabling cost differ. Input/init arrays and solver hashes checked.',
             'All sign counts are MAP ordering violations, not Gaussian-tail probability.',
             'Each run uses its saved global GT offset; common-cohort scores do not refit it.',
-            'The dataset is GT-curated, not an independent held-out set. Objectives across weights are not directly comparable.', '']
-    for title, selected in [('Matched-factor grid (0.1x/1x/10x)',
-                             [r for r in rows if r['weight'] in (3,30,300) and r['rejection'] in (2,20,200)]),
-                            ('Original grid', [r for r in rows if r['weight'] in (30,100,300) and r['rejection'] in (2,10,20)])]:
+            'Reference-assisted input selection, if used, is not independent held-out evaluation. Objectives across weights are not directly comparable.', '']
+    for title, selected in [('All supplied runs',rows)]:
         selected = sorted(selected, key=lambda r: (r['weight'], r['rejection']))
         text += ['## '+title, '',
                  '| Sign | Disable cost | Disabled fibers | Length retained % | Internal parallel signs | Internal perp signs | GT parallel signs | GT perp signs |',
@@ -66,7 +63,8 @@ def markdown_report(rows):
     return '\n'.join(text)+'\n'
 
 
-def compare(roots, baseline, audit_root, output):
+def compare(roots, baseline, internal_audits, output):
+    """Compare explicit solve/audit paths; never infer trial names or directories."""
     baseline = Path(baseline)
     be = json.loads((baseline / 'gt_events.json').read_text())
     bc = json.loads((baseline / 'solve/config.json').read_text())
@@ -111,9 +109,7 @@ def compare(roots, baseline, audit_root, output):
                             for name, mask in [('all', np.ones(len(events), bool)), ('enabled', enabled)]}
             cohorts[kind]['baseline_common'] = cohort_metrics(be, bo, select & common)
             cohorts[kind]['trial_common'] = cohort_metrics(events, order, select & common)
-        audit_path = Path(audit_root) / root.name.removesuffix('_v1') / 'summary.json'
-        if root == baseline:
-            audit_path = baseline.parent / 'sign_tuning_audit_v1/w30_t00/summary.json'
+        audit_path = Path(internal_audits[str(root)])
         internal = json.loads(audit_path.read_text())
         for path in (root / 'solve/solution.npz', root / 'solve/config.json', Path(cfg['tensor_cache'])):
             if internal['hashes'][str(path)] != sha256_file(path):
@@ -128,3 +124,7 @@ def compare(roots, baseline, audit_root, output):
     atomic_write(output / 'comparison.json', rows, durable=False)
     (output / 'report.md').write_text(markdown_report(rows))
     return rows
+
+
+def run(settings):
+    return compare(settings['roots'],settings['baseline'],settings['internal_audits'],settings['output_root'])

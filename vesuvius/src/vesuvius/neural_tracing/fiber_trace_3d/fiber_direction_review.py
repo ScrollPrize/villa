@@ -58,8 +58,8 @@ def export_views(config,cfg,s,d,selected_root):
     selected=sorted(spatial_subset([r[0] for r in pool],[r[1:4] for r in pool],int(config.get('sample_count',1000))))
     # Reuse the established normal-arrow and MeshLab-compatible curve exporter.
     viscfg=dict(output_root=str(root),solution=cfg['stage1'],database=cfg['database'],afv=cfg['afv'],
-        hv_solution=cfg['hv_solution'],umbilicus=cfg['umbilicus'],fiber_ids=selected,
-        arrow_spacing=1024,arrow_length=640,arrow_radius=20,max_arrows=100000,max_points=2000000)
+        hv_solution=cfg['hv_solution'],umbilicus=cfg['umbilicus'],fiber_ids=selected)
+    viscfg.update(config.get('normal_visualization',{}))
     export(viscfg)
     rejected_ids=s['ids'][s['newly_broken']].tolist();records=[];first=1
     with np.load(cfg['warm_start']) as old:oldsign=old[f'direction_sign_{positive}'][d['active']]

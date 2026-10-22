@@ -110,6 +110,8 @@ def target_spans(arc, xyz, q, z_range, winding_range):
 
 
 def run(settings):
+    from .fiber_full_slab import reference_scale
+    reference_scale(settings)
     from . import fiber_reference_comparison as ref, fiber_soft_winding as soft
     from .fiber_uv_arc_phase import event_arc_points,event_signed_arcs
     from .fiber_gt_constraint_score import run as cross_run
@@ -143,7 +145,8 @@ def run(settings):
     surface=None
     def get_surface():
         nonlocal surface
-        if surface is None:surface=ref.Surface(settings['reference'],4.,2,settings.get('threads',128),8)
+        if surface is None:surface=ref.Surface(settings['reference'],settings['reference_xyz_scale'],
+            settings.get('projection_stride',2),settings.get('threads',128),settings.get('projection_candidates',8))
         return surface
     if not selection_path.exists():
         surf=get_surface();wr=settings['winding_range'];halo=settings.get('halo_windings',2)
@@ -185,8 +188,8 @@ def run(settings):
     np.savez(root/'tensors.npz',**d)
     config=dict(base,tensor_cache=str(root/'tensors.npz'),layout_mode='shared_anchor',
         output_root=str(root/'solve'),initial_solution=str(root/'init/solution.npz'),
-        fixed_reference_events=str(root/'fixed_reference_events.npz'),log_every=100,
-        devices=settings.get('devices','0'),bucket_shared_phase=True)
+        fixed_reference_events=str(root/'fixed_reference_events.npz'),
+        devices=settings.get('devices',base.get('devices','0')),bucket_shared_phase=True)
     config.pop('reference_subset',None)
     config['gpu_manager']=dict(base['gpu_manager'],label='broad-reference-anchored-density',exclusive=False)
     atomic_write(root/'candidate_config.json',{'fiber_uv_layout':config},durable=False)
@@ -202,7 +205,7 @@ def run(settings):
     # Calibrate the immutable GT gauge to the surface before the candidate solve.
     gaugepath=root/'reference_gauge.json'
     if not gaugepath.exists():
-        sample=ref.samples(gd,gcfg,64);rc,distance=get_surface().project(sample['xyz'])
+        sample=ref.samples(gd,gcfg,settings.get('sample_spacing',64));rc,distance=get_surface().project(sample['xyz'])
         refq=ref.winding_at(rc[:,1],get_surface().x,get_surface().q)
         gq,_=gt_points(sample['owner'],sample['arc'])
         good=np.isfinite(refq)&(distance<=settings.get('surface_distance',200))

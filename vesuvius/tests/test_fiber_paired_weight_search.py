@@ -2,6 +2,23 @@ import pytest
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_paired_weight_search import better,refine,rank_pair
 
 
+def test_regression_settings_do_not_depend_on_job_name():
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_paired_weight_search import regression_request
+    settings=dict(shared_parameters=['distance_weight'])
+    wrapper=dict(parameters=dict(arc_prior_spacing_vx=71,lr=.02))
+    original=dict(parameters=dict(gt_pair_mode='sign_only'),trials=[{'steps':19}],
+        gpu_manager=dict(exclusive=False,vram_bytes_per_gpu=987654,cpu_cores=7))
+    def request(name):return regression_request(settings,wrapper,original,{'lr':.03},
+        {'distance_weight':2},{'lr':.04},name=name,output_root='out',device='5')
+    a=request('first');b=request('renamed')
+    assert a==b
+    assert a['parameters']==dict(gt_pair_mode='sign_only',arc_prior_spacing_vx=71,lr=.04,distance_weight=2)
+    assert a['gpu_manager']==original['gpu_manager'] and a['trials']==original['trials']
+    settings['gt_parameter_overrides']={'first':{'arc_prior_spacing_vx':None}}
+    assert request('first')['parameters']['arc_prior_spacing_vx'] is None
+    assert request('renamed')['parameters']['arc_prior_spacing_vx']==71
+
+
 def test_numeric_cache_key_ignores_json_number_representation():
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_paired_weight_search import numeric_key
     assert numeric_key(dict(x=1,y=.5))==numeric_key(dict(x=1.,y=.5))

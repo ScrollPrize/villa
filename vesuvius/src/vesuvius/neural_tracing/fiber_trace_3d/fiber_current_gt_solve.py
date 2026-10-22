@@ -46,17 +46,17 @@ def run(settings):
     if len(np.unique(d['source_id'])) != len(d['family']) or len(d['links']):
         raise ValueError('GT must consist of whole, unsplit fibers')
     # Reuse only extraction/family/direction metadata, never the old fitted UV.
-    # The GT tensors already contain the transferred full-corpus radial prior;
-    # its historical source cache may have been removed during cleanup.
+    # Initialization may come from the caller's tensor metadata, never fitted GT UV.
     centers, widths = uv.radial_initial_geometry(d, cfg)
     d.update(radial_initial_centers=centers, radial_initial_widths=widths)
     np.savez(root/'tensors.npz', **d)
     cfg.update(afv=old['afv'], tensor_cache=str(root/'tensors.npz'),
                output_root=str(root/'solve'), initial_solution=str(root/'init/solution.npz'),
-               steps=settings.get('steps',1000), devices=settings.get('devices','3'),
-               force_keep_fibers=True, record_winding_history=False, log_every=100)
+               devices=settings.get('devices',cfg.get('devices','0')),
+               force_keep_fibers=True)
+    if 'steps' in settings:cfg['steps']=settings['steps']
     cfg['gpu_manager']=dict(cfg['gpu_manager'], exclusive=False,
-        label='seven-whole-GT-current-solver', vram_bytes_per_gpu=8*1024**3)
+        label='whole-reference-solver')
     init=root/'init'; init.mkdir(exist_ok=True)
     state=np.column_stack((centers,d['phase'],d['z'],np.full(len(centers),100.))).astype(np.float32)
     np.savez(init/'solution.npz', state=state, widths=widths,
@@ -68,14 +68,14 @@ def run(settings):
     dispatch({'fiber_implicit_winding':cfg})
     sol=arrays(root/'solve/solution.npz')
     if not np.all(sol['state'][:,3]==100):raise ValueError('Trusted fibers lost forced-active state')
-    winding_reference=Path(settings.get('winding_reference',Path(settings['base_config']).parent/'gt_winding_reference.json'))
-    if winding_reference.exists():
+    if settings.get('winding_reference'):
+        winding_reference=Path(settings['winding_reference'])
         from .fiber_gt_winding_reference import run as check_windings
         check_windings(root/'solve',winding_reference)
     if cfg.get('predicted_only_geometry'):
         return json.loads((root/'solve/summary.json').read_text())
     dispatch({'fiber_bucket_uv_report':dict(solve_roots=[str(root/'solve')], output_root=str(root/'metrics'))})
-    dispatch({'fiber_uv_visualization':dict(bucket_comparison=str(root/'solve'),
-        output_root=str(root/'visualization'),render_height=2000,
-        fiber_line_width=10,fiber_vector_line_width=3.25,individual_probability_background=True)})
+    if settings.get('visualization') is not None:
+        dispatch({'fiber_uv_visualization':dict(settings['visualization'],bucket_comparison=str(root/'solve'),
+            output_root=str(root/'visualization'))})
     return json.loads((root/'solve/summary.json').read_text())

@@ -9,6 +9,14 @@ from . import fiber_uv_reference_subset as subset
 from .fiber_gt_constraint_score import arrays
 
 
+def reference_scale(settings):
+    """Require an explicit physical scale before expensive work or output writes."""
+    scale=float(settings['reference_xyz_scale'])
+    if not np.isfinite(scale) or scale<=0:
+        raise ValueError('reference_xyz_scale must be positive and finite')
+    return scale
+
+
 def clean_config(base):
     return {k:v for k,v in base.items() if not (
         k.startswith(('reference_', 'fixed_reference', 'executed_')) or
@@ -16,9 +24,9 @@ def clean_config(base):
                                      'initialization_geometry_cache'))}
 
 
-def reference_metrics(d,sol,config,sample,reference,*,continuous=False):
+def reference_metrics(d,sol,config,sample,reference,*,xyz_scale,continuous=False):
     from . import fiber_reference_comparison as ref
-    metric_cfg=dict(config,reference_widths=dict(meta=str(Path(reference)/'meta.json'),xyz_scale=4))
+    metric_cfg=dict(config,reference_widths=dict(meta=str(Path(reference)/'meta.json'),xyz_scale=xyz_scale))
     state=sol['state'];widths=sol['widths'];b=np.r_[0.,np.cumsum(widths,dtype=float)]
     q=(state[:,0] if continuous else np.floor(state[:,0]+.5))+state[:,1]
     k=np.floor(q).astype(int).clip(0,len(widths)-1)
@@ -38,7 +46,7 @@ def reference_metrics(d,sol,config,sample,reference,*,continuous=False):
     return metrics
 
 
-def score_checkpoints(root,parent,config,reference,*,continuous=False):
+def score_checkpoints(root,parent,config,reference,*,xyz_scale,continuous=False):
     """Shared posthoc scoring; never feed projection data into optimization."""
     root=Path(root);parent=Path(parent)
     if not (parent/'results.json').exists():
@@ -49,7 +57,7 @@ def score_checkpoints(root,parent,config,reference,*,continuous=False):
     rows=[]
     for record in json.loads((root/'history.json').read_text()):
         sol=arrays(root/'checkpoints'/f'{record["iteration"]:06d}.npz')
-        row=dict(record,reference=reference_metrics(d,sol,config,sample,reference,continuous=continuous))
+        row=dict(record,reference=reference_metrics(d,sol,config,sample,reference,xyz_scale=xyz_scale,continuous=continuous))
         rows.append(row)
         print(json.dumps(dict(iteration=row['iteration'],loss=row['loss'],enabled_percent=row['enabled_percent'],
                               reference=row['reference'])),flush=True)
@@ -66,16 +74,16 @@ def soft_trial_config(original,settings):
             config.pop(key)
     config.update(output_root=settings['output_root'],initial_solution=original['initial_solution'],
         soft_samples=original['soft_samples'],tensor_sha256=original['tensor_sha256'],
-        samples_sha256=original['samples_sha256'],log_every=100,save_diagnostic_checkpoints=True,
+        samples_sha256=original['samples_sha256'],save_diagnostic_checkpoints=True,
         devices=settings['devices'],width_lr=settings['width_lr'])
-    config['gpu_manager']=dict(original['gpu_manager'],exclusive=False,
-        vram_bytes_per_gpu=8*1024**3,label=f'soft-slab-width-lr{settings["width_lr"]}')
+    config['gpu_manager']=dict(original['gpu_manager'],exclusive=False,label='soft-slab')
     soft.validate(config)
     return config
 
 
 def run_soft_trial(settings):
     """Fresh, same-input soft-only control; only width LR varies across trials."""
+    reference_scale(settings)
     parent=Path(settings['parent_root']);root=Path(settings['output_root'])
     original=json.loads((parent/'solve/config.json').read_text())
     config=soft_trial_config(original,settings)
@@ -93,7 +101,7 @@ def run_soft_trial(settings):
     if any(saved.get(k)!=v for k,v in config.items()):raise ValueError('Soft trial config mismatch')
     if json.loads((root/'summary.json').read_text())['final']['iteration']!=config['steps']:
         raise ValueError('Incomplete soft trial')
-    rows=score_checkpoints(root,parent,config,settings['reference'],continuous=True)
+    rows=score_checkpoints(root,parent,config,settings['reference'],xyz_scale=settings['reference_xyz_scale'],continuous=True)
     result=dict(width_lr=config['width_lr'],rows=rows,model='continuous_soft_winding_v1',
                 solution_sha256=sha256_file(root/'solution.npz'),gt_supervision=False)
     atomic_write(root/'reference_results.json',result,durable=False)
@@ -102,12 +110,13 @@ def run_soft_trial(settings):
 
 def run_progress(settings):
     """Repeat prepared seeded solve with checkpoints; reference remains posthoc."""
+    reference_scale(settings)
     from . import fiber_implicit_winding as density
     root=Path(settings['output_root']);parent=Path(settings['parent_root'])
     original=json.loads((parent/'solve/config.json').read_text())
     config=clean_config(original)
     config.update(output_root=str(root),initial_solution=original['initial_solution'],
-                  log_every=100,save_diagnostic_checkpoints=True)
+                  save_diagnostic_checkpoints=True)
     root.mkdir(parents=True,exist_ok=True)
     signature=dict(settings=settings,tensors=sha256_file(config['tensor_cache']),
         init=sha256_file(config['initial_solution']),parent_config=sha256_file(parent/'solve/config.json'),
@@ -123,7 +132,7 @@ def run_progress(settings):
         raise ValueError('Incomplete repeat solve')
     if not (parent/'results.json').exists():
         raise RuntimeError('Parent projection not yet published; rerun this command to score saved checkpoints without repeating optimization')
-    rows=score_checkpoints(root,parent,config,settings['reference'])
+    rows=score_checkpoints(root,parent,config,settings['reference'],xyz_scale=settings['reference_xyz_scale'])
     previous=arrays(parent/'solve/solution.npz');current=arrays(root/'solution.npz')
     comparison={k:float(np.max(np.abs(previous[k]-current[k]))) for k in ('state','widths')}
     result=dict(rows=rows,repeat_max_abs_difference=comparison,
@@ -135,6 +144,7 @@ def run_progress(settings):
 
 
 def run(settings):
+    reference_scale(settings)
     from . import fiber_implicit_winding as density
     from . import fiber_reference_comparison as ref
     from . import fiber_cavity_sigma as cavity
@@ -157,7 +167,7 @@ def run(settings):
     uv.prepare(parent)
     atomic_write(root/'parent_config.json',{'fiber_uv_layout':parent},durable=False)
     manifest=subset.run(dict(source_config=str(root/'parent_config.json'),output_root=str(root/'slab'),
-                            z_range=settings['z_range'],sample_spacing=200))
+                            z_range=settings['z_range'],sample_spacing=settings.get('sample_spacing',200)))
     d=arrays(root/'slab/tensors.npz')
     d,filter_stats=soft.constraint_family_filter(d,True)
     if not len(d['family']) or not len(d['i']):raise ValueError('Empty slab constraint graph')
@@ -186,14 +196,16 @@ def run(settings):
     print('slab: posthoc spiral projection (no reference used by optimization)',flush=True)
     sol=arrays(root/'solve/solution.npz')
     sample=arrays(root/'slab/projection.npz')
-    surface=ref.Surface(settings['reference'],4.,2,settings.get('workers',128),4)
+    surface=ref.Surface(settings['reference'],settings['reference_xyz_scale'],settings.get('projection_stride',2),
+                        settings.get('workers',128),settings.get('projection_candidates',4))
     rc,distance=surface.project(sample['xyz'])
     q=ref.winding_at(rc[:,1],surface.x,surface.q)
-    chosen=ref.assign_sources(d,sample,q,distance,200.,surface.limits)
+    max_distance=settings.get('projection_max_distance',200.)
+    chosen=ref.assign_sources(d,sample,q,distance,max_distance,surface.limits)
     sample['chosen_winding']=chosen
     np.savez(root/'reference_projection.npz',**sample,nearest_distance=distance,nearest_q=q)
-    metrics=reference_metrics(d,sol,saved,sample,settings['reference'])
-    support=distance<=200
+    metrics=reference_metrics(d,sol,saved,sample,settings['reference'],xyz_scale=settings['reference_xyz_scale'])
+    support=distance<=max_distance
     result=dict(final=summary['final'],reference=metrics,sources=manifest['sources'],pieces=len(d['family']),
         events=len(d['i']),batch_size=config['batch_size'],updates=config['steps'],
         sampled_pass_equivalents=config['steps']*min(config['batch_size'],len(d['i']))/len(d['i']),

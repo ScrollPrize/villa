@@ -1,24 +1,6 @@
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_split_weight_search import ranking,better,acceptance_limit_reached
 
 
-def test_focused_joint_moves_preserve_frozen_parameters():
-    import json
-    from pathlib import Path
-    from vesuvius.neural_tracing.fiber_trace_3d.fiber_split_weight_search import focused_proposals
-    root=Path(__file__).resolve().parents[1]/'docs/examples/fiber_workflows'
-    cfg=json.loads((root/'run_split_focused_search.json').read_text())['fiber_split_weight_search']
-    best=cfg['initial_parameters'];rows=focused_proposals(cfg,best,0)
-    assert len(rows)==16  # 8 nontrivial sign/cost + 8 nontrivial split combinations.
-    assert len(cfg['weights'])==8
-    assert any(v['sign_violation_weight']==best['sign_violation_weight']*2 and
-               v['rejection_cost']==best['rejection_cost']*.5 for v,_ in rows)
-    for values,_ in rows:
-        assert all(values[k]==v for k,v in best.items() if k not in cfg['weights'])
-        assert values['split_min_perpendicular'] in (2,4,8)
-        assert values['split_target_length_vx'] in (1000,2000,4000)
-    assert focused_proposals(cfg,best,1)==[]
-    assert not cfg['replay_reused_candidates']
-    assert cfg['accepted_improvements'] is None
 
 
 def test_unlimited_search_continues_past_reporting_milestone():
@@ -28,22 +10,6 @@ def test_unlimited_search_continues_past_reporting_milestone():
     assert acceptance_limit_reached(3,3)
 
 
-def test_full_search_freezes_only_minimum_width_parameters():
-    import json
-    from pathlib import Path
-    root=Path(__file__).resolve().parents[1]/'docs/examples/fiber_workflows'
-    old=json.loads((root/'run_split_all_parameter_search.json').read_text())['fiber_split_weight_search']
-    cfg=json.loads((root/'run_split_full_except_minwidth.json').read_text())['fiber_split_weight_search']
-    frozen={'minimum_winding_width','width_minimum_weight'}
-    assert set(cfg['weights'])==set(old['weights'])-frozen
-    assert len(cfg['weights'])==33
-    assert not frozen.intersection(cfg['bounds'])
-    assert cfg['initial_parameters']['minimum_winding_width']==1500
-    assert cfg['initial_parameters']['width_minimum_weight']==1.125
-    assert cfg['base_config']==old['base_config']
-    assert cfg['devices']==old['devices']
-    assert not cfg['replay_reused_candidates']
-    assert not cfg['start_from_best_completed']
 
 
 def test_reuse_key_when_fixed_cost_becomes_tunable(tmp_path):
@@ -55,16 +21,6 @@ def test_reuse_key_when_fixed_cost_becomes_tunable(tmp_path):
     assert historical_trial_key(tmp_path,dict(old,rejection_cost=2.5))==numeric_key(old)
 
 
-def test_exact_search_tunes_whole_rejection_cost_not_unrelated_weights():
-    import json
-    from pathlib import Path
-    root=Path(__file__).resolve().parents[1]/'docs/examples/fiber_workflows'
-    cfg=json.loads((root/'run_split_exact_cost_search.json').read_text())['fiber_split_weight_search']
-    assert set(cfg['weights'])=={'rejection_cost','rejection_perpendicular_cost',
-        'rejection_parallel_cost','rejection_continuation_cost','continuation_weight',
-        'split_target_length_vx','split_min_perpendicular'}
-    assert cfg['initial_parameters']['rejection_cost']==2.5
-    assert min(cfg['absolute_values']['rejection_cost'])<2.5<max(cfg['absolute_values']['rejection_cost'])
 
 
 def test_priority_is_count_divided_by_retained_fraction_then_l1():
@@ -116,3 +72,30 @@ def test_rescore_ignores_historical_ranking_and_selects_high_retention(tmp_path)
     assert results[0]['parameters']['rejection_cost']==1
     assert results[0]['ranking']['count_per_kept_fraction']==6
     assert results[1]['ranking']['count_per_kept_fraction']==24
+
+
+def test_caller_selected_joint_moves_preserve_other_parameters():
+    import pytest
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_split_weight_search import focused_proposals
+    best=dict(rejection_cost=3.,continuation_weight=7.,split_min_perpendicular=3,phase_weight=11.)
+    cfg=dict(weights=['rejection_cost','continuation_weight','split_min_perpendicular'],
+        bounds=dict(rejection_cost=[0,10],continuation_weight=[0,20],split_min_perpendicular=[2,6]),
+        proposal_groups=[dict(name='costs',axes=[dict(parameters=['rejection_cost','continuation_weight'],
+            mode='factor',values=[.5,1,2])]),dict(name='splits',axes=[dict(parameters=['split_min_perpendicular'],
+            mode='absolute',values=[2,3,6])])])
+    rows=focused_proposals(cfg,best,0)
+    assert len(rows)==4
+    assert all(values['phase_weight']==11 for values,_ in rows)
+    assert any(values['rejection_cost']==6 and values['continuation_weight']==14 for values,_ in rows)
+    assert focused_proposals(cfg,best,1)==[]
+    cfg['weights'].remove('continuation_weight')
+    with pytest.raises(ValueError,match='fixed parameter'):focused_proposals(cfg,best,0)
+
+
+def test_minimal_sample_proposals_are_valid():
+    import json
+    from pathlib import Path
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_split_weight_search import focused_proposals
+    path=Path(__file__).resolve().parents[1]/'docs/examples/fiber_workflows/split_search.json'
+    cfg=json.loads(path.read_text())['fiber_split_weight_search']
+    assert len(focused_proposals(cfg,cfg['initial_parameters'],0))==2

@@ -1,4 +1,4 @@
-"""Small reviewed-JSON dataset adapter; all extraction/solving stays shared."""
+"""Reviewed-JSON adapter with caller-configured extraction and solver stages."""
 import json
 import hashlib
 import sqlite3
@@ -22,7 +22,7 @@ def convert(source_dir, template, destination, *, expected_manifest_tokens):
         if xyz.ndim!=2 or xyz.shape[1]!=3 or len(xyz)<2 or not np.isfinite(xyz).all():
             raise ValueError('Invalid curve: '+str(path))
         if doc.get('branches') or doc.get('adjacent_branches'):
-            raise ValueError('This pilot does not import explicit links')
+            raise ValueError('This adapter does not import explicit links')
         manifests=[' '.join(str(c.get('segment_to_next',{}).get(k,'')) for k in ('normal_manifest','fiber_manifest')) for c in doc['control_points']]
         if len(manifests)<2 or any(any(str(token) not in m for token in expected_manifest_tokens) for m in manifests[:-1]):
             raise ValueError('Unverified source scan: '+str(path))
@@ -50,73 +50,49 @@ def convert(source_dir, template, destination, *, expected_manifest_tokens):
 
 def run(config):
     from .fiber_workflows import run as dispatch
-    base=Path(config['templates']); root=Path(config['output_root']); root.mkdir(parents=True,exist_ok=True)
-    templates=('extract_raw_winding.json','orient_normals_full.json','extract_axial_features.json',
-               'extract_outward_priors.json','run_sign_resolution.json','run_hv_recommended.json',
-               'run_h_direction_breakage_v2.json','run_v_direction.json',
-               'run_uv_current_baseline.json','run_uv_joint100_fresh_low_width_v2.json')
-    template_files={name:Path(config.get('template_files',{}).get(name,base/name)) for name in templates}
-    signature=dict(config=config,templates={name:sha256_file(path) for name,path in template_files.items()})
+    root=Path(config['output_root']); root.mkdir(parents=True,exist_ok=True)
+    if any(key in config for key in ('templates','template_files','solve_parameters','trusted_gt')):
+        raise ValueError('Use explicit stages and stage parameters; implicit pipeline presets are not supported')
+    afv=str(root/'fibers.afv')
+    stages=stage_requests(config.get('stages',[]),root,afv)
+    signature=dict(config=config,stages=stages,afv_template_sha256=sha256_file(config['afv_template']))
     manifest=root/'pipeline_inputs.json'
     if manifest.exists() and json.loads(manifest.read_text())!=signature:
         raise ValueError('Changed pipeline inputs: use a new output directory')
     atomic_write(manifest,signature,durable=False)
-    def load(name,key=None):
-        d=json.loads(template_files[name].read_text()); return d[key] if key else d
-    afv=str(root/'fibers.afv'); database=str(root/'oriented.afc.sqlite')
-    convert(config['source_dir'],config['afv_template'],afv,expected_manifest_tokens=config['expected_manifest_tokens'])
-    umbilicus=config.get('umbilicus') or load('extract_axial_features.json')['umbilicus']
-    common=dict(afv=afv,database=database,umbilicus=str(umbilicus),
-                features=str(root/'features.json'),stage1=str(root/'normal/solution_0.1.npz'),
-                hv_solution=str(root/'hv/solution_degree_mix_b0.1_e0.01.npz'))
-    manager=config.get('gpu_manager',dict(exclusive=False,priority=100,cpu_cores=4,vram_bytes_per_gpu=4294967296,label='reviewed-json-fibers'))
-    def native(name,template,**updates):
-        cfg=load(template); cfg.update(afv=afv,threads=4,output=str(root/(name+'.json')),**updates)
-        path=root/(name+'_config.json'); atomic_write(path,cfg,durable=False)
-        if Path(cfg['output']).exists(): return
-        dispatch(dict(output_root=str(root/(name+'_runner')),reference_dir=config['source_dir'],
-                      native_binary=config.get('native_binary','vc_fiber_constraints'),
-                      input_files=[str(path)],commands=[dict(name=name,binary='vc_fiber_trace_chunk',args=['afv-constraints',str(path)])]))
-    native('extract','extract_raw_winding.json',database=str(root/'raw.afc.sqlite'))
-    native('orient','orient_normals_full.json',orient_database=str(root/'raw.afc.sqlite'),database=database)
-    # These wrappers stamp source hashes required by the shared prepare functions.
-    for name,template,key,updates in [
-        ('features','extract_axial_features.json','fiber_axial_features',dict(axial_prior_output=common['features'])),
-        ('priors','extract_outward_priors.json','fiber_normal_priors',dict(orient_database=database,normal_prior_output=str(root/'priors.json')))]:
-        if (root/(name+'.json')).exists(): continue
-        cfg=load(template);cfg.update(afv=afv,threads=4,output=str(root/(name+'_native.json')),**updates)
-        path=root/(name+'_config.json');atomic_write(path,cfg,durable=False)
-        dispatch({key:dict(native_config=str(path),output_root=str(root/(name+'_runner')),
-                          native_binary=config.get('native_binary','vc_fiber_constraints'),
-                          native_regression_binary=config.get('native_regression_binary'))})
-    for name,template,key in [('normal','run_sign_resolution.json','fiber_normal_sign'),
-                               ('hv','run_hv_recommended.json','fiber_hv_stage'),
-                               ('h','run_h_direction_breakage_v2.json','fiber_h_direction'),
-                               ('v','run_v_direction.json','fiber_direction')]:
-        if (root/name/'summary.json').exists(): continue
-        cfg=load(template,key);cfg.update(common,output_root=str(root/name),tensor_cache=str(root/(name+'_tensors.npz')),
-                                         devices=config.get('devices','0'),gpu_manager=manager)
-        cfg.pop('warm_start',None);cfg.pop('baseline_first',None)
-        if name=='normal': cfg.update(priors=str(root/'priors.json'),broken_penalties=[.1])
-        if name=='h': cfg.update(breakage_weights=[.05],baseline_first=True)
-        if name=='v': cfg.update(breakage_weights=[.1],baseline_first=True,inherited_h_solution=str(root/'h/penalty_0.05/solution.npz'))
-        dispatch({key:cfg})
-    cfg=load('run_uv_current_baseline.json','fiber_uv_layout')
-    for key in ('reference_subset','reference_projection','reference_widths','benchmark_updates','benchmark_log_every','benchmark_warmup'):
-        cfg.pop(key,None)
-    uv_name='uv_whole' if config.get('trusted_gt',False) else 'uv'
-    cfg.update(common,h_direction_solution=str(root/'h/penalty_0.05/solution.npz'),
-               v_direction_solution=str(root/'v/penalty_0.1/solution.npz'),
-               tensor_cache=str(root/(uv_name+'_tensors.npz')),output_root=str(root/uv_name),
-               keep_whole_fibers=config.get('trusted_gt',False),force_keep_fibers=config.get('trusted_gt',False),
-               initialization_geometry_cache=load('run_uv_joint100_fresh_low_width_v2.json','fiber_uv_layout')['tensor_cache'],
-               distributed_world_size=1,devices=config.get('devices','0'),gpu_manager=manager,
-               traversal='full_pass',passes=10080,batch_size=24576,log_every=1000,
-               benchmark_updates=10080,benchmark_log_every=1000)
-    cfg['bucket_shared_phase']=config.get('bucket_shared_phase',False)
-    cfg.update(config.get('solve_parameters',{}))
-    if not (root/uv_name/'summary.json').exists(): dispatch({'fiber_uv_layout':cfg})
-    return report(root,uv_name)
+    records=convert(config['source_dir'],config['afv_template'],afv,
+                    expected_manifest_tokens=config['expected_manifest_tokens'])
+    for stage in stages:
+        path=root/(stage['name']+'_request.json')
+        atomic_write(path,stage['request'],durable=False)
+        # Each workflow owns its provenance checks and resume protocol. Do not
+        # infer completion from an arbitrary file left by an earlier experiment.
+        dispatch(stage['request'])
+    if config.get('layout_output'):
+        return report(root,config['layout_output'])
+    return dict(afv=afv,sources=records,stages=[stage['name'] for stage in stages])
+
+
+def stage_requests(stages,root,afv):
+    """Resolve explicit workflow requests without injecting model/run settings."""
+    names=set();result=[]
+    def expand(value):
+        if isinstance(value,str):return value.replace('{output_root}',str(root)).replace('{afv}',str(afv))
+        if isinstance(value,list):return [expand(v) for v in value]
+        if isinstance(value,dict):return {k:expand(v) for k,v in value.items()}
+        return value
+    for stage in stages:
+        name=stage['name']
+        if not name or Path(name).name!=name or name in ('.','..') or name in names:
+            raise ValueError('Stage names must be unique path components')
+        names.add(name)
+        if ('config_file' in stage)==('request' in stage):
+            raise ValueError('Each stage needs exactly one config_file or request')
+        request=json.loads(Path(stage['config_file']).read_text()) if 'config_file' in stage else stage['request']
+        if not isinstance(request,dict) or not request or ('commands' not in request and len(request)!=1):
+            raise ValueError('Each stage must select exactly one workflow or native command list')
+        result.append(dict(name=name,request=expand(request)))
+    return result
 
 
 def report(root,uv_name='uv'):

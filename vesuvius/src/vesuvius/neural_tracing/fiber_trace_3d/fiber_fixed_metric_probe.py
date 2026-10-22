@@ -173,8 +173,7 @@ def run(settings):
     atomic_write(solve/'config.json',dict(cfg,output_root=str(solve)),durable=False)
     atomic_write(root/'report.json',result,durable=False)
     print(json.dumps({k:v for k,v in result.items() if k!='history'}),flush=True)
-    from .fiber_uv_visualization import run as render
-    render(dict(bucket_comparison=str(solve),output_root=str(root/'visualization'),
-        render_height=2000,fiber_line_width=10,fiber_vector_line_width=3.25,
-        individual_probability_background=True))
+    if settings.get('visualization') is not None:
+        from .fiber_uv_visualization import run as render
+        render(dict(settings['visualization'],bucket_comparison=str(solve),output_root=str(root/'visualization')))
     return result

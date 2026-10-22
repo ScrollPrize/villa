@@ -1,4 +1,4 @@
-"""Shared-parameter, seven-problem search ranked by GT perpendicular ordering.
+"""Shared-parameter paired search with a caller-supplied GT regression suite.
 
 Reuse existing solvers, frozen GT scorers, configuration hashes and GT guard.
 No model code or scientific defaults are altered by this controller.
@@ -61,6 +61,17 @@ def refine(initial,evaluate,parameters,factors,bounds,accepted,tolerance=1e-6,ab
 DEFAULT_FACTOR_GRIDS = ((.5, 2.), (.75, 1.5), (.9, 1.1), (.97, 1.03), (.99, 1.01))
 
 
+def regression_request(settings,wrapper,original,canonical,base,values,*,name,output_root,device):
+    """Apply declared shared/test settings; regression names never select a preset."""
+    params=dict(wrapper['parameters'],**canonical)
+    params.update({k:base[k] for k in settings['shared_parameters']})
+    params.update(values)
+    params.update(settings.get('gt_parameter_overrides',{}).get(name,{}))
+    return dict(original,output_root=str(output_root),devices=device,
+        parameters=dict(original.get('parameters',{}),**params),
+        gpu_manager=dict(original.get('gpu_manager',{}),**settings.get('gt_gpu_manager',{})))
+
+
 def run(settings):
     settings = dict(settings)
     settings.setdefault('factor_grids', [list(pair) for pair in DEFAULT_FACTOR_GRIDS])
@@ -74,8 +85,8 @@ def run(settings):
     initial.update(settings.get('initial_parameters',{}))
     devices=list(map(str,settings['devices']))
     screened=bool(settings.get('screen_no_gt',False))
-    if len(set(devices))!=len(devices) or (len(devices)<2 if screened else len(devices)!=4):
-        raise ValueError('Distinct GPU lanes required (four for legacy mode)')
+    if len(set(devices))!=len(devices) or len(devices)<(2 if screened else 3):
+        raise ValueError('Distinct GPU lanes required: two for screened mode; two large-run lanes and at least one regression lane otherwise')
     paths=[Path(settings['base_config']),Path(settings['canonical_baseline'])]
     paths+=list(map(Path,settings['gt_regressions'].values()))
     paths+=list(Path(__file__).parent.glob('fiber_*.py'))
@@ -137,19 +148,12 @@ def run(settings):
         for index,(name,recipe) in enumerate(settings['gt_regressions'].items()):
             if only is not None:
                 if name!=only:continue
-            elif index%2!=lane:continue
+            elif index%(len(devices)-2)!=lane:continue
             wrapper=json.loads(Path(recipe).read_text())['fiber_solver_trial']
             original=json.loads(Path(wrapper['recipe']).read_text())['fiber_gt_convergence_probe']
-            # Same scientific values on every test, except the explicitly
-            # defined test mode, width initialization and sparse-prior control.
-            params=dict(wrapper['parameters'],**canonical)
-            params.update({k:base[k] for k in settings['shared_parameters']})
-            params.update(values)
-            if name=='sign_sparse_control':params['arc_prior_spacing_vx']=None
             out=trial/'gt'/name
-            request=dict(original,output_root=str(out),devices=device if device is not None else devices[2+lane],
-                parameters=dict(original.get('parameters',{}),**params),gpu_manager=dict(
-                    exclusive=False,cpu_cores=4,vram_bytes_per_gpu=4*1024**3,label='paired-GT-'+name))
+            request=regression_request(settings,wrapper,original,canonical,base,values,name=name,
+                output_root=out,device=device if device is not None else devices[2+lane])
             report=execute(trial/('gt_'+name+'.json'),dict(fiber_gt_convergence_probe=request),out/'report.json')['joint']
             reports[name]=dict(final=report['final'],seconds=report['seconds'],optimizer=report['optimizer'],
                                output_root=str(out),solution_sha256=sha256_file(out/'joint/solution.npz'))
@@ -171,15 +175,13 @@ def run(settings):
         else:
             atomic_write(root/'active.json',dict(key=key,parameters=values,completed=len(results)),durable=False)
             print('TRIAL '+json.dumps(dict(key=key,parameters=values)),flush=True)
-            # Only one candidate owns the four fixed lanes at a time; all
-            # seven problems are checked, regardless of large-run ranking.
-            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            # All supplied problems are checked, regardless of large-run ranking.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=len(devices)) as pool:
                 free=pool.submit(large,trial,values,False)
                 joint=pool.submit(large,trial,values,True)
-                a=pool.submit(small_lane,trial,values,0)
-                b=pool.submit(small_lane,trial,values,1)
+                regression_jobs=[pool.submit(small_lane,trial,values,lane) for lane in range(len(devices)-2)]
                 reports=dict(free=free.result(),joint=joint.result())
-                gt=dict(a.result(),**b.result())
+                gt={name:report for job in regression_jobs for name,report in job.result().items()}
             guard=regression_guard(gt,settings['gt_limits'])
             result=dict(key=key,parameters=values,large=reports,gt=gt,gt_guard=guard,
                         ranking=rank_pair(reports,guard))

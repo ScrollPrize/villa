@@ -5,7 +5,33 @@ import pytest
 from functools import partial
 from vesuvius.neural_tracing.fiber_trace_3d.fiber_json_solve import convert as convert_verified
 
-convert=partial(convert_verified,expected_manifest_tokens=['PHercParis4','20260411134726'])
+convert=partial(convert_verified,expected_manifest_tokens=['test-volume','test-scan'])
+
+
+def test_stage_requests_preserve_arbitrary_settings_and_order(tmp_path):
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_json_solve import stage_requests
+    request={'fiber_normal_sign':{'afv':'{afv}','output_root':'{output_root}/oriented',
+        'steps':17,'lr':.013,'gpu_manager':{'vram_bytes_per_gpu':123456},'force_keep_fibers':False}}
+    path=tmp_path/'stage.json';path.write_text(json.dumps(request))
+    stages=stage_requests([{'name':'user-label','config_file':str(path)},
+        {'name':'native','request':{'commands':[{'binary':'custom','args':['{afv}']}]}}],tmp_path,'input.afv')
+    assert [s['name'] for s in stages]==['user-label','native']
+    expected=dict(request['fiber_normal_sign'],afv='input.afv',output_root=str(tmp_path/'oriented'))
+    assert stages[0]['request']=={'fiber_normal_sign':expected}
+    assert stages[1]['request']['commands'][0]['args']==['input.afv']
+    assert stage_requests([],tmp_path,'input.afv')==[]
+
+
+@pytest.mark.parametrize('stages',[
+    [{'name':'../escape','request':{'a':{}}}],
+    [{'name':'same','request':{'a':{}}}]*2,
+    [{'name':'x','request':{'a':{},'b':{}}}],
+    [{'name':'x'}],
+    [{'name':'x','request':{'a':{}},'config_file':'unused'}],
+])
+def test_stage_requests_reject_ambiguous_or_unsafe_input(tmp_path,stages):
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_json_solve import stage_requests
+    with pytest.raises(ValueError):stage_requests(stages,tmp_path,'input.afv')
 
 
 def test_transfer_151_radial_prior():
@@ -45,7 +71,7 @@ def test_conversion_roundtrip_and_source_guard(tmp_path):
         db.execute('INSERT INTO metadata VALUES (?,?)',('root',json.dumps({'coordinate_base_shape_zyx':[20,20,20]})))
     source=tmp_path/'source';source.mkdir()
     doc=dict(coordinate_base_shape_zyx=[20,20,20],line_points=[[1,2,3],[4,5,6]],
-             control_points=[dict(segment_to_next=dict(normal_manifest='PHercParis4/20260411134726',interp_mode='trace')),{}],
+             control_points=[dict(segment_to_next=dict(normal_manifest='test-volume/test-scan',interp_mode='trace')),{}],
              hv_classification={'automatic_tag':'H'},branches=[],adjacent_branches=[])
     path=source/'a.json';path.write_text(json.dumps(doc))
     output=tmp_path/'out.afv'

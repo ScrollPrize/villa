@@ -1,4 +1,4 @@
-"""Frozen consensus regression benchmark for the seven-fiber geometry solve.
+"""Frozen consensus regression benchmark for supplied reference-fiber solves.
 
 No optimization of candidates. A single global affine alignment removes gauge
 and low-order distortion; no per-fiber alignment or integer reassignment.
@@ -91,10 +91,10 @@ def evaluate(candidate,ref,meta):
     cohort=np.union1d(events,candidate['events'])
     cohort=cohort[mask[candidate['a'][cohort]]&mask[candidate['b'][cohort]]]
     gaps=candidate['p'][candidate['b'][cohort]]-candidate['p'][candidate['a'][cohort]]
-    checks=dict(winding=bool(np.abs(error[mask,0]).max()<=.1),
+    checks=dict(winding=bool(np.abs(error[mask,0]).max()<=meta.get('winding_tolerance',.1)),
                 vertical=bool(np.abs(error[mask,1]).max()<=meta['v_tolerance_vx']),
                 global_distortion=bool(matrix_error<=meta['affine_tolerance']),
-                meetings=bool(np.linalg.norm(gaps,axis=1).max()<1),
+                meetings=bool(np.linalg.norm(gaps,axis=1).max()<meta.get('meeting_tolerance_vx',1.)),
                 cohort=len(missing)==0,confident=bool((candidate['prob'][included]>=.5).all()))
     for family in ('H','V'):
         for kind in ('length_percent','angle_degrees'):
@@ -136,7 +136,7 @@ def run(settings):
         # Only one global transform; no local or per-fiber warps are permitted.
         meta=dict(version=2,excluded_source_ids=excluded,v_tolerance_vx=max(1.,1.05*max(np.abs(p-consensus)[mask,1].max() for p,_,_ in fits)),
                   affine_tolerance=max(.01,1.05*max(np.abs(a-np.eye(2)).max() for _,a,_ in fits)),
-                  winding_tolerance=.1,meeting_tolerance_vx=1.,
+                  winding_tolerance=settings.get('winding_tolerance',.1),meeting_tolerance_vx=settings.get('meeting_tolerance_vx',1.),
                   references=[dict(root=m['root'],solution_sha256=m['solution_sha256'],
                                    config_sha256=m['config_sha256']) for m in models],limits={})
         for family in ('H','V'):

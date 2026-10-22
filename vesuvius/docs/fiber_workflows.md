@@ -38,7 +38,7 @@ Other native tools, such as reference replay, must be available separately.
 
 | Workflow key | Inputs / result |
 |---|---|
-| `fiber_json_solve` | Reviewed JSON directory + AFV metadata template + stage templates; creates AFV, constraints, normal/HV/direction stages and whole-GT layout. |
+| `fiber_json_solve` | Reviewed JSON directory + AFV metadata template + explicit ordered stages; creates AFV and dispatches extraction, normal/HV/direction and layout requests. |
 | `fiber_anchored_dataset` | Reference-curated source graph; constructs an anchored dataset with fixed reference events. |
 | `fiber_selected_dataset_eval` | `dataset`, `base_config`, `gt_root`, `output_root`; filter unsupported sources, split if configured, initialize, solve and score. |
 | `fiber_selected_score` / `fiber_selected_checkpoint_report` | Score completed or published intermediate states without rerunning optimization. |
@@ -73,12 +73,24 @@ Editable samples: [selected-set evaluation](examples/fiber_workflows/selected_da
 [neighbor expansion](examples/fiber_workflows/neighbors.json).
 
 For reviewed JSON, provide `expected_manifest_tokens` (source volume/scan tokens)
-and `umbilicus` explicitly. Do not infer scan identity from array shape alone.
-`templates` is a directory; `template_files` can map any historical template name
-to an explicit path. The names are listed in `fiber_json_solve.run`. Template
-content is supplied by the caller, not bundled experimental recipes.
-`solve_parameters` overrides the historical pilot's execution settings.
-`trusted_gt: true` preserves whole fibers and forces them enabled.
+and supply `umbilicus` in stages that require it. Do not infer scan identity from array shape alone.
+Use `stages`, an ordered list of `{name, config_file}` or `{name, request}`
+entries. Each request is a complete workflow object (or native command-list
+job). Stage names are caller-selected output labels, not preset selectors.
+`{afv}` and `{output_root}` are expanded in request string values; referenced
+native configuration files must already contain their own correct paths. No
+solver settings, enablement policies, pass counts or GPU reservations are injected.
+An empty list converts JSON to AFV only. `layout_output` optionally requests the
+categorical-layout report; omit it for other checkpoint formats. See the
+[JSON pipeline example](examples/fiber_workflows/json_pipeline.json).
+
+For surface projection, `reference_xyz_scale` is required in anchored-dataset and
+full-slab jobs (including slab scoring jobs). Supply the reference-to-base-voxel
+scale for the actual input, rather than assuming a particular scan resolution.
+Projection stride, candidate count and sampling distance are configurable.
+`fiber_gt_inpainting` runs deformation only when `deformation_parameters` is
+provided. `fiber_current_gt_solve` renders only when `visualization` is supplied.
+Both settings objects pass caller choices through to the existing implementations.
 
 ## Iterative search and regression problems
 
@@ -88,15 +100,10 @@ and coarse-to-ultrafine coordinate search. The objective remains summed GT
 perpendicular sign violations **divided by** selectable retained-GT arc fraction;
 summed GT perpendicular L1 breaks ties. The threshold is probability >= 0.5.
 
-Portable, editable usage samples:
-
-- [Focused coupled search](examples/fiber_workflows/run_split_focused_search.json)
-- [Split/disablement-only search](examples/fiber_workflows/run_split_exact_cost_search.json)
-- [All-parameter search](examples/fiber_workflows/run_split_all_parameter_search.json)
-- [Full search excluding minimum-width terms](examples/fiber_workflows/run_split_full_except_minwidth.json)
-
-Paths are placeholders and values illustrate the interface, not a newly validated
-optimum. Set `background: true` for a persistent coordinator; it writes its PID,
+The [minimal search example](examples/fiber_workflows/split_search.json) shows
+bounds, discrete choices and a coupled proposal. It is an interface illustration,
+not a tuned parameter set. Unspecified solver settings come from `base_config`.
+Set `background: true` for a persistent coordinator; it writes its PID,
 config and log. Otherwise the process remains attached. `accepted_improvements:
 null` keeps searching; an integer is an explicit stop limit. Resume with identical
 settings and code in the same output root. Changed scientific inputs/code require
@@ -117,32 +124,31 @@ The small-GT matrix is data-independent code:
 4. `fiber_reference_check`: construct/use consensus regression references;
    reports geometry, signs, length, angle and meeting checks.
 5. `fiber_uv_weight_search.regression_guard`: apply the recorded acceptance
-   limits. Supply limits/reference data explicitly; GT7 exclusions are not global.
+   limits. Supply limits/reference data and any excluded source IDs explicitly.
 
-Use full, sign-only with sampled priors, width x0.5, width x2 and sign-only without
-sampled priors as separate recipe inputs. Historical references/thresholds are
-experiment artifacts, not universal assumptions. The same code supports other
-small reference problems. [The no-initialization-width-prior rule](fiber_layout_no_width_prior.md)
-applies to every workflow, including old recipes.
-The [width-regression sample](examples/fiber_workflows/gt_width_regression.json)
-runs three full-objective initializations. Run the same probe with `gt_pair_mode:
-"sign_only"` in `parameters` for the sign controls; set `arc_prior_spacing_vx: 1000`
-for sampled priors and `arc_prior_spacing_vx: null` for the no-extra-sampling control
-(using the original, unresampled source sample cache). The source
-configuration/checkpoint determines all other model settings.
+Choose regression modes, initialization variants, sampling and acceptance limits
+in external configurations. The [width-regression sample](examples/fiber_workflows/gt_width_regression.json)
+illustrates two caller-selected trials; it is not a required test matrix.
+The [no-initialization-width-prior rule](fiber_layout_no_width_prior.md) applies
+to every workflow. In paired searches, `gt_parameter_overrides` explicitly maps
+regression names to mode-specific overrides; names never select hidden behavior.
+Non-screened paired searches use two large-run GPU lanes and the remaining lanes
+for the supplied regression suite. `gt_gpu_manager` optionally overrides regression
+resource requests; otherwise those come from each supplied regression request.
 
 ## Diagnostics, visualization and export
 
 | Workflow/API | Functionality |
 |---|---|
+| `fiber_sign_rejection_report` | Compare supplied `roots` against `baseline`; `internal_audits` maps each root to its audit summary path. No implicit grids or audit-directory discovery. |
 | `fiber_density_sign_report` | Internal or frozen-GT sign counts, distributions and detailed error breakdown. |
 | `fiber_implicit_match_report` | Same-sheet meeting metrics over probability cutoffs. |
 | `fiber_reference_rounding_audit` | Floating vs integer scoring and alternative references. |
 | `fiber_forced_selectable_audit` | Exact parent-geometry/hypothesis transfer and full objective comparison on selectable graphs. |
 | `paired_winding_review` | Matched-cohort changed-winding plots, dotted fibers and sign-neighbor highlighting. |
-| `fiber_direction_review` | Direction disagreement audits and OBJ exports. |
+| `fiber_direction_review` | Direction disagreement audits and OBJ exports; `normal_visualization` configures the shared normal-arrow exporter. |
 | `fiber_uv_refinement_inspection` | Matched before/after deformations, movement in voxels and windings, plots. |
-| `fiber_fixed_metric_probe`, `fiber_optimizer_probe`, `fiber_lbfgs_audit` | Fixed-meeting/length/angle probes and optimizer/conditioning comparisons. |
+| `fiber_fixed_metric_probe`, `fiber_optimizer_probe`, `fiber_lbfgs_audit` | Fixed-meeting/length/angle probes and optimizer/conditioning comparisons. Fixed-metric rendering is opt-in via `visualization`. |
 | `fiber_uv_surface` / `fiber_uv_surface_audit` | H-anchored tifxyz surface construction and audit from historical categorical U/V solutions. |
 | `fiber_reference_surface` | Explicit S3 reference acquisition with integrity/provenance checks. |
 | `fiber_pair_connectivity` | Existing two-fiber threshold/component/skeleton diagnostic with reference strips and OBJ export. |
@@ -183,12 +189,13 @@ solver algebra; enable them explicitly. No new speed or convergence claim is mad
 
 ## Local archive and verification
 
-Historical material is not a package dependency. In this checkout it resides in
-`experiments/docs/global-fiber-sgd/` (recipes/docs/reports) and
-`experiments/data/global-fiber-sgd/` (datasets/results). A compatibility symlink
-preserves old absolute paths without rewriting provenance. The archive and local
-`task.md` are ignored by Git; only reusable code, tests, specs and usage samples
-are intended for review.
+Only reusable implementations, specifications, synthetic tests and minimal usage
+examples belong in the shared tree. Dataset/scan names, snapshot IDs, historical
+trial names, tuned winner configurations and experiment-result tables do not.
+Keep those artifacts externally, for example under ignored `experiments/docs/`
+and `experiments/data/`. Workflows must take experimental choices as explicit
+inputs; report metadata must describe those inputs, not a historical experiment.
+Changing a request requires a new output root when provenance checks reject reuse.
 
 ```sh
 python -m pytest -q vesuvius/tests/test_fiber_*.py vesuvius/tests/test_paired_*.py
