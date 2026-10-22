@@ -49,6 +49,7 @@ def _config(tmp_path, *, device="cpu", depth=0, mode=None, start=0):
 class _Writer:
     def __init__(self):
         self.scalars = {}
+        self.images = []
         self.closed = False
         self.flushes = 0
 
@@ -58,8 +59,8 @@ class _Writer:
     def add_text(self, *args, **kwargs):
         pass
 
-    def add_image(self, *args, **kwargs):
-        pass
+    def add_image(self, tag, image, step, **kwargs):
+        self.images.append((tag, step))
 
     def flush(self):
         self.flushes += 1
@@ -70,7 +71,7 @@ class _Writer:
 
 def _observe_queue(monkeypatch):
     queues = []
-    original = train._make_training_sample_queue
+    original = train.FiberTrace3DSampleQueue
 
     def make(*args, **kwargs):
         queue = original(*args, **kwargs)
@@ -89,7 +90,7 @@ def _observe_queue(monkeypatch):
         queue.submit = record
         return queue
 
-    monkeypatch.setattr(train, "_make_training_sample_queue", make)
+    monkeypatch.setattr(train, "FiberTrace3DSampleQueue", make)
     # A production run must no longer instantiate either legacy whole-batch
     # loader or the serial fallback, even with loader_workers=0.
     monkeypatch.setattr(train, "_make_batch_dataloader", lambda *a, **k: pytest.fail("legacy loader"))
@@ -144,7 +145,8 @@ def _trainer_equivalence(tmp_path, monkeypatch, *, device="cpu", depth=0, mode=N
     if start:
         resume = tmp_path / "resume.pt"
         train._save_snapshot(resume, model=reference, optimizer=optimizer,
-            step=start, config=raw, metric=None, metric_name=None)
+            step=start, config=raw, metric=None, metric_name=None,
+            sample_progress=train._SampleProgress(0, 0, loader.config.batch_size))
 
     # Serial oracle calls the same production losses, model and target builder,
     # but obtains each real augmented crop directly, as before queue integration.
@@ -166,12 +168,12 @@ def _trainer_equivalence(tmp_path, monkeypatch, *, device="cpu", depth=0, mode=N
         if step % 2 == 0:
             expected_rows[step] = _serial_test_rows(reference, test_loader, test_options)
 
-    rows, sheets, observed_batches = {}, [], []
-    evaluate, visualize = train._evaluate_dense_loss_rows, train._write_3d_sample_sheet
-    forward = train._forward_loss_tensors
+    rows, observed_batches = {}, []
+    evaluate = train._evaluate_dense_loss_rows
+    forward = train._forward_loss_statistics
 
     def check_input(model, batch, **kwargs):
-        if kwargs["training_loss"]:
+        if kwargs.get("training_loss", True):
             _assert_same_batch(batch.to("cpu"), expected_batches[len(observed_batches)])
             observed_batches.append(tuple(batch.stream_indices.tolist()))
         return forward(model, batch, **kwargs)
@@ -181,17 +183,8 @@ def _trainer_equivalence(tmp_path, monkeypatch, *, device="cpu", depth=0, mode=N
         rows[kwargs["diagnostic_step"]] = result
         return result
 
-    def sheet(w, tag, model, batch, step, **kwargs):
-        # Check retained test batch zero survived partial batches and ring reuse.
-        if tag.startswith("test_"):
-            expected = materialize_targets(test_loader.load_batch(5).to(dev), test_loader.config)
-            _assert_same_batch(batch, expected)
-        sheets.append((tag, step))
-        return visualize(w, tag, model, batch, step, **kwargs)
-
     monkeypatch.setattr(train, "_evaluate_dense_loss_rows", capture)
-    monkeypatch.setattr(train, "_write_3d_sample_sheet", sheet)
-    monkeypatch.setattr(train, "_forward_loss_tensors", check_input)
+    monkeypatch.setattr(train, "_forward_loss_statistics", check_input)
     # Init consumes exactly the same RNG as the serial oracle; input sampling
     # has its own canonical per-sample seeds and cannot depend on worker order.
     torch.manual_seed(151)
@@ -204,7 +197,7 @@ def _trainer_equivalence(tmp_path, monkeypatch, *, device="cpu", depth=0, mode=N
             assert index == ref_index
             assert actual == pytest.approx(expected, rel=3e-5, abs=3e-6)
     for step, loss in expected_train.items():
-        assert writer.scalars["train/loss_total", step] == pytest.approx(loss, rel=3e-5, abs=3e-6)
+        assert writer.scalars["train/loss_total", step * loader.config.batch_size] == pytest.approx(loss, rel=3e-5, abs=3e-6)
     state = torch.load(tmp_path / "runs/queue_fixed/snapshots/current.pt", weights_only=False,
                        map_location="cpu")
     assert state["step"] == start + 4
@@ -215,12 +208,13 @@ def _trainer_equivalence(tmp_path, monkeypatch, *, device="cpu", depth=0, mode=N
                                 optimizer.state_dict()["state"].values(), strict=True):
         for key, value in expected.items():
             torch.testing.assert_close(actual[key], value.cpu(), rtol=3e-5, atol=3e-6)
-    assert sheets == [("test_sample_3d/principal_slices", start)] + (
+    sheets = [("test_sample_3d/principal_slices", start)] + (
         [("train_sample_3d/principal_slices", 1)] if start == 0 else []) + [
         ("train_sample_3d/principal_slices", start + 2),
         ("test_sample_3d/principal_slices", start + 2),
         ("train_sample_3d/principal_slices", start + 4),
         ("test_sample_3d/principal_slices", start + 4)]
+    assert writer.images == [(tag, step * loader.config.batch_size) for tag, step in sheets]
     assert len(queues) == 1
     queue = queues[0]
     assert len(queue.observed_processes) == 2
@@ -258,17 +252,18 @@ def test_real_paris4_trainer_failure_closes_shared_workers_and_writer(tmp_path, 
     queues = _observe_queue(monkeypatch)
     writer = _Writer()
     monkeypatch.setattr(train, "_make_summary_writer", lambda *a, **k: writer)
-    original = train._forward_loss_tensors
+    original = train._forward_loss_statistics
 
     def fail(model, batch, **kwargs):
-        if ((failure == "train" and kwargs["training_loss"])
-                or (failure == "initial" and not kwargs["training_loss"])
-                or (failure == "periodic" and not kwargs["training_loss"]
+        training_loss = kwargs.get("training_loss", True)
+        if ((failure == "train" and training_loss)
+                or (failure == "initial" and not training_loss)
+                or (failure == "periodic" and not training_loss
                     and "train/loss_total" in {tag for tag, _ in writer.scalars})):
             raise RuntimeError("injected trainer failure")
         return original(model, batch, **kwargs)
 
-    monkeypatch.setattr(train, "_forward_loss_tensors", fail)
+    monkeypatch.setattr(train, "_forward_loss_statistics", fail)
     with pytest.raises(RuntimeError, match="injected trainer failure"):
         train.run_training(path, unmanaged=True)
     assert writer.closed
@@ -356,27 +351,16 @@ def test_cuda_real_distributed_queued_training_matches_previous_ddp_objective(tm
     _distributed_equivalence(tmp_path, "cuda", test_count)
 
 
-def test_real_paris4_open_ended_training_keeps_lazy_queue_and_closes_on_error(tmp_path, monkeypatch):
+def test_real_paris4_queue_requires_finite_steps_before_starting_workers(tmp_path, monkeypatch):
     raw, path = _config(tmp_path)
     raw.pop("test_datasets")
-    raw["training"].update(max_steps=0, test_interval=100, checkpoint_interval=100, loader_workers=0,
-                           sample_pipeline_workers=1, tensorboard_enabled=False)
+    raw["training"].update(max_steps=0, test_interval=100, checkpoint_interval=100,
+                           tensorboard_enabled=False)
     path.write_text(json.dumps(raw))
     queues = _observe_queue(monkeypatch)
-    original = train._forward_loss_tensors
-    processed = []
-
-    def stop(model, batch, **kwargs):
-        processed.append(tuple(batch.stream_indices.tolist()))
-        if len(processed) == 3:
-            raise RuntimeError("stop open-ended run")
-        return original(model, batch, **kwargs)
-
-    monkeypatch.setattr(train, "_forward_loss_tensors", stop)
-    with pytest.raises(RuntimeError, match="stop open-ended run"):
+    with pytest.raises(ValueError, match="finite training.max_steps"):
         train.run_training(path, unmanaged=True)
-    assert processed == [(0, 1), (2, 3), (4, 5)]
-    _assert_workers_exited(queues[0])
+    assert not queues
 
 
 @pytest.mark.parametrize("total,world,expected", [(8, 3, [3, 3, 2]), (2, 4, [1, 1, 0, 0])])
@@ -391,9 +375,10 @@ def test_worker_partition(total, world, expected):
     ("sample_pipeline_cuda_value_augmentation", "all", "prefetch_depth"),
 ])
 def test_invalid_preparation_options_fail_before_worker_start(tmp_path, monkeypatch, key, value, match):
-    raw = {"training": {"device": "cpu", key: value}}
-    monkeypatch.setattr(train, "_load_raw_config", lambda _: raw)
+    raw = {"training": {"device": "cpu", "sample_pipeline_workers": 1, key: value}}
+    config = tmp_path / "invalid.json"
+    config.write_text(json.dumps(raw))
     monkeypatch.setattr(train, "load_config", lambda _: None)
     monkeypatch.setattr(train, "FiberTrace3DLoader", lambda _: pytest.fail("started loader"))
     with pytest.raises(ValueError, match=match):
-        train.run_training(tmp_path / "unused.json", unmanaged=True)
+        train.run_training(config, unmanaged=True)

@@ -1557,15 +1557,16 @@ def compute_losses(
         pred_selected = pred_sparse[row_index, selected_branch]
         direction_error = (pred_selected - batch.direction_target_sparse) ** 2
         direction_error = direction_error * batch.direction_weight_sparse
-        direction_sum = direction_error.sum()
+        # BF16 cannot represent every target count; reduce statistics in FP32.
+        direction_sum = direction_error.float().sum()
         if batch.presence_target_mode == "anisotropic_gaussian":
             direction_falloff = batch.presence_target[
                 indices[:, 0], 0, indices[:, 1], indices[:, 2], indices[:, 3]
-            ].to(dtype=direction_error.dtype)
+            ].float()
             direction_count = direction_falloff.sum() * int(direction_error.shape[-1])
         else:
             direction_falloff = None
-            direction_count = direction_error.new_tensor(direction_error.numel())
+            direction_count = direction_error.new_tensor(direction_error.numel(), dtype=torch.float32)
         selected_axis = pred_axis[row_index, selected_branch]
         agreement = torch.abs(torch.sum(selected_axis * target_axis, dim=-1)).clamp(0.0, 1.0)
         angle_values = torch.rad2deg(torch.acos(agreement))
@@ -1892,11 +1893,12 @@ def compute_conditioned_losses(
             dtype=direction_error.dtype,
             device=direction_error.device,
         )[:, None, :]
-        direction_sum = direction_error.sum()
+        # BF16 cannot represent every target count; reduce statistics in FP32.
+        direction_sum = direction_error.float().sum()
         if batch.presence_target_mode == "anisotropic_gaussian":
             direction_falloff = batch.presence_target[
                 indices[:, 0], 0, indices[:, 1], indices[:, 2], indices[:, 3]
-            ].to(dtype=direction_error.dtype)
+            ].float()
             direction_count = (
                 direction_falloff.sum()
                 * int(direction_error.shape[1])
@@ -1904,7 +1906,7 @@ def compute_conditioned_losses(
             )
         else:
             direction_falloff = None
-            direction_count = direction_error.new_tensor(direction_error.numel())
+            direction_count = direction_error.new_tensor(direction_error.numel(), dtype=torch.float32)
         pred_axis = decode_lasagna_direction_3x2_analytic(pred_dirs.reshape(-1, 6)).reshape(
             int(indices.shape[0]),
             positive_query_count,
@@ -3418,6 +3420,8 @@ def training_units(
     bounded_accumulation = training.get("bounded_gradient_accumulation", False)
     if type(bounded_accumulation) is not bool:
         raise ValueError("training.bounded_gradient_accumulation must be a boolean")
+    if batch_source is not None and not bounded_accumulation:
+        raise ValueError("external canonical sample ownership requires bounded accumulation")
     if raw_config.get("embedding", {}).get("paired_patches", False) and not bounded_accumulation:
         raise ValueError("paired embedding training requires bounded_gradient_accumulation to keep pairs together")
     profile_loader = loader_profile_enabled(training)
@@ -3954,7 +3958,7 @@ def training_units(
         sample_queue = FiberTrace3DSampleQueue(
             sources=sources, workers=local_workers, slot_count=local_slots,
             initial_in_flight=min(local_slots, max(1, int(training.get("sample_pipeline_initial_in_flight", 16)))),
-            load_affinity_workers=max(0, local_workers // 2), profile=profile_loader)
+            load_affinity_workers=max(1, local_workers // 2), profile=profile_loader)
         index_map = bounded_index or VirtualBatchSampleIndex(
             batch_size=loader.config.batch_size, physical_world_size=distributed.world_size,
             rank=distributed.rank, virtual_world_size=optimizer_virtual_world_size, start_step=int(start_step))
@@ -4557,8 +4561,6 @@ def training_units(
         raise
     _distributed_barrier(distributed)
 
-    if batch_source is not None and not bounded_accumulation:
-        raise ValueError("external canonical sample ownership requires bounded accumulation")
     train_iterator = train_dataloader = batch_source if batch_source is not None else queued_train
     admit_training_until_test(start_step)
 
@@ -6807,6 +6809,7 @@ def _next_training_batch(
     sample_index_limit: int | None = None,
     sample_mode: str,
     device: torch.device,
+    prepare_targets: bool = True,
     profile_targets: bool = False,
     output_stride: int = 1,
 ) -> tuple[FiberTrace3DBatch, float, float, float, float]:
@@ -6853,15 +6856,21 @@ def _next_training_batch(
             float(timings.get("cuda_pipeline_target_ms", 0.0)),
         )
     to_device_start = time.perf_counter()
+    release_current = getattr(iterator, "release_current", None)
     try:
         batch = batch.to(device)
+        if callable(release_current) and device.type == "cpu":
+            # .to(cpu) aliases queue storage; own it before returning the slot.
+            batch = replace(batch, **{name: value.clone() for name, value in vars(batch).items()
+                                      if isinstance(value, torch.Tensor)})
         if device.type == "cuda":
             torch.cuda.synchronize(device)
     finally:
-        release_current = getattr(iterator, "release_current", None)
         if callable(release_current):
             release_current()
     to_device_ms = (time.perf_counter() - to_device_start) * 1000.0
+    if not prepare_targets:
+        return batch, wait_ms + to_device_ms, wait_ms, to_device_ms, 0.0
     target_start = time.perf_counter()
     batch = materialize_targets(
         batch,
