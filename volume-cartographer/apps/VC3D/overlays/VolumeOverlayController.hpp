@@ -60,7 +60,6 @@ public:
         std::optional<std::string> volumeId;
         std::optional<std::string> colormap;
         std::optional<float> opacity;
-        std::optional<float> threshold;
         std::optional<Window> window;
         std::optional<bool> intensityAsAlpha;
         std::optional<int> maxDisplayedResolution;
@@ -104,7 +103,6 @@ private:
     void setColormap(const std::string& id);
     void setSamplingMethod(vc::Sampling method);
     void setOpacity(float value);
-    void setThreshold(float value);
     void setWindowBounds(float low, float high);
     void setIntensityAsAlpha(bool enabled);
     void setMaxDisplayedResolution(int value);

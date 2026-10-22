@@ -176,8 +176,6 @@ VolumeOverlayController::apply(const Update& update)
             setColormap(*update.colormap);
         if (update.opacity)
             setOpacity(*update.opacity);
-        if (update.threshold)
-            setThreshold(*update.threshold);
         if (update.window)
             setWindowBounds(update.window->low, update.window->high);
         if (update.intensityAsAlpha)
@@ -797,14 +795,8 @@ void VolumeOverlayController::loadState()
     _overlayOpacity = std::clamp(settings.value(volume_overlay::OPACITY, _overlayOpacity).toFloat(), 0.0f, 1.0f);
     _overlayOpacityBeforeToggle = _overlayOpacity;
 
-    const QVariant storedWindowLow = settings.value(volume_overlay::WINDOW_LOW);
-    if (storedWindowLow.isValid()) {
-        _overlayWindowLow = std::clamp(storedWindowLow.toFloat(), 0.0f, 255.0f);
-    } else {
-        // Fall back to legacy threshold if present.
-        const float legacyThreshold = std::max(0.0f, settings.value(volume_overlay::THRESHOLD, _overlayWindowLow).toFloat());
-        _overlayWindowLow = std::clamp(legacyThreshold, 0.0f, 255.0f);
-    }
+    _overlayWindowLow = std::clamp(
+        settings.value(volume_overlay::WINDOW_LOW, _overlayWindowLow).toFloat(), 0.0f, 255.0f);
 
     const QVariant storedWindowHigh = settings.value(volume_overlay::WINDOW_HIGH);
     if (storedWindowHigh.isValid()) {
@@ -876,7 +868,6 @@ void VolumeOverlayController::saveState() const
     settings.setValue(volume_overlay::OPACITY, _overlayOpacity);
     settings.setValue(volume_overlay::WINDOW_LOW, _overlayWindowLow);
     settings.setValue(volume_overlay::WINDOW_HIGH, _overlayWindowHigh);
-    settings.setValue(volume_overlay::THRESHOLD, _overlayWindowLow); // legacy compatibility
     settings.setValue(volume_overlay::COLORMAP, QString::fromStdString(_overlayColormapName));
     settings.setValue(volume_overlay::INTENSITY_AS_ALPHA, _overlayIntensityAsAlpha);
     settings.setValue(volume_overlay::SAMPLING_METHOD,
@@ -965,12 +956,6 @@ void VolumeOverlayController::setSamplingMethod(vc::Sampling method)
 
     for (auto* manager : _viewerManagers)
         manager->setOverlaySamplingMethod(_overlaySamplingMethod);
-}
-
-void VolumeOverlayController::setThreshold(float value)
-{
-    const float clamped = std::clamp(value, 0.0f, 255.0f);
-    setWindowBounds(clamped, _overlayWindowHigh);
 }
 
 void VolumeOverlayController::setWindowBounds(float low, float high)

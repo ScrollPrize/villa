@@ -518,7 +518,6 @@ namespace volume_overlay {
     constexpr auto OPACITY = "opacity";
     constexpr auto WINDOW_LOW = "window_low";
     constexpr auto WINDOW_HIGH = "window_high";
-    constexpr auto THRESHOLD = "threshold";  // Legacy key
     constexpr auto COLORMAP = "colormap";
     constexpr auto INTENSITY_AS_ALPHA = "intensity_as_alpha";
     constexpr auto SAMPLING_METHOD = "sampling_method";

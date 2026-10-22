@@ -27,17 +27,21 @@ void buildWindowLevelLut(std::array<uint32_t, 256>& lut,
     }
 }
 
-void buildWindowLevelColormapLut(std::array<uint32_t, 256>& lut,
-                                 float windowLow, float windowHigh,
-                                 const std::string& colormapId)
+namespace {
+
+// buildWindowLevelColormapLut, also returning the window/level ramp in wl and
+// the resolved spec (nullptr for grayscale).
+const OverlayColormapSpec* buildColormapLut(std::array<uint32_t, 256>& lut,
+                                            std::array<uint32_t, 256>& wl,
+                                            float windowLow, float windowHigh,
+                                            const std::string& colormapId)
 {
     // First build the window/level grayscale ramp.
-    std::array<uint32_t, 256> wl;
     buildWindowLevelLut(wl, windowLow, windowHigh);
 
     if (colormapId.empty()) {
         lut = wl;
-        return;
+        return nullptr;
     }
 
     const OverlayColormapSpec& spec = vc::resolve(colormapId);
@@ -50,7 +54,7 @@ void buildWindowLevelColormapLut(std::array<uint32_t, 256>& lut,
             lut[i] = spec.discreteLut[mapped];
         }
         lut[0] = kBlack;
-        return;
+        return &spec;
     }
 
     if (spec.kind == OverlayColormapKind::Tint) {
@@ -66,7 +70,7 @@ void buildWindowLevelColormapLut(std::array<uint32_t, 256>& lut,
                    | static_cast<uint32_t>(B);
         }
         lut[0] = kBlack;
-        return;
+        return &spec;
     }
 
     // OpenCV colormap: apply to an 8-bit ramp, then fuse with wl.
@@ -84,6 +88,17 @@ void buildWindowLevelColormapLut(std::array<uint32_t, 256>& lut,
                | static_cast<uint32_t>(bgr[0]);
     }
     lut[0] = kBlack;
+    return &spec;
+}
+
+}  // namespace
+
+void buildWindowLevelColormapLut(std::array<uint32_t, 256>& lut,
+                                 float windowLow, float windowHigh,
+                                 const std::string& colormapId)
+{
+    std::array<uint32_t, 256> wl;
+    buildColormapLut(lut, wl, windowLow, windowHigh, colormapId);
 }
 
 void buildOverlayLut(std::array<uint32_t, 256>& lut,
@@ -91,10 +106,13 @@ void buildOverlayLut(std::array<uint32_t, 256>& lut,
                      const std::string& colormapId,
                      bool intensityAsAlpha)
 {
-    std::array<uint32_t, 256> color;
-    buildWindowLevelColormapLut(color, windowLow, windowHigh, colormapId);
+    std::array<uint32_t, 256> color, wl;
+    const OverlayColormapSpec* spec =
+        buildColormapLut(color, wl, windowLow, windowHigh, colormapId);
+    // Label values are not intensities, so labels always use the default mode.
+    const bool discrete = spec && spec->kind == OverlayColormapKind::DiscreteLut;
 
-    if (!intensityAsAlpha) {
+    if (!intensityAsAlpha || discrete) {
         for (int i = 0; i < 256; ++i) {
             const float v = static_cast<float>(i);
             lut[i] = (v >= windowLow && v <= windowHigh) ? color[i] : 0u;
@@ -102,26 +120,29 @@ void buildOverlayLut(std::array<uint32_t, 256>& lut,
         return;
     }
 
-    std::array<uint32_t, 256> wl;
-    buildWindowLevelLut(wl, windowLow, windowHigh);
     // Empty id is grayscale, which is black at zero like a tint.
-    const OverlayColormapSpec* spec = colormapId.empty() ? nullptr : &vc::resolve(colormapId);
-    const bool discrete = spec && spec->kind == OverlayColormapKind::DiscreteLut;
     const bool premultiplied = !spec || spec->premultiplied;
 
     for (int i = 0; i < 256; ++i) {
         const uint32_t t = wl[i] & 0xFFu;
-        const uint32_t alpha = discrete ? (t != 0 ? 255u : 0u) : t;
-        uint32_t rgb = color[i] & 0x00FFFFFFu;
-        if (!discrete && !premultiplied) {
+        if (t == 0) {
+            lut[i] = 0u;
+            continue;
+        }
+        const uint32_t r = (color[i] >> 16) & 0xFFu;
+        const uint32_t g = (color[i] >> 8) & 0xFFu;
+        const uint32_t b = color[i] & 0xFFu;
+        if (premultiplied) {
+            // Alpha is the brightest channel, so rgb <= alpha holds and the
+            // result over black is exactly the opaque colormap.
+            const uint32_t alpha = std::max({r, g, b});
+            lut[i] = alpha == 0 ? 0u : ((alpha << 24) | (color[i] & 0x00FFFFFFu));
+        } else {
             const auto scale = [t](uint32_t c) {
                 return (c * t + 127u) / 255u;
             };
-            rgb = (scale((rgb >> 16) & 0xFFu) << 16) |
-                  (scale((rgb >> 8) & 0xFFu) << 8) |
-                  scale(rgb & 0xFFu);
+            lut[i] = (t << 24) | (scale(r) << 16) | (scale(g) << 8) | scale(b);
         }
-        lut[i] = alpha == 0 ? 0u : ((alpha << 24) | rgb);
     }
 }
 

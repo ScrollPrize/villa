@@ -158,7 +158,6 @@ void AgentBridgeServer::registerViewerHandlers()
                     QStringLiteral("colormap"),
                     overlayColormapIds()),
                 Params::optionalNumber(QStringLiteral("opacity")),
-                Params::optionalNumber(QStringLiteral("threshold")),
                 optionalWindow(QStringLiteral("window")),
                 Params::optionalBoolean(QStringLiteral("intensityAsAlpha")),
                 Params::optionalInteger(QStringLiteral("maxDisplayedResolution")),

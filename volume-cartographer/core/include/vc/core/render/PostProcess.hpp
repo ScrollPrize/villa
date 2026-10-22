@@ -21,10 +21,12 @@ void buildWindowLevelColormapLut(std::array<uint32_t, 256>& lut,
 
 // Overlay LUT: premultiplied RGB with per-entry alpha in the top byte, for
 // blendOverlayArgb. Default mode is opaque colour inside [windowLow,
-// windowHigh] and transparent outside. intensityAsAlpha makes the windowed
-// intensity the alpha (saturating above windowHigh); the colour is the
-// colormap's, premultiplied or scaled by alpha per spec.premultiplied, and
-// discrete (label) maps are opaque wherever the label is nonzero.
+// windowHigh] and transparent outside. intensityAsAlpha is transparent below
+// the window and opaque from its top: premultiplied maps (spec.premultiplied,
+// and grayscale) keep their colour with alpha = its brightest channel, so over
+// black they match the opaque colormap; straight maps take the windowed
+// intensity as alpha and are scaled by it.
+// Discrete (label) maps ignore intensityAsAlpha and always use default mode.
 void buildOverlayLut(std::array<uint32_t, 256>& lut,
                      float windowLow, float windowHigh,
                      const std::string& colormapId,

@@ -4,6 +4,7 @@
 #include "vc/core/render/PostProcess.hpp"
 #include "vc/core/render/Colormaps.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 
@@ -167,7 +168,7 @@ TEST_CASE("buildOverlayLut: intensity-as-alpha keeps a tint bright and ramps alp
     CHECK(vc::blendOverlayArgb(0xFFFFFFFFu, lut[100], 1.0f) == 0xFFFFFFFFu - 100u * 0x101u);
 }
 
-TEST_CASE("buildOverlayLut: intensity-as-alpha scales straight maps, labels are opaque")
+TEST_CASE("buildOverlayLut: intensity-as-alpha scales straight maps")
 {
     LUT color{}, lut{};
     vc::buildWindowLevelColormapLut(color, 0.0f, 255.0f, "viridis");
@@ -176,9 +177,37 @@ TEST_CASE("buildOverlayLut: intensity-as-alpha scales straight maps, labels are 
     CHECK((lut[255] & 0x00FFFFFFu) == (color[255] & 0x00FFFFFFu));
     CHECK(G(lut[51]) == (G(color[51]) * 51 + 127) / 255);
 
-    vc::buildOverlayLut(lut, 0.0f, 255.0f, "glasbey_black0", true);
-    CHECK(lut[0] == 0u);
-    CHECK(A(lut[7]) == 255);
+}
+
+TEST_CASE("buildOverlayLut: intensity-as-alpha alpha is the brightest channel for black-based maps")
+{
+    for (const char* id : {"fire", "magma", "cyan", ""}) {
+        CAPTURE(id);
+        LUT color{}, lut{};
+        vc::buildWindowLevelColormapLut(color, 20.0f, 200.0f, id);
+        vc::buildOverlayLut(lut, 20.0f, 200.0f, id, true);
+        for (int i = 0; i < 256; ++i) {
+            CAPTURE(i);
+            if (i <= 20) {
+                CHECK(lut[i] == 0u);
+                continue;
+            }
+            CHECK(A(lut[i]) == std::max({R(color[i]), G(color[i]), B(color[i])}));
+            // Over black, the overlay is exactly the opaque colormap.
+            CHECK(vc::blendOverlayArgb(kAlpha, lut[i], 1.0f) == color[i]);
+        }
+    }
+    LUT magma{};
+    vc::buildOverlayLut(magma, 20.0f, 200.0f, "magma", true);
+    CHECK(A(magma[255]) == 253);  // magma's top colour is not white
+}
+
+TEST_CASE("buildOverlayLut: label maps ignore intensity-as-alpha")
+{
+    LUT plain{}, alpha{};
+    vc::buildOverlayLut(plain, 5.0f, 40.0f, "glasbey_black0", false);
+    vc::buildOverlayLut(alpha, 5.0f, 40.0f, "glasbey_black0", true);
+    CHECK(plain == alpha);
 }
 
 TEST_CASE("blendOverlayArgb: opaque entry matches the plain opacity mix")
