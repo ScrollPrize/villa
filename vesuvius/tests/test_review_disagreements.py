@@ -158,3 +158,51 @@ def test_restage_refuses_to_overwrite_a_filled_sheet(tmp_path):
     with pytest.raises(SystemExit, match="already holds verdicts"):
         rd.main(args)
     assert "S01,sheet" in (out / "sheet.csv").read_text()
+
+
+def test_ranks_stage_from_each_queue_position_and_record_the_rank(tmp_path):
+    # Precision by rank needs tiles sampled below the top; the key must say where each came from.
+    data, pred = _dataset(tmp_path)
+    keys = rd.stage(data, pred, tmp_path / "rev", min_vox=30, half=20, limit=1, ranks=[2, 3])
+    assert [(k["rank"], k["kind"]) for k in keys] == [(2, "candidate")]   # crop_c at rank 3 has no candidate
+    queue = list(csv.DictReader(open(tmp_path / "rev" / "queue.csv")))
+    assert keys[0]["crop"] == queue[1]["crop"]
+
+
+def test_decoys_are_shuffled_blind_controls_on_and_off_the_sheet(tmp_path):
+    # A reader who only ever sees candidates cannot show they say NOT when NOT is right.
+    data, pred = _dataset(tmp_path)
+    out = tmp_path / "rev"
+    keys = rd.stage(data, pred, out, min_vox=30, half=20, limit=2, decoys=2, seed=1)
+    kinds = [k["kind"] for k in keys]
+    assert kinds.count("candidate") == 2 and kinds.count("decoy_covered") == 2 and kinds.count("decoy_off") == 2
+    assert kinds != ["candidate", "decoy_covered", "decoy_off"] * 2        # shuffled, not in staging order
+    assert [k["code"] for k in keys] == [f"S{i:02d}" for i in range(1, 7)]
+    label = tifffile.imread(data / "labels" / "crop_a.tif")
+    p = tifffile.imread(pred / "crop_a.tif")
+    for k in keys:
+        if k["crop"] != "crop_a" or k["kind"] == "candidate":
+            continue
+        z, y, x = json.loads(k["marker_zyx"])
+        on = label[z, y, x] == 1 and p[z, y, x] == 1
+        assert on == (k["kind"] == "decoy_covered")
+        if k["kind"] == "decoy_off":
+            assert label[z - 3:z + 4, y - 3:y + 4, x - 3:x + 4].max() == 0 and p[z - 3:z + 4, y - 3:y + 4, x - 3:x + 4].max() == 0
+    assert sorted(q.name for q in (out / "tiles").iterdir()) == [f"S{i:02d}.png" for i in range(1, 7)]
+    assert "kind" not in open(out / "sheet.csv").read()
+
+
+def test_decoy_verdicts_are_scored_by_kind_and_never_exported(tmp_path):
+    data, pred = _dataset(tmp_path)
+    out = tmp_path / "rev"
+    keys = rd.stage(data, pred, out, min_vox=30, half=20, limit=2, decoys=1, seed=3)
+    kind_of = {k["code"]: k["kind"] for k in keys}
+    rd.review(out, lambda png, prompt: "s" if kind_of[prompt.split()[0]] != "decoy_off" else "n")
+    rows = rd.score(out)
+    by = {(r["kind"], r["rank"]): r for r in rows}
+    assert by[("candidate", "1")]["SHEET"] == 1 and by[("candidate", "2")]["SHEET"] == 1
+    assert by[("decoy_covered", "1")]["SHEET"] == 1 and by[("decoy_covered", "2")]["SHEET"] == 1
+    assert sum(r["NOT"] for r in rows if r["kind"] == "decoy_off") == 0   # odd decoys=1 gives covered only
+    index = rd.export_training(data, pred, out, tmp_path / "train", min_vox=30)
+    assert {r["crop"] for r in index} == {"crop_a", "crop_b"} and len(index) == 2
+
