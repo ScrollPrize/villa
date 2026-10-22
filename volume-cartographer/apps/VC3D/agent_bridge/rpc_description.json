@@ -3440,6 +3440,7 @@
       ],
       "mcp": {
         "paramRenames": {
+          "intensityAsAlpha": "intensity_as_alpha",
           "maxDisplayedResolution": "max_displayed_resolution",
           "volumeId": "volume_id"
         },
@@ -3491,15 +3492,15 @@
             },
             "type": "object"
           },
+          "intensityAsAlpha": {
+            "type": "boolean"
+          },
           "maxDisplayedResolution": {
             "maximum": 2147483647,
             "minimum": -2147483648,
             "type": "integer"
           },
           "opacity": {
-            "type": "number"
-          },
-          "threshold": {
             "type": "number"
           },
           "volumeId": {

@@ -156,7 +156,7 @@ public:
     virtual void setOverlayOpacity(float opacity) = 0;
     virtual void setOverlayColormap(const std::string& colormapId) = 0;
     virtual void setOverlaySamplingMethod(vc::Sampling method) = 0;
-    virtual void setOverlayThreshold(float threshold) = 0;
+    virtual void setOverlayIntensityAsAlpha(bool enabled) = 0;
     virtual void setOverlayWindow(float low, float high) = 0;
     virtual void setOverlayMaxDisplayedResolution(int level) = 0;
     virtual void setOverlayComposite(const OverlayCompositeSettings& settings) = 0;
