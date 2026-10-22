@@ -27,8 +27,10 @@ class GridStore;
  * @param uncrush Strength beta >= 0 of an un-crush step for crushed scrolls: before the search the
  *             section is stretched along the axis its segment normals crowd towards, by the
  *             orientation tensor of those normals to the power beta / 2, and the result is mapped
- *             back. A round section is left as it is. 0, the default, is the estimator unchanged;
- *             1.5 was chosen on 3 scrolls with manual umbilici and tested on 13 others.
+ *             back. Each part of the section counts once in that tensor however densely it was
+ *             sampled, and a section spanning less than half a turn is left as it is. 0, the
+ *             default, is the estimator unchanged; 1.5 was chosen on 3 scrolls with manual
+ *             umbilici and tested on 13 others.
  * @return A cv::Vec2f representing the estimated umbilicus point in the 2D grid space.
  */
 cv::Vec2f align_and_extract_umbilicus(const GridStore& grid_store,

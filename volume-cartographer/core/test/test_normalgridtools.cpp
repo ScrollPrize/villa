@@ -21,9 +21,11 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifndef VC_TEST_FIXTURES_DIR
@@ -371,7 +373,7 @@ TEST_CASE("align_and_extract_umbilicus: a real slice the published objective wal
 }
 
 // ---------------------------------------------------------------------------------------------
-// The un-crush option, uncrush = beta > 0. Three cases.
+// The un-crush option, uncrush = beta > 0. Five cases.
 //
 //   6. "uncrush 0 is the estimator unchanged"      the default must not move a single draw.
 //   7. "a crushed half section"                    what the option is for: on ellipses the
@@ -379,28 +381,40 @@ TEST_CASE("align_and_extract_umbilicus: a real slice the published objective wal
 //      estimate back towards it.
 //   8. "a round half section"                      what it must not do: a section that is round
 //      but partial has normals spread evenly over half a turn, so its orientation tensor is
-//      round and the option has to leave the estimate where it was. Stretching by the spread of
-//      the midpoints instead fails this case (2.42 to 4.58 mm median), which is why the
-//      normals and not the midpoints drive it.
+//      round and the option has to leave the estimate about where it was. Stretching by the
+//      spread of the midpoints instead fails this case (2.42 to 4.58 mm median), which is why
+//      the normals and not the midpoints drive it.
+//   9. "a round half section ten times denser in one quadrant"   the same with uneven sampling.
+//      Counted segment by segment, the normals of the dense quadrant outweigh the rest and the
+//      section looks crushed; the first version of the option did that (found in review of
+//      #2123). Each part of the section now counts once, however densely it was sampled.
+//  10. "a round third of a turn"                   a section spanning less than half a turn has
+//      no normals in some directions, so its tensor is long even when it is round. The step is
+//      skipped there, and the estimate is the one with uncrush 0, draw for draw.
 //
 // The crushed sections are the sections of cases 2 to 4 with every y offset from the centre
 // divided by a squash factor, so a circle of radius r becomes an ellipse with semi axes r and
-// r / squash. Measured over seeds 1 to 20 (g++ 13, libstdc++, -O2), errors in mm:
+// r / squash. Measured over seeds 1 to 20 (Apple clang 17, libc++, -O2; libstdc++ draws other
+// samples from the same seeds, so its numbers differ within the spread), errors in mm:
 //
-//   section                      uncrush 0 median / p90 / max    uncrush 1.5 median / p90 / max
-//   crushed 2.5:1, half          2.42 / 2.59 / 6.12              0.85 / 1.02 / 1.23
-//   crushed 2.5:1, full          2.41 / 3.26 / 3.33              0.59 / 1.27 / 1.38
-//   crushed 4:1, full            4.10 / 6.92 / 7.03              0.75 / 0.92 / 0.95
-//   round, half (case 3)         2.42 / 3.71 / 3.98              2.41 / 3.52 / 3.99
-//   round, thinned 1:10 (case 4) 2.24 / 2.62 / 3.51              2.23 / 2.60 / 2.63
+//   section                         uncrush 0           uncrush 1.5         first version
+//                                   median / p90 / max  median / p90 / max  median / p90 / max
+//   crushed 2.5:1, half (case 7)    2.47 / 5.36 / 7.04  0.88 / 1.09 / 1.28  0.88 / 1.15 / 1.33
+//   crushed 2.5:1, full             2.43 / 3.36 / 4.57  0.50 / 0.92 / 1.07  0.54 / 1.04 / 1.23
+//   crushed 4:1, full               5.01 / 6.86 / 6.99  0.74 / 0.86 / 0.90  0.75 / 0.90 / 0.93
+//   round, half (case 3, 8)         2.56 / 3.46 / 3.93  2.45 / 3.38 / 3.85  2.48 / 3.84 / 4.07
+//   round, thinned 1:10 (case 4)    2.23 / 2.58 / 3.41  2.24 / 2.43 / 2.63  2.23 / 2.56 / 3.70
+//   round, half, 1:10 quadrant (9)  7.68 / 8.54 / 10.08 7.68 / 8.55 / 9.18  15.94 / 16.72 / 18.11
+//   round, third of a turn (10)     5.38 / 6.75 / 7.80  5.38 / 6.75 / 7.80  12.05 / 12.30 / 13.65
 //
-// On the crushed half section the worst of 20 seeds with the option, 1.23 mm, is better than the
-// best without it, 1.78 mm. On the round half section the option moves the estimate by 0.041 mm
-// on average over the 20 seeds, under 0.02 mm on 19 of them and 0.70 mm on one, where the climb
-// settles on a neighbouring maximum. Tolerances are 1.5 times the p90 (or the maximum, for the
-// move on the round section), rounded up, as above. On real scrolls the option
-// was measured on the published normal grids of 16 scrolls against manual umbilici; the numbers
-// are in the pull request.
+// On the crushed half section the option improves 20 of 20 seeds, the worst to 1.28 mm. On the
+// round sections of cases 8 and 9 it moves the estimate by a median 0.24 and 0.40 mm, at most
+// 1.62 and 2.61 mm, where the climb settles on a neighbouring maximum; cases 8 and 9 therefore
+// compare the median errors of five seeds, with and without the option, and allow 1 mm, which
+// the midpoint version (+2.2 mm) and the first version on case 9 (+8.3 mm over 20 seeds) both exceed. Other
+// tolerances are 1.5 times the p90, rounded up. On real scrolls the option was measured on the
+// published normal grids of 16 scrolls against manual umbilici; the numbers are in the pull
+// request.
 
 namespace {
 
@@ -422,6 +436,24 @@ void addCrushedSection(GridStore& gs, double squash, double frac)
     }
 }
 
+// Median errors in mm over seeds 1 to 5 without and with uncrush 1.5, on a section built per seed.
+std::pair<double, double> medianErrorsMm(const std::function<void(GridStore&, std::uint32_t)>& build)
+{
+    std::vector<double> unchanged, uncrushed;
+    for (const std::uint32_t seed : {1u, 2u, 3u, 4u, 5u}) {
+        GridStore gs(cv::Rect(0, 0, kSide, kSide), 64);
+        build(gs, seed);
+        const cv::Vec2f a = align_and_extract_umbilicus(gs, seed);
+        const cv::Vec2f b = align_and_extract_umbilicus(gs, seed, 1.5f);
+        REQUIRE(insideGrid(b));
+        unchanged.push_back(errorMm(a));
+        uncrushed.push_back(errorMm(b));
+    }
+    std::sort(unchanged.begin(), unchanged.end());
+    std::sort(uncrushed.begin(), uncrushed.end());
+    return {unchanged[2], uncrushed[2]};
+}
+
 } // namespace
 
 TEST_CASE("align_and_extract_umbilicus: uncrush 0 is the estimator unchanged")
@@ -434,24 +466,43 @@ TEST_CASE("align_and_extract_umbilicus: uncrush 0 is the estimator unchanged")
     CHECK(a[1] == b[1]);
 }
 
-TEST_CASE("align_and_extract_umbilicus: a crushed half section, uncrush 1.5 stays under 1.6 mm")
+TEST_CASE("align_and_extract_umbilicus: a crushed half section, uncrush 1.5 stays under 1.7 mm")
 {
     GridStore gs(cv::Rect(0, 0, kSide, kSide), 64);
     addCrushedSection(gs, 2.5, 0.5);
     auto unchanged = align_and_extract_umbilicus(gs, 1u);
     auto uncrushed = align_and_extract_umbilicus(gs, 1u, 1.5f);
     REQUIRE(insideGrid(uncrushed));
-    CHECK(errorMm(uncrushed) < 1.6);                  // 20 seed median 0.85 mm, p90 1.02 mm
-    CHECK(errorMm(uncrushed) < errorMm(unchanged));   // 20 seed range 0.74 to 1.23 against 1.78 to 6.12 mm
+    CHECK(errorMm(uncrushed) < 1.7);                  // 20 seed median 0.88 mm, p90 1.09 mm
+    CHECK(errorMm(uncrushed) < errorMm(unchanged));   // better on 20 of 20 seeds, worst 1.28 mm
 }
 
-TEST_CASE("align_and_extract_umbilicus: a round half section, uncrush 1.5 moves the estimate under 1.1 mm")
+TEST_CASE("align_and_extract_umbilicus: a round half section, uncrush 1.5 leaves the median error within 1 mm")
+{
+    const auto [unchanged, uncrushed] =
+        medianErrorsMm([](GridStore& gs, std::uint32_t) { addSyntheticSection(gs, 0.5, 1, 0); });
+    CHECK(uncrushed < unchanged + 1.0);   // 20 seed medians 2.56 and 2.45 mm; the midpoint version +2.2 mm
+}
+
+TEST_CASE("align_and_extract_umbilicus: a round half section ten times denser in one quadrant, uncrush 1.5 leaves the median error within 1 mm")
+{
+    // One segment in ten kept in the quadrant x < centre, drawn with the seed.
+    const auto [unchanged, uncrushed] =
+        medianErrorsMm([](GridStore& gs, std::uint32_t seed) { addSyntheticSection(gs, 0.5, 10, seed); });
+    CHECK_MESSAGE(uncrushed < unchanged + 1.0,
+        "uncrush 1.5 moved the median error of a round section from " << unchanged << " to "
+        << uncrushed << " mm over seeds 1 to 5. The section is round and only sampled unevenly, "
+        "ten times more segments in one quadrant than in the other. If each segment counts in "
+        "the orientation tensor instead of each part of the section, uneven sampling looks like "
+        "crushing (the first version made it 16.72 mm against 7.64).");
+}
+
+TEST_CASE("align_and_extract_umbilicus: a round third of a turn, uncrush 1.5 is skipped")
 {
     GridStore gs(cv::Rect(0, 0, kSide, kSide), 64);
-    addSyntheticSection(gs, 0.5, 1, 0);
-    auto unchanged = align_and_extract_umbilicus(gs, 1u);
-    auto uncrushed = align_and_extract_umbilicus(gs, 1u, 1.5f);
-    REQUIRE(insideGrid(uncrushed));
-    const double moved = std::hypot(uncrushed[0] - unchanged[0], uncrushed[1] - unchanged[1]) * kUnitMm;
-    CHECK(moved < 1.1);   // 20 seed mean 0.041 mm, max 0.70 mm; the midpoint version moves it 2 mm
+    addSyntheticSection(gs, 1.0 / 3.0, 1, 0);
+    const cv::Vec2f unchanged = align_and_extract_umbilicus(gs, 1u);
+    const cv::Vec2f uncrushed = align_and_extract_umbilicus(gs, 1u, 1.5f);
+    CHECK(uncrushed[0] == unchanged[0]);   // without the half-turn check: 20 seed median 5.38 to 12.05 mm
+    CHECK(uncrushed[1] == unchanged[1]);
 }

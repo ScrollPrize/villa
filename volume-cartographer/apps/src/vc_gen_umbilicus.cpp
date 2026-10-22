@@ -211,7 +211,8 @@ int main(int argc, char** argv)
             "Without it the library's shared hardware seeded generator is used, as published")
         ("uncrush", po::value<double>()->default_value(0.0),
             "Un-crush strength for crushed scrolls: each slice is stretched along the axis its "
-            "segment normals crowd towards before the search, and round slices are left as they "
+            "segment normals crowd towards before the search, each part of the slice counting once "
+            "however densely it was sampled. Slices spanning under half a turn are left as they "
             "are. 0 is the estimator unchanged; 1.5 is the measured setting")
         ("repeats", po::value<int>()->default_value(1),
             "Estimates per slice. The control point written is their coordinatewise median")
