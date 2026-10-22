@@ -1,10 +1,3 @@
-# 2026-10-22
-
-- Recovered reusable chunk matching/filtering, seed fitting, optional CUDA
-  tracing/refinement, native RAM pooling and generic cache/timing tools onto
-  main's shared tracing/evaluation APIs. Experiment assets excluded; GPU/cohort
-  numerical validation remains separate. See volume-cartographer/docs/trace_recovery.md.
-
 # 2026-10-21
 
 - Extracted existing annotated Fiber3D heads, Gaussian/coarse supervision,
