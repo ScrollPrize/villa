@@ -68,7 +68,7 @@ def load_config(path):
     if not settings.get('cases'):
         raise ValueError('At least one case is required')
     for case in settings['cases']:
-        if set(case)-{'name', 'dataset', 'target_mode', 'sign_only', 'split', 'evaluation', 'baseline'}:
+        if set(case)-{'name', 'dataset', 'target_mode', 'sign_only', 'split', 'evaluation', 'baseline', 'audit'}:
             raise ValueError('Unknown case setting')
         if not isinstance(case.get('sign_only', False), bool):
             raise ValueError('sign_only must be boolean')
@@ -98,6 +98,27 @@ def load_config(path):
                 evaluation['dataset'] = dataset(evaluation['dataset'], path.parent)
         if case.get('baseline'):
             case['baseline'] = file(path.parent, case['baseline'])
+        audit = case.get('audit', {})
+        if set(audit)-{'details', 'sign_analysis', 'measurements', 'rounded_baseline'}:
+            raise ValueError('Unknown audit setting')
+        for flag in ('details', 'sign_analysis'):
+            if flag in audit and not isinstance(audit[flag], bool):
+                raise ValueError(flag+' must be boolean')
+        if audit.get('rounded_baseline'):
+            if case.get('target_mode', 'fractional') != 'fractional':
+                raise ValueError('rounded_baseline requires a fractional trial')
+            audit['rounded_baseline'] = file(path.parent, audit['rounded_baseline'])
+            metrics = Path(audit['rounded_baseline']).with_name('metrics.json')
+            if metrics.is_file():
+                dependencies.add(str(metrics))
+        if audit.get('measurements'):
+            sources = audit['measurements']
+            if set(sources)-{'database', 'stage1', 'sign_cosine_min'}:
+                raise ValueError('Unknown measurement audit setting')
+            for key in ('database', 'stage1'):
+                sources[key] = resolve(path.parent, sources[key])
+                if Path(sources[key]).is_file():
+                    dependencies.add(sources[key])
     settings['output_root'] = resolve(path.parent, settings['output_root'])
     output = Path(settings['output_root'])
     if any(p == output or output in p.parents for p in map(Path, dependencies)):
@@ -211,6 +232,9 @@ def run(config_path):
                 writer.writerows(details)
         metrics['seconds_total'] = time.monotonic()-started
         write(folder/'metrics.json', metrics)
+        if case.get('audit'):
+            from .fiber_min_flow_audit import audit_case
+            audit_case(case, d, solution, folder/'audit', case['audit'])
         results[name] = metrics
         write(output/'results.json', results)
         print(name, 'objective', result['certificate']['primal'], flush=True)
