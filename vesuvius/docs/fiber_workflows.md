@@ -147,6 +147,11 @@ configuration/checkpoint determines all other model settings.
 | `fiber_reference_surface` | Explicit S3 reference acquisition with integrity/provenance checks. |
 | `fiber_pair_connectivity` | Existing two-fiber threshold/component/skeleton diagnostic with reference strips and OBJ export. |
 
+Reference downloads may resume or refresh the same S3 prefix. Reusing an output
+directory for a different source, or leaving local files absent from the current
+source listing, is rejected before downloading. Use a new/clean output directory;
+the downloader does not delete old reference files automatically.
+
 Surface usage:
 
 ```json

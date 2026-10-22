@@ -10,6 +10,26 @@ from .fiber_anchored_dataset import fixed_reference_endpoints
 from .fiber_selected_dataset_eval import remap_events, aligned_widths
 
 
+def score_cohorts(residual, enabled, parallel, sign, order):
+    """Report valid empty/rejected cohorts without inventing zero-error metrics."""
+    score={}
+    for name,kind in [('all',np.ones(len(enabled),bool)),('parallel',parallel),('perpendicular',~parallel)]:
+        use=kind&enabled;error=np.abs(residual[use]);correct=(residual[use]>=-.5)&(residual[use]<.5)
+        signed=use&(sign!=0)
+        total=int(kind.sum());count=int(use.sum());signed_count=int(signed.sum())
+        violations=int((signed&(order<0)).sum())
+        score[name]=dict(total=total,enabled=count,coverage_percent=100*count/total if total else None,
+            l1=float(error.mean()) if count else None,
+            correct_percent=float(100*correct.mean()) if count else None,
+            median=float(np.median(error)) if count else None,
+            p95=float(np.quantile(error,.95)) if count else None,max=float(error.max()) if count else None,
+            sign_violations=violations,signed_events=signed_count,
+            sign_violation_percent=100*violations/signed_count if signed_count else None)
+    score['postfit_offset_diagnostic']=(enabled_l1(residual,enabled,parallel)['gt_global_offset']
+        if enabled.any() else None)
+    return score
+
+
 def run(settings):
     from .fiber_workflows import run as dispatch
     from .fiber_implicit_match_report import run as match_report
@@ -65,15 +85,7 @@ def run(settings):
     residual=rs[:,0]+rs[:,1]-q.numpy()+cfg['perpendicular_offset']*(~par)*fd-references['sign']*references['distance']
     enabled=st[owner,3]>=0
     order=references['sign']*(rs[:,0]-mapped[owner,0]+np.floor(rs[:,1]-phase.numpy()+.5)+cfg['perpendicular_offset']*(~par)*fd)
-    score={}
-    for name,kind in [('all',np.ones(len(owner),bool)),('parallel',par),('perpendicular',~par)]:
-        use=kind&enabled;error=np.abs(residual[use]);correct=(residual[use]>=-.5)&(residual[use]<.5)
-        signed=use&(references['sign']!=0)
-        score[name]=dict(total=int(kind.sum()),enabled=int(use.sum()),coverage_percent=float(100*use.sum()/kind.sum()),
-            l1=float(error.mean()),correct_percent=float(100*correct.mean()),median=float(np.median(error)),
-            p95=float(np.quantile(error,.95)),max=float(error.max()),sign_violations=int((signed&(order<0)).sum()),
-            signed_events=int(signed.sum()),sign_violation_percent=float(100*(signed&(order<0)).sum()/signed.sum()))
-    score['postfit_offset_diagnostic']=enabled_l1(residual,enabled,par)['gt_global_offset']
+    score=score_cohorts(residual,enabled,par,references['sign'],order)
     score['widths']=gt_solve_width_metrics(w,gs['widths'],np.floor(rs[:,0]+rs[:,1]).astype(int),0)
     atomic_write(root/'gt_events.json',[dict(e,enabled=bool(enabled[n]),residual=float(residual[n])) for n,e in enumerate(events)],durable=False)
     matches=match_report(dict(solve_roots=[str(root/'solve')],output_root=str(root/'matches'),cutoffs=[.5,.7]))

@@ -22,6 +22,32 @@ def digest(path):
     return h.hexdigest()
 
 
+def validate_refresh(root, source, prefix, objects):
+    """Reject mixed snapshots before downloading; never remove user files."""
+    manifest=root/'download_manifest.json'
+    previous={}
+    if manifest.exists():
+        doc=json.loads(manifest.read_text())
+        old=urlparse(doc['source']);new=urlparse(source)
+        if (old.scheme,old.netloc,old.path.rstrip('/'))!=(new.scheme,new.netloc,new.path.rstrip('/')):
+            raise ValueError('Reference source changed; use a new output_root')
+        previous={entry['key']:entry for entry in doc['objects']}
+    expected={relative_key(obj['Key'],prefix).as_posix() for obj in objects}
+    metadata={'download_manifest.json','download_manifest.json.part','listing.json'}
+    partials={name+'.download-part' for name in expected}
+    if expected&(metadata|partials):
+        raise ValueError('Reference objects conflict with download metadata or partial files')
+    allowed=expected|metadata|partials
+    stale=[]
+    for path in root.rglob('*'):
+        if path.is_symlink():raise ValueError('Unsafe local destination: '+str(path))
+        if path.is_file() and path.relative_to(root).as_posix() not in allowed:
+            stale.append(path.relative_to(root).as_posix())
+    if stale:
+        raise ValueError('Stale/unlisted reference files; use a clean output_root: '+', '.join(sorted(stale)))
+    return previous
+
+
 def run(cfg):
     import boto3
     from boto3.s3.transfer import TransferConfig
@@ -42,8 +68,8 @@ def run(cfg):
              for obj in page.get('Contents',[]) if not obj['Key'].endswith('/')]
     if not objects:raise ValueError('Empty reference prefix')
     for obj in objects:relative_key(obj['Key'],prefix)
-    manifest=root/'download_manifest.json';previous={}
-    if manifest.exists():previous={entry['key']:entry for entry in json.loads(manifest.read_text())['objects']}
+    manifest=root/'download_manifest.json'
+    previous=validate_refresh(root,cfg['source'],prefix,objects)
     print(f'Reference surface: {len(objects)} objects, {sum(o["Size"] for o in objects):,} bytes',flush=True)
     def fetch(obj):
         relative=relative_key(obj['Key'],prefix);path=root/relative;path.parent.mkdir(parents=True,exist_ok=True)

@@ -215,7 +215,9 @@ def audit(settings):
         hashes=validate_sources(cfg,doc)
         path=Path(settings['output_root'])/item['label'].lower()
         meta=json.loads((path/'meta.json').read_text());stats=json.loads((path/'surface_statistics.json').read_text())
-        assert meta['scale']==[1/settings['grid_step']]*2
+        step=float(settings.get('grid_step',100.))
+        assert stats['grid_step']==step
+        assert meta['scale']==[1/step]*2
         bands=[tifffile.imread(path/(a+'.tif')) for a in ('x','y','z')]
         mask=tifffile.imread(path/'mask.tif')
         assert all(b.dtype==np.float32 and b.shape==mask.shape for b in bands)

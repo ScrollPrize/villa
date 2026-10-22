@@ -105,7 +105,7 @@ def run(settings):
                 ob=s['u_offsets'][s['v_offset_b'][edge]]
                 hu=torch.as_tensor(np.where(reverse,ob,oa),dtype=torch.float64)
                 vu=torch.as_tensor(np.where(reverse,oa,ob),dtype=torch.float64)
-                c=candidates(state[h],state[v],torch.as_tensor(dh),torch.as_tensor(dv),widths,sigma_h,hu,vu,**sigma_args)
+                c=candidates(sh,sv,torch.as_tensor(dh),torch.as_tensor(dv),widths,sigma_h,hu,vu,**sigma_args)
             if 'v_offsets' in s:
                 offset_a=s['v_offsets'][s['v_offset_a'][edge]]
                 offset_b=s['v_offsets'][s['v_offset_b'][edge]]

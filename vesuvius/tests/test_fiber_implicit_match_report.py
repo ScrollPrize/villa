@@ -112,3 +112,36 @@ def test_saved_comparison_tracks_lost_events(tmp_path, filter_families, offsets,
                       10*correction*result[0]['rows'][0]['losses']['u']['selected_mean'])
     assert np.isclose(result[1]['rows'][0]['losses']['u']['full_objective_contribution'],
                       result[1]['rows'][0]['losses']['u']['selected_mean']/2)
+
+
+@pytest.mark.parametrize('mapping', [False, True])
+def test_u_offsets_preserve_shared_event_geometry(tmp_path, monkeypatch, mapping):
+    import json
+    from lasagna.inference_provenance import sha256_file
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_shared_curve as curve
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_implicit_match_report import run
+    d=dict(family=np.array([0,1]),source_id=np.arange(2),start=np.zeros(2),end=np.ones(2),
+        i=np.array([0]),j=np.array([1]),ds_a=np.zeros(1),ds_b=np.zeros(1),parallel=np.array([False]))
+    data=tmp_path/'tensors.npz';np.savez(data,**d)
+    root=tmp_path/'solve';root.mkdir()
+    state=np.array([[2.,.1,0.,10.],[2.,.9,10.,10.]])
+    np.savez(root/'solution.npz',state=state,widths=np.ones(6)*100,
+        u_offsets=np.array([0.,-2.]),v_offsets=np.array([0.,3.]),
+        v_offset_a=d['i'],v_offset_b=d['j'],
+        **{k:d[k] for k in ('family','source_id','start','end')})
+    def saved_points(d,s,state,widths,ids,ds,as_mapping=False):
+        prepared=state[ids].copy()
+        prepared[:,1]=np.array([.3,.4])[ids];prepared[:,2]=np.array([50.,80.])[ids]
+        if as_mapping:return prepared,np.zeros_like(ds)
+        return prepared[:,0]+prepared[:,1],prepared[:,1],prepared[:,2]
+    monkeypatch.setattr(curve,'saved_points',saved_points)
+    (root/'summary.json').write_text(json.dumps(dict(model='implicit_discrete_winding_v1')))
+    (root/'config.json').write_text(json.dumps(dict(tensor_cache=str(data),tensor_sha256=sha256_file(data),
+        winding_sigma=.1,shared_curve_geometry=True,shared_curve_hypothesis_mapping=mapping,
+        u_offset_match_weight=2,v_offset_match_weight=2)))
+    result=run(dict(solve_roots=[str(root)],output_root=str(tmp_path/'out'),cutoffs=[.5]))[0]['rows'][0]
+    assert result['count']==1
+    assert result['u_base_voxels']['l1']==pytest.approx(8.)
+    assert result['v_base_voxels']['l1']==pytest.approx(33.)
+    assert result['uncorrected_u_base_voxels']['l1']==pytest.approx(10.)
+    assert result['uncorrected_v_base_voxels']['l1']==pytest.approx(30.)

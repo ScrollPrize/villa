@@ -104,3 +104,23 @@ def test_source_hash_validation(tmp_path):
     assert m.validate_sources(cfg,doc)==expected
     (tmp_path/'database').write_text('replaced same pathname')
     with pytest.raises(ValueError,match='hash mismatch'):m.validate_sources(cfg,doc)
+
+
+@pytest.mark.parametrize('step', [None, 25])
+def test_audit_uses_export_grid_default(tmp_path,monkeypatch,step):
+    from vesuvius.neural_tracing.fiber_trace_3d import fiber_uv_surface as m
+    from vesuvius.tifxyz.types import Tifxyz
+    from vesuvius.tifxyz.writer import write_tifxyz
+    options={} if step is None else dict(grid_step=step)
+    xyz,valid,stats=construct(*fixture(),SyntheticCurves(),dict(max_search=150,**options))
+    solve=tmp_path/'solve';solve.mkdir();(solve/'summary.json').write_text(json.dumps(dict(config={})))
+    normals=tmp_path/'normals';normals.mkdir();(normals/'index.json').write_text('{}')
+    out=tmp_path/'surface'
+    write_tifxyz(out,Tifxyz(*[xyz[:,:,a] for a in range(3)],
+        _scale=(1/stats['grid_step'],)*2,_mask=valid))
+    (out/'surface_statistics.json').write_text(json.dumps(stats))
+    monkeypatch.setattr(m,'validate_sources',lambda *_: {})
+    result=m.audit(dict(output_root=str(tmp_path),normal_curves=str(normals),
+        solutions=[dict(run_root=str(solve),label='surface')],**options))
+    assert result[0]['tifxyz_valid']
+    assert result[0]['vertices']==int(valid.sum())
