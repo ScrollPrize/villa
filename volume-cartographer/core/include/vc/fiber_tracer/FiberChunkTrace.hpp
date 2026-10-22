@@ -17,10 +17,32 @@ struct FiberChunkTraceConfig {
     double rimNormalBase=16, rimTangentBase=32;
     double joinDistanceBase=12, joinAngleDegrees=25, joinMinimumBase=32;
     bool joinWidthWeight=false;
+    // Replay-only options; never alter cached path construction.
+    int initialAlignmentPower=0; // 0 nearest, 1 cosine, 2 cosine squared
+    double initialNormalRadiusBase=0, initialTangentialRadiusBase=0;
+    bool jointJoinScore=false;
+    std::array<double,4> joinWeights{1,1,1,1}; // overlap,width,distance,direction
+    double conflictNormalBase=0, conflictTangentBase=0; // zero disables
+    double conflictAgreementBase=64, conflictSeparationBase=32;
+    bool cacheOnly=false; // never construct a missing chunk
+    bool presencePeakRestarts=false; // historical aligned-peak seed policy, including no-path stops
+    // Construction/backend options are part of construction cache identity.
+    bool refineSeed=false;
+    double seedMovementBase=0;
+    std::string gpuLibrary; // optional CUDA plugin; CPU default
+    int gpuDevices=0; // visible device count, caller must hold manager grants
+    int onlineRefineIterations=0, onlineRefineWindow=0;
+    double onlineRefineEpsilonBase=.25, onlineRefineStepBase=1, onlineRefineCapBase=8;
+    std::filesystem::path benchmarkExport; // explicit fixture export, empty disables
     bool pinSamplingRegion=true;
     // Reject accidentally enormous dense seed grids before allocating them.
     size_t maxGridSamples=64ULL*1024*1024;
 };
+
+[[nodiscard]] nlohmann::json fiberChunkConfigJson(const FiberChunkTraceConfig&);
+[[nodiscard]] FiberChunkTraceConfig fiberChunkConfigFromJson(const nlohmann::json&);
+[[nodiscard]] nlohmann::json fiberChunkCacheSpecification(const FiberChunkTraceConfig&,
+    const FiberTraceConfig&,double traceToBaseScale,const std::string& sourceIdentity);
 
 struct FiberChunkPaths {
     std::array<int,3> key{}; // XYZ core indices; all geometry below is base XYZ
@@ -28,6 +50,7 @@ struct FiberChunkPaths {
     std::vector<std::vector<cv::Vec3d>> lines;
     std::vector<std::array<std::string,2>> endReasons;
     size_t maxima=0,seeds=0;
+    nlohmann::json timings=nlohmann::json::object();
 };
 
 // Synchronous: on success invoke each index exactly once; join every admitted
@@ -38,6 +61,22 @@ using FiberChunkParallelFor=std::function<void(size_t,const std::function<void(s
 // throw on cancellation. Empty uses the shared future's ordinary blocking wait.
 using FiberChunkWait=std::function<void(const std::function<bool()>&)>;
 
+struct FiberChunkSeedFit {
+    cv::Vec3d point{}, direction{};
+    double width=0, score=-1;
+};
+[[nodiscard]] FiberChunkSeedFit refineFiberChunkSeed(const FiberPredictionSource&,
+    const cv::Vec3d&,const cv::Vec3d&,const FiberChunkPaths&,
+    const FiberChunkTraceConfig&,double traceToBaseScale);
+
+// Clears conflicting paths on the supplied copy; preserves path indices and
+// endpoint reasons. Never overwrites construction-cache payloads. Normals use
+// working coordinates, all geometry/thresholds are base voxels.
+[[nodiscard]] nlohmann::json filterFiberChunkConflicts(FiberChunkPaths&,
+    const FiberChunkTraceConfig&,const vc::lasagna::NormalSampler&,double traceToBaseScale,
+    const FiberChunkParallelFor& parallelFor={},const FiberPredictionSource* readinessSource=nullptr,
+    const std::vector<size_t>* auditQueries=nullptr);
+
 [[nodiscard]] FiberTraceOneWayResult traceFiberChunkHalf(const FiberPredictionSource&,
     const cv::Vec3d& seedTrace,const cv::Vec3d& direction,double distanceTrace,
     const FiberTraceConfig&,const vc::lasagna::NormalSampler*,
@@ -46,7 +85,7 @@ using FiberChunkWait=std::function<void(const std::function<bool()>&)>;
 [[nodiscard]] std::shared_ptr<FiberChunkPaths> buildFiberChunkPaths(
     const std::array<int,3>& key,const FiberPredictionSource&,const FiberTraceConfig&,
     const vc::lasagna::NormalSampler&,const FiberChunkTraceConfig&,double traceToBaseScale,
-    const FiberChunkParallelFor& parallelFor={});
+    const FiberChunkParallelFor& parallelFor={},const FiberChunkWait& wait={});
 
 [[nodiscard]] std::shared_ptr<FiberChunkPaths> loadFiberChunkPaths(const std::filesystem::path&);
 
@@ -75,6 +114,9 @@ struct FiberChunkMatch {
     cv::Vec3d point{};
     double arc=0,overlap=0,error=0,angleError=0;
     double widthCompatibility=1,weightedOverlap=0;
+    double jointScore=0;
+    double initialScore=0;
+    int initialSamples=0;
 };
 struct FiberChunkInitialRegion {
     cv::Vec3d center{};

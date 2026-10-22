@@ -14,7 +14,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.loader import (
     _Augment3DParams, _BlurKernels3D, _DirectGaussianKernel3D,
     _apply_blur_kernels_3d, _build_blur_kernels_3d,
     _directional_gaussian_kernel_3d, _directional_kernel_groups, _gaussian_kernel_1d,
-    apply_complete_value_augmentation_3d, apply_value_augmentation_batch_3d,
+    apply_value_augmentation_batch_3d,
     apply_value_augmentation_suffix_batch_3d, prepare_fiber_trace_3d_cuda_suffix,
     collate_fiber_trace_3d_samples,
     apply_value_augmentation_3d,
@@ -215,7 +215,7 @@ def test_deferred_suffix_preserves_full_chain_and_kernel() -> None:
         }
     )
     raw = loader.load_raw_sample(7)
-    expected = replace(raw.sample, volume=apply_complete_value_augmentation_3d(
+    expected = replace(raw.sample, volume=apply_value_augmentation_3d(
         loader.config, raw.sample.volume[0], raw.augmentation).unsqueeze(0))
     deferred = prepare_fiber_trace_3d_cuda_suffix(loader.config, raw)
     assert deferred.augmentation is raw.augmentation
@@ -242,7 +242,7 @@ def test_batched_cuda_value_augmentation_matches_cpu_without_noise() -> None:
     params = (replace(base, brightness=0.13, contrast=0.81, gamma=1.17),)
     source = torch.randn((1, 1, 9, 11, 13), generator=torch.Generator().manual_seed(101))
     kernels = tuple(_build_blur_kernels_3d(item) for item in params)
-    expected = apply_complete_value_augmentation_3d(loader.config, source[0, 0], params[0])
+    expected = apply_value_augmentation_3d(loader.config, source[0, 0], params[0])
     actual = apply_value_augmentation_batch_3d(
         loader.config,
         source.cuda(),
@@ -299,7 +299,7 @@ def test_batched_cuda_value_augmentation_noise_is_partition_invariant() -> None:
 
 
 @pytest.mark.parametrize("mode", ["blur", "all"])
-def test_shared_deferred_queue_round_trip_keeps_parameters_and_masks(mode):
+def test_shared_deferred_queue_round_trip_keeps_parameters_without_masks(mode):
     loader = _loader_with_mapping({"batch_size": 2, "patch_shape_zyx": [8, 8, 8],
         "augment_blur_sigma": .4, "augment_noise_std": .03,
         "augment_anisotropic_blur_probability": 1.,
@@ -336,7 +336,7 @@ def test_shared_deferred_queue_round_trip_keeps_parameters_and_masks(mode):
             actual = apply_deferred_batch_augmentation(batch, loader.config, mode=mode)
             expected = collate_fiber_trace_3d_samples(expected_samples)
             torch.testing.assert_close(actual.volume, expected.volume, rtol=3e-5, atol=3e-5)
-            assert torch.equal(actual.valid_mask, expected.valid_mask)
+            assert actual.valid_mask is expected.valid_mask is None
             assert actual.stream_indices.tolist() == list(indices)
             assert actual.deferred_augmentation_params is None
             assert actual.deferred_blur_kernels is None
@@ -345,17 +345,14 @@ def test_shared_deferred_queue_round_trip_keeps_parameters_and_masks(mode):
         owner.close()
 
 
-def test_complete_patch_recipe_does_not_replace_legacy_masked_statistics():
+def test_canonical_value_augmentation_normalizes_the_complete_patch():
     loader = _loader_with_mapping({"augment_enabled": False, "image_normalization": "zscore",
                                   "value_augmentation_backend": "torch"})
     params = _value_augmentation_params(0, blur_sigma=0., axis_zyx=None)
     source = torch.arange(8., dtype=torch.float32).reshape(2, 2, 2)
-    mask = source < 4.
-    legacy = apply_value_augmentation_3d(loader.config, source, mask, params)
-    complete = apply_complete_value_augmentation_3d(loader.config, source, params)
-    assert abs(float(legacy[mask].mean())) < 1e-6
+    complete = apply_value_augmentation_3d(loader.config, source, params)
+    torch.testing.assert_close(complete, (source - source.mean()) / source.std(unbiased=False))
     assert abs(float(complete.mean())) < 1e-6
-    assert not torch.allclose(legacy, complete)
 
 
 @pytest.mark.parametrize("mode", ["blur", "all"])

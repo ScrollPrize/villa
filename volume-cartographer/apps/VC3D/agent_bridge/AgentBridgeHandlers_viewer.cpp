@@ -68,9 +68,9 @@ QJsonObject overlaySettingsJson(
     o["volumeId"] = QString::fromStdString(state.volumeId);
     o["colormap"] = QString::fromStdString(state.colormap);
     o["opacity"] = state.opacity;
-    o["threshold"] = state.window.low;
     o["windowLow"] = state.window.low;
     o["windowHigh"] = state.window.high;
+    o["intensityAsAlpha"] = state.intensityAsAlpha;
     o["maxDisplayedResolution"] = state.maxDisplayedResolution;
 
     QJsonObject composite;
@@ -123,9 +123,8 @@ QJsonObject AgentBridgeServer::handleViewerSetOverlay(const QJsonValue& params)
     const float opacity = hasOpacity
         ? static_cast<float>(p.value("opacity").toDouble()) : 0.0f;
 
-    const bool hasThreshold = p.contains("threshold");
-    const float threshold = hasThreshold
-        ? static_cast<float>(p.value("threshold").toDouble()) : 0.0f;
+    const bool hasIntensityAsAlpha = p.contains("intensityAsAlpha");
+    const bool intensityAsAlpha = p.value("intensityAsAlpha").toBool(false);
 
     const bool hasWindow = p.contains("window");
     float windowLow = 0.0f;
@@ -172,14 +171,14 @@ QJsonObject AgentBridgeServer::handleViewerSetOverlay(const QJsonValue& params)
         update.colormap = colormap.toStdString();
     if (hasOpacity)
         update.opacity = opacity;
-    if (hasThreshold)
-        update.threshold = threshold;
     if (hasWindow) {
         update.window = VolumeOverlayController::Window{
             .low = windowLow,
             .high = windowHigh,
         };
     }
+    if (hasIntensityAsAlpha)
+        update.intensityAsAlpha = intensityAsAlpha;
     if (hasMaxRes)
         update.maxDisplayedResolution = maxRes;
     if (hasComposite)

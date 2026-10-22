@@ -379,6 +379,123 @@ and nothing is predicted then. The overlay is display-only: it changes no
 layout, heat-map or publishing result. The grouping and statistics live in
 `FiberMapKollesis.hpp`.
 
+## Linking two fibers from the Fiber Map
+
+The Fiber Map links two fibers in two gestures, without opening either in the
+Line Annotation tab.
+
+Selection: a left click selects one fiber (as before). Shift+left click keeps
+the last two fibers clicked with Shift held selected: clicking a third drops the
+oldest, re-clicking a selected one moves it to the back, Shift on empty space
+changes nothing. Both selected fibers draw bold with their control dots; the
+linked-network glow and the dock row follow the most recent one, and the status
+line names the pair. A rebuild (an automatic Update, a theme change) keeps the
+pair selected.
+
+With two fibers selected, Ctrl+right-click on either of them (its line or one
+of its dots) adds **Link <this> and <other>** to the menu, above Delete. It:
+
+1. finalizes, saves and closes any open Line Annotation of either fiber (what
+   opening another fiber does; annotations of other fibers stay open), and
+   every dialog-less session of them (the intersection inspection included),
+   saving each first. If that saved something the map is stale: it updates
+   by itself and the link continues on the rebuilt map without a second
+   gesture, as long as both fibers still draw where the click saw them. If
+   the saved work moved one of them on the map, the status line asks you to
+   choose Link again (the pair stays selected);
+2. finds where the two fibers meet on the map: the drawn crossing nearest the
+   click, or, when the drawn lines never cross, their closest approach if it
+   is within 1 mm on the map (otherwise the link is refused). That point is
+   inverted exactly to a position on each fiber's stored line through the
+   unrolled arclength the map was drawn with;
+3. searches the fibers' closest 3D pass only within ±5 mm along each fiber
+   around that position (a multi-winding fiber never searches another
+   winding), and never refuses because the pass is far apart: the Fiber
+   Map's own link checks flag a bad link afterwards;
+4. picks a control point on each fiber: an UNLINKED existing control within
+   1 mm along the fiber of the pass is reused (no re-optimization of that
+   fiber); otherwise a new control is placed at the nearest position to the
+   pass that is clear of every existing control by the strip's minimum
+   spacing (so nothing collapses), not beyond a kollesis termination, not in
+   a gap span and inside the focus bounds, then the two spans around it are
+   re-optimized synchronously (wait cursor) and the fiber is saved;
+5. links the two control points with a **pending automatic link**, saves both
+   files and waits for the writes before reporting success in the status line.
+
+While step 4 and 5 run, the operation holds the same guard a merge or split
+holds: a rename, delete, import, merge or split started from the dock meanwhile
+is refused ("A merge, split or link is in progress"). If the pair save fails,
+the link is withdrawn from the loaded fibers (every copy, including an edit's
+synced moves of its endpoints during the wait) and the status line says so.
+
+### Linking from a fiber-intersection X
+
+Inside an open Line Annotation, Ctrl+right-click on the yellow X of another
+fiber's intersection (in the current cut, the side cut or a strip) and choose
+**Link <this fiber> and <that fiber>**, directly under "Go to nearby
+annotation". It makes the same pending automatic link as the Fiber Map does,
+with the open fiber's control point anchored at the pass of its DRAWN line
+nearest to the X in that view (a strip: the X's column; the side cut: the
+nearest drawn segment of the windowed projection; the current cut: the one
+visible pass, the cut position) and the other fiber's at the X itself; from
+those two anchors the same ±5 mm closest-pass search and 1 mm reuse rule
+decide the two control points. Differences from the map:
+
+- this annotation stays open: its new control point is placed exactly like a
+  manual placement (asynchronous span re-optimization, autosave, the same
+  placement limit), and the link is made right after the placement;
+- the OTHER fiber's open annotation or dialog-less sessions are saved and
+  closed first (the map's rule for both fibers, applied to that one);
+- the entry is disabled while the view is still updating or no pass of this
+  fiber is drawn near the marker, and absent for a never-saved annotation.
+
+Failures are reported in the usual error dialog with the map's wording; a
+control point already committed before a refusal is kept, unlinked.
+
+A pending automatic link is an ordinary pending link drawn in its own
+palette: bright cyan (#20f0ff), or light pink (#ffa8d8) for a same-H/V link,
+instead of the pending blue / orange - solid markers like every other link
+state, everywhere a linked point is drawn: the cut views and strips (both
+renderers), the overview bar, the slice-view rings and the Fiber Map dots, and
+the connector and projected X of the linked fiber in the cut views. A tagged
+point (kollesis termination, break) keeps its tag ring over that fill, as any
+linked point does. The rule for a point carrying several links: the automatic
+palette only when every pending link on it is automatic; a human-made pending
+link outranks (pending blue / orange). The control-point menu's approve entry reads
+"Approve auto link to <fiber> / CP n"; approving makes an ordinary approved
+link, exactly like approving a pending link. "Mark link as pending" on an
+approved link makes a plain (human) pending link.
+
+File format: the link entry carries `"auto": true` next to `"pending": true`,
+only while pending and only in the ordinary `branches` array (never on an
+adjacent link); approving removes both keys. The key is mirrored onto the
+reciprocal entry like `pending` (`fiber_merge.py` keeps the two in lockstep and
+drops a stray `auto` that lost its `pending` or sits in `adjacent_branches`).
+An older VC3D strips the key on resave; the link then reads as a plain pending
+link on BOTH sides (the loader reconciles the two refs that way, and a reload
+applies the same downgrade to the refs of any open session of either fiber, so
+a later save of that session cannot write the mark back), and the next pair
+save converges the files. Whenever two refs of one link are combined (a
+collapse of two control points, a dedup, the sync merge), the result is
+automatic only if every pending contributor was; a human-made pending link
+outranks, and an approved contributor says nothing about it. In the sync merge
+a differing mark with both sides still pending is arbitrated against the base
+(the side that changed it wins; without a base the human state wins).
+
+Refusals are shown in the map's status line. Everything decidable up front
+refuses with nothing changed: the fibers do not meet on the map, one of them
+is read-only or open in a session that did not finish its optimization, a
+fiber's control points do not resolve in line order (or its line passes
+through one of its controls twice), no admissible position for a new control
+in the search window, the pair would not resolve on reload (different
+sources), the two existing controls are already linked to each other. A
+failure after the first fiber's new control was placed and saved (the second
+fiber's re-optimization or save, a change to the fibers, the package, the
+umbilicus, the focus bounds or the active volume while the operation yielded,
+or the link's own write) leaves that first control in place - a plain, unlinked
+control point - and the message says so; a failed write means the loaded
+fibers may differ from the files, so reload before further edits.
+
 ## Overview bar during re-optimization
 
 The overview bar above the cut views places each control point at a
@@ -468,7 +585,8 @@ menu offers the same three.
 The control-point menu is ordered by use in four sections: navigation and
 linking (go to linked annotation, go to nearby annotation, delete, link or
 merge with the candidate, designate as link or adjacent link candidate,
-unlink, approve or mark pending); the point tags (kollesis termination,
+unlink, approve or mark pending - an unreviewed automatic link's entry reads
+"Approve auto link"); the point tags (kollesis termination,
 break); new annotations at the click; and the corrections reset.
 
 The top-level `optimization_mode` is either `lasagna` or

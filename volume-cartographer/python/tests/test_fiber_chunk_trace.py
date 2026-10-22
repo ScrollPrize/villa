@@ -139,10 +139,10 @@ def test_chunk_replay_and_reverse_checks(inputs):
             cache.replay(reference, normal, cfg, **kwargs)
 
 
-def test_real_paris4_chunk_replay(tmp_path):
+def test_real_data_chunk_replay(tmp_path):
     names = ["VC_TEST_WIDTH_MANIFEST", "VC_TEST_WIDTH_FIBER", "VC_TEST_REVERSE_NORMAL_MANIFEST"]
     if not all(os.environ.get(name) for name in names):
-        pytest.skip("set the three documented cached Paris4 fixture paths")
+        pytest.skip("set the three documented cached real-data fixture paths")
     manifest, fiber_path, normal_manifest = (os.environ[name] for name in names)
     fiber = json.loads(Path(fiber_path).read_text())
     # The fixture's VC3D line coordinates are already base XYZ.

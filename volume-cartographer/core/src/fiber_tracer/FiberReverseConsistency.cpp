@@ -82,10 +82,14 @@ double verifyFiberReverseSpan(const FiberPredictionSource& predictions,
     ReverseSpanVerifier verifier(geometry, verifiedArc, start.point, normals,
         scale, normalRadiusBase, tangentialRadiusBase);
     if (verifiedArc == 0) return 0;
+    // This check measures geometric reversibility, not a second forward
+    // presence stop. Preserve the fixed width reference and all scoring terms.
+    auto reverseConfig = config;
+    reverseConfig.replayPresenceCutoff = 0;
     try {
         (void)traceFiberExtrapolation(predictions, start.point / scale,
             -start.tangent, std::max(3.0 * verifiedArc / scale,
-                2.0 * config.stepVoxels), config, &normals, {}, false,
+                2.0 * config.stepVoxels), reverseConfig, &normals, {}, false,
             [&](const cv::Vec3d& tracePoint, double, int) {
                 return verifier.observe(tracePoint * scale);
             }, prior);

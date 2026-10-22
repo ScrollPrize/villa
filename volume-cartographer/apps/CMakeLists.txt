@@ -1,3 +1,27 @@
+if(VC_BUILD_FIBERLETS OR VC_BUILD_APPS OR VC_BUILD_PYTHON)
+    add_executable(vc_cache_root src/vc_cache_root.cpp)
+    target_link_libraries(vc_cache_root PRIVATE vc_core)
+    add_executable(vc_fiber_trace_metric src/vc_fiber_trace_metric.cpp src/FiberTraceEvaluationCli.cpp)
+    target_link_libraries(vc_fiber_trace_metric PRIVATE vc_fiber_tracer vc_lasagna)
+    add_executable(vc_fiber_bake_annotations src/vc_fiber_bake_annotations.cpp)
+    target_link_libraries(vc_fiber_bake_annotations PRIVATE vc_fiber_tracer vc_lasagna)
+    add_executable(vc_fiber_constraints src/vc_fiber_constraints.cpp
+        src/FiberAfvConstraintBenchmark.cpp src/FiberConstraintDatabase.cpp)
+    target_link_libraries(vc_fiber_constraints PRIVATE vc_fiber_tracer vc_lasagna vc_fiber_collection)
+    # Wheel libraries live at its root, immediately above bin/.
+    if(VC_BUILD_PYTHON AND NOT VC_BUILD_APPS)
+        if(APPLE)
+            set(_vc_headless_rpath "@loader_path/..")
+        elseif(NOT WIN32)
+            set(_vc_headless_rpath "$ORIGIN/..")
+        endif()
+        set_target_properties(vc_fiber_bake_annotations vc_fiber_constraints vc_fiber_trace_metric vc_cache_root
+            PROPERTIES INSTALL_RPATH "${_vc_headless_rpath}")
+    endif()
+    install(TARGETS vc_fiber_bake_annotations vc_fiber_constraints vc_fiber_trace_metric vc_cache_root
+        RUNTIME DESTINATION bin COMPONENT vc_runtime)
+endif()
+
 if(VC_BUILD_FIBERLETS)
     add_executable(vc_fiberlets src/vc_fiberlets.cpp)
     target_link_libraries(vc_fiberlets PRIVATE vc_fiber_tracer vc_lasagna)
@@ -156,8 +180,6 @@ target_link_libraries(vc_calc_surface_metrics vc_core Boost::program_options)
 add_executable(vc_lasagna_line_probe src/vc_lasagna_line_probe.cpp)
 target_link_libraries(vc_lasagna_line_probe vc_lasagna opencv_imgcodecs opencv_imgproc)
 
-add_executable(vc_fiber_trace_metric src/vc_fiber_trace_metric.cpp)
-target_link_libraries(vc_fiber_trace_metric vc_fiber_tracer vc_lasagna)
 
 add_executable(vc_lasagna_maxflow_graph src/vc_lasagna_maxflow_graph.cpp)
 target_link_libraries(vc_lasagna_maxflow_graph vc_lasagna)
@@ -289,6 +311,7 @@ set(VC_CLI_TARGETS
     vc_straighten vc_cut_windings vc_tifxyz_winding vc_tifxyz_selfcross
     vc_calc_surface_metrics
     vc_lasagna_line_probe vc_fiber_trace_metric vc_lasagna_maxflow_graph
+    vc_cache_root vc_fiber_bake_annotations vc_fiber_constraints
     vc_atlas_inspect vc_atlas_constraints_export vc_atlas_pred_snap_rebuild
     vc_tifxyz_gengt vc_diffuse_winding vc_tifxyz_mmap_prepare
     vc_create_segment_mask vc_merge_tifxyz vc_merge_patch vc_visualize

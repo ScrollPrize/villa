@@ -880,7 +880,7 @@ is the sole bridge method without an MCP tool; `vc3d_wait_job` and
 | `vc3d_set_axis_aligned_slices` | `viewer.set_axis_aligned_slices` | Enable/disable axis-aligned slice mode (checkbox equivalent) — prerequisite for `viewer.rotate`. |
 | `vc3d_set_ink_overlay` | `viewer.set_ink_overlay` | Select, clear, recolor, fade or flip the ink detection overlay; any subset. |
 | `vc3d_set_intersects` | `viewer.set_intersects` | Set which surfaces' intersection lines a viewer draws. |
-| `vc3d_set_overlay` | `viewer.set_overlay` | Update the active workspace and GUI overlay controls together (volume, colormap, opacity, threshold, window, resolution cap, composite, interpolation); any subset. |
+| `vc3d_set_overlay` | `viewer.set_overlay` | Update the active workspace and GUI overlay controls together (volume, colormap, opacity, window, intensity-as-alpha, resolution cap, composite, interpolation); any subset. |
 | `vc3d_set_point_collection_color` | `points.set_collection_color` |
 | `vc3d_set_point_collection_metadata` | `points.set_collection_metadata` |
 | `vc3d_set_point_collection_tag` | `points.set_collection_tag` |

@@ -8100,11 +8100,17 @@ void CWindow::CreateWidgets(void)
                 }
                 if (const auto it = linkInfoById.find(snapshot.id); it != linkInfoById.end()) {
                     chain.colorId = it->second->linkGroupId;
-                    chain.pointLinkStates.assign(chain.points.size(), 0);
-                    for (const auto& [cpIndex, pending] : it->second->linkedControlPoints) {
-                        if (cpIndex >= 0 &&
-                            cpIndex < static_cast<int>(chain.pointLinkStates.size())) {
-                            chain.pointLinkStates[cpIndex] = pending ? 1 : 2;
+                    chain.pointLinkMarks.assign(chain.points.size(), {});
+                    for (const auto& mark : it->second->linkedControlPoints) {
+                        if (mark.controlIndex >= 0 &&
+                            mark.controlIndex < static_cast<int>(chain.pointLinkMarks.size())) {
+                            FiberOverlayController::PointLinkMark& out =
+                                chain.pointLinkMarks[static_cast<size_t>(mark.controlIndex)];
+                            out.state = static_cast<uint8_t>(mark.state);
+                            out.sameHv = mark.sameHv;
+                            out.kollesisTermination = mark.kollesisTermination;
+                            out.breakTag = mark.breakTag;
+                            out.adjacent = mark.adjacent;
                         }
                     }
                 }
@@ -8451,7 +8457,7 @@ void CWindow::CreateWidgets(void)
             .colormapSelect = ui.overlayColormapSelect,
             .samplingMethodSelect = ui.overlayInterpolationSelect,
             .opacitySpin = ui.overlayOpacitySpin,
-            .thresholdSpin = ui.overlayThresholdSpin,
+            .intensityAsAlphaCheck = ui.overlayIntensityAsAlphaCheck,
             .maxDisplayedResolutionSpin = ui.overlayMaxDisplayedResolutionSpin,
             .compositeEnabledCheck = ui.chkOverlayComposite,
             .compositeMethodSelect = ui.cmbOverlayCompositeMethod,

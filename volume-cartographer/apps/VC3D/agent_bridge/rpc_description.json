@@ -4655,6 +4655,7 @@
       ],
       "mcp": {
         "paramRenames": {
+          "intensityAsAlpha": "intensity_as_alpha",
           "maxDisplayedResolution": "max_displayed_resolution",
           "volumeId": "volume_id"
         },
@@ -4706,6 +4707,9 @@
             },
             "type": "object"
           },
+          "intensityAsAlpha": {
+            "type": "boolean"
+          },
           "interpolation": {
             "enum": [
               "nearest",
@@ -4719,9 +4723,6 @@
             "type": "integer"
           },
           "opacity": {
-            "type": "number"
-          },
-          "threshold": {
             "type": "number"
           },
           "volumeId": {

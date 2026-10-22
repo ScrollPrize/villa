@@ -20,12 +20,13 @@ import torch
 
 @dataclass(frozen=True)
 class TrainingBoundary:
-    """A completed logical update/test boundary, not a physical microbatch."""
+    """A safe initialized/update/test boundary, not a physical microbatch."""
 
     step: int
     done: bool
     capture: Any
     phase: str = "update"
+    samples_seen: int | None = None
 
 
 def config_fingerprint(config):
@@ -36,16 +37,35 @@ def config_fingerprint(config):
                                     allow_nan=False).encode()).hexdigest()
 
 
-def model_optimizer_payload(model, optimizer, grad_scaler=None):
+def checkpoint_sources(raw_config, resume_checkpoint=None):
+    """Resolve exact continuation versus a weights-only initialization."""
+    training = raw_config.get("training", {})
+    configured_resume = training.get("resume") or raw_config.get("resume")
+    initialize_from = training.get("initialize_from")
+    if resume_checkpoint is None and configured_resume and initialize_from:
+        raise ValueError("training.resume and training.initialize_from are mutually exclusive")
+    resume = str(resume_checkpoint) if resume_checkpoint is not None else configured_resume
+    return resume, None if resume else initialize_from
+
+
+def model_optimizer_payload(model, optimizer, grad_scaler=None, ema=None):
     """Common payload; callers choose disk serialization or CPU RAM ownership."""
     result = {"model": model.state_dict(), "optimizer": optimizer.state_dict()}
+    if getattr(model, "decoder_migration", None) is not None:
+        result["decoder_migration"] = deepcopy(model.decoder_migration)
     if grad_scaler is not None and grad_scaler.is_enabled():
         result["grad_scaler"] = grad_scaler.state_dict()
+    if ema is not None and ema.tracks:
+        result["ema"] = ema.state_dict()
     return result
 
 
 def restore_model_optimizer(payload, *, model, optimizer=None, grad_scaler=None):
+    if optimizer is not None and payload.get("snapshot_kind") == "ema":
+        raise ValueError("EMA snapshots are inference-only; resume from the raw current.pt snapshot")
     model.load_state_dict(payload.get("model", payload))
+    if payload.get("decoder_migration") is not None:
+        model.decoder_migration = deepcopy(payload["decoder_migration"])
     if optimizer is not None and "optimizer" in payload:
         optimizer.load_state_dict(payload["optimizer"])
     if grad_scaler is not None and grad_scaler.is_enabled() and "grad_scaler" in payload:
@@ -72,13 +92,13 @@ def cpu_clone(value):
     raise TypeError(f"unsupported handoff state value {type(value).__name__}")
 
 
-def capture_handoff(*, model, optimizer, progress, grad_scaler=None, cuda_device=None):
+def capture_handoff(*, model, optimizer, progress, grad_scaler=None, cuda_device=None, ema=None):
     """Called at a completed unit boundary after stopping asynchronous prep.
 
     CUDA RNG is accessed only when the GPU worker explicitly supplies its own
     device. A CPU-only caller never probes CUDA availability or initializes it.
     """
-    payload = cpu_clone(model_optimizer_payload(model, optimizer, grad_scaler))
+    payload = cpu_clone(model_optimizer_payload(model, optimizer, grad_scaler, ema))
     payload["progress"] = cpu_clone(progress)
     payload["rng"] = {
         "python": random.getstate(), "numpy": np.random.get_state(),
@@ -122,6 +142,11 @@ def replica_signature(payload):
                 raise ValueError("replica signature requires dense CPU tensors")
             digest.update(f"tensor:{value.dtype}:{tuple(value.shape)}:".encode())
             digest.update(value.contiguous().reshape(-1).view(torch.uint8).numpy().tobytes())
+        elif isinstance(value, np.ndarray):
+            if value.dtype.hasobject:
+                raise ValueError('replica signature requires numeric arrays')
+            digest.update(f"array:{value.dtype}:{value.shape}:".encode())
+            digest.update(value.tobytes(order='C'))
         elif isinstance(value, dict):
             digest.update(b"{")
             for key in sorted(value, key=lambda key: (type(key).__name__, repr(key))):

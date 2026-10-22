@@ -412,7 +412,7 @@ def check_viewer_normalization(client: BridgeClient, results: Results) -> None:
             "viewer.set_overlay",
             {
                 "opacity": 7.5,
-                "threshold": 300,
+                "intensityAsAlpha": True,
                 "maxDisplayedResolution": 12,
                 "composite": {"layersFront": -7, "layersBehind": 100},
             },
@@ -420,7 +420,7 @@ def check_viewer_normalization(client: BridgeClient, results: Results) -> None:
         )
         for path, expected in {
             "opacity": 1,
-            "threshold": 255,
+            "intensityAsAlpha": True,
             "maxDisplayedResolution": 5,
             "composite.layersFront": 0,
             "composite.layersBehind": 64,

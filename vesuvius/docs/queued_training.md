@@ -18,11 +18,12 @@ The full initial test and periodic tests use the same queue/evaluator.
 
 The opt-in resumable loop now also connects the existing target-normalized
 effective-batch accumulator and RAM handoff described below. Default training
-still uses its original rank-local batch/DDP objective. This stage does not
-enable cooperative resource handling or new model output resolutions.
+uses its original rank-local batch/DDP objective when explicitly unmanaged.
+The default CUDA entry point now uses the cooperative supervisor below. CPU
+test runs and the low-level iterator remain usable without a GPU manager.
 The legacy whole-batch DataLoader helper remains available to the existing
-standalone benchmark, not production training. GPU callers must already hold a
-manager allocation; these loading components never acquire resources.
+standalone benchmark, not production training. The loading components themselves
+never acquire resources; the default training supervisor owns that allocation.
 
 ## Worker and buffer controls
 
@@ -80,12 +81,11 @@ group, including when the initial test or a later update fails.
 
 ## Resumable effective-batch loop
 
-`run_training` exhausts the single `training_units` iterator. Library callers
+Unmanaged `run_training` exhausts the single `training_units` iterator. Library callers
 may instead advance that iterator at completed update/test boundaries and call
 `boundary.capture()` only when needed. Close the iterator before reconstructing
 workers; a capture is not permission to keep old GPU workers alive alongside
-their replacements. Manager registration, allocation and cohort ownership are
-not part of this stage.
+their replacements. The cooperative adapter below uses those same boundaries.
 
 These existing development controls are opt-in:
 
@@ -120,7 +120,8 @@ Initial and periodic bounded tests yield after each wave of original logical
 test groups; completed rows survive interruption and repartition. The retained
 first visualization batch is an owned CPU payload, using this branch's existing
 contact-sheet renderer. It is not reloaded when a test resumes. Disk checkpoint
-schema and its existing RNG semantics remain unchanged.
+semantics remain unchanged; managed snapshots additionally record cumulative
+`samples_seen` and `optimizer_global_batch_size`.
 
 Capture pauses and drains asynchronous CUDA submission (including the geometry
 count prepass), synchronizes the worker device and flushes its writer. If the
@@ -130,15 +131,114 @@ captured frontier. No dataset, queue or allocation is serialized in the handoff.
 
 The source loop is extracted from `3a4a7b2c1`. This stage retains this branch's
 validity masks and existing visualization API rather than importing later
-mask-free targets, embedding, profiling or manager orchestration. It does not
+mask-free targets, embedding or profiling. It does not
 add an alternate loader or a second training implementation.
 
 The optional `batch_source` hook now also connects the existing
 [persistent CPU broker and cancellable worker transport](persistent_training_samples.md).
 In that mode the trainer creates no private queue and closing a worker's input
 view leaves the CPU owner alive. Completed updates and train/test phases retain
-the same canonical ownership rules. Full manager/cohort orchestration and
-automatic calibration remain separate from this integration.
+the same canonical ownership rules.
+
+## Default cooperative launch
+
+The `models`/`all` dependency groups include the monorepo's existing
+`villa_gpu_manager` package. With that environment, start a single supervisor
+process (not `torchrun`):
+
+```bash
+python -m vesuvius.neural_tracing.fiber_trace_3d.train CONFIG.json
+python -m vesuvius.neural_tracing.fiber_trace_3d.train CONFIG.json --resume SNAPSHOT.pt
+```
+
+CUDA training automatically discovers/starts the shared manager and derives its
+request. No socket or resource-request block is required. An explicit
+`--manager-socket PATH` overrides discovery. `--unmanaged` is an explicit debug
+escape hatch, never a fallback after a manager error. CPU-only tests keep their
+existing direct execution. Standalone GPU benchmarking/visualization helpers
+must be invoked by a caller already holding a manager reservation.
+
+Managed training requires a fixed positive `optimizer_global_batch_size`,
+positive `sample_pipeline_workers` and `max_steps`, enough sample slots for the
+effective batch and a logical test batch, and a sample-independent model (for
+example `model.normalization="group"`). BatchNorm/SyncBatchNorm are not silently
+replaced. Use `sync_batchnorm=false` and `ddp_broadcast_buffers=false`.
+
+The CPU supervisor retains one broker, the configured dataset records/samplers
+and one TensorBoard writer for the entire run. A GPU consumer receives only
+validated immutable configuration/sample-count metadata, not another native
+loader. Cohorts launch one authorized PyTorch process per granted GPU UUID;
+microbatches are chosen from measured memory bounds. CPU loader workers are
+parked or enabled according to the grant without being restarted.
+
+Each allocation change drains the current work unit, captures model/optimizer/
+scaler/RNG/test progress into owned CPU RAM, joins the old consumers, and only
+then acknowledges release. Replacement consumers restore that state, replay
+retained speculative CPU samples and continue the same effective batch stream.
+Worker readiness means initialization only: scheduled tests and training do not
+run inside the startup deadline. The pending initial test survives an immediate
+release. Rank-local failures are reported before collective cleanup can wait
+for peers. The existing independent stop guard handles stuck compute children.
+
+Pause, continue, initialization and allocation transitions are printed. Existing
+manager reconnection handling retains authorized work for a 60-second outage,
+then drains/pauses and retries; recovery reconciles ownership before resuming.
+Normal training does not poll driver or allocator memory usage. Telemetry is
+limited to calibration. Managed scalar/image steps use cumulative training
+samples; scheduling and snapshot filenames still use optimizer updates.
+
+### Automatic and explicit calibration
+
+Without a compatible saved report, startup requests exclusive, unpausable use
+at training priority plus 100. It performs the **real initial test and real
+optimizer updates**, initially at microbatch one, then tries safely bounded
+larger physical batches. Updates are not replayed or discarded. Measurements
+include the optimizer, asynchronous preparation, test footprint and reserve;
+unmeasured batch sizes are never used as adaptive estimates.
+
+The report is written below the configured training `run_path`, at
+`.memory-calibrations/<config-fingerprint>.json`. Operational manager settings
+do not change that fingerprint. After calibration, startup workers join and
+the same RAM state/broker/writer continue under a new adaptive registration,
+preserving the locked manager protocol. A single-GPU report sizes each GPU's
+microbatch; it does not permanently restrict the number of training replicas.
+
+For explicit whole-device calibration of a visible subset without global
+exclusivity, set `training.cooperative.startup_calibration_scope="visible_gpus"`.
+The selected devices must be managed and have equal capacity; each is reserved
+in full and cannot be paused during calibration. The default scope is `global`.
+`CUDA_VISIBLE_DEVICES` restricts eligible devices; use UUIDs to avoid ordinal
+ambiguity. `training.cooperative.priority` sets the regular training priority.
+An optional explicit `request` can further cap GPU count/VRAM/CPU resources.
+
+The existing separate cold-start probe remains available for manual debugging:
+
+```bash
+python -m vesuvius.neural_tracing.fiber_trace_3d.memory_calibration CONFIG.json \
+  --gpu-uuids GPU_UUID --microbatch-sizes 1 2 4 \
+  --cpu-workers 8 --steps 3 --vram-limit-bytes PER_GPU_BYTE_LIMIT
+```
+
+It acquires its own exclusive manager reservation before GPU initialization.
+Its checkpoint/config must not resume a previous run. By default its report is
+discovered by training without editing the config. This manual probe is not
+the production startup path.
+
+### Native lower-resolution output
+
+`model.output_stride` (or `model_3d.output_stride`) defaults to one, preserving
+the existing default model/state keys. An explicit encoder resolution such as
+two or four omits the higher-resolution decoder stages. Targets and the
+geometry-only normalization prepass use the same output lattice in training
+and testing; masks retain the conservative coarse validity semantics. Contact
+sheets upsample only for display. The tiled-inference adapter exposes the
+native stride to the existing output-scale handling. This is an opt-in model
+change, not a claim that reduced resolution preserves convergence/accuracy.
+
+The integration comes from `3a4a7b2c1`, with later dataset-metadata, startup
+boundary, calibration-only telemetry and GPU-count fixes from `2192cc5ac`.
+Annotation heads, embedding/refinement and resident tracing tests are separate
+supervision/evaluation extractions, not dependencies of this execution layer.
 
 ## Validation
 
@@ -175,3 +275,21 @@ Resumable tests compare full-effective-batch versus changed physical
 microbatches on the actual U-Net and AdamW, including initial/periodic test
 interruption, completed-run capture, immutable handoffs, RNG restoration and
 unequal/zero-work distributed ranks.
+
+Additional execution checks:
+
+```bash
+python -m pytest -q tests/neural_tracing/test_cooperative_integration.py \
+  -k 'not cuda'
+```
+
+They include real Paris4 U-Net/Adam cohort replacement before testing, during
+tests and during updates, unchanged CPU loader PIDs, metadata validation, an
+isolated real Unix-manager pause/resize/disconnect/reconnect lifecycle, early
+rank-local failure reporting, calibration/request planning and default managed
+launch. CUDA variants require the same external manager reservation described
+above; they exercise two-rank to one-rank resize and native coarse output.
+These tests do not override NCCL transport settings. The real automatic-startup
+test also runs the unmodified production worker factory in a fresh CPU-only
+supervisor, calibrates using real updates, then continues under an adaptive
+registration. This exercises the production defaults on two granted GPUs.

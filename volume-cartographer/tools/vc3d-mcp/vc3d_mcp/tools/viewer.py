@@ -413,8 +413,8 @@ async def vc3d_get_overlay() -> dict[str, Any]:
     are the same settings shown in VC3D's Overlay Volume controls.
 
     Returns {"volumeId" (str, "" when no overlay is set), "colormap" (str, ""
-    for grayscale), "opacity" (0..1), "threshold" (0..255), "windowLow"/
-    "windowHigh" (0..255), "maxDisplayedResolution" (int 0..5),
+    for grayscale), "opacity" (0..1), "windowLow"/"windowHigh" (0..255),
+    "intensityAsAlpha" (bool), "maxDisplayedResolution" (int 0..5),
     "composite": {"enabled" (bool), "method" ("max"|"mean"|"min"),
     "layersFront"/"layersBehind" (int 0..64)}, "interpolation" ("nearest" |
     "trilinear")}."""
@@ -427,8 +427,8 @@ async def vc3d_set_overlay(
     clear: Optional[bool] = None,
     colormap: Optional[_OverlayColormap] = None,
     opacity: Optional[float] = None,
-    threshold: Optional[float] = None,
     window: Optional[_Window] = None,
+    intensity_as_alpha: Optional[bool] = None,
     max_displayed_resolution: Optional[int] = None,
     composite: Optional[_OverlayComposite] = None,
     interpolation: Optional[Literal["nearest", "trilinear"]] = None,
@@ -445,8 +445,10 @@ async def vc3d_set_overlay(
     "blue", "cyan", "magenta", "glasbey_black0"; empty string uses grayscale.
     An unrecognized id raises -32602 rather than being silently ignored.
     opacity: overlay opacity, clamped 0..1.
-    threshold: overlay display threshold, clamped 0..255.
     window: {"low", "high"} overlay display window, clamped 0..255.
+    intensity_as_alpha: True uses the windowed overlay intensity as its alpha
+    (transparent below the window, opaque at and above its top); False shows
+    the window band opaquely. Label colormaps (glasbey_black0) ignore it.
     max_displayed_resolution: overlay resolution cap, clamped 0..5.
     composite: {"enabled", "method" ("max"|"mean"|"min"), "layersFront",
     "layersBehind"} -- any subset; merged over the current composite settings.
@@ -468,8 +470,8 @@ async def vc3d_set_overlay(
                 "clear": clear,
                 "colormap": colormap,
                 "opacity": opacity,
-                "threshold": threshold,
                 "window": window,
+                "intensityAsAlpha": intensity_as_alpha,
                 "maxDisplayedResolution": max_displayed_resolution,
                 "composite": composite,
                 "interpolation": interpolation,
