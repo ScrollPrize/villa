@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -135,6 +136,286 @@ class FiberPointCollectionTests(unittest.TestCase):
                 path, collection_id=7, min_point_spacing=0)
 
             self.assertEqual(collection["branches"], [])
+
+    def _tagged_fiber_docs(self, tag):
+        # A v4 fiber along x (line points every 4 units, control points at
+        # 0, 12, 28, 36) whose span 12 -> 28 carries `tag`, plus a peer fiber
+        # linked reciprocally to its interior control point at 28 (which
+        # greedy decimation at spacing 16 would otherwise discard).
+        from test_bracket_fiber_links import _segment
+        common = {
+            "type": "vc3d_fiber", "version": 4, "generation": 3,
+            "optimization_mode": "native_fiber_trace3d",
+            "hv_classification": {"automatic_tag": "H", "automatic_certainty": 1.0, "manual_tag": ""},
+            "sequence": 1, "started_at": "20260101T000000000", "tags": [], "username": "test",
+        }
+        fiber = dict(common, filename="fiber.json", control_points=[
+            {"position": [0, 0, 0], "segment_to_next": _segment()},
+            {"position": [12, 0, 0], "segment_to_next": dict(_segment(), tags=[tag] if tag else [])},
+            {"position": [28, 0, 0], "segment_to_next": _segment()},
+            {"position": [36, 0, 0]},
+        ], line_points=[[x, 0, 0] for x in range(0, 40, 4)], branches=[
+            {"branch_file": "peer.json", "control_point_index": 2, "branch_control_point_index": 0}])
+        peer = dict(common, filename="peer.json", control_points=[
+            {"position": [28, 0, 0], "segment_to_next": _segment()},
+            {"position": [28, 10, 0]},
+        ], line_points=[[28, 0, 0], [28, 5, 0], [28, 10, 0]], branches=[
+            {"branch_file": "fiber.json", "control_point_index": 0, "branch_control_point_index": 2}])
+        return fiber, peer
+
+    def _write_tagged_pair(self, directory, tag, **load):
+        fiber, peer = self._tagged_fiber_docs(tag)
+        paths = {}
+        for name, doc in (("fiber.json", fiber), ("peer.json", peer)):
+            paths[name] = Path(directory) / name
+            paths[name].write_text(json.dumps(doc))
+        return (load_fiber_point_collection(paths["fiber.json"], collection_id=7, coordinate_scale=1.0, **load),
+                load_fiber_point_collection(paths["peer.json"], collection_id=8, coordinate_scale=1.0, **load))
+
+    def test_flags_the_interior_line_points_of_gap_and_damaged_spans(self):
+        # Format v4 span tags: a `gap` or `damaged` span's line points are the
+        # tracer's bridge over a hole, not sheet. They stay in the polyline
+        # (the chain unwrap needs the geometry) but are flagged fit_excluded;
+        # the span's two control points are ordinary points.
+        from spiral_helpers import resolve_fiber_links
+        for tag in ("gap", "damaged", None):
+            with self.subTest(tag=tag), tempfile.TemporaryDirectory() as temporary:
+                fiber, peer = self._write_tagged_pair(temporary, tag, min_point_spacing=0)
+
+                points = [point["p"][0] for point in fiber["points"].values()]
+                self.assertEqual(points, list(range(0, 40, 4)))
+                excluded = [point["fit_excluded"] for point in fiber["points"].values()]
+                expected = [x in (16, 20, 24) for x in points] if tag else [False] * 10
+                self.assertEqual(excluded, expected)
+                np.testing.assert_array_equal(fiber["control_line_indices"], [0, 3, 7, 9])
+                self.assertEqual(fiber["metadata"]["fiber_excluded_spans"], 1 if tag else 0)
+                self.assertEqual(fiber["metadata"]["fiber_excluded_span_points"], 3 if tag else 0)
+                self.assertFalse(any(point["fit_excluded"] for point in peer["points"].values()))
+
+    def test_flags_survive_coarse_decimation_and_links_resolve_exactly(self):
+        # Greedy decimation at spacing 16 keeps x = 0 and 16 (inside the
+        # span, so flagged); the link endpoint 28 is only 12 further and
+        # survives by force, after which 36 is too close. The reciprocal peer
+        # link resolves to that exact point.
+        from spiral_helpers import resolve_fiber_links
+        with tempfile.TemporaryDirectory() as temporary:
+            fiber, peer = self._write_tagged_pair(temporary, "gap", min_point_spacing=16)
+
+            points = [point["p"][0] for point in fiber["points"].values()]
+            self.assertEqual(points, [0, 16, 28])
+            np.testing.assert_array_equal(fiber["kept_orig_indices"], [0, 4, 7])
+            self.assertEqual([point["fit_excluded"] for point in fiber["points"].values()],
+                             [False, True, False])
+            links = resolve_fiber_links({7: fiber, 8: peer})
+            self.assertEqual(len(links), 1)
+            endpoint = {links[0]["a_coll"]: links[0]["a_point"], links[0]["b_coll"]: links[0]["b_point"]}
+            self.assertEqual(endpoint, {7: 2, 8: 0})
+            self.assertEqual(fiber["points"][2]["p"], [28, 0, 0])
+            self.assertFalse(fiber["points"][2]["fit_excluded"])
+
+    def test_materialized_strips_carry_the_fit_mask_through_decimation(self):
+        # The catalog's fit_excluded flags become the strip's fit_mask, in the
+        # strip's decimated point order, on every (deterministic) rebuild.
+        with tempfile.TemporaryDirectory() as temporary:
+            fiber, peer = self._write_tagged_pair(temporary, "damaged", min_point_spacing=0)
+            catalog = {"fiber": fiber, "peer": peer}
+            for spacing in (0, 16):
+                with self.subTest(spacing=spacing):
+                    views = [materialize_fiber_fit_inputs(
+                        catalog, {}, z_begin=-10, z_end=10, z_margin=0,
+                        min_point_spacing=spacing) for _ in range(2)]
+                    strips = {strip["id"]: strip for strip in views[0][1]}
+                    strip = strips[7]
+                    xs = strip["zyxs"][:, 2].tolist()
+                    if spacing == 0:
+                        self.assertEqual(xs, list(range(0, 40, 4)))
+                        self.assertEqual(strip["link_points"], {7: 7})
+                    else:
+                        # 28 survives only as the force-kept link endpoint
+                        # (greedy spacing would pick 32); 36 as the last point.
+                        self.assertEqual(xs, [0, 16, 28, 36])
+                        self.assertEqual(strip["link_points"], {7: 2})
+                    np.testing.assert_array_equal(
+                        strip["fit_mask"], [x not in (16, 20, 24) for x in xs])
+                    self.assertTrue(strips[8]["fit_mask"].all())
+                    again = {strip["id"]: strip for strip in views[1][1]}[7]
+                    np.testing.assert_array_equal(again["fit_mask"], strip["fit_mask"])
+                    self.assertEqual(len(views[0][3]), 1)
+
+    def test_excluded_points_do_not_make_an_attached_fiber_a_strip(self):
+        # Every eligible point is attached to a patch: without the tag the
+        # fiber yields no unattached strip, and an excluded point inside it
+        # must not change that (it would hand the attached endpoints strip
+        # constraints they did not have).
+        for excluded in (False, True):
+            with self.subTest(excluded=excluded):
+                member = self._linked_member(10, "a", [], 0)
+                member["points"][2] = {
+                    "id": 2, "collectionId": 10, "p": [2.0, 0.0, 0.0],
+                    "zyx": np.asarray([0.0, 0.0, 2.0], dtype=np.float32),
+                    "winding_annotation": float("nan"), "fit_excluded": True}
+                member["points"] = {0: member["points"][0], 1: member["points"][2], 2: member["points"][1]}
+                for point_id, point in member["points"].items():
+                    point["id"] = point_id
+                if not excluded:
+                    member["points"][1]["fit_excluded"] = False
+                    member["points"][1]["on_patch"] = {"id": "patch-a"}
+                cross, strips, _, _, _ = self._materialize({"a": member})
+                self.assertEqual(len(cross), 1)
+                self.assertEqual(strips, [])
+
+    def test_outer_winding_evidence_skips_excluded_points(self):
+        # An excluded excursion to winding 20 on a strip whose eligible
+        # points sit at winding 10 must not widen the winding range or the
+        # strip's extent (which seed the shell outer-winding inference).
+        from spiral_helpers import compute_winding_range_and_input_extents
+        from fit_spiral import _build_strip_flat_bundle
+
+        class Identity:
+            def __call__(self, zyxs):
+                return zyxs
+
+        dr = torch.tensor(12.0)
+        radii = np.array([10.0, 10.0, 10.0, 20.0]) * 12.0
+        zyxs = np.stack([np.zeros(4), np.zeros(4), radii], axis=1).astype(np.float32)
+        cfg = Config().as_dict()
+        results = {}
+        for name, fit_mask in (("plain", None), ("masked", np.array([True, True, True, False]))):
+            strip = {"zyxs": zyxs, "windings": np.zeros(4, np.float32), "fit_mask": fit_mask}
+            flat = _build_strip_flat_bundle([(zyxs, strip["windings"], None, None, fit_mask)], torch.device("cpu"))
+            results[name] = compute_winding_range_and_input_extents(
+                Identity(), dr, [], [strip], cfg, -1, 1, lambda _s, _d: flat)
+        self.assertEqual(results["plain"][2][0][1], 20)
+        self.assertEqual(results["masked"][2][0][1], 10)
+        self.assertEqual(results["plain"][0][1] - results["masked"][0][1], 10)
+
+    def test_hv_fallback_ignores_an_excluded_excursion(self):
+        # Eligible points on a vertical line; an excluded excursion dominates
+        # the path length. The geometric fallback (no usable VC3D tag) must
+        # read the eligible geometry: V, hence the vertical radial offset on
+        # the strip and the front-side link rule for the collection.
+        from spiral_helpers import classify_fiber_hv, fiber_collection_hv_tag
+        zyxs = np.asarray([[0, 0, 100], [10, 0, 100], [15, 0, 1000], [20, 0, 100], [30, 0, 100]],
+                          dtype=np.float32)
+        mask = np.asarray([True, True, False, True, True])
+        kwargs = dict(min_z_fraction=0.8, min_auto_certainty=0.5)
+        self.assertEqual(classify_fiber_hv({}, zyxs, **kwargs), "H")
+        self.assertEqual(classify_fiber_hv({}, zyxs, fit_mask=mask, **kwargs), "V")
+        self.assertEqual(classify_fiber_hv({"manual_tag": "H"}, zyxs, fit_mask=mask, **kwargs), "H")
+        member = self._linked_member(10, "a", [], 0, attached=False)
+        member["points"] = {
+            k: {"id": k, "collectionId": 10, "p": [float(z[2]), 0.0, float(z[0])],
+                "zyx": np.asarray(z, dtype=np.float32), "winding_annotation": float("nan"),
+                "fit_excluded": not bool(m)}
+            for k, (z, m) in enumerate(zip(zyxs, mask))}
+        member["metadata"]["hv_classification"] = {}
+        self.assertEqual(fiber_collection_hv_tag(member, **kwargs), "V")
+        _, strips, _, _, _ = materialize_fiber_fit_inputs(
+            {"a": member}, {}, z_begin=-10, z_end=100, z_margin=0,
+            min_point_spacing=0, vertical_radial_offset=4.0)
+        self.assertEqual(strips[0]["hv_tag"], "V")
+        np.testing.assert_array_equal(strips[0]["radial_offsets"], [4.0] * 5)
+        np.testing.assert_array_equal(strips[0]["fit_mask"], mask)
+
+    def test_overlapping_span_projections_never_exclude_a_control_point(self):
+        # Control points whose nearest line points are out of order
+        # ([0, 7, 3, 9]) with both the 0->28 and the 12->36 span tagged: the
+        # interiors overlap, but the control points at 12 and 28 stay
+        # ordinary points.
+        from test_bracket_fiber_links import _segment
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self._write_fiber(temporary, {
+                "type": "vc3d_fiber", "version": 4, "generation": 3,
+                "optimization_mode": "native_fiber_trace3d",
+                "hv_classification": {"automatic_tag": "H", "automatic_certainty": 1.0, "manual_tag": ""},
+                "sequence": 1, "started_at": "20260101T000000000", "tags": [], "username": "test",
+                "filename": "fiber.json",
+                "control_points": [
+                    {"position": [0, 0, 0], "segment_to_next": dict(_segment(), tags=["gap"])},
+                    {"position": [28, 0, 0], "segment_to_next": _segment()},
+                    {"position": [12, 0, 0], "segment_to_next": dict(_segment(), tags=["damaged"])},
+                    {"position": [36, 0, 0]},
+                ],
+                "line_points": [[x, 0, 0] for x in range(0, 40, 4)],
+            })
+            collection = load_fiber_point_collection(
+                path, collection_id=7, coordinate_scale=1.0, min_point_spacing=0)
+            np.testing.assert_array_equal(collection["control_line_indices"], [0, 7, 3, 9])
+            excluded = [x for point in collection["points"].values()
+                        for x in [point["p"][0]] if point["fit_excluded"]]
+            self.assertEqual(excluded, [4, 8, 16, 20, 24, 32])
+            self.assertEqual(collection["metadata"]["fiber_excluded_spans"], 2)
+            self.assertEqual(collection["metadata"]["fiber_excluded_span_points"], 6)
+
+    def test_segmented_median_skips_excluded_points(self):
+        from spiral_helpers import _segmented_median_per_strip
+        lengths = torch.tensor([4, 3, 2])
+        starts = torch.cat([torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)])
+        values = torch.tensor([5.0, 9.0, 1.0, 9.5,   # kept: 5, 1 -> median 1
+                               2.0, 8.0, 3.0,        # kept: 2, 8, 3 -> median 3
+                               7.0, 6.0])            # nothing kept
+        fit_mask = torch.tensor([True, False, True, False,
+                                 True, True, True,
+                                 False, False])
+        ctx = {'normalised_radii': values, 'strip_id': torch.repeat_interleave(torch.arange(3), lengths),
+               'starts': starts, 'lengths': lengths, 'S': 3, 'device': torch.device('cpu'),
+               'fit_mask': fit_mask}
+        medians = _segmented_median_per_strip(ctx)
+        self.assertEqual(medians[:2].tolist(), [1.0, 3.0])
+        ctx.pop('fit_mask')
+        self.assertEqual(_segmented_median_per_strip(ctx).tolist(), [5.0, 3.0, 6.0])
+
+    def test_segmented_median_skips_excluded_points_in_the_two_pass_branch(self):
+        # FIT_SPIRAL_MAX_PRECISION_FLOAT=32 selects the value-sort-then-strip-
+        # sort branch (MPS); it must agree with the composite-key branch.
+        import devices
+        from spiral_helpers import _segmented_median_per_strip
+        lengths = torch.tensor([4, 3, 2])
+        values = torch.tensor([5.0, 9.0, 1.0, 9.5, 2.0, 8.0, 3.0, 7.0, 6.0])
+        fit_mask = torch.tensor([True, False, True, False, True, True, True, False, False])
+        ctx = {'normalised_radii': values, 'strip_id': torch.repeat_interleave(torch.arange(3), lengths),
+               'starts': torch.cat([torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)]),
+               'lengths': lengths, 'S': 3, 'device': torch.device('cpu'), 'fit_mask': fit_mask}
+        with mock.patch.dict(os.environ, {'FIT_SPIRAL_MAX_PRECISION_FLOAT': '32'}):
+            devices.max_precision_bits.cache_clear()
+            try:
+                self.assertEqual(devices.float_hi('cpu'), torch.float32)
+                self.assertEqual(_segmented_median_per_strip(ctx)[:2].tolist(), [1.0, 3.0])
+            finally:
+                devices.max_precision_bits.cache_clear()
+        devices.max_precision_bits.cache_clear()
+
+    def test_segmented_median_tolerates_empty_strips(self):
+        # Intervening and trailing zero-length strips (the satisfaction API
+        # supports empty collections) must not index past the values.
+        from spiral_helpers import _segmented_median_per_strip
+        lengths = torch.tensor([3, 0, 2, 0])
+        starts = torch.cat([torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)])
+        values = torch.tensor([2.0, 9.0, 4.0, 7.0, 1.0])
+        ctx = {'normalised_radii': values, 'strip_id': torch.repeat_interleave(torch.arange(4), lengths),
+               'starts': starts, 'lengths': lengths, 'S': 4, 'device': torch.device('cpu')}
+        medians = _segmented_median_per_strip(ctx)
+        self.assertEqual(medians[0].item(), 4.0)
+        self.assertEqual(medians[2].item(), 1.0)
+        ctx['fit_mask'] = torch.tensor([True, False, True, False, False])
+        medians = _segmented_median_per_strip(ctx)
+        self.assertEqual(medians[0].item(), 2.0)
+
+    def test_trusted_geometry_leaves_excluded_strip_points_out(self):
+        from fit_spiral import _strip_trusted_point_mask
+        context = FitContext.__new__(FitContext)
+        context.config = FitConfig(Config({"z_begin": 0, "z_end": 10}).as_dict())
+        context.verified_patches_list = []
+        zyxs = np.asarray([[1, 0, 0], [2, 0, 0], [3, 0, 0], [20, 0, 0]], dtype=np.float32)
+        plain = {'zyxs': zyxs}
+        masked = {'zyxs': zyxs, 'fit_mask': np.asarray([True, False, True, True])}
+        np.testing.assert_array_equal(
+            _strip_trusted_point_mask(plain, 0, 10), [True, True, True, False])
+        np.testing.assert_array_equal(
+            _strip_trusted_point_mask(masked, 0, 10), [True, False, True, False])
+        context.unattached_pcl_strips = _UnattachedPclStripList([masked, plain])
+        trusted = context._trusted_geometry_from_active_inputs()
+        self.assertEqual(trusted[:, 0].tolist(), [1.0, 3.0, 1.0, 2.0, 3.0])
 
     def test_declared_coordinate_domain_overrides_legacy_scale(self):
         for shape, expected_scale in (([101, 201, 301], 1),
