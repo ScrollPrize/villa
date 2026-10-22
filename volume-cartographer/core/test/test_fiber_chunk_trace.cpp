@@ -153,7 +153,7 @@ TEST_CASE("chunk matching uses orientation overlap and optional width not neares
     region.metric(0,0)=-1;CHECK_THROWS(matchFiberChunkPaths(chunk,history,{1,0,0},c,true,&region));
 }
 
-TEST_CASE("real Paris4 chunk construction roundtrips with identical parallel paths") {
+TEST_CASE("real-data chunk construction roundtrips with identical parallel paths") {
     const char* manifest=std::getenv("VC_TEST_WIDTH_MANIFEST");
     const char* fiberPath=std::getenv("VC_TEST_WIDTH_FIBER");
     const char* normalManifest=std::getenv("VC_TEST_REVERSE_NORMAL_MANIFEST");
@@ -195,9 +195,9 @@ TEST_CASE("real Paris4 chunk construction roundtrips with identical parallel pat
         CHECK(first.segments[i].tracePointsBase==second.segments[i].tracePointsBase);
         CHECK(first.segments[i].terminationReason==second.segments[i].terminationReason);
     }
-    std::cout<<"Real Paris4 chunk replay: length="<<reference.length()<<" segments="<<first.segments.size()
+    std::cout<<"Real-data chunk replay: length="<<reference.length()<<" segments="<<first.segments.size()
              <<" failures="<<first.failures.size()<<" joins="<<joins<<"; disk reload exact\n";
-    std::cout<<"Real Paris4 chunk: maxima="<<a->maxima<<" seeds="<<a->seeds<<" paths="<<a->lines.size()
+    std::cout<<"Real-data chunk: maxima="<<a->maxima<<" seeds="<<a->seeds<<" paths="<<a->lines.size()
              <<"; serial/parallel/unpinned/disk paths exact\n";
 }
 

@@ -1,7 +1,7 @@
 # Reusable tracing recovery
 
-Recovered onto `origin/main` (`862142652`) from `fiber-exp5` (`8ab5ec0cc`)
-on branch `trace-recovery`. This is code integration, not a new quality result.
+Reusable native tracing, cache and evaluation APIs. This documents code
+integration, not a new quality result or a prescribed experiment configuration.
 
 ## Inventory and scope
 
@@ -20,11 +20,9 @@ on branch `trace-recovery`. This is code integration, not a new quality result.
 
 Historical parameter sweeps, model/checkpoint paths, cohort configurations,
 results, plots, exported data and machine-specific launchers are **not** imported
-or committed here. They remain on `fiber-exp5` and in their external data
-directories. They have not been deleted or moved. Unrelated experimental
-skeleton/BP algorithms and training changes are outside this tracing recovery;
-main's versions remain in place. A later data-directory migration can select
-those artifacts explicitly instead of mixing them into reusable code.
+or committed here. Keep them in external experiment archives. Experimental
+skeleton/BP algorithms and training changes are outside this tracing API;
+the repository's separate implementations remain in place.
 
 ## Settings and units
 

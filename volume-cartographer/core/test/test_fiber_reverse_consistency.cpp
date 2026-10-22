@@ -151,7 +151,7 @@ TEST_CASE("reverse checks fail missing seeds but preserve sampling and configura
     CHECK_THROWS_AS(verifyFiberReverseSpan(prediction,normals,c,line,100,2,8),std::invalid_argument);
 }
 
-TEST_CASE("cached Paris4 forward trace can be checked backward without ground truth") {
+TEST_CASE("cached real-data forward trace can be checked backward without ground truth") {
     const char* manifest=std::getenv("VC_TEST_WIDTH_MANIFEST");
     const char* fiberPath=std::getenv("VC_TEST_WIDTH_FIBER");
     const char* normalManifest=std::getenv("VC_TEST_REVERSE_NORMAL_MANIFEST");
@@ -176,7 +176,7 @@ TEST_CASE("cached Paris4 forward trace can be checked backward without ground tr
     const double parallel=verifyFiberReverseSpan(field,normals,c,geometry,geometry.length(),20,40);
     CHECK(serial==parallel);
     CHECK(serial>=0); CHECK(serial<=geometry.length());
-    std::cout << "Real Paris4 reverse check: forward=" << geometry.length()
+    std::cout << "Real-data reverse check: forward=" << geometry.length()
         << " base voxels; remaining=" << serial << "; verified=" << geometry.length()-serial
         << "; serial/parallel exact\n";
 }
