@@ -280,7 +280,7 @@ VC_TRACE_HD float candidateBound(Fields fields,Params p,const State& parent,floa
 __device__ int prefer(State* c,int a,int b) {
     return b>=0&&(a<0||better(c[b],c[a]))?b:a;
 }
-// Uniformly called by the entire block. Two block barriers per winner, with
+// Uniformly called by the entire block. Three block barriers per winner, with
 // warp reductions in between; retain original candidate IDs for exact ties.
 __device__ int blockBest(State* c,int best,int* warpBest) {
     for(int d=16;d;d/=2) {
@@ -297,7 +297,13 @@ __device__ int blockBest(State* c,int best,int* warpBest) {
         }
         if(threadIdx.x==0)warpBest[0]=best;
     }
-    __syncthreads();return warpBest[0];
+    __syncthreads();
+    // Every warp must snapshot the winner before the next reduction reuses
+    // warpBest[0]. Otherwise a fast warp can overwrite it while another warp
+    // is still reading, producing divergent selection/termination decisions.
+    const int winner=warpBest[0];
+    __syncthreads();
+    return winner;
 }
 __device__ void selectCandidates(State* c,int count,State* selected,int& selectedCount,
     int limit,float prune,bool parallel,int* indices,int* warpBest) {
@@ -327,7 +333,10 @@ __device__ void selectCandidates(State* c,int count,State* selected,int& selecte
 }
 // Re-evaluate the provisional diversity beam after every expansion: adding
 // candidates can change its worst score, so a single top-K threshold is unsafe.
-__device__ void scoreAndSelect(Fields fields,Params p,const State* inputs,int inputCount,
+// Keep the immutable parameter block in its caller-owned storage. Passing a
+// second by-value copy here produced invalid local-memory reads in optimized
+// CUDA 12.8 builds at the second expansion (verified with memcheck on H100).
+__device__ void scoreAndSelect(Fields fields,const Params& p,const State* inputs,int inputCount,
     const float2* offsets,double widthMean,State* candidates,State* selected,int& selectedCount,
     int limit,float prune,bool second,bool parallel,bool bounded,bool audit,
     float* bounds,unsigned char* evaluated,int* indices,int* warpBest,Output& output) {
@@ -661,6 +670,49 @@ void hostRefinementTests() {
 }
 int main(int argc,char** argv) try {
     if(argc==2&&std::string(argv[1])=="--host-refinement-tests"){hostRefinementTests();return 0;}
+    if(argc==2&&std::string(argv[1])=="--device-tests") {
+        // Exercise the actual optimized two-stage search, not just its host
+        // scoring functions. Include partial/empty frontiers and repeated
+        // winner reductions, with no external dataset requirement.
+        constexpr int side=32,count=512;
+        Params p{};for(int a=0;a<3;++a){p.shape[a]=side;p.origin[a]=0;}
+        p.spacing=1;p.step=.5f;p.steps=16;p.lo={3,3,3};p.hi={28,28,28};
+        p.tolerance=.4;p.cutoff=.4;p.prune=.1f;p.historySteps=4;p.cumulative=2;
+        std::vector<float2> offsets;
+        for(int y=-5;y<=5;++y)for(int x=-5;x<=5;++x)if(x*x+y*y<=25)
+            offsets.push_back({float(std::tan(x*.08726646259971647)),float(std::tan(y*.08726646259971647))});
+        p.dirs=offsets.size();
+        std::vector<unsigned char> bytes(side*side*side*6);
+        std::vector<float> widths(side*side*side,12);
+        for(int z=0;z<side;++z)for(int y=0;y<side;++y)for(int x=0;x<side;++x){
+            const size_t i=(z*side+y)*side+x;
+            bytes[6*i]=(x>16&&y>16)?40:240;
+            bytes[6*i+1]=255;bytes[6*i+2]=128;
+            bytes[6*i+3]=255;bytes[6*i+4]=128;bytes[6*i+5]=128;
+        }
+        std::vector<Seed> seeds(count);
+        for(int i=0;i<count;++i)seeds[i]={{float(8+i%16),float(8+(i/16)%16),12},{1,0,0}};
+        Fields f{upload(bytes),upload(widths),upload(tensorTable()),upload(std::vector<int>{0})};
+        auto ds=upload(seeds);auto da=upload(offsets);auto failures=upload(std::vector<int>{0});
+        State* candidates;Node* nodes;Output* output;
+        check(cudaMalloc(&candidates,count*MAX_CAND*sizeof(State)));
+        check(cudaMalloc(&nodes,count*MAX_NODES*sizeof(Node)));check(cudaMalloc(&output,count*sizeof(Output)));
+        selectionTests<<<4,128>>>(failures);check(cudaGetLastError());
+        for(int repeat=0;repeat<3;++repeat){
+            trace<<<count,128>>>(f,p,ds,da,candidates,nodes,output,count,true,false,false);
+            check(cudaGetLastError());check(cudaDeviceSynchronize());
+            std::vector<Output> result(count);check(cudaMemcpy(result.data(),output,count*sizeof(Output),cudaMemcpyDeviceToHost));
+            for(const auto& r:result)if(r.count<1||r.count>p.steps+1||r.reason==5)
+                throw std::runtime_error("invalid device regression trace");
+        }
+        int bad=0,field=0;check(cudaMemcpy(&bad,failures,sizeof(int),cudaMemcpyDeviceToHost));
+        check(cudaMemcpy(&field,f.error,sizeof(int),cudaMemcpyDeviceToHost));
+        cudaFree(candidates);cudaFree(nodes);cudaFree(output);cudaFree(ds);cudaFree(da);cudaFree(failures);
+        cudaFree(const_cast<unsigned char*>(f.bytes));cudaFree(const_cast<float*>(f.widths));
+        cudaFree(const_cast<float*>(f.tensors));cudaFree(f.error);
+        if(bad||field)throw std::runtime_error("device regression failed");
+        std::cout<<"CUDA selector and 1536 two-stage trace regressions passed"<<std::endl;return 0;
+    }
     if(argc!=3&&argc!=8)throw std::runtime_error("usage: benchmark_chunk_gpu FIXTURE OUTPUT [PARALLEL BOUNDED THREADS AUDIT REPEATS]");
     bool parallel=argc==8&&std::stoi(argv[3]),bounded=argc==8&&std::stoi(argv[4]),audit=argc==8&&std::stoi(argv[6]);
     int threads=argc==8?std::stoi(argv[5]):128,repeats=argc==8?std::stoi(argv[7]):3;
