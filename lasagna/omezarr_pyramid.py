@@ -15,6 +15,7 @@ import numcodecs
 from threadpoolctl import threadpool_limits
 import zarr
 
+from vesuvius.neural_tracing.normals import decode_normals as _decode_normals
 
 _NATIVE_THREAD_ENV = (
 	"OPENBLAS_NUM_THREADS",
@@ -218,13 +219,6 @@ def _mean_pool2x_f32(slab: np.ndarray) -> np.ndarray:
 				acc[:sz, :sy, :sx] += part.astype(np.float32, copy=False)
 				cnt[:sz, :sy, :sx] += 1.0
 	return acc / np.maximum(cnt, 1.0)
-
-
-def _decode_normals(nx_u8: np.ndarray, ny_u8: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-	nx = (nx_u8.astype(np.float32, copy=False) - 128.0) / 127.0
-	ny = (ny_u8.astype(np.float32, copy=False) - 128.0) / 127.0
-	nz = np.sqrt(np.maximum(0.0, 1.0 - nx * nx - ny * ny)).astype(np.float32, copy=False)
-	return nx, ny, nz
 
 
 def _moment_pool2x_normals(nx_u8: np.ndarray, ny_u8: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
