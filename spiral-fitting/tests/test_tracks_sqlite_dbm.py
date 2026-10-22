@@ -1,5 +1,4 @@
 import dbm
-import importlib.util
 import os
 import pickle
 import sqlite3
@@ -79,14 +78,29 @@ class SQLiteTrackDBMTests(unittest.TestCase):
             finally:
                 os.chmod(temporary, 0o700)
 
-    @unittest.skipUnless(importlib.util.find_spec('dbm.sqlite3'), 'needs dbm.sqlite3 (Python >= 3.13)')
-    def test_native_dbm_path_is_unchanged(self):
+    def test_recognized_sqlite_store_uses_the_read_only_reader(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = self.make_db(temporary)
-            self.assertEqual(dbm.whichdb(str(path)), 'dbm.sqlite3')
-            with tracks.open_tracks_dbm(path) as database:
-                self.assertNotIsInstance(database, tracks._SQLiteTrackDBM)
-                self.assertEqual(sorted(database.keys()), [b'h:0', b'vy:0'])
+            with (mock.patch.object(tracks.dbm, 'whichdb', return_value='dbm.sqlite3'),
+                  mock.patch.object(tracks.dbm, 'open', side_effect=AssertionError('native SQLite reader used'))):
+                with tracks.open_tracks_dbm(path) as database:
+                    self.assertIsInstance(database, tracks._SQLiteTrackDBM)
+                    self.assertEqual(sorted(database.keys()), [b'h:0', b'vy:0'])
+
+    def test_committed_wal_pages_are_read(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = self.make_db(temporary)
+            writer = sqlite3.connect(path)
+            try:
+                writer.execute('PRAGMA wal_autocheckpoint = 0')
+                writer.execute('INSERT INTO Dict VALUES (?, ?)', (b'new', b'committed in WAL'))
+                writer.commit()
+                self.assertTrue(Path(str(path) + '-wal').exists())
+                with tracks.open_tracks_dbm(path) as database:
+                    self.assertEqual(database[b'new'], b'committed in WAL')
+                    self.assertEqual(len(database), 3)
+            finally:
+                writer.close()
 
 
 if __name__ == '__main__':
