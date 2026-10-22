@@ -1728,8 +1728,10 @@ def suggested_scroll_spec(
     if conventional is not None and not resolve_logical_dbm(conventional):
         candidates = _dbm_candidates(root)
         if len(candidates) == 1:
+            # Written as the spec file spells paths: forward slashes on every
+            # platform, so a template pasted on Windows still loads elsewhere.
             document["paths"] = {
-                "tracks_dbm": os.path.relpath(candidates[0], root)}
+                "tracks_dbm": Path(os.path.relpath(candidates[0], root)).as_posix()}
     return document
 
 
