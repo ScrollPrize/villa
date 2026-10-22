@@ -12,7 +12,7 @@ from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_experiment import loa
 
 def reference_inputs():
     data = dict(source_id=np.array([10]))
-    gt = dict(node_phase=np.zeros((1, 2)))
+    gt = dict(source_id=np.array([20]), node_phase=np.zeros((1, 2)))
     solution = dict(winding=np.array([2]), component=np.array([0]))
     # First comparison crosses the seam; both fibers also cross on their way
     # to the endpoints. Second comparison has no crossings. Both should be +1.
@@ -137,3 +137,53 @@ def test_reference_rejects_contradictory_or_fractional_labels():
         reference_offsets(dict(fiber_offsets={'1': 2}, excluded_source_ids=[1]))
     with pytest.raises(ValueError, match='integers'):
         reference_offsets(dict(fiber_offsets={'1': .5}))
+
+
+def test_generated_cross_event_document_matches_bare_list():
+    args = list(reference_inputs())
+    expected = large_reference(*args)
+    args[4] = dict(events=args[4], inputs={'provenance': 'example'})
+    assert large_reference(*args) == expected
+
+
+@pytest.mark.parametrize('document', [{}, {'events': {}}, {'events': [1]}, None, 'events'])
+def test_malformed_cross_event_documents_fail_clearly(document):
+    args = list(reference_inputs())
+    args[4] = document
+    with pytest.raises(ValueError, match='Cross events'):
+        large_reference(*args)
+
+
+@pytest.mark.parametrize('piece', [-1, 1, 0.5, True, None])
+def test_invalid_gt_piece_indices_rejected(piece):
+    args = list(reference_inputs())
+    args[4][0]['gt_piece'] = piece
+    with pytest.raises(ValueError, match='GT piece index'):
+        large_reference(*args)
+
+
+def test_gt_piece_source_mismatch_rejected_even_without_reference_coverage():
+    args = list(reference_inputs())
+    args[5]['source_id'][0] = 999
+    for reference in (args[3], dict(fiber_offsets={})):
+        args[3] = reference
+        with pytest.raises(ValueError, match='GT piece/source mismatch'):
+            large_reference(*args)
+
+
+def test_relation_scores_ignore_unidentifiable_gauges():
+    from vesuvius.neural_tracing.fiber_trace_3d.fiber_min_flow_evaluation import small_reference
+    d = dict(source_id=np.array([10, 20, 30, 40]), i=np.array([0, 1, 2]),
+             j=np.array([1, 2, 3]), node_phase=np.zeros((4, 1)), parallel=np.array([True]*3))
+    reference = dict(fiber_offsets={'10': 0, '20': 1, '30': 1})
+    transport = dict(fiber_a=np.zeros(3, int), fiber_b=np.zeros(3, int))
+    def score(shift):
+        return small_reference(d, dict(winding=np.array([0, 1, 1+shift, 1+shift]),
+            component=np.array([0, 0, 1, 1])), reference, transport)
+    a = score(0)
+    assert a == score(50)
+    assert a['all']['correct_percent'] == 100
+    assert a['scored_events'] == 1
+    assert a['unidentifiable_events'] == 1
+    assert a['missing_reference_events'] == 1
+    assert a['unscored_events'] == 2

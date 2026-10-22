@@ -59,14 +59,19 @@ excluded IDs must be omitted from `fiber_offsets`. Only IDs present in
 
 - `relations`: whole-fiber tests with known offsets for both endpoints. Compare
   local winding differences to reference relations, including fiber transport.
-  Connector transport cancels between prediction and reference.
+  Connector transport cancels between prediction and reference. Relations between
+  disconnected components are excluded as unidentifiable; their count is reported
+  separately from missing-reference events.
 - `cross_events`: additionally requires `events` (JSON path) and `dataset`
   (the separate GT dataset object or JSON path). Supports whole and split fibers.
 
-Cross events are a list of records with `gt_source`, `test_source`, `gt_piece`
+Cross events accept either a bare list or a generated object containing an
+`events` list. Each record has `gt_source`, `test_source`, `gt_piece`
 (index into GT cache), `gt_arc`, `test_arc` (original polyline arc lengths),
 `signed_distance`, `family_delta`, and boolean `parallel`. Additional event fields
-are preserved in the exported event table. The scorer interprets each distance
+are preserved in the exported event table. Every GT piece index must be a
+nonnegative integer within the GT cache and identify the declared GT source;
+inconsistent event/cache pairs fail before scoring. The scorer interprets each distance
 with the existing integer same/next convention; event distances must already be
 in winding units, with the standard perpendicular calibration. Missing reference
 IDs and ambiguous unsigned targets are excluded and counted in coverage.

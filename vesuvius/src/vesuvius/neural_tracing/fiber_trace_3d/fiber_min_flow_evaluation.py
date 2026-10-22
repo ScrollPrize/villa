@@ -27,6 +27,9 @@ def small_reference(d, solution, reference, transport):
     offsets = reference_offsets(reference)
     use = np.array([int(d['source_id'][a]) in offsets and int(d['source_id'][b]) in offsets
                     for a, b in zip(d['i'], d['j'])], dtype=bool)
+    covered = use.copy()
+    same_component = solution['component'][d['i']] == solution['component'][d['j']]
+    use &= same_component
     # Reference = fiber offset + original UNWRAPPED angle. Convert that to
     # the same seam chart as our endpoint labels; fractional phase is absent.
     anchor = np.floor(d['node_phase'][:, 0]+.25).astype(int)
@@ -35,11 +38,22 @@ def small_reference(d, solution, reference, transport):
     local = solution['winding'][d['j']]-solution['winding'][d['i']]+transport['fiber_b']-transport['fiber_a']
     result = summarize_errors((local-(refb-refa))[use], d['parallel'][use])
     result.update(excluded_reference_source_ids=reference.get('excluded_source_ids', []),
-                  scored_events=int(use.sum()), unscored_events=int((~use).sum()))
+                  scored_events=int(use.sum()), unscored_events=int((~use).sum()),
+                  unidentifiable_events=int(np.sum(covered & ~same_component)),
+                  missing_reference_events=int(np.sum(~covered)))
     return result
 
 
+def cross_events(document):
+    """Accept generated event documents and historical bare lists."""
+    events = document.get('events') if isinstance(document, dict) else document
+    if not isinstance(events, list) or any(not isinstance(e, dict) for e in events):
+        raise ValueError('Cross events must be a list of records or an object containing an events list')
+    return events
+
+
 def large_reference(d, solution, paths, reference, events, gt_data, gt_paths, details=None, pieces=None):
+    events = cross_events(events)
     gd, gp = gt_data, gt_paths
     offsets = reference_offsets(reference)
     picks = {int(s): i for i, s in enumerate(d['source_id'])}
@@ -47,6 +61,13 @@ def large_reference(d, solution, paths, reference, events, gt_data, gt_paths, de
     skipped = 0
     scored = []
     for e in events:
+        piece = e.get('gt_piece')
+        if (isinstance(piece, bool) or not isinstance(piece, (int, np.integer))
+                or not 0 <= piece < len(gd['source_id'])):
+            raise ValueError(f'Invalid GT piece index: {piece!r}')
+        if int(gd['source_id'][piece]) != e['gt_source']:
+            raise ValueError(f'GT piece/source mismatch: row {piece} is '
+                             f"{gd['source_id'][piece]}, event declares {e['gt_source']}")
         if e['gt_source'] not in offsets or e['test_source'] not in picks:
             skipped += 1
             continue
