@@ -1,5 +1,6 @@
 #include "vc/core/util/RemoteCacheSettings.hpp"
 #include "vc/core/util/GlobalCacheRoot.hpp"
+#include "vc/core/render/PersistentZarrCacheBudget.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -130,6 +131,25 @@ fs::path configuredRemoteCachePath(const fs::path& settingsPath)
     return configured.empty() ? fs::path{} : pathFromUtf8(configured);
 }
 
+std::uint64_t configuredGiB(
+    const fs::path& settingsPath, std::string_view key, std::uint64_t fallback)
+{
+    // key is "section/name", as QSettings writes it to the [section] group.
+    const auto separator = key.find('/');
+    const auto configured = configuredIniValue(
+        settingsPath, key.substr(0, separator), key.substr(separator + 1));
+    // Digits only: std::stoull would also accept a sign and wrap "-5".
+    if (configured.empty() ||
+        configured.find_first_not_of("0123456789") != std::string::npos) {
+        return fallback;
+    }
+    try {
+        return std::stoull(configured);
+    } catch (const std::out_of_range&) {
+        return fallback;
+    }
+}
+
 fs::path ensureDirectory(fs::path path)
 {
     if (path.is_relative())
@@ -224,6 +244,22 @@ fs::path remoteCachePath()
         return ensureWritableDirectory(homeDirectory() / ".VC3D" / "remote_cache");
     }();
     return active;
+}
+
+void configureRemoteCacheBudget()
+{
+    constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
+    constexpr std::uint64_t maxGiB = UINT64_MAX / gib;  // keep GiB -> bytes from overflowing
+    const auto settingsPath = settingsFilePath();
+    vc::render::PersistentZarrCacheBudget::Limits limits;
+    if (const auto maximumGiB = configuredGiB(
+            settingsPath, kRemoteCacheMaxGiB, kRemoteCacheMaxGiBDefault);
+        maximumGiB > 0) {
+        limits.maximumBytes = std::min(maximumGiB, maxGiB) * gib;
+    }
+    limits.minimumFreeBytes = std::min(configuredGiB(
+        settingsPath, kRemoteCacheMinFreeGiB, kRemoteCacheMinFreeGiBDefault), maxGiB) * gib;
+    vc::render::PersistentZarrCacheBudget::configure(remoteCachePath(), limits);
 }
 
 bool remoteCacheDelta3dEnabled()
