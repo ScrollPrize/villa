@@ -171,6 +171,7 @@ struct Source {
     double voxelSizeUm = 0;
     Json provenance;
     vc::lasagna::LasagnaDatasetManifest predictionManifest;
+    std::unique_ptr<FiberChunkTraceCache> chunkCache;
     std::shared_ptr<Volume> renderVolume;
     std::string renderCt;
     FiberReplayStripTextureSource renderSource;
@@ -522,8 +523,9 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
         throw std::invalid_argument("reference selection changed since inference prefetch planning");
     const auto trace = traceOptions(config.value("trace_args", Json::array()));
     const auto backend = config.value("backend", std::string("beam"));
-    if (backend != "beam")
-        throw std::invalid_argument("This entrypoint supports direct beam replay");
+    if (backend != "beam" && backend != "chunk-beam")
+        throw std::invalid_argument("backend must be beam or chunk-beam");
+    const auto chunkSettings=fiberChunkConfigFromJson(config.value("chunk_trace",Json::object()));
     const bool live = config.contains("live_endpoint");
     const bool profileTracing = config.value("profile_tracing", false);
     const bool resumeVisualization = config.value("resume_visualization", false);
@@ -656,6 +658,16 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 source.renderSource = validateFiberReplayStripCtVolume(*source.renderVolume, source.renderCt);
             }
         }
+        if(backend=="chunk-beam") {
+            if(!entry.contains("chunk_cache")||!entry.contains("prediction_identity"))
+                throw std::invalid_argument("chunk-beam requires per-source chunk_cache and prediction_identity");
+            source.chunkCache=std::make_unique<FiberChunkTraceCache>(chunkSettings,
+                localPath(configPath.parent_path(),entry.at("chunk_cache").get<std::string>()),
+                entry.at("prediction_identity").get<std::string>());
+            source.provenance["chunk_trace"]=fiberChunkConfigJson(chunkSettings);
+            source.provenance["prediction_identity"]=entry.at("prediction_identity");
+        }
+        source.provenance["backend"]=backend;
         source.provenance["trace_to_base"] = source.traceScale;
         source.provenance["effective_trace"] = cli::traceConfigJson(trace);
         auto selection = references.at("sources").at(sources.size()).at("fibers");
@@ -784,8 +796,11 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
             trial.full, trial.arc, trial.lo, trial.hi});
     }
     const bool trialSearch = config.value("failure_search_trials_only", false);
-    const size_t workers = std::min(cases.size(), requestedWorkers ? size_t(requestedWorkers) : size_t(std::max(1u, std::thread::hardware_concurrency())));
-    const bool queuedCases = live || trialSearch;
+    const size_t workerBudget=requestedWorkers ? size_t(requestedWorkers) : size_t(std::max(1u, std::thread::hardware_concurrency()));
+    // A single chunk supplies many seed jobs; do not cap their shared queue by
+    // the number of reference cases. Direct-beam scheduling remains unchanged.
+    const size_t workers=backend=="chunk-beam"?workerBudget:std::min(cases.size(),workerBudget);
+    const bool queuedCases = live || trialSearch || backend=="chunk-beam";
     if (live && !queuedCases && cases.size() > config.value("max_live_cases", size_t{256}))
         throw std::invalid_argument("live case count exceeds explicit stack-preserving thread budget");
     std::unique_ptr<FiberLiveBridge> bridge;
@@ -956,6 +971,20 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                 FiberChunkReplayConfig replayConfig{threshold, excursionGrace, tangentialFactor, refine};
                 const auto replay = [&]() -> FiberReplayTraceResult {
                     if (resumeVisualization) return *savedReplays.at(index);
+                    if(backend=="chunk-beam") {
+                        const auto& predictions=livePredictions?*livePredictions:*source.predictions;
+                        const auto& tracingNormals=source.tracingNormals?*source.tracingNormals:*source.normals;
+                        auto policy=fiberChunkReplayConsistency(predictions,tracingNormals,effectiveTrace,replayConfig,
+                            effectiveTrace.replayReverseIntervalBase);
+                        const auto geometry=makePolylineArcGeometry(item.points);
+                        return traceFiberChunkReferenceReplay(*source.chunkCache,predictions,effectiveTrace,
+                            source.traceScale,tracingNormals,geometry,0,geometry.length(),*referenceNormals,
+                            source.traceScale,replayConfig,FiberCaseQueue::parallelFor,
+                            [](const auto& ready){FiberCaseQueue::await(ready);},
+                            [&](const FiberTraceProgress& p){
+                                if(p.referenceArcFraction)remaining.store(item.length*(1-std::clamp(*p.referenceArcFraction,0.,1.)));
+                            },{},policy);
+                    }
                     return replayFiberTrainingCase(livePredictions ? *livePredictions : *source.predictions,
                     effectiveTrace, source.traceScale,
                     source.tracingNormals ? *source.tracingNormals : *source.normals,
@@ -971,7 +1000,7 @@ int runFiberTraceEvaluationCli(int argc, char** argv)
                             std::lock_guard lock(progressMutex);
                             std::cout << "trace-profile " << profile.dump() << std::endl;
                         }
-                    });
+                    }, config.value("prediction_based_seeding", false));
                 }();
                 auto provenance = source.provenance;
                 provenance["source_id"] = source.id;

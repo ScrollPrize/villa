@@ -115,6 +115,12 @@ std::optional<PolylineArcSample> findFiberReplayRestartSeed(
                 dir /= cv::norm(dir);
                 const double dot = dir.dot(tangent);
                 if (std::abs(dot) < minDot) continue;
+                if (trace.widthRelativeTolerance > 0) {
+                    std::vector<float> widths;
+                    predictions.sampleWidths({cv::Vec3f(point / grid)}, widths);
+                    if (widths.size() != 1 || !std::isfinite(widths.front()) || widths.front() <= 0)
+                        continue;
+                }
                 bool peak = true, strict = false;
                 for (int a = -1; a <= 1; ++a) for (int b = -1; b <= 1; ++b) {
                     if (!a && !b) continue;
@@ -139,7 +145,8 @@ static FiberReplayTraceResult replayBeamCase(
     const vc::lasagna::NormalSampler& tracingNormals,
     const vc::lasagna::NormalSampler& evaluationNormals, double normalScale,
     const FiberEvaluationCase& c, const FiberChunkReplayConfig& config,
-    double reverseInterval, const FiberTraceProgressCallback& progress, bool trainingProtocol)
+    double reverseInterval, const FiberTraceProgressCallback& progress, bool trainingProtocol,
+    bool predictionBasedSeeding = false)
 {
     const FiberTraceCoordinateAdapter coordinates(scale);
     validateFiberTraceConfig(trace);
@@ -147,6 +154,7 @@ static FiberReplayTraceResult replayBeamCase(
     const double end = c.endArcBase.value_or(reference.length());
     const double interval = !trainingProtocol || reverseInterval > 0 ? reverseInterval : trace.replayReverseIntervalBase;
     auto policy = fiberChunkReplayConsistency(predictions, tracingNormals, trace, config, interval);
+    policy.seedAllStarts = predictionBasedSeeding;
     policy.toStart = trainingProtocol && trace.replayReverseToStart;
     policy.allEndpoints = trainingProtocol && trace.replayReverseAllEndpoints;
     policy.nextSeed = [&](double arc) -> std::optional<PolylineArcSample> {
@@ -169,7 +177,7 @@ static FiberReplayTraceResult replayBeamCase(
             return presence >= trace.replayPresenceCutoff;
         };
     }
-    if (trainingProtocol && (interval > 0 || policy.acceptPoint)) {
+    if (trainingProtocol && (predictionBasedSeeding || interval > 0 || policy.acceptPoint)) {
         policy.nextSeed = [&](double arc) {
             return findFiberReplayRestartSeed(predictions, trace, scale, evaluationNormals,
                 normalScale, reference, arc, end, trace.stepVoxels * scale);
@@ -193,7 +201,9 @@ static FiberReplayTraceResult replayBeamCase(
         request.initialDirection = seed.tangent;
         request.budgetSpanVoxels = remaining / scale;
         request.config = trace;
-        if (trainingProtocol) request.config.replayPresenceCutoff = 0;
+        // Candidate feasibility must use the same cutoff as committed-step
+        // acceptance. Clearing it here lets an infeasible speculative branch
+        // displace a feasible one before the observer can reject that step.
         request.config.traceToBaseScale = scale;
         widthMean = trace.widthReferenceMean;
         return traceFiberReplaySegment(predictions, request, maximumSteps, tracingNormals, report,
@@ -223,10 +233,10 @@ FiberReplayTraceResult replayFiberTrainingCase(
     const vc::lasagna::NormalSampler& tracingNormals,
     const vc::lasagna::NormalSampler& evaluationNormals, double normalScale,
     const FiberEvaluationCase& c, const FiberChunkReplayConfig& config,
-    const FiberTraceProgressCallback& progress)
+    const FiberTraceProgressCallback& progress, bool predictionBasedSeeding)
 {
     return replayBeamCase(predictions, trace, scale, tracingNormals, evaluationNormals,
-        normalScale, c, config, 0, progress, true);
+        normalScale, c, config, 0, progress, true, predictionBasedSeeding);
 }
 
 static std::vector<FiberReplayTraceResult> evaluateCases(

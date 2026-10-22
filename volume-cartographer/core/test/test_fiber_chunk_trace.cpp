@@ -1,6 +1,7 @@
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 #include "vc/fiber_tracer/FiberChunkTrace.hpp"
+#include "vc/fiber_tracer/FiberEvaluation.hpp"
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -287,8 +288,101 @@ TEST_CASE("chunk reference replay shares resets metrics and reverse checks") {
     const auto absent=makePolylineArcGeometry({{0,0,0},{64,0,0}});
     const auto empty=traceFiberChunkReferenceReplay(cache,source,t,1,normals,absent,0,64,normals,1,config);
     CHECK(empty.segments.empty());CHECK(empty.seedSearchSkippedBase==64);
+    // Historical replay first selects a prediction peak, and records a no-path
+    // stop if the stricter cached-path ellipse cannot match it. Default mode
+    // above continues to skip such starts, preserving main's generic behavior.
+    auto historical=c;historical.presencePeakRestarts=true;
+    FiberChunkTraceCache peakCache(historical,tmp.path,"tube-replay");
+    const auto peakResult=traceFiberChunkReferenceReplay(peakCache,source,t,1,normals,
+        absent,0,64,normals,1,config);
+    REQUIRE(!peakResult.failures.empty());
+    CHECK(peakResult.failures.front().reason=="chunk_no_initial_path");
+    CHECK(peakResult.segments.front().tracePointsBase.front()!=cv::Vec3d(0,0,0));
     const auto bent=makePolylineArcGeometry({{0,8,8},{96,8,8},{144,40,8},{240,40,8}});
     const auto reset=traceFiberChunkReferenceReplay(cache,source,t,1,normals,bent,0,bent.length(),normals,1,config);
     CHECK(!reset.failures.empty());CHECK(reset.segments.size()>1);
     CHECK(reset.completedReferenceArcBase==bent.length());
+}
+
+TEST_CASE("prediction based beam replay seeds the first segment at a peak") {
+    Tubes source;Normal normal;auto trace=traceConfig();
+    FiberEvaluationCase input{{{0,7,8},{64,7,8}}};
+    FiberChunkReplayConfig config;config.errorThresholdBase=20;
+    const auto replay=replayFiberTrainingCase(source,trace,1,normal,normal,1,input,config,{},true);
+    REQUIRE(!replay.segments.empty());
+    CHECK(replay.segments.front().tracePointsBase.front()==cv::Vec3d(0,8,8));
+    const auto reference=makePolylineArcGeometry(input.referenceBase);
+    trace.widthRelativeTolerance=.4;
+    // This source has valid presence/directions but invalid widths. A width-
+    // modulated trace must never select such a peak as its starting point.
+    CHECK_FALSE(findFiberReplayRestartSeed(source,trace,1,normal,1,reference,0,64,16));
+}
+
+TEST_CASE("Recovered conflict filter rejects branching partners, not duplicates") {
+    Normal normal;FiberChunkTraceConfig cfg;
+    cfg.conflictNormalBase=10;cfg.conflictTangentBase=20;
+    cfg.conflictAgreementBase=64;cfg.conflictSeparationBase=32;
+    FiberChunkPaths paths;paths.key={1,2,3};
+    for(int line=0;line<3;++line) {
+        std::vector<cv::Vec3d> points;
+        for(int x=0;x<=320;x+=8)points.emplace_back(x,line==0?0.:line==1?std::max(0,x-128)*.5:100.,0);
+        paths.lines.push_back(points);paths.endReasons.push_back({"chunk_boundary","chunk_boundary"});
+    }
+    const auto original=paths;
+    auto report=filterFiberChunkConflicts(paths,cfg,normal,1);
+    CHECK(report["rejected"]==nlohmann::json::array({0,1}));
+    CHECK(paths.lines[0].empty());CHECK(paths.lines[1].empty());
+    CHECK(paths.lines[2]==original.lines[2]);
+    CHECK(paths.endReasons==original.endReasons);
+    auto duplicate=original;duplicate.lines[1]=duplicate.lines[0];
+    report=filterFiberChunkConflicts(duplicate,cfg,normal,1);
+    CHECK(report["rejected"].empty());
+    auto reversed=original;std::reverse(reversed.lines[1].begin(),reversed.lines[1].end());
+    report=filterFiberChunkConflicts(reversed,cfg,normal,1);
+    CHECK(report["rejected"]==nlohmann::json::array({0,1}));
+    cfg.conflictNormalBase=std::numeric_limits<double>::infinity();
+    CHECK_THROWS(filterFiberChunkConflicts(duplicate,cfg,normal,1));
+}
+
+TEST_CASE("Recovered config round trips and cache-only never constructs") {
+    const auto config=chunkConfig();const auto trace=traceConfig();Normal normals;Tubes source;Temp dir;
+    auto json=fiberChunkConfigJson(config);
+    CHECK(fiberChunkConfigJson(fiberChunkConfigFromJson(json))==json);
+    json["unrecognized_option"]=1;CHECK_THROWS(fiberChunkConfigFromJson(json));
+    auto readonly=config;readonly.cacheOnly=true;
+    FiberChunkTraceCache cache(readonly,dir.path,"synthetic");
+    CHECK_THROWS(cache.get({0,0,0},source,trace,normals,1));
+    CHECK(source.calls==0);
+    CHECK_FALSE(std::filesystem::exists(dir.path));
+    CHECK(fiberChunkCacheSpecification(readonly,trace,1,"synthetic")==fiberChunkCacheSpecification(config,trace,1,"synthetic"));
+    auto filter=config;filter.conflictNormalBase=10;filter.conflictTangentBase=20;
+    CHECK(fiberChunkCacheSpecification(filter,trace,1,"synthetic")==fiberChunkCacheSpecification(config,trace,1,"synthetic"));
+    auto refined=config;refined.refineSeed=true;refined.seedMovementBase=8;
+    CHECK(fiberChunkCacheSpecification(refined,trace,1,"synthetic")!=fiberChunkCacheSpecification(config,trace,1,"synthetic"));
+}
+
+TEST_CASE("Recovered angular initial match penalizes a bending candidate") {
+    FiberChunkPaths paths;
+    paths.lines={{{0,0,0},{32,0,0},{64,0,0},{96,12,0},{128,24,0}},
+                 {{0,2,0},{32,2,0},{64,2,0},{96,2,0},{128,2,0}}};
+    FiberChunkInitialRegion region;region.center={64,0,0};region.metric=cv::Matx33d::eye()*(1./400);
+    FiberChunkTraceConfig cfg;cfg.initialAlignmentPower=2;
+    auto match=matchFiberChunkPaths(paths,{{64,0,0}},{1,0,0},cfg,true,&region);
+    CHECK(match.valid);CHECK(match.line==1);CHECK(match.initialSamples==5);
+}
+TEST_CASE("Original main cache defaults load without rewriting or reconstructing") {
+    auto c=chunkConfig();const auto t=traceConfig();Normal normals;Tubes source;Temp dir;
+    FiberChunkTraceCache writer(c,dir.path,"original-main");
+    const auto built=writer.get({0,0,0},source,t,normals,1);
+    const auto path=dir.path/"0_0_0.json";
+    nlohmann::json saved;std::ifstream(path)>>saved;
+    for(const auto* key:{"refine_seed","seed_movement","backend","online_refinement"})
+        saved["specification"]["chunk"].erase(key);
+    const auto bytes=saved.dump();std::ofstream(path)<<bytes;
+    c.cacheOnly=true;FiberChunkTraceCache reader(c,dir.path,"original-main");
+    const auto calls=source.calls.load();
+    CHECK(reader.get({0,0,0},source,t,normals,1)->lines==built->lines);
+    CHECK(source.calls==calls);
+    std::ifstream in(path);std::string after((std::istreambuf_iterator<char>(in)),{});
+    CHECK(after==bytes);
 }
