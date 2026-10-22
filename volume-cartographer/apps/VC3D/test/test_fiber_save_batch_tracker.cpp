@@ -8,7 +8,6 @@
 #include <QTemporaryDir>
 
 #include "FiberSaveBatchTracker.hpp"
-#include "LineAnnotationFiberSaveJob.hpp"
 
 class TestFiberSaveBatchTracker : public QObject {
     Q_OBJECT
@@ -70,48 +69,7 @@ private slots:
         QCOMPARE(error, QStringLiteral("validation failed\nwrite failed"));
     }
 
-    void waitersCompleteAfterAsynchronousDiskWrite()
-    {
-        QTemporaryDir dir;
-        QVERIFY(dir.isValid());
-        const auto path = std::filesystem::path(dir.path().toStdString()) / "fiber.json";
 
-        int calls = 0;
-        auto makeWaiter = [&]() {
-            auto waiter = std::make_shared<FiberSaveBatchTracker>(
-                [&](bool success, const QString& error) {
-                    QVERIFY(success);
-                    QVERIFY(error.isEmpty());
-                    QVERIFY(std::filesystem::exists(path));
-                    ++calls;
-                });
-            waiter->addJob();
-            waiter->finishScheduling();
-            return waiter;
-        };
-        std::vector<std::shared_ptr<FiberSaveBatchTracker>> waiters{
-            makeWaiter(), makeWaiter()};
-
-        vc3d::line_annotation::FiberSavePayload payload;
-        payload.fiberId = 7;
-        payload.generation = 3;
-        payload.path = path;
-        payload.json = {{"type", "vc3d_fiber"}, {"generation", 3}};
-        auto worker = std::async(
-            std::launch::async,
-            [payload = std::move(payload)]() mutable {
-                return vc3d::line_annotation::runFiberSaveJob(
-                    42, {std::move(payload)});
-            });
-
-        QCOMPARE(calls, 0);
-        const auto result = worker.get();
-        QVERIFY(result.ok);
-        for (const auto& waiter : waiters) {
-            waiter->finishJob();
-        }
-        QCOMPARE(calls, 2);
-    }
 };
 
 QTEST_APPLESS_MAIN(TestFiberSaveBatchTracker)

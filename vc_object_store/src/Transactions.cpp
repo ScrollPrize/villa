@@ -4,7 +4,8 @@
 
 namespace vc::objects {
 using namespace detail;
-Txn::Txn(Txn&& other) noexcept : db_(other.db_), handle_(other.handle_), write_(other.write_)
+Txn::Txn(Txn&& other) noexcept : db_(other.db_), handle_(other.handle_), write_(other.write_),
+    expectedRevisions_(std::move(other.expectedRevisions_)), committedRevisions_(std::move(other.committedRevisions_))
 {
     other.handle_ = nullptr;
 }
@@ -39,11 +40,17 @@ void Txn::release(bool commit)
         if (commit && write_) {
             refreshSourceIdentityIndex(conn);
             publishHistory(conn);
+            for (const auto& [uuid, expected] : expectedRevisions_) {
+                Statement head(conn, "SELECT revision_uuid FROM object_heads WHERE object_uuid=?",
+                               formatUuid(parseUuid(uuid)));
+                committedRevisions_[uuid] = head.row() ? std::optional(head.text(0)) : std::nullopt;
+            }
         }
         exec(conn, commit ? "COMMIT;" : "ROLLBACK;");
     }
     catch (...) {
         sqlite3_exec(conn, "ROLLBACK;", nullptr, nullptr, nullptr);
+        committedRevisions_.clear();
         releaseConnection(); throw;
     }
     releaseConnection();
@@ -97,6 +104,7 @@ WriteTxn ObjectStore::write(const RevisionSelection& expected)
 {
     auto txn = write();
     expectHistory(static_cast<sqlite3*>(connection(txn)), expected);
+    txn.expectedRevisions_ = expected;
     return txn;
 }
 

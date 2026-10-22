@@ -1710,7 +1710,7 @@ void LineAnnotationDialog::setGeneratedSideStripIntersectionProgress(const QStri
         tr("strip intersections: %1%").arg(value));
 }
 
-void LineAnnotationDialog::setGeneratedSideStripIntersectionResult(size_t markerCount)
+void LineAnnotationDialog::setGeneratedSideStripIntersectionResult(size_t markerCount, size_t unboundFibers)
 {
     if (_closing || !_sideStripIntersectionProgress) {
         return;
@@ -1719,7 +1719,7 @@ void LineAnnotationDialog::setGeneratedSideStripIntersectionResult(size_t marker
     _sideStripIntersectionProgress->setRange(0, 100);
     _sideStripIntersectionProgress->setValue(100);
     _sideStripIntersectionProgress->setFormat(
-        tr("strip intersections: %1").arg(markerCount));
+        unboundFibers ? tr("strip intersections: %1 (incomplete: %2 unbound fibers)").arg(markerCount).arg(unboundFibers) : tr("strip intersections: %1").arg(markerCount));
 }
 
 void LineAnnotationDialog::setGeneratedSideStripIntersectionError()

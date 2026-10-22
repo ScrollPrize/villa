@@ -140,6 +140,7 @@ struct FiberTraceSegmentMetadata {
     std::string detail);
 
 struct LineControlPoint : vc::lasagna::LineControlPoint {
+    int64_t storeId = -1;
     std::optional<cv::Vec3d> direction;
     std::optional<cv::Vec3d> displayNormal;
     std::string displayNormalSource = "unknown";
@@ -236,6 +237,7 @@ struct PreparedControlPointEdit {
     double linePosition);
 
 struct StoredControlPoint : cv::Vec3d {
+    int64_t storeId = -1;
     std::optional<cv::Vec3d> direction;
     std::optional<cv::Vec3d> displayNormal;
     std::string displayNormalSource = "unknown";

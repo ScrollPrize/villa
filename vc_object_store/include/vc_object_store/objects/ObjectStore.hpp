@@ -263,6 +263,9 @@ public:
     ~Txn();
     void commit();
     bool active() const { return handle_ != nullptr; }
+    // Exact heads captured inside a successful checked commit, before releasing
+    // the writer. A later external commit cannot change this receipt.
+    const RevisionSelection& committedRevisions() const { return committedRevisions_; }
 
 protected:
     Txn(ObjectStore* db, void* handle, bool write) : db_(db), handle_(handle), write_(write) {}
@@ -274,6 +277,7 @@ private:
     ObjectStore* db_ = nullptr;
     void* handle_ = nullptr;  // sqlite3*
     bool write_ = false;
+    RevisionSelection expectedRevisions_, committedRevisions_;
 };
 
 class ReadTxn : public Txn {
@@ -422,6 +426,11 @@ public:
     PackedGeometryArray readGeometryArrays(const Txn&, const std::vector<std::string>& revisionUuids,
         const std::string& arrayName) const;
 
+    // Owned pinned payload with an explicit aggregate byte bound. Reads are
+    // chunked; callers needing larger objects should use ranges/rectangles.
+    GeometryData readGeometryData(const Txn&, const std::string& revisionUuid,
+        uint64_t byteBudget = 64 * 1024 * 1024) const;
+
     // Add/replace/remove channels with checked revisions and relationship decisions.
     // Never resize points or read/rehash unchanged arrays. "points" is reserved.
     std::string updateSurfaceChannels(WriteTxn&, const std::string& objectUuid,
@@ -472,6 +481,7 @@ public:
     void removeMeta(WriteTxn& txn, const std::string& recordUuid, const std::string& key);
 
     std::vector<JournalEntry> journalSince(const Txn& txn, int64_t afterSeq) const;
+    int64_t journalPosition(const Txn& txn) const;
 
     EdgeGeometryState edgeGeometryState(const Txn& txn, const std::string& edgeUuid) const;
     // Atomically repair anchors/bindings, checking edge generation and endpoint heads.

@@ -1,3 +1,4 @@
+#include "vc_object_store/objects/FiberJson.hpp"
 #include "formats/GeometryOutput.hpp"
 #include "formats/TrackInput.hpp"
 #include "vc_object_store/Tiff.hpp"
@@ -42,22 +43,10 @@ Json pointAttributes(Json& attributes, const std::string& key, size_t count)
 }
 void fiber(const Snapshot& s, Json attributes, const fs::path& path)
 {
-    attributes["uuid"] = s.revision.objectUuid;
-    attributes["type"] = "vc3d_fiber";
-    for (const auto* name : {"control_points", "line_points"}) {
-        const auto values = s.values<double>(name);
-        const auto extras = pointAttributes(attributes, std::string(name) + "_attributes", values.size() / 3);
-        auto points = Json::array();
-        for (size_t i = 0; i < values.size() / 3; ++i) {
-            Json xyz = {values[3*i], values[3*i+1], values[3*i+2]};
-            if ((!extras.is_null() && extras[i].is_object()) ||
-                (std::string_view(name) == "control_points" && attributes.value("version", 1) >= 3)) {
-                auto entry = !extras.is_null() && extras[i].is_object() ? extras[i] : Json::object(); entry["position"] = std::move(xyz); points.push_back(std::move(entry));
-            } else points.push_back(std::move(xyz));
-        }
-        attributes[name] = std::move(points);
-    }
-    writeJson(path, attributes);
+    GeometryData data; data.kind = "fiber";
+    for (const auto& array : s.revision.arrays)
+        data.arrays.push_back({array.name, array.dtype, array.shape, s.arrays.at(array.name)});
+    writeJson(path, Json::parse(encodeFiberJson(s.revision.objectUuid, data, attributes.dump())));
 }
 void collection(const Snapshot& s, Json attributes, const fs::path& path)
 {

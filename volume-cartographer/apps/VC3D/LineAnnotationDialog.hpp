@@ -185,7 +185,7 @@ public:
     void setGeneratedSideStripIntersectionProgress(const QString& stage,
                                                    size_t completed,
                                                    size_t total);
-    void setGeneratedSideStripIntersectionResult(size_t markerCount);
+    void setGeneratedSideStripIntersectionResult(size_t markerCount, size_t unboundFibers = 0);
     void setGeneratedSideStripIntersectionError();
     void setGeneratedPredSnapPoints(std::vector<GeneratedOverlay::PredSnapMarker> predSnapPoints);
     void setGeneratedSpanAlignmentMetrics(

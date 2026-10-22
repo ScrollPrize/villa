@@ -48,6 +48,38 @@ current geometry descriptors and spatial queries after edits.
 
 ## Revisions and transactions
 
+C++ applications can share an `ObjectStoreSession` to manage an existing writable
+database's attachment, checked writes, worker cancellation, and journal events.
+Consumers call the existing `ObjectStore` APIs directly inside its callbacks:
+
+```cpp
+vc::objects::ObjectStoreSession session;
+vc::objects::OpenOptions options;
+options.author = "reviewer";
+const auto attachment = session.attach("objects.vcobj", options);
+vc::objects::RevisionSelection observed;
+session.read(attachment, [&](const auto& store, const auto& txn, const auto& cancel) {
+    if (cancel.load()) return;
+    observed[objectUuid] = store.currentObjectRevision(txn, objectUuid)->uuid;
+});
+session.act(attachment, observed, [&](auto& store, auto& txn) {
+    store.setMeta(txn, objectUuid, "review_note", R"("checked")");
+});
+```
+
+Keep all work using a snapshot inside its callback and do not reenter the
+session from a callback. Replacement validates the new database first, drains
+accepted writes, and cancels/waits for old readers. Include the attachment
+generation in asynchronous requests and caches: even reattaching the same store
+invalidates old requests. `takeEvents()` polls local and external commits for
+all object kinds; call it from the application's event loop. `finalize()` waits
+for accepted writes; edits are already committed by `act()`.
+
+Fiber consumers use the same `selectObjects`, `fiberRegion`, geometry, and
+relationship APIs. Update any catalog summaries used by the application in the
+same checked transaction as the geometry edit, and explicitly decide how affected
+relationships apply. There is no separate fiber repository or collection layer.
+
 Object revisions capture metadata, geometry identity and relationship membership.
 `current_object_revision`, `object_revision`, and `object_history` expose them;
 `current_geometry`, `geometry_revision`, and `geometry_history` expose geometry.
@@ -275,6 +307,9 @@ and each chosen fiber finishes unless a budget/cancellation stops it.
 `maximum_fibers=0` means unlimited and ignores `selected`. Runs merge across
 storage boundaries without duplicate segments. Results own their data and carry
 revision identity from one snapshot; each Python call starts a fresh snapshot.
+`options.uuids` optionally restricts the query before selected-fiber priority and
+limits. `None` is unrestricted; an explicit empty list matches nothing. Filter
+setup participates in cancellation and work/processing budgets.
 
 | Budget | Default | Charged work |
 | --- | ---: | --- |
@@ -300,4 +335,18 @@ neither latency nor allocator memory. There is no continuation/coverage cache.
 
 ## Tests
 
-[Build instructions](../README.md#build) include the pytest command.
+For an existing core build tree configured with `VC_OBJECT_STORE_BUILD_TESTS=ON`:
+
+```sh
+AGENTS_AGENT_MODE=1 ninja -C build-core
+AGENTS_AGENT_MODE=1 ctest --test-dir build-core --output-on-failure
+```
+
+The C++ tests cover shared-session lifecycle, direct fiber API transactions,
+and bounded UUID-filtered spatial reads. To run the Python tests with an existing
+Python-enabled build, use its Python interpreter and point to its module directory:
+
+```sh
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 VC_OBJECT_STORE_BUILD_PYTHON_PATH=build/python \
+  /path/to/python -m pytest tests/python -q
+```

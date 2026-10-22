@@ -2,6 +2,7 @@
 #include "internal/Database.hpp"
 #include "internal/Spatial.hpp"
 #include "internal/ReadRequest.hpp"
+#include "internal/RecordSql.hpp"
 #include "geometry/ArrayBytes.hpp"
 #include "vc_object_store/geometry/SegmentClip.hpp"
 #include <exception>
@@ -154,6 +155,26 @@ FiberRegionResult ObjectStore::fiberRegion(const ReadTxn& txn, const FiberSlice&
     };
     try {
         request.poll();
+        std::optional<std::string> includedIds;
+        if (options.uuids) {
+            if (options.uuids->empty()) return result;
+            std::string ids = "[";
+            for (const auto& uuid : *options.uuids) {
+                request.work(&FiberRegionStats::candidateVisits);
+                // Account for the ID vector, JSON representation, and SQL input.
+                request.bytes(64, &FiberRegionStats::metadataBytes);
+                if (const auto id = objectIdByUuid(db, parseUuid(uuid))) {
+                    const auto value = std::to_string(*id);
+                    if (ids.size() + value.size() + 2 > options.maxUnitBytes)
+                        request.stop(FiberRegionStop::ProcessingBudget);
+                    if (ids.size() > 1) ids += ',';
+                    ids += value;
+                }
+            }
+            if (ids.size() == 1) return result;
+            ids += ']';
+            includedIds = std::move(ids);
+        }
         // Selected is attempted before any global priority-selection work.
         const auto query = [&](bool selectedOnly) {
             std::string sql="SELECT o.uuid,o.id,h.revision_uuid,COALESCE(f.family,'') FROM objects o INDEXED BY objects_kind_uuid "
@@ -163,6 +184,7 @@ FiberRegionResult ObjectStore::fiberRegion(const ReadTxn& txn, const FiberSlice&
                 "LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.kind='fiber' AND b.array_name='' "
                 "AND COALESCE(l.retired,0)=0 AND "+spatialOverlapSql()+
                 " AND COALESCE(f.length,0)>=?7 AND (?8 IS NULL OR COALESCE(f.family,'')=?8)";
+            if(includedIds)sql+=" AND o.id IN (SELECT value FROM json_each(?10))";
             if(selectedOnly)sql+=" AND o.uuid=?9";
             else if(selected)sql+=" AND o.uuid!=?9";
             // Drive the UUID index to stream stable priorities without a sorter.
@@ -174,6 +196,7 @@ FiberRegionResult ObjectStore::fiberRegion(const ReadTxn& txn, const FiberSlice&
             candidates.bind(7,options.minLength);
             if(options.family)candidates.bind(8,*options.family);else candidates.bindNull(8);
             if(selected)candidates.bind(9,parseUuid(*selected));
+            if(includedIds)candidates.bind(10,*includedIds);
             while(candidates.row()) {
                 requestWork(&FiberRegionStats::candidateVisits);
                 process(formatUuid(candidates.blob16(0)),candidates.i64(1),formatUuid(candidates.blob16(2)),candidates.text(3));

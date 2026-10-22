@@ -2,6 +2,7 @@
 
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/types/FiberCollection.hpp"
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <QPointF>
 #include <QPointer>
 #include <atomic>
@@ -23,8 +24,7 @@ class QPushButton;
 class QMainWindow;
 class LineAnnotationController;
 
-// Opening a volume keeps its catalog outside the native annotation machinery.
-// Explicit inspection materializes only the selected fiber as an editable copy.
+// Store-backed catalog and bounded slice overlays sharing the editor session.
 class FiberCollectionController : public ViewerOverlayControllerBase
 {
     Q_OBJECT
@@ -47,6 +47,9 @@ protected:
 private:
     struct View;
     using Slice = vc::fibers::ViewRegion;
+    std::map<int64_t,vc::objects::PinnedObject> pins_;
+    std::map<double,std::vector<std::string>> coordinateGroups_;
+    std::map<int64_t,double> coordinateFactors_;
     CState* state_;
     ViewerManager* manager_;
     LineAnnotationController* annotations_;

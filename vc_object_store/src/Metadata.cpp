@@ -99,6 +99,13 @@ void ObjectStore::removeMeta(WriteTxn& txn, const std::string& recordUuid, const
     mutateMeta(static_cast<sqlite3*>(connection(txn)), impl_->options.author, impl_->hostname, recordUuid, key, std::nullopt);
 }
 
+int64_t ObjectStore::journalPosition(const Txn& txn) const
+{
+    Statement position(static_cast<sqlite3*>(connection(txn)), "SELECT COALESCE(MAX(seq),0) FROM journal");
+    position.row();
+    return position.i64(0);
+}
+
 std::vector<JournalEntry> ObjectStore::journalSince(const Txn& txn, int64_t afterSeq) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));

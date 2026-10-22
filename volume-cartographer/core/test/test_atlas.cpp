@@ -2923,3 +2923,54 @@ TEST_CASE("Atlas mapping reports incomplete fibers with fewer than two line anch
         doctest::Contains("incomplete atlas mapping"),
         std::runtime_error);
 }
+
+#include "vc_object_store/objects/FiberJson.hpp"
+#include "vc_object_store/Uuid.hpp"
+TEST_CASE("Atlas pins read and export historical store fibers without source files")
+{
+    using namespace vc::objects;
+    const auto root=tempRoot("atlas_store_pins");
+    writeValidLasagnaAtlasFixture(root,"source");
+    auto atlas=vc::atlas::Atlas::load(root/"atlases/source");
+    const auto uuid=util::newUuid();
+    auto native=nlohmann::json::parse(readText(root/"fibers/fiber.json"));native["uuid"]=uuid;
+    auto storedNative=native;
+    for(const auto* key:{"control_points","line_points"}) for(auto& entry:storedNative[key]) {
+        auto& xyz=entry.is_object() ? entry["position"] : entry;
+        for(auto& value:xyz)value=value.get<double>()*2.0;
+    }
+    const auto doc=decodeFiberJson(storedNative.dump());
+    const auto dbPath=root/"objects.vcobj";
+    OpenOptions options;options.author="atlas-test";
+    {auto db=ObjectStore::create(dbPath,options);}
+    auto store=std::make_shared<ObjectStoreSession>();const auto attachment=store->attach(dbPath,options);
+    std::string geometry;
+    const auto receipt=store->act(attachment,{{uuid,{}}},[&](auto& db,auto& txn) {
+        auto record=doc.object;record.meta=nlohmann::json{{"source",nlohmann::json::parse(doc.source)}}.dump();
+        db.upsertObject(txn,record);geometry=db.putGeometry(txn,uuid,doc.geometry);
+    });
+    atlas.fibers.front().storePin=PinnedObject{attachment,{attachment.storeUuid,uuid},*receipt.at(uuid),geometry};
+    atlas.fibers.front().fiberPath=fs::path(attachment.storeUuid)/uuid;
+    atlas.fibers.front().storeToAtlasScale=0.5;
+    const auto pinnedDir=root/"atlases/pinned";
+    saveSurface(pinnedDir/"base_mesh/base.tifxyz",makeWrappedPlane(3,3,1.0));
+    atlas.save(pinnedDir);
+    fs::remove(root/"fibers/fiber.json");
+    auto loaded=vc::atlas::Atlas::load(pinnedDir,root,{},store);
+    REQUIRE(loaded.fibers.size()==1);
+    REQUIRE(loaded.fibers.front().storePin.has_value());
+    CHECK(loaded.fibers.front().storePin->objectRevision==*receipt.at(uuid));
+    const auto mappingText=readText(pinnedDir/"mappings/fibers"/(uuid+".json"));
+    CHECK(mappingText.find("fiber_path")==std::string::npos);
+    store->act(attachment,receipt,[&](auto& db,auto& txn) {db.setMeta(txn,uuid,"later","true");});
+    fs::path artifact;
+    {
+        auto outgoing=vc::atlas::loadLasagnaAtlasExport(pinnedDir,root,{},store);
+        REQUIRE(outgoing.objects.size()==1);artifact=outgoing.objects.front().fiberPath;
+        CHECK(nlohmann::json::parse(readText(artifact))["line_points"]==native["line_points"]);
+        CHECK(fs::is_regular_file(artifact));
+    }
+    CHECK_FALSE(fs::exists(artifact));
+    store->detach();
+    CHECK_THROWS(vc::atlas::Atlas::load(pinnedDir,root,{},store));
+}

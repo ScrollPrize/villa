@@ -143,7 +143,7 @@ class CWindow : public QMainWindow
     friend class AgentBridgeServer;
 
 public:
-    void openFiberCollection(const QString& path);
+    void attachObjectStore(const QString& path);
     // Starts an atlas fiber-intersection search without opening a dialog.
     // Progress and completion use the atlasSearch signals below.
     // Distinct name (not an overload): the slot is used as a member-function

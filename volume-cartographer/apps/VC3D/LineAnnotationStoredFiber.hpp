@@ -7,6 +7,7 @@
 // without the controller or Qt Widgets. The controller keeps `using` aliases
 // under its former nested names.
 
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -30,6 +31,7 @@ namespace vc3d::line_annotation {
 // branches must go through the private session paths that call
 // syncLinkedBranchMetadataAfterFiberModification().
 struct FiberBranchRef {
+    std::string edgeUuid;
     int controlPointIndex = -1;
     uint64_t branchFiberId = 0;
     int branchControlPointIndex = -1;
@@ -54,6 +56,7 @@ struct FiberBranchRef {
 };
 
 struct StoredFiber {
+    std::optional<vc::objects::PinnedObject> storePin;
     double width = 0.0;
     double widthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
     uint64_t id = 0;

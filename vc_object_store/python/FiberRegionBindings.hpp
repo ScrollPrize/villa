@@ -18,6 +18,7 @@ inline void bindFiberRegion(nb::module_& m)
         .def_rw("local_bounds", &vo::FiberSlice::localBounds);
     nb::class_<vo::FiberRegionOptions>(m, "FiberRegionOptions")
         .def(nb::init<>())
+        .def_rw("uuids", &vo::FiberRegionOptions::uuids)
         .def_rw("maximum_fibers", &vo::FiberRegionOptions::maximumFibers)
         .def_rw("selected", &vo::FiberRegionOptions::selected)
         .def_rw("family", &vo::FiberRegionOptions::family)

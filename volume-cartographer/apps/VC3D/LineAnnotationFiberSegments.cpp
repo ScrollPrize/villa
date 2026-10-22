@@ -2149,6 +2149,7 @@ std::vector<LineControlPoint> mergeOptimizerControlPoints(std::vector<vc::lasagn
         merged.direction = original[index].direction;
         merged.displayNormalSource = original[index].displayNormalSource;
         merged.identity = original[index].identity;
+        merged.storeId = original[index].storeId;
         result.push_back(std::move(merged));
     }
     return result;
@@ -3176,6 +3177,7 @@ std::vector<StoredControlPoint> reversedStoredControlPoints(
     for (size_t j = 0; j < count; ++j) {
         StoredControlPoint control{
             static_cast<const cv::Vec3d&>(controls[count - 1 - j])};
+        control.storeId = controls[count - 1 - j].storeId;
         control.tags = controls[count - 1 - j].tags;
         control.displayNormal = controls[count - 1 - j].displayNormal;
         control.direction = controls[count - 1 - j].direction;

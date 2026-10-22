@@ -560,3 +560,30 @@ std::string ObjectStore::editGeometryRectangle(WriteTxn& txn, const std::string&
 }
 
 } // namespace vc::objects
+
+namespace vc::objects {
+GeometryData ObjectStore::readGeometryData(const Txn& txn, const std::string& uuid, uint64_t budget) const
+{
+    const auto revision = geometryRevision(txn, uuid);
+    if (!revision) throw std::invalid_argument("geometry revision not found");
+    uint64_t total = 0;
+    for (const auto& array : revision->arrays) {
+        if (array.byteLength < 0 || uint64_t(array.byteLength) > budget - total)
+            throw std::runtime_error("geometry read exceeds byte budget; use bounded ranges");
+        total += uint64_t(array.byteLength);
+    }
+    GeometryData data; data.kind = revision->kind; data.formatVersion = revision->formatVersion;
+    data.coordinateSystem = revision->coordinateSystem; data.attributes = revision->attributes;
+    for (const auto& info : revision->arrays) {
+        GeometryArray array{info.name, info.dtype, info.shape, {}};
+        array.bytes.reserve(size_t(info.byteLength));
+        for (int64_t offset = 0; offset < info.byteLength;) {
+            const auto count = std::min<int64_t>(1024 * 1024, info.byteLength - offset);
+            auto bytes = readGeometryArray(txn, uuid, info.name, offset, count);
+            array.bytes.insert(array.bytes.end(), bytes.begin(), bytes.end()); offset += count;
+        }
+        data.arrays.push_back(std::move(array));
+    }
+    return data;
+}
+}

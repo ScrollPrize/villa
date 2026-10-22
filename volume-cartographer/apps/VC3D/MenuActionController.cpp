@@ -230,12 +230,40 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachVolumeAct);
     _fileMenu->addAction(_attachSegmentsAct);
-    _fileMenu->addAction(QObject::tr("Open Automated Fiber Volume…"), this, [qWindow]() {
-        // macOS hides the native file-type selector when there is only one filter.
-        const auto path = QFileDialog::getOpenFileName(qWindow, QObject::tr("Open Automated Fiber Volume (.afv)"),
-                                                     {}, QObject::tr("Automated Fiber Volume (*.afv);;All files (*)"));
-        if (!path.isEmpty()) qWindow->openFiberCollection(path);
+    _fileMenu->addAction(QObject::tr("Attach Object Store..."), this, [qWindow]() {
+        const auto path = QFileDialog::getOpenFileName(qWindow, QObject::tr("Attach Object Store"),
+            {}, QObject::tr("Object store (*.vcobj);;All files (*)"));
+        if (path.isEmpty()) return;
+        auto author = qEnvironmentVariable("USER");
+        if (author.isEmpty()) author = qEnvironmentVariable("USERNAME");
+        if (author.isEmpty()) {
+            author = QInputDialog::getText(qWindow, QObject::tr("Object Store Author"),
+                QObject::tr("Author for recorded edits:"));
+            if (author.trimmed().isEmpty()) return;
+        }
+        try {
+            qWindow->_state->attachObjectStore(path, author.trimmed());
+        } catch (const std::exception& error) {
+            QMessageBox::critical(qWindow, QObject::tr("Cannot attach object store"),
+                QString::fromUtf8(error.what()));
+        }
     });
+    auto* detachStore = _fileMenu->addAction(QObject::tr("Detach Object Store"), this, [qWindow]() {
+        try { qWindow->_state->detachObjectStore(); }
+        catch (const std::exception& error) {
+            QMessageBox::critical(qWindow, QObject::tr("Cannot detach object store"),
+                QString::fromUtf8(error.what()));
+        }
+    });
+    detachStore->setEnabled(qWindow->_state->objectStoreSession()->attachment().has_value());
+    connect(qWindow->_state, &CState::objectStoreChanged, detachStore,
+        [qWindow, detachStore](const vc::objects::StoreSessionEvent&) {
+            detachStore->setEnabled(qWindow->_state->objectStoreSession()->attachment().has_value());
+        });
+    connect(qWindow->_state, &CState::objectStoreObservationFailed, this,
+        [qWindow](const QString& error) {
+            QMessageBox::warning(qWindow, QObject::tr("Object store observation failed"), error);
+        });
     _fileMenu->addAction(_attachNormalGridAct);
     _fileMenu->addAction(_attachUmbilicusAct);
     _fileMenu->addAction(_detachUmbilicusAct);

@@ -30,8 +30,6 @@ set(srcs
     AxisAlignedSliceController.hpp
     LineAnnotationFiberClassification.hpp
     LineAnnotationFiberDeletion.hpp
-    LineAnnotationFiberSaveJob.cpp
-    LineAnnotationFiberSaveJob.hpp
     FiberNameDisplay.cpp
     FiberNameDisplay.hpp
     FiberMapWorkspace.cpp
@@ -386,6 +384,7 @@ target_link_libraries(VC3D
     # mimalloc first so its symbols win malloc/free resolution.
     $<$<BOOL:${mimalloc_FOUND}>:mimalloc>
     vc_core
+    vc_object_store::vc_objects
     vc_fiber_collection
     vc_atlas
     vc_lasagna
@@ -481,4 +480,8 @@ if(EXISTS "${_vc3d_fiber_format_src}/__init__.py")
         FILES_MATCHING
             PATTERN "*.py"
             PATTERN "__pycache__" EXCLUDE)
+endif()
+
+if(VC_TESTING)
+    set_source_files_properties(LineAnnotationController.cpp VCAppMain.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
 endif()

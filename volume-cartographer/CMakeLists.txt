@@ -775,6 +775,8 @@ if(_san)
     add_link_options(${_san})
 endif()
 
+include(cmake/ObjectStore.cmake)
+
 add_subdirectory(utils)
 add_subdirectory(core)
 add_subdirectory(apps)

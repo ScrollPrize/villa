@@ -2,7 +2,6 @@
 
 #include <set>
 
-#include "FiberRuntimeIds.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
 
 #include <QObject>
@@ -58,6 +57,7 @@ class SurfacePanelController;
 class ViewerManager;
 class VolumePkg;
 class QWidget;
+class QTemporaryDir;
 namespace vc::lasagna { class LasagnaDataset; class LasagnaNormalSampler; }
 namespace vc::fiber_tracer { class FiberPredictionField; }
 
@@ -315,7 +315,6 @@ public:
     struct HeadlessFiberOptimizationRequest {
         std::vector<cv::Vec3d> controlPointsL0;
         ResolvedFiberOptimizationInputs inputs;
-        std::filesystem::path destinationFiberSource;
         std::function<bool()> shouldSave;
     };
     using HeadlessFiberCompletion =
@@ -341,8 +340,7 @@ public:
     // to the package: nothing is written, optimized or edited, and the fiber
     // is forgotten when its view closes. key identifies the source fiber
     // (reopening the same key while its view is open reuses that view).
-    LineAnnotationDialog* openFiberReadOnly(const nlohmann::json& fiber, const std::string& key,
-                                            QString* error = nullptr);
+
     void openFiberAtControlPoint(uint64_t fiberId, int controlPointIndex);
     void openFiberAtLinePointIndex(uint64_t fiberId, int linePointIndex);
     void openFiberSpan(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
@@ -383,6 +381,9 @@ public:
                                               const QPointF& scenePoint,
                                               const QPoint& globalPos);
     [[nodiscard]] std::vector<FiberSummary> fiberSummaries() const;
+    uint64_t fiberIdForUuid(const std::string& uuid) const;
+    std::optional<vc::objects::PinnedObject> fiberPin(uint64_t id) const;
+    std::optional<double> fiberCoordinateScale(uint64_t id, bool prompt = false);
     [[nodiscard]] FiberMapSnapshot fiberMapSnapshot() const;
     // Resolves the package's umbilicus for a status line only; nothing is
     // cached, so call it on user-visible state changes rather than per frame.
@@ -425,7 +426,7 @@ public:
     // Resolve an exact source file, including an independently editable copy.
     [[nodiscard]] uint64_t fiberIdForFilePath(const std::filesystem::path& path) const;
     // First loaded filename match; use the full path when sources may overlap.
-    [[nodiscard]] uint64_t fiberIdForFileName(const std::string& fileName) const;
+
     // The loaded fiber a line annotation dialog is editing, or 0 when the
     // dialog is not one of this controller's panes or its fiber has no
     // stored file yet (a new, unsaved fiber).
@@ -440,8 +441,8 @@ public:
     [[nodiscard]] QString fiberDisplayNameForId(uint64_t fiberId) const;
     [[nodiscard]] std::vector<std::string> knownFiberTags() const;
     [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshots() const;
-    [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshotsFromStorage() const;
-    [[nodiscard]] std::vector<FiberSnapshotWithPath> fiberSnapshotsFromStorageWithPaths() const;
+    [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshotsFromStorage();
+    [[nodiscard]] std::vector<FiberSnapshotWithPath> fiberSnapshotsFromStorageWithPaths();
     [[nodiscard]] std::optional<uint64_t> fiberIdForAtlasPath(
         const std::filesystem::path& atlasFiberPath) const;
 
@@ -489,18 +490,9 @@ public:
     void setSurfacePanel(SurfacePanelController* panel);
     void setCurrentAtlasDirectory(std::optional<std::filesystem::path> atlasDir);
 
-    // On-disk JSON path of a stored fiber (empty when the fiber is unknown or
-    // not yet saved). Used by cross-panel actions such as adding a fiber to a
-    // running Spiral fit.
-    [[nodiscard]] std::filesystem::path fiberFilePath(uint64_t fiberId) const;
+    // Temporary native transport artifact from a pinned committed revision.
+    [[nodiscard]] std::filesystem::path fiberTransportPath(uint64_t fiberId) const;
 
-    bool registerExternalFiberSource(const std::filesystem::path& source,
-                                     QString* errorMessage = nullptr, bool workingCopy = false);
-    void unregisterExternalFiberSource(const std::filesystem::path& source);
-    bool flushFiberSavesForDestinationChange(QString* errorMessage = nullptr);
-    bool redirectFiberSource(const std::filesystem::path& source,
-                             const std::filesystem::path& workingCopy,
-                             QString* errorMessage = nullptr);
     [[nodiscard]] std::optional<ResolvedFiberOptimizationInputs>
         resolveFiberOptimizationInputs(
             const std::string& fallbackNormalLocation,
@@ -593,22 +585,7 @@ private:
         nlohmann::json coordinateIdentity = nlohmann::json::object();
     };
 
-    struct FiberSaveJob {
-        uint64_t sequence = 0;
-        std::vector<FiberSaveSnapshot> snapshots;
-        bool showErrors = true;
-        std::vector<std::shared_ptr<FiberSaveBatchTracker>> batches;
-    };
-
     using BranchLinkValidationIssue = vc3d::line_annotation::BranchLinkValidationIssue;
-
-    struct FiberSaveTaskResult {
-        bool ok = false;
-        std::vector<uint64_t> fiberIds;
-        std::vector<uint64_t> generations;
-        std::vector<std::filesystem::path> recoveryFiles;
-        std::string error;
-    };
 
     struct BranchMetadataSyncResult {
         std::vector<uint64_t> affectedFiberIds;
@@ -623,6 +600,7 @@ private:
     using SideStripCancelCallback = std::function<bool()>;
 
     struct SideStripIntersectionRequest {
+        size_t unboundFibers = 0;
         bool suppressErrorDialogs = false;
         uint64_t token = 0;
         uint64_t cacheKey = 0;
@@ -638,6 +616,7 @@ private:
     };
 
     struct SideStripIntersectionTaskResult {
+        size_t unboundFibers = 0;
         bool ok = false;
         bool suppressErrorDialogs = false;
         uint64_t token = 0;
@@ -1067,22 +1046,18 @@ private:
                                                              int activeStart = -1,
                                                              int activeEnd = -1) const;
     void loadFibersForCurrentPackage();
-    void saveLoadedFiberMetadata(StoredFiber& fiber);
     // Drop fibers that are the same fiber seen through several sources (or
     // identical geometry under another name); records link aliases so branch
     // links written against a dropped copy still resolve to the survivor.
-    void dedupeLoadedFiberSources(std::vector<StoredFiber>& fibers,
-                                  const std::vector<std::filesystem::path>& sourcePreference);
-    [[nodiscard]] std::string loadedFiberLinkKey(const StoredFiber& from,
-                                                 const std::string& branchFileName) const;
+
     // Restore adjacent reciprocals only into files whose array was absent.
     // Run before cross-file validation so an old save cannot remove the
     // whole network as missing its reciprocals. A present array is untouched.
-    void healOneSidedAdjacentLinks(std::vector<StoredFiber>& fibers) const;
+
     // The heal's save must not overwrite a file that changed on disk since it
     // was READ (a concurrent sync download): stale when the write time moved,
     // and, failing closed, when it cannot be read.
-    [[nodiscard]] bool adjacentHealSaveIsStale(const StoredFiber& fiber) const;
+
     // `candidate` (a ref on the linked fiber) is the reciprocal of `branch`
     // (a ref on `fiber`): the same two control points named from the other
     // side, positions and directions agreeing. The one predicate for pairing
@@ -1090,8 +1065,7 @@ private:
     [[nodiscard]] static bool isReciprocalBranchRef(const StoredFiber& fiber,
                                                     const FiberBranchRef& branch,
                                                     const FiberBranchRef& candidate);
-    [[nodiscard]] bool validateLoadedFiberLinks(std::vector<StoredFiber>& fibers,
-                                                std::vector<std::string>& errors) const;
+
     // Fibers merged by the sync tool (scripts/fiber_merge.py) carry a
     // needs_reoptimization tag; on load VC3D offers to re-fit their lines.
     // Declining keeps the tag so the next load asks again.
@@ -1115,11 +1089,7 @@ private:
     void reoptimizeMergedFibers(const std::vector<std::string>& fiberFileNames);
     void emitFiberSummaries();
     void addKnownFiberTags(const std::vector<std::string>& tags);
-    [[nodiscard]] std::filesystem::path fibersRootDir() const;
-    [[nodiscard]] std::filesystem::path fibersDir() const;
     [[nodiscard]] std::filesystem::path primaryFiberSourceRoot() const;
-    [[nodiscard]] bool fiberNameOwnedByLiveFiber(const std::filesystem::path& sourceRoot,
-                                                 const std::string& fileName) const;
     // Base grid the fiber's stored geometry lives in: the shape stored in the
     // fiber itself, else the manifest its trace spans recorded, else the
     // package's selected fiber-inference dataset (see
@@ -1130,7 +1100,6 @@ private:
     [[nodiscard]] std::optional<std::array<std::size_t, 3>>
         fiberManifestBaseShape(const std::string& location) const;
     [[nodiscard]] std::filesystem::path relativeFiberPath(const StoredFiber& fiber) const;
-    [[nodiscard]] std::filesystem::path fiberPath(uint64_t fiberId) const;
     [[nodiscard]] std::filesystem::path fiberPath(const StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path currentVolpkgRoot() const;
     [[nodiscard]] std::vector<std::string> atlasPathKeysForFiber(const StoredFiber& fiber) const;
@@ -1205,7 +1174,7 @@ private:
     [[nodiscard]] StoredFiberSessionSnapshot makeStoredFiberSessionSnapshot(
         LineAnnotationSession& session);
     [[nodiscard]] StoredFiber storedFiberFromSession(LineAnnotationSession& session);
-    void saveSessionAsFiber(LineAnnotationSession& session);
+    void saveSessionAsFiber(LineAnnotationSession& session, bool finalize = true);
     // Debounced autosave after a solve landing: consecutive landings coalesce
     // into one saveSessionAsFiber (with its no-op probe, fiber summary
     // rebuild, and linked-fiber sync) instead of paying it per landing. The
@@ -1218,17 +1187,18 @@ private:
     void flushSessionAutoSave(const std::string& surfaceName);
     void flushAllPendingSessionAutoSaves();
     [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber) const;
-    void saveFiberNow(StoredFiber& fiber) const;
-    void scheduleFiberSave(const StoredFiber& fiber);
-    void scheduleFiberPairSave(const StoredFiber& first, const StoredFiber& second);
-    void scheduleFiberSaveSnapshots(std::vector<FiberSaveSnapshot> snapshots,
+    void saveFiberNow(StoredFiber& fiber);
+    friend int runObjectStoreControllerTests();
+    std::unordered_map<std::string, uint64_t> _fiberIdsByUuid;
+    mutable std::shared_ptr<QTemporaryDir> _fiberTransportDirectory;
+    void commitFiberStoreAction(std::vector<FiberSaveSnapshot>& snapshots,
+                               const std::vector<StoredFiber>& retired = {});
+    void scheduleFiberSave(StoredFiber& fiber);
+    void scheduleFiberPairSave(StoredFiber& first, StoredFiber& second);
+    std::vector<FiberSaveSnapshot> scheduleFiberSaveSnapshots(std::vector<FiberSaveSnapshot> snapshots,
                                     bool showErrors = true);
     void canonicalizeFiberSaveSnapshots(std::vector<FiberSaveSnapshot>& snapshots) const;
     void validateFiberSaveSnapshots(const std::vector<FiberSaveSnapshot>& snapshots) const;
-    void startNextFiberSaveJob();
-    void finishFiberSaveJob(QFutureWatcher<FiberSaveTaskResult>* watcher,
-                            bool showErrors,
-                            std::vector<std::shared_ptr<FiberSaveBatchTracker>> batches);
     void waitForFiberSaves();
     [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber);
     [[nodiscard]] static nlohmann::json fiberSaveSnapshotToJson(
@@ -1262,26 +1232,14 @@ private:
     std::optional<StoredFiber> loadFiberFile(const std::filesystem::path& path,
                                              std::vector<std::string>* branchErrors = nullptr,
                                              std::vector<DroppedLinkEntry>* stripped = nullptr) const;
-    [[nodiscard]] std::vector<BranchLinkValidationIssue> collectLoadedFiberBranchIssues(
-        const std::vector<StoredFiber>& fibers) const;
+
     // Drops the offending entries (and, through the fixed point, their
     // reciprocals) in memory without touching the files; marks the fibers
     // whose record now differs from disk. Returns the number of entries
     // dropped.
-    std::size_t neutralizeLoadedFiberBranchLinks(
-        std::vector<StoredFiber>& fibers,
-        const std::vector<BranchLinkValidationIssue>& issues) const;
+
     // `writtenFiles` receives the source-qualified keys of the records
     // saveFiberNow completed (a stale-skipped or failed write is not in it).
-    [[nodiscard]] bool repairLoadedFiberBranchLinks(
-        std::vector<StoredFiber>& fibers,
-        const std::unordered_set<std::string>& fibersWithRemovedBranchEntries,
-        const std::vector<BranchLinkValidationIssue>& initialIssues,
-        std::vector<std::string>& errors,
-        std::unordered_set<std::string>* writtenFiles = nullptr) const;
-    [[nodiscard]] std::string uniqueImportedFiberFileName(const StoredFiber& fiber,
-                                                          std::unordered_set<std::string>& reserved,
-                                                          uint64_t& nextSequence) const;
     [[nodiscard]] static std::vector<ControlSpanRecord> controlSpansForFiber(
         const StoredFiber& fiber);
     // Generation-keyed cache in front of controlSpansForFiber for GUI-thread
@@ -1323,8 +1281,9 @@ private:
     // Returns the created atlas directory; throws std::exception on failure.
     // Does not emit atlasCreated (callers decide).
     std::filesystem::path createAtlasFromFiberCore(uint64_t fiberId);
-    // Shared per-pane finalize+save loop of saveOpenFibers /
-    // saveOpenFibersHeadless (no waiting).
+    // Shared worker and write barrier for saveOpenFibers /
+    // saveOpenFibersHeadless.
+    void refreshChangedStoreFibers();
     void saveOpenFibersCore();
     void cleanupIntersectionInspectionSurfaces();
     // Tears down the intersection-inspection workspace when one of its
@@ -1365,17 +1324,8 @@ private:
     int _nextPaneId = 1;
     std::vector<PaneRecord> _panes;
     std::vector<StoredFiber> _fibers;
-    mutable vc3d::FiberRuntimeIds _fiberRuntimeIds;
-    std::vector<std::filesystem::path> _externalFiberSources;
-    std::set<std::filesystem::path> _workingCopyFiberSources;
-    std::map<std::filesystem::path, std::filesystem::path> _fiberSourceRedirects;
-    // dropped (sourceRoot/fileName) -> surviving key, rebuilt on every load.
-    std::unordered_map<std::string, std::string> _loadedFiberLinkAliases;
-    // Runtime id -> source-qualified file key as of the last non-empty fiber
-    // list, so a reload can follow an open session's link to a copy the
-    // dedupe dropped through _loadedFiberLinkAliases to its survivor. See
-    // loadFibersForCurrentPackage.
-    std::unordered_map<uint64_t, std::string> _formerFiberKeyById;
+
+    mutable uint64_t _nextFiberRuntimeId = 0;
     std::vector<std::string> _knownFiberTags;
     std::unordered_map<uint64_t, CachedFiberAlignmentMetrics> _fiberAlignmentMetrics;
     std::unordered_set<uint64_t> _pendingFiberAlignmentMetrics;
@@ -1435,18 +1385,8 @@ private:
     uint64_t _fiberDataGeneration = 1;
     // See packageGeneration(); starts at 1 for the same reason.
     uint64_t _packageGeneration = 1;
-    // Counts loads of the fiber list. A load that yields to the event loop
-    // before publishing (the broken-link prompt, the repair-error dialog)
-    // compares its own number against this afterwards and stands down if a
-    // newer load ran meanwhile, instead of publishing an older list over it.
-    // This covers those pre-publication continuations only; the loader is
-    // not otherwise reentrant-safe.
+    // Invalidates structural-edit captures when the store-backed view reloads.
     uint64_t _fiberLoadSequence = 0;
-    std::unordered_set<uint64_t> _pendingCoordinateShapeSaves;
-    std::deque<FiberSaveJob> _pendingFiberSaveJobs;
-    QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
-    uint64_t _nextFiberSaveSequence = 0;
-    bool _fiberSaveRunning = false;
     // Total failed save jobs; callers compare before/after a
     // waitForFiberSaves() flush to gate destructive follow-ups (fiber
     // retirement) on the flushed saves having actually succeeded.
@@ -1477,6 +1417,7 @@ private:
     // slot made two panes' unconditional catch-ups evict each other's entry
     // and re-run their queries in a self-sustaining ping-pong).
     struct SideStripReuseEntry {
+        size_t unboundFibers = 0;
         uint64_t cacheKey = 0;
         std::vector<SideStripMarker> markers;
         QString fingerprint;
@@ -1552,15 +1493,7 @@ private:
     // _fiberSaveFailureCount as of the last load: structural edits refuse to
     // run when a save has failed since (memory may be ahead of disk).
     uint64_t _fiberSaveFailureCountAtLoad = 0;
-    // A structural edit's disk undo left artifacts behind: memory and disk
-    // are known to differ until the next load. Latched until then.
-    bool _structuralEditRecoveryRequired = false;
-    // Loads restarted because a save was scheduled while the broken-link
-    // prompt was open (its snapshot predates the reconciliation). Past the
-    // bound the next load answers the prompt itself with "Keep files
-    // unchanged" (no modal, so nothing can schedule a save during it).
-    int _fiberLoadRestartsForSaves = 0;
-    bool _fiberLoadAutoKeepUnchanged = false;
+
 
     // Everything a merge/split needs from the menu callback, captured by
     // identity and position (never by index or iterator) because phase B
@@ -1610,14 +1543,12 @@ private:
     // Entries the current load dropped from stored records (neutralize or
     // repair): the same entries are removed from open sessions, including
     // their armed rollback copies, so no session writes a one-way link back.
-    static std::vector<DroppedLinkEntry> droppedLinkEntries(
-        const std::vector<StoredFiber>& before, const std::vector<StoredFiber>& after);
+
     // Removes from every open session (its live branches and its armed
     // rollback copies) the entries in `dropped` that the session's own
     // record in `records` no longer holds, matched on every field the
     // descriptor knows.
-    void dropLinkEntriesFromOpenSessions(const std::vector<DroppedLinkEntry>& dropped,
-                                         const std::vector<StoredFiber>& records);
+
     bool structuralEditPreflight(uint64_t packageGeneration, uint64_t loadSequence,
                                  std::string* error);
     [[nodiscard]] bool structuralEditParticipantAllowed(const std::filesystem::path& sourceRoot,
@@ -1630,9 +1561,7 @@ private:
     // lenient parser cannot hide an entry a second time; references resolve
     // the way the loader resolves them (owner source root + basename,
     // through the alias table).
-    [[nodiscard]] std::optional<std::string> structuralEditStaleLinkOnDisk(
-        const std::vector<StoredFiber>& originals,
-        const std::unordered_set<std::string>& writeSetKeys) const;
+
     // Deduplicates the deferred re-optimization prompt across reentrant
     // fiber (re)loads.
     bool _reoptimizationPromptPending = false;

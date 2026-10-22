@@ -13,7 +13,9 @@ add_library(vc_objects STATIC
     internal/EdgeSql.cpp
     internal/RecordJson.cpp
     internal/JsonFields.cpp
+    formats/FiberJson.cpp
     Database.cpp
+    ObjectStoreSession.cpp
     Transactions.cpp
     History.cpp
     Lifecycle.cpp
@@ -48,6 +50,8 @@ else()
 endif()
 target_link_libraries(vc_objects PUBLIC vc_geometry PRIVATE nlohmann_json::nlohmann_json OpenSSL::Crypto zstd::libzstd)
 target_compile_features(vc_objects PUBLIC cxx_std_20)
+add_library(vc_object_store::vc_objects ALIAS vc_objects)
+add_library(vc_object_store::vc_geometry ALIAS vc_geometry)
 
 if(NOT VC_OBJECT_STORE_BUILD_ADAPTERS)
     return()

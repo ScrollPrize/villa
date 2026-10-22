@@ -1339,6 +1339,8 @@ vc::atlas::FiberInput fiberInputFromSnapshot(const std::filesystem::path& fiberP
 {
     vc::atlas::FiberInput input;
     input.fiberPath = fiberPath;
+    input.storePin = fiber.storePin;
+    input.storeToAtlasScale = fiber.storeToQueryScale;
     input.controlPoints = fiber.controlPoints;
     input.linePoints = linePointsFromPolyline(fiber);
     vc::atlas::validateFiberInputControlPoints(input);
@@ -1491,7 +1493,8 @@ AtlasSearchSigningContext prepareAtlasSearchSigningContext(
     const std::optional<std::filesystem::path>& atlasDir,
     const vc::lasagna::LasagnaDataset& dataset,
     vc::lasagna::LasagnaNormalSampler& sampler,
-    const vc::atlas::FiberIntersectionProgressCallback& progressCallback)
+    const vc::atlas::FiberIntersectionProgressCallback& progressCallback,
+    std::shared_ptr<vc::objects::ObjectStoreSession> store)
 {
     AtlasSearchSigningContext context;
     if (seedOrderedResults.empty()) {
@@ -1503,7 +1506,7 @@ AtlasSearchSigningContext prepareAtlasSearchSigningContext(
         if (progressCallback) {
             progressCallback(vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface, 0, total);
         }
-        context.atlas = vc::atlas::Atlas::load(*atlasDir);
+        context.atlas = vc::atlas::Atlas::load(*atlasDir, {}, {}, store);
         if (progressCallback) {
             progressCallback(vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface, 1, total);
         }
@@ -1674,7 +1677,8 @@ AtlasSearchWorkerResult buildSignedAtlasSearchResults(
     const std::filesystem::path& lasagnaManifestPath,
     double workingToBaseScale,
     const vc::atlas::FiberIntersectionProgressCallback& progressCallback,
-    bool debugSearch)
+    bool debugSearch,
+    std::shared_ptr<vc::objects::ObjectStoreSession> store)
 {
     AtlasSearchWorkerResult workerResult;
     workerResult.rawResultCount = rawResults.size();
@@ -1695,7 +1699,7 @@ AtlasSearchWorkerResult buildSignedAtlasSearchResults(
                 lasagnaManifestPath, {workingToBaseScale});
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
         auto context = prepareAtlasSearchSigningContext(
-            rawResults, snapshotsById, atlasDir, dataset, sampler, progressCallback);
+            rawResults, snapshotsById, atlasDir, dataset, sampler, progressCallback, store);
         std::vector<AtlasSearchSignedResult> signedResults = signAtlasSearchResults(
             rawResults, snapshotsById, context, sampler, workerResult.skippedSigningCount);
         std::sort(signedResults.begin(), signedResults.end(), [](const auto& a, const auto& b) {
@@ -2684,6 +2688,11 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     if (_spiralWorkspace)
         _spiralWorkspace->setLineAnnotationController(
             _lineAnnotationController.get());
+    connect(_state, &CState::objectStoreChanged, this, [this](const auto&) {
+        if(_atlasSearchCancelFlag) _atlasSearchCancelFlag->store(true);
+        _fiberIntersectionCache.clear();
+        clearAtlasSearchPreviewState();
+    });
     _lineAnnotationController->setVolumeSelectorFactory(
         [this](QWidget* parent) { return createAnnotationVolumeSelector(parent); });
     connect(_lineAnnotationController.get(), &LineAnnotationController::volumeOverlayToggleRequested,
@@ -2703,7 +2712,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                 _fiberIntersectionCache.pruneFiber(fiberId);
                 scheduleAtlasSearchDockRefresh();
                 if (_spiralWorkspace && _lineAnnotationController) {
-                    const auto path = _lineAnnotationController->fiberFilePath(fiberId);
+                    const auto path = _lineAnnotationController->fiberTransportPath(fiberId);
                     if (!path.empty())
                         _spiralWorkspace->noteTrackedFiberSaved(
                             generation, QString::fromStdString(path.string()));
@@ -5079,12 +5088,13 @@ void CWindow::createAtlasWorkspace()
 
 void CWindow::refreshAtlasOverviewDocks()
 {
+    const auto store = _state->objectStoreSession();
     auto vpkg = _state ? _state->vpkg() : nullptr;
     const std::filesystem::path volpkgRoot = vpkg && !vpkg->path().empty()
         ? vpkg->path().parent_path()
         : std::filesystem::path{};
 
-    auto populate = [this, &volpkgRoot](QDockWidget* dock) {
+    auto populate = [this, &volpkgRoot, store](QDockWidget* dock) {
         if (!dock || !dock->widget()) {
             return;
         }
@@ -5096,7 +5106,7 @@ void CWindow::refreshAtlasOverviewDocks()
         for (const auto& atlasInfo : vc::atlas::discoverAtlasDirectories(volpkgRoot)) {
             const std::filesystem::path& atlasDir = atlasInfo.path;
             try {
-                const auto atlas = vc::atlas::Atlas::load(atlasDir);
+                const auto atlas = vc::atlas::Atlas::load(atlasDir, {}, {}, store);
                 auto* item = new QTreeWidgetItem(tree);
                 item->setText(0, QString::fromStdString(atlas.metadata.name));
                 item->setData(0, Qt::UserRole, QString::fromStdString(atlasDir.string()));
@@ -5148,6 +5158,7 @@ void CWindow::refreshAtlasOverviewDocks()
 
 void CWindow::updateAtlasFiberDocks()
 {
+    const auto store = _state->objectStoreSession();
     if (!_atlasWorkspaceFiberDock || !_atlasWorkspaceFiberDock->widget()) {
         return;
     }
@@ -5200,8 +5211,8 @@ void CWindow::updateAtlasFiberDocks()
                 : vpkg->path().parent_path();
         }
         atlas = volpkgRoot.empty()
-            ? vc::atlas::Atlas::load(*_currentAtlasDir)
-            : vc::atlas::Atlas::load(*_currentAtlasDir, volpkgRoot);
+            ? vc::atlas::Atlas::load(*_currentAtlasDir, {}, {}, store)
+            : vc::atlas::Atlas::load(*_currentAtlasDir, volpkgRoot, {}, store);
     } catch (const std::exception& ex) {
         if (label) {
             label->setText(tr("Atlas: %1 (could not load: %2)")
@@ -5328,6 +5339,7 @@ void CWindow::scheduleAtlasSearchDockRefresh()
 
 void CWindow::updateAtlasSearchDocks()
 {
+    const auto store = _state->objectStoreSession();
     const auto snapshots = _lineAnnotationController
         ? _lineAnnotationController->fiberSnapshotsFromStorage()
         : std::vector<vc::atlas::FiberPolyline>{};
@@ -5335,7 +5347,7 @@ void CWindow::updateAtlasSearchDocks()
     QString atlasLoadError;
     if (_currentAtlasDir) {
         try {
-            const vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_currentAtlasDir);
+            const vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_currentAtlasDir, {}, {}, store);
             savedFiberCount = static_cast<int>(atlas.fibers.size());
         } catch (const std::exception& ex) {
             atlasLoadError = QString::fromStdString(ex.what());
@@ -5400,6 +5412,7 @@ void CWindow::updateAtlasSearchDocks()
 bool CWindow::startAtlasRemapHeadless(QString* errorMessage,
                                       std::function<void(bool success, const QString& detail)> onFinished)
 {
+    const auto store = _state->objectStoreSession();
     auto fail = [errorMessage](const QString& message) {
         if (errorMessage) {
             *errorMessage = message;
@@ -5480,7 +5493,7 @@ bool CWindow::startAtlasRemapHeadless(QString* errorMessage,
     });
 
     watcher->setFuture(QtConcurrent::run(
-        [atlasDir, volpkgRoot, manifestPath, workingToBaseScale]() -> QString {
+        [atlasDir, volpkgRoot, manifestPath, workingToBaseScale, store]() -> QString {
         std::cerr << "[atlas-remap] start"
                   << " atlas=" << atlasDir.string()
                   << " volpkg_root=" << volpkgRoot.string()
@@ -5490,7 +5503,7 @@ bool CWindow::startAtlasRemapHeadless(QString* errorMessage,
             vc::lasagna::LasagnaDataset::open(manifestPath, {workingToBaseScale});
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
         const vc::atlas::Atlas rebuilt =
-            vc::atlas::rebuildAtlasFromSourceFibers(atlasDir, volpkgRoot, sampler);
+            vc::atlas::rebuildAtlasFromSourceFibers(atlasDir, volpkgRoot, sampler, {}, store);
 
         std::ostringstream summary;
         summary.imbue(std::locale::classic());
@@ -5534,6 +5547,7 @@ void CWindow::remapCurrentAtlas()
 bool CWindow::optimizeAtlasSnapCandidatesHeadless(QString* errorMessage,
                                                   std::function<void(const QString& detail)> onAsyncError)
 {
+    const auto store = _state->objectStoreSession();
     auto fail = [errorMessage](const QString& message) {
         if (errorMessage) {
             *errorMessage = message;
@@ -5754,7 +5768,7 @@ bool CWindow::optimizeAtlasSnapCandidatesHeadless(QString* errorMessage,
         }
     });
 
-    prepareWatcher->setFuture(QtConcurrent::run([atlasDir,
+    prepareWatcher->setFuture(QtConcurrent::run([store = _state->objectStoreSession(), atlasDir,
                                                   volpkgRoot,
                                                   manifestPath,
                                                   workingToBaseScale]() {
@@ -5788,7 +5802,7 @@ bool CWindow::optimizeAtlasSnapCandidatesHeadless(QString* errorMessage,
                     volpkgRoot,
                     manifestPath,
                     sampler,
-                    options);
+                    options, store);
             const size_t jobCount =
                 prepared.rankRequest.value("jobs", nlohmann::json::array()).size();
             std::cerr << "[atlas-snap] prepare finished"
@@ -5978,6 +5992,7 @@ void CWindow::startAtlasFiberIntersectionSearch()
 bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchParams& params,
                                                         QString* errorMessage)
 {
+    const auto store = _state->objectStoreSession();
     auto fail = [errorMessage](const QString& message) {
         if (errorMessage) {
             *errorMessage = message;
@@ -6020,7 +6035,7 @@ bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchPa
     bool haveAtlas = false;
     if (_currentAtlasDir) {
         try {
-            atlas = vc::atlas::Atlas::load(*_currentAtlasDir);
+            atlas = vc::atlas::Atlas::load(*_currentAtlasDir, {}, {}, store);
             haveAtlas = true;
         } catch (const std::exception& ex) {
             return fail(tr("Could not load selected atlas: %1")
@@ -6065,7 +6080,12 @@ bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchPa
     for (const auto& snapshot : fiberSnapshots) {
         canonicalPaths.push_back(snapshot.fiberPath);
     }
-    const auto runtimeIds = vc::atlas::makeFiberRuntimeIdentityMap(canonicalPaths);
+    vc::atlas::FiberRuntimeIdentityMap runtimeIds;
+    for(const auto& snapshot:fiberSnapshots) {
+        runtimeIds.canonicalPaths.push_back(snapshot.fiberPath);
+        runtimeIds.idByPathKey[vc::atlas::atlasFiberPathKey(snapshot.fiberPath)]=snapshot.storedFiberId;
+        runtimeIds.pathById[snapshot.storedFiberId]=snapshot.fiberPath;
+    }
     const auto searchSets = vc::atlas::atlasFiberSearchSets(atlas, runtimeIds);
     std::vector<vc::atlas::FiberPolyline> fibers;
     std::vector<uint64_t> sourceFiberIds = searchMode == ATLAS_SEARCH_MODE_NON_ATLAS_ONLY
@@ -6282,7 +6302,7 @@ bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchPa
     QPointer<CWindow> self(this);
     auto cancelFlag = _atlasSearchCancelFlag;
     const auto atlasDirForWorker = _currentAtlasDir;
-    watcher->setFuture(QtConcurrent::run([fibers = std::move(fibers),
+    watcher->setFuture(QtConcurrent::run([store = _state->objectStoreSession(), fibers = std::move(fibers),
                                           sourceFiberIds = std::move(sourceFiberIds),
                                           targetFiberIds = std::move(targetFiberIds),
                                           fiberPathById = std::move(fiberPathById),
@@ -6364,7 +6384,7 @@ bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchPa
                                                               ceres,
                                                               &windingSampler,
                                                               progressCallback,
-                                                              cancelCallback);
+                                                              cancelCallback, store);
         if (debugSearch) {
             qInfo().noquote() << QStringLiteral("[atlas-search] finished source_ids=%1 target_ids=%2 result_count=%3")
                 .arg(atlasSearchIdListString(sourceFiberIds),
@@ -6395,7 +6415,7 @@ bool CWindow::startAtlasFiberIntersectionSearchHeadless(const AtlasFiberSearchPa
                                              lasagnaManifestPath,
                                              lasagnaWorkingToBaseScale,
                                              progressCallback,
-                                             debugSearch);
+                                             debugSearch, store);
     }));
     return true;
 }
@@ -6685,6 +6705,7 @@ void CWindow::clearAtlasSearchPreviewState()
 
 void CWindow::updateAtlasSearchPreviewCandidates()
 {
+    const auto store = _state->objectStoreSession();
     if (!_atlasOverlay || !_currentAtlasDir || _atlasSearchResults.empty()) {
         if (_atlasOverlay) {
             _atlasOverlay->setSearchPreviewCandidates({});
@@ -6693,7 +6714,7 @@ void CWindow::updateAtlasSearchPreviewCandidates()
     }
 
     try {
-        vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_currentAtlasDir);
+        vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_currentAtlasDir, {}, {}, store);
         const std::filesystem::path basePath = *_currentAtlasDir / atlas.metadata.baseMeshPath;
         QuadSurface baseSurface(basePath);
         const auto* points = baseSurface.rawPointsPtr();
@@ -6819,6 +6840,7 @@ void CWindow::updateAtlasSearchPreviewRequests()
 
 void CWindow::requestAtlasSearchPreviewLine(int sortedResultIndex)
 {
+    const auto store = _state->objectStoreSession();
     if (sortedResultIndex < 0 ||
         sortedResultIndex >= static_cast<int>(_atlasSearchResults.size()) ||
         !_currentAtlasDir ||
@@ -6853,6 +6875,7 @@ void CWindow::requestAtlasSearchPreviewLine(int sortedResultIndex)
             });
 
     watcher->setFuture(QtConcurrent::run([
+        store = _state->objectStoreSession(),
         atlasDir = *_currentAtlasDir,
         manifestPath = *_atlasSearchLasagnaManifestPath,
         workingToBaseScale = _atlasSearchLasagnaWorkingToBaseScale,
@@ -6862,7 +6885,7 @@ void CWindow::requestAtlasSearchPreviewLine(int sortedResultIndex)
         sortedResultIndex
     ]() -> std::optional<AtlasOverlayController::SearchPreviewFiber> {
         try {
-            vc::atlas::Atlas atlas = vc::atlas::Atlas::load(atlasDir);
+            vc::atlas::Atlas atlas = vc::atlas::Atlas::load(atlasDir, {}, {}, store);
             const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
             auto baseSurface = std::make_shared<QuadSurface>(basePath);
             const auto* points = baseSurface->rawPointsPtr();
@@ -6951,6 +6974,7 @@ void CWindow::requestAtlasSearchPreviewLine(int sortedResultIndex)
 // Dialog-free atlas loading shared by the interactive and direct entry points.
 void CWindow::loadAndDisplayAtlas(const std::filesystem::path& atlasDir)
 {
+    const auto store = _state->objectStoreSession();
     if (!_atlasWorkspaceWindow || !_atlasViewer) {
         createAtlasWorkspace();
     }
@@ -6970,15 +6994,15 @@ void CWindow::loadAndDisplayAtlas(const std::filesystem::path& atlasDir)
     const std::filesystem::path volpkgRoot = vpkg->path().empty()
         ? std::filesystem::path(vpkg->getVolpkgDirectory())
         : vpkg->path().parent_path();
-    auto atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
+    auto atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot, {}, store);
     vc::lasagna::LasagnaDataset dataset =
         vc::lasagna::LasagnaDataset::open(
             manifestPath,
             vc::lasagna::LasagnaDatasetOpenOptions{
                 resolvedLasagna->workingToBaseScale});
     vc::lasagna::LasagnaNormalSampler sampler(dataset);
-    (void)vc::atlas::ensureAtlasPredSnapAttachments(atlasDir, volpkgRoot, sampler);
-    atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
+    (void)vc::atlas::ensureAtlasPredSnapAttachments(atlasDir, volpkgRoot, sampler, store);
+    atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot, {}, store);
     _currentAtlasDir = atlasDir;
     _currentAtlasName = atlas.metadata.name;
     if (_lineAnnotationController) {
@@ -7077,6 +7101,7 @@ bool CWindow::displayAtlasFromDirectoryHeadless(const std::filesystem::path& atl
 
 void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
 {
+    const auto store = _state->objectStoreSession();
     try {
         loadAndDisplayAtlas(atlasDir);
     } catch (const std::exception& ex) {
@@ -7117,7 +7142,7 @@ void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
                     throw std::runtime_error(
                         "Selected Lasagna dataset has no pred_dt channel; atlas pred-snap attachments are required");
                 }
-                vc::atlas::rebuildAtlasFromSourceFibers(atlasDir, volpkgRoot, sampler);
+                vc::atlas::rebuildAtlasFromSourceFibers(atlasDir, volpkgRoot, sampler, {}, store);
                 displayAtlasFromDirectory(atlasDir);
             } catch (const std::exception& rebuildEx) {
                 QMessageBox::warning(
@@ -8148,9 +8173,9 @@ void CWindow::CreateWidgets(void)
                             return;
                         }
                         for (uint64_t fiberId : fiberIds) {
-                            const auto path = _lineAnnotationController->fiberFilePath(fiberId);
+                            const auto path = _lineAnnotationController->fiberTransportPath(fiberId);
                             if (path.empty()) {
-                                showStatusBarMessage(tr("Fiber %1 has no saved JSON file yet").arg(fiberId), 5000);
+                                showStatusBarMessage(tr("Fiber %1 has no committed object-store revision").arg(fiberId), 5000);
                                 continue;
                             }
                             _spiralWorkspace->addFiberToCurrentFit(
@@ -9101,7 +9126,7 @@ bool CWindow::OpenVolume(const QString& path,
     return true;
 }
 
-void CWindow::openFiberCollection(const QString& path)
+void CWindow::attachObjectStore(const QString& path)
 {
     _fiberCollection->openCollection(path);
 }

@@ -25,6 +25,9 @@ struct FiberRegionOptions {
     uint64_t sqlStepBudget = 10000000;
     // Reject a larger indivisible payload/manifest/decompression operation.
     uint64_t maxUnitBytes = 1024 * 1024;
+    // Applied before selected priority and maximumFibers. nullopt is unrestricted;
+    // an explicitly empty set matches nothing. UUIDs are canonicalized by the store.
+    std::optional<std::vector<std::string>> uuids;
 };
 enum class FiberRegionStop { Exhausted, FiberLimit, OutputBudget, ProcessingBudget, CandidateBudget, SqlBudget, Cancelled };
 struct FiberRegionStats {
