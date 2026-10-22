@@ -9,6 +9,94 @@
 #include "vc/fiber_tracer/LasagnaNormalAlignment.hpp"
 #include "vc/fiber_tracer/FiberNormalOrientation.hpp"
 #include "vc/fiber_tracer/FiberAxialAlignment.hpp"
+#include "vc/fiber_tracer/PolylineGeometry.hpp"
+#include "vc/core/util/OrderedBatchQueue.hpp"
+#include <future>
+#include <mutex>
+#include <array>
+
+TEST_CASE("Ordered stream queue bypasses capacity for missing early work and propagates failure") {
+    using vc::core::util::OrderedBatchQueue;
+    using namespace std::chrono_literals;
+    OrderedBatchQueue<int> queue(1);
+    queue.push(1,11);
+    auto early=std::async(std::launch::async,[&]{queue.push(0,10);});
+    const bool ready=early.wait_for(2s)==std::future_status::ready;
+    if(!ready)queue.finish(std::make_exception_ptr(std::runtime_error("timeout")));
+    REQUIRE(ready);early.get();
+    CHECK(queue.peakPending()==2);
+    CHECK(*queue.next()==10);CHECK(*queue.next()==11);
+    queue.finish();CHECK_FALSE(queue.next());
+    CHECK_THROWS(queue.push(2,12));
+
+    OrderedBatchQueue<int> failed(1);
+    failed.push(1,1);
+    auto blocked=std::async(std::launch::async,[&]{
+        try{failed.push(2,2);}catch(const std::runtime_error&){return true;}return false;
+    });
+    failed.finish(std::make_exception_ptr(std::runtime_error("producer failure")));
+    CHECK(blocked.get());CHECK_THROWS(failed.next());
+
+    OrderedBatchQueue<int> cancelled(1);
+    std::stop_source stop;
+    auto reader=std::async(std::launch::async,[&]{return cancelled.next(stop.get_token());});
+    stop.request_stop();CHECK_FALSE(reader.get());
+    OrderedBatchQueue<int> missing(1);
+    missing.push(1,1);missing.finish();CHECK_THROWS(missing.next());
+    OrderedBatchQueue<int> duplicate(1);
+    duplicate.push(0,1);CHECK_THROWS(duplicate.push(0,2));
+    CHECK(*duplicate.next()==1);CHECK_THROWS(duplicate.push(0,3));
+    CHECK_THROWS(OrderedBatchQueue<int>(0));
+}
+
+TEST_CASE("Finalized whole-fiber streamed batches match ordinary extraction exactly") {
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> lines(16);
+    for(int i=0;i<8;++i) {
+        lines[i].pointsBaseXYZ={{0.,64.*i,0.},{512.,64.*i,0.}};
+        lines[8+i].pointsBaseXYZ={{64.*i,0.,20.},{64.*i,512.,20.}};
+    }
+    FiberTraceConstraintConfig cfg;
+    cfg.localEvents=true;cfg.localKeepWholeFibers=true;cfg.parallelThreads=4;
+    cfg.certifyWinding=false;cfg.enforceMaximumWindingDistance=false;cfg.candidateBatchSize=64;
+    const auto sampler=[](const auto&,const auto&,double){return .5;};
+    const auto baseline=extractFiberTraceConstraints(lines,cfg,sampler);
+    std::mutex mutex;
+    std::map<size_t,std::vector<FiberTraceConstraint>> batches;
+    size_t prepared=0;
+    FiberTraceConstraintStream stream;
+    stream.prepared=[&](auto pieces){prepared=pieces.size();};
+    stream.batch=[&](auto index,auto events) {
+        std::lock_guard lock(mutex);batches[index]={events.begin(),events.end()};
+    };
+    const auto actual=extractFiberTraceConstraints(lines,cfg,sampler,{},{},nullptr,{},stream);
+    CHECK(prepared==lines.size());CHECK(batches.size()==actual.scoringBatches);
+    std::vector<FiberTraceConstraint> emitted;
+    for(const auto& [index,events]:batches)emitted.insert(emitted.end(),events.begin(),events.end());
+    REQUIRE(emitted.size()==baseline.constraints.size());REQUIRE_FALSE(emitted.empty());
+    REQUIRE(actual.constraints.size()==emitted.size());
+    for(size_t i=0;i<emitted.size();++i)for(const auto* c:
+        std::array<const FiberTraceConstraint*,2>{&emitted[i],&actual.constraints[i]}) {
+        const auto& b=baseline.constraints[i];
+        CHECK(c->pieceA==b.pieceA);CHECK(c->pieceB==b.pieceB);
+        CHECK(c->arcABaseVoxels==b.arcABaseVoxels);CHECK(c->arcBBaseVoxels==b.arcBBaseVoxels);
+        CHECK(c->pointABaseXYZ==b.pointABaseXYZ);CHECK(c->pointBBaseXYZ==b.pointBBaseXYZ);
+        CHECK(c->parallelScore==b.parallelScore);CHECK(c->perpendicularScore==b.perpendicularScore);
+        CHECK(c->windingDistance==b.windingDistance);CHECK(c->evidenceWeight==b.evidenceWeight);
+    }
+    CHECK(actual.localOutcomesByRelation==baseline.localOutcomesByRelation);
+    CHECK(actual.localFailureChecks==baseline.localFailureChecks);
+    bool notified=false;
+    stream.batch=[](auto,auto){throw std::runtime_error("sink failed");};
+    stream.failed=[&](auto){std::lock_guard lock(mutex);notified=true;};
+    CHECK_THROWS(extractFiberTraceConstraints(lines,cfg,sampler,{},{},nullptr,{},stream));
+    CHECK(notified);
+    cfg.localKeepWholeFibers=false;
+    CHECK_THROWS(extractFiberTraceConstraints(lines,cfg,sampler,{},{},nullptr,{},stream));
+    cfg.localKeepWholeFibers=true;prepared=999;
+    const auto empty=extractFiberTraceConstraints({},cfg,sampler,{},{},nullptr,{},stream);
+    CHECK(prepared==0);CHECK(empty.constraints.empty());
+}
 
 TEST_CASE("Axial fiber agreement is arc weighted and unoriented") {
     using vc::fiber_tracer::fiberAxialAlignment;
@@ -21,12 +109,155 @@ TEST_CASE("Axial fiber agreement is arc weighted and unoriented") {
 }
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <limits>
+#include <mutex>
 #include <numbers>
 #include <numeric>
 #include <string>
 #include <vector>
+
+TEST_CASE("Bounded polyline visits preserve closed boundaries and duplicate vertices")
+{
+    using namespace vc::fiber_tracer;
+    const auto geometry=makePolylineArcGeometry({{0,0,0},{0,0,0},{10,0,0},
+        {10,0,0},{20,0,0},{20,0,0},{30,0,0},{30,0,0}});
+    for(double low:{-5.,0.,1.,10.,10.5,20.,30.,35.})
+        for(double high:{0.,1.,10.,10.5,20.,30.,35.}) {
+            if(low>high)continue;
+            const double begin=std::clamp(low,0.,geometry.length());
+            const double end=std::clamp(high,0.,geometry.length());
+            const auto segments=clippedPolylineArcSegments(geometry,low,high);
+            std::vector<std::size_t> expected;
+            // Independent full-interval enumeration is the boundary oracle.
+            for(std::size_t i=0;i+1<geometry.points.size();++i)
+                if(geometry.vertexArcs[i+1]>geometry.vertexArcs[i]+1e-12 &&
+                   geometry.vertexArcs[i+1]>=begin && geometry.vertexArcs[i]<=end)
+                    expected.push_back(i);
+            REQUIRE(segments.size()==expected.size());
+            for(std::size_t i=0;i<segments.size();++i) {
+                CHECK(segments[i].segmentIndex==expected[i]);
+                CHECK(segments[i].beginArc==std::max(begin,geometry.vertexArcs[expected[i]]));
+                CHECK(segments[i].endArc==std::min(end,geometry.vertexArcs[expected[i]+1]));
+            }
+        }
+}
+
+TEST_CASE("Extraction progress observes stages without changing constraints")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> lines(3);
+    lines[0].pointsBaseXYZ={{0,0,0},{1024,0,0}};
+    lines[1].pointsBaseXYZ={{0,0,20},{1024,0,20}};
+    lines[2].pointsBaseXYZ={{512,-512,30},{512,512,30}};
+    FiberTraceConstraintConfig cfg;
+    cfg.localEvents=true;cfg.localKeepWholeFibers=true;cfg.parallelThreads=1;
+    const auto sampler=[](const cv::Vec3d&,const cv::Vec3d&,double){return .5;};
+    const auto baseline=extractFiberTraceConstraints(lines,cfg,sampler);
+    cfg.parallelThreads=4;
+    cfg.candidateBatchSize=3;
+    std::mutex mutex;
+    std::map<std::string,FiberTraceConstraintProgress> last;
+    const auto tracked=extractFiberTraceConstraints(lines,cfg,sampler,{}, {},nullptr,
+        [&](const FiberTraceConstraintProgress& p) {
+            std::lock_guard lock(mutex);
+            CHECK(p.completed<=p.total);
+            last[std::string(p.phase)]=p;
+        });
+    for(const auto* phase:{"prepare","spatial_index","search","candidate_order","score_batches","finalize"}) {
+        REQUIRE(last.contains(phase));
+        CHECK(last.at(phase).completed==last.at(phase).total);
+    }
+    CHECK(tracked.measuredCandidates==baseline.measuredCandidates);
+    CHECK(tracked.scoringBatches>baseline.scoringBatches);
+    CHECK(tracked.localDeduplicatedCandidates==baseline.localDeduplicatedCandidates);
+    CHECK(tracked.localOutcomesByRelation==baseline.localOutcomesByRelation);
+    CHECK(tracked.localFailureChecks==baseline.localFailureChecks);
+    CHECK(tracked.localRefinedCandidates==baseline.localRefinedCandidates);
+    REQUIRE(tracked.constraints.size()==baseline.constraints.size());
+    for(size_t i=0;i<tracked.constraints.size();++i) {
+        const auto& a=tracked.constraints[i];const auto& b=baseline.constraints[i];
+        CHECK(a.pieceA==b.pieceA);CHECK(a.pieceB==b.pieceB);
+        CHECK(a.arcABaseVoxels==b.arcABaseVoxels);CHECK(a.arcBBaseVoxels==b.arcBBaseVoxels);
+        CHECK(a.pointABaseXYZ==b.pointABaseXYZ);CHECK(a.pointBBaseXYZ==b.pointBBaseXYZ);
+        CHECK(a.parallelScore==b.parallelScore);CHECK(a.perpendicularScore==b.perpendicularScore);
+        CHECK(a.windingDistance==b.windingDistance);
+    }
+    std::atomic<std::size_t> batchCalls{0};
+    const auto batched=extractFiberTraceConstraints(lines,cfg,sampler,
+        [&](const auto& connectors,double,int workers) {
+            CHECK(workers==1); // No nested full-width team per queue worker.
+            batchCalls.fetch_add(1,std::memory_order_relaxed);
+            return std::vector<double>(connectors.size(),.5);
+        });
+    CHECK(batchCalls.load()>1);
+    REQUIRE(batched.constraints.size()==baseline.constraints.size());
+    for(size_t i=0;i<batched.constraints.size();++i) {
+        CHECK(batched.constraints[i].pieceA==baseline.constraints[i].pieceA);
+        CHECK(batched.constraints[i].pieceB==baseline.constraints[i].pieceB);
+        CHECK(batched.constraints[i].pointABaseXYZ==baseline.constraints[i].pointABaseXYZ);
+        CHECK(batched.constraints[i].pointBBaseXYZ==baseline.constraints[i].pointBBaseXYZ);
+        CHECK(batched.constraints[i].windingDistance==baseline.constraints[i].windingDistance);
+    }
+    CHECK_THROWS(extractFiberTraceConstraints(lines,cfg,sampler,
+        [](const auto&,double,int)->std::vector<double> {throw std::runtime_error("sampler failure");}));
+    cfg.candidateBatchSize=0;
+    CHECK_THROWS_AS(extractFiberTraceConstraints(lines,cfg,sampler),std::invalid_argument);
+}
+
+TEST_CASE("Parallel candidate ordering exactly matches serial ordering on a nontrivial queue")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> lines(2);
+    lines[0].pointsBaseXYZ={{0,0,0},{1100000,0,0}};
+    lines[1].pointsBaseXYZ={{0,0,20},{1100000,0,20}};
+    FiberTraceConstraintConfig cfg;
+    cfg.localEvents=true;cfg.localKeepWholeFibers=true;cfg.parallelThreads=1;
+    const auto sampler=[](const auto&,const auto&,double){return .5;};
+    const auto serial=extractFiberTraceConstraints(lines,cfg,sampler);
+    cfg.parallelThreads=4;
+    const auto parallel=extractFiberTraceConstraints(lines,cfg,sampler);
+    CHECK(serial.measuredCandidates>32768);
+    CHECK(serial.measuredCandidates==parallel.measuredCandidates);
+    CHECK(serial.localOutcomesByRelation==parallel.localOutcomesByRelation);
+    REQUIRE(serial.constraints.size()==parallel.constraints.size());
+    for(size_t i=0;i<serial.constraints.size();++i) {
+        const auto& a=serial.constraints[i];const auto& b=parallel.constraints[i];
+        CHECK(a.arcABaseVoxels==b.arcABaseVoxels);CHECK(a.arcBBaseVoxels==b.arcBBaseVoxels);
+        CHECK(a.pointABaseXYZ==b.pointABaseXYZ);CHECK(a.pointBBaseXYZ==b.pointBBaseXYZ);
+        CHECK(a.evidenceWeight==b.evidenceWeight);CHECK(a.parallelWindingDistance==b.parallelWindingDistance);
+    }
+}
+
+TEST_CASE("Whole-fiber event ownership is the identity even with skipped input traces")
+{
+    using namespace vc::fiber_tracer;
+    std::vector<FiberletCropTraceLine> lines(4);
+    lines[0].pointsBaseXYZ={{0,0,0},{0,0,0}};
+    lines[1].pointsBaseXYZ={{0,0,0},{1024,0,0}};
+    lines[2].pointsBaseXYZ={{512,-512,20},{512,512,20}};
+    lines[3].pointsBaseXYZ={{0,0,30},{1024,0,30}};
+    FiberTraceConstraintConfig cfg;
+    cfg.localEvents=true;cfg.localKeepWholeFibers=true;cfg.parallelThreads=4;
+    const auto report=extractFiberTraceConstraints(lines,cfg,
+        [](const auto&,const auto&,double){return .5;});
+    CHECK(report.skippedDegenerateTraces==1);
+    REQUIRE(report.pieces.size()==3);
+    REQUIRE_FALSE(report.constraints.empty());
+    size_t missing=0;
+    const auto remapped=remapCertifiedFiberTraceEvents(report.constraints,report.pieces,report.pieces,missing);
+    CHECK(missing==0);
+    REQUIRE(remapped.size()==report.constraints.size());
+    for(size_t i=0;i<remapped.size();++i) {
+        const auto& a=remapped[i];const auto& b=report.constraints[i];
+        CHECK(a.pieceA==b.pieceA);CHECK(a.pieceB==b.pieceB);
+        CHECK(a.pointABaseXYZ==b.pointABaseXYZ);CHECK(a.pointBBaseXYZ==b.pointBBaseXYZ);
+        CHECK(a.arcABaseVoxels==b.arcABaseVoxels);CHECK(a.arcBBaseVoxels==b.arcBBaseVoxels);
+        CHECK(a.evidenceWeight==b.evidenceWeight);
+        CHECK(a.windingDistance==b.windingDistance);
+    }
+}
 
 TEST_CASE("Independent fiber normal sweep preserves initial gauge and invalid gaps")
 {

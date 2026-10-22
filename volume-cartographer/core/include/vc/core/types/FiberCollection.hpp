@@ -59,6 +59,10 @@ public:
     FiberCollection(const FiberCollection&) = delete;
     FiberCollection& operator=(const FiberCollection&) = delete;
 
+    // Pin a read snapshot for repeated bulk queries until this reader closes.
+    // Avoids per-query file-lock churn; never enables writes. Call at most once.
+    void beginReadSnapshot();
+
     std::string metadata(const std::string& key) const;
     Summary summary(int64_t fiberId) const;
     // Descending length, then ascending ID. Start with +infinity/0 and continue

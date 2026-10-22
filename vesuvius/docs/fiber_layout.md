@@ -20,6 +20,82 @@ Required extraction config entries are `afv`, `coordinate_space`,
 `full_volume: true` or `minimum_xyz`/`maximum_xyz` (base XYZ). Use `database` to
 write a constraint database, with `repetitions: 1`. Existing outputs are not
 overwritten. `threads` controls CPU extraction; this executable uses no GPU.
+`load_threads` independently controls read-only AFV reader connections (default1).
+Each reader pins a snapshot and consumes complete fibers; sorted-ID output and
+length accumulation are unchanged. Measure reader fan-out before raising it:
+SQLite/file-cache contention can make more readers slower, unlike compute workers.
+
+Set `progress_interval_seconds` (positive seconds) to log structured phase
+progress; `progress_file` optionally receives the same JSONL records. Each row
+contains `stage_index`, `phase`, `completed`/`total`, elapsed time, units/second
+and phase ETA. Unix builds also report process CPU seconds and peak RSS bytes.
+The units are fibers for preparation/loading, samples for spatial queries,
+initial candidates for `score_batches`, and accepted events for export. A phase
+ETA is not an overall job ETA. `score_batches` includes encounter deduplication,
+winding measurement and adaptive refinement; their final timings are also saved.
+
+Spatial queries use read-only shared indexing and worker-local contiguous
+candidate buffers. Canonical sample-pair ordering is restored before scoring.
+Geometry/resampling is prepared independently per input trace, then assembled
+in input order, with deterministic exception precedence. Local candidate keys
+are unique: parallel chunk sorting/ordered merging preserves their exact total
+ordering. Legacy epsilon reductions are not reordered. Whole-fiber finalization
+validates existing owners directly rather than copying/remapping unchanged pieces;
+actual subdivisions still use the common certified-event remapper.
+`candidate_batch_size` defaults to 262144 initial candidates and is a scratch
+ceiling target, not an observation limit. A persistent dynamically scheduled
+worker pool consumes independent jobs targeting at most1024 initial candidates
+(or the configured target if smaller). Complete fiber-pair groups stay together,
+so a job can exceed that target; `maximum_batch_candidates` reports the maximum.
+Workers run scoring, deduplication, measurement and refinement without a barrier
+between unrelated jobs. Results and integer counters are assembled deterministically.
+Orientation/winding substage seconds sum worker durations; extraction seconds
+remain wall time and are the appropriate throughput measure.
+All accepted events remain in the output. The legacy epsilon-based nearest-pair
+reduction and arbitrary caller filters keep their serial invocation order.
+Database row encoding is parallel and a bounded producer queue overlaps normal
+sampling/encoding with the SQLite writer. Insertion preserves original event
+order in one transaction; there is no per-row commit or filesystem sync.
+Native whole-volume extraction with a database output now defaults to
+`stream_export: true`: finalized whole-pair event batches feed export while
+other pairs continue extracting. `export_queue_batches` defaults to128 completed
+jobs, plus at most one priority batch for the next required ID; blocked worker
+payloads are additionally bounded by the extraction worker count. A separate
+two-batch encoding queue overlaps sampling/JSON preparation and insertion.
+This bounds additional streaming buffers, not the retained extraction report.
+Canonical ordering, encounter deduplication and evidence normalization are
+preserved. Streaming accepts whole-fiber local events without extra cuts,
+owner filtering or aligned-normal processing; incompatible modes fail explicitly.
+The database is not published until extraction succeeds and indexing/validation
+finish. Errors cancel blocked producers; a failed partial file is not published.
+Use `stream_export: false` only for a sequential timing/control run. The same
+export implementation handles both modes. Progress reports independent phase
+timelines; the final event count is unknown until stream completion.
+`tail_after_extraction_seconds` measures remaining export/index/check time after
+extraction returns; streamed `export_seconds` includes overlapping source waits
+and must not be added to extraction seconds. `processing_seconds` is end-to-end.
+The unpublished partial database receives its full foreign-key audit and
+integrity check before publication; redundant per-insert FK lookups are avoided.
+Export settings preserve the existing format and defaults:
+`sqlite_insert_batch_rows` defaults to32 (range1..32). Constraint rows use cached
+multi-row prepared INSERTs, including an exact-size final partial batch. The
+runtime SQLite variable limit can reduce the batch size. Row order, values,
+schema and publication checks are unchanged;1 permits controlled timing comparisons.
+`sqlite_page_size` is zero (SQLite default) or a power of two from512 to65536;
+`sqlite_in_memory: true` builds/indexes/validates the entire database in RAM,
+then saves it with SQLite's backup API. RAM mode needs enough memory for the
+entire database plus extraction. Both modes count final persistence in
+`export_seconds` and separately report `persist_seconds`. RAM temporary sorting
+alone is not equivalent to building the entire database in RAM.
+Bounded arc projection uses binary interval lookup in the shared geometry helper,
+preserving closed interval endpoints and original segment order/calculations.
+No sampling, radius, numerical precision or acceptance tolerances are changed.
+
+`compare_database` verifies every extracted measurement and its order against
+a saved database. It can be combined with `database` to validate and then export
+a new result; `comparison_seconds` separates verification overhead from timing.
+`wall_seconds` includes verification; `processing_seconds` excludes that optional
+comparison. Export reports insertion, index/commit and validation times separately.
 
 In an already configured VC build:
 

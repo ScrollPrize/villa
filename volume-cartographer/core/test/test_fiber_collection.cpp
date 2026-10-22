@@ -241,6 +241,25 @@ TEST_CASE("clipSegment clips exactly and handles degenerate segments")
     CHECK_FALSE(clipSegment({0, 2, 0}, {0, 2, 0}, kUnit, lo, hi));
 }
 
+TEST_CASE("Bulk read snapshots preserve fiber queries and reject nested transactions")
+{
+    FiberCollection reader(standardCollection());
+    const auto blocks=reader.fiberBlocks(1);
+    const auto annotation=reader.annotation(1);
+    reader.beginReadSnapshot();
+    CHECK(reader.metadata("fiber_count")=="5");
+    CHECK(reader.annotation(1)==annotation);
+    const auto pinned=reader.fiberBlocks(1);
+    REQUIRE(pinned.size()==blocks.size());
+    for(size_t i=0;i<blocks.size();++i) {
+        CHECK(pinned[i].fiberId==blocks[i].fiberId);
+        CHECK(pinned[i].firstSegment==blocks[i].firstSegment);
+        CHECK(pinned[i].points==blocks[i].points);
+    }
+    CHECK_THROWS(reader.beginReadSnapshot());
+    CHECK(reader.metadata("fiber_count")=="5");
+}
+
 TEST_CASE("viewRegion returns the fibers crossing the slice, with quota and selection")
 {
     const FiberCollection c(standardCollection());

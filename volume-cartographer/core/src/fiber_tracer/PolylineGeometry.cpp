@@ -70,9 +70,16 @@ void visitClippedPolylineArcSegments(
     beginArc = std::clamp(beginArc, 0.0, geometry.length());
     endArc = std::clamp(endArc, 0.0, geometry.length());
     bool found = false;
-    for (size_t segment = 0; segment + 1 < geometry.points.size(); ++segment) {
+    // Arc lengths are monotone. Include edges ending exactly at beginArc and
+    // beginning exactly at endArc, as the original full scan did (including
+    // duplicate-vertex runs). All visited edges keep their original order/math.
+    const auto firstEnd=std::lower_bound(
+        geometry.vertexArcs.begin()+1,geometry.vertexArcs.end(),beginArc);
+    const size_t firstSegment=static_cast<size_t>(firstEnd-geometry.vertexArcs.begin()-1);
+    for (size_t segment = firstSegment; segment + 1 < geometry.points.size(); ++segment) {
         const double sourceBegin = geometry.vertexArcs[segment];
         const double sourceEnd = geometry.vertexArcs[segment + 1];
+        if(sourceBegin>endArc)break;
         if (!(sourceEnd > sourceBegin + kEpsilon) || sourceEnd < beginArc ||
             sourceBegin > endArc) {
             continue;

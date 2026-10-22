@@ -14,6 +14,12 @@
 #include <fstream>
 #include <array>
 #include <bit>
+#include <exception>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <iterator>
 
 namespace {
 using Json = nlohmann::json;
@@ -63,8 +69,34 @@ void verifyFiberConstraintDatabaseMeasurements(const std::filesystem::path& path
 nlohmann::json writeFiberConstraintDatabase(
     const std::filesystem::path& output, const std::vector<int64_t>& sourceIds,
     const vc::fiber_tracer::FiberTraceConstraintReport& report,
-    const vc::lasagna::LasagnaNormalSampler& normals, int threads, const Json& metadata)
+    const vc::lasagna::LasagnaNormalSampler& normals, int threads, const Json& metadata,
+    const vc::fiber_tracer::FiberTraceConstraintProgressCallback& progress,
+    const FiberConstraintDatabaseOptions& options)
 {
+    size_t position=0;
+    return streamFiberConstraintDatabase(output,sourceIds,report.pieces,
+        [&](std::stop_token) {
+            const size_t end=std::min(position+8192,report.constraints.size());
+            std::vector<vc::fiber_tracer::FiberTraceConstraint> batch(
+                report.constraints.begin()+position,report.constraints.begin()+end);
+            position=end;
+            return batch;
+        },normals,threads,metadata,progress,options,report.constraints.size());
+}
+
+nlohmann::json streamFiberConstraintDatabase(
+    const std::filesystem::path& output, const std::vector<int64_t>& sourceIds,
+    std::span<const vc::fiber_tracer::FiberTraceConstraintPiece> pieces,
+    const FiberConstraintBatchSource& source,
+    const vc::lasagna::LasagnaNormalSampler& normals, int threads, const Json& metadata,
+    const vc::fiber_tracer::FiberTraceConstraintProgressCallback& progress,
+    const FiberConstraintDatabaseOptions& options, size_t expectedEvents)
+{
+    if(options.insertBatchRows<1 || options.insertBatchRows>32)
+        throw std::invalid_argument("SQLite insert batch rows must be from 1 to 32");
+    if(options.pageSize!=0 && (options.pageSize<512 || options.pageSize>65536 ||
+        (options.pageSize&(options.pageSize-1))))
+        throw std::invalid_argument("SQLite page size must be zero or a power of two from512 to65536");
     const auto start=std::chrono::steady_clock::now();
     auto temporary=output;
     temporary += ".partial";
@@ -72,8 +104,10 @@ nlohmann::json writeFiberConstraintDatabase(
         throw std::runtime_error("Refusing to overwrite constraint database or partial file");
     std::filesystem::create_directories(output.parent_path());
     sqlite3* raw=nullptr;
-    const auto name=temporary.u8string();
-    const int opened=sqlite3_open_v2(reinterpret_cast<const char*>(name.c_str()),&raw,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE,nullptr);
+    const auto name=options.inMemory?std::u8string(u8":memory:"):temporary.u8string();
+    // This connection belongs exclusively to the ordered writer; the producer
+    // never calls SQLite. Avoid a serialized-connection mutex on every bind.
+    const int opened=sqlite3_open_v2(reinterpret_cast<const char*>(name.c_str()),&raw,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_NOMUTEX,nullptr);
     std::unique_ptr<sqlite3,decltype(&sqlite3_close)> db(raw,sqlite3_close);
     if(opened!=SQLITE_OK)throw std::runtime_error("Cannot create constraint database");
     const auto check=[&](int rc){if(rc!=SQLITE_OK && rc!=SQLITE_DONE)throw std::runtime_error(sqlite3_errmsg(db.get()));};
@@ -81,7 +115,12 @@ nlohmann::json writeFiberConstraintDatabase(
     using Statement=std::unique_ptr<sqlite3_stmt,decltype(&sqlite3_finalize)>;
     const auto prepare=[&](const char* sql){sqlite3_stmt* p=nullptr;check(sqlite3_prepare_v2(db.get(),sql,-1,&p,nullptr));return Statement(p,sqlite3_finalize);};
     const auto text=[&](sqlite3_stmt* p,int col,const std::string& value){check(sqlite3_bind_text(p,col,value.c_str(),int(value.size()),SQLITE_TRANSIENT));};
-    exec("PRAGMA application_id=1447249475; PRAGMA user_version=1; PRAGMA foreign_keys=ON; BEGIN IMMEDIATE;"
+    if(options.pageSize)
+        exec(("PRAGMA page_size="+std::to_string(options.pageSize)).c_str());
+    // Bulk load into an unpublished partial file. Endpoint indices are checked
+    // through .at() below; the complete foreign-key audit still runs before
+    // publication. Avoid repeating the same B-tree lookups on every insertion.
+    exec("PRAGMA application_id=1447249475; PRAGMA user_version=1; PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;"
          "CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);"
          "CREATE TABLE fibers(id INTEGER PRIMARY KEY,source_index INTEGER UNIQUE NOT NULL,length_base REAL NOT NULL);"
          "CREATE TABLE constraints(id INTEGER PRIMARY KEY,fiber_a INTEGER NOT NULL REFERENCES fibers(id),"
@@ -95,57 +134,214 @@ nlohmann::json writeFiberConstraintDatabase(
     putMeta("format","fiber-constraints"); putMeta("schema_version",1); putMeta("provenance",metadata);
     putMeta("normal_semantics","unoriented sheet-normal axes sampled at exact constraint base points; invalid values are null");
     auto fiber=prepare("INSERT INTO fibers VALUES(?,?,?)");
-    if(report.pieces.size()!=sourceIds.size())throw std::runtime_error("Export requires whole source fibers");
+    if(pieces.size()!=sourceIds.size())throw std::runtime_error("Export requires whole source fibers");
     std::vector<size_t> degree(sourceIds.size());
-    for(const auto& p:report.pieces) {
+    for(const auto& p:pieces) {
         check(sqlite3_bind_int64(fiber.get(),1,sourceIds.at(p.traceIndex)));
         check(sqlite3_bind_int64(fiber.get(),2,p.traceIndex));
         check(sqlite3_bind_double(fiber.get(),3,p.endArcBaseVoxels-p.beginArcBaseVoxels));
         check(sqlite3_step(fiber.get()));check(sqlite3_reset(fiber.get()));
     }
-    auto insert=prepare("INSERT INTO constraints VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+    constexpr int columnsPerRow=19;
+    const int insertBatchRows=std::min(options.insertBatchRows,
+        sqlite3_limit(db.get(),SQLITE_LIMIT_VARIABLE_NUMBER,-1)/columnsPerRow);
+    if(insertBatchRows<1)throw std::runtime_error("SQLite variable limit cannot hold one constraint");
+    std::vector<Statement> inserts;
+    inserts.reserve(insertBatchRows+1);
+    for(int i=0;i<=insertBatchRows;++i)inserts.emplace_back(nullptr,sqlite3_finalize);
+    const auto insertForRows=[&](size_t rows) {
+        auto& statement=inserts.at(rows);
+        if(!statement) {
+            std::string sql="INSERT INTO constraints VALUES";
+            for(size_t i=0;i<rows;++i) {
+                if(i)sql+=',';
+                sql+="(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)";
+            }
+            statement=prepare(sql.c_str());
+        }
+        return statement.get();
+    };
     size_t invalidNormals=0,parallel=0;
-    double samplingSeconds=0.;
-    for(size_t begin=0;begin<report.constraints.size();begin+=8192) {
-        const size_t end=std::min(begin+8192,report.constraints.size());
-        std::vector<cv::Vec3d> points; points.reserve(2*(end-begin));
-        for(size_t i=begin;i<end;++i){points.push_back(report.constraints[i].pointABaseXYZ);points.push_back(report.constraints[i].pointBBaseXYZ);}
+    double samplingSeconds=0.,serializationSeconds=0.,insertSeconds=0.;
+    if(progress)progress({"export",0,expectedEvents,expectedEvents});
+    struct EncodedBatch {
+        size_t begin=0,end=0;
+        std::vector<vc::fiber_tracer::FiberTraceConstraint> constraints;
         std::vector<vc::lasagna::NormalSampleWithDerivative> samples;
+        std::vector<std::array<std::string,3>> encoded;
+    };
+    std::mutex queueMutex;
+    std::condition_variable_any queueReady;
+    std::deque<EncodedBatch> queue;
+    std::exception_ptr producerFailure;
+    bool producerDone=false;
+    // A bounded preparation queue overlaps normal sampling/encoding with the
+    // single SQLite writer. Connection ownership and insertion order stay fixed.
+    std::jthread producer([&](std::stop_token stop) {
+    try {
+    size_t begin=0;
+    bool sourceDone=false;
+    while(!sourceDone) {
+        {
+            std::unique_lock lock(queueMutex);
+            if(!queueReady.wait(lock,stop,[&]{return queue.size()<2;}))return;
+        }
+        EncodedBatch batch;batch.begin=begin;
+        // Small extraction jobs are coalesced into useful sampling/encoding
+        // batches, not a new OpenMP team for every fiber pair.
+        batch.constraints.reserve(8192);
+        while(batch.constraints.size()<8192) {
+            if(stop.stop_requested())return;
+            auto events=source(stop);
+            if(events.empty()){sourceDone=true;break;}
+            batch.constraints.insert(batch.constraints.end(),
+                std::make_move_iterator(events.begin()),std::make_move_iterator(events.end()));
+        }
+        if(batch.constraints.empty())break;
+        const size_t end=begin+batch.constraints.size();batch.end=end;
+        std::vector<cv::Vec3d> points; points.reserve(2*(end-begin));
+        for(const auto& c:batch.constraints){points.push_back(c.pointABaseXYZ);points.push_back(c.pointBBaseXYZ);}
+        auto& samples=batch.samples;
         const auto samplingStart=std::chrono::steady_clock::now();
         (void)normals.sampleNormalBatch(points,false,threads,samples);
         samplingSeconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-samplingStart).count();
         if(samples.size()!=points.size())throw std::runtime_error("Normal batch size mismatch");
-        for(size_t i=begin;i<end;++i) {
-            const auto& c=report.constraints[i];
-            const auto a=report.pieces.at(c.pieceA).traceIndex,b=report.pieces.at(c.pieceB).traceIndex;
-            ++degree.at(a);++degree.at(b);parallel+=c.parallelScore>c.perpendicularScore;
-            check(sqlite3_bind_int64(insert.get(),1,i));check(sqlite3_bind_int64(insert.get(),2,sourceIds.at(a)));check(sqlite3_bind_int64(insert.get(),3,sourceIds.at(b)));
-            const double values[]={c.arcABaseVoxels,c.arcBBaseVoxels,c.pointABaseXYZ[0],c.pointABaseXYZ[1],c.pointABaseXYZ[2],c.pointBBaseXYZ[0],c.pointBBaseXYZ[1],c.pointBBaseXYZ[2],c.parallelScore,c.perpendicularScore,c.windingDistance,c.parallelWindingDistance,c.evidenceWeight};
-            for(int k=0;k<13;++k)check(sqlite3_bind_double(insert.get(),4+k,values[k]));
-            for(int side=0;side<2;++side) {
-                const auto& n=samples[2*(i-begin)+side].sample;invalidNormals+=!n.valid;
-                text(insert.get(),17+side,Json{{"valid",n.valid},{"xyz",n.valid?point(n.normal):Json(nullptr)},{"reason",n.reason}}.dump());
-            }
-            text(insert.get(),19,measurement(c).dump());check(sqlite3_step(insert.get()));check(sqlite3_reset(insert.get()));
+        // Encode bounded row payloads independently; SQLite insertion remains
+        // in original event order on its single owning thread.
+        const auto serializationStart=std::chrono::steady_clock::now();
+        auto& encoded=batch.encoded;encoded.resize(end-begin);
+        std::vector<std::exception_ptr> failures(end-begin);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(threads)
+#endif
+        for(std::ptrdiff_t offset=0;offset<static_cast<std::ptrdiff_t>(end-begin);++offset) {
+            try {
+                auto& row=encoded[offset];
+                for(int side=0;side<2;++side) {
+                    const auto& n=samples[2*offset+side].sample;
+                    row[side]=Json{{"valid",n.valid},{"xyz",n.valid?point(n.normal):Json(nullptr)},{"reason",n.reason}}.dump();
+                }
+                row[2]=measurement(batch.constraints[offset]).dump();
+            } catch(...) { failures[offset]=std::current_exception(); }
         }
-        if(begin%262144==0)std::cout<<"export constraints "<<end<<"/"<<report.constraints.size()<<std::endl;
+        for(const auto& failure:failures)if(failure)std::rethrow_exception(failure);
+        serializationSeconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-serializationStart).count();
+        {
+            std::lock_guard lock(queueMutex);
+            queue.push_back(std::move(batch));
+        }
+        queueReady.notify_all();
+        begin=end;
     }
+    } catch(...) {
+        std::lock_guard lock(queueMutex);producerFailure=std::current_exception();
+    }
+    {
+        std::lock_guard lock(queueMutex);producerDone=true;
+    }
+    queueReady.notify_all();
+    });
+    size_t eventCount=0;
+    for(;;) {
+        EncodedBatch batch;
+        {
+            std::unique_lock lock(queueMutex);
+            queueReady.wait(lock,[&]{return !queue.empty() || producerDone;});
+            if(queue.empty()) {
+                if(producerFailure)std::rethrow_exception(producerFailure);
+                break;
+            }
+            batch=std::move(queue.front());queue.pop_front();
+        }
+        queueReady.notify_all();
+        const auto begin=batch.begin,end=batch.end;
+        const auto& samples=batch.samples;
+        const auto& encoded=batch.encoded;
+        const auto insertStart=std::chrono::steady_clock::now();
+        for(size_t groupBegin=begin;groupBegin<end;groupBegin+=insertBatchRows) {
+            const size_t groupEnd=std::min(groupBegin+insertBatchRows,end);
+            auto* insert=insertForRows(groupEnd-groupBegin);
+            struct ReleaseBorrowedBindings {
+                sqlite3_stmt* statement;
+                ~ReleaseBorrowedBindings(){sqlite3_clear_bindings(statement);}
+            } releaseBindings{insert};
+            for(size_t i=groupBegin;i<groupEnd;++i) {
+                const int base=columnsPerRow*static_cast<int>(i-groupBegin);
+                const auto& c=batch.constraints[i-begin];
+                if(c.pieceA>=pieces.size() || c.pieceB>=pieces.size())
+                    throw std::out_of_range("Constraint endpoint piece");
+                const auto a=pieces[c.pieceA].traceIndex,b=pieces[c.pieceB].traceIndex;
+                ++degree.at(a);++degree.at(b);parallel+=c.parallelScore>c.perpendicularScore;
+                check(sqlite3_bind_int64(insert,base+1,i));check(sqlite3_bind_int64(insert,base+2,sourceIds.at(a)));check(sqlite3_bind_int64(insert,base+3,sourceIds.at(b)));
+                const double values[]={c.arcABaseVoxels,c.arcBBaseVoxels,c.pointABaseXYZ[0],c.pointABaseXYZ[1],c.pointABaseXYZ[2],c.pointBBaseXYZ[0],c.pointBBaseXYZ[1],c.pointBBaseXYZ[2],c.parallelScore,c.perpendicularScore,c.windingDistance,c.parallelWindingDistance,c.evidenceWeight};
+                for(int k=0;k<13;++k)check(sqlite3_bind_double(insert,base+4+k,values[k]));
+                for(int side=0;side<2;++side) {
+                    const auto& n=samples[2*(i-begin)+side].sample;invalidNormals+=!n.valid;
+                    const auto& value=encoded[i-begin][side];
+                    check(sqlite3_bind_text(insert,base+17+side,value.c_str(),int(value.size()),SQLITE_STATIC));
+                }
+                const auto& value=encoded[i-begin][2];
+                check(sqlite3_bind_text(insert,base+19,value.c_str(),int(value.size()),SQLITE_STATIC));
+            }
+            check(sqlite3_step(insert));check(sqlite3_reset(insert));
+        }
+        insertSeconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-insertStart).count();
+        eventCount=end;
+        if(progress)progress({"export",end,expectedEvents,expectedEvents});
+        else if(begin%262144==0)std::cout<<"export constraints "<<end<<"/"<<expectedEvents<<std::endl;
+    }
+    producer.join();
+    if(expectedEvents && eventCount!=expectedEvents)throw std::runtime_error("Export event count mismatch");
+    if(progress && !expectedEvents)progress({"export",eventCount,eventCount,eventCount});
+    const auto finalizationStart=std::chrono::steady_clock::now();
     std::sort(degree.begin(),degree.end());
     const auto quantile=[&](double p){return degree.empty()?0.:double(degree[size_t(p*(degree.size()-1))]);};
-    Json stats={{"fibers",sourceIds.size()},{"constraints",report.constraints.size()},
-        {"parallel",parallel},{"orthogonal",report.constraints.size()-parallel},{"invalid_endpoint_normals",invalidNormals},
+    Json stats={{"fibers",sourceIds.size()},{"constraints",eventCount},
+        {"parallel",parallel},{"orthogonal",eventCount-parallel},{"invalid_endpoint_normals",invalidNormals},
         {"isolated_fibers",std::count(degree.begin(),degree.end(),size_t(0))},
-        {"mean_degree",sourceIds.empty()?0.:2.*report.constraints.size()/sourceIds.size()},
+        {"mean_degree",sourceIds.empty()?0.:2.*eventCount/sourceIds.size()},
         {"median_degree",quantile(.5)},{"p95_degree",quantile(.95)},{"max_degree",quantile(1)},
-        {"endpoint_normal_sampling_seconds",samplingSeconds}};
+        {"endpoint_normal_sampling_seconds",samplingSeconds},
+        {"json_serialization_seconds",serializationSeconds},{"sqlite_insert_seconds",insertSeconds},
+        {"sqlite_in_memory",options.inMemory},{"sqlite_page_size",options.pageSize},
+        {"sqlite_insert_batch_rows",insertBatchRows},
+        {"sqlite_memory_persistence",options.inMemory?"backup":"file"}};
     putMeta("statistics",stats);putMeta("complete",true);
-    exec("CREATE INDEX constraint_a ON constraints(fiber_a); CREATE INDEX constraint_b ON constraints(fiber_b); COMMIT;");
+    if(progress)progress({"export_indexes",0,2,eventCount});
+    exec("CREATE INDEX constraint_a ON constraints(fiber_a);");
+    if(progress)progress({"export_indexes",1,2,eventCount});
+    exec("CREATE INDEX constraint_b ON constraints(fiber_b); COMMIT; PRAGMA foreign_keys=ON;");
+    if(progress)progress({"export_indexes",2,2,eventCount});
+    const auto validationStart=std::chrono::steady_clock::now();
+    stats["index_and_commit_seconds"]=std::chrono::duration<double>(validationStart-finalizationStart).count();
     auto integrity=prepare("PRAGMA quick_check");
     if(sqlite3_step(integrity.get())!=SQLITE_ROW || std::string(reinterpret_cast<const char*>(sqlite3_column_text(integrity.get(),0)))!="ok")throw std::runtime_error("Constraint database integrity check failed");
     auto fk=prepare("PRAGMA foreign_key_check");if(sqlite3_step(fk.get())!=SQLITE_DONE)throw std::runtime_error("Constraint database foreign key failure");
-    fk.reset();integrity.reset();insert.reset();fiber.reset();meta.reset();db.reset();
+    fk.reset();integrity.reset();inserts.clear();fiber.reset();meta.reset();
+    stats["validation_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-validationStart).count();
+    stats["index_and_validation_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-finalizationStart).count();
+    const auto persistStart=std::chrono::steady_clock::now();
+    if(options.inMemory) {
+        if(progress)progress({"export_persist",0,1,eventCount});
+        sqlite3* destinationRaw=nullptr;
+        const auto destinationName=temporary.u8string();
+        const int rc=sqlite3_open_v2(reinterpret_cast<const char*>(destinationName.c_str()),
+            &destinationRaw,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_NOMUTEX,nullptr);
+        std::unique_ptr<sqlite3,decltype(&sqlite3_close)> destination(destinationRaw,sqlite3_close);
+        if(rc!=SQLITE_OK)throw std::runtime_error("Cannot create persisted constraint database");
+        sqlite3_backup* backup=sqlite3_backup_init(destination.get(),"main",db.get(),"main");
+        if(!backup)throw std::runtime_error(sqlite3_errmsg(destination.get()));
+        const int copied=sqlite3_backup_step(backup,-1);
+        const int finished=sqlite3_backup_finish(backup);
+        if(copied!=SQLITE_DONE || finished!=SQLITE_OK)
+            throw std::runtime_error("Cannot persist in-memory constraint database: "+std::string(sqlite3_errmsg(destination.get())));
+        destination.reset();
+        if(progress)progress({"export_persist",1,1,eventCount});
+    }
+    db.reset();
     std::filesystem::rename(temporary,output);
     stats["export_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
+    stats["persist_seconds"]=std::chrono::duration<double>(std::chrono::steady_clock::now()-persistStart).count();
     stats["database_bytes"]=std::filesystem::file_size(output);
     return stats;
 }

@@ -11,6 +11,9 @@ from pathlib import Path
 def run(config):
     if 'commands' not in config and len(config)!=1:
         raise ValueError('Select exactly one named workflow')
+    if 'fiber_hv_label_comparison' in config:
+        from .fiber_hv_label_comparison import run as compare_hv
+        return compare_hv(config['fiber_hv_label_comparison'])
     if 'fiber_pair_connectivity' in config:
         from .fiber_pair_connectivity import run_pair_connectivity
         return run_pair_connectivity(config['fiber_pair_connectivity'])

@@ -209,6 +209,10 @@ FiberCollection::FiberCollection(const std::filesystem::path& path, size_t cache
     Statement spatialIndex(impl_->db, "SELECT id FROM block_bounds LIMIT 0");
 }
 FiberCollection::~FiberCollection() = default;
+void FiberCollection::beginReadSnapshot()
+{
+    check(sqlite3_exec(impl_->db,"BEGIN",nullptr,nullptr,nullptr),impl_->db);
+}
 std::string FiberCollection::metadata(const std::string& key) const
 {
     Statement s(impl_->db, "SELECT value FROM metadata WHERE key=?");

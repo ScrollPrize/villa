@@ -147,6 +147,7 @@ resource requests; otherwise those come from each supplied regression request.
 | `fiber_forced_selectable_audit` | Exact parent-geometry/hypothesis transfer and full objective comparison on selectable graphs. |
 | `paired_winding_review` | Matched-cohort changed-winding plots, dotted fibers and sign-neighbor highlighting. |
 | `fiber_direction_review` | Direction disagreement audits and OBJ exports; `normal_visualization` configures the shared normal-arrow exporter. |
+| `fiber_hv_label_comparison` | Compare an H/V-stage `solution` NPZ with `afv` family labels. Writes JSON to `report`; optional `per_fiber_output` NPZ and `probability_cutoffs`. Reports count/arc disagreement and confusion by family, keeping normal-stage and H/V-stage exclusions separate. Source labels are comparison-only. |
 | `fiber_uv_refinement_inspection` | Matched before/after deformations, movement in voxels and windings, plots. |
 | `fiber_fixed_metric_probe`, `fiber_optimizer_probe`, `fiber_lbfgs_audit` | Fixed-meeting/length/angle probes and optimizer/conditioning comparisons. Fixed-metric rendering is opt-in via `visualization`. |
 | `fiber_uv_surface` / `fiber_uv_surface_audit` | H-anchored tifxyz surface construction and audit from historical categorical U/V solutions. |
