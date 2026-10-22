@@ -1530,23 +1530,39 @@ UUID_TEXT = re.compile(
 
 def check_legacy_fiber_uuid(client: BridgeClient, results: Results,
                             fiber_volpkg: str, fiber_file: Path) -> None:
-    """A fiber file without a uuid gets one persisted on load, and keeps it
-    across a save and a reopen (the identity must not change per load)."""
-    def stored_uuid() -> str | None:
-        return json.loads(fiber_file.read_text()).get("uuid")
+    """Resolve missing legacy identity and shape after volume activation,
+    then preserve both across save and reopen."""
+    def stored_metadata() -> tuple:
+        data = json.loads(fiber_file.read_text())
+        return data.get("uuid"), data.get("coordinate_base_shape_zyx")
 
     try:
+        original = json.loads(fiber_file.read_text())
         client.call("volume.open", {"path": fiber_volpkg}, timeout=RPC_TIMEOUT)
-        first = stored_uuid()
+        first, first_shape = stored_metadata()
         client.call("fiber.save", {}, timeout=RPC_TIMEOUT)
-        after_save = stored_uuid()
+        after_save, saved_shape = stored_metadata()
         client.call("volume.open", {"path": fiber_volpkg}, timeout=RPC_TIMEOUT)
-        after_reopen = stored_uuid()
+        after_reopen, reopened_shape = stored_metadata()
         results.record(
             "legacy_fiber_uuid_persisted",
             isinstance(first, str) and UUID_TEXT.fullmatch(first) is not None
             and first == after_save == after_reopen,
             f"on_load={first} after_save={after_save} after_reopen={after_reopen}",
+        )
+        results.record(
+            "legacy_fiber_coordinate_shape_persisted",
+            first_shape == saved_shape == reopened_shape == [16, 16, 16],
+            f"on_load={first_shape} after_save={saved_shape} "
+            f"after_reopen={reopened_shape}",
+        )
+        reopened = json.loads(fiber_file.read_text())
+        results.record(
+            "legacy_fiber_geometry_preserved",
+            original["control_points"] == [
+                point["position"] for point in reopened["control_points"]]
+            and original["line_points"] == reopened["line_points"],
+            "metadata backfill preserves stored geometry",
         )
     except Exception as e:  # noqa: BLE001
         results.record("legacy_fiber_uuid_persisted", False,
@@ -1774,10 +1790,16 @@ def main() -> int:
         # Use a separate clean project: broken-link fixtures deliberately
         # defer all load-time repair writes, including UUID backfills.
         legacy_fiber_volpkg = tmp_path / "legacy-fiber.volpkg.json"
-        legacy_fiber_volpkg.write_text(json.dumps({"name": "legacy-fiber", "version": 1}))
+        legacy_fiber_volpkg.write_text(json.dumps({
+            "name": "legacy-fiber",
+            "version": 1,
+            "volumes": ["volumes"],
+        }))
         legacy_fiber_dir = tmp_path / "fibers" / legacy_fiber_volpkg.name
         legacy_fiber_dir.mkdir(parents=True)
         legacy_fiber = legacy_fiber_dir / "fiber_legacy.json"
+        # Both fields are intentionally absent: package fibers load before
+        # volume activation, which must complete the deferred metadata save.
         legacy_fiber.write_text(json.dumps({
             "type": "vc3d_fiber",
             "version": 1,

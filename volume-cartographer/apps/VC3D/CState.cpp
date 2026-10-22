@@ -201,10 +201,16 @@ std::shared_ptr<VolumePkg> CState::vpkg() const { return _vpkg; }
 
 void CState::setVpkg(std::shared_ptr<VolumePkg> pkg)
 {
-    if (_vpkg != pkg) {
-        clearFocusBounds();
-    }
+    const bool changed = _vpkg != pkg;
     _vpkg = std::move(pkg);
+    if (changed) {
+        // Restore without invoking setters: switching projects must not persist
+        // the previous project's bounds into either project.
+        _focusBounds = _vpkg ? _vpkg->focusBounds() : std::nullopt;
+        _focusBoundsEnabled = _vpkg && _vpkg->focusBoundsEnabled();
+        ++_focusBoundsRevision;
+        emit focusBoundsChanged();
+    }
     emit vpkgChanged(_vpkg);
 }
 
@@ -226,7 +232,9 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
     if (_currentVolume == vol) {
         resolveCurrentVolumeId();
+        ++_focusBoundsRevision;
         emit volumeChanged(_currentVolume, _currentVolumeId);
+        emit focusBoundsChanged();
         return;
     }
     _currentVolume = std::move(vol);
@@ -237,14 +245,43 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
                   vc3d::opendata::coordinateIdentityForVolume(
                       *_vpkg, _currentVolumeId))
             : utils::Json::object());
+    ++_focusBoundsRevision;
     emit volumeChanged(_currentVolume, _currentVolumeId);
+    emit focusBoundsChanged();
 }
 
-std::optional<Rect3D> CState::focusBounds() const { return _focusBounds; }
+vc3d::annotation::AnnotationFrame CState::annotationFrame() const
+{
+    if (!_currentVolume)
+        return {};
+    // Exact coordinate tags outrank rounded physical resolutions, including
+    // when coordinateIdentityForVolume cannot resolve a physical resolution.
+    std::optional<double> exactFactor;
+    std::optional<double> stampedResolution;
+    if (_vpkg && !_currentVolumeId.empty()) {
+        if (const auto identity = vc3d::opendata::coordinateIdentityFromTags(
+                _vpkg->volumeTags(_currentVolumeId))) {
+            exactFactor = static_cast<double>(identity->sourceCoordinateScaleFactor);
+            if (identity->sourceOriginalResolution > 0.0)
+                stampedResolution = identity->sourceOriginalResolution;
+        }
+    }
+    return vc3d::annotation::deriveAnnotationFrame(
+        _currentVolume->voxelSize(), _currentVolume->baseScaleLevel(),
+        exactFactor, stampedResolution,
+        {static_cast<double>(_currentVolume->sliceWidth()),
+         static_cast<double>(_currentVolume->sliceHeight()),
+         static_cast<double>(_currentVolume->numSlices())});
+}
+
+std::optional<Rect3D> CState::focusBounds() const
+{
+    return vc3d::annotation::focusBoundsInVolume(_focusBounds, annotationFrame());
+}
 
 std::optional<Rect3D> CState::activeFocusBounds() const
 {
-    return _focusBoundsEnabled ? _focusBounds : std::nullopt;
+    return _focusBoundsEnabled ? focusBounds() : std::nullopt;
 }
 
 bool CState::focusBoundsEnabled() const { return _focusBoundsEnabled; }
@@ -253,19 +290,25 @@ uint64_t CState::focusBoundsRevision() const { return _focusBoundsRevision; }
 
 void CState::setFocusBounds(const Rect3D& bounds)
 {
+    const auto inAnnotationFrame =
+        vc3d::annotation::focusBoundsInAnnotationFrame(bounds, annotationFrame());
+    if (!inAnnotationFrame)
+        return;
     Rect3D normalized;
     for (int axis = 0; axis < 3; ++axis) {
-        if (!std::isfinite(bounds.low[axis]) || !std::isfinite(bounds.high[axis])) {
+        if (!std::isfinite(inAnnotationFrame->low[axis]) ||
+            !std::isfinite(inAnnotationFrame->high[axis])) {
             return;
         }
-        normalized.low[axis] = std::min(bounds.low[axis], bounds.high[axis]);
-        normalized.high[axis] = std::max(bounds.low[axis], bounds.high[axis]);
+        normalized.low[axis] = std::min(inAnnotationFrame->low[axis], inAnnotationFrame->high[axis]);
+        normalized.high[axis] = std::max(inAnnotationFrame->low[axis], inAnnotationFrame->high[axis]);
     }
     if (_focusBounds && _focusBounds->low == normalized.low &&
         _focusBounds->high == normalized.high) {
         return;
     }
     _focusBounds = normalized;
+    if (_vpkg) _vpkg->setFocusBounds(_focusBounds, _focusBoundsEnabled);
     ++_focusBoundsRevision;
     emit focusBoundsChanged();
 }
@@ -276,6 +319,7 @@ void CState::setFocusBoundsEnabled(bool enabled)
         return;
     }
     _focusBoundsEnabled = enabled;
+    if (_vpkg) _vpkg->setFocusBounds(_focusBounds, _focusBoundsEnabled);
     ++_focusBoundsRevision;
     emit focusBoundsChanged();
 }
@@ -287,6 +331,7 @@ void CState::clearFocusBounds()
     }
     _focusBounds.reset();
     _focusBoundsEnabled = false;
+    if (_vpkg) _vpkg->setFocusBounds(_focusBounds, false);
     ++_focusBoundsRevision;
     emit focusBoundsChanged();
 }

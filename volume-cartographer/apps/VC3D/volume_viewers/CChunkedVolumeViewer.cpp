@@ -1,4 +1,5 @@
 #include "CChunkedVolumeViewer.hpp"
+#include "SurfaceRenderPolicy.hpp"
 
 #include <atomic>
 
@@ -2223,18 +2224,6 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
               *ctx.overlayChunkArray, ctx.overlayStartLevel,
               ctx.fbW, ctx.fbH, pixelsPerLevel0VolumeVoxel)
         : 0;
-    // A tile-fill-preferring workspace queues at most one fallback level of
-    // interactive demand. Every level's resident chunks still paint; this
-    // only stops the whole-view coarse prefetch from flooding the shared
-    // scheduler's interactive queue, which the (background-priority)
-    // SurfaceCache tile fills would otherwise wait behind at the
-    // interactive-burst ratio.
-    if (ctx.preferSurfaceTileFills) {
-        options.queuedFallbackLevels =
-            std::min(options.queuedFallbackLevels, 1);
-        overlayOptions.queuedFallbackLevels =
-            std::min(overlayOptions.queuedFallbackLevels, 1);
-    }
     auto generatedSurfaceCoords = [&](bool needNormals) {
         cv::Mat_<cv::Vec3f> coords;
         cv::Mat_<cv::Vec3f> normals;
@@ -2637,6 +2626,15 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
     // interactive demand is queued. A tile-fill-preferring viewer therefore
     // withholds the unused demand; a frame that falls back to raw sampling
     // (band exit, no cache yet) publishes it as before.
+    // Apply the workspace preference per channel, only after resolving whether
+    // its cache can serve this frame. Direct sampling needs all fallback levels.
+    options.queuedFallbackLevels = vc::render::surfaceQueuedFallbackLevels(
+        options.queuedFallbackLevels, ctx.preferSurfaceTileFills,
+        baseCacheUsableForPrepass);
+    overlayOptions.queuedFallbackLevels = vc::render::surfaceQueuedFallbackLevels(
+        overlayOptions.queuedFallbackLevels, ctx.preferSurfaceTileFills,
+        overlayCacheUsableForPrepass);
+
     const bool skipBaseViewDemand =
         ctx.preferSurfaceTileFills && !planeView && baseCacheUsableForPrepass;
     const bool skipOverlayViewDemand =
@@ -3401,10 +3399,10 @@ std::optional<CChunkedVolumeViewer::PendingRenderJob> CChunkedVolumeViewer::capt
     job.surfaceCache = _surfaceCache;
     job.overlaySurfaceCache = _overlaySurfaceCache;
     job.surfaceCacheEpoch = _surfaceCacheEpoch;
-    const bool focusBoundsSupported =
-        dynamic_cast<PlaneSurface*>(surf.get()) != nullptr ||
-        property("vc_viewer_role").toString() == QStringLiteral("annotation");
-    if (focusBoundsSupported && _state) {
+    // Focus bounds are in volume base coordinates for every view, including
+    // segment and atlas QuadSurfaces. Mask the generated coordinates, not UVs;
+    // the underlying surface and its cached tiles remain unchanged.
+    if (_state) {
         job.focusBoundsBase = _state->activeFocusBounds();
     }
     job.genCache = _genSurfaceCache;

@@ -2,12 +2,18 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/render/PersistentZarrCacheBudget.hpp"
+#include "vc/core/render/detail/CacheAgeBuckets.hpp"
 
 #include <atomic>
 #include <chrono>
 #include <fstream>
 #include <random>
 #include <thread>
+#include <cstdlib>
+#include <ctime>
+#include <iostream>
+#include <future>
+#include <map>
 
 namespace fs = std::filesystem;
 using Budget = vc::render::PersistentZarrCacheBudget;
@@ -57,6 +63,293 @@ bool publish(Budget& budget, const fs::path& path, std::size_t size)
 }
 
 } // namespace
+
+TEST_CASE("disk budget synthetic eviction benchmark")
+{
+    if (!std::getenv("VC_CACHE_BUDGET_BENCH"))
+        return;
+    constexpr int count = 20000;
+    const auto root = tempRoot("benchmark");
+    for (int i = 0; i < count; ++i)
+        writeBytes(volumeChunk(root, i), 100);
+    auto budget = Budget::configure(root, {}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(1000000000)));
+    budget->waitForIdle();
+    const auto start = std::chrono::steady_clock::now();
+    const auto cpu = std::clock();
+    budget->updateLimits({count * 50, 0});
+    budget->waitForIdle();
+    const auto trimmed = std::chrono::steady_clock::now();
+    for (int i = count; i < count + 200; ++i)
+        REQUIRE(publish(*budget, volumeChunk(root, i), 100));
+    budget->waitForIdle();
+    const auto finished = std::chrono::steady_clock::now();
+    std::cout << "budget_bench entries=" << count
+              << " trim_s=" << std::chrono::duration<double>(trimmed - start).count()
+              << " churn_s=" << std::chrono::duration<double>(finished - trimmed).count()
+              << " cpu_s=" << double(std::clock() - cpu) / CLOCKS_PER_SEC << '\n';
+    fs::remove_all(root);
+}
+
+TEST_CASE("generation buckets lazily refresh age and survive wrap and long idle gaps")
+{
+    using Ages = vc::render::detail::CacheAgeBuckets<int>;
+    Ages ages(100);
+    const auto old = ages.insert(1, 70);
+    const auto middle = ages.insert(2, 90);
+    const auto young = ages.insert(3, 99);
+    ages.touch(old, 100);
+    CHECK(ages.takeOldest() == middle);
+    ages.erase(middle);
+    ages.suspend(young);
+    CHECK(ages.takeOldest() == old);
+    ages.resume(old);
+    ages.advance(132);
+    ages.resume(young);
+    const auto newest = ages.insert(4, 132);
+    const auto first = ages.takeOldest();
+    CHECK(first != newest);
+    ages.erase(first);
+    const auto second = ages.takeOldest();
+    CHECK(second != newest);
+    ages.erase(second);
+    ages.advance(10000);
+    CHECK(ages.takeOldest() == newest);
+    ages.erase(newest);
+    CHECK(ages.empty());
+    const auto reused = ages.insert(5, 10000);
+    CHECK(ages.value(ages.takeOldest()) == 5);
+    ages.erase(reused);
+}
+
+TEST_CASE("generation bucket lazy work is bounded and pinned slots survive recycling")
+{
+    using Ages = vc::render::detail::CacheAgeBuckets<int>;
+    Ages ages(100);
+    std::vector<Ages::Handle> ids;
+    for (int i = 0; i < 1000; ++i) {
+        ids.push_back(ages.insert(i, 80));
+        ages.touch(ids.back(), 100);
+    }
+    CHECK(ages.takeOldest(8) == Ages::none);
+    CHECK_FALSE(ages.empty());
+    ages.suspend(ids.back());
+    ages.advance(1000);
+    ages.touch(ids.back(), 1000);
+    ages.resume(ids.back());
+    for (int i = 0; i < 999; ++i) {
+        const auto id = ages.takeOldest();
+        REQUIRE(id != Ages::none);
+        CHECK(id != ids.back());
+        ages.erase(id);
+    }
+    CHECK(ages.takeOldest() == ids.back());
+}
+
+TEST_CASE("generation buckets match a reference age model under mixed operations")
+{
+    using Ages = vc::render::detail::CacheAgeBuckets<int>;
+    std::uint64_t now = 100;
+    Ages ages(now);
+    struct Reference { std::uint64_t generation; bool pinned; };
+    std::map<Ages::Handle, Reference> reference;
+    std::mt19937 random(17);
+    auto ageClass = [&](std::uint64_t gen) { return std::max(gen, now - 32); };
+    for (int step = 0; step < 10000; ++step) {
+        const auto op = random() % 6;
+        if (op == 0 || reference.empty()) {
+            reference.emplace(ages.insert(step, now), Reference{now, false});
+        } else if (op == 1) {
+            now += random() % 70;
+            ages.advance(now);
+        } else if (op == 2) {
+            const auto id = ages.takeOldest(10001);
+            std::uint64_t expected = now + 1;
+            for (const auto& [key, entry] : reference)
+                if (!entry.pinned) expected = std::min(expected, ageClass(entry.generation));
+            if (expected == now + 1) {
+                CHECK(id == Ages::none);
+            } else {
+                REQUIRE(id != Ages::none);
+                CHECK_FALSE(reference.at(id).pinned);
+                CHECK(ageClass(reference.at(id).generation) == expected);
+                reference.erase(id);
+                ages.erase(id);
+            }
+        } else {
+            auto it = reference.begin();
+            std::advance(it, random() % reference.size());
+            if (op == 3) {
+                it->second.generation = now;
+                ages.touch(it->first, now);
+            } else if (op == 4) {
+                it->second.pinned = !it->second.pinned;
+                if (it->second.pinned) ages.suspend(it->first);
+                else ages.resume(it->first);
+            } else {
+                ages.erase(it->first);
+                reference.erase(it);
+            }
+        }
+    }
+}
+
+TEST_CASE("slow vacuum space query does not block readers writers or statistics")
+{
+    const auto root = tempRoot("async");
+    std::atomic<bool> armed{false};
+    std::promise<void> entered, release;
+    auto enteredFuture = entered.get_future();
+    auto releaseFuture = release.get_future().share();
+    auto budget = Budget::configure(root, {}, [&](const fs::path&, std::error_code& ec) {
+        ec.clear();
+        if (armed.exchange(false)) {
+            entered.set_value();
+            releaseFuture.wait();
+        }
+        return fs::space_info{100000, 90000, 90000};
+    });
+    budget->waitForIdle();
+    CHECK(publish(*budget, volumeChunk(root, 0), 100));
+    budget->waitForIdle();
+    armed = true;
+    budget->updateLimits({50, 0});
+    const bool enteredInTime = enteredFuture.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    CHECK(enteredInTime);
+    auto work = std::async(std::launch::async, [&] {
+        auto pin = budget->pinRead(volumeChunk(root, 0));
+        CHECK(budget->stats().managedBytes == 100);
+        const bool written = publish(*budget, volumeChunk(root, 1), 10);
+        pin.complete();
+        return written;
+    });
+    const auto state = work.wait_for(std::chrono::seconds(5));
+    release.set_value(); // Unblock even if the assertion failed.
+    CHECK(state == std::future_status::ready);
+    CHECK(work.get());
+    budget->waitForIdle();
+    CHECK(budget->stats().managedBytes <= 50);
+    fs::remove_all(root);
+}
+
+TEST_CASE("pinned cache survives pressure and vacuum retries after unpin")
+{
+    const auto root = tempRoot("pinned");
+    auto budget = Budget::configure(root, {}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(900)));
+    budget->waitForIdle();
+    CHECK(publish(*budget, volumeChunk(root, 0), 50));
+    auto pin = budget->pinRead(volumeChunk(root, 0));
+    budget->updateLimits({0, 0});
+    budget->waitForIdle();
+    CHECK(fs::exists(volumeChunk(root, 0)));
+    CHECK(budget->stats().managedBytes == 50);
+    pin.complete();
+    budget->waitForIdle();
+    CHECK_FALSE(fs::exists(volumeChunk(root, 0)));
+    CHECK(budget->stats().managedBytes == 0);
+    fs::remove_all(root);
+}
+
+TEST_CASE("deleted files and failed removals cannot cause a vacuum busy loop")
+{
+    const auto root = tempRoot("delete_failure");
+    const auto missing = volumeChunk(root, 0), blocked = volumeChunk(root, 1);
+    writeBytes(missing, 10);
+    writeBytes(blocked, 10);
+    auto budget = Budget::configure(root, {}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(900)));
+    budget->waitForIdle();
+    fs::remove(missing);
+    fs::remove(blocked);
+    writeBytes(blocked / "child", 1); // Nonempty directory: portable remove failure.
+    budget->updateLimits({0, 0});
+    budget->waitForIdle();
+    CHECK(budget->stats().managedBytes == 10);
+    fs::remove_all(blocked);
+    budget->updateLimits({0, 0});
+    budget->waitForIdle();
+    CHECK(budget->stats().managedBytes == 0);
+    fs::remove_all(root);
+}
+
+TEST_CASE("ordinary subtree operations do not inventory unrelated new files")
+{
+    const auto root = tempRoot("no_rescan");
+    writeBytes(volumeChunk(root, 0), 10);
+    auto budget = Budget::configure(root, {}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(900)));
+    budget->waitForIdle();
+    writeBytes(root / "other" / "level_0" / "0" / "0" / "0.bin", 20);
+    std::error_code ec;
+    CHECK(budget->moveCacheSubtree(root / "volume-hash", root / "moved", ec));
+    budget->waitForIdle();
+    CHECK(budget->stats().managedBytes == 10);
+    CHECK(budget->removeCacheSubtree(root / "moved", ec));
+    budget->waitForIdle();
+    CHECK(budget->stats().managedBytes == 0);
+    fs::remove_all(root);
+}
+
+TEST_CASE("writes concurrent with startup inventory are merged exactly once")
+{
+    const auto root = tempRoot("startup_writes");
+    for (int i = 0; i < 1000; ++i)
+        writeBytes(volumeChunk(root, i), 1);
+    auto budget = Budget::configure(root, {}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(100000)));
+    for (int i = 0; i < 100; ++i) {
+        CHECK(publish(*budget, volumeChunk(root, i), 3));
+        CHECK(publish(*budget, volumeChunk(root, 1000 + i), 5));
+    }
+    auto cancelled = budget->reserveWrite(volumeChunk(root, 500), 999);
+    cancelled.cancel();
+    budget->waitForIdle();
+    CHECK(budget->stats().managedBytes == 1700);
+    fs::remove_all(root);
+}
+
+TEST_CASE("idle status and reads do not poll the filesystem free space")
+{
+    const auto root = tempRoot("no_poll");
+    std::atomic<int> calls{0};
+    auto budget = Budget::configure(root, {}, [&](const fs::path&, std::error_code& ec) {
+        ++calls;
+        ec.clear();
+        return fs::space_info{1000, 900, 900};
+    });
+    budget->waitForIdle();
+    CHECK(publish(*budget, volumeChunk(root, 0), 10));
+    budget->waitForIdle();
+    const auto before = calls.load();
+    for (int i = 0; i < 100; ++i) {
+        auto pin = budget->pinRead(volumeChunk(root, 0));
+        pin.complete();
+        CHECK(budget->stats().managedBytes == 10);
+    }
+    budget->waitForIdle();
+    CHECK(calls.load() == before);
+    fs::remove_all(root);
+}
+
+TEST_CASE("moving a subtree replaces stale destination accounting")
+{
+    const auto root = tempRoot("move_stale");
+    writeBytes(volumeChunk(root, 0), 10);
+    writeBytes(root / "moved" / "level_0" / "0" / "0" / "0.bin", 20);
+    auto budget = Budget::configure(root, {}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(900)));
+    budget->waitForIdle();
+    fs::remove_all(root / "moved");
+    std::error_code ec;
+    CHECK(budget->moveCacheSubtree(root / "volume-hash", root / "moved", ec));
+    budget->waitForIdle();
+    CHECK(budget->stats().managedBytes == 10);
+    budget->updateLimits({0, 0});
+    budget->waitForIdle();
+    CHECK(budget->stats().managedBytes == 0);
+    fs::remove_all(root);
+}
 
 TEST_CASE("budget discovers only remote-volume and Lasagna Zarr data")
 {
@@ -149,7 +442,7 @@ TEST_CASE("budget-coordinated cache replacement removes stale subtree accounting
     const auto oldVolume = root / "old-volume";
     const auto oldChunk = oldVolume / "level_0" / "0" / "0" / "0.bin";
     writeBytes(oldChunk, 100);
-    auto budget = Budget::configure(root, {100, 0}, spaceWith(
+    auto budget = Budget::configure(root, {101, 0}, spaceWith(
         std::make_shared<std::atomic<std::uint64_t>>(900)));
     budget->waitForIdle();
     REQUIRE(budget->stats().managedBytes == 100);
@@ -211,24 +504,21 @@ TEST_CASE("budget discovers native Zarr v3 shard payloads")
     fs::remove_all(root);
 }
 
-TEST_CASE("protected metadata writes enforce free space without becoming evictable")
+TEST_CASE("protected metadata remains writable under disk pressure and is never evicted")
 {
     const auto root = tempRoot("protected_metadata");
     const auto metadata = root / "volume-hash" / "zarr.json";
-    auto free = std::make_shared<std::atomic<std::uint64_t>>(55);
+    auto free = std::make_shared<std::atomic<std::uint64_t>>(40);
     auto budget = Budget::configure(root, {1, 50}, spaceWith(free));
     budget->waitForIdle();
-
-    CHECK_FALSE(static_cast<bool>(
-        budget->reserveProtectedWrite(metadata, 10)));
-    free->store(60);
     auto reservation = budget->reserveProtectedWrite(metadata, 10);
     REQUIRE(static_cast<bool>(reservation));
     writeBytes(metadata, 10);
     reservation.commit();
-
+    budget->waitForIdle();
     CHECK(fs::is_regular_file(metadata));
     CHECK(budget->stats().managedBytes == 0);
+    CHECK(budget->stats().lowSpace);
     budget->updateLimits({0, 0});
     budget->waitForIdle();
     CHECK(fs::is_regular_file(metadata));
@@ -275,7 +565,7 @@ TEST_CASE("a containing root cannot be registered after its nested root")
     Budget::resetRegistryForTesting();
 }
 
-TEST_CASE("successful reads touch LRU and the oldest unpinned entry is evicted")
+TEST_CASE("successful reads refresh generations without touching filesystem timestamps")
 {
     const auto root = tempRoot("lru");
     const auto old = volumeChunk(root, 0);
@@ -291,6 +581,7 @@ TEST_CASE("successful reads touch LRU and the oldest unpinned entry is evicted")
 
     auto pin = budget->pinRead(old);
     pin.complete(true);
+    CHECK(fs::last_write_time(old) == base);
     budget->updateLimits({10, 0});
     budget->waitForIdle();
     CHECK(fs::exists(old));
@@ -313,79 +604,50 @@ TEST_CASE("lowering a maximum starts an immediate background trim")
     fs::remove_all(root);
 }
 
-TEST_CASE("unlimited maximum still enforces the free-space reserve")
+TEST_CASE("vacuum restores minimum free space including the existing deficit")
 {
     const auto root = tempRoot("reserve");
-    writeBytes(volumeChunk(root, 0), 20);
-    auto free = std::make_shared<std::atomic<std::uint64_t>>(55);
-    auto budget = Budget::configure(root, {std::nullopt, 50}, spaceWith(free));
+    const auto old = volumeChunk(root, 0);
+    const auto fresh = volumeChunk(root, 1);
+    writeBytes(old, 20);
+    fs::last_write_time(old, fs::file_time_type::clock::now() - std::chrono::hours(1));
+    auto budget = Budget::configure(root, {std::nullopt, 50},
+        [old, fresh](const fs::path&, std::error_code& ec) {
+            ec.clear();
+            std::uint64_t used = 0;
+            for (const auto& path : {old, fresh}) {
+                std::error_code ignored;
+                const auto size = fs::file_size(path, ignored);
+                if (!ignored) used += size;
+            }
+            return fs::space_info{1000, 75 - used, 75 - used};
+        });
     budget->waitForIdle();
-    CHECK(publish(*budget, volumeChunk(root, 1), 10));
-    CHECK_FALSE(fs::exists(volumeChunk(root, 0)));
+    CHECK(publish(*budget, fresh, 10));
+    budget->waitForIdle();
+    CHECK_FALSE(fs::exists(old));
+    CHECK(fs::exists(fresh));
     CHECK(budget->stats().managedBytes == 10);
+    CHECK(budget->stats().freeBytes >= 60);
     fs::remove_all(root);
 }
 
-TEST_CASE("equal-size replacements reserve their full temporary payload")
-{
-    const auto root = tempRoot("replacement_reserve");
-    const auto target = volumeChunk(root, 0);
-    writeBytes(target, 10, 'a');
-    auto free = std::make_shared<std::atomic<std::uint64_t>>(59);
-    auto budget = Budget::configure(root, {std::nullopt, 50}, spaceWith(free));
-    budget->waitForIdle();
-
-    CHECK_FALSE(static_cast<bool>(budget->reserveWrite(target, 10)));
-    CHECK(fs::exists(target));
-    free->store(60);
-    CHECK(static_cast<bool>(budget->reserveWrite(target, 10)));
-    fs::remove_all(root);
-}
-
-TEST_CASE("denied oversized writes do not evict existing entries")
-{
-    const auto root = tempRoot("denied_no_evict");
-    const auto first = volumeChunk(root, 0);
-    const auto second = volumeChunk(root, 1);
-    writeBytes(first, 30);
-    writeBytes(second, 30);
-    auto budget = Budget::configure(root, {100, 0}, spaceWith(
-        std::make_shared<std::atomic<std::uint64_t>>(900)));
-    budget->waitForIdle();
-
-    CHECK_FALSE(static_cast<bool>(budget->reserveWrite(volumeChunk(root, 2), 101)));
-    CHECK(fs::exists(first));
-    CHECK(fs::exists(second));
-    CHECK(budget->stats().managedBytes == 60);
-    fs::remove_all(root);
-}
-
-TEST_CASE("oversized writes and concurrent reservations cannot exceed a maximum")
+TEST_CASE("concurrent and oversized reservations do not block on budget enforcement")
 {
     const auto root = tempRoot("concurrent");
-    auto budget = Budget::configure(root, {100, 0}, spaceWith(
-        std::make_shared<std::atomic<std::uint64_t>>(900)));
+    auto budget = Budget::configure(root, {100, 50}, spaceWith(
+        std::make_shared<std::atomic<std::uint64_t>>(55)));
     budget->waitForIdle();
-    CHECK_FALSE(static_cast<bool>(budget->reserveWrite(volumeChunk(root, 0), 101)));
-    auto first = budget->reserveWrite(volumeChunk(root, 0), 60);
+    auto first = budget->reserveWrite(volumeChunk(root, 0), 101);
+    auto second = budget->reserveWrite(volumeChunk(root, 1), 50);
     REQUIRE(static_cast<bool>(first));
-    CHECK_FALSE(static_cast<bool>(budget->reserveWrite(volumeChunk(root, 1), 50)));
-    first.cancel();
-    CHECK(static_cast<bool>(budget->reserveWrite(volumeChunk(root, 1), 50)));
-    fs::remove_all(root);
-}
-
-TEST_CASE("outstanding reservations count against the free-space reserve")
-{
-    const auto root = tempRoot("free_concurrent");
-    auto free = std::make_shared<std::atomic<std::uint64_t>>(55);
-    auto budget = Budget::configure(root, {std::nullopt, 50}, spaceWith(free));
+    REQUIRE(static_cast<bool>(second));
+    writeBytes(volumeChunk(root, 0), 101);
+    first.commit();
+    second.cancel();
     budget->waitForIdle();
-    auto first = budget->reserveWrite(volumeChunk(root, 0), 4);
-    REQUIRE(static_cast<bool>(first));
-    CHECK_FALSE(static_cast<bool>(budget->reserveWrite(volumeChunk(root, 1), 2)));
-    first.cancel();
-    CHECK(static_cast<bool>(budget->reserveWrite(volumeChunk(root, 1), 2)));
+    CHECK(budget->stats().managedBytes <= 100);
+    CHECK_FALSE(fs::exists(volumeChunk(root, 0)));
     fs::remove_all(root);
 }
 

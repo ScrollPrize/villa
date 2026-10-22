@@ -132,12 +132,34 @@ def detect_backend() -> tuple[str, str]:
     return backend, reason
 
 
-def run(command: list[str], *, dry_run: bool) -> None:
+def run(
+    command: list[str], *, dry_run: bool, environment: dict[str, str] | None = None,
+) -> None:
     import shlex
 
-    print("$ " + shlex.join(command), flush=True)
+    assignments = []
+    if environment is not None:
+        assignments = [
+            f"{name}={environment[name]}"
+            for name in ("CC", "CXX")
+            if environment.get(name) != os.environ.get(name)
+        ]
+    prefix = (shlex.join(assignments) + " ") if assignments else ""
+    print("$ " + prefix + shlex.join(command), flush=True)
     if not dry_run:
-        subprocess.run(command, check=True)
+        subprocess.run(command, check=True, env=environment)
+
+
+def volume_cartographer_build_environment() -> dict[str, str] | None:
+    """Select a sufficiently modern GNU C++ compiler on Linux when available."""
+    if not sys.platform.startswith("linux") or os.environ.get("CC") or os.environ.get("CXX"):
+        return None
+    for version in (15, 14, 13):
+        cc = shutil.which(f"gcc-{version}")
+        cxx = shutil.which(f"g++-{version}")
+        if cc is not None and cxx is not None:
+            return {**os.environ, "CC": cc, "CXX": cxx}
+    return None
 
 
 def installed_packages(python: Path) -> set[str]:
@@ -191,6 +213,10 @@ def environment_check_script(backend: str, skip_cuda_check: bool) -> str:
     """
     lines = [
         "import json, torch",
+        "from pathlib import Path",
+        "import sys",
+        "vc_fiberlets = Path(sys.executable).with_name('vc_fiberlets.exe' if sys.platform == 'win32' else 'vc_fiberlets')",
+        "assert vc_fiberlets.is_file(), 'vc_fiberlets is missing from the venv'",
         "import vesuvius.neural_tracing.fiber_trace_3d.infer as fiber_infer",
         "print(json.dumps({'torch': torch.__version__,"
         " 'torch_cuda': torch.version.cuda,"
@@ -229,6 +255,11 @@ def main(argv: list[str] | None = None) -> int:
     venv = args.venv.expanduser().resolve()
     project = args.project.resolve()
     venv_python = venv_interpreter(venv)
+    volume_cartographer = project.parent / "volume-cartographer"
+    if not (volume_cartographer / "pyproject.toml").is_file():
+        raise SystemExit(
+            "the Lasagna bootstrap requires the sibling volume-cartographer checkout"
+        )
     print(f"PyTorch backend: {backend} ({reason})", flush=True)
 
     if not venv_python.exists():
@@ -255,6 +286,19 @@ def main(argv: list[str] | None = None) -> int:
             f"torchvision=={build.torchvision}",
         ],
         dry_run=args.dry_run,
+    )
+    run(
+        [
+            uv,
+            "pip",
+            "install",
+            "--python",
+            str(venv_python),
+            "-e",
+            str(volume_cartographer),
+        ],
+        dry_run=args.dry_run,
+        environment=volume_cartographer_build_environment(),
     )
     run(
         [uv, "pip", "install", "--python", str(venv_python), "-e", str(project)],

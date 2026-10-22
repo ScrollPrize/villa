@@ -141,6 +141,9 @@ struct Run {
     // unrolledLineArclengths), so a point on the drawn curve can be mapped
     // back to a position on the fiber's source line points.
     std::vector<double> arclengths;
+    // Original annotation-frame positions at the same arclength samples.
+    // Display-only, never used by the winding/layout solve.
+    std::vector<cv::Vec3d> worldPoints;
 };
 
 struct PlacedFiber {
@@ -165,6 +168,7 @@ struct PlacedFiber {
     // raw arclength of its source line points exactly.
     double thetaScale = 1.0;
     double offsetRad = 0.0;
+    std::vector<cv::Vec3d> controlWorldPoints;
 };
 
 // The points to DRAW for fiber.runs[runIndex]: the run's own points, except
@@ -174,6 +178,8 @@ struct PlacedFiber {
 // underneath them. Runs away from every gap or damaged span are unchanged.
 [[nodiscard]] std::vector<QPointF> displayRunPoints(const PlacedFiber& fiber,
                                                     std::size_t runIndex);
+[[nodiscard]] std::vector<cv::Vec3d> displayRunWorldPoints(const PlacedFiber& fiber,
+                                                        std::size_t runIndex);
 
 struct PlacedLink {
     uint64_t fiberA = 0;

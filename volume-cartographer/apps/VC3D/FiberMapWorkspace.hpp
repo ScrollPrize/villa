@@ -29,6 +29,7 @@
 #include "FiberMapRuler.hpp"
 #include "FiberMapStaleness.hpp"
 #include "FiberNetworkLayout.hpp"
+#include "vc/core/util/Rect3D.hpp"
 #include "OpenDataVolumeOrientation.hpp"
 
 class LineAnnotationController;
@@ -122,6 +123,8 @@ public:
     // own data, so the wait is for clean pool teardown, not for safety of
     // any shared state.
     ~FiberMapWorkspace() override;
+    // Bounds expressed in the annotation frame, not flattened map coordinates.
+    void setFocusBounds(std::optional<Rect3D> bounds);
 
 signals:
     void openFiberAtControlPointRequested(uint64_t fiberId, int controlPointIndex);
@@ -142,6 +145,9 @@ protected:
     void hideEvent(QHideEvent* event) override;
 
 private:
+    void updateFocusBounds();
+    std::optional<Rect3D> _focusBounds;
+    bool _focusBoundsDirty = false;
     // Scene-space copy of the placed fiber (y negated once, so scroll z reads
     // upward) alongside the two path items carrying its geometry.
     struct FiberEntry {

@@ -7,7 +7,10 @@ from torch.utils.data import DataLoader, SubsetRandomSampler
 
 from vesuvius.models.training.train import BaseTrainer
 from vesuvius.models.training.trainers.semi_supervised import ramps
-from vesuvius.models.training.trainers.semi_supervised.two_stream_batch_sampler import TwoStreamBatchSampler
+from vesuvius.models.training.trainers.semi_supervised.two_stream_batch_sampler import (
+    TwoStreamBatchSampler,
+    split_labeled_indices,
+)
 
 
 # reimplemented from https://github.com/HiLab-git/SSL4MIS/blob/master/code/train_uncertainty_aware_mean_teacher_3D.py
@@ -288,27 +291,6 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
                 f"reduce labeled_ratio ({self.labeled_ratio}), or increase dataset size."
             )
         
-        print(
-            f"Semi-supervised split (patch-level): {len(self.labeled_indices)} labeled patches "
-            f"(from {len(labeled_idx)}), {len(self.unlabeled_indices)} unlabeled patches"
-        )
-        print(
-            f"Batch composition: {self.labeled_batch_size} labeled + {unlabeled_batch_size} unlabeled = {self.mgr.train_batch_size} total")
-        
-        batch_sampler = TwoStreamBatchSampler(
-            primary_indices=self.labeled_indices,
-            secondary_indices=self.unlabeled_indices,
-            batch_size=self.mgr.train_batch_size,
-            secondary_batch_size=unlabeled_batch_size
-        )
-        
-        train_dataloader = DataLoader(
-            train_dataset,
-            batch_sampler=batch_sampler,
-            pin_memory=(True if self.device == 'cuda' else False),
-            num_workers=self.mgr.train_num_dataloader_workers
-        )
-        
         # --- choose validation indices ---
         # If an external validation dataset is provided (e.g., via --val-dir),
         # its indices are independent from the training dataset. In that case
@@ -323,10 +305,34 @@ class TrainUncertaintyAwareMeanTeacher(BaseTrainer):
                 print("Using external validation dataset for uncertainty-aware mean teacher; evaluating on full validation set")
             val_indices = list(range(len(val_dataset)))
         else:
-            # Same source - use only labeled indices for validation
-            train_val_split = self.mgr.tr_val_split
-            val_split = int(np.floor((1 - train_val_split) * max(1, len(self.labeled_indices))))
-            val_indices = self.labeled_indices[-val_split:] if val_split > 0 else self.labeled_indices[-5:]
+            self.labeled_indices, val_indices = split_labeled_indices(
+                self.labeled_indices,
+                self.mgr.tr_val_split,
+                self.labeled_batch_size,
+            )
+
+        print(
+            f"Semi-supervised split (patch-level): {len(self.labeled_indices)} "
+            f"labeled train, {len(val_indices)} labeled validation "
+            f"(from {len(labeled_idx)}), {len(self.unlabeled_indices)} "
+            "unlabeled train"
+        )
+        print(
+            f"Batch composition: {self.labeled_batch_size} labeled + {unlabeled_batch_size} unlabeled = {self.mgr.train_batch_size} total")
+
+        batch_sampler = TwoStreamBatchSampler(
+            primary_indices=self.labeled_indices,
+            secondary_indices=self.unlabeled_indices,
+            batch_size=self.mgr.train_batch_size,
+            secondary_batch_size=unlabeled_batch_size
+        )
+
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_sampler=batch_sampler,
+            pin_memory=(True if self.device == 'cuda' else False),
+            num_workers=self.mgr.train_num_dataloader_workers
+        )
 
         val_dataloader = DataLoader(
             val_dataset,

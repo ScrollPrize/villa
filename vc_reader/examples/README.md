@@ -28,8 +28,21 @@ python -m pip install -e '.[all]'
 ```
 
 The `all` extra includes `reader`, `labels`, `transforms`, `torch`, `previews`
-and `bench` dependencies. CUDA extensions still require the
-`VC_READER_ENABLE_CUDA=ON` build option.
+and `bench` dependencies. On a fresh build, CUDA extensions are enabled
+automatically when a CUDA compiler is found; otherwise the build is CPU-only.
+Discovery includes standard toolkit locations such as `/usr/local/cuda`.
+For a toolkit elsewhere, set `CUDACXX=/path/to/nvcc`.
+
+To force a CPU-only build, use:
+
+```bash
+python -m pip install -e '.[all]' \
+  --config-settings=cmake.define.VC_READER_ENABLE_CUDA=OFF
+```
+
+Use `VC_READER_ENABLE_CUDA=ON` to require CUDA and fail if it is unavailable.
+Explicit settings persist in the CMake build cache, so pass `ON` to enable
+CUDA after a previous CPU-only build.
 
 This builds and installs the compiled extensions. The reader notebook needs NumPy
 and Pillow. The surface and training notebooks also need the `labels`

@@ -513,10 +513,10 @@ public:
     // their interactive counterparts are used in connect().
 
     // Writes a vc3d_fiber_collection bundle without opening a dialog.
-    bool exportFibersToPath(const std::filesystem::path& path, double scale,
+    bool exportFibersToPath(const std::filesystem::path& path,
                             QString* errorMessage = nullptr, int* exportedCount = nullptr);
     // Imports a fiber JSON, bundle, or directory without opening a dialog.
-    bool importFibersFromPath(const std::filesystem::path& path, double scale,
+    bool importFibersFromPath(const std::filesystem::path& path,
                               QString* errorMessage = nullptr,
                               int* importedCount = nullptr, int* skippedCount = nullptr);
     // Adds one unlinked vc3d_fiber to the package without reloading the other
@@ -839,11 +839,16 @@ private:
     // same edit on the matching control of every other pane showing this
     // fiber (and their rollback snapshots), and the overlay refreshes.
     // Returns false when nothing changed or the edit was refused.
+    // changedGoalOwners (optional out): the owners whose span GOAL the gap
+    // policy changed with the tag (saved in the same file write, mirrored
+    // into the peers); the caller re-solves those spans (finishBreakEdit). A
+    // gap that formed on a span already cspline changes no goal.
     using ControlPointEdit = std::function<bool(vc3d::line_annotation::LineControlPoint&)>;
     bool applyControlPointEditAndPersist(const std::string& surfaceName,
                                          size_t controlPointIndex,
                                          const QString& pendingSolveMessage,
-                                         const ControlPointEdit& edit);
+                                         const ControlPointEdit& edit,
+                                         std::vector<size_t>* changedGoalOwners = nullptr);
     // Whether adding `tag` to the control (or the matching control of any
     // other pane showing this fiber, or of their rollback snapshots) would
     // combine the kollesis and break tags.
@@ -856,13 +861,61 @@ private:
                                       size_t controlPointIndex,
                                       const char* tag,
                                       bool enabled,
-                                      const QString& pendingSolveMessage);
-    // After a break tag edit: the gap spans that formed take the cubic-spline
-    // goal, those that dissolved while still cspline return to global, each
-    // through applySegmentInterpolationGoals.
-    void reconcileGapGoalsAfterBreakEdit(LineAnnotationSession& session,
-                                         const std::vector<size_t>& gapOwnersBefore,
-                                         bool enabled);
+                                      const QString& pendingSolveMessage,
+                                      std::vector<size_t>* changedGoalOwners = nullptr);
+    // Re-solves the spans owned by `owners` whose goals a committed tag edit
+    // changed (gap formed -> cspline, dissolved -> global): the goals are
+    // already saved and mirrored, so nothing is rolled back but geometry.
+    // Marks the session Unoptimized first (a refused dataset leaves the
+    // goals in place for the save/close finalization). Returns whether a
+    // solve started.
+    bool startCommittedGoalSolve(LineAnnotationSession& session,
+                                 const std::vector<size_t>& owners);
+    // Shared launch of a goal re-solve: geometry snapshot, dirty ranks (or
+    // the whole line when the interior is not certified), rollback when the
+    // solve cannot start. The controls snapshot must already be armed.
+    // interiorOptimized: computed by the caller BEFORE it marks the session
+    // Unoptimized (an optimized interior with nothing pending may be solved
+    // span by span; anything else solves the whole line).
+    // owedOnFailure: the goals are committed (saved), so a solve that cannot
+    // start leaves whole-line work queued (a later partial or
+    // global-goals-only pass must not certify the untouched span).
+    bool launchGoalSolve(LineAnnotationSession& session,
+                         const std::vector<size_t>& dirtyRanks,
+                         bool interiorOptimized,
+                         bool owedOnFailure);
+    // The session's open-tail policy (lone end breaks, kollesis ends) or the
+    // tail distances changed and no solve covers it yet: mark Unoptimized and,
+    // in auto mode, re-trace the tails (a tails-only solve, or a whole-line
+    // one when work is already pending); a running solve is superseded and a
+    // whole-line pass queued. Shared by the tag handlers' scope guards and
+    // the menu rows' Apply (handleTailConfigChanged).
+    void refreshTailsAfterTailPolicyChange(LineAnnotationSession& session, bool wholeLine);
+    // Scope-guard body of the tag handlers: after the edit (on every exit
+    // path, including a refused second end of the span menu), when the
+    // policy differs from `before` and no solve was started, refresh.
+    void refreshTailsIfPolicyChanged(const std::string& surfaceName,
+                                     vc3d::line_annotation::OpenTailPolicy before);
+    // Scope-guard body of the break handlers (point menu, span menu): on
+    // EVERY exit, also after a refused second end, re-solve the gap spans
+    // whose goals the committed tags changed (that solve re-traces the
+    // tails), else refresh the tails if the policy changed.
+    void finishBreakEdit(const std::string& surfaceName,
+                         const std::vector<size_t>& changedGapOwners,
+                         vc3d::line_annotation::OpenTailPolicy before);
+    // Extrapolation / Break extrapolation Apply: a solver-input change that
+    // also invalidates an armed rollback snapshot's geometry.
+    void handleTailConfigChanged(const std::string& surfaceName);
+    // Rollback snapshot bookkeeping: every site that drops the snapshots on
+    // success clears the invalidation flag; every site that RESTORES one
+    // consumes it after the restore (Unoptimized instead of the snapshot's
+    // state when a mirrored tag edit or a tail-distance change made the
+    // snapshot's tails or goals stale).
+    void disarmRollbackSnapshots(LineAnnotationSession& session);
+    void consumeRollbackInvalidation(LineAnnotationSession& session);
+    // The ray length for a pane: the dialog's applied value, else the
+    // persisted setting (inspection panes, headless paths).
+    [[nodiscard]] int breakExtrapolationDistanceVxForPane(const PaneRecord* pane) const;
     // The span menu captured its two controls before a nested event loop; a
     // solve landing meanwhile can reorder the session. A span action runs
     // only if the two are still neighbours in line-position order.
@@ -964,14 +1017,22 @@ private:
     // the fiber-follow service or the inference dataset when it traces),
     // resolved up front; stillValid as above, checked after each yielding
     // helper returns as well.
+    // solveAsLasagna (optional out): set when a single control without
+    // trace inputs is to be solved as Lasagna for this one synchronous solve
+    // (the close/save path must not open a dataset picker for one control);
+    // without the out-parameter that case is a refusal, as before.
     bool ensureSessionSolveBackends(LineAnnotationSession& session,
-                                    const std::function<bool()>& stillValid = {});
+                                    const std::function<bool()>& stillValid = {},
+                                    bool* solveAsLasagna = nullptr);
     // The synchronous fiber-mode solve as a result only (nothing applied):
     // dirtySegments nullopt = every span (the finalizer's whole-line solve).
+    // solveAsLasagna: this one solve runs in Lasagna mode whatever the
+    // session's persisted optimization mode (see ensureSessionSolveBackends).
     [[nodiscard]] OptimizationTaskResult runFiberModeSolveSynchronously(
         const LineAnnotationSession& session,
         std::optional<std::vector<size_t>> dirtySegments,
-        const std::string& eventName) const;
+        const std::string& eventName,
+        bool solveAsLasagna = false) const;
     // Replaces a pane-less session's synthetic line model by the real one
     // (sampled normals, or the fiber-follow model when model-only).
     bool prepareSessionLineModel(LineAnnotationSession& session,
@@ -1135,6 +1196,7 @@ private:
                                                              int activeStart = -1,
                                                              int activeEnd = -1) const;
     void loadFibersForCurrentPackage();
+    void saveLoadedFiberMetadata(StoredFiber& fiber);
     // Drop fibers that are the same fiber seen through several sources (or
     // identical geometry under another name); records link aliases so branch
     // links written against a dropped copy still resolve to the survivor.
@@ -1193,6 +1255,7 @@ private:
     // fiberBaseShapeManifestCandidates). nullopt when none can be resolved.
     [[nodiscard]] std::optional<std::array<std::size_t, 3>>
         resolveStoredFiberCoordinateBaseShape(const StoredFiber& fiber) const;
+    void retainStoredFiberCoordinateBaseShape(StoredFiber& fiber) const;
     [[nodiscard]] std::optional<std::array<std::size_t, 3>>
         fiberManifestBaseShape(const std::string& location) const;
     [[nodiscard]] std::filesystem::path relativeFiberPath(const StoredFiber& fiber) const;
@@ -1309,8 +1372,8 @@ private:
     // stillValid (optional): checked after each flushed save (a yield);
     // false stops the flush.
     void flushAllPendingSessionAutoSaves(const std::function<bool()>& stillValid = {});
-    [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber, double scale = 1.0) const;
-    void saveFiberNow(const StoredFiber& fiber) const;
+    [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber) const;
+    void saveFiberNow(StoredFiber& fiber) const;
     void scheduleFiberSave(const StoredFiber& fiber);
     void scheduleFiberPairSave(const StoredFiber& first, const StoredFiber& second);
     void scheduleFiberSaveSnapshots(std::vector<FiberSaveSnapshot> snapshots,
@@ -1324,10 +1387,9 @@ private:
     // stillValid (optional): checked after each event loop turn of the
     // drain; false stops waiting (the caller decides what that means).
     void waitForFiberSaves(const std::function<bool()>& stillValid = {});
-    [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber) const;
+    [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber);
     [[nodiscard]] static nlohmann::json fiberSaveSnapshotToJson(
-        const FiberSaveSnapshot& snapshot,
-        double scale = 1.0);
+        const FiberSaveSnapshot& snapshot);
     // A link entry a load dropped from a stored record (neutralized, removed
     // by a repair, or stripped by the lenient parser). Fields a stripped
     // entry did not parse stay unset; a descriptor without a target matches
@@ -1537,6 +1599,7 @@ private:
     // This covers those pre-publication continuations only; the loader is
     // not otherwise reentrant-safe.
     uint64_t _fiberLoadSequence = 0;
+    std::unordered_set<uint64_t> _pendingCoordinateShapeSaves;
     std::deque<FiberSaveJob> _pendingFiberSaveJobs;
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;

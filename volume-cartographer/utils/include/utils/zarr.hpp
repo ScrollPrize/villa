@@ -334,6 +334,8 @@ public:
     virtual ~Store() = default;
 
     [[nodiscard]] virtual bool exists(const std::string& key) const = 0;
+    /// Whether reads may access the network, including disk-cached remote stores.
+    [[nodiscard]] virtual bool is_remote() const noexcept { return false; }
     [[nodiscard]] virtual std::vector<std::byte> get(const std::string& key) const = 0;
     [[nodiscard]] virtual std::optional<std::vector<std::byte>> get_if_exists(const std::string& key) const = 0;
     virtual void set(const std::string& key, std::span<const std::byte> value) = 0;
@@ -415,6 +417,7 @@ private:
 
 class HttpStore final : public Store {
 public:
+    [[nodiscard]] bool is_remote() const noexcept override { return true; }
     /// Construct from a base URL with default HttpClient settings.
     explicit HttpStore(std::string base_url);
 
@@ -741,6 +744,9 @@ public:
 
     /// Root path of the zarr array on disk.
     [[nodiscard]] const std::filesystem::path& path() const noexcept { return root_; }
+    [[nodiscard]] bool is_remote() const noexcept {
+        return store_ && store_->is_remote();
+    }
 
     // -- Attributes ----------------------------------------------------------
 
