@@ -86,4 +86,43 @@ void buildWindowLevelColormapLut(std::array<uint32_t, 256>& lut,
     lut[0] = kBlack;
 }
 
+void buildOverlayLut(std::array<uint32_t, 256>& lut,
+                     float windowLow, float windowHigh,
+                     const std::string& colormapId,
+                     bool intensityAsAlpha)
+{
+    std::array<uint32_t, 256> color;
+    buildWindowLevelColormapLut(color, windowLow, windowHigh, colormapId);
+
+    if (!intensityAsAlpha) {
+        for (int i = 0; i < 256; ++i) {
+            const float v = static_cast<float>(i);
+            lut[i] = (v >= windowLow && v <= windowHigh) ? color[i] : 0u;
+        }
+        return;
+    }
+
+    std::array<uint32_t, 256> wl;
+    buildWindowLevelLut(wl, windowLow, windowHigh);
+    // Empty id is grayscale, which is black at zero like a tint.
+    const OverlayColormapSpec* spec = colormapId.empty() ? nullptr : &vc::resolve(colormapId);
+    const bool discrete = spec && spec->kind == OverlayColormapKind::DiscreteLut;
+    const bool premultiplied = !spec || spec->premultiplied;
+
+    for (int i = 0; i < 256; ++i) {
+        const uint32_t t = wl[i] & 0xFFu;
+        const uint32_t alpha = discrete ? (t != 0 ? 255u : 0u) : t;
+        uint32_t rgb = color[i] & 0x00FFFFFFu;
+        if (!discrete && !premultiplied) {
+            const auto scale = [t](uint32_t c) {
+                return (c * t + 127u) / 255u;
+            };
+            rgb = (scale((rgb >> 16) & 0xFFu) << 16) |
+                  (scale((rgb >> 8) & 0xFFu) << 8) |
+                  scale(rgb & 0xFFu);
+        }
+        lut[i] = alpha == 0 ? 0u : ((alpha << 24) | rgb);
+    }
+}
+
 }  // namespace vc

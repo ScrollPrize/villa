@@ -146,3 +146,45 @@ TEST_CASE("buildWindowLevelColormapLut: unknown id falls back to first spec")
     CHECK(fire == unknown);
 }
 
+
+TEST_CASE("buildOverlayLut: default mode is the colormap LUT band-passed to the window")
+{
+    LUT color{}, lut{};
+    vc::buildWindowLevelColormapLut(color, 40.0f, 200.0f, "viridis");
+    vc::buildOverlayLut(lut, 40.0f, 200.0f, "viridis", false);
+    for (int i = 0; i < 256; ++i)
+        CHECK(lut[i] == ((i >= 40 && i <= 200) ? color[i] : 0u));
+}
+
+TEST_CASE("buildOverlayLut: intensity-as-alpha keeps a tint bright and ramps alpha")
+{
+    LUT lut{};
+    vc::buildOverlayLut(lut, 0.0f, 255.0f, "red", true);
+    CHECK(lut[0] == 0u);
+    // Premultiplied red at alpha 100: over black it is 100, over white 255.
+    CHECK(lut[100] == ((100u << 24) | (100u << 16)));
+    CHECK(vc::blendOverlayArgb(kAlpha, lut[100], 1.0f) == (kAlpha | (100u << 16)));
+    CHECK(vc::blendOverlayArgb(0xFFFFFFFFu, lut[100], 1.0f) == 0xFFFFFFFFu - 100u * 0x101u);
+}
+
+TEST_CASE("buildOverlayLut: intensity-as-alpha scales straight maps, labels are opaque")
+{
+    LUT color{}, lut{};
+    vc::buildWindowLevelColormapLut(color, 0.0f, 255.0f, "viridis");
+    vc::buildOverlayLut(lut, 0.0f, 255.0f, "viridis", true);
+    CHECK(A(lut[255]) == 255);
+    CHECK((lut[255] & 0x00FFFFFFu) == (color[255] & 0x00FFFFFFu));
+    CHECK(G(lut[51]) == (G(color[51]) * 51 + 127) / 255);
+
+    vc::buildOverlayLut(lut, 0.0f, 255.0f, "glasbey_black0", true);
+    CHECK(lut[0] == 0u);
+    CHECK(A(lut[7]) == 255);
+}
+
+TEST_CASE("blendOverlayArgb: opaque entry matches the plain opacity mix")
+{
+    const uint32_t base = 0xFF204060u, over = 0xFFC08010u;
+    // (1 - 0.3) * b + 0.3 * o per channel, rounded.
+    CHECK(vc::blendOverlayArgb(base, over, 0.3f) == 0xFF505348u);
+    CHECK(vc::blendOverlayArgb(base, 0u, 0.3f) == base);
+}

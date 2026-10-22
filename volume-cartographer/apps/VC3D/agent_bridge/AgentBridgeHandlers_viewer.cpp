@@ -67,6 +67,7 @@ QJsonObject overlaySettingsJson(
     o["threshold"] = state.window.low;
     o["windowLow"] = state.window.low;
     o["windowHigh"] = state.window.high;
+    o["intensityAsAlpha"] = state.intensityAsAlpha;
     o["maxDisplayedResolution"] = state.maxDisplayedResolution;
 
     QJsonObject composite;
@@ -121,6 +122,9 @@ QJsonObject AgentBridgeServer::handleViewerSetOverlay(const QJsonValue& params)
     const float threshold = hasThreshold
         ? static_cast<float>(p.value("threshold").toDouble()) : 0.0f;
 
+    const bool hasIntensityAsAlpha = p.contains("intensityAsAlpha");
+    const bool intensityAsAlpha = p.value("intensityAsAlpha").toBool(false);
+
     const bool hasWindow = p.contains("window");
     float windowLow = 0.0f;
     float windowHigh = 0.0f;
@@ -169,6 +173,8 @@ QJsonObject AgentBridgeServer::handleViewerSetOverlay(const QJsonValue& params)
             .high = windowHigh,
         };
     }
+    if (hasIntensityAsAlpha)
+        update.intensityAsAlpha = intensityAsAlpha;
     if (hasMaxRes)
         update.maxDisplayedResolution = maxRes;
     if (hasComposite)

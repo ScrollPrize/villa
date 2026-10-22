@@ -160,6 +160,7 @@ void AgentBridgeServer::registerViewerHandlers()
                 Params::optionalNumber(QStringLiteral("opacity")),
                 Params::optionalNumber(QStringLiteral("threshold")),
                 optionalWindow(QStringLiteral("window")),
+                Params::optionalBoolean(QStringLiteral("intensityAsAlpha")),
                 Params::optionalInteger(QStringLiteral("maxDisplayedResolution")),
                 Params::optionalObject(
                     QStringLiteral("composite"),
