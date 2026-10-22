@@ -118,16 +118,21 @@ def _cube(arr: np.ndarray, center, half: int) -> np.ndarray:
 
 
 def export_training(data: Path, audit: Path, out: Path, dest: Path, half: int = 16,
-                    predictions: Optional[Path] = None, reviewer: str = "") -> List[dict]:
+                    predictions: Optional[Path] = None, reviewer: str = "",
+                    target: str = "surface", ignore_value: int = 2) -> List[dict]:
     """Write one ``.npz`` (ct, label, mask, center_zyx, verdict, pred with ``predictions``)
-    per verdict, plus ``index.csv`` and ``provenance.json``.
+    per verdict, plus ``index.csv`` and ``provenance.json``, and the same cubes in the
+    layout the villa trainer reads (``docs/data_formatting.md``): ``images/<id>.tif`` (CT)
+    and ``labels/<id>_<target>.tif`` (the label with the verdict applied: a FILL hole set
+    to 1, a CUT hole left 0, an UNCLEAR hole set to ``ignore_value``).
 
     This is the labelled set a FILL/CUT model would train on: the reviewer's call with the
     CT it was made from, and the surface model's own output there when ``predictions`` holds
     ``<crop>.tif`` per crop. Nothing is trained here; the export only keeps the pairs.
     """
     rows = list(load_verdicts(out / "verdicts.csv").values())
-    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "images").mkdir(parents=True, exist_ok=True)
+    (dest / "labels").mkdir(exist_ok=True)
     index, cache = [], {}
     for i, r in enumerate(rows):
         crop = r["crop"]
@@ -139,16 +144,25 @@ def export_training(data: Path, audit: Path, out: Path, dest: Path, half: int = 
                 vols["pred"] = tifffile.imread(predictions / f"{crop}.tif")
             cache[crop] = vols
         center = json.loads(r["center_zyx"])
-        name = f"{crop}_{i:04d}.npz"
-        np.savez_compressed(dest / name, center_zyx=np.array(center), verdict=r["verdict"],
-                            **{k: _cube(v, center, half) for k, v in cache[crop].items()})
-        index.append({"file": name, **r})
+        stem = f"{crop}_{i:04d}"
+        cubes = {k: _cube(v, center, half) for k, v in cache[crop].items()}
+        np.savez_compressed(dest / f"{stem}.npz", center_zyx=np.array(center), verdict=r["verdict"], **cubes)
+        corrected = cubes["label"].copy()
+        hole = cubes["mask"] > 0
+        if r["verdict"] == "FILL":
+            corrected[hole] = 1
+        elif r["verdict"] != "CUT":
+            corrected[hole] = ignore_value
+        tifffile.imwrite(dest / "images" / f"{stem}.tif", cubes["ct"])
+        tifffile.imwrite(dest / "labels" / f"{stem}_{target}.tif", corrected)
+        index.append({"file": f"{stem}.npz", **r})
     with open(dest / "index.csv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=["file", *FIELDS])
         w.writeheader()
         w.writerows(index)
     prov = {"data": str(data), "audit": str(audit), "verdicts": str(out / "verdicts.csv"),
             "predictions": str(predictions) if predictions else None, "cube": 2 * half,
+            "target": target, "ignore_value": ignore_value,
             "reviewer": reviewer, "n": len(index),
             "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     (dest / "provenance.json").write_text(json.dumps(prov, indent=1))
@@ -234,16 +248,20 @@ def main(argv=None):
     ap.add_argument("--stage-only", action="store_true",
                     help="stage the top crops into OUT/fix_in for hole_viewer.py and ask nothing")
     ap.add_argument("--export-training", type=Path, metavar="DIR",
-                    help="write OUT/verdicts.csv as training cubes (.npz + index.csv) into DIR and ask nothing")
+                    help="write OUT/verdicts.csv as training cubes (.npz + index.csv, plus images/ and labels/ in the trainer layout) into DIR and ask nothing")
     ap.add_argument("--predictions", type=Path, metavar="DIR",
                     help="with --export-training: surface model output per crop (DIR/<crop>.tif), stored as pred")
     ap.add_argument("--reviewer", default=getpass.getuser(), help="who made the calls (provenance)")
+    ap.add_argument("--target", default="surface",
+                    help="with --export-training: target name in labels/<id>_<target>.tif (trainer layout)")
+    ap.add_argument("--ignore-value", type=int, default=2,
+                    help="with --export-training: label value written into UNCLEAR holes")
     a = ap.parse_args(argv)
     if not (a.audit / "ranked.csv").exists():
         ap.error(f"{a.audit}/ranked.csv missing: run vesuvius.label_topology_audit --batch first")
     if a.export_training:
         n = export_training(a.data, a.audit, a.out, a.export_training, max(a.half // 2, 8),
-                            a.predictions, a.reviewer)
+                            a.predictions, a.reviewer, a.target, a.ignore_value)
         print(f"exported {len(n)} verdict cubes to {a.export_training}")
         return
     if a.stage_only:

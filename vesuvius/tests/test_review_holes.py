@@ -121,3 +121,10 @@ def test_export_training_keeps_each_verdict_with_the_ct_it_was_made_from(tmp_pat
     assert ex["mask"][8, 8, 8] == 1 and ex["label"][8, 8, 8] == 0     # cube centred on the hole
     assert ex["label"][8, 0, 0] == 1                                     # sheet around it
     assert ex["pred"][8, 8, 8] == 1 and ex["label"][8, 8, 8] == 0        # model drew it, label did not
+    # trainer layout (docs/data_formatting.md): images/<id>.tif + labels/<id>_<target>.tif,
+    # with the verdict applied so the label cube is what a corrected label would be
+    cut = tifffile.imread(dest / "labels" / "crop_1_0000_surface.tif")
+    fill = tifffile.imread(dest / "labels" / "crop_1_0001_surface.tif")
+    assert tifffile.imread(dest / "images" / "crop_1_0000.tif").shape == (16, 16, 16)
+    assert cut[8, 8, 8] == 0 and fill[8, 8, 8] == 1 and fill[8, 0, 0] == 1
+    assert prov["target"] == "surface" and prov["ignore_value"] == 2

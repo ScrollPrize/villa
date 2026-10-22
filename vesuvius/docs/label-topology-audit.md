@@ -129,7 +129,10 @@ python src/vesuvius/scripts/fix_holes.py --in-dir review/fix_in --veto review/ve
 #    calls once there are enough of them. Nothing is trained here.
 #    --predictions DIR adds the surface model's output per crop (DIR/<crop>.tif) as a
 #    pred cube, so each example holds what the model drew, the label, and the call;
-#    provenance.json records inputs, reviewer and time.
+#    provenance.json records inputs, reviewer and time. The same cubes also go out
+#    as images/<id>.tif + labels/<id>_<target>.tif (docs/data_formatting.md layout,
+#    --target, default surface) with the verdict applied: FILL hole -> 1, CUT -> 0,
+#    UNCLEAR -> --ignore-value (2), so the folder is a trainer input as it stands.
 python src/vesuvius/scripts/review_holes.py --data DATA_DIR --audit audit_out --out review \
   --export-training review/train --predictions predictions/
 
