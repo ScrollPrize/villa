@@ -88,3 +88,6 @@ python -m pytest -q tests/test_fiber_min_flow.py tests/test_fiber_min_flow_split
 datasets, references, checkpoints and native build dependencies are not bundled.
 No cross-platform execution or new performance/convergence claim is implied by
 this extraction.
+
+For reproducible managed replays of prepared no-GT / forced-GT / selectable-GT
+solves, see [the shareable layout benchmark](fiber_layout_benchmark.md).

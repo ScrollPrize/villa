@@ -1,4 +1,5 @@
 # Python venvs, IDE files, build artifacts
+/local/
 **/.venv*/
 **/.idea/*
 **/__pycache__/
