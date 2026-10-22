@@ -84,3 +84,4 @@ dinovol/cufile.log
 /vc_reader/benchmarks/results
 *.csv
 /dinovol/perf_results
+/dinovol/dinovol_2/perf

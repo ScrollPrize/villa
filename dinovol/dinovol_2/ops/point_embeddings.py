@@ -122,6 +122,7 @@ def sample_grid_points(
     grid: torch.Tensor,
     coordinates_zyx: torch.Tensor,
     input_shape: Sequence[int],
+    *, geometry=None, use_triton=False,
 ) -> torch.Tensor:
     """Trilinearly sample a [B, D, H, W, C] feature grid at [B, P, 3] input-voxel coordinates.
 
@@ -129,21 +130,41 @@ def sample_grid_points(
     centers are aligned (align_corners=False). The 8 neighbours are gathered in one
     indexing operation, keeping the feature map in its dtype and memory layout, so the
     backward pass scatters into a single grid-sized gradient.
+
+    use_triton opts inference-only CUDA calls into a fused forward kernel with
+    FP32 output and small floating-point rounding differences. Autograd, CPU,
+    unsupported dtypes and installations without Triton keep the PyTorch path.
     """
+    needs_grad = torch.is_grad_enabled() and (grid.requires_grad or coordinates_zyx.requires_grad)
+    if (use_triton and grid.is_cuda and not needs_grad and coordinates_zyx.dtype == torch.float32
+            and grid.dtype in (torch.float16, torch.bfloat16, torch.float32)):
+        from dinovol_2.ops.selected_interpolation import available, sample_batched
+        if available():
+            return sample_batched(grid, coordinates_zyx, input_shape)
     batch, points = coordinates_zyx.shape[:2]
     rows = torch.arange(batch, device=grid.device)[:, None].expand(batch, points)
-    return _sample_grid_points_at_rows(grid, coordinates_zyx, input_shape, rows)
+    return _sample_grid_points_at_rows(grid, coordinates_zyx, input_shape, rows, geometry=geometry)
 
 
-def _sample_grid_points_at_rows(grid, coordinates_zyx, input_shape, rows):
+def grid_sample_geometry(grid_shape, input_shape, coordinates_zyx):
+    """Reusable shape constants on the coordinates' device, avoiding repeated host copies.
+
+    Valid while grid/input shapes and the coordinates' device/dtype remain fixed.
+    """
+    shape = coordinates_zyx.new_tensor(tuple(float(size) for size in grid_shape))
+    scale = shape / coordinates_zyx.new_tensor(tuple(float(size) for size in input_shape))
+    offsets = coordinates_zyx.new_tensor(tuple(product((0.0, 1.0), repeat=3)))
+    return shape, scale, offsets
+
+
+def _sample_grid_points_at_rows(grid, coordinates_zyx, input_shape, rows, *, geometry=None):
     """Shared differentiable sampler for batched or flattened point coordinates."""
-    grid_shape = coordinates_zyx.new_tensor(tuple(float(size) for size in grid.shape[1:4]))
-    scale = grid_shape / coordinates_zyx.new_tensor(tuple(float(size) for size in input_shape))
+    grid_shape, scale, offsets = (geometry if geometry is not None else
+                                 grid_sample_geometry(grid.shape[1:4], input_shape, coordinates_zyx))
     position = ((coordinates_zyx + 0.5) * scale - 0.5).clamp(min=0.0)
     position = torch.minimum(position, grid_shape - 1.0)
     lower = position.floor()
     fraction = position - lower
-    offsets = coordinates_zyx.new_tensor(tuple(product((0.0, 1.0), repeat=3)))  # [8, 3]
     index = torch.minimum(lower[..., None, :] + offsets, grid_shape - 1.0).long()
     weight = torch.where(offsets > 0, fraction[..., None, :], 1.0 - fraction[..., None, :]).prod(-1)
     corners = grid[rows[..., None], index[..., 0], index[..., 1], index[..., 2]]

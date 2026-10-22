@@ -192,6 +192,11 @@ Compiled backward graphs are captured with autocast disabled for backward,
 matching the trainer's existing AMP forward / non-autocast backward sequence.
 
 Other configs default to compilation disabled; `"compile": false` disables it.
+Under DDP, `optimize_ddp` (default `false`) keeps Dynamo from splitting compiled
+graphs at gradient-bucket boundaries: the split graphs drop the checkpoint
+save-attention policy, so every student attention forward ran again in backward
+(g256 crops on 3× H100: 5.75 → 4.47 s/step with it off). `"python_reducer"`
+traces DDP's reducer into compiled autograd instead; it measured the same as `false`.
 Optional settings are `backend`, `mode`, `dynamic` (default `null`, automatic
 dynamic-shape handling), and `fullgraph` (default `false`, allowing graph breaks).
 `dynamic` may also map `backbone`, `dino_head`, and `ibot_head` to `true`,
@@ -620,6 +625,14 @@ Images remain CUDA tensors through collation and the model. Point coordinates,
 object labels and cross-view token targets share the image geometry. Paired
 Gram-teacher crops share that geometry and optionally the augmentation seed.
 Inference normalization also uses CUDA.
+
+Each DDP rank's loader
+draws its worker seeds from its own generator (one global torch draw mixed with the
+rank): resuming from a checkpoint with a single RNG state restores identical states
+on every rank, which previously gave all ranks identical samples.
+`data.gpu_prefetch: true` processes the next batch on a side CUDA stream in a
+background thread; with the GPU saturated by training it measured slower on one
+H100 (4.45 vs 4.34 s/step), so it is off by default.
 
 All image stages use `Pipeline.batch()`. For the batch-12 recipe with two global
 and four local views per sample, intensity transforms process all 24 global
@@ -1149,6 +1162,43 @@ group written without it, run `.venv/bin/python -m dinovol_2.eval.embed_volume
 --add-unit-tokens <group.zarr>`. It derives the array from the stored `tokens`
 (cosine ≥ 0.99999 against computing it during the run). At `--dense-stride 1` the
 full PHercParis4 level-2 slab is roughly 345 GB (dense 220, ink 120, tokens 3).
+
+## Rendering embeddings on a segment
+
+`dinovol_2/eval/render_surface_embeddings.py` renders the embeddings on a tifxyz
+segment as a mesh intersection. vc_reader bilinearly interpolates the stored
+grid at every output pixel and samples each volume there trilinearly on CUDA.
+`render_surface(..., step=)` sets one pixel per embedding-level voxel by default.
+Only the lattice cells near the surface are embedded: the voxels it passes
+through, dilated by two. They go to a sparse zarr using the same globally
+consistent tiling as `embed_volume`, one worker process per GPU, and are
+deleted after rendering unless `--keep-embeddings` is given.
+
+```bash
+.venv/bin/python -m dinovol_2.eval.render_surface_embeddings \
+  --volume s3://vesuvius-challenge-open-data/PHerc1667/volumes/20251217075048-2.399um-0.2m-78keV-masked.zarr/ \
+  --level 2 --cache-dir /ephemeral/zarr_cache --no-cache-writes \
+  --tifxyz <segment>/mesh/<id>-on-<volume>-level2.tifxyz \
+  --checkpoint checkpoint_step_640000.pt --out renders/1531 --gpus 5,6,7 \
+  --labels <segment.tifxyz>/ink-labels/<labels>
+```
+
+Outputs (uint8 TIFFs at render resolution):
+
+- `_ct`: the CT on the surface.
+- `_{tokens,dense,ink}_pca`: the top three principal components of each unit embedding, as RGB.
+- `_inklabels`, `_supervision`: the labels upsampled to the render.
+- `_inkfocus_{ink,tokens}`: cos(e, ink) − cos(e, non-ink) against reference embeddings.
+
+The ink references come from the labels. Ink is labelled ink pixels. Non-ink is
+only supervised pixels labelled zero: unlabelled pixels are unknown, never
+background. Segments without labels can reuse `--ink-prototypes` saved by
+another render. References from a segment's own labels make its ink-focus
+image a visualisation, not a held-out test.
+
+`--no-cache-writes` reads uncached chunks remotely without adding them to the
+cache, and `--offline` refuses them instead. `_render.json` records the
+normalization, lattice, timings and files.
 
 ## Extending the training method
 

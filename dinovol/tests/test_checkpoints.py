@@ -109,3 +109,13 @@ class CheckpointTests(unittest.TestCase):
             self.assertFalse(restored.method.gram_teacher_backbone.training)
             for a,b in zip(trainer.method.gram_teacher_backbone.parameters(),restored.method.gram_teacher_backbone.parameters()):
                 torch.testing.assert_close(a,b,rtol=0,atol=0)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA RNG state")
+class RngRestoreTests(unittest.TestCase):
+    def test_restores_checkpoints_saved_with_more_gpus(self):
+        saved = torch.cuda.get_rng_state(0)
+        extra = [saved] * (torch.cuda.device_count() + 3)
+        torch.rand(4, device="cuda")
+        Trainer._restore_rng_state({"cuda": extra})
+        self.assertTrue(torch.equal(torch.cuda.get_rng_state(0), saved))

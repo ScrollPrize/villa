@@ -473,10 +473,22 @@ class SourceReader:
     def read_many(self, regions):
         with self._errors():
             self._ready()
-            if (self._is_zarr and self._raw_axes == self.spatial_axes and self._lookup is None
-                    and self.fill_value == self._backend.fill_value):
-                return self._backend.reader.read_regions(regions)
+            if self._is_zarr and self._lookup is None and self.fill_value == self._backend.fill_value:
+                if self._raw_axes == self.spatial_axes:
+                    return self._backend.reader.read_regions(regions)
+                if self._whole_channels():
+                    # Every channel, stored order: one batched read of full-channel regions instead
+                    # of one read per region and channel.
+                    c, n = self._raw_axes.index('c'), self._raw_shape[self._raw_axes.index('c')]
+                    full = [(tuple(start[:c]) + (0,) + tuple(start[c:]), tuple(size[:c]) + (n,) + tuple(size[c:]))
+                            for start, size in regions]
+                    return self._backend.reader.read_regions(full)
             return [self.read(start, size) for start, size in regions]
+
+    def _whole_channels(self):
+        """A channel axis read in full and in stored order, with no time axis."""
+        return ('c' in self._raw_axes and 't' not in self._raw_axes and self.axes == self._raw_axes
+                and self._channels == tuple(range(self._raw_shape[self._raw_axes.index('c')])))
 
     def stats(self):
         self._ready()

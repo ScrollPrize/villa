@@ -13,6 +13,13 @@ sparse zarr, rendered, and deleted unless ``--keep-embeddings`` is given.
 Writes OUT/<name>_{ct,tokens_pca,dense_pca,ink_pca}.tif (uint8; PCA panels map the top three
 principal components of the unit embeddings to RGB), OUT/<name>_inklabels.tif when labels are given
 (upsampled to the render), and OUT/<name>_render.json.
+
+Ink focus: with ink labels (or ``--ink-prototypes`` from other segments), reference embeddings are the
+mean unit embedding of labelled ink pixels and of non-ink pixels -- only those inside ``supervision``
+labelled zero; unlabelled pixels are unknown, never background. OUT/<name>_inkfocus_{ink,tokens}.tif
+shows cos(e, ink) - cos(e, non-ink) per pixel (cos(e, ink) without supervision; uint8 over its
+1-99th percentiles) and OUT/<name>_ink_prototypes.npz keeps the references. References taken from the
+segment's own labels make that image a visualisation, not a held-out test.
 """
 from __future__ import annotations
 
@@ -34,11 +41,12 @@ import torch.nn.functional as F
 from dinovol_2.dataset.volume_reader import open_volume
 from dinovol_2.eval.embed_volume import (
     AxisLattice, RegionEmbedder, ZarrGroupWriter, global_normalization, sample_volume_histogram,
-    statistics_from_histogram,
+    statistics_from_histogram, plan_slabs,
 )
 from dinovol_2.eval.napari_visualizer import load_backbone_from_checkpoint
 
 OUTPUTS = ("tokens_unit", "dense", "ink")
+FOCUS = ("ink", "tokens_unit")  # embeddings used for the ink-focus image
 STORAGE = {"tokens_unit": "float32", "dense": "unit8", "ink": "unit8"}
 SHELL_DILATION = 2   # voxels around the surface's voxels: covers trilinear support at any render point
 SLAB_CELLS = 4       # lattice cells of z per embedding slab (one unit of GPU work)
@@ -170,7 +178,8 @@ def _model_and_lattice(args, device):
 def _open(args):
     s3 = {"anon": True} if str(args.volume).startswith("s3://") else None
     return open_volume(args.volume, level=args.level, s3_storage_options=s3, cache_dir=args.cache_dir,
-                       offline=args.offline, cache_writes=not args.offline, connections=32, threads=16)
+                       offline=args.offline, cache_writes=not (args.offline or args.no_cache_writes),
+                       connections=32, threads=16)
 
 
 def worker(args) -> None:
@@ -182,7 +191,7 @@ def worker(args) -> None:
     loaded, lattice = _model_and_lattice(args, device)
     transforms = global_normalization(loaded.normalization_scheme, plan["statistics"], loaded.intensity_properties)
     embedder = RegionEmbedder(reader, loaded, transforms=transforms, outputs=OUTPUTS, dense_stride=1,
-                              lattice=lattice, dtypes=STORAGE)
+                              lattice=lattice, dtypes=STORAGE, strip_device=args.strip_device)
     shell = Shell.load(work / "shell.npz")
     need = shell.need_fn(device)
     sink = ZarrGroupWriter(work / "embeddings.zarr", attrs=None)
@@ -205,7 +214,7 @@ def embed(args, work: Path, shell: Shell, statistics, reader, lattice) -> dict:
     stride = lattice[0].stride
     slab = SLAB_CELLS * stride
     start = max(0, z_lo) // stride * stride
-    slabs = [(z, z + slab) for z in range(start, min(z_hi, reader.shape[0]), slab)]
+    slabs = plan_slabs((start, min(z_hi, reader.shape[0])), slab)
     plan = {"slabs": slabs, "array_z": [0, int(reader.shape[0])], "statistics": statistics}
     (work / "plan.json").write_text(json.dumps(plan))
     # Arrays span the volume (z aligned to cells) so slabs write disjoint chunks.
@@ -246,10 +255,8 @@ def _sources(args, work: Path, um: float, tif_level: int, has_mask: bool):
     s = 2.0 ** args.level
     spacing = (um * s,) * 3
     reg = lambda affine: VolumeRegistration("sample", "volume", affine=affine, volume_spacing_um=(um,) * 3)
-    ct_path = args.volume
-    if str(args.volume).startswith("s3://") and args.cache_dir:
-        ct_path = str(Path(args.cache_dir) / "s3" / str(args.volume)[5:].rstrip("/"))
-    ct = Source("ct", Storage(f"{str(ct_path).rstrip('/')}/{args.level}", "zarr"), role="image",
+    # The CT is read like the embedding input: through --cache-dir, and remotely for uncached chunks.
+    ct = Source("ct", Storage(f"{str(args.volume).rstrip('/')}/{args.level}", "zarr"), role="image",
                 axes=("z", "y", "x"), registration=reg(Affine.scale(s)), normalize=False)
     emb = work / "embeddings.zarr"
     targets = {name: Source(name, Storage(str(emb / name), "zarr"), role="image", axes=("z", "y", "x", "c"),
@@ -291,9 +298,22 @@ def render(args, work: Path, out: Path, name: str, meta, um, tif_level, step, gr
             out_[n] = (F.normalize(v, dim=-1), ok)
         return out_
 
+    # Labels live on the tifxyz grid: output pixel (r, c) reads grid (r*step*sy, c*step*sx).
+    rows = np.minimum((np.arange(H) * step * sy).round().astype(int), grid_shape[0] - 1)
+    cols = np.minimum((np.arange(W) * step * sx).round().astype(int), grid_shape[1] - 1)
+    labels = {}
+    if args.labels:
+        for label in ("inklabels", "supervision"):
+            src = Path(args.labels) / f"{label}.tif"
+            if src.exists():
+                labels[label] = tifffile.imread(src) > 0
+    focus_samples = {n: {"ink": [], "background": []} for n in FOCUS}
+    remote = dict(cache_dir=args.cache_dir, offline=args.offline,
+                  cache_writes=not (args.offline or args.no_cache_writes)) if args.cache_dir else {}
     with open_sample(ct, targets, backend="cuda", device=0, surface_output_bytes=16 << 30,
-                     sampling_cache_bytes=8 << 30, sampling_work_bytes=2 << 30) as reader:
-        # Pass 1: PCA bases from a coarse render (every 8th output pixel).
+                     sampling_cache_bytes=8 << 30, sampling_work_bytes=2 << 30, memory_cache=8 << 30,
+                     **remote) as reader:
+        # Pass 1: PCA bases (and labelled ink references) from a coarse render (every 8th output pixel).
         coarse = 8 * step
         samples = {n: [] for n in OUTPUTS}
         for r in range(0, H, tile * 8):
@@ -303,6 +323,16 @@ def render(args, work: Path, out: Path, name: str, meta, um, tif_level, step, gr
                 for n in OUTPUTS:
                     v, ok = d[n]
                     samples[n].append(v[ok])
+                if "inklabels" in labels:
+                    rr, cc = np.ix_(rows[r:r + h:8], cols[c:c + w:8])
+                    ink = torch.from_numpy(labels["inklabels"][rr, cc]).to(device)
+                    for n in FOCUS:
+                        v, ok = d[n]
+                        focus_samples[n]["ink"].append(v[ok & ink])
+                        # Non-ink only where supervised and labelled zero: unlabelled is unknown, not background.
+                        if "supervision" in labels:
+                            sup = torch.from_numpy(labels["supervision"][rr, cc]).to(device)
+                            focus_samples[n]["background"].append(v[ok & sup & ~ink])
         bases = {}
         for n in OUTPUTS:
             v = torch.cat(samples[n])
@@ -311,9 +341,39 @@ def render(args, work: Path, out: Path, name: str, meta, um, tif_level, step, gr
             comps = torch.linalg.svd(v - mean, full_matrices=False)[2][:3]
             proj = (v - mean) @ comps.T
             bases[n] = (mean, comps, torch.quantile(proj, 0.01, dim=0), torch.quantile(proj, 0.99, dim=0))
+        prototypes = {}
+        if "inklabels" in labels:
+            for n in FOCUS:
+                ink = torch.cat(focus_samples[n]["ink"])
+                bg = torch.cat(focus_samples[n]["background"]) if focus_samples[n]["background"] else ink[:0]
+                if len(ink):
+                    prototypes[n] = {"ink": F.normalize(ink.mean(0), dim=0), "count_ink": len(ink),
+                                     "count_background": len(bg)}
+                    if len(bg):
+                        prototypes[n]["background"] = F.normalize(bg.mean(0), dim=0)
+        elif args.ink_prototypes:
+            saved = np.load(args.ink_prototypes)
+            for n in FOCUS:
+                if f"{n}_ink" in saved:
+                    prototypes[n] = {"ink": torch.from_numpy(saved[f"{n}_ink"]).to(device)}
+                    if f"{n}_background" in saved:
+                        prototypes[n]["background"] = torch.from_numpy(saved[f"{n}_background"]).to(device)
+
+        def ink_score(v, proto):
+            # Without a supervised non-ink reference, similarity to ink alone.
+            return v @ proto["ink"] - (v @ proto["background"] if "background" in proto else 0)
+
+        focus = {}
+        for n, proto in prototypes.items():
+            v = torch.cat(samples[n])
+            score = ink_score(v, proto)
+            focus[n] = (proto, torch.quantile(score[torch.randperm(len(score), device=score.device)[:1_000_000]],
+                                              torch.tensor([0.01, 0.99], device=score.device)))
         # Pass 2: full resolution.
         images = {n: np.zeros((H, W, 3), np.uint8) for n in OUTPUTS}
         images["ct"] = np.zeros((H, W), np.uint8)
+        for n in focus:
+            images[f"inkfocus_{n}"] = np.zeros((H, W), np.uint8)
         coverage = 0
         for r, c, h, w, _ in tiles(step):
             d = draw(reader, r, c, h, w, step)
@@ -324,23 +384,38 @@ def render(args, work: Path, out: Path, name: str, meta, um, tif_level, step, gr
                 mean, comps, lo, hi = bases[n]
                 rgb = (((v - mean) @ comps.T - lo) / (hi - lo)).clamp(0, 1) * 255
                 images[n][r:r + h, c:c + w] = (rgb.round() * okn[..., None]).to(torch.uint8).cpu().numpy()
+            for n, (proto, (lo_s, hi_s)) in focus.items():
+                v, okn = d[n]
+                score = ((ink_score(v, proto) - lo_s) / (hi_s - lo_s)).clamp(0, 1)
+                # 0 is reserved for pixels without a valid embedding.
+                images[f"inkfocus_{n}"][r:r + h, c:c + w] = ((score * 254 + 1).round() * okn).to(torch.uint8).cpu().numpy()
             coverage += int(ok.sum())
     paths = {}
     for n, img in images.items():
-        key = "ct" if n == "ct" else f"{'tokens' if n == 'tokens_unit' else n}_pca"
+        key = (n.replace("tokens_unit", "tokens") if n == "ct" or n.startswith("inkfocus_")
+               else f"{'tokens' if n == 'tokens_unit' else n}_pca")
         paths[key] = out / f"{name}_{key}.tif"
         tifffile.imwrite(paths[key], img, bigtiff=True, compression="zlib", tile=(512, 512),
                          photometric="rgb" if img.ndim == 3 else "minisblack")
-    if args.labels:
-        rows = np.minimum((np.arange(H) * step * sy).round().astype(int), grid_shape[0] - 1)
-        cols = np.minimum((np.arange(W) * step * sx).round().astype(int), grid_shape[1] - 1)
-        for label in ("inklabels", "supervision"):
-            src = Path(args.labels) / f"{label}.tif"
-            if src.exists():
-                lab = tifffile.imread(src)
-                paths[label] = out / f"{name}_{label}.tif"
-                tifffile.imwrite(paths[label], lab[rows][:, cols], bigtiff=True, compression="zlib", tile=(512, 512))
-    return {"shape": [H, W], "render_step_uv": step, "valid_pixels": coverage,
+    for label, mask in labels.items():
+        paths[label] = out / f"{name}_{label}.tif"
+        tifffile.imwrite(paths[label], (mask[rows][:, cols] * 255).astype(np.uint8), bigtiff=True,
+                         compression="zlib", tile=(512, 512))
+    focus_info = {}
+    if focus:
+        arrays = {}
+        for n, (proto, (lo_s, hi_s)) in focus.items():
+            arrays[f"{n}_ink"] = proto["ink"].cpu().numpy()
+            if "background" in proto:
+                arrays[f"{n}_background"] = proto["background"].cpu().numpy()
+            focus_info[n] = {"score": "cos(e, ink) - cos(e, background)" if "background" in proto else "cos(e, ink)",
+                             "background": "supervised pixels labelled zero" if "background" in proto else None,
+                             "uint8_range": [float(lo_s), float(hi_s)],
+                             "references": "own labels" if "inklabels" in labels else str(args.ink_prototypes),
+                             **{k: int(v) for k, v in proto.items() if k.startswith("count")}}
+        paths["ink_prototypes"] = out / f"{name}_ink_prototypes.npz"
+        np.savez(paths["ink_prototypes"], **arrays)
+    return {"shape": [H, W], "render_step_uv": step, "valid_pixels": coverage, "ink_focus": focus_info,
             "files": {k: str(v) for k, v in paths.items()}}
 
 
@@ -356,15 +431,21 @@ def parse_args(argv=None):
     p.add_argument("--checkpoint", required=True)
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--name", default=None, help="output file prefix (default: the tifxyz directory name)")
-    p.add_argument("--labels", default=None, help="ink label directory (inklabels.tif/supervision.tif) to upsample")
+    p.add_argument("--labels", default=None, help="ink label directory (inklabels.tif/supervision.tif): upsampled to "
+                   "the render and used for the ink-focus references")
+    p.add_argument("--ink-prototypes", default=None, help="ink/background references (.npz from another render) "
+                   "for segments without labels")
     p.add_argument("--tifxyz-level", type=int, default=None,
                    help="level of the tifxyz coordinates (default: meta.json download_coordinates, else --level)")
     p.add_argument("--voxel-um", type=float, default=None, help="level-0 voxel size (default: parsed from the volume name)")
     p.add_argument("--cache-dir", default=None)
     p.add_argument("--offline", action="store_true", help="read only cached chunks; never write the cache")
+    p.add_argument("--no-cache-writes", action="store_true",
+                   help="read uncached chunks remotely without adding them to --cache-dir")
     p.add_argument("--gpus", default="0", help="comma-separated GPU ids; one embedding worker per GPU")
     p.add_argument("--render-step", type=int, default=None, help="UV pixels between output pixels (default: 1 per voxel)")
     p.add_argument("--render-tile", type=int, default=1024)
+    p.add_argument("--strip-device", default="cuda", help="where pending overlap strips live (cuda or cpu)")
     p.add_argument("--normalization-stats", default=None, help="statistics JSON or an embedding group's .zattrs")
     p.add_argument("--work", default=None, help="scratch directory for the embeddings (default: OUT/work_<name>)")
     p.add_argument("--keep-embeddings", action="store_true")
@@ -407,7 +488,7 @@ def main(argv=None) -> None:
         else:
             histogram, sampled = sample_volume_histogram(reader, skip_missing=True)
             statistics = {**statistics_from_histogram(histogram), "sampled_chunks": sampled, "chunk_stride": 8,
-                          "selection": "nonzero voxels of cached chunks"}
+                          "selection": "nonzero voxels of every 8th chunk along each axis"}
     print(f"{name}: grid {grid.shape[:2]}, tifxyz level {tif_level}, embedding level {args.level}, "
           f"normalization {json.dumps(statistics)}", flush=True)
     voxels = surface_shell(grid, valid, factor, device)

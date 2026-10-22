@@ -208,6 +208,11 @@ class EvaAttention(nn.Module):
     def _attention(self, q, k, v, *, attn_mask=None, spatial_shape=None):
         if not self.fused_attn:
             raise RuntimeError("Fused attention should be used.")
+        if getattr(self, "inference_precision", "bf16") == "fp8":
+            if self.training or attn_mask is not None:
+                raise RuntimeError("FP8 attention supports unmasked inference only")
+            from dinovol_2.ops.fp8_inference import fp8_attention
+            return fp8_attention(q, k, v)
         dropout_p = self.attn_drop.p if self.training else 0.
         if self.attention_priority is None:
             return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
@@ -1032,6 +1037,69 @@ class Eva(nn.Module):
                     module.rope_embed.reset_mixed_frequencies_to_axial()
             allowed_missing_keys.add(f"{prefix}.periods")
         return allowed_missing_keys
+
+    def adapt_checkpoint_state(self, state_dict):
+        """Absorb checkpoint layouts this backbone can take over: returns (state_dict, may_be_missing, converted).
+
+        - Mixed-RoPE ``mix_frequencies`` resume as Compass RoPE: radii and angles are set to give
+          the same phases (``converted`` lists those ``rope_embed`` prefixes); the mixed
+          ``periods`` buffer is dropped and Compass rebuilds its own.
+        - Q/K norms absent from a checkpoint trained without them keep their initial weight of
+          one; ``calibrate_qk_norms`` then rescales them to the measured Q/K magnitudes.
+        Keys are relative to this backbone.
+        """
+        state_dict = dict(state_dict)
+        may_be_missing, converted = set(), []
+        for name, module in self.named_modules():
+            rope = getattr(module, "rope_embed", None)
+            prefix = f"{name}.rope_embed" if name else "rope_embed"
+            if isinstance(rope, CompassRopePositionEmbedding) and f"{prefix}.mix_frequencies" in state_dict:
+                rope.set_frequencies(state_dict.pop(f"{prefix}.mix_frequencies"))
+                state_dict.pop(f"{prefix}.periods", None)
+                may_be_missing |= {f"{prefix}.radii", f"{prefix}.angles", f"{prefix}.periods"}
+                converted.append(prefix)
+        for name, module in self.named_modules():
+            if isinstance(module, nn.RMSNorm) and name.endswith(("attn.q_norm", "attn.k_norm")):
+                may_be_missing.add(f"{name}.weight")
+        return state_dict, may_be_missing, converted
+
+    @torch.no_grad()
+    def calibrate_qk_norms(self, inputs, *, amp_dtype=None, reduce=None) -> dict[str, float]:
+        """Set each Q/K RMSNorm weight to the mean RMS of its input, measured with the norms as identity.
+
+        Starting Q/K norms this way keeps attention logits close to those of the same weights
+        without Q/K norm. ``inputs`` are global-view batches; ``reduce`` (e.g. a cross-rank
+        mean) is applied to each [sum, count] pair before the weights are set.
+        """
+        norms = {name: module for name, module in self.named_modules()
+                 if isinstance(module, nn.RMSNorm) and name.endswith(("attn.q_norm", "attn.k_norm"))}
+        sums = {name: torch.zeros(2, dtype=torch.float64) for name in norms}
+
+        def hook(name):
+            def record(module, args, output):
+                x = args[0].float()
+                sums[name] += torch.tensor([float(x.square().mean(-1).sqrt().sum()), x[..., 0].numel()],
+                                           dtype=torch.float64)
+                return args[0]  # identity while measuring: later blocks see what they saw without Q/K norm
+            return record
+
+        handles = [module.register_forward_hook(hook(name)) for name, module in norms.items()]
+        training = self.training
+        self.eval()
+        try:
+            for x in inputs:
+                with torch.autocast(x.device.type, dtype=amp_dtype or torch.bfloat16, enabled=amp_dtype is not None):
+                    self.forward_features(x, masks=None, view_kind="global")
+        finally:
+            for handle in handles:
+                handle.remove()
+            self.train(training)
+        values = {}
+        for name, module in norms.items():
+            total = reduce(sums[name]) if reduce is not None else sums[name]
+            values[name] = float(total[0] / total[1])
+            module.weight.fill_(values[name])
+        return values
 
     def unchunk_state_dict(self, state_dict):
         """

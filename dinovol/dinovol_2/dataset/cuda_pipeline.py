@@ -3,7 +3,9 @@ from collections import defaultdict, OrderedDict
 from dataclasses import dataclass
 from itertools import permutations
 from functools import lru_cache
+import queue
 import random
+import threading
 
 import torch
 from torch.utils.data import DataLoader
@@ -237,13 +239,82 @@ class CudaBatchProcessor:
 
 
 class CudaDataLoader(DataLoader):
-    """Read ahead on CPU, deliver fully processed CUDA batches on the rank's device."""
-    def __init__(self, dataset, *, collate_fn=None, device="cuda", **kwargs):
+    """Read ahead on CPU, deliver fully processed CUDA batches on the rank's device.
+
+    gpu_prefetch processes the next batch in a background thread on a side CUDA stream, so
+    its host work and uploads overlap the consumer's compute. Batches are unchanged and in
+    order: vc_reader augmentation is seeded per view, and the collate's global ``random``
+    draws (iBOT masks) all happen on that one thread.
+    """
+    def __init__(self, dataset, *, collate_fn=None, device="cuda", gpu_prefetch=False, **kwargs):
         self.processor = CudaBatchProcessor(dataset.config, collate_fn, device=device)
+        self.gpu_prefetch = bool(gpu_prefetch)
         if kwargs.get("num_workers", 0):
             kwargs.setdefault("multiprocessing_context", "spawn")
         super().__init__(dataset, collate_fn=crop_collate, **kwargs)
 
     def __iter__(self):
+        if self.gpu_prefetch:
+            yield from _prefetched(super().__iter__(), self.processor, self.processor.device)
+            return
         for samples in super().__iter__():
             yield self.processor(samples)
+
+
+def _record_cuda(value, stream):
+    if isinstance(value, torch.Tensor):
+        if value.is_cuda:
+            value.record_stream(stream)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _record_cuda(item, stream)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _record_cuda(item, stream)
+
+
+def _prefetched(source, process, device):
+    """Yield process(samples) for each item of source, computed one batch ahead."""
+    stream = torch.cuda.Stream(device)
+    slots = queue.Queue(maxsize=1)
+    stop = threading.Event()
+
+    def put(item):
+        while not stop.is_set():
+            try:
+                slots.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                pass
+        return False
+
+    def produce():
+        try:
+            with torch.cuda.device(device), torch.cuda.stream(stream):
+                for samples in source:
+                    batch = process(samples)
+                    if not put(("batch", batch, stream.record_event())):
+                        return
+            put(("done",))
+        except BaseException as exc:
+            put(("error", exc))
+
+    thread = threading.Thread(target=produce, name="cuda-batch-prefetch", daemon=True)
+    thread.start()
+    try:
+        while True:
+            kind, *rest = slots.get()
+            if kind == "done":
+                return
+            if kind == "error":
+                raise rest[0]
+            batch, event = rest
+            consumer = torch.cuda.current_stream(device)
+            consumer.wait_event(event)
+            # Side-stream allocations must not be reused until the consumer is done with them.
+            _record_cuda(batch, consumer)
+            yield batch
+    finally:
+        stop.set()
+        # A producer blocked on a worker batch exits once it arrives; never hang shutdown on it.
+        thread.join(timeout=30)

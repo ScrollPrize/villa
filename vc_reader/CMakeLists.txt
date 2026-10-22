@@ -6,7 +6,7 @@ project(vc_reader_extensions LANGUAGES CXX)
 # scikit-build-core. Needs libcurl, c-blosc, zstd and SQLite development files:
 #   Ubuntu: apt install libcurl4-openssl-dev libblosc-dev libzstd-dev libsqlite3-dev
 #   macOS:  brew install c-blosc zstd sqlite   (libcurl comes with the SDK)
-# VC-Delta3D is fetched at a pinned commit (the same codec VC3D links).
+# VC-Delta3D is fetched at a pinned commit (v0.2.0: adds multi-channel and signed chunks).
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -155,7 +155,7 @@ if(VC_READER_BUILD_READER)
     set(VC_DELTA3D_INSTALL_CPP OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(vc_delta3d
         GIT_REPOSITORY https://github.com/ScrollPrize/vc-delta3d.git
-        GIT_TAG 457f612aa0379a73fd750d8b8e61eb8b11bf45fd  # v0.1.1
+        GIT_TAG 2473e878173aafa4defd277f9ff3bbf25c573541  # v0.2.0 (multi-channel and signed chunks)
         GIT_SHALLOW FALSE)
     FetchContent_MakeAvailable(vc_delta3d)
     set_target_properties(vc_delta3d PROPERTIES POSITION_INDEPENDENT_CODE ON)

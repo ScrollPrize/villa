@@ -19,14 +19,25 @@ Outputs whose patch/stride block contains only zero (masked-out) voxels are not
 embedded and stay zero; tiles without any such valid output are skipped. Intensity
 statistics for normalization come from nonzero voxels of a fixed sample of the whole
 volume, so every tile and region is normalized identically.
+
+Without --z-start, the CLI streams the entire volume into one group. --slab-depth
+sets the bounded processing depth (default: two lattice strides). Re-run the same
+command with --resume to skip committed slabs and retry an interrupted slab.
+Local vc_reader cache paths are resolved to their remote source so uncached chunks
+can be fetched. --codec vc-delta3d compresses every int8 embedding array losslessly;
+the float16 per-vector scale arrays use Zstd.
 """
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
 import json
 import math
 import os
+import shutil
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
@@ -43,7 +54,7 @@ from dinovol_2.dataset.volume_reader import open_volume
 from dinovol_2.eval.napari_visualizer import (
     LoadedBackbone, _configure_backbone_for_spatial_shape, load_backbone_from_checkpoint,
 )
-from dinovol_2.ops.point_embeddings import sample_grid_points
+from dinovol_2.ops.point_embeddings import grid_sample_geometry, sample_grid_points
 
 OUTPUT_NAMES = ("tokens", "tokens_unit", "dense", "ink")
 OUTPUT_VALUES = {
@@ -53,10 +64,18 @@ OUTPUT_VALUES = {
     "ink": "unit-norm blended embedding",
 }
 DTYPES = ("int8", "float16")
-# Per-output storage: int8 with a per-vector scale array, int8 at a fixed 1/127 scale (unit vectors only;
-# keeps trilinear interpolation of the stored values linear), or plain floats.
-STORAGE = {"int8": (np.int8, True, None), "unit8": (np.int8, False, 1 / 127), "float16": (np.float16, False, None),
-           "float32": (np.float32, False, None)}
+# Per-output storage: (dtype, per-vector scale array, fixed value scale, codec). int8 with a per-vector
+# scale array, int8 at a fixed 1/127 scale (unit vectors only; keeps trilinear interpolation of the stored
+# values linear), or plain floats. Fixed-scale fields vary smoothly in space, so vc-delta3d (lossless,
+# channels last) stores them ~5x smaller than Zstd; per-vector scales break that smoothness.
+STORAGE = {"int8": (np.int8, True, None, "zstd"), "unit8": (np.int8, False, 1 / 127, "vc-delta3d"),
+           "float16": (np.float16, False, None, "zstd"), "float32": (np.float32, False, None, "zstd")}
+# --dtype int8 stores the unit-norm head outputs at the fixed scale; tokens keep per-vector scales.
+CLI_DTYPES = {"int8": {"dense": "unit8", "ink": "unit8"}, "float16": {}}
+CODECS = ("zstd", "vc-delta3d")
+QUANTIZATION = {"int8": "symmetric int8 per vector: value = q * scale; scale in <name>_scale",
+                "unit8": "fixed-scale int8: value = q * value_scale (1/127, in the array's .zattrs)",
+                "float16": None, "float32": None}
 FORMAT = "dinovol-embeddings/1"
 DENSE_POINT_CHUNK_SIZE = 32_768  # every dense-head call is padded to exactly this many points
 CHUNK_BYTES = 16 << 20
@@ -238,44 +257,111 @@ def _chunk_shape(shape: Sequence[int], cell: int, itemsize: int, *, z_cell: bool
 
 
 class ZarrGroupWriter:
-    """Minimal zarr v2 writer (Zstd, '/' separator) that never writes all-zero chunks."""
+    """Minimal zarr v2 writer (Zstd or vc-delta3d, '/' separator) omitting all-fill chunks."""
 
     def __init__(self, path: str | Path, *, attrs: dict[str, Any] | None, overwrite: bool = False,
-                 workers: int = 8):
+                 workers: int = 8, async_transfers: bool = True):
         """attrs=None opens an existing group to add arrays; otherwise a new group is started."""
         self.path = Path(path)
         self.arrays: dict[str, tuple[tuple[int, ...], tuple[int, ...], np.dtype]] = {}
+        self.fill_values: dict[str, int | float] = {}
+        self.codecs: dict[str, str] = {}
+        self.channel_axes: dict[str, str] = {}
         if attrs is None:
             for meta_path in self.path.glob("*/.zarray"):
                 meta = json.loads(meta_path.read_text())
                 self.arrays[meta_path.parent.name] = (tuple(meta["shape"]), tuple(meta["chunks"]),
                                                       np.dtype(meta["dtype"]))
+                self.fill_values[meta_path.parent.name] = meta.get("fill_value", 0)
+                self.codecs[meta_path.parent.name] = (meta.get("compressor") or {}).get("id", "zstd")
+                self.channel_axes[meta_path.parent.name] = (meta.get("compressor") or {}).get("channel_axis", "last")
         else:
-            if self.path.exists() and any(self.path.iterdir()) and not overwrite:
-                raise FileExistsError(f"{self.path} exists; pass --overwrite to replace chunks")
+            if self.path.exists() and any(self.path.iterdir()):
+                if not overwrite:
+                    raise FileExistsError(f"{self.path} exists; pass --resume or --overwrite")
+                if not (self.path / ".zgroup").is_file():
+                    raise ValueError(f"refusing to overwrite a directory without .zgroup: {self.path}")
+                shutil.rmtree(self.path)
             self.path.mkdir(parents=True, exist_ok=True)
             (self.path / ".zgroup").write_text(json.dumps({"zarr_format": 2}))
             (self.path / ".zattrs").write_text(json.dumps(attrs, indent=2))
-        self.codec = Zstd(level=3)
+        self.zstd = Zstd(level=3)
         self.pool = concurrent.futures.ThreadPoolExecutor(workers)
         self.pending: list[concurrent.futures.Future] = []
+        self.async_transfers = async_transfers
+        self._write_lock = threading.Lock()
+        self._transfer_pool = None
+        self._transfers = []
+        self._copy_streams = {}
 
     def create(self, name: str, shape: Sequence[int], chunks: Sequence[int], dtype,
-               attrs: dict[str, Any] | None = None) -> None:
+               attrs: dict[str, Any] | None = None, *, fill_value: int | float = 0, codec: str = "zstd",
+               channel_axis: str = "last") -> None:
+        """vc-delta3d needs integer 4D chunks holding all channels, first or last."""
         dtype = np.dtype(dtype)
+        if channel_axis not in ("first", "last"):
+            raise ValueError("channel_axis must be first or last")
+        if codec not in CODECS:
+            raise ValueError(f"codec must be one of {CODECS}")
+        if codec == "vc-delta3d":
+            axis = 0 if channel_axis == "first" else 3
+            if len(shape) != 4 or len(chunks) != 4 or int(chunks[axis]) != int(shape[axis]) or dtype.kind not in "iu":
+                raise ValueError(f"{name}: vc-delta3d needs integer 4D chunks with all channels")
+            compressor = {"id": "vc-delta3d", "quant": 1, "channel_axis": channel_axis}
+        else:
+            compressor = self.zstd.get_config()
         root = self.path / name
         root.mkdir(exist_ok=True)
         if attrs:
             (root / ".zattrs").write_text(json.dumps(attrs, indent=2))
         meta = {"zarr_format": 2, "shape": [int(v) for v in shape], "chunks": [int(v) for v in chunks],
-                "dtype": dtype.str, "fill_value": 0, "compressor": self.codec.get_config(),
+                "dtype": dtype.str, "fill_value": fill_value, "compressor": compressor,
                 "filters": None, "order": "C", "dimension_separator": "/"}
         (root / ".zarray").write_text(json.dumps(meta, indent=2))
         self.arrays[name] = (tuple(meta["shape"]), tuple(meta["chunks"]), dtype)
+        self.fill_values[name] = fill_value
+        self.codecs[name] = codec
+        self.channel_axes[name] = channel_axis
 
     def write(self, name: str, start: Sequence[int], block: np.ndarray) -> None:
         """Write a block whose start is chunk-aligned and which ends on chunks or the array edge."""
+        with self._write_lock:
+            self._write(name, start, block)
+
+    def write_tensor(self, name: str, start: Sequence[int], block: torch.Tensor) -> None:
+        """Stage an immutable CUDA block to pinned memory while inference continues.
+
+        A single submission worker waits for the copy event before reading host data.
+        At most four blocks can be in flight; flush also waits for their chunk writes.
+        """
+        if not block.is_cuda or not self.async_transfers:
+            self.write(name, start, block.cpu().numpy())
+            return
+        while self._transfers and (self._transfers[0].done() or len(self._transfers) >= 4):
+            self._transfers.pop(0).result()
+        if self._transfer_pool is None:
+            self._transfer_pool = concurrent.futures.ThreadPoolExecutor(1)
+        if block.device not in self._copy_streams:
+            self._copy_streams[block.device] = torch.cuda.Stream(device=block.device)
+        stream = self._copy_streams[block.device]
+        block = block.contiguous()
+        host = torch.empty(block.shape, dtype=block.dtype, device="cpu", pin_memory=True)
+        stream.wait_stream(torch.cuda.current_stream(block.device))
+        with torch.cuda.stream(stream):
+            host.copy_(block, non_blocking=True)
+            block.record_stream(stream)
+            ready = torch.cuda.Event()
+            ready.record(stream)
+
+        def submit():
+            ready.synchronize()
+            self.write(name, start, host.numpy())
+
+        self._transfers.append(self._transfer_pool.submit(submit))
+
+    def _write(self, name: str, start: Sequence[int], block: np.ndarray) -> None:
         shape, chunks, dtype = self.arrays[name]
+        fill_value = self.fill_values[name]
         start = tuple(int(v) for v in start) + (0,) * (len(shape) - len(start))
         for axis, (s, c, n, size) in enumerate(zip(start, chunks, block.shape, shape)):
             if s % c or ((s + n) % c and s + n != size):
@@ -284,33 +370,75 @@ class ZarrGroupWriter:
         for index in np.ndindex(*counts):
             lo = [i * c for i, c in zip(index, chunks)]
             part = block[tuple(slice(l, l + c) for l, c in zip(lo, chunks))]
-            if not part.any():
+            if np.all(part == fill_value):
                 continue
             chunk_index = [(s + l) // c for s, l, c in zip(start, lo, chunks)]
             if part.shape != chunks:
-                padded = np.zeros(chunks, dtype=dtype)
+                padded = np.full(chunks, fill_value, dtype=dtype)
                 padded[tuple(slice(0, n) for n in part.shape)] = part
                 part = padded
-            self._submit(self.path / name / "/".join(map(str, chunk_index)), np.ascontiguousarray(part, dtype))
+            self._submit(self.path / name / "/".join(map(str, chunk_index)), np.ascontiguousarray(part, dtype),
+                         self.codecs[name], self.channel_axes[name])
 
-    def _submit(self, path: Path, data: np.ndarray) -> None:
-        for future in [f for f in self.pending if f.done()]:
-            future.result()
-        self.pending = [f for f in self.pending if not f.done()]
+    def _submit(self, path: Path, data: np.ndarray, codec: str = "zstd", channel_axis: str = "last") -> None:
+        pending = []
+        for future in self.pending:
+            if future.done():
+                future.result()
+            else:
+                pending.append(future)
+        self.pending = pending
         while len(self.pending) > 64:
             self.pending.pop(0).result()
-        self.pending.append(self.pool.submit(self._store, path, data))
+        self.pending.append(self.pool.submit(self._store, path, data, codec, channel_axis))
 
-    def _store(self, path: Path, data: np.ndarray) -> None:
+    def _store(self, path: Path, data: np.ndarray, codec: str = "zstd", channel_axis: str = "last") -> None:
+        if codec == "vc-delta3d":
+            from vc_reader import _reader
+
+            # Decoded and compared with the input before it is returned.
+            last = channel_axis == "last"
+            encoded = _reader._encode_delta3d_channels_verified(
+                data.tobytes(), list(data.shape[:3] if last else data.shape[1:]),
+                int(data.shape[3] if last else data.shape[0]), last, data.itemsize)
+        else:
+            encoded = self.zstd.encode(data)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.tmp")
-        tmp.write_bytes(self.codec.encode(data))
+        tmp.write_bytes(encoded)
         os.replace(tmp, path)
 
-    def close(self) -> None:
+    def flush(self) -> None:
+        """Wait for all chunk writes before recording a completed slab."""
+        for future in self._transfers:
+            future.result()
+        self._transfers.clear()
         for future in self.pending:
             future.result()
-        self.pool.shutdown()
+        self.pending.clear()
+
+    def close(self) -> None:
+        try:
+            self.flush()
+        finally:
+            if self._transfer_pool is not None:
+                self._transfer_pool.shutdown(wait=True)
+            self.pool.shutdown(wait=True)
+
+    def clear_z_range(self, z_range: tuple[int, int], *, array_z_start: int,
+                      steps: dict[str, int]) -> None:
+        """Remove an unfinished slab's chunks before retrying (including now-empty chunks)."""
+        self.flush()
+        for name, (shape, chunks, _) in self.arrays.items():
+            step = steps[name.removesuffix("_scale")]
+            lo, hi = ((z - array_z_start) // step for z in z_range)
+            hi = min(hi, shape[0])
+            if lo % chunks[0] or (hi % chunks[0] and hi != shape[0]):
+                raise ValueError(f"{name}: retry slab is not chunk aligned")
+            for z in range(lo // chunks[0], -(-hi // chunks[0])):
+                root = self.path / name / str(z)
+                if root.exists():
+                    shutil.rmtree(root)
 
 
 def read_embeddings(path: str | Path, name: str, selection: Any = ...) -> np.ndarray:
@@ -362,12 +490,39 @@ class RegionEmbedder:
     def __init__(self, reader, loaded: LoadedBackbone, *, transforms: list, outputs: Sequence[str],
                  dense_stride: int, lattice: Sequence[AxisLattice], dtype: str = "int8",
                  dtypes: dict[str, str] | None = None,
-                 amp_dtype: torch.dtype = torch.bfloat16, point_chunk_size: int = DENSE_POINT_CHUNK_SIZE):
-        """dtypes overrides the storage (a STORAGE key) of individual outputs."""
+                 codec: str | None = None,
+                 compile_model: bool = False,
+                 amp_dtype: torch.dtype = torch.bfloat16, point_chunk_size: int = DENSE_POINT_CHUNK_SIZE,
+                 strip_device: str | torch.device = "cpu", point_sampler: str = "auto",
+                 transformer_precision: str = "bf16", column_block_size: int = 16):
+        """dtypes overrides the storage (a STORAGE key) of individual outputs. strip_device holds the
+        overlap strips pending for the next row (one per column; the GPU is faster when it has room)."""
         self.reader, self.loaded, self.device = reader, loaded, loaded.device
+        self.strip_device = torch.device(strip_device)
+        self.column_block_size = int(column_block_size)
+        if self.column_block_size < 0:
+            raise ValueError("column_block_size must be nonnegative")
         self.backbone, self.dense_head = loaded.backbone, loaded.dense_head
+        self.backbone.eval().requires_grad_(False)
+        if self.dense_head is not None:
+            self.dense_head.eval().requires_grad_(False)
         self.lattice, self.dtype, self.amp_dtype = tuple(lattice), dtype, amp_dtype
         self.point_chunk_size = int(point_chunk_size)
+        if transformer_precision not in ("bf16", "fp8"):
+            raise ValueError("transformer_precision must be 'bf16' or 'fp8'")
+        if transformer_precision == "fp8" and (not compile_model or amp_dtype != torch.bfloat16):
+            raise ValueError("FP8 transformer inference requires compilation and BF16 autocast")
+        self.transformer_precision = transformer_precision
+        self.compile_mode = "max-autotune-no-cudagraphs" if transformer_precision == "fp8" else "default"
+        if point_sampler not in ("auto", "torch"):
+            raise ValueError("point_sampler must be 'auto' or 'torch'")
+        self.point_sampler = point_sampler
+        self.sampling_backend = "torch"
+        if point_sampler == "auto" and self.device.type == "cuda":
+            from dinovol_2.ops.selected_interpolation import available
+            if available():
+                self.sampling_backend = "triton"
+        self._sampling_geometry = {}
         patch = tuple(int(p) for p in loaded.patch_size)
         self.patch = patch
         if dtype not in DTYPES:
@@ -395,6 +550,12 @@ class RegionEmbedder:
         for name, storage in self.dtypes.items():
             if storage not in STORAGE or (storage == "unit8" and name == "tokens"):
                 raise ValueError(f"{name}: unsupported storage {storage!r}")
+        if codec is not None and codec not in CODECS:
+            raise ValueError(f"codec must be one of {CODECS}")
+        self.codecs = {name: codec or STORAGE[storage][3] for name, storage in self.dtypes.items()}
+        if any(self.codecs[name] == "vc-delta3d" and np.dtype(STORAGE[storage][0]).kind not in "iu"
+               for name, storage in self.dtypes.items()):
+            raise ValueError("vc-delta3d requires integer outputs; use --dtype int8")
         # Accumulated grids; tokens_unit is written from the tokens accumulator.
         accumulated = {"tokens" if name == "tokens_unit" else name for name in self.outputs}
         self.specs = [OutputSpec(name, patch if name == "tokens" else (dense_stride,) * 3, channels[name])
@@ -402,6 +563,22 @@ class RegionEmbedder:
         self.pipeline = A.Pipeline(transforms, targets={"image": A.Image(valid=None)}, backend="cuda",
                                    compact=False)
         _configure_backbone_for_spatial_shape(self.backbone, tuple(lat.tile for lat in self.lattice))
+        self.backbone.return_embed_skips = any(spec.name != "tokens" for spec in self.specs)
+        if transformer_precision == "fp8":
+            from dinovol_2.ops.fp8_inference import enable_fp8_transformer
+            enable_fp8_transformer(self.backbone)
+        # Compile the methods actually called below: compiling Module.forward would not cover
+        # forward_features / fpn_grid / readout. Compilation is lazy, on the first inference call.
+        self._forward_features = self.backbone.forward_features
+        if self.backbone.return_embed_skips:
+            self._fpn_grid = self.dense_head.fpn_grid
+            self._readout = self.dense_head.readout
+        if compile_model:
+            options = dict(backend="inductor", mode=self.compile_mode, dynamic=False)
+            self._forward_features = torch.compile(self._forward_features, **options)
+            if self.backbone.return_embed_skips:
+                self._fpn_grid = torch.compile(self._fpn_grid, **options)
+                self._readout = torch.compile(self._readout, **options)
 
     # -- geometry ---------------------------------------------------------
 
@@ -429,8 +606,9 @@ class RegionEmbedder:
     def create_arrays(self, sink, z_range: tuple[int, int], *, z_cell: bool = False) -> None:
         """Create every output (and int8 scale) array in sink for outputs covering z_range."""
         for name, spec, shape, chunks in self.arrays(z_range, z_cell=z_cell):
-            dtype, scaled, value_scale = STORAGE[self.dtypes[name]]
-            sink.create(name, shape, chunks, dtype, attrs={"value_scale": value_scale} if value_scale else None)
+            dtype, scaled, value_scale, _ = STORAGE[self.dtypes[name]]
+            sink.create(name, shape, chunks, dtype, attrs={"value_scale": value_scale} if value_scale else None,
+                        codec=self.codecs[name])
             if scaled:
                 sink.create(f"{name}_scale", shape[:3], chunks[:3], np.float16)
 
@@ -445,6 +623,31 @@ class RegionEmbedder:
     def run(self, sink, *, z_range: tuple[int, int], y_range: tuple[int, int] | None = None,
             x_range: tuple[int, int] | None = None, progress: bool = True, need=None,
             array_z_range: tuple[int, int] | None = None, read: str = "band") -> dict[str, int]:
+        """Embed a region in bounded-width column blocks, retaining overlaps on their device.
+
+        Blocks own disjoint output cells and each recompute one left halo column.
+        This bounds row-strip memory independently of the full volume width.
+        """
+        stride = self.lattice[2].stride
+        lo, hi = x_range or (0, int(self.reader.shape[2]))
+        first, stop = lo // stride, (min(hi, int(self.reader.shape[2])) - 1) // stride + 1
+        width = self.column_block_size or max(1, stop - first)
+        totals = {}
+        for begin in range(first, stop, width):
+            end = min(begin + width, stop)
+            if progress and stop - first > width:
+                print(f"column block: x={max(lo, begin * stride)}:{min(hi, end * stride)}", flush=True)
+            stats = self._run_columns(
+                sink, z_range=z_range, y_range=y_range,
+                x_range=(max(lo, begin * stride), min(hi, end * stride)),
+                progress=progress, need=need, array_z_range=array_z_range, read=read)
+            for key, value in stats.items():
+                totals[key] = totals.get(key, 0) + value
+        return totals
+
+    def _run_columns(self, sink, *, z_range: tuple[int, int], y_range: tuple[int, int] | None = None,
+                     x_range: tuple[int, int] | None = None, progress: bool = True, need=None,
+                     array_z_range: tuple[int, int] | None = None, read: str = "band") -> dict[str, int]:
         """Embed z_range (cells overlapping y/x_range) into sink.
 
         need(z0, z1, y0, x0, size, margin) -> bool tensor or None: the voxels to embed over
@@ -494,6 +697,7 @@ class RegionEmbedder:
                         need_mask = need(z0, z1, ky * ly.stride, kx * lx.stride, ly.support, NEED_MARGIN)
                         if need_mask is None:
                             stats["skipped_columns"] += 1
+                            top.pop(kx, None)
                             left = None
                             bar.update(1)
                             continue
@@ -508,14 +712,20 @@ class RegionEmbedder:
                     acc, valid = self._embed_column(column, band_z0, (z0, z1), ky, kx, box, tiles_z, stats,
                                                     need_mask)
                     if acc is not None:
+                        # This strip has no further consumers. Releasing it here avoids holding
+                        # both complete rows at once, especially when strips live on the GPU.
                         self._finish_column(sink, acc, valid, (z0, z1), ky, kx, cells_y, cells_x,
-                                            top.get(kx), left, next_top, stats, array_z_range)
-                        left = {spec.name: acc[spec.name][:, :ly.stride // spec.step[1], lx.stride // spec.step[2]:]
+                                            top.pop(kx, None), left, next_top, stats, array_z_range)
+                        # A view would retain the entire multi-GiB accumulator during
+                        # the next column's model/transform allocations.
+                        left = {spec.name: acc[spec.name][:, :ly.stride // spec.step[1], lx.stride // spec.step[2]:].clone()
                                 for spec in self.specs}
                     else:
                         # No valid output here: neighbors' strips into this column are dropped too.
                         stats["skipped_columns"] += 1
+                        top.pop(kx, None)
                         left = None
+                    del acc, valid
                     bar.update(1)
                 top = next_top
         bar.close()
@@ -563,7 +773,7 @@ class RegionEmbedder:
         if not any(v.any() for v in valid.values()):
             return None, None
         stats["columns"] += 1
-        image = self.pipeline.batch({"image": raw[None, None]}, seeds=[0], device=self.device)["image"][0, 0]
+        image = self._normalize_column(raw)
         acc = {}
         for spec in self.specs:
             grid = tuple(n // s for n, s in zip(nonzero.shape, spec.step))
@@ -580,7 +790,7 @@ class RegionEmbedder:
             tile = image[a_z - band_z0:a_z - band_z0 + lz.tile][None, None].contiguous()
             with torch.autocast(self.device.type, dtype=self.amp_dtype):
                 self.backbone.return_embed_skips = bool(point_specs)
-                out = self.backbone.forward_features(tile, masks=None, view_kind="global")
+                out = self._forward_features(tile, masks=None, view_kind="global")
             tokens = out["x_norm_patchtokens"][0]
             token_grid = tokens.reshape(*(lat.tile // p for lat, p in zip(self.lattice, self.patch)), -1)
             for spec in self.specs:
@@ -589,6 +799,21 @@ class RegionEmbedder:
             if point_specs:
                 self._add_points(acc, valid, point_specs, token_grid, out["embed_skips"], (lo, hi), z0, a_z)
         return acc, valid
+
+    def _normalize_column(self, raw):
+        batch = {"image": raw[None, None]}
+        try:
+            return self.pipeline.batch(batch, seeds=[0], device=self.device)["image"][0, 0]
+        except RuntimeError as error:
+            if self.device.type != "cuda" or str(error) != "CUDA transform: out of memory":
+                raise
+        # vc_reader's scratch allocations use CUDA's pool, outside PyTorch's
+        # allocator. They cannot reclaim idle PyTorch blocks automatically.
+        # Leave the except block first to release the failed batch's traceback
+        # and tensors, then return cached blocks to CUDA and retry only once.
+        with torch.cuda.device(self.device):
+            torch.cuda.empty_cache()
+        return self.pipeline.batch(batch, seeds=[0], device=self.device)["image"][0, 0]
 
     def _add_tokens(self, acc, token_grid, z_bounds, z0, a_z):
         lz, ly, lx = self.lattice
@@ -603,6 +828,13 @@ class RegionEmbedder:
         target = acc[(lo - z0) // pz:(hi - z0) // pz]
         target[..., :-1] += block * weight[..., None]
         target[..., -1] += weight
+
+    def _sample_points(self, grid, points, input_shape):
+        key = (tuple(grid.shape[1:4]), tuple(input_shape), points.device, points.dtype)
+        if key not in self._sampling_geometry:
+            self._sampling_geometry[key] = grid_sample_geometry(grid.shape[1:4], input_shape, points)
+        return sample_grid_points(grid, points, input_shape, geometry=self._sampling_geometry[key],
+                                  use_triton=self.point_sampler == "auto")
 
     def _add_points(self, acc, valid, specs, token_grid, skips, z_bounds, z0, a_z):
         lz, ly, lx = self.lattice
@@ -630,13 +862,13 @@ class RegionEmbedder:
         padded = torch.cat([coords, coords[-1:].expand(-n % chunk, 3)]) if n % chunk else coords
         with torch.autocast(self.device.type, dtype=self.amp_dtype):
             grid = token_grid[None]
-            fpn_grid = head.fpn_grid(grid, skips)
+            fpn_grid = self._fpn_grid(grid, skips)
             skip_grids = [level.permute(0, 2, 3, 4, 1) for level in skips]
             for begin in range(0, n, chunk):
                 points = padded[None, begin:begin + chunk]
-                fpn = head.fpn_norm(sample_grid_points(fpn_grid, points, input_shape).to(grid.dtype))
-                readout = head.readout(sample_grid_points(grid, points, input_shape),
-                                       [sample_grid_points(g, points, input_shape) for g in skip_grids],
+                fpn = head.fpn_norm(self._sample_points(fpn_grid, points, input_shape).to(grid.dtype))
+                readout = self._readout(self._sample_points(grid, points, input_shape),
+                                       [self._sample_points(g, points, input_shape) for g in skip_grids],
                                        fpn, dtype=grid.dtype)
                 w = weight[begin:begin + chunk, None]
                 rows = flat[begin:begin + chunk]
@@ -656,12 +888,12 @@ class RegionEmbedder:
             # (the corner) to cell kx + 1, which this column reaches first.
             below = next_top.setdefault(kx, {})
             if spec.name in below:
-                below[spec.name] += a[:, sy:, :sx].cpu()
+                below[spec.name] += a[:, sy:, :sx].to(self.strip_device)
             else:
-                below[spec.name] = a[:, sy:, :sx].cpu()
+                below[spec.name] = a[:, sy:, :sx].to(self.strip_device, copy=True)
             corner = next_top.setdefault(kx + 1, {})
-            corner[spec.name] = torch.zeros((a.shape[0], ry, sx, a.shape[3]))
-            corner[spec.name][:, :, :rx] = a[:, sy:, sx:].cpu()
+            corner[spec.name] = torch.zeros((a.shape[0], ry, sx, a.shape[3]), device=self.strip_device)
+            corner[spec.name][:, :, :rx] = a[:, sy:, sx:].to(self.strip_device)
             if ky not in cells_y or kx not in cells_x:
                 continue
             cell = a[:, :sy, :sx].clone()
@@ -685,15 +917,168 @@ class RegionEmbedder:
                 if name not in self.outputs:
                     continue
                 data, scale = quantize(values, ok, self.dtypes[name])
-                sink.write(name, (zi, y0, x0), data[:nz, :ny, :nx].cpu().numpy())
+                self._write_output(sink, name, (zi, y0, x0), data[:nz, :ny, :nx])
                 if scale is not None:
-                    sink.write(f"{name}_scale", (zi, y0, x0), scale[:nz, :ny, :nx].cpu().numpy())
+                    self._write_output(sink, f"{name}_scale", (zi, y0, x0), scale[:nz, :ny, :nx])
         if ky in cells_y and kx in cells_x:
             stats["cells_written"] += 1
+
+    @staticmethod
+    def _write_output(sink, name, start, block):
+        if hasattr(sink, "write_tensor"):
+            sink.write_tensor(name, start, block)
+        else:
+            sink.write(name, start, block.cpu().numpy())
 
 
 # ---------------------------------------------------------------------------
 # CLI
+
+
+def plan_slabs(z_range: tuple[int, int], slab_depth: int) -> list[tuple[int, int]]:
+    """Fixed-depth processing slabs; the last may overhang the output array."""
+    lo, hi = z_range
+    if lo < 0 or hi <= lo or slab_depth <= 0:
+        raise ValueError("need a nonempty, nonnegative z range and positive slab depth")
+    return [(z, z + slab_depth) for z in range(lo, hi, slab_depth)]
+
+
+def resolve_volume_source(volume: str, level: int, cache_dir: str | None) -> tuple[str, str | None]:
+    """Treat a local vc_reader cache as a cache of its remote source, allowing misses to fetch."""
+    if "://" in volume:
+        return volume.rstrip("/"), cache_dir
+    path = Path(volume).resolve()
+    meta_path = path / str(level) / ".zattrs"
+    meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+    source = meta.get("vc_reader", {}).get("source_url")
+    if not source:
+        return str(path), cache_dir
+    suffix = f"/{level}"
+    if not source.endswith(suffix):
+        raise ValueError(f"cached source {source!r} does not match --level {level}")
+    if cache_dir is None:
+        relative = Path(source.replace("://", "/", 1)).parts
+        array_path = meta_path.parent
+        if tuple(array_path.parts[-len(relative):]) != relative:
+            raise ValueError("cannot infer the cache root from this cache path; pass --cache-dir")
+        cache_dir = str(array_path.parents[len(relative) - 1])
+    return source[:-len(suffix)], cache_dir
+
+
+def atomic_json(path: Path, data: dict) -> None:
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, path)
+
+
+@contextmanager
+def output_lock(path: Path):
+    """One CLI writer per group; the OS releases the lock even after a killed process."""
+    import fcntl  # supported on both Linux and macOS
+
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Leave the lock inode in place: unlinking would let concurrent writers lock different files.
+    with (path.parent / f".{path.name}.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError(f"another embedding process is writing {path}") from None
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def validate_resume(saved: dict, expected: dict, path: Path) -> None:
+    """Check configuration and on-disk schemas before modifying an existing output."""
+    for key, value in expected.items():
+        # Earlier manifests imply BF16 and the original fixed 32768-point batch.
+        default = {"point_batch_size": DENSE_POINT_CHUNK_SIZE, "transformer_precision": "bf16"}.get(key)
+        if saved.get(key, default) != value:
+            raise ValueError(f"cannot resume: {key} differs from the saved run")
+    if not (path / ".zgroup").is_file():
+        raise ValueError("cannot resume: missing .zgroup")
+    wanted = set()
+    for name, info in expected["outputs"].items():
+        dtype, scaled, value_scale, _ = STORAGE[info["dtype"]]
+        arrays = [(name, info["shape_zyxc"], info["chunks_zyxc"], dtype, info["codec"])]
+        if scaled:
+            arrays.append((name + "_scale", info["shape_zyxc"][:3], info["chunks_zyxc"][:3],
+                           np.float16, "zstd"))
+        for array, shape, chunks, dt, codec in arrays:
+            wanted.add(array)
+            meta = json.loads((path / array / ".zarray").read_text())
+            compressor = ({"id": "vc-delta3d", "quant": 1, "channel_axis": "last"}
+                          if codec == "vc-delta3d" else Zstd(level=3).get_config())
+            fields = dict(zarr_format=2, shape=shape, chunks=chunks, dtype=np.dtype(dt).str,
+                          fill_value=0, order="C", filters=None, dimension_separator="/", compressor=compressor)
+            if any(meta.get(k) != v for k, v in fields.items()):
+                raise ValueError(f"cannot resume: {array} storage metadata differs")
+        attrs_path = path / name / ".zattrs"
+        attrs = json.loads(attrs_path.read_text()) if attrs_path.exists() else {}
+        if attrs.get("value_scale") != value_scale:
+            raise ValueError(f"cannot resume: {name} value_scale differs")
+    if {p.parent.name for p in path.glob("*/.zarray")} != wanted:
+        raise ValueError("cannot resume: output arrays differ")
+    completed = saved.get("completed_slabs")
+    if not isinstance(completed, dict) or any(k not in {str(i) for i in range(len(expected["slabs"]))}
+                                               for k in completed):
+        raise ValueError("cannot resume: invalid completed_slabs manifest")
+
+
+def pending_slab_groups(slabs, completed, group_size):
+    """Consecutive unfinished slabs, never spanning a committed slab or a gap."""
+    if group_size < 1:
+        raise ValueError("slab group size must be positive")
+    group = []
+    for i, slab in enumerate(slabs):
+        if group and (str(i) in completed or slab[0] != slabs[group[-1]][1] or len(group) == group_size):
+            yield group
+            group = []
+        if str(i) not in completed:
+            group.append(i)
+    if group:
+        yield group
+
+
+def run_slabs(embedder, sink, attrs: dict, *, resume: bool, read: str = "band",
+              slab_group_size: int = 1) -> dict[str, int]:
+    """Commit each slab only after its async chunk writes succeed; retry partial slabs cleanly."""
+    z_range = tuple(attrs["z_range"])
+    completed = attrs.setdefault("completed_slabs", {})
+    steps = {name: info["step_zyx"][0] for name, info in attrs["outputs"].items()}
+    for group in pending_slab_groups(attrs["slabs"], completed, slab_group_size):
+        slab = (attrs["slabs"][group[0]][0], attrs["slabs"][group[-1]][1])
+        print(f"slabs {group[0] + 1}-{group[-1] + 1}/{len(attrs['slabs'])}: "
+              f"z={slab[0]}:{min(slab[1], z_range[1])}", flush=True)
+        if resume:
+            sink.clear_z_range(slab, array_z_start=z_range[0], steps=steps)
+        stats = embedder.run(sink, z_range=slab, array_z_range=z_range,
+                             y_range=attrs["y_range"], x_range=attrs["x_range"], read=read)
+        sink.flush()
+        # One atomic manifest update commits the entire group after all its writes.
+        # Counts describe actual work (including reused boundary tiles), so store
+        # them once on the group's first slab; the other completion entries are empty.
+        for i in group:
+            completed[str(i)] = stats if i == group[0] else {}
+            # Performance backends may change between slabs (small rounding differences
+            # are allowed). Record them without invalidating old manifests.
+            attrs.setdefault("slab_runtime", {})[str(i)] = {
+                "point_sampler": embedder.sampling_backend,
+                "async_output": sink.async_transfers,
+                "group_slabs": group,
+                "column_block_size": embedder.column_block_size,
+            }
+        atomic_json(sink.path / ".zattrs", attrs)
+    totals: dict[str, int] = {}
+    for stats in completed.values():
+        for key, value in stats.items():
+            totals[key] = totals.get(key, 0) + value
+    attrs["run"] = totals
+    attrs["complete"] = True
+    atomic_json(sink.path / ".zattrs", attrs)
+    return totals
 
 
 def parse_args(argv=None):
@@ -704,15 +1089,43 @@ def parse_args(argv=None):
     parser.add_argument("--volume", help="ome-zarr URL or path (s3:// uses --cache-dir)")
     parser.add_argument("--level", type=int, default=0)
     parser.add_argument("--cache-dir", default=None)
+    parser.add_argument("--offline", action="store_true", help="fail on uncached chunks instead of fetching")
+    parser.add_argument("--no-cache-writes", action="store_true", help="fetch misses without caching them")
     parser.add_argument("--connections", type=int, default=32)
     parser.add_argument("--threads", type=int, default=16, help="vc_reader read threads")
+    parser.add_argument("--torch-threads", type=int, default=None,
+                        help="PyTorch CPU threads (default: PyTorch's environment setting)")
+    parser.add_argument("--writer-workers", type=int, default=8, help="compression/write worker threads")
+    parser.add_argument("--strip-device", choices=("cpu", "cuda"), default="cpu",
+                        help="store row-overlap buffers on CPU or GPU (cuda uses more VRAM)")
+    parser.add_argument("--column-block-size", type=int, default=16,
+                        help="maximum output columns per pass, bounding row-strip memory "
+                             "(default: 16; 0 processes the full width)")
+    parser.add_argument("--point-batch-size", type=int, default=DENSE_POINT_CHUNK_SIZE,
+                        help="fixed dense-head point batch; must stay unchanged on resume")
+    parser.add_argument("--point-sampler", choices=("auto", "torch"), default="auto",
+                        help="auto uses fused Triton interpolation on CUDA (small rounding differences); "
+                             "torch uses the original sampler")
+    parser.add_argument("--async-output", action=argparse.BooleanOptionalAction, default=True,
+                        help="overlap pinned-memory output copies and writes with GPU inference (default: on)")
     parser.add_argument("--z-start", type=int)
-    parser.add_argument("--depth", type=int, default=192)
+    parser.add_argument("--depth", type=int, help="region depth (default: 192 with --z-start)")
+    parser.add_argument("--full-volume", action="store_true", help="embed all z (also the default without --z-start)")
+    parser.add_argument("--slab-depth", type=int,
+                        help="processing depth, a multiple of lattice stride (default: two strides)")
+    parser.add_argument("--slab-group-size", type=int, default=1,
+                        help="process adjacent unfinished slabs together to reuse boundary tiles; "
+                             "increases working memory, preserves the saved slab plan (default: 1)")
+    parser.add_argument("--read", choices=("band", "column"), default="band",
+                        help="band prefetches a row within the column block; column uses less host memory")
     parser.add_argument("--y-range", type=int, nargs=2, default=None, help="restrict to lattice cells overlapping [lo, hi)")
     parser.add_argument("--x-range", type=int, nargs=2, default=None, help="restrict to lattice cells overlapping [lo, hi)")
     parser.add_argument("--outputs", default=",".join(OUTPUT_NAMES))
     parser.add_argument("--dense-stride", type=int, default=1)
-    parser.add_argument("--dtype", choices=DTYPES, default="int8")
+    parser.add_argument("--dtype", choices=DTYPES, default="int8",
+                        help="int8: tokens with per-vector scales, dense/ink at a fixed 1/127 scale (vc-delta3d)")
+    parser.add_argument("--codec", choices=CODECS,
+                        help="override embedding compression; vc-delta3d requires int8 (float scale arrays use Zstd)")
     parser.add_argument("--tile", type=int, default=None, help="tile edge in voxels (default: training global crop)")
     parser.add_argument("--margin", type=int, default=None,
                         help="context-only voxels per tile face (default: tile/6, patch-aligned)")
@@ -721,13 +1134,37 @@ def parse_args(argv=None):
                         help="statistics JSON or an earlier output's .zattrs to reuse (skips sampling)")
     parser.add_argument("--stats-chunk-stride", type=int, default=8)
     parser.add_argument("--branch", default="teacher")
+    parser.add_argument("--compile", action=argparse.BooleanOptionalAction, default=True,
+                        help="compile backbone and dense-head inference methods with torch.compile (default: on)")
+    parser.add_argument("--transformer-precision", choices=("bf16", "fp8"), default="bf16",
+                        help="FP8 is lossy, opt-in transformer compute on NVIDIA GPUs >= SM89; "
+                             "requires --compile and a separate output from an existing BF16 run")
     parser.add_argument("--output")
-    parser.add_argument("--overwrite", action="store_true")
+    existing = parser.add_mutually_exclusive_group()
+    existing.add_argument("--overwrite", action="store_true")
+    existing.add_argument("--resume", action="store_true", help="continue an existing run with the same configuration")
     args = parser.parse_args(argv)
-    missing = [f"--{name.replace('_', '-')}" for name in ("checkpoint", "volume", "z_start", "output")
+    missing = [f"--{name.replace('_', '-')}" for name in ("checkpoint", "volume", "output")
                if getattr(args, name) is None]
     if args.add_unit_tokens is None and missing:
         parser.error(f"the following arguments are required: {', '.join(missing)}")
+    if args.full_volume and (args.z_start is not None or args.depth is not None):
+        parser.error("--full-volume cannot be combined with --z-start or --depth")
+    if args.depth is not None and args.z_start is None:
+        parser.error("--depth requires --z-start")
+    for name in ("depth", "slab_depth", "dense_stride", "stats_chunk_stride", "connections", "threads", "tile",
+                 "torch_threads", "writer_workers", "point_batch_size", "slab_group_size"):
+        value = getattr(args, name)
+        if value is not None and value <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.z_start is not None and args.z_start < 0:
+        parser.error("--z-start must be nonnegative")
+    if args.column_block_size < 0:
+        parser.error("--column-block-size must be nonnegative")
+    if args.codec == "vc-delta3d" and args.dtype != "int8":
+        parser.error("--codec vc-delta3d requires --dtype int8")
+    if args.transformer_precision == "fp8" and not args.compile:
+        parser.error("--transformer-precision fp8 requires --compile")
     return args
 
 
@@ -774,22 +1211,50 @@ def add_unit_tokens(path: str | Path, *, name: str = "tokens_unit", overwrite: b
 def main(argv=None) -> None:
     args = parse_args(argv)
     if args.add_unit_tokens is not None:
-        print(f"wrote {add_unit_tokens(args.add_unit_tokens, overwrite=args.overwrite)} tokens_unit chunks")
+        with output_lock(Path(args.add_unit_tokens)):
+            print(f"wrote {add_unit_tokens(args.add_unit_tokens, overwrite=args.overwrite)} tokens_unit chunks")
         return
+    with output_lock(Path(args.output)):
+        embed_volume(args)
+
+
+def embed_volume(args) -> None:
+    if args.torch_threads is not None:
+        torch.set_num_threads(args.torch_threads)
+    path = Path(args.output)
+    saved = None
+    if args.resume:
+        saved = json.loads((path / ".zattrs").read_text())
+        if saved.get("scheduler_version") != 1:
+            raise ValueError("cannot resume: this output has no supported slab manifest")
+    elif path.exists() and any(path.iterdir()) and not args.overwrite:
+        raise FileExistsError(f"{path} exists; pass --resume or --overwrite")
+    volume, cache_dir = resolve_volume_source(args.volume, args.level, args.cache_dir)
+    if volume != args.volume:
+        print(f"volume: {volume}\ncache: {cache_dir}", flush=True)
     torch.backends.cudnn.benchmark = False
-    s3 = {"anon": True} if str(args.volume).startswith("s3://") else None
-    reader = open_volume(args.volume, level=args.level, s3_storage_options=s3, cache_dir=args.cache_dir,
-                         connections=args.connections, threads=args.threads)
+    s3 = {"anon": True} if volume.startswith("s3://") else None
+    with open_volume(volume, level=args.level, s3_storage_options=s3, cache_dir=cache_dir,
+                     offline=args.offline, cache_writes=not (args.offline or args.no_cache_writes),
+                     connections=args.connections, threads=args.threads) as reader:
+        _embed_volume(args, reader, volume, saved)
+
+
+def _embed_volume(args, reader, volume: str, saved: dict | None) -> None:
     loaded = load_backbone_from_checkpoint(args.checkpoint, preferred_branch=args.branch)
     checkpoint_step = torch.load(args.checkpoint, map_location="cpu", weights_only=False, mmap=True).get("step")
+    with Path(args.checkpoint).open("rb") as checkpoint:
+        checkpoint_sha256 = hashlib.file_digest(checkpoint, "sha256").hexdigest()
 
     scheme = loaded.normalization_scheme
     statistics = None
     if scheme not in ("none", "ct"):
         if args.normalization_stats:
             # A statistics dict, or the .zattrs of an earlier output (reuse keeps slabs consistent).
-            saved = json.loads(Path(args.normalization_stats).read_text())
-            statistics = saved.get("normalization", saved).get("statistics", saved)
+            supplied = json.loads(Path(args.normalization_stats).read_text())
+            statistics = supplied.get("normalization", supplied).get("statistics", supplied)
+        elif saved is not None:
+            statistics = saved["normalization"]["statistics"]
         else:
             histogram, sampled = sample_volume_histogram(reader, chunk_stride=args.stats_chunk_stride)
             statistics = {**statistics_from_histogram(histogram), "sampled_chunks": sampled,
@@ -807,41 +1272,76 @@ def main(argv=None) -> None:
     lattice = [AxisLattice(tile, margin, ramp)] * 3
     outputs = [name.strip() for name in args.outputs.split(",") if name.strip()]
     embedder = RegionEmbedder(reader, loaded, transforms=transforms, outputs=outputs,
-                              dense_stride=args.dense_stride, lattice=lattice, dtype=args.dtype)
-    z_range = (args.z_start, args.z_start + args.depth)
+                              dense_stride=args.dense_stride, lattice=lattice, dtype=args.dtype,
+                              dtypes=CLI_DTYPES[args.dtype], codec=args.codec, compile_model=args.compile,
+                              strip_device=args.strip_device, point_chunk_size=args.point_batch_size,
+                              point_sampler=args.point_sampler, transformer_precision=args.transformer_precision,
+                              column_block_size=args.column_block_size)
+    z_range = ((0, int(reader.shape[0])) if args.z_start is None else
+               (args.z_start, args.z_start + (args.depth if args.depth is not None else 192)))
+    if any(z_range[0] % spec.step[0] for spec in embedder.specs):
+        raise ValueError("--z-start must align to every output's grid step")
+    if z_range[0] >= reader.shape[0] or z_range[1] > reader.shape[0]:
+        raise ValueError(f"requested z range {z_range} is outside volume depth {reader.shape[0]}")
+    for name, bounds, size in (("y", args.y_range, reader.shape[1]), ("x", args.x_range, reader.shape[2])):
+        if bounds is not None and not (0 <= bounds[0] < bounds[1] <= size):
+            raise ValueError(f"invalid {name} range {bounds} for size {size}")
+    slab_depth = args.slab_depth if args.slab_depth is not None else 2 * lattice[0].stride
+    if slab_depth <= 0 or slab_depth % lattice[0].stride:
+        raise ValueError(f"--slab-depth must be a positive multiple of lattice stride {lattice[0].stride}")
+    slabs = plan_slabs(z_range, slab_depth)
     attrs = {
         "format": FORMAT,
         "checkpoint": str(Path(args.checkpoint).resolve()), "checkpoint_step": checkpoint_step,
+        "checkpoint_sha256": checkpoint_sha256,
         "branch": loaded.source_branch,
-        "volume": str(args.volume), "level": args.level, "volume_shape": list(reader.shape),
+        "volume": volume, "level": args.level, "volume_shape": list(reader.shape),
         "z_range": list(z_range), "y_range": args.y_range, "x_range": args.x_range,
+        "scheduler_version": 1, "slabs": [list(slab) for slab in slabs],
+        "point_batch_size": args.point_batch_size,
+        "transformer_precision": args.transformer_precision,
+        "execution": {"compile": args.compile, "backend": "inductor" if args.compile else None,
+                      "mode": embedder.compile_mode if args.compile else None, "dynamic": False,
+                      "torch_version": str(torch.__version__)},
         "lattice": {"tile": tile, "margin": margin, "ramp": ramp, "stride": lattice[0].stride,
                     "tile_origin": "k*stride - margin", "support": "[k*stride, k*stride + stride + ramp)"},
         "normalization": {"scheme": scheme, "statistics": statistics,
+                          "intensity_properties": loaded.intensity_properties,
                           "applied": "fixed volume-wide statistics" + (
                               "; robust clips only the upper percentile" if scheme == "robust" else "")},
         "amp_dtype": "bfloat16", "masked": "outputs whose block has no nonzero voxel are zero vectors",
         "outputs": {},
     }
-    sink = ZarrGroupWriter(args.output, attrs=attrs, overwrite=args.overwrite)
-    embedder.create_arrays(sink, z_range)
-    for name, spec, shape, chunks in embedder.arrays(z_range):
+    for name, spec, shape, chunks in embedder.arrays(z_range, z_cell=True):
         attrs["outputs"][name] = {
             "shape_zyxc": list(shape), "step_zyx": list(spec.step),
+            "chunks_zyxc": list(chunks),
             "origin_zyx": [z_range[0], 0, 0],
             "index_to_voxel": "voxel block [origin + i*step, origin + (i+1)*step)",
-            "dtype": args.dtype,
-            "quantization": ("symmetric int8 per vector: value = q * scale; scale in <name>_scale"
-                             if args.dtype == "int8" else None),
+            "dtype": embedder.dtypes[name],
+            "quantization": QUANTIZATION[embedder.dtypes[name]],
+            "codec": embedder.codecs[name],
             "values": OUTPUT_VALUES[name],
         }
-    (Path(args.output) / ".zattrs").write_text(json.dumps(attrs, indent=2))
+    # JSON round-trip canonicalizes tuples and dictionary values before resume comparison.
+    attrs = json.loads(json.dumps(attrs))
+    if saved is not None:
+        validate_resume(saved, attrs, Path(args.output))
+        attrs = saved
+        sink = ZarrGroupWriter(args.output, attrs=None, workers=args.writer_workers,
+                               async_transfers=args.async_output)
+    else:
+        attrs.update(completed_slabs={}, complete=False)
+        sink = ZarrGroupWriter(args.output, attrs=attrs, overwrite=args.overwrite, workers=args.writer_workers,
+                               async_transfers=args.async_output)
     try:
-        stats = embedder.run(sink, z_range=z_range, y_range=args.y_range, x_range=args.x_range)
+        if saved is None:
+            embedder.create_arrays(sink, z_range, z_cell=True)
+            atomic_json(Path(args.output) / ".zattrs", attrs)
+        stats = run_slabs(embedder, sink, attrs, resume=args.resume, read=args.read,
+                          slab_group_size=args.slab_group_size)
     finally:
         sink.close()
-    attrs["run"] = stats
-    (Path(args.output) / ".zattrs").write_text(json.dumps(attrs, indent=2))
     print(json.dumps(stats))
 
 

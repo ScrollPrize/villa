@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 import random
@@ -8,6 +9,7 @@ from typing import Any, Iterator, Mapping
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -110,6 +112,11 @@ class Trainer:
         if self.total_steps > 0 and warmup_ratio > 0.0:
             default_warmup_steps = max(1, round(self.total_steps * warmup_ratio))
         self.warmup_steps = int(self.optimizer_config["warmup_steps"]) if "warmup_steps" in self.optimizer_config else default_warmup_steps
+        # A second linear warmup from a fixed step (e.g. after resuming with changed architecture);
+        # fixed in the config, so restarting the run later does not warm up again.
+        self.rewarmup_steps = int(self.optimizer_config.get("rewarmup_steps", 0))
+        self.rewarmup_start_step = int(self.optimizer_config.get("rewarmup_start_step", 0))
+        self.qk_norm_calibration_batches = int(self.runtime_config.get("qk_norm_calibration_batches", 4))
         self.grad_accumulation_steps = int(self.runtime_config.get("grad_accumulation_steps", 1))
         if self.grad_accumulation_steps < 1:
             raise ValueError("grad_accumulation_steps must be at least 1")
@@ -269,6 +276,7 @@ class Trainer:
             "num_workers": num_workers,
             "pin_memory": self.device.type == "cuda",
             "drop_last": True,
+            "gpu_prefetch": bool(self.data_config.get("gpu_prefetch", False)),
         }
 
         prefetch_factor = _config_get(self.data_config, "prefetch-factor", "prefetch_factor")
@@ -333,6 +341,18 @@ class Trainer:
             return None
         return dict(resolved_configs[0])
 
+    def _loader_generator(self) -> torch.Generator:
+        """Generator for a DataLoader's worker base seed, distinct per rank.
+
+        Workers seed random/numpy/torch from a base seed drawn from this generator, and crops
+        are sampled in the workers. Drawn from the global torch RNG, which starts from the same
+        fixed seed in every process, all DDP ranks got the same worker seeds and so identical
+        samples. One global draw (restored on resume) is mixed with the rank.
+        """
+        seed = int(torch.randint(0, 2 ** 62, (), dtype=torch.int64).item())
+        high, low = np.random.SeedSequence([seed, self.rank]).generate_state(2, dtype=np.uint32)
+        return torch.Generator().manual_seed(int(high) << 32 | int(low))
+
     def _build_ssl_dataloader(self, dataset_config: Mapping[str, Any], *, shuffle: bool) -> DataLoader:
         dataset = SSLZarrDataset(dataset_config, do_augmentations=True)
         collate_fn = self.method.build_collate(dataset)
@@ -351,6 +371,7 @@ class Trainer:
             shuffle=shuffle if sampler is None else False,
             sampler=sampler,
             collate_fn=collate_fn,
+            generator=self._loader_generator(),
             **self._build_dataloader_kwargs(),
         )
 
@@ -572,7 +593,9 @@ class Trainer:
         if "torch" in state:
             torch.set_rng_state(state["torch"])
         if "cuda" in state and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(state["cuda"])
+            # A checkpoint saved with a different number of visible GPUs restores the devices both have.
+            for index, cuda_state in enumerate(list(state["cuda"])[:torch.cuda.device_count()]):
+                torch.cuda.set_rng_state(cuda_state, index)
 
     def _optimizer_to_device(self) -> None:
         for optimizer_state in self.optimizer.state.values():
@@ -659,6 +682,10 @@ class Trainer:
         dataloader = self.build_dataloader()
         self._set_sampler_epoch(dataloader, self._train_sampler_epoch)
         dataloader_iter: Iterator[Any] = iter(dataloader)
+        if getattr(self.method, "qk_norms_to_calibrate", None):
+            # Q/K norms new to a resumed run start from the magnitudes they now normalize.
+            self.method.calibrate_qk_norms([next(dataloader_iter) for _ in range(self.qk_norm_calibration_batches)],
+                                           amp_dtype=self.amp_dtype if self.use_amp else None)
         val_dataloader = self.build_val_dataloader()
         if val_dataloader is not None:
             self._set_sampler_epoch(val_dataloader, self._val_sampler_epoch)
@@ -750,6 +777,8 @@ class Trainer:
 
     def _apply_optim_scheduler(self, step):
         lr, weight_decay = self.lr_schedule[step], self.wd_schedule[step]
+        if self.rewarmup_steps > 0 and step >= self.rewarmup_start_step:
+            lr *= min(1.0, (step - self.rewarmup_start_step + 1) / self.rewarmup_steps)
         for group in self.optimizer.param_groups:
             group["lr"] = lr * group.get("lr_multiplier", 1.0)
             group["weight_decay"] = weight_decay * group.get("wd_multiplier", 1.0)
@@ -765,10 +794,15 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         totals = None
         names = None
-        for micro_batch in micro_batches:
-            with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
-                output = self.method(micro_batch, step)
-            self.scaler.scale(output.loss / len(micro_batches)).backward()
+        model = getattr(self.method, "model", None)
+        for index, micro_batch in enumerate(micro_batches):
+            # Accumulate locally and all-reduce once, on the last microbatch's backward.
+            last = index == len(micro_batches) - 1
+            no_sync = model.no_sync() if isinstance(model, DistributedDataParallel) and not last else contextlib.nullcontext()
+            with no_sync:
+                with torch.autocast(device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp):
+                    output = self.method(micro_batch, step)
+                self.scaler.scale(output.loss / len(micro_batches)).backward()
             metric_values = {"loss": output.loss, **output.metrics}
             current_names = tuple(metric_values)
             if names is not None and names != current_names:

@@ -7,7 +7,7 @@ name = "dinovol-2"
 version = "0.1.0"
 description = "3d adaptation of dinov2 pretraining for larger than memory ome-zarr arrays"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "aiohttp>=3.13.3",
     "einops",
@@ -17,6 +17,7 @@ dependencies = [
     "scikit-image",
     "scipy",
     "s3fs",
+    "setuptools",  # torch.compile / Inductor runtime
     "timm==1.0.20",
     "torch>=2.10.0",
     "vc-reader[reader,transforms,torch]>=0.1.0",

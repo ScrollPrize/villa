@@ -235,6 +235,11 @@ sample parameters with `A.Uniform`, `A.Normal` and `A.Choice` for augmentation.
 Several constructors have random defaults; pipeline calls take an explicit
 `seed` for reproducibility, and `Plan` records sampled operations for replay.
 
+CUDA buffers are allocated with `cudaMallocAsync` from each device's default memory
+pool. On first use vc_reader raises that pool's release threshold so freed memory
+stays in the pool, as PyTorch's caching allocator does; at the default threshold of 0
+every synchronize returned it to the driver and later batches stalled mapping it again.
+
 | Operation family | Examples |
 | --- | --- |
 | Spatial | `Affine`, `Flip`, `CropPad`, `Elastic`, `ForegroundCrop` |

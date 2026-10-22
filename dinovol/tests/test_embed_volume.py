@@ -8,7 +8,7 @@ import torch
 from vc_reader import transforms as A
 
 from dinovol_2.eval.embed_volume import (
-    AxisLattice, RegionEmbedder, ZarrGroupWriter, add_unit_tokens, global_normalization, read_embeddings,
+    CLI_DTYPES, AxisLattice, RegionEmbedder, ZarrGroupWriter, add_unit_tokens, global_normalization, read_embeddings,
     statistics_from_histogram,
 )
 from dinovol_2.eval.napari_visualizer import LoadedBackbone
@@ -107,6 +107,25 @@ class WriterTests(unittest.TestCase):
             np.testing.assert_array_equal(read_embeddings(Path(tmp) / "out.zarr", "dense"),
                                           values.astype(np.float32) * scale[..., None].astype(np.float32))
 
+    def test_delta3d_fixed_scale_round_trip(self):
+        rng = np.random.default_rng(0)
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as tmp:
+            path = Path(tmp) / "out.zarr"
+            writer = ZarrGroupWriter(path, attrs={"x": 1})
+            writer.create("ink", (6, 14, 9, 5), (6, 7, 8, 5), np.int8, attrs={"value_scale": 1 / 127},
+                          codec="vc-delta3d")
+            with self.assertRaises(ValueError):
+                writer.create("bad", (6, 14, 9, 5), (6, 7, 8, 2), np.int8, codec="vc-delta3d")
+            values = rng.integers(-127, 128, (6, 14, 9, 5)).astype(np.int8)
+            values[:, :7, :8] = 0  # an all-zero chunk is skipped
+            writer.write("ink", (0, 0, 0), values)  # x ends mid-chunk at the array edge
+            writer.close()
+            meta = json.loads((path / "ink/.zarray").read_text())
+            self.assertEqual(meta["compressor"], {"id": "vc-delta3d", "quant": 1, "channel_axis": "last"})
+            self.assertFalse((path / "ink/0/0/0/0").exists())
+            np.testing.assert_allclose(read_embeddings(path, "ink"), values.astype(np.float32) / 127, rtol=1e-6)
+            self.assertEqual(ZarrGroupWriter(path, attrs=None).codecs["ink"], "vc-delta3d")
+
 
 @unittest.skipUnless(torch.cuda.is_available(), "tiled embedding runs on CUDA")
 class RegionEmbedderTests(unittest.TestCase):
@@ -183,6 +202,28 @@ class RegionEmbedderTests(unittest.TestCase):
             self.assertGreater(cos.min(), 0.9999)
             meta = json.loads((path / ".zattrs").read_text())["outputs"]["tokens_unit_derived"]
             self.assertEqual(meta["derived_from"], "tokens")
+
+    def test_cli_int8_storage_writes_fixed_scale_delta3d_heads(self):
+        z_range = (32, 64)
+        f16, _ = self.embed(z_range)
+        embedder = RegionEmbedder(self.reader, self.loaded, transforms=self.transforms,
+                                  outputs=("tokens", "dense", "ink"), dense_stride=2,
+                                  lattice=[AxisLattice(48, 8, 8)] * 3, dtype="int8",
+                                  dtypes=CLI_DTYPES["int8"], point_chunk_size=1024)
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as tmp:
+            path = Path(tmp) / "out.zarr"
+            sink = ZarrGroupWriter(path, attrs={"outputs": {}})
+            embedder.create_arrays(sink, z_range)
+            embedder.run(sink, z_range=z_range, progress=False)
+            sink.close()
+            for name, codec in (("tokens", "zstd"), ("dense", "vc-delta3d"), ("ink", "vc-delta3d")):
+                self.assertEqual(json.loads((path / name / ".zarray").read_text())["compressor"]["id"], codec)
+                self.assertEqual((path / f"{name}_scale").exists(), name == "tokens")
+                ref, got = f16[name].astype(np.float32), read_embeddings(path, name)
+                valid = np.abs(ref).sum(-1) > 0
+                np.testing.assert_array_equal(np.abs(got).sum(-1) > 0, valid)
+                cos = (ref * got).sum(-1)[valid] / (np.linalg.norm(ref, axis=-1) * np.linalg.norm(got, axis=-1))[valid]
+                self.assertGreater(cos.min(), 0.999, name)
 
     def test_outputs_do_not_depend_on_requested_region(self):
         a, stats = self.embed((32, 64))

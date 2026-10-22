@@ -745,3 +745,50 @@ class RemoteTests(RemoteFixtureCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ChannelReadManyTests(unittest.TestCase):
+    def test_whole_channel_batched_reads_match_single_reads(self):
+        from vc_reader import Source, Storage, Selection
+        with tempfile.TemporaryDirectory() as tmp:
+            data = np.arange(6 * 7 * 8 * 5, dtype=np.int8).reshape(6, 7, 8, 5)
+            array(Path(tmp) / 'emb.zarr', data, {'_ARRAY_DIMENSIONS': ['z', 'y', 'x', 'c']})
+            regions = [((0, 0, 0), (3, 4, 5)), ((4, 5, 6), (4, 4, 4)), ((-2, 1, 2), (3, 3, 3))]
+            full = Source('emb', Storage(str(Path(tmp) / 'emb.zarr'), 'zarr'), axes=('z', 'y', 'x', 'c')).open()
+            try:
+                self.assertTrue(full._whole_channels())
+                for got, (start, size) in zip(full.read_many(regions), regions):
+                    np.testing.assert_array_equal(got, full.read(start, size))
+            finally:
+                full.close()
+            picked = Source('emb', Storage(str(Path(tmp) / 'emb.zarr'), 'zarr', selection=Selection(channels=(3, 1))),
+                            axes=('z', 'y', 'x', 'c')).open()
+            try:
+                self.assertFalse(picked._whole_channels())
+                np.testing.assert_array_equal(picked.read_many(regions[:1])[0], data[:3, :4, :5][..., [3, 1]])
+            finally:
+                picked.close()
+
+
+class Delta3DChannelChunkTests(unittest.TestCase):
+    def test_reads_multichannel_signed_delta3d_chunks(self):
+        from vc_reader import _reader
+        from vc_reader.reader import open_zarr
+        rng = np.random.default_rng(0)
+        base = np.cumsum(np.cumsum(rng.integers(-2, 3, size=(6, 7, 8)), axis=1), axis=2)
+        data = np.stack([(base + 11 * c) % 200 - 100 for c in range(5)], axis=-1).astype(np.int8)  # (z, y, x, c)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'emb'
+            root.mkdir()
+            (root / '.zarray').write_text(json.dumps(dict(
+                zarr_format=2, shape=[6, 14, 8, 5], chunks=[6, 7, 8, 5], dtype='|i1', fill_value=0, order='C',
+                filters=None, dimension_separator='/',
+                compressor={'id': 'vc-delta3d', 'quant': 1, 'channel_axis': 'last'})))
+            payload = _reader._encode_delta3d_channels_verified(data.tobytes(), [6, 7, 8], 5, True, 1)
+            self.assertEqual(payload[4], 2)  # a version-2 channel container
+            (root / '0' / '1' / '0').mkdir(parents=True)
+            (root / '0' / '1' / '0' / '0').write_bytes(payload)
+            reader = open_zarr(str(root))
+            got = reader.read((slice(None), slice(None), slice(None), slice(None)))
+            np.testing.assert_array_equal(got[:, 7:], data)
+            np.testing.assert_array_equal(got[:, :7], 0)  # the absent chunk reads as fill

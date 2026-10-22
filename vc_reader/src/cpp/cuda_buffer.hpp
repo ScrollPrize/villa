@@ -1,6 +1,7 @@
 #pragma once
 // Shared ownership for reader outputs and external transform inputs. CUDA
 // operations complete before returning to Python; consumers may use any stream.
+#include "cuda_pool.hpp"
 #include "cuda_stream.hpp"
 #include <cuda_runtime.h>
 #include <cstddef>
@@ -34,8 +35,7 @@ struct Buffer {
         Guard guard(device);
         if (!n) return;
 #if CUDART_VERSION >= 11020
-        int supported = 0; check(cudaDeviceGetAttribute(&supported,cudaDevAttrMemoryPoolsSupported,device));
-        pooled = supported;
+        pooled = pooled_allocation(device);
         if (pooled) { check(cudaMallocAsync(&ptr,n,stream)); return; }
 #endif
         check(cudaMalloc(&ptr,n));

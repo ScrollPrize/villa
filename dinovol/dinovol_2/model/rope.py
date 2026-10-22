@@ -429,6 +429,34 @@ class CompassRopePositionEmbedding(_BaseRopePositionEmbedding):
     def no_weight_decay(self) -> set[str]:
         return {"radii", "angles"}
 
+    @torch.no_grad()
+    def set_frequencies(self, frequencies: Tensor) -> None:
+        """Set radii and angles so the mixed per-pair frequencies equal ``frequencies`` exactly.
+
+        ``frequencies`` is (heads, pairs, ndim), e.g. a mixed-RoPE ``mix_frequencies``: both
+        modules then produce the same phases. The DFT mixing is inverted (the normalized
+        Hartley transform is its own inverse; the 2D DFT by its conjugate), each base vector
+        becomes a nonnegative radius and its direction's spherical angles.
+        """
+        if frequencies.shape != (*self.radii.shape, self.ndim):
+            raise ValueError(f"expected frequencies of shape {(*self.radii.shape, self.ndim)}, got {tuple(frequencies.shape)}")
+        mixed = frequencies.to(device=self.radii.device, dtype=torch.float64)
+        cos, sin = self._dft_cos.double(), self._dft_sin.double()
+        if not self.use_dft:
+            base = mixed
+        elif self.ndim == 2:
+            x, y = mixed.unbind(-1)
+            # (C + iS) @ (x + iy) inverts (C - iS), the orthonormal DFT.
+            base = torch.stack((x @ cos.T - y @ sin.T, y @ cos.T + x @ sin.T), dim=-1)
+        else:
+            base = (cos + sin) @ mixed
+        radii = base.norm(dim=-1)
+        direction = base / radii.clamp_min(torch.finfo(torch.float64).tiny)[..., None]
+        self.radii.copy_(radii)
+        self.angles[..., 0].copy_(torch.atan2(direction[..., 1], direction[..., 0]))
+        if self.ndim == 3:
+            self.angles[..., 1].copy_(direction[..., 2].clamp(-1, 1).acos())
+
     def _mix_frequencies(self, frequencies: Tensor) -> Tensor:
         if not self.use_dft:
             return frequencies

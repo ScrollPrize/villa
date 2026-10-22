@@ -219,6 +219,21 @@ class CudaBatchTests(unittest.TestCase):
         result = pipeline.batch({'image': image}, seeds=seeds, params={'sigma': [.7, 1., 2., .9, .3]})
         torch.testing.assert_close(result['image'], image)
 
+    def test_default_pool_keeps_freed_memory(self):
+        import ctypes
+        pipeline = A.Pipeline([A.Normalize('zscore')], backend='cuda', compact=False)
+        pipeline.batch({'image': torch.rand(2, 1, 32, 32, 32, device='cuda')}, seeds=[1, 2])
+        torch.cuda.synchronize()
+        driver = ctypes.CDLL('libcuda.so.1')
+        device, pool = ctypes.c_int(), ctypes.c_void_p()
+        threshold, reserved = ctypes.c_uint64(), ctypes.c_uint64()
+        self.assertEqual(driver.cuDeviceGet(ctypes.byref(device), torch.cuda.current_device()), 0)
+        self.assertEqual(driver.cuDeviceGetDefaultMemPool(ctypes.byref(pool), device), 0)
+        self.assertEqual(driver.cuMemPoolGetAttribute(pool, 4, ctypes.byref(threshold)), 0)  # RELEASE_THRESHOLD
+        self.assertEqual(driver.cuMemPoolGetAttribute(pool, 5, ctypes.byref(reserved)), 0)  # RESERVED_MEM_CURRENT
+        self.assertEqual(threshold.value, 2 ** 64 - 1)
+        self.assertGreater(reserved.value, 0)  # still held after synchronizing
+
     def test_pipeline_groups_on_consumer_stream(self):
         image = np.random.default_rng(82).random((9, 1, 128, 128, 128), dtype=np.float32)
         with torch.cuda.stream(torch.cuda.Stream()):

@@ -10,12 +10,12 @@ DATA_KEYS = {
     'dataset', 'val_dataset', 'monitor_dataset', 'batch_size', 'num_workers',
     'dataloader-workers', 'dataloader_workers', 'prefetch_factor', 'prefetch-factor',
     'persistent_workers', 'persistent-workers', 'shuffle', 'seed', 'epoch_length',
-    'official_epoch_length',
+    'official_epoch_length', 'gpu_prefetch',
 }
 OPTIMIZER_KEYS = {
     'lr', 'min_lr', 'lr_schedule', 'weight_decay', 'weight_decay_end', 'betas',
     'clip_grad', 'layer_decay', 'layerwise_decay', 'patch_embed_lr_mult',
-    'warmup_steps', 'warmup_ratio', 'fused_optimizer',
+    'warmup_steps', 'warmup_ratio', 'fused_optimizer', 'rewarmup_start_step', 'rewarmup_steps',
 }
 DINO_KEYS = {
     'dino_loss_weight', 'ibot_loss_weight', 'koleo_loss_weight', 'koleo_distributed',

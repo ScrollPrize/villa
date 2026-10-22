@@ -14,7 +14,8 @@ from vc_reader import transforms as A
 from torch.nn import functional as F
 
 from dinovol_2.dataset.cuda_pipeline import (
-    CropView, CudaBatchProcessor, CudaDataLoader, SpatialPlan, normalize_batch, point_pipeline, spatial_transforms,
+    CropView, CudaBatchProcessor, CudaDataLoader, SpatialPlan, _prefetched, normalize_batch, point_pipeline,
+    spatial_transforms,
 )
 from dinovol_2.dataset.ssl_zarr_dataset import SSLZarrDataset
 from dinovol_2.dataset.volume_reader import open_volume
@@ -263,6 +264,75 @@ class CudaPipelineTests(unittest.TestCase):
     def test_cuda_required(self):
         with self.assertRaisesRegex(ValueError, 'requires CUDA'):
             CudaBatchProcessor({}, device='cpu')
+
+
+@unittest.skipUnless(torch.cuda.is_available(), 'GPU prefetch needs CUDA')
+class GpuPrefetchTests(unittest.TestCase):
+    @staticmethod
+    def process(samples):
+        # GPU work on the current (side) stream plus a global random draw, like the iBOT collate.
+        x = samples.cuda(non_blocking=True)
+        for _ in range(20):
+            x = x * 1.0001 + 1
+        return {'image': x, 'draw': random.random(), 'nested': [x.sum()]}
+
+    def test_prefetched_batches_match_inline_processing_in_order(self):
+        source = [torch.full((64, 64, 64), float(i)).pin_memory() for i in range(6)]
+        random.seed(3)
+        want = [self.process(x) for x in source]
+        random.seed(3)
+        got = []
+        for batch in _prefetched(iter(source), self.process, torch.device('cuda')):
+            batch['image'] = batch['image'] + 0  # consumer-stream work on the prefetched tensor
+            got.append(batch)
+        self.assertEqual(len(got), len(want))
+        for a, b in zip(got, want):
+            torch.testing.assert_close(a['image'], b['image'])
+            torch.testing.assert_close(a['nested'][0], b['nested'][0])
+            self.assertEqual(a['draw'], b['draw'])
+
+    def test_errors_propagate_and_close_stops_the_producer(self):
+        def failing(samples):
+            if int(samples[0]) == 2:
+                raise RuntimeError('bad batch')
+            return samples.cuda()
+        seen = []
+        with self.assertRaisesRegex(RuntimeError, 'bad batch'):
+            for batch in _prefetched(iter([torch.tensor([i]) for i in range(5)]), failing, torch.device('cuda')):
+                seen.append(int(batch[0]))
+        self.assertEqual(seen, [0, 1])
+        before = {t.name for t in __import__('threading').enumerate()}
+        stream = _prefetched(iter([torch.tensor([i]) for i in range(100)]), lambda x: x.cuda(), torch.device('cuda'))
+        next(stream)
+        stream.close()
+        self.assertNotIn('cuda-batch-prefetch', {t.name for t in __import__('threading').enumerate()} - before)
+
+    def test_loader_prefetch_yields_the_same_batches(self):
+        from dinovol_2.ops.collate import collate_multicrop_batch
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            write_array(root / 'volume', np.random.default_rng(0).integers(0, 255, (40,) * 3, dtype=np.uint8))
+            config = dict(datasets=[dict(volume_path=str(root / 'volume'), volume_scale=0)],
+                epoch_length=4, vol_trim_pct=1, source_sampling_size=[24]*3,
+                global_crop_size=[16]*3, local_crop_size=[8]*3, num_local_crops=2,
+                global_crop_scale=[.4,.8], local_crop_scale=[.1,.2], augmentation='full')
+            results = []
+            for prefetch in (False, True):
+                dataset = SSLZarrDataset(copy.deepcopy(config), do_augmentations=True)
+                try:
+                    random.seed(0)
+                    np.random.seed(0)
+                    torch.manual_seed(0)
+                    loader = CudaDataLoader(dataset, batch_size=2, collate_fn=collate_multicrop_batch,
+                                            gpu_prefetch=prefetch)
+                    results.append([{k: v.clone() for k, v in b.items() if isinstance(v, torch.Tensor)} for b in loader])
+                finally:
+                    dataset.close()
+            self.assertEqual(len(results[0]), 2)
+            for a, b in zip(*results):
+                self.assertEqual(a.keys(), b.keys())
+                for key in a:
+                    torch.testing.assert_close(a[key], b[key], msg=key)
 
 
 if __name__ == '__main__':

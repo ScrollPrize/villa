@@ -1,0 +1,26 @@
+{
+  "checkpoint": "/mnt/raid_nvme/dinovol_ckpts/checkpoint_step_640000.pt",
+  "branch": "teacher",
+  "data": "evals/kaggle_surfaces/data",
+  "output": "evals/kaggle_surfaces/runs/frozen_640000",
+  "vesuvius_source": "../vesuvius/src",
+  "device": "cuda:0",
+  "precision": "bfloat16",
+  "normalization": "robust",
+  "patch_size": [
+    192,
+    192,
+    192
+  ],
+  "blocks": 2,
+  "batch_size": 2,
+  "steps": 50000,
+  "lr": 0.0001,
+  "weight_decay": 0.0001,
+  "val_every": 500,
+  "val_crops_per_case": 2,
+  "preview_count": 6,
+  "seed": 42,
+  "compile": true,
+  "compile_mode": "default"
+}

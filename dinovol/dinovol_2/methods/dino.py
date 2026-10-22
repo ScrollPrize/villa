@@ -45,6 +45,8 @@ class DinoMethod(TrainingMethod):
 
     def __init__(self, config: Mapping[str, Any], *, device, is_distributed=False, rank=0) -> None:
         super().__init__()
+        self._converted_rope: dict[str, str] = {}
+        self.qk_norms_to_calibrate: list[str] = []
         self.config = dict(config["method"])
         runtime = config["runtime"]
         self.data_config = config["data"]
@@ -211,7 +213,7 @@ class DinoMethod(TrainingMethod):
             settings = dict(settings)
         else:
             raise ValueError("compile must be a boolean or a settings mapping")
-        unknown = set(settings) - {"enabled", "backend", "mode", "dynamic", "fullgraph"}
+        unknown = set(settings) - {"enabled", "backend", "mode", "dynamic", "fullgraph", "optimize_ddp"}
         if unknown:
             raise ValueError(f"Unknown compile settings: {sorted(unknown)}")
         enabled = settings.pop("enabled", False)
@@ -220,6 +222,17 @@ class DinoMethod(TrainingMethod):
         self.compile_enabled = enabled
         if not enabled:
             return
+        # Dynamo's DDP optimizer splits compiled graphs at gradient-bucket boundaries. The split
+        # graphs no longer honour the checkpoint save-attention policy: under DDP every student
+        # attention forward ran again in backward (g256 crops, 3x H100: 5.75 -> 4.47 s/step off).
+        # "python_reducer" instead traces DDP's reducer into a compiled-autograd backward.
+        optimize_ddp = settings.pop("optimize_ddp", False)
+        if not isinstance(optimize_ddp, bool) and optimize_ddp != "python_reducer":
+            raise ValueError('compile.optimize_ddp must be a boolean or "python_reducer"')
+        import torch._dynamo
+        torch._dynamo.config.optimize_ddp = optimize_ddp
+        if optimize_ddp == "python_reducer":
+            torch._dynamo.config.compiled_autograd = True
         options = {"backend": "inductor", "mode": "default", "dynamic": None, "fullgraph": False, **settings}
         # dynamic may also map module names (backbone, dino_head, ibot_head) to settings;
         # unlisted modules use null. Backbones see fixed global/local crop shapes, while
@@ -901,6 +914,12 @@ class DinoMethod(TrainingMethod):
         backbone = branch.backbone
         if backbone.rope_embed is None:
             state_dict = {key: value for key, value in state_dict.items() if not key.startswith("backbone.rope_embed.")}
+        # Mixed RoPE resumed as Compass (same phases) and Q/K norms new to the checkpoint.
+        own = {key.removeprefix("backbone."): value for key, value in state_dict.items() if key.startswith("backbone.")}
+        own, adaptable, converted = backbone.adapt_checkpoint_state(own)
+        state_dict = {**{key: value for key, value in state_dict.items() if not key.startswith("backbone.")},
+                      **{f"backbone.{key}": value for key, value in own.items()}}
+        self._converted_rope = {f"backbone.{prefix}.radii": f"backbone.{prefix}.mix_frequencies" for prefix in converted}
         branch_state = branch.state_dict()
         if any(key.startswith(self._ADDABLE_MODULES) for key in state_dict):
             branch_addable = {
@@ -915,7 +934,7 @@ class DinoMethod(TrainingMethod):
                 }
         missing, unexpected = branch.load_state_dict(state_dict, strict=False)
         backbone_missing = [key.removeprefix("backbone.") for key in missing if key.startswith("backbone.")]
-        allowed = {f"backbone.{key}" for key in backbone.warm_start_missing_rope(backbone_missing)}
+        allowed = {f"backbone.{key}" for key in backbone.warm_start_missing_rope(backbone_missing) | adaptable}
         required = [key for key in missing if not key.startswith(self._ADDABLE_MODULES) and key not in allowed]
         if required or unexpected:
             raise RuntimeError(f"Checkpoint does not match the model: missing={required} unexpected={list(unexpected)}")
@@ -932,6 +951,10 @@ class DinoMethod(TrainingMethod):
         # within a group, the checkpoint's parameters are the current ones minus the added.
         names = {id(parameter): name for name, parameter in self.model_module.student.named_parameters()}
         added_set = set(added)
+        converted = getattr(self, "_converted_rope", {})
+        # A converted Compass RoPE took its mixed module's place: radii stand where mix_frequencies
+        # stood (whose Adam state does not carry over), angles are new.
+        added_set |= set(converted) | {key.replace(".radii", ".angles") for key in converted}
         has_replaced_addable = any(name.startswith(self._ADDABLE_MODULES) for name in added_set)
         group_key = lambda group: tuple(group.get(key) for key in self._GROUP_KEYS)
         old_by_key = {group_key(group): group for group in old_groups}
@@ -940,7 +963,9 @@ class DinoMethod(TrainingMethod):
         remapped, matched = {}, set()
         for live_group, new_group in zip(optimizer.param_groups, new_groups):
             kept = [new_id for parameter, new_id in zip(live_group["params"], new_group["params"])
-                    if names[id(parameter)] not in added_set]
+                    if names[id(parameter)] not in added_set or names[id(parameter)] in converted]
+            restored = {new_id for parameter, new_id in zip(live_group["params"], new_group["params"])
+                        if names[id(parameter)] not in added_set}
             old = old_by_key.get(group_key(new_group))
             if old is None:
                 if kept:
@@ -954,7 +979,7 @@ class DinoMethod(TrainingMethod):
                 {
                     new_id: state["state"][old_id]
                     for old_id, new_id in zip(old["params"][: len(kept)], kept)
-                    if old_id in state["state"]
+                    if old_id in state["state"] and new_id in restored
                 }
             )
         if matched != set(old_by_key):
@@ -983,6 +1008,10 @@ class DinoMethod(TrainingMethod):
         added_rope = sorted({key for key in added if key.endswith("rope_embed.mix_frequencies")})
         if added_rope and self.is_main_process:
             print(f"Warm-started {len(added_rope)} mixed-RoPE frequency tensors from the axial layout")
+        if self._converted_rope and self.is_main_process:
+            print(f"Converted {len(self._converted_rope)} mixed-RoPE frequency tensors to Compass RoPE (same phases)")
+        # Q/K norms new to this run start at one; calibrate_qk_norms rescales them before training.
+        self.qk_norms_to_calibrate = sorted(key for key in added if key.endswith(("attn.q_norm.weight", "attn.k_norm.weight")))
         if any(key.startswith(self._ADDABLE_MODULES) for key in added):
             # Heads added to an existing run: their loss ramp starts at the next step.
             self.object_heads_start_step = step + 1
@@ -1012,6 +1041,27 @@ class DinoMethod(TrainingMethod):
                 # keeping any stale initialization from __init__.
                 self._refresh_gram_teacher_from_teacher()
         return added
+
+    @torch.no_grad()
+    def calibrate_qk_norms(self, batches, *, amp_dtype=None) -> None:
+        """Scale Q/K norms new to a resumed run to the Q/K magnitudes of its global views (both branches)."""
+        if not self.qk_norms_to_calibrate:
+            return
+        inputs = [batch["collated_global_crops"].to(self.device, non_blocking=True) for batch in batches]
+
+        def mean_across_ranks(total):
+            if self.is_distributed and dist.is_initialized():
+                total = total.to(self.device)
+                dist.all_reduce(total)
+            return total.cpu()
+
+        for branch_name in ("student", "teacher"):
+            values = getattr(self.model_module, branch_name).backbone.calibrate_qk_norms(
+                inputs, amp_dtype=amp_dtype, reduce=mean_across_ranks)
+            if self.is_main_process:
+                summary = ", ".join(f"{v:.3g}" for v in list(values.values())[:6])
+                print(f"Calibrated {len(values)} {branch_name} Q/K norms to input RMS ({summary}, ...)")
+        self.qk_norms_to_calibrate = []
 
     def evaluate(self, batch: Mapping[str, Any], step: int) -> dict[str, float]:
         """Retain the established validation objective, using the shared computation.
