@@ -136,15 +136,16 @@ def test_linear_float32_witnesses(tmp_path, axis, case, other, scale):
                           shape).copy()
     thin = chunked(tmp_path / "a", src, target, chunks, cv2.INTER_LINEAR)
     whole = chunked(tmp_path / "b", src, target, target, cv2.INTER_LINEAR)
-    # Grid independence is exact.
+    # Grid independence is exact. This is the check that catches the a045a4a
+    # bug (a local cv2 window for non-power-of-two ratios); keep it exact.
     np.testing.assert_array_equal(thin, whole)
     # Close to cv2 on the whole axis. cv2's float32 result depends on the plane
     # width (other=1 vs 2) and its error scales with the input magnitude:
-    # measured up to ~1.7e-5 * max|input| here, so allow 2e-5 * max|input|
-    # plus a few float32 ulp of that magnitude.
+    # measured up to 1.66e-5 * max|input| here (cv2 5.0.0), so allow
+    # 3e-5 * max|input| plus a few float32 ulp of that magnitude.
     ref = R._resize_chunk_3d(src, target, cv2.INTER_LINEAR)
     amax = np.float32(np.abs(src).max())
-    np.testing.assert_allclose(thin, ref, atol=2e-5 * amax + 4 * np.spacing(amax), rtol=0)
+    np.testing.assert_allclose(thin, ref, atol=3e-5 * amax + 4 * np.spacing(amax), rtol=0)
 
 
 @pytest.mark.parametrize("axis", [0, 1, 2])
