@@ -192,6 +192,42 @@ void AgentBridgeServer::registerEditingHandlers()
 
     registerMethod(
         {
+            .name = QStringLiteral("segmentation.manual_add.extend"),
+            .params = {
+                Params::requiredStringEnum(
+                    QStringLiteral("side"),
+                    {
+                        QStringLiteral("up"),
+                        QStringLiteral("down"),
+                        QStringLiteral("left"),
+                        QStringLiteral("right"),
+                    }),
+                boundedInteger(QStringLiteral("cells"), 16, 1, 4096),
+                Params::optionalInteger(QStringLiteral("first")),
+                Params::optionalInteger(QStringLiteral("last")),
+            },
+            .errors = {-32602, -32000, -32005, -32007, -32008},
+            .mcp = Mcp::exact(QStringLiteral("vc3d_manual_add_extend")),
+        },
+        [this](const QJsonValue& p) { return handleManualAddExtend(p); });
+
+    registerMethod(
+        {
+            .name = QStringLiteral("segmentation.manual_add.add_constraint"),
+            .params = {
+                Params::requiredArray(
+                    QStringLiteral("world"),
+                    AgentBridgeParamType::Number),
+                nonNegativeNumber(QStringLiteral("radius"), 0.0),
+            },
+            .errors = {-32602, -32000, -32005, -32007},
+            .mcp = Mcp::exact(
+                QStringLiteral("vc3d_manual_add_add_constraint")),
+        },
+        [this](const QJsonValue& p) { return handleManualAddAddConstraint(p); });
+
+    registerMethod(
+        {
             .name =
                 QStringLiteral("segmentation.corrections.set_point_mode"),
             .params = {

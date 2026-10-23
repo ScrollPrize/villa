@@ -476,7 +476,9 @@ is the sole bridge method without an MCP tool.
 | `vc3d_list_attached_volumes` | `volume.list` | List volume ids already attached to the open package; this does not discover catalog data available to open. |
 | `vc3d_load_points_json` | `points.load_json` |
 | `vc3d_load_points_segment_path` | `points.load_segment_path` |
+| `vc3d_manual_add_add_constraint` | `segmentation.manual_add.add_constraint` |
 | `vc3d_manual_add_begin` | `segmentation.manual_add.begin` |
+| `vc3d_manual_add_extend` | `segmentation.manual_add.extend` |
 | `vc3d_manual_add_finish` | `segmentation.manual_add.finish` |
 | `vc3d_manual_add_set_interpolation` | `segmentation.manual_add.set_interpolation` |
 | `vc3d_manual_add_set_line_mode` | `segmentation.manual_add.set_line_mode` |
