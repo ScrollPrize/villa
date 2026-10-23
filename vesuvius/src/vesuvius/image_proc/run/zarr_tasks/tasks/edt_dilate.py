@@ -6,6 +6,7 @@ Creates a dilated binary mask from a zarr using Euclidean Distance Transform.
 from __future__ import annotations
 
 import argparse
+import math
 import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional, Tuple
@@ -27,9 +28,10 @@ except ImportError:
 
 try:
     from scipy.ndimage import distance_transform_edt as scipy_edt
-except ImportError:  # only needed when edt is unavailable
+except ImportError:  # needed without edt, and for regions too large for edt's float32
     if not HAS_EDT:
         raise
+    scipy_edt = None
 
 
 # Global state for worker processes
@@ -69,6 +71,13 @@ def _validate_distance(distance: float) -> None:
 # float32 (edt.edtsq's output dtype) holds every integer only up to 2**24.
 _FLOAT32_EXACT_INT = 2**24
 
+# scipy's float64 path recovers a squared distance k as rint(fl(fl(sqrt(k))**2)). For
+# k < 2**51, sqrt(k) < 2**25.5 is rounded with ulp <= 2**-27 (error <= 2**-28), so the
+# exact square is within 2*2**25.5*2**-28 ~= 0.354 of k, and rounding that square (ulp
+# <= 0.25) adds <= 0.125: total < 0.5, so rint returns k. From 2**51 the argument fails
+# and rint does return wrong integers. Regions needing k >= 2**51 are rejected.
+_FLOAT64_RINT_EXACT_SQ = 2**51
+
 # Above this many voxels in one chunk-plus-halo region, warn in prepare().
 _REGION_VOXEL_WARN = 2**31
 
@@ -81,6 +90,35 @@ def _halo(distance: float, shape: Tuple[int, ...]) -> int:
 def _max_sq_distance(shape: Tuple[int, ...]) -> int:
     """Upper bound on any squared voxel-centre distance inside an array of ``shape``."""
     return sum(int(n) ** 2 for n in shape)
+
+
+def _check_backend(region: Tuple[int, ...]) -> None:
+    """Raise if no available backend computes exact squared distances for ``region``."""
+    max_sq = _max_sq_distance(region)
+    if HAS_EDT and max_sq < _FLOAT32_EXACT_INT:
+        return
+    if max_sq >= _FLOAT64_RINT_EXACT_SQ:
+        raise ValueError(
+            f"edt-dilate: a region of shape {tuple(region)} allows squared distances up to "
+            f"{max_sq} >= 2**51, beyond which scipy's float64 EDT is not exact; "
+            f"reduce --chunk-size or --distance"
+        )
+    if scipy_edt is None:
+        raise ImportError(
+            f"edt-dilate: a region of shape {tuple(region)} allows squared distances up to "
+            f"{max_sq} >= 2**24, beyond edt's float32 precision, and needs scipy "
+            f"(scipy.ndimage), which is not installed; install scipy or reduce "
+            f"--chunk-size or --distance"
+        )
+
+
+def _scipy_edtsq(inverted: np.ndarray) -> np.ndarray:
+    """Exact squared EDT via scipy's float64 EDT (valid while squared distances < 2**51)."""
+    # In place, so no extra full-size temporaries.
+    distances = scipy_edt(inverted)
+    np.square(distances, out=distances)
+    np.rint(distances, out=distances)
+    return distances
 
 
 def _edt_dilate_worker(
@@ -141,6 +179,7 @@ def _edt_dilate_worker(
     # would disagree, e.g. at distance=float32(sqrt(2)).
     # edt.edtsq returns float32, exact only for squared distances below 2**24 (distances
     # around 4096 voxels). Regions large enough to exceed that use scipy's float64 EDT.
+    _check_backend(inverted.shape)
     if HAS_EDT and _max_sq_distance(inverted.shape) < _FLOAT32_EXACT_INT:
         # Ensure contiguity for edt package
         if not inverted.flags["C_CONTIGUOUS"]:
@@ -148,12 +187,9 @@ def _edt_dilate_worker(
         # Use single thread since we parallelize over chunks
         distances = edt_package.edtsq(inverted, parallel=1, black_border=False)
     else:
-        # float64: sqrt -> square -> rint recovers the integer exactly far beyond any
-        # allocatable region (relative error a few ulp, i.e. < 0.5 below ~2**50).
-        # In place, so no extra full-size temporaries.
-        distances = scipy_edt(inverted)
-        np.square(distances, out=distances)
-        np.rint(distances, out=distances)
+        # float64: sqrt -> square -> rint recovers the integer exactly below 2**51
+        # (see _FLOAT64_RINT_EXACT_SQ; _check_backend rejects larger regions).
+        distances = _scipy_edtsq(inverted)
 
     # Threshold to create dilated mask
     if not black_border:
@@ -264,7 +300,11 @@ class EdtDilateTask(ZarrTask):
 
         halo = _halo(self.config.distance, self._shape)
         region = [min(n, c + 2 * halo) for n, c in zip(self._shape, self.config.chunk_size)]
-        voxels = int(np.prod(region, dtype=np.int64))
+        # Fail before creating any output if no backend can handle the largest region
+        # (+2 per axis for the black_border=False padding).
+        _check_backend(tuple(n + (0 if self.config.black_border else 2) for n in region))
+        # Python ints: np.prod in int64 wraps for huge regions.
+        voxels = math.prod(int(n) for n in region)
         if voxels > _REGION_VOXEL_WARN:
             warnings.warn(
                 f"edt-dilate: distance {self.config.distance} gives a halo of {halo} voxels; each "

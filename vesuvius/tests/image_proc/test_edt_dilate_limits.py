@@ -38,10 +38,71 @@ def test_squared_distance_above_float32_exact_range(tmp_path, monkeypatch, backe
     assert got[: n].all() and not got[n:].any()
 
 
-def test_scipy_rint_recovers_integer_squares():
-    # float64 sqrt -> square -> rint is exact for integer squares far beyond any region.
-    k = np.array([2**24 + 1, 2**40 + 12345, 2**48 - 1, 3 * (2**23) ** 2], dtype=np.float64)
-    assert np.array_equal(np.rint(np.square(np.sqrt(k))), k)
+def test_scipy_rint_recovers_integer_squares(monkeypatch):
+    # Through the production helper: a real scipy EDT with squared distances past 2**24 ...
+    inverted = np.ones((1, 1, 5000), bool)
+    inverted[0, 0, 0] = False
+    got = m._scipy_edtsq(inverted)[0, 0]
+    assert got.dtype == np.float64 and np.array_equal(got, np.arange(5000.0) ** 2)
+    # ... and the helper's square/rint step on float64 distances sqrt(k) up to the 2**51 bound
+    # (regions that large cannot be allocated, so feed scipy's output directly).
+    k = np.array(
+        [2**24 + 1, 2**40 + 12345, 2**48 - 1, 3 * (2**23) ** 2, 2**51 - 1, 2**51 - 3, 2**50 + 1],
+        dtype=np.float64,
+    )
+    monkeypatch.setattr(m, "scipy_edt", lambda a: np.sqrt(k))
+    assert np.array_equal(m._scipy_edtsq(None), k)
+
+
+def test_rint_bound_is_enforced():
+    # Above 2**51 rint(fl(sqrt(k))**2) does return wrong integers, e.g. here:
+    bad = np.arange(2**51, 2**51 + 4096, dtype=np.float64)
+    assert (np.rint(np.square(np.sqrt(bad))) != bad).any()
+    m._check_backend((2**25, 2**24, 1))  # (2**50 + 2**48) < 2**51: accepted
+    with pytest.raises(ValueError, match="2\\*\\*51"):
+        m._check_backend((2**25, 2**25, 1))  # exactly 2**51
+
+
+def test_missing_scipy_large_region_raises_clear_error(tmp_path, monkeypatch):
+    # edt installed, scipy not: regions past edt's float32 range have no backend.
+    monkeypatch.setattr(m, "HAS_EDT", True)
+    monkeypatch.setattr(m, "scipy_edt", None)
+    monkeypatch.setattr(m, "_FLOAT32_EXACT_INT", 2)
+    vol = np.zeros((4, 4, 4), np.uint8)
+    vol[0, 0, 0] = 1
+    with pytest.raises(ImportError, match="needs scipy"):
+        _run(tmp_path, monkeypatch, vol, 1.0)
+    cfg = m.EdtDilateConfig(
+        input_zarr=str(tmp_path / "in.zarr"), output_zarr=str(tmp_path / "out2.zarr"),
+        num_workers=1, distance=1.0, chunk_size=(4, 4, 4),
+    )
+    with pytest.raises(ImportError, match="needs scipy"):
+        m.EdtDilateTask(cfg).prepare()
+    assert not (tmp_path / "out2.zarr").exists()  # checked before creating output
+
+
+def test_missing_scipy_import_defines_none(monkeypatch):
+    # Simulate an environment without scipy: the module must still import with edt.
+    import builtins, importlib, sys
+    real = builtins.__import__
+
+    def fake(name, *a, **k):
+        if name.startswith("scipy"):
+            raise ImportError("simulated: no scipy")
+        return real(name, *a, **k)
+
+    pytest.importorskip("edt")
+    monkeypatch.setattr(builtins, "__import__", fake)
+    for mod in [k for k in sys.modules if k == "scipy" or k.startswith("scipy.")]:
+        monkeypatch.delitem(sys.modules, mod)
+    name = m.__name__
+    monkeypatch.delitem(sys.modules, name)
+    try:
+        fresh = importlib.import_module(name)
+        assert fresh.HAS_EDT and fresh.scipy_edt is None
+    finally:
+        monkeypatch.setattr(builtins, "__import__", real)
+        sys.modules[name] = m
 
 
 def test_halo_is_clipped_to_volume():
@@ -85,3 +146,27 @@ def test_prepare_warns_on_large_region(tmp_path, monkeypatch):
         warnings.simplefilter("error", RuntimeWarning)
         with pytest.raises(_Stop):
             m.EdtDilateTask(cfg).prepare()
+
+
+def test_prepare_warning_counts_huge_regions_exactly(tmp_path, monkeypatch):
+    # (2**22)**3 = 2**66 voxels: np.prod(..., dtype=int64) wraps to 0 and never warned.
+    n = 2**22
+    _create(zarr.open_group(str(tmp_path / "in.zarr"), mode="w"), "0",
+            shape=(n, n, n), chunks=(n, n, n), dtype=np.uint8, fill_value=0)
+    cfg = m.EdtDilateConfig(
+        input_zarr=str(tmp_path / "in.zarr"), output_zarr=str(tmp_path / "out.zarr"),
+        num_workers=1, distance=0.0, chunk_size=(n, n, n),
+    )
+
+    class _Stop(Exception):
+        pass
+
+    class _StopBlosc:
+        BITSHUFFLE = 2
+
+        def __init__(self, *a, **k):
+            raise _Stop
+
+    monkeypatch.setattr(m, "Blosc", _StopBlosc)
+    with pytest.warns(RuntimeWarning, match=str(2**66)), pytest.raises(_Stop):
+        m.EdtDilateTask(cfg).prepare()
