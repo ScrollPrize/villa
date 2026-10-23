@@ -4,9 +4,11 @@
 #include "internal/ReadRequest.hpp"
 #include "internal/RecordSql.hpp"
 #include "internal/CoordinateFilter.hpp"
+#include "internal/VolumeFrames.hpp"
 #include "geometry/ArrayBytes.hpp"
 #include "vc_object_store/geometry/SegmentClip.hpp"
 #include <exception>
+#include <set>
 
 namespace vc::objects {
 using namespace detail;
@@ -104,6 +106,57 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
     const RegionOptions& options, const RegionCancel& cancel) const
 {
     auto* db = static_cast<sqlite3*>(connection(txn));
+    if (options.volume) {
+        // One bounded query per declared frame, merged in UUID order with the
+        // selected object first; the object limit applies to the merge.
+        if (options.coordinates) throw std::invalid_argument("volume and coordinates filters are exclusive");
+        RegionResult merged;
+        std::optional<RegionStop> stopped;
+        bool limited = false;
+        for (const auto& frame : volumeFrames(db, *options.volume, options.kind, false)) {
+            if (merged.stats.outputBytes >= options.outputByteBudget) { stopped = RegionStop::OutputBudget; break; }
+            auto sub = options;
+            sub.volume.reset();
+            sub.coordinates = frame.coordinates;
+            sub.outputByteBudget = options.outputByteBudget - merged.stats.outputBytes;
+            sub.minLength = options.minLength > 0 ? lowestStoredAtLeast(options.minLength, frame.toVolume) : 0.0;
+            RegionSlice stored = view;
+            for (auto& coordinate : stored.origin) coordinate /= frame.toVolume;
+            for (auto& bound : stored.localBounds) bound /= frame.toVolume;
+            auto part = geometryRegion(txn, stored, sub, cancel);
+            for (auto field : {&RegionStats::outputBytes, &RegionStats::processingBytes, &RegionStats::payloadBytes,
+                               &RegionStats::verifiedBytes, &RegionStats::metadataBytes, &RegionStats::reconstructedBytes,
+                               &RegionStats::cacheBytes, &RegionStats::candidateWork, &RegionStats::candidateVisits,
+                               &RegionStats::segmentTests, &RegionStats::sqlSteps})
+                merged.stats.*field += part.stats.*field;
+            for (auto& run : part.runs) {
+                for (auto& point : run.points) for (auto& coordinate : point) coordinate *= frame.toVolume;
+                merged.runs.push_back(std::move(run));
+            }
+            if (part.stop == RegionStop::ObjectLimit) limited = true;
+            else if (!part.complete()) { stopped = part.stop; break; }
+        }
+        const auto selected = options.maximumObjects && options.selected
+            ? std::optional(formatUuid(parseUuid(*options.selected))) : std::nullopt;
+        std::stable_sort(merged.runs.begin(), merged.runs.end(), [&](const VisibleRun& a, const VisibleRun& b) {
+            if ((a.objectUuid == selected) != (b.objectUuid == selected)) return a.objectUuid == selected;
+            return a.objectUuid < b.objectUuid;
+        });
+        std::set<std::string> objects;
+        size_t kept = 0;
+        for (; kept < merged.runs.size(); ++kept) {
+            const auto& uuid = merged.runs[kept].objectUuid;
+            if (!objects.contains(uuid) && options.maximumObjects && objects.size() == options.maximumObjects) {
+                limited = true;
+                break;
+            }
+            objects.insert(uuid);
+        }
+        merged.runs.resize(kept);
+        merged.intersectingObjects = objects.size();
+        merged.stop = stopped ? *stopped : limited ? RegionStop::ObjectLimit : RegionStop::Exhausted;
+        return merged;
+    }
     const auto kind = polylineKind(options.kind);
     const auto bounds = worldBounds(view);
     if (!std::isfinite(options.minLength) || options.minLength < 0 || options.minPoints < 2)

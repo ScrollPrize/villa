@@ -13,8 +13,18 @@ std::pair<std::string, std::string> lifecycleBinding(sqlite3*, const EdgeRecord&
 bool lifecycleBindingMatches(sqlite3*, const EdgeRecord&);
 void bindLifecycle(sqlite3*, const EdgeRecord&, const std::string& aEpoch, const std::string& bEpoch);
 // Shared selection semantics for records and compact graph topology.
+// Internal frame filters of a volume selection, in stored units.
+struct FrameCursor {
+    double tieLow = 0, tieHigh = 0; // stored range of the cursor's volume length
+    double stored = 0;              // the cursor object's stored length
+    std::string uuid;
+};
+struct FrameFilter {
+    std::optional<FrameCursor> cursor;
+    std::optional<std::string> unboundVolume; // objects not bound to this volume
+};
 std::unique_ptr<Statement> objectSelectionQuery(sqlite3* db, const ObjectSelection& selection,
-                                               const std::string& columns);
+                                               const std::string& columns, const FrameFilter* frame = nullptr);
 
 using ObjectFields = std::optional<std::set<std::string>>;
 bool wants(const ObjectFields& fields, const std::string& name);

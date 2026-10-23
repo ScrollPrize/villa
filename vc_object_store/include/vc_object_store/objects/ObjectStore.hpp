@@ -179,6 +179,17 @@ struct ObjectSelection {
     // Exact declared coordinate system (JSON volume_uuid/scale_factor).
     // Missing declarations compare as null; absent filter matches all frames.
     std::optional<std::string> coordinates;
+    // Volume target, exclusive with coordinates: matches objects declared in
+    // this volume ID with a scale factor, across every such frame. bbox,
+    // minLength, afterLength and length_desc then use that volume's voxels,
+    // where volume length = stored length * (1 / scale_factor), the factor of
+    // geometryScaleToVolume(). length_desc ties order by stored length, then
+    // UUID. Returned records and region bounds keep their stored coordinates.
+    std::optional<std::string> volume;
+    // With volume: also list objects not bound to it, after the bound ones in
+    // UUID order (a cursor into them has afterUuid without afterLength).
+    // Excluded when minLength is positive. Not valid for spatialRegions.
+    bool includeUnbound = false;
 };
 struct ObjectCoordinateGroup {
     std::string coordinates;

@@ -353,7 +353,22 @@ an exact JSON coordinate declaration (missing fields compare as null).
 `objectCoordinateGroups(txn, "fiber", cancel)` aggregates current metadata without
 materializing object records or decoding geometry. This lets a viewer query each
 coordinate frame directly, without constructing an inclusion list for every
-object in the store. Region queries drive the persisted R-tree and order only
+object in the store.
+
+A volume target instead queries in one volume's voxels across every frame
+declared in it. `ObjectSelection::volume` / `select_objects(volume=...)`,
+`spatial_regions(volume=...)` and `RegionOptions::volume` take the volume ID
+(the `volume_uuid` of `meta.coordinates`) and match objects declared in it with a
+scale factor. Their bbox, minimum length, `length_desc` order and length cursor
+use volume voxels, where volume length = stored length × (1 / scale_factor), the
+factor `geometryScaleToVolume()` returns. Each frame is queried on its own index
+and merged; equal volume lengths order by stored length, then UUID, so a cursor
+of the last row's volume length and UUID resumes exactly. Region run points and
+spatial region bounds are returned in volume voxels; records keep their stored
+coordinates. `include_unbound` appends objects not bound to the volume (including
+other volumes' frames) in UUID order after the bound ones, unless a positive
+minimum length is set; a cursor into them carries `after_uuid` without
+`after_length`. `volume` and `coordinates` are exclusive. Region queries drive the persisted R-tree and order only
 spatial candidates by UUID. Geometry and intersection predicates are unchanged.
 
 | Budget | Default | Charged work |

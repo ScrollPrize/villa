@@ -451,10 +451,12 @@ NB_MODULE(_native, m)
             const std::optional<std::array<double, 6>>& bbox, const std::optional<std::vector<std::string>>& fields,
             const std::optional<std::string>& family, const std::optional<double>& minLength,
             const std::string& orderBy, const std::optional<std::string>& afterUuid,
-            const std::optional<double>& afterLength, bool includeRetired) {
+            const std::optional<double>& afterLength, bool includeRetired,
+            const std::optional<std::string>& volume, bool includeUnbound) {
             vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset, bbox};
             selection.family = family; selection.minLength = minLength; selection.orderBy = orderBy;
             selection.afterUuid = afterUuid; selection.afterLength = afterLength; selection.includeRetired = includeRetired;
+            selection.volume = volume; selection.includeUnbound = includeUnbound;
             const auto records = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.selectObjects(txn, selection, fields); });
             const std::set<std::string> selected = fields ? std::set<std::string>(fields->begin(), fields->end()) : std::set<std::string>{};
             nb::list result;
@@ -465,16 +467,19 @@ NB_MODULE(_native, m)
            nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("limit") = std::nullopt, nb::arg("offset") = 0,
            nb::arg("bbox") = std::nullopt, nb::arg("fields") = std::nullopt,
            nb::arg("family") = std::nullopt, nb::arg("min_length") = std::nullopt,
-           nb::arg("order_by") = "uuid", nb::arg("after_uuid") = std::nullopt, nb::arg("after_length") = std::nullopt, nb::arg("include_retired") = false)
+           nb::arg("order_by") = "uuid", nb::arg("after_uuid") = std::nullopt, nb::arg("after_length") = std::nullopt, nb::arg("include_retired") = false,
+           nb::arg("volume") = std::nullopt, nb::arg("include_unbound") = false)
         .def("geometry_region", &geometryRegionFromPy, nb::arg("slice"),
              nb::arg("options") = vo::RegionOptions{}, nb::arg("cancel") = nb::none())
         .def("spatial_regions", [](PyObjectStore& self, const std::array<double, 6>& bbox,
             const std::optional<std::string>& kind, const std::optional<std::string>& tag,
             const std::vector<std::string>& ids, const std::optional<std::string>& connected,
             const std::vector<std::string>& edgeKinds, const std::optional<int64_t>& limit, int64_t offset,
-            const std::optional<std::string>& family, const std::optional<double>& minLength, bool includeRetired) {
+            const std::optional<std::string>& family, const std::optional<double>& minLength, bool includeRetired,
+            const std::optional<std::string>& volume) {
             vo::ObjectSelection selection{kind, tag, connected, ids, edgeKinds, limit, offset, bbox};
             selection.family = family; selection.minLength = minLength; selection.includeRetired = includeRetired;
+            selection.volume = volume;
             const auto regions = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.spatialRegions(txn, selection); });
             nb::list result;
             for (const auto& r : regions) {
@@ -488,6 +493,7 @@ NB_MODULE(_native, m)
            nb::arg("object_uuids") = std::vector<std::string>{}, nb::arg("connected_to") = std::nullopt,
            nb::arg("edge_kinds") = std::vector<std::string>{}, nb::arg("limit") = std::nullopt, nb::arg("offset") = 0,
            nb::arg("family") = std::nullopt, nb::arg("min_length") = std::nullopt, nb::arg("include_retired") = false,
+           nb::arg("volume") = std::nullopt,
            "Return revision-bound surface tiles, polyline/point blocks, or external object boxes. Bounds are conservative candidates.")
         .def("export_json", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::optional<std::string>& tag, const std::vector<std::string>& ids,

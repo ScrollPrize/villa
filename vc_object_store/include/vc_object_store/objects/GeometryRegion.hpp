@@ -34,6 +34,11 @@ struct RegionOptions {
     std::optional<std::vector<std::string>> uuids;
     // Exact coordinate declaration, using the same JSON filter as ObjectSelection.
     std::optional<std::string> coordinates;
+    // Volume target, exclusive with coordinates: the slice, minLength and the
+    // returned run points are in this volume's voxels, across every frame
+    // declared in it (see ObjectSelection::volume). maximumObjects, selected
+    // priority and UUID order apply across the frames.
+    std::optional<std::string> volume;
 };
 enum class RegionStop { Exhausted, ObjectLimit, OutputBudget, ProcessingBudget, CandidateBudget, SqlBudget, Cancelled };
 struct RegionStats {
