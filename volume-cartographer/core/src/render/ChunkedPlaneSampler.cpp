@@ -1721,13 +1721,22 @@ int ChunkedPlaneSampler::sourceLevelForView(IChunkedArray& array,
     }
     const double maximumExtent =
         1.0 / (static_cast<double>(pixelsPerBaseVoxel) * qualityBias);
-    int selected = 0;
+    int selected = -1;
     for (int level = 0; level < array.numLevels(); ++level) {
+        // Partial local pyramids retain empty slots for absent physical levels.
+        // Their default transforms do not describe sampleable source voxels.
+        const auto shape = array.shape(level);
+        if (shape[0] <= 0 || shape[1] <= 0 || shape[2] <= 0)
+            continue;
         const double extent = maximumBaseVoxelExtent(array, level);
-        if (std::isfinite(extent) && extent <= maximumExtent)
+        if (!std::isfinite(extent))
+            continue;
+        // At high zoom, keep the finest available level even if no level meets
+        // the quality threshold.
+        if (selected < 0 || extent <= maximumExtent)
             selected = level;
     }
-    return selected;
+    return std::max(selected, 0);
 }
 
 ChunkedPlaneSampler::Stats ChunkedPlaneSampler::requestPlaneDependencies(
