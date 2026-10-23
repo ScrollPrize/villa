@@ -94,12 +94,21 @@ def _edt_dilate_worker(
     # Create binary mask of nonzero values
     mask = chunk_data != 0
 
-    # Skip if chunk is all background (empty)
-    if not mask.any():
-        return (chunk_idx, False)
-
     # Invert mask for EDT (EDT computes distance from True voxels)
     inverted = ~mask
+
+    # Outside the array is always background. edt's own black_border=True would make it
+    # zeros of ``inverted``, i.e. foreground, at every face of the region read. Only with
+    # black_border=False is the *volume* boundary foreground: pad one foreground slab on
+    # the faces of the region that lie on it, for both backends.
+    pad = [(0, 0)] * 3
+    if not black_border:
+        pad = [(int(a == 0), int(b == n)) for a, b, n in zip(lo, hi, input_arr.shape)]
+        inverted = np.pad(inverted, pad, constant_values=False)
+
+    # Skip if the region holds no foreground and touches no foreground border
+    if not mask.any() and not any(a or b for a, b in pad):
+        return (chunk_idx, False)
 
     # Compute EDT
     if HAS_EDT:
@@ -107,11 +116,13 @@ def _edt_dilate_worker(
         if not inverted.flags["C_CONTIGUOUS"]:
             inverted = np.ascontiguousarray(inverted)
         # Use single thread since we parallelize over chunks
-        distances = edt_package.edt(inverted, parallel=1, black_border=black_border)
+        distances = edt_package.edt(inverted, parallel=1, black_border=False)
     else:
         distances = scipy_edt(inverted)
 
     # Threshold to create dilated mask
+    if not black_border:
+        distances = distances[tuple(slice(a, d - b) for (a, b), d in zip(pad, distances.shape))]
     dilated = (distances[inner] <= distance).astype(np.uint8)
 
     # Write to output
@@ -152,7 +163,7 @@ class EdtDilateTask(ZarrTask):
             "--black-border",
             type=lambda x: x.lower() in ("true", "1", "yes"),
             default=True,
-            help="Treat volume boundary as background (default: True)",
+            help="Treat volume boundary as background (default: True); false makes the volume faces foreground",
         )
         parser.add_argument(
             "--resolution",

@@ -1,17 +1,18 @@
-"""Property test: chunked edt_dilate equals a whole-volume oracle on the same EDT backend."""
+"""Property test: chunked edt_dilate equals one whole-volume scipy oracle, for both EDT backends."""
 import itertools
 
 import numpy as np
 import pytest
 
 hypothesis = pytest.importorskip("hypothesis")
-from hypothesis import HealthCheck, assume, given, settings
+from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 scipy_ndimage = pytest.importorskip("scipy.ndimage")
 
 from vesuvius.image_proc.run.zarr_tasks.tasks import edt_dilate as m
 
+from .test_edt_dilate_halo import _oracle as _halo_oracle
 from .test_edt_dilate_halo import _run_chunked
 
 BACKENDS = ["scipy"] + (["edt"] if m.HAS_EDT else [])
@@ -26,13 +27,8 @@ def backend(request, monkeypatch):
 
 
 def _oracle(vol, dist, black_border, backend):
-    if not vol.any():
-        return np.zeros(vol.shape, bool)  # the task skips regions with no foreground
-    if backend == "edt":
-        d = m.edt_package.edt(np.ascontiguousarray(vol == 0), black_border=black_border, parallel=1)
-    else:
-        d = scipy_ndimage.distance_transform_edt(vol == 0)
-    return d <= dist
+    # One backend-independent reference for both backends.
+    return _halo_oracle(vol, dist, black_border)
 
 
 @st.composite
@@ -53,10 +49,6 @@ def cases(draw):
 @given(case=cases())
 def test_chunked_equals_whole_volume(tmp_path_factory, backend, case):
     vol, ch, dist, bb = case
-    # edt with black_border=True seeds the EDT from the volume faces, but the task skips
-    # chunks whose halo has no foreground, so those chunks never get the face shell.
-    # That is a separate, pre-existing issue; this test covers the halo only.
-    assume(not (backend == "edt" and bb))
     tmp = tmp_path_factory.mktemp("p")
     got = _run_chunked(tmp, vol, ch, dist, bb)
     np.testing.assert_array_equal(got, _oracle(vol, dist, bb, backend))

@@ -43,12 +43,15 @@ def test_dilation_crosses_processing_chunk_boundaries(tmp_path, black_border):
 
 
 def _oracle(vol, dist, black_border):
-    """Whole-volume reference using the same EDT backend as the task."""
-    if m.HAS_EDT:
-        # edt's black_border=True treats the volume faces as seeds; scipy has no such option.
-        d = m.edt_package.edt(np.ascontiguousarray(vol == 0), black_border=black_border, parallel=1)
-    else:
-        d = scipy_ndimage.distance_transform_edt(vol == 0)
+    """Whole-volume reference (scipy): black_border=False makes the volume faces foreground."""
+    inv = vol == 0
+    if not black_border:
+        inv = np.pad(inv, 1, constant_values=False)
+    elif inv.all():
+        return np.zeros(vol.shape, bool)  # no foreground, nothing to dilate
+    d = scipy_ndimage.distance_transform_edt(inv)
+    if not black_border:
+        d = d[1:-1, 1:-1, 1:-1]
     return d <= dist
 
 
