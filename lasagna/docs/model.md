@@ -85,7 +85,7 @@ FitResult fields:
 - Local optimization behavior:
 	- Spatial grows use [`Model2D._last_grow_insert_lr`](model.py:146) to build a spatial mask (`const_mask_lr`).
 	- Z grows use [`Model2D._last_grow_insert_z`](model.py:147) and the optimizer masks gradients so **only that Z slice** updates.
-		- This is implemented in [`optimizer.optimize()`](optimizer.py:212) via backward hooks.
+		- This is implemented in [`optimizer.optimize()`](../optimizer/optimizer.py) via backward hooks.
 
 - Visualization behavior:
 	- Visualization selects the slice `z_i = model._last_grow_insert_z` (fallback 0) so the optimized slice is shown.

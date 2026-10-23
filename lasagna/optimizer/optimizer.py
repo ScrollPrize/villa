@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import json
 import math
 import os
 import time
 from dataclasses import dataclass, replace
-from pathlib import Path
 
 import torch
 
@@ -27,92 +25,35 @@ import opt_loss_cyl
 import opt_loss_snap_surf
 import opt_loss_atlas_line
 from snap_surf import map_global as snap_surf_map_global
-from progress_table import format_progress_value, print_progress_legend
 import opt_loss_flatten
 from flatten_clamped_adam import FlattenClampedAdam
-
-
-def _debug_cuda_sync(label: str) -> None:
-	if os.environ.get("LASAGNA_SYNC_DEBUG", "0") == "0":
-		return
-	if torch.cuda.is_available():
-		try:
-			torch.cuda.synchronize()
-		except RuntimeError as exc:
-			raise RuntimeError(f"CUDA failure after {label}") from exc
-
-
-def _cuda_mem_debug_enabled() -> bool:
-	return os.environ.get("LASAGNA_CUDA_MEM_DEBUG", "0") != "0"
-
-
-def _fmt_mib(value: int | float) -> str:
-	return f"{float(value) / 1024.0 ** 2:.1f}MiB"
-
-
-def _log_cuda_memory(label: str, *, device: torch.device | int | None = None) -> None:
-	if not _cuda_mem_debug_enabled() or not torch.cuda.is_available():
-		return
-	try:
-		dev = device if device is not None else torch.cuda.current_device()
-		allocated = torch.cuda.memory_allocated(dev)
-		reserved = torch.cuda.memory_reserved(dev)
-		max_allocated = torch.cuda.max_memory_allocated(dev)
-		max_reserved = torch.cuda.max_memory_reserved(dev)
-		free, total = torch.cuda.mem_get_info(dev)
-		print(
-			f"[cuda_mem] {label}: "
-			f"alloc={_fmt_mib(allocated)} reserved={_fmt_mib(reserved)} "
-			f"peak_alloc={_fmt_mib(max_allocated)} peak_reserved={_fmt_mib(max_reserved)} "
-			f"free={_fmt_mib(free)} total={_fmt_mib(total)}",
-			flush=True,
-		)
-	except RuntimeError as exc:
-		print(f"[cuda_mem] {label}: unavailable ({exc})", flush=True)
-
-
-def _fmt_duration(seconds: float) -> str:
-	seconds = max(0.0, float(seconds))
-	if seconds < 60.0:
-		return f"{seconds:.2f}s"
-	minutes, sec = divmod(seconds, 60.0)
-	if minutes < 60.0:
-		return f"{int(minutes)}m{sec:05.2f}s"
-	hours, minutes = divmod(minutes, 60.0)
-	return f"{int(hours)}h{int(minutes):02d}m{sec:05.2f}s"
-
-
-def _require_consumed_dict(*, where: str, cfg: dict) -> None:
-	if cfg:
-		bad = sorted(cfg.keys())
-		print(f"WARNING stages_json: {where}: unknown key(s): {bad}")
-
-
-@dataclass(frozen=True)
-class OptSettings:
-	steps: int
-	lr: float | list[float]
-	params: list[str]
-	min_scaledown: int
-	default_mul: float | None
-	w_fac: dict | float | None
-	eff: dict[str, float]
-	base_eff: dict[str, float]
-	steps_auto: bool = False
-	args: dict | None = None
-	kind: str = "model"
-
-
-@dataclass(frozen=True)
-class Stage:
-	name: str
-	global_opt: OptSettings | None
-	children: tuple["Stage", ...] = ()
-	grow: dict | None = None
-
-	@property
-	def is_expand(self) -> bool:
-		return self.name.startswith("expand-")
+from . import timing as optimizer_timing
+from .reporting import StageReporter
+from .config import (
+	OptSettings,
+	Stage,
+	CYLINDER_SEED_INIT_STAGE_ROLES,
+	CYLINDER_STAGE_STEP_ARG,
+	CYLINDER_OUTPUT_ALL_SHELLS_ARGS,
+	CYLINDER_MAX_SEARCH_SHELLS_ARGS,
+	CYLINDER_GROW_DIRECTION_ARG,
+	CYLINDER_OUTSIDE_GRID_STEP_ARG,
+	CYLINDER_OUTSIDE_SAMPLE_FACTOR_ARG,
+	CYLINDER_OUTSIDE_THREADS_ARG,
+	CYLINDER_OUTSIDE_CHUNK_SIZE_ARG,
+	CYLINDER_OUTSIDE_DEEP_INTERP_CHUNKS_ARG,
+	CYLINDER_OUTSIDE_DEEP_BLEND_CHUNKS_ARG,
+	CYLINDER_REFINE_MAX_IFRAC_ARGS,
+	DEFAULT_CYLINDER_REFINE_MAX_IFRAC,
+	MODEL_INTERNAL_PARAM,
+	normalize_cylinder_grow_direction,
+	_parse_opt_settings,
+	total_steps_for_stages,
+	_lr_last,
+	_global_map_stage_from_opt_settings,
+	_resolve_snap_surf_map_fixture_export_args,
+	_truthy,
+)
 
 
 @dataclass(frozen=True)
@@ -120,87 +61,6 @@ class CylinderGrowWidthTarget:
 	width_count: int
 	circumference: float
 	width_step: float
-
-
-CYLINDER_SEED_INIT_STAGE_ROLES = ("cyl_init", "cyl_grow", "cyl_grow_refine")
-CYLINDER_STAGE_STEP_ARG = "model-step"
-OLD_CYLINDER_STAGE_STEP_ARGS = ("cyl_shell_width_step", "cyl_width_step", "cyl_step_size", "wstep_target")
-CYLINDER_OUTPUT_ALL_SHELLS_ARGS = ("cyl_output_all_shells", "cyl_shell_output_all")
-CYLINDER_MAX_SEARCH_SHELLS_ARGS = ("cyl_max_shells", "cyl_shell_max_shells", "cyl_shell_search_max_shells")
-CYLINDER_GROW_DIRECTION_ARG = "cyl_grow_direction"
-CYLINDER_OUTSIDE_GRID_STEP_ARG = "cyl_outside_grid_step"
-CYLINDER_OUTSIDE_SAMPLE_FACTOR_ARG = "cyl_outside_sample_factor"
-CYLINDER_OUTSIDE_THREADS_ARG = "cyl_outside_threads"
-CYLINDER_OUTSIDE_CHUNK_SIZE_ARG = "cyl_outside_chunk_size"
-CYLINDER_OUTSIDE_DEEP_INTERP_CHUNKS_ARG = "cyl_outside_deep_interp_chunks"
-CYLINDER_OUTSIDE_DEEP_BLEND_CHUNKS_ARG = "cyl_outside_deep_blend_chunks"
-CYLINDER_REFINE_MAX_IFRAC_ARGS = ("cyl_refine_max_ifrac", "cyl_grow_refine_max_ifrac")
-DEFAULT_CYLINDER_REFINE_MAX_IFRAC = 0.5
-CYLINDER_LOSS_NAMES = (
-	"cyl_normal", "cyl_center", "cyl_smooth", "cyl_z_smooth", "cyl_step",
-	"cyl_z_center", "cyl_step_push", "cyl_radial_mean", "cyl_bend", "cyl_conn_mesh", "cyl_conn_gt",
-	"cyl_base_mesh", "cyl_base_gt", "cyl_outside",
-)
-MODEL_OPT_PARAMS = {"mesh_ms", "amp", "bias", "cyl_params", "map_flatten_ms"}
-MAP_OPT_PARAMS = {"map_surf_affine", "map_surf_ms"}
-PARAM_REPLACEMENTS = {
-	"flatten_map_ms": "map_flatten_ms",
-	"map_affine": "map_surf_affine",
-	"affine": "map_surf_affine",
-	"map_uv_ms": "map_surf_ms",
-}
-MODEL_INTERNAL_PARAM = {
-	"map_flatten_ms": "flatten_map_ms",
-}
-MAP_LOSS_NAMES = (
-	"map_dist",
-	"map_vec_normal",
-	"map_surface_normal",
-	"map_turn",
-	"map_smooth",
-	"map_bend",
-	"map_jac",
-	"map_metric_smooth",
-	"map_area_smooth",
-	"map_dense_prior",
-	"map_station_t",
-)
-MAP_STAGE_LOSS_TO_GLOBAL = {
-	"dist": "map_dist",
-	"vec": "map_vec_normal",
-	"norm": "map_surface_normal",
-	"turn": "map_turn",
-	"smooth": "map_smooth",
-	"bend": "map_bend",
-	"jac": "map_jac",
-	"metric_smooth": "map_metric_smooth",
-	"area_smooth": "map_area_smooth",
-	"prior": "map_dense_prior",
-}
-
-
-def normalize_cylinder_grow_direction(raw: object = "outward") -> int:
-	if raw is None:
-		raw = "outward"
-	if isinstance(raw, str):
-		value = raw.strip().lower()
-		if value in {"outward", "outwards", "grow", "expand", "+", "+1", "1"}:
-			return 1
-		if value in {"inward", "inwards", "shrink", "contract", "-", "-1"}:
-			return -1
-	else:
-		try:
-			value_f = float(raw)
-		except (TypeError, ValueError):
-			value_f = None
-		if value_f == 1.0:
-			return 1
-		if value_f == -1.0:
-			return -1
-	raise ValueError(
-		f"cylinder stage arg '{CYLINDER_GROW_DIRECTION_ARG}' must be "
-		f"'outward' or 'inward', got {raw!r}"
-	)
 
 
 def cylinder_grow_width_target(
@@ -236,523 +96,8 @@ def _cyl_outside_mode_for_direction(direction: int) -> str:
 	)
 
 
-def _stage_to_modifiers(
-	base: dict[str, float],
-	default_mul: float | None,
-	w_fac: dict | float | None,
-	scalar_terms: set[str] | None = None,
-) -> tuple[dict[str, float], dict[str, float]]:
-	eff = {k: float(v) for k, v in base.items()}
-	if default_mul is not None:
-		for name in base.keys():
-			eff[name] = float(base[name]) * float(default_mul)
-	if isinstance(w_fac, (int, float)):
-		terms = scalar_terms if scalar_terms is not None else set(base.keys())
-		for name in terms:
-			if name in base:
-				eff[name] = float(base[name]) * float(w_fac)
-	elif isinstance(w_fac, dict):
-		for k, v in w_fac.items():
-			if v is None:
-				continue
-			eff[str(k)] = float(base.get(str(k), 0.0)) * float(v)
-
-	mods: dict[str, float] = {}
-	for name, val in eff.items():
-		b = float(base.get(name, 0.0))
-		mods[name] = (float(val) / b) if b != 0.0 else 0.0
-	return eff, mods
-
-
 def _need_term(name: str, stage_eff: dict[str, float]) -> float:
 	return float(stage_eff.get(name, 0.0))
-
-
-def _parse_opt_settings(
-	*,
-	stage_name: str,
-	opt_cfg: dict,
-	base: dict[str, float],
-) -> OptSettings:
-	opt_cfg = dict(opt_cfg)
-	steps_raw = opt_cfg.get("steps", 0)
-	lr_raw = opt_cfg.get("lr", 1e-3)
-	if isinstance(lr_raw, list):
-		if not lr_raw:
-			raise ValueError(f"stages_json: stage '{stage_name}' opt.lr: must be a number or a non-empty list")
-		lr: float | list[float] = [float(v) for v in lr_raw]
-	else:
-		lr = float(lr_raw)
-	params = opt_cfg.get("params", [])
-	if not isinstance(params, list):
-		params = []
-	params = [str(p) for p in params]
-	for old, new in PARAM_REPLACEMENTS.items():
-		if old in params:
-			raise ValueError(f"stages_json: stage '{stage_name}' opt.params: use '{new}' instead of '{old}'")
-	model_params = set(params) & MODEL_OPT_PARAMS
-	map_params = set(params) & MAP_OPT_PARAMS
-	bad_params = sorted(set(params) - MODEL_OPT_PARAMS - MAP_OPT_PARAMS)
-	if bad_params:
-		raise ValueError(f"stages_json: stage '{stage_name}' opt.params: unknown name(s): {bad_params}")
-	if model_params and map_params:
-		raise ValueError(
-			f"stages_json: stage '{stage_name}' opt.params: cannot mix model params {sorted(model_params)} "
-			f"with map params {sorted(map_params)}; put concurrent map optimization under args.snap_surf_map.map_opt"
-		)
-	kind = "map" if map_params else "model"
-	min_scaledown = max(0, int(opt_cfg.get("min_scaledown", 0)))
-	default_mul = opt_cfg.get("default_mul", None)
-	w_fac = opt_cfg.get("w_fac", None)
-	args_raw = opt_cfg.get("args", None)
-	# Back-compat: translate old "auto_offset": true → args dict
-	if args_raw is None and opt_cfg.get("auto_offset", False):
-		args_raw = {"winding_offset_autocrop": True}
-	if args_raw is not None and not isinstance(args_raw, dict):
-		raise ValueError(f"stages_json: stage '{stage_name}' opt 'args' must be an object or null")
-	args = dict(args_raw) if args_raw else {}
-	steps_auto = isinstance(steps_raw, str) and steps_raw.strip().lower() == "auto"
-	if steps_auto:
-		steps = max(1, int(args.get("auto_steps_max", 10000)))
-	elif isinstance(steps_raw, str):
-		try:
-			steps = max(0, int(steps_raw))
-		except ValueError as exc:
-			raise ValueError(
-				f"stages_json: stage '{stage_name}' opt.steps: expected an integer or 'auto'"
-		) from exc
-	else:
-		steps = max(0, int(steps_raw))
-	opt_cfg.pop("steps", None)
-	opt_cfg.pop("lr", None)
-	opt_cfg.pop("params", None)
-	opt_cfg.pop("min_scaledown", None)
-	opt_cfg.pop("default_mul", None)
-	opt_cfg.pop("w_fac", None)
-	opt_cfg.pop("auto_offset", None)
-	opt_cfg.pop("args", None)
-	_require_consumed_dict(where=f"stage '{stage_name}' opt", cfg=opt_cfg)
-	if default_mul is not None:
-		default_mul = float(default_mul)
-	if kind == "map" and w_fac is not None and not isinstance(w_fac, (dict, int, float)):
-		raise ValueError(f"stages_json: stage '{stage_name}' opt 'w_fac' must be an object, number, or null for map stages")
-	if kind == "model" and w_fac is not None and not isinstance(w_fac, (dict, int, float)):
-		raise ValueError(f"stages_json: stage '{stage_name}' opt 'w_fac' must be an object, number, or null")
-	if isinstance(w_fac, dict):
-		bad_terms = sorted(set(str(k) for k in w_fac.keys()) - set(base.keys()))
-		if bad_terms:
-			raise ValueError(f"stages_json: stage '{stage_name}' opt.w_fac: unknown term(s): {bad_terms}")
-		if kind == "map":
-			bad_map_terms = sorted(set(str(k) for k in w_fac.keys()) - set(MAP_LOSS_NAMES))
-			if bad_map_terms:
-				raise ValueError(
-					f"stages_json: stage '{stage_name}' opt.w_fac: map stages may only override map loss term(s); "
-					f"got {bad_map_terms}"
-				)
-	scalar_terms = set(MAP_LOSS_NAMES) if kind == "map" else (set(base.keys()) - set(MAP_LOSS_NAMES))
-	eff, _mods = _stage_to_modifiers(base, default_mul, w_fac, scalar_terms=scalar_terms)
-	if float(eff.get("atlas_line_snap", 0.0)) > 0.0:
-		conflicting = [
-			name for name in ("atlas_line", "atlas_line_control", "atlas_line_other")
-			if float(eff.get(name, 0.0)) > 0.0
-		]
-		if conflicting:
-			raise ValueError(
-				f"stages_json: stage '{stage_name}' atlas_line_snap cannot be combined with "
-				+ ", ".join(conflicting)
-			)
-	if steps_auto and "cyl_params" in params:
-		raise ValueError(f"stages_json: stage '{stage_name}' opt.steps='auto' is not supported for cyl_params stages")
-	if "cyl_params" in params:
-		if params != ["cyl_params"]:
-			raise ValueError(f"stages_json: stage '{stage_name}' opt.params: cyl_params must be optimized alone")
-		for old_key in OLD_CYLINDER_STAGE_STEP_ARGS:
-			if old_key in args:
-				raise ValueError(
-					f"stages_json: stage '{stage_name}' opt.args: '{old_key}' is no longer supported; "
-					f"use '{CYLINDER_STAGE_STEP_ARG}'"
-				)
-		if CYLINDER_STAGE_STEP_ARG in args and float(args[CYLINDER_STAGE_STEP_ARG]) <= 0.0:
-			raise ValueError(
-				f"stages_json: stage '{stage_name}' opt.args.{CYLINDER_STAGE_STEP_ARG}: must be > 0"
-		)
-		if not any(float(eff.get(name, 0.0)) != 0.0 for name in CYLINDER_LOSS_NAMES):
-			raise ValueError(f"stages_json: stage '{stage_name}' with cyl_params requires a nonzero cylinder loss")
-	if "map_flatten_ms" in params and not any(
-		float(eff.get(name, 0.0)) != 0.0
-		for name in ("flatten_sdir", "flatten_map_step", "flatten_edge_step", "flatten_avg_offset", "flatten_orient")
-	):
-		raise ValueError(f"stages_json: stage '{stage_name}' with map_flatten_ms requires a nonzero flatten loss")
-	return OptSettings(
-		steps=steps,
-		lr=lr,
-		params=params,
-		min_scaledown=min_scaledown,
-		default_mul=default_mul,
-		w_fac=w_fac,
-		eff=eff,
-		base_eff={k: float(v) for k, v in base.items()},
-		steps_auto=steps_auto,
-		args=args,
-		kind=kind,
-	)
-
-
-lambda_global: dict[str, float] = {
-	"normal": 1.0,
-	"step": 0.0,
-	"smooth_step": 0.0,
-	"avg_step": 0.0,
-	"smooth": 0.0,
-	"winding_density": 0.0,
-	"data": 0.0,
-	"data_plain": 0.0,
-	"pred_dt": 0.0,
-	"corr": 0.0,
-	"winding_vol": 0.0,
-	"station_n": 0.0,
-	"station_t": 0.0,
-	"bend": 0.0,
-	"ext_offset": 0.0,
-	"snap_surf_map": 0.0,
-	"atlas_line": 0.0,
-	"atlas_line_control": 0.0,
-	"atlas_line_other": 0.0,
-	"atlas_line_snap": 0.0,
-	"map_dist": 1.0,
-	"map_vec_normal": 1.0,
-	"map_surface_normal": 1.0,
-	"map_turn": 10.0,
-	"map_smooth": 0.05,
-	"map_bend": 0.01,
-	"map_jac": 1.0,
-	"map_metric_smooth": 0.05,
-	"map_area_smooth": 0.02,
-	"map_dense_prior": 0.001,
-	"map_station_t": 0.0,
-	"cyl_normal": 0.0,
-	"cyl_center": 0.0,
-	"cyl_smooth": 0.0,
-	"cyl_z_smooth": 0.0,
-	"cyl_z_center": 0.0,
-	"cyl_step_push": 0.0,
-	"cyl_step": 0.0,
-	"cyl_radial_mean": 0.0,
-	"cyl_bend": 0.0,
-	"cyl_conn_mesh": 0.0,
-	"cyl_conn_gt": 0.0,
-	"cyl_base_mesh": 0.0,
-	"cyl_base_gt": 0.0,
-	"cyl_outside": 0.0,
-	"flatten_sdir": 0.0,
-	"flatten_map_step": 0.0,
-	"flatten_edge_step": 0.0,
-	"flatten_avg_offset": 0.0,
-	"flatten_orient": 0.0,
-}
-
-
-def _init_mode_from_args(args_cfg: object) -> str | None:
-	if not isinstance(args_cfg, dict):
-		return None
-	model_init = str(args_cfg.get("model-init", args_cfg.get("model_init", "seed"))).strip().lower()
-	if model_init and model_init != "seed":
-		return None
-	init_mode = args_cfg.get("init-mode", args_cfg.get("init_mode", None))
-	return None if init_mode is None else str(init_mode).strip().lower()
-
-
-def _model_init_from_args(args_cfg: object) -> str | None:
-	if not isinstance(args_cfg, dict):
-		return None
-	return str(args_cfg.get("model-init", args_cfg.get("model_init", "seed"))).strip().lower()
-
-
-def _validate_cylinder_seed_stage_roles(stages: list[Stage]) -> None:
-	role_positions: dict[str, int] = {}
-	seen_grow = False
-	seen_non_role = False
-	for i, stage in enumerate(stages):
-		is_role = stage.name in CYLINDER_SEED_INIT_STAGE_ROLES
-		if is_role:
-			if seen_non_role:
-				raise ValueError(
-					"stages_json: cylinder_seed stages must be contiguous before later cylinder stages"
-				)
-			if stage.name in role_positions:
-				raise ValueError(f"stages_json: cylinder_seed stage '{stage.name}' is duplicated")
-			role_positions.setdefault(stage.name, i)
-			if stage.global_opt.params != ["cyl_params"]:
-				raise ValueError(
-					f"stages_json: cylinder_seed stage '{stage.name}' must have params ['cyl_params']"
-				)
-			if stage.name == "cyl_grow":
-				seen_grow = True
-			if stage.name == "cyl_grow_refine" and not seen_grow:
-				raise ValueError("stages_json: cylinder_seed stage 'cyl_grow_refine' must follow cyl_grow")
-		else:
-			if role_positions:
-				seen_non_role = True
-	missing = [name for name in ("cyl_init",) if name not in role_positions]
-	if missing:
-		raise ValueError(f"stages_json: cylinder_seed missing required stage role(s): {missing}")
-	if role_positions["cyl_init"] != 0:
-		raise ValueError(
-			"stages_json: cylinder_seed stages before cyl_init "
-			"must be only cyl_init; later stages are skipped when cyl_grow is absent"
-		)
-	if role_positions["cyl_init"] != min(role_positions.values()):
-		raise ValueError(
-			"stages_json: cylinder_seed stages must appear in order "
-			"cyl_init, cyl_grow, cyl_grow_refine"
-		)
-	if "cyl_grow" not in role_positions:
-		init_pos = role_positions["cyl_init"]
-		for stage in stages[:init_pos]:
-			raise ValueError(
-				"stages_json: cylinder_seed stages before cyl_init "
-				"must be only cyl_init; later stages are skipped when cyl_grow is absent"
-		)
-		return
-	first_non_role = next((i for i, stage in enumerate(stages) if i > role_positions["cyl_init"] and stage.name not in CYLINDER_SEED_INIT_STAGE_ROLES), len(stages))
-	for stage in stages[:first_non_role]:
-		if stage.name not in CYLINDER_SEED_INIT_STAGE_ROLES:
-			raise ValueError(
-				"stages_json: cylinder_seed stages before later stages "
-				"must be only cyl_init/cyl_grow/cyl_grow_refine; later stages run normally"
-		)
-
-
-def load_stages_cfg(cfg: dict, *, init_mode: str | None = None) -> list[Stage]:
-	cfg = dict(cfg)
-	args_cfg = cfg.pop("args", None)
-	top_args = dict(args_cfg) if isinstance(args_cfg, dict) else {}
-	model_init = _model_init_from_args(args_cfg)
-	if init_mode is None:
-		init_mode = _init_mode_from_args(args_cfg)
-	else:
-		init_mode = str(init_mode).strip().lower()
-	base = dict(lambda_global)
-	if model_init == "flatten":
-		base = {k: 0.0 for k in base.keys()}
-	base_cfg = cfg.pop("base", None)
-	if isinstance(base_cfg, dict):
-		bad_base = sorted(set(str(k) for k in base_cfg.keys()) - set(base.keys()))
-		if bad_base:
-			raise ValueError(f"stages_json: base: unknown term(s): {bad_base}")
-		for k, v in base_cfg.items():
-			base[str(k)] = float(v)
-
-	stages_cfg = cfg.pop("stages", None)
-	if stages_cfg is None:
-		raise ValueError("stages_json: missing required key 'stages'")
-	if not isinstance(stages_cfg, list):
-		raise ValueError(
-			f"stages_json: expected key 'stages' to be a non-empty list, got {type(stages_cfg).__name__}"
-		)
-	if not stages_cfg:
-		raise ValueError("stages_json: expected key 'stages' to be a non-empty list, got an empty list")
-	_require_consumed_dict(where="top-level", cfg=cfg)
-
-	def _load_stage_list(raw_stages: list, *, where: str) -> list[Stage]:
-		out: list[Stage] = []
-		for s in raw_stages:
-			if not isinstance(s, dict):
-				raise ValueError(f"stages_json: each stage in {where} must be an object")
-			s = dict(s)
-			name = str(s.pop("name", ""))
-			children_cfg = s.pop("stages", None)
-			grow_cfg = s.pop("grow", None)
-			if children_cfg is not None or name.startswith("expand-"):
-				if not name.startswith("expand-"):
-					raise ValueError(f"stages_json: wrapper stage '{name}' must be named expand-*")
-				if name not in {"expand-z", "expand-xyz"}:
-					raise ValueError(f"stages_json: unsupported expand stage '{name}' (expected expand-z or expand-xyz)")
-				if not isinstance(children_cfg, list) or not children_cfg:
-					raise ValueError(f"stages_json: stage '{name}' requires non-empty nested 'stages' list")
-				if grow_cfg is not None and not isinstance(grow_cfg, dict):
-					raise ValueError(f"stages_json: stage '{name}' field 'grow' must be an object or null")
-				_require_consumed_dict(where=f"stage '{name}'", cfg=s)
-				out.append(Stage(
-					name=name,
-					global_opt=None,
-					children=tuple(_load_stage_list(children_cfg, where=f"stage '{name}'.stages")),
-					grow=None if grow_cfg is None else dict(grow_cfg),
-				))
-				continue
-			global_opt_cfg = s.pop("global_opt", None)
-			if global_opt_cfg is None:
-				global_opt_cfg = s.pop("opt", None)
-			if global_opt_cfg is None:
-				global_opt_cfg = dict(s)
-				s.clear()
-			_require_consumed_dict(where=f"stage '{name}'", cfg=s)
-			if not isinstance(global_opt_cfg, dict):
-				raise ValueError(f"stages_json: stage '{name}' field 'global_opt' must be an object")
-			if "flatten_edge_step_global_scale" in top_args:
-				global_opt_cfg = dict(global_opt_cfg)
-				stage_args = dict(global_opt_cfg.get("args") or {})
-				stage_args.setdefault(
-					"flatten_edge_step_global_scale",
-					top_args["flatten_edge_step_global_scale"],
-				)
-				global_opt_cfg["args"] = stage_args
-			global_opt = _parse_opt_settings(stage_name=name, opt_cfg=global_opt_cfg, base=base)
-			out.append(Stage(name=name, global_opt=global_opt))
-		return out
-
-	out = _load_stage_list(stages_cfg, where="top-level stages")
-	if init_mode == "cylinder_seed":
-		_validate_cylinder_seed_stage_roles([s for s in out if s.global_opt is not None])
-	return out
-
-
-def load_stages(path: str) -> list[Stage]:
-	try:
-		with open(path, "r", encoding="utf-8") as f:
-			cfg = json.load(f)
-	except json.JSONDecodeError as exc:
-		raise ValueError(
-			f"stages_json: invalid JSON in {path}: line {exc.lineno}, column {exc.colno}: {exc.msg}"
-		) from exc
-	if not isinstance(cfg, dict):
-		raise ValueError("stages_json: expected an object")
-	return load_stages_cfg(cfg)
-
-
-def total_steps_for_stages(stages: list[Stage]) -> int:
-	total = 0
-	for stage in stages:
-		if stage.children:
-			total += total_steps_for_stages(list(stage.children))
-			continue
-		if stage.global_opt is None:
-			continue
-		total += max(0, stage.global_opt.steps)
-	return total
-
-
-def _lr_last(lr: float | list[float]) -> float:
-	if isinstance(lr, list):
-		return float(lr[-1])
-	return float(lr)
-
-
-def _global_map_w_fac_from_eff(*, base: dict[str, float], eff: dict[str, float]) -> dict[str, float]:
-	out: dict[str, float] = {}
-	for stage_name, global_name in MAP_STAGE_LOSS_TO_GLOBAL.items():
-		base_val = float(base.get(global_name, 0.0))
-		eff_val = float(eff.get(global_name, 0.0))
-		out[stage_name] = (eff_val / base_val) if base_val != 0.0 else 0.0
-	return out
-
-
-def _global_map_args_from_eff(args: dict, *, base: dict[str, float], eff: dict[str, float]) -> dict:
-	out = dict(args)
-	map_init = dict(out.get("map_init", {})) if isinstance(out.get("map_init", {}), dict) else {}
-	map_init.update({
-		"w_dist": float(base.get("map_dist", 0.0)),
-		"w_vec_normal": float(base.get("map_vec_normal", 0.0)),
-		"w_surface_normal": float(base.get("map_surface_normal", 0.0)),
-		"map_turn": float(base.get("map_turn", 0.0)),
-		"w_smooth": float(base.get("map_smooth", 0.0)),
-		"w_bend": float(base.get("map_bend", 0.0)),
-		"w_jac": float(base.get("map_jac", 0.0)),
-		"w_metric_smooth": float(base.get("map_metric_smooth", 0.0)),
-		"w_area_smooth": float(base.get("map_area_smooth", 0.0)),
-		"w_dense_prior": float(base.get("map_dense_prior", 0.0)),
-	})
-	out["map_init"] = map_init
-	out["map_station_t"] = float(eff.get("map_station_t", 0.0))
-	return out
-
-
-def _global_map_stage_from_opt_settings(*, name: str, opt_cfg: OptSettings, args: dict) -> snap_surf_map_global.GlobalMapStageConfig:
-	if opt_cfg.kind != "map":
-		raise ValueError(f"stage '{name}' is not a map optimization stage")
-	return snap_surf_map_global.GlobalMapStageConfig(
-		name=name,
-		steps=int(opt_cfg.steps),
-		lr=float(_lr_last(opt_cfg.lr)),
-		params=tuple({"map_surf_affine": "affine", "map_surf_ms": "map_uv_ms"}.get(p, p) for p in opt_cfg.params),
-		min_scaledown=int(opt_cfg.min_scaledown),
-		w_fac=_global_map_w_fac_from_eff(base=opt_cfg.base_eff, eff=opt_cfg.eff),
-		args=_global_map_args_from_eff(args, base=opt_cfg.base_eff, eff=opt_cfg.eff),
-	)
-
-
-def global_map_config_from_stages_cfg(cfg: dict) -> snap_surf_map_global.GlobalMapConfig:
-	stages = load_stages_cfg(cfg)
-	map_stages: list[snap_surf_map_global.GlobalMapStageConfig] = []
-	base_eff: dict[str, float] | None = None
-
-	def _collect(raw_stages: list[Stage]) -> None:
-		nonlocal base_eff
-		for stage in raw_stages:
-			if stage.children:
-				raise ValueError("global map fixture configs do not support nested/expand stages")
-			if stage.global_opt is None:
-				continue
-			if stage.global_opt.kind != "map":
-				raise ValueError(
-					f"global map fixture config stage '{stage.name}' is not a map stage; "
-					"fixture configs must contain only map optimization stages"
-				)
-			if base_eff is None:
-				base_eff = dict(stage.global_opt.base_eff)
-			map_stages.append(_global_map_stage_from_opt_settings(
-				name=stage.name,
-				opt_cfg=stage.global_opt,
-				args=stage.global_opt.args or {},
-			))
-
-	_collect(stages)
-	if not map_stages:
-		raise ValueError("global map fixture config contains no map optimization stages")
-	return snap_surf_map_global.GlobalMapConfig(base=dict(base_eff or {}), stages=tuple(map_stages))
-
-
-def load_global_map_config(path: str | Path) -> snap_surf_map_global.GlobalMapConfig:
-	try:
-		with open(path, "r", encoding="utf-8") as f:
-			cfg = json.load(f)
-	except json.JSONDecodeError as exc:
-		raise ValueError(
-			f"stages_json: invalid JSON in {path}: line {exc.lineno}, column {exc.colno}: {exc.msg}"
-		) from exc
-	if not isinstance(cfg, dict):
-		raise ValueError("stages_json: expected an object")
-	return global_map_config_from_stages_cfg(cfg)
-
-
-def _resolve_snap_surf_map_fixture_export_args(args: dict, *, out_dir: str | None) -> dict:
-	if not isinstance(args, dict):
-		return args
-	if out_dir is None:
-		return dict(args)
-	out = dict(args)
-	base = Path(out_dir)
-
-	def _resolve_path(value):
-		if value in (None, "", False):
-			return value
-		path = Path(str(value))
-		return str(path if path.is_absolute() else base / path)
-
-	for key in ("fixture_export_dir", "map_fixture_export_dir"):
-		if key in out:
-			out[key] = _resolve_path(out[key])
-	for key in ("export_fixture", "fixture_export"):
-		raw = out.get(key)
-		if isinstance(raw, str):
-			out[key] = _resolve_path(raw)
-		elif isinstance(raw, dict):
-			nested = dict(raw)
-			for path_key in ("dir", "out_dir", "path"):
-				if path_key in nested:
-					nested[path_key] = _resolve_path(nested[path_key])
-			out[key] = nested
-	return out
 
 
 def _lr_scalespace(*, lr: float | list[float], scale_i: int) -> float:
@@ -1493,47 +838,6 @@ def optimize(
 	def _stage_done(name: str, t0: float) -> None:
 		return None
 
-	def _timing_cuda_sync() -> None:
-		if torch.cuda.is_available():
-			torch.cuda.synchronize()
-
-	def _truthy(value) -> bool:
-		if isinstance(value, bool):
-			return value
-		if value is None:
-			return False
-		if isinstance(value, (int, float)):
-			return value != 0
-		return str(value).strip().lower() not in {"", "0", "false", "no", "off"}
-
-	def _flow_timing_enabled(cfg) -> bool:
-		if _truthy(os.environ.get("LASAGNA_FLOW_TIMING")):
-			return True
-		if not isinstance(cfg, dict):
-			return False
-		return _truthy(cfg.get("profile_cuda_timing", False))
-
-	def _opt_timing_enabled(stage_args_: dict) -> bool:
-		if _truthy(os.environ.get("LASAGNA_OPT_TIMING")):
-			return True
-		if not isinstance(stage_args_, dict):
-			return False
-		return _truthy(stage_args_.get("profile_opt", False))
-
-	def _opt_timing_interval(stage_args_: dict, *, fallback: int) -> int:
-		raw = os.environ.get("LASAGNA_OPT_TIMING_INTERVAL", None)
-		if raw is None and isinstance(stage_args_, dict):
-			raw = stage_args_.get("profile_interval", stage_args_.get("profile_opt_interval", None))
-		if raw is None:
-			raw = fallback
-		return max(1, int(raw))
-
-	def _opt_timing_sync_cuda(stage_args_: dict) -> bool:
-		raw = os.environ.get("LASAGNA_OPT_TIMING_SYNC_CUDA", None)
-		if raw is None and isinstance(stage_args_, dict):
-			raw = stage_args_.get("profile_cuda_sync", True)
-		return _truthy(raw)
-
 	def _is_cyl_stage(stage_: Stage) -> bool:
 		return stage_.global_opt is not None and "cyl_params" in stage_.global_opt.params
 
@@ -1729,132 +1033,6 @@ def optimize(
 		if getattr(model, "cyl_shell_completed", None):
 			model.cyl_shell_completed = [model.cyl_shell_completed[-1]]
 			model.cyl_shell_current_index = 0
-
-	class _FlowTimingWindow:
-		def __init__(self, *, interval: int = 100) -> None:
-			self.interval = max(1, int(interval))
-			self.count = 0
-			self.acc = {
-				"total": 0.0,
-				"io_prefetch": 0.0,
-				"flow_sampling": 0.0,
-				"flow_calc": 0.0,
-				"opt_step": 0.0,
-				"model_forward": 0.0,
-				"loss_eval": 0.0,
-			}
-
-		def add(self, key: str, seconds: float) -> None:
-			self.acc[key] = self.acc.get(key, 0.0) + max(0.0, float(seconds))
-
-		def finish_iter(self, *, label: str, step1: int, max_steps: int) -> None:
-			self.count += 1
-			if (step1 % self.interval) != 0 and step1 != max_steps:
-				return
-			if self.count <= 0:
-				return
-			total = max(1.0e-12, self.acc.get("total", 0.0))
-			io_prefetch = self.acc.get("io_prefetch", 0.0)
-			flow_sampling = self.acc.get("flow_sampling", 0.0)
-			flow_calc = self.acc.get("flow_calc", 0.0)
-			opt_step = self.acc.get("opt_step", 0.0)
-			measured = io_prefetch + flow_sampling + flow_calc + opt_step
-			other = max(0.0, total - measured)
-			rows = [
-				("io/prefetch", io_prefetch),
-				("flow sampling", flow_sampling),
-				("flow calc", flow_calc),
-				("opt step", opt_step),
-				("other", other),
-			]
-			print(f"[flow_timing] {label} {step1}/{max_steps} over {self.count} iters", flush=True)
-			print(f"{'part':<16s} {'runtime_%':>9s} {'ms/it':>10s}", flush=True)
-			for name, seconds in rows:
-				pct = 100.0 * seconds / total
-				ms_it = 1000.0 * seconds / float(self.count)
-				print(f"{name:<16s} {pct:9.2f} {ms_it:10.2f}", flush=True)
-			self.count = 0
-			for key in list(self.acc.keys()):
-				self.acc[key] = 0.0
-
-	class _OptTimingWindow:
-		_ORDER = [
-			"cache_sync",
-			"model_point_prefetch",
-			"model_forward",
-			"loss_prefetch",
-			"loss_eval",
-			"chunk_stats",
-			"zero_grad",
-			"backward",
-			"optimizer_step",
-			"model_updates",
-			"next_prefetch",
-			"progress",
-			"status",
-			"ensure_data",
-			"snapshot",
-		]
-
-		def __init__(self, *, interval: int = 100, sync_cuda: bool = True) -> None:
-			self.interval = max(1, int(interval))
-			self.sync_cuda = bool(sync_cuda)
-			self.count = 0
-			self.acc: dict[str, float] = {"total": 0.0}
-
-		def sync(self) -> None:
-			if self.sync_cuda:
-				_timing_cuda_sync()
-
-		def add(self, key: str, seconds: float) -> None:
-			self.acc[key] = self.acc.get(key, 0.0) + max(0.0, float(seconds))
-
-		def finish_iter(self, *, label: str, step1: int, max_steps: int) -> None:
-			self.count += 1
-			if (step1 % self.interval) != 0 and step1 != max_steps:
-				return
-			if self.count <= 0:
-				return
-			total = max(1.0e-12, self.acc.get("total", 0.0))
-			primary_keys = [k for k in self._ORDER if self.acc.get(k, 0.0) > 0.0]
-			extra_primary = sorted(
-				k for k, v in self.acc.items()
-				if k not in {"total", *primary_keys} and not k.startswith("loss:") and v > 0.0
-			)
-			loss_keys = sorted(k for k, v in self.acc.items() if k.startswith("loss:") and v > 0.0)
-			measured = sum(self.acc.get(k, 0.0) for k in primary_keys + extra_primary)
-			other = max(0.0, total - measured)
-			print(
-				f"[opt_timing] {label} {step1}/{max_steps} over {self.count} iters "
-				f"sync_cuda={int(self.sync_cuda)}",
-				flush=True,
-			)
-			print(f"{'part':<24s} {'runtime_%':>9s} {'ms/it':>10s} {'total_s':>10s}", flush=True)
-			for key in primary_keys + extra_primary:
-				seconds = self.acc.get(key, 0.0)
-				print(
-					f"{key:<24s} {100.0 * seconds / total:9.2f} "
-					f"{1000.0 * seconds / float(self.count):10.2f} {seconds:10.3f}",
-					flush=True,
-				)
-			if other > 0.0:
-				print(
-					f"{'other':<24s} {100.0 * other / total:9.2f} "
-					f"{1000.0 * other / float(self.count):10.2f} {other:10.3f}",
-					flush=True,
-				)
-			if loss_keys:
-				print("[opt_timing] loss term breakdown is inside loss_eval", flush=True)
-				for key in loss_keys:
-					seconds = self.acc.get(key, 0.0)
-					print(
-						f"{key:<24s} {100.0 * seconds / total:9.2f} "
-						f"{1000.0 * seconds / float(self.count):10.2f} {seconds:10.3f}",
-						flush=True,
-					)
-			self.count = 0
-			for key in list(self.acc.keys()):
-				self.acc[key] = 0.0
 
 	Needs = fit_model.ModelForwardNeeds
 	terms = {
@@ -2210,9 +1388,9 @@ def optimize(
 		auto_window = _auto_steps_window(stage_args) if opt_cfg.steps_auto else 0
 		auto_min = _auto_steps_min(stage_args, window=auto_window) if opt_cfg.steps_auto else 0
 		auto_rel_threshold = _auto_steps_rel_threshold(stage_args) if opt_cfg.steps_auto else 0.0
-		opt_timing_enabled = _opt_timing_enabled(stage_args)
-		opt_timing_interval = _opt_timing_interval(stage_args, fallback=max(1, status_interval or 100))
-		opt_timing_sync = _opt_timing_sync_cuda(stage_args)
+		opt_timing_enabled = optimizer_timing.opt_timing_enabled(stage_args)
+		opt_timing_interval = optimizer_timing.opt_timing_interval(stage_args, fallback=max(1, status_interval or 100))
+		opt_timing_sync = optimizer_timing.opt_timing_sync_cuda(stage_args)
 		flatten_max_update = (
 			_flatten_max_update_base(stage_args)
 			if "map_flatten_ms" in opt_cfg.params and bool(getattr(model, "flatten_enabled", False))
@@ -2675,579 +1853,10 @@ def optimize(
 				_capture_optimizer_target_lrs(opt)
 		_stage_done(f"{label}.winding_offset_autocrop", _t)
 
-		_status_rows = 0
-		_status_legend_cols: tuple[str, ...] | None = None
-		_status_step_width = max(16, len(f"{label} {max(0, opt_cfg.steps)}/{steps_label}") + 2)
-
-		def _print_status(*, step_label: str, loss_val: float, tv: dict[str, float], pv: dict[str, float],
-						  its: float | None = None, force_header: bool = False,
-						  shell_no: int | None = None) -> None:
-			nonlocal _status_rows, _status_legend_cols
-			label_map = {
-				"avg_step": "avg_st",
-				"cyl_bend": "c_bend",
-				"cyl_normal": "c_norm",
-				"cyl_outside": "c_out",
-				"cyl_radial_mean": "c_rad",
-				"cyl_smooth": "c_sm",
-				"cyl_step": "c_step",
-				"cyl_step_push": "c_spush",
-				"cyl_z_center": "c_zctr",
-				"cyl_z_smooth": "c_zsm",
-				"p:bend_max_deg": "benddeg",
-				"p:hstep_avg_vx": "havg",
-				"p:hstep_tgt_vx": "htgt",
-				"pred_dt_gate_gt0": "g>0",
-				"pred_dt_gate_gt01": "g>.1",
-				"pred_dt_gate_gt05": "g>.5",
-				"pred_dt_gate_eq1": "g=1",
-				"pred_dt_gate_n_gt0": "n>0",
-				"pred_dt_gate_n_gt01": "n>.1",
-				"pred_dt_gate_n_gt05": "n>.5",
-				"pred_dt_pull_gate_frac": "pcand%",
-				"pred_dt_pull_scored_frac": "pscore%",
-				"pred_dt_pull_active_frac": "pull%",
-				"pred_dt_pull_batches": "pbatch",
-				"pred_dt_pull_samples_m": "psampM",
-				"pred_dt_pull_prefix_mean": "pullpre",
-				"pred_dt_pull_weight_mean": "pullw",
-				"smooth_step": "sm_step",
-				"snap_surf_map": "smap",
-				"snaps_map_snap": "sms_los",
-				"snaps_map_snap_abs": "sms_abs",
-				"snaps_map_snap_max": "sms_max",
-				"snaps_map_snap_samples": "sms_smp",
-				"snaps_m2e": "s_m2e",
-				"snaps_seed": "s_seed",
-				"snaps_sdist": "s_mod",
-				"snaps_sext": "s_ext",
-				"snaps_local": "s_loc",
-				"snaps_brute": "s_brt",
-				"snaps_front": "s_frt",
-				"snaps_brute_on": "s_bon",
-				"snaps_pairs_m": "s_prM",
-				"snaps_gerr_avg": "s_gav",
-				"snaps_gerr_max": "s_gmx",
-				"snaps_ravg": "s_rav",
-				"snaps_rabs": "s_rab",
-				"snaps_rmax": "s_rmx",
-				"snaps_tow": "s_tow",
-				"snaps_dbg_iter": "sd_it",
-				"snaps_dbg_ring": "sd_rng",
-				"snaps_dbg_grid": "sd_grd",
-				"snaps_dbg_ori": "sd_ori",
-				"snaps_dbg_new": "sd_new",
-				"snaps_map_active": "sm_act",
-				"snaps_map_init": "sm_ini",
-				"snaps_map_added": "sm_add",
-				"snaps_map_blocked": "sm_bq",
-				"snaps_map_sparse": "sm_spr",
-				"snaps_map_iters": "sm_it",
-				"snaps_map_blocks": "sm_blk",
-				"snaps_map_grow": "sm_grw",
-				"snaps_map_add_loss": "sm_alos",
-				"snaps_map_add_bad_frac": "sm_abf",
-				"snaps_map_add_success_frac": "sm_asf",
-				"snaps_map_fringe_loss": "sm_flos",
-				"snaps_map_fringe_bad_frac": "sm_fbf",
-				"snaps_map_fringe_success_frac": "sm_fsf",
-				"snaps_map_loss": "sm_los",
-				"snaps_map_avg": "sm_avg",
-				"snaps_map_max": "sm_max",
-				"snaps_map_dist": "sm_dst",
-				"snaps_map_vec": "sm_vec",
-				"snaps_map_norm": "sm_nrm",
-				"snaps_map_turn": "sm_trn",
-				"snaps_map_turn_smp": "sm_ts",
-				"snaps_map_zext_bad": "sm_zeb",
-				"snaps_map_zext_unr": "sm_zeu",
-				"snaps_map_zmdl_bad": "sm_zmb",
-				"snaps_map_zmdl_unr": "sm_zmu",
-				"snaps_map_smooth": "sm_smo",
-				"snaps_map_bend": "sm_bnd",
-				"snaps_map_jac": "sm_jac",
-				"snaps_map_smooth_fwd": "sm_sf",
-				"snaps_map_bend_fwd": "sm_bf",
-				"snaps_map_jac_fwd": "sm_jf",
-				"snaps_map_metric_smooth": "sm_met",
-				"snaps_map_area_smooth": "sm_ar",
-				"snaps_map_smooth_rev": "sm_sr",
-				"snaps_map_bend_rev": "sm_br",
-				"snaps_map_jac_rev": "sm_jr",
-				"snaps_map_jinv_min": "sm_rmn",
-				"snaps_map_jinv_bad": "sm_rbd",
-				"snaps_map_jmin": "sm_jmn",
-				"snaps_map_prior": "sm_pri",
-				"snaps_map_reg": "sm_reg",
-				"snaps_map_jbad": "sm_jbd",
-				"snaps_map_jbadf": "sm_jbf",
-				"snaps_map_samples": "sm_smp",
-				"snaps_map_sample_total": "sm_stot",
-				"snaps_map_sample_valid": "sm_sval",
-				"snaps_map_sample_base": "sm_sbas",
-				"snaps_map_sample_model": "sm_smdl",
-				"snaps_map_sample_limit": "sm_slim",
-				"snaps_map_sample_bad": "sm_sbad",
-				"snaps_map_turn_valid": "sm_tval",
-				"snaps_map_loss_quad": "sm_lq",
-				"snaps_map_valid_quad": "sm_vq",
-				"snaps_map_loss_finite": "sm_lfin",
-				"snaps_map_runtime_steps": "sm_it",
-				"snaps_map_uvbad": "sm_uvb",
-				"snaps_map_model_bad": "sm_mbd",
-				"snaps_map_surf": "sm_srf",
-				"snaps_map_surf_n": "sm_sn",
-				"snaps_map_surf_avg": "sm_sav",
-				"snaps_map_surf_abs": "sm_sab",
-				"snaps_map_surf_max": "sm_smx",
-				"snaps_map_nsign": "sm_sgn",
-				"snaps_map_scales": "sm_scl",
-				"snaps_map_repair": "sm_rep",
-				"cyl_outside_pen_frac": "out%",
-				"cyl_outside_depth_max": "outmax",
-				"cyl_outside_depth_avg": "outavg",
-				"atlas_line": "a_line",
-				"atlas_line_control": "a_ctl",
-				"atlas_line_other": "a_oth",
-				"atlas_line_snap": "a_snap",
-				"atlas_line_samples": "a_samp",
-				"atlas_line_valid": "a_val",
-				"atlas_line_rms": "a_rms",
-				"atlas_line_active_vertices": "a_vtx",
-				"atlas_line_signed_delta_mean": "a_dlt",
-				"atlas_line_control_valid": "a_cval",
-				"atlas_line_control_rms": "a_crms",
-				"atlas_line_control_active_vertices": "a_cvtx",
-				"atlas_line_other_valid": "a_oval",
-				"atlas_line_other_rms": "a_orms",
-				"atlas_line_other_active_vertices": "a_ovtx",
-				"atlas_line_snap_valid": "a_sval",
-				"atlas_line_snap_rms": "a_srms",
-				"atlas_line_snap_active_vertices": "a_svtx",
-				"flatten_sdir": "f_sdir",
-				"flatten_sdir_contrib": "f_sdirW",
-				"flatten_point_valid": "f_pt",
-				"flatten_quad_valid": "f_quad",
-				"flatten_tgt_step": "f_tgt",
-				"flatten_grid_step_avg": "f_step",
-				"flatten_valid_to_invalid": "f_v2i",
-				"flatten_invalid_to_valid": "f_i2v",
-				"flatten_map_step": "f_mstep",
-				"flatten_map_step_contrib": "f_mstpW",
-				"flatten_edge_step": "f_estep",
-				"flatten_edge_step_contrib": "f_estpW",
-				"flatten_avg_offset": "f_avg",
-				"flatten_avg_offset_contrib": "f_avgW",
-				"flatten_avg_offset_norm": "f_avgn",
-				"flatten_orient": "f_orient",
-				"flatten_orient_contrib": "f_oriW",
-				"flatten_orient_fold_frac": "f_fold",
-				"flatten_orient_lowdet_frac": "f_lowdet",
-				"flatten_orient_min_det": "f_mindet",
-				"flatten_orient_mean_det": "f_det",
-				"flatten_sdir_no_new": "f_noadd",
-				"p:wcirc_avg_vx": "cavg",
-				"p:wcirc_tgt_vx": "ctgt",
-				"p:wstep_invalid_avg_vx": "iavg",
-				"p:wstep_invalid_frac": "ifrac",
-				"p:wstep_avg_vx": "wavg",
-				"p:wstep_tgt_vx": "wtgt",
-			}
-			desc_map = {
-				"cyl_bend": "cyl bend",
-				"cyl_normal": "cyl normal",
-				"cyl_outside": "cyl outside",
-				"cyl_radial_mean": "cyl radius",
-				"cyl_smooth": "cyl smooth",
-				"cyl_step": "cyl step",
-				"cyl_step_push": "cyl push",
-				"cyl_z_center": "cyl z center",
-				"cyl_z_smooth": "cyl z smooth",
-				"pred_dt_gate_gt0": "gate >0",
-				"pred_dt_gate_gt01": "gate >.1",
-				"pred_dt_gate_gt05": "gate >.5",
-				"pred_dt_gate_eq1": "gate =1",
-				"pred_dt_gate_n_gt0": "n gate >0",
-				"pred_dt_gate_n_gt01": "n gate >.1",
-				"pred_dt_gate_n_gt05": "n gate >.5",
-				"pred_dt_pull_gate_frac": "pull candidates",
-				"pred_dt_pull_scored_frac": "pull scored",
-				"pred_dt_pull_active_frac": "pull active",
-				"pred_dt_pull_batches": "pull batches",
-				"pred_dt_pull_samples_m": "pull samples M",
-				"pred_dt_pull_prefix_mean": "pull prefix",
-				"pred_dt_pull_weight_mean": "pull weight",
-				"snap_surf_map": "map winding snap loss",
-				"snaps_map_snap": "map winding snap loss",
-				"snaps_map_snap_abs": "map winding snap abs residual",
-				"snaps_map_snap_max": "map winding snap max residual",
-				"snaps_map_snap_samples": "map winding snap samples",
-				"snaps_seed": "seed ok",
-				"snaps_sdist": "seed model dist",
-				"snaps_sext": "seed ext dist",
-				"snaps_m2e": "model->ext loss",
-				"snaps_local": "local hits",
-				"snaps_brute": "brute hits",
-				"snaps_front": "brute frontier",
-				"snaps_brute_on": "brute enabled",
-				"snaps_pairs_m": "pairs M",
-				"snaps_gerr_avg": "grid err avg",
-				"snaps_gerr_max": "grid err max",
-				"snaps_ravg": "residual avg",
-				"snaps_rabs": "residual abs",
-				"snaps_rmax": "residual max",
-				"snaps_tow": "toward loss",
-				"snaps_dbg_iter": "debug iter",
-				"snaps_dbg_ring": "debug ring",
-				"snaps_dbg_grid": "debug grid",
-				"snaps_dbg_ori": "debug orient",
-				"snaps_dbg_new": "debug new",
-				"snaps_map_active": "map active",
-				"snaps_map_init": "seeded quads",
-				"snaps_map_added": "grown quads",
-				"snaps_map_blocked": "blocked quads",
-				"snaps_map_sparse": "sparse pruned",
-				"snaps_map_iters": "map iters",
-				"snaps_map_blocks": "opt blocks",
-				"snaps_map_grow": "grow steps",
-				"snaps_map_add_loss": "add sample loss",
-				"snaps_map_add_bad_frac": "add bad sample frac",
-				"snaps_map_add_success_frac": "add usable quad frac",
-				"snaps_map_fringe_loss": "fringe sample loss",
-				"snaps_map_fringe_bad_frac": "fringe bad sample frac",
-				"snaps_map_fringe_success_frac": "fringe usable quad frac",
-				"snaps_map_loss": "map objective",
-				"snaps_map_avg": "avg model quad mapping distance",
-				"snaps_map_max": "max model quad mapping distance",
-				"snaps_map_dist": "map distance",
-				"snaps_map_vec": "vector normal",
-				"snaps_map_norm": "normal align",
-				"snaps_map_turn": "lifted z heading",
-				"snaps_map_turn_smp": "lifted z samples",
-				"snaps_map_zext_bad": "invalid external z-lift quads",
-				"snaps_map_zext_unr": "unreachable external z-lift quads",
-				"snaps_map_zmdl_bad": "invalid model z-lift quads",
-				"snaps_map_zmdl_unr": "unreachable model z-lift quads",
-				"snaps_map_smooth": "smooth reg",
-				"snaps_map_bend": "bend reg",
-				"snaps_map_jac": "jac reg",
-					"snaps_map_smooth_fwd": "uv+model smooth",
-					"snaps_map_bend_fwd": "uv+model bend",
-					"snaps_map_jac_fwd": "forward jac",
-					"snaps_map_metric_smooth": "model edge scale",
-					"snaps_map_area_smooth": "model area scale",
-				"snaps_map_smooth_rev": "reverse smooth",
-				"snaps_map_bend_rev": "reverse bend",
-				"snaps_map_jac_rev": "reverse jac",
-				"snaps_map_jinv_min": "min rev jac",
-				"snaps_map_jinv_bad": "bad rev jac",
-				"snaps_map_jmin": "min jac",
-				"snaps_map_prior": "dense prior",
-				"snaps_map_reg": "reg vertices",
-				"snaps_map_jbad": "bad jac",
-				"snaps_map_jbadf": "bad jac frac",
-				"snaps_map_samples": "valid samples",
-				"snaps_map_sample_total": "active sample slots",
-				"snaps_map_sample_valid": "finite map samples before quad filtering",
-				"snaps_map_sample_base": "external/uv-valid sample slots",
-				"snaps_map_sample_model": "model-valid sample slots",
-				"snaps_map_sample_limit": "samples passing objective limits",
-				"snaps_map_sample_bad": "samples rejected by validity/limits",
-				"snaps_map_turn_valid": "valid lifted-z sample slots",
-				"snaps_map_loss_quad": "quads contributing sample loss",
-				"snaps_map_valid_quad": "quads passing objective limits",
-				"snaps_map_loss_finite": "finite map loss flag",
-				"snaps_map_runtime_steps": "persistent map optimizer steps",
-				"snaps_map_uvbad": "bad uv quads",
-				"snaps_map_model_bad": "bad model quads",
-				"snaps_map_surf": "surface normal loss",
-				"snaps_map_surf_n": "surface samples",
-				"snaps_map_surf_avg": "surface signed avg",
-				"snaps_map_surf_abs": "surface abs avg",
-				"snaps_map_surf_max": "surface abs max",
-				"snaps_map_nsign": "normal sign",
-				"snaps_map_scales": "scale levels",
-				"snaps_map_repair": "repair blocks",
-				"cyl_outside_pen_frac": "outside frac",
-				"cyl_outside_depth_max": "outside max",
-				"cyl_outside_depth_avg": "outside avg",
-				"smooth_step": "local same-direction step equalization loss",
-				"avg_step": "global average step-scale loss",
-				"atlas_line": "atlas line loss",
-				"atlas_line_control": "atlas control-anchor loss",
-				"atlas_line_other": "atlas in-span line-anchor loss",
-				"atlas_line_snap": "atlas pred-snap loss",
-				"atlas_line_samples": "atlas line sample slots",
-				"atlas_line_valid": "atlas valid samples",
-				"atlas_line_rms": "atlas line RMS",
-				"atlas_line_active_vertices": "atlas active vertices",
-				"atlas_line_signed_delta_mean": "atlas signed normal correction mean",
-				"atlas_line_control_valid": "atlas valid control samples",
-				"atlas_line_control_rms": "atlas control RMS",
-				"atlas_line_control_active_vertices": "atlas active control vertices",
-				"atlas_line_other_valid": "atlas valid other samples",
-				"atlas_line_other_rms": "atlas other RMS",
-				"atlas_line_other_active_vertices": "atlas active other vertices",
-				"atlas_line_snap_valid": "atlas valid pred-snap samples",
-				"atlas_line_snap_rms": "atlas pred-snap RMS",
-				"atlas_line_snap_active_vertices": "atlas active pred-snap vertices",
-				"flatten_edge_step": "physical edge step loss",
-				"flatten_edge_step_contrib": "weighted physical edge step loss",
-				"flatten_map_step": "UV map step loss",
-				"flatten_map_step_contrib": "weighted UV map step loss",
-				"p:wcirc_avg_vx": "param circ avg",
-				"p:wcirc_tgt_vx": "param circ target",
-				"p:wstep_invalid_avg_vx": "param invalid avg",
-				"p:wstep_invalid_frac": "param invalid frac",
-				"p:wstep_avg_vx": "param step avg",
-				"p:wstep_tgt_vx": "param step target",
-			}
-			key_order = {
-				"pred_dt_gate_gt0": 100,
-				"pred_dt_gate_gt01": 101,
-				"pred_dt_gate_gt05": 102,
-				"pred_dt_gate_eq1": 103,
-				"pred_dt_gate_n_gt0": 104,
-				"pred_dt_gate_n_gt01": 105,
-				"pred_dt_gate_n_gt05": 106,
-				"pred_dt_pull_gate_frac": 107,
-				"pred_dt_pull_scored_frac": 108,
-				"pred_dt_pull_active_frac": 109,
-				"pred_dt_pull_batches": 110,
-				"pred_dt_pull_samples_m": 111,
-				"pred_dt_pull_prefix_mean": 112,
-				"pred_dt_pull_weight_mean": 113,
-				"snap_surf_map": 114,
-				"snaps_map_snap": 115,
-				"snaps_map_snap_abs": 116,
-				"snaps_map_snap_max": 117,
-				"snaps_map_snap_samples": 118,
-				"snaps_seed": 119,
-				"snaps_sext": 121,
-				"snaps_sdist": 122,
-				"snaps_m2e": 123,
-				"snaps_local": 124,
-				"snaps_brute": 125,
-				"snaps_front": 126,
-				"snaps_brute_on": 127,
-				"snaps_pairs_m": 128,
-				"snaps_gerr_avg": 129,
-				"snaps_gerr_max": 130,
-				"snaps_ravg": 131,
-				"snaps_rabs": 132,
-				"snaps_rmax": 133,
-				"snaps_tow": 134,
-				"snaps_dbg_iter": 135,
-				"snaps_dbg_ring": 136,
-				"snaps_dbg_grid": 137,
-				"snaps_dbg_ori": 138,
-				"snaps_dbg_new": 139,
-				"snaps_map_active": 140,
-				"snaps_map_init": 141,
-				"snaps_map_added": 142,
-				"snaps_map_blocked": 143,
-				"snaps_map_sparse": 144,
-				"snaps_map_iters": 145,
-				"snaps_map_blocks": 146,
-				"snaps_map_grow": 147,
-				"snaps_map_add_loss": 148,
-				"snaps_map_add_bad_frac": 149,
-				"snaps_map_add_success_frac": 150,
-				"snaps_map_fringe_loss": 151,
-				"snaps_map_fringe_bad_frac": 152,
-				"snaps_map_fringe_success_frac": 153,
-				"snaps_map_loss": 154,
-				"snaps_map_dist": 155,
-				"snaps_map_vec": 156,
-				"snaps_map_norm": 157,
-				"snaps_map_turn": 158,
-				"snaps_map_turn_smp": 159,
-				"snaps_map_smooth": 160,
-				"snaps_map_bend": 161,
-				"snaps_map_jac": 162,
-				"snaps_map_avg": 163,
-				"snaps_map_max": 164,
-				"snaps_map_smooth_fwd": 165,
-				"snaps_map_bend_fwd": 166,
-				"snaps_map_jac_fwd": 167,
-				"snaps_map_metric_smooth": 168,
-				"snaps_map_area_smooth": 167,
-				"snaps_map_smooth_rev": 168,
-				"snaps_map_bend_rev": 169,
-				"snaps_map_jac_rev": 170,
-				"snaps_map_jmin": 164,
-				"snaps_map_jinv_min": 165,
-				"snaps_map_jinv_bad": 166,
-				"snaps_map_prior": 167,
-				"snaps_map_reg": 168,
-				"snaps_map_jbad": 169,
-				"snaps_map_jbadf": 170,
-				"snaps_map_samples": 171,
-				"snaps_map_runtime_steps": 172,
-				"snaps_map_uvbad": 172,
-				"snaps_map_model_bad": 173,
-				"snaps_map_surf": 174,
-				"snaps_map_surf_n": 175,
-				"snaps_map_surf_avg": 176,
-				"snaps_map_surf_abs": 177,
-				"snaps_map_surf_max": 178,
-				"snaps_map_nsign": 179,
-				"snaps_map_scales": 180,
-				"snaps_map_repair": 181,
-				"flatten_sdir": 182,
-				"flatten_sdir_contrib": 183,
-				"flatten_map_step": 184,
-				"flatten_map_step_contrib": 185,
-				"flatten_edge_step": 186,
-				"flatten_edge_step_contrib": 187,
-				"flatten_avg_offset": 188,
-				"flatten_avg_offset_contrib": 189,
-				"flatten_orient": 190,
-				"flatten_orient_contrib": 191,
-				"flatten_tgt_step": 192,
-				"flatten_grid_step_avg": 193,
-				"flatten_point_valid": 194,
-				"flatten_quad_valid": 195,
-				"flatten_avg_offset_norm": 196,
-				"flatten_orient_fold_frac": 197,
-				"flatten_orient_lowdet_frac": 198,
-				"flatten_orient_min_det": 199,
-				"flatten_orient_mean_det": 200,
-				"flatten_sdir_no_new": 201,
-				"flatten_valid_to_invalid": 202,
-				"flatten_invalid_to_valid": 203,
-				"smooth_step": 204,
-				"avg_step": 205,
-				"cyl_outside_pen_frac": 206,
-				"cyl_outside_depth_max": 207,
-				"cyl_outside_depth_avg": 208,
-				"atlas_line": 220,
-				"atlas_line_control": 221,
-				"atlas_line_other": 222,
-				"atlas_line_snap": 223,
-				"atlas_line_samples": 224,
-				"atlas_line_valid": 225,
-				"atlas_line_rms": 226,
-				"atlas_line_active_vertices": 227,
-				"atlas_line_signed_delta_mean": 228,
-				"atlas_line_control_valid": 229,
-				"atlas_line_control_rms": 230,
-				"atlas_line_control_active_vertices": 231,
-				"atlas_line_other_valid": 232,
-				"atlas_line_other_rms": 233,
-				"atlas_line_other_active_vertices": 234,
-				"atlas_line_snap_valid": 235,
-				"atlas_line_snap_rms": 236,
-				"atlas_line_snap_active_vertices": 237,
-			}
-			def _sort_key(k: str) -> tuple[int, str]:
-				return (key_order.get(k, 0), k)
-			def _display_key(k: str) -> str:
-				return label_map.get(k, k)
-			def _desc_key(k: str) -> str:
-				if k in desc_map:
-					return desc_map[k]
-				if k == "flatten_grid_step_avg":
-					return "flatten current avg grid step"
-				if k.endswith("_contrib") and k.startswith("flatten_"):
-					return f"weighted {k[:-8]}"
-				if k.startswith("p:"):
-					return f"param {k[2:]}"
-				return k
-			def _print_status_legend(cols: list[str]) -> None:
-				items = []
-				if shell_no is not None:
-					items.append(("shell", "shell index"))
-				items.extend((("step", "stage step"), ("loss", "total loss"), ("it/s", "optimizer it/s")))
-				items.extend((_display_key(c), _desc_key(c)) for c in cols)
-				print_progress_legend(prefix="[optimizer]", items=items)
-			def _fmt_val(k: str, v: float) -> str:
-				return format_progress_value(v)
-			verbose_map_status = bool((stage_args or {}).get("verbose_map_status", (stage_args or {}).get("debug_map_status", False)))
-			verbose_pred_dt_flow_status = bool((stage_args or {}).get(
-				"verbose_pred_dt_flow_status",
-				(stage_args or {}).get("debug_pred_dt_flow_status", False),
-			))
-			visible_map_status_keys = {
-				"snaps_map_snap",
-				"snaps_map_snap_abs",
-				"snaps_map_snap_max",
-				"snaps_map_snap_samples",
-				"snaps_map_loss",
-				"snaps_map_dist",
-					"snaps_map_vec",
-					"snaps_map_norm",
-					"snaps_map_smooth",
-					"snaps_map_bend",
-					"snaps_map_metric_smooth",
-					"snaps_map_area_smooth",
-					"snaps_map_samples",
-				}
-			hidden_pred_dt_flow_status_prefixes = (
-				"pred_dt_atlas_snap_seed_",
-				"pred_dt_corr_seed_",
-				"pred_dt_flow_",
-				"pred_dt_layer_",
-			)
-			visible_pred_dt_status_keys = {
-				"pred_dt_gate_gt01",
-			}
-			verbose_atlas_line_status = bool((stage_args or {}).get(
-				"verbose_atlas_line_status",
-				(stage_args or {}).get("debug_atlas_line_status", False),
-			))
-			visible_atlas_line_status_keys = {
-				"atlas_line",
-				"atlas_line_control",
-				"atlas_line_other",
-				"atlas_line_snap",
-			}
-			def _show_status_key(k: str) -> bool:
-				ks = str(k)
-				if ks.startswith("snaps_map_"):
-					return verbose_map_status or ks in visible_map_status_keys
-				if ks.startswith(hidden_pred_dt_flow_status_prefixes):
-					return verbose_pred_dt_flow_status
-				if ks.startswith("pred_dt_gate_") or ks.startswith("pred_dt_pull_"):
-					return verbose_pred_dt_flow_status or ks in visible_pred_dt_status_keys
-				if ks.startswith("atlas_line_"):
-					return verbose_atlas_line_status or ks in visible_atlas_line_status_keys
-				return True
-			tv_keys = sorted((k for k in tv.keys() if _show_status_key(k)), key=_sort_key)
-			pv_keys = sorted(pv.keys())
-			cols = tv_keys + [f"p:{k}" for k in pv_keys]
-			values = {k: _fmt_val(k, tv[k]) for k in tv_keys}
-			values.update({f"p:{k}": _fmt_val(f"p:{k}", pv[k]) for k in pv_keys})
-			widths = {k: max(len(_display_key(k)), len(values[k]), 5) for k in cols}
-			legend_cols = tuple(cols)
-			if (
-				force_header
-				or _status_legend_cols != legend_cols
-				or (shell_no is not None and _status_rows == 0)
-				or (shell_no is None and _status_rows % 20 == 0)
-			):
-				if _status_legend_cols != legend_cols:
-					_print_status_legend(cols)
-					_status_legend_cols = legend_cols
-				hdr = ""
-				if shell_no is not None:
-					hdr += f"{'shell':>5s} "
-				hdr += f"{'step':>{_status_step_width}s} {'loss':>8s} {'it/s':>5s}"
-				for c in cols:
-					hdr += f" {_display_key(c):>{widths[c]}s}"
-				print(hdr)
-			_status_rows += 1
-			its_str = f"{its:5.1f}" if its is not None else f"{'':>5s}"
-			row = ""
-			if shell_no is not None:
-				row += f"{int(shell_no):5d} "
-			row += f"{step_label:>{_status_step_width}s} {loss_val:8.4f} {its_str}"
-			for k in tv_keys:
-				row += f" {values[k]:>{widths[k]}s}"
-			for k in pv_keys:
-				pk = f"p:{k}"
-				row += f" {values[pk]:>{widths[pk]}s}"
-			print(row)
+		reporter = StageReporter(
+			stage_args=stage_args,
+			step_width=max(16, len(f"{label} {max(0, opt_cfg.steps)}/{steps_label}") + 2),
+		)
 
 		def _print_cylinder_rough_top(rows: list[dict[str, float | int]], *, keep_n: int) -> None:
 			before = int(getattr(model, "cyl_params").shape[0])
@@ -3375,9 +1984,9 @@ def optimize(
 			with torch.no_grad():
 				_loss_prefetch_items: dict[str, torch.Tensor] = {}
 				if needs_.mesh_conn:
-					_log_cuda_memory(f"{label}.loss_prefetch.winding_density.begin")
+					optimizer_timing.log_cuda_memory(f"{label}.loss_prefetch.winding_density.begin")
 					for _i, _pf in enumerate(opt_loss_winding_density.winding_density_prefetch_grad_mag_batches_for_result(res=res_)):
-						_log_cuda_memory(
+						optimizer_timing.log_cuda_memory(
 							f"{label}.loss_prefetch.winding_density.batch{_i}.ready"
 						)
 						for _cache in _active_caches:
@@ -3387,7 +1996,7 @@ def optimize(
 							_sp = data._spacing_for(_cache.channels[0])
 							_cache.prefetch(_pf, data.origin_fullres, _sp)
 							_prefetched_channels.add("grad_mag")
-						_log_cuda_memory(
+						optimizer_timing.log_cuda_memory(
 							f"{label}.loss_prefetch.winding_density.batch{_i}.prefetched"
 						)
 				if needs_.prefetch_pred_dt_loss:
@@ -3470,7 +2079,7 @@ def optimize(
 
 		# Initial evaluation
 		def _eval_terms(res_, eff_, *, profile_label: str | None = None,
-						timing: _OptTimingWindow | None = None,
+						timing: optimizer_timing.OptTimingWindow | None = None,
 						atlas_debug_step: int | None = None,
 						report_flatten: bool = True):
 			"""Evaluate all loss terms, handling both single and multi-loss returns."""
@@ -3493,7 +2102,7 @@ def optimize(
 							f"artifact(s) for '{name}': {', '.join(missing)}"
 						)
 				loss_label = f"{profile_label or label}.flatten_combined"
-				_log_cuda_memory(f"{loss_label}.before")
+				optimizer_timing.log_cuda_memory(f"{loss_label}.before")
 				_t_loss = _stage_start(loss_label) if profile_label is not None else None
 				_t_loss_wall = time.perf_counter() if timing is not None else None
 				combined_parts = opt_loss_flatten.flatten_combined_loss_parts(
@@ -3502,8 +2111,8 @@ def optimize(
 					step_loss=_flatten_combined_step_loss,
 				)
 				combined_loss = combined_parts[0]
-				_debug_cuda_sync(loss_label)
-				_log_cuda_memory(f"{loss_label}.after_raw")
+				optimizer_timing.debug_cuda_sync(loss_label)
+				optimizer_timing.log_cuda_memory(f"{loss_label}.after_raw")
 				if timing is not None and _t_loss_wall is not None:
 					timing.sync()
 					timing.add("loss:flatten_combined", time.perf_counter() - _t_loss_wall)
@@ -3549,7 +2158,7 @@ def optimize(
 						f"{', '.join(missing)}"
 					)
 				loss_label = f"{profile_label or label}.{name}"
-				_log_cuda_memory(f"{loss_label}.before")
+				optimizer_timing.log_cuda_memory(f"{loss_label}.before")
 				_t_loss = _stage_start(f"{profile_label}.{name}") if profile_label is not None else None
 				_t_loss_wall = time.perf_counter() if timing is not None else None
 				if name == "atlas_line":
@@ -3567,8 +2176,8 @@ def optimize(
 						)
 				else:
 					result = t["loss"](res=res_)
-				_debug_cuda_sync(f"{profile_label}.{name}" if profile_label is not None else name)
-				_log_cuda_memory(f"{loss_label}.after_raw")
+				optimizer_timing.debug_cuda_sync(f"{profile_label}.{name}" if profile_label is not None else name)
+				optimizer_timing.log_cuda_memory(f"{loss_label}.after_raw")
 				if timing is not None and _t_loss_wall is not None:
 					timing.sync()
 					timing.add(f"loss:{name}", time.perf_counter() - _t_loss_wall)
@@ -3767,14 +2376,14 @@ def optimize(
 								status_label: str | None = None,
 								shell_no: int | None = None,
 								suppress_initial_status: bool = False) -> dict[str, object]:
-				nonlocal data, all_params, param_groups, opt, _status_step_width
+				nonlocal data, all_params, param_groups, opt
 				display_label = status_label or shell_label
 				pass_settings = pass_opt_cfg if pass_opt_cfg is not None else opt_cfg
 				pass_max_steps = max(0, int(max_steps if pass_steps is None else pass_steps))
 				if shell_no is not None:
-					_status_step_width = max(_status_step_width, len("1000000") + 2)
+					reporter.ensure_step_width(len("1000000") + 2)
 				else:
-					_status_step_width = max(_status_step_width, len(f"{display_label} {pass_max_steps}/{pass_max_steps}") + 2)
+					reporter.ensure_step_width(len(f"{display_label} {pass_max_steps}/{pass_max_steps}") + 2)
 				pass_needs = _needs_for_eff(
 					pass_eff,
 					pred_dt_flow_gate_cfg_=pred_dt_flow_gate_cfg,
@@ -3851,7 +2460,7 @@ def optimize(
 					}
 				term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
 				if not suppress_initial_status:
-					_print_status(
+					reporter.print_status(
 						step_label=(
 							"0" if shell_no is not None
 							else f"{display_label} 0/{pass_max_steps}"
@@ -3873,7 +2482,7 @@ def optimize(
 				_t_wall_start = time.perf_counter()
 				_t_steps_acc = 0
 				_opt_timing = (
-					_OptTimingWindow(interval=opt_timing_interval, sync_cuda=opt_timing_sync)
+					optimizer_timing.OptTimingWindow(interval=opt_timing_interval, sync_cuda=opt_timing_sync)
 					if opt_timing_enabled else None
 				)
 				step = 0
@@ -3992,7 +2601,7 @@ def optimize(
 						_t_wall_now = time.perf_counter()
 						_t_wall_elapsed = _t_wall_now - _t_wall_start
 						_its = _t_steps_acc / _t_wall_elapsed if _t_wall_elapsed > 0 else None
-						_print_status(
+						reporter.print_status(
 							step_label=(
 								str(step1) if shell_no is not None
 								else f"{display_label} {step1}/{pass_max_steps}"
@@ -4314,9 +2923,9 @@ def optimize(
 		# Initial prefetch for streaming mode
 		if _active_caches:
 			_t = _stage_start(f"{label}.initial_prefetch")
-			_log_cuda_memory(f"{label}.initial_prefetch.before")
+			optimizer_timing.log_cuda_memory(f"{label}.initial_prefetch.before")
 			_prefetch_model_points(stage_needs)
-			_log_cuda_memory(f"{label}.initial_prefetch.after")
+			optimizer_timing.log_cuda_memory(f"{label}.initial_prefetch.after")
 			_stage_done(f"{label}.initial_prefetch", _t)
 
 		# Station-keeping: set seed point anchor (once, on first stage that uses it)
@@ -4331,23 +2940,23 @@ def optimize(
 		_t = _stage_start(f"{label}.initial_eval")
 		with torch.no_grad():
 			_t_forward = _stage_start(f"{label}.initial_eval.model_forward")
-			_log_cuda_memory(f"{label}.initial_eval.model_forward.before")
+			optimizer_timing.log_cuda_memory(f"{label}.initial_eval.model_forward.before")
 			res0 = model(data, needs=stage_needs)
-			_debug_cuda_sync(f"{label}.initial_eval.model_forward")
-			_log_cuda_memory(f"{label}.initial_eval.model_forward.after")
+			optimizer_timing.debug_cuda_sync(f"{label}.initial_eval.model_forward")
+			optimizer_timing.log_cuda_memory(f"{label}.initial_eval.model_forward.after")
 			_stage_done(f"{label}.initial_eval.model_forward", _t_forward)
 			_t_loss_prefetch = _stage_start(f"{label}.initial_eval.loss_prefetch")
-			_log_cuda_memory(f"{label}.initial_eval.loss_prefetch.before")
+			optimizer_timing.log_cuda_memory(f"{label}.initial_eval.loss_prefetch.before")
 			_prefetch_loss_points_for_result(res0, stage_needs)
-			_debug_cuda_sync(f"{label}.initial_eval.loss_prefetch")
-			_log_cuda_memory(f"{label}.initial_eval.loss_prefetch.after")
+			optimizer_timing.debug_cuda_sync(f"{label}.initial_eval.loss_prefetch")
+			optimizer_timing.log_cuda_memory(f"{label}.initial_eval.loss_prefetch.after")
 			_stage_done(f"{label}.initial_eval.loss_prefetch", _t_loss_prefetch)
 			_t_terms = _stage_start(f"{label}.initial_eval.loss_terms")
-			_log_cuda_memory(f"{label}.initial_eval.loss_terms.before")
+			optimizer_timing.log_cuda_memory(f"{label}.initial_eval.loss_terms.before")
 			opt_loss_snap_surf.set_debug_step(0, label=f"{label}_initial")
 			loss0, term_vals0, display_loss0 = _eval_terms(
 				res0, stage_eff, profile_label=f"{label}.initial_eval.loss", atlas_debug_step=0)
-			_log_cuda_memory(f"{label}.initial_eval.loss_terms.after")
+			optimizer_timing.log_cuda_memory(f"{label}.initial_eval.loss_terms.after")
 			_stage_done(f"{label}.initial_eval.loss_terms", _t_terms)
 			if snap_surf_map_opt_stage is not None:
 				map_initial_stage = snap_surf_map_global.GlobalMapStageConfig(
@@ -4388,7 +2997,7 @@ def optimize(
 				}
 			term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
-			_print_status(
+			reporter.print_status(
 				step_label=f"{label} 0/{steps_label}",
 				loss_val=float(display_loss0) if display_loss0 is not None else loss0.item(),
 				tv=term_vals0,
@@ -4419,11 +3028,11 @@ def optimize(
 			pred_dt_flow_gate_cfg is not None
 			and bool(pred_dt_flow_gate_cfg.get("enabled", False))
 			and _need_term("pred_dt", stage_eff) > 0
-			and _flow_timing_enabled(pred_dt_flow_gate_cfg)
+			and optimizer_timing.flow_timing_enabled(pred_dt_flow_gate_cfg)
 		):
-			_flow_timing = _FlowTimingWindow(interval=100)
+			_flow_timing = optimizer_timing.FlowTimingWindow(interval=100)
 		_opt_timing = (
-			_OptTimingWindow(interval=opt_timing_interval, sync_cuda=opt_timing_sync)
+			optimizer_timing.OptTimingWindow(interval=opt_timing_interval, sync_cuda=opt_timing_sync)
 			if opt_timing_enabled else None
 		)
 		if max_steps > 0:
@@ -4440,13 +3049,13 @@ def optimize(
 				step == 0 or step + 1 == max_steps
 				or (status_interval > 0 and (step + 1) % status_interval == 0)
 			)
-			_log_cuda_memory(f"{label}.{step + 1}.iter.begin")
+			optimizer_timing.log_cuda_memory(f"{label}.{step + 1}.iter.begin")
 			# Sync: wait for chunks loaded by last prefetch
 			_t_io = time.perf_counter()
 			if _active_caches:
 				for _cache in _active_caches:
 					_cache.sync()
-			_log_cuda_memory(f"{label}.{step + 1}.cache_sync.after")
+			optimizer_timing.log_cuda_memory(f"{label}.{step + 1}.cache_sync.after")
 			if _flow_timing is not None:
 				_flow_timing.add("io_prefetch", time.perf_counter() - _t_io)
 			if _opt_timing is not None:
@@ -4459,22 +3068,22 @@ def optimize(
 				_opt_timing.add("chunk_stats", time.perf_counter() - _t_part)
 
 			_t_forward = time.perf_counter()
-			_log_cuda_memory(f"{label}.{step + 1}.model_forward.before")
+			optimizer_timing.log_cuda_memory(f"{label}.{step + 1}.model_forward.before")
 			res = model(data, needs=stage_needs)
-			_debug_cuda_sync(f"{label}.{step + 1}.model_forward")
-			_log_cuda_memory(f"{label}.{step + 1}.model_forward.after")
+			optimizer_timing.debug_cuda_sync(f"{label}.{step + 1}.model_forward")
+			optimizer_timing.log_cuda_memory(f"{label}.{step + 1}.model_forward.after")
 			if _flow_timing is not None:
-				_timing_cuda_sync()
+				optimizer_timing.synchronize_cuda()
 				_flow_timing.add("model_forward", time.perf_counter() - _t_forward)
 			if _opt_timing is not None:
 				_opt_timing.sync()
 				_opt_timing.add("model_forward", time.perf_counter() - _t_forward)
 
 			_t_io = time.perf_counter()
-			_log_cuda_memory(f"{label}.{step + 1}.loss_prefetch.before")
+			optimizer_timing.log_cuda_memory(f"{label}.{step + 1}.loss_prefetch.before")
 			_prefetch_loss_points_for_result(res, stage_needs)
-			_debug_cuda_sync(f"{label}.{step + 1}.loss_prefetch")
-			_log_cuda_memory(f"{label}.{step + 1}.loss_prefetch.after")
+			optimizer_timing.debug_cuda_sync(f"{label}.{step + 1}.loss_prefetch")
+			optimizer_timing.log_cuda_memory(f"{label}.{step + 1}.loss_prefetch.after")
 			if _flow_timing is not None:
 				_flow_timing.add("io_prefetch", time.perf_counter() - _t_io)
 			if _opt_timing is not None:
@@ -4483,14 +3092,14 @@ def optimize(
 
 			_t_loss_eval = time.perf_counter()
 			opt_loss_snap_surf.set_debug_step(step + 1, label=label)
-			_log_cuda_memory(f"{label}.{step + 1}.loss_eval.before")
+			optimizer_timing.log_cuda_memory(f"{label}.{step + 1}.loss_eval.before")
 			# Automatic stopping can request a final report on any iteration.
 			loss, term_vals, display_loss = _eval_terms(
 				res, stage_eff, timing=_opt_timing, atlas_debug_step=step + 1,
 				report_flatten=status_due or opt_cfg.steps_auto)
-			_log_cuda_memory(f"{label}.{step + 1}.loss_eval.after")
+			optimizer_timing.log_cuda_memory(f"{label}.{step + 1}.loss_eval.after")
 			if _flow_timing is not None:
-				_timing_cuda_sync()
+				optimizer_timing.synchronize_cuda()
 				_flow_timing.add("loss_eval", time.perf_counter() - _t_loss_eval)
 				_flow_parts = opt_loss_pred_dt.flow_gate_last_timing()
 				_flow_timing.add("flow_sampling", _flow_parts.get("flow_sampling", 0.0))
@@ -4507,15 +3116,15 @@ def optimize(
 
 			_t_opt = time.perf_counter()
 			_t_part = time.perf_counter()
-			_log_cuda_memory(f"{label}.{step + 1}.zero_grad.before")
+			optimizer_timing.log_cuda_memory(f"{label}.{step + 1}.zero_grad.before")
 			opt.zero_grad(set_to_none=True)
-			_log_cuda_memory(f"{label}.{step + 1}.zero_grad.after")
+			optimizer_timing.log_cuda_memory(f"{label}.{step + 1}.zero_grad.after")
 			if _opt_timing is not None:
 				_opt_timing.add("zero_grad", time.perf_counter() - _t_part)
 			_t_part = time.perf_counter()
-			_log_cuda_memory(f"{label}.{step + 1}.backward.before")
+			optimizer_timing.log_cuda_memory(f"{label}.{step + 1}.backward.before")
 			loss.backward()
-			_log_cuda_memory(f"{label}.{step + 1}.backward.after")
+			optimizer_timing.log_cuda_memory(f"{label}.{step + 1}.backward.after")
 			if _opt_timing is not None:
 				_opt_timing.sync()
 				_opt_timing.add("backward", time.perf_counter() - _t_part)
@@ -4529,9 +3138,9 @@ def optimize(
 			):
 				_flatten_update_before = [p.detach().clone() for p in _flatten_update_params]
 			_apply_optimizer_lr_warmup(opt, step1=step + 1, warmup_steps=lr_warmup_steps)
-			_log_cuda_memory(f"{label}.{step + 1}.opt_step.before")
+			optimizer_timing.log_cuda_memory(f"{label}.{step + 1}.opt_step.before")
 			opt.step()
-			_log_cuda_memory(f"{label}.{step + 1}.opt_step.after")
+			optimizer_timing.log_cuda_memory(f"{label}.{step + 1}.opt_step.after")
 			_bump_snap_global_mesh_epoch()
 			if _flatten_update_before is not None:
 				_clamp_flatten_map_ms_update(
@@ -4585,7 +3194,7 @@ def optimize(
 				opt_loss_snap_surf.update_last_stats(map_stats)
 				term_vals.update(_compact_snap_global_map_stats(map_stats))
 			if _flow_timing is not None:
-				_timing_cuda_sync()
+				optimizer_timing.synchronize_cuda()
 				_flow_timing.add("opt_step", time.perf_counter() - _t_opt)
 			if _opt_timing is not None:
 				_opt_timing.sync()
@@ -4650,7 +3259,7 @@ def optimize(
 				_t_wall_now = time.perf_counter()
 				_t_wall_elapsed = _t_wall_now - _t_wall_start
 				_its = _t_steps_acc / _t_wall_elapsed if _t_wall_elapsed > 0 else None
-				_print_status(step_label=f"{label} {step1}/{steps_label}",
+				reporter.print_status(step_label=f"{label} {step1}/{steps_label}",
 							  loss_val=float(display_loss) if display_loss is not None else loss.item(),
 							  tv=term_vals, pv=param_vals, its=_its)
 				_t_steps_acc = 0
@@ -4884,7 +3493,7 @@ def optimize(
 			if not quiet_shell_stage:
 				print(
 					f"[optimizer] stage{si} '{stage.name}' complete in "
-					f"{_fmt_duration(time.perf_counter() - _stage_wall_t0)}",
+					f"{optimizer_timing.format_duration(time.perf_counter() - _stage_wall_t0)}",
 					flush=True,
 				)
 			if _cyl_init_only and stage.name == "cyl_init":
@@ -4910,5 +3519,5 @@ def optimize(
 		print("[optimizer] corr points present but no corr weight > 0, no corr loss computed", flush=True)
 
 	_publish_snap_surf_map_state()
-	print(f"[optimizer] total optimize time: {_fmt_duration(time.perf_counter() - _optimize_t0)}", flush=True)
+	print(f"[optimizer] total optimize time: {optimizer_timing.format_duration(time.perf_counter() - _optimize_t0)}", flush=True)
 	return data

@@ -17,7 +17,7 @@ fit.py  (fitting entrypoint)
   ├─ cli_data / cli_model / cli_opt / cli_json   (argument parsing + JSON config merge)
   ├─ fit_data.py   (loads OME-Zarr → FitData3D, grid_sample_fullres)
   ├─ model.py      (Model3D: arc param + 5-level residual pyramid + modulation)
-  ├─ optimizer.py  (stage-based Adam, per-scale LRs, arc auto-bake)
+  ├─ optimizer/  (stage-based Adam, configuration, reporting and timing)
   │     ├─ opt_loss_dir.py   (quad-face normal vs per-axis dir channels)
   │     └─ opt_loss_step.py  (mesh-row spacing deviation)
   ├─ fit2tifxyz.py (export mesh slices → x/y/z tiffs + meta.json)
@@ -57,7 +57,7 @@ Integrated output channel layout (uint8):
 | Bend loss | `opt_loss_bend.py` | Bend angle constraint — penalizes when angle between adjacent edges exceeds 60° from flat |
 | Pred DT loss | `opt_loss_pred_dt.py` | Two-regime clamped L1 loss on distance-to-surface channel (outside + inner weighting) |
 | Winding density | `opt_loss_winding_density.py` | Winding spacing via grad_mag strip integration (Huber loss), plus `ext_offset` loss for external surface offset optimization |
-| Optimizer | `optimizer.py` | Stage list from JSON config; per-stage parameter groups, per-scale learning rates, automatic arc baking when arc params leave the optimised set |
+| Optimizer | `optimizer/` | Stage list from JSON config; per-stage parameter groups, per-scale learning rates, automatic arc baking when arc params leave the optimised set |
 | Export | `fit2tifxyz.py` | Writes per-winding x/y/z tiffs + `meta.json` with bbox, scale, uuid |
 | HTTP service | `fit_service.py` | REST API for VC3D integration — start/stop jobs, stream progress, download results tar.gz, mDNS discovery |
 | Tifxyz I/O | `tifxyz_io.py` | Loads tifxyz directories → `(xyz, valid, meta)` tensors with `-1,-1,-1` invalid detection |
@@ -103,7 +103,7 @@ concurrently read-modify-write the same underlying zarr chunk.
 **Arc-bake-on-save** — arc parameterisation (cx, cy, radius, angle0, angle1) is now
 automatically absorbed into the mesh pyramid at two points:
 
-1. **`optimizer.py`** — when a stage does not include any arc params in its optimised set,
+1. **`optimizer/optimizer.py`**: when a stage does not include any arc params in its optimised set,
    `bake_arc_into_mesh()` is called before that stage runs.
 2. **`fit.py` `_save_model`** — every checkpoint save calls `bake_arc_into_mesh()` if
    `arc_enabled` is still true.
@@ -121,7 +121,7 @@ self-contained mesh pyramid — no dangling arc parameters.
 | `lasagna/model.py` | `Model3D`, pyramid ops, arc bake |
 | `lasagna/fit.py` | Main fitting entrypoint |
 | `lasagna/fit_data.py` | `FitData3D`, zarr loading, sampling |
-| `lasagna/optimizer.py` | Stage-based optimisation loop |
+| `lasagna/optimizer/optimizer.py` | Stage-based optimisation loop |
 | `lasagna/opt_loss_dir.py` | Direction alignment loss |
 | `lasagna/opt_loss_step.py` | Step distance loss |
 | `lasagna/fit2tifxyz.py` | Tifxyz export |

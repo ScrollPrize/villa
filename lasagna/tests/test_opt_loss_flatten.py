@@ -23,6 +23,14 @@ from flatten_clamped_adam import FlattenClampedAdam
 import model as fit_model
 import opt_loss_flatten
 import optimizer
+from optimizer.optimizer import (
+	_apply_optimizer_lr_warmup,
+	_auto_steps_min,
+	_auto_steps_relative_improvement,
+	_capture_optimizer_target_lrs,
+	_clamp_flatten_map_ms_update,
+	_renorm_forward_flatten_map_step,
+)
 
 
 def _flat_grid(h: int, w: int, *, sx: float = 1.0, sy: float = 1.0) -> torch.Tensor:
@@ -316,8 +324,8 @@ class FlattenLossTest(unittest.TestCase):
 		self.assertEqual(optimizer.total_steps_for_stages(stages), 12)
 
 	def test_auto_steps_min_defaults_to_two_windows(self) -> None:
-		self.assertEqual(optimizer._auto_steps_min({}, window=7), 14)
-		self.assertEqual(optimizer._auto_steps_min({"auto_steps_min": 5}, window=7), 5)
+		self.assertEqual(_auto_steps_min({}, window=7), 14)
+		self.assertEqual(_auto_steps_min({"auto_steps_min": 5}, window=7), 5)
 
 	def test_lr_warmup_scales_each_optimizer_group_to_target_lr(self) -> None:
 		p0 = torch.nn.Parameter(torch.tensor([0.0]))
@@ -327,8 +335,8 @@ class FlattenLossTest(unittest.TestCase):
 			{"params": [p1], "lr": 0.05},
 		])
 
-		optimizer._capture_optimizer_target_lrs(opt)
-		optimizer._apply_optimizer_lr_warmup(opt, step1=2, warmup_steps=4)
+		_capture_optimizer_target_lrs(opt)
+		_apply_optimizer_lr_warmup(opt, step1=2, warmup_steps=4)
 
 		self.assertAlmostEqual(opt.param_groups[0]["lr"], 0.1)
 		self.assertAlmostEqual(opt.param_groups[1]["lr"], 0.025)
@@ -336,7 +344,7 @@ class FlattenLossTest(unittest.TestCase):
 	def test_auto_steps_relative_improvement_uses_best_before_and_recent_window(self) -> None:
 		history = [10.0, 1.0, 9.0, 8.0, 0.9]
 
-		rel = optimizer._auto_steps_relative_improvement(history, window=2)
+		rel = _auto_steps_relative_improvement(history, window=2)
 
 		self.assertAlmostEqual(rel, 0.1, places=6)
 
@@ -1035,7 +1043,7 @@ class FlattenLossTest(unittest.TestCase):
 			params[0].add_(1.0)
 			params[1].add_(1.0)
 
-		optimizer._clamp_flatten_map_ms_update(params, before, base_step=0.1)
+		_clamp_flatten_map_ms_update(params, before, base_step=0.1)
 
 		self.assertLessEqual(float(torch.linalg.vector_norm((params[0] - before[0]).detach(), dim=0).max()), 0.10001)
 		self.assertLessEqual(float(torch.linalg.vector_norm((params[1] - before[1]).detach(), dim=0).max()), 0.20001)
@@ -1066,7 +1074,7 @@ class FlattenLossTest(unittest.TestCase):
 			reference_before = [p.detach().clone() for p in reference_params]
 			fused_before = [p.detach().clone() for p in fused_params]
 			reference.step()
-			optimizer._clamp_flatten_map_ms_update(
+			_clamp_flatten_map_ms_update(
 				reference_params,
 				reference_before,
 				base_step=base_step,
@@ -1534,7 +1542,7 @@ class FlattenLossTest(unittest.TestCase):
 		_set_flatten_map(mdl, identity * (source_step / before_step))
 		center_before = mdl.flatten_map().mean(dim=(0, 1))
 
-		stats = optimizer._renorm_forward_flatten_map_step(mdl)
+		stats = _renorm_forward_flatten_map_step(mdl)
 		res = mdl(
 			fit._dummy_flatten_data(),
 			needs=fit_model.ModelForwardNeeds(flatten=True),

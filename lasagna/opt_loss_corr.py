@@ -23,7 +23,7 @@ _wind_reinit_counter: int = 0
 _wind_prev_any_valid: torch.Tensor | None = None     # (K,) bool — per-point "had valid anchor last step"
 
 # Phase D Gaussian splat config: σ in mesh-vertex units. 1.0 → 7×7 neighborhood (~3-vertex radius).
-# Set per stage via opt_loss_corr.set_splat_sigma(...) from optimizer.py.
+# Set per stage via opt_loss_corr.set_splat_sigma(...) from optimizer.optimize().
 _corr_splat_sigma: float = 1.0
 
 
