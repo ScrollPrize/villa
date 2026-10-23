@@ -6,6 +6,7 @@ Creates a dilated binary mask from a zarr using Euclidean Distance Transform.
 from __future__ import annotations
 
 import argparse
+import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional, Tuple
 
@@ -65,6 +66,23 @@ def _validate_distance(distance: float) -> None:
         )
 
 
+# float32 (edt.edtsq's output dtype) holds every integer only up to 2**24.
+_FLOAT32_EXACT_INT = 2**24
+
+# Above this many voxels in one chunk-plus-halo region, warn in prepare().
+_REGION_VOXEL_WARN = 2**31
+
+
+def _halo(distance: float, shape: Tuple[int, ...]) -> int:
+    """ceil(distance), clipped to the largest volume extent (a wider halo reads nothing more)."""
+    return int(min(np.ceil(distance), max(shape, default=0)))
+
+
+def _max_sq_distance(shape: Tuple[int, ...]) -> int:
+    """Upper bound on any squared voxel-centre distance inside an array of ``shape``."""
+    return sum(int(n) ** 2 for n in shape)
+
+
 def _edt_dilate_worker(
     args: Tuple,
 ) -> Tuple[Tuple[int, int, int], bool]:
@@ -86,7 +104,7 @@ def _edt_dilate_worker(
     # Read input chunk plus a halo of ceil(distance) voxels, so that foreground in a
     # neighbouring chunk dilates across the boundary (and into chunks empty in the input).
     input_arr = zarr.open(input_path, mode="r")[resolution]
-    halo = int(np.ceil(distance))
+    halo = _halo(distance, input_arr.shape)
     lo = [max(0, s - halo) for s in (z_start, y_start, x_start)]
     hi = [min(n, e + halo) for n, e in zip(input_arr.shape, (z_end, y_end, x_end))]
     chunk_data = input_arr[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]]
@@ -121,14 +139,21 @@ def _edt_dilate_worker(
     # rounded back to that integer). Thresholding the float32 square root that edt.edt
     # returns would instead let rounding decide boundary voxels, and the two backends
     # would disagree, e.g. at distance=float32(sqrt(2)).
-    if HAS_EDT:
+    # edt.edtsq returns float32, exact only for squared distances below 2**24 (distances
+    # around 4096 voxels). Regions large enough to exceed that use scipy's float64 EDT.
+    if HAS_EDT and _max_sq_distance(inverted.shape) < _FLOAT32_EXACT_INT:
         # Ensure contiguity for edt package
         if not inverted.flags["C_CONTIGUOUS"]:
             inverted = np.ascontiguousarray(inverted)
         # Use single thread since we parallelize over chunks
         distances = edt_package.edtsq(inverted, parallel=1, black_border=False)
     else:
-        distances = np.rint(np.square(scipy_edt(inverted)))
+        # float64: sqrt -> square -> rint recovers the integer exactly far beyond any
+        # allocatable region (relative error a few ulp, i.e. < 0.5 below ~2**50).
+        # In place, so no extra full-size temporaries.
+        distances = scipy_edt(inverted)
+        np.square(distances, out=distances)
+        np.rint(distances, out=distances)
 
     # Threshold to create dilated mask
     if not black_border:
@@ -236,6 +261,19 @@ class EdtDilateTask(ZarrTask):
         print(f"Dilation distance: {self.config.distance} voxels")
         print(f"Processing chunk size: {self.config.chunk_size}")
         print(f"Black border: {self.config.black_border}")
+
+        halo = _halo(self.config.distance, self._shape)
+        region = [min(n, c + 2 * halo) for n, c in zip(self._shape, self.config.chunk_size)]
+        voxels = int(np.prod(region, dtype=np.int64))
+        if voxels > _REGION_VOXEL_WARN:
+            warnings.warn(
+                f"edt-dilate: distance {self.config.distance} gives a halo of {halo} voxels; each "
+                f"worker reads a region of up to {region} = {voxels} voxels and allocates several "
+                f"arrays of that size (EDT output is 4-8 bytes/voxel). Reduce --distance, "
+                f"--chunk-size or --num-workers if memory is limited.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         # Create output zarr
         compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
