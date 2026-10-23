@@ -2,8 +2,11 @@
 
 #include "ThinPlateSpline3d.hpp"
 
+#include "vc/core/util/PlaneSurface.hpp"
+
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <queue>
 #include <set>
@@ -944,6 +947,34 @@ bool ManualAddTool::recompute(std::string* status)
     }
     touchRevision();
     return true;
+}
+
+std::optional<SegmentationEditManager::GridKey>
+ManualAddTool::pickPlaneConstraintVertex(PlaneSurface& plane, const cv::Vec2f& clickPlane, double radius) const
+{
+    const double radiusSq = radius * radius;
+    double bestDistSq = std::numeric_limits<double>::max();
+    std::optional<GridKey> best;
+    for (const auto& key : _fillVertices) {
+        if (key.row < 0 || key.row >= _previewPoints.rows || key.col < 0 || key.col >= _previewPoints.cols) {
+            continue;
+        }
+        const cv::Vec3f& vertex = _previewPoints(key.row, key.col);
+        const cv::Vec3f projected = plane.project(vertex, 1.0f, 1.0f);
+        const double dx = static_cast<double>(projected[0]) - clickPlane[0];
+        const double dy = static_cast<double>(projected[1]) - clickPlane[1];
+        const double inPlaneSq = dx * dx + dy * dy;
+        if (inPlaneSq > radiusSq) {
+            continue;
+        }
+        const double offPlane = static_cast<double>(plane.scalarp(vertex));
+        const double distSq = inPlaneSq + offPlane * offPlane;
+        if (distSq < bestDistSq) {
+            bestDistSq = distSq;
+            best = key;
+        }
+    }
+    return best;
 }
 
 bool ManualAddTool::addOrReplacePlaneConstraint(int row, int col, const cv::Vec3f& world, std::string* status)

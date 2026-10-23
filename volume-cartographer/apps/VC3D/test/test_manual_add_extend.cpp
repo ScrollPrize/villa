@@ -3,6 +3,7 @@
 #include "segmentation/SurfaceGridEdit.hpp"
 #include "segmentation/tools/ManualAddTool.hpp"
 
+#include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/core.hpp>
@@ -52,6 +53,7 @@ private slots:
     void padPointsAddsInvalidBorder();
     void extensionContinuesEachLineStraight();
     void extensionFollowsAPlaneClick();
+    void planeClickPicksTheRowOnThePlane();
     void extensionRefusesWithoutRoom();
     void clearPendingDropsTheExtension();
     void resizeSurfaceGridKeepsChannelsAligned();
@@ -155,6 +157,30 @@ void TestManualAddExtend::extensionFollowsAPlaneClick()
 
     QVERIFY(tool.removeLastPlaneConstraint(&status));
     QVERIFY(std::abs(tool.previewPoints()(4, 19)[2] - 100.0f) < 1e-3f);
+}
+
+void TestManualAddExtend::planeClickPicksTheRowOnThePlane()
+{
+    const auto points = flatSheet(9, 24, cv::Rect(0, 0, 12, 9));
+    ManualAddTool tool;
+    QVERIFY(tool.begin(points, splineConfig()));
+    std::string status;
+    QVERIFY(tool.beginExtension(ManualAddTool::ExtendSide::Right, 8, std::nullopt, &status));
+
+    // A slice through row 6 that every row of the strip projects onto at the
+    // same spot: only the distance off the plane tells the rows apart.
+    PlaneSurface plane(cv::Vec3f(0.0f, 6 * kSpacing, 0.0f), cv::Vec3f(0.0f, 1.0f, 0.0f));
+    const cv::Vec3f click(17 * kSpacing, 6 * kSpacing, 104.0f);
+    const cv::Vec3f inPlane = plane.project(click, 1.0f, 1.0f);
+    const auto picked = tool.pickPlaneConstraintVertex(plane, cv::Vec2f(inPlane[0], inPlane[1]), 30.0);
+    QVERIFY(picked.has_value());
+    QCOMPARE(picked->row, 6);
+    QCOMPARE(picked->col, 17);
+
+    // Nothing within the radius in the plane: no vertex.
+    const cv::Vec3f far(17 * kSpacing, 6 * kSpacing, 200.0f);
+    const cv::Vec3f farInPlane = plane.project(far, 1.0f, 1.0f);
+    QVERIFY(!tool.pickPlaneConstraintVertex(plane, cv::Vec2f(farInPlane[0], farInPlane[1]), 30.0));
 }
 
 void TestManualAddExtend::extensionRefusesWithoutRoom()

@@ -2585,26 +2585,9 @@ bool SegmentationModule::handleManualAddMousePress(VolumeViewerBase* viewer,
             return recomputeManualAdd();
         }
 
-        const auto& preview = _manualAddTool->previewPoints();
-        const cv::Vec2f clickPlane = viewer->sceneToSurfaceCoords(scenePos);
-        const double radiusSq = _manualAddTool->config().planeConstraintRadius *
-                                _manualAddTool->config().planeConstraintRadius;
-        double bestDistSq = radiusSq;
-        std::optional<SegmentationEditManager::GridKey> best;
-        for (const auto& key : _manualAddTool->fillVertices()) {
-            if (key.row < 0 || key.row >= preview.rows || key.col < 0 || key.col >= preview.cols) {
-                continue;
-            }
-            const cv::Vec3f projected = planeSurf->project(preview(key.row, key.col), 1.0f, 1.0f);
-            const double dx = static_cast<double>(projected[0]) - clickPlane[0];
-            const double dy = static_cast<double>(projected[1]) - clickPlane[1];
-            const double distSq = dx * dx + dy * dy;
-            if (distSq <= bestDistSq) {
-                bestDistSq = distSq;
-                best = key;
-            }
-        }
-        std::string status;
+        const auto best = _manualAddTool->pickPlaneConstraintVertex(
+            *planeSurf, viewer->sceneToSurfaceCoords(scenePos), _manualAddTool->config().planeConstraintRadius);
+        std::string status = "No Manual Add vertex within the plane constraint radius of the click.";
         if (!best || !_manualAddTool->addOrReplacePlaneConstraint(best->row, best->col, worldPos, &status)) {
             emit statusMessageRequested(QString::fromStdString(status), kStatusMedium);
             return true;

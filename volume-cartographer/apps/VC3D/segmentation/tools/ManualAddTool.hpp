@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <vector>
 
+class PlaneSurface;
+
 class ManualAddTool
 {
 public:
@@ -114,6 +116,13 @@ public:
     bool commitHover(std::string* status = nullptr);
     bool addOrReplacePlaneConstraint(int row, int col, const cv::Vec3f& world, std::string* status = nullptr);
     bool removePlaneConstraintNear(const cv::Vec3f& world, double radius, std::string* status = nullptr);
+    // Fill vertex a Shift+click at `clickPlane` (plane coordinates) in a slice
+    // view constrains: of the vertices within `radius` of the click in the
+    // plane, the one nearest in 3D. Ranking by in-plane distance alone picks
+    // vertices far in front of or behind the plane whenever several rows
+    // project onto the same spot, as they do along an extended edge.
+    [[nodiscard]] std::optional<SegmentationEditManager::GridKey>
+    pickPlaneConstraintVertex(PlaneSurface& plane, const cv::Vec2f& clickPlane, double radius) const;
     bool removeLastPlaneConstraint(std::string* status = nullptr);
     bool recompute(std::string* status = nullptr);
 
