@@ -143,6 +143,7 @@ noperspective in vec2 positionPx;
 flat in float segmentLengthPx, radiusPx, dashStartPx;
 flat in int pattern, marker;
 flat in vec4 color;
+uniform int coveragePass; // 0: MSAA coverage; 1: opaque core; 2: antialias fringe
 out vec4 fragColor;
 void main() {
     float x = positionPx.x;
@@ -152,6 +153,8 @@ void main() {
     if (marker == 12) edge = (abs(x) + abs(positionPx.y)) * 0.70710678;
     float coverage = clamp(radiusPx + 0.5 - edge, 0.0, 1.0);
     if (coverage == 0.0 || color.a == 0.0) discard;
+    if (coveragePass == 1 && coverage < 1.0) discard;
+    if (coveragePass == 2 && coverage >= 1.0) discard;
     float phase = mod(max(x, 0.0) + dashStartPx, 12.0);
     if (pattern == 1 && phase > 7.0) discard;
     if (pattern == 2 && (phase > 5.0 && (phase < 8.0 || phase > 9.5))) discard;
@@ -429,7 +432,24 @@ void Fiber3DCanvas::paintGL()
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LEQUAL);
         glDepthMask(GL_TRUE);
-        glEnable(GL_BLEND);
+        // Test the actual widget framebuffer; the requested format may not be
+        // available. Fractionally covered cap/edge pixels must not occlude the
+        // opaque center of the next segment in a densely sampled curve.
+        GLint samples = 0;
+        glGetIntegerv(GL_SAMPLES, &samples);
+        glEnable(GL_MULTISAMPLE);
+        glDisable(GL_SAMPLE_COVERAGE);
+        glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+        glDisable(GL_SAMPLE_ALPHA_TO_ONE);
+        if (samples > 1) {
+            glDisable(GL_BLEND);
+            glEnable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+            // Coverage already supplies alpha at each sample. Keep the resolved
+            // widget opaque, avoiding another alpha multiplication by Qt.
+            glEnable(GL_SAMPLE_ALPHA_TO_ONE);
+        } else {
+            glEnable(GL_BLEND);
+        }
         glBlendEquation(GL_FUNC_ADD);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glDisable(GL_CULL_FACE);
@@ -475,11 +495,23 @@ void Fiber3DCanvas::paintGL()
         program.setUniformValue("palette", 0);
         const auto range = lengthRange(*d->scene, s);
         program.setUniformValue("lengthRange", QVector2D(float(range.first), float(range.second)));
+        program.setUniformValue("coveragePass", samples > 1 ? 0 : 1);
         glDrawArraysInstanced(GL_TRIANGLES, 0, 6, GLsizei(d->vertices.size()));
+        if (samples <= 1) {
+            // Without MSAA draw opaque interiors first, then the antialias
+            // fringes without depth writes. A faint edge can never punch a hole
+            // in a later segment. This also works for subpixel stroke widths.
+            glDepthMask(GL_FALSE);
+            program.setUniformValue("coveragePass", 2);
+            glDrawArraysInstanced(GL_TRIANGLES, 0, 6, GLsizei(d->vertices.size()));
+            glDepthMask(GL_TRUE);
+        }
         program.release();
         glBindTexture(GL_TEXTURE_2D, 0);
         glBindVertexArray(0);
         glDisable(GL_DEPTH_TEST);
+        glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE);
+        glDisable(GL_SAMPLE_ALPHA_TO_ONE);
     }
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);

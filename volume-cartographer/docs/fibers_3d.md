@@ -70,6 +70,12 @@ in `Fiber3DData`, and `Fiber3DPanel` for main-workspace UI, selection and loadin
 It does not edit fibre geometry, perform inference, or reconstruct surfaces.
 The canvas and adapters can be reused in another workspace later.
 
+Antialiased segment caps use the actual framebuffer's MSAA coverage mask rather
+than writing full depth for partially covered pixels. This prevents faint cap
+edges from hiding the opaque interiors of neighbouring short segments. A
+framebuffer without MSAA uses separate core and fringe passes; fringe pixels do
+not write depth. Geometry and picking are unchanged.
+
 Build targets: `VC3D`, `test_fiber_3d_data`, `test_fiber_3d_geometry`, and
 `test_fiber_collection`. Run CTest names `fiber_3d_data`, `fiber_3d_geometry`,
 `test_fiber_collection`.
@@ -94,3 +100,13 @@ modes, with advanced options expanded and collapsed. Its height follows the
 visible controls; all controls remain reachable by scrolling with no horizontal
 overflow. The Settings button uses the same text style as the other toolbar
 buttons, without an icon or native menu indicator.
+
+The dense-curve rendering regression was reproduced with every segment styled
+solid, independently of gap metadata. The corrected renderer was checked on
+the complete 2,373-fibre AFV, individual fibres and dense synthetic curves in
+orthographic and perspective views, at line widths 2 and 4, and with 10/50/100%
+unselected opacity. A standalone check also exercised an actual framebuffer
+with `GL_SAMPLES=0`. On the complete collection, 30 orbit frames including
+synchronous framebuffer readback measured 18.38 ms median / 28.41 ms p95 before
+and 17.77 ms / 24.29 ms after; these are harness timings, not whole-application
+frame-rate measurements.
