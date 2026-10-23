@@ -133,3 +133,62 @@ def test_cubic_lanczos_border_chunks(tmp_path, dtype, case, mode):
     shape, target, chunks = case
     assert all(t % c for t, c in zip(target, chunks))
     _run(tmp_path, _data(shape, dtype, 5), target, chunks, mode)
+
+
+# Window path (power-of-two ratios, nearest/linear/area): same views as above.
+WINDOW = [((16, 24, 20), (32, 12, 40)), ((8, 32, 16), (8, 16, 64))]
+
+
+@pytest.mark.parametrize("dtype", [np.uint8, np.float32], ids=["uint8", "float32"])
+@pytest.mark.parametrize("view", list(VIEWS))
+@pytest.mark.parametrize("case", WINDOW, ids=["w0", "w1"])
+@pytest.mark.parametrize("mode", [cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_AREA],
+                         ids=["nearest", "linear", "area"])
+def test_non_contiguous_input_window_path(dtype, view, case, mode):
+    shape, target = case
+    assert all(R._is_dyadic(a, b) for a, b in zip(shape, target))
+    pre = {"transpose": lambda s: s[::-1], "step2_y": lambda s: (s[0], 2 * s[1], s[2])}
+    src = VIEWS[view](_data(pre.get(view, lambda s: s)(shape), dtype, 6))
+    assert src.shape == shape and not src.flags.c_contiguous
+    ref = R._resize_chunk_3d(np.ascontiguousarray(src), target, mode)
+    chunks = (5, 7, 9)
+    out = np.empty_like(ref)
+    for oz in range(0, target[0], chunks[0]):
+        for oy in range(0, target[1], chunks[1]):
+            for ox in range(0, target[2], chunks[2]):
+                s = (oz, oy, ox)
+                e = tuple(min(a + c, n) for a, c, n in zip(s, chunks, target))
+                out[s[0]:e[0], s[1]:e[1], s[2]:e[2]] = R._resize_chunk_window(
+                    src, s, e, src.shape, target, mode)
+    np.testing.assert_array_equal(out, ref)  # window path is bit-identical to cv2
+
+
+class _FakeZarr:
+    """Stands in for zarr.open: the input array hands out non-contiguous views."""
+
+    def __init__(self, arrays):
+        self.arrays = arrays
+
+    def __call__(self, path, mode="r"):
+        return self.arrays[path]
+
+
+@pytest.mark.parametrize("view", ["transpose", "rev_all"])
+@pytest.mark.parametrize("case", [((16, 24, 20), (32, 12, 40)),    # window path
+                                  ((13, 17, 19), (21, 9, 31))],   # tap path
+                         ids=["window", "taps"])
+@pytest.mark.parametrize("mode", [cv2.INTER_LINEAR, cv2.INTER_CUBIC],
+                         ids=["linear", "cubic"])
+def test_worker_fake_store_non_contiguous(monkeypatch, view, case, mode):
+    shape, target = case
+    src = VIEWS[view](_data(shape[::-1] if view == "transpose" else shape, np.uint16, 7))
+    assert src.shape == shape and not src.flags.c_contiguous
+    out = np.zeros(target, np.uint16)
+    monkeypatch.setattr(R.zarr, "open", _FakeZarr({"in": {"0": src}, "out": {"0": out}}))
+    chunks = (6, 5, 8)
+    for oz in range(0, target[0], chunks[0]):
+        for oy in range(0, target[1], chunks[1]):
+            for ox in range(0, target[2], chunks[2]):
+                R._resize_chunk_worker(("in", "out", "0", oz, oy, ox, chunks, shape,
+                                        target, mode, None))
+    _check(out, src, R._resize_chunk_3d(np.ascontiguousarray(src), target, mode), mode)
