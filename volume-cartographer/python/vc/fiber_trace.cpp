@@ -243,6 +243,7 @@ const std::vector<ConfigField>& configFields()
         field<double, &ft::FiberTraceConfig::smoothnessNormalWeight>("smoothness_normal_weight"),
         field<double, &ft::FiberTraceConfig::smoothnessTangentWeight>("smoothness_tangent_weight"),
         field<double, &ft::FiberTraceConfig::smoothnessFreeAngleDegrees>("smoothness_free_angle_degrees"),
+        field<double, &ft::FiberTraceConfig::sheetPlaneWeight>("sheet_plane_weight"),
         field<int, &ft::FiberTraceConfig::cumulativeSmoothnessSteps>("cumulative_smoothness_steps"),
         field<double, &ft::FiberTraceConfig::cumulativeSmoothnessTangentWeight>("cumulative_smoothness_tangent_weight"),
         field<double, &ft::FiberTraceConfig::initialFreeAngleDegrees>("initial_free_angle_degrees"),
@@ -732,6 +733,7 @@ NB_MODULE(fiber_trace, m)
         .def_rw("parallel_threads", &ft::FiberTraceConfig::parallelThreads)
         .def_rw("smoothness_weight", &ft::FiberTraceConfig::smoothnessWeight)
         .def_rw("smoothness_normal_weight", &ft::FiberTraceConfig::smoothnessNormalWeight)
+        .def_rw("sheet_plane_weight", &ft::FiberTraceConfig::sheetPlaneWeight)
         .def_rw("smoothness_tangent_weight", &ft::FiberTraceConfig::smoothnessTangentWeight)
         .def_rw("smoothness_free_angle_degrees", &ft::FiberTraceConfig::smoothnessFreeAngleDegrees)
         .def_rw("cumulative_smoothness_steps", &ft::FiberTraceConfig::cumulativeSmoothnessSteps)
