@@ -6,6 +6,7 @@
 
 _Static_assert(VCN_REVISION == 2, "volcodec_ng_lib.h documents format revision 2");
 _Static_assert(VOLCODEC_NG_LIB_ERR_MODE == (int)VCN_ERR_MODE, "status codes match the header");
+_Static_assert(VOLCODEC_NG_LIB_ERR_VERSION == (int)VCN_ERR_VERSION, "status codes match the header");
 
 unsigned volcodec_ng_lib_format_revision(void) { return VCN_REVISION; }
 

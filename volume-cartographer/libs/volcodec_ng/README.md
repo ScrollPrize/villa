@@ -6,22 +6,27 @@ decodes exactly as it was stored. It is its own format, not a volcomp
 revision: a chunk starts with the magic `VCNG`, and arrays name the codec
 `volcodec_ng`. volcomp (`libs/volcomp`) is unchanged.
 
-How it codes a chunk: each voxel is predicted from 12 voxels of the two
-previous rows and the two previous slices, with weights fitted per chunk by
-least squares and stored in the stream as integers. The prediction error is
-coded with static canonical Huffman codes, one per activity class of the
-neighborhood, into 4 interleaved bit streams so the decoder can work on 4
+How it codes a chunk (mode 6): each voxel is predicted from 40 of 82 causal
+neighbours (in the same row, the three rows above and the two previous
+slices), with weights fitted per chunk by least squares and stored in the
+stream as integers; the prediction runs in 16-bit fixed point, as
+vc-delta3d's LPC does. The prediction error is coded with static rANS tables,
+one per activity class of already decoded neighbours, in 32 interleaved
+states, and rows are rebuilt on a wavefront so the decoder works on many
 voxels at once. Constant chunks take 13 bytes; a chunk that would not shrink
 is stored raw. The decoder is integer only, so every platform and build decodes
-the same voxels, and the encoder writes the same bytes on every build.
+the same voxels, and the encoder writes the same bytes on every build. The
+decoder also reads mode 5, the earlier lossless mode of this format.
 
 Files (MIT, see `LICENSE`):
 
 - `volcodec_ng_lossless.h`: the single header (all functions `static`). It is
   generated from Chase Hendrick's volcodec-ng source and keeps only the
-  lossless chunk modes (2 raw, 3 constant, 5 lossless); its function bodies are
-  verbatim copies, and its streams are byte-identical to that source's.
-  Chunks of any other `VCNG` mode are refused with "chunk mode not supported".
+  lossless chunk modes (2 raw, 3 constant, 5 and 6 lossless; the encoder
+  writes 6); its function bodies are verbatim copies, and its streams are
+  byte-identical to that source's. Chunks of any other `VCNG` mode are
+  refused with "chunk mode not supported", and a mode 6 stream of another
+  version with "unsupported stream version".
 - `volcodec_ng_lib.{h,c}`: compiles the header once and exports a plain C
   surface (`volcodec_ng_lib_encode`, `volcodec_ng_lib_decode`,
   `volcodec_ng_lib_is_chunk`, `volcodec_ng_lib_chunk_mode`,
@@ -31,11 +36,12 @@ Files (MIT, see `LICENSE`):
 
 ## Portability
 
-No arch flags: on x86-64 the header compiles AVX2 kernels for the predictor
-with a target attribute and selects them at runtime; on x86-64 Linux the bit
-coders are also built for Haswell and picked at load time. arm64 and other
-targets use the plain C kernels. All of them give the same bytes.
-`utils::volcodec_ng_kernels()` reports `"avx2"` or `"c"`.
+No arch flags: on x86-64 the header compiles AVX2 kernels with a target
+attribute and selects them at runtime; on x86-64 Linux the bit coders are also
+built for Haswell and picked at load time. On arm64 (little-endian, GCC or
+Clang) it uses NEON kernels; other targets use the plain C kernels. All of
+them give the same bytes. `utils::volcodec_ng_kernels()` reports `"avx2"`,
+`"neon"` or `"c"`.
 
 ## Where it plugs in
 
@@ -54,4 +60,6 @@ Regenerate `volcodec_ng_lossless.h` from the codec source with its
 `lossless_header.py` and replace this copy. `volcodec_ng_lib.c` only needs
 changes if the API or the format revision changes; its `_Static_assert`s fail
 the build when the revision moves. Run `test_vcdataset_volcodec_ng`: it pins
-the encoded bytes of five synthetic chunks, so a format change fails it.
+the encoded bytes of five synthetic chunks, so a format change fails it. Mode 6
+streams carry their own version byte, so a later change to mode 6 is refused
+by older builds instead of misread.

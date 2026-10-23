@@ -20,7 +20,7 @@ inline constexpr int kVolcodecNgChunkSide = 128;
 inline constexpr std::size_t kVolcodecNgChunkBytes =
     static_cast<std::size_t>(kVolcodecNgChunkSide) * kVolcodecNgChunkSide * kVolcodecNgChunkSide;
 
-// "avx2" or "c": which kernel set this process uses (same bytes either way).
+// "avx2", "neon" or "c": which kernel set this process uses (same bytes either way).
 [[nodiscard]] const char* volcodec_ng_kernels() noexcept;
 // Stream revision the encoder writes (the decoder reads 1 up to this).
 [[nodiscard]] unsigned volcodec_ng_format_revision() noexcept;
@@ -37,8 +37,8 @@ void volcodec_ng_decode_into(std::span<const std::byte> compressed,
 // Magic sniff: buffer begins with "VCNG" and a revision this decoder reads.
 [[nodiscard]] bool is_volcodec_ng_compressed(std::span<const std::byte> data) noexcept;
 
-// Chunk mode recorded in the header: 2 raw, 3 constant, 5 lossless (-1 when
-// not a volcodec_ng chunk).
+// Chunk mode recorded in the header: 2 raw, 3 constant, 6 lossless (5, an
+// earlier lossless mode, is read too); -1 when not a volcodec_ng chunk.
 [[nodiscard]] int volcodec_ng_chunk_mode(std::span<const std::byte> data) noexcept;
 
 }  // namespace utils

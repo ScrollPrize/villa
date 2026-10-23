@@ -115,7 +115,7 @@ TEST_CASE("volcodec_ng: encoded bytes of the pinned chunks")
 {
     MESSAGE("volcodec_ng kernels: " << utils::volcodec_ng_kernels());
     CHECK(utils::volcodec_ng_format_revision() == 2u);
-    const int modes[5] = {3, 2, 5, 5, 5};  // constant, noise stored raw, then lossless
+    const int modes[5] = {3, 2, 6, 6, 6};  // constant, noise stored raw, then lossless
     uint64_t h = 1469598103934665603ull;
     for (int k = 0; k < 5; ++k) {
         const auto src = pinChunk(k);
@@ -128,7 +128,7 @@ TEST_CASE("volcodec_ng: encoded bytes of the pinned chunks")
     }
     // FNV-1a over the five streams, as written by the codec source at the
     // vendored version on every build it was checked with.
-    CHECK(h == 0x38486a56b5fc9b73ull);
+    CHECK(h == 0xcda62457224282e0ull);
 }
 
 TEST_CASE("volcodec_ng: v2 dataset round trip is exact")
@@ -154,7 +154,7 @@ TEST_CASE("volcodec_ng: v2 dataset round trip is exact")
         auto raw = readFile(d / "arr" / "1" / "0" / "0");
         auto sp = std::span<const std::byte>(reinterpret_cast<const std::byte*>(raw.data()), raw.size());
         CHECK(utils::is_volcodec_ng_compressed(sp));
-        CHECK(utils::volcodec_ng_chunk_mode(sp) == 5);
+        CHECK(utils::volcodec_ng_chunk_mode(sp) == 6);
         CHECK(raw.size() < N / 2);
     }
 
@@ -303,7 +303,7 @@ TEST_CASE("volcodec_ng: shim guards")
 
     const auto src = synth(5);
     auto enc = utils::volcodec_ng_encode(bytes(src));
-    REQUIRE(utils::volcodec_ng_chunk_mode(enc) == 5);
+    REQUIRE(utils::volcodec_ng_chunk_mode(enc) == 6);
     std::vector<std::byte> out(N), shortOut(N - 1);
     CHECK_THROWS_AS(utils::volcodec_ng_decode_into(enc, shortOut), std::runtime_error);
 
@@ -331,6 +331,16 @@ TEST_CASE("volcodec_ng: shim guards")
         CHECK(false);
     } catch (const std::runtime_error& e) {
         CHECK(std::string(e.what()).find("chunk mode not supported") != std::string::npos);
+    }
+
+    // so is a lossless stream of another version (its first payload byte)
+    auto newer = enc;
+    newer[12] = std::byte{4};
+    try {
+        utils::volcodec_ng_decode_into(newer, out);
+        CHECK(false);
+    } catch (const std::runtime_error& e) {
+        CHECK(std::string(e.what()).find("unsupported stream version") != std::string::npos);
     }
 
     // and the untouched stream still decodes exactly
