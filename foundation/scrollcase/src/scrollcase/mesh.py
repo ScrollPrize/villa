@@ -141,6 +141,48 @@ def rotate_about_2nd_principal(mesh: mm.Mesh, rotation_rad: float) -> mm.Mesh:
     return rotated_mesh
 
 
+def _cross_2d(a: np.ndarray, b: np.ndarray) -> float:
+    return a[0] * b[1] - a[1] * b[0]
+
+
+def _convex_hull_2d(points: np.ndarray) -> np.ndarray:
+    """Vertices of the convex hull of 2D points, anticlockwise (monotone chain)."""
+    points = np.unique(points, axis=0)
+    if len(points) < 3:
+        return points
+
+    def chain(ordered):
+        out = []
+        for p in ordered:
+            while len(out) >= 2 and _cross_2d(out[-1] - out[-2], p - out[-2]) <= 0:
+                out.pop()
+            out.append(p)
+        return out[:-1]
+
+    return np.array(chain(points) + chain(points[::-1]))
+
+
+def narrowest_in_y(mesh: mm.Mesh) -> tuple[float, float]:
+    """Rotation about Z (radians, anticlockwise, in (-90, 90] degrees) giving the
+    mesh's projection onto the XY plane its least extent in Y (its long side along X),
+    and the ratio of its extents in X and Y once so rotated.
+
+    The least extent is the convex hull's least width, which it has with one of its
+    edges along X.
+    """
+    hull = _convex_hull_2d(mn.getNumpyVerts(mesh)[:, :2].astype(float))
+    edges = np.roll(hull, -1, axis=0) - hull
+    best = None
+    for angle in -np.arctan2(edges[:, 1], edges[:, 0]):
+        angle = np.pi / 2 - (np.pi / 2 - angle) % np.pi
+        c, s = np.cos(angle), np.sin(angle)
+        width = np.ptp(s * hull[:, 0] + c * hull[:, 1])
+        if best is None or width < best[0]:
+            best = (width, angle, np.ptp(c * hull[:, 0] - s * hull[:, 1]))
+    width, angle, length = best
+    return float(angle), float(length / width)
+
+
 @dataclass
 class ScrollMesh:
     """Scroll mesh processing options.
