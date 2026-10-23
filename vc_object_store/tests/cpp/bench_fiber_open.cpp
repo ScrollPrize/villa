@@ -16,10 +16,10 @@ int main(int argc,char** argv) try {
  for (const auto& row:rows) db.currentObjectRevision(txn,row.uuid);
  report("page_200_with_pins");
  // Fixed source-voxel ROI in Paris 4, near the first imported fiber.
- FiberSlice slice;slice.origin={17000,15500,55000};slice.localBounds={-1024,-1024,-3,1024,1024,3};
- FiberRegionOptions region;region.maximumFibers=5000;region.coordinates=groups.front().coordinates;
- auto result=db.fiberRegion(txn,slice,region);report("region_5000");
+ RegionSlice slice;slice.origin={17000,15500,55000};slice.localBounds={-1024,-1024,-3,1024,1024,3};
+ RegionOptions region;region.maximumObjects=5000;region.coordinates=groups.front().coordinates;
+ auto result=db.geometryRegion(txn,slice,region);report("region_5000");
  std::set<std::string> ids;for(const auto& run:result.runs)ids.insert(run.objectUuid);
- std::cout<<"groups="<<groups.size()<<" count="<<groups.front().count<<" fibers="<<ids.size()<<" runs="<<result.runs.size()<<" stop="<<fiberRegionStopName(result.stop)<<" sql_steps="<<result.stats.sqlSteps<<" processing_bytes="<<result.stats.processingBytes<<" output_bytes="<<result.stats.outputBytes<<'\n';
+ std::cout<<"groups="<<groups.size()<<" count="<<groups.front().count<<" fibers="<<ids.size()<<" runs="<<result.runs.size()<<" stop="<<regionStopName(result.stop)<<" sql_steps="<<result.stats.sqlSteps<<" processing_bytes="<<result.stats.processingBytes<<" output_bytes="<<result.stats.outputBytes<<'\n';
  if(ids.size()>5000) return 1;
 } catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}

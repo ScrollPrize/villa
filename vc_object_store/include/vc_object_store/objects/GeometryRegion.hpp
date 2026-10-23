@@ -8,13 +8,17 @@
 #include <vector>
 
 namespace vc::objects {
-struct FiberSlice {
+// Oriented slab: local coordinates are projections onto u, v and normal about origin.
+struct RegionSlice {
     std::array<double, 3> origin{0, 0, 0};
     std::array<double, 3> u{1, 0, 0}, v{0, 1, 0}, normal{0, 0, 1};
     std::array<double, 6> localBounds{-1, -1, -1, 1, 1, 1};
 };
-struct FiberRegionOptions {
-    uint64_t maximumFibers = 0; // zero means unlimited; selected is then ignored
+struct RegionOptions {
+    // Object kind to intersect. Polyline kinds: "fiber" (nonempty line_points,
+    // otherwise control_points) and "track" (points).
+    std::string kind = "fiber";
+    uint64_t maximumObjects = 0; // zero means unlimited; selected is then ignored
     std::optional<std::string> selected;
     std::optional<std::string> family; // null = all; otherwise exact annotation
     double minLength = 0; // source annotation, not recomputed arclength
@@ -25,34 +29,34 @@ struct FiberRegionOptions {
     uint64_t sqlStepBudget = 10000000;
     // Reject a larger indivisible payload/manifest/decompression operation.
     uint64_t maxUnitBytes = 1024 * 1024;
-    // Applied before selected priority and maximumFibers. nullopt is unrestricted;
+    // Applied before selected priority and maximumObjects. nullopt is unrestricted;
     // an explicitly empty set matches nothing. UUIDs are canonicalized by the store.
     std::optional<std::vector<std::string>> uuids;
     // Exact coordinate declaration, using the same JSON filter as ObjectSelection.
     std::optional<std::string> coordinates;
 };
-enum class FiberRegionStop { Exhausted, FiberLimit, OutputBudget, ProcessingBudget, CandidateBudget, SqlBudget, Cancelled };
-struct FiberRegionStats {
+enum class RegionStop { Exhausted, ObjectLimit, OutputBudget, ProcessingBudget, CandidateBudget, SqlBudget, Cancelled };
+struct RegionStats {
     uint64_t outputBytes = 0, processingBytes = 0;
     uint64_t payloadBytes = 0, verifiedBytes = 0, metadataBytes = 0;
     uint64_t reconstructedBytes = 0, cacheBytes = 0;
     uint64_t candidateWork = 0, candidateVisits = 0, segmentTests = 0, sqlSteps = 0;
 };
-struct FiberVisibleRun {
+struct VisibleRun {
     std::string objectUuid, revisionUuid, arrayName, family;
     int64_t firstSegment = 0;
     std::vector<std::array<double, 3>> points;
 };
-struct FiberRegionResult {
-    std::vector<FiberVisibleRun> runs;
-    FiberRegionStats stats;
-    uint64_t intersectingFibers = 0;
-    FiberRegionStop stop = FiberRegionStop::Exhausted;
-    bool complete() const { return stop == FiberRegionStop::Exhausted; }
+struct RegionResult {
+    std::vector<VisibleRun> runs;
+    RegionStats stats;
+    uint64_t intersectingObjects = 0;
+    RegionStop stop = RegionStop::Exhausted;
+    bool complete() const { return stop == RegionStop::Exhausted; }
 };
-const char* fiberRegionStopName(FiberRegionStop);
+const char* regionStopName(RegionStop);
 // Optional cancellation predicate runs on the transaction thread, must not
 // re-enter the store, and may inspect counters (also during SQL). No callback
 // exception crosses SQLite's C boundary. An atomic flag works equally well.
-using FiberRegionCancel = std::function<bool(const FiberRegionStats&)>;
+using RegionCancel = std::function<bool(const RegionStats&)>;
 }

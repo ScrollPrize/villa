@@ -6,7 +6,7 @@ std::vector<uint8_t> readSharedPayload(sqlite3* db, const std::string& name, con
     if (readRequest) {
         Statement size(db, "SELECT length(data) FROM geometry_chunks WHERE hash=?", hash);
         if (!size.row()) throw std::runtime_error("geometry: missing shared payload");
-        requestBytes(size.i64(0), &FiberRegionStats::payloadBytes);
+        requestBytes(size.i64(0), &RegionStats::payloadBytes);
     }
     Statement row(db, "SELECT data FROM geometry_chunks WHERE hash=?", hash);
     if (!row.row()) throw std::runtime_error("geometry: missing shared payload");

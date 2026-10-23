@@ -805,7 +805,7 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
          selectedUuid=pins_.contains(selected) ? pins_.at(selected).object.objectUuid : std::string{}, s,min,cancel,maximum,family]() {
             RegionResult result; result.coverage=s.box;
             if (family == vc::fibers::FamilyFilter::None) return result;
-            struct Visible { vc::objects::FiberVisibleRun run; double factor; };
+            struct Visible { vc::objects::VisibleRun run; double factor; };
             std::vector<Visible> visible;
             connection->read(attachment,[&](const auto& db,const auto& txn,const auto& cancelled) {
                 for (const auto& group : groups) {
@@ -813,16 +813,16 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
                     const auto scale = groupScale(group, volume);
                     if (!scale) continue;
                     const auto factor = *scale;
-                    vc::objects::FiberSlice slice; slice.origin=s.origin; slice.u=s.u; slice.v=s.v; slice.normal=s.n;
+                    vc::objects::RegionSlice slice; slice.origin=s.origin; slice.u=s.u; slice.v=s.v; slice.normal=s.n;
                     for (auto& coordinate : slice.origin) coordinate /= factor;
                     slice.localBounds={s.local.lower[0]/factor,s.local.lower[1]/factor,s.local.lower[2]/factor,s.local.upper[0]/factor,s.local.upper[1]/factor,s.local.upper[2]/factor};
-                    vc::objects::FiberRegionOptions options;
-                    options.maximumFibers=maximum; options.minLength=min/factor; options.coordinates=group.coordinates;
+                    vc::objects::RegionOptions options;
+                    options.kind="fiber"; options.maximumObjects=maximum; options.minLength=min/factor; options.coordinates=group.coordinates;
                     if (!selectedUuid.empty()) options.selected=selectedUuid;
                     if (result.page.decodedBytes >= options.outputByteBudget) { result.page.complete=false; break; }
                     options.outputByteBudget-=result.page.decodedBytes;
                     if (family != vc::fibers::FamilyFilter::All) options.family=family==vc::fibers::FamilyFilter::Horizontal ? "H" : "V";
-                    auto region=db.fiberRegion(txn,slice,options,[&](const auto&) { return cancel->load() || cancelled.load(); });
+                    auto region=db.geometryRegion(txn,slice,options,[&](const auto&) { return cancel->load() || cancelled.load(); });
                     result.page.complete = result.page.complete && region.complete();
                     result.page.decodedBytes += region.stats.outputBytes;
                     for (auto& run : region.runs) visible.push_back({std::move(run),factor});

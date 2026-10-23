@@ -3,7 +3,7 @@
 // SQLite object database with immutable geometry and relationship metadata.
 
 #include "vc_object_store/objects/Geometry.hpp"
-#include "vc_object_store/objects/FiberRegion.hpp"
+#include "vc_object_store/objects/GeometryRegion.hpp"
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -546,9 +546,10 @@ public:
     // An empty fields vector requests identities only.
     std::vector<ObjectRecord> selectObjects(const Txn&, const ObjectSelection& = {},
         const std::optional<std::vector<std::string>>& fields = std::nullopt) const;
-    // One read snapshot; owned partial runs, no continuation or coverage cache.
-    FiberRegionResult fiberRegion(const ReadTxn&, const FiberSlice&,
-        const FiberRegionOptions& = {}, const FiberRegionCancel& cancel = {}) const;
+    // Exact slab intersection of one object kind's geometry. One read snapshot;
+    // owned partial runs, no continuation or coverage cache.
+    RegionResult geometryRegion(const ReadTxn&, const RegionSlice&,
+        const RegionOptions& = {}, const RegionCancel& cancel = {}) const;
 
     // Requires selection.bbox. Same filters as selectObjects, but pagination
     // counts regions, ordered by object UUID, array name and start indices.

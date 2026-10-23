@@ -55,7 +55,7 @@ public:
 inline constexpr size_t geometryChunkSize = 1024 * 1024;
 inline std::string geometryHash(std::span<const uint8_t> bytes)
 {
-    requestBytes(bytes.size(), &FiberRegionStats::verifiedBytes);
+    requestBytes(bytes.size(), &RegionStats::verifiedBytes);
     unsigned char digest[EVP_MAX_MD_SIZE];
     unsigned int size = 0;
     if (EVP_Digest(bytes.data(), bytes.size(), digest, &size, EVP_sha256(), nullptr) != 1)

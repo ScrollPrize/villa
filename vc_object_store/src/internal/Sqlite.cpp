@@ -196,7 +196,7 @@ double Statement::f64(int c) const
 
 std::string Statement::text(int c) const
 {
-    if (readRequest) requestBytes(sqlite3_column_bytes(value, c), &FiberRegionStats::metadataBytes);
+    if (readRequest) requestBytes(sqlite3_column_bytes(value, c), &RegionStats::metadataBytes);
     const auto* p = sqlite3_column_text(value, c);
     return p ? std::string(reinterpret_cast<const char*>(p), size_t(sqlite3_column_bytes(value, c))) : "";
 }

@@ -75,7 +75,7 @@ invalidates old requests. `takeEvents()` polls local and external commits for
 all object kinds; call it from the application's event loop. `finalize()` waits
 for accepted writes; edits are already committed by `act()`.
 
-Fiber consumers use the same `selectObjects`, `fiberRegion`, geometry, and
+Fiber consumers use the same `selectObjects`, `geometryRegion`, geometry, and
 relationship APIs. Update any catalog summaries used by the application in the
 same checked transaction as the geometry edit, and explicitly decide how affected
 relationships apply. There is no separate fiber repository or collection layer.
@@ -312,45 +312,48 @@ Structural changes publish chunk snapshots and restart the delta chain; subseque
 coordinate edits continue using deltas. Structural operations can read and assemble
 the full geometry. Full `put_geometry` replacements have a separate contract.
 
-## Bounded oriented fiber browsing
+## Bounded oriented region browsing
 
-`fiber_region(FiberSlice, FiberRegionOptions, cancel=None)` combines conservative
+`geometry_region(RegionSlice, RegionOptions, cancel=None)` combines conservative
 spatial bounds with exact double-precision segment/slab intersections. It returns
 original unclipped XYZ and zero-based segment indices in contiguous runs; the
 consumer handles rendering/trimming. `geometry/SegmentClip.hpp` shares the clipper.
 
 ```python
-from vc_object_store import FiberSlice, FiberRegionOptions
+from vc_object_store import RegionSlice, RegionOptions
 
-view = FiberSlice()
+view = RegionSlice()
 view.origin = [100, 200, 300]
 view.u, view.v, view.normal = [1, 0, 0], [0, 1, 0], [0, 0, 1]
 view.local_bounds = [-50, -50, -.5, 50, 50, .5]
-options = FiberRegionOptions()
-options.maximum_fibers = 100
-result = store.fiber_region(view, options)
+options = RegionOptions()
+options.kind = "fiber"
+options.maximum_objects = 100
+result = store.geometry_region(view, options)
 ```
 
 Axes must be finite/orthonormal (tolerance `1e-12`); bounds are finite and ordered,
 with zero thickness allowed. Segments can intersect with both endpoints outside.
-Nonempty `line_points` take precedence over controls; `min_points` defaults to 2.
+`options.kind` selects one polyline kind: `fiber` (nonempty `line_points` take
+precedence over controls) or `track` (`points`, widened exactly to float64).
+Other kinds are rejected. `min_points` defaults to 2.
 Family/minimum length filter import annotations, not recomputed geometry.
-Retired/external-only fibers are excluded. UUID ordering is stable; `selected`
-is attempted first when limited. Only intersecting fibers consume the limit,
-and each chosen fiber finishes unless a budget/cancellation stops it.
-`maximum_fibers=0` means unlimited and ignores `selected`. Runs merge across
+Retired/external-only objects are excluded. UUID ordering is stable; `selected`
+is attempted first when limited. Only intersecting objects consume the limit,
+and each chosen object finishes unless a budget/cancellation stops it.
+`maximum_objects=0` means unlimited and ignores `selected`. Runs merge across
 storage boundaries without duplicate segments. Results own their data and carry
 revision identity from one snapshot; each Python call starts a fresh snapshot.
-`options.uuids` optionally restricts the query before selected-fiber priority and
+`options.uuids` optionally restricts the query before selected-object priority and
 limits. `None` is unrestricted; an explicit empty list matches nothing. Filter
 setup participates in cancellation and work/processing budgets.
 
-C++ `ObjectSelection::coordinates` and `FiberRegionOptions::coordinates` accept
+C++ `ObjectSelection::coordinates` and `RegionOptions::coordinates` accept
 an exact JSON coordinate declaration (missing fields compare as null).
 `objectCoordinateGroups(txn, "fiber", cancel)` aggregates current metadata without
 materializing object records or decoding geometry. This lets a viewer query each
 coordinate frame directly, without constructing an inclusion list for every
-fiber in the store. Region queries drive the persisted R-tree and order only
+object in the store. Region queries drive the persisted R-tree and order only
 spatial candidates by UUID. Geometry and intersection predicates are unchanged.
 
 | Budget | Default | Charged work |
@@ -364,11 +367,11 @@ spatial candidates by UUID. Geometry and intersection predicates are unchanged.
 Zero budgets allow no work. Work is reserved before processing; whole cached
 chunks are charged on every touch and verification/reconstruction separately.
 Counters measure work, not unique bytes, disk traffic or memory. `stop` is
-`exhausted`, `fiber_limit`, `output_budget`, `processing_budget`, `candidate_budget`,
+`exhausted`, `object_limit`, `output_budget`, `processing_budget`, `candidate_budget`,
 `sql_budget` or `cancelled`; only `exhausted` means `complete`. Partial runs remain
 valid but imply no spatial coverage. Invalid input/corruption raises.
 
-`FiberRegionCancellation.cancel()` may run from another Python thread; queries
+`RegionCancellation.cancel()` may run from another Python thread; queries
 release the GIL. C++ callbacks inspect stats, must not re-enter the store, and
 propagate exceptions. Checks occur at SQL steps, candidate visits, admitted
 units and segment tests. Hash/JSON/decompression units are indivisible; neither

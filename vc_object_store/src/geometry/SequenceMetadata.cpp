@@ -12,7 +12,7 @@ Json load(sqlite3* db,const std::string& hash) {
     GeometryPhase phase("metadataSnapshotRead");
     if(cache) {
         const auto found=cache->find({db,hash});
-        if(found!=cache->end()) {requestBytes(found->second.bytes,&FiberRegionStats::cacheBytes);return found->second.value;}
+        if(found!=cache->end()) {requestBytes(found->second.bytes,&RegionStats::cacheBytes);return found->second.value;}
     }
     const auto bytes=readSharedPayload(db,"@metadata",hash);
     auto value=Json::parse(bytes);const auto charge=bytes.size()*16+256;
