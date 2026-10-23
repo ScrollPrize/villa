@@ -163,6 +163,8 @@ set(srcs
     segmentation/tools/SurfaceMaskBrushTool.hpp
     segmentation/tools/ManualAddTool.cpp
     segmentation/tools/ManualAddTool.hpp
+    segmentation/tools/SheetNormalField.cpp
+    segmentation/tools/SheetNormalField.hpp
     segmentation/tools/ThinPlateSpline3d.cpp
     segmentation/tools/ThinPlateSpline3d.hpp
     segmentation/tools/SegmentationLineTool.cpp
@@ -364,6 +366,8 @@ target_include_directories(VC3D
         ${CMAKE_SOURCE_DIR}/libs/edt
         ${CMAKE_SOURCE_DIR}/libs/cc3d
         ${CMAKE_SOURCE_DIR}/libs/djikstra3d
+        # Header-only CT sheet-normal estimator shared with vc_reader.
+        ${CMAKE_SOURCE_DIR}/../vc_reader/src/cpp
 )
 
 # Avahi for mDNS service discovery (Linux only)

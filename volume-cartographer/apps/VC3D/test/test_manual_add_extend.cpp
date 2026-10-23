@@ -11,6 +11,7 @@
 
 #include <cmath>
 #include <filesystem>
+#include <optional>
 
 namespace {
 
@@ -63,6 +64,8 @@ private slots:
     void dragPicksTheNearestEdgeStretch();
     void extensionKeepsItsSpan();
     void undoHistoryFollowsGridPadding();
+    void sheetWalkFollowsACurvedSheet();
+    void guidedClicksStayLocal();
 };
 
 void TestManualAddExtend::paddingCoversOnlyTheMissingRoom()
@@ -375,6 +378,94 @@ void TestManualAddExtend::undoHistoryFollowsGridPadding()
     QCOMPARE((*padded)(1, 3), cv::Vec3f(1.0f, 2.0f, 3.0f));
     QCOMPARE((*padded)(0, 0), kInvalid);
     QCOMPARE((*padded)(4, 5), kInvalid);
+}
+
+namespace {
+// A sheet curled around the z axis: radius 40 in x and y, flat in z.
+constexpr float kRadius = 40.0f;
+cv::Mat_<cv::Vec3f> curvedSheet(int rows, int cols, int validCols)
+{
+    cv::Mat_<cv::Vec3f> points(rows, cols, kInvalid);
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < validCols; ++col) {
+            const float angle = col * kSpacing / kRadius;
+            points(row, col) = cv::Vec3f(kRadius * std::cos(angle), kRadius * std::sin(angle), row * kSpacing);
+        }
+    }
+    return points;
+}
+std::optional<cv::Vec3f> cylinderNormal(const cv::Vec3f& p)
+{
+    const float r = std::hypot(p[0], p[1]);
+    if (r < 1e-3f) {
+        return std::nullopt;
+    }
+    return cv::Vec3f(p[0] / r, p[1] / r, 0.0f);
+}
+} // namespace
+
+void TestManualAddExtend::sheetWalkFollowsACurvedSheet()
+{
+    const int cells = 12;
+    const auto points = curvedSheet(6, 30, 10);
+    ManualAddTool tool;
+    QVERIFY(tool.begin(points, splineConfig()));
+    std::string status;
+    QVERIFY2(tool.beginExtension(ManualAddTool::ExtendSide::Right, cells, std::nullopt, &status), status.c_str());
+
+    // The straight continuation leaves the sheet...
+    float straightWorst = 0.0f;
+    for (const auto& key : tool.fillVertices()) {
+        const auto& p = tool.previewPoints()(key.row, key.col);
+        straightWorst = std::max(straightWorst, std::abs(std::hypot(p[0], p[1]) - kRadius));
+    }
+    QVERIFY(straightWorst > 3.0f);
+
+    // ...and the walk along the sheet normals stays on it.
+    const auto walk = tool.sheetWalk();
+    QVERIFY(walk);
+    std::vector<cv::Vec3f> guess(walk->origins.size() * static_cast<std::size_t>(walk->cells));
+    for (std::size_t line = 0; line < walk->origins.size(); ++line) {
+        ManualAddTool::walkSheetLine(*walk, line, cylinderNormal, guess);
+    }
+    QVERIFY(!tool.applySheetWalk(walk->extensionId + 1, guess));
+    QVERIFY2(tool.applySheetWalk(walk->extensionId, guess, &status), status.c_str());
+    QVERIFY(tool.extensionFollowsSheet());
+    for (const auto& key : tool.fillVertices()) {
+        const auto& p = tool.previewPoints()(key.row, key.col);
+        QVERIFY2(std::abs(std::hypot(p[0], p[1]) - kRadius) < 1.0f,
+                 qPrintable(QString("radius %1").arg(std::hypot(p[0], p[1]))));
+        QVERIFY(std::abs(p[2] - key.row * kSpacing) < 1e-3f);
+    }
+}
+
+void TestManualAddExtend::guidedClicksStayLocal()
+{
+    const auto points = flatSheet(20, 40, cv::Rect(0, 0, 10, 20));
+    auto config = splineConfig();
+    config.guidedClickReach = 2.0;
+    config.planeConstraintReplacementRadius = 0.0;
+    ManualAddTool tool;
+    QVERIFY(tool.begin(points, config));
+    std::string status;
+    QVERIFY2(tool.beginExtension(ManualAddTool::ExtendSide::Right, 20, std::nullopt, &status), status.c_str());
+    const auto straight = tool.previewPoints().clone();
+
+    // Unguided: a click bends the strip far from it too.
+    QVERIFY2(tool.addOrReplacePlaneConstraint(2, 25, straight(2, 25) + cv::Vec3f(0.0f, 0.0f, 10.0f), &status),
+             status.c_str());
+    QVERIFY(distance(tool.previewPoints()(17, 25), straight(17, 25)) > 0.5f);
+
+    // Guided: the same click only corrects its neighborhood.
+    const auto walk = tool.sheetWalk();
+    QVERIFY(walk);
+    std::vector<cv::Vec3f> guess;
+    for (const auto& key : tool.fillVertices()) {
+        guess.push_back(straight(key.row, key.col));
+    }
+    QVERIFY2(tool.applySheetWalk(walk->extensionId, guess, &status), status.c_str());
+    QVERIFY(distance(tool.previewPoints()(2, 25), straight(2, 25) + cv::Vec3f(0.0f, 0.0f, 10.0f)) < 0.5f);
+    QVERIFY(distance(tool.previewPoints()(17, 25), straight(17, 25)) < 1e-3f);
 }
 
 QTEST_APPLESS_MAIN(TestManualAddExtend)

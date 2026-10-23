@@ -816,6 +816,8 @@ QJsonObject AgentBridgeServer::handleManualAddExtend(const QJsonValue& params)
     result["active"] = mod->manualAddMode();
     result["side"] = sideStr;
     result["queued"] = mod->manualAddContinuationQueued();
+    // The sheet walk runs in the background; state.get reports when it ends.
+    result["followingSheet"] = mod->manualAddSheetWalkRunning();
     return result;
 }
 

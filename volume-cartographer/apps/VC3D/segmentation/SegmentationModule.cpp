@@ -32,15 +32,16 @@
 #include <QPointer>
 #include <QString>
 #include <QTimer>
-#include <QtConcurrent/QtConcurrent>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <optional>
 #include <tuple>
 #include <limits>
 #include <exception>
+#include <thread>
 #include <set>
 #include <utility>
 #include <vector>
@@ -2359,6 +2360,76 @@ bool SegmentationModule::extendManualAdd(ManualAddTool::ExtendSide side,
     emitPendingChanges();
     refreshOverlay();
     emit statusMessageRequested(QString::fromStdString(status), kStatusMedium);
+    if (config.followSheet) {
+        followSheetForManualAdd();
+    }
+    return true;
+}
+
+bool SegmentationModule::followSheetForManualAdd()
+{
+    if (!_manualAddMode || !_manualAddTool || _sheetWalkRunning) {
+        return false;
+    }
+    const auto walk = _manualAddTool->sheetWalk();
+    std::shared_ptr<Volume> volume = _state ? _state->currentVolume() : nullptr;
+    if (!walk || !volume) {
+        return false;
+    }
+    if (!_sheetNormals || _sheetNormalsVolume != volume) {
+        _sheetNormals = std::make_shared<SheetNormalField>(volume);
+        _sheetNormalsVolume = volume;
+    }
+    _sheetWalkRunning = true;
+    emit statusMessageRequested(tr("Following the sheet in the CT..."), kStatusShort);
+    auto normals = _sheetNormals;
+    const ManualAddTool::SheetWalk job = *walk;
+    QtConcurrent::run([job, normals]() {
+        std::vector<cv::Vec3f> guess(job.origins.size() * static_cast<std::size_t>(job.cells));
+        const ManualAddTool::SheetNormalFn normal = [normals](const cv::Vec3f& world) {
+            return normals->normalAt(world);
+        };
+        // Lines are independent; spread them over the cores.
+        std::atomic<std::size_t> next{0};
+        const unsigned workers = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+        std::vector<std::thread> threads;
+        for (unsigned t = 0; t < workers; ++t) {
+            threads.emplace_back([&]() {
+                for (std::size_t line = next++; line < job.origins.size(); line = next++) {
+                    ManualAddTool::walkSheetLine(job, line, normal, guess);
+                }
+            });
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+        return guess;
+    }).then(this, [this, id = job.extensionId](std::vector<cv::Vec3f> guess) {
+        _sheetWalkRunning = false;
+        if (!_manualAddMode || !_manualAddTool || !_editManager) {
+            return;
+        }
+        std::string status;
+        if (!_manualAddTool->applySheetWalk(id, std::move(guess), &status)) {
+            emit statusMessageRequested(QString::fromStdString(status), kStatusShort);
+            return;
+        }
+        std::optional<cv::Rect> bounds;
+        if (!_editManager->setPreviewPointsOnly(_manualAddTool->previewPoints(),
+                                                _manualAddTool->changedVertices(),
+                                                true,
+                                                &bounds)) {
+            emit statusMessageRequested(tr("Manual Add preview update failed."), kStatusMedium);
+            return;
+        }
+        if (_state && _editManager->previewSurface()) {
+            _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+        }
+        emitPendingChanges();
+        refreshOverlay();
+        emit statusMessageRequested(tr("The extension now follows the sheet. Shift+click where it still misses."),
+                                    kStatusMedium);
+    });
     return true;
 }
 

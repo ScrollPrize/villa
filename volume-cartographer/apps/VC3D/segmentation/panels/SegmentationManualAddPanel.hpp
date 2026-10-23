@@ -55,6 +55,7 @@ private:
     QComboBox* _comboInterpolationMode{nullptr};
     QCheckBox* _chkIncludeTouchedValidBorder{nullptr};
     QCheckBox* _chkAllowBoundarySmoothing{nullptr};
+    QCheckBox* _chkFollowSheet{nullptr};
     QPushButton* _btnClearPending{nullptr};
     QPushButton* _btnRecompute{nullptr};
     QPushButton* _btnApplyExit{nullptr};

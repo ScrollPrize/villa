@@ -27,6 +27,7 @@
 #include "../volume_viewers/VolumeViewerBase.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "tools/ManualAddTool.hpp"
+#include "tools/SheetNormalField.hpp"
 #include "growth/SegmentationGrowth.hpp"
 #include "SegmentationPushPullConfig.hpp"
 #include "SegmentationUndoHistory.hpp"
@@ -208,6 +209,13 @@ public:
     // the save that Apply starts has finished (the direction keys and panel
     // buttons use this, so pressing the same direction again walks on).
     bool extendOrContinueManualAdd(ManualAddTool::ExtendSide side, int cells, QString* errorMessage = nullptr);
+    // Re-walk the pending extension along the CT sheet (see
+    // ManualAddTool::sheetWalk) in the background; the preview updates when
+    // it finishes. Extensions start one on their own when the panel's
+    // "Follow the sheet" is on. Returns false when there is nothing to walk
+    // or no volume.
+    bool followSheetForManualAdd();
+    [[nodiscard]] bool manualAddSheetWalkRunning() const { return _sheetWalkRunning; }
     // True while a repeated extension waits for the save of the one before it.
     [[nodiscard]] bool manualAddContinuationQueued() const { return _manualAddContinuation.has_value(); }
     // Pin the pending manual-add geometry to a world point, as a Shift+click in
@@ -521,6 +529,9 @@ private:
         std::optional<ManualAddTool::EdgeSpan> span;
     };
     std::optional<ManualAddContinuation> _manualAddContinuation;
+    std::shared_ptr<SheetNormalField> _sheetNormals;
+    std::shared_ptr<Volume> _sheetNormalsVolume;
+    bool _sheetWalkRunning{false};
     // Shift+drag in the segmentation view that picks an edge stretch.
     struct ManualAddSpanDrag
     {

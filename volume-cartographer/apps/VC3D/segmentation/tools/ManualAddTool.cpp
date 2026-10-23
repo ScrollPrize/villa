@@ -214,6 +214,7 @@ ManualAddTool::Config ManualAddTool::sanitize(Config config)
     config.boundaryBand = std::clamp(config.boundaryBand, 1, 20);
     config.regularization = std::clamp(config.regularization, 0.0, 1.0);
     config.sampleCap = std::clamp(config.sampleCap, 16, 10000);
+    config.guidedClickReach = std::clamp(config.guidedClickReach, 0.0, 1000.0);
     config.previewThrottleMs = std::clamp(config.previewThrottleMs, 0, 500);
     config.tintOpacity = std::clamp(config.tintOpacity, 0.0f, 1.0f);
     config.planeConstraintRadius = std::clamp(config.planeConstraintRadius, 0.5, 100.0);
@@ -1207,6 +1208,7 @@ bool ManualAddTool::beginExtension(ExtendSide side,
     extension.side = side;
     extension.cells = cells;
     extension.span = span;
+    extension.id = _nextExtensionId++;
     _fillVertices.clear();
     _changedVertices.clear();
     _borderSampleVertices.clear();
@@ -1214,6 +1216,8 @@ bool ManualAddTool::beginExtension(ExtendSide side,
         const auto& line = lines[i];
         const cv::Point2i edgeCell = lineCell(axes, line.line, line.edge);
         const cv::Vec3f origin = _entrySnapshotPoints(edgeCell.y, edgeCell.x);
+        extension.origins.push_back(origin);
+        extension.steps.push_back(smoothed[i]);
         for (int k = 1; k <= cells; ++k) {
             const cv::Point2i cell = lineCell(axes, line.line, line.edge + axes.step * k);
             _fillVertices.push_back(GridKey{cell.y, cell.x});
@@ -1249,6 +1253,78 @@ bool ManualAddTool::beginExtension(ExtendSide side,
                   " vertices. Shift+click the sheet in a slice view to pull the new strip onto it.";
     }
     return true;
+}
+
+std::optional<ManualAddTool::SheetWalk> ManualAddTool::sheetWalk() const
+{
+    if (!_extension || _extension->origins.empty() ||
+        _extension->guess.size() != _extension->origins.size() * static_cast<std::size_t>(_extension->cells)) {
+        return std::nullopt;
+    }
+    return SheetWalk{_extension->id, _extension->cells, _extension->origins, _extension->steps};
+}
+
+void ManualAddTool::walkSheetLine(const SheetWalk& walk,
+                                  std::size_t line,
+                                  const SheetNormalFn& normal,
+                                  std::vector<cv::Vec3f>& guess)
+{
+    if (line >= walk.origins.size() || line >= walk.steps.size() ||
+        guess.size() < (line + 1) * static_cast<std::size_t>(walk.cells)) {
+        return;
+    }
+    cv::Vec3f point = walk.origins[line];
+    cv::Vec3f step = walk.steps[line];
+    const float length = static_cast<float>(cv::norm(step));
+    for (int k = 0; k < walk.cells; ++k) {
+        if (normal && length > 0.0f) {
+            if (const auto n = normal(point + step * 0.5f)) {
+                const float nLength = static_cast<float>(cv::norm(*n));
+                if (nLength > 0.5f) {
+                    const cv::Vec3f unit = *n / nLength;
+                    const cv::Vec3f along = step - unit * step.dot(unit);
+                    const float alongLength = static_cast<float>(cv::norm(along));
+                    if (alongLength > 1e-3f * length) {
+                        step = along * (length / alongLength);
+                    }
+                }
+            }
+        }
+        point += step;
+        guess[line * static_cast<std::size_t>(walk.cells) + static_cast<std::size_t>(k)] = point;
+    }
+}
+
+bool ManualAddTool::applySheetWalk(std::uint64_t extensionId, std::vector<cv::Vec3f> guess, std::string* status)
+{
+    if (!_extension || _extension->id != extensionId) {
+        if (status) {
+            *status = "The extension changed while following the sheet.";
+        }
+        return false;
+    }
+    return setExtensionGuess(std::move(guess), status);
+}
+
+bool ManualAddTool::setExtensionGuess(std::vector<cv::Vec3f> guess, std::string* status)
+{
+    if (!_extension || guess.size() != _fillVertices.size()) {
+        if (status) {
+            *status = "No edge extension is pending.";
+        }
+        return false;
+    }
+    for (const auto& point : guess) {
+        if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) {
+            if (status) {
+                *status = "The extension guess has a non-finite point.";
+            }
+            return false;
+        }
+    }
+    _extension->guess = std::move(guess);
+    _extension->guided = true;
+    return recomputeExtension(status);
 }
 
 bool ManualAddTool::recomputeExtension(std::string* status)
@@ -1305,6 +1381,9 @@ bool ManualAddTool::recomputeExtension(std::string* status)
             }
             return false;
         }
+        // A guided guess is already close to the sheet away from the clicks,
+        // so there each click only corrects its own neighborhood.
+        const double reach = _extension->guided ? _config.guidedClickReach : 0.0;
         for (std::size_t i = 0; i < _fillVertices.size(); ++i) {
             const auto& key = _fillVertices[i];
             auto delta = tps.evaluate(cv::Point2d(key.col, key.row));
@@ -1314,7 +1393,16 @@ bool ManualAddTool::recomputeExtension(std::string* status)
                 }
                 return false;
             }
-            _previewPoints(key.row, key.col) = _extension->guess[i] + *delta;
+            if (reach > 0.0) {
+                double nearest = std::numeric_limits<double>::max();
+                for (const auto& constraint : _userPlaneConstraints) {
+                    const double dr = constraint.row - key.row;
+                    const double dc = constraint.col - key.col;
+                    nearest = std::min(nearest, dr * dr + dc * dc);
+                }
+                *delta *= std::exp(-0.5 * nearest / (reach * reach));
+            }
+            _previewPoints(key.row, key.col) = _extension->guess[i] + cv::Vec3f(*delta);
         }
     }
 

@@ -68,14 +68,19 @@ async def vc3d_manual_add_extend(
 
     Each row (side "left"/"right") or column ("up"/"down") ending at that
     edge is continued along its own direction at the edge; first/last limit
-    it to those rows or columns. Enters manual-add mode if needed and grows
+    it to those rows or columns. With the panel's "Extensions follow the
+    sheet" setting on (the default), each line is then re-walked along the
+    CT sheet in the background; "followingSheet" is true until that finishes
+    (vc3d_get_state reports it as manualAddFollowingSheet), so wait for it
+    before adding constraints or applying. Enters manual-add mode if needed and grows
     the grid when there is no room. Refine the preview with
     vc3d_manual_add_add_constraint or vc3d_shift_click on a plane viewer, then
     vc3d_manual_add_finish to apply (apply=false removes the strip and any
     grid growth). With applyPending=true and an extension of the same side
     pending, that one is applied and saved first and the next starts from the
     new edge, keeping its first/last; "queued" is true while it waits for the
-    save. Returns {"active": bool, "side": str, "queued": bool}.
+    save. Returns {"active": bool, "side": str, "queued": bool,
+    "followingSheet": bool}.
     """
     params: dict[str, Any] = {"side": side, "cells": cells}
     if first is not None:
