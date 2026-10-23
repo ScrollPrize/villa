@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -20,18 +21,37 @@ struct VolumeFrame {
 inline std::vector<VolumeFrame> volumeFrames(sqlite3* db, const std::string& volume,
                                              const std::optional<std::string>& kind, bool includeRetired)
 {
-    Statement rows(db, "SELECT DISTINCT json_extract(o.meta,'$.coordinates.scale_factor') FROM objects o "
-                       "WHERE json_extract(o.meta,'$.coordinates.volume_uuid')=?1 AND (?2 IS NULL OR o.kind=?2)" +
-                       (includeRetired ? std::string() : " AND " + activeObjectSql("o.id")));
-    rows.bind(1, volume);
-    rows.bind(2, kind);
-    std::vector<VolumeFrame> frames;
-    while (rows.row()) {
-        if (rows.isNull(0)) continue;
-        const double scale = rows.f64(0);
-        if (!std::isfinite(scale) || !(scale > 0)) continue;
-        frames.push_back({nlohmann::json{{"volume_uuid", volume}, {"scale_factor", scale}}.dump(), 1.0 / scale});
+    // Seek each distinct scale of the volume through objects_coordinates: one
+    // probe per frame, never a scan of the volume's objects. Scales are
+    // validated finite positive numbers; the walk stops at any other value.
+    std::vector<std::string> kinds;
+    if (kind) kinds.push_back(*kind);
+    else {
+        Statement next(db, "SELECT kind FROM objects INDEXED BY objects_kind WHERE kind>? ORDER BY kind LIMIT 1");
+        for (std::string after;;) {
+            next.reset(); next.bind(1, after);
+            if (!next.row()) break;
+            kinds.push_back(after = next.text(0));
+        }
     }
+    std::set<double> scales;
+    Statement next(db, "SELECT o.coordinate_scale FROM objects o INDEXED BY objects_coordinates "
+                       "WHERE o.kind=?1 AND o.coordinate_volume=?2 AND o.coordinate_scale>?3" +
+                       (includeRetired ? std::string() : " AND " + activeObjectSql("o.id")) +
+                       " ORDER BY o.coordinate_scale LIMIT 1");
+    for (const auto& k : kinds)
+        for (double after = 0;;) {
+            next.reset(); next.bind(1, k); next.bind(2, volume); next.bind(3, after);
+            if (!next.row()) break;
+            const int type = sqlite3_column_type(next.value, 0);
+            if (type != SQLITE_INTEGER && type != SQLITE_FLOAT) break;
+            const double scale = next.f64(0);
+            if (!std::isfinite(scale) || !(scale > after)) break;
+            scales.insert(after = scale);
+        }
+    std::vector<VolumeFrame> frames;
+    for (const double scale : scales)
+        frames.push_back({nlohmann::json{{"volume_uuid", volume}, {"scale_factor", scale}}.dump(), 1.0 / scale});
     return frames;
 }
 

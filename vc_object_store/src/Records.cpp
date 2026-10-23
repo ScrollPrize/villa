@@ -37,27 +37,6 @@ int64_t ObjectStore::objectCount(const Txn& txn, const std::string& kind, bool i
     return s.i64(0);
 }
 
-std::vector<ObjectCoordinateGroup> ObjectStore::objectCoordinateGroups(const Txn& txn, const std::string& kind,
-                                                                     const std::atomic_bool* cancel) const
-{
-    auto* db = static_cast<sqlite3*>(connection(txn));
-    struct Cancellation {
-        sqlite3* db;
-        ~Cancellation() { if (db) sqlite3_progress_handler(db, 0, nullptr, nullptr); }
-    } cancellation{cancel ? db : nullptr};
-    if (cancel) sqlite3_progress_handler(db, 1000, [](void* context) {
-        return static_cast<const std::atomic_bool*>(context)->load() ? 1 : 0;
-    }, const_cast<std::atomic_bool*>(cancel));
-    Statement rows(db,
-        "SELECT json_object('volume_uuid',json_extract(o.meta,'$.coordinates.volume_uuid'),"
-        "'scale_factor',json_extract(o.meta,'$.coordinates.scale_factor')),count(*) FROM objects o "
-        "WHERE o.kind=? AND " + activeObjectSql("o.id") +
-        " GROUP BY json_extract(o.meta,'$.coordinates.volume_uuid'),json_extract(o.meta,'$.coordinates.scale_factor')", kind);
-    std::vector<ObjectCoordinateGroup> result;
-    while (rows.row()) result.push_back({rows.text(0), rows.i64(1)});
-    return result;
-}
-
 std::vector<ObjectRecord> ObjectStore::objectsByTag(const Txn& txn, const std::string& tag, bool includeRetired) const
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));

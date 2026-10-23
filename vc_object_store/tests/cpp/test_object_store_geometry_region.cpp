@@ -27,28 +27,24 @@ int main() try
     RegionOptions options;
     auto all = store.geometryRegion(txn, slice, options);
     require(all.complete() && all.intersectingObjects == 3, "boundary crossing segments");
-    const auto groups = store.objectCoordinateGroups(txn, "fiber");
-    require(groups.size() == 2, "coordinate groups include undeclared frames");
-    int64_t grouped = 0;
-    for (const auto& group : groups) {
-        grouped += group.count;
-        ObjectSelection page; page.kind = "fiber"; page.coordinates = group.coordinates;
-        page.orderBy = "length_desc"; page.limit = 1;
-        const auto first = store.selectObjects(txn, page);
-        require(first.size() == 1, "coordinate-filtered catalog page");
-        page.afterUuid = first[0].uuid; page.afterLength = first[0].fiber->length;
-        const auto second = store.selectObjects(txn, page);
-        require(second.size() == size_t(group.count - 1), "exact coordinate cursor preserves equal-length rows");
-        if (!second.empty()) require(second[0].uuid != first[0].uuid, "cursor does not repeat rows");
-        RegionOptions frame; frame.coordinates = group.coordinates;
-        const auto region = store.geometryRegion(txn, slice, frame);
-        require(region.complete() && region.intersectingObjects == uint64_t(group.count), "region filters coordinate system before decoding");
-        frame.maximumObjects = 1;
-        const auto limited = store.geometryRegion(txn, slice, frame);
-        require(limited.intersectingObjects == 1, "limit applies within coordinate group");
-        require(limited.runs.front().points == region.runs.front().points, "bounded query preserves exact geometry");
-    }
-    require(grouped == 3, "group counts cover active catalog");
+    // The Fibers panel pages equal volume lengths by UUID, and the overlay's
+    // display limit keeps exact geometry. The undeclared fiber is not bound.
+    const std::string volume = "20260411134726";
+    ObjectSelection page; page.kind = "fiber"; page.volume = volume; page.orderBy = "length_desc"; page.limit = 1;
+    const auto first = store.selectObjects(txn, page);
+    require(first.size() == 1, "volume catalog page");
+    page.afterUuid = first[0].uuid; page.afterLength = first[0].fiber->length / 2;
+    const auto second = store.selectObjects(txn, page);
+    require(second.size() == 1 && second[0].uuid != first[0].uuid, "cursor keeps equal-length rows without repeats");
+    page.afterUuid = second[0].uuid;
+    require(store.selectObjects(txn, page).empty(), "the unbound fiber is not in the bound pages");
+    RegionOptions overlay; overlay.volume = volume;
+    const auto region = store.geometryRegion(txn, slice, overlay);
+    require(region.complete() && region.intersectingObjects == 2, "region spans the volume's bound fibers");
+    overlay.maximumObjects = 1;
+    const auto limited = store.geometryRegion(txn, slice, overlay);
+    require(limited.intersectingObjects == 1, "display limit applies to the region");
+    require(limited.runs.front().points == region.runs.front().points, "bounded query preserves exact geometry");
     options.maximumObjects = 1; options.selected = ids.front();
     options.uuids = std::vector<std::string>{ids.back()};
     auto filtered = store.geometryRegion(txn, slice, options);

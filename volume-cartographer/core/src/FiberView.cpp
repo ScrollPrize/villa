@@ -16,12 +16,19 @@ Point ViewRegion::project(const Point& point) const
 
 bool ViewRegion::contains(const ViewRegion& other) const
 {
-    if (u != other.u || v != other.v || n != other.n)
-        return false;
-    const auto offset = project(other.origin);
-    for (int i = 0; i < 3; ++i)
-        if (!(other.local.lower[i] + offset[i] >= local.lower[i] && other.local.upper[i] + offset[i] <= local.upper[i]))
-            return false;
+    // Both regions are boxes in their own frames. A box lies inside a convex
+    // prism exactly when its eight corners do, whatever the two frames' axes.
+    for (const double a : {other.local.lower[0], other.local.upper[0]})
+        for (const double b : {other.local.lower[1], other.local.upper[1]})
+            for (const double c : {other.local.lower[2], other.local.upper[2]}) {
+                Point corner{};
+                for (int i = 0; i < 3; ++i)
+                    corner[i] = other.origin[i] + a * other.u[i] + b * other.v[i] + c * other.n[i];
+                const auto p = project(corner);
+                for (int i = 0; i < 3; ++i)
+                    if (!(p[i] >= local.lower[i] && p[i] <= local.upper[i]))
+                        return false;
+            }
     return true;
 }
 

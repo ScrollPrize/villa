@@ -65,12 +65,50 @@ Point normalized(Point p)
         x /= n;
     return p;
 }
-bool contains(const Bounds& outer, const Bounds& inner)
+bool overlaps(const Bounds& a, const Bounds& b)
 {
     for (size_t i = 0; i < 3; ++i)
-        if (inner.lower[i] < outer.lower[i] || inner.upper[i] > outer.upper[i])
+        if (a.upper[i] < b.lower[i] || b.upper[i] < a.lower[i])
             return false;
     return true;
+}
+// The volume AABB of a region's local box.
+Bounds regionBox(const vc::fibers::ViewRegion& s)
+{
+    Bounds box;
+    box.lower.fill(std::numeric_limits<double>::infinity());
+    box.upper.fill(-std::numeric_limits<double>::infinity());
+    for (double a : {s.local.lower[0], s.local.upper[0]})
+        for (double b : {s.local.lower[1], s.local.upper[1]})
+            for (double c : {s.local.lower[2], s.local.upper[2]})
+                for (int i = 0; i < 3; ++i) {
+                    const double p = s.origin[i] + a * s.u[i] + b * s.v[i] + c * s.n[i];
+                    box.lower[i] = std::min(box.lower[i], p);
+                    box.upper[i] = std::max(box.upper[i], p);
+                }
+    return box;
+}
+// Load a margin around the view so that pans, zooms and the small moves of a
+// cut plane stay inside one complete region instead of re-querying each frame.
+// The view is clipped from it exactly, so the margin never changes the drawing.
+constexpr double kPrefetchSpanFraction = 0.25;
+constexpr double kPrefetchDepthVx = 32;
+vc::fibers::ViewRegion prefetchRegion(vc::fibers::ViewRegion s)
+{
+    const double du = kPrefetchSpanFraction * (s.local.upper[0] - s.local.lower[0]);
+    const double dv = kPrefetchSpanFraction * (s.local.upper[1] - s.local.lower[1]);
+    s.local.lower[0] -= du;
+    s.local.upper[0] += du;
+    s.local.lower[1] -= dv;
+    s.local.upper[1] += dv;
+    s.local.lower[2] -= kPrefetchDepthVx;
+    s.local.upper[2] += kPrefetchDepthVx;
+    s.box = regionBox(s);
+    return s;
+}
+double viewSpan(const vc::fibers::ViewRegion& s)
+{
+    return std::min(s.local.upper[0] - s.local.lower[0], s.local.upper[1] - s.local.lower[1]);
 }
 bool inside(const Point& local, const Bounds& bounds)
 {
@@ -188,8 +226,13 @@ void background(QObject* parent, Work work, Done done)
 }  // namespace
 
 struct FiberCollectionController::View {
-    std::optional<Slice> requested, displayed, coverageSlice;
-    std::optional<Bounds> coverage, pendingBounds;
+    // requested is the view whose region was last queried; pending is the
+    // prism of the query in flight.
+    std::optional<Slice> requested, displayed, coverageSlice, pending;
+    std::optional<Bounds> coverage;
+    // Views at least this span (voxels) are queried without a margin: a
+    // prefetch there exceeded the store's region budget.
+    double prefetchFailedSpan{std::numeric_limits<double>::infinity()};
     std::vector<vc::fibers::Block> blocks;
     struct Control {
         uint64_t fiber = 0;
@@ -322,7 +365,8 @@ void FiberCollectionController::clear()
         s->displayed.reset();
         s->coverage.reset();
         s->coverageSlice.reset();
-        s->pendingBounds.reset();
+        s->pending.reset();
+        s->prefetchFailedSpan = std::numeric_limits<double>::infinity();
         s->dirty = true;
     }
     catalogPending_ = false;
@@ -342,11 +386,17 @@ void FiberCollectionController::projectChanged(bool preserveSelection)
     const auto volume = state_->currentVolume();
     if (!attachment || !annotations_) return;
     catalogCursor_.reset();
-    enabled_ = false;
-    invalidate();
-    publishStatus(tr("Reading fiber catalog metadata…"));
-    nativeToViewer_ = 1;
-    nativeVoxelMm_ = volume ? volume->voxelSize()/1000. : 1.;
+    if (preserveSelection) {
+        // A commit revises the views in place: each keeps drawing what it has
+        // until the replacement lands, so an edit never blanks the overlay.
+        refreshRegions();
+    } else {
+        enabled_ = false;
+        invalidate();
+        publishStatus(tr("Reading fiber catalog metadata…"));
+        nativeToViewer_ = 1;
+        nativeVoxelMm_ = volume ? volume->voxelSize()/1000. : 1.;
+    }
     const auto rev = revision_;
     background<int64_t>(this,
         [connection, attachment=*attachment] {
@@ -360,9 +410,10 @@ void FiberCollectionController::projectChanged(bool preserveSelection)
             if (rev != revision_) return;
             if (!result.error.isEmpty()) { publishStatus(result.error); return; }
             totalFibers_ = result.value;
-            enabled_ = true;
+            const bool wasEnabled = std::exchange(enabled_, true);
             listPage(true);
-            invalidate();
+            if (wasEnabled) publishCount();
+            else invalidate();
             if (preserveSelection && selected_ > 0) selectFiber(selected_, false, false);
         });
 }
@@ -373,12 +424,16 @@ void FiberCollectionController::openCollection(const QString& path)
         emit panelRequested();
     } catch(const std::exception& e) { publishStatus(QString::fromUtf8(e.what())); }
 }
+void FiberCollectionController::publishCount()
+{
+    publishStatus(options_.maxDisplayed
+        ? tr("%1 fibers in store · up to %2 visible per view").arg(totalFibers_).arg(options_.maxDisplayed)
+        : tr("%1 fibers in store · all visible fibers").arg(totalFibers_));
+}
 void FiberCollectionController::invalidate()
 {
     if (enabled_)
-        publishStatus(options_.maxDisplayed
-            ? tr("%1 fibers in store · up to %2 visible per view").arg(totalFibers_).arg(options_.maxDisplayed)
-            : tr("%1 fibers in store · all visible fibers").arg(totalFibers_));
+        publishCount();
     for (auto& [v, s] : views_) {
         if (s->cancelled)
             s->cancelled->store(true);
@@ -386,7 +441,8 @@ void FiberCollectionController::invalidate()
         s->displayed.reset();
         s->coverage.reset();
         s->coverageSlice.reset();
-        s->pendingBounds.reset();
+        s->pending.reset();
+        s->prefetchFailedSpan = std::numeric_limits<double>::infinity();
         s->blocks.clear();
         s->controls.clear();
         s->rings.clear();
@@ -398,6 +454,18 @@ void FiberCollectionController::invalidate()
         s->dirty = true;
     }
     clearPointChainProjectionCache();
+    refreshAll();
+}
+void FiberCollectionController::refreshRegions()
+{
+    for (auto& [v, s] : views_) {
+        if (s->cancelled)
+            s->cancelled->store(true);
+        s->requested.reset();
+        s->coverageSlice.reset();
+        s->chainBox.reset();
+        s->dirty = true;
+    }
     refreshAll();
 }
 std::optional<std::string> FiberCollectionController::familyFilter() const
@@ -547,6 +615,9 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
                 return;
             }
             const auto& row = result.value.row;
+            // Region queries rank the selected fiber first; re-selecting the
+            // same fiber (after a commit) leaves them as they are.
+            const bool reselected = selectedPin_ && selectedPin_->object == result.value.pin.object;
             selectedPin_ = result.value.pin;
             selectedToVolume_ = row.toVolume;
             emit fiberRevealed(row);
@@ -562,7 +633,7 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
             selection.index = previousIndex ? std::clamp(*previousIndex, 0, std::max(last, 0)) : std::max(last, 0) / 2;
             selection.openable = annotations_ != nullptr;
             publishSelection(selection);
-            invalidate();
+            if (!reselected) refreshRegions();
             if (focusView)
                 navigate(selection.index);
             if (openAnnotation)
@@ -634,16 +705,7 @@ std::optional<FiberCollectionController::Slice> FiberCollectionController::slice
     }
     const double d = options_.sliceDistance;
     s.local = {{0, 0, -d}, {std::sqrt(dot(sub(x, s.origin), sub(x, s.origin))), std::sqrt(dot(sub(y, s.origin), sub(y, s.origin))), d}};
-    s.box.lower.fill(std::numeric_limits<double>::infinity());
-    s.box.upper.fill(-std::numeric_limits<double>::infinity());
-    for (double a : {0.0, s.local.upper[0]})
-        for (double b : {0.0, s.local.upper[1]})
-            for (double c : {-d, d})
-                for (int i = 0; i < 3; ++i) {
-                    const double p = s.origin[i] + a * s.u[i] + b * s.v[i] + c * s.n[i];
-                    s.box.lower[i] = std::min(s.box.lower[i], p);
-                    s.box.upper[i] = std::max(s.box.upper[i], p);
-                }
+    s.box = regionBox(s);
     return s;
 }
 bool FiberCollectionController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
@@ -669,26 +731,27 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
         viewer->graphicsView()->viewport()->installEventFilter(this);
     }
     auto& v = *ptr;
-    const bool limited = options_.maxDisplayed > 0;
-    if (!limited && v.complete && v.coverageSlice) {
-        // A complete region already contains all segments needed for a zoom
-        // or pan inside its prism; AABB containment is unsafe for oblique views.
-        if (v.coverageSlice->contains(s)) {
-            if (v.busy && v.cancelled) v.cancelled->store(true);
-            return;
-        }
+    // A complete region (one that reached neither the display limit nor a
+    // store budget) holds every segment of any view inside its prism.
+    if (v.complete && v.coverageSlice && v.coverageSlice->contains(s)) {
+        if (v.busy && v.cancelled) v.cancelled->store(true);
+        return;
     }
     if (v.requested && *v.requested == s)
         return;
     if (v.busy) {
-        // Let a query covering the new layer finish instead of restarting it.
-        if (v.cancelled && (limited || !v.pendingBounds || !contains(*v.pendingBounds, s.box)))
+        // Let the running query finish while it can still draw part of this
+        // view: cancelling on every pan frame starved a moving view of all
+        // results. Its completion requests the view again if still uncovered.
+        if (v.cancelled && (!v.pending || !overlaps(v.pending->box, s.box)))
             v.cancelled->store(true);
         return;
     }
+    const auto query = viewSpan(s) < v.prefetchFailedSpan ? prefetchRegion(s) : s;
     v.busy = true;
     v.dirty = true;
     v.requested = s;
+    v.pending = query;
     v.error.clear();
     auto cancel = std::make_shared<std::atomic_bool>(false);
     v.cancelled = cancel;
@@ -697,12 +760,11 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
     const auto family = familyFilter();
     const auto maximum = options_.maxDisplayed;
     const bool linked = options_.showLinked;
-    v.pendingBounds = s.box;
     background<RegionResult>(
         this,
         [connection=state_->objectStoreSession(),attachment=*state_->objectStoreSession()->attachment(),
          volume=state_->currentVolume() ? state_->currentVolume()->id() : std::string{},
-         selectedUuid=selectedPin_ ? selectedPin_->object.objectUuid : std::string{}, s,min,cancel,maximum,family,linked,
+         selectedUuid=selectedPin_ ? selectedPin_->object.objectUuid : std::string{}, s=query,min,cancel,maximum,family,linked,
          none=noFamilies()]() {
             RegionResult result; result.coverage=s.box;
             if (none || volume.empty()) return result;
@@ -764,15 +826,23 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
             });
             return result;
         },
-        [this, viewer, rev, cancel, s](Outcome<RegionResult> result) {
+        [this, viewer, rev, cancel, s, query](Outcome<RegionResult> result) {
             auto found = views_.find(viewer);
             if (found == views_.end() || found->second->cancelled != cancel)
                 return;
             auto& v = *found->second;
             v.busy = false;
             v.dirty = true;
-            v.pendingBounds.reset();
+            v.pending.reset();
             if (rev != revision_ || cancel->load()) {
+                v.requested.reset();
+                refreshViewer(viewer);
+                return;
+            }
+            if (result.error.isEmpty() && !result.value.page.complete && query != s) {
+                // The margin pushed the region past a store budget the view
+                // alone may fit: never show less than the view's own query.
+                v.prefetchFailedSpan = viewSpan(s);
                 v.requested.reset();
                 refreshViewer(viewer);
                 return;
@@ -792,7 +862,7 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
                 v.blocks = std::move(region.page.blocks);
                 v.complete = region.page.complete;
                 v.coverage = region.coverage;
-                v.coverageSlice = s;
+                v.coverageSlice = query;
             }
             refreshViewer(viewer);
         });
@@ -952,7 +1022,9 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
     }
     // Control points inside the slab, then the linked ones' rings on top.
     for (const auto& control : v.controls) {
-        if (!inside(current->project(control.position), current->local)) continue;
+        // Only fibers drawn in this view, not ones crossing just the margin.
+        if (!visibleIds.contains(int64_t(control.fiber)) ||
+            !inside(current->project(control.position), current->local)) continue;
         const auto scene = viewer->volumeToScene(cvpoint(control.position, nativeToViewer_));
         const auto color = colors.find(int64_t(control.fiber));
         OverlayStyle style;
@@ -979,7 +1051,7 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
         ? tr("%1 visible fibers · max %2").arg(visibleIds.size()).arg(options_.maxDisplayed)
         : tr("%1 visible fibers").arg(visibleIds.size());
     builder.addText(rect.topLeft() + QPointF(8, 40), count, QFont{}, info);
-    if (v.busy && (!v.requested || *v.requested != *current || options_.maxDisplayed || !contains(*v.coverage, current->box)))
+    if (v.busy && !(v.complete && v.coverageSlice && v.coverageSlice->contains(*current)))
         builder.addText(rect.topLeft() + QPointF(8, 20), tr("Updating fiber region…"), QFont{}, info);
     else if (!v.complete)
         builder.addText(rect.topLeft() + QPointF(8, 20), tr("Partial fiber view · zoom in or increase minimum length"), QFont{}, info);

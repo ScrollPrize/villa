@@ -191,10 +191,6 @@ struct ObjectSelection {
     // Excluded when minLength is positive. Not valid for spatialRegions.
     bool includeUnbound = false;
 };
-struct ObjectCoordinateGroup {
-    std::string coordinates;
-    int64_t count = 0;
-};
 struct EdgeSelection {
     std::optional<std::string> kind, tag;
     std::vector<std::string> approvalStates; // empty means all states
@@ -394,9 +390,10 @@ public:
     std::vector<ObjectRecord> objectsByKind(const Txn& txn, const std::string& kind,
                                             const std::optional<std::string>& approvalState = std::nullopt, bool includeRetired = false) const;
     int64_t objectCount(const Txn& txn, const std::string& kind, bool includeRetired = false) const;
-    // Metadata-only aggregation, without reading geometry or materializing objects.
-    std::vector<ObjectCoordinateGroup> objectCoordinateGroups(const Txn&, const std::string& kind,
-                                                             const std::atomic_bool* cancel = nullptr) const;
+    // Active objects of kind that a volume selection lists as unbound (no
+    // finite positive scale declared for volume). Reads only the unbound index
+    // ranges, so a store bound to one volume is not scanned.
+    int64_t unboundObjectCount(const Txn&, const std::string& kind, const std::string& volume) const;
     std::vector<ObjectRecord> objectsByTag(const Txn& txn, const std::string& tag, bool includeRetired = false) const;
     // Distinct tags on active objects, optionally of one kind, sorted.
     std::vector<std::string> objectTags(const Txn&, const std::optional<std::string>& kind = std::nullopt) const;

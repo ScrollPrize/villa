@@ -20,5 +20,5 @@ target_link_libraries(test_object_store_geometry_edits PRIVATE vc_objects nlohma
 add_test(NAME object_store_geometry_edits COMMAND test_object_store_geometry_edits)
 
 # Read-only real-data timing harness; not a fixture-free CTest.
-add_executable(bench_fiber_open bench_fiber_open.cpp)
-target_link_libraries(bench_fiber_open PRIVATE vc_objects)
+add_executable(bench_volume_queries bench_volume_queries.cpp)
+target_link_libraries(bench_volume_queries PRIVATE vc_objects)

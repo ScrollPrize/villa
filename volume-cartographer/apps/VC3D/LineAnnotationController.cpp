@@ -14831,14 +14831,11 @@ void LineAnnotationController::dispatchSideStripIntersectionQuery(
         }
     }
     std::vector<std::string> selected;
-    connection->read(*attachment,[&](const auto& db,const auto& txn,const auto& cancel) {
+    connection->read(*attachment,[&](const auto& db,const auto& txn,const auto&) {
         vc::objects::ObjectSelection selection;selection.kind="fiber";selection.volume=volume->id();
         auto bounds=stripBounds;for(auto& value:bounds)value*=sourceScale;selection.bbox=bounds;
         for(const auto& region:db.spatialRegions(txn,selection)) selected.push_back(region.objectUuid);
-        int64_t bound=0;
-        for(const auto& group:db.objectCoordinateGroups(txn,"fiber",&cancel))
-            if(vc::objects::geometryScaleToVolume({{"coordinates",nlohmann::json::parse(group.coordinates)}},volume->id())) bound+=group.count;
-        request.unboundFibers=static_cast<size_t>(std::max<int64_t>(0,db.objectCount(txn,"fiber")-bound));
+        request.unboundFibers=static_cast<size_t>(db.unboundObjectCount(txn,"fiber",volume->id()));
     });
     std::sort(selected.begin(),selected.end());
     selected.erase(std::unique(selected.begin(),selected.end()),selected.end());

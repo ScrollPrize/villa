@@ -350,10 +350,6 @@ setup participates in cancellation and work/processing budgets.
 
 C++ `ObjectSelection::coordinates` and `RegionOptions::coordinates` accept
 an exact JSON coordinate declaration (missing fields compare as null).
-`objectCoordinateGroups(txn, "fiber", cancel)` aggregates current metadata without
-materializing object records or decoding geometry. This lets a viewer query each
-coordinate frame directly, without constructing an inclusion list for every
-object in the store.
 
 A volume target instead queries in one volume's voxels across every frame
 declared in it. `ObjectSelection::volume` / `select_objects(volume=...)`,
@@ -370,6 +366,17 @@ other volumes' frames) in UUID order after the bound ones, unless a positive
 minimum length is set; a cursor into them carries `after_uuid` without
 `after_length`. `volume` and `coordinates` are exclusive. Region queries drive the persisted R-tree and order only
 spatial candidates by UUID. Geometry and intersection predicates are unchanged.
+
+Volume targets never parse every object's metadata. The `objects` table carries
+`coordinate_volume` and `coordinate_scale`, virtual generated columns equal to
+`json_extract` of `meta.coordinates`, indexed as `objects_coordinates(kind,
+coordinate_volume, coordinate_scale)` (schema version 14; earlier stores are
+rejected and must be rebuilt). A target finds its frames with one index seek per
+distinct scale, and the unbound tail reads only the index ranges outside the
+volume's binding. `unboundObjectCount(txn, kind, volume)` counts that tail the
+same way. SQLite never answers a generated column from an index alone, so an
+aggregate over these columns (a GROUP BY or count of a whole kind) still reads
+every row; new queries should seek index ranges instead.
 
 | Budget | Default | Charged work |
 | --- | ---: | --- |
@@ -425,32 +432,34 @@ for import/export without relationship detectors or their CT reader dependency.
 VC3D uses this configuration; the standalone tools/Python build keeps detectors
 on by default. The existing OpenCV/TIFF dependencies supply native formats.
 
-## Large-store opening and volume-ID correction
+## Large-store reads and volume-ID correction
 
-Build and run the read-only Paris 4 timing harness from this directory:
+`bench_volume_queries` times the volume-targeted reads VC3D issues (viewport
+regions, a line-annotation strip's candidates, the unbound count, a catalog page
+with its unbound tail, and a curved view's control-chain selection), five runs
+each, read-only. Build and run it from this directory; the VC3D read-only
+harness is documented in `docs/fiber-collections.md` in the sibling project:
 
 ```sh
-AGENTS_AGENT_MODE=1 ninja -C build bench_fiber_open
-build/bin/bench_fiber_open /path/to/paris4-fibers.vcobj
+AGENTS_AGENT_MODE=1 ninja -C build bench_volume_queries
+build/bin/bench_volume_queries /path/to/paris4-fibers.vcobj 20260411134726
 ```
 
-The harness uses the fixed source-voxel viewport centered at `(17000,15500,55000)`,
-with half-extents `(1024,1024,3)`, and a 5,000-fiber cap. On Ubuntu arm64,
-RelWithDebInfo (`-O2 -g`), three consecutive runs on the 931,104-fiber Paris 4
-store gave these mean / min / median / max region-query times (seconds):
+On the 931,104-fiber Paris 4 store (Ubuntu arm64, RelWithDebInfo, warm cache;
+"before" is schema 13, "after" the same data with the schema 14 columns and index),
+median milliseconds:
 
-| Query | Mean | Min | Median | Max | Coverage |
-| --- | ---: | ---: | ---: | ---: | --- |
-| UUID-first scan | 3.550 | 2.325 | 2.371 | 5.952 | 50 fibers, SQL budget exhausted |
-| R-tree-first candidates | 0.0583 | 0.0578 | 0.0580 | 0.0590 | All 142 intersecting fibers |
+| Read | Before | After |
+| --- | ---: | ---: |
+| Region 300×200×6 | 810 | 32 |
+| Region 1500×1000×6 | 826 | 52 |
+| Strip candidates (`spatialRegions`) | 802 | 15 |
+| Unbound count (was a per-binding count + `objectCount`) | 2,516 + 69 | 0.004 |
+| Catalog page of 200 with unbound tail | 3,148 | 1.2 |
+| Control-chain selection | 920 | 47 |
 
-SQLite VM work fell from 10,000,000 steps (the budget) to 386,464. The previous
-query returned partial coverage, so this is not a like-for-like throughput ratio.
-These measurements were collected while incremental builds were also running;
-no cold-cache claims are made. Metadata aggregation averaged 2.922 s after the
-change, a 200-row page with revision pins 0.0089 s. VC3D performs both in background
-workers. The VC3D read-only harness is documented in `docs/fiber-collections.md`
-in the sibling project. No numeric representations or predicates were changed.
+Query results were identical on both schemas (checked with
+`test_object_store_volume_target`).
 
 Older imports may contain a UUIDv5-derived volume binding. Correcting a known
 binding is explicit and preserves prior revisions and all geometry. First preview:
