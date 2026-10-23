@@ -66,7 +66,7 @@ struct DisplaySettings {
     QColor vertical{232, 137, 191};
     float lineWidth = 2.0f;
     float unselectedOpacity = 1.0f;
-    bool showGaps = true;
+    bool showGaps = false;
     bool showAnnotations = false;
     bool annotationsSelectedOnly = true;
     bool perspective = false;

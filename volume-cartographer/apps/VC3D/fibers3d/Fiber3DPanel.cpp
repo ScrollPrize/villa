@@ -378,7 +378,8 @@ struct Fiber3DPanel::Impl {
         row(q->tr("Line width"), width);
 
         section(q->tr("Annotations"));
-        auto* gaps = check("fibers3DGaps", q->tr("Dashed gaps"), true);
+        auto* gaps = check("fibers3DGaps", q->tr("Dashed gaps"), false);
+        gaps->setToolTip(q->tr("Display annotated gaps and inferred connections as dashed lines."));
         auto* annotationsVisible = check("fibers3DAnnotations", q->tr("Show markers and tags"), false);
         auto* selectedOnly = check("fibers3DAnnotationsSelected", q->tr("Selected fiber only"), true);
         body->addWidget(gaps);

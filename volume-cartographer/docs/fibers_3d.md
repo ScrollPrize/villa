@@ -27,7 +27,9 @@ The **Settings** button opens controls for:
   fibres only is the default when enabling them. Whole-fibre tags appear in the
   selection details. Control points, `break` and `kollesis_termination` have
   distinct markers; `damaged` has a separate pattern. Link overlays are not
-  drawn. Known `gap` spans and AFV inferred gaps are dashed by default.
+  drawn. **Dashed gaps** optionally marks known `gap` spans and AFV inferred
+  connections; it is off by default. These are metadata-driven display styles,
+  not additional gaps created in the source geometry.
 
 Settings are grouped into Sources, Appearance and Annotations. Only controls
 for the active colour mode are shown, and the CT box width appears when using
