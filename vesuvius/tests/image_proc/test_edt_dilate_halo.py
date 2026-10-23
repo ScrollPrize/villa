@@ -94,3 +94,12 @@ def test_negative_or_nonfinite_distance_rejected(tmp_path, bad):
         m.EdtDilateConfig(input_zarr="in", output_zarr="out", num_workers=1, distance=bad)
     with pytest.raises(ValueError, match="non-negative"):
         m._edt_dilate_worker(((0, 0, 0), (0, 1, 0, 1, 0, 1), bad, True))
+
+
+def test_worker_reports_whether_it_wrote(tmp_path):
+    # finalize() counts written chunks from these flags.
+    vol = np.zeros((8, 16, 8), np.uint8)
+    vol[4, 2, 4] = 1
+    _run_chunked(tmp_path, vol, (8, 8, 8), 1.0, True)  # sets up _WORKER_STATE and the arrays
+    assert m._edt_dilate_worker(((0, 0, 0), (0, 8, 0, 8, 0, 8), 1.0, True)) == ((0, 0, 0), True)
+    assert m._edt_dilate_worker(((0, 1, 0), (0, 8, 8, 16, 0, 8), 1.0, True)) == ((0, 1, 0), False)
