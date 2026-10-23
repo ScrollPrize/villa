@@ -3441,15 +3441,8 @@ uint64_t LineAnnotationController::importFiberJson(const nlohmann::json& root,
 
 void LineAnnotationController::exportFibers()
 {
-    // Flush before the empty check, not just inside exportFibersToPath: a
-    // newly created fiber lives only in its session until the debounced
-    // autosave fires, and exporting right after the first landing would
-    // otherwise report "no fibers".
+    // Publish resident edits before exporting the attached store.
     flushAllPendingSessionAutoSaves();
-    if (_fibers.empty()) {
-        showError(tr("There are no fibers to export."));
-        return;
-    }
 
     const fs::path defaultDir = currentVolpkgRoot();
     const auto options = showFiberJsonPathDialog(_parentWidget.data(), false, defaultDir);
@@ -3479,12 +3472,6 @@ bool LineAnnotationController::exportFibersToPath(const fs::path& exportPath,
     if (exportedCount) {
         *exportedCount = 0;
     }
-    if (_fibers.empty()) {
-        if (errorMessage) {
-            *errorMessage = tr("There are no fibers to export.");
-        }
-        return false;
-    }
 
     try {
         const auto connection = _state->objectStoreSession();
@@ -3501,6 +3488,10 @@ bool LineAnnotationController::exportFibersToPath(const fs::path& exportPath,
                 root["point_collections"].push_back(nlohmann::json::parse(document));
         });
 
+        if (root["point_collections"].empty()) {
+            if (errorMessage) *errorMessage = tr("There are no fibers to export.");
+            return false;
+        }
         writeJsonAtomic(exportPath, root);
         if (exportedCount) {
             *exportedCount = static_cast<int>(root["point_collections"].size());

@@ -132,8 +132,12 @@ int runObjectStoreControllerTests()
         {
             QTemporaryDir transfers;
             const auto bundle = fs::path(transfers.path().toStdString()) / "network.json";
+            controller.loadFibersForCurrentPackage(std::vector<std::string>{});
+            require(controller._fibers.empty(), "export starts with no resident editor geometry");
             QString error; int exported = 0;
             require(controller.exportFibersToPath(bundle, &error, &exported) && exported == 2, "export linked same-name fibers");
+            require(controller._fibers.empty(), "export does not populate editor geometry");
+            controller.loadFibersForCurrentPackage();
             const auto target = fs::path(transfers.path().toStdString()) / "target.vcobj";
             { auto db = ObjectStore::create(target, options); }
             CState destination;

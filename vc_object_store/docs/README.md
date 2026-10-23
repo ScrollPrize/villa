@@ -345,6 +345,14 @@ revision identity from one snapshot; each Python call starts a fresh snapshot.
 limits. `None` is unrestricted; an explicit empty list matches nothing. Filter
 setup participates in cancellation and work/processing budgets.
 
+C++ `ObjectSelection::coordinates` and `FiberRegionOptions::coordinates` accept
+an exact JSON coordinate declaration (missing fields compare as null).
+`objectCoordinateGroups(txn, "fiber", cancel)` aggregates current metadata without
+materializing object records or decoding geometry. This lets a viewer query each
+coordinate frame directly, without constructing an inclusion list for every
+fiber in the store. Region queries drive the persisted R-tree and order only
+spatial candidates by UUID. Geometry and intersection predicates are unchanged.
+
 | Budget | Default | Charged work |
 | --- | ---: | --- |
 | `output_byte_budget` | 8 MiB | 24 bytes per appended XYZ; a new run needs 48 |
@@ -398,3 +406,59 @@ Native format clients link `vc_object_store::vc_object_geometry`. Set
 for import/export without relationship detectors or their CT reader dependency.
 VC3D uses this configuration; the standalone tools/Python build keeps detectors
 on by default. The existing OpenCV/TIFF dependencies supply native formats.
+
+## Large-store opening and volume-ID correction
+
+Build and run the read-only Paris 4 timing harness from this directory:
+
+```sh
+AGENTS_AGENT_MODE=1 ninja -C build bench_fiber_open
+build/bin/bench_fiber_open /path/to/paris4-fibers.vcobj
+```
+
+The harness uses the fixed source-voxel viewport centered at `(17000,15500,55000)`,
+with half-extents `(1024,1024,3)`, and a 5,000-fiber cap. On Ubuntu arm64,
+RelWithDebInfo (`-O2 -g`), three consecutive runs on the 931,104-fiber Paris 4
+store gave these mean / min / median / max region-query times (seconds):
+
+| Query | Mean | Min | Median | Max | Coverage |
+| --- | ---: | ---: | ---: | ---: | --- |
+| UUID-first scan | 3.550 | 2.325 | 2.371 | 5.952 | 50 fibers, SQL budget exhausted |
+| R-tree-first candidates | 0.0583 | 0.0578 | 0.0580 | 0.0590 | All 142 intersecting fibers |
+
+SQLite VM work fell from 10,000,000 steps (the budget) to 386,464. The previous
+query returned partial coverage, so this is not a like-for-like throughput ratio.
+These measurements were collected while incremental builds were also running;
+no cold-cache claims are made. Metadata aggregation averaged 2.922 s after the
+change, a 200-row page with revision pins 0.0089 s. VC3D performs both in background
+workers. The VC3D read-only harness is documented in `docs/fiber-collections.md`
+in the sibling project. No numeric representations or predicates were changed.
+
+Older imports may contain a UUIDv5-derived volume binding. Correcting a known
+binding is explicit and preserves prior revisions and all geometry. First preview:
+
+```sh
+python scripts/rebind_volume.py objects.vcobj --from-id OLD_VALUE --to-id CATALOG_ID
+```
+
+After closing editors, add `--apply` with `PYTHONPATH=build/python` to run checked,
+batched metadata transactions. The tool is resumable and refuses stores with
+relationships, whose coordinate dependencies need explicit review. Unknown
+bindings are not inferred. Verify with `PYTHONPATH=build/python python -m pytest
+tests/python/test_rebind_volume.py -q` and `PYTHONPATH=build/python python
+scripts/import_afv.py --self-test`.
+
+The approved Paris 4 correction on 2026-10-22 updated 931,104 fibers and one
+collection from `2d2a9b21-9c82-5343-9443-57838a5fa5a1` to `20260411134726`.
+All current bindings were checked; every scale factor remained 1. The SHA-256
+fingerprint of all 931,104 sorted geometry-head pairs was unchanged, as were
+1,862,208 control points and 344,875,721 line points. Historical metadata was
+checked for 20 fibers and the collection. The final read-only VC3D check took
+3 ms to attach, 2,931 ms to show the first page, and 2 ms to load the selected
+fiber, with 293 UI heartbeats and just one resident editor. This was one
+offscreen Ubuntu arm64 run, not a cross-platform rendering benchmark.
+
+Validation passed: five targeted C++ tests, all 30 Python tests, the AFV
+importer self-test, and VC3D's `--test-object-store` controller regression.
+A fresh import of 1,000 real AFV fibers was also checked for byte-exact line
+geometry and the verbatim catalog volume ID.

@@ -15,10 +15,12 @@ import getpass
 import json
 from pathlib import Path
 import sqlite3
+import sys
+import time
 import uuid
 
 
-def rebind(path, old, new, *, apply=False, batch_size=256):
+def rebind(path, old, new, *, apply=False, batch_size=256, progress=False):
     if not isinstance(new, str) or not new or not isinstance(old, str) or not old:
         raise ValueError('Volume IDs must be nonempty strings')
     if old == new or batch_size < 1:
@@ -34,6 +36,7 @@ def rebind(path, old, new, *, apply=False, batch_size=256):
         from vc_object_store import ObjectStore
         with ObjectStore.open(str(path), author=getpass.getuser()) as store:
             after = 0
+            last_progress = time.monotonic()
             while True:
                 rows = reader.execute("""SELECT o.id,o.uuid,o.meta,h.revision_uuid
                     FROM objects o JOIN object_heads h ON h.object_uuid=
@@ -51,6 +54,10 @@ def rebind(path, old, new, *, apply=False, batch_size=256):
                         txn.set_meta(identity, 'coordinates', coordinates)
                 report['updated'] += len(changes)
                 after = rows[-1][0]
+                if progress and time.monotonic() - last_progress >= 5:
+                    print(f"Updated {report['updated']:,} / {sum(report['matching'].values()):,} bindings",
+                          file=sys.stderr, flush=True)
+                    last_progress = time.monotonic()
         return report
 
 
@@ -61,4 +68,4 @@ if __name__ == '__main__':
     parser.add_argument('--to-id', required=True)
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
-    print(json.dumps(rebind(args.database, args.from_id, args.to_id, apply=args.apply), indent=2))
+    print(json.dumps(rebind(args.database, args.from_id, args.to_id, apply=args.apply, progress=True), indent=2))
