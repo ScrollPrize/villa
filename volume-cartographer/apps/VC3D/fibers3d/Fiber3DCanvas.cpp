@@ -72,10 +72,10 @@ layout(location=3) in float arc;
 layout(location=4) in vec3 axialDirection;
 uniform mat4 mvp;
 uniform vec2 viewport;
-uniform float width, selectedFiber, otherOpacity;
+uniform float width, selectedWidthBoost, selectedFiber, otherOpacity;
 uniform bool showAnnotations, selectedAnnotationsOnly, showGaps;
 uniform int colorMode, directionMode;
-uniform vec3 customColor, horizontalColor, verticalColor;
+uniform vec3 customColor, horizontalColor, verticalColor, selectedColor;
 uniform sampler2D palette;
 uniform vec2 lengthRange;
 noperspective out vec2 positionPx;
@@ -105,7 +105,7 @@ void main() {
     if (colorMode == 3) c = info.x < 0.0 ? vec3(0.6) :
         ramp(lengthRange.y > lengthRange.x ?
              (info.x - lengthRange.x) / (lengthRange.y - lengthRange.x) : 0.5);
-    if (selected) c = mix(c, vec3(1.0), 0.2);
+    if (selected) c = selectedColor;
     color = vec4(c, selectedFiber < 0.0 || selected ? 1.0 : otherOpacity);
     vec4 p = mvp * vec4(a, 1.0), q = mvp * vec4(b, 1.0);
     float nearA = p.z + p.w, nearB = q.z + q.w;
@@ -122,7 +122,7 @@ void main() {
     segmentLengthPx = length(delta);
     vec2 tangent = segmentLengthPx > 0.001 ? delta / segmentLengthPx : vec2(1.0, 0.0);
     vec2 normal = vec2(-tangent.y, tangent.x);
-    radiusPx = marker != 0 ? 4.0 : width * 0.5 + (selected ? 0.75 : 0.0);
+    radiusPx = marker != 0 ? 4.0 : (width + (selected ? selectedWidthBoost : 0.0)) * 0.5;
     // One antialias pixel is outside the opaque stroke.
     float extent = radiusPx + 1.0;
     const vec2 corners[6] = vec2[6](vec2(0,-1), vec2(1,-1), vec2(0,1),
@@ -478,6 +478,7 @@ void Fiber3DCanvas::paintGL()
         program.setUniformValue("mvp", matrix);
         program.setUniformValue("viewport", QVector2D(float(pixelWidth), float(pixelHeight)));
         program.setUniformValue("width", float(std::clamp(s.lineWidth, 0.5f, 12.f) * ratio));
+        program.setUniformValue("selectedWidthBoost", float(2.0 * ratio));
         program.setUniformValue("selectedFiber", float(d->selectedIndex));
         program.setUniformValue("otherOpacity", std::clamp(s.unselectedOpacity, 0.f, 1.f));
         program.setUniformValue("showGaps", s.showGaps);
@@ -488,6 +489,7 @@ void Fiber3DCanvas::paintGL()
         program.setUniformValue("customColor", rgb(s.custom));
         program.setUniformValue("horizontalColor", rgb(s.horizontal));
         program.setUniformValue("verticalColor", rgb(s.vertical));
+        program.setUniformValue("selectedColor", rgb(vc3d::selectedFiberColor()));
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, d->paletteTexture);
         if (d->uploadedPalette != int(s.palette)) {

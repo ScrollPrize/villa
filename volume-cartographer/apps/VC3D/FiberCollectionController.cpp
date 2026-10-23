@@ -940,7 +940,7 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
     }
     for (const auto& [group, runs] : linkedPaths)
         draw(runs, groupColor(group), width);
-    draw(selected, QColor("#ffff66"), width + 2);
+    draw(selected, vc3d::selectedFiberColor(), width + 2);
     if (painter.isActive()) {
         painter.end();
         builder.addImage(raster, QPixmap::fromImage(raster), rect.topLeft(), 1, 1, 1, 45);

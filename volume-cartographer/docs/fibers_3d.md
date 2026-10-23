@@ -9,6 +9,10 @@ to select it in the existing annotation or automated-fibre list. Right-click a
 fibre to centre the CT views at the picked point or open Line Annotation.
 **Fit** frames the displayed geometry; **Fit selected** frames its selected
 portion. Changing filters or styles preserves the camera.
+Selecting an AFV fibre in a CT slice or the catalogue also highlights it in
+3D, using the same yellow (`#ffff66`) as the slice overlay and a stroke
+2 logical pixels wider than the other fibres, including on Retina displays.
+The highlight respects the existing 3D depth and region/length filters.
 
 A white crosshair marks the shared CT focus at its actual 3D position. Moving
 the focus in a CT view updates it immediately without moving the 3D camera;
