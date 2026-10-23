@@ -1,9 +1,9 @@
 """zarr_tasks resize must not depend on the output chunk grid.
 
 The oracle is the module's own whole-volume ``_resize_chunk_3d`` (cv2.resize
-per YX slice, then per ZX plane). On the exact path (small reduced ratio) the
-chunked result must be bit-identical; on the tap path it must be identical
-across chunkings and within 2 grey levels (integer dtypes) of the oracle.
+per YX slice, then per ZX plane). The chunked result must be identical across
+chunkings, bit-identical to the oracle for nearest, and within 2 grey levels
+(uint8) of it for other modes.
 """
 import cv2
 import numpy as np
@@ -35,8 +35,6 @@ def chunked(tmp, src, target, chunks, interp, tag):
     return zarr.open_group(pout, mode="r")["0"][...]
 
 
-def is_exact(shape, target, interp):
-    return interp in R._EXACT_MODES and all(R._axis_block(a, b)[0] <= R._MAX_EXACT_BLOCK for a, b in zip(shape, target))
 
 
 @settings(max_examples=30, deadline=None,
@@ -57,7 +55,7 @@ def test_chunk_invariant(tmp_path, interp, dtype, data):
     a = chunked(tmp_path, src, target, c1, interp, "a")
     b = chunked(tmp_path, src, target, c2, interp, "b")
     np.testing.assert_array_equal(a, b)
-    if is_exact(shape, target, interp) or interp == cv2.INTER_NEAREST:
+    if interp == cv2.INTER_NEAREST:
         np.testing.assert_array_equal(a, ref)
     else:
         err = np.abs(a.astype(np.float64) - ref)
@@ -73,7 +71,6 @@ def test_real_style_odd_ratio_taps_path(tmp_path, interp):
     rng = np.random.default_rng(0)
     src = rng.integers(0, 256, (8, 67, 71)).astype(np.uint8)
     target = (8, 134, 141)  # 67/134 = 1/2 exact on y, 71/141 coprime on x
-    assert not is_exact(src.shape, target, cv2.INTER_LINEAR)
     a = chunked(tmp_path, src, target, (8, 32, 32), interp, "a")
     b = chunked(tmp_path, src, target, (8, 141, 141), interp, "b")
     np.testing.assert_array_equal(a, b)

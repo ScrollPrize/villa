@@ -65,12 +65,12 @@ def _resize_chunk_3d(
 # Input voxels of context needed on each side of an output chunk; covers the
 # widest cv2 kernel (Lanczos4: 3 taps left, 4 right) plus one for rounding.
 _HALO = 5
-# Largest reduced-ratio input block for which the exact cv2 path is used.
-_MAX_EXACT_BLOCK = 64
-# cv2's cubic/Lanczos SIMD paths round differently depending on image width, so
-# a cropped window is not bit-identical to the whole plane; those modes always
-# use the tap path.
-_EXACT_MODES = (cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_AREA)
+# cv2.resize on a cropped window equals the whole-axis result only when every
+# float operation cv2 does on coordinates is exact, i.e. when the reduced
+# ratio is a power of two (1:1, 1:2, 2:1, 1:4, ...). cv2 computes positions as
+# floor(x * scale) in floating point, which for other ratios is not
+# translation-invariant (90 * 0.7 = 62.999..., 10 * 0.7 + 56 = 63).
+_WINDOW_MODES = (cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_AREA)
 
 
 def _axis_block(n_in: int, n_out: int) -> Tuple[int, int]:
@@ -79,13 +79,15 @@ def _axis_block(n_in: int, n_out: int) -> Tuple[int, int]:
     return n_in // g, n_out // g
 
 
+def _is_dyadic(n_in: int, n_out: int) -> bool:
+    N, M = _axis_block(n_in, n_out)
+    return min(N, M) == 1 and (max(N, M) & (max(N, M) - 1)) == 0
+
+
 def _aligned_window(o0: int, o1: int, n_in: int, n_out: int) -> Tuple[int, int, int, int]:
     """Output/input window aligned to the reduced ratio, padded by a halo.
 
-    Returns (wo0, wo1, wi0, wi1). Because both windows start and end on
-    multiples of the reduced ratio, cv2.resize on the input window computes
-    exactly the same scale and per-pixel source coordinates (shifted by an
-    integer) as a whole-axis resize.
+    Returns (wo0, wo1, wi0, wi1).
     """
     N, M = _axis_block(n_in, n_out)
     pad_blocks = -(-_HALO // N)
@@ -94,8 +96,8 @@ def _aligned_window(o0: int, o1: int, n_in: int, n_out: int) -> Tuple[int, int, 
     return b0 * M, b1 * M, b0 * N, b1 * N
 
 
-def _resize_chunk_exact(input_data, out_start, out_end, input_shape, output_shape,
-                        interpolation):
+def _resize_chunk_window(input_data, out_start, out_end, input_shape, output_shape,
+                         interpolation):
     windows = [
         _aligned_window(o0, o1, ni, no)
         for o0, o1, ni, no in zip(out_start, out_end, input_shape, output_shape)
@@ -130,6 +132,36 @@ def _lanczos_w(t):
     return w / w.sum(axis=1, keepdims=True)
 
 
+def _area_taps(o0: int, o1: int, n_in: int, scale: float):
+    """cv2's computeResizeAreaTab (INTER_AREA box filter), same float ops."""
+    rows = []
+    for dx in range(o0, o1):
+        fsx1 = dx * scale
+        fsx2 = fsx1 + scale
+        cell = min(scale, n_in - fsx1)
+        sx1, sx2 = int(np.ceil(fsx1)), int(np.floor(fsx2))
+        sx2 = min(sx2, n_in - 1)
+        sx1 = min(sx1, sx2)
+        taps = []
+        if sx1 - fsx1 > 1e-3:
+            taps.append((sx1 - 1, float(np.float32((sx1 - fsx1) / cell))))
+        for sx in range(sx1, sx2):
+            taps.append((sx, float(np.float32(1.0 / cell))))
+        if fsx2 - sx2 > 1e-3:
+            taps.append((sx2, float(np.float32(min(min(fsx2 - sx2, 1.0), cell) / cell))))
+        rows.append(taps)
+    # Fixed tap count from the scale alone, so any sub-range of outputs gets
+    # exactly the whole-axis taps (zero-weight padding).
+    k = max([int(np.ceil(scale)) + 2] + [len(t) for t in rows])
+    idx = np.zeros((len(rows), k), np.int64)
+    w = np.zeros((len(rows), k))
+    for r, taps in enumerate(rows):
+        for j, (si, a) in enumerate(taps):
+            idx[r, j], w[r, j] = si, a
+        idx[r, len(taps):] = taps[-1][0]
+    return idx, w
+
+
 def _axis_taps(o0: int, o1: int, n_in: int, n_out: int, interpolation: int,
                true_area: bool = True):
     """Global (cv2-convention) source indices and weights for outputs o0..o1.
@@ -147,17 +179,11 @@ def _axis_taps(o0: int, o1: int, n_in: int, n_out: int, interpolation: int,
         idx = np.minimum(np.floor(d * scale).astype(np.int64), n_in - 1)
         return idx[:, None], np.ones((o1 - o0, 1))
     if interpolation == cv2.INTER_AREA and true_area:
-        lo = d * scale
-        hi = lo + scale
-        first = np.floor(lo).astype(np.int64)
-        ntap = int(np.ceil(scale)) + 1
-        idx = first[:, None] + np.arange(ntap)[None, :]
-        w = np.clip(np.minimum(hi[:, None], idx + 1) - np.maximum(lo[:, None], idx), 0, None)
-        w /= scale
-        return np.clip(idx, 0, n_in - 1), w
+        return _area_taps(o0, o1, n_in, scale)
     if interpolation == cv2.INTER_AREA:
         sx = np.floor(d * scale).astype(np.int64)
-        fx = (d + 1) - (sx + 1) * inv
+        # cv2 computes this offset in float32 before taking the fraction.
+        fx = ((d + 1) - (sx + 1) * inv).astype(np.float32).astype(np.float64)
         fx = np.where(fx <= 0, 0.0, fx - np.floor(fx))
         fx = np.where(sx >= n_in - 1, 0.0, fx)
         sx = np.minimum(sx, n_in - 1)
@@ -230,11 +256,15 @@ def _resize_chunk_worker(args: Tuple) -> Optional[Tuple[int, int, int]]:
     """Process a single output chunk.
 
     The result for every output voxel depends only on global coordinates, so it
-    is independent of the chunk grid. When the reduced input/output ratio is
-    small on every axis and the mode is nearest/linear/area, the chunk is computed with cv2.resize on a
-    ratio-aligned, halo-padded window (bit-identical to a whole-volume
-    _resize_chunk_3d). Otherwise cv2's sampling is reproduced with explicit
-    float64 taps (chunk-invariant, within rounding of cv2's fixed-point maths).
+    is independent of the chunk grid. cv2's per-axis sampling (source indices
+    and weights, computed with the same whole-axis scale and float operations as
+    cv2) is applied as explicit float64 taps in a fixed order. Nearest is
+    bit-identical to a whole-volume _resize_chunk_3d; the other modes are
+    within rounding of cv2's fixed-point maths. Only when every axis has a
+    power-of-two ratio (where cv2's coordinate maths is exact and therefore
+    translation-invariant) and the mode is nearest/linear/area, cv2.resize is
+    run on a ratio-aligned, halo-padded window, bit-identical to the whole
+    volume.
     """
     (
         input_path,
@@ -260,11 +290,9 @@ def _resize_chunk_worker(args: Tuple) -> Optional[Tuple[int, int, int]]:
         min(s + c, n) for s, c, n in zip(out_start, out_chunk_size, output_shape)
     )
 
-    exact = interpolation in _EXACT_MODES and all(
-        _axis_block(ni, no)[0] <= _MAX_EXACT_BLOCK
-        for ni, no in zip(input_shape, output_shape)
-    )
-    fn = _resize_chunk_exact if exact else _resize_chunk_taps
+    window = interpolation in _WINDOW_MODES and all(
+        _is_dyadic(ni, no) for ni, no in zip(input_shape, output_shape))
+    fn = _resize_chunk_window if window else _resize_chunk_taps
     resized = fn(input_data, out_start, out_end, tuple(input_shape),
                  tuple(output_shape), interpolation)
     if resized is None:

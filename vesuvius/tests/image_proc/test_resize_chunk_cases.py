@@ -7,9 +7,9 @@ import zarr
 from vesuvius.image_proc.run.zarr_tasks.tasks import resize as R
 
 CASES = [
-    ((16, 20, 18), (8, 10, 9)),     # 2x down, exact path
-    ((8, 12, 10), (8, 30, 25)),     # 2.5x up, exact path
-    ((9, 17, 13), (6, 23, 29)),     # coprime but small blocks, exact path
+    ((16, 20, 18), (8, 10, 9)),     # 2x down
+    ((8, 12, 10), (8, 30, 25)),     # 2.5x up
+    ((9, 17, 13), (6, 23, 29)),     # coprime but small blocks
     ((5, 67, 13), (5, 23, 29)),     # y block 67 > 64: tap path, y shrinks, x grows
     ((7, 13, 67), (11, 29, 23)),    # tap path, z grows, x shrinks
     ((67, 9, 9), (9, 9, 9)),        # tap path, z-only shrink
@@ -43,9 +43,7 @@ def test_cases(tmp_path, interp, case):
     b = _chunked(tmp_path, src, target, (5, 7, 2), interp, "b")
     np.testing.assert_array_equal(a, b)
     err = np.abs(a.astype(int) - ref)
-    exact = interp in R._EXACT_MODES and all(
-        R._axis_block(i, o)[0] <= R._MAX_EXACT_BLOCK for i, o in zip(shape, target))
-    assert err.max() <= (0 if exact or interp == 0 else 2)
+    assert err.max() <= (0 if interp == 0 else 2)
     assert (err > 0).mean() <= (0.5 if interp == 4 else 0.25)
 
 
