@@ -62,8 +62,180 @@ def _resize_chunk_3d(
     return resized_yx
 
 
+# Input voxels of context needed on each side of an output chunk; covers the
+# widest cv2 kernel (Lanczos4: 3 taps left, 4 right) plus one for rounding.
+_HALO = 5
+# Largest reduced-ratio input block for which the exact cv2 path is used.
+_MAX_EXACT_BLOCK = 64
+# cv2's cubic/Lanczos SIMD paths round differently depending on image width, so
+# a cropped window is not bit-identical to the whole plane; those modes always
+# use the tap path.
+_EXACT_MODES = (cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_AREA)
+
+
+def _axis_block(n_in: int, n_out: int) -> Tuple[int, int]:
+    """Reduced ratio (input block, output block) with n_in/n_out == N/M."""
+    g = int(np.gcd(n_in, n_out))
+    return n_in // g, n_out // g
+
+
+def _aligned_window(o0: int, o1: int, n_in: int, n_out: int) -> Tuple[int, int, int, int]:
+    """Output/input window aligned to the reduced ratio, padded by a halo.
+
+    Returns (wo0, wo1, wi0, wi1). Because both windows start and end on
+    multiples of the reduced ratio, cv2.resize on the input window computes
+    exactly the same scale and per-pixel source coordinates (shifted by an
+    integer) as a whole-axis resize.
+    """
+    N, M = _axis_block(n_in, n_out)
+    pad_blocks = -(-_HALO // N)
+    b0 = max(o0 // M - pad_blocks, 0)
+    b1 = min(-(-o1 // M) + pad_blocks, n_out // M)
+    return b0 * M, b1 * M, b0 * N, b1 * N
+
+
+def _resize_chunk_exact(input_data, out_start, out_end, input_shape, output_shape,
+                        interpolation):
+    windows = [
+        _aligned_window(o0, o1, ni, no)
+        for o0, o1, ni, no in zip(out_start, out_end, input_shape, output_shape)
+    ]
+    src = input_data[tuple(slice(w[2], w[3]) for w in windows)]
+    if not src.any():
+        return None
+    win_shape = tuple(w[1] - w[0] for w in windows)
+    resized = _resize_chunk_3d(np.ascontiguousarray(src), win_shape, interpolation)
+    return resized[tuple(slice(o0 - w[0], o1 - w[0])
+                         for o0, o1, w in zip(out_start, out_end, windows))]
+
+
+def _cubic_w(t):
+    A = -0.75
+    return np.stack([
+        ((A * (t + 1) - 5 * A) * (t + 1) + 8 * A) * (t + 1) - 4 * A,
+        ((A + 2) * t - (A + 3)) * t * t + 1,
+        ((A + 2) * (1 - t) - (A + 3)) * (1 - t) * (1 - t) + 1,
+        1 - (((A * (t + 1) - 5 * A) * (t + 1) + 8 * A) * (t + 1) - 4 * A)
+        - (((A + 2) * t - (A + 3)) * t * t + 1)
+        - (((A + 2) * (1 - t) - (A + 3)) * (1 - t) * (1 - t) + 1),
+    ], axis=-1)
+
+
+def _lanczos_w(t):
+    k = np.arange(-3, 5)
+    x = (t[:, None] - k[None, :]).astype(np.float64)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        w = np.where(np.abs(x) < 1e-12, 1.0,
+                     4 * np.sin(np.pi * x) * np.sin(np.pi * x / 4) / (np.pi * np.pi * x * x))
+    return w / w.sum(axis=1, keepdims=True)
+
+
+def _axis_taps(o0: int, o1: int, n_in: int, n_out: int, interpolation: int,
+               true_area: bool = True):
+    """Global (cv2-convention) source indices and weights for outputs o0..o1.
+
+    For INTER_AREA, cv2 only box-filters when *both* axes of the 2D call shrink
+    (or stay equal); otherwise both axes use its upscale-style coefficients.
+    ``true_area`` carries that 2D decision.
+    """
+    inv = n_out / n_in
+    scale = 1.0 / inv
+    d = np.arange(o0, o1, dtype=np.float64)
+    if n_in == n_out:
+        return np.arange(o0, o1)[:, None], np.ones((o1 - o0, 1))
+    if interpolation == cv2.INTER_NEAREST:
+        idx = np.minimum(np.floor(d * scale).astype(np.int64), n_in - 1)
+        return idx[:, None], np.ones((o1 - o0, 1))
+    if interpolation == cv2.INTER_AREA and true_area:
+        lo = d * scale
+        hi = lo + scale
+        first = np.floor(lo).astype(np.int64)
+        ntap = int(np.ceil(scale)) + 1
+        idx = first[:, None] + np.arange(ntap)[None, :]
+        w = np.clip(np.minimum(hi[:, None], idx + 1) - np.maximum(lo[:, None], idx), 0, None)
+        w /= scale
+        return np.clip(idx, 0, n_in - 1), w
+    if interpolation == cv2.INTER_AREA:
+        sx = np.floor(d * scale).astype(np.int64)
+        fx = (d + 1) - (sx + 1) * inv
+        fx = np.where(fx <= 0, 0.0, fx - np.floor(fx))
+        fx = np.where(sx >= n_in - 1, 0.0, fx)
+        sx = np.minimum(sx, n_in - 1)
+        idx = np.stack([sx, np.minimum(sx + 1, n_in - 1)], axis=1)
+        return idx, np.stack([1 - fx, fx], axis=1)
+    fx = (d + 0.5) * scale - 0.5
+    sx = np.floor(fx).astype(np.int64)
+    t = fx - sx
+    if interpolation == cv2.INTER_LINEAR:
+        t = np.where(sx < 0, 0.0, t)
+        sx = np.maximum(sx, 0)
+        t = np.where(sx >= n_in - 1, 0.0, t)
+        sx = np.minimum(sx, n_in - 1)
+        idx = np.stack([sx, sx + 1], axis=1)
+        w = np.stack([1 - t, t], axis=1)
+    elif interpolation == cv2.INTER_CUBIC:
+        idx = sx[:, None] + np.arange(-1, 3)[None, :]
+        w = _cubic_w(t)
+    elif interpolation == cv2.INTER_LANCZOS4:
+        idx = sx[:, None] + np.arange(-3, 5)[None, :]
+        w = _lanczos_w(t)
+    else:
+        raise ValueError(f"unsupported interpolation {interpolation}")
+    return np.clip(idx, 0, n_in - 1), w
+
+
+def _apply_taps(arr, axis, idx, w, base):
+    """Weighted gather along axis; fixed tap order so the result is chunk-invariant."""
+    arr = np.moveaxis(arr, axis, -1)
+    out = np.zeros(arr.shape[:-1] + (idx.shape[0],), dtype=np.float64)
+    for k in range(idx.shape[1]):
+        out += arr[..., idx[:, k] - base].astype(np.float64) * w[:, k]
+    return np.moveaxis(out, -1, axis)
+
+
+def _cast_like(x, dtype):
+    if np.issubdtype(dtype, np.integer):
+        info = np.iinfo(dtype)
+        return np.clip(np.rint(x), info.min, info.max).astype(dtype)
+    return x.astype(dtype)
+
+
+def _resize_chunk_taps(input_data, out_start, out_end, input_shape, output_shape,
+                       interpolation):
+    shrink = [ni >= no for ni, no in zip(input_shape, output_shape)]
+    # 2D cv2 calls: (y, x) for the YX pass, (z, x-at-target-size) for the Z pass.
+    area_flags = [shrink[0], shrink[1] and shrink[2], shrink[1] and shrink[2]]
+    taps = [
+        _axis_taps(o0, o1, ni, no, interpolation, flag)
+        for o0, o1, ni, no, flag in zip(out_start, out_end, input_shape,
+                                        output_shape, area_flags)
+    ]
+    lo = [int(i.min()) for i, _ in taps]
+    hi = [int(i.max()) + 1 for i, _ in taps]
+    src = input_data[tuple(slice(a, b) for a, b in zip(lo, hi))]
+    if not src.any():
+        return None
+    dtype = src.dtype
+    if interpolation == cv2.INTER_NEAREST:
+        return src[np.ix_(*(i[:, 0] - b for (i, _), b in zip(taps, lo)))]
+    # Same pass order and intermediate rounding as _resize_chunk_3d: YX, then Z.
+    yx = _apply_taps(src, 2, taps[2][0], taps[2][1], lo[2])
+    yx = _cast_like(_apply_taps(yx, 1, taps[1][0], taps[1][1], lo[1]), dtype)
+    if input_shape[0] == output_shape[0]:
+        return yx
+    return _cast_like(_apply_taps(yx, 0, taps[0][0], taps[0][1], lo[0]), dtype)
+
+
 def _resize_chunk_worker(args: Tuple) -> Optional[Tuple[int, int, int]]:
-    """Process a single output chunk."""
+    """Process a single output chunk.
+
+    The result for every output voxel depends only on global coordinates, so it
+    is independent of the chunk grid. When the reduced input/output ratio is
+    small on every axis and the mode is nearest/linear/area, the chunk is computed with cv2.resize on a
+    ratio-aligned, halo-padded window (bit-identical to a whole-volume
+    _resize_chunk_3d). Otherwise cv2's sampling is reproduced with explicit
+    float64 taps (chunk-invariant, within rounding of cv2's fixed-point maths).
+    """
     (
         input_path,
         output_path,
@@ -78,54 +250,27 @@ def _resize_chunk_worker(args: Tuple) -> Optional[Tuple[int, int, int]]:
         output_dtype,
     ) = args
 
-    # Open zarr in each worker
     input_store = zarr.open(input_path, mode="r")
     output_store = zarr.open(output_path, mode="r+")
-
     input_data = input_store[resolution]
     output_data = output_store[resolution]
 
-    # Calculate output chunk bounds
-    oz_end = min(oz_start + out_chunk_size[0], output_shape[0])
-    oy_end = min(oy_start + out_chunk_size[1], output_shape[1])
-    ox_end = min(ox_start + out_chunk_size[2], output_shape[2])
+    out_start = (oz_start, oy_start, ox_start)
+    out_end = tuple(
+        min(s + c, n) for s, c, n in zip(out_start, out_chunk_size, output_shape)
+    )
 
-    out_chunk_shape = (oz_end - oz_start, oy_end - oy_start, ox_end - ox_start)
-
-    # Calculate corresponding input region (with float precision)
-    scale_z = input_shape[0] / output_shape[0]
-    scale_y = input_shape[1] / output_shape[1]
-    scale_x = input_shape[2] / output_shape[2]
-
-    iz_start = int(oz_start * scale_z)
-    iy_start = int(oy_start * scale_y)
-    ix_start = int(ox_start * scale_x)
-
-    iz_end = min(int(np.ceil(oz_end * scale_z)), input_shape[0])
-    iy_end = min(int(np.ceil(oy_end * scale_y)), input_shape[1])
-    ix_end = min(int(np.ceil(ox_end * scale_x)), input_shape[2])
-
-    # Ensure we have at least 1 pixel
-    if iz_end <= iz_start:
-        iz_end = iz_start + 1
-    if iy_end <= iy_start:
-        iy_end = iy_start + 1
-    if ix_end <= ix_start:
-        ix_end = ix_start + 1
-
-    # Read input region
-    input_chunk = input_data[iz_start:iz_end, iy_start:iy_end, ix_start:ix_end]
-
-    # Skip empty chunks (all zeros)
-    if not input_chunk.any():
+    exact = interpolation in _EXACT_MODES and all(
+        _axis_block(ni, no)[0] <= _MAX_EXACT_BLOCK
+        for ni, no in zip(input_shape, output_shape)
+    )
+    fn = _resize_chunk_exact if exact else _resize_chunk_taps
+    resized = fn(input_data, out_start, out_end, tuple(input_shape),
+                 tuple(output_shape), interpolation)
+    if resized is None:
         return None
 
-    # Resize to output chunk shape
-    resized = _resize_chunk_3d(input_chunk, out_chunk_shape, interpolation)
-
-    # Convert dtype if specified
     if output_dtype is not None and resized.dtype != output_dtype:
-        # Clip to valid range and cast
         info = (
             np.iinfo(output_dtype)
             if np.issubdtype(output_dtype, np.integer)
@@ -133,9 +278,7 @@ def _resize_chunk_worker(args: Tuple) -> Optional[Tuple[int, int, int]]:
         )
         resized = np.clip(resized, info.min, info.max).astype(output_dtype)
 
-    # Write to output
-    output_data[oz_start:oz_end, oy_start:oy_end, ox_start:ox_end] = resized
-
+    output_data[oz_start:out_end[0], oy_start:out_end[1], ox_start:out_end[2]] = resized
     return (oz_start, oy_start, ox_start)
 
 
