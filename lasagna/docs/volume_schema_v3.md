@@ -1,7 +1,9 @@
 # Lasagna volume schema v3: embedded manifest and resolution groups
 
-Status: format proposal; writer and reader support are not implemented by this
-document. Existing volumes and running jobs are unchanged.
+Status: schema implemented by the shared prediction writer and the local
+accelerated tracing reader. Existing volumes and running jobs are unchanged.
+Other consumers, particularly remote catalogue/publication integrations,
+still need schema-v3 support before compact output is used with them.
 
 This replaces the external `.lasagna.json` manifest and separate per-channel
 Zarr stores with one Zarr store containing resolution-based channel groups.
@@ -111,6 +113,8 @@ absence, not permission to discard an existing value during conversion.
 | `base_shape_zyx` | Three positive integers, required | Original reference-volume extent `[Z, Y, X]` in base voxels. This is not the model input, prediction, or crop shape. It remains unchanged when outputs are downsampled. Some legacy manifests omit it; that is not allowed for a v3 writer. |
 | `groups` | Nonempty object, required | Maps each native-resolution name `sd<N>` to the channel-group object defined below. Object ordering has no semantic significance. |
 | `validity_channel` | Nonempty string, required | Name of a channel declared in exactly one group. At that channel's stored voxels, a value exactly equal to zero means invalid/no data; a nonzero value is the valid-data signal. This names an existing signal channel, not a separate mask. No default or hardcoded `grad_mag` fallback applies to v3. |
+| `blank_invalid` | Optional boolean; default `false` for a generic volume | Whether Fiber channels other than presence are zeroed where their stored presence is zero. Fiber inference writes `true` by default; Lasagna normals do not require channel blanking. For multi-option output, option-specific channels use that option's presence; shared auxiliary channels use the union of nonzero option presences. |
+| `width_encoding` | Optional string; required when a Fiber width channel is exported | `uint8-base-voxels` means full width rounded to the nearest integer (ties to even), clamped to `[0,255]`, in original base-volume voxels. `float32-input-voxels` retains unquantized full width in model-input voxels. Convert base width to tracer working voxels by dividing by `working_to_base_scale`; this runtime coordinate adapter is not another stored manifest field. |
 | `grad_mag_encode_scale` | Positive finite number; required when `grad_mag` is present | Encoding denominator for winding density; decoded value is `stored * grad_mag_factor / grad_mag_encode_scale`. Legacy default is `1000.0`. This is not a spatial scale factor. |
 | `grad_mag_factor` | Positive finite number; required when `grad_mag` is present | Multiplier applied when decoding gradient magnitude/winding density. Legacy default is `1.0`; an existing value such as `0.25` MUST be preserved, not replaced by the default. |
 | `crops` | Optional array of six-integer arrays; default `[]` | Recorded processing regions, each `[x, y, z, width, height, depth]` in base voxels. Origins are nonnegative and sizes positive. Regions are half-open, for example X covers `[x, x + width)`. Multiple regions may overlap. They record crop coverage, not a per-voxel validity mask or a guarantee that every chunk in a region exists. |
@@ -255,6 +259,10 @@ channels. Spatial chunk size and compressor choice are not fixed by v3.
 All channels in an array necessarily share its dtype; no conversion of channel
 encodings is implied. A writer must not silently quantize incompatible
 channel representations to pack them together.
+When optional float32 width or embedding channels share a group with encoded
+byte channels, the array uses lossless float32 promotion: byte-encoded channel
+values remain the exact integers `[0,255]`, while float channels retain their
+values. Normal/default Fiber outputs, including uint8 width, stay uint8.
 
 Each `sd<N>` group is an OME-NGFF multiscale image. Its metadata lists only
 the arrays actually provided, finest to coarsest. The root is a container;
@@ -322,26 +330,50 @@ Scalar and normal-aware pyramid reduction remain as currently implemented:
 in particular, encoded `nx`/`ny` MUST NOT be independently averaged as scalar
 bytes. Grouping them in a chunk does not change their joint decoding,
 sign-ambiguous interpolation, or normal-aware pyramid construction.
+When Fiber invalid-channel blanking is enabled, zero-presence inputs do not
+contribute normal moments or width/embedding means; they are no-data, not
+zero-width measurements. Scalar presence is still reduced normally, and
+non-presence outputs are blanked again where reduced presence is zero.
+
+## Writer defaults and compatibility options
+
+Both full-volume inference entrypoints default to `--output-format compact`.
+An explicitly requested `--output-format legacy` writes the old per-channel
+stores and `.lasagna.json`. Existing sidecar outputs retain legacy handling;
+new `.lasagna.json` output arguments are normalized to a `.zarr` store when
+compact format is selected. The inference manager chooses `.zarr` output
+paths for new runs and keeps existing run records unchanged.
+
+Fiber inference additionally defaults to `--blank-invalid` and
+`--width-uint8-base`. Their opt-outs are `--no-blank-invalid` and
+`--no-width-uint8-base`. Width is exported when the checkpoint has a width
+head. The stored width is multiplied by the model-input-to-base scale before
+rounding/clamping; it is not multiplied by the output downsampling factor.
+The on-demand benchmark uses inference settings `blank_invalid` and
+`width_uint8_base`, both defaulting to `true`, and records those choices in
+its cache identity so old predictions are not silently reused.
+
+On-demand accumulation already keeps all raw product channels and their
+shared blend weights in one chunk-local arena record. This remains the
+compound accumulation unit; no per-channel accumulators are introduced.
+Whole-volume mmap accumulator storage, addition order, and precision remain
+unchanged. Only publication combines finalized products into a packed chunk.
+
+The accelerated local reader shares the complete decoded payload between
+channel views; it neither re-decodes the same packed chunk once per channel
+nor writes split-channel cache files. Reference-only TTA and mixed-model
+views may use internal v2 sidecars with `packed_channel_view: true`, full
+physical channel lists, and canonical aliases; these are views over the
+embedded-v3 stores, not alternate authoritative dataset manifests.
 
 See the [OME-NGFF 0.4 specification](https://ngff.openmicroscopy.org/0.4/)
 for the underlying image, axis, and multiscale metadata conventions.
 
-## Later implementation plan (not part of this documentation change)
+## Remaining consumer work
 
-1. Add shared v3 manifest validation/serialization while retaining legacy
-   manifest loading; do not change the v1/v2 interpretation.
-2. Update writers to assemble products by native resolution, write full-channel
-   chunks, and embed the manifest at the root. Preserve values, scales, sparse
-   coverage, encodings, and existing pyramid math.
-3. Extend consumers, including the accelerated C++ sampler, to resolve a root
-   store into the manifest, array path, and channel index. Reuse the existing
-   decoding/interpolation implementations rather than duplicating them.
-4. Test round trips, legacy compatibility, declared `grad_mag` and `presence`
-   validity (including absent chunks, explicit zeros, and nonzero values),
-   rejection of missing/unknown validity-channel declarations, packed-channel decoding, normal
-   interpolation, metadata/shape agreement, and base-volume coordinate mapping.
-   Benchmark I/O and decoding on equivalent spatial requests before claiming
-   an acceleration.
-
-No writer default, loader, manager, Atlas publication behavior, or training
-setting is changed until that implementation is explicitly undertaken.
+Remote catalogue/Atlas ingestion, specialised fitting consumers, and
+manager Fiberlet input discovery must understand the embedded manifest and
+packed array paths before they can consume new stores. No existing public
+volume is migrated by this change. Use explicit legacy output for those
+workflows until their v3 support is implemented. No training setting is
+changed by the new inference format.

@@ -258,7 +258,8 @@ def build_fiber_command(
         raise FileNotFoundError(f"legacy Fiber config does not exist: {legacy_config}")
     context_file = run_dir / "provenance_context.json"
     atomic_json(context_file, provenance_context or {})
-    manifest = run_dir / "artifacts" / f"{run_dir.name}.lasagna.json"
+    legacy = _cli_option_value(extra_args, "--output-format") == "legacy"
+    manifest = run_dir / "artifacts" / (run_dir.name + (".lasagna.json" if legacy else ".zarr"))
     input_path = volume_cache_root(config, volume) / str(scale)
     command = [
         str(_runtime_python(config)), "-m", "vesuvius.neural_tracing.fiber_trace_3d.infer",
@@ -285,7 +286,8 @@ def build_lasagna_command(
         raise ValueError("scale must be a non-negative OME-Zarr group index")
     context_file = run_dir / "provenance_context.json"
     atomic_json(context_file, provenance_context or {})
-    manifest = run_dir / "artifacts" / f"{run_dir.name}.lasagna.json"
+    legacy = _cli_option_value(extra_args, "--output-format") == "legacy"
+    manifest = run_dir / "artifacts" / (run_dir.name + (".lasagna.json" if legacy else ".zarr"))
     input_path = volume_cache_root(config, volume) / str(scale)
     command = [
         str(_runtime_python(config)), "-m", "preprocess_cos_omezarr", "predict3d",

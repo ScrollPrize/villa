@@ -1340,6 +1340,14 @@ class OmeZarrOutputAdapter:
 	def update_metadata(self, products: Sequence[OutputProductSpec]) -> None:
 		_ = products
 
+	def write_products_chunk(self, items, *, chunk_origin_zyx):
+		if getattr(self, "blank_invalid", False):
+			from lasagna.compact_zarr import blank_fiber_channels
+			values = blank_fiber_channels({name: a for _, data in items for name, a in data.items()})
+			items = [(p, {c.name: values[c.name] for c in p.channels}) for p, _ in items]
+		for product, data in items:
+			self.write_product_chunk(product, chunk_origin_zyx=chunk_origin_zyx, data=data)
+
 
 def _format_eta(seconds: float) -> str:
 	seconds = max(0.0, float(seconds))
@@ -2833,6 +2841,7 @@ def _execute_flush_process_task(
 			np.maximum(denom, 1.0e-7, out=denom)
 			products = {product.name: product for product in task.products}
 			accumulators = dict(task.accumulators)
+			finalized = []
 			for name in task.dirty_products:
 				product = products[name]
 				raw = np.stack([
@@ -2850,12 +2859,14 @@ def _execute_flush_process_task(
 					}
 				else:
 					persisted = finalizer(product, raw)
-				output_adapter.write_product_chunk(
-					product, chunk_origin_zyx=task.origin,
-					data={channel.name: persisted[channel.name] for channel in product.channels},
-				)
+				finalized.append((product, {channel.name: persisted[channel.name] for channel in product.channels}))
 				written += 1
 				del raw, persisted
+			if hasattr(output_adapter, "write_products_chunk"):
+				output_adapter.write_products_chunk(finalized, chunk_origin_zyx=task.origin)
+			else:
+				for product, persisted in finalized:
+					output_adapter.write_product_chunk(product, chunk_origin_zyx=task.origin, data=persisted)
 		del denom
 	return task.batch_id, task.task_id, written, time.perf_counter() - started
 

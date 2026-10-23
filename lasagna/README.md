@@ -88,7 +88,7 @@ separate config argument is needed. Direct inference uses the same rule:
 ```bash
 python -m vesuvius.neural_tracing.fiber_trace_3d.infer \
   --input /path/to/volume.ome.zarr/1 \
-  --output /path/to/artifacts/fiber.lasagna.json \
+  --output /path/to/artifacts/fiber.zarr \
   --checkpoint /path/to/snapshots/best.pt
 ```
 
@@ -105,8 +105,19 @@ las_manager inference run lasagna/<run>/<checkpoint.pt> <volume> 1 -- --devices 
 ```
 
 The manager dispatches these to `preprocess_cos_omezarr predict3d`; both direct
-and managed Lasagna inference write portable provenance and remain compatible
-with the existing Atlas `lasagna` artifact type.
+and managed Lasagna inference write portable provenance.
+
+New Fiber and Lasagna outputs default to the [compact schema v3](docs/volume_schema_v3.md):
+one Zarr store, an embedded manifest, and resolution-based full-channel chunks.
+Existing sidecar outputs remain resumable. Fiber additionally defaults to
+blanking auxiliary channels at zero presence and rounding/clamping width to
+uint8 base-volume voxels; `--no-blank-invalid` and `--no-width-uint8-base`
+disable those changes independently.
+
+Atlas/catalogue publication and manager Fiberlet discovery still require
+legacy output until their v3 integration is available. For those workflows,
+append `-- --output-format legacy` to the manager command. Direct inference
+uses `--output-format legacy --output /path/to/fiber.lasagna.json`.
 
 Commands and subcommands accept unique prefixes, so `las_manager sn l` is the
 same as `las_manager snapshot ls`. Install path-aware Bash completion once with
