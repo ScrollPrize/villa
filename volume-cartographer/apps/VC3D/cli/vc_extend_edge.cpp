@@ -13,6 +13,7 @@
 
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -54,7 +55,8 @@ int main(int argc, char** argv)
         ("rounds", po::value<int>()->default_value(8), "rounds of growth")
         ("threads", po::value<int>()->default_value(0), "worker threads for the walk (0: all cores)")
         ("overwrite", po::bool_switch(), "replace --output if it exists")
-        ("json", po::bool_switch(), "print the report as JSON");
+        ("json", po::bool_switch(), "print the report as JSON")
+        ("report", po::value<std::string>(), "also write the JSON report to this file");
 
     po::variables_map vm;
     try {
@@ -126,8 +128,8 @@ int main(int argc, char** argv)
         std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     const cv::Size after = surface->rawPointsPtr()->size();
 
-    if (vm["json"].as<bool>()) {
-        auto report = utils::Json::object();
+    auto report = utils::Json::object();
+    {
         report["input"] = input.string();
         report["output"] = output.string();
         report["normals_volume"] = vm["normals-volume"].as<std::string>();
@@ -155,6 +157,11 @@ int main(int argc, char** argv)
             steps.push_back(s);
         }
         report["steps"] = steps;
+    }
+    if (vm.count("report")) {
+        std::ofstream(vm["report"].as<std::string>()) << report.dump(2) << '\n';
+    }
+    if (vm["json"].as<bool>()) {
         std::cout << report.dump(2) << '\n';
     } else {
         for (const auto& step : result->steps) {
