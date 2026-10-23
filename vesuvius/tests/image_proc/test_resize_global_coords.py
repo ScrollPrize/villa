@@ -121,24 +121,30 @@ LINEAR_F32 = [
 
 # other=1 matters: with cv2 4.13 a local window over a 2-wide plane happens to
 # match the whole axis for some of these, while the 1-wide plane does not.
+# scale: the cv2 float32 discrepancy is relative to the input magnitude, so the
+# witnesses also run on [0, 1]-like and 16-bit-range data.
+@pytest.mark.parametrize("scale", [1 / 255, 1, 257], ids=["s1/255", "s1", "s257"])
 @pytest.mark.parametrize("other", [1, 2])
 @pytest.mark.parametrize("axis", [0, 1, 2])
 @pytest.mark.parametrize("case", LINEAR_F32, ids=[c[0] for c in LINEAR_F32])
-def test_linear_float32_witnesses(tmp_path, axis, case, other):
+def test_linear_float32_witnesses(tmp_path, axis, case, other, scale):
     _, n_in, n_out, o, idx, vals = case
     shape, target, chunks = one_axis(n_in, n_out, axis, other)
     line = np.zeros(n_in, np.float32)
-    line[idx] = vals
+    line[idx] = np.float32(vals) * np.float32(scale)
     src = np.broadcast_to(line.reshape([-1 if a == axis else 1 for a in range(3)]),
                           shape).copy()
     thin = chunked(tmp_path / "a", src, target, chunks, cv2.INTER_LINEAR)
     whole = chunked(tmp_path / "b", src, target, target, cv2.INTER_LINEAR)
     # Grid independence is exact.
     np.testing.assert_array_equal(thin, whole)
-    # Close to cv2 on the whole axis. cv2's float32 result itself depends on the
-    # plane width (other=1 vs 2): measured up to 2.75e-3 here (L10, other=1).
+    # Close to cv2 on the whole axis. cv2's float32 result depends on the plane
+    # width (other=1 vs 2) and its error scales with the input magnitude:
+    # measured up to ~1.7e-5 * max|input| here, so allow 2e-5 * max|input|
+    # plus a few float32 ulp of that magnitude.
     ref = R._resize_chunk_3d(src, target, cv2.INTER_LINEAR)
-    np.testing.assert_allclose(thin, ref, atol=4e-3, rtol=0)
+    amax = np.float32(np.abs(src).max())
+    np.testing.assert_allclose(thin, ref, atol=2e-5 * amax + 4 * np.spacing(amax), rtol=0)
 
 
 @pytest.mark.parametrize("axis", [0, 1, 2])

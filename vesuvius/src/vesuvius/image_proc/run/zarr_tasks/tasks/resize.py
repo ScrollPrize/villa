@@ -259,8 +259,11 @@ def _resize_chunk_worker(args: Tuple) -> Optional[Tuple[int, int, int]]:
     is independent of the chunk grid. cv2's per-axis sampling (source indices
     and weights, computed with the same whole-axis scale and float operations as
     cv2) is applied as explicit float64 taps in a fixed order. Nearest is
-    bit-identical to a whole-volume _resize_chunk_3d; the other modes are
-    within rounding of cv2's fixed-point maths. Only when every axis has a
+    bit-identical to a whole-volume _resize_chunk_3d; the other modes are not
+    bit-identical to cv2 at non-power-of-two ratios. Measured (not proven)
+    differences from whole-volume cv2: integer dtypes up to 2 grey levels;
+    float32 linear/area up to ~2e-5 * max|input|, cubic/lanczos up to
+    ~4e-5 * max|input|. Only when every axis has a
     power-of-two ratio (where cv2's coordinate maths is exact and therefore
     translation-invariant) and the mode is nearest/linear/area, cv2.resize is
     run on a ratio-aligned, halo-padded window, bit-identical to the whole
