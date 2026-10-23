@@ -67,9 +67,18 @@ def _edt_dilate_worker(
 
     z_start, z_end, y_start, y_end, x_start, x_end = chunk_bounds
 
-    # Read input chunk
+    # Read input chunk plus a halo of ceil(distance) voxels, so that foreground in a
+    # neighbouring chunk dilates across the boundary (and into chunks empty in the input).
     input_arr = zarr.open(input_path, mode="r")[resolution]
-    chunk_data = input_arr[z_start:z_end, y_start:y_end, x_start:x_end]
+    halo = int(np.ceil(distance))
+    lo = [max(0, s - halo) for s in (z_start, y_start, x_start)]
+    hi = [min(n, e + halo) for n, e in zip(input_arr.shape, (z_end, y_end, x_end))]
+    chunk_data = input_arr[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]]
+    inner = (
+        slice(z_start - lo[0], z_end - lo[0]),
+        slice(y_start - lo[1], y_end - lo[1]),
+        slice(x_start - lo[2], x_end - lo[2]),
+    )
 
     # Create binary mask of nonzero values
     mask = chunk_data != 0
@@ -92,7 +101,7 @@ def _edt_dilate_worker(
         distances = scipy_edt(inverted)
 
     # Threshold to create dilated mask
-    dilated = (distances <= distance).astype(np.uint8)
+    dilated = (distances[inner] <= distance).astype(np.uint8)
 
     # Write to output
     output_arr = zarr.open(output_path, mode="r+")[resolution]
