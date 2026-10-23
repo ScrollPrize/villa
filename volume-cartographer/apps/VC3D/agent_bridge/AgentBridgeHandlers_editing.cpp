@@ -801,7 +801,13 @@ QJsonObject AgentBridgeServer::handleManualAddExtend(const QJsonValue& params)
         span = edgeSpan;
     }
     QString error;
-    if (!mod->extendManualAdd(side, p.value("cells").toInt(16), span, &error)) {
+    const int cells = p.value("cells").toInt(16);
+    // applyPending walks on: a pending extension of the same side is applied
+    // and the next one starts from the new edge once its save has finished.
+    const bool started = p.value("applyPending").toBool(false) && !span
+        ? mod->extendOrContinueManualAdd(side, cells, &error)
+        : mod->extendManualAdd(side, cells, span, &error);
+    if (!started) {
         QJsonObject data;
         data["detail"] = error;
         throw AgentBridgeError{-32005, "Edge extension did not start", data};
@@ -809,6 +815,7 @@ QJsonObject AgentBridgeServer::handleManualAddExtend(const QJsonValue& params)
     QJsonObject result;
     result["active"] = mod->manualAddMode();
     result["side"] = sideStr;
+    result["queued"] = mod->manualAddContinuationQueued();
     return result;
 }
 

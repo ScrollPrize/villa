@@ -62,6 +62,7 @@ async def vc3d_manual_add_extend(
     cells: int = 16,
     first: int | None = None,
     last: int | None = None,
+    applyPending: bool = False,
 ) -> dict[str, Any]:
     """Continue the active segment past one edge by `cells` vertices.
 
@@ -71,13 +72,18 @@ async def vc3d_manual_add_extend(
     the grid when there is no room. Refine the preview with
     vc3d_manual_add_add_constraint or vc3d_shift_click on a plane viewer, then
     vc3d_manual_add_finish to apply (apply=false removes the strip and any
-    grid growth). Returns {"active": bool, "side": str}.
+    grid growth). With applyPending=true and an extension of the same side
+    pending, that one is applied and saved first and the next starts from the
+    new edge, keeping its first/last; "queued" is true while it waits for the
+    save. Returns {"active": bool, "side": str, "queued": bool}.
     """
     params: dict[str, Any] = {"side": side, "cells": cells}
     if first is not None:
         params["first"] = first
     if last is not None:
         params["last"] = last
+    if applyPending:
+        params["applyPending"] = True
     return await _call("segmentation.manual_add.extend", params)
 
 

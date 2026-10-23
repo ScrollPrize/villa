@@ -2751,6 +2751,10 @@
       },
       "params": {
         "properties": {
+          "applyPending": {
+            "default": false,
+            "type": "boolean"
+          },
           "cells": {
             "default": 16,
             "maximum": 4096,

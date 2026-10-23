@@ -205,6 +205,7 @@ void AgentBridgeServer::registerEditingHandlers()
                 boundedInteger(QStringLiteral("cells"), 16, 1, 4096),
                 Params::optionalInteger(QStringLiteral("first")),
                 Params::optionalInteger(QStringLiteral("last")),
+                Params::optionalBoolean(QStringLiteral("applyPending"), false),
             },
             .errors = {-32602, -32000, -32005, -32007, -32008},
             .mcp = Mcp::exact(QStringLiteral("vc3d_manual_add_extend")),
