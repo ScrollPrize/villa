@@ -16,6 +16,7 @@ ALL = [cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA,
 
 
 def chunked(tmp, src, target, chunks, interp):
+    tmp.mkdir(parents=True, exist_ok=True)
     pin, pout = str(tmp / "i.zarr"), str(tmp / "o.zarr")
     zarr.open_group(pin, mode="w").zeros(name="0", shape=src.shape, chunks=src.shape,
                                          dtype=src.dtype)[...] = src
@@ -105,3 +106,42 @@ def test_area_taps_sweep_vs_cv2(rows_out):
             idx, w = R._axis_taps(0, n_out, n_in, n_out, cv2.INTER_AREA, true_area)
             got = (row[0][idx].astype(np.float64) * w).sum(axis=1)
             np.testing.assert_allclose(got, ref, atol=1e-4, rtol=0)
+
+
+# float32 INTER_LINEAR witnesses: a ratio-aligned local cv2 window differs from
+# the whole-axis cv2 result by ~1e-3, so these must not use a local cv2 window.
+# (name, n_in, n_out, output index, nonzero input indices, values)
+LINEAR_F32 = [
+    ("L07", 285, 280, 253, [257, 258], [-59, 53]),
+    ("L08", 260, 255, 254, [258, 259], [-101, 1]),
+    ("L09", 300, 138, 136, [296, 297], [253, 0]),
+    ("L10", 264, 102, 101, [262, 263], [0, 255]),
+]
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2])
+@pytest.mark.parametrize("case", LINEAR_F32, ids=[c[0] for c in LINEAR_F32])
+def test_linear_float32_witnesses(tmp_path, axis, case):
+    _, n_in, n_out, o, idx, vals = case
+    shape, target, chunks = one_axis(n_in, n_out, axis)
+    line = np.zeros(n_in, np.float32)
+    line[idx] = vals
+    src = np.broadcast_to(line.reshape([-1 if a == axis else 1 for a in range(3)]),
+                          shape).copy()
+    thin = chunked(tmp_path / "a", src, target, chunks, cv2.INTER_LINEAR)
+    whole = chunked(tmp_path / "b", src, target, target, cv2.INTER_LINEAR)
+    # Grid independence is exact.
+    np.testing.assert_array_equal(thin, whole)
+    # Close to cv2 on the whole axis (cv2 uses float32 coefficients).
+    ref = R._resize_chunk_3d(src, target, cv2.INTER_LINEAR)
+    np.testing.assert_allclose(thin, ref, atol=1e-3, rtol=0)
+
+
+@pytest.mark.parametrize("axis", [0, 1, 2])
+def test_linear_float32_92_300_1_thick(tmp_path, axis):
+    """92 -> 300 (reduced 23:75) float32 linear was chunk-dependent by ~1.5e-5."""
+    shape, target, chunks = one_axis(92, 300, axis)
+    src = (np.random.default_rng(7).random(shape) * 510 - 255).astype(np.float32)
+    thin = chunked(tmp_path / "a", src, target, chunks, cv2.INTER_LINEAR)
+    whole = chunked(tmp_path / "b", src, target, target, cv2.INTER_LINEAR)
+    np.testing.assert_array_equal(thin, whole)
