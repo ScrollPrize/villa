@@ -161,6 +161,8 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::manualAddApplyExitRequested);
     connect(_manualAddPanel, &SegmentationManualAddPanel::cancelRequested,
             this, &SegmentationWidget::manualAddCancelRequested);
+    connect(_manualAddPanel, &SegmentationManualAddPanel::extendRequested,
+            this, &SegmentationWidget::manualAddExtendRequested);
 
     // Forward corrections panel signals
     connect(_correctionsPanel, &SegmentationCorrectionsPanel::correctionsCreateRequested,

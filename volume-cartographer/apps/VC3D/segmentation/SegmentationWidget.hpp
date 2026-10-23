@@ -249,6 +249,7 @@ signals:
     void manualAddRecomputeRequested();
     void manualAddApplyExitRequested();
     void manualAddCancelRequested();
+    void manualAddExtendRequested(int side, int cells);
 
 private:
     void buildUi();

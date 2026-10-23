@@ -547,6 +547,10 @@ void SegmentationModule::bindWidgetSignals()
             this, [this]() { finishManualAdd(true); });
     connect(_widget, &SegmentationWidget::manualAddCancelRequested,
             this, [this]() { finishManualAdd(false); });
+    connect(_widget, &SegmentationWidget::manualAddExtendRequested,
+            this, [this](int side, int cells) {
+                extendManualAdd(static_cast<ManualAddTool::ExtendSide>(side), cells);
+            });
 }
 
 void SegmentationModule::bindViewerSignals(VolumeViewerBase* viewer)

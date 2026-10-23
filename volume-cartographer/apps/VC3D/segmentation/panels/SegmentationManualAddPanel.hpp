@@ -32,6 +32,7 @@ signals:
     void recomputeRequested();
     void applyExitRequested();
     void cancelRequested();
+    void extendRequested(int side, int cells);
 
 private:
     void writeSetting(const QString& key, const QVariant& value);
@@ -45,6 +46,7 @@ private:
     QDoubleSpinBox* _spinRegularization{nullptr};
     QSpinBox* _spinSampleCap{nullptr};
     QSpinBox* _spinPreviewThrottle{nullptr};
+    QSpinBox* _spinExtendCells{nullptr};
     QSpinBox* _spinTintOpacity{nullptr};
     QDoubleSpinBox* _spinPlaneConstraintRadius{nullptr};
     QDoubleSpinBox* _spinPlaneConstraintReplacementRadius{nullptr};
@@ -56,4 +58,8 @@ private:
     QPushButton* _btnRecompute{nullptr};
     QPushButton* _btnApplyExit{nullptr};
     QPushButton* _btnCancel{nullptr};
+    QPushButton* _btnExtendUp{nullptr};
+    QPushButton* _btnExtendDown{nullptr};
+    QPushButton* _btnExtendLeft{nullptr};
+    QPushButton* _btnExtendRight{nullptr};
 };
