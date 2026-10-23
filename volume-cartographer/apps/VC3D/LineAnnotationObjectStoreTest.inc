@@ -1,14 +1,10 @@
 #include <iostream>
 #include <QApplication>
 #include <QElapsedTimer>
-#include <QMainWindow>
-#include <QListWidget>
-#include <QSpinBox>
 #include <QThread>
 #include "FiberCollectionController.hpp"
 #include "SpiralWorkspace.hpp"
 #include "SpiralServiceManager.hpp"
-#include "overlays/FiberOverlayCoordinates.hpp"
 // Built only with VC_TESTING. Runs the actual controller publication path.
 int runObjectStoreControllerTests()
 {
@@ -20,12 +16,11 @@ int runObjectStoreControllerTests()
         if (const char* source = std::getenv("VC3D_OBJECT_STORE_READ_ONLY_BENCH")) {
             CState state;
             Controller controller(&state,nullptr,nullptr,nullptr);
-            QMainWindow window;
-            FiberCollectionController collection(&state,nullptr,&window,&controller);
-            auto* list = window.findChild<QListWidget*>("fiberCollectionList");
-            auto* limit = window.findChild<QSpinBox*>("fiberCollectionMaxDisplayed");
-            require(list && limit, "fiber catalog controls exist");
-            require(limit->value() == 5000, "clean settings default to 5000 displayed fibers");
+            FiberCollectionController collection(&state,nullptr,nullptr,&controller);
+            require(collection.options().maxDisplayed == 5000, "clean settings default to 5000 displayed fibers");
+            std::vector<FiberCollectionController::CatalogRow> page;
+            QObject::connect(&collection, &FiberCollectionController::catalogChanged,
+                [&](const std::vector<FiberCollectionController::CatalogRow>& rows, bool) { page = rows; });
             int heartbeats = 0;
             QTimer heartbeat; heartbeat.setInterval(10);
             QObject::connect(&heartbeat, &QTimer::timeout, [&] { ++heartbeats; });
@@ -33,33 +28,22 @@ int runObjectStoreControllerTests()
             QElapsedTimer timer; timer.start();
             state.attachObjectStore(QString::fromUtf8(source), {}, true);
             const auto attachedMs = timer.elapsed();
-            require(controller._fibers.empty(), "attachment loads no editor geometry");
-            while (list->count() == 0 && timer.elapsed() < 60000) {
+            while (page.empty() && timer.elapsed() < 60000) {
                 QApplication::processEvents(); QThread::msleep(1);
             }
-            require(list->count() > 0 && list->count() <= 200, "first catalog page is bounded");
-            require(controller._fibers.empty(), "catalog page loads no editor geometry");
+            require(!page.empty() && page.size() <= 200, "first catalog page is bounded");
             require(heartbeats > 0, "UI heartbeat runs while catalog loads");
             const auto pageMs = timer.elapsed();
-            const auto id = list->item(0)->data(Qt::UserRole).toULongLong();
-            controller.ensureStoreFiber(id);
-            require(!controller._fibers.empty() && !controller._fiberCatalogComplete,
-                    "selection loads resident editor fibers without loading the full catalog");
-            const auto selected = std::find_if(controller._fibers.begin(),controller._fibers.end(),
-                [&](const auto& fiber) { return fiber.id == id; });
-            require(selected != controller._fibers.end() && selected->editorError.empty(), "selected controls decode");
+            const auto id = controller.fiberIdForUuid(page.front().record.uuid);
+            auto selected = controller.readStoredFiber(id);
+            require(selected && selected->editorError.empty(), "selected controls decode from the store");
             require(!selected->linePointsLoaded, "selection controls do not eagerly decode sampled line");
             controller.ensureFiberLines(*selected);
-            const auto residentCount = controller._fibers.size();
-            controller.ensureAllFiberLines();
-            require(controller._fibers.size() == residentCount && !controller._fiberCatalogComplete,
-                    "editor helpers do not promote resident reads to a full-store load");
             require(selected->linePointsLoaded, "selected line decodes on demand");
             std::cout << "read-only attach_ms=" << attachedMs << " first_page_ms=" << pageMs
-                      << " selected_ms=" << timer.elapsed()-pageMs << " cached_editors=" << controller._fibers.size()
-                      << " heartbeats=" << heartbeats << std::endl;
+                      << " selected_ms=" << timer.elapsed()-pageMs << " heartbeats=" << heartbeats << std::endl;
             state.detachObjectStore();
-            require(controller._fibers.empty() && controller._registeredStoreFibers.empty(), "detach clears resident identities");
+            require(controller.fiberUuidForId(id).empty() && !controller.readStoredFiber(id), "detach clears runtime identities");
             return 0;
         }
         {
@@ -94,20 +78,19 @@ int runObjectStoreControllerTests()
         controller.commitFiberStoreAction(batch);
         a = batch[0].fiber; b = batch[1].fiber;
         const auto first = a.storePin;
-        controller.loadFibersForCurrentPackage();
-        require(controller._fibers.size()==2,"load both fibers with same name");
-        require(std::none_of(controller._fibers.begin(), controller._fibers.end(), [](const auto& fiber) { return fiber.linePointsLoaded; }), "catalog does not materialize dense lines");
-        (void)controller.fiberSummaries(); (void)controller.fiberSnapshots(false);
-        require(std::none_of(controller._fibers.begin(), controller._fibers.end(), [](const auto& fiber) { return fiber.linePointsLoaded; }), "catalog and control overlays keep line geometry lazy");
-        controller.loadFiberDetails(controller._fibers[0].id);
-        require(controller._fibers[0].linePointsLoaded && !controller._fibers[1].linePointsLoaded, "expanding a fiber loads only its dense geometry");
-        const auto details = controller.fiberSummaries();
-        const auto detail = std::find_if(details.begin(),details.end(),[&](const auto& summary) { return summary.id == controller._fibers[0].id; });
-        require(detail != details.end() && detail->spans.size() == 2 && detail->annotatedLengthVx == 20.0, "on-demand spans retain exact lengths and control ranges");
-        require(controller._fibers[0].id != controller._fibers[1].id,"UUID runtime identity");
+        {
+            const auto all = controller.readStoredFibers(std::nullopt);
+            require(all.size()==2,"store lists both fibers with same name");
+            require(std::none_of(all.begin(), all.end(), [](const auto& fiber) { return fiber.linePointsLoaded; }), "editor reads do not materialize dense lines");
+            require(all[0].id != all[1].id,"UUID runtime identity");
+            const auto detail = controller.fiberSummary(a.id);
+            require(detail && detail->spans.size() == 2 && detail->annotatedLengthVx == 20.0, "store summary retains exact lengths and control ranges");
+        }
+        // Every read resolves the store's current head; nothing is retained between reads.
         auto resolve = [&](const std::string& uuid) {
-            const auto it = std::find_if(controller._fibers.begin(),controller._fibers.end(),[&](const auto& f) { return f.uuid==uuid; });
-            if (it == controller._fibers.end()) throw std::runtime_error("fiber missing"); controller.ensureFiberLines(*it); return *it;
+            auto fibers = controller.readStoredFibers(std::vector<std::string>{uuid}, true);
+            if (fibers.empty()) throw std::runtime_error("fiber missing");
+            return fibers.front();
         };
         a=resolve(a.uuid);b=resolve(b.uuid);
         Controller::FiberBranchRef link;
@@ -117,10 +100,24 @@ int runObjectStoreControllerTests()
         a.branches.push_back(link);
         std::swap(link.controlPointPosition,link.branchControlPointPosition); link.branchFiberId=a.id;link.branchFileName=a.fileName;
         b.branches.push_back(link);
+        // The panel's catalog refreshes from the store's own commit events.
+        FiberCollectionController collection(&state, nullptr, nullptr, &controller);
+        std::vector<FiberCollectionController::CatalogRow> catalog;
+        QObject::connect(&collection, &FiberCollectionController::catalogChanged,
+            [&](const std::vector<FiberCollectionController::CatalogRow>& rows, bool) { catalog = rows; });
         batch={controller.makeFiberSaveSnapshot(a),controller.makeFiberSaveSnapshot(b)};
         controller.commitFiberStoreAction(batch);
-        controller.loadFibersForCurrentPackage();a=resolve(a.uuid);b=resolve(b.uuid);
+        a=resolve(a.uuid);b=resolve(b.uuid);
         require(a.branches.size()==1 && b.branches.size()==1,"shared branch roundtrip");
+        {
+            QElapsedTimer timer; timer.start();
+            auto linked = [&] { return catalog.size() == 2 && std::all_of(catalog.begin(), catalog.end(),
+                [](const auto& row) { return row.links == 1 && row.componentSize == 2; }); };
+            while (!linked() && timer.elapsed() < 10000) { QApplication::processEvents(); QThread::msleep(1); }
+            require(linked(), "catalog rows come from the store with shared links and components");
+            require(std::none_of(catalog.begin(), catalog.end(), [](const auto& row) { return row.toVolume.has_value(); }),
+                    "fibers without a binding list without a volume length");
+        }
         const auto transferPaths = controller.fiberTransportPaths({a.id});
         require(transferPaths.size() == 2, "transport includes both linked endpoints");
         auto readDocument = [](const auto& file) { std::ifstream input(file); return nlohmann::json::parse(input); };
@@ -132,12 +129,8 @@ int runObjectStoreControllerTests()
         {
             QTemporaryDir transfers;
             const auto bundle = fs::path(transfers.path().toStdString()) / "network.json";
-            controller.loadFibersForCurrentPackage(std::vector<std::string>{});
-            require(controller._fibers.empty(), "export starts with no resident editor geometry");
             QString error; int exported = 0;
             require(controller.exportFibersToPath(bundle, &error, &exported) && exported == 2, "export linked same-name fibers");
-            require(controller._fibers.empty(), "export does not populate editor geometry");
-            controller.loadFibersForCurrentPackage();
             const auto target = fs::path(transfers.path().toStdString()) / "target.vcobj";
             { auto db = ObjectStore::create(target, options); }
             CState destination;
@@ -146,8 +139,9 @@ int runObjectStoreControllerTests()
             destination.attachObjectStore(QString::fromStdString(target.string()), "roundtrip-test");
             int count = 0;
             if (!imported.importFibersFromPath(bundle, &error, &count)) throw std::runtime_error(error.toStdString());
-            require(count == 2 && imported._fibers.size() == 2, "duplicate display names import by UUID");
-            for (const auto& fiber : imported._fibers) {
+            const auto importedFibers = imported.readStoredFibers(std::nullopt);
+            require(count == 2 && importedFibers.size() == 2, "duplicate display names import by UUID");
+            for (const auto& fiber : importedFibers) {
                 require(fiber.fileName == "same_name.json", "display name survives transfer");
                 require(fiber.branches.size() == 1, "shared branch survives transfer");
                 require(fiber.branches.front().edgeUuid == a.branches.front().edgeUuid, "edge UUID survives transfer");
@@ -166,7 +160,7 @@ int runObjectStoreControllerTests()
             auto* service = workspace.findChild<SpiralServiceManager*>();
             service->inputEditorRequested(QJsonObject{{"kind", "fiber"}, {"id", QString::fromStdString(a.uuid)}},
                 QString::fromStdString(transferPaths.at(a.uuid).string()));
-            require(imported._fibers.size() == 2 && service->inputDraftStatus().size() == 2,
+            require(imported.readStoredFibers(std::nullopt).size() == 2 && service->inputDraftStatus().size() == 2,
                     "service-only component is imported into attached store before editing");
             auto document = aWire;
             const auto uuid = vc::util::newUuid(); document["uuid"] = uuid;
@@ -178,8 +172,8 @@ int runObjectStoreControllerTests()
             QString error;
             const auto id = imported.importFiberJson(document, "optional-mode.json", &error);
             if (!id) throw std::runtime_error(error.toStdString());
-            auto found = std::find_if(imported._fibers.begin(), imported._fibers.end(), [&](const auto& fiber) { return fiber.id == id; });
-            require(found != imported._fibers.end() && !found->readOnly && found->controlPoints.size() == 3,
+            auto found = imported.readStoredFiber(id, true);
+            require(found && !found->readOnly && found->controlPoints.size() == 3,
                     "absent optional optimization mode keeps geometry editable");
             const auto bundle = fs::path(directory.path().toStdString()) / "export.json";
             require(imported.exportFibersToPath(bundle, &error), "shared UI exporter accepts absent mode");
@@ -222,16 +216,6 @@ int runObjectStoreControllerTests()
                 require(row.toObject()["applied_revision"].toInteger() == 0, "refresh does not auto-apply");
         }
         a = resolve(a.uuid); b = resolve(b.uuid);
-        struct OverlayChain { uint64_t id; std::vector<cv::Vec3f> points; std::vector<int> links; };
-        const std::vector<OverlayChain> chains{{1, {{8,16,24}}, {2}}, {2, {{8,16,24}}, {1}}, {3, {{8,16,24}}, {}}};
-        const auto visible = vc3d::boundFiberChains(chains, [](uint64_t id) -> std::optional<double> {
-            if (id == 1) return .25;
-            if (id == 2) return .5;
-            return {};
-        });
-        require(visible.size() == 2 && visible[0].points[0] == cv::Vec3f(2,4,6) &&
-                visible[1].points[0] == cv::Vec3f(4,8,12), "each overlay uses its own binding and excludes unbound fibers");
-        require(visible[0].id == 1 && visible[0].links == chains[0].links, "transformed hit-test identity and link markers remain aligned");
         require(controller.generatedBranchLinkMarkers(a.branches, 1.0).empty(), "unbound peers have no branch markers");
         {
             auto changedSession = std::make_shared<Controller::LineAnnotationSession>();
@@ -275,19 +259,19 @@ int runObjectStoreControllerTests()
         a.controlPoints[0][0]=-1; a.linePoints[0][0]=-1;
         batch={controller.makeFiberSaveSnapshot(a)};
         vc3d::line_annotation::canonicalizeFiberSaveSnapshots(batch);controller.commitFiberStoreAction(batch);
-        controller.loadFibersForCurrentPackage();a=resolve(a.uuid);
+        a=resolve(a.uuid);
         require(a.controlPoints.front()[0]==-1,"sparse move persists");
         require(a.branches.front().edgeUuid==edge,"branch identity survives move");
         const auto id=a.controlPoints[1].storeId;
         a.controlPoints.erase(a.controlPoints.begin()+1); a.linePoints.erase(a.linePoints.begin()+1);
         batch={controller.makeFiberSaveSnapshot(a)};
         controller.commitFiberStoreAction(batch);
-        controller.loadFibersForCurrentPackage();a=resolve(a.uuid);
+        a=resolve(a.uuid);
         require(a.controlPoints.size()==2 && a.controlPoints.back().storeId==2,"structural deletion preserves control identities");
         a.controlPoints.insert(a.controlPoints.begin()+1,vc3d::line_annotation::StoredControlPoint{cv::Vec3d{10,0,1}});
         a.linePoints.insert(a.linePoints.begin()+1,cv::Vec3d{10,0,1});
         batch={controller.makeFiberSaveSnapshot(a)};controller.commitFiberStoreAction(batch);
-        controller.loadFibersForCurrentPackage();a=resolve(a.uuid);
+        a=resolve(a.uuid);
         require(a.controlPoints[1].storeId!=id,"deleted point identity is not reused");
         a.tags={"reviewed"}; batch={controller.makeFiberSaveSnapshot(a)};controller.commitFiberStoreAction(batch);
         a=batch.front().fiber;
@@ -295,11 +279,11 @@ int runObjectStoreControllerTests()
         controller.commitFibers({&a});
         batch={controller.makeFiberSaveSnapshot(a)};
         const auto stale=batch;
-        controller.loadFibersForCurrentPackage();a=resolve(a.uuid);
+        a=resolve(a.uuid);
         { auto db=ObjectStore::open(path,options);auto txn=db.write({{a.uuid,a.storePin->objectRevision}});db.setMeta(txn,a.uuid,"external","true");txn.commit(); }
         bool conflict=false;try { auto old=stale;controller.commitFiberStoreAction(old); } catch(...) { conflict=true; }
         require(conflict,"stale controller edits reject");
-        controller.loadFibersForCurrentPackage();a=resolve(a.uuid);
+        a=resolve(a.uuid);
         auto outcome=controller.deleteFibers({a.id});require(outcome.deletedIds.size()==1,"retire through controller");
         require(retiredNotifications == std::vector<std::string>{a.uuid}, "retirement publishes object UUID");
         {
@@ -320,9 +304,7 @@ int runObjectStoreControllerTests()
             std::vector<Controller::FiberSaveSnapshot> seeds{
                 controller.makeFiberSaveSnapshot(firstSeed), controller.makeFiberSaveSnapshot(secondSeed)};
             controller.commitFiberStoreAction(seeds);
-            controller.loadFibersForCurrentPackage();
             controller.reoptimizeMergedFibers({secondSeed.id});
-            controller.loadFibersForCurrentPackage();
             require(resolve(firstSeed.uuid).tags == firstSeed.tags, "same-name non-target keeps reoptimization tag");
             require(resolve(secondSeed.uuid).tags.empty(), "reoptimization selects exact runtime identity");
         }
@@ -336,7 +318,7 @@ int runObjectStoreControllerTests()
         const auto frame=nlohmann::json{{"volume_uuid",vc::util::newUuid()},{"scale_factor",4.0}};
         batch.front().fiber.coordinateIdentity["coordinates"]=frame;
         controller.commitFiberStoreAction(batch);parent=batch.front().fiber;
-        controller.loadFibersForCurrentPackage();parent=resolve(parent.uuid);
+        parent=resolve(parent.uuid);
         require(transferJson(parent).at("coordinates") == frame, "current transfer format preserves explicit coordinate identity");
         require(transferJson(parent).at("version") == 4, "current transfer format is independent of source ingestion version");
         const auto identity=[&](const char* name) {la::NewFiberIdentity result;result.id=controller.nextFiberId();result.username="test";result.startedAt="20260101";result.sequence=result.id;result.fileName=name;return result;};
@@ -348,7 +330,6 @@ int runObjectStoreControllerTests()
         auto splitResult=controller.commitStructuralEdit(std::move(splitRequest),&committed);
         if(!splitResult.ok) throw std::runtime_error("split: "+splitResult.error);
         require(committed,"split committed");
-        controller.loadFibersForCurrentPackage();
         auto prefix=resolve(split->prefix.uuid),suffix=resolve(split->suffix.uuid);
         require(prefix.controlPoints.front().storeId==parent.controlPoints.front().storeId,"split retains control identity");
         require(prefix.branches.size()==1 && suffix.branches.size()==1,"split shared branch persists");
@@ -358,7 +339,7 @@ int runObjectStoreControllerTests()
         Controller::StructuralEditRequest mergeRequest;mergeRequest.verb="merge";mergeRequest.newFibers={merge->merged};mergeRequest.originals={prefix,suffix};
         auto mergeResult=controller.commitStructuralEdit(std::move(mergeRequest),&committed);
         if(!mergeResult.ok) throw std::runtime_error("merge: "+mergeResult.error);
-        controller.loadFibersForCurrentPackage();const auto merged=resolve(merge->merged.uuid);
+        const auto merged=resolve(merge->merged.uuid);
         require(merged.controlPoints.size()==parent.controlPoints.size(),"merge persists controls");
         {
             auto live=std::make_shared<Controller::LineAnnotationSession>();
@@ -395,7 +376,8 @@ int runObjectStoreControllerTests()
         }
         require(state.objectStoreSession()->attachment().has_value(),"secondary destruction keeps main attachment");
         state.detachObjectStore();
-        require(controller._fibers.empty(),"detach clears views");
+        require(controller.readStoredFibers(std::nullopt).empty() && controller.fiberUuidForId(merged.id).empty(),
+                "detach leaves nothing to read and no identities");
         {
             // Store-valid control-only geometry must not empty the editor catalog.
             auto db = ObjectStore::open(path, options);
@@ -408,24 +390,13 @@ int runObjectStoreControllerTests()
             ObjectRecord missing; missing.uuid = vc::util::newUuid(); missing.kind = "fiber"; missing.name = "geometry-pending";
             { auto pending = db.write({{missing.uuid,{}}}); db.upsertObject(pending,missing); pending.commit(); }
             state.attachObjectStore(QString::fromStdString(path.string()), {}, true);
-            require(controller._fibers.empty(), "read-only attachment defers controls");
-            auto registerObject = [&](const std::string& uuid) {
-                auto read = db.read();
-                const auto revision = db.currentObjectRevision(read, uuid);
-                const auto attachment = *state.objectStoreSession()->attachment();
-                return controller.registerStoreFiber({attachment, {attachment.storeUuid, uuid}, revision->uuid, revision->geometryRevision});
-            };
-            const auto missingId = registerObject(missing.uuid);
-            const auto controlsId = registerObject(object.uuid);
-            require(controller._fibers.empty(), "registering catalog identities does not load controls");
-            controller.ensureStoreFiber(missingId);
-            controller.ensureStoreFiber(controlsId);
-            const auto unavailable = std::find_if(controller._fibers.begin(),controller._fibers.end(),[&](const auto& fiber) { return fiber.uuid == missing.uuid; });
-            require(unavailable != controller._fibers.end() && !unavailable->editorError.empty(), "unavailable geometry stays in catalog without blocking other fibers");
-            require(controller._fibers.size() >= 2, "control-only record preserves the full catalog");
+            const auto everything = controller.readStoredFibers(std::nullopt);
+            const auto unavailable = std::find_if(everything.begin(),everything.end(),[&](const auto& fiber) { return fiber.uuid == missing.uuid; });
+            require(unavailable != everything.end() && !unavailable->editorError.empty(), "unavailable geometry stays listed without blocking other fibers");
+            require(everything.size() >= 2, "control-only record preserves the full catalog");
             const auto controlsOnly = resolve(object.uuid);
             require(controlsOnly.controlPoints.size() == 2 && controlsOnly.linePoints.empty(), "control-only geometry preserved without synthesizing lines");
-            require(controller.fiberSummaries().size() == controller._fibers.size(), "read-only store fibers remain listed");
+            require(controller.fiberSummaries(std::nullopt).size() == everything.size(), "read-only store fibers remain listed");
             QTemporaryDir transferDir;
             const auto transferPath = fs::path(transferDir.path().toStdString()) / "controls.json";
             const auto exportedControls = transferJson(controlsOnly);
@@ -441,8 +412,9 @@ int runObjectStoreControllerTests()
             if (!imported.importFibersFromPath(transferPath, &importError, &importedCount))
                 throw std::runtime_error(importError.toStdString());
             require(importedCount == 1, "control-only transfer imports");
-            imported.ensureAllFiberLines();
-            require(imported._fibers.front().controlPoints.size() == 2 && imported._fibers.front().linePoints.empty(),
+            const auto importedControls = imported.readStoredFibers(std::nullopt, true);
+            require(importedControls.size() == 1 && importedControls.front().controlPoints.size() == 2 &&
+                    importedControls.front().linePoints.empty(),
                     "control-only transfer preserves geometry without synthesizing a line");
             auto pending = std::vector<Controller::FiberSaveSnapshot>{controller.makeFiberSaveSnapshot(controlsOnly)};
             bool rejected = false; try { controller.commitFiberStoreAction(pending); } catch (...) { rejected = true; }
@@ -453,10 +425,11 @@ int runObjectStoreControllerTests()
             state.detachObjectStore();
         }
         if(const char* smoke=std::getenv("VC3D_OBJECT_STORE_SMOKE_DB")) {
-            state.attachObjectStore(QString::fromUtf8(smoke),"vc3d-real-smoke");controller.loadFibersForCurrentPackage();
-            require(!controller._fibers.empty(),"real database catalog loads");
-            const size_t count=controller._fibers.size();
-            auto fiber=resolve(controller._fibers.front().uuid);
+            state.attachObjectStore(QString::fromUtf8(smoke),"vc3d-real-smoke");
+            const auto everything=controller.readStoredFibers(std::nullopt);
+            require(!everything.empty(),"real database catalog reads");
+            const size_t count=everything.size();
+            auto fiber=resolve(everything.front().uuid);
             if(const char* ct=std::getenv("VC3D_OBJECT_STORE_SMOKE_CT")) {
                 state.setCurrentVolume(Volume::New(ct));
                 require(!controller.fiberCoordinateScale(fiber.id,false),"unbound real fiber requires explicit assignment");
@@ -479,22 +452,20 @@ int runObjectStoreControllerTests()
                 require(resolve(fiber.uuid).linePoints == fiber.linePoints, "display transform does not change stored geometry");
                 require(!fiber.branches.empty(), "real fixture has a linked peer");
                 const auto branch = fiber.branches.front();
-                auto peer = std::find_if(controller._fibers.begin(), controller._fibers.end(), [&](const auto& entry) { return entry.id == branch.branchFiberId; });
-                require(peer != controller._fibers.end(), "linked peer is present");
-                const auto peerFrame = peer->coordinateIdentity;
-                peer->coordinateIdentity = coordinateBindingForVolume(*state.currentVolume(), 2.0);
+                auto peer = controller.readStoredFiber(branch.branchFiberId, true);
+                require(peer.has_value(), "linked peer is present");
+                const auto peerScale = controller.fiberCoordinateScaleForVolume(peer->id, state.currentVolume());
+                require(peerScale.has_value(), "linked peer is bound to the CT");
                 const auto markers = controller.generatedBranchLinkMarkers({branch}, .25);
                 require(markers.size() == 1 && markers[0].localControlPoint == toVec3f(branch.controlPointPosition) * .25f &&
-                    markers[0].linkedControlPoint == toVec3f(branch.branchControlPointPosition) * .5f,
+                    markers[0].linkedControlPoint == toVec3f(branch.branchControlPointPosition) * float(*peerScale),
                     "linked markers use both coordinate frames");
                 Controller::LineAnnotationSession preview;
                 preview.branches = {branch}; preview.fiberBaseToVolumeScale = .25; preview.showLinkedLineOverlays = true;
-                controller.ensureFiberLines(*peer);
                 const auto native = la::linePointsBetweenOuterControlPoints(peer->linePoints, la::storedControlPointPositions(peer->controlPoints));
                 const auto overlays = controller.generatedBranchLinePointsForSession(preview);
-                require(overlays.size() == 1 && overlays.front().front() == toVec3f(native.front()) * .5f,
+                require(overlays.size() == 1 && overlays.front().front() == toVec3f(native.front()) * float(*peerScale),
                     "linked polyline uses its own frame");
-                peer->coordinateIdentity = peerFrame;
                 const auto point=fiber.controlPoints.front()*(*factor);
                 Array3D<uint8_t> crop({2,2,2});
                 require(state.currentVolume()->readZYX(crop,{int(point[2]),int(point[1]),int(point[0])}),"read real CT at scale 2");
@@ -503,8 +474,8 @@ int runObjectStoreControllerTests()
             const auto originalPin=fiber.storePin;
             fiber.tags.push_back("vc3d_smoke");
             controller.commitFibers({&fiber});
-            state.detachObjectStore();state.attachObjectStore(QString::fromUtf8(smoke),"vc3d-real-smoke");controller.loadFibersForCurrentPackage();
-            require(controller._fibers.size()==count,"real database reopens");
+            state.detachObjectStore();state.attachObjectStore(QString::fromUtf8(smoke),"vc3d-real-smoke");
+            require(controller.readStoredFibers(std::nullopt).size()==count,"real database reopens");
             const auto restored=resolve(fiber.uuid);
             require(std::find(restored.tags.begin(),restored.tags.end(),"vc3d_smoke")!=restored.tags.end(),"real database edit persists");
             require(restored.storePin->objectRevision!=originalPin->objectRevision,"real database revision advances");
@@ -521,7 +492,6 @@ int runObjectStoreControllerTests()
             }});
             const auto realSplitResult=controller.commitStructuralEdit(std::move(realRequest),&committed);
             if(!realSplitResult.ok) throw std::runtime_error("real split: "+realSplitResult.error);
-            controller.loadFibersForCurrentPackage();
             auto realPrefix=resolve(realSplit->prefix.uuid),realSuffix=resolve(realSplit->suffix.uuid);
             auto realMerge=la::planFiberMerge(realPrefix,int(realPrefix.controlPoints.size()-1),realSuffix,0,
                 restored.optimizationMode,identity("real-merged.json"),&error);
@@ -535,7 +505,7 @@ int runObjectStoreControllerTests()
             }});
             const auto realMergeResult=controller.commitStructuralEdit(std::move(realRequest),&committed);
             if(!realMergeResult.ok) throw std::runtime_error("real merge: "+realMergeResult.error);
-            state.detachObjectStore();state.attachObjectStore(QString::fromUtf8(smoke),"vc3d-real-smoke");controller.loadFibersForCurrentPackage();
+            state.detachObjectStore();state.attachObjectStore(QString::fromUtf8(smoke),"vc3d-real-smoke");
             const auto roundtrip=resolve(realMerge->merged.uuid);
             require(roundtrip.controlPoints.size()==restored.controlPoints.size(),"real split/merge control count");
             require(roundtrip.linePoints==realMerge->merged.linePoints,"real split/merge preserves planner numerical geometry");

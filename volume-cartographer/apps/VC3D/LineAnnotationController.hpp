@@ -93,7 +93,7 @@ public:
     // and control points. Snapshots are cached per fiber and rebuilt only
     // when the fiber's geometry actually changed (stored generation, or the
     // owning session's line revision/edit epoch), so a query no longer
-    // deep-copies and re-hashes every loaded fiber per placement.
+    // deep-copies and re-hashes every candidate fiber per placement.
     struct SideStripFiberSnapshot {
         std::shared_ptr<const vc::atlas::FiberPolyline> polyline;
         uint64_t geometryHash = 0;
@@ -156,11 +156,10 @@ public:
         // Interpolation provenance of the stored geometry (see deriveTraceState).
         vc3d::line_annotation::FiberTraceState traceState =
             vc3d::line_annotation::FiberTraceState::Legacy;
-        bool detailsLoaded = true;
     };
 
-    // Read-only network snapshot for the Fiber Map workspace: every loaded
-    // fiber's unrolling inputs plus the scroll umbilicus, in one pass.
+    // Read-only network snapshot for the Fiber Map workspace: every store
+    // fiber bound to the current volume, plus the scroll umbilicus, in one pass.
     struct FiberMapLink {
         int controlPointIndex = -1;
         uint64_t branchFiberId = 0;
@@ -199,7 +198,7 @@ public:
         // Per control-point span: the damaged span tag (alternating amber
         // and red dashes in the map). Same size.
         std::vector<bool> damagedSegments;
-        // Branch links resolving to a loaded fiber, pending included.
+        // Branch links resolving to a fiber in the snapshot, pending included.
         std::vector<FiberMapLink> links;
     };
 
@@ -271,19 +270,6 @@ public:
 
     using FiberBranchRef = vc3d::line_annotation::FiberBranchRef;
 
-    // Per-fiber data for the fiber overlay's "Show linked" mode. Only fibers
-    // with at least one valid cross-fiber link are returned. linkGroupId is
-    // the smallest fiber id in the fiber's connected component over all
-    // branch links, pending included — same union-find semantics as
-    // fiberSummaries().
-    struct FiberLinkOverlayInfo {
-        uint64_t fiberId = 0;
-        uint64_t linkGroupId = 0;
-        // (local control point index, pending); one entry per linked control
-        // point, pending winning when a point carries both link states.
-        std::vector<std::pair<int, bool>> linkedControlPoints;
-    };
-
     using DatasetPicker =
         std::function<std::optional<std::string>(QWidget*, const std::filesystem::path&)>;
     using VolumeSelectorFactory = std::function<QWidget*(QWidget*)>;
@@ -351,8 +337,6 @@ public:
     void setFiberManualHvTag(uint64_t fiberId, const QString& tag);
     void setFiberTag(uint64_t fiberId, const QString& tag, bool enabled);
     void recalculateFiberHvClassification(uint64_t fiberId);
-    void recalculateAllFiberHvClassifications();
-    void calculateFiberAlignmentMetrics();
     void calculateFiberAlignmentMetrics(std::vector<uint64_t> orderedFiberIds);
     void requestFiberAlignmentMetrics(uint64_t fiberId);
     void createAtlasFromFiber(uint64_t fiberId);
@@ -375,11 +359,16 @@ public:
     bool showGeneratedControlPointContextMenu(CChunkedVolumeViewer* viewer,
                                               const QPointF& scenePoint,
                                               const QPoint& globalPos);
-    [[nodiscard]] std::vector<FiberSummary> fiberSummaries(bool includeDetails = false) const;
-    void loadFiberDetails(uint64_t fiberId);
-    uint64_t registerStoreFiber(const vc::objects::PinnedObject& pin);
-    void ensureStoreFiber(uint64_t id);
+    // The fiber's current store revision, read in full: spans, links and the
+    // metrics cached for it. nullopt when it is not an active store fiber.
+    [[nodiscard]] std::optional<FiberSummary> fiberSummary(uint64_t fiberId) const;
+    // Every given fiber (nullopt: every active store fiber) from one snapshot.
+    [[nodiscard]] std::vector<FiberSummary> fiberSummaries(
+        const std::optional<std::vector<std::string>>& uuids) const;
+    // Runtime handle of a store object UUID, assigned on first use per attachment.
     uint64_t fiberIdForUuid(const std::string& uuid) const;
+    [[nodiscard]] std::string fiberUuidForId(uint64_t id) const;
+    // The current head of an active fiber, read from the store.
     std::optional<vc::objects::PinnedObject> fiberPin(uint64_t id) const;
     std::optional<double> fiberCoordinateScale(uint64_t id, bool prompt = false);
     [[nodiscard]] std::optional<double> fiberCoordinateScaleForVolume(uint64_t fiberId, const std::shared_ptr<Volume>& volume) const;
@@ -406,14 +395,12 @@ public:
     // catalog entry that orients it; empty for a volume without the tags.
     // A tag read, no parse, so it is cheap enough for dependency checks.
     [[nodiscard]] std::string fiberMapCoordinateSpace() const;
-    [[nodiscard]] std::vector<FiberLinkOverlayInfo> fiberLinkOverlayInfos() const;
-    // Bumped whenever the loaded fiber set changes (load, save, delete, and the
-    // edits that refresh the fiber summaries). Holders of derived data compare
-    // it to decide whether what they built is still current; runtime fiber ids
-    // are only meaningful within one generation. Deliberately an
-    // over-approximation: edits that a given holder's snapshot never reads
-    // (generic tag changes, say) still bump, because a needless rebuild prompt
-    // is bounded while a missed one shows a wrong picture.
+    // Bumped on every store commit (local or external) and attachment change.
+    // Holders of derived data compare it to decide whether what they built is
+    // still current; runtime fiber ids are only meaningful within one
+    // attachment. Deliberately an over-approximation: commits that a given
+    // holder's snapshot never reads still bump, because a needless rebuild
+    // prompt is bounded while a missed one shows a wrong picture.
     [[nodiscard]] uint64_t fiberDataGeneration() const { return _fiberDataGeneration; }
     // Bumped when the project is replaced. A counter rather than a signal so that
     // a derived view which may never be opened costs nothing to keep informed:
@@ -424,23 +411,22 @@ public:
     [[nodiscard]] uint64_t packageGeneration() const { return _packageGeneration; }
     // Resolve an exact source file, including an independently editable copy.
     [[nodiscard]] uint64_t fiberIdForFilePath(const std::filesystem::path& path) const;
-    // First loaded filename match; use the full path when sources may overlap.
 
-    // The loaded fiber a line annotation dialog is editing, or 0 when the
-    // dialog is not one of this controller's panes or its fiber has no
-    // stored file yet (a new, unsaved fiber).
+    // The fiber a line annotation dialog is editing, or 0 when the dialog is
+    // not one of this controller's panes or its fiber has no store object yet
+    // (a new, unsaved fiber).
     [[nodiscard]] uint64_t fiberIdForDialog(const LineAnnotationDialog* dialog) const;
-    // Whether the fiber with this runtime id is loaded under this file name
-    // (a caller that captured both before a yield checks they still agree).
-    [[nodiscard]] bool hasLoadedFiber(uint64_t fiberId, const std::string& fileName) const;
+    // Whether the fiber with this runtime id is an active store fiber under this
+    // file name (a caller that captured both before a yield checks they still agree).
+    [[nodiscard]] bool storedFiberHasFileName(uint64_t fiberId, const std::string& fileName) const;
     // Display name as shown in the fiber panel (file stem, "unnamed" fallback).
     [[nodiscard]] QString fiberDisplayName(uint64_t fiberId) const;
     // File stem of a fiber by id (live session first, then stored), or
     // "unsaved fiber"; resolved at menu time so renames show immediately.
     [[nodiscard]] QString fiberDisplayNameForId(uint64_t fiberId) const;
+    // 'reviewed' first, then every tag on an active store fiber.
     [[nodiscard]] std::vector<std::string> knownFiberTags() const;
-    [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshots(bool includeLines = true) const;
-    [[nodiscard]] std::vector<vc::atlas::FiberPolyline> fiberSnapshotsFromStorage();
+    // Every active store fiber, in full (whole-store tools such as the atlas search).
     [[nodiscard]] std::vector<FiberSnapshotWithPath> fiberSnapshotsFromStorageWithPaths();
     [[nodiscard]] std::optional<uint64_t> fiberIdForAtlasPath(
         const std::filesystem::path& atlasFiberPath) const;
@@ -455,8 +441,8 @@ public:
     bool importFibersFromPath(const std::filesystem::path& path,
                               QString* errorMessage = nullptr,
                               int* importedCount = nullptr, int* skippedCount = nullptr);
-    // Adds one unlinked vc3d_fiber to the package without reloading the other
-    // fibers; returns its id, or 0 with errorMessage set.
+    // Adds one unlinked vc3d_fiber to the attached store; returns its id, or 0
+    // with errorMessage set.
     uint64_t importFiberJson(const nlohmann::json& fiber, const std::string& fileName,
                              QString* errorMessage = nullptr);
     // Creates an atlas without dialogs. It does not emit atlasCreated because
@@ -518,7 +504,8 @@ public:
 signals:
     void volumeOverlayToggleRequested();
     void lineAnnotationWorkspaceRequested(LineAnnotationDialog* dialog, const QString& title);
-    void fibersChanged(std::vector<LineAnnotationController::FiberSummary> fibers);
+    // Store fibers changed: a commit, an external change or a new attachment.
+    void fibersChanged();
     void fiberAlignmentMetricsReset(bool pending);
     void fiberAlignmentMetricsUpdated(
         uint64_t fiberId,
@@ -1023,7 +1010,7 @@ private:
         const std::string& surfaceName,
         cv::Vec3f volumePoint) const;
     // "H"/"V" from the manual tag, falling back to the automatic classification;
-    // empty when unknown or the fiber isn't loaded.
+    // empty when unknown or the fiber is not in the store.
     [[nodiscard]] QString fiberHvDirectionTag(uint64_t fiberId) const;
     // Pushes the H/V tag and the clickable tag buttons to the pane's dialog.
     void pushFiberUiState(const PaneRecord& pane) const;
@@ -1038,10 +1025,25 @@ private:
                                                              bool fullOptimization = false,
                                                              int activeStart = -1,
                                                              int activeEnd = -1) const;
-    void loadFibersForCurrentPackage(const std::optional<std::vector<std::string>>& uuids = std::nullopt);
+    // Current heads of the given fiber UUIDs (nullopt: every active fiber),
+    // decoded for editing. Branch refs resolve against their endpoints in the
+    // same snapshot; missing and retired objects are skipped. Line points are
+    // read on request, otherwise loaded on demand by ensureFiberLines().
+    [[nodiscard]] std::vector<StoredFiber> readStoredFibers(
+        const std::optional<std::vector<std::string>>& uuids, bool lines = false) const;
+    [[nodiscard]] std::optional<StoredFiber> readStoredFiber(uint64_t id, bool lines = false) const;
+    // Active fibers bound to the current volume whose bounds overlap a box in
+    // volume voxels.
+    [[nodiscard]] std::vector<StoredFiber> readStoredFibersInVolumeBox(
+        const std::array<double, 6>& volumeBox, bool lines = false) const;
+    [[nodiscard]] std::string storedFiberFileName(uint64_t fiberId) const;
+    // Stored units -> current volume voxels for a fiber read from the store.
+    [[nodiscard]] std::optional<double> storedFiberScale(const StoredFiber& fiber) const;
+    void registerFiberId(const std::string& uuid, uint64_t id) const;
+    // Drops everything derived from the previous attachment.
+    void resetStoreDerivedState();
+    [[nodiscard]] FiberSummary summarizeStoredFiber(const StoredFiber& fiber, int linkedFiberCount) const;
     void ensureFiberLines(const StoredFiber&) const;
-    void ensureCompleteFiberCatalog() const;
-    void ensureAllFiberLines() const;
     // Match reciprocal references by control identities, positions and directions.
     [[nodiscard]] static bool isReciprocalBranchRef(const StoredFiber& fiber,
                                                     const FiberBranchRef& branch,
@@ -1062,8 +1064,6 @@ private:
             vc3d::line_annotation::FiberOptimizationMode clickedMode,
             vc3d::line_annotation::FiberOptimizationMode candidateMode);
     void reoptimizeMergedFibers(const std::vector<uint64_t>& fiberIds);
-    void emitFiberSummaries();
-    void addKnownFiberTags(const std::vector<std::string>& tags);
     void retainStoredFiberCoordinateBaseShape(StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path relativeFiberPath(const StoredFiber& fiber) const;
     [[nodiscard]] std::filesystem::path currentVolpkgRoot() const;
@@ -1082,7 +1082,9 @@ private:
     [[nodiscard]] std::vector<std::vector<cv::Vec3f>> generatedBranchLinePointsForSession(
         const LineAnnotationSession& session) const;
     void refreshBranchLineViews(uint64_t changedFiberId = 0);
-    [[nodiscard]] std::vector<SideStripFiberSnapshot> fiberSnapshotsForSideStripQuery() const;
+    // Snapshots of the given stored candidates and of every open session.
+    [[nodiscard]] std::vector<SideStripFiberSnapshot> fiberSnapshotsForSideStripQuery(
+        const std::vector<StoredFiber>& stored) const;
     void startSideStripIntersectionQuery(SideStripIntersectionRequest request);
     void updateSideStripIntersectionProgress(uint64_t token,
                                              const std::string& surfaceName,
@@ -1148,7 +1150,9 @@ private:
     void flushAllPendingSessionAutoSaves();
     [[nodiscard]] static nlohmann::json fiberSourceMetadata(const StoredFiber& fiber);
     friend int runObjectStoreControllerTests();
-    std::unordered_map<std::string, uint64_t> _fiberIdsByUuid;
+    // Runtime handles <-> store identities; cleared with each attachment.
+    mutable std::unordered_map<std::string, uint64_t> _fiberIdsByUuid;
+    mutable std::unordered_map<uint64_t, std::string> _fiberUuidsById;
     mutable std::shared_ptr<QTemporaryDir> _fiberTransportDirectory;
     void commitFiberStoreAction(std::vector<FiberSaveSnapshot>& snapshots,
                                const std::vector<StoredFiber>& retired = {});
@@ -1160,10 +1164,8 @@ private:
     [[nodiscard]] static std::vector<ControlSpanRecord> controlSpansForFiber(
         const StoredFiber& fiber);
     // Generation-keyed cache in front of controlSpansForFiber for GUI-thread
-    // callers: the scan is O(controls x linePoints) per fiber, and
-    // fiberSummaries() used to pay it for every loaded fiber on every
-    // emission (~90 ms at 666 fibers). Workers keep calling the static
-    // function directly.
+    // callers: the scan is O(controls x linePoints) per fiber. Workers keep
+    // calling the static function directly.
     [[nodiscard]] const std::vector<ControlSpanRecord>& cachedControlSpansForFiber(
         const StoredFiber& fiber) const;
     [[nodiscard]] FiberSummary::AlignmentMetrics cachedAlignmentForFiber(
@@ -1244,12 +1246,8 @@ private:
     QPointer<QWidget> _parentWidget;
     int _nextPaneId = 1;
     std::vector<PaneRecord> _panes;
-    std::vector<StoredFiber> _fibers;
-    bool _fiberCatalogComplete = false;
-    std::unordered_map<uint64_t, vc::objects::PinnedObject> _registeredStoreFibers;
 
     mutable uint64_t _nextFiberRuntimeId = 0;
-    std::vector<std::string> _knownFiberTags;
     std::unordered_map<uint64_t, CachedFiberAlignmentMetrics> _fiberAlignmentMetrics;
     std::unordered_set<uint64_t> _pendingFiberAlignmentMetrics;
     std::unordered_map<uint64_t, uint64_t> _pendingFiberAlignmentMetricTokens;
@@ -1308,8 +1306,8 @@ private:
     uint64_t _fiberDataGeneration = 1;
     // See packageGeneration(); starts at 1 for the same reason.
     uint64_t _packageGeneration = 1;
-    // Invalidates structural-edit captures when the store-backed view reloads.
-    uint64_t _fiberLoadSequence = 0;
+    // Invalidates structural-edit captures when the store attachment changes.
+    uint64_t _attachmentSequence = 0;
     // Total failed save jobs; callers compare before/after a
     // waitForFiberSaves() flush to gate destructive follow-ups (fiber
     // retirement) on the flushed saves having actually succeeded.
@@ -1391,9 +1389,10 @@ private:
     // A merge or split from its menu callback to the end of its commit; the
     // second one refuses, and deletes/renames/imports refuse meanwhile.
     bool _structuralEditInProgress = false;
-    // _fiberSaveFailureCount as of the last load: structural edits refuse to
-    // run when a save has failed since (memory may be ahead of disk).
-    uint64_t _fiberSaveFailureCountAtLoad = 0;
+    // _fiberSaveFailureCount as of the last attachment: structural edits
+    // refuse to run when a save has failed since (a session may be ahead of
+    // the store).
+    uint64_t _fiberSaveFailureCountAtAttachment = 0;
 
 
     // Everything a merge/split needs from the menu callback, captured by
@@ -1401,7 +1400,7 @@ private:
     // runs after the callback returned and after a save drain.
     struct StructuralEditCapture {
         uint64_t packageGeneration = 0;
-        uint64_t loadSequence = 0;
+        uint64_t attachmentSequence = 0;
         std::weak_ptr<LineAnnotationSession> session;
         std::string surfaceName;
         uint64_t sessionFiberId = 0;
@@ -1439,7 +1438,7 @@ private:
     // any step that allocates, so a caller catching an exception knows
     // whether "nothing was changed" is still true.
     StructuralEditOutcome commitStructuralEdit(StructuralEditRequest request, bool* committed);
-    bool structuralEditPreflight(uint64_t packageGeneration, uint64_t loadSequence,
+    bool structuralEditPreflight(uint64_t packageGeneration, uint64_t attachmentSequence,
                                  std::string* error);
     [[nodiscard]] bool objectStoreEditingAvailable(std::string* error) const;
     // Deduplicates the deferred re-optimization prompt across reentrant

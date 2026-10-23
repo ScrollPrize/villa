@@ -1508,7 +1508,7 @@ void SpiralWorkspace::refreshTrackedFibers()
     std::vector<uint64_t> ids;
     for (const auto& uuid : _trackedFiberPaths.keys()) {
         const auto id = _lineAnnotationController->fiberIdForUuid(uuid.toStdString());
-        if (id) ids.push_back(id);
+        if (id && _lineAnnotationController->fiberPin(id)) ids.push_back(id);
         else noteFiberRetired(uuid);
     }
     stageFiberInputs(ids);

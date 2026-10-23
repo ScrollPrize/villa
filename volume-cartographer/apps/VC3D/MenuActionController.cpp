@@ -229,24 +229,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachVolumeAct);
     _fileMenu->addAction(_attachSegmentsAct);
-    _fileMenu->addAction(QObject::tr("Attach Object Store..."), this, [qWindow]() {
-        const auto path = QFileDialog::getOpenFileName(qWindow, QObject::tr("Attach Object Store"),
-            {}, QObject::tr("Object store (*.vcobj);;All files (*)"));
-        if (path.isEmpty()) return;
-        auto author = qEnvironmentVariable("USER");
-        if (author.isEmpty()) author = qEnvironmentVariable("USERNAME");
-        if (author.isEmpty()) {
-            author = QInputDialog::getText(qWindow, QObject::tr("Object Store Author"),
-                QObject::tr("Author for recorded edits:"));
-            if (author.trimmed().isEmpty()) return;
-        }
-        try {
-            qWindow->_state->attachObjectStore(path, author.trimmed());
-        } catch (const std::exception& error) {
-            QMessageBox::critical(qWindow, QObject::tr("Cannot attach object store"),
-                QString::fromUtf8(error.what()));
-        }
-    });
+    _fileMenu->addAction(QObject::tr("Attach Object Store..."), this, &MenuActionController::attachObjectStore);
     _fileMenu->addAction(QObject::tr("Attach Read-only Object Store..."), this, [qWindow]() {
         const auto path = QFileDialog::getOpenFileName(qWindow, QObject::tr("Attach Read-only Object Store"),
             {}, QObject::tr("Object store (*.vcobj);;All files (*)"));
@@ -256,13 +239,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
             QMessageBox::critical(qWindow, QObject::tr("Cannot attach object store"), QString::fromUtf8(error.what()));
         }
     });
-    auto* detachStore = _fileMenu->addAction(QObject::tr("Detach Object Store"), this, [qWindow]() {
-        try { qWindow->_state->detachObjectStore(); }
-        catch (const std::exception& error) {
-            QMessageBox::critical(qWindow, QObject::tr("Cannot detach object store"),
-                QString::fromUtf8(error.what()));
-        }
-    });
+    auto* detachStore = _fileMenu->addAction(QObject::tr("Detach Object Store"), this, &MenuActionController::detachObjectStore);
     detachStore->setEnabled(qWindow->_state->objectStoreSession()->attachment().has_value());
     connect(qWindow->_state, &CState::objectStoreChanged, detachStore,
         [qWindow, detachStore](const vc::objects::StoreSessionEvent&) {
@@ -2350,4 +2327,33 @@ void MenuActionController::convertLegacyVolpkg()
     auto reply = QMessageBox::question(_window, QObject::tr("Open converted project?"),
         QObject::tr("Wrote %1 — open it now?").arg(out));
     if (reply == QMessageBox::Yes) openVolpkgAt(out);
+}
+
+void MenuActionController::attachObjectStore()
+{
+    const auto path = QFileDialog::getOpenFileName(_window, QObject::tr("Attach Object Store"),
+        {}, QObject::tr("Object store (*.vcobj);;All files (*)"));
+    if (path.isEmpty()) return;
+    auto author = qEnvironmentVariable("USER");
+    if (author.isEmpty()) author = qEnvironmentVariable("USERNAME");
+    if (author.isEmpty()) {
+        author = QInputDialog::getText(_window, QObject::tr("Object Store Author"),
+            QObject::tr("Author for recorded edits:"));
+        if (author.trimmed().isEmpty()) return;
+    }
+    try {
+        _window->_state->attachObjectStore(path, author.trimmed());
+    } catch (const std::exception& error) {
+        QMessageBox::critical(_window, QObject::tr("Cannot attach object store"),
+            QString::fromUtf8(error.what()));
+    }
+}
+
+void MenuActionController::detachObjectStore()
+{
+    try { _window->_state->detachObjectStore(); }
+    catch (const std::exception& error) {
+        QMessageBox::critical(_window, QObject::tr("Cannot detach object store"),
+            QString::fromUtf8(error.what()));
+    }
 }

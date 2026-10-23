@@ -1,43 +1,84 @@
 #pragma once
 
+#include "FiberDisplayOptions.hpp"
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/types/FiberView.hpp"
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
 #include <QPointF>
 #include <QPointer>
+#include <QString>
 #include <atomic>
 #include <memory>
-#include <limits>
 #include <optional>
 #include <unordered_map>
+#include <vector>
 
 class CState;
-class QDockWidget;
-class QLabel;
-class QListWidget;
-class QSpinBox;
-class QDoubleSpinBox;
-class QCheckBox;
-class QSlider;
-class QLineEdit;
-class QPushButton;
-class QMainWindow;
 class LineAnnotationController;
 
-// Store-backed catalog and bounded slice overlays sharing the editor session.
+// The attached store's fibers: the catalog pages listed by the Fibers panel,
+// the selected fiber, and the bounded slice overlay of every viewer. Holds no
+// fiber data beyond the current page and what each viewer displays.
 class FiberCollectionController : public ViewerOverlayControllerBase
 {
     Q_OBJECT
 public:
-    FiberCollectionController(CState* state, ViewerManager* manager, QMainWindow* window, LineAnnotationController* annotations);
+    struct Selection {
+        int64_t id = 0;
+        QString text, toolTip;
+        // Points the selection slider walks; 0 disables it.
+        int64_t pointCount = 0;
+        int index = 0;
+        bool openable = false;
+    };
+    // One listed fiber: its record (name, tags, typed summary, metadata) and links.
+    struct CatalogRow {
+        vc::objects::ObjectRecord record;
+        // Stored units -> volume voxels; unset for a fiber not bound to the volume.
+        std::optional<double> toVolume;
+        int links = 0;
+        int pendingLinks = 0;
+        // Fibers connected through links, this one included.
+        int componentSize = 0;
+    };
+    struct ControlPointHit {
+        uint64_t fiberId = 0;
+        int controlPointIndex = -1;
+    };
+
+    FiberCollectionController(CState* state, ViewerManager* manager, QObject* parent, LineAnnotationController* annotations);
     ~FiberCollectionController() override;
-    QDockWidget* dock() const { return dock_; }
+    [[nodiscard]] const FiberDisplayOptions& options() const { return options_; }
+    void setOptions(const FiberDisplayOptions& options);
     void setLineAnnotationActive(bool active);
     void openCollection(const QString& path);
+    void firstPage();
+    void nextPage();
+    // A listed fiber was clicked: focus it in the main views, or open it in
+    // Line Annotation while that workspace is active.
+    void activateFiber(int64_t id);
+    void selectFiber(int64_t id, bool focusView = true, bool openAnnotation = false);
+    void navigate(int index);
+    void showInLineAnnotation(int64_t id);
     // Selects the trace under a plain left click that no native tool, collection
     // point or fiber annotation used. Returns true if a trace was selected.
     bool handleVolumeClick(Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+    // Nearest drawn control point within maxDistancePx scene units of scenePoint.
+    [[nodiscard]] std::optional<ControlPointHit> hitTestControlPoint(
+        VolumeViewerBase* viewer, const QPointF& scenePoint, qreal maxDistancePx) const;
     void detachViewer(VolumeViewerBase* viewer) override;
+
+signals:
+    void catalogChanged(std::vector<FiberCollectionController::CatalogRow> rows, bool morePages);
+    void statusChanged(bool attached, const QString& text);
+    void selectionChanged(const FiberCollectionController::Selection& selection);
+    // The selected fiber's current catalog row, for a panel whose page lacks it.
+    void fiberRevealed(const FiberCollectionController::CatalogRow& row);
+    // Progress of a Line Annotation open requested here; empty when idle.
+    void annotationStatusChanged(const QString& text);
+    // Asks the host to bring the Fibers panel into view.
+    void panelRequested();
+
 protected:
     bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
     bool needsOverlayRebuild(VolumeViewerBase* viewer) const override;
@@ -47,33 +88,16 @@ protected:
 private:
     struct View;
     using Slice = vc::fibers::ViewRegion;
-    std::map<int64_t,vc::objects::PinnedObject> pins_;
-    std::vector<vc::objects::ObjectCoordinateGroup> coordinateGroups_;
-    using CatalogCursor = std::optional<std::pair<double, std::string>>;
-    std::vector<CatalogCursor> catalogCursors_;
-    std::map<int64_t,double> coordinateFactors_;
+    // The last listed row: its UUID and, when bound, its volume length.
+    struct CatalogCursor {
+        std::string uuid;
+        std::optional<double> length;
+    };
+    std::optional<CatalogCursor> catalogCursor_;
     CState* state_;
     ViewerManager* manager_;
     LineAnnotationController* annotations_;
-    QDockWidget* dock_{};
-    QLabel *status_{}, *selection_{}, *annotationStatus_{};
-    QListWidget* list_{};
-    QDoubleSpinBox* minLength_{};
-    QSpinBox* maxDisplayed_{};
-    QDoubleSpinBox* distance_{};
-    QDoubleSpinBox* lineWidth_{};
-    QCheckBox* visible_{};
-    QCheckBox* rainbow_{};
-    QCheckBox* horizontal_{};
-    QCheckBox* vertical_{};
-    QSlider* along_{};
-    QWidget* selectionSection_{};
-    QWidget* selectionSeparator_{};
-    QLineEdit* idInput_{};
-    QPushButton* next_{};
-    QPushButton* openAnnotation_{};
-    QPushButton* detach_{};
-    std::string uuid_;
+    FiberDisplayOptions options_;
     int64_t totalFibers_{};
     bool annotationBusy_{false};
     bool lineAnnotationActive_{false};
@@ -81,8 +105,12 @@ private:
     double nativeToViewer_{1.0};
     double nativeVoxelMm_{1.0};
     int64_t selected_{0};
+    std::optional<vc::objects::PinnedObject> selectedPin_;
+    std::optional<double> selectedToVolume_;
+    Selection selection_;
     uint64_t revision_{0}, selectionRevision_{0}, navigationRevision_{0}, annotationRevision_{0};
     bool enabled_{false}, catalogBusy_{false}, catalogPending_{false}, navigationBusy_{false};
+    bool catalogPendingReset_{false};
     struct Click {
         QPointer<QObject> viewport;
         QPointF position;
@@ -93,18 +121,19 @@ private:
     std::unordered_map<VolumeViewerBase*, std::unique_ptr<View>> views_;
     void clear();
     void invalidate();
-    void showInLineAnnotation(int64_t id);
+    void publishStatus(const QString& text);
+    void publishSelection(Selection selection);
     void startPendingAnnotation();
     void finishAnnotationRequest();
     void watchAnnotationRender(class LineAnnotationDialog* dialog, int64_t id, uint64_t token);
     void projectChanged(bool preserveSelection = false);
-    void volumeChanged();
     void listPage(bool reset);
-    vc::fibers::FamilyFilter familyFilter() const;
-    void selectFiber(int64_t id, bool focusView = true, bool openAnnotation = false);
-    bool highlightListFiber(int64_t id);
-    void revealListFiber(const vc::fibers::Summary& summary);
-    void navigate(int index);
+    std::optional<std::string> familyFilter() const;
+    bool noFamilies() const;
     void request(VolumeViewerBase* viewer, const Slice& slice);
+    // Curved surfaces (flattened and segmentation views) draw the control
+    // point chains of annotated fibers within the surface's bounds instead.
+    void requestChains(VolumeViewerBase* viewer, const std::array<double, 6>& box);
+    void collectChainPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder);
     std::optional<Slice> slice(VolumeViewerBase* viewer) const;
 };

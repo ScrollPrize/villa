@@ -8,9 +8,10 @@ VC3D edits geometry, annotations, relationships and retirement directly through
 the database APIs in one `ObjectStoreSession::act` transaction. Splits create two
 objects and retire the original in that transaction. VC3D retains pinned working
 snapshots; the database owns revision history and synchronization.
-The catalog reads control geometry and metadata; dense line geometry is loaded
-on demand. Selecting or expanding a fiber loads its exact span details; unloaded
-lengths display as unknown. The total-length calculate link loads all span details. Closing a read-only view does not remove its catalog entry.
+The Fibers panel lists catalog pages from the store's records; selecting or
+expanding a fiber reads its exact span details from its current revision. The
+total length sums the listed fibers' stored lengths. Closing a read-only view does
+not remove its catalog entry.
 
 Each fiber's explicit coordinate binding determines its transform into the active
 volume. Unbound fibers remain listed but are excluded from spatial overlays and
@@ -329,9 +330,9 @@ through `annotationFrame().voxelSizeUm`) and in voxels otherwise; the unit
 is never guessed. Centimetres show two decimals everywhere. The shared
 formatting lives in `FiberLengthDisplay.hpp`.
 
-- The Fibers dock's `len` column carries the unit in its header (`len (cm)`
-  or `len (vx)`), the cells are bare numbers, and a total over the loaded
-  fibers sits at the top of the dock.
+- The Fibers panel's `len` column carries the unit in its header (`len (cm)`
+  or `len (vx)`), the cells are bare numbers, and a total over the listed
+  fibers sits above the list.
 - The main window's status bar shows "Fiber length" for the fiber open in
   the active Line Annotation tab, left of the cache figures; it hides when
   another workspace is active.

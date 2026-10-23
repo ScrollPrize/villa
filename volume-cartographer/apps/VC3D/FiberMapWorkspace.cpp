@@ -163,7 +163,7 @@ const QColor kSuspect(QStringLiteral("#ff6b6b"));
 // crossing reads the same here as it does in the slice and generated views:
 // H/V links are violet, same-type (H-H, V-V) links orange, and both go pale
 // blue / pale orange while they await review. These four rows mirror
-// apps/VC3D/overlays/FiberOverlayController.cpp and
+// apps/VC3D/FiberCollectionController.cpp and
 // apps/VC3D/LineAnnotationGeneratedViews.cpp and must stay in sync with them.
 struct LinkPalette {
     QColor pen;
@@ -3897,7 +3897,7 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
     // re-compared when an action fires, because bestIndex indexes the control
     // points as they were when the menu was built — an edit in between could
     // have made it mean a different point, or none; and the fiber must still
-    // be loaded under the captured id and file name at that same moment.
+    // be in the store under the captured id and file name at that same moment.
     const vc3d::fiber_map::FiberMapDependencies menuDependencies =
         currentDependencies();
     // Parentless: exec() runs a nested event loop, and a parented stack menu would
@@ -3943,12 +3943,12 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
                     return;
                 }
                 // The defense the generation cannot give: a fiber no longer
-                // loaded under its id and name under an unchanged generation
+                // in the store under its id and name under an unchanged generation
                 // means a bump was missed somewhere, and this map cannot be
                 // trusted until it is rebuilt — the one staleness that latches.
-                if (!_controller->hasLoadedFiber(fiberId, fileName)) {
+                if (!_controller->storedFiberHasFileName(fiberId, fileName)) {
                     markStale(tr("Fibers changed — press Update"));
-                    Logger()->warn("Fiber map: {} is no longer loaded; not navigating",
+                    Logger()->warn("Fiber map: {} is no longer in the store; not navigating",
                                    fileName);
                     return;
                 }
@@ -4125,7 +4125,7 @@ void FiberMapWorkspace::deleteConfirmedFiber(
     }
     // Anything could have happened while the dialog stood open (a reload, a
     // package switch): the dependency set is checked again, and then the
-    // fiber must still be loaded under the id AND the name the menu named
+    // fiber must still be in the store under the id AND the name the menu named
     // (runtime ids are stable and unique across sources; a bare name is
     // not, so the id is what is deleted). A fiber gone under unchanged
     // dependencies means the map is not to be trusted until rebuilt - the
@@ -4139,9 +4139,9 @@ void FiberMapWorkspace::deleteConfirmedFiber(
                        fileName);
         return;
     }
-    if (!_controller->hasLoadedFiber(fiberId, fileName)) {
+    if (!_controller->storedFiberHasFileName(fiberId, fileName)) {
         markStale(tr("Fibers changed — press Update"));
-        Logger()->warn("Fiber map: {} is no longer loaded; not deleting", fileName);
+        Logger()->warn("Fiber map: {} is no longer in the store; not deleting", fileName);
         return;
     }
     Logger()->info("Fiber map: deleting fiber {}", fileName);

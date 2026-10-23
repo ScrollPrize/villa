@@ -1,5 +1,7 @@
 #pragma once
 
+#include "FiberDisplayOptions.hpp"
+
 #include <QDockWidget>
 #include <QStandardItemModel>
 #include <QPushButton>
@@ -14,6 +16,8 @@
 
 class QLabel;
 class QButtonGroup;
+class QSlider;
+class QSpinBox;
 class QAction;
 class QCheckBox;
 class QDoubleSpinBox;
@@ -92,7 +96,13 @@ public:
     std::vector<uint64_t> orderedFiberIds() const;
     QAction* createShowFiberSliceAction(QObject* parent);
     QAction* createRenameFiberFileAction(QObject* parent);
+    // The listed fibers: one store catalog page. Entries without details load
+    // them through fiberDetailsRequested when selected or expanded.
     void setFibers(const std::vector<FiberEntry>& fibers);
+    // Replaces one listed fiber's entry with its full details.
+    void updateFiberDetails(const FiberEntry& fiber);
+    // Lists a fiber that is not on the current page (a selection made elsewhere).
+    void revealFiber(const FiberEntry& fiber);
     // Physical size of one annotation-frame voxel in µm, the frame the
     // entries' lengthVx are measured in. With it, lengths (the len column,
     // the selected fiber's header line, the total at the top) read in
@@ -109,13 +119,16 @@ public:
     void selectFiber(uint64_t fiberId);
     void selectFibers(const std::vector<uint64_t>& fiberIds);
     void setDeleteConfirmationForTesting(std::function<bool(const std::vector<uint64_t>&)> confirmer);
-    void setShowFibersAvailable(bool available);
-    void setShowFibersChecked(bool checked);
-    [[nodiscard]] bool showFibersChecked() const;
-    void setShowLinkedChecked(bool checked);
-    [[nodiscard]] bool showLinkedChecked() const;
-    void setFiberViewDistance(double distance);
-    [[nodiscard]] double fiberViewDistance() const;
+    void setDisplayOptions(const FiberDisplayOptions& options);
+    [[nodiscard]] FiberDisplayOptions displayOptions() const;
+    void setStoreStatus(bool attached, const QString& text);
+    void setNextPageAvailable(bool available);
+    // The stored trace followed by the slider; pointCount 0 disables it.
+    void setTraceSelection(const QString& text, const QString& toolTip, int64_t pointCount, int index, bool openable);
+    // Progress of an Open in Line Annotation request; empty hides it.
+    void setAnnotationStatus(const QString& text);
+    // While the Line Annotation workspace is active a click opens the fiber there.
+    void setLineAnnotationActive(bool active);
 
 signals:
     void fiberDetailsRequested(uint64_t fiberId);
@@ -133,9 +146,15 @@ signals:
     void importFibersRequested();
     void exportFibersRequested();
     void metricsCalculationRequested(std::vector<uint64_t> orderedFiberIds);
-    void showFibersToggled(bool checked);
-    void showLinkedToggled(bool checked);
-    void fiberViewDistanceChanged(double distance);
+    void displayOptionsChanged(FiberDisplayOptions options);
+    void attachStoreRequested();
+    void detachStoreRequested();
+    void firstPageRequested();
+    void nextPageRequested();
+    // A listed fiber was clicked, or its ID entered.
+    void fiberActivated(uint64_t fiberId);
+    void traceIndexChanged(int index);
+    void openInLineAnnotationRequested(uint64_t fiberId);
 
 private slots:
     void onSelectionChanged();
@@ -169,6 +188,7 @@ private:
     // model's rows, selection and expansion stay as they are.
     void refreshLengthDisplays();
     void updateTotalLengthLabel();
+    void emitDisplayOptions();
     void sortFibers();
     QStandardItem* findFiberItem(uint64_t fiberId);
     QList<QStandardItem*> rowItemsForNameItem(QStandardItem* nameItem) const;
@@ -189,18 +209,35 @@ private:
     static QString statusTextForFiber(const FiberEntry& fiber);
 
     uint64_t _selectedFiberId = 0;
-    std::vector<FiberEntry> _fibers;
+    std::vector<FiberEntry> _listedFibers;
     std::vector<std::string> _knownTags;
     std::function<bool(const std::vector<uint64_t>&)> _deleteConfirmationForTesting;
     int _sortColumn = 0;
     Qt::SortOrder _sortOrder = Qt::AscendingOrder;
     std::optional<double> _voxelSizeUm;
 
+    QLabel* _storeStatusLabel = nullptr;
+    QPushButton* _attachButton = nullptr;
+    QPushButton* _detachButton = nullptr;
+    QDoubleSpinBox* _minLengthSpinBox = nullptr;
+    QCheckBox* _horizontalCheckBox = nullptr;
+    QCheckBox* _verticalCheckBox = nullptr;
+    QCheckBox* _showFibersCheckBox = nullptr;
+    QCheckBox* _showLinkedCheckBox = nullptr;
+    QCheckBox* _rainbowCheckBox = nullptr;
+    QDoubleSpinBox* _sliceDistanceSpinBox = nullptr;
+    QSpinBox* _maxDisplayedSpinBox = nullptr;
+    QDoubleSpinBox* _lineWidthSpinBox = nullptr;
+    QPushButton* _firstPageButton = nullptr;
+    QPushButton* _nextPageButton = nullptr;
+    QLineEdit* _fiberIdEdit = nullptr;
+    QLabel* _traceLabel = nullptr;
+    QSlider* _traceSlider = nullptr;
+    QPushButton* _openInLineAnnotationButton = nullptr;
+    QLabel* _annotationStatusLabel = nullptr;
+    bool _lineAnnotationActive = false;
     QLabel* _totalLengthLabel = nullptr;
     QCheckBox* _calcMetricsCheckBox;
-    QCheckBox* _showFibersCheckBox;
-    QCheckBox* _showLinkedCheckBox;
-    QDoubleSpinBox* _fiberViewDistanceSpinBox;
     QTreeView* _treeView;
     QStandardItemModel* _model;
     QLabel* _nameLabel;

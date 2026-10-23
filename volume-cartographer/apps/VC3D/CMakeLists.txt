@@ -17,6 +17,7 @@ set(srcs
     CWindow.cpp
     FiberCollectionController.cpp
     FiberCollectionController.hpp
+    FiberDisplayOptions.hpp
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
@@ -195,8 +196,6 @@ set(srcs
     overlays/AtlasControlPointsOverlayController.hpp
     overlays/FiberSliceOverlayController.cpp
     overlays/FiberSliceOverlayController.hpp
-    overlays/FiberOverlayController.cpp
-    overlays/FiberOverlayController.hpp
     overlays/OverlayBatchItem.cpp
     overlays/OverlayBatchItem.hpp
     overlays/ScreenSpacePointIndex.hpp

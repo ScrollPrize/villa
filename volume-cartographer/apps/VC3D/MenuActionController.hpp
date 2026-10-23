@@ -54,6 +54,9 @@ public:
                       QString* errorMessage = nullptr);
     void showOpenDataCatalog();
     bool isOpenDataCatalogVisible() const;
+    // Prompts for a .vcobj (and an author when the environment names none) and attaches it.
+    void attachObjectStore();
+    void detachObjectStore();
     // Resolves sampleId against the cached manifest and opens it. When
     // interactive is false, prompts, progress dialogs, and message boxes are
     // suppressed.

@@ -20,7 +20,7 @@ VC3D is an explicit transfer operation; exported files are not live storage.
 Surfaces, point collections, CT, inference volumes and atlas directories retain
 their existing storage.
 
-Open a CT volume and select a fiber in the Object Store Fibers dock. When its
+Open a CT volume and select a fiber in the **Fibers** panel of the status bar. When its
 coordinate identity or scale is missing, the binding dialog shows the active
 volume identity, dimensions and resolution, alongside known fiber metadata and
 bounds. Enter **stored fiber units per active-volume voxel**. For geometry in a
@@ -68,18 +68,34 @@ are reusable by future point-collection and tifxyz integrations. Optional native
 fiber annotations remain optional; import/export preserves unknown metadata and
 branch identities, approval state, and stable control-point IDs.
 
-Attachment does not load fiber controls, annotations or line arrays. The dock
-aggregates coordinate groups in a background read, fetches catalog pages of 200,
-and reads geometry from the spatial index for each visible viewport. The editor
-hydrates a selected fiber and its connected branch peers on demand. Explicit
-whole-store operations (such as detailed export or the complete fiber map) still
-load the data they need.
+The object store is the only source of fiber data; VC3D keeps no loaded fiber
+set. The **Fibers** panel (status bar) is the single fiber UI: it attaches and
+detaches the store, filters by minimum length and H/V family, sets the display,
+and lists the store's fibers in pages of 200, longest first in the active
+volume's voxels, followed by fibers not bound to that volume. Each row's details
+(spans, metrics, H/V scores) are read from the store when it is selected or
+expanded. Every edit, tag and link action reads the fiber's current revision and
+commits a checked action; a link is one shared edge, so changing it never rewrites
+the fiber at the other end. Opening a fiber in Line Annotation reads it and its
+linked peers in one snapshot. Whole-store tools (detailed export, the fiber map,
+atlas search) query the whole store when they run.
+
+VC3D queries in the active volume's voxels through the store's volume target
+(`ObjectSelection::volume`, `RegionOptions::volume`), which spans every
+coordinate frame bound to that volume; VC3D does not iterate frames itself.
+
+The viewers draw the store's fibers near each slice from bounded region
+queries: sampled lines, the control points of annotated fibers, and, with
+**Show linked**, link-component colours and pending/approved link rings. Curved
+surfaces (flattened and segmentation views) draw the control-point chains of
+annotated fibers within the surface's bounds. Right-clicking a drawn control
+point offers to open the fiber there. **Slice ±** is the one distance control.
 
 **Max displayed fibers** defaults to **5,000 per viewport**, persists in settings,
 and applies before geometry decoding. Zero means unlimited. Selected fibers have
 priority within the limit when they intersect the view. Work/byte budgets can
 return fewer fibers; the overlay reports partial coverage. Panning cancels obsolete
-requests and discards results from old attachments. Resident geometry retains the
+requests and discards results from old attachments. Drawn geometry retains the
 same float64 values and exact clipping predicates.
 
 Slice queries apply UUID inclusion before priority/limits and report incomplete
@@ -131,5 +147,5 @@ VC3D_OBJECT_STORE_READ_ONLY_BENCH=/path/to/paris4-fibers.vcobj \
 ```
 
 Use fresh settings for the default-limit assertion. The check prints attachment,
-first-page and selected-fiber timings and verifies UI heartbeats, deferred editor
-geometry, bounded catalog pages, and clearing the resident cache on detach.
+first-page and selected-fiber timings and verifies UI heartbeats, deferred line
+geometry, bounded catalog pages, and clearing runtime identities on detach.

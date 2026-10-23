@@ -109,6 +109,7 @@
 #include <QPointer>
 #include <QListView>
 #include <algorithm>
+#include <set>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -139,7 +140,6 @@
 #include "WrapAnnotationWidget.hpp"
 #include "AtlasControlPointsDock.hpp"
 #include "CFiberWidget.hpp"
-#include "overlays/FiberOverlayController.hpp"
 #include "FiberCollectionController.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationDialog.hpp"
@@ -2648,8 +2648,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                             ? qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())
                             : nullptr)
                         configureChunkedViewerConnections(chunked);
-                    if (_fiberOverlay && viewer) {
-                        _fiberOverlay->attachViewer(
+                    if (_fiberCollection && viewer) {
+                        _fiberCollection->attachViewer(
                             viewer, _spiralWorkspace->viewerManager());
                     }
                 });
@@ -2814,22 +2814,15 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _pointsOverlay = std::make_unique<PointsOverlayController>(_state->pointCollection(), this);
     _viewerManager->setPointsOverlay(_pointsOverlay.get());
 
-    _fiberOverlay = std::make_unique<FiberOverlayController>(this);
-    _fiberOverlay->bindToViewerManager(_viewerManager.get());
     _fiberCollection = std::make_unique<FiberCollectionController>(_state, _viewerManager.get(), this, _lineAnnotationController.get());
     updateActiveWorkspaceViewerControls();
     if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
         _spiralWorkspace->viewerManager()->forEachBaseViewer(
             [this](VolumeViewerBase* viewer) {
-                _fiberOverlay->attachViewer(
+                _fiberCollection->attachViewer(
                     viewer, _spiralWorkspace->viewerManager());
             });
     }
-    _fiberOverlay->setCoordinateScaleResolver([this](uint64_t id, VolumeViewerBase* viewer) {
-        return _lineAnnotationController->fiberCoordinateScaleForVolume(id, viewer->currentVolume());
-    });
-    connect(_state, &CState::volumeChanged, _fiberOverlay.get(), &FiberOverlayController::invalidateCoordinates);
-    connect(_state, &CState::objectStoreChanged, _fiberOverlay.get(), &FiberOverlayController::invalidateCoordinates);
 
     _rawPointsOverlay = std::make_unique<RawPointsOverlayController>(_state, this);
     _viewerManager->setRawPointsOverlay(_rawPointsOverlay.get());
@@ -3498,7 +3491,6 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
         auto* fiberMenu = menu->addMenu(tr("Fibers"));
         addDock(fiberMenu, _fiberWidget);
         addDock(fiberMenu, _fiberSliceWidget);
-        if (_fiberCollection) addDock(fiberMenu, _fiberCollection->dock());
     }
 }
 
@@ -3647,8 +3639,8 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
 
                         QMenu menu(this);
 
-                        if (_fiberOverlay && _lineAnnotationController) {
-                            if (const auto hit = _fiberOverlay->hitTestControlPoint(
+                        if (_fiberCollection && _lineAnnotationController) {
+                            if (const auto hit = _fiberCollection->hitTestControlPoint(
                                     viewer, scenePoint, 12.0);
                                 hit && hit->fiberId != 0) {
                                 const uint64_t fiberId = hit->fiberId;
@@ -4111,9 +4103,13 @@ ViewerManager* CWindow::activeWorkspaceViewerManager() const
 
 void CWindow::updateActiveWorkspaceViewerControls()
 {
+    const bool lineAnnotationActive =
+        _workspaceTabs && qobject_cast<LineAnnotationDialog*>(_workspaceTabs->currentWidget());
     if (_fiberCollection) {
-        _fiberCollection->setLineAnnotationActive(
-            _workspaceTabs && qobject_cast<LineAnnotationDialog*>(_workspaceTabs->currentWidget()));
+        _fiberCollection->setLineAnnotationActive(lineAnnotationActive);
+    }
+    for (auto* widget : {_fiberWidget, _fiberSliceWidget}) {
+        if (widget) widget->setLineAnnotationActive(lineAnnotationActive);
     }
     auto* manager = activeWorkspaceViewerManager();
     if (_viewerControlsPanel) {
@@ -5224,7 +5220,7 @@ void CWindow::updateAtlasFiberDocks()
         fiberItem->setText(1, tr("%1 controls").arg(static_cast<int>(mapping.controlAnchors.size())));
         fiberItem->setText(3, snapTotal < 0 ? tr("missing") : tr("%1/%2").arg(snapFound).arg(snapTotal));
         fiberItem->setText(6, snapTotal < 0 ? tr("missing") : tr("%1 records").arg(snapTotal));
-        fiberItem->setText(8, fiberId == 0 ? tr("not loaded") : QString::number(fiberId));
+        fiberItem->setText(8, fiberId == 0 ? tr("not in store") : QString::number(fiberId));
         fiberItem->setToolTip(0, QString::fromStdString(mapping.fiberPath.generic_string()));
         fiberItem->setData(0, ATLAS_FIBER_ID_ROLE, QVariant::fromValue<qulonglong>(fiberId));
         fiberItem->setData(0, ATLAS_FIBER_PATH_KEY_ROLE, fiberPathKey);
@@ -5256,7 +5252,7 @@ void CWindow::updateAtlasFiberDocks()
                 : QStringLiteral("-"));
             row->setText(6, predSnapStatusLabel(snap));
             row->setText(7, predSnapStatusReason(snap));
-            row->setText(8, fiberId == 0 ? tr("not loaded") : QString::number(fiberId));
+            row->setText(8, fiberId == 0 ? tr("not in store") : QString::number(fiberId));
             row->setData(0, ATLAS_FIBER_ID_ROLE, QVariant::fromValue<qulonglong>(fiberId));
             row->setData(0, ATLAS_FIBER_PATH_KEY_ROLE, fiberPathKey);
             row->setData(0, ATLAS_CONTROL_INDEX_ROLE, controlIndex);
@@ -5290,10 +5286,23 @@ void CWindow::scheduleAtlasSearchDockRefresh()
     });
 }
 
+bool CWindow::storeHasFibers() const
+{
+    const auto store = _state->objectStoreSession();
+    const auto attachment = store->attachment();
+    bool hasFibers = false;
+    if (attachment) {
+        store->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
+            hasFibers = db.objectCount(txn, "fiber") > 0;
+        });
+    }
+    return hasFibers;
+}
+
 void CWindow::updateAtlasSearchDocks()
 {
     const auto store = _state->objectStoreSession();
-    const bool hasSnapshots = _lineAnnotationController && !_lineAnnotationController->fiberSummaries().empty();
+    const bool hasSnapshots = storeHasFibers();
     int savedFiberCount = 0;
     QString atlasLoadError;
     if (_currentAtlasDir) {
@@ -5927,7 +5936,7 @@ void CWindow::startAtlasFiberIntersectionSearch()
 
     // No saved fibers: silent no-op in the interactive flow (unchanged: no dialog,
     // just refresh the docks).
-    if (_lineAnnotationController->fiberSnapshotsFromStorageWithPaths().empty()) {
+    if (!storeHasFibers()) {
         updateAtlasSearchDocks();
         return;
     }
@@ -6378,16 +6387,24 @@ void CWindow::populateAtlasSearchResults(const std::vector<vc::atlas::FiberInter
         double lengthVx = 0.0;
     };
     std::unordered_map<uint64_t, FiberDisplayInfo> fiberInfo;
-    if (_lineAnnotationController) {
-        for (const auto& fiber : _lineAnnotationController->fiberSummaries()) {
-            QString label = QString::number(fiber.id);
-            if (!fiber.name.empty()) {
-                label = tr("%1 (%2)")
-                    .arg(QString::fromStdString(fiber.name))
-                    .arg(fiber.id);
-            }
-            fiberInfo[fiber.id] = FiberDisplayInfo{label, fiber.lengthVx};
+    const auto store = _state->objectStoreSession();
+    if (const auto attachment = store->attachment(); attachment && _lineAnnotationController) {
+        std::set<uint64_t> fiberIds;
+        for (const auto& result : results) {
+            fiberIds.insert(result.sourceFiberId);
+            fiberIds.insert(result.targetFiberId);
         }
+        store->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
+            for (const uint64_t fiberId : fiberIds) {
+                const auto uuid = _lineAnnotationController->fiberUuidForId(fiberId);
+                const auto object = uuid.empty() ? std::nullopt : db.objectByUuid(txn, uuid);
+                if (!object || !object->fiber) continue;
+                const QString label = object->name.empty()
+                    ? QString::number(fiberId)
+                    : tr("%1 (%2)").arg(QString::fromStdString(object->name + ".json")).arg(fiberId);
+                fiberInfo[fiberId] = FiberDisplayInfo{label, object->fiber->length};
+            }
+        });
     }
 
     auto fiberLabel = [&fiberInfo](uint64_t fiberId) {
@@ -7822,71 +7839,14 @@ void CWindow::CreateWidgets(void)
         _fiberSliceWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _fiberSliceWidget);
     }
 
-    auto syncShowFiberChecks = [this](bool checked) {
-        if (_fiberWidget) {
-            _fiberWidget->setShowFibersChecked(checked);
-        }
-        if (_fiberSliceWidget) {
-            _fiberSliceWidget->setShowFibersChecked(checked);
+    auto forEachFiberWidget = [this](auto&& apply) {
+        for (auto* widget : {_fiberWidget, _fiberSliceWidget}) {
+            if (widget) apply(widget);
         }
     };
-    auto syncShowLinkedChecks = [this](bool checked) {
-        if (_fiberWidget) {
-            _fiberWidget->setShowLinkedChecked(checked);
-        }
-        if (_fiberSliceWidget) {
-            _fiberSliceWidget->setShowLinkedChecked(checked);
-        }
-    };
-    auto syncFiberViewDistances = [this](double distance) {
-        if (_fiberWidget) {
-            _fiberWidget->setFiberViewDistance(distance);
-        }
-        if (_fiberSliceWidget) {
-            _fiberSliceWidget->setFiberViewDistance(distance);
-        }
-    };
-    auto setFiberOverlayVisible = [this, syncShowFiberChecks](bool visible) {
-        if (!_fiberOverlay || !_fiberOverlay->hasChains()) {
-            visible = false;
-        }
-        if (_fiberOverlay) {
-            _fiberOverlay->setVisible(visible);
-        }
-        syncShowFiberChecks(visible);
-    };
-    auto setFiberOverlayShowLinked = [this, syncShowLinkedChecks](bool checked) {
-        if (_fiberOverlay) {
-            _fiberOverlay->setShowLinked(checked);
-        }
-        syncShowLinkedChecks(checked);
-    };
-    auto setFiberViewDistance = [this, syncFiberViewDistances](double distance) {
-        if (_fiberOverlay) {
-            _fiberOverlay->setViewDistance(distance);
-        }
-        syncFiberViewDistances(distance);
-    };
-    if (_fiberWidget) {
-        connect(_fiberWidget, &CFiberWidget::showFibersToggled,
-                this, setFiberOverlayVisible);
-        connect(_fiberWidget, &CFiberWidget::showLinkedToggled,
-                this, setFiberOverlayShowLinked);
-        connect(_fiberWidget, &CFiberWidget::fiberViewDistanceChanged,
-                this, setFiberViewDistance);
-    }
-    if (_fiberSliceWidget) {
-        connect(_fiberSliceWidget, &CFiberWidget::showFibersToggled,
-                this, setFiberOverlayVisible);
-        connect(_fiberSliceWidget, &CFiberWidget::showLinkedToggled,
-                this, setFiberOverlayShowLinked);
-        connect(_fiberSliceWidget, &CFiberWidget::fiberViewDistanceChanged,
-                this, setFiberViewDistance);
-    }
-    setFiberViewDistance(_fiberWidget->fiberViewDistance());
-    setFiberOverlayShowLinked(_fiberWidget->showLinkedChecked());
 
-    if (_lineAnnotationController) {
+    if (_lineAnnotationController && _fiberCollection) {
+        auto* collection = _fiberCollection.get();
         auto toFiberWidgetAlignment =
             [](const LineAnnotationController::FiberSummary::AlignmentMetrics& source) {
                 CFiberWidget::FiberEntry::AlignmentMetrics alignment;
@@ -7898,135 +7858,155 @@ void CWindow::CreateWidgets(void)
                 alignment.error = source.error;
                 return alignment;
             };
-        auto updateFiberList =
-            [this, toFiberWidgetAlignment, syncShowFiberChecks](
-                const std::vector<LineAnnotationController::FiberSummary>& fibers) {
-            std::vector<CFiberWidget::FiberEntry> entries;
-            entries.reserve(fibers.size());
-            for (const auto& fiber : fibers) {
-                CFiberWidget::FiberEntry::AlignmentMetrics alignment =
-                    toFiberWidgetAlignment(fiber.alignment);
-
-                std::vector<CFiberWidget::FiberEntry::SpanEntry> spans;
-                spans.reserve(fiber.spans.size());
-                for (const auto& span : fiber.spans) {
-                    CFiberWidget::FiberEntry::AlignmentMetrics spanAlignment =
-                        toFiberWidgetAlignment(span.alignment);
-                    spans.push_back(CFiberWidget::FiberEntry::SpanEntry{
-                        span.spanIndex,
-                        span.firstControlIndex,
-                        span.secondControlIndex,
-                        span.controlPointCount,
-                        span.linePointCount,
-                        span.lengthVx,
-                        spanAlignment,
-                        span.interpMarker,
-                        span.fiberManifest,
-                    });
-                }
-
-                CFiberWidget::FiberEntry::TraceState traceState =
-                    CFiberWidget::FiberEntry::TraceState::Legacy;
-                switch (fiber.traceState) {
-                case vc3d::line_annotation::FiberTraceState::Predictions:
-                    traceState = CFiberWidget::FiberEntry::TraceState::Predictions;
-                    break;
-                case vc3d::line_annotation::FiberTraceState::Mixed:
-                    traceState = CFiberWidget::FiberEntry::TraceState::Mixed;
-                    break;
-                case vc3d::line_annotation::FiberTraceState::Legacy:
-                    break;
-                }
-                entries.push_back(CFiberWidget::FiberEntry{
-                    fiber.id,
-                    fiber.name,
-                    fiber.controlPointCount,
-                    fiber.linePointCount,
-                    fiber.annotatedLengthVx,
-                    alignment,
-                    spans,
-                    fiber.hvZDistance,
-                    fiber.hvFiberLength,
-                    fiber.horizontalScore,
-                    fiber.verticalScore,
-                    fiber.automaticCertainty,
-                    fiber.automaticHvTag,
-                    fiber.manualHvTag,
-                    fiber.tags,
-                    fiber.linkedFiberCount,
-                    fiber.pendingLinkCount,
-                    traceState,
-                    fiber.detailsLoaded,
+        // A store catalog row as the panels list it; details load on selection.
+        auto catalogEntry = [this](const FiberCollectionController::CatalogRow& row) {
+            CFiberWidget::FiberEntry entry;
+            entry.id = _lineAnnotationController->fiberIdForUuid(row.record.uuid);
+            entry.fileName = row.record.name + ".json";
+            entry.tags = row.record.tags;
+            if (const auto& fiber = row.record.fiber) {
+                entry.controlPointCount = static_cast<int>(fiber->controlPointCount);
+                entry.linePointCount = static_cast<int>(fiber->linePointCount);
+                entry.lengthVx = fiber->length;
+                (fiber->manualFamily ? entry.manualHvTag : entry.automaticHvTag) = fiber->family;
+            }
+            entry.linkedFiberCount = row.componentSize >= 2 ? row.componentSize : 0;
+            entry.pendingLinkCount = row.pendingLinks;
+            entry.detailsLoaded = false;
+            return entry;
+        };
+        auto detailEntry = [toFiberWidgetAlignment](const LineAnnotationController::FiberSummary& fiber) {
+            std::vector<CFiberWidget::FiberEntry::SpanEntry> spans;
+            spans.reserve(fiber.spans.size());
+            for (const auto& span : fiber.spans) {
+                spans.push_back(CFiberWidget::FiberEntry::SpanEntry{
+                    span.spanIndex,
+                    span.firstControlIndex,
+                    span.secondControlIndex,
+                    span.controlPointCount,
+                    span.linePointCount,
+                    span.lengthVx,
+                    toFiberWidgetAlignment(span.alignment),
+                    span.interpMarker,
+                    span.fiberManifest,
                 });
             }
-            _fiberLengthVxById.clear();
-            _fiberLengthVxById.reserve(fibers.size());
-            for (const auto& fiber : fibers) {
-                _fiberLengthVxById[fiber.id] = fiber.annotatedLengthVx;
+            CFiberWidget::FiberEntry::TraceState traceState =
+                CFiberWidget::FiberEntry::TraceState::Legacy;
+            switch (fiber.traceState) {
+            case vc3d::line_annotation::FiberTraceState::Predictions:
+                traceState = CFiberWidget::FiberEntry::TraceState::Predictions;
+                break;
+            case vc3d::line_annotation::FiberTraceState::Mixed:
+                traceState = CFiberWidget::FiberEntry::TraceState::Mixed;
+                break;
+            case vc3d::line_annotation::FiberTraceState::Legacy:
+                break;
             }
-            // Unit first, so the rebuilt rows below are texted once in it.
-            updateFiberLengthUnits();
-            if (_fiberWidget) {
-                _fiberWidget->setFibers(entries);
-                _fiberWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
-            }
-            if (_fiberSliceWidget) {
-                _fiberSliceWidget->setFibers(entries);
-                _fiberSliceWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
-            }
-
-            const auto linkInfos = _lineAnnotationController->fiberLinkOverlayInfos();
-            std::unordered_map<uint64_t, const LineAnnotationController::FiberLinkOverlayInfo*>
-                linkInfoById;
-            linkInfoById.reserve(linkInfos.size());
-            for (const auto& info : linkInfos) {
-                linkInfoById.emplace(info.fiberId, &info);
-            }
-
-            std::vector<FiberOverlayController::Chain> chains;
-            for (const auto& snapshot : _lineAnnotationController->fiberSnapshots(false)) {
-                if (snapshot.controlPoints.empty()) {
-                    continue;
-                }
-                FiberOverlayController::Chain chain;
-                chain.id = snapshot.id;
-                chain.points.reserve(snapshot.controlPoints.size());
-                for (const cv::Vec3d& point : snapshot.controlPoints) {
-                    chain.points.emplace_back(static_cast<float>(point[0]),
-                                              static_cast<float>(point[1]),
-                                              static_cast<float>(point[2]));
-                }
-                if (const auto it = linkInfoById.find(snapshot.id); it != linkInfoById.end()) {
-                    chain.colorId = it->second->linkGroupId;
-                    chain.pointLinkStates.assign(chain.points.size(), 0);
-                    for (const auto& [cpIndex, pending] : it->second->linkedControlPoints) {
-                        if (cpIndex >= 0 &&
-                            cpIndex < static_cast<int>(chain.pointLinkStates.size())) {
-                            chain.pointLinkStates[cpIndex] = pending ? 1 : 2;
-                        }
-                    }
-                }
-                chains.push_back(std::move(chain));
-            }
-            const bool fibersAvailable = !chains.empty();
-            if (_fiberOverlay) {
-                _fiberOverlay->setChains(std::move(chains));
-            }
-            if (_fiberWidget) {
-                _fiberWidget->setShowFibersAvailable(fibersAvailable);
-            }
-            if (_fiberSliceWidget) {
-                _fiberSliceWidget->setShowFibersAvailable(fibersAvailable);
-            }
-            if (!fibersAvailable) {
-                syncShowFiberChecks(false);
-            }
-            updateAtlasFiberDocks();
+            return CFiberWidget::FiberEntry{
+                fiber.id,
+                fiber.name,
+                fiber.controlPointCount,
+                fiber.linePointCount,
+                fiber.annotatedLengthVx,
+                toFiberWidgetAlignment(fiber.alignment),
+                std::move(spans),
+                fiber.hvZDistance,
+                fiber.hvFiberLength,
+                fiber.horizontalScore,
+                fiber.verticalScore,
+                fiber.automaticCertainty,
+                fiber.automaticHvTag,
+                fiber.manualHvTag,
+                fiber.tags,
+                fiber.linkedFiberCount,
+                fiber.pendingLinkCount,
+                traceState,
+                true,
+            };
         };
-        for (auto* widget : {_fiberWidget, _fiberSliceWidget}) if (widget) {
-            connect(widget, &CFiberWidget::fiberDetailsRequested, _lineAnnotationController.get(),
-                &LineAnnotationController::loadFiberDetails, Qt::QueuedConnection);
-        }
+
+        connect(collection, &FiberCollectionController::catalogChanged, this,
+                [this, forEachFiberWidget, catalogEntry](const std::vector<FiberCollectionController::CatalogRow>& rows, bool morePages) {
+                    std::vector<CFiberWidget::FiberEntry> entries;
+                    entries.reserve(rows.size());
+                    for (const auto& row : rows) {
+                        entries.push_back(catalogEntry(row));
+                    }
+                    // Unit first, so the rebuilt rows below are texted once in it.
+                    updateFiberLengthUnits();
+                    const auto tags = _lineAnnotationController->knownFiberTags();
+                    forEachFiberWidget([&](CFiberWidget* widget) {
+                        widget->setFibers(entries);
+                        widget->setKnownTags(tags);
+                        widget->setNextPageAvailable(morePages);
+                    });
+                });
+        connect(collection, &FiberCollectionController::fiberRevealed, this,
+                [forEachFiberWidget, catalogEntry](const FiberCollectionController::CatalogRow& row) {
+                    const auto entry = catalogEntry(row);
+                    forEachFiberWidget([&](CFiberWidget* widget) { widget->revealFiber(entry); });
+                });
+        connect(collection, &FiberCollectionController::statusChanged, this,
+                [forEachFiberWidget](bool attached, const QString& text) {
+                    forEachFiberWidget([&](CFiberWidget* widget) { widget->setStoreStatus(attached, text); });
+                });
+        connect(collection, &FiberCollectionController::selectionChanged, this,
+                [forEachFiberWidget](const FiberCollectionController::Selection& selection) {
+                    forEachFiberWidget([&](CFiberWidget* widget) {
+                        widget->setTraceSelection(selection.text, selection.toolTip, selection.pointCount,
+                                                  selection.index, selection.openable);
+                    });
+                });
+        connect(collection, &FiberCollectionController::annotationStatusChanged, this,
+                [forEachFiberWidget](const QString& text) {
+                    forEachFiberWidget([&](CFiberWidget* widget) { widget->setAnnotationStatus(text); });
+                });
+        connect(collection, &FiberCollectionController::panelRequested, this, [this]() {
+            if (_statusDockPanelHost) {
+                _statusDockPanelHost->showDock(_fiberWidget);
+            } else {
+                _fiberWidget->show();
+                _fiberWidget->raise();
+            }
+        });
+        connect(_lineAnnotationController.get(), &LineAnnotationController::fibersChanged, this,
+                [this, forEachFiberWidget]() {
+                    const auto tags = _lineAnnotationController->knownFiberTags();
+                    forEachFiberWidget([&](CFiberWidget* widget) { widget->setKnownTags(tags); });
+                    updateLineAnnotationLengthLabel();
+                    updateAtlasFiberDocks();
+                });
+
+        forEachFiberWidget([&](CFiberWidget* widget) {
+            widget->setDisplayOptions(collection->options());
+            connect(widget, &CFiberWidget::fiberDetailsRequested, this,
+                    [this, forEachFiberWidget, detailEntry](uint64_t fiberId) {
+                        const auto summary = _lineAnnotationController->fiberSummary(fiberId);
+                        if (!summary) return;
+                        const auto entry = detailEntry(*summary);
+                        forEachFiberWidget([&](CFiberWidget* listed) { listed->updateFiberDetails(entry); });
+                    },
+                    Qt::QueuedConnection);
+            connect(widget, &CFiberWidget::displayOptionsChanged, this,
+                    [collection, forEachFiberWidget](const FiberDisplayOptions& options) {
+                        collection->setOptions(options);
+                        forEachFiberWidget([&](CFiberWidget* listed) { listed->setDisplayOptions(options); });
+                    });
+            connect(widget, &CFiberWidget::attachStoreRequested, this, [this]() {
+                if (_menuController) _menuController->attachObjectStore();
+            });
+            connect(widget, &CFiberWidget::detachStoreRequested, this, [this]() {
+                if (_menuController) _menuController->detachObjectStore();
+            });
+            connect(widget, &CFiberWidget::firstPageRequested, collection, &FiberCollectionController::firstPage);
+            connect(widget, &CFiberWidget::nextPageRequested, collection, &FiberCollectionController::nextPage);
+            connect(widget, &CFiberWidget::fiberActivated, collection,
+                    [collection](uint64_t fiberId) { collection->activateFiber(int64_t(fiberId)); });
+            connect(widget, &CFiberWidget::traceIndexChanged, collection, &FiberCollectionController::navigate);
+            connect(widget, &CFiberWidget::openInLineAnnotationRequested, collection,
+                    [collection](uint64_t fiberId) { collection->showInLineAnnotation(int64_t(fiberId)); });
+        });
         auto updateFiberMetricRows =
             [this, toFiberWidgetAlignment](
                 uint64_t fiberId,
@@ -8141,10 +8121,6 @@ void CWindow::CreateWidgets(void)
                     });
         };
         connect(_lineAnnotationController.get(),
-                &LineAnnotationController::fibersChanged,
-                this,
-                updateFiberList);
-        connect(_lineAnnotationController.get(),
                 &LineAnnotationController::fiberAlignmentMetricsReset,
                 this,
                 setFiberMetricsPending);
@@ -8154,7 +8130,6 @@ void CWindow::CreateWidgets(void)
                 updateFiberMetricRows);
         connectFiberWidget(_fiberWidget);
         connectFiberWidget(_fiberSliceWidget);
-        updateFiberList(_lineAnnotationController->fiberSummaries());
         // The annotation frame (and so the cm conversion) follows the
         // current volume; the lengths themselves do not change.
         connect(_state, &CState::volumeChanged, this,
@@ -8878,9 +8853,8 @@ void CWindow::updateLineAnnotationLengthLabel()
     const uint64_t fiberId = (dialog && _lineAnnotationController)
         ? _lineAnnotationController->fiberIdForDialog(dialog)
         : 0;
-    const auto it = fiberId != 0 ? _fiberLengthVxById.find(fiberId)
-                                 : _fiberLengthVxById.end();
-    if (it == _fiberLengthVxById.end()) {
+    const auto summary = fiberId != 0 ? _lineAnnotationController->fiberSummary(fiberId) : std::nullopt;
+    if (!summary) {
         _lineAnnotationLengthLabel->clear();
         _lineAnnotationLengthLabel->hide();
         return;
@@ -8890,7 +8864,7 @@ void CWindow::updateLineAnnotationLengthLabel()
     const std::optional<double> voxelSizeUm =
         _lineAnnotationController->annotationFrame().voxelSizeUm;
     _lineAnnotationLengthLabel->setText(
-        tr("Fiber length %1").arg(vc3d::fiber_length::formatLength(it->second, voxelSizeUm)));
+        tr("Fiber length %1").arg(vc3d::fiber_length::formatLength(summary->annotatedLengthVx, voxelSizeUm)));
     _lineAnnotationLengthLabel->show();
 }
 

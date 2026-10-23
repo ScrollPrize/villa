@@ -131,13 +131,11 @@ LineAnnotationController* AgentBridgeServer::fiberController() const
 }
 
 
-// Throws -32007 kind:"fiber" unless `fiberId` is a currently-loaded fiber.
+// Throws -32007 kind:"fiber" unless `fiberId` is an active fiber of the attached store.
 void AgentBridgeServer::requireKnownFiber(LineAnnotationController* ctrl, quint64 fiberId) const
 {
-    for (const auto& summary : ctrl->fiberSummaries()) {
-        if (summary.id == fiberId)
-            return;
-    }
+    if (ctrl->fiberPin(fiberId))
+        return;
     QJsonObject data;
     data["kind"] = "fiber";
     data["id"] = QString::number(fiberId);
@@ -216,7 +214,7 @@ QJsonObject AgentBridgeServer::handleFiberList(const QJsonValue&)
     LineAnnotationController* ctrl = fiberController();
 
     QJsonArray fibers;
-    for (const auto& s : ctrl->fiberSummaries(true)) {
+    for (const auto& s : ctrl->fiberSummaries(std::nullopt)) {
         QJsonObject f;
         f["fiberId"] = QString::number(s.id);
         f["name"] = QString::fromStdString(s.name);
