@@ -9,6 +9,7 @@
 #include <QLineEdit>
 #include <QLabel>
 #include <QMetaObject>
+#include <QPersistentModelIndex>
 #include <QPushButton>
 #include <QScrollBar>
 #include <QStandardItemModel>
@@ -588,14 +589,22 @@ int main(int argc, char** argv)
         tree->expand(tree->model()->index(0,0));
         require(requested == 99, "Expanding a deferred fiber requests only its geometry");
 
+        const QPersistentModelIndex row(tree->model()->index(0,0));
         auto detailed = pending;
         detailed.detailsLoaded = true;
+        detailed.lengthVx = 38.0;
         detailed.spans = {CFiberWidget::FiberEntry::SpanEntry{0, 0, 1, 2, 50, 20.0},
-                          CFiberWidget::FiberEntry::SpanEntry{1, 1, 2, 2, 51, 20.0}};
+                          CFiberWidget::FiberEntry::SpanEntry{1, 1, 2, 2, 51, 18.0}};
         lazy.updateFiberDetails(detailed);
-        tree = lazy.findChild<QTreeView*>();
-        require(tree->isExpanded(tree->model()->index(0,0)) && tree->model()->rowCount(tree->model()->index(0,0)) == 2,
+        // A double click on the row that requested these details keeps its press.
+        require(row.isValid() && row == tree->model()->index(0,0), "Details update the listed row in place");
+        require(tree->isExpanded(row) && tree->model()->rowCount(row) == 2,
                 "Details keep the row expanded with its span rows");
+        require(lazy.totalLengthVx() == 38.0, "Details replace the listed length");
+        uint64_t opened = 0;
+        QObject::connect(&lazy, &CFiberWidget::fiberOpenRequested, &lazy, [&](uint64_t id) { opened = id; });
+        QMetaObject::invokeMethod(tree, "doubleClicked", Q_ARG(QModelIndex, QModelIndex(row)));
+        require(opened == 99, "Double clicking a fiber requests opening it");
     }
 
     QThreadPool::globalInstance()->waitForDone();

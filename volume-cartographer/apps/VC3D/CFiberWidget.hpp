@@ -182,6 +182,10 @@ private:
     bool _spiralFitAvailable = false;
     void setupUi();
     void rebuildModel();
+    // A listed fiber's row cells, and its span rows (or the placeholder that
+    // keeps the expand arrow until they are built).
+    void fillFiberRow(const QList<QStandardItem*>& row, const FiberEntry& fiber);
+    void fillSpanChildren(QStandardItem* root, const FiberEntry& fiber, bool expanded);
     // The column headers, with the len column naming its current unit.
     [[nodiscard]] QStringList headerLabels() const;
     // Re-texts every length cell and the header after the unit changed; the

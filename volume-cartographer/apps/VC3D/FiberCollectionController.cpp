@@ -500,7 +500,7 @@ void FiberCollectionController::listPage(bool reset)
 }
 void FiberCollectionController::activateFiber(int64_t id)
 {
-    selectFiber(id, !lineAnnotationActive_, lineAnnotationActive_);
+    selectFiber(id, !lineAnnotationActive_, false);
 }
 void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool openAnnotation)
 {

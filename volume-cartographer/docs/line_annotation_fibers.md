@@ -13,6 +13,10 @@ expanding a fiber reads its exact span details from its current revision. The
 total length sums the listed fibers' stored lengths. Closing a read-only view does
 not remove its catalog entry.
 
+In the Fibers panel a click selects a fiber (and focuses the main views when
+they are shown); a double click opens it in Line Annotation, a span row at that
+span.
+
 A stored fiber opens read-only, from the Fibers panel, a viewer, a linked
 control point or the agent bridge (`fiber.open`), so opening it never re-solves
 or rewrites it. The view needs no Lasagna dataset; without one the strips use an

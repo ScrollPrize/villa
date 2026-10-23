@@ -423,7 +423,8 @@ void CFiberWidget::setupUi()
             this, &CFiberWidget::onHeaderSectionClicked);
 
     _treeView->setMinimumHeight(160);
-    _treeView->setToolTip(tr("Click a fiber to select it and focus the main views."));
+    _treeView->setToolTip(tr("Click a fiber to select it and focus the main views; "
+                             "double-click to open it in Line Annotation."));
     connect(_treeView, &QTreeView::clicked, this, [this](const QModelIndex& index) {
         const auto selected = selectedFiberIds();
         auto* item = _model->itemFromIndex(index);
@@ -656,8 +657,9 @@ void CFiberWidget::setLineAnnotationActive(bool active)
 {
     _lineAnnotationActive = active;
     _treeView->setToolTip(active
-        ? tr("Click a fiber to open its flattened view in Line Annotation.")
-        : tr("Click a fiber to select it and focus the main views."));
+        ? tr("Click a fiber to select it; double-click to open it in Line Annotation.")
+        : tr("Click a fiber to select it and focus the main views; "
+             "double-click to open it in Line Annotation."));
     _traceLabel->setVisible(!active);
     _traceSlider->setVisible(!active);
     _openInLineAnnotationButton->setVisible(!active);
@@ -810,11 +812,20 @@ void CFiberWidget::updateFiberDetails(const FiberEntry& fiber)
     for (const auto& tag : fiber.tags) {
         addUniqueSorted(_knownTags, tag);
     }
-    sortFibers();
-    // Rebuilding keeps an expanded row expanded, now with its span rows.
-    rebuildModel();
+    // Update the row in place: its index must survive, or a double click
+    // whose first click requested these details would lose its press.
+    if (QStandardItem* root = findFiberItem(fiber.id)) {
+        fillFiberRow(rowItemsForNameItem(root), fiber);
+        const bool expanded = _treeView->isExpanded(root->index());
+        root->removeRows(0, root->rowCount());
+        fillSpanChildren(root, fiber, expanded);
+        if (expanded) {
+            _treeView->setExpanded(root->index(), true);
+        }
+    }
     updateTotalLengthLabel();
     selectFibers(previousSelection);
+    updateClassificationUi();
 }
 
 void CFiberWidget::revealFiber(const FiberEntry& fiber)
@@ -973,7 +984,6 @@ void CFiberWidget::rebuildModel()
         }
     }
 
-    const bool showMetrics = _calcMetricsCheckBox && _calcMetricsCheckBox->isChecked();
     _model->removeRows(0, _model->rowCount());
     _model->setColumnCount(kColumnCount);
     _model->setHorizontalHeaderLabels(headerLabels());
@@ -982,54 +992,60 @@ void CFiberWidget::rebuildModel()
     }
 
     for (const auto& fiber : _listedFibers) {
-        QList<QStandardItem*> row{
-            readOnlyItem(displayNameForFiber(fiber)),
-            readOnlyItem(directionForFiber(fiber)),
-            readOnlyItem(fiber.linkedFiberCount > 0
-                             ? QString::number(fiber.linkedFiberCount)
-                             : QString()),
-            readOnlyItem(fiber.pendingLinkCount > 0
-                             ? QString::number(fiber.pendingLinkCount)
-                             : QString()),
-            readOnlyItem(vc3d::fiber_length::formatValue(fiber.lengthVx, _voxelSizeUm)),
-            readOnlyItem(QString::number(fiber.controlPointCount)),
-            readOnlyItem(QString::number(fiber.linePointCount)),
-            readOnlyItem(formatTags(fiber.tags)),
-            readOnlyItem(statusTextForFiber(fiber)),
-        };
-        applyRowMetadata(row, fiber.id, false, fiber.alignment, showMetrics);
-        // Predictions provenance: which fiber-inference manifests produced
-        // the traced spans, shown on the interp status cell.
-        QStringList tracedManifests;
-        for (const auto& span : fiber.spans) {
-            const QString manifest = QString::fromStdString(span.fiberManifest);
-            if (!manifest.isEmpty() && !tracedManifests.contains(manifest)) {
-                tracedManifests.push_back(manifest);
-            }
+        QList<QStandardItem*> row;
+        for (int column = 0; column < kColumnCount; ++column) {
+            row.push_back(readOnlyItem());
         }
-        if (!tracedManifests.isEmpty()) {
-            row[kInterpStatusColumn]->setToolTip(
-                tr("Traced with:\n%1").arg(tracedManifests.join(QStringLiteral("\n"))));
-        }
-
+        fillFiberRow(row, fiber);
         QStandardItem* root = row[kNameColumn];
         const bool wasExpanded =
             _treeView && expandedFibers.find(fiber.id) != expandedFibers.end();
-        if (wasExpanded && fiber.detailsLoaded) {
-            buildSpanChildRows(root, fiber);
-        } else if (!fiber.spans.empty() || (!fiber.detailsLoaded && fiber.controlPointCount >= 2)) {
-            // Placeholder keeps the expand arrow; the real span rows (the
-            // bulk of the model) are built on first expansion.
-            QStandardItem* placeholder = readOnlyItem(QString());
-            placeholder->setData(QVariant::fromValue(fiber.id), kFiberIdRole);
-            placeholder->setData(true, kSpanPlaceholderRole);
-            root->appendRow(placeholder);
-        }
-
+        fillSpanChildren(root, fiber, wasExpanded);
         _model->appendRow(row);
         if (wasExpanded) {
             _treeView->setExpanded(root->index(), true);
         }
+    }
+}
+
+void CFiberWidget::fillFiberRow(const QList<QStandardItem*>& row, const FiberEntry& fiber)
+{
+    const bool showMetrics = _calcMetricsCheckBox && _calcMetricsCheckBox->isChecked();
+    row[kNameColumn]->setText(displayNameForFiber(fiber));
+    row[kDirectionColumn]->setText(directionForFiber(fiber));
+    row[kLinkColumn]->setText(fiber.linkedFiberCount > 0 ? QString::number(fiber.linkedFiberCount) : QString());
+    row[kPendingColumn]->setText(fiber.pendingLinkCount > 0 ? QString::number(fiber.pendingLinkCount) : QString());
+    row[kLengthColumn]->setText(vc3d::fiber_length::formatValue(fiber.lengthVx, _voxelSizeUm));
+    row[kControlPointsColumn]->setText(QString::number(fiber.controlPointCount));
+    row[kLinePointsColumn]->setText(QString::number(fiber.linePointCount));
+    row[kTagsColumn]->setText(formatTags(fiber.tags));
+    row[kInterpStatusColumn]->setText(statusTextForFiber(fiber));
+    applyRowMetadata(row, fiber.id, false, fiber.alignment, showMetrics);
+    // Predictions provenance: which fiber-inference manifests produced
+    // the traced spans, shown on the interp status cell.
+    QStringList tracedManifests;
+    for (const auto& span : fiber.spans) {
+        const QString manifest = QString::fromStdString(span.fiberManifest);
+        if (!manifest.isEmpty() && !tracedManifests.contains(manifest)) {
+            tracedManifests.push_back(manifest);
+        }
+    }
+    row[kInterpStatusColumn]->setToolTip(tracedManifests.isEmpty()
+        ? QString()
+        : tr("Traced with:\n%1").arg(tracedManifests.join(QStringLiteral("\n"))));
+}
+
+void CFiberWidget::fillSpanChildren(QStandardItem* root, const FiberEntry& fiber, bool expanded)
+{
+    if (expanded && fiber.detailsLoaded) {
+        buildSpanChildRows(root, fiber);
+    } else if (!fiber.spans.empty() || (!fiber.detailsLoaded && fiber.controlPointCount >= 2)) {
+        // Placeholder keeps the expand arrow; the real span rows (the
+        // bulk of the model) are built on first expansion.
+        QStandardItem* placeholder = readOnlyItem(QString());
+        placeholder->setData(QVariant::fromValue(fiber.id), kFiberIdRole);
+        placeholder->setData(true, kSpanPlaceholderRole);
+        root->appendRow(placeholder);
     }
 }
 

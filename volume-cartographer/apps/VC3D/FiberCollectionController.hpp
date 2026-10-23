@@ -54,8 +54,8 @@ public:
     void openCollection(const QString& path);
     void firstPage();
     void nextPage();
-    // A listed fiber was clicked: focus it in the main views, or open it in
-    // Line Annotation while that workspace is active.
+    // A listed fiber was clicked: select it, focusing the main views while
+    // they are shown. Opening it in Line Annotation is a double click.
     void activateFiber(int64_t id);
     void selectFiber(int64_t id, bool focusView = true, bool openAnnotation = false);
     void navigate(int index);
