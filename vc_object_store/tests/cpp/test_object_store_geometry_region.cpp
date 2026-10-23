@@ -70,6 +70,7 @@ int main() try
         {
         auto write = store.write();
         ObjectRecord record; record.kind = "track"; record.track.emplace(); record.track->length = 20;
+        record.tags = {"reviewed", "track-only"};
         const auto id = store.upsertObject(write, record);
         vc::geometry::Track track; track.points = {{-10,0,0}, {10,0,0}, {10,10,0}};
         store.putGeometry(write, id, vc::geometry::encode(track));
@@ -84,6 +85,9 @@ int main() try
         require(fibers.intersectingObjects == 3 &&
                 std::none_of(fibers.runs.begin(), fibers.runs.end(), [&](const auto& run) { return run.objectUuid == id; }),
                 "kind filter excludes other kinds");
+        require(store.objectTags(read, std::string{"track"}) == std::vector<std::string>{"reviewed", "track-only"} &&
+                store.objectTags(read, std::string{"fiber"}).empty() &&
+                store.objectTags(read) == std::vector<std::string>{"reviewed", "track-only"}, "distinct tags filter by kind");
         RegionOptions patches; patches.kind = "patch";
         bool rejected = false;
         try { (void)store.geometryRegion(read, slice, patches); } catch (const std::invalid_argument&) { rejected = true; }

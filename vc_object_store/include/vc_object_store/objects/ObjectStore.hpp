@@ -387,6 +387,8 @@ public:
     std::vector<ObjectCoordinateGroup> objectCoordinateGroups(const Txn&, const std::string& kind,
                                                              const std::atomic_bool* cancel = nullptr) const;
     std::vector<ObjectRecord> objectsByTag(const Txn& txn, const std::string& tag, bool includeRetired = false) const;
+    // Distinct tags on active objects, optionally of one kind, sorted.
+    std::vector<std::string> objectTags(const Txn&, const std::optional<std::string>& kind = std::nullopt) const;
     // Require write(expected). Decisions use keepRecordedRelationship,
     // updateEdge/retainRelationship, or removeEdge before commit. UUID lookup
     // always includes retired objects. Restore copies content into a new revision;

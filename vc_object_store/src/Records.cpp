@@ -70,6 +70,17 @@ std::vector<ObjectRecord> ObjectStore::objectsByTag(const Txn& txn, const std::s
     return readObjectRows(db, s);
 }
 
+std::vector<std::string> ObjectStore::objectTags(const Txn& txn, const std::optional<std::string>& kind) const
+{
+    sqlite3* db = static_cast<sqlite3*>(connection(txn));
+    Statement s(db, "SELECT DISTINCT t.tag FROM object_tags t JOIN objects o ON o.id=t.object_id WHERE (?1 IS NULL OR o.kind=?1) AND " +
+                    activeObjectSql("o.id") + " ORDER BY t.tag");
+    if (kind) s.bind(1, *kind); else s.bindNull(1);
+    std::vector<std::string> tags;
+    while (s.row()) tags.push_back(s.text(0));
+    return tags;
+}
+
 void ObjectStore::deleteObject(WriteTxn& txn, const std::string& uuid)
 {
     sqlite3* db = static_cast<sqlite3*>(connection(txn));

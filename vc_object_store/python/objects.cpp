@@ -288,6 +288,8 @@ NB_MODULE(_native, m)
              nb::arg("include_retired") = false)
         .def("objects_by_tag", readMethod<&vo::ObjectStore::objectsByTag>(),
              nb::arg("tag"), nb::arg("include_retired") = false)
+        .def("object_tags", readMethod<&vo::ObjectStore::objectTags>(),
+             nb::arg("kind") = std::nullopt)
         .def("delete_object", writeMethod<&vo::ObjectStore::deleteObject>(),
              nb::arg("uuid"))
         .def("edge", readMethod<&vo::ObjectStore::edgeByUuid>(),
