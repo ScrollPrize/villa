@@ -7,11 +7,16 @@
 #include "ViewerManager.hpp"
 #include "vc/core/types/Volume.hpp"
 
+#include <QActionEvent>
+#include <QApplication>
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
 #include <QDoubleSpinBox>
-#include <QFormLayout>
+#include <QFrame>
+#include <QIcon>
+#include <QPixmap>
+#include <QScreen>
 #include <QFutureWatcher>
 #include <QHideEvent>
 #include <QLabel>
@@ -71,6 +76,11 @@ struct Fiber3DPanel::Impl {
     QDoubleSpinBox *minimum, *rangeMin, *rangeMax;
     QPushButton *customColor, *hColor, *vColor;
     QCheckBox* fixedRange;
+    QWidget *customRow, *familyRow, *directionRow, *paletteRow, *fixedRangeRow, *lengthRangeRow, *boxWidthRow, *annotationOptions;
+    QMenu* settingsMenu;
+    QWidgetAction* settingsAction;
+    QScrollArea* settingsScroll;
+    QWidget* settingsContents;
     DisplaySettings display;
     QTimer debounce;
     QFutureWatcher<LoadResult> watcher;
@@ -105,6 +115,12 @@ struct Fiber3DPanel::Impl {
         auto* gear = button(QString::fromUtf8("⚙"), QStringLiteral("fibers3DSettings"));
         gear->setToolTip(q->tr("3D display settings"));
         gear->setAccessibleName(q->tr("3D display settings"));
+        // The gear already identifies the popup; a native menu arrow overlaps it on macOS.
+        gear->setStyleSheet(QStringLiteral("QToolButton::menu-indicator { image: none; }"));
+        auto gearFont = gear->font();
+        gearFont.setPointSizeF(std::max(14.0, gearFont.pointSizeF() + 2.0));
+        gear->setFont(gearFont);
+        gear->setMinimumWidth(28);
         layout->addLayout(bar);
         canvas = new Fiber3DCanvas(q);
         canvas->setObjectName(QStringLiteral("fibers3DCanvas"));
@@ -205,105 +221,207 @@ struct Fiber3DPanel::Impl {
     {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         settings.beginGroup(QStringLiteral("fibers3d"));
-        auto* menu = new QMenu(gear);
-        auto* scroll = new QScrollArea(menu);
-        scroll->setWidgetResizable(true);
-        scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        scroll->setFixedSize(360, 560);
-        auto* contents = new QWidget(scroll);
-        auto* form = new QFormLayout(contents);
-        form->setRowWrapPolicy(QFormLayout::WrapLongRows);
-        form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
-        scroll->setWidget(contents);
-        auto* action = new QWidgetAction(menu);
-        action->setDefaultWidget(scroll);
-        menu->addAction(action);
-        gear->setMenu(menu);
+        settingsMenu = new QMenu(gear);
+        settingsScroll = new QScrollArea(settingsMenu);
+        settingsScroll->setWidgetResizable(true);
+        settingsScroll->setFrameShape(QFrame::NoFrame);
+        settingsScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+        settingsScroll->setFixedWidth(360);
+        settingsContents = new QWidget(settingsScroll);
+        auto* body = new QVBoxLayout(settingsContents);
+        body->setContentsMargins(12, 10, 12, 10);
+        body->setSpacing(7);
+        settingsScroll->setWidget(settingsContents);
+        settingsAction = new QWidgetAction(settingsMenu);
+        settingsAction->setDefaultWidget(settingsScroll);
+        settingsMenu->addAction(settingsAction);
+        gear->setMenu(settingsMenu);
         gear->setPopupMode(QToolButton::InstantPopup);
+        QObject::connect(settingsMenu, &QMenu::aboutToShow, q, [this] { resizeSettings(); });
+
+        auto section = [&](const QString& title) {
+            if (body->count())
+                body->addSpacing(5);
+            auto* label = new QLabel(title, settingsContents);
+            auto font = label->font();
+            font.setBold(true);
+            label->setFont(font);
+            body->addWidget(label);
+        };
+        auto row = [&](const QString& title, QWidget* field, QVBoxLayout* destination = nullptr) {
+            auto* container = new QWidget(settingsContents);
+            auto* line = new QHBoxLayout(container);
+            line->setContentsMargins(0, 0, 0, 0);
+            line->setSpacing(10);
+            auto* label = new QLabel(title, container);
+            label->setFixedWidth(108);
+            label->setBuddy(field);
+            line->addWidget(label);
+            line->addWidget(field, 1);
+            (destination ? destination : body)->addWidget(container);
+            return container;
+        };
         auto check = [&](const char* key, const QString& label, bool value) {
-            auto* w = new QCheckBox(contents);
+            auto* w = new QCheckBox(label, settingsContents);
             w->setObjectName(QString::fromLatin1(key));
             w->setChecked(settings.value(QString::fromLatin1(key), value).toBool());
-            form->addRow(label, w);
             return w;
         };
-        auto combo = [&](const char* key, const QString& label, const QStringList& choices, int defaultIndex = 0) {
-            auto* w = new QComboBox(contents);
+        auto combo = [&](const char* key, const QStringList& choices, int defaultIndex = 0) {
+            auto* w = new QComboBox(settingsContents);
             w->setObjectName(QString::fromLatin1(key));
             w->addItems(choices);
+            w->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+            w->setMinimumContentsLength(8);
+            w->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
             w->setCurrentIndex(std::clamp(settings.value(QString::fromLatin1(key), defaultIndex).toInt(), 0, int(choices.size()) - 1));
-            form->addRow(label, w);
             return w;
         };
-        auto real = [&](const char* key, const QString& label, double lo, double hi, double value, int decimals) {
-            auto* w = new QDoubleSpinBox(contents);
+        auto real = [&](const char* key, double lo, double hi, double value, int decimals, const QString& suffix = {}) {
+            auto* w = new QDoubleSpinBox(settingsContents);
             w->setObjectName(QString::fromLatin1(key));
             w->setRange(lo, hi);
             w->setDecimals(decimals);
+            w->setSuffix(suffix);
             w->setValue(settings.value(QString::fromLatin1(key), value).toDouble());
-            form->addRow(label, w);
             return w;
         };
-        auto integer = [&](const char* key, const QString& label, int lo, int hi, int value) {
-            auto* w = new QSpinBox(contents);
+        auto integer = [&](const char* key, int lo, int hi, int value) {
+            auto* w = new QSpinBox(settingsContents);
             w->setObjectName(QString::fromLatin1(key));
             w->setRange(lo, hi);
             w->setValue(settings.value(QString::fromLatin1(key), value).toInt());
-            form->addRow(label, w);
             return w;
         };
-        nativeSource = check("fibers3DNative", q->tr("Project annotations"), true);
-        afvSource = check("fibers3DAutomated", q->tr("Automated collection"), true);
-        h = check("fibers3DH", q->tr("Horizontal"), automated->showHorizontal());
-        v = check("fibers3DV", q->tr("Vertical"), automated->showVertical());
-        unknown = check("fibers3DUnknown", q->tr("Unclassified"), true);
-        minimum = real("fibers3DMinLength", q->tr("Minimum length (mm)"), 0, 10000, automated->minimumLengthMm(), 2);
-        // The shared collection controls own these filters; never restore a
-        // second, conflicting filter state from the 3D preferences.
-        h->setChecked(automated->showHorizontal());
-        v->setChecked(automated->showVertical());
-        minimum->setValue(automated->minimumLengthMm());
-        region = combo("fibers3DRegion", q->tr("Region"), {q->tr("Around CT focus"), q->tr("Whole volume")}, 1);
-        boxWidth = integer("fibers3DBoxWidth", q->tr("Box width (CT voxels)"), 16, 100000, 1024);
-        limit = integer("fibers3DLimit", q->tr("Maximum fibers per source"), 1, 50000, 10000);
-        auto* budget = new QLabel(q->tr("Geometry is limited to 16 MiB per source. Narrow the region if the view is partial."), contents);
-        budget->setWordWrap(true);
-        form->addRow(budget);
-        colors = combo("fibers3DColorMode", q->tr("Color"), {q->tr("Custom"), q->tr("H / V"), q->tr("Direction"), q->tr("Length")}, 1);
+        auto horizontal = [&](const QList<QWidget*>& widgets) {
+            auto* container = new QWidget(settingsContents);
+            auto* line = new QHBoxLayout(container);
+            line->setContentsMargins(0, 0, 0, 0);
+            line->setSpacing(8);
+            for (auto* widget : widgets)
+                line->addWidget(widget);
+            return container;
+        };
         auto colorButton = [&](const char* key, const QString& label, QColor& color) {
             const QColor stored(settings.value(QString::fromLatin1(key), color.name()).toString());
             if (stored.isValid())
                 color = stored;
-            auto* b = new QPushButton(color.name(), contents);
-            b->setObjectName(QString::fromLatin1(key));
-            form->addRow(label, b);
-            QObject::connect(b, &QPushButton::clicked, q, [this, b, &color] {
+            auto* button = new QPushButton(label, settingsContents);
+            button->setObjectName(QString::fromLatin1(key));
+            const auto refresh = [button, &color] {
+                QPixmap swatch(32, 32);
+                swatch.setDevicePixelRatio(2);
+                swatch.fill(color);
+                button->setIcon(QIcon(swatch));
+                button->setIconSize(QSize(16, 16));
+                button->setToolTip(color.name());
+            };
+            refresh();
+            QObject::connect(button, &QPushButton::clicked, q, [this, &color, refresh] {
                 const auto chosen = QColorDialog::getColor(color, q, q->tr("Fiber color"));
                 if (chosen.isValid()) {
                     color = chosen;
-                    b->setText(chosen.name());
+                    refresh();
                     applyDisplay();
                 }
             });
-            return b;
+            return button;
         };
-        customColor = colorButton("fibers3DCustomColor", q->tr("Custom color"), display.custom);
-        hColor = colorButton("fibers3DHColor", q->tr("H color"), display.horizontal);
-        vColor = colorButton("fibers3DVColor", q->tr("V color"), display.vertical);
-        direction =
-            combo("fibers3DDirection", q->tr("Direction"), {q->tr("XYZ orientation"), q->tr("Angle to X"), q->tr("Angle to Y"), q->tr("Angle to Z")});
-        palette =
-            combo("fibers3DPalette", q->tr("Palette"), {QStringLiteral("Viridis"), QStringLiteral("Magma"), QStringLiteral("Cividis"), QStringLiteral("Turbo")});
-        fixedRange = check("fibers3DFixedRange", q->tr("Fixed length range"), false);
-        rangeMin = real("fibers3DRangeMin", q->tr("Length minimum (mm)"), 0, 99999.99, 0, 2);
-        rangeMax = real("fibers3DRangeMax", q->tr("Length maximum (mm)"), 0.01, 100000, 10, 2);
-        auto* width = real("fibers3DLineWidth", q->tr("Line width (px)"), 0.5, 10, 2, 1);
-        auto* opacity = real("fibers3DOpacity", q->tr("Unselected opacity"), 0.05, 1, 1, 2);
-        auto* gaps = check("fibers3DGaps", q->tr("Dash gap spans"), true);
-        auto* annotationsVisible = check("fibers3DAnnotations", q->tr("Show annotation markers / tags"), false);
-        auto* selectedOnly = check("fibers3DAnnotationsSelected", q->tr("Annotations on selection only"), true);
+
+        section(q->tr("Sources"));
+        nativeSource = check("fibers3DNative", q->tr("Project annotations"), true);
+        afvSource = check("fibers3DAutomated", q->tr("Automated collection"), true);
+        body->addWidget(nativeSource);
+        body->addWidget(afvSource);
+        h = check("fibers3DH", q->tr("H"), automated->showHorizontal());
+        v = check("fibers3DV", q->tr("V"), automated->showVertical());
+        unknown = check("fibers3DUnknown", q->tr("Unclassified"), true);
+        h->setToolTip(q->tr("Horizontal fibers"));
+        v->setToolTip(q->tr("Vertical fibers"));
+        row(q->tr("Families"), horizontal({h, v, unknown}));
+        minimum = real("fibers3DMinLength", 0, 10000, automated->minimumLengthMm(), 2, q->tr(" mm"));
+        // The collection controls own these shared filters.
+        h->setChecked(automated->showHorizontal());
+        v->setChecked(automated->showVertical());
+        minimum->setValue(automated->minimumLengthMm());
+        row(q->tr("Min. length"), minimum);
+        region = combo("fibers3DRegion", {q->tr("Around CT focus"), q->tr("Whole volume")}, 1);
+        row(q->tr("Region"), region);
+        boxWidth = integer("fibers3DBoxWidth", 16, 100000, 1024);
+        boxWidth->setSuffix(q->tr(" vx"));
+        boxWidth->setToolTip(q->tr("Width in current CT volume voxels"));
+        boxWidthRow = row(q->tr("Box width"), boxWidth);
+
+        section(q->tr("Appearance"));
+        colors = combo("fibers3DColorMode", {q->tr("Custom"), q->tr("H / V"), q->tr("Direction"), q->tr("Length")}, 1);
+        row(q->tr("Color by"), colors);
+        customColor = colorButton("fibers3DCustomColor", q->tr("Choose…"), display.custom);
+        customRow = row(q->tr("Color"), customColor);
+        hColor = colorButton("fibers3DHColor", q->tr("H"), display.horizontal);
+        vColor = colorButton("fibers3DVColor", q->tr("V"), display.vertical);
+        familyRow = row(q->tr("Colors"), horizontal({hColor, vColor}));
+        direction = combo("fibers3DDirection", {q->tr("XYZ orientation"), q->tr("Angle to X"), q->tr("Angle to Y"), q->tr("Angle to Z")});
+        directionRow = row(q->tr("Orientation"), direction);
+        palette = combo("fibers3DPalette", {QStringLiteral("Viridis"), QStringLiteral("Magma"), QStringLiteral("Cividis"), QStringLiteral("Turbo")});
+        paletteRow = row(q->tr("Palette"), palette);
+        fixedRange = check("fibers3DFixedRange", q->tr("Fixed range"), false);
+        fixedRangeRow = row(q->tr("Length scale"), fixedRange);
+        rangeMin = real("fibers3DRangeMin", 0, 99999.99, 0, 2);
+        rangeMax = real("fibers3DRangeMax", 0.01, 100000, 10, 2);
+        rangeMin->setAccessibleName(q->tr("Minimum length in millimeters"));
+        rangeMax->setAccessibleName(q->tr("Maximum length in millimeters"));
+        lengthRangeRow = new QWidget(settingsContents);
+        auto* rangeLayout = new QVBoxLayout(lengthRangeRow);
+        rangeLayout->setContentsMargins(0, 0, 0, 0);
+        rangeLayout->setSpacing(7);
+        rangeMin->setSuffix(q->tr(" mm"));
+        rangeMax->setSuffix(q->tr(" mm"));
+        row(q->tr("Minimum"), rangeMin, rangeLayout);
+        row(q->tr("Maximum"), rangeMax, rangeLayout);
+        body->addWidget(lengthRangeRow);
+        auto* width = real("fibers3DLineWidth", 0.5, 10, 2, 1, q->tr(" px"));
+        row(q->tr("Line width"), width);
+
+        section(q->tr("Annotations"));
+        auto* gaps = check("fibers3DGaps", q->tr("Dashed gaps"), true);
+        auto* annotationsVisible = check("fibers3DAnnotations", q->tr("Show markers and tags"), false);
+        auto* selectedOnly = check("fibers3DAnnotationsSelected", q->tr("Selected fiber only"), true);
+        body->addWidget(gaps);
+        body->addWidget(annotationsVisible);
+        annotationOptions = selectedOnly;
+        body->addWidget(annotationOptions);
+
+        body->addSpacing(5);
+        auto* advanced = new QToolButton(settingsContents);
+        advanced->setObjectName(QStringLiteral("fibers3DAdvanced"));
+        advanced->setText(q->tr("More display options"));
+        advanced->setCheckable(true);
+        advanced->setAutoRaise(true);
+        advanced->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+        advanced->setArrowType(Qt::RightArrow);
+        body->addWidget(advanced);
+        auto* advancedContent = new QWidget(settingsContents);
+        auto* advancedLayout = new QVBoxLayout(advancedContent);
+        advancedLayout->setContentsMargins(0, 0, 0, 0);
+        advancedLayout->setSpacing(7);
+        auto* opacity = real("fibers3DOpacity", 0.05, 1, 1, 2);
+        row(q->tr("Unselected"), opacity, advancedLayout);
+        opacity->setToolTip(q->tr("Opacity of unselected fibers"));
         auto* perspective = check("fibers3DPerspective", q->tr("Perspective"), false);
         auto* bounds = check("fibers3DBounds", q->tr("Show region bounds"), true);
+        advancedLayout->addWidget(perspective);
+        advancedLayout->addWidget(bounds);
+        limit = integer("fibers3DLimit", 1, 50000, 10000);
+        limit->setToolTip(q->tr("Maximum displayed fibers per source"));
+        row(q->tr("Fiber limit"), limit, advancedLayout);
+        body->addWidget(advancedContent);
+        advancedContent->hide();
+        QObject::connect(advanced, &QToolButton::toggled, q, [this, advanced, advancedContent](bool expanded) {
+            advanced->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
+            advancedContent->setVisible(expanded);
+            resizeSettings();
+        });
+
         auto changedDisplay = [=, this] {
             display.lineWidth = float(width->value());
             display.unselectedOpacity = float(opacity->value());
@@ -323,7 +441,8 @@ struct Fiber3DPanel::Impl {
             QObject::connect(w, &QCheckBox::toggled, q, [this] { sharedFilters(); });
         QObject::connect(minimum, &QDoubleSpinBox::valueChanged, q, [this] { sharedFilters(); });
         QObject::connect(region, &QComboBox::currentIndexChanged, q, [this] {
-            boxWidth->setEnabled(region->currentIndex() == 0);
+            boxWidthRow->setVisible(region->currentIndex() == 0);
+            resizeSettings();
             request();
             saveSettings();
         });
@@ -338,8 +457,20 @@ struct Fiber3DPanel::Impl {
             QObject::connect(w, &QDoubleSpinBox::valueChanged, q, changedDisplay);
         for (auto* w : {fixedRange, gaps, annotationsVisible, selectedOnly, perspective, bounds})
             QObject::connect(w, &QCheckBox::toggled, q, changedDisplay);
-        boxWidth->setEnabled(region->currentIndex() == 0);
+        boxWidthRow->setVisible(region->currentIndex() == 0);
         changedDisplay();
+    }
+
+    void resizeSettings()
+    {
+        settingsContents->layout()->activate();
+        const auto available = q->screen()->availableGeometry();
+        const int maximum = std::max(240, std::min(560, available.height() - 80));
+        settingsScroll->setFixedHeight(std::min(maximum, settingsContents->sizeHint().height() + 4));
+        // QMenu caches action geometry; embedded widget resizing alone does not invalidate it.
+        QActionEvent changed(QEvent::ActionChanged, settingsAction);
+        QApplication::sendEvent(settingsMenu, &changed);
+        settingsMenu->adjustSize();
     }
 
     void saveSettings()
@@ -373,14 +504,14 @@ struct Fiber3DPanel::Impl {
         }
         display.lengthMaxMm = rangeMax->value();
         const bool length = display.colorMode == ColorMode::Length;
-        customColor->setEnabled(display.colorMode == ColorMode::Custom);
-        hColor->setEnabled(display.colorMode == ColorMode::Family);
-        vColor->setEnabled(display.colorMode == ColorMode::Family);
-        direction->setEnabled(display.colorMode == ColorMode::Direction);
-        palette->setEnabled(length || (display.colorMode == ColorMode::Direction && display.directionMode != DirectionMode::XYZ));
-        fixedRange->setEnabled(length);
-        rangeMin->setEnabled(length && display.fixedLengthRange);
-        rangeMax->setEnabled(length && display.fixedLengthRange);
+        customRow->setVisible(display.colorMode == ColorMode::Custom);
+        familyRow->setVisible(display.colorMode == ColorMode::Family);
+        directionRow->setVisible(display.colorMode == ColorMode::Direction);
+        paletteRow->setVisible(length || (display.colorMode == ColorMode::Direction && display.directionMode != DirectionMode::XYZ));
+        fixedRangeRow->setVisible(length);
+        lengthRangeRow->setVisible(length && display.fixedLengthRange);
+        annotationOptions->setVisible(display.showAnnotations);
+        resizeSettings();
         canvas->setDisplaySettings(display);
         updateSelection();
         saveSettings();

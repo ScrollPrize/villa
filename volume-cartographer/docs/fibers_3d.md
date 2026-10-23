@@ -29,6 +29,12 @@ The gear menu controls:
   distinct markers; `damaged` has a separate pattern. Link overlays are not
   drawn. Known `gap` spans and AFV inferred gaps are dashed by default.
 
+Settings are grouped into Sources, Appearance and Annotations. Only controls
+for the active colour mode are shown, and the CT box width appears when using
+the focus region. **More display options** contains unselected opacity,
+perspective, region bounds and the fibre limit. The popup adapts its height to
+the visible controls and scrolls when necessary.
+
 ## Geometry and loading
 
 The view uses original stored polylines without resampling or joining separate
@@ -80,3 +86,8 @@ length colours,
 orbit without data reload, picking, exact CT centring, hide/reopen and
 float/redock. Full-window bridge captures composite the OpenGL framebuffer;
 Qt's raster-only widget capture cannot capture this content correctly.
+
+The settings popup was also checked on macOS in H/V, direction and fixed-length
+modes, with advanced options expanded and collapsed. Its height follows the
+visible controls; all controls remain reachable by scrolling with no horizontal
+overflow. The gear has no overlapping native menu indicator.
