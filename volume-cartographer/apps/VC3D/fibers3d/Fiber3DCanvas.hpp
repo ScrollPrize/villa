@@ -33,6 +33,7 @@ signals:
     void fiberPicked(QString key, qint64 linePointIndex, double x, double y, double z);
     void fiberContextRequested(QString key, qint64 linePointIndex, double x, double y, double z, QPoint globalPos);
     void emptyContextRequested(QPoint globalPos);
+    void clearSelectionRequested();
 
 protected:
     void initializeGL() override;
@@ -42,6 +43,7 @@ protected:
     void mouseReleaseEvent(QMouseEvent* event) override;
     void wheelEvent(QWheelEvent* event) override;
     void contextMenuEvent(QContextMenuEvent* event) override;
+    void keyPressEvent(QKeyEvent* event) override;
 
 private:
     struct Impl;

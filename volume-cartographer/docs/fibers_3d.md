@@ -7,6 +7,10 @@ layout is saved with the workspace. It does not load another copy of the CT.
 Drag to orbit, middle/right-drag to pan, and use the wheel to zoom. Click a fibre
 to select it in the existing annotation or automated-fibre list. Right-click a
 fibre to centre the CT views at the picked point or open Line Annotation.
+Press **Escape** with the 3D view focused, click empty space without dragging,
+or choose **Clear selection** in its right-click menu to deselect. This also
+clears the selection in the fibre lists and CT overlays; it does not delete
+fibres or close the collection. Camera dragging does not clear selection.
 **Fit** frames the displayed geometry; **Fit selected** frames its selected
 portion. Changing filters or styles preserves the camera.
 Selecting an AFV fibre in a CT slice or the catalogue also highlights it in
@@ -136,3 +140,9 @@ the marker pixels, and 12 focus moves caused no scene reload in whole-volume
 mode. Canvas checks also cover a focus outside the fibre bounds but inside the
 view, invalid/out-of-view positions, clearing the scene, and large coordinates.
 These checks ran on macOS; the crosshair uses portable Qt painting.
+
+Deselection was checked on the published Paris4 AFV (512,698 fibres), using an
+isolated profile and a bounded focus region. Escape and an empty-space click
+clear both the AFV list and the 3D selection; dragging preserves selection.
+An outstanding inspection request cannot restore a cleared selection. With no
+selection, 87% and 100% other-fibre opacity produce identical framebuffer pixels.

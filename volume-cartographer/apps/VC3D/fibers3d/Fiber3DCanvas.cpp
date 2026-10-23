@@ -4,6 +4,7 @@
 
 #include <QApplication>
 #include <QContextMenuEvent>
+#include <QKeyEvent>
 #include <QLinearGradient>
 #include <QMatrix4x4>
 #include <QMouseEvent>
@@ -662,6 +663,16 @@ void Fiber3DCanvas::contextMenuEvent(QContextMenuEvent* event)
     event->accept();
 }
 
+void Fiber3DCanvas::keyPressEvent(QKeyEvent* event)
+{
+    if (event->key() == Qt::Key_Escape) {
+        emit clearSelectionRequested();
+        event->accept();
+        return;
+    }
+    QOpenGLWidget::keyPressEvent(event);
+}
+
 void Fiber3DCanvas::wheelEvent(QWheelEvent* event)
 {
     const double steps = !event->pixelDelta().isNull() ? event->pixelDelta().y() / 120.0 : event->angleDelta().y() / 120.0;
@@ -717,6 +728,8 @@ void Fiber3DCanvas::pick(const QPointF& position, bool context, const QPoint& gl
     if (!best || !d->scene) {
         if (context)
             emit emptyContextRequested(globalPosition);
+        else
+            emit clearSelectionRequested();
         return;
     }
     const auto point = interpolate(best->a, best->b, bestT);

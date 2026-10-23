@@ -132,7 +132,7 @@ struct Fiber3DPanel::Impl {
         status->setObjectName(QStringLiteral("fibers3DStatus"));
         layout->addWidget(status);
         canvas->setToolTip(
-            q->tr("Drag to orbit · right/middle drag to pan · wheel to zoom\nClick to select · right-click for CT navigation"));
+            q->tr("Drag to orbit · right/middle drag to pan · wheel to zoom\nClick to select · Escape or click empty space to clear selection\nRight-click for CT navigation"));
         QObject::connect(fit, &QToolButton::clicked, canvas, &Fiber3DCanvas::fitAll);
         QObject::connect(fitSelected, &QToolButton::clicked, canvas, &Fiber3DCanvas::fitSelected);
         QObject::connect(detach, &QToolButton::clicked, q, &Fiber3DPanel::detachRequested);
@@ -170,6 +170,7 @@ struct Fiber3DPanel::Impl {
         QObject::connect(canvas, &Fiber3DCanvas::fiberPicked, q, [this](const QString& key, qint64, double, double, double) {
             select(key, true);
         });
+        QObject::connect(canvas, &Fiber3DCanvas::clearSelectionRequested, q, [this] { clearSelection(); });
         QObject::connect(canvas, &Fiber3DCanvas::fiberContextRequested, q, [this](const QString& key, qint64 index, double x, double y, double z, QPoint p) {
             select(key, true);
             contextMenu(p, key, index, {x, y, z});
@@ -195,6 +196,8 @@ struct Fiber3DPanel::Impl {
         QObject::connect(automated, &FiberCollectionController::fiberSelectionChanged, q, [this](qint64 id) {
             if (const auto source = automated->sourceDescriptor(); source && id > 0) {
                 select(source->uuid + QLatin1Char(':') + QString::number(id), false);
+            } else if (id == 0 && !selectedKey.startsWith(QStringLiteral("annotation:"))) {
+                select({}, false);
             }
         });
         auto reset = [this] {
@@ -685,6 +688,15 @@ struct Fiber3DPanel::Impl {
             }
     }
 
+    void clearSelection()
+    {
+        // Clear the shared selections as well as this view: slice overlays and
+        // asynchronous inspection must not restore the old highlight.
+        select({}, false);
+        automated->clearSelection();
+        emit q->nativeFiberSelected(0);
+    }
+
     void updateSelection()
     {
         const auto* fiber = find(selectedKey);
@@ -698,6 +710,7 @@ struct Fiber3DPanel::Impl {
         if (display.showAnnotations && !fiber->tags.empty())
             text += QLatin1Char('\n') + fiber->tags.join(QStringLiteral(", "));
         selection->setText(text);
+        selection->setToolTip(q->tr("Escape in the 3D view or click empty space to clear selection."));
     }
 
     void contextMenu(QPoint position, const QString& key, qint64 index, Point point)
@@ -724,6 +737,10 @@ struct Fiber3DPanel::Impl {
                 else if (annotations->hasLoadedFiber(id, file.toStdString()))
                     annotations->openFiberAtLinePointIndex(id, int(std::clamp<qint64>(index, 0, std::numeric_limits<int>::max())));
             });
+        }
+        if (!selectedKey.isEmpty()) {
+            menu.addSeparator();
+            menu.addAction(q->tr("Clear selection"), q, [this] { clearSelection(); });
         }
         menu.exec(position);
     }
