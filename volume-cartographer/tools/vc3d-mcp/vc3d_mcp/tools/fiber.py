@@ -88,13 +88,17 @@ async def vc3d_fiber_open(
     control_point_index: Optional[int] = None,
     line_point_index: Optional[int] = None,
     span: Optional[list[int]] = None,
+    editable: bool = False,
 ) -> dict[str, Any]:
     """Open a saved fiber in the line-annotation workspace, optionally focused
     at a control point, a line-point index, or a [first, second] control-index
-    span. Pass at most one selector. Requires a manifest-backed Lasagna
-    dataset (a "lasagna"-kind catalog representation, NOT a "normal_grids"
-    store and NOT the vc3d_lasagna_* fit service) resolvable for the currently
-    selected volume; otherwise fails -32005 with detail."""
+    span. Pass at most one selector. The workspace opens read-only, so opening
+    never re-solves or rewrites the fiber; pass editable=True to enable editing
+    (as the workspace's Enable editing button does). Editing requires a
+    manifest-backed Lasagna dataset (a "lasagna"-kind catalog representation,
+    NOT a "normal_grids" store and NOT the vc3d_lasagna_* fit service)
+    resolvable for the currently selected volume; otherwise fails -32005 with
+    detail."""
     return await _call(
         "fiber.open",
         _strip_none(
@@ -103,6 +107,7 @@ async def vc3d_fiber_open(
                 "controlPointIndex": control_point_index,
                 "linePointIndex": line_point_index,
                 "span": span,
+                "editable": editable,
             }
         ),
     )

@@ -328,6 +328,9 @@ public:
     void openFiberAtControlPoint(uint64_t fiberId, int controlPointIndex);
     void openFiberAtLinePointIndex(uint64_t fiberId, int linePointIndex);
     void openFiberSpan(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
+    // Stored fibers open read-only. Enables editing in the most recent pane of
+    // this fiber (as its Enable editing button does); false when it cannot.
+    bool enableFiberEditing(uint64_t fiberId);
     void deleteFiber(uint64_t fiberId);
     // Retire the selected object UUIDs and remove their links in one checked action.
     vc3d::line_annotation::FiberDeleteOutcome deleteFibers(std::vector<uint64_t> fiberIds);
@@ -626,6 +629,10 @@ private:
     std::string nextSurfaceName();
     void cleanupSurfaceName(const std::string& surfaceName);
     bool prepareForUserFacingLineAnnotationOpen();
+    // Wires a pane's editing, linking and optimization requests; read-only
+    // panes get them when editing is enabled.
+    void connectSessionEditing(LineAnnotationDialog* dialog, const std::string& surfaceName);
+    bool enableSessionEditing(const std::string& surfaceName);
     bool launchSession(SourceKind sourceKind,
                        const std::string& surfaceName,
                        std::shared_ptr<Surface> sourceSurface,

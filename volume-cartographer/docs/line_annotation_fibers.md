@@ -13,6 +13,16 @@ expanding a fiber reads its exact span details from its current revision. The
 total length sums the listed fibers' stored lengths. Closing a read-only view does
 not remove its catalog entry.
 
+A stored fiber opens read-only, from the Fibers panel, a viewer, a linked
+control point or the agent bridge (`fiber.open`), so opening it never re-solves
+or rewrites it. The view needs no Lasagna dataset; without one the strips use an
+inspection frame. **Enable editing** in the window's top bar switches the same
+view to editing: it checks that the store still holds the revision on screen,
+asks for the dataset editing needs, and rebuilds the strips in the sheet frame.
+A single-point fiber is traced at that moment. Fibers created or merged in the
+window open editable; `fiber.open` takes `editable: true` for the same. With a
+read-only store attachment the button stays disabled.
+
 Each fiber's explicit coordinate binding determines its transform into the active
 volume. Unbound fibers remain listed but are excluded from spatial overlays and
 search until bound. Slice, intersection, map and point-collection views apply the

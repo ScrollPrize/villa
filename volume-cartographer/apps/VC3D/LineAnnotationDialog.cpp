@@ -1164,6 +1164,14 @@ LineAnnotationDialog::LineAnnotationDialog(ViewerManager* viewerManager,
     // The side-strip intersection query still runs (it feeds the fiber-
     // intersection X markers); we just no longer show a progress indicator.
     // _sideStripIntersectionProgress stays null and its setters no-op.
+    _enableEditingButton = new QPushButton(tr("Enable editing"), buttonRow);
+    _enableEditingButton->setObjectName(QStringLiteral("lineAnnotationEnableEditingButton"));
+    _enableEditingButton->setToolTip(
+        tr("Stored fibers open read-only, so opening one never re-solves or rewrites it. "
+           "Enable editing to change it."));
+    _enableEditingButton->hide();
+    buttonLayout->addWidget(_enableEditingButton);
+    connect(_enableEditingButton, &QPushButton::clicked, this, &LineAnnotationDialog::editingRequested);
     _fiberNameLabel = new QLabel(buttonRow);
     _fiberNameLabel->setObjectName(QStringLiteral("lineAnnotationFiberNameLabel"));
     _fiberNameLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -1433,8 +1441,9 @@ void LineAnnotationDialog::updateFiberDisplayControlsAndGuides()
         const QSignalBlocker blocker(_controlAngleSpin);
         const double angle = _angleControlIndex
             ? _generatedViews.controlAngleOffsetsDegrees[*_angleControlIndex] * _displayTangentSign : 0;
-        if (_controlAngleSpin->isEnabled() != _angleControlIndex.has_value())
-            _controlAngleSpin->setEnabled(_angleControlIndex.has_value());
+        const bool angleEditable = _angleControlIndex.has_value() && !_readOnly;
+        if (_controlAngleSpin->isEnabled() != angleEditable)
+            _controlAngleSpin->setEnabled(angleEditable);
         if (std::abs(_controlAngleSpin->value() - angle) >= 0.005) _controlAngleSpin->setValue(angle);
     }
     for (size_t i = 0; i < _fiberGuides.size(); ++i) {
@@ -2109,6 +2118,20 @@ void LineAnnotationDialog::setFiberTags(const std::vector<std::string>& knownTag
 void LineAnnotationDialog::setCloseAfterFinalizationAllowed(bool allowed)
 {
     _closeAfterFinalizationAllowed = allowed;
+}
+
+void LineAnnotationDialog::setReadOnly(bool readOnly, bool canEdit)
+{
+    _readOnly = readOnly;
+    _enableEditingButton->setVisible(readOnly);
+    _enableEditingButton->setEnabled(canEdit);
+    if (!canEdit) {
+        _enableEditingButton->setToolTip(
+            tr("This fiber cannot be edited: the object store is attached read-only "
+               "or the fiber does not decode."));
+    }
+    _fiberWidthSpin->setEnabled(!readOnly);
+    if (_controlAngleSpin && readOnly) _controlAngleSpin->setEnabled(false);
 }
 
 void LineAnnotationDialog::setWorkspaceEmbedded(bool embedded)

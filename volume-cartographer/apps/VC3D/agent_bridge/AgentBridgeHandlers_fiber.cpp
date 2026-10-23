@@ -310,6 +310,9 @@ QJsonObject AgentBridgeServer::handleFiberOpen(const QJsonValue& params)
         } else {
             ctrl->openFiber(fiberId);
         }
+        // Stored fibers open read-only; editing is an explicit request.
+        if (p.value("editable").toBool(false))
+            ctrl->enableFiberEditing(fiberId);
     });
     if (!err.isEmpty()) {
         QJsonObject data;
