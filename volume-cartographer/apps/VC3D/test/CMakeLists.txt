@@ -9,6 +9,7 @@ vc_register_ctest(surface_transform_name test_surface_transform_name)
 
 add_executable(test_manual_add_extend test_manual_add_extend.cpp
     ../segmentation/SurfaceGridEdit.cpp
+    ../segmentation/tools/AutoExtend.cpp
     ../segmentation/tools/ManualAddTool.cpp
     ../segmentation/tools/ThinPlateSpline3d.cpp)
 set_target_properties(test_manual_add_extend PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)

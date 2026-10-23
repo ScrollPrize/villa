@@ -2,6 +2,7 @@
 
 #include "segmentation/SegmentationUndoHistory.hpp"
 #include "segmentation/SurfaceGridEdit.hpp"
+#include "segmentation/tools/AutoExtend.hpp"
 #include "segmentation/tools/ManualAddTool.hpp"
 
 #include "vc/core/util/PlaneSurface.hpp"
@@ -66,6 +67,7 @@ private slots:
     void undoHistoryFollowsGridPadding();
     void sheetWalkFollowsACurvedSheet();
     void guidedClicksStayLocal();
+    void autoExtendGrowsAlongTheSheet();
 };
 
 void TestManualAddExtend::paddingCoversOnlyTheMissingRoom()
@@ -466,6 +468,50 @@ void TestManualAddExtend::guidedClicksStayLocal()
     QVERIFY2(tool.applySheetWalk(walk->extensionId, guess, &status), status.c_str());
     QVERIFY(distance(tool.previewPoints()(2, 25), straight(2, 25) + cv::Vec3f(0.0f, 0.0f, 10.0f)) < 0.5f);
     QVERIFY(distance(tool.previewPoints()(17, 25), straight(17, 25)) < 1e-3f);
+}
+
+void TestManualAddExtend::autoExtendGrowsAlongTheSheet()
+{
+    QuadSurface surface(curvedSheet(6, 10, 10), cv::Vec2f(0.5f, 0.5f));
+    segmentation::AutoExtendOptions options;
+    options.sides = {ManualAddTool::ExtendSide::Right, ManualAddTool::ExtendSide::Up};
+    options.cells = 5;
+    options.rounds = 3;
+    options.threads = 2;
+    std::string status;
+    const auto result = segmentation::autoExtendSurface(surface, cylinderNormal, options, &status);
+    QVERIFY2(result, status.c_str());
+
+    // Right then Up, three times: each round starts from the edge the last one left.
+    QCOMPARE(static_cast<int>(result->steps.size()), 6);
+    QCOMPARE(result->steps[0].added, 6 * 5);
+    QCOMPARE(result->steps[1].added, 15 * 5);
+    QCOMPARE(result->steps[2].added, 11 * 5);
+    QCOMPARE(result->added, 30 + 75 + 55 + 100 + 80 + 125);
+    const auto& points = *surface.rawPointsPtr();
+    QCOMPARE(points.rows, 6 + 15);
+    QCOMPARE(points.cols, 10 + 15);
+    for (int row = 0; row < points.rows; ++row) {
+        for (int col = 0; col < points.cols; ++col) {
+            const auto& p = points(row, col);
+            QVERIFY(!ManualAddTool::isInvalidPoint(p));
+            QVERIFY2(std::abs(std::hypot(p[0], p[1]) - kRadius) < 1.0f,
+                     qPrintable(QString("(%1, %2) radius %3").arg(row).arg(col).arg(std::hypot(p[0], p[1]))));
+        }
+    }
+    for (const auto& step : result->steps) {
+        QCOMPARE(step.stepsWithoutNormal, 0);
+    }
+
+    // Without normals every step counts as missing and the lines run straight.
+    QuadSurface flat(flatSheet(6, 10, cv::Rect(0, 0, 10, 6)), cv::Vec2f(0.5f, 0.5f));
+    options.sides = {ManualAddTool::ExtendSide::Right};
+    options.rounds = 1;
+    const auto none = segmentation::autoExtendSurface(
+        flat, [](const cv::Vec3f&) { return std::optional<cv::Vec3f>(); }, options, &status);
+    QVERIFY2(none, status.c_str());
+    QCOMPARE(none->steps[0].stepsWithoutNormal, 6 * 5);
+    QVERIFY(distance((*flat.rawPointsPtr())(3, 14), cv::Vec3f(14 * kSpacing, 3 * kSpacing, 100.0f)) < 1e-3f);
 }
 
 QTEST_APPLESS_MAIN(TestManualAddExtend)

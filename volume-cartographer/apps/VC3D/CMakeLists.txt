@@ -411,6 +411,20 @@ target_link_libraries(VC3D
     Blosc::blosc
 )
 
+# Headless Manual Add edge extension along the sheet (no GUI). Qt Core only
+# because ManualAddTool's headers use it.
+add_executable(vc_extend_edge
+    cli/vc_extend_edge.cpp
+    segmentation/SurfaceGridEdit.cpp
+    segmentation/tools/AutoExtend.cpp
+    segmentation/tools/ManualAddTool.cpp
+    segmentation/tools/SheetNormalField.cpp
+    segmentation/tools/ThinPlateSpline3d.cpp)
+target_include_directories(vc_extend_edge PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/../vc_reader/src/cpp)
+target_link_libraries(vc_extend_edge PRIVATE vc_core Qt6::Core Boost::program_options)
+
 # Build-tree Qt plugin deployment (MSVC/vcpkg). vcpkg copies the Qt DLLs next to
 # the executable but not the plugin tree, so a freshly built VC3D.exe cannot find
 # platforms/qwindows.dll and aborts on startup. Copy the plugin folders next to
