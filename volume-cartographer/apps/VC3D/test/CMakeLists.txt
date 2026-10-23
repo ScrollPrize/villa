@@ -656,3 +656,22 @@ target_link_libraries(test_surface_catalog PRIVATE vc_core Qt6::Core Qt6::Concur
 add_test(NAME surface_catalog COMMAND test_surface_catalog)
 vc_register_test_target(test_surface_catalog)
 vc_register_ctest(surface_catalog test_surface_catalog)
+# Read-only 3D geometry adapters: source indices, frames, tags, and clipping.
+add_executable(test_fiber_3d_data test_fiber_3d_data.cpp
+    ../fibers3d/Fiber3DData.cpp)
+set_target_properties(test_fiber_3d_data PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_fiber_3d_data PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_fiber_3d_data PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core vc_fiber_collection)
+add_test(NAME fiber_3d_data COMMAND test_fiber_3d_data)
+vc_register_test_target(test_fiber_3d_data)
+vc_register_ctest(fiber_3d_data test_fiber_3d_data)
+
+add_executable(test_fiber_3d_geometry test_fiber_3d_geometry.cpp)
+set_target_properties(test_fiber_3d_geometry PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_fiber_3d_geometry PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_fiber_3d_geometry PRIVATE
+    Qt6::Core Qt6::Gui Qt6::Test vc_fiber_collection)
+add_test(NAME fiber_3d_geometry COMMAND test_fiber_3d_geometry)
+vc_register_test_target(test_fiber_3d_geometry)
+vc_register_ctest(fiber_3d_geometry test_fiber_3d_geometry)

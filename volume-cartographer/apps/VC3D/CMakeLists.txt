@@ -20,6 +20,16 @@ set(srcs
     SurfaceCatalog.hpp
     FiberCollectionController.hpp
     FiberDisplayOptions.hpp
+    fibers3d/Fiber3DScene.hpp
+    fibers3d/Fiber3DData.cpp
+    fibers3d/Fiber3DData.hpp
+    fibers3d/Fiber3DCanvas.cpp
+    fibers3d/Fiber3DCanvas.hpp
+    fibers3d/Fiber3DColor.hpp
+    fibers3d/Fiber3DGeometry.hpp
+    fibers3d/Fiber3DPanel.cpp
+    fibers3d/Fiber3DPanel.hpp
+    LineAnnotationPolylineIndices.hpp
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp
     StatusDockPanelHost.hpp
