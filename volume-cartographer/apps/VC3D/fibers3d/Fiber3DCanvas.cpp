@@ -10,6 +10,7 @@
 #include <QOpenGLContext>
 #include <QOpenGLShaderProgram>
 #include <QPainter>
+#include <QPainterPath>
 #include <QQuaternion>
 #include <QSurfaceFormat>
 #include <QVector2D>
@@ -172,6 +173,7 @@ struct Fiber3DCanvas::Impl {
     std::vector<Segment> segments;
     Bounds bounds = emptyBounds();
     Point origin{}, target{};
+    std::optional<Point> cursorPosition;
     QQuaternion rotation = QQuaternion::fromEulerAngles(-25.0f, 30.0f, 0.0f);
     double radius = 100.0, scale = 100.0;
     bool fitted = false, dirty = false, glReady = false, dragging = false;
@@ -309,6 +311,7 @@ void Fiber3DCanvas::setSelectedKey(const QString& key)
 void Fiber3DCanvas::clear()
 {
     d->scene.reset();
+    d->cursorPosition.reset();
     d->selectedKey.clear();
     d->selectedIndex = -1;
     d->fitted = false;
@@ -409,6 +412,16 @@ void Fiber3DCanvas::focusPoint(Point point)
     if (!finite(point))
         return;
     d->target = point;
+    update();
+}
+
+void Fiber3DCanvas::setCursorPosition(std::optional<Point> position)
+{
+    if (position && !finite(*position))
+        position.reset();
+    if (d->cursorPosition == position)
+        return;
+    d->cursorPosition = position;
     update();
 }
 
@@ -544,6 +557,26 @@ void Fiber3DCanvas::paintGL()
                 if (i < j && corners[i].w() > 0 && corners[j].w() > 0 && corners[i].z() >= -corners[i].w() && corners[j].z() >= -corners[j].w())
                     painter.drawLine(screen(corners[i]), screen(corners[j]));
             }
+    }
+    if (d->cursorPosition) {
+        // Subtract the scene origin in double precision before projection, as
+        // for the fiber geometry. Do not snap or clamp the CT focus to a fiber.
+        const QVector4D p = matrix * QVector4D(relative(*d->cursorPosition, d->origin), 1);
+        if (std::isfinite(p.w()) && p.w() > 0 && std::isfinite(p.x()) && std::isfinite(p.y()) && std::isfinite(p.z()) &&
+            std::abs(p.x()) <= p.w() && std::abs(p.y()) <= p.w() && std::abs(p.z()) <= p.w()) {
+            const QPointF center((p.x() / p.w() + 1) * width() * .5, (1 - p.y() / p.w()) * height() * .5);
+            QPainterPath reticle;
+            reticle.addEllipse(center, 3, 3);
+            for (const QPointF axis : {QPointF(1, 0), QPointF(-1, 0), QPointF(0, 1), QPointF(0, -1)}) {
+                reticle.moveTo(center + axis * 6);
+                reticle.lineTo(center + axis * 11);
+            }
+            // Logical pixels keep the navigation marker the same size on Retina.
+            painter.setPen(QPen(QColor(10, 14, 18), 4, Qt::SolidLine, Qt::RoundCap));
+            painter.drawPath(reticle);
+            painter.setPen(QPen(Qt::white, 1.5, Qt::SolidLine, Qt::RoundCap));
+            painter.drawPath(reticle);
+        }
     }
     painter.setPen(QColor(210, 215, 222));
     const auto mode = d->settings.colorMode;

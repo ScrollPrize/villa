@@ -151,6 +151,7 @@ struct Fiber3DPanel::Impl {
                 } else if (result.scene) {
                     scene = result.scene;
                     canvas->setScene(scene);
+                    syncCursor();
                     canvas->setSelectedKey(selectedKey);
                     if (!fitted && !scene->fibers.empty()) {
                         canvas->fitAll();
@@ -204,12 +205,28 @@ struct Fiber3DPanel::Impl {
         QObject::connect(state, &CState::vpkgChanged, q, reset);
         QObject::connect(state, &CState::volumeClosing, q, reset);
         QObject::connect(state, &CState::poiChanged, q, [this](const std::string& name, POI*) {
-            if (name == "focus" && region->currentIndex() == 0)
+            if (name != "focus")
+                return;
+            syncCursor();
+            if (region->currentIndex() == 0)
                 request();
         });
         afvSource->setEnabled(automated->sourceDescriptor().has_value());
         canvas->setDisplaySettings(display);
+        syncCursor();
         updateSelection();
+    }
+
+    void syncCursor()
+    {
+        const auto* focus = state->poi("focus");
+        if (!state->currentVolume() || !focus) {
+            canvas->setCursorPosition(std::nullopt);
+            return;
+        }
+        // Like the slice crosshair, the focus is already in the current CT
+        // grid. Copy its position; CState owns and may replace the POI.
+        canvas->setCursorPosition(Point{double(focus->p[0]), double(focus->p[1]), double(focus->p[2])});
     }
 
     void createSettings(QToolButton* settingsButton)
@@ -689,6 +706,7 @@ Fiber3DPanel::~Fiber3DPanel()
 void Fiber3DPanel::showEvent(QShowEvent* e)
 {
     QWidget::showEvent(e);
+    d->syncCursor();
     d->request();
 }
 void Fiber3DPanel::hideEvent(QHideEvent* e)

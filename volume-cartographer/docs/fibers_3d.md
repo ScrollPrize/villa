@@ -10,6 +10,12 @@ fibre to centre the CT views at the picked point or open Line Annotation.
 **Fit** frames the displayed geometry; **Fit selected** frames its selected
 portion. Changing filters or styles preserves the camera.
 
+A white crosshair marks the shared CT focus at its actual 3D position. Moving
+the focus in a CT view updates it immediately without moving the 3D camera;
+in whole-volume mode this does not reload the fibres. It is a navigation
+overlay drawn above the fibres for visibility, not a point snapped to a fibre.
+The marker is hidden when its position is outside the camera view.
+
 The **Settings** button opens controls for:
 
 - Sources: loaded project annotations and the attached read-only AFV collection.
@@ -112,3 +118,10 @@ with `GL_SAMPLES=0`. On the complete collection, 30 orbit frames including
 synchronous framebuffer readback measured 18.38 ms median / 28.41 ms p95 before
 and 17.77 ms / 24.29 ms after; these are harness timings, not whole-application
 frame-rate measurements.
+
+The CT-focus crosshair was checked on the real AFV with the user's 6 mm
+filter (29 displayed fibres): moving the CT focus A → B → A changed only
+the marker pixels, and 12 focus moves caused no scene reload in whole-volume
+mode. Canvas checks also cover a focus outside the fibre bounds but inside the
+view, invalid/out-of-view positions, clearing the scene, and large coordinates.
+These checks ran on macOS; the crosshair uses portable Qt painting.

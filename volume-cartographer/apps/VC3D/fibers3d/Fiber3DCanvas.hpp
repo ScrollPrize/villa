@@ -4,6 +4,7 @@
 #include <QOpenGLFunctions_3_3_Core>
 #include <QOpenGLWidget>
 #include <memory>
+#include <optional>
 
 namespace vc3d::fibers3d
 {
@@ -23,6 +24,9 @@ public:
     void fitAll();
     void fitSelected();
     void focusPoint(Point point);
+    // Navigation overlay at the CT focus, drawn above fibers for readability.
+    // Unlike focusPoint(), updating it never moves the camera.
+    void setCursorPosition(std::optional<Point> position);
     void clear();
 
 signals:
