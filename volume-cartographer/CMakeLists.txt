@@ -158,6 +158,7 @@ else()
     option(VC_BUILD_APPS  "Build app executables (vc_*, VC3D)"           ON)
 endif()
 option(VC_BUILD_UI_TRACER  "Build Qt UI/tracer helper libraries"         ${VC_BUILD_APPS})
+option(VC_BUILD_FIBERLETS "Build the vc_fiberlets command-line processor" ${VC_BUILD_APPS})
 
 # ---- Toolchain --------------------------------------------------------------
 foreach(_path "$ENV{HOME}/miniconda3" "$ENV{HOME}/anaconda3")
@@ -684,7 +685,7 @@ endif()
 
 # VC-Delta3D is maintained as a standalone first-party codec. Prefer an
 # installed package (useful for distro builds and local development), then
-# fetch the reviewed 0.1.0 release for ordinary builds.
+# fetch the reviewed 0.2.0 release for ordinary builds.
 find_package(vc_delta3d CONFIG QUIET)
 if(NOT TARGET vc_delta3d::vc_delta3d)
     include(FetchContent)
@@ -693,7 +694,7 @@ if(NOT TARGET vc_delta3d::vc_delta3d)
     set(VC_DELTA3D_INSTALL_CPP OFF)
     FetchContent_Declare(vc_delta3d
         GIT_REPOSITORY https://github.com/ScrollPrize/vc-delta3d.git
-        GIT_TAG v0.1.0
+        GIT_TAG v0.2.0
     )
     FetchContent_MakeAvailable(vc_delta3d)
 endif()
@@ -850,6 +851,9 @@ if(VC_TESTING)
         test_lasagna_manifest
         test_lasagna_project_volumes
         test_fiber_trace3d
+        test_fiber_anchors
+        test_fiberlet_paths
+        test_fiberlet_storage
         test_open_data_manifest
         test_lasagna_line_optimizer
         test_lasagna_line_view_surfaces
@@ -981,3 +985,6 @@ if(VC_TESTING)
             COMMENT "Running clang source-based coverage")
     endif()
 endif()
+
+# Windows (MinGW): UTF-8 application manifest in every executable (#1979).
+include(cmake/WindowsUtf8Manifest.cmake)

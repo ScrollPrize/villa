@@ -13,6 +13,7 @@
 #include <opencv2/core/mat.hpp>
 
 #include "vc/core/util/Rect3D.hpp"
+#include "AnnotationFrame.hpp"
 
 class VolumePkg;
 class Volume;
@@ -49,8 +50,9 @@ public:
     std::shared_ptr<Volume> currentVolume() const;
     std::string currentVolumeId() const;
     void setCurrentVolume(std::shared_ptr<Volume> vol);
+    vc3d::annotation::AnnotationFrame annotationFrame() const;
 
-    // --- Session focus bounds (base-volume XYZ) ---
+    // Public bounds use current-volume XYZ; storage uses annotation-frame XYZ.
     std::optional<Rect3D> focusBounds() const;
     std::optional<Rect3D> activeFocusBounds() const;
     bool focusBoundsEnabled() const;
@@ -127,7 +129,7 @@ private:
     std::shared_ptr<VolumePkg> _vpkg;
     std::shared_ptr<Volume> _currentVolume;
     std::string _currentVolumeId;
-    std::optional<Rect3D> _focusBounds;
+    std::optional<Rect3D> _focusBounds; // Annotation frame, independent of pyramid level.
     bool _focusBoundsEnabled = false;
     uint64_t _focusBoundsRevision = 0;
     std::string _segmentationGrowthVolumeId;

@@ -74,7 +74,7 @@ class StlGeneratorTests(unittest.TestCase):
             with (output_root / "scroll_summary.csv").open(newline="") as csvfile:
                 self.assertEqual(
                     list(csv.reader(csvfile)),
-                    [["Scroll ID", "Height (mm)", "Diameter (mm)"]],
+                    [["Scroll ID", "Height (mm)", "Diameter (mm)", "Split rotation (deg)"]],
                 )
 
     def test_read_axis_direction_and_two_points(self):
@@ -103,7 +103,7 @@ class StlGeneratorTests(unittest.TestCase):
             label_file.write_text("# engraved on the top cap\nPHerc s.n.\n\ncass. 94\n")
             self.assertEqual(module.read_label(str(label_file)), ("PHerc s.n.", "cass. 94"))
             label_file.write_text("PHerc 1234\n")
-            self.assertEqual(module.read_label(str(label_file)), ("PHerc 1234", "v3"))
+            self.assertEqual(module.read_label(str(label_file)), ("PHerc 1234", "v4"))
             for bad in ("", "# only a comment\n", "a\nb\nc\n"):
                 label_file.write_text(bad)
                 with self.assertRaises(ValueError):
@@ -116,12 +116,14 @@ class StlGeneratorTests(unittest.TestCase):
         class Config:
             lining_interior_height = 10.0
             lining_outer_diameter = 20.0
+            split_rotation_deg = 0.0
 
             def __init__(self, **kwargs):
                 seen.update(kwargs)
 
         module.mesh.ScrollMesh = lambda *a, **k: None
         module.mesh.build_lining = lambda params: (None,) * 5 + (1.0, 2.0)
+        module.mesh.narrowest_in_y = lambda m: (0.5, 1.2)
         module.mesh.combine_brep_case_lining = lambda *a: None
         module.case.ScrollCaseConfig = Config
         module.case.build_case = lambda cfg: (None, None)
@@ -129,7 +131,45 @@ class StlGeneratorTests(unittest.TestCase):
         module.process_scroll("sncass94", "m.ply", "out", None, ("PHerc s.n.", "cass. 94"))
         self.assertEqual((seen["label_line_1"], seen["label_line_2"]), ("PHerc s.n.", "cass. 94"))
         module.process_scroll("0608", "m.ply", "out")
-        self.assertEqual((seen["label_line_1"], seen["label_line_2"]), ("PHerc0608", "v3"))
+        self.assertEqual((seen["label_line_1"], seen["label_line_2"]), ("PHerc0608", "v4"))
+        self.assertNotIn("split_rotation_deg", seen)
+
+    def test_elongated_footprint_turns_the_split(self):
+        module = load_stl_generator()
+        configs, turns = [], []
+
+        class Config:
+            lining_interior_height = 10.0
+            lining_outer_diameter = 20.0
+            split_rotation_deg = 0.0
+            split_rotation_fits = True
+
+            def __init__(self, **kwargs):
+                configs.append(kwargs)
+
+        class Mesh:
+            def transform(self, xf):
+                turns.append(xf)
+
+        module.mesh.ScrollMesh = lambda *a, **k: None
+        module.mesh.build_lining = lambda params: tuple(Mesh() for _ in range(5)) + (1.0, 2.0)
+        module.mesh.narrowest_in_y = lambda m: (-1.2, 2.5)
+        module.mesh.affine_rotation = lambda a: a
+        module.mesh.combine_brep_case_lining = lambda *a: None
+        module.case.ScrollCaseConfig = Config
+        module.case.build_case = lambda cfg: (None, None)
+        module.mm.saveMesh = lambda *a: None
+        module.process_scroll("1482", "m.ply", "out")
+        self.assertAlmostEqual(configs[-1]["split_rotation_deg"], -68.75, places=2)
+        self.assertEqual(turns, [1.2] * 5)
+        for mode, aspect in (("off", 2.5), ("auto", 1.4)):
+            turns.clear()
+            module.mesh.narrowest_in_y = lambda m, aspect=aspect: (-1.2, aspect)
+            module.process_scroll("1482", "m.ply", "out", narrow_y=mode)
+            self.assertNotIn("split_rotation_deg", configs[-1])
+            self.assertEqual(turns, [])
+        module.process_scroll("1482", "m.ply", "out", narrow_y="on")
+        self.assertIn("split_rotation_deg", configs[-1])
 
 
 if __name__ == "__main__":

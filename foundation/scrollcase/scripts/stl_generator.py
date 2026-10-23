@@ -11,9 +11,14 @@ giving the cylinder axis (e.g. along the umbilicus) in the mesh's coordinates, e
 (3 numbers) or as two points on the axis (6 numbers). Without it, the axis of the smallest enclosing
 cylinder is used. An optional
    <scroll_number>-label.txt
-replaces the two label lines engraved on the top cap (default "PHerc<padded number>" and "v3") with its
+replaces the two label lines engraved on the top cap (default "PHerc<padded number>" and "v4") with its
 first one or two non-empty lines ('#' starts a comment), e.g. for an object without a number. Folder names
 that are not a number (optionally followed by one letter) are used unpadded.
+
+A flat fragment, whose projection along the case axis is elongated, has its lining, divider and the split
+turned relative to the square caps so that it is narrowest along y (its long side along x): by default
+(--narrow-y auto) when that projection's length is at least --narrow-y-min-aspect (default 1.5) times its
+least width; --narrow-y on or off always or never turns it.
 
 For each scroll, the script creates a subfolder (named using the padded scroll name) under the output root and saves:
    - <padded_scroll>_scroll.stl
@@ -21,7 +26,8 @@ For each scroll, the script creates a subfolder (named using the padded scroll n
    - <padded_scroll>_left.stl
 
 Additionally, a CSV summary (scroll_summary.csv) is created in the output root with columns:
-   "Scroll ID", "Height (mm)", "Diameter (mm)"
+   "Scroll ID", "Height (mm)", "Diameter (mm)", "Split rotation (deg)"
+the last being how far the lining and split are turned (anticlockwise about z) relative to the caps.
 
 Usage:
     python stl_generator.py --input /path/to/scrolls --output /path/to/output
@@ -30,6 +36,7 @@ Usage:
 import argparse
 import csv
 import logging
+import math
 import multiprocessing
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -58,14 +65,14 @@ def pad_scroll_name(scroll_number: str) -> str:
 def read_label(label_file: str) -> tuple[str, str]:
     """
     Reads the two label lines from a text file: the first one or two non-empty lines ('#' starts a comment).
-    A missing second line keeps the default "v3".
+    A missing second line keeps the default "v4".
     """
     with open(label_file) as f:
         lines = [line.split("#")[0].strip() for line in f]
     lines = [line for line in lines if line]
     if not lines or len(lines) > 2:
         raise ValueError(f"{label_file}: expected one or two label lines, found {len(lines)}")
-    return lines[0], lines[1] if len(lines) == 2 else "v3"
+    return lines[0], lines[1] if len(lines) == 2 else "v4"
 
 
 def read_axis(axis_file: str) -> tuple[float, float, float]:
@@ -86,7 +93,13 @@ def read_axis(axis_file: str) -> tuple[float, float, float]:
 
 
 def process_scroll(
-    padded_scroll: str, mesh_file: str, output_dir: str, cylinder_axis=None, label=None
+    padded_scroll: str,
+    mesh_file: str,
+    output_dir: str,
+    cylinder_axis=None,
+    label=None,
+    narrow_y="auto",
+    narrow_y_min_aspect=1.5,
 ):
     """
     Process a single scroll:
@@ -95,7 +108,7 @@ def process_scroll(
       - Combines the case halves with the mesh lining.
       - Exports the combined STL files.
 
-    Returns a tuple: (padded_scroll, height, diameter)
+    Returns a tuple: (padded_scroll, height, diameter, split rotation)
     """
     logger = logging.getLogger("stl_generator")
 
@@ -120,8 +133,25 @@ def process_scroll(
         "scroll_height_mm": height,
         "scroll_radius_mm": radius,
         "label_line_1": label[0] if label else f"PHerc{padded_scroll}",
-        "label_line_2": label[1] if label else "v3",
+        "label_line_2": label[1] if label else "v4",
     }
+
+    # Turn a flat fragment, with the lining and the split, to be narrowest along y.
+    angle, aspect = mesh.narrowest_in_y(mesh_scroll)
+    turn = narrow_y == "on" or (narrow_y == "auto" and aspect >= narrow_y_min_aspect)
+    if turn:
+        turned = case.ScrollCaseConfig(**scroll_case_defaults, split_rotation_deg=math.degrees(angle))
+        if not turned.split_rotation_fits:
+            if narrow_y == "on":
+                raise ValueError(f"cannot turn the split {math.degrees(angle):.1f} deg within the caps")
+            print(f"{padded_scroll}: not turning by {math.degrees(angle):.1f} deg, the split would not fit the caps")
+            turn = False
+    if turn:
+        print(f"{padded_scroll}: footprint aspect {aspect:.2f}, turning the lining and split {math.degrees(angle):.1f} deg")
+        scroll_case_defaults["split_rotation_deg"] = math.degrees(angle)
+        for m in (lining_mesh_pos, lining_mesh_neg, cavity_mesh_pos, cavity_mesh_neg, mesh_scroll):
+            # affine_rotation(a) rotates by -a.
+            m.transform(mesh.affine_rotation(-angle))
 
     scroll_case = case.ScrollCaseConfig(**scroll_case_defaults)
     case_left, case_right = case.build_case(scroll_case)
@@ -142,7 +172,7 @@ def process_scroll(
     mm.saveMesh(combined_mesh_right, right_stl_path)
     mm.saveMesh(combined_mesh_left, left_stl_path)
 
-    # Return padded_scroll, height, and diameter
+    # Return padded_scroll, height, diameter and split rotation
     # Height includes the entire height of the lining interior to make sure scroll is captured,
     # so is scroll_height + 2 * lining_offset.
     # Diameter is the external diameter of the lining.
@@ -150,6 +180,7 @@ def process_scroll(
         padded_scroll,
         scroll_case.lining_interior_height,
         scroll_case.lining_outer_diameter,
+        scroll_case.split_rotation_deg,
     )
 
 
@@ -174,6 +205,19 @@ def main():
         "--output",
         required=True,
         help="Output root directory where generated STL files and CSV summary will be saved.",
+    )
+    parser.add_argument(
+        "--narrow-y",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help="Turn the lining and split relative to the caps so the scroll is narrowest along y: "
+        "for elongated footprints (auto), always (on) or never (off).",
+    )
+    parser.add_argument(
+        "--narrow-y-min-aspect",
+        type=float,
+        default=1.5,
+        help="With --narrow-y auto, the least ratio of the footprint's length to its least width that turns it.",
     )
     args = parser.parse_args()
 
@@ -229,7 +273,7 @@ def main():
         os.makedirs(scroll_output_dir, exist_ok=True)
         tasks.append((padded_scroll, mesh_file, scroll_output_dir, cylinder_axis, label))
 
-    # List to accumulate CSV summary data as tuples: (Scroll ID, Height, Diameter)
+    # List to accumulate CSV summary data as tuples: (Scroll ID, Height, Diameter, Split rotation)
     scroll_summary = []
 
     # Process scrolls concurrently using ProcessPoolExecutor with a tqdm progress bar
@@ -239,7 +283,16 @@ def main():
         mp_context=multiprocessing.get_context("spawn"),
     ) as executor:
         future_to_scroll = {
-            executor.submit(process_scroll, padded, mesh_file, out_dir, axis, label): padded
+            executor.submit(
+                process_scroll,
+                padded,
+                mesh_file,
+                out_dir,
+                axis,
+                label,
+                args.narrow_y,
+                args.narrow_y_min_aspect,
+            ): padded
             for padded, mesh_file, out_dir, axis, label in tasks
         }
         for future in tqdm(
@@ -249,7 +302,7 @@ def main():
         ):
             padded_scroll = future_to_scroll[future]
             try:
-                result = future.result()  # (padded_scroll, height, diameter)
+                result = future.result()  # (padded_scroll, height, diameter, split rotation)
                 scroll_summary.append(result)
             except Exception as exc:
                 logger.error(f"Error processing scroll '{padded_scroll}': {exc}")
@@ -259,9 +312,9 @@ def main():
     try:
         with open(csv_file, "w", newline="") as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow(["Scroll ID", "Height (mm)", "Diameter (mm)"])
-            for scroll_id, height, diameter in scroll_summary:
-                writer.writerow([scroll_id, f"{height:.2f}", f"{diameter:.2f}"])
+            writer.writerow(["Scroll ID", "Height (mm)", "Diameter (mm)", "Split rotation (deg)"])
+            for scroll_id, height, diameter, rotation in scroll_summary:
+                writer.writerow([scroll_id, f"{height:.2f}", f"{diameter:.2f}", f"{rotation:.2f}"])
     except Exception as e:
         logger.error(f"Error writing CSV summary: {e}")
 

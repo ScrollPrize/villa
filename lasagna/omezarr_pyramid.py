@@ -11,9 +11,11 @@ import uuid
 from pathlib import Path
 
 import numpy as np
+import numcodecs
 from threadpoolctl import threadpool_limits
 import zarr
 
+from vesuvius.neural_tracing.normals import decode_normals as _decode_normals
 
 _NATIVE_THREAD_ENV = (
 	"OPENBLAS_NUM_THREADS",
@@ -22,6 +24,7 @@ _NATIVE_THREAD_ENV = (
 	"BLIS_NUM_THREADS",
 	"VECLIB_MAXIMUM_THREADS",
 	"NUMEXPR_NUM_THREADS",
+	"BLOSC_NTHREADS",
 )
 _PYRAMID_WORKER_THREAD_LIMIT = None
 
@@ -31,10 +34,22 @@ def _set_native_thread_env_one() -> None:
 		os.environ[name] = "1"
 
 
+def _limit_zarr_codec_threads() -> None:
+	"""Prevent each process from creating its own wide Zarr/codec thread pools."""
+	config = getattr(zarr, "config", None)
+	if config is not None:
+		config.set({"async.concurrency": 1, "threading.max_workers": 1})
+	try:
+		numcodecs.blosc.set_nthreads(1)
+	except (AttributeError, RuntimeError):
+		pass
+
+
 def _pyramid_worker_init() -> None:
 	"""Keep native numerical runtimes single-threaded for this worker's life."""
 	global _PYRAMID_WORKER_THREAD_LIMIT
 	_set_native_thread_env_one()
+	_limit_zarr_codec_threads()
 	_PYRAMID_WORKER_THREAD_LIMIT = threadpool_limits(limits=1)
 
 
@@ -204,13 +219,6 @@ def _mean_pool2x_f32(slab: np.ndarray) -> np.ndarray:
 				acc[:sz, :sy, :sx] += part.astype(np.float32, copy=False)
 				cnt[:sz, :sy, :sx] += 1.0
 	return acc / np.maximum(cnt, 1.0)
-
-
-def _decode_normals(nx_u8: np.ndarray, ny_u8: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-	nx = (nx_u8.astype(np.float32, copy=False) - 128.0) / 127.0
-	ny = (ny_u8.astype(np.float32, copy=False) - 128.0) / 127.0
-	nz = np.sqrt(np.maximum(0.0, 1.0 - nx * nx - ny * ny)).astype(np.float32, copy=False)
-	return nx, ny, nz
 
 
 def _moment_pool2x_normals(nx_u8: np.ndarray, ny_u8: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
