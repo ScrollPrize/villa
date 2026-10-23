@@ -28,9 +28,11 @@ level-0 grid viewed at level 2, this is 4. Only use that value when those frames
 are known to match. The assignment is a checked database edit. Unbound fibers
 remain listed but do not contribute to overlays or slice queries. Each displayed
 fiber uses its own binding to the viewer's actual volume, including hit testing.
-`meta.coordinates` is authoritative: its volume UUID must match the active volume,
-and its scale must be finite and positive. Advisory binding labels cannot override
-a different UUID. Transfer preserves known and unknown coordinates for every
+`meta.coordinates` is authoritative: `volume_uuid` stores the volume's `id` from
+open-data `metadata.json` verbatim (for example `20260411134726`). VC3D compares
+it directly with `Volume::id()`; it does not generate or canonicalize a UUID.
+Its scale must be finite and positive. Advisory labels cannot override a different
+volume ID. Existing derived-UUID bindings require an explicit metadata correction. Transfer preserves known and unknown coordinates for every
 geometry kind; atlas export adjusts the declared scale with the exported XYZ.
 
 Completed interactions and accepted solver results commit immediately. Save waits
@@ -65,6 +67,20 @@ VC3D retains editing semantics and UI state. Shared coordinate and artifact help
 are reusable by future point-collection and tifxyz integrations. Optional native
 fiber annotations remain optional; import/export preserves unknown metadata and
 branch identities, approval state, and stable control-point IDs.
+
+Attachment does not load fiber controls, annotations or line arrays. The dock
+aggregates coordinate groups in a background read, fetches catalog pages of 200,
+and reads geometry from the spatial index for each visible viewport. The editor
+hydrates a selected fiber and its connected branch peers on demand. Explicit
+whole-store operations (such as detailed export or the complete fiber map) still
+load the data they need.
+
+**Max displayed fibers** defaults to **5,000 per viewport**, persists in settings,
+and applies before geometry decoding. Zero means unlimited. Selected fibers have
+priority within the limit when they intersect the view. Work/byte budgets can
+return fewer fibers; the overlay reports partial coverage. Panning cancels obsolete
+requests and discards results from old attachments. Resident geometry retains the
+same float64 values and exact clipping predicates.
 
 Slice queries apply UUID inclusion before priority/limits and report incomplete
 results for cancellation or resource/display limits. Their geometric clipping
@@ -104,3 +120,16 @@ coordinate assignment, a CT read, and reopening.
 
 Recorded datasets, exact commands, results and remaining platform/service checks
 are in [the verification record](object-store-verification.md).
+
+For a read-only large-store attachment check (no source database edits):
+
+```sh
+mkdir -p /tmp/vc3d-fiber-bench-config
+QT_QPA_PLATFORM=offscreen VC3D_CONFIG_DIR=/tmp/vc3d-fiber-bench-config \
+VC3D_OBJECT_STORE_READ_ONLY_BENCH=/path/to/paris4-fibers.vcobj \
+  build/bin/VC3D --test-object-store
+```
+
+Use fresh settings for the default-limit assertion. The check prints attachment,
+first-page and selected-fiber timings and verifies UI heartbeats, deferred editor
+geometry, bounded catalog pages, and clearing the resident cache on detach.
