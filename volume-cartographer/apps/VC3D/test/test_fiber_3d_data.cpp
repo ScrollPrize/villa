@@ -226,6 +226,55 @@ private slots:
         }
     }
 
+    void memoryBudgetRetainsSelectedThenLongestFibers()
+    {
+        const FixtureFile fixture({
+            {{{-5, 0, 0}, {5, 0, 0}}, "H"},
+            {{{-15, 0, 0}, {15, 0, 0}}, "V"},
+            {{{-10, 0, 0}, {10, 0, 0}}, "H"}
+        });
+        const auto source = automated(fixture);
+        QueryOptions options;
+        options.maximumFibers = 0;
+        options.byteBudget = 96;
+        auto scene = loadAutomated(source, options);
+        QVERIFY(!scene.complete);
+        QCOMPARE(scene.fibers.size(), size_t(2));
+        QCOMPARE(scene.fibers[0].id, uint64_t(2));
+        QCOMPARE(scene.fibers[1].id, uint64_t(3));
+        options.selectedKey = source.uuid + ":1";
+        scene = loadAutomated(source, options);
+        QCOMPARE(scene.fibers[0].id, uint64_t(1));
+        QCOMPARE(scene.fibers[1].id, uint64_t(2));
+        options.byteBudget = 144;
+        scene = loadAutomated(source, options);
+        QVERIFY(scene.complete);
+        QCOMPARE(scene.fibers.size(), size_t(3));
+        QCOMPARE(scene.fibers[2].id, uint64_t(3));
+    }
+
+    void nativeViewsAlsoPrioritizeFullLengthAndSelection()
+    {
+        auto snapshot = annotated();
+        snapshot.fibers.clear();
+        for (int i = 1; i <= 3; ++i) {
+            LineAnnotationController::FiberMapFiber fiber;
+            fiber.id = uint64_t(i);
+            fiber.linePoints = {{-double(i), 0, 0}, {double(i), 0, 0}};
+            fiber.controlPoints = fiber.linePoints;
+            fiber.hvTag = 'H';
+            snapshot.fibers.push_back(std::move(fiber));
+        }
+        QueryOptions options;
+        options.maximumFibers = 1;
+        auto scene = loadAnnotations(snapshot, {}, options);
+        QCOMPARE(scene.fibers.size(), size_t(1));
+        QCOMPARE(scene.fibers[0].id, uint64_t(3));
+        options.selectedKey = QStringLiteral("annotation:1");
+        scene = loadAnnotations(snapshot, {}, options);
+        QCOMPARE(scene.fibers[0].id, uint64_t(1));
+    }
+
     void afvRejectsChangedIdentityAndCancellation()
     {
         const FixtureFile fixture({{{{-10, 0, 0}, {10, 0, 0}}, "H"}});

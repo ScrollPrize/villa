@@ -14,7 +14,7 @@ struct QueryOptions {
     double minLengthMm = 0.0;
     bool horizontal = true, vertical = true, unclassified = true;
     size_t maximumFibers = 10000;
-    size_t byteBudget = 16 * 1024 * 1024;
+    size_t byteBudget = size_t(512) * 1024 * 1024;
     QString selectedKey;
 };
 

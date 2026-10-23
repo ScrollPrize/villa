@@ -39,6 +39,10 @@ The **Settings** button opens controls for:
 - The whole volume (default, within the display budgets), or a box around the
   current CT focus (initial width: 1,024 current-volume voxels). Moving the 3D
   camera does not change this box.
+- **Memory budget**: 64, 128, 256, 512 MiB, then 1, 2, 4, 8, 16 and 32 GiB,
+  defaulting to **512 MiB**. This is the decoded-coordinate budget per source,
+  not total process/GPU memory; rendering buffers, indexes and CT need additional
+  memory. It is a limit, not a reservation. The chosen byte size is remembered.
 - Custom colour; H/V colours; local axial direction (XYZ or angle to X, Y, Z);
   full-fibre length in millimetres with automatic or fixed range. Scalar modes
   offer Viridis, Magma, Cividis and Turbo with a legend. Reversing a fibre's
@@ -80,9 +84,17 @@ scene. Orbit, zoom, selection and colour changes reuse GPU geometry; they do not
 request data again. Native annotation snapshots are copied from the existing
 controller on the GUI thread.
 
-Each source defaults to 10,000 displayed fibres and a 16 MiB decoded-polyline
-budget. The AFV reader also bounds candidate-block bookkeeping and its block
-cache. Reaching a budget displays an explicit partial-view message; a region
+Each source defaults to 10,000 displayed fibres and a 512 MiB decoded-polyline
+budget. **More display options → Fiber limit → No limit** removes the count
+cap while retaining the memory budget; numeric caps up to 1,000,000 are allowed.
+Within the region and active filters, the selected fibre is loaded first, then
+fibres by decreasing complete-source length, with increasing ID for ties.
+This ordering applies to AFV and native annotations. It does not change with
+camera rotation or zoom. The CT slice renderer keeps its existing stable sample
+ordering. Selection priority does not override region or family/length filters.
+The AFV reader also bounds candidate-block bookkeeping (one sixteenth of the
+coordinate budget, at least 16 MiB) and its block cache.
+Reaching a budget displays an explicit partial-view message; a region
 with too many candidate blocks must be narrowed. These limits bound the new
 AFV view's memory rather than pretending an entire scroll fits in GPU memory.
 
@@ -146,3 +158,12 @@ isolated profile and a bounded focus region. Escape and an empty-space click
 clear both the AFV list and the 3D selection; dragging preserves selection.
 An outstanding inspection request cannot restore a cleared selection. With no
 selection, 87% and 100% other-fibre opacity produce identical framebuffer pixels.
+
+Memory controls were checked on the full 80,887-fibre PHerc1447 AFV: a fresh
+profile starts at 512 MiB; all ten presets are available; 32 GiB survives an
+application restart without integer overflow; and the popup has no horizontal
+overflow. With a 10,000-fibre cap, 64 MiB loads 5,599 fibres and 512 MiB reaches
+the count cap. Lowering the budget preserves selection priority. A separate
+data-loader check, without the count cap or length filter, loads all 80,887
+fibres in descending length within 494,048,712 decoded coordinate bytes.
+That check does not measure full-scroll rendering frame rate or total RAM.

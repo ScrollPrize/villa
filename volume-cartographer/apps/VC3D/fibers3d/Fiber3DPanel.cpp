@@ -72,7 +72,7 @@ struct Fiber3DPanel::Impl {
     Fiber3DCanvas* canvas;
     QLabel *status, *selection;
     QCheckBox *nativeSource, *afvSource, *h, *v, *unknown;
-    QComboBox *region, *colors, *direction, *palette;
+    QComboBox *region, *colors, *direction, *palette, *memoryBudget;
     QSpinBox *boxWidth, *limit;
     QDoubleSpinBox *minimum, *rangeMin, *rangeMax;
     QPushButton *customColor, *hColor, *vColor;
@@ -368,6 +368,22 @@ struct Fiber3DPanel::Impl {
         boxWidth->setToolTip(q->tr("Width in current CT volume voxels"));
         boxWidthRow = row(q->tr("Box width"), boxWidth);
 
+        memoryBudget = new QComboBox(settingsContents);
+        memoryBudget->setObjectName(QStringLiteral("fibers3DMemoryBudgetMiB"));
+        for (int mib = 64; mib <= 32768; mib *= 2) {
+            // Omit values that cannot be represented on this build's address space.
+            if (uint64_t(mib) * 1024 * 1024 > std::numeric_limits<size_t>::max())
+                break;
+            memoryBudget->addItem(mib < 1024 ? q->tr("%1 MiB").arg(mib) : q->tr("%1 GiB").arg(mib / 1024), mib);
+        }
+        const int savedBudget = memoryBudget->findData(settings.value(memoryBudget->objectName(), 512).toInt());
+        memoryBudget->setCurrentIndex(savedBudget >= 0 ? savedBudget : memoryBudget->findData(512));
+        memoryBudget->setToolTip(q->tr("Maximum decoded fiber coordinates per source. Rendering buffers and CT use additional memory. This is a limit, not a preallocation."));
+        row(q->tr("Memory budget"), memoryBudget);
+        auto* memoryHelp = new QLabel(q->tr("Per source. Rendering and CT use additional memory."), settingsContents);
+        memoryHelp->setWordWrap(true);
+        body->addWidget(memoryHelp);
+
         section(q->tr("Appearance"));
         colors = combo("fibers3DColorMode", {q->tr("Custom"), q->tr("H / V"), q->tr("Direction"), q->tr("Length")}, 1);
         row(q->tr("Color by"), colors);
@@ -457,8 +473,9 @@ struct Fiber3DPanel::Impl {
         advancedLayout->addWidget(perspective);
         advancedLayout->addWidget(bounds);
         advancedLayout->addWidget(cursor);
-        limit = integer("fibers3DLimit", 1, 50000, 10000);
-        limit->setToolTip(q->tr("Maximum displayed fibers per source"));
+        limit = integer("fibers3DLimit", 0, 1000000, 10000);
+        limit->setSpecialValueText(q->tr("No limit"));
+        limit->setToolTip(q->tr("Maximum displayed fibers per source. No limit uses only the memory budget. The selected fiber has priority, then the longest fibers in the region."));
         row(q->tr("Fiber limit"), limit, advancedLayout);
         body->addWidget(advancedContent);
         advancedContent->hide();
@@ -490,6 +507,10 @@ struct Fiber3DPanel::Impl {
         QObject::connect(region, &QComboBox::currentIndexChanged, q, [this] {
             boxWidthRow->setVisible(region->currentIndex() == 0);
             resizeSettings();
+            request();
+            saveSettings();
+        });
+        QObject::connect(memoryBudget, &QComboBox::currentIndexChanged, q, [this] {
             request();
             saveSettings();
         });
@@ -529,7 +550,7 @@ struct Fiber3DPanel::Impl {
         for (auto* w : q->findChildren<QCheckBox*>())
             s.setValue(w->objectName(), w->isChecked());
         for (auto* w : q->findChildren<QComboBox*>())
-            s.setValue(w->objectName(), w->currentIndex());
+            s.setValue(w->objectName(), w == memoryBudget ? w->currentData().toInt() : w->currentIndex());
         for (auto* w : q->findChildren<QSpinBox*>()) {
             if (w->objectName() == QStringLiteral("fibers3DOpacity"))
                 s.setValue(w->objectName(), w->value() / 100.0);
@@ -609,6 +630,7 @@ struct Fiber3DPanel::Impl {
         options.vertical = v->isChecked();
         options.unclassified = unknown->isChecked();
         options.maximumFibers = size_t(limit->value());
+        options.byteBudget = size_t(memoryBudget->currentData().toUInt()) * 1024 * 1024;
         options.selectedKey = selectedKey;
         const auto shape = volume->shapeXyz();
         Bounds volumeBounds;

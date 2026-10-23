@@ -293,20 +293,21 @@ Scene loadAutomated(const AutomatedSource& source, const QueryOptions& options, 
         cancelled,
         positive(source.nativeVoxelMm) ? options.minLengthMm / source.nativeVoxelMm : 0.0,
         familyFilter(options),
-        16 * 1024 * 1024);
+        std::max(size_t(16) * 1024 * 1024, options.byteBudget / 16),
+        vc::fibers::ViewOrder::LongestFirst);
     if (page.candidateLimitReached) {
-        limited(scene, QStringLiteral("Region contains too many candidate blocks; reduce the displayed region."));
+        limited(scene, QStringLiteral("Region contains too many candidate blocks; increase Memory budget or narrow the region."));
         return scene;
     }
     if (!page.complete)
-        limited(scene, QStringLiteral("Geometry budget reached; reduce the displayed region."));
+        limited(scene, QStringLiteral("Memory budget reached; increase it in Settings or narrow the region."));
     std::unordered_map<int64_t, size_t> index;
     for (auto& block : page.blocks) {
         checkCancelled(cancelled);
         auto found = index.find(block.fiberId);
         if (found == index.end()) {
             if (options.maximumFibers && scene.fibers.size() >= options.maximumFibers) {
-                limited(scene, QStringLiteral("Fiber limit reached; only a stable subset is displayed."));
+                limited(scene, QStringLiteral("Fiber limit reached; selected fiber and longest fibers have priority."));
                 continue;
             }
             const auto summary = reader.summary(block.fiberId);
@@ -364,21 +365,36 @@ Scene loadAnnotations(
     std::unordered_map<uint64_t, const LineAnnotationController::FiberSummary*> summaryById;
     for (const auto& summary : summaries)
         summaryById.emplace(summary.id, &summary);
-    std::vector<const LineAnnotationController::FiberMapFiber*> order;
-    for (const auto& fiber : snapshot.fibers)
-        order.push_back(&fiber);
-    std::stable_sort(order.begin(), order.end(), [&](const auto* a, const auto* b) {
-        const auto aKey = QStringLiteral("annotation:%1").arg(a->id);
-        const auto bKey = QStringLiteral("annotation:%1").arg(b->id);
+    struct Candidate {
+        const LineAnnotationController::FiberMapFiber* fiber;
+        double length;
+    };
+    std::vector<Candidate> order;
+    for (const auto& fiber : snapshot.fibers) {
+        checkCancelled(cancelled);
+        if (fiber.readOnly || !included(fiber.hvTag, options) || fiber.linePoints.size() < 2)
+            continue;
+        double length = 0.0;
+        for (size_t i = 1; i < fiber.linePoints.size(); ++i) {
+            if ((i & 255) == 0)
+                checkCancelled(cancelled);
+            length += cv::norm(fiber.linePoints[i] - fiber.linePoints[i - 1]);
+        }
+        order.push_back({&fiber, length});
+    }
+    std::sort(order.begin(), order.end(), [&](const auto& a, const auto& b) {
+        const auto aKey = QStringLiteral("annotation:%1").arg(a.fiber->id);
+        const auto bKey = QStringLiteral("annotation:%1").arg(b.fiber->id);
         if ((aKey == options.selectedKey) != (bKey == options.selectedKey))
             return aKey == options.selectedKey;
-        return aKey < bKey;
+        const auto al = std::isfinite(a.length) ? a.length : -std::numeric_limits<double>::infinity();
+        const auto bl = std::isfinite(b.length) ? b.length : -std::numeric_limits<double>::infinity();
+        return al != bl ? al > bl : a.fiber->id < b.fiber->id;
     });
     size_t bytes = 0;
-    for (const auto* source : order) {
+    for (const auto& candidate : order) {
         checkCancelled(cancelled);
-        if (source->readOnly || !included(source->hvTag, options) || source->linePoints.size() < 2)
-            continue;
+        const auto* source = candidate.fiber;
         Fiber fiber;
         // Runtime IDs are unique among loaded sources, including identical
         // filenames from different source roots. A reload invalidates the
@@ -392,21 +408,14 @@ Scene loadAnnotations(
             for (const auto& tag : summary->second->tags)
                 fiber.tags.push_back(QString::fromStdString(tag));
         if (physical) {
-            double length = 0.0;
-            for (size_t i = 1; i < source->linePoints.size(); ++i) {
-                if ((i & 255) == 0)
-                    checkCancelled(cancelled);
-                const auto delta = source->linePoints[i] - source->linePoints[i - 1];
-                length += cv::norm(delta);
-            }
-            fiber.lengthMm = length * *snapshot.voxelSizeUm / 1000.0;
+            fiber.lengthMm = candidate.length * *snapshot.voxelSizeUm / 1000.0;
             if (fiber.lengthMm < options.minLengthMm)
                 continue;
         }
         const bool complete = appendAnnotationRuns(fiber, source->linePoints, scale, options, bytes, cancelled);
         if (!fiber.runs.empty()) {
             if (options.maximumFibers && scene.fibers.size() >= options.maximumFibers) {
-                limited(scene, QStringLiteral("Fiber limit reached; only a stable subset is displayed."));
+                limited(scene, QStringLiteral("Fiber limit reached; selected fiber and longest fibers have priority."));
                 break;
             }
             const auto indices = line_annotation::orderedControlPointLineIndices(source->controlPoints, source->linePoints);
@@ -429,7 +438,7 @@ Scene loadAnnotations(
             scene.fibers.push_back(std::move(fiber));
         }
         if (!complete) {
-            limited(scene, QStringLiteral("Geometry budget reached; reduce the displayed region."));
+            limited(scene, QStringLiteral("Memory budget reached; increase it in Settings or narrow the region."));
             break;
         }
     }
