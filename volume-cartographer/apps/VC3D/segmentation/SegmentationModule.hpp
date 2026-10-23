@@ -195,6 +195,18 @@ public:
     bool setManualAddModeActive(bool active, bool apply = true);
     // Returns false when there is no manual-add constraint to remove.
     bool undoManualAddConstraint();
+    // Start a manual-add edge extension: `cells` new vertices past the last
+    // valid vertex of every line on `side` (optionally only lines span.first
+    // to span.last), growing the grid when it has no room. Enters manual-add
+    // mode first if needed. Apply or cancel it like any manual-add preview.
+    bool extendManualAdd(ManualAddTool::ExtendSide side,
+                         int cells,
+                         std::optional<ManualAddTool::EdgeSpan> span = std::nullopt,
+                         QString* errorMessage = nullptr);
+    // Pin the pending manual-add geometry to a world point, as a Shift+click in
+    // a plane view does, choosing the pending vertex nearest to it within
+    // `radius` (the configured constraint radius when radius <= 0).
+    bool addManualAddConstraintAtWorld(const cv::Vec3f& world, float radius, QString* errorMessage = nullptr);
     // Toggle correction-point authoring mode without a keypress.
     // Activating enforces the same preconditions as the key handler; on failure sets
     // errorMessage to "editing_disabled" | "no_session" | "growth_in_progress". Unlike the
@@ -373,6 +385,10 @@ private:
                                   Qt::MouseButtons buttons,
                                   const QPointF& scenePos);
     void clearLineDragStroke();
+    // Grows (sign > 0) or shrinks (sign < 0) the session's grid by `padding`,
+    // keeping channels, correction anchors and the editing session in step.
+    bool resizeSessionGrid(const ManualAddTool::GridPadding& padding, int sign);
+    void undoManualAddGridPadding();
 
     void handleMousePress(VolumeViewerBase* viewer,
                           const cv::Vec3f& worldPos,
@@ -487,6 +503,9 @@ private:
     QElapsedTimer _manualAddHoverThrottle;
     cv::Mat _pendingManualAddTracerMask;
     SegmentationGrowthMethod _previousGrowthMethodBeforeManualAdd{SegmentationGrowthMethod::Tracer};
+    // Grid rows and columns added for a pending edge extension; removed again
+    // if the extension is canceled.
+    ManualAddTool::GridPadding _manualAddGridPadding;
 
     bool _showApprovalMask{false};
     bool _editApprovedMask{false};
@@ -519,6 +538,9 @@ private:
 
     QFuture<std::shared_ptr<QuadSurface>> _saveFuture;
     std::shared_ptr<QuadSurface> _saveSnapshot;
+    // Set when the grid size or a channel changed, which the vertex-only
+    // autosave path cannot carry; the next save writes the whole surface.
+    bool _autosaveFullSurfaceNeeded{false};
     std::function<bool(const std::shared_ptr<QuadSurface>&)> _editingDestinationResolver;
     std::vector<AutosaveVertexUpdate> _pendingAutosaveVertexUpdates;
     std::unordered_map<std::uint64_t, std::size_t> _pendingAutosaveVertexUpdateIndex;

@@ -7,6 +7,17 @@ add_test(NAME surface_transform_name COMMAND test_surface_transform_name)
 vc_register_test_target(test_surface_transform_name)
 vc_register_ctest(surface_transform_name test_surface_transform_name)
 
+add_executable(test_manual_add_extend test_manual_add_extend.cpp
+    ../segmentation/SurfaceGridEdit.cpp
+    ../segmentation/tools/ManualAddTool.cpp
+    ../segmentation/tools/ThinPlateSpline3d.cpp)
+set_target_properties(test_manual_add_extend PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_manual_add_extend PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_manual_add_extend PRIVATE Qt6::Core Qt6::Test vc_core)
+add_test(NAME manual_add_extend COMMAND test_manual_add_extend)
+vc_register_test_target(test_manual_add_extend)
+vc_register_ctest(manual_add_extend test_manual_add_extend)
+
 add_executable(test_volume_path_labels test_volume_path_labels.cpp
     ../elements/VolumeSelector.cpp ../elements/VolumeSelector.hpp)
 set_target_properties(test_volume_path_labels PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)

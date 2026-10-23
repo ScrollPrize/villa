@@ -26,6 +26,34 @@ public:
         TracerRestrictedToFill = 1,
     };
 
+    // Grid side an edge extension grows from. Up and Down move along rows
+    // (row - 1, row + 1), Left and Right along columns, as in tracer growth.
+    enum class ExtendSide
+    {
+        Up = 0,
+        Down = 1,
+        Left = 2,
+        Right = 3,
+    };
+
+    // Invalid rows and columns to add around the grid before an extension.
+    struct GridPadding
+    {
+        int top{0};
+        int bottom{0};
+        int left{0};
+        int right{0};
+
+        [[nodiscard]] bool any() const { return top > 0 || bottom > 0 || left > 0 || right > 0; }
+    };
+
+    // Inclusive range of rows (Left, Right) or columns (Up, Down) to extend.
+    struct EdgeSpan
+    {
+        int first{0};
+        int last{-1};
+    };
+
     struct Config
     {
         int maxPreviewSpan{256};
@@ -58,6 +86,12 @@ public:
         Source source{Source::Boundary};
     };
 
+    static GridPadding paddingForExtension(const cv::Mat_<cv::Vec3f>& points,
+                                           ExtendSide side,
+                                           int cells,
+                                           std::optional<EdgeSpan> span = std::nullopt);
+    static cv::Mat_<cv::Vec3f> padPoints(const cv::Mat_<cv::Vec3f>& points, const GridPadding& padding);
+
     bool begin(const cv::Mat_<cv::Vec3f>& points, Config config);
     void clear();
     bool clearPending(Config config);
@@ -83,6 +117,18 @@ public:
     bool removeLastPlaneConstraint(std::string* status = nullptr);
     bool recompute(std::string* status = nullptr);
 
+    // Extends every row (Left, Right) or column (Up, Down) of the span by
+    // `cells` new vertices past its last valid vertex on `side`. The preview
+    // continues each line along its own direction at the edge; Shift+click
+    // plane constraints then bend the new strip onto the sheet. The grid must
+    // already have room (see paddingForExtension).
+    bool beginExtension(ExtendSide side,
+                        int cells,
+                        std::optional<EdgeSpan> span = std::nullopt,
+                        std::string* status = nullptr);
+    [[nodiscard]] bool extensionActive() const { return _extension.has_value(); }
+    [[nodiscard]] std::optional<ExtendSide> extensionSide() const;
+
     void setConfig(Config config);
     [[nodiscard]] Config config() const { return _config; }
 
@@ -107,7 +153,19 @@ private:
     void extractFillAndBorder();
     std::vector<Constraint3d> buildFitSamples() const;
     std::vector<Constraint3d> downsampleSamples(std::vector<Constraint3d> samples) const;
+    bool recomputeExtension(std::string* status);
     void touchRevision() { ++_revision; }
+
+    struct Extension
+    {
+        ExtendSide side{ExtendSide::Right};
+        int cells{0};
+        // Continuation of each line past its edge, parallel to _fillVertices.
+        std::vector<cv::Vec3f> guess;
+        // Valid vertices at and just inside the edge; they keep their place.
+        std::vector<GridKey> anchors;
+    };
+    std::optional<Extension> _extension;
 
     Config _config;
     cv::Mat_<cv::Vec3f> _entrySnapshotPoints;

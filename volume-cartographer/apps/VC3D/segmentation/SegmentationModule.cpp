@@ -8,6 +8,7 @@
 #include "CState.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "SegmentationWidget.hpp"
+#include "SurfaceGridEdit.hpp"
 #include "tools/SegmentationLineTool.hpp"
 #include "tools/SegmentationPushPullTool.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
@@ -2125,7 +2126,9 @@ bool SegmentationModule::finishManualAdd(bool apply)
     }
 
     if (apply) {
-        if (_manualAddTool->config().interpolationMode == ManualAddTool::InterpolationMode::TracerRestrictedToFill) {
+        const bool extending = _manualAddTool->extensionActive();
+        if (!extending &&
+            _manualAddTool->config().interpolationMode == ManualAddTool::InterpolationMode::TracerRestrictedToFill) {
             if (!_editManager || !_editManager->hasPendingChanges()) {
                 emit statusMessageRequested(tr("Manual Add tracer preview is not ready yet."), kStatusMedium);
                 return false;
@@ -2145,13 +2148,43 @@ bool SegmentationModule::finishManualAdd(bool apply)
             emitPendingChanges();
             refreshOverlay();
         }
+        if (_manualAddGridPadding.top > 0 || _manualAddGridPadding.left > 0) {
+            // Rows or columns were added before the old first ones, so older
+            // undo entries no longer address the vertices they recorded.
+            clearUndoStack();
+        }
+        if (_manualAddGridPadding.any()) {
+            _autosaveFullSurfaceNeeded = true;
+            if (auto base = _editManager ? _editManager->baseSurface() : nullptr; base && !base->path.empty()) {
+                saveCorrectionPoints(base->path);
+            }
+        }
+        _manualAddGridPadding = {};
+        // Tracer fills went through growth, which already dropped the mask.
+        const bool tracerFill = !extending &&
+            _manualAddTool->config().interpolationMode == ManualAddTool::InterpolationMode::TracerRestrictedToFill;
+        if (!tracerFill && _editManager && _editManager->baseSurface()) {
+            std::vector<cv::Point> cells;
+            cells.reserve(_manualAddTool->changedVertices().size());
+            for (const auto& key : _manualAddTool->changedVertices()) {
+                cells.emplace_back(key.col, key.row);
+            }
+            if (segmentation::markMaskCellsValid(*_editManager->baseSurface(), cells)) {
+                _autosaveFullSurfaceNeeded = true;
+            }
+        }
         if (_editManager && _editManager->hasPendingChanges()) {
             applyEdits();
+        } else if (_autosaveFullSurfaceNeeded) {
+            markAutosaveNeeded(true);
         }
-        emit statusMessageRequested(tr("Manual Add applied and saved."), kStatusMedium);
+        emit statusMessageRequested(extending ? tr("Manual Add extension applied and saved.")
+                                              : tr("Manual Add applied and saved."),
+                                    kStatusMedium);
     } else {
         if (_editManager) {
             _editManager->restorePreviewSnapshot(_manualAddTool->entrySnapshotPoints());
+            undoManualAddGridPadding();
             if (_state && _editManager->previewSurface()) {
                 _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
             }
@@ -2185,6 +2218,152 @@ bool SegmentationModule::setManualAddModeActive(bool active, bool apply)
 bool SegmentationModule::undoManualAddConstraint()
 {
     return undoManualAddPlaneConstraint();
+}
+
+bool SegmentationModule::resizeSessionGrid(const ManualAddTool::GridPadding& padding, int sign)
+{
+    if (!_editManager || !_editManager->hasSession() || !padding.any()) {
+        return false;
+    }
+    auto base = _editManager->baseSurface();
+    if (!base) {
+        return false;
+    }
+    const int s = sign < 0 ? -1 : 1;
+    if (!segmentation::resizeSurfaceGrid(*base,
+                                         s * padding.top,
+                                         s * padding.bottom,
+                                         s * padding.left,
+                                         s * padding.right)) {
+        return false;
+    }
+    if (padding.top != 0 || padding.left != 0) {
+        applyCorrectionAnchorOffset(static_cast<float>(s * padding.left), static_cast<float>(s * padding.top));
+    }
+    // The cached save copy has the old size; the next save writes it all.
+    _saveSnapshot.reset();
+    _autosaveFullSurfaceNeeded = true;
+    refreshSessionFromSurface(base.get());
+    return true;
+}
+
+void SegmentationModule::undoManualAddGridPadding()
+{
+    if (!_manualAddGridPadding.any()) {
+        return;
+    }
+    const ManualAddTool::GridPadding padding = _manualAddGridPadding;
+    _manualAddGridPadding = {};
+    resizeSessionGrid(padding, -1);
+}
+
+bool SegmentationModule::extendManualAdd(ManualAddTool::ExtendSide side,
+                                         int cells,
+                                         std::optional<ManualAddTool::EdgeSpan> span,
+                                         QString* errorMessage)
+{
+    auto fail = [&](const QString& message, const QString& code) {
+        if (errorMessage) {
+            *errorMessage = code;
+        }
+        emit statusMessageRequested(message, kStatusMedium);
+        return false;
+    };
+    if (_growthInProgress) {
+        return fail(tr("Wait for surface growth to finish before extending an edge."),
+                    QStringLiteral("growth_in_progress"));
+    }
+    if (!_manualAddMode && !beginManualAdd()) {
+        return fail(tr("Manual Add could not start."), QStringLiteral("manual_add_unavailable"));
+    }
+    if (!_manualAddTool || !_editManager || !_editManager->hasSession()) {
+        return fail(tr("Open a segmentation editing session before extending an edge."),
+                    QStringLiteral("no_session"));
+    }
+    if (_manualAddTool->extensionActive() || _manualAddTool->initialFillCommitted() ||
+        _editManager->hasPendingChanges()) {
+        return fail(tr("Apply or clear the pending Manual Add geometry before extending an edge."),
+                    QStringLiteral("pending_geometry"));
+    }
+
+    const ManualAddTool::Config config = _widget ? _widget->manualAddConfig() : _manualAddTool->config();
+    cells = std::clamp(cells, 1, config.maxPreviewSpan);
+    const ManualAddTool::GridPadding padding =
+        ManualAddTool::paddingForExtension(_manualAddTool->entrySnapshotPoints(), side, cells, span);
+    if (padding.any()) {
+        if (!resizeSessionGrid(padding, 1)) {
+            return fail(tr("Manual Add could not make room past that edge."), QStringLiteral("resize_failed"));
+        }
+        _manualAddGridPadding = padding;
+        _manualAddTool->begin(_editManager->previewPoints(), config);
+    }
+
+    std::string status;
+    if (!_manualAddTool->beginExtension(side, cells, span, &status)) {
+        undoManualAddGridPadding();
+        _manualAddTool->begin(_editManager->previewPoints(), config);
+        refreshOverlay();
+        return fail(QString::fromStdString(status), QStringLiteral("no_edge"));
+    }
+
+    std::optional<cv::Rect> bounds;
+    if (!_editManager->setPreviewPointsOnly(_manualAddTool->previewPoints(),
+                                            _manualAddTool->changedVertices(),
+                                            true,
+                                            &bounds)) {
+        clearManualAddPending();
+        return fail(tr("Manual Add preview update failed."), QStringLiteral("preview_failed"));
+    }
+    if (_state && _editManager->previewSurface()) {
+        _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+    }
+    emitPendingChanges();
+    refreshOverlay();
+    emit statusMessageRequested(QString::fromStdString(status), kStatusMedium);
+    return true;
+}
+
+bool SegmentationModule::addManualAddConstraintAtWorld(const cv::Vec3f& world, float radius, QString* errorMessage)
+{
+    auto fail = [&](const std::string& message, const QString& code) {
+        if (errorMessage) {
+            *errorMessage = code;
+        }
+        emit statusMessageRequested(QString::fromStdString(message), kStatusMedium);
+        return false;
+    };
+    if (!_manualAddMode || !_manualAddTool || !_editManager) {
+        return fail("Manual Add is not active.", QStringLiteral("manual_add_session"));
+    }
+    if (radius <= 0.0f) {
+        radius = static_cast<float>(_manualAddTool->config().planeConstraintRadius);
+    }
+    const auto& preview = _manualAddTool->previewPoints();
+    double bestDistSq = static_cast<double>(radius) * static_cast<double>(radius);
+    std::optional<SegmentationEditManager::GridKey> best;
+    for (const auto& key : _manualAddTool->fillVertices()) {
+        if (key.row < 0 || key.row >= preview.rows || key.col < 0 || key.col >= preview.cols) {
+            continue;
+        }
+        const cv::Vec3f delta = preview(key.row, key.col) - world;
+        const double distSq = static_cast<double>(delta.dot(delta));
+        if (distSq <= bestDistSq) {
+            bestDistSq = distSq;
+            best = key;
+        }
+    }
+    if (!best) {
+        return fail("No pending Manual Add vertex lies within the radius of that point.",
+                    QStringLiteral("no_vertex_in_radius"));
+    }
+    std::string status;
+    if (!_manualAddTool->addOrReplacePlaneConstraint(best->row, best->col, world, &status)) {
+        return fail(status, QStringLiteral("constraint_rejected"));
+    }
+    if (!recomputeManualAdd()) {
+        return fail("Manual Add could not fit the constraint.", QStringLiteral("fit_failed"));
+    }
+    return true;
 }
 
 bool SegmentationModule::setCorrectionPointMode(bool active, QString* errorMessage)
@@ -2222,6 +2401,7 @@ void SegmentationModule::resetManualAddState(bool restorePreview)
 
     if (_manualAddMode && _manualAddTool && restorePreview && _editManager) {
         _editManager->restorePreviewSnapshot(_manualAddTool->entrySnapshotPoints());
+        undoManualAddGridPadding();
         if (_state && _editManager->previewSurface()) {
             _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
         }
@@ -2231,6 +2411,8 @@ void SegmentationModule::resetManualAddState(bool restorePreview)
     if (_manualAddTool) {
         _manualAddTool->clear();
     }
+    // Without a restore the padded rows stay; they hold only invalid points.
+    _manualAddGridPadding = {};
 
     const bool wasManualAddMode = _manualAddMode;
     _manualAddMode = false;
@@ -2262,7 +2444,8 @@ bool SegmentationModule::recomputeManualAdd()
         return false;
     }
 
-    if (_manualAddTool->config().interpolationMode == ManualAddTool::InterpolationMode::TracerRestrictedToFill) {
+    if (!_manualAddTool->extensionActive() &&
+        _manualAddTool->config().interpolationMode == ManualAddTool::InterpolationMode::TracerRestrictedToFill) {
         if (_growthInProgress) {
             emit statusMessageRequested(tr("Surface growth already in progress"), kStatusMedium);
             return false;
@@ -2319,6 +2502,11 @@ bool SegmentationModule::clearManualAddPending()
         return false;
     }
     _editManager->restorePreviewSnapshot(_manualAddTool->entrySnapshotPoints());
+    if (_manualAddGridPadding.any()) {
+        undoManualAddGridPadding();
+        _manualAddTool->begin(_editManager->previewPoints(),
+                              _widget ? _widget->manualAddConfig() : _manualAddTool->config());
+    }
     if (_state && _editManager->previewSurface()) {
         _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
     }
@@ -2975,6 +3163,16 @@ void SegmentationModule::performAutosave()
     // common geometry-edit case where vertexUpdates carries the precise delta.
     if (snapshot && (snapshot->path != savePath || snapshot->id != saveId)) {
         snapshot.reset();
+    }
+    if (snapshot && snapshot->rawPointsPtr() && snapshot->rawPointsPtr()->size() != sourceSize) {
+        snapshot.reset();
+        _autosaveFullSurfaceNeeded = true;
+    }
+    if (_autosaveFullSurfaceNeeded) {
+        // Vertex updates address the grid as it is now and cannot resize the
+        // saved copy or carry channel edits, so write the whole surface.
+        vertexUpdates.clear();
+        _autosaveFullSurfaceNeeded = false;
     }
 
     if (vertexUpdates.empty()) {
