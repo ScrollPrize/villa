@@ -113,7 +113,10 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
     };
     const QString extendTip = tr("Continue the surface past its %1 edge along each line's own direction. "
                                  "Shift+click the sheet in a slice view to bend the preview onto it, "
-                                 "Shift+right-click to remove a click, then Apply or Cancel.");
+                                 "Shift+right-click to remove a click, then Apply or Cancel. "
+                                 "Pressing it again applies the pending strip and extends on from the new edge. "
+                                 "Keys 1 to 4 do the same in Manual Add, and Shift+drag along an edge "
+                                 "in the segment view extends only that stretch.");
     _btnExtendUp = makeExtendButton(tr("Up"), extendTip.arg(tr("top")));
     _btnExtendDown = makeExtendButton(tr("Down"), extendTip.arg(tr("bottom")));
     _btnExtendLeft = makeExtendButton(tr("Left"), extendTip.arg(tr("left")));
@@ -165,6 +168,11 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
             emit extendRequested(static_cast<int>(side), _spinExtendCells->value());
         });
     }
+}
+
+int SegmentationManualAddPanel::extendCells() const
+{
+    return _spinExtendCells->value();
 }
 
 ManualAddTool::Config SegmentationManualAddPanel::config() const

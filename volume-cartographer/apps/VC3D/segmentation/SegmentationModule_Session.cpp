@@ -98,6 +98,7 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
 
 void SegmentationModule::endEditingSession()
 {
+    _manualAddContinuation.reset();
     _forceFullSurfaceAutosave = false;
     _pendingGridOffsetColDelta = 0;
     _pendingGridOffsetRowDelta = 0;

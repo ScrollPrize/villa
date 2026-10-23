@@ -203,6 +203,13 @@ public:
                          int cells,
                          std::optional<ManualAddTool::EdgeSpan> span = std::nullopt,
                          QString* errorMessage = nullptr);
+    // The same, except that when an extension of `side` is already pending it
+    // is applied first and the next one starts from the new edge, as soon as
+    // the save that Apply starts has finished (the direction keys and panel
+    // buttons use this, so pressing the same direction again walks on).
+    bool extendOrContinueManualAdd(ManualAddTool::ExtendSide side, int cells, QString* errorMessage = nullptr);
+    // True while a repeated extension waits for the save of the one before it.
+    [[nodiscard]] bool manualAddContinuationQueued() const { return _manualAddContinuation.has_value(); }
     // Pin the pending manual-add geometry to a world point, as a Shift+click in
     // a plane view does, choosing the pending vertex nearest to it within
     // `radius` (the configured constraint radius when radius <= 0).
@@ -381,6 +388,7 @@ private:
                                    Qt::MouseButton button,
                                    Qt::KeyboardModifiers modifiers,
                                    const QPointF& scenePos);
+    bool handleManualAddMouseRelease(VolumeViewerBase* viewer, Qt::MouseButton button);
     bool handleManualAddMouseMove(VolumeViewerBase* viewer,
                                   Qt::MouseButtons buttons,
                                   const QPointF& scenePos);
@@ -506,6 +514,23 @@ private:
     // Grid rows and columns added for a pending edge extension; removed again
     // if the extension is canceled.
     ManualAddTool::GridPadding _manualAddGridPadding;
+    struct ManualAddContinuation
+    {
+        ManualAddTool::ExtendSide side{ManualAddTool::ExtendSide::Right};
+        int cells{0};
+        std::optional<ManualAddTool::EdgeSpan> span;
+    };
+    std::optional<ManualAddContinuation> _manualAddContinuation;
+    // Shift+drag in the segmentation view that picks an edge stretch.
+    struct ManualAddSpanDrag
+    {
+        bool active{false};
+        VolumeViewerBase* viewer{nullptr};
+        cv::Point from;
+        cv::Point to;
+    };
+    ManualAddSpanDrag _manualAddSpanDrag;
+    void runManualAddContinuation();
 
     bool _showApprovalMask{false};
     bool _editApprovedMask{false};

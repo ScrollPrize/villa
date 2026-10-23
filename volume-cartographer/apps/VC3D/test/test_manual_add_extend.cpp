@@ -1,5 +1,6 @@
 #include <QtTest/QtTest>
 
+#include "segmentation/SegmentationUndoHistory.hpp"
 #include "segmentation/SurfaceGridEdit.hpp"
 #include "segmentation/tools/ManualAddTool.hpp"
 
@@ -59,6 +60,9 @@ private slots:
     void resizeSurfaceGridKeepsChannelsAligned();
     void maskCellsBecomeValid();
     void maskedFillSurvivesReload();
+    void dragPicksTheNearestEdgeStretch();
+    void extensionKeepsItsSpan();
+    void undoHistoryFollowsGridPadding();
 };
 
 void TestManualAddExtend::paddingCoversOnlyTheMissingRoom()
@@ -298,6 +302,79 @@ void TestManualAddExtend::maskedFillSurvivesReload()
     // Without marking the mask, the reload drops the filled vertex.
     QVERIFY(ManualAddTool::isInvalidPoint(fillAndReload(false)));
     QVERIFY(distance(fillAndReload(true), filled) < 1e-4f);
+}
+
+void TestManualAddExtend::dragPicksTheNearestEdgeStretch()
+{
+    // Rows 1 to 4 and columns 2 to 7 are valid in a 6 x 10 grid.
+    const auto points = flatSheet(6, 10, cv::Rect(2, 1, 6, 4));
+    using Side = ManualAddTool::ExtendSide;
+
+    auto pick = ManualAddTool::edgeFromDrag(points, cv::Point(3, 4), cv::Point(6, 5));
+    QVERIFY(pick);
+    QCOMPARE(pick->side, Side::Down);
+    QCOMPARE(pick->span.first, 3);
+    QCOMPARE(pick->span.last, 6);
+
+    pick = ManualAddTool::edgeFromDrag(points, cv::Point(5, 0), cv::Point(2, 1));
+    QVERIFY(pick);
+    QCOMPARE(pick->side, Side::Up);
+    QCOMPARE(pick->span.first, 2);
+    QCOMPARE(pick->span.last, 5);
+
+    pick = ManualAddTool::edgeFromDrag(points, cv::Point(8, 1), cv::Point(8, 3));
+    QVERIFY(pick);
+    QCOMPARE(pick->side, Side::Right);
+    QCOMPARE(pick->span.first, 1);
+    QCOMPARE(pick->span.last, 3);
+
+    pick = ManualAddTool::edgeFromDrag(points, cv::Point(1, 2), cv::Point(2, 4));
+    QVERIFY(pick);
+    QCOMPARE(pick->side, Side::Left);
+
+    // A single line, or only lines with no valid vertex, pick nothing.
+    QVERIFY(!ManualAddTool::edgeFromDrag(points, cv::Point(4, 4), cv::Point(4, 4)));
+    QVERIFY(!ManualAddTool::edgeFromDrag(points, cv::Point(8, 0), cv::Point(9, 0)));
+}
+
+void TestManualAddExtend::extensionKeepsItsSpan()
+{
+    const auto points = flatSheet(8, 12, cv::Rect(0, 0, 6, 8));
+    ManualAddTool tool;
+    QVERIFY(tool.begin(points, splineConfig()));
+    QVERIFY(!tool.extensionSpan());
+    std::string status;
+    QVERIFY2(tool.beginExtension(ManualAddTool::ExtendSide::Right, 3, ManualAddTool::EdgeSpan{2, 5}, &status),
+             status.c_str());
+    QVERIFY(tool.extensionSpan());
+    QCOMPARE(tool.extensionSpan()->first, 2);
+    QCOMPARE(tool.extensionSpan()->last, 5);
+    // Only rows 2 to 5 get new vertices.
+    for (const auto& key : tool.fillVertices()) {
+        QVERIFY(key.row >= 2 && key.row <= 5);
+    }
+}
+
+void TestManualAddExtend::undoHistoryFollowsGridPadding()
+{
+    segmentation::UndoHistory history;
+    cv::Mat_<cv::Vec3f> snapshot(2, 3, cv::Vec3f(1.0f, 2.0f, 3.0f));
+    QVERIFY(history.capture(snapshot));
+    QVERIFY(history.captureDelta({{1, 2, cv::Vec3f(4.0f, 5.0f, 6.0f)}}));
+
+    history.padGrid(1, 2, 3, 0);
+
+    const auto deltas = history.takeLastDelta();
+    QVERIFY(deltas);
+    QCOMPARE((*deltas)[0].row, 2);
+    QCOMPARE((*deltas)[0].col, 5);
+    const auto padded = history.takeLast();
+    QVERIFY(padded);
+    QCOMPARE(padded->rows, 5);
+    QCOMPARE(padded->cols, 6);
+    QCOMPARE((*padded)(1, 3), cv::Vec3f(1.0f, 2.0f, 3.0f));
+    QCOMPARE((*padded)(0, 0), kInvalid);
+    QCOMPARE((*padded)(4, 5), kInvalid);
 }
 
 QTEST_APPLESS_MAIN(TestManualAddExtend)

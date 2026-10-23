@@ -19,6 +19,7 @@ public:
     explicit SegmentationManualAddPanel(const QString& settingsGroup, QWidget* parent = nullptr);
 
     [[nodiscard]] ManualAddTool::Config config() const;
+    [[nodiscard]] int extendCells() const;
     ManualAddTool::LinePreviewMode cycleLinePreviewMode();
     // Direct changes emit configChanged through the same path as combo edits.
     ManualAddTool::LinePreviewMode setLinePreviewMode(ManualAddTool::LinePreviewMode mode);

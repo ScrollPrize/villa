@@ -88,6 +88,18 @@ public:
         Source source{Source::Boundary};
     };
 
+    struct EdgePick
+    {
+        ExtendSide side{ExtendSide::Right};
+        EdgeSpan span;
+    };
+    // The edge stretch a drag from `from` to `to` (grid cells, x = column,
+    // y = row) runs along: a mostly horizontal drag picks the top or bottom
+    // edge of the columns it covers, whichever the drag runs closer to, and a
+    // mostly vertical one the left or right edge of its rows.
+    static std::optional<EdgePick> edgeFromDrag(const cv::Mat_<cv::Vec3f>& points,
+                                                cv::Point from,
+                                                cv::Point to);
     static GridPadding paddingForExtension(const cv::Mat_<cv::Vec3f>& points,
                                            ExtendSide side,
                                            int cells,
@@ -137,6 +149,10 @@ public:
                         std::string* status = nullptr);
     [[nodiscard]] bool extensionActive() const { return _extension.has_value(); }
     [[nodiscard]] std::optional<ExtendSide> extensionSide() const;
+    [[nodiscard]] std::optional<EdgeSpan> extensionSpan() const
+    {
+        return _extension ? _extension->span : std::nullopt;
+    }
 
     void setConfig(Config config);
     [[nodiscard]] Config config() const { return _config; }
@@ -169,6 +185,7 @@ private:
     {
         ExtendSide side{ExtendSide::Right};
         int cells{0};
+        std::optional<EdgeSpan> span;
         // Continuation of each line past its edge, parallel to _fillVertices.
         std::vector<cv::Vec3f> guess;
         // Valid vertices at and just inside the edge; they keep their place.

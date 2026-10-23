@@ -107,6 +107,48 @@ std::pair<int, int> spanLines(const cv::Mat_<cv::Vec3f>& points,
 }
 }
 
+std::optional<ManualAddTool::EdgePick> ManualAddTool::edgeFromDrag(const cv::Mat_<cv::Vec3f>& points,
+                                                                  cv::Point from,
+                                                                  cv::Point to)
+{
+    if (points.empty()) {
+        return std::nullopt;
+    }
+    const bool horizontal = std::abs(to.x - from.x) >= std::abs(to.y - from.y);
+    // Horizontal drags cover columns, whose ends are the top and bottom edges.
+    const ExtendAxes nearAxes = extendAxes(horizontal ? ExtendSide::Up : ExtendSide::Left);
+    const ExtendAxes farAxes = extendAxes(horizontal ? ExtendSide::Down : ExtendSide::Right);
+    const int count = horizontal ? points.cols : points.rows;
+    const int first = std::clamp(std::min(horizontal ? from.x : from.y, horizontal ? to.x : to.y), 0, count - 1);
+    const int last = std::clamp(std::max(horizontal ? from.x : from.y, horizontal ? to.x : to.y), 0, count - 1);
+    if (last <= first) {
+        return std::nullopt;
+    }
+    // Where the drag runs across the lines, against where they end.
+    const double across = 0.5 * (horizontal ? from.y + to.y : from.x + to.x);
+    double nearGap = 0.0;
+    double farGap = 0.0;
+    int lines = 0;
+    for (int line = first; line <= last; ++line) {
+        const int nearEdge = lineEdge(points, nearAxes, line);
+        const int farEdge = lineEdge(points, farAxes, line);
+        if (nearEdge < 0 || farEdge < 0) {
+            continue;
+        }
+        nearGap += std::abs(across - nearEdge);
+        farGap += std::abs(across - farEdge);
+        ++lines;
+    }
+    if (lines < 2) {
+        return std::nullopt;
+    }
+    EdgePick pick;
+    pick.side = nearGap <= farGap ? (horizontal ? ExtendSide::Up : ExtendSide::Left)
+                                  : (horizontal ? ExtendSide::Down : ExtendSide::Right);
+    pick.span = EdgeSpan{first, last};
+    return pick;
+}
+
 ManualAddTool::GridPadding ManualAddTool::paddingForExtension(const cv::Mat_<cv::Vec3f>& points,
                                                               ExtendSide side,
                                                               int cells,
@@ -1164,6 +1206,7 @@ bool ManualAddTool::beginExtension(ExtendSide side,
     Extension extension;
     extension.side = side;
     extension.cells = cells;
+    extension.span = span;
     _fillVertices.clear();
     _changedVertices.clear();
     _borderSampleVertices.clear();

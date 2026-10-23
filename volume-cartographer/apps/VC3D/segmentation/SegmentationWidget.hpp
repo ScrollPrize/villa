@@ -62,6 +62,7 @@ public:
     [[nodiscard]] QString patchTracerSourcePath() const;
     [[nodiscard]] utils::Json patchTracerParamsJson() const;
     [[nodiscard]] ManualAddTool::Config manualAddConfig() const;
+    [[nodiscard]] int manualAddExtendCells() const;
     // Neural tracer getters — delegated to panel
     [[nodiscard]] bool neuralTracerEnabled() const;
     [[nodiscard]] QString neuralCheckpointPath() const;

@@ -79,7 +79,8 @@ void ensureSurfaceMetaObject(QuadSurface* surface)
 std::optional<std::pair<int, int>> segmentationSceneToGrid(VolumeViewerBase* viewer,
                                                            const QPointF& scenePos,
                                                            int rows,
-                                                           int cols)
+                                                           int cols,
+                                                           bool clampToGrid = false)
 {
     if (!viewer || rows <= 0 || cols <= 0) {
         return std::nullopt;
@@ -101,10 +102,29 @@ std::optional<std::pair<int, int>> segmentationSceneToGrid(VolumeViewerBase* vie
         row = static_cast<int>(std::lround(surfaceCoords[1]));
     }
 
+    if (clampToGrid) {
+        row = std::clamp(row, 0, rows - 1);
+        col = std::clamp(col, 0, cols - 1);
+    }
     if (row < 0 || row >= rows || col < 0 || col >= cols) {
         return std::nullopt;
     }
     return std::make_pair(row, col);
+}
+
+QString extendSideName(ManualAddTool::ExtendSide side)
+{
+    switch (side) {
+    case ManualAddTool::ExtendSide::Up:
+        return QObject::tr("top");
+    case ManualAddTool::ExtendSide::Down:
+        return QObject::tr("bottom");
+    case ManualAddTool::ExtendSide::Left:
+        return QObject::tr("left");
+    case ManualAddTool::ExtendSide::Right:
+    default:
+        return QObject::tr("right");
+    }
 }
 }
 
@@ -304,6 +324,19 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     useFalloff(FalloffTool::Drag);
 
     bindWidgetSignals();
+
+    // A repeated extension waits for the save of the one before it.
+    connect(this, &SegmentationModule::autosaveCompleted, this, [this](bool success) {
+        if (!_manualAddContinuation) {
+            return;
+        }
+        if (!success) {
+            _manualAddContinuation.reset();
+            emit statusMessageRequested(tr("The save failed, so the next extension did not start."), kStatusMedium);
+            return;
+        }
+        QTimer::singleShot(0, this, [this]() { runManualAddContinuation(); });
+    });
 
     if (_viewerManager) {
         _viewerManager->setSegmentationModule(this);
@@ -549,7 +582,7 @@ void SegmentationModule::bindWidgetSignals()
             this, [this]() { finishManualAdd(false); });
     connect(_widget, &SegmentationWidget::manualAddExtendRequested,
             this, [this](int side, int cells) {
-                extendManualAdd(static_cast<ManualAddTool::ExtendSide>(side), cells);
+                extendOrContinueManualAdd(static_cast<ManualAddTool::ExtendSide>(side), cells);
             });
 }
 
@@ -2152,11 +2185,12 @@ bool SegmentationModule::finishManualAdd(bool apply)
             emitPendingChanges();
             refreshOverlay();
         }
-        if (_manualAddGridPadding.top > 0 || _manualAddGridPadding.left > 0) {
-            // Rows or columns were added before the old first ones, so older
-            // undo entries no longer address the vertices they recorded.
-            clearUndoStack();
-        }
+        // Older undo entries follow their vertices into the grown grid, so the
+        // extension and everything before it stay undoable.
+        _undoHistory.padGrid(_manualAddGridPadding.top,
+                             _manualAddGridPadding.bottom,
+                             _manualAddGridPadding.left,
+                             _manualAddGridPadding.right);
         if (_manualAddGridPadding.any()) {
             _autosaveFullSurfaceNeeded = true;
             if (auto base = _editManager ? _editManager->baseSurface() : nullptr; base && !base->path.empty()) {
@@ -2198,6 +2232,7 @@ bool SegmentationModule::finishManualAdd(bool apply)
     }
 
     _manualAddMode = false;
+    _manualAddSpanDrag = {};
     _manualAddHoverThrottle.invalidate();
     _manualAddTool->clear();
     if (_widget) {
@@ -2327,6 +2362,49 @@ bool SegmentationModule::extendManualAdd(ManualAddTool::ExtendSide side,
     return true;
 }
 
+bool SegmentationModule::extendOrContinueManualAdd(ManualAddTool::ExtendSide side,
+                                                   int cells,
+                                                   QString* errorMessage)
+{
+    if (!_manualAddMode || !_manualAddTool || _manualAddTool->extensionSide() != side) {
+        return extendManualAdd(side, cells, std::nullopt, errorMessage);
+    }
+    std::optional<ManualAddTool::EdgeSpan> span = _manualAddTool->extensionSpan();
+    if (span) {
+        // The span counts lines along the edge; rows or columns added before
+        // the first one move it.
+        const bool linesAreRows = side == ManualAddTool::ExtendSide::Left || side == ManualAddTool::ExtendSide::Right;
+        const int shift = linesAreRows ? _manualAddGridPadding.top : _manualAddGridPadding.left;
+        span->first += shift;
+        span->last += shift;
+    }
+    if (!finishManualAdd(true)) {
+        if (errorMessage) {
+            *errorMessage = QStringLiteral("apply_failed");
+        }
+        return false;
+    }
+    _manualAddContinuation = ManualAddContinuation{side, cells, span};
+    runManualAddContinuation();
+    return true;
+}
+
+void SegmentationModule::runManualAddContinuation()
+{
+    if (!_manualAddContinuation) {
+        return;
+    }
+    if (_autosaveState.saveInProgress() || _autosaveState.pending()) {
+        // autosaveCompleted brings us back here.
+        emit statusMessageRequested(tr("Extension applied; the next one starts when the save finishes."),
+                                    kStatusShort);
+        return;
+    }
+    const ManualAddContinuation next = *_manualAddContinuation;
+    _manualAddContinuation.reset();
+    extendManualAdd(next.side, next.cells, next.span);
+}
+
 bool SegmentationModule::addManualAddConstraintAtWorld(const cv::Vec3f& world, float radius, QString* errorMessage)
 {
     auto fail = [&](const std::string& message, const QString& code) {
@@ -2401,6 +2479,7 @@ bool SegmentationModule::setCorrectionPointMode(bool active, QString* errorMessa
 
 void SegmentationModule::resetManualAddState(bool restorePreview)
 {
+    _manualAddSpanDrag = {};
     _pendingManualAddTracerMask.release();
 
     if (_manualAddMode && _manualAddTool && restorePreview && _editManager) {
@@ -2561,6 +2640,18 @@ bool SegmentationModule::handleManualAddMousePress(VolumeViewerBase* viewer,
     if (!_manualAddMode || !_manualAddTool || !viewer) {
         return false;
     }
+    if (viewer->surfName() == "segmentation" && button == Qt::LeftButton && modifiers == Qt::ShiftModifier) {
+        // Shift+drag along an edge picks the stretch to extend.
+        const auto& entry = _manualAddTool->entrySnapshotPoints();
+        if (const auto grid = segmentationSceneToGrid(viewer, scenePos, entry.rows, entry.cols, true)) {
+            _manualAddSpanDrag.active = true;
+            _manualAddSpanDrag.viewer = viewer;
+            _manualAddSpanDrag.from = cv::Point(grid->second, grid->first);
+            _manualAddSpanDrag.to = _manualAddSpanDrag.from;
+            emit statusMessageRequested(tr("Drag along the edge to extend, then release."), kStatusShort);
+        }
+        return true;
+    }
     if (viewer->surfName() == "segmentation" && button == Qt::LeftButton && modifiers == Qt::NoModifier) {
         const auto grid = segmentationSceneToGrid(viewer,
                                                   scenePos,
@@ -2606,6 +2697,26 @@ bool SegmentationModule::handleManualAddMouseMove(VolumeViewerBase* viewer,
                                                   Qt::MouseButtons buttons,
                                                   const QPointF& scenePos)
 {
+    if (_manualAddMode && _manualAddTool && _manualAddSpanDrag.active && viewer == _manualAddSpanDrag.viewer) {
+        const auto& entry = _manualAddTool->entrySnapshotPoints();
+        if (const auto grid = segmentationSceneToGrid(viewer, scenePos, entry.rows, entry.cols, true)) {
+            const cv::Point to(grid->second, grid->first);
+            if (to != _manualAddSpanDrag.to) {
+                _manualAddSpanDrag.to = to;
+                if (const auto pick = ManualAddTool::edgeFromDrag(entry, _manualAddSpanDrag.from, to)) {
+                    const bool rows = pick->side == ManualAddTool::ExtendSide::Left ||
+                                      pick->side == ManualAddTool::ExtendSide::Right;
+                    emit statusMessageRequested(tr("Release to extend the %1 edge along %2 %3 to %4.")
+                                                    .arg(extendSideName(pick->side),
+                                                         rows ? tr("rows") : tr("columns"))
+                                                    .arg(pick->span.first)
+                                                    .arg(pick->span.last),
+                                                kStatusShort);
+                }
+            }
+        }
+        return true;
+    }
     if (!_manualAddMode || !_manualAddTool || !viewer || buttons != Qt::NoButton) {
         return false;
     }
@@ -2636,6 +2747,27 @@ bool SegmentationModule::handleManualAddMouseMove(VolumeViewerBase* viewer,
     if (changed) {
         refreshOverlay();
     }
+    return true;
+}
+
+bool SegmentationModule::handleManualAddMouseRelease(VolumeViewerBase* viewer, Qt::MouseButton button)
+{
+    if (!_manualAddSpanDrag.active || button != Qt::LeftButton || viewer != _manualAddSpanDrag.viewer) {
+        return false;
+    }
+    const cv::Point from = _manualAddSpanDrag.from;
+    const cv::Point to = _manualAddSpanDrag.to;
+    _manualAddSpanDrag = {};
+    if (!_manualAddMode || !_manualAddTool) {
+        return true;
+    }
+    const auto pick = ManualAddTool::edgeFromDrag(_manualAddTool->entrySnapshotPoints(), from, to);
+    if (!pick) {
+        emit statusMessageRequested(tr("Drag along at least two vertices of an edge to extend that stretch."),
+                                    kStatusMedium);
+        return true;
+    }
+    extendManualAdd(pick->side, _widget ? _widget->manualAddExtendCells() : 16, pick->span);
     return true;
 }
 
