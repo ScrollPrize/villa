@@ -23,7 +23,12 @@ try:
     HAS_EDT = True
 except ImportError:
     HAS_EDT = False
+
+try:
     from scipy.ndimage import distance_transform_edt as scipy_edt
+except ImportError:  # only needed when edt is unavailable
+    if not HAS_EDT:
+        raise
 
 
 # Global state for worker processes
@@ -110,20 +115,27 @@ def _edt_dilate_worker(
     if not mask.any() and not any(a or b for a, b in pad):
         return (chunk_idx, False)
 
-    # Compute EDT
+    # Compute the *squared* EDT and threshold it against distance**2. Squared distances
+    # between voxel centres are integers, so both backends can represent them exactly
+    # (edt's float32 is exact below 2**24; scipy's float64 distance is squared and
+    # rounded back to that integer). Thresholding the float32 square root that edt.edt
+    # returns would instead let rounding decide boundary voxels, and the two backends
+    # would disagree, e.g. at distance=float32(sqrt(2)).
     if HAS_EDT:
         # Ensure contiguity for edt package
         if not inverted.flags["C_CONTIGUOUS"]:
             inverted = np.ascontiguousarray(inverted)
         # Use single thread since we parallelize over chunks
-        distances = edt_package.edt(inverted, parallel=1, black_border=False)
+        distances = edt_package.edtsq(inverted, parallel=1, black_border=False)
     else:
-        distances = scipy_edt(inverted)
+        distances = np.rint(np.square(scipy_edt(inverted)))
 
     # Threshold to create dilated mask
     if not black_border:
         distances = distances[tuple(slice(a, d - b) for (a, b), d in zip(pad, distances.shape))]
-    dilated = (distances[inner] <= distance).astype(np.uint8)
+    # np.float64, not a Python float: NumPy 2 would cast a Python float down to the
+    # float32 array's dtype and round e.g. float32(sqrt(3))**2 up to 3.
+    dilated = (distances[inner] <= np.float64(distance) ** 2).astype(np.uint8)
 
     # Write to output
     output_arr = zarr.open(output_path, mode="r+")[resolution]
