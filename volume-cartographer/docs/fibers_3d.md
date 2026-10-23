@@ -10,7 +10,7 @@ fibre to centre the CT views at the picked point or open Line Annotation.
 **Fit** frames the displayed geometry; **Fit selected** frames its selected
 portion. Changing filters or styles preserves the camera.
 
-The gear menu controls:
+The **Settings** button opens controls for:
 
 - Sources: loaded project annotations and the attached read-only AFV collection.
 - H, V, unclassified fibres and minimum full-fibre length. H/V and minimum length
@@ -90,4 +90,5 @@ Qt's raster-only widget capture cannot capture this content correctly.
 The settings popup was also checked on macOS in H/V, direction and fixed-length
 modes, with advanced options expanded and collapsed. Its height follows the
 visible controls; all controls remain reachable by scrolling with no horizontal
-overflow. The gear has no overlapping native menu indicator.
+overflow. The Settings button uses the same text style as the other toolbar
+buttons, without an icon or native menu indicator.

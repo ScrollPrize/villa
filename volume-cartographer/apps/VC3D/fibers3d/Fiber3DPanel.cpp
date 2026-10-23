@@ -112,15 +112,10 @@ struct Fiber3DPanel::Impl {
         auto* fitSelected = button(q->tr("Fit selected"), QStringLiteral("fibers3DFitSelected"));
         bar->addStretch();
         auto* detach = button(q->tr("Detach"), QStringLiteral("fibers3DDetach"));
-        auto* gear = button(QString::fromUtf8("⚙"), QStringLiteral("fibers3DSettings"));
-        gear->setToolTip(q->tr("3D display settings"));
-        gear->setAccessibleName(q->tr("3D display settings"));
-        // The gear already identifies the popup; a native menu arrow overlaps it on macOS.
-        gear->setStyleSheet(QStringLiteral("QToolButton::menu-indicator { image: none; }"));
-        auto gearFont = gear->font();
-        gearFont.setPointSizeF(std::max(14.0, gearFont.pointSizeF() + 2.0));
-        gear->setFont(gearFont);
-        gear->setMinimumWidth(28);
+        auto* settingsButton = button(q->tr("Settings"), QStringLiteral("fibers3DSettings"));
+        settingsButton->setToolTip(q->tr("3D display settings"));
+        settingsButton->setAccessibleName(q->tr("3D display settings"));
+        settingsButton->setStyleSheet(QStringLiteral("QToolButton::menu-indicator { image: none; }"));
         layout->addLayout(bar);
         canvas = new Fiber3DCanvas(q);
         canvas->setObjectName(QStringLiteral("fibers3DCanvas"));
@@ -140,7 +135,7 @@ struct Fiber3DPanel::Impl {
         QObject::connect(fit, &QToolButton::clicked, canvas, &Fiber3DCanvas::fitAll);
         QObject::connect(fitSelected, &QToolButton::clicked, canvas, &Fiber3DCanvas::fitSelected);
         QObject::connect(detach, &QToolButton::clicked, q, &Fiber3DPanel::detachRequested);
-        createSettings(gear);
+        createSettings(settingsButton);
 
         debounce.setSingleShot(true);
         debounce.setInterval(100);
@@ -217,11 +212,11 @@ struct Fiber3DPanel::Impl {
         updateSelection();
     }
 
-    void createSettings(QToolButton* gear)
+    void createSettings(QToolButton* settingsButton)
     {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         settings.beginGroup(QStringLiteral("fibers3d"));
-        settingsMenu = new QMenu(gear);
+        settingsMenu = new QMenu(settingsButton);
         settingsScroll = new QScrollArea(settingsMenu);
         settingsScroll->setWidgetResizable(true);
         settingsScroll->setFrameShape(QFrame::NoFrame);
@@ -235,8 +230,8 @@ struct Fiber3DPanel::Impl {
         settingsAction = new QWidgetAction(settingsMenu);
         settingsAction->setDefaultWidget(settingsScroll);
         settingsMenu->addAction(settingsAction);
-        gear->setMenu(settingsMenu);
-        gear->setPopupMode(QToolButton::InstantPopup);
+        settingsButton->setMenu(settingsMenu);
+        settingsButton->setPopupMode(QToolButton::InstantPopup);
         QObject::connect(settingsMenu, &QMenu::aboutToShow, q, [this] { resizeSettings(); });
 
         auto section = [&](const QString& title) {
