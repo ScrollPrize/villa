@@ -28,6 +28,8 @@ struct FiberRegionOptions {
     // Applied before selected priority and maximumFibers. nullopt is unrestricted;
     // an explicitly empty set matches nothing. UUIDs are canonicalized by the store.
     std::optional<std::vector<std::string>> uuids;
+    // Exact coordinate declaration, using the same JSON filter as ObjectSelection.
+    std::optional<std::string> coordinates;
 };
 enum class FiberRegionStop { Exhausted, FiberLimit, OutputBudget, ProcessingBudget, CandidateBudget, SqlBudget, Cancelled };
 struct FiberRegionStats {

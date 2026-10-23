@@ -11,7 +11,9 @@ inline bool hasGeometryCoordinates(const std::string& kind)
 {
     return kind == "point_collection" || kind == "patch" || kind == "fiber" || kind == "track";
 }
-// The only persistent coordinate declarations are volume UUID and the factor
+// volume_uuid stores the authoritative volume ID verbatim (metadata.json id),
+// including catalog IDs such as "20260411134726". It is not an object UUID.
+// The other persistent coordinate declaration is the factor
 // mapping source-volume voxels to the geometry's annotation coordinates.
 inline CoordinateJson geometryCoordinates(CoordinateJson value)
 {
@@ -23,9 +25,8 @@ inline CoordinateJson geometryCoordinates(CoordinateJson value)
     if (!value.contains("volume_uuid")) value["volume_uuid"] = nullptr;
     if (!value.contains("scale_factor")) value["scale_factor"] = nullptr;
     if (!value["volume_uuid"].is_null()) {
-        if (!value["volume_uuid"].is_string())
-            throw std::invalid_argument("geometry volume_uuid must be a UUID string or null");
-        value["volume_uuid"] = util::canonicalUuid(value["volume_uuid"].get<std::string>());
+        if (!value["volume_uuid"].is_string() || value["volume_uuid"].get_ref<const std::string&>().empty())
+            throw std::invalid_argument("geometry volume_uuid must be a nonempty volume ID string or null");
     }
     const auto& scale = value["scale_factor"];
     if (!scale.is_null() &&
@@ -90,11 +91,11 @@ inline CoordinateJson geometryTransferMetadata(const CoordinateJson& metadata)
 
 // Convert stored XYZ to voxels of exactly the declared volume. Unknown frames
 // remain unknown; names, dimensions, and resolution cannot establish identity.
-inline std::optional<double> geometryScaleToVolume(const CoordinateJson& metadata, const std::string& volumeUuid)
+inline std::optional<double> geometryScaleToVolume(const CoordinateJson& metadata, const std::string& volumeId)
 {
     const auto coordinates = geometryCoordinates(metadata.value("coordinates", CoordinateJson::object()));
     if (coordinates["volume_uuid"].is_null() || coordinates["scale_factor"].is_null() ||
-        coordinates["volume_uuid"] != util::canonicalUuid(volumeUuid)) return std::nullopt;
+        coordinates["volume_uuid"] != volumeId) return std::nullopt;
     const double scale = 1.0 / coordinates["scale_factor"].get<double>();
     if (!std::isfinite(scale) || scale <= 0) throw std::invalid_argument("geometry coordinate conversion is not representable");
     return scale;

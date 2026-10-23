@@ -1,5 +1,11 @@
 #include <iostream>
 #include <QApplication>
+#include <QElapsedTimer>
+#include <QMainWindow>
+#include <QListWidget>
+#include <QSpinBox>
+#include <QThread>
+#include "FiberCollectionController.hpp"
 #include "SpiralWorkspace.hpp"
 #include "SpiralServiceManager.hpp"
 #include "overlays/FiberOverlayCoordinates.hpp"
@@ -11,6 +17,60 @@ int runObjectStoreControllerTests()
     auto require = [](bool value, const char* message) { if (!value) throw std::runtime_error(message); };
     const auto path = std::filesystem::temp_directory_path() / ("vc3d-store-test-"+vc::util::newUuid()+".vcobj");
     try {
+        if (const char* source = std::getenv("VC3D_OBJECT_STORE_READ_ONLY_BENCH")) {
+            CState state;
+            Controller controller(&state,nullptr,nullptr,nullptr);
+            QMainWindow window;
+            FiberCollectionController collection(&state,nullptr,&window,&controller);
+            auto* list = window.findChild<QListWidget*>("fiberCollectionList");
+            auto* limit = window.findChild<QSpinBox*>("fiberCollectionMaxDisplayed");
+            require(list && limit, "fiber catalog controls exist");
+            require(limit->value() == 5000, "clean settings default to 5000 displayed fibers");
+            int heartbeats = 0;
+            QTimer heartbeat; heartbeat.setInterval(10);
+            QObject::connect(&heartbeat, &QTimer::timeout, [&] { ++heartbeats; });
+            heartbeat.start();
+            QElapsedTimer timer; timer.start();
+            state.attachObjectStore(QString::fromUtf8(source), {}, true);
+            const auto attachedMs = timer.elapsed();
+            require(controller._fibers.empty(), "attachment loads no editor geometry");
+            while (list->count() == 0 && timer.elapsed() < 60000) {
+                QApplication::processEvents(); QThread::msleep(1);
+            }
+            require(list->count() > 0 && list->count() <= 200, "first catalog page is bounded");
+            require(controller._fibers.empty(), "catalog page loads no editor geometry");
+            require(heartbeats > 0, "UI heartbeat runs while catalog loads");
+            const auto pageMs = timer.elapsed();
+            const auto id = list->item(0)->data(Qt::UserRole).toULongLong();
+            controller.ensureStoreFiber(id);
+            require(!controller._fibers.empty() && !controller._fiberCatalogComplete,
+                    "selection loads resident editor fibers without loading the full catalog");
+            const auto selected = std::find_if(controller._fibers.begin(),controller._fibers.end(),
+                [&](const auto& fiber) { return fiber.id == id; });
+            require(selected != controller._fibers.end() && selected->editorError.empty(), "selected controls decode");
+            require(!selected->linePointsLoaded, "selection controls do not eagerly decode sampled line");
+            controller.ensureFiberLines(*selected);
+            const auto residentCount = controller._fibers.size();
+            controller.ensureAllFiberLines();
+            require(controller._fibers.size() == residentCount && !controller._fiberCatalogComplete,
+                    "editor helpers do not promote resident reads to a full-store load");
+            require(selected->linePointsLoaded, "selected line decodes on demand");
+            std::cout << "read-only attach_ms=" << attachedMs << " first_page_ms=" << pageMs
+                      << " selected_ms=" << timer.elapsed()-pageMs << " cached_editors=" << controller._fibers.size()
+                      << " heartbeats=" << heartbeats << std::endl;
+            state.detachObjectStore();
+            require(controller._fibers.empty() && controller._registeredStoreFibers.empty(), "detach clears resident identities");
+            return 0;
+        }
+        {
+            QTemporaryDir volumeDir;
+            Volume::ZarrCreateOptions create; create.shapeZYX = {4,4,4};
+            create.chunkShapeZYX = {4,4,4}; create.compressor = "none"; create.uuid = "20260411134726";
+            const auto volume = Volume::New(fs::path(volumeDir.path().toStdString())/"ct.zarr", create);
+            const auto binding = vc3d::coordinateBindingForVolume(*volume, 4);
+            require(binding.at("coordinates").at("volume_uuid") == "20260411134726", "VC3D retains catalog volume ID verbatim");
+            require(vc3d::geometryScaleForVolume(binding, *volume) == .25, "VC3D matches the authoritative volume ID");
+        }
         OpenOptions options; options.author = "vc3d-controller-test";
         { auto db = ObjectStore::create(path,options); }
         CState state;
@@ -344,6 +404,18 @@ int runObjectStoreControllerTests()
             ObjectRecord missing; missing.uuid = vc::util::newUuid(); missing.kind = "fiber"; missing.name = "geometry-pending";
             { auto pending = db.write({{missing.uuid,{}}}); db.upsertObject(pending,missing); pending.commit(); }
             state.attachObjectStore(QString::fromStdString(path.string()), {}, true);
+            require(controller._fibers.empty(), "read-only attachment defers controls");
+            auto registerObject = [&](const std::string& uuid) {
+                auto read = db.read();
+                const auto revision = db.currentObjectRevision(read, uuid);
+                const auto attachment = *state.objectStoreSession()->attachment();
+                return controller.registerStoreFiber({attachment, {attachment.storeUuid, uuid}, revision->uuid, revision->geometryRevision});
+            };
+            const auto missingId = registerObject(missing.uuid);
+            const auto controlsId = registerObject(object.uuid);
+            require(controller._fibers.empty(), "registering catalog identities does not load controls");
+            controller.ensureStoreFiber(missingId);
+            controller.ensureStoreFiber(controlsId);
             const auto unavailable = std::find_if(controller._fibers.begin(),controller._fibers.end(),[&](const auto& fiber) { return fiber.uuid == missing.uuid; });
             require(unavailable != controller._fibers.end() && !unavailable->editorError.empty(), "unavailable geometry stays in catalog without blocking other fibers");
             require(controller._fibers.size() >= 2, "control-only record preserves the full catalog");
@@ -377,7 +449,7 @@ int runObjectStoreControllerTests()
             state.detachObjectStore();
         }
         if(const char* smoke=std::getenv("VC3D_OBJECT_STORE_SMOKE_DB")) {
-            state.attachObjectStore(QString::fromUtf8(smoke),"vc3d-real-smoke");
+            state.attachObjectStore(QString::fromUtf8(smoke),"vc3d-real-smoke");controller.loadFibersForCurrentPackage();
             require(!controller._fibers.empty(),"real database catalog loads");
             const size_t count=controller._fibers.size();
             auto fiber=resolve(controller._fibers.front().uuid);
@@ -427,7 +499,7 @@ int runObjectStoreControllerTests()
             const auto originalPin=fiber.storePin;
             fiber.tags.push_back("vc3d_smoke");
             controller.commitFibers({&fiber});
-            state.detachObjectStore();state.attachObjectStore(QString::fromUtf8(smoke),"vc3d-real-smoke");
+            state.detachObjectStore();state.attachObjectStore(QString::fromUtf8(smoke),"vc3d-real-smoke");controller.loadFibersForCurrentPackage();
             require(controller._fibers.size()==count,"real database reopens");
             const auto restored=resolve(fiber.uuid);
             require(std::find(restored.tags.begin(),restored.tags.end(),"vc3d_smoke")!=restored.tags.end(),"real database edit persists");
@@ -459,7 +531,7 @@ int runObjectStoreControllerTests()
             }});
             const auto realMergeResult=controller.commitStructuralEdit(std::move(realRequest),&committed);
             if(!realMergeResult.ok) throw std::runtime_error("real merge: "+realMergeResult.error);
-            state.detachObjectStore();state.attachObjectStore(QString::fromUtf8(smoke),"vc3d-real-smoke");
+            state.detachObjectStore();state.attachObjectStore(QString::fromUtf8(smoke),"vc3d-real-smoke");controller.loadFibersForCurrentPackage();
             const auto roundtrip=resolve(realMerge->merged.uuid);
             require(roundtrip.controlPoints.size()==restored.controlPoints.size(),"real split/merge control count");
             require(roundtrip.linePoints==realMerge->merged.linePoints,"real split/merge preserves planner numerical geometry");

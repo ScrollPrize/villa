@@ -13,7 +13,16 @@ int main() try {
     OpenOptions options; options.author = "generic-edit-test";
     { auto store = ObjectStore::create(path, options); }
     ObjectStoreSession session; const auto attachment = session.attach(path, options);
-    const auto volume = util::newUuid();
+    const std::string volume = "20260411134726";
+    require(geometryCoordinates(Json{{"volume_uuid",volume}})["volume_uuid"] == volume,
+            "catalog volume ID is stored verbatim");
+    require(geometryCoordinates(Json{{"volume_uuid","MixedCase-ID"}})["volume_uuid"] == "MixedCase-ID",
+            "volume identities are not canonicalized as object UUIDs");
+    mustFail([&] { geometryCoordinates(Json{{"volume_uuid",""}}); });
+    mustFail([&] { geometryCoordinates(Json{{"volume_uuid",20260411134726LL}}); });
+    require(!geometryScaleToVolume(Json{{"coordinates",{{"volume_uuid",volume},{"scale_factor",4}}}},
+                                  "2d2a9b21-9c82-5343-9443-57838a5fa5a1"),
+            "derived UUID does not alias authoritative volume ID");
     require(geometryScaleToVolume(Json{{"coordinates",{{"volume_uuid",volume},{"scale_factor",4}}}},volume) == .25,
             "known coordinates convert exactly");
     require(!geometryScaleToVolume(Json{{"coordinates",{{"volume_uuid",volume},{"scale_factor",4}}}},util::newUuid()), "different volume stays unbound");

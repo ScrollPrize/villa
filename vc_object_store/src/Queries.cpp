@@ -1,5 +1,6 @@
 #include "internal/EdgeSql.hpp"
 #include "internal/SpatialCache.hpp"
+#include "internal/CoordinateFilter.hpp"
 
 namespace vc::objects {
 using namespace detail;
@@ -54,6 +55,10 @@ SelectionFilter objectFilter(sqlite3* db, const ObjectSelection& selection)
         bind(" AND o.id IN (SELECT value FROM json_each(?))", ids.dump());
     }
     if (selection.kind) bind(" AND o.kind=?", *selection.kind);
+    if (selection.coordinates) {
+        const auto parameter = "?" + std::to_string(filter.parameters.size() + 1);
+        bind(coordinateFilterSql("o", parameter), coordinateFilterValue(*selection.coordinates));
+    }
     if (selection.tag) bind(" AND o.id IN (SELECT object_id FROM object_tags INDEXED BY object_tags_tag WHERE tag=?)", *selection.tag);
     if (selection.family) bind(" AND d.family=?", *selection.family);
     if (selection.minLength) bind(" AND d.length>=?", nlohmann::json(*selection.minLength).dump());

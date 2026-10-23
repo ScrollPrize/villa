@@ -176,6 +176,13 @@ struct ObjectSelection {
     std::optional<std::string> afterUuid;
     std::optional<double> afterLength; // paired with afterUuid for length_desc
     bool includeRetired = false;
+    // Exact declared coordinate system (JSON volume_uuid/scale_factor).
+    // Missing declarations compare as null; absent filter matches all frames.
+    std::optional<std::string> coordinates;
+};
+struct ObjectCoordinateGroup {
+    std::string coordinates;
+    int64_t count = 0;
 };
 struct EdgeSelection {
     std::optional<std::string> kind, tag;
@@ -376,6 +383,9 @@ public:
     std::vector<ObjectRecord> objectsByKind(const Txn& txn, const std::string& kind,
                                             const std::optional<std::string>& approvalState = std::nullopt, bool includeRetired = false) const;
     int64_t objectCount(const Txn& txn, const std::string& kind, bool includeRetired = false) const;
+    // Metadata-only aggregation, without reading geometry or materializing objects.
+    std::vector<ObjectCoordinateGroup> objectCoordinateGroups(const Txn&, const std::string& kind,
+                                                             const std::atomic_bool* cancel = nullptr) const;
     std::vector<ObjectRecord> objectsByTag(const Txn& txn, const std::string& tag, bool includeRetired = false) const;
     // Require write(expected). Decisions use keepRecordedRelationship,
     // updateEdge/retainRelationship, or removeEdge before commit. UUID lookup

@@ -3,6 +3,7 @@
 #include "internal/Spatial.hpp"
 #include "internal/ReadRequest.hpp"
 #include "internal/RecordSql.hpp"
+#include "internal/CoordinateFilter.hpp"
 #include "geometry/ArrayBytes.hpp"
 #include "vc_object_store/geometry/SegmentClip.hpp"
 #include <exception>
@@ -177,19 +178,21 @@ FiberRegionResult ObjectStore::fiberRegion(const ReadTxn& txn, const FiberSlice&
         }
         // Selected is attempted before any global priority-selection work.
         const auto query = [&](bool selectedOnly) {
-            std::string sql="SELECT o.uuid,o.id,h.revision_uuid,COALESCE(f.family,'') FROM objects o INDEXED BY objects_kind_uuid "
-                "CROSS JOIN spatial_regions b ON b.object_id=o.id AND b.array_name='' "
-                "CROSS JOIN spatial_regions_rtree r ON r.id=b.id "
+            const std::string from = selectedOnly
+                ? "objects o CROSS JOIN spatial_regions b ON b.object_id=o.id AND b.array_name='' CROSS JOIN spatial_regions_rtree r ON r.id=b.id "
+                : "spatial_regions_rtree r CROSS JOIN spatial_regions b ON b.id=r.id CROSS JOIN objects o ON o.id=b.object_id ";
+            std::string sql="SELECT o.uuid,o.id,h.revision_uuid,COALESCE(f.family,'') FROM " + from +
                 "JOIN geometry_heads h ON h.object_uuid=o.uuid LEFT JOIN fibers f ON f.object_id=o.id "
                 "LEFT JOIN object_lifecycle l ON l.object_id=o.id WHERE o.kind='fiber' AND b.array_name='' "
                 "AND COALESCE(l.retired,0)=0 AND "+spatialOverlapSql()+
                 " AND COALESCE(f.length,0)>=?7 AND (?8 IS NULL OR COALESCE(f.family,'')=?8)";
             if(includedIds)sql+=" AND o.id IN (SELECT value FROM json_each(?10))";
+            if(options.coordinates)sql+=coordinateFilterSql("o", "?11");
             if(selectedOnly)sql+=" AND o.uuid=?9";
             else if(selected)sql+=" AND o.uuid!=?9";
-            // Drive the UUID index to stream stable priorities without a sorter.
-            // Nonspatial object probes also consume the SQL work budget.
-            // There is no LIMIT/OFFSET replay and no candidate coverage cache.
+            // Start with spatial candidates, then order their metadata by UUID.
+            // A small viewport must not scan every object before reaching it.
+            // The sort and candidate probes remain inside the SQL work budget.
             if(!selectedOnly)sql+=" ORDER BY o.uuid";
             Statement candidates(db,sql);
             for(int i=0;i<6;++i)candidates.bind(i+1,bounds[i]);
@@ -197,6 +200,7 @@ FiberRegionResult ObjectStore::fiberRegion(const ReadTxn& txn, const FiberSlice&
             if(options.family)candidates.bind(8,*options.family);else candidates.bindNull(8);
             if(selected)candidates.bind(9,parseUuid(*selected));
             if(includedIds)candidates.bind(10,*includedIds);
+            if(options.coordinates)candidates.bind(11,coordinateFilterValue(*options.coordinates));
             while(candidates.row()) {
                 requestWork(&FiberRegionStats::candidateVisits);
                 process(formatUuid(candidates.blob16(0)),candidates.i64(1),formatUuid(candidates.blob16(2)),candidates.text(3));

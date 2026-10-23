@@ -217,8 +217,10 @@ JSON import rejects lifecycle-bearing exports.
 ## Volume identity and coordinate scale
 
 Geometry objects use `meta.coordinates = {"volume_uuid": ..., "scale_factor": ...}`.
-The UUID is explicit, normalized to lowercase, and need not identify a stored
-object. Paths, levels, resolution and labels never infer it. Scale is a finite
+Despite the field name, `volume_uuid` is the volume's `id` from the open-data
+`metadata.json`, stored verbatim as a nonempty string (for example
+`"20260411134726"`). It is not hashed, lowercased, or converted to an object UUID.
+Paths, levels, resolution and labels never infer it. Scale is a finite
 positive JSON number with direction **stored XYZ = volume voxel XYZ × scale**;
 it differs from physical resolution and patch grid scale. Values are metadata
 only and never rescale payloads or detector parameters. Unknown/missing members
@@ -236,7 +238,9 @@ dependent anchors declare `metadata_keys=["coordinates"]`.
 
 C++ consumers share normalization, conflict checking, transfer metadata and exact
 volume matching through `objects/GeometryCoordinates.hpp`. A display name or
-matching grid dimensions cannot override a mismatched volume UUID.
+matching grid dimensions cannot override a mismatched volume ID. Existing
+bindings containing a derived UUID require an explicit metadata correction;
+they are not silently treated as aliases of catalog IDs.
 
 `ingestGeometryBatch` takes decoded objects, geometry and source annotations and
 inserts them and their native relationships in the caller's transaction. Duplicate,

@@ -377,6 +377,8 @@ public:
                                               const QPoint& globalPos);
     [[nodiscard]] std::vector<FiberSummary> fiberSummaries(bool includeDetails = false) const;
     void loadFiberDetails(uint64_t fiberId);
+    uint64_t registerStoreFiber(const vc::objects::PinnedObject& pin);
+    void ensureStoreFiber(uint64_t id);
     uint64_t fiberIdForUuid(const std::string& uuid) const;
     std::optional<vc::objects::PinnedObject> fiberPin(uint64_t id) const;
     std::optional<double> fiberCoordinateScale(uint64_t id, bool prompt = false);
@@ -1036,8 +1038,9 @@ private:
                                                              bool fullOptimization = false,
                                                              int activeStart = -1,
                                                              int activeEnd = -1) const;
-    void loadFibersForCurrentPackage();
+    void loadFibersForCurrentPackage(const std::optional<std::vector<std::string>>& uuids = std::nullopt);
     void ensureFiberLines(const StoredFiber&) const;
+    void ensureCompleteFiberCatalog() const;
     void ensureAllFiberLines() const;
     // Match reciprocal references by control identities, positions and directions.
     [[nodiscard]] static bool isReciprocalBranchRef(const StoredFiber& fiber,
@@ -1242,6 +1245,8 @@ private:
     int _nextPaneId = 1;
     std::vector<PaneRecord> _panes;
     std::vector<StoredFiber> _fibers;
+    bool _fiberCatalogComplete = false;
+    std::unordered_map<uint64_t, vc::objects::PinnedObject> _registeredStoreFibers;
 
     mutable uint64_t _nextFiberRuntimeId = 0;
     std::vector<std::string> _knownFiberTags;

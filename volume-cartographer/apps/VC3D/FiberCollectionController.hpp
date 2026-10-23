@@ -48,7 +48,9 @@ private:
     struct View;
     using Slice = vc::fibers::ViewRegion;
     std::map<int64_t,vc::objects::PinnedObject> pins_;
-    std::map<double,std::vector<std::string>> coordinateGroups_;
+    std::vector<vc::objects::ObjectCoordinateGroup> coordinateGroups_;
+    using CatalogCursor = std::optional<std::pair<double, std::string>>;
+    std::vector<CatalogCursor> catalogCursors_;
     std::map<int64_t,double> coordinateFactors_;
     CState* state_;
     ViewerManager* manager_;
@@ -78,8 +80,7 @@ private:
     int64_t pendingAnnotation_{};
     double nativeToViewer_{1.0};
     double nativeVoxelMm_{1.0};
-    int64_t selected_{0}, lastRow_{0};
-    double lastLength_{std::numeric_limits<double>::infinity()};
+    int64_t selected_{0};
     uint64_t revision_{0}, selectionRevision_{0}, navigationRevision_{0}, annotationRevision_{0};
     bool enabled_{false}, catalogBusy_{false}, catalogPending_{false}, navigationBusy_{false};
     struct Click {

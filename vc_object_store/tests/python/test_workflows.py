@@ -44,7 +44,7 @@ def test_owned_views_native_export_and_one_time_ingest(db, tmp_path, kind, geome
             db.close()
     with pytest.raises(RuntimeError, match='closed'):
         view.load()
-    coordinates = {'volume_uuid': '12345678-1234-1234-1234-123456789abc', 'scale_factor': 2**60 + 1}
+    coordinates = {'volume_uuid': '20260411134726', 'scale_factor': 2**60 + 1}
     db.set_meta(uid, 'coordinates', coordinates)
     binding = {'active_volume_id': 'display-only', 'shape_zyx': [8, 9, 10]}
     db.set_meta(uid, 'coordinate_binding', binding)
