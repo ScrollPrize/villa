@@ -46,6 +46,11 @@ def _recompress_worker(args: Tuple) -> Tuple[Tuple[Tuple[int, int], ...], bool]:
     )
     input_z = zarr.open(input_path, mode="r")
     output_z = zarr.open(output_path, mode="r+")
+    if isinstance(input_z, zarr.Group):
+        # A wrong input path is a bug, not a corrupt chunk: never zero-fill it.
+        raise TypeError(
+            f"Recompress input {input_path!r} is a zarr group, expected an array"
+        )
 
     slices = tuple(slice(start, stop) for start, stop in chunk_coords)
     corrupted = False
@@ -283,9 +288,14 @@ class RecompressTask(ZarrTask):
         chunk_coords = get_chunk_coords(input_z.shape, input_z.chunks)
         print(f"Total chunks to process: {len(chunk_coords)}")
 
+        source_path = (
+            f"{self.config.input_zarr}/{self._levels_to_process[0]}"
+            if self._is_ome_zarr
+            else self.config.input_zarr
+        )
         work_items = [
             (
-                self.config.input_zarr,
+                source_path,
                 self._lvl0_path,
                 coords,
                 None,
