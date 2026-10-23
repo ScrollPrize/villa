@@ -13,6 +13,11 @@ Selecting an AFV fibre in a CT slice or the catalogue also highlights it in
 3D, using the same yellow (`#ffff66`) as the slice overlay and a stroke
 2 logical pixels wider than the other fibres, including on Retina displays.
 The highlight respects the existing 3D depth and region/length filters.
+Other fibres default to 20% opacity while a displayed fibre is selected; the
+selected fibre stays opaque. With no displayed selection, every fibre is opaque.
+Adjust this in **Settings → More display options → Other fibers opacity**,
+using the 0–100% slider or numeric control (5% arrow steps). Existing saved
+opacity preferences are preserved; the stored setting remains a 0–1 fraction.
 
 A white crosshair marks the shared CT focus at its actual 3D position. Moving
 the focus in a CT view updates it immediately without moving the 3D camera;

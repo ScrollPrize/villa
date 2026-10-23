@@ -26,6 +26,7 @@
 #include <QSettings>
 #include <QShowEvent>
 #include <QSignalBlocker>
+#include <QSlider>
 #include <QSpinBox>
 #include <QTimer>
 #include <QToolButton>
@@ -417,9 +418,36 @@ struct Fiber3DPanel::Impl {
         auto* advancedLayout = new QVBoxLayout(advancedContent);
         advancedLayout->setContentsMargins(0, 0, 0, 0);
         advancedLayout->setSpacing(7);
-        auto* opacity = real("fibers3DOpacity", 0.05, 1, 1, 2);
-        row(q->tr("Unselected"), opacity, advancedLayout);
-        opacity->setToolTip(q->tr("Opacity of unselected fibers"));
+        // Keep the stored 0..1 preference compatible with previous versions;
+        // the controls expose a percentage with useful keyboard/button steps.
+        double storedOpacity = settings.value(QStringLiteral("fibers3DOpacity"), display.unselectedOpacity).toDouble();
+        if (!std::isfinite(storedOpacity))
+            storedOpacity = display.unselectedOpacity;
+        auto* opacity = new QSpinBox(settingsContents);
+        opacity->setObjectName(QStringLiteral("fibers3DOpacity"));
+        opacity->setRange(0, 100);
+        opacity->setSingleStep(5);
+        opacity->setSuffix(QStringLiteral(" %"));
+        opacity->setKeyboardTracking(false);
+        opacity->setValue(int(std::lround(std::clamp(storedOpacity, 0.0, 1.0) * 100.0)));
+        auto* opacitySlider = new QSlider(Qt::Horizontal, settingsContents);
+        opacitySlider->setObjectName(QStringLiteral("fibers3DOpacitySlider"));
+        opacitySlider->setRange(0, 100);
+        opacitySlider->setSingleStep(5);
+        opacitySlider->setPageStep(10);
+        opacitySlider->setValue(opacity->value());
+        auto* opacityLabel = new QLabel(q->tr("Other fibers opacity"), settingsContents);
+        opacityLabel->setBuddy(opacity);
+        opacityLabel->setWordWrap(true);
+        opacitySlider->setAccessibleName(opacityLabel->text());
+        opacity->setAccessibleName(opacityLabel->text());
+        const auto opacityHelp = q->tr("Opacity of other fibers when a displayed fiber is selected. Without a selection, all fibers are opaque.");
+        opacity->setToolTip(opacityHelp);
+        opacitySlider->setToolTip(opacityHelp);
+        advancedLayout->addWidget(opacityLabel);
+        advancedLayout->addWidget(horizontal({opacitySlider, opacity}));
+        QObject::connect(opacitySlider, &QSlider::valueChanged, opacity, &QSpinBox::setValue);
+        QObject::connect(opacity, &QSpinBox::valueChanged, opacitySlider, &QSlider::setValue);
         auto* perspective = check("fibers3DPerspective", q->tr("Perspective"), false);
         auto* bounds = check("fibers3DBounds", q->tr("Show region bounds"), true);
         auto* cursor = check("fibers3DCursor", q->tr("Show cursor"), true);
@@ -439,7 +467,7 @@ struct Fiber3DPanel::Impl {
 
         auto changedDisplay = [=, this] {
             display.lineWidth = float(width->value());
-            display.unselectedOpacity = float(opacity->value());
+            display.unselectedOpacity = float(opacity->value() / 100.0);
             display.showGaps = gaps->isChecked();
             display.showAnnotations = annotationsVisible->isChecked();
             display.annotationsSelectedOnly = selectedOnly->isChecked();
@@ -469,7 +497,8 @@ struct Fiber3DPanel::Impl {
             });
         for (auto* w : {colors, direction, palette})
             QObject::connect(w, &QComboBox::currentIndexChanged, q, changedDisplay);
-        for (auto* w : {width, opacity, rangeMin, rangeMax})
+        QObject::connect(opacity, &QSpinBox::valueChanged, q, changedDisplay);
+        for (auto* w : {width, rangeMin, rangeMax})
             QObject::connect(w, &QDoubleSpinBox::valueChanged, q, changedDisplay);
         for (auto* w : {fixedRange, gaps, annotationsVisible, selectedOnly, perspective, bounds, cursor})
             QObject::connect(w, &QCheckBox::toggled, q, changedDisplay);
@@ -498,8 +527,12 @@ struct Fiber3DPanel::Impl {
             s.setValue(w->objectName(), w->isChecked());
         for (auto* w : q->findChildren<QComboBox*>())
             s.setValue(w->objectName(), w->currentIndex());
-        for (auto* w : q->findChildren<QSpinBox*>())
-            s.setValue(w->objectName(), w->value());
+        for (auto* w : q->findChildren<QSpinBox*>()) {
+            if (w->objectName() == QStringLiteral("fibers3DOpacity"))
+                s.setValue(w->objectName(), w->value() / 100.0);
+            else
+                s.setValue(w->objectName(), w->value());
+        }
         for (auto* w : q->findChildren<QDoubleSpinBox*>())
             s.setValue(w->objectName(), w->value());
         s.setValue(QStringLiteral("fibers3DCustomColor"), display.custom.name());
