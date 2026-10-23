@@ -117,7 +117,7 @@ If you do not install through the pyproject.toml, ensure your torch version is `
 
 #### Get the dataset
 
-Ready-made inputs are published in the [`spiral-input` dataset](data_datasets#spiral-input-2026-07), which lives on the dl.ash2txt.org data server : [Spiral Datasets](https://dl.ash2txt.org/datasets/spiral_datasets/PHercParis4/) (about 177 GB in October 2026; a default fit needs about 13 GB of it, see below):
+Ready-made inputs are published in the [`spiral-input` dataset](data_datasets#spiral-input-2026-07), which lives on the dl.ash2txt.org data server : [Spiral Datasets](https://dl.ash2txt.org/datasets/spiral_datasets/PHercParis4/) (about 177 GB in October 2026; a default fit needs about 15 GB of it, see below):
 
 ```bash
 rclone copy :http: ./spiral_datasets/phercparis4 \

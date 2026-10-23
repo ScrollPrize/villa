@@ -272,9 +272,7 @@ your own configuration (see "Checking a dataset before fitting").
 
 To fetch only what a default fit needs, add include filters to the tutorial's
 rclone command. Everything a default `fit_spiral.py` or VC3D session opens on
-PHercParis4 is about 13 GB instead of the full 177 GB (the 89,237 patch
-directories were sized from a random sample of 200; everything else is
-exact):
+PHercParis4 is about 15 GB instead of the full 177 GB:
 
 ```sh
 rclone copy :http: ./spiral_datasets/phercparis4 \
