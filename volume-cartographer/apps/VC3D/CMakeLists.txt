@@ -26,6 +26,7 @@ set(srcs
     fibers3d/Fiber3DData.hpp
     fibers3d/Fiber3DCanvas.cpp
     fibers3d/Fiber3DCanvas.hpp
+    fibers3d/Fiber3DRenderGeometry.hpp
     fibers3d/Fiber3DColor.hpp
     fibers3d/Fiber3DGeometry.hpp
     fibers3d/Fiber3DPanel.cpp

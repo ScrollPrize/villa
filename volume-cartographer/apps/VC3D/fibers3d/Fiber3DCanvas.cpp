@@ -1,6 +1,9 @@
 #include "Fiber3DCanvas.hpp"
 #include "Fiber3DColor.hpp"
-#include "Fiber3DGeometry.hpp"
+#include "Fiber3DRenderGeometry.hpp"
+#include <QFutureWatcher>
+#include <QTimer>
+#include <QtConcurrent/QtConcurrentRun>
 
 #include <QApplication>
 #include <QContextMenuEvent>
@@ -25,20 +28,11 @@ namespace vc3d::fibers3d
 {
 namespace
 {
-// Each instance is a segment, not a line strip: separate runs can never be
-// accidentally joined. Wide lines use triangles, portable to macOS core GL.
-struct Vertex {
-    float a[3], b[3];
-    float length, family, style, fiber;
-    float arc;
-    float direction[3];
-};
-struct Segment {
-    Point a, b;
-    size_t fiber;
-    int64_t originalIndex;
-    double begin, end;
-};
+using render::Vertex;
+using render::Segment;
+using render::distance;
+using render::expand;
+using render::emptyBounds;
 QVector3D relative(const Point& p, const Point& origin)
 {
     return {float(p[0] - origin[0]), float(p[1] - origin[1]), float(p[2] - origin[2])};
@@ -47,23 +41,6 @@ QVector3D rgb(const QColor& color)
 {
     return {float(color.redF()), float(color.greenF()), float(color.blueF())};
 }
-double distance(const Point& a, const Point& b)
-{
-    return std::hypot(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
-}
-void expand(Bounds& bounds, const Point& point)
-{
-    for (int k = 0; k < 3; ++k) {
-        bounds.lower[k] = std::min(bounds.lower[k], point[k]);
-        bounds.upper[k] = std::max(bounds.upper[k], point[k]);
-    }
-}
-Bounds emptyBounds()
-{
-    const double inf = std::numeric_limits<double>::infinity();
-    return {{inf, inf, inf}, {-inf, -inf, -inf}};
-}
-
 constexpr auto vertexShader = R"glsl(
 #version 330 core
 layout(location=0) in vec3 a;
@@ -74,7 +51,7 @@ layout(location=4) in vec3 axialDirection;
 uniform mat4 mvp;
 uniform vec2 viewport;
 uniform float width, selectedWidthBoost, selectedFiber, otherOpacity;
-uniform bool showAnnotations, selectedAnnotationsOnly, showGaps;
+uniform bool showAnnotations, selectedAnnotationsOnly, showGaps, hideSelected;
 uniform int colorMode, directionMode;
 uniform vec3 customColor, horizontalColor, verticalColor, selectedColor;
 uniform sampler2D palette;
@@ -110,7 +87,7 @@ void main() {
     color = vec4(c, selectedFiber < 0.0 || selected ? 1.0 : otherOpacity);
     vec4 p = mvp * vec4(a, 1.0), q = mvp * vec4(b, 1.0);
     float nearA = p.z + p.w, nearB = q.z + q.w;
-    if ((nearA <= 0.0 && nearB <= 0.0) || (marker != 0 && !annotated)) {
+    if ((nearA <= 0.0 && nearB <= 0.0) || (marker != 0 && !annotated) || (selected && hideSelected)) {
         gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
         positionPx = vec2(0.0); segmentLengthPx = 0.0;
         radiusPx = 0.0; dashStartPx = 0.0;
@@ -170,8 +147,25 @@ struct Fiber3DCanvas::Impl {
     DisplaySettings settings;
     QString selectedKey, error;
     int selectedIndex = -1;
-    std::vector<Vertex> vertices;
-    std::vector<Segment> segments;
+    std::shared_ptr<render::Geometry> geometry;
+    std::shared_ptr<const Scene> requested;
+    QFutureWatcher<std::shared_ptr<render::Geometry>> preparation;
+    std::shared_ptr<std::atomic_bool> cancelled;
+    bool pending = false, fitPending = false, selectedFitPending = false;
+    std::array<GLuint, render::tolerances.size()> buffers{};
+    std::array<size_t, render::tolerances.size()> uploaded{};
+    std::array<bool, render::tolerances.size()> allocated{};
+    std::vector<Vertex> selectedVertices;
+    bool selectedDirty = true;
+    GLuint selectedBuffer = 0, markerBuffer = 0;
+    bool markersDirty = true;
+    QTimer refine;
+    bool interactive = false;
+    std::vector<render::Draw> commands;
+    QMatrix4x4 commandMatrix;
+    double commandTolerance = -1;
+    int commandWidth = 0, commandHeight = 0;
+    float commandLineWidth = -1;
     Bounds bounds = emptyBounds();
     Point origin{}, target{};
     std::optional<Point> cursorPosition;
@@ -180,7 +174,7 @@ struct Fiber3DCanvas::Impl {
     bool fitted = false, dirty = false, glReady = false, dragging = false;
     Qt::MouseButton pressed = Qt::NoButton;
     QPointF pressPosition, previousPosition;
-    GLuint vao = 0, vbo = 0, paletteTexture = 0;
+    GLuint vao = 0, paletteTexture = 0;
     int uploadedPalette = -1;
     std::unique_ptr<QOpenGLShaderProgram> program;
 
@@ -214,10 +208,39 @@ Fiber3DCanvas::Fiber3DCanvas(QWidget* parent) : QOpenGLWidget(parent), d(std::ma
     setMinimumSize(180, 160);
     setFocusPolicy(Qt::StrongFocus);
     setToolTip(tr("Drag: orbit · Right-drag: pan · Wheel: zoom · Click: select · Right-click: actions"));
+    d->refine.setSingleShot(true);
+    d->refine.setInterval(180);
+    connect(&d->refine, &QTimer::timeout, this, [this] { d->interactive = false; update(); });
+    connect(&d->preparation, &QFutureWatcher<std::shared_ptr<render::Geometry>>::finished, this, [this] {
+        try {
+            // Consume the future's result so clearing a scene also releases its
+            // prepared arrays; the watcher must not keep another owner forever.
+            auto geometry = d->preparation.future().takeResult();
+            if (!d->pending && d->requested) {
+                d->geometry = std::move(geometry);
+                d->scene = d->geometry->scene;
+                d->bounds = d->geometry->bounds;
+                d->origin = d->geometry->origin;
+                d->radius = d->geometry->chunks.empty() ? 1 : std::max(1., distance(d->bounds.lower, d->bounds.upper) * .5);
+                d->dirty = true;
+                d->commandTolerance = -1;
+                setSelectedKey(d->selectedKey);
+                if (!d->fitted || d->fitPending) fit(d->selectedFitPending);
+                d->fitPending = false;
+                if (d->glReady && d->program && d->program->isLinked()) d->error.clear();
+            }
+        } catch (const std::exception& e) {
+            if (!d->pending && d->requested) d->error = tr("Cannot prepare fibers: %1").arg(QString::fromUtf8(e.what()));
+        }
+        if (d->pending) startGeometryBuild();
+        update();
+    });
 }
 
 Fiber3DCanvas::~Fiber3DCanvas()
 {
+    if (d->cancelled) d->cancelled->store(true);
+    d->preparation.waitForFinished();
     cleanupGL();
 }
 
@@ -231,13 +254,16 @@ void Fiber3DCanvas::cleanupGL()
         return;
     makeCurrent();
     d->program.reset();
-    if (d->vbo)
-        glDeleteBuffers(1, &d->vbo);
+    glDeleteBuffers(GLsizei(d->buffers.size()), d->buffers.data());
+    d->buffers.fill(0);
+    if (d->selectedBuffer) glDeleteBuffers(1, &d->selectedBuffer);
+    if (d->markerBuffer) glDeleteBuffers(1, &d->markerBuffer);
+    d->selectedBuffer = d->markerBuffer = 0;
     if (d->vao)
         glDeleteVertexArrays(1, &d->vao);
     if (d->paletteTexture)
         glDeleteTextures(1, &d->paletteTexture);
-    d->vbo = d->vao = d->paletteTexture = 0;
+    d->vao = d->paletteTexture = 0;
     d->uploadedPalette = -1;
     d->glReady = false;
     d->dirty = true;
@@ -260,34 +286,41 @@ void Fiber3DCanvas::initializeGL()
     }
     d->error.clear();
     glGenVertexArrays(1, &d->vao);
-    glGenBuffers(1, &d->vbo);
     glGenTextures(1, &d->paletteTexture);
-    glBindVertexArray(d->vao);
-    glBindBuffer(GL_ARRAY_BUFFER, d->vbo);
-    const int sizes[] = {3, 3, 4, 1, 3};
-    const size_t offsets[] = {offsetof(Vertex, a), offsetof(Vertex, b), offsetof(Vertex, length), offsetof(Vertex, arc), offsetof(Vertex, direction)};
-    for (int i = 0; i < 5; ++i) {
-        glEnableVertexAttribArray(i);
-        glVertexAttribPointer(i, sizes[i], GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void*>(offsets[i]));
-        glVertexAttribDivisor(i, 1);
-    }
-    glBindVertexArray(0);
+    glGenBuffers(GLsizei(d->buffers.size()), d->buffers.data());
+    glGenBuffers(1, &d->selectedBuffer);
+    glGenBuffers(1, &d->markerBuffer);
     d->dirty = true;
 }
 
 void Fiber3DCanvas::setScene(std::shared_ptr<const Scene> scene)
 {
-    d->scene = std::move(scene);
-    rebuildGeometry();
-    setSelectedKey(d->selectedKey);
-    if (!d->fitted && !d->segments.empty())
-        fitAll();
+    if (!scene) { clear(); return; }
+    d->requested = std::move(scene);
+    d->pending = true;
+    if (d->cancelled) d->cancelled->store(true);
+    if (!d->preparation.isRunning()) startGeometryBuild();
     update();
+}
+
+void Fiber3DCanvas::startGeometryBuild()
+{
+    d->pending = false;
+    d->cancelled = std::make_shared<std::atomic_bool>(false);
+    const auto scene = d->requested;
+    const auto token = d->cancelled;
+    d->preparation.setFuture(QtConcurrent::run([scene, token] { return render::build(scene, token.get()); }));
 }
 
 std::shared_ptr<const Scene> Fiber3DCanvas::scene() const
 {
     return d->scene;
+}
+
+bool Fiber3DCanvas::isPreparing() const
+{
+    return d->preparation.isRunning() || d->pending ||
+        (d->geometry && !d->geometry->chunks.empty() && (d->dirty || d->uploaded[0] != d->geometry->levels[0].size()));
 }
 
 void Fiber3DCanvas::setDisplaySettings(const DisplaySettings& settings)
@@ -306,90 +339,49 @@ void Fiber3DCanvas::setSelectedKey(const QString& key)
                 d->selectedIndex = int(i);
                 break;
             }
+    updateSelectedGeometry();
     update();
 }
 
 void Fiber3DCanvas::clear()
 {
+    if (d->cancelled) d->cancelled->store(true);
+    d->pending = false;
+    d->requested.reset();
     d->scene.reset();
+    d->geometry.reset();
     d->cursorPosition.reset();
     d->selectedKey.clear();
     d->selectedIndex = -1;
+    d->selectedVertices.clear();
     d->fitted = false;
-    rebuildGeometry();
+    d->dirty = true;
     update();
 }
 
-void Fiber3DCanvas::rebuildGeometry()
+void Fiber3DCanvas::updateSelectedGeometry()
 {
-    d->vertices.clear();
-    d->segments.clear();
-    d->bounds = emptyBounds();
-    d->dirty = true;
-    if (!d->scene)
-        return;
-
-    // CPU and GPU share the exact same clipped segments. All clipping is in
-    // doubles before shifting coordinates into the local rendering frame.
-    std::vector<std::pair<float, double>> metadata;
-    for (size_t fi = 0; fi < d->scene->fibers.size(); ++fi) {
-        const auto& fiber = d->scene->fibers[fi];
-        for (const auto& run : fiber.runs) {
-            double arc = 0.0;
-            for (size_t j = 1; j < run.points.size(); ++j) {
-                const auto& a = run.points[j - 1];
-                const auto& b = run.points[j];
-                if (!finite(a) || !finite(b)) {
-                    arc = 0;
-                    continue;
-                }
-                const double len = distance(a, b);
-                double lo = 0, hi = 1;
-                const bool visible = !d->scene->clipBounds || clipSegment(a, b, *d->scene->clipBounds, lo, hi);
-                if (visible && len > 0 && hi > lo) {
-                    const auto aa = interpolate(a, b, lo), bb = interpolate(a, b, hi);
-                    d->segments.push_back({aa, bb, fi, run.firstPoint + int64_t(j - 1), lo, hi});
-                    metadata.emplace_back(j - 1 < run.styles.size() ? float(run.styles[j - 1]) : 0.f, arc + len * lo);
-                    expand(d->bounds, aa);
-                    expand(d->bounds, bb);
-                }
-                arc += len;
-            }
-        }
+    d->selectedVertices.clear();
+    d->selectedDirty = true;
+    if (!d->geometry || d->selectedIndex < 0) return;
+    const auto& g = *d->geometry;
+    size_t count = 0;
+    for (auto ci : g.fiberChunks[d->selectedIndex]) count += g.chunks[ci].levels[0].count;
+    d->selectedVertices.reserve(count);
+    for (auto ci : g.fiberChunks[d->selectedIndex]) {
+        const auto r = g.chunks[ci].levels[0];
+        d->selectedVertices.insert(d->selectedVertices.end(), g.levels[0].begin() + r.first, g.levels[0].begin() + r.first + r.count);
     }
-    if (d->segments.empty())
-        return;
-    for (int k = 0; k < 3; ++k)
-        d->origin[k] = (d->bounds.lower[k] + d->bounds.upper[k]) * 0.5;
-    d->radius = std::max(1.0, distance(d->bounds.lower, d->bounds.upper) * 0.5);
-    d->vertices.reserve(d->segments.size());
-    auto vertex = [&](const Point& a, const Point& b, size_t fi, float style, double arc) {
-        const auto& fiber = d->scene->fibers[fi];
-        const auto aa = relative(a, d->origin), bb = relative(b, d->origin);
-        const auto direction = axialDirection(a, b);
-        return Vertex{{aa.x(), aa.y(), aa.z()}, {bb.x(), bb.y(), bb.z()}, std::isfinite(fiber.lengthMm) && fiber.lengthMm >= 0 ? float(fiber.lengthMm) : -1.f, fiber.family == 'H' ? 1.f : (fiber.family == 'V' ? 2.f : 0.f), style, float(fi), float(arc), {float(direction[0]), float(direction[1]), float(direction[2])}};
-    };
-    for (size_t i = 0; i < d->segments.size(); ++i) {
-        const auto& segment = d->segments[i];
-        d->vertices.push_back(vertex(segment.a, segment.b, segment.fiber, metadata[i].first, metadata[i].second));
-    }
-    for (size_t fi = 0; fi < d->scene->fibers.size(); ++fi)
-        for (const auto& marker : d->scene->fibers[fi].markers) {
-            double lo = 0, hi = 1;
-            if (!finite(marker.point) || (d->scene->clipBounds && !clipSegment(marker.point, marker.point, *d->scene->clipBounds, lo, hi)))
-                continue;
-            d->vertices.push_back(vertex(marker.point, marker.point, fi, 10.f + float(marker.kind), 0));
-        }
 }
 
 void Fiber3DCanvas::fit(bool selectedOnly)
 {
-    Bounds bounds = emptyBounds();
-    for (const auto& segment : d->segments) {
-        if (selectedOnly && int(segment.fiber) != d->selectedIndex)
-            continue;
-        expand(bounds, segment.a);
-        expand(bounds, segment.b);
+    if (d->preparation.isRunning() || d->pending) { d->fitPending = true; d->selectedFitPending = selectedOnly; }
+    Bounds bounds = d->bounds;
+    if (!d->geometry || d->geometry->chunks.empty()) return;
+    if (selectedOnly) {
+        if (d->selectedIndex < 0) return;
+        bounds = d->geometry->fiberBounds[d->selectedIndex];
     }
     if (!finite(bounds.lower))
         return;
@@ -440,9 +432,21 @@ void Fiber3DCanvas::paintGL()
         glViewport(0, 0, pixelWidth, pixelHeight);
         glClearColor(0.045f, 0.06f, 0.075f, 1.f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        if (d->dirty) {
+            // Release the previous scene before allocating the new resident levels.
+            glDeleteBuffers(GLsizei(d->buffers.size()), d->buffers.data());
+            glGenBuffers(GLsizei(d->buffers.size()), d->buffers.data());
+            glDeleteBuffers(1, &d->selectedBuffer);
+            glDeleteBuffers(1, &d->markerBuffer);
+            glGenBuffers(1, &d->selectedBuffer);
+            glGenBuffers(1, &d->markerBuffer);
+            d->uploaded.fill(0); d->allocated.fill(false);
+            d->selectedDirty = d->markersDirty = true;
+            d->dirty = false;
+        }
     }
     const auto matrix = d->matrix(width(), height());
-    if (d->glReady && d->error.isEmpty() && d->program && d->scene && !d->vertices.empty()) {
+    if (d->glReady && d->error.isEmpty() && d->program && d->geometry && !d->geometry->chunks.empty()) {
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LEQUAL);
         glDepthMask(GL_TRUE);
@@ -468,10 +472,43 @@ void Fiber3DCanvas::paintGL()
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glDisable(GL_CULL_FACE);
         glBindVertexArray(d->vao);
-        if (d->dirty) {
-            glBindBuffer(GL_ARRAY_BUFFER, d->vbo);
-            glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(d->vertices.size() * sizeof(Vertex)), d->vertices.data(), GL_STATIC_DRAW);
-            d->dirty = false;
+        const auto& geometry = *d->geometry;
+        // Upload progressively, coarse levels first. Each repaint transfers at
+        // most 8 MiB; camera motion itself never rebuilds or copies polylines.
+        size_t uploadBudget = 8 * 1024 * 1024 / sizeof(Vertex);
+        bool uploading = false;
+        for (size_t li = d->buffers.size(); li-- > 0;) {
+            const auto& data = geometry.levels[li];
+            if (d->uploaded[li] == data.size()) continue;
+            uploading = true;
+            if (!uploadBudget) break;
+            glBindBuffer(GL_ARRAY_BUFFER, d->buffers[li]);
+            if (!d->allocated[li]) {
+                glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(data.size() * sizeof(Vertex)), nullptr, GL_STATIC_DRAW);
+                if (glGetError() != GL_NO_ERROR) {
+                    d->error = tr("Not enough graphics memory. Reduce the displayed region or Memory budget.");
+                    break;
+                }
+                d->allocated[li] = true;
+            }
+            const size_t count = std::min(uploadBudget, data.size() - d->uploaded[li]);
+            glBufferSubData(GL_ARRAY_BUFFER, GLintptr(d->uploaded[li] * sizeof(Vertex)), GLsizeiptr(count * sizeof(Vertex)), data.data() + d->uploaded[li]);
+            if (glGetError() != GL_NO_ERROR) {
+                d->error = tr("Cannot upload fiber geometry. Reduce the displayed region or Memory budget.");
+                break;
+            }
+            d->uploaded[li] += count; uploadBudget -= count;
+        }
+        if (uploading) update();
+        if (d->selectedDirty) {
+            glBindBuffer(GL_ARRAY_BUFFER, d->selectedBuffer);
+            glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(d->selectedVertices.size() * sizeof(Vertex)), d->selectedVertices.data(), GL_STATIC_DRAW);
+            d->selectedDirty = false;
+        }
+        if (d->settings.showAnnotations && d->markersDirty) {
+            glBindBuffer(GL_ARRAY_BUFFER, d->markerBuffer);
+            glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(geometry.markers.size() * sizeof(Vertex)), geometry.markers.data(), GL_STATIC_DRAW);
+            d->markersDirty = false;
         }
         auto& program = *d->program;
         const auto& s = d->settings;
@@ -509,17 +546,46 @@ void Fiber3DCanvas::paintGL()
             d->uploadedPalette = int(s.palette);
         }
         program.setUniformValue("palette", 0);
-        const auto range = lengthRange(*d->scene, s);
+        const auto range = s.fixedLengthRange ? lengthRange(*d->scene, s) : geometry.lengths;
         program.setUniformValue("lengthRange", QVector2D(float(range.first), float(range.second)));
+        const double tolerance = d->interactive ? 1.25 : .5; // physical screen pixels
+        if (d->commandMatrix != matrix || d->commandTolerance != tolerance || d->commandWidth != pixelWidth ||
+            d->commandHeight != pixelHeight || d->commandLineWidth != s.lineWidth) {
+            d->commands = render::draws(geometry, render::View(matrix, d->origin, pixelWidth, pixelHeight, (s.lineWidth + 2) * ratio), tolerance);
+            d->commandMatrix = matrix; d->commandTolerance = tolerance;
+            d->commandWidth = pixelWidth; d->commandHeight = pixelHeight; d->commandLineWidth = s.lineWidth;
+        }
+        auto drawRange = [&](GLuint buffer, size_t first, size_t count) {
+            if (!count) return;
+            glBindBuffer(GL_ARRAY_BUFFER, buffer);
+            const int sizes[] = {3, 3, 4, 1, 3};
+            const size_t offsets[] = {offsetof(Vertex, a), offsetof(Vertex, b), offsetof(Vertex, length), offsetof(Vertex, arc), offsetof(Vertex, direction)};
+            for (int i = 0; i < 5; ++i) {
+                glEnableVertexAttribArray(i);
+                glVertexAttribPointer(i, sizes[i], GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void*>(first * sizeof(Vertex) + offsets[i]));
+                glVertexAttribDivisor(i, 1);
+            }
+            glDrawArraysInstanced(GL_TRIANGLES, 0, 6, GLsizei(count));
+        };
+        auto draw = [&] {
+            program.setUniformValue("hideSelected", true);
+            if (d->selectedIndex < 0 || s.unselectedOpacity > 0) for (const auto& command : d->commands) {
+                size_t level = command.level;
+                while (level < d->buffers.size() && d->uploaded[level] != geometry.levels[level].size()) ++level;
+                if (level == d->buffers.size()) continue;
+                const auto first = geometry.chunks[command.begin].levels[level], last = geometry.chunks[command.end - 1].levels[level];
+                drawRange(d->buffers[level], first.first, last.first + last.count - first.first);
+            }
+            program.setUniformValue("hideSelected", false);
+            drawRange(d->selectedBuffer, 0, d->selectedVertices.size());
+            if (s.showAnnotations) drawRange(d->markerBuffer, 0, geometry.markers.size());
+        };
         program.setUniformValue("coveragePass", samples > 1 ? 0 : 1);
-        glDrawArraysInstanced(GL_TRIANGLES, 0, 6, GLsizei(d->vertices.size()));
+        draw();
         if (samples <= 1) {
-            // Without MSAA draw opaque interiors first, then the antialias
-            // fringes without depth writes. A faint edge can never punch a hole
-            // in a later segment. This also works for subpixel stroke widths.
             glDepthMask(GL_FALSE);
             program.setUniformValue("coveragePass", 2);
-            glDrawArraysInstanced(GL_TRIANGLES, 0, 6, GLsizei(d->vertices.size()));
+            draw();
             glDepthMask(GL_TRUE);
         }
         program.release();
@@ -536,11 +602,11 @@ void Fiber3DCanvas::paintGL()
         painter.drawText(rect().adjusted(16, 16, -16, -16), Qt::AlignCenter | Qt::TextWordWrap, d->error);
         return;
     }
-    if (d->segments.empty()) {
+    if (!d->geometry || d->geometry->chunks.empty()) {
         painter.drawText(
             rect().adjusted(16, 16, -16, -16),
             Qt::AlignCenter | Qt::TextWordWrap,
-            d->scene && !d->scene->message.isEmpty() ? d->scene->message : tr("No fibers in the displayed region"));
+            d->preparation.isRunning() ? tr("Preparing fibers…") : (d->scene && !d->scene->message.isEmpty() ? d->scene->message : tr("No fibers in the displayed region")));
         return;
     }
     if (d->settings.showBounds) {
@@ -597,7 +663,7 @@ void Fiber3DCanvas::paintGL()
             gradient.setColorAt(i / 255.0, stops[i]);
         painter.fillRect(QRect(12, 34, std::min(160, width() - 24), 8), gradient);
         if (mode == ColorMode::Length) {
-            const auto range = lengthRange(*d->scene, d->settings);
+            const auto range = d->settings.fixedLengthRange ? lengthRange(*d->scene, d->settings) : d->geometry->lengths;
             legend = tr("Full length · %1–%2 mm · unknown gray").arg(range.first, 0, 'g', 3).arg(range.second, 0, 'g', 3);
         } else {
             const QChar axis = QStringLiteral("XYZ")[int(d->settings.directionMode) - 1];
@@ -606,6 +672,10 @@ void Fiber3DCanvas::paintGL()
     }
     painter.drawText(QRect(12, 8, width() - 24, 22), Qt::AlignLeft | Qt::AlignVCenter, legend);
     painter.drawText(QRect(12, height() - 26, width() - 24, 20), Qt::AlignLeft | Qt::AlignVCenter, tr("Drag: orbit · Right-drag: pan · Wheel: zoom"));
+    if (d->preparation.isRunning())
+        painter.drawText(QRect(12, 52, width() - 24, 22), Qt::AlignLeft | Qt::AlignVCenter, tr("Preparing fibers…"));
+    else if (d->geometry && d->uploaded[0] != d->geometry->levels[0].size())
+        painter.drawText(QRect(12, 52, width() - 24, 22), Qt::AlignLeft | Qt::AlignVCenter, tr("Refining display…"));
 }
 
 void Fiber3DCanvas::mousePressEvent(QMouseEvent* event)
@@ -628,6 +698,8 @@ void Fiber3DCanvas::mouseMoveEvent(QMouseEvent* event)
     if (!d->dragging && (event->position() - d->pressPosition).manhattanLength() < QApplication::startDragDistance())
         return;
     d->dragging = true;
+    d->interactive = true;
+    d->refine.start();
     const QPointF delta = event->position() - d->previousPosition;
     d->previousPosition = event->position();
     if (d->pressed == Qt::LeftButton && !(event->modifiers() & Qt::ShiftModifier)) {
@@ -675,6 +747,8 @@ void Fiber3DCanvas::keyPressEvent(QKeyEvent* event)
 
 void Fiber3DCanvas::wheelEvent(QWheelEvent* event)
 {
+    d->interactive = true;
+    d->refine.start();
     const double steps = !event->pixelDelta().isNull() ? event->pixelDelta().y() / 120.0 : event->angleDelta().y() / 120.0;
     d->scale = std::clamp(d->scale * std::exp(-steps * 0.15), 0.01, 1.0e9);
     update();
@@ -684,11 +758,19 @@ void Fiber3DCanvas::wheelEvent(QWheelEvent* event)
 void Fiber3DCanvas::pick(const QPointF& position, bool context, const QPoint& globalPosition)
 {
     const auto matrix = d->matrix(width(), height());
-    const Segment* best = nullptr;
+    if (!d->geometry) return;
+    std::optional<Segment> best;
     const double tolerance = std::max(6.0, double(d->settings.lineWidth * .5 + 3.0));
     double bestDistance = tolerance;
     double bestDepth = 2.0, bestT = 0.0;
-    for (const auto& segment : d->segments) {
+    const auto& g = *d->geometry;
+    const auto candidates = render::pickChunks(g, render::View(matrix, d->origin, width(), height(), tolerance),
+                                               position.x() * 2 / width() - 1, 1 - position.y() * 2 / height());
+    for (auto ci : candidates) {
+      const auto& chunk = g.chunks[ci];
+      for (size_t si = chunk.first; si < chunk.end; ++si) {
+        Segment segment;
+        if (!render::segment(g, chunk, si, segment)) continue;
         if (d->selectedIndex >= 0 && int(segment.fiber) != d->selectedIndex && d->settings.unselectedOpacity <= 0)
             continue;
         QVector4D a = matrix * QVector4D(relative(segment.a, d->origin), 1), b = matrix * QVector4D(relative(segment.b, d->origin), 1);
@@ -720,10 +802,11 @@ void Fiber3DCanvas::pick(const QPointF& position, bool context, const QPoint& gl
         if (best && (dist > bestDistance + 0.75 || (std::abs(dist - bestDistance) <= 0.75 && depth >= bestDepth)))
             continue;
         const double worldT = t * a.w() / ((1 - t) * b.w() + t * a.w());
-        best = &segment;
+        best = segment;
         bestDistance = dist;
         bestDepth = depth;
         bestT = clipA + (clipB - clipA) * worldT;
+    }
     }
     if (!best || !d->scene) {
         if (context)

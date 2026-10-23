@@ -10,7 +10,7 @@ namespace vc3d::fibers3d
 {
 
 // Reusable display-only view. Loading, selection ownership and CT navigation
-// belong to the controller; orbiting never requests or uploads new geometry.
+// belong to the controller; orbiting never reads the AFV again.
 class Fiber3DCanvas : public QOpenGLWidget, protected QOpenGLFunctions_3_3_Core
 {
     Q_OBJECT
@@ -19,6 +19,7 @@ public:
     ~Fiber3DCanvas() override;
     void setScene(std::shared_ptr<const Scene> scene);
     std::shared_ptr<const Scene> scene() const;
+    bool isPreparing() const;
     void setDisplaySettings(const DisplaySettings& settings);
     void setSelectedKey(const QString& key);
     void fitAll();
@@ -49,7 +50,8 @@ private:
     struct Impl;
     std::unique_ptr<Impl> d;
     void cleanupGL();
-    void rebuildGeometry();
+    void startGeometryBuild();
+    void updateSelectedGeometry();
     void fit(bool selectedOnly);
     void pick(const QPointF& position, bool context, const QPoint& globalPosition);
 };

@@ -66,8 +66,14 @@ its height to the visible controls and scrolls when necessary.
 
 ## Geometry and loading
 
-The view uses original stored polylines without resampling or joining separate
-runs. Source indices survive region clipping so a pick opens the correct
+The view retains original stored polylines and never joins separate runs.
+Its display uses levels of detail: the chosen chords deviate by at most
+0.5 physical screen pixel at rest, or 1.25 pixels during orbit/pan/zoom.
+After 180 ms without movement, it returns to the finer bound. The selected
+fibre always uses the exact original clipped segments. These approximations
+only affect drawing, including the direction colour of a displayed chord;
+they do not edit AFV coordinates, lengths, annotations or exported data.
+Source indices survive region clipping so a pick opens the correct
 original line point. CPU coordinates are double precision; rendering subtracts
 a local origin before uploading floats. Native annotations are transformed from
 the verified annotation frame to the current CT grid. AFV coordinates use the
@@ -80,9 +86,28 @@ project, and project changes clear the scene.
 
 Loading is asynchronous, cancellable and coalesced. Workers own value snapshots
 and independent read-only AFV readers. Stale results cannot replace a newer
-scene. Orbit, zoom, selection and colour changes reuse GPU geometry; they do not
-request data again. Native annotation snapshots are copied from the existing
+scene. Geometry preparation also runs on a cancellable worker. A spatial
+hierarchy rejects blocks outside the view before submitting draw calls and
+restricts picking to blocks near the click. Picking still tests original
+segments, in their original order, with the same depth/distance tie rules.
+Orbit, zoom and colour changes reuse prepared geometry; they do not
+request data again. Selecting a fibre uploads its exact geometry separately.
+Native annotation snapshots are copied from the existing
 controller on the GUI thread.
+
+GPU uploads are staged in chunks of at most 8 MiB per repaint, coarse levels
+first. During the initial **Refining display…** phase a coarser complete level
+can be visible before the requested precision is available. No fibre is removed
+by the level-of-detail system. Separate runs, span styles, invalid points and
+region re-entry are never bridged. Curves are simplified against finite chords
+so hairpins are preserved. Conservative perspective bounds fall back to exact
+detail at the near plane. The CPU index references source runs directly instead
+of duplicating every segment's double-precision endpoints for picking.
+
+This bounds drawing error, not frame time or total application memory. Loaded
+coordinates, prepared display levels, GPU buffers and CT still consume memory;
+very large collections may require a smaller displayed region or data budget.
+There is no guarantee of unlimited geometry at a fixed frame rate.
 
 Each source defaults to 10,000 displayed fibres and a 512 MiB decoded-polyline
 budget. **More display options → Fiber limit → No limit** removes the count
@@ -167,3 +192,40 @@ the count cap. Lowering the budget preserves selection priority. A separate
 data-loader check, without the count cap or length filter, loads all 80,887
 fibres in descending length within 494,048,712 decoded coordinate bytes.
 That check does not measure full-scroll rendering frame rate or total RAM.
+
+### Full-scroll rendering measurement (24 October 2026)
+
+Measured on an M2 Max / 32 GiB Mac, Qt 6.11.2, Clang 22, the existing
+`QuickBuild` configuration (`-O1`), with `1447_5mm_v1.afv`: all 80,887 fibres,
+20,472,671 source segments, no count/length filter, 800 × 600 logical pixels at
+2× device scale. Each frame calls the actual canvas paint function followed by
+`glFinish`; these are rendering latencies, not an unlimited-FPS claim. Five
+warm-up frames are excluded, then 60 orbit frames and 10 clicks are measured.
+
+| Operation | Before median / p95 | After median / p95 |
+| --- | --- | --- |
+| Whole-scroll orbit | 190.24 / 194.03 ms | 3.47 / 6.70 ms |
+| Close orbit | 61.02 / 61.47 ms | 3.65 / 5.67 ms |
+| Selection click | 286.73 / 302.41 ms | 1.22 / 2.13 ms |
+
+The baseline macOS `sample` profile spent 1,166 of 1,184 main-thread samples
+waiting for the GPU in `glFinish` / `GLDShareGroupRec::waitUsage`. The new
+preparation/upload took 6.85 seconds once, asynchronously, after reading the
+AFV. This does not occur on camera moves. Initial-load peak process footprint
+was about 6.54 GB; the coordinate budget is still not a total-RAM bound.
+
+A separate full-application check, with CT views open and all 80,887 fibres,
+measured 60 presented frames in a 771 × 882 logical-pixel dock at 2× scale:
+8.35 ms median, 16.83 ms p95, 16.97 ms maximum. Shared AFV selection and Escape
+passed. Additional canvas checks verify exact original point/index picking in
+orthographic and perspective modes, superseded loads, clearing during a load,
+and empty scenes. Tests were run on macOS; Linux was not run for this change.
+
+The local evidence and reproducible harnesses are under
+`exports/VC3D_FIBERS3D_QA/render-lod-20261024` in the parent workspace:
+`build-bench.py baseline` links the saved pre-change canvas,
+`build-bench.py` links the current canvas, and `run-integrated.py` runs an
+isolated application profile. Each harness records its exact inputs and
+JSON timings. `lod-first.json` was an invalid preliminary measurement because
+Qt deferred repaints; it is excluded. The reported comparison uses forced GPU
+completion in both versions (`baseline-forced.json` and `lod-final.json`).
