@@ -15,6 +15,8 @@ the focus in a CT view updates it immediately without moving the 3D camera;
 in whole-volume mode this does not reload the fibres. It is a navigation
 overlay drawn above the fibres for visibility, not a point snapped to a fibre.
 The marker is hidden when its position is outside the camera view.
+Toggle **Settings → More display options → Show cursor** to hide or show it.
+It is enabled by default, and the choice is remembered across sessions.
 
 The **Settings** button opens controls for:
 
@@ -42,8 +44,8 @@ The **Settings** button opens controls for:
 Settings are grouped into Sources, Appearance and Annotations. Only controls
 for the active colour mode are shown, and the CT box width appears when using
 the focus region. **More display options** contains unselected opacity,
-perspective, region bounds and the fibre limit. The popup adapts its height to
-the visible controls and scrolls when necessary.
+perspective, region bounds, the CT cursor and the fibre limit. The popup adapts
+its height to the visible controls and scrolls when necessary.
 
 ## Geometry and loading
 

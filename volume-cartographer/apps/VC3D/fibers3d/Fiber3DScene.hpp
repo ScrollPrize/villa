@@ -72,6 +72,7 @@ struct DisplaySettings {
     bool annotationsSelectedOnly = true;
     bool perspective = false;
     bool showBounds = true;
+    bool showCursor = true;
     bool fixedLengthRange = false;
     double lengthMinMm = 0.0, lengthMaxMm = 10.0;
 };

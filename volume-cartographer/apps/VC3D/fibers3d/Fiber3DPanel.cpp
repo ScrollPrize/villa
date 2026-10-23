@@ -422,8 +422,10 @@ struct Fiber3DPanel::Impl {
         opacity->setToolTip(q->tr("Opacity of unselected fibers"));
         auto* perspective = check("fibers3DPerspective", q->tr("Perspective"), false);
         auto* bounds = check("fibers3DBounds", q->tr("Show region bounds"), true);
+        auto* cursor = check("fibers3DCursor", q->tr("Show cursor"), true);
         advancedLayout->addWidget(perspective);
         advancedLayout->addWidget(bounds);
+        advancedLayout->addWidget(cursor);
         limit = integer("fibers3DLimit", 1, 50000, 10000);
         limit->setToolTip(q->tr("Maximum displayed fibers per source"));
         row(q->tr("Fiber limit"), limit, advancedLayout);
@@ -443,6 +445,7 @@ struct Fiber3DPanel::Impl {
             display.annotationsSelectedOnly = selectedOnly->isChecked();
             display.perspective = perspective->isChecked();
             display.showBounds = bounds->isChecked();
+            display.showCursor = cursor->isChecked();
             applyDisplay();
         };
         for (auto* w : {nativeSource, afvSource, unknown})
@@ -468,7 +471,7 @@ struct Fiber3DPanel::Impl {
             QObject::connect(w, &QComboBox::currentIndexChanged, q, changedDisplay);
         for (auto* w : {width, opacity, rangeMin, rangeMax})
             QObject::connect(w, &QDoubleSpinBox::valueChanged, q, changedDisplay);
-        for (auto* w : {fixedRange, gaps, annotationsVisible, selectedOnly, perspective, bounds})
+        for (auto* w : {fixedRange, gaps, annotationsVisible, selectedOnly, perspective, bounds, cursor})
             QObject::connect(w, &QCheckBox::toggled, q, changedDisplay);
         boxWidthRow->setVisible(region->currentIndex() == 0);
         changedDisplay();

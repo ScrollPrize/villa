@@ -558,7 +558,7 @@ void Fiber3DCanvas::paintGL()
                     painter.drawLine(screen(corners[i]), screen(corners[j]));
             }
     }
-    if (d->cursorPosition) {
+    if (d->settings.showCursor && d->cursorPosition) {
         // Subtract the scene origin in double precision before projection, as
         // for the fiber geometry. Do not snap or clamp the CT focus to a fiber.
         const QVector4D p = matrix * QVector4D(relative(*d->cursorPosition, d->origin), 1);
