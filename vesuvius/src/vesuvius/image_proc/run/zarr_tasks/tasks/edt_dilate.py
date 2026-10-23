@@ -49,6 +49,16 @@ class EdtDilateConfig(TaskConfig):
     black_border: bool = True
     resolution: str = "0"
 
+    def __post_init__(self) -> None:
+        _validate_distance(self.distance)
+
+
+def _validate_distance(distance: float) -> None:
+    if not np.isfinite(distance) or distance < 0:
+        raise ValueError(
+            f"edt-dilate distance must be a finite, non-negative number of voxels; got {distance!r}"
+        )
+
 
 def _edt_dilate_worker(
     args: Tuple,
@@ -60,6 +70,7 @@ def _edt_dilate_worker(
     """
     global _WORKER_STATE
     chunk_idx, chunk_bounds, distance, black_border = args
+    _validate_distance(distance)
 
     input_path = _WORKER_STATE["input_path"]
     output_path = _WORKER_STATE["output_path"]
