@@ -20,6 +20,7 @@ set(srcs
     SurfaceCatalog.hpp
     FiberCollectionController.hpp
     FiberDisplayOptions.hpp
+    FiberOverlayColors.hpp
     fibers3d/Fiber3DScene.hpp
     fibers3d/Fiber3DData.cpp
     fibers3d/Fiber3DData.hpp

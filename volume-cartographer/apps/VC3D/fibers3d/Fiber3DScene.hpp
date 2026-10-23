@@ -1,5 +1,6 @@
 #pragma once
 
+#include "FiberOverlayColors.hpp"
 #include <QColor>
 #include <QString>
 #include <QStringList>
@@ -62,8 +63,8 @@ struct DisplaySettings {
     DirectionMode directionMode = DirectionMode::XYZ;
     Palette palette = Palette::Viridis;
     QColor custom{220, 220, 225};
-    QColor horizontal{239, 177, 118};
-    QColor vertical{232, 137, 191};
+    QColor horizontal = vc3d::horizontalFiberColor();
+    QColor vertical = vc3d::verticalFiberColor();
     float lineWidth = 2.0f;
     float unselectedOpacity = 1.0f;
     bool showGaps = false;

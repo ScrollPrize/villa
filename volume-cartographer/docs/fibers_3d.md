@@ -22,6 +22,8 @@ The **Settings** button opens controls for:
   full-fibre length in millimetres with automatic or fixed range. Scalar modes
   offer Viridis, Magma, Cividis and Turbo with a legend. Reversing a fibre's
   point order leaves its direction colours unchanged.
+  H/V defaults share the AFV slice palette: H blue (`#40a5ff`) and V orange
+  (`#ffad43`). Both colours remain customisable in the 3D settings.
 - Line width, unselected opacity, projection and region bounds.
 - Optional annotation markers/styles. These are off by default, and selected
   fibres only is the default when enabling them. Whole-fibre tags appear in the
