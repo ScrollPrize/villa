@@ -1071,6 +1071,7 @@ vc_add_test(NAME test_load_quad_from_tifxyz)
 vc_add_test(NAME test_surface_patch_index_more)
 
 vc_add_test(NAME test_quadsurface_extras)
+vc_add_test(NAME test_quadsurface_store)
 
 vc_add_test(NAME test_surface_patch_index_cache)
 

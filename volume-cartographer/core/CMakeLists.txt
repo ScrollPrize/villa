@@ -33,6 +33,8 @@ add_library(vc_core
         src/PlaneSurface.cpp
         src/Surface.cpp
         src/QuadSurface.cpp
+        src/QuadSurfaceStore.cpp
+        src/StoreSurfaces.cpp
         src/Render.cpp
         src/Tiff.cpp
         src/Zarr.cpp

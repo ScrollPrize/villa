@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <functional>
 #include <iterator>
 #include <limits>
 #include <mutex>
@@ -14,6 +15,7 @@
 #include <string>
 
 #include "Surface.hpp"
+#include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "Rect3D.hpp"
 
 // Surface loading and channel flags
@@ -499,6 +501,9 @@ public:
 
     void setChannel(const std::string& name, const cv::Mat& channel);
     cv::Mat channel(const std::string& name, int flags = 0);
+    // Loads a registered channel that has no data yet (e.g. from its stored
+    // geometry revision) on first access.
+    void setChannelLoader(std::function<cv::Mat(const std::string&)> loader) { _channelLoader = std::move(loader); }
     void invalidateCache();
     void saveOverwrite();
     // Write a single ancillary channel to path/<name>.tif in place, without
@@ -558,6 +563,7 @@ public:
 
 protected:
     std::unordered_map<std::string, cv::Mat> _channels;
+    std::function<cv::Mat(const std::string&)> _channelLoader;
     std::unique_ptr<cv::Mat_<cv::Vec3f>> _points;
     cv::Rect _bounds;
     cv::Vec3f _center;
@@ -600,6 +606,39 @@ private:
     // the same thread without self-deadlock.
     static std::recursive_mutex& dirWriteMutex(const std::filesystem::path& dir);
 };
+
+// --- vc_object_store surfaces ------------------------------------------------
+// The store equivalents of load_quad_from_tifxyz and save(). Callers own the
+// transactions and revision pins. Stored vertices whose `valid` channel is 0 load
+// as the (-1,-1,-1) sentinel and `valid` is exposed as the "mask" channel (255/0);
+// writes touch only vertices that changed, so masked coordinates stay stored.
+
+// A surface object's geometry revision (default: its current one). Other
+// channels are registered empty; set a loader (store_channel_loader) to read them.
+std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore&, const vc::objects::Txn&,
+    const std::string& objectUuid, const std::optional<std::string>& geometryRevision = std::nullopt);
+// Reads channels of an immutable geometry revision through a session on demand.
+std::function<cv::Mat(const std::string&)> store_channel_loader(
+    std::shared_ptr<vc::objects::ObjectStoreSession>, vc::objects::AttachmentIdentity, std::string geometryRevision);
+// Geometry for putGeometry: points, `valid` from the "mask" channel (reduced to the
+// grid: a vertex is valid only if every mask pixel it covers is 255) and the other channels.
+vc::objects::GeometryData quad_surface_geometry(QuadSurface&);
+// Publish the vertices of `rect` (grid rows/columns) that differ from the stored
+// revision `expected` in one sparse edit: new coordinates also mark the vertex
+// valid; a vertex cleared to the sentinel loses its coordinates. Returns the new
+// (or unchanged) geometry revision.
+std::string write_quad_rect_to_store(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& objectUuid,
+    QuadSurface&, const cv::Rect& rect, const std::string& expected,
+    const std::vector<vc::objects::GeometryEdgeEdit>& edgeEdits = {});
+// Replace the named channels ("mask" is `valid`) with the surface's and remove `remove`.
+std::string write_quad_channels_to_store(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& objectUuid,
+    QuadSurface&, const std::vector<std::string>& names, const std::vector<std::string>& remove,
+    const std::string& expected, const std::vector<vc::objects::GeometryEdgeEdit>& edgeEdits = {});
+// Grow or crop the stored grid so it becomes `gridInStored` (x/y may be negative);
+// new vertices are the sentinel, new valid cells 255, other new channel cells 0.
+std::string resize_store_surface(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& objectUuid,
+    const cv::Rect& gridInStored, const std::string& expected,
+    const std::vector<vc::objects::GeometryEdgeEdit>& edgeEdits = {});
 
 // Serialize a bbox as [[minX,minY,minZ],[maxX,maxY,maxZ]], the layout
 // QuadSurface::save() writes for its own bbox key.

@@ -1315,7 +1315,9 @@ cv::Mat QuadSurface::channel(const std::string& name, int flags)
     ensureLoaded();
     if (_channels.count(name)) {
         cv::Mat& channel = _channels[name];
-        if (channel.empty()) {
+        if (channel.empty() && _channelLoader) {
+            channel = _channelLoader(name);
+        } else if (channel.empty()) {
             // On-demand loading
             std::filesystem::path channel_path = path / (name + ".tif");
             if (std::filesystem::exists(channel_path)) {

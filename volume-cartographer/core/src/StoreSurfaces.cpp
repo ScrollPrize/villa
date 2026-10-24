@@ -1,0 +1,85 @@
+#include "vc/core/util/StoreSurfaces.hpp"
+
+#include <vc_object_store/Uuid.hpp>
+
+#include <cstdlib>
+#include <stdexcept>
+#include <thread>
+
+StoreSurfaces::StoreSurfaces(const std::filesystem::path& store, const std::string& tool)
+    : tool_(tool), session_(std::make_shared<vc::objects::ObjectStoreSession>())
+{
+    vc::objects::OpenOptions options;
+    const char* user = std::getenv("USER");
+    options.author = user && *user ? user : tool;
+    attachment_ = session_->attach(store, options);
+}
+
+StoreSurfaces::~StoreSurfaces()
+{
+    try { session_->detach(attachment_); } catch (...) {}
+}
+
+std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid)
+{
+    std::unique_ptr<QuadSurface> surface;
+    std::string revision;
+    session_->read(attachment_, [&](const auto& db, const auto& txn, const auto&) {
+        surface = load_quad_from_store(db, txn, uuid);
+        revision = db.currentGeometry(txn, surface->id)->uuid;
+    });
+    surface->setChannelLoader(store_channel_loader(session_, attachment_, revision));
+    return surface;
+}
+
+std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name, const nlohmann::json& parameters,
+                                  const std::vector<std::string>& sources, const std::vector<std::string>& tags,
+                                  const std::optional<nlohmann::json>& coordinates)
+{
+    nlohmann::json meta = nlohmann::json::object();
+    if (coordinates) meta["coordinates"] = *coordinates;
+    else if (!sources.empty())
+        session_->read(attachment_, [&](const auto& db, const auto& txn, const auto&) {
+            const auto source = db.objectByUuid(txn, sources.front());
+            if (!source) throw std::runtime_error("source object not found: " + sources.front());
+            const auto sourceMeta = nlohmann::json::parse(source->meta);
+            if (sourceMeta.contains("coordinates")) meta["coordinates"] = sourceMeta.at("coordinates");
+        });
+    meta["provenance"] = {{"tool", tool_}, {"parameters", parameters}, {"sources", sources}};
+    vc::objects::ObjectRecord record;
+    record.uuid = vc::objects::util::newUuid();
+    record.kind = "surface";
+    record.name = name;
+    record.tags = tags;
+    record.meta = meta.dump();
+    const auto geometry = quad_surface_geometry(surface);
+    session_->act(attachment_, {{record.uuid, std::nullopt}}, [&](auto& db, auto& txn) {
+        db.upsertObject(txn, record);
+        db.putGeometry(txn, record.uuid, geometry);
+    });
+    lastWrite_ = std::chrono::system_clock::now();
+    surface.id = record.uuid;
+    return record.uuid;
+}
+
+std::filesystem::path StoreSurfaces::artifactDirectory(const std::string& uuid)
+{
+    return session_->artifactDirectory(attachment_, uuid);
+}
+
+void StoreSurfaces::finish(std::chrono::seconds timeout)
+{
+    session_->finalize();
+    if (!lastWrite_ || !session_->hubStatus(attachment_)) return;
+    const auto written = std::chrono::duration_cast<std::chrono::microseconds>(lastWrite_->time_since_epoch()).count();
+    session_->syncHub(attachment_);
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        // Status describes the last completed sync; it must postdate the writes.
+        const auto status = session_->hubStatus(attachment_);
+        if (status && status->pending.empty() && status->syncedAtUs && *status->syncedAtUs > written) return;
+        if (std::chrono::steady_clock::now() > deadline)
+            throw std::runtime_error("writes did not reach the hub" + (status && !status->error.empty() ? ": " + status->error : std::string()));
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
