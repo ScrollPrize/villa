@@ -152,9 +152,11 @@ void writeTiff(const std::filesystem::path& outPath, const cv::Mat& img, int cvT
 
     if (tileW == 0 || tileH == 0) {
         TIFFSetField(tf, TIFFTAG_ROWSPERSTRIP, H);
+        // The predictor encodes the scanline buffer in place; never hand it the caller's image.
+        std::vector<uint8_t> row(static_cast<size_t>(W) * outImg.elemSize());
         for (uint32_t y = 0; y < H; ++y) {
-            const uint8_t* row = outImg.ptr<uint8_t>(static_cast<int>(y));
-            if (TIFFWriteScanline(tf, const_cast<uint8_t*>(row), y, 0) < 0) {
+            std::memcpy(row.data(), outImg.ptr<uint8_t>(static_cast<int>(y)), row.size());
+            if (TIFFWriteScanline(tf, row.data(), y, 0) < 0) {
                 TIFFClose(tf);
                 throw std::runtime_error("TIFFWriteScanline failed at row " +
                                         std::to_string(y) + " in " + outPath.string());

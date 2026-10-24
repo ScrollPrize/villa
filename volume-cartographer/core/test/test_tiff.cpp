@@ -93,11 +93,15 @@ TEST_CASE("writeTiff: untiled (tileW=0) path")
     auto d = tmpDir("untiled");
     auto p = d / "untiled.tif";
     auto img = ramp(8, 8, CV_8UC1);
+    const cv::Mat original = img.clone();
     writeTiff(p, img, /*cvType=*/-1, /*tileW=*/0, /*tileH=*/0);
     REQUIRE(fs::exists(p));
+    // LZW's horizontal predictor must not encode the caller's image in place.
+    CHECK(cv::countNonZero(img != original) == 0);
     auto loaded = cv::imread(p.string(), cv::IMREAD_UNCHANGED);
     REQUIRE(!loaded.empty());
     CHECK(loaded.rows == 8);
+    CHECK(cv::countNonZero(loaded != original) == 0);
     fs::remove_all(d);
 }
 
