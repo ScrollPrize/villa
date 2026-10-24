@@ -71,7 +71,7 @@ class RenderLoggingTests(unittest.TestCase):
                 self.assertIn("Error opening local zarr:", result.stderr)
 
     def test_missing_segmentation_preserves_error(self):
-        self.assert_logged_error([], "--segmentation required")
+        self.assert_logged_error([], "give --segmentation, or --store with --surface")
 
     def test_caught_volume_error_preserves_diagnostic(self):
         self.assert_logged_error(
