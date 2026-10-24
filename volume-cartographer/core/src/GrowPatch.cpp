@@ -2950,8 +2950,10 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
         for(int ox=std::max(p[1]-r_outer,0);ox<=std::min(p[1]+r_outer,params.dpoints.cols-1);ox++)
             loss_status(oy,ox) = 0;
 
-    for(int oy=std::max(p[0]-radius,0);oy<=std::min(p[0]+radius,params.dpoints.rows-1);oy++)
-        for(int ox=std::max(p[1]-radius,0);ox<=std::min(p[1]+radius,params.dpoints.cols-1);ox++) {
+    // add_missing_losses() reads neighbours up to two cells away, so skip the outer two rows and
+    // columns of the grid (growth never places points there).
+    for(int oy=std::max(p[0]-radius,2);oy<=std::min(p[0]+radius,params.dpoints.rows-3);oy++)
+        for(int ox=std::max(p[1]-radius,2);ox<=std::min(p[1]+radius,params.dpoints.cols-3);ox++) {
             cv::Vec2i op = {oy, ox};
             if (cv::norm(p-op) <= radius) {
                 add_missing_losses(problem, loss_status, op, params, trace_data, settings);
@@ -4706,6 +4708,13 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
 
     int local_opt_r = 3;
 
+    // add_losses() needs two cells of neighbours on every side of a point. A candidate closer
+    // than that to the work-grid edge used to throw "point too close to problem border!" inside
+    // the parallel candidate loop, which std::terminate()s the run before anything is saved.
+    // Growth now stops at this inner rectangle and the surface is saved as usual.
+    const cv::Rect growth_bounds(2, 2, w - 4, h - 4);
+    bool reported_grid_edge = false;
+
     std::cout << "lets start fringe: " << fringe.size() << std::endl;
 
     while (!fringe.empty()) {
@@ -4729,8 +4738,16 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         };
 
         auto append_candidate = [&](const cv::Vec2i& p) {
-            if (!bounds.contains(cv::Point(p[1], p[0])) ||
-                (trace_params.state(p) & STATE_PROCESSING) != 0 ||
+            if (!growth_bounds.contains(cv::Point(p[1], p[0]))) {
+                if (!reported_grid_edge && bounds.contains(cv::Point(p[1], p[0]))) {
+                    reported_grid_edge = true;
+                    std::cout << "growth reached the edge of the " << w << "x" << h
+                              << " work grid and stops there; the grid is sized from 'generations'"
+                              << " (and grow_extra_* / grow_max_extra_* when resuming)" << std::endl;
+                }
+                return;
+            }
+            if ((trace_params.state(p) & STATE_PROCESSING) != 0 ||
                 (trace_params.state(p) & STATE_LOC_VALID) != 0) {
                 return;
             }
