@@ -12,6 +12,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "ObjectStoreRegions.hpp"
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 
 #include <QColor>
@@ -41,6 +42,9 @@
 using vc::fibers::Bounds;
 using vc::fibers::Point;
 using Json = nlohmann::json;
+using vc3d::store::background;
+using vc3d::store::regionBox;
+using vc3d::store::Outcome;
 namespace
 {
 constexpr int64_t kCatalogPageSize = 200;
@@ -68,51 +72,6 @@ Point normalized(Point p)
     for (auto& x : p)
         x /= n;
     return p;
-}
-bool overlaps(const Bounds& a, const Bounds& b)
-{
-    for (size_t i = 0; i < 3; ++i)
-        if (a.upper[i] < b.lower[i] || b.upper[i] < a.lower[i])
-            return false;
-    return true;
-}
-// The volume AABB of a region's local box.
-Bounds regionBox(const vc::fibers::ViewRegion& s)
-{
-    Bounds box;
-    box.lower.fill(std::numeric_limits<double>::infinity());
-    box.upper.fill(-std::numeric_limits<double>::infinity());
-    for (double a : {s.local.lower[0], s.local.upper[0]})
-        for (double b : {s.local.lower[1], s.local.upper[1]})
-            for (double c : {s.local.lower[2], s.local.upper[2]})
-                for (int i = 0; i < 3; ++i) {
-                    const double p = s.origin[i] + a * s.u[i] + b * s.v[i] + c * s.n[i];
-                    box.lower[i] = std::min(box.lower[i], p);
-                    box.upper[i] = std::max(box.upper[i], p);
-                }
-    return box;
-}
-// Load a margin around the view so that pans, zooms and the small moves of a
-// cut plane stay inside one complete region instead of re-querying each frame.
-// The view is clipped from it exactly, so the margin never changes the drawing.
-constexpr double kPrefetchSpanFraction = 0.25;
-constexpr double kPrefetchDepthVx = 32;
-vc::fibers::ViewRegion prefetchRegion(vc::fibers::ViewRegion s)
-{
-    const double du = kPrefetchSpanFraction * (s.local.upper[0] - s.local.lower[0]);
-    const double dv = kPrefetchSpanFraction * (s.local.upper[1] - s.local.lower[1]);
-    s.local.lower[0] -= du;
-    s.local.upper[0] += du;
-    s.local.lower[1] -= dv;
-    s.local.upper[1] += dv;
-    s.local.lower[2] -= kPrefetchDepthVx;
-    s.local.upper[2] += kPrefetchDepthVx;
-    s.box = regionBox(s);
-    return s;
-}
-double viewSpan(const vc::fibers::ViewRegion& s)
-{
-    return std::min(s.local.upper[0] - s.local.lower[0], s.local.upper[1] - s.local.lower[1]);
 }
 bool inside(const Point& local, const Bounds& bounds)
 {
@@ -206,7 +165,6 @@ struct SelectedFiber {
 };
 struct RegionResult {
     vc::fibers::RegionPage page;
-    Bounds coverage;
     std::vector<std::string> blockUuids;
     struct Control {
         std::string uuid;
@@ -260,40 +218,11 @@ std::map<std::string, double> volumeFactors(const vc::objects::ObjectStore& db, 
             factors.emplace(object.uuid, *factor);
     return factors;
 }
-template <class T>
-struct Outcome {
-    T value{};
-    QString error;
-};
-template <class T, class Work, class Done>
-void background(QObject* parent, Work work, Done done)
-{
-    auto* watcher = new QFutureWatcher<Outcome<T>>(parent);
-    QObject::connect(watcher, &QFutureWatcher<Outcome<T>>::finished, parent, [watcher, done]() {
-        auto result = watcher->future().takeResult();
-        watcher->deleteLater();
-        done(std::move(result));
-    });
-    watcher->setFuture(QtConcurrent::run([work]() {
-        Outcome<T> result;
-        try {
-            result.value = work();
-        } catch (const std::exception& error) {
-            result.error = QString::fromUtf8(error.what());
-        }
-        return result;
-    }));
-}
 }  // namespace
 
 struct FiberCollectionController::View {
-    // requested is the view whose region was last queried; pending is the
-    // prism of the query in flight.
-    std::optional<Slice> requested, displayed, coverageSlice, pending;
-    std::optional<Bounds> coverage;
-    // Views at least this span (voxels) are queried without a margin: a
-    // prefetch there exceeded the store's region budget.
-    double prefetchFailedSpan{std::numeric_limits<double>::infinity()};
+    vc3d::store::RegionRequests region;
+    std::optional<Slice> displayed;
     std::vector<vc::fibers::Block> blocks;
     struct Control {
         uint64_t fiber = 0;
@@ -310,14 +239,10 @@ struct FiberCollectionController::View {
     };
     std::vector<Chain> chains;
     std::optional<std::array<double, 6>> chainBox;
-    std::shared_ptr<std::atomic_bool> cancelled;
-    bool busy{false};
-    bool complete{true};
     bool dirty{true};
     QRectF displayedRect;
     qreal displayedDpr{};
     FiberDisplayOptions displayedOptions;
-    QString error;
     struct Hit {
         QPointF a, b;
         int64_t fiber;
@@ -360,8 +285,8 @@ FiberCollectionController::FiberCollectionController(CState* state, ViewerManage
 FiberCollectionController::~FiberCollectionController()
 {
     for (auto& [v, s] : views_)
-        if (s->cancelled)
-            s->cancelled->store(true);
+        if (s->region.cancelled)
+            s->region.cancelled->store(true);
 }
 void FiberCollectionController::setOptions(const FiberDisplayOptions& options)
 {
@@ -418,8 +343,7 @@ void FiberCollectionController::clear()
     pendingAnnotation_ = 0;
     catalogCursor_.reset();
     for (auto& [v, s] : views_) {
-        if (s->cancelled)
-            s->cancelled->store(true);
+        s->region.reset();
         s->blocks.clear();
         s->controls.clear();
         s->rings.clear();
@@ -428,12 +352,7 @@ void FiberCollectionController::clear()
         s->chainBox.reset();
         s->hits.clear();
         s->controlHits.clear();
-        s->requested.reset();
         s->displayed.reset();
-        s->coverage.reset();
-        s->coverageSlice.reset();
-        s->pending.reset();
-        s->prefetchFailedSpan = std::numeric_limits<double>::infinity();
         s->dirty = true;
     }
     catalogPending_ = false;
@@ -502,14 +421,8 @@ void FiberCollectionController::invalidate()
     if (enabled_)
         publishCount();
     for (auto& [v, s] : views_) {
-        if (s->cancelled)
-            s->cancelled->store(true);
-        s->requested.reset();
+        s->region.reset();
         s->displayed.reset();
-        s->coverage.reset();
-        s->coverageSlice.reset();
-        s->pending.reset();
-        s->prefetchFailedSpan = std::numeric_limits<double>::infinity();
         s->blocks.clear();
         s->controls.clear();
         s->rings.clear();
@@ -526,10 +439,7 @@ void FiberCollectionController::invalidate()
 void FiberCollectionController::refreshRegions()
 {
     for (auto& [v, s] : views_) {
-        if (s->cancelled)
-            s->cancelled->store(true);
-        s->requested.reset();
-        s->coverageSlice.reset();
+        s->region.refresh();
         s->chainBox.reset();
         s->dirty = true;
     }
@@ -798,30 +708,11 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
         viewer->graphicsView()->viewport()->installEventFilter(this);
     }
     auto& v = *ptr;
-    // A complete region (one that reached neither the display limit nor a
-    // store budget) holds every segment of any view inside its prism.
-    if (v.complete && v.coverageSlice && v.coverageSlice->contains(s)) {
-        if (v.busy && v.cancelled) v.cancelled->store(true);
-        return;
-    }
-    if (v.requested && *v.requested == s)
-        return;
-    if (v.busy) {
-        // Let the running query finish while it can still draw part of this
-        // view: cancelling on every pan frame starved a moving view of all
-        // results. Its completion requests the view again if still uncovered.
-        if (v.cancelled && (!v.pending || !overlaps(v.pending->box, s.box)))
-            v.cancelled->store(true);
-        return;
-    }
-    const auto query = viewSpan(s) < v.prefetchFailedSpan ? prefetchRegion(s) : s;
-    v.busy = true;
+    const auto started = v.region.start(s);
+    if (!started) return;
+    const auto query = *started;
     v.dirty = true;
-    v.requested = s;
-    v.pending = query;
-    v.error.clear();
-    auto cancel = std::make_shared<std::atomic_bool>(false);
-    v.cancelled = cancel;
+    auto cancel = v.region.cancelled;
     const auto rev = revision_;
     const double min = options_.minLengthMm / nativeVoxelMm_;
     const auto family = familyFilter();
@@ -833,11 +724,10 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
          volume=state_->currentVolume() ? state_->currentVolume()->id() : std::string{},
          selectedUuid=selectedPin_ ? selectedPin_->object.objectUuid : std::string{}, s=query,min,cancel,maximum,family,linked,
          none=noFamilies()]() {
-            RegionResult result; result.coverage=s.box;
+            RegionResult result;
             if (none || volume.empty()) return result;
             connection->read(attachment,[&](const auto& db,const auto& txn,const auto& cancelled) {
-                vc::objects::RegionSlice slice; slice.origin=s.origin; slice.u=s.u; slice.v=s.v; slice.normal=s.n;
-                slice.localBounds={s.local.lower[0],s.local.lower[1],s.local.lower[2],s.local.upper[0],s.local.upper[1],s.local.upper[2]};
+                const auto slice = vc3d::store::regionSlice(s);
                 vc::objects::RegionOptions options;
                 options.kind="fiber"; options.volume=volume; options.maximumObjects=maximum; options.minLength=min;
                 if (!selectedUuid.empty()) options.selected=selectedUuid;
@@ -900,27 +790,13 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
         },
         [this, viewer, rev, cancel, s, query](Outcome<RegionResult> result) {
             auto found = views_.find(viewer);
-            if (found == views_.end() || found->second->cancelled != cancel)
-                return;
+            if (found == views_.end()) return;
             auto& v = *found->second;
-            v.busy = false;
+            using Finished = vc3d::store::RegionRequests::Finished;
+            const auto finished = v.region.finish(cancel, rev == revision_, s, query, result.value.page.complete, result.error);
+            if (finished == Finished::Stale) return;
             v.dirty = true;
-            v.pending.reset();
-            if (rev != revision_ || cancel->load()) {
-                v.requested.reset();
-                refreshViewer(viewer);
-                return;
-            }
-            if (result.error.isEmpty() && !result.value.page.complete && query != s) {
-                // The margin pushed the region past a store budget the view
-                // alone may fit: never show less than the view's own query.
-                v.prefetchFailedSpan = viewSpan(s);
-                v.requested.reset();
-                refreshViewer(viewer);
-                return;
-            }
-            v.error = result.error;
-            if (result.error.isEmpty()) {
+            if (finished == Finished::Install && result.error.isEmpty()) {
                 auto& region = result.value;
                 for (size_t i = 0; i < region.page.blocks.size(); ++i)
                     region.page.blocks[i].fiberId = int64_t(annotations_->fiberIdForUuid(region.blockUuids[i]));
@@ -932,9 +808,6 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
                     v.linkGroups[annotations_->fiberIdForUuid(uuid)] = annotations_->fiberIdForUuid(group);
                 v.rings = std::move(region.rings);
                 v.blocks = std::move(region.page.blocks);
-                v.complete = region.page.complete;
-                v.coverage = region.coverage;
-                v.coverageSlice = query;
             }
             refreshViewer(viewer);
         });
@@ -983,12 +856,12 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
     info.penColor = QColor(255, 210, 100);
     info.z = 60;
     const auto rect = visibleSceneRect(viewer);
-    if (!v.error.isEmpty()) {
-        builder.addText(rect.topLeft() + QPointF(8, 20), v.error, QFont{}, info);
-        if (!v.coverage)
+    if (!v.region.error.isEmpty()) {
+        builder.addText(rect.topLeft() + QPointF(8, 20), v.region.error, QFont{}, info);
+        if (!v.region.loaded)
             return;
     }
-    if (!v.coverage) {
+    if (!v.region.loaded) {
         builder.addText(rect.topLeft() + QPointF(8, 20), tr("Loading fiber region…"), QFont{}, info);
         return;
     }
@@ -1133,9 +1006,9 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
         ? tr("%1 visible fibers · max %2").arg(visibleIds.size()).arg(options_.maxDisplayed)
         : tr("%1 visible fibers").arg(visibleIds.size());
     builder.addText(rect.topLeft() + QPointF(8, 40), count, QFont{}, info);
-    if (v.busy && !(v.complete && v.coverageSlice && v.coverageSlice->contains(*current)))
+    if (v.region.busy && !(v.region.complete && v.region.coverage && v.region.coverage->contains(*current)))
         builder.addText(rect.topLeft() + QPointF(8, 20), tr("Updating fiber region…"), QFont{}, info);
-    else if (!v.complete)
+    else if (!v.region.complete)
         builder.addText(rect.topLeft() + QPointF(8, 20), tr("Partial fiber view · zoom in or increase minimum length"), QFont{}, info);
 }
 void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const std::array<double, 6>& box)
@@ -1148,15 +1021,17 @@ void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const st
     auto& v = *ptr;
     if (v.chainBox == box)
         return;
-    if (v.busy) {
-        if (v.cancelled) v.cancelled->store(true);
+    // Chains share the viewer's one query in flight with its regions.
+    auto& region = v.region;
+    if (region.busy) {
+        if (region.cancelled) region.cancelled->store(true);
         return;
     }
-    v.busy = true;
+    region.busy = true;
     v.chainBox = box;
-    v.error.clear();
+    region.error.clear();
     auto cancel = std::make_shared<std::atomic_bool>(false);
-    v.cancelled = cancel;
+    region.cancelled = cancel;
     const auto rev = revision_;
     background<ChainResult>(
         this,
@@ -1234,16 +1109,16 @@ void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const st
         },
         [this, viewer, rev, cancel](Outcome<ChainResult> result) {
             auto found = views_.find(viewer);
-            if (found == views_.end() || found->second->cancelled != cancel)
+            if (found == views_.end() || found->second->region.cancelled != cancel)
                 return;
             auto& v = *found->second;
-            v.busy = false;
+            v.region.busy = false;
             if (rev != revision_ || cancel->load()) {
                 v.chainBox.reset();
                 refreshViewer(viewer);
                 return;
             }
-            v.error = result.error;
+            v.region.error = result.error;
             if (result.error.isEmpty()) {
                 v.chains.clear();
                 for (auto& chain : result.value.chains)
@@ -1443,8 +1318,8 @@ void FiberCollectionController::watchAnnotationRender(LineAnnotationDialog* dial
 void FiberCollectionController::detachViewer(VolumeViewerBase* viewer)
 {
     if (auto it = views_.find(viewer); it != views_.end()) {
-        if (it->second->cancelled)
-            it->second->cancelled->store(true);
+        if (it->second->region.cancelled)
+            it->second->region.cancelled->store(true);
         views_.erase(it);
     }
     ViewerOverlayControllerBase::detachViewer(viewer);
