@@ -69,12 +69,17 @@ int main() try
     for (int i = 0; i < int(ink.total()); ++i) ink(i / ink.cols, i % ink.cols) = float(i) * 0.5f;
     writeTiff(source / "ink.tif", ink, -1, 0, 0);
     std::ofstream(source / "meta.json") << nlohmann::json{{"uuid", util::newUuid()}, {"scale", {1, 1}},
-        {"format", "tifxyz"}, {"type", "seg"}}.dump();
+        {"format", "tifxyz"}, {"type", "seg"}, {"tags", {{"approved", {{"user", "reviewer"}}}}}}.dump();
 
     const auto report = ingestGeometrySource(db, "surface", source);
     require(report.ingested == 1 && report.problems.empty(), "tifxyz with a VC mask ingests");
     std::string uuid;
-    { auto read = db.read(); uuid = db.selectObjects(read, {})[0].uuid; }
+    {
+        auto read = db.read();
+        const auto object = db.selectObjects(read, {})[0];
+        uuid = object.uuid;
+        require(object.tags == std::vector<std::string>{"approved"}, "meta.json status tags become record tags");
+    }
 
     std::vector<uint8_t> expectedValid(rows * cols, 255);
     expectedValid[3 * cols + 4] = 0;
