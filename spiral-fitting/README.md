@@ -101,6 +101,49 @@ the platform dispatch and fallback/error paths.
 Filesystem API references: [Linux FICLONE](https://man7.org/linux/man-pages/man2/FICLONE.2const.html)
 and [Apple file cloning support](https://developer.apple.com/documentation/foundation/urlresourcevalues/volumesupportsfilecloning).
 
+## Checking a dataset before fitting
+
+`fit_spiral.py --dataset DIR --check` reports what a fit of the current
+configuration needs from that dataset and what the dataset has, then exits
+0 when a fit can start and 1 when it cannot. It reads the dataset only: no
+GPU, no fit, no download, so it answers before `uv sync` has a CUDA device
+to talk to and before the rest of a 177 GB dataset has finished arriving.
+
+```
+$ python fit_spiral.py --dataset ./spiral_datasets/phercparis4 --check
+dataset: /data/spiral_datasets/phercparis4
+spiral-scroll.json: PHercParis4, 9.6 um, outward CW, lasagna group 4 at scale 4
+
+inputs (dense_spacing_mode=winding_model):
+  required  umbilicus                 present  umbilicus.json
+  optional  fibers                    MISSING  fibers
+  off       tracks_dbm                off      tracks/2um_ds2_ps256_surf_v2.dbm
+  required  normal_x                  present  lasagna_inputs/las_008_nx.ome.zarr.respool_g4_pair
+  ...
+
+This dataset can start a fit.
+```
+
+Each row names the path the fit will actually open, so a Lasagna input
+shows its resident-pool sidecar rather than the OME-Zarr store it was
+packed from. `required` / `optional` / `off` come from the same catalog
+predicates the fitter uses, so `FIT_SPIRAL_CONFIG_OVERRIDES` changes the
+report: `dense_spacing_mode=grad_mag` makes `gradient_magnitude` required
+and turns `winding_inference` off, and `input_use_tracks=true` brings the
+tracks DBM back.
+
+With no `spiral-scroll.json` in the dataset root the check prints one to
+paste, with every value it can read off the dataset already filled in --
+including `normal_zarr_group`, taken from the packed sidecar's own
+directory name. `voxel_size_um` and `spiral_outward_sense` are left as
+`<...>` placeholders: nothing in a published dataset records them, and a
+specification still carrying one is refused rather than guessed at.
+
+`--check` also applies the Lasagna geometry checks that otherwise wait
+until a CUDA device is up, so a `lasagna_scale` that puts the fitted
+z-range outside the store is reported here instead of as
+`RuntimeError: lasagna z-ROI [...] is empty` several minutes in.
+
 ## Scroll specification (spiral-scroll.json)
 
 `fit_spiral.py` requires a `spiral-scroll.json` file in the dataset root.
@@ -132,6 +175,12 @@ direction of its cross-product normal, which renders correct with
 
 Optional `paths` object for per-input overrides when a dataset's file names
 don't match the catalog's conventional defaults (e.g. `tracks_dbm`).
+
+The Lasagna entries name the OME-Zarr stores, but a fit reads the
+`pack_resident_pools.py` sidecar beside each one, so a dataset published
+with its pools already packed -- which is what
+`dl.ash2txt.org/datasets/spiral_datasets/PHercParis4/` ships -- does not
+need the stores themselves. `--check` names whichever of the two it found.
 
 Also optional, and easy to get wrong silently: `normal_zarr_group`
 (default `"4"`) and `lasagna_scale` (default `4`) select which OME-Zarr
@@ -198,6 +247,48 @@ The packer only iterates over chunk files that exist, so a store that holds only
 the z chunk rows of your fit window packs correctly; rows outside it read back
 as no-data. Pass `--ct <scroll zarr> --ct-group <group>` to drop bricks outside
 the CT mask.
+
+### Which sidecars a default fit reads
+
+The published `spiral_datasets/PHercParis4` ships three packed sidecars under
+`lasagna_inputs/` and no `.ome.zarr` stores. A default configuration opens one
+of them; the other two only matter for configurations that are off by default.
+Sizes are as served by `dl.ash2txt.org` on 2026-10-22, in decimal GB.
+
+| Sidecar | Size | Read when | Default |
+| --- | --- | --- | --- |
+| `las_008_nx.ome.zarr.respool_g4_pair/` (nx+ny) | 10.2 GB | `input_use_normals` is on and `loss_weight_dense_normals` > 0 | read |
+| `las_008_grad_mag.ome.zarr.respool_g4/` | 5.1 GB | `dense_spacing_mode` is `grad_mag` | not read (`winding_model`) |
+| `las_008_surf_sdt.ome.zarr.respool_g1/` | 35.0 GB | never: no input in `FIT_INPUT_CATALOG` names it | not read |
+
+So the 50.5 GB `lasagna_inputs/` folder contributes 10.2 GB to a default fit.
+The same holds for the rest of the dataset: `tracks/` (50.3 GB) is only opened
+with `input_use_tracks`, `fiber_directions.npz` (2.7 GB) only with
+`input_use_fiber_directions`, and `fibers.afv` (11.1 GB), `fiber_strips/`
+(40.8 GB) and `patch_normals/` (14.9 GB) are not inputs `fit_spiral.py` opens
+(the `fibers` input is a directory of fiber JSONs).
+`fit_spiral.py --dataset <root> --check` prints the same classification for
+your own configuration (see "Checking a dataset before fitting").
+
+To fetch only what a default fit needs, add include filters to the tutorial's
+rclone command. Everything a default `fit_spiral.py` or VC3D session opens on
+PHercParis4 is about 15 GB instead of the full 177 GB:
+
+```sh
+rclone copy :http: ./spiral_datasets/phercparis4 \
+    --http-url https://dl.ash2txt.org/datasets/spiral_datasets/PHercParis4/ \
+    --include "/*.json" \
+    --include "/verified_patches/**" \
+    --include "/outer_shell/**" \
+    --include "/winding_inference/**" \
+    --include "/lasagna_inputs/las_008_nx.ome.zarr.respool_g4_pair/**" \
+    --transfers 32 -P
+```
+
+Re-running without the filters resumes into the same tree, so a partial
+download can be completed later if you switch on tracks or `grad_mag`. The
+sizes above were first measured by Jon Marrs
+([#1655](https://github.com/ScrollPrize/villa/issues/1655)).
 
 ## Sweep runner output
 
