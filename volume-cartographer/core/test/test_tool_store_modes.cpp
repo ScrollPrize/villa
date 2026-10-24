@@ -297,3 +297,20 @@ TEST_CASE("vc_objrefine refines a stored surface into a new object or in place")
     }
     CHECK(db.objectByUuid(txn, created)->name == "refined");
 }
+
+TEST_CASE("vc_straighten stores its result as a new surface")
+{
+    Fixture f;
+    const auto bin = tool("VC_STRAIGHTEN_BIN") + " --trim --trim-max-edge 4.03";
+    run(bin + " \"" + f.tifxyz.string() + "\" \"" + (f.dir / "straight").string() + "\"", f.dir / "file.log");
+    const auto uuid = surfaceUuid(run(bin + " " + f.uuid + " --store \"" + f.store.string() + "\" --tag straight", f.dir / "store.log"));
+    OpenOptions options; options.author = "tool-store-test";
+    auto db = ObjectStore::open(f.store, options);
+    auto txn = db.read();
+    const auto stored = load_quad_from_store(db, txn, uuid);
+    const auto files = load_quad_from_tifxyz(f.dir / "straight");
+    REQUIRE(stored->rawPointsPtr()->size() == files->rawPointsPtr()->size());
+    CHECK(cv::norm(*stored->rawPointsPtr(), *files->rawPointsPtr(), cv::NORM_INF) == 0);
+    CHECK(stored->countValidPoints() < load_quad_from_store(db, txn, f.uuid)->countValidPoints());  // trimmed
+    CHECK(db.objectByUuid(txn, uuid)->name == "surface_straight");
+}

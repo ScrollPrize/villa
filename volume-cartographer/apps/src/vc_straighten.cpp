@@ -23,6 +23,7 @@
 // bilinear resampling, matching the Python reference.
 
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/StoreSurfaces.hpp"
 #include "vc/core/util/Rect3D.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Uuid.hpp"
@@ -63,6 +64,20 @@ struct Grid {
 
 static bool isInvalid(const cv::Vec3f& p) {
     return p[0] == -1.0f && p[1] == -1.0f && p[2] == -1.0f;
+}
+
+// A grid from a loaded surface, its sentinels as invalid cells.
+static Grid gridOf(QuadSurface& surf)
+{
+    Grid g;
+    g.P = surf.rawPointsPtr()->clone();
+    g.scale = surf.scale();
+    const int H = g.P.rows, W = g.P.cols;
+    g.valid = cv::Mat_<uint8_t>::zeros(H, W);
+    for (int r = 0; r < H; ++r)
+        for (int c = 0; c < W; ++c)
+            if (!isInvalid(g.P(r, c))) g.valid(r, c) = 1;
+    return g;
 }
 
 static Grid loadGrid(const fs::path& dir)
@@ -768,7 +783,9 @@ int main(int argc, char** argv)
     desc.add_options()
         ("help,h", "show help")
         ("input", po::value<std::string>(&inPath), "input tifxyz dir")
-        ("output", po::value<std::string>(&outPath), "output tifxyz dir (must not exist)")
+        ("output", po::value<std::string>(&outPath), "output tifxyz dir (must not exist); with --store, the new surface's name")
+        ("store", po::value<std::string>(), "object store: the input is a surface UUID and the result a new surface (prints surface_uuid:)")
+        ("tag", po::value<std::vector<std::string>>()->composing(), "tag for the stored result (repeatable)")
         ("unbend", po::bool_switch(&doUnbend), "run the spine unbend stage")
         ("overlap-pairs", po::value<int>(&overlapCount), "run N overlap-pair passes")
         ("orthogonalize", po::bool_switch(&doOrtho), "run the column orthogonalize stage")
@@ -799,16 +816,27 @@ int main(int argc, char** argv)
     if (!anyStage) { doUnbend = true; overlapCount = 2; doOrtho = true; doTrim = true; }
     if (overlapCount < 0) overlapCount = 0;
 
+    std::optional<StoreSurfaces> store;
+    std::unique_ptr<QuadSurface> stored;
     Grid g;
-    try { g = loadGrid(inPath); }
+    try {
+        if (vm.count("store")) {
+            store.emplace(vm["store"].as<std::string>(), "vc_straighten");
+            stored = store->load(inPath);
+            g = gridOf(*stored);
+        } else {
+            if (vm.count("tag")) throw std::runtime_error("--tag needs --store");
+            g = loadGrid(inPath);
+        }
+    }
     catch (const std::exception& e) { std::cerr << "error loading " << inPath << ": " << e.what() << "\n"; return 1; }
 
     if (analyze) {
         stageOverlapPairs(g, op, /*applyWarp=*/false, nullptr);
         return 0;
     }
-    if (outPath.empty()) { std::cerr << "error: output dir required\n"; return 1; }
-    if (fs::exists(outPath)) { std::cerr << "error: output exists: " << outPath << "\n"; return 1; }
+    if (!store && outPath.empty()) { std::cerr << "error: output dir required\n"; return 1; }
+    if (!store && fs::exists(outPath)) { std::cerr << "error: output exists: " << outPath << "\n"; return 1; }
 
     try {
         if (doUnbend) g = stageUnbend(g, unbendSmooth, unbendMinRows);
@@ -819,6 +847,23 @@ int main(int argc, char** argv)
         }
         if (doOrtho) g = stageOrthogonalize(g, qp);
         if (doTrim)  stageTrim(g, trimMaxEdge);
+        if (store) {
+            cv::Mat_<cv::Vec3f> P = g.P.clone();
+            for (int r = 0; r < g.H(); ++r)
+                for (int c = 0; c < g.W(); ++c)
+                    if (!g.valid(r, c)) P(r, c) = cv::Vec3f(-1, -1, -1);
+            QuadSurface result(P, g.scale);
+            result.meta = stored->meta;  // a straightened copy keeps the input's metadata
+            const std::string name = !outPath.empty() ? outPath
+                : (stored->meta.contains("name") ? stored->meta["name"].get_string() : stored->id) + "_straight";
+            const nlohmann::json parameters = {{"unbend", doUnbend}, {"overlap_pairs", overlapCount},
+                                               {"orthogonalize", doOrtho}, {"trim", doTrim}};
+            const auto uuid = store->create(result, name, parameters, {stored->id},
+                                            vm.count("tag") ? vm["tag"].as<std::vector<std::string>>() : std::vector<std::string>{});
+            store->finish();
+            std::cout << "surface_uuid: " << uuid << "\n";
+            return 0;
+        }
         saveGrid(g, outPath, inPath);
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
