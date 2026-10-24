@@ -4,6 +4,7 @@
 #include "Fiber3DRibbon.hpp"
 #include "Fiber3DSlices.hpp"
 #include "Fiber3DVolumeRenderer.hpp"
+#include "Fiber3DSurfaceRenderer.hpp"
 #include <unordered_map>
 #include <QFutureWatcher>
 #include <QTimer>
@@ -147,6 +148,10 @@ void main() {
 }  // namespace
 
 struct Fiber3DCanvas::Impl {
+    std::shared_ptr<const surface::Mesh> surfaceMesh;
+    std::unique_ptr<Fiber3DSurfaceRenderer> surfaceRenderer;
+    float surfaceOpacity = .5f;
+    bool surfaceUploading = false;
     struct RibbonTile { GLuint texture = 0, buffer = 0; GLsizei vertices = 0; };
     slices::Images slices;
     std::unique_ptr<Fiber3DVolumeRenderer> volumeRenderer;
@@ -214,6 +219,9 @@ struct Fiber3DCanvas::Impl {
         // Preserve apparent scale when switching between perspective and ortho.
         const double eye = scale / std::tan(0.39269908169872415481);
         double extent = radius + distance(target, origin);
+        if (surfaceMesh && !surfaceMesh->indices.empty())
+            extent = std::max(extent, distance(target, surfaceMesh->bounds.lower) +
+                                      distance(surfaceMesh->bounds.lower, surfaceMesh->bounds.upper));
         for (const auto& image : slices) {
             for (const auto& p : slices::corners(*image))
                 extent = std::max(extent, distance(target, p));
@@ -303,6 +311,8 @@ void Fiber3DCanvas::cleanupGL()
     if (!context() || !d->glReady)
         return;
     makeCurrent();
+    d->surfaceRenderer.reset();
+    d->surfaceUploading = bool(d->surfaceMesh);
     d->volumeRenderer.reset();
     d->ribbonProgram.reset();
     for (auto& tile : d->ribbonTiles) {
@@ -720,7 +730,7 @@ void Fiber3DCanvas::fit(bool selectedOnly)
     if (d->preparation.isRunning() || d->pending) { d->fitPending = true; d->selectedFitPending = selectedOnly; }
     Bounds bounds = d->bounds;
     if (!d->geometry || d->geometry->chunks.empty()) {
-        if (selectedOnly || d->slices.empty()) return;
+        if (selectedOnly) return;
         bounds = emptyBounds();
         for (const auto& image : d->slices)
             for (const auto& p : slices::corners(*image))
@@ -736,7 +746,14 @@ void Fiber3DCanvas::fit(bool selectedOnly)
             expand(bounds, b.lower); expand(bounds, b.upper);
         }
     }
-    if (!finite(bounds.lower))
+    if (!selectedOnly && d->surfaceMesh && !d->surfaceMesh->indices.empty()) {
+        expand(bounds, d->surfaceMesh->bounds.lower); expand(bounds, d->surfaceMesh->bounds.upper);
+    }
+    fitBounds(bounds);
+}
+void Fiber3DCanvas::fitBounds(const Bounds& bounds)
+{
+    if (!finite(bounds.lower) || !finite(bounds.upper))
         return;
     for (int k = 0; k < 3; ++k)
         d->target[k] = (bounds.lower[k] + bounds.upper[k]) * 0.5;
@@ -748,6 +765,27 @@ void Fiber3DCanvas::fit(bool selectedOnly)
 void Fiber3DCanvas::fitAll()
 {
     fit(false);
+}
+void Fiber3DCanvas::setSurfaceMesh(std::shared_ptr<const surface::Mesh> mesh)
+{
+    if (mesh && mesh->indices.empty()) mesh.reset();
+    if (d->surfaceMesh == mesh) return;
+    d->surfaceMesh = std::move(mesh); d->surfaceUploading = bool(d->surfaceMesh);
+    if (!d->fitted && d->surfaceMesh) fitSurface();
+    update();
+}
+std::shared_ptr<const surface::Mesh> Fiber3DCanvas::surfaceMesh() const { return d->surfaceMesh; }
+bool Fiber3DCanvas::isSurfaceMeshReady() const
+{
+    return d->surfaceMesh && d->surfaceRenderer && !d->surfaceUploading && d->surfaceRenderer->error().isEmpty();
+}
+void Fiber3DCanvas::setSurfaceOpacity(float opacity) { d->surfaceOpacity = std::clamp(opacity, 0.f, 1.f); update(); }
+void Fiber3DCanvas::fitSurface()
+{
+    if (d->surfaceMesh) {
+        d->fitPending = false;
+        fitBounds(d->surfaceMesh->bounds);
+    }
 }
 void Fiber3DCanvas::fitSelected()
 {
@@ -799,6 +837,11 @@ void Fiber3DCanvas::paintGL()
         }
     }
     const auto matrix = d->matrix(width(), height());
+    if (d->glReady && (d->surfaceMesh || d->surfaceRenderer)) {
+        if (!d->surfaceRenderer) d->surfaceRenderer = std::make_unique<Fiber3DSurfaceRenderer>();
+        d->surfaceUploading = d->surfaceRenderer->draw(d->surfaceMesh, matrix, d->origin, d->rotation, d->surfaceOpacity);
+        if (d->surfaceUploading) update();
+    }
     if (d->glReady) drawCTRibbon();
     if (d->glReady && d->error.isEmpty() && d->program && d->geometry && !d->geometry->chunks.empty()) {
         glEnable(GL_DEPTH_TEST);
@@ -953,6 +996,12 @@ void Fiber3DCanvas::paintGL()
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
     painter.setPen(QColor(210, 215, 222));
+    if (d->surfaceMesh && d->surfaceRenderer) {
+        if (!d->surfaceRenderer->error().isEmpty())
+            painter.drawText(rect().adjusted(12, 66, -12, -12), Qt::AlignTop | Qt::TextWordWrap, d->surfaceRenderer->error());
+        else if (d->surfaceUploading)
+            painter.drawText(rect().adjusted(12, 66, -12, -12), Qt::AlignTop, tr("Uploading surface mesh…"));
+    }
     if (d->volumeRenderer && !d->slices.empty() && d->slices.front()->slab && !d->volumeRenderer->error().isEmpty())
         painter.drawText(rect().adjusted(12, 40, -12, -12), Qt::AlignTop | Qt::TextWordWrap, d->volumeRenderer->error());
     if ((d->ribbon || !d->slices.empty()) && !d->ribbonError.isEmpty())
@@ -962,7 +1011,7 @@ void Fiber3DCanvas::paintGL()
         return;
     }
     if (!d->geometry || d->geometry->chunks.empty()) {
-        if (d->slices.empty()) painter.drawText(
+        if (d->slices.empty() && !d->surfaceMesh) painter.drawText(
             rect().adjusted(16, 16, -16, -16),
             Qt::AlignCenter | Qt::TextWordWrap,
             d->preparation.isRunning() ? tr("Preparing fibers…") : (d->scene && !d->scene->message.isEmpty() ? d->scene->message : tr("No fibers in the displayed region")));

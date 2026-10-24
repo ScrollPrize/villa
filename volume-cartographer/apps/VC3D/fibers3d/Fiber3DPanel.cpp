@@ -3,6 +3,7 @@
 #include "Fiber3DData.hpp"
 #include "Fiber3DRibbonControls.hpp"
 #include "Fiber3DSliceControls.hpp"
+#include "Fiber3DSurfaceControls.hpp"
 #include "CState.hpp"
 #include "FiberCollectionController.hpp"
 #include "VCSettings.hpp"
@@ -74,6 +75,7 @@ struct Fiber3DPanel::Impl {
     Fiber3DCanvas* canvas;
     Fiber3DRibbonControls* ribbonControls;
     Fiber3DSliceControls* sliceControls;
+    Fiber3DSurfaceControls* surfaceControls;
     QLabel *status, *selection;
     QCheckBox *nativeSource, *afvSource, *h, *v, *unknown;
     QComboBox *region, *colors, *direction, *palette, *memoryBudget;
@@ -353,6 +355,10 @@ struct Fiber3DPanel::Impl {
             return button;
         };
 
+        section(q->tr("Surface"));
+        surfaceControls = new Fiber3DSurfaceControls(state, canvas, settingsContents);
+        body->addWidget(surfaceControls);
+
         section(q->tr("Sources"));
         nativeSource = check("fibers3DNative", q->tr("Project annotations"), true);
         afvSource = check("fibers3DAutomated", q->tr("Automated collection"), true);
@@ -387,7 +393,8 @@ struct Fiber3DPanel::Impl {
         }
         const int savedBudget = memoryBudget->findData(settings.value(memoryBudget->objectName(), 512).toInt());
         memoryBudget->setCurrentIndex(savedBudget >= 0 ? savedBudget : memoryBudget->findData(512));
-        memoryBudget->setToolTip(q->tr("Maximum decoded fiber coordinates per source. Rendering buffers and CT use additional memory. This is a limit, not a preallocation."));
+        surfaceControls->setMemoryBudget(size_t(memoryBudget->currentData().toInt()) * 1024 * 1024);
+        memoryBudget->setToolTip(q->tr("Maximum decoded fiber coordinates per source, and maximum surface mesh buffer size. Additional rendering buffers, snapshots and CT use more memory. This is a limit, not a preallocation."));
         row(q->tr("Memory budget"), memoryBudget);
         auto* memoryHelp = new QLabel(q->tr("Per source. Rendering and CT use additional memory."), settingsContents);
         memoryHelp->setWordWrap(true);
@@ -534,6 +541,7 @@ struct Fiber3DPanel::Impl {
             saveSettings();
         });
         QObject::connect(memoryBudget, &QComboBox::currentIndexChanged, q, [this] {
+            surfaceControls->setMemoryBudget(size_t(memoryBudget->currentData().toInt()) * 1024 * 1024);
             request();
             saveSettings();
         });
@@ -824,12 +832,14 @@ void Fiber3DPanel::showEvent(QShowEvent* e)
     d->syncCursor();
     d->request();
     d->sliceControls->resume();
+    d->surfaceControls->resume();
 }
 void Fiber3DPanel::hideEvent(QHideEvent* e)
 {
     QWidget::hideEvent(e);
     d->ribbonControls->cancel();
     d->sliceControls->cancel();
+    d->surfaceControls->suspend();
     ++d->revision;
     d->debounce.stop();
     d->pending = true;

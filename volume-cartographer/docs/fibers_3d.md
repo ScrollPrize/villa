@@ -14,6 +14,42 @@ fibres or close the collection. Camera dragging does not clear selection.
 **Fit** frames the displayed geometry; **Fit selected** frames its selected
 portion. Changing filters or styles preserves the camera.
 
+**Settings → Surface → Display surface mesh** displays the surface selected
+in Main alongside the fibres. It starts off and remembers that choice. **Opacity**
+runs from 0–100% (default 100%, 5% arrow steps); **Fit surface** frames just the
+surface. Ordinary **Fit** includes it with the fibres. Selection changes and
+geometry edits replace the displayed mesh; changing projects or closing the
+volume removes stale geometry. Fibre filters do not crop the surface.
+
+The display uses the existing `segmentation` QuadSurface, including its editing
+preview, in the active CT coordinate frame. Every valid grid cell becomes two
+triangles; invalid cells and holes remain absent. No CT is read, no surface is
+reconstructed or deformed, and the source files are unchanged. A GUI-owned
+coordinate snapshot feeds a cancellable worker. CPU/GPU mesh buffers are bounded
+by the existing **Memory budget** setting; oversized grids show an explicit error.
+Snapshots, temporary indexing and GPU copies use additional memory. Uploads are
+limited to 4 MiB per frame. Orbit and opacity changes reuse the same mesh buffers.
+Two-sided smooth shading uses depth-tested coverage transparency (MSAA where
+available, screen-door coverage otherwise), avoiding per-frame triangle sorting.
+It is an inspection display, not a test of sheet assignment or H/V non-crossing.
+
+Surface validation: `fiber_3d_surface` tests native coordinates, missing cells,
+non-finite points, degenerate triangles, cancellation, allocation bounds and the
+real OpenGL renderer (holes, opacity, foreground occlusion, unload/reload, with
+and without MSAA). All seven focused fibre suites pass on the M2 Max Mac. The
+native application was exercised with public Paris 4 surface `20231221180251`
+in its registered 2.4 µm coordinate frame: 1,598 × 2,103 source points,
+6,085,630 triangles, 139.39 MiB of mesh buffers, and the user's 2,024 displayed
+AFV fibres. Full preparation/upload took 1.42 s while GUI callbacks continued.
+Thirty-five camera drags plus synchronous framebuffer captures took 6.11 ms
+median / 9.59 ms p95 in the existing QuickBuild (-O1), with unchanged mesh data.
+These are capture timings for this scene, not a frame-rate guarantee for all
+scrolls. Toggle/cancellation, mesh-only framing, surface replacement, in-place
+edit updates, deletion and volume closing passed. Reproduction scripts and
+screenshots are in `exports/VC3D_FIBERS3D_QA/mesh-20261024` in the outer workspace.
+Build `VC3D test_fiber_3d_surface`, then run `ctest --test-dir build
+--output-on-failure -R '^fiber_3d_surface$'`. Ubuntu was not run.
+
 **CT ribbon** displays the CT directly along the selected fibre in the 3D view.
 The button opens a **Width** slider (full width, 1–512 active-CT voxels; default
 32) and **Rotation** slider (−180° to +180° about the fibre). Both values are

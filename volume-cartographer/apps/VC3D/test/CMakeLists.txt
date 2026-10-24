@@ -699,3 +699,11 @@ target_link_libraries(test_fiber_3d_volume PRIVATE Qt6::Core Qt6::Gui Qt6::OpenG
 add_test(NAME fiber_3d_volume COMMAND test_fiber_3d_volume)
 vc_register_test_target(test_fiber_3d_volume)
 vc_register_ctest(fiber_3d_volume test_fiber_3d_volume)
+
+add_executable(test_fiber_3d_surface test_fiber_3d_surface.cpp ../fibers3d/Fiber3DSurfaceMesh.cpp ../fibers3d/Fiber3DSurfaceRenderer.cpp)
+set_target_properties(test_fiber_3d_surface PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_fiber_3d_surface PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_fiber_3d_surface PRIVATE Qt6::Core Qt6::Gui Qt6::OpenGL Qt6::Test vc_core)
+add_test(NAME fiber_3d_surface COMMAND test_fiber_3d_surface)
+vc_register_test_target(test_fiber_3d_surface)
+vc_register_ctest(fiber_3d_surface test_fiber_3d_surface)

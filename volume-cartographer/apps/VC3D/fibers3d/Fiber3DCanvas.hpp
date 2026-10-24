@@ -11,6 +11,7 @@
 namespace vc3d::fibers3d
 {
 namespace ribbon { struct Image; }
+namespace surface { struct Mesh; }
 
 // Reusable display-only view. Loading, selection ownership and CT navigation
 // belong to the controller; orbiting never reads the AFV again.
@@ -34,6 +35,11 @@ public:
     const slices::Images& ctSlices() const;
     void setCTSliceOpacity(float opacity);
     void setCTSliceTransfer(const std::array<CompositeParams, 3>&);
+    void setSurfaceMesh(std::shared_ptr<const surface::Mesh>);
+    std::shared_ptr<const surface::Mesh> surfaceMesh() const;
+    bool isSurfaceMeshReady() const;
+    void setSurfaceOpacity(float opacity);
+    void fitSurface();
     void fitAll();
     void fitSelected();
     void focusPoint(Point point);
@@ -72,6 +78,7 @@ private:
     void startProximityBuild();
     void visibilityUpdated();
     void fit(bool selectedOnly);
+    void fitBounds(const Bounds&);
     void pick(const QPointF& position, bool context, const QPoint& globalPosition);
 };
 
