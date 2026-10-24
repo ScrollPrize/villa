@@ -94,10 +94,15 @@ class Patch:
         ij_f = ij.to(dtype=torch.float32)
         flat = ij_f.reshape(-1, 2)
 
-        i0 = torch.floor(flat[:, 0]).long()
-        j0 = torch.floor(flat[:, 1]).long()
-
-        in_bounds = (i0 >= 0) & (j0 >= 0) & (i0 < h - 1) & (j0 < w - 1)
+        # Coordinates on the last row/column belong to the closed vertex grid.
+        # Use the adjacent quad for interpolation, without moving the point.
+        in_bounds = (
+            torch.isfinite(flat).all(dim=-1)
+            & (flat[:, 0] >= 0) & (flat[:, 0] <= h - 1)
+            & (flat[:, 1] >= 0) & (flat[:, 1] <= w - 1)
+        )
+        i0 = torch.floor(flat[:, 0]).long().clamp(0, h - 2)
+        j0 = torch.floor(flat[:, 1]).long().clamp(0, w - 2)
         valid = torch.zeros_like(in_bounds, dtype=torch.bool)
         if in_bounds.any():
             valid_in_bounds = self.valid_quad_mask.to(ij.device)[i0[in_bounds], j0[in_bounds]]
