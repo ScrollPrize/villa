@@ -90,7 +90,9 @@ the application catches the immediate exception.
 
 New `(r,c)` maps to old `(r+row,c+column)`. Negative offsets grow top/left;
 positive offsets crop them. The requested shape independently grows/crops the
-bottom/right. XYZ and all channels resize together, preserving exact scalar
+bottom/right. XYZ and all channels resize together; a channel finer than the
+grid moves by the same grid rectangle scaled to its own pixels, and a resize
+that empties a grid axis is refused while such a channel exists. Resizing preserves exact scalar
 bytes, component counts, NaN payloads and signed zero. Newly exposed cells use
 the supplied fills, including cells that had been cropped away earlier.
 

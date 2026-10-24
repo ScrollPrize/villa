@@ -1,5 +1,6 @@
 #include "formats/GeometryInput.hpp"
 #include "geometry/ArrayBytes.hpp"
+#include "geometry/ArrayLayout.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "formats/SurfaceInput.hpp"
 #include "spatial/SurfaceGrid.hpp"
@@ -61,8 +62,6 @@ Prepared surface(const fs::path& source)
     }
     for (const auto& [name, path] : files) {
         auto samples = readTiffSamples(path);
-        if (samples.width != uint32_t(grid.cols) || samples.height != uint32_t(grid.rows))
-            throw std::runtime_error("surface channel dimensions must match points: " + path.string());
         std::string dtype;
         if (samples.sampleFormat == SAMPLEFORMAT_UINT && samples.bits == 8) dtype = "|u1";
         else if (samples.sampleFormat == SAMPLEFORMAT_UINT && samples.bits == 16) dtype = "<u2";
@@ -75,7 +74,8 @@ Prepared surface(const fs::path& source)
         if constexpr (std::endian::native != std::endian::little)
             for (size_t i = 0; i < samples.bytes.size(); i += samples.bits/8)
                 std::reverse(samples.bytes.begin()+i, samples.bytes.begin()+i+samples.bits/8);
-        std::vector<int64_t> shape{grid.rows, grid.cols};
+        std::vector<int64_t> shape{int64_t(samples.height), int64_t(samples.width)};
+        detail::surfaceChannelResolution(path.string(), shape, {grid.rows, grid.cols});
         if (samples.components != 1) shape.push_back(samples.components);
         p.geometry.arrays.push_back({name, dtype, shape, std::move(samples.bytes)});
     }

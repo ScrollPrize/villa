@@ -406,6 +406,10 @@ Storage dtypes are `|u1`, `<u2`, `<i4`, `<i8`, `<u8`, `<f4`, `<f8`.
 
 Surface `points` is float32 XYZ. Extra arrays are aligned channels of shape
 `[rows,columns]` or `[rows,columns,components]` with positive component count.
+A channel's rows and columns are each a whole multiple of the points grid
+(1 for a per-vertex channel; for example 20 for ink rendered at 20 pixels per
+grid step). The shapes imply the multiple. Rectangle reads and edits of a
+channel use that channel's own pixel coordinates.
 Absent and zero-filled channels differ. Ingestion recognizes lowercase `.tif`
 and `.tiff` sidecars by stem, excluding XYZ; duplicate/reserved names, unaligned,
 truncated or unsupported layouts fail before publication. Tiled/stripped and
@@ -420,8 +424,8 @@ are directional source claims; ingestion infers no graph edges or symmetry.
 
 `update_surface_channels(uuid, channels, remove, expected_revision, edge_edits=[])`
 adds/replaces/removes channels atomically. Supply only changed arrays and exact
-little-endian bytes. Removing absent channels, duplicate names or mismatched
-spatial dimensions fails; dtype/components may change. Use
+little-endian bytes. Removing absent channels, duplicate names or spatial
+dimensions that are not a whole multiple of the grid fails; dtype/components may change. Use
 [structural resizing](structural-editing.md#surface-growth-and-cropping) for shape
 changes. Typed owned surfaces and native export reject auxiliary arrays; bounded
 views and generic readers remain available.

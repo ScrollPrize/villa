@@ -94,12 +94,24 @@ def test_surface_channels_sparse_reads_history_and_resize(db, tile):
     assert db.edit_geometry(uid, [], second) == second
     with pytest.raises(RuntimeError, match='revision'):
         db.edit_geometry(uid, [], first)
-    third = db.update_surface_channels(uid, [array('extra', np.zeros((35, 37), 'u1'))], ['review'], second)
-    fills = [array('points', np.full((1, 1, 3), -1, '<f4')), array('extra', np.ones((1, 1), 'u1'))]
+    # An ink channel rendered finer than the grid: 2x rows, 3x columns.
+    ink = np.arange(70 * 111, dtype='<f4').reshape(70, 111)
+    with pytest.raises(ValueError, match='whole multiple'):
+        db.update_surface_channels(uid, [array('ink', ink[:69])], [], second)
+    third = db.update_surface_channels(uid, [array('extra', np.zeros((35, 37), 'u1')), array('ink', ink)], ['review'], second)
+    assert db.read_geometry_rectangle(third, 'ink', 61, 100, 4, 5) == ink[61:65, 100:105].tobytes()
+    fills = [array('points', np.full((1, 1, 3), -1, '<f4')), array('extra', np.ones((1, 1), 'u1')),
+             array('ink', np.zeros((1, 1), '<f4'))]
     with db.write(expected_revisions=heads(db, uid)) as tx:
         grown = tx.resize_surface(uid, dict(row=-1, column=-1, rows=37, columns=39, fill=fills), third)
     assert db.read_geometry_rectangle(grown, 'points', 1, 1, 35, 37) == values.tobytes()
     assert db.read_geometry_rectangle(grown, 'extra', 0, 0, 1, 1) == b'\x01'
+    assert db.read_geometry_rectangle(grown, 'ink', 2, 3, 70, 111) == ink.tobytes()
+    assert db.read_geometry_rectangle(grown, 'ink', 0, 0, 2, 117) == bytes(2 * 117 * 4)
+    with pytest.raises(RuntimeError, match='finer channels'):
+        with db.write(expected_revisions=heads(db, uid)) as tx:
+            tx.resize_surface(uid, dict(row=0, column=0, rows=0, columns=39, fill=fills), grown)
+    grown = db.update_surface_channels(uid, [], ['ink'], grown)
     assert db.geometry_revision(grown)['grid_origin'] == [-1, -1]
     extra = np.arange(37 * 39, dtype='<u2').reshape(37, 39)
     updated = db.update_surface_channels(uid, [array('extra', extra)], [], grown)
