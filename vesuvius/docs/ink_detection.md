@@ -460,6 +460,29 @@ Flat inference has a narrower preprocessing contract than training. It accepts
 with `divisor: 255`. Other normalization modes are rejected rather than being
 silently replaced with robust normalization.
 
+## Score predictions against labels
+
+`evaluate` scores flat predictions of one segment against the labels beside
+it. When the segment has a `_validation_mask`, it reports the validation
+region and the rest of the supervision mask separately. Training excludes
+validation pixels, so only the first number is held out. A checkpoint trained
+on the segment scores close to 1 on the second.
+
+```bash
+uv run --extra models python -m vesuvius.ink_detection.inference.evaluate   /data/ink_9um/labels/aligned-scrollprizeorg-21slices/pherc0139-w016   s43=/data/predictions/pherc0139-w016_seed43.tif   s42=/data/predictions/pherc0139-w016_seed42.tif   --json-out pherc0139-w016_scores.json
+```
+
+Each prediction is `NAME=PATH`, or just `PATH` to use the file stem as the
+name. Predictions must be on the labels' pixel grid; inference on the
+segment's `surface-volume.zarr` produces that grid. Labels are read at
+level 0, on the `annotation_center_channel` plane when that attribute is
+set and on the middle plane otherwise. Per region the command reports pixel
+and ink counts, AUROC, F1 at 128, and the best F1 with its threshold.
+Every prediction after the first, or after `--reference`, gets an AUROC
+difference against the reference. Its 95% interval comes from a paired
+bootstrap that resamples the same `--block-size` squares (default 64 px)
+for both predictions, `--bootstraps` times (default 2000).
+
 ## Native 3D inference
 
 A tifxyz directory must contain `x.tif`, `y.tif`, `z.tif`, and
