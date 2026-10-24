@@ -435,6 +435,7 @@ the second output.
 | `--output-prefix` | Folder-mode filename prefix, default empty. |
 | `--mask-path` | Optional 2D TIFF; nonzero pixels limit scheduled output. |
 | `--resolution` | Zarr pyramid key, default `0`; bare arrays require level 0. |
+| `--cache-dir`, `--cache-max-gb` | Optional Zarr-3 compressed-chunk cache root and per-volume decimal-GB budget, as in the native runner. Remote inputs are fetched once and re-read from disk. |
 | `--num-workers`, `--workers` | DataLoader workers, default `4`. |
 | `--prefetch-factor` | Per-worker prefetch factor, default `2`. |
 | `--overlap` | Inference overlap fraction in `[0,1)`, default `0.5`. |
