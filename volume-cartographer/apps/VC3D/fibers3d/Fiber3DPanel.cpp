@@ -1,6 +1,7 @@
 #include "Fiber3DPanel.hpp"
 #include "Fiber3DCanvas.hpp"
 #include "Fiber3DData.hpp"
+#include "Fiber3DRibbonControls.hpp"
 #include "CState.hpp"
 #include "FiberCollectionController.hpp"
 #include "VCSettings.hpp"
@@ -70,6 +71,7 @@ struct Fiber3DPanel::Impl {
     LineAnnotationController* annotations;
     FiberCollectionController* automated;
     Fiber3DCanvas* canvas;
+    Fiber3DRibbonControls* ribbonControls;
     QLabel *status, *selection;
     QCheckBox *nativeSource, *afvSource, *h, *v, *unknown;
     QComboBox *region, *colors, *direction, *palette, *memoryBudget;
@@ -111,6 +113,7 @@ struct Fiber3DPanel::Impl {
         };
         auto* fit = button(q->tr("Fit"), QStringLiteral("fibers3DFit"));
         auto* fitSelected = button(q->tr("Fit selected"), QStringLiteral("fibers3DFitSelected"));
+        auto* ribbon = button(q->tr("CT ribbon"), QStringLiteral("fibers3DRibbon"));
         bar->addStretch();
         auto* detach = button(q->tr("Detach"), QStringLiteral("fibers3DDetach"));
         auto* settingsButton = button(q->tr("Settings"), QStringLiteral("fibers3DSettings"));
@@ -120,6 +123,8 @@ struct Fiber3DPanel::Impl {
         layout->addLayout(bar);
         canvas = new Fiber3DCanvas(q);
         canvas->setObjectName(QStringLiteral("fibers3DCanvas"));
+        ribbonControls = new Fiber3DRibbonControls(state, viewers, canvas, ribbon, q);
+        layout->addWidget(ribbonControls);
         layout->addWidget(canvas, 1);
         selection = new QLabel(q);
         selection->setWordWrap(true);
@@ -750,6 +755,7 @@ struct Fiber3DPanel::Impl {
 
     void updateSelection()
     {
+        ribbonControls->setSelection(scene, selectedKey);
         const auto* fiber = find(selectedKey);
         if (!fiber) {
             selection->setText(selectedKey.isEmpty() ? q->tr("Click a fiber to select it.") : q->tr("Selected fiber is outside the displayed region or filters."));
@@ -816,6 +822,7 @@ void Fiber3DPanel::showEvent(QShowEvent* e)
 void Fiber3DPanel::hideEvent(QHideEvent* e)
 {
     QWidget::hideEvent(e);
+    d->ribbonControls->cancel();
     ++d->revision;
     d->debounce.stop();
     d->pending = true;

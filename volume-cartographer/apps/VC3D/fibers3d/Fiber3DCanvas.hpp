@@ -8,6 +8,7 @@
 
 namespace vc3d::fibers3d
 {
+namespace ribbon { struct Image; }
 
 // Reusable display-only view. Loading, selection ownership and CT navigation
 // belong to the controller; orbiting never reads the AFV again.
@@ -24,6 +25,9 @@ public:
     size_t visibleFiberCount() const;
     void setDisplaySettings(const DisplaySettings& settings);
     void setSelectedKey(const QString& key);
+    void setCTRibbon(std::shared_ptr<const ribbon::Image> image);
+    std::shared_ptr<const ribbon::Image> ctRibbon() const;
+    void setCTWindow(float low, float high);
     void fitAll();
     void fitSelected();
     void focusPoint(Point point);
@@ -53,6 +57,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> d;
     void cleanupGL();
+    void drawCTRibbon();
     void startGeometryBuild();
     void updateSelectedGeometry();
     void updateProximity();

@@ -31,6 +31,10 @@ set(srcs
     fibers3d/Fiber3DGeometry.hpp
     fibers3d/Fiber3DPanel.cpp
     fibers3d/Fiber3DPanel.hpp
+    fibers3d/Fiber3DRibbon.hpp
+    fibers3d/Fiber3DRibbon.cpp
+    fibers3d/Fiber3DRibbonControls.hpp
+    fibers3d/Fiber3DRibbonControls.cpp
     LineAnnotationPolylineIndices.hpp
     CWindowContextMenu.cpp
     StatusDockPanelHost.cpp

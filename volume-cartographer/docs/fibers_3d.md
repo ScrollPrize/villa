@@ -13,6 +13,52 @@ clears the selection in the fibre lists and CT overlays; it does not delete
 fibres or close the collection. Camera dragging does not clear selection.
 **Fit** frames the displayed geometry; **Fit selected** frames its selected
 portion. Changing filters or styles preserves the camera.
+
+**CT ribbon** displays the CT directly along the selected fibre in the 3D view.
+The button opens a **Width** slider (full width, 1–512 active-CT voxels; default
+6) and **Rotation** slider (−180° to +180° about the fibre). Both values are
+remembered; the ribbon is initially off. It follows selection from either
+the 3D view or the CT overlays. Clearing selection removes it, and the toggle
+can still be switched off without selecting another fibre.
+
+Attached Lasagna normals provide its initial orientation, with their signs
+aligned along the fibre. Missing normals use the same parallel transport helper
+as Line Annotation; if there are no usable normals, the initial plane is
+arbitrary and the status says to adjust rotation. The rotation offsets that
+baseline along the entire fibre. This is an inspection plane, not a reconstructed
+papyrus surface or a claim about which sheet contains the fibre. It does not
+modify the AFV or manual annotation. Gaps, invalid points and disconnected runs
+are not bridged, and the displayed region still applies.
+
+The ribbon samples the active CT at level 0 with trilinear interpolation, one
+sample per texel and no depth projection/MIP. Width is centred on the fibre.
+The grayscale window follows the existing CT window controls. Sampling and
+normal resolution run on a worker, with debouncing and cancellation; camera
+movement and contrast changes never read CT or recompute the ribbon. A single
+ribbon is cached for immediate hide/show. Texture tiles share one sampled border
+row and are uploaded progressively. Requests are bounded to 8 million texels
+(16 MiB of grayscale/validity pixels); larger requests show an explicit error
+instead of silently reducing resolution. The active CT's existing chunk cache
+is reused, with no additional full-volume copy. Uint8 and uint16 CT are supported
+(uint16 is converted to an 8-bit display range); missing level 0 is reported.
+
+Ribbon validation: `fiber_3d_ribbon`, `fiber_3d_geometry`, `fiber_3d_data` and
+`test_fiber_collection` pass on the M2 Max Mac. The new suite checks curved
+transported frames, sign-flipped/partly missing normals, gap/clipping boundaries,
+rotation against a known CT intensity field, texture seams and cancellation.
+The full application was checked with all 80,887 PHerc1447 fibres loaded, fibre
+2,157,532 selected and 53 nearby fibres displayed. Its 873-row native CT ribbon
+loaded in 4.03 s initially and about 0.48 s on subsequent cached runs (including
+UI debounce/settling); event-loop callbacks continued during loading. Orbit and
+contrast reused the same texture payload. Width/rotation changes, rapid selection
+changes, hide/show, clear and shutdown during a request passed. No real Lasagna
+dataset was attached in that project; normal handling was checked with controlled
+normal fields and the existing dataset-resolution checks. The wider
+`test_open_data_manifest` binary has one failure at `registeredCatalogRoot ==
+sourceRoot` (line 1922), reproduced identically with the pre-change resolver;
+its Lasagna pairing checks passed. QA inputs, screenshots, logs and the baseline
+reproducer are in `exports/VC3D_FIBERS3D_QA/ribbon-20261024` in the outer workspace.
+
 Selecting an AFV fibre in a CT slice or the catalogue also highlights it in
 3D, using the same yellow (`#ffff66`) as the slice overlay and a stroke
 2 logical pixels wider than the other fibres, including on Retina displays.

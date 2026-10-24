@@ -1,6 +1,7 @@
 #include "Fiber3DCanvas.hpp"
 #include "Fiber3DColor.hpp"
 #include "Fiber3DRenderGeometry.hpp"
+#include "Fiber3DRibbon.hpp"
 #include <QFutureWatcher>
 #include <QTimer>
 #include <QtConcurrent/QtConcurrentRun>
@@ -143,6 +144,15 @@ void main() {
 }  // namespace
 
 struct Fiber3DCanvas::Impl {
+    struct RibbonTile { GLuint texture = 0, buffer = 0; GLsizei vertices = 0; };
+    std::shared_ptr<const ribbon::Image> ribbon;
+    std::vector<RibbonTile> ribbonTiles;
+    std::unique_ptr<QOpenGLShaderProgram> ribbonProgram;
+    GLuint ribbonVao = 0;
+    Point ribbonOrigin{};
+    bool ribbonDirty = false;
+    float windowLow = 0, windowHigh = 255;
+    QString ribbonError;
     std::shared_ptr<const Scene> scene;
     DisplaySettings settings;
     QString selectedKey, error;
@@ -275,6 +285,13 @@ void Fiber3DCanvas::cleanupGL()
     if (!context() || !d->glReady)
         return;
     makeCurrent();
+    d->ribbonProgram.reset();
+    for (auto& tile : d->ribbonTiles) {
+        glDeleteTextures(1, &tile.texture); glDeleteBuffers(1, &tile.buffer);
+    }
+    d->ribbonTiles.clear();
+    if (d->ribbonVao) glDeleteVertexArrays(1, &d->ribbonVao);
+    d->ribbonVao = 0; d->ribbonDirty = true;
     d->program.reset();
     glDeleteBuffers(GLsizei(d->buffers.size()), d->buffers.data());
     d->buffers.fill(0);
@@ -312,7 +329,110 @@ void Fiber3DCanvas::initializeGL()
     glGenBuffers(GLsizei(d->buffers.size()), d->buffers.data());
     glGenBuffers(1, &d->selectedBuffer);
     glGenBuffers(1, &d->markerBuffer);
+    glGenVertexArrays(1, &d->ribbonVao);
+    d->ribbonProgram = std::make_unique<QOpenGLShaderProgram>();
+    if (!d->ribbonProgram->addShaderFromSourceCode(QOpenGLShader::Vertex, R"glsl(
+        #version 330 core
+        layout(location=0) in vec3 position;
+        layout(location=1) in vec2 uv;
+        uniform mat4 mvp;
+        out vec2 texCoord;
+        void main() { gl_Position = mvp * vec4(position,1); texCoord = uv; }
+    )glsl") || !d->ribbonProgram->addShaderFromSourceCode(QOpenGLShader::Fragment, R"glsl(
+        #version 330 core
+        in vec2 texCoord;
+        uniform sampler2D ct;
+        uniform vec2 windowRange;
+        out vec4 color;
+        void main() {
+            vec2 sampleValue = texture(ct, texCoord).rg;
+            if (sampleValue.g < .999) discard;
+            float gray = clamp((sampleValue.r * 255.0 - windowRange.x) / max(1.0,windowRange.y-windowRange.x),0.0,1.0);
+            color = vec4(gray,gray,gray,1.0);
+        }
+    )glsl") || !d->ribbonProgram->link())
+        d->ribbonError = tr("Cannot initialize CT ribbon: %1").arg(d->ribbonProgram->log());
+    d->ribbonDirty = true;
     d->dirty = true;
+}
+
+void Fiber3DCanvas::setCTRibbon(std::shared_ptr<const ribbon::Image> image)
+{
+    if (image == d->ribbon) return;
+    d->ribbon = std::move(image); d->ribbonDirty = true;
+    update();
+}
+std::shared_ptr<const ribbon::Image> Fiber3DCanvas::ctRibbon() const { return d->ribbon; }
+void Fiber3DCanvas::setCTWindow(float low, float high)
+{
+    d->windowLow = low; d->windowHigh = high; update();
+}
+
+void Fiber3DCanvas::drawCTRibbon()
+{
+    if (d->ribbonDirty) {
+        for (auto& tile : d->ribbonTiles) {
+            glDeleteTextures(1, &tile.texture); glDeleteBuffers(1, &tile.buffer);
+        }
+        d->ribbonTiles.clear(); d->ribbonDirty = false;
+        if (d->ribbonProgram && d->ribbonProgram->isLinked()) d->ribbonError.clear();
+    }
+    if (!d->ribbon || !d->ribbonProgram || !d->ribbonError.isEmpty() ||
+        d->ribbon->key != d->selectedKey || !d->geometry) return;
+    const auto& image = *d->ribbon;
+    if (image.tiles.empty()) return;
+    d->ribbonOrigin = image.tiles.front().left.front();
+    glBindVertexArray(d->ribbonVao);
+    glActiveTexture(GL_TEXTURE0);
+    // At most one <= 1 MiB tile per frame. Camera changes reuse these objects.
+    if (d->ribbonTiles.size() < image.tiles.size()) {
+        const auto& tile = image.tiles[d->ribbonTiles.size()];
+        Impl::RibbonTile gpu;
+        struct V { float x, y, z, u, v; };
+        std::vector<V> vertices;
+        vertices.reserve(size_t(tile.height) * 2);
+        for (int r = 0; r < tile.height; ++r) for (int side = 0; side < 2; ++side) {
+            const auto p = relative(side ? tile.right[r] : tile.left[r], d->ribbonOrigin);
+            vertices.push_back({p.x(), p.y(), p.z(), (side ? tile.width - .5f : .5f) / tile.width, (r + .5f) / tile.height});
+        }
+        gpu.vertices = GLsizei(vertices.size());
+        glGenBuffers(1, &gpu.buffer); glBindBuffer(GL_ARRAY_BUFFER, gpu.buffer);
+        glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(vertices.size() * sizeof(V)), vertices.data(), GL_STATIC_DRAW);
+        glGenTextures(1, &gpu.texture); glBindTexture(GL_TEXTURE_2D, gpu.texture);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RG8, tile.width, tile.height, 0, GL_RG, GL_UNSIGNED_BYTE, tile.pixels.data());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        if (glGetError() != GL_NO_ERROR) {
+            glDeleteTextures(1, &gpu.texture); glDeleteBuffers(1, &gpu.buffer);
+            d->ribbonError = tr("Cannot upload CT ribbon; reduce its width.");
+        } else d->ribbonTiles.push_back(gpu);
+        if (d->ribbonTiles.size() < image.tiles.size() && d->ribbonError.isEmpty()) update();
+    }
+    glEnable(GL_DEPTH_TEST); glDepthMask(GL_TRUE); glDepthFunc(GL_LEQUAL);
+    glDisable(GL_BLEND); glDisable(GL_CULL_FACE);
+    glDisable(GL_SAMPLE_ALPHA_TO_COVERAGE); glDisable(GL_SAMPLE_ALPHA_TO_ONE);
+    glDisable(GL_SAMPLE_COVERAGE); glEnable(GL_MULTISAMPLE);
+    // A small depth bias lets the centerline remain readable on its CT plane.
+    glEnable(GL_POLYGON_OFFSET_FILL); glPolygonOffset(1, 1);
+    auto mvp = d->matrix(width(), height()); mvp.translate(relative(d->ribbonOrigin, d->origin));
+    auto& program = *d->ribbonProgram; program.bind();
+    program.setUniformValue("mvp", mvp); program.setUniformValue("ct", 0);
+    program.setUniformValue("windowRange", QVector2D(d->windowLow, d->windowHigh));
+    for (const auto& tile : d->ribbonTiles) {
+        glBindTexture(GL_TEXTURE_2D, tile.texture); glBindBuffer(GL_ARRAY_BUFFER, tile.buffer);
+        glEnableVertexAttribArray(0); glEnableVertexAttribArray(1);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), nullptr);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), reinterpret_cast<void*>(3 * sizeof(float)));
+        glVertexAttribDivisor(0, 0); glVertexAttribDivisor(1, 0);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, tile.vertices);
+    }
+    program.release(); glBindTexture(GL_TEXTURE_2D, 0); glBindVertexArray(0);
+    glDisable(GL_POLYGON_OFFSET_FILL); glDisable(GL_DEPTH_TEST);
 }
 
 void Fiber3DCanvas::setScene(std::shared_ptr<const Scene> scene)
@@ -371,6 +491,7 @@ void Fiber3DCanvas::setSelectedKey(const QString& key)
 
 void Fiber3DCanvas::clear()
 {
+    setCTRibbon({});
     if (d->cancelled) d->cancelled->store(true);
     d->pending = false;
     d->requested.reset();
@@ -536,6 +657,7 @@ void Fiber3DCanvas::paintGL()
         }
     }
     const auto matrix = d->matrix(width(), height());
+    if (d->glReady) drawCTRibbon();
     if (d->glReady && d->error.isEmpty() && d->program && d->geometry && !d->geometry->chunks.empty()) {
         glEnable(GL_DEPTH_TEST);
         glDepthFunc(GL_LEQUAL);
@@ -688,6 +810,8 @@ void Fiber3DCanvas::paintGL()
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
     painter.setPen(QColor(210, 215, 222));
+    if (d->ribbon && !d->ribbonError.isEmpty())
+        painter.drawText(rect().adjusted(12, 12, -12, -12), Qt::AlignTop | Qt::TextWordWrap, d->ribbonError);
     if (!d->error.isEmpty()) {
         painter.drawText(rect().adjusted(16, 16, -16, -16), Qt::AlignCenter | Qt::TextWordWrap, d->error);
         return;
