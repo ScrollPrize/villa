@@ -207,6 +207,28 @@ includes the average iteration rate for the current stage (`it/s`). Complete
 combined stdout/stderr for every attempt remains available under
 `<output>/.sweep/logs/<config>.log`.
 
+## Stopping a fit automatically
+
+A headless fit runs for `optimizer_num_training_steps` iterations even when
+the loss levelled off long before. With `optimizer_auto_steps` on, it stops
+early, using the rule lasagna applies for `steps: "auto"`: once the best loss
+of the last `optimizer_auto_steps_window` iterations (default 1000) is less
+than `optimizer_auto_steps_rel_threshold` (default 1e-4, relative) below the
+best loss before them, and at least `optimizer_auto_steps_min` iterations have
+run (0 = twice the window). The loss is read once every 200 iterations, as the
+lowest value in those 200, so the window is a multiple of 200 and the check
+adds no per-step GPU sync. The stop prints an `auto steps: stopping after N
+iterations` line; the final checkpoint and outputs are written as usual and
+record N as the completed iterations. `optimizer_num_training_steps` remains
+the upper bound and still sets the learning-rate decay horizon.
+
+```bash
+FIT_SPIRAL_CONFIG_OVERRIDES='{"optimizer_auto_steps": true}' python fit_spiral.py --dataset <dataset dir>
+```
+
+Single-process fits only: a multi-process fit prints a warning and runs to the
+end. The rule itself is `auto_steps.py`, copied from lasagna's (spiral-fitting
+does not depend on the lasagna package).
 
 
 ## Flattening a fitted checkpoint
