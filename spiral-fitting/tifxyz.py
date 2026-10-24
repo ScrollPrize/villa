@@ -94,10 +94,15 @@ class Patch:
         ij_f = ij.to(dtype=torch.float32)
         flat = ij_f.reshape(-1, 2)
 
-        i0 = torch.floor(flat[:, 0]).long()
-        j0 = torch.floor(flat[:, 1]).long()
-
-        in_bounds = (i0 >= 0) & (j0 >= 0) & (i0 < h - 1) & (j0 < w - 1)
+        # Coordinates on the last row/column belong to the closed vertex grid.
+        # Use the adjacent quad for interpolation, without moving the point.
+        in_bounds = (
+            torch.isfinite(flat).all(dim=-1)
+            & (flat[:, 0] >= 0) & (flat[:, 0] <= h - 1)
+            & (flat[:, 1] >= 0) & (flat[:, 1] <= w - 1)
+        )
+        i0 = torch.floor(flat[:, 0]).long().clamp(0, h - 2)
+        j0 = torch.floor(flat[:, 1]).long().clamp(0, w - 2)
         valid = torch.zeros_like(in_bounds, dtype=torch.bool)
         if in_bounds.any():
             valid_in_bounds = self.valid_quad_mask.to(ij.device)[i0[in_bounds], j0[in_bounds]]
@@ -435,11 +440,19 @@ def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, *, layout_me
     identity, never one derived from the name. ``layout_metadata`` describes
     the export layout of the supplied grid.
     """
-    path = f'{path}/{uuid}'
-    os.makedirs(path, exist_ok=True)
-    Image.fromarray(np.asarray(zyxs[..., 2], dtype=np.float32)).save(f'{path}/x.tif')
-    Image.fromarray(np.asarray(zyxs[..., 1], dtype=np.float32)).save(f'{path}/y.tif')
-    Image.fromarray(np.asarray(zyxs[..., 0], dtype=np.float32)).save(f'{path}/z.tif')
+    # Reject malformed coordinates before creating any output files.
+    zyxs = np.asarray(zyxs, dtype=np.float32)
+    if zyxs.ndim != 3 or zyxs.shape[-1] != 3 or min(zyxs.shape[:2]) < 1:
+        raise ValueError("zyxs must have shape [rows>=1, cols>=1, 3]")
+    if not np.isfinite(zyxs).all():
+        raise ValueError("zyxs contains non-finite coordinates")
+    if not np.isfinite(step_size) or step_size <= 0:
+        raise ValueError("step_size must be finite and positive")
+    if not np.isfinite(voxel_size_um) or voxel_size_um <= 0:
+        raise ValueError("voxel_size_um must be finite and positive")
+
+    # Check that the complete metadata is representable as strict JSON
+    # before creating the destination or writing any TIFF.
     valid_vertex = np.any(zyxs != -1, axis=-1)
     valid_quad = valid_vertex[:-1, :-1] & valid_vertex[1:, :-1] & valid_vertex[:-1, 1:] & valid_vertex[1:, 1:]
     area_vx2 = int(valid_quad.sum()) * step_size ** 2
@@ -461,8 +474,15 @@ def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, *, layout_me
     }
     if layout_metadata is not None:
         metadata[ORIENTATION_METADATA_KEY] = layout_metadata
+    metadata_json = json.dumps(metadata, indent=4, allow_nan=False)
+
+    path = f'{path}/{uuid}'
+    os.makedirs(path, exist_ok=True)
+    Image.fromarray(np.asarray(zyxs[..., 2], dtype=np.float32)).save(f'{path}/x.tif')
+    Image.fromarray(np.asarray(zyxs[..., 1], dtype=np.float32)).save(f'{path}/y.tif')
+    Image.fromarray(np.asarray(zyxs[..., 0], dtype=np.float32)).save(f'{path}/z.tif')
     with open(f'{path}/meta.json', 'w') as f:
-        json.dump(metadata, f, indent=4)
+        f.write(metadata_json)
     return True
 
 
