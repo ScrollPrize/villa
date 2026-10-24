@@ -4432,6 +4432,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
     { name = "s3fs" },
+    { name = "vc-delta3d" },
     { name = "zarr" },
 ]
 
@@ -4576,6 +4577,7 @@ volume-only = [
     { name = "pyyaml" },
     { name = "requests" },
     { name = "s3fs" },
+    { name = "vc-delta3d" },
     { name = "zarr" },
 ]
 
@@ -4705,6 +4707,8 @@ requires-dist = [
     { name = "trimesh", marker = "extra == 'render'", specifier = ">=4.8.2" },
     { name = "typed-argument-parser", marker = "extra == 'all'", specifier = ">=1.11.0" },
     { name = "typed-argument-parser", marker = "extra == 'models'", specifier = ">=1.11.0" },
+    { name = "vc-delta3d", specifier = ">=0.2.0,<0.3" },
+    { name = "vc-delta3d", marker = "extra == 'volume-only'", specifier = ">=0.2.0,<0.3" },
     { name = "vc-object-store", marker = "extra == 'all'", editable = "../vc_object_store" },
     { name = "vc-object-store", marker = "extra == 'models'", editable = "../vc_object_store" },
     { name = "villa-gpu-manager", marker = "extra == 'all'", editable = "../gpu_manager" },
