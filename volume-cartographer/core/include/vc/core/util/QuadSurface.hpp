@@ -524,8 +524,9 @@ public:
     /** Resample the surface by a scale factor. factor > 1 increases density, < 1 decreases.
      *  Uses bilinear interpolation by default (cv::INTER_LINEAR), matching rotate(). */
     void resample(float factor, int interpolation = 1);  // 1 = cv::INTER_LINEAR
-    /** Resample the surface independently in X and Y. */
-    void resample(float factor_x, float factor_y, int interpolation);
+    /** Resample the surface independently in X and Y. pointGrid keeps node 0 on node 0
+     *  (src = dst / factor) instead of the pixel centre rule; channels are unaffected. */
+    void resample(float factor_x, float factor_y, int interpolation, bool pointGrid = false);
 
     /** Compute optimal rotation angle to place highest Z values at row 0 */
     float computeZOrientationAngle() const;
