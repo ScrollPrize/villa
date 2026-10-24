@@ -65,8 +65,18 @@ To get started, we recommend these notebooks that jump right in:
 
 `vesuvius` can be installed with `pip`.
 ```sh
-$ pip install vesuvius
+$ pip install "vesuvius>=0.2"
 ```
+
+The current PyPI release supports Python 3.10 to 3.13. Keep the `>=0.2`: on a newer
+Python, a bare `pip install vesuvius` silently falls back to the old 0.1.x releases,
+which lack most of what is documented here (for example `normalization_scheme`).
+With the pin, pip says which Python versions are supported instead.
+
+The base install reads data only. The command-line tools need an extra:
+`pip install "vesuvius[models]>=0.2"` for `vesuvius.train`, `vesuvius.predict` and
+the other model tools, `pip install "vesuvius[gui]>=0.2"` for `vesuvius.napari_trainer`,
+or `pip install "vesuvius[all]>=0.2"` for everything.
 
 For monorepo development, `uv sync --extra models`, `uv sync --extra all`, and
 `uv sync --all-extras` build the local `volume-cartographer` Python bindings from
