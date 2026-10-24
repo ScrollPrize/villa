@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 import time
+import warnings
 import yaml
 import json
 from numpy.typing import NDArray
@@ -91,6 +92,349 @@ from .utils import get_max_value, open_zarr
 
 # Remove the PIL image size limit
 Image.MAX_IMAGE_PIXELS = None
+
+
+
+def _float_to_int_saturate(arr, target_dtype, inplace=False):
+    """Round float data to ``target_dtype`` with saturation instead of wrapping.
+
+    Policy: NaN -> 0, +inf -> target max, -inf -> target min, finite values are
+    rounded half to even and clipped to the target range. ``inplace=True`` lets
+    the <=32-bit path reuse ``arr`` as scratch when it already has the work dtype.
+    """
+    tinfo = np.iinfo(target_dtype)
+    arr = np.asarray(arr)
+    if tinfo.bits < 64:
+        # The bounds must be exact in the working float type: float32 holds every
+        # 8/16-bit bound, float64 the 32-bit ones (float32 cannot hold 2**31-1 or
+        # 2**32-1, so clipping there would round the bound up and the cast wrap).
+        work = np.float32 if (tinfo.bits <= 16 and arr.dtype in (np.float16, np.float32)) else np.float64
+        a = arr if (inplace and arr.dtype == work) else arr.astype(work, copy=True)
+        np.clip(a, tinfo.min, tinfo.max, out=a)  # NaN passes through
+        np.rint(a, out=a)  # integer bounds stay in range
+        nan = np.isnan(a)
+        if nan.any():
+            a[nan] = 0.0
+        return a.astype(target_dtype)
+    a = np.rint(np.asarray(arr, dtype=np.float64))
+    # Saturate in the integer domain: float64 cannot represent int64/uint64 max
+    # (float(max) rounds up to 2**63 / 2**64), so clipping in float then casting
+    # would overflow. Both bounds below are exact powers of two (or zero).
+    upper = 2.0 ** (tinfo.bits - 1 if tinfo.min < 0 else tinfo.bits)  # == max + 1
+    lower = float(tinfo.min)
+    hi = a >= upper  # includes +inf
+    lo = a < lower   # includes -inf
+    nan = np.isnan(a)
+    interior = ~(hi | lo | nan)
+    out = np.zeros(a.shape, dtype=target_dtype)
+    out[interior] = a[interior].astype(target_dtype)
+    out[hi] = tinfo.max
+    out[lo] = tinfo.min
+    return out
+
+def _subtract_instance_min_exact(arr, work_dtype, percentile=False, pct_cache=None, span_cache=None):
+    """Return ``arr - min`` per normalization instance, computed exactly, as ``work_dtype``.
+
+    A read with more than 3 dims is shifted per channel (axis 0); any other read
+    by its overall minimum. Subtracting a constant never changes a min-max
+    result, so this is correct whichever sub-instances the normalization loop
+    then uses (e.g. per row of a 2D read, or the whole read). The difference of two
+    values of any integer dtype fits in uint64 (0 <= x - min <= 2**64 - 1), and
+    modular uint64 subtraction of the two's-complement bit patterns gives it
+    exactly, for signed and unsigned inputs alike.
+
+    Float work dtype, every value and the span exact in it (the common case): a
+    plain cast, minus the minimum for ``percentile=True``; instance_minmax subtracts
+    the minimum itself, so its output is not shifted there (same bytes either way).
+
+    ``percentile=True`` (percentile_minmax): if the span max - min is not exact in
+    ``work_dtype`` and the shifted values leave too few representable steps between the
+    percentiles (int64 [-2**63, 0..999] -> 0..999 near 2**63 in float64, so p1 == p99),
+    the instance is instead shifted by the order statistic just below the 1st
+    percentile, and values below it map to -1. The map is monotone, so the
+    order statistics, and hence the percentiles, are those of the exact values,
+    and everything outside [p1, p99] is clipped afterwards anyway. Spans that are
+    exact keep the min shift, so ordinary data is unchanged.
+
+    ``span_cache``: a list that receives each group's span (max - min).
+
+    ``pct_cache``: a list that receives, per group, the (p1, p99) of the returned
+    values when this function computed them, else None, so percentile_minmax need
+    not compute them again.
+    """
+    arr = np.asarray(arr)
+    signed = np.issubdtype(arr.dtype, np.signedinteger)
+    as_u64 = None
+    out = np.empty(arr.shape, dtype=work_dtype)
+    groups = [(i,) for i in range(arr.shape[0])] if arr.ndim > 3 else [(Ellipsis,)]
+    exact_lim = (2 ** (np.finfo(work_dtype).nmant + 1)
+                 if np.issubdtype(work_dtype, np.floating) else 0)
+    for g in groups:
+        a = arr[g]
+        mn = np.min(a)
+        mx = np.max(a)
+        span = int(mx) - int(mn)
+        if span_cache is not None:
+            span_cache.append(span)
+        if span <= exact_lim and max(abs(int(mn)), abs(int(mx))) <= exact_lim:
+            # Common case: every value, the minimum and every difference are exact in
+            # work_dtype, so subtracting there gives the same bytes. instance_minmax
+            # subtracts the minimum itself, exactly, so a plain cast is enough there.
+            o = out[g]
+            o[...] = a
+            if percentile:
+                np.subtract(o, o.dtype.type(mn), out=o)
+            if pct_cache is not None:
+                pct_cache.append(None)
+            continue
+        if span < 2 ** 63:
+            # Fast path: x - min is exact, then one cast rounds it to work_dtype: the
+            # same value as the uint64 route below, without the uint64 round trip.
+            # One pass, no temporary: subtract in int64 (exact for <= 32-bit inputs;
+            # for 64-bit inputs the wrap-around result is exact since span < 2**63) or
+            # uint64 (modular), and cast each result to work_dtype on the way out.
+            np.subtract(a, mn, out=out[g], dtype=np.uint64 if arr.dtype == np.uint64 else np.int64,
+                        casting='unsafe')
+        else:
+            if as_u64 is None:
+                as_u64 = (arr.astype(np.int64, copy=False).view(np.uint64)
+                          if signed else arr.astype(np.uint64, copy=False))
+            mn_u64 = np.array(mn, dtype=np.int64).view(np.uint64) if signed else np.uint64(mn)
+            out[g] = (as_u64[g] - mn_u64).astype(work_dtype)
+        if not percentile or span <= 2 ** (np.finfo(work_dtype).nmant + 1):
+            if pct_cache is not None:
+                pct_cache.append(None)
+            continue
+        # The span is not exact in work_dtype. Re-shift only if the min shift really
+        # degrades the [p1, p99] window: fewer than ~1024 representable steps between
+        # the percentiles (0..999 near 2**63 in float64 have none). Otherwise keep the
+        # min shift (same bytes).
+        lo, hi = np.percentile(out[g], (1.0, 99.0))
+        if (hi - lo) >= 1024 * np.spacing(np.asarray(max(abs(lo), abs(hi)), dtype=work_dtype)):
+            if pct_cache is not None:
+                pct_cache.append((lo, hi))
+            continue
+        if pct_cache is not None:
+            pct_cache.append(None)
+        flat = np.asarray(arr[g]).ravel()
+        k = max(int(np.floor((flat.size - 1) * 0.01)) - 1, 0)
+        ref = np.partition(flat, k)[k]
+        if as_u64 is None:
+            as_u64 = (arr.astype(np.int64, copy=False).view(np.uint64)
+                      if signed else arr.astype(np.uint64, copy=False))
+        ref_u64 = np.array(ref, dtype=np.int64).view(np.uint64) if signed else np.uint64(ref)
+        o = (as_u64[g] - ref_u64).astype(work_dtype)
+        o[np.asarray(arr[g]) < ref] = -1
+        out[g] = o
+    return out
+
+
+def _exact_round_ratio(d, span, T):
+    """round_half_even(d * T / span) for Python-int-exact inputs, element-wise (object path)."""
+    p = d.astype(object) * T
+    q = p // span
+    twice = (p - q * span) * 2
+    up = (twice > span) | ((twice == span) & (q % 2 == 1))
+    q = q + up.astype(np.int64).astype(object)
+    return np.array(q.ravel().tolist(), dtype=np.uint64).reshape(d.shape)
+
+
+def _blocked_scale(x, mn, T, span, target_dtype, B=1 << 16):
+    """rint(((x - mn) * T) / span) in float64, in cache-sized blocks (same bytes as
+    the full-array expression, without full-size float64 temporaries)."""
+    flat = np.ascontiguousarray(x).reshape(-1)
+    out = np.empty(flat.size, dtype=target_dtype)
+    y = np.empty(min(B, flat.size))
+    for i in range(0, flat.size, B):
+        n = min(B, flat.size - i)
+        yy = y[:n]
+        yy[...] = flat[i:i + n]
+        if mn:
+            yy -= float(mn)
+        yy *= float(T)
+        yy /= float(span)
+        np.rint(yy, out=yy)
+        out[i:i + n] = yy
+    return out.reshape(np.shape(x))
+
+
+def _minmax_to_int_exact(x, target_dtype, span=None):
+    """Exact ``round_half_even((x - min) * T / (max - min))`` for integer ``x``.
+
+    ``T`` is the target max. A constant instance maps to 0, like the float path.
+    * 8/16-bit input: a lookup table over [min, max] computed exactly, then one
+      gather (as fast as the float32 path it replaces).
+    * wider input (already shifted to uint64 by ``_subtract_instance_min_exact``)
+      and a <=32-bit target: float64 estimate; only elements whose estimate lies
+      within the float error bound of a .5 tie are recomputed with Python ints.
+    * 64-bit targets: Python ints throughout (float64 cannot hold the levels).
+    """
+    x = np.asarray(x)
+    T = int(np.iinfo(target_dtype).max)
+    if x.size == 0:
+        return np.zeros(x.shape, dtype=target_dtype)
+    if span is not None and x.dtype == np.uint64:
+        mn = 0  # shifted by _subtract_instance_min_exact, which also gave the span
+    else:
+        mn, mx = int(x.min()), int(x.max())
+        span = mx - mn
+    if span == 0:
+        return np.zeros(x.shape, dtype=target_dtype)
+    if x.dtype.itemsize <= 2:
+        levels = np.arange(span + 1, dtype=np.uint64)
+        lut_vals = _exact_round_ratio(levels, span, T).astype(target_dtype)
+        u = np.dtype(f"u{x.dtype.itemsize}")
+        lut = np.zeros(1 << (8 * x.dtype.itemsize), dtype=target_dtype)
+        lut[np.arange(mn, mx + 1).astype(x.dtype).view(u)] = lut_vals
+        return lut[x.view(u)]
+    if x.dtype.itemsize <= 4 and span * T < 2 ** 51:
+        # x - min is exact in float64; then as below without the tie check.
+        return _blocked_scale(x, mn, T, span, target_dtype)
+    if mn == 0 and x.dtype == np.uint64:
+        d = x  # already shifted by _subtract_instance_min_exact
+    elif x.dtype.itemsize <= 4:
+        d = (x.astype(np.int64) - np.int64(mn)).view(np.uint64)  # exact, >= 0
+    else:
+        d = x.astype(np.uint64, copy=False) - np.uint64(mn)
+    if np.iinfo(target_dtype).bits >= 64:
+        return _exact_round_ratio(d, span, T).astype(target_dtype)
+    # span < 2**63: d is non-negative as int64, and the signed cast is much faster.
+    src = (d.view(np.int64) if span < 2 ** 63 else d)
+    if span * T < 2 ** 51:
+        # d * T is exact in float64 and the division is correctly rounded. A true
+        # quotient is either an exact .5 tie (then y is exactly that tie) or at least
+        # 1 / (2 * span) > ulp(y) from one, so y lies on the same side: np.rint's
+        # half-even rounding of y is then the exact result, no tie check needed.
+        return _blocked_scale(src, 0, T, span, target_dtype)
+    # Float64 estimate, |error| <= ~4 ulp(y) (rounding of d, of T/span, of the
+    # product, of T and span); elements within that bound of a .5 tie are recomputed
+    # exactly. Done in cache-sized blocks with two reused buffers: the same ufuncs
+    # element by element, so the same bytes, without full-size temporaries.
+    tol = 16 * np.finfo(np.float64).eps * max(float(T), 1.0)
+    ratio = float(T) / float(span)
+    flat = np.ascontiguousarray(src).reshape(-1)
+    out = np.empty(flat.size, dtype=target_dtype)
+    amb = np.empty(flat.size, dtype=bool)
+    B = 1 << 16
+    y = np.empty(min(B, flat.size))
+    q = np.empty_like(y)
+    for i in range(0, flat.size, B):
+        n = min(B, flat.size - i)
+        yy, qq = y[:n], q[:n]
+        yy[...] = flat[i:i + n]
+        yy *= ratio
+        np.rint(yy, out=qq)
+        # |y - rint(y)| <= 0.5, so its distance from a tie is 0.5 - |y - rint(y)|.
+        np.subtract(yy, qq, out=yy)
+        np.abs(yy, out=yy)
+        np.greater_equal(yy, 0.5 - tol, out=amb[i:i + n])
+        out[i:i + n] = qq
+    if amb.any():
+        dflat = np.ascontiguousarray(d).reshape(-1)
+        out[amb] = _exact_round_ratio(dflat[amb], span, T).astype(target_dtype)
+    return out.reshape(d.shape)
+
+
+def _nonfinite_mask(x):
+    """Boolean mask of finite voxels of float ``x``, or None when all are finite."""
+    if x.dtype.kind != 'f':
+        return None
+    fin = np.isfinite(x)
+    return None if fin.all() else fin
+
+
+def _fill_nonfinite(res, x, low, high):
+    """Set output voxels whose INPUT ``x`` is NaN/-inf to ``low`` (NaN -> 0 for min-max) and +inf to ``high``."""
+    res = np.array(res, copy=True)
+    res[np.isnan(x)] = 0.0
+    res[x == np.inf] = high
+    res[x == -np.inf] = low
+    return res
+
+
+def _narrowing_loses_range(src, cast):
+    """True if casting float src to the narrower float cast overflowed a finite value
+    to +-inf, or flushed a non-zero value below the narrow type's normal range
+    (float64 1e-300 -> float32 0), which would distort any normalisation."""
+    if not np.isfinite(cast).all() and np.count_nonzero(np.isfinite(src)) > np.count_nonzero(np.isfinite(cast)):
+        return True
+    with np.errstate(invalid='ignore'):
+        nz = np.abs(src[(src != 0) & np.isfinite(src)])
+    return nz.size > 0 and nz.min() < np.finfo(cast.dtype).tiny
+
+
+def _zscore_stats(v):
+    """mean and std of v (all finite). If either overflows, compute them on v / max|v|
+    and return (mean, std, scale) in that scaled unit; else scale is None."""
+    with np.errstate(over='ignore', invalid='ignore'):
+        mean, std = np.mean(v), np.std(v)
+    if np.isfinite(mean) and np.isfinite(std):
+        return mean, std, None
+    scale = np.abs(v).max()
+    w = v / scale
+    return np.mean(w), np.std(w), scale
+
+
+def _zscore(x, mean, std, scale):
+    if scale is None:
+        return (x - mean) / max(std, 1e-8)
+    # Divide in float64: the std floor 1e-8 / scale (3e-47 for scale 3e38) underflows
+    # to 0 in float32 and would turn a constant instance into 0/0 = NaN.
+    z = (np.asarray(x / scale, np.float64) - float(mean)) / max(float(std), 1e-8 / float(scale))
+    return z.astype(np.asarray(x).dtype, copy=False)
+
+
+def _widen_if_overflow(res, src, fn, stable):
+    """Fix voxels where the result overflowed although the input was finite.
+
+    1. A float32 result is recomputed as fn(src as float64) (e.g. global_zscore
+       3e38 - (-1e38)), as before.
+    2. Voxels still non-finite (x - mean overflows even in float64, e.g. 1e308 -
+       (-1e308)) are recomputed with ``stable`` (((x/2 - mean/2) / std) * 2: halving is
+       exact in the normal range, a true overflow still gives inf); it is applied only to
+       overflowing voxels (halving a subnormal would lose a bit); the others keep
+       the plain result, so ordinary data is unchanged.
+    """
+    if np.isfinite(res).all():
+        return res
+    if res.shape != np.shape(src):
+        # mean/std broadcast against src to a different shape (e.g. a list mean of
+        # length C against a CZYX read with X != C). The plain formula already gives
+        # that shape; the voxel-wise fix below cannot, so say so instead of guessing.
+        raise ValueError(
+            f"global_zscore/ct: mean/std broadcast the input of shape {np.shape(src)} to "
+            f"{res.shape}, and the overflow fix needs them to keep the input shape; "
+            f"give per-channel statistics with shape (C, 1, 1, 1)")
+    if (res.dtype == np.float32
+            and np.count_nonzero(np.isfinite(res)) < np.count_nonzero(np.isfinite(src))):
+        src = src.astype(np.float64)
+        res = fn(src)
+    bad = ~np.isfinite(res) & np.isfinite(src)
+    if bad.any():
+        res = np.array(res, copy=True)
+        # stable() on the whole array: mean/std may be arrays that broadcast against
+        # src (e.g. a (C,1,1,1) mean), which src[bad] (1-D) would not.
+        res[bad] = np.asarray(np.broadcast_to(stable(src), res.shape), dtype=res.dtype)[bad]
+    return res
+
+
+def _stable_percentiles(values, q=(1.0, 99.0)):
+    """np.percentile, but finite and ordered for wide finite ranges.
+
+    np.percentile interpolates as a + (b - a) * t, and b - a overflows for opposite
+    extremes: np.percentile([-1e308, 1e308], (1, 99)) gives [inf, -inf]. Values are
+    halved and the result doubled only in that case, so ordinary input is unchanged.
+    """
+    with np.errstate(over='ignore', invalid='ignore'):
+        lower, upper = np.percentile(values, q)
+    if not (np.isfinite(lower) and np.isfinite(upper) and lower <= upper):
+        half = np.asarray(values).dtype.type(0.5)
+        lo2, hi2 = np.percentile(np.asarray(values) * half, q)
+        lower, upper = lo2 * 2, hi2 * 2
+    if not (np.isfinite(lower) and np.isfinite(upper) and lower <= upper):
+        raise ValueError(f"percentile_minmax: percentiles are not finite and ordered "
+                         f"(lower={lower!r}, upper={upper!r})")
+    return lower, upper
 
 
 class Volume:
@@ -848,6 +1192,16 @@ class Volume:
                 time.sleep(delay)
                 delay = min(delay * 2, 8.0)
 
+    def _integer_return_dtype(self):
+        """The integer dtype named by ``return_as_type``, or None."""
+        if self.return_as_type == 'none':
+            return None
+        try:
+            dt = np.dtype(getattr(np, self.return_as_type.replace('np.', '')))
+        except (AttributeError, TypeError):
+            return None
+        return dt if np.issubdtype(dt, np.integer) else None
+
     def __getitem__(self, idx: Union[Tuple[Union[int, slice], ...], int]) -> Union[NDArray, torch.Tensor]:
         """
         Gets a sub-volume or slice, applying specified normalization and type conversion.
@@ -945,6 +1299,11 @@ class Volume:
                 store = self._level(subvolume_idx)
 
             data_slice = self._read_with_retry(store, coord_idx)
+            # zarr returns a fresh array; a numpy-backed level returns a VIEW of the
+            # caller's array, and normalization below writes in place. Copy only then.
+            if (self.normalization_scheme != 'none' and isinstance(data_slice, np.ndarray)
+                    and not isinstance(store, zarr.Array) and np.may_share_memory(data_slice, store)):
+                data_slice = data_slice.copy()
 
             original_dtype = data_slice.dtype
 
@@ -964,16 +1323,66 @@ class Volume:
         # --- Preprocessing Steps ---
 
         # 1. Convert to float32 for normalization calculations (if needed)
+        # Min-max output that is rescaled to an integer return_as_type is computed in
+        # float64: float32 has a 24-bit mantissa, so it cannot hold int32/uint32 inputs
+        # exactly (uint32 2**32-2 -> 2**32, saturating to the max) and quantizes the
+        # [0, 1] value too coarsely for 32/64-bit targets (errors of up to 2**39 units).
+        # The output dtype is the integer target either way, so this is not observable
+        # other than through the corrected values.
+        work_dtype = np.float32
+        int_target = self._integer_return_dtype()
+        exact_int_minmax = False
+        pct_cache = None
+        span_cache = None
+        if (self.normalization_scheme in ('instance_minmax', 'percentile_minmax')
+                and int_target is not None
+                and (np.iinfo(int_target).bits >= 32
+                     or not np.can_cast(data_slice.dtype, np.float32, casting='safe'))):
+            work_dtype = np.float64
         if self.normalization_scheme != 'none':
             if np.issubdtype(data_slice.dtype, np.floating):
                 # If already float, ensure it's float32 for consistency
-                if data_slice.dtype != np.float32:
-                    data_slice = data_slice.astype(np.float32)
-                    if self.verbose: print(f"  Cast existing float ({original_dtype}) to np.float32 for normalization.")
+                if data_slice.dtype != work_dtype:
+                    with np.errstate(over='ignore'):
+                        cast = data_slice.astype(work_dtype)
+                    # Keep the wider float if narrowing would overflow finite values to
+                    # +-inf (float64 1e308 -> float32 inf): they must stay finite data.
+                    if (np.dtype(work_dtype).itemsize < data_slice.dtype.itemsize
+                            and _narrowing_loses_range(data_slice, cast)):
+                        cast = data_slice
+                    data_slice = cast
+                    if self.verbose: print(f"  Cast existing float ({original_dtype}) to {np.dtype(work_dtype).name} for normalization.")
+            elif (np.issubdtype(data_slice.dtype, np.integer)
+                    and self.normalization_scheme in ('instance_minmax', 'percentile_minmax')
+                    and int_target is None
+                    and np.can_cast(data_slice.dtype, work_dtype, casting='safe')):
+                # Every value is exact in the work float, so x - min is exact there too:
+                # a plain cast gives the same bytes as the shift below, without the
+                # uint64 round trip.
+                data_slice = data_slice.astype(work_dtype)
+                if self.verbose: print(f"  Cast {original_dtype} to {np.dtype(work_dtype).name} for normalization.")
+            elif (np.issubdtype(data_slice.dtype, np.integer)
+                    and self.normalization_scheme in ('instance_minmax', 'percentile_minmax')):
+                # Min-max is shift invariant, so subtract each instance's minimum exactly in
+                # the integer domain before going to float. Casting int64/uint64 first would
+                # merge distinct values within a float64 ulp (2**64-2 and 2**64-1 both become
+                # 2**64), collapse the range to the epsilon and map the instance to 0.
+                exact_int_minmax = (self.normalization_scheme == 'instance_minmax' and int_target is not None)
+                # instance_minmax to an integer type is finished exactly in integer
+                # arithmetic below (float64 scaling of 64-bit spans misrounds by 1:
+                # int64 -1 in [-2**63, 2**63-1] -> uint8 128 instead of 127).
+                if not (exact_int_minmax and data_slice.dtype.itemsize <= 4):  # <= 32-bit: exact on raw values
+                    pct_cache = []
+                    span_cache = []
+                    data_slice = _subtract_instance_min_exact(
+                        data_slice, np.uint64 if exact_int_minmax else work_dtype,
+                        percentile=self.normalization_scheme == 'percentile_minmax',
+                        pct_cache=pct_cache, span_cache=span_cache)
+                if self.verbose: print(f"  Shifted {original_dtype} by its instance minimum and cast to {np.dtype(work_dtype).name}.")
             else:
                 # If integer or other, convert to float32
-                data_slice = data_slice.astype(np.float32)
-                if self.verbose: print(f"  Cast {original_dtype} to np.float32 for normalization.")
+                data_slice = data_slice.astype(work_dtype)
+                if self.verbose: print(f"  Cast {original_dtype} to {np.dtype(work_dtype).name} for normalization.")
 
         # 2. Apply Normalization Scheme
         # Handle potential channel dimension (assume channels are dim 0 if present)
@@ -984,12 +1393,34 @@ class Volume:
             data_slice = data_slice[np.newaxis, ...]
             if self.verbose: print(f"  Added temporary channel dim for normalization: {data_slice.shape}")
 
+        # Non-finite voxels (policy "finite_only"): the per-instance statistics below are
+        # taken over the finite voxels only, so one NaN/inf no longer poisons the whole
+        # instance. In the output NaN -> 0, +inf -> the top of the range (1.0 for min-max,
+        # the largest finite z for z-score), -inf -> the bottom (0.0 / smallest finite z),
+        # matching _float_to_int_saturate. An instance with no finite voxel becomes all 0
+        # (one warning per read). Clean input takes the unchanged code path.
+        all_nonfinite_instances = 0
+        # Integer sources cast to float are always finite: skip the isfinite scans.
+        src_float = np.issubdtype(original_dtype, np.floating)
+        nonfinite_mask = _nonfinite_mask if src_float else (lambda a: None)
         if self.normalization_scheme == 'instance_zscore':
             for c in range(data_slice.shape[0]):  # Iterate over channels (or the single pseudo-channel)
-                mean = np.mean(data_slice[c])
-                std = np.std(data_slice[c])
-                # Epsilon prevents division by zero or near-zero std dev
-                data_slice[c] = (data_slice[c] - mean) / max(std, 1e-8)
+                x = data_slice[c]
+                fin = nonfinite_mask(x)
+                if fin is None:
+                    # Epsilon prevents division by zero or near-zero std dev
+                    data_slice[c] = _zscore(x, *_zscore_stats(x))
+                    continue
+                if not fin.any():
+                    data_slice[c] = 0.0
+                    all_nonfinite_instances += 1
+                    continue
+                stats = _zscore_stats(x[fin])
+                with np.errstate(invalid='ignore', over='ignore'):
+                    z = np.asarray(_zscore(x, *stats))
+                zf = z[fin]
+                z = _fill_nonfinite(z, x, low=zf.min(), high=zf.max())
+                data_slice[c] = z
             if self.verbose: print(f"  Applied instance Z-score normalization.")
 
         elif self.normalization_scheme == 'global_zscore':
@@ -997,27 +1428,94 @@ class Volume:
             if self.global_mean is None or self.global_std is None:
                 raise ValueError(
                     "Internal Error: global_mean/std missing for global_zscore.")  # Should be caught in init
-            data_slice = (data_slice - self.global_mean) / max(self.global_std, 1e-8)
+            gs = max(self.global_std, 1e-8)
+            def gz(a):
+                # main computes (a - mean) / gs: the subtraction in result_type(a, mean), then the
+                # division in result_type(t, gs), which a NumPy float64 std (or 0-d array) widens.
+                # Divide in place only when that result dtype is the temporary's own dtype.
+                t = np.subtract(a, self.global_mean)
+                res_dtype = np.result_type(t, gs)
+                if res_dtype != t.dtype:
+                    return np.divide(t, gs, dtype=res_dtype)
+                return np.divide(t, gs, out=t)
+            gz_stable = lambda a: ((a * 0.5 - np.asarray(self.global_mean) * 0.5) / gs) * 2  # x - mean overflows; halving is exact in the normal range; applied only to overflowing voxels
+            with np.errstate(over='ignore', invalid='ignore'):
+                data_slice = _widen_if_overflow(gz(data_slice), data_slice, gz, gz_stable)
             if self.verbose: print(
                 f"  Applied global Z-score (mean={self.global_mean:.4f}, std={self.global_std:.4f}).")
 
+        elif self.normalization_scheme == 'instance_minmax' and exact_int_minmax:
+            out = np.empty(data_slice.shape, dtype=int_target)
+            for c in range(data_slice.shape[0]):
+                known = (span_cache[c] if span_cache is not None
+                         and len(span_cache) == data_slice.shape[0] else None)
+                out[c] = _minmax_to_int_exact(data_slice[c], int_target, span=known)
+            data_slice = out
+            if self.verbose: print(f"  Applied exact integer instance Min-Max scaling to {int_target.name}.")
+
         elif self.normalization_scheme == 'instance_minmax':
             for c in range(data_slice.shape[0]):
-                min_val = np.min(data_slice[c])
-                max_val = np.max(data_slice[c])
-                denominator = max(max_val - min_val, 1e-8)  # Epsilon for stability
-                data_slice[c] = (data_slice[c] - min_val) / denominator
+                x = data_slice[c]
+                fin = nonfinite_mask(x)
+                if fin is not None and not fin.any():
+                    data_slice[c] = 0.0
+                    all_nonfinite_instances += 1
+                    continue
+                stats = x if fin is None else x[fin]
+                min_val = np.min(stats)
+                max_val = np.max(stats)
+                with np.errstate(invalid='ignore', over='ignore'):
+                    if np.isfinite(min_val) and np.isfinite(max_val) and not np.isfinite(max_val - min_val):
+                        # Finite range wider than the float type (e.g. [-1e308, 1e308]): halve
+                        # first so neither the range nor x - min overflows to inf.
+                        half = data_slice.dtype.type(0.5)
+                        res = (x * half - min_val * half) / (max_val * half - min_val * half)
+                    elif fin is None and x.flags.writeable:
+                        # Same arithmetic as below, in place (no temporary of the instance size).
+                        denominator = max(max_val - min_val, 1e-8)  # Epsilon for stability
+                        np.subtract(x, min_val, out=x)
+                        np.divide(x, denominator, out=x)
+                        continue
+                    else:
+                        denominator = max(max_val - min_val, 1e-8)  # Epsilon for stability
+                        res = (x - min_val) / denominator
+                if fin is not None:
+                    res = _fill_nonfinite(np.asarray(res), x, low=0.0, high=1.0)
+                data_slice[c] = res
             if self.verbose: print(f"  Applied instance Min-Max scaling to [0, 1].")
 
         elif self.normalization_scheme == 'percentile_minmax':
             for c in range(data_slice.shape[0]):
-                lower, upper = np.percentile(data_slice[c], (1.0, 99.0))
-                denominator = float(upper - lower)
-                if denominator <= 1e-8:
+                fin = nonfinite_mask(data_slice[c])
+                if fin is not None and not fin.any():
+                    data_slice[c] = 0.0
+                    all_nonfinite_instances += 1
+                    continue
+                if fin is not None:
+                    # clip below maps +inf/-inf to the finite percentiles; NaN -> 0 after
+                    x_orig = np.array(data_slice[c], copy=True)
+                    lower, upper = _stable_percentiles(x_orig[fin])
+                    data_slice[c] = np.nan_to_num(x_orig, nan=lower, posinf=upper, neginf=lower)
+                elif (pct_cache is not None and len(pct_cache) == data_slice.shape[0]
+                        and pct_cache[c] is not None):
+                    # Integer source: (p1, p99) already taken on these exact values (all
+                    # finite and >= 0, so _stable_percentiles would give the same).
+                    lower, upper = pct_cache[c]
+                else:
+                    lower, upper = _stable_percentiles(data_slice[c])
+                with np.errstate(over='ignore'):
+                    denominator = float(upper - lower)
+                if np.isfinite(lower) and np.isfinite(upper) and not np.isfinite(denominator):
+                    half = data_slice.dtype.type(0.5)  # finite but overflowing range, see instance_minmax
+                    clipped = np.clip(data_slice[c], lower, upper)
+                    data_slice[c] = (clipped * half - lower * half) / (upper * half - lower * half)
+                elif denominator <= 1e-8:
                     data_slice[c] = 0.0
                 else:
                     clipped = np.clip(data_slice[c], lower, upper)
                     data_slice[c] = (clipped - lower) / denominator
+                if fin is not None:
+                    data_slice[c] = _fill_nonfinite(np.asarray(data_slice[c]), x_orig, low=0.0, high=1.0)
             if self.verbose: print(f"  Applied percentile Min-Max scaling to [0, 1].")
 
         elif self.normalization_scheme == 'ct':
@@ -1027,13 +1525,24 @@ class Volume:
             mean = float(self.intensity_props['mean'])
             std = float(self.intensity_props['std'])
             # Clip in-place per channel
-            data_slice = np.clip(data_slice, lb, ub)
-            data_slice = (data_slice - mean) / max(std, 1e-8)
+            cs = max(std, 1e-8)
+            def ctz(a):
+                # Same arithmetic as (clip(a) - mean) / cs, in place on the clip temporary.
+                t = np.clip(a, lb, ub)
+                return np.divide(np.subtract(t, mean, out=t), cs, out=t)
+            ctz_stable = lambda a: ((np.clip(a, lb, ub) * 0.5 - mean * 0.5) / cs) * 2  # x - mean overflows; halving is exact in the normal range; applied only to overflowing voxels
+            with np.errstate(over='ignore', invalid='ignore'):
+                data_slice = _widen_if_overflow(ctz(data_slice), data_slice, ctz, ctz_stable)
             if self.verbose: print(
                 f"  Applied CT normalization (clip to [{lb:.4f}, {ub:.4f}], mean={mean:.4f}, std={std:.4f}).")
 
         elif self.normalization_scheme != 'none':
             raise ValueError(f"Internal Error: Unknown normalization scheme '{self.normalization_scheme}' encountered.")
+
+        if all_nonfinite_instances:
+            warnings.warn(
+                f"Volume read: {all_nonfinite_instances} normalization instance(s) contain no finite "
+                f"value; returned as 0 ({self.normalization_scheme}).", RuntimeWarning, stacklevel=2)
 
         # Remove temporary channel dimension if it was added
         if not has_channel_dim and original_ndim == 3 and data_slice.ndim == 4:
@@ -1051,10 +1560,15 @@ class Volume:
 
                 if np.issubdtype(target_dtype, np.integer):
                     # Handle conversion to integer types
-                    if self.normalization_scheme in ['instance_minmax', 'percentile_minmax']:  # Data is in [0, 1] range
+                    if exact_int_minmax:  # already scaled exactly to the target
+                        final_dtype = target_dtype
+                    elif self.normalization_scheme in ['instance_minmax', 'percentile_minmax']:  # Data is in [0, 1] range
                         max_target_val = get_max_value(target_dtype)
                         # Scale to target range, clip just in case due to float precision
-                        data_slice = np.clip(data_slice * max_target_val, 0, max_target_val)
+                        # data_slice is float64 for >=32-bit targets (see step 1); float32
+                        # holds the 8/16-bit maxima exactly, so scale in the working dtype.
+                        scaled = data_slice * data_slice.dtype.type(max_target_val)
+                        data_slice = _float_to_int_saturate(scaled, target_dtype, inplace=True)
                         final_dtype = target_dtype
                         if self.verbose: print(f"  Scaled [0,1] data to target integer {target_dtype_str}.")
                     elif self.normalization_scheme in ['instance_zscore', 'global_zscore']:
@@ -1064,7 +1578,20 @@ class Volume:
                               f"Output remains {final_dtype} to avoid data loss. Adjust 'return_as_type' or normalization scheme if needed.")
                         # final_dtype remains float32
                     else:  # Normalization was 'none'
-                        # Allow direct casting if no normalization occurred
+                        # A plain astype wraps out-of-range integers (uint16 65535 -> uint8 255,
+                        # 256 -> 0). Narrowing unsigned -> unsigned rescales by the dtype ranges
+                        # (uint16 -> uint8 is v >> 8); anything else is clipped to the target range.
+                        src_dtype = data_slice.dtype
+                        tinfo = np.iinfo(target_dtype)
+                        if (np.issubdtype(src_dtype, np.unsignedinteger)
+                                and np.issubdtype(target_dtype, np.unsignedinteger)
+                                and np.iinfo(src_dtype).max > tinfo.max):
+                            shift = np.iinfo(src_dtype).bits - tinfo.bits
+                            data_slice = data_slice >> shift
+                        elif np.issubdtype(src_dtype, np.floating):
+                            data_slice = _float_to_int_saturate(data_slice, target_dtype)
+                        elif np.issubdtype(src_dtype, np.integer) and not np.can_cast(src_dtype, target_dtype):
+                            data_slice = np.clip(data_slice, tinfo.min, tinfo.max)
                         final_dtype = target_dtype
                         if self.verbose: print(f"  Casting non-normalized data to target integer {target_dtype_str}.")
 
