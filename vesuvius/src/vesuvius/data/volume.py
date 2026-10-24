@@ -626,6 +626,35 @@ class Volume:
             print(f"Error reading or parsing config file {self.configs}: {e}")
             raise
 
+    def __repr__(self) -> str:
+        what = {"scroll": f"scroll {self.scroll_id}", "segment": f"segment {self.segment_id}"}.get(
+            self.type, self.type)
+        scan = ", ".join(p for p in (f"{self.energy} keV" if getattr(self, "energy", None) else "",
+                                     f"{self.resolution} um" if getattr(self, "resolution", None) else "") if p)
+        try:
+            levels = f"{self._num_levels()} level(s), level 0 {self.shape(0)} {self._level(0).dtype}"
+        except Exception as exc:  # repr must not raise; say what could not be read
+            levels = f"levels unreadable ({type(exc).__name__})"
+        return f"<Volume {what}{', ' + scan if scan else ''}: {levels}; {getattr(self, 'url', None)}>"
+
+    def preview(self, axis: str = "z", at=None, crop: Optional[str] = None, level: Optional[int] = None,
+                max_size: int = 1024, **options):
+        """A slice of the volume as a PIL image, which Jupyter shows inline.
+
+        ``at`` is a voxel index or a fraction such as ``0.3`` (default: the middle), ``crop`` is
+        ``"Z0:Z1,Y0:Y1,X0:X1"`` in full-resolution voxels, and ``options`` takes any other
+        ``vesuvius.preview`` option, for example ``views="zyx"`` or ``mip=True``. Only the
+        chunks drawn are read.
+        """
+        from vesuvius.tools import preview as pv
+
+        source = pv.Source(name=str(self.segment_id or self.scroll_id or self.url),
+                           levels=[self._level(i) for i in range(self._num_levels())])
+        args = pv.options(axis=axis, at=None if at is None else str(at), crop=crop, level=level,
+                          max_size=max_size, **options)
+        images = pv.make_images(args, [source])
+        return images[0] if len(images) == 1 else images
+
     def _num_levels(self) -> int:
         """Number of multiscale levels, memoized.
 
