@@ -3,7 +3,8 @@
 #include "sync/Apply.hpp"
 #include "sync/GeometryTransfer.hpp"
 #include "internal/History.hpp"
-#include <thread>
+#include <fstream>
+#include <mutex>
 
 namespace vc::objects {
 using namespace detail;
@@ -13,6 +14,10 @@ struct Upstream {
     std::string hubReplica;
     SyncCursor cursor;
 };
+
+// Other clients hold the dot-file lock for whole syncs and clone steps, not
+// single statements, and the lock is not fair: waiters need generous patience.
+constexpr int kHubBusyTimeoutMs = 60000;
 
 sqlite3* conn(const Txn& txn) { return ObjectStoreImplAccess::conn(txn); }
 StatementPool& pool(const Txn& txn) { return *activeStatementPools.at(conn(txn)); }
@@ -25,20 +30,36 @@ Upstream upstream(sqlite3* db)
     return {row.text(0), row.text(1), {row.i64(2), row.i64(3)}};
 }
 
-ObjectStore openHub(const ObjectStore& replica, const Txn& txn, const Upstream& up)
+// Hub handles stay open for the life of the process. A new connection rereads
+// the header and schema page by page, a network round trip each; an open one
+// keeps its page cache while the hub's change counter is unchanged.
+struct OpenHub {
+    std::shared_ptr<ObjectStore> store;
+    std::string uuid, replica;
+};
+
+std::shared_ptr<ObjectStore> openHub(const ObjectStore& replica, const Txn& txn, const Upstream& up)
 {
-    OpenOptions options;
-    options.author = replica.author();
-    options.sharedFile = true;
-    // Other clients hold the dot-file lock for whole syncs, not single statements.
-    options.busyTimeoutMs = 60000;
-    auto hub = ObjectStore::open(up.hub, options);
-    {
-        auto check = hub.read();
-        if (hub.uuid(check) != replica.uuid(txn) || hub.replicaUuid(check) != up.hubReplica)
-            throw std::runtime_error("hub: " + up.hub.string() + " is not this replica's hub");
+    static std::mutex mutex;
+    static std::map<std::pair<std::string, std::string>, OpenHub> handles;
+    std::lock_guard lock(mutex);
+    auto& hub = handles[{up.hub.string(), replica.author()}];
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (!hub.store) {
+            OpenOptions options;
+            options.author = replica.author();
+            options.sharedFile = true;
+            options.busyTimeoutMs = kHubBusyTimeoutMs;
+            hub.store = std::make_shared<ObjectStore>(ObjectStore::open(up.hub, options));
+            auto check = hub.store->read();
+            hub.uuid = hub.store->uuid(check);
+            hub.replica = hub.store->replicaUuid(check);
+        }
+        if (hub.uuid == replica.uuid(txn) && hub.replica == up.hubReplica) return hub.store;
+        // A handle opened before the hub file was replaced: open it afresh once.
+        hub = {};
     }
-    return hub;
+    throw std::runtime_error("hub: " + up.hub.string() + " is not this replica's hub");
 }
 
 std::string hash(const Json& record)
@@ -114,7 +135,8 @@ std::vector<HubLease> grantLeases(ObjectStore& replica, const std::vector<std::s
     self = replicaIdentity(conn(local)); up = upstream(conn(local));
     for (const auto& object : objects) known[formatUuid(parseUuid(object))] = knownHubVersion(conn(local), object);
     pending = uuidColumn(conn(local), "SELECT record_uuid FROM hub_pending");
-    auto hub = openHub(replica, local, up);
+    const auto handle = openHub(replica, local, up);
+    auto& hub = *handle;
     std::vector<HubLease> granted;
     {
         auto txn = hub.write();
@@ -155,6 +177,54 @@ std::vector<HubLease> grantLeases(ObjectStore& replica, const std::vector<std::s
 }
 }
 
+namespace {
+// Copy the hub file in large reads, which network mounts serve far faster than
+// SQLite's page-at-a-time backup. Every rollback-journal commit changes the
+// header's change counter, so an unlocked copy is consistent when the counter
+// and size, read under the hub lock before and after, are unchanged. A hub that
+// keeps changing is copied while holding its lock; writers wait meanwhile.
+void copyHubFile(sqlite3* source, const std::filesystem::path& hub, const std::filesystem::path& partial,
+                 const util::ProgressCallback& progress)
+{
+    // A read transaction takes the lock and rolls back any interrupted write.
+    auto lock = [&] {
+        exec(source, "BEGIN;");
+        Statement pin(source, "SELECT count(*) FROM sqlite_master"); (void)pin.row();
+    };
+    auto stamp = [&] {
+        std::array<char, 4> counter{};
+        std::ifstream file(hub, std::ios::binary);
+        file.seekg(24);
+        if (!file.read(counter.data(), counter.size())) throw std::runtime_error("hub: cannot read " + hub.string());
+        return std::pair(counter, std::filesystem::file_size(hub));
+    };
+    auto locked = [&](const auto& work) {
+        lock();
+        try { const auto result = work(); exec(source, "COMMIT;"); return result; }
+        catch (...) { sqlite3_exec(source, "ROLLBACK;", nullptr, nullptr, nullptr); throw; }
+    };
+    std::vector<char> buffer(8 << 20);
+    auto copy = [&](uintmax_t size) {
+        std::ifstream in(hub, std::ios::binary);
+        std::ofstream out(partial, std::ios::binary | std::ios::trunc);
+        uint64_t copied = 0;
+        while (in.read(buffer.data(), std::streamsize(buffer.size())) || in.gcount() > 0) {
+            out.write(buffer.data(), in.gcount());
+            copied += uint64_t(in.gcount());
+            util::reportProgress(progress, "copy hub", copied, size);
+        }
+        if (!in.eof() || !out.flush()) throw std::runtime_error("hub: copying " + hub.string() + " failed");
+        return copied;
+    };
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const auto before = locked(stamp);
+        const auto copied = copy(before.second);
+        if (copied == before.second && locked(stamp) == before) return;
+    }
+    locked([&] { return copy(stamp().second); });
+}
+}
+
 void initHub(const std::filesystem::path& path, const std::string& author)
 {
     OpenOptions options; options.author = author;
@@ -184,28 +254,21 @@ void cloneHub(const std::filesystem::path& hubPath, const std::filesystem::path&
     if (std::filesystem::exists(replicaPath)) throw std::runtime_error("hub: clone refuses existing " + replicaPath.string());
     const auto hub = std::filesystem::absolute(hubPath);
     auto partial = replicaPath; partial += ".partial";
-    std::filesystem::remove(partial);
-    auto shared = options; shared.sharedFile = true;
+    // A leftover journal would be replayed into the new copy.
+    auto removePartial = [&] {
+        std::error_code ignored;
+        for (const auto* suffix : {"", "-journal", "-wal", "-shm"}) std::filesystem::remove(partial.string() + suffix, ignored);
+    };
+    removePartial();
+    auto shared = options; shared.sharedFile = true; shared.busyTimeoutMs = kHubBusyTimeoutMs;
     auto* source = openConnection(hub, SQLITE_OPEN_READONLY, shared, false);
     sqlite3* target = nullptr;
     auto close = [&] { if (target) sqlite3_close(target); sqlite3_close(source); target = nullptr; };
     try {
         if (pragmaInt(source, "application_id") != 0x56434f42 || detectHubRole(source) != HubRole::Hub)
             throw std::runtime_error("hub: not a hosted hub: " + hub.string());
-        target = openConnection(partial, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, options, false);
-        // Each step holds the hub lock briefly; a concurrent hub write restarts the copy.
-        auto* backup = sqlite3_backup_init(target, "main", source, "main");
-        if (!backup) fail(target, "hub: clone");
-        int rc = SQLITE_OK;
-        while ((rc = sqlite3_backup_step(backup, 1024)) == SQLITE_OK || rc == SQLITE_BUSY || rc == SQLITE_LOCKED) {
-            const auto total = sqlite3_backup_pagecount(backup);
-            util::reportProgress(progress, "copy hub", total - sqlite3_backup_remaining(backup), total);
-            if (rc != SQLITE_OK) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-        const auto pages = sqlite3_backup_pagecount(backup);
-        sqlite3_backup_finish(backup);
-        if (rc != SQLITE_DONE) fail(target, "hub: clone");
-        util::reportProgress(progress, "copy hub", pages, pages);
+        copyHubFile(source, hub, partial, progress);
+        target = openConnection(partial, SQLITE_OPEN_READWRITE, options, false);
         exec(target, "PRAGMA journal_mode=WAL;");
         exec(target, "BEGIN IMMEDIATE;");
         try {
@@ -218,8 +281,7 @@ void cloneHub(const std::filesystem::path& hubPath, const std::filesystem::path&
         close();
     } catch (...) {
         close();
-        std::error_code ignored;
-        std::filesystem::remove(partial, ignored);
+        removePartial();
         throw;
     }
     try {
@@ -228,8 +290,7 @@ void cloneHub(const std::filesystem::path& hubPath, const std::filesystem::path&
         replica.forkReplica();
         replica.checkpoint();
     } catch (...) {
-        std::error_code ignored;
-        for (const auto* suffix : {"", "-wal", "-shm"}) std::filesystem::remove(partial.string() + suffix, ignored);
+        removePartial();
         throw;
     }
     std::filesystem::rename(partial, replicaPath);
@@ -256,11 +317,11 @@ HubSyncReport hubPull(ObjectStore& replica)
     DependencyScope dependencyScope;
     HubSyncReport report;
     Upstream up;
-    std::optional<ObjectStore> hub;
+    std::shared_ptr<ObjectStore> hub;
     {
         auto local = replica.read();
         up = upstream(conn(local));
-        hub.emplace(openHub(replica, local, up));
+        hub = openHub(replica, local, up);
     }
     // The hub read lock is held until the replica commits, so the installed
     // state and the advanced cursor describe one hub snapshot.
@@ -337,7 +398,8 @@ HubSyncReport hubPush(ObjectStore& replica)
         for (const auto& [id, change] : changes) put.run(id, hash(change.record));
         mark.commit();
     }
-    auto hub = openHub(replica, local, up);
+    const auto handle = openHub(replica, local, up);
+    auto& hub = *handle;
     std::map<std::string, int64_t> published;
     std::vector<HubLease> created;
     {
@@ -472,7 +534,8 @@ void releaseLeases(ObjectStore& replica, const std::vector<std::string>& objects
         ids.push_back(formatUuid(parseUuid(object)));
         if (pending.contains(ids.back())) throw std::runtime_error("hub: push " + ids.back() + " before releasing its lease");
     }
-    auto hub = openHub(replica, local, up);
+    const auto handle = openHub(replica, local, up);
+    auto& hub = *handle;
     {
         auto txn = hub.write();
         Statement drop(conn(txn), "DELETE FROM hub_leases WHERE object_uuid=? AND holder=?");
@@ -494,8 +557,8 @@ std::optional<HubStatus> hubStatus(ObjectStore& store)
     HubStatus status;
     status.hub = upstream(conn(txn)).hub;
     status.replica = replicaIdentity(conn(txn));
-    Statement count(conn(txn), "SELECT count(*) FROM hub_pending"); count.row();
-    status.pending = count.i64(0);
+    Statement pending(conn(txn), "SELECT record_uuid FROM hub_pending ORDER BY record_uuid");
+    while (pending.row()) status.pending.push_back(pending.text(0));
     status.conflicts = conflicts(store, txn);
     status.leases = readLeases(conn(txn));
     return status;
@@ -507,7 +570,7 @@ HubSyncReport resolveHubConflict(ObjectStore& replica, const std::string& uuid, 
     const auto id = formatUuid(parseUuid(uuid));
     if (keep != "hub" && keep != "local") throw std::invalid_argument("hub: keep must be \"hub\" or \"local\"");
     Upstream up;
-    std::optional<ObjectStore> hub;
+    std::shared_ptr<ObjectStore> hub;
     {
         auto local = replica.read();
         up = upstream(conn(local));
@@ -519,7 +582,7 @@ HubSyncReport resolveHubConflict(ObjectStore& replica, const std::string& uuid, 
             if (!lease.row() && isObjectRecord(syncRecord(replica, local, id)))
                 throw std::runtime_error("hub: lease " + id + " before keeping the local record");
         }
-        hub.emplace(openHub(replica, local, up));
+        hub = openHub(replica, local, up);
     }
     auto hubTxn = hub->read();
     const auto record = syncRecord(*hub, hubTxn, id);

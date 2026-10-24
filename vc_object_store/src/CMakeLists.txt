@@ -31,6 +31,7 @@ add_library(vc_objects STATIC
     sync/Apply.cpp
     hub/HubRules.cpp
     hub/Hub.cpp
+    hub/HubWorker.cpp
     geometry/GeometryViews.cpp
     imports/SourceRelationships.cpp
     geometry/GeometryIngestBatch.cpp

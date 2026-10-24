@@ -11,7 +11,6 @@
 #include "vc/fiber_tracer/FiberDisplay.hpp"
 
 #include "CState.hpp"
-#include "HubSyncController.hpp"
 #include "FiberNameDisplay.hpp"
 #include "FiberSaveBatchTracker.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
@@ -247,6 +246,8 @@ struct LineAnnotationController::LineAnnotationSession {
     std::string fiberUuid = vc::util::newUuid();
     std::optional<vc::objects::PinnedObject> storePin;
     std::optional<vc::objects::PinnedObject> runningStorePin;
+    // A hosted replica keeps the fiber leased while it is open for editing.
+    vc::objects::LeaseHold editingLeases;
     std::string fiberUsername;
     std::string fiberStartedAt;
     uint64_t fiberSequence = 0;
@@ -2549,14 +2550,6 @@ bool LineAnnotationController::enableFiberEditing(uint64_t fiberId)
     return false;
 }
 
-std::set<std::string> LineAnnotationController::editingFiberUuids() const
-{
-    std::set<std::string> result;
-    for (const auto& pane : _panes)
-        if (pane.session && !pane.session->readOnly && !pane.session->fiberUuid.empty()) result.insert(pane.session->fiberUuid);
-    return result;
-}
-
 bool LineAnnotationController::enableSessionEditing(const std::string& surfaceName)
 {
     auto* pane = paneForSurface(surfaceName);
@@ -2574,10 +2567,10 @@ bool LineAnnotationController::enableSessionEditing(const std::string& surfaceNa
     }
     // A hosted replica edits only fibers it leases. Leasing may first pull the
     // hub's newer record, which the revision check below then reports.
-    auto* hub = _state ? _state->hubSync() : nullptr;
-    if (hub && hub->active() && session->storePin && !session->storePin->objectRevision.empty()) {
+    const auto connection = _state ? _state->objectStoreSession() : nullptr;
+    if (connection && session->storePin && !session->storePin->objectRevision.empty()) {
         try {
-            hub->ensureLeases({session->fiberUuid});
+            session->editingLeases = connection->holdLeases(session->storePin->attachment, {session->fiberUuid});
         } catch (const std::exception& error) {
             showError(tr("This fiber cannot be edited now: %1").arg(QString::fromUtf8(error.what())),
                       session->suppressErrorDialogs);
@@ -16863,12 +16856,10 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
     }
     for (const auto& fiber : retired) expect(fiber);
     // A hosted replica leases every stored fiber whose record this action changes.
-    if (auto* hub = _state->hubSync(); hub && hub->active()) {
-        std::vector<std::string> changed;
-        for (const auto& edit : edits) if (expected.at(edit.fiber.uuid)) changed.push_back(edit.fiber.uuid);
-        for (const auto& fiber : retired) if (expected.at(fiber.uuid)) changed.push_back(fiber.uuid);
-        hub->ensureLeases(changed);
-    }
+    std::vector<std::string> changed;
+    for (const auto& edit : edits) if (expected.at(edit.fiber.uuid)) changed.push_back(edit.fiber.uuid);
+    for (const auto& fiber : retired) if (expected.at(fiber.uuid)) changed.push_back(fiber.uuid);
+    const auto leases = connection->holdLeases(*attachment, changed);
     std::map<std::string, EdgeRecord> incident;
     connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
         const auto requested = expected;

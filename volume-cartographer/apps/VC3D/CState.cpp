@@ -1,6 +1,5 @@
 #include "CState.hpp"
 
-#include "HubSyncController.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
 #include "VCSettings.hpp"
 
@@ -195,10 +194,6 @@ CState::CState(QObject* parent, bool debugDownloadQueue, CState* objectStoreOwne
         connect(objectStoreOwner, &CState::objectStoreChanged, this, &CState::objectStoreChanged);
         connect(objectStoreOwner, &CState::objectStoreObservationFailed, this, &CState::objectStoreObservationFailed);
     } else {
-        _hubSync = new HubSyncController(this);
-        connect(this, &CState::objectStoreChanged, _hubSync, [this](const vc::objects::StoreSessionEvent& event) {
-            if (event.kind == vc::objects::StoreSessionEvent::Kind::Committed) _hubSync->localCommitted();
-        });
         auto* journalTimer = new QTimer(this);
         journalTimer->setInterval(250);
         connect(journalTimer, &QTimer::timeout, this, &CState::pollObjectStoreChanges);
@@ -225,13 +220,11 @@ void CState::attachObjectStore(const QString& path, const QString& author, bool 
     options.author = author.toStdString();
     options.readOnly = readOnly;
     _objectStoreSession->attach(path.toStdString(), options);
-    if (auto* hub = hubSync()) hub->attach(path, author, readOnly);
     pollObjectStoreChanges();
 }
 
 void CState::detachObjectStore()
 {
-    if (auto* hub = hubSync()) hub->detach();
     _objectStoreSession->detach();
     pollObjectStoreChanges();
 }

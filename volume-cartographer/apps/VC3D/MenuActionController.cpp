@@ -22,7 +22,6 @@
 #include "Keybinds.hpp"
 #include "FileWatcherService.hpp"
 #include "LineAnnotationController.hpp"
-#include "HubSyncController.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -243,11 +242,13 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     });
     _fileMenu->addAction(QObject::tr("Clone Hosted Object Store..."), this, &MenuActionController::cloneHostedStore);
     auto* syncHub = _fileMenu->addAction(QObject::tr("Sync Hosted Object Store Now"), this, [qWindow]() {
-        if (auto* hub = qWindow->_state->hubSync()) hub->syncNow();
+        qWindow->_state->objectStoreSession()->syncHub();
+        qWindow->promptHubConflicts();
     });
     syncHub->setEnabled(false);
-    connect(qWindow->_state->hubSync(), &HubSyncController::statusChanged, syncHub,
-        [syncHub](const QString& status) { syncHub->setEnabled(!status.isEmpty()); });
+    connect(qWindow->_state, &CState::objectStoreChanged, syncHub, [qWindow, syncHub](const vc::objects::StoreSessionEvent&) {
+        syncHub->setEnabled(qWindow->_state->objectStoreSession()->hubStatus().has_value());
+    });
     auto* detachStore = _fileMenu->addAction(QObject::tr("Detach Object Store"), this, &MenuActionController::detachObjectStore);
     detachStore->setEnabled(qWindow->_state->objectStoreSession()->attachment().has_value());
     connect(qWindow->_state, &CState::objectStoreChanged, detachStore,

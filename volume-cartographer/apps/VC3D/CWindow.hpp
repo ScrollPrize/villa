@@ -176,6 +176,9 @@ public slots:
     void onFocusViewsRequested(uint64_t collectionId, std::optional<vc::PointRef> point);
 
 public:
+    // Status bar and conflict prompt for an attached hosted replica.
+    void updateHubStatus();
+    void promptHubConflicts();
     enum class VolumeOpenError {
         None,
         PackageLoadFailed,
@@ -417,6 +420,7 @@ private:
     QLabel* _sharedCacheStatsLabel{nullptr};
     QLabel* _persistentCacheLowSpaceLabel{nullptr};
     QLabel* _hubStatusLabel{nullptr};
+    std::vector<std::string> _hubPromptedConflicts;
     QLabel* _persistentCacheWarningText{nullptr};
     QFrame* _persistentCacheWarningBanner{nullptr};
     QTimer* _statusMessageTimer{nullptr};

@@ -35,7 +35,7 @@ struct HubSyncReport {
 struct HubStatus {
     std::filesystem::path hub;
     std::string replica;  // this replica's UUID, the lease holder identity
-    int64_t pending = 0;  // records changed here and not yet pushed
+    std::vector<std::string> pending;  // records changed here and not yet pushed
     std::vector<HubConflict> conflicts;
     std::vector<HubLease> leases;  // as of the last hub contact
 };

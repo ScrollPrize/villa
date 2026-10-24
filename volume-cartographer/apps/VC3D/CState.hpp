@@ -16,8 +16,6 @@
 #include "AnnotationFrame.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 
-class HubSyncController;
-
 Q_DECLARE_METATYPE(vc::objects::StoreSessionEvent)
 
 class VolumePkg;
@@ -47,8 +45,6 @@ public:
 
     // One session for all object kinds; controllers share this handle.
     std::shared_ptr<vc::objects::ObjectStoreSession> objectStoreSession() const { return _objectStoreSession; }
-    // Hosted-replica sync for the attached store; shared with workspace states.
-    HubSyncController* hubSync() const { return _objectStoreOwner ? _objectStoreOwner->hubSync() : _hubSync; }
     void attachObjectStore(const QString& path, const QString& author, bool readOnly = false);
     void detachObjectStore();
     void pollObjectStoreChanges();
@@ -143,7 +139,6 @@ private:
 
     CState* _objectStoreOwner = nullptr;
     std::shared_ptr<vc::objects::ObjectStoreSession> _objectStoreSession;
-    HubSyncController* _hubSync = nullptr;
     QString _objectStoreObservationError;
     std::shared_ptr<VolumePkg> _vpkg;
     std::shared_ptr<Volume> _currentVolume;

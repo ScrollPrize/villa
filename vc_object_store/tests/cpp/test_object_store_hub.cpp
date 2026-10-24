@@ -1,9 +1,13 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/objects/Hub.hpp"
+#include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
+#include "vc_object_store/objects/GeometryEdits.hpp"
+#include <map>
 #include <nlohmann/json.hpp>
 #include <sqlite3.h>
 #include <bit>
+#include <cstring>
 #include <iostream>
 #include <thread>
 
@@ -95,7 +99,7 @@ int main() try
 
     // Editing an object on the hub requires its lease.
     mustFail([&] { setNote(alice, a, "1"); });
-    require(hubStatus(alice)->pending == 0, "rejected edit leaves nothing pending");
+    require(hubStatus(alice)->pending.empty(), "rejected edit leaves nothing pending");
     acquireLeases(alice, {a});
     mustFail([&] { acquireLeases(bob, {a}); });
     setNote(alice, a, "1");
@@ -105,10 +109,10 @@ int main() try
         geometry = alice.editGeometry(txn, a, {moveX(2, 25)}, alice.currentGeometry(txn, a)->uuid);
         txn.commit();
     }
-    require(hubStatus(alice)->pending == 1, "edit is pending");
+    require(hubStatus(alice)->pending.size() == 1, "edit is pending");
     auto report = hubSync(alice);
     require(report.pushed == 1 && report.conflicts.empty(), "push");
-    require(hubStatus(alice)->pending == 0, "push clears pending");
+    require(hubStatus(alice)->pending.empty(), "push clears pending");
     report = hubPull(bob);
     require(report.pulled == 1 && report.conflicts.empty(), "pull");
     require(meta(bob, a) == meta(alice, a), "pulled metadata");
@@ -118,7 +122,7 @@ int main() try
         require(bob.readGeometryArray(y, geometry, "control_points") == alice.readGeometryArray(x, geometry, "control_points"),
                 "pulled geometry bytes");
     }
-    require(hubStatus(bob)->pending == 0, "pulled changes are not pending");
+    require(hubStatus(bob)->pending.empty(), "pulled changes are not pending");
     require(hubStatus(bob)->leases.size() == 1 && hubStatus(bob)->leases[0].author == "alice", "lease mirror");
 
     // New objects need no lease. Links are shared records: linking to a hub
@@ -168,7 +172,7 @@ int main() try
     require(hubPush(alice).pushed == 1, "push before simulated crash");
     sql(alicePath, "INSERT INTO hub_pending VALUES('" + a + "',7,0);DELETE FROM hub_versions WHERE record_uuid='" + a + "';");
     report = hubPush(alice);
-    require(report.pushed == 0 && report.conflicts.empty() && hubStatus(alice)->pending == 0, "idempotent retry");
+    require(report.pushed == 0 && report.conflicts.empty() && hubStatus(alice)->pending.empty(), "idempotent retry");
 
     // An expired lease taken over by another replica produces a conflict, not an overwrite.
     releaseLeases(alice, {a});
@@ -184,7 +188,7 @@ int main() try
     require(hubStatus(alice)->conflicts.size() == 1, "conflict recorded");
     mustFail([&] { hubPush(alice); });
     resolveHubConflict(alice, a, "hub");
-    require(meta(alice, a) == meta(bob, a) && hubStatus(alice)->pending == 0, "kept hub record");
+    require(meta(alice, a) == meta(bob, a) && hubStatus(alice)->pending.empty(), "kept hub record");
 
     // Keeping the local record publishes it once the lease is back.
     releaseLeases(bob, {a});
@@ -213,6 +217,129 @@ int main() try
     first.join(); second.join();
     hubSync(alice); hubSync(bob);
     require(meta(alice, a) == meta(bob, a) && meta(alice, b) == meta(bob, b), "replicas converge");
+
+    // Every geometry kind travels through the hub, including tiled patches with
+    // sparse deltas and surface channels, stable-ID annotations and track identity.
+    {
+        using namespace vc::geometry;
+        Patch surface{200, 150, {1, 1}, {}};
+        for (int64_t row = 0; row < surface.rows; ++row)
+            for (int64_t column = 0; column < surface.columns; ++column)
+                surface.points.push_back({float(column + 1), float(row + 1), float(row + column + 1)});
+        const std::map<std::string, std::pair<GeometryData, GeometryData>> geometry{
+            {"fiber", {encode(Fiber{{{1,2,3},{4,5,6}},{{1,2,3},{4,5,6}},{10,20}}),
+                       encode(Fiber{{{4,5,7},{8,9,10},{1,2,3}},{{4,5,7},{1,2,3}},{20,30,10}})}},
+            {"point_collection", {encode(PointCollection{{10,20},{{1,2,3},{4,5,6}}}),
+                                  encode(PointCollection{{20,30,10},{{4,5,7},{8,9,10},{1,2,3}}})}},
+            {"track", {encode(Track{{{1,2,3},{4,5,6}}}), encode(Track{{{1,2,3},{4,5,7},{8,9,10}}})}},
+            {"patch", {encode(surface), encode(surface)}}};
+        std::map<std::string, std::string> objects;
+        {
+            auto txn = bob.write();
+            for (const auto& [kind, data] : geometry) {
+                ObjectRecord record; record.uuid = util::newUuid(); record.kind = kind;
+                if (kind == "track") { record.track.emplace(); record.track->datasetRef = "hub"; record.track->externalKey = "1"; }
+                if (kind == "point_collection") record.meta = R"({"source":{"point_attributes":[{"note":"first"},{"note":"second"}]}})";
+                bob.upsertObject(txn, record);
+                bob.putGeometry(txn, record.uuid, data.first);
+                objects[kind] = record.uuid;
+            }
+            txn.commit();
+        }
+        auto same = [&](const std::string& uuid) {
+            auto x = alice.read(); auto y = bob.read();
+            const auto mine = alice.currentGeometry(x, uuid), theirs = bob.currentGeometry(y, uuid);
+            require(mine && theirs && mine->uuid == theirs->uuid && mine->contentHash == theirs->contentHash, "same geometry head");
+            for (const auto& array : mine->arrays)
+                require(alice.readGeometryArray(x, mine->uuid, array.name) == bob.readGeometryArray(y, theirs->uuid, array.name),
+                        "same array bytes");
+            require(alice.geometryHistory(x, uuid).size() == bob.geometryHistory(y, uuid).size(), "same geometry history");
+            require(nlohmann::json::parse(alice.objectByUuid(x, uuid)->meta) == nlohmann::json::parse(bob.objectByUuid(y, uuid)->meta),
+                    "same metadata");
+        };
+        require(hubSync(bob).pushed == 4, "push every kind");
+        hubPull(alice);
+        for (const auto& [kind, uuid] : objects) same(uuid);
+
+        std::vector<std::string> uuids;
+        for (const auto& [kind, uuid] : objects) uuids.push_back(uuid);
+        mustFail([&] { acquireLeases(alice, uuids); });  // pushing new objects leased them to their creator
+        releaseLeases(bob, uuids);
+        acquireLeases(alice, uuids);
+        {
+            RevisionSelection expected;
+            {
+                auto read = alice.read();
+                for (const auto& uuid : uuids) expected[uuid] = alice.currentObjectRevision(read, uuid)->uuid;
+            }
+            auto txn = alice.write(expected);
+            for (const auto& [kind, uuid] : objects) {
+                auto revision = alice.currentGeometry(txn, uuid)->uuid;
+                if (kind != "patch") { updateGeometryArrays(alice, txn, uuid, geometry.at(kind).second, revision); continue; }
+                std::vector<uint8_t> moved(2 * 2 * 3 * sizeof(float));
+                for (size_t i = 0; i < moved.size() / sizeof(float); ++i) {
+                    const float value = 1000.0f + float(i);
+                    std::memcpy(moved.data() + i * sizeof(float), &value, sizeof(float));
+                }
+                revision = alice.editGeometryRectangle(txn, uuid, "points", 130, 140, 2, 2, moved, revision);
+                GeometryArray mask{"mask", "|u1", {surface.rows, surface.columns},
+                                   std::vector<uint8_t>(size_t(surface.rows * surface.columns), 1)};
+                alice.updateSurfaceChannels(txn, uuid, {mask}, {}, revision);
+            }
+            txn.commit();
+        }
+        require(hubSync(alice).pushed == 4, "push edits of every kind");
+        hubPull(bob);
+        for (const auto& [kind, uuid] : objects) same(uuid);
+        {
+            auto x = alice.read(); auto y = bob.read();
+            const auto uuid = objects.at("point_collection");
+            require(alice.geometryPointAnnotations(x, alice.currentGeometry(x, uuid)->uuid, "points") ==
+                    bob.geometryPointAnnotations(y, bob.currentGeometry(y, uuid)->uuid, "points"), "annotations follow stable IDs");
+            require(bob.currentGeometry(y, objects.at("patch"))->arrays.size() == 2, "surface channel arrived");
+        }
+        mustFail([&] { auto txn = bob.write(); bob.setMeta(txn, objects.at("patch"), "note", "1"); txn.commit(); });
+        releaseLeases(alice, uuids);
+    }
+
+    // A session syncs its attached replica in the background: callers only hold
+    // leases while editing and read the status it reports.
+    {
+        hubSync(alice); hubSync(bob);
+        auto eventually = [](const auto& condition, const char* message) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+            while (!condition()) {
+                require(std::chrono::steady_clock::now() < deadline, message);
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+        };
+        ObjectStoreSession session;
+        HubSessionOptions fast; fast.syncInterval = std::chrono::milliseconds(200); fast.pushDelay = std::chrono::milliseconds(50);
+        const auto attachment = session.attach(alicePath, as("alice"), fast);
+        eventually([&] { return session.hubStatus() && session.hubStatus()->syncedAtUs; }, "session syncs on attach");
+        mustFail([&] { session.act(attachment, {}, [&](auto& store, auto& txn) { store.setMeta(txn, b, "note", "\"unleased\""); }); });
+        releaseLeases(bob, {b});
+        {
+            auto hold = session.holdLeases(attachment, {b});
+            RevisionSelection expected;
+            session.read(attachment, [&](const auto& store, const auto& txn, const auto&) {
+                expected[b] = store.currentObjectRevision(txn, b)->uuid;
+            });
+            session.act(attachment, expected, [&](auto& store, auto& txn) { store.setMeta(txn, b, "note", "\"session\""); });
+            eventually([&] { hubPull(bob); return meta(bob, b) == meta(alice, b); }, "action pushed in the background");
+            mustFail([&] { acquireLeases(bob, {b}); });  // still held by the session
+        }
+        eventually([&] {
+            try { acquireLeases(bob, {b}); return true; } catch (const HubLeaseRefused&) { return false; }
+        }, "lease released once the hold ends");
+        bool hubEvent = false;
+        for (const auto& event : session.takeEvents()) hubEvent |= event.kind == StoreSessionEvent::Kind::Hub;
+        require(hubEvent, "status changes are session events");
+        session.detach();
+        require(!session.hubStatus(), "no hub status without an attachment");
+        releaseLeases(bob, {b});
+        hubSync(alice);
+    }
 
     // Detaching leaves an ordinary store.
     { auto closing = std::move(bob); }

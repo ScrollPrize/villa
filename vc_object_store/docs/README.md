@@ -264,6 +264,20 @@ journal sequence) of each record it installed, and its own unpushed changes.
   relationship dependencies like `synchronize`, and verifies the result.
 - A retry after a push whose outcome was lost recognizes its own records.
 
+**Applications** do not drive sync themselves. When an `ObjectStoreSession`
+attaches a writable hosted replica, it starts a background worker. The worker
+pulls and pushes every `HubSessionOptions::syncInterval`, and pushes shortly
+after each `act()`; pulled changes arrive through `takeEvents()` like any other
+external commit. Before editing, a caller takes
+`holdLeases(attachment, uuids)`. The returned `LeaseHold` keeps the leases
+renewed while it lives. Once no hold remains and the changes are pushed, the
+worker releases the lease. A hold pulls once first if the hub is ahead, and it
+is a no-op for ordinary stores, so callers need not check what they attached.
+`hubStatus()` reports pending records, conflicts, the last error and sync time,
+and a `StoreSessionEvent::Kind::Hub` event announces each change.
+`syncHub()` and `resolveHubConflicts(keep)` act asynchronously. Scripts that
+do not use a session call `hub_sync` and the lease functions directly.
+
 Records changed both locally and on the hub become conflicts, and pushing stops
 until they are resolved. `resolveHubConflict(uuid, "hub")` installs the hub's
 record. `"local"` publishes this replica's record over it and requires the lease.
@@ -271,27 +285,43 @@ Object revision UUIDs are per replica, as with `synchronize`. Geometry revision
 UUIDs and the store UUID are shared.
 
 **Operations.**
-- `clone` copies the hub with SQLite's backup API in steps. Writers can continue
-  meanwhile and simply restart the copy.
+- `clone` copies the hub file in large reads without holding the lock. It then
+  checks, under the lock, that the header's change counter and the file size are
+  unchanged; every commit changes the counter, so the copy is consistent. After
+  three interrupted attempts it falls back to SQLite's backup API in locked steps.
+  That fallback reads one page per request and is slow over a network.
 - A client that dies while holding the hub lock leaves `<hub>.lock` behind, and
   every other client waits on it. Once no client is syncing, run
   `vc_object_hub unlock HUB --force`; the next open rolls back the interrupted
   write from its journal.
 - The share must apply `mkdir` atomically and must not serve stale cached data
-  to SQLite. Mount NFS with `noac`, and sshfs without its caches
-  (`-o cache=no`).
+  to SQLite. Mount NFS with `noac`. Mount sshfs (3.x) with
+  `-o direct_io,dir_cache=no,entry_timeout=0,attr_timeout=0,negative_timeout=0`,
+  so page reads and the existence of `<hub>-journal` always come from the
+  server.
+- A process keeps one connection per hub and author open. SQLite then keeps
+  its page cache between operations while the hub is unchanged, instead of
+  rereading the header and schema over the network each time.
+- Hub operations wait up to 60 s for the lock. The lock is not fair, so heavy
+  contention can still time out an operation; retry it.
 - `detach` turns a replica back into an ordinary store.
 
-On local disk, with a synthetic 20,000-fiber hub (354 MB, RelWithDebInfo,
-Ubuntu arm64, 10 iterations, median ms):
+Measured on 2026-10-23 with RelWithDebInfo on Ubuntu arm64, median of 10
+iterations. "Local disk" uses a synthetic 20,000-fiber hub (354 MB). "Network"
+uses 765 real fibers with 186 links (98 MB) on a remote host, mounted with the
+sshfs options above at about 18 ms round-trip time.
 
-| Operation | Median |
-| --- | ---: |
-| Clone | 400 |
-| Lease acquire | 13 |
-| One-fiber push (metadata + control-point edit) | 19 |
-| Pull of that change on another replica | 10 |
-| Sync with nothing to do | 6 |
+| Operation | Local disk | Network |
+| --- | ---: | ---: |
+| Clone | 0.4 s | 3.8 s |
+| Lease acquire | 13 ms | 460 ms |
+| One-fiber push (metadata + geometry edit) | 19 ms | 520 ms |
+| Pull of that change on another replica | 10 ms | 1,080 ms |
+| Sync with nothing to do | 6 ms | 140 ms |
+
+The first operation of a process also opens the hub, which takes about 2 s over
+the network. A pull after any hub commit rereads the index pages it needs: in
+rollback-journal mode, SQLite drops its page cache whenever the file changes.
 
 ## Volume identity and coordinate scale
 

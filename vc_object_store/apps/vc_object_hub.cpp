@@ -98,7 +98,7 @@ try {
         const auto status = hubStatus(replica);
         if (!status) { std::cout << "not a hosted replica\n"; return 0; }
         std::cout << "hub " << status->hub.string() << "\nreplica " << status->replica << "\n"
-                  << status->pending << " pending, " << status->conflicts.size() << " conflicts\n";
+                  << status->pending.size() << " pending, " << status->conflicts.size() << " conflicts\n";
         for (const auto& conflict : status->conflicts) std::cout << "  conflict " << conflict.uuid << '\n';
         print(status->leases);
     } else if (command == "lease") {

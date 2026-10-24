@@ -409,7 +409,7 @@ def test_scripts_edit_hosted_replicas_under_leases(tmp_path):
         [lease] = script.acquire_leases([fiber])
         assert lease['author'] == 'script'
         script.set_meta(fiber, 'review', 'done')
-        assert script.hub_status()['pending'] == 1
+        assert script.hub_status()['pending'] == [fiber]
         assert script.hub_sync() == {'pulled': 0, 'pushed': 1, 'conflicts': []}
         assert viewer.hub_sync()['pulled'] == 1
         assert viewer.object(fiber)['meta']['review'] == 'done'

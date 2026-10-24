@@ -1,6 +1,7 @@
 #include "CWindow.hpp"
-#include "HubSyncController.hpp"
 #include "VolumeComboTooltip.hpp"
+
+#include <QDateTime>
 #include "FiberLengthDisplay.hpp"
 #include "VolumeDisplayNames.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
@@ -2787,29 +2788,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _hubStatusLabel->setToolTip(tr("Sync state of the attached hosted object store replica"));
     _hubStatusLabel->hide();
     statusBar()->addPermanentWidget(_hubStatusLabel);
-    if (auto* hub = _state->hubSync()) {
-        hub->setEditingObjects([this] {
-            return _lineAnnotationController ? _lineAnnotationController->editingFiberUuids() : std::set<std::string>{};
-        });
-        connect(hub, &HubSyncController::statusChanged, this, [this](const QString& text) {
-            _hubStatusLabel->setText(text);
-            _hubStatusLabel->setVisible(!text.isEmpty());
-        });
-        connect(hub, &HubSyncController::conflictsFound, this, [this, hub](const QStringList& uuids) {
-            QMessageBox box(QMessageBox::Warning, tr("Hosted object store conflict"),
-                tr("%n record(s) changed both here and on the hub:", nullptr, int(uuids.size())) +
-                    QStringLiteral("\n") + uuids.mid(0, 10).join(QStringLiteral("\n")) +
-                    (uuids.size() > 10 ? QStringLiteral("\n...") : QString()) +
-                    tr("\n\nUse the hub's versions (discarding your changes to them), or keep yours and publish them?"),
-                QMessageBox::NoButton, this);
-            auto* useHub = box.addButton(tr("Use Hub Versions"), QMessageBox::DestructiveRole);
-            auto* keepMine = box.addButton(tr("Keep Mine"), QMessageBox::AcceptRole);
-            box.addButton(tr("Later"), QMessageBox::RejectRole);
-            box.exec();
-            if (box.clickedButton() == useHub) hub->resolveConflicts(QStringLiteral("hub"));
-            else if (box.clickedButton() == keepMine) hub->resolveConflicts(QStringLiteral("local"));
-        });
-    }
+    connect(_state, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
+        if (event.kind != vc::objects::StoreSessionEvent::Kind::Committed) updateHubStatus();
+    });
 
     _persistentCacheSpaceTimer = new QTimer(this);
     _persistentCacheSpaceTimer->setInterval(5000);
@@ -11326,4 +11307,56 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, std::optional<vc::Poi
     }
 
     showStatusBarMessage(tr("Focused & aligned view to %1 points").arg(pts.size()), 3000);
+}
+
+void CWindow::updateHubStatus()
+{
+    const auto status = _state->objectStoreSession()->hubStatus();
+    if (!status) {
+        _hubStatusLabel->hide();
+        _hubPromptedConflicts.clear();
+        return;
+    }
+    QString text;
+    if (!status->conflicts.empty()) {
+        text = tr("Hub: %n conflict(s)", nullptr, int(status->conflicts.size()));
+    } else if (!status->error.empty()) {
+        text = tr("Hub: offline (%1)").arg(QString::fromStdString(status->error));
+    } else if (!status->pending.empty()) {
+        text = tr("Hub: %n pending", nullptr, int(status->pending.size()));
+    } else if (status->syncedAtUs) {
+        text = tr("Hub: synced %1").arg(QDateTime::fromMSecsSinceEpoch(*status->syncedAtUs / 1000)
+            .toString(QStringLiteral("HH:mm:ss")));
+    } else {
+        text = tr("Hub: connecting");
+    }
+    _hubStatusLabel->setText(text);
+    _hubStatusLabel->show();
+    // Ask about a set of conflicts once; Sync Now asks again.
+    std::vector<std::string> conflicts;
+    for (const auto& conflict : status->conflicts) conflicts.push_back(conflict.uuid);
+    if (conflicts.empty() || conflicts == _hubPromptedConflicts) return;
+    _hubPromptedConflicts = conflicts;
+    promptHubConflicts();
+}
+
+void CWindow::promptHubConflicts()
+{
+    const auto session = _state->objectStoreSession();
+    const auto status = session->hubStatus();
+    if (!status || status->conflicts.empty()) return;
+    QStringList uuids;
+    for (const auto& conflict : status->conflicts) uuids << QString::fromStdString(conflict.uuid);
+    QMessageBox box(QMessageBox::Warning, tr("Hosted object store conflict"),
+        tr("%n record(s) changed both here and on the hub:", nullptr, int(uuids.size())) +
+            QStringLiteral("\n") + uuids.mid(0, 10).join(QStringLiteral("\n")) +
+            (uuids.size() > 10 ? QStringLiteral("\n...") : QString()) +
+            tr("\n\nUse the hub's versions (discarding your changes to them), or keep yours and publish them?"),
+        QMessageBox::NoButton, this);
+    auto* useHub = box.addButton(tr("Use Hub Versions"), QMessageBox::DestructiveRole);
+    auto* keepMine = box.addButton(tr("Keep Mine"), QMessageBox::AcceptRole);
+    box.addButton(tr("Later"), QMessageBox::RejectRole);
+    box.exec();
+    if (box.clickedButton() == useHub) session->resolveHubConflicts("hub");
+    else if (box.clickedButton() == keepMine) session->resolveHubConflicts("local");
 }
