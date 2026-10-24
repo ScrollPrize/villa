@@ -37,11 +37,18 @@ def _cache_snapshot(cache_dir: Path) -> list[tuple[int, int, Path]]:
     return snapshot
 
 
+# Bytes kept from earlier runs at open. Zarr's CacheStore starts its LRU empty
+# in every process, so the rest of the budget is handed to it as its max_size.
+_CACHE_OPEN_RETAIN_FRACTION = 0.5
+
+
 def _evict_to_watermark(
-    snapshot: list[tuple[int, int, Path]], max_bytes: int
+    snapshot: list[tuple[int, int, Path]],
+    max_bytes: int,
+    fraction: float = _CACHE_OPEN_RETAIN_FRACTION,
 ) -> int:
     total = sum(size for _, size, _ in snapshot)
-    target_bytes = 0.9 * max_bytes
+    target_bytes = fraction * max_bytes
     for _, size, path in snapshot:
         if total <= target_bytes:
             break
@@ -121,10 +128,13 @@ def open_volume_root(
             raise ValueError("cache_max_gb must be nonnegative or None")
         cache_path = disk_cache_subdir(path_text, Path(cache_dir))
         cache_path.mkdir(parents=True, exist_ok=True)
+        lru_bytes = maximum_bytes
         if maximum_bytes is not None:
             snapshot = _cache_snapshot(cache_path)
-            if sum(size for _, size, _ in snapshot) > maximum_bytes:
-                _evict_to_watermark(snapshot, maximum_bytes)
+            retained = sum(size for _, size, _ in snapshot)
+            if retained > _CACHE_OPEN_RETAIN_FRACTION * maximum_bytes:
+                retained = _evict_to_watermark(snapshot, maximum_bytes)
+            lru_bytes = max(maximum_bytes - retained, 0)
         if is_remote:
             remote_options = dict(storage_options)
             remote_options["skip_instance_cache"] = True
@@ -138,7 +148,7 @@ def open_volume_root(
         store = CacheStore(
             store=source_store,
             cache_store=LocalStore(cache_path),
-            max_size=maximum_bytes,
+            max_size=lru_bytes,
         )
         return zarr.open(store=store, mode="r")
 

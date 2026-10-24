@@ -139,35 +139,64 @@ def test_open_sweep_prunes_oldest_recursively_and_leaves_under_budget(
     for timestamp, path in enumerate(over_files, start=1):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(bytes([timestamp]) * 4)
-        os.utime(path, ns=(timestamp, timestamp))
+        os.utime(path, ns=(timestamp * 10**9, timestamp * 10**9))
 
     opened = open_volume_root(
         "over.zarr",
         cache_dir=cache_root,
         cache_max_gb=10 / 1e9,
     )
-    assert opened.max_size == 10
     assert not over_files[0].exists()
-    assert over_files[1].read_bytes() == b"\x02" * 4
+    assert not over_files[1].exists()
     assert over_files[2].read_bytes() == b"\x03" * 4
-    assert sum(size for _, size, _ in volume_io._cache_snapshot(over_path)) == 8
+    assert sum(size for _, size, _ in volume_io._cache_snapshot(over_path)) == 4
+    assert opened.max_size == 10 - 4
 
     under_path = disk_cache_subdir("under.zarr", cache_root)
     under_files = [under_path / "zarr.json", under_path / "c" / "0"]
-    for timestamp, (path, size) in enumerate(zip(under_files, (4, 6)), start=20):
+    for timestamp, (path, size) in enumerate(zip(under_files, (2, 3)), start=20):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"x" * size)
-        os.utime(path, ns=(timestamp, timestamp))
+        os.utime(path, ns=(timestamp * 10**9, timestamp * 10**9))
     before = [(path.read_bytes(), path.stat().st_mtime_ns) for path in under_files]
 
-    open_volume_root(
+    opened = open_volume_root(
         "under.zarr",
         cache_dir=cache_root,
         cache_max_gb=10 / 1e9,
     )
+    assert opened.max_size == 10 - 5
 
     after = [(path.read_bytes(), path.stat().st_mtime_ns) for path in under_files]
     assert after == before
+
+
+@pytest.mark.skipif(not _ZARR_V3, reason="volume disk cache requires Zarr 3")
+def test_cache_directory_stays_within_budget_across_reopens(tmp_path):
+    source_path = tmp_path / "source.zarr"
+    cache_dir = tmp_path / "cache"
+    values = np.random.default_rng(0).integers(0, 256, (32, 32, 32), dtype=np.uint8)
+    root = zarr.open_group(source_path, mode="w")
+    root.create_array("0", data=values, chunks=(8, 8, 8))
+    budget = 12_000
+
+    def on_disk_bytes() -> int:
+        return sum(
+            size
+            for _, size, _ in volume_io._cache_snapshot(cache_dir)
+        )
+
+    # Each open stands in for a new process: its LRU starts empty.
+    for _ in range(4):
+        volume = open_volume(
+            source_path, 0, cache_dir=cache_dir, cache_max_gb=budget / 1e9
+        )
+        for z in range(0, 32, 8):
+            np.testing.assert_array_equal(
+                np.asarray(volume[z : z + 8]), values[z : z + 8]
+            )
+            assert on_disk_bytes() <= budget
+        assert on_disk_bytes() > budget // 2
 
 
 @pytest.mark.skipif(not _ZARR_V3, reason="volume disk cache requires Zarr 3")
