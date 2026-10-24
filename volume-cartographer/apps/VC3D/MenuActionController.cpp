@@ -230,18 +230,20 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addSeparator();
     _fileMenu->addAction(_attachVolumeAct);
     _fileMenu->addAction(_attachSegmentsAct);
-    _fileMenu->addAction(QObject::tr("Attach Object Store..."), this, &MenuActionController::attachObjectStore);
-    _fileMenu->addAction(QObject::tr("Attach Read-only Object Store..."), this, [qWindow]() {
-        const auto path = QFileDialog::getOpenFileName(qWindow, QObject::tr("Attach Read-only Object Store"),
+    _objectStoreMenu = new QMenu(QObject::tr("Object &Store"), _fileMenu);
+    _fileMenu->addMenu(_objectStoreMenu);
+    _objectStoreMenu->addAction(QObject::tr("Attach Object Store..."), this, &MenuActionController::attachObjectStore);
+    _objectStoreMenu->addAction(QObject::tr("Attach Read-only Object Store..."), this, [this]() {
+        const auto path = QFileDialog::getOpenFileName(_window, QObject::tr("Attach Read-only Object Store"),
             {}, QObject::tr("Object store (*.vcobj);;All files (*)"));
-        if (path.isEmpty()) return;
-        try { qWindow->_state->attachObjectStore(path, {}, true); }
-        catch (const std::exception& error) {
-            QMessageBox::critical(qWindow, QObject::tr("Cannot attach object store"), QString::fromUtf8(error.what()));
-        }
+        if (!path.isEmpty()) attachObjectStoreAt(path, {}, true);
     });
-    _fileMenu->addAction(QObject::tr("Clone Hosted Object Store..."), this, &MenuActionController::cloneHostedStore);
-    auto* syncHub = _fileMenu->addAction(QObject::tr("Sync Hosted Object Store Now"), this, [qWindow]() {
+    _objectStoreMenu->addAction(QObject::tr("Clone Hosted Object Store..."), this, &MenuActionController::cloneHostedStore);
+    _recentObjectStoreMenu = new QMenu(QObject::tr("Open &Recent Object Store"), _objectStoreMenu);
+    _objectStoreMenu->addMenu(_recentObjectStoreMenu);
+    refreshRecentObjectStoreMenu();
+    _objectStoreMenu->addSeparator();
+    auto* syncHub = _objectStoreMenu->addAction(QObject::tr("Sync Hosted Object Store Now"), this, [qWindow]() {
         qWindow->_state->objectStoreSession()->syncHub();
         qWindow->promptHubConflicts();
     });
@@ -249,7 +251,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     connect(qWindow->_state, &CState::objectStoreChanged, syncHub, [qWindow, syncHub](const vc::objects::StoreSessionEvent&) {
         syncHub->setEnabled(qWindow->_state->objectStoreSession()->hubStatus().has_value());
     });
-    auto* detachStore = _fileMenu->addAction(QObject::tr("Detach Object Store"), this, &MenuActionController::detachObjectStore);
+    auto* detachStore = _objectStoreMenu->addAction(QObject::tr("Detach Object Store"), this, &MenuActionController::detachObjectStore);
     detachStore->setEnabled(qWindow->_state->objectStoreSession()->attachment().has_value());
     connect(qWindow->_state, &CState::objectStoreChanged, detachStore,
         [qWindow, detachStore](const vc::objects::StoreSessionEvent&) {
@@ -2357,12 +2359,104 @@ void MenuActionController::attachObjectStore()
     if (path.isEmpty()) return;
     const auto author = objectStoreAuthor();
     if (author.isEmpty()) return;
+    attachObjectStoreAt(path, author, false);
+}
+
+void MenuActionController::attachObjectStoreAt(const QString& path, const QString& author, bool readOnly)
+{
     try {
-        _window->_state->attachObjectStore(path, author);
+        _window->_state->attachObjectStore(path, author, readOnly);
     } catch (const std::exception& error) {
         QMessageBox::critical(_window, QObject::tr("Cannot attach object store"),
             QString::fromUtf8(error.what()));
+        return;
     }
+    // Only writable attachments reveal a hosted replica; a read-only reopen keeps the earlier tag.
+    const QString absolute = QFileInfo(path).absoluteFilePath();
+    auto stores = loadRecentObjectStores();
+    bool remote = _window->_state->objectStoreSession()->hubStatus().has_value();
+    for (auto it = stores.begin(); it != stores.end();) {
+        if (it->path != absolute) { ++it; continue; }
+        if (readOnly) remote = remote || it->remote;
+        it = stores.erase(it);
+    }
+    stores.insert(stores.begin(), {absolute, readOnly, remote});
+    if (stores.size() > kMaxRecentObjectStores) stores.resize(kMaxRecentObjectStores);
+    saveRecentObjectStores(stores);
+    refreshRecentObjectStoreMenu();
+}
+
+std::vector<MenuActionController::RecentObjectStore> MenuActionController::loadRecentObjectStores() const
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    std::vector<RecentObjectStore> stores;
+    const int count = settings.beginReadArray(vc3d::settings::object_store::RECENT);
+    for (int i = 0; i < count; ++i) {
+        settings.setArrayIndex(i);
+        RecentObjectStore store{settings.value("path").toString(), settings.value("read_only").toBool(),
+                                settings.value("remote").toBool()};
+        if (!store.path.isEmpty()) stores.push_back(std::move(store));
+    }
+    settings.endArray();
+    return stores;
+}
+
+void MenuActionController::saveRecentObjectStores(const std::vector<RecentObjectStore>& stores)
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.remove(vc3d::settings::object_store::RECENT);
+    settings.beginWriteArray(vc3d::settings::object_store::RECENT, int(stores.size()));
+    for (int i = 0; i < int(stores.size()); ++i) {
+        settings.setArrayIndex(i);
+        settings.setValue("path", stores[i].path);
+        settings.setValue("read_only", stores[i].readOnly);
+        settings.setValue("remote", stores[i].remote);
+    }
+    settings.endArray();
+}
+
+void MenuActionController::refreshRecentObjectStoreMenu()
+{
+    if (!_recentObjectStoreMenu) return;
+    _recentObjectStoreMenu->clear();
+    const auto stores = loadRecentObjectStores();
+    for (size_t i = 0; i < stores.size(); ++i) {
+        const auto& store = stores[i];
+        QStringList tags;
+        if (store.remote) tags << QObject::tr("remote");
+        if (store.readOnly) tags << QObject::tr("read-only");
+        QString name = QFileInfo(store.path).fileName();
+        name.replace("&", "&&");
+        QString dir = QFileInfo(store.path).absolutePath();
+        dir.replace("&", "&&");
+        auto text = QObject::tr("&%1 | %2").arg(i + 1).arg(name);
+        if (!tags.isEmpty()) text += QStringLiteral(" (%1)").arg(tags.join(QStringLiteral(", ")));
+        text += QStringLiteral(" - %1").arg(dir);
+        auto* action = _recentObjectStoreMenu->addAction(text, this, [this, store]() { openRecentObjectStore(store); });
+        action->setToolTip(store.path);
+    }
+    _recentObjectStoreMenu->setEnabled(!stores.empty());
+}
+
+void MenuActionController::openRecentObjectStore(const RecentObjectStore& store)
+{
+    if (!QFileInfo::exists(store.path)) {
+        const auto reply = QMessageBox::question(_window, QObject::tr("Object store not found"),
+            QObject::tr("%1 no longer exists. Remove it from the recent list?").arg(store.path));
+        if (reply == QMessageBox::Yes) {
+            auto stores = loadRecentObjectStores();
+            std::erase_if(stores, [&](const RecentObjectStore& entry) { return entry.path == store.path; });
+            saveRecentObjectStores(stores);
+            refreshRecentObjectStoreMenu();
+        }
+        return;
+    }
+    QString author;
+    if (!store.readOnly) {
+        author = objectStoreAuthor();
+        if (author.isEmpty()) return;
+    }
+    attachObjectStoreAt(store.path, author, store.readOnly);
 }
 
 void MenuActionController::cloneHostedStore()
@@ -2399,11 +2493,7 @@ void MenuActionController::cloneHostedStore()
             QMessageBox::critical(_window, QObject::tr("Cannot clone hosted object store"), error);
             return;
         }
-        try {
-            _window->_state->attachObjectStore(replica, author);
-        } catch (const std::exception& failure) {
-            QMessageBox::critical(_window, QObject::tr("Cannot attach object store"), QString::fromUtf8(failure.what()));
-        }
+        attachObjectStoreAt(replica, author, false);
     });
     watcher->setFuture(QtConcurrent::run([hub, replica, author, progress]() {
         try {

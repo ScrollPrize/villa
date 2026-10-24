@@ -2,16 +2,18 @@
 
 VC3D uses one writable `.vcobj` for fiber geometry, annotations, stable control
 point identities, revisions, and shared branch relationships. Choose **File →
-Attach Object Store**, or launch `VC3D --object-store /data/fibers.vcobj`.
+Object Store → Attach Object Store**, or launch `VC3D --object-store /data/fibers.vcobj`.
+Stores attached from that menu are listed under **File → Object Store → Open Recent
+Object Store**; replicas of hosted stores are tagged *(remote)*.
 Attachment lasts for the session. A failed replacement leaves the current store
 attached. Detaching or replacing it cancels old background reads and closes the
 fiber panes after accepted writes finish.
 
 To share fibers with other people, keep the store as a hosted hub on a network
-share. Choose **File → Clone Hosted Object Store...** to copy the hub into a local
-replica and attach it. VC3D then syncs the replica in the background: every 15 s,
-and shortly after each local edit. The status bar shows the sync state. **File →
-Sync Hosted Object Store Now** syncs immediately.
+share. Choose **File → Object Store → Clone Hosted Object Store...** to copy the
+hub into a local replica and attach it. VC3D then syncs the replica in the background: every 15 s,
+and shortly after each local edit. The status bar shows the sync state. **File → Object
+Store → Sync Hosted Object Store Now** syncs immediately.
 
 Enabling editing of a fiber, and any edit, tag or retire action, first leases
 that fiber from the hub. If someone else holds the lease, VC3D reports who and

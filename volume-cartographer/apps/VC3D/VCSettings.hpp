@@ -74,6 +74,14 @@ namespace project {
 }
 
 // -----------------------------------------------------------------------------
+// Object Store Settings
+// -----------------------------------------------------------------------------
+namespace object_store {
+    // Settings array, most recent first; entries hold path, read_only, remote.
+    constexpr auto RECENT = "object_store/recent";
+}
+
+// -----------------------------------------------------------------------------
 // Viewer Settings
 // -----------------------------------------------------------------------------
 namespace viewer {

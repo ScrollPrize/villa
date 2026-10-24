@@ -2,7 +2,7 @@
 
 ## Storage and coordinates
 
-Attach an existing `.vcobj` database with **File → Attach Object Store**.
+Attach an existing `.vcobj` database with **File → Object Store → Attach Object Store**.
 **Attach Read-only Object Store** supports browsing without permitting writes.
 VC3D edits geometry, annotations, relationships and retirement directly through
 the database APIs in one `ObjectStoreSession::act` transaction. Splits create two

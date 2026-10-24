@@ -8,7 +8,7 @@ and Select all/Select none also work. Set the project name and destination
 the currently open project cannot be overwritten through this action.
 
 Fibers live in an explicitly attached object store (`.vcobj`). Project creation
-does not create a fiber directory. Use File → Attach Object Store, then the
+does not create a fiber directory. Use File → Object Store → Attach Object Store, then the
 explicit fiber import command for current-format transfer JSON.
 
 An empty selection creates an empty project. Open Sample still uses the existing
