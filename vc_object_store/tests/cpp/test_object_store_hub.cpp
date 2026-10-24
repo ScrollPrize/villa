@@ -317,6 +317,8 @@ int main() try
         HubSessionOptions fast; fast.syncInterval = std::chrono::milliseconds(200); fast.pushDelay = std::chrono::milliseconds(50);
         const auto attachment = session.attach(alicePath, as("alice"), fast);
         eventually([&] { return session.hubStatus(attachment) && session.hubStatus(attachment)->syncedAtUs; }, "session syncs on attach");
+        require(session.artifactDirectory(attachment, b) == std::filesystem::path(hubPath.string() + ".artifacts") / b,
+                "replicas share the artifact directory beside the hub");
         mustFail([&] { session.act(attachment, {}, [&](auto& store, auto& txn) { store.setMeta(txn, b, "note", "\"unleased\""); }); });
         releaseLeases(bob, {b});
         {

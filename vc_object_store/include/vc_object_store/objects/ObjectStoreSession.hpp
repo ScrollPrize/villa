@@ -115,6 +115,11 @@ public:
     // Copy an object's current record and geometry from one attachment into
     // another as a new object (objects/ObjectCopy.hpp); returns its UUID.
     std::string copyObject(const AttachmentIdentity& from, const AttachmentIdentity& to, const std::string& objectUuid);
+    // Files that belong to an object but are not geometry (fitted models, mesh
+    // exports): <store>.artifacts/<object uuid>/, created on demand. A hosted
+    // replica uses the directory beside its hub so every replica and service
+    // shares it; a hub addressed by sftp:// URL has no shared directory.
+    std::filesystem::path artifactDirectory(const AttachmentIdentity&, const std::string& objectUuid);
     // Drain accepted writes on every attachment. No delayed persistence or new geometry publication.
     void finalize();
     // Poll from the application's event loop. Includes external commits and
