@@ -129,8 +129,8 @@ def resample_points(seg_dir: Path, factor: float) -> tuple[int, int]:
         | ~np.isfinite(pts[..., 2])
         | (pts[..., 0] == -1.0)
         | (pts[..., 2] <= 0)
-    ).astype(np.uint8) * 255
-    scaled_invalid = cv2.resize(invalid, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+    ).astype(np.float32)
+    scaled_invalid = (cv2.resize(invalid, (new_w, new_h), interpolation=cv2.INTER_LINEAR) > 0).astype(np.uint8)
     kernel = np.ones((3, 3), dtype=np.uint8)
     scaled_invalid = cv2.dilate(scaled_invalid, kernel, iterations=1)
     resampled[scaled_invalid > 0] = (-1.0, -1.0, -1.0)
