@@ -86,7 +86,7 @@ pan and zoom. Their footprints match the visible CT areas. A hidden CT view
 has no usable viewport, so its optional plane shows a 1,024-voxel square around
 the shared focus instead. The grayscale window follows the existing CT window
 controls. CT slices and a selected fibre's CT ribbon can be displayed together.
-These are individual inspection slices, with no slab projection or MIP.
+With **Volumetric** off these are individual inspection slices, with no slab projection or MIP.
 
 Sampling runs on a cancellable worker. A preview (at most 256 texels per edge)
 is followed by detail (at most 1,024 per edge), using the available CT pyramid
@@ -96,6 +96,38 @@ three final gray/validity textures occupy at most 6 MiB. Orbit, opacity and
 contrast only redraw cached textures. Switching planes off and back on reuses
 unchanged samples; changed positions discard stale images. A small BSP splits
 intersecting planes so their transparency is ordered correctly during orbit.
+
+**Volumetric**, beside the plane checkboxes, mirrors the mode in **Composite
+View**. Enabling it from either control renders the checked 3D planes as CT
+slabs with real thickness. The 3D XY/XZ/YZ checkboxes determine which slabs are
+visible; the separate Plane View checkboxes in Composite View still control the
+2D viewers. **Layers Front / Behind**, **Reverse**, the alpha intensity range,
+**Material**, **Gamma** and high-pass cutoff are read from the linked views.
+The existing 3D opacity slider fades the complete rendered CT. The 3D camera
+controls the viewing angle, while each 2D viewer retains its own camera.
+
+The worker extracts bounded 3D textures (at most 512 samples per axis and
+32 MiB per slab). A lower-resolution preview precedes detail. The status shows
+the physical layer range and sampled grid size; large footprints/ranges use a
+coarser display grid without changing their world-space extent. There is no
+additional CT disk cache. GPU uploads are limited to 4 MiB per frame. Camera,
+window/level and material changes reuse resident textures. GPU ray marching
+uses the existing VC3D unit-voxel opacity transfer function, with optical-length
+correction so changing the integration step does not change homogeneous-volume
+opacity. Up to 512 steps per intersected slab bound the display work. The same
+CT in overlapping slabs is integrated once, choosing the finer sampled grid.
+Resolved scene depth stops the ray at foreground fibre/ribbon geometry. This
+is a world-space volume render, not a composited image pasted onto a plane.
+
+Volumetric validation is split between `fiber_3d_slices` (known intensity
+field, physical front/behind bounds, reverse direction, preview and cancellation)
+and `fiber_3d_volume` (the real OpenGL renderer, constant-field extinction,
+overlap counted once, step-size invariance, bounds, and foreground-depth
+occlusion, including an MSAA framebuffer). The latter skips explicitly when
+OpenGL 3.3 cannot be created. A separate run of the actual GLSL on an RTX 3090
+passed these optical checks. Mac compilation passed; the native runtime checks
+and relaunch are pending while the Mac SSH connection is unavailable. Local
+QA scripts are in `exports/VC3D_FIBERS3D_QA/volume-20261024`.
 
 Slice validation: `fiber_3d_slices`, `fiber_3d_ribbon`, `fiber_3d_geometry`,
 `fiber_3d_data` and `test_fiber_collection` passed on the M2 Max Mac. Tests cover

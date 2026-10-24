@@ -2,6 +2,7 @@
 
 #include "Fiber3DScene.hpp"
 #include "Fiber3DSlices.hpp"
+#include "vc/core/util/Compositing.hpp"
 #include <QOpenGLFunctions_3_3_Core>
 #include <QOpenGLWidget>
 #include <memory>
@@ -32,6 +33,7 @@ public:
     void setCTSlices(slices::Images);
     const slices::Images& ctSlices() const;
     void setCTSliceOpacity(float opacity);
+    void setCTSliceTransfer(const std::array<CompositeParams, 3>&);
     void fitAll();
     void fitSelected();
     void focusPoint(Point point);

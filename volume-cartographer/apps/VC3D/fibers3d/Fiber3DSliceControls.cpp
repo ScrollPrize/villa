@@ -12,6 +12,7 @@
 #include <QFutureWatcher>
 #include <QLabel>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSlider>
 #include <QSpinBox>
 #include <QTimer>
@@ -36,6 +37,7 @@ struct Fiber3DSliceControls::Impl {
     Fiber3DCanvas* canvas;
     QToolButton* button;
     std::array<QCheckBox*, 3> axes{};
+    QCheckBox* volumetric;
     QLabel* status;
     QTimer poll, debounce;
     QFutureWatcher<Result> watcher;
@@ -65,6 +67,14 @@ struct Fiber3DSliceControls::Impl {
                 refresh();
             });
         }
+        volumetric = new QCheckBox(q->tr("Volumetric"), q);
+        volumetric->setObjectName(QStringLiteral("fibers3DSliceVolumetric"));
+        volumetric->setToolTip(q->tr("Use Volumetric mode from Composite View. Layer thickness and material settings are shared; the 3D camera controls the viewing angle."));
+        row->addWidget(volumetric);
+        QObject::connect(volumetric, &QCheckBox::toggled, q, [this](bool on) {
+            emit viewers->volumetricModeRequested(on);
+            refresh();
+        });
         row->addSpacing(8);
         auto* label = new QLabel(q->tr("Opacity"), q);
         row->addWidget(label);
@@ -144,9 +154,19 @@ struct Fiber3DSliceControls::Impl {
             if (view && view->isVisible() && view->viewport()->width() > 1 && view->viewport()->height() > 1) {
                 const auto size = view->viewport()->size();
                 const auto offset = plane->normal({}, {}) * linked->normalOffset();
-                a = linked->sceneToVolume(view->mapToScene(QPoint(0, 0))) + offset;
-                b = linked->sceneToVolume(view->mapToScene(QPoint(size.width() - 1, 0))) + offset;
-                d = linked->sceneToVolume(view->mapToScene(QPoint(0, size.height() - 1))) + offset;
+                // Perspective maps the viewport to a trapezoid. Bound all
+                // four corners in the physical plane basis, not three corners
+                // pretending to be a parallelogram.
+                const auto x = plane->basisX(), y = plane->basisY(), origin = plane->origin();
+                float x0 = INFINITY, x1 = -INFINITY, y0 = INFINITY, y1 = -INFINITY;
+                for (const auto& pixel : {QPoint(0,0), QPoint(size.width()-1,0), QPoint(0,size.height()-1), QPoint(size.width()-1,size.height()-1)}) {
+                    const auto p = linked->sceneToVolume(view->mapToScene(pixel)) - origin;
+                    x0 = std::min(x0, p.dot(x)); x1 = std::max(x1, p.dot(x));
+                    y0 = std::min(y0, p.dot(y)); y1 = std::max(y1, p.dot(y));
+                }
+                a = origin + x*x0 + y*y0 + offset;
+                b = origin + x*x1 + y*y0 + offset;
+                d = origin + x*x0 + y*y1 + offset;
             } else {
                 // A hidden CT pane has no useful viewport; keep its actual
                 // plane and show a bounded patch around the shared focus.
@@ -167,6 +187,12 @@ struct Fiber3DSliceControls::Impl {
             planes.push_back({i, point(a), point(b - a), point(d - a),
                               std::clamp(int(std::ceil(w / step)) + 1, 2, 1024),
                               std::clamp(int(std::ceil(h / step)) + 1, 2, 1024)});
+            if (volumetric->isChecked()) {
+                auto& p = planes.back(); const auto cs = linked ? linked->compositeRenderSettings() : CompositeRenderSettings{};
+                p.volumetric = true;
+                p.normal = point(plane->normal({}, {}) * (cs.planeReverseDirection ? -1.f : 1.f));
+                p.front = std::max(0, cs.planeLayersFront); p.behind = std::max(0, cs.planeLayersBehind);
+            }
         }
         return planes;
     }
@@ -185,7 +211,12 @@ struct Fiber3DSliceControls::Impl {
         if (images.empty()) status->setText(q->tr("Choose a CT plane."));
         else if (std::any_of(images.begin(), images.end(), [](const auto& image) { return image->preview; }))
             status->setText(q->tr("Refining CT slices…"));
-        else status->setText(q->tr("Linked to CT views · single slices"));
+        else if (volumetric->isChecked()) {
+            const auto& p = images.front()->plane;
+            const auto& slab = *images.front()->slab;
+            status->setText(q->tr("Volumetric · %1 front / %2 behind · %3 × %4 × %5 samples · settings in Composite View")
+                            .arg(p.front).arg(p.behind).arg(slab.width).arg(slab.height).arg(slab.depth));
+        } else status->setText(q->tr("Linked to CT views · single slices"));
     }
     void refresh()
     {
@@ -193,6 +224,15 @@ struct Fiber3DSliceControls::Impl {
         const auto current = state->currentVolume();
         if (current != volume) { cache.clear(); requested.clear(); volume = current; }
         if (!volume) { q->cancel(); status->setText(q->tr("Open a CT volume.")); return; }
+        std::array<CompositeParams, 3> transfer;
+        bool volumeMode = false;
+        for (auto* linked : viewers->baseViewers())
+            for (int i = 0; i < 3; ++i) if (linked->surfName() == names[i]) {
+                transfer[i] = linked->compositeRenderSettings().params;
+                volumeMode = volumeMode || transfer[i].method == "volumetric";
+            }
+        { const QSignalBlocker blocker(volumetric); volumetric->setChecked(volumeMode); }
+        canvas->setCTSliceTransfer(transfer);
         const auto planes = snapshot();
         if (planes == requested) return;
         if (cancelled) cancelled->store(true);

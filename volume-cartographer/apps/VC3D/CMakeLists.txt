@@ -39,6 +39,8 @@ set(srcs
     fibers3d/Fiber3DCT.cpp
     fibers3d/Fiber3DSlices.hpp
     fibers3d/Fiber3DSlices.cpp
+    fibers3d/Fiber3DVolumeRenderer.hpp
+    fibers3d/Fiber3DVolumeRenderer.cpp
     fibers3d/Fiber3DSliceControls.hpp
     fibers3d/Fiber3DSliceControls.cpp
     LineAnnotationPolylineIndices.hpp

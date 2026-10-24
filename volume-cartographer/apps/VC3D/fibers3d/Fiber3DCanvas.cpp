@@ -3,6 +3,7 @@
 #include "Fiber3DRenderGeometry.hpp"
 #include "Fiber3DRibbon.hpp"
 #include "Fiber3DSlices.hpp"
+#include "Fiber3DVolumeRenderer.hpp"
 #include <unordered_map>
 #include <QFutureWatcher>
 #include <QTimer>
@@ -148,6 +149,8 @@ void main() {
 struct Fiber3DCanvas::Impl {
     struct RibbonTile { GLuint texture = 0, buffer = 0; GLsizei vertices = 0; };
     slices::Images slices;
+    std::unique_ptr<Fiber3DVolumeRenderer> volumeRenderer;
+    std::array<CompositeParams, 3> sliceTransfer;
     std::unique_ptr<slices::Tree> sliceTree;
     std::vector<GLuint> sliceTextures;
     std::unordered_map<const slices::Polygon*, std::pair<GLint, GLsizei>> sliceRanges;
@@ -212,7 +215,7 @@ struct Fiber3DCanvas::Impl {
         const double eye = scale / std::tan(0.39269908169872415481);
         double extent = radius + distance(target, origin);
         for (const auto& image : slices) {
-            for (const auto& p : {image->tile.left.front(), image->tile.left.back(), image->tile.right.front(), image->tile.right.back()})
+            for (const auto& p : slices::corners(*image))
                 extent = std::max(extent, distance(target, p));
         }
         const double farPlane = eye + 2.0 * extent + scale;
@@ -300,6 +303,7 @@ void Fiber3DCanvas::cleanupGL()
     if (!context() || !d->glReady)
         return;
     makeCurrent();
+    d->volumeRenderer.reset();
     d->ribbonProgram.reset();
     for (auto& tile : d->ribbonTiles) {
         glDeleteTextures(1, &tile.texture); glDeleteBuffers(1, &tile.buffer);
@@ -418,17 +422,33 @@ void Fiber3DCanvas::setCTSliceOpacity(float opacity)
     update();
 }
 
+void Fiber3DCanvas::setCTSliceTransfer(const std::array<CompositeParams, 3>& params)
+{
+    if (d->sliceTransfer == params) return;
+    d->sliceTransfer = params; update();
+}
 void Fiber3DCanvas::drawCTSlices()
 {
+    const bool volumetric = !d->slices.empty() && bool(d->slices.front()->slab);
+
     if (d->slicesDirty) {
         glDeleteTextures(GLsizei(d->sliceTextures.size()), d->sliceTextures.data());
         d->sliceTextures.clear();
         if (d->sliceBuffer) glDeleteBuffers(1, &d->sliceBuffer);
         d->sliceBuffer = 0;
         d->sliceRanges.clear();
-        d->sliceTree = slices::partition(d->slices);
+        d->sliceTree = volumetric ? nullptr : slices::partition(d->slices);
         d->slicesDirty = false;
     }
+    if (volumetric && !d->volumeRenderer) d->volumeRenderer = std::make_unique<Fiber3DVolumeRenderer>();
+    if (d->volumeRenderer) {
+        const auto ratio = devicePixelRatioF();
+        if (d->volumeRenderer->draw(volumetric ? d->slices : slices::Images{}, d->sliceTransfer,
+                                   d->matrix(width(), height()), d->origin, defaultFramebufferObject(),
+                                   int(width()*ratio), int(height()*ratio), d->windowLow, d->windowHigh,
+                                   d->sliceOpacity, d->interactive)) update();
+    }
+    if (volumetric) return;
     if (d->slices.empty() || !d->ribbonProgram || !d->ribbonProgram->isLinked() || !d->ribbonError.isEmpty()) return;
     glActiveTexture(GL_TEXTURE0);
     glBindVertexArray(d->ribbonVao);
@@ -703,7 +723,7 @@ void Fiber3DCanvas::fit(bool selectedOnly)
         if (selectedOnly || d->slices.empty()) return;
         bounds = emptyBounds();
         for (const auto& image : d->slices)
-            for (const auto& p : {image->tile.left.front(), image->tile.left.back(), image->tile.right.front(), image->tile.right.back()})
+            for (const auto& p : slices::corners(*image))
                 expand(bounds, p);
     } else if (selectedOnly) {
         if (d->selectedIndex < 0) return;
@@ -933,6 +953,8 @@ void Fiber3DCanvas::paintGL()
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
     painter.setPen(QColor(210, 215, 222));
+    if (d->volumeRenderer && !d->slices.empty() && d->slices.front()->slab && !d->volumeRenderer->error().isEmpty())
+        painter.drawText(rect().adjusted(12, 40, -12, -12), Qt::AlignTop | Qt::TextWordWrap, d->volumeRenderer->error());
     if ((d->ribbon || !d->slices.empty()) && !d->ribbonError.isEmpty())
         painter.drawText(rect().adjusted(12, 12, -12, -12), Qt::AlignTop | Qt::TextWordWrap, d->ribbonError);
     if (!d->error.isEmpty()) {

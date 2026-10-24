@@ -59,6 +59,43 @@ private slots:
         edge.down = edge.right;
         QVERIFY_THROWS_EXCEPTION(std::invalid_argument, slices::sample(edge, *volume));
     }
+    void volumetricSamplesKeepThicknessAndReverseDirection()
+    {
+        QTemporaryDir directory;
+        Volume::ZarrCreateOptions options;
+        options.shapeZYX = {32,32,32}; options.chunkShapeZYX = {16,16,16}; options.compressor = "none";
+        auto volume = Volume::New(directory.path().toStdString(), options);
+        Array3D<uint8_t> data({32,32,32});
+        for (int z=0; z<32; ++z) for (int y=0; y<32; ++y) for (int x=0; x<32; ++x)
+            data(z,y,x) = uint8_t(x+2*y+3*z);
+        volume->writeZYX(data, {0,0,0});
+        slices::Plane p{0,{8,8,12},{8,0,0},{0,8,0},9,9,true,{0,0,1},3,2};
+        auto image = slices::sample(p,*volume);
+        QVERIFY(image->slab.has_value()); QVERIFY(!image->preview);
+        const auto& slab = *image->slab;
+        QCOMPARE(slab.depth,6); QCOMPARE(slab.through,(Point{0,0,6}));
+        QCOMPARE(slab.origin,(Point{7.5,7.5,9.5}));
+        for(int z=0;z<6;++z) for(int y=0;y<9;++y) for(int x=0;x<9;++x) {
+            const size_t i=((z*9+y)*9+x)*2;
+            QCOMPARE(slab.pixels[i],uint8_t((8+x)+2*(8+y)+3*(10+z)));
+            QCOMPARE(slab.pixels[i+1],uint8_t(255));
+        }
+        p.normal={0,0,-1};
+        auto reverse = slices::sample(p,*volume);
+        QCOMPARE(reverse->slab->origin,(Point{7.5,7.5,14.5}));
+        QCOMPARE(reverse->slab->pixels[0],uint8_t(8+16+42));
+        p.front=p.behind=0;
+        auto single=slices::sample(p,*volume);
+        QCOMPARE(single->slab->depth,1); QCOMPARE(single->slab->through,(Point{0,0,-1}));
+        p.front=3; p.behind=2;
+        auto preview=slices::sample(p,*volume,nullptr,5);
+        QVERIFY(preview->preview); QCOMPARE(preview->slab->through,reverse->slab->through);
+        QCOMPARE(preview->slab->origin[2],reverse->slab->origin[2]);
+        std::atomic_bool cancelled{true};
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error,slices::sample(p,*volume,&cancelled));
+        p.normal={0,0,0};
+        QVERIFY_THROWS_EXCEPTION(std::invalid_argument,slices::sample(p,*volume));
+    }
     void intersectingPlanesKeepAreaUvsAndCorrectAlphaOrder()
     {
         slices::Images images;
