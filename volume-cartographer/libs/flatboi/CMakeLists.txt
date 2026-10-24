@@ -96,8 +96,15 @@ add_executable(flatboi flatboi.cpp)
 set_target_properties(flatboi PROPERTIES
     AUTOMOC OFF AUTOUIC OFF AUTORCC OFF)
 
-# SLIM_CACHED reuses the AᵀWA sparsity pattern across iters (only updates
-# values). Combined with analyzePattern-once on the PaStiX side this lets
-# every iter past the first skip both libigl-level and solver-level setup.
+# SLIM caches sparse assembly and PaStiX symbolic analysis while the mesh
+# topology is fixed.
 target_compile_definitions(flatboi PRIVATE SLIM_CACHED PASTIX6)
 target_link_libraries(flatboi PRIVATE igl::core pastix spm OpenMP::OpenMP_CXX ${OpenCV_LIBS})
+
+option(FLATBOI_BUILD_SLIM_TESTS "Build SLIM assembly and cache regression checks" ${VC_TESTING})
+if(FLATBOI_BUILD_SLIM_TESTS)
+    if(VC_TESTING)
+        enable_testing()
+    endif()
+    add_subdirectory(tests)
+endif()

@@ -467,7 +467,7 @@ jobs:
       - uses: mozilla-actions/sccache-action@v0.0.10
         with:
           version: v0.15.0
-      - name: Compile Flatboi and PaStiX
+      - name: Build and test Flatboi and PaStiX
         working-directory: volume-cartographer
         run: |
           sccache --zero-stats
@@ -478,8 +478,9 @@ jobs:
             -DCMAKE_AUTOGEN_PARALLEL=4 \
             -DVC_QUICKBUILD_OPT_LEVEL=0 -DVC_USE_SCCACHE=ON \
             -DVC_TESTING=OFF -DVC_BUILD_APPS=OFF \
-            -DVC_BUILD_UI_TRACER=OFF -DVC_BUILD_FLATBOI=ON
-          cmake --build build/ci-fast-flatboi --target flatboi --parallel 4
+            -DVC_BUILD_UI_TRACER=OFF -DVC_BUILD_FLATBOI=ON \
+            -DFLATBOI_BUILD_SLIM_TESTS=ON
+          cmake --build build/ci-fast-flatboi --target flatboi check_slim_assembly --parallel 4
           sccache --show-stats
 
   mcp-test:
