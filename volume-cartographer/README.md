@@ -132,6 +132,12 @@ After dependencies are installed, rebuilds can use:
 scripts/build_macos.sh
 ```
 
+To build one tool, or to pass CMake options such as the unit tests:
+
+```bash
+scripts/build_macos.sh --target vc_render_tifxyz -- -DVC_TESTING=ON
+```
+
 [installation instructions for docker](https://docs.docker.com/engine/install/)
 
 [running docker as a non-root user](https://docs.docker.com/engine/install/linux-postinstall/)

@@ -5,6 +5,7 @@ usage() {
   cat <<'USAGE'
 Usage:
   scripts/build_macos.sh [--install-deps] [--ccache|--sccache] [--build-dir DIR] [--jobs N]
+                         [--target NAME ...] [-- CMAKE_ARGS...]
 
 Build VC3D natively on macOS with Homebrew LLVM/Clang.
 
@@ -14,6 +15,9 @@ Options:
   --sccache        Enable sccache (installed when combined with --install-deps).
   --build-dir DIR  Override the default build directory: build-macos
   --jobs N         Parallel build jobs. Defaults to the host CPU count.
+  --target NAME    Build only this target (repeatable), e.g. VC3D or vc_render_tifxyz.
+  -- CMAKE_ARGS    Everything after -- goes to the CMake configure step,
+                   e.g. -- -DVC_TESTING=ON
 USAGE
 }
 
@@ -32,6 +36,8 @@ use_ccache=0
 use_sccache=0
 build_dir="build-macos"
 jobs="$(sysctl -n hw.ncpu 2>/dev/null || echo 8)"
+build_targets=()
+user_cmake_args=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -54,6 +60,15 @@ while [[ $# -gt 0 ]]; do
     --jobs)
       jobs="${2:?missing value for --jobs}"
       shift 2
+      ;;
+    --target)
+      build_targets+=("${2:?missing value for --target}")
+      shift 2
+      ;;
+    --)
+      shift
+      user_cmake_args=("$@")
+      break
       ;;
     -h|--help)
       usage
@@ -218,9 +233,14 @@ fi
 
 cmake --preset macos-homebrew-llvm \
   -B "$build_dir" \
-  "${extra_cmake_args[@]}"
+  "${extra_cmake_args[@]}" \
+  ${user_cmake_args[@]+"${user_cmake_args[@]}"}
 
-cmake --build "$build_dir" -j "$jobs"
+target_args=()
+for target in ${build_targets[@]+"${build_targets[@]}"}; do
+  target_args+=(--target "$target")
+done
+cmake --build "$build_dir" -j "$jobs" ${target_args[@]+"${target_args[@]}"}
 
 if (( use_ccache )); then
   ccache --show-stats
