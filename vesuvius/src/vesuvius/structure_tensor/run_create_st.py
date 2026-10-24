@@ -261,7 +261,7 @@ def parse_arguments():
     
     # Basic I/O arguments
     parser.add_argument('--input_dir', type=str, required=False,
-                        help='Path to the input Zarr volume (required unless --mode eigenanalysis)')
+                        help='Path to the input Zarr array, or an OME-Zarr group (its level 0 is used); required unless --mode eigenanalysis')
     parser.add_argument('--output_dir', type=str, required=True, 
                         help='Path to store output results')
     
@@ -331,6 +331,24 @@ def parse_arguments():
     return args
 
 
+def _array_path(path: str) -> str:
+    """Path of the array to read: an OME-Zarr group stands for its level 0.
+
+    The tool opens --input_dir as an array, so a scroll volume given as its
+    OME-Zarr root failed with "'Group' object has no attribute 'shape'".
+    """
+    store = open_zarr(
+        path=path,
+        mode='r',
+        storage_options={'anon': False} if path.startswith('s3://') else None
+    )
+    if hasattr(store, 'shape') or '0' not in store:
+        return path
+    resolved = path.rstrip('/') + '/0'
+    print(f"{path} is an OME-Zarr group; using its full-resolution level {resolved}")
+    return resolved
+
+
 def main():
     args = parse_arguments()
     
@@ -341,6 +359,8 @@ def main():
     if args.mode == 'structure-tensor' and not args.input_dir:
         print("Error: --input_dir must be provided for structure-tensor mode")
         return 1
+    if args.input_dir:
+        args.input_dir = _array_path(args.input_dir)
 
     # Validation for eigenanalysis mode
     if args.mode == 'eigenanalysis':
