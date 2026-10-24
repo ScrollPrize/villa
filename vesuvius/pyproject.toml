@@ -223,6 +223,7 @@ Homepage = "https://github.com/ScrollPrize/villa"
 "vesuvius.surface_preflight" = "vesuvius.surface_preflight:main"
 "vesuvius.preview" = "vesuvius.tools.preview:main"
 "vesuvius.crop" = "vesuvius.tools.crop:main"
+"vesuvius.doctor" = "vesuvius.tools.doctor:main"
 
 [tool.setuptools]
 include-package-data = true
