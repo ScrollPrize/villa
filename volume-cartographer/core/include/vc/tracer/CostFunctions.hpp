@@ -1032,9 +1032,12 @@ struct NormalConstraintPlane {
          cv::Point2f p1_ = {-1, -1}, p2_ = {-1, -1};
          T payload_;
          const vc::core::util::NormalGridVolume* grid_source = nullptr;
+         std::weak_ptr<const vc::core::util::GridStore> selected_grid_owner;
  
-         bool valid(const cv::Point2f& p1, const cv::Point2f& p2, float th, const vc::core::util::NormalGridVolume* current_grid_source) const {
+         bool valid(const cv::Point2f& p1, const cv::Point2f& p2, float th, const vc::core::util::NormalGridVolume* current_grid_source, const std::shared_ptr<const vc::core::util::GridStore>& current_grid) const {
              if (grid_source != current_grid_source) return false;
+             const auto prior_grid = selected_grid_owner.lock();
+             if (!prior_grid || prior_grid.get() != current_grid.get() || selected_grid_owner.owner_before(current_grid) || current_grid.owner_before(selected_grid_owner)) return false;
              cv::Point2f d1 = p1 - p1_;
              cv::Point2f d2 = p2 - p2_;
              return (d1.dot(d1) + d2.dot(d2)) < th * th;
@@ -1042,11 +1045,12 @@ struct NormalConstraintPlane {
  
          const T& get() const { return payload_; }
  
-         void put(const cv::Point2f& p1, const cv::Point2f& p2, T payload, const vc::core::util::NormalGridVolume* new_grid_source) {
+         void put(const cv::Point2f& p1, const cv::Point2f& p2, T payload, const vc::core::util::NormalGridVolume* new_grid_source, const std::shared_ptr<const vc::core::util::GridStore>& current_grid) {
              p1_ = p1;
              p2_ = p2;
              payload_ = std::move(payload);
              grid_source = new_grid_source;
+             selected_grid_owner = current_grid;
          }
      };
  
@@ -1185,9 +1189,9 @@ struct NormalConstraintPlane {
 
         T interpolated_loss;
         if (invert_dir)
-            interpolated_loss = calculate_normal_snapping_loss(pE_2d, pA_2d, *grid_ptr, 0);
+            interpolated_loss = calculate_normal_snapping_loss(pE_2d, pA_2d, *grid_ptr, grid_ptr, 0);
         else
-            interpolated_loss = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_ptr, 0);
+            interpolated_loss = calculate_normal_snapping_loss(pA_2d, pE_2d, *grid_ptr, grid_ptr, 0);
 
         // Calculate angular weight.
         double v1[3], v2[3];
@@ -1297,7 +1301,7 @@ struct NormalConstraintPlane {
     }
 
     template <typename T>
-    T calculate_normal_snapping_loss(const T* p1, const T* p2, const vc::core::util::GridStore& normal_grid, int grid_idx) const {
+    T calculate_normal_snapping_loss(const T* p1, const T* p2, const vc::core::util::GridStore& normal_grid, const std::shared_ptr<const vc::core::util::GridStore>& current_grid, int grid_idx) const {
         T edge_vec_x = p2[0] - p1[0];
         T edge_vec_y = p2[1] - p1[1];
 
@@ -1312,11 +1316,11 @@ struct NormalConstraintPlane {
 
         auto& path_cache = path_caches_[grid_idx];
 
-        if (!path_cache.valid(p1_cv, p2_cv, cache_radius_normal_, &normal_grid_volume)) {
+        if (!path_cache.valid(p1_cv, p2_cv, cache_radius_normal_, &normal_grid_volume, current_grid)) {
             cv::Point2f midpoint_cv = 0.5f * (p1_cv + p2_cv);
             auto raw_paths = normal_grid.get(midpoint_cv, query_radius_);
             auto filtered_paths = filter_and_split_paths(raw_paths, p1_cv, p2_cv);
-            path_cache.put(p1_cv, p2_cv, std::move(filtered_paths), &normal_grid_volume);
+            path_cache.put(p1_cv, p2_cv, std::move(filtered_paths), &normal_grid_volume, current_grid);
             // Invalidate snapping cache whenever the path cache is updated
             snap_loss_caches_[grid_idx] = {};
         }
@@ -1372,7 +1376,7 @@ struct NormalConstraintPlane {
             return T(w_normal)*normal_loss;
 
         auto& snap_cache = snap_loss_caches_[grid_idx];
-        if (!snap_cache.valid(p1_cv, p2_cv, cache_radius_snap_, &normal_grid_volume)) {
+        if (!snap_cache.valid(p1_cv, p2_cv, cache_radius_snap_, &normal_grid_volume, current_grid)) {
             SnapLossPayload payload;
             float closest_dist_norm = std::numeric_limits<float>::max();
  
@@ -1410,7 +1414,7 @@ struct NormalConstraintPlane {
                      }
                  }
              }
-            snap_cache.put(p1_cv, p2_cv, payload, &normal_grid_volume);
+            snap_cache.put(p1_cv, p2_cv, payload, &normal_grid_volume, current_grid);
         }
 
         const auto& snap_payload = snap_cache.get();
