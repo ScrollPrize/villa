@@ -11,6 +11,7 @@
 #include "vc/fiber_tracer/FiberDisplay.hpp"
 
 #include "CState.hpp"
+#include "HubSyncController.hpp"
 #include "FiberNameDisplay.hpp"
 #include "FiberSaveBatchTracker.hpp"
 #include "OpenDataCoordinateIdentity.hpp"
@@ -2548,6 +2549,14 @@ bool LineAnnotationController::enableFiberEditing(uint64_t fiberId)
     return false;
 }
 
+std::set<std::string> LineAnnotationController::editingFiberUuids() const
+{
+    std::set<std::string> result;
+    for (const auto& pane : _panes)
+        if (pane.session && !pane.session->readOnly && !pane.session->fiberUuid.empty()) result.insert(pane.session->fiberUuid);
+    return result;
+}
+
 bool LineAnnotationController::enableSessionEditing(const std::string& surfaceName)
 {
     auto* pane = paneForSurface(surfaceName);
@@ -2562,6 +2571,18 @@ bool LineAnnotationController::enableSessionEditing(const std::string& surfaceNa
         showError(tr("This fiber cannot be edited: the object store is attached read-only or the fiber does not decode."),
                   session->suppressErrorDialogs);
         return false;
+    }
+    // A hosted replica edits only fibers it leases. Leasing may first pull the
+    // hub's newer record, which the revision check below then reports.
+    auto* hub = _state ? _state->hubSync() : nullptr;
+    if (hub && hub->active() && session->storePin && !session->storePin->objectRevision.empty()) {
+        try {
+            hub->ensureLeases({session->fiberUuid});
+        } catch (const std::exception& error) {
+            showError(tr("This fiber cannot be edited now: %1").arg(QString::fromUtf8(error.what())),
+                      session->suppressErrorDialogs);
+            return false;
+        }
     }
     // Editing starts from the revision on screen; a newer one reopens the view.
     const auto stored = readStoredFiber(session->fiberId);
@@ -16841,6 +16862,13 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         for (const auto& branch : edit.fiber.branches) expect(findFiber(branch.branchFiberId));
     }
     for (const auto& fiber : retired) expect(fiber);
+    // A hosted replica leases every stored fiber whose record this action changes.
+    if (auto* hub = _state->hubSync(); hub && hub->active()) {
+        std::vector<std::string> changed;
+        for (const auto& edit : edits) if (expected.at(edit.fiber.uuid)) changed.push_back(edit.fiber.uuid);
+        for (const auto& fiber : retired) if (expected.at(fiber.uuid)) changed.push_back(fiber.uuid);
+        hub->ensureLeases(changed);
+    }
     std::map<std::string, EdgeRecord> incident;
     connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
         const auto requested = expected;

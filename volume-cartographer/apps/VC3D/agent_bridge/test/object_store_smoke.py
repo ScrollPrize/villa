@@ -48,10 +48,10 @@ def main():
             '\n[project]\nshow_open_data_catalog_on_startup=false\n')
         tag = 'bridge_smoke_' + str(os.getpid())
 
-        def launch(index):
+        def launch(index, store=database):
             process = VC3DProcess(args.vc3d,
                 ['--agent-bridge', '--agent-bridge-name', f'vc3d-store-{os.getpid()}-{index}',
-                 '--object-store', str(database)],
+                 '--object-store', str(store)],
                 env_overrides={'QT_QPA_PLATFORM': 'offscreen',
                                'XDG_CONFIG_HOME': str(config), 'VC3D_CONFIG_DIR': str(config)})
             client = None
@@ -111,6 +111,65 @@ def main():
         finally:
             client.close()
             process.terminate()
+        hosted(root, database, launch, tag)
+
+
+def hosted(root, database, launch, tag):
+    """Two VC3D replicas of one hub exchange edits; a lease held elsewhere blocks editing."""
+    import vc_object_store as vos
+    hub = root / 'share' / 'hub.vcobj'
+    hub.parent.mkdir()
+    with sqlite3.connect(database) as source, sqlite3.connect(hub) as target:
+        source.backup(target)
+    vos.hub_init(str(hub), 'curator')
+    for name in ('first', 'second', 'script'):
+        vos.hub_clone(str(hub), str(root / f'{name}.vcobj'), name)
+
+    def wait_for_tag(client, wanted):
+        """Fiber IDs are per process: find the fiber by tag in this one."""
+        deadline = time.monotonic() + 90
+        while time.monotonic() < deadline:
+            result, _ = client.call('fiber.list', timeout=120)
+            for fiber in result['fibers']:
+                if wanted in fiber['tags']:
+                    return fiber['fiberId']
+            time.sleep(.5)
+        raise RuntimeError(f'{wanted} did not arrive through the hub')
+
+    first, first_client, fibers = launch(3, root / 'first.vcobj')
+    second = second_client = None
+    try:
+        second, second_client, _ = launch(4, root / 'second.vcobj')
+        first_id = fibers[0]['fiberId']
+        first_client.call('fiber.set_tag', {'fiberId': first_id, 'tag': tag + '_first', 'enabled': True})
+        second_id = wait_for_tag(second_client, tag + '_first')
+        second_client.call('fiber.set_tag', {'fiberId': second_id, 'tag': tag + '_second', 'enabled': True})
+        wait_for_tag(first_client, tag + '_second')
+        with ObjectStore.open(str(root / 'script.vcobj'), author='script') as script:
+            script.hub_sync()
+            [uuid] = [fiber['uuid'] for fiber in script.objects_by_kind('fiber') if tag + '_second' in fiber['tags']]
+            deadline = time.monotonic() + 60
+            while True:  # the second replica releases its lease after pushing
+                try:
+                    script.acquire_leases([uuid])
+                    break
+                except RuntimeError:
+                    if time.monotonic() > deadline:
+                        raise
+                    time.sleep(1)
+                    script.hub_sync()
+            try:
+                first_client.call('fiber.set_tag', {'fiberId': first_id, 'tag': tag + '_blocked', 'enabled': True})
+                raise AssertionError('Editing a fiber leased by another replica must fail')
+            except BridgeError as error:
+                assert 'leased to script' in str(error), error
+        print('Hosted replicas exchanged edits through the hub; a held lease blocked editing', flush=True)
+    finally:
+        for client, process in ((first_client, first), (second_client, second)):
+            if client:
+                client.close()
+            if process:
+                process.terminate()
 
 
 if __name__ == '__main__':

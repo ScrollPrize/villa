@@ -28,6 +28,9 @@ add_library(vc_objects STATIC
     GeometryRegion.cpp
     sync/Synchronize.cpp
     sync/GeometryTransfer.cpp
+    sync/Apply.cpp
+    hub/HubRules.cpp
+    hub/Hub.cpp
     geometry/GeometryViews.cpp
     imports/SourceRelationships.cpp
     geometry/GeometryIngestBatch.cpp

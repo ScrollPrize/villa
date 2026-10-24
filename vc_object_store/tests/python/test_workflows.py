@@ -388,3 +388,32 @@ def test_native_export_pins_object_metadata_and_geometry(db, tmp_path, kind, geo
     assert doc['coordinates']['scale_factor'] == 2
     with pytest.raises(RuntimeError, match='object revision'):
         db.export_geometry(uid, tmp_path / 'wrong.json', object_revision_uuid=first_geometry)
+
+
+def test_scripts_edit_hosted_replicas_under_leases(tmp_path):
+    import vc_object_store as vos
+    hub = tmp_path / 'share' / 'hub.vcobj'
+    hub.parent.mkdir()
+    with ObjectStore.create(str(hub), author='curator') as origin:
+        fiber, _ = put(origin, Fiber([[1, 2, 3], [4, 5, 6]], []), kind='fiber')
+        origin.checkpoint()
+    vos.hub_init(str(hub), 'curator')
+    with pytest.raises(RuntimeError, match='hosted hub'):
+        ObjectStore.open(str(hub), author='curator')
+    for name in ('script', 'viewer'):
+        vos.hub_clone(str(hub), str(tmp_path / f'{name}.vcobj'), name)
+    with ObjectStore.open(str(tmp_path / 'script.vcobj'), author='script') as script, \
+            ObjectStore.open(str(tmp_path / 'viewer.vcobj'), author='viewer') as viewer:
+        with pytest.raises(RuntimeError, match='not leased'):
+            script.set_meta(fiber, 'review', 'done')
+        [lease] = script.acquire_leases([fiber])
+        assert lease['author'] == 'script'
+        script.set_meta(fiber, 'review', 'done')
+        assert script.hub_status()['pending'] == 1
+        assert script.hub_sync() == {'pulled': 0, 'pushed': 1, 'conflicts': []}
+        assert viewer.hub_sync()['pulled'] == 1
+        assert viewer.object(fiber)['meta']['review'] == 'done'
+        with pytest.raises(RuntimeError, match='leased to script'):
+            viewer.acquire_leases([fiber])
+        script.release_leases([fiber])
+        assert viewer.acquire_leases([fiber])[0]['author'] == 'viewer'

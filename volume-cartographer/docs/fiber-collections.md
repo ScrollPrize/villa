@@ -7,6 +7,20 @@ Attachment lasts for the session. A failed replacement leaves the current store
 attached. Detaching or replacing it cancels old background reads and closes the
 fiber panes after accepted writes finish.
 
+To share fibers with other people, keep the store as a hosted hub on a network
+share. Choose **File → Clone Hosted Object Store...** to copy the hub into a local
+replica and attach it. VC3D then syncs the replica in the background: every 15 s,
+and shortly after each local edit. The status bar shows the sync state. **File →
+Sync Hosted Object Store Now** syncs immediately.
+
+Enabling editing of a fiber, and any edit, tag or retire action, first leases
+that fiber from the hub. If someone else holds the lease, VC3D reports who and
+the fiber stays read-only. Leases of fibers still open for editing are renewed.
+Other leases are released once their changes are pushed. When a fiber changed
+both here and on the hub, VC3D asks whether to use the hub's version or keep
+yours. See the store's [hosted hub
+guide](../../vc_object_store/docs/README.md#hosted-hub-and-replicas).
+
 Create the database outside VC3D, using the sibling object-store tools:
 
 ```sh

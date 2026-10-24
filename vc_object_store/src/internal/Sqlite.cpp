@@ -96,7 +96,11 @@ sqlite3* openConnection(const std::filesystem::path& path, int flags, const Open
 {
     sqlite3* db = nullptr;
     const auto name = path.u8string();
-    const int rc = sqlite3_open_v2(reinterpret_cast<const char*>(name.c_str()), &db, flags | SQLITE_OPEN_FULLMUTEX, nullptr);
+    // Network filesystems lack the shared memory and byte-range locks WAL needs.
+    const char* vfs = options.sharedFile ? "unix-dotfile" : nullptr;
+    if (vfs && !sqlite3_vfs_find(vfs))
+        throw std::runtime_error("object store: this SQLite build lacks the unix-dotfile VFS needed for shared files");
+    const int rc = sqlite3_open_v2(reinterpret_cast<const char*>(name.c_str()), &db, flags | SQLITE_OPEN_FULLMUTEX, vfs);
     if (rc != SQLITE_OK) {
         std::string msg = db ? sqlite3_errmsg(db) : "open failed";
         if (db) sqlite3_close(db);

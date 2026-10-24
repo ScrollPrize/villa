@@ -55,6 +55,11 @@ build/bin/vc_object_links --db objects.vcobj --author "$USER" \
   --link-fiber-patches --ct /data/ct.zarr
 ```
 
+A team can share a store as a hub file on a network share. Each client works on
+a local replica and syncs with leases:
+`vc_object_hub clone /mnt/share/hub.vcobj ~/replica.vcobj`. See
+[hosted hub and replicas](docs/README.md#hosted-hub-and-replicas).
+
 See the [API guide](docs/README.md) for checked revisions, geometry reads and
 edits, graph snapshots, spatial queries, and synchronization. Detector distances
 and scale options use working voxels. CT normals use uint8 Zarr data with complete

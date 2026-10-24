@@ -22,11 +22,13 @@
 #include "Keybinds.hpp"
 #include "FileWatcherService.hpp"
 #include "LineAnnotationController.hpp"
+#include "HubSyncController.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/Version.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc_object_store/objects/Hub.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/ScrollUmbilicus.hpp"
 #include "vc/core/util/Umbilicus.hpp"
@@ -239,6 +241,13 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
             QMessageBox::critical(qWindow, QObject::tr("Cannot attach object store"), QString::fromUtf8(error.what()));
         }
     });
+    _fileMenu->addAction(QObject::tr("Clone Hosted Object Store..."), this, &MenuActionController::cloneHostedStore);
+    auto* syncHub = _fileMenu->addAction(QObject::tr("Sync Hosted Object Store Now"), this, [qWindow]() {
+        if (auto* hub = qWindow->_state->hubSync()) hub->syncNow();
+    });
+    syncHub->setEnabled(false);
+    connect(qWindow->_state->hubSync(), &HubSyncController::statusChanged, syncHub,
+        [syncHub](const QString& status) { syncHub->setEnabled(!status.isEmpty()); });
     auto* detachStore = _fileMenu->addAction(QObject::tr("Detach Object Store"), this, &MenuActionController::detachObjectStore);
     detachStore->setEnabled(qWindow->_state->objectStoreSession()->attachment().has_value());
     connect(qWindow->_state, &CState::objectStoreChanged, detachStore,
@@ -2329,24 +2338,82 @@ void MenuActionController::convertLegacyVolpkg()
     if (reply == QMessageBox::Yes) openVolpkgAt(out);
 }
 
-void MenuActionController::attachObjectStore()
+QString MenuActionController::objectStoreAuthor()
 {
-    const auto path = QFileDialog::getOpenFileName(_window, QObject::tr("Attach Object Store"),
-        {}, QObject::tr("Object store (*.vcobj);;All files (*)"));
-    if (path.isEmpty()) return;
     auto author = qEnvironmentVariable("USER");
     if (author.isEmpty()) author = qEnvironmentVariable("USERNAME");
     if (author.isEmpty()) {
         author = QInputDialog::getText(_window, QObject::tr("Object Store Author"),
             QObject::tr("Author for recorded edits:"));
-        if (author.trimmed().isEmpty()) return;
     }
+    return author.trimmed();
+}
+
+void MenuActionController::attachObjectStore()
+{
+    const auto path = QFileDialog::getOpenFileName(_window, QObject::tr("Attach Object Store"),
+        {}, QObject::tr("Object store (*.vcobj);;All files (*)"));
+    if (path.isEmpty()) return;
+    const auto author = objectStoreAuthor();
+    if (author.isEmpty()) return;
     try {
-        _window->_state->attachObjectStore(path, author.trimmed());
+        _window->_state->attachObjectStore(path, author);
     } catch (const std::exception& error) {
         QMessageBox::critical(_window, QObject::tr("Cannot attach object store"),
             QString::fromUtf8(error.what()));
     }
+}
+
+void MenuActionController::cloneHostedStore()
+{
+    const auto filter = QObject::tr("Object store (*.vcobj);;All files (*)");
+    const auto hub = QFileDialog::getOpenFileName(_window,
+        QObject::tr("Clone Hosted Object Store: choose the hub on the network share"), {}, filter);
+    if (hub.isEmpty()) return;
+    const auto replica = QFileDialog::getSaveFileName(_window, QObject::tr("Local Replica"),
+        QDir::home().filePath(QFileInfo(hub).completeBaseName() + QStringLiteral("-replica.vcobj")), filter);
+    if (replica.isEmpty()) return;
+    const auto author = objectStoreAuthor();
+    if (author.isEmpty()) return;
+
+    auto* progressDialog = new QProgressDialog(QObject::tr("Copying the hosted store..."), {}, 0, 1000, _window);
+    progressDialog->setWindowModality(Qt::WindowModal);
+    progressDialog->setMinimumDuration(0);
+    progressDialog->setValue(0);
+    QPointer<QProgressDialog> guardedDialog(progressDialog);
+    auto progress = [guardedDialog](const vc::objects::util::ProgressUpdate& event) {
+        if (!event.total) return;
+        const int value = int(1000 * event.completed / event.total);
+        QMetaObject::invokeMethod(guardedDialog, [guardedDialog, value] {
+            if (guardedDialog) guardedDialog->setValue(value);
+        }, Qt::QueuedConnection);
+    };
+    auto* watcher = new QFutureWatcher<QString>(this);
+    connect(watcher, &QFutureWatcher<QString>::finished, this, [this, watcher, progressDialog, replica, author] {
+        const auto error = watcher->result();
+        watcher->deleteLater();
+        progressDialog->close();
+        progressDialog->deleteLater();
+        if (!error.isEmpty()) {
+            QMessageBox::critical(_window, QObject::tr("Cannot clone hosted object store"), error);
+            return;
+        }
+        try {
+            _window->_state->attachObjectStore(replica, author);
+        } catch (const std::exception& failure) {
+            QMessageBox::critical(_window, QObject::tr("Cannot attach object store"), QString::fromUtf8(failure.what()));
+        }
+    });
+    watcher->setFuture(QtConcurrent::run([hub, replica, author, progress]() {
+        try {
+            vc::objects::OpenOptions options;
+            options.author = author.toStdString();
+            vc::objects::cloneHub(hub.toStdString(), replica.toStdString(), options, progress);
+            return QString();
+        } catch (const std::exception& error) {
+            return QString::fromUtf8(error.what());
+        }
+    }));
 }
 
 void MenuActionController::detachObjectStore()

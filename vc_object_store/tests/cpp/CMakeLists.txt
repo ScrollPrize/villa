@@ -18,6 +18,10 @@ add_test(NAME object_store_fiber_json COMMAND test_object_store_fiber_json)
 add_executable(test_object_store_geometry_edits test_object_store_geometry_edits.cpp)
 target_link_libraries(test_object_store_geometry_edits PRIVATE vc_objects nlohmann_json::nlohmann_json)
 add_test(NAME object_store_geometry_edits COMMAND test_object_store_geometry_edits)
+add_executable(test_object_store_hub test_object_store_hub.cpp)
+target_link_libraries(test_object_store_hub PRIVATE vc_objects nlohmann_json::nlohmann_json Threads::Threads)
+add_test(NAME object_store_hub COMMAND test_object_store_hub)
+set_tests_properties(object_store_hub PROPERTIES TIMEOUT 60)
 
 # Read-only real-data timing harness; not a fixture-free CTest.
 add_executable(bench_volume_queries bench_volume_queries.cpp)

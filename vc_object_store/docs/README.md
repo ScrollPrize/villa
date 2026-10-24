@@ -214,6 +214,85 @@ history. A fresh retired replica may lack an active revision to restore: restore
 on the originating replica and sync, or copy its full database. Metadata-only
 JSON import rejects lifecycle-bearing exports.
 
+## Hosted hub and replicas
+
+A team shares one store by keeping a **hub** `.vcobj` on a network filesystem
+(an sshfs mount, NFS or SMB). Nobody opens the hub to work. Each client clones
+it into a local **replica** and opens that replica like any other store, so reads
+and viewport queries stay on local disk. Hosting needs no server process. Public
+signatures are in [Hub.hpp](../include/vc_object_store/objects/Hub.hpp).
+
+```sh
+vc_object_hub init objects.vcobj        # locally, with no other connections
+cp objects.vcobj /mnt/share/hub.vcobj   # then place it on the share
+vc_object_hub clone /mnt/share/hub.vcobj ~/objects-replica.vcobj
+vc_object_hub lease acquire ~/objects-replica.vcobj UUID
+#   ... edit UUID with any client of the replica ...
+vc_object_hub sync ~/objects-replica.vcobj
+```
+
+The hub keeps SQLite's rollback journal and opens through the `unix-dotfile`
+VFS (`OpenOptions::sharedFile`). That VFS locks by creating `<hub>.lock` with an
+atomic `mkdir`, which works on network filesystems where WAL's shared memory and
+byte-range locks do not. Only hub operations open the file, and each holds the
+lock briefly. An ordinary open of a hub is refused, so nothing can switch it back
+to WAL. Stores without the `hub_*` tables behave exactly as before. That includes
+two-store `synchronize`, which hub sync does not use.
+
+**Leases.** Changing the record or geometry of an object that exists on the hub
+requires this replica to hold that object's lease. The check runs at commit, in
+the library, so it covers every client of the replica. Objects created locally
+need no lease until they are pushed, and a push grants their creator a lease.
+`acquire_leases` is all-or-nothing. It refuses objects another replica holds,
+and objects changed on the hub since this replica last pulled them
+(`HubLeaseRefused::held` / `stale`); pull, then retry. Leases expire after their
+duration (default ten minutes), so clients need roughly synchronized clocks.
+Releasing a lease requires its changes to be pushed first. The hub enforces
+unexpired leases on direct edits too.
+
+Relationships are shared records, not leased. Linking to someone else's object,
+or saving an edit that revalidates its links, does not need the other object's
+lease. Two replicas changing the same relationship produce a conflict.
+
+**Sync.** A replica tracks the hub's journal cursor, the hub version (latest
+journal sequence) of each record it installed, and its own unpushed changes.
+- `hubPull` installs records changed on the hub since the cursor, with their
+  geometry history, in one replica transaction.
+- `hubPush` publishes local changes in one hub transaction. Each record must
+  still have the hub version it was edited from, and each changed hub object must
+  be leased to this replica. The push copies geometry history, validates
+  relationship dependencies like `synchronize`, and verifies the result.
+- A retry after a push whose outcome was lost recognizes its own records.
+
+Records changed both locally and on the hub become conflicts, and pushing stops
+until they are resolved. `resolveHubConflict(uuid, "hub")` installs the hub's
+record. `"local"` publishes this replica's record over it and requires the lease.
+Object revision UUIDs are per replica, as with `synchronize`. Geometry revision
+UUIDs and the store UUID are shared.
+
+**Operations.**
+- `clone` copies the hub with SQLite's backup API in steps. Writers can continue
+  meanwhile and simply restart the copy.
+- A client that dies while holding the hub lock leaves `<hub>.lock` behind, and
+  every other client waits on it. Once no client is syncing, run
+  `vc_object_hub unlock HUB --force`; the next open rolls back the interrupted
+  write from its journal.
+- The share must apply `mkdir` atomically and must not serve stale cached data
+  to SQLite. Mount NFS with `noac`, and sshfs without its caches
+  (`-o cache=no`).
+- `detach` turns a replica back into an ordinary store.
+
+On local disk, with a synthetic 20,000-fiber hub (354 MB, RelWithDebInfo,
+Ubuntu arm64, 10 iterations, median ms):
+
+| Operation | Median |
+| --- | ---: |
+| Clone | 400 |
+| Lease acquire | 13 |
+| One-fiber push (metadata + control-point edit) | 19 |
+| Pull of that change on another replica | 10 |
+| Sync with nothing to do | 6 |
+
 ## Volume identity and coordinate scale
 
 Geometry objects use `meta.coordinates = {"volume_uuid": ..., "scale_factor": ...}`.

@@ -12,6 +12,8 @@ set(srcs
     VCAppMain.cpp
     CState.cpp
     CState.hpp
+    HubSyncController.cpp
+    HubSyncController.hpp
     Keybinds.cpp
     Keybinds.hpp
     CWindow.cpp

@@ -331,6 +331,8 @@ public:
     // Stored fibers open read-only. Enables editing in the most recent pane of
     // this fiber (as its Enable editing button does); false when it cannot.
     bool enableFiberEditing(uint64_t fiberId);
+    // Stored fibers open for editing; a hosted replica keeps their leases.
+    std::set<std::string> editingFiberUuids() const;
     void deleteFiber(uint64_t fiberId);
     // Retire the selected object UUIDs and remove their links in one checked action.
     vc3d::line_annotation::FiberDeleteOutcome deleteFibers(std::vector<uint64_t> fiberIds);

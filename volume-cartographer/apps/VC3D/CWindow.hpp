@@ -416,6 +416,7 @@ private:
     QPointer<QLabel> _lineAnnotationLengthLabel;
     QLabel* _sharedCacheStatsLabel{nullptr};
     QLabel* _persistentCacheLowSpaceLabel{nullptr};
+    QLabel* _hubStatusLabel{nullptr};
     QLabel* _persistentCacheWarningText{nullptr};
     QFrame* _persistentCacheWarningBanner{nullptr};
     QTimer* _statusMessageTimer{nullptr};

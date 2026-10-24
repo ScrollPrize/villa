@@ -56,6 +56,7 @@ public:
     bool isOpenDataCatalogVisible() const;
     // Prompts for a .vcobj (and an author when the environment names none) and attaches it.
     void attachObjectStore();
+    void cloneHostedStore();
     void detachObjectStore();
     // Resolves sampleId against the cached manifest and opens it. When
     // interactive is false, prompts, progress dialogs, and message boxes are
@@ -138,6 +139,8 @@ signals:
     void openDataCatalogVisibilityChanged(bool visible);
 
 private:
+    // Author recorded on edits: the login name, else asked for. Empty means cancelled.
+    QString objectStoreAuthor();
     QStringList loadRecentPaths() const;
     void saveRecentPaths(const QStringList& paths);
     void ensureRecentActions();

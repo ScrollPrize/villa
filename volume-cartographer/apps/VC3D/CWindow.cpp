@@ -1,4 +1,5 @@
 #include "CWindow.hpp"
+#include "HubSyncController.hpp"
 #include "VolumeComboTooltip.hpp"
 #include "FiberLengthDisplay.hpp"
 #include "VolumeDisplayNames.hpp"
@@ -2780,6 +2781,35 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _persistentCacheLowSpaceLabel->setStyleSheet(QStringLiteral("color: #d28b00; font-weight: 600;"));
     _persistentCacheLowSpaceLabel->hide();
     statusBar()->addPermanentWidget(_persistentCacheLowSpaceLabel);
+
+    _hubStatusLabel = new QLabel(this);
+    _hubStatusLabel->setContentsMargins(8, 0, 8, 0);
+    _hubStatusLabel->setToolTip(tr("Sync state of the attached hosted object store replica"));
+    _hubStatusLabel->hide();
+    statusBar()->addPermanentWidget(_hubStatusLabel);
+    if (auto* hub = _state->hubSync()) {
+        hub->setEditingObjects([this] {
+            return _lineAnnotationController ? _lineAnnotationController->editingFiberUuids() : std::set<std::string>{};
+        });
+        connect(hub, &HubSyncController::statusChanged, this, [this](const QString& text) {
+            _hubStatusLabel->setText(text);
+            _hubStatusLabel->setVisible(!text.isEmpty());
+        });
+        connect(hub, &HubSyncController::conflictsFound, this, [this, hub](const QStringList& uuids) {
+            QMessageBox box(QMessageBox::Warning, tr("Hosted object store conflict"),
+                tr("%n record(s) changed both here and on the hub:", nullptr, int(uuids.size())) +
+                    QStringLiteral("\n") + uuids.mid(0, 10).join(QStringLiteral("\n")) +
+                    (uuids.size() > 10 ? QStringLiteral("\n...") : QString()) +
+                    tr("\n\nUse the hub's versions (discarding your changes to them), or keep yours and publish them?"),
+                QMessageBox::NoButton, this);
+            auto* useHub = box.addButton(tr("Use Hub Versions"), QMessageBox::DestructiveRole);
+            auto* keepMine = box.addButton(tr("Keep Mine"), QMessageBox::AcceptRole);
+            box.addButton(tr("Later"), QMessageBox::RejectRole);
+            box.exec();
+            if (box.clickedButton() == useHub) hub->resolveConflicts(QStringLiteral("hub"));
+            else if (box.clickedButton() == keepMine) hub->resolveConflicts(QStringLiteral("local"));
+        });
+    }
 
     _persistentCacheSpaceTimer = new QTimer(this);
     _persistentCacheSpaceTimer->setInterval(5000);

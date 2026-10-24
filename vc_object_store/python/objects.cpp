@@ -4,6 +4,7 @@
 #include "GeometryRegionBindings.hpp"
 #include <nanobind/stl/map.h>
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/objects/Hub.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/CtSheetNormal.hpp"
 using namespace vc::python;
@@ -234,6 +235,38 @@ void bindMutations(nb::class_<T>& cls)
 
 }  // namespace
 
+namespace {
+nb::list hubLeases(const std::vector<vo::HubLease>& leases)
+{
+    nb::list result;
+    for (const auto& lease : leases) {
+        nb::dict item; item["uuid"] = lease.objectUuid; item["holder"] = lease.holder;
+        item["author"] = lease.author; item["host"] = lease.host;
+        item["acquired_us"] = lease.acquiredUs; item["expires_us"] = lease.expiresUs;
+        result.append(item);
+    }
+    return result;
+}
+
+nb::list hubConflicts(const std::vector<vo::HubConflict>& conflicts)
+{
+    nb::list result;
+    for (const auto& conflict : conflicts) {
+        nb::dict item; item["uuid"] = conflict.uuid; item["hub_version"] = conflict.hubVersion;
+        item["hub"] = jsonLoads(conflict.hubRecord); item["local"] = jsonLoads(conflict.localRecord);
+        result.append(item);
+    }
+    return result;
+}
+
+nb::dict hubReport(const vo::HubSyncReport& report)
+{
+    nb::dict result; result["pulled"] = report.pulled; result["pushed"] = report.pushed;
+    result["conflicts"] = hubConflicts(report.conflicts);
+    return result;
+}
+}
+
 NB_MODULE(_native, m)
 {
     nb::class_<vc::CtSheetNormalSampler>(m, "CtSheetNormalSampler")
@@ -255,6 +288,16 @@ NB_MODULE(_native, m)
     bindGraphReadView(m);
     bindGeometryRegion(m);
     bindTypedGeometry(m); // Shared C++ geometry and revision-pinned views.
+
+    m.def("hub_init", &vo::initHub, nb::arg("path"), nb::arg("author"),
+          "Turn a local store with no other connections into a hub for a network share.");
+    m.def("hub_clone", [](const std::filesystem::path& hub, const std::filesystem::path& replica, const std::string& author) {
+        vo::OpenOptions options; options.author = author;
+        nb::gil_scoped_release release;
+        vo::cloneHub(hub, replica, options);
+    }, nb::arg("hub"), nb::arg("replica"), nb::arg("author"), "Copy a hub into a new local replica.");
+    m.def("hub_detach", &vo::detachHub, nb::arg("replica"), nb::arg("author"),
+          "Drop a replica's hub tables, leaving an ordinary store.");
 
     auto store = nb::class_<PyObjectStore>(m, "ObjectStore")
         .def_static("create", &PyObjectStore::create, nb::arg("path"), nb::arg("author"),
@@ -530,6 +573,47 @@ NB_MODULE(_native, m)
             result["conflicts"] = conflicts; return result;
         }, nb::arg("peer"), nb::arg("dry_run") = false,
            nb::arg("resolutions") = std::map<std::string, std::string>{}, nb::arg("expected_plan") = std::nullopt)
+        .def("hub_sync", [](PyObjectStore& self, bool pull, bool push) {
+            auto& db = self.require();
+            if (self.db.use_count() != 1) throw std::runtime_error("hub_sync requires an idle store");
+            vo::HubSyncReport report;
+            { nb::gil_scoped_release release;
+              report = pull && push ? vo::hubSync(db) : pull ? vo::hubPull(db) : vo::hubPush(db); }
+            return hubReport(report);
+        }, nb::arg("pull") = true, nb::arg("push") = true,
+           "Pull hub changes and/or push local ones. Pushing changed hub objects requires their leases.")
+        .def("acquire_leases", [](PyObjectStore& self, const std::vector<std::string>& uuids, int64_t seconds) {
+            auto& db = self.require();
+            std::vector<vo::HubLease> leases;
+            { nb::gil_scoped_release release; leases = vo::acquireLeases(db, uuids, seconds); }
+            return hubLeases(leases);
+        }, nb::arg("uuids"), nb::arg("seconds") = vo::kDefaultLeaseSeconds)
+        .def("renew_leases", [](PyObjectStore& self, const std::vector<std::string>& uuids, int64_t seconds) {
+            auto& db = self.require();
+            std::vector<vo::HubLease> leases;
+            { nb::gil_scoped_release release; leases = vo::renewLeases(db, uuids, seconds); }
+            return hubLeases(leases);
+        }, nb::arg("uuids"), nb::arg("seconds") = vo::kDefaultLeaseSeconds)
+        .def("release_leases", [](PyObjectStore& self, const std::vector<std::string>& uuids) {
+            auto& db = self.require();
+            nb::gil_scoped_release release;
+            vo::releaseLeases(db, uuids);
+        }, nb::arg("uuids"))
+        .def("hub_status", [](PyObjectStore& self) -> nb::object {
+            const auto status = vo::hubStatus(self.require());
+            if (!status) return nb::none();
+            nb::dict result; result["hub"] = status->hub.string(); result["replica"] = status->replica;
+            result["pending"] = status->pending; result["conflicts"] = hubConflicts(status->conflicts);
+            result["leases"] = hubLeases(status->leases);
+            return result;
+        }, "Local hosting state of a replica, or None for an ordinary store.")
+        .def("resolve_hub_conflict", [](PyObjectStore& self, const std::string& uuid, const std::string& keep) {
+            auto& db = self.require();
+            if (self.db.use_count() != 1) throw std::runtime_error("resolve_hub_conflict requires an idle store");
+            vo::HubSyncReport report;
+            { nb::gil_scoped_release release; report = vo::resolveHubConflict(db, uuid, keep); }
+            return hubReport(report);
+        }, nb::arg("uuid"), nb::arg("keep"))
         .def("import_json", writeMethod<&vo::ObjectStore::importJson>(),
              nb::arg("json_text"))
         .def(
