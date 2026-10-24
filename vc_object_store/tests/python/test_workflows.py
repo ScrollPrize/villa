@@ -156,6 +156,36 @@ def test_nearest_surfaces_pick_restrict_and_volume_target(db):
     assert hits[0]['object_uuid'] == near and hits[0]['distance'] > 2
 
 
+def test_remote_registered_surface_is_fetched_once(db, tmp_path):
+    import functools, http.server, threading
+    points = np.stack([*np.mgrid[:3, :4][::-1], np.full((3, 4), 5)], axis=-1).astype('<f4')
+    valid = np.full((3, 4), 255, 'u1')
+    valid[1, 2] = 0
+    source, _ = put(db, dict(kind='surface', attributes={'scale': [1, 1]},
+                             arrays=[array('points', points), array('valid', valid)]), 'surface')
+    served = tmp_path / 'served'
+    served.mkdir()
+    db.export_geometry(source, served / 'segment.tifxyz')
+    handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(served))
+    handler.log_message = lambda *args: None
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        base = f'http://127.0.0.1:{server.server_address[1]}'
+        remote = db.upsert_object(dict(kind='surface', name='catalog', storage_kind='url',
+                                       storage_ref=f'{base}/segment.tifxyz/'))
+        missing = db.upsert_object(dict(kind='surface', storage_kind='url', storage_ref=f'{base}/absent.tifxyz'))
+        assert db.ingest_registered_geometry(object_uuids=[missing])['problems']
+        report = db.ingest_registered_geometry(object_uuids=[remote])
+        assert report['ingested'] == 1 and not report['problems']
+    finally:
+        server.shutdown()
+    revision = db.current_geometry(remote)['uuid']
+    assert db.object(remote)['name'] == 'catalog'
+    assert db.read_geometry_array(revision, 'points') == points.tobytes()
+    assert db.read_geometry_array(revision, 'valid') == valid.tobytes()
+
+
 def test_checked_relationships_lifecycle_graph_and_sync(db, tmp_path):
     a, first = put(db, Track([[1, 2, 3], [4, 5, 6]]))
     b, _ = put(db, Track([[1, 2, 3]]))

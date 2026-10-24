@@ -30,6 +30,11 @@ report partial success. Track identity is dataset reference plus external key.
 Always inspect `problems`.
 `ingest_registered_geometry` loads placeholders only if they have no geometry
 history, preserving unrelated metadata. Use store edits for subsequent changes.
+A surface placeholder with `storage_kind="url"` and an `http(s)://` or `s3://`
+(public bucket) `storage_ref` is a remote tifxyz: ingestion downloads its
+`meta.json`, `x/y/z.tif` and, when present, `mask.tif` and `overlapping.json`,
+decodes them like a local directory and stores the geometry, so the remote is
+read once. The placeholder, not the remote `meta.json`, supplies the identity.
 
 PCL source links use document-scoped collection/point identities. The namespace
 is `meta.source.origin`, the absolute lexically normalized import path; symlink
