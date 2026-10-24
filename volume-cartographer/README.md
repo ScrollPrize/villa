@@ -25,7 +25,7 @@ The `edge` and `main` image tags currently carry the build of 2026-05-13 (see [#
 
 #### Linux
 
-A self-contained `VC3D-<version>-linux-x86_64.AppImage` (VC3D plus the `vc_*` command-line tools, with all dependencies bundled) is attached to each [GitHub release](https://github.com/ScrollPrize/villa/releases). Make it executable and pass the program to run as the first argument:
+A `VC3D-<version>-linux-x86_64.AppImage` containing VC3D and the `vc_*` command-line tools is attached to each [GitHub release](https://github.com/ScrollPrize/villa/releases). The host must provide graphics and font libraries, including for headless CLI use; see the [runtime prerequisites](scripts/appimage/README.md#prerequisites-what-the-host-must-provide). Make it executable and pass the program to run as the first argument:
 
 ```bash
 chmod +x VC3D-*-linux-x86_64.AppImage
