@@ -364,6 +364,8 @@ class Inferer():
         # self.tta_rotation_weights = tta_rotation_weights
         self.num_parts = num_parts
         self.part_id = part_id
+        if not 0.0 <= overlap < 1.0:
+            raise ValueError(f"overlap must be in [0, 1), got {overlap}")
         self.overlap = overlap
         self.batch_size = batch_size
         self.patch_size = tuple(patch_size) if patch_size is not None else None  # Can be None, will derive from model
@@ -794,8 +796,8 @@ class Inferer():
             )
 
     def _create_dataset_and_loader(self):
-        # Use step_size instead of overlap (step_size is [0-1] representing stride as fraction of patch size)
-        # step_size of 0.5 means 50% overlap
+        # The dataset takes a stride as a fraction of the patch size, the complement of the
+        # overlap: overlap 0.25 is a stride of 0.75. A subclass may set step_size directly.
         
         # Use normalization from model checkpoint if available, otherwise use command line arg
         normalization_scheme = self.model_normalization_scheme or self.normalization_scheme
@@ -826,7 +828,7 @@ class Inferer():
         self.dataset = VCDataset(
             input_path=self.input,
             patch_size=self.patch_size,
-            step_size=self.overlap,
+            step_size=(getattr(self, 'step_size', None) or 1.0 - self.overlap),
             num_parts=self.num_parts,
             part_id=self.part_id,
             normalization_scheme=normalization_scheme,
