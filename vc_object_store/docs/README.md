@@ -333,6 +333,24 @@ the attachment announces each change. `syncHub(attachment)` and
 `resolveHubConflicts(attachment, keep)` act asynchronously. Scripts that
 do not use a session call `hub_sync` and the lease functions directly.
 
+Python services use the same session: `ObjectStoreSession().attach(replica,
+author)` starts background sync, `hold_leases(attachment, uuids)` is a context
+manager whose leases renew until it exits, and `hub_status`, `sync_hub`,
+`artifact_directory`, `copy_object` and `take_events` mirror the C++ calls. Data
+is read and edited through `ObjectStore.open(replica)` connections to the same
+file; the session pushes their commits.
+
+```python
+import vc_object_store as vos
+vos.hub_clone(hub, replica, "lasagna")            # once per machine
+session = vos.ObjectStoreSession()
+attachment = session.attach(replica, "lasagna")
+with session.hold_leases(attachment, [surface_uuid]):
+    with vos.ObjectStore.open(replica, author="lasagna") as db:
+        ...  # edit the surface, add objects
+    model_dir = session.artifact_directory(attachment, surface_uuid)
+```
+
 Records changed both locally and on the hub become conflicts, and pushing stops
 until they are resolved. `resolveHubConflict(uuid, "hub")` installs the hub's
 record. `"local"` publishes this replica's record over it and requires the lease.

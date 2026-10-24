@@ -531,6 +531,43 @@ def test_scripts_edit_hosted_replicas_under_leases(tmp_path):
         assert viewer.acquire_leases([fiber])[0]['author'] == 'viewer'
 
 
+def test_service_edits_a_hosted_surface_through_a_session(tmp_path):
+    import time
+    import vc_object_store as vos
+    hub = tmp_path / 'share' / 'hub.vcobj'
+    hub.parent.mkdir()
+    points = np.stack([*np.mgrid[:4, :5][::-1], np.full((4, 5), 9)], axis=-1).astype('<f4')
+    with ObjectStore.create(str(hub), author='curator') as origin:
+        surface, _ = put(origin, dict(kind='surface', attributes={'scale': [1, 1]}, arrays=[array('points', points)]), 'surface')
+        origin.checkpoint()
+    vos.hub_init(str(hub), 'curator')
+    for name in ('service', 'viewer'):
+        vos.hub_clone(str(hub), str(tmp_path / f'{name}.vcobj'), name)
+    session = vos.ObjectStoreSession()
+    attachment = session.attach(str(tmp_path / 'service.vcobj'), 'service', sync_interval_ms=100, push_delay_ms=20)
+    assert session.attachments() == [attachment] and session.writable(attachment)
+    model = session.artifact_directory(attachment, surface)
+    assert model == hub.parent / 'hub.vcobj.artifacts' / surface and model.is_dir()
+    with session.hold_leases(attachment, [surface]):
+        with ObjectStore.open(str(tmp_path / 'service.vcobj'), author='service') as db:
+            revision = db.current_geometry(surface)['uuid']
+            db.edit_geometry_rectangle(surface, 'points', 1, 1, 1, 1, np.array([7, 7, 7], '<f4').tobytes(), revision)
+        edited_at = time.time() * 1e6
+        session.sync_hub(attachment)
+        deadline = time.time() + 20
+        # Status describes the worker's last sync; wait for one after the edit.
+        while (status := session.hub_status(attachment))['pending'] or (status['synced_at_us'] or 0) <= edited_at:
+            assert time.time() < deadline, 'the session pushes the service edit'
+            time.sleep(0.05)
+    kinds = [event['kind'] for event in session.take_events()]
+    assert kinds[0] == 'attached' and 'committed' in kinds
+    session.detach(attachment)
+    with ObjectStore.open(str(tmp_path / 'viewer.vcobj'), author='viewer') as viewer:
+        assert viewer.hub_sync()['pulled'] == 1
+        edited = viewer.read_geometry_rectangle(viewer.current_geometry(surface)['uuid'], 'points', 1, 1, 1, 1)
+        assert edited == np.array([7, 7, 7], '<f4').tobytes()
+
+
 def test_scripts_sync_a_hub_addressed_over_sftp_with_a_password(tmp_path, monkeypatch):
     """The C++ SFTP test executable acts as ssh and serves files with the installed sftp-server."""
     import os

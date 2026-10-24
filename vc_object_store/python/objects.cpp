@@ -2,6 +2,7 @@
 #include "ObjectReadBindings.hpp"
 #include "TypedGeometryBindings.hpp"
 #include "GeometryRegionBindings.hpp"
+#include "HubBindings.hpp"
 #include <nanobind/stl/map.h>
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/Hub.hpp"
@@ -236,38 +237,6 @@ void bindMutations(nb::class_<T>& cls)
 
 }  // namespace
 
-namespace {
-nb::list hubLeases(const std::vector<vo::HubLease>& leases)
-{
-    nb::list result;
-    for (const auto& lease : leases) {
-        nb::dict item; item["uuid"] = lease.objectUuid; item["holder"] = lease.holder;
-        item["author"] = lease.author; item["host"] = lease.host;
-        item["acquired_us"] = lease.acquiredUs; item["expires_us"] = lease.expiresUs;
-        result.append(item);
-    }
-    return result;
-}
-
-nb::list hubConflicts(const std::vector<vo::HubConflict>& conflicts)
-{
-    nb::list result;
-    for (const auto& conflict : conflicts) {
-        nb::dict item; item["uuid"] = conflict.uuid; item["hub_version"] = conflict.hubVersion;
-        item["hub"] = jsonLoads(conflict.hubRecord); item["local"] = jsonLoads(conflict.localRecord);
-        result.append(item);
-    }
-    return result;
-}
-
-nb::dict hubReport(const vo::HubSyncReport& report)
-{
-    nb::dict result; result["pulled"] = report.pulled; result["pushed"] = report.pushed;
-    result["conflicts"] = hubConflicts(report.conflicts);
-    return result;
-}
-}
-
 NB_MODULE(_native, m)
 {
     nb::class_<vc::CtSheetNormalSampler>(m, "CtSheetNormalSampler")
@@ -288,6 +257,7 @@ NB_MODULE(_native, m)
 
     bindGraphReadView(m);
     bindGeometryRegion(m);
+    bindObjectStoreSession(m);
     bindTypedGeometry(m); // Shared C++ geometry and revision-pinned views.
 
     m.def("hub_init", &vo::initHub, nb::arg("path"), nb::arg("author"),
