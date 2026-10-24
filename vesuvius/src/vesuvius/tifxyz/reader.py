@@ -17,6 +17,15 @@ import cv2
 import numpy as np
 import tifffile
 
+from .open_data import (
+    DOWNSCALE_APPLIED_KEY,
+    _check_factor as _check_downscale_factor,
+    applied_downscale_marker,
+    is_open_data_normalized_path,
+    lookup_downscale,
+    warn_known_downscale,
+    warn_missing_downscale,
+)
 from .types import Tifxyz
 
 logger = logging.getLogger(__name__)
@@ -309,6 +318,8 @@ def read_tifxyz(
     validate: bool = True,
     volume_path: Optional[Union[str, Path]] = None,
     discover_label_shapes: bool = False,
+    downscale: Optional[Union[float, str]] = None,
+    open_data_catalog: Optional[Any] = None,
 ) -> Tifxyz:
     """Read a tifxyz directory into a Tifxyz object.
 
@@ -326,6 +337,24 @@ def read_tifxyz(
     discover_label_shapes : bool
         If True, read candidate label images during discovery to validate their
         shapes. Default False keeps label discovery metadata-only.
+    downscale : float, optional
+        Open-data ``original_volume_downscale`` of the segment (catalog
+        ``metadata.json``: ``samples[s].segments[g].properties``). The stored
+        coordinates are multiplied by it (``Tifxyz.retarget(1 / downscale)``:
+        valid points and bbox scaled, grid ``scale`` divided), giving voxels of
+        the segment's original volume. ``tifxyz_normalized`` meshes from the
+        open-data bucket need this when the factor is not 1; their ``meta.json``
+        does not record it. Default None applies nothing and warns
+        (``OpenDataDownscaleWarning``) if the path is an open-data
+        ``mesh/intermediate/tifxyz_normalized`` directory; pass 1 to silence.
+        See also ``read_open_data_normalized``. ``downscale="catalog"`` looks the
+        factor up (meta.json ``original_volume_downscale``, then the catalog) and
+        applies it.
+    open_data_catalog : dict or path, optional
+        Open-data ``metadata.json`` (parsed or a local path; default
+        ``$VESUVIUS_OPEN_DATA_CATALOG``). With it, a ``tifxyz_normalized`` read
+        without ``downscale`` warns only when the segment's factor is not 1, and
+        names the factor.
 
     Returns
     -------
@@ -340,12 +369,46 @@ def read_tifxyz(
     ValueError
         If validation fails (shape mismatch, invalid data).
     """
+    if downscale is not None and downscale != "catalog":
+        _check_downscale_factor(downscale)
     reader = TifxyzReader(path)
     tifxyz = reader.read(
         load_mask=load_mask,
         validate=validate,
         discover_label_shapes=discover_label_shapes,
     )
+
+    already = applied_downscale_marker(tifxyz.extra)
+    if downscale == "catalog":
+        factor, _ = lookup_downscale(reader.path, tifxyz.extra, open_data_catalog)
+        if factor is None:
+            raise ValueError(
+                f"{reader.path}: downscale='catalog' needs meta.json original_volume_downscale, "
+                "or open_data_catalog / $VESUVIUS_OPEN_DATA_CATALOG and a bucket-layout path"
+            )
+        downscale = 1.0 if already is not None else factor
+    if downscale is None:
+        if already is None:
+            factor, source = lookup_downscale(reader.path, tifxyz.extra, open_data_catalog)
+            if factor is not None:
+                if factor != 1.0:
+                    warn_known_downscale(reader.path, factor, source)
+            elif is_open_data_normalized_path(reader.path):
+                warn_missing_downscale(reader.path)
+    else:
+        factor = float(downscale)
+        if already is not None:
+            # Written after a downscale was handled (by this package or by VC3D's Open Data
+            # cache): the coordinates are already original-volume voxels. Never scale twice.
+            if factor != 1.0:
+                raise ValueError(
+                    f"{reader.path}: meta.json says {already[0]}={already[1]}; "
+                    "the coordinates are already in original-volume voxels"
+                )
+        else:
+            if factor != 1.0:
+                tifxyz = tifxyz.retarget(1.0 / factor)
+            tifxyz.extra[DOWNSCALE_APPLIED_KEY] = factor
 
     if volume_path is not None:
         import zarr
