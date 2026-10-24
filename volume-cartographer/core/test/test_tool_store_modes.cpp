@@ -47,6 +47,20 @@ std::string tool(const char* variable)
     return std::string("\"") + path + "\"";
 }
 
+// A 128x192x192 uint8 volume with a deterministic ramp, covering the fixture surface.
+void writeRampVolume(const fs::path& path)
+{
+    Volume::ZarrCreateOptions options;
+    options.shapeZYX = {128, 192, 192};
+    options.compressor = "none";
+    auto volume = Volume::New(path, options);
+    Array3D<uint8_t> ramp({128, 192, 192}, 0);
+    for (size_t z = 0; z < 128; ++z)
+        for (size_t y = 0; y < 192; ++y)
+            for (size_t x = 0; x < 192; ++x) ramp(z, y, x) = uint8_t((x + 2 * y + 3 * z) % 251);
+    volume->writeZYX(ramp, {0, 0, 0});
+}
+
 // A store holding one curved surface, and the same surface as a tifxyz directory.
 struct Fixture {
     fs::path dir = fs::temp_directory_path() / ("vc-tool-store-" + util::newUuid());
@@ -90,15 +104,7 @@ TEST_CASE("vc_tifxyz2obj writes the OBJ into the surface's artifact directory")
 TEST_CASE("vc_render_tifxyz renders a stored surface like its tifxyz")
 {
     Fixture f;
-    Volume::ZarrCreateOptions options;
-    options.shapeZYX = {128, 192, 192};
-    options.compressor = "none";
-    auto volume = Volume::New(f.dir / "volume.zarr", options);
-    Array3D<uint8_t> ramp({128, 192, 192}, 0);
-    for (size_t z = 0; z < 128; ++z)
-        for (size_t y = 0; y < 192; ++y)
-            for (size_t x = 0; x < 192; ++x) ramp(z, y, x) = uint8_t((x + 2 * y + 3 * z) % 251);
-    volume->writeZYX(ramp, {0, 0, 0});
+    writeRampVolume(f.dir / "volume.zarr");
     const auto bin = tool("VC_RENDER_TIFXYZ_BIN") + " --volume \"" + (f.dir / "volume.zarr").string() +
         "\" --scale 1 --group-idx 0 --num-slices 3";
     run(bin + " --segmentation \"" + f.tifxyz.string() + "\" --tif-output \"" + (f.dir / "file").string() + "\"", f.dir / "file.log");
@@ -266,4 +272,28 @@ TEST_CASE("vc_flatten flattens a stored surface and stores its uv channel")
     // tifxyz --uv-only cannot write a two-component channel; the store keeps it per vertex.
     CHECK(uvArray->dtype == "<f4");
     CHECK(uvArray->shape == std::vector<int64_t>{12, 16, 2});
+}
+
+TEST_CASE("vc_objrefine refines a stored surface into a new object or in place")
+{
+    Fixture f;
+    writeRampVolume(f.dir / "volume.zarr");
+    std::ofstream(f.dir / "params.json") << R"({"refine": true, "start": -3, "stop": 3, "step": 1, "r": 1, "scale_group": "0", "reader_scale": 1})";
+    const auto bin = tool("VC_OBJREFINE_BIN");
+    const std::string tail = " \"" + (f.dir / "params.json").string() + "\"";
+    const std::string volume = " \"" + (f.dir / "volume.zarr").string() + "\" ";
+    run(bin + volume + "\"" + f.tifxyz.string() + "\" \"" + (f.dir / "refined").string() + "\"" + tail, f.dir / "file.log");
+    const std::string store = bin + " --store=\"" + f.store.string() + "\"" + volume;
+    const auto created = surfaceUuid(run(store + f.uuid + " refined" + tail, f.dir / "store.log"));
+    run(store + f.uuid + " " + f.uuid + tail, f.dir / "inplace.log");
+    OpenOptions options; options.author = "tool-store-test";
+    auto db = ObjectStore::open(f.store, options);
+    auto txn = db.read();
+    const auto files = load_quad_from_tifxyz(f.dir / "refined");
+    for (const auto& uuid : {created, f.uuid}) {
+        const auto stored = load_quad_from_store(db, txn, uuid);
+        REQUIRE(stored->rawPointsPtr()->size() == files->rawPointsPtr()->size());
+        CHECK(cv::norm(*stored->rawPointsPtr(), *files->rawPointsPtr(), cv::NORM_INF) == 0);
+    }
+    CHECK(db.objectByUuid(txn, created)->name == "refined");
 }

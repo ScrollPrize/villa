@@ -11,6 +11,7 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/StoreSurfaces.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/core/util/Surface.hpp"
 
@@ -285,23 +286,14 @@ int process_obj(const std::string& src,
     return EXIT_SUCCESS;
 }
 
-int process_tifxyz(const std::filesystem::path& src,
-                   const std::filesystem::path& dst,
-                   DSReader& reader,
-                   const RefinementConfig& cfg)
+// The surface with every valid vertex moved along its normal by the
+// alpha-composited offset (unchanged without cfg.refine); null if it has no points.
+std::unique_ptr<QuadSurface> refine_surface(QuadSurface& surf, DSReader& reader, const RefinementConfig& cfg)
 {
-    std::unique_ptr<QuadSurface> surf;
-    try {
-        surf = load_quad_from_tifxyz(src.string());
-    } catch (const std::exception& e) {
-        std::cerr << "failed to load tifxyz: " << e.what() << std::endl;
-        return EXIT_FAILURE;
-    }
-
-    cv::Mat_<cv::Vec3f> original = surf->rawPoints().clone();
+    cv::Mat_<cv::Vec3f> original = surf.rawPoints().clone();
     if (original.empty()) {
-        std::cerr << "tifxyz surface has no points\n";
-        return EXIT_FAILURE;
+        std::cerr << "surface has no points\n";
+        return nullptr;
     }
 
     cv::Mat_<cv::Vec3f> refined = original.clone();
@@ -316,7 +308,7 @@ int process_tifxyz(const std::filesystem::path& src,
                 if (!loc_valid(original, cv::Vec2d(y, x))) {
                     continue;
                 }
-                const cv::Vec3f normal = surf->gridNormal(y, x);
+                const cv::Vec3f normal = surf.gridNormal(y, x);
                 if (!normal_is_valid(normal)) {
                     continue;
                 }
@@ -335,24 +327,60 @@ int process_tifxyz(const std::filesystem::path& src,
         }
     }
 
-    QuadSurface outSurf(refined, surf->scale());
-    outSurf.id = dst.filename().string();
-
-    if (!surf->meta.is_null()) {
-        outSurf.meta = surf->meta;
+    auto out = std::make_unique<QuadSurface>(refined, surf.scale());
+    if (!surf.meta.is_null()) {
+        out->meta = surf.meta;
     }
+    if (cfg.gen_vertexcolor) {
+        std::cerr << "warning: gen_vertexcolor not supported for surface output; ignoring flag\n";
+    }
+    return out;
+}
+
+int process_tifxyz(const std::filesystem::path& src,
+                   const std::filesystem::path& dst,
+                   DSReader& reader,
+                   const RefinementConfig& cfg)
+{
+    std::unique_ptr<QuadSurface> surf;
+    try {
+        surf = load_quad_from_tifxyz(src.string());
+    } catch (const std::exception& e) {
+        std::cerr << "failed to load tifxyz: " << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
+    auto outSurf = refine_surface(*surf, reader, cfg);
+    if (!outSurf) return EXIT_FAILURE;
+    outSurf->id = dst.filename().string();
 
     try {
-        outSurf.saveEdited(src, dst, cfg.overwrite);
+        outSurf->saveEdited(src, dst, cfg.overwrite);
     } catch (const std::exception& e) {
         std::cerr << "failed to save tifxyz: " << e.what() << std::endl;
         return EXIT_FAILURE;
     }
+    return EXIT_SUCCESS;
+}
 
-    if (cfg.gen_vertexcolor) {
-        std::cerr << "warning: gen_vertexcolor not supported for tifxyz output; ignoring flag\n";
+// A stored surface, refined in place when `out` is its UUID, else into a new object named `out`.
+int process_stored(StoreSurfaces& store, const std::string& uuid, const std::string& out,
+                   const nlohmann::json& parameters, DSReader& reader, const RefinementConfig& cfg)
+{
+    try {
+        auto surf = store.load(uuid);
+        auto refined = refine_surface(*surf, reader, cfg);
+        if (!refined) return EXIT_FAILURE;
+        if (out == surf->id || out == uuid) {
+            std::cout << "geometry_revision: " << store.update(surf->id, *refined) << std::endl;
+        } else {
+            const auto created = store.create(*refined, out, parameters, {surf->id});
+            std::cout << "surface_uuid: " << created << std::endl;
+        }
+        store.finish();
+    } catch (const std::exception& e) {
+        std::cerr << "failed to refine stored surface " << uuid << ": " << e.what() << std::endl;
+        return EXIT_FAILURE;
     }
-
     return EXIT_SUCCESS;
 }
 
@@ -375,9 +403,18 @@ private:
 
 int main(int argc, char *argv[])
 {
+    // Store mode: --store=PATH first, then the surface is a UUID and the output
+    // is that UUID (refine in place) or the name of a new surface.
+    std::optional<std::filesystem::path> store_path;
+    if (argc > 1 && std::string(argv[1]).rfind("--store=", 0) == 0) {
+        store_path = std::string(argv[1]).substr(8);
+        ++argv; --argc;
+    }
     if (argc != 5) {
         std::cout << "usage: " << argv[0]
-                  << " <zarr-volume> <src-surface> <out-surface> <json-params>" << std::endl;
+                  << " [--store=<store>] <zarr-volume> <src-surface> <out-surface> <json-params>" << std::endl
+                  << "  with --store the source is a surface UUID; the output is that UUID (refine in place)"
+                  << " or the name of a new surface" << std::endl;
         return EXIT_SUCCESS;
     }
 
@@ -422,6 +459,12 @@ int main(int argc, char *argv[])
     DSReader reader = {&volume, cfg.reader_scale, level};
 
     MeasureLife timer("processing surface ...\n");
+
+    if (store_path) {
+        StoreSurfaces store(*store_path, "vc_objrefine");
+        return process_stored(store, surface_src.string(), surface_dst.string(),
+                              nlohmann::json::parse(params.dump()), reader, cfg);
+    }
 
     int ret = EXIT_FAILURE;
     const SurfaceInputType inputType = detect_surface_type(surface_src);
