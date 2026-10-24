@@ -10,6 +10,25 @@
 namespace vc::objects::formats {
 using Json = nlohmann::json;
 namespace fs = std::filesystem;
+GeometryArray surfaceChannel(const std::string& name, const fs::path& path)
+{
+    auto samples = readTiffSamples(path);
+    std::string dtype;
+    if (samples.sampleFormat == SAMPLEFORMAT_UINT && samples.bits == 8) dtype = "|u1";
+    else if (samples.sampleFormat == SAMPLEFORMAT_UINT && samples.bits == 16) dtype = "<u2";
+    else if (samples.sampleFormat == SAMPLEFORMAT_UINT && samples.bits == 64) dtype = "<u8";
+    else if (samples.sampleFormat == SAMPLEFORMAT_INT && samples.bits == 32) dtype = "<i4";
+    else if (samples.sampleFormat == SAMPLEFORMAT_INT && samples.bits == 64) dtype = "<i8";
+    else if (samples.sampleFormat == SAMPLEFORMAT_IEEEFP && samples.bits == 32) dtype = "<f4";
+    else if (samples.sampleFormat == SAMPLEFORMAT_IEEEFP && samples.bits == 64) dtype = "<f8";
+    else throw std::runtime_error("unsupported surface channel dtype: " + path.string());
+    if constexpr (std::endian::native != std::endian::little)
+        for (size_t i = 0; i < samples.bytes.size(); i += samples.bits/8)
+            std::reverse(samples.bytes.begin()+i, samples.bytes.begin()+i+samples.bits/8);
+    std::vector<int64_t> shape{int64_t(samples.height), int64_t(samples.width)};
+    if (samples.components != 1) shape.push_back(samples.components);
+    return {name, dtype, shape, std::move(samples.bytes)};
+}
 Prepared surface(const fs::path& source)
 {
     auto fingerprint = [&]() {
@@ -63,23 +82,9 @@ Prepared surface(const fs::path& source)
             throw std::runtime_error("duplicate/reserved surface channel name: " + name);
     }
     for (const auto& [name, path] : files) {
-        auto samples = readTiffSamples(path);
-        std::string dtype;
-        if (samples.sampleFormat == SAMPLEFORMAT_UINT && samples.bits == 8) dtype = "|u1";
-        else if (samples.sampleFormat == SAMPLEFORMAT_UINT && samples.bits == 16) dtype = "<u2";
-        else if (samples.sampleFormat == SAMPLEFORMAT_UINT && samples.bits == 64) dtype = "<u8";
-        else if (samples.sampleFormat == SAMPLEFORMAT_INT && samples.bits == 32) dtype = "<i4";
-        else if (samples.sampleFormat == SAMPLEFORMAT_INT && samples.bits == 64) dtype = "<i8";
-        else if (samples.sampleFormat == SAMPLEFORMAT_IEEEFP && samples.bits == 32) dtype = "<f4";
-        else if (samples.sampleFormat == SAMPLEFORMAT_IEEEFP && samples.bits == 64) dtype = "<f8";
-        else throw std::runtime_error("unsupported surface channel dtype: " + path.string());
-        if constexpr (std::endian::native != std::endian::little)
-            for (size_t i = 0; i < samples.bytes.size(); i += samples.bits/8)
-                std::reverse(samples.bytes.begin()+i, samples.bytes.begin()+i+samples.bits/8);
-        std::vector<int64_t> shape{int64_t(samples.height), int64_t(samples.width)};
-        detail::surfaceChannelResolution(path.string(), shape, {grid.rows, grid.cols});
-        if (samples.components != 1) shape.push_back(samples.components);
-        p.geometry.arrays.push_back({name, dtype, shape, std::move(samples.bytes)});
+        auto channel = surfaceChannel(name, path);
+        detail::surfaceChannelResolution(path.string(), channel.shape, {grid.rows, grid.cols});
+        p.geometry.arrays.push_back(std::move(channel));
     }
     if (before != fingerprint()) throw std::runtime_error("surface changed while reading; retry ingestion");
     p.geometry.attributes = Json{{"scale", root.at("scale")}}.dump();

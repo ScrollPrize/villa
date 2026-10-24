@@ -197,4 +197,11 @@ GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& ki
     } catch (const std::exception& error) { problem(report, source.string(), error); }
     return report;
 }
+std::string importSurfaceChannel(ObjectStore& db, WriteTxn& txn, const std::string& objectUuid,
+    const std::string& name, const fs::path& tiff)
+{
+    const auto current = db.currentGeometry(txn, objectUuid);
+    if (!current || current->kind != "surface") throw std::invalid_argument("channel import requires a stored surface: " + objectUuid);
+    return db.updateSurfaceChannels(txn, objectUuid, {formats::surfaceChannel(name, tiff)}, {}, current->uuid);
+}
 } // namespace vc::objects

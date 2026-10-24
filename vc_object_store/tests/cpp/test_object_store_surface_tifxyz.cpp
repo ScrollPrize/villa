@@ -99,6 +99,23 @@ int main() try
         require(data.arrays.size() == 3, "encode keeps validity and channels");
     }
 
+    // An ink prediction rendered at 2x attaches as a channel of the stored surface.
+    cv::Mat_<uint8_t> prediction(2 * rows, 2 * cols, uint8_t(3));
+    writeTiff(directory.path / "prediction.tif", prediction);
+    {
+        auto txn = db.write();
+        importSurfaceChannel(db, txn, uuid, "ink_prediction", directory.path / "prediction.tif");
+        txn.commit();
+    }
+    require(array(db, uuid, "ink_prediction") == std::vector<uint8_t>(prediction.datastart, prediction.dataend),
+            "imported channels keep exact samples");
+    {
+        cv::Mat_<uint8_t> misaligned(2 * rows + 1, 2 * cols, uint8_t(3));
+        writeTiff(directory.path / "misaligned.tif", misaligned);
+        auto txn = db.write();
+        mustFail([&] { importSurfaceChannel(db, txn, uuid, "bad", directory.path / "misaligned.tif"); });
+    }
+
     // Export writes VC's mask (single page, grid resolution) and the channel;
     // ingesting that export reproduces the stored arrays.
     const auto exported = directory.path / "exported";
@@ -108,7 +125,7 @@ int main() try
             exportedMask.bytes == expectedValid, "valid exports as mask.tif");
     auto other = ObjectStore::create(directory.path / "other.vcobj", options);
     require(ingestGeometrySource(other, "surface", exported).ingested == 1, "export ingests");
-    for (const auto* name : {"points", "valid", "ink"})
+    for (const auto* name : {"points", "valid", "ink", "ink_prediction"})
         require(array(other, uuid, name) == array(db, uuid, name), "export round-trips every array");
 
     // A mask that is not a whole multiple of the grid is rejected, not ignored.

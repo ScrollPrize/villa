@@ -9,6 +9,8 @@ try {
     std::optional<std::filesystem::path> root;
     std::vector<std::string> uuids;
     std::vector<std::pair<std::string, std::filesystem::path>> sources;
+    struct Channel { std::string uuid, name; std::filesystem::path image; };
+    std::vector<Channel> channels;
     bool registered = false, showProgress = true;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -25,6 +27,10 @@ try {
         else if (arg == "--fiber") sources.emplace_back("fiber", next());
         else if (arg == "--point-collections") sources.emplace_back("point_collection", next());
         else if (arg == "--tracks") sources.emplace_back("track", next());
+        else if (arg == "--surface-channel") {
+            Channel channel; channel.uuid = next(); channel.name = next(); channel.image = next();
+            channels.push_back(std::move(channel));
+        }
         else if (arg == "--no-progress") showProgress = false;
         else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: vc_object_ingest --db objects.vcobj --author NAME [options]\n"
@@ -35,6 +41,8 @@ try {
                 "  --fiber PATH              import new fibers from JSON or a directory\n"
                 "  --point-collections FILE  import new collections from a JSON\n"
                 "  --tracks PATH             import new packed tracks (or DBM with packed mirror)\n"
+                "  --surface-channel UUID NAME TIFF\n"
+                "                            add or replace a channel of a stored surface\n"
                 "  --no-progress             suppress progress display\n"
                 "Fiber/collection sources and registered batches commit atomically; tracks commit individually. Failures are reported and exit status is nonzero.\n"
                 "Source flags are repeatable. Existing object identities are errors, even when unchanged.\n"
@@ -42,8 +50,8 @@ try {
             return 0;
         } else throw std::runtime_error("unknown argument: " + arg);
     }
-    if (path.empty() || author.empty() || (!registered && sources.empty()))
-        throw std::runtime_error("specify --db, --author and --registered/--uuid or source flags; see --help");
+    if (path.empty() || author.empty() || (!registered && sources.empty() && channels.empty()))
+        throw std::runtime_error("specify --db, --author and --registered/--uuid, source or channel flags; see --help");
     vc::objects::OpenOptions options; options.author = author;
     auto db = std::filesystem::exists(path) ? vc::objects::ObjectStore::open(path, options) : vc::objects::ObjectStore::create(path, options);
     bool failed = false;
@@ -61,6 +69,17 @@ try {
         vc::objects::util::TerminalProgress progress("Ingest registered geometry", showProgress);
         const auto report = vc::objects::ingestRegisteredGeometry(db, root, uuids, progress.callback());
         progress.finish(); print(report);
+    }
+    for (const auto& channel : channels) {
+        try {
+            auto txn = db.write();
+            const auto revision = vc::objects::importSurfaceChannel(db, txn, channel.uuid, channel.name, channel.image);
+            txn.commit();
+            std::cout << channel.uuid << ": channel " << channel.name << " in geometry revision " << revision << '\n';
+        } catch (const std::exception& error) {
+            std::cerr << channel.uuid << ": " << error.what() << '\n';
+            failed = true;
+        }
     }
     db.checkpoint();
     return failed ? 1 : 0;

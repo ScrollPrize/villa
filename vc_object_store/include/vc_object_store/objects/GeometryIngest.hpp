@@ -51,4 +51,10 @@ GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& ki
     const std::filesystem::path& source, const util::ProgressCallback& progress = {},
     const std::string& coordinateContext = "{}");
 
+// Add or replace one channel of a stored surface from a TIFF with its exact
+// samples (rows and columns a whole multiple of the grid), as an edit of the
+// current geometry in the caller's transaction. Returns the new geometry revision.
+std::string importSurfaceChannel(ObjectStore&, WriteTxn&, const std::string& objectUuid,
+    const std::string& name, const std::filesystem::path& tiff);
+
 } // namespace vc::objects

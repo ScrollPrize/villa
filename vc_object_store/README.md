@@ -50,6 +50,8 @@ with ObjectStore.create("objects.vcobj", author="reviewer") as store:
 
 ```sh
 build/bin/vc_object_ingest --db objects.vcobj --author "$USER" --surface /data/surface
+build/bin/vc_object_ingest --db objects.vcobj --author "$USER" \
+  --surface-channel SURFACE_UUID ink /data/ink_prediction.tif
 build/bin/vc_object_links --db objects.vcobj --author "$USER" --link-surface-overlaps
 build/bin/vc_object_links --db objects.vcobj --author "$USER" \
   --link-fiber-surfaces --ct /data/ct.zarr
