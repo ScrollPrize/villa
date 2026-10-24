@@ -22,7 +22,7 @@ table{border-collapse:collapse;margin:8px 0 14px;font-size:.92rem}th,td{text-ali
 .note{border-left:3px solid var(--accent);padding:6px 12px;color:var(--ink-soft);margin:14px 0}
 </style>
 <h1>Adjacent fiber links</h1>
-<p class="sub">Proposal for PR #1829: adjacent links live in their own top-level <code>adjacent_branches</code> array. The array name is the kind; entries have exactly the existing <code>branches</code> schema.</p>
+<p class="sub">Proposal for PR #1829: adjacent links live in their own top-level <code>adjacent_branches</code> array. The array name is the kind; entries have the existing <code>branches</code> schema with one exception: the automatic-link mark <code>"auto": true</code> (an unreviewed link made by the Fiber Map's "Link A and B", only ever next to <code>"pending": true</code>) is never written on an adjacent entry, and a reader drops it from one.</p>
 
 <h2>What it means</h2>
 <p>An ordinary link ties two control points to the same winding of the sheet. An adjacent link ties a vertical fiber to a horizontal fiber one winding outside it: W<sub>V</sub> = W<sub>H</sub> − 1. The effective H/V tags determine which side is inside. An adjacent link between fibers that are not one H and one V remains stored, is flagged as an error in the fiber map, and contributes no winding constraint.</p>

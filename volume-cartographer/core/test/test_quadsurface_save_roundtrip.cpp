@@ -88,7 +88,8 @@ TEST_CASE("saveOverwrite round-trip preserves sparse-but-large surface")
         QuadSurface surf(pts, cv::Vec2f(1.f, 1.f));
         surf.path = pkg.segDir;
         surf.id = pkg.segName;
-        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
+        surf.meta["uuid"] = pkg.segName;
+        surf.save(pkg.segDir.string(), /*force_overwrite=*/false);
     }
 
     // saveOverwrite path: load, then save again.
@@ -128,7 +129,8 @@ TEST_CASE("saveOverwrite snapshot captures the PRIOR on-disk state, not in-memor
         QuadSurface surf(ptsA, cv::Vec2f(1.f, 1.f));
         surf.path = pkg.segDir;
         surf.id = pkg.segName;
-        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
+        surf.meta["uuid"] = pkg.segName;
+        surf.save(pkg.segDir.string(), /*force_overwrite=*/false);
     }
     REQUIRE_FALSE(fs::exists(pkg.backupsDir));  // first save: no backups
 
@@ -181,7 +183,8 @@ TEST_CASE("saveOverwrite skips snapshot on first save when no on-disk state exis
         // is populated.
         // Use the underlying save API since saveOverwrite would also
         // exercise the snapshot path; both should leave no backup.
-        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
+        surf.meta["uuid"] = pkg.segName;
+        surf.save(pkg.segDir.string(), /*force_overwrite=*/false);
     }
 
     REQUIRE_FALSE(fs::exists(pkg.backupsDir));
@@ -205,7 +208,8 @@ TEST_CASE("save recomputes bbox after post-load point mutation (#1272)")
         QuadSurface surf(pts, cv::Vec2f(1.f, 1.f));
         surf.path = pkg.segDir;
         surf.id = pkg.segName;
-        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
+        surf.meta["uuid"] = pkg.segName;
+        surf.save(pkg.segDir.string(), /*force_overwrite=*/false);
     }
 
     // Sanity: the first save recorded the original extent.
@@ -252,7 +256,8 @@ TEST_CASE("save_meta does not publish bounds for unsaved geometry (#1272)")
         QuadSurface surf(pts, cv::Vec2f(1.f, 1.f));
         surf.path = pkg.segDir;
         surf.id = pkg.segName;
-        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
+        surf.meta["uuid"] = pkg.segName;
+        surf.save(pkg.segDir.string(), /*force_overwrite=*/false);
     }
 
     // save_meta() rewrites meta.json only; the x/y/z TIFFs keep the geometry
@@ -294,7 +299,8 @@ TEST_CASE("stale .tmp file in segment dir does not break reload")
         QuadSurface surf(pts, cv::Vec2f(1.f, 1.f));
         surf.path = pkg.segDir;
         surf.id = pkg.segName;
-        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
+        surf.meta["uuid"] = pkg.segName;
+        surf.save(pkg.segDir.string(), /*force_overwrite=*/false);
     }
 
     // Simulate a crash mid-write: some file got written as .tmp but

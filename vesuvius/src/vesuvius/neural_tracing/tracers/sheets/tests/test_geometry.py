@@ -651,6 +651,46 @@ def test_written_tifxyz_records_its_area(tmp_path):
     assert meta['area_vx2'] == pytest.approx(11*200.) and meta['area_cm2'] == pytest.approx(11*200.*100/1e8)
 
 
+def test_written_tifxyz_uuid_is_fresh_and_stable_on_overwrite(tmp_path):
+    import uuid as uuid_mod
+
+    from vesuvius.neural_tracing.tracers.sheets.tracing.inference import write_surface
+    r, c = np.meshgrid(np.arange(5), np.arange(4), indexing='ij')
+    rows = np.stack([np.full(r.shape, 7.), 10.*c, 20.*r], -1).astype(np.float32)
+    keep = np.ones(r.shape, bool)
+
+    def meta_uuid(out):
+        return json.loads((out/'meta.json').read_text())['uuid']
+
+    write_surface(tmp_path/'a'/'up', rows, keep, 20., 10.)
+    write_surface(tmp_path/'b'/'up', rows, keep, 20., 10.)
+    first, other = meta_uuid(tmp_path/'a'/'up'), meta_uuid(tmp_path/'b'/'up')
+    # A real identity, not the directory name shared by both roots.
+    assert uuid_mod.UUID(first) and first != 'up' and first != other
+    # Re-tracing into the same directory keeps that identity.
+    write_surface(tmp_path/'a'/'up', rows, keep, 20., 10., overwrite=True)
+    assert meta_uuid(tmp_path/'a'/'up') == first
+
+
+def test_written_tifxyz_mmap_layout(tmp_path):
+    """``mmap_layout``: each band uncompressed in one strip (what VC3D maps without rewriting), same values."""
+    from vesuvius.neural_tracing.tracers.sheets.tracing.inference import write_surface
+    r, c = np.meshgrid(np.arange(40), np.arange(25), indexing='ij')
+    rows = np.stack([np.full(r.shape, 7.25), 10.*c+.1, 20.*r+.3], -1).astype(np.float32)
+    keep = np.ones(r.shape, bool)
+    keep[3, 4] = False
+    write_surface(tmp_path/'tiled', rows, keep, 20., 10.)
+    write_surface(tmp_path/'mmap', rows, keep, 20., 10., mmap_layout=True)
+    for band, axis in zip('xyz', range(3)):
+        with tifffile.TiffFile(tmp_path/'mmap'/f'{band}.tif') as tif:
+            page = tif.pages[0]
+            assert not page.is_tiled and page.compression == 1 and len(page.dataoffsets) == 1
+            assert tif.byteorder == '<' and page.dtype == np.float32
+            assert np.array_equal(page.asarray(), np.where(keep, rows[..., axis], -1))
+        assert tifffile.TiffFile(tmp_path/'tiled'/f'{band}.tif').pages[0].is_tiled  # the default is unchanged
+    assert not tifffile.TiffFile(tmp_path/'mmap'/'mask.tif').pages[0].is_tiled
+
+
 def test_fiber_seed_directions_follow_the_tensor_normal():
     """trace_from_fibers: the 2/8 structure-tensor normal of a tilted bright sheet, and an advance direction in the
     sheet, perpendicular to the fiber, pointing up."""

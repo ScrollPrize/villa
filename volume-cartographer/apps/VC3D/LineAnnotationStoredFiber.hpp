@@ -20,6 +20,7 @@
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
+#include "vc/core/util/Uuid.hpp"
 
 namespace vc3d::line_annotation {
 
@@ -50,12 +51,19 @@ struct FiberBranchRef {
     // for a link (delete and re-link to change), mirrored on both
     // reciprocal refs.
     bool adjacent = false;
+    // Created by the Fiber Map's automatic link ("Link A and B") and not yet
+    // reviewed: drawn with a dashed marker in the pending colours. Invariant
+    // `autoLink => pending && !adjacent`, enforced wherever a ref is read,
+    // merged or written; approving the link clears it with `pending`.
+    // Mirrored on both reciprocal refs like `pending` (JSON key "auto").
+    bool autoLink = false;
 };
 
 struct StoredFiber {
     double width = 0.0;
     double widthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
     uint64_t id = 0;
+    std::string uuid = vc::util::newUuid();
     std::string username;
     std::string startedAt;
     uint64_t sequence = 0;

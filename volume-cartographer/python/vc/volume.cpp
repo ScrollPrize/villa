@@ -11,11 +11,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -26,9 +28,12 @@
 #include "vc/core/types/Array3D.hpp"
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/util/GlobalCacheRoot.hpp"
 
 namespace nb = nanobind;
 using namespace nb::literals;
+
+void bindNormalSampler(nb::module_& m);
 
 namespace {
 
@@ -43,19 +48,6 @@ std::string dtypeName(vc::render::ChunkDtype dtype)
     throw std::runtime_error("unsupported chunk dtype");
 }
 
-Volume::MissingScaleLevelPolicy parseMissingPolicy(const std::string& value)
-{
-    if (value == "error")
-        return Volume::MissingScaleLevelPolicy::Error;
-    if (value == "all_fill")
-        return Volume::MissingScaleLevelPolicy::AllFill;
-    if (value == "empty")
-        return Volume::MissingScaleLevelPolicy::Empty;
-    if (value == "virtual_downsample")
-        return Volume::MissingScaleLevelPolicy::VirtualDownsample;
-    throw std::invalid_argument(
-        "missing_policy must be one of: error, all_fill, empty, virtual_downsample");
-}
 
 nb::object jsonToPython(const utils::Json& json)
 {
@@ -114,375 +106,157 @@ T typedFill(double fillValue)
     return static_cast<T>(std::clamp(fillValue, 0.0, maxValue));
 }
 
-template <typename T>
-void copyChunkIntersection(std::vector<T>& out,
-                           const std::array<size_t, 3>& outShape,
-                           const std::array<int, 3>& requestOffset,
-                           const std::array<int, 3>& chunkShape,
-                           int level,
-                           int cz,
-                           int cy,
-                           int cx,
-                           vc::render::IChunkedArray& cache,
-                           T fill)
-{
-    const int chunkBaseZ = cz * chunkShape[0];
-    const int chunkBaseY = cy * chunkShape[1];
-    const int chunkBaseX = cx * chunkShape[2];
+struct BBoxReadStats {
+    uint64_t coveredVoxels = 0;
+    uint64_t requestedChunks = 0;
+    uint64_t missingChunks = 0;
+};
 
-    const int64_t reqZ0 = requestOffset[0];
-    const int64_t reqY0 = requestOffset[1];
-    const int64_t reqX0 = requestOffset[2];
-    const int64_t reqZ1 = reqZ0 + static_cast<int64_t>(outShape[0]);
-    const int64_t reqY1 = reqY0 + static_cast<int64_t>(outShape[1]);
-    const int64_t reqX1 = reqX0 + static_cast<int64_t>(outShape[2]);
-
-    const int z0 = static_cast<int>(std::max<int64_t>(reqZ0, chunkBaseZ));
-    const int y0 = static_cast<int>(std::max<int64_t>(reqY0, chunkBaseY));
-    const int x0 = static_cast<int>(std::max<int64_t>(reqX0, chunkBaseX));
-    const int z1 = static_cast<int>(std::min<int64_t>(reqZ1, chunkBaseZ + chunkShape[0]));
-    const int y1 = static_cast<int>(std::min<int64_t>(reqY1, chunkBaseY + chunkShape[1]));
-    const int x1 = static_cast<int>(std::min<int64_t>(reqX1, chunkBaseX + chunkShape[2]));
-    if (z0 >= z1 || y0 >= y1 || x0 >= x1)
-        return;
-
-    const size_t copyCount = static_cast<size_t>(x1 - x0);
-    const size_t dstStrideY = outShape[2];
-    const size_t dstStrideZ = outShape[1] * dstStrideY;
-
-    auto result = cache.getChunkBlocking(level, cz, cy, cx);
-    if (result.status == vc::render::ChunkStatus::Error)
-        throw std::runtime_error(result.error.empty() ? "chunk fetch failed" : result.error);
-
-    if (result.status == vc::render::ChunkStatus::AllFill ||
-        result.status == vc::render::ChunkStatus::Missing ||
-        !result.bytes) {
-        for (int z = z0; z < z1; ++z) {
-            const size_t dstZ = static_cast<size_t>(z - requestOffset[0]);
-            for (int y = y0; y < y1; ++y) {
-                const size_t dstY = static_cast<size_t>(y - requestOffset[1]);
-                const size_t dstX = static_cast<size_t>(x0 - requestOffset[2]);
-                const size_t dst = dstZ * dstStrideZ + dstY * dstStrideY + dstX;
-                std::fill_n(out.data() + dst, copyCount, fill);
-            }
-        }
-        return;
-    }
-
-    const size_t expectedBytes = static_cast<size_t>(chunkShape[0]) *
-                                 static_cast<size_t>(chunkShape[1]) *
-                                 static_cast<size_t>(chunkShape[2]) *
-                                 sizeof(T);
-    if (result.bytes->size() < expectedBytes)
-        throw std::runtime_error("chunk payload is smaller than expected");
-
-    const auto* srcData = reinterpret_cast<const T*>(result.bytes->data());
-    const size_t srcStrideY = static_cast<size_t>(chunkShape[2]);
-    const size_t srcStrideZ = static_cast<size_t>(chunkShape[1]) * srcStrideY;
-
-    for (int z = z0; z < z1; ++z) {
-        const size_t srcZ = static_cast<size_t>(z - chunkBaseZ);
-        const size_t dstZ = static_cast<size_t>(z - requestOffset[0]);
-        for (int y = y0; y < y1; ++y) {
-            const size_t srcY = static_cast<size_t>(y - chunkBaseY);
-            const size_t srcX = static_cast<size_t>(x0 - chunkBaseX);
-            const size_t dstY = static_cast<size_t>(y - requestOffset[1]);
-            const size_t dstX = static_cast<size_t>(x0 - requestOffset[2]);
-            const size_t src = srcZ * srcStrideZ + srcY * srcStrideY + srcX;
-            const size_t dst = dstZ * dstStrideZ + dstY * dstStrideY + dstX;
-            std::memcpy(out.data() + dst, srcData + src, copyCount * sizeof(T));
-        }
-    }
-}
-
-template <typename T>
-void sampleBlockChunkIntersection(std::vector<T>& out,
-                                  std::vector<uint8_t>& valid,
-                                  const std::array<size_t, 3>& outShape,
-                                  const std::array<int, 3>& requestOffset,
-                                  const std::array<int, 3>& chunkShape,
-                                  int level,
-                                  int cz,
-                                  int cy,
-                                  int cx,
-                                  vc::render::IChunkedArray& cache,
-                                  bool blocking,
-                                  T fill,
-                                  vc::render::ChunkedPlaneSampler::Stats& stats)
-{
-    const int chunkBaseZ = cz * chunkShape[0];
-    const int chunkBaseY = cy * chunkShape[1];
-    const int chunkBaseX = cx * chunkShape[2];
-
-    const int64_t reqZ0 = requestOffset[0];
-    const int64_t reqY0 = requestOffset[1];
-    const int64_t reqX0 = requestOffset[2];
-    const int64_t reqZ1 = reqZ0 + static_cast<int64_t>(outShape[0]);
-    const int64_t reqY1 = reqY0 + static_cast<int64_t>(outShape[1]);
-    const int64_t reqX1 = reqX0 + static_cast<int64_t>(outShape[2]);
-
-    const int z0 = static_cast<int>(std::max<int64_t>(reqZ0, chunkBaseZ));
-    const int y0 = static_cast<int>(std::max<int64_t>(reqY0, chunkBaseY));
-    const int x0 = static_cast<int>(std::max<int64_t>(reqX0, chunkBaseX));
-    const int z1 = static_cast<int>(std::min<int64_t>(reqZ1, chunkBaseZ + chunkShape[0]));
-    const int y1 = static_cast<int>(std::min<int64_t>(reqY1, chunkBaseY + chunkShape[1]));
-    const int x1 = static_cast<int>(std::min<int64_t>(reqX1, chunkBaseX + chunkShape[2]));
-    if (z0 >= z1 || y0 >= y1 || x0 >= x1)
-        return;
-
-    auto result = blocking
-        ? cache.getChunkBlocking(level, cz, cy, cx)
-        : cache.tryGetChunk(level, cz, cy, cx);
-    if (result.status == vc::render::ChunkStatus::Error) {
-        ++stats.errorChunks;
-        throw std::runtime_error(result.error.empty() ? "chunk fetch failed" : result.error);
-    }
-    if (blocking && result.status == vc::render::ChunkStatus::MissQueued) {
-        ++stats.errorChunks;
-        throw std::runtime_error(
-            "blocking requested-level block sampling received unresolved chunk after getChunkBlocking");
-    }
-    if (result.status == vc::render::ChunkStatus::MissQueued)
-        return;
-    if (result.status == vc::render::ChunkStatus::Missing)
-        ++stats.missingChunks;
-
-    const size_t copyCount = static_cast<size_t>(x1 - x0);
-    const size_t dstStrideY = outShape[2];
-    const size_t dstStrideZ = outShape[1] * dstStrideY;
-
-    const bool fillOnly = result.status == vc::render::ChunkStatus::AllFill ||
-                          result.status == vc::render::ChunkStatus::Missing;
-    const T fillValue = result.status == vc::render::ChunkStatus::Missing ? T{} : fill;
-    const T* srcData = nullptr;
-    size_t srcStrideY = 0;
-    size_t srcStrideZ = 0;
-    if (!fillOnly) {
-        if (!result.bytes)
-            throw std::runtime_error("chunk payload is missing for data chunk");
-        const size_t expectedBytes = static_cast<size_t>(chunkShape[0]) *
-                                     static_cast<size_t>(chunkShape[1]) *
-                                     static_cast<size_t>(chunkShape[2]) *
-                                     sizeof(T);
-        if (result.bytes->size() < expectedBytes)
-            throw std::runtime_error("chunk payload is smaller than expected");
-        srcData = reinterpret_cast<const T*>(result.bytes->data());
-        srcStrideY = static_cast<size_t>(chunkShape[2]);
-        srcStrideZ = static_cast<size_t>(chunkShape[1]) * srcStrideY;
-    }
-
-    for (int z = z0; z < z1; ++z) {
-        const size_t srcZ = static_cast<size_t>(z - chunkBaseZ);
-        const size_t dstZ = static_cast<size_t>(z - requestOffset[0]);
-        for (int y = y0; y < y1; ++y) {
-            const size_t srcY = static_cast<size_t>(y - chunkBaseY);
-            const size_t srcX = static_cast<size_t>(x0 - chunkBaseX);
-            const size_t dstY = static_cast<size_t>(y - requestOffset[1]);
-            const size_t dstX = static_cast<size_t>(x0 - requestOffset[2]);
-            const size_t dst = dstZ * dstStrideZ + dstY * dstStrideY + dstX;
-            if (fillOnly) {
-                std::fill_n(out.data() + dst, copyCount, fillValue);
-            } else {
-                const size_t src = srcZ * srcStrideZ + srcY * srcStrideY + srcX;
-                std::memcpy(out.data() + dst, srcData + src, copyCount * sizeof(T));
-            }
-            std::fill_n(valid.data() + dst, copyCount, uint8_t{1});
-            stats.coveredPixels += static_cast<int>(copyCount);
-        }
-    }
-}
-
-template <typename T>
-nb::object readZYXTypedSlow(Volume& volume,
-                            const std::array<int, 3>& offset,
-                            const std::array<size_t, 3>& shape,
-                            int level,
-                            Volume::MissingScaleLevelPolicy missingPolicy)
-{
-    Array3D<T> out(shape);
-    bool ok = false;
-    {
-        nb::gil_scoped_release release;
-        ok = volume.readZYX(out, offset, level, missingPolicy);
-    }
-    if (!ok)
-        return nb::none();
-    return nb::cast(makeNumpyArray(toCOrder(out), shape));
-}
-
-template <typename T>
-nb::object readZYXTyped(Volume& volume,
-                        const std::array<int, 3>& offset,
-                        const std::array<size_t, 3>& shape,
-                        int level,
-                        const std::string& missingPolicy)
-{
-    const auto policy = parseMissingPolicy(missingPolicy);
-    if (level < 0)
-        throw std::out_of_range("level must be non-negative");
-    if (!volume.hasScaleLevel(level)) {
-        return readZYXTypedSlow<T>(volume, offset, shape, level, policy);
-    }
-
-    std::vector<T> out(shape[0] * shape[1] * shape[2], T{});
-    if (shape[0] == 0 || shape[1] == 0 || shape[2] == 0)
-        return nb::cast(makeNumpyArray(std::move(out), shape));
-
-    {
-        nb::gil_scoped_release release;
-        auto* cache = volume.chunkedCache();
-        const auto volumeShape = cache->shape(level);
-        const auto chunkShape = cache->chunkShape(level);
-
-        const int64_t reqZ0 = offset[0];
-        const int64_t reqY0 = offset[1];
-        const int64_t reqX0 = offset[2];
-        const int64_t reqZ1 = reqZ0 + static_cast<int64_t>(shape[0]) - 1;
-        const int64_t reqY1 = reqY0 + static_cast<int64_t>(shape[1]) - 1;
-        const int64_t reqX1 = reqX0 + static_cast<int64_t>(shape[2]) - 1;
-
-        const int readZ0 = static_cast<int>(std::max<int64_t>(0, reqZ0));
-        const int readY0 = static_cast<int>(std::max<int64_t>(0, reqY0));
-        const int readX0 = static_cast<int>(std::max<int64_t>(0, reqX0));
-        const int readZ1 = static_cast<int>(std::min<int64_t>(volumeShape[0] - 1, reqZ1));
-        const int readY1 = static_cast<int>(std::min<int64_t>(volumeShape[1] - 1, reqY1));
-        const int readX1 = static_cast<int>(std::min<int64_t>(volumeShape[2] - 1, reqX1));
-
-        if (readZ0 <= readZ1 && readY0 <= readY1 && readX0 <= readX1) {
-            const int cZ0 = readZ0 / chunkShape[0];
-            const int cY0 = readY0 / chunkShape[1];
-            const int cX0 = readX0 / chunkShape[2];
-            const int cZ1 = readZ1 / chunkShape[0];
-            const int cY1 = readY1 / chunkShape[1];
-            const int cX1 = readX1 / chunkShape[2];
-            const T fill = typedFill<T>(cache->fillValue());
-            for (int cz = cZ0; cz <= cZ1; ++cz) {
-                for (int cy = cY0; cy <= cY1; ++cy) {
-                    for (int cx = cX0; cx <= cX1; ++cx) {
-                        copyChunkIntersection(
-                            out, shape, offset, chunkShape, level, cz, cy, cx, *cache, fill);
-                    }
-                }
-            }
-        }
-    }
-    return nb::cast(makeNumpyArray(std::move(out), shape));
-}
-
-template <typename T>
-nb::object readXYZTyped(Volume& volume,
-                        const std::array<int, 3>& offset,
-                        const std::array<size_t, 3>& shapeXYZ,
-                        int level,
-                        const std::string& missingPolicy)
-{
-    const std::array<int, 3> offsetZYX{offset[2], offset[1], offset[0]};
-    const std::array<size_t, 3> shapeZYX{shapeXYZ[2], shapeXYZ[1], shapeXYZ[0]};
-    return readZYXTyped<T>(volume, offsetZYX, shapeZYX, level, missingPolicy);
-}
-
-nb::object readZYX(Volume& volume,
-                   const std::array<int, 3>& offset,
-                   const std::array<size_t, 3>& shape,
-                   int level,
-                   const std::string& missingPolicy)
-{
-    if (volume.dtype() == vc::render::ChunkDtype::UInt8)
-        return readZYXTyped<uint8_t>(volume, offset, shape, level, missingPolicy);
-    return readZYXTyped<uint16_t>(volume, offset, shape, level, missingPolicy);
-}
-
-nb::object readXYZ(Volume& volume,
-                   const std::array<int, 3>& offset,
-                   const std::array<size_t, 3>& shape,
-                   int level,
-                   const std::string& missingPolicy)
-{
-    if (volume.dtype() == vc::render::ChunkDtype::UInt8)
-        return readXYZTyped<uint8_t>(volume, offset, shape, level, missingPolicy);
-    return readXYZTyped<uint16_t>(volume, offset, shape, level, missingPolicy);
-}
-
-std::vector<vc::render::ChunkKey> collectChunkKeys(Volume& volume,
-                                                   const std::array<int, 3>& offset,
-                                                   const std::array<size_t, 3>& shape,
-                                                   int level);
+std::vector<vc::render::ChunkKey> collectChunkKeys(
+    Volume& volume, const std::array<int, 3>& offset,
+    const std::array<size_t, 3>& shape, int level);
 
 nb::dict statsToDict(const vc::render::ChunkedPlaneSampler::Stats& stats);
 
 template <typename T>
-nb::tuple sampleZYXBlockTyped(Volume& volume,
-                              const std::array<int, 3>& offset,
-                              const std::array<size_t, 3>& shape,
-                              int level,
-                              bool blocking)
+void copyBBoxChunk(std::vector<T>& out, std::vector<uint8_t>* valid,
+                   BBoxReadStats* stats, const std::array<size_t, 3>& shape,
+                   const std::array<int, 3>& offset,
+                   const std::array<int, 3>& chunkShape,
+                   const vc::render::ChunkKey& key,
+                   vc::render::IChunkedArray& cache, T fill)
 {
-    if (level < 0)
-        throw std::out_of_range("level must be non-negative");
-    if (!volume.hasScaleLevel(level))
-        throw std::out_of_range(
-            "requested missing zarr scale level " + std::to_string(level));
-
-    vc::render::ChunkedPlaneSampler::Stats stats;
-    stats.requestedLevelOnly = true;
-    stats.fallbackLevels = 0;
-
-    std::vector<T> out(shape[0] * shape[1] * shape[2], T{});
-    std::vector<uint8_t> valid(out.size(), uint8_t{0});
-
-    const auto keys = collectChunkKeys(volume, offset, shape, level);
-    stats.requestedChunks = static_cast<int>(keys.size());
-    if (keys.empty()) {
-        nb::dict statsDict = statsToDict(stats);
-        statsDict["blocking_prefetch_chunks"] = 0;
-        return nb::make_tuple(
-            makeNumpyArray(std::move(out), shape),
-            makeNumpyArray(std::move(valid), shape),
-            statsDict);
+    const std::array<int64_t, 3> base{
+        int64_t(key.iz) * chunkShape[0], int64_t(key.iy) * chunkShape[1],
+        int64_t(key.ix) * chunkShape[2]};
+    std::array<int64_t, 3> lo{}, hi{};
+    for (size_t d = 0; d < 3; ++d) {
+        lo[d] = std::max<int64_t>(offset[d], base[d]);
+        hi[d] = std::min<int64_t>(int64_t(offset[d]) + int64_t(shape[d]),
+                                  base[d] + chunkShape[d]);
+        // Edge chunks are physically padded: do not expose their padding.
+        hi[d] = std::min<int64_t>(hi[d], cache.shape(key.level)[d]);
+        if (lo[d] >= hi[d])
+            return;
     }
-
-    {
-        nb::gil_scoped_release release;
-        auto* cache = volume.chunkedCache();
-        if (blocking)
-            cache->prefetchChunks(keys, false);
-        const auto chunkShape = cache->chunkShape(level);
-        const T fill = typedFill<T>(cache->fillValue());
-        for (const auto& key : keys) {
-            sampleBlockChunkIntersection(
-                out,
-                valid,
-                shape,
-                offset,
-                chunkShape,
-                level,
-                key.iz,
-                key.iy,
-                key.ix,
-                *cache,
-                blocking,
-                fill,
-                stats);
+    const auto result = cache.getChunkBlocking(key.level, key.iz, key.iy, key.ix);
+    if (result.status == vc::render::ChunkStatus::Error)
+        throw std::runtime_error(result.error.empty() ? "chunk fetch failed" : result.error);
+    if (result.status == vc::render::ChunkStatus::MissQueued)
+        throw std::runtime_error("blocking bbox read received unresolved chunk");
+    const bool fillOnly = result.status == vc::render::ChunkStatus::Missing ||
+                          result.status == vc::render::ChunkStatus::AllFill;
+    if (!fillOnly && (result.status != vc::render::ChunkStatus::Data || !result.bytes))
+        throw std::runtime_error("chunk payload is missing for data chunk");
+    size_t expected = sizeof(T);
+    for (int n : chunkShape) {
+        if (n <= 0 || size_t(n) > std::numeric_limits<size_t>::max() / expected)
+            throw std::overflow_error("invalid chunk byte size");
+        expected *= size_t(n);
+    }
+    if (!fillOnly && result.bytes->size() != expected)
+        throw std::runtime_error("chunk payload size does not match expected size");
+    if (stats && result.status == vc::render::ChunkStatus::Missing)
+        ++stats->missingChunks;
+    const size_t count = size_t(hi[2] - lo[2]);
+    const size_t dstY = shape[2], dstZ = shape[1] * dstY;
+    const size_t srcY = size_t(chunkShape[2]), srcZ = size_t(chunkShape[1]) * srcY;
+    for (int64_t z = lo[0]; z < hi[0]; ++z) {
+        for (int64_t y = lo[1]; y < hi[1]; ++y) {
+            const size_t dst = size_t(z - offset[0]) * dstZ +
+                               size_t(y - offset[1]) * dstY + size_t(lo[2] - offset[2]);
+            if (fillOnly) {
+                std::fill_n(out.data() + dst, count, fill);
+            } else {
+                const size_t src = size_t(z - base[0]) * srcZ +
+                                   size_t(y - base[1]) * srcY + size_t(lo[2] - base[2]);
+                std::memcpy(out.data() + dst, result.bytes->data() + src * sizeof(T),
+                            count * sizeof(T));
+            }
+            if (valid)
+                std::fill_n(valid->data() + dst, count, uint8_t{1});
+            if (stats)
+                stats->coveredVoxels += count;
         }
     }
-
-    nb::dict statsDict = statsToDict(stats);
-    statsDict["blocking_prefetch_chunks"] = blocking ? stats.requestedChunks : 0;
-    return nb::make_tuple(
-        makeNumpyArray(std::move(out), shape),
-        makeNumpyArray(std::move(valid), shape),
-        statsDict);
 }
 
-nb::tuple sampleZYXBlock(Volume& volume,
-                         const std::array<int, 3>& offset,
-                         const std::array<size_t, 3>& shape,
-                         int level,
-                         bool blocking)
+template <typename T>
+nb::object readZYXTyped(Volume& volume, const std::array<int, 3>& offset,
+                        const std::array<size_t, 3>& shape, int level,
+                        bool withMask, bool withStats)
+{
+    std::vector<T> out;
+    std::vector<uint8_t> valid;
+    BBoxReadStats stats;
+    {
+        // All volume access, dependency work and large allocations run without
+        // the GIL. Python objects are constructed only after it is reacquired.
+        nb::gil_scoped_release release;
+        if (level < 0)
+            throw std::out_of_range("level must be non-negative");
+        if (!volume.hasScaleLevel(level))
+            throw std::out_of_range("requested missing zarr scale level " + std::to_string(level));
+        size_t count = 1;
+        for (size_t n : shape) {
+            if (n > size_t(std::numeric_limits<int>::max()) ||
+                (count && n > std::numeric_limits<size_t>::max() / count))
+                throw std::overflow_error("bbox shape is too large");
+            count *= n;
+        }
+        if (count > out.max_size())
+            throw std::overflow_error("bbox byte size is too large");
+        auto* cache = volume.chunkedCache();
+        const T fill = typedFill<T>(cache->fillValue());
+        out.resize(count, fill);
+        if (withMask)
+            valid.resize(count, uint8_t{0});
+        const auto keys = collectChunkKeys(volume, offset, shape, level);
+        if (withStats)
+            stats.requestedChunks = keys.size();
+        cache->prefetchChunks(keys, false);
+        const auto chunkShape = cache->chunkShape(level);
+        for (const auto& key : keys)
+            copyBBoxChunk(out, withMask ? &valid : nullptr, withStats ? &stats : nullptr,
+                          shape, offset, chunkShape, key, *cache, fill);
+    }
+    nb::object values = nb::cast(makeNumpyArray(std::move(out), shape));
+    if (!withMask && !withStats)
+        return values;
+    nb::object mask = nb::none(), metadata = nb::none();
+    if (withMask)
+        mask = nb::cast(makeNumpyArray(std::move(valid), shape));
+    if (withStats) {
+        nb::dict d;
+        d["requested_level_only"] = true;
+        d["fallback_levels"] = 0;
+        d["requested_chunks"] = stats.requestedChunks;
+        d["blocking_prefetch_chunks"] = stats.requestedChunks;
+        d["missing_chunks"] = stats.missingChunks;
+        d["error_chunks"] = 0;
+        d["covered_pixels"] = stats.coveredVoxels;
+        metadata = std::move(d);
+    }
+    return nb::make_tuple(values, mask, metadata);
+}
+
+nb::object readZYX(Volume& volume, const std::array<int, 3>& offset,
+                   const std::array<size_t, 3>& shape, int level,
+                   bool withMask, bool withStats)
 {
     if (volume.dtype() == vc::render::ChunkDtype::UInt8)
-        return sampleZYXBlockTyped<uint8_t>(volume, offset, shape, level, blocking);
-    return sampleZYXBlockTyped<uint16_t>(volume, offset, shape, level, blocking);
+        return readZYXTyped<uint8_t>(volume, offset, shape, level, withMask, withStats);
+    if (volume.dtype() == vc::render::ChunkDtype::UInt16)
+        return readZYXTyped<uint16_t>(volume, offset, shape, level, withMask, withStats);
+    throw std::runtime_error("bbox reads require uint8 or uint16 volume");
+}
+
+nb::object readXYZ(Volume& volume, const std::array<int, 3>& offset,
+                   const std::array<size_t, 3>& shape, int level,
+                   bool withMask, bool withStats)
+{
+    return readZYX(volume, {offset[2], offset[1], offset[0]},
+                   {shape[2], shape[1], shape[0]}, level, withMask, withStats);
 }
 
 std::array<size_t, 3> checkedSizeArray(const std::array<int, 3>& value, const char* name)
@@ -572,9 +346,9 @@ std::vector<vc::render::ChunkKey> collectChunkKeys(Volume& volume,
     const int z0 = std::max(0, offset[0]);
     const int y0 = std::max(0, offset[1]);
     const int x0 = std::max(0, offset[2]);
-    const int z1 = std::min(volumeShape[0] - 1, offset[0] + static_cast<int>(shape[0]) - 1);
-    const int y1 = std::min(volumeShape[1] - 1, offset[1] + static_cast<int>(shape[1]) - 1);
-    const int x1 = std::min(volumeShape[2] - 1, offset[2] + static_cast<int>(shape[2]) - 1);
+    const int z1 = int(std::min<int64_t>(volumeShape[0] - 1, int64_t(offset[0]) + int64_t(shape[0]) - 1));
+    const int y1 = int(std::min<int64_t>(volumeShape[1] - 1, int64_t(offset[1]) + int64_t(shape[1]) - 1));
+    const int x1 = int(std::min<int64_t>(volumeShape[2] - 1, int64_t(offset[2]) + int64_t(shape[2]) - 1));
     if (z0 > z1 || y0 > y1 || x0 > x1)
         return {};
 
@@ -649,6 +423,676 @@ nb::object readChunk(Volume& volume,
 using FloatCoords = nb::ndarray<float, nb::numpy, nb::c_contig>;
 using BoolMask = nb::ndarray<bool, nb::numpy, nb::c_contig>;
 
+template <typename T>
+nb::ndarray<T, nb::numpy, nb::c_contig> makeNumpyArray4(
+    std::vector<T>&& data,
+    const std::array<size_t, 4>& shape)
+{
+    auto* heap = new std::vector<T>(std::move(data));
+    nb::capsule owner(heap, [](void* ptr) noexcept {
+        delete static_cast<std::vector<T>*>(ptr);
+    });
+    return nb::ndarray<T, nb::numpy, nb::c_contig>(
+        heap->data(), {shape[0], shape[1], shape[2], shape[3]}, owner);
+}
+
+void requireFloatShape(const FloatCoords& value,
+                       const std::vector<size_t>& expected,
+                       const char* name)
+{
+    if (value.ndim() != expected.size())
+        throw nb::value_error((std::string(name) + " has the wrong rank").c_str());
+    for (size_t axis = 0; axis < expected.size(); ++axis) {
+        if (value.shape(axis) != expected[axis]) {
+            throw nb::value_error(
+                (std::string(name) + " has the wrong shape").c_str());
+        }
+    }
+}
+
+void requireFinite(const FloatCoords& value, const char* name)
+{
+    size_t count = 1;
+    for (size_t axis = 0; axis < value.ndim(); ++axis)
+        count *= value.shape(axis);
+    for (size_t index = 0; index < count; ++index) {
+        if (!std::isfinite(value.data()[index])) {
+            throw nb::value_error(
+                (std::string(name) + " must contain only finite values").c_str());
+        }
+    }
+}
+
+float sampleControl1D(const FloatCoords& control,
+                      float coordinate,
+                      float origin,
+                      float spacing)
+{
+    const size_t count = control.shape(0);
+    if (count == 1)
+        return control.data()[0];
+    const float u = std::clamp(
+        (coordinate - origin) / spacing, 0.0f, static_cast<float>(count - 1));
+    const size_t lo = static_cast<size_t>(std::floor(u));
+    const size_t hi = std::min(lo + 1, count - 1);
+    const float fraction = u - static_cast<float>(lo);
+    return control.data()[lo] * (1.0f - fraction) +
+           control.data()[hi] * fraction;
+}
+
+float sampleControl2D(const FloatCoords& control,
+                      float coordinateA,
+                      float coordinateB,
+                      float originA,
+                      float originB,
+                      float spacingA,
+                      float spacingB)
+{
+    const size_t height = control.shape(0);
+    const size_t width = control.shape(1);
+    const float ua = std::clamp(
+        (coordinateA - originA) / spacingA,
+        0.0f,
+        static_cast<float>(height - 1));
+    const float ub = std::clamp(
+        (coordinateB - originB) / spacingB,
+        0.0f,
+        static_cast<float>(width - 1));
+    const size_t a0 = static_cast<size_t>(std::floor(ua));
+    const size_t b0 = static_cast<size_t>(std::floor(ub));
+    const size_t a1 = std::min(a0 + 1, height - 1);
+    const size_t b1 = std::min(b0 + 1, width - 1);
+    const float wa = ua - static_cast<float>(a0);
+    const float wb = ub - static_cast<float>(b0);
+    const float* data = control.data();
+    const float c00 = data[a0 * width + b0];
+    const float c01 = data[a0 * width + b1];
+    const float c10 = data[a1 * width + b0];
+    const float c11 = data[a1 * width + b1];
+    const float c0 = c00 * (1.0f - wb) + c01 * wb;
+    const float c1 = c10 * (1.0f - wb) + c11 * wb;
+    return c0 * (1.0f - wa) + c1 * wa;
+}
+
+nb::tuple generateFiber3DCoords(
+    const std::array<int, 3>& outputShapeZyx,
+    const FloatCoords& cpLocalZyx,
+    const FloatCoords& cpVolumeZyx,
+    const FloatCoords& outputToSourceZyx,
+    const std::string& smoothMode,
+    const nb::list& smoothControls,
+    const FloatCoords& smoothOriginZyx,
+    const FloatCoords& smoothSpacingZyx,
+    float volumeSpacingBase,
+    const std::array<int, 3>& baseShapeZyx)
+{
+    requireFloatShape(cpLocalZyx, {3}, "cp_local_zyx");
+    requireFloatShape(cpVolumeZyx, {3}, "cp_volume_zyx");
+    requireFloatShape(outputToSourceZyx, {3, 3}, "output_to_source_zyx");
+    requireFloatShape(smoothOriginZyx, {3}, "smooth_origin_zyx");
+    requireFloatShape(smoothSpacingZyx, {3}, "smooth_spacing_zyx");
+    requireFinite(cpLocalZyx, "cp_local_zyx");
+    requireFinite(cpVolumeZyx, "cp_volume_zyx");
+    requireFinite(outputToSourceZyx, "output_to_source_zyx");
+    requireFinite(smoothOriginZyx, "smooth_origin_zyx");
+    requireFinite(smoothSpacingZyx, "smooth_spacing_zyx");
+    if (!std::isfinite(volumeSpacingBase) || volumeSpacingBase <= 0.0f)
+        throw nb::value_error("volume_spacing_base must be finite and positive");
+
+    size_t pointCount = 1;
+    for (size_t axis = 0; axis < 3; ++axis) {
+        if (outputShapeZyx[axis] <= 0)
+            throw nb::value_error("output_shape_zyx values must be positive");
+        if (baseShapeZyx[axis] <= 0)
+            throw nb::value_error("base_shape_zyx values must be positive");
+        if (!(smoothSpacingZyx.data()[axis] > 0.0f))
+            throw nb::value_error("smooth_spacing_zyx values must be positive");
+        const size_t dim = static_cast<size_t>(outputShapeZyx[axis]);
+        if (pointCount > std::numeric_limits<size_t>::max() / dim)
+            throw nb::value_error("output_shape_zyx allocation overflows size_t");
+        pointCount *= dim;
+    }
+    if (pointCount > std::numeric_limits<size_t>::max() / 3 / sizeof(float))
+        throw nb::value_error("coordinate allocation overflows size_t");
+
+    size_t expectedControls = 0;
+    if (smoothMode == "none")
+        expectedControls = 0;
+    else if (smoothMode == "1d" || smoothMode == "2d")
+        expectedControls = 1;
+    else if (smoothMode == "3d")
+        expectedControls = 3;
+    else
+        throw nb::value_error("smooth_mode must be one of: none, 1d, 2d, 3d");
+    if (smoothControls.size() != expectedControls)
+        throw nb::value_error("smooth_controls count does not match smooth_mode");
+
+    std::vector<FloatCoords> controls;
+    controls.reserve(expectedControls);
+    for (size_t index = 0; index < expectedControls; ++index) {
+        auto control = nb::cast<FloatCoords>(smoothControls[index]);
+        const size_t expectedRank = smoothMode == "1d" ? 1 : 2;
+        if (control.ndim() != expectedRank)
+            throw nb::value_error("smooth control has the wrong rank");
+        for (size_t axis = 0; axis < control.ndim(); ++axis) {
+            if (control.shape(axis) == 0)
+                throw nb::value_error("smooth controls must not be empty");
+        }
+        requireFinite(control, "smooth control");
+        controls.emplace_back(std::move(control));
+    }
+
+    std::vector<float> coords(pointCount * 3);
+    std::vector<uint8_t> valid(pointCount);
+    const float* cpLocal = cpLocalZyx.data();
+    const float* cpVolume = cpVolumeZyx.data();
+    const float* matrix = outputToSourceZyx.data();
+    const float* origin = smoothOriginZyx.data();
+    const float* spacing = smoothSpacingZyx.data();
+    const size_t outY = static_cast<size_t>(outputShapeZyx[1]);
+    const size_t outX = static_cast<size_t>(outputShapeZyx[2]);
+    {
+        nb::gil_scoped_release release;
+        size_t point = 0;
+        for (int z = 0; z < outputShapeZyx[0]; ++z) {
+            const float relativeZ = static_cast<float>(z) - cpLocal[0];
+            for (int y = 0; y < outputShapeZyx[1]; ++y) {
+                const float relativeY = static_cast<float>(y) - cpLocal[1];
+                for (int x = 0; x < outputShapeZyx[2]; ++x, ++point) {
+                    const float relativeX = static_cast<float>(x) - cpLocal[2];
+                    float sourceZ = matrix[0] * relativeZ + matrix[1] * relativeY +
+                                    matrix[2] * relativeX;
+                    float sourceY = matrix[3] * relativeZ + matrix[4] * relativeY +
+                                    matrix[5] * relativeX;
+                    float sourceX = matrix[6] * relativeZ + matrix[7] * relativeY +
+                                    matrix[8] * relativeX;
+                    if (smoothMode == "1d") {
+                        sourceZ -= sampleControl1D(
+                            controls[0], sourceX, origin[2], spacing[2]);
+                    } else if (smoothMode == "2d") {
+                        sourceZ -= sampleControl2D(
+                            controls[0], sourceY, sourceX,
+                            origin[1], origin[2], spacing[1], spacing[2]);
+                    } else if (smoothMode == "3d") {
+                        sourceX -= sampleControl2D(
+                            controls[2], sourceZ, sourceY,
+                            origin[0], origin[1], spacing[0], spacing[1]);
+                        sourceY -= sampleControl2D(
+                            controls[1], sourceZ, sourceX,
+                            origin[0], origin[2], spacing[0], spacing[2]);
+                        sourceZ -= sampleControl2D(
+                            controls[0], sourceY, sourceX,
+                            origin[1], origin[2], spacing[1], spacing[2]);
+                    }
+
+                    const float baseZ = (cpVolume[0] + sourceZ) * volumeSpacingBase;
+                    const float baseY = (cpVolume[1] + sourceY) * volumeSpacingBase;
+                    const float baseX = (cpVolume[2] + sourceX) * volumeSpacingBase;
+                    const size_t offset = point * 3;
+                    coords[offset] = baseZ;
+                    coords[offset + 1] = baseY;
+                    coords[offset + 2] = baseX;
+                    valid[point] = static_cast<uint8_t>(
+                        std::isfinite(baseZ) && std::isfinite(baseY) &&
+                        std::isfinite(baseX) && baseZ >= 0.0f && baseY >= 0.0f &&
+                        baseX >= 0.0f &&
+                        baseZ <= static_cast<float>(baseShapeZyx[0] - 1) &&
+                        baseY <= static_cast<float>(baseShapeZyx[1] - 1) &&
+                        baseX <= static_cast<float>(baseShapeZyx[2] - 1));
+                }
+            }
+        }
+    }
+
+    auto coordsArray = makeNumpyArray4<float>(
+        std::move(coords),
+        {static_cast<size_t>(outputShapeZyx[0]), outY, outX, size_t{3}});
+    auto validArray = makeNumpyArray<uint8_t>(
+        std::move(valid),
+        {static_cast<size_t>(outputShapeZyx[0]), outY, outX});
+    return nb::make_tuple(coordsArray, validArray);
+}
+
+struct BlurStencilEntry {
+    int z;
+    int y;
+    int x;
+    float weight;
+};
+
+nb::ndarray<float, nb::numpy, nb::c_contig> fiber3DValueTransform(
+    const FloatCoords& volume,
+    const BoolMask& validMask,
+    const std::string& normalization,
+    float contrast,
+    float brightness,
+    float gamma)
+{
+    if (volume.ndim() != 3 || validMask.ndim() != 3)
+        throw nb::value_error("volume and valid_mask must have shape (Z,Y,X)");
+    std::array<size_t, 3> shape{};
+    size_t pointCount = 1;
+    for (size_t dimension = 0; dimension < 3; ++dimension) {
+        shape[dimension] = volume.shape(dimension);
+        if (shape[dimension] == 0)
+            throw nb::value_error("volume dimensions must be positive");
+        if (validMask.shape(dimension) != shape[dimension])
+            throw nb::value_error("valid_mask shape must match volume");
+        if (pointCount > std::numeric_limits<size_t>::max() / shape[dimension])
+            throw nb::value_error("volume allocation overflows size_t");
+        pointCount *= shape[dimension];
+    }
+    if (pointCount > std::numeric_limits<size_t>::max() / sizeof(float))
+        throw nb::value_error("volume allocation overflows size_t");
+    if (normalization != "none" && normalization != "raw" &&
+        normalization != "identity" && normalization != "zscore" &&
+        normalization != "minmax") {
+        throw nb::value_error("unsupported image normalization");
+    }
+    if (!std::isfinite(contrast) || contrast <= 0.0f ||
+        !std::isfinite(brightness) ||
+        !std::isfinite(gamma) || gamma <= 0.0f) {
+        throw nb::value_error(
+            "contrast and gamma must be positive and all parameters finite");
+    }
+
+    std::vector<float> output(pointCount);
+    const float* source = volume.data();
+    const bool* mask = validMask.data();
+    {
+        nb::gil_scoped_release release;
+        size_t validCount = 0;
+        double sum = 0.0;
+        float sourceMin = std::numeric_limits<float>::infinity();
+        float sourceMax = -std::numeric_limits<float>::infinity();
+        for (size_t index = 0; index < pointCount; ++index) {
+            if (!mask[index])
+                continue;
+            const float value = source[index];
+            sum += static_cast<double>(value);
+            sourceMin = std::min(sourceMin, value);
+            sourceMax = std::max(sourceMax, value);
+            ++validCount;
+        }
+        const bool anyValid = validCount != 0;
+        if (!anyValid) {
+            for (size_t index = 0; index < pointCount; ++index) {
+                const float value = source[index];
+                sum += static_cast<double>(value);
+                sourceMin = std::min(sourceMin, value);
+                sourceMax = std::max(sourceMax, value);
+            }
+            validCount = pointCount;
+        }
+
+        const float sourceMean = static_cast<float>(
+            sum / static_cast<double>(validCount));
+        float normalizeDivisor = 1.0f;
+        const bool useZscore = anyValid && normalization == "zscore";
+        const bool useMinmax = anyValid && normalization == "minmax";
+        if (useZscore) {
+            double squared = 0.0;
+            size_t varianceCount = 0;
+            for (size_t index = 0; index < pointCount; ++index) {
+                if (mask[index]) {
+                    const double delta = static_cast<double>(source[index]) -
+                                         static_cast<double>(sourceMean);
+                    squared += delta * delta;
+                    ++varianceCount;
+                }
+            }
+            const float standardDeviation = std::max(
+                1.0e-6f,
+                static_cast<float>(std::sqrt(
+                    squared / static_cast<double>(varianceCount))));
+            normalizeDivisor = standardDeviation;
+        } else if (useMinmax) {
+            normalizeDivisor = std::max(1.0e-6f, sourceMax - sourceMin);
+        }
+
+        const auto normalizeValue = [&](float value) {
+            if (useZscore)
+                return (value - sourceMean) / normalizeDivisor;
+            if (useMinmax)
+                return (value - sourceMin) / normalizeDivisor;
+            return value;
+        };
+        const float normalizedMean = normalizeValue(sourceMean);
+        const auto transformValue = [&](float value) {
+            const float normalized = normalizeValue(value);
+            return (normalized - normalizedMean) * contrast +
+                   normalizedMean + brightness;
+        };
+        const float transformedMin = transformValue(sourceMin);
+        const float transformedMax = transformValue(sourceMax);
+        const float transformedRange = std::max(
+            1.0e-6f, transformedMax - transformedMin);
+        for (size_t index = 0; index < pointCount; ++index) {
+            float value = transformValue(source[index]);
+            if (gamma != 1.0f) {
+                const float unit = std::clamp(
+                    (value - transformedMin) / transformedRange, 0.0f, 1.0f);
+                value = std::pow(unit, gamma) *
+                            (transformedMax - transformedMin) +
+                        transformedMin;
+            }
+            output[index] = value;
+        }
+    }
+    return makeNumpyArray<float>(std::move(output), shape);
+}
+
+std::array<float, 3> normalizeVector(const std::array<float, 3>& value,
+                                     const char* name)
+{
+    const float norm = std::sqrt(
+        value[0] * value[0] + value[1] * value[1] + value[2] * value[2]);
+    if (!std::isfinite(norm) || norm <= 0.0f)
+        throw nb::value_error(
+            (std::string(name) + " must have positive finite norm").c_str());
+    return {value[0] / norm, value[1] / norm, value[2] / norm};
+}
+
+std::array<float, 3> crossVector(const std::array<float, 3>& a,
+                                 const std::array<float, 3>& b)
+{
+    return {
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    };
+}
+
+std::vector<BlurStencilEntry> makeBlurStencil(const std::array<float, 3>& axis,
+                                              float sigma)
+{
+    if (sigma <= 0.0f)
+        return {{0, 0, 0, 1.0f}};
+    const int radius = std::max(1, static_cast<int>(std::ceil(3.0f * sigma)));
+    std::vector<float> kernel(static_cast<size_t>(2 * radius + 1));
+    float kernelSum = 0.0f;
+    for (int offset = -radius; offset <= radius; ++offset) {
+        const float scaled = static_cast<float>(offset) / sigma;
+        const float weight = std::exp(-0.5f * scaled * scaled);
+        kernel[static_cast<size_t>(offset + radius)] = weight;
+        kernelSum += weight;
+    }
+    for (float& weight : kernel)
+        weight /= kernelSum;
+
+    std::vector<BlurStencilEntry> stencil;
+    stencil.reserve(kernel.size() * 8);
+    for (int tap = -radius; tap <= radius; ++tap) {
+        const std::array<float, 3> delta{
+            static_cast<float>(tap) * axis[0],
+            static_cast<float>(tap) * axis[1],
+            static_cast<float>(tap) * axis[2],
+        };
+        const std::array<int, 3> low{
+            static_cast<int>(std::floor(delta[0])),
+            static_cast<int>(std::floor(delta[1])),
+            static_cast<int>(std::floor(delta[2])),
+        };
+        const std::array<float, 3> fraction{
+            delta[0] - static_cast<float>(low[0]),
+            delta[1] - static_cast<float>(low[1]),
+            delta[2] - static_cast<float>(low[2]),
+        };
+        const float tapWeight = kernel[static_cast<size_t>(tap + radius)];
+        for (int cornerZ = 0; cornerZ < 2; ++cornerZ) {
+            const float weightZ = cornerZ != 0 ? fraction[0] : 1.0f - fraction[0];
+            for (int cornerY = 0; cornerY < 2; ++cornerY) {
+                const float weightY = cornerY != 0 ? fraction[1] : 1.0f - fraction[1];
+                for (int cornerX = 0; cornerX < 2; ++cornerX) {
+                    const float weightX = cornerX != 0 ? fraction[2] : 1.0f - fraction[2];
+                    const BlurStencilEntry candidate{
+                        low[0] + cornerZ,
+                        low[1] + cornerY,
+                        low[2] + cornerX,
+                        tapWeight * weightZ * weightY * weightX,
+                    };
+                    if (candidate.weight == 0.0f)
+                        continue;
+                    auto existing = std::find_if(
+                        stencil.begin(), stencil.end(), [&](const BlurStencilEntry& entry) {
+                            return entry.z == candidate.z && entry.y == candidate.y &&
+                                   entry.x == candidate.x;
+                        });
+                    if (existing == stencil.end())
+                        stencil.push_back(candidate);
+                    else
+                        existing->weight += candidate.weight;
+                }
+            }
+        }
+    }
+    return stencil;
+}
+
+std::optional<size_t> axisAlignedDimension(const std::array<float, 3>& axis)
+{
+    for (size_t dimension = 0; dimension < 3; ++dimension) {
+        const size_t a = (dimension + 1) % 3;
+        const size_t b = (dimension + 2) % 3;
+        if (std::abs(std::abs(axis[dimension]) - 1.0f) <= 1.0e-6f &&
+            std::abs(axis[a]) <= 1.0e-6f && std::abs(axis[b]) <= 1.0e-6f) {
+            return dimension;
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<float> makeGaussianKernel(float sigma)
+{
+    const int radius = std::max(1, static_cast<int>(std::ceil(3.0f * sigma)));
+    std::vector<float> kernel(static_cast<size_t>(2 * radius + 1));
+    float sum = 0.0f;
+    for (int offset = -radius; offset <= radius; ++offset) {
+        const float scaled = static_cast<float>(offset) / sigma;
+        const float weight = std::exp(-0.5f * scaled * scaled);
+        kernel[static_cast<size_t>(offset + radius)] = weight;
+        sum += weight;
+    }
+    for (float& weight : kernel)
+        weight /= sum;
+    return kernel;
+}
+
+void applyAxisAlignedBlur(const float* source,
+                          float* destination,
+                          const std::array<size_t, 3>& shape,
+                          size_t dimension,
+                          float sigma)
+{
+    const auto kernel = makeGaussianKernel(sigma);
+    const int radius = static_cast<int>((kernel.size() - 1) / 2);
+    const int depth = static_cast<int>(shape[0]);
+    const int height = static_cast<int>(shape[1]);
+    const int width = static_cast<int>(shape[2]);
+    const size_t plane = shape[1] * shape[2];
+    for (int z = 0; z < depth; ++z) {
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                float value = 0.0f;
+                for (int offset = -radius; offset <= radius; ++offset) {
+                    int sourceZ = z;
+                    int sourceY = y;
+                    int sourceX = x;
+                    if (dimension == 0)
+                        sourceZ = std::clamp(z + offset, 0, depth - 1);
+                    else if (dimension == 1)
+                        sourceY = std::clamp(y + offset, 0, height - 1);
+                    else
+                        sourceX = std::clamp(x + offset, 0, width - 1);
+                    const size_t index = static_cast<size_t>(sourceZ) * plane +
+                                         static_cast<size_t>(sourceY) * shape[2] +
+                                         static_cast<size_t>(sourceX);
+                    value += source[index] *
+                             kernel[static_cast<size_t>(offset + radius)];
+                }
+                destination[static_cast<size_t>(z) * plane +
+                            static_cast<size_t>(y) * shape[2] +
+                            static_cast<size_t>(x)] = value;
+            }
+        }
+    }
+}
+
+void applyBlurStencil(const float* source,
+                      float* destination,
+                      const std::array<size_t, 3>& shape,
+                      const std::vector<BlurStencilEntry>& stencil)
+{
+    const int depth = static_cast<int>(shape[0]);
+    const int height = static_cast<int>(shape[1]);
+    const int width = static_cast<int>(shape[2]);
+    const size_t plane = shape[1] * shape[2];
+    int minZ = 0;
+    int minY = 0;
+    int minX = 0;
+    int maxZ = 0;
+    int maxY = 0;
+    int maxX = 0;
+    std::vector<std::ptrdiff_t> linearOffsets;
+    linearOffsets.reserve(stencil.size());
+    for (const auto& entry : stencil) {
+        minZ = std::min(minZ, entry.z);
+        minY = std::min(minY, entry.y);
+        minX = std::min(minX, entry.x);
+        maxZ = std::max(maxZ, entry.z);
+        maxY = std::max(maxY, entry.y);
+        maxX = std::max(maxX, entry.x);
+        linearOffsets.push_back(
+            static_cast<std::ptrdiff_t>(entry.z) *
+                static_cast<std::ptrdiff_t>(plane) +
+            static_cast<std::ptrdiff_t>(entry.y) *
+                static_cast<std::ptrdiff_t>(shape[2]) +
+            static_cast<std::ptrdiff_t>(entry.x));
+    }
+    const int interiorZ0 = std::min(depth, std::max(0, -minZ));
+    const int interiorY0 = std::min(height, std::max(0, -minY));
+    const int interiorX0 = std::min(width, std::max(0, -minX));
+    const int interiorZ1 = std::max(interiorZ0, std::min(depth, depth - maxZ));
+    const int interiorY1 = std::max(interiorY0, std::min(height, height - maxY));
+    const int interiorX1 = std::max(interiorX0, std::min(width, width - maxX));
+    const auto writeBoundary = [&](int z, int y, int x) {
+        float value = 0.0f;
+        for (const auto& entry : stencil) {
+            const int sourceZ = std::clamp(z + entry.z, 0, depth - 1);
+            const int sourceY = std::clamp(y + entry.y, 0, height - 1);
+            const int sourceX = std::clamp(x + entry.x, 0, width - 1);
+            const size_t index = static_cast<size_t>(sourceZ) * plane +
+                                 static_cast<size_t>(sourceY) * shape[2] +
+                                 static_cast<size_t>(sourceX);
+            value += source[index] * entry.weight;
+        }
+        destination[static_cast<size_t>(z) * plane +
+                    static_cast<size_t>(y) * shape[2] +
+                    static_cast<size_t>(x)] = value;
+    };
+    for (int z = 0; z < depth; ++z) {
+        for (int y = 0; y < height; ++y) {
+            if (z < interiorZ0 || z >= interiorZ1 ||
+                y < interiorY0 || y >= interiorY1 ||
+                interiorX0 >= interiorX1) {
+                for (int x = 0; x < width; ++x)
+                    writeBoundary(z, y, x);
+                continue;
+            }
+            for (int x = 0; x < interiorX0; ++x)
+                writeBoundary(z, y, x);
+            for (int x = interiorX1; x < width; ++x)
+                writeBoundary(z, y, x);
+
+            float* destinationRow = destination + static_cast<size_t>(z) * plane +
+                                    static_cast<size_t>(y) * shape[2];
+            std::fill(destinationRow + interiorX0, destinationRow + interiorX1, 0.0f);
+            for (size_t tap = 0; tap < stencil.size(); ++tap) {
+                const float* sourceRow = source +
+                    static_cast<std::ptrdiff_t>(static_cast<size_t>(z) * plane +
+                                                static_cast<size_t>(y) * shape[2]) +
+                    linearOffsets[tap];
+                const float weight = stencil[tap].weight;
+                for (int x = interiorX0; x < interiorX1; ++x)
+                    destinationRow[x] += sourceRow[x] * weight;
+            }
+        }
+    }
+}
+
+nb::ndarray<float, nb::numpy, nb::c_contig> anisotropicBlur3D(
+    const FloatCoords& volume,
+    const FloatCoords& axisZyx,
+    float sigmaAlong,
+    float sigmaAcross)
+{
+    if (volume.ndim() != 3)
+        throw nb::value_error("volume must have shape (Z,Y,X)");
+    requireFloatShape(axisZyx, {3}, "axis_zyx");
+    requireFinite(axisZyx, "axis_zyx");
+    if (!std::isfinite(sigmaAlong) || sigmaAlong < 0.0f ||
+        !std::isfinite(sigmaAcross) || sigmaAcross < 0.0f) {
+        throw nb::value_error("blur sigmas must be finite and nonnegative");
+    }
+    std::array<size_t, 3> shape{};
+    size_t pointCount = 1;
+    for (size_t dimension = 0; dimension < 3; ++dimension) {
+        shape[dimension] = volume.shape(dimension);
+        if (shape[dimension] == 0)
+            throw nb::value_error("volume dimensions must be positive");
+        if (shape[dimension] > static_cast<size_t>(std::numeric_limits<int>::max()))
+            throw nb::value_error("volume dimensions exceed native index range");
+        if (pointCount > std::numeric_limits<size_t>::max() / shape[dimension])
+            throw nb::value_error("volume allocation overflows size_t");
+        pointCount *= shape[dimension];
+    }
+    if (pointCount > std::numeric_limits<size_t>::max() / sizeof(float))
+        throw nb::value_error("volume allocation overflows size_t");
+
+    const float* rawAxis = axisZyx.data();
+    const auto along = normalizeVector(
+        {rawAxis[0], rawAxis[1], rawAxis[2]}, "axis_zyx");
+    const std::array<float, 3> reference =
+        std::abs(along[0]) > 0.9f
+            ? std::array<float, 3>{0.0f, 1.0f, 0.0f}
+            : std::array<float, 3>{1.0f, 0.0f, 0.0f};
+    const auto acrossA = normalizeVector(
+        crossVector(along, reference), "perpendicular axis");
+    const auto acrossB = normalizeVector(
+        crossVector(along, acrossA), "perpendicular axis");
+    const std::array<std::array<float, 3>, 3> axes{along, acrossA, acrossB};
+    const std::array<float, 3> sigmas{sigmaAlong, sigmaAcross, sigmaAcross};
+
+    std::vector<float> first(pointCount);
+    std::vector<float> second(pointCount);
+    const float* source = volume.data();
+    float* destination = first.data();
+    size_t completedPasses = 0;
+    {
+        nb::gil_scoped_release release;
+        for (size_t pass = 0; pass < axes.size(); ++pass) {
+            if (sigmas[pass] <= 0.0f)
+                continue;
+            const auto alignedDimension = axisAlignedDimension(axes[pass]);
+            if (alignedDimension) {
+                applyAxisAlignedBlur(
+                    source, destination, shape, *alignedDimension, sigmas[pass]);
+            } else {
+                const auto stencil = makeBlurStencil(axes[pass], sigmas[pass]);
+                applyBlurStencil(source, destination, shape, stencil);
+            }
+            source = destination;
+            destination = destination == first.data() ? second.data() : first.data();
+            ++completedPasses;
+        }
+        if (completedPasses == 0)
+            std::copy(volume.data(), volume.data() + pointCount, first.data());
+        else if (source != first.data())
+            first.swap(second);
+    }
+    return makeNumpyArray<float>(std::move(first), shape);
+}
+
 void validatePlaneVectors(const FloatCoords& values,
                           size_t planeCount,
                           const char* name)
@@ -704,6 +1148,20 @@ nb::dict statsToDict(const vc::render::ChunkedPlaneSampler::Stats& stats)
     out["missing_chunks"] = stats.missingChunks;
     out["fallback_levels"] = stats.fallbackLevels;
     out["requested_level_only"] = stats.requestedLevelOnly;
+    out["sample_workers"] = stats.sampleWorkers;
+    out["dependency_seconds"] = stats.dependencySeconds;
+    out["chunk_resolve_seconds"] = stats.chunkResolveSeconds;
+    out["sample_seconds"] = stats.sampleSeconds;
+    out["dependency_points"] = stats.dependencyPoints;
+    out["dependency_footprint_reuses"] = stats.dependencyFootprintReuses;
+    out["dependency_footprint_changes"] = stats.dependencyFootprintChanges;
+    out["dependency_key_lookups"] = stats.dependencyKeyLookups;
+    out["dependency_hash_probes"] = stats.dependencyHashProbes;
+    out["dependency_chunk_run_reuses"] = stats.dependencyChunkRunReuses;
+    out["sample_direct_gather_points"] = stats.sampleDirectGatherPoints;
+    out["sample_boundary_points"] = stats.sampleBoundaryPoints;
+    out["sample_pinned_map_lookups"] = stats.samplePinnedMapLookups;
+    out["sample_chunk_run_reuses"] = stats.sampleChunkRunReuses;
     return out;
 }
 
@@ -713,16 +1171,29 @@ nb::tuple sampleCoords(Volume& volume,
                        int level,
                        const std::string& sampling,
                        int tileSize,
-                       bool blocking)
+                       bool blocking,
+                       int samplerThreads,
+                       bool chunkLocalityFastPath,
+                       bool collectLocalityStats)
 {
+    if (samplerThreads < 0)
+        throw nb::value_error("sampler_threads must be non-negative");
     auto coords = coordsArrayToMat(coordsXyz);
     auto coverage = skipCoverageFromValidMask(validMask, coords.rows, coords.cols);
     cv::Mat_<uint8_t> out(coords.rows, coords.cols, uint8_t{0});
     vc::render::ChunkedPlaneSampler::Stats stats;
+    auto* chunkCache = dynamic_cast<vc::render::ChunkCache*>(volume.chunkedCache());
+    std::optional<vc::render::ChunkCache::Stats> cacheBefore;
+    std::optional<vc::render::ChunkCache::Stats> cacheAfter;
     {
         nb::gil_scoped_release release;
-        const vc::render::ChunkedPlaneSampler::Options options(
+        vc::render::ChunkedPlaneSampler::Options options(
             parseSampling(sampling), tileSize);
+        options.parallelThreads = samplerThreads;
+        options.chunkLocalityFastPath = chunkLocalityFastPath;
+        options.collectLocalityStats = collectLocalityStats;
+        if (chunkCache)
+            cacheBefore = chunkCache->stats();
         if (blocking) {
             stats = vc::render::ChunkedPlaneSampler::sampleCoordsLevelBlockingRequestedLevel(
                 *volume.chunkedCache(),
@@ -740,6 +1211,8 @@ nb::tuple sampleCoords(Volume& volume,
                 coverage,
                 options);
         }
+        if (chunkCache)
+            cacheAfter = chunkCache->stats();
     }
 
     std::vector<uint8_t> image(static_cast<size_t>(coords.rows) * static_cast<size_t>(coords.cols));
@@ -761,6 +1234,15 @@ nb::tuple sampleCoords(Volume& volume,
         static_cast<size_t>(coords.rows), static_cast<size_t>(coords.cols), size_t{1}});
     nb::dict statsDict = statsToDict(stats);
     statsDict["blocking_prefetch_chunks"] = blocking ? stats.requestedChunks : 0;
+    statsDict["sampler_threads"] = samplerThreads;
+    if (cacheBefore && cacheAfter) {
+        statsDict["decode_attempts"] = cacheAfter->decodeAttempts - cacheBefore->decodeAttempts;
+        statsDict["decoded_chunks"] = cacheAfter->decodedChunks - cacheBefore->decodedChunks;
+        statsDict["decode_input_bytes"] = cacheAfter->decodeInputBytes - cacheBefore->decodeInputBytes;
+        statsDict["decoded_chunk_bytes"] = cacheAfter->decodedChunkBytes - cacheBefore->decodedChunkBytes;
+        statsDict["decode_seconds"] = static_cast<double>(
+            cacheAfter->decodeNanoseconds - cacheBefore->decodeNanoseconds) / 1.0e9;
+    }
     return nb::make_tuple(imageArr, validArr, statsDict);
 }
 
@@ -928,7 +1410,25 @@ nb::list collectBBoxDependencies(
 
 NB_MODULE(volume, m)
 {
+    bindNormalSampler(m);
     m.doc() = "Python bindings for Volume Cartographer zarr volume access";
+    m.def("global_cache_root", [] { return vc::core::util::globalCacheRoot().string(); },
+          "Resolve the shared VC3D cache root without creating it.");
+
+    m.def("initialize_chunk_cache",
+          [](std::size_t bytes, std::size_t fetchWorkers,
+             std::size_t probeWorkers, std::size_t decodeWorkers) {
+              if (!bytes || !fetchWorkers || !probeWorkers || !decodeWorkers)
+                  throw std::invalid_argument("cache budget and worker capacities must be positive");
+              vc::render::ChunkCacheService::Options options;
+              options.decodedByteCapacity = bytes;
+              options.fetchConcurrency = {fetchWorkers, fetchWorkers, false};
+              options.probeWorkerCapacity = probeWorkers;
+              options.decodeWorkerCapacity = decodeWorkers;
+              vc::render::configureProcessChunkCacheService(std::move(options));
+          },
+          "bytes"_a, "fetch_workers"_a, "probe_workers"_a, "decode_workers"_a,
+          "Initialize bounded physical cache pools before opening volumes; repeated calls must retain capacities.");
 
     m.def("set_chunk_cache_budget",
           [](std::size_t bytes) {
@@ -947,7 +1447,45 @@ NB_MODULE(volume, m)
                   ->configureFetchConcurrency(count, false);
           },
           "count"_a,
-          "Set fixed process-wide regular chunk source-read concurrency.");
+          "Set fixed process-wide remote-download concurrency; local source reads use a separate pool.");
+    m.def("set_chunk_cache_decode_threads",
+          [](std::size_t count) {
+              if (count == 0)
+                  throw std::invalid_argument("count must be positive");
+              vc::render::processChunkCacheService()
+                  ->configureDecodeConcurrency(count);
+          },
+          "count"_a,
+          "Set fixed process-wide regular chunk decode concurrency.");
+    m.def("generate_fiber3d_coords",
+          &generateFiber3DCoords,
+          "output_shape_zyx"_a,
+          "cp_local_zyx"_a,
+          "cp_volume_zyx"_a,
+          "output_to_source_zyx"_a,
+          "smooth_mode"_a,
+          "smooth_controls"_a,
+          "smooth_origin_zyx"_a,
+          "smooth_spacing_zyx"_a,
+          "volume_spacing_base"_a,
+          "base_shape_zyx"_a,
+          "Generate Fiber3D base coordinates and validity in one native pass.");
+    m.def("anisotropic_blur_3d",
+          &anisotropicBlur3D,
+          "volume"_a,
+          "axis_zyx"_a,
+          "sigma_along"_a,
+          "sigma_across"_a,
+          "Apply the Fiber3D three-pass oriented Gaussian blur on one CPU thread.");
+    m.def("fiber3d_value_transform",
+          &fiber3DValueTransform,
+          "volume"_a,
+          "valid_mask"_a,
+          "normalization"_a,
+          "contrast"_a,
+          "brightness"_a,
+          "gamma"_a,
+          "Apply Fiber3D normalization, contrast, brightness, and gamma in one CPU pass.");
 
     nb::class_<Volume>(m, "Volume")
         .def_static("open",
@@ -988,17 +1526,15 @@ NB_MODULE(volume, m)
             "offset"_a,
             "shape"_a,
             "level"_a = 0,
-            "missing_policy"_a = "error")
-        .def("sample_zyx_block", &sampleZYXBlock,
-            "offset"_a,
-            "shape"_a,
-            "level"_a = 0,
-            "blocking"_a = true)
+            nb::kw_only(), "with_mask"_a = false, "with_stats"_a = false,
+            "Blocking exact-level bbox read in ZYX. Native dtype and declared fill, including outside bounds. "
+            "Returns array, or (array, mask-or-None, stats-or-None) when auxiliaries are requested.")
         .def("read_xyz", &readXYZ,
             "offset"_a,
             "shape"_a,
             "level"_a = 0,
-            "missing_policy"_a = "error")
+            nb::kw_only(), "with_mask"_a = false, "with_stats"_a = false,
+            "XYZ-argument adapter for read_zyx; returned array remains ZYX.")
         .def("prefetch_zyx", &prefetchZYX,
             "offset"_a,
             "shape"_a,
@@ -1014,7 +1550,10 @@ NB_MODULE(volume, m)
             "level"_a = 0,
             "sampling"_a = "trilinear",
             "tile_size"_a = 32,
-            "blocking"_a = true)
+            "blocking"_a = true,
+            "sampler_threads"_a = 0,
+            "chunk_locality_fast_path"_a = true,
+            "collect_locality_stats"_a = false)
         .def("sample_planes", &samplePlanes,
             "origins_xyz"_a,
             "x_steps_xyz"_a,
@@ -1039,7 +1578,7 @@ NB_MODULE(volume, m)
         .def("__getitem__",
             [](Volume& self, const nb::object& key) {
                 const auto region = parseSliceKey(key, self.shape());
-                return readZYX(self, region.offset, region.shape, 0, "error");
+                return readZYX(self, region.offset, region.shape, 0, false, false);
             },
             "key"_a);
 }

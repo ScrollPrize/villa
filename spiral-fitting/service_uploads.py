@@ -33,7 +33,8 @@ from service_http import (ApiError, TRANSFER_CHUNK_BYTES,
                           is_safe_relative_name)
 from fit_session import (PCL_ROLE_CONVENTIONS,
                          validate_checkpoint_container)
-from vc3d_fiber_format_adapter import parse_vc3d_fiber_format
+from vc3d_fiber_format_adapter import (parse_vc3d_fiber_format,
+                                       validate_fiber_uuid)
 
 
 MAX_UPLOAD_FILES = 256
@@ -207,9 +208,10 @@ def _validate_upload_content(kind, role, directory):
         if not isinstance(document, dict) or document.get("type") != "vc3d_fiber":
             raise ApiError(HTTPStatus.BAD_REQUEST,
                            "Fiber uploads must be JSON documents with type 'vc3d_fiber'")
-        if document.get("version", 1) == 1:
-            return
         try:
+            if document.get("version", 1) == 1:
+                validate_fiber_uuid(document)
+                return
             parse_vc3d_fiber_format(document)
         except ValueError as exc:
             raise ApiError(HTTPStatus.BAD_REQUEST,

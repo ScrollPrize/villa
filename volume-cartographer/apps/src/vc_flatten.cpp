@@ -116,7 +116,7 @@ int main(int argc, char* argv[]) {
 
         // Save the original surface with UV channel
         std::cout << "Saving surface with UV channel to: " << outputPath << std::endl;
-        surf->save(outputPath.string(), outputPath.filename().string(), true);
+        surf->saveEdited(inputPath, outputPath, true);
     } else {
         // Create a new surface with rearranged positions
         std::cout << "\nFlattening mesh..." << std::endl;
@@ -134,7 +134,7 @@ int main(int argc, char* argv[]) {
 
         // Save the flattened surface
         std::cout << "\nSaving flattened surface to: " << outputPath << std::endl;
-        flatSurf->save(outputPath.string(), outputPath.filename().string(), true);
+        flatSurf->saveAsNew(outputPath, true);
 
         delete flatSurf;
     }

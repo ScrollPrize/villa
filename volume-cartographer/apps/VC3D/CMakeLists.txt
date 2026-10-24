@@ -45,6 +45,7 @@ set(srcs
     FiberMapKollesis.cpp
     FiberMapKollesis.hpp
     FiberNetworkLayout.cpp
+    FiberMapAutoLink.cpp
     FiberNetworkLayout.hpp
     FiberWindingSolver.cpp
     FiberWindingSolver.hpp
@@ -252,6 +253,8 @@ set(srcs
     SpiralSessionSync.hpp
     SpiralSshTunnel.cpp
     SpiralSshTunnel.hpp
+    SpiralDescriptions.cpp
+    SpiralDescriptions.hpp
     SpiralPanel.cpp
     SpiralPanel.hpp
     SpiralMinimap.cpp

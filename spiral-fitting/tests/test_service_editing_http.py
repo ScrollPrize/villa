@@ -142,6 +142,48 @@ class EditingHttpTests(HttpServiceFixture):
         self.assertEqual(len(self.state.artifacts.manifest(first['artifact']['id'])['files']), 2)
         self.assertEqual(len(self.state.artifacts.manifest(second['artifact']['id'])['files']), 1)
 
+    def test_full_rebuild_binds_the_baseline_at_load_instead_of_replaying_it(self):
+        from unittest import mock
+        from service_uploads import PCL_ROLE_FILES
+        from test_spiral_service_v2 import FakeSession
+        dataset = self.root / 'dataset'
+        (dataset / PCL_ROLE_FILES['same_winding']).write_text(json.dumps(
+            {'collections': {'7': {'name': 'base', 'points': {}}}}))
+        self.request('POST', '/session/editing/claim', headers=self.owner,
+                     body={'command_id': 'discover'})
+        workspace = self.state.editing()
+        baseline = {e.identity.id for e in workspace.catalog.entries()}
+        self.assertEqual(len(baseline), 1)
+        bindings = []
+
+        def create(*_args, **kwargs):
+            bindings.append(kwargs.get('input_bindings'))
+            session = FakeSession()
+            session.apply_input_changes = self.resident.apply_input_changes
+            return session
+
+        from fit_session import SpiralPreviewConfig, SpiralRunConfig
+        # Request validation needs a real dataset; this test is about what the
+        # full build is handed and what the replay after it sends.
+        prepared = (self.state.session_paths, SpiralRunConfig(z_begin=0, z_end=10),
+                    SpiralPreviewConfig(), None)
+        calls = len(self.resident.calls)
+        with mock.patch('spiral_runtime.create_session', side_effect=create), \
+                mock.patch.object(self.state, '_prepare_session_request',
+                                  return_value=prepared):
+            code, payload, _ = self.request(
+                'POST', '/session/rebuild', headers=self.owner,
+                body={'command_id': 'full-rebuild', 'defaults': True})
+        self.assertEqual(code, 200, payload)
+        bound, = bindings
+        self.assertEqual({r['id'] for r in bound}, baseline)
+        self.assertTrue(all(r['adopt'] for r in bound))
+        # The build bound every desired revision, so the replay after it
+        # does not ask the new resident to derive and relink again.
+        self.assertEqual(len(self.resident.calls), calls)
+        self.assertEqual(workspace.resident_generation, self.state.session_generation)
+        self.assertTrue(all(e.applied == e.accepted for e in workspace.catalog.entries()))
+
     def test_rebuild_retry_does_not_restart_resident_construction(self):
         workspace = self.state.editing()
         original = workspace.replay_resident

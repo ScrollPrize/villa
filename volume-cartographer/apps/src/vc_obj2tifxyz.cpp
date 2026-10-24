@@ -531,7 +531,7 @@ int main(int argc, char *argv[])
         std::cout << "  --uv-to-obj=<ratio> : OBJ units per 1 UV unit (default: 1.0). Only used with --uv-metric." << std::endl;
         std::cout << "  --uv-downsample=<f> : Uniform UV decimation factor (>=1.0). Reduces grid by ~f^2." << std::endl;
         std::cout << "  --grid-cap=<pixels> : Upper bound on total grid pixels. Implies extra decimation if needed." << std::endl;
-        std::cout << "  --uuid=<id>         : Metadata UUID. Defaults to the output-directory basename." << std::endl;
+        std::cout << "  --uuid=<id>         : Metadata UUID. Defaults to a fresh random UUID." << std::endl;
         std::cout << "  --tifxyz-source=<dir>: Original tifxyz being flattened. Its meta.json scale sizes the" << std::endl;
         std::cout << "                        output grid to the input sampling density (output scale == input" << std::endl;
         std::cout << "                        scale). If <dir>/approval.tif exists, it is resampled onto the new" << std::endl;
@@ -717,14 +717,13 @@ int main(int argc, char *argv[])
         std::cout << "Attached resampled approval channel\n";
     }
     
-    // Generate a UUID for the surface
-    const std::string uuid =
-        vc::util::resolveTifxyzUuid(output_dir, obj_path, uuid_override);
+    // A converted mesh is a new object: fresh UUID unless --uuid names one.
+    surf->meta["uuid"] = vc::util::resolveTifxyzUuid(uuid_override);
     
     std::cout << "Saving to tifxyz format..." << std::endl;
     
     try {
-        surf->save(output_dir.string(), uuid);
+        surf->save(output_dir);
         std::cout << "Successfully converted to tifxyz format" << std::endl;
     }
     catch (const std::exception& e) {

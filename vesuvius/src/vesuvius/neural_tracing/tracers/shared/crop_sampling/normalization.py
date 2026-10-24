@@ -1,6 +1,7 @@
 """Per-crop z-score normalization and persisted volume provenance."""
 import json
 from pathlib import Path
+import numba
 import numpy as np
 
 from vesuvius.neural_tracing.tracers.shared.crop_sampling.volume import open_ct_array
@@ -75,12 +76,19 @@ def normalize_ct(image, record):
         raise ValueError('A z-score normalization record is required before sampling model inputs')
     if image.dtype != np.float32 or image.ndim != 3 or not image.flags.c_contiguous:
         raise ValueError('CT normalization requires a contiguous float32 3D crop')
-    if not np.isfinite(image).all():
-        raise ValueError('Z-score CT crop contains nonfinite values')
     mean = image.mean(dtype=np.float32)  # float32 statistics, as the GPU sampler's zscore_crops
-    std = image.std(dtype=np.float32)
-    image -= mean
-    image /= np.float32(max(float(std), ZSCORE_EPSILON))
+    # Any nonfinite value makes the sum nonfinite (finite crop values are bounded; the sum cannot overflow).
+    if not np.isfinite(mean):
+        raise ValueError('Z-score CT crop contains nonfinite values')
+    std = image.std(dtype=np.float32, mean=mean)  # numpy's own std, without summing the mean again
+    _center_scale(image.reshape(-1), mean, np.float32(max(float(std), ZSCORE_EPSILON)))
+
+
+@numba.njit(cache=True, fastmath=False, nogil=True)
+def _center_scale(values, mean, scale):
+    """``values -= mean; values /= scale`` in one pass: the same float32 operations."""
+    for p in range(len(values)):
+        values[p] = (values[p] - mean) / scale
 
 
 def zscore_crops(crops):

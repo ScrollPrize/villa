@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import math
+import uuid
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -520,6 +521,7 @@ def _merge_generated_corr_points(
 		if len(point_ids) >= 3:
 			contour_payload.append({"collection_id": int(cid), "point_ids": point_ids})
 	cols[cid] = {
+		"uuid": str(uuid.uuid4()),
 		"name": "approval_inpaint",
 		"metadata": {"winding_is_absolute": True},
 		"points": points,

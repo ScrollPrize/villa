@@ -15,8 +15,15 @@ public:
     ~Segmentation();
     static std::shared_ptr<Segmentation> New(const std::filesystem::path& path, const std::string& uuid, const std::string& name);
 
+    // VC3D's key for this segment: the directory name (Open Data catalog
+    // segments: their catalog representation id).
     [[nodiscard]] std::string id() const;
-    void setId(const std::string& newId);
+    // meta.json "uuid": the persistent object identity, independent of the
+    // directory name. Unchanged by rename; a copy needs a new one.
+    [[nodiscard]] std::string uuid() const;
+    void setUuid(const std::string& newUuid);
+    // Give a copied segment a fresh UUID and directory-based local lookup.
+    void resetIdentityForCopy();
     [[nodiscard]] std::string name() const;
     void setName(const std::string& n);
     [[nodiscard]] std::filesystem::path path() const { return path_; }

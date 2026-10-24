@@ -23,6 +23,7 @@ import argparse
 import copy
 import json
 from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 from scipy import ndimage
@@ -177,13 +178,29 @@ def add_area(meta_path: Path, xyz: np.ndarray, voxel_size_um: float | None) -> d
 
 
 def write_surface(out: Path, rows: np.ndarray, keep: np.ndarray, row_step: float, column_step: float,
-                  provenance: dict | None = None, overwrite: bool = False, voxel_size_um: float | None = None) -> None:
-    """Rows (R, C, 3) as a tifxyz named after ``out`` (stable uuid); points outside ``keep`` are written as -1.
-    meta.json gets the area of the kept surface (``add_area``; cm^2 with ``voxel_size_um``)."""
+                  provenance: dict | None = None, overwrite: bool = False, voxel_size_um: float | None = None,
+                  mmap_layout: bool = False) -> None:
+    """Rows (R, C, 3) as a tifxyz at ``out``; points outside ``keep`` are written as -1.
+    meta.json gets the area of the kept surface (``add_area``; cm^2 with ``voxel_size_um``). ``mmap_layout``: the
+    TIFFs uncompressed in a single strip (memory-mappable as written) instead of LZW tiles.
+
+    The surface uuid is a fresh uuid4, never derived from the directory
+    name (callers use names like ``up``/``ep00_trace``, which collide
+    across output roots). It stays stable across re-traces into the same
+    directory: an existing non-name-derived uuid is kept on overwrite."""
     xyz = np.where(keep[..., None], rows, -1.).astype(np.float32)
-    surface = Tifxyz(_x=xyz[..., 0], _y=xyz[..., 1], _z=xyz[..., 2], uuid=out.name,
+    surface_uuid = str(uuid4())
+    if overwrite:
+        try:
+            existing = json.loads((out / 'meta.json').read_text()).get('uuid')
+        except (OSError, ValueError, AttributeError):
+            existing = None
+        if isinstance(existing, str) and existing and existing != out.name:
+            surface_uuid = existing
+    surface = Tifxyz(_x=xyz[..., 0], _y=xyz[..., 1], _z=xyz[..., 2], uuid=surface_uuid,
                      _scale=(1./row_step, 1./column_step))
-    write_tifxyz(out, surface, overwrite=overwrite)
+    layout = dict(compression=None, tile_size=None) if mmap_layout else {}
+    write_tifxyz(out, surface, overwrite=overwrite, **layout)
     add_area(out/'meta.json', xyz, voxel_size_um)
     if provenance is not None:
         (out/'trace.json').write_text(json.dumps(provenance, indent=2, default=str))

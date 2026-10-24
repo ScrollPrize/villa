@@ -1,0 +1,20 @@
+{
+ "name": "sheet_strip_paris4_slim50k_v1",
+ "out_root": "../../output",
+ "init_checkpoint": "/home/sean/Documents/villa4/vesuvius/src/vesuvius/neural_tracing/tracers/fibers/output/polar_tokens_a3_ms_slim_dagger_b32x2_50k/ckpt_050000.pt",
+ "model": {
+  "fine": {"depth": 144, "width": 128, "behind": 72, "spacing": 0.5},
+  "strip_half_width": 30.0,
+  "strip_v_spacing": 2.5,
+  "strip_f_points": 2,
+  "strip_refinement_steps": 1,
+  "tube_sigma": 1.0
+ },
+ "data": {
+  "index": "../../output/sheet_strip_data/index_slim50k",
+  "afv": "/home/sean/Documents/villa4/vesuvius/src/vesuvius/neural_tracing/tracers/fibers/output/paris4_fibers_ctz7000_17000_slim50k_20261012/fibers.afv",
+  "full_tube_share": 0.5
+ },
+ "training": {"steps": 40000, "batch": 32, "lr": 0.0001, "new_lr_scale": 3.0, "warmup": 500},
+ "runtime": {"device": "cuda", "workers": 14, "val_workers": 4}
+}

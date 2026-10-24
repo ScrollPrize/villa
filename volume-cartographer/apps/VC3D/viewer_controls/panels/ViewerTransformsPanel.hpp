@@ -27,6 +27,7 @@ public:
 
     [[nodiscard]] bool previewChecked() const;
     [[nodiscard]] bool scaleOnlyChecked() const;
+    [[nodiscard]] bool noResampleChecked() const;
     [[nodiscard]] bool invertChecked() const;
     [[nodiscard]] int scaleValue() const;
 
@@ -42,6 +43,7 @@ signals:
 private:
     QCheckBox* _preview{nullptr};
     QCheckBox* _scaleOnly{nullptr};
+    QCheckBox* _noResample{nullptr};
     QCheckBox* _invert{nullptr};
     QSpinBox* _scale{nullptr};
     QPushButton* _loadAffine{nullptr};

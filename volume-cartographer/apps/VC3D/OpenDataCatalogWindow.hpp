@@ -35,10 +35,15 @@ public:
     using CreateProjectHandler = std::function<bool(const OpenDataSample&,
         const OpenDataResourceSelection&, const OpenDataNewProject&)>;
     void setCreateProjectHandler(CreateProjectHandler handler);
+    using AttachPredictionHandler = std::function<void(const OpenDataSample&,
+        const OpenDataResourceSelection&)>;
+    void setAttachPredictionHandler(AttachPredictionHandler handler);
 
 signals:
     void attachVolumeRequested(const QString& url);
     void attachLasagnaRequested(const QString& url, bool fiber);
+    void attachNormalGridsRequested(const QString& sampleId, const QString& volumeId,
+                                   const QString& url, int level, bool explicitLevel);
 
 private slots:
     void reloadManifest();
@@ -139,6 +144,7 @@ private:
     QString _pendingPhotoSampleId;
     std::function<bool(const OpenDataSample&)> _openSampleHandler;
     CreateProjectHandler _createProjectHandler;
+    AttachPredictionHandler _attachPredictionHandler;
 };
 
 } // namespace vc3d::opendata
