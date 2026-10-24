@@ -95,6 +95,32 @@ int main() try {
             updateGeometryArrays(db, txn, id, malformed, updated);
         }); });
     }
+    // Surfaces larger than any whole-read budget update in place; a changed run
+    // that crosses a read window stays one sparse edit.
+    {
+        const auto id = util::newUuid();
+        const int64_t side = 2400; // 66 MiB of float32 XYZ
+        vc::geometry::Surface surface{side, side, {1, 1}, {}};
+        surface.points.reserve(size_t(side * side));
+        for (int64_t r = 0; r < side; ++r)
+            for (int64_t c = 0; c < side; ++c) surface.points.push_back({float(c), float(r), 7});
+        auto first = vc::geometry::encode(surface);
+        std::string initial, updated;
+        auto pins = session.act(attachment, {{id,{}}}, [&](auto& db, auto& txn) {
+            ObjectRecord object; object.uuid = id; object.kind = "surface";
+            db.upsertObject(txn, object); initial = db.putGeometry(txn, id, first);
+        });
+        const size_t window = 1024 * 1024 / 12; // the vertex containing the first window boundary
+        for (size_t i = window - 3; i < window + 3; ++i) surface.points[i][2] = 9;
+        const auto target = vc::geometry::encode(surface);
+        pins = session.act(attachment, pins, [&](auto& db, auto& txn) {
+            updated = updateGeometryArrays(db, txn, id, target, initial);
+        });
+        session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+            require(db.readGeometryArray(txn, updated, "points") == target.arrays[0].bytes, "large surfaces update exactly");
+            require(db.readGeometryArray(txn, initial, "points") == first.arrays[0].bytes, "large surface history is immutable");
+        });
+    }
     // Structural safety must survive the convenience edit API, including a
     // caller catching the error and trying to commit the surrounding action.
     const auto uuid = util::newUuid();

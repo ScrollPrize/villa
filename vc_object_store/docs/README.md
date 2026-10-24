@@ -393,7 +393,9 @@ existing and retired identities are errors; this is not a refresh operation.
 `updateGeometryArrays` accepts desired typed arrays, the expected geometry revision,
 optional transformed annotations, and a caller-supplied relationship decision
 callback. It uses sparse coordinate edits and stable-ID sequence operations for
-fibers/PCLs/tracks, and sparse channel edits for unchanged surface grids. Omitted
+fibers/PCLs/tracks, and sparse channel edits for unchanged surface grids. Surface
+arrays are compared against the stored revision in 1 MiB windows, so surfaces of
+any size update without reading the whole revision. Omitted
 annotations follow stable IDs; resizing an annotated sequence without IDs requires
 explicit transformed annotations. Grid/channel schema changes retain their dedicated
 surface APIs. These helpers do not introduce another history or editing model.
