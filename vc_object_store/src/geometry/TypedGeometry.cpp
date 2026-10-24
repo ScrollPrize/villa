@@ -86,6 +86,14 @@ void Surface::validate() const
     for (const auto& p : points)
         if (!validSurfacePoint(p) && p != SurfacePoint{-1, -1, -1})
             throw std::invalid_argument("invalid surface vertices must use (-1,-1,-1)");
+    if (!validity.empty() && validity.size() != points.size())
+        throw std::invalid_argument("surface validity must have one byte per vertex");
+    std::set<std::string> names;
+    for (const auto& channel : channels) {
+        if (channel.name == "points" || channel.name == objects::detail::surfaceValidChannel || !names.insert(channel.name).second)
+            throw std::invalid_argument("invalid/duplicate surface channel name: " + channel.name);
+        objects::detail::validateSurfaceChannel(channel, {rows, columns});
+    }
 }
 const SurfacePoint& Surface::vertex(int64_t row, int64_t column) const
 {
@@ -94,7 +102,10 @@ const SurfacePoint& Surface::vertex(int64_t row, int64_t column) const
         throw std::out_of_range("surface vertex out of bounds");
     return points.at(static_cast<size_t>(row * columns + column));
 }
-bool Surface::valid(int64_t row, int64_t column) const { return validSurfacePoint(vertex(row, column)); }
+bool Surface::valid(int64_t row, int64_t column) const
+{
+    return validSurfacePoint(vertex(row, column)) && (validity.empty() || validity[size_t(row * columns + column)]);
+}
 
 objects::GeometryData encode(const Geometry& geometry)
 {
@@ -124,6 +135,9 @@ objects::GeometryData encode(const Geometry& geometry)
             data.kind = "surface";
             data.attributes = nlohmann::json{{"scale", g.scale}}.dump();
             data.arrays = {xyzArray<float>("points", "<f4", {g.rows, g.columns, 3}, g.points)};
+            if (!g.validity.empty())
+                data.arrays.push_back({surfaceValidChannel, "|u1", {g.rows, g.columns}, g.validity});
+            data.arrays.insert(data.arrays.end(), g.channels.begin(), g.channels.end());
         }
         return data;
     }, geometry);
@@ -140,7 +154,9 @@ Geometry decode(const objects::GeometryData& data)
         if (!names.insert(a.name).second) throw std::invalid_argument("duplicate geometry array");
     auto expected = data.kind == "fiber" ? std::set<std::string>{"control_points", "line_points", "control_point_ids"} :
         data.kind == "point_collection" ? std::set<std::string>{"points", "point_ids"} : std::set<std::string>{"points"};
-    if (names != expected) throw std::invalid_argument("typed geometry requires exactly its native arrays");
+    // Surfaces carry their channels; other kinds have exactly their native arrays.
+    if (data.kind == "surface" ? !names.contains("points") : names != expected)
+        throw std::invalid_argument("typed geometry requires exactly its native arrays");
     const auto attributes = nlohmann::json::parse(data.attributes);
     if (!attributes.is_object() || attributes.size() != (data.kind == "surface" ? 1 : 0))
         throw std::invalid_argument("typed geometry cannot discard extra geometry attributes");
@@ -164,7 +180,16 @@ Geometry decode(const objects::GeometryData& data)
         result = Track{xyzValues<int32_t>(require(data, "points", "<i4", 2).bytes)};
     } else if (data.kind == "surface") {
         const auto& a = require(data, "points", "<f4", 3);
-        result = Surface{a.shape[0], a.shape[1], attributes.at("scale").get<std::array<double, 2>>(), xyzValues<float>(a.bytes)};
+        Surface g{a.shape[0], a.shape[1], attributes.at("scale").get<std::array<double, 2>>(), xyzValues<float>(a.bytes)};
+        for (const auto& channel : data.arrays) {
+            if (channel.name == "points") continue;
+            if (channel.name != surfaceValidChannel) g.channels.push_back(channel);
+            else {
+                validateSurfaceChannel(channel, {g.rows, g.columns});
+                g.validity = channel.bytes;
+            }
+        }
+        result = std::move(g);
     } else throw std::invalid_argument("unsupported geometry kind");
     std::visit([](const auto& g) { g.validate(); }, result);
     return result;

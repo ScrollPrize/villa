@@ -26,14 +26,16 @@ conversion check invariants.
 | `PointCollection` | int64 `ids`, float64 XYZ `points` | `point(id)`, `indexOf(id)`, validation |
 | `Fiber` | float64 XYZ `controlPoints`, `linePoints`; int64 `controlPointIds` | Polyline length, validation |
 | `Track` | int32 XYZ `points` | Polyline length, validation |
-| `Surface` | `rows`, `columns`, column/row `scale`, float32 XYZ `points` | Vertex access, validity, validation |
+| `Surface` | `rows`, `columns`, column/row `scale`, float32 XYZ `points`, `validity`, `channels` | Vertex access, validity, validation |
 
 Coordinates remain source XYZ voxels; there is no implicit rescaling, unit
 conversion, or axis reversal. Native packed tracks use ZYX; the format adapter
 performs that conversion at the file boundary. Fiber length uses sampled line
 points if present, otherwise control points. A surface is row-major; scale is grid
-steps per source voxel, and invalid vertices use the existing `(-1,-1,-1)`
-sentinel. Stable point IDs are nonnegative and unique and need not be sorted.
+steps per source voxel, and vertices without coordinates use the
+`(-1,-1,-1)` sentinel. `validity` is the surface's `valid` channel (empty, or one
+byte per vertex, nonzero = valid); `valid(row, column)` requires both coordinates
+and validity. `channels` holds the other aligned channels as generic arrays. Stable point IDs are nonnegative and unique and need not be sorted.
 
 ```cpp
 #include <vc_object_store/geometry/Geometry.hpp>
@@ -56,9 +58,9 @@ write.commit();
 
 `encode()` converts the typed variant to existing `GeometryData` arrays with
 explicit little-endian encoding. `decode()` performs the reverse conversion.
-Point order, IDs and scalar precision are preserved. Owned conversion rejects
-auxiliary arrays and additional immutable geometry attributes instead of silently
-dropping them. The generic array API remains available for those payloads.
+Point order, IDs and scalar precision are preserved. Owned conversion keeps
+surface channels and rejects other auxiliary arrays and additional immutable
+geometry attributes instead of silently dropping them. The generic array API remains available for those payloads.
 
 Python `put_geometry()` accepts either the existing array dictionary or one of
 the four owned types, including inside `store.write()` transactions:
@@ -106,7 +108,8 @@ Views read only requested coordinate ranges or rectangles, through the existing
 verified chunk reader. Point lookup builds an ID index once per view, loading
 the ID array but not the coordinate array. Full materialization is explicit:
 `view.load()` returns the owned type. Large surfaces should use `readTile()` /
-`read_tile()` instead.
+`read_tile()` instead; a tile holds points and validity, and other channels are
+read with `readGeometryRectangle`.
 
 Snapshots pin a consistent database state at creation. Views keep
 that snapshot alive even if the snapshot variable goes out of scope. Explicit

@@ -1,6 +1,8 @@
 #pragma once
 #include <opencv2/core.hpp>
 #include <filesystem>
+#include <optional>
+#include <vector>
 #include <cmath>
 #include <stdexcept>
 namespace vc::object_links {
@@ -18,6 +20,10 @@ public:
     cv::Mat_<cv::Vec3f>* rawPointsPtr() {return &points_;}
     cv::Vec2f scale() const {return scale_;}
 };
+// tifxyz x/y/z planes; z <= 0 becomes the (-1,-1,-1) sentinel.
 SurfaceGrid readSurfaceGrid(const std::filesystem::path& directory);
-void writeSurfaceGrid(const std::filesystem::path& directory,const SurfaceGrid& grid);
+// mask.tif as per-vertex validity (255 valid, 0 invalid), absent without a mask.
+// A mask may be a whole multiple of the grid; a vertex is valid only when every
+// mask pixel it covers is at least 255.
+std::optional<std::vector<uint8_t>> readSurfaceValidity(const std::filesystem::path& directory, int rows, int cols);
 }

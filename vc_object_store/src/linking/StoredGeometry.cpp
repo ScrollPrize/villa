@@ -1,5 +1,6 @@
 #include "linking/StoredGeometry.hpp"
 #include "vc_object_store/Uuid.hpp"
+#include "geometry/ArrayLayout.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <cctype>
@@ -33,6 +34,10 @@ objects::detail::GeometrySnapshot StoredGeometry::load(const objects::ObjectReco
     const std::vector<std::string> names = object.kind == "fiber" ? std::vector<std::string>{"control_points", "line_points"}
         : object.kind == "point_collection" ? std::vector<std::string>{"points", "point_ids"} : std::vector<std::string>{"points"};
     for (const auto& name : names) result.arrays[name] = db_.readGeometryArray(read_, revision->uuid, name);
+    if (object.kind == "surface")
+        for (const auto& array : revision->arrays)
+            if (array.name == objects::detail::surfaceValidChannel)
+                result.arrays[array.name] = db_.readGeometryArray(read_, revision->uuid, array.name);
     return result;
 }
 void StoredGeometry::validate(const objects::WriteTxn& txn) const
@@ -61,6 +66,12 @@ std::shared_ptr<SurfaceGrid> surfaceGrid(const objects::detail::GeometrySnapshot
     for (const auto& point : points)
         for (float value : point.val)
             if (!std::isfinite(value)) throw std::runtime_error("geometry requires finite coordinates");
+    // Discovery sees vertices marked invalid as holes, like missing coordinates.
+    if (const auto valid = geometry.arrays.find(objects::detail::surfaceValidChannel); valid != geometry.arrays.end()) {
+        if (valid->second.size() != points.total()) throw std::runtime_error("surface validity does not match points");
+        for (size_t i = 0; i < points.total(); ++i)
+            if (!valid->second[i]) points(int(i / size_t(points.cols)), int(i % size_t(points.cols))) = {-1, -1, -1};
+    }
     const auto scale = nlohmann::json::parse(geometry.revision.attributes).at("scale").get<std::array<float, 2>>();
     if (!(scale[0] > 0 && scale[1] > 0) || !std::isfinite(scale[0]) || !std::isfinite(scale[1]))
         throw std::runtime_error("invalid stored surface scale");

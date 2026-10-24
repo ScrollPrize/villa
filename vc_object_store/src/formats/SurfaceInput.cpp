@@ -31,6 +31,8 @@ Prepared surface(const fs::path& source)
     const cv::Mat contiguous = grid.isContinuous() ? grid : grid.clone();
     p.geometry.arrays.push_back(detail::scalarArray<float>("points", "<f4", {grid.rows, grid.cols, 3},
         std::span<const float>(contiguous.ptr<float>(), contiguous.total() * 3)));
+    if (auto valid = vc::object_links::readSurfaceValidity(source, grid.rows, grid.cols))
+        p.geometry.arrays.push_back({detail::surfaceValidChannel, "|u1", {grid.rows, grid.cols}, std::move(*valid)});
     SurfaceDetail d;
     d.gridWidth = grid.cols; d.gridHeight = grid.rows;
     const auto scale = surface.scale(); d.scale = {scale[0], scale[1]};
@@ -56,8 +58,8 @@ Prepared surface(const fs::path& source)
     for (const auto& entry : fs::directory_iterator(source)) {
         if (!entry.is_regular_file() || (entry.path().extension() != ".tif" && entry.path().extension() != ".tiff")) continue;
         const auto name = entry.path().stem().string();
-        if (name == "x" || name == "y" || name == "z") continue;
-        if (name == "points" || !files.emplace(name, entry.path()).second)
+        if (name == "x" || name == "y" || name == "z" || name == "mask") continue;
+        if (name == "points" || name == detail::surfaceValidChannel || !files.emplace(name, entry.path()).second)
             throw std::runtime_error("duplicate/reserved surface channel name: " + name);
     }
     for (const auto& [name, path] : files) {

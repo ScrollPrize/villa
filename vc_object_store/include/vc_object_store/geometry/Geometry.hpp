@@ -41,9 +41,14 @@ struct Track {
 struct Surface {
     int64_t rows = 0, columns = 0;
     std::array<double, 2> scale{1, 1}; // column, row; grid steps per source voxel
-    std::vector<SurfacePoint> points;   // row-major; invalid vertices are (-1,-1,-1)
+    std::vector<SurfacePoint> points;   // row-major; vertices without coordinates are (-1,-1,-1)
+    // The `valid` channel: empty, or one byte per vertex (row-major, nonzero = valid).
+    std::vector<uint8_t> validity;
+    // Other aligned channels, each a whole multiple of the grid per axis.
+    std::vector<objects::GeometryArray> channels;
     void validate() const;
     const SurfacePoint& vertex(int64_t row, int64_t column) const;
+    // Has coordinates and is not marked invalid by `validity`.
     bool valid(int64_t row, int64_t column) const;
 };
 

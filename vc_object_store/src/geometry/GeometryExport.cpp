@@ -102,7 +102,9 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
         const std::set<std::string> names = revision->kind == "fiber" ? std::set<std::string>{"control_points", "line_points", "control_point_ids"} :
             revision->kind == "point_collection" ? std::set<std::string>{"points", "point_ids"} : std::set<std::string>{"points"};
         if (revision->kind != "fiber") for (const auto& array : revision->arrays) {
-            if (!names.contains(array.name)) throw std::runtime_error("native export cannot represent auxiliary array: " + array.name);
+            // tifxyz carries surface channels as sidecar TIFFs.
+            if (!names.contains(array.name) && revision->kind != "surface")
+                throw std::runtime_error("native export cannot represent auxiliary array: " + array.name);
             snapshot.arrays[array.name] = db.readGeometryArray(read, revision->uuid, array.name);
         }
     }

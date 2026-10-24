@@ -40,7 +40,8 @@ edits, restoration and sync. Replacement can scan all affected IDs;
 ordinary resolution reads only referenced chunks or metadata-snapshot buckets.
 
 Native export selects an immutable object revision and stages output before publication;
-`overwrite=False` protects existing destinations. It rejects auxiliary arrays.
+`overwrite=False` protects existing destinations. Surfaces export their channels as
+sidecar TIFFs; other kinds reject auxiliary arrays.
 Directory export currently requires Linux `renameat2`. Metadata-only
 `export_json` supports filters and field projection; it is not a geometry backup.
 Typed detail counts, lengths, dimensions and boxes are import summaries: use
@@ -410,12 +411,26 @@ A channel's rows and columns are each a whole multiple of the points grid
 (1 for a per-vertex channel; for example 20 for ink rendered at 20 pixels per
 grid step). The shapes imply the multiple. Rectangle reads and edits of a
 channel use that channel's own pixel coordinates.
-Absent and zero-filled channels differ. Ingestion recognizes lowercase `.tif`
-and `.tiff` sidecars by stem, excluding XYZ; duplicate/reserved names, unaligned,
+Absent and zero-filled channels differ.
+
+`valid` is the per-vertex validity channel: `|u1` at grid resolution, nonzero
+means valid (ingestion writes 255). A vertex is valid when its coordinates are
+not the `(-1,-1,-1)` sentinel and `valid` is nonzero; without the channel every
+vertex with coordinates is valid. Readers apply it (typed surfaces, surface
+views, relationship discovery); spatial bounds still cover every vertex with
+coordinates. `mask`, `x`, `y` and `z` are not channel names.
+
+Ingestion reads `mask.tif` into `valid`: page 0, first sample, which may be a
+whole multiple of the grid; a vertex stays valid only when every mask pixel it
+covers is at least 255. Later pages (VC's render page) are ignored, and a mask
+that is not a whole multiple of the grid is rejected. Ingestion recognizes other lowercase `.tif`
+and `.tiff` sidecars by stem as channels, excluding XYZ; duplicate/reserved names, unaligned,
 truncated or unsupported layouts fail before publication. Tiled/stripped and
 contiguous/separate sample planes preserve TIFF sample order and exact values;
 no color conversion, rescaling, NaN normalization or alpha premultiplication.
-Multipage/volume/non-top-left TIFFs and oversized masks are rejected as channels.
+Multipage/volume/non-top-left TIFFs are rejected as channels. Native export
+writes each channel back as `<name>.tif` with the same samples and `valid` as a
+single-page `mask.tif` (255/0).
 
 `meta.source["overlapping.json"]` retains the complete sidecar: missing means
 unknown, an empty list means known empty. Lists or objects with an `overlapping`
@@ -427,8 +442,7 @@ adds/replaces/removes channels atomically. Supply only changed arrays and exact
 little-endian bytes. Removing absent channels, duplicate names or spatial
 dimensions that are not a whole multiple of the grid fails; dtype/components may change. Use
 [structural resizing](structural-editing.md#surface-growth-and-cropping) for shape
-changes. Typed owned surfaces and native export reject auxiliary arrays; bounded
-views and generic readers remain available.
+changes. Typed owned surfaces carry `validity` and `channels`.
 
 ```python
 import struct

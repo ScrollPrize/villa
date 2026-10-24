@@ -1,6 +1,9 @@
 #include "formats/GeometryOutput.hpp"
 #include "formats/TrackInput.hpp"
 #include "vc_object_store/Tiff.hpp"
+#include "geometry/ArrayLayout.hpp"
+#include <algorithm>
+#include <bit>
 #include <fstream>
 #include <climits>
 #include <set>
@@ -85,6 +88,31 @@ void surface(const Snapshot& s, Json attributes, const fs::path& path)
         for (size_t i = 0; i < plane.total(); ++i) plane.ptr<float>()[i] = xyz[3*i+axis];
         const auto file = path / (std::string(1, "xyz"[axis]) + ".tif");
         writeTiff(file, plane);
+        if (!isReadableTiff(file)) throw std::runtime_error("failed to write complete TIFF: " + file.string());
+    }
+    // Channels keep their exact samples; validity is VC's mask.tif (255 valid).
+    for (const auto& array : s.revision.arrays) {
+        if (array.name == "points") continue;
+        auto bytes = s.arrays.at(array.name);
+        if (array.name == detail::surfaceValidChannel) {
+            for (auto& value : bytes) value = value ? 255 : 0;
+            writeTiffSamples(path / "mask.tif", {uint32_t(shape[1]), uint32_t(shape[0]), 8, SAMPLEFORMAT_UINT, 1, std::move(bytes)});
+            continue;
+        }
+        if (array.shape[0] <= 0 || array.shape[1] <= 0 || array.shape[0] > INT_MAX || array.shape[1] > INT_MAX)
+            throw std::runtime_error("native surface export requires channels within int32 range: " + array.name);
+        TiffSamples samples{uint32_t(array.shape[1]), uint32_t(array.shape[0]), 0, 0,
+            uint16_t(array.shape.size() == 3 ? array.shape[2] : 1), {}};
+        const auto& dtype = array.dtype;
+        samples.bits = uint16_t(8 * detail::geometryByteLength(dtype, {1}));
+        samples.sampleFormat = dtype == "<f4" || dtype == "<f8" ? SAMPLEFORMAT_IEEEFP
+            : dtype == "<i4" || dtype == "<i8" ? SAMPLEFORMAT_INT : SAMPLEFORMAT_UINT;
+        if constexpr (std::endian::native != std::endian::little)
+            for (size_t i = 0; i < bytes.size(); i += samples.bits / 8)
+                std::reverse(bytes.begin() + i, bytes.begin() + i + samples.bits / 8);
+        samples.bytes = std::move(bytes);
+        const auto file = path / (array.name + ".tif");
+        writeTiffSamples(file, samples);
         if (!isReadableTiff(file)) throw std::runtime_error("failed to write complete TIFF: " + file.string());
     }
     attributes["uuid"] = s.revision.objectUuid;

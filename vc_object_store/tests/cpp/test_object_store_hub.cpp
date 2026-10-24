@@ -282,7 +282,7 @@ int main() try
                     std::memcpy(moved.data() + i * sizeof(float), &value, sizeof(float));
                 }
                 revision = alice.editGeometryRectangle(txn, uuid, "points", 130, 140, 2, 2, moved, revision);
-                GeometryArray mask{"mask", "|u1", {surface.rows, surface.columns},
+                GeometryArray mask{"valid", "|u1", {surface.rows, surface.columns},
                                    std::vector<uint8_t>(size_t(surface.rows * surface.columns), 1)};
                 alice.updateSurfaceChannels(txn, uuid, {mask}, {}, revision);
             }

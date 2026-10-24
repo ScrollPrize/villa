@@ -206,6 +206,25 @@ std::vector<vo::GeometryArrayEdit> geometryEditsFromPy(const nb::list& input)
     return result;
 }
 
+vo::GeometryArray arrayFromPy(const nb::handle& item)
+{
+    const auto a = nb::cast<nb::dict>(item);
+    vo::GeometryArray array;
+    array.name = nb::cast<std::string>(a["name"]);
+    array.dtype = nb::cast<std::string>(a["dtype"]);
+    array.shape = nb::cast<std::vector<int64_t>>(a["shape"]);
+    const auto bytes = nb::cast<nb::bytes>(a["data"]);
+    const auto* begin = reinterpret_cast<const uint8_t*>(bytes.c_str());
+    array.bytes.assign(begin, begin + bytes.size());
+    return array;
+}
+nb::dict arrayToPy(const vo::GeometryArray& array)
+{
+    nb::dict result;
+    result["name"] = array.name; result["dtype"] = array.dtype; result["shape"] = array.shape;
+    result["data"] = nb::bytes(reinterpret_cast<const char*>(array.bytes.data()), array.bytes.size());
+    return result;
+}
 vo::GeometryData geometryFromPy(const nb::dict& input)
 {
     vo::GeometryData result;
@@ -213,17 +232,7 @@ vo::GeometryData geometryFromPy(const nb::dict& input)
     if (input.contains("format_version")) result.formatVersion = nb::cast<int64_t>(input["format_version"]);
     if (input.contains("coordinate_system")) result.coordinateSystem = nb::cast<std::string>(input["coordinate_system"]);
     if (input.contains("attributes")) result.attributes = jsonDumps(input["attributes"]);
-    for (const auto item : nb::cast<nb::list>(input["arrays"])) {
-        const auto a = nb::cast<nb::dict>(item);
-        vo::GeometryArray array;
-        array.name = nb::cast<std::string>(a["name"]);
-        array.dtype = nb::cast<std::string>(a["dtype"]);
-        array.shape = nb::cast<std::vector<int64_t>>(a["shape"]);
-        const auto bytes = nb::cast<nb::bytes>(a["data"]);
-        const auto* begin = reinterpret_cast<const uint8_t*>(bytes.c_str());
-        array.bytes.assign(begin, begin + bytes.size());
-        result.arrays.push_back(std::move(array));
-    }
+    for (const auto item : nb::cast<nb::list>(input["arrays"])) result.arrays.push_back(arrayFromPy(item));
     return result;
 }
 nb::dict geometryToPy(const vo::GeometryRevision& r)

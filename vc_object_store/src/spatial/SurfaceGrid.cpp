@@ -37,20 +37,18 @@ SurfaceGrid readSurfaceGrid(const std::filesystem::path& path){
         points(r,c)={float(x(r,c)),float(y(r,c)),float(z(r,c))};
         if(points(r,c)[2]<=0)points(r,c)={-1,-1,-1};
     }
-    if(std::filesystem::exists(path/"mask.tif")){
-        auto mask=band(path/"mask.tif");
-        if(mask.rows%x.rows==0&&mask.cols%x.cols==0){
-            int sy=mask.rows/x.rows,sx=mask.cols/x.cols;
-            for(int r=0;r<mask.rows;++r)for(int c=0;c<mask.cols;++c)if(!(mask(r,c)>=255))points(r/sy,c/sx)={-1,-1,-1};
-        }
-    }
     return SurfaceGrid(points,{metadata.at("scale").at(0).get<float>(),metadata.at("scale").at(1).get<float>()});
 }
-void writeSurfaceGrid(const std::filesystem::path& path,const SurfaceGrid& grid){
-    const auto& points=grid.rawPoints();
-    for(int a=0;a<3;++a){cv::Mat_<float> plane(points.size());
-        for(int r=0;r<points.rows;++r)for(int c=0;c<points.cols;++c)plane(r,c)=points(r,c)[a];
-        writeTiff(path/(std::string(1,"xyz"[a])+".tif"),plane);
-    }
+std::optional<std::vector<uint8_t>> readSurfaceValidity(const std::filesystem::path& path,int rows,int cols){
+    if(!std::filesystem::exists(path/"mask.tif"))return std::nullopt;
+    // Page 0, first sample; a later render page is not validity.
+    const auto mask=band(path/"mask.tif");
+    if(mask.rows<rows||mask.cols<cols||(rows&&mask.rows%rows)||(cols&&mask.cols%cols))
+        throw std::runtime_error("mask.tif must be a whole multiple of the points grid: "+path.string());
+    const int sy=rows?mask.rows/rows:1,sx=cols?mask.cols/cols:1;
+    std::vector<uint8_t> valid(size_t(rows)*size_t(cols),255);
+    for(int r=0;r<mask.rows;++r)for(int c=0;c<mask.cols;++c)
+        if(!(mask(r,c)>=255))valid[size_t(r/sy)*size_t(cols)+size_t(c/sx)]=0;
+    return valid;
 }
 }

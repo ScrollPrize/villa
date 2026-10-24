@@ -165,13 +165,17 @@ std::array<double, 2> SurfaceView::scale() const
     return value;
 }
 geometry::SurfacePoint SurfaceView::vertex(int64_t row, int64_t column) const { return readTile(row, column, 1, 1).points.front(); }
-bool SurfaceView::valid(int64_t row, int64_t column) const { return geometry::validSurfacePoint(vertex(row, column)); }
+bool SurfaceView::valid(int64_t row, int64_t column) const { return readTile(row, column, 1, 1).valid(0, 0); }
 geometry::Surface SurfaceView::readTile(int64_t row, int64_t column, int64_t rows, int64_t columns) const
 {
     state_->read->require();
     const auto bytes = state_->read->db->readGeometryRectangle(*state_->read->txn,
         state_->revision.uuid, "points", row, column, rows, columns);
     geometry::Surface result{rows, columns, scale(), detail::xyzValues<float>(bytes)};
+    const auto& arrays = state_->revision.arrays;
+    if (std::any_of(arrays.begin(), arrays.end(), [](const auto& a) { return a.name == detail::surfaceValidChannel; }))
+        result.validity = state_->read->db->readGeometryRectangle(*state_->read->txn,
+            state_->revision.uuid, detail::surfaceValidChannel, row, column, rows, columns);
     result.validate();
     return result;
 }

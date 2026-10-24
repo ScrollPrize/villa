@@ -41,6 +41,22 @@ inline void bindTypedGeometry(nb::module_& m)
         .def_rw("columns", &vg::Surface::columns)
         .def_rw("scale", &vg::Surface::scale)
         .def_rw("points", &vg::Surface::points)
+        .def_prop_rw("validity",
+            [](const vg::Surface& self) { return nb::bytes(reinterpret_cast<const char*>(self.validity.data()), self.validity.size()); },
+            [](vg::Surface& self, const nb::bytes& value) {
+                const auto* p = reinterpret_cast<const uint8_t*>(value.c_str());
+                self.validity.assign(p, p + value.size());
+            })
+        .def_prop_rw("channels",
+            [](const vg::Surface& self) {
+                nb::list result;
+                for (const auto& channel : self.channels) result.append(arrayToPy(channel));
+                return result;
+            },
+            [](vg::Surface& self, const nb::list& value) {
+                self.channels.clear();
+                for (const auto item : value) self.channels.push_back(arrayFromPy(item));
+            })
         .def("validate", &vg::Surface::validate)
         .def("vertex", &vg::Surface::vertex, nb::arg("row"), nb::arg("column"), nb::rv_policy::copy)
         .def("valid", &vg::Surface::valid, nb::arg("row"), nb::arg("column"));
