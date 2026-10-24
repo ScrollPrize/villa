@@ -217,7 +217,8 @@ JSON import rejects lifecycle-bearing exports.
 ## Hosted hub and replicas
 
 A team shares one store by keeping a **hub** `.vcobj` on a network filesystem
-(an sshfs mount, NFS or SMB). Nobody opens the hub to work. Each client clones
+(an sshfs mount, NFS or SMB) or on any server reachable over SSH, addressed as
+`sftp://[user@]host[:port]/path/hub.vcobj` (`ssh://` works too). Nobody opens the hub to work. Each client clones
 it into a local **replica** and opens that replica like any other store, so reads
 and viewport queries stay on local disk. Hosting needs no server process. Public
 signatures are in [Hub.hpp](../include/vc_object_store/objects/Hub.hpp).
@@ -229,7 +230,38 @@ vc_object_hub clone /mnt/share/hub.vcobj ~/objects-replica.vcobj
 vc_object_hub lease acquire ~/objects-replica.vcobj UUID
 #   ... edit UUID with any client of the replica ...
 vc_object_hub sync ~/objects-replica.vcobj
+# or, with no mount at all:
+vc_object_hub clone sftp://alice@data.example.org/share/hub.vcobj ~/objects-replica.vcobj
 ```
+
+**SFTP addresses.** Hub files addressed as `sftp://` or `ssh://` open through
+the store's own SQLite VFS, which speaks SFTP v3 to the system OpenSSH `ssh`
+program (`ssh -s host sftp`), so `~/.ssh/config`, keys, the agent, ProxyJump and
+`known_hosts` apply as usual and nothing needs mounting. The protocol client is
+the `vc_object_store::vc_sftp` library (`include/vc_object_store/sftp/Sftp.hpp`),
+which VC3D also uses for remote volumes. It locks with the same `<hub>.lock`
+directory as the `unix-dotfile` VFS, so clients on a mount and clients using an
+address can share one hub. The server must offer OpenSSH's `fsync@openssh.com`
+extension (stock OpenSSH does), or writes could not be made durable; the VFS
+refuses to open a hub for writing without it.
+- Without a registered authenticator, `ssh` runs in batch mode: keys and the
+  agent only, and only hosts already in `known_hosts`.
+- With one (`vc::sftp::setAuthenticator`, Python `set_sftp_authenticator`), every
+  ssh prompt (password, key passphrase, one-time code, accepting a new host key)
+  goes to the application through `SSH_ASKPASS`, with ssh's own wording. The
+  helper relays prompts through FIFOs in a private 0700 directory, so secrets
+  never appear in arguments or the environment. An accepted answer is reused
+  when a later connection to the same destination asks the same question; a
+  question repeated within one connection means the answer was wrong, so the
+  user is asked again. VC3D shows dialogs, `vc_object_hub` asks on the terminal
+  (Python: `use_terminal_sftp_prompts()`). Prompts need Linux or macOS; on
+  Windows `ssh` always runs in batch mode.
+- One ssh connection per destination serves every hub file and helper in a
+  process. A broken connection reconnects on next use, unless writes were still
+  unacknowledged; then the operation fails and SQLite rolls back from its journal.
+- Writes are pipelined and collected before any read, sync or unlock, so a
+  commit costs about one round trip plus the bytes. Each page read is still one
+  round trip, as over sshfs.
 
 The hub keeps SQLite's rollback journal and opens through the `unix-dotfile`
 VFS (`OpenOptions::sharedFile`). That VFS locks by creating `<hub>.lock` with an
@@ -292,7 +324,8 @@ UUIDs and the store UUID are shared.
   That fallback reads one page per request and is slow over a network.
 - A client that dies while holding the hub lock leaves `<hub>.lock` behind, and
   every other client waits on it. Once no client is syncing, run
-  `vc_object_hub unlock HUB --force`; the next open rolls back the interrupted
+  `vc_object_hub unlock HUB --force` (a path or an address; library
+  `hubLockAge`/`removeHubLock`); the next open rolls back the interrupted
   write from its journal.
 - The share must apply `mkdir` atomically and must not serve stale cached data
   to SQLite. Mount NFS with `noac`. Mount sshfs (3.x) with

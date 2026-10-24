@@ -74,6 +74,8 @@
 #include <QTreeWidgetItem>
 #include <QUrl>
 #include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QPushButton>
 
 #include "utils/Json.hpp"
 
@@ -2462,11 +2464,35 @@ void MenuActionController::openRecentObjectStore(const RecentObjectStore& store)
 void MenuActionController::cloneHostedStore()
 {
     const auto filter = QObject::tr("Object store (*.vcobj);;All files (*)");
-    const auto hub = QFileDialog::getOpenFileName(_window,
-        QObject::tr("Clone Hosted Object Store: choose the hub on the network share"), {}, filter);
+    QDialog chooser(_window);
+    chooser.setWindowTitle(QObject::tr("Clone Hosted Object Store"));
+    auto* layout = new QVBoxLayout(&chooser);
+    layout->addWidget(new QLabel(QObject::tr("Hub on a network share, or an sftp:// or ssh:// address "
+                                             "(sftp://user@host/path/hub.vcobj):"), &chooser));
+    auto* row = new QHBoxLayout;
+    auto* location = new QLineEdit(&chooser);
+    location->setMinimumWidth(480);
+    location->setPlaceholderText(QStringLiteral("sftp://user@host/path/hub.vcobj"));
+    auto* browse = new QPushButton(QObject::tr("Browse..."), &chooser);
+    QObject::connect(browse, &QPushButton::clicked, &chooser, [&] {
+        const auto file = QFileDialog::getOpenFileName(&chooser,
+            QObject::tr("Choose the hub on the network share"), {}, filter);
+        if (!file.isEmpty()) location->setText(file);
+    });
+    row->addWidget(location);
+    row->addWidget(browse);
+    layout->addLayout(row);
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &chooser);
+    QObject::connect(buttons, &QDialogButtonBox::accepted, &chooser, &QDialog::accept);
+    QObject::connect(buttons, &QDialogButtonBox::rejected, &chooser, &QDialog::reject);
+    layout->addWidget(buttons);
+    if (chooser.exec() != QDialog::Accepted) return;
+    const auto hub = location->text().trimmed();
     if (hub.isEmpty()) return;
+    // The last path component names the replica, for addresses and files alike.
+    const auto hubName = QFileInfo(hub.section(QLatin1Char('/'), -1)).completeBaseName();
     const auto replica = QFileDialog::getSaveFileName(_window, QObject::tr("Local Replica"),
-        QDir::home().filePath(QFileInfo(hub).completeBaseName() + QStringLiteral("-replica.vcobj")), filter);
+        QDir::home().filePath(hubName + QStringLiteral("-replica.vcobj")), filter);
     if (replica.isEmpty()) return;
     const auto author = objectStoreAuthor();
     if (author.isEmpty()) return;

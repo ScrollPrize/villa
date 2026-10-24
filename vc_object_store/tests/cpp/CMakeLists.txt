@@ -22,6 +22,12 @@ add_executable(test_object_store_hub test_object_store_hub.cpp)
 target_link_libraries(test_object_store_hub PRIVATE vc_objects nlohmann_json::nlohmann_json Threads::Threads)
 add_test(NAME object_store_hub COMMAND test_object_store_hub)
 set_tests_properties(object_store_hub PROPERTIES TIMEOUT 60)
+if(NOT WIN32)
+    add_executable(test_object_store_sftp test_object_store_sftp.cpp)
+    target_link_libraries(test_object_store_sftp PRIVATE vc_objects nlohmann_json::nlohmann_json Threads::Threads)
+    add_test(NAME object_store_sftp COMMAND test_object_store_sftp)
+    set_tests_properties(object_store_sftp PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+endif()
 
 # Read-only real-data timing harness; not a fixture-free CTest.
 add_executable(bench_volume_queries bench_volume_queries.cpp)

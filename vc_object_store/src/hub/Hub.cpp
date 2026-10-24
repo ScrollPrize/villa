@@ -3,6 +3,7 @@
 #include "sync/Apply.hpp"
 #include "sync/GeometryTransfer.hpp"
 #include "internal/History.hpp"
+#include "sftp/SftpVfs.hpp"
 #include <fstream>
 #include <mutex>
 
@@ -183,9 +184,10 @@ namespace {
 // header's change counter, so an unlocked copy is consistent when the counter
 // and size, read under the hub lock before and after, are unchanged. A hub that
 // keeps changing is copied while holding its lock; writers wait meanwhile.
-void copyHubFile(sqlite3* source, const std::filesystem::path& hub, const std::filesystem::path& partial,
+void copyHubFile(sqlite3* source, const std::string& hub, const std::filesystem::path& partial,
                  const util::ProgressCallback& progress)
 {
+    const bool remote = isRemotePath(hub);
     // A read transaction takes the lock and rolls back any interrupted write.
     auto lock = [&] {
         exec(source, "BEGIN;");
@@ -193,9 +195,13 @@ void copyHubFile(sqlite3* source, const std::filesystem::path& hub, const std::f
     };
     auto stamp = [&] {
         std::array<char, 4> counter{};
+        if (remote) {
+            remoteRead(hub, 24, std::as_writable_bytes(std::span(counter)));
+            return std::pair(counter, uintmax_t(remoteStat(hub).size));
+        }
         std::ifstream file(hub, std::ios::binary);
         file.seekg(24);
-        if (!file.read(counter.data(), counter.size())) throw std::runtime_error("hub: cannot read " + hub.string());
+        if (!file.read(counter.data(), counter.size())) throw std::runtime_error("hub: cannot read " + hub);
         return std::pair(counter, std::filesystem::file_size(hub));
     };
     auto locked = [&](const auto& work) {
@@ -205,15 +211,24 @@ void copyHubFile(sqlite3* source, const std::filesystem::path& hub, const std::f
     };
     std::vector<char> buffer(8 << 20);
     auto copy = [&](uintmax_t size) {
-        std::ifstream in(hub, std::ios::binary);
         std::ofstream out(partial, std::ios::binary | std::ios::trunc);
         uint64_t copied = 0;
+        if (remote) {
+            remoteCopy(hub, [&](std::span<const std::byte> data) {
+                out.write(reinterpret_cast<const char*>(data.data()), std::streamsize(data.size()));
+                copied += data.size();
+                util::reportProgress(progress, "copy hub", copied, size);
+            });
+            if (!out.flush()) throw std::runtime_error("hub: copying " + hub + " failed");
+            return copied;
+        }
+        std::ifstream in(hub, std::ios::binary);
         while (in.read(buffer.data(), std::streamsize(buffer.size())) || in.gcount() > 0) {
             out.write(buffer.data(), in.gcount());
             copied += uint64_t(in.gcount());
             util::reportProgress(progress, "copy hub", copied, size);
         }
-        if (!in.eof() || !out.flush()) throw std::runtime_error("hub: copying " + hub.string() + " failed");
+        if (!in.eof() || !out.flush()) throw std::runtime_error("hub: copying " + hub + " failed");
         return copied;
     };
     for (int attempt = 0; attempt < 3; ++attempt) {
@@ -252,7 +267,7 @@ void cloneHub(const std::filesystem::path& hubPath, const std::filesystem::path&
               const util::ProgressCallback& progress)
 {
     if (std::filesystem::exists(replicaPath)) throw std::runtime_error("hub: clone refuses existing " + replicaPath.string());
-    const auto hub = std::filesystem::absolute(hubPath);
+    const auto hub = isRemotePath(hubPath) ? canonicalRemotePath(hubPath) : std::filesystem::absolute(hubPath).string();
     auto partial = replicaPath; partial += ".partial";
     // A leftover journal would be replayed into the new copy.
     auto removePartial = [&] {
@@ -266,7 +281,7 @@ void cloneHub(const std::filesystem::path& hubPath, const std::filesystem::path&
     auto close = [&] { if (target) sqlite3_close(target); sqlite3_close(source); target = nullptr; };
     try {
         if (pragmaInt(source, "application_id") != 0x56434f42 || detectHubRole(source) != HubRole::Hub)
-            throw std::runtime_error("hub: not a hosted hub: " + hub.string());
+            throw std::runtime_error("hub: not a hosted hub: " + hub);
         copyHubFile(source, hub, partial, progress);
         target = openConnection(partial, SQLITE_OPEN_READWRITE, options, false);
         exec(target, "PRAGMA journal_mode=WAL;");
@@ -274,7 +289,7 @@ void cloneHub(const std::filesystem::path& hubPath, const std::filesystem::path&
         try {
             createReplicaTables(target);
             const auto cursor = syncCursor(target);
-            execute(target, "INSERT INTO hub_upstream VALUES(1,?,?,?,?,?)", hub.string(), replicaIdentity(target),
+            execute(target, "INSERT INTO hub_upstream VALUES(1,?,?,?,?,?)", hub, replicaIdentity(target),
                 cursor.journal, cursor.journal, cursor.geometry);
             exec(target, "COMMIT;");
         } catch (...) { sqlite3_exec(target, "ROLLBACK;", nullptr, nullptr, nullptr); throw; }
@@ -294,6 +309,32 @@ void cloneHub(const std::filesystem::path& hubPath, const std::filesystem::path&
         throw;
     }
     std::filesystem::rename(partial, replicaPath);
+}
+
+// SQLite's unix-dotfile VFS and the SFTP VFS both lock with this directory.
+std::optional<int64_t> hubLockAge(const std::filesystem::path& hub)
+{
+    const auto now = std::chrono::system_clock::now();
+    if (isRemotePath(hub)) {
+        const auto lock = remoteStat(canonicalRemotePath(hub) + ".lock");
+        if (!lock.exists) return std::nullopt;
+        if (!lock.modified) return 0;
+        return std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count() - int64_t(*lock.modified);
+    }
+    auto lock = hub;
+    lock += ".lock";
+    std::error_code missing;
+    const auto modified = std::filesystem::last_write_time(lock, missing);
+    if (missing) return std::nullopt;
+    return std::chrono::duration_cast<std::chrono::seconds>(std::filesystem::file_time_type::clock::now() - modified).count();
+}
+
+void removeHubLock(const std::filesystem::path& hub)
+{
+    if (isRemotePath(hub)) return remoteRmdir(canonicalRemotePath(hub) + ".lock");
+    auto lock = hub;
+    lock += ".lock";
+    std::filesystem::remove(lock);
 }
 
 void detachHub(const std::filesystem::path& path, const std::string& author)

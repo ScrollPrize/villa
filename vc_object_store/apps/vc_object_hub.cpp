@@ -1,5 +1,6 @@
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc_object_store/TerminalProgress.hpp"
+#include "vc_object_store/sftp/Sftp.hpp"
 #include <chrono>
 #include <cstdlib>
 #include <iostream>
@@ -18,6 +19,8 @@ constexpr const char* kUsage =
     "  resolve REPLICA UUID hub|local  settle a conflict by keeping one record\n"
     "  detach REPLICA                  make a replica an ordinary standalone store\n"
     "  unlock HUB [--force]            remove a stale hub lock left by a crashed client\n"
+    "HUB is a path on a network filesystem or sftp://[user@]host[:port]/path (ssh:// works too);\n"
+    "ssh asks for passwords, passphrases and new host keys on this terminal.\n"
     "--author defaults to $USER. Edits on a replica need a lease on objects that exist on the hub.\n";
 
 void print(const HubSyncReport& report)
@@ -42,6 +45,7 @@ void print(const std::vector<HubLease>& leases)
 
 int main(int argc, char** argv)
 try {
+    vc::sftp::setAuthenticator(vc::sftp::terminalAuthenticator());
     std::vector<std::string> positional;
     std::string author;
     int64_t seconds = kDefaultLeaseSeconds;
@@ -118,14 +122,11 @@ try {
         detachHub(positional[1], author);
     } else if (command == "unlock") {
         need(2);
-        // SQLite's unix-dotfile VFS locks by creating this directory.
-        auto lock = std::filesystem::path(positional[1]); lock += ".lock";
-        if (!std::filesystem::exists(lock)) { std::cout << "hub is not locked\n"; return 0; }
-        const auto age = std::chrono::duration_cast<std::chrono::seconds>(
-            std::filesystem::file_time_type::clock::now() - std::filesystem::last_write_time(lock)).count();
-        std::cout << "hub locked for " << age << " s\n";
+        const auto age = hubLockAge(positional[1]);
+        if (!age) { std::cout << "hub is not locked\n"; return 0; }
+        std::cout << "hub locked for " << *age << " s\n";
         if (!force) { std::cout << "rerun with --force once no client is syncing\n"; return 1; }
-        std::filesystem::remove(lock);
+        removeHubLock(positional[1]);
         std::cout << "lock removed; the next open rolls back any interrupted write\n";
     } else throw std::runtime_error("unknown command: " + command);
     return 0;

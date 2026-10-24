@@ -459,3 +459,45 @@ def test_scripts_edit_hosted_replicas_under_leases(tmp_path):
             viewer.acquire_leases([fiber])
         script.release_leases([fiber])
         assert viewer.acquire_leases([fiber])[0]['author'] == 'viewer'
+
+
+def test_scripts_sync_a_hub_addressed_over_sftp_with_a_password(tmp_path, monkeypatch):
+    """The C++ SFTP test executable acts as ssh and serves files with the installed sftp-server."""
+    import os
+    from urllib.parse import quote
+    import vc_object_store as vos
+    build = os.environ.get('VC_OBJECT_STORE_BUILD_PYTHON_PATH')
+    fixture = Path(build).resolve().parent / 'bin' / 'test_object_store_sftp' if build else None
+    server = next((p for p in ('/usr/lib/openssh/sftp-server', '/usr/lib/ssh/sftp-server', '/usr/libexec/sftp-server',
+                               '/usr/libexec/openssh/sftp-server') if Path(p).exists()), None)
+    if not fixture or not fixture.exists() or not server:
+        pytest.skip('needs the built test_object_store_sftp and an installed OpenSSH sftp-server')
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    (bin_dir / 'ssh').symlink_to(fixture)
+    monkeypatch.setenv('PATH', f'{bin_dir}:{os.environ["PATH"]}')
+    monkeypatch.setenv('VC_SFTP_TEST_SERVER', server)
+    monkeypatch.setenv('VC_SFTP_TEST_PASSWORD', 'hunter2')
+    hub = tmp_path / 'share' / 'hub.vcobj'
+    hub.parent.mkdir()
+    with ObjectStore.create(str(hub), author='curator') as origin:
+        fiber, _ = put(origin, Fiber([[1, 2, 3], [4, 5, 6]], []), kind='fiber')
+        origin.checkpoint()
+    vos.hub_init(str(hub), 'curator')
+    url = 'sftp://annotator@test-host' + quote(str(hub))
+    prompts = []
+    vos.set_sftp_authenticator(lambda destination, prompt, confirmation: prompts.append(destination) or 'hunter2')
+    try:
+        vos.hub_clone(url, str(tmp_path / 'replica.vcobj'), 'script')
+        vos.hub_clone(str(hub), str(tmp_path / 'local.vcobj'), 'viewer')
+        with ObjectStore.open(str(tmp_path / 'replica.vcobj'), author='script') as script, \
+                ObjectStore.open(str(tmp_path / 'local.vcobj'), author='viewer') as viewer:
+            assert script.hub_status()['hub'] == url
+            script.acquire_leases([fiber])
+            script.set_meta(fiber, 'review', 'remote')
+            assert script.hub_sync()['pushed'] == 1
+            assert viewer.hub_sync()['pulled'] == 1 and viewer.object(fiber)['meta']['review'] == 'remote'
+        assert prompts and set(prompts) == {'annotator@test-host'}
+        assert vos.hub_lock_age(url) is None
+    finally:
+        vos.set_sftp_authenticator(None)

@@ -5,6 +5,7 @@
 #include <nanobind/stl/map.h>
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/objects/Hub.hpp"
+#include "vc_object_store/sftp/Sftp.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/CtSheetNormal.hpp"
 using namespace vc::python;
@@ -298,6 +299,39 @@ NB_MODULE(_native, m)
     }, nb::arg("hub"), nb::arg("replica"), nb::arg("author"), "Copy a hub into a new local replica.");
     m.def("hub_detach", &vo::detachHub, nb::arg("replica"), nb::arg("author"),
           "Drop a replica's hub tables, leaving an ordinary store.");
+    m.def("hub_lock_age", [](const std::filesystem::path& hub) {
+        nb::gil_scoped_release release;
+        return vo::hubLockAge(hub);
+    }, nb::arg("hub"), "Seconds since the hub's lock was taken, or None when it is unlocked.");
+    m.def("hub_remove_lock", [](const std::filesystem::path& hub) {
+        nb::gil_scoped_release release;
+        vo::removeHubLock(hub);
+    }, nb::arg("hub"), "Remove a stale lock left by a crashed client, once no client is syncing.");
+
+    // ssh prompts arrive on a helper thread while hub calls run with the GIL released.
+    m.def("set_sftp_authenticator", [](nb::object callback) {
+        if (callback.is_none()) return vc::sftp::setAuthenticator({});
+        auto held = std::shared_ptr<nb::object>(new nb::object(std::move(callback)), [](nb::object* object) {
+            nb::gil_scoped_acquire acquire;
+            delete object;
+        });
+        vc::sftp::setAuthenticator([held](const vc::sftp::Prompt& prompt) -> std::optional<std::string> {
+            nb::gil_scoped_acquire acquire;
+            const auto answer = (*held)(prompt.destination, prompt.text, prompt.confirmation);
+            if (answer.is_none()) return std::nullopt;
+            return nb::cast<std::string>(answer);
+        });
+    }, nb::arg("callback").none(),
+       "Answer ssh prompts for sftp:// hubs: callback(destination, prompt, confirmation) returns the answer, "
+       "or None to cancel. Without one, ssh runs in batch mode (keys and agent only).");
+    m.def("use_terminal_sftp_prompts", [] {
+        auto authenticator = vc::sftp::terminalAuthenticator();
+        const bool available = static_cast<bool>(authenticator);
+        vc::sftp::setAuthenticator(std::move(authenticator));
+        return available;
+    }, "Ask ssh prompts on the controlling terminal; returns False when there is none.");
+    // A callback must not outlive the interpreter.
+    nb::module_::import_("atexit").attr("register")(nb::cpp_function([] { vc::sftp::setAuthenticator({}); }));
 
     auto store = nb::class_<PyObjectStore>(m, "ObjectStore")
         .def_static("create", &PyObjectStore::create, nb::arg("path"), nb::arg("author"),

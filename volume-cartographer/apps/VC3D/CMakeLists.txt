@@ -212,6 +212,8 @@ set(srcs
     SurfacePanelController.hpp
     MenuActionController.cpp
     MenuActionController.hpp
+    SshPrompts.cpp
+    SshPrompts.hpp
     VolumeAttachmentController.cpp
     VolumeAttachmentController.hpp
     UnifiedBrowserDialog.cpp

@@ -1,7 +1,8 @@
 #pragma once
 
-// Hosted stores: one authoritative hub file on a network filesystem (sshfs,
-// NFS, SMB) and full local replicas that every application opens normally.
+// Hosted stores: one authoritative hub file, on a network filesystem (sshfs,
+// NFS, SMB) or addressed directly as sftp://[user@]host[:port]/path (ssh://
+// is accepted too), and full local replicas that every application opens normally.
 // Only replicas are edited; changing the record or geometry of an object that
 // exists on the hub requires this replica to hold its lease. Relationships are
 // shared records protected by version checks, like every pushed record. Sync pulls hub changes and pushes local ones
@@ -57,6 +58,11 @@ void cloneHub(const std::filesystem::path& hub, const std::filesystem::path& rep
               const util::ProgressCallback& progress = {});
 // Drop the replica's hub tables, leaving an ordinary standalone store.
 void detachHub(const std::filesystem::path& replica, const std::string& author);
+// Seconds since a hub's lock was taken, or nullopt when it is unlocked.
+std::optional<int64_t> hubLockAge(const std::filesystem::path& hub);
+// Remove a stale lock left by a crashed client; only once no client is syncing.
+// The next open rolls back any interrupted write from its journal.
+void removeHubLock(const std::filesystem::path& hub);
 
 // Install hub changes. Records with unpushed local changes become conflicts.
 HubSyncReport hubPull(ObjectStore& replica);
