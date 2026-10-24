@@ -207,7 +207,7 @@ def _is_sqlite_dbm(path):
 
 
 class _SQLiteTrackDBM:
-    """Read-only view of a dbm.sqlite3 store for interpreters without dbm.sqlite3.
+    """Read-only view of a dbm.sqlite3 store, independent of interpreter version.
 
     Uses the same single-table schema as CPython's Lib/dbm/sqlite3.py
     (``Dict(key BLOB, value BLOB)``) and only the read operations the track
@@ -216,7 +216,12 @@ class _SQLiteTrackDBM:
 
     def __init__(self, path):
         import sqlite3
+        # Complete, checkpointed stores need no reader-created sidecars. An
+        # existing WAL may hold committed pages, so retain normal SQLite
+        # locking and WAL reads while it is present.
         uri = Path(os.path.abspath(path)).as_uri() + '?mode=ro'
+        if not Path(str(path) + '-wal').exists():
+            uri += '&immutable=1'
         self._connection = sqlite3.connect(uri, uri=True)
 
     def keys(self):
@@ -245,9 +250,9 @@ class _SQLiteTrackDBM:
 
 
 def open_tracks_dbm(path):
-    """Open a tracks DBM read-only, including SQLite-backed stores on Python < 3.13."""
+    """Open a tracks DBM read-only, including SQLite-backed stores on every Python version."""
     text = os.fspath(path)
-    if not dbm.whichdb(text) and _is_sqlite_dbm(text):
+    if _is_sqlite_dbm(text):
         return _SQLiteTrackDBM(text)
     return dbm.open(text, 'r')
 
