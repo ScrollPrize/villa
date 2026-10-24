@@ -62,6 +62,23 @@ struct RegionResult {
     bool complete() const { return stop == RegionStop::Exhausted; }
 };
 const char* regionStopName(RegionStop);
+// The nearest point of every surface within tolerance of a point: one hit per
+// surface, ordered by distance then UUID. Surfaces are their valid triangles,
+// split along the same diagonal as surface regions. With a volume target the
+// point, tolerance and results are in that volume's voxels across its frames.
+struct SurfaceProximityQuery {
+    std::array<double, 3> point{0, 0, 0};
+    double tolerance = 1; // inclusive
+    // nullopt is every surface; an explicitly empty set matches nothing.
+    std::optional<std::vector<std::string>> uuids;
+    std::optional<std::string> coordinates, volume; // exclusive, as in RegionOptions
+};
+struct SurfaceProximityHit {
+    std::string objectUuid, revisionUuid;
+    std::array<double, 2> grid{0, 0};      // column, row on the points grid (fractional)
+    std::array<double, 3> point{0, 0, 0};  // the closest surface point
+    double distance = 0;
+};
 // Optional cancellation predicate runs on the transaction thread, must not
 // re-enter the store, and may inspect counters (also during SQL). No callback
 // exception crosses SQLite's C boundary. An atomic flag works equally well.

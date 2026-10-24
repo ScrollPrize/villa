@@ -566,6 +566,8 @@ public:
     // owned partial runs, no continuation or coverage cache.
     RegionResult geometryRegion(const ReadTxn&, const RegionSlice&,
         const RegionOptions& = {}, const RegionCancel& cancel = {}) const;
+    // Nearest point of each surface near a point, from the persisted tile index.
+    std::vector<SurfaceProximityHit> nearestSurfaces(const ReadTxn&, const SurfaceProximityQuery&) const;
 
     // Requires selection.bbox. Same filters as selectObjects, but pagination
     // counts regions, ordered by object UUID, array name and start indices.

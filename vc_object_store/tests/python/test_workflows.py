@@ -128,6 +128,34 @@ def test_surface_channels_sparse_reads_history_and_resize(db, tile):
         assert ro.read_geometry_array(second, 'review') == channel.tobytes()
 
 
+def test_nearest_surfaces_pick_restrict_and_volume_target(db):
+    y, x = np.mgrid[:40, :40].astype('<f4')
+
+    def sheet(z):
+        points = np.stack([x, y, np.full_like(x, z)], axis=-1)
+        uid, _ = put(db, dict(kind='surface', attributes={'scale': [1, 1]}, arrays=[array('points', points)]), 'surface')
+        db.set_meta(uid, 'coordinates', {'volume_uuid': 'vol', 'scale_factor': 2})
+        return uid
+
+    near, far = sheet(10), sheet(14)
+    hits = db.nearest_surfaces([12.25, 20.5, 11], 5)
+    assert [h['object_uuid'] for h in hits] == [near, far]
+    assert hits[0]['distance'] == 1 and hits[0]['grid'] == [12.25, 20.5] and hits[0]['point'] == [12.25, 20.5, 10]
+    assert db.nearest_surfaces([12.25, 20.5, 11], 0.5) == []
+    assert [h['object_uuid'] for h in db.nearest_surfaces([12.25, 20.5, 11], 5, uuids=[far])] == [far]
+    assert db.nearest_surfaces([12.25, 20.5, 11], 5, uuids=[]) == []
+    # Volume voxels are half the stored coordinates.
+    scaled = db.nearest_surfaces([6.125, 10.25, 5.5], 2.5, volume='vol')
+    assert [h['object_uuid'] for h in scaled] == [near, far] and scaled[0]['distance'] == 0.5
+    assert scaled[0]['point'] == [6.125, 10.25, 5] and scaled[0]['grid'] == [12.25, 20.5]
+    # Vertices marked invalid are holes.
+    valid = np.ones((40, 40), 'u1')
+    valid[19:23, 11:15] = 0
+    db.update_surface_channels(near, [array('valid', valid)], [], db.current_geometry(near)['uuid'])
+    hits = db.nearest_surfaces([12.25, 20.5, 11], 5)
+    assert hits[0]['object_uuid'] == near and hits[0]['distance'] > 2
+
+
 def test_checked_relationships_lifecycle_graph_and_sync(db, tmp_path):
     a, first = put(db, Track([[1, 2, 3], [4, 5, 6]]))
     b, _ = put(db, Track([[1, 2, 3]]))

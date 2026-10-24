@@ -1,100 +1,13 @@
 #include "spatial/SurfaceIndex.hpp"
+#include "spatial/TriangleDistance.hpp"
 #include <limits>
 #include <map>
 namespace vc::object_links {
 namespace {
-struct TriangleHit {
-    cv::Vec3f closest, bary;
-    float distSq;
-};
 bool valid(const cv::Vec3f& p)
 {
     return p[0] != -1 && std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
 }
-TriangleHit closestPointOnTriangle(const cv::Vec3f& p,
-                                   const cv::Vec3f& a,
-                                   const cv::Vec3f& b,
-                                   const cv::Vec3f& c)
-{
-    TriangleHit hit;
-
-    const cv::Vec3f ab = b - a;
-    const cv::Vec3f ac = c - a;
-    const cv::Vec3f ap = p - a;
-
-    float d1 = ab.dot(ap);
-    float d2 = ac.dot(ap);
-    if (d1 <= 0.0f && d2 <= 0.0f) {
-        hit.closest = a;
-        hit.bary = {1.0f, 0.0f, 0.0f};
-        const cv::Vec3f d = p - hit.closest;
-        hit.distSq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
-        return hit;
-    }
-
-    const cv::Vec3f bp = p - b;
-    float d3 = ab.dot(bp);
-    float d4 = ac.dot(bp);
-    if (d3 >= 0.0f && d4 <= d3) {
-        hit.closest = b;
-        hit.bary = {0.0f, 1.0f, 0.0f};
-        const cv::Vec3f d = p - hit.closest;
-        hit.distSq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
-        return hit;
-    }
-
-    float vc = d1 * d4 - d3 * d2;
-    if (vc <= 0.0f && d1 >= 0.0f && d3 <= 0.0f) {
-        float v = d1 / (d1 - d3);
-        hit.closest = a + v * ab;
-        hit.bary = {1.0f - v, v, 0.0f};
-        const cv::Vec3f d = p - hit.closest;
-        hit.distSq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
-        return hit;
-    }
-
-    const cv::Vec3f cp = p - c;
-    float d5 = ab.dot(cp);
-    float d6 = ac.dot(cp);
-    if (d6 >= 0.0f && d5 <= d6) {
-        hit.closest = c;
-        hit.bary = {0.0f, 0.0f, 1.0f};
-        const cv::Vec3f d = p - hit.closest;
-        hit.distSq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
-        return hit;
-    }
-
-    float vb = d5 * d2 - d1 * d6;
-    if (vb <= 0.0f && d2 >= 0.0f && d6 <= 0.0f) {
-        float w = d2 / (d2 - d6);
-        hit.closest = a + w * ac;
-        hit.bary = {1.0f - w, 0.0f, w};
-        const cv::Vec3f d = p - hit.closest;
-        hit.distSq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
-        return hit;
-    }
-
-    float va = d3 * d6 - d5 * d4;
-    if (va <= 0.0f && (d4 - d3) >= 0.0f && (d5 - d6) >= 0.0f) {
-        float w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
-        hit.closest = b + w * (c - b);
-        hit.bary = {0.0f, 1.0f - w, w};
-        const cv::Vec3f d = p - hit.closest;
-        hit.distSq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
-        return hit;
-    }
-
-    float denom = 1.0f / (va + vb + vc);
-    float v = vb * denom;
-    float w = vc * denom;
-    float u = 1.0f - v - w;
-    hit.closest = a + ab * v + ac * w;
-    hit.bary = {u, v, w};
-    const cv::Vec3f d = p - hit.closest;
-    hit.distSq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
-    return hit;
-}
-
 }
 void SurfaceIndex::rebuild(const std::vector<SurfacePtr>& surfaces)
 {
@@ -167,8 +80,8 @@ std::vector<SurfaceIndex::LookupResult> SurfaceIndex::locateAll(const PointQuery
                 }
                 if (outside || !valid(a) || !valid(b) || !valid(d) || !valid(e)) continue;
                 for (int t = 0; t < 2; ++t) {
-                    const auto hit = t ? closestPointOnTriangle(query.worldPoint, b, e, d)
-                                       : closestPointOnTriangle(query.worldPoint, a, b, d);
+                    const auto hit = t ? objects::detail::closestPointOnTriangle(query.worldPoint, b, e, d)
+                                       : objects::detail::closestPointOnTriangle(query.worldPoint, a, b, d);
                     if (!std::isfinite(hit.distSq) || hit.distSq > query.tolerance * query.tolerance) continue;
                     auto& current = best[tile.surface];
                     if (hit.distSq >= current.distanceSquared) continue;

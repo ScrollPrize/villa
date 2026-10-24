@@ -549,6 +549,21 @@ NB_MODULE(_native, m)
            nb::arg("volume") = std::nullopt, nb::arg("include_unbound") = false)
         .def("geometry_region", &geometryRegionFromPy, nb::arg("slice"),
              nb::arg("options") = vo::RegionOptions{}, nb::arg("cancel") = nb::none())
+        .def("nearest_surfaces", [](PyObjectStore& self, const std::array<double, 3>& point, double tolerance,
+            const std::optional<std::vector<std::string>>& uuids, const std::optional<std::string>& coordinates,
+            const std::optional<std::string>& volume) {
+            vo::SurfaceProximityQuery query{point, tolerance, uuids, coordinates, volume};
+            const auto hits = self.withRead<true>([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.nearestSurfaces(txn, query); });
+            nb::list result;
+            for (const auto& hit : hits) {
+                nb::dict row; row["object_uuid"] = hit.objectUuid; row["revision_uuid"] = hit.revisionUuid;
+                row["grid"] = hit.grid; row["point"] = hit.point; row["distance"] = hit.distance;
+                result.append(row);
+            }
+            return result;
+        }, nb::arg("point"), nb::arg("tolerance"), nb::arg("uuids") = std::nullopt,
+           nb::arg("coordinates") = std::nullopt, nb::arg("volume") = std::nullopt,
+           "Nearest point of each surface within tolerance, ordered by distance.")
         .def("spatial_regions", [](PyObjectStore& self, const std::array<double, 6>& bbox,
             const std::optional<std::string>& kind, const std::optional<std::string>& tag,
             const std::vector<std::string>& ids, const std::optional<std::string>& connected,

@@ -68,8 +68,13 @@ and scale options use working voxels. CT normals use uint8 Zarr data with comple
 pyramid levels; credentials and disk-cache configuration are not exposed by this
 adapter. Codec support follows vc_reader.
 
-Surface proximity queries use the store's resident bounds index and exact
-triangles. Bounds are not quantized.
+`nearest_surfaces(point, tolerance, uuids=None, coordinates=None, volume=None)`
+(C++ `ObjectStore::nearestSurfaces`) returns the nearest point of each surface
+within tolerance, ordered by distance: object and geometry revision, fractional
+grid `[column, row]`, the surface point and distance. It reads only the persisted
+spatial tiles near the point and tests their exact valid triangles (the same
+split as surface regions); relationship discovery shares the triangle routine.
+Bounds are not quantized.
 
 Tests are self-contained and do not require the volume-cartographer checkout or
 its fixture data.
