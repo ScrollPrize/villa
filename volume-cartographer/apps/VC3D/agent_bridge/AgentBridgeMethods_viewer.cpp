@@ -186,6 +186,34 @@ void AgentBridgeServer::registerViewerHandlers()
 
     registerMethod(
         {
+            .name = QStringLiteral("viewer.set_hud"),
+            .params = {
+                optionalViewer(),
+                Params::optionalBoolean(QStringLiteral("histogram")),
+                Params::optionalBoolean(QStringLiteral("lineProfile")),
+                Params::optionalBoolean(QStringLiteral("grid")),
+                Params::optionalBoolean(QStringLiteral("loupe")),
+                Params::optionalNumber(QStringLiteral("gridStep")),
+                Params::optionalObject(
+                    QStringLiteral("profileLine"),
+                    {
+                        Params::requiredNumber(QStringLiteral("x1")),
+                        Params::requiredNumber(QStringLiteral("y1")),
+                        Params::requiredNumber(QStringLiteral("x2")),
+                        Params::requiredNumber(QStringLiteral("y2")),
+                    }),
+                Params::optionalBoolean(QStringLiteral("clearProfile")),
+            },
+            .errors = {-32602, -32010, -32002},
+            .mcp = {
+                .tool = QStringLiteral("vc3d_set_hud"),
+                .snakeCaseParams = true,
+            },
+        },
+        [this](const QJsonValue& p) { return handleViewerSetHud(p); });
+
+    registerMethod(
+        {
             .name = QStringLiteral("viewer.list_overlay_volumes"),
             .errors = {-32010, -32000},
             .mcp = {.tool = QStringLiteral("vc3d_list_overlay_volumes")},

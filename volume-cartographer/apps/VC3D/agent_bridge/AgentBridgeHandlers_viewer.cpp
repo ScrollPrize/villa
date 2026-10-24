@@ -22,6 +22,7 @@
 #include "ViewerManager.hpp"
 #include "overlays/VolumeOverlayController.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
+#include "volume_viewers/CVolumeViewerView.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
 #include "vc/core/types/Volume.hpp"
@@ -529,4 +530,95 @@ QJsonObject AgentBridgeServer::handleViewerSetRenderSettings(const QJsonValue& p
 
     // Echo the resulting full settings (unknown keys are ignored).
     return viewerRenderSettingsJson();
+}
+
+
+QJsonObject AgentBridgeServer::handleViewerSetHud(const QJsonValue& params)
+{
+    ViewerManager* mgr = _window ? _window->_viewerManager.get() : nullptr;
+    if (!mgr) {
+        QJsonObject data;
+        data["detail"] = "viewer manager is not available";
+        throw AgentBridgeError{-32010, "Viewer manager unavailable", data};
+    }
+    const QJsonObject p = params.toObject();
+
+    // The overlay switches apply to every viewer, like the checkboxes.
+    vc3d::hud::Options options = mgr->hudOptions();
+    if (p.contains("histogram")) options.histogram = p.value("histogram").toBool();
+    if (p.contains("lineProfile")) options.lineProfile = p.value("lineProfile").toBool();
+    if (p.contains("grid")) options.grid = p.value("grid").toBool();
+    if (p.contains("loupe")) options.loupe = p.value("loupe").toBool();
+    if (p.contains("gridStep")) options.gridStep = std::max(0.0, p.value("gridStep").toDouble());
+    if (p.contains("profileLine")) options.lineProfile = true;
+    mgr->setHudOptions(options);
+
+    QJsonObject hud;
+    hud["histogram"] = options.histogram;
+    hud["lineProfile"] = options.lineProfile;
+    hud["grid"] = options.grid;
+    hud["loupe"] = options.loupe;
+    hud["gridStep"] = options.gridStep;
+    QJsonObject out;
+    out["hud"] = hud;
+
+    // The profile line belongs to one viewer, given in fractions of its viewport.
+    if (!p.contains("profileLine") && !p.value("clearProfile").toBool()) {
+        return out;
+    }
+    auto* chunked = dynamic_cast<CChunkedVolumeViewer*>(resolveViewer(p.value("viewer")));
+    if (!chunked || !chunked->graphicsView()) {
+        QJsonObject data;
+        data["detail"] = "the profile line needs a slice viewer";
+        throw AgentBridgeError{-32002, "Viewer not found", data};
+    }
+    CVolumeViewerView* view = chunked->graphicsView();
+    out["viewer"] = viewerIdFor(chunked);
+    if (p.value("clearProfile").toBool()) {
+        view->setProfileLine(std::nullopt);
+        return out;
+    }
+    const QJsonObject line = p.value("profileLine").toObject();
+    const double w = view->viewport()->width();
+    const double h = view->viewport()->height();
+    auto at = [&](const char* x, const char* y) {
+        return QPointF(std::clamp(line.value(x).toDouble(), 0.0, 1.0) * w,
+                       std::clamp(line.value(y).toDouble(), 0.0, 1.0) * h);
+    };
+    view->setProfileLine(QLineF(at("x1", "y1"), at("x2", "y2")));
+    view->viewport()->repaint();
+
+    const CVolumeViewerView::ProfileReadout r = view->profileReadout();
+    const int n = static_cast<int>(r.values.size());
+    QJsonArray values;
+    double lo = 255, hi = 0, sum = 0;
+    int finite = 0;
+    for (float v : r.values) {
+        if (std::isnan(v)) {
+            values.append(QJsonValue::Null);
+            continue;
+        }
+        values.append(std::round(v * 10.0) / 10.0);
+        lo = std::min(lo, double(v));
+        hi = std::max(hi, double(v));
+        sum += v;
+        ++finite;
+    }
+    QJsonArray peaks;
+    for (int idx : r.peaks) {
+        peaks.append(n > 1 ? double(idx) / (n - 1) : 0.0);
+    }
+    QJsonObject profile;
+    profile["samples"] = n;
+    profile["values"] = values;
+    profile["peaks"] = peaks;
+    profile["length"] = r.lengthUnits;
+    profile["lengthUnit"] = view->physicalUnits() ? QStringLiteral("um") : QStringLiteral("vx");
+    if (finite > 0) {
+        profile["min"] = lo;
+        profile["max"] = hi;
+        profile["mean"] = sum / finite;
+    }
+    out["profile"] = profile;
+    return out;
 }

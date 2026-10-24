@@ -247,6 +247,7 @@ def check_rpc_describe(
         "viewer.set_overlay",
         "viewer.list_overlay_volumes",
         "viewer.set_intersects",
+        "viewer.set_hud",
     }
     try:
         description, _ = client.call(
@@ -296,10 +297,10 @@ def check_rpc_describe(
         coverage = description.get("coverage", {})
         complete = (
             description.get("undocumented") == []
-            and coverage.get("described") == 120
-            and coverage.get("registered") == 120
+            and coverage.get("described") == 121
+            and coverage.get("registered") == 121
             and coverage.get("complete") is True
-            and len(snapshot["methods"]) == 120
+            and len(snapshot["methods"]) == 121
         )
         rendered = json.dumps(snapshot, indent=2, sort_keys=True) + "\n"
         if update_snapshot:

@@ -22,6 +22,7 @@ from vc3d_mcp.tools.viewer import (
     vc3d_get_overlay,
     vc3d_get_render_settings,
     vc3d_list_overlay_volumes,
+    vc3d_set_hud,
     vc3d_set_intersects,
     vc3d_set_overlay,
     vc3d_set_render_settings,
@@ -108,6 +109,12 @@ class ViewerBridge(FakeBridgeServer):
                 "volumes": [{"id": "0", "current": True}, {"id": "1", "current": False}],
                 "overlayVolumeId": self._overlay["volumeId"],
             }
+        elif method == "viewer.set_hud":
+            result = {"hud": {k: params.get(k, False) for k in ("histogram", "lineProfile", "grid", "loupe")}}
+            if "profileLine" in params:
+                result["viewer"] = params.get("viewer") or "v1"
+                result["profile"] = {"samples": 3, "values": [10.0, 200.0, 10.0], "peaks": [0.5],
+                                     "length": 28.1, "lengthUnit": "um"}
         elif method == "viewer.set_intersects":
             ids = sorted(set(params.get("surfaceIds", [])) | {"segmentation"})
             applied = [params["viewer"]] if params.get("viewer") else ["v1", "v2"]
@@ -229,6 +236,16 @@ class ViewerToolTest(unittest.IsolatedAsyncioTestCase):
         result = await vc3d_list_overlay_volumes()
         self.assertEqual(result["volumes"], [{"id": "0", "current": True}, {"id": "1", "current": False}])
         self.assertIn("overlayVolumeId", result)
+
+    async def test_set_hud_sends_camel_case_and_strips_none(self) -> None:
+        await vc3d_set_hud(histogram=True, grid_step=50.0)
+        self.assertEqual(self._last_params(), {"histogram": True, "gridStep": 50.0})
+
+    async def test_set_hud_profile_line_returns_the_profile(self) -> None:
+        line = {"x1": 0.1, "y1": 0.5, "x2": 0.9, "y2": 0.5}
+        result = await vc3d_set_hud(viewer="xy plane", profile_line=line)
+        self.assertEqual(self._last_params(), {"viewer": "xy plane", "profileLine": line})
+        self.assertEqual(result["profile"]["peaks"], [0.5])
 
     async def test_set_intersects_with_viewer_sends_camel_case(self) -> None:
         result = await vc3d_set_intersects(surface_ids=["seg xz", "seg yz"], viewer="v1")
