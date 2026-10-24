@@ -767,7 +767,15 @@ def parse_args(argv=None):
         help="Number of worker threads used to prepare per-bbox crop inputs.",
     )
 
-    parser.add_argument("--bbox-overlap", type=float, default=0.0)
+    parser.add_argument(
+        "--bbox-overlap",
+        type=float,
+        default=0.5,
+        help=(
+            "Overlap fraction for Copy inference crops (default: 0.5 to reduce "
+            "block-edge seams). Pass 0.0 to restore the previous faster behavior."
+        ),
+    )
     parser.add_argument("--bbox-prune", dest="bbox_prune", action="store_true")
     parser.add_argument("--no-bbox-prune", dest="bbox_prune", action="store_false")
     parser.set_defaults(bbox_prune=True)
@@ -876,8 +884,8 @@ def parse_args(argv=None):
             f"--bbox-band-workers must be <= {max_band_workers} "
             f"(half available CPUs; detected cpu_count={cpu_count})."
         )
-    if args.bbox_overlap < 0.0 or args.bbox_overlap >= 1.0:
-        parser.error("--bbox-overlap must satisfy 0.0 <= overlap < 1.0")
+    if not np.isfinite(args.bbox_overlap) or args.bbox_overlap < 0.0 or args.bbox_overlap >= 1.0:
+        parser.error("--bbox-overlap must be finite and satisfy 0.0 <= overlap < 1.0")
     if args.crop_size is not None and any(v < 1 for v in args.crop_size):
         parser.error("--crop-size values must be >= 1")
     if args.volume_cache_retry_seconds < 0.0:
