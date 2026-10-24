@@ -765,6 +765,99 @@ QJsonObject AgentBridgeServer::handleManualAddUndoConstraint(const QJsonValue&)
 }
 
 
+QJsonObject AgentBridgeServer::handleManualAddExtend(const QJsonValue& params)
+{
+    const QJsonObject p = params.toObject();
+    SegmentationModule* mod = _window ? _window->_segmentationModule.get() : nullptr;
+    SegmentationWidget* widget = _window ? _window->_segmentationWidget : nullptr;
+    if (!mod || !widget) {
+        QJsonObject data;
+        data["detail"] = "segmentation module is not available";
+        throw AgentBridgeError{-32000, "Segmentation module unavailable", data};
+    }
+    if (!widget->isEditingEnabled())
+        throw AgentBridgeError{-32008, "Segmentation editing is not enabled", {}};
+    if (!mod->hasActiveSession()) {
+        QJsonObject data;
+        data["kind"] = "session";
+        data["detail"] = "no active segmentation edit session";
+        throw AgentBridgeError{-32007, "No active edit session", data};
+    }
+    requireSourceIdle(QStringLiteral("growth"));
+
+    const QString sideStr = p.value("side").toString();
+    ManualAddTool::ExtendSide side = ManualAddTool::ExtendSide::Right;
+    if (sideStr == QLatin1String("up"))
+        side = ManualAddTool::ExtendSide::Up;
+    else if (sideStr == QLatin1String("down"))
+        side = ManualAddTool::ExtendSide::Down;
+    else if (sideStr == QLatin1String("left"))
+        side = ManualAddTool::ExtendSide::Left;
+    std::optional<ManualAddTool::EdgeSpan> span;
+    if (p.contains("first") || p.contains("last")) {
+        ManualAddTool::EdgeSpan edgeSpan;
+        edgeSpan.first = p.value("first").toInt(0);
+        edgeSpan.last = p.value("last").toInt(std::numeric_limits<int>::max());
+        span = edgeSpan;
+    }
+    QString error;
+    const int cells = p.value("cells").toInt(16);
+    // applyPending walks on: a pending extension of the same side is applied
+    // and the next one starts from the new edge once its save has finished.
+    const bool started = p.value("applyPending").toBool(false) && !span
+        ? mod->extendOrContinueManualAdd(side, cells, &error)
+        : mod->extendManualAdd(side, cells, span, &error);
+    if (!started) {
+        QJsonObject data;
+        data["detail"] = error;
+        throw AgentBridgeError{-32005, "Edge extension did not start", data};
+    }
+    QJsonObject result;
+    result["active"] = mod->manualAddMode();
+    result["side"] = sideStr;
+    result["queued"] = mod->manualAddContinuationQueued();
+    // The sheet walk runs in the background; state.get reports when it ends.
+    result["followingSheet"] = mod->manualAddSheetWalkRunning();
+    return result;
+}
+
+
+QJsonObject AgentBridgeServer::handleManualAddAddConstraint(const QJsonValue& params)
+{
+    const QJsonObject p = params.toObject();
+    SegmentationModule* mod = _window ? _window->_segmentationModule.get() : nullptr;
+    if (!mod) {
+        QJsonObject data;
+        data["detail"] = "segmentation module is not available";
+        throw AgentBridgeError{-32000, "Segmentation module unavailable", data};
+    }
+    if (!mod->manualAddMode()) {
+        QJsonObject data;
+        data["kind"] = "manual_add_session";
+        data["detail"] = "manual-add mode is not active";
+        throw AgentBridgeError{-32007, "Manual add mode not active", data};
+    }
+    const QJsonArray world = p.value("world").toArray();
+    if (world.size() != 3) {
+        QJsonObject data;
+        data["detail"] = "world must be [x, y, z]";
+        throw AgentBridgeError{-32602, "Invalid params", data};
+    }
+    const cv::Vec3f point(static_cast<float>(world.at(0).toDouble()),
+                          static_cast<float>(world.at(1).toDouble()),
+                          static_cast<float>(world.at(2).toDouble()));
+    QString error;
+    if (!mod->addManualAddConstraintAtWorld(point, static_cast<float>(p.value("radius").toDouble(0.0)), &error)) {
+        QJsonObject data;
+        data["detail"] = error;
+        throw AgentBridgeError{-32005, "Constraint was not placed", data};
+    }
+    QJsonObject result;
+    result["placed"] = true;
+    return result;
+}
+
+
 QJsonObject AgentBridgeServer::handleCorrectionsSetPointMode(const QJsonValue& params)
 {
     const QJsonObject p = params.toObject();

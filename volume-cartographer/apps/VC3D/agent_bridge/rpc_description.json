@@ -2692,6 +2692,36 @@
         "type": "object"
       }
     },
+    "segmentation.manual_add.add_constraint": {
+      "errors": [
+        -32602,
+        -32000,
+        -32005,
+        -32007
+      ],
+      "mcp": {
+        "tool": "vc3d_manual_add_add_constraint"
+      },
+      "params": {
+        "properties": {
+          "radius": {
+            "default": 0,
+            "minimum": 0,
+            "type": "number"
+          },
+          "world": {
+            "items": {
+              "type": "number"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "world"
+        ],
+        "type": "object"
+      }
+    },
     "segmentation.manual_add.begin": {
       "errors": [
         -32000,
@@ -2705,6 +2735,55 @@
       },
       "params": {
         "properties": {},
+        "type": "object"
+      }
+    },
+    "segmentation.manual_add.extend": {
+      "errors": [
+        -32602,
+        -32000,
+        -32005,
+        -32007,
+        -32008
+      ],
+      "mcp": {
+        "tool": "vc3d_manual_add_extend"
+      },
+      "params": {
+        "properties": {
+          "applyPending": {
+            "default": false,
+            "type": "boolean"
+          },
+          "cells": {
+            "default": 16,
+            "maximum": 4096,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "first": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          },
+          "last": {
+            "maximum": 2147483647,
+            "minimum": -2147483648,
+            "type": "integer"
+          },
+          "side": {
+            "enum": [
+              "up",
+              "down",
+              "left",
+              "right"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "side"
+        ],
         "type": "object"
       }
     },

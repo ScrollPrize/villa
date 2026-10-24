@@ -161,6 +161,8 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::manualAddApplyExitRequested);
     connect(_manualAddPanel, &SegmentationManualAddPanel::cancelRequested,
             this, &SegmentationWidget::manualAddCancelRequested);
+    connect(_manualAddPanel, &SegmentationManualAddPanel::extendRequested,
+            this, &SegmentationWidget::manualAddExtendRequested);
 
     // Forward corrections panel signals
     connect(_correctionsPanel, &SegmentationCorrectionsPanel::correctionsCreateRequested,
@@ -375,6 +377,7 @@ QString SegmentationWidget::normal3dZarrPath() const { return _growthPanel->norm
 QString SegmentationWidget::patchTracerSourcePath() const { return _growthPanel->patchTracerSourcePath(); }
 utils::Json SegmentationWidget::patchTracerParamsJson() const { return _growthPanel->patchTracerParamsJson(); }
 ManualAddTool::Config SegmentationWidget::manualAddConfig() const { return _manualAddPanel->config(); }
+int SegmentationWidget::manualAddExtendCells() const { return _manualAddPanel->extendCells(); }
 ManualAddTool::LinePreviewMode SegmentationWidget::cycleManualAddLinePreviewMode()
 {
     return _manualAddPanel->cycleLinePreviewMode();

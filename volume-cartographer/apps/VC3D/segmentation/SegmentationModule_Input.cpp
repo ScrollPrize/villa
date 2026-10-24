@@ -132,6 +132,26 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             event->accept();
             return true;
         }
+        // The Grow left/up/down/right keys extend that edge in Manual Add;
+        // the same key again applies the extension and walks on.
+        if (!event->isAutoRepeat() && keyPressMods == Qt::NoModifier) {
+            std::optional<ManualAddTool::ExtendSide> side;
+            const int key = event->key();
+            if (key == vc3d::keybinds::keypress::GrowthLeft.key) {
+                side = ManualAddTool::ExtendSide::Left;
+            } else if (key == vc3d::keybinds::keypress::GrowthUp.key) {
+                side = ManualAddTool::ExtendSide::Up;
+            } else if (key == vc3d::keybinds::keypress::GrowthDown.key) {
+                side = ManualAddTool::ExtendSide::Down;
+            } else if (key == vc3d::keybinds::keypress::GrowthRight.key) {
+                side = ManualAddTool::ExtendSide::Right;
+            }
+            if (side) {
+                extendOrContinueManualAdd(*side, _widget ? _widget->manualAddExtendCells() : 16);
+                event->accept();
+                return true;
+            }
+        }
         if (event->key() == vc3d::keybinds::keypress::CancelOperation.key) {
             finishManualAdd(false);
             event->accept();
@@ -726,9 +746,8 @@ void SegmentationModule::handleMouseRelease(VolumeViewerBase* viewer,
                                             const QPointF& scenePos)
 {
     if (_manualAddMode) {
-        Q_UNUSED(viewer);
+        handleManualAddMouseRelease(viewer, button);
         Q_UNUSED(worldPos);
-        Q_UNUSED(button);
         Q_UNUSED(scenePos);
         return;
     }

@@ -124,6 +124,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
     // Line and interpolation modes persist when manual-add is inactive.
     if (SegmentationModule* mod = _window->_segmentationModule.get()) {
         result["manualAddMode"] = mod->manualAddMode();
+        result["manualAddFollowingSheet"] = mod->manualAddSheetWalkRunning();
         result["correctionsPointMode"] = mod->correctionPointMode();
         // Explicit save/flush bookkeeping.
         const SegmentationModule::AutosaveStatus save = mod->autosaveStatus();
@@ -134,6 +135,7 @@ QJsonObject AgentBridgeServer::handleStateGet(const QJsonValue&)
         result["autosave"] = autosave;
     } else {
         result["manualAddMode"] = false;
+        result["manualAddFollowingSheet"] = false;
         result["correctionsPointMode"] = false;
         result["autosave"] = QJsonValue::Null;
     }

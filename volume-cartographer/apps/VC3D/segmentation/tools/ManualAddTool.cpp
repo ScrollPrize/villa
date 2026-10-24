@@ -2,12 +2,18 @@
 
 #include "ThinPlateSpline3d.hpp"
 
+#include "vc/core/util/PlaneSurface.hpp"
+
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <queue>
 #include <set>
 #include <tuple>
+#include <unordered_map>
+
+#include <opencv2/core.hpp>
 
 namespace
 {
@@ -34,6 +40,172 @@ ManualAddTool::GridPolyline makeLine(int row0, int col0, int row1, int col1)
 
 int rowOf(const cv::Point2i& p) { return p.y; }
 int colOf(const cv::Point2i& p) { return p.x; }
+
+// Vertices used to estimate a line's direction at its edge.
+constexpr int kExtendTangentCells = 4;
+// Neighboring lines (each side) averaged into a line's edge direction.
+constexpr int kExtendTangentSmoothing = 2;
+
+// How a side maps onto the grid. Lines are rows for Left and Right and
+// columns for Up and Down; `step` is +1 or -1 along the line, outward.
+struct ExtendAxes
+{
+    bool linesAreRows{true};
+    int step{1};
+};
+
+ExtendAxes extendAxes(ManualAddTool::ExtendSide side)
+{
+    switch (side) {
+    case ManualAddTool::ExtendSide::Up:
+        return {false, -1};
+    case ManualAddTool::ExtendSide::Down:
+        return {false, 1};
+    case ManualAddTool::ExtendSide::Left:
+        return {true, -1};
+    case ManualAddTool::ExtendSide::Right:
+    default:
+        return {true, 1};
+    }
+}
+
+bool pointIsValid(const cv::Mat_<cv::Vec3f>& points, int row, int col)
+{
+    return row >= 0 && row < points.rows && col >= 0 && col < points.cols &&
+           !ManualAddTool::isInvalidPoint(points(row, col));
+}
+
+// (row, col) of position `index` along `line`.
+cv::Point2i lineCell(const ExtendAxes& axes, int line, int index)
+{
+    return axes.linesAreRows ? cv::Point2i(index, line) : cv::Point2i(line, index);
+}
+
+// Index of the last valid vertex of `line` going outward, or -1.
+int lineEdge(const cv::Mat_<cv::Vec3f>& points, const ExtendAxes& axes, int line)
+{
+    const int length = axes.linesAreRows ? points.cols : points.rows;
+    for (int i = 0; i < length; ++i) {
+        const int index = axes.step > 0 ? length - 1 - i : i;
+        const cv::Point2i cell = lineCell(axes, line, index);
+        if (pointIsValid(points, cell.y, cell.x)) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+std::pair<int, int> spanLines(const cv::Mat_<cv::Vec3f>& points,
+                              const ExtendAxes& axes,
+                              std::optional<ManualAddTool::EdgeSpan> span)
+{
+    const int count = axes.linesAreRows ? points.rows : points.cols;
+    if (!span || span->last < span->first) {
+        return {0, count - 1};
+    }
+    return {std::clamp(span->first, 0, count - 1), std::clamp(span->last, 0, count - 1)};
+}
+}
+
+std::optional<ManualAddTool::EdgePick> ManualAddTool::edgeFromDrag(const cv::Mat_<cv::Vec3f>& points,
+                                                                  cv::Point from,
+                                                                  cv::Point to)
+{
+    if (points.empty()) {
+        return std::nullopt;
+    }
+    const bool horizontal = std::abs(to.x - from.x) >= std::abs(to.y - from.y);
+    // Horizontal drags cover columns, whose ends are the top and bottom edges.
+    const ExtendAxes nearAxes = extendAxes(horizontal ? ExtendSide::Up : ExtendSide::Left);
+    const ExtendAxes farAxes = extendAxes(horizontal ? ExtendSide::Down : ExtendSide::Right);
+    const int count = horizontal ? points.cols : points.rows;
+    const int first = std::clamp(std::min(horizontal ? from.x : from.y, horizontal ? to.x : to.y), 0, count - 1);
+    const int last = std::clamp(std::max(horizontal ? from.x : from.y, horizontal ? to.x : to.y), 0, count - 1);
+    if (last <= first) {
+        return std::nullopt;
+    }
+    // Where the drag runs across the lines, against where they end.
+    const double across = 0.5 * (horizontal ? from.y + to.y : from.x + to.x);
+    double nearGap = 0.0;
+    double farGap = 0.0;
+    int lines = 0;
+    for (int line = first; line <= last; ++line) {
+        const int nearEdge = lineEdge(points, nearAxes, line);
+        const int farEdge = lineEdge(points, farAxes, line);
+        if (nearEdge < 0 || farEdge < 0) {
+            continue;
+        }
+        nearGap += std::abs(across - nearEdge);
+        farGap += std::abs(across - farEdge);
+        ++lines;
+    }
+    if (lines < 2) {
+        return std::nullopt;
+    }
+    EdgePick pick;
+    pick.side = nearGap <= farGap ? (horizontal ? ExtendSide::Up : ExtendSide::Left)
+                                  : (horizontal ? ExtendSide::Down : ExtendSide::Right);
+    pick.span = EdgeSpan{first, last};
+    return pick;
+}
+
+ManualAddTool::GridPadding ManualAddTool::paddingForExtension(const cv::Mat_<cv::Vec3f>& points,
+                                                              ExtendSide side,
+                                                              int cells,
+                                                              std::optional<EdgeSpan> span)
+{
+    GridPadding padding;
+    if (points.empty() || cells <= 0) {
+        return padding;
+    }
+    const ExtendAxes axes = extendAxes(side);
+    const int length = axes.linesAreRows ? points.cols : points.rows;
+    const auto [firstLine, lastLine] = spanLines(points, axes, span);
+    int needed = 0;
+    for (int line = firstLine; line <= lastLine; ++line) {
+        const int edge = lineEdge(points, axes, line);
+        if (edge < 0) {
+            continue;
+        }
+        const int target = edge + axes.step * cells;
+        needed = std::max(needed, axes.step > 0 ? target - (length - 1) : -target);
+    }
+    switch (side) {
+    case ExtendSide::Up:
+        padding.top = needed;
+        break;
+    case ExtendSide::Down:
+        padding.bottom = needed;
+        break;
+    case ExtendSide::Left:
+        padding.left = needed;
+        break;
+    case ExtendSide::Right:
+        padding.right = needed;
+        break;
+    }
+    return padding;
+}
+
+cv::Mat_<cv::Vec3f> ManualAddTool::padPoints(const cv::Mat_<cv::Vec3f>& points, const GridPadding& padding)
+{
+    if (points.empty() || !padding.any()) {
+        return points.clone();
+    }
+    cv::Mat_<cv::Vec3f> padded;
+    cv::copyMakeBorder(points, padded,
+                       std::max(0, padding.top), std::max(0, padding.bottom),
+                       std::max(0, padding.left), std::max(0, padding.right),
+                       cv::BORDER_CONSTANT, cv::Scalar(-1.0, -1.0, -1.0));
+    return padded;
+}
+
+std::optional<ManualAddTool::ExtendSide> ManualAddTool::extensionSide() const
+{
+    if (!_extension) {
+        return std::nullopt;
+    }
+    return _extension->side;
 }
 
 ManualAddTool::Config ManualAddTool::sanitize(Config config)
@@ -42,6 +214,7 @@ ManualAddTool::Config ManualAddTool::sanitize(Config config)
     config.boundaryBand = std::clamp(config.boundaryBand, 1, 20);
     config.regularization = std::clamp(config.regularization, 0.0, 1.0);
     config.sampleCap = std::clamp(config.sampleCap, 16, 10000);
+    config.guidedClickReach = std::clamp(config.guidedClickReach, 0.0, 1000.0);
     config.previewThrottleMs = std::clamp(config.previewThrottleMs, 0, 500);
     config.tintOpacity = std::clamp(config.tintOpacity, 0.0f, 1.0f);
     config.planeConstraintRadius = std::clamp(config.planeConstraintRadius, 0.5, 100.0);
@@ -75,6 +248,7 @@ bool ManualAddTool::begin(const cv::Mat_<cv::Vec3f>& points, Config config)
     _changedVertices.clear();
     _userPlaneConstraints.clear();
     _initialFillCommitted = false;
+    _extension.reset();
     clearHoverFillCache();
     touchRevision();
     return true;
@@ -101,6 +275,7 @@ void ManualAddTool::clear()
     _changedVertices.clear();
     _userPlaneConstraints.clear();
     _initialFillCommitted = false;
+    _extension.reset();
     clearHoverFillCache();
     touchRevision();
 }
@@ -121,6 +296,11 @@ bool ManualAddTool::clearPending(Config config)
     _borderSampleVertices.clear();
     _changedVertices.clear();
     _userPlaneConstraints.clear();
+    if (_extension) {
+        // A cleared extension leaves nothing behind, so another may start.
+        _extension.reset();
+        _initialFillCommitted = false;
+    }
     clearHoverFillCache();
     touchRevision();
     return true;
@@ -343,6 +523,12 @@ bool ManualAddTool::updateHover(int row, int col)
 
 bool ManualAddTool::commitHover(std::string* status)
 {
+    if (_extension) {
+        if (status) {
+            *status = "An edge extension is pending. Apply it with Shift+E or clear it first.";
+        }
+        return false;
+    }
     if (_initialFillCommitted) {
         if (status) {
             *status = "Manual Add initial fill has already been used. Press Shift+E to save, then enable Manual Add again.";
@@ -736,6 +922,9 @@ bool ManualAddTool::recompute(std::string* status)
     if (_entrySnapshotPoints.empty()) {
         return false;
     }
+    if (_extension) {
+        return recomputeExtension(status);
+    }
     extractFillAndBorder();
     if (_fillVertices.empty()) {
         if (status) {
@@ -801,6 +990,34 @@ bool ManualAddTool::recompute(std::string* status)
     }
     touchRevision();
     return true;
+}
+
+std::optional<SegmentationEditManager::GridKey>
+ManualAddTool::pickPlaneConstraintVertex(PlaneSurface& plane, const cv::Vec2f& clickPlane, double radius) const
+{
+    const double radiusSq = radius * radius;
+    double bestDistSq = std::numeric_limits<double>::max();
+    std::optional<GridKey> best;
+    for (const auto& key : _fillVertices) {
+        if (key.row < 0 || key.row >= _previewPoints.rows || key.col < 0 || key.col >= _previewPoints.cols) {
+            continue;
+        }
+        const cv::Vec3f& vertex = _previewPoints(key.row, key.col);
+        const cv::Vec3f projected = plane.project(vertex, 1.0f, 1.0f);
+        const double dx = static_cast<double>(projected[0]) - clickPlane[0];
+        const double dy = static_cast<double>(projected[1]) - clickPlane[1];
+        const double inPlaneSq = dx * dx + dy * dy;
+        if (inPlaneSq > radiusSq) {
+            continue;
+        }
+        const double offPlane = static_cast<double>(plane.scalarp(vertex));
+        const double distSq = inPlaneSq + offPlane * offPlane;
+        if (distSq < bestDistSq) {
+            bestDistSq = distSq;
+            best = key;
+        }
+    }
+    return best;
 }
 
 bool ManualAddTool::addOrReplacePlaneConstraint(int row, int col, const cv::Vec3f& world, std::string* status)
@@ -909,4 +1126,289 @@ bool ManualAddTool::removeLastPlaneConstraint(std::string* status)
     _changedVertices = previousChangedVertices;
     touchRevision();
     return false;
+}
+
+bool ManualAddTool::beginExtension(ExtendSide side,
+                                   int cells,
+                                   std::optional<EdgeSpan> span,
+                                   std::string* status)
+{
+    auto fail = [&](const char* message) {
+        if (status) {
+            *status = message;
+        }
+        return false;
+    };
+    if (_entrySnapshotPoints.empty()) {
+        return fail("Manual Add is not active.");
+    }
+    if (_extension || _initialFillCommitted || !_committedPolylines.empty()) {
+        return fail("Apply or clear the pending Manual Add geometry before extending an edge.");
+    }
+    cells = std::clamp(cells, 1, _config.maxPreviewSpan);
+
+    const ExtendAxes axes = extendAxes(side);
+    const int length = axes.linesAreRows ? _entrySnapshotPoints.cols : _entrySnapshotPoints.rows;
+    const auto [firstLine, lastLine] = spanLines(_entrySnapshotPoints, axes, span);
+
+    struct EdgeLine
+    {
+        int line{0};
+        int edge{0};
+        cv::Vec3f tangent{0.0f, 0.0f, 0.0f};
+    };
+    std::vector<EdgeLine> lines;
+    for (int line = firstLine; line <= lastLine; ++line) {
+        const int edge = lineEdge(_entrySnapshotPoints, axes, line);
+        if (edge < 0) {
+            continue;
+        }
+        // Direction at the edge from the run of valid vertices behind it.
+        int run = 0;
+        for (int back = 1; back <= kExtendTangentCells; ++back) {
+            const cv::Point2i cell = lineCell(axes, line, edge - axes.step * back);
+            if (!isValid(cell.y, cell.x)) {
+                break;
+            }
+            run = back;
+        }
+        if (run == 0) {
+            continue;
+        }
+        const cv::Point2i edgeCell = lineCell(axes, line, edge);
+        const cv::Point2i backCell = lineCell(axes, line, edge - axes.step * run);
+        const cv::Vec3f tangent = (_entrySnapshotPoints(edgeCell.y, edgeCell.x) -
+                                   _entrySnapshotPoints(backCell.y, backCell.x)) / static_cast<float>(run);
+        const int target = edge + axes.step * cells;
+        if (target < 0 || target >= length) {
+            return fail("The grid has no room for this extension yet.");
+        }
+        lines.push_back(EdgeLine{line, edge, tangent});
+    }
+    if (lines.size() < 2) {
+        return fail("Fewer than two lines on that side end in two valid vertices; nothing to extend.");
+    }
+
+    // Average each line's direction with its neighbors so one noisy edge
+    // vertex does not steer its whole line.
+    std::vector<cv::Vec3f> smoothed(lines.size());
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        cv::Vec3f sum(0.0f, 0.0f, 0.0f);
+        int count = 0;
+        for (std::size_t j = 0; j < lines.size(); ++j) {
+            if (std::abs(lines[j].line - lines[i].line) <= kExtendTangentSmoothing) {
+                sum += lines[j].tangent;
+                ++count;
+            }
+        }
+        smoothed[i] = sum / static_cast<float>(std::max(1, count));
+    }
+
+    Extension extension;
+    extension.side = side;
+    extension.cells = cells;
+    extension.span = span;
+    extension.id = _nextExtensionId++;
+    _fillVertices.clear();
+    _changedVertices.clear();
+    _borderSampleVertices.clear();
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        const auto& line = lines[i];
+        const cv::Point2i edgeCell = lineCell(axes, line.line, line.edge);
+        const cv::Vec3f origin = _entrySnapshotPoints(edgeCell.y, edgeCell.x);
+        extension.origins.push_back(origin);
+        extension.steps.push_back(smoothed[i]);
+        for (int k = 1; k <= cells; ++k) {
+            const cv::Point2i cell = lineCell(axes, line.line, line.edge + axes.step * k);
+            _fillVertices.push_back(GridKey{cell.y, cell.x});
+            extension.guess.push_back(origin + smoothed[i] * static_cast<float>(k));
+        }
+        for (int back = 0; back <= _config.boundaryBand; ++back) {
+            const cv::Point2i cell = lineCell(axes, line.line, line.edge - axes.step * back);
+            if (!isValid(cell.y, cell.x)) {
+                break;
+            }
+            extension.anchors.push_back(GridKey{cell.y, cell.x});
+        }
+    }
+    _borderSampleVertices = extension.anchors;
+    _extension = std::move(extension);
+    _initialFillCommitted = true;
+    _hoverPolylines.clear();
+    _hoverVertex.reset();
+    _hoverFillVertices.clear();
+    _userPlaneConstraints.clear();
+    if (!recomputeExtension(status)) {
+        _extension.reset();
+        _initialFillCommitted = false;
+        _fillVertices.clear();
+        _borderSampleVertices.clear();
+        _changedVertices.clear();
+        _previewPoints = _entrySnapshotPoints.clone();
+        touchRevision();
+        return false;
+    }
+    if (status) {
+        *status = "Extending " + std::to_string(lines.size()) + " lines by " + std::to_string(cells) +
+                  " vertices. Shift+click the sheet in a slice view to pull the new strip onto it.";
+    }
+    return true;
+}
+
+std::optional<ManualAddTool::SheetWalk> ManualAddTool::sheetWalk() const
+{
+    if (!_extension || _extension->origins.empty() ||
+        _extension->guess.size() != _extension->origins.size() * static_cast<std::size_t>(_extension->cells)) {
+        return std::nullopt;
+    }
+    return SheetWalk{_extension->id, _extension->cells, _extension->origins, _extension->steps};
+}
+
+void ManualAddTool::walkSheetLine(const SheetWalk& walk,
+                                  std::size_t line,
+                                  const SheetNormalFn& normal,
+                                  std::vector<cv::Vec3f>& guess)
+{
+    if (line >= walk.origins.size() || line >= walk.steps.size() ||
+        guess.size() < (line + 1) * static_cast<std::size_t>(walk.cells)) {
+        return;
+    }
+    cv::Vec3f point = walk.origins[line];
+    cv::Vec3f step = walk.steps[line];
+    const float length = static_cast<float>(cv::norm(step));
+    for (int k = 0; k < walk.cells; ++k) {
+        if (normal && length > 0.0f) {
+            if (const auto n = normal(point + step * 0.5f)) {
+                const float nLength = static_cast<float>(cv::norm(*n));
+                if (nLength > 0.5f) {
+                    const cv::Vec3f unit = *n / nLength;
+                    const cv::Vec3f along = step - unit * step.dot(unit);
+                    const float alongLength = static_cast<float>(cv::norm(along));
+                    if (alongLength > 1e-3f * length) {
+                        step = along * (length / alongLength);
+                    }
+                }
+            }
+        }
+        point += step;
+        guess[line * static_cast<std::size_t>(walk.cells) + static_cast<std::size_t>(k)] = point;
+    }
+}
+
+bool ManualAddTool::applySheetWalk(std::uint64_t extensionId, std::vector<cv::Vec3f> guess, std::string* status)
+{
+    if (!_extension || _extension->id != extensionId) {
+        if (status) {
+            *status = "The extension changed while following the sheet.";
+        }
+        return false;
+    }
+    return setExtensionGuess(std::move(guess), status);
+}
+
+bool ManualAddTool::setExtensionGuess(std::vector<cv::Vec3f> guess, std::string* status)
+{
+    if (!_extension || guess.size() != _fillVertices.size()) {
+        if (status) {
+            *status = "No edge extension is pending.";
+        }
+        return false;
+    }
+    for (const auto& point : guess) {
+        if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) {
+            if (status) {
+                *status = "The extension guess has a non-finite point.";
+            }
+            return false;
+        }
+    }
+    _extension->guess = std::move(guess);
+    _extension->guided = true;
+    return recomputeExtension(status);
+}
+
+bool ManualAddTool::recomputeExtension(std::string* status)
+{
+    if (!_extension || _fillVertices.size() != _extension->guess.size()) {
+        if (status) {
+            *status = "No edge extension is pending.";
+        }
+        return false;
+    }
+
+    // An extension is always previewed and applied by the spline, whatever
+    // the fill method: tracer growth would replace the grid under it.
+    _previewPoints = _entrySnapshotPoints.clone();
+    _changedVertices = _fillVertices;
+    std::unordered_map<int, std::size_t> guessIndex;
+    guessIndex.reserve(_fillVertices.size());
+    for (std::size_t i = 0; i < _fillVertices.size(); ++i) {
+        const auto& key = _fillVertices[i];
+        _previewPoints(key.row, key.col) = _extension->guess[i];
+        guessIndex[flatIndex(key.row, key.col)] = i;
+    }
+
+    if (!_userPlaneConstraints.empty()) {
+        // Fit how far the clicks move the continuation, holding the edge in
+        // place, and apply that displacement to the whole new strip.
+        std::vector<ThinPlateSpline3d::Sample> samples;
+        const int constraintCount = static_cast<int>(_userPlaneConstraints.size());
+        const int anchorBudget = std::max(3, _config.sampleCap - constraintCount);
+        const auto& anchors = _extension->anchors;
+        const int anchorCount = static_cast<int>(anchors.size());
+        const int anchorTake = std::min(anchorCount, anchorBudget);
+        samples.reserve(static_cast<std::size_t>(anchorTake + constraintCount));
+        for (int i = 0; i < anchorTake; ++i) {
+            const std::size_t index = static_cast<std::size_t>(i) * static_cast<std::size_t>(anchorCount) /
+                                      static_cast<std::size_t>(anchorTake);
+            const auto& key = anchors[std::min(index, anchors.size() - 1)];
+            samples.push_back({cv::Point2d(key.col, key.row), cv::Vec3d(0.0, 0.0, 0.0)});
+        }
+        for (const auto& constraint : _userPlaneConstraints) {
+            auto it = guessIndex.find(flatIndex(constraint.row, constraint.col));
+            if (it == guessIndex.end()) {
+                continue;
+            }
+            const cv::Vec3f delta = constraint.world - _extension->guess[it->second];
+            samples.push_back({cv::Point2d(constraint.col, constraint.row),
+                               cv::Vec3d(delta[0], delta[1], delta[2])});
+        }
+
+        ThinPlateSpline3d tps;
+        if (!tps.fit(samples, _config.regularization)) {
+            if (status) {
+                *status = "Manual Add could not fit the edge extension to the plane constraints.";
+            }
+            return false;
+        }
+        // A guided guess is already close to the sheet away from the clicks,
+        // so there each click only corrects its own neighborhood.
+        const double reach = _extension->guided ? _config.guidedClickReach : 0.0;
+        for (std::size_t i = 0; i < _fillVertices.size(); ++i) {
+            const auto& key = _fillVertices[i];
+            auto delta = tps.evaluate(cv::Point2d(key.col, key.row));
+            if (!delta) {
+                if (status) {
+                    *status = "Manual Add interpolation produced a non-finite point.";
+                }
+                return false;
+            }
+            if (reach > 0.0) {
+                double nearest = std::numeric_limits<double>::max();
+                for (const auto& constraint : _userPlaneConstraints) {
+                    const double dr = constraint.row - key.row;
+                    const double dc = constraint.col - key.col;
+                    nearest = std::min(nearest, dr * dr + dc * dc);
+                }
+                *delta *= std::exp(-0.5 * nearest / (reach * reach));
+            }
+            _previewPoints(key.row, key.col) = _extension->guess[i] + cv::Vec3f(*delta);
+        }
+    }
+
+    if (status) {
+        *status = "Manual Add edge extension preview updated.";
+    }
+    touchRevision();
+    return true;
 }

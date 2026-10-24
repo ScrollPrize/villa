@@ -163,6 +163,8 @@ set(srcs
     segmentation/tools/SurfaceMaskBrushTool.hpp
     segmentation/tools/ManualAddTool.cpp
     segmentation/tools/ManualAddTool.hpp
+    segmentation/tools/SheetNormalField.cpp
+    segmentation/tools/SheetNormalField.hpp
     segmentation/tools/ThinPlateSpline3d.cpp
     segmentation/tools/ThinPlateSpline3d.hpp
     segmentation/tools/SegmentationLineTool.cpp
@@ -172,6 +174,8 @@ set(srcs
     segmentation/tools/SegmentationTool.hpp
     segmentation/tools/SegmentationBrushTool.cpp
     segmentation/tools/SegmentationBrushTool.hpp
+    segmentation/SurfaceGridEdit.cpp
+    segmentation/SurfaceGridEdit.hpp
     segmentation/SegmentationModule_Falloff.cpp
     segmentation/SegmentationModule_Input.cpp
     segmentation/SegmentationModule_Session.cpp
@@ -362,6 +366,8 @@ target_include_directories(VC3D
         ${CMAKE_SOURCE_DIR}/libs/edt
         ${CMAKE_SOURCE_DIR}/libs/cc3d
         ${CMAKE_SOURCE_DIR}/libs/djikstra3d
+        # Header-only CT sheet-normal estimator shared with vc_reader.
+        ${CMAKE_SOURCE_DIR}/../vc_reader/src/cpp
 )
 
 # Avahi for mDNS service discovery (Linux only)
@@ -404,6 +410,20 @@ target_link_libraries(VC3D
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
     Blosc::blosc
 )
+
+# Headless Manual Add edge extension along the sheet (no GUI). Qt Core only
+# because ManualAddTool's headers use it.
+add_executable(vc_extend_edge
+    cli/vc_extend_edge.cpp
+    segmentation/SurfaceGridEdit.cpp
+    segmentation/tools/AutoExtend.cpp
+    segmentation/tools/ManualAddTool.cpp
+    segmentation/tools/SheetNormalField.cpp
+    segmentation/tools/ThinPlateSpline3d.cpp)
+target_include_directories(vc_extend_edge PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/../vc_reader/src/cpp)
+target_link_libraries(vc_extend_edge PRIVATE vc_core Qt6::Core Boost::program_options)
 
 # Build-tree Qt plugin deployment (MSVC/vcpkg). vcpkg copies the Qt DLLs next to
 # the executable but not the plugin tree, so a freshly built VC3D.exe cannot find
