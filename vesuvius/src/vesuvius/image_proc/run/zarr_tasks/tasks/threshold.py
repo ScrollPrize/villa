@@ -19,6 +19,7 @@ from ..utils import (
     create_level_dataset,
     get_chunk_coords,
     write_multiscales_metadata,
+    read_level_scale,
 )
 
 
@@ -99,9 +100,10 @@ class ThresholdTask(ZarrTask):
 
     def prepare(self) -> None:
         """Create output OME-Zarr structure."""
-        input_z = self._get_input_array(
-            str(self.config.level) if self.config.level is not None else "0"
-        )
+        level = str(self.config.level) if self.config.level is not None else "0"
+        input_z = self._get_input_array(level)
+        self._input_path = self._input_array_path(level)
+        self._source_scale = read_level_scale(self.config.input_zarr, level)
 
         print(f"Input array shape: {input_z.shape}")
         print(f"Input array chunks: {input_z.chunks}")
@@ -132,7 +134,7 @@ class ThresholdTask(ZarrTask):
 
         for coords in chunk_coords:
             yield (
-                self.config.input_zarr,
+                self._input_path,
                 self._lvl0_path,
                 self.config.threshold,
                 self.config.erase_blank,
@@ -154,8 +156,10 @@ class ThresholdTask(ZarrTask):
             num_levels=self.config.num_levels,
             num_workers=self.config.num_workers,
         )
+        base_scale, units = self._source_scale or (None, None)
         write_multiscales_metadata(
-            root_group_path, self._axes_names, num_levels=self.config.num_levels
+            root_group_path, self._axes_names, num_levels=self.config.num_levels,
+            base_scale=base_scale, units=units,
         )
 
         print(

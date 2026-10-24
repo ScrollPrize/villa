@@ -20,6 +20,7 @@ from ..utils import (
     get_chunk_coords,
     inverse_permutation,
     write_multiscales_metadata,
+    read_level_scale,
 )
 
 
@@ -110,9 +111,10 @@ class TransposeTask(ZarrTask):
 
     def prepare(self) -> None:
         """Create output OME-Zarr structure with transposed shape."""
-        input_z = self._get_input_array(
-            str(self.config.level) if self.config.level is not None else "0"
-        )
+        level = str(self.config.level) if self.config.level is not None else "0"
+        input_z = self._get_input_array(level)
+        self._input_path = self._input_array_path(level)
+        self._source_scale = read_level_scale(self.config.input_zarr, level)
 
         # Parse transpose order string to permutation
         valid_axes = {"x": 2, "y": 1, "z": 0}
@@ -154,7 +156,7 @@ class TransposeTask(ZarrTask):
 
         for coords in out_chunk_coords:
             yield (
-                self.config.input_zarr,
+                self._input_path,
                 self._lvl0_path,
                 self._perm,
                 coords,
@@ -175,8 +177,13 @@ class TransposeTask(ZarrTask):
             num_levels=self.config.num_levels,
             num_workers=self.config.num_workers,
         )
+        base_scale, units = self._source_scale or (None, None)
+        if base_scale is not None:
+            base_scale = [base_scale[p] for p in self._perm]
+            units = [units[p] for p in self._perm]
         write_multiscales_metadata(
-            root_group_path, self._axes_names, num_levels=self.config.num_levels
+            root_group_path, self._axes_names, num_levels=self.config.num_levels,
+            base_scale=base_scale, units=units,
         )
 
         print(

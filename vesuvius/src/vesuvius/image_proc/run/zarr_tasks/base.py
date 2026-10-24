@@ -232,14 +232,19 @@ class ZarrTask(ABC):
         Returns:
             Zarr array
         """
+        return zarr.open(self._input_array_path(level), mode="r")
+
+    def _input_array_path(self, level: Optional[str] = None) -> str:
+        """Path of the input array that workers should open.
+
+        For an OME-Zarr group this is the level's array inside the group, not
+        the group root: zarr.open() on the root returns a Group, which cannot
+        be sliced or asked for its shape.
+        """
         opened = zarr.open(self.config.input_zarr, mode="r")
-
         if isinstance(opened, zarr.Group):
-            if level is not None:
-                return opened[level]
-            return opened["0"]
-
-        return opened
+            return f"{self.config.input_zarr}/{level if level is not None else '0'}"
+        return self.config.input_zarr
 
     @classmethod
     def validate_args(cls, args: argparse.Namespace) -> None:
