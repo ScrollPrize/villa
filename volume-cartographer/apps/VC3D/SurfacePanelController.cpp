@@ -1,81 +1,64 @@
 #include "SurfacePanelController.hpp"
 
 #include "SurfaceTreeWidget.hpp"
-#include "SurfaceDisplayName.hpp"
-#include "SurfaceTimestamp.hpp"
 #include "ViewerManager.hpp"
 #include "CState.hpp"
+#include "ObjectStoreCoordinates.hpp"
+#include "ObjectStoreRegions.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "elements/DropdownChecklistButton.hpp"
 #include "VCSettings.hpp"
 
-#include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/types/Segmentation.hpp"
-#include "vc/core/util/Surface.hpp"
+#include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/DateTime.hpp"
-#include "vc/core/util/LoadJson.hpp"
-#include "utils/Json.hpp"
 #include "vc/ui/VCCollection.hpp"
 
+#include <nlohmann/json.hpp>
+
+#include <QAction>
+#include <QApplication>
+#include <QBrush>
 #include <QCheckBox>
+#include <QClipboard>
 #include <QComboBox>
 #include <QDialog>
 #include <QDoubleSpinBox>
-#include <QFutureWatcher>
 #include <QFormLayout>
 #include <QGridLayout>
-#include <QHeaderView>
 #include <QHBoxLayout>
-#include <QLineEdit>
-#include <QAction>
+#include <QHeaderView>
+#include <QInputDialog>
 #include <QLabel>
+#include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
 #include <QModelIndex>
 #include <QPushButton>
-#include <QProgressDialog>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSizePolicy>
 #include <QStandardItem>
 #include <QStandardItemModel>
 #include <QStyle>
-#include <QBrush>
-#include <QWidget>
-#include <QString>
+#include <QToolButton>
 #include <QTreeWidget>
 #include <QTreeWidgetItemIterator>
-#include <QToolButton>
 #include <QVBoxLayout>
 #include <QVector>
-#include <QtConcurrent>
 
-#include <iostream>
 #include <algorithm>
-#include <fstream>
-#include <optional>
-#include <unordered_set>
-#include <set>
-#include <filesystem>
+#include <cmath>
 
 namespace {
 
 constexpr double kFocusPointFilterRadius = 10.0;
+// Distance within which a point-set point lies on a surface.
+constexpr double kPointSetTolerance = 2.0;
 constexpr double kZRangeFilterLowerDefault = 0.0;
 constexpr double kZRangeFilterUpperDefault = 1000000.0;
 constexpr auto kSurfaceColumnSettingsGroup = "surface_panel/columns";
 constexpr auto kCurrentOnlyFilterSettingsKey = "surface_panel/filters/current_only";
-
-bool preserveSurfaceDuringSegmentReload(const std::string& name)
-{
-    return name == "segmentation" ||
-           name == "xy plane" ||
-           name == "xz plane" ||
-           name == "yz plane" ||
-           name == "seg xz" ||
-           name == "seg yz";
-}
+constexpr int kUnboundRole = Qt::UserRole + 1;
 
 bool z_range_filter_active(QDoubleSpinBox* lower, QDoubleSpinBox* upper)
 {
@@ -87,94 +70,6 @@ bool z_range_filter_active(QDoubleSpinBox* lower, QDoubleSpinBox* upper)
            upper->value() != kZRangeFilterUpperDefault;
 }
 
-QString surface_long_id(QuadSurface* surf)
-{
-    if (!surf || surf->meta.is_null()) {
-        return {};
-    }
-
-    for (const char* key : {
-             "vc_open_data_segment_long_id",
-             "segment_long_id",
-             "long_id",
-             "longId",
-         }) {
-        const auto value = vc::json::string_or(surf->meta, key, std::string{});
-        if (!value.empty()) {
-            return QString::fromStdString(value);
-        }
-    }
-
-    return {};
-}
-
-QString surface_timestamp(QuadSurface* surf)
-{
-    if (!surf || surf->meta.is_null() || !surf->meta.contains("date_last_modified")) {
-        return {};
-    }
-
-    return QString::fromStdString(vc3d::surfaceTimestampForDisplay(
-        surf->meta["date_last_modified"].get_string()));
-}
-
-std::string segment_display_id(const std::string& dirName, const std::string& segmentId, bool currentFolder)
-{
-    if (currentFolder) {
-        return segmentId;
-    }
-    return dirName + "/" + segmentId;
-}
-
-void apply_folder_metadata(QuadSurface* surf,
-                           const SurfacePanelController::SegmentFolderSelection& folder,
-                           const std::string& displayId)
-{
-    if (!surf) {
-        return;
-    }
-    surf->id = displayId;
-    surf->meta["vc3d_segment_folder"] = folder.dirName;
-    surf->meta["vc3d_segment_display_id"] = displayId;
-    surf->meta["vc3d_segment_folder_default_palette"] = folder.defaultPalette;
-    if (!folder.defaultPalette && folder.color.isValid()) {
-        utils::Json color = utils::Json::array();
-        color.push_back(static_cast<double>(folder.color.red()));
-        color.push_back(static_cast<double>(folder.color.green()));
-        color.push_back(static_cast<double>(folder.color.blue()));
-        surf->meta["vc3d_segment_folder_color"] = std::move(color);
-    } else if (surf->meta.contains("vc3d_segment_folder_color")) {
-        surf->meta.erase("vc3d_segment_folder_color");
-    }
-}
-
-std::vector<std::filesystem::path> segment_dirs_under(const std::filesystem::path& root)
-{
-    std::vector<std::filesystem::path> out;
-    if (root.empty() || !std::filesystem::exists(root)) {
-        return out;
-    }
-    if (Segmentation::checkDir(root)) {
-        out.push_back(root);
-        return out;
-    }
-    std::error_code ec;
-    std::filesystem::recursive_directory_iterator it(root, ec);
-    const std::filesystem::recursive_directory_iterator end;
-    while (!ec && it != end) {
-        if (it.depth() > 1) {
-            it.disable_recursion_pending();
-        }
-        if (it->is_directory() && Segmentation::checkDir(it->path())) {
-            out.push_back(it->path());
-            it.disable_recursion_pending();
-        }
-        it.increment(ec);
-    }
-    std::sort(out.begin(), out.end());
-    return out;
-}
-
 QString surface_column_settings_key(int column)
 {
     return QStringLiteral("%1/column_%2_visible").arg(kSurfaceColumnSettingsGroup).arg(column);
@@ -183,78 +78,63 @@ QString surface_column_settings_key(int column)
 bool surface_column_default_visible(int column)
 {
     return column != SURFACE_LONG_ID_COLUMN &&
-           column != SURFACE_AVG_COST_COLUMN &&
-           column != SURFACE_OVERLAPS_COLUMN;
+           column != SURFACE_AVG_COST_COLUMN;
 }
 
-void set_surface_tree_item_text(SurfaceTreeWidgetItem* item,
-                                const std::string& id,
-                                QuadSurface* surf)
+bool has_tag(const SurfaceCatalog::Row& row, const char* tag)
 {
-    if (!item || !surf) {
-        return;
-    }
-
-    const QString idText = QString::fromStdString(
-        vc3d::surfacePanelDisplayName(id, surf->meta));
-    const QString longIdText = surface_long_id(surf);
-    const double areaCm2 = vc::json::number_or(surf->meta, "area_cm2", -1.0);
-    const double avgCost = vc::json::number_or(surf->meta, "avg_cost", -1.0);
-
-    item->setText(SURFACE_ID_COLUMN, idText);
-    item->setToolTip(SURFACE_ID_COLUMN, idText);
-    item->setText(SURFACE_LONG_ID_COLUMN, longIdText);
-    item->setToolTip(SURFACE_LONG_ID_COLUMN, longIdText);
-    // Match the update path below: a surface whose voxel size was unknown has
-    // no area_cm2 at all, and "-" is honest where "-1.000" is not.
-    item->setText(SURFACE_AREA_COLUMN,
-                  areaCm2 >= 0.0 ? QString::number(areaCm2, 'f', 3) : QStringLiteral("-"));
-    item->setText(SURFACE_AVG_COST_COLUMN,
-                  avgCost >= 0.0 ? QString::number(avgCost, 'f', 3) : QStringLiteral("-"));
-    item->setText(SURFACE_OVERLAPS_COLUMN, QString::number(surf->overlappingIds().size()));
-    item->setText(TIMESTAMP_COLUMN, surface_timestamp(surf));
+    return std::find(row.record.tags.begin(), row.record.tags.end(), tag) != row.record.tags.end();
 }
 
-void sync_tag(utils::Json& dict, bool checked, const std::string& name, const std::string& username = {})
+QString display_name(const SurfaceCatalog::Row& row)
 {
-    if (checked && !dict.count(name)) {
-        dict[name] = utils::Json::object();
-        if (!username.empty()) {
-            dict[name]["user"] = username;
-        }
-        dict[name]["date"] = get_surface_time_str();
-        if (name == "approved") {
-            dict["date_last_modified"] = get_surface_time_str();
-        }
-    }
+    return QString::fromStdString(row.record.name.empty() ? row.record.uuid : row.record.name);
+}
 
-    if (!checked && dict.count(name)) {
-        dict.erase(name);
-        if (name == "approved") {
-            dict["date_last_modified"] = get_surface_time_str();
+nlohmann::json row_meta(const SurfaceCatalog::Row& row)
+{
+    auto meta = nlohmann::json::parse(row.record.meta, nullptr, false);
+    return meta.is_object() ? meta : nlohmann::json::object();
+}
+
+QString long_id(const nlohmann::json& meta)
+{
+    for (const char* key : {"segment_long_id", "long_id", "longId"}) {
+        const auto found = meta.find(key);
+        if (found != meta.end() && found->is_string() && !found->get<std::string>().empty()) {
+            return QString::fromStdString(found->get<std::string>());
         }
     }
+    return {};
+}
+
+double number_or(const nlohmann::json& meta, const char* key, double fallback)
+{
+    const auto found = meta.find(key);
+    return found != meta.end() && found->is_number() ? found->get<double>() : fallback;
+}
+
+std::string string_or(const nlohmann::json& meta, const char* key)
+{
+    const auto found = meta.find(key);
+    return found != meta.end() && found->is_string() ? found->get<std::string>() : std::string{};
 }
 
 } // namespace
 
 SurfacePanelController::SurfacePanelController(const UiRefs& ui,
                                                CState* state,
+                                               SurfaceCatalog* catalog,
                                                ViewerManager* viewerManager,
                                                std::function<CChunkedVolumeViewer*()> segmentationViewerProvider,
-                                               std::function<void()> filtersUpdated,
                                                QObject* parent)
     : QObject(parent)
     , _ui(ui)
     , _state(state)
+    , _catalog(catalog)
     , _viewerManager(viewerManager)
     , _segmentationViewerProvider(std::move(segmentationViewerProvider))
-    , _filtersUpdated(std::move(filtersUpdated))
 {
-    if (_ui.reloadButton) {
-        connect(_ui.reloadButton, &QPushButton::clicked, this, &SurfacePanelController::loadSurfacesIncremental);
-    }
-
     if (_ui.treeWidget) {
         _ui.treeWidget->setContextMenuPolicy(Qt::CustomContextMenu);
         setupSurfaceColumnMenu();
@@ -272,42 +152,18 @@ SurfacePanelController::SurfacePanelController(const UiRefs& ui,
             }
         });
     }
-}
-
-void SurfacePanelController::setVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
-{
-    if (pkg != _volumePkg) {
-        _overlaySegmentations.clear();
-        if (_viewerManager) {
-            _viewerManager->clearSurfacePatchIndexCache();
-        }
-    }
-    _volumePkg = pkg;
-}
-
-// Identifies the current folder selection (volpkg + checked folders, with the
-// active folder marked) for the ViewerManager's surface index cache.
-QString SurfacePanelController::folderSelectionCacheKey() const
-{
-    QStringList parts;
-    for (const auto& folder : _visibleSegmentFolders) {
-        parts << QString::fromStdString(folder.dirName) +
-                     (folder.currentFolder ? QStringLiteral("*") : QString());
-    }
-    if (parts.isEmpty() && _volumePkg) {
-        parts << QString::fromStdString(_volumePkg->getSegmentationDirectory());
-    }
-    parts.sort();
-    const QString volpkgDir =
-        _volumePkg ? QString::fromStdString(_volumePkg->getVolpkgDirectory()) : QString();
-    return volpkgDir + QLatin1Char('|') + parts.join(QLatin1Char(','));
-}
-
-void SurfacePanelController::clear()
-{
-    if (_ui.treeWidget) {
-        const QSignalBlocker blocker{_ui.treeWidget};
-        _ui.treeWidget->clear();
+    if (_catalog) {
+        connect(_catalog, &SurfaceCatalog::rowsChanged, this, [this]() {
+            syncTree();
+            rebuildRecordTagFilterModel();
+            refreshProximityFilters();
+            applyFilters();
+        });
+        connect(_catalog, &SurfaceCatalog::errorChanged, this, [this](const QString& error) {
+            if (!error.isEmpty()) {
+                emit statusMessageRequested(tr("Cannot list surfaces: %1").arg(error), 8000);
+            }
+        });
     }
 }
 
@@ -316,774 +172,110 @@ bool SurfacePanelController::hasSurfaces() const
     return _ui.treeWidget && _ui.treeWidget->topLevelItemCount() > 0;
 }
 
-void SurfacePanelController::loadSurfaces(bool reload)
+SurfaceTreeWidgetItem* SurfacePanelController::itemFor(const std::string& id) const
 {
-    if (!_volumePkg) {
-        return;
+    if (!_ui.treeWidget || id.empty()) {
+        return nullptr;
     }
-
-    if (!_visibleSegmentFolders.empty()) {
-        // Stash the live surface index under the outgoing folder selection
-        // BEFORE unbinding its surfaces, so switching back can reuse it.
-        if (_viewerManager) {
-            _viewerManager->setSurfacePatchIndexCacheKey(folderSelectionCacheKey());
+    const QString idQString = QString::fromStdString(id);
+    QTreeWidgetItemIterator it(_ui.treeWidget);
+    while (*it) {
+        if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() == idQString) {
+            return static_cast<SurfaceTreeWidgetItem*>(*it);
         }
-        if (reload) {
-            if (_state) {
-                auto names = _state->surfaceNames();
-                for (const auto& name : names) {
-                    if (preserveSurfaceDuringSegmentReload(name)) {
-                        continue;
-                    }
-                    _state->setSurface(name, nullptr, true, false);
-                }
-            }
-            // Surfaces stay loaded in the VolumePkg's per-folder retention so
-            // returning to a previously visited folder is fast; they are only
-            // rebound to the state below.
-            _multiFolderSurfaceIds.clear();
-        }
-
-        for (const auto& folder : _visibleSegmentFolders) {
-            if (folder.currentFolder) {
-                auto segIds = _volumePkg->segmentationIDs();
-                _volumePkg->loadSurfacesBatch(segIds);
-                if (_state) {
-                    for (const auto& id : segIds) {
-                        auto surf = _volumePkg->getSurface(id);
-                        if (surf &&
-                            !vc3d::opendata::isOpenDataSegmentPlaceholder(
-                                surf->path)) {
-                            apply_folder_metadata(surf.get(), folder, id);
-                            _state->setSurface(id, surf, true, false);
-                        }
-                    }
-                }
-                continue;
-            }
-
-            for (const auto& segPath : segment_dirs_under(folder.path)) {
-                try {
-                    std::shared_ptr<Segmentation> seg;
-                    if (auto retained = _overlaySegmentations.find(segPath.string());
-                        retained != _overlaySegmentations.end()) {
-                        seg = retained->second;
-                    } else {
-                        seg = Segmentation::New(segPath);
-                        _overlaySegmentations.emplace(segPath.string(), seg);
-                    }
-                    auto surf = seg->loadSurface();
-                    if (!surf) {
-                        continue;
-                    }
-                    const std::string displayId = segment_display_id(folder.dirName, seg->id(), folder.currentFolder);
-                    apply_folder_metadata(surf.get(), folder, displayId);
-                    _multiFolderSurfaceIds.insert(displayId);
-                    if (_state &&
-                        !vc3d::opendata::isOpenDataSegmentPlaceholder(
-                            surf->path)) {
-                        _state->setSurface(displayId, surf, true, false);
-                    }
-                } catch (const std::exception& ex) {
-                    std::cout << "Failed to load segment from " << segPath << ": " << ex.what() << std::endl;
-                }
-            }
-        }
-
-        populateSurfaceTree();
-        applyFilters();
-        logSurfaceLoadSummary();
-        if (_filtersUpdated) {
-            _filtersUpdated();
-        }
-        if (_viewerManager) {
-            _viewerManager->primeSurfacePatchIndicesAsync();
-        }
-        emit surfacesLoaded();
-        return;
+        ++it;
     }
-
-    if (_viewerManager) {
-        _viewerManager->setSurfacePatchIndexCacheKey(folderSelectionCacheKey());
-    }
-    if (reload) {
-        // Clear all surfaces from collection BEFORE unloading to prevent dangling pointers
-        if (_state) {
-            auto names = _state->surfaceNames();
-            for (const auto& name : names) {
-                if (preserveSurfaceDuringSegmentReload(name)) {
-                    continue;
-                }
-                _state->setSurface(name, nullptr, true, false);
-            }
-        }
-        _volumePkg->unloadAllSurfaces();
-    }
-
-    auto segIds = _volumePkg->segmentationIDs();
-    _volumePkg->loadSurfacesBatch(segIds);
-
-    if (_state) {
-        for (const auto& id : segIds) {
-            auto surf = _volumePkg->getSurface(id);
-            if (surf &&
-                !vc3d::opendata::isOpenDataSegmentPlaceholder(surf->path)) {
-                _state->setSurface(id, surf, true, false);
-            }
-        }
-    }
-
-    populateSurfaceTree();
-    applyFilters();
-    logSurfaceLoadSummary();
-    if (_filtersUpdated) {
-        _filtersUpdated();
-    }
-    if (_viewerManager) {
-        _viewerManager->primeSurfacePatchIndicesAsync();
-    }
-    emit surfacesLoaded();
+    return nullptr;
 }
 
-void SurfacePanelController::refreshSurfaceList()
+void SurfacePanelController::setItemRow(SurfaceTreeWidgetItem* item, const SurfaceCatalog::Row& row)
 {
-    if (!_volumePkg) return;
-    populateSurfaceTree();
-    applyFilters();
-    if (_filtersUpdated) _filtersUpdated();
+    const auto meta = row_meta(row);
+    const QString name = display_name(row);
+    const QString longId = long_id(meta);
+    const double areaCm2 = number_or(meta, "area_cm2", -1.0);
+    const double avgCost = number_or(meta, "avg_cost", -1.0);
+    item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(row.record.uuid));
+    item->setData(SURFACE_ID_COLUMN, kUnboundRole, !row.toVolume.has_value());
+    item->setText(SURFACE_ID_COLUMN, name);
+    item->setText(SURFACE_LONG_ID_COLUMN, longId);
+    // A surface whose voxel size was unknown has no area_cm2 at all, and "-"
+    // is honest where "-1.000" is not.
+    item->setText(SURFACE_AREA_COLUMN, areaCm2 >= 0.0 ? QString::number(areaCm2, 'f', 3) : QStringLiteral("-"));
+    item->setText(SURFACE_AVG_COST_COLUMN, avgCost >= 0.0 ? QString::number(avgCost, 'f', 3) : QStringLiteral("-"));
+    item->setText(TIMESTAMP_COLUMN, QString::fromStdString(row.record.changedAt));
+    item->updateItemIcon(has_tag(row, "approved"), has_tag(row, "defective"));
+    applyTransformWarningStyle(item);
 }
 
-void SurfacePanelController::loadSurfacesIncremental()
+void SurfacePanelController::syncTree()
 {
-    if (!_volumePkg) {
+    if (!_ui.treeWidget || !_catalog) {
         return;
     }
-
-    std::cout << "Starting incremental surface load..." << std::endl;
-    // Explicit disk refresh: also forget retained overlay-folder segmentations
-    // so the next full load re-reads them from disk.
-    _overlaySegmentations.clear();
-    _volumePkg->refreshSegmentations();
-    auto changes = detectSurfaceChanges();
-
-    // Suppress signals during batch removal to avoid dangling pointer crashes
-    if (_ui.treeWidget) {
-        const QSignalBlocker blocker{_ui.treeWidget};
-        // Perform UI mutations without emitting per-item signals.
-        for (const auto& id : changes.toRemove) {
-            removeSingleSegmentation(id, true);
-        }
-        for (const auto& id : changes.toAdd) {
-            addSingleSegmentation(id);
-        }
-    } else {
-        for (const auto& id : changes.toRemove) {
-            removeSingleSegmentation(id, true);
-        }
-        for (const auto& id : changes.toAdd) {
-            addSingleSegmentation(id);
-        }
-    }
-    // Emit a single signal after batch removal
-    if (!changes.toRemove.empty() && _state) {
-        _state->emitSurfacesChanged();
-    }
-
-    if (!changes.toReload.empty()) {
-        std::vector<std::string> reloadedIds;
-        reloadedIds.reserve(changes.toReload.size());
-
-        for (const auto& id : changes.toReload) {
-            std::cout << "Queueing for reload: " << id << std::endl;
-            auto currentSurface = _state ? _state->surface(id) : nullptr;
-            auto activeSegSurface = _state ? _state->surface("segmentation") : nullptr;
-            const bool wasActiveSeg = (currentSurface != nullptr && activeSegSurface.get() == currentSurface.get());
-
-            if (_state) {
-                _state->setSurface(id, nullptr, true, false);
-                if (wasActiveSeg) {
-                    _state->setSurface("segmentation", nullptr, false, false);
-                }
-            }
-
-            _volumePkg->unloadSurface(id);
-            reloadedIds.push_back(id);
-        }
-
-        _volumePkg->loadSurfacesBatch(reloadedIds);
-
-        for (const auto& id : reloadedIds) {
-            auto reloadedSurface = _volumePkg->getSurface(id);
-            if (!reloadedSurface) {
-                continue;
-            }
-
-            if (_state) {
-                _state->setSurface(id, reloadedSurface, true, false);
-                auto activeSegSurface = _state ? _state->surface("segmentation") : nullptr;
-                if (activeSegSurface == nullptr) {
-                    _state->setSurface("segmentation", reloadedSurface, false, false);
-                }
-            }
-
-            refreshSurfaceMetrics(id);
-            if (_currentSurfaceId == id) {
-                syncSelectionUi(id, reloadedSurface.get());
-            }
-        }
-    }
-
-    std::cout << "Incremental delta: add=" << changes.toAdd.size()
-              << " remove=" << changes.toRemove.size()
-              << " reload=" << changes.toReload.size() << std::endl;
-
-    applyFilters();
-    logSurfaceLoadSummary();
-    if (_filtersUpdated) {
-        _filtersUpdated();
-    }
-    if (_viewerManager) {
-        _viewerManager->primeSurfacePatchIndicesAsync();
-    }
-    emit surfacesLoaded();
-    std::cout << "Incremental surface load completed." << std::endl;
-}
-
-SurfacePanelController::SurfaceChanges SurfacePanelController::detectSurfaceChanges() const
-{
-    SurfaceChanges changes;
-    if (!_volumePkg) {
-        return changes;
-    }
-
-    // Build the set of segmentation IDs currently present on disk.
-    std::unordered_set<std::string> diskIds;
-    for (const auto& id : _volumePkg->segmentationIDs()) {
-        diskIds.insert(id);
-    }
-
-    // Build the set of IDs that the UI currently knows about (tree contents).
-    std::unordered_set<std::string> uiIds;
-    if (_ui.treeWidget) {
-        QTreeWidgetItemIterator it(_ui.treeWidget);
-        while (*it) {
-            const auto qid = (*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
-            if (!qid.isEmpty()) {
-                uiIds.insert(qid.toStdString());
-            }
-            ++it;
-        }
-    } else {
-        // Fallback: if no UI is present, best-effort use currently loaded surfaces
-        // (legacy behavior), but note this may be over-inclusive.
-        for (const auto& id : _volumePkg->getLoadedSurfaceIDs()) {
-            uiIds.insert(id);
-        }
-    }
-
-    // toAdd: present on disk but not yet in the UI tree
-    changes.toAdd.reserve(diskIds.size());
-    for (const auto& id : diskIds) {
-        if (!uiIds.contains(id)) {
-            changes.toAdd.push_back(id);
-        }
-    }
-
-    // toRemove: present in the UI tree but no longer on disk
-    changes.toRemove.reserve(uiIds.size());
-    for (const auto& uiId : uiIds) {
-        if (!diskIds.contains(uiId)) {
-            changes.toRemove.push_back(uiId);
-        }
-    }
-
-    std::unordered_set<std::string> addedIds(
-        changes.toAdd.begin(), changes.toAdd.end());
-    if (_volumePkg) {
-        for (const auto& uiId : uiIds) {
-            if (!diskIds.contains(uiId)) {
-                continue;
-            }
-            if (addedIds.find(uiId) != addedIds.end()) {
-                continue;
-            }
-            if (!_volumePkg->isSurfaceLoaded(uiId)) {
-                changes.toReload.push_back(uiId);
-                continue;
-            }
-            auto surf = _volumePkg->getSurface(uiId);
-            if (!surf) {
-                continue;
-            }
-            const auto storedTs = surf->maskTimestamp();
-            const auto currentTs = QuadSurface::readMaskTimestamp(surf->path);
-            if (storedTs != currentTs) {
-                changes.toReload.push_back(uiId);
-            }
-        }
-    }
-
-    std::cout << "detectSurfaceChanges: disk=" << diskIds.size()
-              << " ui=" << uiIds.size()
-              << " add=" << changes.toAdd.size()
-              << " remove=" << changes.toRemove.size()
-              << " reload=" << changes.toReload.size() << std::endl;
-    return changes;
-}
-
-void SurfacePanelController::populateSurfaceTree()
-{
-    if (!_ui.treeWidget || !_volumePkg) {
-        return;
-    }
-
     const QSignalBlocker blocker{_ui.treeWidget};
-    _ui.treeWidget->clear();
-
-    std::vector<std::string> ids;
-    if (!_visibleSegmentFolders.empty() && _state) {
-        // The current folder is the tree's row source. Metadata-only open-data
-        // placeholders intentionally do not live in CState, so sourcing rows
-        // from CState alone makes every lazy segment disappear.
-        ids = _volumePkg->segmentationIDs();
-        for (const auto& id : _state->surfaceNames()) {
-            if (id == "segmentation" || id == "xy plane" ||
-                id == "xz plane" || id == "yz plane" ||
-                id == "seg xz" || id == "seg yz" ||
-                _multiFolderSurfaceIds.count(id) > 0 ||
-                std::find(ids.begin(), ids.end(), id) != ids.end()) {
-                continue;
-            }
-            ids.push_back(id);
-        }
-        std::sort(ids.begin(), ids.end());
-    } else {
-        ids = _volumePkg->segmentationIDs();
-    }
-
-    for (const auto& id : ids) {
-        auto surf = getSurfaceById(id);
-
-        auto* item = new SurfaceTreeWidgetItem(_ui.treeWidget);
-        item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(id));
-
-        if (surf) {
-            set_surface_tree_item_text(item, id, surf.get());
-            updateTreeItemIcon(item);
-            applyTransformWarningStyle(item);
-        } else {
+    const bool sorting = _ui.treeWidget->isSortingEnabled();
+    _ui.treeWidget->setSortingEnabled(false);
+    const auto& rows = _catalog->rows();
+    std::set<std::string> present;
+    for (int i = _ui.treeWidget->topLevelItemCount() - 1; i >= 0; --i) {
+        auto* item = static_cast<SurfaceTreeWidgetItem*>(_ui.treeWidget->topLevelItem(i));
+        const auto id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
+        const auto row = rows.find(id);
+        if (row == rows.end()) {
             delete item;
+            continue;
+        }
+        setItemRow(item, row->second);
+        present.insert(id);
+    }
+    for (const auto& [id, row] : rows) {
+        if (!present.contains(id)) {
+            setItemRow(new SurfaceTreeWidgetItem(_ui.treeWidget), row);
         }
     }
-
+    _ui.treeWidget->setSortingEnabled(sorting);
     for (int column = 0; column <= TIMESTAMP_COLUMN; ++column) {
         _ui.treeWidget->resizeColumnToContents(column);
     }
-}
-
-void SurfacePanelController::refreshSurfaceMetrics(const std::string& surfaceId)
-{
-    if (!_ui.treeWidget) {
-        return;
-    }
-
-    SurfaceTreeWidgetItem* targetItem = nullptr;
-    const QString idQString = QString::fromStdString(surfaceId);
-    QTreeWidgetItemIterator iterator(_ui.treeWidget);
-    while (*iterator) {
-        if ((*iterator)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() == idQString) {
-            targetItem = static_cast<SurfaceTreeWidgetItem*>(*iterator);
-            break;
-        }
-        ++iterator;
-    }
-
-    auto surf = getSurfaceById(surfaceId);
-    double areaCm2 = -1.0;
-    double avgCost = -1.0;
-    int overlapCount = 0;
-    QString longId;
-    QString timestamp;
-
-    if (surf) {
-        areaCm2 = vc::json::number_or(surf->meta, "area_cm2", -1.0);
-        avgCost = vc::json::number_or(surf->meta, "avg_cost", -1.0);
-        overlapCount = static_cast<int>(surf->overlappingIds().size());
-        longId = surface_long_id(surf.get());
-        timestamp = surface_timestamp(surf.get());
-    }
-
-    if (targetItem) {
-        const QString areaText = areaCm2 >= 0.0 ? QString::number(areaCm2, 'f', 3) : QStringLiteral("-");
-        const QString costText = avgCost >= 0.0 ? QString::number(avgCost, 'f', 3) : QStringLiteral("-");
-        targetItem->setText(SURFACE_LONG_ID_COLUMN, longId);
-        targetItem->setToolTip(SURFACE_LONG_ID_COLUMN, longId);
-        targetItem->setText(SURFACE_AREA_COLUMN, areaText);
-        targetItem->setText(SURFACE_AVG_COST_COLUMN, costText);
-        targetItem->setText(SURFACE_OVERLAPS_COLUMN, QString::number(overlapCount));
-        targetItem->setText(TIMESTAMP_COLUMN, timestamp);
-        updateTreeItemIcon(targetItem);
+    if (!_currentSurfaceId.empty() && !rows.contains(_currentSurfaceId)) {
+        // The open surface left the store (retired) or this volume.
+        _currentSurfaceId.clear();
+        _opened.reset();
+        resetTagUi();
+        emit surfaceSelectionCleared();
+    } else {
+        updateTagCheckboxStates(_catalog->row(_currentSurfaceId));
     }
 }
 
-void SurfacePanelController::updateTreeItemIcon(SurfaceTreeWidgetItem* item)
+void SurfacePanelController::activate(const std::string& id, bool preserveEditing)
 {
-    if (!item) {
-        return;
-    }
-
-    const auto id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
-    auto surf = getSurfaceById(id);
-    if (!surf || surf->meta.is_null()) {
-        return;
-    }
-
-    const auto tags = vc::json::tags_or_empty(surf->meta);
-    item->updateItemIcon(tags.contains("approved"), tags.contains("defective"));
-}
-
-void SurfacePanelController::addSingleSegmentation(const std::string& segId)
-{
-    if (!_volumePkg) {
-        return;
-    }
-
-    std::cout << "Adding segmentation: " << segId << std::endl;
+    const QString idQString = QString::fromStdString(id);
+    std::shared_ptr<QuadSurface> surface;
+    _opened.reset();
     try {
-        (void)_volumePkg->addSingleSegmentation(segId);
-        auto surf = _volumePkg->loadSurface(segId);
-        if (!surf) {
-            return;
-        }
-        if (_state) {
-            _state->setSurface(segId, surf, true, false);
-        }
-        if (_ui.treeWidget) {
-            SurfaceTreeWidgetItem* item = nullptr;
-            QTreeWidgetItemIterator it(_ui.treeWidget);
-            while (*it) {
-                if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == segId) {
-                    item = static_cast<SurfaceTreeWidgetItem*>(*it);
-                    break;
-                }
-                ++it;
-            }
-            if (!item) {
-                item = new SurfaceTreeWidgetItem(_ui.treeWidget);
-            }
-            item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(segId));
-            set_surface_tree_item_text(item, segId, surf.get());
-            updateTreeItemIcon(item);
-            applyTransformWarningStyle(item);
-        }
-    } catch (const std::exception& e) {
-        std::cout << "Failed to add segmentation " << segId << ": " << e.what() << std::endl;
+        _opened = _catalog->open(id);
+        surface = _opened->surface;
+    } catch (const std::exception& error) {
+        emit statusMessageRequested(tr("Cannot open surface %1: %2").arg(idQString, QString::fromUtf8(error.what())), 8000);
     }
-}
-
-void SurfacePanelController::removeSingleSegmentation(const std::string& segId, bool suppressSignals)
-{
-    std::cout << "Removing segmentation: " << segId << std::endl;
-
-    std::shared_ptr<Surface> removedSurface;
-    std::shared_ptr<Surface> activeSegSurface;
-
-    if (_state) {
-        removedSurface = _state->surface(segId);
-        activeSegSurface = _state->surface("segmentation");
-    }
-
-    if (_state) {
-        if (removedSurface && activeSegSurface.get() == removedSurface.get()) {
-            _state->setSurface("segmentation", nullptr, suppressSignals);
-        }
-        _state->setSurface(segId, nullptr, suppressSignals);
-    }
-
-    if (_volumePkg) {
-        _volumePkg->unloadSurface(segId);
-    }
-
-    if (_ui.treeWidget) {
-        // When suppressing signals, also block tree widget signals to prevent
-        // handleTreeSelectionChanged from running during batch deletion.
-        // This avoids accessing surfaces that may have been deleted.
-        std::optional<QSignalBlocker> blocker;
-        if (suppressSignals) {
-            blocker.emplace(_ui.treeWidget);
-        }
-
-        QTreeWidgetItemIterator it(_ui.treeWidget);
-        while (*it) {
-            if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == segId) {
-                const bool wasSelected = (*it)->isSelected();
-                delete *it;
-                if (wasSelected && !suppressSignals) {
-                    emit surfaceSelectionCleared();
-                }
-                break;
-            }
-            ++it;
+    _currentSurfaceId = id;
+    updateTagCheckboxStates(_catalog->row(id));
+    if (_segmentationViewerProvider) {
+        if (auto* viewer = _segmentationViewerProvider()) {
+            const auto* row = _catalog->row(id);
+            viewer->setWindowTitle(surface && row ? tr("Surface %1").arg(display_name(*row)) : tr("Surface"));
         }
     }
-}
-
-bool SurfacePanelController::startOpenDataMaterialization(
-    const std::string& id,
-    const std::shared_ptr<QuadSurface>& surface)
-{
-    if (!surface ||
-        !vc3d::opendata::isOpenDataSegmentPlaceholder(surface->path)) {
-        return false;
+    if (preserveEditing) {
+        emit surfaceActivatedPreserveEditing(idQString, surface);
+    } else {
+        emit surfaceActivated(idQString, surface);
     }
-    if (_segmentMaterializationWatcher &&
-        _segmentMaterializationWatcher->isRunning()) {
-        emit statusMessageRequested(
-            tr("Another open-data segment is already being fetched."), 4000);
-        return true;
+    if (isCurrentOnlyFilterEnabled()) {
+        applyFilters();
     }
-
-    const auto path = surface->path;
-    _pendingMaterializationId = id;
-    emit statusMessageRequested(
-        tr("Fetching or creating segment %1...")
-            .arg(QString::fromStdString(id)),
-        0);
-
-    auto* dialog = new QProgressDialog(
-        tr("Fetching segment data for %1...")
-            .arg(QString::fromStdString(id)),
-        QString(), 0, 0, _ui.treeWidget);
-    dialog->setWindowTitle(tr("Loading Segment"));
-    dialog->setCancelButton(nullptr);
-    dialog->setWindowModality(Qt::WindowModal);
-    dialog->setMinimumDuration(0);
-    dialog->setAutoClose(false);
-    dialog->show();
-    _segmentMaterializationProgress = dialog;
-
-    auto* watcher = new QFutureWatcher<
-        vc3d::opendata::OpenDataSegmentMaterializationResult>(this);
-    _segmentMaterializationWatcher = watcher;
-    connect(watcher, &QFutureWatcher<
-                         vc3d::opendata::OpenDataSegmentMaterializationResult>::finished,
-            this, [this, watcher, path]() {
-                const auto result = watcher->result();
-                const std::string id = _pendingMaterializationId;
-                _pendingMaterializationId.clear();
-                _segmentMaterializationWatcher = nullptr;
-                watcher->deleteLater();
-                if (_segmentMaterializationProgress) {
-                    _segmentMaterializationProgress->close();
-                    _segmentMaterializationProgress->deleteLater();
-                    _segmentMaterializationProgress = nullptr;
-                }
-                if (!result.success) {
-                    emit statusMessageRequested(
-                        tr("Failed to materialize %1: %2")
-                            .arg(QString::fromStdString(id),
-                                 QString::fromStdString(result.message)),
-                        10000);
-                    return;
-                }
-                emit statusMessageRequested(
-                    tr("Segment %1 is ready.")
-                        .arg(QString::fromStdString(id)),
-                    4000);
-                activateMaterializedSurface(id, path);
-            });
-    watcher->setFuture(QtConcurrent::run([path]() {
-        return vc3d::opendata::materializeOpenDataSegment(path);
-    }));
-    return true;
-}
-
-void SurfacePanelController::activateMaterializedSurface(
-    const std::string& id,
-    const std::filesystem::path& path)
-{
-    _overlaySegmentations.erase(path.string());
-    loadSurfaces(true);
-    if (!activateSurfaceById(id)) {
-        emit statusMessageRequested(
-            tr("Segment %1 was fetched, but could not be activated.")
-                .arg(QString::fromStdString(id)),
-            8000);
-    }
-    if (_viewerManager) {
-        _viewerManager->primeSurfacePatchIndicesAsync();
-    }
-}
-
-bool SurfacePanelController::isOpenDataMaterializationRunning() const
-{
-    return _segmentMaterializationWatcher &&
-           _segmentMaterializationWatcher->isRunning();
-}
-
-SurfacePanelController::OpenDataFetchOutcome
-SurfacePanelController::fetchOpenDataSegmentAsync(
-    const std::string& id,
-    std::function<void(bool success, const QString& message)> onDone)
-{
-    auto surface = getSurfaceById(id);
-    if (!surface) {
-        return OpenDataFetchOutcome::NotFound;
-    }
-    if (!vc3d::opendata::isOpenDataSegmentPlaceholder(surface->path)) {
-        return OpenDataFetchOutcome::AlreadyMaterialized;
-    }
-    if (isOpenDataMaterializationRunning()) {
-        return OpenDataFetchOutcome::Busy;
-    }
-
-    const auto path = surface->path;
-    auto* watcher = new QFutureWatcher<
-        vc3d::opendata::OpenDataSegmentMaterializationResult>(this);
-    _segmentMaterializationWatcher = watcher;
-    connect(watcher, &QFutureWatcher<
-                         vc3d::opendata::OpenDataSegmentMaterializationResult>::finished,
-            this, [this, watcher, onDone = std::move(onDone)]() {
-                const auto result = watcher->result();
-                _segmentMaterializationWatcher = nullptr;
-                watcher->deleteLater();
-                if (result.success) {
-                    // Reload so the materialized surface becomes activatable;
-                    // activation remains an explicit caller decision.
-                    loadSurfaces(true);
-                }
-                if (onDone) {
-                    onDone(result.success,
-                           QString::fromStdString(result.message));
-                }
-            });
-    watcher->setFuture(QtConcurrent::run([path]() {
-        return vc3d::opendata::materializeOpenDataSegment(path);
-    }));
-    return OpenDataFetchOutcome::Started;
-}
-
-void SurfacePanelController::materializeCurrentOpenDataFolder()
-{
-    if (!_volumePkg) {
-        emit statusMessageRequested(tr("No project is open."), 4000);
-        return;
-    }
-    if (_folderMaterializationWatcher &&
-        _folderMaterializationWatcher->isRunning()) {
-        emit statusMessageRequested(
-            tr("The current segment folder is already being materialized."),
-            4000);
-        return;
-    }
-    const auto root = _volumePkg->outputSegmentsPath();
-    if (root.empty()) {
-        emit statusMessageRequested(
-            tr("The project has no current local segment folder."), 5000);
-        return;
-    }
-
-    int pending = 0;
-    std::error_code ec;
-    std::filesystem::recursive_directory_iterator pendingIt(root, ec);
-    const std::filesystem::recursive_directory_iterator pendingEnd;
-    while (!ec && pendingIt != pendingEnd) {
-        if (pendingIt->is_directory() &&
-            vc3d::opendata::isOpenDataSegmentPlaceholder(
-                pendingIt->path())) {
-            ++pending;
-            pendingIt.disable_recursion_pending();
-        }
-        pendingIt.increment(ec);
-    }
-    if (ec) {
-        emit statusMessageRequested(
-            tr("Could not inspect the current segment folder: %1")
-                .arg(QString::fromStdString(ec.message())),
-            8000);
-        return;
-    }
-    if (pending == 0) {
-        emit statusMessageRequested(
-            tr("All segments in the current folder are already available."),
-            4000);
-        return;
-    }
-
-    auto* dialog = new QProgressDialog(
-        tr("Preparing open-data segments..."), QString(), 0, pending,
-        _ui.treeWidget);
-    dialog->setWindowTitle(tr("Create/Fetch All Segments"));
-    dialog->setCancelButton(nullptr);
-    dialog->setWindowModality(Qt::WindowModal);
-    dialog->setMinimumDuration(0);
-    dialog->setAutoClose(false);
-    dialog->show();
-    _folderMaterializationProgress = dialog;
-
-    auto* watcher = new QFutureWatcher<
-        vc3d::opendata::OpenDataSegmentMaterializationResult>(this);
-    _folderMaterializationWatcher = watcher;
-    connect(watcher, &QFutureWatcher<
-                         vc3d::opendata::OpenDataSegmentMaterializationResult>::finished,
-            this, [this, watcher, root]() {
-                const auto result = watcher->result();
-                _folderMaterializationWatcher = nullptr;
-                watcher->deleteLater();
-                if (_folderMaterializationProgress) {
-                    _folderMaterializationProgress->close();
-                    _folderMaterializationProgress->deleteLater();
-                    _folderMaterializationProgress = nullptr;
-                }
-                if (result.success) {
-                    emit statusMessageRequested(
-                        tr("Created or fetched %1 segment(s) in the current folder.")
-                            .arg(result.materializedSegments),
-                        6000);
-                } else {
-                    emit statusMessageRequested(
-                        tr("Materialized %1 segment(s); %2 failed. %3")
-                            .arg(result.materializedSegments)
-                            .arg(result.failedSegments)
-                            .arg(QString::fromStdString(result.message)),
-                        12000);
-                }
-                for (auto it = _overlaySegmentations.begin();
-                     it != _overlaySegmentations.end();) {
-                    if (std::filesystem::path(it->first).parent_path() == root) {
-                        it = _overlaySegmentations.erase(it);
-                    } else {
-                        ++it;
-                    }
-                }
-                loadSurfaces(true);
-            });
-
-    const QPointer<QProgressDialog> progress = dialog;
-    watcher->setFuture(QtConcurrent::run([root, progress]() {
-        return vc3d::opendata::materializeOpenDataSegmentFolder(
-            root,
-            [progress](int completed, int total,
-                       const std::filesystem::path& path,
-                       const std::string& status) {
-                if (!progress) return;
-                QMetaObject::invokeMethod(
-                    progress.data(),
-                    [progress, completed, total, path, status]() {
-                        if (!progress) return;
-                        progress->setMaximum(std::max(total, 1));
-                        progress->setValue(completed);
-                        progress->setLabelText(
-                            QObject::tr("%1/%2: %3 (%4)")
-                                .arg(completed)
-                                .arg(total)
-                                .arg(QString::fromStdString(
-                                    path.filename().string()))
-                                .arg(QString::fromStdString(status)));
-                    },
-                    Qt::QueuedConnection);
-            });
-    }));
 }
 
 void SurfacePanelController::handleTreeSelectionChanged()
@@ -1098,10 +290,7 @@ void SurfacePanelController::handleTreeSelectionChanged()
         QStringList currentIds;
         currentIds.reserve(selectedItems.size());
         for (auto* item : selectedItems) {
-            if (!item) {
-                continue;
-            }
-            const QString id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
+            const QString id = item ? item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() : QString();
             if (!id.isEmpty()) {
                 currentIds.append(id);
             }
@@ -1116,16 +305,8 @@ void SurfacePanelController::handleTreeSelectionChanged()
             const QSignalBlocker blocker{_ui.treeWidget};
             _ui.treeWidget->clearSelection();
             for (const QString& id : _lockedSelectionIds) {
-                if (id.isEmpty()) {
-                    continue;
-                }
-                QTreeWidgetItemIterator it(_ui.treeWidget);
-                while (*it) {
-                    if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() == id) {
-                        (*it)->setSelected(true);
-                        break;
-                    }
-                    ++it;
+                if (auto* item = itemFor(id.toStdString())) {
+                    item->setSelected(true);
                 }
             }
             if (!_selectionLockNotified) {
@@ -1139,6 +320,7 @@ void SurfacePanelController::handleTreeSelectionChanged()
 
     if (selectedItems.isEmpty()) {
         _currentSurfaceId.clear();
+        _opened.reset();
         resetTagUi();
         if (_segmentationViewerProvider) {
             if (auto* viewer = _segmentationViewerProvider()) {
@@ -1149,43 +331,13 @@ void SurfacePanelController::handleTreeSelectionChanged()
         return;
     }
 
-    auto* firstSelected = selectedItems.first();
-    const QString idQString = firstSelected->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
-    const std::string id = idQString.toStdString();
-
-    std::shared_ptr<QuadSurface> surface = getSurfaceById(id);
-    if (startOpenDataMaterialization(id, surface)) {
-        return;
-    }
-    bool surfaceJustLoaded = (surface != nullptr);
-
-    if (surface && _state) {
-        // Keep the named entry in sync so intersection viewers can retain this mesh
-        if (surfaceJustLoaded || !_state->surface(id)) {
-            _state->setSurface(id, surface, true, false);
-        }
-    }
-
-    syncSelectionUi(id, surface.get());
-
-    if (_segmentationViewerProvider) {
-        if (auto* viewer = _segmentationViewerProvider()) {
-            viewer->setWindowTitle(surface ? tr("Surface %1").arg(
-                                               firstSelected->text(SURFACE_ID_COLUMN))
-                                           : tr("Surface"));
-        }
-    }
-
-    emit surfaceActivated(idQString, surface.get());
-
-    if (surfaceJustLoaded) {
-        applyFilters();
-    }
+    const auto id = selectedItems.first()->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
+    activate(id, false);
 }
 
 void SurfacePanelController::showContextMenu(const QPoint& pos)
 {
-    if (!_ui.treeWidget) {
+    if (!_ui.treeWidget || !_catalog) {
         return;
     }
 
@@ -1194,191 +346,110 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         return;
     }
 
-    const QList<QTreeWidgetItem*> selectedItems = _ui.treeWidget->selectedItems();
     QStringList selectedSegmentIds;
-    selectedSegmentIds.reserve(selectedItems.size());
-    for (auto* selectedItem : selectedItems) {
+    for (auto* selectedItem : _ui.treeWidget->selectedItems()) {
         selectedSegmentIds << selectedItem->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
     }
-
     const QString segmentId = selectedSegmentIds.isEmpty() ?
         item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() :
         selectedSegmentIds.front();
     const std::string segmentIdStd = segmentId.toStdString();
-    const bool isCurrentFolderSegment = _volumePkg && _volumePkg->getSurface(segmentIdStd) != nullptr;
-    const bool allSelectedCurrentFolder = selectedSegmentIds.isEmpty()
-        ? isCurrentFolderSegment
-        : std::all_of(selectedSegmentIds.begin(),
-                      selectedSegmentIds.end(),
-                      [this](const QString& id) {
-                          return _volumePkg && _volumePkg->getSurface(id.toStdString()) != nullptr;
-                      });
-
-    QMenu contextMenu(tr("Context Menu"), _ui.treeWidget);
-    const bool isLocal = isCurrentFolderSegment;
-
-    if (isLocal) {
-        std::string currentDir = _volumePkg->getSegmentationDirectory();
-        if (currentDir == "traces") {
-            QAction* moveToPathsAction = contextMenu.addAction(tr("Move to Paths"));
-            moveToPathsAction->setIcon(_ui.treeWidget->style()->standardIcon(QStyle::SP_FileDialogDetailedView));
-            connect(moveToPathsAction, &QAction::triggered, this, [this, segmentId]() {
-                emit moveToPathsRequested(segmentId);
-            });
-            contextMenu.addSeparator();
-        }
-
-        // Rename only for single selection
-        if (selectedSegmentIds.size() == 1) {
-            QAction* renameAction = contextMenu.addAction(tr("Rename Surface"));
-            connect(renameAction, &QAction::triggered, this, [this, segmentId]() {
-                emit renameSurfaceRequested(segmentId);
-            });
-        }
+    QStringList targets = selectedSegmentIds;
+    if (targets.isEmpty()) {
+        targets << segmentId;
     }
 
-    if (selectedSegmentIds.size() == 1) {
+    // Tools and edits need the surface in this volume's voxels on a writable store.
+    const bool writable = _catalog->attachment() && _catalog->session()->writable(*_catalog->attachment());
+    auto bound = [this](const QString& id) {
+        const auto* row = _catalog->row(id.toStdString());
+        return row && row->toVolume;
+    };
+    const bool isBound = bound(segmentId);
+    const bool allBound = std::all_of(targets.begin(), targets.end(), bound);
+    const bool usable = isBound && writable;
+    const bool allUsable = allBound && writable;
+
+    QMenu contextMenu(tr("Context Menu"), _ui.treeWidget);
+
+    if (selectedSegmentIds.size() <= 1) {
+        QAction* renameAction = contextMenu.addAction(tr("Rename Surface"));
+        renameAction->setEnabled(writable);
+        connect(renameAction, &QAction::triggered, this, [this, segmentIdStd]() { renameSurface(segmentIdStd); });
         QAction* focusAction = contextMenu.addAction(tr("Focus"));
+        focusAction->setEnabled(isBound);
         connect(focusAction, &QAction::triggered, this, [this, segmentId]() {
             emit focusSurfaceRequested(segmentId);
         });
     }
 
-    QAction* copyPathAction = contextMenu.addAction(tr("Copy Segment Path"));
-    connect(copyPathAction, &QAction::triggered, this, [this, segmentId]() {
-        emit copySegmentPathRequested(segmentId);
+    QAction* copyUuidAction = contextMenu.addAction(tr("Copy UUID"));
+    connect(copyUuidAction, &QAction::triggered, this, [this, targets]() {
+        QApplication::clipboard()->setText(targets.join(QLatin1Char('\n')));
+        emit statusMessageRequested(tr("Copied %n surface UUID(s) to the clipboard", nullptr, int(targets.size())), 3000);
     });
 
+    if (!isBound) {
+        QAction* bindAction = contextMenu.addAction(tr("Bind to Current Volume..."));
+        bindAction->setEnabled(writable && _catalog->volume());
+        connect(bindAction, &QAction::triggered, this, [this, segmentIdStd]() { bindSurface(segmentIdStd); });
+    }
+
     QAction* addToSpiralAction = contextMenu.addAction(tr("Add to current spiral fit"));
-    addToSpiralAction->setEnabled(_spiralFitAvailable);
+    addToSpiralAction->setEnabled(_spiralFitAvailable && isBound);
     addToSpiralAction->setToolTip(_spiralFitAvailable
-        ? tr("Upload this patch to the active Spiral session; it is used on the next run")
+        ? tr("Upload this surface to the active Spiral session; it is used on the next run")
         : tr("No Spiral session is active on the connected service"));
     connect(addToSpiralAction, &QAction::triggered, this, [this, segmentId]() {
         emit addSurfaceToSpiralFitRequested(segmentId);
     });
 
-    QMenu* maskMenu = contextMenu.addMenu(tr("Mask"));
-    maskMenu->setEnabled(isCurrentFolderSegment);
-    QAction* generateMaskAction = maskMenu->addAction(tr("Generate Segment Mask"));
-    connect(generateMaskAction, &QAction::triggered, this, [this, segmentId]() {
-        emit generateSegmentMaskRequested(segmentId);
-    });
-    QAction* appendMaskAction = maskMenu->addAction(tr("Append Surface Mask"));
-    connect(appendMaskAction, &QAction::triggered, this, [this, segmentId]() {
-        emit appendSegmentMaskRequested(segmentId);
-    });
-
     contextMenu.addSeparator();
 
     QAction* growSegmentAction = contextMenu.addAction(tr("Run Trace"));
-    growSegmentAction->setEnabled(isCurrentFolderSegment);
+    growSegmentAction->setEnabled(usable);
     connect(growSegmentAction, &QAction::triggered, this, [this, segmentId]() {
         emit growSegmentRequested(segmentId);
     });
 
-    if (_volumePkg && isCurrentFolderSegment) {
-        QMenu* copySurfaceMenu = contextMenu.addMenu(tr("Copy Surface"));
-        if (selectedSegmentIds.size() == 1) {
-            QAction* copySurfaceAction = copySurfaceMenu->addAction(tr("Copy Surface..."));
-            connect(copySurfaceAction, &QAction::triggered, this, [this, segmentId]() {
-                emit copySurfaceRequested(segmentId);
-            });
-            copySurfaceMenu->addSeparator();
-        }
-        QAction* copyOutAction = copySurfaceMenu->addAction(tr("Out"));
-        connect(copyOutAction, &QAction::triggered, this, [this, segmentId]() {
-            emit neighborCopyRequested(segmentId, true);
-        });
-        QAction* copyInAction = copySurfaceMenu->addAction(tr("In"));
-        connect(copyInAction, &QAction::triggered, this, [this, segmentId]() {
-            emit neighborCopyRequested(segmentId, false);
-        });
-        QAction* resumeLocalAction = contextMenu.addAction(tr("Reoptimize Surface"));
-        connect(resumeLocalAction, &QAction::triggered, this, [this, segmentId]() {
-            emit resumeLocalGrowPatchRequested(segmentId);
-        });
-
-        // Reload from Backup submenu. Backups live under
-        // <backupRoot>/backups/<id> (backupRoot is the volpkg.json's directory),
-        // matching QuadSurface::saveSnapshot().
-        auto backupSurf = getSurfaceById(segmentId.toStdString());
-        std::filesystem::path backupsDir;
-        if (backupSurf && !backupSurf->path.empty()) {
-            std::filesystem::path root = backupSurf->backupRoot.empty()
-                ? backupSurf->path.parent_path() : backupSurf->backupRoot;
-            backupsDir = root / "backups" / backupSurf->path.filename();
-        }
-        if (!backupsDir.empty() && std::filesystem::exists(backupsDir) && std::filesystem::is_directory(backupsDir)) {
-            std::vector<int> availableBackups;
-            for (const auto& entry : std::filesystem::directory_iterator(backupsDir)) {
-                if (entry.is_directory()) {
-                    try {
-                        int idx = std::stoi(entry.path().filename().string());
-                        if (idx >= 0 && idx <= 9) {
-                            availableBackups.push_back(idx);
-                        }
-                    } catch (...) {
-                        // Not a numeric directory, skip
-                    }
-                }
-            }
-            if (!availableBackups.empty()) {
-                std::sort(availableBackups.begin(), availableBackups.end());
-                QMenu* backupMenu = contextMenu.addMenu(tr("Reload from Backup"));
-                for (int idx : availableBackups) {
-                    std::filesystem::path backupPath = backupsDir / std::to_string(idx);
-                    QString label = tr("Backup %1").arg(idx);
-
-                    // Try to get timestamp from meta.json
-                    std::filesystem::path metaPath = backupPath / "meta.json";
-                    if (std::filesystem::exists(metaPath)) {
-                        try {
-                            auto meta = utils::Json::parse_file(metaPath);
-                            if (meta.contains("backup_timestamp")) {
-                                label = tr("Backup %1 - %2").arg(idx).arg(
-                                    QString::fromStdString(meta["backup_timestamp"].get_string()));
-                            }
-                        } catch (...) {
-                            // Couldn't read meta, use simple label
-                        }
-                    }
-
-                    QAction* backupAction = backupMenu->addAction(label);
-                    connect(backupAction, &QAction::triggered, this, [this, segmentId, idx]() {
-                        emit reloadFromBackupRequested(segmentId, idx);
-                    });
-                }
-            }
-        }
+    QMenu* copySurfaceMenu = contextMenu.addMenu(tr("Copy Surface"));
+    copySurfaceMenu->setEnabled(writable);
+    if (selectedSegmentIds.size() <= 1) {
+        QAction* copySurfaceAction = copySurfaceMenu->addAction(tr("Copy Surface..."));
+        connect(copySurfaceAction, &QAction::triggered, this, [this, segmentIdStd]() { copySurface(segmentIdStd); });
+        copySurfaceMenu->addSeparator();
     }
+    QAction* copyOutAction = copySurfaceMenu->addAction(tr("Out"));
+    copyOutAction->setEnabled(usable);
+    connect(copyOutAction, &QAction::triggered, this, [this, segmentId]() {
+        emit neighborCopyRequested(segmentId, true);
+    });
+    QAction* copyInAction = copySurfaceMenu->addAction(tr("In"));
+    copyInAction->setEnabled(usable);
+    connect(copyInAction, &QAction::triggered, this, [this, segmentId]() {
+        emit neighborCopyRequested(segmentId, false);
+    });
+    QAction* resumeLocalAction = contextMenu.addAction(tr("Reoptimize Surface"));
+    resumeLocalAction->setEnabled(usable);
+    connect(resumeLocalAction, &QAction::triggered, this, [this, segmentId]() {
+        emit resumeLocalGrowPatchRequested(segmentId);
+    });
 
     contextMenu.addSeparator();
 
-    QAction* renderAction = contextMenu.addAction(tr("Render segment"));
-    renderAction->setEnabled(isCurrentFolderSegment);
-    connect(renderAction, &QAction::triggered, this, [this, segmentId]() {
-        emit renderSegmentRequested(segmentId);
-    });
-
-    QAction* convertToObjAction = contextMenu.addAction(tr("Convert to OBJ"));
-    convertToObjAction->setEnabled(isCurrentFolderSegment);
-    connect(convertToObjAction, &QAction::triggered, this, [this, segmentId]() {
-        emit convertToObjRequested(segmentId);
-    });
-    QAction* visObjAction = contextMenu.addAction(tr("Lasagna Vis as OBJ"));
-    visObjAction->setEnabled(isCurrentFolderSegment);
-    connect(visObjAction, &QAction::triggered, this, [this, segmentId]() {
-        emit visLasagnaObjRequested(segmentId);
-    });
-    QAction* cropBoundsAction = contextMenu.addAction(tr("Crop bounds to valid region"));
-    cropBoundsAction->setEnabled(isCurrentFolderSegment);
-    connect(cropBoundsAction, &QAction::triggered, this, [this, segmentId]() {
-        emit cropBoundsRequested(segmentId);
-    });
+    auto addToolAction = [&](const QString& text, bool enabled, auto signal) {
+        QAction* action = contextMenu.addAction(text);
+        action->setEnabled(enabled);
+        connect(action, &QAction::triggered, this, [this, segmentId, signal]() { emit (this->*signal)(segmentId); });
+        return action;
+    };
+    addToolAction(tr("Render segment"), usable, &SurfacePanelController::renderSegmentRequested);
+    addToolAction(tr("Convert to OBJ"), usable, &SurfacePanelController::convertToObjRequested);
+    addToolAction(tr("Lasagna Vis as OBJ"), usable, &SurfacePanelController::visLasagnaObjRequested);
+    addToolAction(tr("Crop bounds to valid region"), usable, &SurfacePanelController::cropBoundsRequested);
 
     QMenu* flipMenu = contextMenu.addMenu(tr("Flip Surface"));
-    flipMenu->setEnabled(isCurrentFolderSegment);
+    flipMenu->setEnabled(usable);
     QAction* flipUAction = flipMenu->addAction(tr("V Flip"));
     connect(flipUAction, &QAction::triggered, this, [this, segmentId]() {
         emit flipURequested(segmentId);
@@ -1392,104 +463,59 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         emit flipVRequested(segmentId);
     });
 
-    QAction* rotateAction = contextMenu.addAction(tr("Rotate Surface 90° CW"));
-    rotateAction->setEnabled(isCurrentFolderSegment);
-    connect(rotateAction, &QAction::triggered, this, [this, segmentId]() {
-        emit rotateSurfaceRequested(segmentId);
-    });
-
-    QAction* refineAlphaCompAction = contextMenu.addAction(tr("Refine (Alpha-comp)"));
-    refineAlphaCompAction->setEnabled(isCurrentFolderSegment);
-    connect(refineAlphaCompAction, &QAction::triggered, this, [this, segmentId]() {
-        emit alphaCompRefineRequested(segmentId);
-    });
-
-    QAction* slimFlattenAction = contextMenu.addAction(tr("SLIM-flatten"));
-    slimFlattenAction->setEnabled(isCurrentFolderSegment);
-    connect(slimFlattenAction, &QAction::triggered, this, [this, segmentId]() {
-        emit slimFlattenRequested(segmentId);
-    });
-
-    QAction* straightenAction = contextMenu.addAction(tr("Straighten (vc_straighten)"));
-    straightenAction->setEnabled(isCurrentFolderSegment);
-    connect(straightenAction, &QAction::triggered, this, [this, segmentId]() {
-        emit straightenRequested(segmentId);
-    });
-
-    QAction* abfFlattenAction = contextMenu.addAction(tr("ABF++ flatten"));
-    abfFlattenAction->setEnabled(isCurrentFolderSegment);
-    connect(abfFlattenAction, &QAction::triggered, this, [this, segmentId]() {
-        emit abfFlattenRequested(segmentId);
-    });
+    addToolAction(tr("Rotate Surface 90° CW"), usable, &SurfacePanelController::rotateSurfaceRequested);
+    addToolAction(tr("Refine (Alpha-comp)"), usable, &SurfacePanelController::alphaCompRefineRequested);
+    addToolAction(tr("SLIM-flatten"), usable, &SurfacePanelController::slimFlattenRequested);
+    addToolAction(tr("Straighten (vc_straighten)"), usable, &SurfacePanelController::straightenRequested);
+    addToolAction(tr("ABF++ flatten"), usable, &SurfacePanelController::abfFlattenRequested);
 
     contextMenu.addSeparator();
 
-    QAction* exportChunksAction = contextMenu.addAction(tr("Export width-chunks (40k px)"));
-    exportChunksAction->setEnabled(isCurrentFolderSegment);
-    connect(exportChunksAction, &QAction::triggered, this, [this, segmentId]() {
-        emit exportTifxyzChunksRequested(segmentId);
-    });
-
     QAction* rasterizeAction = contextMenu.addAction(tr("Rasterize"));
-    rasterizeAction->setEnabled(allSelectedCurrentFolder);
-    connect(rasterizeAction, &QAction::triggered, this, [this, selectedSegmentIds, segmentId]() {
-        QStringList rasterizeTargets = selectedSegmentIds;
-        if (rasterizeTargets.isEmpty()) {
-            rasterizeTargets << segmentId;
-        }
-        emit rasterizeSegmentsRequested(rasterizeTargets);
+    rasterizeAction->setEnabled(allUsable);
+    connect(rasterizeAction, &QAction::triggered, this, [this, targets]() {
+        emit rasterizeSegmentsRequested(targets);
     });
 
-    // Merge tifxyz only makes sense for >=2 surfaces; gate on selection
-    // so it doesn't appear when the user right-clicks a single segment.
-    if (selectedSegmentIds.size() >= 2 && allSelectedCurrentFolder) {
-        QAction* mergeAction = contextMenu.addAction(tr("Merge tifxyz..."));
+    // Merge only makes sense for >=2 surfaces; gate on selection so it
+    // doesn't appear when the user right-clicks a single surface.
+    if (selectedSegmentIds.size() >= 2 && allUsable) {
+        QAction* mergeAction = contextMenu.addAction(tr("Merge surfaces..."));
         connect(mergeAction, &QAction::triggered, this, [this, selectedSegmentIds]() {
             emit mergeTifxyzRequested(selectedSegmentIds);
         });
     }
-    // Patch tifxyz is exactly-2-input; gate to exactly 2 selected segments
-    // so the dialog opens with both pickers pre-filled and the user can
-    // dial in border / blend without picking inputs.
-    if (selectedSegmentIds.size() == 2 && allSelectedCurrentFolder) {
-        QAction* patchAction = contextMenu.addAction(tr("Patch tifxyz..."));
+    // Patch is exactly-2-input; gate to exactly 2 selected surfaces so the
+    // dialog opens with both pickers pre-filled.
+    if (selectedSegmentIds.size() == 2 && allUsable) {
+        QAction* patchAction = contextMenu.addAction(tr("Patch surface..."));
         connect(patchAction, &QAction::triggered, this, [this, selectedSegmentIds]() {
             emit mergePatchRequested(selectedSegmentIds);
         });
     }
 
     QAction* addIgnoreLabelAction = contextMenu.addAction(tr("Add ignore label"));
-    addIgnoreLabelAction->setEnabled(isCurrentFolderSegment);
+    addIgnoreLabelAction->setEnabled(usable);
     connect(addIgnoreLabelAction, &QAction::triggered, this, [this]() {
         emit addIgnoreLabelRequested();
     });
 
-    QStringList recalcTargets = selectedSegmentIds;
-    if (recalcTargets.isEmpty()) {
-        recalcTargets << segmentId;
-    }
-
     contextMenu.addSeparator();
 
-    QAction* recalcAreaAction = contextMenu.addAction(tr("Recalculate Area from Mask"));
-    recalcAreaAction->setEnabled(allSelectedCurrentFolder);
-    connect(recalcAreaAction, &QAction::triggered, this, [this, recalcTargets]() {
-        emit recalcAreaRequested(recalcTargets);
+    QAction* recalcAreaAction = contextMenu.addAction(tr("Recalculate Area"));
+    recalcAreaAction->setEnabled(allUsable);
+    connect(recalcAreaAction, &QAction::triggered, this, [this, targets]() {
+        emit recalcAreaRequested(targets);
     });
 
-    QStringList deletionTargets = selectedSegmentIds;
-    if (deletionTargets.isEmpty()) {
-        deletionTargets << segmentId;
-    }
-
-    QString deleteText = deletionTargets.size() > 1 ?
-        tr("Delete %1 Segments").arg(deletionTargets.size()) :
-        tr("Delete Segment");
+    const QString deleteText = targets.size() > 1 ?
+        tr("Delete %1 Surfaces").arg(targets.size()) :
+        tr("Delete Surface");
     QAction* deleteAction = contextMenu.addAction(deleteText);
     deleteAction->setIcon(_ui.treeWidget->style()->standardIcon(QStyle::SP_TrashIcon));
-    deleteAction->setEnabled(isLocal);
-    connect(deleteAction, &QAction::triggered, this, [this, deletionTargets]() {
-        handleDeleteSegments(deletionTargets);
+    deleteAction->setEnabled(writable);
+    connect(deleteAction, &QAction::triggered, this, [this, targets]() {
+        handleRetireSurfaces(targets);
     });
 
     contextMenu.addSeparator();
@@ -1504,132 +530,120 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     contextMenu.exec(_ui.treeWidget->mapToGlobal(pos));
 }
 
-void SurfacePanelController::handleDeleteSegments(const QStringList& segmentIds)
+void SurfacePanelController::renameSurface(const std::string& id)
 {
-    if (segmentIds.isEmpty() || !_volumePkg) {
+    const auto* row = _catalog->row(id);
+    if (!row) {
         return;
     }
-
-    QString message;
-    if (segmentIds.size() == 1) {
-        message = tr("Are you sure you want to delete segment '%1'?\n\nThis action cannot be undone.")
-                      .arg(segmentIds.first());
-    } else {
-        message = tr("Are you sure you want to delete %1 segments?\n\nThis action cannot be undone.")
-                      .arg(segmentIds.size());
-    }
-
-    QWidget* parentWidget = _ui.treeWidget ? static_cast<QWidget*>(_ui.treeWidget) : nullptr;
-    QMessageBox::StandardButton reply = QMessageBox::question(
-        parentWidget,
-        tr("Confirm Deletion"),
-        message,
-        QMessageBox::Yes | QMessageBox::No,
-        QMessageBox::No);
-
-    if (reply != QMessageBox::Yes) {
+    bool accepted = false;
+    const QString name = QInputDialog::getText(_ui.treeWidget, tr("Rename Surface"), tr("Name:"),
+                                               QLineEdit::Normal, display_name(*row), &accepted).trimmed();
+    if (!accepted || name.isEmpty() || name.toStdString() == row->record.name) {
         return;
     }
-
-    const int total = segmentIds.size();
-    int deleted = 0;
-    QString err;
-    if (deleteSegmentsHeadless(segmentIds, &err, &deleted)) {
-        emit statusMessageRequested(tr("Successfully deleted %1 segment(s)").arg(total), 5000);
-    } else if (deleted > 0) {
-        QMessageBox::warning(parentWidget,
-                             tr("Partial Deletion"),
-                             tr("Deleted %1 of %2 segment(s). The following could not be deleted: %3\n\n"
-                                "Permission errors may require manual deletion or running with "
-                                "elevated privileges.")
-                                 .arg(deleted)
-                                 .arg(total)
-                                 .arg(err));
-    } else {
-        QMessageBox::critical(parentWidget,
-                              tr("Deletion Failed"),
-                              tr("None of the %1 selected segment(s) could be deleted: %2\n\n"
-                                 "Permission errors may require manual deletion or running with "
-                                 "elevated privileges.")
-                                  .arg(total)
-                                  .arg(err.isEmpty() ? tr("unknown error") : err));
+    try {
+        _catalog->rename(id, name.toStdString());
+    } catch (const std::exception& error) {
+        QMessageBox::critical(_ui.treeWidget, tr("Rename Failed"), QString::fromUtf8(error.what()));
     }
 }
 
-bool SurfacePanelController::deleteSegmentsHeadless(const QStringList& segmentIds, QString* err,
-                                                    int* deletedCount)
+void SurfacePanelController::copySurface(const std::string& id)
 {
-    if (deletedCount) {
-        *deletedCount = 0;
+    const auto* row = _catalog->row(id);
+    if (!row) {
+        return;
     }
-    if (segmentIds.isEmpty() || !_volumePkg) {
-        if (err) {
-            *err = _volumePkg ? tr("no segments specified")
-                              : tr("no volume package loaded");
-        }
+    bool accepted = false;
+    const QString name = QInputDialog::getText(_ui.treeWidget, tr("Copy Surface"), tr("Name of the copy:"),
+                                               QLineEdit::Normal, display_name(*row) + tr("_copy"), &accepted).trimmed();
+    if (!accepted || name.isEmpty()) {
+        return;
+    }
+    try {
+        const auto copied = _catalog->copy(id, name.toStdString());
+        emit statusMessageRequested(tr("Copied surface to %1").arg(QString::fromStdString(copied)), 5000);
+    } catch (const std::exception& error) {
+        QMessageBox::critical(_ui.treeWidget, tr("Copy Failed"), QString::fromUtf8(error.what()));
+    }
+}
+
+void SurfacePanelController::bindSurface(const std::string& id)
+{
+    const auto volume = _catalog->volume();
+    const auto* row = _catalog->row(id);
+    if (!volume || !row || !_catalog->attachment()) {
+        return;
+    }
+    const auto shape = volume->shape();
+    const auto message = tr("Bind this surface to the active volume?\n\nVolume: %1\nDimensions Z/Y/X: %2 / %3 / %4\nResolution: %5 µm\n"
+                            "Surface metadata: %6\n\nEnter stored surface units per active-volume voxel. No scale is assumed.")
+        .arg(QString::fromStdString(volume->id())).arg(shape[0]).arg(shape[1]).arg(shape[2]).arg(volume->voxelSize())
+        .arg(QString::fromStdString(row_meta(*row).value("coordinates", nlohmann::json::object()).dump()));
+    bool accepted = false;
+    const auto answer = QInputDialog::getText(_ui.treeWidget, tr("Bind Surface Coordinates"), message, QLineEdit::Normal, {}, &accepted);
+    if (!accepted) {
+        return;
+    }
+    bool valid = false;
+    const double scale = answer.toDouble(&valid);
+    if (!valid || !(scale > 0) || !std::isfinite(scale)) {
+        QMessageBox::warning(_ui.treeWidget, tr("Bind Surface Coordinates"), tr("Enter a positive finite coordinate scale."));
+        return;
+    }
+    try {
+        std::string revision;
+        _catalog->session()->read(*_catalog->attachment(), [&](const auto& db, const auto& txn, const auto&) {
+            if (const auto head = db.currentObjectRevision(txn, id)) revision = head->uuid;
+        });
+        vc3d::bindCoordinates(*_catalog->session(), *_catalog->attachment(), id, revision, *volume, scale);
+    } catch (const std::exception& error) {
+        QMessageBox::critical(_ui.treeWidget, tr("Bind Failed"), QString::fromUtf8(error.what()));
+    }
+}
+
+void SurfacePanelController::handleRetireSurfaces(const QStringList& surfaceIds)
+{
+    if (surfaceIds.isEmpty()) {
+        return;
+    }
+
+    const QString message = surfaceIds.size() == 1
+        ? tr("Delete surface '%1'?\n\nIts revisions stay in the object store history.").arg(
+              _catalog->row(surfaceIds.first().toStdString()) ? display_name(*_catalog->row(surfaceIds.first().toStdString()))
+                                                               : surfaceIds.first())
+        : tr("Delete %1 surfaces?\n\nTheir revisions stay in the object store history.").arg(surfaceIds.size());
+    if (QMessageBox::question(_ui.treeWidget, tr("Confirm Deletion"), message,
+                              QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
+        return;
+    }
+
+    QString err;
+    if (retireSurfaces(surfaceIds, &err)) {
+        emit statusMessageRequested(tr("Deleted %n surface(s)", nullptr, int(surfaceIds.size())), 5000);
+    } else {
+        QMessageBox::critical(_ui.treeWidget, tr("Deletion Failed"), err);
+    }
+}
+
+bool SurfacePanelController::retireSurfaces(const QStringList& surfaceIds, QString* err)
+{
+    if (surfaceIds.isEmpty() || !_catalog) {
+        if (err) *err = tr("no surfaces specified");
         return false;
     }
-
-    int successCount = 0;
-    QStringList failedSegments;
-    bool anyChanges = false;
-
-    for (const auto& id : segmentIds) {
-        const std::string idStd = id.toStdString();
-        try {
-            if (_managedDeletionHandler && _managedDeletionHandler(id)) {
-                ++successCount;
-                continue;
-            }
-            // Must clean up CState before destroying the Surface
-            // to avoid dangling pointers in signal handlers.
-            // Suppress signals during batch deletion to prevent handlers from
-            // iterating over surfaces while we're in the middle of deleting them.
-            removeSingleSegmentation(idStd, true);
-            _volumePkg->removeSegmentation(idStd);
-            ++successCount;
-            anyChanges = true;
-        } catch (const std::filesystem::filesystem_error& e) {
-            if (e.code() == std::errc::permission_denied) {
-                failedSegments << id + tr(" (permission denied)");
-            } else {
-                failedSegments << id + tr(" (filesystem error)");
-            }
-            std::cerr << "Failed to delete segment " << idStd << ": " << e.what() << std::endl;
-        } catch (const std::exception& e) {
-            failedSegments << id;
-            std::cerr << "Failed to delete segment " << idStd << ": " << e.what() << std::endl;
-        }
+    std::vector<std::string> uuids;
+    for (const auto& id : surfaceIds) {
+        uuids.push_back(id.toStdString());
     }
-
-    // After all deletions are done, emit a single signal to trigger surface index rebuild
-    if (anyChanges && _state) {
-        _state->emitSurfacesChanged();
-    }
-
-    if (anyChanges) {
-        try {
-            _volumePkg->refreshSegmentations();
-        } catch (const std::exception& e) {
-            std::cerr << "Error refreshing segmentations after deletion: " << e.what() << std::endl;
-        }
-        applyFilters();
-        if (_filtersUpdated) {
-            _filtersUpdated();
-        }
-        emit surfacesLoaded();
-    }
-
-    if (deletedCount) {
-        *deletedCount = successCount;
-    }
-
-    if (successCount == segmentIds.size())
+    try {
+        _catalog->retire(uuids);
         return true;
-
-    if (err)
-        *err = failedSegments.join(", ");
-    return false;
+    } catch (const std::exception& error) {
+        if (err) *err = QString::fromUtf8(error.what());
+        return false;
+    }
 }
 
 void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCollection* pointCollection)
@@ -1714,9 +728,15 @@ void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCol
         _filters.focusPointDistance->setEnabled(_filters.focusPoints->isChecked());
     }
 
+    _recordTagFilter = new QComboBox(_ui.treeWidget);
+    _recordTagFilter->setObjectName(QStringLiteral("cmbFilterRecordTags"));
+    _recordTagFilter->setToolTip(tr("Show only surfaces with any of the checked tags."));
+    _recordTagFilter->hide();
+
     buildFilterDialog();
     connectFilterSignals();
     rebuildPointSetFilterModel();
+    rebuildRecordTagFilterModel();
     applyFilters();
     updateFilterSummary();
 }
@@ -1736,6 +756,7 @@ void SurfacePanelController::configureTags(const TagUiRefs& tags)
 void SurfacePanelController::refreshPointSetFilterOptions()
 {
     rebuildPointSetFilterModel();
+    refreshProximityFilters();
     applyFilters();
 }
 
@@ -1748,34 +769,10 @@ void SurfacePanelController::applyFilters()
     updateFilterSummary();
 }
 
-void SurfacePanelController::syncSelectionUi(const std::string& surfaceId, QuadSurface* surface)
-{
-    _currentSurfaceId = surfaceId;
-    updateTagCheckboxStatesForSurface(surface);
-    if (isCurrentOnlyFilterEnabled()) {
-        applyFilters();
-    }
-}
-
 bool SurfacePanelController::selectSurfaceById(const std::string& surfaceId)
 {
-    if (!_ui.treeWidget || surfaceId.empty()) {
-        return false;
-    }
-
-    const QString idQString = QString::fromStdString(surfaceId);
-    QTreeWidgetItem* targetItem = nullptr;
-    QTreeWidgetItemIterator it(_ui.treeWidget);
-    while (*it) {
-        if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() == idQString) {
-            targetItem = *it;
-            break;
-        }
-        ++it;
-    }
-
-    auto surface = getSurfaceById(surfaceId);
-    if (!targetItem || !surface) {
+    auto* targetItem = itemFor(surfaceId);
+    if (!targetItem) {
         return false;
     }
 
@@ -1786,11 +783,15 @@ bool SurfacePanelController::selectSurfaceById(const std::string& surfaceId)
         _ui.treeWidget->scrollToItem(targetItem);
     }
 
-    syncSelectionUi(surfaceId, surface.get());
+    _currentSurfaceId = surfaceId;
+    updateTagCheckboxStates(_catalog->row(surfaceId));
+    if (isCurrentOnlyFilterEnabled()) {
+        applyFilters();
+    }
 
     if (_segmentationViewerProvider) {
         if (auto* viewer = _segmentationViewerProvider()) {
-            viewer->setWindowTitle(tr("Surface %1").arg(idQString));
+            viewer->setWindowTitle(tr("Surface %1").arg(targetItem->text(SURFACE_ID_COLUMN)));
         }
     }
 
@@ -1807,66 +808,29 @@ bool SurfacePanelController::activateSurfaceById(const std::string& surfaceId,
         return false;
     };
 
-    // 1. Selection lock (held during growth) — refuse headlessly.
+    // Selection lock (held during growth): refuse headlessly.
     if (_selectionLocked) {
         return fail(tr("surface selection is locked while growth runs"));
     }
-
-    if (!_ui.treeWidget || surfaceId.empty()) {
-        return fail(tr("unknown segment: %1").arg(QString::fromStdString(surfaceId)));
-    }
-
-    // 2. Resolve the tree item and the surface.
     const QString idQString = QString::fromStdString(surfaceId);
-    QTreeWidgetItem* targetItem = nullptr;
-    QTreeWidgetItemIterator it(_ui.treeWidget);
-    while (*it) {
-        if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() == idQString) {
-            targetItem = *it;
-            break;
-        }
-        ++it;
+    if (!_catalog || !_catalog->row(surfaceId)) {
+        return fail(tr("unknown surface: %1").arg(idQString));
     }
-    if (!targetItem) {
-        return fail(tr("unknown segment: %1").arg(idQString));
+    try {
+        (void)_catalog->open(surfaceId);
+    } catch (const std::exception& error) {
+        return fail(tr("surface %1 could not be opened: %2").arg(idQString, QString::fromUtf8(error.what())));
     }
-
-    auto surface = getSurfaceById(surfaceId);
-    if (!surface) {
-        return fail(tr("segment %1 could not be loaded").arg(idQString));
-    }
-
-    // 3. Refuse unmaterialized open-data placeholders (no interactive fetch here).
-    if (vc3d::opendata::isOpenDataSegmentPlaceholder(surface->path)) {
-        return fail(tr("segment %1 is an open-data placeholder; fetch it first")
-                        .arg(idQString));
-    }
-
-    // 4. Blocked tree selection — unchanged. The explicit emit below replaces the
-    //    tree signal, so the blocker prevents double activation, not activation.
+    // The blocked tree selection keeps the tree signal from activating twice.
     if (!selectSurfaceById(surfaceId)) {
-        return fail(tr("segment %1 could not be selected").arg(idQString));
+        return fail(tr("surface %1 could not be selected").arg(idQString));
     }
-
-    // 5. Sync the named CState entry exactly as handleTreeSelectionChanged does,
-    //    so onSurfaceActivated can resolve multi-folder display ids kept in CState.
-    if (_state && !_state->surface(surfaceId)) {
-        _state->setSurface(surfaceId, surface, true, false);
-    }
-
-    // 6. Emit activation synchronously (direct connection), identical to a click.
-    emit surfaceActivated(idQString, surface.get());
-
-    // 7. Mirror the surfaceJustLoaded tail of handleTreeSelectionChanged.
-    applyFilters();
-
-    return true;
+    activate(surfaceId, false);
+    return _opened.has_value();
 }
 
 void SurfacePanelController::resetTagUi()
 {
-    _currentSurfaceId.clear();
-
     auto resetBox = [](QCheckBox* box) {
         if (!box) {
             return;
@@ -1929,16 +893,6 @@ bool SurfacePanelController::setTagChecked(Tag tag, bool checked)
     return true;
 }
 
-void SurfacePanelController::reloadSurfacesFromDisk()
-{
-    loadSurfacesIncremental();
-}
-
-void SurfacePanelController::refreshFiltersOnly()
-{
-    applyFilters();
-}
-
 void SurfacePanelController::setSelectionLocked(bool locked)
 {
     if (_selectionLocked == locked) {
@@ -1949,10 +903,6 @@ void SurfacePanelController::setSelectionLocked(bool locked)
     _lockedSelectionIds.clear();
     _selectionLockNotified = false;
 
-    if (_ui.reloadButton) {
-        _ui.reloadButton->setDisabled(locked);
-    }
-
     if (!_ui.treeWidget) {
         return;
     }
@@ -1960,13 +910,8 @@ void SurfacePanelController::setSelectionLocked(bool locked)
     _ui.treeWidget->setDisabled(locked);
 
     if (locked) {
-        const QList<QTreeWidgetItem*> selectedItems = _ui.treeWidget->selectedItems();
-        _lockedSelectionIds.reserve(selectedItems.size());
-        for (auto* item : selectedItems) {
-            if (!item) {
-                continue;
-            }
-            const QString id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
+        for (auto* item : _ui.treeWidget->selectedItems()) {
+            const QString id = item ? item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() : QString();
             if (!id.isEmpty()) {
                 _lockedSelectionIds.append(id);
             }
@@ -1990,11 +935,6 @@ void SurfacePanelController::setTransformWarning(const QString& warningText)
     }
 }
 
-void SurfacePanelController::setVisibleSegmentFolders(std::vector<SegmentFolderSelection> folders)
-{
-    _visibleSegmentFolders = std::move(folders);
-}
-
 void SurfacePanelController::applyTransformWarningStyle(SurfaceTreeWidgetItem* item)
 {
     if (!item) {
@@ -2002,14 +942,16 @@ void SurfacePanelController::applyTransformWarningStyle(SurfaceTreeWidgetItem* i
     }
 
     const bool warning = !_transformWarningText.isEmpty();
-    const QBrush foreground = warning ? QBrush(QColor(QStringLiteral("#c62828"))) : QBrush();
+    const bool unbound = item->data(SURFACE_ID_COLUMN, kUnboundRole).toBool();
+    const QBrush foreground = warning ? QBrush(QColor(QStringLiteral("#c62828")))
+                            : unbound ? QBrush(QColor(Qt::gray)) : QBrush();
     for (int column = SURFACE_ID_COLUMN; column <= TIMESTAMP_COLUMN; ++column) {
         item->setForeground(column, foreground);
         if (warning) {
             item->setToolTip(column, _transformWarningText);
-        } else if (column == SURFACE_ID_COLUMN) {
-            item->setToolTip(column, item->text(column));
-        } else if (column == SURFACE_LONG_ID_COLUMN) {
+        } else if (unbound) {
+            item->setToolTip(column, tr("Not bound to the current volume"));
+        } else if (column == SURFACE_ID_COLUMN || column == SURFACE_LONG_ID_COLUMN) {
             item->setToolTip(column, item->text(column));
         } else {
             item->setToolTip(column, QString());
@@ -2130,7 +1072,12 @@ void SurfacePanelController::buildFilterDialog()
     if (_filters.surfaceIdFilter) {
         _filters.surfaceIdFilter->setParent(_filterDialog);
         _filters.surfaceIdFilter->show();
-        form->addRow(tr("Surface ID"), _filters.surfaceIdFilter);
+        form->addRow(tr("Name or UUID"), _filters.surfaceIdFilter);
+    }
+    if (_recordTagFilter) {
+        _recordTagFilter->setParent(_filterDialog);
+        _recordTagFilter->show();
+        form->addRow(tr("Tags"), _recordTagFilter);
     }
     if (_filters.focusPointDistance) {
         _filters.focusPointDistance->setParent(_filterDialog);
@@ -2156,25 +1103,14 @@ void SurfacePanelController::buildFilterDialog()
         auto* pointSetLayout = new QHBoxLayout();
         pointSetLayout->setSpacing(4);
         pointSetLayout->addWidget(new QLabel(tr("Point sets"), _filterDialog));
-        if (_filters.pointSet) {
-            _filters.pointSet->setParent(_filterDialog);
-            _filters.pointSet->show();
-            pointSetLayout->addWidget(_filters.pointSet, 1);
-        }
-        if (_filters.pointSetMode) {
-            _filters.pointSetMode->setParent(_filterDialog);
-            _filters.pointSetMode->show();
-            pointSetLayout->addWidget(_filters.pointSetMode);
-        }
-        if (_filters.pointSetAll) {
-            _filters.pointSetAll->setParent(_filterDialog);
-            _filters.pointSetAll->show();
-            pointSetLayout->addWidget(_filters.pointSetAll);
-        }
-        if (_filters.pointSetNone) {
-            _filters.pointSetNone->setParent(_filterDialog);
-            _filters.pointSetNone->show();
-            pointSetLayout->addWidget(_filters.pointSetNone);
+        for (QWidget* widget : {static_cast<QWidget*>(_filters.pointSet), static_cast<QWidget*>(_filters.pointSetMode),
+                                static_cast<QWidget*>(_filters.pointSetAll), static_cast<QWidget*>(_filters.pointSetNone)}) {
+            if (!widget) {
+                continue;
+            }
+            widget->setParent(_filterDialog);
+            widget->show();
+            pointSetLayout->addWidget(widget, widget == _filters.pointSet ? 1 : 0);
         }
         mainLayout->addLayout(pointSetLayout);
     }
@@ -2208,7 +1144,6 @@ void SurfacePanelController::connectFilterSignals()
         connect(box, &QCheckBox::toggled, this, [this]() { applyFilters(); });
     };
 
-    connectToggle(_filters.focusPoints);
     connectToggle(_filters.unreviewed);
     connectToggle(_filters.noExpansion);
     connectToggle(_filters.noDefective);
@@ -2232,16 +1167,30 @@ void SurfacePanelController::connectFilterSignals()
         });
     }
 
-    if (_filters.focusPoints && _filters.focusPointDistance) {
-        connect(_filters.focusPoints, &QCheckBox::toggled,
-                _filters.focusPointDistance, &QDoubleSpinBox::setEnabled);
+    if (_filters.focusPoints) {
+        connect(_filters.focusPoints, &QCheckBox::toggled, this, [this]() {
+            refreshProximityFilters();
+            applyFilters();
+        });
+        if (_filters.focusPointDistance) {
+            connect(_filters.focusPoints, &QCheckBox::toggled,
+                    _filters.focusPointDistance, &QDoubleSpinBox::setEnabled);
+        }
     }
 
     if (_filters.focusPointDistance) {
         connect(_filters.focusPointDistance,
                 QOverload<double>::of(&QDoubleSpinBox::valueChanged),
                 this,
-                [this](double) { applyFilters(); });
+                [this](double) { refreshProximityFilters(); applyFilters(); });
+    }
+
+    if (_state) {
+        connect(_state, &CState::poiChanged, this, [this](const std::string& name, POI*) {
+            if (name == "focus" && _filters.focusPoints && _filters.focusPoints->isChecked()) {
+                refreshProximityFilters();
+            }
+        });
     }
 
     if (_filters.zLowerBound) {
@@ -2284,56 +1233,49 @@ void SurfacePanelController::connectFilterSignals()
         connect(_filters.pointSetMode, &QComboBox::currentIndexChanged, this, [this]() { applyFilters(); });
     }
 
+    auto setAllPointSets = [this](Qt::CheckState state) {
+        auto* model = qobject_cast<QStandardItemModel*>(_filters.pointSet ? _filters.pointSet->model() : nullptr);
+        if (!model) {
+            return;
+        }
+        {
+            QSignalBlocker blocker(model);
+            for (int row = 0; row < model->rowCount(); ++row) {
+                model->setData(model->index(row, 0), state, Qt::CheckStateRole);
+            }
+        }
+        refreshProximityFilters();
+        applyFilters();
+    };
     if (_filters.pointSetAll) {
-        connect(_filters.pointSetAll, &QPushButton::clicked, this, [this]() {
-            auto* model = qobject_cast<QStandardItemModel*>(_filters.pointSet ? _filters.pointSet->model() : nullptr);
-            if (!model) {
-                return;
-            }
-            QSignalBlocker blocker(model);
-            for (int row = 0; row < model->rowCount(); ++row) {
-                model->setData(model->index(row, 0), Qt::Checked, Qt::CheckStateRole);
-            }
-            applyFilters();
-        });
+        connect(_filters.pointSetAll, &QPushButton::clicked, this, [setAllPointSets]() { setAllPointSets(Qt::Checked); });
     }
-
     if (_filters.pointSetNone) {
-        connect(_filters.pointSetNone, &QPushButton::clicked, this, [this]() {
-            auto* model = qobject_cast<QStandardItemModel*>(_filters.pointSet ? _filters.pointSet->model() : nullptr);
-            if (!model) {
-                return;
-            }
-            QSignalBlocker blocker(model);
-            for (int row = 0; row < model->rowCount(); ++row) {
-                model->setData(model->index(row, 0), Qt::Unchecked, Qt::CheckStateRole);
-            }
-            applyFilters();
-        });
+        connect(_filters.pointSetNone, &QPushButton::clicked, this, [setAllPointSets]() { setAllPointSets(Qt::Unchecked); });
     }
 
     if (_pointCollection) {
+        auto pointSetsChanged = [this]() {
+            refreshProximityFilters();
+            applyFilters();
+        };
         connect(_pointCollection, &VCCollection::collectionsAdded, this, [this](const std::vector<uint64_t>&) {
             rebuildPointSetFilterModel();
             applyFilters();
         });
         connect(_pointCollection, &VCCollection::collectionRemoved, this, [this](uint64_t) {
             rebuildPointSetFilterModel();
+            refreshProximityFilters();
             applyFilters();
         });
         connect(_pointCollection, &VCCollection::collectionChanged, this, [this](uint64_t) {
             rebuildPointSetFilterModel();
+            refreshProximityFilters();
             applyFilters();
         });
-        connect(_pointCollection, &VCCollection::pointAdded, this, [this](const ColPoint&) {
-            applyFilters();
-        });
-        connect(_pointCollection, &VCCollection::pointChanged, this, [this](const ColPoint&) {
-            applyFilters();
-        });
-        connect(_pointCollection, &VCCollection::pointRemoved, this, [this](vc::PointRef) {
-            applyFilters();
-        });
+        connect(_pointCollection, &VCCollection::pointAdded, this, [pointSetsChanged](const ColPoint&) { pointSetsChanged(); });
+        connect(_pointCollection, &VCCollection::pointChanged, this, [pointSetsChanged](const ColPoint&) { pointSetsChanged(); });
+        connect(_pointCollection, &VCCollection::pointRemoved, this, [pointSetsChanged](vc::PointRef) { pointSetsChanged(); });
     }
 
     if (_filters.surfaceIdFilter) {
@@ -2368,6 +1310,16 @@ void SurfacePanelController::rebuildPointSetFilterModel()
 
     _configuringFilters = true;
 
+    // Keep the checked sets across rebuilds.
+    std::set<QString> checked;
+    if (auto* existing = qobject_cast<QStandardItemModel*>(_filters.pointSet->model())) {
+        for (int row = 0; row < existing->rowCount(); ++row) {
+            if (existing->data(existing->index(row, 0), Qt::CheckStateRole) == Qt::Checked) {
+                checked.insert(existing->data(existing->index(row, 0), Qt::DisplayRole).toString());
+            }
+        }
+    }
+
     auto* model = new QStandardItemModel(_filters.pointSet);
     if (_pointSetModelConnection) {
         disconnect(_pointSetModelConnection);
@@ -2380,9 +1332,10 @@ void SurfacePanelController::rebuildPointSetFilterModel()
 
     if (_pointCollection) {
         for (const auto& pair : _pointCollection->getAllCollections()) {
-            auto* item = new QStandardItem(QString::fromStdString(pair.second.name));
+            const auto name = QString::fromStdString(pair.second.name);
+            auto* item = new QStandardItem(name);
             item->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled);
-            item->setData(Qt::Unchecked, Qt::CheckStateRole);
+            item->setData(checked.contains(name) ? Qt::Checked : Qt::Unchecked, Qt::CheckStateRole);
             model->appendRow(item);
         }
     }
@@ -2391,12 +1344,139 @@ void SurfacePanelController::rebuildPointSetFilterModel()
         this,
         [this](const QModelIndex&, const QModelIndex&, const QVector<int>& roles) {
             if (roles.contains(Qt::CheckStateRole)) {
+                refreshProximityFilters();
                 applyFilters();
             }
         });
 
     _configuringFilters = false;
     updateFilterSummary();
+}
+
+void SurfacePanelController::rebuildRecordTagFilterModel()
+{
+    if (!_recordTagFilter || !_catalog) {
+        return;
+    }
+    std::set<QString> checked;
+    if (auto* existing = qobject_cast<QStandardItemModel*>(_recordTagFilter->model())) {
+        for (int row = 0; row < existing->rowCount(); ++row) {
+            if (existing->data(existing->index(row, 0), Qt::CheckStateRole) == Qt::Checked) {
+                checked.insert(existing->data(existing->index(row, 0), Qt::DisplayRole).toString());
+            }
+        }
+    }
+    std::set<std::string> tags;
+    for (const auto& [id, row] : _catalog->rows()) {
+        tags.insert(row.record.tags.begin(), row.record.tags.end());
+    }
+    _configuringFilters = true;
+    auto* model = new QStandardItemModel(_recordTagFilter);
+    for (const auto& tag : tags) {
+        const auto name = QString::fromStdString(tag);
+        auto* item = new QStandardItem(name);
+        item->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled);
+        item->setData(checked.contains(name) ? Qt::Checked : Qt::Unchecked, Qt::CheckStateRole);
+        model->appendRow(item);
+    }
+    if (auto* existingModel = _recordTagFilter->model()) {
+        existingModel->deleteLater();
+    }
+    _recordTagFilter->setModel(model);
+    connect(model, &QStandardItemModel::dataChanged, this,
+            [this](const QModelIndex&, const QModelIndex&, const QVector<int>& roles) {
+                if (roles.contains(Qt::CheckStateRole)) {
+                    applyFilters();
+                }
+            });
+    _configuringFilters = false;
+}
+
+namespace {
+std::vector<QString> checkedNames(QComboBox* box)
+{
+    std::vector<QString> names;
+    auto* model = qobject_cast<QStandardItemModel*>(box ? box->model() : nullptr);
+    if (!model) {
+        return names;
+    }
+    for (int row = 0; row < model->rowCount(); ++row) {
+        if (model->data(model->index(row, 0), Qt::CheckStateRole) == Qt::Checked) {
+            names.push_back(model->data(model->index(row, 0), Qt::DisplayRole).toString());
+        }
+    }
+    return names;
+}
+}
+
+void SurfacePanelController::refreshProximityFilters()
+{
+    const auto generation = ++_proximityGeneration;
+    if (!_catalog || !_catalog->attachment() || !_catalog->volume()) {
+        _focusAnswer.reset();
+        _pointSetAnswer.reset();
+        return;
+    }
+    // The questions: one point set for the focus point, one per checked collection.
+    std::vector<std::vector<std::array<double, 3>>> focus, pointSets;
+    double focusRadius = _filters.focusPointDistance ? _filters.focusPointDistance->value() : kFocusPointFilterRadius;
+    if (POI* poi = (_filters.focusPoints && _filters.focusPoints->isChecked() && _state) ? _state->poi("focus") : nullptr) {
+        focus.push_back({{poi->p[0], poi->p[1], poi->p[2]}});
+    }
+    if (_pointCollection) {
+        for (const auto& name : checkedNames(_filters.pointSet)) {
+            std::vector<std::array<double, 3>> points;
+            for (const auto& point : _pointCollection->getPoints(name.toStdString())) {
+                points.push_back({point.p[0], point.p[1], point.p[2]});
+            }
+            pointSets.push_back(std::move(points));
+        }
+    }
+    struct Answers { ProximityAnswer focus, pointSets; };
+    vc3d::store::background<Answers>(this,
+        [session = _catalog->session(), attachment = *_catalog->attachment(), volume = _catalog->volume()->id(),
+         focus, pointSets, focusRadius]() {
+            auto answer = [&](const auto& db, const auto& txn, const auto& sets, double tolerance) {
+                ProximityAnswer result;
+                result.pointSets = sets;
+                result.tolerance = tolerance;
+                for (const auto& points : sets) {
+                    std::set<std::string> any, all;
+                    bool first = true;
+                    for (const auto& point : points) {
+                        vc::objects::SurfaceProximityQuery query;
+                        query.point = point;
+                        query.tolerance = tolerance;
+                        query.volume = volume;
+                        std::set<std::string> near;
+                        for (const auto& hit : db.nearestSurfaces(txn, query)) near.insert(hit.objectUuid);
+                        any.insert(near.begin(), near.end());
+                        if (first) all = near;
+                        else std::erase_if(all, [&](const std::string& uuid) { return !near.contains(uuid); });
+                        first = false;
+                    }
+                    result.any.push_back(std::move(any));
+                    result.all.push_back(std::move(all));
+                }
+                return result;
+            };
+            Answers answers;
+            session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+                answers.focus = answer(db, txn, focus, focusRadius);
+                answers.pointSets = answer(db, txn, pointSets, kPointSetTolerance);
+            });
+            return answers;
+        },
+        [this, generation](vc3d::store::Outcome<Answers> result) {
+            if (generation != _proximityGeneration) return;
+            if (!result.error.isEmpty()) {
+                emit statusMessageRequested(tr("Surface filter query failed: %1").arg(result.error), 8000);
+                return;
+            }
+            _focusAnswer = std::move(result.value.focus);
+            _pointSetAnswer = std::move(result.value.pointSets);
+            applyFilters();
+        });
 }
 
 void SurfacePanelController::updateFilterSummary()
@@ -2427,17 +1507,11 @@ void SurfacePanelController::updateFilterSummary()
     if (z_range_filter_active(_filters.zLowerBound, _filters.zUpperBound)) {
         ++activeFilters;
     }
-    if (auto* model = qobject_cast<QStandardItemModel*>(_filters.pointSet ? _filters.pointSet->model() : nullptr)) {
-        bool hasPointSetFilter = false;
-        for (int row = 0; row < model->rowCount(); ++row) {
-            if (model->data(model->index(row, 0), Qt::CheckStateRole) == Qt::Checked) {
-                hasPointSetFilter = true;
-                break;
-            }
-        }
-        if (hasPointSetFilter) {
-            ++activeFilters;
-        }
+    if (!checkedNames(_filters.pointSet).empty()) {
+        ++activeFilters;
+    }
+    if (!checkedNames(_recordTagFilter).empty()) {
+        ++activeFilters;
     }
 
     QString label = tr("Filters");
@@ -2456,16 +1530,11 @@ void SurfacePanelController::updateTagSummary()
     }
 
     int activeTags = 0;
-    const auto countIfChecked = [&activeTags](QCheckBox* box) {
+    for (auto* box : {_tags.approved, _tags.defective, _tags.reviewed, _tags.inspect}) {
         if (box && box->isChecked()) {
             ++activeTags;
         }
-    };
-
-    countIfChecked(_tags.approved);
-    countIfChecked(_tags.defective);
-    countIfChecked(_tags.reviewed);
-    countIfChecked(_tags.inspect);
+    }
 
     QString label = tr("Tags");
     if (activeTags > 0) {
@@ -2478,80 +1547,46 @@ void SurfacePanelController::updateTagSummary()
 
 void SurfacePanelController::onTagCheckboxToggled()
 {
-    if (!_ui.treeWidget) {
+    if (!_ui.treeWidget || !_catalog) {
         return;
     }
 
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    const std::string username = settings.value(vc3d::settings::viewer::USERNAME, vc3d::settings::viewer::USERNAME_DEFAULT).toString().toStdString();
-
-    const auto selectedItems = _ui.treeWidget->selectedItems();
-    for (auto* item : selectedItems) {
-        if (!item) {
-            continue;
-        }
-
+    const std::vector<std::pair<QCheckBox*, const char*>> boxes{
+        {_tags.approved, "approved"}, {_tags.defective, "defective"}, {_tags.reviewed, "reviewed"}, {_tags.inspect, "inspect"}};
+    for (auto* item : _ui.treeWidget->selectedItems()) {
         const std::string id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
-        auto surface = _volumePkg ? _volumePkg->getSurface(id) : nullptr;
-
-        if (!surface || surface->meta.is_null()) {
+        const auto* row = _catalog->row(id);
+        if (!row) {
             continue;
         }
-
-        if (surface->meta.contains("tags")) {
-            auto& tags = surface->meta.at("tags");
-            sync_tag(tags, _tags.approved && _tags.approved->checkState() == Qt::Checked, "approved", username);
-            sync_tag(tags, _tags.defective && _tags.defective->checkState() == Qt::Checked, "defective", username);
-            sync_tag(tags, _tags.reviewed && _tags.reviewed->checkState() == Qt::Checked, "reviewed", username);
-            sync_tag(tags, _tags.inspect && _tags.inspect->checkState() == Qt::Checked, "inspect", username);
-            surface->save_meta();
-        } else if ((_tags.approved && _tags.approved->checkState() == Qt::Checked) ||
-                   (_tags.defective && _tags.defective->checkState() == Qt::Checked) ||
-                   (_tags.reviewed && _tags.reviewed->checkState() == Qt::Checked) ||
-                   (_tags.inspect && _tags.inspect->checkState() == Qt::Checked)) {
-            surface->meta["tags"] = utils::Json::object();
-            auto& tags = surface->meta["tags"];
-
-            if (_tags.approved && _tags.approved->checkState() == Qt::Checked) {
-                tags["approved"] = utils::Json::object();
-                if (!username.empty()) {
-                    tags["approved"]["user"] = username;
-                }
+        auto tags = row->record.tags;
+        for (const auto& [box, name] : boxes) {
+            if (!box) {
+                continue;
             }
-            if (_tags.defective && _tags.defective->checkState() == Qt::Checked) {
-                tags["defective"] = utils::Json::object();
-                if (!username.empty()) {
-                    tags["defective"]["user"] = username;
-                }
+            const bool present = std::find(tags.begin(), tags.end(), name) != tags.end();
+            if (box->checkState() == Qt::Checked && !present) {
+                tags.push_back(name);
+            } else if (box->checkState() != Qt::Checked && present) {
+                std::erase(tags, std::string(name));
             }
-            if (_tags.reviewed && _tags.reviewed->checkState() == Qt::Checked) {
-                tags["reviewed"] = utils::Json::object();
-                if (!username.empty()) {
-                    tags["reviewed"]["user"] = username;
-                }
-            }
-            if (_tags.inspect && _tags.inspect->checkState() == Qt::Checked) {
-                tags["inspect"] = utils::Json::object();
-                if (!username.empty()) {
-                    tags["inspect"]["user"] = username;
-                }
-            }
-
-            surface->save_meta();
         }
-
-        if (auto* treeItem = dynamic_cast<SurfaceTreeWidgetItem*>(item)) {
-            updateTreeItemIcon(treeItem);
+        if (tags == row->record.tags) {
+            continue;
+        }
+        try {
+            _catalog->setTags(id, tags);
+        } catch (const std::exception& error) {
+            emit statusMessageRequested(tr("Cannot tag surface: %1").arg(QString::fromUtf8(error.what())), 8000);
         }
     }
 
-    applyFilters();
     updateTagSummary();
 }
 
 void SurfacePanelController::applyFiltersInternal()
 {
-    if (!_ui.treeWidget) {
+    if (!_ui.treeWidget || !_catalog) {
         emit filtersApplied(0);
         return;
     }
@@ -2560,268 +1595,92 @@ void SurfacePanelController::applyFiltersInternal()
         return box && box->isChecked();
     };
 
-    const QString surfaceIdFilterText = _filters.surfaceIdFilter ? _filters.surfaceIdFilter->text().trimmed() : QString{};
-    const bool hasSurfaceIdFilter = !surfaceIdFilterText.isEmpty();
+    const QString idFilter = _filters.surfaceIdFilter ? _filters.surfaceIdFilter->text().trimmed() : QString{};
     const bool hasZRangeFilter = z_range_filter_active(_filters.zLowerBound, _filters.zUpperBound);
-
-    bool hasActiveFilters = isChecked(_filters.focusPoints) ||
-                            isChecked(_filters.unreviewed) ||
-                            isChecked(_filters.noExpansion) ||
-                            isChecked(_filters.noDefective) ||
-                            isChecked(_filters.partialReview) ||
-                            isChecked(_filters.showPartialReview) ||
-                            isChecked(_filters.currentOnly) ||
-                            isChecked(_filters.hideUnapproved) ||
-                            isChecked(_filters.inspectOnly) ||
-                            hasSurfaceIdFilter ||
-                            hasZRangeFilter;
-
-    auto* model = qobject_cast<QStandardItemModel*>(_filters.pointSet ? _filters.pointSet->model() : nullptr);
-    if (!hasActiveFilters && model) {
-        for (int row = 0; row < model->rowCount(); ++row) {
-            if (model->data(model->index(row, 0), Qt::CheckStateRole) == Qt::Checked) {
-                hasActiveFilters = true;
-                break;
-            }
-        }
-    }
-
-    auto collectVisibleSurfaces = [&](std::set<std::string>& out) {
-        if (!_ui.treeWidget) {
-            return;
-        }
-        QTreeWidgetItemIterator visIt(_ui.treeWidget);
-        while (*visIt) {
-            auto* item = *visIt;
-            const auto idStr = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
-            std::string id = idStr.toStdString();
-            if (!id.empty() && !item->isHidden()) {
-                // Only use already-loaded surfaces; never trigger TIFF I/O from filters.
-                auto surf = getSurfaceById(id);
-                if (surf &&
-                    !vc3d::opendata::isOpenDataSegmentPlaceholder(
-                        surf->path)) {
-                    out.insert(id);
-                    if (_state && !_state->surface(id)) {
-                        _state->setSurface(id, surf, true, false);
-                    }
-                }
-            }
-            ++visIt;
-        }
-        for (const auto& id : _multiFolderSurfaceIds) {
-            auto surf = getSurfaceById(id);
-            if (surf &&
-                !vc3d::opendata::isOpenDataSegmentPlaceholder(surf->path)) {
-                out.insert(id);
-            }
-        }
-    };
-
-    if (!hasActiveFilters) {
-        QTreeWidgetItemIterator it(_ui.treeWidget);
-        while (*it) {
-            (*it)->setHidden(false);
-            ++it;
-        }
-
-        std::set<std::string> intersects = {"segmentation"};
-        collectVisibleSurfaces(intersects);
-
-        if (_viewerManager) {
-            _viewerManager->forEachBaseViewer([&intersects](VolumeViewerBase* viewer) {
-                if (viewer && viewer->surfName() != "segmentation") {
-                    viewer->setIntersects(intersects);
-                }
-            });
-        }
-
-        emit filtersApplied(0);
-        return;
-    }
-
-    std::set<std::string> intersects = {"segmentation"};
-    POI* poi = _state ? _state->poi("focus") : nullptr;
-    int filterCounter = 0;
+    const double zLowerBound = _filters.zLowerBound ? _filters.zLowerBound->value() : kZRangeFilterLowerDefault;
+    const double zUpperBound = _filters.zUpperBound ? _filters.zUpperBound->value() : kZRangeFilterUpperDefault;
     const bool currentOnly = isChecked(_filters.currentOnly);
-    const bool focusPointFilter = isChecked(_filters.focusPoints) && poi;
-    const double focusPointFilterRadius = _filters.focusPointDistance
-        ? _filters.focusPointDistance->value()
-        : kFocusPointFilterRadius;
-    const double zLowerBound = _filters.zLowerBound
-        ? _filters.zLowerBound->value()
-        : kZRangeFilterLowerDefault;
-    const double zUpperBound = _filters.zUpperBound
-        ? _filters.zUpperBound->value()
-        : kZRangeFilterUpperDefault;
-    std::unordered_set<QuadSurface*> focusPointSurfaces;
-    if (focusPointFilter) {
-        if (auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr) {
-            SurfacePatchIndex::PointQuery query;
-            query.worldPoint = poi->p;
-            query.tolerance = static_cast<float>(focusPointFilterRadius);
-            for (const auto& hit : patchIndex->locateAll(query)) {
-                if (hit.surface) {
-                    focusPointSurfaces.insert(hit.surface.get());
-                }
-            }
-        }
+    const bool focusFilter = isChecked(_filters.focusPoints);
+    const bool pointSetFilter = !checkedNames(_filters.pointSet).empty();
+    const bool pointSetAny = !_filters.pointSetMode || _filters.pointSetMode->currentIndex() == 0;
+    std::set<std::string> recordTags;
+    for (const auto& name : checkedNames(_recordTagFilter)) {
+        recordTags.insert(name.toStdString());
     }
 
+    int filterCounter = 0;
+    std::vector<std::string> visible;
     QTreeWidgetItemIterator it(_ui.treeWidget);
     while (*it) {
         auto* item = *it;
-        std::string id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
-
-        bool show = true;
-        // Only use already-loaded surfaces; never trigger TIFF I/O from filters.
-        auto surf = getSurfaceById(id);
-
-        if (hasSurfaceIdFilter && !id.empty()) {
-            const bool idMatches =
-                QString::fromStdString(id).contains(surfaceIdFilterText, Qt::CaseInsensitive) ||
-                item->text(SURFACE_ID_COLUMN).contains(
-                    surfaceIdFilterText, Qt::CaseInsensitive);
-            const bool longIdMatches =
-                item->text(SURFACE_LONG_ID_COLUMN).contains(surfaceIdFilterText, Qt::CaseInsensitive);
-            show = show && (idMatches || longIdMatches);
+        ++it;
+        const std::string id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
+        const auto* row = _catalog->row(id);
+        bool show = row != nullptr;
+        if (show && !idFilter.isEmpty()) {
+            show = QString::fromStdString(id).contains(idFilter, Qt::CaseInsensitive) ||
+                   item->text(SURFACE_ID_COLUMN).contains(idFilter, Qt::CaseInsensitive) ||
+                   item->text(SURFACE_LONG_ID_COLUMN).contains(idFilter, Qt::CaseInsensitive);
         }
-
-        if (focusPointFilter) {
-            show = show && surf && focusPointSurfaces.find(surf.get()) != focusPointSurfaces.end();
+        if (show && !recordTags.empty()) {
+            show = std::any_of(row->record.tags.begin(), row->record.tags.end(),
+                               [&](const std::string& tag) { return recordTags.contains(tag); });
         }
-
-        if (hasZRangeFilter && !surf) {
-            show = false;
+        if (show && focusFilter) {
+            // Until the store answers, the focus filter shows nothing rather than everything.
+            show = _focusAnswer && !_focusAnswer->any.empty() && _focusAnswer->any.front().contains(id);
         }
-
-        if (surf) {
-            if (hasZRangeFilter) {
-                const auto bbox = surf->bbox();
-                show = show && bbox.low[0] != -1.0f &&
-                       bbox.low[2] <= zUpperBound &&
-                       bbox.high[2] >= zLowerBound;
+        if (show && pointSetFilter) {
+            show = _pointSetAnswer && !_pointSetAnswer->any.empty();
+            if (show) {
+                const auto& sets = pointSetAny ? _pointSetAnswer->any : _pointSetAnswer->all;
+                show = pointSetAny ? std::any_of(sets.begin(), sets.end(), [&](const auto& set) { return set.contains(id); })
+                                   : std::all_of(sets.begin(), sets.end(), [&](const auto& set) { return set.contains(id); });
             }
-
-            if (model) {
-                bool anyChecked = false;
-                bool anyMatches = false;
-                bool allMatch = true;
-                for (int row = 0; row < model->rowCount(); ++row) {
-                    if (model->data(model->index(row, 0), Qt::CheckStateRole) == Qt::Checked) {
-                        anyChecked = true;
-                        const auto collectionName = model->data(model->index(row, 0), Qt::DisplayRole).toString().toStdString();
-                        std::vector<cv::Vec3f> points;
-                        if (_pointCollection) {
-                            auto collection = _pointCollection->getPoints(collectionName);
-                            points.reserve(collection.size());
-                            for (const auto& p : collection) {
-                                points.push_back(p.p);
-                            }
-                        }
-                        if (allMatch && !contains(*surf, points)) {
-                            allMatch = false;
-                        }
-                        if (!anyMatches && contains_any(*surf, points)) {
-                            anyMatches = true;
-                        }
-                    }
-                }
-
-                if (anyChecked) {
-                    if (_filters.pointSetMode && _filters.pointSetMode->currentIndex() == 0) {
-                        show = show && anyMatches;
-                    } else {
-                        show = show && allMatch;
-                    }
-                }
-            }
-
-            if (isChecked(_filters.unreviewed)) {
-                if (!surf->meta.is_null()) {
-                    const auto tags = vc::json::tags_or_empty(surf->meta);
-                    show = show && !tags.contains("reviewed");
-                }
-            }
-
-            if (isChecked(_filters.noExpansion)) {
-                if (!surf->meta.is_null()) {
-                    const auto mode = vc::json::string_or(surf->meta, "vc_gsfs_mode", std::string{});
-                    show = show && (mode != "expansion");
-                }
-            }
-
-            if (isChecked(_filters.noDefective)) {
-                if (!surf->meta.is_null()) {
-                    const auto tags = vc::json::tags_or_empty(surf->meta);
-                    show = show && !tags.contains("defective");
-                }
-            }
-
-            if (isChecked(_filters.partialReview)) {
-                if (!surf->meta.is_null()) {
-                    const auto tags = vc::json::tags_or_empty(surf->meta);
-                    const bool hasPartialReview = tags.contains("partial_review") || tags.contains("reviewed");
-                    show = show && !hasPartialReview;
-                }
-            }
-
-            if (isChecked(_filters.showPartialReview)) {
-                if (!surf->meta.is_null()) {
-                    const auto tags = vc::json::tags_or_empty(surf->meta);
-                    const bool hasPartialReview = tags.contains("partial_review") || tags.contains("reviewed");
-                    show = show && hasPartialReview;
-                } else {
-                    show = false;
-                }
-            }
-
-            if (isChecked(_filters.hideUnapproved)) {
-                if (!surf->meta.is_null()) {
-                    const auto tags = vc::json::tags_or_empty(surf->meta);
-                    show = show && tags.contains("approved");
-                } else {
-                    show = false;
-                }
-            }
-
-            if (isChecked(_filters.inspectOnly)) {
-                if (!surf->meta.is_null()) {
-                    const auto tags = vc::json::tags_or_empty(surf->meta);
-                    show = show && tags.contains("inspect");
-                } else {
-                    show = false;
-                }
-            }
+        }
+        if (show && hasZRangeFilter) {
+            const auto& bbox = row->record.surface ? row->record.surface->bbox : std::nullopt;
+            show = bbox && row->toVolume &&
+                   (*bbox)[2] * *row->toVolume <= zUpperBound && (*bbox)[5] * *row->toVolume >= zLowerBound;
+        }
+        if (show && isChecked(_filters.unreviewed)) {
+            show = !has_tag(*row, "reviewed");
+        }
+        if (show && isChecked(_filters.noExpansion)) {
+            show = string_or(row_meta(*row), "vc_gsfs_mode") != "expansion";
+        }
+        if (show && isChecked(_filters.noDefective)) {
+            show = !has_tag(*row, "defective");
+        }
+        if (show && isChecked(_filters.partialReview)) {
+            show = !has_tag(*row, "partial_review") && !has_tag(*row, "reviewed");
+        }
+        if (show && isChecked(_filters.showPartialReview)) {
+            show = has_tag(*row, "partial_review") || has_tag(*row, "reviewed");
+        }
+        if (show && isChecked(_filters.hideUnapproved)) {
+            show = has_tag(*row, "approved");
+        }
+        if (show && isChecked(_filters.inspectOnly)) {
+            show = has_tag(*row, "inspect");
         }
 
         item->setHidden(!show);
-
         if (!show) {
-            filterCounter++;
+            ++filterCounter;
+        } else if (row->toVolume && (!currentOnly || id == _currentSurfaceId)) {
+            visible.push_back(id);
         }
-
-        ++it;
     }
 
-    intersects.clear();
-    intersects.insert("segmentation");
-    if (currentOnly) {
-        // Limit the current segmentation folder to the selected segment while
-        // preserving checked comparison folders.
-        if (!_currentSurfaceId.empty() && getSurfaceById(_currentSurfaceId)) {
-            intersects.insert(_currentSurfaceId);
-        }
-        for (const auto& id : _multiFolderSurfaceIds) {
-            if (getSurfaceById(id)) {
-                intersects.insert(id);
-            }
-        }
-    } else {
-        collectVisibleSurfaces(intersects);
+    std::sort(visible.begin(), visible.end());
+    if (visible != _visibleSurfaceIds) {
+        _visibleSurfaceIds = std::move(visible);
+        emit visibleSurfacesChanged(_visibleSurfaceIds);
     }
 
     if (_viewerManager) {
+        const std::set<std::string> intersects{"segmentation"};
         _viewerManager->forEachBaseViewer([&intersects](VolumeViewerBase* viewer) {
             if (viewer && viewer->surfName() != "segmentation") {
                 viewer->setIntersects(intersects);
@@ -2832,122 +1691,36 @@ void SurfacePanelController::applyFiltersInternal()
     emit filtersApplied(filterCounter);
 }
 
-void SurfacePanelController::updateTagCheckboxStatesForSurface(QuadSurface* surface)
+void SurfacePanelController::updateTagCheckboxStates(const SurfaceCatalog::Row* row)
 {
-    auto resetState = [](QCheckBox* box) {
-        if (!box) {
-            return;
+    for (auto* box : {_tags.approved, _tags.defective, _tags.reviewed, _tags.inspect}) {
+        if (box) {
+            const QSignalBlocker blocker{box};
+            box->setCheckState(Qt::Unchecked);
         }
-        const QSignalBlocker blocker{box};
-        box->setCheckState(Qt::Unchecked);
-    };
-
-    resetState(_tags.approved);
-    resetState(_tags.defective);
-    resetState(_tags.reviewed);
-    resetState(_tags.inspect);
-
-    if (!surface) {
-        setTagCheckboxEnabled(false, false, false, false);
-        updateTagSummary();
-        return;
     }
 
-    setTagCheckboxEnabled(true, true, true, true);
-
-    if (surface->meta.is_null()) {
-        setTagCheckboxEnabled(false, false, true, true);
-        updateTagSummary();
-        return;
+    const bool writable = _catalog && _catalog->attachment() && _catalog->session()->writable(*_catalog->attachment());
+    setTagCheckboxEnabled(row != nullptr && writable);
+    if (row) {
+        for (const auto& [box, name] : std::vector<std::pair<QCheckBox*, const char*>>{
+                 {_tags.approved, "approved"}, {_tags.defective, "defective"},
+                 {_tags.reviewed, "reviewed"}, {_tags.inspect, "inspect"}}) {
+            if (box && has_tag(*row, name)) {
+                const QSignalBlocker blocker{box};
+                box->setCheckState(Qt::Checked);
+            }
+        }
     }
-
-    const auto tags = vc::json::tags_or_empty(surface->meta);
-
-    auto applyTag = [&tags](QCheckBox* box, const char* name) {
-        if (!box) {
-            return;
-        }
-        const QSignalBlocker blocker{box};
-        if (tags.contains(name)) {
-            box->setCheckState(Qt::Checked);
-        }
-    };
-
-    applyTag(_tags.approved, "approved");
-    applyTag(_tags.defective, "defective");
-    applyTag(_tags.reviewed, "reviewed");
-    applyTag(_tags.inspect, "inspect");
     updateTagSummary();
 }
 
-void SurfacePanelController::setTagCheckboxEnabled(bool enabledApproved,
-                                                   bool enabledDefective,
-                                                   bool enabledReviewed,
-                                                   bool enabledInspect)
+void SurfacePanelController::setTagCheckboxEnabled(bool enabled)
 {
-    if (_tags.approved) {
-        _tags.approved->setEnabled(enabledApproved);
-    }
-    if (_tags.defective) {
-        _tags.defective->setEnabled(enabledDefective);
-    }
-    if (_tags.reviewed) {
-        _tags.reviewed->setEnabled(enabledReviewed);
-    }
-    if (_tags.inspect) {
-        _tags.inspect->setEnabled(enabledInspect);
-    }
-}
-
-void SurfacePanelController::logSurfaceLoadSummary() const
-{
-    if (!_volumePkg) {
-        std::cout << "[SurfacePanel] No volume package set; skipping surface load summary." << std::endl;
-        return;
-    }
-
-    const auto segIds = _volumePkg->segmentationIDs();
-    if (segIds.empty()) {
-        std::cout << "[SurfacePanel] No segmentation IDs available." << std::endl;
-        return;
-    }
-
-    size_t loadedCount = 0;
-    std::vector<std::string> missing;
-    missing.reserve(segIds.size());
-
-    for (const auto& id : segIds) {
-        bool hasSurface = false;
-        if (_state) {
-            if (_state->surface(id)) {
-                hasSurface = true;
-            }
-        } else {
-            hasSurface = static_cast<bool>(_volumePkg->getSurface(id));
+    for (auto* box : {_tags.approved, _tags.defective, _tags.reviewed, _tags.inspect}) {
+        if (box) {
+            box->setEnabled(enabled);
         }
-
-        if (hasSurface) {
-            ++loadedCount;
-        } else {
-            missing.push_back(id);
-        }
-    }
-
-    std::cout << "[SurfacePanel] Loaded " << loadedCount << " / " << segIds.size()
-              << " surfaces into memory." << std::endl;
-    if (!missing.empty()) {
-        const size_t previewCount = std::min<size_t>(missing.size(), 10);
-        std::cout << "[SurfacePanel] Missing (" << missing.size() << ") IDs: ";
-        for (size_t i = 0; i < previewCount; ++i) {
-            std::cout << missing[i];
-            if (i + 1 < previewCount) {
-                std::cout << ", ";
-            }
-        }
-        if (missing.size() > previewCount) {
-            std::cout << ", ...";
-        }
-        std::cout << std::endl;
     }
 }
 
@@ -2989,25 +1762,6 @@ std::vector<std::string> SurfacePanelController::highlightedSurfaceIds() const
     return std::vector<std::string>(_highlightedSurfaceIds.begin(), _highlightedSurfaceIds.end());
 }
 
-std::shared_ptr<QuadSurface> SurfacePanelController::getSurfaceById(const std::string& id) const
-{
-    // Multi-folder display IDs live only in CState. Prefer it so folder-qualified
-    // entries such as "paths/foo" resolve before falling back to VolumePkg.
-    if (_state) {
-        auto surf = _state->surface(id);
-        if (surf) {
-            return std::dynamic_pointer_cast<QuadSurface>(surf);
-        }
-    }
-    if (_volumePkg) {
-        auto surf = _volumePkg->getSurface(id);
-        if (surf) {
-            return surf;
-        }
-    }
-    return nullptr;
-}
-
 bool SurfacePanelController::cycleToNextVisibleSegment()
 {
     return cycleVisibleSegment(1);
@@ -3020,15 +1774,15 @@ bool SurfacePanelController::cycleToPreviousVisibleSegment()
 
 bool SurfacePanelController::cycleVisibleSegment(int direction)
 {
-    if (!_ui.treeWidget) {
+    if (!_ui.treeWidget || !_catalog) {
         return false;
     }
 
-    // Collect all visible (non-hidden) items in tree order
+    // Visible surfaces that open in this volume, in tree order.
     std::vector<QTreeWidgetItem*> visibleItems;
     QTreeWidgetItemIterator it(_ui.treeWidget);
     while (*it) {
-        if (!(*it)->isHidden()) {
+        if (!(*it)->isHidden() && !(*it)->data(SURFACE_ID_COLUMN, kUnboundRole).toBool()) {
             visibleItems.push_back(*it);
         }
         ++it;
@@ -3038,61 +1792,32 @@ bool SurfacePanelController::cycleVisibleSegment(int direction)
         return false;
     }
 
-    // Find current selection index
     int currentIndex = -1;
     const QList<QTreeWidgetItem*> selectedItems = _ui.treeWidget->selectedItems();
     if (!selectedItems.isEmpty()) {
-        QTreeWidgetItem* currentItem = selectedItems.first();
-        for (size_t i = 0; i < visibleItems.size(); ++i) {
-            if (visibleItems[i] == currentItem) {
-                currentIndex = static_cast<int>(i);
-                break;
-            }
+        const auto found = std::find(visibleItems.begin(), visibleItems.end(), selectedItems.first());
+        if (found != visibleItems.end()) {
+            currentIndex = int(found - visibleItems.begin());
         }
     }
 
-    // Calculate next index with wraparound
-    int nextIndex;
-    if (currentIndex < 0) {
-        nextIndex = (direction > 0) ? 0 : static_cast<int>(visibleItems.size()) - 1;
-    } else {
-        nextIndex = currentIndex + direction;
-        if (nextIndex < 0) {
-            nextIndex = static_cast<int>(visibleItems.size()) - 1;
-        } else if (nextIndex >= static_cast<int>(visibleItems.size())) {
-            nextIndex = 0;
-        }
-    }
-
+    const int count = int(visibleItems.size());
+    const int nextIndex = currentIndex < 0 ? (direction > 0 ? 0 : count - 1)
+                                           : ((currentIndex + direction) % count + count) % count;
     QTreeWidgetItem* nextItem = visibleItems[nextIndex];
 
-    // Block signals to prevent normal handleTreeSelectionChanged
-    const QSignalBlocker blocker{_ui.treeWidget};
-    _ui.treeWidget->clearSelection();
-    nextItem->setSelected(true);
-    _ui.treeWidget->scrollToItem(nextItem);
-
-    // Get surface and update state
-    const QString idQString = nextItem->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
-    const std::string id = idQString.toStdString();
-
-    std::shared_ptr<QuadSurface> surface = getSurfaceById(id);
-
-    if (surface && _state) {
-        if (!_state->surface(id)) {
-            _state->setSurface(id, surface, true, false);
-        }
+    {
+        // Blocked: activation below replaces handleTreeSelectionChanged.
+        const QSignalBlocker blocker{_ui.treeWidget};
+        _ui.treeWidget->clearSelection();
+        nextItem->setSelected(true);
+        _ui.treeWidget->scrollToItem(nextItem);
     }
 
-    _currentSurfaceId = id;
-    syncSelectionUi(id, surface.get());
-
-    if (_segmentationViewerProvider) {
-        if (auto* viewer = _segmentationViewerProvider()) {
-            viewer->setWindowTitle(surface ? tr("Surface %1").arg(idQString) : tr("Surface"));
-        }
-    }
-
-    emit surfaceActivatedPreserveEditing(idQString, surface.get());
+    activate(nextItem->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString(), true);
     return true;
 }
+
+#ifdef VC_TESTING
+#include "SurfacePanelStoreTest.inc"
+#endif

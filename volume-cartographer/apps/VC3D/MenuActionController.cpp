@@ -10,6 +10,7 @@
 #include "ProjectCreationDefaults.hpp"
 #include "OpenDataVolumePrefill.hpp"
 #include "CWindow.hpp"
+#include "SurfaceCatalog.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
 #include "WrapAnnotationWidget.hpp"
@@ -40,6 +41,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QClipboard>
+#include <QRegularExpression>
 #include <QFutureWatcher>
 #include <QInputDialog>
 #include <QtConcurrent>
@@ -219,10 +221,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     connect(_growTrackPatchesAct, &QAction::triggered,
             this, &MenuActionController::growTrackPatchesFromMenuRequested);
 
-    _materializeOpenDataFolderAct = new QAction(
-        QObject::tr("Create/Fetch All Segments for Current Folder"), this);
-    connect(_materializeOpenDataFolderAct, &QAction::triggered, this,
-            &MenuActionController::materializeCurrentOpenDataSegmentFolder);
 
     // Build menus
     _fileMenu = new QMenu(QObject::tr("&File"), qWindow);
@@ -299,7 +297,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _actionsMenu = new QMenu(QObject::tr("&Actions"), qWindow);
     _actionsMenu->addAction(_drawBBoxAct);
     _actionsMenu->addSeparator();
-    _actionsMenu->addAction(_materializeOpenDataFolderAct);
     _actionsMenu->addSeparator();
     _actionsMenu->addAction(_mergeTifxyzAct);
     _actionsMenu->addAction(_mergePatchAct);
@@ -557,7 +554,7 @@ void MenuActionController::showOpenDataCatalog()
         try {
             const auto result = vc3d::opendata::attachOpenDataSampleVolumes(
                 *_window->_state->vpkg(), sample, &selection);
-            _window->refreshCurrentVolumePackageUi(QString(), true);
+            _window->refreshCurrentVolumePackageUi();
             if (result.failedVolumes) {
                 QStringList messages;
                 for (const auto& message : result.messages)
@@ -583,7 +580,7 @@ void MenuActionController::showOpenDataCatalog()
                 QMessageBox::warning(_window, tr("Attach failed"), tr("Could not attach normal grids."));
                 return;
             }
-            _window->refreshCurrentVolumePackageUi(QString(), true);
+            _window->refreshCurrentVolumePackageUi();
         } catch (const std::exception& e) {
             QMessageBox::warning(_window, tr("Attach failed"), QString::fromUtf8(e.what()));
         }
@@ -1064,8 +1061,7 @@ void MenuActionController::finishOpenDataSampleOpen(OpenDataOpenTaskResult task,
 
     if (_window) {
         _window->refreshCurrentVolumePackageUi(
-            QString::fromStdString(result.preferredVolumeId),
-            true);
+            QString::fromStdString(result.preferredVolumeId));
         _window->UpdateView();
     }
     startOpenDataVolumePrefill(
@@ -1389,7 +1385,7 @@ void MenuActionController::showSettingsDialog()
         _window);
     dialog->exec();
     if (dialog->outputSegmentsChanged()) {
-        _window->refreshCurrentVolumePackageUi(QString(), true);
+        _window->refreshCurrentVolumePackageUi();
     }
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
@@ -1558,7 +1554,7 @@ void MenuActionController::toggleCursorMirroring(bool enabled)
 
 void MenuActionController::surfaceFromSelection()
 {
-    if (!_window || !_window->_viewerManager || !_window->_state->vpkg()) {
+    if (!_window || !_window->_viewerManager || !_window->_surfacePanel || !_window->_surfaceCatalog) {
         return;
     }
 
@@ -1575,14 +1571,14 @@ void MenuActionController::surfaceFromSelection()
         return;
     }
 
-    if (_window->_state->activeSurfaceId().empty() || !_window->_state->vpkg()->getSurface(_window->_state->activeSurfaceId())) {
+    const auto& opened = _window->_surfacePanel->opened();
+    if (!opened || opened->surface->id != _window->_state->activeSurfaceId()) {
         _window->showStatusBarMessage(QObject::tr("Select a segmentation first"), 3000);
         return;
     }
-
-    auto surf = _window->_state->vpkg()->getSurface(_window->_state->activeSurfaceId());
-    std::filesystem::path baseSegPath = surf->path;
-    std::filesystem::path parentDir = baseSegPath.parent_path();
+    const auto sourceUuid = opened->surface->id;
+    const auto* row = _window->_surfaceCatalog->row(sourceUuid);
+    const std::string sourceName = row && !row->record.name.empty() ? row->record.name : sourceUuid;
 
     int idx = 1;
     int created = 0;
@@ -1594,27 +1590,22 @@ void MenuActionController::surfaceFromSelection()
             continue;
         }
 
-        std::string newId = _window->_state->activeSurfaceId() + std::string("_sel_") + ts.toStdString() + std::string("_") + std::to_string(idx++);
-        std::filesystem::path outDir = parentDir / newId;
+        const std::string name = sourceName + "_sel_" + ts.toStdString() + "_" + std::to_string(idx++);
+        const nlohmann::json provenance{
+            {"tool", "vc3d-surface-from-selection"},
+            {"parameters", {{"scene_rect", {rect.x(), rect.y(), rect.width(), rect.height()}}}},
+            {"sources", {sourceUuid}}};
         try {
-            filtered->saveAsNew(outDir);
+            _window->_surfaceCatalog->create(*filtered, name, provenance);
             created++;
         } catch (const std::exception& e) {
             _window->showStatusBarMessage(QObject::tr("Failed to save selection: ") + e.what(), 5000);
         }
     }
 
-    if (created > 0) {
-        if (_window->_surfacePanel) {
-            _window->_surfacePanel->reloadSurfacesFromDisk();
-        }
-        _window->showStatusBarMessage(QObject::tr("Created %1 surface(s) from selection").arg(created), 5000);
-    } else {
-        if (_window->_surfacePanel) {
-            _window->_surfacePanel->refreshFiltersOnly();
-        }
-        _window->showStatusBarMessage(QObject::tr("No surfaces created from selection"), 3000);
-    }
+    _window->showStatusBarMessage(created > 0
+        ? QObject::tr("Created %1 surface(s) from selection").arg(created)
+        : QObject::tr("No surfaces created from selection"), created > 0 ? 5000 : 3000);
 }
 
 void MenuActionController::clearSelection()
@@ -1635,8 +1626,9 @@ void MenuActionController::clearSelection()
 
 void MenuActionController::importObjAsPatch()
 {
-    if (!_window || !_window->_state->vpkg()) {
-        QMessageBox::warning(_window, QObject::tr("Error"), QObject::tr("No volume package loaded."));
+    auto* catalog = _window ? _window->_surfaceCatalog.get() : nullptr;
+    if (!catalog || !catalog->attachment() || !catalog->volume()) {
+        QMessageBox::warning(_window, QObject::tr("Error"), QObject::tr("Attach an object store and open a volume first."));
         return;
     }
 
@@ -1650,37 +1642,24 @@ void MenuActionController::importObjAsPatch()
         return;
     }
 
-    const auto outDir = _window->_state->vpkg()->outputSegmentsPath();
-    if (outDir.empty()) {
-        QMessageBox::warning(_window, QObject::tr("Error"),
-                             QObject::tr("Project has no output segments directory configured."));
-        return;
-    }
-    QString pathsDir = QString::fromStdString(outDir.string());
+    std::filesystem::path store;
+    catalog->session()->read(*catalog->attachment(), [&](const auto& db, const auto&, const auto&) { store = db.path(); });
 
     QStringList successfulIds;
     QStringList failedFiles;
 
     for (const QString& objFile : objFiles) {
         QFileInfo fileInfo(objFile);
-        QString baseName = fileInfo.completeBaseName();
-        QString outputDir = pathsDir + "/" + baseName;
-
-        if (QDir(outputDir).exists()) {
-            if (QMessageBox::question(_window, QObject::tr("Overwrite?"),
-                                      QObject::tr("'%1' exists. Overwrite?").arg(baseName),
-                                      QMessageBox::Yes | QMessageBox::No) == QMessageBox::No) {
-                continue;
-            }
-        }
 
         QProcess process;
         process.setProcessChannelMode(QProcess::MergedChannels);
 
+        // The new surface is bound to the current volume at its voxel scale.
         QStringList args;
-        args << objFile << outputDir;
-        args << QString::number(1000.0f)
-             << QString::number(1.0f)
+        args << objFile
+             << QStringLiteral("--store=%1").arg(QString::fromStdString(store.string()))
+             << QStringLiteral("--name=%1").arg(fileInfo.completeBaseName())
+             << QStringLiteral("--volume-uuid=%1").arg(QString::fromStdString(catalog->volume()->id()))
              << QString::number(20);
 
         QString toolPath = QCoreApplication::applicationDirPath() + "/vc_obj2tifxyz_legacy";
@@ -1693,17 +1672,13 @@ void MenuActionController::importObjAsPatch()
 
         process.waitForFinished(-1);
 
-        if (process.exitCode() == 0 && process.exitStatus() == QProcess::NormalExit) {
-            successfulIds.append(baseName);
+        const QString output = QString::fromUtf8(process.readAll());
+        const auto match = QRegularExpression(QStringLiteral("surface_uuid:\\s*(\\S+)")).match(output);
+        if (process.exitCode() == 0 && process.exitStatus() == QProcess::NormalExit && match.hasMatch()) {
+            successfulIds.append(match.captured(1));
         } else {
             failedFiles.append(fileInfo.fileName());
         }
-    }
-
-    if (!successfulIds.isEmpty() && _window->_surfacePanel) {
-        _window->_surfacePanel->reloadSurfacesFromDisk();
-    } else if (_window->_surfacePanel) {
-        _window->_surfacePanel->refreshFiltersOnly();
     }
 
     QString message = QObject::tr("Imported: %1\nFailed: %2").arg(successfulIds.size()).arg(failedFiles.size());
@@ -1742,14 +1717,6 @@ void MenuActionController::beginRotateSurfaceTransform()
     if (_window->statusBar()) {
         _window->showStatusBarMessage(QObject::tr("Surface rotation active"), 3000);
     }
-}
-
-void MenuActionController::materializeCurrentOpenDataSegmentFolder()
-{
-    if (!_window || !_window->_surfacePanel) {
-        return;
-    }
-    _window->_surfacePanel->materializeCurrentOpenDataFolder();
 }
 
 void MenuActionController::newProject()
@@ -1891,7 +1858,7 @@ void MenuActionController::attachVolume()
         QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Could not add volume (already attached?)"));
         return;
     }
-    _window->refreshCurrentVolumePackageUi(QString(), true);
+    _window->refreshCurrentVolumePackageUi();
 }
 
 void MenuActionController::attachSegments()
@@ -1918,7 +1885,7 @@ void MenuActionController::attachSegments()
         return;
     }
     if (!pkg->hasOutputSegments()) pkg->setOutputSegments(loc.toStdString());
-    _window->refreshCurrentVolumePackageUi(QString(), true);
+    _window->refreshCurrentVolumePackageUi();
 }
 
 void MenuActionController::attachNormalGrid()
@@ -1943,7 +1910,7 @@ void MenuActionController::attachNormalGrid()
         QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Could not add normal grid (already attached?)"));
         return;
     }
-    _window->refreshCurrentVolumePackageUi(QString(), true);
+    _window->refreshCurrentVolumePackageUi();
 }
 
 void MenuActionController::attachUmbilicus()
@@ -2182,7 +2149,7 @@ void MenuActionController::beginLasagnaManifestAttachment(bool remote, const QSt
                 QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QObject::tr("A Lasagna volume conflicts with an existing volume id."));
                 return;
             }
-            _window->refreshCurrentVolumePackageUi(QString(), true);
+            _window->refreshCurrentVolumePackageUi();
         } catch (const std::exception& error) {
             QMessageBox::warning(_window, QObject::tr("Attach Lasagna failed"), QString::fromUtf8(error.what()));
         }
@@ -2263,7 +2230,7 @@ void MenuActionController::detachEntry()
             QObject::tr("Could not remove entry (not found)."));
         return;
     }
-    _window->refreshCurrentVolumePackageUi(QString(), true);
+    _window->refreshCurrentVolumePackageUi();
 }
 
 void MenuActionController::setOutputSegments()
@@ -2292,7 +2259,7 @@ void MenuActionController::setOutputSegments()
         QObject::tr("Where new segments will land:"), items, currentIdx, false, &ok);
     if (!ok || chosen.isEmpty()) return;
     pkg->setOutputSegments(chosen.toStdString());
-    _window->refreshCurrentVolumePackageUi(QString(), true);
+    _window->refreshCurrentVolumePackageUi();
 }
 
 bool MenuActionController::runLegacyVolpkgConvert(const QString& inputLocation, QString* convertedOut)

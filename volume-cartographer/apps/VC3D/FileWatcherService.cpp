@@ -3,10 +3,6 @@
 #ifdef __linux__
 
 #include "CState.hpp"
-#include "SurfacePanelController.hpp"
-#include "segmentation/SegmentationModule.hpp"
-#include "SurfaceTreeWidget.hpp"
-#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "VCSettings.hpp"
@@ -15,11 +11,10 @@
 #include <cerrno>
 #include <cstring>
 #include <iostream>
+#include <chrono>
 #include <filesystem>
 #include <QTimer>
 #include <QSettings>
-#include <QSignalBlocker>
-#include <QTreeWidgetItemIterator>
 
 FileWatcherService::FileWatcherService(CState* state, QObject* parent)
     : QObject(parent)
@@ -57,26 +52,7 @@ void FileWatcherService::startWatching()
         return;
     }
 
-    for (const auto& dirPath : _state->vpkg()->availableSegmentPaths()) {
-        if (!std::filesystem::exists(dirPath)) {
-            Logger()->debug("Directory {} does not exist, skipping watch", dirPath.string());
-            continue;
-        }
-
-        int wd = inotify_add_watch(_inotifyFd, dirPath.c_str(),
-                                  IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_ONLYDIR);
-
-        if (wd < 0) {
-            Logger()->error("Failed to add inotify watch for {}: {}", dirPath.string(), strerror(errno));
-            continue;
-        }
-
-        const auto dirName = dirPath.filename().string();
-        _watchDescriptors[wd] = WatchDescriptorInfo{dirName, false};
-        Logger()->info("Started inotify watch for {} (wd={})", dirPath.string(), wd);
-    }
-
-    // Watch volumes directory for live updates
+    // Watch the volumes directory for live updates
     {
         std::filesystem::path volumesDir = std::filesystem::path(_state->vpkg()->getVolpkgDirectory()) / "volumes";
         if (std::filesystem::exists(volumesDir)) {
@@ -85,7 +61,7 @@ void FileWatcherService::startWatching()
             if (wd < 0) {
                 Logger()->error("Failed to add inotify watch for volumes directory: {}", strerror(errno));
             } else {
-                _watchDescriptors[wd] = WatchDescriptorInfo{"volumes", true};
+                _watchDescriptors.insert(wd);
                 Logger()->info("Started inotify watch for volumes directory (wd={})", wd);
             }
         } else {
@@ -111,7 +87,7 @@ void FileWatcherService::stopWatching()
 
     if (_inotifyFd >= 0) {
         // Remove all watches
-        for (const auto& [wd, info] : _watchDescriptors) {
+        for (const int wd : _watchDescriptors) {
             inotify_rm_watch(_inotifyFd, wd);
         }
         _watchDescriptors.clear();
@@ -156,68 +132,23 @@ void FileWatcherService::onInotifyEvent()
                 continue;
             }
 
-            // Find the directory name for this watch descriptor
-            auto it = _watchDescriptors.find(event->wd);
-            if (it != _watchDescriptors.end()) {
-                const auto& watchInfo = it->second;
-                std::string dirName = watchInfo.isVolumeWatch ? "volumes" : watchInfo.dirName;
-                const auto resourceDomain = watchInfo.isVolumeWatch ? InotifyEvent::Volume : InotifyEvent::Segment;
-
-                // Handle different event types
+            if (_watchDescriptors.contains(event->wd)) {
                 if (event->mask & IN_CREATE) {
-                    // New segment created
-                    InotifyEvent evt;
-                    evt.type = InotifyEvent::Addition;
-                    evt.resourceDomain = resourceDomain;
-                    evt.dirName = dirName;
-                    evt.segmentId = fileName;
-                    _pendingEvents.push_back(evt);
-
+                    _pendingEvents.push_back({InotifyEvent::Addition, fileName, {}});
                 } else if (event->mask & IN_DELETE) {
-                    // Segment deleted
-                    InotifyEvent evt;
-                    evt.type = InotifyEvent::Removal;
-                    evt.resourceDomain = resourceDomain;
-                    evt.dirName = dirName;
-                    evt.segmentId = fileName;
-                    _pendingEvents.push_back(evt);
-
+                    _pendingEvents.push_back({InotifyEvent::Removal, fileName, {}});
                 } else if (event->mask & IN_MOVED_FROM) {
-                    // First part of move/rename - store with cookie
-                    _pendingMoves[event->cookie] = PendingMoveInfo{watchInfo.dirName, fileName, watchInfo.isVolumeWatch};
-
+                    // First part of a rename: wait for its MOVED_TO pair
+                    _pendingMoves[event->cookie] = fileName;
                 } else if (event->mask & IN_MOVED_TO) {
-                    // Second part of move/rename
                     auto moveIt = _pendingMoves.find(event->cookie);
                     if (moveIt != _pendingMoves.end()) {
-                        // This is a rename within watched directories
-                        auto oldMove = moveIt->second;
+                        _pendingEvents.push_back({InotifyEvent::Rename, moveIt->second, fileName});
                         _pendingMoves.erase(moveIt);
-                        if (oldMove.isVolumeWatch == watchInfo.isVolumeWatch) {
-                            InotifyEvent evt;
-                            evt.type = InotifyEvent::Rename;
-                            evt.resourceDomain = resourceDomain;
-                            evt.dirName = dirName;
-                            evt.segmentId = oldMove.movedName;
-                            evt.newId = fileName;
-                            _pendingEvents.push_back(evt);
-                        } else {
-                            Logger()->debug("Ignoring cross-domain rename for cookie {} ({} -> {})",
-                                            event->cookie,
-                                            oldMove.isVolumeWatch ? "volumes" : "segment",
-                                            watchInfo.isVolumeWatch ? "volumes" : "segment");
-                        }
-
                     } else {
-                        // File moved from outside watched directory - treat as new addition
-                        InotifyEvent evt;
-                        evt.type = InotifyEvent::Addition;
-                        evt.resourceDomain = resourceDomain;
-                        evt.dirName = dirName;
-                        evt.segmentId = fileName;
-                        _pendingEvents.push_back(evt);
+                        // Moved in from outside the watched directory
+                        _pendingEvents.push_back({InotifyEvent::Addition, fileName, {}});
                     }
-
                 }
             }
         }
@@ -232,242 +163,16 @@ void FileWatcherService::onInotifyEvent()
 
         // Clean up orphaned moves every 5 seconds
         if (std::chrono::duration_cast<std::chrono::seconds>(now - lastCleanup).count() > 5) {
-            for (auto it = _pendingMoves.begin(); it != _pendingMoves.end(); ) {
-                auto oldMove = it->second;
-                {
-                    // Treat orphaned MOVED_FROM as deletions
-                    InotifyEvent evt;
-                    evt.type = InotifyEvent::Removal;
-                    evt.resourceDomain = oldMove.isVolumeWatch ? InotifyEvent::Volume : InotifyEvent::Segment;
-                    evt.dirName = oldMove.isVolumeWatch ? "volumes" : oldMove.dirName;
-                    evt.segmentId = oldMove.movedName;
-                    _pendingEvents.push_back(evt);
-                }
-
-                it = _pendingMoves.erase(it);
+            // Treat orphaned MOVED_FROM as deletions
+            for (const auto& [cookie, name] : _pendingMoves) {
+                _pendingEvents.push_back({InotifyEvent::Removal, name, {}});
             }
+            _pendingMoves.clear();
             lastCleanup = now;
         }
     }
 
     scheduleProcessing();
-}
-
-void FileWatcherService::processSegmentUpdate(const std::string& dirName, const std::string& segmentName)
-{
-    if (!_state->vpkg()) return;
-
-    Logger()->info("Processing update of {} in {}", segmentName, dirName);
-
-    bool isCurrentDir = (dirName == _state->vpkg()->getSegmentationDirectory());
-    if (!isCurrentDir) {
-        Logger()->debug("Update in non-current directory {}, skipping UI update", dirName);
-        return;
-    }
-
-    std::string segmentId = segmentName; // segment id = directory name
-
-    // Check if the segment exists
-    auto seg = _state->vpkg()->segmentation(segmentId);
-    if (!seg) {
-        Logger()->warn("Segment {} not found for update, treating as addition", segmentId);
-        processSegmentAddition(dirName, segmentName);
-        return;
-    }
-
-    // Skip reloads triggered right after editing sessions end
-    if (shouldSkipForSegment(segmentId, "reload")) {
-        return;
-    }
-
-    bool wasSelected = (_state->activeSurfaceId() == segmentId);
-
-    // Reload the segmentation
-    if (_state->vpkg()->reloadSingleSegmentation(segmentId)) {
-        try {
-            auto reloadedSurf = _state->vpkg()->loadSurface(segmentId);
-            if (reloadedSurf) {
-                if (_state) {
-                    _state->setSurface(segmentId, reloadedSurf, false, false);
-                }
-
-                if (_surfacePanel) {
-                    _surfacePanel->refreshSurfaceMetrics(segmentId);
-                }
-
-                emit statusMessage(tr("Updated: %1").arg(QString::fromStdString(segmentName)), 2000);
-
-                if (wasSelected) {
-                    _state->setActiveSurface(segmentId, reloadedSurf);
-
-                    if (_state) {
-                        _state->setSurface("segmentation", reloadedSurf, false, false);
-                    }
-
-                    if (_surfacePanel) {
-                        _surfacePanel->syncSelectionUi(segmentId, reloadedSurf.get());
-                    }
-                }
-            }
-        } catch (const std::exception& e) {
-            Logger()->error("Failed to reload segment {}: {}", segmentId, e.what());
-        }
-    }
-}
-
-void FileWatcherService::processSegmentRename(const std::string& dirName,
-                                              const std::string& oldDirName,
-                                              const std::string& newDirName)
-{
-    if (!_state->vpkg()) return;
-
-    Logger()->info("Processing rename in {}: {} -> {}", dirName, oldDirName, newDirName);
-
-    bool isCurrentDir = (dirName == _state->vpkg()->getSegmentationDirectory());
-
-    // The old UUID would have been the old directory name
-    std::string oldId = oldDirName;
-    std::string newId = newDirName;
-
-    // Check if the old segment exists
-    if (!_state->vpkg()->segmentation(oldId)) {
-        Logger()->warn("Old segment {} not found, treating as new addition", oldId);
-        processSegmentAddition(dirName, newDirName);
-        return;
-    }
-
-    // Remove the old entry
-    bool wasSelected = isCurrentDir && (_state->activeSurfaceId() == oldId);
-    _state->vpkg()->removeSingleSegmentation(oldId);
-
-    if (isCurrentDir && _surfacePanel) {
-        _surfacePanel->removeSingleSegmentation(oldId);
-    }
-
-    // Add with new name (which will read the meta.json and update the UUID)
-    std::string previousDir;
-    if (!isCurrentDir) {
-        previousDir = _state->vpkg()->getSegmentationDirectory();
-        _state->vpkg()->setSegmentationDirectory(dirName);
-    }
-
-    if (_state->vpkg()->addSingleSegmentation(newDirName)) {
-        // The UUID in meta.json will be updated when the segment is saved/loaded
-        try {
-            auto loadedSurf = _state->vpkg()->loadSurface(newId);
-
-            if (loadedSurf && isCurrentDir) {
-                _state->setSurface(newId, loadedSurf, true);
-                if (_surfacePanel) {
-                    _surfacePanel->addSingleSegmentation(newId);
-                }
-
-                emit statusMessage(tr("Renamed: %1 → %2")
-                                       .arg(QString::fromStdString(oldDirName),
-                                            QString::fromStdString(newDirName)), 3000);
-
-                // Reselect if it was selected
-                if (wasSelected) {
-                    auto surf = _state->surface(newId);
-                    _state->setActiveSurface(newId, std::dynamic_pointer_cast<QuadSurface>(surf));
-                    if (surf && _surfacePanel) {
-                        _surfacePanel->syncSelectionUi(newId, dynamic_cast<QuadSurface*>(surf.get()));
-                    }
-                }
-
-            }
-        } catch (const std::exception& e) {
-            Logger()->error("Failed to load renamed segment {}: {}", newId, e.what());
-        }
-    }
-
-    if (!isCurrentDir && !previousDir.empty()) {
-        _state->vpkg()->setSegmentationDirectory(previousDir);
-    }
-}
-
-void FileWatcherService::processSegmentAddition(const std::string& dirName, const std::string& segmentName)
-{
-    if (!_state->vpkg()) return;
-
-    Logger()->info("Processing addition of {} to {}", segmentName, dirName);
-
-    bool isCurrentDir = (dirName == _state->vpkg()->getSegmentationDirectory());
-
-    // The UUID will be the directory name (or will be updated to match)
-    std::string segmentId = segmentName;
-
-    // Skip addition if editing just stopped recently to avoid thrashing the active surface
-    if (shouldSkipForSegment(segmentId, "addition")) {
-        return;
-    }
-
-    // Switch directory if needed
-    std::string previousDir;
-    if (!isCurrentDir) {
-        previousDir = _state->vpkg()->getSegmentationDirectory();
-        _state->vpkg()->setSegmentationDirectory(dirName);
-    }
-
-    // Add the segment
-    if (_state->vpkg()->addSingleSegmentation(segmentName)) {
-        if (isCurrentDir) {
-            try {
-                auto loadedSurf = _state->vpkg()->loadSurface(segmentId);
-                if (loadedSurf) {
-                    _state->setSurface(segmentId, loadedSurf, true);
-                    if (_surfacePanel) {
-                        _surfacePanel->addSingleSegmentation(segmentId);
-                    }
-                    emit statusMessage(tr("Added: %1").arg(QString::fromStdString(segmentName)), 2000);
-                }
-            } catch (const std::exception& e) {
-                Logger()->error("Failed to load segment {}: {}", segmentId, e.what());
-            }
-        }
-    }
-
-    if (!isCurrentDir && !previousDir.empty()) {
-        _state->vpkg()->setSegmentationDirectory(previousDir);
-    }
-}
-
-void FileWatcherService::processSegmentRemoval(const std::string& dirName, const std::string& segmentName)
-{
-    if (!_state->vpkg()) return;
-
-    std::string segmentId = segmentName;
-
-    Logger()->info("Processing removal of {} from {}", segmentId, dirName);
-
-    // First check if this segment even exists and belongs to this directory
-    auto seg = _state->vpkg()->segmentation(segmentId);
-    if (!seg) {
-        Logger()->debug("Segment {} not found, ignoring removal event from {}", segmentId, dirName);
-        return;
-    }
-
-    // Verify the segment is actually in the directory that reported the removal
-    if (seg->path().parent_path().filename() != dirName) {
-        Logger()->warn("Removal event for {} from {}, but segment is actually in {}",
-                      segmentId, dirName, seg->path().parent_path().filename().string());
-        return;
-    }
-
-    bool isCurrentDir = (dirName == _state->vpkg()->getSegmentationDirectory());
-
-    // Skip removal if editing just ended or is still running
-    if (shouldSkipForSegment(segmentId, "removal")) {
-        return;
-    }
-
-    // Remove from VolumePkg
-    if (_state->vpkg()->removeSingleSegmentation(segmentId)) {
-        if (isCurrentDir && _surfacePanel) {
-            _surfacePanel->removeSingleSegmentation(segmentId);
-            emit statusMessage(tr("Removed: %1").arg(QString::fromStdString(segmentName)), 2000);
-        }
-    }
 }
 
 void FileWatcherService::processVolumeAddition(const std::string& volumeName)
@@ -543,225 +248,16 @@ void FileWatcherService::processVolumeRename(const std::string& oldVolumeName,
 
 void FileWatcherService::processPendingEvents()
 {
-    if (_pendingEvents.empty() && _pendingSegmentUpdates.empty()) {
-        return;
-    }
-
-    // Store current selection to restore later
-    std::string previousSelection = _state->activeSurfaceId();
-    auto previousSurface = _state->activeSurface().lock();
-
-    // Track if the previously selected segment gets removed
-    bool previousSelectionRemoved = false;
-
-    // Sort events to process removals first, then renames, then additions
-    std::vector<InotifyEvent> removals, renames, additions, updates;
-    std::vector<InotifyEvent> volumeRemovals, volumeRenames, volumeAdditions;
-    for (const auto& evt : _pendingEvents) {
-        switch (evt.type) {
-            case InotifyEvent::Removal:
-                if (evt.resourceDomain == InotifyEvent::Segment) {
-                    removals.push_back(evt);
-                } else {
-                    volumeRemovals.push_back(evt);
-                }
-                break;
-            case InotifyEvent::Rename:
-                if (evt.resourceDomain == InotifyEvent::Segment) {
-                    renames.push_back(evt);
-                } else {
-                    volumeRenames.push_back(evt);
-                }
-                break;
-            case InotifyEvent::Addition:
-                if (evt.resourceDomain == InotifyEvent::Segment) {
-                    additions.push_back(evt);
-                } else {
-                    volumeAdditions.push_back(evt);
-                }
-                break;
-            case InotifyEvent::Update:
-                if (evt.resourceDomain == InotifyEvent::Segment) {
-                    updates.push_back(evt);
-                }
-                break;
+    // Removals, then renames, then additions
+    for (const auto type : {InotifyEvent::Removal, InotifyEvent::Rename, InotifyEvent::Addition}) {
+        for (const auto& evt : _pendingEvents) {
+            if (evt.type != type) continue;
+            if (type == InotifyEvent::Removal) processVolumeRemoval(evt.name);
+            else if (type == InotifyEvent::Rename) processVolumeRename(evt.name, evt.newName);
+            else processVolumeAddition(evt.name);
         }
     }
-
-    if (!removals.empty() && !additions.empty()) {
-        using EventKey = std::pair<std::string, std::string>;
-        auto makeKey = [](const InotifyEvent& evt) -> EventKey {
-            return {evt.dirName, evt.segmentId};
-        };
-
-        std::map<EventKey, int> additionCounts;
-        for (const auto& addition : additions) {
-            additionCounts[makeKey(addition)]++;
-        }
-
-        std::map<EventKey, int> pairedCounts;
-        std::vector<InotifyEvent> filteredRemovals;
-        filteredRemovals.reserve(removals.size());
-
-        for (const auto& removal : removals) {
-            EventKey key = makeKey(removal);
-            auto availableIt = additionCounts.find(key);
-            const int available = (availableIt != additionCounts.end()) ? availableIt->second : 0;
-            auto existingPairIt = pairedCounts.find(key);
-            const int alreadyPaired = (existingPairIt != pairedCounts.end()) ? existingPairIt->second : 0;
-
-            if (available > alreadyPaired) {
-                pairedCounts[key] = alreadyPaired + 1;
-
-                InotifyEvent updateEvt;
-                updateEvt.type = InotifyEvent::Update;
-                updateEvt.resourceDomain = removal.resourceDomain;
-                updateEvt.dirName = removal.dirName;
-                updateEvt.segmentId = removal.segmentId;
-                updates.push_back(updateEvt);
-            } else {
-                filteredRemovals.push_back(removal);
-            }
-        }
-
-        std::vector<InotifyEvent> filteredAdditions;
-        filteredAdditions.reserve(additions.size());
-        for (const auto& addition : additions) {
-            EventKey key = makeKey(addition);
-            auto pairIt = pairedCounts.find(key);
-            if (pairIt != pairedCounts.end() && pairIt->second > 0) {
-                pairIt->second--;
-                continue;
-            }
-            filteredAdditions.push_back(addition);
-        }
-
-        removals.swap(filteredRemovals);
-        additions.swap(filteredAdditions);
-    }
-
-    for (const auto& evt : removals) {
-        if (evt.segmentId == previousSelection) {
-            previousSelectionRemoved = true;
-            break;
-        }
-    }
-
-    // Process in order: removals, renames, additions, updates
-    for (const auto& evt : removals) {
-        processSegmentRemoval(evt.dirName, evt.segmentId);
-    }
-
-    for (const auto& evt : renames) {
-        processSegmentRename(evt.dirName, evt.segmentId, evt.newId);
-    }
-
-    for (const auto& evt : additions) {
-        processSegmentAddition(evt.dirName, evt.segmentId);
-    }
-
-    for (const auto& evt : updates) {
-        processSegmentUpdate(evt.dirName, evt.segmentId);
-    }
-
-    for (const auto& evt : volumeRemovals) {
-        processVolumeRemoval(evt.segmentId);
-    }
-
-    for (const auto& evt : volumeRenames) {
-        processVolumeRename(evt.segmentId, evt.newId);
-    }
-
-    for (const auto& evt : volumeAdditions) {
-        processVolumeAddition(evt.segmentId);
-    }
-
-    // Process unique segment updates
-    for (const auto& [dirName, segmentId] : _pendingSegmentUpdates) {
-        processSegmentUpdate(dirName, segmentId);
-    }
-
-    // Clear the queues
     _pendingEvents.clear();
-    _pendingSegmentUpdates.clear();
-
-    // Restore selection if it still exists (might have been renamed or re-added)
-    if (!previousSelection.empty() && previousSelectionRemoved) {
-        // If editing is active for this segment, skip re-emitting the segmentation surface change
-        // because autosave-triggered inotify events were intentionally skipped.
-        bool skipRestoreForActiveEdit = false;
-        if (_segmentationModule && _segmentationModule->editingEnabled()) {
-            auto* activeBaseSurface = _segmentationModule->activeBaseSurface();
-            if (activeBaseSurface && activeBaseSurface->id == previousSelection) {
-                Logger()->info("Skipping selection restore of {} - currently being edited", previousSelection);
-                skipRestoreForActiveEdit = true;
-            }
-        }
-
-        if (!skipRestoreForActiveEdit) {
-            // Check if the segment was re-added in this batch
-            bool wasReAdded = false;
-            for (const auto& evt : additions) {
-                if (evt.segmentId == previousSelection) {
-                    wasReAdded = true;
-                    break;
-                }
-            }
-
-            if (wasReAdded) {
-                // The segment was removed and re-added - restore selection
-                auto seg = _state->vpkg() ? _state->vpkg()->segmentation(previousSelection) : nullptr;
-                if (seg) {
-                    auto surf = _state->vpkg()->getSurface(previousSelection);
-                    _state->setActiveSurface(previousSelection, surf);
-                    if (surf) {
-
-                        if (_state) {
-                            _state->setSurface("segmentation", surf, false, false);
-                        }
-
-                        if (_treeWidget) {
-                            QTreeWidgetItemIterator it(_treeWidget);
-                            while (*it) {
-                                if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == previousSelection) {
-                                    const QSignalBlocker blocker{_treeWidget};
-                                    _treeWidget->clearSelection();
-                                    (*it)->setSelected(true);
-                                    _treeWidget->scrollToItem(*it);
-                                    break;
-                                }
-                                ++it;
-                            }
-                        }
-
-                        if (_surfacePanel) {
-                            _surfacePanel->syncSelectionUi(previousSelection, surf.get());
-                        }
-
-                        // Window title update skipped - handled by caller
-                    }
-                }
-            }
-        }
-    } else if (!previousSelection.empty()) {
-        // Original logic for non-removed segments
-        auto seg = _state->vpkg() ? _state->vpkg()->segmentation(previousSelection) : nullptr;
-        if (seg) {
-            _state->setActiveSurface(previousSelection, std::dynamic_pointer_cast<QuadSurface>(previousSurface));
-
-            if (_surfacePanel) {
-                auto surface = _state->surface(previousSelection);
-                if (surface) {
-                    _surfacePanel->syncSelectionUi(previousSelection, dynamic_cast<QuadSurface*>(surface.get()));
-                }
-            }
-        }
-    }
-
-    // Refresh filters once at the end instead of multiple times
-    if (_surfacePanel) {
-        _surfacePanel->refreshFiltersOnly();
-    }
 }
 
 void FileWatcherService::scheduleProcessing()
@@ -779,95 +275,6 @@ void FileWatcherService::scheduleProcessing()
     _processTimer->start();
 }
 
-bool FileWatcherService::shouldSkipForSegment(const std::string& segmentId, const char* eventCategory)
-{
-    if (segmentId.empty()) {
-        return false;
-    }
-
-    const char* category = eventCategory ? eventCategory : "inotify event";
-
-    if (_segmentationModule && _segmentationModule->editingEnabled()) {
-        if (auto* activeBaseSurface = _segmentationModule->activeBaseSurface()) {
-            if (activeBaseSurface->id == segmentId) {
-                Logger()->info("Skipping {} for {} - currently being edited", category, segmentId);
-                return true;
-            }
-        }
-    }
-
-    // Also skip if approval mask editing is active for this segment
-    if (_segmentationModule && _segmentationModule->isEditingApprovalMask()) {
-        // Get the segment being used for approval mask (the active segmentation surface)
-        if (_state) {
-            auto segSurface = _state->surface("segmentation");
-            if (segSurface && segSurface->id == segmentId) {
-                Logger()->info("Skipping {} for {} - approval mask being edited", category, segmentId);
-                return true;
-            }
-        }
-    }
-
-    pruneExpiredRecentlyEdited();
-
-    if (_recentlyEditedSegments.empty()) {
-        return false;
-    }
-
-    auto it = _recentlyEditedSegments.find(segmentId);
-    if (it == _recentlyEditedSegments.end()) {
-        return false;
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    const auto elapsed = now - it->second;
-    const auto grace = std::chrono::seconds(RECENT_EDIT_GRACE_SECONDS);
-
-    if (elapsed < grace) {
-        const double elapsedSeconds =
-            std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() / 1000.0;
-        const double remainingSeconds = std::max(
-            0.0, static_cast<double>(RECENT_EDIT_GRACE_SECONDS) - elapsedSeconds);
-        Logger()->info("Skipping {} for {} - edits ended {:.1f}s ago ({}s grace remaining)",
-                       category,
-                       segmentId,
-                       elapsedSeconds,
-                       static_cast<int>(std::ceil(remainingSeconds)));
-        return true;
-    }
-
-    _recentlyEditedSegments.erase(it);
-    return false;
-}
-
-void FileWatcherService::markSegmentRecentlyEdited(const std::string& segmentId)
-{
-    if (segmentId.empty()) {
-        return;
-    }
-
-    pruneExpiredRecentlyEdited();
-    _recentlyEditedSegments[segmentId] = std::chrono::steady_clock::now();
-}
-
-void FileWatcherService::pruneExpiredRecentlyEdited()
-{
-    if (_recentlyEditedSegments.empty()) {
-        return;
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    const auto grace = std::chrono::seconds(RECENT_EDIT_GRACE_SECONDS);
-
-    for (auto it = _recentlyEditedSegments.begin(); it != _recentlyEditedSegments.end(); ) {
-        if (now - it->second >= grace) {
-            it = _recentlyEditedSegments.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
 #else // !__linux__
 
 // Stub implementations for non-Linux platforms (no inotify)
@@ -876,6 +283,5 @@ FileWatcherService::FileWatcherService(CState* state, QObject* parent)
 FileWatcherService::~FileWatcherService() = default;
 void FileWatcherService::startWatching() {}
 void FileWatcherService::stopWatching() {}
-void FileWatcherService::markSegmentRecentlyEdited(const std::string&) {}
 
 #endif // __linux__

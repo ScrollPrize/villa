@@ -23,6 +23,7 @@
 
 #include "CState.hpp"
 #include "CWindow.hpp"
+#include "SurfacePanelController.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
 
@@ -255,20 +256,17 @@ void RenderBenchReplay::run(CWindow& window)
         return;
     }
 
-    // 4. Activate the recorded segment (ensure it's loaded first).
+    // 4. Activate the recorded surface once the object store lists it.
     const std::string segId = _header.segmentId.toStdString();
     if (!segId.empty()) {
-        auto surf = vpkg->getSurface(segId);
-        if (!surf)
-            surf = vpkg->loadSurface(segId);
-        if (!surf) {
-            fail("segment not found in volpkg: " + _header.segmentId);
+        QString error;
+        const bool activated = waitForCondition([&] {
+            return window._surfacePanel && window._surfacePanel->activateSurfaceById(segId, &error);
+        }, kReadyTimeoutMs);
+        if (!activated) {
+            fail("surface not found in the object store: " + _header.segmentId + " (" + error + ")");
             return;
         }
-        window.onSurfaceActivated(_header.segmentId, surf.get());
-        // onSurfaceActivated marks the active surface; the segmentation viewer
-        // shows whatever is bound to the "segmentation" slot, so drive that too.
-        window._state->setSurface("segmentation", surf, false, false);
     }
 
     // 5. Wait for the surface to be set on the viewer.

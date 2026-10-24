@@ -115,20 +115,6 @@ void AgentBridgeServer::registerSessionHandlers()
 
     registerMethod(
         {
-            .name = QStringLiteral("segments.fetch"),
-            .params = {
-                Params::requiredString(QStringLiteral("segmentId")),
-            },
-            .errors = {-32602, -32000, -32010, -32004, -32007},
-            .mcp = mcp(
-                QStringLiteral("vc3d_fetch_segment"),
-                true,
-                {QStringLiteral("wait")}),
-        },
-        [this](const QJsonValue& p) { return handleSegmentsFetch(p); });
-
-    registerMethod(
-        {
             .name = QStringLiteral("segments.create_editable_copy"),
             .params = {
                 Params::requiredString(QStringLiteral("segmentId")),

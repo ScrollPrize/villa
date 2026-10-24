@@ -4,6 +4,7 @@
 // the store's commit events, and the materialization of the one surface being
 // viewed or edited. Surfaces are identified by their store UUID.
 #include <vc_object_store/objects/ObjectStoreSession.hpp>
+#include <nlohmann/json.hpp>
 #include <QObject>
 #include <QString>
 #include <atomic>
@@ -48,7 +49,9 @@ public:
     // Session events (CState::objectStoreChanged); other attachments are ignored.
     void handle(const vc::objects::StoreSessionEvent& event);
 
+    const std::shared_ptr<vc::objects::ObjectStoreSession>& session() const { return session_; }
     const std::optional<vc::objects::AttachmentIdentity>& attachment() const { return attachment_; }
+    const std::shared_ptr<Volume>& volume() const { return volume_; }
     const std::map<std::string, Row>& rows() const { return rows_; }
     const Row* row(const std::string& uuid) const;
     // A full listing is being read; rows() holds the previous one meanwhile.
@@ -63,6 +66,13 @@ public:
     void setTags(const std::string& uuid, const std::vector<std::string>& tags);
     void rename(const std::string& uuid, const std::string& name);
     void retire(const std::vector<std::string>& uuids);
+    // A new surface with the current record and geometry of `uuid`; returns its UUID.
+    std::string copy(const std::string& uuid, const std::string& name);
+    // A new surface holding `surface` (in the volume's voxels), bound to the
+    // volume; `provenance` records how it was made ({tool, parameters, sources}).
+    // Sets surface.id and returns the UUID.
+    std::string create(QuadSurface& surface, const std::string& name, const nlohmann::json& provenance,
+                       const std::vector<std::string>& tags = {});
 
 signals:
     // The row set or a row changed.

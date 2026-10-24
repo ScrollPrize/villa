@@ -1173,10 +1173,7 @@ private:
     bool materializeGeneratedViews(LineAnnotationSession& session,
                                    const std::string& surfacePrefix);
     void handleShowAsMesh(const std::string& surfaceName);
-    [[nodiscard]] std::filesystem::path resolveMeshExportPathsDir() const;
-    [[nodiscard]] std::filesystem::path nextMeshExportPath(const std::filesystem::path& pathsDir,
-                                                           const std::string& stem) const;
-    [[nodiscard]] std::vector<std::filesystem::path> saveGeneratedQuadMeshes(LineAnnotationSession& session);
+    [[nodiscard]] std::vector<std::string> saveGeneratedQuadMeshes(LineAnnotationSession& session);
     [[nodiscard]] PaneRecord* paneForSurface(const std::string& surfaceName);
     [[nodiscard]] const PaneRecord* paneForSurface(const std::string& surfaceName) const;
     [[nodiscard]] cv::Vec3f fiberBasePointFromViewer(

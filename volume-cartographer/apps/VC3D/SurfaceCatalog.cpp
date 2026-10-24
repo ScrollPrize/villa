@@ -1,8 +1,10 @@
 #include "SurfaceCatalog.hpp"
+#include "ObjectStoreCoordinates.hpp"
 #include "ObjectStoreRegions.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/Uuid.hpp>
 #include <nlohmann/json.hpp>
 
 namespace {
@@ -181,4 +183,26 @@ void SurfaceCatalog::retire(const std::vector<std::string>& uuids)
     session_->editKeepingRelationships(*attachment_, pins, {}, [&](auto& db, auto& txn, const auto&) {
         for (const auto& [uuid, revision] : pins) db.retireObject(txn, uuid);
     });
+}
+
+std::string SurfaceCatalog::copy(const std::string& uuid, const std::string& name)
+{
+    if (!attachment_) throw std::runtime_error("Attach an object store first");
+    const auto copied = session_->copyObject(*attachment_, *attachment_, uuid);
+    rename(copied, name);
+    return copied;
+}
+
+std::string SurfaceCatalog::create(QuadSurface& surface, const std::string& name, const nlohmann::json& provenance,
+                                   const std::vector<std::string>& tags)
+{
+    if (!attachment_ || !volume_) throw std::runtime_error("Attach an object store and open a volume first");
+    auto meta = vc3d::coordinateBindingForVolume(*volume_, 1);
+    meta["provenance"] = provenance;
+    const auto uuid = util::newUuid();
+    session_->act(*attachment_, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
+        create_quad_in_store(db, txn, uuid, surface, name, tags, meta.dump());
+    });
+    surface.id = uuid;
+    return uuid;
 }

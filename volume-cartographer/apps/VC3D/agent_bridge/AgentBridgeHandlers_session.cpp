@@ -26,6 +26,7 @@
 #include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataSegmentCache.hpp"
 #include "SegmentationCommandHandler.hpp"
+#include "SurfaceCatalog.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
 #include "WrapAnnotationWidget.hpp"
@@ -364,7 +365,7 @@ QJsonObject AgentBridgeServer::handleSegmentsAttach(const QJsonValue& params)
     }
     if (reloadSurfaces) {
         try {
-            _window->refreshCurrentVolumePackageUi(QString(), true);
+            _window->refreshCurrentVolumePackageUi();
         } catch (const std::exception& error) {
             Logger()->warn(
                 "Segment attachment committed, but the VC3D UI could not "
@@ -683,7 +684,7 @@ QJsonObject AgentBridgeServer::handleSegmentsCreateEditableCopy(const QJsonValue
     }
 
     try {
-        _window->refreshCurrentVolumePackageUi(QString(), true);
+        _window->refreshCurrentVolumePackageUi();
     } catch (const std::exception& error) {
         Logger()->warn(
             "Editable segment copy was committed, but the VC3D UI could not "
@@ -769,108 +770,6 @@ QJsonObject AgentBridgeServer::handleSegmentsCreateEditableCopy(const QJsonValue
     };
 }
 
-
-QJsonObject AgentBridgeServer::handleSegmentsFetch(const QJsonValue& params)
-{
-    CState* state = _window ? _window->_state : nullptr;
-    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
-    if (!state || !state->hasVpkg() || !vpkg)
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-
-    const QJsonObject p = params.toObject();
-    const QString segmentIdQ = p.value("segmentId").toString();
-    if (segmentIdQ.isEmpty()) {
-        QJsonObject data;
-        data["param"] = "segmentId";
-        throw AgentBridgeError{-32602, "segmentId is required", data};
-    }
-    const std::string segmentId = segmentIdQ.toStdString();
-
-    SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr;
-    if (!panel) {
-        QJsonObject data;
-        data["detail"] = "surface panel is not available";
-        throw AgentBridgeError{-32010, "Surface panel unavailable", data};
-    }
-
-    // Resolve the segment path (prefer the loaded CState surface for multi-folder
-    // display ids, fall back to the vpkg) so the result carries a stable path.
-    auto resolveSegPath = [&]() -> QString {
-        if (auto surf = state->surface(segmentId))
-            return QString::fromStdString(surf->path.string());
-        try {
-            if (auto s = vpkg->segmentation(segmentId))
-                return QString::fromStdString(s->path().string());
-        } catch (...) {
-        }
-        return QString();
-    };
-    const QString segPath = resolveSegPath();
-
-    auto segmentEntry = [&](bool placeholder) {
-        QJsonObject seg;
-        seg["id"] = segmentIdQ;
-        seg["path"] = segPath;
-        seg["placeholder"] = placeholder;
-        return seg;
-    };
-
-    // A concurrent Open Data operation (catalog open or another segment fetch)
-    // shares the same download subsystem, so reject it up front.
-    requireSourceIdle(QStringLiteral("catalog"));
-
-    // Kick off (or short-circuit) the materialize. fetchOpenDataSegmentAsync
-    // only calls onDone for the `Started` outcome; the others are terminal here.
-    // beginJob runs synchronously below before we return to the event loop, so
-    // the "catalog" job is registered before onDone (which finishes it) can fire.
-    const auto outcome = panel->fetchOpenDataSegmentAsync(
-        segmentId,
-        [this, segmentId](bool success, const QString& message) {
-            finishJob(QStringLiteral("catalog"), success,
-                      success
-                          ? QStringLiteral("segment %1 fetched")
-                                .arg(QString::fromStdString(segmentId))
-                          : message,
-                      QString());
-        });
-
-    switch (outcome) {
-    case SurfacePanelController::OpenDataFetchOutcome::NotFound: {
-        QJsonObject data;
-        data["kind"] = "segment";
-        data["id"] = segmentIdQ;
-        throw AgentBridgeError{-32007, "Segment not found", data};
-    }
-    case SurfacePanelController::OpenDataFetchOutcome::Busy: {
-        QJsonObject data;
-        data["source"] = "catalog";
-        data["detail"] = "another open-data segment fetch is already in progress";
-        throw AgentBridgeError{-32004, "A segment fetch is already in progress", data};
-    }
-    case SurfacePanelController::OpenDataFetchOutcome::AlreadyMaterialized: {
-        QJsonObject result;
-        result["fetched"] = true;
-        result["alreadyMaterialized"] = true;
-        result["segment"] = segmentEntry(false);
-        return result;
-    }
-    case SurfacePanelController::OpenDataFetchOutcome::Started:
-        break;
-    }
-
-    const QString jobId = beginJob(QStringLiteral("catalog"),
-                                   QStringLiteral("segments.fetch"),
-                                   QStringLiteral("Fetching segment %1").arg(segmentIdQ),
-                                   /*broadcastStart=*/true);
-
-    QJsonObject result;
-    result["jobId"] = jobId;
-    result["source"] = "catalog";
-    result["fetched"] = false;
-    result["alreadyMaterialized"] = false;
-    result["segment"] = segmentEntry(true);
-    return result;
-}
 
 
 QJsonObject AgentBridgeServer::handleScreenshotCapture(const QJsonValue& params)
@@ -1298,52 +1197,45 @@ QJsonObject AgentBridgeServer::handleVolumeList(const QJsonValue&)
 }
 
 
+// The surface catalog row of `segmentId`, or -32007.
+static const SurfaceCatalog::Row& catalogRow(SurfaceCatalog* catalog, const QString& segmentIdQ)
+{
+    if (!catalog || !catalog->attachment())
+        throw AgentBridgeError{-32000, "No object store attached", {}};
+    const auto* row = catalog->row(segmentIdQ.toStdString());
+    if (!row) {
+        QJsonObject data;
+        data["kind"] = "segment";
+        data["id"] = segmentIdQ;
+        throw AgentBridgeError{-32007, QStringLiteral("Unknown segment id: %1").arg(segmentIdQ), data};
+    }
+    return *row;
+}
+
 QJsonObject AgentBridgeServer::handleSegmentsDelete(const QJsonValue& params)
 {
-    CState* state = _window ? _window->_state : nullptr;
-    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
-    if (!state || !state->hasVpkg() || !vpkg)
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-
     const QJsonObject p = params.toObject();
     const QString segmentIdQ = p.value("segmentId").toString();
     const bool confirm = p.value("confirm").toBool(false);
     if (!confirm) {
         QJsonObject data;
         data["param"] = "confirm";
-        data["reason"] = "destructive; pass confirm=true";
-        throw AgentBridgeError{-32602,
-            "confirm must be true (on-disk deletion is irreversible)", data};
+        data["reason"] = "retires the surface; pass confirm=true";
+        throw AgentBridgeError{-32602, "confirm must be true", data};
     }
 
-    // Refuse while a segmentation edit is in progress (would race the delete
+    // Refuse while a segmentation edit is in progress (would race the retire
     // against unsaved edits / active-surface teardown).
     if (_window->_segmentationWidget && _window->_segmentationWidget->isEditingEnabled()) {
         QJsonObject data;
         data["detail"] = "cannot delete while editing";
         throw AgentBridgeError{-32004, "cannot delete while editing", data};
     }
+    (void)catalogRow(_window->_surfaceCatalog.get(), segmentIdQ);
 
-    // Unknown id -> -32007. Match against the package's known segment ids.
-    const std::string segmentId = segmentIdQ.toStdString();
-    const std::vector<std::string> ids = vpkg->segmentationIDs();
-    if (std::find(ids.begin(), ids.end(), segmentId) == ids.end()) {
-        QJsonObject data;
-        data["kind"] = "segment";
-        data["id"] = segmentIdQ;
-        throw AgentBridgeError{-32007, QStringLiteral("Unknown segment id: %1").arg(segmentIdQ), data};
-    }
-
-    SurfacePanelController* panel = _window ? _window->_surfacePanel.get() : nullptr;
-    if (!panel) {
-        QJsonObject data;
-        data["detail"] = "surface panel is not available";
-        throw AgentBridgeError{-32010, "Surface panel unavailable", data};
-    }
-
-    // Dialog-free core clears the active slot first, deletes on disk, and refreshes.
+    SurfacePanelController* panel = _window->_surfacePanel.get();
     QString err;
-    if (!panel->deleteSegmentsHeadless(QStringList{segmentIdQ}, &err)) {
+    if (!panel || !panel->retireSurfaces(QStringList{segmentIdQ}, &err)) {
         QJsonObject data;
         data["detail"] = err.isEmpty() ? QStringLiteral("delete failed") : err;
         throw AgentBridgeError{-32010, QStringLiteral("Failed to delete segment: %1").arg(err), data};
@@ -1359,97 +1251,32 @@ QJsonObject AgentBridgeServer::handleSegmentsDelete(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::handleSegmentsRename(const QJsonValue& params)
 {
-    CState* state = _window ? _window->_state : nullptr;
-    std::shared_ptr<VolumePkg> vpkg = state ? state->vpkg() : nullptr;
-    if (!state || !state->hasVpkg() || !vpkg)
-        throw AgentBridgeError{-32000, "No volume package loaded", {}};
-
     const QJsonObject p = params.toObject();
     const QString segmentIdQ = p.value("segmentId").toString();
-    const QString newName = p.value("newName").toString();
-
-    // Validate the new name up front so a bad name is -32602 (not -32010).
-    static const QRegularExpression validNameRegex(QStringLiteral("^[a-zA-Z0-9_-]+$"));
-    if (!validNameRegex.match(newName).hasMatch()) {
+    const QString newName = p.value("newName").toString().trimmed();
+    if (newName.isEmpty()) {
         QJsonObject data;
         data["param"] = "newName";
-        throw AgentBridgeError{-32602,
-            "newName must match ^[a-zA-Z0-9_-]+$", data};
+        throw AgentBridgeError{-32602, "newName is required", data};
     }
-
-    // Refuse while editing (mirrors segments.delete and the interactive guard).
-    if (_window->_segmentationWidget && _window->_segmentationWidget->isEditingEnabled()) {
+    const auto& row = catalogRow(_window->_surfaceCatalog.get(), segmentIdQ);
+    if (row.record.name == newName.toStdString()) {
         QJsonObject data;
-        data["detail"] = "cannot rename while editing";
-        throw AgentBridgeError{-32004, "cannot rename while editing", data};
+        data["param"] = "newName";
+        throw AgentBridgeError{-32602, "newName is unchanged", data};
     }
-
-    // Unknown id -> -32007.
-    const std::string segmentId = segmentIdQ.toStdString();
-    const std::vector<std::string> ids = vpkg->segmentationIDs();
-    if (std::find(ids.begin(), ids.end(), segmentId) == ids.end()) {
+    try {
+        _window->_surfaceCatalog->rename(row.record.uuid, newName.toStdString());
+    } catch (const std::exception& error) {
         QJsonObject data;
-        data["kind"] = "segment";
-        data["id"] = segmentIdQ;
-        throw AgentBridgeError{-32007, QStringLiteral("Unknown segment id: %1").arg(segmentIdQ), data};
+        data["detail"] = QString::fromUtf8(error.what());
+        throw AgentBridgeError{-32010, QStringLiteral("Failed to rename segment: %1").arg(error.what()), data};
     }
 
-    SegmentationCommandHandler* sch = _window ? _window->_segmentationCommandHandler.get() : nullptr;
-    if (!sch) {
-        QJsonObject data;
-        data["detail"] = "segmentation command handler is not available";
-        throw AgentBridgeError{-32010, "Segmentation command handler unavailable", data};
-    }
-
-    QString err;
-    if (!sch->renameSurfaceHeadless(segmentIdQ, newName, &err)) {
-        // Map the core's classifiable sentences to JSON-RPC codes.
-        if (err == QLatin1String("name exists")) {
-            QJsonObject data;
-            data["kind"] = "segment";
-            data["id"] = newName;
-            data["reason"] = "target name already exists";
-            throw AgentBridgeError{-32010, QStringLiteral("A segment named %1 already exists").arg(newName), data};
-        }
-        if (err == QLatin1String("invalid name")) {
-            QJsonObject data;
-            data["param"] = "newName";
-            throw AgentBridgeError{-32602, "newName must match ^[a-zA-Z0-9_-]+$", data};
-        }
-        if (err == QLatin1String("name unchanged")) {
-            QJsonObject data;
-            data["param"] = "newName";
-            throw AgentBridgeError{-32602, "newName is unchanged", data};
-        }
-        if (err == QLatin1String("immutable catalog segment")) {
-            QJsonObject data;
-            data["kind"] = "segment";
-            data["id"] = segmentIdQ;
-            data["action"] = "segments.create_editable_copy";
-            throw AgentBridgeError{
-                -32009,
-                "Cannot rename an immutable Open Data catalog segment",
-                data};
-        }
-        if (err == QLatin1String("editing in progress")) {
-            QJsonObject data;
-            data["detail"] = "cannot rename while editing";
-            throw AgentBridgeError{-32004, "cannot rename while editing", data};
-        }
-        if (err == QLatin1String("segment not found")) {
-            QJsonObject data;
-            data["kind"] = "segment";
-            data["id"] = segmentIdQ;
-            throw AgentBridgeError{-32007, QStringLiteral("Unknown segment id: %1").arg(segmentIdQ), data};
-        }
-        QJsonObject data;
-        data["detail"] = err.isEmpty() ? QStringLiteral("rename failed") : err;
-        throw AgentBridgeError{-32010, QStringLiteral("Failed to rename segment: %1").arg(err), data};
-    }
-
+    // The UUID is the identity; renaming changes only the name.
     QJsonObject result;
-    result["oldId"] = segmentIdQ;
-    result["newId"] = newName;
+    result["id"] = segmentIdQ;
+    result["name"] = newName;
     return result;
 }
 

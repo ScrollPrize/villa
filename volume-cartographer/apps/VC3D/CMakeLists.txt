@@ -126,8 +126,6 @@ set(srcs
     SettingsDialog.cpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
-    SurfaceDisplayName.hpp
-    SurfaceTimestamp.hpp
     SeedingBatchTracker.cpp
     SeedingBatchTracker.hpp
     SeedingWidget.cpp
@@ -485,5 +483,5 @@ if(EXISTS "${_vc3d_fiber_format_src}/__init__.py")
 endif()
 
 if(VC_TESTING)
-    set_source_files_properties(LineAnnotationController.cpp VCAppMain.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
+    set_source_files_properties(LineAnnotationController.cpp SurfacePanelController.cpp VCAppMain.cpp PROPERTIES COMPILE_DEFINITIONS VC_TESTING)
 endif()

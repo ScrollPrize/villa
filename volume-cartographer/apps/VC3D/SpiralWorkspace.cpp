@@ -1521,28 +1521,6 @@ void SpiralWorkspace::noteFiberRetired(const QString& objectUuid)
     _service->removeInputDraft(objectUuid);
 }
 
-bool SpiralWorkspace::stageManagedPatchRemoval(const std::shared_ptr<QuadSurface>& surface)
-{
-    if (!_service || !surface || surface->path.empty()) return false;
-    const auto path = QString::fromStdString(surface->path.string());
-    QString id = _managedPatchCopies.value(path);
-    if (id.isEmpty()) {
-        for (const auto& value : _service->inputDraftStatus()) {
-            const auto input = value.toObject();
-            if (input.value(QStringLiteral("kind")).toString() == QStringLiteral("patch")
-                && QFileInfo(mapServicePath(input.value(QStringLiteral("source")).toString())).canonicalFilePath()
-                    == QFileInfo(path).canonicalFilePath()) {
-                id = input.value(QStringLiteral("id")).toString();
-                break;
-            }
-        }
-    }
-    if (id.isEmpty()) return false;
-    _service->removeInputDraft(id);
-    statusBar()->showMessage(tr("Patch removal staged. Apply removes supervision; Commit deletes dataset files."), 15000);
-    return true;
-}
-
 bool SpiralWorkspace::prepareManagedPatch(const std::shared_ptr<QuadSurface>& surface)
 {
     if (!_service || !surface || surface->path.empty()) return true;

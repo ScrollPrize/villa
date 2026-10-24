@@ -93,9 +93,6 @@ vc_add_test(NAME test_segmentation_autosave_state
     LIBS doctest::doctest
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
-vc_add_test(NAME test_surface_display_name
-    INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
-
 vc_add_test(NAME test_volumetric_compositor
     SOURCES test_volumetric_compositor.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/volume_viewers/VolumetricCompositor.cpp

@@ -14968,22 +14968,22 @@ void LineAnnotationController::handleShowAsMesh(const std::string& surfaceName)
     }
 
     try {
-        const auto savedPaths = saveGeneratedQuadMeshes(session);
-        if (savedPaths.empty()) {
+        const auto savedNames = saveGeneratedQuadMeshes(session);
+        if (savedNames.empty()) {
             showError(tr("No generated line quad meshes are available to export."),
                       session.suppressErrorDialogs);
             return;
         }
 
         QStringList labels;
-        labels.reserve(static_cast<int>(savedPaths.size()));
-        for (const auto& path : savedPaths) {
-            labels.push_back(QString::fromStdString(path.filename().string()));
+        labels.reserve(static_cast<int>(savedNames.size()));
+        for (const auto& name : savedNames) {
+            labels.push_back(QString::fromStdString(name));
         }
         if (!session.suppressErrorDialogs && !_errorDialogsSuppressed) {
             QMessageBox::information(_parentWidget,
                                      tr("Line Annotation"),
-                                     tr("Saved generated mesh surfaces in paths:\n%1")
+                                     tr("Saved generated mesh surfaces:\n%1")
                                          .arg(labels.join(QStringLiteral("\n"))));
         }
     } catch (const std::exception& ex) {
@@ -14993,75 +14993,21 @@ void LineAnnotationController::handleShowAsMesh(const std::string& surfaceName)
     }
 }
 
-fs::path LineAnnotationController::resolveMeshExportPathsDir() const
+std::vector<std::string> LineAnnotationController::saveGeneratedQuadMeshes(LineAnnotationSession& session)
 {
-    if (!_state || !_state->vpkg()) {
-        throw std::runtime_error("No volume package loaded.");
-    }
-
-    auto vpkg = _state->vpkg();
-    fs::path pathsDir = vpkg->outputSegmentsPath();
-    const fs::path volpkgRoot = vpkg->path().empty()
-        ? fs::path(vpkg->getVolpkgDirectory())
-        : vpkg->path().parent_path();
-
-    if (pathsDir.empty()) {
-        if (volpkgRoot.empty()) {
-            throw std::runtime_error("Volume package path is unavailable.");
-        }
-        pathsDir = volpkgRoot / "paths";
-    }
-
-    std::error_code ec;
-    fs::create_directories(pathsDir, ec);
-    if (ec) {
-        throw std::runtime_error("Failed to create paths directory " +
-                                 pathsDir.string() + ": " + ec.message());
-    }
-
-    bool hasEntry = false;
-    const fs::path canonicalPaths = fs::weakly_canonical(pathsDir, ec);
-    for (const auto& entryPath : vpkg->availableSegmentPaths()) {
-        std::error_code entryEc;
-        if (fs::weakly_canonical(entryPath, entryEc) == canonicalPaths && !entryEc) {
-            hasEntry = true;
-            break;
-        }
-    }
-    if (!hasEntry && !volpkgRoot.empty() && pathsDir == volpkgRoot / "paths") {
-        vpkg->addSegmentsEntry("paths");
-    }
-
-    return pathsDir;
-}
-
-fs::path LineAnnotationController::nextMeshExportPath(const fs::path& pathsDir,
-                                                      const std::string& stem) const
-{
-    const std::string timestamp =
-        QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd_HHmmss")).toStdString();
-    std::string base = "line_annotation_" + timestamp + "_" + stem;
-    fs::path candidate = pathsDir / base;
-    int suffix = 1;
-    while (fs::exists(candidate)) {
-        candidate = pathsDir / (base + "_" + std::to_string(suffix++));
-    }
-    return candidate;
-}
-
-std::vector<fs::path> LineAnnotationController::saveGeneratedQuadMeshes(LineAnnotationSession& session)
-{
-    if (!_state) {
+    auto* catalog = _surfacePanel ? _surfacePanel->catalog() : nullptr;
+    if (!_state || !catalog) {
         throw std::runtime_error("No active application state.");
     }
 
-    const fs::path pathsDir = resolveMeshExportPathsDir();
     const std::vector<std::pair<std::string, std::string>> exports = {
         {session.generatedLineSurfaceName, "surface"},
         {session.generatedLineSideSliceName, "side_slice"},
     };
+    const std::string timestamp =
+        QDateTime::currentDateTimeUtc().toString(QStringLiteral("yyyyMMdd_HHmmss")).toStdString();
 
-    std::vector<fs::path> savedPaths;
+    std::vector<std::string> names;
     for (const auto& [surfaceName, stem] : exports) {
         if (surfaceName.empty()) {
             continue;
@@ -15071,30 +15017,19 @@ std::vector<fs::path> LineAnnotationController::saveGeneratedQuadMeshes(LineAnno
             continue;
         }
 
-        auto clone = std::make_shared<QuadSurface>(surface->rawPoints().clone(), surface->scale());
-        clone->meta = surface->meta;
-        vc3d::opendata::copyCoordinateIdentityToSurface(
-            *clone, coordinateIdentityForState(_state));
-
-        const fs::path outputPath = nextMeshExportPath(pathsDir, stem);
-        const std::string outputName = outputPath.filename().string();
-        clone->saveAsNew(outputPath, false);
-
-        if (_surfacePanel) {
-            _surfacePanel->addSingleSegmentation(outputName);
-        } else if (_state->vpkg()) {
-            (void)_state->vpkg()->addSingleSegmentation(outputName);
-        }
-        savedPaths.push_back(outputPath);
+        QuadSurface clone(surface->rawPoints().clone(), surface->scale());
+        clone.meta = surface->meta;
+        const std::string name = "line_annotation_" + timestamp + "_" + stem;
+        const nlohmann::json provenance{{"tool", "vc3d-line-annotation"},
+                                        {"parameters", {{"view", stem}}},
+                                        {"sources", session.fiberUuid.empty() ? nlohmann::json::array()
+                                                                              : nlohmann::json::array({session.fiberUuid})}};
+        catalog->create(clone, name, provenance);
+        names.push_back(name);
     }
 
-    if (!savedPaths.empty() && _state->vpkg()) {
-        _state->emitSurfacesChanged();
-    }
-
-    Logger()->info("Line annotation saved {} generated mesh surface(s) to {}",
-                   savedPaths.size(), pathsDir.string());
-    return savedPaths;
+    Logger()->info("Line annotation saved {} generated mesh surface(s) to the object store", names.size());
+    return names;
 }
 
 std::string LineAnnotationController::nextSurfaceName()

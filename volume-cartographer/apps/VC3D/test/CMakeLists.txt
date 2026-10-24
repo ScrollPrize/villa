@@ -679,6 +679,10 @@ set_tests_properties(object_store_vc3d_controller PROPERTIES
     ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 90)
 vc_register_test_target(VC3D)
 vc_register_ctest(object_store_vc3d_controller VC3D)
+add_test(NAME surface_panel_store COMMAND VC3D --test-surface-panel)
+set_tests_properties(surface_panel_store PROPERTIES
+    ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 90)
+vc_register_ctest(surface_panel_store VC3D)
 
 add_executable(test_surface_catalog test_surface_catalog.cpp ../SurfaceCatalog.cpp ../SurfaceCatalog.hpp)
 set_target_properties(test_surface_catalog PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)

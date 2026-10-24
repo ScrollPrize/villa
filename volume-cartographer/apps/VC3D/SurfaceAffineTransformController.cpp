@@ -3,6 +3,7 @@
 
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
+#include "SurfaceCatalog.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
 #include "segmentation/SegmentationModule.hpp"
@@ -627,7 +628,8 @@ void SurfaceAffineTransformController::onPreviewTransformToggled(bool enabled)
 
 void SurfaceAffineTransformController::onSaveTransformedRequested()
 {
-    if (!_state || !_state->vpkg()) {
+    auto* catalog = _surfacePanel ? _surfacePanel->catalog() : nullptr;
+    if (!_state || !catalog) {
         return;
     }
 
@@ -638,9 +640,10 @@ void SurfaceAffineTransformController::onSaveTransformedRequested()
     }
 
     auto sourceSurface = currentTransformSourceSurface();
-    if (!sourceSurface || sourceSurface->path.empty()) {
+    const auto* sourceRow = sourceSurface ? catalog->row(sourceSurface->id) : nullptr;
+    if (!sourceRow) {
         QMessageBox::warning(_dialogParent, tr("No Segmentation"),
-                             tr("Select a segmentation with files on disk first."));
+                             tr("Select a segmentation from the object store first."));
         return;
     }
 
@@ -661,9 +664,8 @@ void SurfaceAffineTransformController::onSaveTransformedRequested()
         return;
     }
 
-    const QString defaultName = suggestedTransformedSurfaceName(
-        QString::fromStdString(sourceSurface->id.empty()
-            ? sourceSurface->path.filename().string() : sourceSurface->id));
+    const QString defaultName = suggestedTransformedSurfaceName(QString::fromStdString(
+        sourceRow->record.name.empty() ? sourceRow->record.uuid : sourceRow->record.name));
     bool ok = false;
     QString newName = QInputDialog::getText(_dialogParent,
                                             tr("Save Transformed"),
@@ -675,44 +677,18 @@ void SurfaceAffineTransformController::onSaveTransformedRequested()
         return;
     }
 
-    static const QRegularExpression validNameRegex(QStringLiteral("^[a-zA-Z0-9_-]+$"));
-    if (!validNameRegex.match(newName).hasMatch()) {
-        QMessageBox::warning(_dialogParent, tr("Invalid Name"),
-                             tr("Surface name can only contain letters, numbers, underscores, and hyphens."));
-        return;
-    }
-
-    const std::string newId = newName.toStdString();
-    const std::filesystem::path sourcePath = sourceSurface->path;
-    const std::filesystem::path parentDir = sourcePath.parent_path();
-    const std::filesystem::path targetPath = parentDir / newId;
-    if (std::filesystem::exists(targetPath)) {
-        QMessageBox::warning(_dialogParent, tr("Name Exists"),
-                             tr("A surface with the name '%1' already exists.").arg(newName));
-        return;
-    }
-
-    QTemporaryDir stagingRoot;
-    if (!stagingRoot.isValid()) {
-        QMessageBox::critical(_dialogParent, tr("Temporary Directory Error"),
-                              tr("Failed to create a temporary staging directory."));
-        return;
-    }
-
+    const bool invert = hasTransform && transformPanel && transformPanel->invertChecked();
+    const bool noResample = transformPanel && transformPanel->noResampleChecked();
     try {
-        if (hasTransform) {
-            if (transformPanel && transformPanel->invertChecked()) {
-                matrix = invertAffineTransformMatrix(*matrix);
-            }
+        if (invert) {
+            matrix = invertAffineTransformMatrix(*matrix);
         }
         auto transformedSurface = cloneSurfaceForTransform(sourceSurface);
         if (!transformedSurface) {
             throw std::runtime_error("failed to clone source surface");
         }
 
-        if (transformPanel && transformPanel->noResampleChecked()) {
-            if (std::filesystem::exists(sourcePath / "corrections.json"))
-                throw std::runtime_error("No-resample scaling does not yet transform corrections.json");
+        if (noResample) {
             const auto volume = _state->currentVolume();
             vc::core::util::scaleSurfaceWithoutResampling(transformedSurface.get(), scale,
                 volume ? std::optional(volume->shape()) : std::nullopt);
@@ -721,35 +697,22 @@ void SurfaceAffineTransformController::onSaveTransformedRequested()
         }
         refreshTransformedSurfaceState(transformedSurface.get());
 
-        const std::filesystem::path stagingPath =
-            std::filesystem::path(stagingRoot.path().toStdString()) / newId;
-        transformedSurface->saveAsNew(stagingPath, false);
-
-        std::filesystem::copy(sourcePath,
-                              targetPath,
-                              std::filesystem::copy_options::recursive);
-        std::filesystem::copy(stagingPath,
-                              targetPath,
-                              std::filesystem::copy_options::recursive |
-                                  std::filesystem::copy_options::overwrite_existing);
+        nlohmann::json parameters{{"scale", scale}, {"no_resample", noResample}, {"inverted", invert}};
+        if (matrix) {
+            auto rows = nlohmann::json::array();
+            for (int r = 0; r < 4; ++r) {
+                rows.push_back({(*matrix)(r, 0), (*matrix)(r, 1), (*matrix)(r, 2), (*matrix)(r, 3)});
+            }
+            parameters["matrix"] = rows;
+        }
+        catalog->create(*transformedSurface, newName.toStdString(),
+                        {{"tool", "vc3d-affine-transform"}, {"parameters", parameters},
+                         {"sources", {sourceRow->record.uuid}}});
     } catch (const std::exception& ex) {
-        std::error_code cleanupError;
-        std::filesystem::remove_all(targetPath, cleanupError);
         QMessageBox::critical(_dialogParent, tr("Save Failed"),
                               tr("Failed to save transformed surface: %1")
                                   .arg(QString::fromUtf8(ex.what())));
         return;
-    }
-
-    if (_state->vpkg()->addSingleSegmentation(newId)) {
-        if (_surfacePanel) {
-            _surfacePanel->addSingleSegmentation(newId);
-        }
-    } else {
-        _state->vpkg()->refreshSegmentations();
-        if (_surfacePanel) {
-            _surfacePanel->reloadSurfacesFromDisk();
-        }
     }
 
     showStatus(tr("Saved transformed surface as '%1'.").arg(newName), 5000);

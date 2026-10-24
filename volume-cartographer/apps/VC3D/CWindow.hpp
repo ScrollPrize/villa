@@ -105,6 +105,7 @@ static constexpr int VOLPKG_MIN_VERSION = 1;
 class CommandLineToolRunner;
 class SegmentationModule;
 class SurfacePanelController;
+class SurfaceCatalog;
 class MenuActionController;
 class VolumeAttachmentController;
 class SegmentationGrower;
@@ -305,8 +306,7 @@ private:
         const QString& location,
         std::vector<std::string> tags = {},
         const QString& preferredVolumeId = {});
-    void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
-                                       bool reloadSurfaces = true);
+    void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString());
     void syncVolumeSelectionControls(const QString& activeVolumeId = QString());
     QWidget* createAnnotationVolumeSelector(QWidget* parent);
     void updateNormalGridAvailability();
@@ -318,16 +318,8 @@ private:
     bool recenterViewersOnCurrentFocus();
     void setSegmentationCursorMirroring(bool enabled);
     bool segmentationCursorMirroringEnabled() const { return _mirrorCursorToSegmentation; }
-    void updateSurfaceOverlayDropdown();
-    void onSurfaceOverlaySelectionChanged(const QModelIndex& topLeft, const QModelIndex& bottomRight, const QVector<int>& roles);
-    void showSurfaceOverlaySelectionDialog();
-    void applySurfaceOverlaySelection();
-    void updateSurfaceOverlayButtonText();
-    QColor getOverlayColor(size_t index) const;
-    cv::Vec3b getOverlayColorBGR(size_t index) const;
 
 private slots:
-    void onSegmentationDirChanged(int index);
     void onEditMaskPressed(const QString& segmentId);
     void onAppendMaskPressed(const QString& segmentId);
     void onManualLocationChanged();
@@ -361,11 +353,9 @@ private slots:
     std::optional<cv::Matx44d> openDataVolumeTransformForSwitch(
         const std::string& fromLoadedVolumeId,
         const std::string& toLoadedVolumeId) const;
-    void updateOpenDataSegmentTransformState(bool showDialog = true);
     void resetSegmentationViews(bool persistLayout = true);
-    void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface);
-    void onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface);
-    bool restoreActiveSurfaceAfterSurfaceReload(const std::string& surfaceId);
+    void onSurfaceActivated(const QString& surfaceId, const std::shared_ptr<QuadSurface>& surface);
+    void onSurfaceActivatedPreserveEditing(const QString& surfaceId, const std::shared_ptr<QuadSurface>& surface);
     // Attaches the render-bench recorder once a volume+segment are active (no-op
     // unless --record was passed and the recorder isn't already attached).
     void maybeAttachBenchRecorder();
@@ -376,22 +366,12 @@ private slots:
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
     void onConvertPointToAnchor(vc::PointRef point);
     void refreshVolumeSelectionUi(const QString& preferredVolumeId = QString());
-    void refreshSegmentationDirectoryDropdown();
-    void applySegmentFolderSelection(bool reloadSurfaces);
-    void showSegmentFolderPaletteMenu(int row);
-    QColor defaultSegmentFolderColor(const QString& dirName) const;
-    QString effectiveDefaultSegmentFolderDir() const;
 
 private:
     CState* _state;
 
     QComboBox* volSelect{nullptr};
     std::vector<QPointer<QComboBox>> _annotationVolumeSelects;
-    QComboBox* cmbSegmentationDir;
-    QStandardItemModel* _segmentDirModel{nullptr};
-    bool _updatingSegmentDirUi{false};
-    std::map<QString, QColor> _segmentFolderSolidColors;
-    QString _segmentFolderDefaultPaletteDir;
     mutable bool _openDataManifestLoadAttempted{false};
     mutable std::optional<vc3d::opendata::OpenDataManifest> _openDataManifestCache;
 
@@ -405,13 +385,11 @@ private:
     CFiberWidget* _fiberSliceWidget{nullptr};
 
     SurfaceTreeWidget *treeWidgetSurfaces;
-    QPushButton *btnReloadSurfaces;
 
     //TODO abstract these into separate QWidget class?
     QLineEdit* lblLocFocus;
     QCheckBox* chkAxisAlignedSlices;
     QLabel* _segmentationGrowthWarning{nullptr};
-    QLabel* _segmentTransformWarning{nullptr};
     QLabel* _statusMessageLabel{nullptr};
     // Owned by the status bar, which the destructor detaches (and Qt then
     // deletes) before the volume closes: a QPointer, so the late refreshes
@@ -428,7 +406,6 @@ private:
     bool _persistentCacheBannerShownThisSession{false};
     QStringList _sharedCacheStatsItems;
     QString _segmentationGrowthStatusText;
-    QString _lastSegmentTransformWarningVolumeId;
     bool _relayingNativeStatusMessage{false};
 
 
@@ -489,9 +466,6 @@ private:
     std::unique_ptr<SegmentationGrower> _segmentationGrower;
 
     // Surface overlay multi-select state
-    std::map<std::string, size_t> _surfaceOverlayColorAssignments;
-    size_t _nextSurfaceOverlayColorIndex{0};
-    QStandardItemModel* _surfaceOverlayModel{nullptr};
 
     std::unique_ptr<SegmentationEditManager> _segmentationEdit;
     std::unique_ptr<SegmentationOverlayController> _segmentationOverlay;
@@ -507,6 +481,7 @@ private:
     std::unique_ptr<AtlasControlPointsOverlayController> _atlasControlOverlay;
     std::unique_ptr<FiberCollectionController> _fiberCollection;
     std::unique_ptr<SegmentationModule> _segmentationModule;
+    std::unique_ptr<SurfaceCatalog> _surfaceCatalog;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<VolumeAttachmentController> _volumeAttachmentController;
     std::unique_ptr<MenuActionController> _menuController;

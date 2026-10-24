@@ -1,28 +1,25 @@
-#include <functional>
 #pragma once
 
 #include <QObject>
-#include <QColor>
-#include <QPointF>
 #include <QString>
 #include <QStringList>
-#include <QPointer>
 
-#include "OpenDataSegmentCache.hpp"
+#include "SurfaceCatalog.hpp"
 
+#include <array>
 #include <functional>
-#include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
+#include <set>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
 class CState;
-class Segmentation;
 class QLineEdit;
 class ViewerManager;
 class SurfaceTreeWidgetItem;
-class VolumePkg;
 class CChunkedVolumeViewer;
 class VCCollection;
 class QTreeWidget;
@@ -31,26 +28,18 @@ class QComboBox;
 class QDialog;
 class QDoubleSpinBox;
 class QPushButton;
-class QStandardItemModel;
-class QProgressDialog;
-template <typename T> class QFutureWatcher;
 class QuadSurface;
 class DropdownChecklistButton;
 
-// Forward declare for QuadSurface pointer usage
-#include "vc/core/util/QuadSurface.hpp"
-
+// The surface list: the current volume's surfaces from the SurfaceCatalog,
+// filtered, tagged and opened from the object store.
 class SurfacePanelController : public QObject
 {
     Q_OBJECT
 
 public:
-    // True means a managed deletion was staged and dataset removal is deferred.
-    void setManagedDeletionHandler(std::function<bool(const QString&)> handler)
-    { _managedDeletionHandler = std::move(handler); }
     struct UiRefs {
         QTreeWidget* treeWidget{nullptr};
-        QPushButton* reloadButton{nullptr};
     };
 
     struct FilterUiRefs {
@@ -89,30 +78,14 @@ public:
         Inspect,
     };
 
-    struct SegmentFolderSelection {
-        std::string dirName;
-        std::filesystem::path path;
-        bool currentFolder{false};
-        bool defaultPalette{false};
-        QColor color;
-    };
-
     SurfacePanelController(const UiRefs& ui,
                            CState* state,
+                           SurfaceCatalog* catalog,
                            ViewerManager* viewerManager,
                            std::function<CChunkedVolumeViewer*()> segmentationViewerProvider,
-                           std::function<void()> filtersUpdated,
                            QObject* parent = nullptr);
 
-    void setVolumePkg(const std::shared_ptr<VolumePkg>& pkg);
-    void clear();
     bool hasSurfaces() const;
-
-    void loadSurfaces(bool reload);
-    void loadSurfacesIncremental();
-    void refreshSurfaceList();
-    void updateTreeItemIcon(SurfaceTreeWidgetItem* item);
-    void refreshSurfaceMetrics(const std::string& surfaceId);
 
     void configureFilters(const FilterUiRefs& filters, VCCollection* pointCollection);
     void configureTags(const TagUiRefs& tags);
@@ -120,13 +93,12 @@ public:
     void refreshPointSetFilterOptions();
     void applyFilters();
 
-    void syncSelectionUi(const std::string& surfaceId, QuadSurface* surface);
     bool selectSurfaceById(const std::string& surfaceId);
-    /// Programmatically activate a segment: selects it in the tree (signals blocked,
-    /// via selectSurfaceById) then emits surfaceActivated exactly as a live click would
-    /// (reaching CWindow::onSurfaceActivated). Never shows UI. Returns false with a
-    /// reason in *errorMessage when the id is unknown, unloadable, an unmaterialized
-    /// open-data placeholder, or selection is locked while growth runs.
+    /// Programmatically activate a surface: selects it in the tree (signals
+    /// blocked, via selectSurfaceById), opens it from the store and emits
+    /// surfaceActivated exactly as a live click would. Never shows UI. Returns
+    /// false with a reason in *errorMessage when the id is unknown, cannot be
+    /// opened, or selection is locked while growth runs.
     bool activateSurfaceById(const std::string& surfaceId,
                              QString* errorMessage = nullptr);
     void resetTagUi();
@@ -134,17 +106,11 @@ public:
     bool isCurrentOnlyFilterEnabled() const;
     bool toggleTag(Tag tag);
     bool setTagChecked(Tag tag, bool checked);
-    void reloadSurfacesFromDisk();
-    void refreshFiltersOnly();
     void setSelectionLocked(bool locked);
     void setTransformWarning(const QString& warningText);
-    void setVisibleSegmentFolders(std::vector<SegmentFolderSelection> folders);
-    void addSingleSegmentation(const std::string& segId);
-    void removeSingleSegmentation(const std::string& segId, bool suppressSignals = false);
-    // Irreversibly deletes each id from disk and refreshes the panel. The
-    // interactive caller is responsible for confirmation.
-    bool deleteSegmentsHeadless(const QStringList& segmentIds, QString* err = nullptr,
-                                int* deletedCount = nullptr);
+    // Retires each surface in the store. The interactive caller is responsible
+    // for confirmation.
+    bool retireSurfaces(const QStringList& surfaceIds, QString* err = nullptr);
     // Replace the whole highlighted-surface set at once and push it to the viewers,
     // keeping _highlightedSurfaceIds, the source of truth behind the
     // "Highlight in slice views" checkmarks, in sync.
@@ -152,40 +118,22 @@ public:
     std::vector<std::string> highlightedSurfaceIds() const;
     bool cycleToNextVisibleSegment();
     bool cycleToPreviousVisibleSegment();
-    void materializeCurrentOpenDataFolder();
     // Enables the "Add to current spiral fit" context action while a Spiral
     // session is active on the connected service.
     void setSpiralFitAvailable(bool available) { _spiralFitAvailable = available; }
 
-    /// Outcome of an asynchronous single-segment fetch request. Only `Started`
-    /// implies the completion callback will fire later (on the main thread);
-    /// the other outcomes are resolved synchronously by the caller with no
-    /// callback.
-    enum class OpenDataFetchOutcome {
-        Started,             ///< async materialize kicked off; onDone will fire
-        AlreadyMaterialized, ///< not a placeholder; nothing to fetch
-        NotFound,            ///< no such segment / surface could not be loaded
-        Busy,                ///< another single-segment materialize is running
-    };
-
-    /// Materialize one open-data placeholder without a progress dialog or
-    /// forced activation. Shares the GUI path's single-flight guard. On a
-    /// `Started` outcome, reloads the surface list on success and invokes
-    /// onDone(success, message) on the main thread.
-    OpenDataFetchOutcome fetchOpenDataSegmentAsync(
-        const std::string& id,
-        std::function<void(bool success, const QString& message)> onDone);
-
-    /// True while a single-segment materialization holds the shared
-    /// single-flight guard.
-    bool isOpenDataMaterializationRunning() const;
+    SurfaceCatalog* catalog() const { return _catalog; }
+    // The surface last opened by activation, pinned at the revisions it was read from.
+    const std::optional<SurfaceCatalog::Opened>& opened() const { return _opened; }
+    // Surfaces the filters show that can be drawn in the current volume.
+    const std::vector<std::string>& visibleSurfaceIds() const { return _visibleSurfaceIds; }
 
 signals:
-    void surfacesLoaded();
     void surfaceSelectionCleared();
     void filtersApplied(int hiddenCount);
-    void surfaceActivated(const QString& id, QuadSurface* surface);
-    void copySegmentPathRequested(const QString& segmentId);
+    void visibleSurfacesChanged(const std::vector<std::string>& ids);
+    void surfaceActivated(const QString& id, const std::shared_ptr<QuadSurface>& surface);
+    void surfaceActivatedPreserveEditing(const QString& id, const std::shared_ptr<QuadSurface>& surface);
     void addSurfaceToSpiralFitRequested(const QString& segmentId);
     void renderSegmentRequested(const QString& segmentId);
     void growSegmentRequested(const QString& segmentId);
@@ -196,11 +144,8 @@ signals:
     void straightenRequested(const QString& segmentId);
     void abfFlattenRequested(const QString& segmentId);
     void recalcAreaRequested(const QStringList& segmentIds);
-    void exportTifxyzChunksRequested(const QString& segmentId);
     void alphaCompRefineRequested(const QString& segmentId);
     void rasterizeSegmentsRequested(const QStringList& segmentIds);
-    void generateSegmentMaskRequested(const QString& segmentId);
-    void appendSegmentMaskRequested(const QString& segmentId);
     void mergeTifxyzRequested(const QStringList& segmentIds);
     // Emitted when the user right-clicks two selected segments and picks
     // "Patch tifxyz...". CWindow wires this to
@@ -208,29 +153,19 @@ signals:
     void mergePatchRequested(const QStringList& segmentIds);
     void addIgnoreLabelRequested();
     void statusMessageRequested(const QString& message, int timeoutMs);
-    void moveToPathsRequested(const QString& segmentId);
-    void renameSurfaceRequested(const QString& segmentId);
-    void copySurfaceRequested(const QString& segmentId);
     void resumeLocalGrowPatchRequested(const QString& segmentId);
     void neighborCopyRequested(const QString& segmentId, bool copyOut);
-    void reloadFromBackupRequested(const QString& segmentId, int backupIndex);
     void flipURequested(const QString& segmentId);
     void flipVRequested(const QString& segmentId);
     void rotateSurfaceRequested(const QString& segmentId);
     void focusSurfaceRequested(const QString& segmentId);
-    void surfaceActivatedPreserveEditing(const QString& id, QuadSurface* surface);
-
 
 private:
-    std::function<bool(const QString&)> _managedDeletionHandler;
-    struct SurfaceChanges {
-        std::vector<std::string> toAdd;
-        std::vector<std::string> toRemove;
-        std::vector<std::string> toReload;
-    };
-
-    SurfaceChanges detectSurfaceChanges() const;
-    void populateSurfaceTree();
+    void syncTree();
+    void setItemRow(SurfaceTreeWidgetItem* item, const SurfaceCatalog::Row& row);
+    SurfaceTreeWidgetItem* itemFor(const std::string& id) const;
+    // Open the selected surface and announce it.
+    void activate(const std::string& id, bool preserveEditing);
 
     void connectFilterSignals();
     void connectTagSignals();
@@ -240,40 +175,39 @@ private:
     void buildFilterDialog();
     void showFilterDialog();
     void rebuildPointSetFilterModel();
+    void rebuildRecordTagFilterModel();
     void handleTreeSelectionChanged();
     void showContextMenu(const QPoint& pos);
-    void handleDeleteSegments(const QStringList& segmentIds);
+    void handleRetireSurfaces(const QStringList& surfaceIds);
+    void renameSurface(const std::string& id);
+    void copySurface(const std::string& id);
+    void bindSurface(const std::string& id);
     void onTagCheckboxToggled();
     void applyFiltersInternal();
+    // Geometric filters (focus point, point sets) read surfaces near points
+    // from the store in the background; applyFilters() uses the last answer.
+    void refreshProximityFilters();
     void updateFilterSummary();
     void updateTagSummary();
-    void updateTagCheckboxStatesForSurface(QuadSurface* surface);
-    void setTagCheckboxEnabled(bool enabledApproved,
-                               bool enabledDefective,
-                               bool enabledReviewed,
-                               bool enabledInspect);
-    void logSurfaceLoadSummary() const;
-    QString folderSelectionCacheKey() const;
+    void updateTagCheckboxStates(const SurfaceCatalog::Row* row);
+    void setTagCheckboxEnabled(bool enabled);
     void applyHighlightSelection(const std::string& id, bool enabled);
     void applyTransformWarningStyle(SurfaceTreeWidgetItem* item);
     bool cycleVisibleSegment(int direction);
-    std::shared_ptr<QuadSurface> getSurfaceById(const std::string& id) const;
-    bool startOpenDataMaterialization(const std::string& id,
-                                      const std::shared_ptr<QuadSurface>& surface);
-    void activateMaterializedSurface(const std::string& id,
-                                     const std::filesystem::path& path);
 
     UiRefs _ui;
     CState* _state{nullptr};
+    SurfaceCatalog* _catalog{nullptr};
     ViewerManager* _viewerManager{nullptr};
-    std::shared_ptr<VolumePkg> _volumePkg;
     std::function<CChunkedVolumeViewer*()> _segmentationViewerProvider;
-    std::function<void()> _filtersUpdated;
     FilterUiRefs _filters;
     TagUiRefs _tags;
+    QComboBox* _recordTagFilter{nullptr};
     QDialog* _filterDialog{nullptr};
     VCCollection* _pointCollection{nullptr};
     std::string _currentSurfaceId;
+    std::optional<SurfaceCatalog::Opened> _opened;
+    std::vector<std::string> _visibleSurfaceIds;
     QMetaObject::Connection _pointSetModelConnection;
     bool _configuringFilters{false};
     bool _spiralFitAvailable{false};
@@ -282,17 +216,14 @@ private:
     bool _selectionLockNotified{false};
     QString _transformWarningText;
     std::unordered_set<std::string> _highlightedSurfaceIds;
-    std::vector<SegmentFolderSelection> _visibleSegmentFolders;
-    std::unordered_set<std::string> _multiFolderSurfaceIds;
-    // Segmentations loaded for non-current overlay folders, keyed by segment
-    // path. Retained so re-checking a folder (or switching back to a selection
-    // that includes it) reuses the already-loaded surfaces.
-    std::map<std::string, std::shared_ptr<Segmentation>> _overlaySegmentations;
-    QFutureWatcher<vc3d::opendata::OpenDataSegmentMaterializationResult>*
-        _segmentMaterializationWatcher{nullptr};
-    QFutureWatcher<vc3d::opendata::OpenDataSegmentMaterializationResult>*
-        _folderMaterializationWatcher{nullptr};
-    std::string _pendingMaterializationId;
-    QPointer<QProgressDialog> _segmentMaterializationProgress;
-    QPointer<QProgressDialog> _folderMaterializationProgress;
+
+    // Proximity filter answers: the query they answer and the surfaces it found.
+    struct ProximityAnswer {
+        std::vector<std::vector<std::array<double, 3>>> pointSets;
+        double tolerance = 0;
+        // Per point set: surfaces near any point, and near every point.
+        std::vector<std::set<std::string>> any, all;
+    };
+    std::optional<ProximityAnswer> _focusAnswer, _pointSetAnswer;
+    uint64_t _proximityGeneration{0};
 };

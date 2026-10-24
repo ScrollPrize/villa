@@ -3038,35 +3038,6 @@
         "type": "object"
       }
     },
-    "segments.fetch": {
-      "errors": [
-        -32602,
-        -32000,
-        -32010,
-        -32004,
-        -32007
-      ],
-      "mcp": {
-        "extraParams": [
-          "wait"
-        ],
-        "paramRenames": {
-          "segmentId": "segment_id"
-        },
-        "tool": "vc3d_fetch_segment"
-      },
-      "params": {
-        "properties": {
-          "segmentId": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "segmentId"
-        ],
-        "type": "object"
-      }
-    },
     "segments.list": {
       "errors": [
         -32602,

@@ -601,37 +601,6 @@ void queueIndexUpdateForBounds(SurfacePatchIndex* index,
     index->queueCellRangeUpdate(surface, rowStart, rowEnd, colStart, colEnd);
 }
 
-void synchronizeSurfaceMeta(const std::shared_ptr<VolumePkg>& pkg,
-                            QuadSurface* surface,
-                            SurfacePanelController* panel)
-{
-    if (!pkg || !surface) {
-        return;
-    }
-
-    // getSurface now returns the QuadSurface directly, so we just need to refresh the panel
-    const auto loadedIds = pkg->getLoadedSurfaceIDs();
-    for (const auto& id : loadedIds) {
-        auto loadedSurface = pkg->getSurface(id);
-        if (!loadedSurface) {
-            continue;
-        }
-
-        if (loadedSurface->path == surface->path) {
-            // Sync metadata if needed
-            if (!surface->meta.is_null()) {
-                loadedSurface->meta = surface->meta;
-            } else {
-                loadedSurface->meta = utils::Json();
-            }
-
-            if (panel) {
-                panel->refreshSurfaceMetrics(id);
-            }
-        }
-    }
-}
-
 void refreshSegmentationViewers(ViewerManager* manager)
 {
     if (!manager) {
@@ -2192,68 +2161,30 @@ void SegmentationGrower::onFutureFinished()
             return;
         }
 
-        const std::filesystem::path volpkgRoot(request.volumeContext.package->getVolpkgDirectory());
-        const std::string segmentationDir = request.volumeContext.package->getSegmentationDirectory();
-        const std::filesystem::path segmentsDir = volpkgRoot / segmentationDir;
-        std::error_code mkdirEc;
-        std::filesystem::create_directories(segmentsDir, mkdirEc);
-        if (mkdirEc) {
-            showStatus(tr("Failed to create %1 directory for displacement copy: %2")
-                           .arg(QString::fromStdString(segmentationDir))
-                           .arg(QString::fromStdString(mkdirEc.message())),
-                       kStatusLong);
-            cleanupDisplacementTemporarySurfaces();
-            finalize(false);
-            return;
-        }
-
-        auto persistAsNewSegment = [&](QuadSurface* surface, const std::string& fallbackBaseId) -> std::optional<std::string> {
-            if (!surface) {
+        auto* catalog = _surfacePanel ? _surfacePanel->catalog() : nullptr;
+        const std::string sourceUuid = request.segmentationSurface ? request.segmentationSurface->id : std::string{};
+        auto persistAsNewSegment = [&](QuadSurface* surface, const std::string& fallbackName) -> std::optional<std::string> {
+            if (!surface || !catalog) {
                 return std::nullopt;
             }
-            const std::string baseId = sanitizeSegmentId(surface->id.empty() ? fallbackBaseId : surface->id);
-            const std::string newSegmentId = makeUniqueSegmentId(segmentsDir, baseId);
-            const std::filesystem::path newSegmentPath = segmentsDir / newSegmentId;
             try {
-                vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
-                    *surface, *request.volumeContext.package,
-                    request.volumeContext.activeVolumeId);
-                surface->saveAsNew(newSegmentPath, false);
+                const std::string name = surface->id.empty() ? fallbackName : surface->id;
+                catalog->create(*surface, name,
+                                {{"tool", "vc3d-copy-displacement"}, {"parameters", nlohmann::json::object()},
+                                 {"sources", sourceUuid.empty() ? nlohmann::json::array() : nlohmann::json::array({sourceUuid})}});
+                return name;
             } catch (const std::exception& ex) {
                 showStatus(tr("Failed to save displacement copy result: %1").arg(ex.what()), kStatusLong);
                 return std::nullopt;
             }
-
-            if (!request.volumeContext.package->addSingleSegmentation(newSegmentId)) {
-                request.volumeContext.package->refreshSegmentations();
-            }
-            return newSegmentId;
         };
 
         const auto frontId = persistAsNewSegment(frontSurface.get(), "copy_displacement_front");
         const auto backId = persistAsNewSegment(backSurface.get(), "copy_displacement_back");
+        cleanupDisplacementTemporarySurfaces();
         if (!frontId || !backId) {
-            cleanupDisplacementTemporarySurfaces();
             finalize(false);
             return;
-        }
-
-        cleanupDisplacementTemporarySurfaces();
-
-        if (_surfacePanel) {
-            _surfacePanel->addSingleSegmentation(*frontId);
-            _surfacePanel->refreshSurfaceMetrics(*frontId);
-            _surfacePanel->addSingleSegmentation(*backId);
-            _surfacePanel->refreshSurfaceMetrics(*backId);
-        } else if (_context.state) {
-            auto loadedFront = request.volumeContext.package->loadSurface(*frontId);
-            if (loadedFront) {
-                _context.state->setSurface(*frontId, loadedFront, true, false);
-            }
-            auto loadedBack = request.volumeContext.package->loadSurface(*backId);
-            if (loadedBack) {
-                _context.state->setSurface(*backId, loadedBack, true, false);
-            }
         }
 
         refreshSegmentationViewers(_context.viewerManager);
@@ -2296,32 +2227,16 @@ void SegmentationGrower::onFutureFinished()
             return;
         }
 
-        const std::filesystem::path volpkgRoot(request.volumeContext.package->getVolpkgDirectory());
-        const std::string segmentationDir = request.volumeContext.package->getSegmentationDirectory();
-        const std::filesystem::path segmentsDir = volpkgRoot / segmentationDir;
-        std::error_code mkdirEc;
-        std::filesystem::create_directories(segmentsDir, mkdirEc);
-        if (mkdirEc) {
-            showStatus(tr("Failed to create %1 directory for new segment: %2")
-                           .arg(QString::fromStdString(segmentationDir))
-                           .arg(QString::fromStdString(mkdirEc.message())),
-                       kStatusLong);
-            cleanupDisplacementTemporarySurfaces();
-            delete result.surface;
-            finalize(false);
-            return;
-        }
-
-        const std::string baseId = sanitizeSegmentId(
-            result.surface->id.empty() ? std::string("dense_displacement") : result.surface->id);
-        const std::string newSegmentId = makeUniqueSegmentId(segmentsDir, baseId);
-        const std::filesystem::path newSegmentPath = segmentsDir / newSegmentId;
-
+        auto* catalog = _surfacePanel ? _surfacePanel->catalog() : nullptr;
+        const std::string newSegmentId = result.surface->id.empty() ? std::string("dense_displacement") : result.surface->id;
+        const std::string sourceUuid = request.segmentationSurface ? request.segmentationSurface->id : std::string{};
         try {
-            vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
-                *result.surface, *request.volumeContext.package,
-                request.volumeContext.activeVolumeId);
-            result.surface->saveAsNew(newSegmentPath, false);
+            if (!catalog) {
+                throw std::runtime_error("no object store attached");
+            }
+            catalog->create(*result.surface, newSegmentId,
+                            {{"tool", "vc3d-dense-displacement"}, {"parameters", nlohmann::json::object()},
+                             {"sources", sourceUuid.empty() ? nlohmann::json::array() : nlohmann::json::array({sourceUuid})}});
         } catch (const std::exception& ex) {
             showStatus(tr("Failed to save dense displacement result: %1").arg(ex.what()), kStatusLong);
             cleanupDisplacementTemporarySurfaces();
@@ -2329,23 +2244,8 @@ void SegmentationGrower::onFutureFinished()
             finalize(false);
             return;
         }
-
-        if (!request.volumeContext.package->addSingleSegmentation(newSegmentId)) {
-            request.volumeContext.package->refreshSegmentations();
-        }
-
-        cleanupDisplacementTemporarySurfaces(newSegmentPath);
+        cleanupDisplacementTemporarySurfaces();
         delete result.surface;
-
-        if (_surfacePanel) {
-            _surfacePanel->addSingleSegmentation(newSegmentId);
-            _surfacePanel->refreshSurfaceMetrics(newSegmentId);
-        } else if (_context.state) {
-            auto loadedSurface = request.volumeContext.package->loadSurface(newSegmentId);
-            if (loadedSurface) {
-                _context.state->setSurface(newSegmentId, loadedSurface, true, false);
-            }
-        }
 
         refreshSegmentationViewers(_context.viewerManager);
         showStatus(
@@ -2596,38 +2496,6 @@ void SegmentationGrower::onFutureFinished()
         _context.module->updateApprovalToolAfterGrowth(currentSegSurface);
     }
 
-    QuadSurface* metaSurface = surfaceToPersist ? surfaceToPersist : request.segmentationSurface.get();
-    synchronizeSurfaceMeta(request.volumeContext.package, metaSurface, _surfacePanel);
-
-    if (_surfacePanel) {
-        std::vector<std::string> idsToRefresh;
-        idsToRefresh.reserve(surfacesToUpdate.size() + 1);
-
-        auto maybeAddId = [&idsToRefresh](QuadSurface* surface) {
-            if (!surface) {
-                return;
-            }
-            const std::string& surfaceId = surface->id;
-            if (surfaceId.empty()) {
-                return;
-            }
-            if (std::find(idsToRefresh.begin(), idsToRefresh.end(), surfaceId) == idsToRefresh.end()) {
-                idsToRefresh.push_back(surfaceId);
-            }
-        };
-
-        for (const auto& surface : surfacesToUpdate) {
-            maybeAddId(surface.get());
-        }
-        maybeAddId(currentSegSurface);
-        if (_context.module && _context.module->hasActiveSession()) {
-            maybeAddId(_context.module->activeBaseSurfaceShared().get());
-        }
-
-        for (const auto& id : idsToRefresh) {
-            _surfacePanel->refreshSurfaceMetrics(id);
-        }
-    }
 
     if (_callbacks.applySliceOrientation) {
         _callbacks.applySliceOrientation(currentSegSurface);

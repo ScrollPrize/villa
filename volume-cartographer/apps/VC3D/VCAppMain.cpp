@@ -322,6 +322,12 @@ auto main(int argc, char* argv[]) -> int
         // Match normal vc3d shutdown after controller/state cleanup.
         std::_Exit(result);
     }
+    if (hasCliFlag(argc, argv, "--test-surface-panel")) {
+        extern int runSurfacePanelStoreTests();
+        const int result = runSurfacePanelStoreTests();
+        std::cout.flush(); std::cerr.flush();
+        std::_Exit(result);
+    }
 #endif
     // Wide surface-aligned Spiral overlays can legitimately exceed Qt's
     // 128-MiB default image-I/O allocation limit. Set the Qt runtime value

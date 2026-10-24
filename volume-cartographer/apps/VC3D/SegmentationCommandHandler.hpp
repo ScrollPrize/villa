@@ -172,24 +172,6 @@ public:
      */
     void setNormalGridPathGetter(std::function<QString()> fn) { _normalGridPathGetter = std::move(fn); }
 
-    /**
-     * Callback for checking if editing is in progress (from SegmentationModule).
-     * Used by onRenameSurface and onCopySurfaceRequested to block during edits.
-     */
-    void setIsEditingCheck(std::function<bool()> fn) { _isEditingCheck = std::move(fn); }
-
-    /**
-     * Callback for clearing the surface selection in the main window.
-     * Used by onMoveSegmentToPaths, onRenameSurface, etc.
-     */
-    void setClearSelectionCallback(std::function<void()> fn) { _clearSelectionCallback = std::move(fn); }
-
-    /**
-     * Callback for restoring selection to a renamed surface by new ID.
-     * Used by onRenameSurface after the folder rename.
-     */
-    void setRestoreSelectionCallback(std::function<void(const std::string&)> fn) { _restoreSelectionCallback = std::move(fn); }
-
     // --- Access to job state ---
 
     std::optional<NeighborCopyJob>& neighborCopyJob() { return _neighborCopyJob; }
@@ -232,7 +214,6 @@ public slots:
     void onSlimFlatten(const std::string& segmentId);
     void onStraighten(const std::string& segmentId);
     void onABFFlatten(const std::string& segmentId);
-    void onExportWidthChunks(const std::string& segmentId);
     void onRasterizeSegments(const QStringList& segmentIds);
     // Open the MergeTifxyzDialog seeded with `segmentIds` (empty = open
     // dialog with empty grid for the user to populate via "Add segments").
@@ -246,10 +227,6 @@ public slots:
     void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
     void onResumeLocalGrowPatchRequested(const QString& segmentId);
     void onCreateSegmentGrowPatchFromSeed(const QVector3D& seedPoint);
-    void onReloadFromBackup(const QString& segmentId, int backupIndex);
-    void onCopySurfaceRequested(const QString& segmentId);
-    void onMoveSegmentToPaths(const QString& segmentId);
-    void onRenameSurface(const QString& segmentId);
 
     void handleNeighborCopyToolFinished(bool success);
 
@@ -336,15 +313,6 @@ public:
     bool cropSurfaceToValidRegion(const std::string& segmentId,
                                   QString* errorMessage = nullptr);
 
-    /// Dialog-free core of onRenameSurface: renames the segment folder + meta.json
-    /// UUID from `oldId` to `newName`, keeping the editing guard, name validation
-    /// (^[a-zA-Z0-9_-]+$), collision check, CState/vpkg cleanup, and rollback.
-    /// Never opens QInputDialog / QMessageBox. Returns true on success; on failure
-    /// sets `err` (when non-null) to a classifiable sentence: "editing in
-    /// progress", "invalid name", "name unchanged", "segment not found", "name
-    /// exists", "no volume package", or a metadata/rename error string.
-    bool renameSurfaceHeadless(const QString& oldId, const QString& newName,
-                               QString* err = nullptr);
 
     QString findNewNeighborSurface(const NeighborCopyJob& job) const;
     bool startNeighborCopyPass(const QString& paramsPath,
@@ -437,7 +405,4 @@ private:
     // Callbacks for CWindow-specific operations
     std::function<QString()> _normal3dZarrPathGetter;
     std::function<QString()> _normalGridPathGetter;
-    std::function<bool()> _isEditingCheck;
-    std::function<void()> _clearSelectionCallback;
-    std::function<void(const std::string&)> _restoreSelectionCallback;
 };

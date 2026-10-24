@@ -124,7 +124,6 @@ private slots:
     void clearSelection();
     void importObjAsPatch();
     void beginRotateSurfaceTransform();
-    void materializeCurrentOpenDataSegmentFolder();
     void exitApplication();
 
 signals:
@@ -242,7 +241,6 @@ private:
     QAction* _mergeTifxyzAct{nullptr};
     QAction* _mergePatchAct{nullptr};
     QAction* _growTrackPatchesAct{nullptr};
-    QAction* _materializeOpenDataFolderAct{nullptr};
     QAction* _recalculateFiberScoresAct{nullptr};
 
     QPointer<QDialog> _keybindsDialog;
