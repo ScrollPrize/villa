@@ -84,10 +84,49 @@ int main() try
         require(store.objectTags(read, std::string{"track"}) == std::vector<std::string>{"reviewed", "track-only"} &&
                 store.objectTags(read, std::string{"fiber"}).empty() &&
                 store.objectTags(read) == std::vector<std::string>{"reviewed", "track-only"}, "distinct tags filter by kind");
+    }
+    {
+        // A surface tilted so z = x + 1, spanning three tile rows, cut by the plane z = 31.25.
+        vc::geometry::Surface surface{70, 40, {1, 1}, {}};
+        for (int r = 0; r < 70; ++r)
+            for (int c = 0; c < 40; ++c) surface.points.push_back({float(c), float(r), float(c + 1)});
+        std::string id;
+        {
+            auto write = store.write();
+            ObjectRecord record; record.kind = "surface";
+            id = store.upsertObject(write, record);
+            store.putGeometry(write, id, vc::geometry::encode(surface));
+            write.commit();
+        }
+        RegionSlice plane; plane.origin = {0, 0, 31.25}; plane.localBounds = {-1000, -1000, -0.5, 1000, 1000, 0.5};
         RegionOptions surfaces; surfaces.kind = "surface";
-        bool rejected = false;
-        try { (void)store.geometryRegion(read, slice, surfaces); } catch (const std::invalid_argument&) { rejected = true; }
-        require(rejected, "unsupported kinds are rejected");
+        auto read = store.read();
+        auto region = store.geometryRegion(read, plane, surfaces);
+        require(region.complete() && region.intersectingObjects == 1 && region.runs.size() == 1, "surface cut chains across tiles");
+        const auto& run = region.runs[0].points;
+        // Each row crossing plus each diagonal crossing (at row + 0.75), all exactly on the plane.
+        require(run.size() == 139 && std::all_of(run.begin(), run.end(), [](const auto& p) { return p[0] == 30.25 && p[2] == 31.25; }),
+                "surface cut follows the triangle mesh exactly");
+        const auto [low, high] = std::minmax(run.front()[1], run.back()[1]);
+        require(low == 0 && high == 69, "surface cut spans the grid");
+        plane.localBounds = {-1000, 10, -0.5, 1000, 20, 0.5};
+        region = store.geometryRegion(read, plane, surfaces);
+        require(region.runs.size() == 1 && std::min(region.runs[0].points.front()[1], region.runs[0].points.back()[1]) == 10 &&
+                std::max(region.runs[0].points.front()[1], region.runs[0].points.back()[1]) == 20, "surface cut is clipped to the slice");
+        surfaces.family = "any";
+        mustFail([&] { (void)store.geometryRegion(read, plane, surfaces); });
+        surfaces.family.reset();
+        {
+            auto write = store.write();
+            std::vector<uint8_t> valid(70 * 40, 1);
+            valid[40 * 40 + 30] = 0;
+            store.updateSurfaceChannels(write, id, {{"valid", "|u1", {70, 40}, valid}}, {}, store.currentGeometry(write, id)->uuid);
+            write.commit();
+        }
+        auto masked = store.read();
+        plane.localBounds = {-1000, -1000, -0.5, 1000, 1000, 0.5};
+        region = store.geometryRegion(masked, plane, surfaces);
+        require(region.runs.size() == 2 && region.intersectingObjects == 1, "invalid vertices break the cut");
     }
     std::cout << "geometry region tests passed\n";
 } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

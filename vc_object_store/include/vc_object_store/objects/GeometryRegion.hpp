@@ -16,7 +16,9 @@ struct RegionSlice {
 };
 struct RegionOptions {
     // Object kind to intersect. Polyline kinds: "fiber" (nonempty line_points,
-    // otherwise control_points) and "track" (points).
+    // otherwise control_points) and "track" (points). "surface" returns the
+    // polylines where its valid triangles cross the slab's mid-plane, clipped to
+    // the u/v bounds; family and minLength do not apply to surfaces.
     std::string kind = "fiber";
     uint64_t maximumObjects = 0; // zero means unlimited; selected is then ignored
     std::optional<std::string> selected;

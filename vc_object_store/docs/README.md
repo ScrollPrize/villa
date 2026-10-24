@@ -480,8 +480,8 @@ the full geometry. Full `put_geometry` replacements have a separate contract.
 
 `geometry_region(RegionSlice, RegionOptions, cancel=None)` combines conservative
 spatial bounds with exact double-precision segment/slab intersections. It returns
-original unclipped XYZ and zero-based segment indices in contiguous runs; the
-consumer handles rendering/trimming. `geometry/SegmentClip.hpp` shares the clipper.
+original unclipped XYZ and zero-based segment indices in contiguous runs (for
+polyline kinds); the consumer handles rendering/trimming. `geometry/SegmentClip.hpp` shares the clipper.
 
 ```python
 from vc_object_store import RegionSlice, RegionOptions
@@ -499,8 +499,20 @@ result = store.geometry_region(view, options)
 Axes must be finite/orthonormal (tolerance `1e-12`); bounds are finite and ordered,
 with zero thickness allowed. Segments can intersect with both endpoints outside.
 `options.kind` selects one polyline kind: `fiber` (nonempty `line_points` take
-precedence over controls) or `track` (`points`, widened exactly to float64).
-Other kinds are rejected. `min_points` defaults to 2.
+precedence over controls) or `track` (`points`, widened exactly to float64), or
+`surface`. Other kinds are rejected. `min_points` defaults to 2.
+
+A surface returns the cut of its exact triangle mesh by the slab's mid-plane
+(normal coordinate halfway between the slab's normal bounds), clipped to the
+slice's u/v extent. Cells whose four vertices are valid (coordinates and the
+`valid` channel) split along the diagonal into `(r,c),(r,c+1),(r+1,c)` and
+`(r,c+1),(r+1,c+1),(r+1,c)`. A vertex on the plane counts as on its positive
+side. Crossings are computed once per grid edge in double precision, so runs
+are connected polylines through tile boundaries; invalid cells and the u/v
+extent split them into separate runs. Only the spatial tiles that touch the slab
+are read. Run points are the computed crossings (not stored vertices),
+`array_name` is `points` and `first_segment` is the run's offset in its chain.
+Surfaces have no family or length summary, so those filters are rejected.
 Family/minimum length filter import annotations, not recomputed geometry.
 Retired/external-only objects are excluded. UUID ordering is stable; `selected`
 is attempted first when limited. Only intersecting objects consume the limit,
