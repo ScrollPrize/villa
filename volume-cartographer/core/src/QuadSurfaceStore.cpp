@@ -99,7 +99,7 @@ vc::objects::GeometryRevision currentSurface(const vc::objects::ObjectStore& db,
 } // namespace
 
 std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore& db, const vc::objects::Txn& txn,
-    const std::string& objectUuid, const std::optional<std::string>& geometryRevision)
+    const std::string& objectUuid, const std::optional<std::string>& geometryRevision, bool applyValidity)
 {
     const auto object = db.objectByUuid(txn, objectUuid);
     if (!object || object->kind != "surface") throw std::runtime_error("not a surface object: " + objectUuid);
@@ -117,7 +117,7 @@ std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore
         mask.create(rows, cols);
         for (int i = 0; i < rows * cols; ++i) {
             mask(i / cols, i % cols) = valid[size_t(i)] ? 255 : 0;
-            if (!valid[size_t(i)]) (*points)(i / cols, i % cols) = kInvalid;
+            if (applyValidity && !valid[size_t(i)]) (*points)(i / cols, i % cols) = kInvalid;
         }
     }
     const auto attributes = nlohmann::json::parse(revision->attributes);

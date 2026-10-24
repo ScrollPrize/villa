@@ -13,6 +13,7 @@
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/tracer/Tracer.hpp"
+#include "vc/core/util/StoreSurfaces.hpp"
 
 #include "vc/core/types/VcDataset.hpp"
 #include <boost/program_options.hpp>
@@ -274,6 +275,10 @@ static int run_main(int argc, char *argv[])
     bool skip_overlap_check = false;
     std::string segment_name;
     std::optional<unsigned int> rng_seed;
+    // Store mode: surfaces come from and go to an object store instead of tifxyz directories.
+    std::filesystem::path store_path;
+    std::string surface_uuid, volume_uuid;
+    std::vector<std::string> output_tags;
 
     bool use_old_args = (argc == 4 || argc == 7) && argv[1][0] != '-' && argv[2][0] != '-' && argv[3][0] != '-';
 
@@ -289,7 +294,11 @@ static int run_main(int argc, char *argv[])
         desc.add_options()
             ("help,h", "produce help message")
             ("volume,v", po::value<std::string>()->required(), "OME-Zarr volume path")
-            ("target-dir,t", po::value<std::string>()->required(), "Target directory for output")
+            ("target-dir,t", po::value<std::string>(), "Target directory for output (tifxyz mode)")
+            ("store", po::value<std::string>(), "Object store (local or hosted replica) holding input and output surfaces")
+            ("surface", po::value<std::string>(), "Stored surface UUID to resume from or to project (store mode)")
+            ("volume-uuid", po::value<std::string>(), "Volume the output surface's coordinates are bound to (store mode)")
+            ("tag", po::value<std::vector<std::string>>()->composing(), "Tag for the output surface (store mode, repeatable)")
             ("params,p", po::value<std::string>()->required(), "JSON parameters file")
             ("seed,s", po::value<std::vector<float>>()->multitoken(), "Seed coordinates (x y z)")
             ("resume", po::value<std::string>(), "Path to a tifxyz surface to resume from")
@@ -320,8 +329,24 @@ static int run_main(int argc, char *argv[])
         }
 
         vol_path = vm["volume"].as<std::string>();
-        tgt_dir = vm["target-dir"].as<std::string>();
         params_path = vm["params"].as<std::string>();
+        if (vm.count("store")) store_path = vm["store"].as<std::string>();
+        if (vm.count("target-dir")) tgt_dir = vm["target-dir"].as<std::string>();
+        if (store_path.empty() == tgt_dir.empty()) {
+            std::cerr << "ERROR: specify exactly one of --store and --target-dir" << std::endl;
+            return EXIT_FAILURE;
+        }
+        if (vm.count("surface")) surface_uuid = vm["surface"].as<std::string>();
+        if (vm.count("volume-uuid")) volume_uuid = vm["volume-uuid"].as<std::string>();
+        if (vm.count("tag")) output_tags = vm["tag"].as<std::vector<std::string>>();
+        if (store_path.empty() && (!surface_uuid.empty() || !volume_uuid.empty() || !output_tags.empty())) {
+            std::cerr << "ERROR: --surface, --volume-uuid and --tag require --store" << std::endl;
+            return EXIT_FAILURE;
+        }
+        if (!store_path.empty() && vm.count("resume")) {
+            std::cerr << "ERROR: in store mode, resume from --surface UUID" << std::endl;
+            return EXIT_FAILURE;
+        }
 
         if (vm.count("seed")) {
             auto seed_coords = vm["seed"].as<std::vector<float>>();
@@ -336,8 +361,8 @@ static int run_main(int argc, char *argv[])
         }
 
         if (vm.count("correct")) {
-            if (!vm.count("resume")) {
-                std::cerr << "ERROR: --correct can only be used with --resume" << std::endl;
+            if (!vm.count("resume") && !vm.count("surface")) {
+                std::cerr << "ERROR: --correct can only be used with --resume or --surface" << std::endl;
                 return EXIT_FAILURE;
             }
             correct_path = vm["correct"].as<std::string>();
@@ -445,6 +470,22 @@ static int run_main(int argc, char *argv[])
 
     srand(rng_seed ? *rng_seed : static_cast<unsigned int>(clock()));
 
+    std::optional<StoreSurfaces> store;
+    if (!store_path.empty()) store.emplace(store_path, "vc_grow_seg_from_seed");
+    const bool resuming = !resume_path.empty() || !surface_uuid.empty();
+    // Stored surfaces within `tolerance` of a point (in the bound volume's voxels when given).
+    auto stored_surfaces_near = [&](const cv::Vec3d& p, double tolerance) {
+        vc::objects::SurfaceProximityQuery query;
+        query.point = {p[0], p[1], p[2]};
+        query.tolerance = tolerance;
+        if (!volume_uuid.empty()) query.volume = volume_uuid;
+        std::vector<vc::objects::SurfaceProximityHit> hits;
+        store->session()->read(store->attachment(), [&](const auto& db, const auto& txn, const auto&) {
+            hits = db.nearestSurfaces(txn, query);
+        });
+        return hits;
+    };
+
     std::string name_prefix = "auto_grown_";
     int tgt_overlap_count = params.value("tgt_overlap_count", 20);
     float min_area_cm = params.value("min_area_cm", 0.3);
@@ -499,6 +540,7 @@ static int run_main(int argc, char *argv[])
 
     //expansion mode
     int count_overlap = 0;
+    std::unique_ptr<QuadSurface> stored_src;
     if (mode == "expansion") {
         //got trough all exising segments (that match filter/start with auto ...)
         //list which ones do not yet less N overlapping (in symlink dir)
@@ -510,6 +552,7 @@ static int run_main(int argc, char *argv[])
             //if both still have less than N then grow a seg from the seed
             //after growing, check locations on the new seg agains all existing segs
 
+        if (!store)
         for (const auto& entry : std::filesystem::directory_iterator(tgt_dir))
             if (std::filesystem::is_directory(entry)) {
                 std::string name = entry.path().filename().string();
@@ -537,17 +580,15 @@ static int run_main(int argc, char *argv[])
                 surfs_v.push_back(sm);
             }
             
-        if (!surfs.size()) {
+        if (!store && !surfs.size()) {
             std::cerr << "ERROR: no seed surfaces found in expansion mode" << std::endl; 
             return EXIT_FAILURE;
         }
-        
-        std::default_random_engine rng(rng_seed ? *rng_seed : static_cast<unsigned int>(clock()));
-        std::shuffle(std::begin(surfs_v), std::end(surfs_v), rng);
 
 
-        for(auto &it : surfs_v) {
-            src = it;
+        // A seed on `src`: a random vertex, or one walked in from an edge, over dense voxels.
+        auto sample_seed = [&](QuadSurface& seed_surface) {
+            QuadSurface* src = &seed_surface;
             cv::Mat_<cv::Vec3f> points = src->rawPoints();
             int w = points.cols;
             int h = points.rows;
@@ -598,7 +639,42 @@ static int run_main(int argc, char *argv[])
                 }
             }
 
-            if (!found)
+            return found;
+        };
+        if (store) {
+            // One candidate loaded at a time; overlaps are counted with the store's proximity query.
+            std::vector<std::string> candidates;
+            store->session()->read(store->attachment(), [&](const auto& db, const auto& txn, const auto&) {
+                vc::objects::ObjectSelection selection;
+                selection.kind = "surface";
+                if (!volume_uuid.empty()) selection.volume = volume_uuid;
+                for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{}))
+                    candidates.push_back(object.uuid);
+            });
+            if (candidates.empty()) {
+                std::cerr << "ERROR: no seed surfaces found in expansion mode" << std::endl;
+                return EXIT_FAILURE;
+            }
+            std::default_random_engine rng(rng_seed ? *rng_seed : static_cast<unsigned int>(clock()));
+            std::shuffle(candidates.begin(), candidates.end(), rng);
+            for (const auto& uuid : candidates) {
+                auto candidate = store->load(uuid);
+                if (!sample_seed(*candidate))
+                    continue;
+                count_overlap = 0;
+                for (const auto& hit : stored_surfaces_near(origin, 2.0))
+                    if (hit.objectUuid != uuid) ++count_overlap;
+                stored_src = std::move(candidate);
+                src = stored_src.get();
+                if (count_overlap < tgt_overlap_count-1)
+                    break;
+            }
+        } else {
+        std::default_random_engine rng(rng_seed ? *rng_seed : static_cast<unsigned int>(clock()));
+        std::shuffle(std::begin(surfs_v), std::end(surfs_v), rng);
+        for(auto &it : surfs_v) {
+            src = it;
+            if (!sample_seed(*src))
                 continue;
 
             count_overlap = 0;
@@ -613,11 +689,11 @@ static int run_main(int argc, char *argv[])
             if (count_overlap < tgt_overlap_count-1)
                 break;
         }
-
+        }
         std::cout << "found potential overlapping starting seed " << origin << " with overlap " << count_overlap << std::endl;
     }
     else if (mode != "gen_neighbor") {
-        if (!resume_path.empty()) {
+        if (resuming) {
             mode = "resume";
         } else if (use_old_args && argc == 7) {
             mode = "explicit_seed";
@@ -660,7 +736,8 @@ static int run_main(int argc, char *argv[])
                     cv::Vec3d p = origin + i*dir;
                     interpolator.Evaluate(p[2], p[1], p[0], &v);
                     if (v >= 128) {
-                        if (check_existing_segments(tgt_dir, p, name_prefix, search_effort))
+                        if (store ? !stored_surfaces_near(p, 2.0).empty()
+                                  : check_existing_segments(tgt_dir, p, name_prefix, search_effort))
                             continue;
                         succ = true;
                         origin = p;
@@ -700,7 +777,9 @@ static int run_main(int argc, char *argv[])
 
     std::unique_ptr<QuadSurface> resume_surf;
     if (mode == "resume") {
-        if (corrections.getAllCollections().empty())
+        if (store)
+            resume_surf = store->load(surface_uuid, corrections.getAllCollections().empty());
+        else if (corrections.getAllCollections().empty())
            resume_surf = load_quad_from_tifxyz(resume_path);
         else
             resume_surf = load_quad_from_tifxyz(resume_path, SURF_LOAD_IGNORE_MASK);
@@ -719,7 +798,10 @@ static int run_main(int argc, char *argv[])
 
     std::string seg_name;
     std::filesystem::path seg_dir;
-    if (!segment_name.empty()) {
+    if (store) {
+        // Store outputs are objects; the tracer writes no file snapshots.
+        seg_name = segment_name.empty() ? name_prefix + time_str() : segment_name;
+    } else if (!segment_name.empty()) {
         // Use target-dir directly with custom segment name
         seg_name = segment_name;
         seg_dir = tgt_dir;
@@ -729,20 +811,29 @@ static int run_main(int argc, char *argv[])
         seg_dir = tgt_dir / seg_name;
     }
 
+    // Store mode output: a new surface object recording how it was made.
+    auto publish = [&](QuadSurface& output, const std::string& name, const Json& meta, const std::vector<std::string>& sources) {
+        std::optional<nlohmann::json> coordinates;
+        if (!volume_uuid.empty()) coordinates = nlohmann::json{{"volume_uuid", volume_uuid}, {"scale_factor", 1}};
+        const auto uuid = store->create(output, name, nlohmann::json::parse(meta.dump()), sources, output_tags, coordinates);
+        store->finish();
+        std::cout << "surface_uuid: " << uuid << std::endl;
+    };
+
     //
     // gen_neighbor mode: project a source tifxyz surface "in" or "out" along its vertex normals
     // to the first nonzero voxel within a max distance, producing a new tifxyz surface.
     //
     if (mode == "gen_neighbor") {
-        if (resume_path.empty()) {
-            std::cerr << "ERROR: gen_neighbor mode requires --resume <tifxyz_dir> to provide the source surface" << std::endl;
+        if (!resuming) {
+            std::cerr << "ERROR: gen_neighbor mode requires --resume <tifxyz_dir> or --surface UUID for the source surface" << std::endl;
             return EXIT_FAILURE;
         }
 
         // Load source surface
         std::unique_ptr<QuadSurface> src_surface;
         try {
-            src_surface = load_quad_from_tifxyz(resume_path);
+            src_surface = store ? store->load(surface_uuid) : load_quad_from_tifxyz(resume_path);
         } catch (const std::exception& ex) {
             std::cerr << "ERROR: failed to load resume surface: " << ex.what() << std::endl;
             return EXIT_FAILURE;
@@ -1527,7 +1618,8 @@ static int run_main(int argc, char *argv[])
         add_target_context(neighbor_meta, vol_path);
 
         out_surf->meta = neighbor_meta;
-        out_surf->saveAsNew(out_dir, true);
+        if (store) publish(*out_surf, uuid_local, neighbor_meta, {surface_uuid});
+        else out_surf->saveAsNew(out_dir, true);
 
         // Done
         return EXIT_SUCCESS;
@@ -1553,7 +1645,7 @@ static int run_main(int argc, char *argv[])
         if (area_cm2 < min_area_cm) {
             std::cout << "discarding generated surface because area_cm2 " << area_cm2
                       << " is below min_area_cm " << min_area_cm << std::endl;
-            if (std::filesystem::exists(seg_dir)) {
+            if (!store && std::filesystem::exists(seg_dir)) {
                 std::filesystem::remove_all(seg_dir);
             }
 #if defined(_WIN32)
@@ -1565,6 +1657,16 @@ static int run_main(int argc, char *argv[])
             return EXIT_SUCCESS;
 #endif
         }
+    }
+
+    if (store) {
+        // Overlap relationships between stored surfaces are discovered by vc_object_links.
+        std::vector<std::string> sources;
+        if (mode == "resume") sources.push_back(surface_uuid);
+        else if (mode == "expansion" && src) sources.push_back(src->id);
+        publish(*surf, seg_name, surf->meta, sources);
+        delete surf;
+        return EXIT_SUCCESS;
     }
 
     std::cout << "saving " << seg_dir.string() << std::endl;

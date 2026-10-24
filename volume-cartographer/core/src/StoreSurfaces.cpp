@@ -20,12 +20,12 @@ StoreSurfaces::~StoreSurfaces()
     try { session_->detach(attachment_); } catch (...) {}
 }
 
-std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid)
+std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool applyValidity)
 {
     std::unique_ptr<QuadSurface> surface;
     std::string revision;
     session_->read(attachment_, [&](const auto& db, const auto& txn, const auto&) {
-        surface = load_quad_from_store(db, txn, uuid);
+        surface = load_quad_from_store(db, txn, uuid, std::nullopt, applyValidity);
         revision = db.currentGeometry(txn, surface->id)->uuid;
     });
     surface->setChannelLoader(store_channel_loader(session_, attachment_, revision));
@@ -36,7 +36,11 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
                                   const std::vector<std::string>& sources, const std::vector<std::string>& tags,
                                   const std::optional<nlohmann::json>& coordinates)
 {
-    nlohmann::json meta = nlohmann::json::object();
+    auto meta = nlohmann::json::parse(surface.meta.dump());
+    if (!meta.is_object()) meta = nlohmann::json::object();
+    // Identity, geometry and file layout belong to the object and its geometry.
+    for (const auto* key : {"uuid", "name", "format", "type", "bbox", "scale", "tiff_dimensions", "coordinates", "provenance"})
+        meta.erase(key);
     if (coordinates) meta["coordinates"] = *coordinates;
     else if (!sources.empty())
         session_->read(attachment_, [&](const auto& db, const auto& txn, const auto&) {

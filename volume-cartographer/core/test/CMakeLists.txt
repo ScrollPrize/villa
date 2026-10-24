@@ -387,6 +387,12 @@ if(VC_RUN_E2E)
         ENVIRONMENT "VC_RUN_E2E=1;VC_OBJ2TIFXYZ_LEGACY_BIN=$<TARGET_FILE:vc_obj2tifxyz_legacy>")
 endif()
 
+# Spawns the built vc_grow_seg_from_seed on a synthetic sheet in store mode.
+vc_add_test(NAME test_grow_seg_store_mode)
+add_dependencies(test_grow_seg_store_mode vc_grow_seg_from_seed)
+set_tests_properties(test_grow_seg_store_mode PROPERTIES
+    ENVIRONMENT "VC_GROW_SEG_FROM_SEED_BIN=$<TARGET_FILE:vc_grow_seg_from_seed>")
+
 add_executable(bench_volume_sample bench_volume_sample.cpp)
 target_link_libraries(bench_volume_sample PRIVATE doctest::doctest vc_core)
 vc_register_test_target(bench_volume_sample)

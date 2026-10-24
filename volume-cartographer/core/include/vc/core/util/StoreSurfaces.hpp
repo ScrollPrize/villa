@@ -23,10 +23,11 @@ public:
     StoreSurfaces& operator=(const StoreSurfaces&) = delete;
 
     // The surface's current geometry; channels load on demand from that revision.
-    std::unique_ptr<QuadSurface> load(const std::string& uuid);
-    // A new surface object holding `surface`. meta.provenance records the tool,
-    // its parameters and the source objects; meta.coordinates is taken from the
-    // first source unless given.
+    std::unique_ptr<QuadSurface> load(const std::string& uuid, bool applyValidity = true);
+    // A new surface object holding `surface`. Its meta keeps the surface's meta
+    // (e.g. area) except tifxyz file keys; meta.provenance records the tool, its
+    // parameters and the source objects; meta.coordinates is taken from the first
+    // source unless given.
     std::string create(QuadSurface& surface, const std::string& name, const nlohmann::json& parameters,
                        const std::vector<std::string>& sources = {}, const std::vector<std::string>& tags = {},
                        const std::optional<nlohmann::json>& coordinates = std::nullopt);
