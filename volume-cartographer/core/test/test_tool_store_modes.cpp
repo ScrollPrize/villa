@@ -314,3 +314,21 @@ TEST_CASE("vc_straighten stores its result as a new surface")
     CHECK(stored->countValidPoints() < load_quad_from_store(db, txn, f.uuid)->countValidPoints());  // trimmed
     CHECK(db.objectByUuid(txn, uuid)->name == "surface_straight");
 }
+
+TEST_CASE("vc_tifxyz2zarr_sparse rasterizes stored surfaces like tifxyz folders")
+{
+    Fixture f;
+    fs::create_directories(f.dir / "meshes");
+    fs::rename(f.tifxyz, f.dir / "meshes" / "surface.tifxyz");
+    const auto bin = tool("VC_TIFXYZ2ZARR_SPARSE_BIN") + " --shape-z 128 --shape-y 192 --shape-x 192 --chunk-size 32 --threads 2";
+    run(bin + " \"" + (f.dir / "meshes").string() + "\" \"" + (f.dir / "file.zarr").string() + "\"", f.dir / "file.log");
+    run(bin + " --store \"" + f.store.string() + "\" --surface " + f.uuid + " \"" + (f.dir / "store.zarr").string() + "\"", f.dir / "store.log");
+    size_t chunks = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(f.dir / "file.zarr")) {
+        if (!entry.is_regular_file() || entry.path().extension() == ".json" || entry.path().filename().string()[0] == '.') continue;
+        const auto relative = fs::relative(entry.path(), f.dir / "file.zarr");
+        CHECK(readFile(f.dir / "store.zarr" / relative) == readFile(entry.path()));
+        ++chunks;
+    }
+    CHECK(chunks > 0);
+}

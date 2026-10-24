@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -65,5 +66,8 @@ private:
     vc::objects::AttachmentIdentity attachment_;
     std::optional<std::chrono::system_clock::time_point> lastWrite_;
     // Object and geometry revisions of each loaded surface, the pins of updates.
+    // Loads may run on several threads.
+    std::mutex loadedMutex_;
     std::map<std::string, std::pair<std::string, std::string>> loaded_;
+    std::optional<std::pair<std::string, std::string>> loadedRevision(const std::string& uuid);
 };

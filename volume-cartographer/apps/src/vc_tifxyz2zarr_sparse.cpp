@@ -1,4 +1,5 @@
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/StoreSurfaces.hpp"
 #include "vc/core/util/BinaryPyramid.hpp"
 #include "vc/core/util/TriangleVoxelRaster.hpp"
 #include "vc/core/util/Zarr.hpp"
@@ -14,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <iostream>
 #include <list>
@@ -878,6 +880,10 @@ static void rasterizePointGridRows(const cv::Mat_<cv::Vec3f>& pts,
     }
 }
 
+// Meshes are tifxyz directories, or stored surface UUIDs in store mode.
+static std::function<std::unique_ptr<QuadSurface>(const fs::path&)> loadMesh =
+    [](const fs::path& mesh) { return load_quad_from_tifxyz(mesh.string()); };
+
 template<typename EmitVoxel>
 static void rasterizeTifxyzMeshToSpool(const fs::path& meshPath,
                                        const Shape3& shape,
@@ -885,7 +891,7 @@ static void rasterizeTifxyzMeshToSpool(const fs::path& meshPath,
                                        std::size_t zMax,
                                        RasterMode rasterMode,
                                        EmitVoxel&& emit) {
-    auto surf = load_quad_from_tifxyz(meshPath.string());
+    auto surf = loadMesh(meshPath);
     const cv::Mat_<cv::Vec3f> pts = surf->rawPoints();
     if (pts.empty()) return;
     rasterizePointGridRows(pts, 0, pts.rows - 1, shape, rasterMode,
@@ -904,7 +910,7 @@ static void rasterizeSingleMeshIntraParallel(const fs::path& meshPath,
                                              RasterMode rasterMode,
                                              size_t numThreads,
                                              SpoolManager& spool) {
-    auto surf = load_quad_from_tifxyz(meshPath.string());
+    auto surf = loadMesh(meshPath);
     const cv::Mat_<cv::Vec3f> pts = surf->rawPoints();
     const int quadRows = pts.rows - 1;
     if (pts.empty() || quadRows <= 0 || pts.cols < 2) return;
@@ -1453,6 +1459,8 @@ int main(int argc, char* argv[])
         desc.add_options()
             ("help,h", "Show help")
             ("input", po::value<std::string>(), "Input folder containing tifxyz meshes")
+            ("store", po::value<std::string>(), "Object store holding the meshes (with --surface); the positional is then the output")
+            ("surface", po::value<std::vector<std::string>>()->composing(), "Stored surface UUID to rasterize (repeatable, with --store)")
             ("output", po::value<std::string>(), "Output OME-Zarr root")
             ("shape-z", po::value<size_t>(), "Output Z size")
             ("shape-y", po::value<size_t>(), "Output Y size")
@@ -1492,6 +1500,18 @@ int main(int argc, char* argv[])
                           .run();
         po::store(parsed, vm);
         po::notify(vm);
+        std::optional<StoreSurfaces> store;
+        if (vm.count("store")) {
+            if (!vm.count("surface")) throw std::runtime_error("--store needs at least one --surface");
+            // The one positional is the output.
+            if (vm.count("input") && !vm.count("output")) vm.insert({"output", vm["input"]});
+            vm.erase("input");
+            vm.insert({"input", po::variable_value(std::string(), false)});
+            store.emplace(vm["store"].as<std::string>(), "vc_tifxyz2zarr_sparse");
+            loadMesh = [&](const fs::path& uuid) { return store->load(uuid.string()); };
+        } else if (vm.count("surface")) {
+            throw std::runtime_error("--surface needs --store");
+        }
 
         if (vm.count("help") || !vm.count("input") || !vm.count("output")) {
             if (vm.count("self-test") && vm["self-test"].as<bool>()) {
@@ -1571,7 +1591,9 @@ int main(int argc, char* argv[])
         }
         const size_t numThreads = static_cast<size_t>(threadCount);
 
-        const auto meshes = discoverTifxyzMeshes(inputRoot);
+        std::vector<fs::path> meshes;
+        if (store) for (const auto& uuid : vm["surface"].as<std::vector<std::string>>()) meshes.emplace_back(uuid);
+        else meshes = discoverTifxyzMeshes(inputRoot);
         if (meshes.empty()) {
             throw std::runtime_error("no tifxyz meshes found: " + inputRoot.string());
         }

@@ -22,12 +22,16 @@ StoreSurfaces::~StoreSurfaces() = default;
 std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool applyValidity)
 {
     std::unique_ptr<QuadSurface> surface;
-    std::string revision;
+    std::string objectRevision, revision;
     session_->read(attachment_, [&](const auto& db, const auto& txn, const auto&) {
         surface = load_quad_from_store(db, txn, uuid, std::nullopt, applyValidity);
         revision = db.currentGeometry(txn, surface->id)->uuid;
-        loaded_[surface->id] = {db.currentObjectRevision(txn, surface->id)->uuid, revision};
+        objectRevision = db.currentObjectRevision(txn, surface->id)->uuid;
     });
+    {
+        std::lock_guard lock(loadedMutex_);
+        loaded_[surface->id] = {objectRevision, revision};
+    }
     surface->setChannelLoader(store_channel_loader(session_, attachment_, revision));
     return surface;
 }
@@ -68,13 +72,14 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
 
 std::string StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
 {
-    const auto found = loaded_.find(vc::objects::util::canonicalUuid(uuid));
-    if (found == loaded_.end()) throw std::runtime_error("update a surface this tool loaded: " + uuid);
-    const auto& [objectRevision, geometryRevision] = found->second;
+    const auto canonical = vc::objects::util::canonicalUuid(uuid);
+    const auto pins = loadedRevision(canonical);
+    if (!pins) throw std::runtime_error("update a surface this tool loaded: " + uuid);
+    const auto& [objectRevision, geometryRevision] = *pins;
     const auto& points = *surface.rawPointsPtr();
     std::string revision;
-    session_->editKeepingRelationships(attachment_, {{found->first, objectRevision}}, [&](auto& db, auto& txn, const auto& keep) {
-        revision = write_quad_rect_to_store(db, txn, found->first, surface, cv::Rect(0, 0, points.cols, points.rows),
+    session_->editKeepingRelationships(attachment_, {{canonical, objectRevision}}, [&](auto& db, auto& txn, const auto& keep) {
+        revision = write_quad_rect_to_store(db, txn, canonical, surface, cv::Rect(0, 0, points.cols, points.rows),
                                             geometryRevision, keep);
     });
     lastWrite_ = std::chrono::system_clock::now();
@@ -83,15 +88,24 @@ std::string StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
 
 std::string StoreSurfaces::updateChannels(const std::string& uuid, QuadSurface& surface, const std::vector<std::string>& names)
 {
-    const auto found = loaded_.find(vc::objects::util::canonicalUuid(uuid));
-    if (found == loaded_.end()) throw std::runtime_error("update a surface this tool loaded: " + uuid);
-    const auto& [objectRevision, geometryRevision] = found->second;
+    const auto canonical = vc::objects::util::canonicalUuid(uuid);
+    const auto pins = loadedRevision(canonical);
+    if (!pins) throw std::runtime_error("update a surface this tool loaded: " + uuid);
+    const auto& [objectRevision, geometryRevision] = *pins;
     std::string revision;
-    session_->editKeepingRelationships(attachment_, {{found->first, objectRevision}}, [&](auto& db, auto& txn, const auto&) {
-        revision = write_quad_channels_to_store(db, txn, found->first, surface, names, {}, geometryRevision);
+    session_->editKeepingRelationships(attachment_, {{canonical, objectRevision}}, [&](auto& db, auto& txn, const auto&) {
+        revision = write_quad_channels_to_store(db, txn, canonical, surface, names, {}, geometryRevision);
     });
     lastWrite_ = std::chrono::system_clock::now();
     return revision;
+}
+
+std::optional<std::pair<std::string, std::string>> StoreSurfaces::loadedRevision(const std::string& uuid)
+{
+    std::lock_guard lock(loadedMutex_);
+    const auto found = loaded_.find(uuid);
+    if (found == loaded_.end()) return std::nullopt;
+    return found->second;
 }
 
 std::filesystem::path StoreSurfaces::artifactDirectory(const std::string& uuid)
