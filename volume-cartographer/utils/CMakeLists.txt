@@ -1,6 +1,7 @@
 find_package(Qt6 REQUIRED COMPONENTS Core)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 add_library(utils src/zarr.cpp src/Json.cpp src/aws_auth.cpp src/http_fetch.cpp src/sftp_fetch.cpp)
-target_link_libraries(utils PRIVATE Qt6::Core)
+target_link_libraries(utils PRIVATE Qt6::Core OpenSSL::Crypto)
 target_include_directories(utils PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
