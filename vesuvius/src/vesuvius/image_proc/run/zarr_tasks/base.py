@@ -8,11 +8,12 @@ and finalization.
 from __future__ import annotations
 
 import argparse
+import math
+import os
 from abc import ABC, abstractmethod
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from multiprocessing import Pool
-from os import cpu_count
 from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional, Tuple
 
@@ -261,6 +262,28 @@ class ZarrTask(ABC):
         pass
 
 
+_CGROUP_CPU_MAX = Path("/sys/fs/cgroup/cpu.max")
+
+
+def available_cpus() -> int:
+    """CPUs this process may use: its affinity mask, capped by a cgroup CPU quota.
+
+    os.cpu_count() reports every core on the host, so in a container or batch job
+    limited to a few CPUs it starts far more workers than the job may run.
+    """
+    try:
+        cpus = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        cpus = os.cpu_count() or 1
+    try:  # cgroup v2: "max 100000" or "<quota> <period>"
+        quota, period = _CGROUP_CPU_MAX.read_text().split()[:2]
+        if quota != "max":
+            cpus = min(cpus, max(1, math.ceil(int(quota) / int(period))))
+    except (OSError, ValueError):
+        pass
+    return max(1, cpus)
+
+
 def get_base_parser() -> argparse.ArgumentParser:
     """Create base argument parser with common options.
 
@@ -291,7 +314,7 @@ def get_base_parser() -> argparse.ArgumentParser:
         "--num-workers",
         type=int,
         default=None,
-        help="Number of worker processes (default: number of CPU cores)",
+        help="Number of worker processes (default: the CPUs this job may use)",
     )
     parser.add_argument(
         "--inplace",
@@ -330,7 +353,7 @@ def make_task_config(args: argparse.Namespace) -> TaskConfig:
     return TaskConfig(
         input_zarr=args.input_zarr,
         output_zarr=args.output_zarr,
-        num_workers=args.num_workers if args.num_workers else cpu_count(),
+        num_workers=args.num_workers if args.num_workers else available_cpus(),
         inplace=args.inplace,
         level=args.level,
     )
