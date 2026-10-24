@@ -100,7 +100,8 @@ blocks = reader.read_many([
 ```
 
 `np.s_` builds slice selections without reading data, using the same colon
-syntax as direct indexing. These methods accept integers, unit-step slices and ellipsis.
+syntax as direct indexing. These methods accept integers, positive-step slices and ellipsis;
+a stepped slice reads only the chunks (CUDA: bricks) that hold sampled elements.
 Negative indices wrap, slice bounds clip, and integer indices remove axes.
 Destination buffers must match the selected shape and requested dtype;
 conversion writes directly into those buffers. Batched selections share chunk

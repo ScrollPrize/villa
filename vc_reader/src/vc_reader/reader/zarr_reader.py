@@ -45,7 +45,7 @@ from ..errors import CacheMissError
 from .auth import Access, http_url, is_remote, resolve_access
 from .disk_cache import CacheLayer, cached_source_zarray, open_layers, cached_node_dirs, atomic_write, disk_budget
 from .memory_cache import MemoryCache
-from ._indexing import parse_index, expand_index
+from ._indexing import parse_index, parse_selection, expand_index
 from .zarr_meta import ArrayMeta
 
 READ_MODES = ("mmap", "slab")
@@ -441,8 +441,9 @@ class ZarrReader:
     def read(self, selection, *, out=None, dtype=None):
         """Read a NumPy-style selection, optionally converting directly into out.
 
-        Accept integers, unit-step slices and ellipsis, with the same clipping
-        and axis removal as indexing. ``out`` uses the selected output shape.
+        Accept integers, positive-step slices and ellipsis, with the same clipping
+        and axis removal as indexing. Stepped slices read only the chunks holding
+        sampled elements. ``out`` uses the selected output shape.
         """
         return self.read_many([selection], out=None if out is None else [out], dtype=dtype)[0]
 
@@ -452,13 +453,13 @@ class ZarrReader:
         ``out`` supplies one optional destination per selection. Conversion
         writes directly into the destinations; no intermediate crop is needed.
         """
-        plans = [parse_index(selection, self.shape) for selection in selections]
+        plans = [parse_selection(selection, self.shape) for selection in selections]
         if out is not None and len(out) != len(plans):
             raise ValueError(f'out has {len(out)} arrays for {len(plans)} selections')
         buffers = None
         if out is not None:
             buffers = []
-            for given, (_, size, squeeze) in zip(out, plans):
+            for given, (_, size, _, squeeze) in zip(out, plans):
                 shape = tuple(n for n, drop in zip(size, squeeze) if not drop)
                 if given is not None:
                     if not isinstance(given, np.ndarray) or given.shape != shape:
@@ -467,9 +468,10 @@ class ZarrReader:
                     buffers.append(np.expand_dims(given, axes) if axes else given)
                 else:
                     buffers.append(None)
-        values = self.read_regions([(start, size) for start, size, _ in plans], out=buffers, dtype=dtype)
+        values = self._read_regions([(start, size) for start, size, _, _ in plans], buffers, dtype,
+                                    [step for _, _, step, _ in plans])
         results = []
-        for i, (value, (_, _, squeeze)) in enumerate(zip(values, plans)):
+        for i, (value, (_, _, _, squeeze)) in enumerate(zip(values, plans)):
             if out is not None and out[i] is not None:
                 results.append(out[i])
             else:
@@ -506,6 +508,10 @@ class ZarrReader:
         ``vc_reader.transforms.Normalize`` in an transform pipeline for
         min/max or zero-preserving z-score normalization.
         """
+        return self._read_regions(regions, out, dtype)
+
+    def _read_regions(self, regions, out=None, dtype=None, steps=None):
+        """read_regions with optional per-region positive steps (one per axis)."""
         self._ready()
         nd = self.ndim
         out_dtype, floating = _crop_output_dtype(self.dtype, self.dtype, dtype)
@@ -529,13 +535,14 @@ class ZarrReader:
             targets.append(given if given.flags.c_contiguous and (not floating or given.flags.aligned)
                            else np.empty(size, dtype=out_dtype))
         starts, sizes = [list(s) for s, _ in regions], [list(n) for _, n in regions]
+        steps = [] if steps is None or all(all(v == 1 for v in st) for st in steps) else [list(st) for st in steps]
         buffers = [t.reshape(-1).view(np.uint8) for t in targets]
         if floating:
             dt = self.dtype
             self._array.read_many_float(starts, sizes, buffers, dt.kind, dt.itemsize, not dt.isnative,
-                                        out_dtype == np.float64)
+                                        out_dtype == np.float64, steps)
         else:
-            self._array.read_many(starts, sizes, buffers, self.dtype.itemsize)
+            self._array.read_many(starts, sizes, buffers, self.dtype.itemsize, steps)
         for res, tgt in zip(results, targets):
             if res is not tgt:
                 res[...] = tgt
@@ -742,8 +749,8 @@ class ZarrReader:
             if len(keys) < self.ndim or any(isinstance(k, slice) or k is Ellipsis for k in keys):
                 return self._read_mixed_index(keys)
             return self.read_points(_index_points(keys, self.shape))
-        start, size, squeeze = parse_index(key, self.shape)
-        out = self.read_region(start, size)
+        start, size, step, squeeze = parse_selection(key, self.shape)
+        out = self._read_regions([(start, size)], steps=[step])[0]
         return out[tuple(0 if s else slice(None) for s in squeeze)] if any(squeeze) else out
 
     def __array__(self, dtype=None, copy=None) -> np.ndarray:

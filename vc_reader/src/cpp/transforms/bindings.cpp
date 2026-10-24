@@ -302,6 +302,11 @@ NB_MODULE(_transforms, m) {
         .def("export", &DeviceOutputs::mark_exported)
         .def("check", &DeviceOutputs::check, nb::call_guard<nb::gil_scoped_release>());
     m.def("_set_stream", [](std::uintptr_t handle) { vcr::device::current_stream() = handle ? vcr::device::stream_handle(handle) : nullptr; });
+    m.def("_pool_stats", [](int device) {
+        const auto s = vcr::device::pool_stats(device);
+        nb::dict d; d["reserved"] = s.reserved; d["reserved_high"] = s.reserved_high; d["used"] = s.used; d["used_high"] = s.used_high;
+        return d;
+    }, "device"_a);
 #endif
     nb::class_<Pipeline>(m, "Pipeline")
         .def(nb::init<std::vector<Op>, std::map<std::string, Target>, bool, std::string>(), "transforms"_a, "targets"_a, "compact"_a = true, "backend"_a = "cpu")

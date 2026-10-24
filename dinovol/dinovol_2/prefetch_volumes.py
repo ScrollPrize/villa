@@ -5,6 +5,8 @@ Run from the repository root:
 
 All occupancy levels are fetched before training chunks. Nonzero coarse voxels
 select finer chunks with a boundary margin; --no-mask-filter fetches full levels.
+--labels also fetches the surface and fiber prediction stores, selected by the
+occupancy mask of the volume they are aligned with.
 Existing chunks and cached missing-chunk markers are reused by vc_reader.
 """
 from __future__ import annotations
@@ -40,6 +42,16 @@ class VolumeLevel:
     cache_dir: str
     auth: Any
     storage_options: dict | None
+    # Label stores are selected by their volume's occupancy mask: mask_path is that
+    # volume and mask_level the volume pyramid level this store's grid matches.
+    mask_path: str | None = None
+    mask_level: int | None = None
+
+    def __post_init__(self):
+        if self.mask_path is None:
+            self.mask_path = self.path
+        if self.mask_level is None:
+            self.mask_level = self.level
 
     def open(self, *, connections=16, cache_writes=True, compress_cache=False, offline=False):
         return open_volume(self.path, self.level, self.auth, self.storage_options,
@@ -82,9 +94,22 @@ class LevelPlan:
             yield start, size
 
 
-def configured_levels(config, *, cache_dir=None, samples=(), scope="all"):
+def _label_levels(entry):
+    """(path, level, volume-equivalent level) of the label stores aligned with a dataset's volume."""
+    scale = int(entry["volume_scale"])
+    if entry.get("surface_path"):
+        yield str(entry["surface_path"]).rstrip("/"), int(entry.get("surface_level", 0)), scale
+    if entry.get("fiber_presence_path"):
+        factor = int(entry.get("fiber_factor", 1))
+        if factor < 1 or factor & (factor - 1):
+            raise ValueError(f"fiber_factor must be a power of two, got {factor}")
+        for key in ("fiber_presence_path", "fiber_nx_path", "fiber_ny_path"):
+            yield str(entry[key]).rstrip("/"), int(entry.get("fiber_level", 0)), scale + factor.bit_length() - 1
+
+
+def configured_levels(config, *, cache_dir=None, samples=(), scope="all", labels=False):
     """Resolve flat/sectioned training configs without constructing a model/dataset."""
-    if scope not in ("all", "training", "occupancy"):
+    if scope not in ("all", "training", "occupancy", "labels"):
         raise ValueError(f"Unknown scope: {scope}")
     data = config.get("data", config)
     dataset = data.get("dataset")
@@ -108,24 +133,31 @@ def configured_levels(config, *, cache_dir=None, samples=(), scope="all"):
         selected = []
         if scope != "training" and dataset.get("occupancy_level") is not None:
             selected.append(int(dataset["occupancy_level"]))
-        if scope != "occupancy":
+        if scope not in ("occupancy", "labels"):
             selected.append(int(entry["volume_scale"]))
         for level in selected:
             if level < 0:
                 raise ValueError(f"Negative pyramid level for {sample}: {level}")
             levels.setdefault((path, level), VolumeLevel(
                 sample, path, level, root, dataset.get("volume_auth"), dataset.get("s3_storage_options")))
+        if (labels or scope == "labels") and scope != "occupancy":
+            for label_path, level, mask_level in _label_levels(entry):
+                if label_path.startswith(("s3://", "http://", "https://")):
+                    levels.setdefault((label_path, level), VolumeLevel(
+                        sample, label_path, level, root, dataset.get("volume_auth"),
+                        dataset.get("s3_storage_options"), mask_path=path, mask_level=mask_level))
     if requested - found:
         raise ValueError(f"Unknown sample IDs: {', '.join(sorted(requested - found))}")
     return list(levels.values())
 
 
-def staged_sources(config, *, cache_dir=None, samples=(), scope="all", mask_filter=True):
+def staged_sources(config, *, cache_dir=None, samples=(), scope="all", mask_filter=True, labels=False):
     """Include coarse prerequisites even with --scope training, globally first."""
     kwargs = dict(cache_dir=cache_dir, samples=samples)
     coarse = configured_levels(config, scope="occupancy", **kwargs)
-    training = configured_levels(config, scope="training", **kwargs) if scope != "occupancy" else []
-    if scope == "training" and not mask_filter:
+    fine_scope = "labels" if scope == "labels" else "training"
+    training = configured_levels(config, scope=fine_scope, labels=labels, **kwargs) if scope != "occupancy" else []
+    if scope in ("training", "labels") and not mask_filter:
         coarse = []
     keys = {(source.path, source.level) for source in coarse}
     return coarse, [source for source in training if (source.path, source.level) not in keys]
@@ -139,9 +171,9 @@ def select_mask_chunks(plan, coarse, *, padding=1, slab_bytes=64 << 20, progress
     available for skipped chunks. Bounds use the same power-of-two pyramid
     scaling as training, including non-aligned chunk edges.
     """
-    if padding < 0 or coarse.source.level < plan.source.level:
+    if padding < 0 or coarse.source.level < plan.source.mask_level:
         raise ValueError("Mask padding must be nonnegative and mask level must be coarser than training")
-    factor = 2 ** (coarse.source.level - plan.source.level)
+    factor = 2 ** (coarse.source.level - plan.source.mask_level)
     expected = tuple((dim + factor - 1) // factor for dim in plan.shape)
     if coarse.shape != expected:
         raise ValueError(f"Mask shape {coarse.shape} does not match pyramid shape {expected}: {plan.source.path}")
@@ -295,8 +327,10 @@ def main(argv=None):
     parser.add_argument("--compress-cache", action="store_true",
                         help="Use lossless vc-delta3d for new stores (3D uint8/uint16); existing stores keep their codec")
     parser.add_argument("--sample-id", action="append", default=[], help="Limit to this sample ID; repeat for multiple samples")
-    parser.add_argument("--scope", choices=("all", "training", "occupancy"), default="all",
+    parser.add_argument("--scope", choices=("all", "training", "occupancy", "labels"), default="all",
                         help="Levels to prefetch; filtered training also includes coarse mask prerequisites")
+    parser.add_argument("--labels", action="store_true",
+                        help="Also fetch surface and fiber prediction stores, filtered by their volume's mask")
     parser.add_argument("--no-mask-filter", action="store_true", help="Fetch full training levels without occupancy filtering")
     parser.add_argument("--mask-padding", type=int, default=1, help="Boundary margin in coarse voxels (default: 1)")
     parser.add_argument("--batch-chunks", type=int, default=512, help="Chunks scheduled at once (default: 512; maximum: 65536)")
@@ -332,7 +366,8 @@ def run(args, progress_factory=tqdm):
     try:
         coarse_sources, training_sources = staged_sources(
             json.loads(args.config.read_text()), cache_dir=args.cache_dir,
-            samples=args.sample_id, scope=args.scope, mask_filter=not args.no_mask_filter)
+            samples=args.sample_id, scope=args.scope, mask_filter=not args.no_mask_filter,
+            labels=getattr(args, "labels", False))
         sources = coarse_sources + training_sources
         if not sources:
             print("No remote volume levels selected.")
@@ -367,7 +402,7 @@ def run(args, progress_factory=tqdm):
                 fetched += stats.get("remote_bytes", 0)
                 completed += plan.count
         for plan in training_plans:
-            coarse = coarse_by_path.get(plan.source.path)
+            coarse = coarse_by_path.get(plan.source.mask_path)
             if not args.no_mask_filter and coarse is not None:
                 with progress_factory(total=coarse.shape[0], desc=f"Filtering {plan.source.sample}", unit="slice") as progress:
                     select_mask_chunks(plan, coarse, padding=args.mask_padding, progress=progress)

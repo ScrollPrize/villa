@@ -301,66 +301,91 @@ public:
             http_->set_auth(std::move(auth));
     }
 
-    // Reads every region [start, start+size) into its C-order output buffer.
-    // Parts outside the array, and chunks that are not stored, read as fill.
+    // Reads every region into its C-order output buffer: element t of region r on axis i
+    // is source index starts[r][i] + t * steps[r][i] (steps: empty, or one positive step
+    // per axis for each region; unit steps otherwise). Only chunks holding a sampled
+    // index are read. Parts outside the array, and chunks that are not stored, read as fill.
     // `stream`: raw local chunks missing from the memory cache are copied straight
     // into the outputs without being read whole and inserted (callers with their
     // own cache, e.g. the CUDA reader). Memory-cache hits are still used.
     void read_many(const std::vector<Index>& starts, const std::vector<Index>& sizes,
                    const std::vector<std::uint8_t*>& outs, const BoxOutput* output = nullptr,
-                   bool stream = false)
+                   bool stream = false, const std::vector<Index>& steps = {})
     {
         const std::size_t nd = spec_.shape.size();
+        if (!steps.empty() && steps.size() != starts.size())
+            throw std::invalid_argument("steps must be empty or match the regions");
         std::vector<Index> out_strides(starts.size());
         std::map<std::int64_t, std::size_t> slot;  // linear chunk index -> work item (ordered: locality)
         std::vector<Work> work;
+        // Per axis: the chunks holding sampled indices, the first output index each supplies,
+        // how many, and the first sampled index inside the chunk.
+        struct Span { std::int64_t chunk, t0, count, src_lo; };
+        std::vector<std::vector<Span>> spans(nd);
         for (std::size_t r = 0; r < starts.size(); ++r) {
             const Index& start = starts[r];
             const Index& size = sizes[r];
             if (start.size() != nd || size.size() != nd)
                 throw std::invalid_argument("region rank does not match the array");
+            const Index step = steps.empty() ? Index(nd, 1) : steps[r];
+            if (step.size() != nd || std::any_of(step.begin(), step.end(), [](std::int64_t v) { return v <= 0; }))
+                throw std::invalid_argument("steps must hold one positive step per axis");
+            const bool unit = std::all_of(step.begin(), step.end(), [](std::int64_t v) { return v == 1; });
             out_strides[r] = c_strides(size, output ? output->itemsize : spec_.itemsize);
             if (std::any_of(size.begin(), size.end(), [](std::int64_t n) { return n <= 0; }))
                 continue;  // nothing to read or fill
-            Index lo(nd), hi(nd);
             bool empty = false, clipped = false;
-            for (std::size_t i = 0; i < nd; ++i) {
-                lo[i] = std::max<std::int64_t>(start[i], 0);
-                hi[i] = std::min<std::int64_t>(start[i] + size[i], spec_.shape[i]);
-                empty |= hi[i] <= lo[i];
-                clipped |= lo[i] != start[i] || hi[i] != start[i] + size[i];
+            for (std::size_t i = 0; i < nd && !empty; ++i) {
+                // Output indices t whose source index lies inside the array.
+                const std::int64_t s0 = start[i], st = step[i], n = spec_.shape[i];
+                std::int64_t t_lo = s0 >= 0 ? 0 : (-s0 + st - 1) / st;
+                std::int64_t t_hi = s0 > n - 1 ? -1 : std::min(size[i] - 1, (n - 1 - s0) / st);
+                empty |= t_hi < t_lo;
+                clipped |= t_lo != 0 || t_hi != size[i] - 1;
+                spans[i].clear();
+                for (std::int64_t t = t_lo; t <= t_hi;) {
+                    const std::int64_t v = s0 + t * st, c = v / spec_.chunks[i], base = c * spec_.chunks[i];
+                    const std::int64_t t_end = std::min(t_hi, (base + spec_.chunks[i] - 1 - s0) / st);
+                    spans[i].push_back(Span{c, t, t_end - t + 1, v - base});
+                    t = t_end + 1;
+                }
             }
             if (empty || clipped)  // outside the array reads as fill; the inside is overwritten below
                 fill_box(outs[r], out_strides[r], size, output ? output->fill : spec_.fill);
             if (empty)
                 continue;
-            Index c0(nd), c1(nd);
-            for (std::size_t i = 0; i < nd; ++i) {
-                c0[i] = lo[i] / spec_.chunks[i];
-                c1[i] = (hi[i] - 1) / spec_.chunks[i];
-            }
-            Index idx = c0;
-            do {
+            std::vector<std::size_t> k(nd, 0);
+            for (;;) {
                 std::int64_t linear = 0;
                 Piece p;
                 p.region = r;
                 p.src_lo.resize(nd);
                 p.extent.resize(nd);
-                Index dst_lo(nd);
+                if (!unit)
+                    p.step = step;
+                Index dst_lo(nd), idx(nd);
                 for (std::size_t i = 0; i < nd; ++i) {
-                    linear = linear * grid_[i] + idx[i];
-                    const std::int64_t base = idx[i] * spec_.chunks[i];
-                    const std::int64_t a = std::max(lo[i], base), b = std::min(hi[i], base + spec_.chunks[i]);
-                    p.src_lo[i] = a - base;
-                    p.extent[i] = b - a;
-                    dst_lo[i] = a - start[i];
+                    const Span& sp = spans[i][k[i]];
+                    idx[i] = sp.chunk;
+                    linear = linear * grid_[i] + sp.chunk;
+                    p.src_lo[i] = sp.src_lo;
+                    p.extent[i] = sp.count;
+                    dst_lo[i] = sp.t0;
                 }
                 p.dst = outs[r] + offset_of(dst_lo, out_strides[r]);
                 auto [it, fresh] = slot.emplace(linear, work.size());
                 if (fresh)
                     work.push_back(Work{idx, {}, {}});
                 work[it->second].pieces.push_back(std::move(p));
-            } while (next_index(idx, c0, c1));
+                std::size_t ax = nd;
+                while (ax-- > 0) {
+                    if (++k[ax] < spans[ax].size())
+                        break;
+                    k[ax] = 0;
+                }
+                if (ax == static_cast<std::size_t>(-1))
+                    break;
+            }
         }
         std::vector<Work> ordered;  // chunk order: locality
         ordered.reserve(work.size());
@@ -370,10 +395,11 @@ public:
     }
 
     void read_many_float(const std::vector<Index>& starts, const std::vector<Index>& sizes,
-                         const std::vector<std::uint8_t*>& outs, const ElementType& type, bool out64)
+                         const std::vector<std::uint8_t*>& outs, const ElementType& type, bool out64,
+                         const std::vector<Index>& steps = {})
     {
         auto output = out64 ? BoxOutput::make<double>(type, spec_.fill) : BoxOutput::make<float>(type, spec_.fill);
-        read_many(starts, sizes, outs, &output);
+        read_many(starts, sizes, outs, &output, false, steps);
     }
 
     // Reads the elements at `n` points into `out` (one element each, in order).
@@ -490,17 +516,6 @@ public:
     }
 
 private:
-    // Advances idx through the box [c0, c1] in C order; false after the last index.
-    static bool next_index(Index& idx, const Index& c0, const Index& c1)
-    {
-        for (std::size_t ax = idx.size(); ax-- > 0;) {
-            if (++idx[ax] <= c1[ax])
-                return true;
-            idx[ax] = c0[ax];
-        }
-        return false;
-    }
-
     static constexpr std::size_t kPointBatch = std::size_t{1} << 20;  // points per plan: bounds its memory
     static constexpr std::size_t kPlanGrain = std::size_t{1} << 14;   // points per planning segment, at least
     static constexpr std::size_t kMaxSampleDims = 16;
@@ -513,6 +528,7 @@ private:
     struct Piece {
         std::size_t region = 0;
         Index src_lo, extent;
+        Index step;  // source step per axis; empty: unit steps
         std::uint8_t* dst = nullptr;
     };
     // Built in place, field by field: a temporary copied into a vector costs store-forwarding
@@ -1149,7 +1165,7 @@ private:
     {
         Index last(p.extent.size());
         for (std::size_t i = 0; i < last.size(); ++i)
-            last[i] = p.src_lo[i] + p.extent[i] - 1;
+            last[i] = p.src_lo[i] + (p.extent[i] - 1) * (p.step.empty() ? 1 : p.step[i]);
         const std::int64_t first = offset_of(p.src_lo, chunk_strides_);
         return {first, offset_of(last, chunk_strides_) + static_cast<std::int64_t>(spec_.itemsize) - first};
     }
@@ -1188,6 +1204,16 @@ private:
     void copy_piece(const std::uint8_t* src, const Piece& p, const std::vector<Index>& strides,
                     const BoxOutput* output)
     {
+        if (!p.step.empty()) {
+            Index ss(chunk_strides_.size());
+            for (std::size_t i = 0; i < ss.size(); ++i)
+                ss[i] = chunk_strides_[i] * p.step[i];
+            if (output)
+                output->copy_stepped(src, ss, ss.back(), p.dst, strides[p.region], p.extent);
+            else
+                copy_strided_box(src, ss, ss.back(), p.dst, strides[p.region], p.extent, spec_.itemsize);
+            return;
+        }
         if (output) {
             output->copy(src, chunk_strides_, p.dst, strides[p.region], p.extent);
         } else {

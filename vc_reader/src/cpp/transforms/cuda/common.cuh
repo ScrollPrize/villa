@@ -4,10 +4,24 @@
 #include "../../cuda_stream.hpp"
 #include "batch_queue.hpp"
 #include <cuda_runtime.h>
+#include <source_location>
+#include <string>
 #include <unistd.h>
 namespace vcr::transforms::cuda {
-inline void check(cudaError_t status) {
-    if (status != cudaSuccess) throw std::runtime_error(std::string("CUDA transform: ") + cudaGetErrorString(status));
+inline void check(cudaError_t status, std::source_location where = std::source_location::current()) {
+    if (status != cudaSuccess)
+        throw std::runtime_error(std::string("CUDA transform: ") + cudaGetErrorString(status) + " (" +
+                                 where.file_name() + ":" + std::to_string(where.line()) + ")");
+}
+inline void checked_allocation(cudaError_t status, std::size_t bytes) {
+    if (status != cudaSuccess) {
+        std::size_t free = 0, total = 0;
+        cudaGetLastError();
+        cudaMemGetInfo(&free, &total);
+        throw std::runtime_error(std::string("CUDA transform: ") + cudaGetErrorString(status) + " allocating " +
+                                 std::to_string(bytes) + " bytes (device free " + std::to_string(free) + " of " +
+                                 std::to_string(total) + ")");
+    }
 }
 // Stream-ordered allocations reuse CUDA's device pool, allocated and freed on
 // the stream current at construction. Buffers remain owned by the invocation;
@@ -26,9 +40,9 @@ template<class T> struct Buffer {
         if (!n) return;
 #if CUDART_VERSION >= 11020
         pooled = vcr::device::pooled_allocation(device);
-        if (pooled) check(cudaMallocAsync(&ptr,n*sizeof(T),stream)); else
+        if (pooled) checked_allocation(cudaMallocAsync(&ptr,n*sizeof(T),stream), n*sizeof(T)); else
 #endif
-        check(cudaMalloc(&ptr,n*sizeof(T)));
+        checked_allocation(cudaMalloc(&ptr,n*sizeof(T)), n*sizeof(T));
         if (BatchQueue::current) BatchQueue::current->allocated(n*sizeof(T));
     }
     explicit Buffer(const std::vector<T>& v) : Buffer(v.size()) { upload(v.data()); }

@@ -140,6 +140,26 @@ class TrainingTests(unittest.TestCase):
             self.assertEqual(method.updates, 3)
             self.assertTrue((Path(folder)/'checkpoint_step_000002.pt').exists())
 
+    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA required')
+    def test_cuda_memory_headroom_caps_the_allocator(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = dict(device='cuda', use_amp=False, output_dir=folder, cuda_memory_headroom_gib=1.5)
+            with patch('torch.cuda.mem_get_info', return_value=(20 * 2**30, 32 * 2**30)), \
+                 patch('torch.cuda.set_per_process_memory_fraction') as cap:
+                Trainer(config, method=RegressionMethod())
+            self.assertAlmostEqual(cap.call_args.args[0], 18.5 / 32)
+
+    def test_keep_last_checkpoints(self):
+        with tempfile.TemporaryDirectory() as folder:
+            config = dict(device='cpu', use_amp=False, max_iterations=6, warmup_steps=0,
+                          output_dir=folder, save_every_n=1, keep_last_checkpoints=2)
+            trainer = Trainer(config, method=RegressionMethod())
+            loader = torch.utils.data.DataLoader(torch.randn(4,3), batch_size=2)
+            with patch.object(trainer, 'build_dataloader', return_value=loader):
+                trainer.fit()
+            self.assertEqual(sorted(p.name for p in Path(folder).glob('checkpoint_step_*.pt')),
+                             ['checkpoint_step_000004.pt', 'checkpoint_step_000005.pt'])
+
     def test_validation_policy_with_cross_view_and_fused_training(self):
         with tempfile.TemporaryDirectory() as folder:
             config = tiny_config(folder)

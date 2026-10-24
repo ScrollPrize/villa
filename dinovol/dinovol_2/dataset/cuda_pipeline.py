@@ -10,6 +10,7 @@ import threading
 import torch
 from torch.utils.data import DataLoader
 from vc_reader import transforms as A
+from vc_reader.transforms import cuda as transform_cuda
 
 NORMALIZATION_SCHEMES = ("robust", "zscore", "minmax", "rescale_to_01", "ct", "none")
 
@@ -118,6 +119,7 @@ class CudaBatchProcessor:
         # Fail before starting workers if vc_reader was built without CUDA.
         self.pipeline(("normalize",), lambda: normalization_transforms(
             self.config.get("normalization_scheme", "robust"), self.config.get("intensity_properties")))
+        self.device_index = self.device.index if self.device.index is not None else torch.cuda.current_device()
 
     def pipeline(self, key, operations, *, targets=None):
         if key not in self.pipelines:
@@ -130,17 +132,45 @@ class CudaBatchProcessor:
         return self.pipelines[key]
 
     def batch(self, pipeline, images, entries, offset=0):
-        return pipeline.batch({"image": _image_dtype(images, self.device)}, seeds=[e[2].seed + offset for e in entries],
-                              device=self.device)["image"]
+        inputs = {"image": _image_dtype(images, self.device)}
+        seeds = [e[2].seed + offset for e in entries]
+        try:
+            return pipeline.batch(inputs, seeds=seeds, device=self.device)["image"]
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc):
+                raise
+            # vc_reader allocates scratch outside PyTorch, whose cache can hold nearly all free
+            # device memory after a training step. Release that cache and retry with the same
+            # seeds on a rebuilt pipeline (retrying the same one was seen to fail again).
+            stats = transform_cuda.pool_stats(self.device_index)
+            print(f"vc_reader transform failed, rebuilding its pipeline and retrying: {exc}; transform pool reserved "
+                  f"{stats['reserved'] / 2**20:.0f} MiB, used peak {stats['used_high'] / 2**20:.0f} MiB", flush=True)
+            key = next(k for k, v in self.pipelines.items() if v is pipeline)
+            pipeline = A.Pipeline(pipeline.transforms, targets=pipeline.targets, backend="cuda", compact=False)
+            self.pipelines[key] = pipeline
+            torch.cuda.empty_cache()
+            try:
+                return pipeline.batch(inputs, seeds=seeds, device=self.device)["image"]
+            except RuntimeError as retry_exc:
+                free, total = torch.cuda.mem_get_info(self.device)
+                raise RuntimeError(
+                    f"{retry_exc} (after rebuilding the pipeline) for {key}, input {tuple(inputs['image'].shape)} "
+                    f"{inputs['image'].dtype}; device free {free / 2**30:.2f} of {total / 2**30:.2f} GiB, "
+                    f"PyTorch allocated {torch.cuda.memory_allocated(self.device) / 2**30:.2f} "
+                    f"reserved {torch.cuda.memory_reserved(self.device) / 2**30:.2f} GiB"
+                ) from exc
 
-    def scanner(self, size):
+    def scanner(self, target):
         A = self.A
+        depth = target[0]  # slice defects run along z, so their width scales with the view's depth
         return [A.Smear(axis="x", shift=(2, 0), alpha=.1, previous=2, p=.10),
-                A.SliceIllumination(axis="z", defects=(1, 3), width=(size / 12, size / 4),
+                A.SliceIllumination(axis="z", defects=(1, 3), width=(depth / 12, depth / 4),
                     reduction=(.75, 1.1), base_p=(.1, .2), base_reduction=(.9, 1), p=.15)]
 
-    def intensity(self, size):
+    def intensity(self, target):
         A = self.A
+        # Length scales follow the view's largest extent (its plane, for slab views).
+        size = max(target)
         if self.config.get("augmentation", "full") == "dino":
             return [A.OneOf([
                 A.Contrast(factor=A.BalancedContrast(.75, 1.25), preserve_range=True, p=.3, p_channel=.5),
@@ -154,7 +184,7 @@ class CudaBatchProcessor:
                                  mean_centered=True, clip=False, p=.15),
             A.PlasmaBrightnessContrast(brightness=(-.1, .1), contrast=(0, .15), p=.10),
             A.Vignetting(strength=(.1, .3), radius=.8, p=.10),
-            A.CLAHE(clip_limit=(1.5, 2.5), tile_shape=(max(4, size // 4),) * 3, bins=256, p=.10),
+            A.CLAHE(clip_limit=(1.5, 2.5), tile_shape=tuple(max(4, extent // 4) for extent in target), bins=256, p=.10),
             A.Contrast(factor=A.BalancedContrast(.8, 1.2), preserve_range=True, p=.25),
             A.LocalContrast(scale=local_scale, loc=(-.5, 1.5), factor=(.8, 1.2), p=.15),
             A.Gamma(gamma=A.BalancedContrast(.8, 1.25), p_retain_stats=1, p=.25),
@@ -213,7 +243,7 @@ class CudaBatchProcessor:
                                           self.config.get("intensity_properties")),
                 A.Affine(scale_factors=[out / size for out, size in zip(target, shape)],
                          shape=target, border=True),
-                *(self.scanner(min(target)) if scanner else [])])
+                *(self.scanner(target) if scanner else [])])
             raw = torch.stack([v.raw for _, _, v in entries]).unsqueeze(1)
             images = self.batch(pipeline, raw, entries)
             for entry, image in zip(entries, images):
@@ -229,7 +259,7 @@ class CudaBatchProcessor:
             if augment:
                 if self.config.get("augmentation", "full") == "full":
                     images = self.adapt_distribution(images, entries)
-                pipeline = self.pipeline(("intensity", target), lambda: self.intensity(min(target)))
+                pipeline = self.pipeline(("intensity", target), lambda: self.intensity(target))
                 images = self.batch(pipeline, images, entries, offset=1)
             for (views, index, _, _), image in zip(entries, images):
                 views[index] = image

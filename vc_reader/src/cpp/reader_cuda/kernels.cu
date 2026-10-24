@@ -162,8 +162,8 @@ template<class Out> __global__ void sample(Source s, const Grid* grids, const vo
         if (kind==0 || kind==3) {
             std::int64_t at[3];
             if (kind==0) {
-                at[0]=g.base[0]+std::int64_t(i/(g.shape[1]*g.shape[2]));
-                at[1]=g.base[1]+std::int64_t(i/g.shape[2]%g.shape[1]); at[2]=g.base[2]+std::int64_t(i%g.shape[2]);
+                at[0]=g.base[0]+g.step[0]*std::int64_t(i/(g.shape[1]*g.shape[2]));
+                at[1]=g.base[1]+g.step[1]*std::int64_t(i/g.shape[2]%g.shape[1]); at[2]=g.base[2]+g.step[2]*std::int64_t(i%g.shape[2]);
             } else for (int a=0;a<3;++a) at[a]=bits==32 ? static_cast<const std::int32_t*>(points)[3*i+a] : static_cast<const std::int64_t*>(points)[3*i+a];
             const auto* p=Lookup{s}.address(at); value=p ? *p : s.fill; ok=p;
         } else if (kind==2 && bits==64) {
@@ -211,8 +211,8 @@ __global__ void valid_samples(Source s, const Grid* grids, const void* points, i
         if (kind==0 || kind==3) {
             std::int64_t at[3];
             if (kind==0) {
-                at[0]=g.base[0]+std::int64_t(i/(g.shape[1]*g.shape[2]));
-                at[1]=g.base[1]+std::int64_t(i/g.shape[2]%g.shape[1]); at[2]=g.base[2]+std::int64_t(i%g.shape[2]);
+                at[0]=g.base[0]+g.step[0]*std::int64_t(i/(g.shape[1]*g.shape[2]));
+                at[1]=g.base[1]+g.step[1]*std::int64_t(i/g.shape[2]%g.shape[1]); at[2]=g.base[2]+g.step[2]*std::int64_t(i%g.shape[2]);
             } else for (int a=0;a<3;++a) at[a]=bits==32 ? static_cast<const std::int32_t*>(points)[3*i+a] : static_cast<const std::int64_t*>(points)[3*i+a];
             ok=present(s,at,resident);
         } else if (kind==2 && bits==64) {

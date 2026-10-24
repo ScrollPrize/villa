@@ -125,10 +125,12 @@ inline void bind(nb::module_& m) {
         },nb::keep_alive<0,1>())
         .def("grids",[](Reader& r,const std::vector<std::array<std::int64_t,3>>& shapes,
             const std::vector<std::array<std::int64_t,3>>& bases,const std::vector<std::array<float,3>>& origins,
-            const std::vector<std::array<float,9>>& axes,int kind,int order,bool floating,const std::string& route,bool valid,nb::object out) -> nb::object {
+            const std::vector<std::array<float,9>>& axes,int kind,int order,bool floating,const std::string& route,bool valid,nb::object out,
+            const std::vector<std::array<std::int64_t,3>>& steps) -> nb::object {
             if (shapes.size()!=bases.size() || shapes.size()!=origins.size() || shapes.size()!=axes.size()) throw nb::value_error("grid counts differ");
+            if (!steps.empty() && steps.size()!=shapes.size()) throw nb::value_error("steps must be empty or match the grids");
             std::vector<Grid> grids(shapes.size());
-            for (std::size_t i=0;i<grids.size();++i) { auto& g=grids[i]; std::copy_n(shapes[i].begin(),3,g.shape); std::copy_n(bases[i].begin(),3,g.base); std::copy_n(origins[i].begin(),3,g.origin); std::copy_n(axes[i].begin(),9,g.axes); }
+            for (std::size_t i=0;i<grids.size();++i) { auto& g=grids[i]; std::copy_n(shapes[i].begin(),3,g.shape); std::copy_n(bases[i].begin(),3,g.base); std::copy_n(origins[i].begin(),3,g.origin); std::copy_n(axes[i].begin(),9,g.axes); if (!steps.empty()) std::copy_n(steps[i].begin(),3,g.step); }
             device::Storage destination;
             if (!out.is_none()) {
                 const auto a=nb::cast<Device>(out);
@@ -150,7 +152,7 @@ inline void bind(nb::module_& m) {
                 return owned(std::move(result.valid),result.count,nb::dtype<std::uint8_t>(),r.device_id());
             }
             return outputs(std::move(result),r.device_id());
-        },"shapes"_a,"bases"_a,"origins"_a,"axes"_a,"kind"_a,"order"_a,"floating"_a,"route"_a,"valid"_a=false,"out"_a=nb::none())
+        },"shapes"_a,"bases"_a,"origins"_a,"axes"_a,"kind"_a,"order"_a,"floating"_a,"route"_a,"valid"_a=false,"out"_a=nb::none(),"steps"_a=std::vector<std::array<std::int64_t,3>>{})
         .def("warm",[make_grids](Reader& r,const std::vector<std::array<std::int64_t,3>>& shapes,const std::vector<std::array<std::int64_t,3>>& bases) {
             auto grids=make_grids(shapes,bases,std::vector<std::array<float,3>>(shapes.size()),std::vector<std::array<float,9>>(shapes.size()));
             nb::gil_scoped_release release; r.warm(std::move(grids));

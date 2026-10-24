@@ -114,16 +114,28 @@ class DinoMonitor:
         dense_panels = self.method.model_module.dense_enabled
         with torch.no_grad(), torch.autocast(device_type=self.method.device.type, dtype=self.method.amp_dtype, enabled=self.method.use_amp):
             global_crops = monitor_batch["collated_global_crops"].to(self.method.device, non_blocking=True)
-            student_outputs = self.method.model_module(
-                student_input=global_crops,
-                student_masks=None,
-                return_teacher=False,
-                point_coordinates=(
-                    self._center_slice_points(global_crops.shape[0], tuple(global_crops.shape[2:]), self.method.device)
-                    if dense_panels
-                    else None
-                ),
-            )["student"]
+            # One view at a time: dense points cover a whole slice per view, and sampling
+            # them for every view at once does not fit in memory for large slices.
+            per_view = [
+                self.method.model_module(
+                    student_input=view,
+                    student_masks=None,
+                    return_teacher=False,
+                    point_coordinates=(
+                        self._center_slice_points(1, tuple(view.shape[2:]), self.method.device)
+                        if dense_panels
+                        else None
+                    ),
+                )["student"]
+                for view in global_crops.split(1)
+            ]
+            student_outputs = {"patch_tokens": torch.cat([out["patch_tokens"] for out in per_view])}
+            if dense_panels:
+                student_outputs["object_points"] = {
+                    key: torch.cat([out["object_points"][key] for out in per_view])
+                    for key in ("dense", "ink") if key in per_view[0]["object_points"]
+                }
+            del per_view
 
         global_views = monitor_batch["collated_global_crops"]
         n_global_views = int(monitor_batch["n_global_views"])

@@ -330,11 +330,12 @@ public:
                 if (!std::isfinite(g.origin[a])) throw std::invalid_argument("nonfinite origin");
             }
             for (float value:g.axes) if (!std::isfinite(value)) throw std::invalid_argument("nonfinite axes");
+            for (int a=0;a<3;++a) if (g.step[a]<1 || g.step[a]>(1LL<<30) || (kind!=0 && g.step[a]!=1)) throw std::invalid_argument("invalid crop step");
             if (g.count>SIZE_MAX/4-total) throw std::invalid_argument("batch size overflow");
             total+=g.count;
             if (!g.count) continue;
             auto& [lo,size]=bounds[&g-grids.data()];
-            if (kind==0) { std::copy_n(g.base,3,lo.begin()); std::copy_n(g.shape,3,size.begin()); }
+            if (kind==0) { std::copy_n(g.base,3,lo.begin()); for (int a=0;a<3;++a) size[a]=(g.shape[a]-1)*g.step[a]+1; }
             else {
                 // Corner bounds in the same float32 evaluation order as sampling.
                 std::int64_t hi[3];
@@ -357,8 +358,17 @@ public:
             const auto& g=grids[j]; const auto& [lo,size]=bounds[j];
             if (!g.count) return;
             std::set<std::int64_t> keys;
-            if (kind==0) box(keys,lo.data(),size.data());
-            else {
+            if (kind==0) {
+                if (g.step[0]==1 && g.step[1]==1 && g.step[2]==1) box(keys,lo.data(),size.data());
+                else box(keys,lo.data(),size.data(),[&](const std::int64_t* at) {
+                    // Stepped crops: only bricks holding a sampled index on every axis.
+                    for (int a=0;a<3;++a) {
+                        const std::int64_t first=std::max<std::int64_t>(0,(at[a]-g.base[a]+g.step[a]-1)/g.step[a]);
+                        if (first>=g.shape[a] || g.base[a]+first*g.step[a]>=at[a]+source_.brick[a]) return false;
+                    }
+                    return true;
+                });
+            } else {
                 const Footprint footprint(g);
                 box(keys,lo.data(),size.data(),[&](const std::int64_t* at) {
                     const double local[3]{double(at[0]-g.base[0]),double(at[1]-g.base[1]),double(at[2]-g.base[2])};
@@ -382,9 +392,9 @@ public:
             ++cpu_routes_;
             std::vector<std::uint8_t> host(total*(kind==1 && order==1 ? 4 : 1));
             if (kind==0) {
-                std::vector<Index> starts,sizes; std::vector<std::uint8_t*> outs;
-                for (const auto& g:grids) { starts.emplace_back(g.base,g.base+3); sizes.emplace_back(g.shape,g.shape+3); outs.push_back(host.data()+g.offset); }
-                array_.read_many(starts,sizes,outs);
+                std::vector<Index> starts,sizes,steps; std::vector<std::uint8_t*> outs;
+                for (const auto& g:grids) { starts.emplace_back(g.base,g.base+3); sizes.emplace_back(g.shape,g.shape+3); steps.emplace_back(g.step,g.step+3); outs.push_back(host.data()+g.offset); }
+                array_.read_many(starts,sizes,outs,nullptr,false,steps);
             } else for (const auto& g:grids) {
                 FloatAffine coords; for (int a=0;a<3;++a) { coords.shape[a]=g.shape[a]; coords.origin[a]=g.origin[a]; coords.offset[a]=g.base[a]; }
                 std::copy_n(g.axes,9,coords.axes.begin()); array_.sample_u8_float32(coords,g.count,order,host.data()+g.offset*(order ? 4 : 1));

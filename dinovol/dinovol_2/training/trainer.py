@@ -86,6 +86,17 @@ class Trainer:
             # Expandable segments avoid fragmentation-driven cache flushes near full
             # memory. They apply to allocations made after this call.
             torch.cuda.memory._set_allocator_settings("expandable_segments:True")
+        headroom = self.runtime_config.get("cuda_memory_headroom_gib")
+        if self.device.type == "cuda" and headroom is not None:
+            # Cap PyTorch's caching allocator below the memory free at startup. Memory outside
+            # it (CUDA runtime, kernels, vc_reader's augmentation scratch) needs room to grow:
+            # the driver reclaims free memory from vc_reader's pool for PyTorch's allocations.
+            index = self.device.index if self.device.index is not None else torch.cuda.current_device()
+            free, total = torch.cuda.mem_get_info(index)
+            limit = free - float(headroom) * 2**30
+            if limit <= 0:
+                raise ValueError(f"cuda_memory_headroom_gib={headroom} leaves no memory of {free / 2**30:.1f} GiB free")
+            torch.cuda.set_per_process_memory_fraction(limit / total, index)
         if self.device.type == "cuda" and bool(self.runtime_config.get("cudnn_benchmark", False)):
             # Autotune convolution algorithms per input shape (crop shapes are fixed).
             torch.backends.cudnn.benchmark = True
@@ -133,6 +144,10 @@ class Trainer:
         # Save a monitor image from the current training batch every N steps (0 disables).
         self.train_monitor_every_n = int(self.runtime_config.get("train_monitor_every_n", 0))
         self.save_every_n = int(self.runtime_config.get("save_every_n", self.runtime_config.get("save_every", 0)))
+        # Older checkpoints in output_dir beyond the newest keep_last_checkpoints are deleted after each save.
+        self.keep_last_checkpoints = self.runtime_config.get("keep_last_checkpoints")
+        if self.keep_last_checkpoints is not None and int(self.keep_last_checkpoints) < 1:
+            raise ValueError(f"keep_last_checkpoints must be positive, got {self.keep_last_checkpoints}")
         self.monitor_batch_size = max(5, int(self.runtime_config.get("monitor_batch_size", 5)))
         # Monitor PCA panels: components 1-3, 4-6, ... as RGB, `monitor_pca_sets` of them.
         self.monitor_pca_sets = max(1, int(self.runtime_config.get("monitor_pca_sets", 4)))
@@ -858,6 +873,9 @@ class Trainer:
                 "runtime_states": runtime_states,
             }, tmp_path)
             tmp_path.replace(path)
+            if self.keep_last_checkpoints is not None:
+                for old in sorted(self.output_dir.glob("checkpoint_step_*.pt"))[:-int(self.keep_last_checkpoints)]:
+                    old.unlink()
         return path
 
     def load_checkpoint(self, checkpoint_path: str | Path) -> int:

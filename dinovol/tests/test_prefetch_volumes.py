@@ -58,6 +58,22 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual([v.level for v in coarse + fine], [5, 5, 0, 2])
         self.assertEqual(staged_sources(config, scope='training', mask_filter=False)[0], [])
 
+    def test_label_stores_follow_their_volume_mask(self):
+        config = config_for('s3://bucket/a', '/tmp/cache')
+        config['data']['dataset']['datasets'][0].update(
+            volume_scale=2, surface_path='s3://bucket/surface', surface_level=0,
+            fiber_presence_path='s3://bucket/p', fiber_nx_path='s3://bucket/nx', fiber_ny_path='s3://bucket/ny',
+            fiber_level=3, fiber_factor=2)
+        self.assertEqual([v.path for v in staged_sources(config, scope='training')[1]], ['s3://bucket/a'])
+        coarse, fine = staged_sources(config, scope='training', labels=True)
+        self.assertEqual([v.path for v in coarse], ['s3://bucket/a'])
+        self.assertEqual([(v.path, v.level, v.mask_path, v.mask_level) for v in fine], [
+            ('s3://bucket/a', 2, 's3://bucket/a', 2), ('s3://bucket/surface', 0, 's3://bucket/a', 2),
+            ('s3://bucket/p', 3, 's3://bucket/a', 3), ('s3://bucket/nx', 3, 's3://bucket/a', 3),
+            ('s3://bucket/ny', 3, 's3://bucket/a', 3)])
+        self.assertEqual([v.path for v in staged_sources(config, scope='labels')[1]],
+                         ['s3://bucket/surface', 's3://bucket/p', 's3://bucket/nx', 's3://bucket/ny'])
+
     def test_mask_projection_matches_brute_force_with_padding_edges_and_slabs(self):
         rng = np.random.default_rng(10)
         for level in (0, 1, 3, 5):
@@ -70,7 +86,7 @@ class PlanningTests(unittest.TestCase):
                     source = Mock(level=level)
                     source.open.return_value = contextlib.nullcontext(values)
                     coarse = LevelPlan(source, mask_shape, (3, 4, 5), 1)
-                    fine = LevelPlan(Mock(level=0), shape, chunks, 1)
+                    fine = LevelPlan(Mock(level=0, mask_level=0), shape, chunks, 1)
                     expected = np.zeros(fine.grid, dtype=bool)
                     for index in np.ndindex(fine.grid):
                         lo = [max(0, i * c // factor - padding) for i, c in zip(index, chunks)]

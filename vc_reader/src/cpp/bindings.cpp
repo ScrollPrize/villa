@@ -323,7 +323,7 @@ NB_MODULE(_reader, m)
         .def(
             "read_many",
             [](vcr::Array& a, const std::vector<vcr::Index>& starts, const std::vector<vcr::Index>& sizes,
-               std::vector<Bytes> outs, std::size_t itemsize) {
+               std::vector<Bytes> outs, std::size_t itemsize, const std::vector<vcr::Index>& steps) {
                 if (starts.size() != sizes.size() || outs.size() != sizes.size())
                     throw nb::value_error("starts, sizes and outs must have the same length");
                 std::vector<std::uint8_t*> ptrs(outs.size());
@@ -335,15 +335,16 @@ NB_MODULE(_reader, m)
                     ptrs[i] = outs[i].data();
                 }
                 nb::gil_scoped_release release;
-                a.read_many(starts, sizes, ptrs);
+                a.read_many(starts, sizes, ptrs, nullptr, false, steps);
             },
-            "starts"_a, "sizes"_a, "outs"_a, "itemsize"_a,
-            "Read regions into flat uint8 views of C-order outputs (the GIL is released).")
+            "starts"_a, "sizes"_a, "outs"_a, "itemsize"_a, "steps"_a = std::vector<vcr::Index>{},
+            "Read regions into flat uint8 views of C-order outputs (the GIL is released). "
+            "steps: empty, or one positive step per axis for every region.")
         .def(
             "read_many_float",
             [](vcr::Array& a, const std::vector<vcr::Index>& starts, const std::vector<vcr::Index>& sizes,
                std::vector<Bytes> outs, const std::string& kind, std::size_t itemsize, bool swap,
-               bool out64) {
+               bool out64, const std::vector<vcr::Index>& steps) {
                 if (starts.size() != sizes.size()) throw nb::value_error("starts and sizes must match");
                 if (itemsize != a.itemsize()) throw nb::value_error("source itemsize does not match");
                 const auto type = sample_type(kind, itemsize, swap);
@@ -351,9 +352,10 @@ NB_MODULE(_reader, m)
                 std::vector<std::uint8_t*> ptrs;
                 for (auto& out : outs) ptrs.push_back(out.data());
                 nb::gil_scoped_release release;
-                a.read_many_float(starts, sizes, ptrs, type, out64);
+                a.read_many_float(starts, sizes, ptrs, type, out64, steps);
             },
             "starts"_a, "sizes"_a, "outs"_a, "kind"_a, "itemsize"_a, "swap"_a, "out64"_a,
+            "steps"_a = std::vector<vcr::Index>{},
             "Read directly into floating outputs.")
         .def(
             "read_points",

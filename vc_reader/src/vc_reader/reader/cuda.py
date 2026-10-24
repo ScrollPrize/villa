@@ -5,7 +5,7 @@ import numpy as np
 from .. import _reader
 from ..cuda import DeviceArray, is_available, is_device_array, wrap
 from ._sampling import affine32, origin3, points32, shape3
-from ._indexing import parse_index
+from ._indexing import parse_selection
 
 
 def _integer_points(points):
@@ -110,8 +110,11 @@ class CudaReader:
             offset += int(np.prod(shape))
         return result
 
-    def _grids(self, grids, kind, order, dtype, source, valid=False, out=None):
-        """Samples (and validity) as one flat device allocation plus per-crop views."""
+    def _grids(self, grids, kind, order, dtype, source, valid=False, out=None, steps=None):
+        """Samples (and validity) as one flat device allocation plus per-crop views.
+
+        steps: per-grid positive steps for region crops (kind 0), or None for unit steps.
+        """
         self._ready()
         if order not in (0, 1): raise ValueError("order must be 0 or 1")
         dtype = np.dtype(dtype)
@@ -128,7 +131,8 @@ class CudaReader:
             raise ValueError('output size mismatch')
         outputs = self._engine.grids(shapes, bases, [list(o) for o in origins], [np.asarray(a).ravel().tolist() for a in axes],
                                     kind, order, dtype == np.float32, source, valid,
-                                    None if destination is None else destination._array)
+                                    None if destination is None else destination._array,
+                                    [] if steps is None else [list(st) for st in steps])
         if destination is not None:
             masks = DeviceArray(outputs, (total,), np.uint8, self.device) if valid else None
             return destination.reshape(total), masks, shapes
@@ -137,8 +141,8 @@ class CudaReader:
         masks = DeviceArray(mask, (total,), np.uint8, self.device) if valid else None
         return flat, masks, shapes
 
-    def _crops(self, grids, kind, order, dtype, source, valid):
-        flat, masks, shapes = self._grids(grids, kind, order, dtype, source, valid)
+    def _crops(self, grids, kind, order, dtype, source, valid, steps=None):
+        flat, masks, shapes = self._grids(grids, kind, order, dtype, source, valid, steps=steps)
         crops = self._split(flat, shapes)
         return (crops, self._split(masks, shapes)) if valid else crops
 
@@ -152,14 +156,18 @@ class CudaReader:
         return (output[0][0], output[1][0]) if valid else output[0]
 
     def read_many(self, selections, *, dtype=None, source="auto", valid=False):
-        """Read slice selections as one batch with shared chunk uploads."""
+        """Read slice selections (positive steps allowed) as one batch with shared chunk uploads.
+
+        Stepped slices load only the bricks holding sampled voxels.
+        """
         self._ready()
-        plans = [parse_index(selection, self.reader.shape) for selection in selections]
+        plans = [parse_selection(selection, self.reader.shape) for selection in selections]
         if not plans:
             return ([], []) if valid else []
-        output = self.read_regions([(start, size) for start, size, _ in plans],
-                                   dtype=dtype, source=source, valid=valid)
-        shapes = [tuple(n for n, drop in zip(size, squeeze) if not drop) for _, size, squeeze in plans]
+        steps = [step for _, _, step, _ in plans]
+        output = self._read_regions([(start, size) for start, size, _, _ in plans], dtype, source, valid,
+                                    None if all(all(v == 1 for v in st) for st in steps) else steps)
+        shapes = [tuple(n for n, drop in zip(size, squeeze) if not drop) for _, size, _, squeeze in plans]
         def reshape(values):
             return [value.reshape(shape) for value, shape in zip(values, shapes)]
         return (reshape(output[0]), reshape(output[1])) if valid else reshape(output)
@@ -171,12 +179,15 @@ class CudaReader:
 
     def read_regions(self, regions, *, dtype=None, source="auto", valid=False):
         """valid=True also returns uint8 masks: 1 inside the volume (a padding mask)."""
+        return self._read_regions(regions, dtype, source, valid)
+
+    def _read_regions(self, regions, dtype, source, valid, steps=None):
         grids = []
         for start, size in regions:
             start = tuple(operator.index(n) for n in start)
             if len(start) != 3: raise ValueError("start must have three integers")
             grids.append((shape3(size), start, (0, 0, 0), np.eye(3, dtype=np.float32)))
-        return self._crops(grids, 0, 0, np.uint8 if dtype is None else dtype, source, valid)
+        return self._crops(grids, 0, 0, np.uint8 if dtype is None else dtype, source, valid, steps)
 
     def read_affine(self, shape, origin, axes, *, order=1, dtype=None, coordinate_origin=None, source="auto", valid=False):
         out = self.read_affine_many([(shape, origin, axes)], order=order, dtype=dtype,

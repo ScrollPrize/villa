@@ -12,4 +12,9 @@ def is_available() -> bool:
     return _transforms.cuda_available()
 
 
-__all__ = ["is_available"]
+def pool_stats(device: int = 0) -> dict:
+    """Bytes reserved and used in the transform scratch pool, currently and at their peak."""
+    return dict(_transforms._pool_stats(int(device)))
+
+
+__all__ = ["is_available", "pool_stats"]

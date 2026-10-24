@@ -95,11 +95,15 @@ class MaskingGenerator3d:
         return 0
 
     def _sample_block_shape(self, target_volume: float) -> tuple[int, int, int]:
-        depth_scale = math.exp(random.uniform(*self.log_aspect_ratio))
-        planar_aspect = math.exp(random.uniform(*self.log_aspect_ratio))
-
-        base = (target_volume / depth_scale) ** (1.0 / 3.0)
-        depth = max(1, int(round(base * depth_scale)))
+        if self.depth == 1:
+            # A single token deep (slab views): planar blocks, as in 2D BEiT masking.
+            depth = 1
+            planar_aspect = math.exp(random.uniform(*self.log_aspect_ratio))
+        else:
+            depth_scale = math.exp(random.uniform(*self.log_aspect_ratio))
+            planar_aspect = math.exp(random.uniform(*self.log_aspect_ratio))
+            base = (target_volume / depth_scale) ** (1.0 / 3.0)
+            depth = max(1, int(round(base * depth_scale)))
         planar_area = max(target_volume / depth, 1.0)
         height = max(1, int(round(math.sqrt(planar_area * planar_aspect))))
         width = max(1, int(round(math.sqrt(planar_area / planar_aspect))))

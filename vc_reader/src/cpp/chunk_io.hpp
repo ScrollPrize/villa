@@ -105,6 +105,45 @@ inline void copy_box(const std::uint8_t* s, const Index& ss, std::uint8_t* d, co
     }
 }
 
+// Copies a box like copy_box, except that consecutive elements of a source row
+// are `inner` bytes apart (stepped reads). inner == itemsize is copy_box.
+inline void copy_strided_box(const std::uint8_t* s, const Index& ss, std::int64_t inner, std::uint8_t* d,
+                             const Index& ds, const Index& extent, std::size_t itemsize)
+{
+    if (inner == static_cast<std::int64_t>(itemsize)) {
+        copy_box(s, ss, d, ds, extent, itemsize);
+        return;
+    }
+    const std::size_t nd = extent.size();
+    const std::size_t n = static_cast<std::size_t>(extent[nd - 1]);
+    const auto row = [&](const std::uint8_t* src, std::uint8_t* dst) {
+        switch (itemsize) {
+        case 1: for (std::size_t i = 0; i < n; ++i) dst[i] = src[i * inner]; break;
+        case 2: for (std::size_t i = 0; i < n; ++i) std::memcpy(dst + 2 * i, src + i * inner, 2); break;
+        case 4: for (std::size_t i = 0; i < n; ++i) std::memcpy(dst + 4 * i, src + i * inner, 4); break;
+        case 8: for (std::size_t i = 0; i < n; ++i) std::memcpy(dst + 8 * i, src + i * inner, 8); break;
+        default: for (std::size_t i = 0; i < n; ++i) std::memcpy(dst + itemsize * i, src + i * inner, itemsize);
+        }
+    };
+    Index pos(nd - 1, 0);  // position over every axis but the last
+    for (;;) {
+        row(s, d);
+        std::size_t ax = nd - 1;
+        for (;;) {
+            if (ax-- == 0)
+                return;
+            if (++pos[ax] < extent[ax]) {
+                s += ss[ax];
+                d += ds[ax];
+                break;
+            }
+            s -= (extent[ax] - 1) * ss[ax];
+            d -= (extent[ax] - 1) * ds[ax];
+            pos[ax] = 0;
+        }
+    }
+}
+
 // Writes `count` copies of the element `fill` from d on.
 inline void fill_elements(std::uint8_t* d, std::size_t count, const std::vector<std::uint8_t>& fill)
 {

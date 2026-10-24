@@ -342,6 +342,23 @@ class SSLZarrDataset(Dataset):
                 "source_sampling_size must be at least as large as the largest requested crop size, "
                 f"got source_sampling_size={self.source_sampling_size} and required={required_source_sampling_size}"
             )
+        crop_scales = [("global", self.paired_global_crop_size, self.global_crop_scale)]
+        if self.local_crop_size is not None and not self.single_crop_only:
+            crop_scales.append(("local", self.local_crop_size, self.local_crop_scale))
+        for name, target_size, scale_range in crop_scales:
+            largest = self._crop_shape_for_scale(max(scale_range), target_size)
+            if any(crop > source for crop, source in zip(largest, self.source_sampling_size)):
+                raise ValueError(
+                    f"{name} crops at scale {max(scale_range)} span {largest} source voxels, "
+                    f"more than source_sampling_size={self.source_sampling_size}"
+                )
+        if self.object_points_enabled:
+            smallest = self._crop_shape_for_scale(min(self.global_crop_scale), self.paired_global_crop_size)
+            if any(2 * crop <= source for crop, source in zip(smallest, self.source_sampling_size)):
+                raise ValueError(
+                    f"object_points need overlapping global crops, but crops of {smallest} source voxels "
+                    f"can miss each other in source_sampling_size={self.source_sampling_size}"
+                )
         # augmentation: "dino" keeps only flips, right-angle rotations, transposes and
         # brightness/contrast jitter on top of the random resized crops; "full"
         # (default) is the complete pipeline.
@@ -936,16 +953,17 @@ class SSLZarrDataset(Dataset):
         except Exception:
             pass
 
-    def _sample_crop_shape(self, scale_range):
-        ref_depth, ref_height, ref_width = self.source_sampling_size
+    def _crop_shape_for_scale(self, scale, target_size):
+        # The crop keeps the view's aspect ratio, so resizing it is isotropic:
+        # scale**(1/3) is the fraction of the source covered along the view's
+        # longest axis (any axis for cubic views).
+        axis = int(np.argmax(target_size))
+        extent = self.source_sampling_size[axis] * scale ** (1.0 / 3.0)
+        return tuple(max(1, int(round(extent * size / target_size[axis]))) for size in target_size)
+
+    def _sample_crop_shape(self, scale_range, target_size):
         min_scale, max_scale = scale_range
-        scale = np.random.uniform(min_scale, max_scale)
-        scale_per_dim = scale ** (1.0 / 3.0)
-        return (
-            max(1, int(round(ref_depth * scale_per_dim))),
-            max(1, int(round(ref_height * scale_per_dim))),
-            max(1, int(round(ref_width * scale_per_dim))),
-        )
+        return self._crop_shape_for_scale(np.random.uniform(min_scale, max_scale), target_size)
 
     def _finalize_crop(self, crop, target_size):
         return CropView(torch.from_numpy(np.array(crop, copy=True, order="C")), tuple(target_size))
@@ -1008,7 +1026,7 @@ class SSLZarrDataset(Dataset):
         anchor=None,
         anchor_target_size=None,
     ):
-        crop_shape = self._sample_crop_shape(scale_range)
+        crop_shape = self._sample_crop_shape(scale_range, target_size)
         starts = []
         for axis, (source_dim, crop_dim) in enumerate(zip(source_shape, crop_shape)):
             low = 0

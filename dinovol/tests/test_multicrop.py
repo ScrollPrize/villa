@@ -48,3 +48,16 @@ class MultiCropTests(unittest.TestCase):
         for row in range(4):
             weights = batch['masks_weight'][indices // 8 == row]
             if weights.numel(): self.assertAlmostEqual(float(weights.sum()),1.)
+
+
+class SlabMaskingTests(unittest.TestCase):
+    def test_single_token_deep_grids_mask_planar_blocks(self):
+        from scipy import ndimage
+        from dinovol_2.ops.masking import MaskingGenerator3d
+        random.seed(3)
+        generator = MaskingGenerator3d((1, 64, 64))
+        for count in (200, 800, 2000):
+            mask = generator(count)
+            self.assertEqual(int(mask.sum()), count)
+            # Blocks, not the scattered random fallback: few connected regions.
+            self.assertLess(ndimage.label(mask[0])[1], 12)

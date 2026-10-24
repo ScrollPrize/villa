@@ -35,4 +35,22 @@ inline bool pooled_allocation(int device) {
     return false;
 #endif
 }
+struct PoolStats { std::uint64_t reserved, reserved_high, used, used_high; };
+inline PoolStats pool_stats(int device) {
+    PoolStats stats{};
+#if CUDART_VERSION >= 11020
+    const auto check = [](cudaError_t status) {
+        if (status != cudaSuccess) throw std::runtime_error(std::string("CUDA memory pool: ") + cudaGetErrorString(status));
+    };
+    cudaMemPool_t pool;
+    check(cudaDeviceGetDefaultMemPool(&pool, device));
+    check(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &stats.reserved));
+    check(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemHigh, &stats.reserved_high));
+    check(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &stats.used));
+    check(cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &stats.used_high));
+#else
+    (void)device;
+#endif
+    return stats;
+}
 }  // namespace vcr::device

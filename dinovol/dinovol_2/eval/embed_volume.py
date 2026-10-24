@@ -274,7 +274,9 @@ class ZarrGroupWriter:
                                                       np.dtype(meta["dtype"]))
                 self.fill_values[meta_path.parent.name] = meta.get("fill_value", 0)
                 self.codecs[meta_path.parent.name] = (meta.get("compressor") or {}).get("id", "zstd")
-                self.channel_axes[meta_path.parent.name] = (meta.get("compressor") or {}).get("channel_axis", "last")
+                compressor = meta.get("compressor") or {}
+                self.channel_axes[meta_path.parent.name] = compressor.get(
+                    "channel_axis", None if compressor.get("id") == "vc-delta3d" and len(meta["shape"]) == 3 else "last")
         else:
             if self.path.exists() and any(self.path.iterdir()):
                 if not overwrite:
@@ -296,14 +298,21 @@ class ZarrGroupWriter:
 
     def create(self, name: str, shape: Sequence[int], chunks: Sequence[int], dtype,
                attrs: dict[str, Any] | None = None, *, fill_value: int | float = 0, codec: str = "zstd",
-               channel_axis: str = "last") -> None:
-        """vc-delta3d needs integer 4D chunks holding all channels, first or last."""
+               channel_axis: str | None = "last") -> None:
+        """vc-delta3d needs integer 4D chunks holding all channels, first or last.
+
+        channel_axis=None writes a single-channel 3D vc-delta3d array (the CT volume layout).
+        """
         dtype = np.dtype(dtype)
-        if channel_axis not in ("first", "last"):
-            raise ValueError("channel_axis must be first or last")
+        if channel_axis not in ("first", "last", None):
+            raise ValueError("channel_axis must be first, last or None")
         if codec not in CODECS:
             raise ValueError(f"codec must be one of {CODECS}")
-        if codec == "vc-delta3d":
+        if codec == "vc-delta3d" and channel_axis is None:
+            if len(shape) != 3 or len(chunks) != 3 or dtype.kind not in "iu":
+                raise ValueError(f"{name}: 3D vc-delta3d needs integer 3D chunks")
+            compressor = {"id": "vc-delta3d", "quant": 1}
+        elif codec == "vc-delta3d":
             axis = 0 if channel_axis == "first" else 3
             if len(shape) != 4 or len(chunks) != 4 or int(chunks[axis]) != int(shape[axis]) or dtype.kind not in "iu":
                 raise ValueError(f"{name}: vc-delta3d needs integer 4D chunks with all channels")
@@ -397,10 +406,13 @@ class ZarrGroupWriter:
             from vc_reader import _reader
 
             # Decoded and compared with the input before it is returned.
-            last = channel_axis == "last"
-            encoded = _reader._encode_delta3d_channels_verified(
-                data.tobytes(), list(data.shape[:3] if last else data.shape[1:]),
-                int(data.shape[3] if last else data.shape[0]), last, data.itemsize)
+            if channel_axis is None:
+                encoded = _reader._encode_delta3d_verified(data.tobytes(), list(data.shape), data.itemsize)
+            else:
+                last = channel_axis == "last"
+                encoded = _reader._encode_delta3d_channels_verified(
+                    data.tobytes(), list(data.shape[:3] if last else data.shape[1:]),
+                    int(data.shape[3] if last else data.shape[0]), last, data.itemsize)
         else:
             encoded = self.zstd.encode(data)
         path.parent.mkdir(parents=True, exist_ok=True)

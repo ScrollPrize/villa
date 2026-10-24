@@ -244,3 +244,16 @@ class CudaBatchTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+@unittest.skipUnless(torch.cuda.is_available() and A._transforms.cuda_available(), 'CUDA build and device required')
+class TransformPoolTests(unittest.TestCase):
+    def test_pool_stats_track_transform_scratch(self):
+        from vc_reader.transforms import cuda as transform_cuda
+        device = torch.cuda.current_device()
+        pipeline = A.Pipeline([A.GaussianBlur(sigma=1.0)], targets={'image': A.Image(valid=None)}, backend='cuda', compact=False)
+        pipeline.batch({'image': torch.rand((2, 1, 16, 32, 32), device='cuda')}, seeds=[1, 2])
+        stats = transform_cuda.pool_stats(device)
+        self.assertEqual(set(stats), {'reserved', 'reserved_high', 'used', 'used_high'})
+        self.assertGreater(stats['used_high'], 0)
+        self.assertLessEqual(stats['used'], stats['reserved'])

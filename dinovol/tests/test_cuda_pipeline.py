@@ -103,7 +103,7 @@ class CudaPipelineTests(unittest.TestCase):
 
     def test_intensity_preserves_labels(self):
         processor = CudaBatchProcessor({})
-        operations = [A.RicianNoise(std=2), *processor.scanner(16), *processor.intensity(16),
+        operations = [A.RicianNoise(std=2), *processor.scanner((16,) * 3), *processor.intensity((16,) * 3),
                       A.FDA(reference='style', blend=.2, fraction=.1, on='image'),
                       A.PixelDistributionAdaptation(reference='style', blend=.2, on='image')]
         # Exercise every intensity effect, rather than relying on random selection.
@@ -191,6 +191,63 @@ class CudaPipelineTests(unittest.TestCase):
                 self.assertEqual(len(result['collated_local_crops']), 0)
             finally:
                 dataset.close()
+
+    def test_transform_oom_rebuilds_pipeline_and_retries(self):
+        processor = CudaBatchProcessor({})
+        view = CropView(torch.randint(0, 255, (8, 8, 8), dtype=torch.uint8), (8, 8, 8))
+        expected = processor([view])
+        key = next(k for k in processor.pipelines if k[0] == 'prepare')
+        pipeline = processor.pipelines[key]
+        real_batch, calls = type(pipeline).batch, []
+
+        def flaky(self, *args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("CUDA transform: out of memory")
+            return real_batch(self, *args, **kwargs)
+
+        with patch.object(type(pipeline), 'batch', flaky), patch('torch.cuda.empty_cache') as empty:
+            result = processor([view])
+        empty.assert_called_once()
+        self.assertIsNot(processor.pipelines[key], pipeline)
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+    def test_slab_views_keep_their_aspect(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            raw = np.random.default_rng(5).integers(1, 255, (48, 48, 48), dtype=np.uint8)
+            write_array(root / 'volume', raw)
+            write_array(root / 'volume', raw[::2, ::2, ::2], level=1)
+            surface = np.zeros_like(raw)
+            surface[:, ::4] = 255
+            write_array(root / 'surface', surface)
+            config = dict(datasets=[dict(volume_path=str(root / 'volume'), volume_scale=0,
+                surface_path=str(root / 'surface'), pixel_size_um=8)], epoch_length=4, vol_trim_pct=1,
+                source_sampling_size=[5, 48, 48], global_crop_size=[4, 32, 32], local_crop_size=[4, 16, 16],
+                global_crop_scale=[.18, .45], local_crop_scale=[.023, .057], num_local_crops=2,
+                normalization_scheme='robust', augmentation='full', occupancy_level=1,
+                cross_view_token_patch_size=[4]*3,
+                object_points=dict(enabled=True, use_metadata_meshes=False, points_per_sample=16,
+                                   points_per_object=8, max_objects=4))
+            dataset = SSLZarrDataset(copy.deepcopy(config), do_augmentations=True)
+            try:
+                for target in ((4, 32, 32), (4, 16, 16)):
+                    for _ in range(50):
+                        shape = dataset._sample_crop_shape(dataset.global_crop_scale, target)
+                        self.assertEqual(shape[1], shape[2])
+                        self.assertLessEqual(abs(shape[0] - shape[1] * target[0] / target[1]), .5)
+                loader = CudaDataLoader(dataset, batch_size=2, collate_fn=collate((4, 32, 32)))
+                for result in loader:
+                    self.assertEqual(result['collated_global_crops'].shape, (4, 1, 4, 32, 32))
+                    self.assertEqual(result['collated_local_crops'].shape, (4, 1, 4, 16, 16))
+                    self.assertEqual(result['global_token_targets'].shape, (4, 64, 3))
+                    self.assertEqual(result['collated_masks'].shape, (4, 64))
+                    self.assertTrue(torch.isfinite(result['collated_global_crops']).all())
+            finally:
+                dataset.close()
+            for key, value in (('source_sampling_size', [4, 48, 48]), ('source_sampling_size', [6, 48, 48])):
+                with self.assertRaises(ValueError):  # crops overflow the source / global crops can miss
+                    SSLZarrDataset({**copy.deepcopy(config), key: value})
 
     def test_method_independent_view_counts(self):
         from dinovol_2.ops.collate import collate_multicrop_batch
