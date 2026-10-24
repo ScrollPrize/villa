@@ -9,6 +9,7 @@ import time
 
 from .cohort import _Channel
 from .engine import Engine
+from .constraints import Constraints
 from .processes import NvidiaMonitor, process_identity, process_state
 from .process_snapshot import ProcessCollector, collector_main
 from .protocol import MAX_FRAME, decode
@@ -54,6 +55,10 @@ def _state_owner(sock, inventory, state, epoch, parent_identity, journal,
     engine.state, engine.epoch = state, epoch
     if monitor is not None:
         engine.update_blocked_gpus(inventory["gpus"])
+    constraints = Constraints()
+    # Fail closed at startup; live parse failures preserve the last valid policy.
+    constraints.poll(engine, force=True)
+    save_journal(journal, engine.state)
     runtime = Server.__new__(Server)
     runtime.engine, runtime.journal = engine, journal
     clients = {}
@@ -70,6 +75,14 @@ def _state_owner(sock, inventory, state, epoch, parent_identity, journal,
         channel.send("ready", summary())
         collector.request()
         while True:
+            revision = engine.state["policy_revision"]
+            try:
+                constraints.poll(engine)
+            except (OSError, ValueError) as exc:
+                print(f"gpu manager: constraints reload rejected: {exc}", flush=True)
+            if revision != engine.state["policy_revision"]:
+                save_journal(journal, engine.state)
+                channel.send("summary", summary())
             observed = collector.poll()
             if observed is not None:
                 snapshot = observed

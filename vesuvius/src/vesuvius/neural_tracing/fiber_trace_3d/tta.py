@@ -129,7 +129,25 @@ def selected_manifest(manifest, variant):
     if variant not in VARIANTS:
         raise ValueError(f'unknown TTA variant {variant}')
     manifest = Path(manifest)
-    document = json.loads(manifest.read_text())
+    compact = manifest.is_dir()
+    document = json.loads(((manifest / '.zattrs') if compact else manifest).read_text())
+    if compact:
+        document = document['lasagna']
+        # A legacy reference-only view may alias channel slots in packed arrays;
+        # the authoritative dataset manifest remains embedded and unchanged.
+        groups = {}
+        for key, group in document['groups'].items():
+            channels = [name.removeprefix(variant + '_') if name in
+                        {variant + '_' + c for c in ('presence', 'nx', 'ny')}
+                        else f'unused_{key}_{i}' for i, name in enumerate(group['channels'])]
+            groups[key] = {**group, 'channels': channels, 'zarr': str((manifest / group['zarr']).resolve())}
+        document = {**document, 'version': 2, 'groups': groups, 'validity_channel': 'presence', 'packed_channel_view': True}
+        destination = manifest.parent / f'inference.{variant}.lasagna.json'
+        if not destination.exists():
+            atomic_write(destination, document, durable=False)
+        elif json.loads(destination.read_text()) != document:
+            raise ValueError('TTA manifest changed')
+        return destination
     groups = {}
     for name in ('presence', 'nx', 'ny'):
         key = f'{variant}_{name}'

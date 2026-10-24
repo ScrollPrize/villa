@@ -223,3 +223,32 @@ track each worker session before authorizing it, and retire it only after joinin
 its workers. Closing the owner or losing the coordinator triggers cleanup of
 tracked sessions. This uses the existing explicit-root/worker protocol and does
 not claim unrelated coordinator children.
+# Global GPU constraints
+
+The production service reads `~/.config/villa-gpu-manager/constraints.json`
+from the **service owner's** home (not each client's). Override its path with
+`VILLA_GPU_MANAGER_CONSTRAINTS` when starting the service; shared deployments
+can point this at an administrator-owned common file. Every client of the same
+manager obeys it. This does not coordinate independently launched managers.
+
+```json
+{"allowed_gpu_uuids": ["GPU-your-full-uuid"]}
+```
+
+Use physical UUIDs from `nvidia-smi --query-gpu=index,uuid --format=csv,noheader`.
+`villa-gpu-manager constraints` shows the local file; `villa-gpu-manager
+constraints --gpu-uuids GPU-... GPU-...` writes it atomically. Run this as the
+service owner, or with the same explicit constraints path as the service.
+Edits automatically reload within approximately one second; no reload command
+or service restart is needed. Write atomically where possible. An empty list
+disables new GPU grants; `{}` restores the service's full inventory. A missing
+file uses the journaled policy (all inventoried GPUs on first startup). Deleting
+a loaded file does not relax restrictions. Invalid live edits retain the last
+valid policy and log an error; invalid startup configuration prevents startup.
+
+Removed GPUs drain through normal acknowledgement: reservations remain charged
+until released. Already running non-pausable tasks finish naturally; they are
+not killed or falsely declared released. Conflicting manual allocation overrides
+are cleared on reload. The physical inventory and journal remain intact, so
+clients may still request excluded UUIDs but cannot receive new grants on them.
+This is cooperative scheduling, not hardware access control.
