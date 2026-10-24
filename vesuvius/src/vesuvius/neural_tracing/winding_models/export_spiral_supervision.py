@@ -188,6 +188,145 @@ def _arrays_are_valid(directory: Path, manifest: dict) -> bool:
     return True
 
 
+def completed_part(destination: Path, signature: dict) -> dict | None:
+    """Return a finished range product's manifest if it is still valid."""
+    part_manifest = Path(destination) / "manifest.json"
+    if not part_manifest.is_file():
+        return None
+    existing = json.loads(part_manifest.read_text())
+    if (existing.get("source_signature") == signature
+            and _arrays_are_valid(Path(destination), existing)):
+        return existing
+    return None
+
+
+def center_ray_layout(
+    columns: int, column_stride: int, valid_size: int, ray_length: int,
+) -> tuple[int, int, int, int]:
+    """Native column, validity column, transverse sample and anchor sample
+    of the canonical centre ray of a ``columns x columns`` native slab."""
+    center = int(round((columns * column_stride - 1) / column_stride / 2))
+    valid_center = min(int(valid_size) - 1, center * column_stride)
+    anchor = int(round((ray_length - 1) / 2.0))
+    return center, valid_center, center * column_stride, anchor
+
+
+class CenterRayPart:
+    """Decoded centre rays of one restartable range of slabs.
+
+    Shared with ``infer_winding_volume.py --spiral-supervision-only``: a
+    range decoded from a native phase cache and the same range decoded
+    straight from the model output give identical arrays.
+    """
+
+    def __init__(
+        self, num_source_rays: int, *, anchor: int, transverse_center: int,
+        spacing: float, edge_margin: int = DEFAULT_EDGE_MARGIN,
+        edge_trim: int = DEFAULT_EDGE_TRIM,
+    ) -> None:
+        self.num_source_rays = int(num_source_rays)
+        self.num_available_rays = 0
+        self.anchor = int(anchor)
+        self.transverse_center = int(transverse_center)
+        self.spacing = float(spacing)
+        self.edge_margin = int(edge_margin)
+        self.edge_trim = int(edge_trim)
+        self.origins = np.empty((self.num_source_rays, 3), dtype=np.float32)
+        self.steps = np.empty_like(self.origins)
+        self.seed_windings = np.empty(self.num_source_rays, dtype=np.int16)
+        self.offsets = np.empty(self.num_source_rays + 1, dtype=np.int64)
+        self.offsets[0] = 0
+        self.retained_rays = 0
+        self.position_batches: list[np.ndarray] = []
+        self.level_batches: list[np.ndarray] = []
+        self.pending_positions: list[np.ndarray] = []
+        self.pending_levels: list[np.ndarray] = []
+        self.started = time.monotonic()
+
+    def _flush_pending(self) -> None:
+        if self.pending_positions:
+            self.position_batches.append(np.concatenate(self.pending_positions))
+            self.level_batches.append(np.concatenate(self.pending_levels))
+            self.pending_positions.clear()
+            self.pending_levels.clear()
+
+    def add(self, phase, valid, frame, seed_winding) -> None:
+        """Decode one available slab from its centre-ray phase and validity
+        and its ``[origin, axis_a, axis_b, direction]`` frame rows."""
+        self.num_available_rays += 1
+        positions, levels = decode_center_ray(
+            phase, valid, anchor=self.anchor,
+            edge_margin=self.edge_margin, edge_trim=self.edge_trim,
+        )
+        if len(positions) < 2:
+            return
+        frame = np.asarray(frame, dtype=np.float64)
+        origin_xyz = (
+            frame[0]
+            + self.spacing * self.transverse_center * (frame[1] + frame[2])
+        )
+        retained = self.retained_rays
+        self.origins[retained] = origin_xyz[::-1]
+        self.steps[retained] = (self.spacing * frame[3])[::-1]
+        self.seed_windings[retained] = seed_winding
+        self.pending_positions.append(positions)
+        self.pending_levels.append(levels)
+        self.retained_rays = retained + 1
+        self.offsets[retained + 1] = self.offsets[retained] + len(positions)
+        if len(self.pending_positions) >= 4096:
+            self._flush_pending()
+
+    def write(self, destination: Path, fields: dict) -> dict:
+        """Atomically write the range product and return its manifest."""
+        self._flush_pending()
+        destination = Path(destination)
+        temporary = destination.parent / (
+            f".{destination.name}.tmp-{os.getpid()}")
+        for stale in destination.parent.glob(f".{destination.name}.tmp-*"):
+            shutil.rmtree(stale)
+        temporary.mkdir(parents=True)
+        retained = self.retained_rays
+        crossing_t = (np.concatenate(self.position_batches)
+                      if self.position_batches else np.empty(0, np.float32))
+        crossing_level = (np.concatenate(self.level_batches)
+                          if self.level_batches else np.empty(0, np.int16))
+        arrays = {
+            "ray_origin_zyx": _save_array(
+                temporary, "ray_origin_zyx", self.origins[:retained]),
+            "ray_step_zyx": _save_array(
+                temporary, "ray_step_zyx", self.steps[:retained]),
+            "crossing_offsets": _save_array(
+                temporary, "crossing_offsets", self.offsets[: retained + 1]),
+            "crossing_t": _save_array(temporary, "crossing_t", crossing_t),
+            "crossing_level": _save_array(
+                temporary, "crossing_level", crossing_level),
+            "seed_winding": _save_array(
+                temporary, "seed_winding", self.seed_windings[:retained]),
+        }
+        lengths = np.diff(self.offsets[: retained + 1])
+        result = {
+            **fields,
+            "num_source_rays": self.num_source_rays,
+            "num_available_rays": int(self.num_available_rays),
+            "num_retained_rays": int(retained),
+            "num_crossings": int(len(crossing_t)),
+            "crossings_per_ray": {
+                "min": int(lengths.min()) if len(lengths) else 0,
+                "median": float(np.median(lengths)) if len(lengths) else 0.0,
+                "max": int(lengths.max()) if len(lengths) else 0,
+            },
+            "elapsed_seconds": time.monotonic() - self.started,
+            "arrays": arrays,
+        }
+        (temporary / "manifest.json").write_text(
+            json.dumps(result, indent=2, sort_keys=True) + "\n"
+        )
+        if destination.exists():
+            shutil.rmtree(destination)
+        os.replace(temporary, destination)
+        return result
+
+
 def _export_part(task: tuple[str, str, dict, int, int, int, int]) -> dict:
     source_path, partial_path, shard, start, end, edge_margin, edge_trim = task
     group = _get_export_group(source_path)
@@ -195,139 +334,51 @@ def _export_part(task: tuple[str, str, dict, int, int, int, int]) -> dict:
     signature = _source_signature(
         group, shard, edge_margin, edge_trim, start=start, end=end)
     destination = Path(partial_path) / "parts" / name / f"{start:08d}_{end:08d}"
-    part_manifest = destination / "manifest.json"
-    if part_manifest.is_file():
-        existing = json.loads(part_manifest.read_text())
-        if (existing.get("source_signature") == signature
-                and _arrays_are_valid(destination, existing)):
-            return existing
-
-    temporary = destination.parent / (
-        f".{start:08d}_{end:08d}.tmp-{os.getpid()}")
-    for stale in destination.parent.glob(
-            f".{start:08d}_{end:08d}.tmp-*"):
-        shutil.rmtree(stale)
-    temporary.mkdir(parents=True)
+    existing = completed_part(destination, signature)
+    if existing is not None:
+        return existing
 
     phase_array = group["phase"][name]
     valid_array = group["valid"][name]
     frame_array = group["frame"][name]
     available = np.asarray(
         group["available"][name][start:end], dtype=bool)
-    ray_length = int(group.attrs["ray_length"])
-    column_stride = int(group.attrs["column_stride"])
-    columns = int(phase_array.shape[1])
-    center = int(round((columns * column_stride - 1) / column_stride / 2))
-    valid_center = min(
-        int(valid_array.shape[1]) - 1, center * column_stride)
-    transverse_center = center * column_stride
-    anchor = int(round((ray_length - 1) / 2.0))
-    spacing = float(group.attrs["spacing"])
+    center, valid_center, transverse_center, anchor = center_ray_layout(
+        int(phase_array.shape[1]), int(group.attrs["column_stride"]),
+        int(valid_array.shape[1]), int(group.attrs["ray_length"]))
     global_lo = int(shard["lo"]) + int(start)
     seed_winding_all = np.asarray(
         group["rays"]["seed_winding"][global_lo : global_lo + len(available)],
         dtype=np.int16,
     )
 
-    origins = np.empty((len(available), 3), dtype=np.float32)
-    steps = np.empty_like(origins)
-    seed_windings = np.empty(len(available), dtype=np.int16)
-    offsets = np.empty(len(available) + 1, dtype=np.int64)
-    offsets[0] = 0
-    retained_rays = 0
-    position_batches: list[np.ndarray] = []
-    level_batches: list[np.ndarray] = []
-    pending_positions: list[np.ndarray] = []
-    pending_levels: list[np.ndarray] = []
-    started = time.monotonic()
-
-    def flush_pending() -> None:
-        if pending_positions:
-            position_batches.append(np.concatenate(pending_positions))
-            level_batches.append(np.concatenate(pending_levels))
-            pending_positions.clear()
-            pending_levels.clear()
-
+    part = CenterRayPart(
+        len(available), anchor=anchor, transverse_center=transverse_center,
+        spacing=float(group.attrs["spacing"]),
+        edge_margin=edge_margin, edge_trim=edge_trim)
     for part_index in np.flatnonzero(available):
         local_index = int(start) + int(part_index)
-        phase = np.asarray(
-            phase_array[local_index, center, center, :], dtype=np.float32
+        part.add(
+            np.asarray(
+                phase_array[local_index, center, center, :], dtype=np.float32),
+            np.asarray(
+                valid_array[local_index, valid_center, valid_center, :],
+                dtype=bool),
+            frame_array[local_index],
+            seed_winding_all[int(part_index)],
         )
-        valid = np.asarray(
-            valid_array[local_index, valid_center, valid_center, :], dtype=bool
-        )
-        positions, levels = decode_center_ray(
-            phase, valid, anchor=anchor,
-            edge_margin=edge_margin, edge_trim=edge_trim,
-        )
-        if len(positions) < 2:
-            continue
-        frame = np.asarray(frame_array[local_index], dtype=np.float64)
-        origin_xyz = (
-            frame[0]
-            + spacing * transverse_center * (frame[1] + frame[2])
-        )
-        origins[retained_rays] = origin_xyz[::-1]
-        steps[retained_rays] = (spacing * frame[3])[::-1]
-        seed_windings[retained_rays] = seed_winding_all[int(part_index)]
-        pending_positions.append(positions)
-        pending_levels.append(levels)
-        retained_rays += 1
-        offsets[retained_rays] = offsets[retained_rays - 1] + len(positions)
-        if len(pending_positions) >= 4096:
-            flush_pending()
-    flush_pending()
-
-    crossing_t = (np.concatenate(position_batches)
-                  if position_batches else np.empty(0, np.float32))
-    crossing_level = (np.concatenate(level_batches)
-                      if level_batches else np.empty(0, np.int16))
-    arrays = {
-        "ray_origin_zyx": _save_array(
-            temporary, "ray_origin_zyx", origins[:retained_rays]),
-        "ray_step_zyx": _save_array(
-            temporary, "ray_step_zyx", steps[:retained_rays]),
-        "crossing_offsets": _save_array(
-            temporary, "crossing_offsets", offsets[: retained_rays + 1]),
-        "crossing_t": _save_array(temporary, "crossing_t", crossing_t),
-        "crossing_level": _save_array(
-            temporary, "crossing_level", crossing_level),
-        "seed_winding": _save_array(
-            temporary, "seed_winding", seed_windings[:retained_rays]),
-    }
-    lengths = np.diff(offsets[: retained_rays + 1])
-    result = {
+    return part.write(destination, {
         "name": name,
         "part_start": int(start),
         "part_end": int(end),
         "source_signature": signature,
-        "num_source_rays": int(len(available)),
-        "num_available_rays": int(available.sum()),
-        "num_retained_rays": int(retained_rays),
-        "num_crossings": int(len(crossing_t)),
-        "crossings_per_ray": {
-            "min": int(lengths.min()) if len(lengths) else 0,
-            "median": float(np.median(lengths)) if len(lengths) else 0.0,
-            "max": int(lengths.max()) if len(lengths) else 0,
-        },
-        "elapsed_seconds": time.monotonic() - started,
-        "arrays": arrays,
-    }
-    (temporary / "manifest.json").write_text(
-        json.dumps(result, indent=2, sort_keys=True) + "\n"
-    )
-    if destination.exists():
-        shutil.rmtree(destination)
-    os.replace(temporary, destination)
-    return result
+    })
 
 
-def _merge_shard_parts(
-    partial: Path, group, shard: dict, parts: list[dict],
-    edge_margin: int, edge_trim: int,
+def merge_parts(
+    partial: Path, name: str, parts: list[dict], source_signature: dict,
 ) -> dict:
     """Merge small restartable range products into one runtime shard."""
-    name = str(shard["name"])
     destination = partial / name
     temporary = partial / f".{name}.merge-{os.getpid()}"
     for stale in partial.glob(f".{name}.merge-*"):
@@ -373,8 +424,7 @@ def _merge_shard_parts(
     lengths = np.diff(merged["crossing_offsets"])
     result = {
         "name": name,
-        "source_signature": _source_signature(
-            group, shard, edge_margin, edge_trim),
+        "source_signature": source_signature,
         "num_source_rays": int(sum(item["num_source_rays"] for item in parts)),
         "num_available_rays": int(sum(
             item["num_available_rays"] for item in parts)),
@@ -395,6 +445,31 @@ def _merge_shard_parts(
         shutil.rmtree(destination)
     os.replace(temporary, destination)
     return result
+
+
+def _manifest_fingerprint(manifest: dict) -> str:
+    """Digest of a root manifest without its timing and scheduling fields."""
+    identity_view = copy.deepcopy(manifest)
+    identity_view.pop("fingerprint", None)
+    identity_view.pop("elapsed_seconds", None)
+    identity_view.pop("export_workers", None)
+    identity_view.pop("rays_per_task", None)
+    for shard in identity_view.get("shards", []):
+        shard.pop("elapsed_seconds", None)
+    return _canonical_digest(identity_view)
+
+
+def finish_store(partial: Path, output: Path, manifest: dict) -> dict:
+    """Fingerprint ``manifest`` and publish ``partial`` as ``output``."""
+    manifest["fingerprint"] = _manifest_fingerprint(manifest)
+    (partial / "manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
+    )
+    parts_directory = partial / "parts"
+    if parts_directory.exists():
+        shutil.rmtree(parts_directory)
+    os.replace(partial, output)
+    return manifest
 
 
 def export_spiral_supervision(
@@ -490,10 +565,10 @@ def export_spiral_supervision(
             shards, desc="merging compact shards", unit="shard",
             dynamic_ncols=True, disable=not show_progress):
         name = str(shard["name"])
-        results.append(_merge_shard_parts(
-            partial, group, shard,
+        results.append(merge_parts(
+            partial, name,
             [item for item in part_results if item["name"] == name],
-            int(edge_margin), int(edge_trim)))
+            _source_signature(group, shard, int(edge_margin), int(edge_trim))))
     manifest = {
         "artifact_type": FORMAT_NAME,
         "format_version": FORMAT_VERSION,
@@ -520,21 +595,7 @@ def export_spiral_supervision(
         "shards": results,
         "elapsed_seconds": time.monotonic() - started,
     }
-    identity_view = copy.deepcopy(manifest)
-    identity_view.pop("elapsed_seconds")
-    identity_view.pop("export_workers", None)
-    identity_view.pop("rays_per_task", None)
-    for shard in identity_view["shards"]:
-        shard.pop("elapsed_seconds", None)
-    manifest["fingerprint"] = _canonical_digest(identity_view)
-    (partial / "manifest.json").write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-    )
-    parts_directory = partial / "parts"
-    if parts_directory.exists():
-        shutil.rmtree(parts_directory)
-    os.replace(partial, output)
-    return manifest
+    return finish_store(partial, output, manifest)
 
 
 def validate_spiral_supervision(
@@ -552,14 +613,7 @@ def validate_spiral_supervision(
         raise ValueError(
             f"unsupported compact supervision version: "
             f"{manifest.get('format_version')!r}")
-    identity_view = copy.deepcopy(manifest)
-    claimed_fingerprint = identity_view.pop("fingerprint", None)
-    identity_view.pop("elapsed_seconds", None)
-    identity_view.pop("export_workers", None)
-    identity_view.pop("rays_per_task", None)
-    for shard in identity_view.get("shards", []):
-        shard.pop("elapsed_seconds", None)
-    if claimed_fingerprint != _canonical_digest(identity_view):
+    if manifest.get("fingerprint") != _manifest_fingerprint(manifest):
         raise ValueError("compact supervision manifest fingerprint mismatch")
     ray_count = crossing_count = 0
     for shard in manifest.get("shards", []):
