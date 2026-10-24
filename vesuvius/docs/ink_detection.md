@@ -454,6 +454,9 @@ Flat inference requires a checkpoint with `mode: "flat"` and a square Y/X
 crop. It prefers `ema_model`, then common flat state-dict aliases, then
 `model`. The output is a tiled LZW uint8 BigTIFF. Probabilities are clipped to
 `[0,1]`, multiplied by 255, and truncated to uint8.
+The TIFF is written to a unique sibling temporary file and replaces the target
+only after encoding succeeds. A source-read, encoding, or publication error
+preserves any previous output and removes the unpublished temporary file.
 
 Flat inference has a narrower preprocessing contract than training. It accepts
 `robust_mad` only with the default 1st and 99th percentiles, and `divide` only
