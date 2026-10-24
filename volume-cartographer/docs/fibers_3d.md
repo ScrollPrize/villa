@@ -16,7 +16,7 @@ portion. Changing filters or styles preserves the camera.
 
 **CT ribbon** displays the CT directly along the selected fibre in the 3D view.
 The button opens a **Width** slider (full width, 1–512 active-CT voxels; default
-6) and **Rotation** slider (−180° to +180° about the fibre). Both values are
+32) and **Rotation** slider (−180° to +180° about the fibre). Both values are
 remembered; the ribbon is initially off. It follows selection from either
 the 3D view or the CT overlays. Clearing selection removes it, and the toggle
 can still be switched off without selecting another fibre.
@@ -28,7 +28,9 @@ arbitrary and the status says to adjust rotation. The rotation offsets that
 baseline along the entire fibre. This is an inspection plane, not a reconstructed
 papyrus surface or a claim about which sheet contains the fibre. It does not
 modify the AFV or manual annotation. Gaps, invalid points and disconnected runs
-are not bridged, and the displayed region still applies.
+are not bridged, and the displayed region still applies. Consecutive AFV storage
+blocks sharing the same original point use one continuous orientation sequence;
+storage boundaries do not restart the ribbon's frame.
 
 The ribbon samples the active CT at level 0 with trilinear interpolation, one
 sample per texel and no depth projection/MIP. Width is centred on the fibre.
@@ -58,6 +60,20 @@ normal fields and the existing dataset-resolution checks. The wider
 sourceRoot` (line 1922), reproduced identically with the pre-change resolver;
 its Lasagna pairing checks passed. QA inputs, screenshots, logs and the baseline
 reproducer are in `exports/VC3D_FIBERS3D_QA/ribbon-20261024` in the outer workspace.
+
+The AFV block-boundary regression was also reproduced on PHerc1447 fibre
+1,433,216 (560 source points, three storage blocks, 20.98 mm). Restarting the
+fallback frame per block introduced normal jumps of 87.44° and 96.33°.
+The corrected 2,712-row ribbon has exactly the same frames as the unsplit
+source polyline, including across its three texture tiles. Tests also retain
+real gaps and disconnected runs. The native application check verifies the
+32-voxel default, rotation, contrast, camera dragging, selection changes and
+cancellation (`run-seam-integrated.py` and `ribbon-seam-integrated.json` in the
+same QA directory).
+
+With an existing configured build, compile using `cmake --build build --target
+VC3D test_fiber_3d_ribbon -j 6`. Run the focused tests using `ctest --test-dir build
+--output-on-failure -R '^(fiber_3d_ribbon|fiber_3d_geometry|fiber_3d_data|test_fiber_collection)$'`.
 
 Selecting an AFV fibre in a CT slice or the catalogue also highlights it in
 3D, using the same yellow (`#ffff66`) as the slice overlay and a stroke

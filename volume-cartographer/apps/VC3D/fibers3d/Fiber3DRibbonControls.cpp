@@ -78,7 +78,7 @@ struct Fiber3DRibbonControls::Impl {
             layout->addLayout(line);
             return spin;
         };
-        width = row(q->tr("Width"), "fibers3DRibbonWidth", 1, 512, 6, q->tr(" vx"));
+        width = row(q->tr("Width"), "fibers3DRibbonWidth", 1, 512, 32, q->tr(" vx"));
         width->setToolTip(q->tr("Full ribbon width, centered on the fiber, in active CT voxels"));
         rotation = row(q->tr("Rotation"), "fibers3DRibbonRotation", -180, 180, 0, QString::fromUtf8("°"));
         rotation->setToolTip(q->tr("Rotate the sampling plane around the fiber. Without Lasagna normals the starting plane is arbitrary."));

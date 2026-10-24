@@ -9,6 +9,44 @@ class Fiber3DRibbonTest : public QObject
 {
     Q_OBJECT
 private slots:
+    void storageBlocksKeepTheSameFramesAsAnUnsplitFiber()
+    {
+        Run full;
+        for (int i = 0; i < 560; ++i)
+            full.points.push_back({double(i), 10 * std::sin(i * .01), 5 * std::cos(i * .02)});
+        Fiber unsplit;
+        unsplit.runs = {full};
+        Fiber blocked;
+        // Real AFV blocks share their boundary point every 256 segments.
+        // A spatial query need not return blocks in point order.
+        blocked.runs = {
+            Run{{full.points.begin() + 512, full.points.end()}, 512},
+            Run{{full.points.begin(), full.points.begin() + 257}, 0},
+            Run{{full.points.begin() + 256, full.points.begin() + 513}, 256}};
+        const auto expected = ribbon::makeFrames(unsplit, {});
+        const auto actual = ribbon::makeFrames(blocked, {});
+        QCOMPARE(actual.strips.size(), size_t(1));
+        QCOMPARE(actual.rows, expected.rows);
+        for (size_t i = 0; i < actual.rows; ++i) {
+            const auto& a = actual.strips[0][i];
+            const auto& b = expected.strips[0][i];
+            QVERIFY(cv::norm(a.center - b.center) < 1e-12);
+            QVERIFY(cv::norm(a.tangent - b.tangent) < 1e-12);
+            QVERIFY(cv::norm(a.normal - b.normal) < 1e-12);
+        }
+        // Coincident positions do not justify bridging absent source indices.
+        blocked.runs[2].firstPoint += 1;
+        QCOMPARE(ribbon::makeFrames(blocked, {}).strips.size(), size_t(3));
+        blocked.runs[2].firstPoint = 256;
+        blocked.runs[2].points.front()[1] += .1;
+        QCOMPARE(ribbon::makeFrames(blocked, {}).strips.size(), size_t(2));
+        // An explicit gap at a block boundary remains a gap.
+        blocked.runs[2].points.front() = full.points[256];
+        blocked.runs[2].styles.assign(256, SpanStyle::Solid);
+        blocked.runs[2].styles[0] = SpanStyle::InferredGap;
+        QCOMPARE(ribbon::makeFrames(blocked, {}).strips.size(), size_t(2));
+    }
+
     void transportedFramesAndLasagnaSignContinuity()
     {
         Fiber fiber;

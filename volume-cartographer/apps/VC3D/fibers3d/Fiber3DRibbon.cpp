@@ -89,7 +89,28 @@ Frames makeFrames(const Fiber& fiber, const std::optional<Bounds>& clip, const N
             throw std::runtime_error("CT ribbon is too long; narrow the displayed region");
         points.push_back(p);
     };
-    for (const auto& run : fiber.runs) {
+    // AFV storage blocks are not breaks in a fiber. Build one frame sequence
+    // across blocks sharing an original point, even if the spatial query
+    // returned those blocks out of order. Missing indices or geometry still
+    // break the strip; proximity alone never joins separate runs.
+    std::vector<const Run*> ordered;
+    ordered.reserve(fiber.runs.size());
+    for (const auto& run : fiber.runs)
+        ordered.push_back(&run);
+    std::stable_sort(ordered.begin(), ordered.end(), [](const Run* a, const Run* b) { return a->firstPoint < b->firstPoint; });
+    const Run* previous = nullptr;
+    for (const auto* source : ordered) {
+        const auto& run = *source;
+        if (run.points.size() < 2) {
+            flush();
+            previous = nullptr;
+            continue;
+        }
+        const bool contiguous = previous && previous->firstPoint >= 0 && run.firstPoint >= previous->firstPoint &&
+                                uint64_t(run.firstPoint) - uint64_t(previous->firstPoint) == previous->points.size() - 1 &&
+                                previous->points.back() == run.points.front();
+        if (!contiguous)
+            flush();
         for (size_t i = 1; i < run.points.size(); ++i) {
             check(cancelled);
             const auto style = i - 1 < run.styles.size() ? run.styles[i - 1] : SpanStyle::Solid;
@@ -115,8 +136,9 @@ Frames makeFrames(const Fiber& fiber, const std::optional<Bounds>& clip, const N
             for (size_t k = 1; k <= steps; ++k)
                 append(p + (q - p) * (double(k) / steps));
         }
-        flush();
+        previous = source;
     }
+    flush();
     return result;
 }
 
