@@ -80,6 +80,7 @@ def find_segment_patches(
         else open_volume(segment.validation_mask, scan_scale)
     )
     mask_surface = int(supervision.shape[0] // 2)
+    ink_surface = int(inklabels.shape[0] // 2)  # each label store is read at its own mid-plane
     validation_surface = (
         None if validation is None else int(validation.shape[0] // 2)
     )
@@ -137,7 +138,7 @@ def find_segment_patches(
                 )
             )
         label_patch = inklabels[
-            mask_surface, y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
+            ink_surface, y_scan : y_scan + scan_h, x_scan : x_scan + scan_w
         ]
         if has_training and labeled_patch_coverage(label_patch) >= (
             segment.data_config.patch_finding.min_labeled_coverage
