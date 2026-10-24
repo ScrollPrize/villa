@@ -65,12 +65,11 @@ void ObjectStore::deleteObject(WriteTxn& txn, const std::string& uuid)
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Savepoint savepoint(db);
     const auto bytes = parseUuid(uuid);
-    auto id = objectIdByUuid(db, bytes);
-    if (!id) throw std::runtime_error("object store: object not found: " + uuid);
-    Statement s(db, "DELETE FROM objects WHERE id=?");  // FK RESTRICT on edges refuses while referenced
-    s.bind(1, *id);
-    s.stepDone();
-    appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "delete");
+    Statement row(db, "SELECT id,kind FROM objects WHERE uuid=?", bytes);
+    if (!row.row()) throw std::runtime_error("object store: object not found: " + uuid);
+    const auto kind = row.text(1);
+    execute(db, "DELETE FROM objects WHERE id=?", row.i64(0));  // FK RESTRICT on edges refuses while referenced
+    appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "delete", kind);
     savepoint.release();
 }
 

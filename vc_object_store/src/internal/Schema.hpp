@@ -53,7 +53,7 @@ CREATE TABLE object_tags(
 CREATE INDEX object_tags_tag ON object_tags(tag);
 CREATE TABLE journal(
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
-  record_uuid BLOB NOT NULL, generation INTEGER NOT NULL,
+  record_uuid BLOB NOT NULL, record_kind TEXT NOT NULL, generation INTEGER NOT NULL,
   author TEXT NOT NULL, hostname TEXT NOT NULL, timestamp TEXT NOT NULL,
   change_kind TEXT NOT NULL,
   approval_state TEXT, approved_by TEXT, approved_at TEXT, approved_host TEXT, approved_generation INTEGER

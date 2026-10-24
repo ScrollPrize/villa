@@ -70,10 +70,11 @@ void ObjectStore::removeEdge(WriteTxn& txn, const std::string& uuid)
     sqlite3* db = static_cast<sqlite3*>(connection(txn));
     Savepoint savepoint(db);
     const auto bytes = parseUuid(uuid);
-    auto id = edgeIdByUuid(db, bytes);
-    if (!id) throw std::runtime_error("object store: edge not found: " + uuid);
-    execute(db, "DELETE FROM edges WHERE id=?", *id);
-    appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "remove_edge");
+    Statement row(db, "SELECT id,kind FROM edges WHERE uuid=?", bytes);
+    if (!row.row()) throw std::runtime_error("object store: edge not found: " + uuid);
+    const auto kind = row.text(1);
+    execute(db, "DELETE FROM edges WHERE id=?", row.i64(0));
+    appendJournal(db, impl_->options.author, impl_->hostname, bytes, 0, "remove_edge", kind);
     savepoint.release();
 }
 

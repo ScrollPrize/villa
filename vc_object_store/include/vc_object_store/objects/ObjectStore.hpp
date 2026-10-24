@@ -138,6 +138,7 @@ struct SelectedRelationship {
 struct JournalEntry {
     int64_t seq = 0;
     std::string recordUuid;
+    std::string kind; // the object or edge kind, recorded at the change
     int64_t generation = 0;
     std::string author, hostname, timestamp, changeKind;
     // Approval snapshot after this change; absent for deletion events.

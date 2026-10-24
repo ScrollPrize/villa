@@ -60,6 +60,8 @@ int main() try
     events = session.takeEvents();
     require(events.size() == 1 && events[0].changes.size() == 3, "mixed action notification");
     require(events[0].attachment == identity && events[0].journalPosition > 0, "event identity and journal");
+    for (const auto& change : events[0].changes)
+        require(change.kind == (change.recordUuid == edge ? "mixed" : change.recordUuid == a ? "fiber" : "point_collection"), "changes carry record kinds");
     const auto committed = heads();
     mustFail([&] { session.act(identity, expected, [&](auto& store, auto& txn) { store.setMeta(txn, a, "stale", "true"); }); });
     require(heads() == committed && session.takeEvents().empty(), "conflict leaves no changes");
@@ -84,6 +86,9 @@ int main() try
     { auto txn = external.write(); external.setMeta(txn, b, "external", "true"); txn.commit(); }
     events = session.takeEvents();
     require(events.size() == 1 && events[0].changes.size() == 1 && events[0].changes[0].recordUuid == b, "external notification");
+    { auto txn = external.write(); external.removeEdge(txn, edge); txn.commit(); }
+    events = session.takeEvents();
+    require(events.size() == 1 && events[0].changes[0].kind == "mixed", "deletions keep their record kind");
 
     // Same expected head submitted concurrently: exactly one action wins.
     expected = heads();

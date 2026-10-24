@@ -412,6 +412,7 @@ NB_MODULE(_native, m)
                     nb::dict d;
                     d["seq"] = e.seq;
                     d["record_uuid"] = e.recordUuid;
+                    d["kind"] = e.kind;
                     d["generation"] = e.generation;
                     d["author"] = e.author;
                     d["hostname"] = e.hostname;

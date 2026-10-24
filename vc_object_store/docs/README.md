@@ -72,7 +72,9 @@ session from a callback. Replacement validates the new database first, drains
 accepted writes, and cancels/waits for old readers. Include the attachment
 generation in asynchronous requests and caches: even reattaching the same store
 invalidates old requests. `takeEvents()` polls local and external commits for
-all object kinds; call it from the application's event loop. `finalize()` waits
+all object kinds; call it from the application's event loop. Each change carries
+its record's object or edge `kind` (kept for deletions too), so a consumer
+filters by kind without looking the record up. `finalize()` waits
 for accepted writes; edits are already committed by `act()`.
 
 Fiber consumers use the same `selectObjects`, `geometryRegion`, geometry, and
