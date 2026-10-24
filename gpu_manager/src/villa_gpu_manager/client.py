@@ -9,7 +9,10 @@ from .protocol import MAX_FRAME, VERSION, ProtocolError, decode, encode, require
 
 
 class Client:
-    def __init__(self, path, *, timeout=5, registration_root=None):
+    def __init__(self, path, *, timeout=5, registration_root=None, reconfigure_mode="full_release"):
+        if reconfigure_mode not in ("full_release", "incremental_release"):
+            raise ValueError("unknown reconfiguration mode")
+        self.reconfigure_mode = reconfigure_mode
         self.path, self.timeout = str(path), timeout
         self.socket = None
         self.epoch = None
@@ -24,7 +27,7 @@ class Client:
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.socket.settimeout(self.timeout)
         self.socket.connect(self.path)
-        reply = self.call("hello", {"versions": [VERSION], "required_capabilities": ["full_release", "poll", "task_scheduling"]})
+        reply = self.call("hello", {"versions": [VERSION], "required_capabilities": [self.reconfigure_mode, "poll", "task_scheduling"]})
         return reply
 
     def call(self, op, body, *, request_id=None):
@@ -68,7 +71,7 @@ class Client:
         # or restarting the manager cannot strand an allocated task.
         self.token = token or self.token or secrets.token_hex(32)
         body = {"task_id": self.task_id, "label": label, "root": root or self.registration_root or process_identity(),
-                "request": request, "reconfigure_mode": "full_release", "token": self.token,
+                "request": request, "reconfigure_mode": self.reconfigure_mode, "token": self.token,
                 **self.capabilities}
         result = self.call("register", body)
         self.token, self.task = result["token"], result["task"]
