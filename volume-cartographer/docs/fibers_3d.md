@@ -14,6 +14,33 @@ fibres or close the collection. Camera dragging does not clear selection.
 **Fit** frames the displayed geometry; **Fit selected** frames its selected
 portion. Changing filters or styles preserves the camera.
 
+**Settings** opens a movable, non-modal window with five tabs, instead of a
+scrolling menu. Changes apply immediately; you can orbit or select in the 3D
+view while it stays open. **Close** or **Escape** hides the window and reopening
+it keeps the current tab and position for the session.
+
+- **Fibers:** sources, families, minimum length, CT-focus region and box width.
+- **Surface:** mesh visibility/opacity, distance filter and Fit surface.
+- **Appearance:** color mode/palette, line width, camera, cursor, bounds and gaps.
+- **Selection:** nearby fibers, other-fiber opacity, annotation markers and tags.
+- **Memory:** memory budget and fiber count limit (0 means no count limit).
+
+Each page fits without scrolling; color-specific controls appear only when
+relevant. Existing preferences, filters and defaults are preserved. Hiding the
+3D dock also hides its settings window.
+
+Settings validation on macOS: the native application harness checks all five
+pages (520 × 460 logical pixels), every color mode including the expanded length
+range, the CT-focus box and annotation options for clipped controls. It checks
+opacity slider synchronization and saved preference units, Escape/Close/reopen,
+remembered tab/position, dock hiding and camera interaction with settings open.
+The isolated Paris 4 test uses a copy of the project/preferences. QA scripts,
+results and screenshots: `exports/VC3D_FIBERS3D_QA/settings-20261024` in the outer
+workspace. With the existing Mac build, run `cmake --build build --target VC3D
+-j6`, then `python3 /Users/samir/Fiber3DReview/run-settings-integrated.py` (the
+adjacent `settings-startup.cpp` is linked into a separate QA executable).
+This UI change was not exercised on Ubuntu.
+
 **Settings → Surface → Display surface mesh** displays the surface selected
 in Main alongside the fibres. It starts off and remembers that choice. **Opacity**
 runs from 0–100% (default 100%, 5% arrow steps); **Fit surface** frames just the

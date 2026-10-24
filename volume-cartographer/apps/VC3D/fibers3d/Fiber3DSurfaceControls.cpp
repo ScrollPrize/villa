@@ -36,7 +36,16 @@ struct Fiber3DSurfaceControls::Impl {
 
     Impl(Fiber3DSurfaceControls* widget, CState* s, Fiber3DCanvas* c) : q(widget), state(s), canvas(c)
     {
-        auto* layout = new QVBoxLayout(q); layout->setContentsMargins(0,0,0,0); layout->setSpacing(7);
+        auto* layout = new QVBoxLayout(q); layout->setContentsMargins(0,0,0,0); layout->setSpacing(10);
+        auto heading = [&](const QString& text) {
+            auto* title = new QLabel(text, q);
+            auto font = title->font(); font.setBold(true); title->setFont(font);
+            layout->addWidget(title);
+        };
+        heading(q->tr("Surface selected in Main"));
+        status = new QLabel(q); status->setObjectName(QStringLiteral("fibers3DSurfaceStatus"));
+        status->setTextFormat(Qt::PlainText); status->setWordWrap(true); layout->addWidget(status);
+        layout->addSpacing(5);
         QSettings prefs(vc3d::settingsFilePath(), QSettings::IniFormat);
         enabled = new QCheckBox(q->tr("Display surface mesh"), q);
         enabled->setObjectName(QStringLiteral("fibers3DSurfaceMesh"));
@@ -55,6 +64,8 @@ struct Fiber3DSurfaceControls::Impl {
         slider->setAccessibleName(q->tr("Surface mesh opacity")); label->setBuddy(opacity);
         line->addWidget(label); line->addWidget(slider,1); line->addWidget(opacity);
         layout->addWidget(options);
+        layout->addSpacing(5);
+        heading(q->tr("Nearby fibers"));
         nearby = new QCheckBox(q->tr("Only fibers near surface"), q);
         nearby->setObjectName(QStringLiteral("fibers3DNearSurface"));
         nearby->setChecked(prefs.value(QStringLiteral("fibers3d/fibers3DNearSurface"), false).toBool());
@@ -68,11 +79,12 @@ struct Fiber3DSurfaceControls::Impl {
         distance->setValue(prefs.value(QStringLiteral("fibers3d/fibers3DSurfaceDistance"), 64).toInt());
         distance->setEnabled(nearby->isChecked()); distanceLabel->setBuddy(distance);
         distanceRow->addWidget(distanceLabel); distanceRow->addWidget(distance,1); layout->addLayout(distanceRow);
+        auto* help = new QLabel(q->tr("Keeps whole fibers within this distance, on either side. Also works with the mesh hidden."), q);
+        help->setWordWrap(true); layout->addWidget(help);
         canvas->setSurfaceFilter(nearby->isChecked(),distance->value());
         fit = new QPushButton(q->tr("Fit surface"), q); fit->setObjectName(QStringLiteral("fibers3DFitSurface"));
-        fit->setEnabled(false); layout->addWidget(fit);
-        status = new QLabel(q); status->setObjectName(QStringLiteral("fibers3DSurfaceStatus"));
-        status->setTextFormat(Qt::PlainText); status->setWordWrap(true); layout->addWidget(status);
+        fit->setAutoDefault(false);
+        fit->setEnabled(false); layout->addWidget(fit, 0, Qt::AlignLeft);
         QObject::connect(slider, &QSlider::valueChanged, opacity, &QSpinBox::setValue);
         QObject::connect(opacity, &QSpinBox::valueChanged, slider, &QSlider::setValue);
         QObject::connect(opacity, &QSpinBox::valueChanged, q, [this](int value) {

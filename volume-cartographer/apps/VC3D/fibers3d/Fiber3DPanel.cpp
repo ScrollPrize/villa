@@ -10,13 +10,13 @@
 #include "ViewerManager.hpp"
 #include "vc/core/types/Volume.hpp"
 
-#include <QActionEvent>
 #include <QApplication>
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
 #include <QDoubleSpinBox>
-#include <QFrame>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QIcon>
 #include <QPixmap>
 #include <QScreen>
@@ -25,16 +25,15 @@
 #include <QLabel>
 #include <QMenu>
 #include <QPushButton>
-#include <QScrollArea>
 #include <QSettings>
 #include <QShowEvent>
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QSpinBox>
+#include <QTabWidget>
 #include <QTimer>
 #include <QToolButton>
 #include <QVBoxLayout>
-#include <QWidgetAction>
 #include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
@@ -84,10 +83,8 @@ struct Fiber3DPanel::Impl {
     QPushButton *customColor, *hColor, *vColor;
     QCheckBox* fixedRange;
     QWidget *customRow, *familyRow, *directionRow, *paletteRow, *fixedRangeRow, *lengthRangeRow, *boxWidthRow, *annotationOptions;
-    QMenu* settingsMenu;
-    QWidgetAction* settingsAction;
-    QScrollArea* settingsScroll;
-    QWidget* settingsContents;
+    QDialog* settingsDialog;
+    QTabWidget* settingsTabs;
     DisplaySettings display;
     QTimer debounce;
     QFutureWatcher<LoadResult> watcher;
@@ -124,7 +121,6 @@ struct Fiber3DPanel::Impl {
         auto* settingsButton = button(q->tr("Settings"), QStringLiteral("fibers3DSettings"));
         settingsButton->setToolTip(q->tr("3D display settings"));
         settingsButton->setAccessibleName(q->tr("3D display settings"));
-        settingsButton->setStyleSheet(QStringLiteral("QToolButton::menu-indicator { image: none; }"));
         layout->addLayout(bar);
         canvas = new Fiber3DCanvas(q);
         canvas->setObjectName(QStringLiteral("fibers3DCanvas"));
@@ -248,23 +244,57 @@ struct Fiber3DPanel::Impl {
     {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         settings.beginGroup(QStringLiteral("fibers3d"));
-        settingsMenu = new QMenu(settingsButton);
-        settingsScroll = new QScrollArea(settingsMenu);
-        settingsScroll->setWidgetResizable(true);
-        settingsScroll->setFrameShape(QFrame::NoFrame);
-        settingsScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-        settingsScroll->setFixedWidth(360);
-        settingsContents = new QWidget(settingsScroll);
-        auto* body = new QVBoxLayout(settingsContents);
-        body->setContentsMargins(12, 10, 12, 10);
-        body->setSpacing(7);
-        settingsScroll->setWidget(settingsContents);
-        settingsAction = new QWidgetAction(settingsMenu);
-        settingsAction->setDefaultWidget(settingsScroll);
-        settingsMenu->addAction(settingsAction);
-        settingsButton->setMenu(settingsMenu);
-        settingsButton->setPopupMode(QToolButton::InstantPopup);
-        QObject::connect(settingsMenu, &QMenu::aboutToShow, q, [this] { resizeSettings(); });
+        settingsDialog = new QDialog(q, Qt::Tool);
+        settingsDialog->setObjectName(QStringLiteral("fibers3DSettingsDialog"));
+        settingsDialog->setWindowTitle(q->tr("Fibers 3D · Settings"));
+        settingsDialog->setModal(false);
+        settingsDialog->resize(520, 460);
+        auto* dialogLayout = new QVBoxLayout(settingsDialog);
+        dialogLayout->setContentsMargins(12, 12, 12, 12);
+        settingsTabs = new QTabWidget(settingsDialog);
+        settingsTabs->setObjectName(QStringLiteral("fibers3DSettingsTabs"));
+        settingsTabs->setUsesScrollButtons(false);
+        // The application's dark theme gives all tabs the same background.
+        // Keep the current settings page unmistakable in either theme.
+        settingsTabs->setStyleSheet(QStringLiteral(
+            "QTabBar::tab:selected { background-color: palette(highlight); color: palette(highlighted-text); }"));
+        dialogLayout->addWidget(settingsTabs);
+        auto* closeButtons = new QDialogButtonBox(QDialogButtonBox::Close, settingsDialog);
+        closeButtons->button(QDialogButtonBox::Close)->setAutoDefault(false);
+        dialogLayout->addWidget(closeButtons);
+        QObject::connect(closeButtons, &QDialogButtonBox::rejected, settingsDialog, &QDialog::hide);
+        QObject::connect(settingsButton, &QToolButton::clicked, q, [this, settingsButton] {
+            resizeSettings();
+            if (!settingsDialog->isVisible()) {
+                // Keep the last position when reopened, but recover a window
+                // left on a disconnected monitor. Use the button's screen for
+                // a new dialog, also when the 3D dock has been detached.
+                const auto available = settingsButton->screen()->availableGeometry();
+                if (!settingsDialog->property("positioned").toBool() ||
+                    !available.contains(settingsDialog->frameGeometry())) {
+                    auto position = settingsButton->mapToGlobal(QPoint(settingsButton->width() - settingsDialog->width(), settingsButton->height()));
+                    position.setX(std::clamp(position.x(), available.left(), std::max(available.left(), available.right() - settingsDialog->width())));
+                    position.setY(std::clamp(position.y(), available.top() + 30, std::max(available.top() + 30, available.bottom() - settingsDialog->height())));
+                    settingsDialog->move(position);
+                    settingsDialog->setProperty("positioned", true);
+                }
+                settingsDialog->show();
+            }
+            settingsDialog->raise();
+            settingsDialog->activateWindow();
+        });
+
+        QWidget* settingsContents = nullptr;
+        QVBoxLayout* body = nullptr;
+        auto page = [&](const QString& title, const QString& name) {
+            if (body) body->addStretch();
+            settingsContents = new QWidget(settingsTabs);
+            settingsContents->setObjectName(name);
+            body = new QVBoxLayout(settingsContents);
+            body->setContentsMargins(16, 16, 16, 16);
+            body->setSpacing(10);
+            settingsTabs->addTab(settingsContents, title);
+        };
 
         auto section = [&](const QString& title) {
             if (body->count())
@@ -281,7 +311,8 @@ struct Fiber3DPanel::Impl {
             line->setContentsMargins(0, 0, 0, 0);
             line->setSpacing(10);
             auto* label = new QLabel(title, container);
-            label->setFixedWidth(108);
+            label->setMinimumWidth(128);
+            label->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
             label->setBuddy(field);
             line->addWidget(label);
             line->addWidget(field, 1);
@@ -334,6 +365,7 @@ struct Fiber3DPanel::Impl {
             if (stored.isValid())
                 color = stored;
             auto* button = new QPushButton(label, settingsContents);
+            button->setAutoDefault(false);
             button->setObjectName(QString::fromLatin1(key));
             const auto refresh = [button, &color] {
                 QPixmap swatch(32, 32);
@@ -355,15 +387,13 @@ struct Fiber3DPanel::Impl {
             return button;
         };
 
-        section(q->tr("Surface"));
-        surfaceControls = new Fiber3DSurfaceControls(state, canvas, settingsContents);
-        body->addWidget(surfaceControls);
-
+        page(q->tr("Fibers"), QStringLiteral("fibers3DSettingsFibers"));
         section(q->tr("Sources"));
         nativeSource = check("fibers3DNative", q->tr("Project annotations"), true);
         afvSource = check("fibers3DAutomated", q->tr("Automated collection"), true);
         body->addWidget(nativeSource);
         body->addWidget(afvSource);
+        section(q->tr("Filters"));
         h = check("fibers3DH", q->tr("H"), automated->showHorizontal());
         v = check("fibers3DV", q->tr("V"), automated->showVertical());
         unknown = check("fibers3DUnknown", q->tr("Unclassified"), true);
@@ -375,13 +405,20 @@ struct Fiber3DPanel::Impl {
         h->setChecked(automated->showHorizontal());
         v->setChecked(automated->showVertical());
         minimum->setValue(automated->minimumLengthMm());
-        row(q->tr("Min. length"), minimum);
+        row(q->tr("Minimum length"), minimum);
         region = combo("fibers3DRegion", {q->tr("Around CT focus"), q->tr("Whole volume")}, 1);
         row(q->tr("Region"), region);
         boxWidth = integer("fibers3DBoxWidth", 16, 100000, 1024);
         boxWidth->setSuffix(q->tr(" vx"));
         boxWidth->setToolTip(q->tr("Width in current CT volume voxels"));
         boxWidthRow = row(q->tr("Box width"), boxWidth);
+
+        page(q->tr("Surface"), QStringLiteral("fibers3DSettingsSurface"));
+        surfaceControls = new Fiber3DSurfaceControls(state, canvas, settingsContents);
+        body->addWidget(surfaceControls);
+
+        page(q->tr("Memory"), QStringLiteral("fibers3DSettingsMemory"));
+        section(q->tr("Loading limits"));
 
         memoryBudget = new QComboBox(settingsContents);
         memoryBudget->setObjectName(QStringLiteral("fibers3DMemoryBudgetMiB"));
@@ -396,11 +433,18 @@ struct Fiber3DPanel::Impl {
         surfaceControls->setMemoryBudget(size_t(memoryBudget->currentData().toInt()) * 1024 * 1024);
         memoryBudget->setToolTip(q->tr("Maximum decoded fiber coordinates per source, and maximum surface mesh buffer size. Additional rendering buffers, snapshots and CT use more memory. This is a limit, not a preallocation."));
         row(q->tr("Memory budget"), memoryBudget);
-        auto* memoryHelp = new QLabel(q->tr("Per source. Rendering and CT use additional memory."), settingsContents);
+        auto* memoryHelp = new QLabel(q->tr("Budget per fiber source and for the surface mesh. Rendering buffers and CT use additional memory. Memory is allocated only as needed."), settingsContents);
         memoryHelp->setWordWrap(true);
         body->addWidget(memoryHelp);
+        limit = integer("fibers3DLimit", 0, 1000000, 10000);
+        limit->setSpecialValueText(q->tr("No limit"));
+        limit->setToolTip(q->tr("Maximum displayed fibers per source. No limit uses only the memory budget. The selected fiber has priority, then the longest fibers in the region."));
+        row(q->tr("Fiber limit"), limit);
+        auto* limitHelp = new QLabel(q->tr("Set to 0 for no count limit. The selected fiber loads first, then the longest fibers in the region."), settingsContents);
+        limitHelp->setWordWrap(true);
+        body->addWidget(limitHelp);
 
-        section(q->tr("Appearance"));
+        page(q->tr("Appearance"), QStringLiteral("fibers3DSettingsAppearance"));
         colors = combo("fibers3DColorMode", {q->tr("Custom"), q->tr("H / V"), q->tr("Direction"), q->tr("Length")}, 1);
         row(q->tr("Color by"), colors);
         customColor = colorButton("fibers3DCustomColor", q->tr("Choose…"), display.custom);
@@ -428,9 +472,21 @@ struct Fiber3DPanel::Impl {
         row(q->tr("Maximum"), rangeMax, rangeLayout);
         body->addWidget(lengthRangeRow);
         auto* width = real("fibers3DLineWidth", 0.5, 10, display.lineWidth, 1, q->tr(" px"));
+        width->setSingleStep(0.5);
         row(q->tr("Line width"), width);
 
-        section(q->tr("Selection"));
+        section(q->tr("View"));
+        auto* perspective = check("fibers3DPerspective", q->tr("Perspective"), false);
+        auto* bounds = check("fibers3DBounds", q->tr("Show region bounds"), display.showBounds);
+        auto* cursor = check("fibers3DCursor", q->tr("Show cursor"), true);
+        body->addWidget(perspective);
+        body->addWidget(horizontal({cursor, bounds}));
+        auto* gaps = check("fibers3DGaps", q->tr("Show annotated gaps as dashed lines"), false);
+        gaps->setToolTip(q->tr("Display annotated gaps and inferred connections as dashed lines."));
+        body->addWidget(gaps);
+
+        page(q->tr("Selection"), QStringLiteral("fibers3DSettingsSelection"));
+        section(q->tr("Nearby fibers"));
         auto* nearby = check("fibers3DNearbyOnly", q->tr("Only fibers near selection"), false);
         nearby->setToolTip(q->tr("Keep whole loaded fibers that pass within this distance of any part of the selected fiber. Without a selection, show all loaded fibers. This only filters the 3D view."));
         body->addWidget(nearby);
@@ -441,29 +497,7 @@ struct Fiber3DPanel::Impl {
         nearbyDistance->setToolTip(q->tr("Shortest 3D distance between fiber centerlines, in active CT voxels. Computed from original segments, independently of zoom."));
         row(q->tr("Distance"), nearbyDistance);
 
-        section(q->tr("Annotations"));
-        auto* gaps = check("fibers3DGaps", q->tr("Dashed gaps"), false);
-        gaps->setToolTip(q->tr("Display annotated gaps and inferred connections as dashed lines."));
-        auto* annotationsVisible = check("fibers3DAnnotations", q->tr("Show markers and tags"), false);
-        auto* selectedOnly = check("fibers3DAnnotationsSelected", q->tr("Selected fiber only"), true);
-        body->addWidget(gaps);
-        body->addWidget(annotationsVisible);
-        annotationOptions = selectedOnly;
-        body->addWidget(annotationOptions);
-
-        body->addSpacing(5);
-        auto* advanced = new QToolButton(settingsContents);
-        advanced->setObjectName(QStringLiteral("fibers3DAdvanced"));
-        advanced->setText(q->tr("More display options"));
-        advanced->setCheckable(true);
-        advanced->setAutoRaise(true);
-        advanced->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-        advanced->setArrowType(Qt::RightArrow);
-        body->addWidget(advanced);
-        auto* advancedContent = new QWidget(settingsContents);
-        auto* advancedLayout = new QVBoxLayout(advancedContent);
-        advancedLayout->setContentsMargins(0, 0, 0, 0);
-        advancedLayout->setSpacing(7);
+        section(q->tr("Highlight"));
         // Keep the stored 0..1 preference compatible with previous versions;
         // the controls expose a percentage with useful keyboard/button steps.
         double storedOpacity = settings.value(QStringLiteral("fibers3DOpacity"), display.unselectedOpacity).toDouble();
@@ -490,27 +524,24 @@ struct Fiber3DPanel::Impl {
         const auto opacityHelp = q->tr("Opacity of other fibers when a displayed fiber is selected. Without a selection, all fibers are opaque.");
         opacity->setToolTip(opacityHelp);
         opacitySlider->setToolTip(opacityHelp);
-        advancedLayout->addWidget(opacityLabel);
-        advancedLayout->addWidget(horizontal({opacitySlider, opacity}));
+        body->addWidget(opacityLabel);
+        body->addWidget(horizontal({opacitySlider, opacity}));
         QObject::connect(opacitySlider, &QSlider::valueChanged, opacity, &QSpinBox::setValue);
         QObject::connect(opacity, &QSpinBox::valueChanged, opacitySlider, &QSlider::setValue);
-        auto* perspective = check("fibers3DPerspective", q->tr("Perspective"), false);
-        auto* bounds = check("fibers3DBounds", q->tr("Show region bounds"), display.showBounds);
-        auto* cursor = check("fibers3DCursor", q->tr("Show cursor"), true);
-        advancedLayout->addWidget(perspective);
-        advancedLayout->addWidget(bounds);
-        advancedLayout->addWidget(cursor);
-        limit = integer("fibers3DLimit", 0, 1000000, 10000);
-        limit->setSpecialValueText(q->tr("No limit"));
-        limit->setToolTip(q->tr("Maximum displayed fibers per source. No limit uses only the memory budget. The selected fiber has priority, then the longest fibers in the region."));
-        row(q->tr("Fiber limit"), limit, advancedLayout);
-        body->addWidget(advancedContent);
-        advancedContent->hide();
-        QObject::connect(advanced, &QToolButton::toggled, q, [this, advanced, advancedContent](bool expanded) {
-            advanced->setArrowType(expanded ? Qt::DownArrow : Qt::RightArrow);
-            advancedContent->setVisible(expanded);
-            resizeSettings();
-        });
+        auto* opacityHelpLabel = new QLabel(q->tr("Applied when a fiber is selected. All fibers stay opaque without a selection."), settingsContents);
+        opacityHelpLabel->setWordWrap(true);
+        body->addWidget(opacityHelpLabel);
+        section(q->tr("Annotation details"));
+        auto* annotationsVisible = check("fibers3DAnnotations", q->tr("Show markers and tags"), false);
+        auto* selectedOnly = check("fibers3DAnnotationsSelected", q->tr("Selected fiber only"), true);
+        body->addWidget(annotationsVisible);
+        annotationOptions = selectedOnly;
+        body->addWidget(annotationOptions);
+        body->addStretch();
+        // Memory is deliberately last; the everyday controls come first.
+        auto* memoryPage = settingsTabs->widget(2);
+        settingsTabs->removeTab(2);
+        settingsTabs->addTab(memoryPage, q->tr("Memory"));
 
         auto changedDisplay = [=, this] {
             display.lineWidth = float(width->value());
@@ -564,21 +595,18 @@ struct Fiber3DPanel::Impl {
 
     void resizeSettings()
     {
-        settingsContents->layout()->activate();
-        const auto available = q->screen()->availableGeometry();
-        const int maximum = std::max(240, std::min(560, available.height() - 80));
-        settingsScroll->setFixedHeight(std::min(maximum, settingsContents->sizeHint().height() + 4));
-        // QMenu caches action geometry; embedded widget resizing alone does not invalidate it.
-        QActionEvent changed(QEvent::ActionChanged, settingsAction);
-        QApplication::sendEvent(settingsMenu, &changed);
-        settingsMenu->adjustSize();
+        settingsDialog->layout()->activate();
+        // Never shrink or jump while changing a mode or tab. Grow only if
+        // a longer translation/font or newly visible control requires it.
+        settingsDialog->resize(settingsDialog->size().expandedTo(
+            settingsDialog->sizeHint()).expandedTo(QSize(520, 460)));
     }
 
     void saveSettings()
     {
         QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
         s.beginGroup(QStringLiteral("fibers3d"));
-        // All editable settings have stable object names; the popup is a child.
+        // All editable settings have stable object names; the dialog is a child.
         for (auto* w : q->findChildren<QCheckBox*>())
             s.setValue(w->objectName(), w->isChecked());
         for (auto* w : q->findChildren<QComboBox*>())
@@ -837,6 +865,7 @@ void Fiber3DPanel::showEvent(QShowEvent* e)
 void Fiber3DPanel::hideEvent(QHideEvent* e)
 {
     QWidget::hideEvent(e);
+    d->settingsDialog->hide();
     d->ribbonControls->cancel();
     d->sliceControls->cancel();
     d->surfaceControls->suspend();
