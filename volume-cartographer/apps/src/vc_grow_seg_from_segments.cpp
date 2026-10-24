@@ -618,8 +618,7 @@ static std::unique_ptr<QuadSurface> load_or_create_center_cutout(QuadSurface& ta
     seed_surface->meta["sweep_cutout_px"] = cutout_px;
     seed_surface->meta["sweep_cutout_x"] = x0;
     seed_surface->meta["sweep_cutout_y"] = y0;
-    const std::string uuid = cutout_dir.filename().string();
-    seed_surface->save(cutout_dir, uuid, true);
+    seed_surface->saveAsNew(cutout_dir, true);
     std::cout << "Created sweep seed cutout " << cutout_dir
               << " roi=" << roi
               << " edge_cm=" << cutout_cm << std::endl;
@@ -1281,10 +1280,16 @@ int main(int argc, char *argv[])
         size_t best_idx = 0;
         double best_score = std::numeric_limits<double>::infinity();
         double best_coverage_adjusted_distance_vx = std::numeric_limits<double>::infinity();
+        // best_uuid / best_complete_uuid hold output *directory names*
+        // (the per-run `uuid` variable below is a directory name, despite
+        // its name); the surfaces themselves saveAsNew with fresh random
+        // object uuids, tracked separately for the report's uuid fields.
         std::string best_uuid;
+        std::string best_object_uuid;
         size_t best_complete_idx = 0;
         double best_complete_score = -std::numeric_limits<double>::infinity();
         std::string best_complete_uuid;
+        std::string best_complete_object_uuid;
         const double min_complete_area_cm2 = seed_only_sweep ? sweep_min_area_cm2 : 0.0;
 
         for (size_t i = 0; i < runs.size(); ++i) {
@@ -1354,13 +1359,15 @@ int main(int argc, char *argv[])
                     surf->meta["sweep_seed_only"] = seed_only_sweep;
                     add_metric_meta(*surf, sweep_metrics);
                     add_target_context(surf->meta, vol_path);
-                    surf->save(seg_dir, uuid);
+                    surf->saveAsNew(seg_dir);
+                    run_report["uuid"] = surf->objectUuid();
 
                     run_report["metrics"] = metrics_json(sweep_metrics);
                     if (sweep_metrics.objective_score < best_score) {
                         best_score = sweep_metrics.objective_score;
                         best_idx = i;
                         best_uuid = uuid;
+                        best_object_uuid = surf->objectUuid();
                     }
                     if (!seed_only_sweep &&
                         sweep_metrics.result_to_target.samples > 0 &&
@@ -1375,6 +1382,7 @@ int main(int argc, char *argv[])
                         best_complete_score = sweep_metrics.mesh_completeness_score;
                         best_complete_idx = i;
                         best_complete_uuid = uuid;
+                        best_complete_object_uuid = surf->objectUuid();
                     }
 
                     std::cout << "  score=" << sweep_metrics.objective_score
@@ -1400,7 +1408,7 @@ int main(int argc, char *argv[])
 
         report["best"] = {
             {"index", best_idx},
-            {"uuid", best_uuid},
+            {"uuid", best_object_uuid},
             {"path", best_uuid.empty() ? std::string{} : (tgt_dir / best_uuid).string()},
             {"objective_score", best_score},
             {"best_coverage_adjusted_distance_vx", best_coverage_adjusted_distance_vx}
@@ -1408,7 +1416,7 @@ int main(int argc, char *argv[])
         if (seed_only_sweep) {
             report["best_complete_mesh"] = {
                 {"index", best_complete_idx},
-                {"uuid", best_complete_uuid},
+                {"uuid", best_complete_object_uuid},
                 {"path", best_complete_uuid.empty() ? std::string{} : (tgt_dir / best_complete_uuid).string()},
                 {"mesh_completeness_score", best_complete_score},
                 {"min_area_cm2", min_complete_area_cm2}
@@ -1422,12 +1430,12 @@ int main(int argc, char *argv[])
 
         if (!best_uuid.empty()) {
             std::cout << "Best sweep: index=" << best_idx
-                      << " uuid=" << best_uuid
+                      << " uuid=" << best_object_uuid
                       << " score=" << best_score
                       << " path=" << (tgt_dir / best_uuid) << std::endl;
         } else if (seed_only_sweep && !best_complete_uuid.empty()) {
             std::cout << "Best complete mesh: index=" << best_complete_idx
-                      << " uuid=" << best_complete_uuid
+                      << " uuid=" << best_complete_object_uuid
                       << " mesh_completeness_score=" << best_complete_score
                       << " path=" << (tgt_dir / best_complete_uuid) << std::endl;
         } else {
@@ -1486,7 +1494,7 @@ int main(int argc, char *argv[])
 
             std::string uuid = "auto_trace_" + get_surface_time_str() + "_" + seed.label;
             std::filesystem::path seg_dir = tgt_dir / uuid;
-            surf->save(seg_dir, uuid);
+            surf->saveAsNew(seg_dir);
             std::cout << "  output=" << seg_dir << std::endl;
 
             delete surf;
@@ -1518,7 +1526,7 @@ int main(int argc, char *argv[])
     add_target_context(surf->meta, vol_path);
     std::string uuid = "auto_trace_" + get_surface_time_str();;
     std::filesystem::path seg_dir = tgt_dir / uuid;
-    surf->save(seg_dir, uuid);
+    surf->saveAsNew(seg_dir);
 
     delete surf;
     delete_loaded_source_surfaces(surfaces, src);

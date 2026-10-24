@@ -17,6 +17,9 @@ same zoom, so always confirm the blocks and orientation changes on the contact s
 
 `link` builds TREE_DIR/<name>/ directories of symlinks to the files of each block in
 blocks.tsv (skipping those in duplicates.txt beside it), the layout sam2-photogrammetry expects.
+Camera JPEGs (captures without RAW files) are accepted too: there is nothing for raw2jpg.py to
+convert, so `link` hard-links them straight to TREE_DIR/<name>/JPGEnhanced/<stem>.jpg, ready for
+segment.py. macOS AppleDouble files (._DSC01234.JPG, left by copying from a Mac) are ignored.
 
 Usage:
     python find_blocks.py scan RAW_DIR OUT_DIR [--burst-gap 5] [--block-gap 30]
@@ -37,14 +40,32 @@ import subprocess
 from PIL import Image, ImageDraw
 
 RAW_EXT = (".arw", ".cr2", ".cr3", ".nef", ".dng", ".raf", ".orf", ".rw2")
+JPEG_EXT = (".jpg", ".jpeg")
 SETTINGS = ("FocalLength", "ExposureTime", "FNumber", "ISO", "ImageSize")
 TILE_W, TILE_H, LABEL_W, COLS = 240, 160, 150, 8
 
 
+def photographs(raw_dir):
+    """RAW and camera-JPEG files of a capture folder, without macOS AppleDouble ._ files."""
+    return sorted(f for f in os.listdir(raw_dir)
+                  if f.lower().endswith(RAW_EXT + JPEG_EXT) and not f.startswith("._"))
+
+
+def link_photo(src, block_dir):
+    """Symlink a RAW file into the block directory; hard-link a camera JPEG as JPGEnhanced/<stem>.jpg."""
+    name = os.path.basename(src)
+    if not name.lower().endswith(JPEG_EXT):
+        os.symlink(os.path.abspath(src), os.path.join(block_dir, name))
+        return
+    jdir = os.path.join(block_dir, "JPGEnhanced")
+    os.makedirs(jdir, exist_ok=True)
+    os.link(src, os.path.join(jdir, os.path.splitext(name)[0] + ".jpg"))  # same filesystem, as for the PGS input
+
+
 def read_exif(raw_dir):
-    files = sorted(f for f in os.listdir(raw_dir) if f.lower().endswith(RAW_EXT))
+    files = photographs(raw_dir)
     if not files:
-        raise SystemExit(f"no RAW files in {raw_dir}")
+        raise SystemExit(f"no RAW or JPEG files in {raw_dir}")
     out = subprocess.run(["exiftool", "-j", "-n", "-DateTimeOriginal", *("-" + s for s in SETTINGS), *files],
                          cwd=raw_dir, check=True, capture_output=True, text=True).stdout
     rows = sorted(json.loads(out), key=lambda r: r["SourceFile"])
@@ -158,7 +179,7 @@ def link(args):
         d = os.path.join(args.tree_dir, b["name"])
         os.makedirs(d)
         for n in members:
-            os.symlink(os.path.abspath(os.path.join(args.raw_dir, n)), os.path.join(d, n))
+            link_photo(os.path.join(args.raw_dir, n), d)
         total += len(members)
         if len(members) != int(b["count"]):
             print(f"warning: {b['name']} has {len(members)} files between {b['first']} and {b['last']}, "

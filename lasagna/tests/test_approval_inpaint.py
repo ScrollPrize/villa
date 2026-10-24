@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -80,9 +81,11 @@ class ApprovalInpaintTest(unittest.TestCase):
 		approval = np.zeros((7, 7), dtype=np.uint8)
 		approval[1:6, 1:6] = 255
 		approval[2:5, 2:5] = 0
+		existing_uuid = "0f8fad5b-d9cb-469f-a165-70867728950e"
 		existing = {
 			"collections": {
 				"2": {
+					"uuid": existing_uuid,
 					"metadata": {"winding_is_absolute": True},
 					"points": {"0": {"p": [0, 0, 100], "wind_a": 0}},
 				}
@@ -109,6 +112,10 @@ class ApprovalInpaintTest(unittest.TestCase):
 		self.assertIn("3", result.corr_points["collections"])
 		generated = result.corr_points["collections"]["3"]
 		self.assertTrue(generated["metadata"]["winding_is_absolute"])
+		# Existing collections keep their identity; the new one gets a fresh uuid4.
+		self.assertEqual(result.corr_points["collections"]["2"]["uuid"], existing_uuid)
+		self.assertEqual(uuid.UUID(generated["uuid"]).version, 4)
+		self.assertNotEqual(generated["uuid"], existing_uuid)
 		self.assertIsNone(result.output_mask)
 		for point in generated["points"].values():
 			self.assertEqual(point["wind_a"], 2.0)

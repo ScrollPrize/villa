@@ -37,11 +37,13 @@
 #include "LineAnnotationFiberSegments.hpp"
 #include "LineAnnotationFiberLinkValidation.hpp"
 #include "LineAnnotationStoredFiber.hpp"
+#include "FiberMapAutoLink.hpp"
 #include "LineAnnotationStructuralEdits.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
 #include "vc/core/util/ScrollUmbilicus.hpp"
+#include "vc/core/util/Uuid.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 
@@ -173,6 +175,9 @@ public:
         // two refs of one pair with different kinds are a real disagreement.
         // Missing adjacent arrays are healed before load-time validation.
         bool adjacentExplicit = true;
+        // Mirrors FiberBranchRef::autoLink (an unreviewed automatic link):
+        // the map draws its endpoints dashed.
+        bool autoLink = false;
     };
 
     struct FiberMapFiber {
@@ -277,12 +282,26 @@ public:
     // the smallest fiber id in the fiber's connected component over all
     // branch links, pending included — same union-find semantics as
     // fiberSummaries().
+    // How a linked control point is marked in the slice overlays. The values
+    // are the overlay's pointLinkStates bytes (FiberOverlayController::Chain).
+    enum class LinkMarkState : uint8_t { Pending = 1, Approved = 2, AutoPending = 3 };
+    // One linked control point as the slice overlays draw it: the review
+    // state (pending winning when a point carries both, AutoPending when
+    // every pending link on it is automatic), the same-orientation warning
+    // of the winning state, the point tags and the adjacent-link shape - the
+    // same look the annotation views give the point.
+    struct LinkedControlMark {
+        int controlIndex = -1;
+        LinkMarkState state = LinkMarkState::Approved;
+        bool sameHv = false;
+        bool kollesisTermination = false;
+        bool breakTag = false;
+        bool adjacent = false;
+    };
     struct FiberLinkOverlayInfo {
         uint64_t fiberId = 0;
         uint64_t linkGroupId = 0;
-        // (local control point index, pending); one entry per linked control
-        // point, pending winning when a point carries both link states.
-        std::vector<std::pair<int, bool>> linkedControlPoints;
+        std::vector<LinkedControlMark> linkedControlPoints;
     };
 
     using DatasetPicker =
@@ -344,6 +363,54 @@ public:
                                             QString* error = nullptr);
     void openFiberAtControlPoint(uint64_t fiberId, int controlPointIndex);
     void openFiberAtLinePointIndex(uint64_t fiberId, int linePointIndex);
+
+    // The Fiber Map's "Link <A> and <B>" (automatic link), in two calls the
+    // workspace makes from one queued callback (see FiberMapWorkspace::
+    // startAutoLink). Both resolve a fiber by runtime id AND file name.
+    struct FiberMapAutoLinkOutcome {
+        bool ok = false;
+        QString message;
+    };
+    // Phase B: finalizes, saves and closes every live session of the two
+    // fibers (dialogs through the ordinary open preparation, dialog-less
+    // panes and the intersection inspection explicitly, each saved before
+    // its pane is erased), then the structural-edit preflight (save drain,
+    // save-failure and reload checks). After it, no session of either fiber
+    // exists; the caller re-verifies its map dependencies (a save may have
+    // moved the fiber generation) before locating the meeting on the map.
+    FiberMapAutoLinkOutcome prepareFiberMapAutoLink(uint64_t fiberIdA,
+                                                    const std::string& fileNameA,
+                                                    uint64_t fiberIdB,
+                                                    const std::string& fileNameB);
+
+    struct FiberMapAutoLinkEndpoint {
+        uint64_t fiberId = 0;
+        std::string fileName;
+        // The meeting's position on this fiber's stored line points (the
+        // locator's exact inversion of the drawn point).
+        double linePosition = 0.0;
+    };
+    struct FiberMapAutoLinkParams {
+        // D3: +-window along each fiber around the meeting (physical).
+        double searchWindowUm = 5000.0;
+        // D4: an unlinked control within this arclength of the pass is reused.
+        double reuseUm = 1000.0;
+    };
+    // Phase D: the closest 3D pass inside the windows, a control point per
+    // fiber (reused or newly placed with a span re-optimization, saved), and
+    // the pending automatic link between them. mapFiberDataGeneration is
+    // the generation the map was built from; mapStillFresh is the
+    // workspace's own dependency check (everything but the fiber
+    // generation), consulted after every yield.
+    FiberMapAutoLinkOutcome autoLinkFibers(const FiberMapAutoLinkEndpoint& a,
+                                           const FiberMapAutoLinkEndpoint& b,
+                                           uint64_t mapFiberDataGeneration,
+                                           std::function<bool()> mapStillFresh,
+                                           const FiberMapAutoLinkParams& params);
+    // The stored line points of a loaded fiber (nullptr when not loaded under
+    // that id and name): what the locator inverts drawn points against.
+    [[nodiscard]] const std::vector<cv::Vec3d>* storedFiberLinePoints(
+        uint64_t fiberId, const std::string& fileName) const;
     void openFiberSpan(uint64_t fiberId, int firstControlIndex, int secondControlIndex);
     void deleteFiber(uint64_t fiberId);
     // Deletes the requested fibers' files and drops them from the package.
@@ -448,10 +515,10 @@ public:
     // their interactive counterparts are used in connect().
 
     // Writes a vc3d_fiber_collection bundle without opening a dialog.
-    bool exportFibersToPath(const std::filesystem::path& path, double scale,
+    bool exportFibersToPath(const std::filesystem::path& path,
                             QString* errorMessage = nullptr, int* exportedCount = nullptr);
     // Imports a fiber JSON, bundle, or directory without opening a dialog.
-    bool importFibersFromPath(const std::filesystem::path& path, double scale,
+    bool importFibersFromPath(const std::filesystem::path& path,
                               QString* errorMessage = nullptr,
                               int* importedCount = nullptr, int* skippedCount = nullptr);
     // Adds one unlinked vc3d_fiber to the package without reloading the other
@@ -665,7 +732,15 @@ private:
 
     std::string nextSurfaceName();
     void cleanupSurfaceName(const std::string& surfaceName);
-    bool prepareForUserFacingLineAnnotationOpen();
+    // stillValid (optional): forwarded to each session's finalization and
+    // checked after each save (both can yield); false makes it return false.
+    // only (optional): finalizes, saves and closes just the dialogs whose
+    // session satisfies it (the Fiber Map's auto-link: the two fibers being
+    // linked), leaving every other dialog open and unsaved; unset walks
+    // every dialog, as opening another fiber does.
+    bool prepareForUserFacingLineAnnotationOpen(
+        const std::function<bool()>& stillValid = {},
+        const std::function<bool(const LineAnnotationSession&)>& only = {});
     bool launchSession(SourceKind sourceKind,
                        const std::string& surfaceName,
                        std::shared_ptr<Surface> sourceSurface,
@@ -766,11 +841,16 @@ private:
     // same edit on the matching control of every other pane showing this
     // fiber (and their rollback snapshots), and the overlay refreshes.
     // Returns false when nothing changed or the edit was refused.
+    // changedGoalOwners (optional out): the owners whose span GOAL the gap
+    // policy changed with the tag (saved in the same file write, mirrored
+    // into the peers); the caller re-solves those spans (finishBreakEdit). A
+    // gap that formed on a span already cspline changes no goal.
     using ControlPointEdit = std::function<bool(vc3d::line_annotation::LineControlPoint&)>;
     bool applyControlPointEditAndPersist(const std::string& surfaceName,
                                          size_t controlPointIndex,
                                          const QString& pendingSolveMessage,
-                                         const ControlPointEdit& edit);
+                                         const ControlPointEdit& edit,
+                                         std::vector<size_t>* changedGoalOwners = nullptr);
     // Whether adding `tag` to the control (or the matching control of any
     // other pane showing this fiber, or of their rollback snapshots) would
     // combine the kollesis and break tags.
@@ -783,13 +863,61 @@ private:
                                       size_t controlPointIndex,
                                       const char* tag,
                                       bool enabled,
-                                      const QString& pendingSolveMessage);
-    // After a break tag edit: the gap spans that formed take the cubic-spline
-    // goal, those that dissolved while still cspline return to global, each
-    // through applySegmentInterpolationGoals.
-    void reconcileGapGoalsAfterBreakEdit(LineAnnotationSession& session,
-                                         const std::vector<size_t>& gapOwnersBefore,
-                                         bool enabled);
+                                      const QString& pendingSolveMessage,
+                                      std::vector<size_t>* changedGoalOwners = nullptr);
+    // Re-solves the spans owned by `owners` whose goals a committed tag edit
+    // changed (gap formed -> cspline, dissolved -> global): the goals are
+    // already saved and mirrored, so nothing is rolled back but geometry.
+    // Marks the session Unoptimized first (a refused dataset leaves the
+    // goals in place for the save/close finalization). Returns whether a
+    // solve started.
+    bool startCommittedGoalSolve(LineAnnotationSession& session,
+                                 const std::vector<size_t>& owners);
+    // Shared launch of a goal re-solve: geometry snapshot, dirty ranks (or
+    // the whole line when the interior is not certified), rollback when the
+    // solve cannot start. The controls snapshot must already be armed.
+    // interiorOptimized: computed by the caller BEFORE it marks the session
+    // Unoptimized (an optimized interior with nothing pending may be solved
+    // span by span; anything else solves the whole line).
+    // owedOnFailure: the goals are committed (saved), so a solve that cannot
+    // start leaves whole-line work queued (a later partial or
+    // global-goals-only pass must not certify the untouched span).
+    bool launchGoalSolve(LineAnnotationSession& session,
+                         const std::vector<size_t>& dirtyRanks,
+                         bool interiorOptimized,
+                         bool owedOnFailure);
+    // The session's open-tail policy (lone end breaks, kollesis ends) or the
+    // tail distances changed and no solve covers it yet: mark Unoptimized and,
+    // in auto mode, re-trace the tails (a tails-only solve, or a whole-line
+    // one when work is already pending); a running solve is superseded and a
+    // whole-line pass queued. Shared by the tag handlers' scope guards and
+    // the menu rows' Apply (handleTailConfigChanged).
+    void refreshTailsAfterTailPolicyChange(LineAnnotationSession& session, bool wholeLine);
+    // Scope-guard body of the tag handlers: after the edit (on every exit
+    // path, including a refused second end of the span menu), when the
+    // policy differs from `before` and no solve was started, refresh.
+    void refreshTailsIfPolicyChanged(const std::string& surfaceName,
+                                     vc3d::line_annotation::OpenTailPolicy before);
+    // Scope-guard body of the break handlers (point menu, span menu): on
+    // EVERY exit, also after a refused second end, re-solve the gap spans
+    // whose goals the committed tags changed (that solve re-traces the
+    // tails), else refresh the tails if the policy changed.
+    void finishBreakEdit(const std::string& surfaceName,
+                         const std::vector<size_t>& changedGapOwners,
+                         vc3d::line_annotation::OpenTailPolicy before);
+    // Extrapolation / Break extrapolation Apply: a solver-input change that
+    // also invalidates an armed rollback snapshot's geometry.
+    void handleTailConfigChanged(const std::string& surfaceName);
+    // Rollback snapshot bookkeeping: every site that drops the snapshots on
+    // success clears the invalidation flag; every site that RESTORES one
+    // consumes it after the restore (Unoptimized instead of the snapshot's
+    // state when a mirrored tag edit or a tail-distance change made the
+    // snapshot's tails or goals stale).
+    void disarmRollbackSnapshots(LineAnnotationSession& session);
+    void consumeRollbackInvalidation(LineAnnotationSession& session);
+    // The ray length for a pane: the dialog's applied value, else the
+    // persisted setting (inspection panes, headless paths).
+    [[nodiscard]] int breakExtrapolationDistanceVxForPane(const PaneRecord* pane) const;
     // The span menu captured its two controls before a nested event loop; a
     // solve landing meanwhile can reorder the session. A span action runs
     // only if the two are still neighbours in line-position order.
@@ -815,6 +943,27 @@ private:
     void handleGeneratedControlPointLinkWithCandidate(const std::string& surfaceName,
                                                       size_t controlPointIndex,
                                                       cv::Vec3f volumePoint);
+    // The link of a session control point to a stored fiber's control point
+    // (session index on this side, stored index on the far side), shared by
+    // the candidate menu and the automatic link from a fiber-intersection
+    // marker: both refs written, the pair save scheduled, the fiber list
+    // updated, both refs removed again on a synchronous failure. Returns the
+    // error to show, nullopt on success. stillValid is checked after the
+    // summary publication (which can yield) before the pane is refreshed.
+    // scheduledGenerations (optional out): the fiber generations the pair
+    // save was scheduled with (local, far) - what fiberSaved reports when
+    // that job, or a later one rewriting the same records, lands.
+    std::optional<QString> linkSessionControlToStoredControl(
+        const std::string& surfaceName,
+        const std::shared_ptr<LineAnnotationSession>& owned,
+        size_t controlPointIndex,
+        uint64_t farFiberId,
+        int farControlIndex,
+        bool adjacent,
+        bool autoLink,
+        const std::function<bool()>& stillValid,
+        const std::function<void()>& installed = {},
+        std::pair<uint64_t, uint64_t>* scheduledGenerations = nullptr);
     // Concatenates the link candidate's fiber onto the session's fiber
     // end-to-end (both control points must be endpoints) into one brand-new
     // fiber: tags unioned, third-party links remapped, the pair link between
@@ -846,6 +995,20 @@ private:
                                        size_t secondControlPointIndex,
                                        bool enabled);
     void handleGeneratedOpenNearbyAnnotation(uint64_t fiberId, cv::Vec3f volumePoint);
+    // "Link <current> and <other>" from a fiber-intersection X inside an open
+    // Line Annotation: phase A (validation, capture, the structural guard
+    // reserved) in the slot, phases B-D deferred on a clean stack
+    // (runDialogAutoLink): the other fiber's sessions retired, the choices
+    // over the live session and the stored fiber, the other fiber's control
+    // placed on a detached session, this fiber's through the interactive
+    // placement tail, the pending automatic link awaited and withdrawn on a
+    // failed write. The intersection point is in the viewer's volume grid:
+    // converted only after the menu-time identity was verified.
+    void handleGeneratedLinkNearbyFiber(const std::string& surfaceName,
+                                        uint64_t fiberIdB,
+                                        cv::Vec3f viewerPoint,
+                                        double anchorLinePosition,
+                                        uint64_t anchorLineRevision);
     void handleGeneratedControlPointUnlink(const std::string& surfaceName,
                                            size_t controlPointIndex,
                                            uint64_t branchFiberId,
@@ -880,15 +1043,48 @@ private:
             std::vector<vc3d::line_annotation::GeneratedOverlay::FiberIntersectionMarker> markers,
             const LineAnnotationSession* session) const;
     [[nodiscard]] bool fibersShareHvDirection(uint64_t localFiberId, uint64_t linkedFiberId) const;
-    bool ensureDatasetForSession(LineAnnotationSession& session, bool required = true);
-    bool ensureFiberInferenceDatasetForSession(LineAnnotationSession& session);
+    // stillValid (optional): checked right after the helper's own yield (a
+    // dataset picker) before anything is attached to the session or the
+    // package; false makes the helper return false at once.
+    bool ensureDatasetForSession(LineAnnotationSession& session, bool required = true,
+                                 const std::function<bool()>& stillValid = {});
+    bool ensureFiberInferenceDatasetForSession(LineAnnotationSession& session,
+                                               const std::function<bool()>& stillValid = {});
+    // Every backend a fiber-mode solve of the session needs (dataset, and
+    // the fiber-follow service or the inference dataset when it traces),
+    // resolved up front; stillValid as above, checked after each yielding
+    // helper returns as well.
+    // solveAsLasagna (optional out): set when a single control without
+    // trace inputs is to be solved as Lasagna for this one synchronous solve
+    // (the close/save path must not open a dataset picker for one control);
+    // without the out-parameter that case is a refusal, as before.
+    bool ensureSessionSolveBackends(LineAnnotationSession& session,
+                                    const std::function<bool()>& stillValid = {},
+                                    bool* solveAsLasagna = nullptr);
+    // The synchronous fiber-mode solve as a result only (nothing applied):
+    // dirtySegments nullopt = every span (the finalizer's whole-line solve).
+    // solveAsLasagna: this one solve runs in Lasagna mode whatever the
+    // session's persisted optimization mode (see ensureSessionSolveBackends).
+    [[nodiscard]] OptimizationTaskResult runFiberModeSolveSynchronously(
+        const LineAnnotationSession& session,
+        std::optional<std::vector<size_t>> dirtySegments,
+        const std::string& eventName,
+        bool solveAsLasagna = false) const;
+    // Replaces a pane-less session's synthetic line model by the real one
+    // (sampled normals, or the fiber-follow model when model-only).
+    bool prepareSessionLineModel(LineAnnotationSession& session,
+                                 const std::vector<cv::Vec3d>& linePoints,
+                                 const std::function<bool()>& stillValid = {});
     void refreshLineAnnotationDatasetMenus() const;
     void refreshLineAnnotationDatasetMenu(LineAnnotationDialog* dialog) const;
     void handleLasagnaDatasetSelectionChanged(const std::string& location);
     void handleFiberInferenceDatasetSelectionChanged(const std::string& location);
     bool needsFinalOptimization(const LineAnnotationSession& session) const;
+    // stillValid (optional): forwarded to the backend helpers and checked
+    // once more after the solve, before the result is applied.
     bool finalizeSessionOptimizationSynchronously(LineAnnotationSession& session,
-                                                  bool fireSuccessCallback);
+                                                  bool fireSuccessCallback,
+                                                  const std::function<bool()>& stillValid = {});
     void setSessionOptimizationState(LineAnnotationSession& session,
                                      SessionOptimizationState state);
     void refreshSessionOptimizationStatus(const LineAnnotationSession& session);
@@ -899,6 +1095,53 @@ private:
     mutable uint64_t _nextControlIdentity = 1;
     bool placementAllowedByFocusBounds(const cv::Vec3d& point,
                                        bool suppressErrorDialogs) const;
+    // The geometric part of placing / moving a control point, shared by the
+    // interactive handler and the pane-less automatic placement: display-
+    // normal inheritance, the geometric prepare and splice, the open-tail
+    // focus clamp, assignment into the session, the gap span policy, the
+    // branch index remap, the line revision bump and the Unoptimized state.
+    // SESSION-ONLY (no peer sync, no dialog bookkeeping). Throws
+    // std::runtime_error before touching the session when the prepare or the
+    // splice fails.
+    struct GeometricControlPointEdit {
+        double linePosition = 0.0;
+        cv::Vec3d point{0.0, 0.0, 0.0};
+        std::vector<size_t> nearbyControlIndices;
+        double segmentLength = 0.0;
+        std::optional<cv::Vec3d> displayNormal;
+        bool manualDisplayNormal = false;
+        std::optional<cv::Vec3d> direction;
+    };
+    vc3d::line_annotation::PreparedControlPointEdit applyGeometricControlPointEdit(
+        LineAnnotationSession& session,
+        const std::vector<cv::Vec3d>& currentLinePoints,
+        const std::vector<double>& cumulativeArclengths,
+        const std::vector<double>& controlLinePositions,
+        GeometricControlPointEdit edit);
+    // The two halves of handleGeneratedControlPoint, shared with the
+    // automatic link made from a fiber-intersection marker: the yields that
+    // precede a placement's geometry capture (autosave flush, dataset), with
+    // lifetime / validity / pane re-checked after each; and the placement
+    // tail over an edit whose collapse set the caller decided (the handler
+    // from its click, the automatic link explicitly empty). The tail
+    // returns the placed control's session index; nullopt means either that
+    // nothing was placed (the error was shown) OR that a validity check
+    // failed after the geometric mutation committed - a caller that must
+    // know reads the control back by its position. `mutated` runs right
+    // after the session's mutation and its metadata saves, before anything
+    // that can yield, so a caller can advance its own expectations (the
+    // fiber generation) over the operation's own bumps.
+    bool prepareSessionForControlPlacement(const std::string& surfaceName,
+                                           const std::shared_ptr<LineAnnotationSession>& owned,
+                                           const std::function<bool()>& stillValid);
+    std::optional<size_t> placeControlInSession(const std::string& surfaceName,
+                                                const std::shared_ptr<LineAnnotationSession>& owned,
+                                                const std::vector<cv::Vec3d>& currentLinePoints,
+                                                const std::vector<double>& cumulativeArclengths,
+                                                const std::vector<double>& controlLinePositions,
+                                                GeometricControlPointEdit edit,
+                                                const std::function<bool()>& stillValid,
+                                                const std::function<void()>& mutated = {});
     bool applyOptimizationTaskResult(LineAnnotationSession& session,
                                      OptimizationTaskResult task,
                                      bool updateGeneratedViews,
@@ -931,7 +1174,8 @@ private:
     [[nodiscard]] static bool fiberFollowEnabled();
     // GUI thread: starts the fiber-follow service if needed; false (error
     // shown unless headless) when it cannot run.
-    bool ensureFiberFollowService(bool headless, LineAnnotationDialog* dialog = nullptr);
+    bool ensureFiberFollowService(bool headless, LineAnnotationDialog* dialog = nullptr,
+                                  const std::function<bool()>& stillValid = {});
     // Points the request's tail extrapolation and Trace spans at the running
     // fiber-follow service. familyHint: "H", "V" or empty (from the direction).
     void installFiberFollowTracer(vc3d::line_annotation::FiberModeOptimizationRequest& request,
@@ -983,7 +1227,10 @@ private:
         const LineAnnotationSession& session);
     [[nodiscard]] vc::fiber_tracer::FiberDisplayField displayFieldForSession(
         const LineAnnotationSession& session, const std::vector<cv::Vec3f>& orientedNormals) const;
-    bool materializeGeneratedViews(LineAnnotationSession& session);
+    // stillValid (optional): the normal-reset warning inside is modal;
+    // false right after it returns false without publishing anything.
+    bool materializeGeneratedViews(LineAnnotationSession& session,
+                                   const std::function<bool()>& stillValid = {});
     bool materializeGeneratedViews(LineAnnotationSession& session,
                                    const std::string& surfacePrefix);
     void handleShowAsMesh(const std::string& surfaceName);
@@ -1013,6 +1260,7 @@ private:
                                                              int activeStart = -1,
                                                              int activeEnd = -1) const;
     void loadFibersForCurrentPackage();
+    void saveLoadedFiberMetadata(StoredFiber& fiber);
     // Drop fibers that are the same fiber seen through several sources (or
     // identical geometry under another name); records link aliases so branch
     // links written against a dropped copy still resolve to the survivor.
@@ -1071,6 +1319,7 @@ private:
     // fiberBaseShapeManifestCandidates). nullopt when none can be resolved.
     [[nodiscard]] std::optional<std::array<std::size_t, 3>>
         resolveStoredFiberCoordinateBaseShape(const StoredFiber& fiber) const;
+    void retainStoredFiberCoordinateBaseShape(StoredFiber& fiber) const;
     [[nodiscard]] std::optional<std::array<std::size_t, 3>>
         fiberManifestBaseShape(const std::string& location) const;
     [[nodiscard]] std::filesystem::path relativeFiberPath(const StoredFiber& fiber) const;
@@ -1135,6 +1384,124 @@ private:
     [[nodiscard]] bool controlPointHasBranch(const LineAnnotationSession& session,
                                              int controlPointIndex) const;
     std::vector<uint64_t> syncBranchEndpointPositions(LineAnnotationSession& session);
+    // A link an operation must still be able to find after its yields: the
+    // identity of its two fibers and EVERY position each endpoint has held
+    // since (the installed one first). syncBranchEndpointPositions() appends
+    // a moved endpoint's new position, so a copy of the link that an edit
+    // during the yield moved (a session's ref, the peer's synced reciprocal)
+    // and one it did not reach yet (the stored record awaiting that save)
+    // both match. Registered by address for the operation's scope.
+    struct TrackedLinkEndpoints {
+        uint64_t fiberIdA = 0;
+        std::string fileA;
+        uint64_t fiberIdB = 0;
+        std::string fileB;
+        std::vector<cv::Vec3d> pointsA;
+        std::vector<cv::Vec3d> pointsB;
+        // True when `point` is one of the positions this endpoint has held.
+        [[nodiscard]] bool heldA(const cv::Vec3d& point) const;
+        [[nodiscard]] bool heldB(const cv::Vec3d& point) const;
+    };
+    std::vector<TrackedLinkEndpoints*> _trackedLinks;
+    // A control of fiber (fiberId, fileName) moved from `from` to `to`:
+    // every tracked link with an endpoint there follows.
+    void noteTrackedEndpointMove(uint64_t fiberId, const std::string& fileName,
+                                 const cv::Vec3d& from, const cv::Vec3d& to);
+    // The same preparation over any set of participants, with one pane that
+    // stays (the Line Annotation the automatic link is made FROM): its
+    // session is neither finalized nor retired nor counted as still open.
+    struct AutoLinkParticipant {
+        uint64_t fiberId = 0;
+        std::string fileName;
+    };
+    FiberMapAutoLinkOutcome prepareAutoLinkParticipants(
+        const std::vector<AutoLinkParticipant>& participants,
+        const std::optional<std::string>& keepSurfaceName);
+    // The automatic link's choice step over plain data (base voxels), fed by
+    // a stored fiber (choiceSourceFromStoredFiber) or a live session.
+    struct AutoLinkChoiceSource {
+        const std::vector<cv::Vec3d>* linePoints = nullptr;
+        vc3d::line_annotation::AutoLinkChoiceFacts facts;
+    };
+    struct AutoLinkChoiceSide {
+        QString name;
+        AutoLinkChoiceSource source;
+        double anchorPosition = 0.0;
+        double windowVx = 0.0;
+        double reuseVx = 0.0;
+        std::vector<double> cumulative;
+        std::vector<size_t> orderedIndex;
+        vc3d::fiber_map::autolink::ControlChoice choice;
+    };
+    [[nodiscard]] AutoLinkChoiceSource choiceSourceFromStoredFiber(const StoredFiber& fiber) const;
+    std::optional<QString> planAutoLinkChoices(std::array<AutoLinkChoiceSide, 2>& sides,
+                                               double* passDistance) const;
+    // The placement of one new control on a prepared detached session (the
+    // map's Step 4), driven through the caller's guard callbacks.
+    struct AutoLinkPlacement {
+        std::shared_ptr<LineAnnotationSession> session;
+        vc3d::fiber_map::autolink::ControlChoice choice;
+        QString name;
+        bool placed = false;
+        int storedIndex = -1;
+    };
+    struct AutoLinkPlacementContext {
+        std::function<bool(bool)> checkAndResolve;
+        std::function<bool()> identityOnly;
+        std::function<StoredFiber*()> resolveOwn;
+        std::function<std::optional<nlohmann::json>()> otherSnapshot;
+        QString otherName;
+        uint64_t* expectedGeneration = nullptr;
+        QString changedMessage;
+    };
+    std::optional<QString> placePreparedControl(AutoLinkPlacement& placement,
+                                                const AutoLinkPlacementContext& context);
+    // The withdrawal of an installed link whose pair save did not write both
+    // files: every copy, matched by the tracked endpoints (see
+    // TrackedLinkEndpoints), under the operation's starting identity only.
+    void withdrawTrackedLink(const TrackedLinkEndpoints& tracked,
+                             uint64_t packageGeneration,
+                             uint64_t loadSequence);
+    // After a withdrawal: the withdrawn state written back and drained, the
+    // correction reported as done only when ITS job wrote both files.
+    // Returns the sentence to append to the refusal (empty when the identity
+    // no longer allows a save).
+    QString correctivePairResaveTail(uint64_t fiberIdA,
+                                     uint64_t fiberIdB,
+                                     const std::function<StoredFiber*()>& resolveA,
+                                     const std::function<StoredFiber*()>& resolveB,
+                                     const std::function<bool()>& identityOnly);
+    // The identity tokens captured right before a generated context menu
+    // opens, for the one deferred action that must still see them (the
+    // automatic link): a volume switch during the menu changes the session
+    // scale without touching the line revision.
+    struct ContextMenuIdentity {
+        bool valid = false;
+        std::string surfaceName;
+        uint64_t packageGeneration = 0;
+        uint64_t loadSequence = 0;
+        uint64_t fiberGeneration = 0;
+        std::shared_ptr<Volume> volume;
+    };
+    ContextMenuIdentity _contextMenuIdentity;
+    struct DialogAutoLinkCapture {
+        uint64_t packageGeneration = 0;
+        uint64_t loadSequence = 0;
+        std::shared_ptr<Volume> volume;
+        std::string surfaceName;
+        std::shared_ptr<LineAnnotationSession> session;
+        uint64_t fiberIdA = 0;
+        std::string fileA;
+        uint64_t lineRevision = 0;
+        double anchorLinePosition = 0.0;
+        int extrapolationLimitVx = 0;
+        uint64_t fiberIdB = 0;
+        std::string fileB;
+        cv::Vec3d pointB{0.0, 0.0, 0.0};
+    };
+    void runDialogAutoLink(const DialogAutoLinkCapture& capture);
+    [[nodiscard]] AutoLinkChoiceSource choiceSourceFromSession(
+        const LineAnnotationSession& session, const std::vector<cv::Vec3d>* linePoints) const;
     static void scaleStoredFiber(StoredFiber& fiber, double scale);
     [[nodiscard]] static vc::lasagna::LineModel lineModelFromPoints(
         const std::vector<cv::Vec3d>& points,
@@ -1161,9 +1528,11 @@ private:
     // so nothing reads a fiber whose newest geometry is still session-only.
     void scheduleSessionAutoSave(LineAnnotationSession& session);
     void flushSessionAutoSave(const std::string& surfaceName);
-    void flushAllPendingSessionAutoSaves();
-    [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber, double scale = 1.0) const;
-    void saveFiberNow(const StoredFiber& fiber) const;
+    // stillValid (optional): checked after each flushed save (a yield);
+    // false stops the flush.
+    void flushAllPendingSessionAutoSaves(const std::function<bool()>& stillValid = {});
+    [[nodiscard]] nlohmann::json fiberToJson(const StoredFiber& fiber) const;
+    void saveFiberNow(StoredFiber& fiber) const;
     void scheduleFiberSave(const StoredFiber& fiber);
     void scheduleFiberPairSave(const StoredFiber& first, const StoredFiber& second);
     void scheduleFiberSaveSnapshots(std::vector<FiberSaveSnapshot> snapshots,
@@ -1174,11 +1543,12 @@ private:
     void finishFiberSaveJob(QFutureWatcher<FiberSaveTaskResult>* watcher,
                             bool showErrors,
                             std::vector<std::shared_ptr<FiberSaveBatchTracker>> batches);
-    void waitForFiberSaves();
-    [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber) const;
+    // stillValid (optional): checked after each event loop turn of the
+    // drain; false stops waiting (the caller decides what that means).
+    void waitForFiberSaves(const std::function<bool()>& stillValid = {});
+    [[nodiscard]] FiberSaveSnapshot makeFiberSaveSnapshot(const StoredFiber& fiber);
     [[nodiscard]] static nlohmann::json fiberSaveSnapshotToJson(
-        const FiberSaveSnapshot& snapshot,
-        double scale = 1.0);
+        const FiberSaveSnapshot& snapshot);
     // A link entry a load dropped from a stored record (neutralized, removed
     // by a repair, or stripped by the lenient parser). Fields a stripped
     // entry did not parse stay unset; a descriptor without a target matches
@@ -1249,7 +1619,10 @@ private:
     [[nodiscard]] std::shared_ptr<vc::lasagna::LasagnaDataset>
         resolveAlignmentMetricsDataset();
     void requestFiberAlignmentMetricsForFibers(std::vector<uint64_t> fiberIds);
-    void saveFiberDisplayAnnotations(LineAnnotationSession& session);
+    // stillValid (optional): a failed metadata save shows a modal; false
+    // right after it returns without scheduling the autosave.
+    void saveFiberDisplayAnnotations(LineAnnotationSession& session,
+                                     const std::function<bool()>& stillValid = {});
     void setSessionFiberWidth(LineAnnotationSession& session, double width);
     void publishFiberAlignmentMetrics(uint64_t fiberId,
                                       CachedFiberAlignmentMetrics metrics);
@@ -1388,6 +1761,7 @@ private:
     // This covers those pre-publication continuations only; the loader is
     // not otherwise reentrant-safe.
     uint64_t _fiberLoadSequence = 0;
+    std::unordered_set<uint64_t> _pendingCoordinateShapeSaves;
     std::deque<FiberSaveJob> _pendingFiberSaveJobs;
     QPointer<QFutureWatcher<FiberSaveTaskResult>> _fiberSaveWatcher;
     uint64_t _nextFiberSaveSequence = 0;
@@ -1563,8 +1937,32 @@ private:
     // descriptor knows.
     void dropLinkEntriesFromOpenSessions(const std::vector<DroppedLinkEntry>& dropped,
                                          const std::vector<StoredFiber>& records);
+    // The load's automatic-link downgrade (validateLoadedFiberLinks: a link
+    // automatic on one side only becomes plain pending on both) applied to
+    // every open session (its live branches and its armed rollback copies):
+    // an entry the session's own record in `records` holds as a plain
+    // pending link loses its automatic mark, so the session's next save does
+    // not write the mark back and have the canonicalizer mirror it onto the
+    // other file. Entries the record does not hold (unsaved additions) are
+    // left alone; nothing is ever upgraded. Affected dialogs rebuild their
+    // markers.
+    void downgradeAutomaticLinksInOpenSessions(const std::vector<StoredFiber>& records);
     bool structuralEditPreflight(uint64_t packageGeneration, uint64_t loadSequence,
                                  std::string* error);
+    // Links two STORED control points (stored indices) of two loaded fibers
+    // with a pending link: duplicate / already-linked / position-ambiguity /
+    // rebind checks, both refs (makeBranchRef + reciprocalBranchRef), the pair
+    // save, metrics, summaries and views. The error names what refused.
+    std::optional<QString> linkStoredControlPoints(StoredFiber& local,
+                                                   int localControlIndex,
+                                                   StoredFiber& far,
+                                                   int farControlIndex,
+                                                   bool autoLink);
+    // The pair-level part of linkStoredControlPoints' checks (same fiber,
+    // read-only, the loader's source rebind), so an operation can refuse
+    // BEFORE it mutates anything.
+    [[nodiscard]] std::optional<QString> linkPairEligibilityError(const StoredFiber& local,
+                                                                  const StoredFiber& far) const;
     [[nodiscard]] bool structuralEditParticipantAllowed(const std::filesystem::path& sourceRoot,
                                                         const std::string& fileName,
                                                         std::string* error) const;

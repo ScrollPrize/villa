@@ -1,7 +1,8 @@
 # `spiral-input` — PHercParis4
 
-Manual annotations of the spiral (winding) structure of scroll **PHercParis4**
-(Scroll 1), used as ground-truth inputs for fitting a global winding solution.
+Annotations of the spiral (winding) structure of scroll **PHercParis4**
+(Scroll 1), together with machine-derived guidance (surface tracks and volume
+predictions), used as inputs for fitting a global winding solution.
 
 In cross-section, a scroll is a single papyrus sheet wound into a spiral around
 a central axis (the *umbilicus*). The annotations here record which parts of
@@ -15,7 +16,7 @@ the volume can be fit and evaluated.
 | --- | --- |
 | `verified_patches/` | Manually verified surface patches. Each patch is a grid-topology quad mesh sampled on the papyrus surface (~27,399 items). |
 | `unverified_patches/` | Candidate surface patches not yet manually verified (~203,900 items). |
-| `tracks/` | Line annotations: curves traced across the surface, stored as sequences of `(z, y, x)` points. |
+| `tracks/` | Surface tracks: machine-extracted skeleton curves through a binarized surface prediction, cut on regularly spaced horizontal and vertical slabs (created with `extract_surface_tracks.py`). Stored as a Python `dbm` database of `(z, y, x)` point sequences, plus a packed `.vctracks/` store. |
 | `fibers/` | Fiber annotations. |
 | `outer_shell/` | Geometry of the scroll's outer shell. |
 | `lasagna_inputs/` | Volume data consumed by the fitting pipeline. |
@@ -28,7 +29,13 @@ the volume can be fit and evaluated.
 
 ## Conventions
 
-- Coordinates are `(z, y, x)`, in full-resolution scroll-volume voxels.
+- Coordinates are in **9.6 µm voxels**, level 2 of the 2.4 µm volume `20260411134726-2.400um-0.2m-78keV-masked.zarr`
+  (multiply by 4 for that volume's level-0 voxels), matching `voxel_size_um: 9.6` in `spiral-scroll.json`.
+  Checked for `verified_patches/`, `outer_shell/`, `umbilicus.json`, `same_windings.json`, `relative_windings.json`
+  and `abs_winding.json`.
+- Exception: `eval_fibers/` are in level-0 (2.4 µm) voxels, as their `vc_open_data_*` fields state.
+- Axis order: `umbilicus.json` uses `x`/`y`/`z` keys; points in the winding files are `[x, y, z]`; patches are
+  tifxyz meshes with separate `x`, `y`, `z` images.
 
 ## License
 

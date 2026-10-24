@@ -806,9 +806,10 @@ class S3SyncManager:
         {'pending': ..., 'remote_tmp': ..., 'summary': ...} for the caller
         to apply with _apply_pending_merges() AFTER the user confirms the
         sync (or discard with _discard_pending_merges() on cancellation).
-        Returns None when the file is not eligible, no base is available,
-        or the merge has genuine conflicts (all three versions are stashed
-        in that case and the caller falls back to the interactive prompt).
+        Returns None when the file is not eligible, no base is available and
+        the copies differ beyond UUID, or the merge has genuine conflicts
+        (all three versions are stashed in that case and the caller falls
+        back to the interactive prompt).
         In dry-run mode nothing is stashed and the return is a dict:
         {'summary', 'merged_doc', 'base_doc', 'peer_files'} for a clean
         content merge (link consistency is NOT assessed), or {'reason'}.
@@ -834,11 +835,6 @@ class S3SyncManager:
                                (path,)).fetchone()
         tracked = dict(row) if row else {}
         base_doc = self._load_base(path, tracked)
-        if base_doc is None or not fiber_merge.is_fiber_doc(base_doc):
-            if not dry_run:
-                print(f"  (no merge base available for {path})")
-            return fail("no merge base")
-
         remote_doc, remote_tmp = self._fetch_remote_json(path)
         if remote_doc is None or not fiber_merge.is_fiber_doc(remote_doc):
             if remote_tmp:
@@ -850,6 +846,15 @@ class S3SyncManager:
 
         keep_remote_tmp = False
         try:
+            if base_doc is None or not fiber_merge.is_fiber_doc(base_doc):
+                if not fiber_merge.same_fiber_content(local_doc, remote_doc):
+                    if not dry_run:
+                        print(f"  (no merge base available for {path})")
+                    return fail("no merge base")
+                # No edit history is needed for identical named content.
+                # Use that content for the merger and peer-link bookkeeping;
+                # this is not evidence of ancestry for divergent edits.
+                base_doc = remote_doc
             # A merger bug on malformed input must degrade to manual
             # resolution, never abort the whole sync.
             try:

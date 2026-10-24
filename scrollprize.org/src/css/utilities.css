@@ -85,6 +85,63 @@ a.vc-card:hover,
 }
 .vc-btn-outline:hover { border-color: var(--vc-line-strong); background: var(--vc-raised); color: var(--vc-text); text-decoration: none; }
 
+/* --- Submission link: a markdown [Submission Form](…) wrapped in
+       <div className="vc-submit"> renders as an ember text CTA, a size up
+       from .vc-cta (the wrapper keeps the link plain markdown for scripts
+       that rewrite it). */
+.vc-submit { margin: 20px 0 8px; }
+.vc-submit p { margin: 0; }
+.vc-submit a {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--vc-accent);
+  font-size: 0.9375rem;
+  font-weight: 650;
+  line-height: 1.2;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  text-decoration: none;
+}
+.vc-submit a::after { content: "\2192"; } /* → arrow glyph */
+.vc-submit a:hover { color: var(--vc-accent); text-decoration: underline; text-underline-offset: 3px; }
+/* A tip/admonition right after a collapsible starts a new beat. */
+.markdown details + .theme-admonition { margin-top: 48px; }
+
+/* --- Deadline line under a prize heading: semibold, dim. */
+.vc-deadline {
+  margin: -6px 0 16px;
+  font-size: 0.9375rem;
+  font-weight: 600;
+  color: var(--vc-text-dim);
+}
+.vc-deadline p { margin: 0; }
+
+/* --- Prize meta block right after a prize heading: the deadline, plus a
+       submission link lifted onto the heading's line at the right edge
+       (h2 is 35px tall; the meta block starts 14px below it). Under 600px
+       the link stays in flow below the deadline. */
+.vc-prize-meta {
+  position: relative;
+  margin: -6px 0 16px;
+}
+/* Extra air between prizes (default h2 top margin is 40px). */
+.markdown h2:has(+ .vc-prize-meta) { margin-top: 56px; }
+.vc-prize-meta .vc-deadline { margin: 0; }
+.vc-prize-meta .vc-submit { margin: 6px 0 0; white-space: nowrap; }
+@media (min-width: 600px) {
+  .markdown h2:has(+ .vc-prize-meta) { padding-right: 200px; }
+  .vc-prize-meta .vc-submit {
+    position: absolute;
+    right: 0;
+    top: -49px;
+    height: 35px;
+    display: flex;
+    align-items: center;
+    margin: 0;
+  }
+}
+
 /* --- Body link: text color + ember underline, hover -> ember.
        Solid-ember text is reserved for CTAs + active nav. */
 .vc-link {
@@ -182,7 +239,8 @@ a.vc-card:hover,
 .vc-cta:focus-visible,
 .vc-btn:focus-visible,
 .vc-btn-outline:focus-visible,
-.vc-link:focus-visible {
+.vc-link:focus-visible,
+.vc-submit a:focus-visible {
   outline: 2px solid var(--vc-accent);
   outline-offset: 2px;
 }

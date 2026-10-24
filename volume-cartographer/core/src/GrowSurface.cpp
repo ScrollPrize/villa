@@ -1157,7 +1157,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
         try {
             auto dbg_surf = new QuadSurface(points_hr_inp(used_area_hr), {1/src_step,1/src_step});
             std::string uuid = std::string(Z_DBG_GEN_PREFIX)+"inp_hr";
-            dbg_surf->save(tgt_dir / uuid, uuid, true);
+            dbg_surf->saveAsNew(tgt_dir / uuid, true);
             delete dbg_surf;
         } catch (cv::Exception&) {
             // We did not find a valid region of interest to expand to
@@ -1371,7 +1371,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
         try {
             auto dbg_surf = new QuadSurface(points_hr_inp(used_area_hr), {1/src_step,1/src_step});
             std::string uuid = std::string(Z_DBG_GEN_PREFIX)+"opt_inp_hr";
-            dbg_surf->save(tgt_dir / uuid, uuid, true);
+            dbg_surf->saveAsNew(tgt_dir / uuid, true);
             delete dbg_surf;
         } catch (cv::Exception&) {
             // We did not find a valid region of interest to expand to
@@ -3119,7 +3119,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 const std::filesystem::path legacy_current_path = tgt_dir / (std::string(Z_DBG_GEN_PREFIX)+"current");
                 std::string uuid = std::string(Z_DBG_GEN_PREFIX) + get_surface_time_str();
                 const std::filesystem::path snapshot_path = tgt_dir / uuid;
-                dbg_surf->save(snapshot_path.string(), uuid, true);
+                dbg_surf->saveAsNew(snapshot_path, true);
 
                 std::error_code cleanup_ec;
                 if (legacy_current_path != snapshot_path) {
@@ -3203,7 +3203,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                                            static_cast<double>(area_est_vx2),
                                            static_cast<double>(voxelsize));
                 dbg_surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
-                dbg_surf->save(tgt_dir / uuid, uuid, true);
+                dbg_surf->saveAsNew(tgt_dir / uuid, true);
                 delete dbg_surf;
             }
         }

@@ -176,9 +176,7 @@ bool SegmentationModule::ensureActiveSurfaceEditableForModification()
         vc3d::opendata::attachEditableOpenDataSegmentRoot(
             *pkg, surface->path, editableRoot, true);
 
-        const std::string segmentId = surface->id.empty()
-            ? editablePath.filename().string()
-            : surface->id;
+        const std::string segmentId = editablePath.filename().string();
         auto editableSurface = pkg->loadSurface(segmentId);
         if (!editableSurface) {
             editableSurface = std::make_shared<QuadSurface>(editablePath);

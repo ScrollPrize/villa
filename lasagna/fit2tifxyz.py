@@ -6,6 +6,7 @@ import json
 import math
 import shutil
 import sys
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -918,7 +919,8 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 		bbox = [[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]]
 
 	meta = {
-		"uuid": str(out_dir.name),
+		# A new surface: fresh random identity, never derived from its name.
+		"uuid": str(uuid.uuid4()),
 		"name": str(out_dir.name),
 		"type": "seg",
 		"format": "tifxyz",

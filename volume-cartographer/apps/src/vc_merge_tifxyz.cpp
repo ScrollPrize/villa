@@ -1518,24 +1518,6 @@ gmEdtBlend(const std::vector<std::string>& names,
     return out;
 }
 
-// vc_obj2tifxyz_legacy writes meta.json with its own uuid; rewrite it to match
-// the output dir name so downstream tools (which key on dir == uuid) are happy.
-void patchMetaUuid(const fs::path& tifxyz_dir)
-{
-    fs::path meta_p = tifxyz_dir / "meta.json";
-    if (!fs::exists(meta_p)) return;
-    json m;
-    {
-        std::ifstream f(meta_p);
-        f >> m;
-    }
-    m["uuid"] = tifxyz_dir.filename().string();
-    {
-        std::ofstream f(meta_p);
-        f << m.dump();
-    }
-}
-
 int rasterizeObjToTifxyz(const fs::path& obj2tifxyz,
                          const fs::path& obj,
                          const fs::path& output,
@@ -1555,7 +1537,7 @@ int rasterizeObjToTifxyz(const fs::path& obj2tifxyz,
         std::cerr << "vc_obj2tifxyz_legacy failed (rc=" << rc << ")\n";
         return 1;
     }
-    patchMetaUuid(output);
+    // vc_obj2tifxyz_legacy gives the rasterized surface its own fresh UUID.
     return 0;
 }
 

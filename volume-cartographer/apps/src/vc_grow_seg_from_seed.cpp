@@ -273,6 +273,7 @@ static int run_main(int argc, char *argv[])
     PointCollections corrections;
     bool skip_overlap_check = false;
     std::string segment_name;
+    std::optional<unsigned int> rng_seed;
 
     bool use_old_args = (argc == 4 || argc == 7) && argv[1][0] != '-' && argv[2][0] != '-' && argv[3][0] != '-';
 
@@ -298,7 +299,9 @@ static int run_main(int argc, char *argv[])
             ("inpaint", "perform automatic inpainting on all detected holes.")
             ("resume-opt", po::value<std::string>(), "Resume optimization option (skip, local, global)")
             ("resume-generations", po::value<int>(), "Number of additional generations to grow from current (overrides JSON generations)")
-            ("segment-name", po::value<std::string>(), "Output segment name (uses target-dir directly instead of creating subfolder)");
+            ("segment-name", po::value<std::string>(), "Output segment name (uses target-dir directly instead of creating subfolder)")
+            ("rng-seed", po::value<unsigned int>(), "Seed every random choice of the run (seed search, expansion order and the offsets GrowPatch "
+                                                    "adds to new points), so the same inputs give the same surface. Without it the clock is used.");
 
         po::variables_map vm;
         try {
@@ -376,6 +379,16 @@ static int run_main(int argc, char *argv[])
         if (vm.count("segment-name")) {
             segment_name = vm["segment-name"].as<std::string>();
         }
+
+        if (vm.count("rng-seed")) {
+            rng_seed = vm["rng-seed"].as<unsigned int>();
+            // GrowPatch reads this once, the first time it draws an offset.
+#ifdef _WIN32
+            _putenv_s("VC_GROWPATCH_RNG_SEED", std::to_string(*rng_seed).c_str());
+#else
+            setenv("VC_GROWPATCH_RNG_SEED", std::to_string(*rng_seed).c_str(), 1);
+#endif
+        }
     }
 
     if (params.empty()) {
@@ -430,7 +443,7 @@ static int run_main(int argc, char *argv[])
 
     auto chunk_size = chunk_shape_zyx;
 
-    srand(clock());
+    srand(rng_seed ? *rng_seed : static_cast<unsigned int>(clock()));
 
     std::string name_prefix = "auto_grown_";
     int tgt_overlap_count = params.value("tgt_overlap_count", 20);
@@ -529,7 +542,7 @@ static int run_main(int argc, char *argv[])
             return EXIT_FAILURE;
         }
         
-        std::default_random_engine rng(clock());
+        std::default_random_engine rng(rng_seed ? *rng_seed : static_cast<unsigned int>(clock()));
         std::shuffle(std::begin(surfs_v), std::end(surfs_v), rng);
 
 
@@ -681,6 +694,9 @@ static int run_main(int argc, char *argv[])
                   << "Set \"thread_limit\" in the params JSON (VC3D uses 1) or "
                   << "OMP_NUM_THREADS to cap it." << std::endl;
     }
+    if (rng_seed && omp_get_max_threads() > 1)
+        std::cout << "WARNING: --rng-seed is only repeatable single-threaded, but running with " << omp_get_max_threads()
+                  << " threads; set \"thread_limit\": 1 or OMP_NUM_THREADS=1." << std::endl;
 
     std::unique_ptr<QuadSurface> resume_surf;
     if (mode == "resume") {
@@ -701,16 +717,16 @@ static int run_main(int argc, char *argv[])
     if (mode == "expansion")
         meta_params["seed_overlap"] = count_overlap;
 
-    std::string uuid;
+    std::string seg_name;
     std::filesystem::path seg_dir;
     if (!segment_name.empty()) {
         // Use target-dir directly with custom segment name
-        uuid = segment_name;
+        seg_name = segment_name;
         seg_dir = tgt_dir;
     } else {
         // Default: create timestamped subfolder
-        uuid = name_prefix + time_str();
-        seg_dir = tgt_dir / uuid;
+        seg_name = name_prefix + time_str();
+        seg_dir = tgt_dir / seg_name;
     }
 
     //
@@ -1511,7 +1527,7 @@ static int run_main(int argc, char *argv[])
         add_target_context(neighbor_meta, vol_path);
 
         out_surf->meta = neighbor_meta;
-        out_surf->save(out_dir, uuid_local, true);
+        out_surf->saveAsNew(out_dir, true);
 
         // Done
         return EXIT_SUCCESS;
@@ -1552,7 +1568,7 @@ static int run_main(int argc, char *argv[])
     }
 
     std::cout << "saving " << seg_dir.string() << std::endl;
-    surf->save(seg_dir, uuid, true);
+    surf->saveAsNew(seg_dir, true);
     surf->path = seg_dir;
 
     if (mode == "expansion" && !skip_overlap_check) {

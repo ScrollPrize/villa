@@ -2170,8 +2170,7 @@ void SpiralWorkspace::loadPreview(const QString& manifestPath, qint64 generation
             || meta.value(QStringLiteral("output_step_vx"))
                 != manifest.value(QStringLiteral("output_step_vx"))
             || (hasBaseShape && meta.value(QStringLiteral("base_shape_zyx"))
-                != manifest.value(QStringLiteral("base_shape_zyx")))
-            || meta.value(QStringLiteral("uuid")).toString() != surfaceId)
+                != manifest.value(QStringLiteral("base_shape_zyx"))))
             return failure(QObject::tr(
                 "Spiral preview metadata does not match its generation manifest"));
         try {

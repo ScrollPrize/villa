@@ -3,29 +3,16 @@
 
 #include "vc/core/util/TifxyzIdentity.hpp"
 
-TEST_CASE("explicit TIFXYZ UUID overrides a generic output directory")
+TEST_CASE("explicit TIFXYZ UUID is kept as given")
 {
-    CHECK(vc::util::resolveTifxyzUuid(
-              "/tmp/output_tifxyz", "/tmp/mesh.obj", "PHerc1447-segment") ==
-          "PHerc1447-segment");
+    CHECK(vc::util::resolveTifxyzUuid("PHerc1447-segment") == "PHerc1447-segment");
 }
 
-TEST_CASE("TIFXYZ UUID keeps the historical output-directory default")
+TEST_CASE("TIFXYZ UUID defaults to a fresh random UUID, not a path name")
 {
-    CHECK(vc::util::resolveTifxyzUuid(
-              "/tmp/output_tifxyz", "/tmp/mesh.obj") == "output_tifxyz");
-}
-
-TEST_CASE("TIFXYZ UUID falls back to the input stem for a trailing output path")
-{
-    CHECK(vc::util::resolveTifxyzUuid(
-              std::filesystem::path("/tmp/output/"), "/tmp/source-mesh.obj") ==
-          "source-mesh");
-}
-
-TEST_CASE("TIFXYZ UUID rejects completely empty identity inputs")
-{
-    CHECK_THROWS_AS(
-        vc::util::resolveTifxyzUuid(std::filesystem::path{}, std::filesystem::path{}),
-        std::invalid_argument);
+    const std::string first = vc::util::resolveTifxyzUuid();
+    const std::string second = vc::util::resolveTifxyzUuid();
+    CHECK(vc::util::isUuid(first));
+    CHECK(vc::util::isUuid(second));
+    CHECK(first != second);
 }

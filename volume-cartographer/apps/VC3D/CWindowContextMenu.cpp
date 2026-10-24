@@ -24,6 +24,7 @@
 #include "elements/VolumeSelector.hpp"
 #include "elements/JsonProfilePresets.hpp"
 #include "utils/Json.hpp"
+#include "vc/core/util/Uuid.hpp"
 
 // --------- local helpers for running external tools -------------------------
 static bool runProcessBlocking(const QString& program,
@@ -330,11 +331,8 @@ private:
             root.insert(QStringLiteral("type"), QStringLiteral("seg"));
         }
         if (!root.contains(QStringLiteral("uuid"))) {
-            QString uuid = QFileInfo(dir).fileName();
-            if (uuid.isEmpty()) {
-                uuid = QDir(dir).dirName();
-            }
-            root.insert(QStringLiteral("uuid"), uuid);
+            root.insert(QStringLiteral("uuid"),
+                        QString::fromStdString(vc::util::newUuid()));
         }
         if (!root.contains(QStringLiteral("format"))) {
             root.insert(QStringLiteral("format"), QStringLiteral("tifxyz"));
@@ -788,7 +786,7 @@ static ABFFlattenResult runAbfFlattenTask(const ABFFlattenTaskConfig& cfg, const
         emitProgress(QObject::tr("Saving flattened surface..."));
         std::filesystem::path outPath(cfg.outputPath.toStdString());
         std::filesystem::create_directories(outPath);
-        flatSurf->save(outPath, true);
+        flatSurf->saveAsNew(outPath, true);
 
         result.success = true;
     } catch (const std::exception& e) {
