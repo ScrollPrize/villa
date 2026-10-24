@@ -170,6 +170,45 @@ Additional synthetic smoke:
 - `flatten_fast.json` and `flatten_long.json` load through
   `optimizer.load_stages_cfg(...)`.
 
+## Real-Data Benchmark
+
+`flatten_fast.json` vs `flatten_long.json` on six public tifxyz segments, MPS float32,
+Apple M4 Pro, September 2026:
+
+- PHercParis4 `verified_patches/`: `0000_low_band_final`, `0000_mid_band_final`,
+  `0000_top_band`, `auto_grown_20260415165722318`
+- PHerc0191 and PHerc0826 spiral-fit strips `w089` from Hugging Face
+  `rodriguescarson/eligible-scroll-spiral-fits`
+
+Stretch is |3D edge length / output step - 1| over output edges. Folds is the share of
+neighbouring output quads whose 3D normals point opposite ways.
+
+| segment (grid, valid pts) | loss fast / long | long steps per stage | p99 stretch fast / long | folds fast / long |
+|---|---|---|---|---|
+| PHercParis4 auto_grown (122x122, 13k) | 0.00127 / 0.00127 | 5.5k / 5.5k / 4k | 0.033 / 0.033 | 0 / 0 |
+| PHercParis4 low band (130x3498, 193k) | 0.00085 / 0.00083 | 14k / 6k / 28k | 0.032 / 0.032 | 0 / 0 |
+| PHercParis4 mid band (112x1731, 174k) | 0.00206 / 0.00201 | 100k / 100k / 97k | 0.046 / 0.046 | 0 / 0 |
+| PHercParis4 top band (241x13168, 1.22M) | 0.00657 / 0.00214 | 14k / 100k / 100k | 0.051 / 0.045 | 0 / 0 |
+| PHerc0191 strip (56x434, 18k) | 0.00486 / 0.00262 | 7k / 10k / 4k | 0.104 / 0.075 | 0.004% / 0.023% |
+| PHerc0826 strip (56x415, 17k) | 0.02889 / 0.00152 | 22k / 9k / 4k | 0.273 / 0.057 | 0.26% / 0 |
+
+- Clean segments: long changes the loss by 0-3% and the stretch not at all. Unthrottled low
+  band wall time was 103 s fast, 1,693 s long.
+- Large or folded input: fast stops early. Long cuts the top band loss to a third. Both
+  spiral-fit strips are folded in the source (1.4% and 1.9% of neighbouring quads flipped);
+  fast leaves overlap patches there, and long removes them on PHerc0826.
+- Long changes the flat layout (top band strip 0.9% shorter, mid band strip bent) but covers
+  the same source area within 0.3%.
+- Auto-stop: a stage ends when its running minimum improves by less than 1e-5 over 2000
+  steps. Adam's step noise keeps setting new minima, so 5 of the 9 band stages ran to, or
+  within 3% of, `auto_steps_max`. Long took hours on the mid band and about a day on the top
+  band.
+- Precision: float32 export matched `LASAGNA_MAX_PRECISION_FLOAT=64` on all six segments: same
+  final loss, at most 0.011 voxel vertex difference, at most 1 output pixel changing validity.
+  Runs are deterministic. The one larger difference is inside the PHerc0826 overlap patch,
+  where two source sheets land on the same output pixels.
+- `flatten_orient_fold_frac` stayed at or below 0.0001 at every status row.
+
 ## Known Limitations
 
 - Forward export uses a CPU KD-tree candidate search and vectorized barycentric
@@ -200,9 +239,8 @@ the old experiment as a known-good baseline. The current working direction is:
 
 Good follow-up tasks:
 
-- Benchmark `flatten_fast.json` vs `flatten_long.json` on a representative
-  real tifxyz and record wall time, final loss, valid output fraction, and
-  visual quality.
+- Replace the running-minimum auto-stop with a plateau test on a smoothed loss
+  (see Real-Data Benchmark).
 - Profile `_flatten_invert_forward_uv_map(...)` on large outputs.
 - Save the optimized forward UV map in checkpoints under a separate field,
   for example `flatten_forward_uv_flat`, while keeping `flatten_map_flat`
