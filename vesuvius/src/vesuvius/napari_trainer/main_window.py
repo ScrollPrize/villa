@@ -21,9 +21,13 @@ Image.MAX_IMAGE_PIXELS = None
 
 _config_manager = None
 
+# vesuvius/models/configuration/..., beside this package (napari_trainer/).
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent / 'models' / 'configuration' / 'single_task' / 'ps128_dicece.yaml'
+
+
 @magicgui(filenames={"label": "select config file", "filter": "*.yaml"},
           auto_call=True)
-def filespicker(filenames: Sequence[Path] = str(Path(__file__).parent.parent.parent / 'models' / 'configuration' / 'single_task' / 'ps128_dicece.yaml')) -> Sequence[Path]:
+def filespicker(filenames: Sequence[Path] = str(DEFAULT_CONFIG_PATH)) -> Sequence[Path]:
     print("selected config : ", filenames)
     if filenames and _config_manager is not None:
         # Load the first selected file into the config manager
@@ -169,7 +173,7 @@ def main():
     global _config_manager
     _config_manager = ConfigManager(verbose=True)
     # Use an absolute path based on the location of this script
-    default_config_path = Path(__file__).parent.parent.parent / 'models' / 'configuration' / 'single_task' / 'ps128_dicece.yaml'
+    default_config_path = DEFAULT_CONFIG_PATH
     _config_manager.load_config(default_config_path)
     print(f"Default config loaded from {default_config_path}")
 
