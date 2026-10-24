@@ -431,11 +431,8 @@ class Volume:
             elif isinstance(self.data, zarr.Group):
                 # Group case (e.g., OME-Zarr with multiscales)
                 # Find the first array in the group - typically '0' for highest resolution
-                first_key = None
-                for key in self.data.keys():
-                    if isinstance(self.data[key], zarr.Array):
-                        first_key = key
-                        break
+                level_keys = self._group_level_keys()
+                first_key = level_keys[0] if level_keys else None
                 if first_key is None:
                     raise ValueError(f"No arrays found in zarr Group at {self.path}")
                 first_array = self.data[first_key]
@@ -640,8 +637,33 @@ class Volume:
             return 1
         n = getattr(self, "_num_levels_memo", None)
         if n is None:
-            n = self._num_levels_memo = len(self.data)
+            if isinstance(self.data, zarr.Group):
+                n = len(self._group_level_keys())
+            else:
+                n = len(self.data)
+            self._num_levels_memo = n
         return n
+
+    def _group_level_keys(self) -> List[str]:
+        """Level array names of an OME-Zarr group, level 0 first.
+
+        Read from the multiscales metadata when the group has it: an HTTPS store
+        such as the open-data S3 bucket cannot list its members, so a group opened
+        from it looks empty to ``keys()``. Groups without that metadata fall back to
+        listing their arrays.
+        """
+        keys = getattr(self, "_level_keys_memo", None)
+        if keys is not None:
+            return keys
+        attrs = self.data.attrs.asdict() if hasattr(self.data.attrs, "asdict") else dict(self.data.attrs)
+        multiscales = attrs.get("multiscales") or attrs.get("ome", {}).get("multiscales")
+        if multiscales:
+            keys = [str(d["path"]) for d in multiscales[0].get("datasets", [])]
+        else:
+            keys = [k for k in self.data.keys() if isinstance(self.data[k], zarr.Array)]
+            keys.sort(key=lambda k: (not k.isdigit(), int(k) if k.isdigit() else 0, k))
+        self._level_keys_memo = keys
+        return keys
 
     def _level(self, idx: int = 0):
         """Return multiscale level ``idx`` of ``self.data``.
