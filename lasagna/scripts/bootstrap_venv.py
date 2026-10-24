@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -39,6 +40,14 @@ TORCH_BUILDS = {
         torch="2.13.0",
         torchvision="0.28.0",
         index_url="https://download.pytorch.org/whl/cu130",
+    ),
+    # Opt-in only (--backend rocm); auto never selects it. The rocm7.2 index
+    # ships manylinux_2_28_x86_64 wheels only.
+    "rocm": TorchBuild(
+        backend="rocm",
+        torch="2.13.0",
+        torchvision="0.28.0",
+        index_url="https://download.pytorch.org/whl/rocm7.2",
     ),
 }
 CUDA13_ONLY_PACKAGES = {"cucim-cu13", "cupy-cuda13x", "nvidia-nvimgcodec-cu13"}
@@ -98,7 +107,58 @@ def query_compute_caps(nvidia_smi: str) -> list[tuple[int, int]]:
     return parse_compute_caps(result.stdout)
 
 
+ROCM_DEVICE = "/dev/kfd"
+ROCM_HINT = "AMD ROCm tools found; to use an AMD GPU run with --backend rocm"
+
+
+def detect_rocm() -> str | None:
+    """Describe the ROCm signs found on this machine, or None.
+
+    Tools or /opt/rocm do not prove that a usable AMD GPU is present (leftover
+    packages, a container without the device passed through), so auto
+    detection only uses this to print ROCM_HINT and never selects rocm.
+    """
+    for tool in ("rocminfo", "amd-smi", "rocm-smi"):
+        if shutil.which(tool) is not None:
+            return f"{tool} found"
+    if Path("/opt/rocm").is_dir():
+        return "/opt/rocm exists"
+    if os.path.exists(ROCM_DEVICE):
+        return f"{ROCM_DEVICE} exists"
+    return None
+
+
+def rocm_hint() -> str | None:
+    """One-line hint for --backend auto when ROCm signs are present.
+
+    Not shown where --backend rocm would be refused (not Linux x86_64).
+    """
+    if detect_rocm() is None or rocm_unsupported_reason(need_device=False):
+        return None
+    return ROCM_HINT
+
+
+def rocm_unsupported_reason(*, need_device: bool) -> str | None:
+    """Why --backend rocm cannot work here, or None if it can be tried."""
+    machine = platform.machine()
+    if sys.platform != "linux" or machine != "x86_64":
+        return (
+            f"--backend rocm needs Linux x86_64 (the rocm7.2 index only has "
+            f"manylinux_2_28_x86_64 wheels); this machine is {sys.platform} "
+            f"{machine or 'unknown'}. Use --backend cpu"
+        )
+    if need_device and not os.path.exists(ROCM_DEVICE):
+        return (
+            f"--backend rocm: {ROCM_DEVICE} does not exist, so no AMD GPU is "
+            "visible (amdgpu kernel driver not loaded, or the device was not "
+            "passed into this container: --device /dev/kfd --device /dev/dri). "
+            "Use --backend cpu, or --skip-cuda-check to install without a GPU"
+        )
+    return None
+
+
 def detect_backend() -> tuple[str, str]:
+    """Pick cpu, cu128 or cu130 from nvidia-smi. rocm is opt-in only."""
     nvidia_smi = shutil.which("nvidia-smi")
     if nvidia_smi is None:
         return "cpu", "nvidia-smi is not installed"
@@ -109,7 +169,7 @@ def detect_backend() -> tuple[str, str]:
     if result.returncode != 0:
         raise RuntimeError(
             "nvidia-smi exists but cannot communicate with the driver; "
-            "fix the driver or pass --backend cpu/cu128/cu130 explicitly"
+            "fix the driver or pass --backend cpu/cu128/cu130/rocm explicitly"
         )
     cuda_version = parse_cuda_version(output)
     if cuda_version is None:
@@ -183,9 +243,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--python", default="3.14", help="Python version for uv venv")
     parser.add_argument(
         "--backend",
-        choices=("auto", "cpu", "cu128", "cu130"),
+        choices=("auto", "cpu", "cu128", "cu130", "rocm"),
         default="auto",
-        help="PyTorch backend; auto inspects nvidia-smi",
+        help="PyTorch backend; auto inspects nvidia-smi (cpu/cu128/cu130); "
+        "rocm (AMD, Linux x86_64) is opt-in only",
     )
     parser.add_argument(
         "--project",
@@ -219,22 +280,64 @@ def environment_check_script(backend: str, skip_cuda_check: bool) -> str:
         "assert vc_fiberlets.is_file(), 'vc_fiberlets is missing from the venv'",
         "import vesuvius.neural_tracing.fiber_trace_3d.infer as fiber_infer",
         "print(json.dumps({'torch': torch.__version__,"
-        " 'torch_cuda': torch.version.cuda,"
+        " 'torch_cuda': torch.version.cuda, 'torch_hip': torch.version.hip,"
         " 'cuda_available': torch.cuda.is_available(),"
         " 'fiber_infer': fiber_infer.__file__}))",
     ]
     if backend != "cpu" and not skip_cuda_check:
+        lines.append("ok = torch.cuda.is_available()")
+        if backend == "rocm":
+            # is_available() is also True on an AMD GPU whose gfx target the
+            # wheel has no kernels for; its first kernel then fails with
+            # "invalid device function". Compare the targets first (exit 2).
+            lines += [
+                "import os",
+                "wheel = sorted({a.split(':')[0] for a in torch.cuda.get_arch_list()})",
+                "gpus = [torch.cuda.get_device_properties(i).gcnArchName.split(':')[0]"
+                " for i in range(torch.cuda.device_count())] if ok else []",
+                "missing = [f'{i}:{a}' for i, a in enumerate(gpus) if wheel and a not in wheel]",
+                "if missing:",
+                "    print('GPU gfx target without kernels in this ROCm wheel:',"
+                " ' '.join(missing), '| wheel targets:', ' '.join(wheel))",
+                "    if not os.environ.get('HSA_OVERRIDE_GFX_VERSION'):",
+                "        raise SystemExit(2)",
+                "    print('HSA_OVERRIDE_GFX_VERSION is set; running the smoke test anyway')",
+            ]
+        api = "ROCm" if backend == "rocm" else "CUDA"
         lines += [
-            "ok = torch.cuda.is_available()",
             "if ok:",
             "    try:",
             "        (torch.ones(8, device='cuda') * 2).sum().item()",
             "    except Exception as exc:",
-            "        print('CUDA smoke test failed:', exc)",
+            f"        print('{api} smoke test failed:', exc)",
             "        ok = False",
             "raise SystemExit(0 if ok else 1)",
         ]
     return "\n".join(lines)
+
+
+def check_failure_message(backend: str, returncode: int) -> str:
+    """Error for a failed environment check, worded for the installed backend."""
+    if backend != "rocm":
+        return (
+            "PyTorch installed, but CUDA is unavailable. Check nvidia-smi/driver access "
+            "or rerun with --backend cpu."
+        )
+    if returncode == 2:
+        return (
+            "PyTorch installed, but the AMD GPU's gfx target has no kernels in the "
+            "ROCm wheel (targets listed above). If the card is ISA-compatible with a "
+            "listed target, set HSA_OVERRIDE_GFX_VERSION (e.g. 11.0.0 for gfx1100) and "
+            "rerun; hide unsupported GPUs with HIP_VISIBLE_DEVICES; or rerun with "
+            "--backend cpu."
+        )
+    return (
+        "PyTorch installed, but the AMD GPU is unavailable through ROCm. Check that "
+        "/dev/kfd and /dev/dri/renderD* are accessible (add your user to the "
+        "'render' and 'video' groups and log in again; in a container pass "
+        "--device /dev/kfd --device /dev/dri), and that HSA_OVERRIDE_GFX_VERSION "
+        "is unset or names a target your GPU supports; or rerun with --backend cpu."
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -243,13 +346,18 @@ def main(argv: list[str] | None = None) -> int:
     if uv is None:
         raise SystemExit("uv is required; install it from https://docs.astral.sh/uv/")
 
+    if args.backend == "rocm":
+        unsupported = rocm_unsupported_reason(need_device=not args.skip_cuda_check)
+        if unsupported is not None:
+            raise SystemExit(unsupported)
+    hint = rocm_hint() if args.backend == "auto" else None
     try:
         if args.backend == "auto":
             backend, reason = detect_backend()
         else:
             backend, reason = args.backend, "selected explicitly"
     except RuntimeError as exc:
-        raise SystemExit(str(exc)) from exc
+        raise SystemExit(str(exc) + (f"\n{hint}" if hint else "")) from exc
 
     build = TORCH_BUILDS[backend]
     venv = args.venv.expanduser().resolve()
@@ -261,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
             "the Lasagna bootstrap requires the sibling volume-cartographer checkout"
         )
     print(f"PyTorch backend: {backend} ({reason})", flush=True)
+    if hint is not None:
+        print(hint, flush=True)
 
     if not venv_python.exists():
         run([uv, "venv", "--python", args.python, str(venv)], dry_run=args.dry_run)
@@ -315,10 +425,7 @@ def main(argv: list[str] | None = None) -> int:
         env=check_environment,
     )
     if result.returncode != 0:
-        raise SystemExit(
-            "PyTorch installed, but CUDA is unavailable. Check nvidia-smi/driver access "
-            "or rerun with --backend cpu."
-        )
+        raise SystemExit(check_failure_message(backend, result.returncode))
     print(f"Lasagna environment ready: {venv}", flush=True)
     return 0
 
