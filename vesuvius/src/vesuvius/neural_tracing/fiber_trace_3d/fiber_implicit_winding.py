@@ -681,7 +681,8 @@ def run(config):
     config['width_gather_sha256']=sha256_file(fiber_grouped_gather.__file__)
     config['width_layout_sha256']=sha256_file(soft.uv.__file__)
     if config.get('indexing_audit'):
-        raise ValueError('The experimental indexing audit is not part of the reusable solver')
+        from . import fiber_indexing_audit
+        config['indexing_audit_sha256']=sha256_file(fiber_indexing_audit.__file__)
     if config.get('v_endpoint_offsets',False):
         from . import fiber_v_endpoint_offsets as offsets
         config['offset_solver_sha256']=sha256_file(offsets.__file__)
@@ -751,6 +752,10 @@ if __name__ == '__main__':
     for key,path in [('width_gather_sha256',fiber_grouped_gather.__file__),('width_layout_sha256',soft.uv.__file__)]:
         if key in config and sha256_file(path)!=config[key]:raise ValueError('Width implementation changed while waiting')
 
+    if config.get('indexing_audit'):
+        from . import fiber_indexing_audit
+        if sha256_file(fiber_indexing_audit.__file__)!=config['indexing_audit_sha256']:
+            raise ValueError('Indexing audit changed while waiting')
     if config.get('cavity_winding_sigma'):
         from . import fiber_cavity_sigma as cavity
         if sha256_file(cavity.__file__) != config['cavity_solver_sha256']:

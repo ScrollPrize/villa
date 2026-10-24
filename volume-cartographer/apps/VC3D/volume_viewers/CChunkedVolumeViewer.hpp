@@ -157,7 +157,7 @@ public:
     void setOverlayOpacity(float opacity) override;
     void setOverlayColormap(const std::string& colormapId) override;
     void setOverlaySamplingMethod(vc::Sampling method) override;
-    void setOverlayThreshold(float threshold) override;
+    void setOverlayIntensityAsAlpha(bool enabled) override;
     void setOverlayWindow(float low, float high) override;
     void setOverlayMaxDisplayedResolution(int level) override;
     void setOverlayComposite(const OverlayCompositeSettings& settings) override;
@@ -426,6 +426,7 @@ private:
         std::string overlayColormapId;
         float overlayWindowLow = 0.0f;
         float overlayWindowHigh = 255.0f;
+        bool overlayIntensityAsAlpha = false;
         OverlayCompositeSettings overlayComposite;
         std::uint64_t chunkContentEpoch = 0;
         std::uint64_t surfaceGeometryEpoch = 0;
@@ -645,6 +646,7 @@ private:
     vc::Sampling _overlaySamplingMethod = vc::Sampling::Nearest;
     float _overlayWindowLow = 0.0f;
     float _overlayWindowHigh = 255.0f;
+    bool _overlayIntensityAsAlpha = false;
     int _overlayMaxDisplayedResolution = 0;
     OverlayCompositeSettings _overlayComposite;
 

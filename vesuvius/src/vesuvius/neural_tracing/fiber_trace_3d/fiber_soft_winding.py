@@ -600,8 +600,9 @@ def _solve(config, device, pair_cost, model, diagnostics, extension_factory, par
         if extension is not None and hasattr(extension, 'update'):
             with torch.profiler.record_function('solver/window_and_cavity'):
                 extension.update(state, (torch.nn.functional.softplus(raw)+1e-4).detach(), data, iteration)
-        if config.get('indexing_audit'):
-            raise ValueError('The experimental indexing audit is not part of the reusable solver')
+        if config.get('indexing_audit') and iteration==5:
+            from .fiber_indexing_audit import audit
+            atomic_write(root/'indexing_audit.json',audit(state,raw,widths,data,nodes,config,pair_cost,extension),durable=False)
         iteration_config=(dict(config,_optimization_iteration=iteration)
                           if config.get('pair_weight_schedule') else config)
         plateau_action=None
