@@ -151,6 +151,48 @@ TEST_CASE("Volume: writeZYX then readZYX round-trips a small buffer")
     fs::remove_all(d);
 }
 
+TEST_CASE("Volume: readZYX across chunk edges and past the volume matches voxel by voxel")
+{
+    auto d = tmpDir("crosschunk");
+    auto v = Volume::New(d, makeOpts());
+    REQUIRE(v);
+
+    // Fill seven of the eight level-0 chunks; chunk (1, 1, 1) stays absent.
+    auto value = [](int z, int y, int x) {
+        return static_cast<uint8_t>(1 + ((z * 7 + y * 3 + x * 5) % 250));
+    };
+    for (int cz = 0; cz < 2; ++cz)
+        for (int cy = 0; cy < 2; ++cy)
+            for (int cx = 0; cx < 2; ++cx) {
+                if (cz == 1 && cy == 1 && cx == 1)
+                    continue;
+                Array3D<uint8_t> chunk({32, 32, 32});
+                for (int z = 0; z < 32; ++z)
+                    for (int y = 0; y < 32; ++y)
+                        for (int x = 0; x < 32; ++x)
+                            chunk(z, y, x) = value(cz * 32 + z, cy * 32 + y, cx * 32 + x);
+                v->writeZYX(chunk, {cz * 32, cy * 32, cx * 32}, /*level=*/0);
+            }
+
+    // A box that starts before the volume, crosses every chunk edge and ends past it.
+    const std::array<int, 3> offset{-5, 3, 20};
+    Array3D<uint8_t> out({60, 70, 50});
+    REQUIRE(v->readZYX(out, offset, 0));
+    int mismatches = 0;
+    for (int z = 0; z < 60; ++z)
+        for (int y = 0; y < 70; ++y)
+            for (int x = 0; x < 50; ++x) {
+                const int iz = offset[0] + z, iy = offset[1] + y, ix = offset[2] + x;
+                const bool inside = iz >= 0 && iz < 64 && iy >= 0 && iy < 64 && ix >= 0 && ix < 64;
+                const bool absent = inside && iz >= 32 && iy >= 32 && ix >= 32;
+                const int expected = (!inside || absent) ? 0 : value(iz, iy, ix);
+                if (int(out(z, y, x)) != expected)
+                    ++mismatches;
+            }
+    CHECK(mismatches == 0);
+    fs::remove_all(d);
+}
+
 TEST_CASE("Volume: readChunkOrFill returns fill when chunk is absent")
 {
     auto d = tmpDir("orfill");
