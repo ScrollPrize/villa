@@ -98,6 +98,10 @@ class ScaleTask(ZarrTask):
         )
 
     @classmethod
+    def planned_output(cls, args, shape, dtype):
+        return tuple(max(1, int(round(n * args.scale_factor))) for n in shape), dtype
+
+    @classmethod
     def validate_args(cls, args: argparse.Namespace) -> None:
         """Validate scale arguments."""
         if args.scale_factor is None or args.scale_factor <= 0:

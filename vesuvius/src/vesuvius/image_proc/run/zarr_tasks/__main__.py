@@ -93,6 +93,13 @@ def main():
     # Validate task-specific arguments
     task_cls.validate_args(args)
 
+    if args.dry_run:
+        from .base import describe_plan
+
+        print("\n".join(describe_plan(task_cls, args)))
+        print("Dry run: nothing was written.")
+        return
+
     # Confirm overwrite for output
     if not args.inplace and args.output_zarr:
         output_path = Path(args.output_zarr)

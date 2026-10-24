@@ -128,3 +128,26 @@ def test_list_tasks_shows_a_summary_per_task():
     assert result.returncode == 0
     line = next(l for l in result.stdout.splitlines() if l.strip().startswith("threshold"))
     assert get_task("threshold").__doc__.split(".")[0] in line
+
+
+def test_dry_run_prints_the_plan_and_writes_nothing(tmp_path):
+    src = _ome_group(tmp_path, _volume())
+    out = tmp_path / "half.zarr"
+    result = _cli(src, str(out), "--task", "scale", "--scale-factor", "0.5", "-n", "2", "--dry-run")
+    assert result.returncode == 0, result.stderr
+    assert "shape (8, 16, 12), chunks (4, 8, 8), uint8, 8 chunks" in result.stdout
+    assert "level 0 shape (4, 8, 6), uint8" in result.stdout
+    assert "workers    2, about 4 chunks each" in result.stdout
+    assert "Dry run: nothing was written." in result.stdout
+    assert not out.exists()
+
+
+def test_dry_run_reports_the_output_dtype_and_replacement(tmp_path):
+    src = _ome_group(tmp_path, _volume().astype(np.uint16))
+    out = tmp_path / "mask.zarr"
+    out.mkdir()
+    result = _cli(src, str(out), "--task", "threshold", "-n", "1", "--dry-run")
+    assert result.returncode == 0, result.stderr
+    assert "(exists: would be replaced)" in result.stdout
+    assert "level 0 shape (8, 16, 12), uint8" in result.stdout
+    assert list(out.iterdir()) == []

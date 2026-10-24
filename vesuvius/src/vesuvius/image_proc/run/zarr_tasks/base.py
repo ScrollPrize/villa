@@ -17,6 +17,7 @@ from multiprocessing import Pool
 from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional, Tuple
 
+import numpy as np
 import zarr
 from tqdm import tqdm
 
@@ -248,6 +249,14 @@ class ZarrTask(ABC):
         return self.config.input_zarr
 
     @classmethod
+    def planned_output(cls, args: argparse.Namespace, shape: Tuple[int, ...], dtype) -> Tuple[Tuple[int, ...], Any]:
+        """Level 0 shape and dtype this task would write, for --dry-run.
+
+        The default is the input's; tasks that change either override it.
+        """
+        return tuple(shape), dtype
+
+    @classmethod
     def validate_args(cls, args: argparse.Namespace) -> None:
         """Validate parsed arguments.
 
@@ -333,12 +342,51 @@ def get_base_parser() -> argparse.ArgumentParser:
         help="List available tasks and exit",
     )
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would be read and written, with chunk counts and sizes, then exit",
+    )
+    parser.add_argument(
         "-y",
         "--yes",
         action="store_true",
         help="Overwrite an existing output without asking (for scripts and batch jobs)",
     )
     return parser
+
+
+def describe_plan(task_cls, args: argparse.Namespace) -> List[str]:
+    """What a run would read and write, without writing anything (for --dry-run)."""
+    level = str(args.level) if args.level is not None else "0"
+    opened = zarr.open(args.input_zarr, mode="r")
+    arr = opened[level] if isinstance(opened, zarr.Group) else opened
+    n_chunks = math.prod(math.ceil(s / c) for s, c in zip(arr.shape, arr.chunks))
+    out_shape, out_dtype = task_cls.planned_output(args, arr.shape, arr.dtype)
+    in_bytes = math.prod(arr.shape) * np.dtype(arr.dtype).itemsize
+    out_bytes = math.prod(out_shape) * np.dtype(out_dtype).itemsize
+    levels = getattr(args, "num_levels", None)
+    workers = args.num_workers or available_cpus()
+    lines = [
+        f"task       {args.task}",
+        f"input      {args.input_zarr}" + (f" (level {level})" if isinstance(opened, zarr.Group) else ""),
+        f"           shape {tuple(arr.shape)}, chunks {tuple(arr.chunks)}, {np.dtype(arr.dtype)}, "
+        f"{n_chunks} chunks, {_gb(in_bytes)} uncompressed",
+    ]
+    if args.output_zarr:
+        lines.append(f"output     {args.output_zarr}" + ("  (exists: would be replaced)"
+                                                         if Path(args.output_zarr).exists() else ""))
+        lines.append(f"           level 0 shape {tuple(out_shape)}, {np.dtype(out_dtype)}, "
+                     f"{_gb(out_bytes)} uncompressed" + (f", {levels} levels" if levels else ""))
+    elif args.inplace:
+        lines.append("output     in place")
+    lines.append(f"workers    {workers}, about {math.ceil(n_chunks / workers)} chunks each")
+    return lines
+
+
+def _gb(n: int) -> str:
+    if n >= 1e8:
+        return f"{n / 1e9:.2f} GB"
+    return f"{n / 1e6:.1f} MB" if n >= 1e5 else f"{n / 1e3:.1f} kB"
 
 
 def make_task_config(args: argparse.Namespace) -> TaskConfig:

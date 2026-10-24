@@ -85,6 +85,11 @@ class TransposeTask(ZarrTask):
         )
 
     @classmethod
+    def planned_output(cls, args, shape, dtype):
+        axes = {"x": 2, "y": 1, "z": 0}
+        return tuple(shape[axes[c]] for c in args.transpose_order.lower()), dtype
+
+    @classmethod
     def validate_args(cls, args: argparse.Namespace) -> None:
         """Validate transpose arguments."""
         order_str = args.transpose_order.lower()

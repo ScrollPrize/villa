@@ -83,6 +83,10 @@ class ThresholdTask(ZarrTask):
         )
 
     @classmethod
+    def planned_output(cls, args, shape, dtype):
+        return tuple(shape), np.uint8
+
+    @classmethod
     def from_args(cls, args: argparse.Namespace) -> "ThresholdTask":
         """Create task from parsed arguments."""
         base_config = make_task_config(args)
