@@ -67,3 +67,106 @@ triangles. Bounds are not quantized.
 
 Tests are self-contained and do not require the volume-cartographer checkout or
 its fixture data.
+
+### Coordinate-aware detectors
+
+The Python and C++ PCL-patch, patch-overlap, fiber-patch and stored-track-patch
+APIs accept an optional `volume_uuid` (`CoordinateParams::volumeUuid` in C++).
+With this option, every selected object's `meta.coordinates` must declare that
+volume and a finite positive `scale_factor`, where **stored XYZ = volume XYZ ×
+scale_factor**. Detectors resolve scales individually within one discovery pass;
+all tolerances, strip distances and overlap UV poses then use
+reference-volume voxels (patch areas use squared voxels). The selection and stale-edge scope are unchanged.
+
+```python
+report = store.link_point_collections_to_patches(
+    volume_uuid="20260411134726", collection_uuids=collections, patch_uuids=patches)
+report = store.link_patch_overlaps(volume_uuid="20260411134726", patch_uuids=patches)
+report = store.link_fibers_to_patches(
+    "/data/ct.zarr", volume_uuid="20260411134726",
+    fiber_uuids=fibers, patch_uuids=patches, ct_level=1, ct_to_base_scale=2)
+```
+
+In this mode, leave `point_scale`, `patch_scale`, `fiber_scale`, `track_scale`
+and `working_to_base_scale` at their identity defaults (1). Nonidentity values
+are rejected rather than overriding metadata or applying scaling twice.
+`ct_to_base_scale` is the selected CT level's downsampling relative to the declared
+volume; `ct_level` selects data and does not add another scaling factor. The caller
+is responsible for binding the CT path to that volume. Without `volume_uuid`,
+existing explicit-scale behavior is preserved; unknown metadata remains allowed.
+
+For legacy objects, `legacy_coordinates={object_uuid: {"volume_uuid": V,
+"scale_factor": s}}` can fill missing declarations for that invocation. Keys must
+be canonical object UUIDs. C++ uses `CoordinateParams::legacyCoordinates`, mapping
+UUIDs to JSON strings. A declaration cannot override conflicting known metadata,
+and requires `volume_uuid`. Generated edges record both resolved frames and legacy
+declarations in `meta.coordinate_frame`; object metadata is not modified. Explicit-scale
+reruns set this field to null, clearing any previous metadata-mode declaration. Frame
+validation runs before geometry processing or relationship writes. Existing
+geometry/load failure reporting remains unchanged.
+
+Stored arrays and source anchors remain unchanged. Grid indices do not scale;
+working patch grid steps per voxel are divided by the XYZ conversion multiplier.
+Invalid patch vertices retain their sentinels. Overlap edges record their working
+UV grid scales and pose units, so consumers can interpret metric poses correctly.
+
+Python exposes the existing native `geometry_coordinates`,
+`merge_geometry_coordinates` and `geometry_scale_to_volume` helpers, plus strict
+`resolve_geometry_coordinates` and `geometry_scale_to_frame`. The volume helper
+returns `None` for unknown or mismatched frames. The strict helpers raise instead.
+For fitting downsampling N, use:
+
+```python
+from vc_object_store import geometry_scale_to_frame
+multiplier = geometry_scale_to_frame(metadata, V, downsample_factor=N)
+fit_xyz = stored_xyz * multiplier  # stored_xyz / scale_factor / N
+```
+
+The strict helper accepts an optional `legacy_coordinates` declaration and checks
+representability both before and after downsampling. Consumers must preserve
+invalid vertex sentinels when applying the multiplier to arrays.
+
+Run regression tests against an existing native build and Python environment:
+
+```sh
+cmake --build /tmp/vc-object-coordinate-build -j 6
+ctest --test-dir /tmp/vc-object-coordinate-build --output-on-failure
+VC_OBJECT_STORE_BUILD_PYTHON_PATH=/tmp/vc-object-coordinate-build/python \
+  python -m pytest -q vc_object_store/tests/python
+PYTHONPATH=/tmp/vc-object-coordinate-build/python \
+  python vc_object_store/tests/smoke/coordinate_frames.py \
+  ../spiral/dataset /tmp/coordinate-real-smoke
+```
+
+The real-data smoke command requires a new output directory. It ingests one patch
+and five PCLs, assigns UUIDs in temporary legacy import wrappers, and compares
+explicit scaling with mixed source scales (patch 2; PCLs 0.25 and 4). It checks exact
+attachment/patch-grid agreement and idempotent reruns; it does not train a fitter.
+
+Validated on Ubuntu amd64, GCC 13.3, Release, Python 3.14.5. The local build used
+existing cached nanobind and vc-delta3d sources, with downloads disabled:
+
+```sh
+export AGENTS_AGENT_MODE=1
+coordinate_build_python=/home/paul/.cache/uv/builds-v0/.tmp3Merin/bin/python
+coordinate_test_python=/mnt/bcache/projects/vesuvius-scrolls/villa-spiral-simplification/spiral-fitting/.venv/bin/python
+coordinate_delta_source=/tmp/claude-1000/-mnt-bcache-projects-vesuvius-scrolls-villa/aa6c6e86-9c08-4d44-a30b-e17a92fd9821/scratchpad/build-tests/_deps/vc_delta3d-src
+cmake -S vc_object_store -B /tmp/vc-object-coordinate-build -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DVC_OBJECT_STORE_BUILD_PYTHON=ON \
+  -DCMAKE_MAKE_PROGRAM=/home/paul/.cache/uv/builds-v0/.tmp3Merin/bin/ninja \
+  -DPython_EXECUTABLE="$coordinate_build_python" \
+  -DFETCHCONTENT_SOURCE_DIR_VC_DELTA3D="$coordinate_delta_source" \
+  -DFETCHCONTENT_FULLY_DISCONNECTED=ON
+cmake --build /tmp/vc-object-coordinate-build -j 6
+ctest --test-dir /tmp/vc-object-coordinate-build --output-on-failure
+VC_OBJECT_STORE_BUILD_PYTHON_PATH=/tmp/vc-object-coordinate-build/python \
+  "$coordinate_test_python" -m pytest -q vc_object_store/tests/python
+PYTHONPATH=/tmp/vc-object-coordinate-build/python \
+  "$coordinate_test_python" vc_object_store/tests/smoke/coordinate_frames.py \
+  ../spiral/dataset /tmp/vc-object-coordinate-real-smoke-final
+```
+
+The real subset produced 32 identical attachments in both coordinate modes, with
+zero duplicates, updates or removals on repeat discovery. macOS and arm64 were not
+run locally. This validates store coordinate conversion only; the spiral CLI port
+and training acceptance remain separate stages.

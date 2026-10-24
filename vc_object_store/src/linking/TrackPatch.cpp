@@ -11,6 +11,7 @@ DetectorReport linkTracksToPatches(objects::ObjectStore& db, const std::filesyst
     try {
         detail::StoredGeometry inputs(db);
         const auto tracks = inputs.select("track", params.trackUuids);
+        const auto scales = detail::coordinateScales(tracks, params, params.trackScale);
         auto load = [&](size_t index, DetectorReport& report) -> std::optional<detail::LineData> {
             const auto& object = tracks[index];
             try {
@@ -21,13 +22,14 @@ DetectorReport linkTracksToPatches(objects::ObjectStore& db, const std::filesyst
                 detail::LineData line;
                 line.uuid = object.uuid;
                 line.object = object;
+                line.sourceScale = scales.at(object.uuid);
                 line.lastLine = count - 1;
                 line.line.reserve(count);
                 line.arclength.reserve(count);
                 for (size_t i = 0; i < count; ++i) {
                     if ((i & 1023) == 0 && cancel && cancel->load())
                         throw std::runtime_error("track-patch linking cancelled");
-                    const cv::Vec3d xyz = cv::Vec3d(points[3*i], points[3*i+1], points[3*i+2]) * params.trackScale;
+                    const cv::Vec3d xyz = cv::Vec3d(points[3*i], points[3*i+1], points[3*i+2]) * line.sourceScale;
                     for (int a = 0; a < 3; ++a)
                         if (points[3*i+a] < 0 || points[3*i+a] >= (1 << 20) || !std::isfinite(xyz[a]))
                             throw std::runtime_error("invalid scaled track coordinate");

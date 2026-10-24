@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -89,7 +90,16 @@ DetectorReport commitCandidates(objects::ObjectStore& db, objects::WriteTxn& txn
                                 const objects::util::ProgressCallback& progress = {});
 
 // --- Detectors ---
-struct PointCollectionPatchParams {
+// Opt-in metadata conversion: all working distances are reference-volume voxels.
+// Without volumeUuid, the existing explicit-scale APIs retain their behavior.
+// With volumeUuid, explicit scale multipliers must remain at their identity
+// defaults; metadata (plus optional per-UUID legacy declarations) is authoritative.
+struct CoordinateParams {
+    std::optional<std::string> volumeUuid;
+    std::map<std::string, std::string> legacyCoordinates; // UUID -> coordinate JSON
+};
+
+struct PointCollectionPatchParams : CoordinateParams {
     std::vector<std::string> collectionUuids, patchUuids;
     double tolerance = 2.5;       // working voxels, matching fit_spiral's default
     double pointScale = 1.0;      // source XYZ -> working XYZ
@@ -110,7 +120,7 @@ DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
     const PointCollectionPatchParams& params = {}, const std::atomic_bool* cancel = nullptr);
 
 // Patch overlap distances are in working voxels unless noted.
-struct PatchOverlapParams {
+struct PatchOverlapParams : CoordinateParams {
     std::vector<std::string> patchUuids;
     int workers = 0; // 0: auto, at most 8; positive: requested search concurrency
     objects::util::ProgressCallback progress; // optional; no terminal output from the library
@@ -151,7 +161,7 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
 
 // Fiber/track-to-patch strips have stripRowsEachSide rows at stripSpacing
 // on each side of the centerline. Distances are in working voxels.
-struct LinePatchParams {
+struct LinePatchParams : CoordinateParams {
     std::vector<std::string> patchUuids;
     objects::util::ProgressCallback progress; // optional; no terminal output from the library
     // Isotropic coordinate multipliers: source XYZ * scale = working XYZ.

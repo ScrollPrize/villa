@@ -7,6 +7,7 @@
 namespace vc::object_links::detail {
 struct LineData {
     std::string uuid;
+    double sourceScale = 1.0;
     std::vector<cv::Vec3d> line; // working XYZ, raw input order
     std::vector<double> arclength;
     std::vector<cv::Vec3d> controls; // fibers only

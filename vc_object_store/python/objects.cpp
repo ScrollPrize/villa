@@ -6,6 +6,7 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "vc_object_store/CtSheetNormal.hpp"
+#include "vc_object_store/objects/GeometryCoordinates.hpp"
 using namespace vc::python;
 namespace {
 nb::dict objectRevisionToPy(const vo::ObjectRevision& revision)
@@ -115,8 +116,19 @@ nb::dict detectorReportToPy(const vc::object_links::DetectorReport& rep)
     return d;
 }
 
+bool setCoordinateParameter(vc::object_links::CoordinateParams& p, const std::string& key, nb::handle value)
+{
+    if (key == "volume_uuid") p.volumeUuid = nb::cast<std::string>(value);
+    else if (key == "legacy_coordinates") {
+        for (auto item : nb::cast<nb::dict>(value))
+            p.legacyCoordinates[nb::cast<std::string>(item.first)] = jsonDumps(item.second);
+    } else return false;
+    return true;
+}
+
 bool setLinePatchParameter(vc::object_links::LinePatchParams& p, const std::string& key, nb::handle val)
 {
+    if (setCoordinateParameter(p, key, val)) return true;
     if (key == "patch_uuids") p.patchUuids = nb::cast<std::vector<std::string>>(val);
     else if (key == "patch_scale") p.patchScale = nb::cast<double>(val);
     else if (key == "ct_level") p.ctLevel = nb::cast<int>(val);
@@ -236,6 +248,26 @@ void bindMutations(nb::class_<T>& cls)
 
 NB_MODULE(_native, m)
 {
+    m.def("geometry_coordinates", [](const nb::dict& value) {
+        return jsonLoads(vo::geometryCoordinates(nlohmann::json::parse(jsonDumps(value))).dump());
+    }, nb::arg("coordinates"));
+    m.def("merge_geometry_coordinates", [](const nb::dict& a, const nb::dict& b) {
+        return jsonLoads(vo::mergeGeometryCoordinates(nlohmann::json::parse(jsonDumps(a)),
+            nlohmann::json::parse(jsonDumps(b))).dump());
+    }, nb::arg("a"), nb::arg("b"));
+    m.def("geometry_scale_to_volume", [](const nb::dict& metadata, const std::string& volume) {
+        return vo::geometryScaleToVolume(nlohmann::json::parse(jsonDumps(metadata)), volume);
+    }, nb::arg("metadata"), nb::arg("volume_uuid"));
+    m.def("resolve_geometry_coordinates", [](const nb::dict& metadata, const std::string& volume, const nb::dict& legacy) {
+        return jsonLoads(vo::resolveGeometryCoordinates(nlohmann::json::parse(jsonDumps(metadata)), volume,
+            nlohmann::json::parse(jsonDumps(legacy))).dump());
+    }, nb::arg("metadata"), nb::arg("volume_uuid"), nb::arg("legacy_coordinates") = nb::dict());
+    m.def("geometry_scale_to_frame", [](const nb::dict& metadata, const std::string& volume, double downsample, const nb::dict& legacy) {
+        return vo::geometryScaleToFrame(nlohmann::json::parse(jsonDumps(metadata)), volume, downsample,
+            nlohmann::json::parse(jsonDumps(legacy)));
+    }, nb::arg("metadata"), nb::arg("volume_uuid"), nb::arg("downsample_factor") = 1.0,
+       nb::arg("legacy_coordinates") = nb::dict());
+
     nb::class_<vc::CtSheetNormalSampler>(m, "CtSheetNormalSampler")
         .def(nb::init<const std::filesystem::path&, int, double>(),
              nb::arg("ct_volume"), nb::arg("level") = 0, nb::arg("working_to_ct_scale") = 1.0)
@@ -539,6 +571,7 @@ NB_MODULE(_native, m)
                 for (auto item : kwargs) {
                     const auto key = nb::cast<std::string>(item.first);
                     const nb::handle value = item.second;
+                    if (setCoordinateParameter(p, key, value)) continue;
                     if (key == "collection_uuids") p.collectionUuids = nb::cast<std::vector<std::string>>(value);
                     else if (key == "patch_uuids") p.patchUuids = nb::cast<std::vector<std::string>>(value);
                     else if (key == "tolerance") p.tolerance = nb::cast<double>(value);
@@ -566,6 +599,7 @@ NB_MODULE(_native, m)
                 for (auto item : kwargs) {
                     const std::string key = nb::cast<std::string>(item.first);
                     const nb::handle val = item.second;
+                    if (setCoordinateParameter(p, key, val)) continue;
                     if (key == "patch_uuids") p.patchUuids = nb::cast<std::vector<std::string>>(val);
                     else if (key == "workers") p.workers = nb::cast<int>(val);
                     else if (key == "tolerance") p.tolerance = nb::cast<double>(val);

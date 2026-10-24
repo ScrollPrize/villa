@@ -7,6 +7,71 @@
 #include <set>
 
 namespace vc::object_links::detail {
+void validateCoordinateParams(const CoordinateParams& params, double explicitScale)
+{
+    if (!std::isfinite(explicitScale) || explicitScale <= 0)
+        throw std::invalid_argument("coordinate scale must be finite and positive");
+    if (!params.volumeUuid && !params.legacyCoordinates.empty())
+        throw std::invalid_argument("legacy_coordinates requires volume_uuid");
+    if (params.volumeUuid) {
+        if (params.volumeUuid->empty()) throw std::invalid_argument("volume_uuid must be nonempty");
+        if (explicitScale != 1.0)
+            throw std::invalid_argument("explicit scales must be identity when volume_uuid is supplied");
+    }
+    for (const auto& [uuid, declaration] : params.legacyCoordinates) {
+        if (objects::util::canonicalUuid(uuid) != uuid)
+            throw std::invalid_argument("legacy_coordinates keys must be canonical UUIDs");
+        objects::geometryCoordinates(nlohmann::json::parse(declaration));
+    }
+}
+nlohmann::json coordinateProvenance(const objects::ObjectRecord& object, const CoordinateParams& params)
+{
+    if (!params.volumeUuid) return nlohmann::json::object();
+    const auto found = params.legacyCoordinates.find(object.uuid);
+    const auto legacy = found == params.legacyCoordinates.end() ? nlohmann::json::object()
+        : nlohmann::json::parse(found->second);
+    return {{"coordinates", objects::resolveGeometryCoordinates(nlohmann::json::parse(object.meta), *params.volumeUuid, legacy)},
+            {"legacy_declaration", legacy}};
+}
+std::map<std::string, double> coordinateScales(const std::vector<objects::ObjectRecord>& objects,
+    const CoordinateParams& params, double explicitScale)
+{
+    validateCoordinateParams(params, explicitScale);
+    std::map<std::string, double> result;
+    for (const auto& object : objects) {
+        try {
+            result[object.uuid] = params.volumeUuid
+                ? vc::objects::geometryScaleToFrame(coordinateProvenance(object, params), *params.volumeUuid)
+                : explicitScale;
+        } catch (const std::exception& e) {
+            throw std::invalid_argument(object.uuid + ": " + e.what());
+        }
+    }
+    return result;
+}
+std::shared_ptr<PatchGrid> scaledPatchSurface(const std::shared_ptr<PatchGrid>& source, double scale,
+    bool scaleParameterization)
+{
+    if (scale == 1.0) return source;
+    auto points = source->rawPointsPtr()->clone();
+    for (auto& point : points) {
+        if (point[0] == -1.0f) continue; // preserve invalid vertices verbatim
+        const cv::Vec3d scaled = cv::Vec3d(point) * scale;
+        point = cv::Vec3f(scaled);
+        for (float value : point.val)
+            if (!std::isfinite(value)) throw std::invalid_argument("scaled patch coordinate overflow");
+        if (point[0] == -1.0f) throw std::invalid_argument("scaled patch coordinate collides with invalid sentinel");
+    }
+    auto gridScale = source->scale();
+    if (scaleParameterization) {
+        for (auto& value : gridScale.val) {
+            value = float(double(value) / scale);
+            if (!std::isfinite(value) || value <= 0)
+                throw std::invalid_argument("scaled patch grid spacing is not representable");
+        }
+    }
+    return std::make_shared<PatchGrid>(points, gridScale);
+}
 std::vector<objects::ObjectRecord> StoredGeometry::select(const std::string& kind,
     const std::vector<std::string>& uuids)
 {

@@ -2,6 +2,7 @@
 #include "vc_object_store/object_links/ObjectLinks.hpp"
 #include "geometry/GeometrySnapshot.hpp"
 #include "spatial/PatchGrid.hpp"
+#include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include <map>
 #include <memory>
 
@@ -27,5 +28,12 @@ DetectorReport commitStoredCandidates(objects::ObjectStore& db, const StoredGeom
     objects::WriteTxn& txn, const std::string& detectorName, int detectorVersion,
     const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
     const StaleEdgeScope* staleScope, const objects::util::ProgressCallback& progress);
+// Preflight the complete selection before expensive work or any writes.
+void validateCoordinateParams(const CoordinateParams& params, double explicitScale = 1.0);
+std::map<std::string, double> coordinateScales(const std::vector<objects::ObjectRecord>& objects,
+    const CoordinateParams& params, double explicitScale = 1.0);
+nlohmann::json coordinateProvenance(const objects::ObjectRecord& object, const CoordinateParams& params);
+std::shared_ptr<PatchGrid> scaledPatchSurface(const std::shared_ptr<PatchGrid>& source, double scale,
+    bool scaleParameterization);
 std::shared_ptr<PatchGrid> patchSurface(const objects::detail::GeometrySnapshot& geometry);
 } // namespace vc::object_links::detail

@@ -82,6 +82,7 @@ struct LoadedPatch {
     std::string uuid;
     std::shared_ptr<PatchGrid> surface;
     const cv::Mat_<cv::Vec3f>* points = nullptr; // stable for this read-only detector run
+    nlohmann::json coordinateProvenance;
     cv::Vec2f scale = {1.0f, 1.0f};
     std::vector<SamplePoint> samples;                  // strided by sampleSpacing
     cv::Vec3f bboxLow, bboxHigh;
@@ -148,11 +149,12 @@ std::optional<cv::Vec3f> sampleXyz(const LoadedPatch& patch, Vec2 uv)
 }
 
 std::optional<LoadedPatch> loadPatch(detail::StoredGeometry& inputs, const objects::ObjectRecord& object, const PatchOverlapParams& params,
-                                     DetectorReport& report)
+                                     DetectorReport& report, double sourceScale)
 {
     LoadedPatch patch;
     try {
-        patch.surface = detail::patchSurface(inputs.load(object));
+        patch.surface = detail::scaledPatchSurface(detail::patchSurface(inputs.load(object)), sourceScale, params.volumeUuid.has_value());
+        patch.coordinateProvenance = detail::coordinateProvenance(object, params);
         patch.uuid = object.uuid;
         patch.scale = patch.surface->scale();
         if (!(patch.scale[0] > 0) || !(patch.scale[1] > 0)) {
@@ -648,6 +650,7 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
 
     detail::StoredGeometry inputs(db);
     const auto objects = inputs.select("patch", params.patchUuids);
+    const auto scales = detail::coordinateScales(objects, params);
 
     std::vector<LoadedPatch> patches;
     size_t loadedCount = 0;
@@ -658,7 +661,7 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
             return report;
         }
         PhaseTimer loadingTimer(profile.enabled ? &profile.loading : nullptr);
-        if (auto loaded = loadPatch(inputs, object, params, report))
+        if (auto loaded = loadPatch(inputs, object, params, report, scales.at(object.uuid)))
             patches.push_back(std::move(*loaded));
     }
     objects::util::reportProgress(progress, "loading patches", objects.size(), objects.size());
@@ -763,7 +766,16 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
                                    {"pose", {fit.pose.r00, fit.pose.r01, fit.pose.tx,
                                              fit.pose.r10, fit.pose.r11, fit.pose.ty}}};
             if (params.minOverlapFraction > 0.0) fitMeta["overlap_fraction"] = overlapFraction;
-            candidate.meta = nlohmann::json{{"fit", std::move(fitMeta)}}.dump();
+            auto metadata = nlohmann::json{{"fit", std::move(fitMeta)}, {"coordinate_frame", nullptr}};
+            if (params.volumeUuid) {
+                metadata["coordinate_frame"] = {{"volume_uuid", *params.volumeUuid},
+                    {"objects", {{seed.uuid, seed.coordinateProvenance}, {target.uuid, target.coordinateProvenance}}}};
+                metadata["fit"]["pose_units"] = "volume_voxels";
+                metadata["fit"]["pose_direction"] = "b_to_a";
+                metadata["fit"]["a_grid_scale"] = {seed.scale[0], seed.scale[1]};
+                metadata["fit"]["b_grid_scale"] = {target.scale[0], target.scale[1]};
+            }
+            candidate.meta = metadata.dump();
             candidates.push_back(std::move(candidate));
         }
         processedPairs += patches.size() - si - 1;

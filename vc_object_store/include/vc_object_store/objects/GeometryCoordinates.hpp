@@ -100,4 +100,33 @@ inline std::optional<double> geometryScaleToVolume(const CoordinateJson& metadat
     if (!std::isfinite(scale) || scale <= 0) throw std::invalid_argument("geometry coordinate conversion is not representable");
     return scale;
 }
+// Resolve an explicitly declared legacy frame without changing persistent metadata.
+// Known declarations may only be confirmed, never overridden.
+inline CoordinateJson resolveGeometryCoordinates(const CoordinateJson& metadata,
+    const std::string& volumeId, const CoordinateJson& legacy = CoordinateJson::object())
+{
+    if (volumeId.empty()) throw std::invalid_argument("target volume_uuid must be nonempty");
+    const auto coordinates = mergeGeometryCoordinates(
+        metadata.value("coordinates", CoordinateJson::object()), legacy);
+    if (coordinates["volume_uuid"].is_null() || coordinates["scale_factor"].is_null())
+        throw std::invalid_argument("unknown geometry coordinate frame");
+    if (coordinates["volume_uuid"] != volumeId)
+        throw std::invalid_argument("geometry volume_uuid does not match target volume");
+    return coordinates;
+}
+
+// Stored XYZ -> volume XYZ -> fitting XYZ. Keep the reciprocal conversion's
+// representability check even when a later downsampling might hide overflow.
+inline double geometryScaleToFrame(const CoordinateJson& metadata, const std::string& volumeId,
+    double downsampleFactor = 1.0, const CoordinateJson& legacy = CoordinateJson::object())
+{
+    if (!std::isfinite(downsampleFactor) || downsampleFactor <= 0)
+        throw std::invalid_argument("downsample factor must be finite and positive");
+    const auto coordinates = resolveGeometryCoordinates(metadata, volumeId, legacy);
+    const auto toVolume = geometryScaleToVolume(CoordinateJson{{"coordinates", coordinates}}, volumeId);
+    const double scale = *toVolume / downsampleFactor;
+    if (!std::isfinite(scale) || scale <= 0)
+        throw std::invalid_argument("geometry coordinate conversion is not representable");
+    return scale;
+}
 } // namespace vc::objects

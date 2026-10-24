@@ -15,6 +15,7 @@ std::optional<detail::LineData> loadFiber(detail::StoredGeometry& inputs,
         detail::LineData fiber;
         fiber.uuid = object.uuid;
         fiber.object = object;
+        fiber.sourceScale = scale;
         auto points = [&](const char* name, auto& output) {
             const auto xyz = geometry.values<double>(name);
             for (size_t i = 0; i < xyz.size(); i += 3) {
@@ -78,8 +79,9 @@ DetectorReport linkFibersToPatches(objects::ObjectStore& db, const std::filesyst
     detail::validateLinePatchParams(params, params.fiberScale);
     detail::StoredGeometry inputs(db);
     const auto fibers = inputs.select("fiber", params.fiberUuids);
+    const auto scales = detail::coordinateScales(fibers, params, params.fiberScale);
     auto load = [&](size_t index, DetectorReport& report) -> std::optional<detail::LineData> {
-        auto fiber = loadFiber(inputs, fibers[index], params.fiberScale, report);
+        auto fiber = loadFiber(inputs, fibers[index], scales.at(fibers[index].uuid), report);
         if (fiber && !params.cacheDirectory.empty()) {
             fiber->stripCacheFile = params.cacheDirectory / (fiber->uuid + ".cbor");
             fiber->rebuildStrip = params.rebuildStrips;

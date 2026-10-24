@@ -1,0 +1,241 @@
+"""Shared coordinate resolver and mixed-scale detector regression coverage."""
+import json
+
+import numpy as np
+import pytest
+
+from vc_object_store import (
+    Fiber, Track, geometry_coordinates, geometry_scale_to_frame, geometry_scale_to_volume,
+    merge_geometry_coordinates, resolve_geometry_coordinates,
+)
+from test_object_links import array, put
+
+
+VOLUME = "20260411134726"
+
+
+def frame(scale=1, volume=VOLUME):
+    return {"volume_uuid": volume, "scale_factor": scale}
+
+
+def patch(db, scale=1, size=33, offset=(0, 0, 20), hole=False):
+    y, x = np.mgrid[:size, :size]
+    xyz = (np.stack([x, y, np.zeros_like(x)], axis=-1) + offset) * scale
+    xyz = xyz.astype(np.float32)
+    if hole:
+        xyz[0, 0] = -1
+    return put(db, "patch", [array("points", xyz, "<f4")],
+               {"scale": [1 / scale, 1 / scale]}, meta={"coordinates": frame(scale)})[0]
+
+
+def collection(db, scale=1, points=((10, 10, 20),), **metadata):
+    return put(db, "point_collection", [
+        array("points", np.asarray(points) * scale, "<f8"),
+        array("point_ids", np.arange(len(points)) * 9 + 7, "<i8"),
+    ], meta={"coordinates": frame(scale), **metadata})[0]
+
+
+def test_shared_resolution_and_round_trip():
+    assert geometry_coordinates({}) == {"volume_uuid": None, "scale_factor": None}
+    assert merge_geometry_coordinates({"volume_uuid": VOLUME}, {"scale_factor": 2}) == frame(2)
+    assert geometry_scale_to_volume({}, VOLUME) is None
+    assert geometry_scale_to_volume({"coordinates": frame(volume="other")}, VOLUME) is None
+    for scale in (0.25, 1, 2, 8):
+        metadata = {"coordinates": frame(scale)}
+        for n in (1, 2, 8):
+            multiplier = geometry_scale_to_frame(metadata, VOLUME, n)
+            xyz = np.array([100., 200., 300.])
+            fitting = xyz * scale * multiplier
+            np.testing.assert_array_equal(fitting * n, xyz)
+            # Selected CT level at D=4; no additional coordinate conversion.
+            np.testing.assert_array_equal(fitting * n / 4, xyz / 4)
+    assert resolve_geometry_coordinates({}, VOLUME, frame(2)) == frame(2)
+    assert geometry_scale_to_frame({}, VOLUME, 4, frame(2)) == 0.125
+
+
+@pytest.mark.parametrize("metadata,legacy,reason", [
+    ({}, {}, "unknown"),
+    ({"coordinates": frame(volume="other")}, {}, "does not match"),
+    ({"coordinates": frame(2)}, frame(1), "conflict"),
+    ({"coordinates": frame()}, frame(volume="other"), "conflict"),
+    ({"coordinates": frame(0)}, {}, "positive"),
+    ({"coordinates": frame(-1)}, {}, "positive"),
+    ({"coordinates": frame(5e-324)}, {}, "representable"),
+    ({"coordinates": {"scale_factor": 1, "typo": 1}}, {}, "unknown geometry coordinate field"),
+])
+def test_invalid_frames(metadata, legacy, reason):
+    with pytest.raises(ValueError, match=reason):
+        geometry_scale_to_frame(metadata, VOLUME, legacy_coordinates=legacy)
+
+
+@pytest.mark.parametrize("n", [0, -1, float("inf"), float("nan")])
+def test_invalid_downsample(n):
+    with pytest.raises(ValueError, match="positive"):
+        geometry_scale_to_frame({"coordinates": frame()}, VOLUME, n)
+
+
+def test_underflow_and_exact_scale_conflicts():
+    with pytest.raises(ValueError, match="representable"):
+        geometry_scale_to_frame({"coordinates": frame(1e308)}, VOLUME, 1e308)
+    with pytest.raises(ValueError, match="conflict"):
+        merge_geometry_coordinates({"scale_factor": 2**53 + 1}, {"scale_factor": float(2**53)})
+
+
+def test_mixed_pcl_scales_selection_anchors_and_sentinels(db):
+    a = patch(db, 2, hole=True)
+    b = patch(db, 0.5, size=17)
+    first, second = collection(db, 4), collection(db, 0.25)
+    before = {uid: db.object(uid) for uid in (a, b, first, second)}
+    report = db.link_point_collections_to_patches(volume_uuid=VOLUME)
+    assert report["edges_created"] == 2
+    for uid, scale in ((first, 4), (second, 0.25)):
+        edge, = db.edges_of(uid)
+        assert {edge["a"], edge["b"]} == {a, uid}  # physical area wins across scales
+        anchor = edge["a_anchor"] if edge["a"] == uid else edge["b_anchor"]
+        other = edge["b_anchor"] if edge["a"] == uid else edge["a_anchor"]
+        assert anchor["position"] == (10 * scale, 10 * scale, 20 * scale)
+        assert other["position"] == (20, 20, 40)  # source patch coordinates
+        assert edge["meta"]["point_collection_patch"]["ij"] == [10, 10]
+        assert edge["meta"]["settings"]["point_scale"] == 1 / scale
+    assert db.link_point_collections_to_patches(volume_uuid=VOLUME)["edges_skipped_existing"] == 2
+    assert {uid: db.object(uid) for uid in before} == before
+    # The hole at grid (0,0) remains invalid after scaling (it must not become -0.5).
+    hole = collection(db, points=((-0.5, -0.5, -0.5),))
+    assert db.link_point_collections_to_patches(volume_uuid=VOLUME, collection_uuids=[hole],
+                                               patch_uuids=[a], tolerance=0.1)["edges_created"] == 0
+    assert len(db.edges_of(first)) == 1
+
+
+def test_legacy_provenance_and_preflight_no_writes(db):
+    a = patch(db, 2)
+    c = collection(db, 4)
+    db.set_meta(c, "coordinates", {})
+    before = db.journal_since()
+    with pytest.raises(ValueError, match="unknown"):
+        db.link_point_collections_to_patches(volume_uuid=VOLUME)
+    assert db.journal_since() == before
+    assert db.link_point_collections_to_patches(volume_uuid=VOLUME, legacy_coordinates={c: frame(4)})["edges_created"] == 1
+    edge, = db.edges_of(c)
+    assert edge["meta"]["coordinate_frame"]["objects"][c]["legacy_declaration"] == frame(4)
+    before = db.journal_since()
+    for options in ({"legacy_coordinates": {a: frame(3), c: frame(4)}}, {"point_scale": 0.5}):
+        with pytest.raises(ValueError, match="conflict|identity"):
+            db.link_point_collections_to_patches(volume_uuid=VOLUME, **options)
+        assert db.journal_since() == before
+    with pytest.raises(ValueError, match="requires volume_uuid"):
+        db.link_patch_overlaps(legacy_coordinates={a: frame()})
+
+
+def test_mixed_patch_overlap_parameterization_and_scope(db):
+    a, b, c = patch(db, 2), patch(db, 0.5), patch(db, 4)
+    report = db.link_patch_overlaps(volume_uuid=VOLUME)
+    assert report["edges_created"] == 3, report
+    for edge in db.edges_of(a):
+        fit = edge["meta"]["fit"]
+        np.testing.assert_allclose(fit["pose"], [1, 0, 0, 0, 1, 0], atol=1e-8)
+        assert fit["a_grid_scale"] == fit["b_grid_scale"] == [1, 1]
+        assert fit["pose_units"] == "volume_voxels"
+        assert fit["pose_direction"] == "b_to_a"
+    assert db.link_patch_overlaps(volume_uuid=VOLUME)["edges_skipped_existing"] == 3
+    assert db.link_patch_overlaps(volume_uuid=VOLUME, patch_uuids=[a, b], min_inliers=10000)["stale_removed"] == 1
+    assert len(db.edges_of(c)) == 2
+    db.set_meta(b, "coordinates", frame(volume="other"))
+    before = db.journal_since()
+    with pytest.raises(ValueError, match="does not match"):
+        db.link_patch_overlaps(volume_uuid=VOLUME)
+    assert db.journal_since() == before
+
+
+def fiber(db, scale):
+    xyz = np.array([[x, 96, 96] for x in range(72, 121)], dtype=float) * scale
+    uid = db.upsert_object({"kind": "fiber", "meta": {"coordinates": frame(scale)}})
+    db.put_geometry(uid, Fiber(xyz[[0, -1]].tolist(), xyz.tolist()))
+    return uid
+
+
+def test_fiber_frame_preflight_precedes_ct_open(db):
+    patch(db)
+    uid = fiber(db, 2)
+    db.set_meta(uid, "coordinates", {})
+    before = db.journal_since()
+    with pytest.raises(ValueError, match="unknown"):
+        db.link_fibers_to_patches("/missing-ct", volume_uuid=VOLUME)
+    with pytest.raises(ValueError, match="identity"):
+        db.link_fibers_to_patches("/missing-ct", volume_uuid=VOLUME, fiber_scale=2)
+    with pytest.raises(ValueError, match="working_to_base_scale"):
+        db.link_fibers_to_patches("/missing-ct", volume_uuid=VOLUME, working_to_base_scale=2)
+    assert db.journal_since() == before
+
+
+@pytest.mark.parametrize("kind", ["fiber", "track"])
+@pytest.mark.parametrize("ct_downsample", [1, 2])
+def test_mixed_lines_and_patch_with_ct(db, tmp_path, kind, ct_downsample):
+    # Uncompressed Zarr v2, no Python Zarr dependency. Full tensor support.
+    ct = tmp_path / "ct.zarr"
+    ct.mkdir()
+    shape = (192, 192, 192)
+    (ct / ".zarray").write_text(json.dumps(dict(zarr_format=2, shape=shape, chunks=shape,
+        dtype="|u1", compressor=None, fill_value=0, order="C", filters=None)))
+    z = np.arange(shape[0], dtype=float)
+    intensity = (200 * np.exp(-((z - 96) / 3)**2)).astype(np.uint8)
+    (ct / "0.0.0").write_bytes(np.broadcast_to(intensity[:, None, None], shape).tobytes())
+    a, b = patch(db, 2, 65, (64, 64, 96)), patch(db, 0.5, 65, (64, 64, 96))
+    def line(scale):
+        if kind == "fiber":
+            return fiber(db, scale)
+        uid = db.upsert_object({"kind": "track", "meta": {"coordinates": frame(scale)},
+            "track": {"dataset_ref": "fixture", "external_key": str(scale), "family": "horizontal"}})
+        db.put_geometry(uid, Track([[int(x * scale), int(96 * scale), int(96 * scale)] for x in range(72, 121)]))
+        return uid
+    second_scale = 0.25 if kind == "fiber" else 2
+    first, second = line(4), line(second_scale)
+    for uid, scale in ((a, 2), (b, 0.5), (first, 4), (second, second_scale)):
+        db.set_meta(uid, "coordinates", frame(scale / ct_downsample))
+    link = db.link_fibers_to_patches if kind == "fiber" else db.link_tracks_to_patches
+    options = dict(volume_uuid=VOLUME, strip_spacing=2, strip_march_step=1,
+                   anchor_contact=10, contact_gap=10, strip_margin=0, ct_to_base_scale=ct_downsample)
+    report = link(str(ct), **options)
+    assert report["edges_created"] == 4, report
+    for uid, scale in ((first, 4), (second, second_scale)):
+        assert len(db.edges_of(uid)) == 2
+        for edge in db.edges_of(uid):
+            anchor = edge["a_anchor"] if edge["a"] == uid else edge["b_anchor"]
+            assert anchor["position"] == (96 * scale, 96 * scale, 96 * scale)
+            assert anchor["points"][0]["index"] == [24]
+            assert edge["meta"][kind + "_patch"]["patch_grid"] == [32, 32]
+            assert edge["meta"]["settings"][kind + "_scale"] == ct_downsample / scale
+    assert link(str(ct), **options)["edges_skipped_existing"] == 4
+    # Explicit-scale callers still use their supplied multipliers.
+    explicit = {kind + "_uuids": [first], "patch_uuids": [a], kind + "_scale": ct_downsample / 4,
+                "patch_scale": ct_downsample / 2, **{k: v for k, v in options.items() if k != "volume_uuid"}}
+    assert link(str(ct), **explicit)["edges_updated"] == 1
+    assert len(db.edges_of(first)) == 2
+    selected = next(e for e in db.edges_of(first) if a in (e["a"], e["b"]))
+    assert selected["meta"]["coordinate_frame"] is None
+
+
+@pytest.mark.parametrize("value", [True, "1", float("nan"), float("inf"), -float("inf")])
+def test_non_numeric_or_nonfinite_scale_is_rejected(value):
+    with pytest.raises((ValueError, RuntimeError)):
+        geometry_coordinates(frame(value))
+
+
+def test_authoritative_metadata_and_partial_legacy_declaration():
+    metadata = {"coordinates": {"volume_uuid": VOLUME}, "source": {"coordinates": frame(99)}}
+    with pytest.raises(ValueError, match="unknown"):
+        geometry_scale_to_frame(metadata, VOLUME)
+    assert geometry_scale_to_frame(metadata, VOLUME, legacy_coordinates={"scale_factor": 2}) == 0.5
+    metadata["coordinates"] = frame(4)
+    assert geometry_scale_to_frame(metadata, VOLUME) == 0.25
+
+
+def test_scaled_patch_coordinate_overflow_never_writes(db):
+    patch(db)
+    c = collection(db)
+    # The double multiplier is representable, but converted patch float32 XYZ is not.
+    p = patch(db)
+    db.set_meta(p, "coordinates", frame(1e-40))
+    before = db.journal_since()
+    with pytest.raises(ValueError, match="overflow"):
+        db.link_point_collections_to_patches(volume_uuid=VOLUME, collection_uuids=[c])
+    assert db.journal_since() == before

@@ -687,6 +687,10 @@ void validateParams(const LinePatchParams& p)
 void validateLinePatchParams(const LinePatchParams& params, double sourceScale)
 {
     validateParams(params);
+    validateCoordinateParams(params, sourceScale);
+    validateCoordinateParams(params, params.patchScale);
+    if (params.volumeUuid && params.workingToBaseScale != 1.0)
+        throw std::invalid_argument("volume_uuid requires working_to_base_scale=1 (volume voxels)");
     if (!std::isfinite(sourceScale) || sourceScale <= 0)
         throw std::invalid_argument("graph links: invalid source coordinate scale");
 }
@@ -701,6 +705,10 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
     DetectorReport report;
     try {
         checkCancelled(cancel);
+        const auto objects = inputs.select("patch", params.patchUuids);
+        const auto patchScales = coordinateScales(objects, params, params.patchScale);
+        std::map<std::string, nlohmann::json> patchFrames;
+        for (const auto& object : objects) patchFrames[object.uuid] = coordinateProvenance(object, params);
         objects::util::reportProgress(params.progress, "opening normal source");
         const SheetNormalSource sampler(ctVolume, params);
         std::optional<nlohmann::json> stripSource;
@@ -711,7 +719,6 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
                 report.problems.push_back(std::string("fiber strip cache unavailable: ") + e.what());
             }
         }
-        const auto objects = inputs.select("patch", params.patchUuids);
         std::set<std::string> identities;
         auto unique = [&](const std::string& uuid) {
             if (!identities.insert(uuid).second)
@@ -731,19 +738,7 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
                 const auto scale = quad->scale();
                 if (!(scale[0] > 0) || !(scale[1] > 0) || !std::isfinite(scale[0]) || !std::isfinite(scale[1]))
                     throw std::runtime_error("invalid patch scale");
-                if (params.patchScale != 1.0) {
-
-                    auto points = quad->rawPointsPtr()->clone();
-                    for (auto& p : points) {
-                        if (!Surface::valid(p)) continue; // preserve holes, including the -1 sentinel
-                        const cv::Vec3d scaled = cv::Vec3d(p) * params.patchScale;
-                        p = cv::Vec3f(scaled);
-                        if (!Surface::valid(p)) throw std::runtime_error("scaled patch coordinate is invalid");
-                    }
-                    // Preserve grid coordinates/UV scale. Only world XYZ changes;
-                    // use a detached surface so mapped source TIFFs stay untouched.
-                    quad = std::make_shared<PatchGrid>(points, scale);
-                }
+                quad = scaledPatchSurface(quad, patchScales.at(object.uuid), params.volumeUuid.has_value());
                 surface = std::make_unique<Surface>(quad);
             } catch (const std::exception& e) {
                 report.problems.push_back(object.uuid + ": " + e.what() + ", skipped");
@@ -778,6 +773,7 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
             auto loaded = load(input, report);
             if (!loaded) continue;
             const auto& fiber = *loaded;
+            const double lineScale = fiber.sourceScale;
             unique(fiber.uuid);
             ++report.objectsConsidered;
             const auto item = std::string(tracks ? "track " : "fiber ") +
@@ -807,7 +803,7 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
                     proposals.push_back(std::move(proposal));
                 }
             try {
-                autoLink(fiber, proposals, patches, sampler, lineParams, sourceScale, stripSource, report, cancel);
+                autoLink(fiber, proposals, patches, sampler, lineParams, lineScale, stripSource, report, cancel);
             } catch (const std::exception& e) {
                 checkCancelled(cancel);
                 report.problems.push_back(fiber.uuid + ": " + e.what() + ", skipped");
@@ -841,8 +837,8 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
                 c.bUuid = patch.uuid;
                 c.kind = params.edgeKind;
                 c.aAnchor.points.push_back({tracks ? "points" : "line_points", {int64_t(median)}});
-                c.aAnchor.position = std::array<double, 3>{contact[0] / sourceScale,
-                    contact[1] / sourceScale, contact[2] / sourceScale};
+                c.aAnchor.position = std::array<double, 3>{contact[0] / lineScale,
+                    contact[1] / lineScale, contact[2] / lineScale};
                 PatchIndex::PointQuery q;
                 q.worldPoint = cv::Vec3f(contact);
                 q.tolerance = float(params.proximity);
@@ -871,6 +867,13 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
                     metadata["track_dataset_ref"] = fiber.object.track->datasetRef;
                     metadata["track_source_id"] = fiber.object.track->externalKey;
                 }
+                metadata["settings"][tracks ? "track_scale" : "fiber_scale"] = lineScale;
+                metadata["settings"]["patch_scale"] = patchScales.at(patch.uuid);
+                metadata["coordinate_frame"] = nullptr; // clear a previous metadata-mode declaration
+                if (params.volumeUuid)
+                    metadata["coordinate_frame"] = {{"volume_uuid", *params.volumeUuid},
+                        {"objects", {{fiber.uuid, coordinateProvenance(fiber.object, params)},
+                                     {patch.uuid, patchFrames.at(patch.uuid)}}}};
                 metadata["ct_volume"] = ctVolume.string();
                 c.meta = metadata.dump();
                 candidates.push_back(std::move(c));

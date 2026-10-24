@@ -31,11 +31,13 @@ struct Collection {
     objects::ObjectRecord object;
     std::vector<Point> points;
     bool absoluteWinding = false;
+    double sourceScale = 1.0;
 };
 struct Patch {
     objects::ObjectRecord object;
     std::shared_ptr<PatchGrid> surface;
     double area = 0;
+    double sourceScale = 1.0;
 };
 
 bool validPoint(const cv::Vec3f& p)
@@ -44,7 +46,7 @@ bool validPoint(const cv::Vec3f& p)
 }
 
 std::vector<Collection> loadCollections(detail::StoredGeometry& inputs,
-    const PointCollectionPatchParams& params, const std::atomic_bool* cancel)
+    const PointCollectionPatchParams& params, const std::map<std::string, double>& scales, const std::atomic_bool* cancel)
 {
     std::vector<Collection> result;
     for (const auto& object : inputs.select("point_collection", params.collectionUuids)) {
@@ -58,6 +60,7 @@ std::vector<Collection> loadCollections(detail::StoredGeometry& inputs,
             throw std::runtime_error("stored point annotations do not match geometry");
         Collection collection;
         collection.object = object;
+        collection.sourceScale = scales.at(object.uuid);
         collection.absoluteWinding = params.absoluteWinding.value_or(attributes.value("winding_is_absolute", false));
         std::set<int64_t> seen;
         for (size_t i = 0; i < ids.size(); ++i) {
@@ -68,7 +71,7 @@ std::vector<Collection> loadCollections(detail::StoredGeometry& inputs,
                 throw std::runtime_error("stored point IDs must be nonnegative and unique");
             parsed.source = {xyz[3*i], xyz[3*i+1], xyz[3*i+2]};
             for (int axis = 0; axis < 3; ++axis) {
-                parsed.working[axis] = float(parsed.source[axis] * params.pointScale);
+                parsed.working[axis] = float(parsed.source[axis] * collection.sourceScale);
                 if (!std::isfinite(parsed.working[axis])) throw std::runtime_error("non-finite scaled point");
             }
             parsed.winding = extras.is_null() || extras[i].is_null() ? Json() : extras[i].value("wind_a", Json());
@@ -83,7 +86,7 @@ std::vector<Collection> loadCollections(detail::StoredGeometry& inputs,
 }
 
 std::vector<Patch> loadPatches(detail::StoredGeometry& inputs,
-    const PointCollectionPatchParams& params, const std::atomic_bool* cancel)
+    const PointCollectionPatchParams& params, const std::map<std::string, double>& scales, const std::atomic_bool* cancel)
 {
     std::vector<Patch> patches;
     const auto objects = inputs.select("patch", params.patchUuids);
@@ -92,25 +95,18 @@ std::vector<Patch> loadPatches(detail::StoredGeometry& inputs,
         objects::util::reportProgress(params.progress, "loading PCL target patches", patches.size(), objects.size(), object.uuid);
         Patch patch;
         patch.object = object;
+        patch.sourceScale = scales.at(object.uuid);
         const auto original = detail::patchSurface(inputs.load(object));
-        const auto scale = original->scale();
+        patch.surface = detail::scaledPatchSurface(original, patch.sourceScale, params.volumeUuid.has_value());
         const auto& source = *original->rawPointsPtr();
-        auto working = source.clone();
-        for (int row = 0; row < source.rows; ++row) {
+        for (int row = 0; row + 1 < source.rows; ++row) {
             checkCancelled(cancel);
-            for (int col = 0; col < source.cols; ++col) {
-                if (row + 1 < source.rows && col + 1 < source.cols && validPoint(source(row, col)) &&
-                    validPoint(source(row + 1, col)) && validPoint(source(row, col + 1)) && validPoint(source(row + 1, col + 1)))
-                    patch.area += 1;
-                if (validPoint(source(row, col))) {
-                    working(row, col) *= params.patchScale;
-                    for (int axis = 0; axis < 3; ++axis)
-                        if (!std::isfinite(working(row, col)[axis])) throw std::runtime_error("scaled patch coordinate overflow");
-                }
-            }
+            for (int col = 0; col + 1 < source.cols; ++col)
+                if (validPoint(source(row, col)) && validPoint(source(row + 1, col)) &&
+                    validPoint(source(row, col + 1)) && validPoint(source(row + 1, col + 1))) patch.area += 1;
         }
+        const auto scale = patch.surface->scale();
         patch.area /= double(scale[0]) * scale[1];
-        patch.surface = std::make_shared<PatchGrid>(working, scale);
         patches.push_back(std::move(patch));
     }
     return patches;
@@ -152,8 +148,10 @@ DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
     checkCancelled(cancel);
     objects::util::reportProgress(params.progress, "loading point collections");
     detail::StoredGeometry inputs(db);
-    auto collections = loadCollections(inputs, params, cancel);
-    auto patches = loadPatches(inputs, params, cancel);
+    const auto pointScales = detail::coordinateScales(inputs.select("point_collection", params.collectionUuids), params, params.pointScale);
+    const auto patchScales = detail::coordinateScales(inputs.select("patch", params.patchUuids), params, params.patchScale);
+    auto collections = loadCollections(inputs, params, pointScales, cancel);
+    auto patches = loadPatches(inputs, params, patchScales, cancel);
     std::map<std::string, size_t> byName;
     std::unordered_map<PatchGrid*, size_t> bySurface;
     std::vector<PatchIndex::SurfacePtr> surfaces;
@@ -212,7 +210,7 @@ DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
             candidate.aUuid = collection.object.uuid; candidate.bUuid = patch.object.uuid;
             candidate.aAnchor.points.push_back({"point_ids", {point.id}});
             candidate.aAnchor.position = point.source;
-            candidate.bAnchor.position = projection(patch, row, col, params.patchScale);
+            candidate.bAnchor.position = projection(patch, row, col, patch.sourceScale);
             const auto& grid = *patch.surface->rawPointsPtr();
             const int r = std::clamp(int(std::floor(row)), 0, grid.rows - 2);
             const int c = std::clamp(int(std::floor(col)), 0, grid.cols - 2);
@@ -220,12 +218,19 @@ DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
             candidate.bAnchor.points = dr + dc <= 1
                 ? std::vector<objects::PointReference>{{"points", {r, c}}, {"points", {r, c+1}}, {"points", {r+1, c}}}
                 : std::vector<objects::PointReference>{{"points", {r+1, c+1}}, {"points", {r, c+1}}, {"points", {r+1, c}}};
-            candidate.meta = Json{{"anchor_index_space", "point_id"},
+            candidate.meta = Json{{"anchor_index_space", "point_id"}, {"coordinate_frame", nullptr},
                 {"point_collection_patch", {{"ij", {row, col}}, {"distance", hit.distance},
                     {"winding_annotation", point.winding}, {"winding_is_absolute", absolute},
                     {"selection", targets.empty() ? "largest_area" : "nearest_named_pair"}}},
-                {"settings", {{"tolerance", params.tolerance}, {"point_scale", params.pointScale}, {"patch_scale", params.patchScale},
+                {"settings", {{"tolerance", params.tolerance}, {"point_scale", collection.sourceScale}, {"patch_scale", patch.sourceScale},
                     {"window_points", params.windowPoints}, {"window_min_points", params.windowMinPoints}}}}.dump();
+            if (params.volumeUuid) {
+                auto metadata = Json::parse(candidate.meta);
+                metadata["coordinate_frame"] = {{"volume_uuid", *params.volumeUuid},
+                    {"objects", {{collection.object.uuid, detail::coordinateProvenance(collection.object, params)},
+                                 {patch.object.uuid, detail::coordinateProvenance(patch.object, params)}}}};
+                candidate.meta = metadata.dump();
+            }
             candidates.push_back(std::move(candidate));
         }
     }
