@@ -8325,7 +8325,7 @@ void CWindow::CreateWidgets(void)
             .colormapSelect = ui.overlayColormapSelect,
             .samplingMethodSelect = ui.overlayInterpolationSelect,
             .opacitySpin = ui.overlayOpacitySpin,
-            .thresholdSpin = ui.overlayThresholdSpin,
+            .intensityAsAlphaCheck = ui.overlayIntensityAsAlphaCheck,
             .maxDisplayedResolutionSpin = ui.overlayMaxDisplayedResolutionSpin,
             .compositeEnabledCheck = ui.chkOverlayComposite,
             .compositeMethodSelect = ui.cmbOverlayCompositeMethod,

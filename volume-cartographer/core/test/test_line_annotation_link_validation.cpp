@@ -15,6 +15,7 @@
 
 #include "LineAnnotationFiberLinkValidation.hpp"
 #include "LineAnnotationFiberLinks.hpp"
+#include "LineAnnotationGeneratedViews.hpp"
 #include "LineAnnotationStoredFiber.hpp"
 
 using vc3d::line_annotation::BranchLinkValidationIssue;
@@ -193,4 +194,134 @@ TEST_CASE("link validation: labels are independent of object identity")
         for (auto& branch : fiber.branches) branch.branchFileName.clear();
     }
     CHECK(collect(fibers).empty());
+}
+
+// --- the automatic-link mark (FiberBranchRef::autoLink, JSON "auto") ---
+
+namespace {
+
+struct SaveSnapshot {
+    StoredFiber fiber;
+};
+
+std::vector<SaveSnapshot> linkedPair(bool autoOnA, bool autoOnB, bool pending)
+{
+    auto a = makeFiber("a.json", 0.0, 0.0);
+    auto b = makeFiber("b.json", 0.0, 50.0);
+    a.id = 1;
+    b.id = 2;
+    link(a, 2, b, 2);
+    a.branches[0].pending = pending;
+    b.branches[0].pending = pending;
+    a.branches[0].autoLink = autoOnA;
+    b.branches[0].autoLink = autoOnB;
+    return {SaveSnapshot{a}, SaveSnapshot{b}};
+}
+
+}  // namespace
+
+TEST_CASE("auto link: the first snapshot visited propagates its state, like pending")
+{
+    {
+        // A (visited first) says auto, B does not: A's pass writes B's
+        // reciprocal, so when B is visited it already says auto and writes
+        // that back - the FIRST snapshot visited wins for the pair, exactly
+        // as `pending` behaves.
+        auto batch = linkedPair(true, false, true);
+        vc3d::line_annotation::canonicalizeFiberSaveSnapshots(batch);
+        CHECK(batch[0].fiber.branches[0].autoLink);
+        CHECK(batch[1].fiber.branches[0].autoLink);
+    }
+    {
+        // The reverse order: B (visited first) says NOT auto.
+        auto batch = linkedPair(true, false, true);
+        std::swap(batch[0], batch[1]);
+        vc3d::line_annotation::canonicalizeFiberSaveSnapshots(batch);
+        CHECK_FALSE(batch[0].fiber.branches[0].autoLink);
+        CHECK_FALSE(batch[1].fiber.branches[0].autoLink);
+    }
+    {
+        auto batch = linkedPair(true, true, true);
+        vc3d::line_annotation::canonicalizeFiberSaveSnapshots(batch);
+        CHECK(batch[0].fiber.branches[0].autoLink);
+        CHECK(batch[1].fiber.branches[0].autoLink);
+    }
+    {
+        // Approved: the mark cannot survive canonicalization.
+        auto batch = linkedPair(true, true, false);
+        vc3d::line_annotation::canonicalizeFiberSaveSnapshots(batch);
+        CHECK_FALSE(batch[0].fiber.branches[0].autoLink);
+        CHECK_FALSE(batch[1].fiber.branches[0].autoLink);
+    }
+}
+
+TEST_CASE("auto link: ref builders assemble a reciprocal pair under the invariant")
+{
+    using vc3d::line_annotation::makeBranchRef;
+    using vc3d::line_annotation::reciprocalBranchRef;
+    const cv::Vec3d pa(1.0, 2.0, 3.0);
+    const cv::Vec3d pb(4.0, 5.0, 6.0);
+    const cv::Vec3d da(1.0, 0.0, 0.0);
+    const cv::Vec3d db(0.0, 1.0, 0.0);
+    const FiberBranchRef ref = makeBranchRef(3, pa, da, 7, "b.json", 5, pb, db, true, false, true);
+    CHECK(ref.controlPointIndex == 3);
+    CHECK(ref.branchFiberId == 7);
+    CHECK(ref.branchControlPointIndex == 5);
+    CHECK(ref.branchFileName == "b.json");
+    CHECK(ref.controlPointPosition == pa);
+    CHECK(ref.branchControlPointPosition == pb);
+    CHECK(ref.controlPointDirection == da);
+    CHECK(ref.branchControlPointDirection == db);
+    CHECK(ref.pending);
+    CHECK_FALSE(ref.adjacent);
+    CHECK(ref.autoLink);
+    const FiberBranchRef back = reciprocalBranchRef(ref, 9, "a.json");
+    CHECK(back.controlPointIndex == 5);
+    CHECK(back.branchFiberId == 9);
+    CHECK(back.branchControlPointIndex == 3);
+    CHECK(back.branchFileName == "a.json");
+    CHECK(back.controlPointPosition == pb);
+    CHECK(back.branchControlPointPosition == pa);
+    CHECK(back.controlPointDirection == db);
+    CHECK(back.branchControlPointDirection == da);
+    CHECK(back.pending);
+    CHECK(back.autoLink);
+    // The invariant: no mark on an adjacent or on an approved link.
+    CHECK_FALSE(makeBranchRef(3, pa, da, 7, "b.json", 5, pb, db, true, true, true).autoLink);
+    CHECK_FALSE(makeBranchRef(3, pa, da, 7, "b.json", 5, pb, db, false, false, true).autoLink);
+}
+
+TEST_CASE("auto link: the marker rule is 'every pending link on the point is automatic'")
+{
+    using vc3d::line_annotation::autoPendingMarker;
+    using vc3d::line_annotation::automaticLinkMarker;
+    struct L {
+        bool pending;
+        bool autoLink;
+    };
+    CHECK(autoPendingMarker(std::vector<L>{{true, true}}));
+    CHECK(autoPendingMarker(std::vector<L>{{true, true}, {false, false}}));
+    CHECK_FALSE(autoPendingMarker(std::vector<L>{{true, true}, {true, false}}));
+    CHECK_FALSE(autoPendingMarker(std::vector<L>{{false, false}}));
+    CHECK_FALSE(autoPendingMarker(std::vector<L>{}));
+    CHECK(automaticLinkMarker(true, true));
+    CHECK_FALSE(automaticLinkMarker(true, false));
+    CHECK_FALSE(automaticLinkMarker(false, true));
+}
+
+
+TEST_CASE("auto link: combining two refs of one link keeps a human pending link human")
+{
+    using vc3d::line_annotation::combineReviewStates;
+    // automatic + human pending -> pending, not automatic
+    CHECK_FALSE(combineReviewStates(true, true, true, false, false).autoLink);
+    // automatic + approved -> pending, automatic
+    CHECK(combineReviewStates(true, true, false, false, false).autoLink);
+    CHECK(combineReviewStates(true, true, false, false, false).pending);
+    // automatic + automatic -> automatic
+    CHECK(combineReviewStates(true, true, true, true, false).autoLink);
+    // approved + approved -> approved
+    CHECK_FALSE(combineReviewStates(false, false, false, false, false).pending);
+    // adjacent never automatic
+    CHECK_FALSE(combineReviewStates(true, true, true, true, true).autoLink);
 }

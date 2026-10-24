@@ -4,6 +4,7 @@
 #include "VCSettings.hpp"
 #include "LineAnnotationController.hpp"
 #include "LineAnnotationDialog.hpp"
+#include "LineAnnotationGeneratedViews.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"
@@ -18,6 +19,7 @@
 #include <QGuiApplication>
 #include <QMouseEvent>
 #include <QPainter>
+#include <QPainterPath>
 #include <QPolygonF>
 #include <QScopeGuard>
 #include <QSettings>
@@ -27,6 +29,7 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <bit>
+#include <functional>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -138,6 +141,63 @@ QColor groupColor(uint64_t id)
     const int value = 255 - static_cast<int>((id / 1080ULL) % 3ULL) * 20;
     return QColor::fromHsv(hue, saturation, value);
 }
+// The look of one linked control point, from every link on it, by the Line
+// Annotation views' marker rule: pending wins, automatic only while every
+// pending link on the point is automatic, the same-H/V warning of the winning
+// state, a triangle for any adjacent link.
+struct LinkMark {
+    bool linked = false;
+    bool pending = false;
+    bool humanPending = false;
+    bool sameHvPending = false;
+    bool sameHvApproved = false;
+    bool adjacent = false;
+    void add(const vc::objects::EdgeRecord& edge, bool sameHv)
+    {
+        const auto meta = Json::parse(edge.meta);
+        const bool linkPending = edge.approvalState != "approved";
+        const bool linkAdjacent = meta.value("adjacent", false);
+        const bool automatic = linkPending && !linkAdjacent && meta.value("auto", false);
+        linked = true;
+        pending = pending || linkPending;
+        humanPending = humanPending || (linkPending && !automatic);
+        adjacent = adjacent || linkAdjacent;
+        if (sameHv) (linkPending ? sameHvPending : sameHvApproved) = true;
+    }
+    bool automatic() const { return pending && !humanPending; }
+    bool sameHv() const { return pending ? sameHvPending : sameHvApproved; }
+};
+// Whether a link joins two fibers of the same known H/V family.
+std::function<bool(const vc::objects::EdgeRecord&)> sameFamilyTest(
+    const vc::objects::ObjectStore& db, const vc::objects::ReadTxn& txn,
+    const std::vector<vc::objects::EdgeRecord>& edges)
+{
+    vc::objects::ObjectSelection selection;
+    for (const auto& edge : edges) {
+        selection.uuids.push_back(edge.aUuid);
+        selection.uuids.push_back(edge.bUuid);
+    }
+    std::map<std::string, std::string> families;
+    if (!selection.uuids.empty())
+        for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{"fiber"}))
+            if (object.fiber && !object.fiber->family.empty()) families[object.uuid] = object.fiber->family;
+    return [families = std::move(families)](const vc::objects::EdgeRecord& edge) {
+        const auto a = families.find(edge.aUuid), b = families.find(edge.bUuid);
+        return a != families.end() && b != families.end() && a->second == b->second;
+    };
+}
+ViewerOverlayControllerBase::OverlayStyle linkMarkStyle(const LinkMark& mark, float opacity)
+{
+    const auto rgb = vc3d::line_annotation::linkStateRgb(mark.pending, mark.sameHv(), mark.automatic());
+    ViewerOverlayControllerBase::OverlayStyle style;
+    style.penColor = QColor(rgb.r, rgb.g, rgb.b, 245);
+    style.brushColor = QColor(rgb.r, rgb.g, rgb.b, 175);
+    style.penColor.setAlphaF(style.penColor.alphaF() * opacity);
+    style.brushColor.setAlphaF(style.brushColor.alphaF() * opacity);
+    style.penWidth = 2.0;
+    style.z = 95;
+    return style;
+}
 struct SelectedFiber {
     FiberCollectionController::CatalogRow row;
     vc::objects::PinnedObject pin;
@@ -155,7 +215,7 @@ struct RegionResult {
     std::vector<Control> controls;
     struct Ring {
         Point position;
-        bool pending = false;
+        LinkMark mark;
     };
     std::vector<Ring> rings;
     // Visible fiber -> smallest UUID of its linked component.
@@ -165,8 +225,8 @@ struct ChainResult {
     struct Chain {
         std::string uuid;
         std::vector<cv::Vec3f> points;
-        // Per control point: 0 none, 1 pending link, 2 approved link.
-        std::vector<uint8_t> linkStates;
+        // Per control point (unlinked when !linked).
+        std::vector<LinkMark> linkMarks;
     };
     std::vector<Chain> chains;
     std::map<std::string, std::string> linkGroups;
@@ -245,7 +305,7 @@ struct FiberCollectionController::View {
     struct Chain {
         uint64_t fiber = 0;
         std::vector<cv::Vec3f> points;
-        std::vector<uint8_t> linkStates;
+        std::vector<LinkMark> linkMarks;
     };
     std::vector<Chain> chains;
     std::optional<std::array<double, 6>> chainBox;
@@ -808,8 +868,12 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
                 edges.endpointUuids.emplace();
                 for (const auto& [uuid, fiber] : drawn) edges.endpointUuids->push_back(uuid);
                 std::set<std::string> linkedUuids;
-                for (const auto& edge : db.selectEdges(txn, edges)) {
-                    const bool pending = edge.approvalState != "approved";
+                const auto links = db.selectEdges(txn, edges);
+                const auto sameFamily = sameFamilyTest(db, txn, links);
+                // One mark per linked control point, over every link on it.
+                std::map<std::pair<std::string, Point>, LinkMark> marks;
+                for (const auto& edge : links) {
+                    const bool sameHv = sameFamily(edge);
                     for (const auto& [endpoint, anchor] : {std::pair{edge.aUuid, edge.aAnchor}, std::pair{edge.bUuid, edge.bAnchor}}) {
                         const auto factor = factors.find(endpoint);
                         if (factor == factors.end()) continue;
@@ -817,9 +881,10 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
                         if (!anchor.position) continue;
                         Point position{(*anchor.position)[0], (*anchor.position)[1], (*anchor.position)[2]};
                         for (auto& coordinate : position) coordinate *= factor->second;
-                        result.rings.push_back({position, pending});
+                        marks[{endpoint, position}].add(edge, sameHv);
                     }
                 }
+                for (const auto& [key, mark] : marks) result.rings.push_back({key.second, mark});
                 std::set<std::string> drawnUuids;
                 for (const auto& [uuid, fiber] : drawn) drawnUuids.insert(uuid);
                 result.linkGroups = linkGroupsOf(db, txn, linkedUuids, drawnUuids, cancelled);
@@ -866,6 +931,22 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
             }
             refreshViewer(viewer);
         });
+}
+// A linked control point: a circle, or a triangle for an adjacent link.
+void FiberCollectionController::addLinkMark(OverlayBuilder& builder, const QPointF& center,
+                                            const OverlayStyle& style, bool adjacent)
+{
+    constexpr qreal radius = 6.25;
+    if (!adjacent) {
+        builder.addPoint(center, radius, style);
+        return;
+    }
+    QPainterPath triangle;
+    triangle.moveTo(center.x(), center.y() - radius);
+    triangle.lineTo(center.x() + radius * 0.8660254, center.y() + radius * 0.5);
+    triangle.lineTo(center.x() - radius * 0.8660254, center.y() + radius * 0.5);
+    triangle.closeSubpath();
+    builder.addPainterPath(triangle, style);
 }
 void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder)
 {
@@ -1036,15 +1117,9 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
         v.controlHits.push_back({scene, control.fiber, control.index});
     }
     if (options_.showLinked) {
-        // Colors match the Line Annotation GUI's branch control-point markers.
         for (const auto& ring : v.rings) {
             if (!inside(current->project(ring.position), current->local)) continue;
-            OverlayStyle style;
-            style.penColor = ring.pending ? QColor(80, 150, 255, 245) : QColor(210, 95, 255, 245);
-            style.brushColor = ring.pending ? QColor(80, 150, 255, 175) : QColor(210, 95, 255, 175);
-            style.penWidth = 2.0;
-            style.z = 95;
-            builder.addPoint(viewer->volumeToScene(cvpoint(ring.position, nativeToViewer_)), 6.25, style);
+            addLinkMark(builder, viewer->volumeToScene(cvpoint(ring.position, nativeToViewer_)), linkMarkStyle(ring.mark, 1.0f), ring.mark.adjacent);
         }
     }
     const QString count = options_.maxDisplayed
@@ -1121,7 +1196,7 @@ void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const st
                         for (size_t byte = 0; byte < 8; ++byte) bits |= uint64_t(ids.data[row * 8 + byte]) << (8 * byte);
                         index.second[std::bit_cast<int64_t>(bits)] = size_t(row - ids.offsets[i]);
                     }
-                    chain.linkStates.assign(chain.points.size(), 0);
+                    chain.linkMarks.assign(chain.points.size(), LinkMark{});
                     result.chains.push_back(std::move(chain));
                 }
                 if (!linked) return;
@@ -1129,20 +1204,20 @@ void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const st
                 edges.kind = "fiber_branch";
                 edges.endpointUuids = uuids;
                 std::set<std::string> linkedUuids;
-                for (const auto& edge : db.selectEdges(txn, edges)) {
-                    const bool pending = edge.approvalState != "approved";
+                const auto links = db.selectEdges(txn, edges);
+                const auto sameFamily = sameFamilyTest(db, txn, links);
+                for (const auto& edge : links) {
+                    const bool sameHv = sameFamily(edge);
                     for (const auto& [endpoint, anchor] : {std::pair{edge.aUuid, edge.aAnchor}, std::pair{edge.bUuid, edge.bAnchor}}) {
                         const auto chain = controlIndex.find(endpoint);
                         if (chain == controlIndex.end()) continue;
                         linkedUuids.insert(endpoint);
-                        auto& states = result.chains[chain->second.first].linkStates;
+                        auto& marks = result.chains[chain->second.first].linkMarks;
                         for (const auto& reference : anchor.points) {
                             if (reference.array != "control_point_ids" || reference.index.empty()) continue;
                             const auto control = chain->second.second.find(reference.index.front());
                             if (control == chain->second.second.end()) continue;
-                            // Pending wins, matching the annotation views' marker precedence.
-                            auto& state = states[control->second];
-                            state = pending ? 1 : (state == 0 ? 2 : state);
+                            marks[control->second].add(edge, sameHv);
                         }
                     }
                 }
@@ -1165,7 +1240,7 @@ void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const st
             if (result.error.isEmpty()) {
                 v.chains.clear();
                 for (auto& chain : result.value.chains)
-                    v.chains.push_back({annotations_->fiberIdForUuid(chain.uuid), std::move(chain.points), std::move(chain.linkStates)});
+                    v.chains.push_back({annotations_->fiberIdForUuid(chain.uuid), std::move(chain.points), std::move(chain.linkMarks)});
                 v.linkGroups.clear();
                 for (const auto& [uuid, group] : result.value.linkGroups)
                     v.linkGroups[annotations_->fiberIdForUuid(uuid)] = annotations_->fiberIdForUuid(group);
@@ -1189,7 +1264,7 @@ void FiberCollectionController::collectChainPrimitives(VolumeViewerBase* viewer,
     v.dirty = false;
     struct Ring {
         QPointF position;
-        bool pending;
+        LinkMark mark;
         float opacity;
     };
     std::vector<Ring> rings;
@@ -1210,22 +1285,13 @@ void FiberCollectionController::collectChainPrimitives(VolumeViewerBase* viewer,
             if (opacity <= 0.0f) continue;
             const size_t source = filtered.sourceIndices[i];
             v.controlHits.push_back({filtered.scenePoints[i], chain.fiber, int(source)});
-            if (options_.showLinked && source < chain.linkStates.size() && chain.linkStates[source])
-                rings.push_back({filtered.scenePoints[i], chain.linkStates[source] == 1, opacity});
+            if (options_.showLinked && source < chain.linkMarks.size() && chain.linkMarks[source].linked)
+                rings.push_back({filtered.scenePoints[i], chain.linkMarks[source], opacity});
         }
     }
-    // Rings paint after every chain; colors match the Line Annotation GUI's
-    // branch control-point markers.
-    for (const auto& ring : rings) {
-        OverlayStyle style;
-        style.penColor = ring.pending ? QColor(80, 150, 255, 245) : QColor(210, 95, 255, 245);
-        style.brushColor = ring.pending ? QColor(80, 150, 255, 175) : QColor(210, 95, 255, 175);
-        style.penColor.setAlphaF(style.penColor.alphaF() * ring.opacity);
-        style.brushColor.setAlphaF(style.brushColor.alphaF() * ring.opacity);
-        style.penWidth = 2.0;
-        style.z = 95;
-        builder.addPoint(ring.position, 6.25, style);
-    }
+    // Rings paint after every chain.
+    for (const auto& ring : rings)
+        addLinkMark(builder, ring.position, linkMarkStyle(ring.mark, ring.opacity), ring.mark.adjacent);
 }
 std::optional<FiberCollectionController::ControlPointHit> FiberCollectionController::hitTestControlPoint(
     VolumeViewerBase* viewer, const QPointF& scenePoint, qreal maxDistancePx) const

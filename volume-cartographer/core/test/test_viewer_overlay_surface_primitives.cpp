@@ -154,7 +154,7 @@ public:
     void setOverlayOpacity(float) override {}
     void setOverlayColormap(const std::string&) override {}
     void setOverlaySamplingMethod(vc::Sampling) override {}
-    void setOverlayThreshold(float) override {}
+    void setOverlayIntensityAsAlpha(bool) override {}
     void setOverlayWindow(float, float) override {}
     void setOverlayMaxDisplayedResolution(int) override {}
     void setOverlayComposite(const OverlayCompositeSettings&) override {}

@@ -1,4 +1,7 @@
 #include "vc/fiber_tracer/FiberReplayVisualization.hpp"
+#include "vc/core/util/AtomicFile.hpp"
+#include <iomanip>
+#include <sstream>
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfaceTexture.hpp"
@@ -954,6 +957,258 @@ std::vector<BuiltLineViewComponent> buildLineViewComponents(
     return output;
 }
 
+nlohmann::json pointsJson(const std::vector<cv::Vec3d>& points)
+{
+    nlohmann::json result = nlohmann::json::array();
+    for (const auto& point : points)
+        result.push_back(pointJson(point));
+    return result;
+}
+
+bool sameThresholdMeasurement(
+    const FiberReplayThresholdMeasurement& left,
+    const FiberReplayThresholdMeasurement& right)
+{
+    const auto sameOptional = [](const auto& first, const auto& second) {
+        return first.has_value() == second.has_value() &&
+            (!first.has_value() || nearlyEqual(*first, *second));
+    };
+    return nearlyEqual(
+               left.euclideanErrorBaseVoxels,
+               right.euclideanErrorBaseVoxels) &&
+        sameOptional(
+            left.normalErrorBaseVoxels,
+            right.normalErrorBaseVoxels) &&
+        sameOptional(
+            left.tangentialErrorBaseVoxels,
+            right.tangentialErrorBaseVoxels) &&
+        nearlyEqual(
+            left.thresholdErrorBaseVoxels,
+            right.thresholdErrorBaseVoxels) &&
+        nearlyEqual(left.thresholdErrorRatio, right.thresholdErrorRatio) &&
+        left.localNormalValid == right.localNormalValid;
+}
+
+void validateGreedyThresholdData(
+    const FiberReplayTraceResult& replay,
+    double normalThresholdBaseVoxels)
+{
+    for (const auto& segment : replay.segments) {
+        for (const auto& match : segment.matches) {
+            if (match.tracePointIndex >= segment.tracePointsBase.size()) {
+                throw std::invalid_argument(
+                    "greedy replay threshold match index is invalid");
+            }
+            validateFiberReplayThresholdMeasurement(
+                match.thresholdMeasurement,
+                normalThresholdBaseVoxels);
+            if (!nearlyEqual(
+                    cv::norm(
+                        segment.tracePointsBase[match.tracePointIndex] -
+                        match.matchedReferencePointBase),
+                    match.thresholdMeasurement.euclideanErrorBaseVoxels)) {
+                throw std::invalid_argument(
+                    "greedy replay threshold Euclidean error differs from geometry");
+            }
+        }
+    }
+    for (const auto& failure : replay.failures) {
+        if (failure.thresholdMeasurement.has_value()) {
+            validateFiberReplayThresholdMeasurement(
+                *failure.thresholdMeasurement,
+                normalThresholdBaseVoxels);
+        }
+        if (failure.reason != "distance_above_threshold")
+            continue;
+        if (!failure.thresholdMeasurement.has_value() ||
+            !failure.segmentPointIndex.has_value() ||
+            failure.segmentIndex >= replay.segments.size()) {
+            throw std::invalid_argument(
+                "greedy replay distance failure lacks threshold diagnostics");
+        }
+        const auto& matches = replay.segments[failure.segmentIndex].matches;
+        const auto found = std::find_if(
+            matches.begin(), matches.end(), [&](const auto& match) {
+                return match.tracePointIndex == *failure.segmentPointIndex;
+            });
+        if (found == matches.end() ||
+            !sameThresholdMeasurement(
+                found->thresholdMeasurement,
+                *failure.thresholdMeasurement)) {
+            throw std::invalid_argument(
+                "greedy replay distance failure differs from its terminal match");
+        }
+    }
+}
+
+void validateNativeReplayStructure(const FiberReplayTraceResult& replay)
+{
+    const double begin = replay.referenceBeginArcBase;
+    const double end = replay.referenceEndArcBase;
+    const auto inInterval = [](double v, double lo, double hi) {
+        return std::isfinite(v) && v >= lo - kEpsilon && v <= hi + kEpsilon;
+    };
+    if (!std::isfinite(begin) || begin < 0 || !std::isfinite(end) || end <= begin ||
+        !inInterval(replay.completedReferenceArcBase, begin, end))
+        throw std::invalid_argument("invalid native replay interval/progress");
+    double previousEnd = begin;
+    double previousFilteredEnd = begin;
+    for (const auto& stop : replay.filteredStops) {
+        if (!inInterval(stop[0], previousFilteredEnd, end) ||
+            !inInterval(stop[1], stop[0], end) || !inInterval(stop[2], stop[1], end))
+            throw std::invalid_argument("invalid filtered replay interval");
+        previousFilteredEnd = stop[2];
+    }
+    for (const auto& segment : replay.segments) {
+        if (!inInterval(segment.startReferenceArcBase, previousEnd, end) ||
+            !inInterval(segment.endReferenceArcBase, segment.startReferenceArcBase, end) ||
+            segment.endReferenceArcBase > replay.completedReferenceArcBase + kEpsilon ||
+            (replay.graphGeometry && segment.tracePointsBase.empty() ? !segment.matches.empty() :
+                segment.tracePointsBase.size() != segment.matches.size() + 1) ||
+            (!(replay.graphGeometry && segment.cumulativeLosses.empty()) && segment.cumulativeLosses.size() != segment.tracePointsBase.size()))
+            throw std::invalid_argument("invalid native replay segment interval/geometry");
+        for (const auto& p : segment.tracePointsBase)
+            for (double value : p.val)
+                if (!std::isfinite(value)) throw std::invalid_argument("nonfinite replay point");
+        for (double loss : segment.cumulativeLosses)
+            if (!std::isfinite(loss)) throw std::invalid_argument("nonfinite replay loss");
+        double previousArc = segment.startReferenceArcBase;
+        for (size_t i = 0; i < segment.matches.size(); ++i) {
+            const auto& match = segment.matches[i];
+            if (match.tracePointIndex != i + 1 ||
+                !inInterval(match.searchBeginArcBase, previousArc, previousArc) ||
+                !inInterval(match.searchEndArcBase, match.searchBeginArcBase, end) ||
+                !inInterval(match.predictedReferenceArcBase, match.searchBeginArcBase, match.searchEndArcBase) ||
+                !inInterval(match.matchedReferenceArcBase, match.searchBeginArcBase, match.searchEndArcBase))
+                throw std::invalid_argument("invalid native replay match interval/index");
+            for (double value : match.matchedReferencePointBase.val)
+                if (!std::isfinite(value)) throw std::invalid_argument("nonfinite matched point");
+            previousArc = match.matchedReferenceArcBase;
+        }
+        if (!inInterval(previousArc, segment.startReferenceArcBase, segment.endReferenceArcBase))
+            throw std::invalid_argument("native replay match exceeds segment end");
+        previousEnd = segment.endReferenceArcBase;
+    }
+    for (const auto& failure : replay.failures) {
+        if (failure.segmentIndex >= replay.segments.size())
+            throw std::invalid_argument("invalid native replay failure segment index");
+        const auto& segment = replay.segments[failure.segmentIndex];
+        if (!inInterval(failure.referenceArcBase, segment.startReferenceArcBase, segment.endReferenceArcBase) ||
+            failure.reason != segment.terminationReason ||
+            (failure.segmentPointIndex && *failure.segmentPointIndex >= segment.tracePointsBase.size()))
+            throw std::invalid_argument("invalid native replay failure segment association");
+    }
+}
+
+std::vector<std::vector<cv::Vec3d>> greedySegments(const FiberReplayTraceResult& replay)
+{
+    std::vector<std::vector<cv::Vec3d>> result;
+    result.reserve(replay.segments.size());
+    for (const auto& segment : replay.segments)
+        result.push_back(segment.tracePointsBase);
+    return result;
+}
+
+nlohmann::json greedyReplayJson(
+    const FiberReplayTraceResult& replay,
+    double normalThresholdBaseVoxels)
+{
+    nlohmann::json root = {
+        {"format", "vc_greedy_fiber_replay"},
+        {"filtered_stops", replay.filteredStops},
+        {"reverse_checks", replay.reverseChecks},
+        {"version", 2},
+        {"reference_begin_arc_base", replay.referenceBeginArcBase},
+        {"reference_end_arc_base", replay.referenceEndArcBase},
+        {"completed_reference_arc_base", replay.completedReferenceArcBase},
+        {"threshold", fiberReplayThresholdDescriptorJson(
+             normalThresholdBaseVoxels, replay.tangentialThresholdFactor)},
+        {"segments", nlohmann::json::array()},
+        {"failures", nlohmann::json::array()},
+    };
+    for (const auto& segment : replay.segments) {
+        nlohmann::json matches = nlohmann::json::array();
+        for (const auto& match : segment.matches) {
+            validateFiberReplayThresholdMeasurement(
+                match.thresholdMeasurement,
+                normalThresholdBaseVoxels);
+            auto matchJson = fiberReplayThresholdMeasurementJson(
+                match.thresholdMeasurement);
+            matchJson.update({
+                {"trace_point_index", match.tracePointIndex},
+                {"predicted_reference_arc_base", match.predictedReferenceArcBase},
+                {"matched_reference_arc_base", match.matchedReferenceArcBase},
+                {"matched_reference_point_base_xyz", pointJson(match.matchedReferencePointBase)},
+                {"search_begin_arc_base", match.searchBeginArcBase},
+                {"search_end_arc_base", match.searchEndArcBase},
+            });
+            matches.push_back(std::move(matchJson));
+        }
+        root["segments"].push_back({
+            {"start_reference_arc_base", segment.startReferenceArcBase},
+            {"end_reference_arc_base", segment.endReferenceArcBase},
+            {"termination_reason", segment.terminationReason},
+            {"trace_points_base_xyz", pointsJson(segment.tracePointsBase)},
+            {"trace_cumulative_losses", segment.cumulativeLosses},
+            {"matches", std::move(matches)},
+        });
+        if (segment.filteredDistanceFailure)
+            root["segments"].back()["filtered_distance_failure_xyz_arc"] = *segment.filteredDistanceFailure;
+    }
+    for (const auto& failure : replay.failures)
+        root["failures"].push_back(failureJson(
+            failure, normalThresholdBaseVoxels));
+    return root;
+}
+
+std::string lineObj(const char* header, const std::vector<cv::Vec3d>& points, bool pointRecord = false)
+{
+    std::ostringstream output;
+    output << header << '\n' << std::setprecision(17);
+    for (const auto& point : points)
+        output << "v " << point[0] << ' ' << point[1] << ' ' << point[2] << '\n';
+    if (pointRecord) {
+        if (points.size() != 1)
+            throw std::invalid_argument("replay point OBJ requires exactly one point");
+        output << "p 1\n";
+    } else if (!points.empty()) {
+        output << "l";
+        if (points.size() == 1) {
+            output << " 1 1";
+        } else {
+            for (size_t index = 0; index < points.size(); ++index)
+                output << ' ' << index + 1;
+        }
+        output << '\n';
+    }
+    return output.str();
+}
+
+std::string segmentedLineObj(const char* header, const std::vector<std::vector<cv::Vec3d>>& segments)
+{
+    std::ostringstream output;
+    output << header << '\n' << std::setprecision(17);
+    size_t offset = 0;
+    for (size_t segmentIndex = 0; segmentIndex < segments.size(); ++segmentIndex) {
+        const auto& points = segments[segmentIndex];
+        if (points.empty())
+            continue;
+        output << "g segment_" << segmentIndex << '\n';
+        for (const auto& point : points)
+            output << "v " << point[0] << ' ' << point[1] << ' ' << point[2] << '\n';
+        output << "l";
+        if (points.size() == 1) {
+            output << ' ' << offset + 1 << ' ' << offset + 1;
+        } else {
+            for (size_t index = 0; index < points.size(); ++index)
+                output << ' ' << offset + index + 1;
+        }
+        output << '\n';
+        offset += points.size();
+    }
+    return output.str();
+}
+
 }  // namespace
 FiberReplayStripTextureSource validateFiberReplayStripCtVolume(
     ::Volume& volume,
@@ -1678,5 +1933,143 @@ FiberReplayOverview composeFiberReplayOverviewForTesting(
 }
 }  // namespace testing
 #endif
+
+nlohmann::json fiberReplayTraceJson(const FiberReplayTraceResult& replay, double normalThresholdBaseVoxels)
+{
+    validateNativeReplayStructure(replay);
+    validateReplayFailures(replay, "native");
+    validateGreedyThresholdData(replay, normalThresholdBaseVoxels);
+    auto result = greedyReplayJson(replay, normalThresholdBaseVoxels);
+    result["format"] = "vc_native_fiber_replay";
+    result["version"] = 1;
+    if (replay.graphGeometry)
+        result["geometry_backend"] = "fiberlet";
+    else if (!replay.geometryBackend.empty())
+        result["geometry_backend"] = replay.geometryBackend;
+    return result;
+}
+
+FiberReplayTraceResult fiberReplayTraceFromJson(const nlohmann::json& document)
+{
+    if (document.at("format") != "vc_native_fiber_replay" || document.at("version") != 1)
+        throw std::invalid_argument("unsupported native replay format/version");
+    const double threshold = document.at("threshold").at("normal_radius_base_voxels");
+    const double factor = document.at("threshold").value("tangential_factor", 4.0);
+    if (document.at("threshold") != fiberReplayThresholdDescriptorJson(threshold, factor))
+        throw std::invalid_argument("unsupported native replay threshold descriptor");
+    const auto point = [](const nlohmann::json& value) {
+        if (!value.is_array() || value.size() != 3)
+            throw std::invalid_argument("replay point must contain three coordinates");
+        cv::Vec3d result{value.at(0).get<double>(), value.at(1).get<double>(), value.at(2).get<double>()};
+        for (double v : result.val)
+            if (!std::isfinite(v)) throw std::invalid_argument("nonfinite replay point");
+        return result;
+    };
+    const auto optionalDouble = [](const nlohmann::json& value) -> std::optional<double> {
+        return value.is_null() ? std::nullopt : std::optional<double>(value.get<double>());
+    };
+    const auto optionalIndex = [](const nlohmann::json& value) -> std::optional<size_t> {
+        if (value.is_null()) return std::nullopt;
+        if (!value.is_number_integer() || value.get<int64_t>() < 0)
+            throw std::invalid_argument("invalid replay index");
+        return value.get<size_t>();
+    };
+    const auto measurement = [&](const nlohmann::json& value) {
+        FiberReplayThresholdMeasurement m;
+        m.euclideanErrorBaseVoxels = value.at("euclidean_error_base_voxels");
+        m.normalErrorBaseVoxels = optionalDouble(value.at("normal_error_base_voxels"));
+        m.tangentialErrorBaseVoxels = optionalDouble(value.at("tangential_error_base_voxels"));
+        m.thresholdErrorBaseVoxels = value.at("threshold_error_base_voxels");
+        m.thresholdErrorRatio = value.at("threshold_error_ratio");
+        m.localNormalValid = value.at("local_normal_valid");
+        m.tangentialFactor = value.value("tangential_factor", factor);
+        if (m.tangentialFactor != factor)
+            throw std::invalid_argument("measurement tangential factor differs from descriptor");
+        validateFiberReplayThresholdMeasurement(m, threshold);
+        return m;
+    };
+    FiberReplayTraceResult replay;
+    replay.filteredStops = document.value("filtered_stops", std::vector<std::array<double, 3>>{});
+    replay.reverseChecks = document.value("reverse_checks", size_t(0));
+    replay.geometryBackend = document.value("geometry_backend", std::string{});
+    replay.graphGeometry = replay.geometryBackend == "fiberlet";
+    replay.tangentialThresholdFactor = factor;
+    replay.referenceBeginArcBase = document.at("reference_begin_arc_base");
+    replay.referenceEndArcBase = document.at("reference_end_arc_base");
+    replay.completedReferenceArcBase = document.at("completed_reference_arc_base");
+    for (const auto& value : document.at("segments")) {
+        FiberReplayTraceSegment segment;
+        segment.startReferenceArcBase = value.at("start_reference_arc_base");
+        segment.endReferenceArcBase = value.at("end_reference_arc_base");
+        segment.terminationReason = value.at("termination_reason").get<std::string>();
+        if (value.contains("filtered_distance_failure_xyz_arc"))
+            segment.filteredDistanceFailure = value.at("filtered_distance_failure_xyz_arc").get<std::array<double, 4>>();
+        for (const auto& p : value.at("trace_points_base_xyz")) segment.tracePointsBase.push_back(point(p));
+        segment.cumulativeLosses = value.at("trace_cumulative_losses").get<std::vector<double>>();
+        for (const auto& m : value.at("matches")) {
+            segment.matches.push_back({
+                m.at("trace_point_index").get<size_t>(),
+                m.at("predicted_reference_arc_base").get<double>(),
+                m.at("matched_reference_arc_base").get<double>(),
+                point(m.at("matched_reference_point_base_xyz")),
+                m.at("search_begin_arc_base").get<double>(),
+                m.at("search_end_arc_base").get<double>(), measurement(m)});
+        }
+        if ((replay.graphGeometry && segment.tracePointsBase.empty() ? !segment.matches.empty() :
+                segment.tracePointsBase.size() != segment.matches.size() + 1) ||
+            (!(replay.graphGeometry && segment.cumulativeLosses.empty()) && segment.cumulativeLosses.size() != segment.tracePointsBase.size()))
+            throw std::invalid_argument("replay segment geometry/loss/match lengths disagree");
+        for (size_t i = 0; i < segment.matches.size(); ++i)
+            if (segment.matches[i].tracePointIndex != i + 1)
+                throw std::invalid_argument("noncontiguous replay match indices");
+        for (double loss : segment.cumulativeLosses)
+            if (!std::isfinite(loss)) throw std::invalid_argument("nonfinite replay loss");
+        replay.segments.push_back(std::move(segment));
+    }
+    for (const auto& value : document.at("failures")) {
+        FiberReplayFailure f;
+        f.index = value.at("index");
+        f.segmentIndex = value.at("segment_index");
+        f.reason = value.at("reason").get<std::string>();
+        f.referenceArcBase = value.at("reference_arc_base");
+        f.referenceArcFraction = value.at("reference_arc_fraction");
+        f.referencePointBase = point(value.at("reference_point_base_xyz"));
+        if (!value.at("evaluator_point_base_xyz").is_null())
+            f.evaluatorPointBase = point(value.at("evaluator_point_base_xyz"));
+        f.segmentPointIndex = optionalIndex(value.at("segment_point_index"));
+        f.candidateIndex = optionalIndex(value.at("candidate_index"));
+        f.arcIndex = optionalIndex(value.at("arc_index"));
+        f.candidatePathPointIndex = optionalIndex(value.at("candidate_path_point_index"));
+        if (!value.at("threshold_error_base_voxels").is_null()) f.thresholdMeasurement = measurement(value);
+        replay.failures.push_back(std::move(f));
+    }
+    validateNativeReplayStructure(replay);
+    validateReplayFailures(replay, "native");
+    validateGreedyThresholdData(replay, threshold);
+    return replay;
+}
+
+void writeFiberReplayTraceArtifacts(
+    const std::filesystem::path& outputDirectory,
+    const std::vector<cv::Vec3d>& referenceGeometryBase,
+    const FiberReplayTraceResult& replay, double threshold,
+    const nlohmann::json& provenance)
+{
+    const auto reference = makePolylineArcGeometry(referenceGeometryBase);
+    if (!nearlyEqual(reference.length(), replay.referenceEndArcBase - replay.referenceBeginArcBase))
+        throw std::invalid_argument("native replay artifact reference extent mismatch");
+    const auto serialized = fiberReplayTraceJson(replay, threshold);
+    (void)matchedGreedySegments(replay, reference);
+    if (!std::filesystem::create_directory(outputDirectory))
+        throw std::invalid_argument("native replay artifact directory already exists");
+    vc::core::util::ephemeralWriteString(outputDirectory / "reference.obj",
+        lineObj("# vc_native_replay_reference", referenceGeometryBase));
+    vc::core::util::ephemeralWriteString(outputDirectory / "trace.obj",
+        segmentedLineObj("# vc_native_replay_segments; resets are disconnected", greedySegments(replay)));
+    vc::core::util::ephemeralWriteString(outputDirectory / "trace.json", nlohmann::json{
+        {"format", "vc_native_replay_artifact"}, {"version", 1},
+        {"reference_points_base_xyz", pointsJson(referenceGeometryBase)},
+        {"provenance", provenance}, {"replay", serialized}}.dump(2) + "\n");
+}
 
 }  // namespace vc::fiber_tracer

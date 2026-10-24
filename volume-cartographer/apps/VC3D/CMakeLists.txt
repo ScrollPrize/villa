@@ -44,6 +44,7 @@ set(srcs
     FiberMapKollesis.cpp
     FiberMapKollesis.hpp
     FiberNetworkLayout.cpp
+    FiberMapAutoLink.cpp
     FiberNetworkLayout.hpp
     FiberWindingSolver.cpp
     FiberWindingSolver.hpp

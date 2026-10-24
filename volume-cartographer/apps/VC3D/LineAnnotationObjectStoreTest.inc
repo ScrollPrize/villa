@@ -97,6 +97,8 @@ int runObjectStoreControllerTests()
         link.controlPointIndex=0;link.branchControlPointIndex=0;link.branchFiberId=b.id;link.branchFileName=b.fileName;
         link.controlPointPosition=a.controlPoints[0];link.branchControlPointPosition=b.controlPoints[0];
         link.controlPointDirection={1,0,0};link.branchControlPointDirection={1,0,0};
+        // An unreviewed automatic link ("Link A and B").
+        link.pending=true;link.autoLink=true;
         a.branches.push_back(link);
         std::swap(link.controlPointPosition,link.branchControlPointPosition); link.branchFiberId=a.id;link.branchFileName=a.fileName;
         b.branches.push_back(link);
@@ -109,6 +111,8 @@ int runObjectStoreControllerTests()
         controller.commitFiberStoreAction(batch);
         a=resolve(a.uuid);b=resolve(b.uuid);
         require(a.branches.size()==1 && b.branches.size()==1,"shared branch roundtrip");
+        require(a.branches[0].pending && a.branches[0].autoLink && b.branches[0].autoLink,
+                "automatic mark is one shared edge state");
         {
             QElapsedTimer timer; timer.start();
             auto linked = [&] { return catalog.size() == 2 && std::all_of(catalog.begin(), catalog.end(),
@@ -125,6 +129,8 @@ int runObjectStoreControllerTests()
         const auto bWire = readDocument(transferPaths.at(b.uuid));
         require(aWire["branches"][0]["branch_file"] == b.uuid + ".json", "transport serializes branch target UUID");
         require(bWire["branches"][0]["branch_file"] == a.uuid + ".json", "transport serializes reciprocal branch");
+        require(aWire["branches"][0].value("auto", false) && bWire["branches"][0].value("auto", false),
+                "transport writes the automatic mark on both entries");
         require(aWire["name"] == bWire["name"] && aWire["filename"] != bWire["filename"], "same-name fibers have distinct transport identities");
         {
             QTemporaryDir transfers;
@@ -145,7 +151,22 @@ int runObjectStoreControllerTests()
                 require(fiber.fileName == "same_name.json", "display name survives transfer");
                 require(fiber.branches.size() == 1, "shared branch survives transfer");
                 require(fiber.branches.front().edgeUuid == a.branches.front().edgeUuid, "edge UUID survives transfer");
+                require(fiber.branches.front().autoLink, "automatic mark survives transfer");
             }
+        }
+        {
+            // Approval clears the mark on the shared edge.
+            auto approved = a;
+            approved.branches[0].pending = false;
+            controller.commitFibers({&approved});
+            const auto again = resolve(a.uuid);
+            require(!again.branches[0].pending && !again.branches[0].autoLink, "approval clears the automatic mark");
+            auto pending = again;
+            pending.branches[0].pending = true;
+            controller.commitFibers({&pending});
+            const auto human = resolve(b.uuid);
+            require(human.branches[0].pending && !human.branches[0].autoLink, "re-flagged link is a human pending link");
+            a=resolve(a.uuid);b=resolve(b.uuid);
         }
         {
             QTemporaryDir directory;

@@ -74,8 +74,10 @@ int main() try {
         edge.aAnchor.points = {{"control_point_ids", {10}}}; edge.bAnchor.points = {{"control_point_ids", {90}}};
         edge.aAnchor.position = {5,2,3}; edge.bAnchor.position = {1,2,3};
         edge.aAnchor.direction = {1,0,0}; edge.bAnchor.direction = {0,1,0};
+        // A stale automatic mark on a reviewed edge is not transported.
+        edge.meta = R"({"auto":true})";
         ordinary = db.addEdge(txn, edge); db.setApproval(txn, ordinary, "approved");
-        edge.meta = R"({"adjacent":true})";
+        edge.meta = R"({"adjacent":true,"auto":true})";
         edge.aAnchor.points = {{"control_point_ids", {90}}}; edge.aAnchor.position = {1,2,3};
         edge.bAnchor.points = {{"control_point_ids", {10}}}; edge.bAnchor.position = {5,2,3};
         adjacent = db.addEdge(txn, edge); db.setApproval(txn, adjacent, "pending");
@@ -91,6 +93,8 @@ int main() try {
         require(link["branch_file"] == b+".json" && link["edge_uuid"] == ordinary && !link["pending"].get<bool>(), "ordinary branch exported from edge");
         require(second["branches"][0]["branch_file"] == a+".json" && second["branches"][0]["control_point_index"] == 0, "reciprocal orientation exported");
         require(first["adjacent_branches"][0]["edge_uuid"] == adjacent && first["adjacent_branches"][0]["pending"].get<bool>(), "adjacent pending edge preserved separately");
+        require(!link.contains("auto") && !first["adjacent_branches"][0].contains("auto"),
+                "automatic mark only on pending ordinary links");
         require(first["coordinates"]["scale_factor"] == 4.0, "coordinate binding exported");
         require(!first.contains("coordinate_binding"), "source annotations cannot restore an absent binding");
         mustFail([&] { fiberNetworkJson(db,txn,{{a,networkPins.at(a)}}); });

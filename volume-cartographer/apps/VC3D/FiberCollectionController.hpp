@@ -138,5 +138,7 @@ private:
     // point chains of annotated fibers within the surface's bounds instead.
     void requestChains(VolumeViewerBase* viewer, const std::array<double, 6>& box);
     void collectChainPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder);
+    static void addLinkMark(OverlayBuilder& builder, const QPointF& center,
+                            const OverlayStyle& style, bool adjacent);
     std::optional<Slice> slice(VolumeViewerBase* viewer) const;
 };

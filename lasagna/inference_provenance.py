@@ -55,7 +55,17 @@ def json_digest(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def atomic_write(path: str | Path, value: Mapping[str, Any]) -> None:
+def atomic_write(
+    path: str | Path,
+    value: Mapping[str, Any],
+    *,
+    durable: bool = True,
+) -> None:
+    """Atomically replace a JSON file, optionally forcing its data to storage.
+
+    ``durable=False`` retains the temp-file-plus-rename atomicity guarantee but
+    avoids coupling regenerable control files to unrelated filesystem writeback.
+    """
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     fd, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
@@ -64,7 +74,8 @@ def atomic_write(path: str | Path, value: Mapping[str, Any]) -> None:
             json.dump(value, handle, indent=2, sort_keys=True)
             handle.write("\n")
             handle.flush()
-            os.fsync(handle.fileno())
+            if durable:
+                os.fsync(handle.fileno())
         os.replace(temporary, destination)
     finally:
         try:
