@@ -32,7 +32,7 @@ Always inspect `problems`.
 history, preserving unrelated metadata. Use store edits for subsequent changes.
 A surface placeholder with `storage_kind="url"` and an `http(s)://` or `s3://`
 (public bucket) `storage_ref` is a remote tifxyz: ingestion downloads its
-`meta.json`, `x/y/z.tif` and, when present, `mask.tif` and `overlapping.json`,
+`meta.json`, `x/y/z.tif` and, when present, `mask.tif`,
 decodes them like a local directory and stores the geometry, so the remote is
 read once. The placeholder, not the remote `meta.json`, supplies the identity.
 
@@ -477,10 +477,8 @@ Multipage/volume/non-top-left TIFFs are rejected as channels. Native export
 writes each channel back as `<name>.tif` with the same samples and `valid` as a
 single-page `mask.tif` (255/0).
 
-`meta.source["overlapping.json"]` retains the complete sidecar: missing means
-unknown, an empty list means known empty. Lists or objects with an `overlapping`
-list retain ordering, duplicates, extra fields and unresolved identities. These
-are directional source claims; ingestion infers no graph edges or symmetry.
+Ingestion ignores tifxyz `overlapping.json`: surface overlaps are relationships
+made by the linking tools (`surface-overlap` detector).
 
 `update_surface_channels(uuid, channels, remove, expected_revision, edge_edits=[])`
 adds/replaces/removes channels atomically. Supply only changed arrays and exact

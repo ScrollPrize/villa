@@ -34,7 +34,7 @@ Prepared surface(const fs::path& source)
     auto fingerprint = [&]() {
         std::map<std::string, std::pair<uintmax_t, fs::file_time_type>> result;
         for (const auto& entry : fs::directory_iterator(source))
-            if (entry.is_regular_file() && (entry.path().extension() == ".tif" || entry.path().extension() == ".tiff" || entry.path().filename() == "meta.json" || entry.path().filename() == "overlapping.json"))
+            if (entry.is_regular_file() && (entry.path().extension() == ".tif" || entry.path().extension() == ".tiff" || entry.path().filename() == "meta.json"))
                 result[entry.path().filename().string()] = {entry.file_size(), entry.last_write_time()};
         return result;
     };
@@ -62,17 +62,6 @@ Prepared surface(const fs::path& source)
     }
     p.object.surface = d;
     p.source = root;
-    const auto overlapPath = source / "overlapping.json";
-    if (fs::exists(overlapPath)) {
-        const auto overlap = readJson(overlapPath);
-        const auto& entries = overlap.is_array() ? overlap : overlap.at("overlapping");
-        if (!entries.is_array()) throw std::runtime_error("overlapping.json must contain an overlapping list");
-        for (const auto& entry : entries)
-            if (!entry.is_string()) throw std::runtime_error("overlapping.json entries must be source identity strings");
-        // Preserve the complete sidecar, including unresolved IDs and ordering.
-        // This is directional source evidence, not a symmetric graph assertion.
-        p.source["overlapping.json"] = overlap;
-    } else p.source.erase("overlapping.json");
     std::map<std::string, fs::path> files;
     for (const auto& entry : fs::directory_iterator(source)) {
         if (!entry.is_regular_file() || (entry.path().extension() != ".tif" && entry.path().extension() != ".tiff")) continue;

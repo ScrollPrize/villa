@@ -28,7 +28,7 @@ void fetchRemoteSurface(const std::string& location, const std::filesystem::path
     vcr::HttpClient client(vcr::HttpOptions{});
     for (const auto& [name, required] : std::initializer_list<std::pair<const char*, bool>>{
              {"meta.json", true}, {"x.tif", true}, {"y.tif", true}, {"z.tif", true},
-             {"mask.tif", false}, {"overlapping.json", false}}) {
+             {"mask.tif", false}}) {
         std::vector<std::uint8_t> body;
         if (!client.get(base + "/" + name, body)) {
             if (required) throw std::runtime_error("remote surface is missing " + std::string(name) + ": " + base);
