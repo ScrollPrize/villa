@@ -39,6 +39,8 @@ public:
     std::shared_ptr<const surface::Mesh> surfaceMesh() const;
     bool isSurfaceMeshReady() const;
     void setSurfaceOpacity(float opacity);
+    void setSurfaceVisible(bool visible);
+    void setSurfaceFilter(bool enabled, double distanceVoxels);
     void fitSurface();
     void fitAll();
     void fitSelected();

@@ -45,6 +45,8 @@ set(srcs
     fibers3d/Fiber3DSliceControls.cpp
     fibers3d/Fiber3DSurfaceMesh.hpp
     fibers3d/Fiber3DSurfaceMesh.cpp
+    fibers3d/Fiber3DSurfaceProximity.hpp
+    fibers3d/Fiber3DSurfaceProximity.cpp
     fibers3d/Fiber3DSurfaceRenderer.hpp
     fibers3d/Fiber3DSurfaceRenderer.cpp
     fibers3d/Fiber3DSurfaceControls.hpp

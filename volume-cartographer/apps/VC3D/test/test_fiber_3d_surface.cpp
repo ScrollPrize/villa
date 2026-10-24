@@ -1,5 +1,6 @@
 #include "fibers3d/Fiber3DSurfaceMesh.hpp"
 #include "fibers3d/Fiber3DSurfaceRenderer.hpp"
+#include "fibers3d/Fiber3DSurfaceProximity.hpp"
 #include <QOffscreenSurface>
 #include <QOpenGLContext>
 #include <QOpenGLFramebufferObject>
@@ -15,6 +16,53 @@ class Fiber3DSurfaceTest : public QObject {
         return p;
     }
 private slots:
+    void indexMatchesExhaustiveTriangleSearch() {
+        auto p=grid(20);p(5,5)={-1,-1,-1};p(6,5)={-1,-1,-1};
+        std::atomic_bool cancelled{false};auto mesh=surface::build(p,1<<20,cancelled);auto index=surface::index(mesh,cancelled);
+        QVERIFY(index->nodes.size()>1);
+        auto scene=std::make_shared<Scene>();
+        for(int i=0;i<40;++i){double x=95+(i*7)%32,y=195+(i*11)%32,z=296+i%10;Fiber f;f.runs={Run{{{x,y,z},{x+3,y+7,z+5}}}};scene->fibers.push_back(f);}
+        const auto geometry=render::build(scene);const auto filtered=surface::nearby(*geometry,*index,2.25,{},cancelled);
+        auto vertex=[&](uint32_t id){const auto&p=mesh->vertices[id].position;return Point{p[0]+mesh->origin[0],p[1]+mesh->origin[1],p[2]+mesh->origin[2]};};
+        for(size_t fi=0;fi<scene->fibers.size();++fi){const auto&line=scene->fibers[fi].runs[0].points;bool keep=false;
+            for(size_t i=0;i<mesh->indices.size();i+=3)if(surface::segmentTriangleDistance(line[0],line[1],vertex(mesh->indices[i]),vertex(mesh->indices[i+1]),vertex(mesh->indices[i+2]))<=2.25){keep=true;break;}
+            QCOMPARE(filtered.includes(fi),keep);
+        }
+    }
+    void proximityUsesBothSidesAndTriangleInteriors() {
+        using surface::segmentTriangleDistance;
+        const Point a{0,0,0},b{10,0,0},c{0,10,0};
+        QCOMPARE(segmentTriangleDistance({2,2,-10},{2,2,10},a,b,c),0.);
+        QCOMPARE(segmentTriangleDistance({2,2,2},{3,3,2},a,b,c),2.);
+        QCOMPARE(segmentTriangleDistance({2,2,-2},{3,3,-2},a,b,c),2.);
+        QCOMPARE(segmentTriangleDistance({-10,2,2},{20,2,2},a,b,c),2.);
+        QCOMPARE(segmentTriangleDistance({-1,-1,0},{-1,-1,0},a,b,c),std::sqrt(2.));
+        std::atomic_bool cancelled{false};auto p=grid(5);
+        for(int y=0;y<5;++y)for(int x=0;x<5;++x)p(y,x)={float(100+10*x),float(200+10*y),300};
+        p(2,2)={-1,-1,-1};auto mesh=surface::build(p,1<<20,cancelled);auto index=surface::index(mesh,cancelled);
+        auto scene=std::make_shared<Scene>();
+        auto add=[&](std::vector<Run> runs){Fiber f;f.runs=std::move(runs);scene->fibers.push_back(std::move(f));};
+        add({Run{{{105,205,302},{115,205,302}}}});
+        add({Run{{{105,205,298},{115,205,298}}}});
+        add({Run{{{105,205,303},{115,205,303}}}});
+        add({Run{{{105,205,290},{105,205,310}}}});
+        add({Run{{{120,220,200},{120,220,400}}}}); // crosses a hole, not a triangle
+        add({Run{{{50,205,302},{180,205,302}}}}); // both ends far outside the surface
+        add({Run{{{90,190,302},{95,195,302}}}});
+        add({Run{{{105,205,280},{105,205,290}}},Run{{{105,205,310},{105,205,320}}}}); // gap
+        auto geometry=render::build(scene);
+        auto near=surface::nearby(*geometry,*index,2,{},cancelled);
+        QCOMPARE(near.fibers,(std::vector<uint8_t>{1,1,0,1,0,1,0,0}));
+        auto zero=surface::nearby(*geometry,*index,0,{},cancelled);
+        QCOMPARE(zero.fibers,(std::vector<uint8_t>{0,0,0,1,0,0,0,0}));
+        auto mask=render::visibility(*geometry,{0,1,1,1,1,1,1,1});
+        QCOMPARE(surface::nearby(*geometry,*index,2,mask,cancelled).fibers,(std::vector<uint8_t>{0,1,0,1,0,1,0,0}));
+        // Clipping cannot keep a fibre because of a hidden part of its path.
+        scene->clipBounds=Bounds{{0,0,310},{1000,1000,400}};geometry=render::build(scene);
+        QCOMPARE(surface::nearby(*geometry,*index,2,{},cancelled).count,size_t(0));
+        cancelled=true;QVERIFY_THROWS_EXCEPTION(std::runtime_error,surface::index(mesh,cancelled));
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error,surface::nearby(*geometry,*index,2,{},cancelled));
+    }
     void holesCoordinatesAndBudget() {
         std::atomic_bool cancelled{false};
         auto p=grid(5); const auto original=p.clone();

@@ -24,6 +24,8 @@ struct Fiber3DSurfaceControls::Impl {
     CState* state;
     Fiber3DCanvas* canvas;
     QCheckBox* enabled;
+    QCheckBox* nearby;
+    QSpinBox* distance;
     QLabel* status;
     QPushButton* fit;
     QTimer debounce;
@@ -40,6 +42,7 @@ struct Fiber3DSurfaceControls::Impl {
         enabled->setObjectName(QStringLiteral("fibers3DSurfaceMesh"));
         enabled->setToolTip(q->tr("Display the surface selected in Main, in the same CT coordinates as the fibers."));
         enabled->setChecked(prefs.value(QStringLiteral("fibers3d/fibers3DSurfaceMesh"), false).toBool());
+        canvas->setSurfaceVisible(enabled->isChecked());
         layout->addWidget(enabled);
         auto* options = new QWidget(q);
         auto* line = new QHBoxLayout(options); line->setContentsMargins(0,0,0,0);
@@ -52,6 +55,20 @@ struct Fiber3DSurfaceControls::Impl {
         slider->setAccessibleName(q->tr("Surface mesh opacity")); label->setBuddy(opacity);
         line->addWidget(label); line->addWidget(slider,1); line->addWidget(opacity);
         layout->addWidget(options);
+        nearby = new QCheckBox(q->tr("Only fibers near surface"), q);
+        nearby->setObjectName(QStringLiteral("fibers3DNearSurface"));
+        nearby->setChecked(prefs.value(QStringLiteral("fibers3d/fibers3DNearSurface"), false).toBool());
+        nearby->setToolTip(q->tr("Keep whole loaded fibers that pass within this distance of the selected surface, on either side. Works even when the mesh is hidden. Combines with other fiber filters."));
+        layout->addWidget(nearby);
+        auto* distanceRow = new QHBoxLayout;
+        auto* distanceLabel = new QLabel(q->tr("Distance to surface"), q);
+        distance = new QSpinBox(q); distance->setObjectName(QStringLiteral("fibers3DSurfaceDistance"));
+        distance->setRange(0,100000); distance->setSingleStep(8); distance->setSuffix(q->tr(" vx"));
+        distance->setKeyboardTracking(false);
+        distance->setValue(prefs.value(QStringLiteral("fibers3d/fibers3DSurfaceDistance"), 64).toInt());
+        distance->setEnabled(nearby->isChecked()); distanceLabel->setBuddy(distance);
+        distanceRow->addWidget(distanceLabel); distanceRow->addWidget(distance,1); layout->addLayout(distanceRow);
+        canvas->setSurfaceFilter(nearby->isChecked(),distance->value());
         fit = new QPushButton(q->tr("Fit surface"), q); fit->setObjectName(QStringLiteral("fibers3DFitSurface"));
         fit->setEnabled(false); layout->addWidget(fit);
         status = new QLabel(q); status->setObjectName(QStringLiteral("fibers3DSurfaceStatus"));
@@ -68,10 +85,21 @@ struct Fiber3DSurfaceControls::Impl {
         options->setEnabled(enabled->isChecked());
         QObject::connect(enabled, &QCheckBox::toggled, q, [this, options](bool on) {
             options->setEnabled(on);
+            canvas->setSurfaceVisible(on);
             QSettings prefs(vc3d::settingsFilePath(), QSettings::IniFormat);
             prefs.setValue(QStringLiteral("fibers3d/fibers3DSurfaceMesh"), on);
-            invalidate();
+            refreshOptions();
         });
+        auto filterChanged = [this] {
+            distance->setEnabled(nearby->isChecked());
+            QSettings prefs(vc3d::settingsFilePath(), QSettings::IniFormat);
+            prefs.setValue(QStringLiteral("fibers3d/fibers3DNearSurface"),nearby->isChecked());
+            prefs.setValue(QStringLiteral("fibers3d/fibers3DSurfaceDistance"),distance->value());
+            canvas->setSurfaceFilter(nearby->isChecked(),distance->value());
+            refreshOptions();
+        };
+        QObject::connect(nearby, &QCheckBox::toggled, q, filterChanged);
+        QObject::connect(distance, &QSpinBox::valueChanged, q, filterChanged);
         debounce.setSingleShot(true); debounce.setInterval(150);
         QObject::connect(&debounce, &QTimer::timeout, q, [this] { start(); });
         QObject::connect(state, &CState::surfaceChanged, q, [this](const std::string& name) {
@@ -86,7 +114,7 @@ struct Fiber3DSurfaceControls::Impl {
         QObject::connect(&watcher, &QFutureWatcher<Result>::finished, q, [this] {
             busy = false;
             auto result = watcher.future().takeResult();
-            if (!cancelled->load() && !suspended && enabled->isChecked()) {
+            if (!cancelled->load() && !suspended && wanted()) {
                 canvas->setSurfaceMesh(result.mesh);
                 const bool valid = result.mesh && !result.mesh->indices.empty();
                 fit->setEnabled(valid);
@@ -99,6 +127,11 @@ struct Fiber3DSurfaceControls::Impl {
         });
         status->setText(q->tr("Surface selected in Main"));
     }
+    bool wanted() const { return enabled->isChecked() || nearby->isChecked(); }
+    void refreshOptions()
+    {
+        if (!wanted() || !canvas->surfaceMesh()) invalidate();
+    }
     void clear()
     {
         if (cancelled) cancelled->store(true);
@@ -108,13 +141,13 @@ struct Fiber3DSurfaceControls::Impl {
     void invalidate()
     {
         clear();
-        if (!enabled->isChecked()) { status->setText(q->tr("Surface selected in Main")); return; }
+        if (!wanted()) { status->setText(q->tr("Surface selected in Main")); return; }
         pending = true;
         if (!suspended) { status->setText(q->tr("Preparing surface mesh…")); debounce.start(); }
     }
     void start()
     {
-        if (busy || suspended || !pending || !enabled->isChecked()) return;
+        if (busy || suspended || !pending || !wanted()) return;
         pending = false;
         auto quad = std::dynamic_pointer_cast<QuadSurface>(state->surface("segmentation"));
         if (!quad) { status->setText(q->tr("Select a surface in Main.")); return; }

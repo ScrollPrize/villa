@@ -21,6 +21,31 @@ surface. Ordinary **Fit** includes it with the fibres. Selection changes and
 geometry edits replace the displayed mesh; changing projects or closing the
 volume removes stale geometry. Fibre filters do not crop the surface.
 
+**Only fibers near surface**, in the same Surface section, filters the loaded
+fibres by their shortest distance to that surface. **Distance to surface** is
+in active CT voxels, on either side (default 64; remembered; the filter starts
+off). It retains a whole fibre if any original segment passes within that
+distance. It does not trim the fibre to the neighbourhood or label it as belonging
+to that sheet. The existing length, region, family and selected-fibre proximity
+filters still apply. A selected fibre outside the surface filter stays hidden.
+The filter also works with **Display surface mesh** switched off. Without a
+selected/loaded surface it shows no fibres, rather than silently ignoring the
+constraint.
+
+Distance queries include segment and triangle interiors and preserve mesh holes
+and disconnected fibre runs. A cached BVH of triangle blocks bounds the search;
+index creation and filtering run on cancellable workers. Changing the distance
+reuses the spatial index, and camera movement reuses the visibility mask. On the
+same Paris 4 scene with the user's 16 mm minimum length, 2,024 loaded fibres become
+20 at 32 vx, 40 at 64 vx, and 80 at 128 vx. Initial indexing/filtering at 64 vx
+took 0.90 s; changing to 32 vx took 0.65 s including QA settling time. Tests cover
+both sides, triangle/segment interiors, holes, gaps, clipped regions, intersected
+filters, and indexed queries against exhaustive triangle search. The native app
+also checks radius changes, hidden mesh, missing/replaced surface, and that a
+distant selected fibre cannot bypass the filter or dim the remaining fibres.
+QA: `mesh-proximity-startup.cpp`, `run-proximity-integrated.py` and
+`mesh-proximity-integrated.json` in the same outer QA directory.
+
 The display uses the existing `segmentation` QuadSurface, including its editing
 preview, in the active CT coordinate frame. Every valid grid cell becomes two
 triangles; invalid cells and holes remain absent. No CT is read, no surface is
