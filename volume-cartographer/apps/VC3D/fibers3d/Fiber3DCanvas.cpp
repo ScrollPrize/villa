@@ -151,6 +151,12 @@ struct Fiber3DCanvas::Impl {
     std::shared_ptr<const Scene> requested;
     QFutureWatcher<std::shared_ptr<render::Geometry>> preparation;
     std::shared_ptr<std::atomic_bool> cancelled;
+    QFutureWatcher<render::Visibility> proximity;
+    std::shared_ptr<std::atomic_bool> proximityCancelled;
+    bool proximityPending = false, proximityBusy = false;
+    render::Visibility visible;
+    std::vector<render::Range> visibleMarkers;
+    QString proximityError;
     bool pending = false, fitPending = false, selectedFitPending = false;
     std::array<GLuint, render::tolerances.size()> buffers{};
     std::array<size_t, render::tolerances.size()> uploaded{};
@@ -211,6 +217,18 @@ Fiber3DCanvas::Fiber3DCanvas(QWidget* parent) : QOpenGLWidget(parent), d(std::ma
     d->refine.setSingleShot(true);
     d->refine.setInterval(180);
     connect(&d->refine, &QTimer::timeout, this, [this] { d->interactive = false; update(); });
+    connect(&d->proximity, &QFutureWatcher<render::Visibility>::finished, this, [this] {
+        d->proximityBusy = false;
+        try {
+            auto visible = d->proximity.future().takeResult();
+            if (!d->proximityCancelled->load() && !d->proximityPending) d->visible = std::move(visible);
+        } catch (const std::exception& e) {
+            if (!d->proximityCancelled->load() && !d->proximityPending)
+                d->proximityError = tr("Cannot filter nearby fibers: %1").arg(QString::fromUtf8(e.what()));
+        }
+        if (d->proximityPending) startProximityBuild();
+        visibilityUpdated();
+    });
     connect(&d->preparation, &QFutureWatcher<std::shared_ptr<render::Geometry>>::finished, this, [this] {
         try {
             // Consume the future's result so clearing a scene also releases its
@@ -240,7 +258,11 @@ Fiber3DCanvas::Fiber3DCanvas(QWidget* parent) : QOpenGLWidget(parent), d(std::ma
 Fiber3DCanvas::~Fiber3DCanvas()
 {
     if (d->cancelled) d->cancelled->store(true);
-    d->preparation.waitForFinished();
+    if (d->proximityCancelled) d->proximityCancelled->store(true);
+    // Qt rethrows worker exceptions from waitForFinished too, including our
+    // cancellation exception. Join both workers without throwing in teardown.
+    try { d->proximity.waitForFinished(); } catch (const std::exception&) {}
+    try { d->preparation.waitForFinished(); } catch (const std::exception&) {}
     cleanupGL();
 }
 
@@ -325,8 +347,11 @@ bool Fiber3DCanvas::isPreparing() const
 
 void Fiber3DCanvas::setDisplaySettings(const DisplaySettings& settings)
 {
+    const bool proximityChanged = settings.nearbyOnly != d->settings.nearbyOnly ||
+        settings.nearbyDistanceVoxels != d->settings.nearbyDistanceVoxels;
     d->settings = settings;
-    update();  // No geometry allocation or upload; only uniforms / tiny palette LUT.
+    if (proximityChanged) updateProximity();
+    update();  // Display changes reuse uploaded geometry.
 }
 
 void Fiber3DCanvas::setSelectedKey(const QString& key)
@@ -340,6 +365,7 @@ void Fiber3DCanvas::setSelectedKey(const QString& key)
                 break;
             }
     updateSelectedGeometry();
+    updateProximity();
     update();
 }
 
@@ -356,7 +382,64 @@ void Fiber3DCanvas::clear()
     d->selectedVertices.clear();
     d->fitted = false;
     d->dirty = true;
+    updateProximity();
     update();
+}
+
+bool Fiber3DCanvas::isFiltering() const
+{
+    return d->proximityPending || (d->proximityBusy && d->proximityCancelled && !d->proximityCancelled->load());
+}
+
+size_t Fiber3DCanvas::visibleFiberCount() const
+{
+    return d->visible.fibers.empty() ? (d->scene ? d->scene->fibers.size() : 0) : d->visible.count;
+}
+
+void Fiber3DCanvas::visibilityUpdated()
+{
+    d->commandTolerance = -1;
+    d->visibleMarkers.clear();
+    if (d->geometry) for (size_t i = 0; i < d->geometry->markers.size(); ++i) {
+        if (!d->visible.includes(size_t(d->geometry->markers[i].fiber))) continue;
+        if (!d->visibleMarkers.empty() && d->visibleMarkers.back().first + d->visibleMarkers.back().count == i)
+            ++d->visibleMarkers.back().count;
+        else d->visibleMarkers.push_back({i, 1});
+    }
+    emit visibilityChanged();
+    update();
+}
+
+void Fiber3DCanvas::updateProximity()
+{
+    if (d->proximityCancelled) d->proximityCancelled->store(true);
+    d->proximityPending = false;
+    d->visible = {};
+    d->proximityError.clear();
+    if (d->settings.nearbyOnly && d->geometry && d->selectedIndex >= 0) {
+        // Until the new result arrives show only the selected fiber, never
+        // neighbors left over from a previous selection/radius/scene.
+        std::vector<uint8_t> keep(d->scene->fibers.size(), 0);
+        keep[d->selectedIndex] = 1;
+        d->visible = render::visibility(*d->geometry, std::move(keep));
+        d->proximityPending = true;
+        if (!d->proximityBusy) startProximityBuild();
+    }
+    visibilityUpdated();
+}
+
+void Fiber3DCanvas::startProximityBuild()
+{
+    d->proximityPending = false;
+    d->proximityBusy = true;
+    d->proximityCancelled = std::make_shared<std::atomic_bool>(false);
+    const auto token = d->proximityCancelled;
+    const auto geometry = d->geometry;
+    const auto selected = size_t(d->selectedIndex);
+    const auto radius = d->settings.nearbyDistanceVoxels;
+    d->proximity.setFuture(QtConcurrent::run([geometry, selected, radius, token] {
+        return render::nearbyFibers(*geometry, selected, radius, token.get());
+    }));
 }
 
 void Fiber3DCanvas::updateSelectedGeometry()
@@ -382,6 +465,13 @@ void Fiber3DCanvas::fit(bool selectedOnly)
     if (selectedOnly) {
         if (d->selectedIndex < 0) return;
         bounds = d->geometry->fiberBounds[d->selectedIndex];
+    } else if (!d->visible.fibers.empty()) {
+        bounds = emptyBounds();
+        for (size_t i = 0; i < d->visible.fibers.size(); ++i) {
+            const auto& b = d->geometry->fiberBounds[i];
+            if (!d->visible.includes(i) || !finite(b.lower)) continue;
+            expand(bounds, b.lower); expand(bounds, b.upper);
+        }
     }
     if (!finite(bounds.lower))
         return;
@@ -551,7 +641,7 @@ void Fiber3DCanvas::paintGL()
         const double tolerance = d->interactive ? 1.25 : .5; // physical screen pixels
         if (d->commandMatrix != matrix || d->commandTolerance != tolerance || d->commandWidth != pixelWidth ||
             d->commandHeight != pixelHeight || d->commandLineWidth != s.lineWidth) {
-            d->commands = render::draws(geometry, render::View(matrix, d->origin, pixelWidth, pixelHeight, (s.lineWidth + 2) * ratio), tolerance);
+            d->commands = render::draws(geometry, render::View(matrix, d->origin, pixelWidth, pixelHeight, (s.lineWidth + 2) * ratio), tolerance, d->visible);
             d->commandMatrix = matrix; d->commandTolerance = tolerance;
             d->commandWidth = pixelWidth; d->commandHeight = pixelHeight; d->commandLineWidth = s.lineWidth;
         }
@@ -578,7 +668,7 @@ void Fiber3DCanvas::paintGL()
             }
             program.setUniformValue("hideSelected", false);
             drawRange(d->selectedBuffer, 0, d->selectedVertices.size());
-            if (s.showAnnotations) drawRange(d->markerBuffer, 0, geometry.markers.size());
+            if (s.showAnnotations) for (const auto& r : d->visibleMarkers) drawRange(d->markerBuffer, r.first, r.count);
         };
         program.setUniformValue("coveragePass", samples > 1 ? 0 : 1);
         draw();
@@ -676,6 +766,9 @@ void Fiber3DCanvas::paintGL()
         painter.drawText(QRect(12, 52, width() - 24, 22), Qt::AlignLeft | Qt::AlignVCenter, tr("Preparing fibers…"));
     else if (d->geometry && d->uploaded[0] != d->geometry->levels[0].size())
         painter.drawText(QRect(12, 52, width() - 24, 22), Qt::AlignLeft | Qt::AlignVCenter, tr("Refining display…"));
+    if (isFiltering() || !d->proximityError.isEmpty())
+        painter.drawText(QRect(12, 78, width() - 24, 44), Qt::AlignLeft | Qt::TextWordWrap,
+                         isFiltering() ? tr("Finding nearby fibers…") : d->proximityError);
 }
 
 void Fiber3DCanvas::mousePressEvent(QMouseEvent* event)
@@ -765,7 +858,7 @@ void Fiber3DCanvas::pick(const QPointF& position, bool context, const QPoint& gl
     double bestDepth = 2.0, bestT = 0.0;
     const auto& g = *d->geometry;
     const auto candidates = render::pickChunks(g, render::View(matrix, d->origin, width(), height(), tolerance),
-                                               position.x() * 2 / width() - 1, 1 - position.y() * 2 / height());
+                                               position.x() * 2 / width() - 1, 1 - position.y() * 2 / height(), d->visible);
     for (auto ci : candidates) {
       const auto& chunk = g.chunks[ci];
       for (size_t si = chunk.first; si < chunk.end; ++si) {

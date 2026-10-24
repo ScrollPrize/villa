@@ -9,6 +9,63 @@ class Fiber3DGeometryTest : public QObject
 {
     Q_OBJECT
 private slots:
+    void proximityUsesSegmentInteriorsAndEuclideanDistance()
+    {
+        using render::segmentDistance;
+        QCOMPARE(segmentDistance({-10, 0, 0}, {10, 0, 0}, {0, -10, 3}, {0, 10, 3}), 3.);
+        QCOMPARE(segmentDistance({0, 0, 0}, {10, 0, 0}, {12, 3, 0}, {12, 4, 0}), std::sqrt(13.));
+        QCOMPARE(segmentDistance({0, 0, 0}, {10, 0, 0}, {8, 2, 0}, {2, 2, 0}), 2.);
+        QCOMPARE(segmentDistance({0, 0, 0}, {0, 0, 0}, {-2, 1, 0}, {2, 1, 0}), 1.);
+        QCOMPARE(segmentDistance({0, 0, 0}, {0, 0, 0}, {0, 3, 4}, {0, 3, 4}), 5.);
+        QVERIFY(segmentDistance({-1e6, 0, 0}, {1e6, 0, 0}, {-1e6, -1e-3, 1}, {1e6, 1e-3, 1}) <= 1.000000001);
+    }
+
+    void proximityKeepsWholeFibersWithoutJoiningRuns()
+    {
+        auto scene = std::make_shared<Scene>();
+        auto add = [&](std::vector<Run> runs) { Fiber f; f.runs = std::move(runs); scene->fibers.push_back(std::move(f)); };
+        add({Run{{{-10, 0, 0}, {10, 0, 0}}}}); // selected
+        add({Run{{{0, -100, 2}, {0, 100, 2}}}}); // interiors at exactly radius
+        add({Run{{{-10, 1.5, 1.5}, {10, 1.5, 1.5}}}}); // inside padded box, outside sphere
+        add({Run{{{-10, 0, 3}, {10, 0, 3}}}});
+        add({Run{{{0, -20, 0}, {0, -10, 0}}}, Run{{{0, 10, 0}, {0, 20, 0}}}}); // disjoint runs
+        add({Run{{{0, -20, 0}, {NAN, 0, 0}, {0, 20, 0}}}}); // no bridge through NaN
+        auto g = render::build(scene);
+        const auto visible = render::nearbyFibers(*g, 0, 2);
+        QCOMPARE(visible.fibers, (std::vector<uint8_t>{1, 1, 0, 0, 0, 0}));
+        QCOMPARE(visible.count, size_t(2));
+        QMatrix4x4 m; m.ortho(-200.f, 200.f, -200.f, 200.f, -200.f, 200.f);
+        m.translate(float(g->origin[0]), float(g->origin[1]), float(g->origin[2]));
+        render::View view(m, g->origin, 800, 600, 2);
+        for (const auto& d : render::draws(*g, view, 10, visible))
+            for (size_t i = d.begin; i < d.end; ++i) QVERIFY(visible.includes(g->chunks[i].fiber));
+        for (auto ci : render::pickChunks(*g, view, 0, 0, visible)) QVERIFY(visible.includes(g->chunks[ci].fiber));
+        QCOMPARE(render::nearbyFibers(*g, 0, 3).count, size_t(4));
+        std::atomic_bool cancelled{true};
+        QVERIFY_THROWS_EXCEPTION(std::runtime_error, render::nearbyFibers(*g, 0, 2, &cancelled));
+        QVERIFY_THROWS_EXCEPTION(std::invalid_argument, render::nearbyFibers(*g, 99, 2));
+        QVERIFY_THROWS_EXCEPTION(std::invalid_argument, render::nearbyFibers(*g, 0, NAN));
+    }
+
+    void proximityRespectsClippingAndBvhPruning()
+    {
+        auto scene = std::make_shared<Scene>();
+        scene->clipBounds = Bounds{{0, -100, -100}, {10, 100, 100}};
+        Fiber selected; selected.runs = {Run{{{-10, 0, 0}, {10, 0, 0}}}};
+        scene->fibers.push_back(selected);
+        Fiber outside; outside.runs = {Run{{{-9, 0, 0}, {0, 30, 0}, {10, 30, 0}}}};
+        scene->fibers.push_back(outside);
+        for (int i = 0; i < 80; ++i) {
+            Fiber f; f.runs = {Run{{{0, double(i), 1}, {10, double(i), 1}}}};
+            scene->fibers.push_back(f);
+        }
+        auto g = render::build(scene);
+        const auto visible = render::nearbyFibers(*g, 0, 5);
+        QVERIFY(!visible.includes(1)); // near the selected fiber only outside the region
+        for (int i = 0; i < 80; ++i) QCOMPARE(visible.includes(i + 2), std::hypot(double(i), 1.) <= 5);
+        QCOMPARE(visible.count, size_t(6));
+    }
+
     void simplificationBoundsAndHairpins()
     {
         std::vector<Point> points;

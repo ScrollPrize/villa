@@ -133,6 +133,7 @@ struct Fiber3DPanel::Impl {
         layout->addWidget(status);
         canvas->setToolTip(
             q->tr("Drag to orbit · right/middle drag to pan · wheel to zoom\nClick to select · Escape or click empty space to clear selection\nRight-click for CT navigation"));
+        QObject::connect(canvas, &Fiber3DCanvas::visibilityChanged, q, [this] { updateStatus(); });
         QObject::connect(fit, &QToolButton::clicked, canvas, &Fiber3DCanvas::fitAll);
         QObject::connect(fitSelected, &QToolButton::clicked, canvas, &Fiber3DCanvas::fitSelected);
         QObject::connect(detach, &QToolButton::clicked, q, &Fiber3DPanel::detachRequested);
@@ -158,9 +159,7 @@ struct Fiber3DPanel::Impl {
                         canvas->fitAll();
                         fitted = true;
                     }
-                    const auto text =
-                        q->tr("%1 fibers displayed%2").arg(scene->fibers.size()).arg(scene->complete ? QString{} : q->tr(" · partial view"));
-                    status->setText(text + (scene->message.isEmpty() ? QString{} : QLatin1Char('\n') + scene->message));
+                    updateStatus();
                     updateSelection();
                 }
             }
@@ -414,6 +413,17 @@ struct Fiber3DPanel::Impl {
         auto* width = real("fibers3DLineWidth", 0.5, 10, 2, 1, q->tr(" px"));
         row(q->tr("Line width"), width);
 
+        section(q->tr("Selection"));
+        auto* nearby = check("fibers3DNearbyOnly", q->tr("Only fibers near selection"), false);
+        nearby->setToolTip(q->tr("Keep whole loaded fibers that pass within this distance of any part of the selected fiber. Without a selection, show all loaded fibers. This only filters the 3D view."));
+        body->addWidget(nearby);
+        auto* nearbyDistance = integer("fibers3DNearbyDistance", 1, 100000, 64);
+        nearbyDistance->setSuffix(q->tr(" vx"));
+        nearbyDistance->setSingleStep(8);
+        nearbyDistance->setKeyboardTracking(false);
+        nearbyDistance->setToolTip(q->tr("Shortest 3D distance between fiber centerlines, in active CT voxels. Computed from original segments, independently of zoom."));
+        row(q->tr("Distance"), nearbyDistance);
+
         section(q->tr("Annotations"));
         auto* gaps = check("fibers3DGaps", q->tr("Dashed gaps"), false);
         gaps->setToolTip(q->tr("Display annotated gaps and inferred connections as dashed lines."));
@@ -494,6 +504,9 @@ struct Fiber3DPanel::Impl {
             display.perspective = perspective->isChecked();
             display.showBounds = bounds->isChecked();
             display.showCursor = cursor->isChecked();
+            display.nearbyOnly = nearby->isChecked();
+            display.nearbyDistanceVoxels = nearbyDistance->value();
+            nearbyDistance->setEnabled(display.nearbyOnly);
             applyDisplay();
         };
         for (auto* w : {nativeSource, afvSource, unknown})
@@ -522,9 +535,10 @@ struct Fiber3DPanel::Impl {
         for (auto* w : {colors, direction, palette})
             QObject::connect(w, &QComboBox::currentIndexChanged, q, changedDisplay);
         QObject::connect(opacity, &QSpinBox::valueChanged, q, changedDisplay);
+        QObject::connect(nearbyDistance, &QSpinBox::valueChanged, q, changedDisplay);
         for (auto* w : {width, rangeMin, rangeMax})
             QObject::connect(w, &QDoubleSpinBox::valueChanged, q, changedDisplay);
-        for (auto* w : {fixedRange, gaps, annotationsVisible, selectedOnly, perspective, bounds, cursor})
+        for (auto* w : {fixedRange, gaps, annotationsVisible, selectedOnly, perspective, bounds, cursor, nearby})
             QObject::connect(w, &QCheckBox::toggled, q, changedDisplay);
         boxWidthRow->setVisible(region->currentIndex() == 0);
         changedDisplay();
@@ -717,6 +731,21 @@ struct Fiber3DPanel::Impl {
         select({}, false);
         automated->clearSelection();
         emit q->nativeFiberSelected(0);
+    }
+
+    void updateStatus()
+    {
+        if (!scene) return;
+        const auto current = canvas->scene();
+        if (current != scene) {
+            status->setText(q->tr("Preparing %1 fibers…").arg(scene->fibers.size()));
+            return;
+        }
+        QString text = canvas->isFiltering() ? q->tr("Finding fibers near selection…") :
+            q->tr("%1 fibers displayed / %2 loaded").arg(canvas->visibleFiberCount()).arg(scene->fibers.size());
+        if (!scene->complete) text += q->tr(" · partial view");
+        if (!scene->message.isEmpty()) text += QLatin1Char('\n') + scene->message;
+        status->setText(text);
     }
 
     void updateSelection()

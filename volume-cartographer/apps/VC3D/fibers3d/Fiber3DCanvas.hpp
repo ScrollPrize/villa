@@ -20,6 +20,8 @@ public:
     void setScene(std::shared_ptr<const Scene> scene);
     std::shared_ptr<const Scene> scene() const;
     bool isPreparing() const;
+    bool isFiltering() const;
+    size_t visibleFiberCount() const;
     void setDisplaySettings(const DisplaySettings& settings);
     void setSelectedKey(const QString& key);
     void fitAll();
@@ -31,6 +33,7 @@ public:
     void clear();
 
 signals:
+    void visibilityChanged();
     void fiberPicked(QString key, qint64 linePointIndex, double x, double y, double z);
     void fiberContextRequested(QString key, qint64 linePointIndex, double x, double y, double z, QPoint globalPos);
     void emptyContextRequested(QPoint globalPos);
@@ -52,6 +55,9 @@ private:
     void cleanupGL();
     void startGeometryBuild();
     void updateSelectedGeometry();
+    void updateProximity();
+    void startProximityBuild();
+    void visibilityUpdated();
     void fit(bool selectedOnly);
     void pick(const QPointF& position, bool context, const QPoint& globalPosition);
 };

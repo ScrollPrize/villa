@@ -23,6 +23,52 @@ Adjust this in **Settings → More display options → Other fibers opacity**,
 using the 0–100% slider or numeric control (5% arrow steps). Existing saved
 opacity preferences are preserved; the stored setting remains a 0–1 fraction.
 
+**Settings → Selection → Only fibers near selection** hides distant fibres
+in the 3D view. **Distance** starts at 64 active-CT voxels and is
+remembered with the checkbox (off by default). A whole loaded fibre is kept
+if any of its original segments passes within that 3D distance of any part
+of the selected fibre. This includes close approaches between segment interiors,
+not just stored vertices, and does not depend on zoom or display simplification.
+It does not infer that neighbouring fibres belong to the same sheet.
+The existing source, region, length and memory filters still apply: this option
+does not load missing fibres or search outside the loaded region. Separate runs
+are never joined for the distance query. CT overlays remain unchanged.
+
+Selecting from the CT views or fibre lists updates the neighbourhood too.
+Escape/clearing the selection, or disabling the option, restores all loaded
+fibres immediately. Camera position, colours and opacity preferences are kept.
+**Fit** frames the visible neighbours; **Fit selected** frames the selection.
+The status shows the displayed and loaded counts. Neighbour searches reuse
+the spatial index and run on a cancellable worker without rebuilding/uploading
+the scene. Until a new search completes, only the selection is shown, with
+**Finding nearby fibers…**; stale results cannot restore an old neighbourhood.
+Hidden fibres and their annotation markers cannot be picked or drawn.
+
+Proximity validation on the M2 Max Mac (QuickBuild `-O1`, Qt 6.11.2), using
+the complete `PHerc1447/1447_5mm_v1.afv` (80,887 fibres): selecting fibre
+2,157,532 retained 27 / 53 / 123 fibres at 32 / 64 / 128 voxels respectively,
+including the selection. End-to-end settling took 114 / 121 / 125 ms in that
+single UI run (includes a 50 ms test settling delay; not a throughput benchmark).
+The event loop continued processing timer events during the searches. The
+same loaded scene was retained. Rapid selection/radius changes, disable,
+Escape, scene clearing and clean process shutdown passed in the full VC3D app.
+The three suites `fiber_3d_geometry`, `fiber_3d_data` and `test_fiber_collection`
+passed. Geometry tests cover interior approaches, parallel/degenerate segments,
+Euclidean rather than box distance, disjoint runs, clipping, cancellation,
+filtered drawing and picking. macOS was exercised; Ubuntu was not run.
+
+Reproduce the build/tests in an already configured tree:
+
+```sh
+cmake --build <build-dir> --target VC3D test_fiber_3d_geometry test_fiber_3d_data -j 6
+ctest --test-dir <build-dir> --output-on-failure -R '^(fiber_3d_data|fiber_3d_geometry|test_fiber_collection)$'
+```
+
+The local real-data QA harness and screenshots are in
+`exports/VC3D_FIBERS3D_QA/proximity-20261024/` in the parent project. Its
+`run-integrated.py` relinks the existing VC3D objects with `proximity-startup.cpp`
+and runs a disposable copy of the settings/project; it does not modify the AFV.
+
 A white crosshair marks the shared CT focus at its actual 3D position. Moving
 the focus in a CT view updates it immediately without moving the 3D camera;
 in whole-volume mode this does not reload the fibres. It is a navigation
@@ -58,7 +104,7 @@ The **Settings** button opens controls for:
   connections; it is off by default. These are metadata-driven display styles,
   not additional gaps created in the source geometry.
 
-Settings are grouped into Sources, Appearance and Annotations. Only controls
+Settings are grouped into Sources, Appearance, Selection and Annotations. Only controls
 for the active colour mode are shown, and the CT box width appears when using
 the focus region. **More display options** contains unselected opacity,
 perspective, region bounds, the CT cursor and the fibre limit. The popup adapts

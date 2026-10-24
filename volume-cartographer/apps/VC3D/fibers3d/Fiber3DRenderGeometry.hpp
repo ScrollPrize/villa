@@ -93,6 +93,97 @@ inline double distanceToSegment(const Point& p, const Point& a, const Point& b)
     }
     return distance(p, interpolate(a, b, ab2 > 0 ? std::clamp(dot / ab2, 0., 1.) : 0.));
 }
+// A minimum lies on one of the four boundaries, or at the closest interior
+// points of the two supporting lines. Cross products avoid cancellation in
+// |u|²|v|² - (u.v)² for nearly parallel fibers.
+inline double segmentDistance(const Point& a, const Point& b, const Point& c, const Point& d)
+{
+    double best = std::min({distanceToSegment(a, c, d), distanceToSegment(b, c, d),
+                            distanceToSegment(c, a, b), distanceToSegment(d, a, b)});
+    const auto cross = [](const Point& u, const Point& v) -> Point {
+        return {u[1]*v[2]-u[2]*v[1], u[2]*v[0]-u[0]*v[2], u[0]*v[1]-u[1]*v[0]};
+    };
+    const auto dot = [](const Point& u, const Point& v) { return u[0]*v[0]+u[1]*v[1]+u[2]*v[2]; };
+    Point u, v, w;
+    for (int k = 0; k < 3; ++k) { u[k] = b[k]-a[k]; v[k] = d[k]-c[k]; w[k] = c[k]-a[k]; }
+    const auto n = cross(u, v);
+    const double denominator = dot(n, n);
+    if (denominator > 0) {
+        const double s = dot(cross(w, v), n) / denominator;
+        const double t = dot(cross(w, u), n) / denominator;
+        if (s >= 0 && s <= 1 && t >= 0 && t <= 1)
+            best = std::min(best, distance(interpolate(a, b, s), interpolate(c, d, t)));
+    }
+    return best;
+}
+
+// Empty means no proximity filter. Prefix counts allow whole BVH nodes to be
+// accepted/rejected without scanning their fibers on every camera movement.
+struct Visibility {
+    std::vector<uint8_t> fibers;
+    std::vector<size_t> chunkPrefix;
+    size_t count = 0;
+    bool includes(size_t fiber) const { return fibers.empty() || fibers[fiber] != 0; }
+};
+inline Visibility visibility(const Geometry& g, std::vector<uint8_t> fibers)
+{
+    Visibility out;
+    out.fibers = std::move(fibers);
+    out.count = std::count(out.fibers.begin(), out.fibers.end(), uint8_t(1));
+    out.chunkPrefix.reserve(g.chunks.size() + 1);
+    out.chunkPrefix.push_back(0);
+    for (const auto& c : g.chunks)
+        out.chunkPrefix.push_back(out.chunkPrefix.back() + out.includes(c.fiber));
+    return out;
+}
+inline Visibility nearbyFibers(const Geometry& g, size_t selected, double radius, const std::atomic_bool* cancelled = nullptr)
+{
+    if (selected >= g.scene->fibers.size() || !std::isfinite(radius) || radius < 0)
+        throw std::invalid_argument("Invalid fiber proximity query");
+    std::vector<uint8_t> keep(g.scene->fibers.size(), 0);
+    keep[selected] = 1;
+    auto check = [&] {
+        if (cancelled && cancelled->load(std::memory_order_relaxed)) throw std::runtime_error("Cancelled");
+    };
+    check();
+    for (const auto ci : g.fiberChunks[selected]) {
+        const auto& selectedChunk = g.chunks[ci];
+        for (size_t si = selectedChunk.first; si < selectedChunk.end; ++si) {
+            check();
+            Segment a;
+            if (!segment(g, selectedChunk, si, a)) continue;
+            Bounds search = emptyBounds(); expand(search, a.a); expand(search, a.b);
+            for (int k = 0; k < 3; ++k) { search.lower[k] -= radius; search.upper[k] += radius; }
+            auto overlaps = [&](const Bounds& box) {
+                for (int k = 0; k < 3; ++k)
+                    if (box.lower[k] > search.upper[k] || box.upper[k] < search.lower[k]) return false;
+                return true;
+            };
+            auto visit = [&](auto&& self, size_t ni) -> void {
+                const auto& node = g.nodes[ni];
+                if (!overlaps(node.bounds)) return;
+                check();
+                if (!node.leaf()) { self(self, node.left); self(self, node.right); return; }
+                for (size_t j = node.begin; j < node.end; ++j) {
+                    const auto& c = g.chunks[j];
+                    if (keep[c.fiber] || !overlaps(c.bounds)) continue;
+                    for (size_t k = c.first; k < c.end; ++k) {
+                        Segment b;
+                        if (!segment(g, c, k, b)) continue;
+                        Bounds bb = emptyBounds(); expand(bb, b.a); expand(bb, b.b);
+                        if (overlaps(bb) && segmentDistance(a.a, a.b, b.a, b.b) <= radius) {
+                            keep[c.fiber] = 1;
+                            break;
+                        }
+                    }
+                }
+            };
+            if (!g.nodes.empty()) visit(visit, 0);
+        }
+    }
+    check();
+    return visibility(g, std::move(keep));
+}
 // RDP using distance to the finite chord (not its infinite supporting line).
 // This also preserves hairpins/backtracking. Original endpoints are retained.
 inline void simplify(const std::vector<Point>& points, size_t a, size_t b, double tolerance, std::vector<size_t>& out)
@@ -335,7 +426,7 @@ struct Draw {
     Range range;
     size_t begin, end;
 };
-inline std::vector<Draw> draws(const Geometry& g, const View& view, double pixelError)
+inline std::vector<Draw> draws(const Geometry& g, const View& view, double pixelError, const Visibility& visible = {})
 {
     std::vector<Draw> result;
     if (g.nodes.empty())
@@ -356,16 +447,18 @@ inline std::vector<Draw> draws(const Geometry& g, const View& view, double pixel
     };
     auto visit = [&](auto&& self, size_t i) -> void {
         const auto& n = g.nodes[i];
+        const size_t kept = visible.fibers.empty() ? n.end - n.begin : visible.chunkPrefix[n.end] - visible.chunkPrefix[n.begin];
+        if (!kept) return;
         const int state = view.classify(n.bounds);
         if (state < 0)
             return;
-        if (state == 1) {
+        if (state == 1 && kept == n.end - n.begin) {
             append(n.begin, n.end, n.bounds);
             return;
         }
         if (n.leaf()) {
             for (size_t c = n.begin; c < n.end; ++c)
-                if (view.classify(g.chunks[c].bounds) >= 0)
+                if (visible.includes(g.chunks[c].fiber) && view.classify(g.chunks[c].bounds) >= 0)
                     append(c, c + 1, g.chunks[c].bounds);
         } else {
             self(self, n.left);
@@ -375,18 +468,19 @@ inline std::vector<Draw> draws(const Geometry& g, const View& view, double pixel
     visit(visit, 0);
     return result;
 }
-inline std::vector<size_t> pickChunks(const Geometry& g, const View& view, double x, double y)
+inline std::vector<size_t> pickChunks(const Geometry& g, const View& view, double x, double y, const Visibility& visible = {})
 {
     std::vector<size_t> result;
     if (g.nodes.empty())
         return result;
     auto visit = [&](auto&& self, size_t i) -> void {
         const auto& n = g.nodes[i];
+        if (!visible.fibers.empty() && visible.chunkPrefix[n.end] == visible.chunkPrefix[n.begin]) return;
         if (view.classify(n.bounds, x, x, y, y) < 0)
             return;
         if (n.leaf()) {
             for (size_t c = n.begin; c < n.end; ++c)
-                if (view.classify(g.chunks[c].bounds, x, x, y, y) >= 0)
+                if (visible.includes(g.chunks[c].fiber) && view.classify(g.chunks[c].bounds, x, x, y, y) >= 0)
                     result.push_back(c);
         } else {
             self(self, n.left);

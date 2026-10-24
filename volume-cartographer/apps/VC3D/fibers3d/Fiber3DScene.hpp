@@ -73,6 +73,8 @@ struct DisplaySettings {
     bool perspective = false;
     bool showBounds = true;
     bool showCursor = true;
+    bool nearbyOnly = false;
+    double nearbyDistanceVoxels = 64.0;
     bool fixedLengthRange = false;
     double lengthMinMm = 0.0, lengthMaxMm = 10.0;
 };
