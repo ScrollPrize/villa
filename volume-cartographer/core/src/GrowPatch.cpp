@@ -48,6 +48,7 @@
 #include <omp.h>  // ensure omp_get_max_threads() is declared
 
 #include "vc/tracer/Tracer.hpp"
+#include "vc/tracer/SeedAnchor.hpp"
 #include "vc/core/PointCollections.hpp"
 #include "vc/tracer/NeuralTracerConnection.h"
 
@@ -730,6 +731,7 @@ static std::optional<cv::Vec2i> pick_seed_for_collection(
 struct TraceData {
     TraceData(const std::vector<DirectionField> &direction_fields) : direction_fields(direction_fields) {};
     PointCorrection point_correction;
+    vc::tracer::SeedAnchor seed_anchor;
     const vc::core::util::NormalGridVolume *ngv = nullptr;
     const std::vector<DirectionField> &direction_fields;
     bool cell_reopt_mode = false;
@@ -2875,6 +2877,7 @@ static void local_optimization(const cv::Rect &roi, const cv::Mat_<uchar> &mask,
     options.max_num_iterations = 10000;
     // options.minimizer_progress_to_stdout = true;
     ceres::Solver::Summary summary;
+    trace_data.seed_anchor.apply(problem);
     ceres::Solve(options, &problem, &summary);
 
     // std::cout << "inpaint solve " << summary.BriefReport() << std::endl;
@@ -3026,6 +3029,7 @@ static float local_optimization(int radius, const cv::Vec2i &p, TraceParameters 
 
     ceres::Solver::Summary summary;
 
+    trace_data.seed_anchor.apply(problem);
     ceres::Solve(options, &problem, &summary);
 
     if (timing) {
@@ -3140,6 +3144,16 @@ struct thresholdedDistance
 
 QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const PointCollections &corrections, const cv::Mat* allowed_growth_mask)
 {
+    // Opt-in only. Existing jobs and unsupported editing/scaling modes retain
+    // their old behavior unless an anchor is explicitly requested.
+    const bool anchor_requested = params.contains("seed_anchor_xyz");
+    if (resume_surf && resume_surf->meta.contains("seed_anchor") && !anchor_requested)
+        throw std::runtime_error("anchored resume requires seed_anchor_xyz");
+    if (anchor_requested && (level != 0 || scale != 1.0f ||
+            params.value("growth_scale", 0) != 0 || params.contains("neural_socket") ||
+            params.value("cell_reopt_mode", false) || params.value("rewind_gen", -1) != -1 ||
+            params.value("inpaint", false) || !corrections.getAllCollections().empty()))
+        throw std::runtime_error("seed anchor supports level-0 explicit seed/resume without inpaint or corrections only");
     const std::array<int, 3> volume_shape_zyx = volume.shape(level);
     auto* cache = volume.chunkedCache();
 
@@ -3203,6 +3217,25 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         }
     }
     TraceData trace_data(direction_fields);
+    if (anchor_requested) {
+        auto xyz = params["seed_anchor_xyz"].get_double_array();
+        if (xyz.size() != 3) throw std::runtime_error("seed_anchor_xyz needs three coordinates");
+        trace_data.seed_anchor.configure({xyz[0], xyz[1], xyz[2]});
+        if (!resume_surf) {
+            double seed[3] = {origin[0], origin[1], origin[2]};
+            if (!trace_data.seed_anchor.matches(seed))
+                throw std::runtime_error("explicit seed differs from seed_anchor_xyz");
+        } else {
+            if (!resume_surf->meta.contains("seed_anchor"))
+                throw std::runtime_error("resume has no seed anchor provenance");
+            const auto& saved = resume_surf->meta["seed_anchor"];
+            if (saved.value("version", 0) != 1 || saved.value("mode", std::string()) != "fixed-vertex")
+                throw std::runtime_error("unsupported seed anchor provenance");
+            auto old = saved["xyz"].get_double_array();
+            if (old.size() != 3 || !trace_data.seed_anchor.matches(old.data()))
+                throw std::runtime_error("resume seed anchor identity changed");
+        }
+    }
     LossSettings loss_settings;
     loss_settings.applyJsonWeights(params);
     const bool patch_normals_requested =
@@ -3806,6 +3839,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     int resume_pad_x = 0;
 
     auto create_surface_from_state = [&, &f_timer = *timer]() {
+        trace_data.seed_anchor.verify();
         cv::Rect used_area_safe = used_area;
         used_area_safe.x -= 2;
         used_area_safe.y -= 2;
@@ -3877,6 +3911,14 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         vc::surface::storeAreaMeta(surf->meta, area_est_vx2,
                                    static_cast<double>(voxelsize));
         surf->meta["max_gen"] = generation;
+        if (anchor_requested) {
+            auto a = utils::Json::object();
+            a["version"] = 1; a["mode"] = "fixed-vertex";
+            auto xyz = utils::Json::array();
+            for (double v : trace_data.seed_anchor.xyz()) xyz.push_back(v);
+            a["xyz"] = xyz;
+            surf->meta["seed_anchor"] = a;
+        }
         {
             auto seed_arr = utils::Json::array();
             seed_arr.push_back(origin[0]); seed_arr.push_back(origin[1]); seed_arr.push_back(origin[2]);
@@ -4090,6 +4132,14 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             }
         }
 
+        if (anchor_requested) {
+            for (int r = 0; r < trace_params.dpoints.rows; ++r)
+                for (int c = 0; c < trace_params.dpoints.cols; ++c)
+                    if ((trace_params.state(r,c) & STATE_LOC_VALID) && generations(r,c) == 1 &&
+                            trace_data.seed_anchor.matches(&trace_params.dpoints(r,c)[0]))
+                        trace_data.seed_anchor.bind(&trace_params.dpoints(r,c)[0]);
+            trace_data.seed_anchor.verify();
+        }
         if (imported_zero_generation_points > 0) {
             std::cout << "Resume import preserved " << imported_zero_generation_points
                       << " valid points with zero generation metadata." << std::endl;
@@ -4468,6 +4518,15 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
         fringe.push_back({y0+1,x0+1});
     }
 
+    if (anchor_requested && !resume_surf)
+        trace_data.seed_anchor.bind(&trace_params.dpoints(y0,x0)[0]);
+    auto log_seed_anchor = [&](const char* event) {
+        if (!anchor_requested) return;
+        trace_data.seed_anchor.verify();
+        std::cout << "seed_anchor event=" << event << " generation=" << generation
+                  << " displacement_vox=0 mode=fixed-vertex" << std::endl;
+    };
+    log_seed_anchor("before-initial-optimization");
     int succ_start = succ;
 
     // Solve the initial optimisation problem, just placing the first four vertices around the seed
@@ -4696,6 +4755,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
     }
 
     // Prepare a new set of Ceres options used later during local solves
+    log_seed_anchor("after-initial-optimization");
     ceres::Solver::Options options;
     options.linear_solver_type = ceres::DENSE_QR;
     options.minimizer_progress_to_stdout = false;
@@ -4917,6 +4977,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
                     problem.SetParameterBlockVariable(&trace_params.dpoints(p)[0]);
 
                     ceres::Solver::Summary summary;
+                    trace_data.seed_anchor.apply(problem);
                     ceres::Solve(options, &problem, &summary);
 
                     local_optimization(1, p, trace_params, trace_data, loss_settings, true, false);
@@ -4993,6 +5054,7 @@ QuadSurface *tracer(Volume& volume, float scale, int level, cv::Vec3f origin, co
             }
         }
 
+        log_seed_anchor("after-generation");
         cands.resize(0);
 
         // --- Speed Reporting ---
