@@ -1,5 +1,6 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/StoreSurfaces.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/TifxyzIdentity.hpp"
 #include <cctype>
@@ -517,7 +518,7 @@ int main(int argc, char *argv[])
 {
     if (argc < 3) {
         std::cout << "usage: " << argv[0]
-                  << " <input.obj> <output_directory> [stretch_factor] [mesh_units]"
+                  << " <input.obj> <output_directory | --store=<store>> [stretch_factor] [mesh_units]"
                   << " [--uv-metric] [--uv-to-obj=<ratio>] [--uv-downsample=<f>]"
                   << " [--grid-cap=<pixels>] [--uuid=<id>]" << std::endl;
         std::cout << "Converts an OBJ file to tifxyz format" << std::endl;
@@ -526,6 +527,9 @@ int main(int argc, char *argv[])
         std::cout << "  stretch_factor: UV scaling factor (default: 1.0)" << std::endl;
         std::cout << "  mesh_units    : micrometers per OBJ unit (default: 1.0)" << std::endl;
         std::cout << "Flags:" << std::endl;
+        std::cout << "  --store=<store>     : write a new surface object instead of a directory (prints surface_uuid:)," << std::endl;
+        std::cout << "                        with --name=<name>, --tag=<tag> (repeatable), --volume-uuid=<id> and" << std::endl;
+        std::cout << "                        --source-surface=<uuid> in place of --tifxyz-source" << std::endl;
         std::cout << "  --uv-metric         : UVs are metric (default; UV units == OBJ units unless --uv-to-obj is set)" << std::endl;
         std::cout << "  --uv-non-metric     : Revert to legacy behavior (measure scale from 3D mesh)" << std::endl;
         std::cout << "  --uv-to-obj=<ratio> : OBJ units per 1 UV unit (default: 1.0). Only used with --uv-metric." << std::endl;
@@ -546,7 +550,11 @@ int main(int argc, char *argv[])
     }
 
     std::filesystem::path obj_path = argv[1];
-    std::filesystem::path output_dir = argv[2];
+    // The output is a directory, or a store given as --store=PATH.
+    const bool output_positional = std::string(argv[2]).rfind("--", 0) != 0;
+    std::filesystem::path output_dir = output_positional ? argv[2] : "";
+    StoreOutputArgs store_output;
+    std::string source_surface;
     float stretch_factor = 1.0f;
     float mesh_units = 1.0f;      // micrometers per OBJ unit
     bool  uv_metric = true;       // treat UV as metric parametrization
@@ -560,8 +568,13 @@ int main(int argc, char *argv[])
     // positional numbers: stretch_factor, mesh_units
     // optional flags: --uv-metric (no-op default)  --uv-non-metric  --uv-to-obj=<ratio>
     int consumed_numbers = 0;
-    for (int i = 3; i < argc; ++i) {
+    for (int i = output_positional ? 3 : 2; i < argc; ++i) {
         std::string a = argv[i];
+        if (store_output.parse(a)) continue;
+        if (starts_with(a, "--source-surface=")) {
+            source_surface = a.substr(std::string("--source-surface=").size());
+            continue;
+        }
         if (starts_with(a, "--uv-metric")) {
             uv_metric = true;
             continue;
@@ -631,6 +644,17 @@ int main(int argc, char *argv[])
         }
     }
 
+    if (output_dir.empty() == store_output.store.empty() ||
+        (store_output.store.empty() && (!store_output.name.empty() || !store_output.tags.empty() ||
+                                        !store_output.volume.empty() || !source_surface.empty()))) {
+        std::cerr << "Give an output directory or --store=<store>; --name, --tag, --volume-uuid and --source-surface need --store\n";
+        return EXIT_FAILURE;
+    }
+    if (!store_output.store.empty() && (!uuid_override.empty() || !tifxyz_source.empty())) {
+        std::cerr << "In store mode the source is --source-surface=<uuid> and the store assigns the UUID\n";
+        return EXIT_FAILURE;
+    }
+
     if (!std::filesystem::exists(obj_path)) {
         std::cerr << "Input file does not exist: " << obj_path << std::endl;
         return EXIT_FAILURE;
@@ -668,9 +692,11 @@ int main(int argc, char *argv[])
     // to the input sampling density, and (if present) the approval mask to
     // resample. Absent -> legacy metric sizing, no approval channel.
     utils::Json sourceMeta = utils::Json::object();
-    if (!tifxyz_source.empty()) {
+    if (!tifxyz_source.empty() || !source_surface.empty()) {
         try {
-            std::unique_ptr<QuadSurface> src(load_quad_from_tifxyz(tifxyz_source));
+            std::unique_ptr<QuadSurface> src(source_surface.empty()
+                ? load_quad_from_tifxyz(tifxyz_source)
+                : StoreSurfaces(store_output.store, "vc_obj2tifxyz").load(source_surface));
             if (src->meta.is_object())
                 sourceMeta = src->meta;
             const cv::Vec2f s = src->scale();
@@ -717,6 +743,23 @@ int main(int argc, char *argv[])
         std::cout << "Attached resampled approval channel\n";
     }
     
+    if (!store_output.store.empty()) {
+        try {
+            nlohmann::json parameters = {{"input", obj_path.filename().string()}, {"arguments", std::vector<std::string>(argv + 2, argv + argc)}};
+            StoreSurfaces store(store_output.store, std::filesystem::path(argv[0]).filename().string());
+            const auto uuid = store.create(*surf, store_output.name.empty() ? obj_path.stem().string() : store_output.name,
+                                           parameters, source_surface.empty() ? std::vector<std::string>{} : std::vector<std::string>{source_surface}, store_output.tags, store_output.coordinates());
+            store.finish();
+            std::cout << "surface_uuid: " << uuid << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "Error storing surface: " << e.what() << std::endl;
+            delete surf;
+            return EXIT_FAILURE;
+        }
+        delete surf;
+        return EXIT_SUCCESS;
+    }
+
     // A converted mesh is a new object: fresh UUID unless --uuid names one.
     surf->meta["uuid"] = vc::util::resolveTifxyzUuid(uuid_override);
     

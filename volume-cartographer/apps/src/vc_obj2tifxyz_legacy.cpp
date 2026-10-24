@@ -1,4 +1,5 @@
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/StoreSurfaces.hpp"
 #include "vc/core/util/TifxyzIdentity.hpp"
 
 #include <iostream>
@@ -338,7 +339,7 @@ private:
 int main(int argc, char *argv[])
 {
     if (argc < 3) {
-        std::cout << "usage: " << argv[0] << " <input.obj> <output_directory> [step_size] [--uuid=<id>]"
+        std::cout << "usage: " << argv[0] << " <input.obj> <output_directory | --store=<store>> [step_size] [--uuid=<id>]"
                   << " [--scale-method=median|mean | --uv-scale=<s>[,<sv>]]" << std::endl;
         std::cout << "Converts an OBJ file to tifxyz format" << std::endl;
         std::cout << std::endl;
@@ -346,6 +347,8 @@ int main(int argc, char *argv[])
         std::cout << "  step_size: UV units per grid cell (default: 20)" << std::endl;
         std::cout << "             Scale will be 1/step_size (default: 0.05)" << std::endl;
         std::cout << "  --uuid=<id>: Metadata UUID. Defaults to a fresh random UUID." << std::endl;
+        std::cout << "  --store=<store>: write a new surface object instead of a directory (prints surface_uuid:)," << std::endl;
+        std::cout << "             with --name=<name>, --tag=<tag> (repeatable) and --volume-uuid=<id>" << std::endl;
         std::cout << "  --scale-method=median|mean: how the UV-to-3D scale (voxels per UV unit) that sizes" << std::endl;
         std::cout << "             the grid is estimated from the mesh: area weighted median of the per" << std::endl;
         std::cout << "             triangle Jacobian norms (default, robust to a few stretched triangles)" << std::endl;
@@ -360,7 +363,10 @@ int main(int argc, char *argv[])
     }
 
     std::filesystem::path obj_path = argv[1];
-    std::filesystem::path output_dir = argv[2];
+    // The output is a directory, or a store given as --store=PATH.
+    const bool output_positional = std::string(argv[2]).rfind("--", 0) != 0;
+    std::filesystem::path output_dir = output_positional ? argv[2] : "";
+    StoreOutputArgs store_output;
     float step_size = 20.0f;
     std::string uuid_override;
     ScaleMethod scale_method = ScaleMethod::Median;
@@ -368,8 +374,9 @@ int main(int argc, char *argv[])
     cv::Vec2d manual_scale(1.0, 1.0);
 
     bool consumed_step_size = false;
-    for (int i = 3; i < argc; ++i) {
+    for (int i = output_positional ? 3 : 2; i < argc; ++i) {
         const std::string arg = argv[i];
+        if (store_output.parse(arg)) continue;
         if (arg.rfind("--uuid=", 0) == 0) {
             uuid_override = arg.substr(std::string("--uuid=").size());
             if (uuid_override.empty()) {
@@ -419,6 +426,16 @@ int main(int argc, char *argv[])
         consumed_step_size = true;
     }
 
+    if (output_dir.empty() == store_output.store.empty() ||
+        (store_output.store.empty() && (!store_output.name.empty() || !store_output.tags.empty() || !store_output.volume.empty()))) {
+        std::cerr << "Give an output directory or --store=<store>; --name, --tag and --volume-uuid need --store" << std::endl;
+        return EXIT_FAILURE;
+    }
+    if (!store_output.store.empty() && !uuid_override.empty()) {
+        std::cerr << "--uuid names tifxyz output; stored surfaces get their UUID from the store" << std::endl;
+        return EXIT_FAILURE;
+    }
+
     if (method_given && uv_scale_given) {
         std::cerr << "--scale-method and --uv-scale are exclusive" << std::endl;
         return EXIT_FAILURE;
@@ -453,6 +470,23 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
     
+    if (!store_output.store.empty()) {
+        try {
+            nlohmann::json parameters = {{"input", obj_path.filename().string()}, {"arguments", std::vector<std::string>(argv + 2, argv + argc)}};
+            StoreSurfaces store(store_output.store, std::filesystem::path(argv[0]).filename().string());
+            const auto uuid = store.create(*surf, store_output.name.empty() ? obj_path.stem().string() : store_output.name,
+                                           parameters, {}, store_output.tags, store_output.coordinates());
+            store.finish();
+            std::cout << "surface_uuid: " << uuid << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "Error storing surface: " << e.what() << std::endl;
+            delete surf;
+            return EXIT_FAILURE;
+        }
+        delete surf;
+        return EXIT_SUCCESS;
+    }
+
     // A converted mesh is a new object: fresh UUID unless --uuid names one.
     surf->meta["uuid"] = vc::util::resolveTifxyzUuid(uuid_override);
     

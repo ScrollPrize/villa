@@ -86,3 +86,25 @@ void StoreSurfaces::finish(std::chrono::seconds timeout)
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
+
+bool StoreOutputArgs::parse(const std::string& arg)
+{
+    auto value = [&](const char* option) -> std::optional<std::string> {
+        const std::string prefix = std::string(option) + "=";
+        if (arg.rfind(prefix, 0) != 0) return std::nullopt;
+        if (arg.size() == prefix.size()) throw std::invalid_argument(std::string(option) + " needs a value");
+        return arg.substr(prefix.size());
+    };
+    if (const auto v = value("--store")) store = *v;
+    else if (const auto v = value("--name")) name = *v;
+    else if (const auto v = value("--tag")) tags.push_back(*v);
+    else if (const auto v = value("--volume-uuid")) volume = *v;
+    else return false;
+    return true;
+}
+
+std::optional<nlohmann::json> StoreOutputArgs::coordinates() const
+{
+    if (volume.empty()) return std::nullopt;
+    return nlohmann::json{{"volume_uuid", volume}, {"scale_factor", 1}};
+}

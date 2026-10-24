@@ -9,6 +9,9 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_object_store/Uuid.hpp>
 
+#include <nlohmann/json.hpp>
+#include <opencv2/core.hpp>
+
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -103,4 +106,46 @@ TEST_CASE("vc_render_tifxyz renders a stored surface like its tifxyz")
         if (entry.is_regular_file()) files.push_back(fs::relative(entry.path(), f.dir / "file"));
     REQUIRE_FALSE(files.empty());
     for (const auto& file : files) CHECK(readFile(f.dir / "store" / file) == readFile(f.dir / "file" / file));
+}
+
+namespace {
+std::string surfaceUuid(const std::string& output)
+{
+    std::smatch match;
+    REQUIRE(std::regex_search(output, match, std::regex("surface_uuid: ([0-9a-f-]{36})")));
+    return match[1];
+}
+void checkSameSurface(const Fixture& f, const std::string& uuid, const fs::path& tifxyz, const std::string& tool)
+{
+    OpenOptions options; options.author = "tool-store-test";
+    auto db = ObjectStore::open(f.store, options);
+    auto txn = db.read();
+    const auto stored = load_quad_from_store(db, txn, uuid);
+    const auto files = load_quad_from_tifxyz(tifxyz);
+    REQUIRE(stored->rawPointsPtr()->size() == files->rawPointsPtr()->size());
+    CHECK(cv::norm(*stored->rawPointsPtr(), *files->rawPointsPtr(), cv::NORM_INF) == 0);
+    CHECK(stored->_scale == files->_scale);
+    const auto meta = nlohmann::json::parse(db.objectByUuid(txn, uuid)->meta);
+    CHECK(meta.at("provenance").at("tool") == tool);
+    CHECK(meta.at("coordinates").at("volume_uuid") == "vol");
+    CHECK(db.objectByUuid(txn, uuid)->tags == std::vector<std::string>{"imported"});
+}
+}
+
+TEST_CASE("OBJ converters create stored surfaces equal to their tifxyz output")
+{
+    Fixture f;
+    run(tool("VC_TIFXYZ2OBJ_BIN") + " \"" + f.tifxyz.string() + "\" \"" + (f.dir / "mesh.obj").string() + "\"", f.dir / "obj.log");
+    const std::string mesh = "\"" + (f.dir / "mesh.obj").string() + "\"";
+    const std::string storeOptions = " --store=\"" + f.store.string() + "\" --tag=imported --volume-uuid=vol";
+
+    const auto legacy = tool("VC_OBJ2TIFXYZ_LEGACY_BIN");
+    run(legacy + " " + mesh + " \"" + (f.dir / "legacy.tifxyz").string() + "\" 4", f.dir / "legacy-file.log");
+    const auto legacyUuid = surfaceUuid(run(legacy + " " + mesh + storeOptions + " 4", f.dir / "legacy-store.log"));
+    checkSameSurface(f, legacyUuid, f.dir / "legacy.tifxyz", "vc_obj2tifxyz_legacy");
+
+    const auto modern = tool("VC_OBJ2TIFXYZ_BIN");
+    run(modern + " " + mesh + " \"" + (f.dir / "modern.tifxyz").string() + "\" --tifxyz-source=\"" + f.tifxyz.string() + "\"", f.dir / "modern-file.log");
+    const auto modernUuid = surfaceUuid(run(modern + " " + mesh + storeOptions + " --source-surface=" + f.uuid, f.dir / "modern-store.log"));
+    checkSameSurface(f, modernUuid, f.dir / "modern.tifxyz", "vc_obj2tifxyz");
 }

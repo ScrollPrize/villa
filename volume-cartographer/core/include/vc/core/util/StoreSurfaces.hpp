@@ -11,6 +11,19 @@
 #include <string>
 #include <vector>
 
+// Store-mode output options of tools with hand-written argument parsing:
+// --store=PATH, --name=NAME, --tag=TAG (repeatable), --volume-uuid=ID.
+struct StoreOutputArgs {
+    std::filesystem::path store;
+    std::string name;
+    std::vector<std::string> tags;
+    std::string volume;
+    // Consumes `arg` when it is one of the options above.
+    bool parse(const std::string& arg);
+    // meta.coordinates for outputs: bound to `volume` at its voxel scale.
+    std::optional<nlohmann::json> coordinates() const;
+};
+
 // Surface objects for command-line tools: `--store PATH` with `--surface UUID`
 // inputs and new surface outputs that record their provenance. A hosted
 // replica syncs in the background and finish() waits until the tool's writes
