@@ -257,6 +257,7 @@ TEST_CASE("vc_flatten flattens a stored surface and stores its uv channel")
     const auto bin = tool("VC_FLATTEN_BIN") + " --iterations 5";
     run(bin + " -i \"" + f.tifxyz.string() + "\" -o \"" + (f.dir / "flat").string() + "\"", f.dir / "file.log");
     const auto flat = surfaceUuid(run(bin + " -i " + f.uuid + " --store \"" + f.store.string() + "\" --tag flat", f.dir / "store.log"));
+    run(bin + " -i \"" + f.tifxyz.string() + "\" -o \"" + (f.dir / "uv").string() + "\" --uv-only", f.dir / "file-uv.log");
     run(bin + " -i " + f.uuid + " --store \"" + f.store.string() + "\" --uv-only", f.dir / "store-uv.log");
     OpenOptions options; options.author = "tool-store-test";
     auto db = ObjectStore::open(f.store, options);
@@ -269,9 +270,11 @@ TEST_CASE("vc_flatten flattens a stored surface and stores its uv channel")
     const auto revision = db.currentGeometry(txn, f.uuid);
     const auto uvArray = std::find_if(revision->arrays.begin(), revision->arrays.end(), [](const auto& a) { return a.name == "uv"; });
     REQUIRE(uvArray != revision->arrays.end());
-    // tifxyz --uv-only cannot write a two-component channel; the store keeps it per vertex.
     CHECK(uvArray->dtype == "<f4");
     CHECK(uvArray->shape == std::vector<int64_t>{12, 16, 2});
+    const cv::Mat fileUv = load_quad_from_tifxyz(f.dir / "uv")->channel("uv", SURF_CHANNEL_NORESIZE);
+    REQUIRE(fileUv.type() == CV_32FC2);
+    CHECK(std::vector<uint8_t>(fileUv.datastart, fileUv.dataend) == db.readGeometryArray(txn, revision->uuid, "uv"));
 }
 
 TEST_CASE("vc_objrefine refines a stored surface into a new object or in place")

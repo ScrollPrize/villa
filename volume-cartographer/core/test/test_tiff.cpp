@@ -312,3 +312,16 @@ TEST_CASE("mergeTiffParts: no part files returns false")
     CHECK_FALSE(ok);
     fs::remove_all(d);
 }
+
+TEST_CASE("writeSamplesTiff: two float components round-trip")
+{
+    auto d = tmpDir("samples");
+    cv::Mat_<cv::Vec2f> uv(5, 7);
+    for (int r = 0; r < uv.rows; ++r)
+        for (int c = 0; c < uv.cols; ++c) uv(r, c) = {float(c) * 0.5f, float(r) - 2.f};
+    writeSamplesTiff(d / "uv.tif", uv);
+    const cv::Mat loaded = readSamplesTiff(d / "uv.tif");
+    REQUIRE(loaded.type() == CV_32FC2);
+    CHECK(cv::norm(loaded, uv, cv::NORM_INF) == 0);
+    fs::remove_all(d);
+}

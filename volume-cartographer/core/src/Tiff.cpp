@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <system_error>
 #include <vector>
@@ -514,4 +515,76 @@ void atomicImwriteMulti(const std::filesystem::path& outPath,
         std::filesystem::remove(tmpPath, ec);
         throw;
     }
+}
+
+namespace {
+bool samplesFormat(int depth, uint16_t& bits, uint16_t& format)
+{
+    switch (depth) {
+    case CV_8U: bits = 8; format = SAMPLEFORMAT_UINT; return true;
+    case CV_16U: bits = 16; format = SAMPLEFORMAT_UINT; return true;
+    case CV_32S: bits = 32; format = SAMPLEFORMAT_INT; return true;
+    case CV_32F: bits = 32; format = SAMPLEFORMAT_IEEEFP; return true;
+    case CV_64F: bits = 64; format = SAMPLEFORMAT_IEEEFP; return true;
+    }
+    return false;
+}
+}
+
+void writeSamplesTiff(const std::filesystem::path& outPath, const cv::Mat& img)
+{
+    uint16_t bits = 0, format = 0;
+    if (img.empty() || !samplesFormat(img.depth(), bits, format))
+        throw std::runtime_error("unsupported image for " + outPath.string());
+    const cv::Mat contiguous = img.isContinuous() ? img : img.clone();
+    std::unique_ptr<TIFF, decltype(&TIFFClose)> file(TIFFOpen(outPath.string().c_str(), "w"), TIFFClose);
+    if (!file) throw std::runtime_error("Failed to open TIFF for writing: " + outPath.string());
+    TIFF* tf = file.get();
+    TIFFSetField(tf, TIFFTAG_IMAGEWIDTH, uint32_t(contiguous.cols));
+    TIFFSetField(tf, TIFFTAG_IMAGELENGTH, uint32_t(contiguous.rows));
+    TIFFSetField(tf, TIFFTAG_SAMPLESPERPIXEL, uint16_t(contiguous.channels()));
+    TIFFSetField(tf, TIFFTAG_BITSPERSAMPLE, bits);
+    TIFFSetField(tf, TIFFTAG_SAMPLEFORMAT, format);
+    TIFFSetField(tf, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+    TIFFSetField(tf, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_MINISBLACK);
+    if (contiguous.channels() > 1) {
+        std::vector<uint16_t> extra(size_t(contiguous.channels() - 1), EXTRASAMPLE_UNSPECIFIED);
+        TIFFSetField(tf, TIFFTAG_EXTRASAMPLES, uint16_t(extra.size()), extra.data());
+    }
+    TIFFSetField(tf, TIFFTAG_COMPRESSION, COMPRESSION_NONE);
+    TIFFSetField(tf, TIFFTAG_ROWSPERSTRIP, uint32_t(contiguous.rows));
+    std::vector<uint8_t> row(contiguous.cols * contiguous.elemSize());
+    for (int y = 0; y < contiguous.rows; ++y) {
+        std::memcpy(row.data(), contiguous.ptr(y), row.size());
+        if (TIFFWriteScanline(tf, row.data(), uint32_t(y), 0) < 0)
+            throw std::runtime_error("TIFFWriteScanline failed in " + outPath.string());
+    }
+    if (!TIFFWriteDirectory(tf)) throw std::runtime_error("TIFFWriteDirectory failed for " + outPath.string());
+}
+
+cv::Mat readSamplesTiff(const std::filesystem::path& path)
+{
+    std::unique_ptr<TIFF, decltype(&TIFFClose)> file(TIFFOpen(path.string().c_str(), "r"), TIFFClose);
+    if (!file) return {};
+    TIFF* tf = file.get();
+    uint32_t width = 0, height = 0;
+    uint16_t bits = 0, format = SAMPLEFORMAT_UINT, samples = 1, planar = PLANARCONFIG_CONTIG;
+    TIFFGetField(tf, TIFFTAG_IMAGEWIDTH, &width);
+    TIFFGetField(tf, TIFFTAG_IMAGELENGTH, &height);
+    TIFFGetFieldDefaulted(tf, TIFFTAG_BITSPERSAMPLE, &bits);
+    TIFFGetFieldDefaulted(tf, TIFFTAG_SAMPLEFORMAT, &format);
+    TIFFGetFieldDefaulted(tf, TIFFTAG_SAMPLESPERPIXEL, &samples);
+    TIFFGetFieldDefaulted(tf, TIFFTAG_PLANARCONFIG, &planar);
+    int depth = -1;
+    for (int candidate : {CV_8U, CV_16U, CV_32S, CV_32F, CV_64F}) {
+        uint16_t b = 0, f = 0;
+        if (samplesFormat(candidate, b, f) && b == bits && f == format) depth = candidate;
+    }
+    if (!width || !height || depth < 0 || planar != PLANARCONFIG_CONTIG || TIFFIsTiled(tf) || samples < 1 || samples > CV_CN_MAX)
+        return {};
+    cv::Mat result(int(height), int(width), CV_MAKETYPE(depth, samples));
+    if (TIFFScanlineSize(tf) != tmsize_t(result.cols * result.elemSize())) return {};
+    for (uint32_t y = 0; y < height; ++y)
+        if (TIFFReadScanline(tf, result.ptr(int(y)), y, 0) != 1) return {};
+    return result;
 }

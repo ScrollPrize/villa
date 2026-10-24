@@ -243,6 +243,15 @@ void replaceDirectoryContents(const std::filesystem::path& source,
 }
 #endif
 
+// Channel files with a sample count OpenCV's TIFF codec does not handle.
+bool readSamplesTiffFirst(const std::filesystem::path& path)
+{
+    std::unique_ptr<TIFF, decltype(&TIFFClose)> tif(TIFFOpen(path.string().c_str(), "r"), TIFFClose);
+    uint16_t samples = 1;
+    if (tif) TIFFGetFieldDefaulted(tif.get(), TIFFTAG_SAMPLESPERPIXEL, &samples);
+    return samples == 2 || samples > 4;
+}
+
 void normalizeMaskChannel(cv::Mat& mask)
 {
     if (mask.empty()) {
@@ -1322,9 +1331,14 @@ cv::Mat QuadSurface::channel(const std::string& name, int flags)
             std::filesystem::path channel_path = path / (name + ".tif");
             if (std::filesystem::exists(channel_path)) {
                 std::vector<cv::Mat> layers;
-                cv::imreadmulti(channel_path.string(), layers, cv::IMREAD_UNCHANGED);
-                if (!layers.empty()) {
-                    channel = layers[0];
+                // OpenCV rejects some sample layouts (e.g. two float components).
+                if (readSamplesTiffFirst(channel_path)) {
+                    channel = readSamplesTiff(channel_path);
+                } else {
+                    cv::imreadmulti(channel_path.string(), layers, cv::IMREAD_UNCHANGED);
+                    if (!layers.empty()) {
+                        channel = layers[0];
+                    }
                 }
             }
         }
@@ -2290,6 +2304,11 @@ void QuadSurface::writeChannelFile(const std::filesystem::path& dir, const std::
         }
     }
 
+    // OpenCV writes 1, 3 or 4 channels; others (e.g. the two-component uv) keep their samples.
+    if (!wrote && (mat.channels() == 2 || mat.channels() > 4)) {
+        writeSamplesTiff(dir / (name + ".tif"), mat);
+        wrote = true;
+    }
     if (!wrote) {
         std::vector<int> compression_params = { cv::IMWRITE_TIFF_COMPRESSION, COMPRESSION_NONE };
         cv::imwrite((dir / (name + ".tif")).string(), mat, compression_params);

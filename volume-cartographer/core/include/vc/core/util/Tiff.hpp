@@ -102,6 +102,13 @@ private:
 // probing; the caller decides what to report.
 bool isReadableTiff(const std::filesystem::path& path);
 
+// Any-channel images that OpenCV's TIFF codec cannot write or read (e.g. two
+// float components): one uncompressed page with interleaved samples. Depths
+// 8U, 16U, 32S, 32F and 64F.
+void writeSamplesTiff(const std::filesystem::path& outPath, const cv::Mat& img);
+// Page 0 with its samples interleaved; empty when the file is not such a TIFF.
+cv::Mat readSamplesTiff(const std::filesystem::path& path);
+
 // Merge partial .partN.tif files into final TIFFs.
 // Scans outputPath (or its parent directory) for .partN.tif files,
 // merges them tile-by-tile, and removes the part files.
