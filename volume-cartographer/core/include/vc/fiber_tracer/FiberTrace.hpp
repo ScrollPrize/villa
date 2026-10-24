@@ -100,6 +100,10 @@ struct FiberTraceConfig {
     double smoothnessNormalWeight = 0.1;
     double smoothnessTangentWeight = 10.0;
     double smoothnessFreeAngleDegrees = 0.0;
+    // Opt-in: weight * (angle between the step and the Lasagna sheet plane)^2,
+    // so a trace is charged for leaving its sheet. Zero disables it. Like the
+    // normal-aware smoothness terms above, it needs the Lasagna normals.
+    double sheetPlaneWeight = 0.0;
     int cumulativeSmoothnessSteps = 4;
     double cumulativeSmoothnessTangentWeight = 2.0;
     double initialFreeAngleDegrees = 0.0;
