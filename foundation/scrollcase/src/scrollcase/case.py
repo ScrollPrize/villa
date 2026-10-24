@@ -20,6 +20,11 @@ class ScrollCaseConfig:
     label_line_1: str = ""
     label_line_2: str = ""
 
+    # Turn (degrees, anticlockwise about Z) of the divider, and the lining, relative to
+    # the caps, whose bolt protrusions sit on the side within 45 degrees of it
+    # (cap_split_deg); the split runs from the lining to the middle of that side.
+    split_rotation_deg: float = 0
+
     # Gap/offset between scroll and lining wall interior
     lining_offset_mm: float = 2
     # Wall thicknesses
@@ -112,6 +117,23 @@ class ScrollCaseConfig:
         return 2 * self.lining_offset_mm + self.scroll_height_mm
 
     @property
+    def cap_split_deg(self):
+        """Turn of the caps' bolt protrusions (and top-cap labels): the multiple of 90
+        degrees nearest split_rotation_deg."""
+        return 90 * round(self.split_rotation_deg / 90)
+
+    @property
+    def split_rotation_fits(self):
+        """Whether the split can reach the caps' side from a divider at split_rotation_deg."""
+        return self.split_rotation_deg == self.cap_split_deg or curved_divider_wall.split_reaches_cap_side(
+            self.lining_outer_radius,
+            self.wall_thickness_mm,
+            self.split_rotation_deg,
+            self.cap_split_deg,
+            self.square_loft_radius,
+        )
+
+    @property
     def mount_disc_top_to_lining_bottom(self):
         return self.square_height_mm + self.lower_margin_mm + self.wall_thickness_mm
 
@@ -151,7 +173,8 @@ def mount_disc(case: ScrollCaseConfig):
         return mount_disc_part
 
 
-def cap(case: ScrollCaseConfig, with_bolt_protrusions: bool = True):
+def cap(case: ScrollCaseConfig, with_bolt_protrusions: bool = True, rotation_deg: float = 0):
+    """Square cap, its bolt protrusions along X turned by rotation_deg about Z."""
     with BuildPart() as cap_part:
         with BuildSketch():
             # Main rectangle
@@ -236,6 +259,8 @@ def cap(case: ScrollCaseConfig, with_bolt_protrusions: bool = True):
                 hex = hex_nut(case.m4_nut_diameter_mm, case.m4_nut_depth_mm + 10)
                 add(hex, mode=Mode.SUBTRACT, rotation=(90, 0, 0))
 
+    if rotation_deg:
+        cap_part.part = cap_part.part.rotate(Axis.Z, rotation_deg)
     return cap_part
 
 
@@ -259,6 +284,9 @@ def top_cap(case: ScrollCaseConfig, with_bolt_protrusions: bool = True):
                 )
         extrude(amount=-case.text_depth_mm, mode=Mode.SUBTRACT)
 
+    # The labels turn with the bolt protrusions, to stay off the split.
+    if case.cap_split_deg:
+        top_cap_part.part = top_cap_part.part.rotate(Axis.Z, case.cap_split_deg)
     return top_cap_part
 
 
@@ -268,7 +296,8 @@ def bottom_cap(
     with_counter_bore: bool = True,
 ):
     with BuildPart() as bottom_cap_part:
-        add(cap(case, with_bolt_protrusions=with_bolt_protrusions))
+        # The base's bolt holes and alignment arrow stay put.
+        add(cap(case, with_bolt_protrusions=with_bolt_protrusions, rotation_deg=case.cap_split_deg))
 
         if with_counter_bore:
             # Bolt holes
@@ -479,6 +508,11 @@ def build_case(config: ScrollCaseConfig) -> tuple[Solid, Solid]:
     logger.info(
         f"Constructing case with scroll radius: {config.scroll_radius_mm}, height: {config.scroll_height_mm}"
     )
+    if not config.split_rotation_fits:
+        raise ValueError(
+            f"A divider turned {config.split_rotation_deg:.1f} deg cannot reach the caps' "
+            f"side at {config.cap_split_deg} deg"
+        )
 
     with BuildPart(Location((0, 0, config.cylinder_bottom))) as case:
         # Top and bottom caps
@@ -492,6 +526,9 @@ def build_case(config: ScrollCaseConfig) -> tuple[Solid, Solid]:
             config.wall_thickness_mm,
             config.cylinder_height,
             config.square_loft_radius * 2,
+            config.split_rotation_deg,
+            config.cap_split_deg,
+            config.square_loft_radius,
         )
         add(divider_wall)
 
@@ -519,6 +556,9 @@ def build_case(config: ScrollCaseConfig) -> tuple[Solid, Solid]:
                 config.lining_outer_radius,
                 config.square_loft_radius * 2,
                 config.wall_thickness_mm,
+                config.split_rotation_deg,
+                config.cap_split_deg,
+                config.square_loft_radius,
             ).part
             assert isinstance(remove_part, Part)
             add(remove_part, mode=Mode.SUBTRACT)

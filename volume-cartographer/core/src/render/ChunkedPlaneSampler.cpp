@@ -388,10 +388,10 @@ bool readVoxel(IChunkedArray& array,
     const std::size_t offset = (std::size_t(lz) * std::size_t(chunkShape[1])
                               + std::size_t(ly)) * std::size_t(chunkShape[2])
                               + std::size_t(lx);
-    if (offset >= result.bytes->size())
+    if (result.byteOffset + offset >= result.bytes->size())
         return false;
 
-    out = std::to_integer<uint8_t>((*result.bytes)[offset]);
+    out = std::to_integer<uint8_t>((*result.bytes)[result.byteOffset + offset]);
     return true;
 }
 
@@ -463,12 +463,12 @@ StrictSampleStatus readPinnedVoxel(const PinnedChunkCache& cache,
     const std::size_t offset = (std::size_t(lz) * std::size_t(chunkShape[1])
                               + std::size_t(ly)) * std::size_t(chunkShape[2])
                               + std::size_t(lx);
-    if (offset >= result->bytes->size()) {
+    if (result->byteOffset + offset >= result->bytes->size()) {
         error = "chunk payload is smaller than expected";
         return StrictSampleStatus::Error;
     }
 
-    out = std::to_integer<uint8_t>((*result->bytes)[offset]);
+    out = std::to_integer<uint8_t>((*result->bytes)[result->byteOffset + offset]);
     return StrictSampleStatus::Ready;
 }
 
@@ -844,8 +844,8 @@ bool sampleTrilinear(IChunkedArray& array,
                                             + std::size_t(ly) * strideY
                                             + std::size_t(lx);
                 const std::size_t offset111 = offset000 + strideZ + strideY + strideX;
-                if (offset111 < result.bytes->size()) {
-                    const auto* bytes = result.bytes->data();
+                if (result.byteOffset + offset111 < result.bytes->size()) {
+                    const auto* bytes = result.bytes->data() + result.byteOffset;
                     const uint8_t v000 = std::to_integer<uint8_t>(bytes[offset000]);
                     const uint8_t v001 = std::to_integer<uint8_t>(bytes[offset000 + strideX]);
                     const uint8_t v010 = std::to_integer<uint8_t>(bytes[offset000 + strideY]);
@@ -982,11 +982,11 @@ StrictSampleStatus samplePinnedTrilinear(const PinnedChunkCache& cache,
                 std::size_t(iy - run->begin[1]) * strideY +
                 std::size_t(ix - run->begin[2]);
             const std::size_t offset111 = offset000 + strideZ + strideY + strideX;
-            if (offset111 >= result->bytes->size()) {
+            if (result->byteOffset + offset111 >= result->bytes->size()) {
                 error = "chunk payload is smaller than expected";
                 return StrictSampleStatus::Error;
             }
-            const auto* bytes = result->bytes->data();
+            const auto* bytes = result->bytes->data() + result->byteOffset;
             out = interpolateTrilinearU8(
                 fx, fy, fz,
                 std::to_integer<uint8_t>(bytes[offset000]),
@@ -2537,8 +2537,10 @@ ChunkedPlaneSampler::visitTrilinearCornersLevelBlockingRequestedLevel(
                 ++stats.missingChunks;
             const auto& stored = result;
             if (stored.status == ChunkStatus::Data && stored.bytes) {
-                pinned[volumeIndex].data[dependencyIndex] = stored.bytes->data();
-                pinned[volumeIndex].size[dependencyIndex] = stored.bytes->size();
+                if (stored.byteOffset > stored.bytes->size())
+                    throw std::runtime_error("packed channel offset exceeds chunk payload");
+                pinned[volumeIndex].data[dependencyIndex] = stored.bytes->data() + stored.byteOffset;
+                pinned[volumeIndex].size[dependencyIndex] = stored.bytes->size() - stored.byteOffset;
             }
         }
         ++volumeIndex;

@@ -131,21 +131,8 @@ Tests mock GPU launches. Actual data replay requires the prepared tensors,
 initializers/samples, frozen GT, cached cross-events, and historical reports;
 these large artifacts are not bundled. No installation or bootstrap is done.
 
-Real-data compatibility check (2026-10-22): replaying the historical accepted
-candidate `a838956dd140d329e78f` through the new scorer reproduced all three
-recorded perpendicular/parallel scores and sign counts (L1/correctness tolerance
-1e-10). Summed perpendicular signs: 38; selectable GT retained length: 95.315808%;
-rank score: 39.867469; summed perpendicular L1: 1.023098. This checks the scoring
-API against real checkpoints, **not** convergence of new solves on main.
-
-Review-fix validation (2026-10-22): all 14 recorded final loss terms and all
-other final scientific fields match for each of the three historical checkpoints.
-The same scores above are reproduced with the stricter checks. Auditing the
-170/171/170 source settings and the solver's prepared configs found no scientific
-setting changes versus the historical executed configs; differences are output
-paths, GPU lanes/labels, and code-provenance metadata. The L-BFGS, geometry and
-loss implementations were also compared against the historical solver revision
-`4a35bf9e18c3` (and the last experiment branch `d8f8c3595`): objective calculations
-are unchanged. Changes in the merged entrypoint modules concern launch dispatch,
-moved imports and removal of experiment-only dispatch/audits. No fresh GPU solve
-was run for this review-fix check.
+For a read-only compatibility check against caller-supplied saved checkpoints,
+set `FIBER_LAYOUT_REFERENCE_SPEC` to a benchmark specification and run
+`vesuvius/tests/test_fiber_workflows_real_data.py`. This recomputes scores and
+full-objective terms without running optimization. Keep experiment-specific
+measurements and checkpoint identities with the external results, not here.

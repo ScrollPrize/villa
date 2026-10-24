@@ -1,0 +1,13 @@
+{
+  "fiber_json_solve": {
+    "source_dir": "/data/fiber-layout/reviewed",
+    "afv_template": "/data/fiber-layout/metadata.afv",
+    "expected_manifest_tokens": ["YOUR_VOLUME", "YOUR_SCAN"],
+    "output_root": "/data/fiber-layout/prepared",
+    "stages": [
+      {"name": "extraction", "config_file": "/configs/fiber-layout/extraction.json"},
+      {"name": "orientation", "config_file": "/configs/fiber-layout/orientation.json"},
+      {"name": "layout", "config_file": "/configs/fiber-layout/layout.json"}
+    ]
+  }
+}

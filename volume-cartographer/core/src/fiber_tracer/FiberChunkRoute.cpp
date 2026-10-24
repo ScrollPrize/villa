@@ -1,4 +1,5 @@
 #include "vc/fiber_tracer/FiberChunkTrace.hpp"
+#include "vc/fiber_tracer/FiberEvaluation.hpp"
 #include "vc/fiber_tracer/FiberWidth.hpp"
 #include <algorithm>
 #include <cmath>
@@ -160,19 +161,31 @@ FiberReplayTraceResult traceFiberChunkReferenceReplay(FiberChunkTraceCache& cach
     if(!std::isfinite(c.errorThresholdBase)||c.errorThresholdBase<=0)
         throw std::invalid_argument("chunk replay requires a positive initial acceptance radius");
     const auto& config=cache.config();
+    auto initial=c;
+    if(config.initialNormalRadiusBase>0) {
+        initial.errorThresholdBase=config.initialNormalRadiusBase;
+        initial.tangentialThresholdFactor=config.initialTangentialRadiusBase/config.initialNormalRadiusBase;
+    }
     const FiberChunkProvider get=[&](const auto& key){return cache.get(key,source,t,tracingNormals,scale,parallel,wait);};
     auto policy=consistency;policy.seedAllStarts=true;
     policy.nextSeed=[&](double from)->std::optional<PolylineArcSample> {
         while(from<end) {
-            auto seed=consistency.nextSeed?consistency.nextSeed(from):std::optional(samplePolylineArc(reference,from));
+            auto seed=config.presencePeakRestarts?
+                findFiberReplayRestartSeed(source,t,scale,normals,normalScale,reference,from,end,stepBase):
+                (consistency.nextSeed?consistency.nextSeed(from):std::optional(samplePolylineArc(reference,from)));
             if(!seed) return std::nullopt;
             if(!std::isfinite(seed->arc)||seed->arc<from||seed->arc>=end)
                 throw std::invalid_argument("chunk seed search did not advance within reference bounds");
             const auto ref=samplePolylineArc(reference,seed->arc);
-            const auto region=initialRegion(ref.point,normals,normalScale,c);
+            const auto region=initialRegion(ref.point,normals,normalScale,initial);
             const auto chunk=getChunk(get,keyAt(ref.point,config.coreBase));
             const auto match=matchFiberChunkPaths(*chunk,{ref.point},ref.tangent,config,true,&region);
-            if(match.valid) {seed->point=match.point;seed->tangent=ref.tangent;return seed;}
+            if(match.valid) {
+                seed->point=match.point;
+                if(!config.presencePeakRestarts)seed->tangent=ref.tangent;
+                return seed;
+            }
+            if(config.presencePeakRestarts)return seed; // report no initial path, as historical replay did
             const double next=seed->arc+stepBase;
             if(next<=from) throw std::invalid_argument("chunk seed search cannot advance");
             from=next;
@@ -182,7 +195,7 @@ FiberReplayTraceResult traceFiberChunkReferenceReplay(FiberChunkTraceCache& cach
     const ReplaySegmentRunner run=[&](const PolylineArcSample& seed,double remaining,int maximumSteps,
         const ReplayPointObserver& observe,const FiberTraceProgressCallback& report) {
         const auto ref=samplePolylineArc(reference,seed.arc);
-        const auto region=initialRegion(ref.point,normals,normalScale,c);
+        const auto region=initialRegion(ref.point,normals,normalScale,initial);
         const ReplayPointObserver forwarding=[&](const cv::Vec3d& p,double loss,int step) {
             const bool keep=observe(p,loss,step);
             if(report) {

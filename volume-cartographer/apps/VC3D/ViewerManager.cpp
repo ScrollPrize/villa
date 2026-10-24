@@ -432,6 +432,7 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
     baseViewer->setOverlayColormap(_overlayColormapId);
     baseViewer->setOverlaySamplingMethod(_overlaySamplingMethod);
     baseViewer->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
+    baseViewer->setOverlayIntensityAsAlpha(_overlayIntensityAsAlpha);
     baseViewer->setOverlayMaxDisplayedResolution(_overlayMaxDisplayedResolution);
     baseViewer->setOverlayComposite(_overlayComposite);
     baseViewer->setSurfaceCacheBudgets(_surfaceCacheBudgetBytes,
@@ -1168,9 +1169,12 @@ void ViewerManager::setOverlaySamplingMethod(vc::Sampling method)
     });
 }
 
-void ViewerManager::setOverlayThreshold(float threshold)
+void ViewerManager::setOverlayIntensityAsAlpha(bool enabled)
 {
-    setOverlayWindow(std::max(threshold, 0.0f), _overlayWindowHigh);
+    _overlayIntensityAsAlpha = enabled;
+    forEachBaseViewer([this](VolumeViewerBase* v) {
+        v->setOverlayIntensityAsAlpha(_overlayIntensityAsAlpha);
+    });
 }
 
 void ViewerManager::setOverlayWindow(float low, float high)

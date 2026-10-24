@@ -1534,6 +1534,7 @@ def run_preprocess_3d(
 	live_cache: LiveOmeZarrCache | None = None,
 	profile_pipeline: bool = False,
 	product_accumulator_dtype: str = "float16",
+	output_format: str = "compact",
 ) -> None:
 	"""Run 3D UNet inference and write .lasagna.json with OME-Zarr pyramids.
 
@@ -1565,8 +1566,9 @@ def run_preprocess_3d(
 	if int(prefetch_tiles_per_gpu) <= 0 or int(input_io_threads) <= 0 or int(input_copy_threads) <= 0:
 		raise ValueError("prefetch_tiles_per_gpu and TensorStore thread counts must be > 0")
 
-	if not output_path.endswith(".lasagna.json"):
-		raise ValueError(f"output must be .lasagna.json, got: {output_path}")
+	from lasagna.compact_zarr import CompactOutputAdapter, resolve_output
+	output_location, output_format = resolve_output(output_path, output_format)
+	output_path = str(output_location)
 
 	a_in = zarr.open(str(input_path), mode="r")
 	if not hasattr(a_in, "shape"):
@@ -1621,7 +1623,7 @@ def run_preprocess_3d(
 	os.makedirs(out_dir, exist_ok=True)
 
 	# Derive zarr name prefix from JSON filename: "s5.lasagna.json" → "s5_"
-	json_stem = os.path.basename(output_path).removesuffix(".lasagna.json")
+	json_stem = os.path.basename(output_path).removesuffix(".lasagna.json").removesuffix(".zarr")
 	prefix = f"{json_stem}_" if json_stem else ""
 	_removed_tmp = _cleanup_predict3d_temp_files(out_dir, prefix)
 	if _removed_tmp > 0:
@@ -1740,6 +1742,9 @@ def run_preprocess_3d(
 	nx_omezarr_path = os.path.join(out_dir, f"{prefix}nx.ome.zarr")
 	ny_omezarr_path = os.path.join(out_dir, f"{prefix}ny.ome.zarr")
 	dt_omezarr_path = os.path.join(out_dir, f"{prefix}pred_dt.ome.zarr") if pred_dt_path else None
+	if dt_omezarr_path and output_format == "compact":
+		# Resumable scratch only; the authoritative pred_dt joins the packed chunk.
+		dt_omezarr_path = os.path.join(out_dir, f".{prefix}pred_dt.staging.zarr")
 
 	predict_adapter = LasagnaCosPredict3DAdapter(
 		checkpoint=unet3d_checkpoint,
@@ -1781,36 +1786,44 @@ def run_preprocess_3d(
 			else None
 		),
 	)
-	output_adapter = OmeZarrOutputAdapter(
-		products=predict_adapter.output_products,
-		n_levels=n_levels,
-	)
+	if output_format == "compact":
+		output_adapter = CompactOutputAdapter(root=output_path, products=predict_adapter.output_products,
+			n_levels=n_levels, validity_channel="grad_mag")
+		output_adapter.prepare(base_shape_zyx=base_shape_zyx, ome_chunk=oc, ome_compressor=ome_compressor,
+			source_to_base=source_to_base, grad_mag_factor=1.0/input_sd,
+			crop=crop_xyzwhd, provenance="../inference.json")
+		output_groups = None
+	else:
+		output_adapter = OmeZarrOutputAdapter(
+			products=predict_adapter.output_products,
+			n_levels=n_levels,
+		)
+		output_groups = create_product_omezarr_groups(
+			products=predict_adapter.output_products,
+			base_shape_zyx=base_shape_zyx,
+			n_levels=n_levels,
+			ome_chunk=oc,
+			ome_compressor=ome_compressor,
+		)
+		write_lasagna_product_manifest(
+			output_path=output_path,
+			products=predict_adapter.output_products,
+			base_shape_zyx=base_shape_zyx,
+			crop_xyzwhd_base=crop_xyzwhd,
+			source_to_base=source_to_base,
+			grad_mag_factor=_grad_mag_factor_from_input_sd(input_sd),
+			provenance_json="inference.json",
+		)
 	cos_product = predict_adapter.cos_product
 	normal_product = predict_adapter.normal_product
 
-	output_groups = create_product_omezarr_groups(
-		products=predict_adapter.output_products,
-		base_shape_zyx=base_shape_zyx,
-		n_levels=n_levels,
-		ome_chunk=oc,
-		ome_compressor=ome_compressor,
-	)
-	write_lasagna_product_manifest(
-		output_path=output_path,
-		products=predict_adapter.output_products,
-		base_shape_zyx=base_shape_zyx,
-		crop_xyzwhd_base=crop_xyzwhd,
-		source_to_base=source_to_base,
-		grad_mag_factor=_grad_mag_factor_from_input_sd(input_sd),
-		provenance_json="inference.json",
-	)
-
 	# Level arrays (3D) for writing
-	cos_lv_arr = output_groups["cos"][str(cos_level)]
-	gm_lv_arr = output_groups["grad_mag"][str(other_level)]
-	nx_lv_arr = output_groups["nx"][str(other_level)]
-	ny_lv_arr = output_groups["ny"][str(other_level)]
-	dt_lv_arr = output_groups["pred_dt"][str(cos_level)] if dt_omezarr_path else None
+	if dt_omezarr_path and output_format == "compact":
+		dt_lv_arr = _open_or_create_omezarr(dt_omezarr_path, base_shape_zyx, cos_level,
+			n_levels, oc, "pred_dt", ome_compressor)[str(cos_level)]
+		output_adapter.external_channels["pred_dt"] = str(Path(dt_omezarr_path) / str(cos_level))
+	else:
+		dt_lv_arr = output_groups["pred_dt"][str(cos_level)] if dt_omezarr_path else None
 
 	# Resume is handled per-chunk: _is_tile_done skips tiles whose output
 	# chunks exist, and the flush skips writing existing chunks.
@@ -1837,7 +1850,10 @@ def run_preprocess_3d(
 	# calibration, when requested, is transferred as an explicit CPU state dict.
 	model = None
 	calibrated_state = None
-	if len(resolved_devices) == 1 or calibrate_norm:
+	from lasagna.cooperative_inference import enabled as cooperative_enabled
+	if cooperative_enabled(resolved_devices) and calibrate_norm:
+		raise ValueError("norm calibration is not supported during cooperative volume inference; calibrate the checkpoint first")
+	if (len(resolved_devices) == 1 and not cooperative_enabled(resolved_devices)) or calibrate_norm:
 		model = predict_adapter.load_model(device=torch_device)
 	if calibrate_norm:
 		_calibrate_instance_norm(
@@ -1866,6 +1882,35 @@ def run_preprocess_3d(
 			other_oz1 * effective_other_sd,
 		),
 	}
+	if pred_dt_zarr is not None and dt_lv_arr is not None:
+		base_z0 = cos_oz0 * effective_cos_sd
+		base_z1 = cos_oz1 * effective_cos_sd
+		if crop_xyzwhd is not None:
+			pdt_y0, pdt_y1 = y0 * input_sd // pred_sd, (y0 + ny) * input_sd // pred_sd
+			pdt_x0, pdt_x1 = x0 * input_sd // pred_sd, (x0 + nx_dim) * input_sd // pred_sd
+		else:
+			pdt_y0, pdt_y1 = 0, int(pred_dt_zarr.shape[1])
+			pdt_x0, pdt_x1 = 0, int(pred_dt_zarr.shape[2])
+		_compute_pred_dt_slab(
+			pred_zarr=pred_dt_zarr,
+			pred_path=pred_dt_path,
+			output_level_arr=dt_lv_arr,
+			output_omezarr_path=dt_omezarr_path,
+			output_level_key=str(cos_level),
+			pred_z0=base_z0 // pred_sd,
+			pred_z1=base_z1 // pred_sd,
+			pred_y0=pdt_y0,
+			pred_y1=pdt_y1,
+			pred_x0=pdt_x0,
+			pred_x1=pdt_x1,
+			out_z0=cos_oz0,
+			out_y0=cos_oy0,
+			out_x0=cos_ox0,
+			scaledown=pred_per_cos,
+			ome_chunk=oc,
+			n_levels=n_levels,
+			progress=_progress,
+		)
 	_t_inference_start = time.time()
 	try:
 		run_tiled_inference_3d(
@@ -1920,52 +1965,28 @@ def run_preprocess_3d(
 		if torch_device.type == "cuda":
 			torch.cuda.empty_cache()
 
-	if pred_dt_zarr is not None and dt_lv_arr is not None:
-		base_z0 = cos_oz0 * effective_cos_sd
-		base_z1 = cos_oz1 * effective_cos_sd
-		if crop_xyzwhd is not None:
-			pdt_y0, pdt_y1 = y0 * input_sd // pred_sd, (y0 + ny) * input_sd // pred_sd
-			pdt_x0, pdt_x1 = x0 * input_sd // pred_sd, (x0 + nx_dim) * input_sd // pred_sd
-		else:
-			pdt_y0, pdt_y1 = 0, int(pred_dt_zarr.shape[1])
-			pdt_x0, pdt_x1 = 0, int(pred_dt_zarr.shape[2])
-		_compute_pred_dt_slab(
-			pred_zarr=pred_dt_zarr,
-			pred_path=pred_dt_path,
-			output_level_arr=dt_lv_arr,
-			output_omezarr_path=dt_omezarr_path,
-			output_level_key=str(cos_level),
-			pred_z0=base_z0 // pred_sd,
-			pred_z1=base_z1 // pred_sd,
-			pred_y0=pdt_y0,
-			pred_y1=pdt_y1,
-			pred_x0=pdt_x0,
-			pred_x1=pdt_x1,
-			out_z0=cos_oz0,
-			out_y0=cos_oy0,
-			out_x0=cos_ox0,
-			scaledown=pred_per_cos,
-			ome_chunk=oc,
-			n_levels=n_levels,
-			progress=_progress,
-		)
 
 	print("[predict3d] building OME-Zarr pyramids ...", flush=True)
-	build_product_omezarr_pyramids(
-		products=predict_adapter.output_products,
-		n_levels=n_levels,
-		ome_chunk=oc,
-		crop_zyx_by_product={
-			cos_product.name: (cos_oz0, cos_oy0, cos_ox0, cos_oz1, cos_oy1, cos_ox1),
-			normal_product.name: (other_oz0, other_oy0, other_ox0, other_oz1, other_oy1, other_ox1),
-			**(
-				{predict_adapter.pred_dt_product.name: (cos_oz0, cos_oy0, cos_ox0, cos_oz1, cos_oy1, cos_ox1)}
-				if predict_adapter.pred_dt_product is not None else {}
-			),
-		},
-	)
+	if output_format == "compact":
+		output_adapter.build_pyramids(workers=os.cpu_count() or 1)
+	else:
+		build_product_omezarr_pyramids(
+			products=predict_adapter.output_products,
+			n_levels=n_levels,
+			ome_chunk=oc,
+			crop_zyx_by_product={
+				cos_product.name: (cos_oz0, cos_oy0, cos_ox0, cos_oz1, cos_oy1, cos_ox1),
+				normal_product.name: (other_oz0, other_oy0, other_ox0, other_oz1, other_oy1, other_ox1),
+				**(
+					{predict_adapter.pred_dt_product.name: (cos_oz0, cos_oy0, cos_ox0, cos_oz1, cos_oy1, cos_ox1)}
+					if predict_adapter.pred_dt_product is not None else {}
+				),
+			},
+		)
 	if _gpu_ctx is not None:
 		_gpu_ctx.__exit__(None, None, None)
+	if dt_omezarr_path and output_format == "compact":
+		_remove_path_quiet(dt_omezarr_path)
 	_cleanup_predict3d_temp_files(out_dir, prefix, remove_current_process=True)
 	print(f"[predict3d] done. manifest: {output_path}", flush=True)
 	return
@@ -2677,7 +2698,9 @@ def _predict3d_repository_state() -> dict[str, object]:
 
 
 def _lasagna_product_provenance(manifest_path: Path) -> dict[str, object]:
-	manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+	manifest = json.loads(((manifest_path / ".zattrs") if manifest_path.is_dir() else manifest_path).read_text(encoding="utf-8"))
+	if manifest_path.is_dir():
+		manifest = manifest["lasagna"]
 	groups = manifest.get("groups", {})
 	return {
 		"manifest_version": manifest.get("version"),
@@ -2706,11 +2729,12 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		pass
 
 	p = argparse.ArgumentParser(
-		description="Run 3D UNet inference and write .lasagna.json with per-group zarrs (cos, prediction, pred_dt).",
+		description="Run 3D UNet inference and write a compact prediction Zarr (or legacy per-channel output).",
 		formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 	)
 	p.add_argument("--input", required=True, help="Input zarr array (3D ZYX).")
-	p.add_argument("--output", required=True, help="Output .lasagna.json path.")
+	p.add_argument("--output", required=True, help="Output compact .zarr store; existing sidecars remain resumable.")
+	p.add_argument("--output-format", choices=("compact", "legacy"), default="compact")
 	p.add_argument("--unet-checkpoint", required=True, help="3D UNet checkpoint (.pt).")
 	p.add_argument("--tile-size", type=int, default=None,
 		help="Inference tile size (default: checkpoint patch_size).")
@@ -2845,7 +2869,9 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 			load_context,
 			sha256_file,
 		)
-	output_manifest = Path(args.output)
+	from lasagna.compact_zarr import resolve_output
+	output_manifest, args.output_format = resolve_output(args.output, args.output_format)
+	args.output = str(output_manifest)
 	provenance_path = output_manifest.parent / "inference.json"
 	context = load_context(args.provenance_context)
 	provenance = base_document(artifact_kind="lasagna", context=context)
@@ -2929,6 +2955,7 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		run_preprocess_3d(
 		input_path=str(args.input),
 		output_path=str(args.output),
+		output_format=args.output_format,
 		unet3d_checkpoint=str(args.unet_checkpoint),
 		device=args.device,
 		devices=args.devices,
