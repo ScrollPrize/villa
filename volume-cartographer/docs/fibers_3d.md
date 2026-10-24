@@ -95,7 +95,8 @@ The **Settings** button opens controls for:
   point order leaves its direction colours unchanged.
   H/V defaults share the AFV slice palette: H blue (`#40a5ff`) and V orange
   (`#ffad43`). Both colours remain customisable in the 3D settings.
-- Line width, unselected opacity, projection and region bounds.
+- Line width (default: 1 logical pixel), unselected opacity, projection and
+  region bounds (hidden by default). Existing saved preferences take priority.
 - Optional annotation markers/styles. These are off by default, and selected
   fibres only is the default when enabling them. Whole-fibre tags appear in the
   selection details. Control points, `break` and `kollesis_termination` have

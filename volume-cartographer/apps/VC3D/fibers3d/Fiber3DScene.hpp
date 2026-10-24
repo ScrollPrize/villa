@@ -65,13 +65,13 @@ struct DisplaySettings {
     QColor custom{220, 220, 225};
     QColor horizontal = vc3d::horizontalFiberColor();
     QColor vertical = vc3d::verticalFiberColor();
-    float lineWidth = 2.0f;
+    float lineWidth = 1.0f;
     float unselectedOpacity = 0.2f;
     bool showGaps = false;
     bool showAnnotations = false;
     bool annotationsSelectedOnly = true;
     bool perspective = false;
-    bool showBounds = true;
+    bool showBounds = false;
     bool showCursor = true;
     bool nearbyOnly = false;
     double nearbyDistanceVoxels = 64.0;

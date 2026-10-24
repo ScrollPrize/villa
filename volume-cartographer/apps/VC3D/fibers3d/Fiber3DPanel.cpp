@@ -410,7 +410,7 @@ struct Fiber3DPanel::Impl {
         row(q->tr("Minimum"), rangeMin, rangeLayout);
         row(q->tr("Maximum"), rangeMax, rangeLayout);
         body->addWidget(lengthRangeRow);
-        auto* width = real("fibers3DLineWidth", 0.5, 10, 2, 1, q->tr(" px"));
+        auto* width = real("fibers3DLineWidth", 0.5, 10, display.lineWidth, 1, q->tr(" px"));
         row(q->tr("Line width"), width);
 
         section(q->tr("Selection"));
@@ -478,7 +478,7 @@ struct Fiber3DPanel::Impl {
         QObject::connect(opacitySlider, &QSlider::valueChanged, opacity, &QSpinBox::setValue);
         QObject::connect(opacity, &QSpinBox::valueChanged, opacitySlider, &QSlider::setValue);
         auto* perspective = check("fibers3DPerspective", q->tr("Perspective"), false);
-        auto* bounds = check("fibers3DBounds", q->tr("Show region bounds"), true);
+        auto* bounds = check("fibers3DBounds", q->tr("Show region bounds"), display.showBounds);
         auto* cursor = check("fibers3DCursor", q->tr("Show cursor"), true);
         advancedLayout->addWidget(perspective);
         advancedLayout->addWidget(bounds);
