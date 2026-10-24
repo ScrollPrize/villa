@@ -3309,49 +3309,171 @@ std::unique_ptr<QuadSurface> surface_intersection(QuadSurface* a, QuadSurface* b
 void QuadSurface::rotate(float angleDeg)
 {
     ensureLoaded();
-    if (!_points || _points->empty() || std::abs(angleDeg) < 0.01f) {
+    if (!_points || _points->empty()) {
         return;
     }
 
-    // Compute rotation center (center of the image)
+    // Normalise the angle to (-180, 180] first, so the no-op check and the
+    // quarter-turn snap see the same angle and use the same tolerance
+    // (359.995 is a no-op just like 0.005, 89.995 a quarter turn like 90.005).
+    constexpr double kAngleTolDeg = 0.01;
+    double a = std::fmod(static_cast<double>(angleDeg), 360.0);
+    if (a <= -180.0) a += 360.0;
+    if (a > 180.0) a -= 360.0;
+    if (std::abs(a) < kAngleTolDeg) {
+        return;
+    }
+
+    // Channels that have not been read yet (key present, Mat empty: lazy
+    // loading, or after unloadCaches()) are read now at their stored size, so
+    // they get the same rotation as the points. Otherwise a later channel()
+    // reads the unrotated file from disk and stretches it onto the new grid.
+    {
+        std::vector<std::string> lazyChannels;
+        for (const auto& [name, mat] : _channels) {
+            if (mat.empty()) lazyChannels.push_back(name);
+        }
+        for (const auto& name : lazyChannels) {
+            channel(name, SURF_CHANNEL_NORESIZE);
+        }
+    }
+
+    // Quarter turns are exact grid permutations. Do them as such so every
+    // vertex keeps its exact coordinates and no vertex next to a hole is
+    // dropped by the bilinear "all four neighbours valid" rule.
+    // Direction matches cv::getRotationMatrix2D below (positive = counter-
+    // clockwise in grid index space, x right / y down).
+    const double quarter = std::round(a / 90.0);
+    if (std::abs(a - quarter * 90.0) < kAngleTolDeg) {
+        const int k = ((static_cast<int>(quarter) % 4) + 4) % 4;
+        if (k == 0) {
+            return;
+        }
+        const int code = (k == 1) ? cv::ROTATE_90_COUNTERCLOCKWISE
+                       : (k == 2) ? cv::ROTATE_180
+                                  : cv::ROTATE_90_CLOCKWISE;
+        cv::Mat_<cv::Vec3f> rotatedPoints;
+        cv::rotate(*_points, rotatedPoints, code);
+        *_points = rotatedPoints;
+        for (auto& [name, channel] : _channels) {
+            if (channel.empty()) continue;
+            cv::Mat rotatedChannel;
+            cv::rotate(channel, rotatedChannel, code);
+            channel = rotatedChannel;
+        }
+        if (k % 2 == 1) {
+            std::swap(_scale[0], _scale[1]);
+        }
+        invalidateCache();
+        return;
+    }
+
+    // Rotate about the centre of the vertex grid. Vertices sit at integer
+    // indices 0..cols-1 / 0..rows-1, so the centre is ((cols-1)/2, (rows-1)/2).
+    const cv::Size srcSize = _points->size();
     cv::Point2f center(
-        static_cast<float>(_points->cols - 1) / 2.0f,
-        static_cast<float>(_points->rows - 1) / 2.0f
+        static_cast<float>(srcSize.width - 1) / 2.0f,
+        static_cast<float>(srcSize.height - 1) / 2.0f
     );
 
     // Get rotation matrix
-    cv::Mat rotMat = cv::getRotationMatrix2D(center, angleDeg, 1.0);
+    cv::Mat rotMat = cv::getRotationMatrix2D(center, a, 1.0);
 
-    // Calculate bounding box of rotated image
-    cv::Rect2f bbox = cv::RotatedRect(center, _points->size(), angleDeg).boundingRect2f();
-
-    // Adjust rotation matrix to translate image to center of new canvas
-    rotMat.at<double>(0, 2) += bbox.width / 2.0 - center.x;
-    rotMat.at<double>(1, 2) += bbox.height / 2.0 - center.y;
+    // Size the new canvas from the extent of the rotated vertex lattice
+    // ((cols-1) x (rows-1), not the cols x rows pixel area) and map the grid
+    // centre onto the canvas centre ((W-1)/2, (H-1)/2), so the grid is not
+    // shifted by half a cell.
+    const cv::Rect2f extent =
+        cv::RotatedRect(center,
+                        cv::Size2f(static_cast<float>(srcSize.width - 1),
+                                   static_cast<float>(srcSize.height - 1)),
+                        static_cast<float>(a))
+            .boundingRect2f();
+    constexpr double kSizeEpsilon = 1e-4;
+    auto canvasExtent = [&](double ext, int srcCount) {
+        int n = static_cast<int>(std::ceil(ext - kSizeEpsilon)) + 1;
+        // Keep the centre on the same lattice as the source centre (a vertex
+        // for odd sizes, a cell midpoint for even sizes).
+        if ((n - 1) % 2 != (srcCount - 1) % 2) ++n;
+        return n;
+    };
+    const cv::Size dstSize(canvasExtent(extent.width, srcSize.width),
+                           canvasExtent(extent.height, srcSize.height));
+    rotMat.at<double>(0, 2) += (dstSize.width - 1) / 2.0 - center.x;
+    rotMat.at<double>(1, 2) += (dstSize.height - 1) / 2.0 - center.y;
 
     // Rotate points without blending invalid sentinels into finite coordinates.
-    const cv::Size dstSize = bbox.size();
     cv::Mat_<cv::Vec3f> rotatedMat =
         warpAffinePointsLinearPreservingInvalids(*_points, rotMat, dstSize);
 
     // Update points
     *_points = rotatedMat;
 
-    // Rotate all channels
+    // Vertices that are invalid after the rotation (used to keep mask-like
+    // channels invalid there).
+    cv::Mat invalidDst(dstSize, CV_8UC1, cv::Scalar(0));
+    for (int r = 0; r < dstSize.height; ++r) {
+        const cv::Vec3f* row = rotatedMat[r];
+        uint8_t* out = invalidDst.ptr<uint8_t>(r);
+        for (int c = 0; c < dstSize.width; ++c) {
+            if (row[c][0] == -1.f) out[c] = 255;
+        }
+    }
+
+    const cv::Matx33d gridRot(
+        rotMat.at<double>(0, 0), rotMat.at<double>(0, 1), rotMat.at<double>(0, 2),
+        rotMat.at<double>(1, 0), rotMat.at<double>(1, 1), rotMat.at<double>(1, 2),
+        0.0, 0.0, 1.0);
+
+    // Rotate all channels. Each channel gets its own warp built from its own
+    // size: a channel can be stored at a different resolution than the points
+    // (e.g. a 2x mask kept with SURF_CHANNEL_NORESIZE). channel() maps it onto
+    // the grid with cv::resize (pixel centres), so grid = (px + 0.5) / s - 0.5.
+    // Rotate in grid space and map back to the channel's own resolution.
     for (auto& [name, channel] : _channels) {
         if (channel.empty()) continue;
 
+        const bool maskLike = (name == "mask" || name == "generations");
+        const double sx = static_cast<double>(channel.cols) / srcSize.width;
+        const double sy = static_cast<double>(channel.rows) / srcSize.height;
+        const cv::Size chDst(
+            std::max(1, static_cast<int>(std::lround(dstSize.width * sx))),
+            std::max(1, static_cast<int>(std::lround(dstSize.height * sy))));
+        const double dx = static_cast<double>(chDst.width) / dstSize.width;
+        const double dy = static_cast<double>(chDst.height) / dstSize.height;
+        const cv::Matx33d toGrid(1.0 / sx, 0.0, 0.5 / sx - 0.5,
+                                 0.0, 1.0 / sy, 0.5 / sy - 0.5,
+                                 0.0, 0.0, 1.0);
+        const cv::Matx33d fromGrid(dx, 0.0, 0.5 * dx - 0.5,
+                                   0.0, dy, 0.5 * dy - 0.5,
+                                   0.0, 0.0, 1.0);
+        const cv::Matx33d m = fromGrid * gridRot * toGrid;
+        const cv::Mat chRot = (cv::Mat_<double>(2, 3) << m(0, 0), m(0, 1), m(0, 2),
+                                                         m(1, 0), m(1, 1), m(1, 2));
+
+        // Mask-like channels use nearest neighbour (as in resample()), so a
+        // 0/255 mask stays 0/255. Normals outside the canvas are NaN, not (0,0,0).
+        const cv::Scalar borderValue = (name == "normals")
+            ? cv::Scalar::all(std::numeric_limits<double>::quiet_NaN())
+            : cv::Scalar::all(0);
         cv::Mat rotatedChannel;
-        cv::Scalar borderValue = (name == "normals") ? cv::Scalar(0, 0, 0) : cv::Scalar(0, 0, 0);
         cv::warpAffine(
             channel,
             rotatedChannel,
-            rotMat,
-            dstSize,
-            cv::INTER_LINEAR,
+            chRot,
+            chDst,
+            maskLike ? cv::INTER_NEAREST : cv::INTER_LINEAR,
             cv::BORDER_CONSTANT,
             borderValue
         );
+
+        // Keep invalid invalid: where the rotated vertex was dropped, clear
+        // the mask-like channel too.
+        if (maskLike) {
+            cv::Mat invalidCh;
+            cv::resize(invalidDst, invalidCh, chDst, 0, 0, cv::INTER_NEAREST);
+            rotatedChannel.setTo(cv::Scalar::all(0), invalidCh);
+        }
         channel = rotatedChannel;
     }
 

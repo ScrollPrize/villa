@@ -8,9 +8,13 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/core.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include <cmath>
+#include <filesystem>
+#include <random>
+#include <string>
 #include <memory>
 #include <vector>
 
@@ -366,4 +370,156 @@ TEST_CASE("lookupDepthIndex returns finite value or NAN; no crash")
     QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
     float v = lookupDepthIndex(&qs, 4, 4);
     CHECK((std::isfinite(v) || std::isnan(v)));
+}
+
+TEST_CASE("rotate by quarter turns is exact and keeps every valid vertex")
+{
+    // Non-square grid with a hole, so a half-cell shift or a lost vertex shows.
+    cv::Mat_<cv::Vec3f> pts(7, 11);
+    for (int r = 0; r < pts.rows; ++r)
+        for (int c = 0; c < pts.cols; ++c)
+            pts(r, c) = cv::Vec3f(20.f * c, 20.f * r, float(r * 100 + c));
+    pts(3, 5) = cv::Vec3f(-1.f, -1.f, -1.f);
+
+    struct Case { float angle; int code; };
+    for (const Case tc : {Case{90.f, cv::ROTATE_90_COUNTERCLOCKWISE},
+                          Case{180.f, cv::ROTATE_180},
+                          Case{270.f, cv::ROTATE_90_CLOCKWISE},
+                          Case{-90.f, cv::ROTATE_90_CLOCKWISE}}) {
+        QuadSurface qs(pts.clone(), cv::Vec2f(0.05f, 0.04f));
+        const int validBefore = qs.countValidPoints();
+        qs.rotate(tc.angle);
+        cv::Mat_<cv::Vec3f> expected;
+        cv::rotate(pts, expected, tc.code);
+        const auto* p = qs.rawPointsPtr();
+        REQUIRE(p);
+        REQUIRE(p->size() == expected.size());
+        CHECK(qs.countValidPoints() == validBefore);
+        CHECK(cv::norm(*p, expected, cv::NORM_INF) == 0.0);
+        const bool quarter = (tc.angle != 180.f);
+        CHECK(qs.scale()[0] == doctest::Approx(quarter ? 0.04f : 0.05f));
+        CHECK(qs.scale()[1] == doctest::Approx(quarter ? 0.05f : 0.04f));
+    }
+}
+
+TEST_CASE("rotate by an arbitrary angle keeps the centre vertex on a vertex")
+{
+    cv::Mat_<cv::Vec3f> pts(21, 21);
+    for (int r = 0; r < pts.rows; ++r)
+        for (int c = 0; c < pts.cols; ++c)
+            pts(r, c) = cv::Vec3f(20.f * c, 20.f * r, 0.f);
+    QuadSurface qs(pts.clone(), cv::Vec2f(0.05f, 0.05f));
+    qs.rotate(45.f);
+    const auto* p = qs.rawPointsPtr();
+    REQUIRE(p);
+    REQUIRE(p->cols % 2 == 1);
+    REQUIRE(p->rows % 2 == 1);
+    const cv::Vec3f centre = (*p)(p->rows / 2, p->cols / 2);
+    CHECK(centre[0] == doctest::Approx(200.f).epsilon(1e-4));
+    CHECK(centre[1] == doctest::Approx(200.f).epsilon(1e-4));
+}
+
+TEST_CASE("rotate also rotates channels that have not been loaded yet")
+{
+    namespace fs = std::filesystem;
+    std::mt19937_64 rng(std::random_device{}());
+    const fs::path dir = fs::temp_directory_path() / ("vc_qs_rot_" + std::to_string(rng()));
+    fs::create_directories(dir);
+
+    cv::Mat_<cv::Vec3f> pts(7, 11);
+    for (int r = 0; r < pts.rows; ++r)
+        for (int c = 0; c < pts.cols; ++c)
+            pts(r, c) = cv::Vec3f(20.f * c, 20.f * r, 0.f);
+    // Asymmetric mask so a missing rotation (or a stretch) shows.
+    cv::Mat mask(pts.size(), CV_8UC1, cv::Scalar(0));
+    mask(cv::Rect(0, 0, 4, 2)).setTo(255);
+    REQUIRE(cv::imwrite((dir / "mask.tif").string(), mask));
+
+    QuadSurface qs(pts.clone(), cv::Vec2f(0.05f, 0.05f));
+    qs.path = dir;
+    qs.setChannel("mask", cv::Mat());  // key only, like a lazily loaded segment
+
+    qs.rotate(90.f);
+    cv::Mat expected;
+    cv::rotate(mask, expected, cv::ROTATE_90_COUNTERCLOCKWISE);
+    const cv::Mat got = qs.channel("mask");
+    REQUIRE(got.size() == expected.size());
+    CHECK(cv::countNonZero(got != expected) == 0);
+
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+}
+
+TEST_CASE("rotate normalises the angle before the no-op and quarter-turn checks")
+{
+    cv::Mat_<cv::Vec3f> pts(7, 11);
+    for (int r = 0; r < pts.rows; ++r)
+        for (int c = 0; c < pts.cols; ++c)
+            pts(r, c) = cv::Vec3f(20.f * c, 20.f * r, float(r * 100 + c));
+    pts(3, 5) = cv::Vec3f(-1.f, -1.f, -1.f);
+
+    for (const float angle : {359.995f, -359.995f, 720.f, 0.005f}) {
+        QuadSurface qs(pts.clone(), cv::Vec2f(0.05f, 0.04f));
+        qs.rotate(angle);
+        const auto* p = qs.rawPointsPtr();
+        REQUIRE(p);
+        REQUIRE(p->size() == pts.size());
+        CHECK(cv::norm(*p, pts, cv::NORM_INF) == 0.0);
+    }
+    for (const float angle : {89.995f, 450.f, -270.005f}) {
+        QuadSurface qs(pts.clone(), cv::Vec2f(0.05f, 0.04f));
+        qs.rotate(angle);
+        cv::Mat_<cv::Vec3f> expected;
+        cv::rotate(pts, expected, cv::ROTATE_90_COUNTERCLOCKWISE);
+        const auto* p = qs.rawPointsPtr();
+        REQUIRE(p);
+        REQUIRE(p->size() == expected.size());
+        CHECK(cv::norm(*p, expected, cv::NORM_INF) == 0.0);
+    }
+}
+
+TEST_CASE("rotate by a general angle keeps a 2x mask aligned, 0/255, and invalid where vertices are invalid")
+{
+    cv::Mat_<cv::Vec3f> pts(21, 31);
+    for (int r = 0; r < pts.rows; ++r)
+        for (int c = 0; c < pts.cols; ++c)
+            pts(r, c) = cv::Vec3f(20.f * c, 20.f * r, 0.f);
+    for (int r = 8; r < 12; ++r)
+        for (int c = 12; c < 16; ++c)
+            pts(r, c) = cv::Vec3f(-1.f, -1.f, -1.f);
+
+    // Mask at 2x the grid resolution: 255 on valid vertices, 0 on the hole.
+    cv::Mat valid(pts.size(), CV_8UC1, cv::Scalar(255));
+    valid(cv::Rect(12, 8, 4, 4)).setTo(0);
+    cv::Mat mask2x;
+    cv::resize(valid, mask2x, cv::Size(pts.cols * 2, pts.rows * 2), 0, 0, cv::INTER_NEAREST);
+
+    QuadSurface qs(pts.clone(), cv::Vec2f(0.05f, 0.05f));
+    qs.setChannel("mask", mask2x);
+    qs.rotate(30.f);
+
+    const auto* p = qs.rawPointsPtr();
+    REQUIRE(p);
+    const cv::Mat stored = qs.channel("mask", SURF_CHANNEL_NORESIZE);
+    CHECK(stored.cols == p->cols * 2);
+    CHECK(stored.rows == p->rows * 2);
+    // Nearest neighbour: no blended in-between values.
+    CHECK(cv::countNonZero((stored != 0) & (stored != 255)) == 0);
+
+    const cv::Mat onGrid = qs.channel("mask");
+    REQUIRE(onGrid.size() == p->size());
+    int validCount = 0, validButMasked = 0, invalidButSet = 0;
+    for (int r = 0; r < p->rows; ++r) {
+        for (int c = 0; c < p->cols; ++c) {
+            const bool v = (*p)(r, c)[0] != -1.f;
+            const bool m = onGrid.at<uint8_t>(r, c) != 0;
+            validCount += v;
+            if (v && !m) ++validButMasked;
+            if (!v && m) ++invalidButSet;
+        }
+    }
+    REQUIRE(validCount > 0);
+    CHECK(invalidButSet == 0);
+    // Aligned: valid vertices see the rotated mask (allow a thin rim).
+    CHECK(validButMasked <= validCount / 50);
 }
