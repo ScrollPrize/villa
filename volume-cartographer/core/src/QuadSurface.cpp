@@ -1834,6 +1834,14 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     // basis as the positions, so there is nothing to warp here.
     if (need_normals && !smooth) {
         warpNearestConstVec3f(normal_src, normals_big, ox, oy, sx, sy, qnVec);
+        if (_genInterpolation == GenInterpolation::LinearBlendedNormals) {  // unit blend; nearest where a corner is NaN
+            cv::Mat_<cv::Vec3f> blended(normals_big.size());
+            warpBilinearReplicateVec3f(normal_src, blended, ox, oy, sx, sy);
+            for (int j = 0; j < blended.rows; ++j)
+                for (int i = 0; i < blended.cols; ++i)
+                    if (const float len = float(cv::norm(blended(j, i))); std::isfinite(len) && len > 0.f && std::isfinite(normals_big(j, i)[0]))
+                        normals_big(j, i) = blended(j, i) / len;
+        }
     }
 
 
