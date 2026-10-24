@@ -617,9 +617,10 @@ private:
 // A surface object's geometry revision (default: its current one). Other
 // channels are registered empty; set a loader (store_channel_loader) to read them.
 // Without applyValidity, masked vertices keep their coordinates (like SURF_LOAD_IGNORE_MASK).
+// toVolume scales the stored coordinates (and the grid's step) into a volume's voxels.
 std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore&, const vc::objects::Txn&,
     const std::string& objectUuid, const std::optional<std::string>& geometryRevision = std::nullopt,
-    bool applyValidity = true);
+    bool applyValidity = true, double toVolume = 1);
 // Reads channels of an immutable geometry revision through a session on demand.
 std::function<cv::Mat(const std::string&)> store_channel_loader(
     std::shared_ptr<vc::objects::ObjectStoreSession>, vc::objects::AttachmentIdentity, std::string geometryRevision);

@@ -104,6 +104,14 @@ TEST_CASE("QuadSurface round trip through the object store")
     CHECK(loadedGenerations.type() == CV_16U);
     CHECK(cv::countNonZero(loadedGenerations != 7) == 0);
 
+    // Loaded into a volume of twice the stored resolution: coordinates and grid step double.
+    store.session->read(store.attachment, [&](const auto& db, const auto& txn, const auto&) {
+        const auto scaled = load_quad_from_store(db, txn, uuid, std::nullopt, true, 2.0);
+        CHECK(scaled->_scale == cv::Vec2f(0.25f, 0.25f));
+        CHECK((*scaled->rawPointsPtr())(1, 1) == cv::Vec3f(2, 2, 20));
+        CHECK((*scaled->rawPointsPtr())(0, 4) == cv::Vec3f(-1, -1, -1));
+    });
+
     // Edit one vertex, clear another, leave the masked one alone.
     (*loaded->rawPointsPtr())(1, 1) = {1.5f, 1.f, 11.f};
     (*loaded->rawPointsPtr())(3, 0) = {-1.f, -1.f, -1.f};

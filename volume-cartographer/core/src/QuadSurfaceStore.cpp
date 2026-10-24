@@ -99,7 +99,7 @@ vc::objects::GeometryRevision currentSurface(const vc::objects::ObjectStore& db,
 } // namespace
 
 std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore& db, const vc::objects::Txn& txn,
-    const std::string& objectUuid, const std::optional<std::string>& geometryRevision, bool applyValidity)
+    const std::string& objectUuid, const std::optional<std::string>& geometryRevision, bool applyValidity, double toVolume)
 {
     const auto object = db.objectByUuid(txn, objectUuid);
     if (!object || object->kind != "surface") throw std::runtime_error("not a surface object: " + objectUuid);
@@ -121,7 +121,11 @@ std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore
         }
     }
     const auto attributes = nlohmann::json::parse(revision->attributes);
-    const cv::Vec2f scale(attributes.at("scale").at(0).get<float>(), attributes.at("scale").at(1).get<float>());
+    cv::Vec2f scale(attributes.at("scale").at(0).get<float>(), attributes.at("scale").at(1).get<float>());
+    if (toVolume != 1) {
+        for (auto& p : *points) if (p != kInvalid) p *= float(toVolume);
+        scale /= float(toVolume);
+    }
     auto surface = std::make_unique<QuadSurface>(points.release(), scale);
     surface->id = object->uuid;
     surface->meta = utils::Json::parse(object->meta);
