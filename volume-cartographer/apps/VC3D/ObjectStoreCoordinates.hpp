@@ -1,6 +1,7 @@
 #pragma once
 #include "vc/core/types/Volume.hpp"
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
 
 namespace vc3d {
 inline nlohmann::json coordinateBindingForVolume(const Volume& volume, double storedUnitsPerVoxel)
@@ -13,5 +14,18 @@ inline nlohmann::json coordinateBindingForVolume(const Volume& volume, double st
 inline std::optional<double> geometryScaleForVolume(const nlohmann::json& metadata, const Volume& volume)
 {
     return vc::objects::geometryScaleToVolume(metadata, volume.id());
+}
+// Bind an object of any kind, pinned at `objectRevision`, to `volume`: its stored
+// coordinates are `storedUnitsPerVoxel` units per volume voxel. Its
+// relationships are kept as recorded.
+inline void bindCoordinates(vc::objects::ObjectStoreSession& session, const vc::objects::AttachmentIdentity& attachment,
+                            const std::string& uuid, const std::string& objectRevision, const Volume& volume,
+                            double storedUnitsPerVoxel)
+{
+    const auto assigned = coordinateBindingForVolume(volume, storedUnitsPerVoxel);
+    session.editKeepingRelationships(attachment, {{uuid, objectRevision}}, {}, [&](auto& db, auto& txn, const auto&) {
+        for (const auto* key : {"coordinates", "coordinate_binding"}) db.setMeta(txn, uuid, key, assigned.at(key).dump());
+        for (const auto& edge : db.edgesOf(txn, uuid, true)) db.keepRecordedRelationship(txn, edge.uuid);
+    });
 }
 }

@@ -51,7 +51,6 @@ public:
     [[nodiscard]] const FiberDisplayOptions& options() const { return options_; }
     void setOptions(const FiberDisplayOptions& options);
     void setLineAnnotationActive(bool active);
-    void openCollection(const QString& path);
     void firstPage();
     void nextPage();
     // A listed fiber was clicked: select it, focusing the main views while

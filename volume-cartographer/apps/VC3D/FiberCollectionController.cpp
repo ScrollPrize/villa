@@ -403,13 +403,6 @@ void FiberCollectionController::projectChanged(bool preserveSelection)
             if (preserveSelection && selected_ > 0) selectFiber(selected_, false, false);
         });
 }
-void FiberCollectionController::openCollection(const QString& path)
-{
-    try {
-        state_->attachObjectStore(path,qEnvironmentVariable("USER",qEnvironmentVariable("USERNAME","vc3d")));
-        emit panelRequested();
-    } catch(const std::exception& e) { publishStatus(QString::fromUtf8(e.what())); }
-}
 void FiberCollectionController::publishCount()
 {
     publishStatus(options_.maxDisplayed

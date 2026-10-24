@@ -9039,7 +9039,13 @@ bool CWindow::OpenVolume(const QString& path,
 
 void CWindow::attachObjectStore(const QString& path)
 {
-    _fiberCollection->openCollection(path);
+    try {
+        _state->attachObjectStore(path, qEnvironmentVariable("USER", qEnvironmentVariable("USERNAME", "vc3d")));
+    } catch (const std::exception& error) {
+        const auto message = tr("Cannot attach object store %1: %2").arg(path, QString::fromUtf8(error.what()));
+        qWarning().noquote() << message;
+        statusBar()->showMessage(message, 10000);
+    }
 }
 
 bool CWindow::openVolumePackage(const QString& path,

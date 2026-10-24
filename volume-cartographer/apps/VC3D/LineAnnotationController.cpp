@@ -18455,36 +18455,19 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
         for (const auto& branch : edit.fiber.branches) expect(findFiber(branch.branchFiberId));
     }
     for (const auto& fiber : retired) expect(fiber);
-    // A hosted replica leases every stored fiber whose record this action changes.
-    std::vector<std::string> changed;
-    for (const auto& edit : edits) if (expected.at(edit.fiber.uuid)) changed.push_back(edit.fiber.uuid);
-    for (const auto& fiber : retired) if (expected.at(fiber.uuid)) changed.push_back(fiber.uuid);
-    const auto leases = connection->holdLeases(*attachment, changed);
-    std::map<std::string, EdgeRecord> incident;
-    connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-        const auto requested = expected;
-        for (const auto& [uuid, revision] : requested) {
-            if (!db.objectByUuid(txn, uuid)) continue;
-            for (const auto& edge : db.edgesOf(txn, uuid, true)) {
-                incident[edge.uuid] = edge;
-                for (const auto& endpoint : {edge.aUuid, edge.bUuid})
-                    if (!expected.contains(endpoint)) expected[endpoint] = db.currentObjectRevision(txn, endpoint)->uuid;
-            }
-        }
-    });
+    // The action changes the edited and retired fibers; branch targets only gain links.
+    RevisionSelection pins, related;
+    for (const auto& [uuid, revision] : expected) {
+        const bool changed = std::any_of(edits.begin(), edits.end(), [&](const auto& edit) { return edit.fiber.uuid == uuid; }) ||
+            std::any_of(retired.begin(), retired.end(), [&](const auto& fiber) { return fiber.uuid == uuid; });
+        (changed ? pins : related).emplace(uuid, revision);
+    }
     std::map<std::string, std::string> geometryHeads;
-    const auto committed = connection->act(*attachment, expected, [&](auto& db, auto& txn) {
-        auto decisions = [&](const auto& affected) {
-            std::vector<GeometryEdgeEdit> result;
-            for (const auto& edge : affected) {
-                GeometryEdgeEdit edit; edit.edgeUuid = edge.uuid; edit.expectedGeneration = edge.generation;
-                edit.action = "keep_recorded";
-                if (const auto r = db.currentGeometry(txn, edge.aUuid)) edit.aRevision = r->uuid;
-                if (const auto r = db.currentGeometry(txn, edge.bUuid)) edit.bRevision = r->uuid;
-                result.push_back(std::move(edit));
-            }
-            return result;
-        };
+    const auto committed = connection->editKeepingRelationships(*attachment, pins, related, [&](auto& db, auto& txn, const auto& decisions) {
+        std::map<std::string, EdgeRecord> incident;
+        for (const auto& [uuid, revision] : expected)
+            if (db.objectByUuid(txn, uuid))
+                for (const auto& edge : db.edgesOf(txn, uuid, true)) incident[edge.uuid] = edge;
         for (auto& snapshot : edits) {
             auto& fiber = snapshot.fiber;
             const auto current = db.objectByUuid(txn, fiber.uuid);
@@ -18658,19 +18641,7 @@ std::optional<double> LineAnnotationController::fiberCoordinateScale(uint64_t id
     if (!accepted) return std::nullopt;
     bool valid=false;const double scale=answer.toDouble(&valid);
     if (!valid || !(scale>0) || !std::isfinite(scale)) { showError(tr("Enter a positive finite coordinate scale."));return std::nullopt; }
-    const auto assigned=coordinateBindingForVolume(*volume,scale);
-    vc::objects::RevisionSelection expected{{fiber.uuid,pin.objectRevision}};
-    std::vector<std::string> edges;
-    connection->read(pin.attachment,[&](const auto& db,const auto& txn,const auto&) {
-        for(const auto& edge:db.edgesOf(txn,fiber.uuid,true)) {
-            edges.push_back(edge.uuid);
-            for(const auto& endpoint:{edge.aUuid,edge.bUuid}) if(!expected.contains(endpoint)) expected[endpoint]=db.currentObjectRevision(txn,endpoint)->uuid;
-        }
-    });
-    connection->act(pin.attachment,expected,[&](auto& db,auto& txn) {
-        for(const auto* key:{"coordinates","coordinate_binding"}) db.setMeta(txn,fiber.uuid,key,assigned.at(key).dump());
-        for(const auto& edge:edges) db.keepRecordedRelationship(txn,edge);
-    });
+    vc3d::bindCoordinates(*connection,pin.attachment,fiber.uuid,pin.objectRevision,*volume,scale);
     return 1.0/scale;
 }
 
