@@ -235,6 +235,38 @@ std::filesystem::path ObjectStoreSession::artifactDirectory(const AttachmentIden
     return directory;
 }
 
+RevisionSelection ObjectStoreSession::editKeepingRelationships(const AttachmentIdentity& identity,
+    const RevisionSelection& pins, const std::function<void(ObjectStore&, WriteTxn&, const KeepRecorded&)>& edit)
+{
+    std::vector<std::string> objects;
+    for (const auto& [uuid, revision] : pins) objects.push_back(uuid);
+    const auto leases = holdLeases(identity, objects);
+    auto expected = pins;
+    read(identity, [&](const auto& store, const auto& txn, const auto&) {
+        for (const auto& uuid : objects)
+            for (const auto& edge : store.edgesOf(txn, uuid, true))
+                for (const auto& endpoint : {edge.aUuid, edge.bUuid})
+                    if (!expected.contains(endpoint))
+                        if (const auto head = store.currentObjectRevision(txn, endpoint)) expected[endpoint] = head->uuid;
+    });
+    return act(identity, expected, [&](auto& store, auto& txn) {
+        const KeepRecorded keep = [&](const std::vector<EdgeRecord>& affected) {
+            std::vector<GeometryEdgeEdit> result;
+            for (const auto& edge : affected) {
+                GeometryEdgeEdit decision;
+                decision.edgeUuid = edge.uuid;
+                decision.expectedGeneration = edge.generation;
+                decision.action = "keep_recorded";
+                if (const auto r = store.currentGeometry(txn, edge.aUuid)) decision.aRevision = r->uuid;
+                if (const auto r = store.currentGeometry(txn, edge.bUuid)) decision.bRevision = r->uuid;
+                result.push_back(std::move(decision));
+            }
+            return result;
+        };
+        edit(store, txn, keep);
+    });
+}
+
 void ObjectStoreSession::finalize()
 {
     std::lock_guard transition(transition_);

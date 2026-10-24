@@ -112,6 +112,15 @@ public:
     // All writes are immediate checked atomic actions. The library enforces
     // expectations for every affected object and relationship endpoint.
     RevisionSelection act(const AttachmentIdentity&, const RevisionSelection&, const Action&);
+    // Decisions for relationships an edit affects: each is kept as recorded, with
+    // its historical pins and no claim that it applies to the new geometry.
+    using KeepRecorded = std::function<std::vector<GeometryEdgeEdit>(const std::vector<EdgeRecord>&)>;
+    // A checked edit of existing objects, pinned at the object revisions in `pins`,
+    // that keeps their relationships as recorded: it also expects every endpoint of
+    // their relationships, holds the objects' leases on a hosted replica, and hands
+    // the callback the decisions to pass to geometry edits. Returns the receipt.
+    RevisionSelection editKeepingRelationships(const AttachmentIdentity&, const RevisionSelection& pins,
+        const std::function<void(ObjectStore&, WriteTxn&, const KeepRecorded&)>&);
     // Copy an object's current record and geometry from one attachment into
     // another as a new object (objects/ObjectCopy.hpp); returns its UUID.
     std::string copyObject(const AttachmentIdentity& from, const AttachmentIdentity& to, const std::string& objectUuid);

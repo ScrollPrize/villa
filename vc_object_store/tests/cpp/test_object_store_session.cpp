@@ -5,6 +5,7 @@
 #include <future>
 #include <thread>
 #include <iostream>
+#include <cstring>
 #include <algorithm>
 #include <cctype>
 #include <sqlite3.h>
@@ -255,6 +256,44 @@ int main() try
     session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
         require(store.objectByUuid(txn, added).has_value(), "remaining attachment still reads");
     });
+    // Edits that keep relationships as recorded: an anchored vertex moves and the
+    // relationship stays, pinned to the geometry it was made from.
+    {
+        const auto sheet = util::newUuid(), marker = util::newUuid();
+        std::string link;
+        session.act(replacement, {{sheet, std::nullopt}, {marker, std::nullopt}}, [&](auto& store, auto& txn) {
+            ObjectRecord record; record.uuid = sheet; record.kind = "surface";
+            store.upsertObject(txn, record);
+            store.putGeometry(txn, sheet, vc::geometry::encode(vc::geometry::Surface{2, 2, {1, 1}, {{1, 1, 1}, {2, 1, 1}, {1, 2, 1}, {2, 2, 1}}}));
+            record.uuid = marker; record.kind = "point_collection";
+            store.upsertObject(txn, record);
+            store.putGeometry(txn, marker, vc::geometry::encode(vc::geometry::PointCollection{{0}, {{1, 1, 1}}}));
+            EdgeRecord edge; edge.kind = "point-surface"; edge.aUuid = sheet; edge.bUuid = marker;
+            edge.aAnchor.points = {{"points", {0, 0}}};
+            edge.bAnchor.points = {{"point_ids", {0}}};
+            link = store.addEdge(txn, edge);
+        });
+        RevisionSelection pins;
+        session.read(replacement, [&](const auto& store, const auto& txn, const auto&) { pins[sheet] = store.currentObjectRevision(txn, sheet)->uuid; });
+        mustFail([&] { session.act(replacement, pins, [&](auto& store, auto& txn) {
+            const auto head = store.currentGeometry(txn, sheet)->uuid;
+            std::vector<uint8_t> moved(12); const float xyz[3] = {1, 1, 5}; std::memcpy(moved.data(), xyz, 12);
+            store.editGeometry(txn, sheet, {{"points", 0, moved}}, head);
+        }); });
+        session.editKeepingRelationships(replacement, pins, [&](auto& store, auto& txn, const auto& keep) {
+            const auto head = store.currentGeometry(txn, sheet)->uuid;
+            std::vector<uint8_t> moved(12); const float xyz[3] = {1, 1, 5}; std::memcpy(moved.data(), xyz, 12);
+            const std::vector<GeometryArrayEdit> edits{{"points", 0, moved}};
+            store.editGeometry(txn, sheet, edits, head, keep(store.affectedGeometryEditEdges(txn, sheet, edits, head)));
+        });
+        session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+            require(store.edgeByUuid(txn, link).has_value(), "relationships survive kept-as-recorded edits");
+            const auto points = store.readGeometryArray(txn, store.currentGeometry(txn, sheet)->uuid, "points");
+            float z; std::memcpy(&z, points.data() + 8, 4);
+            require(z == 5, "the anchored vertex moved");
+        });
+        session.takeEvents();
+    }
     session.detach(replacement);
     std::cout << "session tests passed\n";
 } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

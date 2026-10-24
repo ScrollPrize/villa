@@ -87,7 +87,12 @@ requests. `takeEvents()` polls local and external commits of
 every attachment for all object kinds, tagged by attachment; call it from the
 application's event loop. Each change carries
 its record's object or edge `kind` (kept for deletions too), so a consumer
-filters by kind without looking the record up. `copyObject(from, to, uuid)` copies an
+filters by kind without looking the record up. `editKeepingRelationships(attachment, pins, edit)` is the checked edit for
+tools and editors that change existing objects without deciding about each
+relationship: it expects the pinned object revisions and every endpoint of
+their relationships, holds the objects' leases, and gives the callback
+`keep_recorded` decisions to pass to geometry edits (affected relationships keep
+their historical pins). `copyObject(from, to, uuid)` copies an
 object's current record and geometry from one attachment into another as a new
 object (new UUID, `meta.copied_from` naming the source store, object and
 revisions; point annotations kept); relationships, history and approval stay
