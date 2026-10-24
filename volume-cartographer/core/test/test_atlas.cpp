@@ -182,7 +182,7 @@ vc::objects::PinnedObject fixturePin(const std::shared_ptr<vc::objects::ObjectSt
     auto root = nlohmann::json::parse(readText(file));
     root["uuid"] = util::newUuid();
     auto document = decodeFiberJson(root.dump());
-    const auto attachment = *store->attachment();
+    const auto attachment = store->attachments().front();
     std::string geometry;
     const auto receipt = store->act(attachment, {{document.object.uuid,{}}}, [&](auto& db, auto& txn) {
         auto object = document.object;
@@ -3044,6 +3044,6 @@ TEST_CASE("Atlas pins read and export historical store fibers without source fil
         CHECK(fs::is_regular_file(artifact));
     }
     CHECK_FALSE(fs::exists(artifact));
-    store->detach();
+    store->detach(store->attachments().front());
     CHECK_THROWS(vc::atlas::Atlas::load(pinnedDir, store));
 }

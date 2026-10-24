@@ -757,5 +757,5 @@ TEST_CASE("Store selected candidates preserve indexed refinement and reject stal
     auto pin=*fibers.front().storePin;
     session->act(attachment,{{pin.object.objectUuid,pin.objectRevision}},[&](auto& db,auto& txn) {db.setMeta(txn,pin.object.objectUuid,"external","true");});
     CHECK_THROWS(vc::atlas::searchFiberIntersections(fibers,{1},{2,3},nullptr,broad,ceres,nullptr,{},{},session));
-    session->detach();std::filesystem::remove(path);
+    session->detach(attachment);std::filesystem::remove(path);
 }

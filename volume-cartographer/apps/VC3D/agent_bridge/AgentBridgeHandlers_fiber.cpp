@@ -121,7 +121,7 @@ uint64_t jsonToFiberId(const QJsonValue& value, const char* paramName)
 LineAnnotationController* AgentBridgeServer::fiberController() const
 {
     CState* state = _window ? _window->_state : nullptr;
-    if (!state || !state->objectStoreSession()->attachment())
+    if (!state || !state->objectStoreAttachment())
         throw AgentBridgeError{-32000, "Attach an object store before using fibers", {}};
     LineAnnotationController* ctrl =
         _window->_lineAnnotationController ? _window->_lineAnnotationController.get() : nullptr;

@@ -211,21 +211,33 @@ CState::CState(QObject* parent, bool debugDownloadQueue, CState* objectStoreOwne
 
 CState::~CState()
 {
-    if (!_objectStoreOwner) { try { _objectStoreSession->detach(); } catch (...) {} }
+    if (!_objectStoreOwner && _objectStoreAttachment) {
+        try { _objectStoreSession->detach(*_objectStoreAttachment); } catch (...) {}
+    }
+}
+
+std::optional<vc::objects::AttachmentIdentity> CState::objectStoreAttachment() const
+{
+    return _objectStoreOwner ? _objectStoreOwner->objectStoreAttachment() : _objectStoreAttachment;
 }
 
 void CState::attachObjectStore(const QString& path, const QString& author, bool readOnly)
 {
+    if (_objectStoreOwner) { _objectStoreOwner->attachObjectStore(path, author, readOnly); return; }
     vc::objects::OpenOptions options;
     options.author = author.toStdString();
     options.readOnly = readOnly;
-    _objectStoreSession->attach(path.toStdString(), options);
+    _objectStoreAttachment = _objectStoreAttachment
+        ? _objectStoreSession->replace(*_objectStoreAttachment, path.toStdString(), options)
+        : _objectStoreSession->attach(path.toStdString(), options);
     pollObjectStoreChanges();
 }
 
 void CState::detachObjectStore()
 {
-    _objectStoreSession->detach();
+    if (_objectStoreOwner) { _objectStoreOwner->detachObjectStore(); return; }
+    if (_objectStoreAttachment) _objectStoreSession->detach(*_objectStoreAttachment);
+    _objectStoreAttachment.reset();
     pollObjectStoreChanges();
 }
 

@@ -246,18 +246,20 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     refreshRecentObjectStoreMenu();
     _objectStoreMenu->addSeparator();
     auto* syncHub = _objectStoreMenu->addAction(QObject::tr("Sync Hosted Object Store Now"), this, [qWindow]() {
-        qWindow->_state->objectStoreSession()->syncHub();
+        if (const auto attachment = qWindow->_state->objectStoreAttachment())
+            qWindow->_state->objectStoreSession()->syncHub(*attachment);
         qWindow->promptHubConflicts();
     });
     syncHub->setEnabled(false);
     connect(qWindow->_state, &CState::objectStoreChanged, syncHub, [qWindow, syncHub](const vc::objects::StoreSessionEvent&) {
-        syncHub->setEnabled(qWindow->_state->objectStoreSession()->hubStatus().has_value());
+        const auto attachment = qWindow->_state->objectStoreAttachment();
+        syncHub->setEnabled(attachment && qWindow->_state->objectStoreSession()->hubStatus(*attachment));
     });
     auto* detachStore = _objectStoreMenu->addAction(QObject::tr("Detach Object Store"), this, &MenuActionController::detachObjectStore);
-    detachStore->setEnabled(qWindow->_state->objectStoreSession()->attachment().has_value());
+    detachStore->setEnabled(qWindow->_state->objectStoreAttachment().has_value());
     connect(qWindow->_state, &CState::objectStoreChanged, detachStore,
         [qWindow, detachStore](const vc::objects::StoreSessionEvent&) {
-            detachStore->setEnabled(qWindow->_state->objectStoreSession()->attachment().has_value());
+            detachStore->setEnabled(qWindow->_state->objectStoreAttachment().has_value());
         });
     connect(qWindow->_state, &CState::objectStoreObservationFailed, this,
         [qWindow](const QString& error) {
@@ -2376,7 +2378,8 @@ void MenuActionController::attachObjectStoreAt(const QString& path, const QStrin
     // Only writable attachments reveal a hosted replica; a read-only reopen keeps the earlier tag.
     const QString absolute = QFileInfo(path).absoluteFilePath();
     auto stores = loadRecentObjectStores();
-    bool remote = _window->_state->objectStoreSession()->hubStatus().has_value();
+    const auto attachment = _window->_state->objectStoreAttachment();
+    bool remote = attachment && _window->_state->objectStoreSession()->hubStatus(*attachment);
     for (auto it = stores.begin(); it != stores.end();) {
         if (it->path != absolute) { ++it; continue; }
         if (readOnly) remote = remote || it->remote;

@@ -28,7 +28,7 @@ int runObjectStoreControllerTests()
         for (int i = 0; i < 20; ++i) {
             QElapsedTimer timer; timer.start();
             state.objectStoreChanged({StoreSessionEvent::Kind::Hub,
-                *state.objectStoreSession()->attachment(), 0, {}});
+                *state.objectStoreAttachment(), 0, {}});
             QApplication::processEvents();
             while (!catalogReady() && timer.elapsed() < 10000) {
                 QApplication::processEvents(); QThread::msleep(1);
@@ -176,7 +176,7 @@ int runObjectStoreControllerTests()
                 [&](const auto& selection) { if (selection.id == 0) ++selectionResets; });
             QObject::connect(&controller, &Controller::fibersChanged, &observer, [&] { ++fiberUpdates; });
             const auto connection = state.objectStoreSession();
-            const auto attachment = *connection->attachment();
+            const auto attachment = *state.objectStoreAttachment();
             const auto unrelated = vc::util::newUuid();
             connection->act(attachment, {{unrelated, std::nullopt}}, [&](auto& db, auto& txn) {
                 ObjectRecord record; record.uuid = unrelated; record.kind = "point_collection";
@@ -479,7 +479,7 @@ int runObjectStoreControllerTests()
             CState child(nullptr,false,&state);
             require(child.objectStoreSession()==state.objectStoreSession(),"secondary workspaces share session");
         }
-        require(state.objectStoreSession()->attachment().has_value(),"secondary destruction keeps main attachment");
+        require(state.objectStoreAttachment().has_value(),"secondary destruction keeps main attachment");
         state.detachObjectStore();
         require(controller.readStoredFibers(std::nullopt).empty() && controller.fiberUuidForId(merged.id).empty(),
                 "detach leaves nothing to read and no identities");

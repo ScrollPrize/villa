@@ -5300,7 +5300,7 @@ void CWindow::scheduleAtlasSearchDockRefresh()
 bool CWindow::storeHasFibers() const
 {
     const auto store = _state->objectStoreSession();
-    const auto attachment = store->attachment();
+    const auto attachment = _state->objectStoreAttachment();
     bool hasFibers = false;
     if (attachment) {
         store->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
@@ -6399,7 +6399,7 @@ void CWindow::populateAtlasSearchResults(const std::vector<vc::atlas::FiberInter
     };
     std::unordered_map<uint64_t, FiberDisplayInfo> fiberInfo;
     const auto store = _state->objectStoreSession();
-    if (const auto attachment = store->attachment(); attachment && _lineAnnotationController) {
+    if (const auto attachment = _state->objectStoreAttachment(); attachment && _lineAnnotationController) {
         std::set<uint64_t> fiberIds;
         for (const auto& result : results) {
             fiberIds.insert(result.sourceFiberId);
@@ -11311,7 +11311,8 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, std::optional<vc::Poi
 
 void CWindow::updateHubStatus()
 {
-    const auto status = _state->objectStoreSession()->hubStatus();
+    const auto attachment = _state->objectStoreAttachment();
+    const auto status = attachment ? _state->objectStoreSession()->hubStatus(*attachment) : std::nullopt;
     if (!status) {
         _hubStatusLabel->hide();
         _hubPromptedConflicts.clear();
@@ -11343,7 +11344,8 @@ void CWindow::updateHubStatus()
 void CWindow::promptHubConflicts()
 {
     const auto session = _state->objectStoreSession();
-    const auto status = session->hubStatus();
+    const auto attachment = _state->objectStoreAttachment();
+    const auto status = attachment ? session->hubStatus(*attachment) : std::nullopt;
     if (!status || status->conflicts.empty()) return;
     QStringList uuids;
     for (const auto& conflict : status->conflicts) uuids << QString::fromStdString(conflict.uuid);
@@ -11357,6 +11359,6 @@ void CWindow::promptHubConflicts()
     auto* keepMine = box.addButton(tr("Keep Mine"), QMessageBox::AcceptRole);
     box.addButton(tr("Later"), QMessageBox::RejectRole);
     box.exec();
-    if (box.clickedButton() == useHub) session->resolveHubConflicts("hub");
-    else if (box.clickedButton() == keepMine) session->resolveHubConflicts("local");
+    if (box.clickedButton() == useHub) session->resolveHubConflicts(*attachment, "hub");
+    else if (box.clickedButton() == keepMine) session->resolveHubConflicts(*attachment, "local");
 }

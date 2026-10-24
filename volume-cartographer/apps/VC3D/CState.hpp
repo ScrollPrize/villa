@@ -45,6 +45,8 @@ public:
 
     // One session for all object kinds; controllers share this handle.
     std::shared_ptr<vc::objects::ObjectStoreSession> objectStoreSession() const { return _objectStoreSession; }
+    // The user's store in that session: the attachment edits go to.
+    std::optional<vc::objects::AttachmentIdentity> objectStoreAttachment() const;
     void attachObjectStore(const QString& path, const QString& author, bool readOnly = false);
     void detachObjectStore();
     void pollObjectStoreChanges();
@@ -139,6 +141,7 @@ private:
 
     CState* _objectStoreOwner = nullptr;
     std::shared_ptr<vc::objects::ObjectStoreSession> _objectStoreSession;
+    std::optional<vc::objects::AttachmentIdentity> _objectStoreAttachment;
     QString _objectStoreObservationError;
     std::shared_ptr<VolumePkg> _vpkg;
     std::shared_ptr<Volume> _currentVolume;

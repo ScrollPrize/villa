@@ -280,7 +280,7 @@ SpiralWorkspace::SpiralWorkspace(CState* mainState, QWidget* parent)
     _state = new CState(
         this, _mainState && _mainState->debugDownloadQueueEnabled(), _mainState);
     connect(_state,&CState::objectStoreChanged,this,[this](const vc::objects::StoreSessionEvent& event) {
-        if(event.kind==vc::objects::StoreSessionEvent::Kind::Attachment) {
+        if(event.kind==vc::objects::StoreSessionEvent::Kind::Attached || event.kind == vc::objects::StoreSessionEvent::Kind::Detached) {
             cancelLineAnnotationDraft();
             _trackedFiberPaths.clear();
         }
@@ -1129,7 +1129,7 @@ QString SpiralWorkspace::lineAnnotationDraftUnavailableReason() const
         return _previewCoordinateError.isEmpty()
             ? tr("Spiral preview and fiber coordinates have not been paired")
             : _previewCoordinateError;
-    if (!_state->objectStoreSession()->attachment()) return tr("Attach an object store before creating fibers");
+    if (!_state->objectStoreAttachment()) return tr("Attach an object store before creating fibers");
     return {};
 }
 

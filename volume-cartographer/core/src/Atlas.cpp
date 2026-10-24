@@ -292,12 +292,22 @@ nlohmann::json readJsonFile(const fs::path& path)
     return nlohmann::json::parse(in);
 }
 
+// The session attachment of the store an atlas pin references.
+std::optional<vc::objects::AttachmentIdentity> pinnedAttachment(const vc::objects::ObjectStoreSession& store,
+                                                                const vc::objects::PinnedObject& pin)
+{
+    for (const auto& attachment : store.attachments())
+        if (attachment.storeUuid == pin.object.storeUuid) return attachment;
+    return std::nullopt;
+}
+
 nlohmann::json storedFiberDocument(const FiberMapping& mapping,
     const std::shared_ptr<vc::objects::ObjectStoreSession>& store)
 {
     if(!store || !mapping.storePin) throw std::runtime_error("Attach the atlas object store before reading its fibers");
-    const auto attachment=store->attachment();const auto& pin=*mapping.storePin;
-    if(!attachment || attachment->storeUuid!=pin.object.storeUuid) throw std::runtime_error("Atlas references a different object store");
+    const auto& pin=*mapping.storePin;
+    const auto attachment=pinnedAttachment(*store,pin);
+    if(!attachment) throw std::runtime_error("Atlas references a different object store");
     nlohmann::json result;
     store->read(*attachment,[&](const auto& db,const auto& txn,const auto& cancelled) {
         const auto revision=db.objectRevision(txn,pin.objectRevision);
@@ -328,10 +338,9 @@ FiberInput loadMappedFiberInput(const FiberMapping& mapping,
     const std::shared_ptr<vc::objects::ObjectStoreSession>& store)
 {
     if (!store || !mapping.storePin) throw std::runtime_error("Atlas fiber requires an object store revision pin");
-    const auto attachment = store->attachment();
     const auto& pin = *mapping.storePin;
-    if (!attachment || attachment->storeUuid != pin.object.storeUuid)
-        throw std::runtime_error("Atlas references a different object store");
+    const auto attachment = pinnedAttachment(*store, pin);
+    if (!attachment) throw std::runtime_error("Atlas references a different object store");
     if (!(mapping.storeToAtlasScale > 0) || !std::isfinite(mapping.storeToAtlasScale))
         throw std::runtime_error("Invalid stored atlas coordinate transform");
     FiberInput input;
@@ -2949,7 +2958,8 @@ struct AtlasSnapPreparedCandidatesState {
     std::shared_ptr<vc::objects::ObjectStoreSession> store;
     std::optional<vc::objects::AttachmentIdentity> attachment;
     void checkPins() const {
-        if(!store) return;
+        const bool pinned = std::any_of(atlas.fibers.begin(), atlas.fibers.end(), [](const auto& m) { return m.storePin.has_value(); });
+        if(!store || !pinned) return;
         if(!attachment) throw std::runtime_error("Atlas request has no object store attachment");
         store->read(*attachment,[&](const auto& db,const auto& txn,const auto& canceled) {
             for(const auto& mapping:atlas.fibers) if(mapping.storePin) {
@@ -3043,7 +3053,6 @@ AtlasSnapPreparedCandidates prepareAtlasPredSnapCandidates(
     prepared.state = std::make_shared<AtlasSnapPreparedCandidatesState>();
     AtlasSnapPreparedCandidatesState& state = *prepared.state;
     state.store=store;
-    if(store) state.attachment=store->attachment();
     state.atlasDir = atlasDir;
     state.manifestPath = manifestPath;
     state.options = options;
@@ -3054,6 +3063,9 @@ AtlasSnapPreparedCandidates prepareAtlasPredSnapCandidates(
               << " volpkg_root=" << volpkgRoot.string()
               << std::endl;
     Atlas atlas = Atlas::load(atlasDir, store);
+    if (store)
+        for (const auto& mapping : atlas.fibers)
+            if (mapping.storePin) { state.attachment = pinnedAttachment(*store, *mapping.storePin); break; }
     std::cerr << "[atlas-snap] loaded atlas"
               << " fibers=" << atlas.fibers.size()
               << " links=" << atlas.links.size()
