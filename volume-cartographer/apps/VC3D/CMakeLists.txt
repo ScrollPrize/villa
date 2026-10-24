@@ -33,6 +33,8 @@ set(srcs
     fibers3d/Fiber3DPanel.hpp
     fibers3d/Fiber3DRibbon.hpp
     fibers3d/Fiber3DRibbon.cpp
+    fibers3d/Fiber3DCT.hpp
+    fibers3d/Fiber3DCT.cpp
     fibers3d/Fiber3DRibbonControls.hpp
     fibers3d/Fiber3DRibbonControls.cpp
     LineAnnotationPolylineIndices.hpp

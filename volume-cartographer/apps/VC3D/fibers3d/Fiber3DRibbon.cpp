@@ -170,8 +170,6 @@ std::shared_ptr<Image> sample(const Frames& frames, Volume& volume, int widthVox
     image->sampledNormals = frames.sampledNormals;
     image->widthVoxels = widthVoxels;
     image->rotationDegrees = rotationDegrees;
-    const auto shape = volume.shapeXyz();
-    vc::SampleParams params;  // native trilinear; no compositing
     for (const auto& strip : frames.strips)
         for (size_t start = 0; start + 1 < strip.size(); start += 1023) {
             check(cancelled);
@@ -185,31 +183,7 @@ std::shared_ptr<Image> sample(const Frames& frames, Volume& volume, int widthVox
                 tile.left.push_back(point(row.center - axis * (widthVoxels * .5)));
                 tile.right.push_back(point(row.center + axis * (widthVoxels * .5)));
             }
-            // Small requests bound cancellation latency and decoded chunks held by
-            // the existing blocking sampler. Never materialize the enclosing CT box.
-            for (int first = 0; first < tile.height; first += 32) {
-                check(cancelled);
-                const int rows = std::min(32, tile.height - first);
-                cv::Mat_<cv::Vec3f> coords(rows, width);
-                for (int r = 0; r < rows; ++r)
-                    for (int c = 0; c < width; ++c) {
-                        const auto p = interpolate(tile.left[first + r], tile.right[first + r], double(c) / widthVoxels);
-                        const bool valid =
-                            p[0] >= 0 && p[1] >= 0 && p[2] >= 0 && p[0] <= shape[0] - 1 && p[1] <= shape[1] - 1 && p[2] <= shape[2] - 1;
-                        coords(r, c) = cv::Vec3f(float(p[0]), float(p[1]), float(p[2]));
-                        tile.pixels[(size_t(first + r) * width + c) * 2 + 1] = valid ? 255 : 0;
-                    }
-                cv::Mat_<uint8_t> bytes;
-                if (dtype == vc::render::ChunkDtype::UInt16) {
-                    cv::Mat_<uint16_t> values;
-                    volume.sample(values, coords, params);
-                    values.convertTo(bytes, CV_8U, 1. / 256.);
-                } else
-                    volume.sample(bytes, coords, params);
-                for (int r = 0; r < rows; ++r)
-                    for (int c = 0; c < width; ++c)
-                        tile.pixels[(size_t(first + r) * width + c) * 2] = bytes(r, c);
-            }
+            ct::sampleTile(tile, volume, 0, cancelled);
             image->tiles.push_back(std::move(tile));
         }
     check(cancelled);

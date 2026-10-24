@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Fiber3DScene.hpp"
+#include "Fiber3DCT.hpp"
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -28,12 +29,7 @@ struct Frames {
 Frames makeFrames(const Fiber& fiber, const std::optional<Bounds>& clip, const NormalAt& normalAt = {}, const std::atomic_bool* cancelled = nullptr);
 cv::Vec3d across(const Row& row, double rotationDegrees);
 
-struct Tile {
-    std::vector<Point> left, right;
-    int width = 0, height = 0;
-    // Interleaved grayscale / validity, independent of display window/level.
-    std::vector<uint8_t> pixels;
-};
+using Tile = ct::Tile;
 struct Image {
     QString key;
     std::vector<Tile> tiles;

@@ -676,7 +676,7 @@ add_test(NAME fiber_3d_geometry COMMAND test_fiber_3d_geometry)
 vc_register_test_target(test_fiber_3d_geometry)
 vc_register_ctest(fiber_3d_geometry test_fiber_3d_geometry)
 
-add_executable(test_fiber_3d_ribbon test_fiber_3d_ribbon.cpp ../fibers3d/Fiber3DRibbon.cpp)
+add_executable(test_fiber_3d_ribbon test_fiber_3d_ribbon.cpp ../fibers3d/Fiber3DRibbon.cpp ../fibers3d/Fiber3DCT.cpp)
 set_target_properties(test_fiber_3d_ribbon PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_fiber_3d_ribbon PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
 target_link_libraries(test_fiber_3d_ribbon PRIVATE Qt6::Core Qt6::Gui Qt6::Test vc_core vc_fiber_collection)
