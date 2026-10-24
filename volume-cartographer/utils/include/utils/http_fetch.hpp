@@ -30,11 +30,14 @@ struct HttpResponse {
     std::vector<std::byte> body;
     std::string content_type;
     std::size_t content_length = 0;
-    // Populated when libcurl fails before an HTTP response is received.
+    // Populated on transport failures, SFTP errors and unconfirmed S3 missing-object responses.
     std::string error_message;
+    // A 404 from an S3 origin that did not prove the key is absent (no complete
+    // NoSuchKey error, or a HEAD miss that a ranged GET contradicted).
+    bool unconfirmed_404 = false;
 
     [[nodiscard]] bool ok() const noexcept { return status_code >= 200 && status_code < 300; }
-    [[nodiscard]] bool not_found() const noexcept { return status_code == 404; }
+    [[nodiscard]] bool not_found() const noexcept { return status_code == 404 && !unconfirmed_404; }
 
     [[nodiscard]] std::string_view body_string() const noexcept {
         return {reinterpret_cast<const char*>(body.data()), body.size()};

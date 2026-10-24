@@ -109,6 +109,10 @@ std::string httpGetString(const std::string& url, const HttpAuth& auth)
         return body;
     }
 
+    if (resp.status_code == 404 && !resp.not_found()) {
+        throw std::runtime_error("HTTP 404 fetching " + url + ": " + resp.error_message);
+    }
+
     if (resp.status_code >= 400) {
         const auto body = std::string(resp.body_string());
         if (isAwsAuthenticationFailure(resp.status_code, body))
@@ -129,6 +133,10 @@ std::vector<std::byte> httpGetBytes(const std::string& url, const HttpAuth& auth
         throw std::runtime_error("SFTP fetch failed: " + resp.error_message);
     if (resp.ok()) {
         return std::move(resp.body);
+    }
+
+    if (resp.status_code == 404 && !resp.not_found()) {
+        throw std::runtime_error("HTTP 404 fetching " + url + ": " + resp.error_message);
     }
 
     if (resp.status_code >= 400) {

@@ -1260,6 +1260,15 @@ std::filesystem::path FileSystemStore::safe_path(const std::string& key) const {
 // HttpStore
 // ---------------------------------------------------------------------------
 
+namespace {
+void check_http_store_response(const HttpResponse& response, const std::string& key) {
+    if (!response.ok() && !response.not_found()) {
+        throw std::runtime_error("HttpStore: HTTP " + std::to_string(response.status_code) +
+            " fetching " + key + (response.error_message.empty() ? "" : ": " + response.error_message));
+    }
+}
+} // namespace
+
 HttpStore::HttpStore(std::string base_url)
     : base_url_(strip_trailing_slash(std::move(base_url)))
     , client_(std::make_shared<HttpClient>()) {}
@@ -1281,6 +1290,7 @@ bool HttpStore::exists(const std::string& key) const {
     const auto resp = client_->head(make_url(key));
     if (is_sftp_url(base_url_) && !resp.ok() && !resp.not_found())
         throw std::runtime_error("SFTP stat failed: " + resp.error_message);
+    check_http_store_response(resp, key);
     return resp.ok();
 }
 
@@ -1296,7 +1306,8 @@ HttpStore::get_if_exists(const std::string& key) const {
     auto resp = client_->get(make_url(key));
     if (is_sftp_url(base_url_) && !resp.ok() && !resp.not_found())
         throw std::runtime_error("SFTP read failed: " + resp.error_message);
-    if (!resp.ok()) return std::nullopt;
+    check_http_store_response(resp, key);
+    if (resp.not_found()) return std::nullopt;
     return std::move(resp.body);
 }
 
@@ -1310,16 +1321,19 @@ void HttpStore::erase(const std::string& /*key*/) {
 
 std::optional<std::vector<std::byte>>
 HttpStore::get_partial(const std::string& key, std::size_t offset, std::size_t length) const {
+    if (length == 0) return std::nullopt;
     auto resp = client_->get_range(make_url(key), offset, length);
     if (is_sftp_url(base_url_) && !resp.ok() && !resp.not_found())
         throw std::runtime_error("SFTP range read failed: " + resp.error_message);
-    if (!resp.ok()) return std::nullopt;
+    check_http_store_response(resp, key);
+    if (resp.not_found()) return std::nullopt;
     return std::move(resp.body);
 }
 
 std::optional<std::size_t> HttpStore::size_of(const std::string& key) const {
     auto resp = client_->head(make_url(key));
-    if (!resp.ok() || resp.content_length == 0) return std::nullopt;
+    check_http_store_response(resp, key);
+    if (resp.not_found() || resp.content_length == 0) return std::nullopt;
     return resp.content_length;
 }
 
