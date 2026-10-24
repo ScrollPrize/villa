@@ -495,3 +495,57 @@ def test_flat_inference_ignores_embedded_io_paths_and_keeps_reference_defaults(
     assert "stride=8 requested_overlap=0.500 blend_mode=hann" in caplog.text
     assert np.all(tifffile.imread(output) == 127)
     assert not any(path.name.startswith("ink_flat_infer_") for path in tmp_path.iterdir())
+
+
+def test_block_inference_logs_progress_and_summary(caplog):
+    """Long runs report patches done, rate and remaining time, then a summary."""
+
+    from torch.utils.data import DataLoader
+
+    from vesuvius.ink_detection.inference.infer import run_block_inference
+
+    class _ConstantModel(nn.Module):
+        def forward(self, image_BCZYX):
+            batch, _, _, height, width = image_BCZYX.shape
+            return torch.zeros((batch, 1, height, width), dtype=image_BCZYX.dtype)
+
+    patch = 2
+    samples = []
+    for index, (y0, x0) in enumerate([(0, 0), (0, 2), (2, 0), (2, 2)]):
+        image = torch.full((1, 3, patch, patch), 0.5, dtype=torch.float32)
+        nonempty = 0 if index == 3 else 1  # the last block is empty and skipped
+        samples.append((image, torch.tensor([y0, x0, patch, patch, nonempty])))
+    loader = DataLoader(samples, batch_size=1, shuffle=False)
+    probability = np.zeros((4, 4), dtype=np.float32)
+    weight = np.zeros((4, 4), dtype=np.float32)
+    scheduled = iter_blocks((4, 4), patch, patch)
+    accumulator = ChunkAccumulator(
+        shape=(4, 4),
+        chunk_shape=(4, 4),
+        prob_sum_store=probability,
+        weight_sum_store=weight,
+        contribution_counts=compute_chunk_contribution_counts(
+            scheduled, chunk_shape=(4, 4)
+        ),
+    )
+    with caplog.at_level("INFO"):
+        run_block_inference(
+            loader=loader,
+            model=_ConstantModel(),
+            accumulator=accumulator,
+            weight_map=np.ones((patch, patch), dtype=np.float32),
+            mask=None,
+            device=torch.device("cpu"),
+            amp_dtype=None,
+            tta_axes=(),
+            tta_batch_size=None,
+            progress_interval=0.0,
+        )
+    progress = [r.getMessage() for r in caplog.records if "patches (" in r.getMessage()]
+    assert progress, caplog.text
+    assert progress[0].startswith("ink inference: 1/4 patches (25.0%)")
+    assert "remaining" in progress[0]
+    # the last batch is reported by the summary, not by a progress line
+    assert all(not line.startswith("ink inference: 4/4") for line in progress)
+    summary = [r.getMessage() for r in caplog.records if "patches in" in r.getMessage()]
+    assert len(summary) == 1 and summary[0].startswith("ink inference: 4 patches in")
