@@ -291,80 +291,77 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
         chunkReadError = error.empty() ? "chunk fetch failed" : error;
     };
 
+    if (readZ0 > readZ1 || readY0 > readY1 || readX0 > readX1) {
+        return;
+    }
+
+    // Look each chunk up once, then copy rows with no lookups. Looking the
+    // chunk up again on every voxel row took the cache's lock about twice a
+    // row (24,000 locked lookups for a 109 voxel cube), which serialized
+    // threads that read at the same time. The voxels copied are the same.
+    // One layer of chunks along z is held at a time, so a large read pins
+    // no more than one layer of decoded chunks.
+    const int cZ0 = readZ0 / chunkShape[0];
+    const int cY0 = readY0 / chunkShape[1];
+    const int cX0 = readX0 / chunkShape[2];
+    const int nZ = readZ1 / chunkShape[0] - cZ0 + 1;
+    const int nY = readY1 / chunkShape[1] - cY0 + 1;
+    const int nX = readX1 / chunkShape[2] - cX0 + 1;
+    struct LoadedChunk {
+        const T* data = nullptr; // null: fill value
+        std::shared_ptr<const std::vector<std::byte>> bytes;
+    };
+    std::vector<LoadedChunk> layer(static_cast<size_t>(nY) * nX);
+
     #pragma omp parallel
-    {
-        struct CachedChunk {
-            int cz = std::numeric_limits<int>::min();
-            int cy = std::numeric_limits<int>::min();
-            int cx = std::numeric_limits<int>::min();
-            bool allFill = false;
-            const T* data = nullptr;
-            std::shared_ptr<const std::vector<std::byte>> bytes;
-        } cached;
+    for (int zi = 0; zi < nZ; ++zi) {
+        const int cz = cZ0 + zi;
 
-        auto loadChunk = [&](int cz, int cy, int cx) -> bool {
+        #pragma omp for schedule(dynamic, 1)
+        for (std::int64_t c = 0; c < static_cast<std::int64_t>(layer.size()); ++c) {
+            layer[c] = {};
             if (chunkReadFailed.load(std::memory_order_acquire)) {
-                return false;
+                continue;
             }
-            if (cached.cz == cz && cached.cy == cy && cached.cx == cx) {
-                return true;
-            }
-            cached = {};
-            cached.cz = cz;
-            cached.cy = cy;
-            cached.cx = cx;
-
+            const int cy = cY0 + static_cast<int>(c / nX);
+            const int cx = cX0 + static_cast<int>(c % nX);
             const auto result = array.getChunkBlocking(level, cz, cy, cx);
-            if (result.status == ChunkStatus::AllFill) {
-                cached.allFill = true;
-            } else if (result.status == ChunkStatus::Data && result.bytes) {
-                cached.bytes = result.bytes;
-                cached.data = reinterpret_cast<const T*>(cached.bytes->data());
+            if (result.status == ChunkStatus::Data && result.bytes) {
+                layer[c].bytes = result.bytes;
+                layer[c].data = reinterpret_cast<const T*>(layer[c].bytes->data());
             } else if (result.status == ChunkStatus::Error) {
                 recordChunkReadError(cz, cy, cx, result.error);
-                return false;
-            } else {
-                cached.allFill = true;
             }
-            return true;
-        };
+        }
 
+        const int layerZ0 = std::max(readZ0, cz * chunkShape[0]);
+        const int layerZ1 = std::min(readZ1, cz * chunkShape[0] + chunkShape[0] - 1);
         #pragma omp for schedule(dynamic, 4) collapse(2)
-        for (size_t z = 0; z < outShape[0]; ++z) {
-            for (size_t y = 0; y < outShape[1]; ++y) {
+        for (int iz = layerZ0; iz <= layerZ1; ++iz) {
+            for (int iy = readY0; iy <= readY1; ++iy) {
                 if (chunkReadFailed.load(std::memory_order_acquire)) {
                     continue;
                 }
-                const int iz = z0 + static_cast<int>(z);
-                const int iy = y0 + static_cast<int>(y);
-                if (iz < 0 || iz >= volumeShape[0] ||
-                    iy < 0 || iy >= volumeShape[1]) {
-                    continue;
-                }
-                const int cz = iz / chunkShape[0];
                 const int cy = iy / chunkShape[1];
-                const int lz = iz - cz * chunkShape[0];
-                const int ly = iy - cy * chunkShape[1];
-                for (size_t x = 0; x < outShape[2]; ++x) {
-                    if (chunkReadFailed.load(std::memory_order_acquire)) {
-                        break;
-                    }
-                    const int ix = x0 + static_cast<int>(x);
-                    if (ix < 0 || ix >= volumeShape[2]) {
+                const size_t lz = static_cast<size_t>(iz - cz * chunkShape[0]);
+                const size_t ly = static_cast<size_t>(iy - cy * chunkShape[1]);
+                const size_t z = static_cast<size_t>(iz - z0);
+                const size_t y = static_cast<size_t>(iy - y0);
+                for (int xi = 0; xi < nX; ++xi) {
+                    const int cx = cX0 + xi;
+                    const LoadedChunk& chunk = layer[static_cast<size_t>(cy - cY0) * nX + xi];
+                    const int chunkX0 = cx * chunkShape[2];
+                    const int bx0 = std::max(readX0, chunkX0);
+                    const int bx1 = std::min(readX1, chunkX0 + chunkShape[2] - 1);
+                    if (!chunk.data) {
+                        for (int ix = bx0; ix <= bx1; ++ix) {
+                            out(z, y, static_cast<size_t>(ix - x0)) = fill;
+                        }
                         continue;
                     }
-                    const int cx = ix / chunkShape[2];
-                    const int lx = ix - cx * chunkShape[2];
-                    if (!loadChunk(cz, cy, cx)) {
-                        break;
-                    }
-                    if (cached.allFill || !cached.data) {
-                        out(z, y, x) = fill;
-                    } else {
-                        const size_t offset = static_cast<size_t>(lz) * chunkStrideZ +
-                                              static_cast<size_t>(ly) * chunkStrideY +
-                                              static_cast<size_t>(lx);
-                        out(z, y, x) = cached.data[offset];
+                    const T* row = chunk.data + lz * chunkStrideZ + ly * chunkStrideY;
+                    for (int ix = bx0; ix <= bx1; ++ix) {
+                        out(z, y, static_cast<size_t>(ix - x0)) = row[ix - chunkX0];
                     }
                 }
             }
