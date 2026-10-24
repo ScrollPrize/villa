@@ -126,7 +126,8 @@ Atlas/local normal overrides and compatibility rules.
 This installation currently expects the `villa` monorepo layout: Lasagna
 packages the sibling `vesuvius/src` implementation, installs its declared
 model dependencies, and installs the sibling Volume Cartographer Python
-distribution with its `vc_fiberlets` command. Copying only the `lasagna/`
+distribution with its `vc_fiberlets` command and the sibling `vc_object_store`
+Python package, through which surfaces are exchanged. Copying only the `lasagna/`
 directory is therefore not yet a supported standalone installation. On Linux,
 the bootstrap selects an available GCC 13 or newer for that C++23 build unless
 `CC` or `CXX` is already set.

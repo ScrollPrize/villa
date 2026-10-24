@@ -69,6 +69,9 @@ fit_service_requires = [
     "tensorstore>=0.1.60",
     "tifffile>=2023.7.10",
     "torch>=2.1",
+    # Monorepo-only: surfaces and fit artifacts are exchanged through the object
+    # store; scripts/bootstrap_venv.py installs the sibling vc_object_store.
+    "vc-object-store",
     "zarr>=3.0,<4",
 ]
 downloader_requires = ["boto3>=1.28"]
