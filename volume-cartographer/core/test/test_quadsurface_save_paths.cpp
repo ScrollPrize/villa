@@ -204,6 +204,38 @@ TEST_CASE("save(path, force_overwrite=true): atomic-exchange replaces existing")
     fs::remove_all(root);
 }
 
+TEST_CASE("saving over a segment keeps its subfolders")
+{
+    auto root = tmpDir("subfolders");
+    auto segDir = root / "seg";
+    QuadSurface(grid(), cv::Vec2f(1.f, 1.f)).save(segDir);
+
+    // What VC3D keeps inside a catalog segment, and a label zarr.
+    fs::create_directories(segDir / "ink-detections");
+    std::ofstream(segDir / "ink-detections" / "ink_detection.png") << "png";
+    fs::create_directories(segDir / "seg_inklabels.zarr" / "0");
+    std::ofstream(segDir / "seg_inklabels.zarr" / "0" / ".zarray") << "{}";
+
+    SUBCASE("saveOverwrite (VC3D edits and autosave)")
+    {
+        QuadSurface loaded(segDir);
+        loaded.ensureLoaded();
+        loaded.saveOverwrite();
+    }
+    SUBCASE("save(path, force_overwrite=true)")
+    {
+        auto loaded = load_quad_from_tifxyz(segDir.string());
+        REQUIRE(loaded);
+        loaded->save(segDir, true);
+    }
+
+    CHECK(fs::exists(segDir / "ink-detections" / "ink_detection.png"));
+    CHECK(fs::exists(segDir / "seg_inklabels.zarr" / "0" / ".zarray"));
+    CHECK(fs::exists(segDir / "x.tif"));
+    CHECK(QuadSurface(segDir).meta["format"].get_string() == "tifxyz");
+    fs::remove_all(root);
+}
+
 TEST_CASE("load rolls back an interrupted multi-file save generation")
 {
     auto root = tmpDir("rollback");
