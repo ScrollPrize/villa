@@ -16,6 +16,8 @@ set(srcs
     Keybinds.hpp
     CWindow.cpp
     FiberCollectionController.cpp
+    SurfaceCatalog.cpp
+    SurfaceCatalog.hpp
     FiberCollectionController.hpp
     FiberDisplayOptions.hpp
     CWindowContextMenu.cpp

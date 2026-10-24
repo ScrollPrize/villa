@@ -1,0 +1,113 @@
+// The VC3D surface catalog over a real object store: rows of the current
+// volume's surfaces kept current from commit events, opening a surface in the
+// volume's voxels, and record edits (tags, name, retire).
+#include "SurfaceCatalog.hpp"
+#include "ObjectStoreCoordinates.hpp"
+#include "vc/core/types/Volume.hpp"
+#include "vc/core/util/QuadSurface.hpp"
+#include <vc_object_store/Uuid.hpp>
+#include <QCoreApplication>
+#include <QElapsedTimer>
+#include <QTemporaryDir>
+#include <QThread>
+#include <filesystem>
+#include <iostream>
+
+namespace fs = std::filesystem;
+using namespace vc::objects;
+
+namespace {
+void require(bool value, const char* message)
+{
+    if (!value) throw std::runtime_error(message);
+}
+}
+
+int main(int argc, char** argv)
+{
+    QCoreApplication app(argc, argv);
+    try {
+        QTemporaryDir dir;
+        Volume::ZarrCreateOptions create;
+        create.shapeZYX = {4, 4, 4}; create.chunkShapeZYX = {4, 4, 4}; create.compressor = "none"; create.uuid = "vol1";
+        const auto volume = Volume::New(fs::path(dir.path().toStdString()) / "ct.zarr", create);
+        const auto path = fs::path(dir.path().toStdString()) / "objects.vcobj";
+        OpenOptions options; options.author = "surface-catalog-test";
+        { auto created = ObjectStore::create(path, options); }
+        auto session = std::make_shared<ObjectStoreSession>();
+        const auto attachment = session->attach(path, options);
+
+        cv::Mat_<cv::Vec3f> points(3, 3);
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) points(r, c) = {float(c), float(r), 1.f};
+        QuadSurface grid(points, {1.f, 1.f});
+        auto add = [&](const std::string& name, const std::optional<nlohmann::json>& coordinates) {
+            const auto uuid = util::newUuid();
+            session->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
+                ObjectRecord record; record.uuid = uuid; record.kind = "surface"; record.name = name; record.tags = {"approved"};
+                auto meta = nlohmann::json::object();
+                if (coordinates) meta.update(*coordinates);
+                record.meta = meta.dump();
+                db.upsertObject(txn, record);
+                db.putGeometry(txn, uuid, quad_surface_geometry(grid));
+            });
+            return uuid;
+        };
+        const auto native = add("native", vc3d::coordinateBindingForVolume(*volume, 1));
+        const auto half = add("half", vc3d::coordinateBindingForVolume(*volume, 0.5));
+        const auto unbound = add("unbound", std::nullopt);
+        const auto other = add("other", nlohmann::json{{"coordinates", geometryCoordinates({{"volume_uuid", "vol2"}, {"scale_factor", 1}})}});
+
+        SurfaceCatalog catalog(session);
+        std::vector<std::string> committed;
+        QObject::connect(&catalog, &SurfaceCatalog::surfacesCommitted,
+                         [&](const std::vector<std::string>& uuids) { committed.insert(committed.end(), uuids.begin(), uuids.end()); });
+        auto pump = [&](const std::function<bool()>& done, const char* message) {
+            QElapsedTimer timer; timer.start();
+            while (!done() && timer.elapsed() < 10000) {
+                for (const auto& event : session->takeEvents()) catalog.handle(event);
+                QCoreApplication::processEvents();
+                QThread::msleep(1);
+            }
+            if (!done()) std::cerr << "rows=" << catalog.rows().size() << " loading=" << catalog.loading()
+                                   << " error=" << catalog.error().toStdString() << '\n';
+            require(done(), message);
+        };
+        session->takeEvents();
+        catalog.setSource(attachment, volume);
+        pump([&] { return !catalog.loading() && catalog.rows().size() == 4; }, "lists the volume's surfaces and those not bound to it");
+        require(catalog.row(native)->toVolume == 1.0 && catalog.row(half)->toVolume == 2.0 && !catalog.row(unbound)->toVolume &&
+                !catalog.row(other)->toVolume, "rows carry the volume scale; other volumes' surfaces are unbound here");
+        require(catalog.row(native)->record.name == "native" && catalog.row(native)->record.tags == std::vector<std::string>{"approved"},
+                "rows carry name and tags");
+
+        const auto opened = catalog.open(native);
+        require(opened.editable && opened.surface->id == native && opened.pin.geometryRevision, "native surfaces open editable and pinned");
+        require((*opened.surface->rawPointsPtr())(2, 1) == cv::Vec3f(1, 2, 1), "native points are stored points");
+        const auto scaled = catalog.open(half);
+        require(!scaled.editable && scaled.toVolume == 2.0, "scaled surfaces open read-only");
+        require((*scaled.surface->rawPointsPtr())(2, 1) == cv::Vec3f(2, 4, 2), "scaled points are in volume voxels");
+        bool refused = false;
+        try { catalog.open(unbound); } catch (const std::exception&) { refused = true; }
+        require(refused, "unbound surfaces do not open");
+
+        catalog.setTags(native, {"reviewed"});
+        catalog.rename(native, "renamed");
+        pump([&] {
+            const auto* row = catalog.row(native);
+            return row && row->record.name == "renamed" && row->record.tags == std::vector<std::string>{"reviewed"};
+        }, "record edits reach the rows through commit events");
+        require(std::count(committed.begin(), committed.end(), native) >= 1, "commits name the edited surface");
+        catalog.retire({half});
+        pump([&] { return !catalog.row(half) && catalog.rows().size() == 3; }, "retired surfaces leave the listing");
+
+        catalog.setSource(std::nullopt, volume);
+        require(catalog.rows().empty(), "no attachment lists nothing");
+        session->detach(attachment);
+        std::cout << "surface catalog tests passed\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "surface catalog test: " << error.what() << '\n';
+        return 1;
+    }
+}
