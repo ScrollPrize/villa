@@ -230,6 +230,12 @@ def _record_point_patch_link(
     distance: float,
     ij_coords: List[float],
 ) -> None:
+    if point.get('fit_excluded', False):
+        # Inside a gap/damaged fiber span (spiral_helpers.load_fiber_point_
+        # collection): the point is geometry only and must not tie its
+        # fiber's winding to a patch. _link_from_hits drops such hits before
+        # the window gate; this guard covers the single-hit legacy path.
+        return
     point_zyx = np.asarray(point.get('zyx', point['p'][::-1]), dtype=np.float32).tolist()
     point['on_patch'] = {'id': patch_id, 'distance': float(distance), 'ij': list(ij_coords)}
     links.setdefault(patch_id, []).append(
@@ -387,6 +393,14 @@ def _link_from_hits(
     if len(surf_idx) == 0:
         return local
     keep = surf_idx >= 0
+    # Points excluded from the fit (gap/damaged fiber spans) have no hits:
+    # they neither attach nor count towards a neighbour's window support.
+    # They keep their index positions, so window extents are unchanged.
+    excluded = np.fromiter(
+        (bool(point.get('fit_excluded', False)) for _, point in point_items),
+        dtype=bool, count=len(point_items))
+    if excluded.any():
+        keep &= ~excluded[point_idx]
     if target_idxs is not None:
         keep &= np.isin(surf_idx, target_idxs)
     if not keep.all():
