@@ -292,6 +292,13 @@ int vfsOpen(sqlite3_vfs*, const char* name, sqlite3_file* file, int flags, int* 
                 throw std::runtime_error("the SFTP server lacks fsync@openssh.com, so writes cannot be made durable");
             s->handle = session.open(s->path, create);
             s->generation = s->connection->generation;
+            // Like SQLite's unix VFS, a journal takes its database's permission
+            // bits, so every user who may write the hub can roll it back.
+            constexpr std::string_view suffix = "-journal";
+            if ((flags & SQLITE_OPEN_MAIN_JOURNAL) && (flags & SQLITE_OPEN_CREATE) && s->path.ends_with(suffix)) {
+                const auto database = session.stat(s->path.substr(0, s->path.size() - suffix.size()));
+                if (database.permissions) session.setPermissions(s->handle, *database.permissions & 07777);
+            }
         });
         reinterpret_cast<File*>(file)->state = s.release();
         file->pMethods = &kMethods;

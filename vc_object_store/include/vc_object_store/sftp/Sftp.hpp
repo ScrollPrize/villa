@@ -114,6 +114,7 @@ public:
     void close(const Handle& handle);
     Attributes fstat(const Handle& handle);
     void truncate(const Handle& handle, uint64_t size);
+    void setPermissions(const Handle& handle, uint32_t mode);  // not subject to the server's umask
     void fsync(const Handle& handle);  // requires fsync@openssh.com
     // Reads up to out.size() bytes with several requests in flight; returns
     // fewer only at end of file.

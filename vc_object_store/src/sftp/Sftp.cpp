@@ -443,6 +443,13 @@ void Session::truncate(const Handle& handle, uint64_t size)
     u64(b, size);
     impl_->call(Fsetstat, b, StatusReply);
 }
+void Session::setPermissions(const Handle& handle, uint32_t mode)
+{
+    auto b = impl_->pathPayload(handle);
+    u32(b, PermissionsFlag);
+    u32(b, mode);
+    impl_->call(Fsetstat, b, StatusReply);
+}
 void Session::fsync(const Handle& handle)
 {
     if (!supports("fsync@openssh.com")) throw StatusError(OpUnsupported, "server lacks fsync@openssh.com");

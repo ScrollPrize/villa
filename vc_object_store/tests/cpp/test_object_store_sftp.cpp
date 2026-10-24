@@ -7,6 +7,8 @@
 #include "vc_object_store/geometry/Geometry.hpp"
 #include "vc_object_store/sftp/Sftp.hpp"
 #include <nlohmann/json.hpp>
+#include <sqlite3.h>
+#include <sys/stat.h>
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -57,6 +59,7 @@ int fakeSsh(int argc, char** argv)
             return 255;
         }
     }
+    if (const char* mask = std::getenv("VC_SFTP_TEST_UMASK")) umask(mode_t(std::stoi(mask, nullptr, 8)));
     const char* server = std::getenv("VC_SFTP_TEST_SERVER");
     execl(server, server, "-e", static_cast<char*>(nullptr));
     return 43;
@@ -243,6 +246,25 @@ void hosting(const std::filesystem::path& root)
     hubPull(alice);
     hubPull(bob);
     require(meta(alice, a) == meta(bob, a) && meta(alice, b) == meta(bob, b), "concurrent syncs converge");
+
+    // A journal takes the hub's permission bits, whatever the server's umask, so
+    // every user who may write the hub can also roll back a journal left behind.
+    {
+        std::filesystem::permissions(hubPath, std::filesystem::perms(0666));
+        setenv("VC_SFTP_TEST_UMASK", "077", 1);
+        const auto restrictive = "sftp://umask@test-host" + sftp::encodePath(hubPath.string());
+        sqlite3* db = nullptr;
+        require(sqlite3_open_v2(restrictive.c_str(), &db, SQLITE_OPEN_READWRITE, "vc-sftp") == SQLITE_OK, "raw remote open");
+        require(sqlite3_exec(db, "BEGIN IMMEDIATE; CREATE TABLE permission_probe(x);", nullptr, nullptr, nullptr) == SQLITE_OK,
+                "write inside a transaction");
+        struct stat journal{};
+        require(::stat((hubPath.string() + "-journal").c_str(), &journal) == 0, "journal exists during the write");
+        const auto mode = journal.st_mode & 0777;
+        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+        sqlite3_close(db);
+        unsetenv("VC_SFTP_TEST_UMASK");
+        require(mode == 0666, "journal mirrors the hub's permissions");
+    }
 
     // Stale locks are visible and removable through either address.
     require(!hubLockAge(hubUrl) && !hubLockAge(hubPath), "unlocked after syncs");
