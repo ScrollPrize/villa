@@ -6,6 +6,8 @@ Creates a dilated binary mask from a zarr using Euclidean Distance Transform.
 from __future__ import annotations
 
 import argparse
+import math
+import warnings
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Optional, Tuple
 
@@ -23,7 +25,13 @@ try:
     HAS_EDT = True
 except ImportError:
     HAS_EDT = False
+
+try:
     from scipy.ndimage import distance_transform_edt as scipy_edt
+except ImportError:  # needed without edt, and for regions too large for edt's float32
+    if not HAS_EDT:
+        raise
+    scipy_edt = None
 
 
 # Global state for worker processes
@@ -49,6 +57,69 @@ class EdtDilateConfig(TaskConfig):
     black_border: bool = True
     resolution: str = "0"
 
+    def __post_init__(self) -> None:
+        _validate_distance(self.distance)
+
+
+def _validate_distance(distance: float) -> None:
+    if not np.isfinite(distance) or distance < 0:
+        raise ValueError(
+            f"edt-dilate distance must be a finite, non-negative number of voxels; got {distance!r}"
+        )
+
+
+# float32 (edt.edtsq's output dtype) holds every integer only up to 2**24.
+_FLOAT32_EXACT_INT = 2**24
+
+# scipy's float64 path recovers a squared distance k as rint(fl(fl(sqrt(k))**2)). For
+# k < 2**51, sqrt(k) < 2**25.5 is rounded with ulp <= 2**-27 (error <= 2**-28), so the
+# exact square is within 2*2**25.5*2**-28 ~= 0.354 of k, and rounding that square (ulp
+# <= 0.25) adds <= 0.125: total < 0.5, so rint returns k. From 2**51 the argument fails
+# and rint does return wrong integers. Regions needing k >= 2**51 are rejected.
+_FLOAT64_RINT_EXACT_SQ = 2**51
+
+# Above this many voxels in one chunk-plus-halo region, warn in prepare().
+_REGION_VOXEL_WARN = 2**31
+
+
+def _halo(distance: float, shape: Tuple[int, ...]) -> int:
+    """ceil(distance), clipped to the largest volume extent (a wider halo reads nothing more)."""
+    return int(min(np.ceil(distance), max(shape, default=0)))
+
+
+def _max_sq_distance(shape: Tuple[int, ...]) -> int:
+    """Upper bound on any squared voxel-centre distance inside an array of ``shape``."""
+    return sum(int(n) ** 2 for n in shape)
+
+
+def _check_backend(region: Tuple[int, ...]) -> None:
+    """Raise if no available backend computes exact squared distances for ``region``."""
+    max_sq = _max_sq_distance(region)
+    if HAS_EDT and max_sq < _FLOAT32_EXACT_INT:
+        return
+    if max_sq >= _FLOAT64_RINT_EXACT_SQ:
+        raise ValueError(
+            f"edt-dilate: a region of shape {tuple(region)} allows squared distances up to "
+            f"{max_sq} >= 2**51, beyond which scipy's float64 EDT is not exact; "
+            f"reduce --chunk-size or --distance"
+        )
+    if scipy_edt is None:
+        raise ImportError(
+            f"edt-dilate: a region of shape {tuple(region)} allows squared distances up to "
+            f"{max_sq} >= 2**24, beyond edt's float32 precision, and needs scipy "
+            f"(scipy.ndimage), which is not installed; install scipy or reduce "
+            f"--chunk-size or --distance"
+        )
+
+
+def _scipy_edtsq(inverted: np.ndarray) -> np.ndarray:
+    """Exact squared EDT via scipy's float64 EDT (valid while squared distances < 2**51)."""
+    # In place, so no extra full-size temporaries.
+    distances = scipy_edt(inverted)
+    np.square(distances, out=distances)
+    np.rint(distances, out=distances)
+    return distances
+
 
 def _edt_dilate_worker(
     args: Tuple,
@@ -60,6 +131,7 @@ def _edt_dilate_worker(
     """
     global _WORKER_STATE
     chunk_idx, chunk_bounds, distance, black_border = args
+    _validate_distance(distance)
 
     input_path = _WORKER_STATE["input_path"]
     output_path = _WORKER_STATE["output_path"]
@@ -67,32 +139,64 @@ def _edt_dilate_worker(
 
     z_start, z_end, y_start, y_end, x_start, x_end = chunk_bounds
 
-    # Read input chunk
+    # Read input chunk plus a halo of ceil(distance) voxels, so that foreground in a
+    # neighbouring chunk dilates across the boundary (and into chunks empty in the input).
     input_arr = zarr.open(input_path, mode="r")[resolution]
-    chunk_data = input_arr[z_start:z_end, y_start:y_end, x_start:x_end]
+    halo = _halo(distance, input_arr.shape)
+    lo = [max(0, s - halo) for s in (z_start, y_start, x_start)]
+    hi = [min(n, e + halo) for n, e in zip(input_arr.shape, (z_end, y_end, x_end))]
+    chunk_data = input_arr[lo[0]:hi[0], lo[1]:hi[1], lo[2]:hi[2]]
+    inner = (
+        slice(z_start - lo[0], z_end - lo[0]),
+        slice(y_start - lo[1], y_end - lo[1]),
+        slice(x_start - lo[2], x_end - lo[2]),
+    )
 
     # Create binary mask of nonzero values
     mask = chunk_data != 0
 
-    # Skip if chunk is all background (empty)
-    if not mask.any():
-        return (chunk_idx, False)
-
     # Invert mask for EDT (EDT computes distance from True voxels)
     inverted = ~mask
 
-    # Compute EDT
-    if HAS_EDT:
+    # Outside the array is always background. edt's own black_border=True would make it
+    # zeros of ``inverted``, i.e. foreground, at every face of the region read. Only with
+    # black_border=False is the *volume* boundary foreground: pad one foreground slab on
+    # the faces of the region that lie on it, for both backends.
+    pad = [(0, 0)] * 3
+    if not black_border:
+        pad = [(int(a == 0), int(b == n)) for a, b, n in zip(lo, hi, input_arr.shape)]
+        inverted = np.pad(inverted, pad, constant_values=False)
+
+    # Skip if the region holds no foreground and touches no foreground border
+    if not mask.any() and not any(a or b for a, b in pad):
+        return (chunk_idx, False)
+
+    # Compute the *squared* EDT and threshold it against distance**2. Squared distances
+    # between voxel centres are integers, so both backends can represent them exactly
+    # (edt's float32 is exact below 2**24; scipy's float64 distance is squared and
+    # rounded back to that integer). Thresholding the float32 square root that edt.edt
+    # returns would instead let rounding decide boundary voxels, and the two backends
+    # would disagree, e.g. at distance=float32(sqrt(2)).
+    # edt.edtsq returns float32, exact only for squared distances below 2**24 (distances
+    # around 4096 voxels). Regions large enough to exceed that use scipy's float64 EDT.
+    _check_backend(inverted.shape)
+    if HAS_EDT and _max_sq_distance(inverted.shape) < _FLOAT32_EXACT_INT:
         # Ensure contiguity for edt package
         if not inverted.flags["C_CONTIGUOUS"]:
             inverted = np.ascontiguousarray(inverted)
         # Use single thread since we parallelize over chunks
-        distances = edt_package.edt(inverted, parallel=1, black_border=black_border)
+        distances = edt_package.edtsq(inverted, parallel=1, black_border=False)
     else:
-        distances = scipy_edt(inverted)
+        # float64: sqrt -> square -> rint recovers the integer exactly below 2**51
+        # (see _FLOAT64_RINT_EXACT_SQ; _check_backend rejects larger regions).
+        distances = _scipy_edtsq(inverted)
 
     # Threshold to create dilated mask
-    dilated = (distances <= distance).astype(np.uint8)
+    if not black_border:
+        distances = distances[tuple(slice(a, d - b) for (a, b), d in zip(pad, distances.shape))]
+    # np.float64, not a Python float: NumPy 2 would cast a Python float down to the
+    # float32 array's dtype and round e.g. float32(sqrt(3))**2 up to 3.
+    dilated = (distances[inner] <= np.float64(distance) ** 2).astype(np.uint8)
 
     # Write to output
     output_arr = zarr.open(output_path, mode="r+")[resolution]
@@ -132,7 +236,7 @@ class EdtDilateTask(ZarrTask):
             "--black-border",
             type=lambda x: x.lower() in ("true", "1", "yes"),
             default=True,
-            help="Treat volume boundary as background (default: True)",
+            help="Treat volume boundary as background (default: True); false makes the volume faces foreground",
         )
         parser.add_argument(
             "--resolution",
@@ -193,6 +297,23 @@ class EdtDilateTask(ZarrTask):
         print(f"Dilation distance: {self.config.distance} voxels")
         print(f"Processing chunk size: {self.config.chunk_size}")
         print(f"Black border: {self.config.black_border}")
+
+        halo = _halo(self.config.distance, self._shape)
+        region = [min(n, c + 2 * halo) for n, c in zip(self._shape, self.config.chunk_size)]
+        # Fail before creating any output if no backend can handle the largest region
+        # (+2 per axis for the black_border=False padding).
+        _check_backend(tuple(n + (0 if self.config.black_border else 2) for n in region))
+        # Python ints: np.prod in int64 wraps for huge regions.
+        voxels = math.prod(int(n) for n in region)
+        if voxels > _REGION_VOXEL_WARN:
+            warnings.warn(
+                f"edt-dilate: distance {self.config.distance} gives a halo of {halo} voxels; each "
+                f"worker reads a region of up to {region} = {voxels} voxels and allocates several "
+                f"arrays of that size (EDT output is 4-8 bytes/voxel). Reduce --distance, "
+                f"--chunk-size or --num-workers if memory is limited.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         # Create output zarr
         compressor = Blosc(cname="zstd", clevel=3, shuffle=Blosc.BITSHUFFLE)
