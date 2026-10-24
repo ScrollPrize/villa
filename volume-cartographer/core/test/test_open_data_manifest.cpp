@@ -1253,6 +1253,48 @@ TEST_CASE("Catalog source selection is independent of derived representations")
     CHECK(raw->volumeEntries().front().location == source.resolvedUrl);
 }
 
+TEST_CASE("Single catalog prediction attachment retains identity and validates its source level")
+{
+    OpenDataSample sample;
+    sample.id = "sample";
+    OpenDataVolume volume;
+    volume.id = "scan";
+    volume.pixelSizeUm = 2.4;
+    OpenDataArtifact source, prediction;
+    source.type = "ome-zarr";
+    source.resolvedUrl = "http://127.0.0.1:9/source.zarr";
+    prediction.type = "surface-prediction-zarr";
+    prediction.resolvedUrl = "http://127.0.0.1:9/prediction.zarr";
+    prediction.levelParameterPresent = true;
+    prediction.sourceCoordinateLevel = 2;
+    volume.artifacts = {source, prediction};
+    sample.volumes = {volume};
+    OpenDataResourceSelection selection;
+    selection.rawVolumeIds.emplace();
+    selection.representations = std::vector<OpenDataRepresentationRef>{
+        {0, 1, OpenDataRepresentationKind::Prediction}};
+    vc::project::LoadOptions options;
+    options.deferResolution = true;
+    auto pkg = VolumePkg::newDetached(options);
+    const auto result = attachOpenDataSampleVolumes(*pkg, sample, &selection);
+    REQUIRE(pkg->volumeEntries().size() == 1);
+    const auto& entry = pkg->volumeEntries().front();
+    CHECK(entry.location == prediction.resolvedUrl);
+    for (const auto* tag : {"surface-prediction", "vc-open-data-sample-id:sample",
+                           "vc-open-data-volume-id:scan"})
+        CHECK(std::find(entry.tags.begin(), entry.tags.end(), tag) != entry.tags.end());
+    CHECK(vc::project::usesAnonymousRemoteAuth(entry));
+    // The source need not be attached, but its descriptor must be checked before
+    // assigning a coordinate frame. A failed check is reported, not silently L0.
+    CHECK(result.failedVolumes == 1);
+    CHECK(std::any_of(result.messages.begin(), result.messages.end(), [](const auto& message) {
+        return message.find("against source L2:") != std::string::npos;
+    }));
+    CHECK(std::none_of(entry.tags.begin(), entry.tags.end(), [](const auto& tag) {
+        return tag.starts_with("vc-open-data-coordinate-space:");
+    }));
+}
+
 TEST_CASE("Selective catalog projects isolate cached projects and individual segments")
 {
     auto manifest = parseOpenDataManifest(kFixture);

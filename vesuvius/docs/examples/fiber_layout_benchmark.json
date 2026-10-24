@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "protocol": "frozen-gt-map-half-up-v1",
+  "reference_root": "data/frozen_gt/uv_whole",
+  "arms": {
+    "free": {
+      "solver_config": "data/free/solve_config.json",
+      "events": "data/free/gt_events.json",
+      "historical_solve": "data/free/solve",
+      "expected_report": "data/free/search_report.json"
+    },
+    "joint": {
+      "solver_config": "data/joint/solve_config.json",
+      "events": "data/prepared/gt_events.json",
+      "historical_solve": "data/joint/solve",
+      "expected_report": "data/joint/search_report.json",
+      "gt_source_ids": [101, 102],
+      "force_gt_enabled": true
+    },
+    "selectable": {
+      "solver_config": "data/selectable/solve_config.json",
+      "events": "data/prepared/gt_events.json",
+      "historical_solve": "data/selectable/solve",
+      "expected_report": "data/selectable/search_report.json",
+      "gt_source_ids": [101, 102],
+      "force_gt_enabled": false
+    }
+  }
+}

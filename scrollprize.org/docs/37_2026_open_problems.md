@@ -130,9 +130,9 @@ The explanation starts at the fiber level. Carbonized papyrus fibers contain sma
 <Figure
   variant="pair"
   srcs={["/img/ash2text/image5.jpg", "/img/ash2text/image6.jpg"]}
-  alts={["Compressed region of PHerc. Paris 4 scanned at DLS, 7.91 µm", "The same region rescanned at ESRF, 2.4 µm"]}
+  alts={["Compressed region of PHerc. Paris. 4 scanned at DLS, 7.91 µm", "The same region rescanned at ESRF, 2.4 µm"]}
   subCaptions={["DLS, 7.91 µm", "ESRF, 2.4 µm"]}
-  caption="The same compressed region of PHerc. Paris 4, imaged with two protocols. With a suboptimal protocol, layer boundaries blur into haze and adjacent sheets become hard to tell apart; with a more optimized protocol, individual windings become far easier to separate."
+  caption="The same compressed region of PHerc. Paris. 4, imaged with two protocols. With a suboptimal protocol, layer boundaries blur into haze and adjacent sheets become hard to tell apart; with a more optimized protocol, individual windings become far easier to separate."
 />
 
  The difficulty of unwrapping scrolls begins here. Blur the boundaries in the scan, and every downstream step gets harder: surface localization (finding the writing surface within the volume) turns noisier, mesh tracing turns less stable, and ink recovery may miss information it needs.
@@ -567,7 +567,7 @@ This is especially attractive for our data because the volumes are enormous and 
 
 Labels derived from DINO embeddings in the scroll domain are usually either coarse or noisy. Still, they can be used as segmentation targets to train UNet models. The convolutional layers inside the UNet will learn a finer and accurate representation, and will likely be able to perform precise segmentation. 
 
-Sometimes, before training directly an UNet, it could be worth “reinforcing” the embedding of the feature you want to label, using a minimal amount of manual input. For instance, one can use **supervised contrastive learning:** using a small set of labels (e.g, air, fiber, and an "ignore" class) to pull same-class embeddings together and push different-class ones apart. We did it on the PHerc. Paris 4 2.4 µm scan, and the fine-tuned DINO model is shared here: [dinovol\_v2\_ps8\_supcon3class\_step362500](https://huggingface.co/scrollprize/dinovol_v2_ps8_supcon3class_step362500)
+Sometimes, before training directly an UNet, it could be worth “reinforcing” the embedding of the feature you want to label, using a minimal amount of manual input. For instance, one can use **supervised contrastive learning:** using a small set of labels (e.g, air, fiber, and an "ignore" class) to pull same-class embeddings together and push different-class ones apart. We did it on the PHerc. Paris. 4 2.4 µm scan, and the fine-tuned DINO model is shared here: [dinovol\_v2\_ps8\_supcon3class\_step362500](https://huggingface.co/scrollprize/dinovol_v2_ps8_supcon3class_step362500)
 
 We used this frozen checkpoint to guide a 2-class background/fiber segmentation model.[fiber\_dinoguided\_2class\_step010000](https://huggingface.co/scrollprize/fiber_dinoguided_2class_step010000). "DINO-guided" doesn't mean what it might sound like: DINO isn't wired into this model's own architecture or forward pass. It's used externally, as a similarity signal for building the model's own training target. The training target itself is regenerated dynamically at every step. It can be blended with cosine similarity between each voxel's DINO generated embedding and a reference fiber embedding.
 
@@ -583,7 +583,7 @@ We used this frozen checkpoint to guide a 2-class background/fiber segmentation 
 Top row: the raw CT image; the input mask; the teacher's pre-mask; the teacher's sigmoid output; the teacher binarized. Bottom row: the cosine-similarity map; the same map binarized by Otsu's method (labeled "Sim bin (Otsu=0.503)" in the original figure — 0.503 is simply this step's dynamically computed threshold, not a fixed setting); the soft union of the two signals; the binarized training target; and the student's own prediction.
 
 ### Direct 3D ink segmentation
-In recent high-resolution scans of PHerc. Paris 4, ink-bearing deposits become visible enough to support direct volumetric segmentation (see [this paper](https://arxiv.org/abs/2606.29085)).
+In recent high-resolution scans of PHerc. Paris. 4, ink-bearing deposits become visible enough to support direct volumetric segmentation (see [this paper](https://arxiv.org/abs/2606.29085)).
 
 <Figure
   variant="medium"
@@ -591,23 +591,23 @@ In recent high-resolution scans of PHerc. Paris 4, ink-bearing deposits become v
   enlarge
   maxHeight={640}
   src="/img/ash2text/image24.png"
-  alt="PHerc. Paris 4: ink segmented in 3D and overlaid on the flattened surface"
-  caption="a) XY slice of PHerc. Paris 4, 2.4 µm scan. b) Ink segmented in 3D. c) Virtually unwrapped PI (no ink detection, the letter is directly visible). d): the flattened region with the recovered ink overlaid in red on the actual papyrus surface — multiple full lines of clearly legible Greek letters running the width of the sheet, not an isolated word or two."
+  alt="PHerc. Paris. 4: ink segmented in 3D and overlaid on the flattened surface"
+  caption="a) XY slice of PHerc. Paris. 4, 2.4 µm scan. b) Ink segmented in 3D. c) Virtually unwrapped PI (no ink detection, the letter is directly visible). d): the flattened region with the recovered ink overlaid in red on the actual papyrus surface — multiple full lines of clearly legible Greek letters running the width of the sheet, not an isolated word or two."
 />
 
-Not every scroll will behave like PHerc. Paris 4 — but direct 3D ink segmentation is possible under favorable scan and preservation conditions, and it gives us a cleaner target for future models.
+Not every scroll will behave like PHerc. Paris. 4 — but direct 3D ink segmentation is possible under favorable scan and preservation conditions, and it gives us a cleaner target for future models.
 
-The checkpoint behind panel (d) in the previous image, [ink\_3d\_dino\_guided](https://huggingface.co/scrollprize/ink_3d_dino_guided)  is trained specifically for PHerc. Paris 4 and is released on Hugging Face.
+The checkpoint behind panel (d) in the previous image, [ink\_3d\_dino\_guided](https://huggingface.co/scrollprize/ink_3d_dino_guided)  is trained specifically for PHerc. Paris. 4 and is released on Hugging Face.
 
 Careful\! The 3D UNet segmentation model for ink segmentation was not only DINO guided, but it also used **self-distillation** from another 3D ink detection model (not discussed here) to clean up the DINO embedding during UNet training.
 
 <Admonition type="tip" icon="🙋" title="How you can help">
 
-If you work in 3D deep learning — segmentation, self-supervised learning, U-Nets — this is a natural fit. When ink is visible or can be localized confidently, as in PHerc. Paris 4 above, the cleanest formulation is voxel-level ink segmentation: it could reduce the ambiguity that 2D-projected labels otherwise introduce, giving the model a direct target instead of an indirect one.
+If you work in 3D deep learning — segmentation, self-supervised learning, U-Nets — this is a natural fit. When ink is visible or can be localized confidently, as in PHerc. Paris. 4 above, the cleanest formulation is voxel-level ink segmentation: it could reduce the ambiguity that 2D-projected labels otherwise introduce, giving the model a direct target instead of an indirect one.
 
 </Admonition>
 ### Self-distillation without ground truth
-Not every fiber- and ink-modeling effort in this pipeline starts from labels at all. A trainer at [scripts/fiber\_5class/](https://github.com/ScrollPrize/villa/tree/main/scripts/fiber_5class), specifically its [label\_generator.py](https://github.com/ScrollPrize/villa/blob/main/scripts/fiber_5class/label_generator.py), trains a 3D U-Net for 4-class semantic segmentation — background, vertical fiber, horizontal/angular fiber, and ink — directly on raw CT, with no ground-truth labels of any kind (in PHerc. Paris 4).
+Not every fiber- and ink-modeling effort in this pipeline starts from labels at all. A trainer at [scripts/fiber\_5class/](https://github.com/ScrollPrize/villa/tree/main/scripts/fiber_5class), specifically its [label\_generator.py](https://github.com/ScrollPrize/villa/blob/main/scripts/fiber_5class/label_generator.py), trains a 3D U-Net for 4-class semantic segmentation — background, vertical fiber, horizontal/angular fiber, and ink — directly on raw CT, with no ground-truth labels of any kind (in PHerc. Paris. 4).
 
 Instead, two already-trained **teacher** networks generate the labels themselves. A teacher, here, is simply an ordinary, already-trained 3D U-Net — one estimating fiber probability, one estimating ink probability — kept completely **frozen** (its weights are never updated during this training run). Both teachers generate a fresh pseudo-label for every training crop, live, entirely on the GPU, and a **student** network is trained to reproduce it. Training a network this way — to reproduce another model's output rather than a hand-made label — is called **self-distillation**.
 

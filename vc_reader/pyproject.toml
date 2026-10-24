@@ -1,0 +1,45 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.10.2"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "vc-reader"
+version = "0.1.0"
+description = "Find and locate Vesuvius Challenge open data from its published metadata.json"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+]
+# The catalog layer is stdlib-only. The reader is the compiled extension built
+# from src/cpp/ (see CMakeLists.txt) plus numpy.
+dependencies = []
+
+[project.optional-dependencies]
+reader = ["numpy>=1.24"]
+labels = ["numpy>=1.24", "Pillow>=10.1", "tifffile"]
+transforms = ["numpy>=1.24"]
+torch = ["numpy>=1.24", "torch>=2.0"]
+previews = ["numpy>=1.24", "Pillow>=10.1"]
+bench = ["numpy>=1.24", "tensorstore>=0.1.60", "zarr>=3", "scipy>=1.11", "tifffile", "s3fs", "aiohttp"]
+all = [
+    "numpy>=1.24", "Pillow>=10.1", "tifffile", "torch>=2.0",
+    "tensorstore>=0.1.60", "zarr>=3", "scipy>=1.11", "s3fs", "aiohttp",
+]
+
+[project.scripts]
+vc-reader = "vc_reader.cli:main"
+
+[tool.scikit-build]
+# The C++ read path (src/cpp/, module vc_reader._reader); see CMakeLists.txt for system deps.
+minimum-version = "build-system.requires"
+wheel.packages = ["src/vc_reader"]
+cmake.build-type = "Release"
+build-dir = "build/{wheel_tag}"
+# Keep local development artifacts out of source releases if regenerated.
+sdist.exclude = ["benchmarks/results/**", "tests/**", "elastic_comparison/**"]

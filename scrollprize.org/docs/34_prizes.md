@@ -30,11 +30,11 @@ prizes:
     href: "/prizes#first-letters-prizes"
     hook: "$50,000 per scroll across the eligible unread scroll volumes: uncover 10 letters within a single 4 cm² area."
   - id: first-title
-    title: "PHerc. Paris 4's Title"
+    title: "PHerc. Paris. 4's Title"
     amount: 50000
     cadence: "Deadline June 25th, 2027"
     href: "/prizes#first-title-prize"
-    hook: "Discover the title of PHerc. Paris 4 (Scroll 1) — any scan, including the 2.4 µm volumes."
+    hook: "Discover the title of PHerc. Paris. 4 (Scroll 1) — any scan, including the 2.4 µm volumes."
   - id: progress-prizes
     title: "Progress Prizes"
     amount: 590000
@@ -257,7 +257,7 @@ A few things worth knowing:
 
 </details>
 
-## PHerc. Paris 4’s Title Prize {#first-title-prize}
+## PHerc. Paris. 4’s Title Prize {#first-title-prize}
 
 <div className="vc-prize-meta">
 <div className="vc-deadline">Deadline: June 25th, 2027 (11:59pm Pacific)</div>
@@ -270,7 +270,7 @@ A few things worth knowing:
 
 Discovering a scroll’s title tells scholars what — and whom — they have been reading, and helps contextualize the entire work. We have already recovered the titles of [PHerc. 172](/data_browser/PHerc0172) and [PHerc. 139](/data_browser/PHerc0139) — but the title of Scroll 1, the scroll where the first passages were read, is still missing.
 
-**PHerc. Paris 4’s Title: <span className="vc-money">\$50,000</span> to the first team to discover the title of [PHerc. Paris 4](/data_browser/PHercParis4) (Scroll 1), using any of its scans — including the 2.4 µm volumes.** Scroll 1 is one of our most-read scrolls: substantial continuous Greek text of an Epicurean prose work has been recovered, yet its author and title remain unknown. The expected title region has shown no detectable ink so far — possibly a different ink, and the top rows are physically missing — so finding it may take better methods, higher resolution, or looking somewhere new.
+**PHerc. Paris. 4’s Title: <span className="vc-money">\$50,000</span> to the first team to discover the title of [PHerc. Paris. 4](/data_browser/PHercParis4) (Scroll 1), using any of its scans — including the 2.4 µm volumes.** Scroll 1 is one of our most-read scrolls: substantial continuous Greek text of an Epicurean prose work has been recovered, yet its author and title remain unknown. The expected title region has shown no detectable ink so far — possibly a different ink, and the top rows are physically missing — so finding it may take better methods, higher resolution, or looking somewhere new.
 
 <div className="mb-4">
   <img src="/img/data/title_example.webp" className="w-[50%]"/>
