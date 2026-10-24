@@ -11,6 +11,7 @@
  */
 
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/StoreSurfaces.hpp"
 #include "vc/flattening/ABFFlattening.hpp"
 
 #include <boost/program_options.hpp>
@@ -25,7 +26,11 @@ int main(int argc, char* argv[]) {
     desc.add_options()
         ("help,h", "Show this help message")
         ("input,i", po::value<std::string>()->required(),
-            "Input TIFXYZ directory")
+            "Input TIFXYZ directory, or a surface UUID with --store")
+        ("store", po::value<std::string>(),
+            "Object store: the input is a stored surface; the flattened surface is stored as a new "
+            "object (prints surface_uuid:), or --uv-only adds the uv channel to the input")
+        ("tag", po::value<std::vector<std::string>>()->composing(), "Tag for the stored output (repeatable)")
         ("output,o", po::value<std::string>(),
             "Output TIFXYZ directory (default: <input>_flat)")
         ("iterations", po::value<int>()->default_value(10),
@@ -69,8 +74,20 @@ int main(int argc, char* argv[]) {
 
     fs::path inputPath = vm["input"].as<std::string>();
     fs::path outputPath;
+    std::optional<StoreSurfaces> store;
+    if (vm.count("store")) {
+        if (vm.count("output")) {
+            std::cerr << "--output names a tifxyz directory; stored outputs are new objects" << std::endl;
+            return 1;
+        }
+        store.emplace(vm["store"].as<std::string>(), "vc_flatten");
+    } else if (vm.count("tag")) {
+        std::cerr << "--tag needs --store" << std::endl;
+        return 1;
+    }
 
-    if (vm.count("output")) {
+    if (store) {
+    } else if (vm.count("output")) {
         outputPath = vm["output"].as<std::string>();
     } else {
         outputPath = inputPath.parent_path() / (inputPath.filename().string() + "_flat");
@@ -87,7 +104,7 @@ int main(int argc, char* argv[]) {
 
     // Load surface
     std::cout << "Loading surface: " << inputPath << std::endl;
-    auto surf = load_quad_from_tifxyz(inputPath.string());
+    auto surf = store ? store->load(inputPath.string()) : load_quad_from_tifxyz(inputPath.string());
     if (!surf) {
         std::cerr << "Failed to load surface: " << inputPath << std::endl;
         return 1;
@@ -114,9 +131,15 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        // Save the original surface with UV channel
-        std::cout << "Saving surface with UV channel to: " << outputPath << std::endl;
-        surf->saveEdited(inputPath, outputPath, true);
+        if (store) {
+            std::cout << "Storing the uv channel of " << surf->id << std::endl;
+            std::cout << "geometry_revision: " << store->updateChannels(surf->id, *surf, {"uv"}) << std::endl;
+            store->finish();
+        } else {
+            // Save the original surface with UV channel
+            std::cout << "Saving surface with UV channel to: " << outputPath << std::endl;
+            surf->saveEdited(inputPath, outputPath, true);
+        }
     } else {
         // Create a new surface with rearranged positions
         std::cout << "\nFlattening mesh..." << std::endl;
@@ -132,9 +155,19 @@ int main(int argc, char* argv[]) {
         std::cout << "  Valid points: " << flatSurf->countValidPoints() << std::endl;
         std::cout << "  Valid quads: " << flatSurf->countValidQuads() << std::endl;
 
-        // Save the flattened surface
-        std::cout << "\nSaving flattened surface to: " << outputPath << std::endl;
-        flatSurf->saveAsNew(outputPath, true);
+        if (store) {
+            const std::string name = (surf->meta.contains("name") ? surf->meta["name"].get_string() : surf->id) + "_flat";
+            const nlohmann::json parameters = {{"iterations", config.maxIterations}, {"downsample", config.downsampleFactor},
+                                               {"abf", config.useABF}, {"scale_to_original_area", config.scaleToOriginalArea}};
+            const auto uuid = store->create(*flatSurf, name, parameters, {surf->id},
+                                            vm.count("tag") ? vm["tag"].as<std::vector<std::string>>() : std::vector<std::string>{});
+            store->finish();
+            std::cout << "surface_uuid: " << uuid << std::endl;
+        } else {
+            // Save the flattened surface
+            std::cout << "\nSaving flattened surface to: " << outputPath << std::endl;
+            flatSurf->saveAsNew(outputPath, true);
+        }
 
         delete flatSurf;
     }

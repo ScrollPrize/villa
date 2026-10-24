@@ -81,6 +81,19 @@ std::string StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
     return revision;
 }
 
+std::string StoreSurfaces::updateChannels(const std::string& uuid, QuadSurface& surface, const std::vector<std::string>& names)
+{
+    const auto found = loaded_.find(vc::objects::util::canonicalUuid(uuid));
+    if (found == loaded_.end()) throw std::runtime_error("update a surface this tool loaded: " + uuid);
+    const auto& [objectRevision, geometryRevision] = found->second;
+    std::string revision;
+    session_->editKeepingRelationships(attachment_, {{found->first, objectRevision}}, [&](auto& db, auto& txn, const auto&) {
+        revision = write_quad_channels_to_store(db, txn, found->first, surface, names, {}, geometryRevision);
+    });
+    lastWrite_ = std::chrono::system_clock::now();
+    return revision;
+}
+
 std::filesystem::path StoreSurfaces::artifactDirectory(const std::string& uuid)
 {
     return session_->artifactDirectory(attachment_, uuid);
