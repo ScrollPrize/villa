@@ -143,6 +143,9 @@ class SurfaceIoTests(unittest.TestCase):
             tifffile.imwrite(path / "mask.tif", mask)
 
             surface = load_surface(path)
+            # valid and scale_yx below are owned, so release the mapped x/y/z
+            # grids before the TemporaryDirectory is torn down (Windows).
+            surface.close()
 
         self.assertEqual(surface.scale_yx, (0.25, 0.5))
         expected = np.ones((2, 3), dtype=bool)
