@@ -624,6 +624,12 @@ std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore
 // Reads channels of an immutable geometry revision through a session on demand.
 std::function<cv::Mat(const std::string&)> store_channel_loader(
     std::shared_ptr<vc::objects::ObjectStoreSession>, vc::objects::AttachmentIdentity, std::string geometryRevision);
+// Create surface object `uuid` holding `surface` (the caller's transaction
+// expects it absent). Its meta keeps the surface's meta except identity,
+// geometry and file-layout keys and status tags (`tags` are the record's), with
+// `meta` (e.g. coordinates, provenance) on top.
+void create_quad_in_store(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& uuid, QuadSurface&,
+    const std::string& name, const std::vector<std::string>& tags, const std::string& metaJson);
 // Geometry for putGeometry: points, `valid` from the "mask" channel (reduced to the
 // grid: a vertex is valid only if every mask pixel it covers is 255) and the other channels.
 vc::objects::GeometryData quad_surface_geometry(QuadSurface&);

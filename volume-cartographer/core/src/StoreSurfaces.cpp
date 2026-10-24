@@ -40,12 +40,7 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
                                   const std::vector<std::string>& sources, const std::vector<std::string>& tags,
                                   const std::optional<nlohmann::json>& coordinates)
 {
-    auto meta = nlohmann::json::parse(surface.meta.dump());
-    if (!meta.is_object()) meta = nlohmann::json::object();
-    // Identity, geometry and file layout belong to the object and its geometry.
-    // Status tags belong to the record and are not inherited from a source.
-    for (const auto* key : {"uuid", "name", "format", "type", "bbox", "scale", "tiff_dimensions", "coordinates", "provenance", "tags"})
-        meta.erase(key);
+    auto meta = nlohmann::json::object();
     if (coordinates) meta["coordinates"] = *coordinates;
     else if (!sources.empty())
         session_->read(attachment_, [&](const auto& db, const auto& txn, const auto&) {
@@ -55,20 +50,13 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
             if (sourceMeta.contains("coordinates")) meta["coordinates"] = sourceMeta.at("coordinates");
         });
     meta["provenance"] = {{"tool", tool_}, {"parameters", parameters}, {"sources", sources}};
-    vc::objects::ObjectRecord record;
-    record.uuid = vc::objects::util::newUuid();
-    record.kind = "surface";
-    record.name = name;
-    record.tags = tags;
-    record.meta = meta.dump();
-    const auto geometry = quad_surface_geometry(surface);
-    session_->act(attachment_, {{record.uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-        db.upsertObject(txn, record);
-        db.putGeometry(txn, record.uuid, geometry);
+    const auto uuid = vc::objects::util::newUuid();
+    session_->act(attachment_, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
+        create_quad_in_store(db, txn, uuid, surface, name, tags, meta.dump());
     });
     lastWrite_ = std::chrono::system_clock::now();
-    surface.id = record.uuid;
-    return record.uuid;
+    surface.id = uuid;
+    return uuid;
 }
 
 std::string StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)

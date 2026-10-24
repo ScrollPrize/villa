@@ -158,6 +158,26 @@ std::function<cv::Mat(const std::string&)> store_channel_loader(
     };
 }
 
+void create_quad_in_store(vc::objects::ObjectStore& db, vc::objects::WriteTxn& txn, const std::string& uuid, QuadSurface& surface,
+    const std::string& name, const std::vector<std::string>& tags, const std::string& metaJson)
+{
+    auto meta = nlohmann::json::parse(surface.meta.dump());
+    if (!meta.is_object()) meta = nlohmann::json::object();
+    // Identity, geometry and file layout belong to the object and its geometry.
+    // Status tags belong to the record and are not inherited from a source.
+    for (const auto* key : {"uuid", "name", "format", "type", "bbox", "scale", "tiff_dimensions", "coordinates", "provenance", "tags"})
+        meta.erase(key);
+    meta.update(nlohmann::json::parse(metaJson));
+    vc::objects::ObjectRecord record;
+    record.uuid = uuid;
+    record.kind = "surface";
+    record.name = name;
+    record.tags = tags;
+    record.meta = meta.dump();
+    db.upsertObject(txn, record);
+    db.putGeometry(txn, uuid, quad_surface_geometry(surface));
+}
+
 vc::objects::GeometryData quad_surface_geometry(QuadSurface& surface)
 {
     auto* points = surface.rawPointsPtr();
