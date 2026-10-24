@@ -1,6 +1,7 @@
 #include "vc/core/util/VolpkgConvert.hpp"
 
 #include "utils/Json.hpp"
+#include "utils/sftp_fetch.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <fstream>
@@ -14,7 +15,7 @@ namespace {
 
 bool isRemoteScheme(const std::string& s)
 {
-    return s.rfind("s3://", 0) == 0
+    return utils::is_sftp_url(s) || s.rfind("s3://", 0) == 0
         || s.rfind("s3+", 0) == 0
         || s.rfind("http://", 0) == 0
         || s.rfind("https://", 0) == 0;

@@ -1,8 +1,13 @@
 #include "FiberMapWorkspace.hpp"
 
+#include "FiberLengthDisplay.hpp"
 #include "FiberMapRuler.hpp"
 #include "FiberMapRulerMath.hpp"
+#include "FiberSliceGeometry.hpp"
 #include "LineAnnotationController.hpp"
+#include "FiberMapAutoLink.hpp"
+#include "LineAnnotationFiberLinks.hpp"
+#include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationGeneratedViews.hpp"
 
 #include "vc/core/util/Logging.hpp"
@@ -20,7 +25,10 @@
 #include <QGraphicsItem>
 #include <QGraphicsLineItem>
 #include <QGraphicsPathItem>
+#include "FiberMapFocusBounds.hpp"
 #include <QGraphicsPixmapItem>
+#include <QGraphicsPolygonItem>
+#include <QPolygonF>
 #include <QGraphicsRectItem>
 #include <QGraphicsScene>
 #include <QGraphicsSimpleTextItem>
@@ -155,19 +163,31 @@ const QColor kSuspect(QStringLiteral("#ff6b6b"));
 
 // Link markers use the line annotation's branch-link palette verbatim, so a
 // crossing reads the same here as it does in the slice and generated views:
-// H/V links are violet, same-type (H-H, V-V) links orange, and both go pale
-// blue / pale orange while they await review. These four rows mirror
-// apps/VC3D/overlays/FiberOverlayController.cpp and
-// apps/VC3D/LineAnnotationGeneratedViews.cpp and must stay in sync with them.
+// H/V links are violet, same-type (H-H, V-V) links orange, both go pale
+// blue / pale orange while they await review, and an unreviewed automatic
+// link is cyan / pink. Every row is built from the one shared table
+// (line_annotation::linkStateRgb), as the slice overlay and the generated
+// views build theirs.
 struct LinkPalette {
     QColor pen;
     QColor brush;
 };
-const LinkPalette kLinkCross{QColor(210, 95, 255, 245), QColor(210, 95, 255, 175)};
-const LinkPalette kLinkCrossPending{QColor(80, 150, 255, 245), QColor(80, 150, 255, 175)};
-const LinkPalette kLinkSameType{QColor(255, 140, 0, 245), QColor(255, 140, 0, 175)};
-const LinkPalette kLinkSameTypePending{QColor(255, 190, 120, 245),
-                                       QColor(255, 190, 120, 175)};
+// Built from the one shared table (line_annotation::linkStateRgb): pen at
+// 245, brush at 175, as the annotation views draw them.
+LinkPalette linkPaletteFromTable(bool pending, bool sameType, bool automatic)
+{
+    const vc3d::line_annotation::LinkStateRgb rgb =
+        vc3d::line_annotation::linkStateRgb(pending, sameType, automatic);
+    return LinkPalette{QColor(rgb.r, rgb.g, rgb.b, 245), QColor(rgb.r, rgb.g, rgb.b, 175)};
+}
+const LinkPalette kLinkCross = linkPaletteFromTable(false, false, false);
+const LinkPalette kLinkCrossPending = linkPaletteFromTable(true, false, false);
+const LinkPalette kLinkSameType = linkPaletteFromTable(false, true, false);
+const LinkPalette kLinkSameTypePending = linkPaletteFromTable(true, true, false);
+// Unreviewed automatic pending links: bright cyan, light pink same-type (the
+// cyan is well away from the theme's teal H fibers).
+const LinkPalette kLinkCrossAuto = linkPaletteFromTable(true, false, true);
+const LinkPalette kLinkSameTypeAuto = linkPaletteFromTable(true, true, true);
 
 // The map draws a link as a dot on each of its two control points, which
 // overlap when zoomed out; the fill is thinned so the two stacked compound
@@ -183,6 +203,15 @@ QColor kollesisColor(int alpha)
     return vc3d::line_annotation::generatedKollesisTerminationColor(alpha);
 }
 constexpr qreal kKollesisRimWidthPx = 2.0;
+
+// A kollesis seam the statistics predict rather than a tag places: an amber
+// one warm step from the tagged seams' yellow, clear of the gap heat map's
+// blue-to-violet ramp, the fibers' cyan and green and the link violet. The
+// same value serves both themes.
+QColor kollesisPredictionColor(int alpha)
+{
+    return QColor(255, 170, 0, alpha);
+}
 
 // A control point tagged break is marked the same way in the break amber,
 // with a dotted rim; the span between two consecutive break points (a gap
@@ -226,6 +255,10 @@ constexpr int kNetworkGlowAlpha = 70;
 constexpr qreal kPanelZ = -3.0;
 // The gap heat map: over the ground, under the winding grid and every fiber.
 constexpr qreal kGapZ = -2.5;
+// The kollesis overlap bands and their bound/mid lines: over the heat map,
+// under the winding grid (0) and everything drawn on it.
+constexpr qreal kKollesisBandZ = -2.0;
+constexpr qreal kKollesisLineZ = -1.5;
 // Columns per heat-map pixmap tile: well under any platform pixmap limit.
 constexpr int kGapTileCols = 4096;
 // Gap heat map defaults and ranges, in centimetres (the spinboxes' unit).
@@ -456,6 +489,31 @@ std::vector<QImage> colourGapTiles(const vc3d::fiber_map::gaps::GapField& field,
 // The three run styles are mutually exclusive: a gap run is neither traced
 // nor interpolated for drawing purposes.
 enum class RunKind { Traced, Interpolated, Gap, Damaged };
+
+class FocusPathItem : public QGraphicsPathItem
+{
+public:
+    using QGraphicsPathItem::QGraphicsPathItem;
+    void setFocusPaths(std::optional<vc3d::fiber_map::FocusPaths> paths)
+    {
+        _paths = std::move(paths);
+        update();
+    }
+    void paint(QPainter* painter, const QStyleOptionGraphicsItem* option, QWidget* widget) override
+    {
+        if (!_paths) {
+            QGraphicsPathItem::paint(painter, option, widget);
+            return;
+        }
+        auto dimPen = pen();
+        const auto color = dimPen.color();
+        dimPen.setColor(QColor(color.red() / 2, color.green() / 2, color.blue() / 2, color.alpha()));
+        painter->strokePath(_paths->outside, dimPen);
+        painter->strokePath(_paths->inside, pen());
+    }
+private:
+    std::optional<vc3d::fiber_map::FocusPaths> _paths;
+};
 
 RunKind runKind(const vc3d::fiber_map::Run& run)
 {
@@ -731,6 +789,10 @@ FiberMapView::FiberMapView(QWidget* parent)
         this, FiberMapRuler::Edge::Left, FiberMapRuler::Mode::Height));
     _rulers.push_back(std::make_unique<FiberMapRuler>(
         this, FiberMapRuler::Edge::Bottom, FiberMapRuler::Mode::SheetDistance));
+    // The kollesis band stacks outside the winding band on the ceiling; it
+    // takes no room while the model has no seams.
+    _rulers.push_back(std::make_unique<FiberMapRuler>(
+        this, FiberMapRuler::Edge::Top, FiberMapRuler::Mode::Kollesis, /*stackLevel=*/1));
     for (const auto& ruler : _rulers) {
         ruler->setFont(font());
     }
@@ -742,6 +804,22 @@ void FiberMapView::setRulerModel(const FiberMapRulerModel& model)
 {
     for (const auto& ruler : _rulers) {
         ruler->setModel(model);
+    }
+    // Once the ceiling scrolls off, the top stack clamps to the viewport
+    // edge: the winding band keeps room beyond it for the kollesis band
+    // exactly while that has seams to show.
+    int outerTopBands = 0;
+    for (const auto& ruler : _rulers) {
+        if (ruler->edge() == FiberMapRuler::Edge::Top &&
+            ruler->mode() == FiberMapRuler::Mode::Kollesis && ruler->hasContent()) {
+            ++outerTopBands;
+        }
+    }
+    for (const auto& ruler : _rulers) {
+        if (ruler->edge() == FiberMapRuler::Edge::Top &&
+            ruler->mode() == FiberMapRuler::Mode::Windings) {
+            ruler->setStackDepth(outerTopBands);
+        }
     }
     viewport()->update();
 }
@@ -776,7 +854,10 @@ bool FiberMapView::viewportEvent(QEvent* event)
     if (event && event->type() == QEvent::ToolTip) {
         auto* help = static_cast<QHelpEvent*>(event);
         const QRect area = viewport()->rect();
-        for (const auto& ruler : _rulers) {
+        // Where bands overlap at a viewport corner the last painted one is
+        // on top, so the hit test runs in reverse paint order.
+        for (auto it = _rulers.rbegin(); it != _rulers.rend(); ++it) {
+            const auto& ruler = *it;
             const QRect band = ruler->bandRect(area);
             if (band.contains(help->pos())) {
                 QToolTip::showText(help->globalPos(), ruler->toolTipText(), viewport(), band);
@@ -856,7 +937,7 @@ void FiberMapView::mouseReleaseEvent(QMouseEvent* event)
     _pressed = false;
     QGraphicsView::mouseReleaseEvent(event);
     if (wasPressed) {
-        emit clicked(mapToScene(event->pos()));
+        emit clicked(mapToScene(event->pos()), event->modifiers());
     }
 }
 
@@ -931,22 +1012,66 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
            "(0: only fibers on the same winding count)."));
     toolBar->addWidget(_gapFadeWindingsSpin);
     toolBar->addSeparator();
+
+    // The kollesis seams, read from the kollesis termination tags.
+    _kollesisCheck = new QCheckBox(tr("Kollesis"), toolBar);
+    _kollesisCheck->setObjectName(QStringLiteral("fiberMapKollesisCheck"));
+    _kollesisCheck->setChecked(true);
+    _kollesisCheck->setToolTip(
+        tr("Mark the kollesis seams: H fibers tagged kollesis termination at\n"
+           "their left end bound a sheet's start, at their right end its end.\n"
+           "Terminations within the gap below group into one seam; each side's\n"
+           "bound is the vertical through its mean position, the band between\n"
+           "them is the overlap and the seam sits centred in it. The band above\n"
+           "the winding ruler ticks every seam and lengths the sheet between\n"
+           "them. Gaps that measure several sheets get predicted seams in amber,\n"
+           "as do the sheets extrapolated past the last tagged seam."));
+    toolBar->addWidget(_kollesisCheck);
+    _kollesisGapSpin = new QDoubleSpinBox(toolBar);
+    _kollesisGapSpin->setObjectName(QStringLiteral("fiberMapKollesisGapSpin"));
+    _kollesisGapSpin->setRange(0.05, 5.0);
+    _kollesisGapSpin->setDecimals(2);
+    _kollesisGapSpin->setSingleStep(0.05);
+    _kollesisGapSpin->setValue(0.75);
+    _kollesisGapSpin->setSuffix(tr(" windings"));
+    _kollesisGapSpin->setToolTip(
+        tr("Terminations farther apart than this along the map start a new\n"
+           "kollesis seam."));
+    toolBar->addWidget(_kollesisGapSpin);
+    _kollesisAheadSpin = new QSpinBox(toolBar);
+    _kollesisAheadSpin->setObjectName(QStringLiteral("fiberMapKollesisAheadSpin"));
+    _kollesisAheadSpin->setRange(0, 50);
+    _kollesisAheadSpin->setValue(3);
+    _kollesisAheadSpin->setSuffix(tr(" ahead"));
+    _kollesisAheadSpin->setToolTip(
+        tr("How many kollesis seams to predict past the last tagged one, one\n"
+           "estimated sheet length apart (0: none). The estimate is the mean\n"
+           "sheet length over the tagged seams' gaps; the amber band around each\n"
+           "prediction is its spread, growing with the sheets stepped."));
+    toolBar->addWidget(_kollesisAheadSpin);
+    toolBar->addSeparator();
     _statusLabel =
         new QLabel(tr("press Update"), toolBar);
     toolBar->addWidget(_statusLabel);
 
     _tree = new QTreeWidget(this);
-    _tree->setColumnCount(5);
-    _tree->setHeaderLabels(
-        {tr("Fiber"), tr("H/V"), tr("Winding"), tr("Anchor"), tr("Annotation")});
+    _tree->setColumnCount(kTreeColumnCount);
+    _tree->setHeaderLabels(treeHeaderLabels());
     _tree->setUniformRowHeights(true);
     _tree->setSelectionMode(QAbstractItemView::SingleSelection);
     // Everything but the annotation name takes only what it needs; the
     // annotation name gets the rest of the dock.
-    for (int column = 0; column < 4; ++column) {
+    for (int column = 0; column < kTreeAnnotationColumn; ++column) {
         _tree->header()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
     }
     _tree->header()->setStretchLastSection(true);
+    _totalLengthLabel = new QLabel(this);
+    _totalLengthLabel->setObjectName(QStringLiteral("fiberMapTotalLengthLabel"));
+    _totalLengthLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _totalLengthLabel->setToolTip(
+        tr("Sum of the line lengths of every fiber the map was built from,\n"
+           "placed or not. Centimetres when the annotation frame's voxel size\n"
+           "is known, otherwise voxels."));
     _searchEdit = new QLineEdit(this);
     _searchEdit->setObjectName(QStringLiteral("fiberMapSearch"));
     _searchEdit->setPlaceholderText(tr("Search fibers by label or name"));
@@ -958,8 +1083,10 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
     auto* dockLayout = new QVBoxLayout(dockBody);
     dockLayout->setContentsMargins(0, 0, 0, 0);
     dockLayout->setSpacing(2);
+    dockLayout->addWidget(_totalLengthLabel);
     dockLayout->addWidget(_searchEdit);
     dockLayout->addWidget(_tree, 1);
+    updateTotalLengthLabel();
     _fiberDock = new QDockWidget(tr("Fibers"), this);
     _fiberDock->setObjectName(QStringLiteral("fiberMapFiberDock"));
     _fiberDock->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
@@ -990,6 +1117,12 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
             [this](bool) { handleGapParamsChanged(); });
     connect(_gapFadeWindingsSpin, &QSpinBox::valueChanged, this,
             [this](int) { handleGapParamsChanged(); });
+    connect(_kollesisCheck, &QCheckBox::toggled, this,
+            [this](bool) { rebuildKollesisOverlay(); });
+    connect(_kollesisGapSpin, &QDoubleSpinBox::valueChanged, this,
+            [this](double) { rebuildKollesisOverlay(); });
+    connect(_kollesisAheadSpin, &QSpinBox::valueChanged, this,
+            [this](int) { rebuildKollesisOverlay(); });
     updateGapLegend();
     // Shift held at the click asks for the from-scratch rebuild (the
     // memoization check's other half); the plain click is the memoized Update.
@@ -1020,6 +1153,9 @@ FiberMapWorkspace::FiberMapWorkspace(LineAnnotationController* controller,
                 if (fiberId == 0 && !errorExtent.isValid()) {
                     return;
                 }
+                // Choosing a row is moving on from a waiting Link (before the
+                // stale gate below, which returns on the map it waits for).
+                cancelAutoLinkResume();
                 // The same gate the scene click and the control-point menu use;
                 // acting on a map whose dependencies moved is showing a wrong
                 // picture, not a late one. Evaluated here and applied on the next
@@ -1154,12 +1290,250 @@ double FiberMapWorkspace::sceneVxPerCm() const
 
 QString FiberMapWorkspace::formatMapLength(double valueVx) const
 {
-    if (_voxelSizeUm) {
-        return tr("%1 cm").arg(valueVx * *_voxelSizeUm / kUmPerCm, 0, 'f', 2);
-    }
     // The layout works in voxels, so the voxel count is exactly what it computed;
-    // only the trip to centimetres needs a voxel size, and there is none.
-    return tr("%1 vx").arg(std::llround(valueVx));
+    // only the trip to centimetres needs a voxel size. Whole voxels here: these
+    // are map distances (gap saturation, ruler spans), not fiber lengths.
+    return vc3d::fiber_length::formatLength(valueVx, _voxelSizeUm, /*vxDecimals=*/0);
+}
+
+void FiberMapWorkspace::updateTotalLengthLabel()
+{
+    if (!_totalLengthLabel) {
+        return;
+    }
+    if (!_layoutBuilt) {
+        _totalLengthLabel->setText(tr("Total fiber length: -"));
+        return;
+    }
+    double totalVx = 0.0;
+    for (const auto& [id, lengthVx] : _fiberLengthVx) {
+        if (std::isfinite(lengthVx)) {
+            totalVx += lengthVx;
+        }
+    }
+    _totalLengthLabel->setText(
+        tr("Total fiber length: %1  (%2 fibers)")
+            .arg(vc3d::fiber_length::formatLength(totalVx, _voxelSizeUm))
+            .arg(_fiberLengthVx.size()));
+}
+
+vc3d::fiber_map::kollesis::Model FiberMapWorkspace::buildKollesisModel() const
+{
+    using vc3d::fiber_map::kollesis::Termination;
+    std::vector<Termination> terminations;
+    for (const vc3d::fiber_map::GlobalPlacedFiber& placed : _layout.fibers) {
+        const vc3d::fiber_map::PlacedFiber& fiber = placed.fiber;
+        // Only H fibers run along the sheet; a V fiber's two ends sit at
+        // nearly one x and say nothing about which side of a seam they are.
+        if (fiber.hvTag != 'H' || fiber.controlPoints.size() < 2) {
+            continue;
+        }
+        const std::size_t last = fiber.controlPoints.size() - 1;
+        const double xFirst = fiber.controlPoints.front().x();
+        const double xLast = fiber.controlPoints.back().x();
+        for (const std::size_t index : {std::size_t{0}, last}) {
+            if (index >= fiber.kollesisTerminations.size() ||
+                !fiber.kollesisTerminations[index]) {
+                continue;
+            }
+            // Placed control points are (map x, +z).
+            const QPointF& point = fiber.controlPoints[index];
+            Termination termination;
+            termination.fiberId = fiber.id;
+            termination.controlIndex = static_cast<int>(index);
+            termination.xMapVx = point.x();
+            termination.xSceneVx = sceneXOf(point.x());
+            termination.zVx = point.y();
+            // The end at the smaller x is where the sheet starts.
+            termination.left = index == 0 ? xFirst <= xLast : xLast < xFirst;
+            terminations.push_back(termination);
+        }
+    }
+    vc3d::fiber_map::kollesis::Params params;
+    params.gapWindings = _kollesisGapSpin ? _kollesisGapSpin->value() : 0.75;
+    params.windingWidthVx = 2.0 * M_PI * _layout.rRefVx;
+    params.predictInterior = true;
+    params.extrapolateCount = _kollesisAheadSpin ? _kollesisAheadSpin->value() : 0;
+    return vc3d::fiber_map::kollesis::buildModel(std::move(terminations), params);
+}
+
+void FiberMapWorkspace::rebuildKollesisOverlay()
+{
+    for (QGraphicsItem* item : _kollesisItems) {
+        _scene->removeItem(item);
+        delete item;
+    }
+    _kollesisItems.clear();
+    _rulerModel.kollesis.clear();
+    _kollesisModel = {};
+    const bool haveLayout = _layoutBuilt && !_layout.fibers.empty();
+    if (haveLayout) {
+        // The seams may reach past the layout (extrapolated predictions
+        // above all); the rulers' run, the scene rect and the fit follow
+        // them. Start from the layout's own extent each time.
+        _kollesisReach = QRectF();
+        _rulerModel.extentLeftSceneX = _contentRect.left();
+        _rulerModel.extentRightSceneX = _contentRect.right();
+    }
+    const bool wanted = _kollesisCheck && _kollesisCheck->isChecked();
+    if (!wanted || !haveLayout) {
+        _view->setRulerModel(_rulerModel);
+        if (haveLayout) {
+            applySceneRect();
+        }
+        return;
+    }
+    _kollesisModel = buildKollesisModel();
+    const vc3d::fiber_map::kollesis::Model& model = _kollesisModel;
+    // Scene y is -z; the ruler model holds the scroll extent the seams span.
+    const double topY = _rulerModel.extentTopSceneY;
+    const double bottomY = _rulerModel.extentBottomSceneY;
+    const auto formatVx = [this](double lengthVx) {
+        return vc3d::fiber_length::formatLength(lengthVx, _voxelSizeUm, 0);
+    };
+
+    QPen boundPen(kollesisColor(180));
+    boundPen.setWidthF(1.2);
+    boundPen.setCosmetic(true);
+    QPen seamPen(kollesisColor(235));
+    seamPen.setWidthF(1.0);
+    seamPen.setCosmetic(true);
+    seamPen.setStyle(Qt::DashLine);
+    const QBrush bandBrush(kollesisColor(48));
+    QPen predictedPen(kollesisPredictionColor(225));
+    predictedPen.setWidthF(1.2);
+    predictedPen.setCosmetic(true);
+    predictedPen.setStyle(Qt::DotLine);
+    const QBrush predictedBrush(kollesisPredictionColor(32));
+
+    const auto addVertical = [&](double x, const QPen& pen, const QString& tip) {
+        auto* line = _scene->addLine(x, topY, x, bottomY, pen);
+        line->setZValue(kKollesisLineZ);
+        line->setToolTip(tip);
+        _kollesisItems.push_back(line);
+    };
+    const auto addBand = [&](double x0, double x1, const QBrush& brush, const QString& tip) {
+        auto* band = _scene->addRect(QRectF(QPointF(x0, topY), QPointF(x1, bottomY)).normalized(),
+                                     QPen(Qt::NoPen), brush);
+        band->setZValue(kKollesisBandZ);
+        band->setToolTip(tip);
+        _kollesisItems.push_back(band);
+    };
+
+    const vc3d::fiber_map::kollesis::SheetStatistics& stats = model.statistics;
+    QString statsLine;
+    if (stats.valid()) {
+        statsLine = tr("Sheet length %1 ± %2 over %3 gaps")
+                        .arg(formatVx(stats.unitLengthVx), formatVx(stats.spreadVx))
+                        .arg(model.sheetLengthVx.size());
+    }
+
+    for (std::size_t i = 0; i < model.seams.size(); ++i) {
+        const vc3d::fiber_map::kollesis::Seam& seam = model.seams[i];
+        const bool hasNext = i + 1 < model.seams.size();
+        QString tip = tr("Kollesis %1: %2 left, %3 right terminations")
+                          .arg(i + 1)
+                          .arg(seam.left ? seam.left->count : 0)
+                          .arg(seam.right ? seam.right->count : 0);
+        if (!seam.hasBand()) {
+            tip += tr("\nOne side only: the seam is drawn as a line, not a band.");
+        }
+        if (hasNext) {
+            tip += tr("\nGap to the next seam: %1").arg(formatVx(model.sheetLengthVx[i]));
+            if (stats.valid() && stats.sheetCounts[i] >= 2) {
+                tip += tr(", read as %1 sheets").arg(stats.sheetCounts[i]);
+            }
+        }
+        if (!statsLine.isEmpty()) {
+            tip += QLatin1Char('\n') + statsLine;
+        }
+        if (seam.hasBand()) {
+            addBand(seam.left->xVx, seam.right->xVx, bandBrush, tip);
+            addVertical(seam.left->xVx, boundPen, tip);
+            addVertical(seam.right->xVx, boundPen, tip);
+            addVertical(seam.xVx(), seamPen, tip);
+        } else {
+            addVertical(seam.xVx(), boundPen, tip);
+        }
+        FiberMapRulerModel::KollesisMark mark;
+        mark.xVx = seam.xVx();
+        mark.predicted = false;
+        _rulerModel.kollesis.push_back(mark);
+    }
+
+    for (const vc3d::fiber_map::kollesis::PredictedSeam& prediction : model.predicted) {
+        QString tip = prediction.extrapolated
+            ? tr("Predicted kollesis: %1 sheets past the last tagged seam")
+                  .arg(prediction.step)
+            : tr("Predicted kollesis: sheet %1 of %2 between seams %3 and %4, "
+                 "where no termination is tagged")
+                  .arg(prediction.step)
+                  .arg(stats.sheetCounts[static_cast<std::size_t>(prediction.gapIndex)])
+                  .arg(prediction.gapIndex + 1)
+                  .arg(prediction.gapIndex + 2);
+        if (prediction.spreadVx > 0.0) {
+            tip += tr("\n± %1").arg(formatVx(prediction.spreadVx));
+        }
+        if (!statsLine.isEmpty()) {
+            tip += QLatin1Char('\n') + statsLine;
+        }
+        if (prediction.spreadVx > 0.0) {
+            addBand(prediction.xVx - prediction.spreadVx, prediction.xVx + prediction.spreadVx,
+                    predictedBrush, tip);
+        }
+        addVertical(prediction.xVx, predictedPen, tip);
+        FiberMapRulerModel::KollesisMark mark;
+        mark.xVx = prediction.xVx;
+        mark.predicted = true;
+        _rulerModel.kollesis.push_back(mark);
+    }
+
+    // The bar reads tagged and predicted seams as one ascending sequence,
+    // with the length between each neighbouring pair.
+    std::sort(_rulerModel.kollesis.begin(), _rulerModel.kollesis.end(),
+              [](const FiberMapRulerModel::KollesisMark& a,
+                 const FiberMapRulerModel::KollesisMark& b) { return a.xVx < b.xVx; });
+    for (std::size_t i = 0; i < _rulerModel.kollesis.size(); ++i) {
+        _rulerModel.kollesis[i].toNextVx =
+            i + 1 < _rulerModel.kollesis.size()
+                ? _rulerModel.kollesis[i + 1].xVx - _rulerModel.kollesis[i].xVx
+                : std::numeric_limits<double>::quiet_NaN();
+    }
+
+    // Everything drawn above, bands and lines alike, lies within the x range
+    // of the items; where that leaves the layout, the rulers run on, the
+    // scene rect grows so the view can pan there and the fit frames it.
+    double reachLeft = _contentRect.left();
+    double reachRight = _contentRect.right();
+    for (const QGraphicsItem* item : _kollesisItems) {
+        const QRectF bounds = item->sceneBoundingRect();
+        reachLeft = std::min(reachLeft, bounds.left());
+        reachRight = std::max(reachRight, bounds.right());
+    }
+    if (reachLeft < _contentRect.left() || reachRight > _contentRect.right()) {
+        _kollesisReach = QRectF(QPointF(reachLeft, _contentRect.top()),
+                                QPointF(reachRight, _contentRect.bottom()));
+        _rulerModel.extentLeftSceneX = reachLeft;
+        _rulerModel.extentRightSceneX = reachRight;
+    }
+    _view->setRulerModel(_rulerModel);
+    applySceneRect();
+}
+
+QRectF FiberMapWorkspace::framedRect() const
+{
+    return _kollesisReach.isNull() ? _contentRect : _contentRect.united(_kollesisReach);
+}
+
+void FiberMapWorkspace::applySceneRect()
+{
+    // Panning stops at the scene rect, so the rect runs wider than the content:
+    // zoomed in, the map's edges can be dragged away from the viewport edge
+    // instead of being pinned to it.
+    const QRectF framed = framedRect();
+    const double xMargin =
+        std::max(0.25 * framed.width(), kMinSceneMarginCm * sceneVxPerCm());
+    _scene->setSceneRect(framed.adjusted(-xMargin, 0.0, xMargin, 0.0));
 }
 
 QString FiberMapWorkspace::withCachedUmbilicusStatus(const QString& status)
@@ -1179,8 +1553,55 @@ void FiberMapWorkspace::showStale(const QString& reason)
     _staleReason = reason;
     if (_statusLabel) {
         _statusLabel->setStyleSheet({});
-        _statusLabel->setText(withCachedUmbilicusStatus(reason));
+        _statusLabel->setText(composeStatus(withCachedUmbilicusStatus(reason)));
     }
+}
+
+QString FiberMapWorkspace::composeStatus(const QString& floor) const
+{
+    if (_operationStatus.isEmpty()) {
+        return floor;
+    }
+    if (floor.isEmpty()) {
+        return _operationStatus;
+    }
+    return _operationStatus + QStringLiteral(" · ") + floor;
+}
+
+void FiberMapWorkspace::redrawStatus()
+{
+    // Re-shows whatever the line's floor is right now, composed with the
+    // operation message. The floor's own writers (showStale, publication,
+    // the selection) each compose too; this is for a message change alone.
+    if (!_statusLabel) {
+        return;
+    }
+    if (!_staleReason.isEmpty()) {
+        showStale(_staleReason);
+        return;
+    }
+    if (!_layoutBuilt) {
+        _statusLabel->setStyleSheet({});
+        _statusLabel->setText(composeStatus(withCachedUmbilicusStatus(
+            _restingReason.isEmpty() ? tr("press Update") : _restingReason)));
+        return;
+    }
+    updateSelectionStatus();
+}
+
+void FiberMapWorkspace::setOperationStatus(const QString& message)
+{
+    _operationStatus = message;
+    redrawStatus();
+}
+
+void FiberMapWorkspace::clearOperationStatus()
+{
+    if (_operationStatus.isEmpty()) {
+        return;
+    }
+    _operationStatus.clear();
+    redrawStatus();
 }
 
 void FiberMapWorkspace::markStale(const QString& reason)
@@ -1204,6 +1625,8 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     // instead of geometry; it also owns tearing down the items, the entries and
     // the highlight, so none of that is repeated here.
     _layout = {};
+    _layoutUmbilicusCenters.clear();
+    _endpointReviews.clear();
     _gapField.reset();
     _pendingGapTiles.clear();
     _gapPublishedWanted = false;
@@ -1221,6 +1644,7 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     // epoch bump refuses its publication.
     _rebuildQueue.invalidate();
     _voxelSizeUm.reset();
+    _fiberLengthVx.clear();
     updateGapLegend();
     _scrollZMaxVx = 0.0;
     // A fresh fit belongs to the next layout, which is not this one's frame.
@@ -1233,9 +1657,13 @@ void FiberMapWorkspace::clearLayout(const QString& reason)
     // latch goes with the layout it described.
     _staleReason.clear();
     _latchedReason.clear();
+    // The fibers the message was about are gone with the layout.
+    _operationStatus.clear();
+    cancelAutoLinkResume();
     if (_tree) {
         _tree->clear();
     }
+    updateTotalLengthLabel();
     rebuildScene(reason);
     _restingReason = reason;
     _freshStatus = withCachedUmbilicusStatus(reason);
@@ -1333,11 +1761,14 @@ bool FiberMapWorkspace::applyStaleVerdict(const StaleVerdict& verdict)
         // stays MarkStale until a rebuild or clear.
         if (!_staleReason.isEmpty() && _layoutBuilt) {
             _staleReason.clear();
-            if (_statusLabel) {
-                _statusLabel->setStyleSheet(_freshStatusStyle);
-                _statusLabel->setText(_freshStatus);
-            }
+            // The fresh floor with the selection (and the operation message).
+            updateSelectionStatus();
         }
+        // A Link waiting for a fresh layout (resumeAutoLinkAfterPublish
+        // kept it while the layout was stale) gets its chance here too:
+        // freshness can return without a rebuild (a volume switched away
+        // and back), and then no publication would ever retry it.
+        resumeAutoLinkAfterPublish();
         break;
     }
     return false;
@@ -1467,6 +1898,9 @@ struct FiberMapWorkspace::RebuildJobResult {
     uint64_t builtUmbilicusGeneration = 0;
     // Inputs (snapshot fibers are consumed by the worker's conversion).
     LineAnnotationController::FiberMapSnapshot snapshot;
+    // Every endpoint's review state, from every link of the inputs
+    // (aggregateEndpointReviews), computed before the layout drops any.
+    std::map<vc3d::fiber_map::EndpointKey, vc3d::fiber_map::EndpointReview> endpointReviews;
     vc3d::fiber_map::GlobalLayoutParams params;
     bool hadFibers = false;
     bool hadUmbilicus = false;
@@ -1497,6 +1931,10 @@ struct FiberMapWorkspace::RebuildJobResult {
     qint64 gapMs = 0;
     // Products.
     vc3d::fiber_map::GlobalResult layout;
+    // Every snapshot fiber's line length (annotation-frame voxels), read
+    // before the conversion consumes the line points; display only, so not
+    // part of either digest.
+    std::unordered_map<uint64_t, double> fiberLengthVx;
     vc3d::fiber_map::ContentDigest inputsDigest;
     vc3d::fiber_map::ContentDigest outputDigest;
     vc3d::fiber_map::GlobalLayoutCache::Stats stats;
@@ -1518,7 +1956,10 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
         const auto convertBegin = std::chrono::steady_clock::now();
         std::vector<vc3d::fiber_map::InputFiber> inputs;
         inputs.reserve(job->snapshot.fibers.size());
+        job->fiberLengthVx.reserve(job->snapshot.fibers.size());
         for (auto& fiber : job->snapshot.fibers) {
+            job->fiberLengthVx[fiber.id] = vc3d::fiber_slice::annotatedLineLengthVx(
+                fiber.linePoints, fiber.controlPoints);
             vc3d::fiber_map::InputFiber input;
             input.id = fiber.id;
             input.fileName = fiber.fileName;
@@ -1539,10 +1980,12 @@ void runRebuildJob(const std::shared_ptr<FiberMapWorkspace::RebuildJobResult>& j
                                                link.branchControlPointIndex,
                                                link.pending,
                                                link.adjacent,
-                                               link.adjacentExplicit});
+                                               link.adjacentExplicit,
+                                               link.autoLink});
             }
             inputs.push_back(std::move(input));
         }
+        job->endpointReviews = vc3d::fiber_map::aggregateEndpointReviews(inputs);
         // The winding sense is the scroll's, and the catalog states it for
         // the volumes it orients; only without that does the layout fall
         // back to solving both senses. Settled before the input digest,
@@ -1637,6 +2080,7 @@ void FiberMapWorkspace::hideEvent(QHideEvent* event)
 void FiberMapWorkspace::showEvent(QShowEvent* event)
 {
     QMainWindow::showEvent(event);
+    if (_focusBoundsDirty) updateFocusBounds();
     if (_stalePollTimer) {
         _stalePollTimer->start();
     }
@@ -1665,9 +2109,9 @@ void FiberMapWorkspace::showEvent(QShowEvent* event)
         // changed since (nothing is built, so no dependency comparison will
         // ever say so). The cache re-resolves when the fingerprint moved.
         _statusLabel->setStyleSheet({});
-        _statusLabel->setText(withCachedUmbilicusStatus(
+        _statusLabel->setText(composeStatus(withCachedUmbilicusStatus(
             _restingReason.isEmpty() ? tr("press Update")
-                                     : _restingReason));
+                                     : _restingReason)));
     }
 }
 
@@ -1675,6 +2119,12 @@ void FiberMapWorkspace::requestRebuild(bool fullRebuild, bool automatic)
 {
     if (!_controller) {
         return;
+    }
+    if (!automatic) {
+        // A pressed Update is the user moving on; an automatic one (the
+        // generation bump after a link) is part of the operation itself and
+        // its publication keeps the message.
+        clearOperationStatus();
     }
     switch (_rebuildQueue.request(fullRebuild, automatic)) {
     case vc3d::fiber_map::FiberMapRebuildQueue::Request::Refused:
@@ -1832,6 +2282,7 @@ void FiberMapWorkspace::applyRebuild(const std::shared_ptr<RebuildJobResult>& jo
             job->cache = {};
             job->gapField.reset();
             job->gapTiles.clear();
+            job->fiberLengthVx.clear();
         }
     });
 
@@ -1938,6 +2389,8 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     // dependency watermark commits together.
     _layoutCache = std::move(job.cache);
     _layout = std::move(job.layout);
+    _layoutUmbilicusCenters = job.snapshot.umbilicusCenters;
+    _endpointReviews = std::move(job.endpointReviews);
     // Null when the checkbox was off at job start or the build failed; the
     // scene rebuild below draws whatever this is.
     _gapField = job.gapField;
@@ -1959,6 +2412,7 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     _latchedReason.clear();
     _restingReason.clear();
     _voxelSizeUm = job.snapshot.voxelSizeUm;
+    _fiberLengthVx = std::move(job.fiberLengthVx);
     // The scale's tooltip notes an assumed voxel size, which this may have
     // just replaced with the package's own.
     updateGapLegend();
@@ -2018,8 +2472,20 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     } else if (_layout.fibers.empty()) {
         emptyMessage = tr("no placeable fibers");
     }
+    // The scene rebuild clears the selection; the same fibers (by runtime
+    // id, stable within the package) are re-selected when they still exist,
+    // so an automatic Update after an edit keeps the user's pair.
+    const std::vector<uint64_t> selectedBefore = _selectedFibers;
     rebuildScene(emptyMessage);
     rebuildTree();
+    if (!selectedBefore.empty()) {
+        setSelectedFibers(selectedBefore);
+        if (_highlightedFiber != 0) {
+            selectFiberRow(_highlightedFiber);
+        }
+    }
+    // A Link that waited for this rebuild (see _autoLinkResume).
+    resumeAutoLinkAfterPublish();
     const qint64 publishMs = publishTimer.elapsed();
     Logger()->info(
         "fiber map rebuild: GUI stalls snapshot {} ms + publish {} ms · "
@@ -2149,10 +2615,10 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
         ? QStringLiteral("QLabel { color: %1; font-weight: bold; }").arg(kSuspect.name())
         : QString();
     _statusLabel->setStyleSheet(_freshStatusStyle);
-    _statusLabel->setText(status);
+    _statusLabel->setText(composeStatus(status));
 
     if (!_viewFitted && !_layout.fibers.empty()) {
-        _view->fitInView(_contentRect, Qt::KeepAspectRatio);
+        _view->fitInView(framedRect(), Qt::KeepAspectRatio);
         _viewFitted = true;
     }
     // fitInView changes the scale without a wheel event.
@@ -2224,11 +2690,13 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     _entries.clear();
     clearControlPointDots();
     _highlightedFiber = 0;
+    _selectedFibers.clear();
     _networkEmphasized.clear();
     _labelChips.clear();
     _chipHideScale = 0.0;
     // Scene-owned: clear() deletes them.
     _gapTiles.clear();
+    _kollesisItems.clear();
     _scene->clear();
 
     // Kept so a theme change can rebuild the scene as it stands, without asking
@@ -2241,13 +2709,17 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     // The axes read the layout through the view; an empty layout blanks them.
     // Their colours are the map's, so a theme switch re-styles them with the
     // same rebuild. The model is completed below once the extent is known.
-    _view->setRulerStyle(FiberMapRulerStyle{theme.surface, theme.inkSoft, theme.winding});
+    _view->setRulerStyle(FiberMapRulerStyle{theme.surface, theme.inkSoft, theme.winding,
+                                            kollesisColor(255), kollesisPredictionColor(255)});
 
     if (_layout.fibers.empty()) {
-        _view->setRulerModel(FiberMapRulerModel{});
+        _rulerModel = FiberMapRulerModel{};
+        _kollesisModel = {};
+        _view->setRulerModel(_rulerModel);
         auto* message = _scene->addSimpleText(emptyMessage);
         message->setBrush(theme.ink);
         _contentRect = message->boundingRect().adjusted(-40.0, -40.0, 40.0, 40.0);
+        _kollesisReach = QRectF();
         _scene->setSceneRect(_contentRect);
         return;
     }
@@ -2323,7 +2795,8 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         rulerModel.extentBottomSceneY = extentBottomY;
         rulerModel.extentLeftSceneX = leftX;
         rulerModel.extentRightSceneX = rightX;
-        _view->setRulerModel(rulerModel);
+        _rulerModel = std::move(rulerModel);
+        _view->setRulerModel(_rulerModel);
     }
 
     // One ground for the whole map, spanning the scroll's own z extent.
@@ -2334,6 +2807,19 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
 
     // The gap heat map, when there is one and it is switched on.
     addGapTiles();
+
+    // The scroll extent, when known, is part of what the first-build fit
+    // shows. The axes float just outside the extent, so the fit keeps a
+    // slice of room above the ceiling and below the floor for their bands.
+    // Set before the kollesis overlay, which may reach past the layout.
+    {
+        const double height = std::max(sceneBottomY - sceneTopY, 1e-6);
+        _contentRect = QRectF(leftX, sceneTopY - 0.06 * height, sceneWidth, 1.12 * height);
+    }
+
+    // The kollesis seams, over the ground and the heat map, under the grid
+    // and the fibers.
+    rebuildKollesisOverlay();
 
     // The winding grid, one line per integer winding. The numbers are the
     // top ruler's, which labels whatever is in view; the scene carries only
@@ -2367,25 +2853,30 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         const QColor color = fiberColor(entry.fiber.hvTag, theme);
         const QPainterPath tracedPath = pathForRuns(entry.fiber, RunKind::Traced);
         if (!tracedPath.isEmpty()) {
-            entry.tracedItem = _scene->addPath(tracedPath, cosmeticPen(color, kTracedWidth));
+            entry.tracedItem = new FocusPathItem(tracedPath);
+            entry.tracedItem->setPen(cosmeticPen(color, kTracedWidth));
+            _scene->addItem(entry.tracedItem);
             entry.tracedItem->setZValue(kFiberZ);
         }
         const QPainterPath interpolatedPath = pathForRuns(entry.fiber, RunKind::Interpolated);
         if (!interpolatedPath.isEmpty()) {
-            entry.interpolatedItem = _scene->addPath(
-                interpolatedPath,
-                interpolatedPen(tint(color, theme.surface, 0.45), kInterpolatedWidth));
+            entry.interpolatedItem = new FocusPathItem(interpolatedPath);
+            entry.interpolatedItem->setPen(interpolatedPen(tint(color, theme.surface, 0.45), kInterpolatedWidth));
+            _scene->addItem(entry.interpolatedItem);
             entry.interpolatedItem->setZValue(kFiberZ);
         }
         const QPainterPath gapPath = pathForRuns(entry.fiber, RunKind::Gap);
         if (!gapPath.isEmpty()) {
-            entry.gapItem = _scene->addPath(gapPath, gapPen(gapLineColor(255), kTracedWidth));
+            entry.gapItem = new FocusPathItem(gapPath);
+            entry.gapItem->setPen(gapPen(gapLineColor(255), kTracedWidth));
+            _scene->addItem(entry.gapItem);
             entry.gapItem->setZValue(kFiberZ);
         }
         const QPainterPath damagedPath = pathForRuns(entry.fiber, RunKind::Damaged);
         if (!damagedPath.isEmpty()) {
-            entry.damagedItem =
-                _scene->addPath(damagedPath, gapPen(damagedColor(255), kTracedWidth));
+            entry.damagedItem = new FocusPathItem(damagedPath);
+            entry.damagedItem->setPen(gapPen(damagedColor(255), kTracedWidth));
+            _scene->addItem(entry.damagedItem);
             entry.damagedItem->setZValue(kFiberZ);
         }
 
@@ -2445,6 +2936,56 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         _entries.insert(fiberId, std::move(entry));
     }
 
+    // The two endpoint dots of a link, from each endpoint's AGGREGATED look
+    // (endpointLook: pending outranks approved, the automatic palette when
+    // every pending link on the point is automatic; a tagged endpoint keeps
+    // its tag rim over the fill). Drawn for every link, suspect ones
+    // included (their red diagnostic rings go on top).
+    const auto drawEndpointDots = [&](const vc3d::fiber_map::PlacedLink& link,
+                                      const QPointF& a, const QPointF& b,
+                                      const std::array<std::optional<EndpointLook>, 2>& looks,
+                                      const LinkPalette& palette,
+                                      const std::array<bool, 2>& drawEndpoint = {true, true}) {
+        const std::array<bool, 2> tagged{
+            isKollesisTermination(link.fiberA, link.cpA),
+            isKollesisTermination(link.fiberB, link.cpB)};
+        const std::array<bool, 2> broken{
+            isBreak(link.fiberA, link.cpA),
+            isBreak(link.fiberB, link.cpB)};
+        std::size_t endpointIndex = 0;
+        for (const QPointF& endpoint : {a, b}) {
+            if (!drawEndpoint[endpointIndex]) {
+                ++endpointIndex;
+                continue;
+            }
+            const bool kollesis = tagged[endpointIndex];
+            const bool breakTag = broken[endpointIndex];
+            const EndpointLook look = looks[endpointIndex].value_or(
+                EndpointLook{palette.brush, palette.pen, link.pending, false});
+            ++endpointIndex;
+            // Two stacked fills read darker than one; this alpha
+            // compounds, where the dots overlap, to about the palette's own.
+            QColor fill = look.fill;
+            fill.setAlpha(kLinkEndpointFillAlpha);
+            auto* dot = new ScaledDot(QBrush(fill),
+                                      kollesis   ? cosmeticPen(kollesisColor(245), kKollesisRimWidthPx)
+                                      : breakTag ? dottedPen(breakColor(245), kKollesisRimWidthPx)
+                                                 : cosmeticPen(look.pen, 1.0),
+                                      crossingDotRadius,
+                                      kMinCrossingDotPx, kMaxCrossingDotPx,
+                                      crossingDotBounds,
+                                      /*triangle=*/looks[endpointIndex - 1]
+                                          ? looks[endpointIndex - 1]->adjacent
+                                          : link.adjacent);
+            _scene->addItem(dot);
+            dot->setPos(endpoint);
+            // A tagged endpoint sits above its untagged twin where the two
+            // overlap zoomed out, so the rim stays visible.
+            dot->setZValue(kollesis || breakTag ? 4.1 : 4.0);
+        }
+    };
+    updateFocusBounds();
+
     for (const vc3d::fiber_map::PlacedLink& link : _layout.links) {
         const QPointF a(sceneXOf(link.a.x()), -link.a.y());
         const QPointF b(sceneXOf(link.b.x()), -link.b.y());
@@ -2459,39 +3000,19 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
             // at the midpoint sat on neither.
             const LinkPalette& palette =
                 linkPalette(hvTagOf(link.fiberA), hvTagOf(link.fiberB), link.pending);
+            // Each endpoint dot takes the endpoint's AGGREGATED look
+            // (endpointLook: pending outranks approved, the automatic palette
+            // when every pending link on the point is automatic), so two links sharing
+            // a control point never paint contradicting markers; the
+            // connector keeps this link's own palette.
+            const std::array<std::optional<EndpointLook>, 2> looks{
+                endpointLook(link.fiberA, link.cpA), endpointLook(link.fiberB, link.cpB)};
             QPen connectorPen = cosmeticPen(palette.pen, 1.0);
             connectorPen.setStyle(Qt::DotLine);
             auto* connector = _scene->addLine(QLineF(a, b));
             connector->setPen(connectorPen);
             connector->setZValue(3.9);
-            // Two stacked fills read darker than one; this alpha compounds,
-            // where the dots overlap, to about the palette's own.
-            QColor fill = palette.brush;
-            fill.setAlpha(kLinkEndpointFillAlpha);
-            const std::array<bool, 2> tagged{
-                isKollesisTermination(link.fiberA, link.cpA),
-                isKollesisTermination(link.fiberB, link.cpB)};
-            const std::array<bool, 2> broken{
-                isBreak(link.fiberA, link.cpA),
-                isBreak(link.fiberB, link.cpB)};
-            std::size_t endpointIndex = 0;
-            for (const QPointF& endpoint : {a, b}) {
-                const bool kollesis = tagged[endpointIndex];
-                const bool breakTag = broken[endpointIndex++];
-                auto* dot = new ScaledDot(QBrush(fill),
-                                          kollesis   ? cosmeticPen(kollesisColor(245), kKollesisRimWidthPx)
-                                          : breakTag ? dottedPen(breakColor(245), kKollesisRimWidthPx)
-                                                     : cosmeticPen(palette.pen, 1.0),
-                                          crossingDotRadius,
-                                          kMinCrossingDotPx, kMaxCrossingDotPx,
-                                          crossingDotBounds,
-                                          /*triangle=*/link.adjacent);
-                _scene->addItem(dot);
-                dot->setPos(endpoint);
-                // A tagged endpoint sits above its untagged twin where the two
-                // overlap zoomed out, so the rim stays visible.
-                dot->setZValue(kollesis || breakTag ? 4.1 : 4.0);
-            }
+            drawEndpointDots(link, a, b, looks, palette);
             continue;
         }
         QPen suspectPen(kSuspect);
@@ -2501,13 +3022,31 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         auto* line = _scene->addLine(QLineF(a, b));
         line->setPen(suspectPen);
         line->setZValue(4.0);
-        for (const QPointF& endpoint : {a, b}) {
-            auto* ring = new ScaledDot(QBrush(Qt::NoBrush), cosmeticPen(kSuspect, 1.4),
-                                       suspectRingRadius, kMinSuspectRingPx,
-                                       kMaxSuspectRingPx, suspectRingBounds);
-            _scene->addItem(ring);
-            ring->setPos(endpoint);
-            ring->setZValue(kSuspectRingZ);
+        {
+            // The endpoint markers a suspect link's control points carry
+            // (link palettes, tag rims) are the same as every other link's;
+            // the red ring is the diagnostic on top of them.
+            const LinkPalette& palette =
+                linkPalette(hvTagOf(link.fiberA), hvTagOf(link.fiberB), link.pending);
+            const std::array<std::optional<EndpointLook>, 2> looks{
+                endpointLook(link.fiberA, link.cpA), endpointLook(link.fiberB, link.cpB)};
+            // The pre-existing suspect look (rings only) stays for an
+            // endpoint without an automatic link; an endpoint WITH one gets
+            // the automatic decorations (the automatic-palette dot, tag
+            // ring) under the red ring - decided per endpoint.
+            const std::array<bool, 2> decorate{looks[0] && looks[0]->anyAuto,
+                                               looks[1] && looks[1]->anyAuto};
+            if (decorate[0] || decorate[1]) {
+                drawEndpointDots(link, a, b, looks, palette, decorate);
+            }
+            for (const QPointF& endpoint : {a, b}) {
+                auto* ring = new ScaledDot(QBrush(Qt::NoBrush), cosmeticPen(kSuspect, 1.4),
+                                           suspectRingRadius, kMinSuspectRingPx,
+                                           kMaxSuspectRingPx, suspectRingBounds);
+                _scene->addItem(ring);
+                ring->setPos(endpoint);
+                ring->setZValue(kSuspectRingZ);
+            }
         }
         auto* label = _scene->addSimpleText(
             link.adjacentDisagrees ? tr("adjacent kind disagrees between the fibers")
@@ -2522,15 +3061,24 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
     // Kollesis terminations on unlinked control points: a linked one was
     // already drawn above as its link endpoint dot with the pale yellow rim.
     {
-        // Suspect links draw rings, not endpoint dots, so their tagged
-        // endpoints still need the marker.
+        // The endpoints whose dot (with the tag rim) was drawn above: every
+        // non-suspect link's, and a suspect link's only where an automatic
+        // link made it draw one; the others keep their standalone tag ring.
         std::set<std::pair<uint64_t, int>> linkedEndpoints;
         for (const vc3d::fiber_map::PlacedLink& link : _layout.links) {
-            if (link.suspect) {
+            if (!link.suspect) {
+                linkedEndpoints.emplace(link.fiberA, link.cpA);
+                linkedEndpoints.emplace(link.fiberB, link.cpB);
                 continue;
             }
-            linkedEndpoints.emplace(link.fiberA, link.cpA);
-            linkedEndpoints.emplace(link.fiberB, link.cpB);
+            // A suspect link drew a dot only at an endpoint with an
+            // automatic link.
+            if (const auto look = endpointLook(link.fiberA, link.cpA); look && look->anyAuto) {
+                linkedEndpoints.emplace(link.fiberA, link.cpA);
+            }
+            if (const auto look = endpointLook(link.fiberB, link.cpB); look && look->anyAuto) {
+                linkedEndpoints.emplace(link.fiberB, link.cpB);
+            }
         }
         const QPen rim = cosmeticPen(kollesisColor(245), kKollesisRimWidthPx);
         const QPen breakRim = dottedPen(breakColor(245), kKollesisRimWidthPx);
@@ -2545,9 +3093,17 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
                     linkedEndpoints.count({fiber.id, static_cast<int>(i)}) != 0) {
                     continue;
                 }
-                auto* dot = new ScaledDot(fill, kollesis ? rim : breakRim, crossingDotRadius,
+                // A tagged point whose links the layout could not place (an
+                // automatic link to a one-point fiber, say) still draws its
+                // automatic decoration here: the link fill inside the tag
+                // ring, as its endpoint dot would have - selection and
+                // deselection then agree.
+                const auto look = endpointLook(fiber.id, static_cast<int>(i));
+                const bool automatic = look && look->anyAuto;
+                auto* dot = new ScaledDot(automatic ? QBrush(look->fill) : fill,
+                                          kollesis ? rim : breakRim, crossingDotRadius,
                                           kMinCrossingDotPx, kMaxCrossingDotPx,
-                                          crossingDotBounds);
+                                          crossingDotBounds, /*triangle=*/look && look->adjacent);
                 _scene->addItem(dot);
                 dot->setPos(fiber.controlPoints[i]);
                 dot->setZValue(4.1);
@@ -2566,17 +3122,7 @@ void FiberMapWorkspace::rebuildScene(const QString& emptyMessage)
         ring->setZValue(kSuspectRingZ);
     }
 
-    // The scroll extent, when known, is part of what the first-build fit
-    // shows. The axes float just outside the extent, so the fit keeps a
-    // slice of room above the ceiling and below the floor for their bands.
-    const double height = std::max(sceneBottomY - sceneTopY, 1e-6);
-    _contentRect = QRectF(leftX, sceneTopY - 0.06 * height, sceneWidth, 1.12 * height);
-
-    // Panning stops at the scene rect, so the rect runs wider than the content:
-    // zoomed in, the map's edges can be dragged away from the viewport edge
-    // instead of being pinned to it.
-    const double xMargin = std::max(0.25 * sceneWidth, kMinSceneMarginCm * vxPerCm);
-    _scene->setSceneRect(_contentRect.adjusted(-xMargin, 0.0, xMargin, 0.0));
+    applySceneRect();
 
     // Chips hide once a winding is narrower than kMinChipPixelsPerWinding on
     // screen. Windings are not equally wide in the scene, so the threshold is
@@ -2681,25 +3227,35 @@ void FiberMapWorkspace::rebuildTree()
         }
         return text;
     };
+    // The fiber's line length as the len column shows it (its header names
+    // the unit); a fiber the snapshot did not measure reads as a dash.
+    const auto lengthText = [this](uint64_t fiberId) {
+        const auto it = _fiberLengthVx.find(fiberId);
+        return vc3d::fiber_length::formatValue(
+            it != _fiberLengthVx.end() ? it->second
+                                       : std::numeric_limits<double>::quiet_NaN(),
+            _voxelSizeUm);
+    };
+    const auto lengthOf = [this](uint64_t fiberId) {
+        const auto it = _fiberLengthVx.find(fiberId);
+        return it != _fiberLengthVx.end() && std::isfinite(it->second) ? it->second : 0.0;
+    };
     const auto addFiberRow = [&](QTreeWidgetItem* parent,
                                  const vc3d::fiber_map::GlobalPlacedFiber* row) {
         const QString annotationName =
             _controller ? _controller->fiberDisplayName(row->fiber.id) : QString();
-        auto* item = parent != nullptr
-            ? new QTreeWidgetItem(
-                  parent, {row->fiber.label, QString(QLatin1Char(row->fiber.hvTag)),
-                           windingText(row->meta), anchorText(row->meta),
-                           annotationName})
-            : new QTreeWidgetItem(
-                  _tree, {row->fiber.label, QString(QLatin1Char(row->fiber.hvTag)),
-                          windingText(row->meta), anchorText(row->meta),
-                          annotationName});
+        const QStringList columns{row->fiber.label, QString(QLatin1Char(row->fiber.hvTag)),
+                                  windingText(row->meta), lengthText(row->fiber.id),
+                                  anchorText(row->meta), annotationName};
+        auto* item = parent != nullptr ? new QTreeWidgetItem(parent, columns)
+                                       : new QTreeWidgetItem(_tree, columns);
         item->setData(0, Qt::UserRole, QVariant::fromValue<qulonglong>(row->fiber.id));
+        item->setTextAlignment(kTreeLengthColumn, Qt::AlignRight | Qt::AlignVCenter);
         const QColor color = fiberColor(row->fiber.hvTag, theme);
         for (int column = 0; column < _tree->columnCount(); ++column) {
             item->setForeground(column, color);
         }
-        item->setForeground(3, theme.inkSoft);
+        item->setForeground(kTreeAnchorColumn, theme.inkSoft);
     };
 
     // Every red mark on the map, as the status line counts them: each suspect
@@ -2766,10 +3322,15 @@ void FiberMapWorkspace::rebuildTree()
     }
 
     for (const auto& [id, members] : networks) {
+        double networkLengthVx = 0.0;
+        for (const vc3d::fiber_map::GlobalPlacedFiber* row : members) {
+            networkLengthVx += lengthOf(row->fiber.id);
+        }
         auto* networkItem = new QTreeWidgetItem(
-            _tree, {tr("Network %1 — %2 fibers")
+            _tree, {tr("Network %1 — %2 fibers · %3")
                         .arg(id + 1)
-                        .arg(members.size())});
+                        .arg(members.size())
+                        .arg(vc3d::fiber_length::formatLength(networkLengthVx, _voxelSizeUm))});
         networkItem->setForeground(0, theme.inkSoft);
         // A header across the whole row, so the columns stay narrow.
         networkItem->setFirstColumnSpanned(true);
@@ -2796,14 +3357,49 @@ void FiberMapWorkspace::rebuildTree()
             _controller ? _controller->fiberDisplayName(unplaced->id) : QString();
         auto* item = new QTreeWidgetItem(
             _tree, {unplaced->label, QString(QLatin1Char(unplaced->hvTag)),
-                    QStringLiteral("—"), tr("unplaceable"), annotationName});
+                    QStringLiteral("—"), lengthText(unplaced->id), tr("unplaceable"),
+                    annotationName});
         item->setData(0, Qt::UserRole, QVariant::fromValue<qulonglong>(unplaced->id));
+        item->setTextAlignment(kTreeLengthColumn, Qt::AlignRight | Qt::AlignVCenter);
         for (int column = 0; column < _tree->columnCount(); ++column) {
             item->setForeground(column, theme.inkSoft);
         }
     }
+    _tree->setHeaderLabels(treeHeaderLabels());
+    updateTotalLengthLabel();
     applyTreeFilter();
     _syncingSelection = guard;
+}
+
+QStringList FiberMapWorkspace::treeHeaderLabels() const
+{
+    QStringList labels;
+    labels.reserve(kTreeColumnCount);
+    for (int column = 0; column < kTreeColumnCount; ++column) {
+        switch (column) {
+        case kTreeFiberColumn:
+            labels << tr("Fiber");
+            break;
+        case kTreeHvColumn:
+            labels << tr("H/V");
+            break;
+        case kTreeWindingColumn:
+            labels << tr("Winding");
+            break;
+        case kTreeLengthColumn:
+            labels << vc3d::fiber_length::columnHeader(tr("Len"), _voxelSizeUm);
+            break;
+        case kTreeAnchorColumn:
+            labels << tr("Anchor");
+            break;
+        case kTreeAnnotationColumn:
+            labels << tr("Annotation");
+            break;
+        default:
+            break;
+        }
+    }
+    return labels;
 }
 
 void FiberMapWorkspace::applyTreeFilter()
@@ -2858,7 +3454,7 @@ void FiberMapWorkspace::changeEvent(QEvent* event)
     _retheming = true;
     // rebuildScene clears the highlight, so it is restored afterwards: a theme
     // switch should not cost the user their selection.
-    const uint64_t highlighted = _highlightedFiber;
+    const std::vector<uint64_t> selectedBefore = _selectedFibers;
     // A selected error entry survives too: the rebuilt tree lists the same
     // errors in the same order for the same layout, so its row index is its
     // identity.
@@ -2878,9 +3474,11 @@ void FiberMapWorkspace::changeEvent(QEvent* event)
         _syncingSelection = true;
         _tree->setCurrentItem(_tree->topLevelItem(selectedErrorRow));
         _syncingSelection = guard;
-    } else if (highlighted != 0 && _entries.contains(highlighted)) {
-        setHighlightedFiber(highlighted);
-        selectFiberRow(highlighted);
+    } else if (!selectedBefore.empty()) {
+        setSelectedFibers(selectedBefore);
+        if (_highlightedFiber != 0) {
+            selectFiberRow(_highlightedFiber);
+        }
     }
     _retheming = false;
 }
@@ -2940,15 +3538,38 @@ uint64_t FiberMapWorkspace::fiberAt(const QPointF& scenePos) const
     return best;
 }
 
-void FiberMapWorkspace::handleSceneClick(const QPointF& scenePos)
+void FiberMapWorkspace::handleSceneClick(const QPointF& scenePos, Qt::KeyboardModifiers modifiers)
 {
+    // Any click on the map is the user moving on from the last operation -
+    // before the stale gate, so a click on the stale map a Link is waiting
+    // to be rebuilt still cancels that Link.
+    cancelAutoLinkResume();
     // A stale map's runtime ids may name different fibers than they did when it
     // was built, so it stops responding until rebuilt.
     if (refreshStaleState()) {
         return;
     }
     const uint64_t fiberId = fiberAt(scenePos);
-    setHighlightedFiber(fiberId);
+    clearOperationStatus();
+    std::vector<uint64_t> selection;
+    if (modifiers.testFlag(Qt::ShiftModifier)) {
+        // The last two fibers clicked with Shift held: a re-clicked fiber
+        // moves to the back, the oldest drops off. Shift on empty space
+        // changes nothing.
+        if (fiberId == 0) {
+            return;
+        }
+        selection = _selectedFibers;
+        selection.erase(std::remove(selection.begin(), selection.end(), fiberId),
+                        selection.end());
+        selection.push_back(fiberId);
+        while (selection.size() > 2) {
+            selection.erase(selection.begin());
+        }
+    } else if (fiberId != 0) {
+        selection = {fiberId};
+    }
+    setSelectedFibers(std::move(selection));
     if (fiberId != 0) {
         selectFiberRow(fiberId, /*revealHidden=*/true);
     }
@@ -3007,6 +3628,41 @@ void FiberMapWorkspace::clearControlPointDots()
     _controlPointDots.clear();
 }
 
+void FiberMapWorkspace::setFocusBounds(std::optional<Rect3D> bounds)
+{
+    if ((!bounds && !_focusBounds) || (bounds && _focusBounds &&
+        bounds->low == _focusBounds->low && bounds->high == _focusBounds->high)) return;
+    _focusBounds = std::move(bounds);
+    _focusBoundsDirty = true;
+    if (isVisible()) updateFocusBounds();
+}
+
+void FiberMapWorkspace::updateFocusBounds()
+{
+    for (auto& entry : _entries) {
+        const std::array<QGraphicsPathItem*, 5> items{
+            entry.tracedItem, entry.interpolatedItem, entry.gapItem, entry.damagedItem, entry.glowItem};
+        std::array<vc3d::fiber_map::FocusPaths, 5> paths;
+        if (_focusBounds) {
+            for (std::size_t i = 0; i < entry.fiber.runs.size(); ++i) {
+                auto split = vc3d::fiber_map::focusRunPaths(entry.fiber, i, *_focusBounds);
+                auto& path = paths[static_cast<std::size_t>(runKind(entry.fiber.runs[i]))];
+                path.inside.addPath(split.inside);
+                path.outside.addPath(split.outside);
+                paths.back().inside.addPath(split.inside);
+                paths.back().outside.addPath(split.outside);
+            }
+        }
+        for (std::size_t i = 0; i < items.size(); ++i) {
+            if (auto* item = dynamic_cast<FocusPathItem*>(items[i])) {
+                item->setFocusPaths(_focusBounds
+                    ? std::optional{std::move(paths[i])} : std::nullopt);
+            }
+        }
+    }
+    _focusBoundsDirty = false;
+}
+
 void FiberMapWorkspace::paintFiberEmphasis(FiberEntry& entry,
                                            FiberEmphasis emphasis)
 {
@@ -3051,9 +3707,11 @@ void FiberMapWorkspace::paintFiberEmphasis(FiberEntry& entry,
             }
             QColor glow = color;
             glow.setAlpha(kNetworkGlowAlpha);
-            entry.glowItem =
-                _scene->addPath(path, cosmeticPen(glow, kNetworkGlowWidthPx));
+            entry.glowItem = new FocusPathItem(path);
+            entry.glowItem->setPen(cosmeticPen(glow, kNetworkGlowWidthPx));
+            _scene->addItem(entry.glowItem);
             entry.glowItem->setZValue(kNetworkGlowZ);
+            if (_focusBounds) updateFocusBounds();
         }
     } else if (entry.glowItem != nullptr) {
         _scene->removeItem(entry.glowItem);
@@ -3249,7 +3907,7 @@ void FiberMapWorkspace::refreshGapStatus()
     _freshStatus = _freshStatusBase + gapStatusSuffix();
     // Only the resting text is recomposed; a stale banner keeps the floor.
     if (_staleReason.isEmpty() && _latchedReason.isEmpty()) {
-        _statusLabel->setText(_freshStatus);
+        updateSelectionStatus();
     }
 }
 
@@ -3296,15 +3954,63 @@ void FiberMapWorkspace::updateGapLegend()
     }
 }
 
+bool FiberMapWorkspace::endpointAutoPending(uint64_t fiberId, int controlIndex) const
+{
+    const auto it = _endpointReviews.find(vc3d::fiber_map::EndpointKey{fiberId, controlIndex});
+    return it != _endpointReviews.end() && it->second.autoPending;
+}
+
+std::optional<FiberMapWorkspace::EndpointLook> FiberMapWorkspace::endpointLook(
+    uint64_t fiberId, int controlIndex) const
+{
+    // From the endpoint's review state over EVERY link (the layout keeps
+    // only the links it placed): the palette of the winning state (pending
+    // over approved; the orange same-H/V warning when the winning state has
+    // one; the automatic palette when every pending link is automatic), the
+    // triangle.
+    const auto it = _endpointReviews.find(vc3d::fiber_map::EndpointKey{fiberId, controlIndex});
+    if (it == _endpointReviews.end() || !it->second.linked) {
+        return std::nullopt;
+    }
+    const vc3d::fiber_map::EndpointReview& review = it->second;
+    const LinkPalette& palette = review.pending
+        ? (review.autoPending ? (review.sameHv ? kLinkSameTypeAuto : kLinkCrossAuto)
+                              : (review.sameHv ? kLinkSameTypePending : kLinkCrossPending))
+        : (review.sameHv ? kLinkSameType : kLinkCross);
+    EndpointLook look;
+    look.fill = palette.brush;
+    look.pen = palette.pen;
+    look.pending = review.pending;
+    look.automatic = review.autoPending;
+    look.anyAuto = review.anyAuto;
+    look.adjacent = review.adjacent;
+    return look;
+}
+
 void FiberMapWorkspace::setHighlightedFiber(uint64_t fiberId)
 {
-    if (_highlightedFiber == fiberId) {
+    cancelAutoLinkResume();
+    clearOperationStatus();
+    setSelectedFibers(fiberId != 0 ? std::vector<uint64_t>{fiberId} : std::vector<uint64_t>{});
+}
+
+void FiberMapWorkspace::setSelectedFibers(std::vector<uint64_t> fibers)
+{
+    // Only fibers on the map can be selected; order kept, at most two.
+    fibers.erase(std::remove_if(fibers.begin(), fibers.end(),
+                                [this](uint64_t id) { return !_entries.contains(id); }),
+                 fibers.end());
+    while (fibers.size() > 2) {
+        fibers.erase(fibers.begin());
+    }
+    if (fibers == _selectedFibers) {
         return;
     }
     // Restore the previous selection and its network's glow.
-    if (const auto previous = _entries.find(_highlightedFiber);
-        previous != _entries.end()) {
-        paintFiberEmphasis(*previous, FiberEmphasis::Plain);
+    for (const uint64_t previous : _selectedFibers) {
+        if (const auto entry = _entries.find(previous); entry != _entries.end()) {
+            paintFiberEmphasis(*entry, FiberEmphasis::Plain);
+        }
     }
     for (const uint64_t member : _networkEmphasized) {
         if (const auto entry = _entries.find(member); entry != _entries.end()) {
@@ -3313,63 +4019,108 @@ void FiberMapWorkspace::setHighlightedFiber(uint64_t fiberId)
     }
     _networkEmphasized.clear();
     clearControlPointDots();
-    _highlightedFiber = fiberId;
-
-    const auto entry = _entries.find(fiberId);
-    if (entry == _entries.end()) {
+    _selectedFibers = std::move(fibers);
+    _highlightedFiber = _selectedFibers.empty() ? 0 : _selectedFibers.back();
+    updateSelectionStatus();
+    if (_highlightedFiber == 0) {
         return;
     }
-    // The whole linked network glows; the selected fiber itself gets the
-    // full treatment instead.
-    if (entry->networkId >= 0) {
+    // The most recent fiber's whole linked network glows; every selected
+    // fiber itself gets the full treatment and its control dots.
+    if (const auto entry = _entries.find(_highlightedFiber);
+        entry != _entries.end() && entry->networkId >= 0) {
         for (auto other = _entries.begin(); other != _entries.end(); ++other) {
             if (other->networkId == entry->networkId &&
-                other.key() != fiberId) {
+                std::find(_selectedFibers.begin(), _selectedFibers.end(), other.key()) ==
+                    _selectedFibers.end()) {
                 paintFiberEmphasis(*other, FiberEmphasis::Network);
                 _networkEmphasized.push_back(other.key());
             }
         }
     }
-    paintFiberEmphasis(*entry, FiberEmphasis::Selected);
-    const FiberMapPalette& theme = activePalette();
+    for (const uint64_t fiberId : _selectedFibers) {
+        if (const auto entry = _entries.find(fiberId); entry != _entries.end()) {
+            paintFiberEmphasis(*entry, FiberEmphasis::Selected);
+            drawControlPointDots(fiberId);
+        }
+    }
+}
+
+void FiberMapWorkspace::updateSelectionStatus()
+{
+    // Two selected fibers are named in the status line (the fresh status
+    // only; a stale banner outranks the selection).
+    if (!_statusLabel || !_layoutBuilt || !_staleReason.isEmpty()) {
+        return;
+    }
+    _statusLabel->setStyleSheet(_freshStatusStyle);
+    if (_selectedFibers.size() == 2 && _controller) {
+        _statusLabel->setText(composeStatus(
+            tr("%1 · Selected: %2, %3")
+                .arg(_freshStatus, _controller->fiberDisplayName(_selectedFibers[0]),
+                     _controller->fiberDisplayName(_selectedFibers[1]))));
+    } else {
+        _statusLabel->setText(composeStatus(_freshStatus));
+    }
+}
+
+void FiberMapWorkspace::drawControlPointDots(uint64_t fiberId)
+{
+    const auto entry = _entries.constFind(fiberId);
+    if (entry == _entries.constEnd()) {
+        return;
+    }
+        const FiberMapPalette& theme = activePalette();
     const QColor color = fiberColor(entry->fiber.hvTag, theme);
     const double vxPerCm = sceneVxPerCm();
     // The selected fiber's dots cover the scene's kollesis markers, so a
     // tagged point keeps its look here: a hollow yellow ring when unlinked,
     // the link fill inside the yellow ring when linked.
-    const char selfTag = entry->fiber.hvTag;
-    const auto linkFillFor = [this, selfTag](uint64_t fiberId,
-                                             int controlIndex) -> std::optional<QColor> {
-        for (const vc3d::fiber_map::PlacedLink& link : _layout.links) {
-            const bool atA = link.fiberA == fiberId && link.cpA == controlIndex;
-            const bool atB = link.fiberB == fiberId && link.cpB == controlIndex;
-            if ((!atA && !atB) || link.suspect) {
-                continue;
-            }
-            const auto other = _entries.constFind(atA ? link.fiberB : link.fiberA);
-            const char otherTag = other == _entries.constEnd() ? '?' : other->fiber.hvTag;
-            return linkPalette(selfTag, otherTag, link.pending).brush;
-        }
-        return std::nullopt;
-    };
     for (std::size_t i = 0; i < entry->fiber.controlPoints.size(); ++i) {
         QBrush fill(color);
         QPen rim = cosmeticPen(theme.chipInk, 1.0);
         const bool kollesis =
             i < entry->fiber.kollesisTerminations.size() && entry->fiber.kollesisTerminations[i];
         const bool breakTag = !kollesis && i < entry->fiber.breaks.size() && entry->fiber.breaks[i];
+        // An unreviewed automatic link on this control: the automatic
+        // palette (automaticLinkMarker, the rule every renderer draws).
+        const auto look = endpointLook(fiberId, static_cast<int>(i));
+        const bool anyAuto = look && look->anyAuto;
+        const bool triangle = look && look->adjacent;
+        // The pre-existing rule for the tag fill of a selected point: the
+        // link's palette only through a placed, non-suspect link (a point
+        // linked only by suspect links, or only to unplaceable fibers,
+        // stays hollow); an automatic link fills it regardless.
+        bool placedNonSuspectLink = false;
+        for (const vc3d::fiber_map::PlacedLink& link : _layout.links) {
+            if (link.suspect) {
+                continue;
+            }
+            if ((link.fiberA == fiberId && link.cpA == static_cast<int>(i)) ||
+                (link.fiberB == fiberId && link.cpB == static_cast<int>(i))) {
+                placedNonSuspectLink = true;
+                break;
+            }
+        }
         if (kollesis || breakTag) {
-            if (const auto linkFill = linkFillFor(fiberId, static_cast<int>(i))) {
-                fill = QBrush(*linkFill);
+            if (look && (placedNonSuspectLink || anyAuto)) {
+                fill = QBrush(look->fill);
             } else {
                 fill = QBrush(Qt::NoBrush);
             }
             rim = kollesis ? cosmeticPen(kollesisColor(255), kKollesisRimWidthPx)
                            : dottedPen(breakColor(255), kKollesisRimWidthPx);
+        } else if (anyAuto && look) {
+            // An untagged endpoint with an automatic link: the look's palette
+            // (the automatic one when every pending link is automatic, the
+            // pending one for a mixed point), fill and outline.
+            fill = QBrush(look->fill);
+            rim = cosmeticPen(look->pen, 1.0);
         }
         auto* dot = new ScaledDot(fill, rim,
                                   kControlDotRadiusCm * vxPerCm, kMinControlDotPx,
-                                  kMaxControlDotPx, kControlDotBoundsCm * vxPerCm);
+                                  kMaxControlDotPx, kControlDotBoundsCm * vxPerCm,
+                                  /*triangle=*/triangle);
         _scene->addItem(dot);
         dot->setPos(entry->fiber.controlPoints[i]);
         dot->setZValue(kHighlightZ + 1.0);
@@ -3381,17 +4132,43 @@ void FiberMapWorkspace::setHighlightedFiber(uint64_t fiberId)
 
 void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QPoint& globalPos)
 {
-    // The menu acts on the selected fiber only, and only when the click lands
+    // The menu acts on a selected fiber only, and only when the click lands
     // on it - its line or one of its control dots. Selecting by left click
     // first is what says, unambiguously, which fiber "Delete" means; a
-    // ctrl+right-click elsewhere does nothing rather than guess.
-    if (_highlightedFiber == 0 || !_controller) {
+    // ctrl+right-click elsewhere does nothing rather than guess. With two
+    // fibers selected the one under the click is the subject.
+    if (_selectedFibers.empty() || !_controller) {
         return;
     }
     if (refreshStaleState()) {
         return;
     }
-    const uint64_t fiberId = _highlightedFiber;
+    const double subjectTolerance = sceneTolerance(kControlDotTolerancePx);
+    const auto landsOn = [this, &scenePos, subjectTolerance](uint64_t candidate) {
+        if (fiberAt(scenePos) == candidate) {
+            return true;
+        }
+        for (QGraphicsItem* dot : _controlPointDots) {
+            if (dot->data(0).toULongLong() != candidate) {
+                continue;
+            }
+            const QPointF delta = scenePos - dot->pos();
+            if (std::sqrt(QPointF::dotProduct(delta, delta)) <= subjectTolerance) {
+                return true;
+            }
+        }
+        return false;
+    };
+    uint64_t fiberId = 0;
+    for (auto it = _selectedFibers.rbegin(); it != _selectedFibers.rend(); ++it) {
+        if (landsOn(*it)) {
+            fiberId = *it;
+            break;
+        }
+    }
+    if (fiberId == 0) {
+        return;
+    }
     const auto entry = _entries.constFind(fiberId);
     if (entry == _entries.constEnd()) {
         return;
@@ -3408,6 +4185,9 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
     int bestIndex = -1;
     double bestDistance = tolerance;
     for (QGraphicsItem* dot : _controlPointDots) {
+        if (dot->data(0).toULongLong() != fiberId) {
+            continue;
+        }
         const QPointF delta = scenePos - dot->pos();
         const double distance = std::sqrt(QPointF::dotProduct(delta, delta));
         if (distance <= bestDistance) {
@@ -3485,8 +4265,30 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
             });
         menu.addSeparator();
     }
+    if (_selectedFibers.size() == 2) {
+        // "Link <subject> and <other>": the automatic link at the fibers'
+        // closest pass near where they meet on the map, deferred out of the
+        // menu's nested loop like the delete (it finalizes sessions, runs
+        // solves and bumps the generation).
+        const uint64_t otherId = _selectedFibers[0] == fiberId ? _selectedFibers[1]
+                                                               : _selectedFibers[0];
+        const QString otherName = _controller->fiberDisplayName(otherId);
+        QAction* linkAction = menu.addAction(tr("Link %1 and %2").arg(displayName, otherName));
+        linkAction->setEnabled(!_deleteInFlight && !_autoLinkInFlight);
+        const QPointF clickScene = scenePos;
+        connect(linkAction, &QAction::triggered, this,
+                [this, fiberId, otherId, clickScene, menuDependencies]() {
+                    QMetaObject::invokeMethod(
+                        this,
+                        [this, fiberId, otherId, clickScene, menuDependencies]() {
+                            startAutoLink(fiberId, otherId, clickScene, menuDependencies);
+                        },
+                        Qt::QueuedConnection);
+                });
+        menu.addSeparator();
+    }
     QAction* deleteAction = menu.addAction(tr("Delete %1…").arg(displayName));
-    deleteAction->setEnabled(!_deleteInFlight);
+    deleteAction->setEnabled(!_deleteInFlight && !_autoLinkInFlight);
     connect(deleteAction, &QAction::triggered, this,
             [this, fiberId, fileName, displayName, menuDependencies]() {
                 // Deferred past menu.exec()'s nested loop: the confirmation
@@ -3501,6 +4303,313 @@ void FiberMapWorkspace::handleControlPointMenu(const QPointF& scenePos, const QP
                     Qt::QueuedConnection);
             });
     menu.exec(globalPos);
+}
+
+bool FiberMapWorkspace::sameDrawnFiber(const vc3d::fiber_map::PlacedFiber& a,
+                                       const vc3d::fiber_map::PlacedFiber& b)
+{
+    if (a.id != b.id || a.fileName != b.fileName || a.runs.size() != b.runs.size() ||
+        a.controlPoints != b.controlPoints) {
+        return false;
+    }
+    for (std::size_t i = 0; i < a.runs.size(); ++i) {
+        const vc3d::fiber_map::Run& ra = a.runs[i];
+        const vc3d::fiber_map::Run& rb = b.runs[i];
+        if (ra.traced != rb.traced || ra.gap != rb.gap || ra.damaged != rb.damaged ||
+            ra.firstControl != rb.firstControl || ra.lastControl != rb.lastControl ||
+            ra.points != rb.points || ra.arclengths != rb.arclengths) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void FiberMapWorkspace::resumeAutoLinkAfterPublish()
+{
+    if (!_autoLinkResume || !_layoutBuilt || !_controller || _autoLinkInFlight ||
+        _deleteInFlight) {
+        return;
+    }
+    // Only a layout that is fresh against the dependencies of this moment
+    // can be linked on: a publication that landed inside phase B followed by
+    // another change (the umbilicus file, a setting) leaves _entries stale
+    // while the next automatic Update is still to come. The request stays
+    // and this runs again from that publication.
+    const vc3d::fiber_map::FiberMapDependencies dependencies = layoutDependencies();
+    if (vc3d::fiber_map::staleVerdictFor(dependencies, currentDependencies(),
+                                         /*layoutBuilt=*/true, QString())
+            .action != StaleVerdict::Action::Fresh) {
+        return;
+    }
+    const AutoLinkResume resume = std::move(*_autoLinkResume);
+    _autoLinkResume.reset();
+    const auto subject = _entries.constFind(resume.subjectId);
+    const auto other = _entries.constFind(resume.otherId);
+    if (subject == _entries.constEnd() || other == _entries.constEnd() ||
+        !sameDrawnFiber(subject->fiber, resume.subject) ||
+        !sameDrawnFiber(other->fiber, resume.other)) {
+        // The saved work moved one of the fibers on the map: the click no
+        // longer names a meeting on it.
+        setOperationStatus(tr("Saved the open line annotation; the rebuilt map draws the "
+                              "fibers differently — choose Link again"));
+        Logger()->warn("Fiber map auto-link: the rebuilt map draws the fibers differently; "
+                       "not resumed");
+        return;
+    }
+    // Deferred exactly like the menu's trigger, against the dependencies the
+    // published layout was built from (phase A's capture): the resumed
+    // start re-verifies them against the current ones first.
+    const QPointer<FiberMapWorkspace> self(this);
+    const uint64_t token = _autoLinkResumeToken;
+    _autoLinkResumeQueued = true;
+    QMetaObject::invokeMethod(
+        this,
+        [self, resume, dependencies, token]() {
+            if (!self) {
+                return;
+            }
+            self->_autoLinkResumeQueued = false;
+            if (self->_autoLinkResumeToken != token) {
+                // Cancelled between the publication and this callback (the
+                // cancellation cleared the promise).
+                return;
+            }
+            Logger()->info("Fiber map auto-link: resumed after the map update");
+            self->startAutoLink(resume.subjectId, resume.otherId, resume.scenePos, dependencies);
+        },
+        Qt::QueuedConnection);
+}
+
+void FiberMapWorkspace::cancelAutoLinkResume()
+{
+    const bool promised = _autoLinkResume.has_value() || _autoLinkResumeQueued;
+    _autoLinkResume.reset();
+    _autoLinkResumeQueued = false;
+    ++_autoLinkResumeToken;
+    if (promised) {
+        // The line promised the link would continue by itself; it will not.
+        clearOperationStatus();
+    }
+}
+
+void FiberMapWorkspace::startAutoLink(uint64_t subjectId, uint64_t otherId, QPointF scenePos,
+                                      const vc3d::fiber_map::FiberMapDependencies& menuDependencies)
+{
+    // Three phases on one queued callback, every one guarded:
+    //  B. the controller finalizes, saves and closes every live session of
+    //     the two fibers (only those) and drains the saves; if that moved
+    //     the fiber generation the map is stale and the automatic Update is
+    //     armed - the request is kept (_autoLinkResume) and run again from
+    //     publishRebuild when the rebuilt map draws both fibers as the click
+    //     saw them, else the user chooses Link again (the pair stays
+    //     selected);
+    //  C. the meeting of the two DRAWN fibers nearest the click, inverted
+    //     exactly to a position on each fiber's stored line points;
+    //  D. the controller's auto-link (closest 3D pass, control points,
+    //     span re-optimizations, the pending automatic link).
+    // The workspace and the controller may both go away inside the yields:
+    // nothing of either is touched afterwards without the QPointer checks.
+    if (!_controller || _autoLinkInFlight || _deleteInFlight) {
+        return;
+    }
+    // A new attempt supersedes the last one's message and any waiting resume.
+    cancelAutoLinkResume();
+    clearOperationStatus();
+    // The request's token: a click or a row chosen inside phase B's drains
+    // bumps it, and that is this request cancelled - nothing is stored or
+    // continued after preparation then.
+    const uint64_t requestToken = _autoLinkResumeToken;
+    const QPointer<FiberMapWorkspace> self(this);
+    const QPointer<LineAnnotationController> controller(_controller);
+    const auto fresh = [self, menuDependencies]() {
+        if (!self) {
+            return false;
+        }
+        return vc3d::fiber_map::staleVerdictFor(menuDependencies, self->currentDependencies(),
+                                                /*layoutBuilt=*/true, QString())
+                   .action == StaleVerdict::Action::Fresh;
+    };
+    const auto bail = [self](const QString& reason) {
+        if (!self) {
+            return;
+        }
+        // Kept in front of whatever the line's floor becomes (the stale
+        // banner, the rebuilt map's summary) until the next user action.
+        self->setOperationStatus(reason);
+        Logger()->warn("Fiber map auto-link: {}", reason.toStdString());
+    };
+    // Phase A's capture is re-verified now, exactly as the deferred delete does.
+    if (!fresh()) {
+        refreshStaleState();
+        Logger()->warn("Fiber map: dependencies changed before the auto-link started");
+        return;
+    }
+    std::string subjectFile;
+    std::string otherFile;
+    if (const auto entry = _entries.constFind(subjectId); entry != _entries.constEnd()) {
+        subjectFile = entry->fiber.fileName;
+    }
+    if (const auto entry = _entries.constFind(otherId); entry != _entries.constEnd()) {
+        otherFile = entry->fiber.fileName;
+    }
+    if (subjectFile.empty() || otherFile.empty() ||
+        !_controller->hasLoadedFiber(subjectId, subjectFile) ||
+        !_controller->hasLoadedFiber(otherId, otherFile)) {
+        markStale(tr("Fibers changed — press Update"));
+        return;
+    }
+    // The geometry the click was made on, by value, before phase B's yields
+    // (a publication can land inside them): what a resume compares against.
+    const vc3d::fiber_map::PlacedFiber subjectAtClick = _entries.constFind(subjectId)->fiber;
+    const vc3d::fiber_map::PlacedFiber otherAtClick = _entries.constFind(otherId)->fiber;
+    _autoLinkInFlight = true;
+    QGuiApplication::setOverrideCursor(Qt::WaitCursor);
+    // Whatever path leaves this function, the flag and the cursor are
+    // restored (a controller exception included - it is reported, not
+    // propagated into the event loop).
+    const auto cleanup = qScopeGuard([self]() {
+        if (self) {
+            self->_autoLinkInFlight = false;
+        }
+        QGuiApplication::restoreOverrideCursor();
+    });
+
+    // Phase B.
+    LineAnnotationController::FiberMapAutoLinkOutcome prepared;
+    try {
+        prepared = controller->prepareFiberMapAutoLink(subjectId, subjectFile, otherId, otherFile);
+    } catch (const std::exception& ex) {
+        prepared.ok = false;
+        prepared.message = tr("Could not prepare the link: %1").arg(QString::fromUtf8(ex.what()));
+    }
+    if (!self || !controller) {
+        if (self) {
+            bail(tr("The annotation controller went away."));
+        }
+        return;
+    }
+    if (!prepared.ok) {
+        bail(prepared.message);
+        return;
+    }
+    if (_autoLinkResumeToken != requestToken) {
+        bail(tr("The link was cancelled by the click on the map"));
+        refreshStaleState();
+        return;
+    }
+    if (!fresh()) {
+        // A session of one of the fibers was saved: the map must be rebuilt
+        // before a meeting can be located on it. The automatic Update is
+        // already armed by the generation bump and the selection restore
+        // keeps the pair; the request itself waits for the publication
+        // (resumeAutoLinkAfterPublish), which runs it again when both
+        // fibers still draw as they did under the click. A publication
+        // that already landed inside phase B's yields is taken up now.
+        _autoLinkResume = AutoLinkResume{subjectId, otherId, scenePos, subjectAtClick, otherAtClick};
+        bail(tr("Saved the open line annotation; the map is updating and the link continues by itself"));
+        refreshStaleState();
+        if (!self) {
+            return;
+        }
+        if (_layoutBuilt &&
+            vc3d::fiber_map::staleVerdictFor(layoutDependencies(), currentDependencies(),
+                                             /*layoutBuilt=*/true, QString())
+                    .action == StaleVerdict::Action::Fresh) {
+            // Queued: this operation is still in flight here (the scope guard
+            // releases _autoLinkInFlight on return), and the helper refuses
+            // while it is.
+            QMetaObject::invokeMethod(
+                this, [self]() {
+                    if (self) {
+                        self->resumeAutoLinkAfterPublish();
+                    }
+                },
+                Qt::QueuedConnection);
+        }
+        return;
+    }
+
+    // Phase C: the locator on the current map geometry.
+    const auto subjectEntry = _entries.constFind(subjectId);
+    const auto otherEntry = _entries.constFind(otherId);
+    if (subjectEntry == _entries.constEnd() || otherEntry == _entries.constEnd()) {
+        bail(tr("Fibers changed — press Update"));
+        return;
+    }
+    const double maxApproachVx = 0.1 * sceneVxPerCm();  // 1 mm on the map
+    const auto meeting = vc3d::fiber_map::autolink::findMapMeeting(
+        subjectEntry->fiber, otherEntry->fiber, scenePos, maxApproachVx);
+    if (!meeting) {
+        bail(tr("%1 and %2 neither cross nor come within 1 mm of each other on the map")
+                 .arg(_controller->fiberDisplayName(subjectId),
+                      _controller->fiberDisplayName(otherId)));
+        return;
+    }
+    const auto sourcePosition = [this, controller](uint64_t fiberId, const std::string& fileName,
+                                                   const vc3d::fiber_map::PlacedFiber& placed,
+                                                   double arclength) -> std::optional<double> {
+        const std::vector<cv::Vec3d>* linePoints = controller->storedFiberLinePoints(fiberId, fileName);
+        if (!linePoints || linePoints->empty()) {
+            return std::nullopt;
+        }
+        const std::vector<double> raw = vc3d::fiber_map::unrolledLineArclengths(
+            *linePoints, _layoutUmbilicusCenters, placed.thetaScale, placed.offsetRad,
+            _layout.rRefVx);
+        return vc3d::fiber_map::autolink::sourcePositionAtArclength(raw, arclength);
+    };
+    const auto positionA = sourcePosition(subjectId, subjectFile, subjectEntry->fiber,
+                                          meeting->a.arclength);
+    const auto positionB = sourcePosition(otherId, otherFile, otherEntry->fiber,
+                                          meeting->b.arclength);
+    if (!positionA || !positionB) {
+        bail(tr("Fibers changed — press Update"));
+        return;
+    }
+
+    // Phase D.
+    LineAnnotationController::FiberMapAutoLinkEndpoint endpointA;
+    endpointA.fiberId = subjectId;
+    endpointA.fileName = subjectFile;
+    endpointA.linePosition = *positionA;
+    LineAnnotationController::FiberMapAutoLinkEndpoint endpointB;
+    endpointB.fiberId = otherId;
+    endpointB.fileName = otherFile;
+    endpointB.linePosition = *positionB;
+    const uint64_t mapGeneration = _layoutGeneration;
+    const auto mapStillFresh = [self, menuDependencies, mapGeneration]() {
+        if (!self) {
+            return false;
+        }
+        vc3d::fiber_map::FiberMapDependencies current = self->currentDependencies();
+        // The fiber generation is the controller's own guard (only this
+        // operation's saves may advance it); everything else must hold.
+        current.fiberGeneration = menuDependencies.fiberGeneration;
+        return vc3d::fiber_map::staleVerdictFor(menuDependencies, current, true, QString())
+                   .action == StaleVerdict::Action::Fresh;
+    };
+    LineAnnotationController::FiberMapAutoLinkOutcome outcome;
+    try {
+        outcome = controller->autoLinkFibers(endpointA, endpointB, mapGeneration, mapStillFresh,
+                                             LineAnnotationController::FiberMapAutoLinkParams{});
+    } catch (const std::exception& ex) {
+        outcome.ok = false;
+        outcome.message = tr("Linking failed: %1").arg(QString::fromUtf8(ex.what()));
+    }
+    if (!self) {
+        return;
+    }
+    // The outcome (a refusal, a retained-control explanation after a partial
+    // failure, the success summary) outlives the stale gate below and the
+    // automatic Update it arms: composeStatus() keeps it in front of both.
+    setOperationStatus(outcome.message);
+    if (outcome.ok) {
+        Logger()->info("Fiber map auto-link: {}", outcome.message.toStdString());
+    } else {
+        Logger()->warn("Fiber map auto-link refused: {}", outcome.message.toStdString());
+    }
+    // The link (and any placement) bumped the fiber generation: the stale
+    // gate arms the automatic Update, which redraws the map with the link.
+    refreshStaleState();
 }
 
 void FiberMapWorkspace::handleTreeContextMenu(const QPoint& pos)
@@ -3588,11 +4697,13 @@ void FiberMapWorkspace::confirmAndDeleteFiber(
     // saves in a nested loop that processes input, so without this a second
     // confirmation of the same fiber could start a second delete that, once
     // the first had removed the file, fell back to an unrelated one.
-    if (_deleteInFlight) {
+    if (_deleteInFlight || _autoLinkInFlight) {
         Logger()->warn("Fiber map: a delete is already pending; ignoring {}", fileName);
         return;
     }
     _deleteInFlight = true;
+    cancelAutoLinkResume();
+    clearOperationStatus();
     // The confirmation is modeless (open(), not exec()): a nested loop with a
     // parented dialog would be undefined if the workspace were torn down
     // meanwhile, whereas this dialog simply dies with its parent and the

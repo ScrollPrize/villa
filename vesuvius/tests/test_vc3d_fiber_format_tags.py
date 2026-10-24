@@ -111,3 +111,14 @@ def test_version_4_span_tags():
     bad['control_points'][1]['segment_to_next']['tags'] = 'gap'
     with pytest.raises(ValueError):
         parse_vc3d_fiber_format(bad)
+
+
+@pytest.mark.parametrize('version', [3, 4])
+def test_fiber_uuid_validation_preserved_across_format_versions(version):
+    doc = _v3_fiber()
+    doc['version'] = version
+    doc['uuid'] = '0f8fad5b-d9cb-469f-a165-70867728950e'
+    assert len(parse_vc3d_fiber_format(doc).control_points_xyz) == 4
+    doc['uuid'] = 'fiber-directory-name'
+    with pytest.raises(ValueError, match='invalid uuid'):
+        parse_vc3d_fiber_format(doc)

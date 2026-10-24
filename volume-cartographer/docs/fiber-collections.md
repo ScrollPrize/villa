@@ -40,13 +40,15 @@ or use **File → Open Automated Fiber Volume…**. The dock is under
   fiber annotation, segmentation editing or line placement keep their native
   behavior, and drags are never treated as picks. The slider follows every
   stored point of the selected fiber.
-* **Line Annotation.** **Open in Line Annotation** copies only the selected
-  fiber into the project's editable annotations and fits it in both strips;
-  opening it again reuses that copy. The `.afv` itself is never modified. If
-  the project has no Lasagna dataset, the cuts follow a frame transported
-  along the curve instead of measured sheet normals, and a notice says so.
-  This frame is used for display only; tracing and optimization still require
-  a dataset.
+* **Line Annotation.** **Open in Line Annotation** shows the selected fiber
+  read-only in a Line Annotation window titled "· read only": it is not added
+  to the project's annotations, no file is written, and it is never optimized.
+  Its editing, linking and optimization requests are disabled, the window
+  closes without finalization, and the fiber is forgotten when it closes.
+  Opening the same fiber again while its window is open brings that window
+  back. The `.afv` itself is never modified. If the project has no Lasagna
+  dataset, the cuts follow a frame transported along the curve instead of
+  measured sheet normals, and a notice says so.
 * **Limits.** The overlay is drawn on planar CT views, axis-aligned or oblique.
   Each viewport retains at most 8 MiB of visible geometry and shows
   **Partial fiber view** beyond that; zoom in or raise the minimum length.

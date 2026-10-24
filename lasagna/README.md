@@ -27,7 +27,8 @@ Verify the selected PyTorch build and GPU access:
 python -c 'import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())'
 ```
 
-The install exposes these commands:
+The install exposes these commands, including the native Fiberlet processor
+packaged by the sibling Volume Cartographer Python distribution:
 
 ```bash
 lasagna-fit-service --help
@@ -37,6 +38,7 @@ lasagna-preprocess --help
 lasagna-preprocess integrate --help
 lasagna-preprocess predict3d --help
 las_manager --help
+vc_fiberlets --help
 ```
 
 The bootstrap installs Lasagna with `-e`, so changes in this checkout are
@@ -56,15 +58,22 @@ ${EDITOR:-vi} "${XDG_CONFIG_HOME:-$HOME/.config}/las_manager/config.toml"
 las_manager fetch
 las_manager volume ls --sample PHerc0332
 las_manager snapshot ls
+las_manager snapshot import /path/to/RUN/snapshots/best.pt --model-identifier OWNER/REPOSITORY
 las_manager volume prefetch <volume> 1 --workers 512
-las_manager inference run <snapshot> <volume> 1 -- --devices all
+las_manager inference run <snapshot> <volume> [scale]
+las_manager las-inference <snapshot> <volume> [scale]
+las_manager fiber-inference <snapshot> <volume> [scale]
 las_manager inference ls
+las_manager fiberlet run <completed-fiber-inference>
 ```
 
-Fresh configs include shared inference defaults equivalent to
-`--tile-size 512 --border 32 --overlap 96 --devices all` in the `params` token
-array. Edit that array globally or append arguments after `--` for a single-run
-override.
+Fresh configs use `params` for Fiber inference defaults. Regular Lasagna uses
+its checkpoint and CLI defaults, with `--devices all` supplied by the separate
+`lasagna_params` array. The snapshot and volume remain required, while the
+input scale defaults to OME-Zarr group 2. `las-inference` and
+`fiber-inference` are backend-forcing aliases for `inference run`; all three
+share the same launch path. Arguments after `--` remain available for
+deliberate per-run overrides.
 
 `inference run` returns as soon as its run directory and detached tmux session
 are created. The tmux workflow performs automatic prefetch first and inference
@@ -73,13 +82,46 @@ printed run directory's `run.log`. Passing `--no-prefetch` writes only the
 source descriptor and lets the inference backend download missing chunks on
 demand for its crop; this download belongs to the inference lifecycle.
 
+### Cooperative full-volume GPUs
+
+`las_manager` inference jobs automatically use the local cooperative GPU manager
+(`incremental_release` capability required). Prefetch does not reserve GPUs.
+The GPU phase uses one tile per forward pass and varies the **number of GPUs**,
+not batch size or tile geometry. `--devices` limits the eligible devices; it is
+not itself a reservation. CUDA ordinals are resolved to UUIDs before requesting
+resources. An older manager fails capability negotiation; it is never bypassed
+or restarted behind existing clients' backs.
+
+CPU readers, caches, bounded queues, accumulators and output state persist when
+the allocation changes. Removed GPU workers finish submitted tiles, return their
+results and exit before release is acknowledged. Retained workers stay loaded;
+only newly granted GPUs load a model. Full pause unloads all GPU workers; work
+continues automatically after a new grant. Pyramid generation runs after GPU
+workers have exited and release has been reported. A manager restart still
+requires a GPU-only drain; the CPU pipeline remains intact. Communication errors
+are logged and stop new tile admission, drain GPU workers and retry every five
+seconds. No full-volume rescan is needed for these transitions.
+
+Until a one-tile peak is measured, the conservative default requests a full
+selected GPU's memory (the largest selected capacity on heterogeneous hosts).
+To share GPUs, pass a **measured budget including CUDA overhead and reserve**
+through `LASAGNA_GPU_MEMORY_GIB`, for example `46` only if that budget has been
+verified for the chosen model/tile size. `LASAGNA_GPU_PRIORITY` defaults to `0`;
+`VILLA_GPU_MANAGER_SOCKET` optionally selects a socket. These variables are
+inherited by the inference runner. The worker limits Torch's allocator to the
+grant minus 1 GiB reserved for non-allocator CUDA use; this is not a memory
+calibration and an undersized user budget may still fail with OOM. Normalization
+calibration must be performed separately, not inside cooperative inference.
+Direct API/CLI callers can opt into the same behavior with `LASAGNA_COOPERATIVE=1`;
+the manager launcher always sets it for volume inference, not Fiberlet jobs.
+
 Current Fiber checkpoints carry their authoritative inference config, so no
 separate config argument is needed. Direct inference uses the same rule:
 
 ```bash
 python -m vesuvius.neural_tracing.fiber_trace_3d.infer \
   --input /path/to/volume.ome.zarr/1 \
-  --output /path/to/artifacts/fiber.lasagna.json \
+  --output /path/to/artifacts/fiber.zarr \
   --checkpoint /path/to/snapshots/best.pt
 ```
 
@@ -96,8 +138,19 @@ las_manager inference run lasagna/<run>/<checkpoint.pt> <volume> 1 -- --devices 
 ```
 
 The manager dispatches these to `preprocess_cos_omezarr predict3d`; both direct
-and managed Lasagna inference write portable provenance and remain compatible
-with the existing Atlas `lasagna` artifact type.
+and managed Lasagna inference write portable provenance.
+
+New Fiber and Lasagna outputs default to the [compact schema v3](docs/volume_schema_v3.md):
+one Zarr store, an embedded manifest, and resolution-based full-channel chunks.
+Existing sidecar outputs remain resumable. Fiber additionally defaults to
+blanking auxiliary channels at zero presence and rounding/clamping width to
+uint8 base-volume voxels; `--no-blank-invalid` and `--no-width-uint8-base`
+disable those changes independently.
+
+Atlas/catalogue publication and manager Fiberlet discovery still require
+legacy output until their v3 integration is available. For those workflows,
+append `-- --output-format legacy` to the manager command. Direct inference
+uses `--output-format legacy --output /path/to/fiber.lasagna.json`.
 
 Commands and subcommands accept unique prefixes, so `las_manager sn l` is the
 same as `las_manager snapshot ls`. Install path-aware Bash completion once with
@@ -108,11 +161,19 @@ Cached volumes, snapshots, runs, option values, and locally known OME scale
 indices are completed contextually. A final `help` token shows help for the
 longest recognized command prefix, for example `las_manager vol pre help`.
 
+Managed Fiberlet preprocessing automatically resolves compatible published
+regular Lasagna normals from the open-data catalogue and caches their manifest
+and on-demand chunks under the configured manager cache. See
+[`docs/manager.md`](docs/manager.md#whole-volume-fiberlet-jobs) for explicit
+Atlas/local normal overrides and compatibility rules.
+
 This installation currently expects the `villa` monorepo layout: Lasagna
-packages the sibling `vesuvius/src` implementation and installs its declared
-model dependencies. It deliberately does not build Volume Cartographer, which
-is not needed for preprocessing. Copying only the `lasagna/` directory is
-therefore not yet a supported standalone installation.
+packages the sibling `vesuvius/src` implementation, installs its declared
+model dependencies, and installs the sibling Volume Cartographer Python
+distribution with its `vc_fiberlets` command. Copying only the `lasagna/`
+directory is therefore not yet a supported standalone installation. On Linux,
+the bootstrap selects an available GCC 13 or newer for that C++23 build unless
+`CC` or `CXX` is already set.
 
 ### Batch-download the PHerc scale-0 volumes
 
@@ -244,7 +305,7 @@ Notes:
 
 - `x/y` are written in **original pixel units** by multiplying by `--downscale` (default 4.0).
 - `--offset x y z` adds a global translation in original pixel/voxel units (for crop & z-start alignment).
-- `meta.json` contains required `uuid` (dirname) and `type="seg"`.
+- `meta.json` contains required `uuid` (a fresh random UUID per output surface, never derived from the dirname) and `type="seg"`.
 
 
 ## Exporting PLY (one per winding)

@@ -6,7 +6,7 @@
 namespace vc {
 
 struct ResolvedUrl {
-    std::string httpsUrl;      // resolved HTTPS URL
+    std::string httpsUrl;      // resolved transport URL (legacy field name; also SFTP)
     std::string awsRegion;     // empty if not S3
     bool useAwsSigv4 = false;  // true if s3:// and credentials detected
 };
@@ -15,6 +15,7 @@ struct ResolvedUrl {
 // Supports s3://bucket/key (defaults to us-east-1) and
 // s3+REGION://bucket/key (explicit region).
 // Passes through http:// and https:// URLs unchanged.
+// Validates sftp:// URLs and canonicalizes ssh:// aliases to sftp://.
 ResolvedUrl resolveRemoteUrl(const std::string& input);
 
 inline constexpr int kMaxRemoteVolumeBaseScale = 5;

@@ -1,4 +1,5 @@
 #include "utils/http_fetch.hpp"
+#include "utils/sftp_fetch.hpp"
 
 #if UTILS_HAS_CURL
 
@@ -452,6 +453,7 @@ HttpClient::ScopedDownloadObserver::~ScopedDownloadObserver()
 // ---------------------------------------------------------------------------
 
 HttpResponse HttpClient::get(std::string_view url) const {
+    if (is_sftp_url(url)) return fetch_sftp(config_, url, false, {}, thread_download_observer());
     return perform(config_, url, Method::GET, {}, {});
 }
 
@@ -460,23 +462,27 @@ HttpResponse HttpClient::get_range(std::string_view url,
     if (length == 0) {
         return HttpResponse{};
     }
+    if (is_sftp_url(url)) return fetch_sftp(config_, url, false, std::pair{offset, length}, thread_download_observer());
     auto range = std::to_string(offset) + "-" + std::to_string(offset + length - 1);
     return perform(config_, url, Method::GET_RANGE, {}, {}, range);
 }
 
 HttpResponse HttpClient::head(std::string_view url) const {
+    if (is_sftp_url(url)) return fetch_sftp(config_, url, true, {}, {});
     return perform(config_, url, Method::HEAD, {}, {});
 }
 
 HttpResponse HttpClient::put(std::string_view url,
                              std::span<const std::byte> data,
                              std::string_view content_type) const {
+    if (is_sftp_url(url)) throw std::invalid_argument("SFTP access is read-only");
     return perform(config_, url, Method::PUT, data, content_type);
 }
 
 HttpResponse HttpClient::put_file(std::string_view url,
                                   const std::filesystem::path& file_path,
                                   std::string_view content_type) const {
+    if (is_sftp_url(url)) throw std::invalid_argument("SFTP access is read-only");
     auto resolved = resolve_url(url);
 
     // path::c_str() is wchar_t* on Windows; _wfopen takes it directly.

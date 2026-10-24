@@ -1,5 +1,6 @@
 #include "elements/SpiralConfigProfileEditor.hpp"
 
+#include "SpiralDescriptions.hpp"
 #include "VCSettings.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
 
@@ -493,6 +494,10 @@ void SpiralConfigProfileEditor::rebuildControls()
             const QString impactText = impactLabel(
                 spec.value(QStringLiteral("runtime_impact")).toString());
             const QString type = spec.value(QStringLiteral("type")).toString();
+            // The description comes from spiral-fitting's descriptions.json by
+            // way of the service catalog; the key stays visible beneath it.
+            const QString toolTip = vc3d::spiral::descriptionToolTip(
+                spec.value(QStringLiteral("description")).toString(), key);
             QWidget* editor = nullptr;
             if (type == QStringLiteral("boolean")) {
                 auto* value = new QCheckBox(group);
@@ -537,7 +542,7 @@ void SpiralConfigProfileEditor::rebuildControls()
             editor->setObjectName(
                 QStringLiteral("spiralConfigEditor_%1").arg(key));
             editor->setProperty("spiralConfigKey", key);
-            editor->setToolTip(key);
+            editor->setToolTip(toolTip);
             QWidget* displayed = editor;
             if (spec.value(QStringLiteral("nullable")).toBool()) {
                 displayed = new QWidget(group);
@@ -560,13 +565,14 @@ void SpiralConfigProfileEditor::rebuildControls()
             rowWidget->setObjectName(
                 QStringLiteral("spiralConfigRow_%1").arg(key));
             rowWidget->setProperty("spiralConfigKey", key);
+            rowWidget->setToolTip(toolTip);
             auto* row = new QGridLayout(rowWidget);
             row->setContentsMargins(0, 0, 0, 0);
             row->setHorizontalSpacing(8);
             auto* label = new QLabel(labelText, rowWidget);
             label->setObjectName(
                 QStringLiteral("spiralConfigLabel_%1").arg(key));
-            label->setToolTip(key);
+            label->setToolTip(toolTip);
             auto* impact = new QLabel(impactText, rowWidget);
             impact->setObjectName(
                 QStringLiteral("spiralConfigImpact_%1").arg(key));

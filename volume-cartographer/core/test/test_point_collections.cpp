@@ -5,6 +5,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/PointCollections.hpp"
+#include "vc/core/util/Uuid.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -179,6 +180,7 @@ TEST_CASE("segment-path round-trip (anchored collections only)")
     c.addPoint("anchored", {1, 2, 3});
     c.addPoint("plain", {4, 5, 6});
     const uint64_t anchored = c.getCollectionId("anchored").value();
+    const std::string anchoredUuid = c.getAllCollections().at(anchored).uuid;
     c.setCollectionAnchor2d(anchored, cv::Vec2f(8, 9));
     REQUIRE(c.saveToSegmentPath(dir));
     CHECK(fs::exists(dir / "corrections.json"));
@@ -188,7 +190,10 @@ TEST_CASE("segment-path round-trip (anchored collections only)")
     // Only the anchored collection is persisted.
     bool has_anchored = false, has_plain = false;
     for (const auto& [id, col] : loaded.getAllCollections()) {
-        if (col.name == "anchored") has_anchored = true;
+        if (col.name == "anchored") {
+            has_anchored = true;
+            CHECK(col.uuid == anchoredUuid);
+        }
         if (col.name == "plain") has_plain = true;
     }
     CHECK(has_anchored);
@@ -204,6 +209,9 @@ TEST_CASE("JSON round-trip preserves data")
     c.addPoint("alpha", {4, 5, 6});
     c.addPoint("beta", {7, 8, 9});
     const uint64_t alpha = c.getCollectionId("alpha").value();
+    const std::string alphaUuid = c.getAllCollections().at(alpha).uuid;
+    CHECK(vc::util::isUuid(alphaUuid));
+    CHECK(c.getAllCollections().at(c.getCollectionId("beta").value()).uuid != alphaUuid);
     c.setCollectionColor(alpha, {0.1f, 0.2f, 0.3f});
     c.setCollectionTag(alpha, "kind", "correction");
 
@@ -218,9 +226,12 @@ TEST_CASE("JSON round-trip preserves data")
     CHECK(loaded.getAllCollections().size() == c.getAllCollections().size());
     const uint64_t la = loaded.getCollectionId("alpha").value();
     CHECK(la != 0);
+    CHECK(loaded.getAllCollections().at(la).uuid == alphaUuid);
     CHECK(loaded.getPoints("alpha").size() == 2);
     CHECK(loaded.getPoints("beta").size() == 1);
     CHECK(loaded.getCollectionTag(la, "kind") == std::optional<std::string>("correction"));
+    loaded.renameCollection(la, "renamed");
+    CHECK(loaded.getAllCollections().at(la).uuid == alphaUuid);
 }
 
 TEST_CASE("zero and duplicate point ids retain collection-local identity")
@@ -364,6 +375,12 @@ TEST_CASE("old point JSON defaults links and fiber direction")
 
     PointCollections loaded;
     REQUIRE(loaded.loadFromJSON(tmp.string()));
+    const std::string uuid = loaded.getAllCollections().begin()->second.uuid;
+    CHECK(vc::util::isUuid(uuid));
+    REQUIRE(loaded.saveToJSON(tmp.string()));
+    PointCollections reloaded;
+    REQUIRE(reloaded.loadFromJSON(tmp.string()));
+    CHECK(reloaded.getAllCollections().begin()->second.uuid == uuid);
     fs::remove(tmp);
 
     const auto points = loaded.getPoints("old");
@@ -510,4 +527,52 @@ TEST_CASE("ids stay unique across a load + further adds")
     }
     CHECK(matches == 1);
     CHECK(loaded.getPoints("a").size() == 3);
+}
+
+TEST_CASE("an invalid collection uuid leaves the store unchanged")
+{
+    const fs::path tmp = fs::temp_directory_path() /
+        ("pc_bad_uuid_" + std::to_string(::getpid()) + ".json");
+    {
+        std::ofstream o(tmp);
+        o << R"({
+            "vc_pointcollections_json_version": "1",
+            "collections": {
+                "1": {"name": "good", "points": {}, "metadata": {}, "color": [1, 1, 1]},
+                "2": {"uuid": "not-a-uuid", "name": "bad", "points": {},
+                      "metadata": {}, "color": [1, 1, 1]}
+            }
+        })";
+    }
+
+    PointCollections c;
+    c.addPoint("kept", {1, 2, 3});
+    const std::string keptUuid =
+        c.getAllCollections().at(c.getCollectionId("kept").value()).uuid;
+    CHECK_FALSE(c.loadFromJSON(tmp.string()));
+    REQUIRE(c.getAllCollections().size() == 1);
+    CHECK(c.getAllCollections().begin()->second.uuid == keptUuid);
+    CHECK(c.getPoints("kept").size() == 1);
+    fs::remove(tmp);
+
+    // A segment corrections file fails the same way: nothing is half-loaded.
+    const fs::path segDir = fs::temp_directory_path() /
+        ("pc_bad_uuid_seg_" + std::to_string(::getpid()));
+    fs::create_directories(segDir);
+    {
+        std::ofstream o(segDir / "corrections.json");
+        o << R"({
+            "vc_pointcollections_json_version": "1",
+            "collections": {
+                "1": {"name": "good", "points": {}, "metadata": {}, "color": [1, 1, 1],
+                      "anchor2d": [1, 2]},
+                "2": {"uuid": "not-a-uuid", "name": "bad", "points": {},
+                      "metadata": {}, "color": [1, 1, 1], "anchor2d": [3, 4]}
+            }
+        })";
+    }
+    CHECK_FALSE(c.loadFromSegmentPath(segDir));
+    CHECK(c.getAllCollections().size() == 1);
+    CHECK(c.getCollectionId("good") == std::nullopt);
+    fs::remove_all(segDir);
 }

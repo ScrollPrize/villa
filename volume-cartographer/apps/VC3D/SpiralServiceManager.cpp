@@ -198,7 +198,7 @@ QString SpiralServiceManager::findPython() const
     return {};
 }
 
-QString SpiralServiceManager::findService() const
+QString SpiralServiceManager::findService()
 {
     const QString app = QCoreApplication::applicationDirPath();
     const QStringList candidates{

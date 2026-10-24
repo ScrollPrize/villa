@@ -9,6 +9,7 @@ except ImportError:  # pragma: no cover - unavailable on Windows
 import numpy as np
 import torch
 
+from devices import fit_device
 from pack_resident_pools import pack_arrays, sidecar_path
 
 
@@ -141,6 +142,7 @@ def prepare_lasagna_volume(
     yx_bounds_working=None,
     interior_fn=None,
     paged_chunk=64,
+    device=None,
     progress=None,
 ):
     """Open normals/grad-magnitude as fully-resident sparse brick pools.
@@ -154,7 +156,8 @@ def prepare_lasagna_volume(
         raise ValueError(
             f"storage_backend={storage_backend!r} is no longer supported; "
             "use 'sparse_cuda'")
-    if not torch.cuda.is_available():
+    device = fit_device() if device is None else torch.device(device)
+    if device.type == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('sparse CUDA volume sampling requires an available CUDA device')
 
     if use_normals and (not normal_nx_zarr_path or not normal_ny_zarr_path):
@@ -206,7 +209,6 @@ def prepare_lasagna_volume(
 
     roi_shape = (z_hi - z_lo, reference_shape[1], reference_shape[2])
     from sparse_cuda_cache import ResidentBrickPool, SparseLasagnaStore
-    device = torch.device('cuda')
     normal_cache = None
     if use_normals:
         if progress is not None:

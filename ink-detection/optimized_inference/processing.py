@@ -7,6 +7,7 @@ tasks (prepare, reduce) to run without loading torch.
 import os
 os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")
 
+import hashlib
 import logging
 import shutil
 import math
@@ -69,8 +70,14 @@ def get_cached_zarr_store(path: str):
         # Create base S3 store using zarr3's FsspecStore
         base_store = FsspecStore(fs=fs, path=s3_path, read_only=True)
 
-        # Configure cache settings from environment variables
-        cache_dir = os.environ.get("ZARR_CACHE_DIR", "./zarr_cache")
+        # Configure cache settings from environment variables.
+        # Cached keys are store-relative (".zarray", "0/0/0/1"), so every source volume
+        # gets its own subdirectory; in a shared directory a second volume would be
+        # served the first volume's metadata and chunks.
+        cache_dir = os.path.join(
+            os.environ.get("ZARR_CACHE_DIR", "./zarr_cache"),
+            hashlib.sha1(path.rstrip("/").encode()).hexdigest()[:12],
+        )
         cache_size_gb = float(os.environ.get("ZARR_CACHE_SIZE_GB", "100"))
         cache_max_age = os.environ.get("ZARR_CACHE_MAX_AGE", "infinity")
 
@@ -172,7 +179,12 @@ def _read_gray_any(path: str) -> np.ndarray:
                 return None
             if img.ndim > 2:
                 img = img[..., 0]
-            if img.dtype != np.uint8:
+            if img.dtype == np.uint16:
+                # 16-bit layers (what volume-cartographer renders) carry the signal in
+                # the high byte. Keep it, as cv2.IMREAD_GRAYSCALE does for the other
+                # formats; clipping at 255 saturates every voxel of such a layer.
+                img = (img >> 8).astype(np.uint8)
+            elif img.dtype != np.uint8:
                 # Minimal, safe conversion to uint8
                 img = np.clip(img, 0, 255).astype(np.uint8)
             return img
@@ -190,6 +202,51 @@ def _read_gray_any(path: str) -> np.ndarray:
                 profiler.increment_counter("local_read_bytes", os.path.getsize(path))
             except OSError:
                 profiler.add_note(f"Local read byte size unavailable for {path}")
+
+
+def contiguous_layer_window(layer_names: List[str]) -> Tuple[int, int]:
+    """Return [first, last + 1) for layer files named by their index (e.g. ``01.tif``).
+
+    The prepared zarr's channel k is the k-th file, so recording a layer window is only valid when the files are
+    exactly one per index with no gaps; duplicates (e.g. the same index under two ``layers/`` folders) or gaps
+    would shift every later channel, so they are an error.
+    """
+    indices = sorted(int(os.path.splitext(os.path.basename(name))[0]) for name in layer_names)
+    if not indices:
+        raise RuntimeError("No layer files to stack")
+    duplicates = sorted({i for i in indices if indices.count(i) > 1})
+    if duplicates:
+        raise RuntimeError(f"Layer indices {duplicates} appear more than once; point S3_PATH at a single layers/ folder")
+    missing = sorted(set(range(indices[0], indices[-1] + 1)) - set(indices))
+    if missing:
+        raise RuntimeError(f"Layers {missing} are missing between {indices[0]} and {indices[-1]}")
+    return indices[0], indices[-1] + 1
+
+
+def record_layer_window(zarr_path: str, start_layer: int, end_layer: int) -> None:
+    """Record which source layers a prepared surface-volume zarr holds (channel k = layer start_layer + k)."""
+    z = zarr.open(get_writable_zarr_store(zarr_path), mode="r+")
+    z.attrs["layer_start"] = int(start_layer)
+    z.attrs["layer_end"] = int(end_layer)
+
+
+def resolve_zarr_layer_window(zarr_path: str, start_layer: int, end_layer: int):
+    """Translate the requested absolute layer window into channel indices of ``zarr_path``.
+
+    A zarr written by the prepare step records its layer window in attrs and already holds only
+    [layer_start, layer_end); the requested window is rebased onto it. A zarr without the attrs
+    (an externally built full-depth stack) is indexed with the absolute layer indices as before.
+    """
+    attrs = zarr.open(get_cached_zarr_store(zarr_path), mode="r").attrs
+    if "layer_start" not in attrs:
+        return int(start_layer), int(end_layer)
+    base, top = int(attrs["layer_start"]), int(attrs["layer_end"])
+    if int(start_layer) < base or int(end_layer) > top:
+        raise RuntimeError(
+            f"Requested layers [{start_layer}, {end_layer}) are not all present in {zarr_path}, "
+            f"which holds layers [{base}, {top})"
+        )
+    return int(start_layer) - base, int(end_layer) - base
 
 
 def create_surface_volume_zarr(

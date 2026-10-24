@@ -336,18 +336,14 @@ int process_tifxyz(const std::filesystem::path& src,
     }
 
     QuadSurface outSurf(refined, surf->scale());
-    std::string uuid = !surf->id.empty() ? surf->id : dst.filename().string();
-    if (uuid.empty()) {
-        uuid = "refined_surface";
-    }
-    outSurf.id = uuid;
+    outSurf.id = dst.filename().string();
 
     if (!surf->meta.is_null()) {
         outSurf.meta = surf->meta;
     }
 
     try {
-        outSurf.save(dst.string(), uuid, cfg.overwrite);
+        outSurf.saveEdited(src, dst, cfg.overwrite);
     } catch (const std::exception& e) {
         std::cerr << "failed to save tifxyz: " << e.what() << std::endl;
         return EXIT_FAILURE;

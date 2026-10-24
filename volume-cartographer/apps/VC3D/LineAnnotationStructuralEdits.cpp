@@ -170,7 +170,8 @@ std::optional<MergePlan> planFiberMerge(const StoredFiber& clicked,
     // carries the gap tag and its cubic-spline goal like any other
     // structural edit.
     applyGapSpanPolicy(merged.controlPoints);
-    merged.optimizationMode = mode;
+    merged.modelOnly = clicked.modelOnly || far.modelOnly;
+    merged.optimizationMode = merged.modelOnly ? FiberOptimizationMode::NativeFiberTrace3d : mode;
     merged.manualHvTag =
         clicked.manualHvTag == far.manualHvTag ? clicked.manualHvTag : std::string{};
     for (const auto& tag : clicked.tags) {
@@ -235,6 +236,7 @@ std::optional<SplitPlanResult> planFiberSplit(const StoredFiber& parent,
         // ends exactly on its split CP until its line is re-fit.
         addUniqueSorted(half.tags, std::string{kNeedsReoptimizationTag});
         half.optimizationMode = parent.optimizationMode;
+        half.modelOnly = parent.modelOnly;
         half.coordinateBaseShapeZYX = parent.coordinateBaseShapeZYX;
     };
     StoredFiber& prefix = result.prefix;

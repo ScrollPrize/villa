@@ -401,7 +401,8 @@ int main(int argc, char** argv) {
     std::unique_ptr<QuadSurface> surf(new QuadSurface(points, scale_for_save));
     std::cout << "Saving (staging) dir=\"" << staging_base.string() << "\" name=" << final_name
               << "\" (scale=" << scale_for_save << ")\n";
-    surf->save(staging_base, final_name);
+    surf->saveAsNew(staging_base);
+    const std::string object_uuid = surf->objectUuid();
 
     // Discover where meta.json landed
     fs::path produced_dir;
@@ -433,7 +434,7 @@ int main(int argc, char** argv) {
 
     // Patch freshly written meta.json (uuid, bbox, exact scale json preserved)
     std::string meta_err;
-    if (!patch_target_meta(chosen_final, chosen_final.filename().string(), B,
+    if (!patch_target_meta(chosen_final, object_uuid, B,
                            scale_json, rgb_path.filename().string(), &meta_err)) {
         std::cerr << "Warning: failed to patch meta.json: " << meta_err << "\n";
     }
@@ -442,7 +443,7 @@ int main(int argc, char** argv) {
     const fs::path src_json_dir = bounds_path.parent_path();
     std::string err;
     if (!copy_and_patch_jsons(src_json_dir, chosen_final,
-                              /*new_uuid*/ chosen_final.filename().string(),
+                              /*new_uuid*/ object_uuid,
                               /*bounds*/ B,
                               /*scale_json*/ scale_json,
                               /*source_png*/ rgb_path.filename().string(),

@@ -64,7 +64,7 @@ int main(int argc, char *argv[])
     }
     points->setTo(cv::Vec3f(-1,-1,-1), mask_points);
 
-    surf->save(tgt_path);
+    surf->saveEdited(seg_path, tgt_path);
 
     return EXIT_SUCCESS;
 }

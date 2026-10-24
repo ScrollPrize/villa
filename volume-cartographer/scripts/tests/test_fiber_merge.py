@@ -1879,6 +1879,107 @@ def test_v3_tagging_and_refitting_the_same_final_span_is_a_manual_conflict():
     assert any('changed differently on both sides' in c for c in result['conflicts'])
 
 
+FIBER_UUID_A = '0f8fad5b-d9cb-469f-a165-70867728950e'
+FIBER_UUID_B = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
+
+
+def test_is_fiber_doc_rejects_present_but_invalid_uuid():
+    doc = make_fiber(BASE_CPS)
+    assert fiber_merge.is_fiber_doc(doc)  # legacy: no uuid
+    doc['uuid'] = FIBER_UUID_A
+    assert fiber_merge.is_fiber_doc(doc)
+    doc['uuid'] = FIBER_UUID_A.upper()  # isxdigit accepts either case
+    assert fiber_merge.is_fiber_doc(doc)
+    for bad in ('dj_x_000001', '', None, 7, FIBER_UUID_A + '0',
+                FIBER_UUID_A.replace('-', '')):
+        doc['uuid'] = bad
+        assert not fiber_merge.is_fiber_doc(doc), bad
+
+
+def test_differing_uuids_are_a_conflict_not_a_generation_pick():
+    base = make_fiber(BASE_CPS)
+    base['uuid'] = FIBER_UUID_A
+    local = make_fiber(BASE_CPS, tags=['x'], generation=3)
+    remote = make_fiber(BASE_CPS, tags=['y'], generation=2)
+    local['uuid'] = FIBER_UUID_A
+    remote['uuid'] = FIBER_UUID_B
+    result = merge_fibers(base, local, remote)
+    assert not result['ok']
+    assert any("'uuid' differs" in c for c in result['conflicts'])
+    # An established identity mismatch with different content stays a conflict.
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    remote['uuid'] = FIBER_UUID_B
+    remote['tags'] = ['changed']
+    assert not merge_fibers(base, local, remote)['ok']
+
+
+def test_identical_named_content_adopts_remote_uuid_without_mutating_inputs():
+    base = make_fiber(BASE_CPS)
+    base['uuid'] = FIBER_UUID_A
+    local = copy.deepcopy(base)
+    remote = copy.deepcopy(base)
+    remote['uuid'] = FIBER_UUID_B
+    before = copy.deepcopy((base, local, remote))
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['uuid'] == FIBER_UUID_B
+    assert result['merged']['generation'] == remote['generation']
+    assert (base, local, remote) == before
+
+
+def test_legacy_base_allows_independent_uuid_migration_and_tag_edits():
+    base = make_fiber(BASE_CPS)
+    local = {**copy.deepcopy(base), 'uuid': FIBER_UUID_A, 'tags': ['local']}
+    remote = {**copy.deepcopy(base), 'uuid': FIBER_UUID_B, 'tags': ['remote']}
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['uuid'] == FIBER_UUID_B
+    assert set(result['merged']['tags']) == {'local', 'remote'}
+
+
+@pytest.mark.parametrize('field,value', [
+    ('filename', 'different.json'), ('generation', 2),
+    ('tags', ['changed']), ('unknown_metadata', {'uuid': FIBER_UUID_B}),
+    ('control_points', [cp(0), cp(1, dz=1)]),
+])
+def test_same_fiber_content_ignores_only_top_level_uuid(field, value):
+    local = make_fiber(BASE_CPS)
+    remote = {**copy.deepcopy(local), 'uuid': FIBER_UUID_B}
+    assert fiber_merge.same_fiber_content(local, remote)
+    remote[field] = value
+    assert not fiber_merge.same_fiber_content(local, remote)
+
+
+@pytest.mark.parametrize('filename', [None, '', 42])
+def test_same_fiber_content_requires_a_filename(filename):
+    doc = {**make_fiber(BASE_CPS), 'filename': filename}
+    assert not fiber_merge.same_fiber_content(doc, doc)
+
+
+def test_uuid_survives_merge_from_either_side():
+    base = make_fiber(BASE_CPS)
+    # Newer (remote) side is legacy; local carries the uuid.
+    local = make_fiber(BASE_CPS, tags=['x'], generation=2)
+    remote = make_fiber(BASE_CPS, tags=['y'], generation=5)
+    local['uuid'] = FIBER_UUID_A
+    result = merge_fibers(base, local, remote)
+    assert result['ok'], result['conflicts']
+    assert result['merged']['uuid'] == FIBER_UUID_A
+    # Short circuit: local unchanged, remote (without uuid) taken.
+    base['uuid'] = FIBER_UUID_A
+    local = copy.deepcopy(base)
+    remote = make_fiber(BASE_CPS, tags=['y'], generation=2)
+    result = merge_fibers(base, local, remote)
+    assert result['ok'] and result['merged']['uuid'] == FIBER_UUID_A
+    # Same uuid on both sides is the ordinary case.
+    remote['uuid'] = FIBER_UUID_A
+    local = make_fiber(BASE_CPS, tags=['x'], generation=3)
+    local['uuid'] = FIBER_UUID_A
+    result = merge_fibers(base, local, remote)
+    assert result['ok'] and result['merged']['uuid'] == FIBER_UUID_A
+
+
 def test_is_fiber_doc_accepts_the_break_tag():
     """The break tag is one more string in the per-CP tags array: every loader
     already accepts it, on any control point, so untouched fibers and older
@@ -2021,3 +2122,125 @@ def test_v3_save_over_a_v4_base_with_span_tags_is_a_regression_conflict():
     downgraded = copy.deepcopy(plain)
     downgraded['version'] = 3
     assert fiber_merge.legacy_regression(downgraded, plain) is None
+
+
+# --- the automatic-link mark ("auto": an unreviewed link made by the Fiber
+# Map's "Link A and B"; VC3D's invariant: only with pending, ordinary kind) ---
+
+def test_refresh_mirrors_auto_onto_existing_reciprocal():
+    b_cps = [cp(i, dz=50.0) for i in range(4)]
+    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1, pending=True)
+    a['branches'][0]['auto'] = True
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+    assert out['ok'] and out['b_changed'] and not out['a_changed']
+    assert out['b_doc']['branches'][0]['pending'] is True
+    assert out['b_doc']['branches'][0]['auto'] is True
+    assert loader_issues({'a.json': out['a_doc'], 'b.json': out['b_doc']}) == []
+    again = refresh_pair_links(out['a_doc'], out['b_doc'], 'a.json', 'b.json')
+    assert again['ok'] and not again['a_changed'] and not again['b_changed']
+
+
+def test_refresh_restores_reciprocal_with_auto():
+    b_cps = [cp(i, dz=50.0) for i in range(4)]
+    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1, pending=True)
+    a['branches'][0]['auto'] = True
+    b['branches'] = []
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+    assert out['ok'] and out['b_changed']
+    assert out['b_doc']['branches'][0].get('auto') is True
+    assert out['b_doc']['branches'][0].get('pending') is True
+
+
+def test_refresh_drops_auto_without_pending_and_on_adjacent_kind():
+    b_cps = [cp(i, dz=50.0) for i in range(4)]
+    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1, pending=False)
+    a['branches'][0]['auto'] = True            # approved: the mark is invalid
+    b['branches'][0]['auto'] = True
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+    assert out['ok'] and out['a_changed'] and out['b_changed']
+    assert 'auto' not in out['a_doc']['branches'][0]
+    assert 'auto' not in out['b_doc']['branches'][0]
+
+    a, b = adjacent_pair()
+    a['adjacent_branches'][0]['auto'] = True   # adjacent: never automatic
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+    assert out['ok']
+    assert 'auto' not in out['a_doc']['adjacent_branches'][0]
+    assert 'auto' not in out['b_doc']['adjacent_branches'][0]
+
+
+def test_merge_keeps_auto_on_pending_and_drops_it_on_approval():
+    auto_link = dict(link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True), auto=True)
+    approved_link = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=False)
+    # Both sides still pending and automatic: the mark survives the merge.
+    base = make_fiber(BASE_CPS, branches=[auto_link])
+    local = make_fiber_with_marker(make_fiber(BASE_CPS, branches=[auto_link], generation=5))
+    remote = make_fiber(BASE_CPS, branches=[auto_link], generation=2)
+    result = merge_fibers(base, local, remote)
+    assert result['ok']
+    assert result['merged']['branches'][0].get('auto') is True
+    # Approval on the remote wins and takes the mark with it.
+    remote = make_fiber(BASE_CPS, branches=[approved_link], generation=2)
+    result = merge_fibers(base, local, remote)
+    assert result['ok']
+    assert result['merged']['branches'][0]['pending'] is False
+    assert 'auto' not in result['merged']['branches'][0]
+
+
+def test_merge_shortcuts_normalize_the_auto_mark():
+    stray = dict(link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=False), auto=True)
+    base = make_fiber(BASE_CPS, branches=[stray])
+    # identical sides, remote unchanged, local unchanged: every shortcut
+    for local, remote in ((base, base),
+                          (make_fiber_with_marker(base), base),
+                          (base, make_fiber_with_marker(base))):
+        result = merge_fibers(base, local, remote)
+        assert result['ok']
+        assert 'auto' not in result['merged']['branches'][0]
+
+
+def test_full_merge_and_refresh_normalize_every_copied_entry():
+    # Full merge: an unrelated (third-fiber) entry with a stray mark on one
+    # side is copied into the merge normalized.
+    stray = dict(link('kb_c.json', BASE_CPS[1], OTHER, 1, pending=False), auto=True)
+    base = make_fiber(BASE_CPS)
+    local = make_fiber_with_marker(make_fiber(BASE_CPS, branches=[stray], generation=5))
+    remote = make_fiber(BASE_CPS, generation=2, tags=['other'])
+    result = merge_fibers(base, local, remote)
+    assert result['ok']
+    assert all('auto' not in e for e in result['merged']['branches'])
+    # Refresh: an unrelated entry of B (to a third fiber) is normalized too.
+    b_cps = [cp(i, dz=50.0) for i in range(4)]
+    a, b = make_pair('a.json', 'b.json', BASE_CPS, b_cps, 2, 1, pending=True)
+    b['branches'].append(dict(link('kb_c.json', b_cps[3], OTHER, 1, pending=False), auto=True))
+    out = refresh_pair_links(a, b, 'a.json', 'b.json')
+    assert out['ok'] and out['b_changed']
+    assert all('auto' not in e for e in out['b_doc']['branches'])
+
+
+def test_merge_arbitrates_the_auto_mark_against_the_base_when_both_pending():
+    auto_link = dict(link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True), auto=True)
+    human_link = link('kb_a.json', BASE_CPS[2], OTHER, 2, pending=True)
+    # Base automatic; local cleared the mark (a human took it over), remote
+    # kept it with unrelated newer edits: the cleared mark wins.
+    base = make_fiber(BASE_CPS, branches=[auto_link])
+    local = make_fiber(BASE_CPS, branches=[human_link], generation=2)
+    remote = make_fiber(BASE_CPS, branches=[auto_link], generation=9, tags=['remote-edit'])
+    result = merge_fibers(base, local, remote)
+    assert result['ok']
+    assert result['merged']['branches'][0]['pending'] is True
+    assert 'auto' not in result['merged']['branches'][0]
+    # Base human pending; remote re-linked automatically, local untouched but
+    # newer elsewhere: the new automatic link survives.
+    base = make_fiber(BASE_CPS, branches=[human_link])
+    local = make_fiber(BASE_CPS, branches=[human_link], generation=9, tags=['local-edit'])
+    remote = make_fiber(BASE_CPS, branches=[auto_link], generation=2)
+    result = merge_fibers(base, local, remote)
+    assert result['ok']
+    assert result['merged']['branches'][0].get('auto') is True
+    # No base: the human state wins.
+    local = make_fiber(BASE_CPS, branches=[human_link], generation=2)
+    remote = make_fiber(BASE_CPS, branches=[auto_link], generation=9, tags=['remote-edit'])
+    result = merge_fibers(make_fiber(BASE_CPS), local, remote)
+    assert result['ok']
+    assert 'auto' not in result['merged']['branches'][0]

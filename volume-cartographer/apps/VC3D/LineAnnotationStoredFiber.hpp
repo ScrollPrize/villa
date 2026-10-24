@@ -20,6 +20,7 @@
 #include "LineAnnotationFiberClassification.hpp"
 #include "LineAnnotationFiberSegments.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
+#include "vc/core/util/Uuid.hpp"
 
 namespace vc3d::line_annotation {
 
@@ -50,12 +51,19 @@ struct FiberBranchRef {
     // for a link (delete and re-link to change), mirrored on both
     // reciprocal refs.
     bool adjacent = false;
+    // Created by the Fiber Map's automatic link ("Link A and B") and not yet
+    // reviewed: drawn with a dashed marker in the pending colours. Invariant
+    // `autoLink => pending && !adjacent`, enforced wherever a ref is read,
+    // merged or written; approving the link clears it with `pending`.
+    // Mirrored on both reciprocal refs like `pending` (JSON key "auto").
+    bool autoLink = false;
 };
 
 struct StoredFiber {
     double width = 0.0;
     double widthGapFraction = vc::fiber_tracer::kDefaultFiberWidthGapFraction;
     uint64_t id = 0;
+    std::string uuid = vc::util::newUuid();
     std::string username;
     std::string startedAt;
     uint64_t sequence = 0;
@@ -72,6 +80,7 @@ struct StoredFiber {
     std::string manualHvTag;
     std::vector<std::string> tags;
     FiberOptimizationMode optimizationMode = FiberOptimizationMode::Lasagna;
+    bool modelOnly = false;
     // Coordinate domain in which control_points and line_points are
     // stored. New Spiral-created fibers record the fiber manifest's L0
     // shape so a downsampled active volume can display them correctly.
@@ -97,6 +106,10 @@ struct StoredFiber {
     // holds them. Structural edits consult this before trusting the record
     // as the on-disk truth.
     bool linkEntriesDroppedAtLoad = false;
+    // Shown read-only from an Automated Fiber Volume: held in memory only for
+    // its view (never written, listed, linked or optimized) and dropped when
+    // that view closes.
+    bool readOnly = false;
 };
 
 }  // namespace vc3d::line_annotation

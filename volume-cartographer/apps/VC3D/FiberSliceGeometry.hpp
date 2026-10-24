@@ -75,6 +75,17 @@ double signedDistanceToPlane(const cv::Vec3d& point, const Plane& plane);
 
 size_t nearestLinePointIndex(const std::vector<cv::Vec3d>& linePoints,
                              const cv::Vec3d& controlPoint);
+// Arc length of the line from linePoints[firstIndex] to linePoints[lastIndex]
+// (voxels), skipping non-finite points; 0 unless lastIndex > firstIndex.
+double polylineLengthRange(const std::vector<cv::Vec3d>& linePoints,
+                           size_t firstIndex,
+                           size_t lastIndex);
+// The length of a fiber as annotated: its line between the outermost control
+// points (each taken to its nearest line point), in voxels. The open tails
+// the optimizer extrapolates past the first and last control point are not
+// part of it. With fewer than two finite control points the whole line.
+double annotatedLineLengthVx(const std::vector<cv::Vec3d>& linePoints,
+                             const std::vector<cv::Vec3d>& controlPoints);
 ControlSpanSelection selectControlSpan(const std::vector<cv::Vec3d>& linePoints,
                                        const std::vector<cv::Vec3d>& controlPoints);
 PlaneFit fitLeastSquaresPlane(const ControlSpanSelection& span,

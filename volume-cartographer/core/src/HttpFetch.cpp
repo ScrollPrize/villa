@@ -2,6 +2,7 @@
 #include "vc/core/util/S3AuthFallback.hpp"
 
 #include <utils/http_fetch.hpp>
+#include <utils/sftp_fetch.hpp>
 
 #include <array>
 #include <chrono>
@@ -98,6 +99,8 @@ std::string httpGetString(const std::string& url, const HttpAuth& auth)
 {
     auto client = makeTextClient(auth);
     auto resp = client.get(url);
+    if (utils::is_sftp_url(url) && !resp.ok() && !resp.not_found())
+        throw std::runtime_error("SFTP fetch failed: " + resp.error_message);
     if (resp.ok()) {
         auto body = std::string(resp.body_string());
         if (hasGzipMagic(body)) {
@@ -122,6 +125,8 @@ std::vector<std::byte> httpGetBytes(const std::string& url, const HttpAuth& auth
 {
     auto client = makeBinaryClient(auth);
     auto resp = client.get(url);
+    if (utils::is_sftp_url(url) && !resp.ok() && !resp.not_found())
+        throw std::runtime_error("SFTP fetch failed: " + resp.error_message);
     if (resp.ok()) {
         return std::move(resp.body);
     }

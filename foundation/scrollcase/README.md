@@ -51,12 +51,13 @@ See example `scripts/example_mesh_processing.ipynb`.
 Mesh processing involves the following steps:
 1. Optionally scale mesh to target size (for unscaled meshes)
 2. Simplify (decimate) mesh to a target error
-3. Fit the minimum bounding error
-4. (Optional) Optimize rotation about the cylinder axis
+3. Fit the minimum bounding cylinder, or use the given `cylinder_axis` (e.g. along the umbilicus of a squashed scroll, where the smallest cylinder runs the wrong way)
+4. (Optional) Optimize rotation about the cylinder axis, then (`rotation_search`, on by default) turn further to where the S-shaped divider leaves the scroll least room between it and the halves (so the parting surface bends least), within 5 mm of the shallowest pockets; scrolls with no clear gain keep their split
 5. (Optional) Smooth mesh
 6. Offset by 2mm
 7. Split along YZ plane
 8. Remove overhangs
+9. Part the halves on a smooth surface that is the S-shaped divider away from the scroll and bends to pass through it wherever the scroll lies off the divider (a thin, curved fragment); the divider wall follows it at constant thickness. Only where parting on the divider would leave the scroll room of at least 2.7% of its lined volume (`parting_min_fill_fraction`); otherwise, as for scrolls, part on the divider
 
 ### Mesh smoothing
 
@@ -85,6 +86,10 @@ Case as viewed in the OCP CAD Viewer:
 Enabling transparency to check clearances etc.:
 
 <img width="1000" alt="image" src="https://github.com/user-attachments/assets/495dcffd-c353-496e-b086-b02d5a0bc729" />
+
+### Flat fragments
+
+The halves part across the S-shaped divider, which `build_lining` lays along the scroll's wide direction. For a flat fragment, `scripts/stl_generator.py` then turns the lining, divider and split together about the axis, relative to the square caps, so the fragment is narrowest along y (its long side along x, as the divider runs before the rotation search turns it): `mesh.narrowest_in_y` gives the turn, and `ScrollCaseConfig.split_rotation_deg` takes it. The caps keep their outline, base bolt holes, mount and alignment arrow; their bolt protrusions (and the top cap's labels) move to the pair of sides nearest the turned divider, and past the lining the split runs straight to the middle of those sides. By default (`--narrow-y auto`) a fragment is turned when its footprint's length is at least `--narrow-y-min-aspect` (1.5) times its least width; `--narrow-y on`/`off` always or never turns it. A turn the split cannot make within the caps (a lining too wide for a divider nearly 45 degrees from the caps' sides) is skipped under `auto` and an error under `on`. `scroll_summary.csv` records the turn as `Split rotation (deg)`.
 
 ### Customizing the case
 

@@ -162,17 +162,18 @@ async def vc3d_fiber_create_atlas(fiber_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
-async def vc3d_fiber_export(path: str, scale: float = 1.0) -> dict[str, Any]:
+async def vc3d_fiber_export(path: str) -> dict[str, Any]:
     """Export ALL saved fibers to one vc3d_fiber_collection JSON bundle at
-    `path` (headless; no dialog). scale multiplies coordinates on export.
+    `path` (headless; no dialog). Coordinates and their grid shape are preserved.
     Returns {"exported": count, "path"}."""
-    return await _call("fiber.export", {"path": path, "scale": scale})
+    return await _call("fiber.export", {"path": path})
 
 
 @mcp.tool()
-async def vc3d_fiber_import(path: str, scale: float = 1.0) -> dict[str, Any]:
+async def vc3d_fiber_import(path: str) -> dict[str, Any]:
     """Import fibers from `path`: a single vc3d_fiber JSON, a
     vc3d_fiber_collection bundle, or a directory of fiber JSONs (headless; no
-    dialog). Imported fibers are saved into the package's fibers directory
-    and the fiber list reloads. Returns {"imported", "skipped"}."""
-    return await _call("fiber.import", {"path": path, "scale": scale})
+    dialog). Coordinates and grid shapes are preserved. Imported fibers are
+    saved into the package's fibers directory and the fiber list reloads.
+    Returns {"imported", "skipped"}."""
+    return await _call("fiber.import", {"path": path})
