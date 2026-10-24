@@ -48,6 +48,7 @@ volume-only = [
 # Machine-learning & training stack
 models = [
     "torch>=2.12,<3",
+    "torchvision",  # direct so that its Windows CUDA source in [tool.uv.sources] applies
     "accelerate>=1.13.0",
     "diffusers>=0.37.0",
     "pytorch-lightning>=2.5.5",
@@ -142,6 +143,7 @@ label-transfer = [
 all = [
     # Machine-learning & training stack
     "torch>=2.12,<3",
+    "torchvision",  # direct so that its Windows CUDA source in [tool.uv.sources] applies
     "accelerate>=1.13.0",
     "diffusers>=0.37.0",
     "pytorch-lightning>=2.5.5",
@@ -252,9 +254,21 @@ required-environments = [
 name = "nvidia"
 url = "https://pypi.nvidia.com"
 
+# PyPI only ships CPU builds of torch for Windows, so without this a plain
+# `uv sync --extra models` on Windows gets torch 2.12.1+cpu and every ink/model
+# command silently runs on the CPU. Linux keeps the PyPI wheels, which already
+# bundle CUDA 13 (nvidia-*-cu13); cu130 is the matching Windows build (driver >= 580).
+# Same pattern as spiral-fitting/pyproject.toml (#1584).
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
 [tool.uv.sources]
 volume-cartographer = { path = "../volume-cartographer", editable = true }
 villa-gpu-manager = { path = "../gpu_manager", editable = true }
 cucim-cu13 = { index = "nvidia" }
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
+torchvision = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
 batchgeneratorsv2 = { path = "../segmentation/models/batchgeneratorsv2" }
 nnunetv2 = { path = "../segmentation/models/arch/nnunet" }
