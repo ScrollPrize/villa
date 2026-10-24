@@ -9,12 +9,13 @@ import torch
 import fit_data
 import model
 import optimizer
+from optimizer.config import _resolve_snap_surf_map_fixture_export_args
 
 
 class OptimizerExpandStageTest(unittest.TestCase):
 	def test_snap_surf_map_fixture_export_paths_resolve_under_out_dir(self) -> None:
 		with tempfile.TemporaryDirectory() as tmp:
-			resolved = optimizer._resolve_snap_surf_map_fixture_export_args(
+			resolved = _resolve_snap_surf_map_fixture_export_args(
 				{
 					"fixture_export_dir": "flat_fixture",
 					"export_fixture": {

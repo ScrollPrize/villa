@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 import torch
 import optimizer
+from optimizer.optimizer import _auto_steps_should_stop
 import fit_data
 
 TEST_DIR = os.path.dirname(__file__)
@@ -1242,7 +1243,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 			status_steps: list[int] = []
 
 			def auto_stop(*, history: list[float], step: int) -> bool:
-				return int(step) >= 3 and optimizer._auto_steps_should_stop(
+				return int(step) >= 3 and _auto_steps_should_stop(
 					history,
 					window=2,
 					rel_threshold=1.0e-6,
@@ -1325,7 +1326,7 @@ class SnapSurfMapGlobalTest(unittest.TestCase):
 
 			def auto_stop(*, history: list[float], step: int) -> bool:
 				auto_steps.append(int(step))
-				return int(step) >= 3 and optimizer._auto_steps_should_stop(
+				return int(step) >= 3 and _auto_steps_should_stop(
 					history,
 					window=2,
 					rel_threshold=1.0e-6,

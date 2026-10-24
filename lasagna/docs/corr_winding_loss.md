@@ -95,7 +95,7 @@ Anchors `(d, h, w)` per correspondence persist across optimization steps (module
 | `opt_loss_corr.py` | New `_corr_winding_loss`, helpers, anchor state |
 | `cli_opt.py` | `--corr-mode` arg (replaces `--corr-snap`) |
 | `fit.py` | Calls `set_corr_mode()` instead of `set_snap_mode()` |
-| `optimizer.py` | Debug print uses `_corr_mode` |
+| `optimizer/optimizer.py` | Debug print uses `_corr_mode` |
 
 ## Key functions in opt_loss_corr.py
 
