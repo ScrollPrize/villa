@@ -374,7 +374,7 @@ _Keybinds:_
 
 **Segmentation**
 
-_Primary entry point for interacting with the segmentation, more info in the [segmentation docs](docs/segmentation.md)_
+_Primary entry point for interacting with the segmentation, more info in [extending and modifying segmentations](docs/extending_and_modifying_segmentations.md)_
  
 <img src="docs/imgs/segmentation-widget-ui.png" style="height: 500px">
 
