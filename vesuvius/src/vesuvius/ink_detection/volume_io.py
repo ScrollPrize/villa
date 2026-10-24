@@ -244,3 +244,78 @@ def read_bbox_with_padding(
     )
     output[destination] = crop
     return output, destination
+
+
+def open_vc_reader(
+    path: str | Path,
+    resolution: int | str,
+    *,
+    cache_dir: str | Path | None = None,
+    cache_max_gb: float | None = None,
+    memory_cache_mb: int = 512,
+    connections: int = 32,
+):
+    """Open one pyramid level with the optional compiled ``vc_reader`` package.
+
+    Each process (e.g. each DataLoader worker) gets its own memory cache and
+    connection pool.
+    """
+
+    try:
+        from vc_reader.reader import open_zarr
+    except ImportError as exc:
+        raise ImportError(
+            "reader 'vc_reader' needs the vc_reader package (villa/vc_reader); "
+            "install it or use the default zarr reader"
+        ) from exc
+    return open_zarr(
+        str(path),
+        level=str(resolution),
+        cache_dir=cache_dir,
+        cache_max_bytes=None if cache_max_gb is None else int(cache_max_gb * 2**30),
+        memory_cache=int(memory_cache_mb) << 20,
+        connections=int(connections),
+    )
+
+
+def read_bboxes_with_padding(
+    volume: Any,
+    bboxes_zyx: list[tuple[int, int, int, int, int, int]],
+    *,
+    fill_value: int | float = 0,
+) -> list[tuple[np.ndarray, tuple[slice, slice, slice] | None]]:
+    """Read several bboxes like read_bbox_with_padding.
+
+    A vc_reader volume reads them in one call, fetching shared chunks once.
+    """
+    if not hasattr(volume, "read_regions"):
+        return [
+            read_bbox_with_padding(volume, bbox, fill_value=fill_value)
+            for bbox in bboxes_zyx
+        ]
+    bboxes = [tuple(int(value) for value in bbox) for bbox in bboxes_zyx]
+    for bbox in bboxes:
+        if any(bbox[axis + 3] <= bbox[axis] for axis in range(3)):
+            raise ValueError(f"bbox must define a positive crop, got {bbox!r}")
+    shape = tuple(int(value) for value in volume.shape[:3])
+    sizes = [tuple(bbox[axis + 3] - bbox[axis] for axis in range(3)) for bbox in bboxes]
+    crops = volume.read_regions(
+        [(bbox[:3], size) for bbox, size in zip(bboxes, sizes)]
+    )
+    results = []
+    for bbox, size, crop in zip(bboxes, sizes, crops):
+        if crop.shape != size:
+            raise ValueError(f"read_regions returned {crop.shape} for bbox {bbox!r}")
+        # Copy out of vc_reader's recycled buffers and pad with fill_value.
+        output = np.full(size, fill_value, dtype=np.dtype(volume.dtype))
+        starts = [max(0, bbox[axis]) for axis in range(3)]
+        stops = [min(shape[axis], bbox[axis + 3]) for axis in range(3)]
+        destination = None
+        if all(stop > start for start, stop in zip(starts, stops)):
+            destination = tuple(
+                slice(start - bbox[axis], stop - bbox[axis])
+                for axis, (start, stop) in enumerate(zip(starts, stops))
+            )
+            output[destination] = crop[destination]
+        results.append((output, destination))
+    return results
