@@ -171,7 +171,7 @@ vc::objects::GeometryData quad_surface_geometry(QuadSurface& surface)
 
 std::string write_quad_rect_to_store(vc::objects::ObjectStore& db, vc::objects::WriteTxn& txn, const std::string& objectUuid,
     QuadSurface& surface, const cv::Rect& rect, const std::string& expected,
-    const std::vector<vc::objects::GeometryEdgeEdit>& edgeEdits)
+    const vc::objects::ObjectStoreSession::KeepRecorded& decide)
 {
     const auto revision = currentSurface(db, txn, objectUuid, expected);
     const auto shape = pointsShape(revision);
@@ -205,7 +205,9 @@ std::string write_quad_rect_to_store(vc::objects::ObjectStore& db, vc::objects::
     };
     rows("points", stored, 12, 3);
     if (validChanged) rows("valid", valid, 1, 1);
-    return db.editGeometry(txn, objectUuid, edits, revision.uuid, edgeEdits);
+    const auto decisions = decide ? decide(db.affectedGeometryEditEdges(txn, objectUuid, edits, revision.uuid))
+                                  : std::vector<vc::objects::GeometryEdgeEdit>{};
+    return db.editGeometry(txn, objectUuid, edits, revision.uuid, decisions);
 }
 
 std::string write_quad_channels_to_store(vc::objects::ObjectStore& db, vc::objects::WriteTxn& txn, const std::string& objectUuid,

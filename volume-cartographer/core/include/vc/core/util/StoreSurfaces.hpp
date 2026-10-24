@@ -44,6 +44,10 @@ public:
     std::string create(QuadSurface& surface, const std::string& name, const nlohmann::json& parameters,
                        const std::vector<std::string>& sources = {}, const std::vector<std::string>& tags = {},
                        const std::optional<nlohmann::json>& coordinates = std::nullopt);
+    // Publish the edited vertices of a surface this tool loaded, checked against
+    // the revision it loaded; relationships are kept as recorded. The grid must
+    // keep its size. Returns the new geometry revision.
+    std::string update(const std::string& uuid, QuadSurface& surface);
     // Shared non-geometry files of an object (OBJ exports, models).
     std::filesystem::path artifactDirectory(const std::string& uuid);
     // Wait until this tool's writes reached the hub (no-op for local stores).
@@ -57,4 +61,6 @@ private:
     std::shared_ptr<vc::objects::ObjectStoreSession> session_;
     vc::objects::AttachmentIdentity attachment_;
     std::optional<std::chrono::system_clock::time_point> lastWrite_;
+    // Object and geometry revisions of each loaded surface, the pins of updates.
+    std::map<std::string, std::pair<std::string, std::string>> loaded_;
 };

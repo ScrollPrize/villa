@@ -26,6 +26,7 @@ std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool a
     session_->read(attachment_, [&](const auto& db, const auto& txn, const auto&) {
         surface = load_quad_from_store(db, txn, uuid, std::nullopt, applyValidity);
         revision = db.currentGeometry(txn, surface->id)->uuid;
+        loaded_[surface->id] = {db.currentObjectRevision(txn, surface->id)->uuid, revision};
     });
     surface->setChannelLoader(store_channel_loader(session_, attachment_, revision));
     return surface;
@@ -63,6 +64,21 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
     lastWrite_ = std::chrono::system_clock::now();
     surface.id = record.uuid;
     return record.uuid;
+}
+
+std::string StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
+{
+    const auto found = loaded_.find(vc::objects::util::canonicalUuid(uuid));
+    if (found == loaded_.end()) throw std::runtime_error("update a surface this tool loaded: " + uuid);
+    const auto& [objectRevision, geometryRevision] = found->second;
+    const auto& points = *surface.rawPointsPtr();
+    std::string revision;
+    session_->editKeepingRelationships(attachment_, {{found->first, objectRevision}}, [&](auto& db, auto& txn, const auto& keep) {
+        revision = write_quad_rect_to_store(db, txn, found->first, surface, cv::Rect(0, 0, points.cols, points.rows),
+                                            geometryRevision, keep);
+    });
+    lastWrite_ = std::chrono::system_clock::now();
+    return revision;
 }
 
 std::filesystem::path StoreSurfaces::artifactDirectory(const std::string& uuid)

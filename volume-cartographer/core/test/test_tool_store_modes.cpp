@@ -33,7 +33,7 @@ std::string run(const std::string& command, const fs::path& log)
 {
     const int status = std::system((command + " > \"" + log.string() + "\" 2>&1").c_str());
     const auto output = readFile(log);
-    INFO(output);
+    if (status != 0) MESSAGE(command << "\n" << output);
     REQUIRE(status == 0);
     return output;
 }
@@ -148,4 +148,49 @@ TEST_CASE("OBJ converters create stored surfaces equal to their tifxyz output")
     run(modern + " " + mesh + " \"" + (f.dir / "modern.tifxyz").string() + "\" --tifxyz-source=\"" + f.tifxyz.string() + "\"", f.dir / "modern-file.log");
     const auto modernUuid = surfaceUuid(run(modern + " " + mesh + storeOptions + " --source-surface=" + f.uuid, f.dir / "modern-store.log"));
     checkSameSurface(f, modernUuid, f.dir / "modern.tifxyz", "vc_obj2tifxyz");
+}
+
+TEST_CASE("vc_merge_patch edits a stored parent like a tifxyz parent")
+{
+    Fixture f;
+    auto sheet = [](int rows, int cols, int row0, int col0, float lift) {
+        cv::Mat_<cv::Vec3f> points(rows, cols);
+        for (int r = 0; r < rows; ++r)
+            for (int c = 0; c < cols; ++c) {
+                const float x = 200.f + 2.f * float(col0 + c), y = 200.f + 2.f * float(row0 + r);
+                const bool interior = r > 6 && c > 6 && r < rows - 7 && c < cols - 7;
+                points(r, c) = {x, y, 100.f + 0.01f * (x - 240.f) * (x - 240.f) + (interior ? lift : 0.f)};
+                // A patch has an invalid frame around its valid region.
+                if (lift != 0.f && (r < 2 || c < 2 || r >= rows - 2 || c >= cols - 2)) points(r, c) = {-1.f, -1.f, -1.f};
+            }
+        return QuadSurface(points, {0.5f, 0.5f});
+    };
+    auto parent = sheet(40, 40, 0, 0, 0.f), child = sheet(24, 24, 8, 8, 1.5f);
+    parent.save(f.dir / "parent", true);
+    child.save(f.dir / "child", true);
+    const auto parentUuid = util::newUuid(), childUuid = util::newUuid();
+    {
+        OpenOptions options; options.author = "tool-store-test";
+        auto db = ObjectStore::open(f.store, options);
+        auto txn = db.write();
+        for (const auto& [uuid, surface] : {std::pair{parentUuid, &parent}, std::pair{childUuid, &child}}) {
+            ObjectRecord record; record.uuid = uuid; record.kind = "surface";
+            db.upsertObject(txn, record);
+            db.putGeometry(txn, uuid, quad_surface_geometry(*surface));
+        }
+        txn.commit();
+    }
+    const auto bin = tool("VC_MERGE_PATCH_BIN") + " --ransac-seed 7 --border-cells 4 --blend-cells 2";
+    run(bin + " --parent \"" + (f.dir / "parent").string() + "\" --child \"" + (f.dir / "child").string() + "\"", f.dir / "file.log");
+    const auto output = run(bin + " --store \"" + f.store.string() + "\" --parent " + parentUuid + " --child " + childUuid, f.dir / "store.log");
+    CHECK(output.find("geometry_revision: ") != std::string::npos);
+    OpenOptions options; options.author = "tool-store-test";
+    auto db = ObjectStore::open(f.store, options);
+    auto txn = db.read();
+    const auto stored = load_quad_from_store(db, txn, parentUuid);
+    const auto files = load_quad_from_tifxyz(f.dir / "parent");
+    REQUIRE(stored->rawPointsPtr()->size() == files->rawPointsPtr()->size());
+    CHECK(cv::norm(*stored->rawPointsPtr(), *files->rawPointsPtr(), cv::NORM_INF) == 0);
+    CHECK(cv::norm(*stored->rawPointsPtr(), *parent.rawPointsPtr(), cv::NORM_INF) > 0);  // the patch changed it
+    CHECK(fs::exists(fs::path(f.store.string() + ".artifacts") / parentUuid / "merge_patch_summary.json"));
 }

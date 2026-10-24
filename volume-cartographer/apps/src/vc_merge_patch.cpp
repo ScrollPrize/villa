@@ -34,6 +34,7 @@
 
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/StoreSurfaces.hpp"
 #include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
@@ -657,13 +658,14 @@ struct PMSurface {
     int                          valid{0};
 };
 
-PMSurface pmLoadSurface(const fs::path& p)
+// A tifxyz directory, or a stored surface UUID when `store` is given.
+PMSurface pmLoadSurface(const fs::path& p, StoreSurfaces* store)
 {
-    auto up = load_quad_from_tifxyz(p.string());
+    auto up = store ? store->load(p.string()) : load_quad_from_tifxyz(p.string());
     if (!up) throw std::runtime_error("failed to load surface: " + p.string());
     PMSurface s;
-    s.name = p.filename().string();
-    s.path = p;
+    s.name = store ? up->id : p.filename().string();
+    s.path = store ? fs::path() : p;
     s.qs = std::shared_ptr<QuadSurface>(up.release());
     const cv::Mat_<cv::Vec3f> pts = s.qs->rawPoints();
     s.H = pts.rows; s.W = pts.cols;
@@ -1055,7 +1057,7 @@ PMPatchStats pmApplyPatch(cv::Mat_<cv::Vec3f>& parent_points,
     return stats;
 }
 
-int pmRun(PMSurface parent, PMSurface child, const PMConfig& cfg)
+int pmRun(PMSurface parent, PMSurface child, const PMConfig& cfg, StoreSurfaces* store)
 {
     std::cout << "[0/6] parent + child ready\n";
     std::cout << "  parent: " << parent.name
@@ -1169,19 +1171,29 @@ int pmRun(PMSurface parent, PMSurface child, const PMConfig& cfg)
     //      retain their parent values bit-identical to the input.
     // invalidateMask + writeValidMask re-derive mask.tif from the patched
     // points so any newly valid cells are reflected.
-    std::cout << "[6/6] overwriting parent tifxyz at " << parent.path
-              << " (snapshot to " << parent.path.parent_path().string()
-              << "/backups/" << parent.name << "/)\n";
+    fs::path summary_path;
+    if (store) {
+        // A stored parent is edited in place; its revision history replaces backups.
+        std::cout << "[6/6] publishing the patched parent " << parent.name << "\n";
+        const auto revision = store->update(parent.name, *parent.qs);
+        store->finish();
+        std::cout << "geometry_revision: " << revision << "\n";
+        summary_path = store->artifactDirectory(parent.name) / "merge_patch_summary.json";
+    } else {
+        std::cout << "[6/6] overwriting parent tifxyz at " << parent.path
+                  << " (snapshot to " << parent.path.parent_path().string()
+                  << "/backups/" << parent.name << "/)\n";
 
-    parent.qs->invalidateMask();
-    parent.qs->saveOverwrite();
-    parent.qs->writeValidMask();
-
-    const fs::path summary_path = parent.path / (parent.name + "_summary.json");
+        parent.qs->invalidateMask();
+        parent.qs->saveOverwrite();
+        parent.qs->writeValidMask();
+        summary_path = parent.path / (parent.name + "_summary.json");
+    }
+    const auto identity = [&](const PMSurface& s) { return store ? s.name : s.path.string(); };
     json summary = {
-        {"parent",       parent.path.string()},
-        {"child",        child.path.string()},
-        {"output",       parent.path.string()},
+        {"parent",       identity(parent)},
+        {"child",        identity(child)},
+        {"output",       identity(parent)},
         {"border_cells", cfg.border_cells},
         {"blend_cells",  cfg.blend_cells},
         {"anchors", {
@@ -1254,6 +1266,9 @@ int main(int argc, char** argv)
         "edits in VC3D)");
     desc.add_options()
         ("help,h", "print help")
+        ("store", po::value<std::string>(),
+            "Object store holding both surfaces; the inputs are then surface UUIDs and "
+            "the parent is edited in place (its revision history replaces backups)")
         ("parent,p", po::value<std::string>(),
             "Parent tifxyz directory (explicit override). When both "
             "--parent and --child are set, auto-detection is skipped. "
@@ -1360,15 +1375,19 @@ int main(int argc, char** argv)
     }
 
     try {
-        if (!fs::is_directory(path_a))
-            throw std::runtime_error("not a directory: " + path_a.string());
-        if (!fs::is_directory(path_b))
-            throw std::runtime_error("not a directory: " + path_b.string());
+        std::optional<StoreSurfaces> store;
+        if (vm.count("store")) store.emplace(vm["store"].as<std::string>(), "vc_merge_patch");
+        else {
+            if (!fs::is_directory(path_a))
+                throw std::runtime_error("not a directory: " + path_a.string());
+            if (!fs::is_directory(path_b))
+                throw std::runtime_error("not a directory: " + path_b.string());
+        }
 
         std::cout << "[0/6] loading " << path_a.filename().string()
                   << " and " << path_b.filename().string() << "\n";
-        PMSurface a = pmLoadSurface(path_a);
-        PMSurface b = pmLoadSurface(path_b);
+        PMSurface a = pmLoadSurface(path_a, store ? &*store : nullptr);
+        PMSurface b = pmLoadSurface(path_b, store ? &*store : nullptr);
 
         PMSurface parent_surf, child_surf;
         if (explicit_roles) {
@@ -1402,7 +1421,7 @@ int main(int argc, char** argv)
             }
         }
 
-        return pmRun(std::move(parent_surf), std::move(child_surf), cfg);
+        return pmRun(std::move(parent_surf), std::move(child_surf), cfg, store ? &*store : nullptr);
     } catch (const std::exception& e) {
         std::cerr << "vc_merge_patch failed: " << e.what() << "\n";
         return EXIT_FAILURE;

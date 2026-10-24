@@ -627,11 +627,11 @@ std::function<cv::Mat(const std::string&)> store_channel_loader(
 vc::objects::GeometryData quad_surface_geometry(QuadSurface&);
 // Publish the vertices of `rect` (grid rows/columns) that differ from the stored
 // revision `expected` in one sparse edit: new coordinates also mark the vertex
-// valid; a vertex cleared to the sentinel loses its coordinates. Returns the new
-// (or unchanged) geometry revision.
+// valid; a vertex cleared to the sentinel loses its coordinates. `decide` answers
+// for relationships the edit affects. Returns the new (or unchanged) geometry revision.
 std::string write_quad_rect_to_store(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& objectUuid,
     QuadSurface&, const cv::Rect& rect, const std::string& expected,
-    const std::vector<vc::objects::GeometryEdgeEdit>& edgeEdits = {});
+    const vc::objects::ObjectStoreSession::KeepRecorded& decide = {});
 // Replace the named channels ("mask" is `valid`) with the surface's and remove `remove`.
 std::string write_quad_channels_to_store(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& objectUuid,
     QuadSurface&, const std::vector<std::string>& names, const std::vector<std::string>& remove,
