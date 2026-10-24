@@ -23,6 +23,7 @@ from vesuvius.ink_detection.inference.infer import (
     compute_equal_length_mirror_axes,
     compute_importance_map_2d,
     flat_preprocessing_from_config,
+    folder_run_identity,
     infer_folder,
     iter_blocks,
     iter_probability_tiles,
@@ -345,24 +346,210 @@ def test_folder_mode_logs_existing_prediction_and_summary(
     (input_zarr / ".zarray").touch()
     prediction_dir = segment / "preds"
     prediction_dir.mkdir()
-    existing = prediction_dir / "segment_model_forward_010101.tif"
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"weights")
+    configured = SimpleNamespace(patch_size=16, amp_dtype=None)
+    args = SimpleNamespace(
+        folder=tmp_path,
+        checkpoint=checkpoint,
+        output_prefix="",
+        direction="forward",
+        resolution="0",
+        mask_path=None,
+        overlap=0.5,
+        stride=None,
+        blend_mode="auto",
+        layer_start=None,
+        layer_end=None,
+        tta_mirror=False,
+        tta_batch_size=None,
+    )
+    identity = folder_run_identity(
+        args, configured, device=torch.device("cpu")
+    )
+    existing = prediction_dir / f"segment_{identity}_forward_010101.tif"
     existing.touch()
     monkeypatch.setattr(
         "vesuvius.ink_detection.inference.infer.infer_single_zarr",
         lambda **kwargs: pytest.fail("existing prediction was rerun"),
     )
-    args = SimpleNamespace(
-        folder=tmp_path,
-        checkpoint=Path("model.pth"),
-        output_prefix="",
-        direction="forward",
+    with caplog.at_level("INFO"):
+        infer_folder(args, configured, device=torch.device("cpu"))
+
+    assert f"already have {existing.name}" in caplog.text
+    assert "segments_ran=0 segments_skipped=1" in caplog.text
+
+
+def test_folder_mode_distinguishes_semantic_run_identity(tmp_path, monkeypatch):
+    segment = tmp_path / "segments" / "segment"
+    input_zarr = segment / "surface.zarr"
+    input_zarr.mkdir(parents=True)
+    (input_zarr / ".zarray").touch()
+    seed42 = tmp_path / "seed42" / "step-075000.pth"
+    seed43 = tmp_path / "seed43" / "step-075000.pth"
+    seed42.parent.mkdir()
+    seed43.parent.mkdir()
+    seed42.write_bytes(b"seed42 checkpoint")
+    seed43.write_bytes(b"seed43 checkpoint")
+    configured = SimpleNamespace(patch_size=16, amp_dtype=None)
+    calls = []
+
+    def record_inference(**kwargs):
+        output_tiff = Path(kwargs["output_tiff"])
+        output_tiff.parent.mkdir(parents=True, exist_ok=True)
+        output_tiff.touch()
+        calls.append(output_tiff.name)
+
+    monkeypatch.setattr(
+        "vesuvius.ink_detection.inference.infer.infer_single_zarr",
+        record_inference,
     )
 
-    with caplog.at_level("INFO"):
-        infer_folder(args, None, device=torch.device("cpu"))
+    def run(checkpoint, layer_start):
+        args = SimpleNamespace(
+            folder=tmp_path / "segments",
+            checkpoint=checkpoint,
+            output_prefix="",
+            direction="forward",
+            resolution="0",
+            mask_path=None,
+            overlap=0.5,
+            stride=None,
+            blend_mode="auto",
+            layer_start=layer_start,
+            layer_end=layer_start + 16,
+            tta_mirror=False,
+            tta_batch_size=None,
+        )
+        infer_folder(args, configured, device=torch.device("cpu"))
+        return folder_run_identity(
+            args, configured, device=torch.device("cpu")
+        )
 
-    assert "already have segment_model_forward_010101.tif" in caplog.text
-    assert "segments_ran=0 segments_skipped=1" in caplog.text
+    first_identity = run(seed42, 0)
+    changed_settings_identity = run(seed42, 8)
+    repeated_identity = run(seed42, 0)
+    changed_checkpoint_identity = run(seed43, 0)
+
+    assert len(calls) == 3
+    assert len(set(calls)) == 3
+    assert first_identity == repeated_identity
+    assert first_identity != changed_settings_identity
+    assert first_identity != changed_checkpoint_identity
+
+
+def test_folder_run_identity_covers_semantic_not_operational_inputs(tmp_path):
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"checkpoint")
+    ensemble_a = tmp_path / "seed-a" / "member.pth"
+    ensemble_b = tmp_path / "seed-b" / "member.pth"
+    ensemble_a.parent.mkdir()
+    ensemble_b.parent.mkdir()
+    ensemble_a.write_bytes(b"ensemble a")
+    ensemble_b.write_bytes(b"ensemble b")
+    mask_a = tmp_path / "mask-a.png"
+    mask_b = tmp_path / "mask-b.png"
+    mask_a.write_bytes(b"same mask bytes")
+    mask_b.write_bytes(b"same mask bytes")
+    configured = SimpleNamespace(patch_size=16, amp_dtype=None)
+    device = torch.device("cpu")
+    defaults = {
+        "checkpoint": checkpoint,
+        "ensemble_checkpoint": [],
+        "resolution": "0",
+        "mask_path": None,
+        "overlap": 0.5,
+        "stride": None,
+        "blend_mode": "auto",
+        "layer_start": 0,
+        "layer_end": 16,
+        "tta_mirror": False,
+        "tta_batch_size": None,
+        "num_workers": 0,
+        "prefetch_factor": 2,
+        "batch_size": 1,
+        "compile_model": False,
+        "compile_mode": "default",
+        "cache_dir": None,
+        "cache_max_gb": 64.0,
+    }
+
+    def identity(**updates):
+        values = {**defaults, **updates}
+        return folder_run_identity(
+            SimpleNamespace(**values), configured, device=device
+        )
+
+    reference = identity()
+    semantic_variants = (
+        identity(resolution="1"),
+        identity(mask_path=mask_a),
+        identity(layer_start=8, layer_end=24),
+        identity(stride=4),
+        identity(blend_mode="gaussian"),
+        identity(tta_mirror=True, tta_batch_size=2),
+        identity(ensemble_checkpoint=[ensemble_a]),
+        folder_run_identity(
+            SimpleNamespace(**defaults),
+            SimpleNamespace(patch_size=16, amp_dtype=torch.float16),
+            device=torch.device("cuda"),
+        ),
+    )
+    assert all(value != reference for value in semantic_variants)
+    assert identity(mask_path=mask_a) == identity(mask_path=mask_b)
+    assert identity(ensemble_checkpoint=[ensemble_a]) != identity(
+        ensemble_checkpoint=[ensemble_b]
+    )
+    assert "-ens2-" in identity(ensemble_checkpoint=[ensemble_a])
+    assert identity(
+        num_workers=8,
+        prefetch_factor=5,
+        batch_size=4,
+        compile_model=True,
+        compile_mode="reduce-overhead",
+        cache_dir=tmp_path / "cache",
+        cache_max_gb=1.0,
+    ) == reference
+
+
+def test_folder_run_identity_hashes_each_unique_checkpoint_once(
+    tmp_path, monkeypatch
+):
+    checkpoint = tmp_path / "primary.pth"
+    ensemble = tmp_path / "member.pth"
+    checkpoint.write_bytes(b"primary")
+    ensemble.write_bytes(b"member")
+    calls = []
+
+    def record_hash(path):
+        calls.append(Path(path))
+        return f"hash-{Path(path).name}"
+
+    monkeypatch.setattr(
+        "vesuvius.ink_detection.inference.infer._file_sha256", record_hash
+    )
+    args = SimpleNamespace(
+        checkpoint=checkpoint,
+        ensemble_checkpoint=[ensemble, ensemble],
+        resolution="0",
+        mask_path=None,
+        overlap=0.5,
+        stride=None,
+        blend_mode="auto",
+        layer_start=0,
+        layer_end=16,
+        tta_mirror=False,
+        tta_batch_size=None,
+    )
+
+    identity = folder_run_identity(
+        args,
+        SimpleNamespace(patch_size=16, amp_dtype=None),
+        device=torch.device("cpu"),
+    )
+
+    assert calls == [checkpoint, ensemble]
+    assert "-ens3-" in identity
 
 
 def test_cpu_command_checkpoint_to_tiff_timeline(tmp_path, caplog):
