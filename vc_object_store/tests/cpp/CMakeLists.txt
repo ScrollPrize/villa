@@ -1,6 +1,6 @@
 find_package(Threads REQUIRED)
 add_executable(test_object_store_session test_object_store_session.cpp)
-target_link_libraries(test_object_store_session PRIVATE vc_objects Threads::Threads)
+target_link_libraries(test_object_store_session PRIVATE vc_objects nlohmann_json::nlohmann_json Threads::Threads)
 add_test(NAME object_store_session COMMAND test_object_store_session)
 set_tests_properties(object_store_session PROPERTIES TIMEOUT 30)
 add_executable(test_object_store_geometry_region test_object_store_geometry_region.cpp)

@@ -112,6 +112,9 @@ public:
     // All writes are immediate checked atomic actions. The library enforces
     // expectations for every affected object and relationship endpoint.
     RevisionSelection act(const AttachmentIdentity&, const RevisionSelection&, const Action&);
+    // Copy an object's current record and geometry from one attachment into
+    // another as a new object (objects/ObjectCopy.hpp); returns its UUID.
+    std::string copyObject(const AttachmentIdentity& from, const AttachmentIdentity& to, const std::string& objectUuid);
     // Drain accepted writes on every attachment. No delayed persistence or new geometry publication.
     void finalize();
     // Poll from the application's event loop. Includes external commits and

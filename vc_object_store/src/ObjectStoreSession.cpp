@@ -1,5 +1,6 @@
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "hub/HubWorker.hpp"
+#include "vc_object_store/objects/ObjectCopy.hpp"
 #include <algorithm>
 #include <stdexcept>
 
@@ -204,6 +205,15 @@ RevisionSelection ObjectStoreSession::act(const AttachmentIdentity& identity,
     } catch (...) { release(*attachment, true); throw; }
     release(*attachment, true);
     return committed;
+}
+
+std::string ObjectStoreSession::copyObject(const AttachmentIdentity& from, const AttachmentIdentity& to,
+                                           const std::string& objectUuid)
+{
+    std::optional<ObjectCopy> copy;
+    read(from, [&](const auto& store, const auto& txn, const auto&) { copy = readObjectCopy(store, txn, objectUuid); });
+    act(to, {{copy->record.uuid, std::nullopt}}, [&](auto& store, auto& txn) { writeObjectCopy(store, txn, *copy); });
+    return copy->record.uuid;
 }
 
 void ObjectStoreSession::finalize()

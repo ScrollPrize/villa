@@ -82,7 +82,11 @@ requests. `takeEvents()` polls local and external commits of
 every attachment for all object kinds, tagged by attachment; call it from the
 application's event loop. Each change carries
 its record's object or edge `kind` (kept for deletions too), so a consumer
-filters by kind without looking the record up. `finalize()` waits
+filters by kind without looking the record up. `copyObject(from, to, uuid)` copies an
+object's current record and geometry from one attachment into another as a new
+object (new UUID, `meta.copied_from` naming the source store, object and
+revisions; point annotations kept); relationships, history and approval stay
+behind. `finalize()` waits
 for accepted writes on every attachment; edits are already committed by `act()`.
 
 Fiber consumers use the same `selectObjects`, `geometryRegion`, geometry, and

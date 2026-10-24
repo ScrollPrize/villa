@@ -37,6 +37,7 @@ add_library(vc_objects STATIC
     Spatial.cpp
     GeometryRegion.cpp
     SurfaceProximity.cpp
+    ObjectCopy.cpp
     sync/Synchronize.cpp
     sync/GeometryTransfer.cpp
     sync/Apply.cpp

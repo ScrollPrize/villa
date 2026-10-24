@@ -1,5 +1,7 @@
 #include "TestSupport.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
+#include <nlohmann/json.hpp>
 #include <future>
 #include <thread>
 #include <iostream>
@@ -198,6 +200,53 @@ int main() try
         require(event.kind == StoreSessionEvent::Kind::Committed && event.changes.size() == 1 &&
                 event.changes[0].recordUuid == (event.attachment == catalog ? a : added), "events are tagged by attachment");
     mustFail([&] { session.act(catalog, {}, [](auto&, auto&) {}); });
+
+    // Copying from the read-only catalog into the writable store makes a new,
+    // editable object with the same geometry, channels and point annotations.
+    std::string surface, points;
+    {
+        auto txn = external.write();
+        ObjectRecord record; record.kind = "surface"; record.name = "catalog surface"; record.tags = {"paths"};
+        record.meta = R"({"coordinates":{"volume_uuid":"vol","scale_factor":1}})";
+        surface = external.upsertObject(txn, record);
+        auto data = vc::geometry::encode(vc::geometry::Surface{1, 2, {1, 1}, {{1, 2, 3}, {4, 5, 6}}, {255, 0}});
+        data.arrays.push_back({"ink", "<u2", {2, 4}, std::vector<uint8_t>(16, 7)});
+        external.putGeometry(txn, surface, data);
+        ObjectRecord collection; collection.kind = "point_collection";
+        collection.meta = R"({"source":{"point_attributes":[{"note":"first"},{}]}})";
+        points = external.upsertObject(txn, collection);
+        external.putGeometry(txn, points, vc::geometry::encode(vc::geometry::PointCollection{{7, 3}, {{1, 2, 3}, {4, 5, 6}}}));
+        txn.commit();
+    }
+    for (const auto& original : {surface, points}) {
+        const auto copied = session.copyObject(catalog, replacement, original);
+        require(copied != original, "copies get new UUIDs");
+        GeometryData source, target;
+        std::string sourceAnnotations, targetAnnotations;
+        session.read(catalog, [&](const auto& store, const auto& txn, const auto&) {
+            const auto revision = store.currentGeometry(txn, original)->uuid;
+            source = store.readGeometryData(txn, revision);
+            if (source.kind != "surface") sourceAnnotations = store.geometryPointAnnotations(txn, revision, "points");
+        });
+        session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+            const auto object = store.objectByUuid(txn, copied);
+            const auto meta = nlohmann::json::parse(object->meta);
+            require(meta.at("copied_from").at("object_uuid") == original &&
+                    meta.at("copied_from").at("store_uuid") == catalog.storeUuid, "copies record their source");
+            if (object->kind == "surface")
+                require(object->name == "catalog surface" && object->tags == std::vector<std::string>{"paths"} &&
+                        meta.at("coordinates").at("volume_uuid") == "vol", "copies keep name, tags and binding");
+            const auto revision = store.currentGeometry(txn, copied)->uuid;
+            target = store.readGeometryData(txn, revision);
+            if (target.kind != "surface") targetAnnotations = store.geometryPointAnnotations(txn, revision, "points");
+        });
+        require(source.arrays.size() == target.arrays.size(), "copies keep every array");
+        for (size_t i = 0; i < source.arrays.size(); ++i)
+            require(source.arrays[i].name == target.arrays[i].name && source.arrays[i].bytes == target.arrays[i].bytes,
+                    "copies keep exact geometry");
+        require(sourceAnnotations == targetAnnotations, "copies keep point annotations");
+    }
+    session.takeEvents();
     session.detach(catalog);
     require(session.current(replacement) && !session.current(catalog), "detaching one keeps the other");
     session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
