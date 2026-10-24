@@ -391,6 +391,10 @@ Each GPU-using process runs a `GpuPauseServer` on a PID-based Unix socket
 the LIFO ownership order.  If a pausing process crashes, the paused process
 auto-resumes within 5 seconds (watchdog).
 
+To run a job without pausing the current owner, for example two inference
+runs meant to share one GPU or to use different GPUs of one machine, set
+`GPU_PAUSE_DISABLE=1` for it (the fit service also takes `--no-gpu-pause`).
+
 Control from another terminal (auto-discovers current GPU owner):
 
 ```bash
