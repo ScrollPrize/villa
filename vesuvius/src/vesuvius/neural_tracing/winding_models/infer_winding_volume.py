@@ -762,7 +762,9 @@ def build_seed_rays(args, device="cuda:0"):
                 "gap_expander_logit_resolution", "gap_expander_num_windings",
                 "gap_expander_lr_scale", "linear_z_resolution",
                 "initial_dr_per_winding"):
-        cfg.setdefault(f"model_{key}", cfg[key])
+        # Recent spiral-fitting checkpoints store only the model_ keys.
+        if key in cfg:
+            cfg.setdefault(f"model_{key}", cfg[key])
 
     z_begin, z_end = int(checkpoint["z_begin"]), int(checkpoint["z_end"])
     z_lo, z_hi = args.z_range if args.z_range else (z_begin, z_end)
