@@ -96,18 +96,18 @@ Because the papyrus is damaged, the readings are fragmentary, with gaps where th
 
 <div className="opacity-60 italic mb-4 text-sm">Translated from the Greek; the full column-by-column transcription is in the <a href="/pdf/main.pdf" target="_blank" rel="noopener">preprint</a>.</div>
 
-### PHerc. Paris 4 — ink made visible by higher resolution
+### PHerc. Paris. 4 — ink made visible by higher resolution
 
-In a second scroll — **PHerc. Paris 4, the scroll the Vesuvius Challenge community knows as Scroll 1** — a higher-resolution imaging technique makes the ink **directly visible inside the scroll itself**, in the three-dimensional X-ray data, for the first time. Segmented in 3D and projected back onto the unwrapped page, that ink matches the text read in the 2023 Grand Prize **one-to-one** — an independent confirmation, from better data, that the reading is real.
+In a second scroll — **PHerc. Paris. 4, the scroll the Vesuvius Challenge community knows as Scroll 1** — a higher-resolution imaging technique makes the ink **directly visible inside the scroll itself**, in the three-dimensional X-ray data, for the first time. Segmented in 3D and projected back onto the unwrapped page, that ink matches the text read in the 2023 Grand Prize **one-to-one** — an independent confirmation, from better data, that the reading is real.
 
 <figure className="">
-  <img src="/img/firstscroll/fig2.webp" alt="Higher-resolution cross-section of PHerc. Paris 4 showing ink directly visible on the papyrus surface, with the ink segmented in three dimensions." />
-  <figcaption className="mt-0">Ink made visible by higher resolution in PHerc. Paris 4 (Scroll 1). In a cross-section of the X-ray scan, the ink sits directly on the papyrus surface (left); it can then be segmented in three dimensions (red) and projected onto the unwrapped page.</figcaption>
+  <img src="/img/firstscroll/fig2.webp" alt="Higher-resolution cross-section of PHerc. Paris. 4 showing ink directly visible on the papyrus surface, with the ink segmented in three dimensions." />
+  <figcaption className="mt-0">Ink made visible by higher resolution in PHerc. Paris. 4 (Scroll 1). In a cross-section of the X-ray scan, the ink sits directly on the papyrus surface (left); it can then be segmented in three dimensions (red) and projected onto the unwrapped page.</figcaption>
 </figure>
 
 <figure className="">
-  <img src="/img/firstscroll/fig3.webp" alt="PHerc. Paris 4: the 2023 Grand Prize reading compared with the 2024 high-resolution synchrotron result, showing markedly clearer letters." />
-  <figcaption className="mt-0">PHerc. Paris 4: the 2023 Vesuvius Challenge Grand Prize reading (top) and the new 3D ink segmentation (bottom) — the same text, recovered one-to-one from better data.</figcaption>
+  <img src="/img/firstscroll/fig3.webp" alt="PHerc. Paris. 4: the 2023 Grand Prize reading compared with the 2024 high-resolution synchrotron result, showing markedly clearer letters." />
+  <figcaption className="mt-0">PHerc. Paris. 4: the 2023 Vesuvius Challenge Grand Prize reading (top) and the new 3D ink segmentation (bottom) — the same text, recovered one-to-one from better data.</figcaption>
 </figure>
 
 ### PHerc. 139 — a title, and an author

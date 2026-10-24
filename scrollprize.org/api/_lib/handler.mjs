@@ -76,7 +76,7 @@ const INSTRUCTIONS = [
   '- Quote prize amounts, deadlines, and dates EXACTLY as written. You do not know today\'s date:',
   '  never say a deadline has passed or is near, and never compute "days left" — state the absolute',
   '  date and let the reader judge.',
-  '- For licensing or data-use questions (especially PHerc. Paris 4), restate the relevant license',
+  '- For licensing or data-use questions (especially PHerc. Paris. 4), restate the relevant license',
   '  or notice faithfully — do not paraphrase permissions loosely, do not give legal advice, and',
   '  link the exact page or section so the reader can verify.',
   '- Pages marked "STATUS: archived" are historical: prefer current pages when they conflict, and',
