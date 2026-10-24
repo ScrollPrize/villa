@@ -905,6 +905,7 @@ if(VC_TESTING)
     endfunction()
 
     enable_testing()
+    add_subdirectory(utils/tests)
     add_subdirectory(core/test)
     add_subdirectory(apps/VC3D/agent_bridge/test)
     add_subdirectory(apps/VC3D/test)
@@ -921,6 +922,7 @@ if(VC_TESTING)
 
     set(_vc_actual_ctests)
     foreach(_test_dir
+            "${CMAKE_SOURCE_DIR}/utils/tests"
             "${CMAKE_SOURCE_DIR}/core/test"
             "${CMAKE_SOURCE_DIR}/apps/VC3D/agent_bridge/test"
             "${CMAKE_SOURCE_DIR}/apps/VC3D/test")

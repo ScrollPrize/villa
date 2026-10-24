@@ -1,5 +1,6 @@
 #include "utils/zarr.hpp"
 #include "utils/sftp_fetch.hpp"
+#include "verified_chunk_runtime.hpp"
 
 #include <charconv>
 #include <cmath>
@@ -1685,6 +1686,7 @@ ZarrArray ZarrArray::create(const std::filesystem::path& path,
 
 ZarrArray ZarrArray::open(std::shared_ptr<Store> store, const std::string& array_key,
                           Codec codec) {
+    selected_read::runtime().reject_store();
     // Build store key without leading "/" when array_key is empty.
     auto store_key = [&](const std::string& name) -> std::string {
         return array_key.empty() ? name : array_key + "/" + name;
@@ -1704,6 +1706,7 @@ ZarrArray ZarrArray::open(std::shared_ptr<Store> store, const std::string& array
 
 ZarrArray ZarrArray::open(std::shared_ptr<Store> store, const std::string& array_key,
                           CodecRegistry registry) {
+    selected_read::runtime().reject_store();
     auto store_key = [&](const std::string& name) -> std::string {
         return array_key.empty() ? name : array_key + "/" + name;
     };
@@ -2045,6 +2048,7 @@ bool ZarrArray::direct_chunk_payload_is_decoded_bytes() const noexcept {
 std::optional<std::vector<std::byte>>
 ZarrArray::read_inner_chunk(std::span<const std::size_t> shard_indices,
                             std::span<const std::size_t> inner_indices) const {
+    selected_read::runtime().reject(root_);
     if (!is_sharded())
         throw std::runtime_error("zarr: not a sharded array");
 
@@ -2255,6 +2259,7 @@ void ZarrArray::set_shard_entry_locked(const std::filesystem::path& p, std::size
 
 std::optional<detail::ShardIndexEntry>
 ZarrArray::read_shard_entry(const std::filesystem::path& p, std::size_t linear) const {
+    selected_read::runtime().reject(root_);
     // The trailing index moves on every update, so its position (the file
     // size) is taken under the lock that guards the entry read, from the
     // same descriptor.
@@ -2390,6 +2395,9 @@ std::string ZarrArray::chunk_key_v3(std::span<const std::size_t> idx) const {
 
 std::optional<std::vector<std::byte>>
 ZarrArray::read_raw(const std::string& key) const {
+    auto& verifier = selected_read::runtime();
+    if (store_) verifier.reject_store();
+    if (verifier.protects(root_)) return verifier.read(root_, key, is_sharded(), bool(store_));
     if (store_) {
         auto full_key = array_key_.empty() ? key : array_key_ + "/" + key;
         return store_->get_if_exists(full_key);
@@ -2414,6 +2422,7 @@ void ZarrArray::write_chunk_raw(std::span<const std::size_t> idx,
 
 std::optional<std::vector<std::byte>>
 ZarrArray::read_inner_chunk_from_shard(std::span<const std::size_t> chunk_indices) const {
+    selected_read::runtime().reject(root_);
     if (!is_sharded()) return std::nullopt;
     const auto ndim = meta_.ndim();
 
@@ -2510,6 +2519,7 @@ ZarrArray::read_inner_chunk_from_shard(std::span<const std::size_t> chunk_indice
 
 std::optional<ShardBytes>
 ZarrArray::read_whole_shard(std::span<const std::size_t> chunk_indices) const {
+    selected_read::runtime().reject(root_);
     if (!is_sharded()) return std::nullopt;
     const auto ndim = meta_.ndim();
     std::vector<std::size_t> shard_idx(ndim);
