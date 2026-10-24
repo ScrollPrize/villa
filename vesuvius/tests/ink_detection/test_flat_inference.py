@@ -18,6 +18,7 @@ from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
 from vesuvius.ink_detection.inference.infer import (
     ChunkAccumulator,
     FlatPatchReader,
+    build_lowres_block_mask,
     choose_pyramid_array,
     compute_chunk_contribution_counts,
     compute_equal_length_mirror_axes,
@@ -77,6 +78,112 @@ def test_pyramid_substitution_and_mask_alignment_warn_factually(tmp_path, caplog
     assert mask.shape == (3, 2)
     assert "Requested input level 0 was not found; using level 1" in caplog.text
     assert "Mask shape (2, 3) did not match Zarr shape (3, 2)" in caplog.text
+
+
+def _layer_preserving_pyramid(path, level0, levels):
+    """Write a surface-volume pyramid that keeps every layer and floors Y/X."""
+
+    if int(zarr.__version__.split(".", 1)[0]) >= 3:
+        group = zarr.open_group(path, mode="w", zarr_format=2)
+        create = group.create_array
+    else:
+        group = zarr.open_group(path, mode="w")
+        create = group.create_dataset
+    data = level0
+    for level in range(levels):
+        if level:
+            depth, height, width = data.shape
+            data = data[:, : height // 2 * 2, : width // 2 * 2]
+            data = data.reshape(depth, height // 2, 2, width // 2, 2).max(axis=(2, 4))
+        chunks = (data.shape[0], min(64, data.shape[1]), min(64, data.shape[2]))
+        create(str(level), shape=data.shape, chunks=chunks, dtype="u1")
+        group[str(level)][:] = data
+    return group
+
+
+def test_occupancy_scan_uses_volume_depth_axis_and_fits_user_mask(tmp_path):
+    # 6 layers kept at every level: level 3 of a 41-row render has 5 rows,
+    # fewer than its 6 layers, and floor rounding leaves it one row short of
+    # the any-pooled user mask (ceil(41 / 8) = 6).
+    level0 = np.zeros((6, 41, 200), dtype=np.uint8)
+    level0[:, :, 96:160] = 7
+    root = _layer_preserving_pyramid(tmp_path / "strip.zarr", level0, 4)
+    user_mask = np.zeros((41, 200), dtype=bool)
+    user_mask[:, 100:140] = True
+
+    occupancy, scale, level = build_lowres_block_mask(
+        root,
+        height=41,
+        width=200,
+        user_mask=user_mask,
+        depth_axis_first=True,
+    )
+
+    assert level == "3"
+    assert scale == (8, 8)
+    assert occupancy.shape == (5, 25)
+    assert not occupancy[:, :12].any()
+    assert occupancy[:, 12:18].all()
+    assert not occupancy[:, 18:].any()
+
+
+def test_occupancy_without_pyramid_is_pooled_band_by_band(tmp_path, monkeypatch):
+    # prepare_9um_isotropic_input writes only level 0: the scan must not load
+    # the whole level at once, and must still keep every nonempty block.
+    level0 = np.zeros((6, 300, 90), dtype=np.uint8)
+    level0[:, 130:140, 40:50] = 9
+    root = _layer_preserving_pyramid(tmp_path / "single.zarr", level0, 1)
+    array_type = type(root["0"])
+    original_getitem = array_type.__getitem__
+    read_rows = []
+
+    def recording_getitem(self, selection):
+        value = original_getitem(self, selection)
+        read_rows.append(np.asarray(value).shape[1])
+        return value
+
+    monkeypatch.setattr(array_type, "__getitem__", recording_getitem)
+
+    occupancy, scale, level = build_lowres_block_mask(
+        root,
+        height=300,
+        width=90,
+        user_mask=np.ones((300, 90), dtype=bool),
+        depth_axis_first=True,
+    )
+
+    assert level == "0"
+    assert scale == (8, 8)
+    assert occupancy.shape == (38, 12)
+    assert occupancy[16:18, 5:7].all()
+    assert occupancy.sum() == 4
+    assert read_rows and max(read_rows) <= 64
+    blocks = iter_blocks((300, 90), 64, 32, occupancy, scale)
+    assert {(block.y0, block.x0) for block in blocks} == {
+        (96, 0),
+        (96, 26),
+        (128, 0),
+        (128, 26),
+    }
+
+
+def test_user_mask_fits_a_pyramid_that_floors_odd_sizes(tmp_path):
+    # The depth axis is unambiguous here, but level 3 is floored
+    # (81 -> 40 -> 20 -> 10 rows) while the pooled mask has ceil(81 / 8) = 11.
+    level0 = np.zeros((6, 81, 200), dtype=np.uint8)
+    level0[:, :, 96:160] = 7
+    root = _layer_preserving_pyramid(tmp_path / "odd.zarr", level0, 4)
+    user_mask = np.zeros((81, 200), dtype=bool)
+    user_mask[:, 100:140] = True
+
+    occupancy, scale, _ = build_lowres_block_mask(
+        root, height=81, width=200, user_mask=user_mask
+    )
+
+    assert scale == (8, 8)
+    assert occupancy.shape == (10, 25)
+    assert occupancy[:, 12:18].all()
+    assert occupancy.sum() == 10 * 6
 
 
 def test_flat_preprocessing_accepts_exact_training_contracts():
