@@ -309,6 +309,12 @@ def get_base_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="List available tasks and exit",
     )
+    parser.add_argument(
+        "-y",
+        "--yes",
+        action="store_true",
+        help="Overwrite an existing output without asking (for scripts and batch jobs)",
+    )
     return parser
 
 
