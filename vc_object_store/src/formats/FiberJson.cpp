@@ -24,12 +24,35 @@ size_t fiberBranchControlIndex(const std::vector<int64_t>& controlIds, const Anc
     throw std::runtime_error("Fiber branch control point is absent from selected geometry");
 }
 
+namespace {
+// Version 3 names its frame "SAMPLE/VOLUME_ID@Lk". Only level 0 (scale factor 1) is
+// exactly the store's {volume_uuid, scale_factor 1}; other levels are refused.
+void version3Coordinates(Json& root)
+{
+    if (root.contains("vc_open_data_coordinate_space")) {
+        const auto space = root.at("vc_open_data_coordinate_space").get<std::string>();
+        const auto slash = space.find('/'), level = space.rfind("@L");
+        if (slash == std::string::npos || level == std::string::npos || level <= slash + 1)
+            throw std::runtime_error("invalid version 3 coordinate space: " + space);
+        if (space.substr(level) != "@L0" || root.value("vc_open_data_source_coordinate_scale_factor", 1.0) != 1.0)
+            throw std::runtime_error("version 3 fiber coordinates are supported only at level 0: " + space);
+        root["coordinates"] = {{"volume_uuid", space.substr(slash + 1, level - slash - 1)}, {"scale_factor", 1}};
+    }
+    std::vector<std::string> openData;
+    for (const auto& [key, value] : root.items())
+        if (key.starts_with("vc_open_data_")) openData.push_back(key);
+    for (const auto& key : openData) root.erase(key);
+}
+}
+
 GeometrySource decodeFiberJson(const std::string& text)
 {
     auto root = Json::parse(text);
     if (root.value("type", "") != "vc3d_fiber") throw std::runtime_error("expected vc3d_fiber JSON");
-    if (root.value("version", int64_t(0)) != 4)
-        throw std::runtime_error("Fiber transfer requires version 4");
+    const auto version = root.value("version", int64_t(0));
+    if (version != 3 && version != 4)
+        throw std::runtime_error("Fiber transfer requires version 3 or 4");
+    if (version == 3) version3Coordinates(root);
     GeometrySource p;
     p.object.uuid = util::canonicalUuid(root.at("uuid").get<std::string>());
     p.object.kind = "fiber";

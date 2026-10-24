@@ -14,10 +14,21 @@ int main() try {
                                       Json{{"position",{5.25,2,3}}}})},
         {"line_points",{{1.25,2,3},{5.25,2,3}}}, {"hv_classification",{{"manual_tag","H"}}}};
     const auto doc = decodeFiberJson(root.dump());
-    for (const int version : {1, 2, 3}) {
+    for (const int version : {1, 2}) {
         auto legacy = root; legacy["version"] = version;
         mustFail([&] { decodeFiberJson(legacy.dump()); });
     }
+    auto version3 = root; version3["version"] = 3;
+    version3["vc_open_data_coordinate_space"] = "PHercParis4/20260411134726@L0";
+    version3["vc_open_data_source_coordinate_scale_factor"] = 1;
+    version3["vc_open_data_source_path"] = "https://example.invalid/volume.zarr";
+    const auto fromVersion3 = decodeFiberJson(version3.dump());
+    require(fromVersion3.source["coordinates"] == Json({{"volume_uuid","20260411134726"},{"scale_factor",1}}) &&
+            !fromVersion3.source.contains("vc_open_data_source_path") && fromVersion3.object.formatVersion == 4,
+            "version 3 level-0 coordinate space becomes the volume binding");
+    version3["vc_open_data_coordinate_space"] = "PHercParis4/20260411134726@L2";
+    version3["vc_open_data_source_coordinate_scale_factor"] = 4;
+    mustFail([&] { decodeFiberJson(version3.dump()); });
     auto versionless = root; versionless.erase("version");
     mustFail([&] { decodeFiberJson(versionless.dump()); });
     auto oldControls = root; oldControls["control_points"] = {{1.25,2,3},{5.25,2,3}};

@@ -370,6 +370,48 @@ def test_fiber_collection_and_linked_file_import_use_uuid_endpoints(db, tmp_path
         assert other.object_count('fiber') == 0
 
 
+def test_version3_fiber_directory_import_resolves_links_by_file(tmp_path):
+    import json
+    import uuid
+    ids = [str(uuid.uuid4()) for _ in range(3)]
+    files = [f'anon_{i}.json' for i in range(3)]
+
+    def branch(target, own, other, direction, branch_direction):
+        return dict(branch_file=files[target], branch_fiber_id=target, control_point_index=own,
+                    branch_control_point_index=other, control_point_position=[0, 0, 0],
+                    branch_control_point_position=[0, 0, 0], control_point_direction=direction,
+                    branch_control_point_direction=branch_direction)
+
+    def write(directory, noise):
+        directory.mkdir()
+        documents = [dict(type='vc3d_fiber', version=3, uuid=uid, filename=name, sequence=i,
+                          control_points=[{'position': [i, 0, 0]}, {'position': [i, 1, 0]}],
+                          line_points=[[i, 0, 0], [i, 1, 0]], branches=[])
+                     for i, (uid, name) in enumerate(zip(ids, files))]
+        documents[0].update(vc_open_data_coordinate_space='Sample/20260411134726@L0',
+                            vc_open_data_source_coordinate_scale_factor=1)
+        # VC3D v3 wrote each link from both ends; directions differ by float noise.
+        documents[0]['branches'].append(branch(1, 1, 0, [1, 0, 0], [0, 1, 0]))
+        documents[1]['branches'].append(branch(0, 0, 1, [0, 1 + noise, 0], [1, 0, 0]))
+        for i, document in enumerate(documents):
+            (directory / files[i]).write_text(json.dumps(document))
+
+    write(tmp_path / 'fibers', 1e-16)
+    with ObjectStore.create(str(tmp_path / 'v3.vcobj'), author='test') as store:
+        report = store.ingest_geometry_source(
+            'fiber', tmp_path / 'fibers', coordinate_context=dict(volume_uuid='20260411134726', scale_factor=1))
+        assert report == dict(ingested=3, edges_imported=1, problems=[])
+        edge = store.edges_by_kind('fiber_branch')[0]
+        assert {edge['a'], edge['b']} == set(ids[:2]) and edge['approval_state'] == 'approved'
+        for uid in ids:
+            assert store.object(uid)['meta']['coordinates'] == dict(volume_uuid='20260411134726', scale_factor=1)
+    # Reciprocal declarations that genuinely disagree still roll back the batch.
+    write(tmp_path / 'conflict', 1e-3)
+    with ObjectStore.create(str(tmp_path / 'conflict.vcobj'), author='test') as store:
+        assert store.ingest_geometry_source('fiber', tmp_path / 'conflict')['problems']
+        assert store.object_count('fiber') == 0
+
+
 @pytest.mark.parametrize('kind,geometry', [
     ('fiber', Fiber([[1, 2, 3], [4, 5, 6]], [])),
     ('point_collection', PointCollection([42, 7], [[1, 2, 3], [4, 5, 6]])),
