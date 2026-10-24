@@ -16,6 +16,7 @@
 #include <filesystem>
 #include <fstream>
 #include <regex>
+#include <tuple>
 #include <sstream>
 
 namespace fs = std::filesystem;
@@ -193,4 +194,52 @@ TEST_CASE("vc_merge_patch edits a stored parent like a tifxyz parent")
     CHECK(cv::norm(*stored->rawPointsPtr(), *files->rawPointsPtr(), cv::NORM_INF) == 0);
     CHECK(cv::norm(*stored->rawPointsPtr(), *parent.rawPointsPtr(), cv::NORM_INF) > 0);  // the patch changed it
     CHECK(fs::exists(fs::path(f.store.string() + ".artifacts") / parentUuid / "merge_patch_summary.json"));
+}
+
+TEST_CASE("vc_merge_tifxyz stores the merge of stored surfaces like a tifxyz merge")
+{
+    Fixture f;
+    auto plane = [](int xOffset) {
+        cv::Mat_<cv::Vec3f> points(16, 16);
+        for (int r = 0; r < 16; ++r)
+            for (int c = 0; c < 16; ++c) points(r, c) = {float(c + xOffset), float(r), 100.f};
+        return QuadSurface(points, {1.f, 1.f});
+    };
+    auto a = plane(0), b = plane(8);
+    fs::create_directories(f.dir / "paths");
+    a.save(f.dir / "paths" / "surface_a", true);
+    b.save(f.dir / "paths" / "surface_b", true);
+    const auto uuidA = util::newUuid(), uuidB = util::newUuid();
+    {
+        OpenOptions options; options.author = "tool-store-test";
+        auto db = ObjectStore::open(f.store, options);
+        auto txn = db.write();
+        for (const auto& [uuid, surface, name] : {std::tuple{uuidA, &a, "surface_a"}, std::tuple{uuidB, &b, "surface_b"}}) {
+            ObjectRecord record; record.uuid = uuid; record.kind = "surface"; record.name = name;
+            db.upsertObject(txn, record);
+            db.putGeometry(txn, uuid, quad_surface_geometry(*surface));
+        }
+        txn.commit();
+    }
+    std::ofstream(f.dir / "merge.json") << R"({"rows":["surface_a surface_b"]})";
+    std::ofstream(f.dir / "merge-store.json") << nlohmann::json{{"rows", {uuidA + " " + uuidB}}}.dump();
+    const auto bin = tool("VC_MERGE_TIFXYZ_BIN") + " --obj2tifxyz " + tool("VC_OBJ2TIFXYZ_LEGACY_BIN");
+    run(bin + " --merge \"" + (f.dir / "merge.json").string() + "\"", f.dir / "file.log");
+    const auto uuid = surfaceUuid(run(bin + " --merge \"" + (f.dir / "merge-store.json").string() + "\" --store \"" +
+                                      f.store.string() + "\" --tag merged --volume-uuid vol", f.dir / "store.log"));
+    OpenOptions options; options.author = "tool-store-test";
+    auto db = ObjectStore::open(f.store, options);
+    auto txn = db.read();
+    const auto stored = load_quad_from_store(db, txn, uuid);
+    const auto files = load_quad_from_tifxyz(f.dir / "paths" / "surface_a_merged");
+    REQUIRE(stored->rawPointsPtr()->size() == files->rawPointsPtr()->size());
+    CHECK(cv::norm(*stored->rawPointsPtr(), *files->rawPointsPtr(), cv::NORM_INF) == 0);
+    const auto object = db.objectByUuid(txn, uuid);
+    CHECK(object->name == "surface_a_merged");
+    CHECK(object->tags == std::vector<std::string>{"merged"});
+    const auto meta = nlohmann::json::parse(object->meta);
+    CHECK(meta.at("provenance").at("sources").size() == 2);
+    const auto artifacts = fs::path(f.store.string() + ".artifacts") / uuid;
+    CHECK(fs::exists(artifacts / "merge.obj"));
+    CHECK(fs::exists(artifacts / "merge_summary.json"));
 }
