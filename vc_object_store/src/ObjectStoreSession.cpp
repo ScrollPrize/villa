@@ -1,5 +1,6 @@
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "hub/HubWorker.hpp"
+#include <algorithm>
 #include <stdexcept>
 
 namespace vc::objects {
@@ -9,108 +10,172 @@ struct ObjectStoreSession::Attachment {
     AttachmentIdentity identity;
     bool writable = true;
     std::atomic_bool cancelled{false};
-    int64_t journalPosition = 0; // guarded by journal_
+    // Admission, guarded by the session mutex.
+    bool accepting = true;
+    size_t readers = 0, writers = 0;
+    // writer serializes accepted actions; journal guards journalPosition.
+    std::mutex writer, journal;
+    int64_t journalPosition = 0;
     // Hosted replicas only; declared after store so it stops first.
     std::unique_ptr<detail::HubWorker> hub;
 };
 
 ObjectStoreSession::~ObjectStoreSession()
 {
-    // switchTo drains before allocating the notification, so even an allocation
-    // failure cannot destroy a handle while a worker owns a transaction.
-    try { detach(); } catch (...) {}
+    // Retirement drains before releasing a handle, so no worker can still own
+    // a transaction when its store closes.
+    std::lock_guard transition(transition_);
+    for (;;) {
+        std::shared_ptr<Attachment> attachment;
+        {
+            std::lock_guard lock(mutex_);
+            if (attached_.empty()) break;
+            attachment = attached_.back();
+        }
+        try { retire(attachment); } catch (...) {
+            std::lock_guard lock(mutex_);
+            std::erase(attached_, attachment);
+        }
+    }
+}
+
+std::shared_ptr<ObjectStoreSession::Attachment> ObjectStoreSession::open(const std::filesystem::path& path,
+    const OpenOptions& options, const HubSessionOptions& hubOptions)
+{
+    auto next = std::make_shared<Attachment>(ObjectStore::open(path, options));
+    // Exercise write access without changing records. Opening a read connection
+    // successfully is not sufficient validation for an editing session.
+    next->writable = !options.readOnly;
+    if (next->writable) { auto writable = next->store.write(RevisionSelection{}); writable.commit(); }
+    auto txn = next->store.read();
+    next->identity.storeUuid = next->store.uuid(txn);
+    next->journalPosition = next->store.journalPosition(txn);
+    return next;
 }
 
 AttachmentIdentity ObjectStoreSession::attach(const std::filesystem::path& path, const OpenOptions& options,
                                               const HubSessionOptions& hubOptions)
 {
     std::lock_guard transition(transition_);
-    auto next = std::make_shared<Attachment>(ObjectStore::open(path, options));
-    // Exercise write access without changing records. Opening a read connection
-    // successfully is not sufficient validation for an editing session.
-    next->writable = !options.readOnly;
-    if (next->writable) { auto writable = next->store.write(RevisionSelection{}); writable.commit(); }
+    auto next = open(path, options, hubOptions);
     {
-        auto txn = next->store.read();
-        next->identity.storeUuid = next->store.uuid(txn);
-        next->journalPosition = next->store.journalPosition(txn);
+        std::lock_guard lock(mutex_);
+        if (std::any_of(attached_.begin(), attached_.end(),
+                        [&](const auto& a) { return a->identity.storeUuid == next->identity.storeUuid; }))
+            throw std::runtime_error("object store is already attached to this session");
+        next->identity.generation = ++generation_;
+        attached_.push_back(next);
+        events_.push_back({StoreSessionEvent::Kind::Attached, next->identity, next->journalPosition, {}});
     }
     if (next->writable && vc::objects::hubStatus(next->store))
         next->hub = std::make_unique<detail::HubWorker>(next->store, hubOptions,
             [this, owner = next.get()] { hubChanged(owner); });
-    switchTo(next);
     return next->identity;
 }
 
-void ObjectStoreSession::switchTo(std::shared_ptr<Attachment> next)
+AttachmentIdentity ObjectStoreSession::replace(const AttachmentIdentity& identity, const std::filesystem::path& path,
+    const OpenOptions& options, const HubSessionOptions& hubOptions)
+{
+    std::lock_guard transition(transition_);
+    const auto previous = find(identity);
+    if (!previous) throw std::runtime_error("object-store attachment is missing or superseded");
+    auto next = open(path, options, hubOptions);
+    {
+        std::lock_guard lock(mutex_);
+        if (std::any_of(attached_.begin(), attached_.end(), [&](const auto& a) {
+                return a != previous && a->identity.storeUuid == next->identity.storeUuid; }))
+            throw std::runtime_error("object store is already attached to this session");
+    }
+    retire(previous);
+    {
+        std::lock_guard lock(mutex_);
+        next->identity.generation = ++generation_;
+        attached_.push_back(next);
+        events_.push_back({StoreSessionEvent::Kind::Attached, next->identity, next->journalPosition, {}});
+    }
+    if (next->writable && vc::objects::hubStatus(next->store))
+        next->hub = std::make_unique<detail::HubWorker>(next->store, hubOptions,
+            [this, owner = next.get()] { hubChanged(owner); });
+    return next->identity;
+}
+
+void ObjectStoreSession::retire(const std::shared_ptr<Attachment>& attachment)
 {
     std::unique_lock lock(mutex_);
-    accepting_ = false;
-    if (attached_) attached_->cancelled.store(true);
-    idle_.wait(lock, [&] { return readers_ == 0 && writers_ == 0; });
-    const auto previous = attached_;
+    attachment->accepting = false;
+    attachment->cancelled.store(true);
+    idle_.wait(lock, [&] { return attachment->readers == 0 && attachment->writers == 0; });
     lock.unlock();
     try {
-        if (previous) observe(previous);
+        // Its last commits are delivered before it is reported detached.
+        observe(*attachment);
     } catch (...) {
         lock.lock();
-        if (previous) previous->cancelled.store(false);
-        accepting_ = true;
+        attachment->cancelled.store(false);
+        attachment->accepting = true;
         throw;
     }
     lock.lock();
-    // Accepted writes have finished before announcing the new attachment.
-    attached_ = std::move(next);
-    const AttachmentIdentity identity{attached_ ? attached_->identity.storeUuid : "", ++generation_};
-    if (attached_) attached_->identity = identity;
-    accepting_ = true;
-    events_.push_back({StoreSessionEvent::Kind::Attachment, identity,
-                      attached_ ? attached_->journalPosition : 0, {}});
-    // Stop the old replica's sync outside the lock its status reports take.
+    std::erase(attached_, attachment);
+    events_.push_back({StoreSessionEvent::Kind::Detached, attachment->identity, attachment->journalPosition, {}});
+    // Stop the replica's sync outside the lock its status reports take.
     lock.unlock();
-    if (previous) previous->hub.reset();
+    attachment->hub.reset();
 }
 
-void ObjectStoreSession::detach()
+void ObjectStoreSession::detach(const AttachmentIdentity& identity)
 {
     std::lock_guard transition(transition_);
-    switchTo(nullptr);
+    if (const auto attachment = find(identity)) retire(attachment);
 }
 
-std::optional<AttachmentIdentity> ObjectStoreSession::attachment() const
+std::vector<AttachmentIdentity> ObjectStoreSession::attachments() const
 {
     std::lock_guard lock(mutex_);
-    if (!attached_) return std::nullopt;
-    return attached_->identity;
+    std::vector<AttachmentIdentity> result;
+    for (const auto& attachment : attached_)
+        if (attachment->accepting) result.push_back(attachment->identity);
+    return result;
 }
 
-bool ObjectStoreSession::writable() const
+std::shared_ptr<ObjectStoreSession::Attachment> ObjectStoreSession::find(const AttachmentIdentity& identity) const
 {
     std::lock_guard lock(mutex_);
-    return accepting_ && attached_ && attached_->writable;
+    for (const auto& attachment : attached_)
+        if (attachment->identity == identity) return attachment;
+    return nullptr;
+}
+
+bool ObjectStoreSession::writable(const AttachmentIdentity& identity) const
+{
+    std::lock_guard lock(mutex_);
+    return std::any_of(attached_.begin(), attached_.end(), [&](const auto& a) {
+        return a->identity == identity && a->accepting && a->writable; });
 }
 
 bool ObjectStoreSession::current(const AttachmentIdentity& identity) const
 {
     std::lock_guard lock(mutex_);
-    return accepting_ && attached_ && attached_->identity == identity;
+    return std::any_of(attached_.begin(), attached_.end(), [&](const auto& a) {
+        return a->identity == identity && a->accepting; });
 }
 
 std::shared_ptr<ObjectStoreSession::Attachment> ObjectStoreSession::acquire(
     const AttachmentIdentity& identity, bool write)
 {
     std::lock_guard lock(mutex_);
-    if (!accepting_ || !attached_ || attached_->identity != identity)
-        throw std::runtime_error("object-store attachment is missing or superseded");
-    if (write && !attached_->writable) throw std::runtime_error("Object store is attached read-only");
-    ++(write ? writers_ : readers_);
-    return attached_;
+    const auto found = std::find_if(attached_.begin(), attached_.end(),
+                                    [&](const auto& a) { return a->identity == identity && a->accepting; });
+    if (found == attached_.end()) throw std::runtime_error("object-store attachment is missing or superseded");
+    if (write && !(*found)->writable) throw std::runtime_error("Object store is attached read-only");
+    ++(write ? (*found)->writers : (*found)->readers);
+    return *found;
 }
 
-void ObjectStoreSession::release(bool write)
+void ObjectStoreSession::release(Attachment& attachment, bool write)
 {
     std::lock_guard lock(mutex_);
-    --(write ? writers_ : readers_);
+    --(write ? attachment.writers : attachment.readers);
     idle_.notify_all();
 }
 
@@ -120,8 +185,8 @@ void ObjectStoreSession::read(const AttachmentIdentity& identity, const Read& ca
     try {
         auto txn = attachment->store.read();
         callback(attachment->store, txn, attachment->cancelled);
-    } catch (...) { release(false); throw; }
-    release(false);
+    } catch (...) { release(*attachment, false); throw; }
+    release(*attachment, false);
 }
 
 RevisionSelection ObjectStoreSession::act(const AttachmentIdentity& identity,
@@ -130,14 +195,14 @@ RevisionSelection ObjectStoreSession::act(const AttachmentIdentity& identity,
     RevisionSelection committed;
     auto attachment = acquire(identity, true);
     try {
-        std::lock_guard writer(writer_);
+        std::lock_guard writer(attachment->writer);
         auto txn = attachment->store.write(expected);
         callback(attachment->store, txn);
         txn.commit();
         committed = txn.committedRevisions();
         if (attachment->hub) attachment->hub->requestSync(true);
-    } catch (...) { release(true); throw; }
-    release(true);
+    } catch (...) { release(*attachment, true); throw; }
+    release(*attachment, true);
     return committed;
 }
 
@@ -145,36 +210,41 @@ void ObjectStoreSession::finalize()
 {
     std::lock_guard transition(transition_);
     std::unique_lock lock(mutex_);
-    accepting_ = false;
-    idle_.wait(lock, [&] { return writers_ == 0; });
-    accepting_ = true;
+    for (const auto& attachment : attached_) attachment->accepting = false;
+    idle_.wait(lock, [&] {
+        return std::all_of(attached_.begin(), attached_.end(), [](const auto& a) { return a->writers == 0; });
+    });
+    for (const auto& attachment : attached_) attachment->accepting = true;
 }
 
-void ObjectStoreSession::observe(const std::shared_ptr<Attachment>& attachment)
+void ObjectStoreSession::observe(Attachment& attachment)
 {
-    std::lock_guard journal(journal_);
-    auto txn = attachment->store.read();
-    auto changes = attachment->store.journalSince(txn, attachment->journalPosition);
+    std::lock_guard journal(attachment.journal);
+    auto txn = attachment.store.read();
+    auto changes = attachment.store.journalSince(txn, attachment.journalPosition);
     if (changes.empty()) return;
     const auto position = changes.back().seq;
     std::lock_guard lock(mutex_);
-    events_.push_back({StoreSessionEvent::Kind::Committed, attachment->identity, position, std::move(changes)});
-    attachment->journalPosition = position;
+    events_.push_back({StoreSessionEvent::Kind::Committed, attachment.identity, position, std::move(changes)});
+    attachment.journalPosition = position;
 }
 
 std::vector<StoreSessionEvent> ObjectStoreSession::takeEvents()
 {
-    // Observation participates in the worker barrier; no old event can arrive
-    // after a replacement notification.
-    std::shared_ptr<Attachment> attachment;
+    // Observation participates in each attachment's barrier; no event of a
+    // retired attachment can arrive after its Detached notification.
+    std::vector<std::shared_ptr<Attachment>> current;
     {
         std::lock_guard lock(mutex_);
-        if (accepting_ && attached_) { attachment = attached_; ++readers_; }
+        for (const auto& attachment : attached_)
+            if (attachment->accepting) { ++attachment->readers; current.push_back(attachment); }
     }
-    if (attachment) {
-        try { observe(attachment); } catch (...) { release(false); throw; }
-        release(false);
+    std::exception_ptr error;
+    for (const auto& attachment : current) {
+        if (!error) try { observe(*attachment); } catch (...) { error = std::current_exception(); }
+        release(*attachment, false);
     }
+    if (error) std::rethrow_exception(error);
     std::lock_guard lock(mutex_);
     std::vector<StoreSessionEvent> result;
     result.swap(events_);
@@ -187,33 +257,37 @@ LeaseHold ObjectStoreSession::holdLeases(const AttachmentIdentity& identity, con
     LeaseHold hold;
     try {
         if (attachment->hub) hold = attachment->hub->hold(objects);
-    } catch (...) { release(true); throw; }
-    release(true);
+    } catch (...) { release(*attachment, true); throw; }
+    release(*attachment, true);
     return hold;
 }
 
-std::optional<HubSessionStatus> ObjectStoreSession::hubStatus() const
+std::optional<HubSessionStatus> ObjectStoreSession::hubStatus(const AttachmentIdentity& identity) const
 {
     std::lock_guard lock(mutex_);
-    if (!attached_ || !attached_->hub) return std::nullopt;
-    return attached_->hub->status();
+    for (const auto& attachment : attached_)
+        if (attachment->identity == identity && attachment->accepting && attachment->hub) return attachment->hub->status();
+    return std::nullopt;
 }
 
-void ObjectStoreSession::syncHub()
+void ObjectStoreSession::syncHub(const AttachmentIdentity& identity)
 {
     std::lock_guard lock(mutex_);
-    if (attached_ && attached_->hub) attached_->hub->requestSync(false);
+    for (const auto& attachment : attached_)
+        if (attachment->identity == identity && attachment->hub) attachment->hub->requestSync(false);
 }
 
-void ObjectStoreSession::resolveHubConflicts(const std::string& keep)
+void ObjectStoreSession::resolveHubConflicts(const AttachmentIdentity& identity, const std::string& keep)
 {
     std::lock_guard lock(mutex_);
-    if (attached_ && attached_->hub) attached_->hub->requestResolve(keep);
+    for (const auto& attachment : attached_)
+        if (attachment->identity == identity && attachment->hub) attachment->hub->requestResolve(keep);
 }
 
 void ObjectStoreSession::hubChanged(const Attachment* owner)
 {
     std::lock_guard lock(mutex_);
-    if (attached_.get() == owner) events_.push_back({StoreSessionEvent::Kind::Hub, attached_->identity, 0, {}});
+    for (const auto& attachment : attached_)
+        if (attachment.get() == owner) events_.push_back({StoreSessionEvent::Kind::Hub, attachment->identity, 0, {}});
 }
 }

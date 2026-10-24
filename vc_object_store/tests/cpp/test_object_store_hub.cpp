@@ -316,7 +316,7 @@ int main() try
         ObjectStoreSession session;
         HubSessionOptions fast; fast.syncInterval = std::chrono::milliseconds(200); fast.pushDelay = std::chrono::milliseconds(50);
         const auto attachment = session.attach(alicePath, as("alice"), fast);
-        eventually([&] { return session.hubStatus() && session.hubStatus()->syncedAtUs; }, "session syncs on attach");
+        eventually([&] { return session.hubStatus(attachment) && session.hubStatus(attachment)->syncedAtUs; }, "session syncs on attach");
         mustFail([&] { session.act(attachment, {}, [&](auto& store, auto& txn) { store.setMeta(txn, b, "note", "\"unleased\""); }); });
         releaseLeases(bob, {b});
         {
@@ -335,8 +335,8 @@ int main() try
         bool hubEvent = false;
         for (const auto& event : session.takeEvents()) hubEvent |= event.kind == StoreSessionEvent::Kind::Hub;
         require(hubEvent, "status changes are session events");
-        session.detach();
-        require(!session.hubStatus(), "no hub status without an attachment");
+        session.detach(attachment);
+        require(!session.hubStatus(attachment), "no hub status without an attachment");
         releaseLeases(bob, {b});
         hubSync(alice);
     }

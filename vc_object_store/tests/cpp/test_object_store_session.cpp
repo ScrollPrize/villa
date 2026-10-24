@@ -45,22 +45,29 @@ int main() try
     ObjectStoreSession session;
     auto identity = session.attach(path, options);
     auto events = session.takeEvents();
-    require(events.size() == 1 && events[0].kind == StoreSessionEvent::Kind::Attachment, "attachment event");
+    require(events.size() == 1 && events[0].kind == StoreSessionEvent::Kind::Attached, "attachment event");
     mustFail([&] { session.attach(directory.path / "absent.vcobj", options); });
     require(!std::filesystem::exists(directory.path / "absent.vcobj"), "attach must not create");
+    mustFail([&] { session.replace(identity, directory.path / "absent.vcobj", options); });
     require(session.current(identity), "failed replacement preserved old attachment");
+    mustFail([&] { session.attach(path, options); });
+    require(session.attachments().size() == 1, "a store is attached once");
     auto readonly = options; readonly.readOnly = true;
-    identity = session.attach(path, readonly);
-    require(!session.writable(), "read-only attachment reports access mode");
+    identity = session.replace(identity, path, readonly);
+    require(!session.writable(identity), "read-only attachment reports access mode");
     session.read(identity, [&](const auto& store, const auto& txn, const auto&) {
         require(store.objectByUuid(txn, a).has_value(), "read-only attachment reads objects");
     });
     bool callbackRan = false;
     mustFail([&] { session.act(identity, {}, [&](auto&, auto&) { callbackRan = true; }); });
     require(!callbackRan, "read-only actions rejected before callback");
-    identity = session.attach(path, options);
-    session.takeEvents();
-    require(session.writable(), "writable reattachment");
+    identity = session.replace(identity, path, options);
+    events = session.takeEvents();
+    // Two replacements: read-only, then writable again.
+    require(events.size() == 4 && events[2].kind == StoreSessionEvent::Kind::Detached &&
+            events[3].kind == StoreSessionEvent::Kind::Attached && events[3].attachment == identity,
+            "replacement reports the old attachment leaving before the new one joins");
+    require(session.writable(identity), "writable reattachment");
 
     auto heads = [&] {
         RevisionSelection result;
@@ -141,11 +148,12 @@ int main() try
     entered.get_future().wait();
     { auto txn = external.write(); external.setMeta(txn, b, "external", "2"); txn.commit(); }
     changed.set_value();
-    session.detach(); reader.get();
-    require(!session.attachment(), "detached");
+    session.detach(identity); reader.get();
+    require(session.attachments().empty(), "detached");
     events = session.takeEvents();
     require(events.size() == 2 && events[0].kind == StoreSessionEvent::Kind::Committed &&
-            events[1].kind == StoreSessionEvent::Kind::Attachment, "old commits precede detachment");
+            events[1].kind == StoreSessionEvent::Kind::Detached && events[1].attachment == identity,
+            "old commits precede detachment");
     mustFail([&] { session.act(identity, {}, [](auto&, auto&) {}); });
     const auto second = session.attach(path, options);
     require(second.storeUuid == identity.storeUuid && second.generation > identity.generation, "same store invalidates old requests");
@@ -162,7 +170,7 @@ int main() try
         });
     });
     writing.get_future().wait();
-    auto detach = std::async(std::launch::async, [&] { session.detach(); });
+    auto detach = std::async(std::launch::async, [&] { session.detach(second); });
     while (session.current(second)) std::this_thread::yield();
     mustFail([&] { session.act(second, latest, [](auto&, auto&) {}); });
     finishWriting.set_value(); pending.get(); detach.get();
@@ -170,7 +178,31 @@ int main() try
     auto replacementPath = directory.path / "replacement.vcobj";
     { auto replacement = ObjectStore::create(replacementPath, options); }
     auto replacement = session.attach(replacementPath, options);
-    require(replacement.storeUuid != second.storeUuid && replacement.generation > second.generation, "different-store replacement");
-    session.detach();
+    require(replacement.storeUuid != second.storeUuid && replacement.generation > second.generation, "different-store attachment");
+    session.takeEvents();
+
+    // Several stores side by side: a read-only catalog next to a writable store.
+    // Each keeps its own access mode and events; detaching one leaves the other.
+    auto catalog = session.attach(path, readonly);
+    require(session.attachments() == std::vector<AttachmentIdentity>{replacement, catalog}, "attachments in attach order");
+    require(session.writable(replacement) && !session.writable(catalog), "access mode is per attachment");
+    const auto added = util::newUuid();
+    session.act(replacement, {{added, std::nullopt}}, [&](auto& store, auto& txn) {
+        ObjectRecord o; o.uuid = added; o.kind = "surface"; store.upsertObject(txn, o);
+    });
+    { auto txn = external.write(); external.setMeta(txn, a, "catalog", "1"); txn.commit(); }
+    events = session.takeEvents();
+    require(events.size() == 3 && events[0].kind == StoreSessionEvent::Kind::Attached && events[0].attachment == catalog,
+            "second attachment joins");
+    for (const auto& event : std::vector(events.begin() + 1, events.end()))
+        require(event.kind == StoreSessionEvent::Kind::Committed && event.changes.size() == 1 &&
+                event.changes[0].recordUuid == (event.attachment == catalog ? a : added), "events are tagged by attachment");
+    mustFail([&] { session.act(catalog, {}, [](auto&, auto&) {}); });
+    session.detach(catalog);
+    require(session.current(replacement) && !session.current(catalog), "detaching one keeps the other");
+    session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+        require(store.objectByUuid(txn, added).has_value(), "remaining attachment still reads");
+    });
+    session.detach(replacement);
     std::cout << "session tests passed\n";
 } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

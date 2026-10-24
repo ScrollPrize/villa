@@ -142,7 +142,7 @@ int main() try
         store.upsertObject(txn, record);
         store.retireObject(txn, right);
     });
-    session.detach();
+    session.detach(attachment);
     const auto reattached = session.attach(path, options);
     session.read(reattached, [&](const auto& store, const auto& txn, const auto&) {
         require(store.objectByUuid(txn, left)->fiber->controlPointCount == 3, "immediate persistence and reload");

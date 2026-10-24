@@ -29,10 +29,12 @@ struct PinnedObject {
 };
 
 struct StoreSessionEvent {
-    // Hub: the attached replica's hubStatus() changed.
-    enum class Kind { Attachment, Committed, Hub };
-    Kind kind = Kind::Attachment;
-    // Empty storeUuid denotes detachment. Generation increases on every switch,
+    // Attached/Detached: an attachment joined or left the session (replace()
+    // reports the old one's Detached before the new one's Attached).
+    // Hub: that attachment's hubStatus() changed.
+    enum class Kind { Attached, Detached, Committed, Hub };
+    Kind kind = Kind::Attached;
+    // Generations are unique within a session and increase on every attach,
     // including reattachment of the same file/UUID.
     AttachmentIdentity attachment;
     int64_t journalPosition = 0;
@@ -75,12 +77,14 @@ private:
     std::vector<std::string> objects_;
 };
 
-// Application-owned connection and lifetime boundary, independent of object kind
-// and UI toolkit. All worker work belongs inside read(); its snapshot and store
-// references must not escape the callback. Callbacks must not reenter the session.
-// Cancellation is cooperative. A replacement/detachment waits for accepted reads
+// Application-owned connection and lifetime boundary for any number of stores,
+// independent of object kind and UI toolkit. Each attachment is independent:
+// its own identity, access mode, writer, journal events and hub sync. All worker
+// work belongs inside read(); its snapshot and store references must not escape
+// the callback. Callbacks must not reenter the session. Cancellation is
+// cooperative. Detaching or replacing an attachment waits for its accepted reads
 // and checked writes to finish; the caller must not hold a worker's completion
-// hostage to the thread performing that replacement.
+// hostage to the thread performing that change.
 class ObjectStoreSession {
 public:
     using Read = std::function<void(const ObjectStore&, const ReadTxn&, const std::atomic_bool&)>;
@@ -91,51 +95,56 @@ public:
     ObjectStoreSession(const ObjectStoreSession&) = delete;
     ObjectStoreSession& operator=(const ObjectStoreSession&) = delete;
 
-    // Existing database only; read-only attachments reject all actions. Validation failure preserves the attachment.
-    // A writable hosted replica also starts background hub sync.
+    // Existing database only; read-only attachments reject all actions. A store
+    // is attached at most once. A writable hosted replica also starts background hub sync.
     AttachmentIdentity attach(const std::filesystem::path&, const OpenOptions&, const HubSessionOptions& = {});
-    void detach();
-    std::optional<AttachmentIdentity> attachment() const;
-    bool writable() const;
+    // Swap one attachment for another store. The new store is validated first
+    // (failure preserves the old attachment); the old one drains and delivers its
+    // last commits before the new one is announced.
+    AttachmentIdentity replace(const AttachmentIdentity&, const std::filesystem::path&, const OpenOptions&,
+                               const HubSessionOptions& = {});
+    void detach(const AttachmentIdentity&);
+    std::vector<AttachmentIdentity> attachments() const;
+    bool writable(const AttachmentIdentity&) const;
     bool current(const AttachmentIdentity&) const;
 
     void read(const AttachmentIdentity&, const Read&);
     // All writes are immediate checked atomic actions. The library enforces
     // expectations for every affected object and relationship endpoint.
     RevisionSelection act(const AttachmentIdentity&, const RevisionSelection&, const Action&);
-    // Drain accepted writes. No delayed persistence or new geometry publication.
+    // Drain accepted writes on every attachment. No delayed persistence or new geometry publication.
     void finalize();
     // Poll from the application's event loop. Includes external commits and
-    // non-fiber records. Events retain attachment identity across replacements.
+    // every record kind, tagged by attachment, in order per attachment.
     std::vector<StoreSessionEvent> takeEvents();
 
     // Hosted replicas: lease objects before editing them, pulling once if the
     // hub is ahead. Blocks on the hub; throws HubLeaseRefused when another
     // replica holds one. Returns an empty hold for other stores.
     LeaseHold holdLeases(const AttachmentIdentity&, const std::vector<std::string>& objects);
-    // nullopt unless a writable hosted replica is attached.
-    std::optional<HubSessionStatus> hubStatus() const;
+    // nullopt unless the attachment is a writable hosted replica.
+    std::optional<HubSessionStatus> hubStatus(const AttachmentIdentity&) const;
     // Asynchronous: sync now, or settle every conflict ("hub" or "local") then sync.
-    void syncHub();
-    void resolveHubConflicts(const std::string& keep);
+    void syncHub(const AttachmentIdentity&);
+    void resolveHubConflicts(const AttachmentIdentity&, const std::string& keep);
 
 private:
     struct Attachment;
+    std::shared_ptr<Attachment> open(const std::filesystem::path&, const OpenOptions&, const HubSessionOptions&);
+    std::shared_ptr<Attachment> find(const AttachmentIdentity&) const;
     std::shared_ptr<Attachment> acquire(const AttachmentIdentity&, bool write);
-    void release(bool write);
-    void switchTo(std::shared_ptr<Attachment>);
-    void observe(const std::shared_ptr<Attachment>&);
+    void release(Attachment&, bool write);
+    void retire(const std::shared_ptr<Attachment>&);
+    void observe(Attachment&);
     void hubChanged(const Attachment*);
 
-    // transition_ serializes lifecycle operations; writer_ serializes accepted
-    // actions. Neither is held by read callbacks. mutex_ protects admission.
-    std::mutex transition_, writer_, journal_;
+    // transition_ serializes lifecycle operations and is never held by read
+    // callbacks. mutex_ protects the attachment list, admission and events.
+    std::mutex transition_;
     mutable std::mutex mutex_;
     std::condition_variable idle_;
-    std::shared_ptr<Attachment> attached_;
+    std::vector<std::shared_ptr<Attachment>> attached_;
     uint64_t generation_ = 0;
-    size_t readers_ = 0, writers_ = 0;
-    bool accepting_ = true;
     std::vector<StoreSessionEvent> events_;
 };
 }

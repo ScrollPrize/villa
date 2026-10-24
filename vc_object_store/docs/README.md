@@ -49,8 +49,8 @@ current geometry descriptors and spatial queries after edits.
 
 ## Revisions and transactions
 
-C++ applications can share an `ObjectStoreSession` to manage an existing writable
-database's attachment, checked writes, worker cancellation, and journal events.
+C++ applications can share an `ObjectStoreSession` to manage attachments of
+existing databases, checked writes, worker cancellation, and journal events.
 Consumers call the existing `ObjectStore` APIs directly inside its callbacks:
 
 ```cpp
@@ -69,14 +69,21 @@ session.act(attachment, observed, [&](auto& store, auto& txn) {
 ```
 
 Keep all work using a snapshot inside its callback and do not reenter the
-session from a callback. Replacement validates the new database first, drains
-accepted writes, and cancels/waits for old readers. Include the attachment
-generation in asynchronous requests and caches: even reattaching the same store
-invalidates old requests. `takeEvents()` polls local and external commits for
-all object kinds; call it from the application's event loop. Each change carries
+session from a callback. A session holds any number of attachments (for example a
+writable store beside read-only catalog stores), each with its own access mode,
+writer, events and hub sync; a store is attached at most once. `attach()` adds one,
+`replace(attachment, ...)` swaps one for another store, `detach(attachment)` removes
+one, and `attachments()` lists them in attach order. Replacement validates the new
+database first, drains the old attachment's accepted writes, cancels/waits for
+its readers and delivers its last commits; events report `Detached` for the old
+attachment before `Attached` for the new one. Include the attachment generation in
+asynchronous requests and caches: even reattaching the same store invalidates old
+requests. `takeEvents()` polls local and external commits of
+every attachment for all object kinds, tagged by attachment; call it from the
+application's event loop. Each change carries
 its record's object or edge `kind` (kept for deletions too), so a consumer
 filters by kind without looking the record up. `finalize()` waits
-for accepted writes; edits are already committed by `act()`.
+for accepted writes on every attachment; edits are already committed by `act()`.
 
 Fiber consumers use the same `selectObjects`, `geometryRegion`, geometry, and
 relationship APIs. Update any catalog summaries used by the application in the
@@ -308,9 +315,10 @@ external commit. Before editing, a caller takes
 renewed while it lives. Once no hold remains and the changes are pushed, the
 worker releases the lease. A hold pulls once first if the hub is ahead, and it
 is a no-op for ordinary stores, so callers need not check what they attached.
-`hubStatus()` reports pending records, conflicts, the last error and sync time,
-and a `StoreSessionEvent::Kind::Hub` event announces each change.
-`syncHub()` and `resolveHubConflicts(keep)` act asynchronously. Scripts that
+`hubStatus(attachment)` reports pending records, conflicts, the last error and
+sync time for that replica, and a `StoreSessionEvent::Kind::Hub` event tagged with
+the attachment announces each change. `syncHub(attachment)` and
+`resolveHubConflicts(attachment, keep)` act asynchronously. Scripts that
 do not use a session call `hub_sync` and the lease functions directly.
 
 Records changed both locally and on the hub become conflicts, and pushing stops
