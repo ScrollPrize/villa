@@ -378,6 +378,7 @@ VolumeViewerBase* ViewerManager::initializeChunkedViewer(CChunkedVolumeViewer* c
         baseViewer->setShowSurfaceNormals(showNormals);
     }
     chunkedViewer->setShowCoordinateFrame(_showCoordinateFrames);
+    chunkedViewer->graphicsView()->setHudOptions(_hudOptions);
 
     {
         using namespace vc3d::settings;
@@ -805,6 +806,20 @@ void ViewerManager::setShowCoordinateFrames(bool show)
             chunkedViewer->setShowCoordinateFrame(show);
         }
     });
+}
+
+void ViewerManager::setHudOptions(const vc3d::hud::Options& options)
+{
+    if (_hudOptions == options) {
+        return;
+    }
+    _hudOptions = options;
+    forEachBaseViewer([&options](VolumeViewerBase* viewer) {
+        if (auto* chunkedViewer = dynamic_cast<CChunkedVolumeViewer*>(viewer)) {
+            chunkedViewer->graphicsView()->setHudOptions(options);
+        }
+    });
+    emit hudOptionsChanged(options);
 }
 
 void ViewerManager::setPlaneIntersectionLinesVisible(bool visible)

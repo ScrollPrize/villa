@@ -19,6 +19,7 @@
 #include "vc/core/util/Compositing.hpp"
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "volume_viewers/ViewerHud.hpp"
 
 #include <array>
 
@@ -209,6 +210,9 @@ public:
     void setShowDirectionHints(bool show);
     void setShowSurfaceNormals(bool show);
     void setShowCoordinateFrames(bool show);
+    // Measurement overlays: on-screen histogram, line profile, volume grid, loupe.
+    void setHudOptions(const vc3d::hud::Options& options);
+    const vc3d::hud::Options& hudOptions() const { return _hudOptions; }
     void setPlaneIntersectionLinesVisible(bool visible);
     void setSurfaceOverlaysEnabled(bool enabled);
     void setSurfaceOverlapThreshold(float threshold);
@@ -249,6 +253,7 @@ public:
     void beginShutdown() noexcept { _shuttingDown = true; }
 
 signals:
+    void hudOptionsChanged(const vc3d::hud::Options& options);
     void baseViewerCreated(VolumeViewerBase* viewer);
     void baseViewerClosing(VolumeViewerBase* viewer);
     void currentVolumeChanged();
@@ -348,6 +353,7 @@ private:
     VolumeViewerBase* _pendingLinkedCursorSource{nullptr};
     std::optional<cv::Vec3f> _pendingLinkedCursorPoint;
     bool _showCoordinateFrames{true};
+    vc3d::hud::Options _hudOptions;
     double _zScrollSensitivity{1.0};
     int _surfacePatchSamplingStride{1};
     std::atomic<bool> _shuttingDown{false};
