@@ -10,6 +10,7 @@ import secrets
 import tempfile
 import threading
 from typing import Optional, Sequence, Tuple
+import warnings
 
 import numpy as np
 from numpy.typing import NDArray
@@ -158,6 +159,12 @@ def load_surface(path: Path | str, use_mask: bool = True) -> Surface:
 
     with (surface_path / "meta.json").open("r", encoding="utf-8") as handle:
         metadata = json.load(handle)
+    if "scale" not in metadata:
+        warnings.warn(
+            f"{surface_path / 'meta.json'} declares no 'scale'; treating one cell as one voxel. "
+            "Distances derived from this surface are wrong unless the cell pitch really is 1.",
+            stacklevel=2,
+        )
     scale = metadata.get("scale", [1.0, 1.0])
     if not isinstance(scale, list) or len(scale) < 2:
         raise ValueError(f"invalid scale in {surface_path / 'meta.json'}")

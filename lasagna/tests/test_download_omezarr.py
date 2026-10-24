@@ -368,3 +368,106 @@ def test_remote_chunk_listing_can_be_limited_to_expected_z_prefixes(monkeypatch)
         "3.0.0",
     }
     assert calls == ["root/0/1.", "root/0/3."]
+
+
+def test_parse_multiscales_reports_levels_without_a_scale_transform():
+    zattrs = {
+        "multiscales": [
+            {
+                "datasets": [
+                    {
+                        "path": "0",
+                        "coordinateTransformations": [
+                            {"type": "scale", "scale": [8.64, 8.64, 8.64]}
+                        ],
+                    },
+                    {"path": "1"},
+                    {
+                        "path": "2",
+                        "coordinateTransformations": [
+                            {"type": "translation", "translation": [0.0, 0.0, 0.0]}
+                        ],
+                    },
+                ]
+            }
+        ]
+    }
+    missing: set[int] = set()
+
+    assert dl._parse_multiscales(zattrs, missing) == {
+        0: [8.64, 8.64, 8.64],
+        1: [1.0, 1.0, 1.0],
+        2: [1.0, 1.0, 1.0],
+    }
+    assert missing == {1, 2}
+
+
+def test_parse_multiscales_without_missing_sink_keeps_previous_behaviour():
+    assert dl._parse_multiscales({}) == {}
+    assert dl._parse_multiscales({"multiscales": [{"datasets": [{"path": "0"}]}]}) == {
+        0: [1.0, 1.0, 1.0]
+    }
+
+
+# ---------------------------------------------------------------------------------------------
+# The defect the catalog audit reported is NOT a missing scale transform: the affected stores
+# publish an explicit [1, 1, 1] scale and no unit on any axis. These tests pin the check to that
+# condition, because the first version of this patch only fired on the missing-transform case and
+# never warned on the stores it was written for (review on ScrollPrize/villa#2137).
+
+
+def test_axes_have_units_is_false_for_the_audited_shape():
+    zattrs = {
+        "multiscales": [
+            {
+                "axes": [{"name": "z"}, {"name": "y"}, {"name": "x"}],
+                "datasets": [
+                    {"path": "0", "coordinateTransformations": [{"type": "scale", "scale": [1.0, 1.0, 1.0]}]}
+                ],
+            }
+        ]
+    }
+    assert download_omezarr._axes_have_units(zattrs) is False
+
+
+def test_axes_have_units_is_true_when_every_axis_declares_a_unit():
+    zattrs = {
+        "multiscales": [
+            {
+                "axes": [
+                    {"name": "z", "unit": "micrometer"},
+                    {"name": "y", "unit": "micrometer"},
+                    {"name": "x", "unit": "micrometer"},
+                ]
+            }
+        ]
+    }
+    assert download_omezarr._axes_have_units(zattrs) is True
+
+
+def test_axes_have_units_ignores_a_channel_axis_without_a_unit():
+    zattrs = {
+        "multiscales": [
+            {
+                "axes": [
+                    {"name": "c", "type": "channel"},
+                    {"name": "z", "unit": "micrometer"},
+                    {"name": "y", "unit": "micrometer"},
+                    {"name": "x", "unit": "micrometer"},
+                ]
+            }
+        ]
+    }
+    assert download_omezarr._axes_have_units(zattrs) is True
+
+
+def test_pitch_from_manifest_returns_the_recorded_pitch(monkeypatch):
+    monkeypatch.setattr(
+        download_omezarr, "_MANIFEST_PITCH", {"PHerc0009B/volumes/x.zarr": 8.64}
+    )
+    assert download_omezarr._pitch_from_manifest("PHerc0009B/volumes/x.zarr/") == 8.64
+
+
+def test_pitch_from_manifest_returns_none_when_the_catalog_has_no_pitch(monkeypatch):
+    monkeypatch.setattr(download_omezarr, "_MANIFEST_PITCH", {"other/store.zarr": 2.4})
+    assert download_omezarr._pitch_from_manifest("PHercParis2Fr47/legacy/x.zarr") is None

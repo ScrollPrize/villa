@@ -7,6 +7,7 @@ import argparse
 import json
 import multiprocessing
 import os
+import re
 import shutil
 import sys
 import time
@@ -131,7 +132,23 @@ def _infer_zyx_scale(arr, array_path: Path) -> tuple[float, float, float]:
         return scale
     scale = _scale_from_ome_parent(array_path)
     if scale is not None:
+        # A [1, 1, 1] parent scale on a store whose name states a pitch is the placeholder case the
+        # catalog audit found, not a measured value - warn instead of returning it silently.
+        stated = re.search(r"(\d+(?:\.\d+)?)um", str(array_path), re.IGNORECASE)
+        if stated and tuple(float(v) for v in scale) == (1.0, 1.0, 1.0):
+            print(
+                f"WARN: parent OME-Zarr metadata for {array_path} declares a [1, 1, 1] scale with no "
+                f"axes[].unit, while the path states {stated.group(1)}um; distances derived from 1.0 "
+                "per voxel will be wrong unless the voxel size really is 1.0.",
+                file=sys.stderr,
+            )
         return scale
+    print(
+        f"WARN: no physical scale found for {array_path} (neither preprocess params nor "
+        "parent OME-Zarr metadata carry one); assuming 1.0 per voxel. Physical distances "
+        "derived from this scale will be wrong unless the voxel size is known to be 1.0.",
+        file=sys.stderr,
+    )
     return 1.0, 1.0, 1.0
 
 
