@@ -205,6 +205,29 @@ def test_explicit_label_version_requires_matching_required_assets(tmp_path):
         discover_segment_labels(_segment(config, tmp_path))
 
 
+def test_tiff_and_png_labels_get_a_conversion_hint(tmp_path):
+    # Label images as downloaded, before create_label_zarrs: the trainer reads
+    # only .zarr, so the error now names the skipped files and the converter.
+    segment_dir = tmp_path / "segment-a"
+    segment_dir.mkdir()
+    (segment_dir / "segment-a_inklabels.png").touch()
+    (segment_dir / "segment-a_supervision_mask.tif").touch()
+    (segment_dir / "other_inklabels.tif").touch()
+    with pytest.raises(ValueError) as raised:
+        discover_segment_labels(_segment(_config(tmp_path), tmp_path))
+    message = str(raised.value)
+    assert "segment-a_inklabels.png, segment-a_supervision_mask.tif" in message
+    assert "other_inklabels.tif" not in message
+    assert "create_label_zarrs" in message
+
+
+def test_missing_labels_without_other_formats_have_no_hint(tmp_path):
+    (tmp_path / "segment-a").mkdir()
+    with pytest.raises(ValueError) as raised:
+        discover_segment_labels(_segment(_config(tmp_path), tmp_path))
+    assert "create_label_zarrs" not in str(raised.value)
+
+
 def test_segment_gathering_preserves_remote_and_explicit_volume_paths(tmp_path):
     native_root = tmp_path / "native-segments"
     native_segment = native_root / "native-a"

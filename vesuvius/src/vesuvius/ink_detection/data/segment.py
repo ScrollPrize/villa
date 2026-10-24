@@ -48,6 +48,33 @@ def parse_label_asset_path(path: str | Path) -> dict[str, object] | None:
     return None
 
 
+def _other_format_hint(segment: Segment, extension: str) -> str:
+    """Point at label files the trainer skipped because of their format.
+
+    The trainer reads only one extension (.zarr), so a folder holding the label
+    TIFFs from the data server failed with a bare "must contain" error.
+    """
+    found = []
+    for path in segment.segment_dir.iterdir():
+        # create_label_zarrs also converts PNGs, which the parser itself skips.
+        probe = path.with_suffix(".tif") if path.suffix.lower() == ".png" else path
+        parsed = parse_label_asset_path(probe)
+        if (
+            parsed is not None
+            and parsed["prefix"] == segment.segment_name
+            and path.suffix.lower() != extension
+        ):
+            found.append(path.name)
+    found.sort()
+    if not found:
+        return ""
+    return (
+        f". Found {', '.join(found)}, which the trainer does not read; convert them "
+        "with `python -m vesuvius.ink_detection.preprocessing.create_label_zarrs "
+        f"{segment.segment_dir.parent}`"
+    )
+
+
 def discover_segment_labels(
     segment: Segment, *, extension: str = ".zarr", required: bool = True
 ) -> Segment:
@@ -88,6 +115,7 @@ def discover_segment_labels(
                 raise ValueError(
                     f"{segment.segment_dir} does not contain matching "
                     f"{normalized_extension} labels for version {requested}"
+                    + _other_format_hint(segment, normalized_extension)
                 )
             return replace(
                 segment,
@@ -105,11 +133,13 @@ def discover_segment_labels(
             raise ValueError(
                 f"{segment.segment_dir} must contain at least one inklabels "
                 f"{normalized_extension} asset"
+                + _other_format_hint(segment, normalized_extension)
             )
         if not candidates_by_kind["supervision_mask"]:
             raise ValueError(
                 f"{segment.segment_dir} must contain at least one supervision_mask "
                 f"{normalized_extension} asset"
+                + _other_format_hint(segment, normalized_extension)
             )
     selected_paths: dict[str, Path | None] = {}
     for kind, candidates in candidates_by_kind.items():
