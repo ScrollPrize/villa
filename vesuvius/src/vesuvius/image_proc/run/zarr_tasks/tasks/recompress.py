@@ -19,6 +19,8 @@ from numcodecs import Blosc
 from tqdm import tqdm
 from multiprocessing import Pool
 
+from vesuvius.data.utils import open_zarr
+
 from ..base import TaskConfig, ZarrTask, make_task_config
 from ..registry import register_task
 from ..utils import (
@@ -197,8 +199,10 @@ class RecompressTask(ZarrTask):
             read_z = zarr.open(level_path, mode="r")
             print(f"  Shape: {read_z.shape}, Chunks: {read_z.chunks}")
 
-            # Create temp zarr with new compressor
-            temp_z = zarr.open(
+            # zarr.open on zarr 3 creates a v3 array and rejects this numcodecs
+            # compressor. open_zarr writes zarr_format 2, which is what Blosc
+            # requires, the same rule create_level_dataset already uses.
+            temp_z = open_zarr(
                 temp_path,
                 mode="w",
                 shape=read_z.shape,
