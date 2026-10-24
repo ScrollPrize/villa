@@ -1,5 +1,6 @@
 #include <QApplication>
 #include <QComboBox>
+#include <QCryptographicHash>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -26,6 +27,8 @@
 
 #include <memory>
 #include <filesystem>
+#include <utility>
+#include <vector>
 #include <cstdlib>
 #include <iostream>
 
@@ -491,6 +494,50 @@ int main(int argc, char** argv)
     require(modelRefJobSpec[QStringLiteral("model")].toObject()[QStringLiteral("hash")].toString() ==
                 QStringLiteral("md5:22222222222222222222222222222222"),
             "Re-optimize should derive job_spec.model from meta.json object_refs when no local model is present");
+
+    // A fetched catalog segment keeps ink-detections/ next to ink-detections.json.
+    // The service (fit_service._segment_manifest_hash) hashes the files ordered by
+    // their relative path strings and rejects an upload whose declared hash differs.
+    const QString segInkDir = tempDir.filePath(QStringLiteral("sheet_ink.tifxyz"));
+    require(QDir().mkpath(segInkDir + QStringLiteral("/ink-detections")),
+            "Failed to create tifxyz segment with ink detections");
+    const std::vector<std::pair<QString, QByteArray>> inkSegmentFiles = {
+        {QStringLiteral("ink-detections.json"), QByteArrayLiteral("[]")},
+        {QStringLiteral("ink-detections/ink.jpg"), QByteArrayLiteral("jpg")},
+        {QStringLiteral("meta.json"), QByteArrayLiteral("{}")},
+        {QStringLiteral("x.tif"), QByteArrayLiteral("x")},
+        {QStringLiteral("y.tif"), QByteArrayLiteral("y")},
+        {QStringLiteral("z.tif"), QByteArrayLiteral("z")},
+    };
+    QByteArray inkManifest;
+    for (const auto& [rel, bytes] : inkSegmentFiles) {
+        writeFile(segInkDir + QStringLiteral("/") + rel, bytes);
+        inkManifest += rel.toUtf8() + QByteArrayLiteral("\tmd5:") +
+            QCryptographicHash::hash(bytes, QCryptographicHash::Md5).toHex() + QByteArrayLiteral("\n");
+    }
+    const QString serviceInkHash = QStringLiteral("md5:") + QString::fromLatin1(
+        QCryptographicHash::hash(inkManifest, QCryptographicHash::Md5).toHex());
+    auto inkSurface = std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});
+    inkSurface->path = std::filesystem::path(segInkDir.toStdString());
+    state.setSurface("segmentation", inkSurface, true);
+    panel.startOptimizationAtSeed(
+        &state,
+        &statusBar,
+        SegmentationLasagnaPanel::LasagnaMode::ReOptimize,
+        configPath,
+        4,
+        5,
+        6);
+    QString declaredInkHash;
+    for (const QJsonValue& value : g_lastLasagnaOptimizationRequest[QStringLiteral("_objects")].toArray()) {
+        const QJsonObject ref = value.toObject()[QStringLiteral("object")].toObject();
+        if (ref[QStringLiteral("type")].toString() == QStringLiteral("tifxyz_segment") &&
+            ref[QStringLiteral("name")].toString() == QStringLiteral("sheet_ink.tifxyz")) {
+            declaredInkHash = ref[QStringLiteral("hash")].toString();
+        }
+    }
+    require(declaredInkHash == serviceInkHash,
+            "Re-optimize should declare the segment hash the Lasagna service computes (relative paths sorted as strings)");
 
     const QString segBrokenModelDir = tempDir.filePath(QStringLiteral("sheet_broken_model.tifxyz"));
     require(QDir().mkpath(segBrokenModelDir), "Failed to create broken-model tifxyz segment");

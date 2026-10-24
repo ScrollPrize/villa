@@ -188,7 +188,11 @@ QJsonObject segmentArtifactForPath(const std::filesystem::path& segPath,
             files.push_back(entry.path());
         }
     }
-    std::sort(files.begin(), files.end());
+    // Order as fit_service._segment_manifest_hash does: path strings, so
+    // "ink-detections.json" sorts before "ink-detections/...".
+    std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) {
+        return a.generic_string() < b.generic_string();
+    });
 
     QByteArray manifest;
     for (const auto& path : files) {
