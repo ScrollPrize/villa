@@ -6,6 +6,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/StoreSurfaces.hpp"
 
 #include "vc/core/types/VcDataset.hpp"
 #include "utils/Json.hpp"
@@ -312,6 +313,8 @@ int main(int argc, char *argv[])
 {
     if (argc == 2 && (std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help")) {
         std::cout << "usage: " << argv[0] << " <tiffxyz> <obj> [--normalize-uv] [--align-grid] [--keep=<p>] [--clean [K]] [--no-inpaint]\n"
+                  << "       " << argv[0] << " --store <store> --surface <uuid> <obj-name> [options]\n"
+                  << "  store mode writes the OBJ into the surface's artifact directory and prints obj: <path>\n"
                   << "  --normalize-uv : Normalize UVs to [0,1] range\n"
                   << "  --align-grid   : Align grid Z only (flatten Z per row)\n"
                   << "  --keep=<p>     : Percent of source points to keep (1..100). 100 = no decimation. One pass; stride = round(1/sqrt(p/100)).\n"
@@ -321,6 +324,13 @@ int main(int argc, char *argv[])
         return EXIT_SUCCESS;
     }
 
+    // Store mode: --store PATH --surface UUID NAME, then the same options.
+    const bool store_mode = argc > 1 && std::string(argv[1]) == "--store";
+    if (store_mode && (argc < 6 || std::string(argv[3]) != "--surface")) {
+        std::cerr << "error: store mode is --store <store> --surface <uuid> <obj-name> [options]\n";
+        return EXIT_FAILURE;
+    }
+    const int first_option = store_mode ? 6 : 3;
     if (argc < 3) {
     std::cerr << "error: too few arguments\n"
                   << "usage: " << argv[0] << " <tiffxyz> <obj> [--normalize-uv] [--align-grid] [--keep=<p>] [--clean [K]] [--no-inpaint]\n";
@@ -335,7 +345,7 @@ int main(int argc, char *argv[])
     bool inpaint_holes = false;
     
     // Parse optional arguments
-    for (int i = 3; i < argc; ++i) {
+    for (int i = first_option; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--normalize-uv") {
             normalize_uv = true;
@@ -379,19 +389,36 @@ int main(int argc, char *argv[])
         }
     }
 
-    const std::filesystem::path seg_path = argv[1];
-    const std::filesystem::path obj_path = argv[2];
-
     std::unique_ptr<QuadSurface> surf;
-    try {
-        surf = load_quad_from_tifxyz(seg_path);
-    }
-    catch (...) {
-        std::cerr << "error when loading: " << seg_path << std::endl;
-        return EXIT_FAILURE;
+    std::filesystem::path obj_path;
+    if (store_mode) {
+        const std::filesystem::path name = argv[5];
+        if (name.has_parent_path() || name.empty()) {
+            std::cerr << "error: <obj-name> is a file name inside the artifact directory\n";
+            return EXIT_FAILURE;
+        }
+        try {
+            StoreSurfaces store(argv[2], "vc_tifxyz2obj");
+            surf = store.load(argv[4]);
+            obj_path = store.artifactDirectory(argv[4]) / name;
+        } catch (const std::exception& error) {
+            std::cerr << "error when loading " << argv[4] << ": " << error.what() << std::endl;
+            return EXIT_FAILURE;
+        }
+    } else {
+        const std::filesystem::path seg_path = argv[1];
+        obj_path = argv[2];
+        try {
+            surf = load_quad_from_tifxyz(seg_path);
+        }
+        catch (...) {
+            std::cerr << "error when loading: " << seg_path << std::endl;
+            return EXIT_FAILURE;
+        }
     }
 
     surf_write_obj(surf.get(), obj_path, normalize_uv, align_grid, keep_percent, clean_surface, clean_sigma_k, inpaint_holes);
+    if (store_mode) std::cout << "obj: " << obj_path.string() << std::endl;
 
     return EXIT_SUCCESS;
 }

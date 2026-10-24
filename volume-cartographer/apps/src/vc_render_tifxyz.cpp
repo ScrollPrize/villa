@@ -3,6 +3,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/StoreSurfaces.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Tiff.hpp"
 #include "vc/core/util/Zarr.hpp"
@@ -1260,6 +1261,8 @@ int main(int argc, char *argv[])
     optional.add_options()
         ("help,h", "Show this help message")
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
+        ("store", po::value<std::string>(), "Object store holding the surface to render (with --surface)")
+        ("surface", po::value<std::string>(), "Stored surface UUID to render (with --store)")
         ("cache-gb", po::value<size_t>()->default_value(16), "Zarr chunk cache size in GB")
         ("prefetch-remote", po::bool_switch()->default_value(false), "With a remote --volume, fetch the chunks this render reads into the shared remote cache before rendering instead of streaming them during the render")
         ("remote-url", po::value<std::string>(), "[DEPRECATED] Same as passing the remote OME-Zarr URL as --volume")
@@ -1435,8 +1438,13 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    if (!parsed.count("segmentation")) { logPrintf(stderr, "Error: --segmentation required\n"); return EXIT_FAILURE; }
-    std::filesystem::path seg_path = parsed["segmentation"].as<std::string>();
+    const bool store_mode = parsed.count("store") || parsed.count("surface");
+    if (store_mode ? !(parsed.count("store") && parsed.count("surface")) || parsed.count("segmentation")
+                   : !parsed.count("segmentation")) {
+        logPrintf(stderr, "Error: give --segmentation, or --store with --surface\n");
+        return EXIT_FAILURE;
+    }
+    std::filesystem::path seg_path = store_mode ? parsed["surface"].as<std::string>() : parsed["segmentation"].as<std::string>();
 
     float tgt_scale = parsed["scale"].as<float>();
     int group_idx = parsed["group-idx"].as<int>();
@@ -1787,7 +1795,10 @@ int main(int argc, char *argv[])
         }
 
         std::unique_ptr<QuadSurface> surf;
-        try { surf = load_quad_from_tifxyz(seg_folder); }
+        try {
+            surf = store_mode ? StoreSurfaces(parsed["store"].as<std::string>(), "vc_render_tifxyz").load(seg_folder.string())
+                              : load_quad_from_tifxyz(seg_folder);
+        }
         catch (...) { logPrintf(stderr, "Error loading: %s\n", seg_folder.string().c_str()); return false; }
 
         if (parsed["flatten"].as<bool>()) {

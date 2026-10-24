@@ -393,6 +393,12 @@ add_dependencies(test_grow_seg_store_mode vc_grow_seg_from_seed)
 set_tests_properties(test_grow_seg_store_mode PROPERTIES
     ENVIRONMENT "VC_GROW_SEG_FROM_SEED_BIN=$<TARGET_FILE:vc_grow_seg_from_seed>")
 
+# Store modes of the command-line tools, compared with their tifxyz modes.
+vc_add_test(NAME test_tool_store_modes)
+add_dependencies(test_tool_store_modes vc_tifxyz2obj vc_render_tifxyz)
+set_tests_properties(test_tool_store_modes PROPERTIES
+    ENVIRONMENT "VC_TIFXYZ2OBJ_BIN=$<TARGET_FILE:vc_tifxyz2obj>;VC_RENDER_TIFXYZ_BIN=$<TARGET_FILE:vc_render_tifxyz>")
+
 add_executable(bench_volume_sample bench_volume_sample.cpp)
 target_link_libraries(bench_volume_sample PRIVATE doctest::doctest vc_core)
 vc_register_test_target(bench_volume_sample)

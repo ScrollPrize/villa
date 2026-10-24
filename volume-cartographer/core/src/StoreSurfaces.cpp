@@ -15,10 +15,9 @@ StoreSurfaces::StoreSurfaces(const std::filesystem::path& store, const std::stri
     attachment_ = session_->attach(store, options);
 }
 
-StoreSurfaces::~StoreSurfaces()
-{
-    try { session_->detach(attachment_); } catch (...) {}
-}
+// Loaded surfaces keep the session (and its attachment) alive for their channels;
+// the session detaches when the last of them is gone.
+StoreSurfaces::~StoreSurfaces() = default;
 
 std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool applyValidity)
 {
