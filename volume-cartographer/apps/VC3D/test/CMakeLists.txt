@@ -683,3 +683,11 @@ target_link_libraries(test_fiber_3d_ribbon PRIVATE Qt6::Core Qt6::Gui Qt6::Test 
 add_test(NAME fiber_3d_ribbon COMMAND test_fiber_3d_ribbon)
 vc_register_test_target(test_fiber_3d_ribbon)
 vc_register_ctest(fiber_3d_ribbon test_fiber_3d_ribbon)
+
+add_executable(test_fiber_3d_slices test_fiber_3d_slices.cpp ../fibers3d/Fiber3DSlices.cpp ../fibers3d/Fiber3DCT.cpp)
+set_target_properties(test_fiber_3d_slices PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_fiber_3d_slices PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_fiber_3d_slices PRIVATE Qt6::Core Qt6::Gui Qt6::Test vc_core)
+add_test(NAME fiber_3d_slices COMMAND test_fiber_3d_slices)
+vc_register_test_target(test_fiber_3d_slices)
+vc_register_ctest(fiber_3d_slices test_fiber_3d_slices)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Fiber3DScene.hpp"
+#include "Fiber3DSlices.hpp"
 #include <QOpenGLFunctions_3_3_Core>
 #include <QOpenGLWidget>
 #include <memory>
@@ -28,6 +29,9 @@ public:
     void setCTRibbon(std::shared_ptr<const ribbon::Image> image);
     std::shared_ptr<const ribbon::Image> ctRibbon() const;
     void setCTWindow(float low, float high);
+    void setCTSlices(slices::Images);
+    const slices::Images& ctSlices() const;
+    void setCTSliceOpacity(float opacity);
     void fitAll();
     void fitSelected();
     void focusPoint(Point point);
@@ -58,6 +62,8 @@ private:
     std::unique_ptr<Impl> d;
     void cleanupGL();
     void drawCTRibbon();
+    void drawCTSlices();
+    GLuint uploadCTTexture(const ct::Tile& tile);
     void startGeometryBuild();
     void updateSelectedGeometry();
     void updateProximity();

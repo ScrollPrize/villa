@@ -75,6 +75,40 @@ With an existing configured build, compile using `cmake --build build --target
 VC3D test_fiber_3d_ribbon -j 6`. Run the focused tests using `ctest --test-dir build
 --output-on-failure -R '^(fiber_3d_ribbon|fiber_3d_geometry|fiber_3d_data|test_fiber_collection)$'`.
 
+**CT slices** displays the linked **XY**, **XZ** and **YZ** CT planes in the
+3D view, independently of fibre selection. Its controls sit below the toolbar;
+each plane has a checkbox and the shared **Opacity** slider runs from 0–100%
+(default 70%, numeric arrow steps of 5%). XY and YZ start enabled, XZ disabled;
+these choices are remembered, while the CT slices button starts off.
+
+The planes follow the existing CT views' position, normal offset, rotation,
+pan and zoom. Their footprints match the visible CT areas. A hidden CT view
+has no usable viewport, so its optional plane shows a 1,024-voxel square around
+the shared focus instead. The grayscale window follows the existing CT window
+controls. CT slices and a selected fibre's CT ribbon can be displayed together.
+These are individual inspection slices, with no slab projection or MIP.
+
+Sampling runs on a cancellable worker. A preview (at most 256 texels per edge)
+is followed by detail (at most 1,024 per edge), using the available CT pyramid
+level appropriate for that sampling spacing. Zooming the linked CT view narrows
+the footprint and reveals finer detail. The existing CT cache is reused; the
+three final gray/validity textures occupy at most 6 MiB. Orbit, opacity and
+contrast only redraw cached textures. Switching planes off and back on reuses
+unchanged samples; changed positions discard stale images. A small BSP splits
+intersecting planes so their transparency is ordered correctly during orbit.
+
+Slice validation: `fiber_3d_slices`, `fiber_3d_ribbon`, `fiber_3d_geometry`,
+`fiber_3d_data` and `test_fiber_collection` passed on the M2 Max Mac. Tests cover
+known 3D intensity fields, axis-aligned/tilted planes, volume bounds, pyramid
+preview/detail footprints, cancellation, and intersecting-plane area, UVs and
+alpha ordering. The native app was also exercised with the complete 80,887-fibre
+PHerc1447 AFV: all three planes, opacity/contrast without resampling, actual
+camera drags, individual toggles, a 7-voxel CT normal offset, CT rotation/zoom,
+concurrent ribbon display, and cancellation/resume. The QA harness and results
+are in `exports/VC3D_FIBERS3D_QA/slices-20261024` in the outer workspace. Ubuntu
+was not run. Add `test_fiber_3d_slices` to the build targets and `fiber_3d_slices`
+to the focused CTest expression above to reproduce the slice tests.
+
 Selecting an AFV fibre in a CT slice or the catalogue also highlights it in
 3D, using the same yellow (`#ffff66`) as the slice overlay and a stroke
 2 logical pixels wider than the other fibres, including on Retina displays.
