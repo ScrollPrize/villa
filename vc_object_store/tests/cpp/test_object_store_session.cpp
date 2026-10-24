@@ -280,7 +280,7 @@ int main() try
             std::vector<uint8_t> moved(12); const float xyz[3] = {1, 1, 5}; std::memcpy(moved.data(), xyz, 12);
             store.editGeometry(txn, sheet, {{"points", 0, moved}}, head);
         }); });
-        session.editKeepingRelationships(replacement, pins, [&](auto& store, auto& txn, const auto& keep) {
+        session.editKeepingRelationships(replacement, pins, {}, [&](auto& store, auto& txn, const auto& keep) {
             const auto head = store.currentGeometry(txn, sheet)->uuid;
             std::vector<uint8_t> moved(12); const float xyz[3] = {1, 1, 5}; std::memcpy(moved.data(), xyz, 12);
             const std::vector<GeometryArrayEdit> edits{{"points", 0, moved}};
@@ -291,6 +291,15 @@ int main() try
             const auto points = store.readGeometryArray(txn, store.currentGeometry(txn, sheet)->uuid, "points");
             float z; std::memcpy(&z, points.data() + 8, 4);
             require(z == 5, "the anchored vertex moved");
+        });
+        // An object pinned without a revision is created by the same edit.
+        const auto created = util::newUuid();
+        session.editKeepingRelationships(replacement, {{created, std::nullopt}}, {}, [&](auto& store, auto& txn, const auto&) {
+            ObjectRecord record; record.uuid = created; record.kind = "surface";
+            store.upsertObject(txn, record);
+        });
+        session.read(replacement, [&](const auto& store, const auto& txn, const auto&) {
+            require(store.objectByUuid(txn, created).has_value(), "edits create objects pinned without a revision");
         });
         session.takeEvents();
     }

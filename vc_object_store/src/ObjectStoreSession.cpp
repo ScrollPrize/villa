@@ -236,15 +236,23 @@ std::filesystem::path ObjectStoreSession::artifactDirectory(const AttachmentIden
 }
 
 RevisionSelection ObjectStoreSession::editKeepingRelationships(const AttachmentIdentity& identity,
-    const RevisionSelection& pins, const std::function<void(ObjectStore&, WriteTxn&, const KeepRecorded&)>& edit)
+    const RevisionSelection& pins, const RevisionSelection& related,
+    const std::function<void(ObjectStore&, WriteTxn&, const KeepRecorded&)>& edit)
 {
-    std::vector<std::string> objects;
-    for (const auto& [uuid, revision] : pins) objects.push_back(uuid);
-    const auto leases = holdLeases(identity, objects);
+    // Objects pinned without a revision are created by the edit: none to lease.
+    std::vector<std::string> existing;
+    for (const auto& [uuid, revision] : pins)
+        if (revision) existing.push_back(uuid);
+    const auto leases = holdLeases(identity, existing);
     auto expected = pins;
+    for (const auto& [uuid, revision] : related)
+        if (!expected.emplace(uuid, revision).second && expected.at(uuid) != revision)
+            throw std::invalid_argument("object store: conflicting revisions for " + uuid);
     read(identity, [&](const auto& store, const auto& txn, const auto&) {
-        for (const auto& uuid : objects)
-            for (const auto& edge : store.edgesOf(txn, uuid, true))
+        // Objects expected absent have no relationships yet.
+        const auto touched = expected;
+        for (const auto& [uuid, revision] : touched)
+            if (revision) for (const auto& edge : store.edgesOf(txn, uuid, true))
                 for (const auto& endpoint : {edge.aUuid, edge.bUuid})
                     if (!expected.contains(endpoint))
                         if (const auto head = store.currentObjectRevision(txn, endpoint)) expected[endpoint] = head->uuid;

@@ -79,7 +79,7 @@ std::string StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
     const auto& [objectRevision, geometryRevision] = *pins;
     const auto& points = *surface.rawPointsPtr();
     std::string revision;
-    session_->editKeepingRelationships(attachment_, {{canonical, objectRevision}}, [&](auto& db, auto& txn, const auto& keep) {
+    session_->editKeepingRelationships(attachment_, {{canonical, objectRevision}}, {}, [&](auto& db, auto& txn, const auto& keep) {
         revision = write_quad_rect_to_store(db, txn, canonical, surface, cv::Rect(0, 0, points.cols, points.rows),
                                             geometryRevision, keep);
     });
@@ -94,7 +94,7 @@ std::string StoreSurfaces::updateChannels(const std::string& uuid, QuadSurface& 
     if (!pins) throw std::runtime_error("update a surface this tool loaded: " + uuid);
     const auto& [objectRevision, geometryRevision] = *pins;
     std::string revision;
-    session_->editKeepingRelationships(attachment_, {{canonical, objectRevision}}, [&](auto& db, auto& txn, const auto&) {
+    session_->editKeepingRelationships(attachment_, {{canonical, objectRevision}}, {}, [&](auto& db, auto& txn, const auto&) {
         revision = write_quad_channels_to_store(db, txn, canonical, surface, names, {}, geometryRevision);
     });
     lastWrite_ = std::chrono::system_clock::now();
