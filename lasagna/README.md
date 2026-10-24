@@ -82,6 +82,39 @@ printed run directory's `run.log`. Passing `--no-prefetch` writes only the
 source descriptor and lets the inference backend download missing chunks on
 demand for its crop; this download belongs to the inference lifecycle.
 
+### Cooperative full-volume GPUs
+
+`las_manager` inference jobs automatically use the local cooperative GPU manager
+(`incremental_release` capability required). Prefetch does not reserve GPUs.
+The GPU phase uses one tile per forward pass and varies the **number of GPUs**,
+not batch size or tile geometry. `--devices` limits the eligible devices; it is
+not itself a reservation. CUDA ordinals are resolved to UUIDs before requesting
+resources. An older manager fails capability negotiation; it is never bypassed
+or restarted behind existing clients' backs.
+
+CPU readers, caches, bounded queues, accumulators and output state persist when
+the allocation changes. Removed GPU workers finish submitted tiles, return their
+results and exit before release is acknowledged. Retained workers stay loaded;
+only newly granted GPUs load a model. Full pause unloads all GPU workers; work
+continues automatically after a new grant. Pyramid generation runs after GPU
+workers have exited and release has been reported. A manager restart still
+requires a GPU-only drain; the CPU pipeline remains intact. Communication errors
+are logged and stop new tile admission, drain GPU workers and retry every five
+seconds. No full-volume rescan is needed for these transitions.
+
+Until a one-tile peak is measured, the conservative default requests a full
+selected GPU's memory (the largest selected capacity on heterogeneous hosts).
+To share GPUs, pass a **measured budget including CUDA overhead and reserve**
+through `LASAGNA_GPU_MEMORY_GIB`, for example `46` only if that budget has been
+verified for the chosen model/tile size. `LASAGNA_GPU_PRIORITY` defaults to `0`;
+`VILLA_GPU_MANAGER_SOCKET` optionally selects a socket. These variables are
+inherited by the inference runner. The worker limits Torch's allocator to the
+grant minus 1 GiB reserved for non-allocator CUDA use; this is not a memory
+calibration and an undersized user budget may still fail with OOM. Normalization
+calibration must be performed separately, not inside cooperative inference.
+Direct API/CLI callers can opt into the same behavior with `LASAGNA_COOPERATIVE=1`;
+the manager launcher always sets it for volume inference, not Fiberlet jobs.
+
 Current Fiber checkpoints carry their authoritative inference config, so no
 separate config argument is needed. Direct inference uses the same rule:
 

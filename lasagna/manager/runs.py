@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import uuid
 from typing import Any, Sequence
+from ..cooperative_inference import INFERENCE_ENV
 
 from .catalog import VolumeRecord
 from .config import ManagerConfig
@@ -460,7 +461,7 @@ def launch_inference(
         "private": {"hostname": socket.gethostname(), "user": getpass.getuser()},
         "manager": {"version": "0.1", **_git_revision(Path(__file__).resolve().parents[2])},
         "runtime": _runtime_info(python),
-        "environment": {name: os.environ[name] for name in ("CUDA_VISIBLE_DEVICES",) if name in os.environ},
+        "environment": {name: os.environ[name] for name in INFERENCE_ENV if name in os.environ},
         "source": {
             "volume": {**asdict(volume), "selector": volume.selector},
             "scale": scale,

@@ -517,8 +517,10 @@ def run_fiber_trace_3d_inference(
     resolved_devices = resolve_inference_devices(device=device, devices=devices)
     torch_device = resolved_devices[0]
 
+    from lasagna.cooperative_inference import enabled as cooperative_enabled
     precision_mode, precision_source = _resolve_inference_precision(
         inference_precision, checkpoint=checkpoint, devices=resolved_devices,
+        validate_devices=not cooperative_enabled(resolved_devices),
     )
     config = dict(config)
     effective_training = dict(config.get("training", {}))
@@ -695,7 +697,7 @@ def run_fiber_trace_3d_inference(
     t0 = time.time()
     model = None
     try:
-        if len(resolved_devices) == 1:
+        if len(resolved_devices) == 1 and not cooperative_enabled(resolved_devices):
             print(
                 f"[fiber_trace_3d:infer] loading checkpoint={checkpoint} device={torch_device}",
                 flush=True,

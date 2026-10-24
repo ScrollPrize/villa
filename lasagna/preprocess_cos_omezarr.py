@@ -1850,7 +1850,10 @@ def run_preprocess_3d(
 	# calibration, when requested, is transferred as an explicit CPU state dict.
 	model = None
 	calibrated_state = None
-	if len(resolved_devices) == 1 or calibrate_norm:
+	from lasagna.cooperative_inference import enabled as cooperative_enabled
+	if cooperative_enabled(resolved_devices) and calibrate_norm:
+		raise ValueError("norm calibration is not supported during cooperative volume inference; calibrate the checkpoint first")
+	if (len(resolved_devices) == 1 and not cooperative_enabled(resolved_devices)) or calibrate_norm:
 		model = predict_adapter.load_model(device=torch_device)
 	if calibrate_norm:
 		_calibrate_instance_norm(
