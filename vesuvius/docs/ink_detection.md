@@ -454,6 +454,8 @@ Flat inference requires a checkpoint with `mode: "flat"` and a square Y/X
 crop. It prefers `ema_model`, then common flat state-dict aliases, then
 `model`. The output is a tiled LZW uint8 BigTIFF. Probabilities are clipped to
 `[0,1]`, multiplied by 255, and truncated to uint8.
+All positive accumulated blend weights are normalized, including low Gaussian
+weights at patch corners; uncovered and masked pixels retain zero weight.
 
 Flat inference has a narrower preprocessing contract than training. It accepts
 `robust_mad` only with the default 1st and 99th percentiles, and `divide` only
@@ -519,6 +521,8 @@ Native inference requires a checkpoint whose mode is `full_3d` or
 volume because those determine the plan. Level 0 is a sparse uint8 Zarr-v2
 array in scroll Z/Y/X coordinates. Five rounded-mean levels are derived from
 it, producing a six-level OME-Zarr pyramid with ceil-halved shapes.
+Gaussian blending normalizes every positive accumulated weight, including
+single-patch corners and edges. Zero-weight masked voxels are not divided.
 
 ## Labeling loop
 
