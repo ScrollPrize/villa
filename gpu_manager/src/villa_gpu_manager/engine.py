@@ -351,7 +351,11 @@ class Engine:
                 task["held"] = copy.deepcopy(body["held"])
                 task["phase"] = "applied"
             elif phase in ("released", "failed"):
-                require(task["phase"] in ("release", "initialize", "applied"), "no active grant to release")
+                retained_waiting = (task["phase"] == "waiting"
+                                    and task.get("reconfigure_mode") == "incremental_release"
+                                    and task["granted"] != empty())
+                require(task["phase"] in ("release", "initialize", "applied") or retained_waiting,
+                        "no active grant to release")
                 # Nonzero reports preserve *all* reservations until both GPU and CPU drain.
                 held = body["held"]
                 fields(held, ("cpu_cores", "gpus"))

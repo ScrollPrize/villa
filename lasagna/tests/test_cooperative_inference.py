@@ -143,6 +143,40 @@ def test_close_refuses_live_workers():
     assert client.engine.tasks[client.task_id]["terminal"]
 
 
+def test_reconnect_releases_retained_waiting_grant_before_blocked_expansion():
+    client, pool, tick = setup()
+    tick()
+    other = EngineClient()
+    other.engine = client.engine
+    other.connect()
+    other.register("blocker", dict(REQUEST, max_gpus=1, allowed_gpu_uuids=["GPU-b"]),
+                   root=dict(pid=1000, start_us=1, boot_us=1))
+    removed = pool.workers[1]
+    tick()
+    removed.alive = False
+    tick()
+    tick()
+    other.report("applied", other.poll()["granted"])
+    other.pause(True)  # B remains reserved until its release acknowledgement.
+    tick()
+    assert client.task["phase"] == "waiting"
+    assert client.task["granted"] == ONE
+    retained = pool.workers[0]
+    client.offline = True
+    tick()
+    tick()
+    assert client.engine.tasks[client.task_id]["granted"] == ONE
+    retained.alive = False
+    tick()
+    assert retained.joined
+    client.offline = False
+    tick()
+    assert pool.connected
+    assert client.task["granted"] == empty()
+    other.report("released", empty())
+    assert tick() == {0, 1}
+
+
 def test_cuda_admission_gate_waits_for_manager_process_report():
     client, pool, tick = setup()
     def make(i, u, b):
