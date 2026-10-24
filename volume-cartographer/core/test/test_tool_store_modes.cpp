@@ -85,7 +85,7 @@ struct Fixture {
         db.putGeometry(txn, uuid, quad_surface_geometry(surface));
         txn.commit();
     }
-    ~Fixture() { std::error_code ignored; fs::remove_all(dir, ignored); }
+    ~Fixture() { std::error_code ignored; if (!std::getenv("VC_KEEP_FIXTURE")) fs::remove_all(dir, ignored); }
     std::string storeArgs() const { return "--store \"" + store.string() + "\" --surface " + uuid; }
 };
 }
@@ -331,4 +331,45 @@ TEST_CASE("vc_tifxyz2zarr_sparse rasterizes stored surfaces like tifxyz folders"
         ++chunks;
     }
     CHECK(chunks > 0);
+}
+
+TEST_CASE("vc_grow_seg_from_segments grows a stored surface from stored sources")
+{
+    // The growth itself is not repeatable (unseeded rand() and OpenMP), so this
+    // checks what store mode adds: stored sources in, a stored trace out.
+    Fixture f;
+    writeRampVolume(f.dir / "volume.zarr");
+    auto plane = [](int xOffset) {
+        cv::Mat_<cv::Vec3f> points(24, 24);
+        for (int r = 0; r < 24; ++r)
+            for (int c = 0; c < 24; ++c) points(r, c) = {60.f + 2.f * float(c + xOffset), 60.f + 2.f * float(r), 64.f};
+        return QuadSurface(points, {0.5f, 0.5f});
+    };
+    auto a = plane(0), b = plane(12);
+    const auto uuidA = util::newUuid(), uuidB = util::newUuid();
+    {
+        OpenOptions options; options.author = "tool-store-test";
+        auto db = ObjectStore::open(f.store, options);
+        auto txn = db.write();
+        for (const auto& [uuid, surface] : {std::pair{uuidA, &a}, std::pair{uuidB, &b}}) {
+            ObjectRecord record; record.uuid = uuid; record.kind = "surface"; record.tags = {"source"};
+            db.upsertObject(txn, record);
+            db.putGeometry(txn, uuid, quad_surface_geometry(*surface));
+        }
+        txn.commit();
+    }
+    std::ofstream(f.dir / "params.json") << R"({"generations": 3, "use_cuda": false})";
+    const auto output = run(tool("VC_GROW_SEG_FROM_SEGMENTS_BIN") + " --volume \"" + (f.dir / "volume.zarr").string() +
+                            "\" --params \"" + (f.dir / "params.json").string() + "\" --store \"" + f.store.string() +
+                            "\" --src-surface " + uuidA + " --source-tag source --tag trace", f.dir / "store.log");
+    const auto uuid = surfaceUuid(output);
+    OpenOptions options; options.author = "tool-store-test";
+    auto db = ObjectStore::open(f.store, options);
+    auto txn = db.read();
+    CHECK(db.currentGeometry(txn, uuid).has_value());
+    const auto object = db.objectByUuid(txn, uuid);
+    CHECK(object->tags == std::vector<std::string>{"trace"});
+    CHECK(nlohmann::json::parse(object->meta).at("provenance").at("sources") == nlohmann::json::array({uuidA}));
+    // The tracer's debug snapshots land in the output's artifacts, not a target directory.
+    CHECK(fs::is_directory(fs::path(f.store.string() + ".artifacts") / uuid / "grow_debug"));
 }

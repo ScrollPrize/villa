@@ -39,7 +39,7 @@ public:
     // The surface's current geometry; channels load on demand from that revision.
     std::unique_ptr<QuadSurface> load(const std::string& uuid, bool applyValidity = true);
     // A new surface object holding `surface`. Its meta keeps the surface's meta
-    // (e.g. area) except tifxyz file keys; meta.provenance records the tool, its
+    // (e.g. area) except tifxyz file keys and status tags (`tags` are the record's); meta.provenance records the tool, its
     // parameters and the source objects; meta.coordinates is taken from the first
     // source unless given.
     std::string create(QuadSurface& surface, const std::string& name, const nlohmann::json& parameters,

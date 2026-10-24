@@ -20,6 +20,8 @@
 #include "vc/core/util/OpenCvCompat.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
+#include "vc/core/util/StoreSurfaces.hpp"
+#include <vc_object_store/Uuid.hpp>
 #include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/VoxelSizeMetadata.hpp"
 
@@ -983,6 +985,10 @@ int main(int argc, char *argv[])
     int sweep_max_height = -1;
     int cli_max_width = -1;
     uint32_t sweep_seed = 1;
+    // Store mode: sources and outputs are surface objects.
+    std::filesystem::path store_path;
+    std::string src_surface, volume_uuid, source_tag;
+    std::vector<std::string> output_tags;
 
     bool use_old_args = argc == 6 && argv[1][0] != '-' && argv[2][0] != '-' &&
         argv[3][0] != '-' && argv[4][0] != '-' && argv[5][0] != '-';
@@ -998,8 +1004,13 @@ int main(int argc, char *argv[])
         desc.add_options()
             ("help,h", "produce help message")
             ("volume,v", po::value<std::string>()->required(), "OME-Zarr volume path")
-            ("src-dir,s", po::value<std::string>()->required(), "Directory containing source segments")
-            ("target-dir,t", po::value<std::string>()->required(), "Target directory for output traces")
+            ("src-dir,s", po::value<std::string>(), "Directory containing source segments (tifxyz mode)")
+            ("target-dir,t", po::value<std::string>(), "Target directory for output traces (tifxyz mode)")
+            ("store", po::value<std::string>(), "Object store: sources are its surfaces and outputs new surface objects (prints surface_uuid:)")
+            ("src-surface", po::value<std::string>(), "Stored surface UUID to grow from (store mode)")
+            ("source-tag", po::value<std::string>(), "Only surfaces with this tag are sources (store mode; default all)")
+            ("volume-uuid", po::value<std::string>(), "Volume whose surfaces are sources and that outputs are bound to (store mode)")
+            ("tag", po::value<std::vector<std::string>>()->composing(), "Tag for output surfaces (store mode, repeatable)")
             ("params,p", po::value<std::string>(), "JSON parameters file (required unless --sweep is used)")
             ("src-segment", po::value<std::string>(), "Source segment path to grow from")
             ("seed-coord", po::value<std::vector<std::string>>()->composing(), "3D seed coordinate x,y,z. May be repeated")
@@ -1041,8 +1052,25 @@ int main(int argc, char *argv[])
         }
 
         vol_path = vm["volume"].as<std::string>();
-        src_dir = vm["src-dir"].as<std::string>();
-        tgt_dir = vm["target-dir"].as<std::string>();
+        if (vm.count("store")) {
+            if (vm.count("src-dir") || vm.count("target-dir") || vm.count("src-segment") || vm.count("sweep")) {
+                std::cerr << "ERROR: store mode takes --src-surface/--seed-coord and no directories or --sweep" << std::endl;
+                return EXIT_FAILURE;
+            }
+            store_path = vm["store"].as<std::string>();
+            if (vm.count("src-surface")) src_surface = vm["src-surface"].as<std::string>();
+            if (vm.count("source-tag")) source_tag = vm["source-tag"].as<std::string>();
+            if (vm.count("volume-uuid")) volume_uuid = vm["volume-uuid"].as<std::string>();
+            if (vm.count("tag")) output_tags = vm["tag"].as<std::vector<std::string>>();
+        } else {
+            if (!vm.count("src-dir") || !vm.count("target-dir") || vm.count("src-surface") || vm.count("source-tag") ||
+                vm.count("volume-uuid") || vm.count("tag")) {
+                std::cerr << "ERROR: give --src-dir and --target-dir, or --store with its options" << std::endl;
+                return EXIT_FAILURE;
+            }
+            src_dir = vm["src-dir"].as<std::string>();
+            tgt_dir = vm["target-dir"].as<std::string>();
+        }
         if (vm.count("params")) {
             params_path = vm["params"].as<std::string>();
         }
@@ -1075,8 +1103,8 @@ int main(int argc, char *argv[])
         sweep_metric_tolerance = vm["sweep-metric-tolerance"].as<double>();
         sweep_max_distance_samples = vm["sweep-max-distance-samples"].as<int>();
         const bool has_seed_coordinates = !seed_coord_values.empty() || !seed_coords_path.empty();
-        if (sweep_target_path.empty() && src_path.empty() && !has_seed_coordinates) {
-            std::cerr << "ERROR: --src-segment, --seed-coord/--seed-coords, or --sweep is required" << std::endl;
+        if (sweep_target_path.empty() && src_path.empty() && src_surface.empty() && !has_seed_coordinates) {
+            std::cerr << "ERROR: --src-segment/--src-surface, --seed-coord/--seed-coords, or --sweep is required" << std::endl;
             return EXIT_FAILURE;
         }
         if (sweep_target_path.empty() && params_path.empty()) {
@@ -1149,6 +1177,44 @@ int main(int argc, char *argv[])
     } else {
         set_space_tracing_use_cuda(true);
     }
+    // Store mode: debug snapshots go to a scratch directory that becomes part of
+    // the first output's artifacts; sources are the selected stored surfaces.
+    std::optional<StoreSurfaces> store;
+    std::vector<std::unique_ptr<QuadSurface>> stored_sources;
+    if (!store_path.empty()) {
+        store.emplace(store_path, "vc_grow_seg_from_segments");
+        tgt_dir = std::filesystem::temp_directory_path() / ("vc-grow-segments-" + vc::objects::util::newUuid());
+        std::vector<std::string> uuids;
+        store->session()->read(store->attachment(), [&](const auto& db, const auto& txn, const auto&) {
+            vc::objects::ObjectSelection selection;
+            selection.kind = "surface";
+            if (!source_tag.empty()) selection.tag = source_tag;
+            if (!volume_uuid.empty()) selection.volume = volume_uuid;
+            for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{})) uuids.push_back(object.uuid);
+        });
+        if (!src_surface.empty() && std::find(uuids.begin(), uuids.end(), vc::objects::util::canonicalUuid(src_surface)) == uuids.end())
+            uuids.push_back(src_surface);
+        for (const auto& uuid : uuids) stored_sources.push_back(store->load(uuid));
+    }
+    std::vector<QuadSurface*> stored_source_pointers;
+    for (const auto& surface : stored_sources) stored_source_pointers.push_back(surface.get());
+    std::vector<std::string> published;
+    auto publish = [&](QuadSurface& surface, const std::string& name, const QuadSurface* source) {
+        std::optional<nlohmann::json> coordinates;
+        if (!volume_uuid.empty()) coordinates = nlohmann::json{{"volume_uuid", volume_uuid}, {"scale_factor", 1}};
+        const auto uuid = store->create(surface, name, nlohmann::json::parse(params.dump()),
+                                        source ? std::vector<std::string>{source->id} : std::vector<std::string>{},
+                                        output_tags, coordinates);
+        published.push_back(uuid);
+        std::cout << "surface_uuid: " << uuid << std::endl;
+    };
+    auto finish_store = [&] {
+        std::error_code ignored;
+        if (!published.empty() && std::filesystem::exists(tgt_dir) && !std::filesystem::is_empty(tgt_dir, ignored))
+            std::filesystem::rename(tgt_dir, store->artifactDirectory(published.front()) / "grow_debug", ignored);
+        std::filesystem::remove_all(tgt_dir, ignored);
+        store->finish();
+    };
     params["tgt_dir"] = tgt_dir.string();
 
     std::unique_ptr<vc::VcDataset> ds = std::make_unique<vc::VcDataset>(vol_path / "0");
@@ -1446,7 +1512,7 @@ int main(int argc, char *argv[])
     }
 
     if (!seed_coordinates.empty()) {
-        std::vector<QuadSurface*> surfaces = load_source_surfaces(src_dir, nullptr);
+        std::vector<QuadSurface*> surfaces = store ? stored_source_pointers : load_source_surfaces(src_dir, nullptr);
         if (surfaces.empty()) {
             std::cerr << "Error: no source surfaces found in " << src_dir << std::endl;
             return EXIT_FAILURE;
@@ -1493,15 +1559,37 @@ int main(int argc, char *argv[])
             add_target_context(surf->meta, vol_path);
 
             std::string uuid = "auto_trace_" + get_surface_time_str() + "_" + seed.label;
-            std::filesystem::path seg_dir = tgt_dir / uuid;
-            surf->saveAsNew(seg_dir);
-            std::cout << "  output=" << seg_dir << std::endl;
+            if (store) {
+                surf->meta["seed_source_patch"] = src->id;
+                publish(*surf, uuid, src);
+            } else {
+                std::filesystem::path seg_dir = tgt_dir / uuid;
+                surf->saveAsNew(seg_dir);
+                std::cout << "  output=" << seg_dir << std::endl;
+            }
 
             delete surf;
         }
 
-        delete_loaded_source_surfaces(surfaces, nullptr);
+        if (store) finish_store();
+        else delete_loaded_source_surfaces(surfaces, nullptr);
         return had_failure ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
+
+    if (store) {
+        QuadSurface* src = nullptr;
+        for (auto* surface : stored_source_pointers)
+            if (surface->id == vc::objects::util::canonicalUuid(src_surface)) src = surface;
+        QuadSurface* surf = grow_surf_from_surfs(src, stored_source_pointers, params, voxelsize);
+        if (surf) {
+            surf->meta["source"] = "vc_grow_seg_from_segments";
+            surf->meta["vc_grow_seg_from_segments_params"] = utils::Json::parse(params.dump());
+            add_target_context(surf->meta, vol_path);
+            publish(*surf, "auto_trace_" + get_surface_time_str(), src);
+            delete surf;
+        }
+        finish_store();
+        return EXIT_SUCCESS;
     }
 
     std::vector<QuadSurface*> surfaces;

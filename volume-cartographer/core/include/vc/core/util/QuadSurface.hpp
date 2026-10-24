@@ -611,6 +611,7 @@ private:
 // The store equivalents of load_quad_from_tifxyz and save(). Callers own the
 // transactions and revision pins. Stored vertices whose `valid` channel is 0 load
 // as the (-1,-1,-1) sentinel and `valid` is exposed as the "mask" channel (255/0);
+// record tags appear as meta["tags"] keys;
 // writes touch only vertices that changed, so masked coordinates stay stored.
 
 // A surface object's geometry revision (default: its current one). Other

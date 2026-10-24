@@ -43,7 +43,8 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
     auto meta = nlohmann::json::parse(surface.meta.dump());
     if (!meta.is_object()) meta = nlohmann::json::object();
     // Identity, geometry and file layout belong to the object and its geometry.
-    for (const auto* key : {"uuid", "name", "format", "type", "bbox", "scale", "tiff_dimensions", "coordinates", "provenance"})
+    // Status tags belong to the record and are not inherited from a source.
+    for (const auto* key : {"uuid", "name", "format", "type", "bbox", "scale", "tiff_dimensions", "coordinates", "provenance", "tags"})
         meta.erase(key);
     if (coordinates) meta["coordinates"] = *coordinates;
     else if (!sources.empty())

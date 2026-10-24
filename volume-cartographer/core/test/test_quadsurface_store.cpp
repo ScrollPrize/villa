@@ -86,13 +86,14 @@ TEST_CASE("QuadSurface round trip through the object store")
 
     const auto uuid = util::newUuid();
     store.session->act(store.attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-        ObjectRecord record; record.uuid = uuid; record.kind = "surface"; record.name = "sheet";
+        ObjectRecord record; record.uuid = uuid; record.kind = "surface"; record.name = "sheet"; record.tags = {"approved"};
         db.upsertObject(txn, record);
         db.putGeometry(txn, uuid, quad_surface_geometry(source));
     });
 
     auto loaded = store.load(uuid);
     CHECK(loaded->id == uuid);
+    CHECK(loaded->meta["tags"].contains("approved"));
     CHECK(loaded->_scale == cv::Vec2f(0.5f, 0.5f));
     const auto& p = *loaded->rawPointsPtr();
     CHECK(p(1, 1) == cv::Vec3f(1, 1, 10));
