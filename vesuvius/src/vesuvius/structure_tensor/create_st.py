@@ -433,6 +433,37 @@ class ChunkDataset(Dataset):
         return idx, (z0, z1, y0, y1, x0, x1), block
 
 
+class GroupChunkDataset(Dataset):
+    """ChunkDataset over an already opened array.
+
+    Kept at module level, with a module-level collate function, so DataLoader
+    workers can pickle it: macOS and Python 3.14 on Linux start workers with
+    spawn or forkserver, which cannot pickle a class defined inside a function.
+    """
+    def __init__(self, structure_tensor_arr, chunks, device):
+        self.src = structure_tensor_arr
+        self.chunks = chunks
+        self.device = device
+
+    def __len__(self):
+        return len(self.chunks)
+
+    def __getitem__(self, idx):
+        z0, z1, y0, y1, x0, x1 = self.chunks[idx]
+        block_np = self.src[:, z0:z1, y0:y1, x0:x1].astype('float32')
+        block = torch.from_numpy(block_np).to(self.device)
+        if not torch.isfinite(block).all():
+            bad = (~torch.isfinite(block)).sum().item()
+            raise RuntimeError(
+                f"Non-finite values detected in chunk {(z0, z1, y0, y1, x0, x1)}: {bad} entries"
+            )
+        return idx, (z0, z1, y0, y1, x0, x1), block
+
+
+def _first_item(batch):
+    return batch[0]
+
+
 # solve the eigenvalue problem and sanitize the output
 def _eigh_and_sanitize(M: torch.Tensor):
     # 1) enforce symmetry (numerically more stable? M is already symmetrical)
@@ -655,34 +686,13 @@ def _finalize_structure_tensor_torch(
     else:
         device = torch.device(device)
     
-    # Modified ChunkDataset to work with zarr groups
-    class GroupChunkDataset(Dataset):
-        def __init__(self, structure_tensor_arr, chunks, device):
-            self.src = structure_tensor_arr
-            self.chunks = chunks
-            self.device = device
-
-        def __len__(self):
-            return len(self.chunks)
-
-        def __getitem__(self, idx):
-            z0, z1, y0, y1, x0, x1 = self.chunks[idx]
-            block_np = self.src[:, z0:z1, y0:y1, x0:x1].astype('float32')
-            block = torch.from_numpy(block_np).to(self.device)
-            if not torch.isfinite(block).all():
-                bad = (~torch.isfinite(block)).sum().item()
-                raise RuntimeError(
-                    f"Non-finite values detected in chunk {(z0, z1, y0, y1, x0, x1)}: {bad} entries"
-                )
-            return idx, (z0, z1, y0, y1, x0, x1), block
-    
     gds = GroupChunkDataset(src, chunks, device)
     loader = DataLoader(
         gds,
         batch_size=1,
         num_workers=num_workers,
         pin_memory=False,
-        collate_fn=lambda batch: batch[0]
+        collate_fn=_first_item
     )
 
     # Process each chunk
