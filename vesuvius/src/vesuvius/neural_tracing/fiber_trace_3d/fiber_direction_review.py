@@ -4,9 +4,9 @@ import csv
 from pathlib import Path
 import numpy as np
 from lasagna.inference_provenance import atomic_write, sha256_file
-from .fiber_direction import _ro, breakage_readout, family_settings,label_metrics
-from .fiber_normal_sign_visualization import export, spatial_subset, obj_fiber, arrow_mesh
-from vesuvius.neural_tracing.tracers.shared.annotations.afv import read_afv_polylines
+from .fiber_direction import breakage_readout, family_settings,label_metrics
+from .fiber_normal_sign_visualization import catalog_rows, export, spatial_subset, obj_fiber, arrow_mesh
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest, read_polylines
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at, tangents_at
 
 
@@ -52,12 +52,11 @@ def audit(root, d):
 def export_views(config,cfg,s,d,selected_root):
     family,label,(positive,negative)=family_settings(cfg);short=family.lower()
     root=Path(config['visualization_root']);survivors=s['ids'][s['labels']==label]
-    with _ro(cfg['afv']) as db:
-        rows=db.execute('SELECT id,(min_x+max_x)/2.,(min_y+max_y)/2.,(min_z+max_z)/2.,length FROM fibers ORDER BY length DESC,id').fetchall()
+    rows=sorted(catalog_rows(cfg['fibers']),key=lambda r:(-r[4],r[0]))
     allowed=set(survivors.tolist());pool=[r for r in rows if r[0] in allowed][:int(config.get('longest_candidate_count',10000))]
     selected=sorted(spatial_subset([r[0] for r in pool],[r[1:4] for r in pool],int(config.get('sample_count',1000))))
     # Reuse the established normal-arrow and MeshLab-compatible curve exporter.
-    viscfg=dict(output_root=str(root),solution=cfg['stage1'],database=cfg['database'],afv=cfg['afv'],
+    viscfg=dict(output_root=str(root),solution=cfg['stage1'],database=cfg['database'],fibers=cfg['fibers'],
         hv_solution=cfg['hv_solution'],umbilicus=cfg['umbilicus'],fiber_ids=selected)
     viscfg.update(config.get('normal_visualization',{}))
     export(viscfg)
@@ -67,7 +66,7 @@ def export_views(config,cfg,s,d,selected_root):
     conflicts=np.bincount(np.r_[d['i'][bad],d['j'][bad]],minlength=len(d['active']))
     with (root/f'disabled_{short}.obj').open('w') as out:
         out.write(f'# ALL newly rejected {family} fibers; native L0 XYZ, full original curves\nmtllib fibers.mtl\n')
-        for row,points in read_afv_polylines(cfg['afv'],rejected_ids):
+        for row,points in read_polylines(cfg['fibers'],rejected_ids):
             out.write(obj_fiber(row['id'],points,first,True))
             a=int(np.searchsorted(s['ids'][s['active']],row['id']))
             records.append(dict(id=row['id'],first_vertex=first,vertices=len(points),edges=len(points)-1,
@@ -80,7 +79,7 @@ def export_views(config,cfg,s,d,selected_root):
     arrow_records=[];first=1
     with (root/f'surviving_{short}_directions.obj').open('w') as out:
         out.write(f'# Same surviving {family} subset, with {positive.upper()} tangent arrows; native L0 XYZ\nmtllib fibers.mtl\n')
-        for row,points in read_afv_polylines(cfg['afv'],selected):
+        for row,points in read_polylines(cfg['fibers'],selected):
             fid=row['id'];sign=int(s[f'direction_sign_{positive}'][np.searchsorted(s['ids'],fid)])
             if sign not in (-1,1):raise ValueError('Disabled fiber in surviving view')
             out.write(obj_fiber(fid,points,first,False,material=short));first+=len(points)
@@ -101,7 +100,7 @@ def export_views(config,cfg,s,d,selected_root):
     files=[f'disabled_{short}.obj',f'disabled_{short}.csv',f'{short}_fibers.obj',f'{short}_normals.ply',f'surviving_{short}_directions.obj','umbilicus.ply','fibers.mtl']
     manifest=dict(config=config,solution=str(selected_root/'solution.npz'),solution_sha256=sha256_file(selected_root/'solution.npz'),
         disabled_count=len(rejected_ids),disabled_records=records,surviving_ids=selected,arrows=arrow_records,
-        source_afv_sha256=sha256_file(cfg['afv']),
+        source_fibers_digest=fibers_digest(cfg['fibers']),
         selection=f'All newly disabled {family}; farthest-point spatial sample from longest surviving {family}; whole original curves',
         direction=f'{positive.upper()} relative to positive-Z umbilicus axis; saved sign times stored tangent; NOT sheet-normal arrows',
         files={name:dict(bytes=(root/name).stat().st_size,sha256=sha256_file(root/name)) for name in files})
@@ -118,10 +117,10 @@ def run(config):
     root=Path(config['sweep_root']);sweep=json.loads((root/'summary.json').read_text());cfg=sweep['config']
     family,_,(positive,negative)=family_settings(cfg)
     stamp=json.loads(Path(cfg['tensor_cache']).with_suffix('.json').read_text())
-    keys=['database','afv','features','stage1','hv_solution','umbilicus']
+    keys=['database','fibers','features','stage1','hv_solution','umbilicus']
     if cfg.get('inherited_h_solution'):keys.append('inherited_h_solution')
     for key in keys:
-        if sha256_file(cfg[key])!=stamp['signature'][key]:raise ValueError('Changed input '+key)
+        if (fibers_digest if key=='fibers' else sha256_file)(cfg[key])!=stamp['signature'][key]:raise ValueError('Changed input '+key)
     with np.load(cfg['tensor_cache']) as f:d={k:f[k] for k in f.files}
     rows=[];chosen=None;chosen_root=Path(sweep['selected']['output_root'])
     for row in sweep['results']:

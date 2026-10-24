@@ -1,16 +1,16 @@
-"""Read-only integrity, measurement round-trip and AFV geometry checks."""
+"""Read-only integrity, measurement round-trip and object-store fiber geometry checks."""
 import argparse
 import json
 import math
 from pathlib import Path
 import re
 import sqlite3
-import struct
+
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fiber_catalog, read_polylines
 
 
-def validate(path, afv, all_measurements=False, *, header):
+def validate(path, fibers, all_measurements=False, *, header):
     db = sqlite3.connect(path.resolve().as_uri()+"?mode=ro", uri=True)
-    source = sqlite3.connect(afv.resolve().as_uri()+"?mode=ro", uri=True)
     assert db.execute("pragma integrity_check").fetchall() == [("ok",)]
     assert not db.execute("pragma foreign_key_check").fetchall()
     meta = {k: json.loads(v) for k,v in db.execute("select key,value from metadata")}
@@ -18,7 +18,8 @@ def validate(path, afv, all_measurements=False, *, header):
     count = db.execute("select count(*) from constraints").fetchone()[0]
     assert count == meta["statistics"]["constraints"]
     assert db.execute("select count(*) from fibers").fetchone()[0] == meta["statistics"]["fibers"]
-    source_ids = {r[0] for r in source.execute("select id from fibers")}
+    volume = meta["provenance"]["config"]["coordinate_space"].split("/")[-1]
+    source_ids = {r["id"] for r in fiber_catalog(fibers, volume)}
     ids = {r[0] for r in db.execute("select id from fibers")}
     assert ids <= source_ids
     if meta["provenance"]["config"].get("full_volume"):
@@ -46,9 +47,7 @@ def validate(path, afv, all_measurements=False, *, header):
                 assert n["xyz"] is None
             # Check a bounded deterministic sample against original unsimplified geometry.
             if checked < 100:
-                points=[]
-                for (blob,) in source.execute("select points from blocks where fiber_id=? order by first_segment",(row[1+side],)):
-                    block=list(struct.iter_unpack("<ddd",blob));points.extend(block[1:] if points else block)
+                points=read_polylines(fibers,[row[1+side]],volume=volume)[0][1].tolist()
                 target=row[3+side];remaining=target; actual=None
                 for a,b in zip(points,points[1:]):
                     length=math.dist(a,b)
@@ -68,7 +67,7 @@ def validate(path, afv, all_measurements=False, *, header):
 
 if __name__=="__main__":
     p=argparse.ArgumentParser(description=__doc__);p.add_argument("database",type=Path)
-    p.add_argument("--afv",type=Path,required=True)
+    p.add_argument("--fibers",type=Path,required=True)
     p.add_argument("--header",type=Path,required=True)
     p.add_argument("--all-measurements",action="store_true")
-    a=p.parse_args();validate(a.database,a.afv,a.all_measurements,header=a.header)
+    a=p.parse_args();validate(a.database,a.fibers,a.all_measurements,header=a.header)

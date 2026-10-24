@@ -1,4 +1,4 @@
-"""Neighboring annotated fibers of an AFV source: foreign masks, certified wrong continuations and switch detection.
+"""Neighboring annotated fibers of a fiber-store source: foreign masks, certified wrong continuations and switch detection.
 
 These are supervision-only paths, never image inputs.
 """
@@ -10,28 +10,29 @@ from pathlib import Path
 import numpy as np
 from scipy.spatial import cKDTree
 
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, crop_indices, exact_nearest, interp_at
 
 
-class AFVBank:
-    """Nearby annotations of the same AFV catalog, cleared of the intended annotation."""
+class FiberBank:
+    """Nearby annotations of the same fiber store (a FiberStore), cleared of the intended annotation."""
     def __init__(self, fibers):
         self.fibers = fibers
         self.exclusion = 1.5
         self._trees = OrderedDict()
         self.root = Path(fibers.path)
-        self.run = {'mining': {'min_distance': self.exclusion}, 'digest': fibers.metadata['uuid']}
+        self.run = {'mining': {'min_distance': self.exclusion}, 'digest': fibers_digest(fibers.path)}
         self._cdf = np.cumsum(fibers.lengths)/fibers.lengths.sum()
 
     def draw_path(self, rng, *, min_length=0., hard_fraction=0.):
         """Draw a nearby, target-clear continuous path with arc correspondence.
 
         Parent locations are length weighted; neighbor IDs are sampled without
-        duplicate RTree blocks. Whole-target clearance rejects overlapping
+        duplicate spatial blocks. Whole-target clearance rejects overlapping
         duplicates. Unknown/short/nonmatching geometry is retried or skipped.
         """
         if not 0 <= hard_fraction <= 1 or min_length < 0:
-            raise ValueError('Invalid AFV neighbor sampling options')
+            raise ValueError('Invalid fiber neighbor sampling options')
         from vesuvius.neural_tracing.tracers.fibers.data.bank_geometry import difficulty_scores, DIFFICULTY_KINDS
         proposals = []
         hard = rng.random() < hard_fraction
@@ -41,12 +42,12 @@ class AFVBank:
             at = float(rng.uniform(0., parent.length))
             anchor = interp_at(parent.points, parent.s, [at])[0]
             radius = 6. if rng.random() < .5 else 32.
-            ids = self.fibers.nearby_fiber_ids(anchor, radius, self.fibers.catalog[fi][0])
+            ids = self.fibers.nearby_fiber_ids(anchor, radius, self.fibers.catalog[fi]['id'])
             if not ids:
                 continue
             tree, gap = self._target_tree(fi)
             for neighbor_id in rng.permutation(ids)[:8]:
-                neighbor = self.fibers[self.fibers.id_to_index[int(neighbor_id)]]
+                neighbor = self.fibers[self.fibers.id_to_index[str(neighbor_id)]]
                 j = int(np.argmin(np.linalg.norm(neighbor.points-anchor, axis=1)))
                 span = max(160., min_length+32.)
                 a, b = max(0., neighbor.s[j]-span), min(neighbor.length, neighbor.s[j]+span)
@@ -88,11 +89,11 @@ class AFVBank:
         return proposals[int(np.argmax(scores))]
 
     def provenance(self):
-        return dict(kind='afv', path=self.fibers.path, manifest=self.fibers.manifest_entries())
+        return dict(kind='fibers', path=self.fibers.path, manifest=self.fibers.manifest_entries())
 
     def spatial_records(self, fi, world, radius=0.):
         bounds = np.stack((np.min(world, axis=0)-radius, np.max(world, axis=0)+radius))
-        own = self.fibers.catalog[fi][0]
+        own = self.fibers.catalog[fi]['id']
         return list(self.fibers.nearby_blocks(bounds, own, records=True))
 
     def _target_tree(self, fi):

@@ -2,15 +2,15 @@
 arrays, memory-mapped by every loader worker (``data/fibers.py``). Per point, every ``--sample`` voxels along each
 fiber: ``points`` (M, 3) float32 in patch level-0 voxels, ``tangent`` (M, 3) unit direction along the fiber, ``arc``
 (M,) float32 arc length from the fiber's start, ``instance`` (M,) int32 index into ``keys`` (one per fiber:
-``afv:<id>`` or ``json:<file stem>``, the ids ``match_fibers_to_patches.py`` writes) and ``family`` (M,) int8 (0
+``fiber:<UUID>`` or ``json:<file stem>``, the keys ``match_fibers_to_patches.py`` writes) and ``family`` (M,) int8 (0
 horizontal, 1 vertical); points are sorted by ``CELL``-voxel cell, ``cell_keys`` / ``cell_starts`` index them.
 
-AFV fibers of any family (``AFVFibers``, coordinates divided by ``--grid-scale``), plus VC3D fiber JSONs with
-``--fiber-jsons``. An AFV fiber running along a JSON fiber (at least ``--dedup-fraction`` of its samples within
+Fiber-store fibers of any family (``FiberStore``, coordinates divided by ``--grid-scale``), plus VC3D fiber JSONs
+with ``--fiber-jsons``. A store fiber running along a JSON fiber (at least ``--dedup-fraction`` of its samples within
 ``--dedup-distance`` voxels of it) is the same physical fiber and is left out, so no fiber appears as two instances;
 ``aliases.json`` maps it to that JSON fiber.
 
-  python scripts/build_fiber_pool.py --afv PARIS4.afv --grid-scale 4 --fiber-jsons FIBERS_DIR --out POOL_DIR
+  python scripts/build_fiber_pool.py --fibers PARIS4.vcobj --grid-scale 4 --fiber-jsons FIBERS_DIR --out POOL_DIR
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from scipy.spatial import cKDTree
 
 from vesuvius.neural_tracing.tracers.shared.annotations.vc3d import fiber_tag
 from vesuvius.neural_tracing.tracers.shared.geometry import arclength, resample_polyline
-from vesuvius.neural_tracing.tracers.shared.annotations.afv import AFVFibers
+from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import FiberStore, fiber_volume
 from vesuvius.neural_tracing.tracers.sheets.data.fibers import CELL, cell_key
 
 FAMILY = {'H': 0, 'V': 1}
@@ -40,7 +40,7 @@ def resample(points: np.ndarray, step: float) -> tuple[np.ndarray, np.ndarray, n
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--afv', required=True)
+    ap.add_argument('--fibers', required=True, help='fiber store (.vcobj)')
     ap.add_argument('--grid-scale', type=float, default=4.)
     ap.add_argument('--fiber-jsons')
     ap.add_argument('--sample', type=float, default=5.)
@@ -58,18 +58,18 @@ def main(argv=None):
     print(f'{len(fibers)} JSON fibers', flush=True)
     json_tree = cKDTree(np.concatenate([f[2] for f in fibers])) if fibers else None
     owner = np.concatenate([np.full(len(f[2]), k) for k, f in enumerate(fibers)]) if fibers else None
-    afv = AFVFibers(args.afv, grid_scale=args.grid_scale, split='all')
-    aliases = {}  # dropped AFV fiber -> the JSON fiber it duplicates (fiber runs may name either)
-    for i, row in enumerate(afv.catalog):
-        pts, tan, arc = resample(afv.geometry(i).points, args.sample)
+    store = FiberStore(args.fibers, fiber_volume(args.fibers), grid_scale=args.grid_scale, split='all')
+    aliases = {}  # dropped store fiber -> the JSON fiber it duplicates (fiber runs may name either)
+    for i, row in enumerate(store.catalog):
+        pts, tan, arc = resample(store.geometry(i).points, args.sample)
         if json_tree is not None:
             near, j = json_tree.query(pts, distance_upper_bound=args.dedup_distance)
             hit = np.isfinite(near)
             if hit.mean() >= args.dedup_fraction:
-                aliases[f'afv:{row[0]}'] = fibers[int(np.bincount(owner[j[hit]]).argmax())][0]
+                aliases[f'fiber:{row["id"]}'] = fibers[int(np.bincount(owner[j[hit]]).argmax())][0]
                 continue
-        fibers.append((f'afv:{row[0]}', FAMILY.get(row[2], 0), pts, tan, arc))
-    print(f'{len(afv.catalog)} AFV fibers, {len(aliases)} left out as duplicates of JSON fibers', flush=True)
+        fibers.append((f'fiber:{row["id"]}', FAMILY.get(row['family'], 0), pts, tan, arc))
+    print(f'{len(store.catalog)} store fibers, {len(aliases)} left out as duplicates of JSON fibers', flush=True)
     points = np.concatenate([f[2] for f in fibers]).astype(np.float32)
     keys = cell_key(points)
     order = np.argsort(keys, kind='stable')
@@ -85,7 +85,7 @@ def main(argv=None):
     (args.out/'keys.json').write_text(json.dumps([f[0] for f in fibers]))
     (args.out/'aliases.json').write_text(json.dumps(aliases))
     (args.out/'meta.json').write_text(json.dumps(dict(cell=CELL, sample=args.sample, grid_scale=args.grid_scale,
-                                                      afv=str(args.afv), fiber_jsons=args.fiber_jsons)))
+                                                      fibers=str(args.fibers), fiber_jsons=args.fiber_jsons)))
     print(f'{len(fibers)} fibers, {len(points)} points -> {args.out}', flush=True)
 
 

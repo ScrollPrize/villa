@@ -5,33 +5,16 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from lasagna.inference_provenance import atomic_write, sha256_file
-from .constraint_extraction import native_config_with_store, resolve_native_binary
-
-
-def native_name_args(case):
-    name=case['binary'];args=list(case.get('args',[]))
-    # The AFV exporter was extracted from the historical tracing executable.
-    if name=='vc_fiber_trace_chunk' and args[:1]==['afv-constraints']:
-        name='vc_fiber_constraints';args=args[1:]
-    return name,args
+from .constraint_extraction import resolve_native_binary
 
 
 def resolve_command(case, config):
-    name,args=native_name_args(case)
-    return [resolve_native_binary(name, config),*map(str,args)]
-
-
-def native_command(case, config):
-    """resolve_command, with the exporter's config pointed at its AFV's object store."""
-    command=resolve_command(case, config)
-    if native_name_args(case)[0]=='vc_fiber_constraints' and len(command)>1:
-        command[1]=str(native_config_with_store(command[1], config))
-    return command
+    return [resolve_native_binary(case['binary'], config),*map(str,case.get('args',[]))]
 
 
 def run(config):
     root=Path(config['output_root']);root.mkdir(parents=True,exist_ok=True)
-    commands=[(case,native_command(case,config)) for case in config['commands']]
+    commands=[(case,resolve_command(case,config)) for case in config['commands']]
     inputs={str(p):sha256_file(p) for p in config.get('input_files',[])}
     references={str(p):sha256_file(p) for p in sorted(Path(config['reference_dir']).glob('*.json'))} if config.get('reference_dir') else {}
     records=[]

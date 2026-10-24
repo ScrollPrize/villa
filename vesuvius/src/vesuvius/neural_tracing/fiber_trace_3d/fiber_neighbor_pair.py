@@ -30,9 +30,11 @@ def run(settings):
         cfg.pop(key,None)
     cfg['gpu_manager']=dict(cfg['gpu_manager'],exclusive=False)
     paths=[Path(settings['base_config']),dataset/'summary.json',
-           dataset/'tensors.npz',dataset/'selected.afv',dataset/'cross/cross_events.json',Path(__file__)]
+           dataset/'tensors.npz',dataset/'cross/cross_events.json',Path(__file__)]
     if settings.get('optimum'):paths.append(Path(settings['optimum']))
-    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths})
+    from vesuvius.neural_tracing.tracers.shared.annotations.fiber_store import fibers_digest
+    signature=dict(settings=settings,inputs={str(p):sha256_file(p) for p in paths},
+                   selected_fibers=fibers_digest(dataset/'selected.vcobj'))
     manifest=root/'inputs.json'
     if manifest.exists() and json.loads(manifest.read_text())!=signature:raise ValueError('Changed paired inputs')
     atomic_write(manifest,signature,durable=False)

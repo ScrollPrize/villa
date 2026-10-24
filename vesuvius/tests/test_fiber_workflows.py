@@ -4,7 +4,6 @@ import importlib
 import inspect
 import json
 from pathlib import Path
-import sqlite3
 import pytest
 from vesuvius.neural_tracing.fiber_trace_3d import fiber_workflows as workflows
 
@@ -63,7 +62,7 @@ def test_native_exporter_uses_standalone_command(monkeypatch):
     from vesuvius.neural_tracing.fiber_trace_3d import constraint_extraction as native
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_native_workflow import resolve_command
     monkeypatch.setattr(native.shutil,'which',lambda name:'/bin/exporter' if name=='custom-exporter' else None)
-    assert resolve_command({'binary':'vc_fiber_trace_chunk','args':['afv-constraints','input.json']},
+    assert resolve_command({'binary':'vc_fiber_constraints','args':['input.json']},
         {'native_binary':'custom-exporter'})==['/bin/exporter','input.json']
 
 
@@ -72,34 +71,8 @@ def test_native_input_regression_can_be_run_first(tmp_path,monkeypatch):
     calls=[]
     monkeypatch.setattr(native,'resolve_native_binary',lambda name,settings:name)
     monkeypatch.setattr(native.subprocess,'run',lambda command,**kwargs:calls.append(command))
-    (tmp_path/'extract.json').write_text('{}')
     native.run_native_constraints(tmp_path/'extract.json',{'native_regression_binary':'test_fiber_trace_winding_bp'})
     assert calls==[['test_fiber_trace_winding_bp'],['vc_fiber_constraints',str(tmp_path/'extract.json')]]
-
-
-def test_native_exporter_reads_the_afv_object_store(tmp_path,monkeypatch):
-    from vesuvius.neural_tracing.fiber_trace_3d import constraint_extraction as native
-    afv=tmp_path/'fibers.afv'
-    with sqlite3.connect(afv) as db:
-        db.execute('CREATE TABLE metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
-        db.execute("INSERT INTO metadata VALUES('uuid','\"1482bcc8-f93e-4c3b-b380-2ddf369318f4\"')")
-    importer=tmp_path/'import_afv.py';importer.write_text('')
-    calls=[]
-    def run(command,**kwargs):
-        calls.append(command)
-        if command[1]==str(importer):Path(command[3]).mkdir()
-    monkeypatch.setattr(native,'resolve_native_binary',lambda name,settings:name)
-    monkeypatch.setattr(native.subprocess,'run',run)
-    config=tmp_path/'extract.json';config.write_text(json.dumps(dict(afv=str(afv),full_volume=True)))
-    settings=dict(afv_importer=str(importer))
-    native.run_native_constraints(config,settings)
-    native.run_native_constraints(config,settings)
-    imports=[command for command in calls if command[1]==str(importer)]
-    assert len(imports)==1 and imports[0][2]==str(afv) and imports[0][4]=='--unbound'
-    resolved=json.loads((tmp_path/'extract.store.json').read_text())
-    assert resolved['afv']==str(afv) and resolved['object_store']==imports[0][3]
-    assert resolved['collection']=='1482bcc8-f93e-4c3b-b380-2ddf369318f4'
-    assert calls[-1]==['vc_fiber_constraints',str(tmp_path/'extract.store.json')]
 
 
 def test_usage_examples_do_not_depend_on_local_experiments():
@@ -125,4 +98,4 @@ def test_shared_workflows_and_docs_have_no_embedded_run_identity():
 def test_reviewed_json_requires_explicit_scan_identity(tmp_path):
     from vesuvius.neural_tracing.fiber_trace_3d.fiber_json_solve import convert
     with pytest.raises(TypeError,match='expected_manifest_tokens'):
-        convert(tmp_path,tmp_path/'source.afv',tmp_path/'out.afv')
+        convert(tmp_path,tmp_path/'out.vcobj',volume='123',shape_zyx=[10,10,10])

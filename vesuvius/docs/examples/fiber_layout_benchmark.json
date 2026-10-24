@@ -14,7 +14,7 @@
       "events": "data/prepared/gt_events.json",
       "historical_solve": "data/joint/solve",
       "expected_report": "data/joint/search_report.json",
-      "gt_source_ids": [101, 102],
+      "gt_source_ids": ["00000000-0000-4000-8000-000000000101", "00000000-0000-4000-8000-000000000102"],
       "force_gt_enabled": true
     },
     "selectable": {
@@ -22,7 +22,7 @@
       "events": "data/prepared/gt_events.json",
       "historical_solve": "data/selectable/solve",
       "expected_report": "data/selectable/search_report.json",
-      "gt_source_ids": [101, 102],
+      "gt_source_ids": ["00000000-0000-4000-8000-000000000101", "00000000-0000-4000-8000-000000000102"],
       "force_gt_enabled": false
     }
   }
