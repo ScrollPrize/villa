@@ -8,12 +8,16 @@ import os
 from pathlib import Path
 from typing import Any
 
+import logging
+
 import aiohttp
 import numpy as np
 import zarr
 
 from vesuvius.data.utils import open_zarr as open_vesuvius_zarr
 
+
+LOGGER = logging.getLogger(__name__)
 
 _PUBLIC_S3_VOLUME_SUBSTRING = "vesuvius-challenge-open-data"
 ZARR_V3 = int(zarr.__version__.split(".", 1)[0]) >= 3
@@ -244,3 +248,34 @@ def read_bbox_with_padding(
     )
     output[destination] = crop
     return output, destination
+
+
+def close_volume_root(root: Any) -> None:
+    """Best-effort close of the remote HTTP session behind an opened root.
+
+    ``FsspecStore`` creates its ``HTTPFileSystem`` asynchronously on zarr's
+    event loop, so fsspec never registers its exit-time finaliser for the
+    session. Nothing closes the aiohttp session, and every successful run
+    ends with ``ERROR Unclosed client session`` (and ``Unclosed connector``)
+    printed by aiohttp's garbage-collection hook. Local stores have no session
+    and are left untouched; failures here never propagate.
+    """
+    store = getattr(root, "store", None)
+    candidates = (
+        store,
+        getattr(store, "store", None),  # CacheStore wraps the remote store
+        getattr(store, "_store", None),
+    )
+    for candidate in candidates:
+        fs = getattr(candidate, "fs", None)
+        session = getattr(fs, "_session", None)
+        if session is None or getattr(session, "closed", False):
+            continue
+        try:
+            from zarr.core.sync import sync
+
+            sync(session.close())
+        except Exception:  # pragma: no cover - best effort only
+            LOGGER.debug("Could not close the remote volume session", exc_info=True)
+        else:
+            fs._session = None
