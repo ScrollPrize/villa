@@ -1,4 +1,4 @@
-#include "FiberAfvConstraintBenchmark.hpp"
+#include "FiberConstraintExtraction.hpp"
 #include "FiberConstraintDatabase.hpp"
 #include "vc/fiber_tracer/FiberAxialAlignment.hpp"
 #include "vc/core/util/AtomicFile.hpp"
@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/objects/GeometryRegion.hpp>
 #include <vc_object_store/objects/ObjectStore.hpp>
 #include <chrono>
@@ -22,7 +23,7 @@
 #include <set>
 #include <stdexcept>
 
-int runFiberAfvConstraintBenchmark(int argc, char** argv)
+int runFiberConstraintExtraction(int argc, char** argv)
 {
     using namespace vc::fiber_tracer;
     using Clock = std::chrono::steady_clock;
@@ -41,39 +42,26 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
         std::filesystem::exists(cfg.at("database").get<std::string>()+".partial")))
         throw std::runtime_error("Database output already exists");
     const auto started=Clock::now();
-    // The fibers of an AFV that import_afv.py streamed into an object store:
-    // the collection object keeps the AFV's metadata, each fiber its AFV id,
-    // so the outputs keep the AFV's identities.
+    // The fibers are every object-store fiber bound to the volume that
+    // coordinate_space names (SAMPLE/VOLUME_ID), read in its voxels.
+    const std::string scan=cfg.at("coordinate_space");
+    const auto slash=scan.find('/');
+    if (slash==std::string::npos) throw std::invalid_argument("coordinate_space must be SAMPLE/VOLUME_ID");
+    const std::string volume=scan.substr(slash+1);
     vc::objects::OpenOptions storeOptions; storeOptions.readOnly=true;
-    auto store=vc::objects::ObjectStore::open(cfg.at("object_store").get<std::string>(),storeOptions);
+    auto store=vc::objects::ObjectStore::open(cfg.at("fibers").get<std::string>(),storeOptions);
     const auto txn=store.read();
-    const auto collectionUuid=cfg.at("collection").get<std::string>();
-    const auto collection=store.objectByUuid(txn,collectionUuid);
-    if (!collection || collection->kind!="collection" || collection->retired)
-        throw std::invalid_argument("Object store has no such AFV collection");
-    const auto collectionMeta=Json::parse(collection->meta);
-    if (!collectionMeta.value("import",Json::object()).value("complete",false))
-        throw std::invalid_argument("AFV collection import is incomplete");
-    const auto& afvMetadata=collectionMeta.at("afv").at("metadata");
-    const auto& root=afvMetadata.at("root");
-    const auto& frame=afvMetadata.at("frame");
-    if (frame.at("vc_open_data_coordinate_space")!=cfg.at("coordinate_space") ||
-        frame.value("vc_open_data_source_coordinate_level",0)!=0 ||
-        frame.value("vc_open_data_source_coordinate_scale_factor",1.)!=1.)
-        throw std::invalid_argument("AFV must use expected native coordinate frame");
     vc::lasagna::LasagnaDatasetOpenOptions open;
     open.workingToBaseScale=1.;
     open.remoteCacheRoot=cfg.at("remote_cache").get<std::string>();
     const auto dataset=vc::lasagna::LasagnaDataset::openLocation(cfg.at("normal_manifest"),open);
-    if (!dataset.manifest().baseShapeZYX ||
-        Json(*dataset.manifest().baseShapeZYX)!=root.at("coordinate_base_shape_zyx"))
-        throw std::invalid_argument("AFV and Lasagna base shapes differ");
+    if (!dataset.manifest().baseShapeZYX)
+        throw std::invalid_argument("Lasagna manifest has no base shape");
+    const auto baseShapeZYX=*dataset.manifest().baseShapeZYX;
     // This historical manifest has no coordinate identity. Require its sibling
     // inference provenance to name the expected scan rather than trusting shape.
     Json provenance; std::ifstream prov(cfg.at("normal_provenance").get<std::string>()); prov>>provenance;
-    const std::string scan=cfg.at("coordinate_space");
-    const auto slash=scan.find('/');
-    if (slash==std::string::npos || provenance.at("source").at("sample_id")!=scan.substr(0,slash) ||
+    if (provenance.at("source").at("sample_id")!=scan.substr(0,slash) ||
         provenance.at("source").at("volume_id")!=scan.substr(slash+1))
         throw std::invalid_argument("Normal provenance does not name expected scan");
     const auto manifestName=std::filesystem::path(cfg.at("normal_manifest").get<std::string>()).filename().string();
@@ -82,20 +70,21 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
         artifactFound=artifactFound || (artifact.at("kind")=="manifest" && artifact.at("path")==manifestName);
     if(!artifactFound)throw std::invalid_argument("Normal manifest is not the recorded provenance artifact");
     const auto queryStart=Clock::now();
-    // AFV id -> (fiber object, line point count), in AFV id order.
-    std::map<int64_t,std::pair<std::string,int64_t>> members;
-    const std::string coordinates=collectionMeta.at("coordinates").dump();
+    // Fiber UUID -> (stored-to-volume scale, line point count), in UUID
+    // order: that order is the trace order and the database's source_index.
+    std::map<std::string,std::pair<double,int64_t>> members;
     const auto addMembers=[&](const std::vector<vc::objects::ObjectRecord>& records) {
         for(const auto& record:records) {
-            const auto source=Json::parse(record.meta).value("source",Json::object()).value("afv",Json::object());
-            if(source.value("collection_uuid",std::string{})!=collectionUuid || !record.fiber) continue;
-            members.emplace(source.at("fiber_id").get<int64_t>(),std::pair{record.uuid,record.fiber->linePointCount});
+            if(!record.fiber || record.fiber->linePointCount<2) continue;
+            const auto scale=vc::objects::geometryScaleToVolume(Json::parse(record.meta),volume);
+            if(!scale) throw std::runtime_error("Fiber "+record.uuid+" is not bound to volume "+volume);
+            members.emplace(record.uuid,std::pair{*scale,record.fiber->linePointCount});
         }
     };
     const std::vector<std::string> memberFields{"meta","fiber"};
     if(cfg.value("full_volume",false)) {
         vc::objects::ObjectSelection selection;
-        selection.kind="fiber"; selection.coordinates=coordinates; selection.limit=8192;
+        selection.kind="fiber"; selection.volume=volume; selection.limit=8192;
         while(true) {
             const auto page=store.selectObjects(txn,selection,memberFields);
             if(page.empty())break;
@@ -104,7 +93,7 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
         }
     } else {
     const auto lower=xyz(cfg.at("minimum_xyz")), upper=xyz(cfg.at("maximum_xyz"));
-    // Exact slab intersection of the fibers' segments with the box.
+    // Exact slab intersection of the fibers' segments with the box (volume voxels).
     vc::objects::RegionSlice slice;
     for(int d=0;d<3;++d) {
         if (!std::isfinite(lower[d]) || !std::isfinite(upper[d]) || lower[d]>=upper[d])
@@ -113,20 +102,20 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
         slice.localBounds[d+3]=upper[d];
     }
     vc::objects::RegionOptions region;
-    region.kind="fiber"; region.coordinates=coordinates; region.minPoints=2;
+    region.kind="fiber"; region.volume=volume; region.minPoints=2;
     region.outputByteBudget=region.processingByteBudget=512ULL*1024*1024;
     region.candidateWorkBudget=region.sqlStepBudget=std::numeric_limits<uint64_t>::max();
     const auto visible=store.geometryRegion(txn,slice,region);
     if (!visible.complete())
-        throw std::runtime_error(std::string("AFV spatial query stopped (")+vc::objects::regionStopName(visible.stop)+
-                                 "); no truncated benchmark allowed");
+        throw std::runtime_error(std::string("Fiber spatial query stopped (")+vc::objects::regionStopName(visible.stop)+
+                                 "); no truncated extraction allowed");
     vc::objects::ObjectSelection selection;
     for(const auto& run:visible.runs)
         if(selection.uuids.empty() || selection.uuids.back()!=run.objectUuid) selection.uuids.push_back(run.objectUuid);
     if(!selection.uuids.empty()) addMembers(store.selectObjects(txn,selection,memberFields));
     }
-    std::set<int64_t> ids;
-    for(const auto& [id,member]:members) ids.insert(id);
+    std::vector<std::string> ids;
+    for(const auto& [uuid,member]:members) ids.push_back(uuid);
     if (ids.empty()) throw std::runtime_error("No fibers intersect selection box");
     const double querySeconds=seconds(queryStart);
     const auto loadStart=Clock::now();
@@ -134,29 +123,32 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
     cv::Vec3d lo{INFINITY,INFINITY,INFINITY}, hi{-INFINITY,-INFINITY,-INFINITY};
     double totalArc=0.; std::size_t totalPoints=0;
     std::vector<std::string> revisions;
-    std::vector<int64_t> pointCounts;
-    for(const auto& [id,member]:members) {
-        const auto head=store.currentGeometry(txn,member.first);
-        if(!head)throw std::runtime_error("AFV fiber "+std::to_string(id)+" has no geometry");
+    std::vector<std::pair<double,int64_t>> scaleAndCount;
+    for(const auto& [uuid,member]:members) {
+        const auto head=store.currentGeometry(txn,uuid);
+        if(!head)throw std::runtime_error("Fiber "+uuid+" has no geometry");
         revisions.push_back(head->uuid);
-        pointCounts.push_back(member.second);
+        scaleAndCount.push_back(member);
     }
     constexpr std::size_t kLoadBatch=4096;
     for(std::size_t start=0;start<revisions.size();start+=kLoadBatch) {
         const std::vector<std::string> batch(revisions.begin()+static_cast<std::ptrdiff_t>(start),
             revisions.begin()+static_cast<std::ptrdiff_t>(std::min(revisions.size(),start+kLoadBatch)));
         const auto packed=store.readGeometryArrays(txn,batch,"line_points");
-        if(packed.dtype!="<f8")throw std::runtime_error("AFV line points must be float64");
+        if(packed.dtype!="<f8")throw std::runtime_error("Fiber line points must be float64");
         for(std::size_t i=0;i<batch.size();++i) {
             FiberletCropTraceLine line;
+            const auto [scale,count]=scaleAndCount[start+i];
             for(uint64_t row=packed.offsets[i];row<packed.offsets[i+1];++row) {
                 double p[3];
                 std::memcpy(p,packed.data.data()+row*sizeof(p),sizeof(p));
+                // Stored coordinates are never rescaled; volume voxels = stored * scale.
+                if(scale!=1.) for(double& v:p) v*=scale;
                 line.pointsBaseXYZ.emplace_back(p[0],p[1],p[2]);
                 for(int d=0;d<3;++d){lo[d]=std::min(lo[d],p[d]);hi[d]=std::max(hi[d],p[d]);}
             }
-            if(line.pointsBaseXYZ.size()!=static_cast<std::size_t>(pointCounts[start+i]))
-                throw std::runtime_error("AFV point-count mismatch");
+            if(line.pointsBaseXYZ.size()!=static_cast<std::size_t>(count))
+                throw std::runtime_error("Fiber point-count mismatch");
             totalArc+=makePolylineArcGeometry(line.pointsBaseXYZ).length();
             totalPoints+=line.pointsBaseXYZ.size();
             lines.push_back(std::move(line));
@@ -165,7 +157,7 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
     const double loadSeconds=seconds(loadStart);
     const vc::lasagna::LasagnaNormalSampler normals(dataset);
     const double spacing=vc::lasagna::bindLasagnaChannel(dataset.manifest(),"nx").spacing;
-    std::cout<<"AFV selected fibers="<<lines.size()<<" points="<<totalPoints<<" arc_base="<<totalArc
+    std::cout<<"selected fibers="<<lines.size()<<" points="<<totalPoints<<" arc_base="<<totalArc
              <<" unsigned normals; no alignment"<<std::endl;
     FiberTraceConstraintConfig options;
     options.localEvents=true; options.localKeepWholeFibers=true; options.parallelThreads=threads;
@@ -177,7 +169,7 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
     options.localParallelReciprocal=cfg.value("parallel_reciprocal",false);
     options.localMovingProjectionWindows=cfg.value("moving_projection_windows",true);
     options.localPerpendicularProjectionIterations=cfg.value("perpendicular_iterations",16u);
-    Json result={{"config",cfg},{"afv_uuid",afvMetadata.at("uuid")},
+    Json result={{"config",cfg},{"fibers_store_uuid",store.uuid(txn)},
         {"normal_manifest",dataset.manifest().raw},{"normal_provenance",provenance},
         {"selected_ids",ids},{"selected_fibers",lines.size()},{"points",totalPoints},
         {"arc_base",totalArc},{"query_seconds",querySeconds},{"load_seconds",loadSeconds},
@@ -200,11 +192,13 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
     const auto output=std::filesystem::path(cfg.at("output").get<std::string>());
     std::filesystem::create_directories(output.parent_path());
     const auto loadAxis=[&]() {
-        const auto& shape=root.at("coordinate_base_shape_zyx");
+        // The volume's grid, as the Lasagna manifest states it; the umbilicus
+        // file's own voxel size is not cross-checked.
+        const auto& shape=baseShapeZYX;
         auto loaded=vc::core::util::loadUmbilicusWithFrameCheck(cfg.at("umbilicus").get<std::string>(),
-            {shape[2].get<double>(),shape[1].get<double>(),shape[0].get<double>()},
-            {shape[0].get<int>(),shape[1].get<int>(),shape[2].get<int>()},
-            vc::core::util::UmbilicusTargetGridAuthority::Authoritative,root.at("voxel_size_mm").get<double>()*1000.);
+            {double(shape[2]),double(shape[1]),double(shape[0])},
+            {int(shape[0]),int(shape[1]),int(shape[2])},
+            vc::core::util::UmbilicusTargetGridAuthority::Authoritative,std::nullopt);
         if(!loaded.umbilicus || !loaded.warning.empty() || loaded.scaleDescription.empty())
             throw std::runtime_error("Umbilicus frame not verified: "+loaded.error+loaded.warning);
         result["umbilicus_frame"]=loaded.scaleDescription;
@@ -227,9 +221,9 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
             for(int i=range.start;i<range.end;++i)
                 agreement[i]=fiberAxialAlignment(lines[i].pointsBaseXYZ,axisAt,step);
         });
-        Json features={{"format","fiber-axial-priors"},{"version",1},{"afv_uuid",result["afv_uuid"]},
+        Json features={{"format","fiber-axial-priors"},{"version",1},{"fibers_store_uuid",result["fibers_store_uuid"]},
             {"source_ids",ids},{"agreement",agreement},{"umbilicus",cfg.at("umbilicus")},
-            {"afv_sha256",cfg.at("afv_sha256")},{"umbilicus_sha256",cfg.at("umbilicus_sha256")},
+            {"fibers_digest",cfg.at("fibers_digest")},{"umbilicus_sha256",cfg.at("umbilicus_sha256")},
             {"sample_spacing_base",step},{"axis_secant_halfspan_z",8},
             {"semantics","arc mean 2*(fiber tangent dot axis tangent)^2-1; V positive, H negative"},
             {"seconds",seconds(begin)},{"umbilicus_frame",result["umbilicus_frame"]}};
@@ -252,7 +246,7 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
         }
         result["orientation"]=orientFiberConstraintDatabase(
             cfg.at("orient_database").get<std::string>(),cfg.at(cfg.contains("normal_curves_output")?"normal_curves_output":(umbilicus?"normal_prior_output":"database")).get<std::string>(),
-            std::vector<int64_t>(ids.begin(),ids.end()),lines,normals,threads,
+            ids,lines,normals,threads,
             cfg.value("normal_sample_spacing",spacing),result,umbilicus?&*umbilicus:nullptr,
             cfg.contains("normal_curves_output"));
         result["wall_seconds"]=seconds(started);
@@ -295,7 +289,7 @@ int runFiberAfvConstraintBenchmark(int argc, char** argv)
         }
         if(cfg.contains("database")) {
             result["export"]=writeFiberConstraintDatabase(cfg.at("database").get<std::string>(),
-                std::vector<int64_t>(ids.begin(),ids.end()),report,normals,threads,result);
+                ids,report,normals,threads,result);
             result["wall_seconds"]=seconds(started);
             std::cout<<"export complete "<<result["export"].dump()<<std::endl;
         }
