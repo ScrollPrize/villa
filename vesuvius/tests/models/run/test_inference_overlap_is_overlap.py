@@ -51,6 +51,7 @@ def _captured_step(monkeypatch, *, overlap, step_size=None):
     inferer.input_anon = False
     inferer.bbox = None
     inferer.read_retries = 1
+    inferer.chunk_cache_mb = 0
     inferer.device = torch.device('cpu')
     inferer.max_patches = None
     inferer._create_dataset_and_loader()
