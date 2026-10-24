@@ -29,7 +29,7 @@ int main() try {
     require(!geometryScaleToVolume(Json::object(),volume), "unknown coordinates stay unbound");
     mustFail([&] { geometryCoordinates(Json{{"scale_factor",0}}); });
     mustFail([&] { mergeGeometryCoordinates(Json{{"scale_factor",(uint64_t(1)<<60)+1}},Json{{"scale_factor",double(uint64_t(1)<<60)}}); });
-    for (const auto& kind : {"fiber", "point_collection", "track", "patch"}) {
+    for (const auto& kind : {"fiber", "point_collection", "track", "surface"}) {
         const auto uuid = util::newUuid();
         GeometryData first, target;
         if (std::string(kind) == "fiber") {
@@ -42,8 +42,8 @@ int main() try {
             first = vc::geometry::encode(vc::geometry::Track{{{1,2,3},{4,5,6}}});
             target = vc::geometry::encode(vc::geometry::Track{{{1,2,3},{4,5,7},{8,9,10}}});
         } else {
-            first = vc::geometry::encode(vc::geometry::Patch{1,2,{1,1},{{1,2,3},{4,5,6}}});
-            target = vc::geometry::encode(vc::geometry::Patch{1,2,{1,1},{{1,2,3},{4,5,7}}});
+            first = vc::geometry::encode(vc::geometry::Surface{1,2,{1,1},{{1,2,3},{4,5,6}}});
+            target = vc::geometry::encode(vc::geometry::Surface{1,2,{1,1},{{1,2,3},{4,5,7}}});
         }
         const auto annotated = std::string(kind) == "fiber" || std::string(kind) == "point_collection";
         const auto array = std::string(kind) == "fiber" ? "control_points" : "points";
@@ -74,13 +74,13 @@ int main() try {
     // store schema even when owned, typed geometry cannot represent them.
     {
         const auto id = util::newUuid();
-        auto first = vc::geometry::encode(vc::geometry::Patch{1,2,{1,1},{{1,2,3},{4,5,6}}});
+        auto first = vc::geometry::encode(vc::geometry::Surface{1,2,{1,1},{{1,2,3},{4,5,6}}});
         first.arrays.push_back({"review", "<u2", {1,2}, {1,0,2,0}});
         first.arrays[0].bytes[0] = 0x45; first.arrays[0].bytes[1] = 0x23;
         first.arrays[0].bytes[2] = 0xc1; first.arrays[0].bytes[3] = 0x7f; // NaN payload
         std::string initial, updated;
         auto pins = session.act(attachment, {{id,{}}}, [&](auto& db, auto& txn) {
-            ObjectRecord object; object.uuid = id; object.kind = "patch";
+            ObjectRecord object; object.uuid = id; object.kind = "surface";
             db.upsertObject(txn, object); initial = db.putGeometry(txn, id, first);
         });
         auto target = first; target.arrays.back().bytes = {3,0,4,0};

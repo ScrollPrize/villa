@@ -391,8 +391,8 @@ std::vector<uint8_t> GeometryReader::rectangle(const std::string& name, int64_t 
     if (found == layouts_.end()) throw std::invalid_argument("geometry: array not found: " + name);
     const auto& array = manifest_.at("arrays").at(name);
     const auto shape = array.at("shape").get<std::vector<int64_t>>();
-    if (manifest_.at("kind") != "patch" || (shape.size() != 2 && shape.size() != 3))
-        throw std::invalid_argument("geometry: rectangle requires an aligned patch array");
+    if (manifest_.at("kind") != "surface" || (shape.size() != 2 && shape.size() != 3))
+        throw std::invalid_argument("geometry: rectangle requires an aligned surface array");
     if (row < 0 || column < 0 || rows < 0 || columns < 0 || row > shape[0] || column > shape[1] ||
         rows > shape[0] - row || columns > shape[1] - column)
         throw std::out_of_range("geometry: invalid rectangle");

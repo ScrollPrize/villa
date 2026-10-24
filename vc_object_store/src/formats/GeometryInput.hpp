@@ -10,7 +10,7 @@ nlohmann::json readJson(const std::filesystem::path&);
 ObjectRecord sourceObject(const nlohmann::json&, const std::string&, const std::filesystem::path&);
 Prepared fiber(const std::filesystem::path&);
 std::vector<Prepared> fibers(const std::filesystem::path&, const std::vector<std::string>& available);
-Prepared patch(const std::filesystem::path&);
+Prepared surface(const std::filesystem::path&);
 std::vector<Prepared> collections(const std::filesystem::path&);
 Prepared track(const PackedTrackStore&, size_t row, ObjectRecord);
 } // namespace vc::objects::formats

@@ -4,13 +4,13 @@ A SQLite object database for geometry, revisioned metadata, and graph-like relat
 
 The object store imports geometry files (tifxyz, pcl, fiber, track) and stores them as binary chunks or tiles using sqlite blob storage. Once objects are imported, the object store contains tooling to discover geometric relationships between these objects and stores this edge information as traversable object metadata. The primary types of edges indicate that the linked objects lie on the same winding: 
 
-- Patch to Patch
-- Fiber to Patch 
+- Surface to Surface
+- Fiber to Surface 
 - Fiber to Fiber
-- Track to Patch 
+- Track to Surface 
 - Track to Track
 
-PCL to Patch edges can be absolute winding, relative winding, or same-winding (which is the same as relative with a 0 delta along `wind_a`)
+PCL to Surface edges can be absolute winding, relative winding, or same-winding (which is the same as relative with a 0 delta along `wind_a`)
 
 Modifications to geometry are stored as the delta to the previous iteration and contain a timestamp. If the object requires modifications to its shape a "checkpoint" is created, and any later deltas for history refer to this checkpoint. "Point-in-time" database views can be recovered by simply providing the timestamp 
 
@@ -45,14 +45,14 @@ There is no old-format migration or compatibility reader.
 from vc_object_store import ObjectStore
 
 with ObjectStore.create("objects.vcobj", author="reviewer") as store:
-    report = store.ingest_geometry_source("patch", "/data/patch")
+    report = store.ingest_geometry_source("surface", "/data/surface")
 ```
 
 ```sh
-build/bin/vc_object_ingest --db objects.vcobj --author "$USER" --patch /data/patch
-build/bin/vc_object_links --db objects.vcobj --author "$USER" --link-patch-overlaps
+build/bin/vc_object_ingest --db objects.vcobj --author "$USER" --surface /data/surface
+build/bin/vc_object_links --db objects.vcobj --author "$USER" --link-surface-overlaps
 build/bin/vc_object_links --db objects.vcobj --author "$USER" \
-  --link-fiber-patches --ct /data/ct.zarr
+  --link-fiber-surfaces --ct /data/ct.zarr
 ```
 
 A team can share a store as a hub file on a network share or on any SSH server.

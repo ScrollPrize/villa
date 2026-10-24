@@ -1,15 +1,15 @@
 #include "formats/GeometryInput.hpp"
 #include "geometry/ArrayBytes.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
-#include "formats/PatchInput.hpp"
-#include "spatial/PatchGrid.hpp"
+#include "formats/SurfaceInput.hpp"
+#include "spatial/SurfaceGrid.hpp"
 #include <cmath>
 #include <bit>
 #include <set>
 namespace vc::objects::formats {
 using Json = nlohmann::json;
 namespace fs = std::filesystem;
-Prepared patch(const fs::path& source)
+Prepared surface(const fs::path& source)
 {
     auto fingerprint = [&]() {
         std::map<std::string, std::pair<uintmax_t, fs::file_time_type>> result;
@@ -21,16 +21,16 @@ Prepared patch(const fs::path& source)
     const auto before = fingerprint();
     const auto root = readJson(source / "meta.json");
     Prepared p;
-    p.object = sourceObject(root, "patch", source); p.geometry.kind = "patch";
-    detail::validatePatchFiles(source);
-    auto surface = vc::object_links::readPatchGrid(source);
+    p.object = sourceObject(root, "surface", source); p.geometry.kind = "surface";
+    detail::validateSurfaceFiles(source);
+    auto surface = vc::object_links::readSurfaceGrid(source);
     const auto grid = surface.rawPoints();
     // TIFF loading produces a contiguous XYZ grid. Retain a fallback for a
     // strided view, but avoid building a second full-size scalar vector.
     const cv::Mat contiguous = grid.isContinuous() ? grid : grid.clone();
     p.geometry.arrays.push_back(detail::scalarArray<float>("points", "<f4", {grid.rows, grid.cols, 3},
         std::span<const float>(contiguous.ptr<float>(), contiguous.total() * 3)));
-    PatchDetail d;
+    SurfaceDetail d;
     d.gridWidth = grid.cols; d.gridHeight = grid.rows;
     const auto scale = surface.scale(); d.scale = {scale[0], scale[1]};
     if (root.contains("bbox") && root.at("bbox").is_array() && root.at("bbox").size() == 2) {
@@ -38,7 +38,7 @@ Prepared patch(const fs::path& source)
         const auto high = root.at("bbox")[1].get<std::array<double, 3>>();
         d.bbox = {low[0], low[1], low[2], high[0], high[1], high[2]};
     }
-    p.object.patch = d;
+    p.object.surface = d;
     p.source = root;
     const auto overlapPath = source / "overlapping.json";
     if (fs::exists(overlapPath)) {
@@ -79,7 +79,7 @@ Prepared patch(const fs::path& source)
         if (samples.components != 1) shape.push_back(samples.components);
         p.geometry.arrays.push_back({name, dtype, shape, std::move(samples.bytes)});
     }
-    if (before != fingerprint()) throw std::runtime_error("patch changed while reading; retry ingestion");
+    if (before != fingerprint()) throw std::runtime_error("surface changed while reading; retry ingestion");
     p.geometry.attributes = Json{{"scale", root.at("scale")}}.dump();
     return p;
 }

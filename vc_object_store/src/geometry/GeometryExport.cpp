@@ -107,7 +107,7 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
         }
     }
     const auto& kind = snapshot.revision.kind;
-    const bool directory = kind == "patch" || kind == "track";
+    const bool directory = kind == "surface" || kind == "track";
     const auto stagingPath = dest.parent_path() / (".vc-export-" + util::newUuid());
     if (!fs::create_directory(stagingPath)) throw std::runtime_error("cannot create export staging directory");
     Stage stage{stagingPath};
@@ -120,7 +120,7 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
         file.close();
     }
     else if (kind == "point_collection") formats::collection(snapshot, attributes, output);
-    else if (kind == "patch") formats::patch(snapshot, attributes, output);
+    else if (kind == "surface") formats::surface(snapshot, attributes, output);
     else if (kind == "track") formats::track(snapshot, attributes, output);
     else throw std::runtime_error("unsupported geometry kind for export");
     publish(output, dest, overwrite, directory);

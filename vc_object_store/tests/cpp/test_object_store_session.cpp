@@ -14,7 +14,7 @@ int main() try
     TemporaryDirectory directory;
     OpenOptions options; options.author = "session-test";
     // Both pre-backport formats are rejected before the new journal is queried.
-    for (const int version : {14, 15}) {
+    for (const int version : {14, 15, 16}) {
         const auto oldPath = directory.path / ("schema-" + std::to_string(version) + ".vcobj");
         { auto db = ObjectStore::create(oldPath, options); }
         sqlite3* raw = nullptr;

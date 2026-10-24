@@ -1,4 +1,4 @@
-#include "spatial/PatchGrid.hpp"
+#include "spatial/SurfaceGrid.hpp"
 #include "vc_object_store/Tiff.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
@@ -28,7 +28,7 @@ cv::Mat_<double> band(const std::filesystem::path& path){
     return output;
 }
 }
-PatchGrid readPatchGrid(const std::filesystem::path& path){
+SurfaceGrid readSurfaceGrid(const std::filesystem::path& path){
     std::ifstream file(path/"meta.json");auto metadata=nlohmann::json::parse(file);
     auto x=band(path/"x.tif"),y=band(path/"y.tif"),z=band(path/"z.tif");
     if(x.size()!=y.size()||x.size()!=z.size())throw std::runtime_error("tifxyz dimensions differ");
@@ -44,9 +44,9 @@ PatchGrid readPatchGrid(const std::filesystem::path& path){
             for(int r=0;r<mask.rows;++r)for(int c=0;c<mask.cols;++c)if(!(mask(r,c)>=255))points(r/sy,c/sx)={-1,-1,-1};
         }
     }
-    return PatchGrid(points,{metadata.at("scale").at(0).get<float>(),metadata.at("scale").at(1).get<float>()});
+    return SurfaceGrid(points,{metadata.at("scale").at(0).get<float>(),metadata.at("scale").at(1).get<float>()});
 }
-void writePatchGrid(const std::filesystem::path& path,const PatchGrid& grid){
+void writeSurfaceGrid(const std::filesystem::path& path,const SurfaceGrid& grid){
     const auto& points=grid.rawPoints();
     for(int a=0;a<3;++a){cv::Mat_<float> plane(points.size());
         for(int r=0;r<points.rows;++r)for(int c=0;c<points.cols;++c)plane(r,c)=points(r,c)[a];

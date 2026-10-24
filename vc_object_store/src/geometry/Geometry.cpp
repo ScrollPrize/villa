@@ -57,9 +57,9 @@ std::vector<GeometryRevision> ObjectStore::geometryHistory(const Txn& txn, const
 }
 
 namespace {
-int64_t revisionPatchTileSize(const Txn& txn, const GeometryRevision& revision)
+int64_t revisionSurfaceTileSize(const Txn& txn, const GeometryRevision& revision)
 {
-    if (revision.kind != "patch") return 0;
+    if (revision.kind != "surface") return 0;
     const detail::GeometryReader reader(txn, revision.uuid);
     const auto& points = reader.manifest().at("arrays").at("points");
     return points.contains("storage") ? points.at("storage").at("tile_size").get<int64_t>() : 0;
@@ -194,7 +194,7 @@ std::vector<EdgeRecord> ObjectStore::affectedGeometryEdges(const Txn& txn, const
     const auto object = objectByUuid(txn, objectUuid);
     if (!object || object->kind != data.kind) throw std::invalid_argument("geometry: object missing or kind mismatch");
     const auto current = currentGeometry(txn, objectUuid);
-    const auto manifest = detail::geometryManifest(data, current ? revisionPatchTileSize(txn, *current) : GeometryStorageOptions{}.patchTileSize).dump();
+    const auto manifest = detail::geometryManifest(data, current ? revisionSurfaceTileSize(txn, *current) : GeometryStorageOptions{}.surfaceTileSize).dump();
     if (current && current->contentHash == detail::geometryHash(std::span(reinterpret_cast<const uint8_t*>(manifest.data()), manifest.size())))
         return {};
     return affectedEdges(*this, txn, object->uuid, current, detail::dependencyGeometry(data));
@@ -214,12 +214,12 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
     const auto expected = expectedRevision ? std::optional(formatUuid(parseUuid(*expectedRevision))) : std::nullopt;
     if ((current ? std::optional(current->uuid) : std::nullopt) != expected)
         historyConflict(db, "geometry: current revision changed; reload before committing");
-    if (current && data.kind != "patch")
+    if (current && data.kind != "surface")
         throw std::invalid_argument("sequences require structural or sparse edits");
     Savepoint savepoint(db);
     auto source = nlohmann::json::parse(object->meta).value("source", nlohmann::json::object());
-    auto manifest = detail::geometryManifest(data, storage.patchTileSize);
-    if (data.kind != "patch") {
+    auto manifest = detail::geometryManifest(data, storage.surfaceTileSize);
+    if (data.kind != "surface") {
         manifest["sequences"] = initialSequences(db, data, source);
         setMeta(txn, objectUuid, "source", source.dump());
     }
@@ -227,9 +227,9 @@ std::string ObjectStore::putGeometry(WriteTxn& txn, const std::string& objectUui
     if (geometryWork) geometryWork->manifestBytesWritten += manifestText.size();
     const auto contentHash = detail::geometryHash(std::span(reinterpret_cast<const uint8_t*>(manifestText.data()), manifestText.size()));
     bool unchanged = current && current->contentHash == contentHash;
-    if (current && !unchanged && data.kind == "patch") {
-        const auto oldTile = revisionPatchTileSize(txn, *current);
-        if (oldTile != storage.patchTileSize) {
+    if (current && !unchanged && data.kind == "surface") {
+        const auto oldTile = revisionSurfaceTileSize(txn, *current);
+        if (oldTile != storage.surfaceTileSize) {
             const auto oldManifest = detail::geometryManifest(data, oldTile).dump();
             unchanged = current->contentHash == detail::geometryHash(std::span(reinterpret_cast<const uint8_t*>(oldManifest.data()), oldManifest.size()));
         }
@@ -379,7 +379,7 @@ std::string detail::publishStructuralSnapshot(ObjectStore& store, WriteTxn& txn,
     DependencyScope scope;
     const auto current=store.currentGeometry(txn,objectUuid);
     if (!current || current->uuid != formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
-    auto manifest=geometryManifest(data,revisionPatchTileSize(txn,*current));
+    auto manifest=geometryManifest(data,revisionSurfaceTileSize(txn,*current));
     for(const auto* field:{"sequences","grid_origin"})if(previous.contains(field))manifest[field]=previous.at(field);
     auto after=dependencyGeometry(data);
     after.gridOrigin=manifest.value("grid_origin",std::array<int64_t,2>{0,0});
@@ -466,13 +466,13 @@ std::string ObjectStore::updateSurfaceChannels(WriteTxn& txn, const std::string&
     const auto current = currentGeometry(txn, objectUuid);
     if (!current || current->uuid != formatUuid(parseUuid(expected)))
         historyConflict(db, "geometry: current revision changed; reload before committing");
-    if (current->kind != "patch") throw std::invalid_argument("surface channels require a patch");
+    if (current->kind != "surface") throw std::invalid_argument("surface channels require a surface");
     auto reader = std::make_shared<GeometryReader>(txn, current->uuid);
     const auto original = reader->manifest();
     auto manifest = original;
     auto& arrays = manifest.at("arrays");
     const auto grid = arrays.at("points").at("shape").get<std::vector<int64_t>>();
-    const auto tile = revisionPatchTileSize(txn, *current);
+    const auto tile = revisionSurfaceTileSize(txn, *current);
     std::set<std::string> names;
     for (const auto& name : remove) {
         if (name.empty() || name == "points" || !names.insert(name).second)
@@ -539,7 +539,7 @@ std::string ObjectStore::editGeometryRectangle(WriteTxn& txn, const std::string&
     const auto revision = currentGeometry(txn, objectUuid);
     if (!revision || revision->uuid != formatUuid(parseUuid(expected)))
         historyConflict(static_cast<sqlite3*>(connection(txn)), "geometry: current revision changed; reload before committing");
-    if (revision->kind != "patch") throw std::invalid_argument("rectangle edit requires a patch");
+    if (revision->kind != "surface") throw std::invalid_argument("rectangle edit requires a surface");
     const auto found = std::find_if(revision->arrays.begin(), revision->arrays.end(), [&](const auto& a) { return a.name == name; });
     if (found == revision->arrays.end()) throw std::invalid_argument("geometry: array not found: " + name);
     const auto pixel = surfacePixelBytes(found->dtype, found->shape);

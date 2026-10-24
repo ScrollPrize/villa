@@ -21,7 +21,7 @@ try {
         else if (arg == "--dataset-root") root = next();
         else if (arg == "--registered") registered = true;
         else if (arg == "--uuid") { uuids.push_back(next()); registered = true; }
-        else if (arg == "--patch") sources.emplace_back("patch", next());
+        else if (arg == "--surface") sources.emplace_back("surface", next());
         else if (arg == "--fiber") sources.emplace_back("fiber", next());
         else if (arg == "--point-collections") sources.emplace_back("point_collection", next());
         else if (arg == "--tracks") sources.emplace_back("track", next());
@@ -31,7 +31,7 @@ try {
                 "  --registered              load initial geometry for registered placeholders\n"
                 "  --uuid UUID               load selected placeholders (flag repeatable)\n"
                 "  --dataset-root DIR        resolve registered source paths relative to DIR\n"
-                "  --patch DIR               import a new tifxyz patch\n"
+                "  --surface DIR               import a new tifxyz surface\n"
                 "  --fiber PATH              import new fibers from JSON or a directory\n"
                 "  --point-collections FILE  import new collections from a JSON\n"
                 "  --tracks PATH             import new packed tracks (or DBM with packed mirror)\n"

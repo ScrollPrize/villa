@@ -51,7 +51,7 @@ std::string updateGeometryArrays(ObjectStore& db, WriteTxn& txn, const std::stri
                 throw std::invalid_argument("array updates cannot remove arrays");
         for (const auto& [name, value] : annotations)
             if (!findArray(desired, name) || (desired.kind == "fiber" ? name != "control_points" && name != "line_points"
-                : desired.kind == "patch" || name != "points"))
+                : desired.kind == "surface" || name != "points"))
                 throw std::invalid_argument("invalid sequence annotations: " + name);
         auto decisions = [&](const std::vector<EdgeRecord>& edges) {
             return decide ? decide(edges) : std::vector<GeometryEdgeEdit>{};
@@ -65,7 +65,7 @@ std::string updateGeometryArrays(ObjectStore& db, WriteTxn& txn, const std::stri
             const auto scalarBytes = detail::geometryByteLength(target.dtype, {1});
             const auto idsName = detail::sequenceIdArray(desired.kind, target.name);
             const bool sequence = desired.kind == "fiber" ? target.name == "control_points" || target.name == "line_points"
-                : desired.kind != "patch" && target.name == "points";
+                : desired.kind != "surface" && target.name == "points";
             if (sequence) {
                 const size_t count = target.shape.at(0), oldCount = old.shape.at(0);
                 const auto oldIds = idsName.empty() ? std::vector<int64_t>{} : pointIds(data, idsName, oldCount);

@@ -1,7 +1,7 @@
 #include "linking/StoredGeometry.hpp"
 #include "vc_object_store/object_links/ObjectLinks.hpp"
-#include "spatial/PatchGrid.hpp"
-#include "spatial/PatchIndex.hpp"
+#include "spatial/SurfaceGrid.hpp"
+#include "spatial/SurfaceIndex.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -18,7 +18,7 @@ using Json = nlohmann::json;
 
 void checkCancelled(const std::atomic_bool* cancel)
 {
-    if (cancel && cancel->load()) throw std::runtime_error("point-collection-patch: cancelled; no changes committed");
+    if (cancel && cancel->load()) throw std::runtime_error("point-collection-surface: cancelled; no changes committed");
 }
 
 struct Point {
@@ -32,9 +32,9 @@ struct Collection {
     std::vector<Point> points;
     bool absoluteWinding = false;
 };
-struct Patch {
+struct Surface {
     objects::ObjectRecord object;
-    std::shared_ptr<PatchGrid> surface;
+    std::shared_ptr<SurfaceGrid> grid;
     double area = 0;
 };
 
@@ -44,7 +44,7 @@ bool validPoint(const cv::Vec3f& p)
 }
 
 std::vector<Collection> loadCollections(detail::StoredGeometry& inputs,
-    const PointCollectionPatchParams& params, const std::atomic_bool* cancel)
+    const PointCollectionSurfaceParams& params, const std::atomic_bool* cancel)
 {
     std::vector<Collection> result;
     for (const auto& object : inputs.select("point_collection", params.collectionUuids)) {
@@ -82,17 +82,17 @@ std::vector<Collection> loadCollections(detail::StoredGeometry& inputs,
     return result;
 }
 
-std::vector<Patch> loadPatches(detail::StoredGeometry& inputs,
-    const PointCollectionPatchParams& params, const std::atomic_bool* cancel)
+std::vector<Surface> loadSurfaces(detail::StoredGeometry& inputs,
+    const PointCollectionSurfaceParams& params, const std::atomic_bool* cancel)
 {
-    std::vector<Patch> patches;
-    const auto objects = inputs.select("patch", params.patchUuids);
+    std::vector<Surface> surfaces;
+    const auto objects = inputs.select("surface", params.surfaceUuids);
     for (const auto& object : objects) {
         checkCancelled(cancel);
-        objects::util::reportProgress(params.progress, "loading PCL target patches", patches.size(), objects.size(), object.uuid);
-        Patch patch;
-        patch.object = object;
-        const auto original = detail::patchSurface(inputs.load(object));
+        objects::util::reportProgress(params.progress, "loading PCL target surfaces", surfaces.size(), objects.size(), object.uuid);
+        Surface surface;
+        surface.object = object;
+        const auto original = detail::surfaceGrid(inputs.load(object));
         const auto scale = original->scale();
         const auto& source = *original->rawPointsPtr();
         auto working = source.clone();
@@ -101,73 +101,73 @@ std::vector<Patch> loadPatches(detail::StoredGeometry& inputs,
             for (int col = 0; col < source.cols; ++col) {
                 if (row + 1 < source.rows && col + 1 < source.cols && validPoint(source(row, col)) &&
                     validPoint(source(row + 1, col)) && validPoint(source(row, col + 1)) && validPoint(source(row + 1, col + 1)))
-                    patch.area += 1;
+                    surface.area += 1;
                 if (validPoint(source(row, col))) {
-                    working(row, col) *= params.patchScale;
+                    working(row, col) *= params.surfaceScale;
                     for (int axis = 0; axis < 3; ++axis)
-                        if (!std::isfinite(working(row, col)[axis])) throw std::runtime_error("scaled patch coordinate overflow");
+                        if (!std::isfinite(working(row, col)[axis])) throw std::runtime_error("scaled surface coordinate overflow");
                 }
             }
         }
-        patch.area /= double(scale[0]) * scale[1];
-        patch.surface = std::make_shared<PatchGrid>(working, scale);
-        patches.push_back(std::move(patch));
+        surface.area /= double(scale[0]) * scale[1];
+        surface.grid = std::make_shared<SurfaceGrid>(working, scale);
+        surfaces.push_back(std::move(surface));
     }
-    return patches;
+    return surfaces;
 }
 
-std::set<size_t> betweenTargets(const std::string& name, const std::map<std::string, size_t>& patches)
+std::set<size_t> betweenTargets(const std::string& name, const std::map<std::string, size_t>& surfaces)
 {
-    const std::string prefix = "between_patches__";
+    const std::string prefix = "between_surfaces__";
     if (!name.starts_with(prefix)) return {};
     const auto rest = name.substr(prefix.size());
     for (auto split = rest.find("__"); split != std::string::npos; split = rest.find("__", split + 1)) {
-        const auto a = patches.find(rest.substr(0, split)), b = patches.find(rest.substr(split + 2));
-        if (a != patches.end() && b != patches.end()) return {a->second, b->second};
+        const auto a = surfaces.find(rest.substr(0, split)), b = surfaces.find(rest.substr(split + 2));
+        if (a != surfaces.end() && b != surfaces.end()) return {a->second, b->second};
     }
     return {}; // Spiral falls back to the general policy if either name is absent.
 }
 
-std::array<double, 3> projection(const Patch& patch, double row, double col, double patchScale)
+std::array<double, 3> projection(const Surface& surface, double row, double col, double surfaceScale)
 {
-    const auto& points = *patch.surface->rawPointsPtr();
+    const auto& points = *surface.grid->rawPointsPtr();
     const int r = std::clamp(int(std::floor(row)), 0, points.rows - 2);
     const int c = std::clamp(int(std::floor(col)), 0, points.cols - 2);
     const float dr = std::clamp(float(row - r), 0.0f, 1.0f), dc = std::clamp(float(col - c), 0.0f, 1.0f);
     const auto p00 = points(r, c), p10 = points(r, c + 1), p01 = points(r + 1, c), p11 = points(r + 1, c + 1);
     const auto foot = dr + dc <= 1 ? p00 + dc * (p10 - p00) + dr * (p01 - p00)
         : p11 + (1 - dr) * (p10 - p11) + (1 - dc) * (p01 - p11);
-    return {foot[0] / patchScale, foot[1] / patchScale, foot[2] / patchScale};
+    return {foot[0] / surfaceScale, foot[1] / surfaceScale, foot[2] / surfaceScale};
 }
 } // namespace
 
-DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
-    const PointCollectionPatchParams& params, const std::atomic_bool* cancel)
+DetectorReport linkPointCollectionsToSurfaces(objects::ObjectStore& db,
+    const PointCollectionSurfaceParams& params, const std::atomic_bool* cancel)
 {
     if (!(params.tolerance > 0) || !std::isfinite(params.tolerance) || params.tolerance > std::numeric_limits<float>::max() ||
         !(params.pointScale > 0) || !std::isfinite(params.pointScale) ||
-        !(params.patchScale > 0) || !std::isfinite(params.patchScale) || params.edgeKind.empty() ||
+        !(params.surfaceScale > 0) || !std::isfinite(params.surfaceScale) || params.edgeKind.empty() ||
         params.windowPoints < 1 || params.windowMinPoints < 1 || params.windowMinPoints > params.windowPoints)
-        throw std::invalid_argument("point-collection-patch: invalid tolerance, scale, window or edge kind");
+        throw std::invalid_argument("point-collection-surface: invalid tolerance, scale, window or edge kind");
     checkCancelled(cancel);
     objects::util::reportProgress(params.progress, "loading point collections");
     detail::StoredGeometry inputs(db);
     auto collections = loadCollections(inputs, params, cancel);
-    auto patches = loadPatches(inputs, params, cancel);
+    auto surfaces = loadSurfaces(inputs, params, cancel);
     std::map<std::string, size_t> byName;
-    std::unordered_map<PatchGrid*, size_t> bySurface;
-    std::vector<PatchIndex::SurfacePtr> surfaces;
+    std::unordered_map<SurfaceGrid*, size_t> byGrid;
+    std::vector<SurfaceIndex::SurfacePtr> grids;
     StaleEdgeScope scope{{params.edgeKind}, {}};
-    for (size_t i = 0; i < patches.size(); ++i) {
-        byName[patches[i].object.name] = i;
-        bySurface[patches[i].surface.get()] = i;
-        surfaces.push_back(patches[i].surface);
-        scope.objectUuids.push_back(patches[i].object.uuid);
+    for (size_t i = 0; i < surfaces.size(); ++i) {
+        byName[surfaces[i].object.name] = i;
+        byGrid[surfaces[i].grid.get()] = i;
+        grids.push_back(surfaces[i].grid);
+        scope.objectUuids.push_back(surfaces[i].object.uuid);
     }
-    PatchIndex index;
+    SurfaceIndex index;
 
-    objects::util::reportProgress(params.progress, "indexing PCL target patches");
-    index.rebuild(surfaces);
+    objects::util::reportProgress(params.progress, "indexing PCL target surfaces");
+    index.rebuild(grids);
     std::vector<LinkCandidate> candidates;
     for (size_t ci = 0; ci < collections.size(); ++ci) {
         checkCancelled(cancel);
@@ -177,15 +177,15 @@ DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
         objects::util::reportProgress(params.progress, "linking point collections", ci, collections.size(), collection.object.name);
         const auto targets = betweenTargets(collection.object.name, byName);
         const auto count = collection.points.size();
-        std::vector<std::map<size_t, PatchIndex::LookupResult>> hits(count);
+        std::vector<std::map<size_t, SurfaceIndex::LookupResult>> hits(count);
         std::map<size_t, std::vector<size_t>> hitPoints;
         for (size_t i = 0; i < count; ++i) {
             checkCancelled(cancel);
             for (const auto& hit : index.locateAll({collection.points[i].working, float(params.tolerance), {}})) {
-                const auto patch = bySurface.at(hit.surface.get());
-                if (!targets.empty() && !targets.contains(patch)) continue;
-                hits[i].emplace(patch, hit);
-                hitPoints[patch].push_back(i);
+                const auto surface = byGrid.at(hit.surface.get());
+                if (!targets.empty() && !targets.contains(surface)) continue;
+                hits[i].emplace(surface, hit);
+                hitPoints[surface].push_back(i);
             }
         }
         const size_t half = absolute ? 0 : size_t(params.windowPoints / 2);
@@ -198,22 +198,22 @@ DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
                 const auto& members = hitPoints.at(pi);
                 const auto support = std::lower_bound(members.begin(), members.end(), hi) - std::lower_bound(members.begin(), members.end(), lo);
                 if (size_t(support) < required) continue;
-                if (!winner || (targets.empty() && patches[pi].area > patches[*winner].area) ||
-                    ((!targets.empty() || patches[pi].area == patches[*winner].area) && hit.distance < hits[i].at(*winner).distance))
+                if (!winner || (targets.empty() && surfaces[pi].area > surfaces[*winner].area) ||
+                    ((!targets.empty() || surfaces[pi].area == surfaces[*winner].area) && hit.distance < hits[i].at(*winner).distance))
                     winner = pi;
             }
             if (!winner) continue;
             const auto& point = collection.points[i];
-            const auto& patch = patches[*winner];
+            const auto& surface = surfaces[*winner];
             const auto& hit = hits[i].at(*winner);
             const double col = hit.grid[0], row = hit.grid[1];
             LinkCandidate candidate;
             candidate.kind = params.edgeKind;
-            candidate.aUuid = collection.object.uuid; candidate.bUuid = patch.object.uuid;
+            candidate.aUuid = collection.object.uuid; candidate.bUuid = surface.object.uuid;
             candidate.aAnchor.points.push_back({"point_ids", {point.id}});
             candidate.aAnchor.position = point.source;
-            candidate.bAnchor.position = projection(patch, row, col, params.patchScale);
-            const auto& grid = *patch.surface->rawPointsPtr();
+            candidate.bAnchor.position = projection(surface, row, col, params.surfaceScale);
+            const auto& grid = *surface.grid->rawPointsPtr();
             const int r = std::clamp(int(std::floor(row)), 0, grid.rows - 2);
             const int c = std::clamp(int(std::floor(col)), 0, grid.cols - 2);
             const double dr = std::clamp(row - r, 0.0, 1.0), dc = std::clamp(col - c, 0.0, 1.0);
@@ -221,23 +221,23 @@ DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
                 ? std::vector<objects::PointReference>{{"points", {r, c}}, {"points", {r, c+1}}, {"points", {r+1, c}}}
                 : std::vector<objects::PointReference>{{"points", {r+1, c+1}}, {"points", {r, c+1}}, {"points", {r+1, c}}};
             candidate.meta = Json{{"anchor_index_space", "point_id"},
-                {"point_collection_patch", {{"ij", {row, col}}, {"distance", hit.distance},
+                {"point_collection_surface", {{"ij", {row, col}}, {"distance", hit.distance},
                     {"winding_annotation", point.winding}, {"winding_is_absolute", absolute},
                     {"selection", targets.empty() ? "largest_area" : "nearest_named_pair"}}},
-                {"settings", {{"tolerance", params.tolerance}, {"point_scale", params.pointScale}, {"patch_scale", params.patchScale},
+                {"settings", {{"tolerance", params.tolerance}, {"point_scale", params.pointScale}, {"surface_scale", params.surfaceScale},
                     {"window_points", params.windowPoints}, {"window_min_points", params.windowMinPoints}}}}.dump();
             candidates.push_back(std::move(candidate));
         }
     }
     checkCancelled(cancel);
     auto txn = db.write();
-    auto report = detail::commitStoredCandidates(db, inputs, txn, kPointCollectionPatchDetector, 1, candidates,
+    auto report = detail::commitStoredCandidates(db, inputs, txn, kPointCollectionSurfaceDetector, 1, candidates,
         params.replaceStalePending, &scope, params.progress);
     checkCancelled(cancel);
     objects::util::reportProgress(params.progress, "committing point-collection links");
     checkCancelled(cancel);
     txn.commit();
-    report.objectsConsidered = int64_t(collections.size() + patches.size());
+    report.objectsConsidered = int64_t(collections.size() + surfaces.size());
     return report;
 }
 } // namespace vc::object_links

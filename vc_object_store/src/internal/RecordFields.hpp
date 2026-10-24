@@ -33,7 +33,7 @@ void detailFields(Detail& d, Visit visit)
         visit("control_point_count", d.controlPointCount); visit("line_point_count", d.linePointCount);
         visit("length", d.length); visit("width", d.width);
         visit("width_gap_fraction", d.widthGapFraction); visit("optimization_mode", d.optimizationMode);
-    } else if constexpr (std::is_same_v<T, PatchDetail>) {
+    } else if constexpr (std::is_same_v<T, SurfaceDetail>) {
         visit("grid_width", d.gridWidth); visit("grid_height", d.gridHeight);
         visit("scale", d.scale);
     } else {
@@ -47,6 +47,6 @@ void detailFields(Detail& d, Visit visit)
 template<class Record, class Visit>
 void objectDetails(Record& r, Visit visit)
 {
-    visit("fiber", r.fiber); visit("patch", r.patch); visit("track", r.track);
+    visit("fiber", r.fiber); visit("surface", r.surface); visit("track", r.track);
 }
 }

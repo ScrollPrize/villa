@@ -16,10 +16,10 @@ struct LineData {
     bool rebuildStrip = false;
 };
 using LineLoader = std::function<std::optional<LineData>(size_t, DetectorReport&)>;
-void validateLinePatchParams(const LinePatchParams& params, double sourceScale);
+void validateLineSurfaceParams(const LineSurfaceParams& params, double sourceScale);
 // Load one line at a time so track coordinates need not all be copied into RAM.
-DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
+DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
     const std::filesystem::path& ctVolume,
-    const LinePatchParams& params, double sourceScale, const char* detector, int version,
+    const LineSurfaceParams& params, double sourceScale, const char* detector, int version,
     const std::atomic_bool* cancel);
 } // namespace vc::object_links::detail

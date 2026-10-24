@@ -50,22 +50,22 @@ private:
     friend class GeometrySnapshot;
     using GeometryView::GeometryView;
 };
-class PatchView : public GeometryView {
+class SurfaceView : public GeometryView {
 public:
     int64_t rows() const;
     int64_t columns() const;
     std::array<double, 2> scale() const;
-    geometry::PatchPoint vertex(int64_t row, int64_t column) const;
+    geometry::SurfacePoint vertex(int64_t row, int64_t column) const;
     bool valid(int64_t row, int64_t column) const;
     // Returns an owned, row-major rectangle with the same scale.
-    geometry::Patch readTile(int64_t row, int64_t column, int64_t rows, int64_t columns) const;
-    geometry::Patch load() const;
+    geometry::Surface readTile(int64_t row, int64_t column, int64_t rows, int64_t columns) const;
+    geometry::Surface load() const;
 private:
     friend class GeometrySnapshot;
     using GeometryView::GeometryView;
 };
 
-using TypedGeometryView = std::variant<PointCollectionView, FiberView, TrackView, PatchView>;
+using TypedGeometryView = std::variant<PointCollectionView, FiberView, TrackView, SurfaceView>;
 
 class GeometrySnapshot {
 public:
@@ -78,7 +78,7 @@ public:
     PointCollectionView pointCollection(const std::string& objectUuid) const;
     FiberView fiber(const std::string& objectUuid) const;
     TrackView track(const std::string& objectUuid) const;
-    PatchView patch(const std::string& objectUuid) const;
+    SurfaceView surface(const std::string& objectUuid) const;
     TypedGeometryView geometry(const std::string& objectUuid) const;
 private:
     std::shared_ptr<detail::GeometryViewState> view(const std::string&, const std::string& kind) const;

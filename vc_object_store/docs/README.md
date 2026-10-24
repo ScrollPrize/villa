@@ -3,7 +3,7 @@
 `ObjectStore` keeps objects, immutable geometry, metadata and relationships in one
 SQLite file. Source files are needed for ingestion; subsequent queries, edits,
 detection and export use stored revisions. CT remains an input to fiber/track
-patch detection. See [build/CLI instructions](../README.md),
+surface detection. See [build/CLI instructions](../README.md),
 [typed geometry](typed-geometry.md) and [structural editing](structural-editing.md).
 C++ callers link `vc_objects` for storage, `vc_object_geometry` for native I/O,
 and `vc_object_links` for detectors. Public signatures live in
@@ -15,12 +15,12 @@ and `vc_object_links` for detectors. Public signatures live in
 from vc_object_store import ObjectStore
 
 with ObjectStore.create("objects.vcobj", author="reviewer") as store:
-    report = store.ingest_geometry_source("patch", "/data/patch")
+    report = store.ingest_geometry_source("surface", "/data/surface")
     assert not report["problems"], report["problems"]
-    report = store.link_patch_overlaps()
+    report = store.link_surface_overlaps()
     assert not report["problems"], report["problems"]
-    patches = store.objects_by_kind("patch")
-    store.export_geometry(patches[0]["uuid"], "/data/exported-patch")
+    surfaces = store.objects_by_kind("surface")
+    store.export_geometry(surfaces[0]["uuid"], "/data/exported-surface")
 ```
 
 Ingestion is **one-time**. Existing UUIDs (even unchanged or retired), duplicates,
@@ -366,7 +366,7 @@ Despite the field name, `volume_uuid` is the volume's `id` from the open-data
 `"20260411134726"`). It is not hashed, lowercased, or converted to an object UUID.
 Paths, levels, resolution and labels never infer it. Scale is a finite
 positive JSON number with direction **stored XYZ = volume voxel XYZ × scale**;
-it differs from physical resolution and patch grid scale. Values are metadata
+it differs from physical resolution and surface grid scale. Values are metadata
 only and never rescale payloads or detector parameters. Unknown/missing members
 mean `null`, not scale 1. Setting coordinates replaces the whole field and
 rejects unknown keys; positive 64-bit integers stay exact.
@@ -392,19 +392,19 @@ existing and retired identities are errors; this is not a refresh operation.
 `updateGeometryArrays` accepts desired typed arrays, the expected geometry revision,
 optional transformed annotations, and a caller-supplied relationship decision
 callback. It uses sparse coordinate edits and stable-ID sequence operations for
-fibers/PCLs/tracks, and sparse channel edits for unchanged patch grids. Omitted
+fibers/PCLs/tracks, and sparse channel edits for unchanged surface grids. Omitted
 annotations follow stable IDs; resizing an annotated sequence without IDs requires
 explicit transformed annotations. Grid/channel schema changes retain their dedicated
 surface APIs. These helpers do not introduce another history or editing model.
 
 ## Arrays, surface channels and sparse edits
 
-Generic readers support full arrays, byte ranges, patch rectangles and packed
+Generic readers support full arrays, byte ranges, surface rectangles and packed
 homogeneous arrays. Packed results expose dtype, shape, data and row offsets;
 trailing dimensions/dtypes must match and request order/duplicates are preserved.
 Storage dtypes are `|u1`, `<u2`, `<i4`, `<i8`, `<u8`, `<f4`, `<f8`.
 
-Patch `points` is float32 XYZ. Extra arrays are aligned channels of shape
+Surface `points` is float32 XYZ. Extra arrays are aligned channels of shape
 `[rows,columns]` or `[rows,columns,components]` with positive component count.
 Absent and zero-filled channels differ. Ingestion recognizes lowercase `.tif`
 and `.tiff` sidecars by stem, excluding XYZ; duplicate/reserved names, unaligned,
@@ -423,7 +423,7 @@ adds/replaces/removes channels atomically. Supply only changed arrays and exact
 little-endian bytes. Removing absent channels, duplicate names or mismatched
 spatial dimensions fails; dtype/components may change. Use
 [structural resizing](structural-editing.md#surface-growth-and-cropping) for shape
-changes. Typed owned patches and native export reject auxiliary arrays; bounded
+changes. Typed owned surfaces and native export reject auxiliary arrays; bounded
 views and generic readers remain available.
 
 ```python
@@ -444,7 +444,7 @@ Net no-ops create no revision/journal entry, but stale expectations still fail.
 Rectangle edits preserve all components and require exact byte lengths.
 Geometry, bounds, approvals and relationship decisions publish atomically.
 
-Patch tiles support 32/64/128 (default 128); size 0 uses linear 1 MiB
+Surface tiles support 32/64/128 (default 128); size 0 uses linear 1 MiB
 chunks. Sparse deltas retain exact bytes, including NaN payloads/signed zero,
 with checksum verification and a 256 MiB decoded limit. Current heads use a
 chunk overlay; historical reads reconstruct from snapshots or reverse a shorter
@@ -514,7 +514,7 @@ spatial candidates by UUID. Geometry and intersection predicates are unchanged.
 Volume targets never parse every object's metadata. The `objects` table carries
 `coordinate_volume` and `coordinate_scale`, virtual generated columns equal to
 `json_extract` of `meta.coordinates`, indexed as `objects_coordinates(kind,
-coordinate_volume, coordinate_scale)` (schema version 16; earlier stores are
+coordinate_volume, coordinate_scale)` (schema version 17; earlier stores are
 rejected and must be rebuilt). Version 16 also records object/edge kinds in the
 journal, including deletions, for selective cache invalidation. A target finds its frames with one index seek per
 distinct scale, and the unbound tail reads only the index ranges outside the

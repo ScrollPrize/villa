@@ -98,21 +98,21 @@ std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::
         result->require("control_points", "<f8", 2);
         result->require("line_points", "<f8", 2);
     } else if (revision->kind == "track") result->require("points", "<i4", 2);
-    else if (revision->kind == "patch") result->require("points", "<f4", 3);
+    else if (revision->kind == "surface") result->require("points", "<f4", 3);
     else throw std::invalid_argument("unsupported geometry kind");
     return result;
 }
 PointCollectionView GeometrySnapshot::pointCollection(const std::string& id) const { return PointCollectionView(view(id, "point_collection")); }
 FiberView GeometrySnapshot::fiber(const std::string& id) const { return FiberView(view(id, "fiber")); }
 TrackView GeometrySnapshot::track(const std::string& id) const { return TrackView(view(id, "track")); }
-PatchView GeometrySnapshot::patch(const std::string& id) const { return PatchView(view(id, "patch")); }
+SurfaceView GeometrySnapshot::surface(const std::string& id) const { return SurfaceView(view(id, "surface")); }
 TypedGeometryView GeometrySnapshot::geometry(const std::string& id) const
 {
     auto s = view(id, "");
     if (s->revision.kind == "point_collection") return PointCollectionView(s);
     if (s->revision.kind == "fiber") return FiberView(s);
     if (s->revision.kind == "track") return TrackView(s);
-    return PatchView(s);
+    return SurfaceView(s);
 }
 GeometrySnapshot ObjectStore::geometrySnapshot() { return GeometrySnapshot(*this); }
 
@@ -155,26 +155,26 @@ geometry::Fiber FiberView::load() const { return std::get<geometry::Fiber>(loadG
 int64_t TrackView::size() const { return state_->array("points").shape[0]; }
 std::vector<geometry::TrackPoint> TrackView::points(int64_t start, int64_t count) const { return objects::points<int32_t>(*state_, "points", start, count); }
 geometry::Track TrackView::load() const { return std::get<geometry::Track>(loadGeometry()); }
-int64_t PatchView::rows() const { return state_->array("points").shape[0]; }
-int64_t PatchView::columns() const { return state_->array("points").shape[1]; }
-std::array<double, 2> PatchView::scale() const
+int64_t SurfaceView::rows() const { return state_->array("points").shape[0]; }
+int64_t SurfaceView::columns() const { return state_->array("points").shape[1]; }
+std::array<double, 2> SurfaceView::scale() const
 {
     state_->read->require();
     auto value = nlohmann::json::parse(state_->revision.attributes).at("scale").get<std::array<double, 2>>();
-    for (auto v : value) if (!(v > 0) || !std::isfinite(v)) throw std::invalid_argument("invalid patch scale");
+    for (auto v : value) if (!(v > 0) || !std::isfinite(v)) throw std::invalid_argument("invalid surface scale");
     return value;
 }
-geometry::PatchPoint PatchView::vertex(int64_t row, int64_t column) const { return readTile(row, column, 1, 1).points.front(); }
-bool PatchView::valid(int64_t row, int64_t column) const { return geometry::validPatchPoint(vertex(row, column)); }
-geometry::Patch PatchView::readTile(int64_t row, int64_t column, int64_t rows, int64_t columns) const
+geometry::SurfacePoint SurfaceView::vertex(int64_t row, int64_t column) const { return readTile(row, column, 1, 1).points.front(); }
+bool SurfaceView::valid(int64_t row, int64_t column) const { return geometry::validSurfacePoint(vertex(row, column)); }
+geometry::Surface SurfaceView::readTile(int64_t row, int64_t column, int64_t rows, int64_t columns) const
 {
     state_->read->require();
     const auto bytes = state_->read->db->readGeometryRectangle(*state_->read->txn,
         state_->revision.uuid, "points", row, column, rows, columns);
-    geometry::Patch result{rows, columns, scale(), detail::xyzValues<float>(bytes)};
+    geometry::Surface result{rows, columns, scale(), detail::xyzValues<float>(bytes)};
     result.validate();
     return result;
 }
-geometry::Patch PatchView::load() const { return std::get<geometry::Patch>(loadGeometry()); }
+geometry::Surface SurfaceView::load() const { return std::get<geometry::Surface>(loadGeometry()); }
 
 } // namespace vc::objects

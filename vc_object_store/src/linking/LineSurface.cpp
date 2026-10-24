@@ -1,6 +1,6 @@
 #include "linking/StoredGeometry.hpp"
-// Shared strip construction and patch-contact tests for stored fibers and tracks.
-#include "linking/LinePatch.hpp"
+// Shared strip construction and surface-contact tests for stored fibers and tracks.
+#include "linking/LineSurface.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -20,18 +20,18 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 
-#include "spatial/PatchGrid.hpp"
-#include "spatial/PatchIndex.hpp"
+#include "spatial/SurfaceGrid.hpp"
+#include "spatial/SurfaceIndex.hpp"
 #include "vc_object_store/Uuid.hpp"
 #include "vc_object_store/CtSheetNormal.hpp"
 
 namespace vc::object_links::detail {
 namespace {
 
-// Profile CT queries, including cache hits, used by strip marching and patch-link gates.
+// Profile CT queries, including cache hits, used by strip marching and surface-link gates.
 class SheetNormalSource {
 public:
-    SheetNormalSource(const std::filesystem::path& ctVolume, const LinePatchParams& params) {
+    SheetNormalSource(const std::filesystem::path& ctVolume, const LineSurfaceParams& params) {
         ct_ = std::make_unique<vc::CtSheetNormalSampler>(ctVolume, params.ctLevel,
             params.workingToBaseScale / params.ctToBaseScale);
     }
@@ -42,7 +42,7 @@ public:
         return vc::CtSheetNormalSampler::method;
     }
     vc::CtSheetNormal sampleNormal(const cv::Vec3d& point, const std::atomic_bool* cancel) const {
-        if (cancel && cancel->load()) throw std::runtime_error("graph links: line-patch linking cancelled");
+        if (cancel && cancel->load()) throw std::runtime_error("graph links: line-surface linking cancelled");
         const auto start = profile_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         vc::CtSheetNormal result;
         result = ct_->sampleNormal(point, cancel);
@@ -56,11 +56,11 @@ public:
     }
 private:
     void printProfile(const char* phase) const {
-        std::fprintf(stderr, "FIBER_PATCH_PROFILE %s queries %zu normal_seconds %.9f invalid %zu\n",
+        std::fprintf(stderr, "FIBER_SURFACE_PROFILE %s queries %zu normal_seconds %.9f invalid %zu\n",
                      phase, queries_, seconds_, invalid_);
     }
     std::unique_ptr<vc::CtSheetNormalSampler> ct_;
-    bool profile_ = std::getenv("VC_FIBER_PATCH_PROFILE") != nullptr;
+    bool profile_ = std::getenv("VC_FIBER_SURFACE_PROFILE") != nullptr;
     mutable size_t queries_ = 0, invalid_ = 0;
     mutable double seconds_ = 0;
 };
@@ -74,7 +74,7 @@ cv::Vec3d unit(const cv::Vec3d& v)
 void checkCancelled(const std::atomic_bool* cancel)
 {
     if (cancel && cancel->load())
-        throw std::runtime_error("graph links: line-patch linking cancelled");
+        throw std::runtime_error("graph links: line-surface linking cancelled");
 }
 
 // Interpolate entries flagged bad from nearest good neighbours.
@@ -123,8 +123,8 @@ std::vector<cv::Vec3d> gaussianAlong(const std::vector<cv::Vec3d>& values, doubl
 // The reduced fast strip: centerline resampled every stripSpacing,
 // marched stripRowsEachSide rows out along the in-sheet cross direction
 // while following normals estimated directly from CT intensities.
-std::shared_ptr<PatchGrid> buildStrip(const LineData& fiber, const SheetNormalSource& sampler,
-                                        const LinePatchParams& params, const std::atomic_bool* cancel)
+std::shared_ptr<SurfaceGrid> buildStrip(const LineData& fiber, const SheetNormalSource& sampler,
+                                        const LineSurfaceParams& params, const std::atomic_bool* cancel)
 {
     const double spacing = params.stripSpacing;
     const int rowsEachSide = std::max(0, params.stripRowsEachSide);
@@ -287,13 +287,13 @@ std::shared_ptr<PatchGrid> buildStrip(const LineData& fiber, const SheetNormalSo
     for (int r = 0; r < rows; ++r)
         for (int c = 0; c < cols; ++c)
             points(r, c) = cv::Vec3f(xyz[size_t(r) * cols + c]);
-    return std::make_shared<PatchGrid>(points, cv::Vec2f(1.0f, 1.0f));
+    return std::make_shared<SurfaceGrid>(points, cv::Vec2f(1.0f, 1.0f));
 }
 
 // Cache source identity without traversing a potentially enormous chunk tree.
 // Volume chunks are treated as immutable; rebuildStrips explicitly refreshes
 // entries after in-place voxel edits. Read metadata once per detector run.
-nlohmann::json normalSourceIdentity(const std::filesystem::path& ct, const LinePatchParams& p)
+nlohmann::json normalSourceIdentity(const std::filesystem::path& ct, const LineSurfaceParams& p)
 {
     namespace fs = std::filesystem;
     const auto location = ct.string();
@@ -320,12 +320,12 @@ nlohmann::json normalSourceIdentity(const std::filesystem::path& ct, const LineP
     return identity;
 }
 
-nlohmann::json stripCacheKey(const LineData& fiber, const LinePatchParams& p,
+nlohmann::json stripCacheKey(const LineData& fiber, const LineSurfaceParams& p,
                             double sourceScale, const SheetNormalSource& sampler,
                             const nlohmann::json& source)
 {
     // Store exact inputs, avoiding hash collisions and ignoring unrelated
-    // fiber JSON edits (names, annotations) and patch-link acceptance gates.
+    // fiber JSON edits (names, annotations) and surface-link acceptance gates.
     // Bump version whenever buildStrip's geometry algorithm changes.
     nlohmann::json key{{"format", "vc-fiber-strip"}, {"version", 2}, {"uuid", fiber.uuid},
         {"source", source}, {"normal_method", sampler.method()}, {"source_scale", sourceScale},
@@ -337,8 +337,8 @@ nlohmann::json stripCacheKey(const LineData& fiber, const LinePatchParams& p,
     return key;
 }
 
-std::shared_ptr<PatchGrid> cachedStrip(const LineData& fiber, const SheetNormalSource& sampler,
-    const LinePatchParams& p, double sourceScale, const std::optional<nlohmann::json>& source,
+std::shared_ptr<SurfaceGrid> cachedStrip(const LineData& fiber, const SheetNormalSource& sampler,
+    const LineSurfaceParams& p, double sourceScale, const std::optional<nlohmann::json>& source,
     DetectorReport& report, const std::atomic_bool* cancel)
 {
     if (fiber.stripCacheFile.empty() || !source) return buildStrip(fiber, sampler, p, cancel);
@@ -368,7 +368,7 @@ std::shared_ptr<PatchGrid> cachedStrip(const LineData& fiber, const SheetNormalS
                     }
                     checkCancelled(cancel);
                     objects::util::reportProgress(p.progress, "using cached fiber strip");
-                    return std::make_shared<PatchGrid>(points, cv::Vec2f(1.f, 1.f));
+                    return std::make_shared<SurfaceGrid>(points, cv::Vec2f(1.f, 1.f));
                 }
             }
         } catch (const std::exception&) {
@@ -412,15 +412,15 @@ std::shared_ptr<PatchGrid> cachedStrip(const LineData& fiber, const SheetNormalS
 }
 
 // Indexed surface and area-weighted vertex normals, using the same
-// diagonal as PatchIndex: (00,10,01) and (10,11,01).
-struct Surface {
-    std::shared_ptr<PatchGrid> quad;
-    PatchIndex index;
+// diagonal as SurfaceIndex: (00,10,01) and (10,11,01).
+struct Mesh {
+    std::shared_ptr<SurfaceGrid> quad;
+    SurfaceIndex index;
     std::vector<cv::Vec3d> vertices, normals;
     cv::Vec3d low = cv::Vec3d::all(std::numeric_limits<double>::infinity());
     cv::Vec3d high = -low;
 
-    explicit Surface(std::shared_ptr<PatchGrid> q) : quad(std::move(q))
+    explicit Mesh(std::shared_ptr<SurfaceGrid> q) : quad(std::move(q))
     {
 
         const auto& points = *quad->rawPointsPtr();
@@ -476,7 +476,7 @@ struct Surface {
     std::optional<Hit> nearest(const cv::Vec3d& p, const cv::Vec3d& normal, double tolerance) const
     {
         if (!inBox(p, tolerance)) return {};
-        PatchIndex::PointQuery query;
+        SurfaceIndex::PointQuery query;
         query.worldPoint = cv::Vec3f(p);
         query.tolerance = float(tolerance);
         const auto hit = index.locate(query);
@@ -500,13 +500,13 @@ struct Surface {
     }
 };
 
-struct Patch {
+struct Surface {
     std::string uuid;
-    std::unique_ptr<Surface> surface;
+    std::unique_ptr<Mesh> mesh;
 };
 
 struct Proposal {
-    size_t patch = 0;
+    size_t surface = 0;
     std::vector<size_t> contacts;
     double contact = 0, stripSame = 0, stripAdjacent = 0, linkedSame = 0, linkedAdjacent = 0;
     bool anchor = false;
@@ -531,26 +531,26 @@ double contactLength(const LineData& fiber, const std::vector<size_t>& contacts,
     return total;
 }
 
-bool sameSheet(double distance, double dot, const LinePatchParams& p)
+bool sameSheet(double distance, double dot, const LineSurfaceParams& p)
 {
     return distance <= p.sameSheet && dot > p.sameNormal;
 }
-bool adjacentSheet(double distance, double dot, const LinePatchParams& p)
+bool adjacentSheet(double distance, double dot, const LineSurfaceParams& p)
 {
     return distance >= p.adjacentLow && distance <= p.adjacentHigh && dot > p.adjacentNormal;
 }
 
-std::pair<double, double> stripAgreement(const Surface& strip, const Surface& patch,
-                                        const LinePatchParams& p, const std::atomic_bool* cancel)
+std::pair<double, double> stripAgreement(const Mesh& strip, const Mesh& surface,
+                                        const LineSurfaceParams& p, const std::atomic_bool* cancel)
 {
     const int rows = strip.quad->rawPointsPtr()->rows;
     double weight = 0, same = 0, adjacent = 0;
     size_t selected = 0;
-    for (size_t i = 0; i < patch.vertices.size(); ++i) {
+    for (size_t i = 0; i < surface.vertices.size(); ++i) {
         if ((i & 1023) == 0) checkCancelled(cancel);
-        if (!strip.inBox(patch.vertices[i], p.stripMargin)) continue;
+        if (!strip.inBox(surface.vertices[i], p.stripMargin)) continue;
         ++selected;
-        const auto hit = strip.nearest(patch.vertices[i], patch.normals[i], p.adjacentHigh);
+        const auto hit = strip.nearest(surface.vertices[i], surface.normals[i], p.adjacentHigh);
         const int rowDistance = hit ? std::abs(std::clamp(int(std::lround(hit->grid[1])), 0, rows - 1) - rows / 2)
                                     : int(p.stripWeights.size());
         const double w = rowDistance < int(p.stripWeights.size()) ? p.stripWeights[rowDistance] : 0.05;
@@ -566,7 +566,7 @@ std::pair<double, double> stripAgreement(const Surface& strip, const Surface& pa
 struct Relation {
     std::vector<double> distance, normalDot;
     explicit Relation(size_t n) : distance(n, std::numeric_limits<double>::infinity()), normalDot(n, 0) {}
-    void update(const Surface& self, const Surface& other, const LinePatchParams& p,
+    void update(const Mesh& self, const Mesh& other, const LineSurfaceParams& p,
                 const std::atomic_bool* cancel)
     {
         for (int d = 0; d < 3; ++d)
@@ -581,7 +581,7 @@ struct Relation {
             }
         }
     }
-    std::pair<double, double> fractions(const LinePatchParams& p) const
+    std::pair<double, double> fractions(const LineSurfaceParams& p) const
     {
         size_t same = 0, adjacent = 0;
         for (size_t i = 0; i < distance.size(); ++i) {
@@ -593,29 +593,29 @@ struct Relation {
     }
 };
 
-void autoLink(const LineData& fiber, std::vector<Proposal>& proposals, const std::vector<Patch>& patches,
-              const SheetNormalSource& sampler, const LinePatchParams& p, double sourceScale,
+void autoLink(const LineData& fiber, std::vector<Proposal>& proposals, const std::vector<Surface>& surfaces,
+              const SheetNormalSource& sampler, const LineSurfaceParams& p, double sourceScale,
               const std::optional<nlohmann::json>& source, DetectorReport& report, const std::atomic_bool* cancel)
 {
     if (proposals.empty()) return;
     const auto stripGeometry = cachedStrip(fiber, sampler, p, sourceScale, source, report, cancel);
     objects::util::reportProgress(p.progress, "indexing normal strip");
-    const Surface strip(stripGeometry);
+    const Mesh strip(stripGeometry);
     std::vector<size_t> fresh;
     std::vector<std::unique_ptr<Relation>> relations(proposals.size());
     for (size_t i = 0; i < proposals.size(); ++i) {
         objects::util::reportProgress(p.progress, "checking contact anchors", i, proposals.size());
         auto& c = proposals[i];
-        const auto& patch = *patches[c.patch].surface;
+        const auto& surface = *surfaces[c.surface].mesh;
         c.contact = contactLength(fiber, c.contacts, p.contactGap);
         if (c.contact >= p.anchorContact) {
-            std::tie(c.stripSame, c.stripAdjacent) = stripAgreement(strip, patch, p, cancel);
+            std::tie(c.stripSame, c.stripAdjacent) = stripAgreement(strip, surface, p, cancel);
             c.anchor = c.stripSame > 0 && c.stripSame > p.stripGateRatio * c.stripAdjacent + p.stripGateMargin;
         }
         if (c.anchor) {
             c.round = 0;
             fresh.push_back(i);
-        } else relations[i] = std::make_unique<Relation>(patch.vertices.size());
+        } else relations[i] = std::make_unique<Relation>(surface.vertices.size());
     }
     for (int round = 1; round <= p.maxRounds && !fresh.empty(); ++round) {
         checkCancelled(cancel);
@@ -624,17 +624,17 @@ void autoLink(const LineData& fiber, std::vector<Proposal>& proposals, const std
             if (proposals[i].round < 0) pending.push_back(i);
         const size_t width = std::min<size_t>(8, std::max(1u, std::thread::hardware_concurrency()));
         for (size_t first = 0; first < pending.size(); first += width) {
-            objects::util::reportProgress(p.progress, "growing linked patches", first, pending.size());
+            objects::util::reportProgress(p.progress, "growing linked surfaces", first, pending.size());
             std::vector<std::future<void>> jobs;
             for (size_t j = first; j < std::min(first + width, pending.size()); ++j)
                 jobs.push_back(std::async(std::launch::async, [&, i = pending[j]] {
                     for (size_t f : fresh)
-                        relations[i]->update(*patches[proposals[i].patch].surface,
-                                             *patches[proposals[f].patch].surface, p, cancel);
+                        relations[i]->update(*surfaces[proposals[i].surface].mesh,
+                                             *surfaces[proposals[f].surface].mesh, p, cancel);
                 }));
             for (auto& job : jobs) job.get();
         }
-        objects::util::reportProgress(p.progress, "growing linked patches", pending.size(), pending.size());
+        objects::util::reportProgress(p.progress, "growing linked surfaces", pending.size(), pending.size());
         fresh.clear();
         for (size_t i : pending) {
             auto& c = proposals[i];
@@ -647,9 +647,9 @@ void autoLink(const LineData& fiber, std::vector<Proposal>& proposals, const std
     }
 }
 
-nlohmann::json settingsJson(const LinePatchParams& p)
+nlohmann::json settingsJson(const LineSurfaceParams& p)
 {
-    return {{"patch_scale", p.patchScale},
+    return {{"surface_scale", p.surfaceScale},
             {"working_to_base_scale", p.workingToBaseScale},
             {"ct_to_base_scale", p.ctToBaseScale}, {"ct_level", p.ctLevel},
             {"proximity", p.proximity}, {"min_contacts", p.minContacts},
@@ -662,13 +662,13 @@ nlohmann::json settingsJson(const LinePatchParams& p)
             {"strip_margin", p.stripMargin}, {"max_rounds", p.maxRounds}};
 }
 
-void validateParams(const LinePatchParams& p)
+void validateParams(const LineSurfaceParams& p)
 {
     const auto settings = settingsJson(p);
     for (const auto& [name, value] : settings.items())
         if (value.is_number() && (!std::isfinite(value.get<double>()) || value.get<double>() < 0))
             throw std::invalid_argument("graph links: invalid " + name);
-    if (p.patchScale <= 0 || p.workingToBaseScale <= 0 || p.ctToBaseScale <= 0 || p.ctLevel < 0 ||
+    if (p.surfaceScale <= 0 || p.workingToBaseScale <= 0 || p.ctToBaseScale <= 0 || p.ctLevel < 0 ||
         !std::isfinite(p.workingToBaseScale / p.ctToBaseScale) ||
         p.workingToBaseScale / p.ctToBaseScale <= 0 ||
         p.proximity <= 0 || p.minContacts < 2 || p.stripSpacing <= 0 || p.stripMarchStep <= 0 ||
@@ -677,27 +677,27 @@ void validateParams(const LinePatchParams& p)
         p.sameSheet <= 0 || p.adjacentLow <= p.sameSheet || p.adjacentHigh <= p.adjacentLow ||
         p.sameNormal > 1 || p.adjacentNormal > 1 || p.growSame > 1 || p.stripGateRatio <= 0 ||
         p.maxRounds < 1 || p.edgeKind.empty())
-        throw std::invalid_argument("graph links: invalid fiber-patch parameters");
+        throw std::invalid_argument("graph links: invalid fiber-surface parameters");
     for (double w : p.stripWeights)
         if (!std::isfinite(w) || w < 0) throw std::invalid_argument("graph links: invalid strip weight");
 }
 
 }  // namespace
 
-void validateLinePatchParams(const LinePatchParams& params, double sourceScale)
+void validateLineSurfaceParams(const LineSurfaceParams& params, double sourceScale)
 {
     validateParams(params);
     if (!std::isfinite(sourceScale) || sourceScale <= 0)
         throw std::invalid_argument("graph links: invalid source coordinate scale");
 }
 
-DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
+DetectorReport linkLinesToSurfaces(objects::ObjectStore& db, StoredGeometry& inputs, size_t lineCount, const LineLoader& load,
     const std::filesystem::path& ctVolume,
-    const LinePatchParams& params, double sourceScale, const char* detector, int version,
+    const LineSurfaceParams& params, double sourceScale, const char* detector, int version,
     const std::atomic_bool* cancel)
 {
-    validateLinePatchParams(params, sourceScale);
-    const bool tracks = std::string(detector) == kTrackPatchDetector;
+    validateLineSurfaceParams(params, sourceScale);
+    const bool tracks = std::string(detector) == kTrackSurfaceDetector;
     DetectorReport report;
     try {
         checkCancelled(cancel);
@@ -711,64 +711,64 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
                 report.problems.push_back(std::string("fiber strip cache unavailable: ") + e.what());
             }
         }
-        const auto objects = inputs.select("patch", params.patchUuids);
+        const auto objects = inputs.select("surface", params.surfaceUuids);
         std::set<std::string> identities;
         auto unique = [&](const std::string& uuid) {
             if (!identities.insert(uuid).second)
                 throw std::runtime_error("graph links: duplicate input UUID " + uuid);
         };
-        std::vector<Patch> patches;
-        size_t patchNumber = 0;
+        std::vector<Surface> surfaces;
+        size_t surfaceNumber = 0;
         for (const auto& object : objects) {
-            objects::util::reportProgress(params.progress, "loading patches", patchNumber++, objects.size(), object.uuid);
+            objects::util::reportProgress(params.progress, "loading surfaces", surfaceNumber++, objects.size(), object.uuid);
             checkCancelled(cancel);
-            std::shared_ptr<PatchGrid> quad;
-            std::unique_ptr<Surface> surface;
+            std::shared_ptr<SurfaceGrid> quad;
+            std::unique_ptr<Mesh> mesh;
             std::string uuid;
             try {
-                quad = patchSurface(inputs.load(object));
+                quad = surfaceGrid(inputs.load(object));
                 uuid = object.uuid;
                 const auto scale = quad->scale();
                 if (!(scale[0] > 0) || !(scale[1] > 0) || !std::isfinite(scale[0]) || !std::isfinite(scale[1]))
-                    throw std::runtime_error("invalid patch scale");
-                if (params.patchScale != 1.0) {
+                    throw std::runtime_error("invalid surface scale");
+                if (params.surfaceScale != 1.0) {
 
                     auto points = quad->rawPointsPtr()->clone();
                     for (auto& p : points) {
-                        if (!Surface::valid(p)) continue; // preserve holes, including the -1 sentinel
-                        const cv::Vec3d scaled = cv::Vec3d(p) * params.patchScale;
+                        if (!Mesh::valid(p)) continue; // preserve holes, including the -1 sentinel
+                        const cv::Vec3d scaled = cv::Vec3d(p) * params.surfaceScale;
                         p = cv::Vec3f(scaled);
-                        if (!Surface::valid(p)) throw std::runtime_error("scaled patch coordinate is invalid");
+                        if (!Mesh::valid(p)) throw std::runtime_error("scaled surface coordinate is invalid");
                     }
                     // Preserve grid coordinates/UV scale. Only world XYZ changes;
                     // use a detached surface so mapped source TIFFs stay untouched.
-                    quad = std::make_shared<PatchGrid>(points, scale);
+                    quad = std::make_shared<SurfaceGrid>(points, scale);
                 }
-                surface = std::make_unique<Surface>(quad);
+                mesh = std::make_unique<Mesh>(quad);
             } catch (const std::exception& e) {
                 report.problems.push_back(object.uuid + ": " + e.what() + ", skipped");
                 continue;
             }
             unique(uuid);
-            patches.push_back({uuid, std::move(surface)});
+            surfaces.push_back({uuid, std::move(mesh)});
         }
-        objects::util::reportProgress(params.progress, "loading patches", objects.size(), objects.size());
-        report.objectsConsidered = int64_t(patches.size());
-        // One discovery index finds every patch touched by each dense line
+        objects::util::reportProgress(params.progress, "loading surfaces", objects.size(), objects.size());
+        report.objectsConsidered = int64_t(surfaces.size());
+        // One discovery index finds every surface touched by each dense line
         // point. locateAll returns one nearest hit per surface.
-        PatchIndex discovery;
+        SurfaceIndex discovery;
 
-        std::vector<PatchIndex::SurfacePtr> surfaces;
-        std::unordered_map<PatchGrid*, size_t> patchIndex;
-        for (size_t i = 0; i < patches.size(); ++i) {
-            surfaces.push_back(patches[i].surface->quad);
-            patchIndex.emplace(surfaces.back().get(), i);
+        std::vector<SurfaceIndex::SurfacePtr> grids;
+        std::unordered_map<SurfaceGrid*, size_t> surfaceIndex;
+        for (size_t i = 0; i < surfaces.size(); ++i) {
+            grids.push_back(surfaces[i].mesh->quad);
+            surfaceIndex.emplace(grids.back().get(), i);
         }
-        objects::util::reportProgress(params.progress, "building patch discovery index");
-        discovery.rebuild(surfaces);
+        objects::util::reportProgress(params.progress, "building surface discovery index");
+        discovery.rebuild(grids);
         std::vector<LinkCandidate> candidates;
         StaleEdgeScope scope{{params.edgeKind}, {}};
-        for (const auto& patch : patches) scope.objectUuids.push_back(patch.uuid);
+        for (const auto& surface : surfaces) scope.objectUuids.push_back(surface.uuid);
         auto settings = settingsJson(params);
         settings[tracks ? "track_scale" : "fiber_scale"] = sourceScale;
         const auto linkingStage = tracks ? "linking tracks" : "linking fibers";
@@ -788,32 +788,32 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
             for (size_t i = fiber.firstLine; i <= fiber.lastLine; ++i) {
                 if ((i & 255) == 0 || i == fiber.firstLine) {
                     checkCancelled(cancel);
-                    objects::util::reportProgress(lineParams.progress, "finding patch contacts", i - fiber.firstLine, fiber.lastLine - fiber.firstLine + 1);
+                    objects::util::reportProgress(lineParams.progress, "finding surface contacts", i - fiber.firstLine, fiber.lastLine - fiber.firstLine + 1);
                 }
-                PatchIndex::PointQuery q;
+                SurfaceIndex::PointQuery q;
                 q.worldPoint = cv::Vec3f(fiber.line[i]);
                 q.tolerance = float(params.proximity);
                 for (const auto& hit : discovery.locateAll(q))
-                    contacts[patchIndex.at(hit.surface.get())].push_back(i);
+                    contacts[surfaceIndex.at(hit.surface.get())].push_back(i);
             }
-            objects::util::reportProgress(lineParams.progress, "finding patch contacts",
+            objects::util::reportProgress(lineParams.progress, "finding surface contacts",
                 fiber.lastLine - fiber.firstLine + 1, fiber.lastLine - fiber.firstLine + 1);
             std::vector<Proposal> proposals;
-            for (auto& [patch, lines] : contacts)
+            for (auto& [surface, lines] : contacts)
                 if (lines.size() >= params.minContacts) {
                     Proposal proposal;
-                    proposal.patch = patch;
+                    proposal.surface = surface;
                     proposal.contacts = std::move(lines);
                     proposals.push_back(std::move(proposal));
                 }
             try {
-                autoLink(fiber, proposals, patches, sampler, lineParams, sourceScale, stripSource, report, cancel);
+                autoLink(fiber, proposals, surfaces, sampler, lineParams, sourceScale, stripSource, report, cancel);
             } catch (const std::exception& e) {
                 checkCancelled(cancel);
                 report.problems.push_back(fiber.uuid + ": " + e.what() + ", skipped");
                 continue;
             }
-            if (std::getenv("VC_FIBER_PATCH_PROFILE")) {
+            if (std::getenv("VC_FIBER_SURFACE_PROFILE")) {
                 size_t eligible = 0, anchors = 0, linked = 0;
                 double maxContact = 0, maxSame = 0, maxAdjacent = 0;
                 for (const auto& proposal : proposals) {
@@ -828,25 +828,25 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
                     {"proposals", proposals.size()}, {"eligible", eligible}, {"anchors", anchors},
                     {"linked", linked}, {"max_contact", maxContact},
                     {"max_strip_same", maxSame}, {"max_strip_adjacent", maxAdjacent}};
-                std::fprintf(stderr, "FIBER_PATCH_FIBER %s\n", profile.dump().c_str());
+                std::fprintf(stderr, "FIBER_SURFACE_FIBER %s\n", profile.dump().c_str());
             }
             scope.objectUuids.push_back(fiber.uuid);
             for (const auto& p : proposals) {
                 if (p.round < 0) continue;
-                const auto& patch = patches[p.patch];
+                const auto& surface = surfaces[p.surface];
                 const size_t median = p.contacts[p.contacts.size() / 2];
                 const auto& contact = fiber.line[median];
                 LinkCandidate c;
                 c.aUuid = fiber.uuid;
-                c.bUuid = patch.uuid;
+                c.bUuid = surface.uuid;
                 c.kind = params.edgeKind;
                 c.aAnchor.points.push_back({tracks ? "points" : "line_points", {int64_t(median)}});
                 c.aAnchor.position = std::array<double, 3>{contact[0] / sourceScale,
                     contact[1] / sourceScale, contact[2] / sourceScale};
-                PatchIndex::PointQuery q;
+                SurfaceIndex::PointQuery q;
                 q.worldPoint = cv::Vec3f(contact);
                 q.tolerance = float(params.proximity);
-                const auto hit = patch.surface->index.locate(q);
+                const auto hit = surface.mesh->index.locate(q);
                 if (!hit) continue;
                 nlohmann::json evidence{{"contacts", p.contacts.size()}, {"contact_length", p.contact},
                     {"anchor", p.anchor}, {"round", p.round}, {"strip_same", p.stripSame},
@@ -854,15 +854,15 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
                     {"linked_adjacent", p.linkedAdjacent}, {"median_line_index", median}};
                 if (hit) {
                     const auto grid = hit->grid;
-                    evidence["patch_grid"] = {grid[0], grid[1]};
-                    const auto* points = patch.surface->quad->rawPointsPtr();
+                    evidence["surface_grid"] = {grid[0], grid[1]};
+                    const auto* points = surface.mesh->quad->rawPointsPtr();
                     const int row = std::clamp(int(std::floor(grid[1])), 0, points->rows - 2);
                     const int col = std::clamp(int(std::floor(grid[0])), 0, points->cols - 2);
                     c.bAnchor.points = {{"points", {row, col}}, {"points", {row, col+1}},
                                         {"points", {row+1, col}}, {"points", {row+1, col+1}}};
                 }
                 c.score = p.anchor ? p.stripSame : p.linkedSame;
-                auto metadata = nlohmann::json{{tracks ? "track_patch" : "fiber_patch", evidence}, {"settings", settings},
+                auto metadata = nlohmann::json{{tracks ? "track_surface" : "fiber_surface", evidence}, {"settings", settings},
                     {"normal_source", ctVolume.string()},
                     {"normal_method", sampler.method()},
                     {"pred_dt_snap", false},

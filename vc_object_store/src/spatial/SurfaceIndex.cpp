@@ -1,4 +1,4 @@
-#include "spatial/PatchIndex.hpp"
+#include "spatial/SurfaceIndex.hpp"
 #include <limits>
 #include <map>
 namespace vc::object_links {
@@ -96,7 +96,7 @@ TriangleHit closestPointOnTriangle(const cv::Vec3f& p,
 }
 
 }
-void PatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces)
+void SurfaceIndex::rebuild(const std::vector<SurfacePtr>& surfaces)
 {
     surfaces_ = surfaces;
     tiles_.clear();
@@ -126,7 +126,7 @@ void PatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces)
     bounds_.build(std::move(boxes));
 }
 
-std::vector<PatchIndex::LookupResult> PatchIndex::locateAll(const PointQuery& query) const
+std::vector<SurfaceIndex::LookupResult> SurfaceIndex::locateAll(const PointQuery& query) const
 {
     if (!(query.tolerance > 0) || !std::isfinite(query.tolerance)) return {};
     objects::detail::BoundsIndex::Box box;
@@ -184,7 +184,7 @@ std::vector<PatchIndex::LookupResult> PatchIndex::locateAll(const PointQuery& qu
     return result;
 }
 
-std::optional<PatchIndex::LookupResult> PatchIndex::locate(const PointQuery& query) const
+std::optional<SurfaceIndex::LookupResult> SurfaceIndex::locate(const PointQuery& query) const
 {
     auto hits = locateAll(query);
     if (hits.empty()) return {};

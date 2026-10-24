@@ -239,7 +239,7 @@ nb::dict geometryToPy(const vo::GeometryRevision& r)
     nb::list arrays;
     for (const auto& a : r.arrays) {
         nb::dict item; item["name"] = a.name; item["dtype"] = a.dtype;
-        if (r.kind == "patch") item["components"] = a.shape.size() == 3 ? a.shape[2] : 1;
+        if (r.kind == "surface") item["components"] = a.shape.size() == 3 ? a.shape[2] : 1;
         item["shape"] = a.shape; item["byte_length"] = a.byteLength; arrays.append(item);
     }
     result["arrays"] = arrays;
@@ -420,6 +420,6 @@ vo::GeometrySurfaceResize surfaceResizeFromPy(const nb::dict& input) {
     vo::GeometrySurfaceResize resize;
     resize.row=nb::cast<int64_t>(input["row"]); resize.column=nb::cast<int64_t>(input["column"]);
     resize.rows=nb::cast<int64_t>(input["rows"]); resize.columns=nb::cast<int64_t>(input["columns"]);
-    nb::dict data; data["kind"]="patch"; data["arrays"]=input["fill"];
+    nb::dict data; data["kind"]="surface"; data["arrays"]=input["fill"];
     resize.fill=geometryFromPy(data).arrays; return resize;
 }

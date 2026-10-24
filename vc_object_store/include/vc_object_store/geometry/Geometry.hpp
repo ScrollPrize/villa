@@ -9,7 +9,7 @@
 namespace vc::geometry {
 
 using Point = std::array<double, 3>;
-using PatchPoint = std::array<float, 3>;
+using SurfacePoint = std::array<float, 3>;
 using TrackPoint = std::array<int32_t, 3>;
 using PointId = int64_t;
 
@@ -38,16 +38,16 @@ struct Track {
     double length() const;
 };
 
-struct Patch {
+struct Surface {
     int64_t rows = 0, columns = 0;
     std::array<double, 2> scale{1, 1}; // column, row; grid steps per source voxel
-    std::vector<PatchPoint> points;   // row-major; invalid vertices are (-1,-1,-1)
+    std::vector<SurfacePoint> points;   // row-major; invalid vertices are (-1,-1,-1)
     void validate() const;
-    const PatchPoint& vertex(int64_t row, int64_t column) const;
+    const SurfacePoint& vertex(int64_t row, int64_t column) const;
     bool valid(int64_t row, int64_t column) const;
 };
 
-using Geometry = std::variant<PointCollection, Fiber, Track, Patch>;
+using Geometry = std::variant<PointCollection, Fiber, Track, Surface>;
 
 // Preserve scalar precision, point order and stable IDs. encode/decode are the
 // bridge to the existing lossless array storage, not external file formats.
@@ -56,6 +56,6 @@ Geometry decode(const objects::GeometryData&);
 
 double polylineLength(std::span<const Point>);
 double polylineLength(std::span<const TrackPoint>);
-bool validPatchPoint(const PatchPoint&);
+bool validSurfacePoint(const SurfacePoint&);
 
 } // namespace vc::geometry

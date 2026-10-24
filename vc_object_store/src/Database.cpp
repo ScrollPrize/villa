@@ -15,7 +15,7 @@ ObjectStore& ObjectStore::operator=(ObjectStore&&) noexcept = default;
 std::unique_ptr<ObjectStore::Impl> ObjectStore::openImpl(const std::filesystem::path& path, const OpenOptions& options, bool create)
 {
     const int kApplicationId = 0x56434f42;
-    const int kSchemaVersion = 16;
+    const int kSchemaVersion = 17;
     if (create && options.readOnly) throw std::invalid_argument("create requires writable options");
     if (create && options.sharedFile) throw std::invalid_argument("object store: create a store locally, then initialize it as a hub");
     if (sqlite3_threadsafe() == 0)

@@ -6,7 +6,7 @@
 #include <tuple>
 
 namespace vc::objects::detail {
-nlohmann::json coordinateBounds(std::span<const uint8_t> bytes,const std::string& dtype,bool patch) {
+nlohmann::json coordinateBounds(std::span<const uint8_t> bytes,const std::string& dtype,bool surface) {
     GeometryPhase phase("coordinateBounds");
     std::optional<std::array<double,6>> result;
     auto scan=[&]<class T>() {
@@ -14,7 +14,7 @@ nlohmann::json coordinateBounds(std::span<const uint8_t> bytes,const std::string
         for (size_t offset=0;offset<bytes.size();offset+=3*sizeof(T)) {
             std::array<T,3> point; copyScalars<T>(bytes.subspan(offset,3*sizeof(T)),point);
             const double x=point[0],y=point[1],z=point[2];
-            if (!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)||(patch&&x==-1&&z<=0)) continue;
+            if (!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)||(surface&&x==-1&&z<=0)) continue;
             if(!result)result=std::array<double,6>{x,y,z,x,y,z};
             else for(size_t axis=0;axis<3;++axis) {(*result)[axis]=std::min((*result)[axis],double(point[axis]));(*result)[axis+3]=std::max((*result)[axis+3],double(point[axis]));}
         }
@@ -50,7 +50,7 @@ std::string spatialOverlapSql(int firstParameter)
 std::optional<Bounds> recordBounds(const ObjectRecord& object)
 {
     if (object.kind == "fiber" && object.fiber) return object.fiber->bbox;
-    if (object.kind == "patch" && object.patch) return object.patch->bbox;
+    if (object.kind == "surface" && object.surface) return object.surface->bbox;
     if (object.kind == "track" && object.track) return object.track->bbox;
     return std::nullopt;
 }
@@ -65,8 +65,8 @@ struct BoundsBuilder {
             (*bounds)[axis + 3] = std::max((*bounds)[axis + 3], b[axis + 3]);
         }
     }
-    void append(std::span<const uint8_t> bytes, const std::string& dtype, bool patch) {
-        const auto value=coordinateBounds(bytes,dtype,patch);
+    void append(std::span<const uint8_t> bytes, const std::string& dtype, bool surface) {
+        const auto value=coordinateBounds(bytes,dtype,surface);
         if(!value.is_null())merge(value.get<Bounds>());
     }
 };
@@ -91,7 +91,7 @@ void writeBounds(sqlite3* db, int64_t objectId, const std::optional<Bounds>& bou
     put.stepDone();
 }
 
-// Starts/counts exclude the final XYZ axis. Patches use rows and columns;
+// Starts/counts exclude the final XYZ axis. Surfaces use rows and columns;
 // one-dimensional arrays use row_start/count and zero column values.
 struct Region {
     int64_t id = 0, rows = 0, columns = 0;
@@ -125,7 +125,7 @@ private:
 
 template<class Read, class ReadRectangle>
 void indexGeometry(sqlite3* db, int64_t objectId, const std::string& revision,
-                   const std::string& kind, const std::vector<GeometryArrayInfo>& arrays, Read&& read, ReadRectangle&& readRectangle, bool tiledPatch = false)
+                   const std::string& kind, const std::vector<GeometryArrayInfo>& arrays, Read&& read, ReadRectangle&& readRectangle, bool tiledSurface = false)
 {
     // Reuse unchanged entries rather than churning the R-tree on every edit.
     // Revision identity belongs to the object's head, so unchanged blocks do
@@ -158,7 +158,7 @@ void indexGeometry(sqlite3* db, int64_t objectId, const std::string& revision,
     };
     for (const auto& a : arrays) if (coordinates(kind, a.name)) {
         const int64_t stride = a.dtype == "<f8" ? 24 : 12;
-        if (kind == "patch") {
+        if (kind == "surface") {
             const auto rows = a.shape.at(0), cols = a.shape.at(1);
             if (!rows || !cols) continue;
             constexpr int64_t cells = 32;
@@ -166,7 +166,7 @@ void indexGeometry(sqlite3* db, int64_t objectId, const std::string& revision,
             for (int64_t row = 0; row < std::max<int64_t>(1, rows - 1); row += cells) {
                 const int64_t height = std::min(cells + 1, rows - row);
                 std::vector<BoundsBuilder> tiles(static_cast<size_t>(tileColumns));
-                if (tiledPatch) {
+                if (tiledSurface) {
                     // Tiled payloads are visited as rectangles, once per region.
                     for (int64_t t = 0; t < tileColumns; ++t) {
                         const auto col = t * cells, width = std::min(cells + 1, cols - col);
@@ -174,7 +174,7 @@ void indexGeometry(sqlite3* db, int64_t objectId, const std::string& revision,
                     }
                 } else {
                     // Linear and in-memory arrays need row-major traversal:
-                    // tile-major reads on a wide linear patch would repeatedly
+                    // tile-major reads on a wide linear surface would repeatedly
                     // fetch dozens of 1 MiB chunks for each small region.
                     for (int64_t y = row; y < row + height; ++y)
                         for (int64_t t = 0; t < tileColumns; ++t) {
@@ -247,7 +247,7 @@ void refreshGeometryBounds(sqlite3* db, const std::string& objectUuid)
         [&](const std::string& name, int64_t offset, int64_t count) { return reader.read(name, offset, count); },
         [&](const std::string& name, int64_t row, int64_t col, int64_t rows, int64_t cols) {
             return reader.rectangle(name, row, col, rows, cols);
-        }, manifest.at("kind") == "patch" && manifest.at("arrays").at("points").contains("storage"));
+        }, manifest.at("kind") == "surface" && manifest.at("arrays").at("points").contains("storage"));
 }
 
 void updateEditedGeometryBounds(sqlite3* db, int64_t objectId, const std::string& revision,
@@ -265,7 +265,7 @@ void updateEditedGeometryBounds(sqlite3* db, int64_t objectId, const std::string
         const auto first = edit.elementOffset / 3;
         const auto last = (edit.elementOffset + int64_t(edit.bytes.size() / scalar) - 1) / 3;
         for (auto point = first; point <= last; ++point) {
-            if (kind == "patch") {
+            if (kind == "surface") {
                 const auto row = point / shape[1], col = point % shape[1];
                 for (auto r : {row / 32 * 32, row > 0 && row % 32 == 0 ? row - 32 : row / 32 * 32})
                     for (auto c : {col / 32 * 32, col > 0 && col % 32 == 0 ? col - 32 : col / 32 * 32})
@@ -285,12 +285,12 @@ void updateEditedGeometryBounds(sqlite3* db, int64_t objectId, const std::string
         const auto& a = manifest.at("arrays").at(name);
         const auto shape = a.at("shape").get<std::vector<int64_t>>();
         const std::string dtype = a.at("dtype");
-        const auto rows = std::min<int64_t>(kind == "patch" ? 33 : kind == "point_collection" ? 256 : 257, shape[0]-row);
-        const auto cols = kind == "patch" ? std::min<int64_t>(33, shape[1]-col) : 0;
+        const auto rows = std::min<int64_t>(kind == "surface" ? 33 : kind == "point_collection" ? 256 : 257, shape[0]-row);
+        const auto cols = kind == "surface" ? std::min<int64_t>(33, shape[1]-col) : 0;
         BoundsBuilder bounds;
         const auto stride = geometryByteLength(dtype, {3});
-        bounds.append(kind == "patch" ? reader.rectangle(name, row, col, rows, cols) : reader.read(name, row*stride, rows*stride),
-                      dtype, kind == "patch");
+        bounds.append(kind == "surface" ? reader.rectangle(name, row, col, rows, cols) : reader.read(name, row*stride, rows*stride),
+                      dtype, kind == "surface");
         writer.update(name, row, col, rows, cols, bounds.bounds);
     }
     Statement total(db, "SELECT min(min_x),min(min_y),min(min_z),max(max_x),max(max_y),max(max_z) "

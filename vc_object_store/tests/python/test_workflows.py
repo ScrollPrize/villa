@@ -6,7 +6,7 @@ import sys
 
 import numpy as np
 import pytest
-from vc_object_store import ObjectStore, PointCollection, Fiber, Track, Patch
+from vc_object_store import ObjectStore, PointCollection, Fiber, Track, Surface
 from object_helpers import edge_choice
 
 
@@ -30,7 +30,7 @@ def array(name, values):
     ('point_collection', PointCollection([42, 7], [[1, 2, 3], [4, 5, 6]]), 'points'),
     ('fiber', Fiber([[1, 2, 3], [4, 5, 6]], []), 'control_points'),
     ('track', Track([[1, 2, 3], [4, 5, 6]]), 'points'),
-    ('patch', Patch(1, 2, [1, 1], [[1, 2, 3], [4, 5, 6]]), 'points'),
+    ('surface', Surface(1, 2, [1, 1], [[1, 2, 3], [4, 5, 6]]), 'points'),
 ])
 def test_owned_views_native_export_and_one_time_ingest(db, tmp_path, kind, geometry, array_name):
     uid, revision = put(db, geometry, kind)
@@ -74,9 +74,9 @@ def test_surface_channels_sparse_reads_history_and_resize(db, tile):
     values = np.arange(35 * 37 * 3, dtype='<f4').reshape(35, 37, 3)
     values.view('<u4').flat[3:7] = [0x7fc12345, 0x80000000, 0x7f800000, 0xff800000]
     channel = np.arange(35 * 37, dtype='<u2').reshape(35, 37)
-    geometry = dict(kind='patch', attributes={'scale': [1, 1]},
+    geometry = dict(kind='surface', attributes={'scale': [1, 1]},
                     arrays=[array('points', values), array('review', channel)])
-    uid, first = put(db, geometry, 'patch', patch_tile_size=tile)
+    uid, first = put(db, geometry, 'surface', surface_tile_size=tile)
     for name, original in [('points', values), ('review', channel)]:
         assert db.read_geometry_array(first, name) == original.tobytes()
         rect = db.read_geometry_rectangle(first, name, 31, 31, 3, 4)
@@ -249,7 +249,7 @@ def test_unsupported_schema_is_rejected(db, version, read_only):
 @pytest.mark.parametrize('kind,detail', [
     ('fiber', dict(family='V', manual_family=True, control_point_count=2, line_point_count=3,
                   length=4.5, width=2.5, width_gap_fraction=.3, optimization_mode='fit', bbox=[0., 1., 2., 3., 4., 5.])),
-    ('patch', dict(grid_width=3, grid_height=2, scale=(.5, .25), bbox=None)),
+    ('surface', dict(grid_width=3, grid_height=2, scale=(.5, .25), bbox=None)),
     ('track', dict(dataset_ref='dataset', external_key='track', family='H', point_count=3, length=4.5, bbox=None)),
 ])
 def test_record_fields_and_transaction_bindings(db, kind, detail):

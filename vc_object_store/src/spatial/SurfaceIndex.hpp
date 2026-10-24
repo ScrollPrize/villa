@@ -1,15 +1,15 @@
 #pragma once
-#include "spatial/PatchGrid.hpp"
+#include "spatial/SurfaceGrid.hpp"
 #include "spatial/BoundsIndex.hpp"
 #include <memory>
 #include <span>
 #include <optional>
 #include <unordered_set>
 namespace vc::object_links {
-class PatchIndex {
+class SurfaceIndex {
 public:
-    using SurfacePtr=std::shared_ptr<PatchGrid>;
-    struct SurfaceFilter {const std::unordered_set<PatchGrid*>* includeRaw=nullptr;};
+    using SurfacePtr=std::shared_ptr<SurfaceGrid>;
+    struct SurfaceFilter {const std::unordered_set<SurfaceGrid*>* includeRaw=nullptr;};
     struct PointQuery {cv::Vec3f worldPoint;float tolerance=1;SurfaceFilter surfaces;};
     struct LookupResult {SurfacePtr surface; cv::Vec2f grid; float distance;};
     void rebuild(const std::vector<SurfacePtr>& surfaces);

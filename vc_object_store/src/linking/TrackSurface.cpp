@@ -1,13 +1,13 @@
-#include "linking/LinePatch.hpp"
+#include "linking/LineSurface.hpp"
 #include "linking/StoredGeometry.hpp"
 #include <cmath>
 #include <stdexcept>
 
 namespace vc::object_links {
-DetectorReport linkTracksToPatches(objects::ObjectStore& db, const std::filesystem::path& ctVolume,
-    const TrackPatchParams& params, const std::atomic_bool* cancel)
+DetectorReport linkTracksToSurfaces(objects::ObjectStore& db, const std::filesystem::path& ctVolume,
+    const TrackSurfaceParams& params, const std::atomic_bool* cancel)
 {
-    detail::validateLinePatchParams(params, params.trackScale);
+    detail::validateLineSurfaceParams(params, params.trackScale);
     try {
         detail::StoredGeometry inputs(db);
         const auto tracks = inputs.select("track", params.trackUuids);
@@ -26,7 +26,7 @@ DetectorReport linkTracksToPatches(objects::ObjectStore& db, const std::filesyst
                 line.arclength.reserve(count);
                 for (size_t i = 0; i < count; ++i) {
                     if ((i & 1023) == 0 && cancel && cancel->load())
-                        throw std::runtime_error("track-patch linking cancelled");
+                        throw std::runtime_error("track-surface linking cancelled");
                     const cv::Vec3d xyz = cv::Vec3d(points[3*i], points[3*i+1], points[3*i+2]) * params.trackScale;
                     for (int a = 0; a < 3; ++a)
                         if (points[3*i+a] < 0 || points[3*i+a] >= (1 << 20) || !std::isfinite(xyz[a]))
@@ -44,11 +44,11 @@ DetectorReport linkTracksToPatches(objects::ObjectStore& db, const std::filesyst
                 return {};
             }
         };
-        return detail::linkLinesToPatches(db, inputs, tracks.size(), load, ctVolume,
-            params, params.trackScale, kTrackPatchDetector, 1, cancel);
+        return detail::linkLinesToSurfaces(db, inputs, tracks.size(), load, ctVolume,
+            params, params.trackScale, kTrackSurfaceDetector, 1, cancel);
     } catch (const std::exception& error) {
         DetectorReport report;
-        report.problems.push_back(std::string("track-patch: no objects or edges committed: ") + error.what());
+        report.problems.push_back(std::string("track-surface: no objects or edges committed: ") + error.what());
         return report;
     }
 }

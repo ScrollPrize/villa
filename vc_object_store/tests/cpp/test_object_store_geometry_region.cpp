@@ -84,9 +84,9 @@ int main() try
         require(store.objectTags(read, std::string{"track"}) == std::vector<std::string>{"reviewed", "track-only"} &&
                 store.objectTags(read, std::string{"fiber"}).empty() &&
                 store.objectTags(read) == std::vector<std::string>{"reviewed", "track-only"}, "distinct tags filter by kind");
-        RegionOptions patches; patches.kind = "patch";
+        RegionOptions surfaces; surfaces.kind = "surface";
         bool rejected = false;
-        try { (void)store.geometryRegion(read, slice, patches); } catch (const std::invalid_argument&) { rejected = true; }
+        try { (void)store.geometryRegion(read, slice, surfaces); } catch (const std::invalid_argument&) { rejected = true; }
         require(rejected, "unsupported kinds are rejected");
     }
     std::cout << "geometry region tests passed\n";

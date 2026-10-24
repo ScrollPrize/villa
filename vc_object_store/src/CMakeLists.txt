@@ -74,12 +74,12 @@ if(NOT VC_OBJECT_STORE_BUILD_ADAPTERS)
     return()
 endif()
 find_package(TIFF REQUIRED)
-add_library(vc_object_formats STATIC Tiff.cpp MemMap.cpp PackedTrackStore.cpp spatial/PatchGrid.cpp)
+add_library(vc_object_formats STATIC Tiff.cpp MemMap.cpp PackedTrackStore.cpp spatial/SurfaceGrid.cpp)
 target_include_directories(vc_object_formats PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(vc_object_formats PUBLIC opencv_core TIFF::TIFF PRIVATE nlohmann_json::nlohmann_json)
 target_compile_features(vc_object_formats PUBLIC cxx_std_20)
 add_library(vc_object_geometry STATIC geometry/GeometryIngest.cpp geometry/GeometryExport.cpp geometry/SourceMetadata.cpp
-    formats/GeometryInput.cpp formats/FiberInput.cpp formats/PatchInput.cpp
+    formats/GeometryInput.cpp formats/FiberInput.cpp formats/SurfaceInput.cpp
     formats/PointCollectionInput.cpp formats/TrackInput.cpp formats/GeometryOutput.cpp)
 add_library(vc_object_store::vc_object_geometry ALIAS vc_object_geometry)
 target_include_directories(vc_object_geometry PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -105,9 +105,9 @@ target_include_directories(vc_track_crossings PUBLIC "$<BUILD_INTERFACE:${CMAKE_
 target_link_libraries(vc_track_crossings PRIVATE OpenMP::OpenMP_CXX)
 target_compile_features(vc_track_crossings PUBLIC cxx_std_20)
 add_library(vc_object_links STATIC
-    CtSheetNormal.cpp spatial/PatchIndex.cpp
-    linking/LinkCandidates.cpp linking/PatchOverlap.cpp linking/FiberPatch.cpp
-    linking/TrackTrack.cpp linking/StoredGeometry.cpp linking/LinePatch.cpp
-    linking/TrackPatch.cpp linking/PointCollectionPatch.cpp)
+    CtSheetNormal.cpp spatial/SurfaceIndex.cpp
+    linking/LinkCandidates.cpp linking/SurfaceOverlap.cpp linking/FiberSurface.cpp
+    linking/TrackTrack.cpp linking/StoredGeometry.cpp linking/LineSurface.cpp
+    linking/TrackSurface.cpp linking/PointCollectionSurface.cpp)
 target_include_directories(vc_object_links PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(vc_object_links PUBLIC vc_objects PRIVATE vc_track_crossings vc_object_formats vc_reader::reader opencv_core nlohmann_json::nlohmann_json)

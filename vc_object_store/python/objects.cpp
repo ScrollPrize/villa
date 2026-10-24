@@ -117,10 +117,10 @@ nb::dict detectorReportToPy(const vc::object_links::DetectorReport& rep)
     return d;
 }
 
-bool setLinePatchParameter(vc::object_links::LinePatchParams& p, const std::string& key, nb::handle val)
+bool setLineSurfaceParameter(vc::object_links::LineSurfaceParams& p, const std::string& key, nb::handle val)
 {
-    if (key == "patch_uuids") p.patchUuids = nb::cast<std::vector<std::string>>(val);
-    else if (key == "patch_scale") p.patchScale = nb::cast<double>(val);
+    if (key == "surface_uuids") p.surfaceUuids = nb::cast<std::vector<std::string>>(val);
+    else if (key == "surface_scale") p.surfaceScale = nb::cast<double>(val);
     else if (key == "ct_level") p.ctLevel = nb::cast<int>(val);
     else if (key == "ct_to_base_scale") p.ctToBaseScale = nb::cast<double>(val);
     else if (key == "working_to_base_scale") p.workingToBaseScale = nb::cast<double>(val);
@@ -185,12 +185,12 @@ void bindMutations(nb::class_<T>& cls)
         .def("remove_meta", writeMethod<&vo::ObjectStore::removeMeta, T>(),
              nb::arg("uuid"), nb::arg("key"))
         .def("put_geometry", [](T& self, const std::string& uuid, const nb::object& input,
-                               const std::optional<std::string>& expected, const nb::list& choices, int64_t patchTileSize) {
+                               const std::optional<std::string>& expected, const nb::list& choices, int64_t surfaceTileSize) {
             const auto data = geometryInputFromPy(input);
             const auto edits = edgeEditsFromPy(choices);
-            return self.template withWrite<true>([&](vo::ObjectStore& db, vo::WriteTxn& txn) { return db.putGeometry(txn, uuid, data, expected, edits, vo::GeometryStorageOptions{patchTileSize}); });
+            return self.template withWrite<true>([&](vo::ObjectStore& db, vo::WriteTxn& txn) { return db.putGeometry(txn, uuid, data, expected, edits, vo::GeometryStorageOptions{surfaceTileSize}); });
         }, nb::arg("object_uuid"), nb::arg("geometry"), nb::arg("expected_revision") = std::nullopt,
-           nb::arg("edge_edits") = nb::list(), nb::arg("patch_tile_size") = vo::GeometryStorageOptions{}.patchTileSize)
+           nb::arg("edge_edits") = nb::list(), nb::arg("surface_tile_size") = vo::GeometryStorageOptions{}.surfaceTileSize)
         .def("edit_geometry", [](T& self, const std::string& uuid, const nb::list& input,
                                 const std::string& expected, const nb::list& choices) {
             const auto edits = geometryEditsFromPy(input);
@@ -201,7 +201,7 @@ void bindMutations(nb::class_<T>& cls)
         }, nb::arg("object_uuid"), nb::arg("edits"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
         .def("update_surface_channels", [](T& self, const std::string& uuid, const nb::list& channels,
                                            const std::vector<std::string>& remove, const std::string& expected, const nb::list& choices) {
-            nb::dict input; input["kind"] = "patch"; input["arrays"] = channels;
+            nb::dict input; input["kind"] = "surface"; input["arrays"] = channels;
             const auto data = geometryFromPy(input); const auto edges = edgeEditsFromPy(choices);
             return self.template withWrite<true>([&](auto& db, auto& txn) { return db.updateSurfaceChannels(txn, uuid, data.arrays, remove, expected, edges); });
         }, nb::arg("object_uuid"), nb::arg("channels"), nb::arg("remove"), nb::arg("expected_revision"), nb::arg("edge_edits") = nb::list())
@@ -447,7 +447,7 @@ NB_MODULE(_native, m)
         }, nb::arg("revision_uuids"), nb::arg("array_name"),
            "Read homogeneous arrays into one verified packed buffer with row offsets.")
         .def("read_geometry_rectangle", readMethod<&vo::ObjectStore::readGeometryRectangle, true>(), nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("row"), nb::arg("column"),
-             nb::arg("rows"), nb::arg("columns"), "Read a dense row-major patch rectangle, preserving native dtype and component bytes.")
+             nb::arg("rows"), nb::arg("columns"), "Read a dense row-major surface rectangle, preserving native dtype and component bytes.")
         .def("read_geometry_rectangles", readMethod<&vo::ObjectStore::readGeometryRectangles, true>(), nb::arg("revision_uuid"), nb::arg("array_name"), nb::arg("rectangles"),
              "Read [row,column,rows,columns] rectangles in order, sharing verified chunks.")
         .def("read_geometry_ranges", readMethod<&vo::ObjectStore::readGeometryRanges, true>(), nb::arg("revision_uuid"), nb::arg("array_name"),
@@ -480,7 +480,7 @@ NB_MODULE(_native, m)
         }, nb::arg("edge_uuid"))
         .def("resolve_storage_path", readMethod<&vo::ObjectStore::resolveStoragePath>(), nb::arg("uuid"),
              nb::arg("dataset_root") = std::nullopt,
-             "Find a patch/fiber by source UUID, verifying the saved path before searching the dataset root.")
+             "Find a surface/fiber by source UUID, verifying the saved path before searching the dataset root.")
         .def("checkpoint", [](PyObjectStore& self) { self.require().checkpoint(); })
         .def("select_edges", [](PyObjectStore& self, const std::optional<std::string>& kind,
             const std::vector<std::string>& states, const std::optional<std::vector<std::string>>& endpoints,
@@ -652,40 +652,40 @@ NB_MODULE(_native, m)
         .def("import_json", writeMethod<&vo::ObjectStore::importJson>(),
              nb::arg("json_text"))
         .def(
-            "link_point_collections_to_patches",
+            "link_point_collections_to_surfaces",
             [](PyObjectStore& self, const nb::kwargs& kwargs) {
-                vc::object_links::PointCollectionPatchParams p;
+                vc::object_links::PointCollectionSurfaceParams p;
                 for (auto item : kwargs) {
                     const auto key = nb::cast<std::string>(item.first);
                     const nb::handle value = item.second;
                     if (key == "collection_uuids") p.collectionUuids = nb::cast<std::vector<std::string>>(value);
-                    else if (key == "patch_uuids") p.patchUuids = nb::cast<std::vector<std::string>>(value);
+                    else if (key == "surface_uuids") p.surfaceUuids = nb::cast<std::vector<std::string>>(value);
                     else if (key == "tolerance") p.tolerance = nb::cast<double>(value);
                     else if (key == "point_scale") p.pointScale = nb::cast<double>(value);
-                    else if (key == "patch_scale") p.patchScale = nb::cast<double>(value);
+                    else if (key == "surface_scale") p.surfaceScale = nb::cast<double>(value);
                     else if (key == "window_points") p.windowPoints = nb::cast<int>(value);
                     else if (key == "window_min_points") p.windowMinPoints = nb::cast<int>(value);
                     else if (key == "absolute_winding") p.absoluteWinding = nb::cast<std::optional<bool>>(value);
                     else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(value);
                     else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(value);
-                    else throw std::runtime_error("link_point_collections_to_patches: unknown parameter '" + key + "'");
+                    else throw std::runtime_error("link_point_collections_to_surfaces: unknown parameter '" + key + "'");
                 }
                 return detectorReportToPy(self.withStore<true>([&](auto& db) {
-                    return vc::object_links::linkPointCollectionsToPatches(db, p);
+                    return vc::object_links::linkPointCollectionsToSurfaces(db, p);
                 }));
             },
             nb::arg("kwargs"),
-            "Link regular PCL points to patches using Spiral's largest-area/nearest-named-pair rules. "
-            "Point IDs anchor the edges; winding annotations and patch grid coordinates are retained. "
+            "Link regular PCL points to surfaces using Spiral's largest-area/nearest-named-pair rules. "
+            "Point IDs anchor the edges; winding annotations and surface grid coordinates are retained. "
             "Defaults: tolerance=2.5, window_points=1, window_min_points=1; no CT required.")
         .def(
-            "link_patch_overlaps",
+            "link_surface_overlaps",
             [](PyObjectStore& self, const nb::kwargs& kwargs) {
-                vc::object_links::PatchOverlapParams p;
+                vc::object_links::SurfaceOverlapParams p;
                 for (auto item : kwargs) {
                     const std::string key = nb::cast<std::string>(item.first);
                     const nb::handle val = item.second;
-                    if (key == "patch_uuids") p.patchUuids = nb::cast<std::vector<std::string>>(val);
+                    if (key == "surface_uuids") p.surfaceUuids = nb::cast<std::vector<std::string>>(val);
                     else if (key == "workers") p.workers = nb::cast<int>(val);
                     else if (key == "tolerance") p.tolerance = nb::cast<double>(val);
                     else if (key == "sample_spacing") p.sampleSpacing = nb::cast<double>(val);
@@ -703,14 +703,14 @@ NB_MODULE(_native, m)
                     else if (key == "allow_reflection") p.allowReflection = nb::cast<bool>(val);
                     else if (key == "edge_kind") p.edgeKind = nb::cast<std::string>(val);
                     else if (key == "replace_stale_pending") p.replaceStalePending = nb::cast<bool>(val);
-                    else throw std::runtime_error("link_patch_overlaps: unknown parameter '" + key + "'");
+                    else throw std::runtime_error("link_surface_overlaps: unknown parameter '" + key + "'");
                 }
                 return detectorReportToPy(self.withStore<true>([&](auto& db) {
-                    return vc::object_links::linkPatchOverlaps(db, p);
+                    return vc::object_links::linkSurfaceOverlaps(db, p);
                 }));
             },
-            "Run patch-overlap discovery using stored geometry; patch_uuids optionally selects objects. "
-            "kwargs mirror PatchOverlapParams (tolerance, min_minor_spread, ...).")
+            "Run surface-overlap discovery using stored geometry; surface_uuids optionally selects objects. "
+            "kwargs mirror SurfaceOverlapParams (tolerance, min_minor_spread, ...).")
         .def(
             "link_tracks_to_tracks",
             [](PyObjectStore& self, const nb::kwargs& kwargs) {
@@ -736,28 +736,28 @@ NB_MODULE(_native, m)
             "Discover crossings from stored tracks, optionally selected by track_uuids and dataset_ref. "
             "Anchors are raw point indices and source XYZ positions.")
         .def(
-            "link_tracks_to_patches",
+            "link_tracks_to_surfaces",
             [](PyObjectStore& self, const std::string& ctVolume, const nb::kwargs& kwargs) {
-                vc::object_links::TrackPatchParams p;
+                vc::object_links::TrackSurfaceParams p;
                 for (auto item : kwargs) {
                     const auto key = nb::cast<std::string>(item.first);
                     const nb::handle val = item.second;
                     if (key == "track_scale") p.trackScale = nb::cast<double>(val);
                     else if (key == "track_uuids") p.trackUuids = nb::cast<std::vector<std::string>>(val);
-                    else if (!setLinePatchParameter(p, key, val))
-                        throw std::runtime_error("link_tracks_to_patches: unknown parameter '" + key + "'");
+                    else if (!setLineSurfaceParameter(p, key, val))
+                        throw std::runtime_error("link_tracks_to_surfaces: unknown parameter '" + key + "'");
                 }
                 return detectorReportToPy(self.withStore<true>([&](auto& db) {
-                    return vc::object_links::linkTracksToPatches(db, ctVolume, p);
+                    return vc::object_links::linkTracksToSurfaces(db, ctVolume, p);
                 }));
             },
             nb::arg("ct_volume") = "", nb::arg("kwargs"),
-            "Link stored tracks to stored patches; select with track_uuids and patch_uuids. "
+            "Link stored tracks to stored surfaces; select with track_uuids and surface_uuids. "
             "vc_reader supplies CT normals. Anchors retain raw indices and source XYZ.")
         .def(
-            "link_fibers_to_patches",
+            "link_fibers_to_surfaces",
             [](PyObjectStore& self, const std::string& ctVolume, const nb::kwargs& kwargs) {
-                vc::object_links::FiberPatchParams p;
+                vc::object_links::FiberSurfaceParams p;
                 for (auto item : kwargs) {
                     const std::string key = nb::cast<std::string>(item.first);
                     const nb::handle val = item.second;
@@ -765,15 +765,15 @@ NB_MODULE(_native, m)
                     else if (key == "cache_directory") p.cacheDirectory = nb::cast<std::string>(val);
                     else if (key == "fiber_scale") p.fiberScale = nb::cast<double>(val);
                     else if (key == "rebuild_strips") p.rebuildStrips = nb::cast<bool>(val);
-                    else if (!setLinePatchParameter(p, key, val))
-                        throw std::runtime_error("link_fibers_to_patches: unknown parameter '" + key + "'");
+                    else if (!setLineSurfaceParameter(p, key, val))
+                        throw std::runtime_error("link_fibers_to_surfaces: unknown parameter '" + key + "'");
                 }
                 return detectorReportToPy(self.withStore<true>([&](auto& db) {
-                    return vc::object_links::linkFibersToPatches(db, ctVolume, p);
+                    return vc::object_links::linkFibersToSurfaces(db, ctVolume, p);
                 }));
             },
             nb::arg("ct_volume") = "", nb::arg("kwargs"),
-            "Link stored fibers to stored patches; select with fiber_uuids and patch_uuids. "
+            "Link stored fibers to stored surfaces; select with fiber_uuids and surface_uuids. "
             "vc_reader supplies CT normals. Optional cache_directory stores disposable strips.")
         .def_prop_ro("uuid", readMethod<&vo::ObjectStore::uuid>())
         .def("current_object_revision", readMethod<&vo::ObjectStore::currentObjectRevision>(),

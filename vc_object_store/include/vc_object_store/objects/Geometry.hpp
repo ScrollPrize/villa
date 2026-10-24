@@ -18,7 +18,7 @@ struct GeometryArray {
 };
 
 struct GeometryData {
-    std::string kind; // patch, fiber, point_collection, track
+    std::string kind; // surface, fiber, point_collection, track
     int64_t formatVersion = 1;
     std::string coordinateSystem = "source_xyz";
     std::string attributes = "{}"; // immutable JSON object; no geometry coordinates
@@ -32,9 +32,9 @@ struct GeometryArrayInfo {
 };
 
 // Applies to new revisions only. Unchanged geometry retains its revision and
-// layout. Zero selects linear storage; all aligned patch channels use the same tile size.
+// layout. Zero selects linear storage; all aligned surface channels use the same tile size.
 struct GeometryStorageOptions {
-    int64_t patchTileSize = 128; // supported sizes: 0, 32, 64, 128 vertices
+    int64_t surfaceTileSize = 128; // supported sizes: 0, 32, 64, 128 vertices
 };
 
 // Replace a contiguous range of scalar elements in an existing array.

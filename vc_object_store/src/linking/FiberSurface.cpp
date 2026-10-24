@@ -1,5 +1,5 @@
-// Stored fiber adapter for the shared line-to-patch linker.
-#include "linking/LinePatch.hpp"
+// Stored fiber adapter for the shared line-to-surface linker.
+#include "linking/LineSurface.hpp"
 #include "linking/StoredGeometry.hpp"
 #include <algorithm>
 #include <cmath>
@@ -72,10 +72,10 @@ std::optional<detail::LineData> loadFiber(detail::StoredGeometry& inputs,
 
 } // namespace
 
-DetectorReport linkFibersToPatches(objects::ObjectStore& db, const std::filesystem::path& ctVolume,
-    const FiberPatchParams& params, const std::atomic_bool* cancel)
+DetectorReport linkFibersToSurfaces(objects::ObjectStore& db, const std::filesystem::path& ctVolume,
+    const FiberSurfaceParams& params, const std::atomic_bool* cancel)
 {
-    detail::validateLinePatchParams(params, params.fiberScale);
+    detail::validateLineSurfaceParams(params, params.fiberScale);
     detail::StoredGeometry inputs(db);
     const auto fibers = inputs.select("fiber", params.fiberUuids);
     auto load = [&](size_t index, DetectorReport& report) -> std::optional<detail::LineData> {
@@ -86,7 +86,7 @@ DetectorReport linkFibersToPatches(objects::ObjectStore& db, const std::filesyst
         }
         return fiber;
     };
-    return detail::linkLinesToPatches(db, inputs, fibers.size(), load, ctVolume,
-        params, params.fiberScale, kFiberPatchDetector, 3, cancel);
+    return detail::linkLinesToSurfaces(db, inputs, fibers.size(), load, ctVolume,
+        params, params.fiberScale, kFiberSurfaceDetector, 3, cancel);
 }
 } // namespace vc::object_links

@@ -59,19 +59,19 @@ void collection(const Snapshot& s, Json attributes, const fs::path& path)
     attributes["points"] = std::move(points);
     writeJson(path, {{"vc_pointcollections_json_version", "1"}, {"collections", {{collectionId, attributes}}}});
 }
-void patch(const Snapshot& s, Json attributes, const fs::path& path)
+void surface(const Snapshot& s, Json attributes, const fs::path& path)
 {
     const auto descriptor = std::find_if(s.revision.arrays.begin(), s.revision.arrays.end(), [](const auto& a) { return a.name == "points"; });
     const auto& shape = descriptor->shape;
     if (shape[0] <= 0 || shape[1] <= 0 || shape[0] > INT_MAX || shape[1] > INT_MAX)
-        throw std::runtime_error("native patch export requires nonempty dimensions within int32 range");
+        throw std::runtime_error("native surface export requires nonempty dimensions within int32 range");
     const auto xyz = s.values<float>("points");
     std::array<float, 3> low{-1,-1,-1}, high = low;
     bool any = false;
     for (size_t i = 0; i < xyz.size(); i += 3) {
         if (xyz[i+2] <= 0) {
             if (xyz[i] != -1 || xyz[i+1] != -1 || xyz[i+2] != -1)
-                throw std::runtime_error("patch points with z <= 0 must use the (-1,-1,-1) invalid sentinel");
+                throw std::runtime_error("surface points with z <= 0 must use the (-1,-1,-1) invalid sentinel");
             continue;
         }
         for (int a = 0; a < 3; ++a) {

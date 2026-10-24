@@ -20,7 +20,7 @@ void usage()
     std::cerr
         << "usage: vc_object_links --db <objects.vcobj> --author <name> [options]\n"
         << "  --no-progress        disable terminal progress reporting (stderr)\n"
-        << "  --link-pcl-patches             link stored point collections to stored patches\n"
+        << "  --link-pcl-surfaces             link stored point collections to stored surfaces\n"
         << "  --pcl-tolerance <vx>           maximum point distance (default 2.5)\n"
         << "  --point-scale <factor>         point XYZ -> working XYZ\n"
         << "  --pcl-window-points <n>        support window (default 1)\n"
@@ -29,14 +29,14 @@ void usage()
         << "  --link-track-tracks            discover crossings between stored tracks\n"
         << "  --track-dataset <ref>          restrict to stored dataset identity\n"
         << "  --track-uuid <uuid>            select track (repeatable)\n"
-        << "  --patch-uuid <uuid>            select patch (repeatable)\n"
+        << "  --surface-uuid <uuid>            select surface (repeatable)\n"
         << "  --fiber-uuid <uuid>            select fiber (repeatable)\n"
         << "  --collection-uuid <uuid>       select collection (repeatable)\n"
         << "  --track-workers <n>            crossing workers (default 1)\n"
         << "  --track-min-angle <deg>        crossing angle gate (default 30)\n"
         << "  --track-tangent-radius <vx>    tangent radius (default 12)\n"
         << "  --track-cluster-radius <n>     cluster index radius (default 4)\n"
-        << "  --link-patch-overlaps          discover overlaps between stored patches\n"
+        << "  --link-surface-overlaps          discover overlaps between stored surfaces\n"
         << "  --overlap-workers <n>            search workers (default 0: auto, up to 8)\n"
         << "  --overlap-tolerance <vx>          (default 2)\n"
         << "  --overlap-uv-tolerance <vx>       (default 3)\n"
@@ -48,18 +48,18 @@ void usage()
         << "  --overlap-agreement <0..1>        (default 0.6)\n"
         << "  --overlap-min-fraction <0..1>     (default 0 = off)\n"
         << "  --overlap-edge-kind <name>        (default same-surface)\n"
-        << "  --link-track-patches            link stored tracks to stored patches\n"
+        << "  --link-track-surfaces            link stored tracks to stored surfaces\n"
         << "  --track-scale <factor>          track XYZ -> working XYZ (default 1)\n"
         << "  --strip-rows <n>                shared strip rows each side (default 1)\n"
         << "  --anchor-contact <vx>           shared minimum anchor contact (default 75)\n"
-        << "  --link-fiber-patches            link stored fibers to stored patches\n"
+        << "  --link-fiber-surfaces            link stored fibers to stored surfaces\n"
         << "  --strip-cache <dir>             optional disposable fiber-strip cache\n"
         << "  --rebuild-fiber-strips          refresh strip caches (e.g. after CT voxel edits)\n"
         << "  --ct <path>                     uint8 CT volume for linking (default normal source)\n"
         << "  --ct-level <level>              CT pyramid level (default 0)\n"
         << "  --ct-to-base-scale <factor>     selected CT voxel size in base units (default 1)\n"
         << "  --fiber-scale <factor>           fiber XYZ -> working XYZ (default 1)\n"
-        << "  --patch-scale <factor>           patch XYZ -> working XYZ (default 1)\n"
+        << "  --surface-scale <factor>           surface XYZ -> working XYZ (default 1)\n"
         << "  --working-to-base-scale <factor> working voxel size in common base units (default 1)\n"
         << "  --import-json <path> import a vc_object_metadata JSON document\n"
         << "  --export-json <path> write a vc_object_metadata JSON document (- for stdout)\n"
@@ -72,15 +72,15 @@ int main(int argc, char** argv)
 try {
     fs::path dbPath, importJsonPath, exportJsonPath;
     fs::path ctVolume;
-    bool linkFibers = false, linkTrackPatches = false, linkPcl = false, linkOverlaps = false;
-    vc::object_links::PointCollectionPatchParams pclParams;
-    vc::object_links::TrackPatchParams trackPatchParams;
-    vc::object_links::FiberPatchParams fiberPatchParams;
+    bool linkFibers = false, linkTrackSurfaces = false, linkPcl = false, linkOverlaps = false;
+    vc::object_links::PointCollectionSurfaceParams pclParams;
+    vc::object_links::TrackSurfaceParams trackSurfaceParams;
+    vc::object_links::FiberSurfaceParams fiberSurfaceParams;
     bool linkTracks = false;
     bool showProgress = true;
     vc::object_links::TrackTrackParams trackParams;
     std::string author;
-    vc::object_links::PatchOverlapParams overlapParams;
+    vc::object_links::SurfaceOverlapParams overlapParams;
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         auto next = [&](const char* flag) -> std::string {
@@ -90,7 +90,7 @@ try {
         if (arg == "--no-progress") showProgress = false;
         else if (arg == "--db") dbPath = next("--db");
         else if (arg == "--author") author = next("--author");
-        else if (arg == "--link-pcl-patches") linkPcl = true;
+        else if (arg == "--link-pcl-surfaces") linkPcl = true;
         else if (arg == "--pcl-tolerance") pclParams.tolerance = std::stod(next(arg.c_str()));
         else if (arg == "--point-scale") pclParams.pointScale = std::stod(next(arg.c_str()));
         else if (arg == "--pcl-window-points") pclParams.windowPoints = std::stoi(next(arg.c_str()));
@@ -98,22 +98,22 @@ try {
         else if (arg == "--pcl-absolute") pclParams.absoluteWinding = true;
         else if (arg == "--pcl-relative") pclParams.absoluteWinding = false;
         else if (arg == "--link-track-tracks") linkTracks = true;
-        else if (arg == "--patch-uuid") {
+        else if (arg == "--surface-uuid") {
             const auto uuid = next(arg.c_str());
-            overlapParams.patchUuids.push_back(uuid);
-            fiberPatchParams.patchUuids.push_back(uuid);
-            pclParams.patchUuids.push_back(uuid);
+            overlapParams.surfaceUuids.push_back(uuid);
+            fiberSurfaceParams.surfaceUuids.push_back(uuid);
+            pclParams.surfaceUuids.push_back(uuid);
         }
-        else if (arg == "--fiber-uuid") fiberPatchParams.fiberUuids.push_back(next(arg.c_str()));
+        else if (arg == "--fiber-uuid") fiberSurfaceParams.fiberUuids.push_back(next(arg.c_str()));
         else if (arg == "--collection-uuid") pclParams.collectionUuids.push_back(next(arg.c_str()));
-        else if (arg == "--strip-cache") fiberPatchParams.cacheDirectory = next(arg.c_str());
+        else if (arg == "--strip-cache") fiberSurfaceParams.cacheDirectory = next(arg.c_str());
         else if (arg == "--track-dataset") trackParams.datasetRef = next(arg.c_str());
         else if (arg == "--track-uuid") trackParams.trackUuids.push_back(next(arg.c_str()));
         else if (arg == "--track-workers") trackParams.workers = std::stoi(next(arg.c_str()));
         else if (arg == "--track-min-angle") trackParams.minAngleDegrees = std::stod(next(arg.c_str()));
         else if (arg == "--track-tangent-radius") trackParams.tangentRadiusVoxels = std::stod(next(arg.c_str()));
         else if (arg == "--track-cluster-radius") trackParams.clusterIndexRadius = std::stoi(next(arg.c_str()));
-        else if (arg == "--link-patch-overlaps") linkOverlaps = true;
+        else if (arg == "--link-surface-overlaps") linkOverlaps = true;
         else if (arg == "--overlap-workers") overlapParams.workers = std::stoi(next(arg.c_str()));
         else if (arg == "--overlap-tolerance") overlapParams.tolerance = std::stod(next(arg.c_str()));
         else if (arg == "--overlap-uv-tolerance") overlapParams.uvInlierTolerance = std::stod(next(arg.c_str()));
@@ -125,18 +125,18 @@ try {
         else if (arg == "--overlap-agreement") overlapParams.minAgreementRatio = std::stod(next(arg.c_str()));
         else if (arg == "--overlap-min-fraction") overlapParams.minOverlapFraction = std::stod(next(arg.c_str()));
         else if (arg == "--overlap-edge-kind") overlapParams.edgeKind = next(arg.c_str());
-        else if (arg == "--link-track-patches") linkTrackPatches = true;
-        else if (arg == "--track-scale") trackPatchParams.trackScale = std::stod(next(arg.c_str()));
-        else if (arg == "--link-fiber-patches") linkFibers = true;
-        else if (arg == "--rebuild-fiber-strips") fiberPatchParams.rebuildStrips = true;
+        else if (arg == "--link-track-surfaces") linkTrackSurfaces = true;
+        else if (arg == "--track-scale") trackSurfaceParams.trackScale = std::stod(next(arg.c_str()));
+        else if (arg == "--link-fiber-surfaces") linkFibers = true;
+        else if (arg == "--rebuild-fiber-strips") fiberSurfaceParams.rebuildStrips = true;
         else if (arg == "--ct") ctVolume = next(arg.c_str());
-        else if (arg == "--ct-level") fiberPatchParams.ctLevel = std::stoi(next(arg.c_str()));
-        else if (arg == "--ct-to-base-scale") fiberPatchParams.ctToBaseScale = std::stod(next(arg.c_str()));
-        else if (arg == "--fiber-scale") fiberPatchParams.fiberScale = std::stod(next(arg.c_str()));
-        else if (arg == "--patch-scale") fiberPatchParams.patchScale = std::stod(next(arg.c_str()));
-        else if (arg == "--working-to-base-scale") fiberPatchParams.workingToBaseScale = std::stod(next(arg.c_str()));
-        else if (arg == "--strip-rows") fiberPatchParams.stripRowsEachSide = std::stoi(next(arg.c_str()));
-        else if (arg == "--anchor-contact") fiberPatchParams.anchorContact = std::stod(next(arg.c_str()));
+        else if (arg == "--ct-level") fiberSurfaceParams.ctLevel = std::stoi(next(arg.c_str()));
+        else if (arg == "--ct-to-base-scale") fiberSurfaceParams.ctToBaseScale = std::stod(next(arg.c_str()));
+        else if (arg == "--fiber-scale") fiberSurfaceParams.fiberScale = std::stod(next(arg.c_str()));
+        else if (arg == "--surface-scale") fiberSurfaceParams.surfaceScale = std::stod(next(arg.c_str()));
+        else if (arg == "--working-to-base-scale") fiberSurfaceParams.workingToBaseScale = std::stod(next(arg.c_str()));
+        else if (arg == "--strip-rows") fiberSurfaceParams.stripRowsEachSide = std::stoi(next(arg.c_str()));
+        else if (arg == "--anchor-contact") fiberSurfaceParams.anchorContact = std::stod(next(arg.c_str()));
         else if (arg == "--import-json") importJsonPath = next("--import-json");
         else if (arg == "--export-json") exportJsonPath = next("--export-json");
         else if (arg == "--help" || arg == "-h") {
@@ -151,12 +151,12 @@ try {
         return 2;
     }
 
-    if ((linkFibers || linkTrackPatches) && ctVolume.empty())
-        throw std::runtime_error("patch linking requires --ct");
-    pclParams.patchScale = fiberPatchParams.patchScale;
+    if ((linkFibers || linkTrackSurfaces) && ctVolume.empty())
+        throw std::runtime_error("surface linking requires --ct");
+    pclParams.surfaceScale = fiberSurfaceParams.surfaceScale;
 
-    static_cast<vc::object_links::LinePatchParams&>(trackPatchParams) = fiberPatchParams;
-    trackPatchParams.trackUuids = trackParams.trackUuids;
+    static_cast<vc::object_links::LineSurfaceParams&>(trackSurfaceParams) = fiberSurfaceParams;
+    trackSurfaceParams.trackUuids = trackParams.trackUuids;
 
     OpenOptions options;
     options.author = author;
@@ -186,10 +186,10 @@ try {
     };
     using namespace vc::object_links;
     if (linkTracks) run("Track crossings", "track-tracks", "tracks", trackParams, linkTracksToTracks);
-    if (linkOverlaps) run("Patch overlaps", "patch-overlaps", "patches", overlapParams, linkPatchOverlaps);
-    if (linkTrackPatches) run("Track to patch", "track-patches", "objects", trackPatchParams, linkTracksToPatches, ctVolume);
-    if (linkFibers) run("Fiber to patch", "fiber-patches", "objects", fiberPatchParams, linkFibersToPatches, ctVolume);
-    if (linkPcl) run("Point collections to patches", "pcl-patches", "objects", pclParams, linkPointCollectionsToPatches);
+    if (linkOverlaps) run("Surface overlaps", "surface-overlaps", "surfaces", overlapParams, linkSurfaceOverlaps);
+    if (linkTrackSurfaces) run("Track to surface", "track-surfaces", "objects", trackSurfaceParams, linkTracksToSurfaces, ctVolume);
+    if (linkFibers) run("Fiber to surface", "fiber-surfaces", "objects", fiberSurfaceParams, linkFibersToSurfaces, ctVolume);
+    if (linkPcl) run("Point collections to surfaces", "pcl-surfaces", "objects", pclParams, linkPointCollectionsToSurfaces);
     if (!importJsonPath.empty()) {
         vc::objects::util::TerminalProgress progress("Import JSON", showProgress);
         vc::objects::util::reportProgress(progress.callback(), "reading JSON");

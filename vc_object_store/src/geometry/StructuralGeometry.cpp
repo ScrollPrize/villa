@@ -71,7 +71,7 @@ std::string ObjectStore::editGeometrySequence(WriteTxn& txn,const std::string& o
     try {
         const auto uuid=formatUuid(parseUuid(objectId)); const auto current=currentGeometry(txn,uuid);
         if (!current || current->uuid!=formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
-        if (current->kind=="patch" || (current->kind=="fiber" ? edit.array!="control_points" && edit.array!="line_points" : edit.array!="points"))
+        if (current->kind=="surface" || (current->kind=="fiber" ? edit.array!="control_points" && edit.array!="line_points" : edit.array!="points"))
             throw std::invalid_argument("invalid structural sequence array");
         GeometryReader reader(txn,current->uuid); auto manifest=reader.manifest();
         auto data=snapshotData(reader);
@@ -186,7 +186,7 @@ std::string ObjectStore::resizeSurface(WriteTxn& txn,const std::string& objectId
     try {
         const auto uuid=formatUuid(parseUuid(objectId)); const auto current=currentGeometry(txn,uuid);
         if (!current || current->uuid!=formatUuid(parseUuid(expected))) historyConflict(db,"geometry: current revision changed; reload before committing");
-        if (current->kind!="patch") throw std::invalid_argument("surface resize requires a patch");
+        if (current->kind!="surface") throw std::invalid_argument("surface resize requires a surface");
         GeometryReader reader(txn,current->uuid); auto manifest=reader.manifest();
         if (resize.rows<0 || resize.columns<0) throw std::invalid_argument("negative surface shape");
         const auto origin=manifest.value("grid_origin",std::array<int64_t,2>{0,0});

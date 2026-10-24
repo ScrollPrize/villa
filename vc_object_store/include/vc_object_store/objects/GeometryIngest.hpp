@@ -11,7 +11,7 @@ struct GeometrySource {
     GeometryData geometry;
     nlohmann::json source;
 };
-// Decode a native patch, point-collection file, or fiber file/collection/directory
+// Decode a native surface, point-collection file, or fiber file/collection/directory
 // before opening a write transaction. Linked documents are loaded recursively;
 // available UUIDs are existing endpoints whose stored contents remain authoritative.
 // Explicit roots and duplicate identities are never silently skipped.
@@ -38,7 +38,7 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db,
     const std::optional<std::filesystem::path>& datasetRoot = std::nullopt,
     const std::vector<std::string>& objectUuids = {}, const util::ProgressCallback& progress = {});
 
-// Create new objects and ingest one source: a tifxyz patch directory,
+// Create new objects and ingest one source: a tifxyz surface directory,
 // vc3d_fiber JSON, collection or directory, vc_pointcollections JSON (all collections), or packed tracks
 // (.vctracks directory or DBM path with an existing packed mirror). Track
 // identity is (dataset_ref, external_key), within the object store. Fiber/collection

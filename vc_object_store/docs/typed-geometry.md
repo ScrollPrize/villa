@@ -4,7 +4,7 @@ The package separates geometry, stored objects and file formats:
 
 | Layer | Public API | Responsibility |
 | --- | --- | --- |
-| Owned geometry | `geometry/Geometry.hpp`, `vc::geometry` | Point collections, fibers, tracks and patches; validation and geometry operations |
+| Owned geometry | `geometry/Geometry.hpp`, `vc::geometry` | Point collections, fibers, tracks and surfaces; validation and geometry operations |
 | Stored geometry | `store/GeometryViews.hpp`, `vc::objects` | Snapshot views, bounded reads and checked sparse edits |
 | Object store | `objects/ObjectStore.hpp` | Identity, metadata, history, transactions, relationships and spatial queries |
 | Native formats | `objects/GeometryIngest.hpp`, `objects/GeometryExport.hpp` | Import/export orchestration; decoders and encoders live in `src/formats/` |
@@ -26,12 +26,12 @@ conversion check invariants.
 | `PointCollection` | int64 `ids`, float64 XYZ `points` | `point(id)`, `indexOf(id)`, validation |
 | `Fiber` | float64 XYZ `controlPoints`, `linePoints`; int64 `controlPointIds` | Polyline length, validation |
 | `Track` | int32 XYZ `points` | Polyline length, validation |
-| `Patch` | `rows`, `columns`, column/row `scale`, float32 XYZ `points` | Vertex access, validity, validation |
+| `Surface` | `rows`, `columns`, column/row `scale`, float32 XYZ `points` | Vertex access, validity, validation |
 
 Coordinates remain source XYZ voxels; there is no implicit rescaling, unit
 conversion, or axis reversal. Native packed tracks use ZYX; the format adapter
 performs that conversion at the file boundary. Fiber length uses sampled line
-points if present, otherwise control points. A patch is row-major; scale is grid
+points if present, otherwise control points. A surface is row-major; scale is grid
 steps per source voxel, and invalid vertices use the existing `(-1,-1,-1)`
 sentinel. Stable point IDs are nonnegative and unique and need not be sorted.
 
@@ -84,8 +84,8 @@ native value.
 auto snapshot = store.geometrySnapshot();
 auto collection = snapshot.pointCollection(collectionUuid);
 auto xyz = collection.point(42);
-auto patch = snapshot.patch(patchUuid);
-auto tile = patch.readTile(30, 31, 4, 4); // row, column, rows, columns
+auto surface = snapshot.surface(surfaceUuid);
+auto tile = surface.readTile(30, 31, 4, 4); // row, column, rows, columns
 ```
 
 ```python
@@ -93,19 +93,19 @@ with store.geometry_snapshot() as snapshot:
     collection = snapshot.point_collection(collection_uuid)
     ids = collection.ids(0, len(collection))
     xyz = collection.point(42)
-    patch = snapshot.patch(patch_uuid)
-    tile = patch.read_tile(30, 31, 4, 4)
+    surface = snapshot.surface(surface_uuid)
+    tile = surface.read_tile(30, 31, 4, 4)
 ```
 
 `snapshot.geometry(uuid)` returns the corresponding view (a variant in C++).
 Typed factories reject kind mismatches and objects without stored geometry.
-Counts and patch dimensions come from the pinned geometry revision, not stored
+Counts and surface dimensions come from the pinned geometry revision, not stored
 import summaries.
 
 Views read only requested coordinate ranges or rectangles, through the existing
 verified chunk reader. Point lookup builds an ID index once per view, loading
 the ID array but not the coordinate array. Full materialization is explicit:
-`view.load()` returns the owned type. Large patches should use `readTile()` /
+`view.load()` returns the owned type. Large surfaces should use `readTile()` /
 `read_tile()` instead.
 
 Snapshots pin a consistent database state at creation. Views keep

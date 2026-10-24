@@ -48,14 +48,14 @@ void StoredGeometry::validate(const objects::WriteTxn& txn) const
             throw std::runtime_error("geometry changed during discovery; retry: " + uuid);
     }
 }
-std::shared_ptr<PatchGrid> patchSurface(const objects::detail::GeometrySnapshot& geometry)
+std::shared_ptr<SurfaceGrid> surfaceGrid(const objects::detail::GeometrySnapshot& geometry)
 {
     const auto descriptor = std::find_if(geometry.revision.arrays.begin(), geometry.revision.arrays.end(),
         [](const auto& a) { return a.name == "points"; });
     if (descriptor == geometry.revision.arrays.end() || descriptor->shape.size() != 3 ||
         descriptor->shape[0] < 2 || descriptor->shape[1] < 2 ||
         descriptor->shape[0] > INT_MAX || descriptor->shape[1] > INT_MAX)
-        throw std::runtime_error("patch discovery requires a grid of at least 2 by 2 points");
+        throw std::runtime_error("surface discovery requires a grid of at least 2 by 2 points");
     cv::Mat_<cv::Vec3f> points(int(descriptor->shape[0]), int(descriptor->shape[1]));
     geometry.copyValues<float>("points", {reinterpret_cast<float*>(points.data), points.total() * 3});
     for (const auto& point : points)
@@ -63,7 +63,7 @@ std::shared_ptr<PatchGrid> patchSurface(const objects::detail::GeometrySnapshot&
             if (!std::isfinite(value)) throw std::runtime_error("geometry requires finite coordinates");
     const auto scale = nlohmann::json::parse(geometry.revision.attributes).at("scale").get<std::array<float, 2>>();
     if (!(scale[0] > 0 && scale[1] > 0) || !std::isfinite(scale[0]) || !std::isfinite(scale[1]))
-        throw std::runtime_error("invalid stored patch scale");
-    return std::make_shared<PatchGrid>(points, cv::Vec2f(scale[0], scale[1]));
+        throw std::runtime_error("invalid stored surface scale");
+    return std::make_shared<SurfaceGrid>(points, cv::Vec2f(scale[0], scale[1]));
 }
 } // namespace vc::object_links::detail

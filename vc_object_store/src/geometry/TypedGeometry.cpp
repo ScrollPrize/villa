@@ -42,7 +42,7 @@ const objects::GeometryArray& require(const objects::GeometryData& data,
 
 double polylineLength(std::span<const Point> points) { return length(points); }
 double polylineLength(std::span<const TrackPoint> points) { return length(points); }
-bool validPatchPoint(const PatchPoint& p)
+bool validSurfacePoint(const SurfacePoint& p)
 {
     return p[2] > 0 && std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
 }
@@ -75,26 +75,26 @@ void Fiber::validate() const {
 double Fiber::length() const { validate(); return polylineLength(linePoints.empty() ? controlPoints : linePoints); }
 void Track::validate() const {}
 double Track::length() const { return polylineLength(points); }
-void Patch::validate() const
+void Surface::validate() const
 {
     if (rows < 0 || columns < 0 || (columns && rows > INT64_MAX / columns) ||
         uint64_t(rows) * uint64_t(columns) != points.size())
-        throw std::invalid_argument("patch dimensions do not match vertices");
+        throw std::invalid_argument("surface dimensions do not match vertices");
     for (auto v : scale)
-        if (!(v > 0) || !std::isfinite(v)) throw std::invalid_argument("patch scale must be positive and finite");
+        if (!(v > 0) || !std::isfinite(v)) throw std::invalid_argument("surface scale must be positive and finite");
     finite(points);
     for (const auto& p : points)
-        if (!validPatchPoint(p) && p != PatchPoint{-1, -1, -1})
-            throw std::invalid_argument("invalid patch vertices must use (-1,-1,-1)");
+        if (!validSurfacePoint(p) && p != SurfacePoint{-1, -1, -1})
+            throw std::invalid_argument("invalid surface vertices must use (-1,-1,-1)");
 }
-const PatchPoint& Patch::vertex(int64_t row, int64_t column) const
+const SurfacePoint& Surface::vertex(int64_t row, int64_t column) const
 {
     if (row < 0 || column < 0 || row >= rows || column >= columns ||
         (columns && row > (INT64_MAX - column) / columns))
-        throw std::out_of_range("patch vertex out of bounds");
+        throw std::out_of_range("surface vertex out of bounds");
     return points.at(static_cast<size_t>(row * columns + column));
 }
-bool Patch::valid(int64_t row, int64_t column) const { return validPatchPoint(vertex(row, column)); }
+bool Surface::valid(int64_t row, int64_t column) const { return validSurfacePoint(vertex(row, column)); }
 
 objects::GeometryData encode(const Geometry& geometry)
 {
@@ -121,7 +121,7 @@ objects::GeometryData encode(const Geometry& geometry)
             data.kind = "track";
             data.arrays = {xyzArray<int32_t>("points", "<i4", {int64_t(g.points.size()), 3}, g.points)};
         } else {
-            data.kind = "patch";
+            data.kind = "surface";
             data.attributes = nlohmann::json{{"scale", g.scale}}.dump();
             data.arrays = {xyzArray<float>("points", "<f4", {g.rows, g.columns, 3}, g.points)};
         }
@@ -142,7 +142,7 @@ Geometry decode(const objects::GeometryData& data)
         data.kind == "point_collection" ? std::set<std::string>{"points", "point_ids"} : std::set<std::string>{"points"};
     if (names != expected) throw std::invalid_argument("typed geometry requires exactly its native arrays");
     const auto attributes = nlohmann::json::parse(data.attributes);
-    if (!attributes.is_object() || attributes.size() != (data.kind == "patch" ? 1 : 0))
+    if (!attributes.is_object() || attributes.size() != (data.kind == "surface" ? 1 : 0))
         throw std::invalid_argument("typed geometry cannot discard extra geometry attributes");
     Geometry result;
     if (data.kind == "point_collection") {
@@ -162,9 +162,9 @@ Geometry decode(const objects::GeometryData& data)
         PointCollection{fiber.controlPointIds, fiber.controlPoints}.validate();
     } else if (data.kind == "track") {
         result = Track{xyzValues<int32_t>(require(data, "points", "<i4", 2).bytes)};
-    } else if (data.kind == "patch") {
+    } else if (data.kind == "surface") {
         const auto& a = require(data, "points", "<f4", 3);
-        result = Patch{a.shape[0], a.shape[1], attributes.at("scale").get<std::array<double, 2>>(), xyzValues<float>(a.bytes)};
+        result = Surface{a.shape[0], a.shape[1], attributes.at("scale").get<std::array<double, 2>>(), xyzValues<float>(a.bytes)};
     } else throw std::invalid_argument("unsupported geometry kind");
     std::visit([](const auto& g) { g.validate(); }, result);
     return result;

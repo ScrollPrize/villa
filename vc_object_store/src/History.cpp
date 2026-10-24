@@ -172,7 +172,7 @@ CREATE TABLE history_validated_edges(uuid TEXT PRIMARY KEY, a_meta TEXT NOT NULL
             return "INSERT INTO " + table + " " + values + " ON CONFLICT(uuid) DO NOTHING;";
         };
         trigger("objects", mark("history_dirty_objects", "VALUES(" + row + ".uuid)"));
-        for (const auto* table : {"fibers", "patches", "tracks", "object_tags"})
+        for (const auto* table : {"fibers", "surfaces", "tracks", "object_tags"})
             trigger(table, mark("history_dirty_objects", "SELECT uuid FROM objects WHERE id=" + row + ".object_id"));
         trigger("geometry_heads", mark("history_dirty_objects", "VALUES(" + row + ".object_uuid)"));
         trigger("edges",

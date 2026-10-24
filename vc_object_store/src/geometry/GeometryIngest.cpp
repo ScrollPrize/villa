@@ -16,7 +16,7 @@ using Json = nlohmann::json;
 namespace fs = std::filesystem;
 using formats::Prepared;
 using formats::fiber;
-using formats::patch;
+using formats::surface;
 using formats::collections;
 using formats::track;
 using formats::readJson;
@@ -62,7 +62,7 @@ std::vector<GeometrySource> prepareGeometrySource(const std::string& kind, const
     const std::vector<std::string>& availableUuids)
 {
     if (kind == "fiber") return formats::fibers(source, availableUuids);
-    if (kind == "patch") return {patch(source)};
+    if (kind == "surface") return {surface(source)};
     if (kind == "point_collection") return collections(source);
     throw std::invalid_argument("unsupported batch geometry kind: " + kind);
 }
@@ -76,7 +76,7 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
     {
         auto read = db.read();
         if (objectUuids.empty()) {
-            for (const char* kind : {"patch", "fiber", "point_collection", "track"}) {
+            for (const char* kind : {"surface", "fiber", "point_collection", "track"}) {
                 auto batch = db.objectsByKind(read, kind); objects.insert(objects.end(), batch.begin(), batch.end());
             }
         } else {
@@ -114,7 +114,7 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
                 std::optional<fs::path> path;
                 { auto read = db.read(); path = db.resolveStoragePath(read, object.uuid, datasetRoot); }
                 if (!path) throw std::runtime_error("source not found by UUID");
-                if (object.kind == "patch") p = patch(*path);
+                if (object.kind == "surface") p = surface(*path);
                 else if (object.kind == "fiber") p = fiber(*path);
                 else if (object.kind == "point_collection") {
                     if (!pclCache.contains(*path)) pclCache[*path] = collections(*path);

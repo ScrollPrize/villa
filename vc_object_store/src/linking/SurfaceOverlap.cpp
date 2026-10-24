@@ -19,8 +19,8 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core.hpp>
 
-#include "spatial/PatchGrid.hpp"
-#include "spatial/PatchIndex.hpp"
+#include "spatial/SurfaceGrid.hpp"
+#include "spatial/SurfaceIndex.hpp"
 #include "vc_object_store/Uuid.hpp"
 
 namespace vc::object_links {
@@ -34,7 +34,7 @@ struct PhaseTimer {
     ~PhaseTimer() { if (seconds) *seconds += std::chrono::duration<double>(Clock::now() - start).count(); }
 };
 struct Profile {
-    bool enabled = std::getenv("VC_PATCH_OVERLAP_PROFILE") != nullptr;
+    bool enabled = std::getenv("VC_SURFACE_OVERLAP_PROFILE") != nullptr;
     double loading = 0, index = 0, harvest = 0, fit = 0, agreement = 0;
     uint64_t bboxPairs = 0, queries = 0, fitPairs = 0, samples = 0;
     ~Profile() {
@@ -42,7 +42,7 @@ struct Profile {
             const nlohmann::json out{{"loading_s", loading}, {"index_s", index}, {"harvest_s", harvest},
                 {"fit_s", fit}, {"agreement_s", agreement}, {"bbox_pairs", bboxPairs},
                 {"queries", queries}, {"fit_pairs", fitPairs}, {"samples", samples}};
-            std::fprintf(stderr, "PATCH_OVERLAP_PROFILE %s\n", out.dump().c_str());
+            std::fprintf(stderr, "SURFACE_OVERLAP_PROFILE %s\n", out.dump().c_str());
         }
     }
 };
@@ -78,9 +78,9 @@ struct SamplePoint {
     cv::Vec3f tangentV;
 };
 
-struct LoadedPatch {
+struct LoadedSurface {
     std::string uuid;
-    std::shared_ptr<PatchGrid> surface;
+    std::shared_ptr<SurfaceGrid> grid;
     const cv::Mat_<cv::Vec3f>* points = nullptr; // stable for this read-only detector run
     cv::Vec2f scale = {1.0f, 1.0f};
     std::vector<SamplePoint> samples;                  // strided by sampleSpacing
@@ -125,11 +125,11 @@ std::optional<std::pair<cv::Vec3f, cv::Vec3f>> tangentsAt(
 }
 
 // Bilinear xyz sample at metric UV; nullopt on invalid quad.
-std::optional<cv::Vec3f> sampleXyz(const LoadedPatch& patch, Vec2 uv)
+std::optional<cv::Vec3f> sampleXyz(const LoadedSurface& surface, Vec2 uv)
 {
-    const auto* points = patch.points;
-    double col = uv.x * patch.scale[0];
-    double row = uv.y * patch.scale[1];
+    const auto* points = surface.points;
+    double col = uv.x * surface.scale[0];
+    double row = uv.y * surface.scale[1];
     const int c0 = int(std::floor(col));
     const int r0 = int(std::floor(row));
     if (c0 < 0 || r0 < 0 || c0 + 1 >= points->cols || r0 + 1 >= points->rows) return std::nullopt;
@@ -147,15 +147,15 @@ std::optional<cv::Vec3f> sampleXyz(const LoadedPatch& patch, Vec2 uv)
                      interp(p00[2], p10[2], p01[2], p11[2])};
 }
 
-std::optional<LoadedPatch> loadPatch(detail::StoredGeometry& inputs, const objects::ObjectRecord& object, const PatchOverlapParams& params,
+std::optional<LoadedSurface> loadSurface(detail::StoredGeometry& inputs, const objects::ObjectRecord& object, const SurfaceOverlapParams& params,
                                      DetectorReport& report)
 {
-    LoadedPatch patch;
+    LoadedSurface surface;
     try {
-        patch.surface = detail::patchSurface(inputs.load(object));
-        patch.uuid = object.uuid;
-        patch.scale = patch.surface->scale();
-        if (!(patch.scale[0] > 0) || !(patch.scale[1] > 0)) {
+        surface.grid = detail::surfaceGrid(inputs.load(object));
+        surface.uuid = object.uuid;
+        surface.scale = surface.grid->scale();
+        if (!(surface.scale[0] > 0) || !(surface.scale[1] > 0)) {
             report.problems.push_back(object.uuid + ": invalid scale, skipped");
             return std::nullopt;
         }
@@ -164,34 +164,34 @@ std::optional<LoadedPatch> loadPatch(detail::StoredGeometry& inputs, const objec
         report.problems.push_back(object.uuid + ": load failed: " + e.what());
         return std::nullopt;
     }
-    const auto* points = patch.surface->rawPointsPtr();
-    patch.points = points;
-    const int stepR = std::max(1, int(std::llround(params.sampleSpacing * patch.scale[1])));
-    const int stepC = std::max(1, int(std::llround(params.sampleSpacing * patch.scale[0])));
-    patch.bboxLow = {1e30f, 1e30f, 1e30f};
-    patch.bboxHigh = {-1e30f, -1e30f, -1e30f};
+    const auto* points = surface.grid->rawPointsPtr();
+    surface.points = points;
+    const int stepR = std::max(1, int(std::llround(params.sampleSpacing * surface.scale[1])));
+    const int stepC = std::max(1, int(std::llround(params.sampleSpacing * surface.scale[0])));
+    surface.bboxLow = {1e30f, 1e30f, 1e30f};
+    surface.bboxHigh = {-1e30f, -1e30f, -1e30f};
     for (int row = 0; row < points->rows; ++row) {
         for (int col = 0; col < points->cols; ++col) {
             const cv::Vec3f p = (*points)(row, col);
             if (p[0] == -1.0f || !std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2])) continue;
-            patch.bboxLow = {std::min(patch.bboxLow[0], p[0]), std::min(patch.bboxLow[1], p[1]), std::min(patch.bboxLow[2], p[2])};
-            patch.bboxHigh = {std::max(patch.bboxHigh[0], p[0]), std::max(patch.bboxHigh[1], p[1]), std::max(patch.bboxHigh[2], p[2])};
+            surface.bboxLow = {std::min(surface.bboxLow[0], p[0]), std::min(surface.bboxLow[1], p[1]), std::min(surface.bboxLow[2], p[2])};
+            surface.bboxHigh = {std::max(surface.bboxHigh[0], p[0]), std::max(surface.bboxHigh[1], p[1]), std::max(surface.bboxHigh[2], p[2])};
             if (row % stepR != 0 || col % stepC != 0) continue;
-            auto tangents = tangentsAt(*points, row, col, patch.scale);
+            auto tangents = tangentsAt(*points, row, col, surface.scale);
             if (!tangents) continue;
             SamplePoint sample;
-            sample.uv = {col / double(patch.scale[0]), row / double(patch.scale[1])};
+            sample.uv = {col / double(surface.scale[0]), row / double(surface.scale[1])};
             sample.xyz = p;
             sample.tangentU = tangents->first;
             sample.tangentV = tangents->second;
-            patch.samples.push_back(std::move(sample));
+            surface.samples.push_back(std::move(sample));
         }
     }
-    if (patch.samples.empty()) {
+    if (surface.samples.empty()) {
         report.problems.push_back(object.uuid + ": no usable samples, skipped");
         return std::nullopt;
     }
-    return patch;
+    return surface;
 }
 
 struct Correspondence {
@@ -245,8 +245,8 @@ private:
     std::map<uint64_t, uint64_t> ranks_;
 };
 
-void addCorrespondence(const SamplePoint& sample, const LoadedPatch& target,
-    const PatchIndex::LookupResult& hit, const PatchOverlapParams& params,
+void addCorrespondence(const SamplePoint& sample, const LoadedSurface& target,
+    const SurfaceIndex::LookupResult& hit, const SurfaceOverlapParams& params,
     CorrespondenceCollector& collector)
 {
     const auto* targetPoints = target.points;
@@ -275,25 +275,25 @@ void addCorrespondence(const SamplePoint& sample, const LoadedPatch& target,
     collector.add(c);
 }
 
-std::map<size_t, CorrespondenceCollector> harvestTargets(const LoadedPatch& seed,
-    const std::vector<LoadedPatch>& patches, const std::vector<size_t>& targets,
-    const PatchIndex& index, const PatchOverlapParams& params,
+std::map<size_t, CorrespondenceCollector> harvestTargets(const LoadedSurface& seed,
+    const std::vector<LoadedSurface>& surfaces, const std::vector<size_t>& targets,
+    const SurfaceIndex& index, const SurfaceOverlapParams& params,
     const std::atomic_bool* cancel, Profile& profile, const objects::util::ProgressCallback& progress)
 {
     std::map<size_t, CorrespondenceCollector> matches;
     if (targets.empty()) return matches;
-    std::unordered_map<PatchGrid*, size_t> targetIndex;
-    std::unordered_set<PatchGrid*> included;
+    std::unordered_map<SurfaceGrid*, size_t> targetIndex;
+    std::unordered_set<SurfaceGrid*> included;
     for (const auto ti : targets) {
-        targetIndex.emplace(patches[ti].surface.get(), ti);
-        included.insert(patches[ti].surface.get());
+        targetIndex.emplace(surfaces[ti].grid.get(), ti);
+        included.insert(surfaces[ti].grid.get());
     }
     using Matches = std::map<size_t, CorrespondenceCollector>;
     std::atomic_size_t completed{0};
-    const auto label = seed.uuid + " -> " + std::to_string(targets.size()) + " patches";
+    const auto label = seed.uuid + " -> " + std::to_string(targets.size()) + " surfaces";
     auto harvestRange = [&](size_t begin, size_t end) {
         Matches local;
-        PatchIndex::SurfaceFilter filter;
+        SurfaceIndex::SurfaceFilter filter;
         filter.includeRaw = &included;
         std::array<cv::Vec3f, 512> points;
         for (size_t first = begin; first < end; first += points.size()) {
@@ -308,7 +308,7 @@ std::map<size_t, CorrespondenceCollector> harvestTargets(const LoadedPatch& seed
                     for (const auto& hit : hits) {
                         const auto ti = targetIndex.at(hit.surface.get());
                         auto [it, inserted] = local.try_emplace(ti, params.maxCorrespondences);
-                        addCorrespondence(sample, patches[ti], hit, params, it->second);
+                        addCorrespondence(sample, surfaces[ti], hit, params, it->second);
                     }
                 });
             completed.fetch_add(count, std::memory_order_relaxed);
@@ -469,7 +469,7 @@ struct FitResult {
     std::string rejection;
 };
 
-FitResult fitPair(const std::vector<Correspondence>& values, const PatchOverlapParams& params, std::uint64_t seed)
+FitResult fitPair(const std::vector<Correspondence>& values, const SurfaceOverlapParams& params, std::uint64_t seed)
 {
     FitResult result;
     if (values.size() < params.minInliers) {
@@ -578,13 +578,13 @@ FitResult fitPair(const std::vector<Correspondence>& values, const PatchOverlapP
     return result;
 }
 
-// Dense 3D agreement of one patch against another under a pose mapping
+// Dense 3D agreement of one surface against another under a pose mapping
 // target UV -> seed UV: {overlap samples, agreements, total samples}.
 struct Consistency {
     std::size_t samples = 0, agreements = 0, total = 0;
 };
 
-Consistency overlapConsistency(const LoadedPatch& seed, const LoadedPatch& target, const Pose& targetToSeed,
+Consistency overlapConsistency(const LoadedSurface& seed, const LoadedSurface& target, const Pose& targetToSeed,
                                double agreementRadius)
 {
     Consistency result;
@@ -601,14 +601,14 @@ Consistency overlapConsistency(const LoadedPatch& seed, const LoadedPatch& targe
     return result;
 }
 
-bool bboxOverlap(const LoadedPatch& a, const LoadedPatch& b, double pad)
+bool bboxOverlap(const LoadedSurface& a, const LoadedSurface& b, double pad)
 {
     for (int i = 0; i < 3; ++i)
         if (a.bboxLow[i] - pad > b.bboxHigh[i] || b.bboxLow[i] - pad > a.bboxHigh[i]) return false;
     return true;
 }
 
-void validateParams(const PatchOverlapParams& params)
+void validateParams(const SurfaceOverlapParams& params)
 {
     auto positive = [](double value, const char* name) {
         if (!(value > 0.0) || !std::isfinite(value))
@@ -636,78 +636,78 @@ void validateParams(const PatchOverlapParams& params)
 
 }  // namespace
 
-DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
-                                 const PatchOverlapParams& params, const std::atomic_bool* cancel)
+DetectorReport linkSurfaceOverlaps(objects::ObjectStore& db,
+                                 const SurfaceOverlapParams& params, const std::atomic_bool* cancel)
 {
     validateParams(params);
     Profile profile;
     const auto& progress = params.progress;
-    objects::util::reportProgress(progress, "selecting stored patches");
+    objects::util::reportProgress(progress, "selecting stored surfaces");
     DetectorReport report;
     auto cancelled = [&] { return cancel && cancel->load(); };
 
     detail::StoredGeometry inputs(db);
-    const auto objects = inputs.select("patch", params.patchUuids);
+    const auto objects = inputs.select("surface", params.surfaceUuids);
 
-    std::vector<LoadedPatch> patches;
+    std::vector<LoadedSurface> surfaces;
     size_t loadedCount = 0;
     for (const auto& object : objects) {
-        objects::util::reportProgress(progress, "loading patches", loadedCount++, objects.size(), object.uuid);
+        objects::util::reportProgress(progress, "loading surfaces", loadedCount++, objects.size(), object.uuid);
         if (cancelled()) {
-            report.problems.push_back("patch-overlap: cancelled during loading");
+            report.problems.push_back("surface-overlap: cancelled during loading");
             return report;
         }
         PhaseTimer loadingTimer(profile.enabled ? &profile.loading : nullptr);
-        if (auto loaded = loadPatch(inputs, object, params, report))
-            patches.push_back(std::move(*loaded));
+        if (auto loaded = loadSurface(inputs, object, params, report))
+            surfaces.push_back(std::move(*loaded));
     }
-    objects::util::reportProgress(progress, "loading patches", objects.size(), objects.size());
-    report.objectsConsidered = int64_t(patches.size());
-    for (const auto& patch : patches) profile.samples += patch.samples.size();
+    objects::util::reportProgress(progress, "loading surfaces", objects.size(), objects.size());
+    report.objectsConsidered = int64_t(surfaces.size());
+    for (const auto& surface : surfaces) profile.samples += surface.samples.size();
 
-    // Triangle-accurate spatial index over every loaded patch, as in
+    // Triangle-accurate spatial index over every loaded surface, as in
     // vc_seg_add_overlap; each seed sample queries all eligible targets at once.
-    objects::util::reportProgress(progress, "building patch spatial index");
-    PatchIndex index;
+    objects::util::reportProgress(progress, "building surface spatial index");
+    SurfaceIndex index;
 
     {
-        std::vector<PatchIndex::SurfacePtr> surfaces;
-        surfaces.reserve(patches.size());
-        for (const auto& patch : patches) surfaces.push_back(patch.surface);
+        std::vector<SurfaceIndex::SurfacePtr> grids;
+        grids.reserve(surfaces.size());
+        for (const auto& surface : surfaces) grids.push_back(surface.grid);
         PhaseTimer indexTimer(profile.enabled ? &profile.index : nullptr);
-        index.rebuild(surfaces);
+        index.rebuild(grids);
     }
 
     const double agreementRadius = params.tolerance + params.uvInlierTolerance;
     std::vector<LinkCandidate> candidates;
     std::map<std::string, std::size_t> rejections;
-    const uint64_t totalPairs = patches.empty() ? 0 : uint64_t(patches.size()) * (patches.size() - 1) / 2;
+    const uint64_t totalPairs = surfaces.empty() ? 0 : uint64_t(surfaces.size()) * (surfaces.size() - 1) / 2;
     uint64_t processedPairs = 0;
-    objects::util::reportProgress(progress, "checking patch pairs", 0, totalPairs);
-    for (std::size_t si = 0; si < patches.size(); ++si) {
-        const LoadedPatch& seed = patches[si];
-        const auto item = "patch " + std::to_string(si + 1) + "/" + std::to_string(patches.size());
-        const auto patchProgress = objects::util::subtaskProgress(progress, "checking patch pairs",
+    objects::util::reportProgress(progress, "checking surface pairs", 0, totalPairs);
+    for (std::size_t si = 0; si < surfaces.size(); ++si) {
+        const LoadedSurface& seed = surfaces[si];
+        const auto item = "surface " + std::to_string(si + 1) + "/" + std::to_string(surfaces.size());
+        const auto surfaceProgress = objects::util::subtaskProgress(progress, "checking surface pairs",
             processedPairs, totalPairs, item);
         std::vector<size_t> targets;
-        for (size_t ti = si + 1; ti < patches.size(); ++ti)
-            if (bboxOverlap(seed, patches[ti], params.tolerance)) targets.push_back(ti);
+        for (size_t ti = si + 1; ti < surfaces.size(); ++ti)
+            if (bboxOverlap(seed, surfaces[ti], params.tolerance)) targets.push_back(ti);
         profile.bboxPairs += targets.size();
         auto matches = [&] {
             PhaseTimer timer(profile.enabled ? &profile.harvest : nullptr);
-            return harvestTargets(seed, patches, targets, index, params, cancel, profile, patchProgress);
+            return harvestTargets(seed, surfaces, targets, index, params, cancel, profile, surfaceProgress);
         }();
         if (cancelled()) {
-            report.problems.push_back("patch-overlap: cancelled");
+            report.problems.push_back("surface-overlap: cancelled");
             return report;
         }
-        objects::util::reportProgress(patchProgress, "fitting overlaps");
+        objects::util::reportProgress(surfaceProgress, "fitting overlaps");
         for (auto& [ti, collector] : matches) {
             if (cancelled()) {
-                report.problems.push_back("patch-overlap: cancelled");
+                report.problems.push_back("surface-overlap: cancelled");
                 return report;
             }
-            const LoadedPatch& target = patches[ti];
+            const LoadedSurface& target = surfaces[ti];
             const auto correspondences = collector.take();
             if (correspondences.size() < params.minInliers) continue;
             const std::uint64_t pairSeed = splitmix64(std::uint64_t(si + 1) * 0x9E3779B9ULL ^ std::uint64_t(ti + 1));
@@ -766,18 +766,18 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
             candidate.meta = nlohmann::json{{"fit", std::move(fitMeta)}}.dump();
             candidates.push_back(std::move(candidate));
         }
-        processedPairs += patches.size() - si - 1;
-        objects::util::reportProgress(progress, "checking patch pairs", processedPairs, totalPairs, item);
+        processedPairs += surfaces.size() - si - 1;
+        objects::util::reportProgress(progress, "checking surface pairs", processedPairs, totalPairs, item);
     }
-    objects::util::reportProgress(progress, "checking patch pairs", totalPairs, totalPairs);
+    objects::util::reportProgress(progress, "checking surface pairs", totalPairs, totalPairs);
     for (const auto& [reason, count] : rejections)
-        report.problems.push_back("patch-overlap: " + std::to_string(count) + " pair(s) rejected: " + reason);
+        report.problems.push_back("surface-overlap: " + std::to_string(count) + " pair(s) rejected: " + reason);
 
     StaleEdgeScope scope{{params.edgeKind}, {}};
-    for (const auto& patch : patches) scope.objectUuids.push_back(patch.uuid);
+    for (const auto& surface : surfaces) scope.objectUuids.push_back(surface.uuid);
     auto txn = db.write();
-    DetectorReport committed = detail::commitStoredCandidates(db, inputs, txn, kPatchOverlapDetector, 1, candidates, params.replaceStalePending, &scope, progress);
-    if (cancelled()) throw std::runtime_error("patch-overlap: cancelled before commit");
+    DetectorReport committed = detail::commitStoredCandidates(db, inputs, txn, kSurfaceOverlapDetector, 1, candidates, params.replaceStalePending, &scope, progress);
+    if (cancelled()) throw std::runtime_error("surface-overlap: cancelled before commit");
     txn.commit();
     report.candidatesFound = committed.candidatesFound;
     report.edgesCreated = committed.edgesCreated;

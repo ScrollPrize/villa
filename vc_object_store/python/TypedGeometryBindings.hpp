@@ -34,16 +34,16 @@ inline void bindTypedGeometry(nb::module_& m)
         .def_rw("points", &vg::Track::points)
         .def("validate", &vg::Track::validate)
         .def("length", &vg::Track::length);
-    nb::class_<vg::Patch>(m, "Patch")
-        .def(nb::init<int64_t, int64_t, std::array<double, 2>, std::vector<vg::PatchPoint>>(),
+    nb::class_<vg::Surface>(m, "Surface")
+        .def(nb::init<int64_t, int64_t, std::array<double, 2>, std::vector<vg::SurfacePoint>>(),
              nb::arg("rows"), nb::arg("columns"), nb::arg("scale"), nb::arg("points"))
-        .def_rw("rows", &vg::Patch::rows)
-        .def_rw("columns", &vg::Patch::columns)
-        .def_rw("scale", &vg::Patch::scale)
-        .def_rw("points", &vg::Patch::points)
-        .def("validate", &vg::Patch::validate)
-        .def("vertex", &vg::Patch::vertex, nb::arg("row"), nb::arg("column"), nb::rv_policy::copy)
-        .def("valid", &vg::Patch::valid, nb::arg("row"), nb::arg("column"));
+        .def_rw("rows", &vg::Surface::rows)
+        .def_rw("columns", &vg::Surface::columns)
+        .def_rw("scale", &vg::Surface::scale)
+        .def_rw("points", &vg::Surface::points)
+        .def("validate", &vg::Surface::validate)
+        .def("vertex", &vg::Surface::vertex, nb::arg("row"), nb::arg("column"), nb::rv_policy::copy)
+        .def("valid", &vg::Surface::valid, nb::arg("row"), nb::arg("column"));
 
     nb::class_<vo::GeometryView>(m, "GeometryView")
         .def_prop_ro("revision", [](const vo::GeometryView& self) { return geometryToPy(self.revision()); })
@@ -64,15 +64,15 @@ inline void bindTypedGeometry(nb::module_& m)
         .def("__len__", &vo::TrackView::size)
         .def("points", &vo::TrackView::points, nb::arg("start"), nb::arg("count"), nb::call_guard<nb::gil_scoped_release>())
         .def("load", &vo::TrackView::load, nb::call_guard<nb::gil_scoped_release>());
-    nb::class_<vo::PatchView, vo::GeometryView>(m, "PatchView")
-        .def_prop_ro("rows", &vo::PatchView::rows)
-        .def_prop_ro("columns", &vo::PatchView::columns)
-        .def_prop_ro("scale", &vo::PatchView::scale)
-        .def("vertex", &vo::PatchView::vertex, nb::arg("row"), nb::arg("column"), nb::call_guard<nb::gil_scoped_release>())
-        .def("valid", &vo::PatchView::valid, nb::arg("row"), nb::arg("column"), nb::call_guard<nb::gil_scoped_release>())
-        .def("read_tile", &vo::PatchView::readTile, nb::arg("row"), nb::arg("column"),
+    nb::class_<vo::SurfaceView, vo::GeometryView>(m, "SurfaceView")
+        .def_prop_ro("rows", &vo::SurfaceView::rows)
+        .def_prop_ro("columns", &vo::SurfaceView::columns)
+        .def_prop_ro("scale", &vo::SurfaceView::scale)
+        .def("vertex", &vo::SurfaceView::vertex, nb::arg("row"), nb::arg("column"), nb::call_guard<nb::gil_scoped_release>())
+        .def("valid", &vo::SurfaceView::valid, nb::arg("row"), nb::arg("column"), nb::call_guard<nb::gil_scoped_release>())
+        .def("read_tile", &vo::SurfaceView::readTile, nb::arg("row"), nb::arg("column"),
              nb::arg("rows"), nb::arg("columns"), nb::call_guard<nb::gil_scoped_release>())
-        .def("load", &vo::PatchView::load, nb::call_guard<nb::gil_scoped_release>());
+        .def("load", &vo::SurfaceView::load, nb::call_guard<nb::gil_scoped_release>());
     nb::class_<vo::GeometrySnapshot>(m, "GeometrySnapshot")
         .def("__enter__", [](nb::object self) {
             if (!nb::cast<vo::GeometrySnapshot&>(self).active()) throw std::runtime_error("geometry snapshot is closed");
@@ -84,7 +84,7 @@ inline void bindTypedGeometry(nb::module_& m)
         .def("point_collection", &vo::GeometrySnapshot::pointCollection, nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>())
         .def("fiber", &vo::GeometrySnapshot::fiber, nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>())
         .def("track", &vo::GeometrySnapshot::track, nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>())
-        .def("patch", &vo::GeometrySnapshot::patch, nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>())
+        .def("surface", &vo::GeometrySnapshot::surface, nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>())
         .def("geometry", &vo::GeometrySnapshot::geometry, nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>());
 }
 } // namespace vc::python

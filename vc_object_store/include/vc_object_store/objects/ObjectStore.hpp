@@ -31,7 +31,7 @@ struct FiberDetail {
     std::optional<std::array<double, 6>> bbox;  // minx,miny,minz,maxx,maxy,maxz
 };
 
-struct PatchDetail {
+struct SurfaceDetail {
     int64_t gridWidth = 0;
     int64_t gridHeight = 0;
     std::array<double, 2> scale{0.0, 0.0};  // column and row scale, as in tifxyz meta.json
@@ -72,13 +72,13 @@ struct ObjectRecord : RecordCommon {
     int64_t dataGeneration = 0;
     std::optional<std::string> dataChecksum;
     std::optional<FiberDetail> fiber;
-    std::optional<PatchDetail> patch;
+    std::optional<SurfaceDetail> surface;
     std::optional<TrackDetail> track;
 };
 
 struct PointReference {
     // Geometry array and point coordinates, excluding the final XYZ axis:
-    // control_points:[5], line_points:[12], points:[20,145] (patch row,col).
+    // control_points:[5], line_points:[12], points:[20,145] (surface row,col).
     // point_ids:[42] addresses stable point ID 42 in a point_collection.
     std::string array;
     std::vector<int64_t> index;
@@ -412,7 +412,7 @@ public:
                        const std::optional<std::string>& sourceRevision = std::nullopt);
     void deleteObject(WriteTxn& txn, const std::string& uuid);  // fails while edges or retained geometry reference it
 
-    // Create geometry, or replace a patch; sequences use structural/sparse edits.
+    // Create geometry, or replace a surface; sequences use structural/sparse edits.
     // Creation consumes source point annotations into the immutable revision.
     // Null expectedRevision expects no geometry; stale writers fail. Every
     // affected edge requires an explicit retain/update/remove decision.
@@ -483,7 +483,7 @@ public:
     std::string geometryPointAnnotations(const Txn&, const std::string& revisionUuid,
         const std::string& arrayName) const;
 
-    // Dense row-major rectangle from any aligned patch array. Exact
+    // Dense row-major rectangle from any aligned surface array. Exact
     // bytes; handles tiled and linear layouts. Coordinates/counts are vertices.
     // Rectangle/range reads may reuse verified bytes on a pooled reader until
     // its next snapshot observes a commit. Writes always use fresh readers.
@@ -575,7 +575,7 @@ public:
     std::string exportJson(const Txn&, const JsonExportOptions& = {}) const;
     void importJson(WriteTxn&, const std::string&);
 
-    // Resolve patch/fiber/point_collection source UUIDs: verify storageRef, then
+    // Resolve surface/fiber/point_collection source UUIDs: verify storageRef, then
     // search datasetRoot (default: DB directory; also rebases relative hints).
     // Read JSON only; skip hidden/Zarr directories and directory symlinks. No cache
     // or writes. Return an absolute path or nullopt; ambiguity/traversal errors throw.

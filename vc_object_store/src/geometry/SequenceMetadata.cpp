@@ -79,7 +79,7 @@ SharedJson MetadataSnapshot::save() {
 SharedJson identityGet(sqlite3* db,const SharedJson& root,int64_t id) {return MetadataSnapshot(db,root).get(id);}
 SharedJson initialSequences(sqlite3* db, const GeometryData& data, SharedJson& source) {
     auto sequences = SharedJson::object();
-    if (data.kind == "patch") return sequences;
+    if (data.kind == "surface") return sequences;
     for (const auto& array : data.arrays) {
         if (array.name != "points" && array.name != "control_points" && array.name != "line_points") continue;
         const auto count = array.shape.at(0);

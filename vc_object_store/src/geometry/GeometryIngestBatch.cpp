@@ -17,7 +17,7 @@ void normalizeMetadata(GeometrySource& p, const std::string& coordinateContext)
     eraseSourceGeometryCoordinates(source);
     for (const auto* field : {"uuid", "name", "type", "version", "branches", "adjacent_branches", "windings_linked"}) source.erase(field);
     if (source.contains("tags") && source["tags"].is_array()) source.erase("tags");
-    if (p.object.kind == "patch") for (const auto* field : {"scale", "bbox", "tiff_dimensions", "format"}) source.erase(field);
+    if (p.object.kind == "surface") for (const auto* field : {"scale", "bbox", "tiff_dimensions", "format"}) source.erase(field);
     if (p.object.kind == "fiber") for (const auto* field : {"width", "width_gap_fraction", "optimization_mode"}) source.erase(field);
     if (p.object.kind == "fiber" && source.contains("hv_classification")) {
         source["hv_classification"].erase("manual_tag");
@@ -68,7 +68,7 @@ int64_t detail::ingestGeometryBatch(ObjectStore& db, WriteTxn& write, std::vecto
             metadata.value("coordinates", Json::object()), incoming["coordinates"]);
         record.meta = metadata.dump();
         if (p.object.fiber) record.fiber = p.object.fiber;
-        if (p.object.patch) record.patch = p.object.patch;
+        if (p.object.surface) record.surface = p.object.surface;
         if (p.object.track) record.track = p.object.track;
         db.upsertObject(write, record);
         db.putGeometry(write, p.object.uuid, p.geometry);
