@@ -111,4 +111,25 @@ bool abfFlattenInPlace(QuadSurface& surface, const ABFConfig& config = {});
  */
 QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig& config = {});
 
+/**
+ * @brief Grid cells per voxel along (cols, rows), measured from the points.
+ *
+ * Computed as 1 / median 3D distance between valid horizontally (x) or
+ * vertically (y) adjacent grid points (sampled). An axis with no valid
+ * adjacent pair returns 0. For a tifxyz with step 20 this is 0.05, the
+ * value meta.json "scale" should hold (issue #1379).
+ */
+cv::Vec2f measuredGridScale(const cv::Mat_<cv::Vec3f>& points);
+
+/** Largest output grid abfFlattenToNewSurface will allocate (12 GB of Vec3f). */
+inline constexpr double kAbfMaxOutputCells = 1.0e9;
+
+/**
+ * @brief Output grid size for a UV range at a given scale (cells per voxel).
+ *
+ * Returns false (and logs) when the grid would exceed kAbfMaxOutputCells or
+ * overflow int, instead of letting OpenCV fail a huge allocation.
+ */
+bool abfOutputGridSize(const cv::Vec2f& uvRange, const cv::Vec2f& scale, int& gridW, int& gridH);
+
 } // namespace vc

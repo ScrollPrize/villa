@@ -78,6 +78,8 @@ vc_add_test(NAME test_omp_thread_point_collection)
 
 vc_add_test(NAME test_surface_area_units)
 
+vc_add_test(NAME test_abf_grid_scale LIBS doctest::doctest vc_core vc_flattening)
+
 vc_add_test(NAME test_voxel_size_metadata)
 
 vc_add_test(NAME test_tifxyz_identity)

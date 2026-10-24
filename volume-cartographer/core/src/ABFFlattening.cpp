@@ -2061,6 +2061,53 @@ static float triangleStretchMax(const cv::Vec3f& p0, const cv::Vec3f& p1, const 
     return std::max({s01, s12, s20});
 }
 
+cv::Vec2f measuredGridScale(const cv::Mat_<cv::Vec3f>& points)
+{
+    std::vector<float> dx;
+    std::vector<float> dy;
+    const auto valid = [](const cv::Vec3f& p) { return p[0] != -1.f && std::isfinite(p[0]); };
+    const int stride = std::max(1, std::min(points.rows, points.cols) / 256);
+    for (int row = 0; row < points.rows; row += stride) {
+        for (int col = 0; col < points.cols; col += stride) {
+            const cv::Vec3f& p = points(row, col);
+            if (!valid(p)) {
+                continue;
+            }
+            if (col + 1 < points.cols && valid(points(row, col + 1))) {
+                dx.push_back(static_cast<float>(cv::norm(points(row, col + 1) - p)));
+            }
+            if (row + 1 < points.rows && valid(points(row + 1, col))) {
+                dy.push_back(static_cast<float>(cv::norm(points(row + 1, col) - p)));
+            }
+        }
+    }
+    const auto inverseMedian = [](std::vector<float>& v) -> float {
+        if (v.empty()) {
+            return 0.f;
+        }
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        const float m = v[v.size() / 2];
+        return m > 1e-6f ? 1.f / m : 0.f;
+    };
+    return {inverseMedian(dx), inverseMedian(dy)};
+}
+
+bool abfOutputGridSize(const cv::Vec2f& uvRange, const cv::Vec2f& scale, int& gridW, int& gridH)
+{
+    const double gridWd = std::ceil(static_cast<double>(uvRange[0]) * scale[0]) + 1.0;
+    const double gridHd = std::ceil(static_cast<double>(uvRange[1]) * scale[1]) + 1.0;
+    if (!std::isfinite(gridWd) || !std::isfinite(gridHd) || gridWd * gridHd > kAbfMaxOutputCells ||
+        gridWd > std::numeric_limits<int>::max() || gridHd > std::numeric_limits<int>::max()) {
+        std::cerr << "ABF++: refusing output grid " << gridWd << " x " << gridHd
+                  << " (input scale=" << scale[0] << "x" << scale[1]
+                  << "); check the scale field in meta.json" << std::endl;
+        return false;
+    }
+    gridW = std::max(2, static_cast<int>(gridWd));
+    gridH = std::max(2, static_cast<int>(gridHd));
+    return true;
+}
+
 QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig& config) {
     // Step 1: Compute flattened UVs
     cv::Mat_<cv::Vec2f> uvs = abfFlatten(surface, config);
@@ -2270,8 +2317,37 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
     float inputScaleX = surface._scale[0];
     float inputScaleY = surface._scale[1];
 
-    int gridW = std::max(2, static_cast<int>(std::ceil(uvRange[0] * inputScaleX)) + 1);
-    int gridH = std::max(2, static_cast<int>(std::ceil(uvRange[1] * inputScaleY)) + 1);
+    // Guard against scale metadata that disagrees with the grid it describes
+    // (issue #1379: a shell stored the step ~20 instead of 1/step 0.05, so the
+    // output grid became 361753 x 303196 and OpenCV tried to allocate 1.3 TB).
+    // The measured value is grid cells per voxel = 1 / median adjacent 3D spacing.
+    {
+        const cv::Vec2f measured = measuredGridScale(*srcPoints);
+        const auto disagrees = [](float declared, float measuredAxis) {
+            if (!(measuredAxis > 0.f) || !std::isfinite(measuredAxis)) {
+                return false;
+            }
+            if (!(declared > 0.f) || !std::isfinite(declared)) {
+                return true;
+            }
+            const float ratio = declared / measuredAxis;
+            return ratio > 4.f || ratio < 0.25f;
+        };
+        if (disagrees(inputScaleX, measured[0]) || disagrees(inputScaleY, measured[1])) {
+            std::cerr << "ABF++: meta.json scale [" << inputScaleX << ", " << inputScaleY
+                      << "] disagrees with the measured grid density [" << measured[0]
+                      << ", " << measured[1] << "] cells/voxel; using the measured value"
+                      << " (see tifxyz_format.md: scale = 1/step)" << std::endl;
+            inputScaleX = measured[0] > 0.f ? measured[0] : inputScaleX;
+            inputScaleY = measured[1] > 0.f ? measured[1] : inputScaleY;
+        }
+    }
+
+    int gridW = 0;
+    int gridH = 0;
+    if (!abfOutputGridSize(uvRange, cv::Vec2f(inputScaleX, inputScaleY), gridW, gridH)) {
+        return nullptr;
+    }
 
     std::cout << "ABF++: Creating output grid " << gridW << " x " << gridH
               << " (input scale=" << inputScaleX << "x" << inputScaleY
@@ -2400,8 +2476,9 @@ QuadSurface* abfFlattenToNewSurface(const QuadSurface& surface, const ABFConfig&
 
     // Step 6: Use input scale for output
     // The scale determines how gen() upscales the grid. Using the same scale
-    // as input ensures consistent rendering behavior.
-    cv::Vec2f outScale = surface._scale;
+    // the grid was sized with (the input scale, or the measured one when the
+    // input's meta.json disagreed with its points) keeps rendering consistent.
+    cv::Vec2f outScale(inputScaleX, inputScaleY);
 
     QuadSurface* result = new QuadSurface(outPoints, outScale);
 
