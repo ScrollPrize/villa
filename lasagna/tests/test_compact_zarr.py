@@ -77,6 +77,28 @@ def test_output_resolution(tmp_path):
     assert resolve_output(old)[1] == "legacy"
 
 
+@pytest.mark.parametrize("factor", [0.5, 2.0])
+def test_coordinate_scale_preserves_output_grid_and_boundary_chunks(tmp_path, factor):
+    p = product("normal", ["grad_mag", "nx", "ny"], level=1)
+    root = tmp_path / "scaled.zarr"
+    output = CompactOutputAdapter(root=root, products=(p,), n_levels=3,
+                                  validity_channel="grad_mag")
+    kwargs = dict(base_shape_zyx=(16, 16, 16), ome_chunk=4, source_to_base=factor)
+    output.prepare(**kwargs)
+    values = np.full((4, 4, 4), 128, np.uint8)
+    output.write_products_chunk([(p, {c: values for c in p.channel_names})],
+                                chunk_origin_zyx=(4, 4, 4))
+    array = zarr.open_array(str(root / "sd1/1"), mode="r")
+    assert array.shape == (3, 8, 8, 8)
+    assert np.all(array[:, 4:, 4:, 4:] == 128)
+    output.prepare(**kwargs)  # Resume uses the same dimensions.
+    output.build_pyramids(workers=1)
+    assert zarr.open_array(str(root / "sd1/2"), mode="r").shape == (3, 4, 4, 4)
+    attrs = json.loads((root / "sd1/.zattrs").read_text())
+    assert attrs["multiscales"][0]["datasets"][0]["coordinateTransformations"][0]["scale"] == [1, factor*2, factor*2, factor*2]
+    assert LasagnaVolume.load(root).source_to_base == factor
+
+
 def test_compact_options_and_resume_encoding(tmp_path):
     p = product("fiber", ["presence", "nx", "ny"])
     width = product("width", ["width"], dtype=np.float32)
@@ -161,7 +183,8 @@ def test_compact_demand_complete_and_warm_resume(tmp_path):
 
 
 @pytest.mark.parametrize("with_distance", [False, True])
-def test_compact_lasagna_full_volume_matches_legacy(tmp_path, monkeypatch, with_distance):
+@pytest.mark.parametrize("source_to_base", [1., 2.])
+def test_compact_lasagna_full_volume_matches_legacy(tmp_path, monkeypatch, with_distance, source_to_base):
     import torch
     from lasagna import preprocess_cos_omezarr as module
     class Model:
@@ -182,7 +205,8 @@ def test_compact_lasagna_full_volume_matches_legacy(tmp_path, monkeypatch, with_
         module.run_preprocess_3d(input_path=str(source), output_path=str(dest), output_format=fmt,
             unet3d_checkpoint="unused.pt", device="cpu", crop_xyzwhd=None, tile_size=8, overlap=0, border=0,
             cos_scaledown=1, scaledown=2, base_ref=str(source), base_scale=0, n_levels=3, ome_chunk=4,
-            flush_workers=0, accumulator_workers=0, pred_dt_path=str(source) if with_distance else None)
+            flush_workers=0, accumulator_workers=0, pred_dt_path=str(source) if with_distance else None,
+            source_to_base=source_to_base)
     packed_root = tmp_path / "compact/output.zarr"
     manifest = LasagnaVolume.load(packed_root)
     assert manifest.validity_channel == "grad_mag"

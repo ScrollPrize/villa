@@ -248,9 +248,13 @@ new Fiber prediction channel meanings.
 ## Arrays, chunks, and OME metadata
 
 For level `L`, every resolution-group array has axes `[c, z, y, x]` and a
-spatial sampling interval `source_to_base * 2**L` in base voxels. Its shape
-uses the existing full-extent rounding convention: for each base dimension
-`B`, `max(1, ceil(B / (source_to_base * 2**L)))`.
+spatial sampling interval `source_to_base * 2**L` in base voxels. Array shapes
+must match the inference coordinator's output grid. The full-volume writer
+uses the existing full-extent rounding convention: for each supplied reference
+dimension `B`, `max(1, ceil(B / 2**L))`. As in legacy output,
+`--source-to-base` is a coordinate-metadata transform, not an additional
+resampling operation; it must not shrink these arrays. Readers obtain array
+extents from Zarr metadata rather than deriving them from the scale transform.
 
 For an array with `C` channels, chunks have shape `[C, cz, cy, cx]`, with
 positive spatial chunk dimensions chosen by the writer. This means one chunk

@@ -4,7 +4,6 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 import json
-import math
 import os
 from pathlib import Path
 import threading
@@ -190,9 +189,8 @@ class CompactOutputAdapter:
             datasets = []
             for level in range(n, self.n_levels):
                 shape = _omezarr_level_shape(base_shape_zyx, level)
-                # Absolute levels are relative to the manifest working grid.
-                if source_to_base != 1:
-                    shape = tuple(max(1, math.ceil(b / (source_to_base * 2**level))) for b in base_shape_zyx)
+                # Match the coordinator's grid; source_to_base transforms
+                # coordinates in metadata, not the array dimensions.
                 _create_array(group, str(level), (len(channels), *shape),
                               (len(channels), *(min(v, ome_chunk) for v in shape)), dtype, codec,
                               array_path=root / f"sd{n}" / str(level))
