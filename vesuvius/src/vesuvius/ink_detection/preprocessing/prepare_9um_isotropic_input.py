@@ -12,7 +12,11 @@ from numcodecs import Blosc
 import zarr
 
 from vesuvius.ink_detection.preprocessing.staged_write import publish_staged_output
-from vesuvius.ink_detection.volume_io import ZARR_V3, open_volume_root
+from vesuvius.ink_detection.volume_io import (
+    ZARR_V3,
+    open_volume_root,
+    require_pyramid_depth_scale,
+)
 from vesuvius.label_zarr import open_v2_group
 from vesuvius.utils.cli import HyphenUnderscoreParser
 
@@ -33,11 +37,18 @@ def centered_slice(length: int, requested: int) -> tuple[int, int]:
     return start, start + requested
 
 
-def open_source_array(path: str, level: str) -> zarr.Array:
+def open_source_array(
+    path: str,
+    level: str,
+    *,
+    check_depth_scale: bool = False,
+) -> zarr.Array:
     """Open a bare ZYX array or one named level from a local or remote group."""
     node = open_volume_root(path)
     if hasattr(node, "shape"):
         return node
+    if check_depth_scale:
+        require_pyramid_depth_scale(node, level, source=path)
     if level not in node:
         available = sorted(node.array_keys())
         raise KeyError(
@@ -80,7 +91,7 @@ def prepare_isotropic_input(
     workers: int = 8,
 ) -> Path:
     """Write the centered four-plane rounded-mean ZYX volume transactionally."""
-    source = open_source_array(input_zarr, level)
+    source = open_source_array(input_zarr, level, check_depth_scale=True)
     shape = tuple(int(value) for value in source.shape)
     if source.dtype != np.uint8 or len(shape) != 3:
         raise ValueError(f"Expected 3D uint8 source, got {shape} {source.dtype}")
