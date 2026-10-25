@@ -80,3 +80,45 @@ Bounds are not quantized.
 
 Tests are self-contained and do not require the volume-cartographer checkout or
 its fixture data.
+
+## Transformed geometry views
+
+Canonical geometry stays in its recorded volume. Request another coordinate frame
+explicitly; the object store resolves the registration and applies it while reading:
+
+```cpp
+auto snapshot = store.geometrySnapshot();
+auto surface = snapshot.surface(uuid).viewTransformedAt(targetVolume);
+auto tile = surface.readTile(row, column, rows, columns);
+// Equivalently, for any geometry kind:
+auto view = snapshot.viewTransformedAt(uuid, targetVolume);
+```
+
+```python
+with store.geometry_snapshot() as snapshot:
+    view = snapshot.surface(uuid).view_transformed_at(target_volume)
+    tile = view.read_tile(row=0, column=0, rows=64, columns=64)
+    # Fiber, track, point_collection and umbilicus accessors support the same call.
+    fiber = snapshot.fiber(fiber_uuid).view_transformed_at(target_volume)
+    controls = fiber.points("control_points", start=0, count=2)
+```
+
+Views retain the canonical revision and snapshot lifetime. Surface validity is
+separate from transformed coordinates; track views return floating coordinates.
+`coordinateEdits` and `surfaceEdits` map changed positions back to canonical
+storage, preserving untouched values. Track edits round to nearest integers,
+with ties away from zero. Call `validateForWrite` in the checked write transaction
+before applying edits; changed geometry or registrations invalidate the view.
+Alternatively, `writeCoordinates` and `writeSurface` validate and apply an edit in
+one call. Python exposes these as `store.edit_transformed_coordinates(view, ...)`
+and `store.edit_transformed_surface(view, ...)`.
+
+`availableTransforms(txn, uuid)` and each geometry view’s `availableTransforms()`
+(`available_transforms` in Python) list reachable
+volumes and ambiguity. Incompatible or ambiguous view requests fail explicitly.
+Registrations and path choices are revisioned store objects. Open Data registrations
+can be supplied through `OpenOptions::catalogTransforms`, or `catalog=catalog`
+when opening a Python store with a `vc_reader.Catalog`. Catalog parsing, affine
+composition and path resolution are implemented in vc_reader's native library,
+shared by its Python and C++ consumers. Target-volume length filters measure the
+transformed polyline, including nonuniform scaling and shear.

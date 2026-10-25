@@ -1,8 +1,22 @@
+set(VC_OBJECT_STORE_READER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../../vc_reader" CACHE PATH "vc_reader source checkout")
+if(NOT TARGET vc_reader::catalog)
+    find_package(vc_reader CONFIG QUIET)
+endif()
+if(NOT TARGET vc_reader::catalog)
+    set(VC_READER_BUILD_PYTHON OFF)
+    set(VC_READER_BUILD_READER ${VC_OBJECT_STORE_BUILD_LINKING})
+    # This adapter uses CPU normals; an explicit reader CUDA option is still honored.
+    if(NOT DEFINED VC_READER_ENABLE_CUDA)
+        set(VC_READER_ENABLE_CUDA OFF)
+    endif()
+    add_subdirectory("${VC_OBJECT_STORE_READER_SOURCE}" "${CMAKE_CURRENT_BINARY_DIR}/reader")
+endif()
+
 # Shared owned geometry and operations; no SQLite, OpenCV or application types.
 add_library(vc_geometry STATIC geometry/TypedGeometry.cpp)
 target_include_directories(vc_geometry PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_geometry PRIVATE nlohmann_json::nlohmann_json)
+target_link_libraries(vc_geometry PRIVATE nlohmann_json::nlohmann_json vc_reader::catalog)
 target_compile_features(vc_geometry PUBLIC cxx_std_20)
 
 # SFTP v3 client over the system OpenSSH program; no SQLite or application types.
@@ -25,6 +39,7 @@ add_library(vc_objects STATIC
     internal/JsonFields.cpp
     formats/FiberJson.cpp
     Database.cpp
+    VolumeTransforms.cpp
     ObjectStoreSession.cpp
     Transactions.cpp
     History.cpp
@@ -67,7 +82,7 @@ if(TARGET SQLite3::SQLite3)
 else()
     target_link_libraries(vc_objects PUBLIC SQLite::SQLite3)
 endif()
-target_link_libraries(vc_objects PUBLIC vc_geometry vc_sftp nlohmann_json::nlohmann_json PRIVATE OpenSSL::Crypto zstd::libzstd)
+target_link_libraries(vc_objects PUBLIC vc_geometry vc_sftp vc_reader::catalog nlohmann_json::nlohmann_json PRIVATE OpenSSL::Crypto zstd::libzstd)
 target_compile_features(vc_objects PUBLIC cxx_std_20)
 add_library(vc_object_store::vc_objects ALIAS vc_objects)
 add_library(vc_object_store::vc_geometry ALIAS vc_geometry)
@@ -79,19 +94,6 @@ find_package(TIFF REQUIRED)
 find_package(CURL REQUIRED)
 # vc_reader's HTTP client fetches remote sources; its Zarr reader is only needed
 # by the relationship detectors.
-set(VC_OBJECT_STORE_READER_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/../../vc_reader" CACHE PATH "vc_reader source checkout")
-if(NOT TARGET vc_reader::headers)
-    find_package(vc_reader CONFIG QUIET)
-endif()
-if(NOT TARGET vc_reader::headers)
-    set(VC_READER_BUILD_PYTHON OFF)
-    set(VC_READER_BUILD_READER ${VC_OBJECT_STORE_BUILD_LINKING})
-    # This adapter uses CPU normals; an explicit reader CUDA option is still honored.
-    if(NOT DEFINED VC_READER_ENABLE_CUDA)
-        set(VC_READER_ENABLE_CUDA OFF)
-    endif()
-    add_subdirectory("${VC_OBJECT_STORE_READER_SOURCE}" "${CMAKE_CURRENT_BINARY_DIR}/reader")
-endif()
 add_library(vc_object_formats STATIC Tiff.cpp MemMap.cpp PackedTrackStore.cpp spatial/SurfaceGrid.cpp)
 add_library(vc_object_store::vc_object_formats ALIAS vc_object_formats)
 target_include_directories(vc_object_formats PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

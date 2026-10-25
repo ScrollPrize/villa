@@ -27,8 +27,10 @@ bool before(const SurfaceProximityHit& a, const SurfaceProximityHit& b)
 }
 }
 
-std::vector<SurfaceProximityHit> ObjectStore::nearestSurfaces(const ReadTxn& txn, const SurfaceProximityQuery& query) const
+std::vector<SurfaceProximityHit> ObjectStore::nearestSurfaces(const ReadTxn& txn, const SurfaceProximityQuery& requested) const
 {
+    auto query = requested;
+    if(query.volume&&!query.transforms) query.transforms=std::make_shared<VolumeTransforms>(volumeTransforms(txn));
     auto* db = static_cast<sqlite3*>(connection(txn));
     for (double x : query.point) if (!std::isfinite(x)) throw std::invalid_argument("surface proximity point must be finite");
     if (!std::isfinite(query.tolerance) || query.tolerance < 0)
@@ -36,17 +38,12 @@ std::vector<SurfaceProximityHit> ObjectStore::nearestSurfaces(const ReadTxn& txn
     std::vector<SurfaceProximityHit> result;
     if (query.volume) {
         if (query.coordinates) throw std::invalid_argument("volume and coordinates filters are exclusive");
-        for (const auto& frame : volumeFrames(db, *query.volume, std::string("surface"), false)) {
+        for (const auto& frame : volumeFrames(db, *query.volume, std::string("surface"), false, query.transforms.get())) {
             auto stored = query;
             stored.volume.reset();
             stored.coordinates = frame.coordinates;
-            for (auto& x : stored.point) x /= frame.toVolume;
-            stored.tolerance /= frame.toVolume;
-            for (auto hit : nearestSurfaces(txn, stored)) {
-                for (auto& x : hit.point) x *= frame.toVolume;
-                hit.distance *= frame.toVolume;
-                result.push_back(std::move(hit));
-            }
+            stored.toTarget=frame.mapping;
+            for (auto hit : nearestSurfaces(txn, stored)) result.push_back(std::move(hit));
         }
         std::sort(result.begin(), result.end(), before);
         return result;
@@ -64,6 +61,7 @@ std::vector<SurfaceProximityHit> ObjectStore::nearestSurfaces(const ReadTxn& txn
         box[axis] = query.point[axis] - query.tolerance;
         box[axis + 3] = query.point[axis] + query.tolerance;
     }
+    const auto sourceBox=query.toTarget?transformBounds(box,query.toTarget->inverse()):box;
     std::string sql = "SELECT o.uuid,h.revision_uuid,b.row_start,b.col_start,b.row_count,b.col_count "
         "FROM spatial_regions_rtree r CROSS JOIN spatial_regions b ON b.id=r.id CROSS JOIN objects o ON o.id=b.object_id "
         "JOIN geometry_heads h ON h.object_uuid=o.uuid LEFT JOIN object_lifecycle l ON l.object_id=o.id "
@@ -72,7 +70,7 @@ std::vector<SurfaceProximityHit> ObjectStore::nearestSurfaces(const ReadTxn& txn
     if (query.coordinates) sql += coordinateFilterSql("o", "?7");
     sql += " ORDER BY o.uuid,b.row_start,b.col_start";
     Statement tiles(db, sql);
-    for (int i = 0; i < 6; ++i) tiles.bind(i + 1, box[i]);
+    for (int i = 0; i < 6; ++i) tiles.bind(i + 1, sourceBox[i]);
     if (query.coordinates) tiles.bind(7, coordinateFilterValue(*query.coordinates));
     if (includedIds) tiles.bind(8, *includedIds);
     const Vec3 p{query.point};
@@ -101,6 +99,7 @@ std::vector<SurfaceProximityHit> ObjectStore::nearestSurfaces(const ReadTxn& txn
         for (size_t i = 0; i < world.size(); ++i) {
             std::array<float, 3> q; copyScalars<float>(std::span(bytes).subspan(i * 12, 12), q);
             world[i] = {{q[0], q[1], q[2]}};
+            if(query.toTarget)world[i].v=query.toTarget->apply(world[i].v);
             usable[i] = vc::geometry::validSurfacePoint(q) && (!hasValid || valid[i]);
         }
         for (int64_t r = 0; r + 1 < rows; ++r)

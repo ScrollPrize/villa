@@ -1,4 +1,5 @@
 #pragma once
+#include "vc_object_store/objects/VolumeTransforms.hpp"
 
 // SQLite object database with immutable geometry and relationship metadata.
 
@@ -155,6 +156,7 @@ struct JournalEntry {
 };
 
 struct OpenOptions {
+    std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransforms;
     bool readOnly = false;
     int readerPoolSize = 4;
     int busyTimeoutMs = 5000;
@@ -193,17 +195,16 @@ struct ObjectSelection {
     // Exact declared coordinate system (JSON volume_uuid/scale_factor).
     // Missing declarations compare as null; absent filter matches all frames.
     std::optional<std::string> coordinates;
-    // Volume target, exclusive with coordinates: matches objects declared in
-    // this volume ID with a scale factor, across every such frame. bbox,
-    // minLength, afterLength and length_desc then use that volume's voxels,
-    // where volume length = stored length * (1 / scale_factor), the factor of
-    // geometryScaleToVolume(). length_desc ties order by stored length, then
-    // UUID. Returned records and region bounds keep their stored coordinates.
+    // Explicit target volume, exclusive with coordinates. Includes compatible
+    // registered frames. Bounds and length filters use target voxels; affine
+    // lengths are measured from the transformed polyline. Returned object
+    // records retain their canonical metadata. Spatial regions use target bounds.
     std::optional<std::string> volume;
     // With volume: also list objects not bound to it, after the bound ones in
     // UUID order (a cursor into them has afterUuid without afterLength).
     // Excluded when minLength is positive. Not valid for spatialRegions.
     bool includeUnbound = false;
+    std::shared_ptr<const VolumeTransforms> transforms;
 };
 struct EdgeSelection {
     std::optional<std::string> kind, tag;
@@ -362,6 +363,14 @@ public:
     ReadTxn read();
     // Typed, bounded geometry reads. Include store/GeometryViews.hpp to use.
     GeometrySnapshot geometrySnapshot();
+    VolumeTransforms volumeTransforms(const Txn&) const;
+    std::vector<vcr::catalog::TransformResolution> availableTransforms(const Txn&, const std::string& objectUuid) const;
+    // Exact polyline length after mapping to target voxels; reads bounded chunks.
+    double geometryLengthInVolume(const Txn&, const std::string& objectUuid, const std::string& target, double targetScale=1) const;
+    std::string registerVolumeTransform(WriteTxn&, const std::string& source, const std::string& target,
+        const VolumeAffine&, const std::string& name, const std::optional<std::string>& uuid = std::nullopt);
+    std::string chooseVolumeTransform(WriteTxn&, const std::string& source, const std::string& target,
+        const std::vector<std::string>& path);
     WriteTxn write();
     // Check supplied heads before editing; require every changed object/endpoint.
     // Commit publishes one revision per changed object. Missing expectations or

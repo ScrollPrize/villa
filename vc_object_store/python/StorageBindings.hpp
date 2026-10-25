@@ -1,3 +1,4 @@
+#include <vc_reader/catalog.hpp>
 #pragma once
 #include <set>
 #include <algorithm>
@@ -293,7 +294,7 @@ struct PyObjectStore {
 
     static PyObjectStore create(const std::string& path, const std::string& author,
                                              const std::optional<std::string>& hostname, int readerPoolSize,
-                                             size_t geometryCacheBytes, size_t spatialCacheBytes)
+                                             size_t geometryCacheBytes, size_t spatialCacheBytes, const nb::object& catalog)
     {
         vo::OpenOptions o;
         o.author = author;
@@ -301,6 +302,12 @@ struct PyObjectStore {
         o.readerPoolSize = readerPoolSize;
         o.geometryCacheBytes = geometryCacheBytes;
         o.spatialCacheBytes = spatialCacheBytes;
+        if(!catalog.is_none()) {
+            auto graph=std::make_shared<vcr::catalog::RegistrationGraph>();
+            const auto raw=nb::hasattr(catalog,"raw")?catalog.attr("raw"):catalog;
+            graph->addCatalog(vcr::catalog::parseOpenDataManifest(jsonDumps(raw)));
+            o.catalogTransforms=std::move(graph);
+        }
         PyObjectStore self;
         self.db = std::make_shared<vo::ObjectStore>(vo::ObjectStore::create(path, o));
         return self;
@@ -308,7 +315,7 @@ struct PyObjectStore {
 
     static PyObjectStore open(const std::string& path, const std::optional<std::string>& author,
                                            bool readOnly, const std::optional<std::string>& hostname,
-                                           int readerPoolSize, size_t geometryCacheBytes, size_t spatialCacheBytes)
+                                           int readerPoolSize, size_t geometryCacheBytes, size_t spatialCacheBytes, const nb::object& catalog)
     {
         vo::OpenOptions o;
         o.readOnly = readOnly;
@@ -317,6 +324,12 @@ struct PyObjectStore {
         o.readerPoolSize = readerPoolSize;
         o.geometryCacheBytes = geometryCacheBytes;
         o.spatialCacheBytes = spatialCacheBytes;
+        if(!catalog.is_none()) {
+            auto graph=std::make_shared<vcr::catalog::RegistrationGraph>();
+            const auto raw=nb::hasattr(catalog,"raw")?catalog.attr("raw"):catalog;
+            graph->addCatalog(vcr::catalog::parseOpenDataManifest(jsonDumps(raw)));
+            o.catalogTransforms=std::move(graph);
+        }
         PyObjectStore self;
         self.db = std::make_shared<vo::ObjectStore>(vo::ObjectStore::open(path, o));
         return self;

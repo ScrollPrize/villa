@@ -200,6 +200,16 @@ void bindMutations(nb::class_<T>& cls)
             return self.template withWrite<true>([&](vo::ObjectStore& db, vo::WriteTxn& txn) { return db.putGeometry(txn, uuid, data, expected, edits, vo::GeometryStorageOptions{surfaceTileSize}); });
         }, nb::arg("object_uuid"), nb::arg("geometry"), nb::arg("expected_revision") = std::nullopt,
            nb::arg("edge_edits") = nb::list(), nb::arg("surface_tile_size") = vo::GeometryStorageOptions{}.surfaceTileSize)
+        .def("edit_transformed_coordinates", [](T& self,const vo::TransformedGeometryView& view,
+            const std::string& array,int64_t start,const std::vector<vc::geometry::Point>& points,const nb::list& choices) {
+            const auto edges=edgeEditsFromPy(choices);
+            return self.template withWrite<true>([&](auto& db,auto& txn){return view.writeCoordinates(db,txn,array,start,points,edges);});
+        },nb::arg("view"),nb::arg("array"),nb::arg("start"),nb::arg("points"),nb::arg("edge_edits")=nb::list())
+        .def("edit_transformed_surface", [](T& self,const vo::TransformedGeometryView& view,
+            int64_t row,int64_t column,int64_t rows,int64_t columns,const std::vector<vc::geometry::SurfacePoint>& points,const nb::list& choices) {
+            const auto edges=edgeEditsFromPy(choices);
+            return self.template withWrite<true>([&](auto& db,auto& txn){return view.writeSurface(db,txn,row,column,rows,columns,points,edges);});
+        },nb::arg("view"),nb::arg("row"),nb::arg("column"),nb::arg("rows"),nb::arg("columns"),nb::arg("points"),nb::arg("edge_edits")=nb::list())
         .def("edit_geometry", [](T& self, const std::string& uuid, const nb::list& input,
                                 const std::string& expected, const nb::list& choices) {
             const auto edits = geometryEditsFromPy(input);
@@ -319,13 +329,13 @@ NB_MODULE(_native, m)
         .def_static("create", &PyObjectStore::create, nb::arg("path"), nb::arg("author"),
                     nb::arg("hostname") = std::nullopt, nb::arg("reader_pool_size") = 4,
                     nb::arg("geometry_cache_bytes") = 16 * 1024 * 1024,
-                    nb::arg("spatial_cache_bytes") = 16 * 1024 * 1024,
+                    nb::arg("spatial_cache_bytes") = 16 * 1024 * 1024, nb::arg("catalog") = nb::none(),
                     "Create a new object database at path (refuses existing files).")
         .def_static("open", &PyObjectStore::open, nb::arg("path"), nb::arg("author") = std::nullopt,
                     nb::arg("read_only") = false, nb::arg("hostname") = std::nullopt,
                     nb::arg("reader_pool_size") = 4,
                     nb::arg("geometry_cache_bytes") = 16 * 1024 * 1024,
-                    nb::arg("spatial_cache_bytes") = 16 * 1024 * 1024,
+                    nb::arg("spatial_cache_bytes") = 16 * 1024 * 1024, nb::arg("catalog") = nb::none(),
                     "Open an existing object database. author is required unless read_only.")
         .def("geometry_snapshot", [](PyObjectStore& self) {
             self.require();
@@ -824,6 +834,18 @@ NB_MODULE(_native, m)
             nb::arg("expected_revisions") = std::nullopt, nb::keep_alive<0, 1>(),
             "Batch write transaction context manager: 'with db.write() as w: w.upsert_object(...)'");
 
+    store.def("available_transforms",[](PyObjectStore& self,const std::string& uuid){
+        return volumeTransformsToPy(self.withRead([&](auto& db,auto& txn){return db.availableTransforms(txn,uuid);}));
+    },nb::arg("object_uuid"));
+    store.def("geometry_length_in_volume",readMethod<&vo::ObjectStore::geometryLengthInVolume>(),
+        nb::arg("object_uuid"),nb::arg("target_volume"),nb::arg("target_scale")=1.0);
+    store.def("register_volume_transform",[](PyObjectStore& self,const std::string& source,const std::string& target,const nb::object& rows,const std::string& name){
+        const auto matrix=vo::VolumeAffine::fromJson(nlohmann::json::parse(jsonDumps(rows)));
+        return self.withWrite([&](auto& db,auto& txn){return db.registerVolumeTransform(txn,source,target,matrix,name);});
+    },nb::arg("source_volume"),nb::arg("target_volume"),nb::arg("matrix"),nb::arg("name")="volume registration");
+    store.def("choose_volume_transform",[](PyObjectStore& self,const std::string& source,const std::string& target,const std::vector<std::string>& path){
+        return self.withWrite([&](auto& db,auto& txn){return db.chooseVolumeTransform(txn,source,target,path);});
+    },nb::arg("source_volume"),nb::arg("target_volume"),nb::arg("path"));
     auto writer = nb::class_<PyObjectWriteTxn>(m, "WriteTransaction")
         .def("__enter__", [](nb::object self) {
             nb::cast<PyObjectWriteTxn&>(self).enter();

@@ -3,6 +3,7 @@
 #include "vc_object_store/objects/ObjectStore.hpp"
 
 namespace vc::objects {
+class TransformedGeometryView;
 namespace detail { struct GeometryReadState; struct GeometryViewState; }
 
 // Views share a read transaction and pin a geometry revision. Reads are bounded
@@ -10,6 +11,8 @@ namespace detail { struct GeometryReadState; struct GeometryViewState; }
 // views; otherwise they keep the snapshot alive. Thread-confined, like Txn.
 class GeometryView {
 public:
+    TransformedGeometryView viewTransformedAt(const std::string& targetVolume, double targetScale=1) const;
+    std::vector<vcr::catalog::TransformResolution> availableTransforms() const;
     const GeometryRevision& revision() const;
     const std::string& objectRevision() const;
 protected:
@@ -79,6 +82,49 @@ private:
 };
 using TypedGeometryView = std::variant<PointCollectionView, FiberView, TrackView, SurfaceView, UmbilicusView>;
 
+struct TransformedSurfaceTile {
+    int64_t rows=0, columns=0;
+    std::vector<geometry::Point> points;
+    std::vector<uint8_t> validity;
+    std::array<double,2> scale{1,1};
+};
+// Uses the canonical view's transaction/lifetime, scalar types and stable IDs.
+// Transformed coordinates are never serialized without an explicit inverse edit.
+class TransformedGeometryView {
+public:
+    const GeometryRevision& revision() const;
+    const std::string& objectRevision() const;
+    const VolumeAffine& mapping() const {return mapping_;}
+    const TypedGeometryView& canonical() const {return source_;}
+    const std::string& targetVolume() const {return target_;}
+    double targetScale() const {return targetScale_;}
+    // Validate the pinned mapping and geometry before submitting inverse edits.
+    void validateForWrite(const ObjectStore&, const Txn&) const;
+    std::string writeCoordinates(ObjectStore&, WriteTxn&, const std::string& array, int64_t start,
+        const std::vector<geometry::Point>& desired, const std::vector<GeometryEdgeEdit>& edges={}) const;
+    std::string writeSurface(ObjectStore&, WriteTxn&, int64_t row, int64_t column, int64_t rows, int64_t columns,
+        const std::vector<geometry::SurfacePoint>& desired, const std::vector<GeometryEdgeEdit>& edges={}) const;
+    // Float32 surface consumer adapter. Validity remains separate from XYZ;
+    // unchanged displayed vertices reuse the exact canonical float32 values.
+    geometry::Surface canonicalSurface(const geometry::Surface& desired) const;
+    std::vector<GeometryArrayEdit> surfaceEdits(int64_t row, int64_t column,
+        int64_t rows, int64_t columns, const std::vector<geometry::SurfacePoint>& desired) const;
+    std::vector<geometry::Point> points(const std::string& array,int64_t start,int64_t count) const;
+    TransformedSurfaceTile readTile(int64_t row,int64_t column,int64_t rows,int64_t columns) const;
+    // Encode only explicitly changed positions; unchanged values reuse their
+    // original bytes. Track edits round to nearest, with ties away from zero.
+    std::vector<GeometryArrayEdit> coordinateEdits(const std::string& array,int64_t start,
+        const std::vector<geometry::Point>& desired) const;
+private:
+    friend class GeometrySnapshot;
+    TransformedGeometryView(TypedGeometryView source,VolumeAffine mapping,std::string target,double targetScale)
+        :source_(std::move(source)),mapping_(mapping),target_(std::move(target)),targetScale_(targetScale){}
+    TypedGeometryView source_;
+    VolumeAffine mapping_;
+    std::string target_;
+    double targetScale_;
+};
+
 class GeometrySnapshot {
 public:
     // A borrowed store must outlive this snapshot and its views.
@@ -89,6 +135,8 @@ public:
     // valid while it is.
     GeometrySnapshot(const ObjectStore&, const Txn&);
     void close();
+    TransformedGeometryView viewTransformedAt(const std::string& objectUuid,const std::string& target,
+        double targetScale=1, const VolumeTransforms* transforms=nullptr) const;
     bool active() const;
     // The object's current geometry, or its pinned `geometryRevision`. A view of
     // a pinned revision has an empty objectRevision().

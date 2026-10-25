@@ -5,6 +5,7 @@
 #include "internal/RecordSql.hpp"
 #include "internal/CoordinateFilter.hpp"
 #include "internal/VolumeFrames.hpp"
+#include "internal/TransformedLength.hpp"
 #include "vc_object_store/geometry/ArrayBytes.hpp"
 #include "vc_object_store/geometry/SegmentClip.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
@@ -112,8 +113,10 @@ Bounds worldBounds(const RegionSlice& view) {
 }
 
 RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& view,
-    const RegionOptions& options, const RegionCancel& cancel) const
+    const RegionOptions& requested, const RegionCancel& cancel) const
 {
+    auto options=requested;
+    if(options.volume&&!options.transforms)options.transforms=std::make_shared<VolumeTransforms>(volumeTransforms(txn));
     auto* db = static_cast<sqlite3*>(connection(txn));
     if (options.volume) {
         // One bounded query per declared frame, merged in UUID order with the
@@ -122,24 +125,24 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
         RegionResult merged;
         std::optional<RegionStop> stopped;
         bool limited = false;
-        for (const auto& frame : volumeFrames(db, *options.volume, options.kind, false)) {
+        for (const auto& frame : volumeFrames(db, *options.volume, options.kind, false, options.transforms.get())) {
             if (merged.stats.outputBytes >= options.outputByteBudget) { stopped = RegionStop::OutputBudget; break; }
             auto sub = options;
             sub.volume.reset();
             sub.coordinates = frame.coordinates;
             sub.outputByteBudget = options.outputByteBudget - merged.stats.outputBytes;
-            sub.minLength = options.minLength > 0 ? lowestStoredAtLeast(options.minLength, frame.toVolume) : 0.0;
-            RegionSlice stored = view;
-            for (auto& coordinate : stored.origin) coordinate /= frame.toVolume;
-            for (auto& bound : stored.localBounds) bound /= frame.toVolume;
-            auto part = geometryRegion(txn, stored, sub, cancel);
+            sub.minLength = options.minLength;
+            sub.toTarget=frame.mapping;
+            sub.processingByteBudget=options.processingByteBudget-std::min(options.processingByteBudget,merged.stats.processingBytes);
+            sub.candidateWorkBudget=options.candidateWorkBudget-std::min(options.candidateWorkBudget,merged.stats.candidateWork);
+            sub.sqlStepBudget=options.sqlStepBudget-std::min(options.sqlStepBudget,merged.stats.sqlSteps);
+            auto part = geometryRegion(txn, view, sub, cancel);
             for (auto field : {&RegionStats::outputBytes, &RegionStats::processingBytes, &RegionStats::payloadBytes,
                                &RegionStats::verifiedBytes, &RegionStats::metadataBytes, &RegionStats::reconstructedBytes,
                                &RegionStats::cacheBytes, &RegionStats::candidateWork, &RegionStats::candidateVisits,
                                &RegionStats::segmentTests, &RegionStats::sqlSteps})
                 merged.stats.*field += part.stats.*field;
             for (auto& run : part.runs) {
-                for (auto& point : run.points) for (auto& coordinate : point) coordinate *= frame.toVolume;
                 merged.runs.push_back(std::move(run));
             }
             if (part.stop == RegionStop::ObjectLimit) limited = true;
@@ -167,7 +170,8 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
         return merged;
     }
     const auto kind = regionKind(options.kind);
-    const auto bounds = worldBounds(view);
+    const auto targetBounds = worldBounds(view);
+    const auto bounds = options.toTarget ? transformBounds(targetBounds, options.toTarget->inverse()) : targetBounds;
     if (!std::isfinite(options.minLength) || options.minLength < 0 || options.minPoints < 2)
         throw std::invalid_argument("geometry region requires nonnegative finite length and minPoints >= 2");
     if (kind.surface && (options.family || options.minLength > 0))
@@ -185,6 +189,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
     const double planeOffset = (view.localBounds[2] + view.localBounds[5]) / 2;
     const Bounds planeBox{view.localBounds[0], view.localBounds[1], -1, view.localBounds[3], view.localBounds[4], 1};
     auto processSurface = [&](const std::string& uuid, int64_t id, const std::string& revision) {
+        if(options.toTarget && options.minLength>0 && transformedLength(db,revision,*options.toTarget,options.kind)<options.minLength)return;
         GeometryReader reader(db, revision);
         const auto& arrays = reader.manifest().at("arrays");
         const auto shape = arrays.at("points").at("shape").get<std::vector<int64_t>>();
@@ -210,6 +215,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
             for (size_t i = 0; i < world.size(); ++i) {
                 std::array<float, 3> q; copyScalars<float>(std::span(bytes).subspan(i * 12, 12), q);
                 world[i] = {q[0], q[1], q[2]};
+                if(options.toTarget)world[i]=options.toTarget->apply(world[i]);
                 usable[i] = vc::geometry::validSurfacePoint(q) && (!hasValid || valid[i]);
                 distance[i] = project(view, world[i])[2] - planeOffset;
             }
@@ -280,7 +286,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
                     if (t <= 0) return a;
                     if (t >= 1) return b;
                     Point p; for (int k = 0; k < 3; ++k) p[k] = a[k] + t * (b[k] - a[k]);
-                    return p;
+                    return options.toTarget?options.toTarget->apply(p):p;
                 };
                 const uint64_t added = open && first <= 0 ? 24 : 48;
                 if (added > options.outputByteBudget - result.stats.outputBytes) request.stop(RegionStop::OutputBudget);
@@ -296,6 +302,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
     };
     auto process = [&](const std::string& uuid, int64_t id, const std::string& revision, const std::string& family) {
         if (kind.surface) return processSurface(uuid, id, revision);
+        if(options.toTarget && options.minLength>0 && transformedLength(db,revision,*options.toTarget,options.kind)<options.minLength)return;
         GeometryReader reader(db, revision);
         const auto& arrays = reader.manifest().at("arrays");
         std::string name = kind.arrays.back();
@@ -320,7 +327,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
                     Point p;
                     if (kind.stride == 24) copyScalars<double>(source,p);
                     else { std::array<int32_t,3> q; copyScalars<int32_t>(source,q); for(int k=0;k<3;++k)p[k]=q[k]; }
-                    return p;
+                    return options.toTarget?options.toTarget->apply(p):p;
                 };
                 Point a=point(0), pa=project(view,a);
                 for (int64_t i=0;i<count;++i) {
@@ -404,7 +411,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
             if(!selectedOnly)sql+=" ORDER BY o.uuid";
             Statement candidates(db,sql);
             for(int i=0;i<6;++i)candidates.bind(i+1,bounds[i]);
-            candidates.bind(7,options.minLength);
+            candidates.bind(7,options.toTarget?0.:options.minLength);
             if(options.family)candidates.bind(8,*options.family);else candidates.bindNull(8);
             if(selected)candidates.bind(9,parseUuid(*selected));
             if(includedIds)candidates.bind(10,*includedIds);

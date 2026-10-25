@@ -1,4 +1,5 @@
 #pragma once
+#include "vc_object_store/objects/VolumeTransforms.hpp"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -41,6 +42,9 @@ struct RegionOptions {
     // declared in it (see ObjectSelection::volume). maximumObjects, selected
     // priority and UUID order apply across the frames.
     std::optional<std::string> volume;
+    std::shared_ptr<const VolumeTransforms> transforms;
+    // Internal frame traversal: source coordinates to the query coordinate frame.
+    std::optional<VolumeAffine> toTarget;
 };
 enum class RegionStop { Exhausted, ObjectLimit, OutputBudget, ProcessingBudget, CandidateBudget, SqlBudget, Cancelled };
 struct RegionStats {
@@ -72,6 +76,9 @@ struct SurfaceProximityQuery {
     // nullopt is every surface; an explicitly empty set matches nothing.
     std::optional<std::vector<std::string>> uuids;
     std::optional<std::string> coordinates, volume; // exclusive, as in RegionOptions
+    std::shared_ptr<const VolumeTransforms> transforms;
+    // Internal frame traversal: source coordinates to the query coordinate frame.
+    std::optional<VolumeAffine> toTarget;
 };
 struct SurfaceProximityHit {
     std::string objectUuid, revisionUuid;

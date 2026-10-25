@@ -37,3 +37,7 @@ endif()
 # Read-only real-data timing harness; not a fixture-free CTest.
 add_executable(bench_volume_queries bench_volume_queries.cpp)
 target_link_libraries(bench_volume_queries PRIVATE vc_objects)
+
+add_executable(test_object_store_transforms test_object_store_transforms.cpp)
+target_link_libraries(test_object_store_transforms PRIVATE vc_objects)
+add_test(NAME object_store_transforms COMMAND test_object_store_transforms)

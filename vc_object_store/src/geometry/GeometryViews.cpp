@@ -3,6 +3,7 @@
 #include "geometry/ArrayLayout.hpp"
 #include <nlohmann/json.hpp>
 #include <cmath>
+#include <limits>
 
 namespace vc::objects {
 namespace detail {
@@ -81,6 +82,30 @@ GeometrySnapshot::GeometrySnapshot(std::shared_ptr<ObjectStore> db)
 }
 GeometrySnapshot::GeometrySnapshot(const ObjectStore& db, const Txn& txn)
     : state_(std::make_shared<detail::GeometryReadState>(db, txn)) {}
+TransformedGeometryView GeometrySnapshot::viewTransformedAt(const std::string& uuid,const std::string& target,
+    double targetScale,const VolumeTransforms* context) const
+{
+    state_->require();
+    const auto record=state_->db->objectByUuid(*state_->txn,uuid);
+    if(!record)throw std::invalid_argument("object not found");
+    const auto local=context?VolumeTransforms{}:state_->db->volumeTransforms(*state_->txn);
+    const auto mapping=(context?*context:local).toVolume(nlohmann::json::parse(record->meta),target,targetScale);
+    if(!mapping)throw std::runtime_error("object has no unambiguous transform to volume "+target);
+    return TransformedGeometryView(geometry(uuid),*mapping,target,targetScale);
+}
+
+TransformedGeometryView GeometryView::viewTransformedAt(const std::string& target,double scale) const {
+    state_->read->require();
+    auto result=GeometrySnapshot(*state_->read->db,*state_->read->txn).viewTransformedAt(state_->revision.objectUuid,target,scale);
+    if(result.revision().uuid!=state_->revision.uuid)throw std::invalid_argument("transform a current object view; historical geometry needs its coordinate metadata");
+    return result;
+}
+
+std::vector<vcr::catalog::TransformResolution> GeometryView::availableTransforms() const {
+    state_->read->require();
+    return state_->read->db->availableTransforms(*state_->read->txn,state_->revision.objectUuid);
+}
+
 void GeometrySnapshot::close() { state_->txn = nullptr; state_->owned.reset(); state_->lease.reset(); }
 bool GeometrySnapshot::active() const { return state_->txn && state_->txn->active(); }
 std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::string& kind,
@@ -206,4 +231,153 @@ geometry::Surface SurfaceView::readTile(int64_t row, int64_t column, int64_t row
 }
 geometry::Surface SurfaceView::load() const { return std::get<geometry::Surface>(loadGeometry()); }
 
+
+const GeometryRevision& TransformedGeometryView::revision() const {
+    return std::visit([](const auto& v)->const GeometryRevision&{return v.revision();},source_);
+}
+const std::string& TransformedGeometryView::objectRevision() const {
+    return std::visit([](const auto& v)->const std::string&{return v.objectRevision();},source_);
+}
+std::vector<geometry::Point> TransformedGeometryView::points(const std::string& array,int64_t start,int64_t count) const {
+    auto result=std::visit([&](const auto& v)->std::vector<geometry::Point>{
+        using T=std::decay_t<decltype(v)>;
+        if constexpr(std::is_same_v<T,FiberView>) {
+            if(array=="control_points")return v.controlPoints(start,count);
+            if(array=="line_points")return v.linePoints(start,count);
+        } else if constexpr(std::is_same_v<T,SurfaceView>) {
+            throw std::invalid_argument("use readTile for a surface");
+        } else if constexpr(std::is_same_v<T,TrackView>) {
+            if(array=="points") {
+                auto stored=v.points(start,count);std::vector<geometry::Point> out;out.reserve(stored.size());
+                for(const auto& p:stored)out.push_back({double(p[0]),double(p[1]),double(p[2])});return out;
+            }
+        } else {if(array=="points")return v.points(start,count);}
+        throw std::invalid_argument("not a coordinate array: "+array);
+    },source_);
+    for(auto& p:result)p=mapping_.apply(p);
+    return result;
+}
+TransformedSurfaceTile TransformedGeometryView::readTile(int64_t row,int64_t column,int64_t rows,int64_t columns) const {
+    const auto* surface=std::get_if<SurfaceView>(&source_);
+    if(!surface)throw std::invalid_argument("not a surface");
+    const auto source=surface->readTile(row,column,rows,columns);
+    TransformedSurfaceTile result{rows,columns};
+    result.scale=source.scale;
+    // A general affine has no single voxel step. Isotropic mappings do, and
+    // preserve the existing grid-step convention of a uniformly scaled surface.
+    const auto x=mapping_.apply({1,0,0},true),y=mapping_.apply({0,1,0},true),z=mapping_.apply({0,0,1},true);
+    const auto dot=[](const auto& a,const auto& b){return a[0]*b[0]+a[1]*b[1]+a[2]*b[2];};
+    const double squared=dot(x,x),tolerance=1e-12*squared;
+    if(squared>0&&std::abs(dot(y,y)-squared)<=tolerance&&std::abs(dot(z,z)-squared)<=tolerance&&
+       std::abs(dot(x,y))<=tolerance&&std::abs(dot(x,z))<=tolerance&&std::abs(dot(y,z))<=tolerance)
+        for(auto& step:result.scale)step/=std::sqrt(squared);
+    result.points.reserve(source.points.size());result.validity.reserve(source.points.size());
+    for(size_t i=0;i<source.points.size();++i) {
+        const bool valid=source.valid(i/columns,i%columns);
+        const auto& p=source.points[i];
+        result.validity.push_back(valid?255:0);
+        result.points.push_back(valid?mapping_.apply({p[0],p[1],p[2]}):geometry::Point{-1,-1,-1});
+    }
+    return result;
+}
+std::vector<GeometryArrayEdit> TransformedGeometryView::coordinateEdits(const std::string& array,int64_t start,
+    const std::vector<geometry::Point>& desired) const {
+    const auto shown=points(array,start,desired.size()); // checks array/range and snapshot lifetime
+    const auto inverse=mapping_.inverse();
+    std::vector<GeometryArrayEdit> edits;
+    for(size_t i=0;i<desired.size();++i) {
+        if(desired[i]==shown[i])continue;
+        auto canonical=inverse.apply(desired[i]);
+        for(double v:canonical)if(!std::isfinite(v))throw std::invalid_argument("coordinate edit is not finite");
+        GeometryArrayEdit edit{array,3*(start+int64_t(i)),{}};
+        if(std::holds_alternative<TrackView>(source_)) {
+            std::array<int32_t,3> integer;
+            for(int k=0;k<3;++k) {
+                const double v=std::round(canonical[k]);
+                if(v<std::numeric_limits<int32_t>::min()||v>std::numeric_limits<int32_t>::max())throw std::overflow_error("track coordinate exceeds int32");
+                integer[k]=int32_t(v);
+            }
+            edit.bytes=detail::scalarBytes<int32_t>(integer);
+        } else edit.bytes=detail::scalarBytes<double>(canonical);
+        edits.push_back(std::move(edit));
+    }
+    return edits;
+}
+void TransformedGeometryView::validateForWrite(const ObjectStore& db,const Txn& txn) const {
+    const auto& pinned=revision();
+    const auto head=db.currentGeometry(txn,pinned.objectUuid);
+    const auto object=db.currentObjectRevision(txn,pinned.objectUuid);
+    if(!head||head->uuid!=pinned.uuid||!object||object->uuid!=objectRevision())
+        throw std::runtime_error("object changed; reopen its transformed view");
+    const auto mapping=db.volumeTransforms(txn).toVolume(nlohmann::json::parse(object->record.meta),target_,targetScale_);
+    if(!mapping||*mapping!=mapping_)throw std::runtime_error("volume registration changed; reopen its transformed view");
+}
+std::string TransformedGeometryView::writeCoordinates(ObjectStore& db,WriteTxn& txn,const std::string& array,int64_t start,
+    const std::vector<geometry::Point>& desired,const std::vector<GeometryEdgeEdit>& edges) const {
+    validateForWrite(db,txn);
+    return db.editGeometry(txn,revision().objectUuid,coordinateEdits(array,start,desired),revision().uuid,edges);
+}
+std::string TransformedGeometryView::writeSurface(ObjectStore& db,WriteTxn& txn,int64_t row,int64_t column,int64_t rows,int64_t columns,
+    const std::vector<geometry::SurfacePoint>& desired,const std::vector<GeometryEdgeEdit>& edges) const {
+    validateForWrite(db,txn);
+    return db.editGeometry(txn,revision().objectUuid,surfaceEdits(row,column,rows,columns,desired),revision().uuid,edges);
+}
+namespace {
+geometry::SurfacePoint inverseSurfacePoint(const geometry::SurfacePoint& desired,
+    const std::optional<geometry::SurfacePoint>& original,bool valid,const VolumeAffine& forward,const VolumeAffine& inverse) {
+    const geometry::SurfacePoint missing{-1,-1,-1};
+    auto shown=missing;
+    if(original&&valid) {
+        const auto p=forward.apply({(*original)[0],(*original)[1],(*original)[2]});
+        shown={float(p[0]),float(p[1]),float(p[2])};
+    }
+    if(original&&desired==shown)return *original;
+    if(desired==missing)return missing;
+    const auto p=inverse.apply({desired[0],desired[1],desired[2]});
+    geometry::SurfacePoint result{float(p[0]),float(p[1]),float(p[2])};
+    if(!geometry::validSurfacePoint(result))throw std::invalid_argument("surface coordinate cannot be represented in the canonical frame");
+    return result;
+}
+}
+geometry::Surface TransformedGeometryView::canonicalSurface(const geometry::Surface& desired) const {
+    const auto* surface=std::get_if<SurfaceView>(&source_);
+    if(!surface)throw std::invalid_argument("not a surface");
+    if(desired.rows<0||desired.columns<0||size_t(desired.rows)*size_t(desired.columns)!=desired.points.size())
+        throw std::invalid_argument("surface shape mismatch");
+    const auto stored=surface->readTile(0,0,surface->rows(),surface->columns());
+    auto result=desired;result.scale=stored.scale;
+    if(result.validity.empty()&&!stored.validity.empty()) {
+        result.validity.assign(desired.points.size(),255);
+        for(int64_t r=0;r<std::min(stored.rows,desired.rows);++r)
+            for(int64_t c=0;c<std::min(stored.columns,desired.columns);++c)
+                result.validity[r*desired.columns+c]=stored.validity[r*stored.columns+c];
+    }
+    const auto inverse=mapping_.inverse();
+    for(int64_t r=0;r<desired.rows;++r)for(int64_t c=0;c<desired.columns;++c) {
+        const auto i=r*desired.columns+c;
+        const bool exists=r<stored.rows&&c<stored.columns;
+        result.points[i]=inverseSurfacePoint(desired.points[i],exists?std::optional(stored.points[r*stored.columns+c]):std::nullopt,
+            exists&&stored.valid(r,c),mapping_,inverse);
+    }
+    result.validate();return result;
+}
+std::vector<GeometryArrayEdit> TransformedGeometryView::surfaceEdits(int64_t row,int64_t column,int64_t rows,int64_t columns,
+    const std::vector<geometry::SurfacePoint>& desired) const {
+    const auto* surface=std::get_if<SurfaceView>(&source_);
+    if(!surface)throw std::invalid_argument("not a surface");
+    const auto stored=surface->readTile(row,column,rows,columns);
+    if(desired.size()!=stored.points.size())throw std::invalid_argument("surface edit shape mismatch");
+    const auto inverse=mapping_.inverse();
+    std::vector<GeometryArrayEdit> edits;
+    for(int64_t r=0;r<rows;++r)for(int64_t c=0;c<columns;++c) {
+        const auto i=r*columns+c;
+        const auto point=inverseSurfacePoint(desired[i],stored.points[i],stored.valid(r,c),mapping_,inverse);
+        if(point==stored.points[i])continue;
+        const auto offset=(row+r)*surface->columns()+column+c;
+        edits.push_back({"points",offset*3,detail::scalarBytes<float>(point)});
+        if(!stored.validity.empty()&&!stored.validity[i]&&geometry::validSurfacePoint(point))
+            edits.push_back({"valid",offset,{255}});
+    }
+    return edits;
+}
 } // namespace vc::objects

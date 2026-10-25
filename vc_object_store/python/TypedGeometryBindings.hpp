@@ -35,6 +35,17 @@ nb::ndarray<nb::numpy, bool> validMask(const vc::geometry::Surface& s)
 }
 }
 namespace vc::python {
+inline nb::object volumeTransformsToPy(const std::vector<vcr::catalog::TransformResolution>& resolutions) {
+    nlohmann::json result=nlohmann::json::array();
+    for(const auto& mapping:resolutions) {
+        nlohmann::json candidates=nlohmann::json::array();
+        for(const auto& c:mapping.candidates)candidates.push_back({{"matrix",c.forward.json()},{"path",c.path}});
+        result.push_back({{"volume",mapping.target},{"available",mapping.status==vcr::catalog::TransformStatus::Resolved},
+            {"ambiguous",mapping.status==vcr::catalog::TransformStatus::Ambiguous},{"candidates",candidates}});
+    }
+    return jsonLoads(result.dump());
+}
+
 inline void bindTypedGeometry(nb::module_& m)
 {
     namespace vg = vc::geometry;
@@ -129,6 +140,8 @@ inline void bindTypedGeometry(nb::module_& m)
         .def("valid_mask", &validMask, "Per-vertex validity (coordinates and the valid channel) as a (rows, columns) bool array.");
 
     nb::class_<vo::GeometryView>(m, "GeometryView")
+        .def_prop_ro("available_transforms",[](const vo::GeometryView& v){return volumeTransformsToPy(v.availableTransforms());})
+        .def("view_transformed_at",&vo::GeometryView::viewTransformedAt,nb::arg("volume"),nb::arg("target_scale")=1.)
         .def_prop_ro("revision", [](const vo::GeometryView& self) { return geometryToPy(self.revision()); })
         .def_prop_ro("object_revision", &vo::GeometryView::objectRevision, nb::rv_policy::copy);
     nb::class_<vo::PointCollectionView, vo::GeometryView>(m, "PointCollectionView")
@@ -178,12 +191,32 @@ inline void bindTypedGeometry(nb::module_& m)
             return nb::make_tuple(xyzArray(tile.points, {size_t(tile.rows), size_t(tile.columns), 3}), validMask(tile));
         }, nb::arg("row") = 0, nb::arg("column") = 0, nb::arg("rows") = nb::none(), nb::arg("columns") = nb::none(),
            "(points, valid): a rectangle (default: all) as a (rows, columns, 3) float32 array and the store's per-vertex validity as a bool array.");
+    nb::class_<vo::TransformedGeometryView>(m,"TransformedGeometryView")
+        .def_prop_ro("object_revision",&vo::TransformedGeometryView::objectRevision)
+        .def_prop_ro("canonical",&vo::TransformedGeometryView::canonical)
+        .def_prop_ro("target_volume",&vo::TransformedGeometryView::targetVolume)
+        .def_prop_ro("matrix",[](const vo::TransformedGeometryView& v){return jsonLoads(v.mapping().json().dump());})
+        .def("points",&vo::TransformedGeometryView::points,nb::arg("array"),nb::arg("start"),nb::arg("count"))
+        .def("read_tile",[](const vo::TransformedGeometryView& v,int64_t row,int64_t col,int64_t rows,int64_t cols){
+            auto tile=v.readTile(row,col,rows,cols);nb::dict result;
+            result["points"]=xyzArray(tile.points,{size_t(rows),size_t(cols),3});
+            result["validity"]=ownedArray(std::move(tile.validity),{size_t(rows),size_t(cols)});result["scale"]=tile.scale;return result;
+        },nb::arg("row"),nb::arg("column"),nb::arg("rows"),nb::arg("columns"))
+        .def("coordinate_edits",[](const vo::TransformedGeometryView& v,const std::string& array,int64_t start,const std::vector<vg::Point>& desired){
+            nb::list result;for(const auto& e:v.coordinateEdits(array,start,desired)){
+                nb::dict item;item["array"]=e.array;item["element_offset"]=e.elementOffset;
+                item["data"]=nb::bytes(reinterpret_cast<const char*>(e.bytes.data()),e.bytes.size());result.append(item);
+            }return result;
+        },nb::arg("array"),nb::arg("start"),nb::arg("points"));
     nb::class_<vo::GeometrySnapshot>(m, "GeometrySnapshot")
         .def("__enter__", [](nb::object self) {
             if (!nb::cast<vo::GeometrySnapshot&>(self).active()) throw std::runtime_error("geometry snapshot is closed");
             return self;
         })
         .def("__exit__", [](vo::GeometrySnapshot& self, nb::args) { self.close(); })
+        .def("view_transformed_at",[](const vo::GeometrySnapshot& snapshot,const std::string& uuid,const std::string& volume,double scale){
+            return snapshot.viewTransformedAt(uuid,volume,scale);
+        },nb::arg("object_uuid"),nb::arg("volume"),nb::arg("target_scale")=1.)
         .def("close", &vo::GeometrySnapshot::close)
         .def_prop_ro("active", &vo::GeometrySnapshot::active)
         .def("point_collection", &vo::GeometrySnapshot::pointCollection, nb::arg("object_uuid"), nb::arg("geometry_revision") = nb::none(), nb::call_guard<nb::gil_scoped_release>())
