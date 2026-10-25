@@ -4732,32 +4732,6 @@ bool LineAnnotationController::importFibersFromPath(const fs::path& importPath,
     }
 }
 
-uint64_t LineAnnotationController::importFiberJson(const nlohmann::json& root,
-                                                   const std::string& fileName,
-                                                   QString* errorMessage)
-{
-    try {
-        if (_structuralEditInProgress) throw std::runtime_error("A merge or split is in progress");
-        if (!_state || !_state->objectStoreAttachment())
-            throw std::runtime_error("Attach an object store before importing fibers");
-        auto decoded = vc::objects::decodeFiberJson(root.dump());
-        const auto& source = decoded.source;
-        if (!source.value("branches", nlohmann::json::array()).empty() ||
-            !source.value("adjacent_branches", nlohmann::json::array()).empty())
-            throw std::runtime_error("Linked fibers can only be imported with Import Fibers");
-        const auto uuid = decoded.object.uuid;
-        if (decoded.object.name.empty()) decoded.object.name = fs::path(fileName).stem().string();
-        const auto connection = _state->objectStoreSession();
-        connection->act(*_state->objectStoreAttachment(), {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
-            vc::objects::ingestGeometryBatch(db, txn, {std::move(decoded)});
-        });
-        return fiberIdForUuid(uuid);
-    } catch (const std::exception& ex) {
-        if (errorMessage) *errorMessage = tr("Could not import fibers: %1").arg(QString::fromUtf8(ex.what()));
-        return 0;
-    }
-}
-
 void LineAnnotationController::exportFibers()
 {
     // Publish pending session edits before exporting the attached store.

@@ -415,8 +415,10 @@ int runObjectStoreControllerTests()
             document["coordinates"] = {{"volume_uuid", volumeUuid}, {"scale_factor", 4}};
             document["coordinate_binding"] = {{"active_volume_id", "display"}};
             QString error;
-            const auto id = imported.importFiberJson(document, "optional-mode.json", &error);
-            if (!id) throw std::runtime_error(error.toStdString());
+            const auto single = fs::path(directory.path().toStdString()) / "optional-mode.json";
+            { std::ofstream out(single); out << document.dump(); }
+            if (!imported.importFibersFromPath(single, &error)) throw std::runtime_error(error.toStdString());
+            const auto id = imported.fiberIdForUuid(uuid);
             auto found = imported.readStoredFiber(id, true);
             require(found && !found->readOnly && found->controlPoints.size() == 3,
                     "absent optional optimization mode keeps geometry editable");
