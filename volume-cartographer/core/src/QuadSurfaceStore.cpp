@@ -128,8 +128,11 @@ std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore
         const auto tile = transformed->readTile(0, 0, rows, cols);
         scale={float(tile.scale[0]),float(tile.scale[1])};
         for (int i=0; i<rows*cols; ++i) {
+            // Stored vertices the tifxyz rule treats as missing (z <= 0) stay missing in any view.
             const auto& p=tile.points[i];
-            (*points)(i/cols,i%cols)=tile.validity[i] ? cv::Vec3f(float(p[0]),float(p[1]),float(p[2])) : kInvalid;
+            const auto& s=stored.points[size_t(i)];
+            (*points)(i/cols,i%cols)=tile.validity[i] && usable({s[0],s[1],s[2]})
+                ? cv::Vec3f(float(p[0]),float(p[1]),float(p[2])) : kInvalid;
         }
     } else if (toVolume != 1) {
         for (auto& p : *points) if (p != kInvalid) p *= float(toVolume);
@@ -216,10 +219,22 @@ std::string write_quad_rect_to_store(vc::objects::ObjectStore& db, vc::objects::
     const auto area = rect & cv::Rect(0, 0, points.cols, points.rows);
     if (area.empty()) return revision.uuid;
     if (transformed) {
+        // As loaded: a stored vertex hidden by the tifxyz rule (z <= 0) keeps its
+        // stored value while it stays missing; other missing vertices are cleared.
+        const auto shown = transformed->readTile(area.y, area.x, area.height, area.width);
+        const auto canonical = std::get<vc::objects::SurfaceView>(transformed->canonical())
+                                   .readTile(area.y, area.x, area.height, area.width);
         std::vector<vc::geometry::SurfacePoint> desired;
         desired.reserve(size_t(area.width)*area.height);
         for(int r=area.y;r<area.y+area.height;++r)for(int c=area.x;c<area.x+area.width;++c) {
-            const auto p=points(r,c);desired.push_back({p[0],p[1],p[2]});
+            const auto p=points(r,c);
+            const size_t i=size_t(r-area.y)*size_t(area.width)+size_t(c-area.x);
+            const auto& s=canonical.points[i];
+            if(!usable(p)&&shown.validity[i]&&!usable({s[0],s[1],s[2]})) {
+                const auto& q=shown.points[i];
+                desired.push_back({float(q[0]),float(q[1]),float(q[2])});
+            } else if(!usable(p)) desired.push_back({-1,-1,-1});
+            else desired.push_back({p[0],p[1],p[2]});
         }
         const auto edits=transformed->surfaceEdits(area.y,area.x,area.height,area.width,desired);
         return decide ? db.editGeometry(txn,objectUuid,edits,revision.uuid,vc::objects::ObjectStore::EdgeDecider(decide))

@@ -8,6 +8,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/StoreSurfaces.hpp"
 #include <vc_object_store/objects/Hub.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/Uuid.hpp>
 
 #include <opencv2/core.hpp>
@@ -165,6 +166,39 @@ TEST_CASE("A stored vertex without coordinates loads as missing")
     CHECK((*loaded->rawPointsPtr())(0, 0) == cv::Vec3f(1, 2, 3));
     CHECK((*loaded->rawPointsPtr())(0, 1) == cv::Vec3f(-1, -1, -1));
     CHECK((*loaded->rawPointsPtr())(0, 2) == cv::Vec3f(-1, -1, -1));
+}
+
+TEST_CASE("A view hides stored z <= 0 vertices and keeps them on save")
+{
+    Store store;
+    const auto uuid = util::newUuid();
+    cv::Mat_<cv::Vec3f> grid(2, 2);
+    grid(0, 0) = {1, 1, 4}; grid(0, 1) = {2, 1, 4}; grid(1, 0) = {1, 2, 4}; grid(1, 1) = {2, 2, -3};
+    QuadSurface surface(grid, {1.f, 1.f});
+    // Written as stored bytes: a tracer extrapolation below z = 0, marked valid.
+    auto data = quad_surface_geometry(surface);
+    std::memcpy(data.arrays.front().bytes.data() + 3 * 12, cv::Vec3f(2, 2, -3).val, 12);
+    store.session->act(store.attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
+        ObjectRecord record; record.uuid = uuid; record.kind = "surface";
+        record.meta = R"({"coordinates":{"volume_uuid":"vol","scale_factor":0.5}})";
+        db.upsertObject(txn, record);
+        db.putGeometry(txn, uuid, data);
+    });
+    std::unique_ptr<QuadSurface> shown;
+    store.session->read(store.attachment, [&](const auto& db, const auto& txn, const auto&) {
+        const auto view = GeometrySnapshot(db, txn).viewTransformedAt(uuid, "vol");
+        shown = load_quad_from_store(db, txn, uuid, std::nullopt, true, 1, &view);
+    });
+    CHECK((*shown->rawPointsPtr())(0, 0) == cv::Vec3f(2, 2, 8));
+    CHECK((*shown->rawPointsPtr())(1, 1) == cv::Vec3f(-1, -1, -1));
+    (*shown->rawPointsPtr())(0, 0) = {4, 4, 8};
+    const auto geometry = store.head(uuid);
+    store.session->act(store.attachment, store.pin(uuid), [&](auto& db, auto& txn) {
+        const auto view = GeometrySnapshot(db, txn).viewTransformedAt(uuid, "vol");
+        write_quad_rect_to_store(db, txn, uuid, *shown, cv::Rect(0, 0, 2, 2), geometry, {}, &view);
+    });
+    CHECK(stored(store, uuid, 0, 0) == cv::Vec3f(2, 2, 4));
+    CHECK(stored(store, uuid, 1, 1) == cv::Vec3f(2, 2, -3));
 }
 
 TEST_CASE("Tools read surfaces in a bound volume's voxels and write back only stored units")
