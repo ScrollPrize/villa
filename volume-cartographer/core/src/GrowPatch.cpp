@@ -1127,6 +1127,17 @@ static std::unique_ptr<TraceData::PatchNormalContext> load_patch_normal_context(
         }
         ctx->umbilicus = std::move(loaded.umbilicus);
         ctx->signed_normals = true;
+    } else if (params.contains("umbilicus_points") && params["umbilicus_points"].is_array()) {
+        // Control points already in the tracing grid's voxels (e.g. VC3D's
+        // stored umbilicus, whose frame was settled when it was stored).
+        std::vector<cv::Vec3f> points;
+        for (const auto& p : params["umbilicus_points"]) {
+            points.emplace_back(p[0].get_float(), p[1].get_float(), p[2].get_float());
+        }
+        ctx->umbilicus = Umbilicus::FromPoints(
+            std::move(points),
+            cv::Vec3i(volume_shape_zyx[0], volume_shape_zyx[1], volume_shape_zyx[2]));
+        ctx->signed_normals = true;
     }
 
     if (params.contains("patch_normal_signed")) {
