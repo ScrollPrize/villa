@@ -152,6 +152,7 @@
 #include "segmentation/growth/SegmentationGrowth.hpp"
 #include "segmentation/growth/SegmentationGrower.hpp"
 #include "SurfaceCatalog.hpp"
+#include "overlays/StoreSurfaceOverlayController.hpp"
 #include "SurfacePanelController.hpp"
 #include "elements/DropdownChecklistButton.hpp"
 #include "MenuActionController.hpp"
@@ -6725,6 +6726,21 @@ void CWindow::CreateWidgets(void)
         _viewerManager.get(),
         [this]() { return segmentationViewer(); },
         this);
+    _storeSurfaceOverlay = std::make_unique<StoreSurfaceOverlayController>(
+        _state, _surfaceCatalog.get(), _viewerManager.get(), this);
+    connect(_surfacePanel.get(), &SurfacePanelController::visibleSurfacesChanged,
+            _storeSurfaceOverlay.get(), &StoreSurfaceOverlayController::setSurfaces);
+    connect(_surfacePanel.get(), &SurfacePanelController::highlightedSurfacesChanged,
+            _storeSurfaceOverlay.get(), &StoreSurfaceOverlayController::setHighlighted);
+    if (_viewerManager) {
+        _viewerManager->setSurfacePicker([this](const cv::Vec3f& point, float tolerance) -> std::optional<std::string> {
+            const auto active = _state->surface("segmentation");
+            for (const auto& hit : _surfaceCatalog->nearest({point[0], point[1], point[2]}, tolerance,
+                                                            _surfacePanel->visibleSurfaceIds()))
+                if (!active || hit.objectUuid != active->id) return hit.objectUuid;
+            return std::nullopt;
+        });
+    }
     if (_segmentationGrower) {
         _segmentationGrower->setSurfacePanel(_surfacePanel.get());
     }
@@ -7140,6 +7156,7 @@ void CWindow::CreateWidgets(void)
 
     // Create Seeding widget
     _seedingWidget = new SeedingWidget(_state->pointCollection(), _state);
+    _seedingWidget->setSurfaceCatalog(_surfaceCatalog.get());
     _seedingWidget->setViewerManager(_viewerManager.get());
     attachScrollAreaToDock(ui.dockWidgetDistanceTransform, _seedingWidget, QStringLiteral("dockWidgetDistanceTransformContent"));
 

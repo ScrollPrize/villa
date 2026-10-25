@@ -148,8 +148,6 @@ public:
     // surface panel sets the key before rebinding surfaces on a folder
     // switch; the live index is stashed under the outgoing key and swapped
     // back in (if still valid) when the user returns to that selection.
-    void setSurfacePatchIndexCacheKey(const QString& key);
-    void clearSurfacePatchIndexCache();
 
     bool resetDefaultFor(VolumeViewerBase* viewer) const;
     void setResetDefaultFor(VolumeViewerBase* viewer, bool value);
@@ -191,6 +189,10 @@ public:
                                                       Qt::MouseButton button,
                                                       Qt::KeyboardModifiers modifiers)>;
     void setVolumeClickInterceptor(VolumeClickInterceptor interceptor) { _volumeClickInterceptor = std::move(interceptor); }
+    // The id of a drawn surface within `tolerance` voxels of a volume point
+    // other than the active one (Ctrl+Shift+click activation).
+    using SurfacePicker = std::function<std::optional<std::string>(const cv::Vec3f&, float tolerance)>;
+    void setSurfacePicker(SurfacePicker picker) { _surfacePicker = std::move(picker); }
 
     // --- Volume-switch policy shared by all workspaces ---
     // Snapshot of per-viewer cameras and view centers, retargetable through an
@@ -210,9 +212,6 @@ public:
     void setShowSurfaceNormals(bool show);
     void setShowCoordinateFrames(bool show);
     void setPlaneIntersectionLinesVisible(bool visible);
-    void setSurfaceOverlaysEnabled(bool enabled);
-    void setSurfaceOverlapThreshold(float threshold);
-    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays);
 
     // --- Reset-view-on-surface-change policy ---
     // Store the new default on every viewer, keeping the segmentation viewer
@@ -322,6 +321,7 @@ private:
     std::vector<VolumeViewerBase*> _baseViewers;
     VolumeViewerBase* _activeViewer{nullptr};
     VolumeClickInterceptor _volumeClickInterceptor;
+    SurfacePicker _surfacePicker;
     // The one maintenance clock for the whole app. Ticks ~60Hz; render requests
     // submit immediately, while deferred intersections/status are serviced here.
     QTimer* _globalClock{nullptr};
@@ -360,16 +360,6 @@ private:
     VolumeOverlayController* _volumeOverlay{nullptr};
     InkDetectionOverlayController* _inkDetectionOverlay{nullptr};
     SurfacePatchIndex _surfacePatchIndex;
-    struct CachedSurfacePatchIndex {
-        SurfacePatchIndex index;
-        std::unordered_set<std::string> ids;
-    };
-    // Indexes stashed on folder-selection switches, keyed by the selection
-    // they were built for. Entries are validated against the current surface
-    // instances (and stride) before being swapped back in.
-    std::map<QString, CachedSurfacePatchIndex> _surfacePatchIndexCache;
-    QString _surfacePatchIndexCacheKey;
-    void invalidateSurfacePatchIndexCacheFor(const SurfacePatchIndex::SurfacePtr& surface);
     bool _surfacePatchIndexNeedsRebuild{true};
     // A first surface entering an empty index has no other builder.
     bool _surfacePatchIndexPrimeQueued{false};

@@ -106,6 +106,7 @@ class CommandLineToolRunner;
 class SegmentationModule;
 class SurfacePanelController;
 class SurfaceCatalog;
+class StoreSurfaceOverlayController;
 class MenuActionController;
 class VolumeAttachmentController;
 class SegmentationGrower;
@@ -476,6 +477,7 @@ private:
     std::unique_ptr<VectorOverlayController> _vectorOverlay;
     std::unique_ptr<InkDetectionOverlayController> _inkDetectionOverlay;
     std::unique_ptr<PlaneSlicingOverlayController> _planeSlicingOverlay;
+    std::unique_ptr<StoreSurfaceOverlayController> _storeSurfaceOverlay;
     std::unique_ptr<SurfaceRotationOverlayController> _surfaceRotationOverlay;
     std::unique_ptr<AtlasOverlayController> _atlasOverlay;
     std::unique_ptr<AtlasControlPointsOverlayController> _atlasControlOverlay;

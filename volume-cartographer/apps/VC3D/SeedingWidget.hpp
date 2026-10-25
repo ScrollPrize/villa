@@ -35,6 +35,8 @@ class ViewerManager;
 class SurfacePatchIndex;
 class QuadSurface;
 
+class SurfaceCatalog;
+
 class SeedingWidget : public QWidget {
     Q_OBJECT
     
@@ -49,6 +51,8 @@ public:
 
     void setState(CState* state);
     void setViewerManager(ViewerManager* viewerManager);
+    // Relative-winding paths cross the store surfaces of the current volume.
+    void setSurfaceCatalog(SurfaceCatalog* catalog) { _surfaceCatalog = catalog; }
 
     // Dialog-free operation entry points.
     bool previewRaysHeadless(QString* errorMessage = nullptr);
@@ -152,7 +156,6 @@ private:
     void finalizePathLabelWraps(bool shiftHeld);
     void findPeaksAlongPathToCollection(const ViewerOverlayControllerBase::PathPrimitive& path, const std::string& collectionName);
     int findPatchIntersectionsAlongPathToCollection(const ViewerOverlayControllerBase::PathPrimitive& path, const std::string& collectionName);
-    std::vector<std::shared_ptr<QuadSurface>> relWindingPatchSurfaces() const;
     QColor generatePathColor();
     void displayPaths();
     void updatePointsDisplay();
@@ -194,6 +197,7 @@ private:
     // Data
     CState* _state{nullptr};
     ViewerManager* _viewerManager{nullptr};
+    SurfaceCatalog* _surfaceCatalog{nullptr};
     QPointer<CChunkedVolumeViewer> _relWindingDrawViewer;
     int currentZSlice;
     VCCollection* _point_collection;

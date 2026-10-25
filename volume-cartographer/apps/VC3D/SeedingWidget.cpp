@@ -1,4 +1,6 @@
 #include "SeedingWidget.hpp"
+#include "ObjectStoreRegions.hpp"
+#include "SurfaceCatalog.hpp"
 #include <iostream>
 #include "CState.hpp"
 #include "ViewerManager.hpp"
@@ -1927,43 +1929,6 @@ void SeedingWidget::findPeaksAlongPathToCollection(const PathPrimitive& path, co
     }
 }
 
-std::vector<std::shared_ptr<QuadSurface>> SeedingWidget::relWindingPatchSurfaces() const
-{
-    std::vector<std::shared_ptr<QuadSurface>> surfaces;
-    std::unordered_set<QuadSurface*> seen;
-    auto addSurface = [&](const std::shared_ptr<QuadSurface>& surface) {
-        if (!surface || seen.find(surface.get()) != seen.end()) {
-            return;
-        }
-        seen.insert(surface.get());
-        surfaces.push_back(surface);
-    };
-
-    auto package = _state ? _state->vpkg() : nullptr;
-    if (package) {
-        auto ids = package->getLoadedSurfaceIDs();
-        std::sort(ids.begin(), ids.end());
-        for (const auto& id : ids) {
-            addSurface(package->getSurface(id));
-        }
-    }
-
-    if (!surfaces.empty() || !_state) {
-        return surfaces;
-    }
-
-    auto names = _state->surfaceNames();
-    std::sort(names.begin(), names.end());
-    for (const auto& name : names) {
-        if (name == "segmentation" || name == "line-surface" || name == "line-side-slice" ||
-            name.rfind("line_annotation_slice_", 0) == 0) {
-            continue;
-        }
-        addSurface(std::dynamic_pointer_cast<QuadSurface>(_state->surface(name)));
-    }
-    return surfaces;
-}
-
 int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimitive& path,
                                                                const std::string& collectionName)
 {
@@ -1976,28 +1941,8 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
         return 0;
     }
 
-    auto* patchIndex = _viewerManager->surfacePatchIndex();
-    auto* editPatchIndex = _viewerManager->activeSegmentationEditSurfacePatchIndex();
-    if ((!patchIndex || patchIndex->empty()) && (!editPatchIndex || editPatchIndex->empty())) {
-        return 0;
-    }
-
-    std::unordered_set<SurfacePatchIndex::SurfacePtr> targetSurfaces;
-    for (const auto& surface : relWindingPatchSurfaces()) {
-        if (!surface) {
-            continue;
-        }
-        if ((patchIndex && patchIndex->containsSurface(surface)) ||
-            (editPatchIndex && editPatchIndex->containsSurface(surface))) {
-            targetSurfaces.insert(surface);
-        }
-    }
-    if (targetSurfaces.empty()) {
-        return 0;
-    }
-
     struct PathHit {
-        SurfacePatchIndex::SurfacePtr surface;
+        std::string surface;
         float pathDistance = 0.0f;
         float distanceSq = std::numeric_limits<float>::max();
         cv::Vec3f point{0, 0, 0};
@@ -2033,19 +1978,42 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
                       std::max(1, static_cast<int>(std::ceil(maxX - minX + roiPad * 2.0f))),
                       std::max(1, static_cast<int>(std::ceil(maxY - minY + roiPad * 2.0f)))};
 
-    std::unordered_map<SurfacePatchIndex::SurfacePtr, std::vector<SurfacePatchIndex::TriangleSegment>> intersections;
-    auto appendIntersections = [&](SurfacePatchIndex* index) {
-        if (!index || index->empty()) {
-            return;
+    // Where surfaces cross the drawing plane around the path: the surface being
+    // edited from its live geometry, the others from the object store.
+    std::map<std::string, std::vector<std::array<cv::Vec3f, 2>>> intersections;
+    auto active = _state ? std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation")) : nullptr;
+    auto* editPatchIndex = _viewerManager->activeSegmentationEditSurfacePatchIndex();
+    if (active && editPatchIndex && editPatchIndex->containsSurface(active)) {
+        for (auto& [surface, segments] : editPatchIndex->computePlaneIntersections(*plane, planeRoi, {active}))
+            for (const auto& segment : segments) intersections[active->id].push_back({segment.world[0], segment.world[1]});
+    }
+    if (_surfaceCatalog && _surfaceCatalog->attachment() && _surfaceCatalog->volume()) {
+        auto corner = [&](float x, float y) {
+            const cv::Vec3f p = plane->coord({0, 0, 0}, {x, y, 0.0f});
+            return vc::fibers::Point{p[0], p[1], p[2]};
+        };
+        const auto region = vc3d::store::viewRegion(corner(planeRoi.x, planeRoi.y),
+                                                    corner(planeRoi.x + planeRoi.width, planeRoi.y),
+                                                    corner(planeRoi.x, planeRoi.y + planeRoi.height), 1.0);
+        if (region) {
+            try {
+                _surfaceCatalog->session()->read(*_surfaceCatalog->attachment(), [&](const auto& db, const auto& txn, const auto&) {
+                    vc::objects::RegionOptions options;
+                    options.kind = "surface";
+                    options.volume = _surfaceCatalog->volume()->id();
+                    for (const auto& run : db.geometryRegion(txn, vc3d::store::regionSlice(*region), options).runs) {
+                        if (active && run.objectUuid == active->id && intersections.contains(active->id)) continue;
+                        auto& out = intersections[run.objectUuid];
+                        for (size_t i = 1; i < run.points.size(); ++i)
+                            out.push_back({cv::Vec3f(run.points[i - 1][0], run.points[i - 1][1], run.points[i - 1][2]),
+                                           cv::Vec3f(run.points[i][0], run.points[i][1], run.points[i][2])});
+                    }
+                });
+            } catch (const std::exception& error) {
+                Logger()->warn("Relative winding surface query failed: {}", error.what());
+            }
         }
-        auto partial = index->computePlaneIntersections(*plane, planeRoi, targetSurfaces);
-        for (auto& [surface, segments] : partial) {
-            auto& out = intersections[surface];
-            out.insert(out.end(), segments.begin(), segments.end());
-        }
-    };
-    appendIntersections(patchIndex);
-    appendIntersections(editPatchIndex);
+    }
     if (intersections.empty()) {
         return 0;
     }
@@ -2062,8 +2030,8 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
 
         for (const auto& [surface, segments] : intersections) {
             for (const auto& segment : segments) {
-                const cv::Vec3f aProj = plane->project(segment.world[0], 1.0f, 1.0f);
-                const cv::Vec3f bProj = plane->project(segment.world[1], 1.0f, 1.0f);
+                const cv::Vec3f aProj = plane->project(segment[0], 1.0f, 1.0f);
+                const cv::Vec3f bProj = plane->project(segment[1], 1.0f, 1.0f);
                 if (!std::isfinite(aProj[0]) || !std::isfinite(aProj[1]) ||
                     !std::isfinite(bProj[0]) || !std::isfinite(bProj[1])) {
                     continue;
@@ -2091,9 +2059,7 @@ int SeedingWidget::findPatchIntersectionsAlongPathToCollection(const PathPrimiti
         if (a.pathDistance != b.pathDistance) {
             return a.pathDistance < b.pathDistance;
         }
-        const std::string aId = a.surface ? a.surface->id : std::string();
-        const std::string bId = b.surface ? b.surface->id : std::string();
-        return aId < bId;
+        return a.surface < b.surface;
     });
 
     const float mergeDistance = std::max(1e-3f, tolerance);

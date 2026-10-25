@@ -96,6 +96,30 @@ inline double viewSpan(const Region& s)
 {
     return std::min(s.local.upper[0] - s.local.lower[0], s.local.upper[1] - s.local.lower[1]);
 }
+// The slab of half depth `halfDepth` around the view rectangle whose corners
+// are `origin` (top left), `right` (top right) and `down` (bottom left), in
+// the query's coordinates. Nothing for a degenerate rectangle.
+inline std::optional<Region> viewRegion(const vc::fibers::Point& origin, const vc::fibers::Point& right,
+                                        const vc::fibers::Point& down, double halfDepth)
+{
+    auto sub = [](const auto& a, const auto& b) { return vc::fibers::Point{a[0] - b[0], a[1] - b[1], a[2] - b[2]}; };
+    auto dot = [](const auto& a, const auto& b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+    const auto x = sub(right, origin), y = sub(down, origin);
+    const double width = std::sqrt(dot(x, x)), height = std::sqrt(dot(y, y));
+    Region s;
+    s.origin = origin;
+    for (int i = 0; i < 3; ++i) {
+        s.u[i] = x[i] / width;
+        s.v[i] = y[i] / height;
+    }
+    s.n = {s.u[1] * s.v[2] - s.u[2] * s.v[1], s.u[2] * s.v[0] - s.u[0] * s.v[2], s.u[0] * s.v[1] - s.u[1] * s.v[0]};
+    const double normal = std::sqrt(dot(s.n, s.n));
+    if (!(width > 0) || !(height > 0) || !(normal > 0) || !std::isfinite(normal)) return std::nullopt;
+    for (auto& c : s.n) c /= normal;
+    s.local = {{0, 0, -halfDepth}, {width, height, halfDepth}};
+    s.box = regionBox(s);
+    return s;
+}
 inline vc::objects::RegionSlice regionSlice(const Region& s)
 {
     vc::objects::RegionSlice slice;

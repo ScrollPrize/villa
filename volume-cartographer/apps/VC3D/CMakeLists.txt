@@ -175,6 +175,9 @@ set(srcs
     segmentation/SegmentationModule_Input.cpp
     segmentation/SegmentationModule_Session.cpp
     overlays/SegmentationOverlayController.cpp
+    overlays/StoreSurfaceOverlayController.cpp
+    overlays/StoreSurfaceOverlayController.hpp
+    SurfaceIntersectionStyle.hpp
     overlays/SegmentationOverlayController.hpp
     overlays/PointsOverlayController.cpp
     overlays/PointsOverlayController.hpp

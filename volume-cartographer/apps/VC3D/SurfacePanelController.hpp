@@ -132,6 +132,7 @@ signals:
     void surfaceSelectionCleared();
     void filtersApplied(int hiddenCount);
     void visibleSurfacesChanged(const std::vector<std::string>& ids);
+    void highlightedSurfacesChanged(const std::vector<std::string>& ids);
     void surfaceActivated(const QString& id, const std::shared_ptr<QuadSurface>& surface);
     void surfaceActivatedPreserveEditing(const QString& id, const std::shared_ptr<QuadSurface>& surface);
     void addSurfaceToSpiralFitRequested(const QString& segmentId);

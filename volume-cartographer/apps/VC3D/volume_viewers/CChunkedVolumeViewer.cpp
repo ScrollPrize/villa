@@ -1,4 +1,5 @@
 #include "CChunkedVolumeViewer.hpp"
+#include "SurfaceIntersectionStyle.hpp"
 #include "SurfaceRenderPolicy.hpp"
 
 #include <atomic>
@@ -121,37 +122,17 @@ constexpr int kSurfaceTileRenderDebounceMs = 50;
 constexpr float kPanSmoothingAlpha = 0.65f;
 constexpr int kSurfaceCellTileSize = 64;
 
-constexpr std::array<QRgb, 12> kIntersectionPalette = {
-    qRgb(255, 120, 120), qRgb(120, 200, 255), qRgb(120, 255, 140),
-    qRgb(255, 220, 100), qRgb(220, 140, 255), qRgb(255, 160, 200),
-    qRgb(140, 255, 220), qRgb(200, 255, 140), qRgb(255, 180, 120),
-    qRgb(180, 200, 255), qRgb(255, 140, 180), qRgb(160, 255, 180),
-};
-constexpr int kIntersectionZ = 100;
+using vc3d::kIntersectionPalette;
+using vc3d::kIntersectionZ;
+using vc3d::kHighlightedIntersectionZ;
+using vc3d::kActiveIntersectionZ;
 constexpr const char* kMeasurementOverlayKey = "segmentation_measurement";
 
-constexpr int kHighlightedIntersectionZ = 110;
-constexpr int kActiveIntersectionZ = 120;
 constexpr float kActiveIntersectionOpacityScale = 1.2f;
 constexpr float kActiveIntersectionWidthScale = 1.3f;
 constexpr float kActiveIntersectionMinWidthDelta = 0.75f;
 constexpr float kApprovalPlaneIntersectionScale = 1.5f;
 constexpr float kFocusProjectionThreshold = 4.0f;
-
-std::optional<QColor> segmentFolderColorOverride(const QuadSurface* surface)
-{
-    if (!surface || surface->meta.is_null() || !surface->meta.contains("vc3d_segment_folder_color")) {
-        return std::nullopt;
-    }
-    const auto& color = surface->meta["vc3d_segment_folder_color"];
-    if (!color.is_array() || color.size() < 3) {
-        return std::nullopt;
-    }
-    auto channel = [&](size_t index) {
-        return std::clamp(static_cast<int>(std::lround(color.at(index).get_double())), 0, 255);
-    };
-    return QColor(channel(0), channel(1), channel(2));
-}
 
 struct IntersectionStyle {
     QRgb color = 0;
@@ -6767,10 +6748,8 @@ void CChunkedVolumeViewer::renderIntersections(const char* reason, std::source_l
             opacity *= kActiveIntersectionOpacityScale;
             penWidth = activeSegmentationIntersectionWidth(penWidth);
         } else if (_highlightedSurfaceIds.count(target->id)) {
-            baseColor = QColor(0, 220, 255);
+            baseColor = vc3d::highlightedIntersectionColor();
             zValue = kHighlightedIntersectionZ;
-        } else if (auto folderColor = segmentFolderColorOverride(target.get())) {
-            baseColor = *folderColor;
         } else {
             const auto& id = target->id;
             auto it = _surfaceColorAssignments.find(id);

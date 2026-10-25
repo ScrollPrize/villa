@@ -43,7 +43,6 @@ using vc::fibers::Bounds;
 using vc::fibers::Point;
 using Json = nlohmann::json;
 using vc3d::store::background;
-using vc3d::store::regionBox;
 using vc3d::store::Outcome;
 namespace
 {
@@ -56,22 +55,9 @@ Point point(const cv::Vec3f& p, double scale = 1)
 {
     return {p[0] * scale, p[1] * scale, p[2] * scale};
 }
-Point sub(const Point& a, const Point& b)
-{
-    return {a[0] - b[0], a[1] - b[1], a[2] - b[2]};
-}
 double dot(const Point& a, const Point& b)
 {
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-}
-Point normalized(Point p)
-{
-    const double n = std::sqrt(dot(p, p));
-    if (!(n > 0))
-        throw std::runtime_error("Degenerate slice frame");
-    for (auto& x : p)
-        x /= n;
-    return p;
 }
 bool inside(const Point& local, const Bounds& bounds)
 {
@@ -662,21 +648,10 @@ std::optional<FiberCollectionController::Slice> FiberCollectionController::slice
     const auto rect = visibleSceneRect(viewer);
     if (rect.isEmpty())
         return std::nullopt;
-    Slice s;
-    s.origin = point(viewer->sceneToVolume(rect.topLeft()), 1 / nativeToViewer_);
-    const auto x = point(viewer->sceneToVolume(rect.topRight()), 1 / nativeToViewer_);
-    const auto y = point(viewer->sceneToVolume(rect.bottomLeft()), 1 / nativeToViewer_);
-    try {
-        s.u = normalized(sub(x, s.origin));
-        s.v = normalized(sub(y, s.origin));
-        s.n = normalized({s.u[1] * s.v[2] - s.u[2] * s.v[1], s.u[2] * s.v[0] - s.u[0] * s.v[2], s.u[0] * s.v[1] - s.u[1] * s.v[0]});
-    } catch (...) {
-        return std::nullopt;
-    }
-    const double d = options_.sliceDistance;
-    s.local = {{0, 0, -d}, {std::sqrt(dot(sub(x, s.origin), sub(x, s.origin))), std::sqrt(dot(sub(y, s.origin), sub(y, s.origin))), d}};
-    s.box = regionBox(s);
-    return s;
+    return vc3d::store::viewRegion(point(viewer->sceneToVolume(rect.topLeft()), 1 / nativeToViewer_),
+                                   point(viewer->sceneToVolume(rect.topRight()), 1 / nativeToViewer_),
+                                   point(viewer->sceneToVolume(rect.bottomLeft()), 1 / nativeToViewer_),
+                                   options_.sliceDistance);
 }
 bool FiberCollectionController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {

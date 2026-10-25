@@ -62,6 +62,11 @@ public:
     // demand from the same revision. Throws when it cannot be read.
     Opened open(const std::string& uuid) const;
 
+    // Surfaces (among `uuids`, all when nullopt) within `tolerance` voxels of a
+    // volume point, nearest first. Synchronous.
+    std::vector<vc::objects::SurfaceProximityHit> nearest(const std::array<double, 3>& point, double tolerance,
+        const std::optional<std::vector<std::string>>& uuids = std::nullopt) const;
+
     // Record edits: they commit at once and reach rows() through the commit events.
     void setTags(const std::string& uuid, const std::vector<std::string>& tags);
     void rename(const std::string& uuid, const std::string& name);

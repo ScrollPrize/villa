@@ -206,3 +206,17 @@ std::string SurfaceCatalog::create(QuadSurface& surface, const std::string& name
     surface.id = uuid;
     return uuid;
 }
+
+std::vector<SurfaceProximityHit> SurfaceCatalog::nearest(const std::array<double, 3>& point, double tolerance,
+                                                         const std::optional<std::vector<std::string>>& uuids) const
+{
+    std::vector<SurfaceProximityHit> hits;
+    if (!attachment_ || !volume_) return hits;
+    SurfaceProximityQuery query;
+    query.point = point;
+    query.tolerance = tolerance;
+    query.uuids = uuids;
+    query.volume = volume_->id();
+    session_->read(*attachment_, [&](const auto& db, const auto& txn, const auto&) { hits = db.nearestSurfaces(txn, query); });
+    return hits;
+}

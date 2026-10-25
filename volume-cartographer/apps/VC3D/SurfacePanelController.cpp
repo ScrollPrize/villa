@@ -1736,10 +1736,11 @@ void SurfacePanelController::applyHighlightSelection(const std::string& id, bool
         _highlightedSurfaceIds.erase(id);
     }
 
+    std::vector<std::string> ids(_highlightedSurfaceIds.begin(), _highlightedSurfaceIds.end());
     if (_viewerManager) {
-        std::vector<std::string> ids(_highlightedSurfaceIds.begin(), _highlightedSurfaceIds.end());
         _viewerManager->setHighlightedSurfaceIds(ids);
     }
+    emit highlightedSurfacesChanged(ids);
 }
 
 void SurfacePanelController::setHighlightedSurfaceIds(const std::vector<std::string>& ids)
@@ -1751,10 +1752,11 @@ void SurfacePanelController::setHighlightedSurfaceIds(const std::vector<std::str
         }
     }
 
+    std::vector<std::string> live(_highlightedSurfaceIds.begin(), _highlightedSurfaceIds.end());
     if (_viewerManager) {
-        std::vector<std::string> live(_highlightedSurfaceIds.begin(), _highlightedSurfaceIds.end());
         _viewerManager->setHighlightedSurfaceIds(live);
     }
+    emit highlightedSurfacesChanged(live);
 }
 
 std::vector<std::string> SurfacePanelController::highlightedSurfaceIds() const

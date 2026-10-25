@@ -654,18 +654,10 @@ void ViewerManager::handleVolumeClicked(cv::Vec3f volLoc, cv::Vec3f normal, Surf
         if (!dynamic_cast<PlaneSurface*>(surf)) {
             return;
         }
-        if (auto* patchIndex = surfacePatchIndexIfReady()) {
-            static constexpr float kPatchPickToleranceVoxels = 10.0f;
-            SurfacePatchIndex::PointQuery query;
-            query.worldPoint = volLoc;
-            query.tolerance = kPatchPickToleranceVoxels;
-            if (const auto hit = patchIndex->locate(query)) {
-                const auto current = std::dynamic_pointer_cast<QuadSurface>(
-                    _state ? _state->surface("segmentation") : nullptr);
-                if (hit->surface && hit->surface != current &&
-                    !hit->surface->id.empty()) {
-                    emit surfaceActivationRequested(hit->surface->id);
-                }
+        static constexpr float kPatchPickToleranceVoxels = 10.0f;
+        if (_surfacePicker) {
+            if (const auto id = _surfacePicker(volLoc, kPatchPickToleranceVoxels)) {
+                emit surfaceActivationRequested(*id);
             }
         }
         std::string surfId;
@@ -812,33 +804,6 @@ void ViewerManager::setPlaneIntersectionLinesVisible(bool visible)
     forEachBaseViewer([visible](VolumeViewerBase* viewer) {
         if (viewer) {
             viewer->setPlaneIntersectionLinesVisible(visible);
-        }
-    });
-}
-
-void ViewerManager::setSurfaceOverlaysEnabled(bool enabled)
-{
-    forEachBaseViewer([enabled](VolumeViewerBase* viewer) {
-        if (viewer) {
-            viewer->setSurfaceOverlayEnabled(enabled);
-        }
-    });
-}
-
-void ViewerManager::setSurfaceOverlapThreshold(float threshold)
-{
-    forEachBaseViewer([threshold](VolumeViewerBase* viewer) {
-        if (viewer) {
-            viewer->setSurfaceOverlapThreshold(threshold);
-        }
-    });
-}
-
-void ViewerManager::setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays)
-{
-    forEachBaseViewer([&overlays](VolumeViewerBase* viewer) {
-        if (viewer) {
-            viewer->setSurfaceOverlays(overlays);
         }
     });
 }
@@ -1315,66 +1280,11 @@ SurfacePatchIndex* ViewerManager::activeSegmentationEditSurfacePatchIndex() cons
     return _segmentationModule ? _segmentationModule->activeEditSurfacePatchIndex() : nullptr;
 }
 
-void ViewerManager::setSurfacePatchIndexCacheKey(const QString& key)
-{
-    if (key == _surfacePatchIndexCacheKey) {
-        return;
-    }
-    const bool primeBusy = _surfacePatchIndexWatcher && _surfacePatchIndexWatcher->isRunning();
-    const bool taskBusy = (_surfacePatchIndexTaskWatcher && _surfacePatchIndexTaskWatcher->isRunning()) ||
-                          !_pendingSurfacePatchIndexTasks.empty();
-    // Stash the live index under the outgoing key so returning to that folder
-    // selection can skip the full rebuild. Only safe when the index is current
-    // and no worker is reading or mutating it; otherwise it is simply dropped
-    // and rebuilt on return like before.
-    if (!_surfacePatchIndexCacheKey.isEmpty() && !_surfacePatchIndexNeedsRebuild &&
-        !_surfacePatchIndex.empty() && !primeBusy && !taskBusy &&
-        !_deferredIndexSwap && _indexReadsInFlight == 0) {
-        CachedSurfacePatchIndex entry;
-        entry.index = std::move(_surfacePatchIndex);
-        entry.ids = std::move(_indexedSurfaceIds);
-        _surfacePatchIndexCache.insert_or_assign(_surfacePatchIndexCacheKey, std::move(entry));
-        _surfacePatchIndex = SurfacePatchIndex{};
-        _surfacePatchIndex.setSamplingStride(_surfacePatchSamplingStride);
-        VC3D_DEBUG_QCINFO(lcViewerManager) << "Stashed SurfacePatchIndex for" << _surfacePatchIndexCacheKey;
-    }
-    // The old folder's surfaces are about to be unbound; clearing the indexed
-    // ids keeps handleSurfaceWillBeDeleted from queueing per-cell rtree
-    // removals for surfaces the next prime replaces wholesale anyway.
-    _indexedSurfaceIds.clear();
-    _surfacePatchIndexNeedsRebuild = true;
-    _surfacePatchIndexCacheKey = key;
-    forEachBaseViewer([](VolumeViewerBase* v) { v->invalidateIntersect(); });
-}
-
-void ViewerManager::clearSurfacePatchIndexCache()
-{
-    _surfacePatchIndexCache.clear();
-    _surfacePatchIndexCacheKey.clear();
-}
-
-void ViewerManager::invalidateSurfacePatchIndexCacheFor(const SurfacePatchIndex::SurfacePtr& surface)
-{
-    if (!surface) {
-        return;
-    }
-    // The surface's geometry changed; any stashed index containing it would
-    // pass the instance-identity check on reuse while holding stale patches.
-    for (auto it = _surfacePatchIndexCache.begin(); it != _surfacePatchIndexCache.end();) {
-        if (it->second.index.containsSurface(surface)) {
-            it = _surfacePatchIndexCache.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
 void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface)
 {
     if (!surface) {
         return;
     }
-    invalidateSurfacePatchIndexCacheFor(surface);
     // An intersection worker is reading the index now: defer the in-place mutation
     // (mark dirty -> rebuilt on the next query) instead of tearing the read.
     if (_indexReadsInFlight > 0) { _surfacePatchIndexNeedsRebuild = true; return; }
@@ -1410,7 +1320,6 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
         VC3D_DEBUG_QCINFO(lcViewerManager) << "Skipped SurfacePatchIndex update (no changes)";
         return;
     }
-    invalidateSurfacePatchIndexCacheFor(surface);
     if (_indexReadsInFlight > 0) { _surfacePatchIndexNeedsRebuild = true; return; }  // defer: worker reading
 
     const std::string surfId = surface->id;
@@ -1462,9 +1371,6 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     std::unordered_set<SurfacePatchIndex::SurfacePtr> seenSurfaces;
     for (const auto& surface : allSurfaces) {
         if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surface)) {
-            if (vc3d::opendata::isOpenDataSegmentPlaceholder(quad->path)) {
-                continue;
-            }
             // Skip if we've already seen this surface (shared_ptr hash uses underlying pointer)
             if (seenSurfaces.insert(quad).second) {
                 quadSurfaces.push_back(quad);
@@ -1501,47 +1407,6 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
                     })) {
         _pendingSurfacePatchIndexSurfaceIds.clear();
         return;
-    }
-
-    // A folder-selection switch may have stashed a still-valid index for this
-    // exact surface set — swap it back in instead of rebuilding.
-    if (auto cacheIt = _surfacePatchIndexCache.find(_surfacePatchIndexCacheKey);
-        cacheIt != _surfacePatchIndexCache.end()) {
-        CachedSurfacePatchIndex entry = std::move(cacheIt->second);
-        _surfacePatchIndexCache.erase(cacheIt);
-        const bool matches =
-            entry.index.samplingStride() == _surfacePatchSamplingStride &&
-            entry.index.surfaceCount() == quadSurfaces.size() &&
-            std::all_of(quadSurfaces.begin(), quadSurfaces.end(),
-                        [&entry](const SurfacePatchIndex::SurfacePtr& quad) {
-                            return entry.index.containsSurface(quad);
-                        });
-        if (matches) {
-            _surfacesQueuedDuringRebuild.clear();
-            _pendingSurfacePatchIndexSurfaceIds.clear();
-            if (_indexReadsInFlight > 0) {
-                // A worker is reading the live index; apply via the deferred
-                // swap path once reads drain.
-                _deferredIndexSwap = std::make_shared<SurfacePatchIndex>(std::move(entry.index));
-                _deferredIndexSwapIds.assign(surfaceIds.begin(), surfaceIds.end());
-                _surfacePatchIndexNeedsRebuild = false;
-                return;
-            }
-            _surfacePatchIndex = std::move(entry.index);
-            _indexedSurfaceIds = std::move(entry.ids);
-            _surfacePatchIndexNeedsRebuild = false;
-            VC3D_DEBUG_QCINFO(lcViewerManager) << "Reused stashed SurfacePatchIndex for"
-                                    << _indexedSurfaceIds.size() << "surfaces"
-                                    << "(" << _surfacePatchIndexCacheKey << ")";
-            forEachBaseViewer([](VolumeViewerBase* v) {
-                v->invalidateIntersect();
-                v->renderIntersections("surface index cache hit");
-            });
-            scheduleSurfacePatchIndexOverlayRefresh();
-            return;
-        }
-        // Entry went stale (surfaces reloaded, deleted, or stride changed);
-        // it was dropped above — fall through to a full rebuild.
     }
 
     // Clear rebuild flag since we're about to do an async build
@@ -1794,7 +1659,6 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
     if (_surfacePatchIndex.hasPendingUpdates(quad)) {
         // Pending cell updates mean real geometry changes; stashed indexes
         // containing this surface are stale.
-        invalidateSurfacePatchIndexCacheFor(quad);
         const bool flushed = _surfacePatchIndex.flushPendingUpdates(quad);
         if (flushed) {
             _indexedSurfaceIds.insert(surfId);
