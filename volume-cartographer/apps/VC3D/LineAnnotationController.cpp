@@ -4,6 +4,7 @@
 #include <vc_object_store/objects/GeometryEdits.hpp>
 #include <vc_object_store/objects/GeometryIngest.hpp>
 #include "ObjectStoreCoordinates.hpp"
+#include "BindCoordinatesPrompt.hpp"
 #include "ObjectStoreEvents.hpp"
 #include "ObjectStoreRegions.hpp"
 #include "ObjectStoreArtifacts.hpp"
@@ -17854,25 +17855,18 @@ bool LineAnnotationController::ensureFiberInVolume(uint64_t id, bool prompt)
         if (!record) throw std::runtime_error("Fiber revision missing");
         metadata=Json::parse(record->record.meta);
     });
-    const auto coordinates=metadata.value("coordinates",Json::object());
-    const auto shape=volume->shape();
     const auto source=metadata.value("source",Json::object());
-    Json known=coordinates;
+    Json known=metadata.value("coordinates",Json::object());
     for(const auto* key:{"coordinate_base_shape_zyx","vc_open_data_coordinate_space","vc_open_data_source_coordinate_scale_factor","vc_open_data_resolution_um"})
         if(source.contains(key)) known[key]=source[key];
     cv::Vec3d lower{INFINITY,INFINITY,INFINITY},upper{-INFINITY,-INFINITY,-INFINITY};
     for (const auto& point : fiber.linePoints) for(int axis=0;axis<3;++axis) {
         lower[axis]=std::min(lower[axis],point[axis]);upper[axis]=std::max(upper[axis],point[axis]);
     }
-    const auto message=tr("Assign this fiber to the active volume?\n\nVolume: %1\nDimensions Z/Y/X: %2 / %3 / %4\nResolution: %5 µm\nFiber metadata: %6\nFiber bounds XYZ: (%7, %8, %9) – (%10, %11, %12)\n\nEnter stored fiber units per active-volume voxel. No scale is assumed.")
-        .arg(QString::fromStdString(volume->id())).arg(shape[0]).arg(shape[1]).arg(shape[2]).arg(volume->voxelSize())
-        .arg(QString::fromStdString(known.dump())).arg(lower[0]).arg(lower[1]).arg(lower[2]).arg(upper[0]).arg(upper[1]).arg(upper[2]);
-    bool accepted=false;
-    const auto answer=QInputDialog::getText(_parentWidget.data(),tr("Bind Fiber Coordinates"),message,QLineEdit::Normal,{},&accepted);
-    if (!accepted) return false;
-    bool valid=false;const double scale=answer.toDouble(&valid);
-    if (!valid || !(scale>0) || !std::isfinite(scale)) { showError(tr("Enter a positive finite coordinate scale."));return false; }
-    vc3d::bindCoordinates(*connection,pin.attachment,fiber.uuid,pin.objectRevision,*volume,scale);
+    const auto scale=vc3d::promptStoredUnitsPerVoxel(_parentWidget.data(),tr("Bind Fiber Coordinates"),tr("fiber"),*volume,known,
+        tr("Fiber bounds XYZ: (%1, %2, %3) – (%4, %5, %6)").arg(lower[0]).arg(lower[1]).arg(lower[2]).arg(upper[0]).arg(upper[1]).arg(upper[2]));
+    if (!scale) return false;
+    vc3d::bindCoordinates(*connection,pin.attachment,fiber.uuid,pin.objectRevision,*volume,*scale);
     return true;
 }
 

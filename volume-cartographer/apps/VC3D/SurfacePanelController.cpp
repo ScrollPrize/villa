@@ -1,4 +1,5 @@
 #include "SurfacePanelController.hpp"
+#include "BindCoordinatesPrompt.hpp"
 
 #include "SurfaceTreeWidget.hpp"
 #include "ViewerManager.hpp"
@@ -634,24 +635,13 @@ void SurfacePanelController::bindSurface(const std::string& id)
     if (!volume || !row || !_catalog->attachment()) {
         return;
     }
-    const auto shape = volume->shape();
-    const auto message = tr("Bind this surface to the active volume?\n\nVolume: %1\nDimensions Z/Y/X: %2 / %3 / %4\nResolution: %5 µm\n"
-                            "Surface metadata: %6\n\nEnter stored surface units per active-volume voxel. No scale is assumed.")
-        .arg(QString::fromStdString(volume->id())).arg(shape[0]).arg(shape[1]).arg(shape[2]).arg(volume->voxelSize())
-        .arg(QString::fromStdString(row_meta(*row).value("coordinates", nlohmann::json::object()).dump()));
-    bool accepted = false;
-    const auto answer = QInputDialog::getText(_ui.treeWidget, tr("Bind Surface Coordinates"), message, QLineEdit::Normal, {}, &accepted);
-    if (!accepted) {
-        return;
-    }
-    bool valid = false;
-    const double scale = answer.toDouble(&valid);
-    if (!valid || !(scale > 0) || !std::isfinite(scale)) {
-        QMessageBox::warning(_ui.treeWidget, tr("Bind Surface Coordinates"), tr("Enter a positive finite coordinate scale."));
+    const auto scale = vc3d::promptStoredUnitsPerVoxel(_ui.treeWidget, tr("Bind Surface Coordinates"), tr("surface"), *volume,
+                                                       row_meta(*row).value("coordinates", nlohmann::json::object()));
+    if (!scale) {
         return;
     }
     try {
-        _catalog->bind(id, scale);
+        _catalog->bind(id, *scale);
     } catch (const std::exception& error) {
         QMessageBox::critical(_ui.treeWidget, tr("Bind Failed"), QString::fromUtf8(error.what()));
     }
