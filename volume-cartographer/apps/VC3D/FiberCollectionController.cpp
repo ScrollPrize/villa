@@ -197,6 +197,20 @@ std::map<std::string, vc::objects::VolumeAffine> volumeMappings(const vc::object
             mappings.emplace(object.uuid, *mapping);
     return mappings;
 }
+
+// The control points of fiber geometry revisions in a volume's voxels
+// (`mappings[i]` maps revision i's stored frame).
+std::vector<std::vector<std::array<double, 3>>> controlsInVolume(const vc::objects::ObjectStore& db, const vc::objects::ReadTxn& txn,
+    const std::vector<std::string>& revisions, const std::vector<vc::objects::VolumeAffine>& mappings)
+{
+    const auto controls = db.readGeometryArrays(txn, revisions, "control_points");
+    if (controls.dtype != "<f8") throw std::runtime_error("fiber control points must be float64");
+    std::vector<std::vector<std::array<double, 3>>> result(revisions.size());
+    for (size_t i = 0; i < revisions.size(); ++i)
+        for (const auto& position : vc::objects::xyzFromBytes<double>(vc::objects::packedItem(controls, i)))
+            result[i].push_back(mappings[i].apply(position));
+    return result;
+}
 }  // namespace
 
 struct FiberCollectionController::View {
@@ -712,18 +726,17 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
                 if (drawn.empty()) return;
                 const auto mappings = volumeMappings(db, txn, drawn, volume);
                 std::vector<std::string> revisions, owners;
+                std::vector<vc::objects::VolumeAffine> ownerMappings;
                 for (const auto& [uuid, sampledRevision] : drawn)
-                    if (sampledRevision && mappings.contains(uuid)) { revisions.push_back(*sampledRevision); owners.push_back(uuid); }
-                if (!revisions.empty()) {
-                    const auto controls = db.readGeometryArrays(txn, revisions, "control_points");
-                    if (controls.dtype != "<f8") throw std::runtime_error("fiber control points must be float64");
-                    for (size_t i = 0; i < owners.size(); ++i) {
-                        const auto positions = vc::objects::xyzFromBytes<double>(vc::objects::packedItem(controls, i));
-                        for (size_t k = 0; k < positions.size(); ++k) {
-                            const auto position = mappings.at(owners[i]).apply(positions[k]);
-                            result.controls.push_back({owners[i], int(k), position});
-                        }
+                    if (sampledRevision && mappings.contains(uuid)) {
+                        revisions.push_back(*sampledRevision);
+                        owners.push_back(uuid);
+                        ownerMappings.push_back(mappings.at(uuid));
                     }
+                if (!revisions.empty()) {
+                    const auto controls = controlsInVolume(db, txn, revisions, ownerMappings);
+                    for (size_t i = 0; i < owners.size(); ++i)
+                        for (size_t k = 0; k < controls[i].size(); ++k) result.controls.push_back({owners[i], int(k), controls[i][k]});
                 }
                 if (!linked) return;
                 vc::objects::EdgeSelection edges;
@@ -1031,17 +1044,16 @@ void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const st
                     mappings.push_back(*mapping);
                 }
                 if (revisions.empty()) return;
-                const auto controls = db.readGeometryArrays(txn, revisions, "control_points");
+                const auto controls = controlsInVolume(db, txn, revisions, mappings);
                 const auto ids = db.readGeometryArrays(txn, revisions, "control_point_ids");
-                if (controls.dtype != "<f8" || ids.dtype != "<i8") throw std::runtime_error("unexpected fiber control point arrays");
+                if (ids.dtype != "<i8") throw std::runtime_error("fiber control point IDs must be int64");
                 std::map<std::string, std::pair<size_t, std::unordered_map<int64_t, size_t>>> controlIndex;
                 for (size_t i = 0; i < uuids.size(); ++i) {
                     ChainResult::Chain chain;
                     chain.uuid = uuids[i];
                     auto& index = controlIndex[uuids[i]];
                     index.first = result.chains.size();
-                    for (const auto& position : vc::objects::xyzFromBytes<double>(vc::objects::packedItem(controls, i)))
-                        chain.points.push_back(cvpoint(mappings[i].apply(position)));
+                    for (const auto& position : controls[i]) chain.points.push_back(cvpoint(position));
                     const auto controlIds = vc::objects::scalarsFromBytes<int64_t>(vc::objects::packedItem(ids, i));
                     for (size_t k = 0; k < controlIds.size(); ++k) index.second[controlIds[k]] = k;
                     chain.linkMarks.assign(chain.points.size(), LinkMark{});
