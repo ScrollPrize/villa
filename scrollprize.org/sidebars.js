@@ -32,6 +32,7 @@ const sidebars = {
         { type: 'doc', id: 'tutorial_spiral' },
         { type: 'doc', id: 'winding_annotations' },
         { type: 'doc', id: 'tutorial5' },
+        { type: 'doc', id: 'tutorial_mac' },
         {
           type: 'link',
           label: 'Scroll Anatomy',
