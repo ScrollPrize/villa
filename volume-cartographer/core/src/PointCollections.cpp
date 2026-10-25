@@ -683,50 +683,17 @@ const Json& PointCollections::fileMetadata() const
     return _fileMetadata;
 }
 
-bool PointCollections::saveToSegmentPath(const std::filesystem::path& segmentPath) const
+std::map<uint64_t, Json> PointCollections::anchoredCollections() const
 {
-    if (segmentPath.empty()) {
-        return false;
-    }
-
-    auto filePath = segmentPath / "corrections.json";
-
-    // Filter to only collections with anchor2d set
-    Json collections_obj = Json::object();
-    int anchoredCount = 0;
-    for (const auto& pair : _collections) {
-        if (pair.second.anchor2d.has_value()) {
+    std::map<uint64_t, Json> result;
+    for (const auto& [id, collection] : _collections) {
+        if (collection.anchor2d.has_value()) {
             Json cj;
-            to_json(cj, pair.second);
-            collections_obj[std::to_string(pair.first)] = cj;
-            anchoredCount++;
+            to_json(cj, collection);
+            result.emplace(id, std::move(cj));
         }
     }
-
-    // If no anchored collections exist, remove the file if it exists
-    if (anchoredCount == 0) {
-        std::error_code ec;
-        if (std::filesystem::exists(filePath, ec)) {
-            std::filesystem::remove(filePath, ec);
-            std::cerr << "Removed empty corrections file: " << filePath.string() << std::endl;
-        }
-        return true;
-    }
-
-    Json j = _fileMetadata.is_object() ? _fileMetadata : Json::object();
-    j["vc_pointcollections_json_version"] = VC_POINTCOLLECTIONS_JSON_VERSION;
-    j["collections"] = collections_obj;
-
-    std::ofstream o(filePath);
-    if (!o.is_open()) {
-        std::cerr << "Failed to open corrections file for writing: " << filePath.string() << std::endl;
-        return false;
-    }
-    o << j.dump(4);
-    o.close();
-
-    std::cerr << "Saved " << anchoredCount << " anchored correction collections to " << filePath.string() << std::endl;
-    return true;
+    return result;
 }
 
 void PointCollections::applyAnchorOffset(float offsetX, float offsetY)
@@ -751,105 +718,56 @@ void PointCollections::applyAnchorOffset(float offsetX, float offsetY)
     }
 }
 
-bool PointCollections::loadFromSegmentPath(const std::filesystem::path& segmentPath)
+bool PointCollections::replaceAnchoredCollections(const std::map<uint64_t, Json>& collections)
 {
-    // Clear existing anchored collections (segment-specific corrections) before loading
-    // This ensures switching segments replaces old corrections with new ones
+    // Parse every collection before installing any, so malformed input does
+    // not leave a partial load behind.
+    std::vector<Collection> parsed;
+    try {
+        for (const auto& [id, json] : collections) {
+            Collection col;
+            from_json(json, col);
+            if (!col.anchor2d.has_value()) {
+                continue;
+            }
+            col.id = id;
+            parsed.push_back(std::move(col));
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Invalid correction collections: " << e.what() << std::endl;
+        return false;
+    }
+
+    // Switching surfaces replaces the previous surface's corrections.
     std::vector<uint64_t> toRemove;
     for (const auto& [id, col] : _collections) {
         if (col.anchor2d.has_value()) {
             toRemove.push_back(id);
         }
     }
-    if (!toRemove.empty()) {
-        std::cerr << "Clearing " << toRemove.size() << " existing anchored correction collections" << std::endl;
-    }
     for (uint64_t id : toRemove) {
         clearCollection(id);
     }
 
-    // If no path provided, just clear (already done above) and return success
-    if (segmentPath.empty()) {
-        return true;
-    }
-
-    auto filePath = segmentPath / "corrections.json";
-
-    std::error_code ec;
-    if (!std::filesystem::exists(filePath, ec)) {
-        // No corrections file - this is normal, not an error
-        std::cerr << "No corrections file at " << filePath.string() << std::endl;
-        return true;
-    }
-
-    Json j;
-    try {
-        j = Json::parse_file(filePath);
-    } catch (const std::exception& e) {
-        std::cerr << "Failed to parse corrections JSON: " << e.what() << std::endl;
-        return false;
-    }
-
-    try {
-        if (!j.contains("vc_pointcollections_json_version") ||
-            j.at("vc_pointcollections_json_version").get_string() != VC_POINTCOLLECTIONS_JSON_VERSION) {
-            std::cerr << "Corrections file has incorrect version" << std::endl;
-            return false;
+    std::vector<uint64_t> addedCollectionIds;
+    for (auto& col : parsed) {
+        _collections[col.id] = col;
+        for (auto& point_pair : _collections.at(col.id).points) {
+            point_pair.second.collectionId = col.id;
         }
-
-        Json collections_obj = j.at("collections");  // copy — ref into at() cache gets evicted by nested at() calls
-        if (!collections_obj.is_object()) {
-            return false;
+        if (col.id >= _next_collection_id) {
+            _next_collection_id = col.id + 1;
         }
-
-        // Parse every collection before installing any, so a malformed file
-        // does not leave a partial load behind.
-        std::vector<Collection> parsed;
-        for (auto it = collections_obj.begin(); it != collections_obj.end(); ++it) {
-            Collection col;
-            from_json(*it, col);
-            // Only load collections with anchor2d set
-            if (!col.anchor2d.has_value()) {
-                continue;
+        for (const auto& point_pair : col.points) {
+            if (point_pair.first >= _next_point_id) {
+                _next_point_id = point_pair.first + 1;
             }
-            col.id = std::stoull(it.key());
-            parsed.push_back(std::move(col));
         }
-
-        std::vector<uint64_t> addedCollectionIds;
-        int loadedCount = 0;
-
-        for (auto& col : parsed) {
-            _collections[col.id] = col;
-            for (auto& point_pair : _collections.at(col.id).points) {
-                point_pair.second.collectionId = col.id;
-            }
-
-            // Update next IDs
-            if (col.id >= _next_collection_id) {
-                _next_collection_id = col.id + 1;
-            }
-            for (const auto& point_pair : col.points) {
-                if (point_pair.first >= _next_point_id) {
-                    _next_point_id = point_pair.first + 1;
-                }
-            }
-
-            addedCollectionIds.push_back(col.id);
-            loadedCount++;
-        }
-
-        if (!addedCollectionIds.empty()) {
-            onCollectionsAdded(addedCollectionIds);
-        }
-
-        std::cerr << "Loaded " << loadedCount << " anchored correction collections from " << filePath.string() << std::endl;
-
-    } catch (const std::exception& e) {
-        std::cerr << "Failed to extract data from corrections JSON: " << e.what() << std::endl;
-        return false;
+        addedCollectionIds.push_back(col.id);
     }
-
+    if (!addedCollectionIds.empty()) {
+        onCollectionsAdded(addedCollectionIds);
+    }
     return true;
 }
 

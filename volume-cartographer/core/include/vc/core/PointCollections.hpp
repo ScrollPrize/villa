@@ -5,6 +5,7 @@
 #include <vector>
 #include <unordered_map>
 #include <cmath>
+#include <map>
 #include <optional>
 #include <filesystem>
 #include <functional>
@@ -119,10 +120,13 @@ public:
    void setFileMetadata(const utils::Json& metadata);
    [[nodiscard]] const utils::Json& fileMetadata() const;
 
-   // Path-based persistence for segment-specific corrections
-   // Only saves collections with anchor2d set (2D anchored points only)
-   bool saveToSegmentPath(const std::filesystem::path& segmentPath) const;
-   bool loadFromSegmentPath(const std::filesystem::path& segmentPath);
+   // Segment-specific corrections: the collections anchored on a surface
+   // (anchor2d set), as collection JSON by collection id.
+   [[nodiscard]] std::map<uint64_t, utils::Json> anchoredCollections() const;
+   // Replace the anchored collections with `collections` (collection JSON by
+   // id). Parses every collection before installing any; collections without
+   // anchor2d are skipped. Returns false (changing nothing) on malformed input.
+   bool replaceAnchoredCollections(const std::map<uint64_t, utils::Json>& collections);
 
    // Apply grid offset to all anchor2d values (for surface growth remapping)
    void applyAnchorOffset(float offsetX, float offsetY);

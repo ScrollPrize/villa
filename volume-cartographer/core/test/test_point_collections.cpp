@@ -170,36 +170,35 @@ TEST_CASE("missing-id queries are safe")
     CHECK(c.getAutoFillMode(999) == PointCollections::WindingFillMode::None);
 }
 
-TEST_CASE("segment-path round-trip (anchored collections only)")
+TEST_CASE("anchored collections round-trip (anchored collections only)")
 {
-    const fs::path dir = fs::temp_directory_path() /
-        ("pc_seg_" + std::to_string(::getpid()));
-    fs::create_directories(dir);
-
     PointCollections c;
     c.addPoint("anchored", {1, 2, 3});
     c.addPoint("plain", {4, 5, 6});
     const uint64_t anchored = c.getCollectionId("anchored").value();
     const std::string anchoredUuid = c.getAllCollections().at(anchored).uuid;
     c.setCollectionAnchor2d(anchored, cv::Vec2f(8, 9));
-    REQUIRE(c.saveToSegmentPath(dir));
-    CHECK(fs::exists(dir / "corrections.json"));
+    const auto saved = c.anchoredCollections();
+    REQUIRE(saved.size() == 1);
 
     PointCollections loaded;
-    REQUIRE(loaded.loadFromSegmentPath(dir));
-    // Only the anchored collection is persisted.
-    bool has_anchored = false, has_plain = false;
+    loaded.addPoint("previous", {0, 0, 0});
+    loaded.setCollectionAnchor2d(loaded.getCollectionId("previous").value(), cv::Vec2f(1, 1));
+    REQUIRE(loaded.replaceAnchoredCollections(saved));
+    // Only the anchored collection is carried, and it replaces the previous surface's.
+    bool has_anchored = false, has_plain = false, has_previous = false;
     for (const auto& [id, col] : loaded.getAllCollections()) {
         if (col.name == "anchored") {
             has_anchored = true;
             CHECK(col.uuid == anchoredUuid);
+            CHECK(col.anchor2d == cv::Vec2f(8, 9));
         }
         if (col.name == "plain") has_plain = true;
+        if (col.name == "previous") has_previous = true;
     }
     CHECK(has_anchored);
     CHECK_FALSE(has_plain);
-
-    fs::remove_all(dir);
+    CHECK_FALSE(has_previous);
 }
 
 TEST_CASE("JSON round-trip preserves data")
@@ -478,26 +477,6 @@ TEST_CASE("top-level coordinate metadata is saved and loaded")
     fs::remove(tmp);
 }
 
-TEST_CASE("segment correction files carry top-level coordinate metadata")
-{
-    const fs::path dir = fs::temp_directory_path() /
-        ("pc_segment_coordinate_metadata_" + std::to_string(::getpid()));
-    fs::create_directories(dir);
-
-    PointCollections points;
-    points.addPoint("correction", {1, 2, 3});
-    points.setCollectionAnchor2d(points.getCollectionId("correction").value(), cv::Vec2f(4, 5));
-    utils::Json metadata = utils::Json::object();
-    metadata["vc_open_data_coordinate_space"] = "PHerc1451/20260319101107@L2";
-    points.setFileMetadata(metadata);
-    REQUIRE(points.saveToSegmentPath(dir));
-
-    const auto saved = utils::Json::parse_file(dir / "corrections.json");
-    CHECK(saved["vc_open_data_coordinate_space"].get_string() ==
-          "PHerc1451/20260319101107@L2");
-    fs::remove_all(dir);
-}
-
 TEST_CASE("saveToJSON fails on an unwritable path")
 {
     PointCollections c;
@@ -555,24 +534,11 @@ TEST_CASE("an invalid collection uuid leaves the store unchanged")
     CHECK(c.getPoints("kept").size() == 1);
     fs::remove(tmp);
 
-    // A segment corrections file fails the same way: nothing is half-loaded.
-    const fs::path segDir = fs::temp_directory_path() /
-        ("pc_bad_uuid_seg_" + std::to_string(::getpid()));
-    fs::create_directories(segDir);
-    {
-        std::ofstream o(segDir / "corrections.json");
-        o << R"({
-            "vc_pointcollections_json_version": "1",
-            "collections": {
-                "1": {"name": "good", "points": {}, "metadata": {}, "color": [1, 1, 1],
-                      "anchor2d": [1, 2]},
-                "2": {"uuid": "not-a-uuid", "name": "bad", "points": {},
-                      "metadata": {}, "color": [1, 1, 1], "anchor2d": [3, 4]}
-            }
-        })";
-    }
-    CHECK_FALSE(c.loadFromSegmentPath(segDir));
+    // Anchored corrections fail the same way: nothing is half-loaded.
+    std::map<uint64_t, utils::Json> corrections;
+    corrections[1] = utils::Json::parse(R"({"name": "good", "points": {}, "metadata": {}, "color": [1, 1, 1], "anchor2d": [1, 2]})");
+    corrections[2] = utils::Json::parse(R"({"uuid": "not-a-uuid", "name": "bad", "points": {}, "metadata": {}, "color": [1, 1, 1], "anchor2d": [3, 4]})");
+    CHECK_FALSE(c.replaceAnchoredCollections(corrections));
     CHECK(c.getAllCollections().size() == 1);
     CHECK(c.getCollectionId("good") == std::nullopt);
-    fs::remove_all(segDir);
 }
