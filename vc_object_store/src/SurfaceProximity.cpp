@@ -38,11 +38,13 @@ std::vector<SurfaceProximityHit> ObjectStore::nearestSurfaces(const ReadTxn& txn
     std::vector<SurfaceProximityHit> result;
     if (query.volume) {
         if (query.coordinates) throw std::invalid_argument("volume and coordinates filters are exclusive");
+        if (!std::isfinite(query.targetScale) || query.targetScale <= 0)
+            throw std::invalid_argument("surface proximity target scale must be finite and positive");
         for (const auto& frame : volumeFrames(db, *query.volume, std::string("surface"), false, query.transforms.get())) {
             auto stored = query;
             stored.volume.reset();
             stored.coordinates = frame.coordinates;
-            stored.toTarget=frame.mapping;
+            stored.toTarget=VolumeAffine::scale(query.targetScale)*frame.mapping;
             for (auto hit : nearestSurfaces(txn, stored)) result.push_back(std::move(hit));
         }
         std::sort(result.begin(), result.end(), before);

@@ -33,10 +33,18 @@ int main() try {
         SurfaceProximityQuery query;query.volume="b";query.point={12.5,1,21.5};query.tolerance=.51;
         const auto hits=db.nearestSurfaces(txn,query);require(hits.size()==1,"registered nearest surface");
         require(std::abs(hits.front().distance-.5)<1e-10,"target-space Euclidean distance");
+        // At half resolution (a pyramid level) the query and hit are in half-scale voxels.
+        query.targetScale=.5;query.point={6.25,.5,10.75};query.tolerance=.26;
+        const auto half=db.nearestSurfaces(txn,query);
+        require(half.size()==1&&std::abs(half.front().distance-.25)<1e-10,"proximity at a target scale");
         RegionOptions region;region.volume="b";region.kind="fiber";
         RegionSlice slice;slice.origin={13,0,20};slice.localBounds={-4,-1,-1,4,1,1};
         const auto runs=db.geometryRegion(txn,slice,region);require(runs.complete()&&runs.runs.size()==1,"registered region intersection");
         require(runs.runs.front().points.front()==std::array<double,3>{10,0,20},"runs use target coordinates");
+        region.targetScale=.5;slice.origin={6.5,0,10};slice.localBounds={-2,-.5,-.5,2,.5,.5};
+        const auto halfRuns=db.geometryRegion(txn,slice,region);
+        require(halfRuns.complete()&&halfRuns.runs.size()==1&&halfRuns.runs.front().points.front()==std::array<double,3>{5,0,10},
+                "regions at a target scale");
     }
     std::string objectRevision,geometryRevision;
     std::vector<GeometryArrayEdit> changes;

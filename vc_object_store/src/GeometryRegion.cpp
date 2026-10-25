@@ -122,6 +122,8 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
         // One bounded query per declared frame, merged in UUID order with the
         // selected object first; the object limit applies to the merge.
         if (options.coordinates) throw std::invalid_argument("volume and coordinates filters are exclusive");
+        if (!std::isfinite(options.targetScale) || options.targetScale <= 0)
+            throw std::invalid_argument("region target scale must be finite and positive");
         RegionResult merged;
         std::optional<RegionStop> stopped;
         bool limited = false;
@@ -132,7 +134,7 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
             sub.coordinates = frame.coordinates;
             sub.outputByteBudget = options.outputByteBudget - merged.stats.outputBytes;
             sub.minLength = options.minLength;
-            sub.toTarget=frame.mapping;
+            sub.toTarget=VolumeAffine::scale(options.targetScale)*frame.mapping;
             sub.processingByteBudget=options.processingByteBudget-std::min(options.processingByteBudget,merged.stats.processingBytes);
             sub.candidateWorkBudget=options.candidateWorkBudget-std::min(options.candidateWorkBudget,merged.stats.candidateWork);
             sub.sqlStepBudget=options.sqlStepBudget-std::min(options.sqlStepBudget,merged.stats.sqlSteps);

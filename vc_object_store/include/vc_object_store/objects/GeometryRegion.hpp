@@ -42,6 +42,9 @@ struct RegionOptions {
     // declared in it (see ObjectSelection::volume). maximumObjects, selected
     // priority and UUID order apply across the frames.
     std::optional<std::string> volume;
+    // With a volume target: voxels of that volume at this scale (a pyramid
+    // level's voxels per level-0 voxel, e.g. 0.5 for level 1).
+    double targetScale = 1;
     std::shared_ptr<const VolumeTransforms> transforms;
     // Internal frame traversal: source coordinates to the query coordinate frame.
     std::optional<VolumeAffine> toTarget;
@@ -76,6 +79,7 @@ struct SurfaceProximityQuery {
     // nullopt is every surface; an explicitly empty set matches nothing.
     std::optional<std::vector<std::string>> uuids;
     std::optional<std::string> coordinates, volume; // exclusive, as in RegionOptions
+    double targetScale = 1; // as in RegionOptions
     std::shared_ptr<const VolumeTransforms> transforms;
     // Internal frame traversal: source coordinates to the query coordinate frame.
     std::optional<VolumeAffine> toTarget;
