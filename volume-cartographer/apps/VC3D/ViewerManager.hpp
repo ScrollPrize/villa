@@ -144,11 +144,6 @@ public:
     void primeSurfacePatchIndicesAsync();
     void resetStrideUserOverride() {}
 
-    // Folder-selection keyed retention of built surface patch indexes. The
-    // surface panel sets the key before rebinding surfaces on a folder
-    // switch; the live index is stashed under the outgoing key and swapped
-    // back in (if still valid) when the user returns to that selection.
-
     bool resetDefaultFor(VolumeViewerBase* viewer) const;
     void setResetDefaultFor(VolumeViewerBase* viewer, bool value);
 

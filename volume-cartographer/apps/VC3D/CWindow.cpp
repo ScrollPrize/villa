@@ -4,7 +4,6 @@
 #include <QDateTime>
 #include "FiberLengthDisplay.hpp"
 #include "VolumeDisplayNames.hpp"
-#include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataLasagna.hpp"
 #include "OpenDataSurfaceStore.hpp"
 #include <vc_object_store/objects/VolumeTransforms.hpp>

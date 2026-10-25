@@ -2,7 +2,6 @@
 #include "SurfaceStoreEdit.hpp"
 
 #include "../OpenDataManifest.hpp"
-#include "../OpenDataCoordinateIdentity.hpp"
 
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/CVolumeViewerView.hpp"

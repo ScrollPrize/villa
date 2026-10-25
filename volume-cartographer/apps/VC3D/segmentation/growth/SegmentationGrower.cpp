@@ -1,7 +1,6 @@
 #include "SegmentationGrower.hpp"
 #include <vc_object_store/store/GeometryViews.hpp>
 
-#include "OpenDataCoordinateIdentity.hpp"
 
 #include "../../NeuralTraceServiceManager.hpp"
 #include "../SegmentationModule.hpp"
@@ -467,7 +466,7 @@ std::vector<std::shared_ptr<QuadSurface>> loadPatchTracerSurfaces(const PatchTra
         try {
             source.session->read(entry.attachment, [&](const auto& db, const auto& txn, const auto&) {
                 const auto view=vc::objects::GeometrySnapshot(db,txn).viewTransformedAt(entry.uuid,entry.targetVolume,entry.targetScale);
-                surfaces.emplace_back(load_quad_from_store(db, txn, entry.uuid, std::nullopt, true, 1, &view));
+                surfaces.emplace_back(load_quad_from_store(db, txn, entry.uuid, std::nullopt, true, &view));
             });
         } catch (const std::exception& ex) {
             // e.g. a catalog surface whose geometry was never fetched.

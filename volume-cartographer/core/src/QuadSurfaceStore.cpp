@@ -100,7 +100,7 @@ vc::objects::GeometryRevision currentSurface(const vc::objects::ObjectStore& db,
 } // namespace
 
 std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore& db, const vc::objects::Txn& txn,
-    const std::string& objectUuid, const std::optional<std::string>& geometryRevision, bool applyValidity, double toVolume, const vc::objects::TransformedGeometryView* transformed)
+    const std::string& objectUuid, const std::optional<std::string>& geometryRevision, bool applyValidity, const vc::objects::TransformedGeometryView* transformed)
 {
     const auto object = db.objectByUuid(txn, objectUuid);
     if (!object || object->kind != "surface") throw std::runtime_error("not a surface object: " + objectUuid);
@@ -134,9 +134,6 @@ std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore
             (*points)(i/cols,i%cols)=tile.validity[i] && usable({s[0],s[1],s[2]})
                 ? cv::Vec3f(float(p[0]),float(p[1]),float(p[2])) : kInvalid;
         }
-    } else if (toVolume != 1) {
-        for (auto& p : *points) if (p != kInvalid) p *= float(toVolume);
-        scale /= float(toVolume);
     }
     auto surface = std::make_unique<QuadSurface>(points.release(), scale);
     surface->id = object->uuid;

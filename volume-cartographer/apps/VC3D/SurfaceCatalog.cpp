@@ -204,7 +204,7 @@ SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSes
             throw std::runtime_error("The surface is no longer in the object store");
         if (!revision->geometryRevision) throw NoGeometry("The surface has no geometry");
         const auto view=GeometrySnapshot(db,txn).viewTransformedAt(uuid,volume,scale);
-        opened.surface=load_quad_from_store(db,txn,uuid,*revision->geometryRevision,true,1,&view);
+        opened.surface=load_quad_from_store(db,txn,uuid,*revision->geometryRevision,true,&view);
         opened.view = {volume, scale, view.mapping()};
         opened.pin = {attachment, {attachment.storeUuid, revision->objectUuid}, revision->uuid, revision->geometryRevision};
     });

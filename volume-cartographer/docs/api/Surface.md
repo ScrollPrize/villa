@@ -87,18 +87,20 @@ Callers own the transactions and revision pins.
 
 | Function | Description |
 |----------|-------------|
-| `load_quad_from_store(db, txn, uuid, geometryRevision, applyValidity, toVolume)` | Opens a geometry revision (default: current). Vertices whose `valid` is 0 load as `{-1, -1, -1}`; `valid` is the `mask` channel; record tags appear as `meta["tags"]` keys; `toVolume` scales into a volume's voxels |
+| `load_quad_from_store(db, txn, uuid, geometryRevision, applyValidity, transformed)` | Opens a geometry revision (default: current). Vertices whose `valid` is 0 (or stored z <= 0) load as `{-1, -1, -1}`; `valid` is the `mask` channel; record tags appear as `meta["tags"]` keys; through `transformed` (the store's `viewTransformedAt` of that revision) points are in the view's volume voxels |
 | `store_channel_loader(session, attachment, geometryRevision)` | Loads other channels on demand (pass to `setChannelLoader`) |
 | `create_quad_in_store(db, txn, uuid, surface, name, tags, metaJson)` | Creates a surface object from a `QuadSurface` |
 | `quad_surface_geometry(surface)` | The geometry for `putGeometry`: points, `valid` and the other channels |
-| `write_quad_rect_to_store(db, txn, uuid, surface, rect, expected)` | Publishes the changed vertices of a grid rectangle as one sparse edit |
+| `write_quad_rect_to_store(db, txn, uuid, surface, rect, expected, decide, transformed)` | Publishes the changed vertices of a grid rectangle as one sparse edit; through `transformed`, edits map back to the stored frame |
 | `write_quad_channels_to_store(db, txn, uuid, surface, names, remove, expected)` | Replaces or removes channels |
-| `resize_store_surface(db, txn, uuid, gridInStored, expected)` | Grows or crops the stored grid |
+
+A grid of another size (growth, crop) is published with `putGeometry`.
 
 Command-line tools use `StoreSurfaces` (`vc/core/util/StoreSurfaces.hpp`) for
-their `--store` mode: `load`, `create` (with tool provenance), `update`,
-`updateChannels`, `artifactDirectory` and `finish` (waits for the hosted-store
-sync).
+their `--store` mode: `load` (in stored units, or through a volume's view),
+`create` (with tool provenance, bound to the frame its sources were read in),
+`update`, `updateChannels` and `finish` (waits for the hosted-store sync).
+Per-object files go in the session's `artifactDirectory`.
 
 ### tifxyz files
 

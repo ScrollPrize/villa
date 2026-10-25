@@ -160,52 +160,6 @@ void TiffWriter::close() {
 }
 
 // ============================================================================
-// isReadableTiff
-// ============================================================================
-
-namespace {
-
-// Decode every tile (or strip) of the first directory into a scratch buffer.
-// A payload that is truncated, points past the end of the file or fails to
-// decompress makes libtiff return -1 or a short count.
-bool decodesCompletely(TIFF* tf)
-{
-    if (TIFFIsTiled(tf)) {
-        const tmsize_t tileBytes = TIFFTileSize(tf);
-        if (tileBytes <= 0)
-            return false;
-        std::vector<uint8_t> buf(static_cast<size_t>(tileBytes));
-        const ttile_t n = TIFFNumberOfTiles(tf);
-        for (ttile_t t = 0; t < n; ++t)
-            if (TIFFReadEncodedTile(tf, t, buf.data(), tileBytes) != tileBytes)
-                return false;
-        return true;
-    }
-
-    uint32_t height = 0, rowsPerStrip = 0;
-    if (!TIFFGetField(tf, TIFFTAG_IMAGELENGTH, &height) || height == 0)
-        return false;
-    TIFFGetFieldDefaulted(tf, TIFFTAG_ROWSPERSTRIP, &rowsPerStrip);
-    if (rowsPerStrip == 0 || rowsPerStrip > height)
-        rowsPerStrip = height;
-    const tmsize_t stripBytes = TIFFStripSize(tf);
-    if (stripBytes <= 0)
-        return false;
-    std::vector<uint8_t> buf(static_cast<size_t>(stripBytes));
-    const tstrip_t n = TIFFNumberOfStrips(tf);
-    for (tstrip_t s = 0; s < n; ++s) {
-        // The last strip may hold fewer rows than ROWSPERSTRIP.
-        const uint32_t rows = std::min<uint32_t>(rowsPerStrip, height - s * rowsPerStrip);
-        const tmsize_t expected = TIFFVStripSize(tf, rows);
-        if (expected <= 0 || TIFFReadEncodedStrip(tf, s, buf.data(), expected) != expected)
-            return false;
-    }
-    return true;
-}
-
-} // namespace
-
-// ============================================================================
 // mergeTiffParts implementation
 // ============================================================================
 

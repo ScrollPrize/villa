@@ -23,7 +23,6 @@
 #include "CWindow.hpp"
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
-#include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataManifest.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "SurfaceCatalog.hpp"

@@ -31,7 +31,7 @@ std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool a
         if (volume) {
             const auto view = vc::objects::GeometrySnapshot(db, txn).viewTransformedAt(uuid, *volume);
             storedUnits = view.mapping() == vc::objects::VolumeAffine::identity();
-            surface = load_quad_from_store(db, txn, uuid, std::nullopt, applyValidity, 1, &view);
+            surface = load_quad_from_store(db, txn, uuid, std::nullopt, applyValidity, &view);
         } else {
             surface = load_quad_from_store(db, txn, uuid, std::nullopt, applyValidity);
         }
