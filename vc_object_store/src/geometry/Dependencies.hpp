@@ -1,5 +1,6 @@
 #pragma once
 #include "vc_object_store/objects/ObjectStore.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
 #include "geometry/GeometrySnapshot.hpp"
 #include <functional>
 #include "geometry/GeometryReader.hpp"
@@ -150,7 +151,7 @@ inline std::optional<std::vector<uint8_t>> pointValue(const DependencyGeometry& 
     if (array.dtype == "<f8") (void)snapshot.values<double>("point");
     else if (array.dtype == "<f4") {
         const auto xyz = snapshot.values<float>("point");
-        if (geometry.kind == "surface" && xyz[2] <= 0) return std::nullopt;
+        if (geometry.kind == "surface" && !vc::geometry::validSurfacePoint({xyz[0], xyz[1], xyz[2]})) return std::nullopt;
     }
     return bytes;
 }

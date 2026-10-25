@@ -1,3 +1,4 @@
+#include "vc_object_store/geometry/Geometry.hpp"
 #include "internal/Database.hpp"
 #include "internal/Spatial.hpp"
 #include "geometry/GeometryReader.hpp"
@@ -14,7 +15,8 @@ nlohmann::json coordinateBounds(std::span<const uint8_t> bytes,const std::string
         for (size_t offset=0;offset<bytes.size();offset+=3*sizeof(T)) {
             std::array<T,3> point; copyScalars<T>(bytes.subspan(offset,3*sizeof(T)),point);
             const double x=point[0],y=point[1],z=point[2];
-            if (!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)||(surface&&x==-1&&z<=0)) continue;
+            if (!std::isfinite(x)||!std::isfinite(y)||!std::isfinite(z)) continue;
+            if (surface&&!vc::geometry::validSurfacePoint({float(x),float(y),float(z)})) continue;
             if(!result)result=std::array<double,6>{x,y,z,x,y,z};
             else for(size_t axis=0;axis<3;++axis) {(*result)[axis]=std::min((*result)[axis],double(point[axis]));(*result)[axis+3]=std::max((*result)[axis+3],double(point[axis]));}
         }

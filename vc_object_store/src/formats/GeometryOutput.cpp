@@ -1,6 +1,7 @@
 #include "formats/GeometryOutput.hpp"
 #include "formats/TrackInput.hpp"
 #include "vc_object_store/Tiff.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
 #include "geometry/ArrayLayout.hpp"
 #include <algorithm>
 #include <bit>
@@ -82,11 +83,14 @@ void surface(const Snapshot& s, Json attributes, const fs::path& path)
     std::array<float, 3> low{-1,-1,-1}, high = low;
     bool any = false;
     for (size_t i = 0; i < xyz.size(); i += 3) {
-        if (xyz[i+2] <= 0) {
+        if (!vc::geometry::validSurfacePoint({xyz[i], xyz[i+1], xyz[i+2]})) {
             if (xyz[i] != -1 || xyz[i+1] != -1 || xyz[i+2] != -1)
-                throw std::runtime_error("surface points with z <= 0 must use the (-1,-1,-1) invalid sentinel");
+                throw std::runtime_error("missing surface vertices must use the (-1,-1,-1) sentinel");
             continue;
         }
+        // tifxyz readers treat z <= 0 as missing.
+        if (xyz[i+2] <= 0)
+            throw std::runtime_error("tifxyz cannot hold a surface vertex at z <= 0");
         for (int a = 0; a < 3; ++a) {
             low[a] = any ? std::min(low[a], xyz[i+a]) : xyz[i+a];
             high[a] = any ? std::max(high[a], xyz[i+a]) : xyz[i+a];

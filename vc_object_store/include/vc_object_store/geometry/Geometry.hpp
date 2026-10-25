@@ -67,6 +67,9 @@ Geometry decode(const objects::GeometryData&);
 
 double polylineLength(std::span<const Point>);
 double polylineLength(std::span<const TrackPoint>);
+// A surface vertex has coordinates unless a component is -1 or non-finite;
+// missing vertices are stored as the (-1,-1,-1) sentinel. (Legacy tifxyz files
+// mark them with z <= 0; their readers convert at the file boundary.)
 bool validSurfacePoint(const SurfacePoint&);
 
 } // namespace vc::geometry

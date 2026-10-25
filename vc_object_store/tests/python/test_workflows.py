@@ -609,3 +609,15 @@ def test_scripts_sync_a_hub_addressed_over_sftp_with_a_password(tmp_path, monkey
         assert vos.hub_lock_age(url) is None
     finally:
         vos.set_sftp_authenticator(None)
+
+
+def test_surface_vertices_are_missing_only_as_the_minus_one_sentinel(db, tmp_path):
+    surface = Surface(1, 2, [1, 1], [[1, 2, 0], [-1, -1, -1]])
+    assert surface.valid(0, 0) and not surface.valid(0, 1)  # z = 0 is a slice, not a missing vertex
+    with pytest.raises((RuntimeError, ValueError)):
+        Surface(1, 1, [1, 1], [[-1, 5, 5]]).validate()  # missing vertices use exactly (-1,-1,-1)
+    uid, _ = put(db, surface, 'surface')
+    with db.geometry_snapshot() as snapshot:
+        assert snapshot.surface(uid).valid(0, 0)
+    with pytest.raises((RuntimeError, ValueError)):
+        db.export_geometry(uid, tmp_path / 'out')  # tifxyz readers drop z <= 0

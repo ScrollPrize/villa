@@ -44,7 +44,9 @@ double polylineLength(std::span<const Point> points) { return length(points); }
 double polylineLength(std::span<const TrackPoint> points) { return length(points); }
 bool validSurfacePoint(const SurfacePoint& p)
 {
-    return p[2] > 0 && std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+    for (const auto v : p)
+        if (!std::isfinite(v) || v == -1) return false;
+    return true;
 }
 void PointCollection::validate() const
 {
