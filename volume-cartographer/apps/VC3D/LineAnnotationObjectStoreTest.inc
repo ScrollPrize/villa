@@ -5,6 +5,7 @@
 #include "FiberCollectionController.hpp"
 #include "SpiralWorkspace.hpp"
 #include "SpiralServiceManager.hpp"
+#include <vc_object_store/geometry/Geometry.hpp>
 // Built only with VC_TESTING. Runs the actual controller publication path.
 int runObjectStoreControllerTests()
 {
@@ -94,6 +95,52 @@ int runObjectStoreControllerTests()
             const auto binding = vc3d::coordinateBindingForVolume(*volume, 4);
             require(binding.at("coordinates").at("volume_uuid") == "20260411134726", "VC3D retains catalog volume ID verbatim");
             require(vc3d::geometryScaleForVolume(binding, *volume) == .25, "VC3D matches the authoritative volume ID");
+        }
+        {
+            // The umbilicus is the store's, bound to a volume; its frame was set when stored.
+            QTemporaryDir dir;
+            Volume::ZarrCreateOptions create; create.shapeZYX = {16,8,8};
+            create.chunkShapeZYX = {16,8,8}; create.compressor = "none"; create.uuid = "umbilicus-volume";
+            const auto volume = Volume::New(fs::path(dir.path().toStdString())/"ct.zarr", create);
+            const auto storePath = fs::path(dir.path().toStdString())/"objects.vcobj";
+            OpenOptions umbilicusOptions; umbilicusOptions.author = "vc3d-umbilicus-test";
+            { auto db = ObjectStore::create(storePath, umbilicusOptions); }
+            CState state;
+            Controller controller(&state,nullptr,nullptr,nullptr);
+            state.attachObjectStore(QString::fromStdString(storePath.string()), "vc3d-umbilicus-test");
+            state.setCurrentVolume(volume);
+            int changed = 0;
+            QObject::connect(&state, &CState::umbilicusChanged, [&] { ++changed; });
+            require(!state.storedUmbilicus().error.empty() && !controller.umbilicusStatus().available,
+                    "a volume without a stored umbilicus has none");
+            const auto attachment = *state.objectStoreAttachment();
+            auto add = [&](const std::string& name) {
+                const auto uuid = vc::util::newUuid();
+                state.objectStoreSession()->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
+                    ObjectRecord record; record.uuid = uuid; record.kind = "umbilicus"; record.name = name;
+                    record.meta = vc3d::coordinateBindingForVolume(*volume, 2).dump();
+                    db.upsertObject(txn, record);
+                    db.putGeometry(txn, uuid, vc::geometry::encode(vc::geometry::Umbilicus{{{8, 6, 0}, {8, 6, 30}}}));
+                });
+                state.pollObjectStoreChanges();
+                return uuid;
+            };
+            const auto first = add("scroll");
+            const auto stored = state.storedUmbilicus();
+            require(changed > 0, "committing an umbilicus announces it");
+            require(stored.error.empty() && stored.uuid == first &&
+                    stored.points == std::vector<cv::Vec3f>{{4, 3, 0}, {4, 3, 15}},
+                    "the stored umbilicus is read in the volume's voxels");
+            require(controller.umbilicusStatus().available && controller.umbilicusStatus().text == "scroll",
+                    "the fiber map status names the stored umbilicus");
+            const auto snapshot = controller.umbilicusForSnapshot(controller.annotationFrame());
+            require(snapshot.message.isEmpty() && snapshot.centers.size() == 2, "the fiber map reads the stored umbilicus");
+            const auto token = controller.umbilicusFingerprint();
+            add("second");
+            require(state.storedUmbilicus().error.find("several") != std::string::npos &&
+                    controller.umbilicusFingerprint() != token,
+                    "several umbilici bound to one volume are refused");
+            state.detachObjectStore();
         }
         OpenOptions options; options.author = "vc3d-controller-test";
         { auto db = ObjectStore::create(path,options); }

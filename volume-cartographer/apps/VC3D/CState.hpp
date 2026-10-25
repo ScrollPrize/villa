@@ -120,16 +120,25 @@ public:
     std::vector<POI*> pois();
     std::vector<std::string> poiNames();
 
-    // Announces that the project's attached umbilicus changed. Nothing else
-    // reports it: setUmbilicus() only persists a project field, so a consumer
-    // holding geometry placed relative to the umbilicus has no way to hear about
-    // an attach or a detach.
-    void notifyUmbilicusChanged() { emit umbilicusChanged(); }
+    // The umbilicus of the current volume: the one live umbilicus object in the
+    // attached store bound to it, with its points in the volume's voxels. Its frame
+    // was decided when it was stored. `error` says why there is none (nothing
+    // attached or bound, or several bound). `token` (uuid@revision, else the
+    // error) changes whenever the answer does.
+    struct StoredUmbilicus {
+        std::string uuid;
+        std::string name;
+        std::vector<cv::Vec3f> points;
+        std::string error;
+        std::string token;
+    };
+    StoredUmbilicus storedUmbilicus() const;
 
 signals:
     void objectStoreChanged(const vc::objects::StoreSessionEvent& event);
     void objectStoreObservationFailed(const QString& error);
     void vpkgChanged(std::shared_ptr<VolumePkg> vpkg);
+    // An umbilicus was committed, or a store was attached or detached.
     void umbilicusChanged();
     void volumeChanged(std::shared_ptr<Volume> volume, const std::string& volumeId);
     void focusBoundsChanged();

@@ -31,6 +31,9 @@
 #include "vc_object_store/objects/Hub.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/ScrollUmbilicus.hpp"
+#include "ObjectStoreCoordinates.hpp"
+#include <vc_object_store/geometry/Geometry.hpp>
+#include <vc_object_store/Uuid.hpp>
 #include "vc/core/util/Umbilicus.hpp"
 #include "vc/core/util/VolpkgConvert.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
@@ -141,11 +144,11 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _attachNormalGridAct = new QAction(QObject::tr("Attach &Normal Grid..."), this);
     connect(_attachNormalGridAct, &QAction::triggered, this, &MenuActionController::attachNormalGrid);
 
-    _attachUmbilicusAct = new QAction(QObject::tr("Attach &Umbilicus..."), this);
-    connect(_attachUmbilicusAct, &QAction::triggered, this, &MenuActionController::attachUmbilicus);
+    _importUmbilicusAct = new QAction(QObject::tr("Import &Umbilicus..."), this);
+    connect(_importUmbilicusAct, &QAction::triggered, this, &MenuActionController::importUmbilicus);
 
-    _detachUmbilicusAct = new QAction(QObject::tr("Detach Um&bilicus"), this);
-    connect(_detachUmbilicusAct, &QAction::triggered, this, &MenuActionController::detachUmbilicus);
+    _removeUmbilicusAct = new QAction(QObject::tr("Remove Um&bilicus"), this);
+    connect(_removeUmbilicusAct, &QAction::triggered, this, &MenuActionController::removeUmbilicus);
 
     _attachLasagnaManifestAct = new QAction(QObject::tr("Attach Lasagna Manifest..."), this);
     connect(_attachLasagnaManifestAct, &QAction::triggered, this, &MenuActionController::attachLasagnaManifest);
@@ -258,8 +261,8 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
             QMessageBox::warning(qWindow, QObject::tr("Object store observation failed"), error);
         });
     _fileMenu->addAction(_attachNormalGridAct);
-    _fileMenu->addAction(_attachUmbilicusAct);
-    _fileMenu->addAction(_detachUmbilicusAct);
+    _fileMenu->addAction(_importUmbilicusAct);
+    _fileMenu->addAction(_removeUmbilicusAct);
     _fileMenu->addAction(_attachLasagnaManifestAct);
     _fileMenu->addAction(_attachRemoteLasagnaManifestAct);
     _fileMenu->addAction(_detachEntryAct);
@@ -1773,89 +1776,179 @@ void MenuActionController::attachNormalGrid()
     _window->refreshCurrentVolumePackageUi();
 }
 
-void MenuActionController::attachUmbilicus()
+namespace {
+// The attached volume an umbilicus stamp names by store directory name, so the
+// stamp can be checked against it. Remote volumes are skipped: the check needs
+// local shape metadata.
+std::shared_ptr<Volume> attachedVolumeByStoreName(const VolumePkg& pkg, const std::string& storeName)
 {
-    if (!_window || !_window->_state || !_window->_state->vpkg()) {
-        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+    const std::string wanted = std::filesystem::path(storeName).filename().string();
+    if (wanted.empty()) return nullptr;
+    for (const std::string& id : pkg.volumeIDs()) {
+        const std::shared_ptr<Volume> volume = pkg.volume(id);
+        if (volume && !volume->isRemote() && volume->path().filename().string() == wanted) return volume;
+    }
+    return nullptr;
+}
+}
+
+void MenuActionController::importUmbilicus()
+{
+    auto& state = *_window->_state;
+    const auto attachment = state.objectStoreAttachment();
+    const auto volume = state.currentVolume();
+    if (!attachment || !volume || !state.vpkg()) {
+        QMessageBox::information(_window, QObject::tr("Import Umbilicus"),
+            QObject::tr("Open a volume and attach an object store first."));
         return;
     }
-    auto pkg = _window->_state->vpkg();
     const auto file = QFileDialog::getOpenFileName(
-        _window, QObject::tr("Attach Umbilicus"),
-        QString::fromStdString(pkg->getVolpkgDirectory()),
-        QObject::tr("Umbilicus (*.json)"));
+        _window, QObject::tr("Import Umbilicus"),
+        QString::fromStdString(state.vpkg()->getVolpkgDirectory()),
+        QObject::tr("Umbilicus (*.json *.txt *.csv)"));
     if (file.isEmpty()) return;
 
     vc::core::util::UmbilicusFileInfo info;
     try {
-        info = vc::core::util::Umbilicus::LoadFileInfo(
-            std::filesystem::path(file.toStdString()));
+        info = vc::core::util::Umbilicus::LoadFileInfo(std::filesystem::path(file.toStdString()));
     } catch (const std::exception& e) {
-        QMessageBox::warning(_window, QObject::tr("Attach failed"),
-            QObject::tr("%1 is not a valid umbilicus file:\n\n%2")
-                .arg(file, QString::fromUtf8(e.what())));
+        QMessageBox::warning(_window, QObject::tr("Import failed"),
+            QObject::tr("%1 is not a valid umbilicus file:\n\n%2").arg(file, QString::fromUtf8(e.what())));
         return;
     }
-
-    // Malformed metadata makes the file unusable until it is fixed — the
-    // resolver refuses it — so attaching it would store an attachment nothing
-    // can use and report success beside a warning. Rejected instead, naming
-    // the errors; fix the file and attach again.
     if (!info.metadataErrors.empty()) {
         QStringList errors;
-        errors.reserve(static_cast<int>(info.metadataErrors.size()));
-        for (const auto& error : info.metadataErrors) {
-            errors << QString::fromStdString(error);
-        }
-        QMessageBox::warning(_window, QObject::tr("Attach failed"),
-            QObject::tr("%1 declares malformed frame metadata and was not "
-                        "attached:\n\n%2")
+        for (const auto& error : info.metadataErrors) errors << QString::fromStdString(error);
+        QMessageBox::warning(_window, QObject::tr("Import failed"),
+            QObject::tr("%1 declares malformed frame metadata:\n\n%2")
                 .arg(QFileInfo(file).fileName(), errors.join(QStringLiteral("\n"))));
         return;
     }
 
-    pkg->setUmbilicus(file.toStdString());
-    // Consumers that placed geometry relative to the old umbilicus have no other
-    // way to learn this happened.
-    _window->_state->notifyUmbilicusChanged();
-    if (_window->statusBar()) {
-        _window->showStatusBarMessage(
-            QObject::tr("Attached umbilicus %1").arg(QFileInfo(file).fileName()), 5000);
+    // The frame is decided here, once: the file's stamp against the volume the
+    // umbilicus is bound to. A stamp naming an attached volume is checked against it.
+    const std::array<double, 3> volumeGridXyz{static_cast<double>(volume->sliceWidth()),
+                                              static_cast<double>(volume->sliceHeight()),
+                                              static_cast<double>(volume->numSlices())};
+    const double voxelSize = volume->voxelSize();
+    const auto derived = vc::core::util::deriveUmbilicusScale(
+        info, volumeGridXyz, std::isfinite(voxelSize) && voxelSize > 0 ? std::optional(voxelSize) : std::nullopt);
+    std::optional<std::string> contradiction;
+    if (info.volume && !info.volume->empty()) {
+        if (const auto named = attachedVolumeByStoreName(*state.vpkg(), *info.volume)) {
+            const double namedVoxel = named->voxelSize();
+            contradiction = vc::core::util::umbilicusStampContradiction(
+                info,
+                {static_cast<double>(named->sliceWidth()), static_cast<double>(named->sliceHeight()),
+                 static_cast<double>(named->numSlices())},
+                std::isfinite(namedVoxel) && namedVoxel > 0 ? std::optional(namedVoxel) : std::nullopt);
+        }
     }
-    if (!vc::core::util::umbilicusFrameClaim(info).any()) {
-        // Dimensions alone are a complete statement — the preferred one, in fact,
-        // being exact integer counts — so warning about a missing voxelsize_um
-        // there would call the better-stamped file unstamped.
-        QMessageBox::information(_window, QObject::tr("Attach Umbilicus"),
-            QObject::tr("%1 declares no frame, so consumers may have to guess "
-                        "the grid its coordinates index.").arg(QFileInfo(file).fileName()));
+    const auto action = vc::core::util::decideUmbilicusLoadAction(
+        derived, vc::core::util::umbilicusFrameClaim(info), true, contradiction.has_value());
+    if (contradiction) {
+        QMessageBox::warning(_window, QObject::tr("Import failed"),
+            QObject::tr("%1: %2").arg(QFileInfo(file).fileName(), QString::fromStdString(*contradiction)));
+        return;
     }
+    if (action == vc::core::util::UmbilicusLoadAction::Refuse) {
+        QMessageBox::warning(_window, QObject::tr("Import failed"),
+            QObject::tr("%1 states a frame that does not fit volume %2.")
+                .arg(QFileInfo(file).fileName(), QString::fromStdString(volume->id())));
+        return;
+    }
+    // A stated frame is taken as stated; an inferred one is offered for
+    // confirmation, and a file stating nothing asks, like an unbound fiber.
+    double storedUnitsPerVoxel = derived ? 1.0 / derived->factor : 1.0;
+    if (action != vc::core::util::UmbilicusLoadAction::Apply ||
+        derived->source == vc::core::util::UmbilicusScaleSource::InferredFromGrid) {
+        const QString reason = derived
+            ? QObject::tr("Inferred from the points: %1").arg(QString::fromStdString(derived->description))
+            : QObject::tr("The file states no frame.");
+        bool accepted = false;
+        storedUnitsPerVoxel = QInputDialog::getDouble(
+            _window, QObject::tr("Bind Umbilicus Coordinates"),
+            QObject::tr("%1\n\nVolume: %2 (X/Y/Z %3 / %4 / %5, %6 µm)\n\n"
+                        "Enter umbilicus units per volume voxel.")
+                .arg(reason, QString::fromStdString(volume->id()))
+                .arg(volume->sliceWidth()).arg(volume->sliceHeight()).arg(volume->numSlices()).arg(voxelSize),
+            storedUnitsPerVoxel, 1e-6, 1e6, 6, &accepted);
+        if (!accepted) return;
+    }
+
+    // One umbilicus per volume: importing replaces the ones bound to it.
+    std::vector<std::string> replaced;
+    state.objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
+        vc::objects::ObjectSelection selection;
+        selection.kind = "umbilicus";
+        selection.volume = volume->id();
+        for (const auto& record : db.selectObjects(txn, selection)) replaced.push_back(record.uuid);
+    });
+    if (!replaced.empty() &&
+        QMessageBox::question(_window, QObject::tr("Import Umbilicus"),
+            QObject::tr("Volume %1 already has an umbilicus. Replace it?").arg(QString::fromStdString(volume->id())))
+            != QMessageBox::Yes)
+        return;
+
+    auto meta = vc3d::coordinateBindingForVolume(*volume, storedUnitsPerVoxel);
+    meta["provenance"] = {{"tool", "vc3d-import-umbilicus"},
+                          {"parameters", {{"file", file.toStdString()}, {"units_per_voxel", storedUnitsPerVoxel},
+                                          {"frame", derived ? derived->description : std::string("entered")}}},
+                          {"sources", nlohmann::json::array()}};
+    vc::geometry::Umbilicus geometry;
+    for (const auto& p : info.controlPoints) geometry.points.push_back({p[0], p[1], p[2]});
+    const auto uuid = vc::objects::util::newUuid();
+    vc::objects::RevisionSelection pins{{uuid, std::nullopt}};
+    try {
+        state.objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
+            for (const auto& id : replaced) pins[id] = db.currentObjectRevision(txn, id)->uuid;
+        });
+        state.objectStoreSession()->act(*attachment, pins, [&](auto& db, auto& txn) {
+            for (const auto& id : replaced) db.retireObject(txn, id);
+            vc::objects::ObjectRecord record;
+            record.uuid = uuid;
+            record.kind = "umbilicus";
+            record.name = QFileInfo(file).completeBaseName().toStdString();
+            record.meta = meta.dump();
+            db.upsertObject(txn, record);
+            db.putGeometry(txn, uuid, vc::geometry::encode(geometry));
+        });
+    } catch (const std::exception& e) {
+        QMessageBox::warning(_window, QObject::tr("Import failed"), QString::fromUtf8(e.what()));
+        return;
+    }
+    _window->showStatusBarMessage(
+        QObject::tr("Imported umbilicus %1 for volume %2").arg(QFileInfo(file).fileName(), QString::fromStdString(volume->id())), 5000);
 }
 
-void MenuActionController::detachUmbilicus()
+void MenuActionController::removeUmbilicus()
 {
-    if (!_window || !_window->_state || !_window->_state->vpkg()) {
-        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+    auto& state = *_window->_state;
+    const auto attachment = state.objectStoreAttachment();
+    const auto volumeId = state.currentVolumeId();
+    if (!attachment || volumeId.empty()) {
+        QMessageBox::information(_window, QObject::tr("Remove Umbilicus"),
+            QObject::tr("Open a volume and attach an object store first."));
         return;
     }
-    auto pkg = _window->_state->vpkg();
-    const auto configured = pkg->umbilicus();
-    if (configured.empty()) {
-        QMessageBox::information(_window, QObject::tr("Detach Umbilicus"),
-            QObject::tr("No umbilicus is attached — the project already resolves one "
-                        "automatically."));
+    vc::objects::RevisionSelection pins;
+    state.objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
+        vc::objects::ObjectSelection selection;
+        selection.kind = "umbilicus";
+        selection.volume = volumeId;
+        for (const auto& record : db.selectObjects(txn, selection))
+            pins[record.uuid] = db.currentObjectRevision(txn, record.uuid)->uuid;
+    });
+    if (pins.empty()) {
+        QMessageBox::information(_window, QObject::tr("Remove Umbilicus"),
+            QObject::tr("Volume %1 has no umbilicus.").arg(QString::fromStdString(volumeId)));
         return;
     }
-    // Clearing the field persists the project and restores automatic
-    // resolution; the umbilicus is a single-valued field, so it is not part of
-    // the entry-based Detach dialog.
-    pkg->setUmbilicus({});
-    _window->_state->notifyUmbilicusChanged();
-    if (_window->statusBar()) {
-        _window->showStatusBarMessage(
-            QObject::tr("Detached umbilicus %1; resolution is automatic again")
-                .arg(QString::fromStdString(configured)), 5000);
-    }
+    state.objectStoreSession()->act(*attachment, pins, [&](auto& db, auto& txn) {
+        for (const auto& [id, revision] : pins) db.retireObject(txn, id);
+    });
+    _window->showStatusBarMessage(
+        QObject::tr("Removed the umbilicus of volume %1").arg(QString::fromStdString(volumeId)), 5000);
 }
 
 void MenuActionController::attachLasagnaManifest()

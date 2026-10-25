@@ -758,7 +758,7 @@ QString withUmbilicusStatus(const QString& status, LineAnnotationController* con
     if (umbilicus.text.isEmpty()) {
         return status;
     }
-    return status + QObject::tr(" · %1 — File > Attach Umbilicus…").arg(umbilicus.text);
+    return status + QObject::tr(" · %1 — File > Import Umbilicus…").arg(umbilicus.text);
 }
 
 } // namespace
@@ -2460,14 +2460,13 @@ void FiberMapWorkspace::publishRebuild(RebuildJobResult& job)
     if (!job.hadFibers) {
         emptyMessage = tr("no fibers");
     } else if (!job.hadUmbilicus) {
-        // The resolver's own words when it has any; they name the file it
-        // rejected or the candidates it could not choose between.
+        // The store's reason when it has one: none bound to this volume, or several.
         emptyMessage = job.snapshot.umbilicusMessage.isEmpty()
             ? tr("no umbilicus found — cannot unroll")
             : job.snapshot.umbilicusMessage;
-        // Whatever the resolver's complaint was, the way out is the same.
+        // Whatever the reason, the way out is the same.
         emptyMessage += QLatin1Char('\n');
-        emptyMessage += tr("Attach one via File > Attach Umbilicus…");
+        emptyMessage += tr("Import one via File > Import Umbilicus…");
     } else if (_layout.fibers.empty()) {
         emptyMessage = tr("no placeable fibers");
     }

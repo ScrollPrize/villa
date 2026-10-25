@@ -83,7 +83,6 @@ private:
     void updateGrowthUiState();
     void updateNormal3dUi();
     void updatePatchTracerSourceUi();
-    void updatePatchTracerUmbilicusUi();
     void resetPatchTracerParams(bool persist);
     void syncPatchTracerParamsUi();
     void persistPatchTracerParams();
@@ -115,10 +114,6 @@ private:
     QLabel* _lblPatchTracerSource{nullptr};
     QWidget* _patchTracerSourceContainer{nullptr};
     QLineEdit* _editPatchTracerSourceTag{nullptr};
-    QLabel* _lblPatchTracerUmbilicus{nullptr};
-    QWidget* _patchTracerUmbilicusContainer{nullptr};
-    QLineEdit* _editPatchTracerUmbilicusPath{nullptr};
-    QPushButton* _btnPatchTracerUmbilicusBrowse{nullptr};
     QGroupBox* _groupPatchTracerParams{nullptr};
     QPushButton* _btnPatchTracerResetDefaults{nullptr};
     QSpinBox* _spinPatchGlobalStepsPerWindow{nullptr};
@@ -160,8 +155,6 @@ private:
     QString _normal3dSelectedPath;
     QString _volumePackagePath;
     QString _patchTracerSourceTag;
-    QString _patchTracerUmbilicusPath;
-    bool _patchTracerUmbilicusPathUserSet{false};
     int _patchGlobalStepsPerWindow{0};
     int _patchSrcStep{20};
     int _patchStep{10};

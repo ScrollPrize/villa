@@ -701,6 +701,24 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             }
         }
 
+        // The current volume's stored umbilicus, in its voxels (the tracer runs at level 0).
+        const auto umbilicus = _context.state->storedUmbilicus();
+        if (!umbilicus.points.empty()) {
+            auto points = utils::Json::array();
+            for (const auto& p : umbilicus.points) {
+                auto xyz = utils::Json::array();
+                xyz.push_back(p[0]);
+                xyz.push_back(p[1]);
+                xyz.push_back(p[2]);
+                points.push_back(std::move(xyz));
+            }
+            request.customParams["umbilicus_points"] = std::move(points);
+        } else if (request.customParams.value("single wrap", false)) {
+            showStatus(tr("Single-wrap growth needs an umbilicus: %1").arg(QString::fromStdString(umbilicus.error)),
+                       kStatusLong);
+            return false;
+        }
+
         // The source: the current volume's surfaces with the tag, other than the one growing.
         const QString sourceTag = _context.widget->patchTracerSourceTag();
         auto* catalog = _surfacePanel ? _surfacePanel->catalog() : nullptr;

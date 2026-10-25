@@ -4,6 +4,7 @@
 #include "VCSettings.hpp"
 
 #include <algorithm>
+#include <cstring>
 #include <cmath>
 #include <exception>
 #include <thread>
@@ -12,6 +13,7 @@
 #include <QTimer>
 
 #include "vc/core/types/VolumePkg.hpp"
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -207,6 +209,15 @@ CState::CState(QObject* parent, bool debugDownloadQueue, CState* objectStoreOwne
         std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{0,1,0}));
     setSurface("yz plane",
         std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{1,0,0}));
+    connect(this, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
+        using Kind = vc::objects::StoreSessionEvent::Kind;
+        if (event.kind == Kind::Hub) return;
+        if (event.kind == Kind::Committed &&
+            std::none_of(event.changes.begin(), event.changes.end(),
+                         [](const auto& change) { return change.kind == "umbilicus"; }))
+            return;
+        emit umbilicusChanged();
+    });
 }
 
 CState::~CState()
@@ -326,6 +337,51 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
     ++_focusBoundsRevision;
     emit volumeChanged(_currentVolume, _currentVolumeId);
     emit focusBoundsChanged();
+}
+
+CState::StoredUmbilicus CState::storedUmbilicus() const
+{
+    StoredUmbilicus result;
+    const auto attachment = objectStoreAttachment();
+    const auto volumeId = currentVolumeId();
+    if (!attachment || volumeId.empty()) {
+        result.error = "no object store or volume";
+        result.token = result.error;
+        return result;
+    }
+    _objectStoreSession->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
+        vc::objects::ObjectSelection selection;
+        selection.kind = "umbilicus";
+        selection.volume = volumeId;
+        const auto records = db.selectObjects(txn, selection);
+        if (records.size() != 1) {
+            if (records.empty()) {
+                result.error = "no umbilicus is bound to volume " + volumeId;
+            } else {
+                result.error = "several umbilici are bound to volume " + volumeId + ":";
+                for (const auto& record : records)
+                    result.error += " " + (record.name.empty() ? record.uuid : record.name);
+            }
+            return;
+        }
+        const auto& record = records.front();
+        const auto scale = vc::objects::geometryScaleToVolume(nlohmann::json::parse(record.meta), volumeId);
+        const auto geometry = db.currentGeometry(txn, record.uuid);
+        if (!scale || !geometry) {
+            result.error = "umbilicus " + record.name + " has no geometry";
+            return;
+        }
+        const auto bytes = db.readGeometryArray(txn, geometry->uuid, "points");
+        std::vector<double> xyz(bytes.size() / sizeof(double));
+        std::memcpy(xyz.data(), bytes.data(), xyz.size() * sizeof(double));
+        for (std::size_t p = 0; p + 2 < xyz.size(); p += 3)
+            result.points.emplace_back(float(xyz[p] * *scale), float(xyz[p + 1] * *scale), float(xyz[p + 2] * *scale));
+        result.uuid = record.uuid;
+        result.name = record.name;
+        result.token = record.uuid + "@" + db.currentObjectRevision(txn, record.uuid)->uuid;
+    });
+    if (result.token.empty()) result.token = result.error;
+    return result;
 }
 
 vc3d::annotation::AnnotationFrame CState::annotationFrame() const

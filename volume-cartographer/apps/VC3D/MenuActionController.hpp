@@ -102,8 +102,8 @@ private slots:
     void saveProjectAs();
     void attachVolume();
     void attachNormalGrid();
-    void attachUmbilicus();
-    void detachUmbilicus();
+    void importUmbilicus();
+    void removeUmbilicus();
     void attachLasagnaManifest();
     void attachRemoteLasagnaManifest();
     void detachEntry();
@@ -211,8 +211,8 @@ private:
     QAction* _saveProjectAsAct{nullptr};
     QAction* _attachVolumeAct{nullptr};
     QAction* _attachNormalGridAct{nullptr};
-    QAction* _attachUmbilicusAct{nullptr};
-    QAction* _detachUmbilicusAct{nullptr};
+    QAction* _importUmbilicusAct{nullptr};
+    QAction* _removeUmbilicusAct{nullptr};
     QAction* _attachLasagnaManifestAct{nullptr};
     QAction* _attachRemoteLasagnaManifestAct{nullptr};
     QAction* _detachEntryAct{nullptr};

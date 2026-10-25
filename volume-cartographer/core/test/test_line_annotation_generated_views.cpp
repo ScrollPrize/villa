@@ -5464,9 +5464,8 @@ namespace {
 vc3d::annotation::UmbilicusCacheInputs cacheInputs()
 {
     vc3d::annotation::UmbilicusCacheInputs inputs;
-    inputs.root = "/proj";
     inputs.volumeId = "vol-a";
-    inputs.dependencyToken = "field|/proj/umbilicus.json=100:1";
+    inputs.dependencyToken = "umbilicus-uuid@revision-1";
     inputs.frame = vc3d::annotation::deriveAnnotationFrame(
         2.4, 0, std::nullopt, std::nullopt, {100.0, 100.0, 1000.0});
     return inputs;
@@ -5485,24 +5484,16 @@ TEST_CASE("umbilicus cache: reused only while every input it was built from hold
     // Identical inputs reuse.
     CHECK_FALSE(umbilicusReloadNeeded(true, cached, cached));
 
-    auto otherRoot = cached;
-    otherRoot.root = "/other";
-    CHECK(umbilicusReloadNeeded(true, cached, otherRoot));
-
-    // The finding this pins: a volume switch whose annotation frame is
-    // byte-identical must still re-resolve, because the legacy reading's
-    // registration transform and the volume-centre fallback belong to the
-    // volume, not to the frame.
+    // A volume switch whose annotation frame is byte-identical must still
+    // reload, because the volume-centre fallback belongs to the volume.
     auto otherVolume = cached;
     otherVolume.volumeId = "vol-b";
     CHECK(umbilicusReloadNeeded(true, cached, otherVolume));
 
-    // Any resolver dependency changing on disk — the attached file fixed in
-    // place, a discovery candidate appearing, the registration transform
-    // edited — lands in the token.
-    auto editedFile = cached;
-    editedFile.dependencyToken = "field|/proj/umbilicus.json=100:2";
-    CHECK(umbilicusReloadNeeded(true, cached, editedFile));
+    // A new revision of the stored umbilicus (or a different one) lands in the token.
+    auto edited = cached;
+    edited.dependencyToken = "umbilicus-uuid@revision-2";
+    CHECK(umbilicusReloadNeeded(true, cached, edited));
 
     // A frame change rescales the cached points, so it cannot be reused...
     auto otherFrame = cached;

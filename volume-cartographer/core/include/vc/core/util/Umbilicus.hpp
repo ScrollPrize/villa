@@ -35,9 +35,9 @@ namespace vc::core::util {
         // is distinguishable from a legacy file that never declared the field.
         // Each entry reads "<key>: <reason>, got <value-as-written>", e.g.
         // `volume_width: expected a positive integer, got -5`. Parsing still
-        // succeeds and the points are still returned; it is
-        // resolveScrollUmbilicus() that refuses a file with errors, so callers
-        // that only want the polyline are unaffected.
+        // succeeds and the points are still returned; callers that decide a
+        // frame refuse a file with errors, while callers that only want the
+        // polyline are unaffected.
         std::vector<std::string> metadataErrors;
     };
 

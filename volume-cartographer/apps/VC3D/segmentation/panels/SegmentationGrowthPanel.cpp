@@ -9,7 +9,6 @@
 #include <QComboBox>
 #include <QDoubleSpinBox>
 #include <QDir>
-#include <QFileDialog>
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
@@ -238,24 +237,6 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
         panelLayout->addWidget(_patchTracerSourceContainer);
     }
 
-    {
-        _patchTracerUmbilicusContainer = new QWidget(this);
-        auto* umbilicusRow = new QHBoxLayout();
-        umbilicusRow->setContentsMargins(0, 0, 0, 0);
-        _patchTracerUmbilicusContainer->setLayout(umbilicusRow);
-        _lblPatchTracerUmbilicus = new QLabel(tr("Umbilicus:"), this);
-        umbilicusRow->addWidget(_lblPatchTracerUmbilicus, 0);
-
-        _editPatchTracerUmbilicusPath = new QLineEdit(this);
-        _editPatchTracerUmbilicusPath->setReadOnly(true);
-        umbilicusRow->addWidget(_editPatchTracerUmbilicusPath, 1);
-
-        _btnPatchTracerUmbilicusBrowse = new QPushButton(tr("Browse"), this);
-        _btnPatchTracerUmbilicusBrowse->setToolTip(tr("Select an umbilicus JSON file for Patch Tracer single-wrap growth."));
-        umbilicusRow->addWidget(_btnPatchTracerUmbilicusBrowse, 0);
-        panelLayout->addWidget(_patchTracerUmbilicusContainer);
-    }
-
     _groupPatchTracerParams = new QGroupBox(tr("Patch Tracer"), this);
     auto* patchParamsLayout = new QVBoxLayout(_groupPatchTracerParams);
     auto* patchForm = new QFormLayout();
@@ -398,8 +379,8 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
                   tr("Enable only when diagnosing growth behavior; it adds disk output and runtime overhead.")));
     _chkPatchSingleWrap = new QCheckBox(tr("Single wrap"), _groupPatchTracerParams);
     _chkPatchSingleWrap->setToolTip(
-        patchHelp(tr("Uses the selected umbilicus to prevent growth across the single-wrap seam."),
-                  tr("Requires an umbilicus path and constrains seam crossings using angular/radial checks.")));
+        patchHelp(tr("Uses the volume's umbilicus to prevent growth across the single-wrap seam."),
+                  tr("Requires an imported umbilicus (File > Import Umbilicus) and constrains seam crossings using angular/radial checks.")));
     connect(_chkPatchFlipX, &QCheckBox::toggled, this, [this]() { persistPatchTracerParams(); });
     connect(_chkPatchDebugImages, &QCheckBox::toggled, this, [this]() { persistPatchTracerParams(); });
     connect(_chkPatchSingleWrap, &QCheckBox::toggled, this, [this]() { persistPatchTracerParams(); });
@@ -490,25 +471,6 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
     connect(_editPatchTracerSourceTag, &QLineEdit::editingFinished, this, [this]() {
         _patchTracerSourceTag = _editPatchTracerSourceTag->text().trimmed();
         writeSetting(QStringLiteral("patch_tracer_source_tag"), _patchTracerSourceTag);
-    });
-
-    connect(_btnPatchTracerUmbilicusBrowse, &QPushButton::clicked, this, [this]() {
-        QString initial = _patchTracerUmbilicusPath;
-        if (initial.isEmpty() && !_volumePackagePath.isEmpty()) {
-            initial = _volumePackagePath;
-        }
-        const QString file = QFileDialog::getOpenFileName(this,
-                                                          tr("Select umbilicus JSON"),
-                                                          initial,
-                                                          tr("JSON Files (*.json);;All Files (*)"));
-        if (file.isEmpty()) {
-            return;
-        }
-        _patchTracerUmbilicusPath = QDir::cleanPath(file);
-        _patchTracerUmbilicusPathUserSet = true;
-        writeSetting(QStringLiteral("patch_tracer_umbilicus_path"), _patchTracerUmbilicusPath);
-        writeSetting(QStringLiteral("patch_tracer_umbilicus_path_user_set"), _patchTracerUmbilicusPathUserSet);
-        updatePatchTracerUmbilicusUi();
     });
 
     // Z-range connections
@@ -716,15 +678,6 @@ void SegmentationGrowthPanel::setNormal3dZarrCandidates(const QStringList& candi
 void SegmentationGrowthPanel::setVolumePackagePath(const QString& path)
 {
     _volumePackagePath = path;
-    if (!_patchTracerUmbilicusPathUserSet && !_volumePackagePath.isEmpty()) {
-        const QString defaultUmbilicus = QDir(_volumePackagePath).filePath(QStringLiteral("umbilicus.json"));
-        std::error_code ec;
-        if (std::filesystem::exists(defaultUmbilicus.toStdString(), ec) && !ec) {
-            _patchTracerUmbilicusPath = defaultUmbilicus;
-        } else {
-            _patchTracerUmbilicusPath.clear();
-        }
-    }
     syncUiState(_editingEnabled, _growthInProgress);
 }
 
@@ -812,9 +765,6 @@ utils::Json SegmentationGrowthPanel::patchTracerParamsJson() const
     params["max_width"] = _patchMaxWidth;
     params["debug_images"] = _patchDebugImages;
     params["single wrap"] = _patchSingleWrap;
-    if (!_patchTracerUmbilicusPath.trimmed().isEmpty()) {
-        params["umbilicus_path"] = _patchTracerUmbilicusPath.toStdString();
-    }
     params["local_cost_inl_th"] = _patchLocalCostInlierThreshold;
     params["same_surface_th"] = _patchSameSurfaceThreshold;
     params["straight_weight"] = _patchStraightWeight;
@@ -965,9 +915,6 @@ void SegmentationGrowthPanel::updateGrowthUiState()
     if (_patchTracerSourceContainer) {
         _patchTracerSourceContainer->setVisible(!manual && _growthMethod == SegmentationGrowthMethod::PatchTracer);
     }
-    if (_patchTracerUmbilicusContainer) {
-        _patchTracerUmbilicusContainer->setVisible(!manual && _growthMethod == SegmentationGrowthMethod::PatchTracer);
-    }
     if (_groupPatchTracerParams) {
         _groupPatchTracerParams->setVisible(!manual && _growthMethod == SegmentationGrowthMethod::PatchTracer);
     }
@@ -1009,9 +956,6 @@ void SegmentationGrowthPanel::updateGrowthUiState()
     }
     if (_editPatchTracerSourceTag) {
         _editPatchTracerSourceTag->setEnabled(enableGrowth);
-    }
-    if (_btnPatchTracerUmbilicusBrowse) {
-        _btnPatchTracerUmbilicusBrowse->setEnabled(enableGrowth);
     }
     if (_groupPatchTracerParams) {
         _groupPatchTracerParams->setEnabled(enableGrowth);
@@ -1093,21 +1037,6 @@ void SegmentationGrowthPanel::updatePatchTracerSourceUi()
     if (_editPatchTracerSourceTag) {
         const QSignalBlocker blocker(_editPatchTracerSourceTag);
         _editPatchTracerSourceTag->setText(_patchTracerSourceTag);
-    }
-}
-
-void SegmentationGrowthPanel::updatePatchTracerUmbilicusUi()
-{
-    if (!_patchTracerUmbilicusPathUserSet && _patchTracerUmbilicusPath.isEmpty() && !_volumePackagePath.isEmpty()) {
-        const QString defaultUmbilicus = QDir(_volumePackagePath).filePath(QStringLiteral("umbilicus.json"));
-        std::error_code ec;
-        if (std::filesystem::exists(defaultUmbilicus.toStdString(), ec) && !ec) {
-            _patchTracerUmbilicusPath = defaultUmbilicus;
-        }
-    }
-    if (_editPatchTracerUmbilicusPath) {
-        _editPatchTracerUmbilicusPath->setText(_patchTracerUmbilicusPath);
-        _editPatchTracerUmbilicusPath->setToolTip(_patchTracerUmbilicusPath);
     }
 }
 
@@ -1290,8 +1219,6 @@ void SegmentationGrowthPanel::restoreSettings(QSettings& settings)
     _normal3dSelectedPath = settings.value(QStringLiteral("normal3d_selected_path"), QString()).toString();
     _growthScale = std::clamp(settings.value(QStringLiteral("growth_scale"), _growthScale).toInt(), 0, 5);
     _patchTracerSourceTag = settings.value(QStringLiteral("patch_tracer_source_tag"), QString()).toString();
-    _patchTracerUmbilicusPath = settings.value(QStringLiteral("patch_tracer_umbilicus_path"), QString()).toString();
-    _patchTracerUmbilicusPathUserSet = settings.value(QStringLiteral("patch_tracer_umbilicus_path_user_set"), false).toBool();
     _patchGlobalStepsPerWindow = settings.value(QStringLiteral("patch_global_steps_per_window"), _patchGlobalStepsPerWindow).toInt();
     _patchFlipX = settings.value(QStringLiteral("patch_flip_x"), _patchFlipX).toBool();
     _patchSrcStep = std::clamp(settings.value(QStringLiteral("patch_src_step"), _patchSrcStep).toInt(), 1, 1000);
@@ -1343,9 +1270,6 @@ void SegmentationGrowthPanel::syncUiState(bool editingEnabled, bool growthInProg
     }
     if (_patchTracerSourceContainer) {
         _patchTracerSourceContainer->setVisible(_growthMethod == SegmentationGrowthMethod::PatchTracer);
-    }
-    if (_patchTracerUmbilicusContainer) {
-        _patchTracerUmbilicusContainer->setVisible(_growthMethod == SegmentationGrowthMethod::PatchTracer);
     }
 
     applyGrowthDirectionMaskToUi();
@@ -1405,7 +1329,6 @@ void SegmentationGrowthPanel::syncUiState(bool editingEnabled, bool growthInProg
 
     updateNormal3dUi();
     updatePatchTracerSourceUi();
-    updatePatchTracerUmbilicusUi();
     syncPatchTracerParamsUi();
 
     updateGrowthUiState();

@@ -50,6 +50,19 @@ constraint export and pred-snap rebuild tools accept `--object-store PATH` and
 open that database read-only. Native JSON needed by external processing tools is
 materialized explicitly from pinned revisions into temporary transfer files.
 
+The scroll umbilicus (Fiber Map unrolling, generated-view normal orientation,
+Patch Tracer single-wrap growth) is an `umbilicus` object in the attached store,
+bound to a volume like a fiber. **File → Import Umbilicus...** reads an umbilicus
+file (JSON, text or CSV) for the active volume and decides its frame once: a file
+stamping its grid (`volume_width/height/slices` or `voxelsize_um`) is scaled from
+that stamp, a stamp contradicting the volume it names is refused, and a file that
+states nothing (or only matches by inference) asks for its units per voxel.
+Importing replaces the volume's previous umbilicus; **Remove Umbilicus** retires
+it. A volume uses the one live umbilicus bound to it; with none, or several, the
+consumers report it and use none. An umbilicus drawn in a registration's
+fixed-volume frame must be transformed before import: a binding is a scale.
+`vc_object_ingest --umbilicus FILE` imports the store's own `vc_umbilicus` JSON.
+
 Example build and checks (existing configured Ninja build):
 
 ```sh

@@ -160,13 +160,6 @@ public:
     // Bounds are source annotation-frame XYZ, never current-volume voxel units.
     void setFocusBounds(std::optional<Rect3D> bounds, bool enabled);
 
-    // The project's umbilicus polyline, if one has been attached explicitly.
-    // Declaring it here removes the ambiguity of searching directories for
-    // umbilicus.json when a project references several packages.
-    [[nodiscard]] std::string umbilicus() const;
-    void setUmbilicus(std::string location);
-    [[nodiscard]] std::filesystem::path umbilicusPath() const;
-
     [[nodiscard]] bool hasVolumes() const;
     [[nodiscard]] bool hasVolume(const std::string& id) const;
     [[nodiscard]] std::size_t numberOfVolumes() const;
@@ -208,7 +201,6 @@ private:
     std::vector<vc::project::Entry> lasagnaDatasets_;
     std::optional<std::string> selectedLasagnaDataset_;
     std::optional<std::string> selectedFiberInferenceDataset_;
-    std::optional<std::string> umbilicus_;
     std::optional<Rect3D> focusBounds_;
     bool focusBoundsEnabled_ = false;
 

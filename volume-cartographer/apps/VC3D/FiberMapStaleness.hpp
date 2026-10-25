@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <optional>
 
-#include "vc/core/util/ScrollUmbilicus.hpp"
 
 #include "AnnotationFrame.hpp"
 
@@ -23,8 +22,7 @@ struct FiberMapDependencies {
     uint64_t fiberGeneration = 0;
     uint64_t packageGeneration = 0;
     uint64_t umbilicusGeneration = 0;
-    // Cheap metadata token over the files the umbilicus resolver depends on,
-    // covering a file changing underneath VC3D, which no counter reports.
+    // The stored umbilicus (uuid@revision), or why there is none.
     QString umbilicusFingerprint;
     vc3d::annotation::AnnotationFrame frame;
     // Which catalog volume the current volume is

@@ -20,7 +20,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "vc/core/util/ScrollUmbilicus.hpp"
 
 #include "AnnotationFrame.hpp"
 #include "FiberMapGapField.hpp"

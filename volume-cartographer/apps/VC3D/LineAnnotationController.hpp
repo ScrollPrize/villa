@@ -41,7 +41,6 @@
 #include "LineAnnotationGeneratedViews.hpp"
 #include "vc/atlas/FiberIntersections.hpp"
 #include "vc/core/util/Umbilicus.hpp"
-#include "vc/core/util/ScrollUmbilicus.hpp"
 #include "vc/core/util/Uuid.hpp"
 #include "vc/lasagna/LineOptimizer.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
@@ -233,7 +232,7 @@ public:
         // names the catalog entry that orients it; empty for a volume without
         // the tags.
         std::string coordinateSpace;
-        QString umbilicusMessage;           // resolver error / ambiguity text; empty on success
+        QString umbilicusMessage;           // why there is no umbilicus; empty on success
         // Ready-to-display description of the frame the scale maps from, for
         // workspace status bars: the stamped volume and its level offset when
         // the ratio is a power of two, the stamped grid size otherwise, or the
@@ -422,7 +421,7 @@ public:
     std::optional<double> fiberCoordinateScale(uint64_t id, bool prompt = false);
     [[nodiscard]] std::optional<double> fiberCoordinateScaleForVolume(uint64_t fiberId, const std::shared_ptr<Volume>& volume) const;
     [[nodiscard]] FiberMapSnapshot fiberMapSnapshot() const;
-    // Resolves the package's umbilicus for a status line only; nothing is
+    // The current volume's stored umbilicus for a status line only; nothing is
     // cached, so call it on user-visible state changes rather than per frame.
     [[nodiscard]] UmbilicusStatus umbilicusStatus() const;
     // The frame line points and control points are expressed in: the current
@@ -431,13 +430,8 @@ public:
     // Holders of derived geometry compare it to know whether what they built is
     // still in a frame that means anything.
     [[nodiscard]] vc3d::annotation::AnnotationFrame annotationFrame() const;
-    // Cheap token over everything resolveScrollUmbilicus() depends on: the
-    // project's field plus a stat() of each path the resolver's own scan reports,
-    // and no JSON parse. Size and mtime, so it is a metadata token rather than a
-    // guarantee -- a same-size rewrite inside one timestamp tick is invisible to
-    // it. It covers the file changing underneath VC3D, which no counter reports;
-    // for attach and detach it overlaps umbilicusGeneration(), which holders
-    // still compare as the reviewer-prescribed mechanism for in-app changes.
+    // The stored umbilicus of the current volume as uuid@revision, or why there
+    // is none: changes whenever the umbilicus derived views depend on does.
     [[nodiscard]] QString umbilicusFingerprint() const;
     // The current volume's open-data coordinate space
     // ("<sample>/<volume>@L<level>", from its vc-open-data tags), naming the
@@ -1133,21 +1127,13 @@ private:
     // before focus and navigation are restored, and materialization reads pane
     // camera state. Also collapses rapid switching into one rebuild.
     void scheduleStaleViewRefresh();
-    // Cheap fingerprint over everything the resolved umbilicus was read from: a
-    // stat() of every resolver candidate (the attached file when the project
-    // field is set, the discovery candidates otherwise) plus the registration
-    // transform the legacy reading would consult — no JSON parse. Part of the
-    // cached umbilicus's key, so fixing a refused file, editing a transform in
-    // place, or a new candidate appearing all reach the views.
-    [[nodiscard]] QString umbilicusCacheToken() const;
-    // The umbilicus half of fiberMapSnapshot(): the resolver's answer brought
-    // into the fibers' frame through the shared derivation, or the message
-    // saying why it could not be. Empty centers with an empty message mean the
-    // resolved file had no points, or no package is loaded.
+    // The umbilicus half of fiberMapSnapshot(): the stored umbilicus brought
+    // into the fibers' frame, or the message saying why it could not be. Empty
+    // centers with an empty message mean no state is loaded.
     struct SnapshotUmbilicus {
         std::vector<cv::Vec3f> centers;  // scaled into the fibers' frame, z-sorted
-        QString label;                   // frame description; empty when refused
-        QString message;                 // resolver/frame error; empty on success
+        QString label;                   // the umbilicus' name; empty when refused
+        QString message;                 // why there is none; empty on success
     };
     [[nodiscard]] SnapshotUmbilicus umbilicusForSnapshot(
         const vc3d::annotation::AnnotationFrame& frame) const;
@@ -1155,9 +1141,9 @@ private:
     // Pushes _umbilicusNotice to every open pane's dialog.
     void publishUmbilicusNotice();
     void finishOptimization(const std::string& surfaceName);
-    // Loads the volpkg's scroll umbilicus into the session frame on first use
-    // and caches the (possibly empty) result; re-attempted when the volpkg
-    // root changes.
+    // Loads the stored umbilicus into the session frame on first use and caches
+    // the (possibly empty) result; reloaded when the volume, frame or stored
+    // umbilicus changes.
     const std::optional<vc::core::util::Umbilicus>& ensureScrollUmbilicusLoaded();
     // Per-line-point sampled sheet normals, sign-oriented away from the
     // scroll center (umbilicus when available, volume XY center otherwise);
@@ -1506,15 +1492,11 @@ private:
     bool _fiberMetricsPending = false;
     std::unique_ptr<IntersectionInspectionSession> _intersectionInspection;
     std::unique_ptr<FiberSliceOverlayController> _fiberSliceOverlay;
-    // Scroll-center reference for orienting generated-view normals; loaded
-    // lazily from the volpkg's umbilicus file and re-attempted when the
-    // volpkg root changes. nullopt after a failed attempt (volume-center
-    // fallback is used instead).
+    // Scroll-center reference for orienting generated-view normals: the stored
+    // umbilicus of the current volume, scaled into the annotation frame. nullopt
+    // after a failed attempt (volume-center fallback is used instead).
     std::optional<vc::core::util::Umbilicus> _scrollUmbilicus;
-    std::filesystem::path _scrollUmbilicusRoot;
-    // The resolver's dependencies as of the cached load — a stat of every
-    // candidate plus the legacy transform — so any of them changing underneath
-    // VC3D (fixed, replaced, removed, or newly appearing) is noticed.
+    // The stored umbilicus token as of the cached load.
     QString _scrollUmbilicusToken;
     // The annotation frame _scrollUmbilicus was scaled into. Part of the cache
     // key because the cached value is not the file's contents: its points are
