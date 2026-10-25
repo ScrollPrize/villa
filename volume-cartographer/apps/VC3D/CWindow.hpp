@@ -47,7 +47,6 @@
 #include "overlays/AtlasOverlayController.hpp"
 #include "overlays/AtlasControlPointsOverlayController.hpp"
 #include "overlays/VolumeOverlayController.hpp"
-#include "SurfaceAffineTransformController.hpp"
 
 class CChunkedVolumeViewer;
 #include "ViewerManager.hpp"
@@ -122,7 +121,6 @@ class QFrame;
 class FileWatcherService;
 class AxisAlignedSliceController;
 class SegmentationCommandHandler;
-class ViewerTransformsPanel;
 class LineAnnotationController;
 class FiberCollectionController;
 class WrapAnnotationWidget;
@@ -486,7 +484,6 @@ private:
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<VolumeAttachmentController> _volumeAttachmentController;
     std::unique_ptr<MenuActionController> _menuController;
-    std::unique_ptr<SurfaceAffineTransformController> _surfaceAffineTransforms;
     // runner for command line tools
     CommandLineToolRunner* _cmdRunner;
     // Render-bench profiling harness (record/replay navigation timelines).

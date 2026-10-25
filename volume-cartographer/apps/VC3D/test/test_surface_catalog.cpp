@@ -11,6 +11,7 @@
 #include <vc_object_store/store/GeometryViews.hpp>
 #include "ObjectStoreCoordinates.hpp"
 #include "OpenDataSurfaceStore.hpp"
+#include "VolumeRegistrations.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_object_store/Uuid.hpp>
@@ -262,6 +263,53 @@ int main(int argc, char** argv)
         bool staleMapping=false;
         try {registeredEdit.save(*registered.surface,cv::Rect(1,2,1,1));}catch(const std::exception&){staleMapping=true;}
         require(staleMapping,"registration conflicts invalidate writable views");
+
+        // What VC3D does with registrations: list the related volumes, choose a
+        // route for an ambiguous pair, register a new affine.
+        {
+            namespace reg = vc3d::registrations;
+            auto relatedTo = [&](const std::string& volumeId) {
+                std::vector<reg::Related> result;
+                session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+                    result = reg::related(db.volumeTransforms(txn), volumeId);
+                });
+                return result;
+            };
+            auto related = relatedTo("vol1");
+            require(related.size() == 1 && related[0].volume == "vol2" &&
+                    related[0].status == vcr::catalog::TransformStatus::Ambiguous && related[0].routes.size() == 2 &&
+                    !related[0].chosen, "two registrations of vol2 make an ambiguous pair");
+            const auto chosenPath = related[0].routes[1].path;
+            reg::chooseRoute(*session, attachment, "vol2", "vol1", chosenPath);
+            related = relatedTo("vol1");
+            require(related[0].status == vcr::catalog::TransformStatus::Resolved && related[0].chosen == chosenPath,
+                    "a chosen route resolves the pair");
+            reg::chooseRoute(*session, attachment, "vol2", "vol1", related[0].routes[0].path);
+            require(relatedTo("vol1")[0].chosen == related[0].routes[0].path, "choosing again replaces the choice");
+            const auto opened = catalog.open(other);
+            require(opened.view.mapping == related[0].routes[0].forward, "views follow the chosen route");
+
+            require(reg::parseAffine("[[2, 0, 0, 1], [0, 2, 0, 0], [0, 0, 2, 0]]") ==
+                        VolumeAffine::fromJson(nlohmann::json::parse("[[2,0,0,1],[0,2,0,0],[0,0,2,0]]")),
+                    "a pasted JSON matrix parses");
+            require(reg::parseAffine("1 0 0 0\n0 1 0 0\n0 0 1 0\n0 0 0 1") == VolumeAffine::identity(), "4x4 rows parse");
+            bool rejected = false;
+            try { reg::parseAffine("1 0 0\n0 1 0"); } catch (const std::exception&) { rejected = true; }
+            require(rejected, "a matrix of the wrong size is refused");
+            rejected = false;
+            try { reg::parseAffine("0 0 0 0 0 0 0 0 0 0 0 0"); } catch (const std::exception&) { rejected = true; }
+            require(rejected, "a singular matrix is refused");
+
+            reg::registerAffine(*session, attachment, "vol3", "vol1", VolumeAffine::scale(4), "test scan");
+            const auto withNew = relatedTo("vol1");
+            const auto vol3 = std::find_if(withNew.begin(), withNew.end(), [](const auto& r) { return r.volume == "vol3"; });
+            require(vol3 != withNew.end() && vol3->status == vcr::catalog::TransformStatus::Resolved &&
+                    vol3->routes.front().forward == VolumeAffine::scale(4), "a registered affine relates its volume");
+            session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+                require(reg::describeRoute(db.volumeTransforms(txn).graph, vol3->routes.front().path).find("test scan") != std::string::npos,
+                        "routes are described by registration name");
+            });
+        }
 
         // A volume opened at pyramid level 1 has its own id: registering the level
         // relates it to the volume it shows, both ways, once.

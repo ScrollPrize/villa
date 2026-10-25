@@ -42,13 +42,11 @@ Existing output is never intentionally overwritten; caught errors remove staging
 A killed process may leave a uniquely named `.scale-*.tmp` directory, which is not
 a completed output and is not reused by subsequent runs.
 
-In VC3D, enable **Scale Only**, then **Don't resample (scale only)** in the
-Transforms panel. The selected volume supplies the destination shape. Preview
-operates on the current in-memory surface, preserving edits; **Save Transformed**
-creates a new surface in the attached object store (catalog surfaces included)
-whose provenance names the source. Corrections stay linked to the source surface.
-Use the CLI for streamed processing of large tifxyz directories without loading a
-surface.
+VC3D does not rescale or transform surfaces itself: stored surfaces open in any
+volume the object store relates to theirs (by coordinate scale or a registration),
+through the store's views. Its Transforms panel lists those volumes, registers a
+new affine to the open volume and chooses among a pair's routes; the store does
+the mapping.
 
 Build and test:
 

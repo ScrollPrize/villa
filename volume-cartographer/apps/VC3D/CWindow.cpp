@@ -133,7 +133,7 @@
 
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "viewer_controls/ViewerControlsPanel.hpp"
-#include "viewer_controls/panels/ViewerTransformsPanel.hpp"
+#include "viewer_controls/panels/VolumeRegistrationsPanel.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "SettingsDialog.hpp"
 #include "elements/VolumeSelector.hpp"
@@ -3577,9 +3577,6 @@ void CWindow::resetSegmentationViews(bool persistLayout)
 
 void CWindow::clearSurfaceSelection()
 {
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->clearPreview(true);
-    }
     _state->clearActiveSurface();
 
     if (_surfacePanel) {
@@ -3594,9 +3591,6 @@ void CWindow::clearSurfaceSelection()
         treeWidgetSurfaces->clearSelection();
     }
 
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->refresh();
-    }
     if (_atlasControlDock) {
         _atlasControlDock->clearResults();
     }
@@ -3709,9 +3703,6 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId)
         _surfacePanel->refreshPointSetFilterOptions();
     }
 
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->refresh();
-    }
 }
 
 void CWindow::updateNormalGridAvailability()
@@ -6599,9 +6590,6 @@ void CWindow::CreateWidgets(void)
     }
     connect(_surfaceCatalog.get(), &SurfaceCatalog::rowsChanged, this, [this]() {
         emit _state->surfacesLoaded();
-        if (_surfaceAffineTransforms) {
-            _surfaceAffineTransforms->refresh();
-        }
     });
     connect(_surfacePanel.get(), &SurfacePanelController::surfaceSelectionCleared, this, [this]() {
         clearSurfaceSelection();
@@ -7018,12 +7006,6 @@ void CWindow::CreateWidgets(void)
     _seedingWidget->setState(_state);
     connect(_state, &CState::volumeChanged, _seedingWidget,
             static_cast<void (SeedingWidget::*)(std::shared_ptr<Volume>, const std::string&)>(&SeedingWidget::onVolumeChanged));
-    connect(_state, &CState::volumeChanged, this,
-            [this](std::shared_ptr<Volume>, const std::string&) {
-                if (_surfaceAffineTransforms) {
-                    _surfaceAffineTransforms->refresh();
-                }
-            });
     connect(_seedingWidget, &SeedingWidget::sendStatusMessageAvailable, this, &CWindow::onShowStatusMessage);
     connect(_state, &CState::surfacesLoaded, _seedingWidget, &SeedingWidget::onSurfacesLoaded);
 
@@ -7537,7 +7519,7 @@ void CWindow::CreateWidgets(void)
 
     _transformsDock = new QDockWidget(tr("Transforms"), this);
     _transformsDock->setObjectName(QStringLiteral("dockWidgetTransforms"));
-    auto* transformsPanel = new ViewerTransformsPanel(_transformsDock);
+    auto* transformsPanel = new VolumeRegistrationsPanel(_state, _transformsDock);
     attachScrollAreaToDock(_transformsDock,
                            transformsPanel,
                            QStringLiteral("dockWidgetTransformsContent"));
@@ -7554,20 +7536,6 @@ void CWindow::CreateWidgets(void)
         _viewerControlsPanel->setViewControlsEnabled(!ui.grpVolManager || ui.grpVolManager->isEnabled());
     }
 
-    _surfaceAffineTransforms = std::make_unique<SurfaceAffineTransformController>(
-        SurfaceAffineTransformController::Deps{
-            .state = _state,
-            .transformsPanel = transformsPanel,
-            .viewerManager = _viewerManager.get(),
-            .segmentationModule = _segmentationModule.get(),
-            .surfacePanel = _surfacePanel.get(),
-            .axisAlignedSliceController = _axisAlignedSliceController.get(),
-            .dialogParent = this,
-            .showStatus = [this](const QString& text, int timeoutMs) {
-                onShowStatusMessage(text, timeoutMs);
-            },
-        },
-        this);
 
     _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetViewerControls);
     _segmentWorkspaceWindow->splitDockWidget(ui.dockWidgetVolumes, ui.dockWidgetViewerControls, Qt::Vertical);
@@ -7598,9 +7566,6 @@ void CWindow::CreateWidgets(void)
             this, &CWindow::onSurfaceActivated);
     connect(_surfacePanel.get(), &SurfacePanelController::surfaceActivatedPreserveEditing,
             this, &CWindow::onSurfaceActivatedPreserveEditing);
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->refresh();
-    }
 
     // new and remove path buttons
     // connect(ui.btnNewPath, SIGNAL(clicked()), this, SLOT(OnNewPathClicked()));
@@ -8713,9 +8678,6 @@ void CWindow::CloseVolume(void)
         _fileWatcher->stopWatching();
     }
 
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->clearPreview(false);
-    }
 
     // Tear down active segmentation editing before surfaces disappear to avoid
     // dangling pointers inside the edit manager when the underlying surfaces
@@ -8767,9 +8729,6 @@ void CWindow::CloseVolume(void)
         _spiralWorkspace->viewerManager()->setOverlayVolume(nullptr, {});
     }
 
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->refresh();
-    }
 }
 
 // Handle open request
@@ -8887,9 +8846,6 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, const std::shared_ptr
         _surfacePanel->applyFilters();
     }
 
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->refresh();
-    }
 
     maybeAttachBenchRecorder();
 }
@@ -8997,9 +8953,6 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, const 
         _surfacePanel->applyFilters();
     }
 
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->refresh();
-    }
 }
 
 void CWindow::onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf)
@@ -9392,9 +9345,6 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
         ? tr("Segmentation editing enabled")
         : tr("Segmentation editing disabled");
     showStatusBarMessage(message, 2000);
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->refresh();
-    }
 }
 
 void CWindow::onSegmentationStopToolsRequested()

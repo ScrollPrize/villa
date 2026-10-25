@@ -79,8 +79,8 @@ set(srcs
     OpenDataNormalGrids.hpp
     OpenDataSurfaceStore.cpp
     OpenDataSurfaceStore.hpp
-    SurfaceAffineTransformController.cpp
-    SurfaceAffineTransformController.hpp
+    VolumeRegistrations.cpp
+    VolumeRegistrations.hpp
     SurfaceAreaCalculator.cpp
     SurfaceAreaCalculator.hpp
     AtlasControlPointsDock.cpp
@@ -281,8 +281,8 @@ set(srcs
     viewer_controls/panels/ViewerNavigationPanel.hpp
     viewer_controls/panels/ViewerNormalVisualizationPanel.cpp
     viewer_controls/panels/ViewerNormalVisualizationPanel.hpp
-    viewer_controls/panels/ViewerTransformsPanel.cpp
-    viewer_controls/panels/ViewerTransformsPanel.hpp
+    viewer_controls/panels/VolumeRegistrationsPanel.cpp
+    viewer_controls/panels/VolumeRegistrationsPanel.hpp
     viewer_controls/panels/ViewerViewExtrasPanel.cpp
     viewer_controls/panels/ViewerViewExtrasPanel.hpp
     elements/ProgressUtil.cpp
