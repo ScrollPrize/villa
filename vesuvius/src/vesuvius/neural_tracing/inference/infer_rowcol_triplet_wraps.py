@@ -43,7 +43,7 @@ from vesuvius.neural_tracing.inference.generate_segment_cover_bboxes import (
 )
 from vesuvius.neural_tracing.heatmap_single_point.tifxyz import get_area, save_tifxyz
 from vesuvius.tifxyz import read_tifxyz
-from vesuvius.stored_objects import open_store
+from vc_object_store import ObjectStore
 from vesuvius.tifxyz.store import create_surface, read_surface
 
 _TTA_TRANSFORM_ALIASES = {
@@ -2156,7 +2156,7 @@ class _StoredSurfaces:
                              retarget_factor)
 
     def name(self, ref):
-        with open_store(self.store) as store:
+        with ObjectStore.open(str(self.store), read_only=True, reader_pool_size=1) as store:
             record = store.object(ref)
         return (record or {}).get("name") or ref
 

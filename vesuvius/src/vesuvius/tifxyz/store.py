@@ -7,8 +7,8 @@ import getpass
 import uuid as uuidlib
 
 import numpy as np
+from vc_object_store import ObjectStore, Surface, geometry_scale_to_volume
 
-from vesuvius.stored_objects import open_store, volume_scale
 from vesuvius.tifxyz.types import Tifxyz
 
 INVALID = -1.0
@@ -17,32 +17,25 @@ INVALID = -1.0
 def read_surface(path, surface_uuid, *, volume, geometry_revision=None):
     """The surface (its current geometry, or ``geometry_revision``) in voxels of ``volume`` as a Tifxyz.
 
-    Vertices the ``valid`` array marks invalid are missing (-1). Raises when the surface is not bound to
-    ``volume``."""
-    with open_store(path) as store:
+    Missing vertices, by the store's rule (coordinates and the ``valid`` array), are -1. Raises when the surface
+    is not bound to ``volume``."""
+    with ObjectStore.open(str(path), read_only=True, reader_pool_size=1) as store:
         record = store.object(surface_uuid)
         if record is None or record['kind'] != 'surface':
             raise ValueError(f'No surface {surface_uuid} in {path}')
-        to_volume = volume_scale(record['meta'], volume)
+        to_volume = geometry_scale_to_volume(record['meta'], volume)
         if to_volume is None:
             raise ValueError(f'Surface {surface_uuid} is not bound to volume {volume}')
-        revision = geometry_revision or store.current_geometry(surface_uuid)['uuid']
-        geometry = store.geometry_revision(revision)
-        shapes = {array['name']: array['shape'] for array in geometry['arrays']}
-        points = np.frombuffer(store.read_geometry_array(revision, 'points'), dtype='<f4').reshape(shapes['points'])
-        points = points.copy()
-        # Missing: any coordinate -1 or non-finite (the store's rule), or marked invalid.
-        missing = ~np.isfinite(points).all(axis=-1) | (points == INVALID).any(axis=-1)
-        if 'valid' in shapes:
-            valid = np.frombuffer(store.read_geometry_array(revision, 'valid'), dtype='u1').reshape(shapes['valid'])
-            missing |= valid == 0
-        points[missing] = INVALID
-        scale = [float(s) for s in geometry['attributes']['scale']]
+        with store.geometry_snapshot() as snapshot:
+            view = snapshot.surface(surface_uuid, geometry_revision)
+            points, valid = view.read_arrays()
+            scale = list(view.scale)
+    points[~valid] = INVALID
     if to_volume != 1.0:
-        points[~missing] *= np.float32(to_volume)
+        points[valid] *= np.float32(to_volume)
         scale = [s/to_volume for s in scale]
     return Tifxyz(_x=points[..., 0], _y=points[..., 1], _z=points[..., 2], uuid=surface_uuid,
-                  _scale=tuple(scale), extra=dict(record['meta']), _mask=~missing)
+                  _scale=tuple(scale), extra=dict(record['meta']), _mask=valid)
 
 
 def create_surface(path, zyxs, *, name, scale, volume, tool, parameters=None, sources=(), meta=None, tags=(),
@@ -54,17 +47,14 @@ def create_surface(path, zyxs, *, name, scale, volume, tool, parameters=None, so
     if zyxs.ndim != 3 or zyxs.shape[2] != 3:
         raise ValueError(f'Expected a rows x columns x 3 grid, got {zyxs.shape}')
     points = np.ascontiguousarray(zyxs[..., ::-1], dtype='<f4')
-    missing = ~np.isfinite(points).all(axis=2) | (points == INVALID).any(axis=2)
-    points[missing] = INVALID
+    points[~np.isfinite(points).all(axis=2) | (points == INVALID).any(axis=2)] = INVALID
     surface_uuid = str(uuidlib.uuid4())
     record_meta = dict(meta or {})
     record_meta['coordinates'] = dict(volume_uuid=str(volume), scale_factor=1)
     record_meta['provenance'] = dict(tool=tool, parameters=parameters or {}, sources=list(sources))
     record = dict(uuid=surface_uuid, kind='surface', name=name, tags=list(tags), meta=record_meta)
-    geometry = dict(kind='surface', attributes=dict(scale=[float(scale[0]), float(scale[1])]),
-                    arrays=[dict(name='points', dtype='<f4', shape=list(points.shape), data=points.tobytes())])
-    with open_store(path, read_only=False, author=author or getpass.getuser()) as store:
+    with ObjectStore.open(str(path), author=author or getpass.getuser()) as store:
         with store.write(expected_revisions={surface_uuid: None}) as tx:
             tx.upsert_object(record)
-            tx.put_geometry(surface_uuid, geometry)
+            tx.put_geometry(surface_uuid, Surface.from_arrays(points, [float(scale[0]), float(scale[1])]))
     return surface_uuid
