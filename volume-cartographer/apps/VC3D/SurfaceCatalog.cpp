@@ -129,9 +129,15 @@ void SurfaceCatalog::schedule()
 SurfaceCatalog::Opened SurfaceCatalog::open(const std::string& uuid) const
 {
     if (!attachment_ || !volume_) throw std::runtime_error("Attach an object store and open a volume first");
+    return open(session_, *attachment_, volume_->id(), uuid);
+}
+
+SurfaceCatalog::Opened SurfaceCatalog::open(const std::shared_ptr<ObjectStoreSession>& session,
+                                            const AttachmentIdentity& attachment, const std::string& volume,
+                                            const std::string& uuid)
+{
     Opened opened;
-    const auto volume = volume_->id();
-    session_->read(*attachment_, [&](const auto& db, const auto& txn, const auto&) {
+    session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
         const auto revision = db.currentObjectRevision(txn, uuid);
         if (!revision || revision->record.retired || revision->record.kind != "surface")
             throw std::runtime_error("The surface is no longer in the object store");
@@ -139,11 +145,11 @@ SurfaceCatalog::Opened SurfaceCatalog::open(const std::string& uuid) const
         if (!factor) throw std::runtime_error("The surface is not bound to volume " + volume);
         if (!revision->geometryRevision) throw std::runtime_error("The surface has no geometry");
         opened.surface = load_quad_from_store(db, txn, uuid, *revision->geometryRevision, true, *factor);
-        opened.pin = {*attachment_, {attachment_->storeUuid, revision->objectUuid}, revision->uuid, revision->geometryRevision};
+        opened.pin = {attachment, {attachment.storeUuid, revision->objectUuid}, revision->uuid, revision->geometryRevision};
         opened.toVolume = *factor;
     });
-    opened.surface->setChannelLoader(store_channel_loader(session_, *attachment_, *opened.pin.geometryRevision));
-    opened.editable = opened.toVolume == 1 && session_->writable(*attachment_);
+    opened.surface->setChannelLoader(store_channel_loader(session, attachment, *opened.pin.geometryRevision));
+    opened.editable = opened.toVolume == 1 && session->writable(attachment);
     return opened;
 }
 

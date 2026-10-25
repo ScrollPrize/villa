@@ -506,7 +506,8 @@ QJsonObject AgentBridgeServer::handleTracerRunTrace(const QJsonValue& params)
         rt.paramOverrides = overrides.toObject();
     if (p.contains("ompThreads"))
         rt.ompThreads = p.value("ompThreads").toInt();
-    rt.tgtDir = p.value("outputDir").toString();
+    rt.sourceTag = p.value("sourceTag").toString(rt.sourceTag);
+    rt.outputTag = p.value("outputTag").toString(rt.outputTag);
 
     const QString jobId = beginJob(QStringLiteral("tool"),
                                    QStringLiteral("tracer.run_trace"),
@@ -514,24 +515,20 @@ QJsonObject AgentBridgeServer::handleTracerRunTrace(const QJsonValue& params)
                                    /*broadcastStart=*/false);
 
     CommandLaunchError error;
-    QString outputDir;
-    if (!handler->startRunTrace(
-            segmentIdQ.toStdString(), rt, &error, &outputDir)) {
+    if (!handler->startRunTrace(segmentIdQ.toStdString(), rt, &error)) {
         _activeJobs.remove(QStringLiteral("tool"));
         throwCommandLaunchError(error, "Failed to start Run Trace",
                                 segmentIdQ, "tool");
     }
 
-    if (auto it = _activeJobs.find(QStringLiteral("tool")); it != _activeJobs.end()) {
-        it.value().outputPath = outputDir;
+    // The traced surfaces' UUIDs arrive with the job's completion.
+    if (auto it = _activeJobs.find(QStringLiteral("tool")); it != _activeJobs.end())
         broadcastJobProgress(it.value(), QStringLiteral("started"));
-    }
 
     QJsonObject result;
     result["jobId"] = jobId;
     result["kind"] = "tracer.run_trace";
     result["source"] = "tool";
-    result["outputDir"] = outputDir;
     return result;
 }
 

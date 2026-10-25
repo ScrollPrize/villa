@@ -126,9 +126,14 @@ void CommandLineToolRunner::setRemoteVolumeAuth(const QString& accessKey,
     _remoteRegion = region;
 }
 
-void CommandLineToolRunner::setSegmentPath(const QString& path)
+void CommandLineToolRunner::setStore(const QString& storePath)
 {
-    _segmentPath = path;
+    _storePath = storePath;
+}
+
+void CommandLineToolRunner::setSurface(const QString& uuid)
+{
+    _surfaceUuid = uuid;
 }
 
 void CommandLineToolRunner::setOutputPattern(const QString& pattern)
@@ -154,19 +159,21 @@ void CommandLineToolRunner::setRenderOutputFormat(RenderOutputFormat format)
     _renderOutputFormat = format;
 }
 
-void CommandLineToolRunner::setTraceParams(QString volumePath, QString srcDir, QString tgtDir, QString jsonParams, QString srcSegment)
+void CommandLineToolRunner::setTraceParams(QString volumePath, QString volumeUuid, QString sourceTag, QString outputTag,
+                                           QString jsonParams, QString srcSurface)
 {
     setVolumePath(volumePath);
-    _srcDir = srcDir;
-    _tgtDir = tgtDir;
+    _volumeUuid = volumeUuid;
+    _sourceTag = sourceTag;
+    _outputTag = outputTag;
     _jsonParams = jsonParams;
-    _srcSegment = srcSegment;
+    _srcSegment = srcSurface;
 }
 
-void CommandLineToolRunner::setToObjParams(QString tifxyzPath, QString objPath)
+void CommandLineToolRunner::setToObjParams(QString surfaceUuid, QString objName)
 {
-    _tifxyzPath = tifxyzPath;
-    _objPath = objPath;
+    _surfaceUuid = surfaceUuid;
+    _objPath = objName;
 }
 
 void CommandLineToolRunner::setIncludeTifs(bool include)
@@ -297,8 +304,13 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
         return false;
     }
 
-    if (tool == Tool::RenderTifXYZ && _segmentPath.isEmpty()) {
-        warn(tr("Error"), tr("Segment path not specified."));
+    if (!isCustom && _storePath.isEmpty()) {
+        warn(tr("Error"), tr("No object store attached."));
+        return false;
+    }
+
+    if ((tool == Tool::RenderTifXYZ || tool == Tool::tifxyz2obj) && _surfaceUuid.isEmpty()) {
+        warn(tr("Error"), tr("Surface not specified."));
         return false;
     }
 
@@ -308,7 +320,7 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
     }
 
     if (tool == Tool::NeighborCopy) {
-        if (_jsonParams.isEmpty() || _resumeSurfacePath.isEmpty() || _tgtDir.isEmpty()) {
+        if (_jsonParams.isEmpty() || _resumeSurfacePath.isEmpty()) {
             warn(tr("Error"), tr("Neighbor copy parameters incomplete."));
             return false;
         }
@@ -332,6 +344,9 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
     }
 
     _currentTool = tool;
+    _createdSurfaces.clear();
+    _exportedObj.clear();
+    _partialLine.clear();
     _executionOptions = options;
     _terminalReported = false;
     _pendingProcessError.clear();
@@ -426,7 +441,7 @@ bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
     startMessage = isCustom ? tr("Starting %1").arg(toolLabel)
                            : tr("Starting %1 for: %2")
                                  .arg(toolLabel)
-                                 .arg(QFileInfo(_segmentPath).fileName());
+                                 .arg(_surfaceUuid.isEmpty() ? _srcSegment : _surfaceUuid);
     emit toolStarted(_currentTool, startMessage);
 
     _consoleOutput->setTitle(tr("Running: %1").arg(toolLabel));
@@ -502,7 +517,22 @@ void CommandLineToolRunner::onProcessReadyRead()
             _logStream->flush();
         }
 
+        parseReportLines(outputText);
         emit consoleOutputReceived(outputText);
+    }
+}
+
+void CommandLineToolRunner::parseReportLines(const QString& output)
+{
+    // Output arrives in arbitrary chunks: keep the unterminated tail.
+    const QStringList lines = (_partialLine + output).split('\n');
+    _partialLine = lines.back();
+    for (qsizetype i = 0; i + 1 < lines.size(); ++i) {
+        const QString line = lines[i].trimmed();
+        if (line.startsWith(QStringLiteral("surface_uuid:")))
+            _createdSurfaces << line.mid(13).trimmed();
+        else if (line.startsWith(QStringLiteral("obj:")))
+            _exportedObj = line.mid(4).trimmed();
     }
 }
 
@@ -551,6 +581,9 @@ void CommandLineToolRunner::onProcessFinished(int exitCode, QProcess::ExitStatus
     if (_terminalReported) {
         return;
     }
+    // Report lines may still be buffered or unterminated.
+    onProcessReadyRead();
+    if (!_partialLine.isEmpty()) parseReportLines(QStringLiteral("\n"));
     if (_logStream) {
         *_logStream << Qt::endl << "===================================" << Qt::endl;
         *_logStream << "Process finished at: " << QDateTime::currentDateTime().toString(Qt::ISODate) << Qt::endl;
@@ -651,7 +684,8 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                          ? QStringLiteral("--zarr-output")
                          : QStringLiteral("--tif-output"))
                  << _outputPattern
-                 << "--segmentation" << _segmentPath
+                 << "--store" << _storePath
+                 << "--surface" << _surfaceUuid
                  << "--scale" << QString::number(_scale)
                  << "--group-idx" << QString::number(_resolution)
                  << "--num-slices" << QString::number(_layers);
@@ -701,50 +735,45 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
             break;
 
         case Tool::GrowSegFromSegment:
-            args << _volumePath
-                 << _srcDir
-                 << _tgtDir
-                 << _jsonParams
-                 << _srcSegment;
+            args << "--volume" << _volumePath
+                 << "--params" << _jsonParams
+                 << "--store" << _storePath
+                 << "--src-surface" << _srcSegment
+                 << "--volume-uuid" << _volumeUuid
+                 << "--source-tag" << _sourceTag
+                 << "--tag" << _outputTag;
             break;
 
-
         case Tool::tifxyz2obj:
-            args << _tifxyzPath
+            args << "--store" << _storePath
+                 << "--surface" << _surfaceUuid
                  << _objPath;
             if (_optNormalizeUV) args << "--normalize-uv";
             if (_optAlignGrid)   args << "--align-grid";
             break;
-        case Tool::obj2tifxyz:
-            args << _objPath
-                 << _objOutputDir
-                 << QString::number(_objStretchFactor)
-                 << QString::number(_objMeshUnits)
-                 << QString::number(_objStepSize);
-            break;
         case Tool::AlphaCompRefine:
-            args << _volumePath
-                 << _segmentPath
+            args << QStringLiteral("--store=%1").arg(_storePath)
+                 << _volumePath
+                 << _surfaceUuid
                  << _refineDst
                  << _jsonParams;
             break;
         case Tool::NeighborCopy:
             args << "-v" << _volumePath
                  << "-p" << _jsonParams
-                 << "--resume" << _resumeSurfacePath
-                 << "-t" << _tgtDir;
+                 << "--store" << _storePath
+                 << "--surface" << _resumeSurfacePath
+                 << "--volume-uuid" << _volumeUuid
+                 << "--tag" << _outputTag;
             if (!_resumeOpt.isEmpty()) {
                 args << "--resume-opt" << _resumeOpt;
             }
             break;
         case Tool::MergeTifxyz:
-            args << "--merge" << _mergeJsonPath;
-            // The tool defaults paths-dir to <merge.parent>/paths; pass
-            // the resolved segments dir (e.g. paths_2um_ds2/) explicitly
-            // so this works regardless of the volpkg's directory layout.
-            if (!_mergePathsDir.isEmpty()) {
-                args << "--paths-dir" << _mergePathsDir;
-            }
+            args << "--merge" << _mergeJsonPath
+                 << "--store" << _storePath
+                 << "--volume-uuid" << _volumeUuid
+                 << "--tag" << _outputTag;
             // Empty refSurface -> let vc_merge_tifxyz auto-pick the
             // surface with the largest valid-cell count. Otherwise pass
             // the user's pick straight through.
@@ -763,6 +792,7 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
             // Either positional (auto-detect roles by valid-cell count) or
             // explicit --parent / --child when the user swapped via the
             // dialog. The binary requires exactly one of these forms.
+            args << "--store" << _storePath;
             if (_patchExplicitRoles) {
                 args << "--parent" << _patchParentPath
                      << "--child"  << _patchChildPath;
@@ -800,9 +830,6 @@ QString CommandLineToolRunner::toolName(Tool tool) const
         case Tool::tifxyz2obj:
             return basePath + "vc_tifxyz2obj";
 
-        case Tool::obj2tifxyz:
-            return basePath + "vc_obj2tifxyz_legacy";
-
         case Tool::AlphaCompRefine:
             return basePath + "vc_objrefine";
 
@@ -825,32 +852,21 @@ QString CommandLineToolRunner::toolName(Tool tool) const
 
 QString CommandLineToolRunner::getOutputPath() const
 {
-    if (_currentTool == Tool::AlphaCompRefine) {
-        return _refineDst;
+    switch (_currentTool) {
+        case Tool::RenderTifXYZ: return QFileInfo(_outputPattern).dir().path();
+        case Tool::tifxyz2obj: return _exportedObj;
+        // An in-place refinement creates nothing: the source changed.
+        case Tool::AlphaCompRefine: return _createdSurfaces.isEmpty() ? _surfaceUuid : _createdSurfaces.join('\n');
+        // The binary edits the parent in place.
+        case Tool::MergePatch: return _patchParentPath;
+        case Tool::CustomCommand: return QString();
+        default: return _createdSurfaces.join('\n');
     }
-    if (_currentTool == Tool::NeighborCopy) {
-        return _tgtDir;
-    }
-    if (_currentTool == Tool::MergeTifxyz) {
-        // The tool auto-names the output dir under <volpkg>/paths/; we
-        // surface the merge.json instead so the user can find the run.
-        return _mergeJsonPath;
-    }
-    if (_currentTool == Tool::MergePatch) {
-        // The binary overwrites the parent in place; surface that path so
-        // the post-run notification can point users at what changed.
-        return _patchParentPath;
-    }
-    if (_currentTool == Tool::CustomCommand) {
-        return QString();
-    }
-
-    QFileInfo outputInfo(_outputPattern);
-    return outputInfo.dir().path();
 }
 
 void CommandLineToolRunner::setMergeParams(const QString& mergeJsonPath,
-                                           const QString& pathsDir,
+                                           const QString& volumeUuid,
+                                           const QString& outputTag,
                                            const QString& refSurface,
                                            int ransacIters,
                                            double ransacMinThresh,
@@ -861,7 +877,8 @@ void CommandLineToolRunner::setMergeParams(const QString& mergeJsonPath,
                                            int stripCols)
 {
     _mergeJsonPath        = mergeJsonPath;
-    _mergePathsDir        = pathsDir;
+    _volumeUuid           = volumeUuid;
+    _outputTag            = outputTag;
     _mergeRefSurface      = refSurface;
     _mergeRansacIters     = ransacIters;
     _mergeRansacMinThresh = ransacMinThresh;
@@ -899,23 +916,13 @@ void CommandLineToolRunner::setMergePatchParams(const QString& parentPath,
     _patchAnchorCap       = anchorCap;
 }
 
-void CommandLineToolRunner::setObj2TifxyzParams(const QString& objPath, const QString& outputDir,
-                                                float stretchFactor, float meshUnits, int stepSize)
-{
-    _objPath = objPath;
-    _objOutputDir = outputDir;
-    _objStretchFactor = stretchFactor;
-    _objMeshUnits = meshUnits;
-    _objStepSize = stepSize;
-}
-
 void CommandLineToolRunner::setObjRefineParams(const QString& volumePath,
                                                const QString& srcSurface,
                                                const QString& dstSurface,
                                                const QString& jsonParams)
 {
     setVolumePath(volumePath);
-    _segmentPath = srcSurface;
+    _surfaceUuid = srcSurface;
     _refineDst = dstSurface;
     _jsonParams = jsonParams;
 }
@@ -923,12 +930,14 @@ void CommandLineToolRunner::setObjRefineParams(const QString& volumePath,
 void CommandLineToolRunner::setNeighborCopyParams(const QString& volumePath,
                                                   const QString& paramsJson,
                                                   const QString& resumeSurface,
-                                                  const QString& outputDir,
+                                                  const QString& volumeUuid,
+                                                  const QString& outputTag,
                                                   const QString& resumeOpt)
 {
     setVolumePath(volumePath);
     _jsonParams = paramsJson;
     _resumeSurfacePath = resumeSurface;
-    _tgtDir = outputDir;
+    _volumeUuid = volumeUuid;
+    _outputTag = outputTag;
     _resumeOpt = resumeOpt;
 }

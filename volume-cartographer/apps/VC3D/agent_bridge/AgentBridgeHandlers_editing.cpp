@@ -590,7 +590,7 @@ QJsonObject AgentBridgeServer::handleSegmentationGrowPatchFromSeed(const QJsonVa
 
     gp.iterations = p.value("iterations").toInt(200);
     gp.minAreaCm = p.value("minAreaCm").toDouble(0.002);
-    gp.outputDir = p.value("outputDir").toString();
+    gp.outputTag = p.value("outputTag").toString(gp.outputTag);
 
     const QString effectiveVolumeId = gp.volumeId.isEmpty()
         ? QString::fromStdString(state->currentVolumeId())
@@ -609,16 +609,13 @@ QJsonObject AgentBridgeServer::handleSegmentationGrowPatchFromSeed(const QJsonVa
                                 {}, "tool");
     }
 
-    const QString outputDir = handler->activeGrowPatchOutputDir();
-    if (auto it = _activeJobs.find(QStringLiteral("tool")); it != _activeJobs.end()) {
-        it.value().outputPath = outputDir;
+    // The new surface's UUID arrives with the job's completion.
+    if (auto it = _activeJobs.find(QStringLiteral("tool")); it != _activeJobs.end())
         broadcastJobProgress(it.value(), QStringLiteral("started"));
-    }
 
     QJsonObject result;
     result["jobId"] = jobId;
     result["kind"] = "segmentation.grow_patch_from_seed";
-    result["outputDir"] = outputDir;
     result["volumeId"] = effectiveVolumeId;
     return result;
 }

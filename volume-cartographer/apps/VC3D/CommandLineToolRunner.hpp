@@ -32,7 +32,6 @@ public:
         RenderTifXYZ,
         GrowSegFromSegment,
         tifxyz2obj,
-        obj2tifxyz,
         AlphaCompRefine,
         NeighborCopy,
         MergeTifxyz,
@@ -76,7 +75,11 @@ public:
                              const QString& secretKey,
                              const QString& sessionToken,
                              const QString& region);
-    void setSegmentPath(const QString& path);
+    // Tools read and write surfaces in this object store (the attached store's
+    // file; a hosted replica's local file, which tools sync themselves).
+    void setStore(const QString& storePath);
+    // The stored surface a render or OBJ export reads.
+    void setSurface(const QString& uuid);
     void setOutputPattern(const QString& pattern);
 
     bool executeCustomCommand(const QString& command,
@@ -93,29 +96,32 @@ public:
     void setRenderAdvanced(int cropX, int cropY, int cropWidth, int cropHeight,
                            const QString& affinePath, bool invertAffine,
                            float scaleSegmentation, double rotateDegrees, int flipAxis);
-    void setTraceParams(QString volumePath, QString srcDir, QString tgtDir, QString jsonParams, QString srcSegment);
-    void setToObjParams(QString tifxyzPath, QString objPath);
+    // vc_grow_seg_from_segments: grow `srcSurface` along the surfaces of `volumeUuid`
+    // tagged `sourceTag` into new surfaces tagged `outputTag` and bound to the volume.
+    void setTraceParams(QString volumePath, QString volumeUuid, QString sourceTag, QString outputTag,
+                        QString jsonParams, QString srcSurface);
+    // vc_tifxyz2obj: export a stored surface to `objName` in its artifact directory.
+    void setToObjParams(QString surfaceUuid, QString objName);
     void setToObjOptions(bool normalizeUV, bool alignGrid);
-    void setObj2TifxyzParams(const QString& objPath, const QString& outputDir,
-                             float stretchFactor = 1000.0f,
-                             float meshUnits = 1.0f,
-                             int stepSize = 20);
+    // vc_objrefine: `dstSurface` is a new surface's name, or `srcSurface` to refine in place.
     void setObjRefineParams(const QString& volumePath,
                             const QString& srcSurface,
                             const QString& dstSurface,
                             const QString& jsonParams);
+    // vc_grow_seg_from_seed: grow from (resume) `resumeSurface` into a new surface
+    // tagged `outputTag` and bound to `volumeUuid`.
     void setNeighborCopyParams(const QString& volumePath,
                                const QString& paramsJson,
                                const QString& resumeSurface,
-                               const QString& outputDir,
+                               const QString& volumeUuid,
+                               const QString& outputTag,
                                const QString& resumeOpt);
-    // vc_merge_tifxyz: only --merge is required; the remaining args are
-    // RANSAC + blend tunables that all have working defaults. pathsDir
-    // is forwarded as --paths-dir so the volpkg's actual segments
-    // directory (e.g. paths_2um_ds2/, traces/) is used instead of the
-    // tool's `<merge.parent>/paths` default.
+    // vc_merge_tifxyz: --merge lists the input surfaces by UUID; the merge is a
+    // new surface tagged `outputTag` and bound to `volumeUuid`. The remaining
+    // args are RANSAC + blend tunables that all have working defaults.
     void setMergeParams(const QString& mergeJsonPath,
-                        const QString& pathsDir,
+                        const QString& volumeUuid,
+                        const QString& outputTag,
                         const QString& refSurface,
                         int ransacIters,
                         double ransacMinThresh,
@@ -124,11 +130,10 @@ public:
                         int ransacSeed,
                         int anchorCap,
                         int stripCols);
-    // vc_merge_patch: two tifxyz dirs; the binary auto-detects parent vs
+    // vc_merge_patch: two stored surfaces; the binary auto-detects parent vs
     // child by valid-cell count unless explicitRoles is set, in which case
-    // we pass --parent / --child explicitly. The parent tifxyz is
-    // overwritten in place (the binary snapshots the pre-patch state to
-    // <parent_dir>/backups/<parent_name>/{0..7}/ first).
+    // we pass --parent / --child explicitly. The parent is edited in place
+    // (its revision history keeps the pre-patch state).
     void setMergePatchParams(const QString& parentPath,
                              const QString& childPath,
                              bool explicitRoles,
@@ -144,6 +149,8 @@ public:
     bool execute(Tool tool, ExecutionOptions options = {});
     void cancel();
     bool isRunning() const;
+    // Surfaces the current (or last) run created, from its `surface_uuid:` lines.
+    const QStringList& createdSurfaces() const { return _createdSurfaces; }
     
     void showConsoleOutput();
     void hideConsoleOutput();
@@ -180,6 +187,8 @@ private:
     QStringList buildArguments(Tool tool);
     QString toolName(Tool tool) const;
     QString getOutputPath() const;
+    // Collects the tool's `surface_uuid:` and `obj:` report lines.
+    void parseReportLines(const QString& output);
     void closeLog();
     void finishExecution(bool success,
                          const QString& message,
@@ -199,12 +208,13 @@ private:
     QString _remoteSecretKey;
     QString _remoteSessionToken;
     QString _remoteRegion;
-    QString _segmentPath;
+    QString _storePath;
+    QString _surfaceUuid;
     QString _outputPattern;
-    QString _tgtDir;
-    QString _srcDir;
+    QString _sourceTag;
+    QString _outputTag;
+    QString _volumeUuid;
     QString _srcSegment;
-    QString _tifxyzPath;
     QString _objPath;
     QString _jsonParams;
     QString _resumeSurfacePath;
@@ -253,16 +263,14 @@ private:
     bool _terminalReported{true};
     QString _pendingProcessError;
 
-    QString _objOutputDir;
-    float _objStretchFactor = 1000.0f;
-    float _objMeshUnits = 1.0f;
-    int _objStepSize = 20;
     QString _refineDst;
+    QStringList _createdSurfaces;
+    QString _exportedObj;
+    QString _partialLine;
     bool _preserveConsoleOutput{false};
 
     // vc_merge_tifxyz parameters
     QString _mergeJsonPath;
-    QString _mergePathsDir;
     QString _mergeRefSurface;
     int     _mergeRansacIters{3000};
     double  _mergeRansacMinThresh{5.0};

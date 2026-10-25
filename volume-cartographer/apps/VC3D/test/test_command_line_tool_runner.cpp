@@ -81,6 +81,17 @@ int runChild(const QStringList& arguments)
         std::raise(SIGKILL);
         return 1;
     }
+    if (mode == "report") {
+        // A report line split across writes, and one without a final newline.
+        QFile out;
+        out.open(stdout, QIODevice::WriteOnly);
+        out.write("progress\nsurface_uu");
+        out.flush();
+        QThread::msleep(50);
+        out.write("id: 11111111-1111-1111-1111-111111111111\nsurface_uuid: 22222222-2222-2222-2222-222222222222");
+        out.flush();
+        return 0;
+    }
     if (mode == "write-omp" && marker + 2 < arguments.size()) {
         QFile output(arguments.at(marker + 2));
         if (!output.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -269,7 +280,8 @@ private slots:
     {
         CommandLineToolRunner runner(nullptr, {});
         runner.setVolumePath("volume.zarr");
-        runner.setSegmentPath("surface");
+        runner.setStore("objects.vcobj");
+        runner.setSurface("surface-uuid");
         const QString zarrPath = QDir::temp().filePath("render.zarr");
         runner.setOutputPattern(zarrPath);
         runner.setRenderParams(1.0f, 0, 4);
@@ -293,7 +305,8 @@ private slots:
     {
         CommandLineToolRunner runner(nullptr, {});
         runner.setVolumePath("volume.zarr");
-        runner.setSegmentPath("surface");
+        runner.setStore("objects.vcobj");
+        runner.setSurface("surface-uuid");
         runner.setOutputPattern(QDir::temp().filePath("render_layers"));
         runner.setRenderParams(1.0f, 0, 4);
         runner.setRenderOutputFormat(CommandLineToolRunner::RenderOutputFormat::TifStack);
@@ -304,6 +317,35 @@ private slots:
         QCOMPARE(arguments.count("--tif-output"), 1);
         QCOMPARE(arguments.count("--zarr-output"), 0);
         QVERIFY(!arguments.contains("--include-tifs"));
+    }
+
+    void renderReadsTheStoredSurface()
+    {
+        CommandLineToolRunner runner(nullptr, {});
+        runner.setVolumePath("volume.zarr");
+        runner.setStore("objects.vcobj");
+        runner.setSurface("surface-uuid");
+        runner.setOutputPattern(QDir::temp().filePath("render_layers"));
+        const QStringList arguments =
+            runner.argumentsForTesting(CommandLineToolRunner::Tool::RenderTifXYZ);
+        const int store = arguments.indexOf("--store");
+        const int surface = arguments.indexOf("--surface");
+        QVERIFY(store >= 0 && surface >= 0);
+        QCOMPARE(arguments.at(store + 1), QString("objects.vcobj"));
+        QCOMPARE(arguments.at(surface + 1), QString("surface-uuid"));
+        QVERIFY(!arguments.contains("--segmentation"));
+    }
+
+    void createdSurfacesComeFromReportLines()
+    {
+        CommandLineToolRunner runner(nullptr, {});
+        QSignalSpy finished(&runner, &CommandLineToolRunner::toolFinished);
+        QVERIFY(startHelper(runner, "report"));
+        expectSingleCompletion(finished);
+        QVERIFY(completionSucceeded(finished));
+        QCOMPARE(runner.createdSurfaces(),
+                 QStringList({"11111111-1111-1111-1111-111111111111",
+                              "22222222-2222-2222-2222-222222222222"}));
     }
 };
 

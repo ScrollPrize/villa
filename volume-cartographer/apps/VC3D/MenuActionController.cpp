@@ -41,7 +41,6 @@
 #include <QAction>
 #include <QApplication>
 #include <QClipboard>
-#include <QRegularExpression>
 #include <QFutureWatcher>
 #include <QInputDialog>
 #include <QtConcurrent>
@@ -63,7 +62,6 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QPointer>
-#include <QProcess>
 #include <QProgressDialog>
 #include <QScrollArea>
 #include <QSignalBlocker>
@@ -1622,71 +1620,6 @@ void MenuActionController::clearSelection()
 
     segViewer->clearSelections();
     _window->showStatusBarMessage(QObject::tr("Selections cleared"), 2000);
-}
-
-void MenuActionController::importObjAsPatch()
-{
-    auto* catalog = _window ? _window->_surfaceCatalog.get() : nullptr;
-    if (!catalog || !catalog->attachment() || !catalog->volume()) {
-        QMessageBox::warning(_window, QObject::tr("Error"), QObject::tr("Attach an object store and open a volume first."));
-        return;
-    }
-
-    QStringList objFiles = QFileDialog::getOpenFileNames(
-        _window,
-        QObject::tr("Select OBJ Files"),
-        QDir::homePath(),
-        QObject::tr("OBJ Files (*.obj);;All Files (*)"));
-
-    if (objFiles.isEmpty()) {
-        return;
-    }
-
-    std::filesystem::path store;
-    catalog->session()->read(*catalog->attachment(), [&](const auto& db, const auto&, const auto&) { store = db.path(); });
-
-    QStringList successfulIds;
-    QStringList failedFiles;
-
-    for (const QString& objFile : objFiles) {
-        QFileInfo fileInfo(objFile);
-
-        QProcess process;
-        process.setProcessChannelMode(QProcess::MergedChannels);
-
-        // The new surface is bound to the current volume at its voxel scale.
-        QStringList args;
-        args << objFile
-             << QStringLiteral("--store=%1").arg(QString::fromStdString(store.string()))
-             << QStringLiteral("--name=%1").arg(fileInfo.completeBaseName())
-             << QStringLiteral("--volume-uuid=%1").arg(QString::fromStdString(catalog->volume()->id()))
-             << QString::number(20);
-
-        QString toolPath = QCoreApplication::applicationDirPath() + "/vc_obj2tifxyz_legacy";
-        process.start(toolPath, args);
-
-        if (!process.waitForStarted(5000)) {
-            failedFiles.append(fileInfo.fileName());
-            continue;
-        }
-
-        process.waitForFinished(-1);
-
-        const QString output = QString::fromUtf8(process.readAll());
-        const auto match = QRegularExpression(QStringLiteral("surface_uuid:\\s*(\\S+)")).match(output);
-        if (process.exitCode() == 0 && process.exitStatus() == QProcess::NormalExit && match.hasMatch()) {
-            successfulIds.append(match.captured(1));
-        } else {
-            failedFiles.append(fileInfo.fileName());
-        }
-    }
-
-    QString message = QObject::tr("Imported: %1\nFailed: %2").arg(successfulIds.size()).arg(failedFiles.size());
-    if (!failedFiles.isEmpty()) {
-        message += QObject::tr("\n\nFailed files:\n%1").arg(failedFiles.join("\n"));
-    }
-
-    QMessageBox::information(_window, QObject::tr("Import Results"), message);
 }
 
 void MenuActionController::beginRotateSurfaceTransform()

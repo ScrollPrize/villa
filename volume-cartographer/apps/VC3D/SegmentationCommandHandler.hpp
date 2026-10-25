@@ -20,6 +20,7 @@
 // Full definition needed: RenderSegmentParams stores a
 // CommandLineToolRunner::RenderOutputFormat (nested enum) by value.
 #include "CommandLineToolRunner.hpp"
+#include "SurfaceCatalog.hpp"
 
 class CState;
 class CommandLineToolRunner;
@@ -49,23 +50,20 @@ public:
         Stage stage{Stage::None};
         QString segmentId;
         QString volumePath;
-        QString resumeSurfacePath;
-        QString outputDir;
-        QString generatedSurfacePath;
+        QString volumeUuid;          // outputs are bound to it
+        QString store;
+        QString outputTag;
+        QString generatedSurface;    // pass 1's surface, resumed by pass 2
         QString pass1JsonPath;
         QString pass2JsonPath;
-        QString directoryPrefix;
-        QString resumeOptMode{QStringLiteral("local")};
         int pass2OmpThreads{1};
         bool copyOut{true};
-        QSet<QString> baselineEntries;
         std::unique_ptr<QTemporaryFile> pass1JsonFile;
         std::unique_ptr<QTemporaryFile> pass2JsonFile;
     };
 
     struct ResumeLocalJob {
         QString segmentId;
-        QString outputDir;
         QString paramsPath;
         std::unique_ptr<QTemporaryFile> paramsFile;
     };
@@ -75,7 +73,6 @@ public:
     };
 
     struct GrowPatchSeedJob {
-        QString outputDir;
         QString paramsPath;
         std::unique_ptr<QTemporaryFile> paramsFile;
     };
@@ -85,15 +82,15 @@ public:
         QString volumeId;          // vpkg volume id; empty => current volume
         int     iterations{200};   // clamped/validated to [1, 100000]
         double  minAreaCm{0.002};  // >= 0
-        QString outputDir;         // absolute or relative to volpkg root; empty =>
-                                   // default head of the dialog's choice list
+        QString outputTag{QStringLiteral("paths")};  // tag of the new surface
     };
 
     // Arguments accepted by startRunTrace.
     struct RunTraceParams {
         QJsonObject paramOverrides;   // merged over <volpkg>/trace_params.json
         int         ompThreads{-1};   // -1 => runner default
-        QString     tgtDir;           // empty => <volpkg>/traces (created if missing)
+        QString     sourceTag{QStringLiteral("paths")};  // the surfaces the trace grows along
+        QString     outputTag{QStringLiteral("traces")}; // tag of the traced surface
     };
 
     // Arguments accepted by startRenderSegment. Options that belong to the
@@ -103,8 +100,8 @@ public:
         CommandLineToolRunner::RenderOutputFormat outputFormat{
             CommandLineToolRunner::RenderOutputFormat::TifStack};
         QString outputDir;            // absolute or relative to volpkg root; empty
-                                      // => the segment folder (matching the dialog
-                                      // default of <segment>/layers)
+                                      // => the surface's artifact directory (matching
+                                      // the dialog default of <artifacts>/layers)
         float   scale{1.0f};          // pixels per level-g voxel; > 0
         int     groupIdx{0};          // OME-Zarr group index; >= 0
         int     numSlices{1};         // number of slices to render; >= 1
@@ -120,8 +117,8 @@ public:
         QString energyType{QStringLiteral("symmetric_dirichlet")}; // or "conformal"
         double  keepPercent{100.0};  // 1..100; 100 => full-res (no decimation)
         bool    inpaintHoles{false};
-        QString outputDir;           // absolute or relative to volpkg root; empty =>
-                                     // <segment>_flatboi (matching the dialog default)
+        QString outputName;          // the flattened surface's name; empty =>
+                                     // <name>_flatboi (matching the dialog default)
     };
 
     // Arguments accepted by startStraighten.
@@ -132,8 +129,8 @@ public:
         bool    orthogonalize{true};
         bool    trim{true};
         double  trimMaxEdge{100.0};       // only emitted when trim is true
-        QString outputDir;                // absolute or relative to volpkg root; empty
-                                          // => <segment>_straightened (dialog default)
+        QString outputName;               // the straightened surface's name; empty
+                                          // => <name>_straightened (dialog default)
     };
 
     // Inputs shared by the interactive dialog and dialog-free caller. Base
@@ -200,7 +197,7 @@ signals:
     /**
      * Emitted once per flattening job at its terminal state. `message` holds the
      * captured error text on failure when dialogs are suppressed;
-     * `outputPath` is the artifact dir on success, else empty. `success=false`
+     * `outputPath` is the new surface's UUID on success, else empty. `success=false`
      * with an empty message denotes a user cancel.
      */
     void flattenJobFinished(bool success, QString message, QString outputPath);
@@ -242,19 +239,11 @@ public:
                                 const GrowPatchSeedParams& params,
                                 CommandLaunchError* error = nullptr);
 
-    /// Output dir from the most recent successful startGrowPatchFromSeed while its
-    /// job is active; empty when none pending.
-    QString activeGrowPatchOutputDir() const
-    {
-        return _growPatchSeedJob ? _growPatchSeedJob->outputDir : QString();
-    }
-
-    /// Starts vc_grow_seg_from_segments without opening a dialog. On success,
-    /// `resolvedOutputDir` receives the target directory when provided.
+    /// Starts vc_grow_seg_from_segments without opening a dialog. The traced
+    /// surfaces are reported by toolFinished (their UUIDs as the output).
     bool startRunTrace(const std::string& segmentId,
                        const RunTraceParams& params,
-                       CommandLaunchError* error = nullptr,
-                       QString* resolvedOutputDir = nullptr);
+                       CommandLaunchError* error = nullptr);
 
     /// Starts vc_render_tifxyz without opening a dialog. On success,
     /// `resolvedOutputDir` receives the layers directory or Zarr store.
@@ -265,10 +254,11 @@ public:
 
     /// Starts SLIM/flatboi asynchronously with dialogs suppressed. Preconditions
     /// and tools are resolved before launch; completion uses flattenJobFinished.
+    /// `resolvedOutputName` receives the new surface's name.
     bool startSlimFlatten(const std::string& segmentId,
                           const SlimFlattenParams& params,
                           CommandLaunchError* error = nullptr,
-                          QString* resolvedOutputDir = nullptr);
+                          QString* resolvedOutputName = nullptr);
 
     /// Starts ABF++ asynchronously on a worker thread with dialogs suppressed.
     /// Completion uses flattenJobFinished.
@@ -276,34 +266,30 @@ public:
                          int iterations,
                          int downsampleFactor,
                          CommandLaunchError* error = nullptr,
-                         QString* resolvedOutputDir = nullptr);
+                         QString* resolvedOutputName = nullptr);
 
-    /// Starts vc_straighten asynchronously with dialogs suppressed. The tool and
-    /// output directory are validated before launch; completion uses
-    /// flattenJobFinished.
+    /// Starts vc_straighten asynchronously with dialogs suppressed. The tool is
+    /// validated before launch; completion uses flattenJobFinished.
     bool startStraighten(const std::string& segmentId,
                          const StraightenParams& params,
                          CommandLaunchError* error = nullptr,
-                         QString* resolvedOutputDir = nullptr);
+                         QString* resolvedOutputName = nullptr);
 
     /// Dialog-free Resume-opt Local (GrowPatch) launch. The interactive slot
     /// gathers the same ResumeLocalGrowParams and uses the same launch core.
-    /// Completion is observable via CommandLineToolRunner::toolFinished. On
-    /// success `resolvedOutputDir` receives the target directory when provided.
+    /// Completion is observable via CommandLineToolRunner::toolFinished (the
+    /// resumed surface's UUID as the output).
     bool startResumeLocalGrowPatch(const std::string& segmentId,
                                    const ResumeLocalGrowParams& params,
-                                   CommandLaunchError* error = nullptr,
-                                   QString* resolvedOutputDir = nullptr);
+                                   CommandLaunchError* error = nullptr);
 
     /// Dialog-free alpha-comp refinement launch. The interactive slot gathers
     /// the same request and uses the same preparation and launch core.
-    /// Completion is observable via CommandLineToolRunner::toolFinished. On
-    /// success `resolvedOutputDir` (when non-null) receives the refined output
-    /// directory.
+    /// Completion is observable via CommandLineToolRunner::toolFinished (the
+    /// refined surface's UUID as the output).
     bool startAlphaCompRefine(const std::string& segmentId,
                               const AlphaCompRefineParams& params,
-                              CommandLaunchError* error = nullptr,
-                              QString* resolvedOutputDir = nullptr);
+                              CommandLaunchError* error = nullptr);
 
     /// Dialog-free core of onCropSurfaceToValidRegion (the interactive slot wraps
     /// this). Crops the surface grid to its tightest valid bounds, writes it in
@@ -316,14 +302,13 @@ public:
                                   QString* errorMessage = nullptr);
 
 
-    QString findNewNeighborSurface(const NeighborCopyJob& job) const;
     bool startNeighborCopyPass(const QString& paramsPath,
                                const QString& resumeSurface,
                                const QString& resumeOpt,
                                int ompThreads);
+    // Marks a rasterized label volume and records its source surfaces (UUIDs).
     bool appendRasterizationMetadata(const QString& outputZarrPath,
-                                   const QStringList& segmentIds,
-                                   const QStringList& segmentPaths) const;
+                                   const QStringList& segmentIds) const;
 
 private:
     /** Helper: get current volume path from state */
@@ -336,6 +321,22 @@ private:
      * If \p checkRunner is true, also verifies _cmdRunner is set and idle.
      * Returns the QuadSurface* on success, or nullptr on failure.
      */
+    // A surface tools read from the store and the store they open.
+    struct StoredSurface {
+        std::string uuid;
+        QString name;        // record name; the UUID when unnamed
+        QString store;       // the store file (a hosted replica's local file)
+        QString volumeUuid;  // the current volume, which outputs are bound to
+    };
+    // The listed surface `id` stored at the current volume's scale (tools read
+    // stored coordinates) in a writable store; nullopt with `error` set otherwise.
+    std::optional<StoredSurface> storedSurface(const std::string& id, CommandLaunchError* error) const;
+    // Same, reporting failures in a dialog; `checkRunner` also needs an idle runner.
+    std::optional<StoredSurface> requireStoredSurface(const std::string& id, bool checkRunner);
+    // The listed surfaces stored in the current volume's voxels (tool inputs).
+    std::vector<const SurfaceCatalog::Row*> toolSurfaces() const;
+    // The attached store's file and the current volume, for tools that read no surface.
+    std::optional<StoredSurface> storeForTools(CommandLaunchError* error) const;
     std::function<bool(const std::shared_ptr<QuadSurface>&)> _editingDestinationResolver;
     std::function<bool(QuadSurface*)> _surfaceSaver;
     // The active surface when it is `segmentId`: tools change the surface on screen.
@@ -363,13 +364,16 @@ private:
     bool startResumeLocalGrowPatchImpl(const std::string& segmentId,
                                        const ResumeLocalGrowParams& params,
                                        bool interactive,
-                                       CommandLaunchError* error,
-                                       QString* resolvedOutputDir);
+                                       CommandLaunchError* error);
     bool startRunTraceImpl(const std::string& segmentId,
                            const RunTraceParams& params,
                            bool interactive,
-                           CommandLaunchError* error,
-                           QString* resolvedOutputDir);
+                           CommandLaunchError* error);
+    bool startSlimFlattenImpl(const std::string& segmentId,
+                              const SlimFlattenParams& params,
+                              bool interactive,
+                              CommandLaunchError* error,
+                              QString* resolvedOutputName);
     bool startGrowPatchFromSeedImpl(const QVector3D& seedPoint,
                                     const GrowPatchSeedParams& params,
                                     bool interactive,
@@ -377,25 +381,10 @@ private:
     bool startAlphaCompRefineImpl(const std::string& segmentId,
                                   const AlphaCompRefineParams& params,
                                   bool interactive,
-                                  CommandLaunchError* error,
-                                  QString* resolvedOutputDir);
+                                  CommandLaunchError* error);
     static QJsonObject alphaCompRefineParamsJson(
         const AlphaCompRefineParams& params);
 
-    /**
-     * Resolve a segment launch's output directory: the surface's own parent
-     * directory, falling back to <volpkg>/paths, created if missing. Returns the
-     * absolute path, or an empty string with \p errorMessage set on a directory
-     * creation failure.
-     */
-    QString resolveSegmentOutputDir(const std::filesystem::path& surfacePath,
-                                    QString* errorMessage) const;
-
-    /**
-     * The default alpha-comp refinement output path (<src>_refined, preserving
-     * any file suffix), shared by the dialog and direct-launch defaults.
-     */
-    static QString defaultRefinedOutputPath(const QFileInfo& srcInfo);
 
     QWidget* _parentWidget{nullptr};
     CState* _state{nullptr};
@@ -407,6 +396,8 @@ private:
     std::optional<ResumeLocalJob> _resumeLocalJob;
     std::optional<AlphaCompJob> _alphaCompJob;
     std::optional<GrowPatchSeedJob> _growPatchSeedJob;
+    // The merged trace params of the running Run Trace.
+    std::unique_ptr<QTemporaryFile> _traceParamsFile;
 
     // Callbacks for CWindow-specific operations
     std::function<QString()> _normal3dZarrPathGetter;

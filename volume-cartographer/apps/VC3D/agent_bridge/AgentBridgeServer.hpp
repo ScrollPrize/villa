@@ -281,7 +281,7 @@ private:
     QJsonObject launchFlattenJob(
         const QString& kind, const QString& label, const QString& segmentId,
         const std::function<bool(CommandLaunchError* error,
-                                 QString* outDir)>& launch);
+                                 QString* outputName)>& launch);
 
     // Per-segment mesh operations live in AgentBridgeHandlers_surfaceops.cpp.
     // Sync: crop_bounds / recalc_area. Async source:"tool": reoptimize /

@@ -47,12 +47,6 @@ QJsonObject AgentBridgeServer::handleSegmentCropBounds(const QJsonValue& params)
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
     const QString segmentId = p.value("segmentId").toString();
-    if (!state->vpkg()->getSurface(segmentId.toStdString())) {
-        QJsonObject data;
-        data["kind"] = "segment";
-        data["id"] = segmentId;
-        throw AgentBridgeError{-32007, "Segment not found", data};
-    }
 
     SegmentationCommandHandler* handler = _window->_segmentationCommandHandler.get();
     if (!handler) {
@@ -152,12 +146,6 @@ QJsonObject AgentBridgeServer::handleSegmentReoptimize(const QJsonValue& params)
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
     const QString segmentId = p.value("segmentId").toString();
-    if (!state->vpkg()->getSurface(segmentId.toStdString())) {
-        QJsonObject data;
-        data["kind"] = "segment";
-        data["id"] = segmentId;
-        throw AgentBridgeError{-32007, "Segment not found", data};
-    }
 
     SegmentationCommandHandler::ResumeLocalGrowParams rp;
     rp.volumeId = p.value("volumeId").toString();
@@ -194,24 +182,20 @@ QJsonObject AgentBridgeServer::handleSegmentReoptimize(const QJsonValue& params)
                                    /*broadcastStart=*/false);
 
     CommandLaunchError error;
-    QString outputDir;
-    if (!handler->startResumeLocalGrowPatch(
-            segmentId.toStdString(), rp, &error, &outputDir)) {
+    if (!handler->startResumeLocalGrowPatch(segmentId.toStdString(), rp, &error)) {
         _activeJobs.remove(QStringLiteral("tool"));
         throwCommandLaunchError(error, "Failed to start reoptimize",
                                 segmentId, "tool");
     }
 
-    if (auto it = _activeJobs.find(QStringLiteral("tool")); it != _activeJobs.end()) {
-        it.value().outputPath = outputDir;
+    // The resumed surface's UUID arrives with the job's completion.
+    if (auto it = _activeJobs.find(QStringLiteral("tool")); it != _activeJobs.end())
         broadcastJobProgress(it.value(), QStringLiteral("started"));
-    }
 
     QJsonObject result;
     result["jobId"] = jobId;
     result["kind"] = "segment.reoptimize";
     result["source"] = "tool";
-    result["outputDir"] = outputDir;
     result["volumeId"] = effectiveVolumeId;
     return result;
 }
@@ -231,12 +215,6 @@ QJsonObject AgentBridgeServer::handleSegmentRefineAlphaComp(const QJsonValue& pa
         throw AgentBridgeError{-32001, "No volume loaded", {}};
 
     const QString segmentId = p.value("segmentId").toString();
-    if (!state->vpkg()->getSurface(segmentId.toStdString())) {
-        QJsonObject data;
-        data["kind"] = "segment";
-        data["id"] = segmentId;
-        throw AgentBridgeError{-32007, "Segment not found", data};
-    }
 
     SegmentationCommandHandler::AlphaCompRefineParams rp;
     rp.refine = p.value("refine").toBool(rp.refine);
@@ -249,12 +227,12 @@ QJsonObject AgentBridgeServer::handleSegmentRefineAlphaComp(const QJsonValue& pa
     rp.radius = p.value("radius").toInt(rp.radius);
     rp.genVertexColor =
         p.value("genVertexColor").toBool(rp.genVertexColor);
-    rp.overwrite = p.value("overwrite").toBool(rp.overwrite);
     rp.readerScale = p.value("readerScale").toDouble(rp.readerScale);
     rp.scaleGroup = p.value("scaleGroup").toString(rp.scaleGroup);
     if (p.contains("ompThreads"))
         rp.ompThreads = p.value("ompThreads").toInt();
-    rp.outputDir = p.value("outputDir").toString();
+    rp.outputName = p.value("outputName").toString();
+    rp.inPlace = p.value("inPlace").toBool(rp.inPlace);
 
     // Refinement runs vc_objrefine via the runner: the "tool" source.
     requireSourceIdle(QStringLiteral("tool"));
@@ -272,24 +250,20 @@ QJsonObject AgentBridgeServer::handleSegmentRefineAlphaComp(const QJsonValue& pa
                                    /*broadcastStart=*/false);
 
     CommandLaunchError error;
-    QString outputDir;
-    if (!handler->startAlphaCompRefine(
-            segmentId.toStdString(), rp, &error, &outputDir)) {
+    if (!handler->startAlphaCompRefine(segmentId.toStdString(), rp, &error)) {
         _activeJobs.remove(QStringLiteral("tool"));
         throwCommandLaunchError(error, "Failed to start refinement",
                                 segmentId, "tool");
     }
 
-    if (auto it = _activeJobs.find(QStringLiteral("tool")); it != _activeJobs.end()) {
-        it.value().outputPath = outputDir;
+    // The refined surface's UUID arrives with the job's completion.
+    if (auto it = _activeJobs.find(QStringLiteral("tool")); it != _activeJobs.end())
         broadcastJobProgress(it.value(), QStringLiteral("started"));
-    }
 
     QJsonObject result;
     result["jobId"] = jobId;
     result["kind"] = "segment.refine_alpha_comp";
     result["source"] = "tool";
-    result["outputDir"] = outputDir;
     result["segmentId"] = segmentId;
     return result;
 }

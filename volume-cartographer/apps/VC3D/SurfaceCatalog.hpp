@@ -61,6 +61,10 @@ public:
     // The surface's current geometry in the volume's voxels; channels read on
     // demand from the same revision. Throws when it cannot be read.
     Opened open(const std::string& uuid) const;
+    // The same from an explicit source, for worker threads.
+    static Opened open(const std::shared_ptr<vc::objects::ObjectStoreSession>& session,
+                       const vc::objects::AttachmentIdentity& attachment, const std::string& volume,
+                       const std::string& uuid);
 
     // Surfaces (among `uuids`, all when nullopt) within `tolerance` voxels of a
     // volume point, nearest first. Synchronous.

@@ -122,7 +122,6 @@ private slots:
     void toggleCursorMirroring(bool enabled);
     void surfaceFromSelection();
     void clearSelection();
-    void importObjAsPatch();
     void beginRotateSurfaceTransform();
     void exitApplication();
 
@@ -236,7 +235,6 @@ private:
     QAction* _mirrorCursorAct{nullptr};
     QAction* _surfaceFromSelectionAct{nullptr};
     QAction* _selectionClearAct{nullptr};
-    QAction* _importObjAct{nullptr};
     QAction* _rotateSurfaceAct{nullptr};
     QAction* _mergeTifxyzAct{nullptr};
     QAction* _mergePatchAct{nullptr};

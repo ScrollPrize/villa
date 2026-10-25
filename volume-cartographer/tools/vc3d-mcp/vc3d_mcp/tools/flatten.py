@@ -80,8 +80,8 @@ async def vc3d_flatten_slim(
     flattening method, the headless twin of the "SLIM flatten" context-menu
     action. Asynchronous (a source:"flatten" job -- poll vc3d_job_status).
 
-    Runs the flatboi pipeline (vc_tifxyz2obj -> flatboi -> vc_obj2tifxyz, with a
-    vc_obj_uv_lift step only when decimating). No dialog is ever shown.
+    flatboi reads the stored surface and creates the flattened surface object
+    (no OBJ files). No dialog is ever shown.
 
     segment_id: id of the segment to flatten.
     iterations: flatboi iterations, >= 1 (default 50).
