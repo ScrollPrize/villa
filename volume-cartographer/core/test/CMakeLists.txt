@@ -390,6 +390,8 @@ add_dependencies(test_grow_seg_store_mode vc_grow_seg_from_seed)
 set_tests_properties(test_grow_seg_store_mode PROPERTIES
     ENVIRONMENT "VC_GROW_SEG_FROM_SEED_BIN=$<TARGET_FILE:vc_grow_seg_from_seed>")
 
+vc_add_test(NAME test_surface_meshing)
+
 # Store modes of the command-line tools, compared with their tifxyz modes.
 vc_add_test(NAME test_tool_store_modes)
 if(TARGET flatboi)

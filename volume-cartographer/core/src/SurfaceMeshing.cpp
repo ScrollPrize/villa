@@ -73,6 +73,53 @@ GridMesh meshGrid(const cv::Mat_<cv::Vec3f>& points)
     return mesh;
 }
 
+LiftedUVs liftGridUVs(const GridMesh& fine, const cv::Mat_<cv::Vec3f>& coarsePoints, const GridMesh& coarse,
+                      const std::vector<cv::Vec2d>& coarseUVs, int stride)
+{
+    if (coarseUVs.size() != coarse.cells.size()) throw std::invalid_argument("one UV per coarse vertex");
+    cv::Mat_<int> index(coarsePoints.size(), -1);
+    for (std::size_t i = 0; i < coarse.cells.size(); ++i) index(coarse.cells[i]) = static_cast<int>(i);
+    const auto uvOf = [&](int r, int c) { return coarseUVs[index(r, c)]; };
+
+    LiftedUVs lifted;
+    lifted.uvs.resize(fine.cells.size());
+    lifted.valid.assign(fine.cells.size(), 0);
+    const int rows = coarsePoints.rows, cols = coarsePoints.cols;
+#pragma omp parallel for schedule(static)
+    for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(fine.cells.size()); ++i) {
+        const double gr = double(fine.cells[i][0]) / stride;
+        const double gc = double(fine.cells[i][1]) / stride;
+        const int qr = std::clamp(int(std::floor(gr)), 0, std::max(0, rows - 2));
+        const int qc = std::clamp(int(std::floor(gc)), 0, std::max(0, cols - 2));
+        if (rows > 1 && cols > 1 && loc_valid(coarsePoints, cv::Vec2d(qr, qc))) {
+            // The quad's faces are (r+1,c)(r,c)(r,c+1) below the diagonal u+v=1
+            // and (r+1,c)(r,c+1)(r+1,c+1) above it.
+            const double u = std::clamp(gc - qc, 0.0, 1.0);
+            const double v = std::clamp(gr - qr, 0.0, 1.0);
+            const cv::Vec2d uv = u + v <= 1.0
+                ? (1.0 - u - v) * uvOf(qr, qc) + u * uvOf(qr, qc + 1) + v * uvOf(qr + 1, qc)
+                : (u + v - 1.0) * uvOf(qr + 1, qc + 1) + (1.0 - v) * uvOf(qr, qc + 1) + (1.0 - u) * uvOf(qr + 1, qc);
+            lifted.uvs[i] = cv::Vec2f(float(uv[0]), float(uv[1]));
+            lifted.valid[i] = 1;
+            continue;
+        }
+        double best = std::numeric_limits<double>::infinity();
+        const int cr = int(std::lround(gr)), cc = int(std::lround(gc));
+        for (int r = std::max(0, cr - 2); r <= std::min(rows - 1, cr + 2); ++r)
+            for (int c = std::max(0, cc - 2); c <= std::min(cols - 1, cc + 2); ++c) {
+                if (index(r, c) < 0) continue;
+                const double d = (r - gr) * (r - gr) + (c - gc) * (c - gc);
+                if (d < best) {
+                    best = d;
+                    const cv::Vec2d uv = uvOf(r, c);
+                    lifted.uvs[i] = cv::Vec2f(float(uv[0]), float(uv[1]));
+                    lifted.valid[i] = 1;
+                }
+            }
+    }
+    return lifted;
+}
+
 namespace {
 // Sub-pixel resolution for fixed-point vertex snapping (8 fractional bits).
 constexpr long long SUBPIXEL = 256;

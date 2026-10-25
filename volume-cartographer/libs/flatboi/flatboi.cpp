@@ -961,65 +961,6 @@ static void save_energies(const fs::path& input, const std::vector<double>& E) {
 // the decimated mesh.
 namespace surface_mode {
 
-struct Lifted {
-  std::vector<cv::Vec2f> uvs;  // per full-grid vertex
-  std::vector<bool> valid;
-};
-
-// UVs of the full grid's mesh vertices from the decimated mesh's flattened UVs.
-// A vertex in a decimated quad takes the barycentric mix of that quad's
-// triangle; one beyond the decimated quads (a hole, or the rows/columns past
-// the last decimated sample) takes the nearest decimated vertex within two cells.
-static Lifted lift(const vc::meshing::GridMesh& fine, const cv::Mat_<cv::Vec3f>& coarse,
-                   const vc::meshing::GridMesh& coarse_mesh, const Eigen::MatrixXd& coarse_uv, int stride)
-{
-  cv::Mat_<int> index(coarse.size(), -1);
-  for (std::size_t i = 0; i < coarse_mesh.cells.size(); ++i) index(coarse_mesh.cells[i]) = static_cast<int>(i);
-  const auto uv_of = [&](int r, int c) {
-    const int i = index(r, c);
-    return cv::Vec2d(coarse_uv(i, 0), coarse_uv(i, 1));
-  };
-
-  Lifted lifted;
-  lifted.uvs.resize(fine.cells.size());
-  lifted.valid.assign(fine.cells.size(), false);
-  #pragma omp parallel for schedule(static)
-  for (std::ptrdiff_t i = 0; i < static_cast<std::ptrdiff_t>(fine.cells.size()); ++i) {
-    const double gr = double(fine.cells[i][0]) / stride;
-    const double gc = double(fine.cells[i][1]) / stride;
-    const int qr = std::clamp(int(std::floor(gr)), 0, std::max(0, coarse.rows - 2));
-    const int qc = std::clamp(int(std::floor(gc)), 0, std::max(0, coarse.cols - 2));
-    if (coarse.rows > 1 && coarse.cols > 1 && loc_valid(coarse, cv::Vec2d(qr, qc))) {
-      // The quad's faces are (r+1,c)(r,c)(r,c+1) below the diagonal u+v=1
-      // and (r+1,c)(r,c+1)(r+1,c+1) above it.
-      const double u = std::clamp(gc - qc, 0.0, 1.0);
-      const double v = std::clamp(gr - qr, 0.0, 1.0);
-      cv::Vec2d uv;
-      if (u + v <= 1.0)
-        uv = (1.0 - u - v) * uv_of(qr, qc) + u * uv_of(qr, qc + 1) + v * uv_of(qr + 1, qc);
-      else
-        uv = (u + v - 1.0) * uv_of(qr + 1, qc + 1) + (1.0 - v) * uv_of(qr, qc + 1) + (1.0 - u) * uv_of(qr + 1, qc);
-      lifted.uvs[i] = cv::Vec2f(float(uv[0]), float(uv[1]));
-      lifted.valid[i] = true;
-      continue;
-    }
-    double best = std::numeric_limits<double>::infinity();
-    const int cr = int(std::lround(gr)), cc = int(std::lround(gc));
-    for (int r = std::max(0, cr - 2); r <= std::min(coarse.rows - 1, cr + 2); ++r)
-      for (int c = std::max(0, cc - 2); c <= std::min(coarse.cols - 1, cc + 2); ++c) {
-        if (index(r, c) < 0) continue;
-        const double d = (r - gr) * (r - gr) + (c - gc) * (c - gc);
-        if (d < best) {
-          best = d;
-          const cv::Vec2d uv = uv_of(r, c);
-          lifted.uvs[i] = cv::Vec2f(float(uv[0]), float(uv[1]));
-          lifted.valid[i] = true;
-        }
-      }
-  }
-  return lifted;
-}
-
 struct Options {
   int iters = 50;
   igl::MappingEnergyType energy = igl::MappingEnergyType::SYMMETRIC_DIRICHLET;
@@ -1091,9 +1032,11 @@ static std::unique_ptr<QuadSurface> flatten(QuadSurface& surface, const Options&
   // The flattened mesh at full resolution.
   const auto fine_mesh = decimating ? vc::meshing::meshGrid(full) : coarse_mesh;
   std::vector<cv::Vec2f> uvs(fine_mesh.positions.size());
-  std::vector<bool> uv_valid(fine_mesh.positions.size(), true);
+  std::vector<uint8_t> uv_valid(fine_mesh.positions.size(), 1);
   if (decimating) {
-    auto lifted = lift(fine_mesh, coarse, coarse_mesh, uv_out, stride);
+    std::vector<cv::Vec2d> coarse_uvs(coarse_mesh.cells.size());
+    for (std::size_t i = 0; i < coarse_uvs.size(); ++i) coarse_uvs[i] = cv::Vec2d(uv_out(i, 0), uv_out(i, 1));
+    auto lifted = vc::meshing::liftGridUVs(fine_mesh, coarse, coarse_mesh, coarse_uvs, stride);
     uvs = std::move(lifted.uvs);
     uv_valid = std::move(lifted.valid);
   } else {

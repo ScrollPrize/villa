@@ -28,6 +28,21 @@ struct GridMesh {
 };
 GridMesh meshGrid(const cv::Mat_<cv::Vec3f>& points);
 
+// UVs for the vertices of `fine` (meshGrid of a grid) from `coarseUVs`, the
+// UVs of `coarse` = meshGrid(coarsePoints), coarsePoints = decimateGrid(grid,
+// ..., stride). Vertices are matched by grid position: fine cell (r, c) lies at
+// (r, c) / stride in the decimated grid, so a vertex on a decimated sample takes
+// that sample's UV exactly and one inside a decimated quad the barycentric mix
+// of the quad's triangle. A vertex outside the decimated quads (a hole, or the
+// rows/columns after the last sample) takes the nearest decimated vertex within
+// two cells; with none it stays invalid.
+struct LiftedUVs {
+    std::vector<cv::Vec2f> uvs;
+    std::vector<uint8_t> valid;
+};
+LiftedUVs liftGridUVs(const GridMesh& fine, const cv::Mat_<cv::Vec3f>& coarsePoints, const GridMesh& coarse,
+                      const std::vector<cv::Vec2d>& coarseUVs, int stride);
+
 // A triangle of a UV-mapped mesh: vertex and texture-coordinate indices.
 struct UvFace {
     int v[3];
