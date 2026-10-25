@@ -155,9 +155,9 @@ def test_mixed_patch_overlap_parameterization_and_scope(db):
     for edge in db.edges_of(a):
         fit = edge["meta"]["fit"]
         np.testing.assert_allclose(fit["pose"], [1, 0, 0, 0, 1, 0], atol=1e-8)
-        assert fit["a_grid_scale"] == fit["b_grid_scale"] == [1, 1]
+        assert fit["grid_scales"] == {edge["a"]: [1, 1], edge["b"]: [1, 1]}
         assert fit["pose_units"] == "volume_voxels"
-        assert fit["pose_direction"] == "b_to_a"
+        assert {fit["pose_from"], fit["pose_to"]} == {edge["a"], edge["b"]}
     assert db.link_patch_overlaps(volume_uuid=VOLUME)["edges_skipped_existing"] == 3
     assert db.link_patch_overlaps(volume_uuid=VOLUME, patch_uuids=[a, b], min_inliers=10000)["stale_removed"] == 1
     assert len(db.edges_of(c)) == 2

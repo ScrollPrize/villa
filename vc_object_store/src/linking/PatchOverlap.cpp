@@ -72,6 +72,7 @@ struct Pose {
 };
 
 struct SamplePoint {
+    int row = 0, col = 0;  // stored grid vertex
     Vec2 uv;  // metric (voxel) parameterization: grid index / scale
     cv::Vec3f xyz;
     cv::Vec3f tangentU;  // d(xyz)/d(u), d(xyz)/d(v)
@@ -182,6 +183,8 @@ std::optional<LoadedPatch> loadPatch(detail::StoredGeometry& inputs, const objec
             auto tangents = tangentsAt(*points, row, col, patch.scale);
             if (!tangents) continue;
             SamplePoint sample;
+            sample.row = row;
+            sample.col = col;
             sample.uv = {col / double(patch.scale[0]), row / double(patch.scale[1])};
             sample.xyz = p;
             sample.tangentU = tangents->first;
@@ -771,9 +774,11 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
                 metadata["coordinate_frame"] = {{"volume_uuid", *params.volumeUuid},
                     {"objects", {{seed.uuid, seed.coordinateProvenance}, {target.uuid, target.coordinateProvenance}}}};
                 metadata["fit"]["pose_units"] = "volume_voxels";
-                metadata["fit"]["pose_direction"] = "b_to_a";
-                metadata["fit"]["a_grid_scale"] = {seed.scale[0], seed.scale[1]};
-                metadata["fit"]["b_grid_scale"] = {target.scale[0], target.scale[1]};
+                // Stored edges reorder endpoints, so name the pose direction by UUID.
+                metadata["fit"]["pose_from"] = target.uuid;
+                metadata["fit"]["pose_to"] = seed.uuid;
+                metadata["fit"]["grid_scales"] = {{seed.uuid, {seed.scale[0], seed.scale[1]}},
+                                                  {target.uuid, {target.scale[0], target.scale[1]}}};
             }
             candidate.meta = metadata.dump();
             candidates.push_back(std::move(candidate));
@@ -801,5 +806,104 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
     return report;
 }
 
-}  // namespace vc::object_links
+std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::ObjectStore& db,
+    const std::vector<std::string>& edgeUuids, const OverlapCorrespondenceParams& params)
+{
+    using Json = nlohmann::json;
+    if (params.volumeUuid.empty()) throw std::invalid_argument("overlap correspondences: volumeUuid is required");
+    if (!(params.spacing > 0) || !std::isfinite(params.spacing) || !(params.agreementRadius > 0) ||
+        !std::isfinite(params.agreementRadius) || params.maxPairs == 0)
+        throw std::invalid_argument("overlap correspondences: spacing, agreementRadius and maxPairs must be positive");
+    detail::StoredGeometry inputs(db);
+    PatchOverlapParams loading;
+    loading.volumeUuid = params.volumeUuid;
+    loading.sampleSpacing = params.spacing;
+    std::map<std::string, LoadedPatch> patches;
+    auto patchFor = [&](const std::string& uuid) -> const LoadedPatch& {
+        if (const auto found = patches.find(uuid); found != patches.end()) return found->second;
+        const auto objects = inputs.select("patch", {uuid});
+        DetectorReport report;
+        auto loaded = loadPatch(inputs, objects.front(), loading, report,
+            detail::coordinateScales(objects, loading).at(objects.front().uuid));
+        if (!loaded) throw std::runtime_error(report.problems.empty() ? uuid + ": patch could not be loaded" : report.problems.front());
+        return patches.emplace(uuid, std::move(*loaded)).first->second;
+    };
+    std::vector<OverlapCorrespondences> result;
+    for (const auto& id : edgeUuids) {
+        OverlapCorrespondences out;
+        out.edgeUuid = id;
+        try {
+            const auto edge = db.edgeByUuid(inputs.read(), id);
+            if (!edge) throw std::runtime_error("edge not found");
+            out.edgeUuid = edge->uuid; out.aUuid = edge->aUuid; out.bUuid = edge->bUuid;
+            if (!edge->aAnchor.wholeGeometry || !edge->bAnchor.wholeGeometry || edge->aUuid == edge->bUuid)
+                throw std::runtime_error("not a whole-patch overlap edge");
+            const auto meta = Json::parse(edge->meta);
+            const auto fit = meta.value("fit", Json());
+            if (!fit.is_object() || !fit.contains("pose")) throw std::runtime_error("edge has no overlap pose");
+            const auto frame = meta.value("coordinate_frame", Json());
+            if (!frame.is_object() || frame.value("volume_uuid", "") != params.volumeUuid ||
+                fit.value("pose_units", "") != "volume_voxels")
+                throw std::runtime_error("edge pose is not in volume " + params.volumeUuid +
+                    " voxels; rerun patch-overlap detection with that volume_uuid");
+            std::string from, to;
+            Json scales;
+            if (fit.contains("pose_from")) {
+                from = fit.at("pose_from").get<std::string>(); to = fit.at("pose_to").get<std::string>();
+                scales = fit.at("grid_scales");
+            } else if (fit.value("pose_direction", "") == "b_to_a") {
+                // Edges written before pose_from/pose_to call the detector's seed "a".
+                // The seed was the patch with the smaller UUID (selection is UUID-ordered),
+                // whatever endpoint order the stored edge uses.
+                const auto [low, high] = std::minmax(edge->aUuid, edge->bUuid);
+                from = high; to = low;
+                scales = {{low, fit.at("a_grid_scale")}, {high, fit.at("b_grid_scale")}};
+            } else throw std::runtime_error("edge does not record its pose direction");
+            if (std::minmax(from, to) != std::minmax(edge->aUuid, edge->bUuid))
+                throw std::runtime_error("pose endpoints do not match the edge");
+            if (db.edgeGeometryState(inputs.read(), edge->uuid).stale)
+                throw std::runtime_error("edge geometry is stale");
+            const auto& a = patchFor(edge->aUuid);
+            const auto& b = patchFor(edge->bUuid);
+            for (const auto* patch : {&a, &b}) {
+                const auto recorded = scales.at(patch->uuid).get<std::array<double, 2>>();
+                for (int axis = 0; axis < 2; ++axis)
+                    if (std::abs(recorded[axis] - patch->scale[axis]) > 1e-6 * std::abs(recorded[axis]))
+                        throw std::runtime_error(patch->uuid + ": grid scale differs from the detected pose; refresh the edge");
+            }
+            const auto values = fit.at("pose").get<std::vector<double>>();
+            if (values.size() != 6 || !std::all_of(values.begin(), values.end(), [](double v) { return std::isfinite(v); }))
+                throw std::runtime_error("invalid overlap pose");
+            const Pose pose{values[0], values[1], values[3], values[4], values[2], values[5]};
+            const Pose aToB = from == edge->aUuid ? pose : pose.inverse();
+            std::vector<OverlapCorrespondence> agreeing;
+            for (const auto& sample : a.samples) {
+                const Vec2 uv = aToB.apply(sample.uv);
+                const auto other = sampleXyz(b, uv);
+                if (!other) continue;
+                const cv::Vec3f delta = *other - sample.xyz;
+                const double distance = std::sqrt(double(delta.dot(delta)));
+                if (distance > params.agreementRadius) continue;
+                OverlapCorrespondence pair;
+                pair.aGrid = {double(sample.row), double(sample.col)};
+                pair.bGrid = {uv.y * b.scale[1], uv.x * b.scale[0]};
+                pair.aXyz = {sample.xyz[0], sample.xyz[1], sample.xyz[2]};
+                pair.bXyz = {(*other)[0], (*other)[1], (*other)[2]};
+                pair.distance = distance;
+                agreeing.push_back(pair);
+            }
+            if (agreeing.empty()) throw std::runtime_error("no agreeing correspondences under the stored pose");
+            const auto count = std::min(agreeing.size(), params.maxPairs);
+            for (size_t i = 0; i < count; ++i) out.pairs.push_back(agreeing[i * agreeing.size() / count]);
+            out.aGeometryRevision = db.currentGeometry(inputs.read(), edge->aUuid)->uuid;
+            out.bGeometryRevision = db.currentGeometry(inputs.read(), edge->bUuid)->uuid;
+        } catch (const std::exception& error) {
+            out.pairs.clear();
+            out.error = error.what();
+        }
+        result.push_back(std::move(out));
+    }
+    return result;
+}
 
+}  // namespace vc::object_links

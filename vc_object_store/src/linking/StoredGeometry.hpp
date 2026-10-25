@@ -18,6 +18,7 @@ public:
     std::string pointAnnotations(const objects::GeometryRevision& revision, const std::string& array) const
     { return db_.geometryPointAnnotations(read_, revision.uuid, array); }
     void validate(const objects::WriteTxn& txn) const;
+    const objects::ReadTxn& read() const { return read_; }
 private:
     objects::ObjectStore& db_;
     objects::ReadTxn read_;

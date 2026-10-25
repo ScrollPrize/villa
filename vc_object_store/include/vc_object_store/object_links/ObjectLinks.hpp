@@ -177,8 +177,42 @@ struct PatchOverlapParams : CoordinateParams {
 };
 // Stored patches on the same sheet, using 3D correspondences, robust UV fitting
 // and dense overlap agreement. Accepted pairs become pending edges.
+// With volumeUuid, accepted edges record meta.fit.pose (row-major [r00,r01,tx,
+// r10,r11,ty]) mapping metric UV of patch fit.pose_from to fit.pose_to, in volume
+// voxels, and fit.grid_scales {uuid: [u, v]} (grid steps per voxel). Stored edge
+// endpoint order is unrelated to the pose direction.
 DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
     const PatchOverlapParams& params = {}, const std::atomic_bool* cancel = nullptr);
+
+// Concrete point pairs for accepted patch-overlap edges, from each edge's stored
+// pose and the current endpoint geometry. Patch a's valid vertices are sampled
+// every `spacing` voxels in row-major order and mapped to patch b's metric UV;
+// a pair is kept when b is valid there and the two points lie within
+// agreementRadius (default: the detector's tolerance + uvInlierTolerance).
+// More than maxPairs agreeing pairs are thinned evenly in sample order. The
+// result is deterministic for the same geometry, metadata and parameters.
+struct OverlapCorrespondenceParams {
+    std::string volumeUuid;      // required: the edges' coordinate frame
+    double spacing = 8.0;        // volume voxels between sampled vertices of patch a
+    double agreementRadius = 5.0;
+    std::size_t maxPairs = 256;
+};
+struct OverlapCorrespondence {
+    std::array<double, 2> aGrid, bGrid;  // (row, column) in each patch's stored grid
+    std::array<double, 3> aXyz, bXyz;    // volume voxels; b is bilinear in its quad
+    double distance = 0;                 // |aXyz - bXyz|, volume voxels
+};
+// Pairs follow the stored edge's endpoint order. A nonempty error means the edge
+// could not be materialized (wrong kind or frame, stale geometry, changed grid
+// scales, no agreeing pairs); pairs are then empty.
+struct OverlapCorrespondences {
+    std::string edgeUuid, aUuid, bUuid, aGeometryRevision, bGeometryRevision;
+    std::vector<OverlapCorrespondence> pairs;
+    std::string error;
+};
+// Edges are processed independently, in the given order. Invalid parameters throw.
+std::vector<OverlapCorrespondences> materializeOverlapCorrespondences(objects::ObjectStore& db,
+    const std::vector<std::string>& edgeUuids, const OverlapCorrespondenceParams& params);
 
 // Fiber/track-to-patch strips have stripRowsEachSide rows at stripSpacing
 // on each side of the centerline. Distances are in working voxels.

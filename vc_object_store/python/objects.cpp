@@ -640,6 +640,36 @@ NB_MODULE(_native, m)
             "Run patch-overlap discovery using stored geometry; patch_uuids optionally selects objects. "
             "kwargs mirror PatchOverlapParams (tolerance, min_minor_spread, ...).")
         .def(
+            "overlap_correspondences",
+            [](PyObjectStore& self, const std::vector<std::string>& edges, const std::string& volume,
+               double spacing, double agreementRadius, std::size_t maxPairs) {
+                const vc::object_links::OverlapCorrespondenceParams p{volume, spacing, agreementRadius, maxPairs};
+                const auto results = self.withStore<true>([&](auto& db) {
+                    return vc::object_links::materializeOverlapCorrespondences(db, edges, p);
+                });
+                nb::list out;
+                for (const auto& r : results) {
+                    nb::dict item;
+                    item["edge_uuid"] = r.edgeUuid; item["a"] = r.aUuid; item["b"] = r.bUuid;
+                    item["a_geometry_revision"] = r.aGeometryRevision; item["b_geometry_revision"] = r.bGeometryRevision;
+                    item["error"] = r.error.empty() ? nb::none() : nb::cast(r.error);
+                    nb::list pairs;
+                    for (const auto& pair : r.pairs) {
+                        nb::dict q;
+                        q["a_grid"] = pair.aGrid; q["b_grid"] = pair.bGrid;
+                        q["a_xyz"] = pair.aXyz; q["b_xyz"] = pair.bXyz; q["distance"] = pair.distance;
+                        pairs.append(q);
+                    }
+                    item["pairs"] = pairs;
+                    out.append(item);
+                }
+                return out;
+            },
+            nb::arg("edge_uuids"), nb::arg("volume_uuid"), nb::arg("spacing") = 8.0,
+            nb::arg("agreement_radius") = 5.0, nb::arg("max_pairs") = 256,
+            "Point pairs for accepted patch-overlap edges from their stored poses; grids are (row, column), "
+            "XYZ in volume voxels, in stored edge endpoint order. A non-null error means the edge failed.")
+        .def(
             "link_tracks_to_tracks",
             [](PyObjectStore& self, const nb::kwargs& kwargs) {
                 vc::object_links::TrackTrackParams p;

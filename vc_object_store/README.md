@@ -148,8 +148,39 @@ writes. Existing geometry/load failure reporting remains unchanged.
 
 Stored arrays and source anchors remain unchanged. Grid indices do not scale;
 working patch grid steps per voxel are divided by the XYZ conversion multiplier.
-Invalid patch vertices retain their sentinels. Overlap edges record their working
-UV grid scales and pose units, so consumers can interpret metric poses correctly.
+Invalid patch vertices retain their sentinels. Overlap edges record
+`meta.fit.pose` (row-major `[r00, r01, tx, r10, r11, ty]`), mapping metric UV of
+patch `pose_from` to `pose_to`, with `pose_units = "volume_voxels"` and per-patch
+`grid_scales` (`{uuid: [u, v]}`, grid steps per voxel). Direction and scales are
+keyed by UUID because stored edges order their endpoints independently of the
+detector. Edges written before this used positional `pose_direction = "b_to_a"`
+and `a_grid_scale`/`b_grid_scale`, where "a" was the smaller UUID.
+
+### Overlap correspondences
+
+`materializeOverlapCorrespondences` (Python `overlap_correspondences`) turns
+accepted overlap edges into concrete point pairs, applying each edge's stored
+pose to the current endpoint geometry rather than repeating the detector's
+matching:
+
+```python
+for result in store.overlap_correspondences(edge_uuids, volume_uuid,
+                                            spacing=8, agreement_radius=5, max_pairs=256):
+    if result["error"]:
+        ...  # report; never drop silently
+    for pair in result["pairs"]:
+        pair["a_grid"], pair["b_grid"]  # (row, column) in each stored grid
+        pair["a_xyz"], pair["b_xyz"]    # volume voxels; "distance" between them
+```
+
+Patch a's valid vertices are sampled every `spacing` voxels in row-major order
+and mapped to patch b's metric UV; a pair is kept when b's containing quad is
+valid and the points lie within `agreement_radius` (default: the detector's
+`tolerance + uv_inlier_tolerance`). Agreeing pairs above `max_pairs` are thinned
+evenly in sample order, so results are deterministic. Pairs follow the stored
+edge's a/b order. Each edge reports an `error` instead of pairs when it has no
+volume-frame pose, its geometry is stale, an endpoint's grid scale has changed
+since detection, or no pair agrees. Approval filtering is the caller's choice.
 
 Python exposes the existing native `geometry_coordinates`,
 `merge_geometry_coordinates` and `geometry_scale_to_volume` helpers, plus strict
