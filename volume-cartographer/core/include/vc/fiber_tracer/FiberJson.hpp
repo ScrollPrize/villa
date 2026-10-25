@@ -13,7 +13,7 @@
 #include <nlohmann/json.hpp>
 #include <opencv2/core/types.hpp>
 #include "vc/fiber_tracer/FiberDisplay.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 namespace vc::fiber_tracer
 {
@@ -276,7 +276,7 @@ inline Vc3dFiberJson parseVc3dFiberJson(const nlohmann::json& root,
 
     Vc3dFiberJson fiber;
     if (!root.contains("uuid") || !root.at("uuid").is_string() ||
-        !vc::util::isUuid(root.at("uuid").get<std::string>()))
+        !vc::objects::util::isUuid(root.at("uuid").get<std::string>()))
         throw std::runtime_error(context + " requires an explicit valid uuid");
     fiber.uuid = root.at("uuid").get<std::string>();
     fiber.width = fiberWidthFromJson(root);

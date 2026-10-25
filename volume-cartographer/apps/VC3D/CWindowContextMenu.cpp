@@ -25,7 +25,7 @@
 #include "elements/VolumeSelector.hpp"
 #include "elements/JsonProfilePresets.hpp"
 #include "utils/Json.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 
 // ====================== CWindow member functions ==============================

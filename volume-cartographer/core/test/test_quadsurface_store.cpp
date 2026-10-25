@@ -145,16 +145,6 @@ TEST_CASE("QuadSurface round trip through the object store")
     CHECK(cv::countNonZero(reloaded->channel("generations", SURF_CHANNEL_NORESIZE) != 9) == 0);
     CHECK((*reloaded->rawPointsPtr())(0, 0) == cv::Vec3f(-1, -1, -1));
     CHECK(storedValid(store, uuid, 0, 0) == 0);
-
-    // Growth adds sentinel vertices around the stored grid.
-    store.edit(uuid, [&](auto& db, auto& txn, const auto& head) {
-        resize_store_surface(db, txn, uuid, cv::Rect(-1, -1, 7, 6), head);
-    });
-    auto grown = store.load(uuid);
-    CHECK(grown->rawPointsPtr()->size() == cv::Size(7, 6));
-    CHECK((*grown->rawPointsPtr())(0, 0) == cv::Vec3f(-1, -1, -1));
-    CHECK((*grown->rawPointsPtr())(2, 2) == cv::Vec3f(1.5f, 1.f, 11.f));
-    CHECK(grown->channel("generations", SURF_CHANNEL_NORESIZE).at<uint16_t>(0, 0) == 0);
 }
 
 TEST_CASE("A stored vertex without coordinates loads as missing")
@@ -252,7 +242,7 @@ TEST_CASE("Tools create surfaces with provenance and push them to a hub")
         (*input->rawPointsPtr())(1, 1)[2] = 5.f;
         created = surfaces.create(*input, "grown", nlohmann::json{{"steps", 3}}, {source}, {"paths"});
         CHECK(input->id == created);
-        CHECK(fs::is_directory(surfaces.artifactDirectory(created)));
+        CHECK(fs::is_directory(surfaces.session()->artifactDirectory(surfaces.attachment(), created)));
         surfaces.finish();
     }
     auto viewer = ObjectStore::open(dir / "viewer.vcobj", options);

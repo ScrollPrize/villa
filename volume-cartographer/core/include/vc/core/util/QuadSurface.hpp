@@ -614,11 +614,6 @@ std::string write_quad_rect_to_store(vc::objects::ObjectStore&, vc::objects::Wri
 std::string write_quad_channels_to_store(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& objectUuid,
     QuadSurface&, const std::vector<std::string>& names, const std::vector<std::string>& remove,
     const std::string& expected, const std::vector<vc::objects::GeometryEdgeEdit>& edgeEdits = {});
-// Grow or crop the stored grid so it becomes `gridInStored` (x/y may be negative);
-// new vertices are the sentinel, new valid cells 255, other new channel cells 0.
-std::string resize_store_surface(vc::objects::ObjectStore&, vc::objects::WriteTxn&, const std::string& objectUuid,
-    const cv::Rect& gridInStored, const std::string& expected,
-    const std::vector<vc::objects::GeometryEdgeEdit>& edgeEdits = {});
 
 // Serialize a bbox as [[minX,minY,minZ],[maxX,maxY,maxZ]], the layout
 // QuadSurface::save() writes for its own bbox key.

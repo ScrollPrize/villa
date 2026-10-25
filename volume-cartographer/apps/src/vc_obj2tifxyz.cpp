@@ -3,7 +3,7 @@
 #include "vc/core/util/StoreSurfaces.hpp"
 #include "vc/core/util/SurfaceMeshing.hpp"
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/util/TifxyzIdentity.hpp"
+#include <vc_object_store/Uuid.hpp>
 #include <cctype>
 
 #include <iostream>
@@ -366,7 +366,7 @@ int main(int argc, char *argv[])
     }
 
     // A converted mesh is a new object: fresh UUID unless --uuid names one.
-    surf->meta["uuid"] = vc::util::resolveTifxyzUuid(uuid_override);
+    surf->meta["uuid"] = uuid_override.empty() ? vc::objects::util::newUuid() : uuid_override;
     
     std::cout << "Saving to tifxyz format..." << std::endl;
     

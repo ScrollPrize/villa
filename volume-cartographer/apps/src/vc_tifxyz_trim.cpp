@@ -1,7 +1,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Rect3D.hpp"
 #include "vc/core/util/Tiff.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 #include "utils/Json.hpp"
 
@@ -180,7 +180,7 @@ int main(int argc, char* argv[])
     const bool in_place = dst == src ||
         (fs::exists(dst) && fs::equivalent(src, dst, eq_ec) && !eq_ec);
     if (!in_place) {
-        meta["uuid"] = vc::util::newUuid();
+        meta["uuid"] = vc::objects::util::newUuid();
         meta["name"] = dst.filename().string();
     }
     // Recompute rather than erase. Trimming drops rows/columns, so the input's

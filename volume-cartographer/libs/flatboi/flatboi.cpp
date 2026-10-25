@@ -40,7 +40,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/StoreSurfaces.hpp"
 #include "vc/core/util/SurfaceMeshing.hpp"
-#include "vc/core/util/TifxyzIdentity.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 #include <unistd.h>
 
@@ -1088,7 +1088,7 @@ static int run_store(const StoreOutputArgs& output, const std::string& source, c
   const std::string name = !output.name.empty() ? output.name
       : (surface->meta.contains("name") ? surface->meta["name"].get_string() : surface->id) + "_flatboi";
   const auto uuid = store.create(*flat, name, parameters(opt), {source}, output.tags, output.coordinates());
-  const auto artifacts = store.artifactDirectory(uuid);
+  const auto artifacts = store.session()->artifactDirectory(store.attachment(), uuid);
   for (const auto& entry : fs::directory_iterator(report_dir)) {
     std::error_code ignored;
     fs::copy_file(entry.path(), artifacts / entry.path().filename(), fs::copy_options::overwrite_existing, ignored);
@@ -1108,7 +1108,7 @@ static int run_tifxyz(const fs::path& input, const fs::path& output, const Optio
   const auto surface = load_quad_from_tifxyz(input.string());
   const auto flat = flatten(*surface, opt, output.parent_path() / (output.filename().string() + ".obj"), input.string());
   if (!flat) return 3;
-  flat->meta["uuid"] = vc::util::resolveTifxyzUuid("");
+  flat->meta["uuid"] = vc::objects::util::newUuid();
   flat->save(output);
   std::cout << "Wrote: " << output << "\n";
   return 0;

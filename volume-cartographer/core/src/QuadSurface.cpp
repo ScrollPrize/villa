@@ -8,7 +8,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/Tiff.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/calib3d.hpp>
@@ -2158,7 +2158,7 @@ std::string QuadSurface::objectUuid() const
 std::string QuadSurface::objectUuidOrNew() const
 {
     std::string uuid = objectUuid();
-    return uuid.empty() ? vc::util::newUuid() : uuid;
+    return uuid.empty() ? vc::objects::util::newUuid() : uuid;
 }
 
 void QuadSurface::save(const std::filesystem::path &path_, bool force_overwrite)
@@ -2168,7 +2168,7 @@ void QuadSurface::save(const std::filesystem::path &path_, bool force_overwrite)
 
 void QuadSurface::saveAsNew(const std::filesystem::path &path_, bool force_overwrite)
 {
-    saveWithUuid(path_, vc::util::newUuid(), force_overwrite);
+    saveWithUuid(path_, vc::objects::util::newUuid(), force_overwrite);
 }
 
 void QuadSurface::saveEdited(const std::filesystem::path &source,

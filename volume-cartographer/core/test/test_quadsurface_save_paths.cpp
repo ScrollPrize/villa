@@ -4,7 +4,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 #include <opencv2/core.hpp>
 
@@ -45,7 +45,7 @@ TEST_CASE("new patch UUID survives metadata and geometry saves")
     created.save(segDir);
     QuadSurface loaded(segDir);
     const std::string uuid = loaded.meta["uuid"].get_string();
-    CHECK(vc::util::isUuid(uuid));
+    CHECK(vc::objects::util::isUuid(uuid));
     CHECK(loaded.id == "named_patch");
     loaded.ensureLoaded();
     loaded.saveOverwrite();
@@ -62,7 +62,7 @@ TEST_CASE("in-place edits keep the object UUID; copies get a new one")
         created.save(segDir);
     }
     const std::string uuid = QuadSurface(segDir).objectUuid();
-    REQUIRE(vc::util::isUuid(uuid));
+    REQUIRE(vc::objects::util::isUuid(uuid));
 
     // In-place geometry edit (crop/flip/rotate path): save over the source.
     {
@@ -80,7 +80,7 @@ TEST_CASE("in-place edits keep the object UUID; copies get a new one")
         loaded->saveAsNew(copyDir);
     }
     const std::string copyUuid = QuadSurface(copyDir).objectUuid();
-    CHECK(vc::util::isUuid(copyUuid));
+    CHECK(vc::objects::util::isUuid(copyUuid));
     CHECK(copyUuid != uuid);
 
     // saveEdited decides by destination.
@@ -95,7 +95,7 @@ TEST_CASE("in-place edits keep the object UUID; copies get a new one")
         loaded->saveEdited(segDir, editedDir);
     }
     const std::string editedUuid = QuadSurface(editedDir).objectUuid();
-    CHECK(vc::util::isUuid(editedUuid));
+    CHECK(vc::objects::util::isUuid(editedUuid));
     CHECK(editedUuid != uuid);
     CHECK(editedUuid != copyUuid);
 

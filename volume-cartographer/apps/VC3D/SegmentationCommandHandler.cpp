@@ -8,7 +8,7 @@
 #include "VCSettings.hpp"
 #include "OpenDataNormalGrids.hpp"
 #include "OpenDataManifest.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 #include <functional>
 #include <algorithm>

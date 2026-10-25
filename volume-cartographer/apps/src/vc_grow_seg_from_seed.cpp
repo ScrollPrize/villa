@@ -809,9 +809,8 @@ static int run_main(int argc, char *argv[])
 
     // Store mode output: a new surface object recording how it was made.
     auto publish = [&](QuadSurface& output, const std::string& name, const Json& meta, const std::vector<std::string>& sources) {
-        std::optional<nlohmann::json> coordinates;
-        if (!volume_uuid.empty()) coordinates = nlohmann::json{{"volume_uuid", volume_uuid}, {"scale_factor", 1}};
-        const auto uuid = store->create(output, name, nlohmann::json::parse(meta.dump()), sources, output_tags, coordinates);
+        const auto uuid = store->create(output, name, nlohmann::json::parse(meta.dump()), sources, output_tags,
+                                        volumeCoordinates(volume_uuid));
         store->finish();
         std::cout << "surface_uuid: " << uuid << std::endl;
     };

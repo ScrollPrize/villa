@@ -5,7 +5,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/PointCollections.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -209,7 +209,7 @@ TEST_CASE("JSON round-trip preserves data")
     c.addPoint("beta", {7, 8, 9});
     const uint64_t alpha = c.getCollectionId("alpha").value();
     const std::string alphaUuid = c.getAllCollections().at(alpha).uuid;
-    CHECK(vc::util::isUuid(alphaUuid));
+    CHECK(vc::objects::util::isUuid(alphaUuid));
     CHECK(c.getAllCollections().at(c.getCollectionId("beta").value()).uuid != alphaUuid);
     c.setCollectionColor(alpha, {0.1f, 0.2f, 0.3f});
     c.setCollectionTag(alpha, "kind", "correction");
@@ -375,7 +375,7 @@ TEST_CASE("old point JSON defaults links and fiber direction")
     PointCollections loaded;
     REQUIRE(loaded.loadFromJSON(tmp.string()));
     const std::string uuid = loaded.getAllCollections().begin()->second.uuid;
-    CHECK(vc::util::isUuid(uuid));
+    CHECK(vc::objects::util::isUuid(uuid));
     REQUIRE(loaded.saveToJSON(tmp.string()));
     PointCollections reloaded;
     REQUIRE(reloaded.loadFromJSON(tmp.string()));

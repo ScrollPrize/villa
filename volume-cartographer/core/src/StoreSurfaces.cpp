@@ -2,6 +2,7 @@
 
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
 
 #include <cstdlib>
 #include <stdexcept>
@@ -105,11 +106,6 @@ StoreSurfaces::Loaded StoreSurfaces::writable(const std::string& uuid)
     return found->second;
 }
 
-std::filesystem::path StoreSurfaces::artifactDirectory(const std::string& uuid)
-{
-    return session_->artifactDirectory(attachment_, uuid);
-}
-
 void StoreSurfaces::finish(std::chrono::seconds timeout)
 {
     session_->finalize();
@@ -143,8 +139,13 @@ bool StoreOutputArgs::parse(const std::string& arg)
     return true;
 }
 
-std::optional<nlohmann::json> StoreOutputArgs::coordinates() const
+std::optional<nlohmann::json> volumeCoordinates(const std::string& volume)
 {
     if (volume.empty()) return std::nullopt;
-    return nlohmann::json{{"volume_uuid", volume}, {"scale_factor", 1}};
+    return vc::objects::geometryCoordinates({{"volume_uuid", volume}, {"scale_factor", 1}});
+}
+
+std::optional<nlohmann::json> StoreOutputArgs::coordinates() const
+{
+    return volumeCoordinates(volume);
 }

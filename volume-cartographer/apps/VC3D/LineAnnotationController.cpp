@@ -245,7 +245,7 @@ struct LineAnnotationController::LineAnnotationSession {
     bool detachedPendingWork = false;
     bool deferShowUntilGenerated = false;
     uint64_t fiberId = 0;
-    std::string fiberUuid = vc::util::newUuid();
+    std::string fiberUuid = vc::objects::util::newUuid();
     std::optional<vc::objects::PinnedObject> storePin;
     std::optional<vc::objects::PinnedObject> runningStorePin;
     // A hosted replica keeps the fiber leased while it is open for editing.

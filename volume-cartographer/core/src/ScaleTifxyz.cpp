@@ -1,6 +1,6 @@
 #include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 #include <tiffio.h>
 #include <algorithm>
@@ -227,7 +227,7 @@ void scaleTifxyzWithoutResampling(const std::filesystem::path& input,
             if (name == "meta.json" || name == "x.tif" || name == "y.tif" || name == "z.tif") continue;
             if (entry.is_regular_file()) fs::copy_file(entry.path(), staging / entry.path().filename());
         }
-        meta["uuid"] = vc::util::newUuid();
+        meta["uuid"] = vc::objects::util::newUuid();
         meta["name"] = output.filename().string();
         std::ofstream out(staging / "meta.json");
         out.exceptions(std::ios::badbit | std::ios::failbit);

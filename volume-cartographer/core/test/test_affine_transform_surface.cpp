@@ -8,7 +8,7 @@
 #include "vc/core/util/AffineTransform.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Tiff.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 #include <opencv2/core.hpp>
 
@@ -146,7 +146,7 @@ TEST_CASE("streamed scaling gives a new identity but retains coordinate provenan
 {
     namespace fs = std::filesystem;
     struct Scratch {
-        fs::path path = fs::current_path() / ("scale-identity-test-" + vc::util::newUuid());
+        fs::path path = fs::current_path() / ("scale-identity-test-" + vc::objects::util::newUuid());
         Scratch() { fs::create_directory(path); }
         ~Scratch() { std::error_code ec; fs::remove_all(path, ec); }
     } scratch;
@@ -159,7 +159,7 @@ TEST_CASE("streamed scaling gives a new identity but retains coordinate provenan
     })");
     source.save(input);
     const auto sourceUuid = source.objectUuid();
-    REQUIRE(vc::util::isUuid(sourceUuid));
+    REQUIRE(vc::objects::util::isUuid(sourceUuid));
     std::ofstream(input / "ancillary.txt") << "unchanged";
     const auto original = utils::Json::parse_file(input / "meta.json");
     std::string previousUuid;
@@ -168,7 +168,7 @@ TEST_CASE("streamed scaling gives a new identity but retains coordinate provenan
         scaleTifxyzWithoutResampling(input, output, 4, std::array<int, 3>{40,39,39});
         const auto metadata = utils::Json::parse_file(output / "meta.json");
         const auto uuid = metadata["uuid"].get_string();
-        CHECK(vc::util::isUuid(uuid));
+        CHECK(vc::objects::util::isUuid(uuid));
         CHECK(uuid != sourceUuid);
         CHECK(uuid != previousUuid);
         CHECK(metadata["name"].get_string() == "same-name");
@@ -181,7 +181,7 @@ TEST_CASE("streamed scaling gives a new identity but retains coordinate provenan
     }
     source.saveAsNew(scratch.path / "gui-copy");
     const auto guiMeta = utils::Json::parse_file(scratch.path / "gui-copy/meta.json");
-    CHECK(vc::util::isUuid(guiMeta["uuid"].get_string()));
+    CHECK(vc::objects::util::isUuid(guiMeta["uuid"].get_string()));
     CHECK(guiMeta["uuid"].get_string() != sourceUuid);
     CHECK(guiMeta["fit_config"].dump() == original["fit_config"].dump());
     CHECK(utils::Json::parse_file(input / "meta.json").dump() == original.dump());

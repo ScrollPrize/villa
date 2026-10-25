@@ -4762,7 +4762,7 @@ TEST_CASE("fiber segment metadata round trips with its owning control point")
     strictRoot["optimization_mode"] = "native_fiber_trace3d";
     strictRoot["line_points"] = {{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}};
     CHECK_THROWS_AS(vc::fiber_tracer::parseVc3dFiberJson(strictRoot, "test fiber"), std::runtime_error);
-    strictRoot["uuid"] = vc::util::newUuid();
+    strictRoot["uuid"] = vc::objects::util::newUuid();
     CHECK(vc::fiber_tracer::parseVc3dFiberJson(strictRoot, "test fiber").uuid ==
           strictRoot.at("uuid").get<std::string>());
     auto invalidUuid = strictRoot;

@@ -1178,7 +1178,7 @@ int pmRun(PMSurface parent, PMSurface child, const PMConfig& cfg, StoreSurfaces*
         const auto revision = store->update(parent.name, *parent.qs);
         store->finish();
         std::cout << "geometry_revision: " << revision << "\n";
-        summary_path = store->artifactDirectory(parent.name) / "merge_patch_summary.json";
+        summary_path = store->session()->artifactDirectory(store->attachment(), parent.name) / "merge_patch_summary.json";
     } else {
         std::cout << "[6/6] overwriting parent tifxyz at " << parent.path
                   << " (snapshot to " << parent.path.parent_path().string()

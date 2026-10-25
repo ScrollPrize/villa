@@ -11,7 +11,7 @@
 #include <functional>
 
 #include "utils/Json.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 namespace vc {
 struct PointRef
@@ -75,7 +75,7 @@ public:
         float autoFillConstant = 0.0f;
         std::unordered_map<std::string, std::string> tags;
         std::vector<uint64_t> windings_linked;
-        std::string uuid = vc::util::newUuid();
+        std::string uuid = vc::objects::util::newUuid();
     };
 
     PointCollections() = default;

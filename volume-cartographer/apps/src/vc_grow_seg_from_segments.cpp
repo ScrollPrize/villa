@@ -1202,18 +1202,16 @@ int main(int argc, char *argv[])
     for (const auto& surface : stored_sources) stored_source_pointers.push_back(surface.get());
     std::vector<std::string> published;
     auto publish = [&](QuadSurface& surface, const std::string& name, const QuadSurface* source) {
-        std::optional<nlohmann::json> coordinates;
-        if (!volume_uuid.empty()) coordinates = nlohmann::json{{"volume_uuid", volume_uuid}, {"scale_factor", 1}};
         const auto uuid = store->create(surface, name, nlohmann::json::parse(params.dump()),
                                         source ? std::vector<std::string>{source->id} : std::vector<std::string>{},
-                                        output_tags, coordinates);
+                                        output_tags, volumeCoordinates(volume_uuid));
         published.push_back(uuid);
         std::cout << "surface_uuid: " << uuid << std::endl;
     };
     auto finish_store = [&] {
         std::error_code ignored;
         if (!published.empty() && std::filesystem::exists(tgt_dir) && !std::filesystem::is_empty(tgt_dir, ignored))
-            std::filesystem::rename(tgt_dir, store->artifactDirectory(published.front()) / "grow_debug", ignored);
+            std::filesystem::rename(tgt_dir, store->session()->artifactDirectory(store->attachment(), published.front()) / "grow_debug", ignored);
         std::filesystem::remove_all(tgt_dir, ignored);
         store->finish();
     };

@@ -12,7 +12,7 @@ int runObjectStoreControllerTests()
     using Controller = LineAnnotationController;
     using namespace vc::objects;
     auto require = [](bool value, const char* message) { if (!value) throw std::runtime_error(message); };
-    const auto path = std::filesystem::temp_directory_path() / ("vc3d-store-test-"+vc::util::newUuid()+".vcobj");
+    const auto path = std::filesystem::temp_directory_path() / ("vc3d-store-test-"+vc::objects::util::newUuid()+".vcobj");
     auto checkHubStatus = [&](CState& state, Controller& controller,
                               FiberCollectionController& collection,
                               const std::function<bool()>& catalogReady) {
@@ -116,7 +116,7 @@ int runObjectStoreControllerTests()
                     "a volume without a stored umbilicus has none");
             const auto attachment = *state.objectStoreAttachment();
             auto add = [&](const std::string& name) {
-                const auto uuid = vc::util::newUuid();
+                const auto uuid = vc::objects::util::newUuid();
                 state.objectStoreSession()->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
                     ObjectRecord record; record.uuid = uuid; record.kind = "umbilicus"; record.name = name;
                     record.meta = vc3d::coordinateBindingForVolume(*volume, 2).dump();
@@ -162,7 +162,7 @@ int runObjectStoreControllerTests()
         a.username = "test"; a.startedAt = "20260101"; a.sequence = 1;
         a.coordinateBaseShapeZYX = std::array<size_t,3>{100,100,100};
         for (int x : {0,10,20}) { a.controlPoints.emplace_back(cv::Vec3d{x*1.,0,1}); a.linePoints.emplace_back(x*1.,0,1); }
-        auto b = a; b.uuid = vc::util::newUuid(); b.id = controller.nextFiberId();
+        auto b = a; b.uuid = vc::objects::util::newUuid(); b.id = controller.nextFiberId();
         std::vector<Controller::FiberSaveSnapshot> batch{controller.makeFiberSaveSnapshot(a),controller.makeFiberSaveSnapshot(b)};
         controller.commitFiberStoreAction(batch);
         a = batch[0].fiber; b = batch[1].fiber;
@@ -226,7 +226,7 @@ int runObjectStoreControllerTests()
             QObject::connect(&controller, &Controller::fibersChanged, &observer, [&] { ++fiberUpdates; });
             const auto connection = state.objectStoreSession();
             const auto attachment = *state.objectStoreAttachment();
-            const auto unrelated = vc::util::newUuid();
+            const auto unrelated = vc::objects::util::newUuid();
             connection->act(attachment, {{unrelated, std::nullopt}}, [&](auto& db, auto& txn) {
                 ObjectRecord record; record.uuid = unrelated; record.kind = "point_collection";
                 db.upsertObject(txn, record);
@@ -234,7 +234,7 @@ int runObjectStoreControllerTests()
             state.pollObjectStoreChanges();
             // Old/foreign attachments must not invalidate this store's fibers.
             StoreSessionEvent foreign{StoreSessionEvent::Kind::Committed,
-                {vc::util::newUuid(), attachment.generation}, 0, {}};
+                {vc::objects::util::newUuid(), attachment.generation}, 0, {}};
             JournalEntry change; change.kind = "fiber"; foreign.changes.push_back(change);
             state.objectStoreChanged(foreign);
             QApplication::processEvents();
@@ -323,10 +323,10 @@ int runObjectStoreControllerTests()
             require(imported.readStoredFibers(std::nullopt).size() == 2 && service->inputDraftStatus().size() == 2,
                     "service-only component is imported into attached store before editing");
             auto document = aWire;
-            const auto uuid = vc::util::newUuid(); document["uuid"] = uuid;
+            const auto uuid = vc::objects::util::newUuid(); document["uuid"] = uuid;
             document["branches"] = nlohmann::json::array(); document["adjacent_branches"] = nlohmann::json::array();
             document.erase("optimization_mode"); document["custom_annotation"] = {{"note", "retain"}};
-            const auto volumeUuid = vc::util::newUuid();
+            const auto volumeUuid = vc::objects::util::newUuid();
             document["coordinates"] = {{"volume_uuid", volumeUuid}, {"scale_factor", 4}};
             document["coordinate_binding"] = {{"active_volume_id", "display"}};
             QString error;
@@ -460,7 +460,7 @@ int runObjectStoreControllerTests()
             firstSeed.controlPoints.emplace_back(cv::Vec3d{1,2,3});
             firstSeed.tags = {la::kNeedsReoptimizationTag};
             auto secondSeed = firstSeed;
-            secondSeed.id = controller.nextFiberId(); secondSeed.uuid = vc::util::newUuid();
+            secondSeed.id = controller.nextFiberId(); secondSeed.uuid = vc::objects::util::newUuid();
             std::vector<Controller::FiberSaveSnapshot> seeds{
                 controller.makeFiberSaveSnapshot(firstSeed), controller.makeFiberSaveSnapshot(secondSeed)};
             controller.commitFiberStoreAction(seeds);
@@ -475,7 +475,7 @@ int runObjectStoreControllerTests()
         parent.coordinateBaseShapeZYX=std::array<size_t,3>{100,100,100};
         for(int x:{30,40,50,60}) {parent.controlPoints.emplace_back(cv::Vec3d{x*1.,0,1});parent.linePoints.emplace_back(x*1.,0,1);}
         batch={controller.makeFiberSaveSnapshot(parent)};
-        const auto frame=nlohmann::json{{"volume_uuid",vc::util::newUuid()},{"scale_factor",4.0}};
+        const auto frame=nlohmann::json{{"volume_uuid",vc::objects::util::newUuid()},{"scale_factor",4.0}};
         batch.front().fiber.coordinateIdentity["coordinates"]=frame;
         controller.commitFiberStoreAction(batch);parent=batch.front().fiber;
         parent=resolve(parent.uuid);
@@ -541,13 +541,13 @@ int runObjectStoreControllerTests()
         {
             // Store-valid control-only geometry must not empty the editor catalog.
             auto db = ObjectStore::open(path, options);
-            ObjectRecord object; object.uuid = vc::util::newUuid(); object.kind = "fiber"; object.name = "controls-only";
+            ObjectRecord object; object.uuid = vc::objects::util::newUuid(); object.kind = "fiber"; object.name = "controls-only";
             auto txn = db.write({{object.uuid,{}}});
             object.formatVersion = 1;
             db.upsertObject(txn, object);
             db.putGeometry(txn, object.uuid, vc::geometry::encode(vc::geometry::Fiber{{{0,0,0},{1,0,0}}, {}}));
             txn.commit();
-            ObjectRecord missing; missing.uuid = vc::util::newUuid(); missing.kind = "fiber"; missing.name = "geometry-pending";
+            ObjectRecord missing; missing.uuid = vc::objects::util::newUuid(); missing.kind = "fiber"; missing.name = "geometry-pending";
             { auto pending = db.write({{missing.uuid,{}}}); db.upsertObject(pending,missing); pending.commit(); }
             state.attachObjectStore(QString::fromStdString(path.string()), {}, true);
             const auto everything = controller.readStoredFibers(std::nullopt);
@@ -604,7 +604,7 @@ int runObjectStoreControllerTests()
                 require(factor && *factor==0.25,"explicit scale-2 binding persists");
                 fiber=resolve(fiber.uuid);
                 auto mismatched = fiber.coordinateIdentity;
-                mismatched["coordinates"]["volume_uuid"] = vc::util::newUuid();
+                mismatched["coordinates"]["volume_uuid"] = vc::objects::util::newUuid();
                 require(!vc3d::geometryScaleForVolume(mismatched, *state.currentVolume()),
                         "matching display ID cannot override conflicting volume UUID");
                 const auto display = controller.fiberInVolumeCoordinates(fiber);

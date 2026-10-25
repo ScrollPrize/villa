@@ -1,5 +1,5 @@
 #include "LasagnaServiceManager.hpp"
-#include "vc/core/util/Uuid.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 #include <QCoreApplication>
 #include <QCryptographicHash>

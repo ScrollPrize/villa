@@ -25,6 +25,10 @@ struct StoreOutputArgs {
     std::optional<nlohmann::json> coordinates() const;
 };
 
+// The coordinates of a tool's output in `volume`'s voxels (scale 1); none when
+// no volume is named.
+std::optional<nlohmann::json> volumeCoordinates(const std::string& volume);
+
 // Surface objects for command-line tools: `--store PATH` with `--surface UUID`
 // inputs and new surface outputs that record their provenance. A hosted
 // replica syncs in the background and finish() waits until the tool's writes
@@ -57,8 +61,6 @@ public:
     // Replace the named channels ("mask" is validity) of a surface this tool
     // loaded with the surface's, the same way. Returns the new geometry revision.
     std::string updateChannels(const std::string& uuid, QuadSurface& surface, const std::vector<std::string>& names);
-    // Shared non-geometry files of an object (OBJ exports, models).
-    std::filesystem::path artifactDirectory(const std::string& uuid);
     // Wait until this tool's writes reached the hub (no-op for local stores).
     void finish(std::chrono::seconds timeout = std::chrono::seconds(120));
 

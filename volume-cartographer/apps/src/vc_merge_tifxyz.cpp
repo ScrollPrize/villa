@@ -2278,13 +2278,12 @@ int gmBlendAndRasterize(GMAlignState& st, const fs::path& obj2tifxyz,
         // The rasterized merge becomes a surface object; the OBJ and summary
         // move to its artifact directory and the scratch directory goes away.
         auto merged = load_quad_from_tifxyz(target_dir);
-        std::optional<json> coordinates;
-        if (!cfg.volume_uuid.empty()) coordinates = json{{"volume_uuid", cfg.volume_uuid}, {"scale_factor", 1}};
         // Named after the first input, as the directory name is in tifxyz mode.
         const auto& first = st.surfs.at(st.names.front()).qs->meta;
         const std::string name = (first.contains("name") ? first["name"].get_string() : st.names.front()) + "_merged";
-        const auto uuid = cfg.store->create(*merged, name, summary.at("params"), st.names, cfg.tags, coordinates);
-        const auto artifacts = cfg.store->artifactDirectory(uuid);
+        const auto uuid = cfg.store->create(*merged, name, summary.at("params"), st.names, cfg.tags,
+                                            volumeCoordinates(cfg.volume_uuid));
+        const auto artifacts = cfg.store->session()->artifactDirectory(cfg.store->attachment(), uuid);
         fs::rename(st.obj_out, artifacts / "merge.obj");
         fs::rename(st.summary_path, artifacts / "merge_summary.json");
         cfg.store->finish();

@@ -147,7 +147,7 @@ void to_json(Json& j, const PointCollections::Collection& c) {
 void from_json(const Json& j, PointCollections::Collection& c) {
     if (j.contains("uuid")) {
         if (!j.at("uuid").is_string() ||
-            !vc::util::isUuid(j.at("uuid").get_string())) {
+            !vc::objects::util::isUuid(j.at("uuid").get_string())) {
             throw std::runtime_error("Point collection has an invalid uuid");
         }
         c.uuid = j.at("uuid").get_string();

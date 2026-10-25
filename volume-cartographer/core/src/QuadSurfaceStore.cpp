@@ -3,6 +3,7 @@
 
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/Uuid.hpp>
 
 #include <nlohmann/json.hpp>
@@ -173,8 +174,9 @@ void create_quad_in_store(vc::objects::ObjectStore& db, vc::objects::WriteTxn& t
     if (!meta.is_object()) meta = nlohmann::json::object();
     // Identity, geometry and file layout belong to the object and its geometry.
     // Status tags belong to the record and are not inherited from a source.
-    for (const auto* key : {"uuid", "name", "format", "type", "bbox", "scale", "tiff_dimensions", "coordinates", "provenance", "tags", "vc3d_view"})
+    for (const auto* key : {"uuid", "name", "format", "type", "bbox", "scale", "tiff_dimensions", "provenance", "tags", "vc3d_view"})
         meta.erase(key);
+    vc::objects::eraseSourceGeometryCoordinates(meta);
     meta.update(nlohmann::json::parse(metaJson));
     vc::objects::ObjectRecord record;
     record.uuid = uuid;
@@ -273,25 +275,4 @@ std::string write_quad_channels_to_store(vc::objects::ObjectStore& db, vc::objec
     std::vector<std::string> removed;
     for (const auto& name : remove) removed.push_back(name == "mask" ? "valid" : name);
     return db.updateSurfaceChannels(txn, objectUuid, channels, removed, revision.uuid, edgeEdits);
-}
-
-std::string resize_store_surface(vc::objects::ObjectStore& db, vc::objects::WriteTxn& txn, const std::string& objectUuid,
-    const cv::Rect& gridInStored, const std::string& expected, const std::vector<vc::objects::GeometryEdgeEdit>& edgeEdits)
-{
-    const auto revision = currentSurface(db, txn, objectUuid, expected);
-    vc::objects::GeometrySurfaceResize resize;
-    resize.row = gridInStored.y; resize.column = gridInStored.x;
-    resize.rows = gridInStored.height; resize.columns = gridInStored.width;
-    for (const auto& array : revision.arrays) {
-        auto fillShape = array.shape;
-        fillShape[0] = fillShape[1] = 1;
-        const size_t pixel = cv::Mat(1, 1, CV_MAKETYPE(cvDepth(array.dtype), array.shape.size() == 3 ? int(array.shape[2]) : 1)).elemSize();
-        GeometryArray fill{array.name, array.dtype, fillShape, std::vector<uint8_t>(pixel, 0)};
-        if (array.name == "points") {
-            fill.bytes.resize(12);
-            std::memcpy(fill.bytes.data(), kInvalid.val, 12);
-        } else if (array.name == "valid") fill.bytes = {255};
-        resize.fill.push_back(std::move(fill));
-    }
-    return db.resizeSurface(txn, objectUuid, resize, revision.uuid, edgeEdits);
 }
