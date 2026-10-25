@@ -5,6 +5,7 @@
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 
 #include <cstdlib>
+#include <set>
 #include <stdexcept>
 
 StoreSurfaces::StoreSurfaces(const std::filesystem::path& store, const std::string& tool)
@@ -39,7 +40,7 @@ std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool a
     });
     {
         std::lock_guard lock(loadedMutex_);
-        loaded_[surface->id] = {objectRevision, revision, storedUnits};
+        loaded_[surface->id] = {objectRevision, revision, storedUnits, volume};
     }
     surface->setChannelLoader(store_channel_loader(session_, attachment_, revision));
     return surface;
@@ -50,7 +51,17 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
                                   const std::optional<nlohmann::json>& coordinates)
 {
     auto meta = nlohmann::json::object();
+    std::optional<std::string> loadedIn;
+    {
+        std::lock_guard lock(loadedMutex_);
+        std::set<std::optional<std::string>> frames;
+        for (const auto& source : sources)
+            if (const auto found = loaded_.find(source); found != loaded_.end()) frames.insert(found->second.volume);
+        if (frames.size() > 1) throw std::runtime_error("sources were loaded in different frames");
+        if (!frames.empty()) loadedIn = *frames.begin();
+    }
     if (coordinates) meta["coordinates"] = *coordinates;
+    else if (loadedIn) meta["coordinates"] = *volumeCoordinates(*loadedIn);
     else if (!sources.empty())
         session_->read(attachment_, [&](const auto& db, const auto& txn, const auto&) {
             const auto source = db.objectByUuid(txn, sources.front());
@@ -71,7 +82,7 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
 std::string StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
 {
     const auto canonical = vc::objects::util::canonicalUuid(uuid);
-    const auto [objectRevision, geometryRevision, storedUnits] = writable(canonical);
+    const auto [objectRevision, geometryRevision, storedUnits, volume] = writable(canonical);
     const auto& points = *surface.rawPointsPtr();
     std::string revision;
     session_->editKeepingRelationships(attachment_, {{canonical, objectRevision}}, {}, [&](auto& db, auto& txn, const auto& keep) {
@@ -85,7 +96,7 @@ std::string StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
 std::string StoreSurfaces::updateChannels(const std::string& uuid, QuadSurface& surface, const std::vector<std::string>& names)
 {
     const auto canonical = vc::objects::util::canonicalUuid(uuid);
-    const auto [objectRevision, geometryRevision, storedUnits] = writable(canonical);
+    const auto [objectRevision, geometryRevision, storedUnits, volume] = writable(canonical);
     std::string revision;
     session_->editKeepingRelationships(attachment_, {{canonical, objectRevision}}, {}, [&](auto& db, auto& txn, const auto&) {
         revision = write_quad_channels_to_store(db, txn, canonical, surface, names, {}, geometryRevision);

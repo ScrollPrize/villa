@@ -49,8 +49,9 @@ public:
                                       const std::optional<std::string>& volume = std::nullopt);
     // A new surface object holding `surface`. Its meta keeps the surface's meta
     // (e.g. area) except tifxyz file keys and status tags (`tags` are the record's); meta.provenance records the tool, its
-    // parameters and the source objects; meta.coordinates is taken from the first
-    // source unless given.
+    // parameters and the source objects. meta.coordinates, unless given, is the
+    // frame the sources were loaded in: the volume they were read through (scale
+    // 1), else the first source's binding. Sources read in different frames throw.
     std::string create(QuadSurface& surface, const std::string& name, const nlohmann::json& parameters,
                        const std::vector<std::string>& sources = {}, const std::vector<std::string>& tags = {},
                        const std::optional<nlohmann::json>& coordinates = std::nullopt);
@@ -78,6 +79,8 @@ private:
     struct Loaded {
         std::string objectRevision, geometryRevision;
         bool storedUnits = true;
+        // The volume it was read through; nullopt: stored coordinates.
+        std::optional<std::string> volume;
     };
     std::map<std::string, Loaded> loaded_;
     // The pins of a surface this tool loaded in stored units; throws otherwise.

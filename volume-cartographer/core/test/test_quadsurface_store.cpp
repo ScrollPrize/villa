@@ -202,6 +202,12 @@ TEST_CASE("Tools read surfaces in a bound volume's voxels and write back only st
         auto registered = surfaces.load(uuid, true, std::string("registered"));
         CHECK((*registered->rawPointsPtr())(1, 1) == cv::Vec3f(11, 1, 4));
         CHECK_THROWS(surfaces.update(uuid, *registered));
+        // A new surface made from it is in the registered volume's voxels.
+        const auto derived = surfaces.create(*registered, "derived", nlohmann::json::object(), {uuid});
+        auto reread = surfaces.load(derived, true, std::string("registered"));
+        CHECK((*reread->rawPointsPtr())(1, 1) == cv::Vec3f(11, 1, 4));
+        auto derivedInStore = surfaces.load(derived);
+        CHECK_THROWS(surfaces.create(*derivedInStore, "mixed", nlohmann::json::object(), {uuid, derived}));
         auto inStore = surfaces.load(uuid);
         CHECK((*inStore->rawPointsPtr())(1, 1) == cv::Vec3f(2, 2, 8));
         CHECK_NOTHROW(surfaces.update(uuid, *inStore));
