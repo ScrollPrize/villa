@@ -87,12 +87,13 @@ class StoreSession:
 
 
 def _volume_factor(meta: dict, volume: str | None, surface_uuid: str) -> float:
-	coordinates = (meta or {}).get("coordinates") or {}
+	from vc_object_store import geometry_scale_to_volume
 	if volume is None:
 		raise ValueError(f"reading stored surface {surface_uuid} needs the volume its coordinates are in")
-	if coordinates.get("volume_uuid") != volume or not coordinates.get("scale_factor"):
+	factor = geometry_scale_to_volume(meta or {}, volume)
+	if factor is None:
 		raise ValueError(f"stored surface {surface_uuid} is not bound to volume {volume}")
-	return 1.0 / float(coordinates["scale_factor"])
+	return factor
 
 
 class StoredSurface:
@@ -101,23 +102,21 @@ class StoredSurface:
 	xyz: (H, W, 3) float32, -1 at missing vertices; meta: the record meta plus ``uuid``, ``name`` and the grid
 	``scale``; channel(name) reads a per-vertex channel (None when absent)."""
 
-	def __init__(self, store, surface_uuid, revision, record, geometry, xyz, factor):
+	def __init__(self, store, surface_uuid, revision, record, channels, scale, xyz, factor):
 		self._store = store
 		self.uuid = surface_uuid
 		self.revision = revision
 		self.xyz = xyz
-		self._arrays = {array["name"]: array for array in geometry["arrays"]}
-		scale = [float(s) / factor for s in geometry["attributes"]["scale"]]
+		self._channels = channels
+		scale = [float(s) / factor for s in scale]
 		self.meta = {**(record.get("meta") or {}), "uuid": surface_uuid, "name": record.get("name") or surface_uuid,
 					 "scale": scale}
 
 	def channel(self, name: str) -> np.ndarray | None:
-		array = self._arrays.get(name)
-		if array is None:
+		if name not in self._channels:
 			return None
 		with open_store(self._store) as store:
-			data = store.read_geometry_array(self.revision, name)
-		return np.frombuffer(data, dtype=np.dtype(array["dtype"])).reshape(array["shape"]).copy()
+			return np.array(store.read_geometry_arrays([self.revision], name).values)
 
 
 def read_surface(store: str | Path, ref: str, *, volume: str | None) -> StoredSurface:
@@ -130,19 +129,15 @@ def read_surface(store: str | Path, ref: str, *, volume: str | None) -> StoredSu
 		if record is None or record["kind"] != "surface":
 			raise ValueError(f"no surface {surface_uuid} in {store}")
 		factor = _volume_factor(record.get("meta"), volume, surface_uuid)
-		revision = revision or db.current_geometry(surface_uuid)["uuid"]
-		geometry = db.geometry_revision(revision)
-		shapes = {array["name"]: array["shape"] for array in geometry["arrays"]}
-		xyz = np.frombuffer(db.read_geometry_array(revision, "points"), dtype="<f4").reshape(shapes["points"]).copy()
-		# Missing: any coordinate -1 or non-finite (the store's rule), or marked invalid.
-		missing = ~np.isfinite(xyz).all(axis=-1) | (xyz == INVALID).any(axis=-1)
-		if "valid" in shapes:
-			valid = np.frombuffer(db.read_geometry_array(revision, "valid"), dtype="u1").reshape(shapes["valid"])
-			missing |= valid == 0
-	xyz[missing] = INVALID
+		with db.geometry_snapshot() as snapshot:
+			view = snapshot.surface(surface_uuid, revision)
+			xyz, valid = view.read_arrays()
+			revision, scale = view.revision["uuid"], list(view.scale)
+			channels = {array["name"] for array in view.revision["arrays"]} - {"points", "valid"}
+	xyz[~valid] = INVALID
 	if factor != 1.0:
-		xyz[~missing] *= np.float32(factor)
-	return StoredSurface(store, surface_uuid, revision, record, geometry, xyz, factor)
+		xyz[valid] *= np.float32(factor)
+	return StoredSurface(store, surface_uuid, revision, record, channels, scale, xyz, factor)
 
 
 def create_surface(store: str | Path, xyz: np.ndarray, *, name: str, scale: float, volume: str, tool: str,
@@ -155,14 +150,16 @@ def create_surface(store: str | Path, xyz: np.ndarray, *, name: str, scale: floa
 	points = np.ascontiguousarray(np.asarray(xyz, dtype="<f4"))
 	if points.ndim != 3 or points.shape[2] != 3:
 		raise ValueError(f"expected an (H, W, 3) grid, got {points.shape}")
-	missing = ~np.isfinite(points).all(axis=2) | (points == INVALID).any(axis=2)
-	points[missing] = INVALID
-	arrays = [dict(name="points", dtype="<f4", shape=list(points.shape), data=points.tobytes())]
+	from vc_object_store import Surface
+	points[~np.isfinite(points).all(axis=2) | (points == INVALID).any(axis=2)] = INVALID
+	geometry = Surface.from_arrays(points, [float(scale), float(scale)])
+	arrays = []
 	for channel_name, values in sorted((channels or {}).items()):
 		data = np.ascontiguousarray(values)
 		if tuple(data.shape[:2]) != tuple(points.shape[:2]):
 			raise ValueError(f"channel {channel_name!r} shape {data.shape} does not match the grid {points.shape}")
 		arrays.append(dict(name=channel_name, dtype=data.dtype.str, shape=list(data.shape), data=data.tobytes()))
+	geometry.channels = arrays
 	surface_uuid = str(uuidlib.uuid4())
 	record_meta = dict(meta or {})
 	for key in ("uuid", "name", "format", "type", "scale", "bbox"):
@@ -170,7 +167,6 @@ def create_surface(store: str | Path, xyz: np.ndarray, *, name: str, scale: floa
 	record_meta["coordinates"] = dict(volume_uuid=str(volume), scale_factor=1)
 	record_meta["provenance"] = dict(tool=tool, parameters=parameters or {}, sources=list(sources))
 	record = dict(uuid=surface_uuid, kind="surface", name=name, tags=list(tags), meta=record_meta)
-	geometry = dict(kind="surface", attributes=dict(scale=[float(scale), float(scale)]), arrays=arrays)
 	with open_store(store, read_only=False, author=author) as db:
 		with db.write(expected_revisions={surface_uuid: None}) as tx:
 			tx.upsert_object(record)
@@ -195,17 +191,15 @@ def attach_results(store: str | Path, surface_uuid: str, document: dict, *, role
 	collection attached to the surface: one point per record (-1 when the record has no finite position) whose
 	annotation is the record, and the rest of the document in meta.source. Returns the collection's UUID."""
 	records = [r for r in document.get(list_key, []) if isinstance(r, dict)]
-	points = np.asarray([_position(r.get(position_key)) for r in records], dtype="<f8").reshape(len(records), 3)
-	ids = np.arange(len(records), dtype="<i8")
+	from vc_object_store import PointCollection
+	points = [list(_position(r.get(position_key))) for r in records]
 	collection_uuid = str(uuidlib.uuid4())
 	rest = {key: value for key, value in document.items() if key != list_key}
 	record = dict(uuid=collection_uuid, kind="point_collection", name=name,
 				  meta=dict(role=role, coordinates=dict(volume_uuid=str(volume), scale_factor=1),
 							source=dict(document=rest, list_key=list_key, position_key=position_key,
 										point_attributes=records)))
-	geometry = dict(kind="point_collection", arrays=[
-		dict(name="points", dtype="<f8", shape=[len(records), 3], data=points.tobytes()),
-		dict(name="point_ids", dtype="<i8", shape=[len(records)], data=ids.tobytes())])
+	geometry = PointCollection(list(range(len(records))), points)
 	with open_store(store, read_only=False, author=author) as db:
 		surface_revision = db.current_object_revision(surface_uuid)
 		with db.write(expected_revisions={collection_uuid: None,
