@@ -1,4 +1,5 @@
 #pragma once
+#include <vc_reader/catalog.hpp>
 
 // An in-process JSON-RPC 2.0 server that listens on a QLocalServer socket and
 // lets an out-of-process agent drive and inspect VC3D.
@@ -34,9 +35,7 @@ class CWindow;
 class VolumeViewerBase;
 struct CommandLaunchError;
 
-namespace vc3d::opendata {
-struct OpenDataManifest;
-}
+namespace vcr::catalog { struct OpenDataManifest; }
 
 // Thrown by a handler that has deferred its response: the handler
 // has stashed (socket, id) via beginDeferred() and will write the response
@@ -297,10 +296,10 @@ private:
     // `build` may throw AgentBridgeError to surface a -3200x error.
     QJsonObject withOpenDataManifest(
         bool refresh,
-        const std::function<QJsonObject(const vc3d::opendata::OpenDataManifest&)>& build);
+        const std::function<QJsonObject(const vcr::catalog::OpenDataManifest&)>& build);
     void startManifestFetch(
         int token,
-        const std::function<QJsonObject(const vc3d::opendata::OpenDataManifest&)>& build);
+        const std::function<QJsonObject(const vcr::catalog::OpenDataManifest&)>& build);
 
     // Job tracking permits one active job per lifecycle source. Independent
     // sources may run concurrently; job ids share one monotonic counter.

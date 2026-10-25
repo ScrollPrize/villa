@@ -1,4 +1,5 @@
 #pragma once
+#include <vc_reader/catalog.hpp>
 
 #include "OpenDataManifest.hpp"
 #include "OpenDataSampleProject.hpp"
@@ -28,14 +29,14 @@ class OpenDataCatalogWindow : public QDialog
 
 public:
     explicit OpenDataCatalogWindow(QWidget* parent = nullptr);
-    explicit OpenDataCatalogWindow(const OpenDataManifest& manifest, QWidget* parent = nullptr);
+    explicit OpenDataCatalogWindow(const vcr::catalog::OpenDataManifest& manifest, QWidget* parent = nullptr);
     ~OpenDataCatalogWindow() override;
 
-    void setOpenSampleHandler(std::function<bool(const OpenDataSample&)> handler);
-    using CreateProjectHandler = std::function<bool(const OpenDataSample&,
+    void setOpenSampleHandler(std::function<bool(const vcr::catalog::OpenDataSample&)> handler);
+    using CreateProjectHandler = std::function<bool(const vcr::catalog::OpenDataSample&,
         const OpenDataResourceSelection&, const OpenDataNewProject&)>;
     void setCreateProjectHandler(CreateProjectHandler handler);
-    using AttachPredictionHandler = std::function<void(const OpenDataSample&,
+    using AttachPredictionHandler = std::function<void(const vcr::catalog::OpenDataSample&,
         const OpenDataResourceSelection&)>;
     void setAttachPredictionHandler(AttachPredictionHandler handler);
 
@@ -64,8 +65,7 @@ private slots:
 
 private:
     struct ManifestLoadResult {
-        OpenDataManifest manifest;
-        QString jsonText;
+        vcr::catalog::OpenDataManifest manifest;
         QString sourceLabel;
         QString error;
     };
@@ -79,30 +79,28 @@ private:
 
     void buildUi();
     void loadCachedManifestIfAvailable();
-    void applyManifest(OpenDataManifest manifest, QString sourceLabel, bool fromCache);
+    void applyManifest(vcr::catalog::OpenDataManifest manifest, QString sourceLabel, bool fromCache);
     void setStatus(const QString& text);
     void setLoading(bool loading);
-    void persistFetchedManifest(const ManifestLoadResult& result) const;
     void populateSamples();
-    void populateDetails(const OpenDataSample* sample);
+    void populateDetails(const vcr::catalog::OpenDataSample* sample);
     void clearDetails();
     void refreshSelectedSampleCacheStatus();
     void updateActionButtons();
-    void loadOverviewPhoto(const OpenDataSample& sample);
+    void loadOverviewPhoto(const vcr::catalog::OpenDataSample& sample);
     void onOverviewPhotoFinished(QFutureWatcher<PhotoLoadResult>* watcher);
     void setOverviewPhotoText(const QString& text);
     void setOverviewPhotoImage(const QImage& image);
 
-    [[nodiscard]] const OpenDataSample* selectedSample() const;
-    [[nodiscard]] const OpenDataVolume* selectedVolume() const;
-    [[nodiscard]] const OpenDataArtifact* selectedRepresentationArtifact() const;
-    [[nodiscard]] const OpenDataSegment* selectedSegment() const;
+    [[nodiscard]] const vcr::catalog::OpenDataSample* selectedSample() const;
+    [[nodiscard]] const vcr::catalog::OpenDataVolume* selectedVolume() const;
+    [[nodiscard]] const vcr::catalog::OpenDataArtifact* selectedRepresentationArtifact() const;
+    [[nodiscard]] const vcr::catalog::OpenDataSegment* selectedSegment() const;
     [[nodiscard]] QString selectedVolumeUrl() const;
     [[nodiscard]] QString selectedRepresentationUrl() const;
     [[nodiscard]] QString selectedSegmentUrl() const;
     [[nodiscard]] std::filesystem::path cacheRoot() const;
     [[nodiscard]] std::filesystem::path cachedManifestPath() const;
-    [[nodiscard]] std::filesystem::path cacheMetadataPath() const;
 
     QLineEdit* _searchEdit{nullptr};
     QCheckBox* _segmentsOnlyCheck{nullptr};
@@ -132,14 +130,14 @@ private:
     QPushButton* _syncSampleCacheButton{nullptr};
     QCheckBox* _doNotShowOnNextOpenCheck{nullptr};
 
-    std::optional<OpenDataManifest> _manifest;
+    std::optional<vcr::catalog::OpenDataManifest> _manifest;
     std::vector<std::size_t> _visibleSampleIndexes;
     QFutureWatcher<ManifestLoadResult>* _fetchWatcher{nullptr};
     bool _manifestRefreshPending{false};
     QFutureWatcher<PhotoLoadResult>* _photoWatcher{nullptr};
     std::vector<QFutureWatcher<PhotoLoadResult>*> _photoWatchers;
     QString _pendingPhotoSampleId;
-    std::function<bool(const OpenDataSample&)> _openSampleHandler;
+    std::function<bool(const vcr::catalog::OpenDataSample&)> _openSampleHandler;
     CreateProjectHandler _createProjectHandler;
     AttachPredictionHandler _attachPredictionHandler;
 };

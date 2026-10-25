@@ -40,15 +40,15 @@ bool containsInsensitive(const std::string& haystack, const std::string& needle)
     return lowerCopy(haystack).find(lowerCopy(needle)) != std::string::npos;
 }
 
-std::string artifactUrl(const OpenDataArtifact& artifact)
+std::string artifactUrl(const vcr::catalog::OpenDataArtifact& artifact)
 {
     return trimTrailingSlashes(artifact.resolvedUrl.empty()
                                   ? artifact.sourcePath
                                   : artifact.resolvedUrl);
 }
 
-bool isSupportedRemoteZarr(const OpenDataVolume& volume,
-                           const OpenDataArtifact& artifact,
+bool isSupportedRemoteZarr(const vcr::catalog::OpenDataVolume& volume,
+                           const vcr::catalog::OpenDataArtifact& artifact,
                            const std::string& url)
 {
     if (url.empty()) {
@@ -92,9 +92,9 @@ bool jsonStringEqualsInsensitive(const nlohmann::json& obj,
     return lowerCopy(it->get<std::string>()) == expected;
 }
 
-std::vector<std::string> volumeTags(const OpenDataSample& sample,
-                                    const OpenDataVolume& volume,
-                                    const OpenDataArtifact& artifact,
+std::vector<std::string> volumeTags(const vcr::catalog::OpenDataSample& sample,
+                                    const vcr::catalog::OpenDataVolume& volume,
+                                    const vcr::catalog::OpenDataArtifact& artifact,
                                     bool preferredNativeSource,
                                     std::optional<int> coordinateLevel = std::nullopt,
                                     std::optional<double> effectiveVoxelSize = std::nullopt,
@@ -177,25 +177,25 @@ std::vector<std::string> volumeTags(const OpenDataSample& sample,
     return tags;
 }
 
-bool isSupportedSurfacePrediction(const OpenDataArtifact& artifact)
+bool isSupportedSurfacePrediction(const vcr::catalog::OpenDataArtifact& artifact)
 {
     return lowerCopy(artifact.type) == "surface-prediction-zarr";
 }
 
-bool isSupportedInk3dPrediction(const OpenDataArtifact& artifact)
+bool isSupportedInk3dPrediction(const vcr::catalog::OpenDataArtifact& artifact)
 {
     const auto type = lowerCopy(artifact.type);
     return type == "ink-detection-3d-zarr" ||
            type == "ink_detection_3d_zarr";
 }
 
-bool isSupportedCoordinatePrediction(const OpenDataArtifact& artifact)
+bool isSupportedCoordinatePrediction(const vcr::catalog::OpenDataArtifact& artifact)
 {
     return isSupportedSurfacePrediction(artifact) ||
            isSupportedInk3dPrediction(artifact);
 }
 
-std::optional<int> predictionSourceCoordinateLevel(const OpenDataArtifact& artifact)
+std::optional<int> predictionSourceCoordinateLevel(const vcr::catalog::OpenDataArtifact& artifact)
 {
     if (!isSupportedCoordinatePrediction(artifact))
         return std::nullopt;
@@ -213,15 +213,15 @@ std::optional<int> predictionSourceCoordinateLevel(const OpenDataArtifact& artif
     return std::nullopt;
 }
 
-std::string coordinateSpaceId(const OpenDataSample& sample,
-                              const OpenDataVolume& volume,
+std::string coordinateSpaceId(const vcr::catalog::OpenDataSample& sample,
+                              const vcr::catalog::OpenDataVolume& volume,
                               int level)
 {
     return sample.id + "/" + volume.id + "@L" + std::to_string(level);
 }
 
-std::vector<std::string> coordinateTags(const OpenDataSample& sample,
-                                        const OpenDataVolume& volume,
+std::vector<std::string> coordinateTags(const vcr::catalog::OpenDataSample& sample,
+                                        const vcr::catalog::OpenDataVolume& volume,
                                         int level,
                                         double voxelSize,
                                         const std::string& sourcePath)
@@ -277,13 +277,13 @@ bool hasVolumeEntry(const VolumePkg& pkg, const std::string& location)
     });
 }
 
-std::string volumeLabel(const OpenDataVolume& volume)
+std::string volumeLabel(const vcr::catalog::OpenDataVolume& volume)
 {
     return volume.id.empty() ? std::string("<unnamed volume>") : volume.id;
 }
 
-std::string volumeArtifactLabel(const OpenDataVolume& volume,
-                                const OpenDataArtifact& artifact)
+std::string volumeArtifactLabel(const vcr::catalog::OpenDataVolume& volume,
+                                const vcr::catalog::OpenDataArtifact& artifact)
 {
     auto label = volumeLabel(volume);
     if (!artifact.type.empty()) {
@@ -307,7 +307,7 @@ std::string safePathComponent(std::string value)
 }
 
 std::string segmentSourcePreferredVolumeId(
-    const OpenDataSample& sample,
+    const vcr::catalog::OpenDataSample& sample,
     const std::vector<std::string>& supportedVolumeIds)
 {
     if (supportedVolumeIds.empty() || sample.segments.empty()) {
@@ -338,7 +338,7 @@ std::string segmentSourcePreferredVolumeId(
 
 std::filesystem::path sampleProjectCachePath(
     const std::filesystem::path& remoteCacheRoot,
-    const OpenDataSample& sample)
+    const vcr::catalog::OpenDataSample& sample)
 {
     return remoteCacheRoot / "open_data" / "projects" /
            (safePathComponent(sample.id.empty() ? "sample" : sample.id) + ".volpkg.json");
@@ -355,7 +355,7 @@ bool isNonEmptyFile(const std::filesystem::path& path)
 } // namespace
 
 std::shared_ptr<VolumePkg> createOpenDataSampleProject(
-    const OpenDataSample& sample,
+    const vcr::catalog::OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
     OpenDataSampleProjectResult* resultOut,
     const OpenDataSampleProgressCallback& progressCallback,
@@ -494,15 +494,15 @@ std::shared_ptr<VolumePkg> createOpenDataSampleProject(
 
 OpenDataSampleProjectResult attachOpenDataSampleVolumes(
     VolumePkg& pkg,
-    const OpenDataSample& sample,
+    const vcr::catalog::OpenDataSample& sample,
     const OpenDataResourceSelection* selection)
 {
     OpenDataSampleProjectResult result;
     std::vector<std::string> supportedVolumeIds;
 
     struct PredictionCandidate {
-        const OpenDataVolume* volume = nullptr;
-        const OpenDataArtifact* prediction = nullptr;
+        const vcr::catalog::OpenDataVolume* volume = nullptr;
+        const vcr::catalog::OpenDataArtifact* prediction = nullptr;
         std::string predictionUrl;
         std::string sourceUrl;
         int sourceCoordinateLevel = 0;
@@ -510,7 +510,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
     };
     std::vector<PredictionCandidate> predictions;
     struct VirtualSourceCandidate {
-        const OpenDataVolume* volume = nullptr;
+        const vcr::catalog::OpenDataVolume* volume = nullptr;
         std::string sourceUrl;
         int sourceCoordinateLevel = 0;
         std::string representationLabel;
@@ -532,7 +532,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
         }
 
         bool foundSupportedArtifact = false;
-        const auto* preferredSource = preferredVolumeArtifact(volume);
+        const auto* preferredSource = vcr::catalog::preferredVolumeArtifact(volume);
         std::string preferredSourceUrl;
         if (preferredSource) {
             preferredSourceUrl = artifactUrl(*preferredSource);
@@ -550,7 +550,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
                 if (selection &&
                     !selection->allowsRepresentation(
                         volumeIndex, artifactIndex,
-                        OpenDataRepresentationKind::Lasagna, volume.id)) {
+                        vcr::catalog::OpenDataRepresentationKind::Lasagna, volume.id)) {
                     continue;
                 }
                 if (!artifact.levelParameterPresent ||
@@ -578,7 +578,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
             // pass the representation and kind filters.
             if (selection) {
                 if (const auto reprKind =
-                        classifyDerivedRepresentation(artifact)) {
+                        vcr::catalog::classifyDerivedRepresentation(artifact)) {
                     if (!selection->allowsRepresentation(
                             volumeIndex, artifactIndex, *reprKind, volume.id)) {
                         continue;
@@ -823,7 +823,7 @@ OpenDataSampleProjectResult attachOpenDataSampleVolumes(
 }
 
 void importOpenDataSampleSurfaces(
-    const OpenDataSample& sample,
+    const vcr::catalog::OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
     OpenDataSampleProjectResult& result,
     const std::optional<std::vector<std::string>>& segmentIds)

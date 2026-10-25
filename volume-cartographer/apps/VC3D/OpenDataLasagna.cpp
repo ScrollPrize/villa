@@ -373,7 +373,7 @@ std::string discoverOpenDataLasagnaManifestUrl(const std::string& artifactUrl)
     std::string prefix;
     if (!splitPrefixUrl(artifactUrl, origin, prefix))
         throw std::runtime_error("Invalid Lasagna artifact URL");
-    return joinOpenDataUrl(origin, key);
+    return vcr::catalog::joinOpenDataUrl(origin, key);
 }
 
 OpenDataLasagnaDatasetKind validateOpenDataLasagnaManifest(
@@ -429,13 +429,13 @@ std::string lasagnaSourceManifestLocation(const vc::project::Entry& entry)
         tagValue(entry.tags, kOpenDataLasagnaArtifactTagPrefix);
     if (artifactUrl.empty())
         return entry.location;
-    return joinOpenDataUrl(
+    return vcr::catalog::joinOpenDataUrl(
         artifactUrl, std::filesystem::path(entry.location).filename().string());
 }
 
 std::vector<OpenDataLasagnaInfo> lasagnaArtifacts(
     const std::string& sampleId,
-    const OpenDataVolume& volume)
+    const vcr::catalog::OpenDataVolume& volume)
 {
     std::vector<OpenDataLasagnaInfo> result;
     for (std::size_t artifactIndex = 0;
@@ -568,7 +568,7 @@ std::filesystem::path prepareOpenDataLasagna(
 }
 
 int attachOpenDataLasagna(VolumePkg& pkg,
-                          const OpenDataSample& sample,
+                          const vcr::catalog::OpenDataSample& sample,
                           const std::filesystem::path& remoteCacheRoot,
                           std::vector<std::string>* messages,
                           const OpenDataResourceSelection* selection)
@@ -598,7 +598,7 @@ int attachOpenDataLasagna(VolumePkg& pkg,
             if (selection &&
                 !selection->allowsRepresentation(
                     volumeIndex, info.artifactIndex,
-                    OpenDataRepresentationKind::Lasagna, volume.id)) {
+                    vcr::catalog::OpenDataRepresentationKind::Lasagna, volume.id)) {
                 continue;
             }
             std::string error;

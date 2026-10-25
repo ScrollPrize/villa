@@ -23,15 +23,15 @@ class CatalogProjectDialogTest : public QObject
 private slots:
     void attachRepresentations()
     {
-        OpenDataManifest manifest;
-        OpenDataSample sample;
+        vcr::catalog::OpenDataManifest manifest;
+        vcr::catalog::OpenDataSample sample;
         sample.id = "test";
-        OpenDataVolume volume;
+        vcr::catalog::OpenDataVolume volume;
         volume.id = "scan";
         const QStringList types{"ink-detection-3d-zarr", "ink_detection_3d_zarr",
             "surface-prediction-zarr", "lasagna", "normal-grids", "surface-prediction-mesh"};
         for (const auto& type : types) {
-            OpenDataArtifact artifact;
+            vcr::catalog::OpenDataArtifact artifact;
             artifact.type = type.toStdString();
             artifact.resolvedUrl = "https://example.invalid/" + artifact.type;
             artifact.sourcePath = "predictions/fibers/" + artifact.type;
@@ -49,7 +49,7 @@ private slots:
         manifest.samples.push_back(sample);
         OpenDataCatalogWindow catalog(manifest);
         int predictions = 0;
-        catalog.setAttachPredictionHandler([&](const OpenDataSample& selected,
+        catalog.setAttachPredictionHandler([&](const vcr::catalog::OpenDataSample& selected,
                 const OpenDataResourceSelection& selection) {
             QCOMPARE(selected.id, sample.id);
             QCOMPARE(selected.volumes.front().id, volume.id);
@@ -60,7 +60,7 @@ private slots:
             const auto ref = selection.representations->front();
             QCOMPARE(ref.volumeIndex, std::size_t(0));
             QCOMPARE(ref.artifactIndex, std::size_t(predictions));
-            QCOMPARE(ref.kind, OpenDataRepresentationKind::Prediction);
+            QCOMPARE(ref.kind, vcr::catalog::OpenDataRepresentationKind::Prediction);
             const auto& artifact = selected.volumes.at(ref.volumeIndex).artifacts.at(ref.artifactIndex);
             QCOMPARE(artifact.sourceCoordinateLevel.value(), 2);
             QCOMPARE(QString::fromStdString(artifact.resolvedUrl),
@@ -106,24 +106,24 @@ private slots:
         settings.sync();
         const auto oldRoot = VolumePkg::autosaveRoot();
         VolumePkg::setAutosaveRoot(temp.path().toStdString());
-        OpenDataManifest manifest;
-        OpenDataSample sample;
+        vcr::catalog::OpenDataManifest manifest;
+        vcr::catalog::OpenDataSample sample;
         sample.id = "PHercParis4";
-        OpenDataVolume volume;
+        vcr::catalog::OpenDataVolume volume;
         volume.id = "test-volume";
         volume.dataFormat = "zarr";
         volume.pixelSizeUm = 2.4;
-        OpenDataArtifact raw, prediction;
+        vcr::catalog::OpenDataArtifact raw, prediction;
         raw.type = "ome-zarr";
         raw.resolvedUrl = "https://example.invalid/source.zarr";
         prediction.type = "surface-prediction-zarr";
         prediction.resolvedUrl = "https://example.invalid/prediction.zarr";
         volume.artifacts = {raw, prediction};
         sample.volumes = {volume};
-        OpenDataSegment segment;
+        vcr::catalog::OpenDataSegment segment;
         segment.id = "segment";
         segment.originalVolumeId = volume.id;
-        OpenDataArtifact tifxyz;
+        vcr::catalog::OpenDataArtifact tifxyz;
         tifxyz.type = "tifxyz";
         tifxyz.resolvedUrl = "https://example.invalid/segment";
         segment.artifacts = {tifxyz};
@@ -138,7 +138,7 @@ private slots:
         sample.volumes.push_back(more);
         manifest.samples = {first, sample};
         if (qEnvironmentVariableIsSet("VC_CATALOG_TEST_MANIFEST")) {
-            manifest = loadOpenDataManifestFile(qgetenv("VC_CATALOG_TEST_MANIFEST").toStdString());
+            manifest = vcr::catalog::loadOpenDataManifestFile(qgetenv("VC_CATALOG_TEST_MANIFEST").toStdString());
             for (auto& entry : manifest.samples) entry.artifacts.clear();
         }
         OpenDataCatalogWindow catalog(manifest);

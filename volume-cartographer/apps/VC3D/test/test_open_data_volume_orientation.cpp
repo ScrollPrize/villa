@@ -91,7 +91,7 @@ private slots:
 
     void propertiesAreReadAsBooleansOrTheirStrings()
     {
-        const auto manifest = vc3d::opendata::parseOpenDataManifest(manifestText(
+        const auto manifest = vcr::catalog::parseOpenDataManifest(manifestText(
             R"({"z_direction_is_top_to_bottom": true, "left_handed_coordinates": "false"})"));
         const auto found =
             vc3d::opendata::findVolumeOrientation(manifest, "PHerc0139", "20260102150214");
@@ -100,7 +100,7 @@ private slots:
         QCOMPARE(found->leftHandedCoordinates, std::optional<bool>(false));
 
         // Absent, null, or anything else is unset - never a default.
-        const auto unset = vc3d::opendata::parseOpenDataManifest(manifestText(
+        const auto unset = vcr::catalog::parseOpenDataManifest(manifestText(
             R"({"left_handed_coordinates": null, "pixel_size_um": 2.399})"));
         const auto partial =
             vc3d::opendata::findVolumeOrientation(unset, "PHerc0139", "20260102150214");

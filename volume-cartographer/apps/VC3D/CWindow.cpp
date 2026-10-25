@@ -8436,7 +8436,7 @@ void CWindow::rememberCurrentVolumeForPackage(const QString& volumeId) const
     settings.setValue(key, volumeId);
 }
 
-const vc3d::opendata::OpenDataManifest* CWindow::cachedOpenDataManifest() const
+const vcr::catalog::OpenDataManifest* CWindow::cachedOpenDataManifest() const
 {
     if (_openDataManifestCache) {
         return &*_openDataManifestCache;
@@ -8452,9 +8452,9 @@ const vc3d::opendata::OpenDataManifest* CWindow::cachedOpenDataManifest() const
     }
 
     try {
-        _openDataManifestCache = vc3d::opendata::loadOpenDataManifestFile(
+        _openDataManifestCache = vcr::catalog::loadOpenDataManifestFile(
             manifestPath,
-            std::string(vc3d::opendata::kDefaultManifestUrl));
+            std::string(vcr::catalog::kDefaultManifestUrl));
         return &*_openDataManifestCache;
     } catch (const std::exception& ex) {
         Logger()->warn("Failed to load cached open-data manifest '{}': {}",
@@ -8523,8 +8523,9 @@ std::optional<cv::Matx44d> CWindow::openDataVolumeTransformForSwitch(
     }
 
     for (const auto& sample : manifest->samples) {
-        if (auto matrix = vc3d::opendata::findSampleVolumeTransform(
+        if (auto nativeMatrix = vcr::catalog::findSampleVolumeTransform(
                 sample, fromCatalogId, toCatalogId)) {
+            auto matrix = std::optional(vc3d::opendata::cvMatrix(*nativeMatrix));
             if (!explicitCoordinates)
                 return matrix;
             const auto sourceScale = coordinateLevelScale(*fromLevel);

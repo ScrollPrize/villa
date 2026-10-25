@@ -1,4 +1,5 @@
 #pragma once
+#include <vc_reader/catalog.hpp>
 
 #include "OpenDataManifest.hpp"
 
@@ -66,7 +67,7 @@ enum class OpenDataLasagnaDatasetKind {
 
 [[nodiscard]] std::vector<OpenDataLasagnaInfo> lasagnaArtifacts(
     const std::string& sampleId,
-    const OpenDataVolume& volume);
+    const vcr::catalog::OpenDataVolume& volume);
 
 [[nodiscard]] std::filesystem::path lasagnaCacheDir(
     const std::filesystem::path& remoteCacheRoot,
@@ -82,7 +83,7 @@ enum class OpenDataLasagnaDatasetKind {
 // selection optionally restricts attached volumes and representations;
 // nullptr attaches everything.
 int attachOpenDataLasagna(VolumePkg& pkg,
-                          const OpenDataSample& sample,
+                          const vcr::catalog::OpenDataSample& sample,
                           const std::filesystem::path& remoteCacheRoot,
                           std::vector<std::string>* messages = nullptr,
                           const OpenDataResourceSelection* selection = nullptr);

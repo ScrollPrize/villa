@@ -542,7 +542,7 @@ void MenuActionController::showOpenDataCatalog()
             this, &MenuActionController::showAttachRemoteZarrDialog);
     connect(dialog, &vc3d::opendata::OpenDataCatalogWindow::attachLasagnaRequested,
             this, &MenuActionController::attachCatalogLasagna);
-    dialog->setAttachPredictionHandler([this](const vc3d::opendata::OpenDataSample& sample,
+    dialog->setAttachPredictionHandler([this](const vcr::catalog::OpenDataSample& sample,
             const vc3d::opendata::OpenDataResourceSelection& selection) {
         if (!_window || !_window->_state || !_window->_state->vpkg()) {
             QMessageBox::information(_window, tr("No project"), tr("Open or create a project first."));
@@ -582,7 +582,7 @@ void MenuActionController::showOpenDataCatalog()
             QMessageBox::warning(_window, tr("Attach failed"), QString::fromUtf8(e.what()));
         }
     });
-    dialog->setOpenSampleHandler([this](const vc3d::opendata::OpenDataSample& sample) {
+    dialog->setOpenSampleHandler([this](const vcr::catalog::OpenDataSample& sample) {
         return openOpenDataSample(sample);
     });
     dialog->setCreateProjectHandler([this](const auto& sample, const auto& selection,
@@ -615,12 +615,12 @@ bool MenuActionController::openOpenDataSampleById(const QString& sampleId, bool 
         return false;
     }
 
-    const vc3d::opendata::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
+    const vcr::catalog::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
     if (!manifest) {
         return false;
     }
 
-    const vc3d::opendata::OpenDataSample* sample =
+    const vcr::catalog::OpenDataSample* sample =
         manifest->findSample(sampleId.toStdString());
     if (!sample) {
         return false;
@@ -640,13 +640,13 @@ bool MenuActionController::openOpenDataSampleById(
         return false;
     }
 
-    const vc3d::opendata::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
+    const vcr::catalog::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
     if (!manifest) {
         if (errorMessage) *errorMessage = QObject::tr("Open Data manifest is unavailable.");
         return false;
     }
 
-    const vc3d::opendata::OpenDataSample* sample =
+    const vcr::catalog::OpenDataSample* sample =
         manifest->findSample(sampleId.toStdString());
     if (!sample) {
         if (errorMessage)
@@ -658,7 +658,7 @@ bool MenuActionController::openOpenDataSampleById(
                               errorMessage, resultOut);
 }
 
-bool MenuActionController::openOpenDataSample(const vc3d::opendata::OpenDataSample& sample,
+bool MenuActionController::openOpenDataSample(const vcr::catalog::OpenDataSample& sample,
                                              bool interactive,
                                              const vc3d::opendata::OpenDataResourceSelection* selection,
                                              QString* errorMessage,
@@ -739,12 +739,12 @@ bool MenuActionController::startOpenDataSampleOpen(
         if (errorMessage) *errorMessage = QObject::tr("No sample id provided.");
         return false;
     }
-    const vc3d::opendata::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
+    const vcr::catalog::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
     if (!manifest) {
         if (errorMessage) *errorMessage = QObject::tr("Open Data manifest is unavailable.");
         return false;
     }
-    const vc3d::opendata::OpenDataSample* sample =
+    const vcr::catalog::OpenDataSample* sample =
         manifest->findSample(sampleId.toStdString());
     if (!sample) {
         if (errorMessage)
@@ -770,7 +770,7 @@ bool MenuActionController::openDataSampleOpenInFlight() const
 }
 
 void MenuActionController::beginOpenDataSampleOpenTask(
-    const vc3d::opendata::OpenDataSample& sample,
+    const vcr::catalog::OpenDataSample& sample,
     bool interactive,
     const vc3d::opendata::OpenDataResourceSelection* selection,
     std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,
@@ -778,7 +778,7 @@ void MenuActionController::beginOpenDataSampleOpenTask(
     const vc3d::opendata::OpenDataNewProject* newProject)
 {
     const QString cacheDir = vc3d::remoteCachePath();
-    const vc3d::opendata::OpenDataSample sampleCopy = sample;
+    const vcr::catalog::OpenDataSample sampleCopy = sample;
     const auto projectCopy = newProject
         ? std::make_optional(*newProject) : std::nullopt;
     // Copy the selection by value so the worker thread never dereferences a

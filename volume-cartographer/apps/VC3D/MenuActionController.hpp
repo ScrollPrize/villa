@@ -1,4 +1,5 @@
 #pragma once
+#include <vc_reader/catalog.hpp>
 
 #include <QObject>
 #include <QFutureWatcher>
@@ -23,7 +24,7 @@ class CWindow;
 class Volume;
 
 namespace vc3d::opendata {
-struct OpenDataSample;
+
 struct OpenDataSampleProjectResult;
 class OpenDataCatalogWindow;
 }
@@ -158,7 +159,7 @@ private:
     void beginLasagnaManifestAttachment(bool remote, const QString& initialUrl = {}, bool fiber = false);
     void attachCatalogLasagna(const QString& artifactUrl, bool fiber);
     struct LasagnaAttachTaskResult;
-    bool openOpenDataSample(const vc3d::opendata::OpenDataSample& sample,
+    bool openOpenDataSample(const vcr::catalog::OpenDataSample& sample,
                             bool interactive = true,
                             const vc3d::opendata::OpenDataResourceSelection* selection = nullptr,
                             QString* errorMessage = nullptr,
@@ -169,7 +170,7 @@ private:
     // Launches the QtConcurrent task without a nested event loop. Its watcher is
     // parented to this; completion and onFinished run on the GUI thread.
     void beginOpenDataSampleOpenTask(
-        const vc3d::opendata::OpenDataSample& sample,
+        const vcr::catalog::OpenDataSample& sample,
         bool interactive,
         const vc3d::opendata::OpenDataResourceSelection* selection,
         std::function<void(const OpenDataSampleOpenOutcome&)> onFinished,

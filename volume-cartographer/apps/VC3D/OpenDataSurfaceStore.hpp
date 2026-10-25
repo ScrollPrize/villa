@@ -1,4 +1,5 @@
 #pragma once
+#include <vc_reader/catalog.hpp>
 
 // Open Data segments as surfaces of one internal object store per sample
 // (<remote cache>/open_data/stores/<sample>.vcobj). Only this importer writes
@@ -24,32 +25,25 @@ enum class OpenDataSegmentRepresentationKind {
     // The authored tifxyz of the source volume, in its downscaled voxels.
     DerivedNative,
     // A published tifxyz in a target volume's L0 voxels.
-    PublishedTransformed,
-    // The source representation moved into a target volume by the sample's
-    // volume matrix (no published one for that volume).
-    Generated
+    PublishedTransformed
 };
 
 struct OpenDataSegmentRepresentation {
-    const OpenDataArtifact* artifact = nullptr;  // registered ones
+    const vcr::catalog::OpenDataArtifact* artifact = nullptr;  // registered ones
     OpenDataSegmentRepresentationKind kind = OpenDataSegmentRepresentationKind::DerivedNative;
     bool canonicalSource = false;
     std::string coordinateVolumeId;
     std::string coordinateSpace;
     std::string representationId;
-    // Generated: the representation it is computed from and the matrix.
-    std::string sourceRepresentationId;
-    std::optional<cv::Matx44d> matrix;
 };
 
 // The representations of a segment, at most one per sample volume. The source
 // volume's is canonical: an explicit published representation targeting it
 // wins, otherwise the authored artifact in native L0. Published ones win for
-// every other volume; the rest of the volumes with a sample matrix from the
-// source volume get a generated one.
+// every other volume. Other compatible volumes use transformed store views.
 [[nodiscard]] std::vector<OpenDataSegmentRepresentation>
-classifyOpenDataSegmentRepresentations(const OpenDataSample& sample,
-                                       const OpenDataSegment& segment);
+classifyOpenDataSegmentRepresentations(const vcr::catalog::OpenDataSample& sample,
+                                       const vcr::catalog::OpenDataSegment& segment);
 
 [[nodiscard]] std::filesystem::path surfaceStorePath(const std::filesystem::path& remoteCacheRoot,
                                                      const std::string& sampleId);
@@ -72,22 +66,20 @@ struct SurfaceImportResult {
 };
 // Record the representations of the sample's segments (only `segmentIds` when
 // given) in its store, creating the store. Re-importing updates the records;
-// geometry already fetched or generated stays.
+// geometry already fetched stays.
 SurfaceImportResult importSampleSurfaces(const std::filesystem::path& remoteCacheRoot,
-                                         const OpenDataSample& sample,
+                                         const vcr::catalog::OpenDataSample& sample,
                                          const std::optional<std::vector<std::string>>& segmentIds = std::nullopt);
 
 enum class SurfaceState { Missing, Remote, Stored };
 // The canonical representation of a segment: not imported, imported without
 // geometry yet, or with geometry in the store.
 [[nodiscard]] SurfaceState surfaceStateForSegment(const std::filesystem::path& remoteCacheRoot,
-                                                  const OpenDataSample& sample,
-                                                  const OpenDataSegment& segment);
+                                                  const vcr::catalog::OpenDataSample& sample,
+                                                  const vcr::catalog::OpenDataSegment& segment);
 [[nodiscard]] const char* surfaceStateName(SurfaceState state) noexcept;
 
-// Give a catalog surface its geometry: fetch the registered tifxyz, or compute
-// a generated one from its source (fetched first when needed). Blocking; no-op
-// when it has geometry.
+// Fetch a catalog surface's registered tifxyz. Blocking; no-op when it has geometry.
 void materializeSurface(const std::filesystem::path& store, const std::string& uuid);
 [[nodiscard]] bool surfaceHasGeometry(const std::filesystem::path& store, const std::string& uuid);
 

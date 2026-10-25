@@ -222,7 +222,7 @@ std::string fixtureWithSegmentArtifactType(const char* type)
 
 TEST_CASE("OpenDataManifest strictly parses coordinate-bearing artifact parameters")
 {
-    const auto manifest = parseOpenDataManifest(R"({
+    const auto manifest = vcr::catalog::parseOpenDataManifest(R"({
       "metadata":{"samples":{"sample":{"volumes":{"volume":{"data":[
         {"type":"surface-prediction-zarr","parameters":{"level":2}},
         {"type":"normal-grids","parameters":{"level":2.5}},
@@ -246,7 +246,7 @@ TEST_CASE("OpenDataManifest strictly parses coordinate-bearing artifact paramete
 
 TEST_CASE("OpenDataManifest parses Lasagna as a distinct typed artifact")
 {
-    const auto manifest = parseOpenDataManifest(R"({
+    const auto manifest = vcr::catalog::parseOpenDataManifest(R"({
       "metadata":{"samples":{"sample":{"volumes":{"volume":{
         "properties":{"shape":[100,200,300]},
         "data":[{
@@ -297,7 +297,7 @@ TEST_CASE("OpenDataManifest parses Lasagna as a distinct typed artifact")
 
 TEST_CASE("Open-data fiber Lasagna accepts authoritative inner metadata")
 {
-    const auto manifest = parseOpenDataManifest(R"({
+    const auto manifest = vcr::catalog::parseOpenDataManifest(R"({
       "metadata":{"samples":{"PHercParis4":{"volumes":{"20260411134726":{
         "properties":{"shape":[75784,32693,32693]},
         "data":[{
@@ -362,12 +362,12 @@ TEST_CASE("Open-data Lasagna still rejects incompatible inner metadata")
 
 TEST_CASE("Open-data Lasagna attachment handles level artifacts independently")
 {
-    OpenDataSample sample;
+    vcr::catalog::OpenDataSample sample;
     sample.id = "sample";
-    OpenDataVolume volume;
+    vcr::catalog::OpenDataVolume volume;
     volume.id = "volume";
     for (int level : {1, 3}) {
-        OpenDataArtifact artifact;
+        vcr::catalog::OpenDataArtifact artifact;
         artifact.type = "lasagna";
         artifact.resolvedUrl =
             "https://example.test/lasagna/L" + std::to_string(level);
@@ -388,8 +388,8 @@ TEST_CASE("Open-data Lasagna attachment handles level artifacts independently")
     auto pkg = VolumePkg::newEmpty();
     OpenDataResourceSelection selection;
     selection.representations =
-        std::vector<OpenDataRepresentationRef>{{0, 1,
-                                                OpenDataRepresentationKind::Lasagna}};
+        std::vector<vcr::catalog::OpenDataRepresentationRef>{{0, 1,
+                                                vcr::catalog::OpenDataRepresentationKind::Lasagna}};
     std::vector<std::string> messages;
     CHECK(attachOpenDataLasagna(
               *pkg, sample, {}, &messages, &selection) == 0);
@@ -400,7 +400,7 @@ TEST_CASE("Open-data Lasagna attachment handles level artifacts independently")
 
 TEST_CASE("OpenDataManifest enumerates derived volume representations")
 {
-    const auto manifest = parseOpenDataManifest(R"({
+    const auto manifest = vcr::catalog::parseOpenDataManifest(R"({
       "metadata":{"samples":{"sample":{"volumes":{"volume":{"data":[
         {"type":"zarr"},
         {"type":"normal-grids"},
@@ -410,15 +410,15 @@ TEST_CASE("OpenDataManifest enumerates derived volume representations")
         {"type":"future-pred-zarr"}
       ]}}}}}
     })");
-    const auto representations = derivedRepresentations(manifest.samples.front());
+    const auto representations = vcr::catalog::derivedRepresentations(manifest.samples.front());
     REQUIRE(representations.size() == 5);
-    CHECK(representations[0].kind == OpenDataRepresentationKind::NormalGrids);
-    CHECK(representations[1].kind == OpenDataRepresentationKind::Lasagna);
-    CHECK(representations[2].kind == OpenDataRepresentationKind::Prediction);
-    CHECK(representations[3].kind == OpenDataRepresentationKind::Prediction);
-    CHECK(representations[4].kind == OpenDataRepresentationKind::Prediction);
-    CHECK(representationKindName(representations[0].kind) == "Normal grids");
-    CHECK(representationKindName(representations[1].kind) == "Lasagna");
+    CHECK(representations[0].kind == vcr::catalog::OpenDataRepresentationKind::NormalGrids);
+    CHECK(representations[1].kind == vcr::catalog::OpenDataRepresentationKind::Lasagna);
+    CHECK(representations[2].kind == vcr::catalog::OpenDataRepresentationKind::Prediction);
+    CHECK(representations[3].kind == vcr::catalog::OpenDataRepresentationKind::Prediction);
+    CHECK(representations[4].kind == vcr::catalog::OpenDataRepresentationKind::Prediction);
+    CHECK(vcr::catalog::representationKindName(representations[0].kind) == "Normal grids");
+    CHECK(vcr::catalog::representationKindName(representations[1].kind) == "Lasagna");
 }
 
 TEST_CASE("Open-data Lasagna resolution requires exact parent volume and dyadic level")
@@ -496,6 +496,8 @@ TEST_CASE("Manual project Lasagna resolution materializes a selected remote mani
 
     const QByteArray previousConfigDir = qgetenv("VC3D_CONFIG_DIR");
     qputenv("VC3D_CONFIG_DIR", QByteArray::fromStdString((root / "settings").string()));
+    writeFile(root / "settings" / "cache.json",
+              nlohmann::json{{"version",1},{"root",root.string()}}.dump());
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(
         vc3d::settings::viewer::REMOTE_CACHE_DIR,
@@ -564,19 +566,19 @@ TEST_CASE("Open-data Lasagna derives and verifies coordinate scale from volume s
 
 TEST_CASE("Open-data Lasagna alone requests its declared rebased source view")
 {
-    OpenDataSample sample;
+    vcr::catalog::OpenDataSample sample;
     sample.id = "sample";
-    OpenDataVolume volume;
+    vcr::catalog::OpenDataVolume volume;
     volume.id = "high-resolution";
     volume.suffix = "2.4um";
     volume.pixelSizeUm = 2.4;
 
-    OpenDataArtifact source;
+    vcr::catalog::OpenDataArtifact source;
     source.type = "ome-zarr";
     source.resolvedUrl = "http://127.0.0.1:9/source.zarr";
     volume.artifacts.push_back(source);
 
-    OpenDataArtifact lasagna;
+    vcr::catalog::OpenDataArtifact lasagna;
     lasagna.type = "lasagna";
     lasagna.resolvedUrl = "http://127.0.0.1:9/lasagna";
     lasagna.levelParameterPresent = true;
@@ -609,12 +611,12 @@ TEST_CASE("Open-data Lasagna alone requests its declared rebased source view")
 
 TEST_CASE("Selected Lasagna does not implicitly attach scan views")
 {
-    OpenDataSample sample;
+    vcr::catalog::OpenDataSample sample;
     sample.id = "sample";
-    OpenDataVolume volume;
+    vcr::catalog::OpenDataVolume volume;
     volume.id = "v";
     volume.pixelSizeUm = 2.4;
-    OpenDataArtifact source, lasagna;
+    vcr::catalog::OpenDataArtifact source, lasagna;
     source.type = "ome-zarr";
     source.resolvedUrl = "http://127.0.0.1:9/source.zarr";
     lasagna.type = "lasagna";
@@ -625,7 +627,7 @@ TEST_CASE("Selected Lasagna does not implicitly attach scan views")
     sample.volumes = {volume};
     OpenDataResourceSelection selection;
     selection.rawVolumeIds.emplace();
-    selection.representations = derivedRepresentations(sample);
+    selection.representations = vcr::catalog::derivedRepresentations(sample);
     vc::project::LoadOptions options;
     options.deferResolution = true;
     auto pkg = VolumePkg::newDetached(options);
@@ -649,7 +651,7 @@ TEST_CASE("Selected Lasagna does not implicitly attach scan views")
 
 TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache identities")
 {
-    const auto manifest = parseOpenDataManifest(R"({
+    const auto manifest = vcr::catalog::parseOpenDataManifest(R"({
       "metadata":{"samples":{"sample":{"volumes":{"volume":{"data":[
         {"type":"normal-grids","parameters":{"level":0},"origins":[{
           "path":"grids/L0","access_roots":[{"type":"https","url":"https://example.test/","usage":"public-read"}]}]},
@@ -677,7 +679,7 @@ TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache iden
 
 TEST_CASE("OpenDataManifest parses samples and computes summary counts")
 {
-    const auto manifest = parseOpenDataManifest(kFixture, "fixture://metadata.json");
+    const auto manifest = vcr::catalog::parseOpenDataManifest(kFixture, "fixture://metadata.json");
 
     CHECK(manifest.manifestUrl == "fixture://metadata.json");
     REQUIRE(manifest.samples.size() == 1);
@@ -692,7 +694,7 @@ TEST_CASE("OpenDataManifest parses samples and computes summary counts")
     CHECK(sample->inkDetectionSegmentCount() == 1);
     CHECK(sample->properties.at("unknown_sample_field").get<int>() == 7);
     REQUIRE(sample->artifacts.size() == 1);
-    const auto* photo = preferredPhotoArtifact(*sample);
+    const auto* photo = vcr::catalog::preferredPhotoArtifact(*sample);
     REQUIRE(photo != nullptr);
     CHECK(photo->resolvedUrl ==
           "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0139/photos/PHerc0139_photo.jpg");
@@ -702,7 +704,7 @@ TEST_CASE("OpenDataManifest parses samples and computes summary counts")
 
 TEST_CASE("OpenDataManifest parses volumes and segment artifact availability")
 {
-    const auto manifest = parseOpenDataManifest(kFixture);
+    const auto manifest = vcr::catalog::parseOpenDataManifest(kFixture);
     const auto& sample = *manifest.findSample("PHerc0139");
 
     REQUIRE(sample.volumes.size() == 1);
@@ -716,7 +718,7 @@ TEST_CASE("OpenDataManifest parses volumes and segment artifact availability")
     REQUIRE(volume.detectorDistanceMm.has_value());
     CHECK(*volume.detectorDistanceMm == doctest::Approx(12.5));
 
-    const auto* volumeArtifact = preferredVolumeArtifact(volume);
+    const auto* volumeArtifact = vcr::catalog::preferredVolumeArtifact(volume);
     REQUIRE(volumeArtifact != nullptr);
     CHECK(volumeArtifact->sourcePath ==
           "s3://vesuvius-challenge-open-data/PHerc0139/volumes/vol1.zarr");
@@ -740,7 +742,7 @@ TEST_CASE("OpenDataManifest parses volumes and segment artifact availability")
 
 TEST_CASE("OpenDataManifest reads the live segment creation date shape")
 {
-    const auto manifest = parseOpenDataManifest(R"({
+    const auto manifest = vcr::catalog::parseOpenDataManifest(R"({
       "samples":{"sample":{"segments":{"segment":{
         "creation":{"date":"2026-06-02T20:44:01.955138Z"}
       }}}}
@@ -754,7 +756,7 @@ TEST_CASE("OpenDataManifest reads the live segment creation date shape")
 
 TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties or referenced scan")
 {
-    const auto manifest = parseOpenDataManifest(R"({
+    const auto manifest = vcr::catalog::parseOpenDataManifest(R"({
       "samples": {
         "sample-a": {
           "scans": {
@@ -810,9 +812,9 @@ TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties
     CHECK(*sample->scans.front().pixelSizeUm == doctest::Approx(2.403));
     REQUIRE(sample->volumes.size() == 2);
 
-    const auto byId = [&](const std::string& id) -> const OpenDataVolume* {
+    const auto byId = [&](const std::string& id) -> const vcr::catalog::OpenDataVolume* {
         const auto it = std::find_if(
-            sample->volumes.begin(), sample->volumes.end(), [&](const OpenDataVolume& volume) {
+            sample->volumes.begin(), sample->volumes.end(), [&](const vcr::catalog::OpenDataVolume& volume) {
                 return volume.id == id;
             });
         return it == sample->volumes.end() ? nullptr : &*it;
@@ -854,7 +856,7 @@ TEST_CASE("OpenDataManifest propagates catalog pixel size from volume properties
 
 TEST_CASE("OpenDataManifest parses exact sample-level volume transforms")
 {
-    const auto manifest = parseOpenDataManifest(R"({
+    const auto manifest = vcr::catalog::parseOpenDataManifest(R"({
       "metadata": {
         "samples": {
           "sample-a": {
@@ -895,7 +897,7 @@ TEST_CASE("OpenDataManifest parses exact sample-level volume transforms")
     CHECK(sample->volumeTransforms.front().transforms.front().toVolumeId == "vol-b");
     CHECK(sample->volumeTransforms.front().transforms.front().derivationPath == "vol-a-vol-b");
 
-    const auto forward = findSampleVolumeTransform(*sample, "vol-a", "vol-b");
+    const auto forward = vcr::catalog::findSampleVolumeTransform(*sample, "vol-a", "vol-b");
     REQUIRE(forward.has_value());
     CHECK((*forward)(0, 0) == doctest::Approx(0.5));
     CHECK((*forward)(0, 3) == doctest::Approx(10.0));
@@ -903,44 +905,44 @@ TEST_CASE("OpenDataManifest parses exact sample-level volume transforms")
     CHECK((*forward)(2, 3) == doctest::Approx(30.0));
     CHECK((*forward)(3, 3) == doctest::Approx(1.0));
 
-    CHECK_FALSE(findSampleVolumeTransform(*sample, "vol-b", "vol-a").has_value());
-    CHECK_FALSE(findSampleVolumeTransform(*sample, "vol-a", "vol-c").has_value());
-    CHECK_FALSE(findSampleVolumeTransform(*sample, "", "vol-b").has_value());
+    CHECK(vcr::catalog::findSampleVolumeTransform(*sample, "vol-b", "vol-a").has_value());
+    CHECK_FALSE(vcr::catalog::findSampleVolumeTransform(*sample, "vol-a", "vol-c").has_value());
+    CHECK_FALSE(vcr::catalog::findSampleVolumeTransform(*sample, "", "vol-b").has_value());
 }
 
 TEST_CASE("OpenDataManifest resolves public origins with the website rewrite table")
 {
-    CHECK(resolveOpenDataUrl("s3://vesuvius-challenge-open-data/a/b") ==
+    CHECK(vcr::catalog::resolveOpenDataUrl("s3://vesuvius-challenge-open-data/a/b") ==
           "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/a/b");
-    CHECK(resolveOpenDataUrl("s3://vesuvius-challenge/full-scrolls/x") ==
+    CHECK(vcr::catalog::resolveOpenDataUrl("s3://vesuvius-challenge/full-scrolls/x") ==
           "https://data.aws.ash2txt.org/samples/full-scrolls/x");
-    CHECK(joinOpenDataUrl("s3://vesuvius-challenge-open-data/", "/a/b") ==
+    CHECK(vcr::catalog::joinOpenDataUrl("s3://vesuvius-challenge-open-data/", "/a/b") ==
           "s3://vesuvius-challenge-open-data/a/b");
 
-    const auto manifest = parseOpenDataManifest(kFixture);
+    const auto manifest = vcr::catalog::parseOpenDataManifest(kFixture);
     const auto& segment = manifest.findSample("PHerc0139")->segments.front();
-    const auto* tifxyz = findArtifact(segment.artifacts, "tifxyz");
+    const auto* tifxyz = vcr::catalog::findArtifact(segment.artifacts, "tifxyz");
     REQUIRE(tifxyz != nullptr);
     CHECK(tifxyz->resolvedUrl ==
           "https://vesuvius-challenge-open-data.s3.us-east-1.amazonaws.com/PHerc0139/segments/20260311000000/tifxyz");
 
-    const auto* ink = findArtifact(segment.artifacts, "ink_detection");
+    const auto* ink = vcr::catalog::findArtifact(segment.artifacts, "ink_detection");
     REQUIRE(ink != nullptr);
     CHECK(ink->resolvedUrl == "https://example.test/data/PHerc0139/segments/20260311000000/ink.zarr");
 }
 
 TEST_CASE("OpenDataSampleProject attaches all supported zarr artifacts for a catalog volume")
 {
-    OpenDataSample sample;
+    vcr::catalog::OpenDataSample sample;
     sample.id = "PHerc0139";
 
-    OpenDataVolume volume;
+    vcr::catalog::OpenDataVolume volume;
     volume.id = "scan-volume";
     volume.dataFormat = "zarr";
     volume.pixelSizeUm = 7.91;
 
     auto artifact = [](std::string type, std::string url) {
-        OpenDataArtifact out;
+        vcr::catalog::OpenDataArtifact out;
         out.type = std::move(type);
         out.resolvedUrl = std::move(url);
         return out;
@@ -1022,12 +1024,12 @@ TEST_CASE("Project creation defaults to the shared autosave directory")
 
 TEST_CASE("Catalog source selection is independent of derived representations")
 {
-    OpenDataSample sample;
+    vcr::catalog::OpenDataSample sample;
     sample.id = "selection";
-    OpenDataVolume volume;
+    vcr::catalog::OpenDataVolume volume;
     volume.id = "v";
     volume.dataFormat = "zarr";
-    OpenDataArtifact source, prediction;
+    vcr::catalog::OpenDataArtifact source, prediction;
     source.type = "ome-zarr";
     source.resolvedUrl = "http://127.0.0.1:9/base.zarr";
     prediction.type = "surface-prediction-zarr";
@@ -1043,7 +1045,7 @@ TEST_CASE("Catalog source selection is independent of derived representations")
     attachOpenDataSampleVolumes(*empty, sample, &selection);
     CHECK(empty->volumeEntries().empty());
 
-    selection.representations = derivedRepresentations(sample);
+    selection.representations = vcr::catalog::derivedRepresentations(sample);
     auto derived = VolumePkg::newEmpty(options);
     attachOpenDataSampleVolumes(*derived, sample, &selection);
     REQUIRE(derived->volumeEntries().size() == 1);
@@ -1059,12 +1061,12 @@ TEST_CASE("Catalog source selection is independent of derived representations")
 
 TEST_CASE("Single catalog prediction attachment retains identity and validates its source level")
 {
-    OpenDataSample sample;
+    vcr::catalog::OpenDataSample sample;
     sample.id = "sample";
-    OpenDataVolume volume;
+    vcr::catalog::OpenDataVolume volume;
     volume.id = "scan";
     volume.pixelSizeUm = 2.4;
-    OpenDataArtifact source, prediction;
+    vcr::catalog::OpenDataArtifact source, prediction;
     source.type = "ome-zarr";
     source.resolvedUrl = "http://127.0.0.1:9/source.zarr";
     prediction.type = "surface-prediction-zarr";
@@ -1075,8 +1077,8 @@ TEST_CASE("Single catalog prediction attachment retains identity and validates i
     sample.volumes = {volume};
     OpenDataResourceSelection selection;
     selection.rawVolumeIds.emplace();
-    selection.representations = std::vector<OpenDataRepresentationRef>{
-        {0, 1, OpenDataRepresentationKind::Prediction}};
+    selection.representations = std::vector<vcr::catalog::OpenDataRepresentationRef>{
+        {0, 1, vcr::catalog::OpenDataRepresentationKind::Prediction}};
     vc::project::LoadOptions options;
     options.deferResolution = true;
     auto pkg = VolumePkg::newDetached(options);
@@ -1101,7 +1103,7 @@ TEST_CASE("Single catalog prediction attachment retains identity and validates i
 
 TEST_CASE("Selective catalog projects isolate cached projects and individual segments")
 {
-    auto manifest = parseOpenDataManifest(kFixture);
+    auto manifest = vcr::catalog::parseOpenDataManifest(kFixture);
     auto sample = *manifest.findSample("PHerc0139");
     const auto root = std::filesystem::current_path() /
         ("selective_catalog_test_" + std::to_string(vc::memmap::pid()));
@@ -1159,24 +1161,24 @@ TEST_CASE("Selective catalog projects isolate cached projects and individual seg
 
 TEST_CASE("OpenDataSampleProject prefers the volume sourcing the most segments")
 {
-    OpenDataSample sample;
+    vcr::catalog::OpenDataSample sample;
     sample.id = "PHerc0139";
 
     auto artifact = [](std::string url) {
-        OpenDataArtifact out;
+        vcr::catalog::OpenDataArtifact out;
         out.type = "zarr";
         out.resolvedUrl = std::move(url);
         return out;
     };
     auto volume = [&](std::string id) {
-        OpenDataVolume out;
+        vcr::catalog::OpenDataVolume out;
         out.id = std::move(id);
         out.dataFormat = "zarr";
         out.artifacts.push_back(artifact("http://127.0.0.1:9/" + out.id + ".zarr"));
         return out;
     };
     auto segment = [](std::string volumeId) {
-        OpenDataSegment out;
+        vcr::catalog::OpenDataSegment out;
         out.originalVolumeId = std::move(volumeId);
         return out;
     };
@@ -1199,7 +1201,7 @@ TEST_CASE("OpenDataSampleProject prefers the volume sourcing the most segments")
 
 TEST_CASE("OpenDataSampleProject saves and reuses cached volpkg json")
 {
-    OpenDataSample sample;
+    vcr::catalog::OpenDataSample sample;
     sample.id = "Sample With Spaces";
 
     const auto cacheRoot = std::filesystem::temp_directory_path() /
@@ -1233,12 +1235,12 @@ namespace {
 // A sample with a source volume, a published target and a third volume reached
 // by the sample's volume matrix; one segment authored on the source at 2x
 // downscale with one ink detection.
-OpenDataSample representationSample()
+vcr::catalog::OpenDataSample representationSample()
 {
-    OpenDataSample sample;
+    vcr::catalog::OpenDataSample sample;
     sample.id = "sample";
     for (const char* id : {"source", "target", "third"}) {
-        OpenDataVolume volume;
+        vcr::catalog::OpenDataVolume volume;
         volume.id = id;
         sample.volumes.push_back(volume);
     }
@@ -1249,22 +1251,25 @@ OpenDataSample representationSample()
             {"matrix", {{1, 0, 0, 10}, {0, 1, 0, 20}, {0, 0, 1, 30}}},
         }})},
     }});
-    OpenDataSegment segment;
+    sample.volumeTransforms = vcr::catalog::parseOpenDataManifest(
+        nlohmann::json{{"samples", {{"sample", {{"properties", sample.properties}}}}}}.dump())
+        .samples.front().volumeTransforms;
+    vcr::catalog::OpenDataSegment segment;
     segment.id = "segment";
     segment.longId = "sample-segment";
     segment.suffix = "w001";
     segment.originalVolumeId = "source";
     segment.properties["original_volume_downscale"] = 2;
-    OpenDataArtifact authored;
+    vcr::catalog::OpenDataArtifact authored;
     authored.type = "tifxyz-flattened";
     authored.resolvedUrl = "https://example.test/authored";
     segment.artifacts.push_back(authored);
-    OpenDataArtifact published;
+    vcr::catalog::OpenDataArtifact published;
     published.type = "tifxyz-transformed";
     published.resolvedUrl = "https://example.test/published";
     published.targetVolumeId = "target";
     segment.artifacts.push_back(published);
-    OpenDataArtifact ink;
+    vcr::catalog::OpenDataArtifact ink;
     ink.type = "ink_detection";
     ink.resolvedUrl = "https://example.test/ink.png";
     segment.artifacts.push_back(ink);
@@ -1282,26 +1287,20 @@ std::filesystem::path freshRoot(const std::string& tag)
 
 } // namespace
 
-TEST_CASE("Open Data segments are canonical, published and generated representations")
+TEST_CASE("Open Data segments retain canonical and published representations")
 {
     auto sample = representationSample();
     auto& segment = sample.segments.front();
     const auto representations = classifyOpenDataSegmentRepresentations(sample, segment);
-    REQUIRE(representations.size() == 3);
+    REQUIRE(representations.size() == 2);
     CHECK(representations[0].kind == OpenDataSegmentRepresentationKind::DerivedNative);
     CHECK(representations[0].canonicalSource);
     CHECK(representations[0].coordinateSpace == "sample/source@L0");
     CHECK(representations[0].artifact == &segment.artifacts[0]);
     CHECK(representations[1].kind == OpenDataSegmentRepresentationKind::PublishedTransformed);
     CHECK(representations[1].coordinateVolumeId == "target");
-    CHECK(representations[2].kind == OpenDataSegmentRepresentationKind::Generated);
-    CHECK(representations[2].coordinateVolumeId == "third");
-    CHECK(representations[2].sourceRepresentationId == representations[0].representationId);
-    REQUIRE(representations[2].matrix);
-    CHECK((*representations[2].matrix)(0, 3) == doctest::Approx(10));
-
     // A published representation of the source volume wins over the authored one.
-    OpenDataArtifact publishedSource = segment.artifacts[1];
+    vcr::catalog::OpenDataArtifact publishedSource = segment.artifacts[1];
     publishedSource.resolvedUrl = "https://example.test/published-source";
     publishedSource.targetVolumeId = "source";
     segment.artifacts.push_back(publishedSource);
@@ -1312,7 +1311,7 @@ TEST_CASE("Open Data segments are canonical, published and generated representat
     CHECK(withPublishedSource[0].artifact == &segment.artifacts.back());
 
     // Artifacts targeting volumes outside the sample are ignored.
-    OpenDataArtifact elsewhere = segment.artifacts[1];
+    vcr::catalog::OpenDataArtifact elsewhere = segment.artifacts[1];
     elsewhere.targetVolumeId = "missing";
     segment.artifacts.push_back(elsewhere);
     CHECK(classifyOpenDataSegmentRepresentations(sample, segment).size() == withPublishedSource.size());
@@ -1324,15 +1323,14 @@ TEST_CASE("Open Data import records representations as catalog surfaces bound to
     const auto sample = representationSample();
     const auto root = freshRoot("import");
     const auto imported = importSampleSurfaces(root, sample);
-    CHECK(imported.representations == 3);
-    CHECK(imported.added == 3);
+    CHECK(imported.representations == 2);
+    CHECK(imported.added == 2);
     const auto store = surfaceStorePath(root, "sample");
     REQUIRE(std::filesystem::exists(store));
 
     const auto representations = classifyOpenDataSegmentRepresentations(sample, sample.segments.front());
     const auto native = surfaceUuidForRepresentation(representations[0].representationId);
     const auto published = surfaceUuidForRepresentation(representations[1].representationId);
-    const auto generated = surfaceUuidForRepresentation(representations[2].representationId);
     CHECK(native == surfaceUuidForRepresentation(representations[0].representationId));
     {
         vo::OpenOptions options;
@@ -1355,12 +1353,6 @@ TEST_CASE("Open Data import records representations as catalog surfaces bound to
 
         const auto publishedMeta = nlohmann::json::parse(db.objectByUuid(read, published)->meta);
         CHECK(vo::geometryScaleToVolume(publishedMeta, "target") == doctest::Approx(1.0));
-        const auto generatedRecord = db.objectByUuid(read, generated);
-        REQUIRE(generatedRecord);
-        CHECK(generatedRecord->storageKind != "url");
-        const auto generate = nlohmann::json::parse(generatedRecord->meta).at("open_data").at("generate");
-        CHECK(generate.at("source_surface") == native);
-        CHECK(generate.at("target_volume_id") == "third");
         CHECK_FALSE(db.currentGeometry(read, native));
     }
     CHECK(surfaceStateForSegment(root, sample, sample.segments.front()) == SurfaceState::Remote);
@@ -1369,54 +1361,6 @@ TEST_CASE("Open Data import records representations as catalog surfaces bound to
     const auto again = importSampleSurfaces(root, sample);
     CHECK(again.added == 0);
     CHECK(again.updated == 0);
-    std::filesystem::remove_all(root);
-}
-
-TEST_CASE("Generated Open Data surfaces are computed from their source when first opened")
-{
-    namespace vo = vc::objects;
-    const auto sample = representationSample();
-    const auto root = freshRoot("generate");
-    (void)importSampleSurfaces(root, sample);
-    const auto store = surfaceStorePath(root, "sample");
-    const auto representations = classifyOpenDataSegmentRepresentations(sample, sample.segments.front());
-    const auto native = surfaceUuidForRepresentation(representations[0].representationId);
-    const auto generated = surfaceUuidForRepresentation(representations[2].representationId);
-
-    // The canonical source as the store holds it once fetched (authored at 2x downscale).
-    {
-        cv::Mat_<cv::Vec3f> points(2, 2);
-        points.setTo(cv::Vec3f(1, 2, 3));
-        QuadSurface authored(points, cv::Vec2f(1, 1));
-        vo::OpenOptions options;
-        options.author = "test";
-        auto db = vo::ObjectStore::open(store, options);
-        std::string revision;
-        {
-            auto read = db.read();
-            revision = db.currentObjectRevision(read, native)->uuid;
-        }
-        auto txn = db.write({{native, revision}});
-        db.putGeometry(txn, native, quad_surface_geometry(authored));
-        txn.commit();
-    }
-    CHECK(surfaceStateForSegment(root, sample, sample.segments.front()) == SurfaceState::Stored);
-    CHECK_FALSE(surfaceHasGeometry(store, generated));
-
-    materializeSurface(store, generated);
-    REQUIRE(surfaceHasGeometry(store, generated));
-    {
-        vo::OpenOptions options;
-        options.readOnly = true;
-        auto db = vo::ObjectStore::open(store, options);
-        auto read = db.read();
-        const auto surface = load_quad_from_store(db, read, generated);
-        // Source L0 voxels (2x the authored coordinates) moved by the matrix.
-        CHECK((*surface->rawPointsPtr())(0, 0)[0] == doctest::Approx(2 + 10));
-        CHECK((*surface->rawPointsPtr())(0, 0)[2] == doctest::Approx(6 + 30));
-        CHECK(vo::geometryScaleToVolume(nlohmann::json::parse(db.objectByUuid(read, generated)->meta), "third") ==
-              doctest::Approx(1.0));
-    }
     std::filesystem::remove_all(root);
 }
 

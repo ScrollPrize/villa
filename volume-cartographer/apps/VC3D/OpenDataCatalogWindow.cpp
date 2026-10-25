@@ -180,7 +180,7 @@ QString formatByteSize(std::uint64_t bytes)
 
 QString normalGridsStatusDisplay(const std::filesystem::path& remoteRoot,
                                  const std::string& sampleId,
-                                 const OpenDataVolume& volume)
+                                 const vcr::catalog::OpenDataVolume& volume)
 {
     const auto state = normalGridsCacheState(remoteRoot, sampleId, volume);
     if (!state.hasArtifact) {
@@ -221,7 +221,7 @@ struct SampleCacheSummary {
 };
 
 SampleCacheSummary sampleCacheSummary(const std::filesystem::path& remoteCacheRoot,
-                                      const OpenDataSample& sample)
+                                      const vcr::catalog::OpenDataSample& sample)
 {
     SampleCacheSummary summary;
     for (const auto& segment : sample.segments) {
@@ -275,11 +275,11 @@ QTableWidgetItem* numericItem(qulonglong value)
     return tableItem;
 }
 
-QString firstArtifactUrl(const std::vector<OpenDataArtifact>& artifacts, const QString& preferredType = {})
+QString firstArtifactUrl(const std::vector<vcr::catalog::OpenDataArtifact>& artifacts, const QString& preferredType = {})
 {
-    const OpenDataArtifact* artifact = nullptr;
+    const vcr::catalog::OpenDataArtifact* artifact = nullptr;
     if (!preferredType.isEmpty()) {
-        artifact = findArtifact(artifacts, preferredType.toStdString());
+        artifact = vcr::catalog::findArtifact(artifacts, preferredType.toStdString());
     }
     if (!artifact && !artifacts.empty()) {
         artifact = &artifacts.front();
@@ -290,14 +290,14 @@ QString firstArtifactUrl(const std::vector<OpenDataArtifact>& artifacts, const Q
     return qstr(artifact->resolvedUrl.empty() ? artifact->sourcePath : artifact->resolvedUrl);
 }
 
-QString artifactUrl(const OpenDataArtifact& artifact)
+QString artifactUrl(const vcr::catalog::OpenDataArtifact& artifact)
 {
     return qstr(artifact.resolvedUrl.empty() ? artifact.sourcePath : artifact.resolvedUrl);
 }
 
-QString volumeSourceFilename(const OpenDataVolume& volume)
+QString volumeSourceFilename(const vcr::catalog::OpenDataVolume& volume)
 {
-    const auto* artifact = findArtifact(volume.artifacts, "ome-zarr");
+    const auto* artifact = vcr::catalog::findArtifact(volume.artifacts, "ome-zarr");
     QStringList filenames;
     if (artifact) {
         for (const auto& origin : artifact->origins) {
@@ -313,7 +313,7 @@ QString volumeSourceFilename(const OpenDataVolume& volume)
     return filenames.isEmpty() ? QStringLiteral("—") : filenames.join(QStringLiteral("\n"));
 }
 
-QString predictionType(const OpenDataArtifact& artifact)
+QString predictionType(const vcr::catalog::OpenDataArtifact& artifact)
 {
     const auto parts = qstr(artifact.sourcePath).split('/', Qt::SkipEmptyParts);
     const auto index = parts.indexOf(QStringLiteral("predictions"));
@@ -321,31 +321,31 @@ QString predictionType(const OpenDataArtifact& artifact)
         ? parts[index + 1] : QStringLiteral("—");
 }
 
-bool canAttachRepresentation(const OpenDataArtifact& artifact)
+bool canAttachRepresentation(const vcr::catalog::OpenDataArtifact& artifact)
 {
     if (!artifact.hasResolvedUrl()) return false;
-    const auto kind = classifyDerivedRepresentation(artifact);
+    const auto kind = vcr::catalog::classifyDerivedRepresentation(artifact);
     if (!kind) return false;
-    if (*kind == OpenDataRepresentationKind::NormalGrids &&
+    if (*kind == vcr::catalog::OpenDataRepresentationKind::NormalGrids &&
         artifact.levelParameterPresent && !artifact.sourceCoordinateLevel)
         return false;
-    if (*kind != OpenDataRepresentationKind::Prediction) return true;
+    if (*kind != vcr::catalog::OpenDataRepresentationKind::Prediction) return true;
     // Prediction artifacts are not necessarily volumes (e.g. meshes).
     const auto type = qstr(artifact.type).toLower().replace('_', '-');
     return type.endsWith("-zarr");
 }
 
-QString representationCoordinates(const OpenDataArtifact& artifact,
-                                  OpenDataRepresentationKind kind)
+QString representationCoordinates(const vcr::catalog::OpenDataArtifact& artifact,
+                                  vcr::catalog::OpenDataRepresentationKind kind)
 {
     if (artifact.sourceCoordinateLevel)
         return QStringLiteral("L%1").arg(*artifact.sourceCoordinateLevel);
-    if (kind == OpenDataRepresentationKind::Lasagna)
+    if (kind == vcr::catalog::OpenDataRepresentationKind::Lasagna)
         return QObject::tr("Base L0 (shape matched)");
     return QObject::tr("Unspecified");
 }
 
-QString representationParameters(const OpenDataArtifact& artifact)
+QString representationParameters(const vcr::catalog::OpenDataArtifact& artifact)
 {
     nlohmann::json details = artifact.parameters;
     if (!details.is_object()) details = nlohmann::json::object();
@@ -355,7 +355,7 @@ QString representationParameters(const OpenDataArtifact& artifact)
 }
 
 QStringList volumeCells(const std::filesystem::path& remoteRoot,
-                        const OpenDataSample& sample, const OpenDataVolume& volume)
+                        const vcr::catalog::OpenDataSample& sample, const vcr::catalog::OpenDataVolume& volume)
 {
     return {qstr(volume.id), qstr(volume.scanId), qstr(volume.suffix),
             optionalNumber(volume.pixelSizeUm), optionalNumber(volume.energyKeV, 'f', 1),
@@ -364,8 +364,8 @@ QStringList volumeCells(const std::filesystem::path& remoteRoot,
             volumeSourceFilename(volume)};
 }
 
-QStringList representationCells(const OpenDataVolume& volume, const OpenDataArtifact& artifact,
-                                OpenDataRepresentationKind kind)
+QStringList representationCells(const vcr::catalog::OpenDataVolume& volume, const vcr::catalog::OpenDataArtifact& artifact,
+                                vcr::catalog::OpenDataRepresentationKind kind)
 {
     return {qstr(volume.id), predictionType(artifact), qstr(artifact.type),
             qstr(artifact.modelId.value_or(std::string{})), representationCoordinates(artifact, kind),
@@ -375,7 +375,7 @@ QStringList representationCells(const OpenDataVolume& volume, const OpenDataArti
 }
 
 QStringList segmentCells(const std::filesystem::path& remoteRoot,
-                         const OpenDataSample& sample, const OpenDataSegment& segment)
+                         const vcr::catalog::OpenDataSample& sample, const vcr::catalog::OpenDataSegment& segment)
 {
     return {qstr(segment.id), qstr(segment.suffix), qstr(segment.originalVolumeId),
             optionalInt(segment.width), optionalInt(segment.height), yesNo(segment.hasTifxyz()),
@@ -469,7 +469,7 @@ OpenDataCatalogWindow::OpenDataCatalogWindow(QWidget* parent)
     reloadManifest();
 }
 
-OpenDataCatalogWindow::OpenDataCatalogWindow(const OpenDataManifest& manifest, QWidget* parent)
+OpenDataCatalogWindow::OpenDataCatalogWindow(const vcr::catalog::OpenDataManifest& manifest, QWidget* parent)
     : QDialog(parent)
 {
     buildUi();
@@ -488,7 +488,7 @@ OpenDataCatalogWindow::~OpenDataCatalogWindow()
     }
 }
 
-void OpenDataCatalogWindow::setOpenSampleHandler(std::function<bool(const OpenDataSample&)> handler)
+void OpenDataCatalogWindow::setOpenSampleHandler(std::function<bool(const vcr::catalog::OpenDataSample&)> handler)
 {
     _openSampleHandler = std::move(handler);
     updateActionButtons();
@@ -577,23 +577,23 @@ void OpenDataCatalogWindow::createSelectedProject()
         return item;
     };
     std::vector<std::pair<QTreeWidgetItem*, std::string>> volumes, segments;
-    std::vector<std::pair<QTreeWidgetItem*, OpenDataRepresentationRef>> representations;
+    std::vector<std::pair<QTreeWidgetItem*, vcr::catalog::OpenDataRepresentationRef>> representations;
     auto* sourceGroup = group(volumeTree, tr("Source volumes"));
     for (std::size_t row = 0; row < sample.volumes.size(); ++row) {
         const auto& volume = sample.volumes[row];
         if (std::none_of(volume.artifacts.begin(), volume.artifacts.end(),
-                        [](const auto& a) { return !classifyDerivedRepresentation(a) && a.hasResolvedUrl(); }))
+                        [](const auto& a) { return !vcr::catalog::classifyDerivedRepresentation(a) && a.hasResolvedUrl(); }))
             continue;
         volumes.emplace_back(leaf(sourceGroup, volumeCells(remoteRoot, sample, volume)), volume.id);
     }
     QMap<QString, QTreeWidgetItem*> groups;
-    const auto refs = derivedRepresentations(sample);
+    const auto refs = vcr::catalog::derivedRepresentations(sample);
     for (std::size_t row = 0; row < refs.size(); ++row) {
         const auto& ref = refs[row];
         const auto& volume = sample.volumes.at(ref.volumeIndex);
         const auto& artifact = volume.artifacts.at(ref.artifactIndex);
-        const QString type = QString::fromUtf8(representationKindName(ref.kind).data(),
-                                              int(representationKindName(ref.kind).size()));
+        const QString type = QString::fromUtf8(vcr::catalog::representationKindName(ref.kind).data(),
+                                              int(vcr::catalog::representationKindName(ref.kind).size()));
         const QString prediction = predictionType(artifact);
         const QString label = prediction.isEmpty() ? type : type + " / " + prediction;
         if (!groups.contains(label)) groups[label] = group(representationTree, label);
@@ -915,10 +915,10 @@ void OpenDataCatalogWindow::buildUi()
     connect(_attachRepresentationButton, &QPushButton::clicked, this, [this]() {
         const auto* artifact = selectedRepresentationArtifact();
         if (_manifestRefreshPending || !artifact || !canAttachRepresentation(*artifact)) return;
-        const auto kind = *classifyDerivedRepresentation(*artifact);
-        if (kind == OpenDataRepresentationKind::Lasagna) {
+        const auto kind = *vcr::catalog::classifyDerivedRepresentation(*artifact);
+        if (kind == vcr::catalog::OpenDataRepresentationKind::Lasagna) {
             emit attachLasagnaRequested(artifactUrl(*artifact), predictionType(*artifact) == QStringLiteral("fibers"));
-        } else if (kind == OpenDataRepresentationKind::NormalGrids) {
+        } else if (kind == vcr::catalog::OpenDataRepresentationKind::NormalGrids) {
             const auto* sample = selectedSample();
             const auto* item = _representationsTable->item(_representationsTable->currentRow(), 0);
             const auto volumeIndex = item->data(kRepresentationVolumeIndexRole).toULongLong();
@@ -931,7 +931,7 @@ void OpenDataCatalogWindow::buildUi()
             const auto* item = _representationsTable->item(_representationsTable->currentRow(), 0);
             OpenDataResourceSelection selection;
             selection.rawVolumeIds.emplace();
-            selection.representations = std::vector<OpenDataRepresentationRef>{{
+            selection.representations = std::vector<vcr::catalog::OpenDataRepresentationRef>{{
                 item->data(kRepresentationVolumeIndexRole).toULongLong(),
                 item->data(kRepresentationArtifactIndexRole).toULongLong(), kind}};
             const auto sample = *selectedSample();
@@ -980,18 +980,16 @@ void OpenDataCatalogWindow::reloadManifest()
     connect(_fetchWatcher, &QFutureWatcher<ManifestLoadResult>::finished,
             this, &OpenDataCatalogWindow::onFetchFinished);
 
-    const auto manifestUrl = std::string(kDefaultManifestUrl);
+    const auto manifestUrl = std::string(vcr::catalog::kDefaultManifestUrl);
     _fetchWatcher->setFuture(QtConcurrent::run([manifestUrl]() {
         ManifestLoadResult result;
         result.sourceLabel = QString::fromStdString(manifestUrl);
         try {
-            const auto body = vc::httpGetString(manifestUrl);
-            if (body.empty()) {
-                result.error = QStringLiteral("Open-data manifest fetch returned an empty response.");
-                return result;
-            }
-            result.jsonText = QString::fromStdString(body);
-            result.manifest = parseOpenDataManifest(body, manifestUrl);
+            auto loaded = vcr::catalog::loadCatalog(manifestUrl,
+                {cachedOpenDataManifestPath(), true});
+            result.manifest = std::move(loaded.manifest);
+            if (loaded.fromCache) result.sourceLabel += QStringLiteral(" (cached)");
+            if (!loaded.warning.empty()) result.sourceLabel += QStringLiteral(": ") + QString::fromStdString(loaded.warning);
         } catch (const std::exception& e) {
             result.error = QString::fromUtf8(e.what());
         } catch (...) {
@@ -1018,7 +1016,6 @@ void OpenDataCatalogWindow::onFetchFinished()
         return;
     }
 
-    persistFetchedManifest(result);
     applyManifest(result.manifest, result.sourceLabel, false);
 }
 
@@ -1029,14 +1026,14 @@ void OpenDataCatalogWindow::loadCachedManifestIfAvailable()
         return;
     }
     try {
-        auto manifest = loadOpenDataManifestFile(path, std::string(kDefaultManifestUrl));
+        auto manifest = vcr::catalog::loadOpenDataManifestFile(path, std::string(vcr::catalog::kDefaultManifestUrl));
         applyManifest(std::move(manifest), qstr(path.string()), true);
     } catch (const std::exception& e) {
         setStatus(manifestJsonError(e));
     }
 }
 
-void OpenDataCatalogWindow::applyManifest(OpenDataManifest manifest, QString sourceLabel, bool fromCache)
+void OpenDataCatalogWindow::applyManifest(vcr::catalog::OpenDataManifest manifest, QString sourceLabel, bool fromCache)
 {
     _manifest = std::move(manifest);
     populateSamples();
@@ -1065,39 +1062,6 @@ void OpenDataCatalogWindow::setLoading(bool loading)
             : tr("Fetching open-data catalog..."));
     }
     updateActionButtons();
-}
-
-void OpenDataCatalogWindow::persistFetchedManifest(const ManifestLoadResult& result) const
-{
-    if (result.jsonText.isEmpty()) {
-        return;
-    }
-
-    const auto root = cacheRoot();
-    std::error_code ec;
-    std::filesystem::create_directories(root, ec);
-    if (ec) {
-        return;
-    }
-
-    QSaveFile manifestFile(QString::fromStdString(cachedManifestPath().string()));
-    if (manifestFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        manifestFile.write(result.jsonText.toUtf8());
-        manifestFile.commit();
-    }
-
-    nlohmann::json meta = {
-        {"manifest_url", std::string(kDefaultManifestUrl)},
-        {"fetched_at_utc", QDateTime::currentDateTimeUtc().toString(Qt::ISODate).toStdString()},
-        {"sample_count", result.manifest.samples.size()},
-        {"model_count", result.manifest.models.size()}
-    };
-    QSaveFile metadataFile(QString::fromStdString(cacheMetadataPath().string()));
-    if (metadataFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-        const auto bytes = QByteArray::fromStdString(meta.dump(2));
-        metadataFile.write(bytes);
-        metadataFile.commit();
-    }
 }
 
 void OpenDataCatalogWindow::populateSamples()
@@ -1166,7 +1130,7 @@ void OpenDataCatalogWindow::updateSelectedSample()
     populateDetails(selectedSample());
 }
 
-void OpenDataCatalogWindow::populateDetails(const OpenDataSample* sample)
+void OpenDataCatalogWindow::populateDetails(const vcr::catalog::OpenDataSample* sample)
 {
     if (!sample) {
         clearDetails();
@@ -1175,7 +1139,7 @@ void OpenDataCatalogWindow::populateDetails(const OpenDataSample* sample)
 
     const auto remoteRoot = vc3d::remoteCachePathFs();
     const auto cacheSummary = sampleCacheSummary(remoteRoot, *sample);
-    const auto representations = derivedRepresentations(*sample);
+    const auto representations = vcr::catalog::derivedRepresentations(*sample);
     _overviewLabel->setText(
         tr("<b>%1</b><br>Type: %2<br>Scans: %3<br>Volumes: %4<br>Segments: %5<br>"
            "Representations: %6<br>TIFXYZ segments: %7<br>Ink detections: %8<br>Photos: %9<br>"
@@ -1295,10 +1259,10 @@ void OpenDataCatalogWindow::refreshSelectedSampleCacheStatus()
     populateDetails(sample);
 }
 
-void OpenDataCatalogWindow::loadOverviewPhoto(const OpenDataSample& sample)
+void OpenDataCatalogWindow::loadOverviewPhoto(const vcr::catalog::OpenDataSample& sample)
 {
     _pendingPhotoSampleId = qstr(sample.id);
-    const auto* artifact = preferredPhotoArtifact(sample);
+    const auto* artifact = vcr::catalog::preferredPhotoArtifact(sample);
     if (!artifact) {
         if (_overviewPhotoLabel) {
             static_cast<OverviewPhotoLabel*>(_overviewPhotoLabel)->clearSourceImage();
@@ -1398,7 +1362,7 @@ void OpenDataCatalogWindow::setOverviewPhotoImage(const QImage& image)
     _overviewPhotoLabel->show();
 }
 
-const OpenDataSample* OpenDataCatalogWindow::selectedSample() const
+const vcr::catalog::OpenDataSample* OpenDataCatalogWindow::selectedSample() const
 {
     if (!_manifest || !_sampleTable || !_sampleTable->currentItem()) {
         return nullptr;
@@ -1415,7 +1379,7 @@ const OpenDataSample* OpenDataCatalogWindow::selectedSample() const
     return &_manifest->samples[static_cast<std::size_t>(sampleIndex)];
 }
 
-const OpenDataVolume* OpenDataCatalogWindow::selectedVolume() const
+const vcr::catalog::OpenDataVolume* OpenDataCatalogWindow::selectedVolume() const
 {
     const auto* sample = selectedSample();
     if (!sample || !_volumesTable || _volumesTable->currentRow() < 0) {
@@ -1433,7 +1397,7 @@ const OpenDataVolume* OpenDataCatalogWindow::selectedVolume() const
     return &sample->volumes[static_cast<std::size_t>(volumeIndex)];
 }
 
-const OpenDataArtifact* OpenDataCatalogWindow::selectedRepresentationArtifact() const
+const vcr::catalog::OpenDataArtifact* OpenDataCatalogWindow::selectedRepresentationArtifact() const
 {
     const auto* sample = selectedSample();
     if (!sample || !_representationsTable ||
@@ -1454,7 +1418,7 @@ const OpenDataArtifact* OpenDataCatalogWindow::selectedRepresentationArtifact() 
     return &sample->volumes[volumeIndex].artifacts[artifactIndex];
 }
 
-const OpenDataSegment* OpenDataCatalogWindow::selectedSegment() const
+const vcr::catalog::OpenDataSegment* OpenDataCatalogWindow::selectedSegment() const
 {
     const auto* sample = selectedSample();
     if (!sample || !_segmentsTable || _segmentsTable->currentRow() < 0) {
@@ -1478,7 +1442,7 @@ QString OpenDataCatalogWindow::selectedVolumeUrl() const
     if (!volume) {
         return {};
     }
-    const auto* artifact = preferredVolumeArtifact(*volume);
+    const auto* artifact = vcr::catalog::preferredVolumeArtifact(*volume);
     if (!artifact) {
         return {};
     }
@@ -1497,7 +1461,7 @@ QString OpenDataCatalogWindow::selectedSegmentUrl() const
     if (!segment) {
         return {};
     }
-    const auto* artifact = preferredTifxyzArtifact(*segment);
+    const auto* artifact = vcr::catalog::preferredTifxyzArtifact(*segment);
     if (!artifact) {
         return firstArtifactUrl(segment->artifacts);
     }
@@ -1513,7 +1477,7 @@ void OpenDataCatalogWindow::updateActionButtons()
     if (_attachRepresentationButton) {
         _attachRepresentationButton->setEnabled(manifestReady && representation &&
             canAttachRepresentation(*representation) &&
-            (classifyDerivedRepresentation(*representation) != OpenDataRepresentationKind::Prediction ||
+            (vcr::catalog::classifyDerivedRepresentation(*representation) != vcr::catalog::OpenDataRepresentationKind::Prediction ||
              bool(_attachPredictionHandler)));
     }
     const bool hasSegmentUrl = !selectedSegmentUrl().isEmpty();
@@ -1850,11 +1814,6 @@ std::filesystem::path OpenDataCatalogWindow::cacheRoot() const
 std::filesystem::path OpenDataCatalogWindow::cachedManifestPath() const
 {
     return vc3d::opendata::cachedOpenDataManifestPath();
-}
-
-std::filesystem::path OpenDataCatalogWindow::cacheMetadataPath() const
-{
-    return cacheRoot() / "metadata.cache.json";
 }
 
 } // namespace vc3d::opendata

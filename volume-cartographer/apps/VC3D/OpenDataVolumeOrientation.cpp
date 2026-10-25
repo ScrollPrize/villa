@@ -59,7 +59,7 @@ std::string catalogVolumeOfCoordinateSpace(std::string_view coordinateSpace)
     return ids->first + '/' + ids->second;
 }
 
-VolumeOrientation volumeOrientationOf(const OpenDataVolume& volume)
+VolumeOrientation volumeOrientationOf(const vcr::catalog::OpenDataVolume& volume)
 {
     VolumeOrientation orientation;
     orientation.zTopToBottom =
@@ -69,15 +69,15 @@ VolumeOrientation volumeOrientationOf(const OpenDataVolume& volume)
     return orientation;
 }
 
-std::optional<VolumeOrientation> findVolumeOrientation(const OpenDataManifest& manifest,
+std::optional<VolumeOrientation> findVolumeOrientation(const vcr::catalog::OpenDataManifest& manifest,
                                                        std::string_view sampleId,
                                                        std::string_view volumeId)
 {
-    const OpenDataSample* sample = manifest.findSample(sampleId);
+    const vcr::catalog::OpenDataSample* sample = manifest.findSample(sampleId);
     if (sample == nullptr) {
         return std::nullopt;
     }
-    for (const OpenDataVolume& volume : sample->volumes) {
+    for (const vcr::catalog::OpenDataVolume& volume : sample->volumes) {
         if (volume.id == volumeId) {
             return volumeOrientationOf(volume);
         }
@@ -169,7 +169,7 @@ CatalogVolumeOrientationLookup::CatalogSense CatalogVolumeOrientationLookup::res
         std::optional<VolumeOrientation> value;
         if (token) {
             try {
-                value = findVolumeOrientation(loadOpenDataManifestFile(_manifestPath),
+                value = findVolumeOrientation(vcr::catalog::loadOpenDataManifestFile(_manifestPath),
                                               ids->first, ids->second);
             } catch (...) {
                 value = std::nullopt;

@@ -16,24 +16,24 @@
 
 namespace {
 
-QString representationKindToJson(vc3d::opendata::OpenDataRepresentationKind kind)
+QString representationKindToJson(vcr::catalog::OpenDataRepresentationKind kind)
 {
     switch (kind) {
-    case vc3d::opendata::OpenDataRepresentationKind::NormalGrids: return QStringLiteral("normal_grids");
-    case vc3d::opendata::OpenDataRepresentationKind::Lasagna:     return QStringLiteral("lasagna");
-    case vc3d::opendata::OpenDataRepresentationKind::Prediction:  return QStringLiteral("prediction");
+    case vcr::catalog::OpenDataRepresentationKind::NormalGrids: return QStringLiteral("normal_grids");
+    case vcr::catalog::OpenDataRepresentationKind::Lasagna:     return QStringLiteral("lasagna");
+    case vcr::catalog::OpenDataRepresentationKind::Prediction:  return QStringLiteral("prediction");
     }
     return QStringLiteral("prediction");
 }
-std::optional<vc3d::opendata::OpenDataRepresentationKind>
+std::optional<vcr::catalog::OpenDataRepresentationKind>
 representationKindFromJson(const QString& s)
 {
     if (s == QLatin1String("normal_grids"))
-        return vc3d::opendata::OpenDataRepresentationKind::NormalGrids;
+        return vcr::catalog::OpenDataRepresentationKind::NormalGrids;
     if (s == QLatin1String("lasagna"))
-        return vc3d::opendata::OpenDataRepresentationKind::Lasagna;
+        return vcr::catalog::OpenDataRepresentationKind::Lasagna;
     if (s == QLatin1String("prediction"))
-        return vc3d::opendata::OpenDataRepresentationKind::Prediction;
+        return vcr::catalog::OpenDataRepresentationKind::Prediction;
     return std::nullopt;
 }
 
@@ -56,13 +56,13 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
 
     // Resolve the sample first so we can distinguish "unknown sample" (-32007)
     // from "manifest unavailable" / "open failed" (-32005).
-    const vc3d::opendata::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
+    const vcr::catalog::OpenDataManifest* manifest = _window->cachedOpenDataManifest();
     if (!manifest) {
         QJsonObject data;
         data["detail"] = "Open Data manifest is unavailable";
         throw AgentBridgeError{-32005, "Manifest fetch failed", data};
     }
-    const vc3d::opendata::OpenDataSample* sample =
+    const vcr::catalog::OpenDataSample* sample =
         manifest->findSample(sampleId.toStdString());
     if (!sample) {
         QJsonObject data;
@@ -121,11 +121,11 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
         }
 
         // representationRefs axis. Each "vi:ai" must name a real derived
-        // representation of the sample (from derivedRepresentations()).
+        // representation of the sample (from vcr::catalog::derivedRepresentations()).
         if (res.contains("representationRefs")) {
             const QJsonValue refsv = res.value("representationRefs");
-            const auto derived = vc3d::opendata::derivedRepresentations(*sample);
-            std::vector<vc3d::opendata::OpenDataRepresentationRef> refs;
+            const auto derived = vcr::catalog::derivedRepresentations(*sample);
+            std::vector<vcr::catalog::OpenDataRepresentationRef> refs;
             for (const QJsonValue& rv : refsv.toArray()) {
                 const QString refStr = rv.toString();
                 const auto reject = [&]() {
@@ -144,7 +144,7 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
                 if (!okVi || !okAi)
                     reject();
                 const auto match = std::find_if(derived.begin(), derived.end(),
-                    [&](const vc3d::opendata::OpenDataRepresentationRef& r) {
+                    [&](const vcr::catalog::OpenDataRepresentationRef& r) {
                         return r.volumeIndex == vi && r.artifactIndex == ai;
                     });
                 if (match == derived.end())
@@ -157,7 +157,7 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
         // kinds axis.
         if (res.contains("kinds")) {
             const QJsonValue kindsv = res.value("kinds");
-            std::vector<vc3d::opendata::OpenDataRepresentationKind> kinds;
+            std::vector<vcr::catalog::OpenDataRepresentationKind> kinds;
             for (const QJsonValue& kv : kindsv.toArray()) {
                 const QString ks = kv.toString();
                 const auto kind = representationKindFromJson(ks);
@@ -254,7 +254,7 @@ QJsonObject AgentBridgeServer::handleCatalogOpenSample(const QJsonValue& params)
 
 QJsonObject AgentBridgeServer::withOpenDataManifest(
     bool refresh,
-    const std::function<QJsonObject(const vc3d::opendata::OpenDataManifest&)>& build)
+    const std::function<QJsonObject(const vcr::catalog::OpenDataManifest&)>& build)
 {
     if (!_window) {
         QJsonObject data;
@@ -263,7 +263,7 @@ QJsonObject AgentBridgeServer::withOpenDataManifest(
     }
 
     if (!refresh) {
-        if (const vc3d::opendata::OpenDataManifest* cached =
+        if (const vcr::catalog::OpenDataManifest* cached =
                 _window->cachedOpenDataManifest()) {
             return build(*cached);  // AgentBridgeError from build propagates to dispatch.
         }
@@ -279,10 +279,10 @@ QJsonObject AgentBridgeServer::withOpenDataManifest(
 
 void AgentBridgeServer::startManifestFetch(
     int token,
-    const std::function<QJsonObject(const vc3d::opendata::OpenDataManifest&)>& build)
+    const std::function<QJsonObject(const vcr::catalog::OpenDataManifest&)>& build)
 {
     struct FetchResult {
-        std::optional<vc3d::opendata::OpenDataManifest> manifest;
+        std::optional<vcr::catalog::OpenDataManifest> manifest;
         QString error;
     };
 
@@ -317,7 +317,8 @@ void AgentBridgeServer::startManifestFetch(
     watcher->setFuture(QtConcurrent::run([]() {
         FetchResult fr;
         try {
-            fr.manifest = vc3d::opendata::fetchOpenDataManifest();
+            fr.manifest = vcr::catalog::loadCatalog(std::string(vcr::catalog::kDefaultManifestUrl),
+                {vc3d::opendata::cachedOpenDataManifestPath(), true}).manifest;
         } catch (const std::exception& e) {
             fr.error = QString::fromUtf8(e.what());
         } catch (...) {
@@ -333,7 +334,7 @@ QJsonObject AgentBridgeServer::handleCatalogListSamples(const QJsonValue& params
     const QJsonObject p = params.toObject();
     const bool refresh = p.value("refresh").toBool(false);
 
-    auto build = [](const vc3d::opendata::OpenDataManifest& manifest) -> QJsonObject {
+    auto build = [](const vcr::catalog::OpenDataManifest& manifest) -> QJsonObject {
         QJsonObject result;
         result["manifestUrl"] = QString::fromStdString(manifest.manifestUrl);
         QJsonArray samples;
@@ -367,8 +368,8 @@ QJsonObject AgentBridgeServer::handleCatalogDescribeSample(const QJsonValue& par
     const bool refresh = p.value("refresh").toBool(false);
     const std::string sid = sampleId.toStdString();
 
-    auto build = [sampleId, sid](const vc3d::opendata::OpenDataManifest& manifest) -> QJsonObject {
-        const vc3d::opendata::OpenDataSample* sample = manifest.findSample(sid);
+    auto build = [sampleId, sid](const vcr::catalog::OpenDataManifest& manifest) -> QJsonObject {
+        const vcr::catalog::OpenDataSample* sample = manifest.findSample(sid);
         if (!sample) {
             QJsonObject data;
             data["kind"] = "sample";
@@ -405,7 +406,7 @@ QJsonObject AgentBridgeServer::handleCatalogDescribeSample(const QJsonValue& par
         result["volumes"] = volumes;
 
         QJsonArray representations;
-        for (const auto& ref : vc3d::opendata::derivedRepresentations(*sample)) {
+        for (const auto& ref : vcr::catalog::derivedRepresentations(*sample)) {
             const auto& volume = sample->volumes[ref.volumeIndex];
             const auto& artifact = volume.artifacts[ref.artifactIndex];
             QJsonObject o;

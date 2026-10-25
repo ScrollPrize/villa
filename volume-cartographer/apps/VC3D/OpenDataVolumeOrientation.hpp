@@ -1,4 +1,5 @@
 #pragma once
+#include <vc_reader/catalog.hpp>
 
 #include "OpenDataManifest.hpp"
 
@@ -42,11 +43,11 @@ sampleAndVolumeOfCoordinateSpace(std::string_view coordinateSpace);
 // The two properties as the volume's catalog entry states them; a property
 // that is absent or not a boolean (the strings "true" / "false" are read as
 // booleans) is unset.
-[[nodiscard]] VolumeOrientation volumeOrientationOf(const OpenDataVolume& volume);
+[[nodiscard]] VolumeOrientation volumeOrientationOf(const vcr::catalog::OpenDataVolume& volume);
 
 // nullopt when the manifest has no such sample or volume.
 [[nodiscard]] std::optional<VolumeOrientation> findVolumeOrientation(
-    const OpenDataManifest& manifest,
+    const vcr::catalog::OpenDataManifest& manifest,
     std::string_view sampleId,
     std::string_view volumeId);
 

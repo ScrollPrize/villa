@@ -1,4 +1,5 @@
 #pragma once
+#include <vc_reader/catalog.hpp>
 
 #include "OpenDataManifest.hpp"
 #include "OpenDataSurfaceStore.hpp"
@@ -55,7 +56,7 @@ struct OpenDataNewProject {
 // nullptr attaches everything. newProject bypasses the cached full-sample project
 // and saves a fresh JSON before returning an ordinarily persistent loaded package.
 [[nodiscard]] std::shared_ptr<VolumePkg> createOpenDataSampleProject(
-    const OpenDataSample& sample,
+    const vcr::catalog::OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
     OpenDataSampleProjectResult* resultOut = nullptr,
     const OpenDataSampleProgressCallback& progressCallback = {},
@@ -64,13 +65,13 @@ struct OpenDataNewProject {
 
 OpenDataSampleProjectResult attachOpenDataSampleVolumes(
     VolumePkg& pkg,
-    const OpenDataSample& sample,
+    const vcr::catalog::OpenDataSample& sample,
     const OpenDataResourceSelection* selection = nullptr);
 
 // Record the sample's segments (only `segmentIds` when given) as surfaces in
 // its surface store.
 void importOpenDataSampleSurfaces(
-    const OpenDataSample& sample,
+    const vcr::catalog::OpenDataSample& sample,
     const std::filesystem::path& remoteCacheRoot,
     OpenDataSampleProjectResult& result,
     const std::optional<std::vector<std::string>>& segmentIds = std::nullopt);

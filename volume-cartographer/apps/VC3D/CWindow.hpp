@@ -1,4 +1,5 @@
 #pragma once
+#include <vc_reader/catalog.hpp>
 
 #include <cstddef>
 #include <cstdint>
@@ -346,7 +347,7 @@ private slots:
     QString lastVolumeSettingKeyForCurrentPackage() const;
     QString rememberedVolumeIdForCurrentPackage() const;
     void rememberCurrentVolumeForPackage(const QString& volumeId) const;
-    const vc3d::opendata::OpenDataManifest* cachedOpenDataManifest() const;
+    const vcr::catalog::OpenDataManifest* cachedOpenDataManifest() const;
     std::string openDataVolumeIdForLoadedVolumeId(const std::string& volumeId) const;
     std::optional<cv::Matx44d> openDataVolumeTransformForSwitch(
         const std::string& fromLoadedVolumeId,
@@ -371,7 +372,7 @@ private:
     QComboBox* volSelect{nullptr};
     std::vector<QPointer<QComboBox>> _annotationVolumeSelects;
     mutable bool _openDataManifestLoadAttempted{false};
-    mutable std::optional<vc3d::opendata::OpenDataManifest> _openDataManifestCache;
+    mutable std::optional<vcr::catalog::OpenDataManifest> _openDataManifestCache;
 
 
     SeedingWidget* _seedingWidget;

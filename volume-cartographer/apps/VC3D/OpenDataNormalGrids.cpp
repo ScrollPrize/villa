@@ -36,7 +36,7 @@ std::string trimTrailingSlashes(std::string value)
     return value;
 }
 
-std::string artifactUrl(const OpenDataArtifact& artifact)
+std::string artifactUrl(const vcr::catalog::OpenDataArtifact& artifact)
 {
     return trimTrailingSlashes(artifact.resolvedUrl.empty()
                                   ? artifact.sourcePath
@@ -325,14 +325,14 @@ void writeCompleteMarker(const std::filesystem::path& dir,
 
 } // namespace
 
-const OpenDataArtifact* normalGridsArtifact(const OpenDataVolume& volume)
+const vcr::catalog::OpenDataArtifact* normalGridsArtifact(const vcr::catalog::OpenDataVolume& volume)
 {
-    return findArtifact(volume.artifacts, kNormalGridsArtifactType);
+    return vcr::catalog::findArtifact(volume.artifacts, kNormalGridsArtifactType);
 }
 
 std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
     const std::string& sampleId,
-    const OpenDataVolume& volume)
+    const vcr::catalog::OpenDataVolume& volume)
 {
     std::vector<OpenDataNormalGridsInfo> result;
     for (const auto& artifact : volume.artifacts) {
@@ -367,7 +367,7 @@ std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
     return result;
 }
 
-std::string normalGridsArtifactUrl(const OpenDataVolume& volume)
+std::string normalGridsArtifactUrl(const vcr::catalog::OpenDataVolume& volume)
 {
     const auto* artifact = normalGridsArtifact(volume);
     return artifact ? artifactUrl(*artifact) : std::string{};
@@ -473,7 +473,7 @@ bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
 }
 
 int attachOpenDataNormalGrids(VolumePkg& pkg,
-                              const OpenDataSample& sample,
+                              const vcr::catalog::OpenDataSample& sample,
                               const std::filesystem::path& remoteCacheRoot,
                               const OpenDataResourceSelection* selection)
 {
@@ -500,7 +500,7 @@ int attachOpenDataNormalGrids(VolumePkg& pkg,
                 if (!artifactIndex ||
                     !selection->allowsRepresentation(
                         volumeIndex, *artifactIndex,
-                        OpenDataRepresentationKind::NormalGrids, volume.id)) {
+                        vcr::catalog::OpenDataRepresentationKind::NormalGrids, volume.id)) {
                     continue;
                 }
             }
@@ -515,7 +515,7 @@ int attachOpenDataNormalGrids(VolumePkg& pkg,
 NormalGridsCacheState normalGridsCacheState(
     const std::filesystem::path& remoteCacheRoot,
     const std::string& sampleId,
-    const OpenDataVolume& volume)
+    const vcr::catalog::OpenDataVolume& volume)
 {
     NormalGridsCacheState state;
     const auto artifacts = normalGridsArtifacts(sampleId, volume);
@@ -735,9 +735,9 @@ std::vector<OpenDataNormalGridsInfo> normalGridsAvailabilityFromCachedManifest()
     if (!std::filesystem::is_regular_file(manifestPath, ec)) {
         return result;
     }
-    OpenDataManifest manifest;
+    vcr::catalog::OpenDataManifest manifest;
     try {
-        manifest = loadOpenDataManifestFile(manifestPath);
+        manifest = vcr::catalog::loadOpenDataManifestFile(manifestPath);
     } catch (...) {
         return result;
     }

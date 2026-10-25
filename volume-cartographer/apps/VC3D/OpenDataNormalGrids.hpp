@@ -1,4 +1,5 @@
 #pragma once
+#include <vc_reader/catalog.hpp>
 
 #include <atomic>
 #include <cstdint>
@@ -13,9 +14,9 @@ class VolumePkg;
 
 namespace vc3d::opendata {
 
-struct OpenDataArtifact;
-struct OpenDataSample;
-struct OpenDataVolume;
+
+
+
 struct OpenDataResourceSelection;
 
 inline constexpr std::string_view kNormalGridsArtifactType = "normal-grids";
@@ -34,11 +35,11 @@ struct OpenDataNormalGridsInfo {
     bool levelWasExplicit = false;
 };
 
-[[nodiscard]] const OpenDataArtifact* normalGridsArtifact(const OpenDataVolume& volume);
+[[nodiscard]] const vcr::catalog::OpenDataArtifact* normalGridsArtifact(const vcr::catalog::OpenDataVolume& volume);
 [[nodiscard]] std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
     const std::string& sampleId,
-    const OpenDataVolume& volume);
-[[nodiscard]] std::string normalGridsArtifactUrl(const OpenDataVolume& volume);
+    const vcr::catalog::OpenDataVolume& volume);
+[[nodiscard]] std::string normalGridsArtifactUrl(const vcr::catalog::OpenDataVolume& volume);
 
 // Recover the pairing from a loaded volume's project tags. Returns nullopt when
 // the tags carry no open-data volume identity (i.e. not a catalog volume).
@@ -68,7 +69,7 @@ bool attachStreamingNormalGridsEntry(VolumePkg& pkg,
 // normal-grids artifact. Returns the number of entries attached. selection
 // optionally restricts volumes and representations; nullptr attaches all.
 int attachOpenDataNormalGrids(VolumePkg& pkg,
-                              const OpenDataSample& sample,
+                              const vcr::catalog::OpenDataSample& sample,
                               const std::filesystem::path& remoteCacheRoot,
                               const OpenDataResourceSelection* selection = nullptr);
 
@@ -84,7 +85,7 @@ struct NormalGridsCacheState {
 [[nodiscard]] NormalGridsCacheState normalGridsCacheState(
     const std::filesystem::path& remoteCacheRoot,
     const std::string& sampleId,
-    const OpenDataVolume& volume);
+    const vcr::catalog::OpenDataVolume& volume);
 
 struct NormalGridsDownloadProgress {
     int totalFiles = 0;
