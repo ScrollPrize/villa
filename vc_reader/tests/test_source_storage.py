@@ -47,6 +47,18 @@ def read_remote_source(source, options):
         return reader.read((0, 0), (5, 7))
 
 
+def open_new_caches(barrier, root, rounds):
+    from vc_reader import _reader
+    failures = 0
+    for i in range(rounds):
+        barrier.wait()
+        try:
+            _reader.DiskCache(os.path.join(root, str(i)), -1)
+        except RuntimeError:
+            failures += 1
+    sys.exit(failures)
+
+
 def array(path, data, attrs=None, fill=0):
     path.mkdir(parents=True, exist_ok=True)
     (path / '.zarray').write_text(json.dumps(dict(zarr_format=2, shape=data.shape, chunks=data.shape,
@@ -366,6 +378,19 @@ class StorageTests(FixtureCase):
                         axes=('z', 'c', 'y', 'x'))
         with stack.open() as reader:
             np.testing.assert_array_equal(reader.read((0, 7, 9), (2, 5, 7)), 2**40)
+
+    def test_processes_released_together_open_one_new_cache(self):
+        # Each round releases every worker at once on a directory nobody has
+        # opened, so they all create and convert the same index together.
+        context = multiprocessing.get_context('spawn')
+        barrier = context.Barrier(4, timeout=60)
+        workers = [context.Process(target=open_new_caches, args=(barrier, str(self.root/'cache'), 10))
+                   for _ in range(4)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(120)
+        self.assertEqual([worker.exitcode for worker in workers], [0]*4)
 
 
 class RemoteFixtureCase(FixtureCase):
