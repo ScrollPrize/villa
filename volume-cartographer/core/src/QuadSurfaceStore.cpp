@@ -2,6 +2,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <vc_object_store/geometry/Geometry.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/Uuid.hpp>
 
 #include <nlohmann/json.hpp>
@@ -109,23 +110,23 @@ std::unique_ptr<QuadSurface> load_quad_from_store(const vc::objects::ObjectStore
     if (!object || object->kind != "surface") throw std::runtime_error("not a surface object: " + objectUuid);
     const auto revision = geometryRevision ? db.geometryRevision(txn, *geometryRevision) : db.currentGeometry(txn, object->uuid);
     if (!revision || revision->objectUuid != object->uuid) throw std::runtime_error("surface has no such geometry revision: " + objectUuid);
-    const auto shape = pointsShape(*revision);
-    const int rows = int(shape[0]), cols = int(shape[1]);
+    const auto view = vc::objects::GeometrySnapshot(db, txn).surface(object->uuid, revision->uuid);
+    const int rows = int(view.rows()), cols = int(view.columns());
+    const auto stored = view.readTile(0, 0, rows, cols);
     auto points = std::make_unique<cv::Mat_<cv::Vec3f>>(rows, cols);
-    const auto bytes = db.readGeometryRectangle(txn, revision->uuid, "points", 0, 0, rows, cols);
-    std::memcpy(points->data, bytes.data(), bytes.size());
-    for (auto& p : *points) if (!usable(p)) p = kInvalid;
+    for (int i = 0; i < rows * cols; ++i) {
+        const auto& p = stored.points[size_t(i)];
+        (*points)(i / cols, i % cols) = usable({p[0], p[1], p[2]}) ? cv::Vec3f(p[0], p[1], p[2]) : kInvalid;
+    }
     cv::Mat_<uint8_t> mask;
-    if (hasArray(*revision, "valid")) {
-        const auto valid = db.readGeometryRectangle(txn, revision->uuid, "valid", 0, 0, rows, cols);
+    if (!stored.validity.empty()) {
         mask.create(rows, cols);
         for (int i = 0; i < rows * cols; ++i) {
-            mask(i / cols, i % cols) = valid[size_t(i)] ? 255 : 0;
-            if (applyValidity && !valid[size_t(i)]) (*points)(i / cols, i % cols) = kInvalid;
+            mask(i / cols, i % cols) = stored.validity[size_t(i)] ? 255 : 0;
+            if (applyValidity && !stored.validity[size_t(i)]) (*points)(i / cols, i % cols) = kInvalid;
         }
     }
-    const auto attributes = nlohmann::json::parse(revision->attributes);
-    cv::Vec2f scale(attributes.at("scale").at(0).get<float>(), attributes.at("scale").at(1).get<float>());
+    cv::Vec2f scale(float(view.scale()[0]), float(view.scale()[1]));
     if (toVolume != 1) {
         for (auto& p : *points) if (p != kInvalid) p *= float(toVolume);
         scale /= float(toVolume);
