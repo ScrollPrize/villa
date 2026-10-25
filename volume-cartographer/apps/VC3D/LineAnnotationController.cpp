@@ -5148,19 +5148,29 @@ fs::path LineAnnotationController::createAtlasFromFiberCore(uint64_t fiberId)
 
     const std::string atlasName = "fiber_" + std::to_string(fiberId);
     const fs::path atlasDir = vc::atlas::uniqueAtlasDirectory(volpkgRoot, atlasName);
-    auto atlas = vc::atlas::createSingleFiberAtlas(volpkgRoot,
-                                                   atlasDir.filename().string(),
-                                                   input,
-                                                   selected,
-                                                   zeroWindingColumn,
-                                                   std::move(mapping));
     const auto coordinateIdentity = coordinateIdentityForState(_state);
-    copyCoordinateIdentityToJson(
-        atlas.metadata.coordinateMetadata, coordinateIdentity);
     vc3d::opendata::copyCoordinateIdentityToSurface(
         *selected.surface, coordinateIdentity);
-    vc::atlas::saveAtlasBaseMeshCopy(*selected.surface,
-                                     atlasDir / atlas.metadata.baseMeshPath);
+    // The chosen init shell becomes a stored surface; the atlas pins the revision it maps onto.
+    const auto attachment = _state->objectStoreAttachment();
+    const auto volume = _state->currentVolume();
+    if (!attachment || !volume) {
+        throw std::runtime_error("Creating an atlas needs an attached object store and an open volume");
+    }
+    auto baseMeta = vc3d::coordinateBindingForVolume(*volume, 1);
+    baseMeta["provenance"] = {{"tool", "vc3d_atlas"},
+                              {"parameters", {{"init_shell", selected.path.string()}}},
+                              {"sources", nlohmann::json::array()}};
+    const auto basePin = vc::atlas::storeAtlasBaseSurface(
+        *_state->objectStoreSession(), *attachment, *selected.surface,
+        atlasDir.filename().string() + "_base", baseMeta.dump());
+    auto atlas = vc::atlas::createSingleFiberAtlas(atlasDir.filename().string(),
+                                                   input,
+                                                   basePin,
+                                                   zeroWindingColumn,
+                                                   std::move(mapping));
+    copyCoordinateIdentityToJson(
+        atlas.metadata.coordinateMetadata, coordinateIdentity);
     atlas.save(atlasDir);
     if (sampler.hasPredDtChannel() && !atlas.fibers.empty()) {
         (void)vc::atlas::ensureAtlasPredSnapSet(atlasDir,
@@ -5472,8 +5482,7 @@ bool LineAnnotationController::acceptIntersectionSameWindingChoice()
         const auto& dataset = *resolvedLasagna;
         vc::lasagna::LasagnaNormalSampler sampler(dataset);
 
-        const fs::path basePath = *_intersectionInspection->atlasDir / atlas.metadata.baseMeshPath;
-        auto baseSurface = std::make_shared<QuadSurface>(basePath);
+        auto baseSurface = vc::atlas::loadAtlasBaseSurface(atlas, _state->objectStoreSession());
         SurfacePatchIndex baseIndex;
         baseIndex.rebuild({baseSurface});
         const int periodColumns = vc::atlas::atlasHorizontalPeriodColumns(*baseSurface);

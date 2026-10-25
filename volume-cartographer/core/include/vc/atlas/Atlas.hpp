@@ -32,8 +32,9 @@ struct AtlasMetadata {
     std::string type = "vc3d_atlas";
     int version = 5;
     std::string name;
-    std::filesystem::path baseMeshPath;
-    std::filesystem::path sourceBaseMeshPath;
+    // The stored surface (an init shell chosen at creation) at the revision the
+    // atlas was built on; its coordinates are atlas coordinates.
+    std::optional<vc::objects::PinnedObject> basePin;
     int zeroWindingColumn = 0;
     int seedLineIndex = 0;
     double seedAtlasU = 0.0;
@@ -314,8 +315,6 @@ struct LasagnaAtlasExport {
     Atlas atlas;
     std::filesystem::path atlasDir;
     std::filesystem::path volpkgRoot;
-    std::filesystem::path basePath;
-    std::filesystem::path baseRelativePath;
     std::vector<LasagnaAtlasObject> objects;
     nlohmann::json compactJson;
 };
@@ -359,8 +358,17 @@ BaseSelection selectBaseSurfaceBySeedRay(const FiberInput& fiber,
                                          const LineMappingOptions& options = {});
 
 int computeZeroWindingColumn(const QuadSurface& surface);
-void saveAtlasBaseMeshCopy(const QuadSurface& surface,
-                           const std::filesystem::path& targetDir);
+// The atlas's base surface: its pinned stored revision.
+std::shared_ptr<QuadSurface> loadAtlasBaseSurface(const Atlas& atlas,
+                                                  const std::shared_ptr<vc::objects::ObjectStoreSession>& store);
+// Create `surface` (the init shell chosen as an atlas base, in atlas
+// coordinates) as a stored surface named `name`, tagged atlas_base, with record
+// meta `metaJson` (coordinates, provenance); returns the pin an atlas records.
+vc::objects::PinnedObject storeAtlasBaseSurface(vc::objects::ObjectStoreSession& session,
+                                                const vc::objects::AttachmentIdentity& attachment,
+                                                QuadSurface& surface,
+                                                const std::string& name,
+                                                const std::string& metaJson);
 AtlasCoveredSize mappedObjectCoveredAtlasSize(
     const Atlas& atlas,
     cv::Vec2f atlasScale = cv::Vec2f(1.0f, 1.0f),
@@ -485,8 +493,8 @@ void validateFiberInputControlPoints(FiberInput& fiber);
 bool atlasLoadErrorRequiresRebuild(const std::exception& ex);
 AtlasBaseMappingContext atlasBaseMappingContextFromSurface(
     std::shared_ptr<QuadSurface> baseSurface);
-AtlasBaseMappingContext loadAtlasBaseMappingContext(const std::filesystem::path& atlasDir,
-                                                    const Atlas& atlas);
+AtlasBaseMappingContext loadAtlasBaseMappingContext(const Atlas& atlas,
+                                                    const std::shared_ptr<vc::objects::ObjectStoreSession>& store);
 Atlas rebuildAtlasFromSourceFibers(const std::filesystem::path& atlasDir,
                                    const std::filesystem::path& volpkgRoot,
                                    const vc::lasagna::NormalSampler& normalSampler,
@@ -506,10 +514,9 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
                                    const vc::lasagna::NormalSampler& normalSampler,
                                    const LineMappingOptions& options = {});
 
-Atlas createSingleFiberAtlas(const std::filesystem::path& volpkgRoot,
-                             const std::string& atlasName,
+Atlas createSingleFiberAtlas(const std::string& atlasName,
                              const FiberInput& fiber,
-                             const SurfaceCandidate& baseSurface,
+                             const vc::objects::PinnedObject& basePin,
                              int zeroWindingColumn,
                              FiberMapping mapping);
 

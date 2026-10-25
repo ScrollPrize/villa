@@ -43,7 +43,7 @@ namespace {
 
 constexpr double kEpsilon = 1.0e-9;
 constexpr double kControlPointMatchEpsilon = 1.0e-8;
-constexpr int kAtlasMetadataVersion = 5;
+constexpr int kAtlasMetadataVersion = 6;
 constexpr std::array<const char*, 5> kCoordinateMetadataKeys{
     "vc_open_data_coordinate_space",
     "vc_open_data_source_path",
@@ -444,8 +444,7 @@ Atlas loadAtlasContextForRebuild(const fs::path& atlasDir)
         throw std::runtime_error("unsupported atlas metadata in " + atlasDir.string());
     }
     atlas.metadata.name = metadata.value("name", atlasDir.filename().string());
-    atlas.metadata.baseMeshPath = metadata.value("base_mesh_path", std::string{});
-    atlas.metadata.sourceBaseMeshPath = metadata.value("source_base_mesh_path", std::string{});
+    atlas.metadata.basePin = atlasObjectPin(metadata.value("base", nlohmann::json::object()));
     atlas.metadata.zeroWindingColumn = metadata.at("zero_winding_column").get<int>();
     atlas.metadata.seedLineIndex = metadata.value("seed_line_index", 0);
     if (metadata.contains("seed_atlas") && metadata["seed_atlas"].is_array() &&
@@ -1045,12 +1044,13 @@ void Atlas::save(const fs::path& atlasDir) const
         {"type", metadata.type},
         {"version", kAtlasMetadataVersion},
         {"name", metadata.name},
-        {"base_mesh_path", metadata.baseMeshPath.generic_string()},
-        {"source_base_mesh_path", metadata.sourceBaseMeshPath.generic_string()},
         {"zero_winding_column", metadata.zeroWindingColumn},
         {"seed_line_index", metadata.seedLineIndex},
         {"seed_atlas", nlohmann::json::array({metadata.seedAtlasU, metadata.seedAtlasV})},
     };
+    if (metadata.basePin) {
+        metadataJson["base"] = {{"object", atlasObjectPinJson(*metadata.basePin)}};
+    }
     saveCoordinateMetadata(metadata, metadataJson);
     writeJsonFile(atlasDir / "metadata.json", metadataJson);
 
@@ -1102,8 +1102,7 @@ Atlas Atlas::load(const fs::path& atlasDir,
         throw std::runtime_error("unsupported atlas metadata in " + atlasDir.string());
     }
     atlas.metadata.name = metadata.value("name", atlasDir.filename().string());
-    atlas.metadata.baseMeshPath = metadata.value("base_mesh_path", std::string{});
-    atlas.metadata.sourceBaseMeshPath = metadata.value("source_base_mesh_path", std::string{});
+    atlas.metadata.basePin = atlasObjectPin(metadata.value("base", nlohmann::json::object()));
     atlas.metadata.zeroWindingColumn = metadata.at("zero_winding_column").get<int>();
     atlas.metadata.seedLineIndex = metadata.value("seed_line_index", 0);
     if (metadata.contains("seed_atlas") && metadata["seed_atlas"].is_array() &&
@@ -1189,14 +1188,10 @@ AtlasBaseMappingContext atlasBaseMappingContextFromSurface(
     return context;
 }
 
-AtlasBaseMappingContext loadAtlasBaseMappingContext(const fs::path& atlasDir,
-                                                    const Atlas& atlas)
+AtlasBaseMappingContext loadAtlasBaseMappingContext(const Atlas& atlas,
+                                                    const std::shared_ptr<vc::objects::ObjectStoreSession>& store)
 {
-    if (atlas.metadata.baseMeshPath.empty()) {
-        throw std::runtime_error("cannot load atlas base mapping context without base_mesh_path");
-    }
-    return atlasBaseMappingContextFromSurface(
-        std::make_shared<QuadSurface>(atlasDir / atlas.metadata.baseMeshPath));
+    return atlasBaseMappingContextFromSurface(loadAtlasBaseSurface(atlas, store));
 }
 
 Atlas rebuildAtlasFromSourceFibers(const fs::path& atlasDir,
@@ -1206,7 +1201,7 @@ Atlas rebuildAtlasFromSourceFibers(const fs::path& atlasDir,
     std::shared_ptr<vc::objects::ObjectStoreSession> store)
 {
     const Atlas legacy = loadAtlasContextForRebuild(atlasDir);
-    auto context = loadAtlasBaseMappingContext(atlasDir, legacy);
+    auto context = loadAtlasBaseMappingContext(legacy, store);
     return rebuildAtlasFromSourceFibers(
         atlasDir, volpkgRoot, *context.baseSurface, *context.baseIndex, normalSampler, options, store);
 }
@@ -2116,10 +2111,8 @@ AtlasPredSnapAttachmentReport ensureAtlasPredSnapAttachments(
     }
 
     Atlas atlas = Atlas::load(atlasDir, store);
-    if (atlas.metadata.baseMeshPath.empty()) {
-        throw std::runtime_error("cannot generate atlas pred-snap attachments without base_mesh_path");
-    }
-    QuadSurface baseSurface(atlasDir / atlas.metadata.baseMeshPath);
+    const auto baseSurfacePtr = loadAtlasBaseSurface(atlas, store);
+    const QuadSurface& baseSurface = *baseSurfacePtr;
     const auto* points = baseSurface.rawPointsPtr();
     if (!points || points->empty()) {
         throw std::runtime_error("cannot generate atlas pred-snap attachments: base mesh has no valid grid");
@@ -3070,10 +3063,11 @@ AtlasSnapPreparedCandidates prepareAtlasPredSnapCandidates(
               << " fibers=" << atlas.fibers.size()
               << " links=" << atlas.links.size()
               << std::endl;
-    std::cerr << "[atlas-snap] loading base mesh="
-              << (atlasDir / atlas.metadata.baseMeshPath).string()
+    std::cerr << "[atlas-snap] loading base surface="
+              << (atlas.metadata.basePin ? atlas.metadata.basePin->object.objectUuid : std::string("<none>"))
               << std::endl;
-    QuadSurface baseSurface(atlasDir / atlas.metadata.baseMeshPath);
+    const auto baseSurfacePtr = loadAtlasBaseSurface(atlas, store);
+    const QuadSurface& baseSurface = *baseSurfacePtr;
     const nlohmann::json rankOptions = effectiveRankOptions(options);
     state.rankOptions = rankOptions;
     const double predDtThreshold = rankOptions.value("threshold", options.predDtThreshold);
@@ -3685,29 +3679,23 @@ LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
         ? inferVolpkgRootFromAtlasDir(atlasDir)
         : volpkgRootIn;
     exportData.atlas = Atlas::load(atlasDir, store);
-    exportData.baseRelativePath = exportData.atlas.metadata.baseMeshPath;
-    if (exportData.baseRelativePath.empty()) {
-        throw std::runtime_error("Atlas metadata is missing base_mesh_path.");
+    if (!exportData.atlas.metadata.basePin) {
+        throw std::runtime_error("Atlas metadata has no base surface.");
     }
-    exportData.basePath = (atlasDir / exportData.baseRelativePath).lexically_normal();
-    if (!fs::is_directory(exportData.basePath)) {
-        throw std::runtime_error("Atlas base mesh does not exist: " + exportData.basePath.string());
-    }
+    const std::string baseUuid = exportData.atlas.metadata.basePin->object.objectUuid;
     try {
-        const QuadSurface base(exportData.basePath);
+        const auto baseSurface = loadAtlasBaseSurface(exportData.atlas, store);
+        const QuadSurface& base = *baseSurface;
         const cv::Mat_<cv::Vec3f>* points = base.rawPointsPtr();
         if (!points || points->rows < 2 || points->cols < 2) {
-            throw std::runtime_error("Atlas base mesh is too small: " +
-                                     exportData.basePath.string());
+            throw std::runtime_error("Atlas base surface is too small: " + baseUuid);
         }
         double maxDelta = 0.0;
         for (int row = 0; row < points->rows; ++row) {
             const cv::Vec3f first = (*points)(row, 0);
             const cv::Vec3f last = (*points)(row, points->cols - 1);
             if (!finitePoint(first) || !finitePoint(last)) {
-                throw std::runtime_error(
-                    "Atlas base mesh contains invalid wrap endpoints: " +
-                    exportData.basePath.string());
+                throw std::runtime_error("Atlas base surface contains invalid wrap endpoints: " + baseUuid);
             }
             for (int c = 0; c < 3; ++c) {
                 maxDelta = std::max(
@@ -3724,8 +3712,7 @@ LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
         const int periodColumns = atlasHorizontalPeriodColumns(base);
         layoutAtlasObjects(exportData.atlas, periodColumns);
     } catch (const std::exception& ex) {
-        throw std::runtime_error("Cannot load atlas base mesh " +
-                                 exportData.basePath.string() + ": " + ex.what());
+        throw std::runtime_error("Cannot load atlas base surface " + baseUuid + ": " + ex.what());
     }
 
     const fs::path mappingsDir = atlasDir / "mappings" / "fibers";
@@ -3804,8 +3791,11 @@ LasagnaAtlasExport loadLasagnaAtlasExport(const fs::path& atlasDir,
         {"type", "lasagna_atlas"},
         {"version", 1},
         {"name", atlasName},
+        // The Lasagna service reads the base from the store, at the atlas's revision.
         {"base", {
-            {"path", exportData.baseRelativePath.generic_string()},
+            {"ref", {{"type", "surface"},
+                     {"uuid", baseUuid},
+                     {"revision", exportData.atlas.metadata.basePin->geometryRevision.value_or("")}}},
         }},
         {"metadata", {
             {"zero_winding_column", exportData.atlas.metadata.zeroWindingColumn},
@@ -3985,24 +3975,55 @@ int computeZeroWindingColumn(const QuadSurface& surface)
     return bestCol;
 }
 
-void saveAtlasBaseMeshCopy(const QuadSurface& surface,
-                           const fs::path& targetDir)
+std::shared_ptr<QuadSurface> loadAtlasBaseSurface(const Atlas& atlas,
+                                                  const std::shared_ptr<vc::objects::ObjectStoreSession>& store)
 {
-    const auto* points = surface.rawPointsPtr();
-    if (!points) {
-        throw std::runtime_error("base surface has no point grid");
+    if (!atlas.metadata.basePin) {
+        throw std::runtime_error("Atlas has no base surface");
     }
-    QuadSurface copy(*points, surface.scale());
-    copy.meta = surface.meta;
-    auto& mutableSurface = const_cast<QuadSurface&>(surface);
-    for (const auto& name : mutableSurface.channelNames()) {
-        cv::Mat channel = mutableSurface.channel(name, SURF_CHANNEL_NORESIZE);
-        if (channel.empty()) {
-            continue;
+    if (!store) {
+        throw std::runtime_error("Attach the atlas object store before reading its base surface");
+    }
+    const auto& pin = *atlas.metadata.basePin;
+    const auto attachment = pinnedAttachment(*store, pin);
+    if (!attachment) {
+        throw std::runtime_error("Atlas references a different object store");
+    }
+    std::shared_ptr<QuadSurface> surface;
+    store->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
+        const auto revision = db.objectRevision(txn, pin.objectRevision);
+        if (!revision || revision->objectUuid != pin.object.objectUuid ||
+            revision->geometryRevision != pin.geometryRevision || !pin.geometryRevision) {
+            throw std::runtime_error("Atlas base surface revision is unavailable");
         }
-        copy.setChannel(name, channel.clone());
-    }
-    copy.saveAsNew(targetDir, true);
+        surface = load_quad_from_store(db, txn, pin.object.objectUuid, pin.geometryRevision);
+    });
+    surface->setChannelLoader(store_channel_loader(store, *attachment, *pin.geometryRevision));
+    return surface;
+}
+
+vc::objects::PinnedObject storeAtlasBaseSurface(vc::objects::ObjectStoreSession& session,
+                                                const vc::objects::AttachmentIdentity& attachment,
+                                                QuadSurface& surface,
+                                                const std::string& name,
+                                                const std::string& metaJson)
+{
+    const std::string uuid = vc::objects::util::newUuid();
+    const auto committed = session.act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
+        create_quad_in_store(db, txn, uuid, surface, name, {"atlas_base"}, metaJson);
+    });
+    vc::objects::PinnedObject pin;
+    pin.attachment = attachment;
+    pin.object = {attachment.storeUuid, uuid};
+    pin.objectRevision = committed.at(uuid).value();
+    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+        const auto revision = db.objectRevision(txn, pin.objectRevision);
+        if (!revision || !revision->geometryRevision) {
+            throw std::runtime_error("stored atlas base surface has no geometry");
+        }
+        pin.geometryRevision = revision->geometryRevision;
+    });
+    return pin;
 }
 
 AtlasCoveredSize mappedObjectCoveredAtlasSize(const Atlas& atlas,
@@ -4593,21 +4614,15 @@ FiberMapping mapFiberToBaseSurface(const FiberInput& fiber,
     return mapping;
 }
 
-Atlas createSingleFiberAtlas(const fs::path& volpkgRoot,
-                             const std::string& atlasName,
+Atlas createSingleFiberAtlas(const std::string& atlasName,
                              const FiberInput& fiber,
-                             const SurfaceCandidate& baseSurface,
+                             const vc::objects::PinnedObject& basePin,
                              int zeroWindingColumn,
                              FiberMapping mapping)
 {
-    if (!baseSurface.surface) {
-        throw std::runtime_error("base surface is null");
-    }
     Atlas atlas;
     atlas.metadata.name = sanitizeAtlasName(atlasName);
-    const std::string baseDirName = sanitizeAtlasName(baseSurface.name) + ".tifxyz";
-    atlas.metadata.baseMeshPath = fs::path("base_mesh") / baseDirName;
-    atlas.metadata.sourceBaseMeshPath = fs::relative(baseSurface.path, volpkgRoot);
+    atlas.metadata.basePin = basePin;
     atlas.metadata.zeroWindingColumn = zeroWindingColumn;
     atlas.metadata.seedLineIndex = seedLineIndexForFiber(fiber);
     auto seedIt = std::find_if(mapping.lineAnchors.begin(),

@@ -221,6 +221,23 @@ std::shared_ptr<vc::objects::ObjectStoreSession> fixtureStore(const fs::path& at
             fs::remove(snapFile);
         }
     }
+    // The authored base mesh becomes a stored surface the atlas pins, as atlas creation does.
+    const auto metadataPath = atlasDir / "metadata.json";
+    if (fs::is_regular_file(metadataPath)) {
+        auto metadata = nlohmann::json::parse(readText(metadataPath));
+        if (metadata.contains("base_mesh_path")) {
+            const auto basePath = atlasDir / metadata.at("base_mesh_path").get<std::string>();
+            if (fs::is_directory(basePath)) {
+                QuadSurface base(basePath);
+                const auto pin = vc::atlas::storeAtlasBaseSurface(*store, store->attachments().front(), base, "base", "{}");
+                metadata["base"] = {{"object", fixturePinJson(pin)}};
+            }
+            metadata.erase("base_mesh_path");
+            metadata.erase("source_base_mesh_path");
+            if (metadata.value("version", 0) == 5) metadata["version"] = 6;
+            writeText(metadataPath, metadata.dump());
+        }
+    }
     const auto linksPath = atlasDir/"links.json";
     if (fs::exists(linksPath)) {
         auto links=nlohmann::json::parse(readText(linksPath));
@@ -310,7 +327,7 @@ void writeValidLasagnaAtlasFixture(const fs::path& volpkgRoot,
     writeText(atlasDir / "mappings" / "fibers" / "fiber.json",
               R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/fiber.json","winding_offset":2,"line_anchors":[{"source_index":0,"world":[1,1,0],"atlas":[1,1],"distance":0}],"control_anchors":[]})");
     writeText(atlasDir / "metadata.json",
-              R"({"type":"vc3d_atlas","version":5,"name":")" + atlasName +
+              R"({"type":"vc3d_atlas","version":6,"name":")" + atlasName +
               R"(","base_mesh_path":"base_mesh/base.tifxyz","zero_winding_column":1})");
 }
 
@@ -547,8 +564,9 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
 
     vc::atlas::Atlas atlas;
     atlas.metadata.name = "fiber_1";
-    atlas.metadata.baseMeshPath = "base_mesh/shell.tifxyz";
-    atlas.metadata.sourceBaseMeshPath = "segments/shell";
+    const auto store = fixtureStoreAt(volpkgRoot);
+    atlas.metadata.basePin = vc::atlas::storeAtlasBaseSurface(
+        *store, store->attachments().front(), *makeWrappedPlane(3, 3, 1.0), "shell", "{}");
     atlas.metadata.zeroWindingColumn = 3;
     atlas.metadata.seedLineIndex = 1;
     atlas.metadata.seedAtlasU = 4.5;
@@ -583,7 +601,8 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
 
     saveFixtureAtlas(atlas, atlasDir);
     const std::string metadata = readText(atlasDir / "metadata.json");
-    CHECK(metadata.find("\"version\": 5") != std::string::npos);
+    CHECK(metadata.find("\"version\": 6") != std::string::npos);
+    CHECK(metadata.find("base_mesh_path") == std::string::npos);
     CHECK(metadata.find("\"zero_winding_column\": 3") != std::string::npos);
     CHECK(metadata.find("\"vc_open_data_source_coordinate_scale_factor\": 4") !=
           std::string::npos);
@@ -595,7 +614,12 @@ TEST_CASE("Atlas JSON round trips metadata links and fiber mapping")
     const auto loaded = loadFixtureAtlas(atlasDir);
 
     REQUIRE(loaded.metadata.name == "fiber_1");
-    CHECK(loaded.metadata.version == 5);
+    CHECK(loaded.metadata.version == 6);
+    REQUIRE(loaded.metadata.basePin);
+    CHECK(loaded.metadata.basePin->object == atlas.metadata.basePin->object);
+    CHECK(loaded.metadata.basePin->geometryRevision == atlas.metadata.basePin->geometryRevision);
+    const auto base = vc::atlas::loadAtlasBaseSurface(loaded, store);
+    CHECK(base->rawPointsPtr()->cols == 4);
     CHECK(loaded.metadata.zeroWindingColumn == 3);
     CHECK(loaded.metadata.seedLineIndex == 1);
     CHECK(loaded.metadata.seedAtlasU == doctest::Approx(4.5));
@@ -1547,7 +1571,7 @@ TEST_CASE("Atlas rebuild remaps source fibers and refreshes link endpoints")
     const auto rebuilt = vc::atlas::rebuildAtlasFromSourceFibers(
         atlasDir, root, sampler, {}, fixtureStore(atlasDir, root));
 
-    CHECK(rebuilt.metadata.version == 5);
+    CHECK(rebuilt.metadata.version == 6);
     REQUIRE(rebuilt.fibers.size() == 2);
     REQUIRE(rebuilt.fibers[0].controlAnchors.size() == 1);
     CHECK(rebuilt.fibers[0].controlAnchors[0].sourceIndex == 1);
@@ -1562,13 +1586,13 @@ TEST_CASE("Atlas rebuild remaps source fibers and refreshes link endpoints")
     CHECK(rebuilt.links[0].second.atlasU == doctest::Approx(5.0));
     CHECK(rebuilt.links[0].desiredWindingDelta == 1);
 
-    CHECK(readText(atlasDir / "metadata.json").find("\"version\": 5") != std::string::npos);
+    CHECK(readText(atlasDir / "metadata.json").find("\"version\": 6") != std::string::npos);
     CHECK(readText(atlasDir / "mappings" / "fibers" / (rebuilt.fibers[0].storePin->object.objectUuid + ".json"))
               .find("\"version\": 4") != std::string::npos);
     fs::remove(atlasDir / "mappings/fibers/a.json");
     fs::remove(atlasDir / "mappings/fibers/b.json");
     const auto loaded = loadFixtureAtlas(atlasDir);
-    CHECK(loaded.metadata.version == 5);
+    CHECK(loaded.metadata.version == 6);
     REQUIRE(loaded.links.size() == 1);
     CHECK(loaded.links[0].first.atlasU == doctest::Approx(2.0));
 }
@@ -1597,7 +1621,11 @@ TEST_CASE("Lasagna atlas export is derived from native atlas metadata and mappin
     const auto exported = exportFixtureAtlas(root / "atlases" / "fiber_atlas", root);
     CHECK(readText(fiberPath) == fiberBefore);
     CHECK(exported.atlas.metadata.zeroWindingColumn == 1);
-    CHECK(exported.basePath == root / "atlases" / "fiber_atlas" / "base_mesh" / "base.tifxyz");
+    REQUIRE(exported.atlas.metadata.basePin);
+    const auto& baseRef = exported.compactJson.at("base").at("ref");
+    CHECK(baseRef.at("type") == "surface");
+    CHECK(baseRef.at("uuid") == exported.atlas.metadata.basePin->object.objectUuid);
+    CHECK(baseRef.at("revision") == *exported.atlas.metadata.basePin->geometryRevision);
     REQUIRE(exported.objects.size() == 1);
     CHECK(exported.objects[0].id == exported.atlas.fibers[0].fiberPath.generic_string());
     CHECK(exported.objects[0].fiberPath.parent_path() == *exported.transportDirectory);
@@ -1673,12 +1701,9 @@ TEST_CASE("Atlas 21 Lasagna export fixture resolves mappings and native base sam
         }
         throw;
     }
-    CHECK(exported.atlas.metadata.version == 5);
+    CHECK(exported.atlas.metadata.version == 6);
     CHECK(exported.atlas.metadata.name == "fiber_21");
-    CHECK(exported.atlas.metadata.baseMeshPath ==
-          fs::path("base_mesh/shell_0034.tifxyz"));
-    CHECK(exported.basePath ==
-          atlasDir / "base_mesh" / "shell_0034.tifxyz");
+    REQUIRE(exported.atlas.metadata.basePin);
     REQUIRE(exported.objects.size() == 8);
     REQUIRE(exported.atlas.fibers.size() == 8);
 
@@ -1690,7 +1715,8 @@ TEST_CASE("Atlas 21 Lasagna export fixture resolves mappings and native base sam
         CHECK(fs::is_regular_file(object.mappingPath));
     }
 
-    const QuadSurface baseSurface(exported.basePath);
+    const auto baseSurfacePtr = vc::atlas::loadAtlasBaseSurface(exported.atlas, fixtureStoreAt(fixtureRoot));
+    const QuadSurface& baseSurface = *baseSurfacePtr;
     for (const auto& mapping : exported.atlas.fibers) {
         CHECK(mapping.controlAnchors.size() > 0);
         CHECK(mapping.lineAnchors.size() > mapping.controlAnchors.size());
@@ -1822,7 +1848,7 @@ TEST_CASE("Lasagna atlas export validates missing metadata base fibers and mappi
               R"({"type":"vc3d_atlas_fiber_mapping","version":4,"fiber_path":"fibers/fiber.json","winding_offset":0,"line_anchors":[]})");
     CHECK_THROWS_WITH_AS(
         exportFixtureAtlas(missingBase, root),
-        doctest::Contains("base mesh does not exist"),
+        doctest::Contains("no base surface"),
         std::runtime_error);
 
     const fs::path missingFiber = root / "atlases" / "missing_fiber";
@@ -2141,9 +2167,9 @@ TEST_CASE("Atlas zero winding column finds the lowest average Y column")
     CHECK(vc::atlas::computeZeroWindingColumn(surface) == 2);
 }
 
-TEST_CASE("Atlas base mesh copy preserves source columns and explicit wrapped seam")
+TEST_CASE("Stored atlas base surface preserves source columns, wrapped seam and channels")
 {
-    const fs::path root = tempRoot("vc_atlas_base_mesh_copy");
+    const fs::path root = tempRoot("vc_atlas_base_surface_store");
     cv::Mat_<cv::Vec3f> points(2, 5);
     cv::Mat labels(2, 5, CV_8U);
     for (int row = 0; row < points.rows; ++row) {
@@ -2159,8 +2185,13 @@ TEST_CASE("Atlas base mesh copy preserves source columns and explicit wrapped se
     QuadSurface surface(points, cv::Vec2f(1.0f, 1.0f));
     surface.setChannel("labels", labels);
 
-    vc::atlas::saveAtlasBaseMeshCopy(surface, root / "base_mesh" / "shell.tifxyz");
-    QuadSurface saved(root / "base_mesh" / "shell.tifxyz");
+    const auto store = fixtureStoreAt(root);
+    vc::atlas::Atlas atlas;
+    atlas.metadata.basePin = vc::atlas::storeAtlasBaseSurface(
+        *store, store->attachments().front(), surface, "shell_base", "{}");
+    const auto savedPtr = vc::atlas::loadAtlasBaseSurface(atlas, store);
+    QuadSurface& saved = *savedPtr;
+    CHECK(saved.meta["tags"].contains("atlas_base"));
     const auto* out = saved.rawPointsPtr();
     REQUIRE(out != nullptr);
     CHECK(out->cols == 5);
@@ -2712,9 +2743,8 @@ TEST_CASE("Atlas zero winding column changes winding interpretation only")
 
 TEST_CASE("Atlas creation keeps base-relative anchor coordinates")
 {
-    const fs::path root = tempRoot("vc_atlas_base_relative_anchors");
-    auto surface = makeWrappedPlane(3, 4, 0.0);
-    vc::atlas::SurfaceCandidate base{"shell_a", root / "segments" / "shell_a.tifxyz", surface};
+    vc::objects::PinnedObject basePin;
+    basePin.object = {"store", "base"};
     vc::atlas::FiberInput fiber;
     fiber.fiberPath = "fibers/1.json";
     fiber.linePoints = {{1.0, 1.0, 1.0}, {2.0, 1.0, 1.0}};
@@ -2725,8 +2755,9 @@ TEST_CASE("Atlas creation keeps base-relative anchor coordinates")
     mapping.lineAnchors.push_back({1, {}, 2.25, 1.0, 0.0});
 
     auto atlas = vc::atlas::createSingleFiberAtlas(
-        root, "fiber_1", fiber, base, 3, std::move(mapping));
+        "fiber_1", fiber, basePin, 3, std::move(mapping));
 
+    CHECK(atlas.metadata.basePin == basePin);
     CHECK(atlas.metadata.zeroWindingColumn == 3);
     REQUIRE(atlas.fibers.size() == 1);
     REQUIRE(atlas.fibers[0].lineAnchors.size() == 2);
@@ -3025,7 +3056,7 @@ TEST_CASE("Atlas pins read and export historical store fibers without source fil
     atlas.fibers.front().fiberPath=fs::path(attachment.storeUuid)/uuid;
     atlas.fibers.front().storeToAtlasScale=0.5;
     const auto pinnedDir=root/"atlases/pinned";
-    saveSurface(pinnedDir/"base_mesh/base.tifxyz",makeWrappedPlane(3,3,1.0));
+    atlas.metadata.basePin=vc::atlas::storeAtlasBaseSurface(*store,attachment,*makeWrappedPlane(3,3,1.0),"base","{}");
     atlas.save(pinnedDir);
     fs::remove(root/"fibers/fiber.json");
     auto loaded=vc::atlas::Atlas::load(pinnedDir, store);

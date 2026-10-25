@@ -276,11 +276,11 @@ int main(int argc, char** argv)
                 options.atlasDir,
                 options.volpkgRoot,
                 store);
-        QuadSurface baseSurface(exportData.basePath);
+        const auto baseSurface = vc::atlas::loadAtlasBaseSurface(exportData.atlas, store);
 
         auto result = vc::atlas::exportAtlasConstraints(
             exportData,
-            &baseSurface,
+            baseSurface.get(),
             nullptr,
             options.exportOptions);
         if (!result.collections.saveToJSON(options.output.string())) {

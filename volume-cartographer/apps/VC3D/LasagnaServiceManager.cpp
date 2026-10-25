@@ -88,22 +88,9 @@ QString objectRefKey(const QJsonObject& ref)
         + ref[QStringLiteral("hash")].toString();
 }
 
-QString md5Ref(const QByteArray& bytes)
-{
-    return QStringLiteral("md5:%1").arg(QString::fromLatin1(
-        QCryptographicHash::hash(bytes, QCryptographicHash::Md5).toHex()));
-}
-
 QString md5DigestRef(const QByteArray& digest)
 {
     return QStringLiteral("md5:%1").arg(QString::fromLatin1(digest.toHex()));
-}
-
-QByteArray jsonString(const QString& value)
-{
-    QByteArray encoded =
-        QJsonDocument(QJsonArray{value}).toJson(QJsonDocument::Compact);
-    return encoded.mid(1, encoded.size() - 2);
 }
 
 void writeUploadBytes(QIODevice& output, const QByteArray& bytes)
@@ -145,8 +132,7 @@ std::shared_ptr<QTemporaryFile> materializeLocalArtifactUpload(
         throw std::runtime_error("Cannot create temporary artifact upload");
     }
 
-    if (upload.contains(QStringLiteral("data"))
-        || upload.contains(QStringLiteral("files"))) {
+    if (upload.contains(QStringLiteral("data"))) {
         writeUploadBytes(
             *body, QJsonDocument(upload).toJson(QJsonDocument::Compact));
         body->seek(0);
@@ -180,57 +166,6 @@ std::shared_ptr<QTemporaryFile> materializeLocalArtifactUpload(
                     .toStdString());
         }
         writeUploadBytes(*body, QByteArrayLiteral("\"}"));
-        body->seek(0);
-        return body;
-    }
-
-    if (payload == QStringLiteral("directory")) {
-        namespace fs = std::filesystem;
-        const fs::path root(localPath.toStdString());
-        std::vector<fs::path> files;
-        std::error_code ec;
-        for (const auto& entry : fs::recursive_directory_iterator(root, ec)) {
-            if (entry.is_regular_file()) {
-                files.push_back(entry.path());
-            }
-        }
-        if (ec) {
-            throw std::runtime_error(QStringLiteral("Cannot scan artifact directory: %1").arg(localPath).toStdString());
-        }
-        std::sort(files.begin(), files.end());
-
-        QByteArray manifest;
-        writeUploadBytes(*body, QByteArrayLiteral(",\"files\":{"));
-        bool first = true;
-        for (const auto& path : files) {
-            const auto relPath = fs::relative(path, root, ec);
-            if (ec) {
-                throw std::runtime_error(
-                    QStringLiteral("Cannot compute artifact relative path: %1")
-                        .arg(QString::fromStdString(path.string()))
-                        .toStdString());
-            }
-            const QString rel = QString::fromStdString(relPath.generic_string());
-            if (!first) writeUploadBytes(*body, QByteArrayLiteral(","));
-            first = false;
-            writeUploadBytes(*body, jsonString(rel) + QByteArrayLiteral(":\""));
-            const QString fileHash = writeBase64File(
-                *body, QString::fromStdString(path.string()));
-            writeUploadBytes(*body, QByteArrayLiteral("\""));
-            manifest.append(rel.toUtf8());
-            manifest.append('\t');
-            manifest.append(fileHash.toUtf8());
-            manifest.append('\n');
-        }
-        const QString actualHash = md5Ref(manifest);
-        if (actualHash != ref[QStringLiteral("hash")].toString()) {
-            throw std::runtime_error(
-                QStringLiteral("Artifact directory hash mismatch for %1: declared %2 actual %3")
-                    .arg(ref[QStringLiteral("name")].toString(),
-                         ref[QStringLiteral("hash")].toString(), actualHash)
-                    .toStdString());
-        }
-        writeUploadBytes(*body, QByteArrayLiteral("}}"));
         body->seek(0);
         return body;
     }

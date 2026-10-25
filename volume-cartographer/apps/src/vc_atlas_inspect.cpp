@@ -308,7 +308,7 @@ void printHuman(const vc::atlas::LasagnaAtlasExport& exportData,
     std::cout.imbue(std::locale::classic());
     std::cout << "Atlas control inspection\n"
               << "  atlas_dir=" << exportData.atlasDir.generic_string() << '\n'
-              << "  base_mesh=" << exportData.basePath.generic_string() << '\n'
+              << "  base_surface=" << exportData.atlas.metadata.basePin->object.objectUuid << '\n'
               << "  period_columns=" << periodColumns << '\n'
               << "  fibers=" << exportData.atlas.fibers.size()
               << " control_anchors=" << rows.size()
@@ -502,7 +502,8 @@ int main(int argc, char** argv)
         store->attach(options.objectStore, storeOptions);
         const auto exportData = vc::atlas::loadLasagnaAtlasExport(options.atlasDir,
                                                                   project.volpkgRoot, store);
-        const QuadSurface baseSurface(exportData.basePath);
+        const auto baseSurfacePtr = vc::atlas::loadAtlasBaseSurface(exportData.atlas, store);
+        const QuadSurface& baseSurface = *baseSurfacePtr;
         const SourceControlByObjectId sourceControls = loadSourceControlPoints(exportData);
 
         std::optional<RemapReport> remapReport;

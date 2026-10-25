@@ -144,55 +144,6 @@ QJsonObject bytesArtifact(const QByteArray& bytes,
     return upload;
 }
 
-QJsonObject segmentArtifactForPath(const std::filesystem::path& segPath,
-                                   const QString& objectType,
-                                   const QString& objectFormat,
-                                   qint64* rawBytes,
-                                   int* fileCount)
-{
-    std::vector<std::filesystem::path> files;
-    std::error_code ec;
-    for (const auto& entry : std::filesystem::recursive_directory_iterator(segPath, ec)) {
-        if (entry.is_regular_file()) {
-            files.push_back(entry.path());
-        }
-    }
-    std::sort(files.begin(), files.end());
-
-    QByteArray manifest;
-    for (const auto& path : files) {
-        QFile f(QString::fromStdString(path.string()));
-        if (!f.open(QIODevice::ReadOnly)) {
-            return {};
-        }
-        const QByteArray bytes = f.readAll();
-        const auto relPath = std::filesystem::relative(path, segPath, ec);
-        if (ec) {
-            return {};
-        }
-        const QString rel = QString::fromStdString(relPath.generic_string());
-        const QString fileHash = md5Ref(bytes);
-        manifest.append(rel.toUtf8());
-        manifest.append('\t');
-        manifest.append(fileHash.toUtf8());
-        manifest.append('\n');
-        if (rawBytes) {
-            *rawBytes += bytes.size();
-        }
-        if (fileCount) {
-            ++(*fileCount);
-        }
-    }
-
-    const QString segName = QString::fromStdString(segPath.filename().string());
-    QJsonObject upload;
-    upload[QStringLiteral("object")] = makeObjectRef(
-        objectType, segName, md5Ref(manifest), objectFormat);
-    upload[QStringLiteral("_local_payload")] = QStringLiteral("directory");
-    upload[QStringLiteral("_local_path")] = QString::fromStdString(segPath.string());
-    return upload;
-}
-
 QStringList linkedSurfaceNamesFromRefs(const QJsonArray& refs)
 {
     QStringList names;
@@ -356,8 +307,6 @@ bool buildAtlasRequestArtifacts(const std::filesystem::path& atlasDir,
         atlasExport.atlas.metadata.name.empty()
             ? atlasDir.filename().string()
             : atlasExport.atlas.metadata.name);
-    const QString baseRel = QString::fromStdString(
-        atlasExport.baseRelativePath.generic_string());
 
     auto appendUploadIfNew = [out](const QJsonObject& upload) {
         const QJsonObject ref = upload[QStringLiteral("object")].toObject();
@@ -374,30 +323,10 @@ bool buildAtlasRequestArtifacts(const std::filesystem::path& atlasDir,
         out->uploads.append(upload);
     };
 
-    QJsonObject baseUpload = segmentArtifactForPath(
-        atlasExport.basePath,
-        QStringLiteral("atlas-base"),
-        QStringLiteral("tifxyz"),
-        &out->rawBytes,
-        &out->fileCount);
-    if (baseUpload.isEmpty()) {
-        if (error) {
-            *error = QObject::tr("Cannot pack atlas base mesh: %1")
-                .arg(QString::fromStdString(atlasExport.basePath.string()));
-        }
-        return false;
-    }
-    QJsonObject baseRef = baseUpload[QStringLiteral("object")].toObject();
-    baseRef[QStringLiteral("name")] = safeAtlasObjectName(atlasName, baseRel, QStringLiteral("base_mesh.tifxyz"));
-    baseUpload[QStringLiteral("object")] = baseRef;
-    appendUploadIfNew(baseUpload);
-
+    // The compact atlas refers to its base surface in the store (base.ref).
     QJsonDocument compactDoc = QJsonDocument::fromJson(
         QByteArray::fromStdString(atlasExport.compactJson.dump()));
     QJsonObject compact = compactDoc.object();
-    QJsonObject compactBase = compact[QStringLiteral("base")].toObject();
-    compactBase[QStringLiteral("ref")] = baseRef;
-    compact[QStringLiteral("base")] = compactBase;
 
     QSet<QString> lineIds;
     QHash<QString, QJsonObject> lineRefsById;

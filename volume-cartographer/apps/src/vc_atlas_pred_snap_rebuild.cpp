@@ -1049,12 +1049,8 @@ int main(int argc, char** argv)
 
         vc::atlas::Atlas atlas =
             vc::atlas::Atlas::load(options.atlasDir, store);
-        if (atlas.metadata.baseMeshPath.empty()) {
-            throw std::runtime_error("atlas metadata is missing base_mesh_path");
-        }
-        const fs::path basePath = (options.atlasDir / atlas.metadata.baseMeshPath)
-                                      .lexically_normal();
-        QuadSurface baseSurface(basePath);
+        const auto baseSurfacePtr = vc::atlas::loadAtlasBaseSurface(atlas, store);
+        const QuadSurface& baseSurface = *baseSurfacePtr;
 
         if (options.verbose) {
             std::cout << "atlas=" << options.atlasDir << '\n'
@@ -1063,7 +1059,7 @@ int main(int argc, char** argv)
                       << "lasagna_manifest=" << options.lasagnaManifest << '\n'
                       << "pred_dt_spacing=" << optionalDoubleString(predDtSpacing) << '\n'
                       << "pred_dt_search_step=" << optionalDoubleString(predDtStepVx) << '\n'
-                      << "base_mesh=" << basePath << '\n'
+                      << "base_surface=" << atlas.metadata.basePin->object.objectUuid << '\n'
                       << "fibers=" << atlas.fibers.size()
                       << " dry_run=" << (options.dryRun ? "yes" : "no")
                       << " overwrite_manual=" << (options.overwriteManual ? "yes" : "no")

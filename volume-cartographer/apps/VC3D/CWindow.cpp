@@ -1144,7 +1144,7 @@ AtlasSearchSigningContext prepareAtlasSearchSigningContext(
         if (progressCallback) {
             progressCallback(vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface, 1, total);
         }
-        context.baseMapping = vc::atlas::loadAtlasBaseMappingContext(*atlasDir, context.atlas);
+        context.baseMapping = vc::atlas::loadAtlasBaseMappingContext(context.atlas, store);
         context.haveAtlas = true;
         context.orientationSource = QStringLiteral("selected_atlas");
         if (progressCallback) {
@@ -4568,8 +4568,8 @@ void CWindow::refreshAtlasOverviewDocks()
 
                 auto* coveredSize = new QTreeWidgetItem(item);
                 coveredSize->setText(0, tr("Object covered atlas size"));
-                const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
-                const QuadSurface baseSurface(basePath);
+                const auto baseSurfacePtr = vc::atlas::loadAtlasBaseSurface(atlas, store);
+                const QuadSurface& baseSurface = *baseSurfacePtr;
                 const auto* basePoints = baseSurface.rawPointsPtr();
                 if (!basePoints || basePoints->empty() || basePoints->cols <= 0) {
                     throw std::runtime_error("atlas base mesh has no valid grid");
@@ -6169,8 +6169,8 @@ void CWindow::updateAtlasSearchPreviewCandidates()
 
     try {
         vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_currentAtlasDir, store);
-        const std::filesystem::path basePath = *_currentAtlasDir / atlas.metadata.baseMeshPath;
-        QuadSurface baseSurface(basePath);
+        const auto baseSurfacePtr = vc::atlas::loadAtlasBaseSurface(atlas, store);
+        const QuadSurface& baseSurface = *baseSurfacePtr;
         const auto* points = baseSurface.rawPointsPtr();
         if (!points || points->empty() || points->cols <= 0) {
             throw std::runtime_error("atlas base mesh has no valid grid");
@@ -6340,8 +6340,7 @@ void CWindow::requestAtlasSearchPreviewLine(int sortedResultIndex)
     ]() -> std::optional<AtlasOverlayController::SearchPreviewFiber> {
         try {
             vc::atlas::Atlas atlas = vc::atlas::Atlas::load(atlasDir, store);
-            const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
-            auto baseSurface = std::make_shared<QuadSurface>(basePath);
+            auto baseSurface = vc::atlas::loadAtlasBaseSurface(atlas, store);
             const auto* points = baseSurface->rawPointsPtr();
             if (!points || points->empty() || points->cols <= 0) {
                 throw std::runtime_error("atlas base mesh has no valid grid");
@@ -6466,8 +6465,7 @@ void CWindow::loadAndDisplayAtlas(const std::filesystem::path& atlasDir)
         _segmentationWidget->lasagnaPanel()->setSelectedAtlasPath(
             QString::fromStdString(atlasDir.string()));
     }
-    const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
-    auto baseSurface = std::make_shared<QuadSurface>(basePath);
+    auto baseSurface = vc::atlas::loadAtlasBaseSurface(atlas, store);
     const auto* points = baseSurface->rawPointsPtr();
     if (!points || points->empty() || points->cols <= 0) {
         throw std::runtime_error("atlas base mesh has no valid grid");
