@@ -34,6 +34,20 @@ class MergeConfig(TaskConfig):
     interpolation: str = "average"  # "average" or "nearest"
 
 
+def _validate_merge_paths(input1: str, input2: str, output: Optional[str]) -> None:
+    """Keep an output store separate from both read-only input trees."""
+    if not output:
+        raise ValueError("merge requires a separate output path")
+    destination = Path(output).resolve()
+    for source in (input1, input2):
+        input_path = Path(source).resolve()
+        if destination.is_relative_to(input_path) or input_path.is_relative_to(destination):
+            raise ValueError(
+                "merge output overlaps an input; use a separate output directory: "
+                f"{output!r} and {source!r}"
+            )
+
+
 def _merge_chunk_worker(args: Tuple) -> str:
     """Process a single chunk: read both, take maximum, write output.
 
@@ -177,6 +191,87 @@ def _downsample_chunk_worker(args: Tuple) -> str:
     return "written"
 
 
+def _merge_grid(group):
+    """Read the physical grid of the exact level0 array consumed by merge."""
+    from copy import deepcopy
+    import math
+
+    if "multiscales" not in group.attrs:
+        if "ome" in group.attrs:
+            raise ValueError("merge supports declared OME-NGFF0.4 grids only")
+        return None
+    multiscales = group.attrs["multiscales"]
+    if not isinstance(multiscales, list):
+        raise ValueError("merge multiscales must be a list")
+    matches = []
+    for image in multiscales:
+        if not isinstance(image, dict) or not isinstance(image.get("datasets"), list):
+            raise ValueError("merge needs datasets in each multiscales entry")
+        for dataset in image["datasets"]:
+            if not isinstance(dataset, dict):
+                raise ValueError("merge datasets must be objects")
+            if dataset.get("path") in ("0", "0/", "./0"):
+                matches.append((image, dataset))
+    if len(matches) != 1:
+        raise ValueError("merge needs exactly one declared grid for level0")
+    image, dataset = matches[0]
+    axes = image.get("axes")
+    if (not isinstance(axes, list) or len(axes) != 3 or len(group["0"].shape) != 3
+            or not all(isinstance(axis, dict) and isinstance(axis.get("name"), str)
+                       and axis["name"] and axis.get("type", "space") == "space"
+                       and ("unit" not in axis or isinstance(axis["unit"], str) and axis["unit"])
+                       for axis in axes)
+            or len({axis["name"] for axis in axes}) != 3):
+        raise ValueError("merge declared grids require three named spatial axes")
+
+    def transforms(items):
+        if (not isinstance(items, list) or len(items) not in (1, 2)
+                or not all(isinstance(item, dict) for item in items)
+                or [item.get("type") for item in items] not in
+                   (["scale"], ["scale", "translation"])):
+            raise ValueError("merge coordinates require scale then optional translation")
+        vectors = {"translation": [0.0, 0.0, 0.0]}
+        for item in items:
+            kind = item["type"]
+            values = item.get(kind)
+            if (not isinstance(values, list) or len(values) != 3
+                    or not all(isinstance(value, (int, float)) and not isinstance(value, bool)
+                               for value in values)):
+                raise ValueError("merge coordinates require three finite numbers")
+            try:
+                values = [float(value) for value in values]
+            except (ValueError, OverflowError):
+                raise ValueError("merge coordinates require three finite numbers") from None
+            if not all(math.isfinite(value) and (kind != "scale" or value > 0) for value in values):
+                raise ValueError("merge coordinates must be finite with positive scale")
+            vectors[kind] = values
+        return vectors["scale"], vectors["translation"]
+
+    scale, translation = transforms(dataset.get("coordinateTransformations"))
+    if "coordinateTransformations" in image:
+        outer_scale, outer_translation = transforms(image["coordinateTransformations"])
+        scale = [a*b for a, b in zip(scale, outer_scale)]
+        translation = [a*b+c for a, b, c in zip(translation, outer_scale, outer_translation)]
+    if not all(math.isfinite(value) and value > 0 for value in scale) or not all(
+            math.isfinite(value) for value in translation):
+        raise ValueError("merge composed grid must be finite with positive scale")
+    return {"axes": deepcopy(axes), "scale": scale, "translation": translation}
+
+
+def _merge_grids_match(first, second):
+    """Compare units/order exactly and positions relative to voxel pitch."""
+    import math
+
+    signature = lambda grid: [(a["name"], a.get("type", "space"), a.get("unit"))
+                              for a in grid["axes"]]
+    return (signature(first) == signature(second)
+        and all(math.isclose(a, b, rel_tol=1e-12, abs_tol=0.0)
+                for a, b in zip(first["scale"], second["scale"]))
+        and all(abs(a-b) <= min(sa, sb)*1e-9
+                for a, b, sa, sb in zip(first["translation"], second["translation"],
+                                       first["scale"], second["scale"])))
+
+
 @register_task("merge")
 class MergeTask(ZarrTask):
     """Merge two OME-Zarr files by taking the maximum at overlapping positions."""
@@ -189,6 +284,7 @@ class MergeTask(ZarrTask):
         self._dtype: np.dtype = np.dtype("uint8")
         self._compressor: Optional[Blosc] = None
         self._merge_stats: Counter = Counter()
+        self._grid = None
 
     @classmethod
     def add_arguments(cls, parser: argparse.ArgumentParser) -> None:
@@ -225,6 +321,10 @@ class MergeTask(ZarrTask):
         """Validate merge arguments."""
         if not args.input2:
             raise SystemExit("Error: --input2 is required for merge task")
+        try:
+            _validate_merge_paths(args.input_zarr, args.input2, args.output_zarr)
+        except ValueError as error:
+            raise SystemExit(f"Error: {error}") from None
 
     @classmethod
     def from_args(cls, args: argparse.Namespace) -> "MergeTask":
@@ -263,12 +363,22 @@ class MergeTask(ZarrTask):
                 f"Dtype mismatch: input1 has dtype {arr1.dtype}, input2 has dtype {arr2.dtype}."
             )
 
+        first_grid, second_grid = _merge_grid(store1), _merge_grid(store2)
+        if (first_grid is None) != (second_grid is None):
+            raise ValueError("merge requires both inputs to declare grids, or neither")
+        if first_grid is not None and not _merge_grids_match(first_grid, second_grid):
+            raise ValueError("merge inputs declare different coordinate grids; align them first")
+        self._grid = first_grid
+
         self._shape = arr1.shape
         self._chunks = arr1.chunks
         self._dtype = arr1.dtype
 
     def prepare(self) -> None:
         """Validate inputs and create output zarr."""
+        _validate_merge_paths(
+            self.config.input_zarr, self.config.input2_zarr, self.config.output_zarr
+        )
         print(f"Input 1: {self.config.input_zarr}")
         print(f"Input 2: {self.config.input2_zarr}")
         print(f"Output: {self.config.output_zarr}")
@@ -386,7 +496,12 @@ class MergeTask(ZarrTask):
                     pass
 
     def _create_ome_zarr_metadata(self) -> dict:
-        """Create OME-Zarr multiscales metadata."""
+        """Keep the validated level0 grid and existing pyramid-origin convention."""
+        from copy import deepcopy
+
+        grid = self._grid
+        base_scale = grid["scale"] if grid is not None else [1.0, 1.0, 1.0]
+        translation = grid["translation"] if grid is not None else [0.0, 0.0, 0.0]
         datasets = []
         for level in range(self.config.num_levels):
             scale = 2**level
@@ -396,9 +511,10 @@ class MergeTask(ZarrTask):
                     "coordinateTransformations": [
                         {
                             "type": "scale",
-                            "scale": [float(scale), float(scale), float(scale)],
+                            "scale": [value * scale for value in base_scale],
                         }
-                    ],
+                    ] + ([{"type": "translation", "translation": list(translation)}]
+                         if any(translation) else []),
                 }
             )
 
@@ -407,11 +523,8 @@ class MergeTask(ZarrTask):
                 {
                     "version": "0.4",
                     "name": "merged",
-                    "axes": [
-                        {"name": "z", "type": "space", "unit": "micrometer"},
-                        {"name": "y", "type": "space", "unit": "micrometer"},
-                        {"name": "x", "type": "space", "unit": "micrometer"},
-                    ],
+                    "axes": (deepcopy(grid["axes"]) if grid is not None else
+                             [{"name": name, "type": "space"} for name in ("z", "y", "x")]),
                     "datasets": datasets,
                     "type": self.config.interpolation,
                     "metadata": {
