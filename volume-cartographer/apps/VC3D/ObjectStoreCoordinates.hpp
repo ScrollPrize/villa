@@ -11,10 +11,6 @@ inline nlohmann::json coordinateBindingForVolume(const Volume& volume, double st
             {"coordinate_binding", {{"active_volume_id", volume.id()}, {"shape_zyx", volume.shape()},
                                     {"resolution_um", volume.voxelSize()}}}};
 }
-inline std::optional<double> geometryScaleForVolume(const nlohmann::json& metadata, const Volume& volume)
-{
-    return vc::objects::geometryScaleToVolume(metadata, volume.id());
-}
 // Bind an object of any kind, pinned at `objectRevision`, to `volume`: its stored
 // coordinates are `storedUnitsPerVoxel` units per volume voxel. Its
 // relationships are kept as recorded.

@@ -3,6 +3,7 @@
 #include "OpenDataCoordinateIdentity.hpp"
 #include "OpenDataManifest.hpp"
 #include "VCSettings.hpp"
+#include "ObjectStoreRegions.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -221,11 +222,10 @@ CState::CState(QObject* parent, bool debugDownloadQueue, CState* objectStoreOwne
     setSurface("yz plane",
         std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{1,0,0}));
     connect(this, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
-        using Kind = vc::objects::StoreSessionEvent::Kind;
-        if (event.kind == Kind::Hub) return;
-        if (event.kind == Kind::Committed &&
-            std::none_of(event.changes.begin(), event.changes.end(),
-                         [](const auto& change) { return change.kind == "umbilicus"; }))
+        // The umbilicus is read through the store's volume mapping, so a
+        // registration change moves it too.
+        if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub ||
+            !vc3d::store::touches(event, {"umbilicus", "volume_transform", "volume_transform_choice"}))
             return;
         emit umbilicusChanged();
     });

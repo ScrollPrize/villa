@@ -94,7 +94,7 @@ int runObjectStoreControllerTests()
             const auto volume = Volume::New(fs::path(volumeDir.path().toStdString())/"ct.zarr", create);
             const auto binding = vc3d::coordinateBindingForVolume(*volume, 4);
             require(binding.at("coordinates").at("volume_uuid") == "20260411134726", "VC3D retains catalog volume ID verbatim");
-            require(vc3d::geometryScaleForVolume(binding, *volume) == .25, "VC3D matches the authoritative volume ID");
+            require(vc::objects::geometryScaleToVolume(binding, volume->id()) == .25, "VC3D matches the authoritative volume ID");
         }
         {
             // The umbilicus is the store's, bound to a volume; its frame was set when stored.
@@ -605,7 +605,7 @@ int runObjectStoreControllerTests()
                 fiber=resolve(fiber.uuid);
                 auto mismatched = fiber.coordinateIdentity;
                 mismatched["coordinates"]["volume_uuid"] = vc::objects::util::newUuid();
-                require(!vc3d::geometryScaleForVolume(mismatched, *state.currentVolume()),
+                require(!vc::objects::geometryScaleToVolume(mismatched, state.currentVolume()->id()),
                         "matching display ID cannot override conflicting volume UUID");
                 const auto display = controller.fiberInVolumeCoordinates(fiber);
                 require(display.controlPoints.front() == fiber.controlPoints.front() * .25 && display.linePoints.front() == fiber.linePoints.front() * .25, "display geometry uses explicit binding");

@@ -17995,14 +17995,14 @@ std::optional<double> LineAnnotationController::fiberCoordinateScaleForVolume(
         if (object && !object->retired) metadata = nlohmann::json::parse(object->meta);
     });
     if (!metadata) return std::nullopt;
-    return vc3d::geometryScaleForVolume(*metadata, *volume);
+    return vc::objects::geometryScaleToVolume(*metadata, volume->id());
 }
 
 std::optional<double> LineAnnotationController::storedFiberScale(const StoredFiber& fiber) const
 {
     const auto volume = _state ? _state->currentVolume() : nullptr;
     if (!volume || !fiber.storePin) return std::nullopt;
-    return vc3d::geometryScaleForVolume(fiber.coordinateIdentity, *volume);
+    return vc::objects::geometryScaleToVolume(fiber.coordinateIdentity, volume->id());
 }
 
 uint64_t LineAnnotationController::fiberIdForUuid(const std::string& uuid) const
