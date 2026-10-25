@@ -735,8 +735,10 @@ class RemoteTests(RemoteFixtureCase):
 
     def test_remote_process_population_temporary_limit_and_shared_chunk_budget(self):
         source = Source('workers', Storage(self.url+'/image.png', 'png'))
+        # Forked children cannot open the disk cache with Apple's system SQLite ("locking protocol" or a crash).
+        methods = ('spawn',) if sys.platform == 'darwin' else ('spawn', 'fork')
         with source.open(cache_dir=self.cache) as reader:
-            for method in ('spawn', 'fork'):
+            for method in methods:
                 if method not in multiprocessing.get_all_start_methods():
                     continue
                 with multiprocessing.get_context(method).Pool(2) as pool:
@@ -758,7 +760,7 @@ class RemoteTests(RemoteFixtureCase):
         disk_budget(str(self.cache), limit)
         with zarr.open(cache_dir=self.cache) as reader:
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
-            self.assertEqual(reader._backend.reader.write_layer.budget_root, str(self.cache))
+            self.assertEqual(reader._backend.reader.write_layer.budget_root, str(self.cache.resolve()))
         with source.open(cache_dir=self.cache) as reader:
             np.testing.assert_array_equal(reader.read((0, 0), (5, 7)), self.data)
         import sqlite3
