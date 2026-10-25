@@ -3,7 +3,6 @@
 #include "vc_object_store/store/GeometryViews.hpp"
 #include <nanobind/stl/variant.h>
 #include <nanobind/ndarray.h>
-#include <cstring>
 
 namespace {
 vo::GeometryData geometryInputFromPy(const nb::object& input)
@@ -53,7 +52,20 @@ inline void bindTypedGeometry(nb::module_& m)
         .def_rw("line_points", &vg::Fiber::linePoints)
         .def_rw("control_point_ids", &vg::Fiber::controlPointIds)
         .def("validate", &vg::Fiber::validate)
-        .def("length", &vg::Fiber::length);
+        .def("length", &vg::Fiber::length)
+        .def_static("from_arrays", [](nb::ndarray<const double, nb::shape<-1, 3>, nb::c_contig, nb::device::cpu> controls,
+                                      std::optional<nb::ndarray<const double, nb::shape<-1, 3>, nb::c_contig, nb::device::cpu>> line) {
+            vg::Fiber f;
+            f.controlPoints.resize(controls.shape(0));
+            for (size_t i = 0; i < f.controlPoints.size(); ++i) f.controlPoints[i] = {controls.data()[3*i], controls.data()[3*i+1], controls.data()[3*i+2]};
+            if (line) {
+                f.linePoints.resize(line->shape(0));
+                for (size_t i = 0; i < f.linePoints.size(); ++i) f.linePoints[i] = {line->data()[3*i], line->data()[3*i+1], line->data()[3*i+2]};
+            }
+            f.validate();
+            return f;
+        }, nb::arg("control_points"), nb::arg("line_points") = nb::none(),
+           "A fiber from (n, 3) float64 control points and optional sampled line points; control IDs are 0..n-1.");
     nb::class_<vg::Track>(m, "Track")
         .def(nb::init<std::vector<vg::TrackPoint>>(), nb::arg("points"))
         .def_rw("points", &vg::Track::points)
@@ -62,7 +74,14 @@ inline void bindTypedGeometry(nb::module_& m)
     nb::class_<vg::Umbilicus>(m, "Umbilicus")
         .def(nb::init<std::vector<vg::Point>>(), nb::arg("points"))
         .def_rw("points", &vg::Umbilicus::points)
-        .def("validate", &vg::Umbilicus::validate);
+        .def("validate", &vg::Umbilicus::validate)
+        .def_static("from_arrays", [](nb::ndarray<const double, nb::shape<-1, 3>, nb::c_contig, nb::device::cpu> points) {
+            vg::Umbilicus u;
+            u.points.resize(points.shape(0));
+            for (size_t i = 0; i < u.points.size(); ++i) u.points[i] = {points.data()[3*i], points.data()[3*i+1], points.data()[3*i+2]};
+            u.validate();
+            return u;
+        }, nb::arg("points"), "An umbilicus from (n, 3) float64 control points.");
     nb::class_<vg::Surface>(m, "Surface")
         .def(nb::init<int64_t, int64_t, std::array<double, 2>, std::vector<vg::SurfacePoint>>(),
              nb::arg("rows"), nb::arg("columns"), nb::arg("scale"), nb::arg("points"))
@@ -94,7 +113,7 @@ inline void bindTypedGeometry(nb::module_& m)
                                       std::optional<nb::ndarray<const uint8_t, nb::ndim<2>, nb::c_contig, nb::device::cpu>> validity) {
             vg::Surface s{int64_t(points.shape(0)), int64_t(points.shape(1)), scale, {}};
             s.points.resize(size_t(s.rows * s.columns));
-            std::memcpy(s.points.data(), points.data(), s.points.size() * sizeof(vg::SurfacePoint));
+            for (size_t i = 0; i < s.points.size(); ++i) s.points[i] = {points.data()[3*i], points.data()[3*i+1], points.data()[3*i+2]};
             if (validity) {
                 if (validity->shape(0) != points.shape(0) || validity->shape(1) != points.shape(1))
                     throw std::invalid_argument("validity must match the points grid");

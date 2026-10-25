@@ -681,3 +681,13 @@ def test_numpy_geometry_and_coordinate_bindings(db):
     assert geometry_scale_to_volume(db.object(bound)['meta'], 'other') is None
     assert db.unbound_object_count('umbilicus', 'vol') == 0
     assert db.unbound_object_count('surface', 'vol') == 1
+
+
+def test_numpy_constructors_for_polylines(db):
+    from vc_object_store import Umbilicus
+    fiber = Fiber.from_arrays(np.array([[0, 0, 0], [2, 0, 0]], '<f8'), np.array([[0, 0, 0], [1, 0, 0], [2, 0, 0]], '<f8'))
+    uid, _ = put(db, fiber, 'fiber')
+    with db.geometry_snapshot() as snapshot:
+        view = snapshot.fiber(uid)
+        assert view.control_point_ids(0, 2) == [0, 1] and view.line_points_array().tolist()[1] == [1, 0, 0]
+    assert Umbilicus.from_arrays(np.array([[1, 2, 3]], '<f8')).points == [[1, 2, 3]]
