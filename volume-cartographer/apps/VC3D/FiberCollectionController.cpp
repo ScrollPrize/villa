@@ -1,6 +1,7 @@
 #include "FiberCollectionController.hpp"
 #include "ObjectStoreEvents.hpp"
 #include <vc_object_store/geometry/ArrayBytes.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include "CState.hpp"
 #include "ViewerManager.hpp"
 #include "VCSettings.hpp"
@@ -47,13 +48,13 @@ using vc3d::store::Outcome;
 namespace
 {
 constexpr int64_t kCatalogPageSize = 200;
-cv::Vec3f cvpoint(const Point& p, double scale = 1)
+cv::Vec3f cvpoint(const Point& p)
 {
-    return {float(p[0] * scale), float(p[1] * scale), float(p[2] * scale)};
+    return {float(p[0]), float(p[1]), float(p[2])};
 }
-Point point(const cv::Vec3f& p, double scale = 1)
+Point point(const cv::Vec3f& p)
 {
-    return {p[0] * scale, p[1] * scale, p[2] * scale};
+    return {p[0], p[1], p[2]};
 }
 double dot(const Point& a, const Point& b)
 {
@@ -136,6 +137,8 @@ struct SelectedFiber {
     FiberCollectionController::CatalogRow row;
     vc::objects::PinnedObject pin;
     int64_t pointCount = 0;
+    // In volume voxels, for a fiber bound to the volume.
+    std::optional<double> volumeLength;
 };
 struct RegionResult {
     // The store's runs, in volume voxels.
@@ -180,18 +183,19 @@ std::map<std::string, std::string> linkGroupsOf(const vc::objects::ObjectStore& 
     }
     return groups;
 }
-// Stored units -> volume voxels of each listed object bound to the volume.
+// Stored coordinates -> volume voxels of each listed object bound to the volume.
 template <class Keys>
-std::map<std::string, double> volumeFactors(const vc::objects::ObjectStore& db, const vc::objects::ReadTxn& txn,
-                                            const Keys& objects, const std::string& volume)
+std::map<std::string, vc::objects::VolumeAffine> volumeMappings(const vc::objects::ObjectStore& db, const vc::objects::ReadTxn& txn,
+                                                                const Keys& objects, const std::string& volume)
 {
     vc::objects::ObjectSelection selection;
     for (const auto& [uuid, value] : objects) selection.uuids.push_back(uuid);
-    std::map<std::string, double> factors;
+    const auto transforms = db.volumeTransforms(txn);
+    std::map<std::string, vc::objects::VolumeAffine> mappings;
     for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{"meta"}))
-        if (const auto factor = vc::objects::geometryScaleToVolume(Json::parse(object.meta), volume))
-            factors.emplace(object.uuid, *factor);
-    return factors;
+        if (const auto mapping = transforms.toVolume(Json::parse(object.meta), volume))
+            mappings.emplace(object.uuid, *mapping);
+    return mappings;
 }
 }  // namespace
 
@@ -319,7 +323,7 @@ void FiberCollectionController::clear()
     enabled_ = false;
     selected_ = 0;
     selectedPin_.reset();
-    selectedToVolume_.reset();
+    selectedBound_ = false;
     pendingAnnotation_ = 0;
     catalogCursor_.reset();
     for (auto& [v, s] : views_) {
@@ -360,7 +364,6 @@ void FiberCollectionController::projectChanged(bool preserveSelection)
         enabled_ = false;
         invalidate();
         publishStatus(tr("Reading fiber catalog metadata…"));
-        nativeToViewer_ = 1;
         nativeVoxelMm_ = volume ? volume->voxelSize()/1000. : 1.;
     }
     const auto rev = revision_;
@@ -467,10 +470,10 @@ void FiberCollectionController::listPage(bool reset)
             if (none) return rows;
             connection->read(attachment, [&](const auto& db, const auto& txn, const auto& cancelled) {
                 std::vector<std::string> uuids;
+                const auto transforms = db.volumeTransforms(txn);
                 for (auto& record : db.selectObjects(txn, selection, std::vector<std::string>{"name", "tags", "fiber", "meta"})) {
                     CatalogRow row;
-                    if (selection.volume)
-                        row.toVolume = vc::objects::geometryScaleToVolume(Json::parse(record.meta), *selection.volume);
+                    if (selection.volume) row.mapping = transforms.toVolume(Json::parse(record.meta), *selection.volume);
                     uuids.push_back(record.uuid);
                     row.record = std::move(record);
                     rows.push_back(std::move(row));
@@ -506,11 +509,11 @@ void FiberCollectionController::listPage(bool reset)
             if (!result.error.isEmpty()) { publishStatus(result.error); return; }
             auto& rows = result.value;
             if (!rows.empty()) {
-                // A bound row resumes by volume length; an unbound one by UUID alone.
+                // A bound row resumes by the volume length the store ordered it by;
+                // an unbound one by UUID alone.
                 const auto& last = rows.back();
                 const double stored = last.record.fiber ? last.record.fiber->length : 0.0;
-                catalogCursor_ = CatalogCursor{last.record.uuid,
-                    !volume ? std::optional(stored) : last.toVolume ? std::optional(stored * *last.toVolume) : std::nullopt};
+                catalogCursor_ = CatalogCursor{last.record.uuid, !volume ? std::optional(stored) : last.record.volumeLength};
             }
             const bool more = rows.size() == size_t(kCatalogPageSize);
             emit catalogChanged(std::move(rows), more);
@@ -551,7 +554,8 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
                 auto& row=selected.row;
                 selected.pin={attachment,{attachment.storeUuid,uuid},revision->uuid,revision->geometryRevision};
                 row.record=revision->record;
-                row.toVolume=volumeId.empty() ? std::nullopt : vc::objects::geometryScaleToVolume(Json::parse(row.record.meta),volumeId);
+                if (!volumeId.empty()) row.mapping = db.volumeTransforms(txn).toVolume(Json::parse(row.record.meta), volumeId);
+                if (row.mapping) selected.volumeLength = db.geometryLengthInVolume(txn, uuid, volumeId);
                 const auto& fiber=*row.record.fiber;
                 selected.pointCount=fiber.linePointCount ? fiber.linePointCount : fiber.controlPointCount;
             });
@@ -569,10 +573,10 @@ void FiberCollectionController::selectFiber(int64_t id, bool focusView, bool ope
             // same fiber (after a commit) leaves them as they are.
             const bool reselected = selectedPin_ && selectedPin_->object == result.value.pin.object;
             selectedPin_ = result.value.pin;
-            selectedToVolume_ = row.toVolume;
+            selectedBound_ = row.mapping.has_value();
             emit fiberRevealed(row);
             const auto pointCount = result.value.pointCount;
-            const double length = row.toVolume ? row.record.fiber->length * *row.toVolume : -1.0;
+            const double length = result.value.volumeLength.value_or(-1.0);
             Selection selection;
             selection.id = id;
             selection.toolTip = QString::fromStdString(row.record.name);
@@ -594,8 +598,8 @@ void FiberCollectionController::navigate(int index)
 {
     if (!selected_ || !enabled_ || !selectedPin_) return;
     selection_.index = index;
-    if (!selectedToVolume_) selectedToVolume_ = annotations_->fiberCoordinateScale(uint64_t(selected_), true);
-    if (!selectedToVolume_) return;
+    if (!selectedBound_) selectedBound_ = annotations_->fiberCoordinateScale(uint64_t(selected_), true).has_value();
+    if (!selectedBound_) return;
     ++navigationRevision_;
     pendingIndex_ = index;
     if (navigationBusy_)
@@ -606,17 +610,18 @@ void FiberCollectionController::navigate(int index)
     const auto token = navigationRevision_;
     background<Point>(
         this,
-        [connection=state_->objectStoreSession(),pin=*selectedPin_,index]() {
+        [connection=state_->objectStoreSession(),pin=*selectedPin_,index,
+         volume=state_->currentVolume() ? state_->currentVolume()->id() : std::string{}]() {
             Point point{};
             connection->read(pin.attachment,[&](const auto& db,const auto& txn,const auto&) {
-                if(!pin.geometryRevision) throw std::runtime_error("Fiber has no geometry");
-                const auto geometry=db.geometryRevision(txn,*pin.geometryRevision);
-                const auto lines=std::find_if(geometry->arrays.begin(),geometry->arrays.end(),[](const auto& a){return a.name=="line_points";});
-                const auto name=lines!=geometry->arrays.end() && lines->shape[0]>0 ? "line_points" : "control_points";
-                point=vc::objects::xyzFromBytes<double>(db.readGeometryArray(txn,*pin.geometryRevision,name,int64_t(index)*24,24)).front();
+                // The fiber's point in the volume's voxels, through the store's mapping.
+                const auto fiber=vc::objects::GeometrySnapshot(db,txn).fiber(pin.object.objectUuid);
+                const auto shown=fiber.viewTransformedAt(volume);
+                const auto name=fiber.linePointCount()>0 ? "line_points" : "control_points";
+                point=shown.points(name,index,1).front();
             });return point;
         },
-        [this, rev, token, factor=*selectedToVolume_](const Outcome<Point>& result) {
+        [this, rev, token](const Outcome<Point>& result) {
             navigationBusy_ = false;
             if (pendingIndex_) {
                 const int next = *pendingIndex_;
@@ -632,7 +637,7 @@ void FiberCollectionController::navigate(int index)
                 publishSelection(selection);
                 return;
             }
-            manager_->centerFocusAt(cvpoint(result.value, factor), {0, 0, 1}, "fiber-collection");
+            manager_->centerFocusAt(cvpoint(result.value), {0, 0, 1}, "fiber-collection");
         });
 }
 std::optional<FiberCollectionController::Slice> FiberCollectionController::slice(VolumeViewerBase* viewer) const
@@ -642,9 +647,9 @@ std::optional<FiberCollectionController::Slice> FiberCollectionController::slice
     const auto rect = visibleSceneRect(viewer);
     if (rect.isEmpty())
         return std::nullopt;
-    return vc3d::store::viewRegion(point(viewer->sceneToVolume(rect.topLeft()), 1 / nativeToViewer_),
-                                   point(viewer->sceneToVolume(rect.topRight()), 1 / nativeToViewer_),
-                                   point(viewer->sceneToVolume(rect.bottomLeft()), 1 / nativeToViewer_),
+    return vc3d::store::viewRegion(point(viewer->sceneToVolume(rect.topLeft())),
+                                   point(viewer->sceneToVolume(rect.topRight())),
+                                   point(viewer->sceneToVolume(rect.bottomLeft())),
                                    options_.sliceDistance);
 }
 bool FiberCollectionController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
@@ -705,18 +710,17 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
                 }
                 result.runs = std::move(region.runs);
                 if (drawn.empty()) return;
-                const auto factors = volumeFactors(db, txn, drawn, volume);
+                const auto mappings = volumeMappings(db, txn, drawn, volume);
                 std::vector<std::string> revisions, owners;
                 for (const auto& [uuid, sampledRevision] : drawn)
-                    if (sampledRevision && factors.contains(uuid)) { revisions.push_back(*sampledRevision); owners.push_back(uuid); }
+                    if (sampledRevision && mappings.contains(uuid)) { revisions.push_back(*sampledRevision); owners.push_back(uuid); }
                 if (!revisions.empty()) {
                     const auto controls = db.readGeometryArrays(txn, revisions, "control_points");
                     if (controls.dtype != "<f8") throw std::runtime_error("fiber control points must be float64");
                     for (size_t i = 0; i < owners.size(); ++i) {
                         const auto positions = vc::objects::xyzFromBytes<double>(vc::objects::packedItem(controls, i));
                         for (size_t k = 0; k < positions.size(); ++k) {
-                            auto position = positions[k];
-                            for (auto& coordinate : position) coordinate *= factors.at(owners[i]);
+                            const auto position = mappings.at(owners[i]).apply(positions[k]);
                             result.controls.push_back({owners[i], int(k), position});
                         }
                     }
@@ -734,13 +738,12 @@ void FiberCollectionController::request(VolumeViewerBase* viewer, const Slice& s
                 for (const auto& edge : links) {
                     const bool sameHv = sameFamily(edge);
                     for (const auto& [endpoint, anchor] : {std::pair{edge.aUuid, edge.aAnchor}, std::pair{edge.bUuid, edge.bAnchor}}) {
-                        const auto factor = factors.find(endpoint);
-                        if (factor == factors.end()) continue;
+                        // Anchors are in the fiber's stored frame.
+                        const auto mapping = mappings.find(endpoint);
+                        if (mapping == mappings.end()) continue;
                         linkedUuids.insert(endpoint);
                         if (!anchor.position) continue;
-                        Point position{(*anchor.position)[0], (*anchor.position)[1], (*anchor.position)[2]};
-                        for (auto& coordinate : position) coordinate *= factor->second;
-                        marks[{endpoint, position}].add(edge, sameHv);
+                        marks[{endpoint, mapping->second.apply(*anchor.position)}].add(edge, sameHv);
                     }
                 }
                 for (const auto& [key, mark] : marks) result.rings.push_back({key.second, mark});
@@ -880,7 +883,7 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
                 p[j] = b.points[i - 1][j] + lo * d;
                 q[j] = b.points[i - 1][j] + hi * d;
             }
-            const auto pa = viewer->volumeToScene(cvpoint(p, nativeToViewer_)), pb = viewer->volumeToScene(cvpoint(q, nativeToViewer_));
+            const auto pa = viewer->volumeToScene(cvpoint(p)), pb = viewer->volumeToScene(cvpoint(q));
             // Stroke contiguous segments together. Independent round caps on
             // every tiny segment make Qt's compound-path rasterizer expensive
             // in dense views. Keep every vertex and every actual slice break.
@@ -949,7 +952,7 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
         // Only fibers drawn in this view, not ones crossing just the margin.
         if (!visibleIds.contains(int64_t(control.fiber)) ||
             !inside(current->project(control.position), current->local)) continue;
-        const auto scene = viewer->volumeToScene(cvpoint(control.position, nativeToViewer_));
+        const auto scene = viewer->volumeToScene(cvpoint(control.position));
         const auto color = colors.find(int64_t(control.fiber));
         OverlayStyle style;
         style.penColor = color == colors.end() ? QColor("#bbbbbb") : color->second;
@@ -962,7 +965,7 @@ void FiberCollectionController::collectPrimitives(VolumeViewerBase* viewer, Over
     if (options_.showLinked) {
         for (const auto& ring : v.rings) {
             if (!inside(current->project(ring.position), current->local)) continue;
-            addLinkMark(builder, viewer->volumeToScene(cvpoint(ring.position, nativeToViewer_)), linkMarkStyle(ring.mark, 1.0f), ring.mark.adjacent);
+            addLinkMark(builder, viewer->volumeToScene(cvpoint(ring.position)), linkMarkStyle(ring.mark, 1.0f), ring.mark.adjacent);
         }
     }
     const QString count = options_.maxDisplayed
@@ -1014,18 +1017,18 @@ void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const st
                 selection.family = family;
                 if (maximum > 0) selection.limit = maximum;
                 std::vector<std::string> uuids, revisions;
-                std::vector<double> factors;
+                std::vector<vc::objects::VolumeAffine> mappings;
+                const auto transforms = db.volumeTransforms(txn);
                 for (const auto& object : db.selectObjects(txn, selection, std::vector<std::string>{"fiber", "meta"})) {
                     if (cancel->load() || cancelled.load()) return;
                     if (!object.fiber || object.fiber->linePointCount == 0) continue;
-                    // The selection also lists fibers registered to the volume; fibers
-                    // are only drawn in a volume they are bound to by scale.
-                    const auto factor = vc::objects::geometryScaleToVolume(Json::parse(object.meta), volume);
+                    // Fibers bound by scale or through a registration, in volume voxels.
+                    const auto mapping = transforms.toVolume(Json::parse(object.meta), volume);
                     const auto head = db.currentGeometry(txn, object.uuid);
-                    if (!factor || !head) continue;
+                    if (!mapping || !head) continue;
                     uuids.push_back(object.uuid);
                     revisions.push_back(head->uuid);
-                    factors.push_back(*factor);
+                    mappings.push_back(*mapping);
                 }
                 if (revisions.empty()) return;
                 const auto controls = db.readGeometryArrays(txn, revisions, "control_points");
@@ -1038,7 +1041,7 @@ void FiberCollectionController::requestChains(VolumeViewerBase* viewer, const st
                     auto& index = controlIndex[uuids[i]];
                     index.first = result.chains.size();
                     for (const auto& position : vc::objects::xyzFromBytes<double>(vc::objects::packedItem(controls, i)))
-                        chain.points.push_back(cvpoint(position, factors[i]));
+                        chain.points.push_back(cvpoint(mappings[i].apply(position)));
                     const auto controlIds = vc::objects::scalarsFromBytes<int64_t>(vc::objects::packedItem(ids, i));
                     for (size_t k = 0; k < controlIds.size(); ++k) index.second[controlIds[k]] = k;
                     chain.linkMarks.assign(chain.points.size(), LinkMark{});

@@ -7203,7 +7203,8 @@ void CWindow::CreateWidgets(void)
             if (const auto& fiber = row.record.fiber) {
                 entry.controlPointCount = static_cast<int>(fiber->controlPointCount);
                 entry.linePointCount = static_cast<int>(fiber->linePointCount);
-                entry.lengthVx = fiber->length;
+                // The volume length the store ordered a bound row by; stored units otherwise.
+                entry.lengthVx = row.record.volumeLength.value_or(fiber->length);
                 (fiber->manualFamily ? entry.manualHvTag : entry.automaticHvTag) = fiber->family;
             }
             entry.linkedFiberCount = row.componentSize >= 2 ? row.componentSize : 0;

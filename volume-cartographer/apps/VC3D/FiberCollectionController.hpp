@@ -34,8 +34,9 @@ public:
     // One listed fiber: its record (name, tags, typed summary, metadata) and links.
     struct CatalogRow {
         vc::objects::ObjectRecord record;
-        // Stored units -> volume voxels; unset for a fiber not bound to the volume.
-        std::optional<double> toVolume;
+        // Stored coordinates -> volume voxels (by scale or a registration);
+        // unset for a fiber not bound to the volume.
+        std::optional<vc::objects::VolumeAffine> mapping;
         int links = 0;
         int pendingLinks = 0;
         // Fibers connected through links, this one included.
@@ -101,11 +102,10 @@ private:
     bool annotationBusy_{false};
     bool lineAnnotationActive_{false};
     int64_t pendingAnnotation_{};
-    double nativeToViewer_{1.0};
     double nativeVoxelMm_{1.0};
     int64_t selected_{0};
     std::optional<vc::objects::PinnedObject> selectedPin_;
-    std::optional<double> selectedToVolume_;
+    bool selectedBound_{false};
     Selection selection_;
     uint64_t revision_{0}, selectionRevision_{0}, navigationRevision_{0}, annotationRevision_{0};
     bool enabled_{false}, catalogBusy_{false}, catalogPending_{false}, navigationBusy_{false};

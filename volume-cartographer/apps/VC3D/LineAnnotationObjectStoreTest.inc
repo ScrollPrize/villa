@@ -144,6 +144,78 @@ int runObjectStoreControllerTests()
                     "several umbilici bound to one volume are refused");
             state.detachObjectStore();
         }
+        {
+            // Fibers bound by scale or through a registration are read and edited
+            // in the open volume's voxels and saved back to their stored frame.
+            QTemporaryDir dir;
+            Volume::ZarrCreateOptions create; create.shapeZYX = {16,16,16};
+            create.chunkShapeZYX = {16,16,16}; create.compressor = "none"; create.uuid = "frame-volume";
+            const auto volume = Volume::New(fs::path(dir.path().toStdString())/"ct.zarr", create);
+            const auto storePath = fs::path(dir.path().toStdString())/"objects.vcobj";
+            OpenOptions frameOptions; frameOptions.author = "vc3d-frame-test";
+            VolumeAffine shear; shear(0,0)=2; shear(0,1)=.5; shear(0,3)=1; shear(2,3)=3;
+            std::string scaled, registered;
+            const std::vector<vc::geometry::Point> controls{{2,4,6},{10,4,6}}, line{{2,4,6},{6,4,6},{10,4,6}};
+            {
+                auto db = ObjectStore::create(storePath, frameOptions);
+                auto txn = db.write();
+                (void)db.registerVolumeTransform(txn, "other-volume", "frame-volume", shear, "scan registration");
+                auto add = [&](const nlohmann::json& meta) {
+                    ObjectRecord record; record.kind = "fiber"; record.meta = meta.dump();
+                    vc::objects::FiberDetail detail; detail.width = 8; record.fiber = detail;
+                    const auto uuid = db.upsertObject(txn, record);
+                    vc::geometry::Fiber fiber; fiber.controlPoints = controls; fiber.linePoints = line;
+                    db.putGeometry(txn, uuid, vc::geometry::encode(fiber));
+                    return uuid;
+                };
+                // Two stored units per voxel: the volume sees half the coordinates.
+                scaled = add(vc3d::coordinateBindingForVolume(*volume, 2));
+                registered = add({{"coordinates", {{"volume_uuid", "other-volume"}, {"scale_factor", 1}}}});
+                txn.commit();
+            }
+            CState state;
+            Controller controller(&state,nullptr,nullptr,nullptr);
+            controller._errorDialogsSuppressed = true;
+            state.attachObjectStore(QString::fromStdString(storePath.string()), "vc3d-frame-test");
+            state.setCurrentVolume(volume);
+            auto read = [&](const std::string& uuid) {
+                auto fibers = controller.readStoredFibers(std::vector<std::string>{uuid}, true);
+                require(fibers.size() == 1 && fibers.front().editorError.empty(), "bound fiber decodes");
+                return fibers.front();
+            };
+            auto stored = [&](const std::string& uuid) {
+                vc::geometry::Fiber fiber;
+                state.objectStoreSession()->read(*state.objectStoreAttachment(), [&](const auto& db, const auto& txn, const auto&) {
+                    fiber = GeometrySnapshot(db, txn).fiber(uuid).load();
+                });
+                return fiber;
+            };
+            auto s = read(scaled), r = read(registered);
+            require(s.frame && r.frame && controller.storedFiberScale(s) == 1.0 && controller.storedFiberScale(r) == 1.0,
+                    "fibers bound by scale or registration are read in the volume");
+            require(cv::Vec3d(s.controlPoints[1]) == cv::Vec3d{5,2,3} && s.width == 4, "scale-bound fiber in volume voxels");
+            require(cv::Vec3d(r.controlPoints[0]) == cv::Vec3d{7,4,9}, "registered fiber in volume voxels");
+            // Move one control point (and its line sample) of each; save through the controller.
+            for (auto* fiber : {&s, &r}) {
+                fiber->controlPoints[1][0] += 1;
+                fiber->linePoints[2][0] += 1;
+            }
+            std::vector<Controller::FiberSaveSnapshot> edits{controller.makeFiberSaveSnapshot(s), controller.makeFiberSaveSnapshot(r)};
+            controller.commitFiberStoreAction(edits);
+            const auto savedScaled = stored(scaled), savedRegistered = stored(registered);
+            require(savedScaled.controlPoints[0] == controls[0] && savedScaled.linePoints[1] == line[1],
+                    "unchanged points keep their stored values");
+            require(savedScaled.controlPoints[1] == vc::geometry::Point{12,4,6} && savedScaled.linePoints[2] == savedScaled.controlPoints[1],
+                    "a moved point is saved in the stored frame");
+            require(savedRegistered.controlPoints[0] == controls[0] && savedRegistered.linePoints[1] == line[1],
+                    "unchanged points of a registered fiber keep their stored values");
+            const auto moved = shear.apply(savedRegistered.controlPoints[1]);
+            require(std::abs(moved[0] - (r.controlPoints[1][0])) < 1e-9 && savedRegistered.linePoints[2] == savedRegistered.controlPoints[1],
+                    "a moved registered point maps back through the inverse");
+            const auto reread = read(scaled);
+            require(reread.width == 4 && cv::Vec3d(reread.controlPoints[1]) == cv::Vec3d{6,2,3}, "the saved fiber reads back in the volume");
+            state.detachObjectStore();
+        }
         OpenOptions options; options.author = "vc3d-controller-test";
         { auto db = ObjectStore::create(path,options); }
         CState state;
@@ -208,7 +280,7 @@ int runObjectStoreControllerTests()
                 [](const auto& row) { return row.links == 1 && row.componentSize == 2; }); };
             while (!linked() && timer.elapsed() < 10000) { QApplication::processEvents(); QThread::msleep(1); }
             require(linked(), "catalog rows come from the store with shared links and components");
-            require(std::none_of(catalog.begin(), catalog.end(), [](const auto& row) { return row.toVolume.has_value(); }),
+            require(std::none_of(catalog.begin(), catalog.end(), [](const auto& row) { return row.mapping.has_value(); }),
                     "fibers without a binding list without a volume length");
         }
         require(controller.fiberSnapshotsForSideStripQuery({a, b}).size() == 2, "warm linked fiber snapshots");

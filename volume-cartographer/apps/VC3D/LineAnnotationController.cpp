@@ -17564,7 +17564,10 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
     const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
     if (!attachment || (uuids && uuids->empty())) return result;
     const bool readOnly = !connection->writable(*attachment);
+    const auto volume = _state->currentVolume();
     connection->read(*attachment, [&](const auto& db, const auto& txn, const auto& cancel) {
+        // Fibers bound to the open volume (by scale or a registration) are read in its voxels.
+        const auto transforms = volume ? std::optional(db.volumeTransforms(txn)) : std::nullopt;
         auto decode = [&](const ObjectRecord& object, const ObjectRevision& head, bool withLines) {
             StoredFiber fiber;
             fiber.uuid = object.uuid;
@@ -17579,22 +17582,35 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                 if (!head.geometryRevision) throw std::runtime_error("Fiber has no geometry");
                 // Controls always; the sampled line only when asked for.
                 const auto view = GeometrySnapshot(db, txn).fiber(object.uuid, *head.geometryRevision);
-                vc::geometry::Fiber geometry;
-                geometry.controlPoints = view.controlPoints(0, view.controlPointCount());
-                geometry.controlPointIds = view.controlPointIds(0, view.controlPointCount());
-                if (withLines) geometry.linePoints = view.linePoints(0, view.linePointCount());
                 const auto metadata = nlohmann::json::parse(object.meta);
+                if (transforms)
+                    if (const auto mapping = transforms->toVolume(metadata, volume->id()))
+                        fiber.frame = vc3d::line_annotation::FiberVolumeFrame{volume->id(), *mapping};
+                vc::geometry::Fiber geometry;
+                geometry.controlPointIds = view.controlPointIds(0, view.controlPointCount());
+                if (fiber.frame) {
+                    const auto shown = view.viewTransformedAt(volume->id());
+                    geometry.controlPoints = shown.points("control_points", 0, view.controlPointCount());
+                    if (withLines) geometry.linePoints = shown.points("line_points", 0, view.linePointCount());
+                } else {
+                    geometry.controlPoints = view.controlPoints(0, view.controlPointCount());
+                    if (withLines) geometry.linePoints = view.linePoints(0, view.linePointCount());
+                }
                 const auto source = metadata.value("source", nlohmann::json::object());
                 fiber.username = source.value("username", std::string{"anon"});
                 fiber.startedAt = source.value("started_at", std::string{});
                 fiber.sequence = source.value("sequence", uint64_t{0});
                 fiber.modelOnly = source.value("model_only", false);
-                if (source.contains("coordinate_base_shape_zyx"))
+                if (fiber.frame) {
+                    const auto shape = volume->shape();
+                    fiber.coordinateBaseShapeZYX = std::array<size_t, 3>{size_t(shape[0]), size_t(shape[1]), size_t(shape[2])};
+                } else if (source.contains("coordinate_base_shape_zyx"))
                     fiber.coordinateBaseShapeZYX = source.at("coordinate_base_shape_zyx").template get<std::array<size_t,3>>();
                 for (const auto* key : {"coordinates", "coordinate_binding"})
                     if (metadata.contains(key)) fiber.coordinateIdentity[key] = metadata.at(key);
                 if (object.fiber) {
-                    fiber.width = object.fiber->width;
+                    fiber.width = fiber.frame ? vc3d::line_annotation::mapFiberWidth(fiber.frame->storedToVolume, object.fiber->width)
+                                              : object.fiber->width;
                     fiber.widthGapFraction = object.fiber->widthGapFraction;
                     if (!object.fiber->optimizationMode.empty())
                         fiber.optimizationMode = vc3d::line_annotation::fiberOptimizationModeFromString(object.fiber->optimizationMode);
@@ -17613,6 +17629,11 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                         fiber.editorError = error.what();
                     }
                     cp.storeId = geometry.controlPointIds.at(i);
+                    if (fiber.frame) {
+                        const auto& m = fiber.frame->storedToVolume;
+                        if (cp.direction) cp.direction = vc3d::line_annotation::mapFiberDirection(m, *cp.direction);
+                        if (cp.displayNormal) cp.displayNormal = vc3d::line_annotation::mapFiberNormal(m, *cp.displayNormal);
+                    }
                     fiber.controlPoints.push_back(std::move(cp));
                 }
                 for (const auto& point : geometry.linePoints)
@@ -17678,8 +17699,13 @@ std::vector<LineAnnotationController::StoredFiber> LineAnnotationController::rea
                     branch.branchFiberId = target.id; branch.branchFileName = target.fileName;
                     branch.controlPointPosition = local.controlPoints.at(i);
                     branch.branchControlPointPosition = target.controlPoints.at(j);
-                    branch.controlPointDirection = {(*own.direction)[0], (*own.direction)[1], (*own.direction)[2]};
-                    branch.branchControlPointDirection = {(*other.direction)[0], (*other.direction)[1], (*other.direction)[2]};
+                    // Anchor directions are in each fiber's stored frame.
+                    const auto direction = [](const StoredFiber& fiber, const Anchor& anchor) {
+                        const cv::Vec3d d{(*anchor.direction)[0], (*anchor.direction)[1], (*anchor.direction)[2]};
+                        return fiber.frame ? vc3d::line_annotation::mapFiberDirection(fiber.frame->storedToVolume, d) : d;
+                    };
+                    branch.controlPointDirection = direction(local, own);
+                    branch.branchControlPointDirection = direction(target, other);
                     const auto meta = nlohmann::json::parse(edge.meta);
                     branch.pending = edge.approvalState != "approved";
                     branch.adjacent = meta.value("adjacent", false);
@@ -17795,6 +17821,42 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
     }
     std::map<std::string, std::string> geometryHeads;
     const auto committed = connection->editKeepingRelationships(*attachment, pins, related, [&](auto& db, auto& txn, const auto& decisions) {
+        // A fiber read in an open volume, back in its stored frame: positions
+        // through the store's view (unchanged points keep their exact values),
+        // vectors and width through the inverse; classification in that frame.
+        std::map<std::string, StoredFiber> storedFrames;
+        auto inStoredFrame = [&](const StoredFiber& fiber) -> const StoredFiber& {
+            if (const auto found = storedFrames.find(fiber.uuid); found != storedFrames.end()) return found->second;
+            auto stored = fiber;
+            if (fiber.frame) {
+                const auto shown = GeometrySnapshot(db, txn).viewTransformedAt(fiber.uuid, fiber.frame->volume);
+                if (shown.mapping() != fiber.frame->storedToVolume)
+                    throw std::runtime_error("The fiber's volume registration changed; reopen it");
+                vc::geometry::Fiber edited;
+                for (const auto& cp : fiber.controlPoints) {
+                    edited.controlPoints.push_back({cp[0], cp[1], cp[2]});
+                    edited.controlPointIds.push_back(cp.storeId);
+                }
+                for (const auto& point : fiber.linePoints) edited.linePoints.push_back({point[0], point[1], point[2]});
+                const auto canonical = shown.canonicalFiber(edited);
+                const auto inverse = fiber.frame->storedToVolume.inverse();
+                for (size_t i = 0; i < stored.controlPoints.size(); ++i) {
+                    auto& cp = stored.controlPoints[i];
+                    cp[0] = canonical.controlPoints[i][0]; cp[1] = canonical.controlPoints[i][1]; cp[2] = canonical.controlPoints[i][2];
+                    if (cp.direction) cp.direction = vc3d::line_annotation::mapFiberDirection(inverse, *cp.direction);
+                    if (cp.displayNormal) cp.displayNormal = vc3d::line_annotation::mapFiberNormal(inverse, *cp.displayNormal);
+                }
+                for (size_t i = 0; i < stored.linePoints.size(); ++i)
+                    stored.linePoints[i] = {canonical.linePoints[i][0], canonical.linePoints[i][1], canonical.linePoints[i][2]};
+                stored.width = vc3d::line_annotation::mapFiberWidth(inverse, fiber.width);
+                stored.hvClassification = vc3d::line_annotation::classifyFiberHv(
+                    vc3d::line_annotation::storedControlPointPositions(stored.controlPoints));
+                // The object keeps the frame it was created in.
+                stored.coordinateBaseShapeZYX.reset();
+                stored.frame.reset();
+            }
+            return storedFrames.emplace(fiber.uuid, std::move(stored)).first->second;
+        };
         std::map<std::string, EdgeRecord> incident;
         for (const auto& [uuid, revision] : expected)
             if (db.objectByUuid(txn, uuid))
@@ -17813,7 +17875,8 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
             for (const auto* key : {"coordinates", "coordinate_binding"})
                 if (meta.contains(key)) fiber.coordinateIdentity[key] = meta.at(key);
             auto source = meta.value("source", Json::object());
-            auto incoming = fiberSourceMetadata(fiber);
+            const auto& stored = inStoredFrame(fiber);
+            auto incoming = fiberSourceMetadata(stored);
             // An existing object keeps the coordinate frame it was created in.
             if (source.contains("coordinate_base_shape_zyx")) incoming.erase("coordinate_base_shape_zyx");
             source.update(incoming, true);
@@ -17823,20 +17886,21 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
             for (const auto& cp : fiber.controlPoints) nextId = std::max(nextId, cp.storeId + 1);
             std::set<int64_t> ids;
             vc::geometry::Fiber geometry;
+            // IDs are allocated on the working copy; positions are the stored frame's.
             for (auto& cp : fiber.controlPoints) {
                 if (cp.storeId < 0 || ids.contains(cp.storeId)) cp.storeId = nextId++;
                 ids.insert(cp.storeId);
-                geometry.controlPoints.push_back({cp[0], cp[1], cp[2]});
                 geometry.controlPointIds.push_back(cp.storeId);
             }
-            for (const auto& point : fiber.linePoints) geometry.linePoints.push_back({point[0], point[1], point[2]});
+            for (const auto& cp : stored.controlPoints) geometry.controlPoints.push_back({cp[0], cp[1], cp[2]});
+            for (const auto& point : stored.linePoints) geometry.linePoints.push_back({point[0], point[1], point[2]});
             source["next_control_point_id"] = nextId;
             FiberDetail detail;
             detail.controlPointCount = geometry.controlPoints.size(); detail.linePointCount = geometry.linePoints.size();
-            detail.length = geometry.length(); detail.width = fiber.width; detail.widthGapFraction = fiber.widthGapFraction;
+            detail.length = geometry.length(); detail.width = stored.width; detail.widthGapFraction = fiber.widthGapFraction;
             detail.optimizationMode = vc3d::line_annotation::fiberOptimizationModeToString(fiber.optimizationMode);
             detail.manualFamily = !fiber.manualHvTag.empty();
-            detail.family = detail.manualFamily ? fiber.manualHvTag : vc3d::line_annotation::fiberHvTagToString(fiber.hvClassification.automaticTag);
+            detail.family = detail.manualFamily ? fiber.manualHvTag : vc3d::line_annotation::fiberHvTagToString(stored.hvClassification.automaticTag);
             record.fiber = detail;
             const auto dataToSave = vc::geometry::encode(geometry);
             auto head = current ? db.currentGeometry(txn, fiber.uuid) : std::nullopt;
@@ -17861,11 +17925,15 @@ void LineAnnotationController::commitFiberStoreAction(std::vector<FiberSaveSnaps
             for (auto& branch : local.branches) {
                 const auto& target = findFiber(branch.branchFiberId);
                 if (retiredUuids.contains(target.uuid)) throw std::runtime_error("Branch still references a retired fiber");
-                auto anchor = [&](const auto& fiber, int index, const cv::Vec3d& direction) {
+                // Anchors are in each fiber's stored frame; IDs come from the working copy.
+                auto anchor = [&](const StoredFiber& fiber, int index, const cv::Vec3d& shown) {
+                    const auto& stored = inStoredFrame(fiber);
+                    const auto direction = fiber.frame
+                        ? vc3d::line_annotation::mapFiberDirection(fiber.frame->storedToVolume.inverse(), shown) : shown;
                     Anchor a;
-                    const auto& cp = fiber.controlPoints.at(index);
+                    const auto& cp = stored.controlPoints.at(index);
                     a.position = {cp[0],cp[1],cp[2]}; a.direction = {direction[0],direction[1],direction[2]};
-                    a.points = {{"control_point_ids", {cp.storeId}}}; return a;
+                    a.points = {{"control_point_ids", {fiber.controlPoints.at(index).storeId}}}; return a;
                 };
                 EdgeRecord edge; edge.uuid = branch.edgeUuid; edge.kind = "fiber_branch";
                 edge.aUuid = local.uuid; edge.bUuid = target.uuid;
@@ -17973,7 +18041,8 @@ std::optional<double> LineAnnotationController::fiberCoordinateScale(uint64_t id
     bool valid=false;const double scale=answer.toDouble(&valid);
     if (!valid || !(scale>0) || !std::isfinite(scale)) { showError(tr("Enter a positive finite coordinate scale."));return std::nullopt; }
     vc3d::bindCoordinates(*connection,pin.attachment,fiber.uuid,pin.objectRevision,*volume,scale);
-    return 1.0/scale;
+    // Bound fibers are read in the volume's voxels.
+    return 1.0;
 }
 
 std::optional<double> LineAnnotationController::fiberCoordinateScaleForVolume(
@@ -17983,20 +18052,22 @@ std::optional<double> LineAnnotationController::fiberCoordinateScaleForVolume(
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
     const auto attachment = _state ? _state->objectStoreAttachment() : std::nullopt;
     if (!volume || uuid.empty() || !attachment) return std::nullopt;
-    std::optional<nlohmann::json> metadata;
+    // Bound fibers (by scale or a registration) are read in the volume's voxels.
+    bool bound = false;
     connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
         const auto object = db.objectByUuid(txn, uuid);
-        if (object && !object->retired) metadata = nlohmann::json::parse(object->meta);
+        bound = object && !object->retired &&
+                db.volumeTransforms(txn).toVolume(nlohmann::json::parse(object->meta), volume->id()).has_value();
     });
-    if (!metadata) return std::nullopt;
-    return vc::objects::geometryScaleToVolume(*metadata, volume->id());
+    return bound ? std::optional(1.0) : std::nullopt;
 }
 
 std::optional<double> LineAnnotationController::storedFiberScale(const StoredFiber& fiber) const
 {
     const auto volume = _state ? _state->currentVolume() : nullptr;
     if (!volume || !fiber.storePin) return std::nullopt;
-    return vc::objects::geometryScaleToVolume(fiber.coordinateIdentity, volume->id());
+    // Read in the open volume's voxels when bound to it.
+    return fiber.frame && fiber.frame->volume == volume->id() ? std::optional(1.0) : std::nullopt;
 }
 
 uint64_t LineAnnotationController::fiberIdForUuid(const std::string& uuid) const
