@@ -11,27 +11,16 @@ void validateCoordinateParams(const CoordinateParams& params, double explicitSca
 {
     if (!std::isfinite(explicitScale) || explicitScale <= 0)
         throw std::invalid_argument("coordinate scale must be finite and positive");
-    if (!params.volumeUuid && !params.legacyCoordinates.empty())
-        throw std::invalid_argument("legacy_coordinates requires volume_uuid");
     if (params.volumeUuid) {
         if (params.volumeUuid->empty()) throw std::invalid_argument("volume_uuid must be nonempty");
         if (explicitScale != 1.0)
             throw std::invalid_argument("explicit scales must be identity when volume_uuid is supplied");
     }
-    for (const auto& [uuid, declaration] : params.legacyCoordinates) {
-        if (objects::util::canonicalUuid(uuid) != uuid)
-            throw std::invalid_argument("legacy_coordinates keys must be canonical UUIDs");
-        objects::geometryCoordinates(nlohmann::json::parse(declaration));
-    }
 }
 nlohmann::json coordinateProvenance(const objects::ObjectRecord& object, const CoordinateParams& params)
 {
     if (!params.volumeUuid) return nlohmann::json::object();
-    const auto found = params.legacyCoordinates.find(object.uuid);
-    const auto legacy = found == params.legacyCoordinates.end() ? nlohmann::json::object()
-        : nlohmann::json::parse(found->second);
-    return {{"coordinates", objects::resolveGeometryCoordinates(nlohmann::json::parse(object.meta), *params.volumeUuid, legacy)},
-            {"legacy_declaration", legacy}};
+    return {{"coordinates", objects::resolveGeometryCoordinates(nlohmann::json::parse(object.meta), *params.volumeUuid)}};
 }
 std::map<std::string, double> coordinateScales(const std::vector<objects::ObjectRecord>& objects,
     const CoordinateParams& params, double explicitScale)

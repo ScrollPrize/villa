@@ -119,10 +119,7 @@ nb::dict detectorReportToPy(const vc::object_links::DetectorReport& rep)
 bool setCoordinateParameter(vc::object_links::CoordinateParams& p, const std::string& key, nb::handle value)
 {
     if (key == "volume_uuid") p.volumeUuid = nb::cast<std::string>(value);
-    else if (key == "legacy_coordinates") {
-        for (auto item : nb::cast<nb::dict>(value))
-            p.legacyCoordinates[nb::cast<std::string>(item.first)] = jsonDumps(item.second);
-    } else return false;
+    else return false;
     return true;
 }
 
@@ -258,15 +255,12 @@ NB_MODULE(_native, m)
     m.def("geometry_scale_to_volume", [](const nb::dict& metadata, const std::string& volume) {
         return vo::geometryScaleToVolume(nlohmann::json::parse(jsonDumps(metadata)), volume);
     }, nb::arg("metadata"), nb::arg("volume_uuid"));
-    m.def("resolve_geometry_coordinates", [](const nb::dict& metadata, const std::string& volume, const nb::dict& legacy) {
-        return jsonLoads(vo::resolveGeometryCoordinates(nlohmann::json::parse(jsonDumps(metadata)), volume,
-            nlohmann::json::parse(jsonDumps(legacy))).dump());
-    }, nb::arg("metadata"), nb::arg("volume_uuid"), nb::arg("legacy_coordinates") = nb::dict());
-    m.def("geometry_scale_to_frame", [](const nb::dict& metadata, const std::string& volume, double downsample, const nb::dict& legacy) {
-        return vo::geometryScaleToFrame(nlohmann::json::parse(jsonDumps(metadata)), volume, downsample,
-            nlohmann::json::parse(jsonDumps(legacy)));
-    }, nb::arg("metadata"), nb::arg("volume_uuid"), nb::arg("downsample_factor") = 1.0,
-       nb::arg("legacy_coordinates") = nb::dict());
+    m.def("resolve_geometry_coordinates", [](const nb::dict& metadata, const std::string& volume) {
+        return jsonLoads(vo::resolveGeometryCoordinates(nlohmann::json::parse(jsonDumps(metadata)), volume).dump());
+    }, nb::arg("metadata"), nb::arg("volume_uuid"));
+    m.def("geometry_scale_to_frame", [](const nb::dict& metadata, const std::string& volume, double downsample) {
+        return vo::geometryScaleToFrame(nlohmann::json::parse(jsonDumps(metadata)), volume, downsample);
+    }, nb::arg("metadata"), nb::arg("volume_uuid"), nb::arg("downsample_factor") = 1.0);
 
     nb::class_<vc::CtSheetNormalSampler>(m, "CtSheetNormalSampler")
         .def(nb::init<const std::filesystem::path&, int, double>(),
@@ -407,11 +401,13 @@ NB_MODULE(_native, m)
         .def("read_geometry_ranges", readMethod<&vo::ObjectStore::readGeometryRanges, true>(), nb::arg("revision_uuid"), nb::arg("array_name"),
              nb::arg("ranges"))
         .def("ingest_registered_geometry", [](PyObjectStore& self, const std::optional<std::filesystem::path>& root,
-                                             const std::vector<std::string>& uuids) {
+                                             const std::vector<std::string>& uuids, const nb::dict& context) {
+            const auto declarations = jsonDumps(context);
             return geometryReportToPy(self.withStore<true>([&](auto& db) {
-                return vo::ingestRegisteredGeometry(db, root, uuids, {});
+                return vo::ingestRegisteredGeometry(db, root, uuids, {}, declarations);
             }));
-        }, nb::arg("dataset_root") = std::nullopt, nb::arg("object_uuids") = std::vector<std::string>{})
+        }, nb::arg("dataset_root") = std::nullopt, nb::arg("object_uuids") = std::vector<std::string>{},
+           nb::arg("coordinate_context") = nb::dict())
         .def("ingest_geometry_source", [](PyObjectStore& self, const std::string& kind, const std::filesystem::path& source,
                                          const nb::dict& context) {
             const auto declarations = jsonDumps(context);

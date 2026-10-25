@@ -100,14 +100,12 @@ inline std::optional<double> geometryScaleToVolume(const CoordinateJson& metadat
     if (!std::isfinite(scale) || scale <= 0) throw std::invalid_argument("geometry coordinate conversion is not representable");
     return scale;
 }
-// Resolve an explicitly declared legacy frame without changing persistent metadata.
-// Known declarations may only be confirmed, never overridden.
-inline CoordinateJson resolveGeometryCoordinates(const CoordinateJson& metadata,
-    const std::string& volumeId, const CoordinateJson& legacy = CoordinateJson::object())
+// Strict form of geometryScaleToVolume: the object's declared frame, which must be
+// complete and match the target. Frames are declared at ingest or with setMeta.
+inline CoordinateJson resolveGeometryCoordinates(const CoordinateJson& metadata, const std::string& volumeId)
 {
     if (volumeId.empty()) throw std::invalid_argument("target volume_uuid must be nonempty");
-    const auto coordinates = mergeGeometryCoordinates(
-        metadata.value("coordinates", CoordinateJson::object()), legacy);
+    const auto coordinates = geometryCoordinates(metadata.value("coordinates", CoordinateJson::object()));
     if (coordinates["volume_uuid"].is_null() || coordinates["scale_factor"].is_null())
         throw std::invalid_argument("unknown geometry coordinate frame");
     if (coordinates["volume_uuid"] != volumeId)
@@ -118,11 +116,11 @@ inline CoordinateJson resolveGeometryCoordinates(const CoordinateJson& metadata,
 // Stored XYZ -> volume XYZ -> fitting XYZ. Keep the reciprocal conversion's
 // representability check even when a later downsampling might hide overflow.
 inline double geometryScaleToFrame(const CoordinateJson& metadata, const std::string& volumeId,
-    double downsampleFactor = 1.0, const CoordinateJson& legacy = CoordinateJson::object())
+    double downsampleFactor = 1.0)
 {
     if (!std::isfinite(downsampleFactor) || downsampleFactor <= 0)
         throw std::invalid_argument("downsample factor must be finite and positive");
-    const auto coordinates = resolveGeometryCoordinates(metadata, volumeId, legacy);
+    const auto coordinates = resolveGeometryCoordinates(metadata, volumeId);
     const auto toVolume = geometryScaleToVolume(CoordinateJson{{"coordinates", coordinates}}, volumeId);
     const double scale = *toVolume / downsampleFactor;
     if (!std::isfinite(scale) || scale <= 0)

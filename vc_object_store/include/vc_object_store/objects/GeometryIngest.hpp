@@ -34,9 +34,11 @@ struct GeometryIngestReport {
 // never had geometry are eligible. Existing/retired imports are errors, even if
 // unchanged. Source data must be stable during ingestion; edit imported objects
 // through the store APIs. There is no file refresh or reconciliation.
+// coordinateContext is applied as for ingestGeometrySource.
 GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db,
     const std::optional<std::filesystem::path>& datasetRoot = std::nullopt,
-    const std::vector<std::string>& objectUuids = {}, const util::ProgressCallback& progress = {});
+    const std::vector<std::string>& objectUuids = {}, const util::ProgressCallback& progress = {},
+    const std::string& coordinateContext = "{}");
 
 // Create new objects and ingest one source: a tifxyz patch directory,
 // vc3d_fiber JSON, collection or directory, vc_pointcollections JSON (all collections), or packed tracks

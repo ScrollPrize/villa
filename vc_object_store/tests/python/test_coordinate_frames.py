@@ -1,5 +1,6 @@
 """Shared coordinate resolver and mixed-scale detector regression coverage."""
 import json
+import uuid
 
 import numpy as np
 import pytest
@@ -49,23 +50,21 @@ def test_shared_resolution_and_round_trip():
             np.testing.assert_array_equal(fitting * n, xyz)
             # Selected CT level at D=4; no additional coordinate conversion.
             np.testing.assert_array_equal(fitting * n / 4, xyz / 4)
-    assert resolve_geometry_coordinates({}, VOLUME, frame(2)) == frame(2)
-    assert geometry_scale_to_frame({}, VOLUME, 4, frame(2)) == 0.125
+    assert resolve_geometry_coordinates({"coordinates": frame(2)}, VOLUME) == frame(2)
 
 
-@pytest.mark.parametrize("metadata,legacy,reason", [
-    ({}, {}, "unknown"),
-    ({"coordinates": frame(volume="other")}, {}, "does not match"),
-    ({"coordinates": frame(2)}, frame(1), "conflict"),
-    ({"coordinates": frame()}, frame(volume="other"), "conflict"),
-    ({"coordinates": frame(0)}, {}, "positive"),
-    ({"coordinates": frame(-1)}, {}, "positive"),
-    ({"coordinates": frame(5e-324)}, {}, "representable"),
-    ({"coordinates": {"scale_factor": 1, "typo": 1}}, {}, "unknown geometry coordinate field"),
+@pytest.mark.parametrize("metadata,reason", [
+    ({}, "unknown"),
+    ({"coordinates": {"volume_uuid": VOLUME}}, "unknown"),
+    ({"coordinates": frame(volume="other")}, "does not match"),
+    ({"coordinates": frame(0)}, "positive"),
+    ({"coordinates": frame(-1)}, "positive"),
+    ({"coordinates": frame(5e-324)}, "representable"),
+    ({"coordinates": {"scale_factor": 1, "typo": 1}}, "unknown geometry coordinate field"),
 ])
-def test_invalid_frames(metadata, legacy, reason):
+def test_invalid_frames(metadata, reason):
     with pytest.raises(ValueError, match=reason):
-        geometry_scale_to_frame(metadata, VOLUME, legacy_coordinates=legacy)
+        geometry_scale_to_frame(metadata, VOLUME)
 
 
 @pytest.mark.parametrize("n", [0, -1, float("inf"), float("nan")])
@@ -106,24 +105,47 @@ def test_mixed_pcl_scales_selection_anchors_and_sentinels(db):
     assert len(db.edges_of(first)) == 1
 
 
-def test_legacy_provenance_and_preflight_no_writes(db):
-    a = patch(db, 2)
+def test_frame_provenance_and_preflight_no_writes(db):
+    patch(db, 2)
     c = collection(db, 4)
     db.set_meta(c, "coordinates", {})
     before = db.journal_since()
     with pytest.raises(ValueError, match="unknown"):
         db.link_point_collections_to_patches(volume_uuid=VOLUME)
     assert db.journal_since() == before
-    assert db.link_point_collections_to_patches(volume_uuid=VOLUME, legacy_coordinates={c: frame(4)})["edges_created"] == 1
+    # A missing frame is declared on the object itself, not per detector run.
+    db.set_meta(c, "coordinates", frame(4))
+    assert db.link_point_collections_to_patches(volume_uuid=VOLUME)["edges_created"] == 1
     edge, = db.edges_of(c)
-    assert edge["meta"]["coordinate_frame"]["objects"][c]["legacy_declaration"] == frame(4)
+    assert edge["meta"]["coordinate_frame"]["objects"][c] == {"coordinates": frame(4)}
     before = db.journal_since()
-    for options in ({"legacy_coordinates": {a: frame(3), c: frame(4)}}, {"point_scale": 0.5}):
-        with pytest.raises(ValueError, match="conflict|identity"):
-            db.link_point_collections_to_patches(volume_uuid=VOLUME, **options)
-        assert db.journal_since() == before
-    with pytest.raises(ValueError, match="requires volume_uuid"):
-        db.link_patch_overlaps(legacy_coordinates={a: frame()})
+    with pytest.raises(ValueError, match="identity"):
+        db.link_point_collections_to_patches(volume_uuid=VOLUME, point_scale=0.5)
+    assert db.journal_since() == before
+    with pytest.raises(RuntimeError, match="unknown parameter 'legacy_coordinates'"):
+        db.link_patch_overlaps(volume_uuid=VOLUME, legacy_coordinates={c: frame()})
+
+
+def write_collections(path, collections):
+    path.write_text(json.dumps({"vc_pointcollections_json_version": "1", "collections": {
+        str(i): {"uuid": str(uuid.uuid4()), "name": f"c{i}", "points": {str(i): {"p": [1.0, 2.0, 3.0]}}, **extra}
+        for i, extra in enumerate(collections)}}))
+
+
+def test_ingest_coordinate_context_fills_and_rejects_conflicts(db, tmp_path):
+    source = tmp_path / "collections.json"
+    write_collections(source, [{}, {"coordinates": {"volume_uuid": VOLUME}}, {"scale_factor": 2}])
+    report = db.ingest_geometry_source("point_collection", str(source), coordinate_context=frame(2))
+    assert report["ingested"] == 3 and not report["problems"], report
+    for record in db.select_objects():
+        assert db.object(record["uuid"])["meta"]["coordinates"] == frame(2)
+        assert geometry_scale_to_frame(db.object(record["uuid"])["meta"], VOLUME) == 0.5
+    before = db.journal_since()
+    for declared in ({"scale_factor": 4}, {"volume_uuid": "other"}):
+        write_collections(source, [{}, declared])
+        report = db.ingest_geometry_source("point_collection", str(source), coordinate_context=frame(2))
+        assert report["ingested"] == 0 and "conflict" in " ".join(report["problems"]), report
+    assert db.journal_since() == before
 
 
 def test_mixed_patch_overlap_parameterization_and_scope(db):
@@ -220,11 +242,10 @@ def test_non_numeric_or_nonfinite_scale_is_rejected(value):
         geometry_coordinates(frame(value))
 
 
-def test_authoritative_metadata_and_partial_legacy_declaration():
+def test_authoritative_metadata_ignores_source_declarations():
     metadata = {"coordinates": {"volume_uuid": VOLUME}, "source": {"coordinates": frame(99)}}
     with pytest.raises(ValueError, match="unknown"):
         geometry_scale_to_frame(metadata, VOLUME)
-    assert geometry_scale_to_frame(metadata, VOLUME, legacy_coordinates={"scale_factor": 2}) == 0.5
     metadata["coordinates"] = frame(4)
     assert geometry_scale_to_frame(metadata, VOLUME) == 0.25
 

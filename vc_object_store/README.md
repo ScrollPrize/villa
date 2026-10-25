@@ -95,15 +95,18 @@ volume; `ct_level` selects data and does not add another scaling factor. The cal
 is responsible for binding the CT path to that volume. Without `volume_uuid`,
 existing explicit-scale behavior is preserved; unknown metadata remains allowed.
 
-For legacy objects, `legacy_coordinates={object_uuid: {"volume_uuid": V,
-"scale_factor": s}}` can fill missing declarations for that invocation. Keys must
-be canonical object UUIDs. C++ uses `CoordinateParams::legacyCoordinates`, mapping
-UUIDs to JSON strings. A declaration cannot override conflicting known metadata,
-and requires `volume_uuid`. Generated edges record both resolved frames and legacy
-declarations in `meta.coordinate_frame`; object metadata is not modified. Explicit-scale
-reruns set this field to null, clearing any previous metadata-mode declaration. Frame
-validation runs before geometry processing or relationship writes. Existing
-geometry/load failure reporting remains unchanged.
+Frames are declared on the objects, never per detector run. Source files that do
+not declare one (for example the Spiral dataset's tifxyz patches, fibers and PCL
+JSONs) get it at ingest: `vc_object_ingest --volume-uuid V --scale-factor s`, or
+`coordinate_context={"volume_uuid": V, "scale_factor": s}` on
+`ingest_geometry_source` / `ingest_registered_geometry`. The context fills in
+missing fields for every object in that run; a conflicting source declaration is
+an ingest error. Objects already in a store are declared with
+`set_meta(uuid, "coordinates", {...})`, as VC3D's Bind Fiber Coordinates does.
+Generated edges record each endpoint's resolved frame in `meta.coordinate_frame`.
+Explicit-scale reruns set this field to null, clearing any previous metadata-mode
+declaration. Frame validation runs before geometry processing or relationship
+writes. Existing geometry/load failure reporting remains unchanged.
 
 Stored arrays and source anchors remain unchanged. Grid indices do not scale;
 working patch grid steps per voxel are divided by the XYZ conversion multiplier.
@@ -122,8 +125,7 @@ multiplier = geometry_scale_to_frame(metadata, V, downsample_factor=N)
 fit_xyz = stored_xyz * multiplier  # stored_xyz / scale_factor / N
 ```
 
-The strict helper accepts an optional `legacy_coordinates` declaration and checks
-representability both before and after downsampling. Consumers must preserve
+The strict helper checks representability both before and after downsampling. Consumers must preserve
 invalid vertex sentinels when applying the multiplier to arrays.
 
 Run regression tests against an existing native build and Python environment:
@@ -139,7 +141,8 @@ PYTHONPATH=/tmp/vc-object-coordinate-build/python \
 ```
 
 The real-data smoke command requires a new output directory. It ingests one patch
-and five PCLs, assigns UUIDs in temporary legacy import wrappers, and compares
+and five PCLs (assigning UUIDs in temporary import wrappers, since the source
+files lack them), declares a local frame at ingest, and compares
 explicit scaling with mixed source scales (patch 2; PCLs 0.25 and 4). It checks exact
 attachment/patch-grid agreement and idempotent reruns; it does not train a fitter.
 

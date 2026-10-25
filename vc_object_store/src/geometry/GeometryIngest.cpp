@@ -68,8 +68,10 @@ std::vector<GeometrySource> prepareGeometrySource(const std::string& kind, const
 }
 
 GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::optional<fs::path>& datasetRoot,
-    const std::vector<std::string>& objectUuids, const util::ProgressCallback& progress)
+    const std::vector<std::string>& objectUuids, const util::ProgressCallback& progress,
+    const std::string& coordinateContext)
 {
+    geometryCoordinates(Json::parse(coordinateContext));
     GeometryIngestReport report;
     std::vector<ObjectRecord> objects;
     std::map<std::string, Expected> expectations;
@@ -129,7 +131,7 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
         } catch (const std::exception& error) { problem(report, object.uuid, error); }
     }
     if (report.problems.empty()) {
-        try { ingestBatch(db, std::move(prepared), expectations, report, "{}", true); }
+        try { ingestBatch(db, std::move(prepared), expectations, report, coordinateContext, true); }
         catch (const std::exception& error) { problem(report, "batch", error); }
     }
     util::reportProgress(progress, "ingesting geometry", objects.size(), objects.size());

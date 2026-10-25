@@ -11,7 +11,6 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
-#include <map>
 #include <string>
 #include <vector>
 
@@ -93,10 +92,9 @@ DetectorReport commitCandidates(objects::ObjectStore& db, objects::WriteTxn& txn
 // Opt-in metadata conversion: all working distances are reference-volume voxels.
 // Without volumeUuid, the existing explicit-scale APIs retain their behavior.
 // With volumeUuid, explicit scale multipliers must remain at their identity
-// defaults; metadata (plus optional per-UUID legacy declarations) is authoritative.
+// defaults; each object's meta.coordinates is authoritative.
 struct CoordinateParams {
     std::optional<std::string> volumeUuid;
-    std::map<std::string, std::string> legacyCoordinates; // UUID -> coordinate JSON
 };
 
 struct PointCollectionPatchParams : CoordinateParams {
