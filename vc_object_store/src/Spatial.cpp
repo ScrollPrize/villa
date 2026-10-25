@@ -269,20 +269,28 @@ void updateEditedGeometryBounds(sqlite3* db, int64_t objectId, const std::string
         const auto scalar = geometryByteLength(a.at("dtype"), {1});
         const auto first = edit.elementOffset / 3;
         const auto last = (edit.elementOffset + int64_t(edit.bytes.size() / scalar) - 1) / 3;
-        for (auto point = first; point <= last; ++point) {
-            if (kind == "surface") {
-                const auto row = point / shape[1], col = point % shape[1];
+        if (kind == "surface") {
+            // A vertex dirties its 32-block and, on a block's first row or column,
+            // the block before it (regions overlap by one vertex). Per run of a
+            // row: the blocks from the first vertex's to the last vertex's.
+            const auto rowLimit = std::max<int64_t>(1, shape[0]-1), colLimit = std::max<int64_t>(1, shape[1]-1);
+            for (auto point = first; point <= last;) {
+                const auto row = point / shape[1], firstCol = point % shape[1];
+                const auto lastCol = std::min(shape[1] - 1, firstCol + (last - point));
+                const auto fromCol = firstCol > 0 && firstCol % 32 == 0 ? firstCol - 32 : firstCol / 32 * 32;
                 for (auto r : {row / 32 * 32, row > 0 && row % 32 == 0 ? row - 32 : row / 32 * 32})
-                    for (auto c : {col / 32 * 32, col > 0 && col % 32 == 0 ? col - 32 : col / 32 * 32})
-                        if (r < std::max<int64_t>(1, shape[0]-1) && c < std::max<int64_t>(1, shape[1]-1))
-                            dirty.emplace(edit.array, r, c);
-            } else {
-                const bool line = polyline(kind);
-                const auto end = line ? std::max<int64_t>(1, shape[0]-1) : shape[0];
-                const auto start = point / 256 * 256;
-                if (start < end) dirty.emplace(edit.array, start, 0);
-                if (line && point && point % 256 == 0) dirty.emplace(edit.array, point-256, 0);
+                    for (auto c = fromCol; c <= lastCol / 32 * 32; c += 32)
+                        if (r < rowLimit && c < colLimit) dirty.emplace(edit.array, r, c);
+                point += lastCol - firstCol + 1;
             }
+            continue;
+        }
+        for (auto point = first; point <= last; ++point) {
+            const bool line = polyline(kind);
+            const auto end = line ? std::max<int64_t>(1, shape[0]-1) : shape[0];
+            const auto start = point / 256 * 256;
+            if (start < end) dirty.emplace(edit.array, start, 0);
+            if (line && point && point % 256 == 0) dirty.emplace(edit.array, point-256, 0);
         }
     }
     RegionWriter writer(db, objectId);

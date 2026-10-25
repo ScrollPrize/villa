@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <map>
 #include <optional>
@@ -461,6 +462,11 @@ public:
                              const std::vector<GeometryArrayEdit>&,
                              const std::string& expectedRevision,
                              const std::vector<GeometryEdgeEdit>& edgeEdits = {});
+    // As above, choosing the decisions for the relationships the edit affects
+    // from the same plan (affectedGeometryEditEdges + editGeometry plans twice).
+    using EdgeDecider = std::function<std::vector<GeometryEdgeEdit>(const std::vector<EdgeRecord>&)>;
+    std::string editGeometry(WriteTxn&, const std::string& objectUuid, const std::vector<GeometryArrayEdit>&,
+                             const std::string& expectedRevision, const EdgeDecider& decide);
     std::vector<EdgeRecord> affectedGeometryEditEdges(const Txn&, const std::string& objectUuid,
                              const std::vector<GeometryArrayEdit>&,
                              const std::string& expectedRevision) const;
@@ -630,6 +636,9 @@ private:
     static std::unique_ptr<Impl> openImpl(const std::filesystem::path&, const OpenOptions&, bool create);
     explicit ObjectStore(std::unique_ptr<Impl>);
     void* connection(const Txn&) const;
+    std::string editGeometry(WriteTxn&, const std::string& objectUuid, const std::vector<GeometryArrayEdit>&,
+                             const std::string& expectedRevision, const std::vector<GeometryEdgeEdit>& edgeEdits,
+                             const EdgeDecider* decide);
     std::unique_ptr<Impl> impl_;
     friend class Txn;
 };

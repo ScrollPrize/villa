@@ -147,8 +147,7 @@ std::string updateGeometryArrays(ObjectStore& db, WriteTxn& txn, const std::stri
             }
             if (run) close(target.bytes.size());
             if (!edits.empty()) {
-                const auto affected = db.affectedGeometryEditEdges(txn, uuid, edits, head);
-                head = db.editGeometry(txn, uuid, edits, head, decisions(affected));
+                head = db.editGeometry(txn, uuid, edits, head, ObjectStore::EdgeDecider(decisions));
                 whole.reset();
             }
         }

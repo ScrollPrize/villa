@@ -262,7 +262,10 @@ namespace {
 struct SparseGeometryEdit {
     std::shared_ptr<GeometryReader> reader;
     nlohmann::json manifest;
-    std::map<GeometryChunkKey, std::vector<uint8_t>> original, modified;
+    std::map<GeometryChunkKey, std::vector<uint8_t>> original;
+    // Shared with the dependency reader of `after` rather than copied.
+    std::shared_ptr<std::map<GeometryChunkKey, std::vector<uint8_t>>> modified =
+        std::make_shared<std::map<GeometryChunkKey, std::vector<uint8_t>>>();
     std::vector<GeometryChunkChange> changes;
     DependencyGeometry after;
 };
@@ -299,27 +302,31 @@ std::shared_ptr<SparseGeometryEdit> prepareEdit(const ObjectStore& store, const 
                 available = w * layout.pixelBytes - within % (w * layout.pixelBytes);
             }
             const GeometryChunkKey key{edit.array, index};
-            auto found = plan->modified.find(key);
-            if (found == plan->modified.end()) {
+            auto found = plan->modified->find(key);
+            if (found == plan->modified->end()) {
                 auto bytes = plan->reader->chunk(edit.array, index);
                 plan->original.emplace(key, bytes);
-                found = plan->modified.emplace(key, std::move(bytes)).first;
+                found = plan->modified->emplace(key, std::move(bytes)).first;
             }
             const auto count = std::min<size_t>(available, edit.bytes.size() - consumed);
             std::memcpy(found->second.data() + within, edit.bytes.data() + consumed, count);
             consumed += count; offset += count;
         }
     }
-    for (auto it = plan->modified.begin(); it != plan->modified.end();) {
+    for (auto it = plan->modified->begin(); it != plan->modified->end();) {
         const auto& old = plan->original.at(it->first);
         const auto& next = it->second;
-        if (old == next) { it = plan->modified.erase(it); continue; }
-        GeometryChunkChange change{it->first, geometryPayloadHash(it->first.first, old), geometryPayloadHash(it->first.first, next), {}};
+        if (old == next) { it = plan->modified->erase(it); continue; }
+        // The old chunk was verified against its manifest hash when read.
+        const std::string beforeHash = plan->reader->manifest().at("arrays").at(it->first.first).at("chunks").at(it->first.second);
+        GeometryChunkChange change{it->first, beforeHash, geometryPayloadHash(it->first.first, next), {}, {}, {}};
         for (size_t i = 0; i < old.size();) {
             if (old[i] == next[i]) { ++i; continue; }
             const auto begin = i++;
             while (i < old.size() && old[i] != next[i]) ++i;
-            change.changes.push_back({int64_t(begin), {old.begin()+begin, old.begin()+i}, {next.begin()+begin, next.begin()+i}});
+            change.changes.push_back({int64_t(begin), int64_t(i - begin)});
+            change.before.insert(change.before.end(), old.begin() + begin, old.begin() + i);
+            change.after.insert(change.after.end(), next.begin() + begin, next.begin() + i);
         }
         plan->manifest["arrays"][it->first.first]["chunks"][it->first.second] = change.afterHash;
         plan->changes.push_back(std::move(change)); ++it;
@@ -333,7 +340,7 @@ std::shared_ptr<SparseGeometryEdit> prepareEdit(const ObjectStore& store, const 
     // Keep the dependency reader independent of the plan's lifetime; capture
     // only buffers and the original reader, avoiding a plan -> lambda cycle.
     auto reader = plan->reader;
-    auto modified = std::make_shared<decltype(plan->modified)>(plan->modified);
+    auto modified = plan->modified;
     auto manifest = plan->manifest;
     plan->after.read = [reader, modified, manifest](const std::string& name, int64_t offset, int64_t count) {
         auto result = reader->read(name, offset, count);
@@ -406,6 +413,19 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
     const std::vector<GeometryArrayEdit>& edits, const std::string& expected,
     const std::vector<GeometryEdgeEdit>& edgeEdits)
 {
+    return editGeometry(txn, objectId, edits, expected, edgeEdits, nullptr);
+}
+
+std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId,
+    const std::vector<GeometryArrayEdit>& edits, const std::string& expected, const EdgeDecider& decide)
+{
+    return editGeometry(txn, objectId, edits, expected, {}, &decide);
+}
+
+std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId,
+    const std::vector<GeometryArrayEdit>& edits, const std::string& expected,
+    const std::vector<GeometryEdgeEdit>& edgeEdits, const EdgeDecider* decide)
+{
     auto* db = static_cast<sqlite3*>(connection(txn));
     const auto objectUuid = formatUuid(parseUuid(objectId));
     DependencyScope scope;
@@ -421,7 +441,8 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
     }
     const auto object = *objectByUuid(txn, objectUuid);
     const auto affected = affectedEdges(*this, txn, objectUuid, current, plan->after);
-    const auto decisions = validateEdgeEdits(*this, txn, db, objectUuid, plan->after, affected, edgeEdits);
+    const auto decisions = validateEdgeEdits(*this, txn, db, objectUuid, plan->after, affected,
+                                             decide ? (*decide)(affected) : edgeEdits);
     auto encoded = encodeGeometryDelta(plan->changes);
     Statement old(db, "SELECT manifest FROM geometry_revisions WHERE uuid=?", parseUuid(current.uuid)); old.row();
     const auto previous = loadGeometryManifest(db, current.uuid, old.text(0), current.contentHash);
@@ -441,7 +462,7 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
     Statement put(db, "INSERT INTO geometry_current_chunks VALUES(?,?,?,?,?) ON CONFLICT(object_uuid,array_name,chunk_index) "
         "DO UPDATE SET hash=excluded.hash,data=excluded.data");
     for (const auto& change : plan->changes) {
-        const auto& bytes = plan->modified.at(change.key);
+        const auto& bytes = plan->modified->at(change.key);
         put.run(parseUuid(objectUuid), change.key.first, change.key.second, change.afterHash, bytes);
     }
     execute(db, "INSERT INTO geometry_materializations VALUES(?,?,?) ON CONFLICT(object_uuid) "

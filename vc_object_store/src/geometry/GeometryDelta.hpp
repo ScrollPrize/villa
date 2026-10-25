@@ -3,14 +3,16 @@
 
 namespace vc::objects::detail {
 using GeometryChunkKey = std::pair<std::string, int64_t>;
+// A run of changed bytes in a chunk; its old and new bytes are the next
+// `length` bytes of the chunk change's `before` and `after`.
 struct GeometryByteChange {
-    int64_t offset;
-    std::vector<uint8_t> before, after;
+    int64_t offset, length;
 };
 struct GeometryChunkChange {
     GeometryChunkKey key;
     std::string beforeHash, afterHash;
     std::vector<GeometryByteChange> changes;
+    std::vector<uint8_t> before, after; // the runs' bytes, concatenated in order
 };
 struct EncodedGeometryDelta {
     nlohmann::json description;
