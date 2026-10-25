@@ -1,4 +1,5 @@
 #include "vc/core/render/ZarrChunkFetcher.hpp"
+#include "ChunkReadBatch.hpp"
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/util/CacheCompression.hpp"
 #include "vc/core/util/S3AuthFallback.hpp"
@@ -343,8 +344,12 @@ public:
         try {
             auto encoded = std::move(fetched.bytes);
             result.status = ChunkFetchStatus::Found;
-            result.bytes = array_->decode_chunk_payload(
-                std::span<const std::byte>(encoded.data(), encoded.size()));
+            if (!fetched.decodeBuffer.empty()) {
+                result.bytes = std::move(fetched.decodeBuffer);
+                array_->decode_chunk_payload_into(encoded, result.bytes);
+            } else {
+                result.bytes = array_->decode_chunk_payload(encoded);
+            }
             if (!persistEncodedExtension_.empty()) {
                 result.persistentBytes = std::move(encoded);
                 result.hasPersistentBytes = true;
@@ -1306,15 +1311,15 @@ class ZarrChannelView final : public IChunkedArray {
         result.byteOffset = offset_;
         return result;
     }
-public:
-    const std::shared_ptr<ChunkCache>& physicalSource() const {return source_;}
-    bool prefersBatchReads() const noexcept override {return source_->prefersBatchReads();}
+    bool prefersBatchReads() const noexcept override {return detail::ChunkReadBatch::enabled(*source_);}
     std::vector<ChunkResult> getChunksBlocking(const std::vector<ChunkKey>& keys,const ChunkRequestContext& request = {}) override {
         if(request.channelHints)request.channelHints->prefetch(*this,keys,-1024,request);
-        auto plain=request;plain.channelHints.reset();auto results=source_->getChunksBlocking(keys,plain);
+        auto plain=request;plain.channelHints.reset();auto results=detail::ChunkReadBatch::read(*source_,keys,plain);
         for(auto& result:results)result=view(std::move(result));
         return results;
     }
+public:
+    const std::shared_ptr<ChunkCache>& physicalSource() const {return source_;}
     const void* physicalCacheIdentity() const noexcept override {return source_->physicalCacheIdentity();}
     std::shared_ptr<IChunkedArray> inService(const std::shared_ptr<ChunkCacheService>& service) const {
         auto copy=std::make_shared<ZarrChannelView>(*this);copy->source_=source_->inService(service);return copy;

@@ -15,6 +15,7 @@ namespace vc::render {
 
 class ChunkChannelHints;
 class IChunkedArray;
+namespace detail { struct ChunkReadBatch; }
 
 enum class ChunkStatus {
     MissQueued,
@@ -96,8 +97,10 @@ public:
     virtual LevelTransform levelTransform(int level) const = 0;
     // Equal identities share one physical decoded payload (e.g. packed CZYX).
     virtual const void* physicalCacheIdentity() const noexcept {return this;}
-    // Whole-key batch scheduling is opt-in; direct readers keep their existing
-    // per-chunk acquisition/copy loop. Results retain input order.
+protected:
+    // Implementation hooks for ROI loading. Worker callers use Volume::readZYX;
+    // chunk-list scheduling is deliberately not an additional public API.
+    friend struct detail::ChunkReadBatch;
     virtual bool prefersBatchReads() const noexcept {return false;}
     virtual std::vector<ChunkResult> getChunksBlocking(const std::vector<ChunkKey>& keys,
                                                       const ChunkRequestContext& request = {})
@@ -107,6 +110,7 @@ public:
         return results;
     }
 
+public:
     // Interactive viewers must use tryGetChunk() only. A miss queues I/O and
     // returns immediately; chunk-ready listeners are responsible for scheduling
     // a later repaint on the UI thread.

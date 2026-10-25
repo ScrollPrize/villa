@@ -1398,6 +1398,7 @@ void ChunkCache::refreshFetchers(
         notifyRemoteFetchListeners(state, key, false,
                                    /*isolateCallbackExceptions=*/true);
     state->cv_.notify_all();
+    notifyQueued(state); // refresh may have dropped entries whose restart threw
 }
 
 void ChunkCache::restartUnresolvedLocked(const std::shared_ptr<State>& state)
@@ -1825,7 +1826,7 @@ bool ChunkCache::prefersBatchReads() const noexcept
 std::vector<ChunkResult> ChunkCache::getChunksBlocking(const std::vector<ChunkKey>& keys,
                                                        const ChunkRequestContext& request)
 {
-    if(!prefersBatchReads()||request.interactive())return IChunkedArray::getChunksBlocking(keys,request);
+    if(request.interactive())return IChunkedArray::getChunksBlocking(keys,request);
     if(request.channelHints)request.channelHints->prefetch(*this,keys,-1024,request);
     // Resident values already own their decoded payload. Do not park a reader
     // on the coordinator just to return a cache hit; inspect a whole ROI under
@@ -1846,8 +1847,29 @@ std::vector<ChunkResult> ChunkCache::getChunksBlocking(const std::vector<ChunkKe
     }
     // Do not retain hints: they own channel handles which own this service.
     if(!pending.empty()){
-        auto loaded=service_->impl_->loadQueue->submit(queuedSource(),std::move(pending),request.foreground,-1024).get();
-        for(std::size_t i=0;i<indices.size();++i)results[indices[i]]=std::move(loaded[i]);
+        if(prefersBatchReads()){
+            auto loaded=service_->impl_->loadQueue->submit(queuedSource(),std::move(pending),request.foreground,-1024).get();
+            for(std::size_t i=0;i<indices.size();++i)results[indices[i]]=std::move(loaded[i]);
+        }else{
+            // Bulk is bulk even without the optional cross-request coordinator.
+            // Reserve the whole batch before scheduling it so an early result
+            // cannot be evicted while we await an earlier key in result order.
+            // Reuse the same reservation helpers as the queued backend.
+            auto source=queuedSource();source.acquire(pending);
+            auto plain=request;plain.channelHints.reset();
+            try{
+                prefetchChunks(pending,false,-1024,plain);
+                for(std::size_t i=0;i<pending.size();++i){
+                    const auto& k=pending[i];
+                    results[indices[i]]=getChunkBlocking(k.level,k.iz,k.iy,k.ix,plain);
+                }
+            }catch(...){
+                const auto error=std::current_exception();
+                try{source.release(pending);}catch(...){}
+                std::rethrow_exception(error);
+            }
+            source.release(pending);
+        }
     }
     return results;
 }
@@ -1871,7 +1893,7 @@ ChunkLoadQueue::Source ChunkCache::queuedSource() const
     };
     source.poll=[state](const auto& queries){return pollQueuedChunks(state,queries);};
     source.release=[state](const auto& keys){releaseQueuedChunks(state,keys);};
-    source.subscribe=[state](std::function<void()> wake){
+    source.subscribeKeys=[state](std::function<void(std::optional<ChunkKey>)> wake){
         std::lock_guard lock(state->mutex_);
         state->queuedInvalidationWake_=std::move(wake);
         return [state]{std::lock_guard lock(state->mutex_);state->queuedInvalidationWake_={};};
@@ -1891,13 +1913,14 @@ std::vector<ChunkResult> ChunkCache::pollQueuedChunks(const std::shared_ptr<Stat
         if(!state->fetchers_[key.level]){results.push_back({ChunkStatus::Missing,state->dtype_,state->levels_[key.level].chunkShape,{},{}});continue;}
         try {
             auto [it,inserted]=state->entries_.emplace(key,Entry{});
+            const bool promoted=query.foreground&&!it->second.foregroundDemand;
             it->second.foregroundDemand |= query.foreground;
             it->second.backgroundDemand |= !query.foreground;
             if(inserted){
                 if(queueFetchLocked(state,key,state->generation_,query.priority))remoteStarts.push_back(key);
             }else if(it->second.status==EntryStatus::InFlight){
                 const auto priority=fetchBasePriority(*state,key,query.priority);
-                if(priority<it->second.basePriority||query.foreground){
+                if(priority<it->second.basePriority||promoted){
                     it->second.basePriority=std::min(priority,it->second.basePriority);
                     reprioritizeEntryLocked(*state,key,it->second);
                 }
@@ -2037,7 +2060,7 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix,
             // reader's own wake is still pending, which lands in the retry
             // below.
             { detail::SamplingWaitTimer timer(9);
-            state->cv_.wait(lock, [&] {
+            state->cv_.wait_key(key, lock, [&] {
                 auto entry = state->entries_.find(key);
                 if (entry == state->entries_.end())
                     return true;
@@ -2670,7 +2693,7 @@ void ChunkCache::clearViewDemand(std::uint64_t viewId,
 
 void ChunkCache::invalidateState(const std::shared_ptr<State>& state)
 {
-    std::function<void()> queuedWake;
+    std::function<void(std::optional<ChunkKey>)> queuedWake;
     std::uint64_t schedulerEpoch = 0;
     std::vector<ChunkKey> activeRemoteFetches;
     std::vector<std::shared_ptr<PersistenceOperation>> cancelledPersistence;
@@ -2679,6 +2702,10 @@ void ChunkCache::invalidateState(const std::shared_ptr<State>& state)
         queuedWake=state->queuedInvalidationWake_;
         ++state->generation_;
         schedulerEpoch = ++state->schedulerEpoch_;
+        // Remove cache ownership accounting before final-reader releases can
+        // recycle these allocations into the budget's now-free space.
+        removeDecodedBytesLocked(*state, state->decodedBytes_);
+        state->decodedBytes_ = 0;
         state->entries_.clear();
         state->lru_.clear();
         state->viewSnapshots_.clear();
@@ -2691,8 +2718,6 @@ void ChunkCache::invalidateState(const std::shared_ptr<State>& state)
                 cancelledPersistence.push_back(operation);
         }
         state->persistenceOperations_.clear();
-        removeDecodedBytesLocked(*state, state->decodedBytes_);
-        state->decodedBytes_ = 0;
         activeRemoteFetches.reserve(state->activeRemoteFetches_.size());
         for (const auto& [key, count] : state->activeRemoteFetches_) {
             (void)count;
@@ -2731,7 +2756,7 @@ void ChunkCache::invalidateState(const std::shared_ptr<State>& state)
         operation->cv.notify_all();
     }
     state->cv_.notify_all();
-    if(queuedWake)queuedWake();
+    if(queuedWake)queuedWake(std::nullopt);
 }
 
 void ChunkCache::unregisterStateBudget(State& state)
@@ -3529,8 +3554,10 @@ void ChunkCache::queueRemoteFetch(const std::shared_ptr<State>& state,
     if (remoteStart)
         notifyRemoteFetchListeners(state, key, true,
                                    /*isolateCallbackExceptions=*/true);
-    if (pruned || waitingForPersistence)
+    if (pruned || waitingForPersistence) {
         state->cv_.notify_all();
+        notifyQueued(state,key);
+    }
 }
 
 std::shared_ptr<ChunkRequestScheduler> ChunkCache::sourceScheduler(
@@ -3655,8 +3682,10 @@ void ChunkCache::queuePersistentDecode(const std::shared_ptr<State>& state,
                 }
             });
     });
-    if (pruned)
+    if (pruned) {
         state->cv_.notify_all();
+        notifyQueued(state,key);
+    }
 }
 
 void ChunkCache::queueFetchedDecode(const std::shared_ptr<State>& state,
@@ -3701,8 +3730,10 @@ void ChunkCache::queueFetchedDecode(const std::shared_ptr<State>& state,
                 }
             });
     });
-    if (pruned)
+    if (pruned) {
         state->cv_.notify_all();
+        notifyQueued(state,key);
+    }
 }
 
 void ChunkCache::runSourceTransfer(const std::shared_ptr<State>& state,
@@ -4492,6 +4523,10 @@ void ChunkCache::decodeFetchedAndStore(
     const auto decodeInputBytes = fetched->bytes.size();
     const auto decodeStarted = std::chrono::steady_clock::now();
     try {
+        if (fetched->status == ChunkFetchStatus::Found &&
+            state->dtype_ != ChunkDtype::Opaque && state->decodedByteBudget_)
+            fetched->decodeBuffer = state->decodedByteBudget_->takeBuffer(
+                expectedChunkBytes(*state, key));
         decoded = context.fetcher->decodeFetched(
             fetcherKey(key), std::move(*fetched));
     } catch (const std::exception& e) {
@@ -4549,6 +4584,23 @@ void ChunkCache::finishAndStore(const std::shared_ptr<State>& state,
                                 ChunkFetchResult fetch,
                                 bool loadedFromPersistentCache)
 {
+    // Reclaim all-fill, stale and rejected decoded storage as well as published
+    // payloads. The guard runs after source locks on every return path.
+    const auto recycle = [budget=state->decodedByteBudget_](ChunkFetchResult* result) noexcept {
+        if (budget) {
+            budget->recycleBuffer(std::move(result->bytes));
+            budget->recycleBuffer(std::move(result->decodeBuffer));
+        }
+    };
+    const std::unique_ptr<ChunkFetchResult, decltype(recycle)> recycleGuard(&fetch, recycle);
+    // Source shape/dtype/fill/detection policy are immutable. Scan the owned
+    // decoded buffer on the decode worker, not under the source metadata lock.
+    // Keep fetch owned here so discarded/all-fill buffers are also freed after
+    // leaving that lock. Generation/serial validation still happens below.
+    const bool allFill = fetch.status == ChunkFetchStatus::Found &&
+        state->dtype_ != ChunkDtype::Opaque && !fetch.payload &&
+        fetch.bytes.size() == expectedChunkBytes(*state,key) &&
+        state->options_.detectAllFillChunks && isAllFill(*state,fetch.bytes);
     // Keep the newly resolved value leased until shared-budget enforcement
     // finishes. Otherwise a chunk larger than the configured budget can evict
     // itself before the blocking requester has a chance to acquire its lease.
@@ -4567,7 +4619,7 @@ void ChunkCache::finishAndStore(const std::shared_ptr<State>& state,
         it->second.fetchTaskId = 0;
         it->second.decodeTaskId = 0;
         storeFetchResultLocked(
-            state, key, std::move(fetch), loadedFromPersistentCache);
+            state, key, fetch, loadedFromPersistentCache, allFill);
         const auto stored = state->entries_.find(key);
         if (stored != state->entries_.end() &&
             stored->second.status == EntryStatus::Data) {
@@ -4576,8 +4628,8 @@ void ChunkCache::finishAndStore(const std::shared_ptr<State>& state,
         }
     }
     enforceSharedBudget(state);
-    state->cv_.notify_all();
-    notifyListeners(state);
+    state->cv_.notify_key(key);
+    notifyListeners(state,key);
 }
 
 void ChunkCache::finishDelta3dAndStore(
@@ -4587,6 +4639,9 @@ void ChunkCache::finishDelta3dAndStore(
     ChunkFetchResult fetch,
     std::shared_ptr<PersistenceOperation> persistence)
 {
+    const bool allFill = fetch.status == ChunkFetchStatus::Found &&
+        fetch.bytes.size() == expectedChunkBytes(*state,key) &&
+        state->options_.detectAllFillChunks && isAllFill(*state,fetch.bytes);
     bool persistenceQueued = false;
     {
         std::lock_guard lock(state->mutex_);
@@ -4601,7 +4656,7 @@ void ChunkCache::finishDelta3dAndStore(
         it->second.fetchTaskId = 0;
         it->second.decodeTaskId = 0;
         persistenceQueued = storeDelta3dFetchResultLocked(
-            state, key, std::move(fetch), persistence);
+            state, key, fetch, persistence, allFill);
     }
     if (persistence && !persistenceQueued) {
         completePersistenceOperation(
@@ -4610,15 +4665,15 @@ void ChunkCache::finishDelta3dAndStore(
              "could not persist shared Delta3D decode"});
     }
     enforceSharedBudget(state);
-    state->cv_.notify_all();
-    notifyListeners(state);
+    state->cv_.notify_key(key);
+    notifyListeners(state,key);
 }
 
 void ChunkCache::storeFetchResultLocked(
     const std::shared_ptr<State>& state,
     const ChunkKey& key,
-    ChunkFetchResult fetch,
-    bool loadedFromPersistentCache)
+    ChunkFetchResult& fetch,
+    bool loadedFromPersistentCache, bool allFill)
 {
     auto it = state->entries_.find(key);
     if (it == state->entries_.end())
@@ -4665,8 +4720,7 @@ void ChunkCache::storeFetchResultLocked(
             entry.error = "decoded chunk byte size does not match full chunk shape";
             break;
         }
-        if (!opaque && state->options_.detectAllFillChunks &&
-            isAllFill(*state, fetch.bytes)) {
+        if (!opaque && allFill) {
             entry.status = EntryStatus::AllFill;
             // `persisted` is set by the writer's completion callback once
             // the bytes are actually on disk (same for the cases below).
@@ -4681,8 +4735,7 @@ void ChunkCache::storeFetchResultLocked(
         if (opaque) {
             entry.payload = std::move(fetch.payload);
         } else {
-            entry.bytes = std::make_shared<const std::vector<std::byte>>(
-                std::move(fetch.bytes));
+            entry.bytes = state->decodedByteBudget_->shareBuffer(std::move(fetch.bytes));
         }
         state->decodedBytes_ += entry.decodedBytes;
         addDecodedBytesLocked(*state, entry.decodedBytes);
@@ -4720,8 +4773,8 @@ void ChunkCache::storeFetchResultLocked(
 bool ChunkCache::storeDelta3dFetchResultLocked(
     const std::shared_ptr<State>& state,
     const ChunkKey& key,
-    ChunkFetchResult fetch,
-    const std::shared_ptr<PersistenceOperation>& persistence)
+    ChunkFetchResult& fetch,
+    const std::shared_ptr<PersistenceOperation>& persistence, bool allFill)
 {
     // This deliberately owns the Delta3D-only decisions instead of adding
     // mode checks to storeFetchResultLocked. The ordinary SourceMirror store
@@ -4763,8 +4816,7 @@ bool ChunkCache::storeDelta3dFetchResultLocked(
             value.error = "decoded chunk byte size does not match full chunk shape";
             break;
         }
-        if (state->options_.detectAllFillChunks &&
-            isAllFill(*state, fetch.bytes)) {
+        if (allFill) {
             value.status = EntryStatus::AllFill;
             value.persistentWriteQueued = persistence
                 ? queuePersistentSourceEmptyWrite(state, key, persistence)
@@ -4773,8 +4825,7 @@ bool ChunkCache::storeDelta3dFetchResultLocked(
         }
         value.status = EntryStatus::Data;
         value.decodedBytes = fetch.bytes.size();
-        value.bytes = std::make_shared<const std::vector<std::byte>>(
-            std::move(fetch.bytes));
+        value.bytes = state->decodedByteBudget_->shareBuffer(std::move(fetch.bytes));
         state->decodedBytes_ += value.decodedBytes;
         addDecodedBytesLocked(*state, value.decodedBytes);
         value.persistentWriteQueued = queueDelta3dWrite(
@@ -6086,10 +6137,17 @@ std::size_t ChunkCache::expectedChunkBytes(const State& state, const ChunkKey& k
            dtypeSize(state.dtype_);
 }
 
-void ChunkCache::notifyListeners(const std::shared_ptr<State>& state)
+void ChunkCache::notifyQueued(const std::shared_ptr<State>& state,std::optional<ChunkKey> key)
+{
+    std::function<void(std::optional<ChunkKey>)> callback;
+    {std::lock_guard lock(state->mutex_);callback=state->queuedInvalidationWake_;}
+    if(callback)callback(key);
+}
+
+void ChunkCache::notifyListeners(const std::shared_ptr<State>& state,std::optional<ChunkKey> key)
 {
     std::vector<ChunkReadyCallback> callbacks;
-    std::function<void()> queuedWake;
+    std::function<void(std::optional<ChunkKey>)> queuedWake;
     {
         std::lock_guard lock(state->mutex_);
         queuedWake=state->queuedInvalidationWake_;
@@ -6099,7 +6157,7 @@ void ChunkCache::notifyListeners(const std::shared_ptr<State>& state)
             callbacks.push_back(cb);
         }
     }
-    if(queuedWake)queuedWake(); // independent of arbitrary user callbacks
+    if(queuedWake)queuedWake(key); // independent of arbitrary user callbacks
     for (auto& cb : callbacks) {
         if (!cb)continue;
         try{cb();}

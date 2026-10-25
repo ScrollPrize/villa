@@ -1037,6 +1037,8 @@ vc_add_test(NAME test_channel_read_hints)
 vc_add_test(NAME test_chunk_load_queue)
 add_executable(bench_chunk_cache_contention bench_chunk_cache_contention.cpp)
 target_link_libraries(bench_chunk_cache_contention PRIVATE vc_core)
+add_executable(bench_parallel_chunk_read bench_parallel_chunk_read.cpp)
+target_link_libraries(bench_parallel_chunk_read PRIVATE vc_core)
 
 vc_add_test(NAME test_volume_extras)
 

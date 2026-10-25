@@ -176,6 +176,8 @@ public:
     // Blocking integer reads through the chunked local/remote cache.
     // ZYX order matches zarr storage and numpy-style volume indexing:
     //   offset = [z, y, x], shape = [z, y, x].
+    // A successful read overwrites every output voxel. Reuse an already-sized
+    // output to avoid allocation. On exceptions the partial output is unusable.
     bool readZYX(Array3D<uint8_t>& out,
                  const std::array<int, 3>& offsetZYX,
                  int level = 0,

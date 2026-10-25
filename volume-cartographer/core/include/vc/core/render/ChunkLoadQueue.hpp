@@ -23,9 +23,13 @@ public:
         std::function<void(const std::vector<ChunkKey>&)> release;
         // Subscribe before the first poll; return an unsubscribe callback.
         std::function<std::function<void()>(std::function<void()>)> subscribe;
+        // Optional precise completion channel. nullopt invalidates the source;
+        // a key signals that key alone. Used instead of subscribe when provided.
+        std::function<std::function<void()>(std::function<void(std::optional<ChunkKey>)>)> subscribeKeys;
     };
     struct Stats {
         std::uint64_t requests=0, keys=0, coalesced=0, completed=0, polls=0, wakes=0;
+        std::uint64_t queriedKeys=0;
         std::size_t inFlight=0, peakInFlight=0, pending=0, peakPending=0;
         std::size_t replyBytes=0, peakReplyBytes=0;
     };

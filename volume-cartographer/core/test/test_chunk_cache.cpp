@@ -1027,6 +1027,100 @@ TEST_CASE("ChunkCacheService enforces one decoded budget across sources")
     CHECK(cacheB->getChunkIfCached(0, 0, 0, 1).status == ChunkStatus::Data);
 }
 
+TEST_CASE("released decoded leases race safely with shared budget reductions")
+{
+    auto service=makeService(512);
+    auto fetcher=std::make_shared<CountingFetcher>();
+    for(int z=0;z<2;++z)for(int y=0;y<2;++y)for(int x=0;x<2;++x){
+        ChunkFetchResult result;result.status=ChunkFetchStatus::Found;
+        result.bytes=makeBytes(64,std::byte{91});
+        fetcher->setCanned({0,z,y,x},result);
+    }
+    auto cache=makeServiceCache(service,"recycle-shrink",fetcher);
+    auto budget=service->decodedByteBudget();
+    for(int repeat=0;repeat<8;++repeat){
+        budget->setMaximumBytes(512);
+        std::vector<ChunkResult> leases;
+        for(int z=0;z<2;++z)for(int y=0;y<2;++y)for(int x=0;x<2;++x){
+            leases.push_back(cache->getChunkBlocking(0,z,y,x));
+            REQUIRE(leases.back().bytes);
+        }
+        cache->invalidate();
+        std::atomic_bool go{false};
+        std::vector<std::thread> releases;
+        for(auto& lease:leases)releases.emplace_back([value=std::move(lease.bytes),&go]() mutable {
+            while(!go.load())std::this_thread::yield();
+            value.reset();
+        });
+        std::thread shrink([&]{
+            go.store(true);
+            for(int i=0;i<32;++i)budget->setMaximumBytes(i%2?128:0);
+            budget->setMaximumBytes(0);
+        });
+        shrink.join();for(auto& thread:releases)thread.join();
+        CHECK(budget->stats().decodedBytes==0);
+        CHECK(budget->stats().recycledBytes==0);
+    }
+}
+
+TEST_CASE("a non-Zarr decoder can consume cache-owned reusable output")
+{
+    class ReusingFetcher final : public IChunkFetcher {
+    public:
+        mutable std::atomic<int> reuse{0};
+        ChunkFetchResult fetch(const ChunkKey& key) override { return decodeFetched(key,fetchEncoded(key)); }
+        ChunkFetchResult fetchEncoded(const ChunkKey& key) override {
+            ChunkFetchResult r;r.status=ChunkFetchStatus::Found;
+            r.bytes={std::byte(21+key.ix)};return r;
+        }
+        ChunkFetchResult decodeFetched(const ChunkKey&,ChunkFetchResult input) const override {
+            const auto value=input.bytes.front();
+            ChunkFetchResult r;r.status=ChunkFetchStatus::Found;
+            if(!input.decodeBuffer.empty())++reuse;
+            r.bytes=std::move(input.decodeBuffer);
+            r.bytes.resize(64);
+            std::fill(r.bytes.begin(),r.bytes.end(),value);
+            return r;
+        }
+    };
+    auto service=makeService(128);
+    auto fetcher=std::make_shared<ReusingFetcher>();
+    auto cache=makeServiceCache(service,"generic-reuse",fetcher);
+    auto first=cache->getChunkBlocking(0,0,0,0);
+    REQUIRE(first.bytes);
+    const auto* address=first.bytes->data();
+    cache->invalidate();
+    CHECK(service->decodedByteBudget()->stats().recycledBytes==0);
+    first.bytes.reset();
+    auto second=cache->getChunkBlocking(0,0,0,1);
+    REQUIRE(second.bytes);
+    CHECK(fetcher->reuse==1);
+    CHECK(second.bytes->data()==address);
+    CHECK(*second.bytes==makeBytes(64,std::byte{22}));
+}
+
+TEST_CASE("shrinking the idle pool trims only excess capacity")
+{
+    auto service=makeService(256);
+    auto fetcher=std::make_shared<CountingFetcher>();
+    for(int y=0;y<2;++y)for(int x=0;x<2;++x){
+        ChunkFetchResult r;r.status=ChunkFetchStatus::Found;r.bytes=makeBytes(64,std::byte{17});
+        fetcher->setCanned({0,0,y,x},std::move(r));
+    }
+    auto cache=makeServiceCache(service,"partial-pool-trim",fetcher);
+    for(int y=0;y<2;++y)for(int x=0;x<2;++x)
+        REQUIRE(cache->getChunkBlocking(0,0,y,x).status==ChunkStatus::Data);
+    cache->invalidate();
+    auto budget=service->decodedByteBudget();
+    REQUIRE(budget->stats().recycledBytes==256);
+    budget->setMaximumBytes(192);
+    CHECK(budget->stats().recycledBytes==192);
+    CHECK(budget->stats().trimmedBuffers==1);
+    CHECK(budget->stats().trimmedBytes==64);
+    budget->setMaximumBytes(0);
+    CHECK(budget->stats().recycledBytes==0);
+}
+
 TEST_CASE("ChunkCacheService capacity changes preserve sources and global LRU")
 {
     auto service = makeService(128);

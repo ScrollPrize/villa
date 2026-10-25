@@ -271,9 +271,11 @@ public:
 
     VolumeSourceId sourceId() const noexcept;
     const void* physicalCacheIdentity() const noexcept override {return state_.get();}
+private:
     bool prefersBatchReads() const noexcept override;
     std::vector<ChunkResult> getChunksBlocking(const std::vector<ChunkKey>& keys,
                                               const ChunkRequestContext& request = {}) override;
+public:
     std::shared_ptr<ChunkCache> inService(const std::shared_ptr<ChunkCacheService>& service) const;
 
     int numLevels() const override;
@@ -502,6 +504,71 @@ private:
         std::mutex mutex;
         std::vector<std::weak_ptr<State>> states;
     };
+    // Keyed readers share their source mutex for predicate/publication, but do
+    // not wake for unrelated chunks. Registration belongs to the wait, never to
+    // an evictable entry. Global waiters (prefetch/drain) retain their old CV.
+    class KeyedReadCondition {
+        struct Channel {
+            std::shared_ptr<std::condition_variable> cv;
+            std::size_t readers = 0;
+        };
+        std::mutex registryMutex_;
+        std::unordered_map<ChunkKey, Channel, ChunkKeyHash> channels_;
+        std::condition_variable global_;
+
+        void release(const ChunkKey& key) {
+            std::lock_guard lock(registryMutex_);
+            auto it = channels_.find(key);
+            if (--it->second.readers == 0)
+                channels_.erase(it);
+        }
+    public:
+        template<class Predicate>
+        void wait(std::unique_lock<std::mutex>& lock, Predicate predicate) {
+            global_.wait(lock, std::move(predicate));
+        }
+        template<class Predicate>
+        void wait_key(const ChunkKey& key, std::unique_lock<std::mutex>& lock,
+                      Predicate predicate) {
+            // Caller still owns the source mutex here; publication cannot race
+            // registration. Resident hits need no registry allocation.
+            if (predicate()) return;
+            std::shared_ptr<std::condition_variable> ready;
+            {
+                std::lock_guard guard(registryMutex_);
+                auto it = channels_.find(key);
+                if (it == channels_.end())
+                    it = channels_.emplace(key, Channel{std::make_shared<std::condition_variable>(), 0}).first;
+                auto& channel = it->second;
+                ready = channel.cv;
+                ++channel.readers;
+            }
+            try { ready->wait(lock, std::move(predicate)); }
+            catch (...) { release(key); throw; }
+            release(key);
+        }
+        void notify_key(const ChunkKey& key) {
+            std::shared_ptr<std::condition_variable> ready;
+            {
+                std::lock_guard guard(registryMutex_);
+                auto it = channels_.find(key);
+                if (it != channels_.end()) ready = it->second.cv;
+            }
+            if (ready) ready->notify_all();
+            global_.notify_all();
+        }
+        void notify_all() {
+            // No predicate or source-mutex acquisition while holding registry.
+            // Notifying here also avoids allocating during invalidation/cleanup.
+            {
+                std::lock_guard guard(registryMutex_);
+                for (const auto& [key, channel] : channels_)
+                    channel.cv->notify_all();
+            }
+            global_.notify_all();
+        }
+    };
+
     struct State {
         State(std::vector<LevelInfo> levels,
               std::vector<std::shared_ptr<IChunkFetcher>> fetchers,
@@ -544,10 +611,10 @@ private:
         VolumeSourceId sourceId_{};
         std::string sourceIdentity_;
         std::shared_ptr<InvalidationGroup> invalidationGroup_ = std::make_shared<InvalidationGroup>();
-        std::function<void()> queuedInvalidationWake_;
+        std::function<void(std::optional<ChunkKey>)> queuedInvalidationWake_;
 
         mutable std::mutex mutex_;
-        std::condition_variable cv_;
+        KeyedReadCondition cv_;
         std::unordered_map<ChunkKey, Entry, ChunkKeyHash> entries_;
         std::unordered_map<ChunkKey,
                            std::shared_ptr<PersistenceOperation>,
@@ -752,13 +819,13 @@ private:
     static void storeFetchResultLocked(
         const std::shared_ptr<State>& state,
         const ChunkKey& key,
-        ChunkFetchResult fetch,
-        bool loadedFromPersistentCache);
+        ChunkFetchResult& fetch,
+        bool loadedFromPersistentCache, bool allFill);
     [[nodiscard]] static bool storeDelta3dFetchResultLocked(
         const std::shared_ptr<State>& state,
         const ChunkKey& key,
-        ChunkFetchResult fetch,
-        const std::shared_ptr<PersistenceOperation>& persistence);
+        ChunkFetchResult& fetch,
+        const std::shared_ptr<PersistenceOperation>& persistence, bool allFill);
     static bool queuePersistentWrite(const std::shared_ptr<State>& state,
                                      const ChunkKey& key,
                                      std::shared_ptr<const std::vector<std::byte>> bytes);
@@ -838,7 +905,10 @@ private:
     static bool isAllFill(const State& state, const std::vector<std::byte>& bytes);
     static std::size_t dtypeSize(ChunkDtype dtype);
     static std::size_t expectedChunkBytes(const State& state, const ChunkKey& key);
-    static void notifyListeners(const std::shared_ptr<State>& state);
+    static void notifyListeners(const std::shared_ptr<State>& state,
+                                std::optional<ChunkKey> key=std::nullopt);
+    static void notifyQueued(const std::shared_ptr<State>& state,
+                             std::optional<ChunkKey> key=std::nullopt);
     static void notifyRemoteFetchListeners(const std::shared_ptr<State>& state,
                                            const ChunkKey& key,
                                            bool active,

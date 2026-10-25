@@ -1,4 +1,6 @@
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/types/StridedCopy3D.hpp"
+#include "render/ChunkReadBatch.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -229,8 +231,6 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
     if (outShape[0] == 0 || outShape[1] == 0 || outShape[2] == 0) {
         return;
     }
-    out.fill(T{});
-
     const auto volumeShape = array.shape(level);
     const auto chunkShape = array.chunkShape(level);
     if (chunkShape[0] <= 0 || chunkShape[1] <= 0 || chunkShape[2] <= 0) {
@@ -243,6 +243,12 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
     const int z1 = z0 + static_cast<int>(outShape[0]) - 1;
     const int y1 = y0 + static_cast<int>(outShape[1]) - 1;
     const int x1 = x0 + static_cast<int>(outShape[2]) - 1;
+
+    // Interior intersections write every output cell, including missing/fill
+    // chunks. Reused output buffers need no redundant clearing. Outside-volume
+    // padding remains zero. Output is not usable after a failed read.
+    if (z0 < 0 || y0 < 0 || x0 < 0 || z1 >= volumeShape[0] ||
+        y1 >= volumeShape[1] || x1 >= volumeShape[2]) out.fill(T{});
 
     const int readZ0 = std::max(0, z0);
     const int readY0 = std::max(0, y0);
@@ -269,7 +275,7 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
                 }
             }
         }
-        if (!keys.empty() && !array.prefersBatchReads()) {
+        if (!keys.empty() && !vc::render::detail::ChunkReadBatch::enabled(array)) {
             array.prefetchChunks(keys, false, 0, request);
         }
     }
@@ -296,7 +302,8 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
     auto plainRequest=request;plainRequest.channelHints.reset(); // expanded once for this ROI batch
     // The opt-in queued backend admits all concurrent ROIs together. The
     // existing backend retains its per-storage-chunk streaming copy path.
-    const auto batch=array.prefersBatchReads()?array.getChunksBlocking(keys,request):std::vector<vc::render::ChunkResult>{};
+    const bool batched=vc::render::detail::ChunkReadBatch::enabled(array);
+    const auto batch=batched?vc::render::detail::ChunkReadBatch::read(array,keys,request):std::vector<vc::render::ChunkResult>{};
     // Each storage chunk is acquired once, not again for every ROI row. The
     // intersections are disjoint, so copies need no locks or per-voxel atomics.
     // Holding the result's bytes owns only this copy operation, not a cache pin.
@@ -305,7 +312,7 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
         if (chunkReadFailed.load(std::memory_order_acquire))
             continue;
         const auto& key = keys[static_cast<size_t>(index)];
-        const auto result = array.prefersBatchReads()?batch[static_cast<size_t>(index)]:array.getChunkBlocking(level, key.iz, key.iy, key.ix,plainRequest);
+        const auto result = batched?batch[static_cast<size_t>(index)]:array.getChunkBlocking(level, key.iz, key.iy, key.ix,plainRequest);
         const T* data = nullptr;
         if (result.status == ChunkStatus::Error) {
             recordChunkReadError(key.iz, key.iy, key.ix, result.error);
@@ -325,13 +332,21 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
         const int endZ = std::min(readZ1 + 1, chunkZ + chunkShape[0]);
         const int endY = std::min(readY1 + 1, chunkY + chunkShape[1]);
         const int endX = std::min(readX1 + 1, chunkX + chunkShape[2]);
-        for (int z = std::max(readZ0, chunkZ); z < endZ; ++z) {
-            for (int y = std::max(readY0, chunkY); y < endY; ++y) {
-                const size_t row = static_cast<size_t>(z - chunkZ) * chunkStrideZ +
-                                   static_cast<size_t>(y - chunkY) * chunkStrideY;
-                for (int x = std::max(readX0, chunkX); x < endX; ++x)
-                    out(z - z0, y - y0, x - x0) = data ? data[row + x - chunkX] : fill;
-            }
+        const int startZ = std::max(readZ0, chunkZ);
+        const int startY = std::max(readY0, chunkY);
+        const int startX = std::max(readX0, chunkX);
+        T* dst = &out(startZ-z0, startY-y0, startX-x0);
+        const size_t dstStrideX = outShape[0]*outShape[1];
+        if (data) {
+            const T* src = data + (startZ-chunkZ)*chunkStrideZ +
+                (startY-chunkY)*chunkStrideY + startX-chunkX;
+            vc::copyStrided3D(src, {chunkStrideZ,chunkStrideY,1}, dst,
+                {1,outShape[0],dstStrideX},
+                {size_t(endZ-startZ),size_t(endY-startY),size_t(endX-startX)});
+        } else {
+            for (int x = 0; x < endX-startX; ++x)
+                for (int y = 0; y < endY-startY; ++y)
+                    std::fill_n(dst+x*dstStrideX+y*outShape[0], endZ-startZ, fill);
         }
     }
 

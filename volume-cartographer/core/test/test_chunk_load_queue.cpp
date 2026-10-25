@@ -3,6 +3,7 @@
 #include "vc/core/render/ChunkCache.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "../src/render/ChunkReadBatch.hpp"
 #include "utils/zarr.hpp"
 #include <atomic>
 #include <chrono>
@@ -13,6 +14,10 @@
 using namespace vc::render;
 using namespace std::chrono_literals;
 namespace {
+template<class T> concept PublicChunkBatch = requires(T& value, const std::vector<ChunkKey>& keys) {
+    value.getChunksBlocking(keys);
+};
+static_assert(!PublicChunkBatch<IChunkedArray> && !PublicChunkBatch<ChunkCache>);
 class Fetcher final:public IChunkFetcher {
 public:
     std::atomic<int> calls{0},active{0},peak{0},value{31};
@@ -43,7 +48,7 @@ TEST_CASE("queued batches coalesce and bound concurrent unique keys") {
     auto s=service(4);auto f=std::make_shared<Fetcher>();std::promise<void> gate;f->gate=gate.get_future().share();auto a=source(s,f);
     std::vector<ChunkKey> keys;for(int x=0;x<8;++x)keys.push_back({0,0,0,x});
     std::vector<std::future<std::vector<ChunkResult>>> reads;
-    for(int i=0;i<10;++i)reads.push_back(std::async(std::launch::async,[&]{return a->getChunksBlocking(keys);}));
+    for(int i=0;i<10;++i)reads.push_back(std::async(std::launch::async,[&]{return detail::ChunkReadBatch::read(*a,keys);}));
     const bool combined=until([&]{return s->loaderStats().coalesced>=72;});
     gate.set_value();CHECK(combined);
     for(auto& read:reads){auto results=read.get();REQUIRE(results.size()==8);for(auto& r:results)CHECK(r.bytes->at(0)==std::byte(31));}
@@ -53,10 +58,30 @@ TEST_CASE("queued batches coalesce and bound concurrent unique keys") {
     CHECK_THROWS(s->createDecodedPartition(1024));
 }
 
+TEST_CASE("direct bulk read exposes concurrent work and protects results in tiny cache") {
+    auto options=ChunkCacheService::batchOptions(4,1);
+    auto s=std::make_shared<ChunkCacheService>(options);
+    auto f=std::make_shared<Fetcher>();std::promise<void> gate;f->gate=gate.get_future().share();
+    auto a=source(s,f);
+    std::vector<ChunkKey> keys;for(int x=0;x<8;++x)keys.push_back({0,0,0,x});
+    keys.push_back(keys[0]);
+    auto read=std::async(std::launch::async,[&]{return detail::ChunkReadBatch::read(*a,keys);});
+    const bool concurrent=until([&]{return f->active>=4;});
+    gate.set_value();CHECK(concurrent);
+    auto results=read.get();REQUIRE(results.size()==9);
+    for(const auto& result:results){REQUIRE(result.bytes);CHECK(result.bytes->at(0)==std::byte(31));}
+    CHECK(results[0].bytes==results[8].bytes);CHECK(f->calls==8);
+    CHECK(a->stats().blockingReaders==0);
+    f->value=-2;a->invalidate();
+    auto failed=detail::ChunkReadBatch::read(*a,keys);
+    for(const auto& result:failed)CHECK(result.status==ChunkStatus::Error);
+    CHECK(a->stats().blockingReaders==0);
+}
+
 TEST_CASE("queued reservations survive tiny cache and invalidation") {
     auto s=service(3,1);auto f=std::make_shared<Fetcher>();auto a=source(s,f);
     std::vector<ChunkKey> keys;for(int x=0;x<32;++x)keys.push_back({0,0,0,x});
-    auto results=a->getChunksBlocking(keys);CHECK(f->calls==32);
+    auto results=detail::ChunkReadBatch::read(*a,keys);CHECK(f->calls==32);
     for(auto& r:results){REQUIRE(r.bytes);CHECK(r.bytes->at(0)==std::byte(31));}
     CHECK(until([&]{return a->stats().blockingReaders==0;}));
     std::promise<void> gate;f->gate=gate.get_future().share();a->invalidate();
@@ -68,17 +93,48 @@ TEST_CASE("queued reservations survive tiny cache and invalidation") {
     CHECK(f->calls>=before+2);CHECK(until([&]{return a->stats().blockingReaders==0;}));
 }
 
+TEST_CASE("direct keyed readers and global prefetch waiters survive invalidation") {
+    auto s=std::make_shared<ChunkCacheService>(ChunkCacheService::batchOptions(4,1<<20));
+    auto f=std::make_shared<Fetcher>();std::promise<void> gate;f->gate=gate.get_future().share();
+    auto a=source(s,f);
+    std::vector<std::future<ChunkResult>> reads;
+    for(int i=0;i<8;++i)reads.push_back(std::async(std::launch::async,[&]{return a->getChunkBlocking(0,0,0,0);}));
+    auto prefetch=std::async(std::launch::async,[&]{a->prefetchChunks({{0,0,0,0},{0,0,0,1}},true);});
+    const bool parked=until([&]{return a->stats().blockingReaders==8&&f->calls>=2;});
+    f->value=42;a->invalidate();gate.set_value();CHECK(parked);
+    for(auto& read:reads){
+        REQUIRE(read.wait_for(3s)==std::future_status::ready);
+        auto value=read.get();REQUIRE(value.bytes);CHECK(value.bytes->at(0)==std::byte(42));
+    }
+    REQUIRE(prefetch.wait_for(3s)==std::future_status::ready);prefetch.get();
+    CHECK(a->stats().blockingReaders==0);
+}
+
+TEST_CASE("direct completion wakes both keyed readers and global prefetch waiters") {
+    auto s=std::make_shared<ChunkCacheService>(ChunkCacheService::batchOptions(4,1<<20));
+    auto f=std::make_shared<Fetcher>();std::promise<void> gate;f->gate=gate.get_future().share();
+    auto a=source(s,f);
+    auto read=std::async(std::launch::async,[&]{return a->getChunkBlocking(0,0,0,0);});
+    auto prefetch=std::async(std::launch::async,[&]{a->prefetchChunks({{0,0,0,0},{0,0,0,1}},true);});
+    const bool parked=until([&]{return a->stats().blockingReaders==1&&f->calls>=2;});
+    gate.set_value();CHECK(parked);
+    REQUIRE(read.wait_for(3s)==std::future_status::ready);
+    CHECK(read.get().status==ChunkStatus::Data);
+    REQUIRE(prefetch.wait_for(3s)==std::future_status::ready);prefetch.get();
+    CHECK(a->stats().blockingReaders==0);
+}
+
 TEST_CASE("queued resident reads bypass admission and mixed batches preserve order") {
     auto s=service();auto f=std::make_shared<Fetcher>();auto a=source(s,f);
     REQUIRE(a->getChunkBlocking(0,0,0,0).status==ChunkStatus::Data);
     REQUIRE(until([&]{return a->stats().blockingReaders==0;}));
     const auto requests=s->loaderStats().requests;
     a->prefetchChunks({{0,0,0,0}},true);
-    auto hits=a->getChunksBlocking({{0,0,0,0},{0,0,0,0}});
+    auto hits=detail::ChunkReadBatch::read(*a,{{0,0,0,0},{0,0,0,0}});
     REQUIRE(hits.size()==2);CHECK(hits[0].bytes==hits[1].bytes);
     CHECK(s->loaderStats().requests==requests);CHECK(f->calls==1);
     f->value=42;
-    auto mixed=a->getChunksBlocking({{0,0,0,0},{0,0,0,1},{0,0,0,0},{0,0,0,1}});
+    auto mixed=detail::ChunkReadBatch::read(*a,{{0,0,0,0},{0,0,0,1},{0,0,0,0},{0,0,0,1}});
     REQUIRE(mixed.size()==4);
     CHECK(mixed[0].bytes->at(0)==std::byte(31));CHECK(mixed[2].bytes==mixed[0].bytes);
     CHECK(mixed[1].bytes->at(0)==std::byte(42));CHECK(mixed[3].bytes==mixed[1].bytes);
@@ -100,7 +156,7 @@ TEST_CASE("queued hints use ordinary caches and preserve missing fill errors") {
         bf->value=value;b->invalidate();CHECK(b->getChunkBlocking(0,0,0,0).status==status);
     }
     CHECK(b->getChunkBlocking(0,0,0,-1).status==ChunkStatus::AllFill);
-    CHECK(a->getChunksBlocking({}).empty());
+    CHECK(detail::ChunkReadBatch::read(*a,{}).empty());
 }
 
 TEST_CASE("queue stop resolves pending and active requests without blocking IO") {
@@ -114,6 +170,38 @@ TEST_CASE("queue stop resolves pending and active requests without blocking IO")
     REQUIRE(until([&]{return acquired==1;}));queue.stop();
     CHECK_THROWS(future.get());CHECK(released==1);CHECK(unsubscribed==1);
     CHECK_THROWS(queue.submit(source,{{0,0,0,0}},false,0));
+}
+
+TEST_CASE("keyed completion polls only changed entries and invalidation rescans source") {
+    ChunkLoadQueue queue(16);
+    std::atomic<unsigned> ready{0};std::atomic<size_t> acquired{0},released{0};
+    std::mutex callbackMutex;
+    std::function<void(std::optional<ChunkKey>)> notify;
+    ChunkLoadQueue::Source source;source.id=1;
+    source.acquire=[&](const auto& keys){acquired+=keys.size();};
+    source.release=[&](const auto& keys){released+=keys.size();};
+    source.subscribeKeys=[&](auto callback){
+        {std::lock_guard lock(callbackMutex);notify=std::move(callback);}
+        return []{};
+    };
+    source.poll=[&](const auto& queries){
+        std::vector<ChunkResult> result(queries.size());
+        for(size_t i=0;i<queries.size();++i)
+            if(ready.load()&(1u<<queries[i].key.ix))result[i].status=ChunkStatus::Missing;
+        return result;
+    };
+    std::vector<ChunkKey> keys;for(int x=0;x<16;++x)keys.push_back({0,0,0,x});
+    auto read=queue.submit(source,keys,false,0);
+    REQUIRE(until([&]{return queue.stats().queriedKeys==16;}));
+    ready=1;
+    {std::lock_guard lock(callbackMutex);notify(ChunkKey{0,0,0,0});}
+    REQUIRE(until([&]{return queue.stats().completed==1&&queue.stats().queriedKeys==17;}));
+    CHECK(queue.stats().queriedKeys==17);
+    ready=0xffff;
+    {std::lock_guard lock(callbackMutex);notify(std::nullopt);}
+    REQUIRE(read.wait_for(3s)==std::future_status::ready);
+    CHECK(read.get().size()==16);CHECK(until([&]{return released==16;}));
+    CHECK(acquired==16);CHECK(until([&]{return queue.stats().queriedKeys==32;}));
 }
 
 TEST_CASE("queued completion cannot be hidden by a throwing user listener") {
@@ -170,7 +258,7 @@ TEST_CASE("queued packed ROI reads preserve offsets and fill padding") {
     // INSIDE the logical volume uses its declared fill value instead.
     CHECK(out(0,0,0)==0);CHECK(out(1,1,1)==20);CHECK(out(4,4,4)==20);
     CHECK(out(1,1,5)==7);CHECK(out(1,1,8)==7);CHECK(out(5,5,9)==0);
-    auto results=b->getChunksBlocking({{0,0,0,0},{0,0,0,0}});
+    auto results=detail::ChunkReadBatch::read(*b,{{0,0,0,0},{0,0,0,0}});
     REQUIRE(results.size()==2);CHECK(results[0].byteOffset==64);CHECK(results[0].bytes->at(64)==std::byte(90));
     CHECK(results[0].bytes==results[1].bytes);
     auto cache=acquireProcessChunkCache(path.string(),array);CHECK(cache->stats().decodeAttempts==1);
