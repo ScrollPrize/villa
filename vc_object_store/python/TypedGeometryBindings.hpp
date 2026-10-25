@@ -105,11 +105,11 @@ inline void bindTypedGeometry(nb::module_& m)
         .def("__exit__", [](vo::GeometrySnapshot& self, nb::args) { self.close(); })
         .def("close", &vo::GeometrySnapshot::close)
         .def_prop_ro("active", &vo::GeometrySnapshot::active)
-        .def("point_collection", &vo::GeometrySnapshot::pointCollection, nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>())
-        .def("fiber", &vo::GeometrySnapshot::fiber, nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>())
-        .def("track", &vo::GeometrySnapshot::track, nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>())
-        .def("surface", &vo::GeometrySnapshot::surface, nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>())
-        .def("umbilicus", &vo::GeometrySnapshot::umbilicus, nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>())
-        .def("geometry", &vo::GeometrySnapshot::geometry, nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>());
+        .def("point_collection", &vo::GeometrySnapshot::pointCollection, nb::arg("object_uuid"), nb::arg("geometry_revision") = nb::none(), nb::call_guard<nb::gil_scoped_release>())
+        .def("fiber", &vo::GeometrySnapshot::fiber, nb::arg("object_uuid"), nb::arg("geometry_revision") = nb::none(), nb::call_guard<nb::gil_scoped_release>())
+        .def("track", &vo::GeometrySnapshot::track, nb::arg("object_uuid"), nb::arg("geometry_revision") = nb::none(), nb::call_guard<nb::gil_scoped_release>())
+        .def("surface", &vo::GeometrySnapshot::surface, nb::arg("object_uuid"), nb::arg("geometry_revision") = nb::none(), nb::call_guard<nb::gil_scoped_release>())
+        .def("umbilicus", &vo::GeometrySnapshot::umbilicus, nb::arg("object_uuid"), nb::arg("geometry_revision") = nb::none(), nb::call_guard<nb::gil_scoped_release>())
+        .def("geometry", &vo::GeometrySnapshot::geometry, nb::arg("object_uuid"), nb::arg("geometry_revision") = nb::none(), nb::call_guard<nb::gil_scoped_release>());
 }
 } // namespace vc::python

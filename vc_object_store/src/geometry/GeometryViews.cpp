@@ -8,9 +8,13 @@ namespace vc::objects {
 namespace detail {
 struct GeometryReadState {
     std::shared_ptr<ObjectStore> lease;
-    ObjectStore* db;
-    std::unique_ptr<ReadTxn> txn;
-    explicit GeometryReadState(ObjectStore& store) : db(&store), txn(std::make_unique<ReadTxn>(store.read())) {}
+    const ObjectStore* db;
+    // The snapshot's own transaction, or none when it borrows the caller's.
+    std::unique_ptr<ReadTxn> owned;
+    const Txn* txn;
+    explicit GeometryReadState(ObjectStore& store)
+        : db(&store), owned(std::make_unique<ReadTxn>(store.read())), txn(owned.get()) {}
+    GeometryReadState(const ObjectStore& store, const Txn& borrowed) : db(&store), txn(&borrowed) {}
     void require() const {
         if (!txn || !txn->active()) throw std::runtime_error("geometry snapshot is closed");
     }
@@ -75,20 +79,27 @@ GeometrySnapshot::GeometrySnapshot(std::shared_ptr<ObjectStore> db)
     state_ = std::make_shared<detail::GeometryReadState>(*db);
     state_->lease = std::move(db);
 }
-void GeometrySnapshot::close() { state_->txn.reset(); state_->lease.reset(); }
+GeometrySnapshot::GeometrySnapshot(const ObjectStore& db, const Txn& txn)
+    : state_(std::make_shared<detail::GeometryReadState>(db, txn)) {}
+void GeometrySnapshot::close() { state_->txn = nullptr; state_->owned.reset(); state_->lease.reset(); }
 bool GeometrySnapshot::active() const { return state_->txn && state_->txn->active(); }
-std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::string& kind) const
+std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::string& kind,
+                                              const std::optional<std::string>& geometryRevision) const
 {
     state_->require();
     const auto object = state_->db->currentObjectRevision(*state_->txn, id);
     if (!object || object->deleted) throw std::invalid_argument("object not found");
-    const auto revision = state_->db->currentGeometry(*state_->txn, id);
+    const auto revision = geometryRevision ? state_->db->geometryRevision(*state_->txn, *geometryRevision)
+                                           : state_->db->currentGeometry(*state_->txn, id);
     if (!revision) throw std::invalid_argument("object has no stored geometry");
+    if (revision->objectUuid != object->objectUuid)
+        throw std::invalid_argument("geometry revision belongs to another object");
     if (!kind.empty() && revision->kind != kind) throw std::invalid_argument("geometry kind mismatch: expected " + kind);
     if (revision->formatVersion != 1 || revision->coordinateSystem != "source_xyz")
         throw std::invalid_argument("unsupported geometry version or coordinate system");
     auto result = std::make_shared<State>();
-    result->read = state_; result->revision = *revision; result->objectRevision = object->uuid;
+    result->read = state_; result->revision = *revision;
+    if (!geometryRevision) result->objectRevision = object->uuid;
     if (revision->kind == "point_collection") {
         result->require("points", "<f8", 2);
         result->require("point_ids", "<i8", 1);
@@ -103,14 +114,14 @@ std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::
     else throw std::invalid_argument("unsupported geometry kind");
     return result;
 }
-PointCollectionView GeometrySnapshot::pointCollection(const std::string& id) const { return PointCollectionView(view(id, "point_collection")); }
-FiberView GeometrySnapshot::fiber(const std::string& id) const { return FiberView(view(id, "fiber")); }
-TrackView GeometrySnapshot::track(const std::string& id) const { return TrackView(view(id, "track")); }
-UmbilicusView GeometrySnapshot::umbilicus(const std::string& id) const { return UmbilicusView(view(id, "umbilicus")); }
-SurfaceView GeometrySnapshot::surface(const std::string& id) const { return SurfaceView(view(id, "surface")); }
-TypedGeometryView GeometrySnapshot::geometry(const std::string& id) const
+PointCollectionView GeometrySnapshot::pointCollection(const std::string& id, const std::optional<std::string>& revision) const { return PointCollectionView(view(id, "point_collection", revision)); }
+FiberView GeometrySnapshot::fiber(const std::string& id, const std::optional<std::string>& revision) const { return FiberView(view(id, "fiber", revision)); }
+TrackView GeometrySnapshot::track(const std::string& id, const std::optional<std::string>& revision) const { return TrackView(view(id, "track", revision)); }
+UmbilicusView GeometrySnapshot::umbilicus(const std::string& id, const std::optional<std::string>& revision) const { return UmbilicusView(view(id, "umbilicus", revision)); }
+SurfaceView GeometrySnapshot::surface(const std::string& id, const std::optional<std::string>& revision) const { return SurfaceView(view(id, "surface", revision)); }
+TypedGeometryView GeometrySnapshot::geometry(const std::string& id, const std::optional<std::string>& revision) const
 {
-    auto s = view(id, "");
+    auto s = view(id, "", revision);
     if (s->revision.kind == "point_collection") return PointCollectionView(s);
     if (s->revision.kind == "fiber") return FiberView(s);
     if (s->revision.kind == "track") return TrackView(s);

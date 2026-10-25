@@ -83,16 +83,25 @@ public:
     explicit GeometrySnapshot(ObjectStore&);
     // Owning overload useful for application/binding lifetime management.
     explicit GeometrySnapshot(std::shared_ptr<ObjectStore>);
+    // Views over the caller's transaction (e.g. inside ObjectStoreSession::read),
+    // valid while it is.
+    GeometrySnapshot(const ObjectStore&, const Txn&);
     void close();
     bool active() const;
-    PointCollectionView pointCollection(const std::string& objectUuid) const;
-    FiberView fiber(const std::string& objectUuid) const;
-    TrackView track(const std::string& objectUuid) const;
-    UmbilicusView umbilicus(const std::string& objectUuid) const;
-    SurfaceView surface(const std::string& objectUuid) const;
-    TypedGeometryView geometry(const std::string& objectUuid) const;
+    // The object's current geometry, or its pinned `geometryRevision`. A view of
+    // a pinned revision has an empty objectRevision().
+    PointCollectionView pointCollection(const std::string& objectUuid,
+                                        const std::optional<std::string>& geometryRevision = std::nullopt) const;
+    FiberView fiber(const std::string& objectUuid, const std::optional<std::string>& geometryRevision = std::nullopt) const;
+    TrackView track(const std::string& objectUuid, const std::optional<std::string>& geometryRevision = std::nullopt) const;
+    UmbilicusView umbilicus(const std::string& objectUuid,
+                            const std::optional<std::string>& geometryRevision = std::nullopt) const;
+    SurfaceView surface(const std::string& objectUuid, const std::optional<std::string>& geometryRevision = std::nullopt) const;
+    TypedGeometryView geometry(const std::string& objectUuid,
+                               const std::optional<std::string>& geometryRevision = std::nullopt) const;
 private:
-    std::shared_ptr<detail::GeometryViewState> view(const std::string&, const std::string& kind) const;
+    std::shared_ptr<detail::GeometryViewState> view(const std::string&, const std::string& kind,
+                                                    const std::optional<std::string>& geometryRevision) const;
     std::shared_ptr<detail::GeometryReadState> state_;
 };
 

@@ -3,6 +3,7 @@
 #include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "vc_object_store/objects/ObjectStoreSession.hpp"
 #include "vc_object_store/geometry/Geometry.hpp"
+#include "vc_object_store/store/GeometryViews.hpp"
 #include <nlohmann/json.hpp>
 #include <iostream>
 using namespace vc::objects;
@@ -68,6 +69,19 @@ int main() try {
                 require(db.readGeometryArray(txn,initialGeometry,original.name) == original.bytes,"historical arrays are immutable");
             if (annotated) require(Json::parse(db.geometryPointAnnotations(txn,editedGeometry,array)) ==
                 Json::array({Json{{"note","second"}},Json::object(),Json{{"note","first"}}}),"annotations follow stable IDs through splice");
+            // Typed views over the session's own transaction, at a pinned or the current revision.
+            GeometrySnapshot inSession(db, txn);
+            const auto encoded = [&](const std::optional<std::string>& revision) {
+                return std::visit([](const auto& view) { return vc::geometry::encode(view.load()); },
+                                  inSession.geometry(uuid, revision));
+            };
+            for (const auto& [revision, expected] : {std::pair{std::optional(initialGeometry), &first},
+                                                     std::pair{std::optional<std::string>{}, &target}}) {
+                const auto loaded = encoded(revision);
+                require(loaded.arrays.size() == expected->arrays.size(), "pinned view loads the revision's arrays");
+                for (size_t i = 0; i < loaded.arrays.size(); ++i)
+                    require(loaded.arrays[i].bytes == expected->arrays[i].bytes, "pinned view loads the revision exactly");
+            }
         });
         mustFail([&] { session.act(attachment,pins,[&](auto& db,auto& txn) {
             updateGeometryArrays(db,txn,uuid,target,initialGeometry);
