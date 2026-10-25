@@ -1369,6 +1369,12 @@ std::vector<std::string> QuadSurface::channelNames() const
     return names;
 }
 
+bool QuadSurface::channelLoaded(const std::string& name) const
+{
+    const auto found = _channels.find(name);
+    return found != _channels.end() && !found->second.empty();
+}
+
 int QuadSurface::countValidPoints() const
 {
     const_cast<QuadSurface*>(this)->ensureLoaded();

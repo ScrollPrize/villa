@@ -522,6 +522,8 @@ public:
     static int backupCount();
     void invalidateMask();
     std::vector<std::string> channelNames() const;
+    // Whether a registered channel holds data (a store channel loads on first use).
+    bool channelLoaded(const std::string& name) const;
 
     /** Rotate the surface by arbitrary angle (degrees). Expands canvas to fit. */
     void rotate(float angleDeg);
