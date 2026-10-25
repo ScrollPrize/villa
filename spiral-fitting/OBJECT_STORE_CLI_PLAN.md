@@ -90,8 +90,23 @@ Names below are proposed additions, not existing options:
 | `object_store_approved_links_only = false` | If true, consume only currently approved, applicable relationships |
 | `fit_volume_uuid` | Optional reference volume identity; inferred from selected objects when unambiguous, otherwise required |
 | `track_scale_factor` | Required when attaching a track store: stored track coordinates = reference-volume coordinates × this finite positive factor |
-| `normal_ct` | CT location, level, reference-volume UUID and selected-level downsampling |
+| `normal_ct` | Optional CT location, level, reference-volume UUID and selected-level downsampling; fiber-patch strip normals when the fit has no lasagna normals |
 | Object selection | Explicit UUID/tag selectors for patches, fibers and PCLs; defaults documented and stable |
+
+No normal input is required for fiber-patch refresh. The CLI passes the store
+the first available of:
+
+1. The fit's lasagna normals, when its normals input is enabled: the `normal_x`
+   and `normal_y` stores as `normal_x_volume`/`normal_y_volume`,
+   `normal_zarr_group` as `ct_level` (an integer group) and `lasagna_scale` as
+   `ct_to_base_scale`. The store decodes them exactly as the fitter does.
+2. `normal_ct`, giving CT structure-tensor normals.
+3. Neither: centerline-only linking, which gates anchors on the fiber polyline's
+   own same- versus adjacent-sheet distances to each patch.
+
+Print the chosen source; edges record it in `normal_method`/`normal_source`.
+Lasagna and CT are mutually exclusive in one refresh, so a configured `normal_ct`
+is ignored, with a message, when lasagna normals are available.
 
 Select active geometry with usable revisions; do not infer patch eligibility
 from directory names. Keep object-selection/review policy distinct from the
@@ -163,8 +178,9 @@ vertex sentinels rather than scaling them into apparently valid coordinates.
 
 Declare the frame for umbilicus, shell and external supervision as well. Convert
 their geometry and distance units to the same fitting frame. Loss thresholds,
-ROI bounds, spacing and radial offsets use reference-volume voxels. CT pyramid
-selection does not implicitly apply coordinate scaling a second time.
+ROI bounds, spacing and radial offsets use reference-volume voxels. CT or lasagna
+level selection does not implicitly apply coordinate scaling a second time.
+`lasagna_scale` is the lasagna group's downsampling relative to V.
 
 Track stores do not carry coordinate metadata. When attaching one, require an
 explicit `track_scale_factor` s; assume it belongs to the fit's volume V, without
@@ -176,14 +192,15 @@ does not change the track-store format or migrate tracks into the object store.
 Record the declared track scale in the input manifest and checkpoint, and verify
 it on resume. Never infer it from dimensions or silently assume scale 1.
 
-Record resolved V, reference-volume fitting units, object scales and CT level/D
-in logs and checkpoints. The CT location
+Record resolved V, reference-volume fitting units, object scales and the
+fiber-patch normal source (lasagna group/scale, CT level/D, or none) in logs and
+checkpoints. The CT location
 binding is explicit initially because `volume_uuid` alone does not resolve it.
 
 ## Startup and refresh lifecycle
 
 1. Parse selection and frame declarations; validate available geometry, metadata,
-   winding annotations and CT requirements before expensive work. Resolve the fit
+   winding annotations and normal-source inputs before expensive work. Resolve the fit
    volume after object selection, as described above, and validate every selected
    frame before running detectors.
 2. Resolve object selectors into explicit UUID sets before refresh. Distinguish
@@ -337,6 +354,7 @@ and include focused regression tests with each functional commit.
 10. **CLI: implement startup and frozen-input lifecycle.** Add default refresh,
    aggregated failure exit, approved-only/no-refresh modes, rank-zero coordination,
    manifest agreement, external-input frame conversion and resume validation.
+   Select the fiber-patch normal source (lasagna, else `normal_ct`, else none).
    Wire the adapter into `fit_spiral.py` as the supported ingestion path and
    record complete input/frame provenance in logs and checkpoints.
 11. **Fitter: remove obsolete ingestion and linking.** Delete filesystem
@@ -380,6 +398,9 @@ part of this task. Add small temporary DB fixtures and focused regression tests.
   regardless of source filename; missing/contradictory annotations.
 - Pending/approved/rejected and inapplicable relationships; reviewed-edge
   preservation; approved-only behavior after refresh.
+- Fiber-patch refresh uses lasagna normals when the fit loads them, `normal_ct`
+  only without them, and centerline-only linking with neither; no configuration
+  requires a CT volume.
 - Multiple independent refresh failures are all reported and training never
   starts; ordinary rejected candidates do not cause fatal exit.
 - A two-rank startup refreshes only on rank zero, propagates refresh failure to
