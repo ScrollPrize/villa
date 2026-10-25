@@ -1,5 +1,7 @@
 #pragma once
 
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
+
 #include "SegmentationGrowth.hpp"
 
 #include "vc/core/util/SurfacePatchIndex.hpp"
@@ -96,7 +98,8 @@ private:
         std::optional<cv::Rect> correctionsAffectedBounds;
         // For corrections annotation saving
         std::optional<CorrectionsBounds> correctionsBounds;
-        std::unique_ptr<QuadSurface> beforeCrop;
+        // The surface's store revisions when the growth started.
+        std::optional<vc::objects::PinnedObject> beforePin;
         SegmentationCorrectionsPayload corrections;
     };
 
@@ -110,7 +113,7 @@ private:
     bool _running{false};
     std::unique_ptr<QFutureWatcher<TracerGrowthResult>> _watcher;
     std::optional<ActiveRequest> _activeRequest;
-    QString _patchTracerCachedSourcePath;
+    QString _patchTracerCachedSourceKey;
     std::vector<std::shared_ptr<QuadSurface>> _patchTracerCachedSurfaces;
     std::shared_ptr<SurfacePatchIndex> _patchTracerCachedIndex;
 };

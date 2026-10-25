@@ -1544,30 +1544,6 @@
         "type": "object"
       }
     },
-    "points.load_segment_path": {
-      "errors": [
-        -32602,
-        -32000,
-        -32010
-      ],
-      "mcp": {
-        "paramRenames": {
-          "segmentPath": "segment_path"
-        },
-        "tool": "vc3d_load_points_segment_path"
-      },
-      "params": {
-        "properties": {
-          "segmentPath": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "segmentPath"
-        ],
-        "type": "object"
-      }
-    },
     "points.remove_collection_tag": {
       "errors": [
         -32000,
@@ -1699,30 +1675,6 @@
         },
         "required": [
           "path"
-        ],
-        "type": "object"
-      }
-    },
-    "points.save_segment_path": {
-      "errors": [
-        -32602,
-        -32000,
-        -32010
-      ],
-      "mcp": {
-        "paramRenames": {
-          "segmentPath": "segment_path"
-        },
-        "tool": "vc3d_save_points_segment_path"
-      },
-      "params": {
-        "properties": {
-          "segmentPath": {
-            "type": "string"
-          }
-        },
-        "required": [
-          "segmentPath"
         ],
         "type": "object"
       }

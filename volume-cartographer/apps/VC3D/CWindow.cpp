@@ -6888,21 +6888,13 @@ void CWindow::CreateWidgets(void)
                 for (const auto& id : segmentIds) {
                     ids.push_back(id.toStdString());
                 }
-                auto results = SurfaceAreaCalculator::calculateAreas(_state->vpkg(), _state->currentVolume(), ids);
+                // The panel shows the new areas from the commit events.
+                auto results = SurfaceAreaCalculator::calculateAreas(*_surfaceCatalog, ids);
                 int okCount = 0, failCount = 0;
                 QStringList skippedIds;
                 for (const auto& r : results) {
                     if (r.success) {
                         ++okCount;
-                        // Update tree widget
-                        QTreeWidgetItemIterator it(treeWidgetSurfaces);
-                        while (*it) {
-                            if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == r.segmentId) {
-                                (*it)->setText(2, QString::number(r.areaCm2, 'f', 3));
-                                break;
-                            }
-                            ++it;
-                        }
                     } else {
                         ++failCount;
                         skippedIds << QString::fromStdString(r.segmentId + " (" + r.errorReason + ")");

@@ -200,8 +200,6 @@ private:
     QJsonObject handlePointsApplyAnchorOffset(const QJsonValue& params);
     QJsonObject handlePointsSaveJson(const QJsonValue& params);
     QJsonObject handlePointsLoadJson(const QJsonValue& params);
-    QJsonObject handlePointsSaveSegmentPath(const QJsonValue& params);
-    QJsonObject handlePointsLoadSegmentPath(const QJsonValue& params);
     QJsonObject handleProjectCreate(const QJsonValue& params);
     QJsonObject handleVolumeOpen(const QJsonValue& params);
     QJsonObject handleVolumeAttach(const QJsonValue& params);

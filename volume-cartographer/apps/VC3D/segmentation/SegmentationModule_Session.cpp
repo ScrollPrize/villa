@@ -1,4 +1,5 @@
 #include "SegmentationModule.hpp"
+#include "SurfaceCorrections.hpp"
 #include "SurfaceStoreEdit.hpp"
 
 #include "../CState.hpp"
@@ -90,17 +91,8 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
         refreshOverlay();
     }
 
-    // Auto-load persisted corrections and set path for auto-save
-    if (_pointCollection && !surface->path.empty()) {
-        qCInfo(lcSegModule) << "Loading correction points from segment path:"
-                            << QString::fromStdString(surface->path.string());
-        _pointCollection->loadFromSegmentPath(surface->path);
-        _correctionsSegmentPath = surface->path;
-    } else {
-        qCInfo(lcSegModule) << "No segment path for correction points auto-save (path empty:"
-                            << surface->path.empty() << ")";
-        _correctionsSegmentPath.clear();
-    }
+    // The surface's stored corrections, auto-saved while it stays active.
+    loadCorrections(surface.get());
 
     emitPendingChanges();
     _pendingAutosaveVertexUpdates.clear();
@@ -144,12 +136,7 @@ void SegmentationModule::endEditingSession()
     if (_correctionsSaveTimer && _correctionsSaveTimer->isActive()) {
         _correctionsSaveTimer->stop();
     }
-    if (_pointCollection && !_correctionsSegmentPath.empty()) {
-        qCInfo(lcSegModule) << "Saving correction points on session end to:"
-                            << QString::fromStdString(_correctionsSegmentPath.string());
-        _pointCollection->saveToSegmentPath(_correctionsSegmentPath);
-    }
-    _correctionsSegmentPath.clear();
+    saveCorrections();
 
     if (_autosaveState.pending()) {
         performAutosave();
@@ -498,9 +485,38 @@ void SegmentationModule::applyCorrectionAnchorOffset(float offsetX, float offset
     }
 }
 
-void SegmentationModule::saveCorrectionPoints(const std::filesystem::path& segmentPath)
+void SegmentationModule::loadCorrections(QuadSurface* surface)
 {
-    if (_pointCollection && !segmentPath.empty()) {
-        _pointCollection->saveToSegmentPath(segmentPath);
+    _correctionsSurfaceId.clear();
+    if (!_pointCollection) {
+        return;
+    }
+    std::map<uint64_t, utils::Json> stored;
+    if (const auto storeEdit = storeEditFor(surface)) {
+        try {
+            stored = vc3d::corrections::read(*_state->objectStoreSession(), storeEdit->pin().attachment, storeEdit->uuid());
+            _correctionsSurfaceId = storeEdit->uuid();
+        } catch (const std::exception& error) {
+            emit statusMessageRequested(tr("Cannot read correction points: %1").arg(QString::fromUtf8(error.what())), kStatusLong);
+        }
+    }
+    _pointCollection->replaceAnchoredCollections(stored);
+}
+
+void SegmentationModule::saveCorrections()
+{
+    if (_correctionsSaveTimer && _correctionsSaveTimer->isActive()) {
+        _correctionsSaveTimer->stop();
+    }
+    if (!_pointCollection || _correctionsSurfaceId.empty() || !_storeEdit || _storeEdit->uuid() != _correctionsSurfaceId ||
+        !_state || !_state->currentVolume()) {
+        return;
+    }
+    try {
+        vc3d::corrections::write(*_state->objectStoreSession(), _storeEdit->pin().attachment, _correctionsSurfaceId,
+                                 _pointCollection->anchoredCollections(), *_state->currentVolume());
+    } catch (const std::exception& error) {
+        qCWarning(lcSegModule) << "Saving correction points failed:" << error.what();
+        emit statusMessageRequested(tr("Failed to save correction points: %1").arg(QString::fromUtf8(error.what())), kStatusLong);
     }
 }

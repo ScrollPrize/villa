@@ -37,7 +37,12 @@ public:
     [[nodiscard]] bool growthKeybindsEnabled() const { return _growthKeybindsEnabled; }
     [[nodiscard]] int growthScale() const { return _growthScale; }
     [[nodiscard]] QString normal3dZarrPath() const { return _normal3dSelectedPath; }
-    [[nodiscard]] QString patchTracerSourcePath() const { return _patchTracerSourcePath; }
+    // Patch Tracer grows from the surfaces with this record tag.
+    static constexpr const char* kDefaultPatchTracerSourceTag = "paths";
+    [[nodiscard]] QString patchTracerSourceTag() const
+    {
+        return _patchTracerSourceTag.isEmpty() ? QString::fromLatin1(kDefaultPatchTracerSourceTag) : _patchTracerSourceTag;
+    }
     [[nodiscard]] utils::Json patchTracerParamsJson() const;
     [[nodiscard]] std::vector<SegmentationGrowthDirection> allowedGrowthDirections() const;
     [[nodiscard]] std::optional<std::pair<int, int>> correctionsZRange() const;
@@ -109,8 +114,7 @@ private:
     QLineEdit* _editNormal3dPath{nullptr};
     QLabel* _lblPatchTracerSource{nullptr};
     QWidget* _patchTracerSourceContainer{nullptr};
-    QLineEdit* _editPatchTracerSourcePath{nullptr};
-    QPushButton* _btnPatchTracerSourceBrowse{nullptr};
+    QLineEdit* _editPatchTracerSourceTag{nullptr};
     QLabel* _lblPatchTracerUmbilicus{nullptr};
     QWidget* _patchTracerUmbilicusContainer{nullptr};
     QLineEdit* _editPatchTracerUmbilicusPath{nullptr};
@@ -155,7 +159,7 @@ private:
     QString _normal3dHint;
     QString _normal3dSelectedPath;
     QString _volumePackagePath;
-    QString _patchTracerSourcePath;
+    QString _patchTracerSourceTag;
     QString _patchTracerUmbilicusPath;
     bool _patchTracerUmbilicusPathUserSet{false};
     int _patchGlobalStepsPerWindow{0};

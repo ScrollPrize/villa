@@ -193,7 +193,7 @@ struct TracerGrowthResult {
     QString error;
     QString statusMessage;
     std::vector<std::filesystem::path> temporarySurfacePaths;
-    QString patchTracerCacheSourcePath;
+    QString patchTracerCacheSourceKey;
     std::vector<std::shared_ptr<QuadSurface>> patchTracerCachedSurfaces;
     std::shared_ptr<SurfacePatchIndex> patchTracerCachedIndex;
 };

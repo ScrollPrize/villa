@@ -1,12 +1,9 @@
 #pragma once
 
-#include <opencv2/core/mat.hpp>
 #include <string>
 #include <vector>
 
-class VolumePkg;
-class Volume;
-class SurfaceTreeWidget;
+class SurfaceCatalog;
 
 struct AreaResult {
     std::string segmentId;
@@ -18,10 +15,8 @@ struct AreaResult {
 
 namespace SurfaceAreaCalculator {
 
-// Calculate area for multiple segments. Pure computation, no UI.
-std::vector<AreaResult> calculateAreas(
-    const std::shared_ptr<VolumePkg>& vpkg,
-    const std::shared_ptr<Volume>& volume,
-    const std::vector<std::string>& ids);
+// Area of each surface's valid quads in the current volume's voxels, recorded
+// in its record meta (area_vx2, and area_cm2 when the voxel size is known).
+std::vector<AreaResult> calculateAreas(SurfaceCatalog& catalog, const std::vector<std::string>& ids);
 
 } // namespace SurfaceAreaCalculator

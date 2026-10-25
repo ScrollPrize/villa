@@ -231,13 +231,10 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
         _lblPatchTracerSource = new QLabel(tr("Patch Tracer source:"), this);
         patchTracerRow->addWidget(_lblPatchTracerSource, 0);
 
-        _editPatchTracerSourcePath = new QLineEdit(this);
-        _editPatchTracerSourcePath->setReadOnly(true);
-        patchTracerRow->addWidget(_editPatchTracerSourcePath, 1);
-
-        _btnPatchTracerSourceBrowse = new QPushButton(tr("Browse"), this);
-        _btnPatchTracerSourceBrowse->setToolTip(tr("Select a folder of patch surfaces for Patch Tracer growth."));
-        patchTracerRow->addWidget(_btnPatchTracerSourceBrowse, 0);
+        _editPatchTracerSourceTag = new QLineEdit(this);
+        _editPatchTracerSourceTag->setPlaceholderText(QString::fromLatin1(kDefaultPatchTracerSourceTag));
+        _editPatchTracerSourceTag->setToolTip(tr("Patch Tracer grows from the surfaces of the current volume with this tag."));
+        patchTracerRow->addWidget(_editPatchTracerSourceTag, 1);
         panelLayout->addWidget(_patchTracerSourceContainer);
     }
 
@@ -490,21 +487,9 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
         updateNormal3dUi();
     });
 
-    connect(_btnPatchTracerSourceBrowse, &QPushButton::clicked, this, [this]() {
-        QString initial = _patchTracerSourcePath;
-        if (initial.isEmpty() && !_volumePackagePath.isEmpty()) {
-            initial = QDir(_volumePackagePath).filePath(QStringLiteral("paths"));
-        }
-        const QString dir = QFileDialog::getExistingDirectory(this,
-                                                              tr("Select Patch Tracer source folder"),
-                                                              initial,
-                                                              QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks);
-        if (dir.isEmpty()) {
-            return;
-        }
-        _patchTracerSourcePath = QDir::cleanPath(dir);
-        writeSetting(QStringLiteral("patch_tracer_source_path"), _patchTracerSourcePath);
-        updatePatchTracerSourceUi();
+    connect(_editPatchTracerSourceTag, &QLineEdit::editingFinished, this, [this]() {
+        _patchTracerSourceTag = _editPatchTracerSourceTag->text().trimmed();
+        writeSetting(QStringLiteral("patch_tracer_source_tag"), _patchTracerSourceTag);
     });
 
     connect(_btnPatchTracerUmbilicusBrowse, &QPushButton::clicked, this, [this]() {
@@ -731,9 +716,6 @@ void SegmentationGrowthPanel::setNormal3dZarrCandidates(const QStringList& candi
 void SegmentationGrowthPanel::setVolumePackagePath(const QString& path)
 {
     _volumePackagePath = path;
-    if (_patchTracerSourcePath.isEmpty() && !_volumePackagePath.isEmpty()) {
-        _patchTracerSourcePath = QDir(_volumePackagePath).filePath(QStringLiteral("paths"));
-    }
     if (!_patchTracerUmbilicusPathUserSet && !_volumePackagePath.isEmpty()) {
         const QString defaultUmbilicus = QDir(_volumePackagePath).filePath(QStringLiteral("umbilicus.json"));
         std::error_code ec;
@@ -1025,8 +1007,8 @@ void SegmentationGrowthPanel::updateGrowthUiState()
     if (_spinCorrectionsZMax) {
         _spinCorrectionsZMax->setEnabled(allowZRange && _correctionsZRangeEnabled);
     }
-    if (_btnPatchTracerSourceBrowse) {
-        _btnPatchTracerSourceBrowse->setEnabled(enableGrowth);
+    if (_editPatchTracerSourceTag) {
+        _editPatchTracerSourceTag->setEnabled(enableGrowth);
     }
     if (_btnPatchTracerUmbilicusBrowse) {
         _btnPatchTracerUmbilicusBrowse->setEnabled(enableGrowth);
@@ -1108,12 +1090,9 @@ void SegmentationGrowthPanel::updateNormal3dUi()
 
 void SegmentationGrowthPanel::updatePatchTracerSourceUi()
 {
-    if (_patchTracerSourcePath.isEmpty() && !_volumePackagePath.isEmpty()) {
-        _patchTracerSourcePath = QDir(_volumePackagePath).filePath(QStringLiteral("paths"));
-    }
-    if (_editPatchTracerSourcePath) {
-        _editPatchTracerSourcePath->setText(_patchTracerSourcePath);
-        _editPatchTracerSourcePath->setToolTip(_patchTracerSourcePath);
+    if (_editPatchTracerSourceTag) {
+        const QSignalBlocker blocker(_editPatchTracerSourceTag);
+        _editPatchTracerSourceTag->setText(_patchTracerSourceTag);
     }
 }
 
@@ -1310,7 +1289,7 @@ void SegmentationGrowthPanel::restoreSettings(QSettings& settings)
 
     _normal3dSelectedPath = settings.value(QStringLiteral("normal3d_selected_path"), QString()).toString();
     _growthScale = std::clamp(settings.value(QStringLiteral("growth_scale"), _growthScale).toInt(), 0, 5);
-    _patchTracerSourcePath = settings.value(QStringLiteral("patch_tracer_source_path"), QString()).toString();
+    _patchTracerSourceTag = settings.value(QStringLiteral("patch_tracer_source_tag"), QString()).toString();
     _patchTracerUmbilicusPath = settings.value(QStringLiteral("patch_tracer_umbilicus_path"), QString()).toString();
     _patchTracerUmbilicusPathUserSet = settings.value(QStringLiteral("patch_tracer_umbilicus_path_user_set"), false).toBool();
     _patchGlobalStepsPerWindow = settings.value(QStringLiteral("patch_global_steps_per_window"), _patchGlobalStepsPerWindow).toInt();

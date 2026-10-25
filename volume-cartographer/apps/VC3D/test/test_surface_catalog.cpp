@@ -2,7 +2,10 @@
 // volume's surfaces kept current from commit events, opening a surface in the
 // volume's voxels, and record edits (tags, name, retire).
 #include "SurfaceCatalog.hpp"
+#include "segmentation/SurfaceCorrections.hpp"
 #include "segmentation/SurfaceStoreEdit.hpp"
+#include "vc/core/PointCollections.hpp"
+#include <vc_object_store/geometry/Geometry.hpp>
 #include "ObjectStoreCoordinates.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -124,6 +127,55 @@ int main(int argc, char** argv)
             bool stale = false;
             try { SurfaceStoreEdit(session, edited.pin).hold(); } catch (const std::exception&) { stale = true; }
             require(stale, "an edit from a superseded pin is refused");
+        }
+
+        // Correction points live with their surface as linked point collections.
+        {
+            PointCollections points;
+            points.addPoint("fix", {1, 2, 3});
+            const auto fix = points.getCollectionId("fix").value();
+            points.setCollectionAnchor2d(fix, cv::Vec2f(1.5f, 0.5f));
+            const auto saved = points.anchoredCollections();
+            vc3d::corrections::write(*session, attachment, half, saved, *volume);
+            auto stored = vc3d::corrections::read(*session, attachment, half);
+            require(stored.size() == 1 && stored.begin()->first == fix, "corrections round-trip by collection id");
+            PointCollections reloaded;
+            require(reloaded.replaceAnchoredCollections(stored), "stored corrections load");
+            const auto& collection = reloaded.getAllCollections().at(fix);
+            require(collection.uuid == points.getAllCollections().at(fix).uuid && collection.anchor2d == cv::Vec2f(1.5f, 0.5f) &&
+                    collection.points.size() == 1 && collection.points.begin()->second.p == cv::Vec3f(1, 2, 3),
+                    "corrections keep identity, anchor and points");
+            points.addPoint("fix", {4, 5, 6});
+            vc3d::corrections::write(*session, attachment, half, points.anchoredCollections(), *volume);
+            require(vc3d::corrections::read(*session, attachment, half).at(fix).at("points").size() == 2, "corrections update in place");
+            {
+                const auto firstPoint = points.getAllCollections().at(fix).points.begin()->second;
+                auto movedPoint = firstPoint;
+                movedPoint.p = {7, 8, 9};
+                points.updatePoint(movedPoint);
+                vc3d::corrections::write(*session, attachment, half, points.anchoredCollections(), *volume);
+                const auto stored = vc3d::corrections::read(*session, attachment, half).at(fix);
+                const auto& moved = stored.at("points").at(std::to_string(firstPoint.id)).at("p");
+                require(moved[0].get_double() == 7 && moved[2].get_double() == 9, "moved correction points keep their id");
+            }
+            vc3d::corrections::write(*session, attachment, half, {}, *volume);
+            require(vc3d::corrections::read(*session, attachment, half).empty(), "dropped corrections are retired");
+            require(vc3d::corrections::read(*session, attachment, native).empty(), "corrections belong to one surface");
+            vc3d::corrections::GrowthAnnotation annotation;
+            annotation.surfaceUuid = half;
+            annotation.beforeGeometry = "before";
+            annotation.afterGeometry = "after";
+            annotation.points = {{fix, 2, "fix", {1, 2, 3}, 20}, {fix, 1, "fix", {4, 5, 6}, 10}};
+            const auto annotationUuid = vc3d::corrections::writeGrowthAnnotation(*session, attachment, annotation, *volume);
+            session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+                const auto object = db.objectByUuid(txn, annotationUuid);
+                require(object && nlohmann::json::parse(object->meta)["source"]["growth_annotation"]["after_geometry"] == "after",
+                        "growth annotations record the revisions");
+                const auto points = std::get<vc::geometry::PointCollection>(
+                    vc::geometry::decode(db.readGeometryData(txn, db.currentGeometry(txn, annotationUuid)->uuid)));
+                require(points.ids == std::vector<int64_t>{1, 2}, "annotation points keep placement order");
+            });
+            require(vc3d::corrections::read(*session, attachment, half).empty(), "annotations are not corrections");
         }
 
         catalog.setTags(native, {"reviewed"});

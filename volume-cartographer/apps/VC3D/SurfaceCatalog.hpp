@@ -70,6 +70,7 @@ public:
     // Record edits: they commit at once and reach rows() through the commit events.
     void setTags(const std::string& uuid, const std::vector<std::string>& tags);
     void rename(const std::string& uuid, const std::string& name);
+    void updateMeta(const std::string& uuid, const std::function<void(nlohmann::json&)>& change);
     void retire(const std::vector<std::string>& uuids);
     // A new surface with the current record and geometry of `uuid`; returns its UUID.
     std::string copy(const std::string& uuid, const std::string& name);

@@ -657,10 +657,6 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
     if (_overlay) {
         _overlay->loadApprovalMaskImage(nullptr);
     }
-    // The previous surface's pending approval edits are saved: its edits end here.
-    if (_storeEdit && (!newSurface || newSurface->id != _storeEdit->uuid())) {
-        _storeEdit.reset();
-    }
     if (_surfaceMaskTool) {
         _surfaceMaskTool->setSurface(newSurface);
         _surfaceMaskTool->setActive(_editingEnabled && hasActiveSession() && _drawMaskEnabled);
@@ -724,27 +720,14 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
 
     // Save corrections for old segment and load for new segment
     if (_pointCollection) {
-        // Save pending corrections for the old segment
-        if (_correctionsSaveTimer && _correctionsSaveTimer->isActive()) {
-            _correctionsSaveTimer->stop();
-        }
-        if (!_correctionsSegmentPath.empty()) {
-            qCInfo(lcSegModule) << "  Saving correction points for previous segment";
-            _pointCollection->saveToSegmentPath(_correctionsSegmentPath);
-        }
-
-        // Load corrections for new segment
-        if (newSurface && !newSurface->path.empty()) {
-            qCInfo(lcSegModule) << "  Loading correction points for new segment:"
-                                << QString::fromStdString(newSurface->path.string());
-            _pointCollection->loadFromSegmentPath(newSurface->path);
-            _correctionsSegmentPath = newSurface->path;
-        } else {
-            // No valid path - clear anchored collections and path
-            qCInfo(lcSegModule) << "  No segment path, clearing anchored corrections";
-            _pointCollection->loadFromSegmentPath({});  // Clears anchored collections
-            _correctionsSegmentPath.clear();
-        }
+        saveCorrections();
+    }
+    // The previous surface's pending saves are done: its store edit ends here.
+    if (_storeEdit && (!newSurface || newSurface->id != _storeEdit->uuid())) {
+        _storeEdit.reset();
+    }
+    if (_pointCollection) {
+        loadCorrections(newSurface);
     }
 
     refreshOverlay();
@@ -3026,8 +3009,8 @@ void SegmentationModule::updateAutosaveState()
 
 void SegmentationModule::scheduleCorrectionsAutoSave()
 {
-    // Only auto-save if we have a valid segment path
-    if (_correctionsSegmentPath.empty() || !_pointCollection) {
+    // Only auto-save corrections of a surface from the object store
+    if (_correctionsSurfaceId.empty() || !_pointCollection) {
         return;
     }
 
@@ -3042,15 +3025,7 @@ void SegmentationModule::scheduleCorrectionsAutoSave()
 
 void SegmentationModule::performCorrectionsAutoSave()
 {
-    if (_correctionsSegmentPath.empty() || !_pointCollection) {
-        return;
-    }
-
-    if (_pointCollection->saveToSegmentPath(_correctionsSegmentPath)) {
-        qCDebug(lcSegModule) << "Auto-saved correction points to" << QString::fromStdString(_correctionsSegmentPath.string());
-    } else {
-        qCWarning(lcSegModule) << "Failed to auto-save correction points";
-    }
+    saveCorrections();
 }
 
 std::shared_ptr<SurfaceStoreEdit> SegmentationModule::storeEditFor(QuadSurface* surface)
@@ -3108,4 +3083,10 @@ bool SegmentationModule::saveNow(QuadSurface* surface, bool vertices, const std:
         emit statusMessageRequested(tr("Failed to save surface: %1").arg(QString::fromUtf8(error.what())), kStatusLong);
         return false;
     }
+}
+
+std::optional<vc::objects::PinnedObject> SegmentationModule::storePin(QuadSurface* surface)
+{
+    const auto storeEdit = storeEditFor(surface);
+    return storeEdit ? std::optional(storeEdit->pin()) : std::nullopt;
 }

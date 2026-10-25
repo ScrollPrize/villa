@@ -159,6 +159,7 @@ void SurfaceCatalog::editRecord(const std::string& uuid, const std::function<voi
         auto record = *db.objectByUuid(txn, uuid);
         change(record);
         db.upsertObject(txn, record);
+        for (const auto& edge : db.edgesOf(txn, uuid, true)) db.keepRecordedRelationship(txn, edge.uuid);
     });
 }
 
@@ -172,6 +173,15 @@ void SurfaceCatalog::rename(const std::string& uuid, const std::string& name)
     editRecord(uuid, [&](ObjectRecord& record) { record.name = name; });
 }
 
+void SurfaceCatalog::updateMeta(const std::string& uuid, const std::function<void(nlohmann::json&)>& change)
+{
+    editRecord(uuid, [&](ObjectRecord& record) {
+        auto meta = nlohmann::json::parse(record.meta);
+        change(meta);
+        record.meta = meta.dump();
+    });
+}
+
 void SurfaceCatalog::retire(const std::vector<std::string>& uuids)
 {
     if (!attachment_) throw std::runtime_error("Attach an object store first");
@@ -181,7 +191,10 @@ void SurfaceCatalog::retire(const std::vector<std::string>& uuids)
             if (const auto head = db.currentObjectRevision(txn, uuid)) pins[uuid] = head->uuid;
     });
     session_->editKeepingRelationships(*attachment_, pins, {}, [&](auto& db, auto& txn, const auto&) {
-        for (const auto& [uuid, revision] : pins) db.retireObject(txn, uuid);
+        for (const auto& [uuid, revision] : pins) {
+            db.retireObject(txn, uuid);
+            for (const auto& edge : db.edgesOf(txn, uuid, true)) db.keepRecordedRelationship(txn, edge.uuid);
+        }
     });
 }
 

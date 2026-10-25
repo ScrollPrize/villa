@@ -223,6 +223,8 @@ set(srcs
     UnifiedBrowserDialog.hpp
     segmentation/SegmentationModule.cpp
     segmentation/SurfaceStoreEdit.cpp
+    segmentation/SurfaceCorrections.cpp
+    segmentation/SurfaceCorrections.hpp
     segmentation/SurfaceStoreEdit.hpp
     segmentation/SegmentationModule.hpp
     segmentation/growth/SegmentationCorrections.cpp

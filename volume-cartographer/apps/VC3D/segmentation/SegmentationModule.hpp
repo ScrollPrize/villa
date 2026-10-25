@@ -145,6 +145,8 @@ public:
     bool saveSurfaceChannels(QuadSurface* surface, const std::vector<std::string>& channels);
     // Synchronously publish every changed vertex and loaded channel of `surface`.
     bool saveSurfaceNow(QuadSurface* surface);
+    // The store revisions the surface's edits continue from.
+    std::optional<vc::objects::PinnedObject> storePin(QuadSurface* surface);
     void endEditingSession();
     [[nodiscard]] bool hasActiveSession() const;
     [[nodiscard]] QuadSurface* activeBaseSurface() const;
@@ -154,7 +156,9 @@ public:
     void requestAutosaveFromGrowth();
     void updateApprovalToolAfterGrowth(QuadSurface* surface);
     void applyCorrectionAnchorOffset(float offsetX, float offsetY);
-    void saveCorrectionPoints(const std::filesystem::path& segmentPath);
+    // The active surface's correction point collections in the store.
+    void loadCorrections(QuadSurface* surface);
+    void saveCorrections();
 
     void attachViewer(VolumeViewerBase* viewer);
     void detachViewer(VolumeViewerBase* viewer);
@@ -540,7 +544,7 @@ private:
     // Correction points auto-save
     static constexpr int kCorrectionsSaveDelayMs = 2000;
     QTimer* _correctionsSaveTimer{nullptr};
-    std::filesystem::path _correctionsSegmentPath;
+    std::string _correctionsSurfaceId;
     void scheduleCorrectionsAutoSave();
     void performCorrectionsAutoSave();
 

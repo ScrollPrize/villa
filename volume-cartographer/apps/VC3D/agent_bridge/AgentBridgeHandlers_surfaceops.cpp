@@ -117,7 +117,7 @@ QJsonObject AgentBridgeServer::handleSegmentRecalcArea(const QJsonValue& params)
     // so an unknown/invalid id is reported in-band (success:false) rather than
     // failing the whole call.
     const std::vector<AreaResult> results =
-        SurfaceAreaCalculator::calculateAreas(state->vpkg(), state->currentVolume(), ids);
+        SurfaceAreaCalculator::calculateAreas(*_window->_surfaceCatalog, ids);
 
     QJsonArray out;
     for (const AreaResult& r : results) {

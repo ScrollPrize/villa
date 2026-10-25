@@ -610,29 +610,4 @@ QJsonObject AgentBridgeServer::handlePointsLoadJson(const QJsonValue& params)
 }
 
 
-QJsonObject AgentBridgeServer::handlePointsSaveSegmentPath(const QJsonValue& params)
-{
-    const QJsonObject p = params.toObject();
-    CState* state = _window ? _window->_state : nullptr;
-    VCCollection* pc = requirePointStore(state);
 
-    const QString segmentPath = p.value("segmentPath").toString();
-
-    QJsonObject result;
-    result["saved"] = pc->saveToSegmentPath(std::filesystem::path(segmentPath.toStdString()));
-    return result;
-}
-
-
-QJsonObject AgentBridgeServer::handlePointsLoadSegmentPath(const QJsonValue& params)
-{
-    const QJsonObject p = params.toObject();
-    CState* state = _window ? _window->_state : nullptr;
-    VCCollection* pc = requirePointStore(state);
-
-    const QString segmentPath = p.value("segmentPath").toString();
-
-    QJsonObject result;
-    result["loaded"] = pc->loadFromSegmentPath(std::filesystem::path(segmentPath.toStdString()));
-    return result;
-}
