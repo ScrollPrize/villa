@@ -54,16 +54,17 @@ void LasagnaServiceManager::startOptimization(const QJsonObject& request)
 void LasagnaServiceManager::setObjectStore(std::shared_ptr<vc::objects::ObjectStoreSession> session,
                                            std::optional<vc::objects::AttachmentIdentity> attachment)
 {
-    _storeSession = std::move(session);
+    _storeSession = session;
     _storeAttachment = attachment;
 }
 
 std::optional<std::filesystem::path> LasagnaServiceManager::surfaceModel(const std::string& surfaceUuid) const
 {
-    if (!_storeSession || !_storeAttachment) {
+    const auto session = _storeSession.lock();
+    if (!session || !_storeAttachment) {
         return std::nullopt;
     }
-    const auto model = _storeSession->artifactDirectory(*_storeAttachment, surfaceUuid, false) / "model.pt";
+    const auto model = session->artifactDirectory(*_storeAttachment, surfaceUuid, false) / "model.pt";
     return std::filesystem::is_regular_file(model) ? std::optional(model) : std::nullopt;
 }
 

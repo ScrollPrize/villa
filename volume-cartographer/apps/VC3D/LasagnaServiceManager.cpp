@@ -1733,7 +1733,7 @@ void LasagnaServiceManager::startOptimization(const QJsonObject& config)
 
 QString LasagnaServiceManager::storeError() const
 {
-    if (!_storeSession || !_storeAttachment) {
+    if (_storeSession.expired() || !_storeAttachment) {
         return tr("Lasagna needs an attached object store.");
     }
     if (_isExternal && _serviceStoreUuid != QString::fromStdString(_storeAttachment->storeUuid)) {
@@ -1748,13 +1748,14 @@ QString LasagnaServiceManager::storeError() const
 
 void LasagnaServiceManager::afterStoreSync(std::function<void()> then)
 {
-    const auto status = _isExternal ? _storeSession->hubStatus(*_storeAttachment) : std::nullopt;
+    const auto session = _storeSession.lock();
+    const auto status = _isExternal && session ? session->hubStatus(*_storeAttachment) : std::nullopt;
     if (!status) {
         then();
         return;
     }
     const int64_t requestedUs = QDateTime::currentMSecsSinceEpoch() * 1000;
-    _storeSession->syncHub(*_storeAttachment);
+    session->syncHub(*_storeAttachment);
     auto* timer = new QTimer(this);
     timer->setInterval(100);
     auto deadline = std::make_shared<QElapsedTimer>();
@@ -1765,7 +1766,8 @@ void LasagnaServiceManager::afterStoreSync(std::function<void()> then)
             timer->deleteLater();
             return;
         }
-        const auto status = _storeSession->hubStatus(*_storeAttachment);
+        const auto session = _storeSession.lock();
+        const auto status = session ? session->hubStatus(*_storeAttachment) : std::nullopt;
         QString error;
         if (!status) {
             error = tr("The object store was detached.");
@@ -1790,11 +1792,11 @@ void LasagnaServiceManager::afterStoreSync(std::function<void()> then)
 void LasagnaServiceManager::setObjectStore(std::shared_ptr<vc::objects::ObjectStoreSession> session,
                                            std::optional<vc::objects::AttachmentIdentity> attachment)
 {
-    _storeSession = std::move(session);
+    _storeSession = session;
     _storeAttachment = attachment;
     _storePath.clear();
-    if (_storeSession && _storeAttachment) {
-        _storeSession->read(*_storeAttachment, [this](const auto& db, const auto&, const auto&) {
+    if (session && _storeAttachment) {
+        session->read(*_storeAttachment, [this](const auto& db, const auto&, const auto&) {
             _storePath = QString::fromStdString(db.path().string());
         });
     }
@@ -1806,10 +1808,11 @@ void LasagnaServiceManager::setObjectStore(std::shared_ptr<vc::objects::ObjectSt
 
 std::optional<std::filesystem::path> LasagnaServiceManager::surfaceModel(const std::string& surfaceUuid) const
 {
-    if (!_storeSession || !_storeAttachment) {
+    const auto session = _storeSession.lock();
+    if (!session || !_storeAttachment) {
         return std::nullopt;
     }
-    const auto model = _storeSession->artifactDirectory(*_storeAttachment, surfaceUuid, false) / "model.pt";
+    const auto model = session->artifactDirectory(*_storeAttachment, surfaceUuid, false) / "model.pt";
     std::error_code ec;
     return std::filesystem::is_regular_file(model, ec) ? std::optional(model) : std::nullopt;
 }
@@ -2189,8 +2192,8 @@ void LasagnaServiceManager::handleJobsReply(QNetworkReply* reply)
                 surfaces.append(surface.toString());
             }
             // An external service pushed them to the hub: pull them now.
-            if (_isExternal && _storeSession && _storeAttachment) {
-                _storeSession->syncHub(*_storeAttachment);
+            if (const auto session = _storeSession.lock(); _isExternal && session && _storeAttachment) {
+                session->syncHub(*_storeAttachment);
             }
             emit jobFinished(jobId, surfaces);
             emit optimizationFinished(surfaces);

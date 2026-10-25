@@ -219,7 +219,9 @@ private:
     bool _isExternal{false};
     QString _lastError;
     QString _dataDirectory;
-    std::shared_ptr<vc::objects::ObjectStoreSession> _storeSession;
+    // Not owned: the session belongs to the window's state and must not outlive
+    // it (this manager is a process-lifetime singleton).
+    std::weak_ptr<vc::objects::ObjectStoreSession> _storeSession;
     std::optional<vc::objects::AttachmentIdentity> _storeAttachment;
     QString _storePath;         // the attached store's file
     QString _serviceStorePath;  // the file the internal service was started on
