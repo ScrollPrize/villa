@@ -180,6 +180,20 @@ int main(int argc, char** argv)
                 const auto& moved = stored.at("points").at(std::to_string(firstPoint.id)).at("p");
                 require(moved[0].get_double() == 7 && moved[2].get_double() == 9, "moved correction points keep their id");
             }
+            {
+                // Through a view at half scale: points read halved, unchanged ones
+                // keep their stored values on save, moved ones map back.
+                const vc3d::VolumeView coarse{"vol1", 0.5, VolumeAffine::scale(0.5)};
+                auto shown = vc3d::corrections::read(*session, attachment, half, coarse);
+                const auto& ordered = points.getAllCollections().at(fix).points;
+                const auto firstId = std::to_string(ordered.begin()->first), secondId = std::to_string(std::next(ordered.begin())->first);
+                require(shown.at(fix).at("points").at(firstId).at("p")[0].get_double() == 3.5, "corrections read through the view");
+                shown.at(fix)["points"][secondId]["p"] = utils::Json::parse("[1.0, 1.0, 1.0]");
+                vc3d::corrections::write(*session, attachment, half, shown, *volume, coarse);
+                const auto stored = vc3d::corrections::read(*session, attachment, half).at(fix).at("points");
+                require(stored.at(firstId).at("p")[0].get_double() == 7 && stored.at(secondId).at("p")[0].get_double() == 2,
+                        "corrections save back to their stored frame");
+            }
             vc3d::corrections::write(*session, attachment, half, {}, *volume);
             require(vc3d::corrections::read(*session, attachment, half).empty(), "dropped corrections are retired");
             require(vc3d::corrections::read(*session, attachment, native).empty(), "corrections belong to one surface");

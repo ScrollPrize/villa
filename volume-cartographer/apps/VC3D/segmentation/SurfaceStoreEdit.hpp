@@ -34,6 +34,7 @@ public:
     // The pin the edit started from (the opened surface's).
     const vc::objects::PinnedObject& origin() const { return _origin; }
     const std::string& uuid() const { return _uuid; }
+    const std::optional<vc3d::VolumeView>& view() const { return _view; }
 
 private:
     std::shared_ptr<vc::objects::ObjectStoreSession> _session;

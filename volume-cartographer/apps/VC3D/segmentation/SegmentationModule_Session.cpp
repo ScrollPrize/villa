@@ -494,7 +494,8 @@ void SegmentationModule::loadCorrections(QuadSurface* surface)
     std::map<uint64_t, utils::Json> stored;
     if (const auto storeEdit = storeEditFor(surface)) {
         try {
-            stored = vc3d::corrections::read(*_state->objectStoreSession(), storeEdit->pin().attachment, storeEdit->uuid());
+            stored = vc3d::corrections::read(*_state->objectStoreSession(), storeEdit->pin().attachment, storeEdit->uuid(),
+                                             storeEdit->view());
             _correctionsSurfaceId = storeEdit->uuid();
         } catch (const std::exception& error) {
             emit statusMessageRequested(tr("Cannot read correction points: %1").arg(QString::fromUtf8(error.what())), kStatusLong);
@@ -514,7 +515,7 @@ void SegmentationModule::saveCorrections()
     }
     try {
         vc3d::corrections::write(*_state->objectStoreSession(), _storeEdit->pin().attachment, _correctionsSurfaceId,
-                                 _pointCollection->anchoredCollections(), *_state->currentVolume());
+                                 _pointCollection->anchoredCollections(), *_state->currentVolume(), _storeEdit->view());
     } catch (const std::exception& error) {
         qCWarning(lcSegModule) << "Saving correction points failed:" << error.what();
         emit statusMessageRequested(tr("Failed to save correction points: %1").arg(QString::fromUtf8(error.what())), kStatusLong);

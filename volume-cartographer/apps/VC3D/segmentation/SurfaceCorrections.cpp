@@ -4,6 +4,7 @@
 #include "vc/core/types/Volume.hpp"
 
 #include <vc_object_store/objects/GeometryEdits.hpp>
+#include <vc_object_store/store/GeometryViews.hpp>
 #include <vc_object_store/Uuid.hpp>
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <nlohmann/json.hpp>
@@ -53,7 +54,7 @@ Stored toStore(uint64_t id, const Json& collection)
 }
 
 std::map<uint64_t, utils::Json> vc3d::corrections::read(ObjectStoreSession& session, const AttachmentIdentity& attachment,
-                                                        const std::string& surfaceUuid)
+                                                        const std::string& surfaceUuid, const std::optional<vc3d::VolumeView>& view)
 {
     std::map<uint64_t, utils::Json> result;
     session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
@@ -61,7 +62,11 @@ std::map<uint64_t, utils::Json> vc3d::corrections::read(ObjectStoreSession& sess
             const auto object = db.objectByUuid(txn, uuid);
             const auto head = object && !object->retired ? db.currentGeometry(txn, uuid) : std::nullopt;
             if (!head) continue;
-            const auto points = std::get<vc::geometry::PointCollection>(vc::geometry::decode(db.readGeometryData(txn, head->uuid)));
+            auto points = std::get<vc::geometry::PointCollection>(vc::geometry::decode(db.readGeometryData(txn, head->uuid)));
+            if (view) {
+                const auto shown = GeometrySnapshot(db, txn).viewTransformedAt(uuid, view->volume, view->scale);
+                points.points = shown.points("points", 0, int64_t(points.points.size()));
+            }
             const auto attributes = Json::parse(db.geometryPointAnnotations(txn, head->uuid, "points"));
             auto collection = Json::parse(object->meta).value("source", Json::object());
             const auto id = std::stoull(collection.value("source_collection_id", std::string("0")));
@@ -82,7 +87,8 @@ std::map<uint64_t, utils::Json> vc3d::corrections::read(ObjectStoreSession& sess
 }
 
 void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdentity& attachment, const std::string& surfaceUuid,
-                              const std::map<uint64_t, utils::Json>& collections, const Volume& volume)
+                              const std::map<uint64_t, utils::Json>& collections, const Volume& volume,
+                              const std::optional<vc3d::VolumeView>& view)
 {
     std::map<std::string, std::pair<uint64_t, Json>> desired;
     for (const auto& [id, json] : collections) {
@@ -132,6 +138,10 @@ void vc3d::corrections::write(ObjectStoreSession& session, const AttachmentIdent
                 meta["source"] = stored.source;
                 record.meta = meta.dump();
                 db.upsertObject(txn, record);
+                if (view) {
+                    const auto shown = GeometrySnapshot(db, txn).viewTransformedAt(uuid, view->volume, view->scale);
+                    stored.points = shown.canonicalPointCollection(stored.points);
+                }
                 const auto previous = std::get<vc::geometry::PointCollection>(vc::geometry::decode(db.readGeometryData(txn, head->uuid)));
                 const auto previousAnnotations = Json::parse(db.geometryPointAnnotations(txn, head->uuid, "points"));
                 if (previous.ids == stored.points.ids && previous.points == stored.points.points &&
