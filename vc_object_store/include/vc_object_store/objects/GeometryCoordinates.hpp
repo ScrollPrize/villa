@@ -9,7 +9,8 @@ namespace vc::objects {
 using CoordinateJson = nlohmann::json;
 inline bool hasGeometryCoordinates(const std::string& kind)
 {
-    return kind == "point_collection" || kind == "surface" || kind == "fiber" || kind == "track";
+    return kind == "point_collection" || kind == "surface" || kind == "fiber" || kind == "track" ||
+           kind == "umbilicus";
 }
 // volume_uuid stores the authoritative volume ID verbatim (metadata.json id),
 // including catalog IDs such as "20260411134726". It is not an object UUID.

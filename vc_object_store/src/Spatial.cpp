@@ -70,6 +70,9 @@ struct BoundsBuilder {
         if(!value.is_null())merge(value.get<Bounds>());
     }
 };
+// Kinds whose points are a polyline: spatial blocks overlap by one point so
+// every segment lies in a block.
+bool polyline(const std::string& kind) { return kind == "fiber" || kind == "track" || kind == "umbilicus"; }
 bool coordinates(const std::string& kind, const std::string& name) {
     return kind == "fiber" ? name == "line_points" || name == "control_points" : name == "points";
 }
@@ -187,7 +190,7 @@ void indexGeometry(sqlite3* db, int64_t objectId, const std::string& revision,
             }
         } else {
             const int64_t points = a.shape.at(0);
-            const bool line = kind == "fiber" || kind == "track";
+            const bool line = polyline(kind);
             constexpr int64_t block = 256;
             const auto end = line ? std::max<int64_t>(1, points - 1) : points;
             for (int64_t start = 0; points && start < end; start += block) {
@@ -272,7 +275,7 @@ void updateEditedGeometryBounds(sqlite3* db, int64_t objectId, const std::string
                         if (r < std::max<int64_t>(1, shape[0]-1) && c < std::max<int64_t>(1, shape[1]-1))
                             dirty.emplace(edit.array, r, c);
             } else {
-                const bool line = kind == "fiber" || kind == "track";
+                const bool line = polyline(kind);
                 const auto end = line ? std::max<int64_t>(1, shape[0]-1) : shape[0];
                 const auto start = point / 256 * 256;
                 if (start < end) dirty.emplace(edit.array, start, 0);

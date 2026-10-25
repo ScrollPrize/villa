@@ -124,6 +124,7 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
     else if (kind == "point_collection") formats::collection(snapshot, attributes, output);
     else if (kind == "surface") formats::surface(snapshot, attributes, output);
     else if (kind == "track") formats::track(snapshot, attributes, output);
+    else if (kind == "umbilicus") formats::umbilicus(snapshot, attributes, output);
     else throw std::runtime_error("unsupported geometry kind for export");
     publish(output, dest, overwrite, directory);
     return snapshot.revision.uuid;

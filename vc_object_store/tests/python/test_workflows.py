@@ -6,7 +6,7 @@ import sys
 
 import numpy as np
 import pytest
-from vc_object_store import ObjectStore, PointCollection, Fiber, Track, Surface
+from vc_object_store import ObjectStore, PointCollection, Fiber, Track, Surface, Umbilicus
 from object_helpers import edge_choice
 
 
@@ -31,6 +31,7 @@ def array(name, values):
     ('fiber', Fiber([[1, 2, 3], [4, 5, 6]], []), 'control_points'),
     ('track', Track([[1, 2, 3], [4, 5, 6]]), 'points'),
     ('surface', Surface(1, 2, [1, 1], [[1, 2, 3], [4, 5, 6]]), 'points'),
+    ('umbilicus', Umbilicus([[10.5, 20, 3], [11, 21, 400]]), 'points'),
 ])
 def test_owned_views_native_export_and_one_time_ingest(db, tmp_path, kind, geometry, array_name):
     uid, revision = put(db, geometry, kind)

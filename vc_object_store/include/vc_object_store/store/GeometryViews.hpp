@@ -66,7 +66,16 @@ private:
     using GeometryView::GeometryView;
 };
 
-using TypedGeometryView = std::variant<PointCollectionView, FiberView, TrackView, SurfaceView>;
+class UmbilicusView : public GeometryView {
+public:
+    int64_t size() const;
+    std::vector<geometry::Point> points(int64_t start, int64_t count) const;
+    geometry::Umbilicus load() const;
+private:
+    friend class GeometrySnapshot;
+    using GeometryView::GeometryView;
+};
+using TypedGeometryView = std::variant<PointCollectionView, FiberView, TrackView, SurfaceView, UmbilicusView>;
 
 class GeometrySnapshot {
 public:
@@ -79,6 +88,7 @@ public:
     PointCollectionView pointCollection(const std::string& objectUuid) const;
     FiberView fiber(const std::string& objectUuid) const;
     TrackView track(const std::string& objectUuid) const;
+    UmbilicusView umbilicus(const std::string& objectUuid) const;
     SurfaceView surface(const std::string& objectUuid) const;
     TypedGeometryView geometry(const std::string& objectUuid) const;
 private:

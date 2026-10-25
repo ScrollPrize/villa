@@ -98,7 +98,7 @@ target_link_libraries(vc_object_formats PUBLIC opencv_core TIFF::TIFF PRIVATE nl
 target_compile_features(vc_object_formats PUBLIC cxx_std_20)
 add_library(vc_object_geometry STATIC geometry/GeometryIngest.cpp geometry/GeometryExport.cpp geometry/SourceMetadata.cpp
     formats/GeometryInput.cpp formats/FiberInput.cpp formats/SurfaceInput.cpp
-    formats/PointCollectionInput.cpp formats/TrackInput.cpp formats/GeometryOutput.cpp formats/RemoteSource.cpp)
+    formats/PointCollectionInput.cpp formats/UmbilicusInput.cpp formats/TrackInput.cpp formats/GeometryOutput.cpp formats/RemoteSource.cpp)
 add_library(vc_object_store::vc_object_geometry ALIAS vc_object_geometry)
 target_include_directories(vc_object_geometry PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(vc_object_geometry PUBLIC vc_objects PRIVATE vc_object_formats vc_reader::headers CURL::libcurl nlohmann_json::nlohmann_json)

@@ -14,5 +14,6 @@ Prepared surface(const std::filesystem::path&);
 // One surface channel TIFF with its exact samples (little-endian), unchecked against a grid.
 GeometryArray surfaceChannel(const std::string& name, const std::filesystem::path&);
 std::vector<Prepared> collections(const std::filesystem::path&);
+Prepared umbilicus(const std::filesystem::path&);
 Prepared track(const PackedTrackStore&, size_t row, ObjectRecord);
 } // namespace vc::objects::formats

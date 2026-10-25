@@ -171,7 +171,8 @@ void forEachGeometryChunk(const GeometryArray& array, int64_t tile, Visit&& visi
 inline nlohmann::json geometrySchema(const GeometryData& data)
 {
     using Json = nlohmann::json;
-    if (data.kind != "surface" && data.kind != "fiber" && data.kind != "point_collection" && data.kind != "track")
+    if (data.kind != "surface" && data.kind != "fiber" && data.kind != "point_collection" && data.kind != "track" &&
+        data.kind != "umbilicus")
         throw std::invalid_argument("geometry: unsupported object kind " + data.kind);
     if (data.formatVersion != 1 || data.coordinateSystem != "source_xyz")
         throw std::invalid_argument("geometry: unsupported format version or coordinate system");
@@ -208,6 +209,7 @@ inline nlohmann::json geometrySchema(const GeometryData& data)
             throw std::invalid_argument("geometry: control IDs and coordinates differ in length");
     }
     if (data.kind == "track") require("points", "<i4", 2, true);
+    if (data.kind == "umbilicus") require("points", "<f8", 2, true);
     if (data.kind == "point_collection") {
         require("points", "<f8", 2, true);
         require("point_ids", "<i8", 1, false);

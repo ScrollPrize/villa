@@ -62,6 +62,16 @@ void collection(const Snapshot& s, Json attributes, const fs::path& path)
     attributes["points"] = std::move(points);
     writeJson(path, {{"vc_pointcollections_json_version", "1"}, {"collections", {{collectionId, attributes}}}});
 }
+void umbilicus(const Snapshot& s, Json attributes, const fs::path& path)
+{
+    const auto xyz = s.values<double>("points");
+    auto points = Json::array();
+    for (size_t i = 0; i < xyz.size(); i += 3) points.push_back({{"x", xyz[i]}, {"y", xyz[i+1]}, {"z", xyz[i+2]}});
+    attributes["uuid"] = s.revision.objectUuid;
+    attributes["vc_umbilicus_json_version"] = "1";
+    attributes["points"] = std::move(points);
+    writeJson(path, attributes);
+}
 void surface(const Snapshot& s, Json attributes, const fs::path& path)
 {
     const auto descriptor = std::find_if(s.revision.arrays.begin(), s.revision.arrays.end(), [](const auto& a) { return a.name == "points"; });

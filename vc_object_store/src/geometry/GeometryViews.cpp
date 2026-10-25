@@ -98,6 +98,7 @@ std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::
         result->require("control_points", "<f8", 2);
         result->require("line_points", "<f8", 2);
     } else if (revision->kind == "track") result->require("points", "<i4", 2);
+    else if (revision->kind == "umbilicus") result->require("points", "<f8", 2);
     else if (revision->kind == "surface") result->require("points", "<f4", 3);
     else throw std::invalid_argument("unsupported geometry kind");
     return result;
@@ -105,6 +106,7 @@ std::shared_ptr<State> GeometrySnapshot::view(const std::string& id, const std::
 PointCollectionView GeometrySnapshot::pointCollection(const std::string& id) const { return PointCollectionView(view(id, "point_collection")); }
 FiberView GeometrySnapshot::fiber(const std::string& id) const { return FiberView(view(id, "fiber")); }
 TrackView GeometrySnapshot::track(const std::string& id) const { return TrackView(view(id, "track")); }
+UmbilicusView GeometrySnapshot::umbilicus(const std::string& id) const { return UmbilicusView(view(id, "umbilicus")); }
 SurfaceView GeometrySnapshot::surface(const std::string& id) const { return SurfaceView(view(id, "surface")); }
 TypedGeometryView GeometrySnapshot::geometry(const std::string& id) const
 {
@@ -112,6 +114,7 @@ TypedGeometryView GeometrySnapshot::geometry(const std::string& id) const
     if (s->revision.kind == "point_collection") return PointCollectionView(s);
     if (s->revision.kind == "fiber") return FiberView(s);
     if (s->revision.kind == "track") return TrackView(s);
+    if (s->revision.kind == "umbilicus") return UmbilicusView(s);
     return SurfaceView(s);
 }
 GeometrySnapshot ObjectStore::geometrySnapshot() { return GeometrySnapshot(*this); }
@@ -155,6 +158,9 @@ geometry::Fiber FiberView::load() const { return std::get<geometry::Fiber>(loadG
 int64_t TrackView::size() const { return state_->array("points").shape[0]; }
 std::vector<geometry::TrackPoint> TrackView::points(int64_t start, int64_t count) const { return objects::points<int32_t>(*state_, "points", start, count); }
 geometry::Track TrackView::load() const { return std::get<geometry::Track>(loadGeometry()); }
+int64_t UmbilicusView::size() const { return state_->array("points").shape[0]; }
+std::vector<geometry::Point> UmbilicusView::points(int64_t start, int64_t count) const { return objects::points<double>(*state_, "points", start, count); }
+geometry::Umbilicus UmbilicusView::load() const { return std::get<geometry::Umbilicus>(loadGeometry()); }
 int64_t SurfaceView::rows() const { return state_->array("points").shape[0]; }
 int64_t SurfaceView::columns() const { return state_->array("points").shape[1]; }
 std::array<double, 2> SurfaceView::scale() const

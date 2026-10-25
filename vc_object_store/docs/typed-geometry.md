@@ -4,7 +4,7 @@ The package separates geometry, stored objects and file formats:
 
 | Layer | Public API | Responsibility |
 | --- | --- | --- |
-| Owned geometry | `geometry/Geometry.hpp`, `vc::geometry` | Point collections, fibers, tracks and surfaces; validation and geometry operations |
+| Owned geometry | `geometry/Geometry.hpp`, `vc::geometry` | Point collections, fibers, tracks, surfaces and umbilici; validation and geometry operations |
 | Stored geometry | `store/GeometryViews.hpp`, `vc::objects` | Snapshot views, bounded reads and checked sparse edits |
 | Object store | `objects/ObjectStore.hpp` | Identity, metadata, history, transactions, relationships and spatial queries |
 | Native formats | `objects/GeometryIngest.hpp`, `objects/GeometryExport.hpp` | Import/export orchestration; decoders and encoders live in `src/formats/` |
@@ -12,7 +12,7 @@ The package separates geometry, stored objects and file formats:
 Link `vc_geometry` for owned geometry alone, or `vc_objects` for stored geometry.
 Installed CMake targets have the `vc_object_store::` prefix. Owned geometry has no
 SQLite, OpenCV, Qt, volume-cartographer or spiral-fitting dependency.
-All four types and the snapshot/edit API are also available in Python.
+All five types and the snapshot/edit API are also available in Python.
 
 ## Owned geometry
 
@@ -27,13 +27,16 @@ conversion check invariants.
 | `Fiber` | float64 XYZ `controlPoints`, `linePoints`; int64 `controlPointIds` | Polyline length, validation |
 | `Track` | int32 XYZ `points` | Polyline length, validation |
 | `Surface` | `rows`, `columns`, column/row `scale`, float32 XYZ `points`, `validity`, `channels` | Vertex access, validity, validation |
+| `Umbilicus` | float64 XYZ `points` (ordered control polyline, at least one) | Validation |
 
 Coordinates remain source XYZ voxels; there is no implicit rescaling, unit
 conversion, or axis reversal. Native packed tracks use ZYX; the format adapter
 performs that conversion at the file boundary. Fiber length uses sampled line
 points if present, otherwise control points. A surface is row-major; scale is grid
 steps per source voxel, and vertices without coordinates use the
-`(-1,-1,-1)` sentinel. `validity` is the surface's `valid` channel (empty, or one
+`(-1,-1,-1)` sentinel. An umbilicus is a scroll's centre line; its native file
+is `{"vc_umbilicus_json_version": "1", "points": [{"x", "y", "z"}, ...]}` plus the
+object's name, tags, `coordinates` and other metadata (`vc_object_ingest --umbilicus`). `validity` is the surface's `valid` channel (empty, or one
 byte per vertex, nonzero = valid); `valid(row, column)` requires both coordinates
 and validity. `channels` holds the other aligned channels as generic arrays. Stable point IDs are nonnegative and unique and need not be sorted.
 

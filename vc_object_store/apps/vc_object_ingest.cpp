@@ -26,6 +26,7 @@ try {
         else if (arg == "--surface") sources.emplace_back("surface", next());
         else if (arg == "--fiber") sources.emplace_back("fiber", next());
         else if (arg == "--point-collections") sources.emplace_back("point_collection", next());
+        else if (arg == "--umbilicus") sources.emplace_back("umbilicus", next());
         else if (arg == "--tracks") sources.emplace_back("track", next());
         else if (arg == "--surface-channel") {
             Channel channel; channel.uuid = next(); channel.name = next(); channel.image = next();
@@ -40,6 +41,7 @@ try {
                 "  --surface DIR               import a new tifxyz surface\n"
                 "  --fiber PATH              import new fibers from JSON or a directory\n"
                 "  --point-collections FILE  import new collections from a JSON\n"
+                "  --umbilicus FILE          import a new umbilicus from a vc_umbilicus JSON\n"
                 "  --tracks PATH             import new packed tracks (or DBM with packed mirror)\n"
                 "  --surface-channel UUID NAME TIFF\n"
                 "                            add or replace a channel of a stored surface\n"

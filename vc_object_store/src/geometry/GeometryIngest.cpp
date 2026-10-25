@@ -65,6 +65,7 @@ std::vector<GeometrySource> prepareGeometrySource(const std::string& kind, const
     if (kind == "fiber") return formats::fibers(source, availableUuids);
     if (kind == "surface") return {surface(source)};
     if (kind == "point_collection") return collections(source);
+    if (kind == "umbilicus") return {formats::umbilicus(source)};
     throw std::invalid_argument("unsupported batch geometry kind: " + kind);
 }
 

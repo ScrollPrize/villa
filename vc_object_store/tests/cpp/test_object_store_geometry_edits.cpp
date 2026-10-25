@@ -29,7 +29,7 @@ int main() try {
     require(!geometryScaleToVolume(Json::object(),volume), "unknown coordinates stay unbound");
     mustFail([&] { geometryCoordinates(Json{{"scale_factor",0}}); });
     mustFail([&] { mergeGeometryCoordinates(Json{{"scale_factor",(uint64_t(1)<<60)+1}},Json{{"scale_factor",double(uint64_t(1)<<60)}}); });
-    for (const auto& kind : {"fiber", "point_collection", "track", "surface"}) {
+    for (const auto& kind : {"fiber", "point_collection", "track", "surface", "umbilicus"}) {
         const auto uuid = util::newUuid();
         GeometryData first, target;
         if (std::string(kind) == "fiber") {
@@ -41,6 +41,9 @@ int main() try {
         } else if (std::string(kind) == "track") {
             first = vc::geometry::encode(vc::geometry::Track{{{1,2,3},{4,5,6}}});
             target = vc::geometry::encode(vc::geometry::Track{{{1,2,3},{4,5,7},{8,9,10}}});
+        } else if (std::string(kind) == "umbilicus") {
+            first = vc::geometry::encode(vc::geometry::Umbilicus{{{1,2,3},{4,5,6}}});
+            target = vc::geometry::encode(vc::geometry::Umbilicus{{{1,2,3},{4,5,7},{8,9,10}}});
         } else {
             first = vc::geometry::encode(vc::geometry::Surface{1,2,{1,1},{{1,2,3},{4,5,6}}});
             target = vc::geometry::encode(vc::geometry::Surface{1,2,{1,1},{{1,2,3},{4,5,7}}});

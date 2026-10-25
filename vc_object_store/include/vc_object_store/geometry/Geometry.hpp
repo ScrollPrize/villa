@@ -52,7 +52,13 @@ struct Surface {
     bool valid(int64_t row, int64_t column) const;
 };
 
-using Geometry = std::variant<PointCollection, Fiber, Track, Surface>;
+// A scroll's umbilicus: the ordered control polyline of its centre, in source XYZ.
+struct Umbilicus {
+    std::vector<Point> points;
+    void validate() const;
+};
+
+using Geometry = std::variant<PointCollection, Fiber, Track, Surface, Umbilicus>;
 
 // Preserve scalar precision, point order and stable IDs. encode/decode are the
 // bridge to the existing lossless array storage, not external file formats.

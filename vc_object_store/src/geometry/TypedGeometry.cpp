@@ -74,6 +74,11 @@ void Fiber::validate() const {
 }
 double Fiber::length() const { validate(); return polylineLength(linePoints.empty() ? controlPoints : linePoints); }
 void Track::validate() const {}
+void Umbilicus::validate() const
+{
+    if (points.empty()) throw std::invalid_argument("umbilicus requires at least one point");
+    finite(points);
+}
 double Track::length() const { return polylineLength(points); }
 void Surface::validate() const
 {
@@ -131,6 +136,9 @@ objects::GeometryData encode(const Geometry& geometry)
         } else if constexpr (std::is_same_v<T, Track>) {
             data.kind = "track";
             data.arrays = {xyzArray<int32_t>("points", "<i4", {int64_t(g.points.size()), 3}, g.points)};
+        } else if constexpr (std::is_same_v<T, Umbilicus>) {
+            data.kind = "umbilicus";
+            data.arrays = {xyzArray<double>("points", "<f8", {int64_t(g.points.size()), 3}, g.points)};
         } else {
             data.kind = "surface";
             data.attributes = nlohmann::json{{"scale", g.scale}}.dump();
@@ -178,6 +186,8 @@ Geometry decode(const objects::GeometryData& data)
         PointCollection{fiber.controlPointIds, fiber.controlPoints}.validate();
     } else if (data.kind == "track") {
         result = Track{xyzValues<int32_t>(require(data, "points", "<i4", 2).bytes)};
+    } else if (data.kind == "umbilicus") {
+        result = Umbilicus{xyzValues<double>(require(data, "points", "<f8", 2).bytes)};
     } else if (data.kind == "surface") {
         const auto& a = require(data, "points", "<f4", 3);
         Surface g{a.shape[0], a.shape[1], attributes.at("scale").get<std::array<double, 2>>(), xyzValues<float>(a.bytes)};

@@ -34,6 +34,10 @@ inline void bindTypedGeometry(nb::module_& m)
         .def_rw("points", &vg::Track::points)
         .def("validate", &vg::Track::validate)
         .def("length", &vg::Track::length);
+    nb::class_<vg::Umbilicus>(m, "Umbilicus")
+        .def(nb::init<std::vector<vg::Point>>(), nb::arg("points"))
+        .def_rw("points", &vg::Umbilicus::points)
+        .def("validate", &vg::Umbilicus::validate);
     nb::class_<vg::Surface>(m, "Surface")
         .def(nb::init<int64_t, int64_t, std::array<double, 2>, std::vector<vg::SurfacePoint>>(),
              nb::arg("rows"), nb::arg("columns"), nb::arg("scale"), nb::arg("points"))
@@ -80,6 +84,10 @@ inline void bindTypedGeometry(nb::module_& m)
         .def("__len__", &vo::TrackView::size)
         .def("points", &vo::TrackView::points, nb::arg("start"), nb::arg("count"), nb::call_guard<nb::gil_scoped_release>())
         .def("load", &vo::TrackView::load, nb::call_guard<nb::gil_scoped_release>());
+    nb::class_<vo::UmbilicusView, vo::GeometryView>(m, "UmbilicusView")
+        .def("__len__", &vo::UmbilicusView::size)
+        .def("points", &vo::UmbilicusView::points, nb::arg("start"), nb::arg("count"), nb::call_guard<nb::gil_scoped_release>())
+        .def("load", &vo::UmbilicusView::load, nb::call_guard<nb::gil_scoped_release>());
     nb::class_<vo::SurfaceView, vo::GeometryView>(m, "SurfaceView")
         .def_prop_ro("rows", &vo::SurfaceView::rows)
         .def_prop_ro("columns", &vo::SurfaceView::columns)
@@ -101,6 +109,7 @@ inline void bindTypedGeometry(nb::module_& m)
         .def("fiber", &vo::GeometrySnapshot::fiber, nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>())
         .def("track", &vo::GeometrySnapshot::track, nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>())
         .def("surface", &vo::GeometrySnapshot::surface, nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>())
+        .def("umbilicus", &vo::GeometrySnapshot::umbilicus, nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>())
         .def("geometry", &vo::GeometrySnapshot::geometry, nb::arg("object_uuid"), nb::call_guard<nb::gil_scoped_release>());
 }
 } // namespace vc::python
