@@ -222,9 +222,8 @@ std::string write_quad_rect_to_store(vc::objects::ObjectStore& db, vc::objects::
             const auto p=points(r,c);desired.push_back({p[0],p[1],p[2]});
         }
         const auto edits=transformed->surfaceEdits(area.y,area.x,area.height,area.width,desired);
-        const auto decisions=decide?decide(db.affectedGeometryEditEdges(txn,objectUuid,edits,revision.uuid))
-            :std::vector<vc::objects::GeometryEdgeEdit>{};
-        return db.editGeometry(txn,objectUuid,edits,revision.uuid,decisions);
+        return decide ? db.editGeometry(txn,objectUuid,edits,revision.uuid,vc::objects::ObjectStore::EdgeDecider(decide))
+                      : db.editGeometry(txn,objectUuid,edits,revision.uuid);
     }
     auto stored = db.readGeometryRectangle(txn, revision.uuid, "points", area.y, area.x, area.height, area.width);
     const bool hasValid = hasArray(revision, "valid");
@@ -252,9 +251,9 @@ std::string write_quad_rect_to_store(vc::objects::ObjectStore& db, vc::objects::
     };
     rows("points", stored, 12, 3);
     if (validChanged) rows("valid", valid, 1, 1);
-    const auto decisions = decide ? decide(db.affectedGeometryEditEdges(txn, objectUuid, edits, revision.uuid))
-                                  : std::vector<vc::objects::GeometryEdgeEdit>{};
-    return db.editGeometry(txn, objectUuid, edits, revision.uuid, decisions);
+    // One plan decides the affected relationships and commits.
+    return decide ? db.editGeometry(txn, objectUuid, edits, revision.uuid, vc::objects::ObjectStore::EdgeDecider(decide))
+                  : db.editGeometry(txn, objectUuid, edits, revision.uuid);
 }
 
 std::string write_quad_channels_to_store(vc::objects::ObjectStore& db, vc::objects::WriteTxn& txn, const std::string& objectUuid,
