@@ -2,15 +2,64 @@
 #include <doctest/doctest.h>
 #include "vc/fiber_tracer/FiberChunkTrace.hpp"
 #include "vc/fiber_tracer/FiberEvaluation.hpp"
+#include "vc/fiber_tracer/detail/PolylineSegmentIndex.hpp"
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <random>
+#include <set>
+#include <zstd.h>
 
 using namespace vc::fiber_tracer;
+
+TEST_CASE("chunk segment R-tree conservatively contains every nearby segment") {
+    std::mt19937_64 rng(1234);
+    std::uniform_real_distribution<double> random(-100.,100.);
+    for(double offset:{0.,9e9}) {
+        std::vector<std::vector<cv::Vec3d>> paths;
+        for(int line=0;line<12;++line) {
+            paths.emplace_back();
+            for(int i=0;i<2+line*11;++i)
+                paths.back().emplace_back(offset+random(rng),offset+random(rng),offset+random(rng));
+        }
+        paths.push_back({{0,0,0},{100,0,0},{0,0,0},{100,0,0}});
+        paths.push_back({{0,0,0},{1e-7,0,0},{2e-7,1e-7,0}});
+        const detail::ChunkSegmentIndex index(paths,[](const auto& p)->const auto& {return p;});
+        for(int query=0;query<600;++query) {
+            cv::Vec3d p(offset+random(rng)*3,offset+random(rng)*3,offset+random(rng)*3);
+            const double radius=query%2?20.:10.;
+            if(query<12)p=paths[query][0]+cv::Vec3d(radius,0,0);
+            std::set<size_t> hits;
+            index.nearbyPaths(p,radius,[&](size_t id){hits.insert(id);});
+            for(size_t line=0;line<paths.size();++line) {
+                const auto& points=paths[line];
+                std::vector<double> arcs{0};
+                for(size_t s=1;s<points.size();++s)arcs.push_back(arcs.back()+cv::norm(points[s]-points[s-1]));
+                for(size_t s=1;s<points.size();++s) {
+                    auto v=points[s]-points[s-1];double len=arcs[s]-arcs[s-1];
+                    double t=std::clamp((p-points[s-1]).dot(v)/(len*len),0.,1.);
+                    auto d=p-(points[s-1]+t*v);
+                    if(d.dot(d)<=radius*radius)CHECK(hits.count(line)==1);
+                }
+            }
+        }
+    }
+    size_t visits=0;
+    detail::ChunkSegmentIndex().nearbyPaths({0,0,0},20,[&](size_t){++visits;});
+    CHECK(visits==0);
+}
 namespace {
+nlohmann::json readPackedFixture(const std::filesystem::path& path) {
+    std::ifstream in(path,std::ios::binary);
+    const std::string data((std::istreambuf_iterator<char>(in)),{});
+    const auto size=ZSTD_getFrameContentSize(data.data(),data.size());
+    REQUIRE(size!=ZSTD_CONTENTSIZE_ERROR);REQUIRE(size!=ZSTD_CONTENTSIZE_UNKNOWN);
+    std::vector<uint8_t> decoded(size);
+    REQUIRE(ZSTD_decompress(decoded.data(),decoded.size(),data.data(),data.size())==size);
+    return nlohmann::json::from_msgpack(decoded);
+}
 struct Temp {
     std::filesystem::path path=std::filesystem::temp_directory_path()/
         ("vc_chunk_trace_"+std::to_string(std::mt19937_64(std::random_device{}())()));
@@ -123,7 +172,17 @@ TEST_CASE("chunk cache shares builds persists checks configuration and retries f
     CHECK_THROWS(cache.get({0,0,0},source,t,normals,1));
     FiberChunkTraceCache changed(c,temp.path,"fixture-v1");
     CHECK_THROWS(changed.get({0,0,0},source,t,normals,1));
-    CHECK(loadFiberChunkPaths(temp.path/"0_0_0.json")->lines==a->lines);
+    CHECK_FALSE(std::filesystem::exists(temp.path/"0_0_0.json"));
+    const auto packed=temp.path/"0_0_0.msgpack.zst";
+    CHECK(loadFiberChunkPaths(packed)->lines==a->lines);
+    const auto document=readPackedFixture(packed);
+    CHECK(document.at("timings")==a->timings);
+    std::ofstream(temp.path/"0_0_0.json")<<document.dump();
+    // A corrupt new-format file must not silently fall back to an old file.
+    std::ofstream(packed,std::ios::binary|std::ios::trunc)<<"broken";
+    CHECK_THROWS(loadFiberChunkPaths(packed));
+    FiberChunkTraceCache corrupt(c,temp.path,"fixture-v1");
+    CHECK_THROWS(corrupt.get({0,0,0},source,traceConfig(),normals,1));
 }
 
 TEST_CASE("chunk configuration rejects invalid and unbounded allocations") {
@@ -133,6 +192,66 @@ TEST_CASE("chunk configuration rejects invalid and unbounded allocations") {
     c=chunkConfig();t.stepVoxels=std::numeric_limits<double>::quiet_NaN();
     CHECK_THROWS(buildFiberChunkPaths({0,0,0},source,t,normal,c,1));
     CHECK(source.calls==0);
+}
+
+TEST_CASE("online refinement stays disabled unless iterations are explicitly enabled") {
+    const FiberChunkTraceConfig defaults;
+    CHECK(defaults.onlineRefineIterations==0);
+    CHECK(defaults.beamCommitMode=="shared_prefix");
+    CHECK(fiberChunkConfigFromJson(nlohmann::json::object()).onlineRefineIterations==0);
+    auto j=fiberChunkConfigJson(defaults);
+    CHECK(j.at("online_refine_iterations")==0);
+    j.erase("online_refine_iterations");j["online_refine_mode"]="analytic";
+    const auto omitted=fiberChunkConfigFromJson(j);
+    CHECK(omitted.onlineRefineIterations==0);
+    CHECK(fiberChunkCacheSpecification(omitted,traceConfig(),1,"fixture")==
+          fiberChunkCacheSpecification(defaults,traceConfig(),1,"fixture"));
+    j["online_refine_iterations"]=1;
+    CHECK(fiberChunkConfigFromJson(j).onlineRefineIterations==1);
+}
+
+TEST_CASE("rolling beam commits have separate identity even without refinement") {
+    auto c=chunkConfig();auto t=traceConfig();
+    const auto baseline=fiberChunkCacheSpecification(c,t,1,"fixture");
+    c.beamCommitMode="rolling";
+    CHECK(fiberChunkCacheSpecification(c,t,1,"fixture")!=baseline);
+    auto j=fiberChunkConfigJson(c);auto decoded=fiberChunkConfigFromJson(j);
+    CHECK(decoded.beamCommitMode=="rolling");
+    Tubes source;Normal normals;
+    CHECK_THROWS(buildFiberChunkPaths({0,0,0},source,t,normals,c,1));
+    c.beamCommitMode="invalid";
+    CHECK_THROWS(buildFiberChunkPaths({0,0,0},source,t,normals,c,1));
+}
+
+TEST_CASE("analytic refinement identity is separate but batching is execution only") {
+    auto c=chunkConfig();const auto t=traceConfig();
+    const auto disabled=fiberChunkCacheSpecification(c,t,1,"fixture");
+    c.onlineRefineMode="analytic";c.gpuBatchHalves=4096;c.gpuBatchMemoryMiB=1024;
+    CHECK(fiberChunkCacheSpecification(c,t,1,"fixture")==disabled);
+    auto decoded=fiberChunkConfigFromJson(fiberChunkConfigJson(c));
+    CHECK(decoded.onlineRefineMode=="analytic");CHECK(decoded.gpuBatchHalves==4096);
+    CHECK(decoded.gpuBatchMemoryMiB==1024);
+    c.onlineRefineIterations=1;
+    const auto analytic=fiberChunkCacheSpecification(c,t,1,"fixture");
+    c.gpuBatchHalves=1024;c.gpuBatchMemoryMiB=4096;
+    CHECK(fiberChunkCacheSpecification(c,t,1,"fixture")==analytic);
+    c.onlineRefineMode="legacy";
+    CHECK(fiberChunkCacheSpecification(c,t,1,"fixture")!=analytic);
+    c.onlineRefineMode="unknown";
+    CHECK_THROWS(fiberChunkConfigFromJson(fiberChunkConfigJson(c)));
+    c.onlineRefineMode="legacy";c.gpuBatchHalves=0;
+    CHECK_THROWS(fiberChunkConfigFromJson(fiberChunkConfigJson(c)));
+}
+
+TEST_CASE("online refinement supports up to 64 iterations") {
+    auto c=chunkConfig();c.onlineRefineMode="analytic";c.beamCommitMode="rolling";
+    c.onlineRefineIterations=64;
+    CHECK(fiberChunkConfigFromJson(fiberChunkConfigJson(c)).onlineRefineIterations==64);
+    const auto sixtyFour=fiberChunkCacheSpecification(c,traceConfig(),1,"fixture");
+    c.onlineRefineIterations=8;
+    CHECK(fiberChunkCacheSpecification(c,traceConfig(),1,"fixture")!=sixtyFour);
+    c.onlineRefineIterations=65;
+    CHECK_THROWS(fiberChunkConfigFromJson(fiberChunkConfigJson(c)));
 }
 
 TEST_CASE("chunk matching uses orientation overlap and optional width not nearest endpoint alone") {
@@ -344,6 +463,36 @@ TEST_CASE("Recovered conflict filter rejects branching partners, not duplicates"
     CHECK_THROWS(filterFiberChunkConflicts(duplicate,cfg,normal,1));
 }
 
+TEST_CASE("conflict candidate shared-run boundary and gap preserve directed decisions") {
+    Normal normal;FiberChunkTraceConfig cfg;
+    cfg.conflictNormalBase=10;cfg.conflictTangentBase=20;
+    cfg.conflictAgreementBase=64;cfg.conflictSeparationBase=32;
+    for(int end:{48,56,64,72})for(bool reverse:{false,true}) {
+        FiberChunkPaths paths;
+        std::vector<cv::Vec3d> straight;
+        for(int x=0;x<=256;x+=8)straight.emplace_back(x,0,0);
+        if(reverse)std::reverse(straight.begin(),straight.end());
+        // Keep the departing segment long: a second bend would introduce a
+        // nearest-projection jump and intentionally fail the correspondence gate.
+        paths.lines={straight,{{-32,0,0},{double(end),0,0},{512,double(512-end),0}}};
+        const auto report=filterFiberChunkConflicts(paths,cfg,normal,1);
+        const auto pair=nlohmann::json::array({0,1});
+        const auto& pairs=report["directed_conflict_pairs"];
+        CHECK((std::find(pairs.begin(),pairs.end(),pair)!=pairs.end())==(end>=64));
+    }
+    cfg.conflictNormalBase=cfg.conflictTangentBase=1;
+    FiberChunkPaths gap;
+    for(int x=0;x<=256;x+=8) {
+        if(gap.lines.empty())gap.lines.emplace_back();
+        gap.lines[0].emplace_back(x,0,0);
+    }
+    gap.lines.push_back({{-32,0,0},{32,0,0},{40,80,0},{48,0,0},{80,0,0},{160,80,0},{320,80,0}});
+    const auto report=filterFiberChunkConflicts(gap,cfg,normal,1);
+    const auto pair=nlohmann::json::array({0,1});
+    const auto& pairs=report["directed_conflict_pairs"];
+    CHECK(std::find(pairs.begin(),pairs.end(),pair)==pairs.end());
+}
+
 TEST_CASE("Recovered config round trips and cache-only never constructs") {
     const auto config=chunkConfig();const auto trace=traceConfig();Normal normals;Tubes source;Temp dir;
     auto json=fiberChunkConfigJson(config);
@@ -370,12 +519,50 @@ TEST_CASE("Recovered angular initial match penalizes a bending candidate") {
     auto match=matchFiberChunkPaths(paths,{{64,0,0}},{1,0,0},cfg,true,&region);
     CHECK(match.valid);CHECK(match.line==1);CHECK(match.initialSamples==5);
 }
+
+TEST_CASE("saved conflict flags retain geometry and matching ignores rejected paths") {
+    Temp dir;std::filesystem::create_directories(dir.path);
+    auto c=chunkConfig();c.coreBase=512;c.haloBase=64;
+    c.conflictNormalBase=10;c.conflictTangentBase=20;
+    auto t=traceConfig();Normal normal;Tubes source;
+    nlohmann::json lines=nlohmann::json::array();
+    for(int line=0;line<3;++line) {
+        nlohmann::json points=nlohmann::json::array();
+        for(int x=0;x<=320;x+=8)points.push_back({x,line==0?0.:line==1?std::max(0,x-128)*.5:100.,0.});
+        lines.push_back(points);
+    }
+    nlohmann::json doc={{"key",{0,0,0}},{"lo",{-64,-64,-64}},{"hi",{576,576,576}},
+        {"maxima",3},{"seeds",3},{"lines",lines},
+        {"end_reasons",std::vector<std::array<std::string,2>>(3,{"chunk_boundary","chunk_boundary"})},
+        {"specification",fiberChunkCacheSpecification(c,t,1,"flags-test")}};
+    std::ofstream(dir.path/"0_0_0.json")<<doc;
+    std::string outcome;
+    auto paths=prepareFiberChunkPaths({0,0,0},source,t,normal,c,1,dir.path,"flags-test",outcome);
+    CHECK(outcome=="annotated");CHECK(source.calls==0);
+    CHECK(paths->conflictFlags==std::vector<bool>{true,true,false});
+    CHECK(paths->lines[0].size()==41);CHECK(paths->lines[1].size()==41);
+    auto loaded=loadFiberChunkPaths(dir.path/"0_0_0.msgpack.zst");
+    CHECK(loaded->lines==paths->lines);CHECK(loaded->conflictFlags==paths->conflictFlags);
+    FiberChunkInitialRegion region;region.center={64,0,0};region.metric=cv::Matx33d::eye()/400.;
+    auto stale=c;stale.conflictSeparationBase=48;
+    CHECK_THROWS(matchFiberChunkPaths(*loaded,{{64,0,0}},{1,0,0},stale,true,&region));
+    CHECK_FALSE(matchFiberChunkPaths(*loaded,{{64,0,0}},{1,0,0},c,true,&region).valid);
+    c.conflictNormalBase=c.conflictTangentBase=0;
+    CHECK(matchFiberChunkPaths(*loaded,{{64,0,0}},{1,0,0},c,true,&region).valid);
+    c.conflictNormalBase=10;c.conflictTangentBase=20;
+    const auto modified=std::filesystem::last_write_time(dir.path/"0_0_0.msgpack.zst");
+    paths=prepareFiberChunkPaths({0,0,0},source,t,normal,c,1,dir.path,"flags-test",outcome);
+    CHECK(outcome=="reused");CHECK(source.calls==0);
+    CHECK(std::filesystem::last_write_time(dir.path/"0_0_0.msgpack.zst")==modified);
+}
 TEST_CASE("Original main cache defaults load without rewriting or reconstructing") {
     auto c=chunkConfig();const auto t=traceConfig();Normal normals;Tubes source;Temp dir;
     FiberChunkTraceCache writer(c,dir.path,"original-main");
     const auto built=writer.get({0,0,0},source,t,normals,1);
     const auto path=dir.path/"0_0_0.json";
-    nlohmann::json saved;std::ifstream(path)>>saved;
+    const auto packed=dir.path/"0_0_0.msgpack.zst";
+    auto saved=readPackedFixture(packed);
+    std::filesystem::remove(packed);
     for(const auto* key:{"refine_seed","seed_movement","backend","online_refinement"})
         saved["specification"]["chunk"].erase(key);
     const auto bytes=saved.dump();std::ofstream(path)<<bytes;
@@ -385,4 +572,27 @@ TEST_CASE("Original main cache defaults load without rewriting or reconstructing
     CHECK(source.calls==calls);
     std::ifstream in(path);std::string after((std::istreambuf_iterator<char>(in)),{});
     CHECK(after==bytes);
+}
+
+TEST_CASE("real cached geometry survives MessagePack Zstd and rejects truncation") {
+    const char* fixture=std::getenv("VC_TEST_CHUNK_PATH");
+    if(!fixture)return;
+    const auto original=loadFiberChunkPaths(fixture);
+    std::ifstream input(fixture);nlohmann::json document;input>>document;
+    const auto bytes=nlohmann::json::to_msgpack(document);
+    std::string compressed(ZSTD_compressBound(bytes.size()),'\0');
+    const auto size=ZSTD_compress(compressed.data(),compressed.size(),bytes.data(),bytes.size(),3);
+    REQUIRE_FALSE(ZSTD_isError(size));compressed.resize(size);
+    Temp dir;std::filesystem::create_directories(dir.path);
+    const auto path=dir.path/"fixture.msgpack.zst";
+    std::ofstream(path,std::ios::binary).write(compressed.data(),compressed.size());
+    const auto decoded=loadFiberChunkPaths(path);
+    CHECK(decoded->lines==original->lines);CHECK(decoded->endReasons==original->endReasons);
+    CHECK(decoded->key==original->key);CHECK(decoded->lo==original->lo);CHECK(decoded->hi==original->hi);
+    CHECK(decoded->seeds==original->seeds);CHECK(decoded->maxima==original->maxima);
+    CHECK(decoded->timings==original->timings);
+    CHECK(readPackedFixture(path)==document);
+    compressed.pop_back();
+    std::ofstream(path,std::ios::binary|std::ios::trunc).write(compressed.data(),compressed.size());
+    CHECK_THROWS(loadFiberChunkPaths(path));
 }

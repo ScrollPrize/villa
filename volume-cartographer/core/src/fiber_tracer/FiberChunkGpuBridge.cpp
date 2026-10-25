@@ -1,4 +1,5 @@
 #include "vc/fiber_tracer/FiberChunkTrace.hpp"
+#include "vc/fiber_tracer/detail/FiberChunkTensor.hpp"
 #include <atomic>
 #include "vc/core/util/AtomicFile.hpp"
 #include <condition_variable>
@@ -91,7 +92,8 @@ std::shared_ptr<void> acquireFiberChunkGpu(const FiberChunkTraceConfig& c,const 
 void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& source,
     const vc::lasagna::NormalSampler& normals,const FiberTraceConfig& cfg,
     const FiberChunkTraceConfig& c,double scale,const std::vector<Json>& gpuSeeds,
-    const std::shared_ptr<vc::render::PinnedChunkRegion>& pinned,const FiberChunkWait& wait)
+    const std::shared_ptr<vc::render::PinnedChunkRegion>& pinned,const FiberChunkWait& wait,
+    const detail::FiberChunkTensor* tensor)
 {
     if(c.gpuLibrary.empty())throw std::invalid_argument("GPU library required");
     auto& gpu=gpuChunks(c);
@@ -113,7 +115,11 @@ void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& sourc
         std::vector<unsigned char> byteValues;std::vector<float> widthValues;
         byteValues.reserve(size_t(shape[0])*shape[1]*shape[2]*6);
         widthValues.reserve(size_t(shape[0])*shape[1]*shape[2]);
-        {
+        if(tensor) {
+            if(origin!=tensor->origin() || shape!=tensor->shape() || spacing!=tensor->spacing())
+                throw std::logic_error("GPU and owned tensor lattices disagree");
+            tensor->packGpu(byteValues,widthValues);
+        } else {
 
         for(int z=0;z<shape[2];++z) {
             std::vector<cv::Vec3f> points;
@@ -140,6 +146,7 @@ void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& sourc
             widthValues.insert(widthValues.end(),widths.begin(),widths.end());
         }
         }
+        out->timings["gpu_pack_seconds"]=elapsed();
         Json seeds=Json::array();for(const auto& seed:gpuSeeds) if(!seed.is_null()) seeds.push_back(seed);
         Json meta={{"seeds",seeds},{"origin",origin},{"shape_xyz",shape},{"spacing",spacing},
             {"bounds",{xyz(out->lo/scale),xyz(out->hi/scale)}},{"trace_to_base",scale},
@@ -154,6 +161,10 @@ void runFiberChunkGpu(FiberChunkPaths& output,const FiberPredictionSource& sourc
             {"cumulative_steps",cfg.cumulativeSmoothnessSteps},{"mask_normals",normalField->masksInvalidCorners()}};
         meta["online_refine_iterations"]=c.onlineRefineIterations;
         meta["online_refine_window"]=c.onlineRefineWindow;
+        meta["online_refine_mode"]=c.onlineRefineMode;
+        meta["beam_commit_mode"]=c.beamCommitMode;
+        meta["gpu_batch_halves"]=c.gpuBatchHalves;
+        meta["gpu_batch_memory_mib"]=c.gpuBatchMemoryMiB;
         meta["online_refine_epsilon"]=c.onlineRefineEpsilonBase/scale;
         meta["online_refine_step"]=c.onlineRefineStepBase/scale;
         meta["online_refine_cap"]=c.onlineRefineCapBase/scale;

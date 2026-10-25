@@ -32,9 +32,15 @@ struct FiberChunkTraceConfig {
     std::string gpuLibrary; // optional CUDA plugin; CPU default
     int gpuDevices=0; // visible device count, caller must hold manager grants
     int onlineRefineIterations=0, onlineRefineWindow=0;
+    std::string onlineRefineMode="legacy"; // explicit comparison control
+    std::string beamCommitMode="shared_prefix"; // experimental GPU rolling horizon
+    int gpuBatchHalves=8192;
+    int gpuBatchMemoryMiB=2048; // workspace cap, excludes resident fields
     double onlineRefineEpsilonBase=.25, onlineRefineStepBase=1, onlineRefineCapBase=8;
     std::filesystem::path benchmarkExport; // explicit fixture export, empty disables
     bool pinSamplingRegion=true;
+    bool channelHints=true; // generic cache hint; no change to construction identity
+    std::size_t workerCacheBytes=0; // 0: shared; otherwise experimental per-worker decoded LRU
     // Reject accidentally enormous dense seed grids before allocating them.
     size_t maxGridSamples=64ULL*1024*1024;
 };
@@ -51,6 +57,9 @@ struct FiberChunkPaths {
     std::vector<std::array<std::string,2>> endReasons;
     size_t maxima=0,seeds=0;
     nlohmann::json timings=nlohmann::json::object();
+    // Empty annotation means unchecked. Geometry is always retained on disk.
+    nlohmann::json conflictAnnotation=nullptr;
+    std::vector<bool> conflictFlags;
 };
 
 // Synchronous: on success invoke each index exactly once; join every admitted
@@ -77,6 +86,12 @@ struct FiberChunkSeedFit {
     const FiberChunkParallelFor& parallelFor={},const FiberPredictionSource* readinessSource=nullptr,
     const std::vector<size_t>* auditQueries=nullptr);
 
+// Non-destructive variant; identical decisions to filterFiberChunkConflicts.
+[[nodiscard]] nlohmann::json inspectFiberChunkConflicts(const FiberChunkPaths&,
+    const FiberChunkTraceConfig&,const vc::lasagna::NormalSampler&,double,
+    const FiberChunkParallelFor& = {},const FiberPredictionSource* = nullptr,
+    const std::vector<size_t>* = nullptr);
+
 [[nodiscard]] FiberTraceOneWayResult traceFiberChunkHalf(const FiberPredictionSource&,
     const cv::Vec3d& seedTrace,const cv::Vec3d& direction,double distanceTrace,
     const FiberTraceConfig&,const vc::lasagna::NormalSampler*,
@@ -88,6 +103,15 @@ struct FiberChunkSeedFit {
     const FiberChunkParallelFor& parallelFor={},const FiberChunkWait& wait={});
 
 [[nodiscard]] std::shared_ptr<FiberChunkPaths> loadFiberChunkPaths(const std::filesystem::path&);
+
+// Load/validate/annotate or build/annotate/publish exactly one chunk. Caller owns
+// unique-key scheduling and the output-directory writer lock. No RAM retention.
+// outcome is "built", "annotated", or "reused" (no output rewrite).
+[[nodiscard]] std::shared_ptr<FiberChunkPaths> prepareFiberChunkPaths(
+    const std::array<int,3>&,const FiberPredictionSource&,const FiberTraceConfig&,
+    const vc::lasagna::NormalSampler&,const FiberChunkTraceConfig&,double,
+    const std::filesystem::path&,const std::string& sourceIdentity,std::string& outcome,
+    const FiberChunkParallelFor& = {},const FiberChunkWait& = {});
 
 // One cache instance/output directory belongs to one immutable prediction and
 // normal dataset identity. Source identity is supplied by the caller; geometry

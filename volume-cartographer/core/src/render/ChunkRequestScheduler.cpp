@@ -938,7 +938,15 @@ struct ChunkRequestScheduler::Impl {
             item.reset();
             activeCount.fetch_sub(1, std::memory_order_release);
             std::lock_guard lock(mutex);
-            cv.notify_all();
+            // Ordinary completion frees one admission slot, and this worker
+            // also loops back to select work. Waking the entire read/decode
+            // pool for every chunk causes a mutex/futex herd at large pools.
+            // Maintenance head transitions can change effective admission by
+            // more than one slot, so preserve their broadcast behavior.
+            if constexpr (ReserveMaintenanceCapacity)
+                cv.notify_all();
+            else
+                cv.notify_one();
             if (gui.empty() && foreground.empty() && background.empty() && maintenance.empty() &&
                 activeCount.load(std::memory_order_acquire) == 0) {
                 idleCv.notify_all();

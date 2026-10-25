@@ -298,7 +298,7 @@ vc_add_test(NAME test_fiber_embedding_scoring LIBS doctest::doctest vc_fiber_tra
 vc_add_test(NAME test_fiber_width_scoring LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_reverse_consistency LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_reference_replay_core LIBS doctest::doctest vc_fiber_tracer)
-vc_add_test(NAME test_fiber_chunk_trace LIBS doctest::doctest vc_fiber_tracer)
+vc_add_test(NAME test_fiber_chunk_trace LIBS doctest::doctest vc_fiber_tracer zstd::libzstd)
 vc_add_test(NAME test_prediction_pooling LIBS doctest::doctest vc_lasagna)
 vc_add_test(NAME test_fiber_live_readiness LIBS doctest::doctest vc_fiber_tracer)
 vc_add_test(NAME test_fiber_case_queue LIBS doctest::doctest vc_fiber_tracer)
@@ -755,6 +755,8 @@ if(VC_RUN_BENCHES)
 endif()
 
 add_executable(bench_fiber_intersections bench_fiber_intersections.cpp)
+add_executable(bench_fiber_seed_grid bench_fiber_seed_grid.cpp)
+target_link_libraries(bench_fiber_seed_grid PRIVATE vc_fiber_tracer)
 target_link_libraries(bench_fiber_intersections PRIVATE vc_atlas vc_lasagna nlohmann_json::nlohmann_json)
 vc_register_test_target(bench_fiber_intersections)
 if(VC_RUN_BENCHES)
@@ -1031,6 +1033,10 @@ vc_add_test(NAME test_vcdataset)
 vc_add_test(NAME test_zarr)
 
 vc_add_test(NAME test_chunk_cache)
+vc_add_test(NAME test_channel_read_hints)
+vc_add_test(NAME test_chunk_load_queue)
+add_executable(bench_chunk_cache_contention bench_chunk_cache_contention.cpp)
+target_link_libraries(bench_chunk_cache_contention PRIVATE vc_core)
 
 vc_add_test(NAME test_volume_extras)
 

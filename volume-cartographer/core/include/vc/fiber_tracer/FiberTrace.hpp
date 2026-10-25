@@ -378,6 +378,12 @@ struct FiberPredictionFieldOptions {
 
 class FiberPredictionField final : public FiberPredictionSource {
 public:
+    // Canonical single-option region loader metadata. Await publication once,
+    // then read the returned presence/nx/ny/width bindings into owned tensors.
+    // The field remains alive while bindings are used. Width multiplier converts
+    // stored units into the same working units as sampleWidths().
+    [[nodiscard]] std::pair<std::array<vc::lasagna::LasagnaChannelBinding,4>,double>
+        chunkRegionChannels(const cv::Vec3d& lo,const cv::Vec3d& hi) const;
     // Configure before concurrent sampling; empty keeps offline behavior.
     // The gate may be called concurrently and must not sample this field itself.
     void setReadinessGate(FiberPredictionReadinessGate gate);
@@ -456,6 +462,9 @@ private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+[[nodiscard]] FiberPredictionSampleOption materializeFiberScalarPrediction(
+    double rawPresence,const cv::Vec3d& direction,const cv::Vec3d& reference);
 
 struct FiberTraceSegmentRequest {
     std::vector<cv::Vec3d> referenceLine;

@@ -195,6 +195,8 @@ T typedFillValue(vc::render::IChunkedArray& array)
     const double fill = array.fillValue();
     if constexpr (std::is_same_v<T, uint8_t>) {
         return static_cast<uint8_t>(std::clamp(fill, 0.0, 255.0));
+    } else if constexpr (std::is_same_v<T, float>) {
+        return static_cast<float>(fill);
     } else {
         return static_cast<uint16_t>(std::clamp(fill, 0.0, 65535.0));
     }
@@ -210,7 +212,7 @@ template <typename T>
 void readFromChunkedArrayZYX(Array3D<T>& out,
                                    const std::array<int, 3>& offsetZYX,
                                    vc::render::IChunkedArray& array,
-                                   int level)
+                                   int level, const vc::render::ChunkRequestContext& request = {})
 {
     using vc::render::ChunkKey;
     using vc::render::ChunkStatus;
@@ -218,7 +220,7 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
 
     const ChunkDtype expectedDtype = std::is_same_v<T, uint8_t>
         ? ChunkDtype::UInt8
-        : ChunkDtype::UInt16;
+        : (std::is_same_v<T, float> ? ChunkDtype::Float32 : ChunkDtype::UInt16);
     if (array.dtype() != expectedDtype) {
         throw std::runtime_error("Volume::read dtype does not match volume dtype");
     }
@@ -249,8 +251,8 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
     const int readY1 = std::min(volumeShape[1] - 1, y1);
     const int readX1 = std::min(volumeShape[2] - 1, x1);
 
+    std::vector<ChunkKey> keys;
     if (readZ0 <= readZ1 && readY0 <= readY1 && readX0 <= readX1) {
-        std::vector<ChunkKey> keys;
         const int cZ0 = readZ0 / chunkShape[0];
         const int cY0 = readY0 / chunkShape[1];
         const int cX0 = readX0 / chunkShape[2];
@@ -267,8 +269,8 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
                 }
             }
         }
-        if (!keys.empty()) {
-            array.prefetchChunks(keys, false);
+        if (!keys.empty() && !array.prefersBatchReads()) {
+            array.prefetchChunks(keys, false, 0, request);
         }
     }
 
@@ -291,82 +293,44 @@ void readFromChunkedArrayZYX(Array3D<T>& out,
         chunkReadError = error.empty() ? "chunk fetch failed" : error;
     };
 
-    #pragma omp parallel
-    {
-        struct CachedChunk {
-            int cz = std::numeric_limits<int>::min();
-            int cy = std::numeric_limits<int>::min();
-            int cx = std::numeric_limits<int>::min();
-            bool allFill = false;
-            const T* data = nullptr;
-            std::shared_ptr<const std::vector<std::byte>> bytes;
-        } cached;
-
-        auto loadChunk = [&](int cz, int cy, int cx) -> bool {
-            if (chunkReadFailed.load(std::memory_order_acquire)) {
-                return false;
+    auto plainRequest=request;plainRequest.channelHints.reset(); // expanded once for this ROI batch
+    // The opt-in queued backend admits all concurrent ROIs together. The
+    // existing backend retains its per-storage-chunk streaming copy path.
+    const auto batch=array.prefersBatchReads()?array.getChunksBlocking(keys,request):std::vector<vc::render::ChunkResult>{};
+    // Each storage chunk is acquired once, not again for every ROI row. The
+    // intersections are disjoint, so copies need no locks or per-voxel atomics.
+    // Holding the result's bytes owns only this copy operation, not a cache pin.
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (std::ptrdiff_t index = 0; index < static_cast<std::ptrdiff_t>(keys.size()); ++index) {
+        if (chunkReadFailed.load(std::memory_order_acquire))
+            continue;
+        const auto& key = keys[static_cast<size_t>(index)];
+        const auto result = array.prefersBatchReads()?batch[static_cast<size_t>(index)]:array.getChunkBlocking(level, key.iz, key.iy, key.ix,plainRequest);
+        const T* data = nullptr;
+        if (result.status == ChunkStatus::Error) {
+            recordChunkReadError(key.iz, key.iy, key.ix, result.error);
+            continue;
+        }
+        if (result.status == ChunkStatus::Data && result.bytes) {
+            const size_t needed = static_cast<size_t>(chunkShape[0]) * chunkStrideZ * sizeof(T);
+            if (result.byteOffset > result.bytes->size() || needed > result.bytes->size() - result.byteOffset) {
+                recordChunkReadError(key.iz, key.iy, key.ix, "decoded channel chunk is truncated");
+                continue;
             }
-            if (cached.cz == cz && cached.cy == cy && cached.cx == cx) {
-                return true;
-            }
-            cached = {};
-            cached.cz = cz;
-            cached.cy = cy;
-            cached.cx = cx;
-
-            const auto result = array.getChunkBlocking(level, cz, cy, cx);
-            if (result.status == ChunkStatus::AllFill) {
-                cached.allFill = true;
-            } else if (result.status == ChunkStatus::Data && result.bytes) {
-                cached.bytes = result.bytes;
-                cached.data = reinterpret_cast<const T*>(cached.bytes->data());
-            } else if (result.status == ChunkStatus::Error) {
-                recordChunkReadError(cz, cy, cx, result.error);
-                return false;
-            } else {
-                cached.allFill = true;
-            }
-            return true;
-        };
-
-        #pragma omp for schedule(dynamic, 4) collapse(2)
-        for (size_t z = 0; z < outShape[0]; ++z) {
-            for (size_t y = 0; y < outShape[1]; ++y) {
-                if (chunkReadFailed.load(std::memory_order_acquire)) {
-                    continue;
-                }
-                const int iz = z0 + static_cast<int>(z);
-                const int iy = y0 + static_cast<int>(y);
-                if (iz < 0 || iz >= volumeShape[0] ||
-                    iy < 0 || iy >= volumeShape[1]) {
-                    continue;
-                }
-                const int cz = iz / chunkShape[0];
-                const int cy = iy / chunkShape[1];
-                const int lz = iz - cz * chunkShape[0];
-                const int ly = iy - cy * chunkShape[1];
-                for (size_t x = 0; x < outShape[2]; ++x) {
-                    if (chunkReadFailed.load(std::memory_order_acquire)) {
-                        break;
-                    }
-                    const int ix = x0 + static_cast<int>(x);
-                    if (ix < 0 || ix >= volumeShape[2]) {
-                        continue;
-                    }
-                    const int cx = ix / chunkShape[2];
-                    const int lx = ix - cx * chunkShape[2];
-                    if (!loadChunk(cz, cy, cx)) {
-                        break;
-                    }
-                    if (cached.allFill || !cached.data) {
-                        out(z, y, x) = fill;
-                    } else {
-                        const size_t offset = static_cast<size_t>(lz) * chunkStrideZ +
-                                              static_cast<size_t>(ly) * chunkStrideY +
-                                              static_cast<size_t>(lx);
-                        out(z, y, x) = cached.data[offset];
-                    }
-                }
+            data = reinterpret_cast<const T*>(result.bytes->data() + result.byteOffset);
+        }
+        const int chunkZ = key.iz * chunkShape[0];
+        const int chunkY = key.iy * chunkShape[1];
+        const int chunkX = key.ix * chunkShape[2];
+        const int endZ = std::min(readZ1 + 1, chunkZ + chunkShape[0]);
+        const int endY = std::min(readY1 + 1, chunkY + chunkShape[1]);
+        const int endX = std::min(readX1 + 1, chunkX + chunkShape[2]);
+        for (int z = std::max(readZ0, chunkZ); z < endZ; ++z) {
+            for (int y = std::max(readY0, chunkY); y < endY; ++y) {
+                const size_t row = static_cast<size_t>(z - chunkZ) * chunkStrideZ +
+                                   static_cast<size_t>(y - chunkY) * chunkStrideY;
+                for (int x = std::max(readX0, chunkX); x < endX; ++x)
+                    out(z - z0, y - y0, x - x0) = data ? data[row + x - chunkX] : fill;
             }
         }
     }
@@ -1870,17 +1834,23 @@ bool Volume::readZYX(Array3D<uint16_t>& out,
 void Volume::readZYX(Array3D<uint8_t>& out,
                            const std::array<int, 3>& offsetZYX,
                            vc::render::IChunkedArray& array,
-                           int level)
+                           int level, const vc::render::ChunkRequestContext& request)
 {
-    readFromChunkedArrayZYX(out, offsetZYX, array, level);
+    readFromChunkedArrayZYX(out, offsetZYX, array, level,request);
 }
 
 void Volume::readZYX(Array3D<uint16_t>& out,
                            const std::array<int, 3>& offsetZYX,
                            vc::render::IChunkedArray& array,
-                           int level)
+                           int level, const vc::render::ChunkRequestContext& request)
 {
-    readFromChunkedArrayZYX(out, offsetZYX, array, level);
+    readFromChunkedArrayZYX(out, offsetZYX, array, level,request);
+}
+
+void Volume::readZYX(Array3D<float>& out, const std::array<int,3>& offsetZYX,
+                    vc::render::IChunkedArray& array, int level,const vc::render::ChunkRequestContext& request)
+{
+    readFromChunkedArrayZYX(out, offsetZYX, array, level,request);
 }
 
 bool Volume::readXYZ(Array3D<uint8_t>& out,

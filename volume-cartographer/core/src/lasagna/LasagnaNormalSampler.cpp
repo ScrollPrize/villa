@@ -137,6 +137,7 @@ void validateLasagnaNormalDatasetStructure(const LasagnaDataset& dataset)
 class LasagnaNormalSampler::Impl {
 public:
     bool masksInvalidCorners() const noexcept { return maskInvalidCorners_; }
+    std::array<LasagnaChannelBinding,3> regionChannels() const {return {gradMag_,nx_,ny_};}
     Impl(const LasagnaDataset& dataset)
         : gradMagDecodeScale_(
               requiredPositiveManifestDouble(dataset.manifest(), "grad_mag_encode_scale") /
@@ -1025,6 +1026,11 @@ LasagnaNormalSampler::LasagnaNormalSampler(
 }
 
 LasagnaNormalSampler::~LasagnaNormalSampler() = default;
+
+std::array<LasagnaChannelBinding,3> LasagnaNormalSampler::regionChannels() const
+{
+    return impl_->regionChannels();
+}
 
 LasagnaNormalSampler::LasagnaNormalSampler(
     const LasagnaDataset& dataset, LasagnaNormalSamplerOptions options)

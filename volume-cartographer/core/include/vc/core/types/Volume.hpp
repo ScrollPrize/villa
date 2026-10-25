@@ -187,11 +187,16 @@ public:
     static void readZYX(Array3D<uint8_t>& out,
                         const std::array<int, 3>& offsetZYX,
                         vc::render::IChunkedArray& array,
-                        int level = 0);
+                        int level = 0, const vc::render::ChunkRequestContext& request = {});
     static void readZYX(Array3D<uint16_t>& out,
                         const std::array<int, 3>& offsetZYX,
                         vc::render::IChunkedArray& array,
-                        int level = 0);
+                        int level = 0, const vc::render::ChunkRequestContext& request = {});
+    // Float scalar channels, preserving physical values and fill value.
+    static void readZYX(Array3D<float>& out,
+                        const std::array<int, 3>& offsetZYX,
+                        vc::render::IChunkedArray& array,
+                        int level = 0, const vc::render::ChunkRequestContext& request = {});
 
     // UI/coordinate-order convenience:
     //   offset = [x, y, z], shape = [x, y, z].

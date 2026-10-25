@@ -19,6 +19,8 @@ struct FiberEvaluationCase {
 
 struct FiberEvaluationStatus {
     size_t total = 0, completed = 0;
+    size_t built = 0, reused = 0, annotated = 0;
+    bool chunkVolume = false;
     bool started = false, finished = false, cancelled = false;
     std::string error;
 };
@@ -42,6 +44,14 @@ private:
     FiberEvaluationStatus status_;
     FiberCaseQueue* queue_ = nullptr; // protected by mutex_, borrowed during run
 };
+
+// Continuous unique-key construction using the same cooperative scheduler as
+// replay. Only active jobs own geometry; output files are the resume state.
+void prepareFiberChunkVolume(const FiberPredictionSource&,const FiberTraceConfig&,
+    double,const vc::lasagna::NormalSampler&,const FiberChunkTraceConfig&,
+    const std::filesystem::path&,const std::string& sourceIdentity,
+    const std::vector<std::array<int,3>>&,FiberEvaluationControl&,
+    size_t workers=4,size_t contextsPerWorker=8);
 
 // Ordered, all-or-error results. All admitted jobs are joined before throwing.
 // References/configs are copied before work starts. Dataset and cache lifetimes

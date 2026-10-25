@@ -1307,6 +1307,18 @@ class ZarrChannelView final : public IChunkedArray {
         return result;
     }
 public:
+    const std::shared_ptr<ChunkCache>& physicalSource() const {return source_;}
+    bool prefersBatchReads() const noexcept override {return source_->prefersBatchReads();}
+    std::vector<ChunkResult> getChunksBlocking(const std::vector<ChunkKey>& keys,const ChunkRequestContext& request = {}) override {
+        if(request.channelHints)request.channelHints->prefetch(*this,keys,-1024,request);
+        auto plain=request;plain.channelHints.reset();auto results=source_->getChunksBlocking(keys,plain);
+        for(auto& result:results)result=view(std::move(result));
+        return results;
+    }
+    const void* physicalCacheIdentity() const noexcept override {return source_->physicalCacheIdentity();}
+    std::shared_ptr<IChunkedArray> inService(const std::shared_ptr<ChunkCacheService>& service) const {
+        auto copy=std::make_shared<ZarrChannelView>(*this);copy->source_=source_->inService(service);return copy;
+    }
     ZarrChannelView(std::shared_ptr<ChunkCache> source, const utils::ZarrMetadata& meta, std::size_t channel)
         : source_(std::move(source)),
           shape_(toArray3({meta.shape[1], meta.shape[2], meta.shape[3]}, "shape")),
@@ -1319,12 +1331,21 @@ public:
     double fillValue() const override { return source_->fillValue(); }
     LevelTransform levelTransform(int level) const override { return source_->levelTransform(level); }
     ChunkResult tryGetChunk(int l,int z,int y,int x) override { return view(source_->tryGetChunk(l,z,y,x)); }
-    ChunkResult tryGetChunk(int l,int z,int y,int x,const ChunkRequestContext& r) override { return view(source_->tryGetChunk(l,z,y,x,r)); }
+    ChunkResult tryGetChunk(int l,int z,int y,int x,const ChunkRequestContext& r) override {
+        if(r.channelHints)r.channelHints->prefetch(*this,{{l,z,y,x}},0,r);
+        auto plain=r;plain.channelHints.reset();return view(source_->tryGetChunk(l,z,y,x,plain));
+    }
     ChunkResult getChunkIfCached(int l,int z,int y,int x) override { return view(source_->getChunkIfCached(l,z,y,x)); }
     ChunkResult getChunkBlocking(int l,int z,int y,int x) override { return view(source_->getChunkBlocking(l,z,y,x)); }
-    ChunkResult getChunkBlocking(int l,int z,int y,int x,const ChunkRequestContext& r) override { return view(source_->getChunkBlocking(l,z,y,x,r)); }
+    ChunkResult getChunkBlocking(int l,int z,int y,int x,const ChunkRequestContext& r) override {
+        if(r.channelHints)r.channelHints->prefetch(*this,{{l,z,y,x}},-1024,r);
+        auto plain=r;plain.channelHints.reset();return view(source_->getChunkBlocking(l,z,y,x,plain));
+    }
     void prefetchChunks(const std::vector<ChunkKey>& k,bool wait,int priority) override { source_->prefetchChunks(k,wait,priority); }
-    void prefetchChunks(const std::vector<ChunkKey>& k,bool wait,int priority,const ChunkRequestContext& r) override { source_->prefetchChunks(k,wait,priority,r); }
+    void prefetchChunks(const std::vector<ChunkKey>& k,bool wait,int priority,const ChunkRequestContext& r) override {
+        if(r.channelHints)r.channelHints->prefetch(*this,k,priority,r);
+        auto plain=r;plain.channelHints.reset();source_->prefetchChunks(k,wait,priority,plain);
+    }
     ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback cb) override { return source_->addChunkReadyListener(std::move(cb)); }
     void removeChunkReadyListener(ChunkReadyCallbackId id) override { source_->removeChunkReadyListener(id); }
 };
@@ -1342,6 +1363,26 @@ std::shared_ptr<IChunkedArray> acquireProcessZarrChannel(
         throw std::invalid_argument("invalid packed Zarr channel");
     auto source = acquireProcessChunkCache(std::move(identity), array, std::move(options));
     return std::make_shared<ZarrChannelView>(std::move(source), meta, channel);
+}
+
+std::shared_ptr<IChunkedArray> rebindChunkCache(const std::shared_ptr<IChunkedArray>& array,
+    const std::shared_ptr<ChunkCacheService>& partition)
+{
+    if(auto channel=std::dynamic_pointer_cast<ZarrChannelView>(array))return channel->inService(partition);
+    if(auto cache=std::dynamic_pointer_cast<ChunkCache>(array))return cache->inService(partition);
+    throw std::invalid_argument("array does not support decoded-cache partitioning");
+}
+
+std::shared_ptr<ChunkCacheService> threadLocalDecodedPartition(
+    const std::shared_ptr<ChunkCacheService>& parent,std::size_t bytes)
+{
+    if(!parent||!bytes)throw std::invalid_argument("worker cache requires parent and budget");
+    struct Local {std::weak_ptr<ChunkCacheService> parent;std::shared_ptr<ChunkCacheService> partition;std::size_t bytes=0;};
+    static thread_local Local local;
+    if(local.parent.lock()!=parent||local.bytes!=bytes){
+        local.partition=parent->createDecodedPartition(bytes);local.parent=parent;local.bytes=bytes;
+    }
+    return local.partition;
 }
 
 } // namespace vc::render

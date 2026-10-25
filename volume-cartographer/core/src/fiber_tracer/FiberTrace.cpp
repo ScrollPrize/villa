@@ -3805,7 +3805,7 @@ public:
         return bindings;
     }
 
-    std::shared_ptr<vc::render::PinnedChunkRegion> pinRegion(
+    void awaitRegion(
         const cv::Vec3d& lo, const cv::Vec3d& hi) const
     {
         for (int axis = 0; axis < 3; ++axis)
@@ -3825,10 +3825,26 @@ public:
         });
         dependencies.erase(std::unique(dependencies.begin(), dependencies.end()), dependencies.end());
         if (readinessGate_ && !dependencies.empty()) readinessGate_(dependencies);
+    }
+
+    std::shared_ptr<vc::render::PinnedChunkRegion> pinRegion(
+        const cv::Vec3d& lo, const cv::Vec3d& hi) const
+    {
+        awaitRegion(lo,hi);
+        const auto bindings=regionBindings();
         auto region = std::make_shared<vc::render::PinnedChunkRegion>();
         for (const auto* binding : bindings) vc::lasagna::pinLasagnaRegion(*region, *binding, lo, hi);
         region->markReady(this);
         return region;
+    }
+
+    std::pair<std::array<vc::lasagna::LasagnaChannelBinding,4>,double>
+    chunkRegionChannels(const cv::Vec3d& lo,const cv::Vec3d& hi) const
+    {
+        if(options_.size()!=1 || width_.size()!=1 || !embeddings_.empty())
+            throw std::invalid_argument("dense chunk tensor requires one prediction option, width, no embeddings");
+        awaitRegion(lo,hi);
+        return {{{options_[0].presence,options_[0].nx,options_[0].ny,width_[0]}},widthToWorking_};
     }
 
     void requirePinnedOwner(const vc::render::PinnedChunkRegion& region) const
@@ -4827,11 +4843,7 @@ public:
                 out.options.push_back({});
                 continue;
             }
-            out.options.push_back({
-                alignTo(*direction, referenceDirection),
-                static_cast<float>(clamp01(*rawPresence / 255.0)),
-                true,
-            });
+            out.options.push_back(materializeFiberScalarPrediction(*rawPresence,*direction,referenceDirection));
         }
         return out;
     }
@@ -5106,6 +5118,18 @@ void FiberPredictionField::sampleWidths(const std::vector<cv::Vec3f>& points,
 {
     impl_->awaitPoints(points);
     impl_->sampleWidths(points, widths);
+}
+
+std::pair<std::array<vc::lasagna::LasagnaChannelBinding,4>,double>
+FiberPredictionField::chunkRegionChannels(const cv::Vec3d& lo,const cv::Vec3d& hi) const
+{
+    return impl_->chunkRegionChannels(lo,hi);
+}
+
+FiberPredictionSampleOption materializeFiberScalarPrediction(double rawPresence,
+    const cv::Vec3d& direction,const cv::Vec3d& reference)
+{
+    return {alignTo(direction,reference),static_cast<float>(clamp01(rawPresence/255.0)),true};
 }
 
 void FiberPredictionField::sampleEmbeddings(const std::vector<cv::Vec3f>& points,

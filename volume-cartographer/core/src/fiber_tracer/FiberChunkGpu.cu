@@ -2,6 +2,7 @@
 // One block owns each seed half; fields, search state and paths stay on device.
 #include <cuda_runtime.h>
 #include "vc/fiber_tracer/detail/PortableTraceMath.hpp"
+#include "vc/fiber_tracer/detail/TraceDifferential.hpp"
 #include "vc/core/util/PortableTensor.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
@@ -39,13 +40,29 @@ struct Params {
     float step=0,prune=0,cumulative=0;
     bool maskNormals=true,cosWidth=true;
     int refineIterations=0,refineWindow=0;
+    bool analyticRefinement=false;
+    bool rolling=false;
     float refineEpsilon=.25f,refineStep=1,refineCap=8;
     FiberLocalSmoothnessConfig smooth;
 };
 struct Sample {V dir,normal;float presence=0,width=0;bool valid=false;};
+struct SampleJacobian {V presence,width,dir[3],normal[3];};
 struct Fields {const unsigned char* bytes;const float* widths;const float* tensors;int* error;};
-template<bool ScalarsOnly=false>
-VC_TRACE_HD Sample sample(Fields f,Params p,V q,V hint) {
+VC_TRACE_HD V tensorProduct(const float* t,V v){return {t[0]*v.x+t[1]*v.y+t[2]*v.z,t[1]*v.x+t[3]*v.y+t[4]*v.z,t[2]*v.x+t[4]*v.y+t[5]*v.z};}
+VC_TRACE_HD V tensorAxisDerivative(const float* t,const float* dt,V v) {
+    // Piecewise derivative of the principal symmetric eigenvector. At a tied
+    // eigenvalue / the scalar solver's diagonal fallback, choose zero.
+    if(v.dot(v)<1e-12f || t[1]*t[1]+t[2]*t[2]+t[4]*t[4]<=1e-12f)return {};
+    auto basis=portable::traceBasis(v);V a=basis[0],b=basis[1];
+    float lambda=v.dot(tensorProduct(t,v));
+    float aa=lambda-a.dot(tensorProduct(t,a)),bb=lambda-b.dot(tensorProduct(t,b)),ab=-a.dot(tensorProduct(t,b));
+    float det=aa*bb-ab*ab;
+    if(!(aa>1e-6f&&bb>1e-6f&&det>1e-12f))return {};
+    V rhs=tensorProduct(dt,v);float ra=a.dot(rhs),rb=b.dot(rhs);
+    return a*((bb*ra-ab*rb)/det)+b*((aa*rb-ab*ra)/det);
+}
+template<bool ScalarsOnly=false,bool Differentiate=false>
+VC_TRACE_HD Sample sample(Fields f,const Params& p,V q,V hint,SampleJacobian* jac=nullptr) {
     int b[3];float frac[3];double df[3];
     for(int a=0;a<3;++a) {
         double scaled=double(q[a])/p.spacing;int origin=int(std::floor(scaled));
@@ -58,6 +75,7 @@ VC_TRACE_HD Sample sample(Fields f,Params p,V q,V hint) {
         }
     }
     float tensor[2][6]={},presence=0,validNormal=0;double ws[8],weighted=0,denom=0;
+    float dt[2][3][6]={};V dp{},dweighted{},ddenom{};
     bool all=true;
     for(int k=0;k<8;++k) {
         size_t i=(size_t(b[2]+((k>>2)&1))*p.shape[1]+b[1]+((k>>1)&1))*p.shape[0]+b[0]+(k&1);
@@ -68,10 +86,21 @@ VC_TRACE_HD Sample sample(Fields f,Params p,V q,V hint) {
         ws[k]=f.widths[i];all&=bytes[0]>0;
         double dw=((k&1)?df[0]:1-df[0])*((k&2)?df[1]:1-df[1])*((k&4)?df[2]:1-df[2]);
         if(bytes[0]&&dw>0){weighted+=dw*ws[k];denom+=dw;}
+        V derivative;
+        if constexpr(Differentiate) {
+            for(int a=0;a<3;++a){float v=((k>>a)&1)?1.f:-1.f;
+                for(int b=0;b<3;++b)if(a!=b)v*=((k>>b)&1)?frac[b]:1-frac[b];
+                derivative[a]=v/float(p.spacing);
+            }
+            dp=dp+derivative*(float(bytes[0])/255.f);
+            if(bytes[0]){dweighted=dweighted+derivative*float(ws[k]);ddenom=ddenom+derivative;}
+        }
         if constexpr(!ScalarsOnly) for(int axis=0;axis<2;++axis) {
             float weight=(axis==0?!bytes[0]:(p.maskNormals&&!bytes[3]))?0:w;
             const float* t=f.tensors+6*((unsigned(bytes[axis*3+1])<<8)|bytes[axis*3+2]);
             for(int j=0;j<6;++j)tensor[axis][j]=std::fma(weight,t[j],tensor[axis][j]);
+            if constexpr(Differentiate)if(axis==0?bytes[0]>0:(!p.maskNormals||bytes[3]>0))
+                for(int a=0;a<3;++a)for(int j=0;j<6;++j)dt[axis][a][j]+=derivative[a]*t[j];
         }
     }
     Sample s;s.presence=std::clamp(presence/255.f,0.f,1.f);
@@ -88,21 +117,44 @@ VC_TRACE_HD Sample sample(Fields f,Params p,V q,V hint) {
         double c=ws[4]*(1-df[0])+ws[5]*df[0],d=ws[6]*(1-df[0])+ws[7]*df[0];
         s.width=float((a*(1-df[1])+b0*df[1])*(1-df[2])+(c*(1-df[1])+d*df[1])*df[2]);
     } else s.width=denom>0?float(weighted/denom):0;
+    if constexpr(Differentiate) {
+        jac->presence=presence>0&&presence<255?dp:V{};
+        jac->width=denom>0?(dweighted-ddenom*s.width)/float(denom):V{};
+        for(int a=0;a<3;++a){jac->dir[a]=tensorAxisDerivative(tensor[0],dt[0][a],s.dir);jac->normal[a]=tensorAxisDerivative(tensor[1],dt[1][a],s.normal);}
+    }
     s.valid=s.dir.dot(s.dir)>1e-12f;return s;
 }
 struct Node {V point;int previous=-1,depth=0;float modulated=0;double scoringWidth=0;
-    V planeOrigin,planeNormal;bool planeFrozen=false;};
-struct State {V point,previous,current,history;float loss=0,modulated=0;int node=0,historySamples=0,original=0;bool valid=true,presenceRejected=false;};
+    V planeOrigin,planeNormal;bool planeFrozen=false;V history;float prefixLoss=0;};
+struct State {V point,previous,current,history;float loss=0,modulated=0;int node=0,historySamples=0,original=0;bool valid=true,presenceRejected=false;
+    double widthSum=0;int widthCount=0,source=0;};
 struct Seed {V point,direction;};
-struct Output {V points[MAX_STEPS+1];float scores[MAX_STEPS+1];double widths[MAX_STEPS+1];
+// Diagnostics are compiled only into the standalone benchmark, never the
+// production library. They observe decisions without changing acceptance.
+#ifndef VC_CHUNK_GPU_LIBRARY
+struct RefinementAudit {
+    int calls=0,callsImproved=0,invalidInitial=0,attempts=0,invalidTrials=0,nonDecreasingTrials=0;
+    int exhausted=0,noProposal=0,beamChecks=0,beamWorsened=0,backtracks[8]={};
+    int zeroGradient=0,nonfiniteGradient=0,invalidCurrent=0,noMovement=0,capTrials=0;
+    double initialObjective=0,finalObjective=0,acceptedBefore=0,acceptedAfter=0;
+    double beamBefore=0,beamAfter=0;
+    float maxObjectiveMismatch=0,minAcceptedGain=INFINITY,maxAcceptedGain=0,maxBeamIncrease=0;
+};
+#endif
+struct RefinementStats {int refinementCommits=0,refinementAccepted=0,refinedFrontiers=0;float refinementGain=0,maxPlaneError=0,maxMovement=0;
+#ifndef VC_CHUNK_GPU_LIBRARY
+    RefinementAudit audit;
+#endif
+};
+struct Output:RefinementStats {V points[MAX_STEPS+1];float scores[MAX_STEPS+1];double widths[MAX_STEPS+1];
     V rejected;float rejectedScore=0;double rejectedWidth=0;bool hasRejected=false;
     int count=0,reason=0;unsigned long long candidates=0,scored=0,boundViolations=0;
-    int refinementCommits=0,refinementAccepted=0,refinedFrontiers=0;float refinementGain=0,maxPlaneError=0,maxMovement=0;};
+};
 // Reason: 0 distance, 1 cutoff, 2 boundary, 3 no candidates, 4 invalid width,
 // 5 device capacity/field error. Never silently truncate at an implementation cap.
-VC_TRACE_HD bool outside(V q,Params p){for(int a=0;a<3;++a)if(q[a]<p.lo[a]||q[a]>=p.hi[a])return true;return false;}
+VC_TRACE_HD bool outside(V q,const Params& p){for(int a=0;a<3;++a)if(q[a]<p.lo[a]||q[a]>=p.hi[a])return true;return false;}
 VC_TRACE_HD bool better(const State& a,const State& b){return a.loss<b.loss||(a.loss==b.loss&&a.original<b.original);}
-VC_TRACE_HD State scoreAtPoint(Fields fields,Params p,const State& parent,V point,V direction,double widthMean,int original,bool cutoff=true) {
+VC_TRACE_HD State scoreAtPoint(Fields fields,const Params& p,const State& parent,V point,V direction,double widthMean,int original,bool cutoff=true) {
     auto s=sample(fields,p,point,direction);
     State out;out.valid=s.valid;out.loss=INFINITY;out.original=original;
     if(!s.valid)return out;
@@ -120,19 +172,23 @@ VC_TRACE_HD State scoreAtPoint(Fields fields,Params p,const State& parent,V poin
     if (cutoff && p.cutoff>0 && !(out.modulated >= p.cutoff)) {out.valid=false;out.presenceRejected=true;}
     out.history=parent.historySamples<=0||p.historySteps<=1?unit(direction):unit(unit(direction)+unit(parent.history)*float(std::clamp(parent.historySamples,1,p.historySteps-1)),unit(direction));
     out.historySamples=std::min(parent.historySamples+1,std::max(1,p.historySteps));
-    out.node=parent.node;return out;
+    out.node=parent.node;out.source=parent.source;
+    if(p.rolling){out.widthSum=parent.widthSum+s.width;out.widthCount=parent.widthCount+1;
+        out.valid&=s.width>0&&std::isfinite(s.width);}
+    return out;
 }
-VC_TRACE_HD State candidate(Fields fields,Params p,const State& parent,float u,float v,double widthMean,int original) {
+VC_TRACE_HD State candidate(Fields fields,const Params& p,const State& parent,float u,float v,double widthMean,int original) {
     V forward=unit(parent.current,{1,0,0});
     auto basis=portable::traceBasis(forward);V b0=basis[0],b1=basis[1];
     V direction=unit(forward+b0*u+b1*v,forward),point=parent.point+direction*p.step;
+    if(p.rolling)widthMean=parent.widthSum/parent.widthCount;
     return scoreAtPoint(fields,p,parent,point,direction,widthMean,original);
 }
 
 // All probes check the interpolation footprint before sampling: a rejected
 // optimization trial is not an inference-cache miss.
-VC_TRACE_HD bool inField(Params p,V q) {
-    for(int a=0;a<3;++a){int b=int(std::floor(double(q[a])/p.spacing))-p.origin[a];if(b<0||b+1>=p.shape[a])return false;}
+VC_TRACE_HD bool inField(const Params& p,V q) {
+    for(int a=0;a<3;++a){if(!std::isfinite(q[a]))return false;int b=int(std::floor(double(q[a])/p.spacing))-p.origin[a];if(b<0||b+1>=p.shape[a])return false;}
     return true;
 }
 VC_TRACE_HD State initialState(Seed seed) {
@@ -140,7 +196,7 @@ VC_TRACE_HD State initialState(Seed seed) {
 }
 // Full history is replayed even when only the final N points can move. The
 // optional single-point perturbation avoids private copies of the prefix.
-VC_TRACE_HD State replayPoints(Fields f,Params p,Seed seed,const V* points,int n,double width,
+VC_TRACE_HD State replayPoints(Fields f,const Params& p,Seed seed,const V* points,int n,double width,
                               int perturb=-1,V delta={},bool cutoff=true) {
     State s=initialState(seed);
     for(int i=1;i<n;++i){V q=points[i]+(i==perturb?delta:V{});
@@ -152,7 +208,11 @@ VC_TRACE_HD State replayPoints(Fields f,Params p,Seed seed,const V* points,int n
 struct RefineScratch {
     V points[MAX_STEPS+1],trial[MAX_STEPS+1],gradient[MAX_STEPS+1];
     int ids[MAX_STEPS+1],n,first,accepted;
+    V histories[MAX_STEPS+1],adjacent[3][MAX_STEPS+1],historyGradient[MAX_STEPS+1];
+    float losses[MAX_STEPS+1],widths[MAX_STEPS+1],oldWidths[MAX_STEPS+1];
+    int valid[MAX_STEPS+1];float before,largest;bool proposal;
 };
+#include "FiberChunkRefinement.cuh"
 VC_TRACE_HD void freezePlanes(Node* nodes,const int* pending,int n) {
     // Freeze the whole common-prefix batch before any predecessor is moved.
     for(int i=0;i<n;++i){auto& node=nodes[pending[i]];if(!node.planeFrozen){
@@ -160,7 +220,7 @@ VC_TRACE_HD void freezePlanes(Node* nodes,const int* pending,int n) {
         node.planeFrozen=true;
     }}
 }
-VC_TRACE_HD void refinementGradient(Fields f,Params p,Seed seed,Node* nodes,double widthMean,RefineScratch& work,int i) {
+VC_TRACE_HD void refinementGradient(Fields f,const Params& p,Seed seed,Node* nodes,double widthMean,RefineScratch& work,int i) {
     work.gradient[i]={};auto& node=nodes[work.ids[i]];
     if(outside(node.point,p))return;
     auto axes=portable::traceBasis(node.planeNormal);
@@ -170,8 +230,8 @@ VC_TRACE_HD void refinementGradient(Fields f,Params p,Seed seed,Node* nodes,doub
         if(std::isfinite(plus)&&std::isfinite(minus))work.gradient[i]=work.gradient[i]+axes[axis]*((plus-minus)/(2*p.refineEpsilon));
     }
 }
-VC_TRACE_HD void refinementLineSearch(Fields f,Params p,Seed seed,Node* nodes,
-    double& widthSum,double& widthMean,int& widthCount,RefineScratch& work,Output& output) {
+VC_TRACE_HD void refinementLineSearch(Fields f,const Params& p,Seed seed,Node* nodes,
+    double& widthSum,double& widthMean,int& widthCount,RefineScratch& work,RefinementStats& output) {
             work.accepted=0;
             auto before=replayPoints(f,p,seed,work.points,work.n,widthMean);
             float largest=0;for(int i=work.first;i<work.n;++i)largest=fmaxf(largest,std::sqrt(work.gradient[i].dot(work.gradient[i])));
@@ -207,17 +267,18 @@ VC_TRACE_HD void refinementLineSearch(Fields f,Params p,Seed seed,Node* nodes,
                 State state=initialState(seed);
                 for(int i=1;i<work.n;++i){auto& node=nodes[work.ids[i]];
                     state=scoreAtPoint(f,p,state,node.point,unit(node.point-state.point),widthMean,0);
-                    node.modulated=state.modulated;node.scoringWidth=widthMean;
+                    node.modulated=state.modulated;node.scoringWidth=widthMean;node.history=state.history;node.prefixLoss=state.loss;
                 }
                 ++output.refinementAccepted;output.refinementGain+=before.loss-after.loss;work.accepted=1;break;
             }
 }
 // Uniform block call. Gradients run in parallel over movable nodes, and each
 // trace/seed owns its state. No locks or Python processing in this path.
-__device__ void refinePrefix(Fields f,Params p,Seed seed,Node* nodes,int committed,
+__device__ void refinePrefix(Fields f,const Params& p,Seed seed,Node* nodes,int committed,
                             double& widthSum,double& widthMean,int& widthCount,
-                            RefineScratch& work,Output& output) {
+                            RefineScratch& work,RefinementStats& output) {
     if(!p.refineIterations||committed==0)return;
+    if(p.analyticRefinement){refineDirect(f,p,seed,nodes,committed,widthSum,widthMean,widthCount,work,output);return;}
     if(threadIdx.x==0){
         ++output.refinementCommits;work.n=nodes[committed].depth+1;
         for(int at=committed;at>=0;at=nodes[at].previous){int i=nodes[at].depth;work.ids[i]=at;work.points[i]=nodes[at].point;}
@@ -232,16 +293,20 @@ __device__ void refinePrefix(Fields f,Params p,Seed seed,Node* nodes,int committ
         if(!work.accepted)break;
     }
 }
-VC_TRACE_HD State rebuildState(Fields f,Params p,Seed seed,Node* nodes,State old,int committed,double widthMean) {
-    int chain[MAX_STEPS+1],n=0;for(int at=old.node;at>0;at=nodes[at].previous)chain[n++]=at;
+VC_TRACE_HD State rebuildState(Fields f,const Params& p,Seed seed,Node* nodes,State old,int committed,double widthMean) {
+    int chain[MAX_STEPS+1],n=0;for(int at=old.node;at>0&&(!p.analyticRefinement||at!=committed);at=nodes[at].previous)chain[n++]=at;
     State s=initialState(seed);
+    if(p.analyticRefinement&&committed>0){auto& node=nodes[committed];s.point=node.point;
+        s.previous=unit(node.point-nodes[node.previous].point);s.current=sample(f,p,node.point,s.previous).dir;
+        s.history=node.history;s.historySamples=std::min(node.depth,std::max(1,p.historySteps));s.loss=node.prefixLoss;
+    }
     for(int i=n-1;i>=0;--i){auto& node=nodes[chain[i]];
         double width=node.depth<=nodes[committed].depth?node.scoringWidth:widthMean;
         s=scoreAtPoint(f,p,s,node.point,unit(node.point-s.point),width,old.original);
         if(!s.valid){s.node=chain[i];return s;}
     }s.node=old.node;return s;
 }
-__device__ void commitPending(Fields f,Params p,Seed seed,Node* nodes,const int* pending,int n,
+__device__ void commitPending(Fields f,const Params& p,Seed seed,Node* nodes,const int* pending,int n,
     int& observed,int& last,int& stop,int& reason,double& widthSum,double& widthMean,int& widthCount,
     RefineScratch& scratch,Output& output) {
     __shared__ int failed;
@@ -251,7 +316,7 @@ __device__ void commitPending(Fields f,Params p,Seed seed,Node* nodes,const int*
         if(threadIdx.x==0){
             int at=pending[k];float width=sample(f,p,nodes[at].point,V{1,0,0}).width;
             if(p.refineIterations){State s;s.node=at;s=rebuildState(f,p,seed,nodes,s,observed,widthMean);
-                nodes[at].modulated=s.valid?s.modulated:-INFINITY;nodes[at].scoringWidth=widthMean;}
+                nodes[at].modulated=s.valid?s.modulated:-INFINITY;nodes[at].scoringWidth=widthMean;nodes[at].history=s.history;nodes[at].prefixLoss=s.loss;}
             if(!(width>0)){stop=1;reason=4;last=observed;failed=1;}
             else {
                 widthSum+=width;widthMean=widthSum/++widthCount;
@@ -269,7 +334,8 @@ __device__ void commitPending(Fields f,Params p,Seed seed,Node* nodes,const int*
 // Same multiplicative bound as the native scorer: replace unknown direction
 // factors with one, omit nonnegative smoothness. Width/presence math is shared
 // with the full sampler; no reduced-precision or approximate angular search.
-VC_TRACE_HD float candidateBound(Fields fields,Params p,const State& parent,float u,float v,double widthMean) {
+VC_TRACE_HD float candidateBound(Fields fields,const Params& p,const State& parent,float u,float v,double widthMean) {
+    if(p.rolling)widthMean=parent.widthSum/parent.widthCount;
     V forward=unit(parent.current,{1,0,0});auto basis=portable::traceBasis(forward);
     V direction=unit(forward+basis[0]*u+basis[1]*v,forward);
     auto s=sample<true>(fields,p,parent.point+direction*p.step,direction);
@@ -306,7 +372,7 @@ __device__ int blockBest(State* c,int best,int* warpBest) {
     return winner;
 }
 __device__ void selectCandidates(State* c,int count,State* selected,int& selectedCount,
-    int limit,float prune,bool parallel,int* indices,int* warpBest) {
+    int limit,float prune,bool parallel,int* indices,int* warpBest,bool uniqueParent=false) {
     if(threadIdx.x==0)selectedCount=0;
     __syncthreads();
     for(int j=0;j<limit;++j) {
@@ -318,6 +384,7 @@ __device__ void selectCandidates(State* c,int count,State* selected,int& selecte
             // of rescanning the selected-index list for the top32 stage.
             if(j&&!better(selected[j-1],c[i]))continue;
             bool rejected=false;
+            if(uniqueParent)for(int k=0;k<j;++k)rejected|=c[i].node==selected[k].node;
             if(prune>0)for(int k=0;k<j;++k) {
                 V delta=c[i].point-selected[k].point;
                 rejected|=delta.dot(delta)<prune*prune;
@@ -407,6 +474,9 @@ __global__ void trace(Fields fields,Params p,const Seed* seeds,const float2* off
     if(threadIdx.x==0) {
         output.count=0;output.hasRejected=false;output.candidates=0;output.scored=0;output.boundViolations=0;reason=0;stop=0;nodeCount=1;observed=0;last=0;
         output.refinementCommits=output.refinementAccepted=output.refinedFrontiers=0;output.refinementGain=output.maxPlaneError=output.maxMovement=0;
+#ifndef VC_CHUNK_GPU_LIBRARY
+        output.audit={};
+#endif
         auto seed=seeds[id];nodes[0]={seed.point,-1,0,1};
         beam[0]={};beam[0].point=seed.point;beam[0].previous=beam[0].current=beam[0].history=unit(seed.direction,{1,0,0});beamCount=1;
         widthMean=sample(fields,p,seed.point,seed.direction).width;widthSum=widthMean;widthCount=1;
@@ -420,7 +490,7 @@ __global__ void trace(Fields fields,Params p,const Seed* seeds,const float2* off
             for(int j=0;j<parentCount;++j) {
                 State& chosen=parents[j];
                 if(nodeCount>=MAX_NODES){reason=5;stop=1;break;}
-                nodes[nodeCount]={chosen.point,chosen.node,nodes[chosen.node].depth+1,chosen.modulated,widthMean};chosen.node=nodeCount++;
+                nodes[nodeCount]={chosen.point,chosen.node,nodes[chosen.node].depth+1,chosen.modulated,widthMean};nodes[nodeCount].history=chosen.history;nodes[nodeCount].prefixLoss=chosen.loss;chosen.node=nodeCount++;
             }
             if(!parentCount){stop=1;reason=output.hasRejected?1:3;}else last=parents[0].node;
         }
@@ -432,7 +502,7 @@ __global__ void trace(Fields fields,Params p,const Seed* seeds,const float2* off
             for(int j=0;j<beamCount;++j) {
                 State& chosen=beam[j];
                 if(nodeCount>=MAX_NODES){reason=5;stop=1;break;}
-                nodes[nodeCount]={chosen.point,chosen.node,nodes[chosen.node].depth+1,chosen.modulated,widthMean};chosen.node=nodeCount++;
+                nodes[nodeCount]={chosen.point,chosen.node,nodes[chosen.node].depth+1,chosen.modulated,widthMean};nodes[nodeCount].history=chosen.history;nodes[nodeCount].prefixLoss=chosen.loss;chosen.node=nodeCount++;
             }
             bool crossing=false;
             for(int k=0;k<beamCount;++k)for(int n=beam[k].node;n!=observed&&n>=0;n=nodes[n].previous)crossing|=outside(nodes[n].point,p);
@@ -483,6 +553,8 @@ __global__ void trace(Fields fields,Params p,const Seed* seeds,const float2* off
         if(reason!=1)output.hasRejected=false;
     }
 }
+#include "FiberChunkRolling.cuh"
+
 __global__ void feasibilityTests(const float* tensors,int* failures) {
     unsigned char bytes[48]={};float widths[8];for(int i=0;i<8;++i)widths[i]=12;
     Params p{};for(int a=0;a<3;++a){p.shape[a]=2;p.origin[a]=0;}p.spacing=1;p.step=.1f;
@@ -503,6 +575,7 @@ __global__ void feasibilityTests(const float* tensors,int* failures) {
 // Scenarios: all/last2/disabled/boundary/variable width. These are deliberately
 // small and deterministic, independent of any benchmark cache or GPU model.
 __global__ void refinementTests(const float* tensors,int* failures) {
+    const int scenario=blockIdx.x%5;
     __shared__ unsigned char bytes[8*8*8*6];
     __shared__ float widths[8*8*8];
     __shared__ __align__(16) unsigned char nodeMemory[5*sizeof(Node)],scratchMemory[sizeof(RefineScratch)],outMemory[sizeof(Output)];
@@ -511,29 +584,33 @@ __global__ void refinementTests(const float* tensors,int* failures) {
     __shared__ double sum,mean;__shared__ int count;
     Params p{};for(int a=0;a<3;++a){p.shape[a]=8;p.origin[a]=0;}
     p.spacing=1;p.step=1;p.lo={0,0,0};p.hi={7,7,7};p.cutoff=.05;p.tolerance=.4;
-    p.refineIterations=blockIdx.x==2?0:2;p.refineWindow=blockIdx.x==1?2:0;
+    p.analyticRefinement=blockIdx.x>=5;
+    p.refineIterations=scenario==2?0:2;p.refineWindow=scenario==1?2:0;
     p.refineEpsilon=.02f;p.refineStep=.2f;p.refineCap=.6f;
-    if(blockIdx.x==3)p.hi.x=5;
+    if(scenario==3)p.hi.x=5;
     for(int i=threadIdx.x;i<512;i+=blockDim.x){int y=(i/8)%8,z=i/64;
         bytes[6*i]=static_cast<unsigned char>(240*expf(-.15f*((y-4)*(y-4)+(z-3)*(z-3))));
         bytes[6*i+1]=255;bytes[6*i+2]=128;bytes[6*i+3]=255;bytes[6*i+4]=128;bytes[6*i+5]=128;
-        widths[i]=blockIdx.x==4?12.f+.2f*y:12.f;
+        widths[i]=scenario==4?12.f+.2f*y:12.f;
     }
     Seed seed{{1,3.3f,3},{1,0,0}};
     Fields f{bytes,widths,tensors,failures};
     if(threadIdx.x==0){
-        output={};count=5;mean=blockIdx.x==4?12.66:12;sum=mean*count;
+        output={};count=5;mean=scenario==4?12.66:12;sum=mean*count;
+        State state=initialState(seed);
         for(int i=0;i<5;++i){nodes[i]={};nodes[i].point={float(i+1),3.3f,3};nodes[i].previous=i-1;nodes[i].depth=i;
-            nodes[i].planeOrigin=nodes[i].point;nodes[i].planeNormal={1,0,0};nodes[i].planeFrozen=true;nodes[i].scoringWidth=mean;}
+            nodes[i].planeOrigin=nodes[i].point;nodes[i].planeNormal={1,0,0};nodes[i].planeFrozen=true;nodes[i].scoringWidth=mean;
+            if(i)state=scoreAtPoint(f,p,state,nodes[i].point,{1,0,0},mean,0);
+            nodes[i].history=state.history;nodes[i].prefixLoss=state.loss;}
     }__syncthreads();
     refinePrefix(f,p,seed,nodes,4,sum,mean,count,work,output);
     if(threadIdx.x==0){
         if(nodes[0].point.x!=1||nodes[0].point.y!=3.3f||nodes[0].point.z!=3)atomicAdd(failures,1);
         for(int i=1;i<5;++i){if(nodes[i].point.x!=i+1||nodes[i].planeOrigin.y!=3.3f||nodes[i].planeNormal.x!=1)atomicAdd(failures,1);}
-        if(blockIdx.x==1 && (nodes[1].point.y!=3.3f||nodes[2].point.y!=3.3f))atomicAdd(failures,1);
-        if(blockIdx.x==2){if(output.refinementAccepted||nodes[4].point.y!=3.3f)atomicAdd(failures,1);}
+        if(scenario==1 && (nodes[1].point.y!=3.3f||nodes[2].point.y!=3.3f))atomicAdd(failures,1);
+        if(scenario==2){if(output.refinementAccepted||nodes[4].point.y!=3.3f)atomicAdd(failures,1);}
         else if(!output.refinementAccepted||!(output.refinementGain>0)||output.maxPlaneError>1e-6||output.maxMovement>p.refineCap+1e-5)atomicAdd(failures,1);
-        if(blockIdx.x==3 && nodes[4].point.y!=3.3f)atomicAdd(failures,1);
+        if(scenario==3 && nodes[4].point.y!=3.3f)atomicAdd(failures,1);
         V points[5];for(int i=0;i<5;++i)points[i]=nodes[i].point;
         if(!replayPoints(f,p,seed,points,5,mean).valid)atomicAdd(failures,1);
     }
@@ -544,6 +621,7 @@ __global__ void firstStep(Fields f,Params p,const Seed* seeds,const float2* offs
     auto seed=seeds[i/p.dirs];State parent{};parent.point=seed.point;
     parent.previous=parent.current=parent.history=unit(seed.direction,{1,0,0});
     double width=sample(f,p,seed.point,seed.direction).width;
+    parent.widthSum=width;parent.widthCount=1;
     result[i]=candidate(f,p,parent,offsets[i%p.dirs].x,offsets[i%p.dirs].y,width,i%p.dirs);
 }
 // Small independent selector tests: ties/permuted IDs, no candidates, partial
@@ -579,11 +657,64 @@ __global__ void selectionTests(int* failures) {
     if(threadIdx.x==0){if(n!=expectedCount)atomicAdd(failures,1);for(int i=0;i<n;++i)if(selected[i].original!=expected[i])atomicAdd(failures,1);}
 }
 void check(cudaError_t e){if(e!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(e));}
+size_t refinementSharedBytes(const Params& p){return p.refineIterations?sizeof(RefineScratch):0;}
+void configureRefinementKernel(const Params& p){
+    if(p.refineIterations)check(cudaFuncSetAttribute(trace,cudaFuncAttributeMaxDynamicSharedMemorySize,sizeof(RefineScratch)));
+    if(p.rolling&&p.refineIterations)check(cudaFuncSetAttribute(rollingRefine,cudaFuncAttributeMaxDynamicSharedMemorySize,sizeof(RefineScratch)));
+}
+struct RollingWorkspace {
+    RollingBranch* branches=nullptr;size_t capacity=0;
+    ~RollingWorkspace(){if(branches)cudaFree(branches);}
+    void reserve(size_t n){if(n>capacity){if(branches)check(cudaFree(branches));branches=nullptr;capacity=0;
+        check(cudaMalloc(&branches,n*sizeof(RollingBranch)));capacity=n;}}
+};
+void launchTrace(Fields fields,Params p,const Seed* seeds,const float2* offsets,State* candidates,
+    Node* nodes,Output* output,int count,int threads,bool parallel,bool bounded,bool audit,RollingWorkspace& rolling) {
+    if(!p.rolling){trace<<<count,threads,refinementSharedBytes(p)>>>(fields,p,seeds,offsets,candidates,nodes,output,count,parallel,bounded,audit);check(cudaGetLastError());return;}
+    if(bounded||audit)throw std::runtime_error("rolling mode currently uses exhaustive candidate evaluation only");
+    rolling.reserve(size_t(count)*MAX_BEAM*2);
+    auto* before=rolling.branches;auto* after=before+size_t(count)*MAX_BEAM;
+    Node* oldNodes=nodes;Node* newNodes=nodes+size_t(count)*MAX_BEAM*ROLLING_PATH;
+    rollingInit<<<(count+127)/128,128>>>(fields,p,seeds,before,oldNodes,output,count);check(cudaGetLastError());
+    for(int step=0;step<p.steps;++step){
+        rollingSearch<<<count,threads>>>(fields,p,seeds,offsets,before,after,oldNodes,newNodes,candidates,output,count,step);check(cudaGetLastError());
+        if(p.refineIterations){rollingRefine<<<count*MAX_BEAM,threads,sizeof(RefineScratch)>>>(fields,p,seeds,after,newNodes,output,count);check(cudaGetLastError());}
+        rollingFinish<<<(count+127)/128,128>>>(after,newNodes,output,count);check(cudaGetLastError());
+        std::swap(before,after);std::swap(oldNodes,newNodes);
+    }
+}
+size_t traceBatchSize(const Json& j,size_t count){
+    int limit=j.value("gpu_batch_halves",8192),mib=j.value("gpu_batch_memory_mib",2048);
+    if(limit<1||limit>65536||mib<1||mib>65536)throw std::runtime_error("invalid GPU batch bounds");
+    const size_t perHalf=MAX_CAND*sizeof(State)+MAX_NODES*sizeof(Node)+sizeof(Output)+sizeof(Seed)+
+        (j.value("beam_commit_mode",std::string("shared_prefix"))=="rolling"?2*MAX_BEAM*sizeof(RollingBranch):0);
+    size_t free=0,total=0;check(cudaMemGetInfo(&free,&total));
+    size_t budget=std::min(size_t(mib)*1024*1024,free/2);
+    if(budget<perHalf)throw std::runtime_error("insufficient GPU workspace memory");
+    return std::max(size_t(1),std::min({size_t(limit),count,budget/perHalf}));
+}
 template<class T> T* upload(const std::vector<T>& v){T* p;check(cudaMalloc(&p,v.size()*sizeof(T)));check(cudaMemcpy(p,v.data(),v.size()*sizeof(T),cudaMemcpyHostToDevice));return p;}
 template<class T> std::vector<T> read(const std::filesystem::path& path){std::ifstream in(path,std::ios::binary|std::ios::ate);if(!in)throw std::runtime_error("missing fixture "+path.string());size_t bytes=in.tellg();if(bytes%sizeof(T))throw std::runtime_error("bad fixture length");std::vector<T> v(bytes/sizeof(T));in.seekg(0);in.read(reinterpret_cast<char*>(v.data()),bytes);if(!in)throw std::runtime_error("short fixture read");return v;}
 V vec(const Json& j){return {j[0].get<float>(),j[1].get<float>(),j[2].get<float>()};}
-Json refinementReport(const Output& r){return {{"commits",r.refinementCommits},{"accepted",r.refinementAccepted},
-    {"frontier_rebuilds",r.refinedFrontiers},{"objective_gain",r.refinementGain},{"max_plane_error",r.maxPlaneError},{"max_movement",r.maxMovement}};}
+Json refinementReport(const Output& r){Json result={{"commits",r.refinementCommits},{"accepted",r.refinementAccepted},
+    {"frontier_rebuilds",r.refinedFrontiers},{"objective_gain",r.refinementGain},{"max_plane_error",r.maxPlaneError},{"max_movement",r.maxMovement}};
+#ifndef VC_CHUNK_GPU_LIBRARY
+    const auto& a=r.audit;
+    result["audit"]={{"calls",a.calls},{"calls_improved",a.callsImproved},{"invalid_initial",a.invalidInitial},
+        {"attempts",a.attempts},{"invalid_trials",a.invalidTrials},{"non_decreasing_trials",a.nonDecreasingTrials},
+        {"exhausted",a.exhausted},{"no_proposal",a.noProposal},{"backtracks",a.backtracks},
+        {"zero_gradient",a.zeroGradient},{"nonfinite_gradient",a.nonfiniteGradient},{"invalid_current",a.invalidCurrent},
+        {"no_movement",a.noMovement},{"cap_trials",a.capTrials},
+        {"initial_objective",a.initialObjective},{"final_objective",a.finalObjective},
+        {"accepted_before",a.acceptedBefore},{"accepted_after",a.acceptedAfter},
+        {"beam_checks",a.beamChecks},{"beam_worsened",a.beamWorsened},
+        {"beam_before",a.beamBefore},{"beam_after",a.beamAfter},
+        {"max_objective_mismatch",a.maxObjectiveMismatch},{"max_beam_increase",a.maxBeamIncrease},
+        {"min_accepted_gain",std::isfinite(a.minAcceptedGain)?Json(a.minAcceptedGain):Json(nullptr)},
+        {"max_accepted_gain",a.maxAcceptedGain}};
+#endif
+    return result;
+}
 Params parameters(const Json& j,std::vector<float2>& offsets) {
     if(j["beam"]!=8||j["lookahead"]!=2||j["parent_cap"]!=32||!j["modulated"].get<bool>())throw std::runtime_error("unsupported GPU beam configuration");
     Params p;for(int a=0;a<3;++a){p.origin[a]=j["origin"][a];p.shape[a]=j["shape_xyz"][a];}
@@ -594,8 +725,15 @@ Params parameters(const Json& j,std::vector<float2>& offsets) {
     p.smooth={j["smoothness"],j["normal_smoothness"],j["tangent_smoothness"],j["free_angle"].get<float>()*float(3.14159265358979323846)/180.f};
     p.cumulative=j["cumulative_weight"];p.historySteps=j["cumulative_steps"];
     p.refineIterations=j.value("online_refine_iterations",0);p.refineWindow=j.value("online_refine_window",0);
+    auto refinementMode=j.value("online_refine_mode",std::string("legacy"));
+    if(refinementMode!="legacy"&&refinementMode!="analytic")throw std::runtime_error("unknown refinement mode");
+    p.analyticRefinement=refinementMode=="analytic";
+    auto commitMode=j.value("beam_commit_mode",std::string("shared_prefix"));
+    if(commitMode!="shared_prefix"&&commitMode!="rolling")throw std::runtime_error("unknown beam commit mode");
+    p.rolling=commitMode=="rolling";
+    if(p.rolling&&p.refineIterations&&!p.analyticRefinement)throw std::runtime_error("rolling mode needs analytic refinement");
     p.refineEpsilon=j.value("online_refine_epsilon",.25f);p.refineStep=j.value("online_refine_step",1.f);p.refineCap=j.value("online_refine_cap",8.f);
-    if(p.refineIterations<0||p.refineIterations>16||p.refineWindow<0||p.refineWindow>MAX_STEPS||
+    if(p.refineIterations<0||p.refineIterations>64||p.refineWindow<0||p.refineWindow>MAX_STEPS||
        !(p.refineEpsilon>0&&std::isfinite(p.refineEpsilon))||!(p.refineStep>0&&std::isfinite(p.refineStep))||!(p.refineCap>0&&std::isfinite(p.refineCap)))
         throw std::runtime_error("invalid online refinement settings");
     for(float w:{p.smooth.isotropicWeight,p.smooth.normalWeight,p.smooth.tangentWeight,p.cumulative})
@@ -620,6 +758,62 @@ std::vector<float> tensorTable() {
     return tensors;
 }
 #ifndef VC_CHUNK_GPU_LIBRARY
+#include "FiberChunkRollingTests.cuh"
+void hostGradientTests() {
+    auto tensors=tensorTable();std::vector<unsigned char> bytes(512*6);std::vector<float> widths(512);
+    for(int i=0;i<512;++i){int x=i%8,y=i/8%8,z=i/64;
+        bytes[6*i]=180+3*x+2*y+z;bytes[6*i+1]=220+y;bytes[6*i+2]=155+z;
+        bytes[6*i+3]=255;bytes[6*i+4]=140+x;bytes[6*i+5]=145+y;widths[i]=12+.05f*x+.03f*y;
+    }
+    Fields f{bytes.data(),widths.data(),tensors.data(),nullptr};Params p{};
+    for(int a=0;a<3;++a)p.shape[a]=8;
+    p.spacing=1;p.lo={0,0,0};p.hi={7,7,7};p.tolerance=.4;p.cumulative=2;p.historySteps=4;
+    p.smooth={2,.05f,10,0};Seed seed{{1.2f,2.3f,2.1f},unit(V{1,.2f,.5f})};
+    V points[4]={seed.point,{2.2f,2.7f,2.8f},{3.1f,3.3f,3.4f},{4.2f,3.5f,4.2f}};
+    V h=unit(V{1,.3f,.4f});float worst=0;int tested=0;
+    for(bool maskNormals:{false,true})for(float spacing:{1.f,2.f})for(bool masked:{false,true}){
+        p.maskNormals=maskNormals;p.spacing=spacing;
+        bytes[6*((3*8+3)*8+3)]=masked?0:198;
+        V scaledPoints[4];for(int i=0;i<4;++i)scaledPoints[i]=points[i]*spacing;
+        float width,mod;bool valid;
+        auto analytic=directTerm<true>(f,p,seed,scaledPoints,3,h,13,width,mod,valid);
+        for(int k=0;k<12;++k){
+            constexpr float eps=.002f;V plus[4],minus[4];std::copy(scaledPoints,scaledPoints+4,plus);std::copy(scaledPoints,scaledPoints+4,minus);V hp=h,hm=h;
+            if(k<9){plus[3-k/3][k%3]+=eps;minus[3-k/3][k%3]-=eps;}else {hp[k-9]+=eps;hm[k-9]-=eps;}
+            float a=directTerm<false>(f,p,seed,plus,3,hp,13,width,mod,valid),b=directTerm<false>(f,p,seed,minus,3,hm,13,width,mod,valid);
+            float numeric=(a-b)/(2*eps),error=std::abs(numeric-analytic.gradient[k]);worst=fmaxf(worst,error);++tested;
+            if(!std::isfinite(error)||error>.04f+.02f*std::abs(numeric))throw std::runtime_error("local analytic gradient mismatch at "+std::to_string(k)+": "+std::to_string(analytic.gradient[k])+" vs "+std::to_string(numeric));
+        }
+    }
+    // Check complete short-window adjoints, including cumulative history and
+    // the fixed-prefix boundary. Finite differences are a test oracle only.
+    p.spacing=1;p.maskNormals=true;
+    bytes[6*((3*8+3)*8+3)]=198;
+    const V tailPoints[7]={points[0],points[1],points[2],points[3],{5.1f,4.f,4.5f},{5.8f,4.3f,4.9f},{6.5f,4.6f,5.3f}};
+    for(int first:{1,3,5}){
+        Node nodes[7];RefineScratch w{};w.n=7;w.first=1;
+        for(int i=0;i<w.n;++i){w.ids[i]=i;w.points[i]=tailPoints[i];nodes[i].point=tailPoints[i];nodes[i].planeNormal=unit(V{1,.2f,.4f});}
+        directHistories(p,seed,nodes,w,w.points);for(int i=0;i<w.n;++i)nodes[i].history=w.histories[i];w.first=first;
+        for(int i=first;i<w.n;++i){float width,mod;bool valid;
+            auto term=directTerm<true>(f,p,seed,w.points,i,w.histories[i-1],13,width,mod,valid);
+            w.valid[i]=1;w.losses[i]=term.value;
+            for(int k=0;k<3;++k)w.adjacent[k][i]={term.gradient[3*k],term.gradient[3*k+1],term.gradient[3*k+2]};
+            w.historyGradient[i]={term.gradient[9],term.gradient[10],term.gradient[11]};
+        }
+        for(int i=first;i<w.n;++i){w.gradient[i]=w.adjacent[0][i];if(i+1<w.n)w.gradient[i]=w.gradient[i]+w.adjacent[1][i+1];if(i+2<w.n)w.gradient[i]=w.gradient[i]+w.adjacent[2][i+2];}
+        directAdjoint(p,nodes,w);
+        for(int i=first;i<w.n;++i)for(V axis:portable::traceBasis(nodes[i].planeNormal)){
+            float loss[2];constexpr float eps=.002f;
+            for(int sign=0;sign<2;++sign){V trial[7];std::copy(tailPoints,tailPoints+7,trial);trial[i]=trial[i]+axis*(sign?eps:-eps);
+                directHistories(p,seed,nodes,w,trial);loss[sign]=0;
+                for(int j=first;j<w.n;++j){float width,mod;bool valid;loss[sign]+=directTerm<false>(f,p,seed,trial,j,w.histories[j-1],13,width,mod,valid);}
+            }
+            float numeric=(loss[1]-loss[0])/(2*eps),analytic=w.gradient[i].dot(axis),error=std::abs(numeric-analytic);++tested;worst=fmaxf(worst,error);
+            if(!std::isfinite(error)||error>.04f+.02f*std::abs(numeric))throw std::runtime_error("tail adjoint mismatch "+std::to_string(analytic)+" vs "+std::to_string(numeric));
+        }
+    }
+    std::cout<<tested<<" analytic local/tail derivatives passed; max absolute error "<<worst<<std::endl;
+}
 void hostRefinementTests() {
     auto tensors=tensorTable();std::vector<unsigned char> bytes(512*6);std::vector<float> widths(512,12);
     for(int i=0;i<512;++i){int y=i/8%8,z=i/64;
@@ -669,7 +863,9 @@ void hostRefinementTests() {
     std::cout<<"7 shared host refinement tests passed"<<std::endl;
 }
 int main(int argc,char** argv) try {
+    if(argc==2&&std::string(argv[1])=="--host-gradient-tests"){hostGradientTests();return 0;}
     if(argc==2&&std::string(argv[1])=="--host-refinement-tests"){hostRefinementTests();return 0;}
+    if(argc==2&&std::string(argv[1])=="--rolling-tests"){rollingTests();return 0;}
     if(argc==2&&std::string(argv[1])=="--device-tests") {
         // Exercise the actual optimized two-stage search, not just its host
         // scoring functions. Include partial/empty frontiers and repeated
@@ -727,18 +923,19 @@ int main(int argc,char** argv) try {
     auto uploadStart=std::chrono::steady_clock::now();
     Fields fields{upload(bytes),upload(widths),upload(tensors),upload(std::vector<int>{0})};auto deviceSeeds=upload(seeds);auto deviceOffsets=upload(offsets);
     State* candidates;Node* nodes;Output* output;size_t count=seeds.size();
-    check(cudaMalloc(&candidates,count*MAX_CAND*sizeof(State)));check(cudaMalloc(&nodes,count*MAX_NODES*sizeof(Node)));check(cudaMalloc(&output,count*sizeof(Output)));
+    const size_t batch=traceBatchSize(j,count);configureRefinementKernel(p);
+    check(cudaMalloc(&candidates,batch*MAX_CAND*sizeof(State)));check(cudaMalloc(&nodes,batch*MAX_NODES*sizeof(Node)));check(cudaMalloc(&output,count*sizeof(Output)));
     cudaFuncAttributes attrs;check(cudaFuncGetAttributes(&attrs,trace));
     if(threads>attrs.maxThreadsPerBlock)throw std::runtime_error("thread count exceeds kernel register/resource limit: "+std::to_string(attrs.maxThreadsPerBlock));
     auto testFailures=upload(std::vector<int>{0});
     selectionTests<<<4,threads>>>(testFailures);check(cudaGetLastError());
     feasibilityTests<<<1,1>>>(fields.tensors,testFailures);check(cudaGetLastError());
-    refinementTests<<<5,128>>>(fields.tensors,testFailures);check(cudaGetLastError());
+    refinementTests<<<10,128>>>(fields.tensors,testFailures);check(cudaGetLastError());
     int failed=0;check(cudaMemcpy(&failed,testFailures,sizeof(int),cudaMemcpyDeviceToHost));cudaFree(testFailures);
     if(failed)throw std::runtime_error("synthetic selection/refinement regression failures: "+std::to_string(failed));
     check(cudaDeviceSynchronize());auto ready=std::chrono::steady_clock::now();
-    Json timings=Json::array();std::vector<Output> result(count),previous(count);bool repeated=true;
-    for(int repeat=0;repeat<repeats;++repeat){auto begin=std::chrono::steady_clock::now();trace<<<count,threads,p.refineIterations?sizeof(RefineScratch):0>>>(fields,p,deviceSeeds,deviceOffsets,candidates,nodes,output,count,parallel,bounded,audit);check(cudaGetLastError());check(cudaDeviceSynchronize());timings.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count());
+    Json timings=Json::array();std::vector<Output> result(count),previous(count);bool repeated=true;RollingWorkspace rolling;
+    for(int repeat=0;repeat<repeats;++repeat){auto begin=std::chrono::steady_clock::now();for(size_t offset=0;offset<count;offset+=batch){size_t take=std::min(batch,count-offset);launchTrace(fields,p,deviceSeeds+offset,deviceOffsets,candidates,nodes,output+offset,take,threads,parallel,bounded,audit,rolling);}check(cudaDeviceSynchronize());timings.push_back(std::chrono::duration<double>(std::chrono::steady_clock::now()-begin).count());
         check(cudaMemcpy(result.data(),output,count*sizeof(Output),cudaMemcpyDeviceToHost));
         if(repeat)for(size_t i=0;i<count;++i){repeated&=previous[i].count==result[i].count&&previous[i].reason==result[i].reason;for(int k=0;k<std::min(previous[i].count,result[i].count);++k)for(int a=0;a<3;++a)repeated&=previous[i].points[k][a]==result[i].points[k][a];}previous=result;
     }
@@ -759,12 +956,16 @@ int main(int argc,char** argv) try {
     if(fieldError)throw std::runtime_error("GPU trace accessed outside exported field");
     for(const auto& r:result)if(r.reason==5)throw std::runtime_error("GPU trace exceeded device capacity");
     // Independent host/device first-step check, outside timed trace region.
-    firstStep<<<(count*p.dirs+127)/128,128>>>(fields,p,deviceSeeds,deviceOffsets,candidates,count);check(cudaGetLastError());check(cudaDeviceSynchronize());
-    std::vector<State> first(count*p.dirs);check(cudaMemcpy(first.data(),candidates,first.size()*sizeof(State),cudaMemcpyDeviceToHost));
+    // Candidate scratch is batch-bounded; first-step checks must be too.
+    std::vector<State> first(count*p.dirs);
+    for(size_t offset=0;offset<count;offset+=batch){size_t take=std::min(batch,count-offset);
+        firstStep<<<(take*p.dirs+127)/128,128>>>(fields,p,deviceSeeds+offset,deviceOffsets,candidates,take);check(cudaGetLastError());
+        check(cudaMemcpy(first.data()+offset*p.dirs,candidates,take*p.dirs*sizeof(State),cudaMemcpyDeviceToHost));}
     Fields host{bytes.data(),widths.data(),tensors.data(),nullptr};
     size_t validityMismatch=0,lossMismatch=0;double maxLoss=0,maxPosition=0;
     for(size_t i=0;i<first.size();++i){auto seed=seeds[i/p.dirs];State parent{};parent.point=seed.point;parent.previous=parent.current=parent.history=unit(seed.direction,{1,0,0});
         double width=sample(host,p,seed.point,seed.direction).width;
+        parent.widthSum=width;parent.widthCount=1;
         auto expected=candidate(host,p,parent,offsets[i%p.dirs].x,offsets[i%p.dirs].y,width,i%p.dirs);auto actual=first[i];
         validityMismatch+=expected.valid!=actual.valid;
         if(expected.valid&&actual.valid){lossMismatch+=expected.loss!=actual.loss;maxLoss=std::max(maxLoss,double(std::abs(expected.loss-actual.loss)));for(int a=0;a<3;++a)maxPosition=std::max(maxPosition,double(std::abs(expected.point[a]-actual.point[a])));}
@@ -776,7 +977,7 @@ int main(int argc,char** argv) try {
     report["optimization"]={{"parallel",parallel},{"bounded",bounded},{"threads",threads},{"audit",audit},{"candidates",total},{"scored",scored},{"bound_violations",violations}};
     report["kernel_resources"]={{"registers_per_thread",attrs.numRegs},{"shared_bytes",attrs.sharedSizeBytes},{"local_bytes_per_thread",attrs.localSizeBytes},{"max_threads",attrs.maxThreadsPerBlock}};
     report["selection_tests_passed"]=true;
-    report["refinement_tests_passed"]=true;
+    report["refinement_tests_passed"]=true;report["batch_halves"]=batch;report["online_refine_mode"]=p.analyticRefinement?"analytic":"legacy";
     report["parameters"]=j;
     for(size_t i=0;i<result.size();++i)report["traces"][i]["refinement"]=refinementReport(result[i]);
     report["reusable_upload_seconds"]=reusableUpload;
@@ -798,6 +999,7 @@ struct Workspace {
     Buffer<unsigned char> bytes;Buffer<float> widths,tensors;
     Buffer<int> error;Buffer<Seed> seeds;Buffer<float2> offsets;
     Buffer<State> candidates;Buffer<Node> nodes;Buffer<Output> output;
+    RollingWorkspace rolling;
 };
 // One persistent host thread owns each device and its reusable workspace.
 // The caller retains input arrays until this synchronous call returns.
@@ -816,7 +1018,7 @@ extern "C" const char* vc_chunk_gpu_run(int device,const char* metadata,
         int zero=0;w.error.copy(&zero,1);w.offsets.copy(offsets.data(),offsets.size());
         std::vector<Seed> seeds;
         for(const auto& s:j["seeds"]){auto point=vec(s["seed"]),dir=vec(s["direction"]);seeds.push_back({point,dir});seeds.push_back({point,dir*-1});}
-        constexpr size_t batch=1024;
+        const size_t batch=traceBatchSize(j,seeds.size());configureRefinementKernel(p);
         const size_t capacity=std::min(batch,seeds.size());
         w.candidates.reserve(capacity*MAX_CAND);w.nodes.reserve(capacity*MAX_NODES);w.output.reserve(capacity);
         Fields fields{w.bytes.data,w.widths.data,w.tensors.data,w.error.data};
@@ -824,8 +1026,8 @@ extern "C" const char* vc_chunk_gpu_run(int device,const char* metadata,
         for(size_t start=0;start<seeds.size();start+=batch){
             const size_t count=std::min(batch,seeds.size()-start);w.seeds.copy(seeds.data()+start,count);
             auto k=std::chrono::steady_clock::now();
-            trace<<<count,128,p.refineIterations?sizeof(RefineScratch):0>>>(fields,p,w.seeds.data,w.offsets.data,w.candidates.data,w.nodes.data,w.output.data,count,true,false,false);
-            check(cudaGetLastError());check(cudaDeviceSynchronize());
+            launchTrace(fields,p,w.seeds.data,w.offsets.data,w.candidates.data,w.nodes.data,w.output.data,count,128,true,false,false,w.rolling);
+            check(cudaDeviceSynchronize());
             kernelSeconds+=std::chrono::duration<double>(std::chrono::steady_clock::now()-k).count();
             std::vector<Output> result(count);check(cudaMemcpy(result.data(),w.output.data,count*sizeof(Output),cudaMemcpyDeviceToHost));
             for(const auto& r:result){

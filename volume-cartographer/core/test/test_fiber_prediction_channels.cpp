@@ -2,6 +2,8 @@
 #include <doctest/doctest.h>
 
 #include "vc/fiber_tracer/FiberTrace.hpp"
+#include "vc/fiber_tracer/detail/FiberChunkTensor.hpp"
+#include "vc/lasagna/Manifest.hpp"
 #include "vc/lasagna/ChannelSampler.hpp"
 #include "utils/zarr.hpp"
 
@@ -64,6 +66,151 @@ FiberPredictionFieldOptions auxiliaryOptions() {
     options.enableWidth = true;
     return options;
 }
+}
+
+TEST_CASE("dense chunk tensor matches scalar and batch interpolation with masked byte and float widths") {
+    for(bool byteWidth:{false,true})for(bool masked:{false,true}) {
+        Fixture fixture;
+        fixture.channel<uint8_t>("presence",{0,255,203,204,205,255,128,0},utils::ZarrDtype::uint8);
+        fixture.channel<uint8_t>("nx",{128,129,0,255,50,170,128,128},utils::ZarrDtype::uint8);
+        fixture.channel<uint8_t>("ny",{128,200,0,255,170,100,128,128},utils::ZarrDtype::uint8);
+        fixture.channel<uint8_t>("grad_mag",{0,255,0,255,255,0,255,255},utils::ZarrDtype::uint8);
+        if(byteWidth)fixture.channel<uint8_t>("width",{0,20,40,80,120,200,255,0},utils::ZarrDtype::uint8);
+        else fixture.channel<float>("width",{0,20.125f,-4.5f,80,120,200,255,0},utils::ZarrDtype::float32);
+        auto manifest=fixture.dataset().manifest();
+        manifest.workingToBaseScale=2;
+        manifest.raw["mask_invalid_normal_corners"]=masked;
+        if(byteWidth)manifest.raw["width_encoding"]="uint8-base-voxels";
+        vc::lasagna::LasagnaDataset dataset(manifest);
+        FiberPredictionFieldOptions options;options.enableWidth=true;
+        FiberPredictionField field(dataset,options);vc::lasagna::LasagnaNormalSampler normals(dataset);
+        detail::FiberChunkTensor dense(field,normals,{-1,-1,-1},{2,2,2});
+        const double s=field.chunkRegionChannels({0,0,0},{1,1,1}).first[0].spacing;
+        std::vector<cv::Vec3d> points{{0,0,0},{s,s,s},{-.1,0,0},{s+.01,0,0},{2*s,0,0}};
+        std::mt19937 rng(35);std::uniform_real_distribution<double> dist(0,s);
+        for(int i=0;i<100;++i)points.emplace_back(dist(rng),dist(rng),dist(rng));
+        for(const auto& p:points) {
+            const cv::Vec3d dir{.2,-.7,.4};
+            const auto a=field.sample(p,dir),b=dense.sample(p,dir);
+            REQUIRE(a.options.size()==b.options.size());
+            CHECK(a.options[0].valid==b.options[0].valid);
+            CHECK(a.options[0].presence==b.options[0].presence);
+            CHECK(a.options[0].direction==b.options[0].direction);
+            std::vector<FiberPredictionSample> aa,bb;
+            field.sampleBatch({p},{dir},1,aa);dense.sampleBatch({p},{dir},1,bb);
+            CHECK(aa[0].options[0].valid==bb[0].options[0].valid);
+            CHECK(aa[0].options[0].presence==bb[0].options[0].presence);
+            CHECK(aa[0].options[0].direction==bb[0].options[0].direction);
+            field.sampleBatch({p},{{1,0,0}},1,aa);
+            const auto old=aa[0].options[0];const float value=dense.seedPresence(p,.8);
+            CHECK(value==(old.valid&&old.presence>=.8?old.presence:0));
+            std::vector<float> wa,wb;field.sampleWidths({cv::Vec3f(p)},wa);dense.sampleWidths({cv::Vec3f(p)},wb);
+            CHECK(wa==wb);
+            const auto na=normals.sampleNormal(p),nb=dense.sampleNormal(p);
+            CHECK(na.valid==nb.valid);if(na.valid)CHECK(na.normal==nb.normal);
+        }
+    }
+}
+
+TEST_CASE("sparse regular seed grid exactly matches independent point interpolation") {
+    for(int pattern=0;pattern<4;++pattern)for(double spacing:{1.,1.7}) {
+        Fixture fixture;
+        fixture.channel<uint8_t>("presence",pattern==0?std::vector<uint8_t>{0,255,203,204,205,255,128,0}:
+            std::vector<uint8_t>(8,pattern==1?255:pattern==2?0:204),utils::ZarrDtype::uint8);
+        fixture.channel<uint8_t>("nx",pattern==1?std::vector<uint8_t>(8,128):
+            std::vector<uint8_t>{128,129,0,255,50,170,128,128},utils::ZarrDtype::uint8);
+        fixture.channel<uint8_t>("ny",pattern==1?std::vector<uint8_t>(8,128):
+            std::vector<uint8_t>{128,200,0,255,170,100,128,128},utils::ZarrDtype::uint8);
+        fixture.channel<uint8_t>("grad_mag",std::vector<uint8_t>(8,255),utils::ZarrDtype::uint8);
+        fixture.auxiliary();
+        auto manifest=fixture.dataset().manifest();manifest.sourceToBase=spacing;
+        const vc::lasagna::LasagnaDataset dataset(manifest);
+        FiberPredictionFieldOptions options;options.enableWidth=true;
+        FiberPredictionField field(dataset,options);
+        vc::lasagna::LasagnaNormalSampler normals(dataset);
+        detail::FiberChunkTensor reference(field,normals,{-2,-2,-2},{4,4,4});
+        const std::vector<double> thresholds{0,.8,double(std::nextafter(.8f,0.f)),
+            double(std::nextafter(.8f,1.f)),1};
+        for(double threshold:thresholds)for(double scale:{1.,2.,1.7})for(double grid:{.125,.137}) {
+            detail::FiberChunkTensor candidate(field,normals,{-2,-2,-2},{4,4,4},true);
+            CHECK_THROWS(candidate.seedPresence({0,0,0},threshold));
+            const cv::Vec3d lo{-.123,-.25,0};const int side=20;
+            std::vector<float> actual;
+            const auto stats=candidate.seedGrid(lo,scale,grid,side,threshold,actual);
+            REQUIRE(actual.size()==size_t(side*side*side));
+            for(int z=0;z<side;++z)for(int y=0;y<side;++y)for(int x=0;x<side;++x){
+                const cv::Vec3d point=(lo+cv::Vec3d(x*grid,y*grid,z*grid))/scale;
+                CHECK(actual[(z*side+y)*side+x]==reference.seedPresence(point,threshold));
+            }
+            if(pattern==2 && threshold>0) {
+                CHECK(stats["interpolated_points"]==0);
+                CHECK(stats["presence_eligible_points"]==0);
+                std::vector<unsigned char> bytes;std::vector<float> widths;
+                CHECK_THROWS(candidate.packGpu(bytes,widths));
+            }
+        }
+    }
+}
+
+TEST_CASE("dense ROI respects packed channel offsets and missing chunks") {
+    Fixture fixture;
+    utils::ZarrMetadata meta;meta.version=utils::ZarrVersion::v2;
+    meta.shape={7,8,4,4};meta.chunks={7,4,4,4};meta.dtype=utils::ZarrDtype::uint8;
+    meta.compressor_id.clear();meta.fill_value=0;
+    auto array=utils::ZarrArray::create(fixture.path/"packed",meta);
+    std::vector<uint8_t> data(7*64);
+    const std::array<uint8_t,7> constants{255,128,200,40,180,130,255};
+    for(size_t c=0;c<7;++c)std::fill(data.begin()+c*64,data.begin()+(c+1)*64,constants[c]);
+    array.write_chunk(std::vector<size_t>{0,0,0,0},std::as_bytes(std::span(data)));
+    const auto manifest=vc::lasagna::LasagnaDatasetManifest::parseText(nlohmann::json{
+        {"version",3},{"source_to_base",1},{"base_shape_zyx",{8,4,4}},
+        {"width_encoding","uint8-base-voxels"},{"validity_channel","presence"},
+        {"groups",{{"sd0",{{"zarr","packed"},{"scaledown",0},
+        {"channels",{"presence","nx","ny","width","sheet_nx","sheet_ny","sheet_grad_mag"}}}}}}}.dump(),fixture.path/"manifest.json");
+    vc::lasagna::LasagnaDataset dataset(manifest);
+    FiberPredictionFieldOptions options;options.enableWidth=true;
+    FiberPredictionField field(dataset,options);
+    vc::lasagna::LasagnaNormalSampler normals(vc::lasagna::LasagnaDataset(vc::lasagna::fiberNormalManifest(manifest)));
+    detail::FiberChunkTensor dense(field,normals,{0,0,0},{3,3,7});
+    std::vector<unsigned char> bytes;std::vector<float> widths;dense.packGpu(bytes,widths);
+    REQUIRE(bytes.size()==6*128);REQUIRE(widths.size()==128);
+    const std::array<int,6> order{0,1,2,6,4,5};
+    for(size_t i=0;i<128;++i){
+        for(size_t c=0;c<6;++c)CHECK(bytes[i*6+c]==(i<64?constants[order[c]]:0));
+        CHECK(widths[i]==(i<64?40:0));
+    }
+    CHECK(dense.sampleNormal({1.1,1.2,1.3}).normal==normals.sampleNormal({1.1,1.2,1.3}).normal);
+    // The last exported lattice point is not a volume edge: width sampling
+    // still needs its upper interpolation corner outside the exported ROI.
+    detail::FiberChunkTensor interior(field,normals,{1,1,1},{2,2,2});
+    interior.packGpu(bytes,widths);
+    REQUIRE(bytes.size()==6*8);
+    REQUIRE(widths.size()==8);
+    for(float value:widths)CHECK(value==40);
+}
+
+TEST_CASE("dense ROI allows independently chunked widths") {
+    Fixture fixture;
+    fixture.channel<uint8_t>("grad_mag",std::vector<uint8_t>(8,255),utils::ZarrDtype::uint8);
+    utils::ZarrMetadata meta;meta.version=utils::ZarrVersion::v2;
+    meta.shape={2,2,2};meta.chunks={1,1,1};meta.dtype=utils::ZarrDtype::float32;
+    meta.compressor_id.clear();meta.fill_value=0;
+    auto array=utils::ZarrArray::create(fixture.path/"width",meta);
+    for(size_t z=0;z<2;++z)for(size_t y=0;y<2;++y)for(size_t x=0;x<2;++x){
+        const std::array<size_t,3> key{z,y,x};
+        const std::array<float,1> value{float(10+z*4+y*2+x)};
+        array.write_chunk(key,std::as_bytes(std::span(value)));
+    }
+    fixture.groups["width"]={{"zarr","width"},{"scaledown",0},{"channels",{"width"}}};
+    const auto dataset=fixture.dataset();
+    FiberPredictionFieldOptions options;options.enableWidth=true;
+    FiberPredictionField field(dataset,options);
+    vc::lasagna::LasagnaNormalSampler normals(dataset);
+    detail::FiberChunkTensor dense(field,normals,{0,0,0},{1,1,1});
+    const std::vector<cv::Vec3f> points{{.2f,.3f,.4f},{1,1,1},{0,0,0}};
+    std::vector<float> expected,actual;
+    field.sampleWidths(points,expected);dense.sampleWidths(points,actual);
+    CHECK(expected==actual);
 }
 
 TEST_CASE("auxiliary channels are opt in and missing channels fail explicitly") {

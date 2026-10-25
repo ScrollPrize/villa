@@ -209,6 +209,14 @@ private:
 [[nodiscard]] size_t lasagnaReadWorkersPerChannel();
 
 [[nodiscard]] double decodeCompactNormalComponent(double raw);
+// Storage-independent scalar interpolation, also used by owned dense ROIs.
+[[nodiscard]] double interpolateLasagnaScalarCorners(const std::array<double,8>&,
+    const cv::Vec3d& fraction);
+[[nodiscard]] std::optional<double> interpolateLasagnaMaskedScalarCorners(
+    const std::array<double,8>&, const cv::Vec3d&, const std::array<uint8_t,8>&);
+[[nodiscard]] std::optional<cv::Vec3d> interpolateLasagnaCompactTensorCorners(
+    const std::array<uint8_t,8>& nx, const std::array<uint8_t,8>& ny,
+    const cv::Vec3d& fraction, const std::array<uint8_t,8>& mask);
 [[nodiscard]] cv::Vec3d decodeCompactNormalFromRaw(double rawNx, double rawNy);
 [[nodiscard]] std::optional<std::array<uint8_t, 2>>
 encodeCompactNormalToRaw(const cv::Vec3d& normal);

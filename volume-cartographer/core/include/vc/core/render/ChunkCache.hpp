@@ -1,4 +1,5 @@
 #pragma once
+#include "vc/core/render/ChunkLoadQueue.hpp"
 
 #include "vc/core/render/DecodedChunkCacheBudget.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
@@ -101,6 +102,10 @@ public:
     };
 
     struct Options {
+        enum class LoaderBackend {Direct, Queued};
+        LoaderBackend loaderBackend = LoaderBackend::Direct;
+        // 0 selects twice the combined local-read and decode worker capacity.
+        std::size_t queuedChunkWindow = 0;
         // Initial capacity used only when decodedByteBudget is not supplied.
         std::size_t decodedByteCapacity = 512ULL * 1024ULL * 1024ULL;
         std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget;
@@ -118,6 +123,10 @@ public:
 
     ChunkCacheService();
     explicit ChunkCacheService(Options options);
+    static Options batchOptions(std::size_t cores,std::size_t decodedBytes);
+    Options::LoaderBackend loaderBackend() const noexcept;
+    std::size_t queuedChunkWindow() const noexcept;
+    ChunkLoadQueue::Stats loaderStats() const;
     ~ChunkCacheService();
 
     ChunkCacheService(const ChunkCacheService&) = delete;
@@ -152,10 +161,14 @@ public:
     PersistentCacheEncoding persistentCacheEncoding() const noexcept;
     std::size_t sourceCount() const;
     bool invalidateSource(std::string_view sourceIdentity);
+    // Independent decoded LRU/budget, but the same central I/O/decode pools.
+    // Parent service remains alive; partition teardown never drains other work.
+    std::shared_ptr<ChunkCacheService> createDecodedPartition(std::size_t bytes);
 
 private:
     friend class ChunkCache;
     struct Impl;
+    explicit ChunkCacheService(std::shared_ptr<Impl> impl);
     std::shared_ptr<Impl> impl_;
 };
 
@@ -257,6 +270,11 @@ public:
     ~ChunkCache() override;
 
     VolumeSourceId sourceId() const noexcept;
+    const void* physicalCacheIdentity() const noexcept override {return state_.get();}
+    bool prefersBatchReads() const noexcept override;
+    std::vector<ChunkResult> getChunksBlocking(const std::vector<ChunkKey>& keys,
+                                              const ChunkRequestContext& request = {}) override;
+    std::shared_ptr<ChunkCache> inService(const std::shared_ptr<ChunkCacheService>& service) const;
 
     int numLevels() const override;
     std::array<int, 3> shape(int level) const override;
@@ -480,6 +498,10 @@ private:
         bool sourceStarted = false;
     };
 
+    struct InvalidationGroup {
+        std::mutex mutex;
+        std::vector<std::weak_ptr<State>> states;
+    };
     struct State {
         State(std::vector<LevelInfo> levels,
               std::vector<std::shared_ptr<IChunkFetcher>> fetchers,
@@ -521,6 +543,8 @@ private:
         std::shared_ptr<DecodedChunkCacheBudget> decodedByteBudget_;
         VolumeSourceId sourceId_{};
         std::string sourceIdentity_;
+        std::shared_ptr<InvalidationGroup> invalidationGroup_ = std::make_shared<InvalidationGroup>();
+        std::function<void()> queuedInvalidationWake_;
 
         mutable std::mutex mutex_;
         std::condition_variable cv_;
@@ -592,6 +616,8 @@ private:
 
     };
 
+    static ChunkResult cachedResultLocked(State& state, const ChunkKey& key, bool touch,
+                                         const ChunkRequestContext* request = nullptr);
     static ChunkResult resultFromEntryLocked(
         State& state, const ChunkKey& key, Entry& entry, bool promote = true);
     static int fetchBasePriority(const State& state, const ChunkKey& key, int priorityOffset);
@@ -819,6 +845,11 @@ private:
                                            bool isolateCallbackExceptions = false);
     static std::uint64_t nextSchedulerGroup();
     static void invalidateState(const std::shared_ptr<State>& state);
+    static void invalidateRelatedStates(const std::shared_ptr<State>& state);
+    ChunkLoadQueue::Source queuedSource() const;
+    static std::vector<ChunkResult> pollQueuedChunks(const std::shared_ptr<State>& state,
+                                                    const std::vector<ChunkLoadQueue::Query>& queries);
+    static void releaseQueuedChunks(const std::shared_ptr<State>& state,const std::vector<ChunkKey>& keys);
     static void registerStateBudget(const std::shared_ptr<State>& state);
     static void unregisterStateBudget(State& state);
 

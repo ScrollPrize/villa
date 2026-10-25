@@ -409,6 +409,24 @@ ft::FiberReplayTraceResult chunkReplay(ChunkCacheHandle& self,const PointsIn& po
 
 NB_MODULE(fiber_trace, m)
 {
+    m.def("configure_chunk_loader",[](size_t cores,size_t bytes,const std::string& backend,size_t window){
+        nb::gil_scoped_release release;
+        auto options=vc::render::ChunkCacheService::batchOptions(cores,bytes);
+        if(backend=="queued")options.loaderBackend=vc::render::ChunkCacheService::Options::LoaderBackend::Queued;
+        else if(backend!="direct")throw std::invalid_argument("loader backend must be direct or queued");
+        options.queuedChunkWindow=window;
+        const auto service=vc::render::configureProcessChunkCacheService(options);
+        return nlohmann::json{{"local_read_workers",service->localReadWorkers()},
+            {"decode_workers",service->decodeWorkerCapacity()},{"cache_bytes",bytes},
+            {"backend",backend},{"queued_chunk_window",service->queuedChunkWindow()}}.dump();
+    },"cores"_a,"cache_bytes"_a,"backend"_a="direct","queued_chunk_window"_a=0);
+    m.def("chunk_loader_stats",[]{
+        const auto s=vc::render::processChunkCacheService()->loaderStats();
+        return nlohmann::json{{"requests",s.requests},{"keys",s.keys},{"coalesced",s.coalesced},
+            {"completed",s.completed},{"polls",s.polls},{"wakes",s.wakes},{"in_flight",s.inFlight},
+            {"peak_in_flight",s.peakInFlight},{"pending",s.pending},{"peak_pending",s.peakPending},
+            {"reply_bytes",s.replyBytes},{"peak_reply_bytes",s.peakReplyBytes}}.dump();
+    });
     m.def("reference_plan_json", [](const std::string& text) {
         return ft::vc3dEvaluationReferencePlan(
             ft::parseVc3dFiberJson(nlohmann::json::parse(text), "reference"), "reference").dump();
@@ -459,6 +477,8 @@ NB_MODULE(fiber_trace, m)
         .def_rw("join_minimum_base",&ft::FiberChunkTraceConfig::joinMinimumBase)
         .def_rw("join_width_weight",&ft::FiberChunkTraceConfig::joinWidthWeight)
         .def_rw("pin_sampling_region",&ft::FiberChunkTraceConfig::pinSamplingRegion)
+        .def_rw("channel_hints",&ft::FiberChunkTraceConfig::channelHints)
+        .def_rw("worker_cache_bytes",&ft::FiberChunkTraceConfig::workerCacheBytes)
         .def_rw("max_grid_samples",&ft::FiberChunkTraceConfig::maxGridSamples)
         .def_rw("initial_alignment_power",&ft::FiberChunkTraceConfig::initialAlignmentPower)
         .def_rw("initial_normal_radius_base",&ft::FiberChunkTraceConfig::initialNormalRadiusBase)
@@ -477,6 +497,10 @@ NB_MODULE(fiber_trace, m)
         .def_rw("gpu_devices",&ft::FiberChunkTraceConfig::gpuDevices)
         .def_rw("online_refine_iterations",&ft::FiberChunkTraceConfig::onlineRefineIterations)
         .def_rw("online_refine_window",&ft::FiberChunkTraceConfig::onlineRefineWindow)
+        .def_rw("online_refine_mode",&ft::FiberChunkTraceConfig::onlineRefineMode)
+        .def_rw("beam_commit_mode",&ft::FiberChunkTraceConfig::beamCommitMode)
+        .def_rw("gpu_batch_halves",&ft::FiberChunkTraceConfig::gpuBatchHalves)
+        .def_rw("gpu_batch_memory_mib",&ft::FiberChunkTraceConfig::gpuBatchMemoryMiB)
         .def_rw("online_refine_epsilon_base",&ft::FiberChunkTraceConfig::onlineRefineEpsilonBase)
         .def_rw("online_refine_step_base",&ft::FiberChunkTraceConfig::onlineRefineStepBase)
         .def_rw("online_refine_cap_base",&ft::FiberChunkTraceConfig::onlineRefineCapBase)
@@ -489,6 +513,17 @@ NB_MODULE(fiber_trace, m)
         nb::gil_scoped_release release;
         return ChunkPathsHandle{ft::loadFiberChunkPaths(path)};
     },"path"_a);
+    m.def("prepare_chunk_volume",[](const PredictionFieldHandle& field,const NormalSamplerHandle& normals,
+        const ft::FiberTraceConfig& trace,const ft::FiberChunkTraceConfig& chunks,
+        const std::string& output,const std::string& identity,const std::vector<std::array<int,3>>& keys,
+        ft::FiberEvaluationControl& control,size_t workers,size_t contexts) {
+        const auto t=checkedConfig(field,trace,&normals);
+        const auto c=chunks;const auto copiedKeys=keys;
+        nb::gil_scoped_release release;
+        ft::prepareFiberChunkVolume(*field.field,t,field.scales.traceToBaseScale,*normals.sampler,c,
+            output,identity,copiedKeys,control,workers,contexts);
+    },"field"_a,"normals"_a,"trace"_a,"chunks"_a,"output"_a,"source_identity"_a,"keys_xyz"_a,
+       "control"_a,"workers"_a=4,"contexts_per_worker"_a=8);
     m.def("build_chunk_paths",[](const PredictionFieldHandle& field,const NormalSamplerHandle& normals,
                                  const ft::FiberTraceConfig& t,const ft::FiberChunkTraceConfig& c,
                                  const std::array<int,3>& key,size_t workers) {
@@ -536,6 +571,8 @@ NB_MODULE(fiber_trace, m)
         .def_prop_ro("seeds",[](const ChunkPathsHandle& s){return s.paths->seeds;})
         .def_prop_ro("timings_json",[](const ChunkPathsHandle& s){return s.paths->timings.dump();})
         .def_prop_ro("end_reasons",[](const ChunkPathsHandle& s){return s.paths->endReasons;})
+        .def_prop_ro("conflict_flags",[](const ChunkPathsHandle& s){return s.paths->conflictFlags;})
+        .def_prop_ro("conflict_annotation_json",[](const ChunkPathsHandle& s){return s.paths->conflictAnnotation.dump();})
         .def_prop_ro("lines_base",[](const ChunkPathsHandle& s){
             nb::list lines;for(const auto& line:s.paths->lines) lines.append(pointsArray(line));return lines;
         });
@@ -661,6 +698,27 @@ NB_MODULE(fiber_trace, m)
           "remote_cache_root"_a = nb::none(),
           "Open a Lasagna normal dataset (nx/ny/grad_mag) at the tracer's working scale.");
 
+    m.def("open_fiber_normal_sampler",[](const PredictionFieldHandle& field,size_t cacheBytes) {
+        auto handle=std::make_unique<NormalSamplerHandle>();
+        nb::gil_scoped_release release;
+        handle->dataset=std::make_unique<vc::lasagna::LasagnaDataset>(
+            vc::lasagna::fiberNormalManifest(field.dataset->manifest()));
+        handle->sampler=std::make_unique<vc::lasagna::LasagnaNormalSampler>(*handle->dataset,
+            vc::lasagna::LasagnaNormalSamplerOptions{cacheBytes});
+        handle->workingToBaseScale=field.scales.traceToBaseScale;
+        handle->location=field.location;
+        return handle;
+    },"field"_a,"cache_bytes"_a=size_t{512}<<20);
+
+    m.def("prediction_presence_storage",[](const PredictionFieldHandle& field) {
+        const auto& manifest=field.dataset->manifest();
+        const auto* group=manifest.groupForChannel("presence");
+        if(!group||group->isRemote()||!manifest.baseShapeZYX)
+            throw std::invalid_argument("sparse enumeration requires local presence and explicit base shape");
+        return nb::make_tuple(group->zarrPath.string(),*group->channelIndex("presence"),
+            manifest.sourceToBase*group->scaleFactor(),*manifest.baseShapeZYX);
+    },"field"_a);
+
     nb::class_<ChunkCacheHandle>(m,"ChunkCache")
         .def(nb::init<const PredictionFieldHandle&,const NormalSamplerHandle&,const ft::FiberTraceConfig&,
              const ft::FiberChunkTraceConfig&,const std::string&,const std::string&>(),
@@ -705,6 +763,7 @@ NB_MODULE(fiber_trace, m)
             const auto s = self.status();
             nb::dict out;
             out["total"] = s.total; out["completed"] = s.completed;
+            if(s.chunkVolume){out["built"]=s.built;out["reused"]=s.reused;out["annotated"]=s.annotated;}
             out["started"] = s.started; out["finished"] = s.finished;
             out["cancelled"] = s.cancelled; out["error"] = s.error;
             return out;

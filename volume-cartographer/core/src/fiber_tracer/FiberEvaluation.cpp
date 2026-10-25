@@ -2,6 +2,7 @@
 #include "vc/fiber_tracer/FiberReverseConsistency.hpp"
 #include <atomic>
 #include <cmath>
+#include <set>
 
 namespace vc::fiber_tracer {
 
@@ -38,11 +39,12 @@ FiberEvaluationStatus FiberEvaluationControl::status() const
 
 class FiberEvaluationRun {
 public:
-    FiberEvaluationRun(FiberEvaluationControl& control, size_t total) : control_(control) {
+    FiberEvaluationRun(FiberEvaluationControl& control, size_t total, bool volume=false) : control_(control) {
         std::lock_guard lock(control_.mutex_);
         if (control_.status_.started) throw std::invalid_argument("evaluation control already used");
         control_.status_.started = true;
         control_.status_.total = total;
+        control_.status_.chunkVolume = volume;
     }
     ~FiberEvaluationRun() {
         std::lock_guard lock(control_.mutex_);
@@ -58,9 +60,12 @@ public:
         const auto s = control_.status();
         if (s.cancelled) throw std::runtime_error(s.error);
     }
-    void completed() {
+    void completed(const std::string& outcome={}) {
         std::lock_guard lock(control_.mutex_);
         ++control_.status_.completed;
+        control_.status_.built += outcome=="built";
+        control_.status_.reused += outcome=="reused";
+        control_.status_.annotated += outcome=="annotated";
     }
     void finish() {
         std::lock_guard lock(control_.mutex_);
@@ -74,6 +79,42 @@ public:
 private:
     FiberEvaluationControl& control_;
 };
+
+void prepareFiberChunkVolume(const FiberPredictionSource& predictions,const FiberTraceConfig& trace,
+    double scale,const vc::lasagna::NormalSampler& normals,const FiberChunkTraceConfig& chunks,
+    const std::filesystem::path& output,const std::string& identity,
+    const std::vector<std::array<int,3>>& keys,FiberEvaluationControl& control,size_t workers,size_t contexts)
+{
+    FiberEvaluationRun run(control,keys.size(),true);
+    try {
+        run.check();
+        if(!workers||!contexts||trace.parallelThreads!=1||trace.profile)
+            throw std::invalid_argument("volume requires positive workers/contexts, parallel_threads=1 and no shared profile");
+        if(!predictions.supportsConcurrentSampling()||!normals.supportsConcurrentSampling())
+            throw std::invalid_argument("volume requires concurrent sampling sources");
+        if(std::set<std::array<int,3>>(keys.begin(),keys.end()).size()!=keys.size())
+            throw std::invalid_argument("duplicate volume chunk keys");
+        std::atomic<size_t> next{0};
+        auto queue=std::make_unique<FiberCaseQueue>(workers,keys.size(),[&] {
+            run.check();
+            const auto key=keys[next.fetch_add(1)];
+            std::string outcome;
+            try {
+                // No cache object/future retains completed geometry.
+                auto chunk=prepareFiberChunkPaths(key,predictions,trace,normals,chunks,scale,output,identity,outcome,
+                    FiberCaseQueue::parallelFor,[](const auto& ready){FiberCaseQueue::await(ready);});
+            } catch(const std::exception& e) {
+                throw std::runtime_error("chunk "+std::to_string(key[0])+"_"+std::to_string(key[1])+"_"+
+                    std::to_string(key[2])+": "+e.what());
+            }
+            run.completed(outcome);
+        },contexts);
+        run.attach(queue.get());
+        try {queue->join();}catch(...){run.attach(nullptr);throw;}
+        run.attach(nullptr);run.finish();
+    }catch(const std::exception& e){run.failed(e.what());throw;}
+    catch(...){run.failed("unknown chunk volume error");throw;}
+}
 
 std::optional<PolylineArcSample> findFiberReplayRestartSeed(
     const FiberPredictionSource& predictions, const FiberTraceConfig& trace, double scale,
