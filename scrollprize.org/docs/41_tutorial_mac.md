@@ -80,7 +80,9 @@ Seeds matter more than anything else here. A random seed often lands where sheet
 - `--frame-level` says which pyramid level the mesh coordinates are in;
 - `--level` picks the level to sample.
 
-Re-rendering PHerc0800 segment `20251029010146` this way matched the published surface volume with normalised cross-correlation 0.968 and no offset. The published volumes use the opposite normal sign, so pass `--flip`.
+Re-rendering PHerc0814 segment `46527` this way at level 2 matched the published surface volume with normalised cross-correlation 0.94 at zero shift. The published volumes use the opposite normal sign, so pass `--flip`.
+
+The official `vc_render_tifxyz` from the same VC3D release can also stream a remote volume: pass the `https://` OME-Zarr URL as `-v`. Use whichever fits your setup. `render.py` is a small pure-Python alternative that is easy to modify.
 
 <figure>
   <img src="/img/tutorials/mac-renderer-vs-official.webp" />
