@@ -48,12 +48,17 @@ public:
     struct Row {
         // uuid, name, tags, meta, surface detail, change stamps and approval.
         vc::objects::ObjectRecord record;
-        // Volume voxels per stored unit; nullopt for a surface not bound to the volume.
-        std::optional<double> toVolume;
+        // Stored coordinates to the open volume's voxels; nullopt when the store
+        // cannot map the surface into the volume.
         std::optional<vc::objects::VolumeAffine> mapping;
         // The store it is in; catalog rows are read-only.
         Source source;
         bool catalog = false;
+        // Shown and opened in the open volume (through `mapping`).
+        bool bound() const { return mapping.has_value(); }
+        // Input for external tools, which read stored coordinates: a user
+        // surface stored in the open volume's voxels.
+        bool toolInput() const { return !catalog && mapping == vc::objects::VolumeAffine::identity(); }
     };
     // A materialized surface: points in the volume's voxels, pinned at the
     // revisions it was read from.

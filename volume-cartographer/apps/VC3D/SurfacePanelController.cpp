@@ -196,7 +196,7 @@ void SurfacePanelController::setItemRow(SurfaceTreeWidgetItem* item, const Surfa
     const double areaCm2 = number_or(meta, "area_cm2", -1.0);
     const double avgCost = number_or(meta, "avg_cost", -1.0);
     item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(row.record.uuid));
-    item->setData(SURFACE_ID_COLUMN, kUnboundRole, !row.toVolume.has_value());
+    item->setData(SURFACE_ID_COLUMN, kUnboundRole, !row.bound());
     item->setText(SURFACE_ID_COLUMN, name);
     const auto coordinates=row_meta(row).value("coordinates",nlohmann::json::object());
     const auto source=coordinates.value("volume_uuid",nlohmann::json(nullptr));
@@ -402,8 +402,9 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         targets << segmentId;
     }
 
-    // Tools and edits need the surface in this volume's voxels on a writable store;
-    // catalog surfaces are read-only.
+    // Edits need a writable store; catalog surfaces are read-only. In-app edits
+    // read a bound surface through its view; external tools read stored
+    // coordinates, so they take user surfaces stored in this volume's voxels.
     const bool storeWritable = _catalog->attachment() && _catalog->session()->writable(*_catalog->attachment());
     const bool writable = storeWritable &&
         std::none_of(targets.begin(), targets.end(), [this](const QString& id) {
@@ -412,12 +413,18 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         });
     auto bound = [this](const QString& id) {
         const auto* row = _catalog->row(id.toStdString());
-        return row && row->toVolume;
+        return row && row->bound();
+    };
+    auto toolInput = [this](const QString& id) {
+        const auto* row = _catalog->row(id.toStdString());
+        return row && row->toolInput();
     };
     const bool isBound = bound(segmentId);
     const bool allBound = std::all_of(targets.begin(), targets.end(), bound);
     const bool usable = isBound && writable;
     const bool allUsable = allBound && writable;
+    const bool toolUsable = toolInput(segmentId) && writable;
+    const bool allToolUsable = std::all_of(targets.begin(), targets.end(), toolInput) && writable;
 
     QMenu contextMenu(tr("Context Menu"), _ui.treeWidget);
 
@@ -456,7 +463,7 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     contextMenu.addSeparator();
 
     QAction* growSegmentAction = contextMenu.addAction(tr("Run Trace"));
-    growSegmentAction->setEnabled(usable);
+    growSegmentAction->setEnabled(toolUsable);
     connect(growSegmentAction, &QAction::triggered, this, [this, segmentId]() {
         emit growSegmentRequested(segmentId);
     });
@@ -470,17 +477,17 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         copySurfaceMenu->addSeparator();
     }
     QAction* copyOutAction = copySurfaceMenu->addAction(tr("Out"));
-    copyOutAction->setEnabled(usable);
+    copyOutAction->setEnabled(toolUsable);
     connect(copyOutAction, &QAction::triggered, this, [this, segmentId]() {
         emit neighborCopyRequested(segmentId, true);
     });
     QAction* copyInAction = copySurfaceMenu->addAction(tr("In"));
-    copyInAction->setEnabled(usable);
+    copyInAction->setEnabled(toolUsable);
     connect(copyInAction, &QAction::triggered, this, [this, segmentId]() {
         emit neighborCopyRequested(segmentId, false);
     });
     QAction* resumeLocalAction = contextMenu.addAction(tr("Reoptimize Surface"));
-    resumeLocalAction->setEnabled(usable);
+    resumeLocalAction->setEnabled(toolUsable);
     connect(resumeLocalAction, &QAction::triggered, this, [this, segmentId]() {
         emit resumeLocalGrowPatchRequested(segmentId);
     });
@@ -493,8 +500,8 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         connect(action, &QAction::triggered, this, [this, segmentId, signal]() { emit (this->*signal)(segmentId); });
         return action;
     };
-    addToolAction(tr("Render segment"), usable, &SurfacePanelController::renderSegmentRequested);
-    addToolAction(tr("Convert to OBJ"), usable, &SurfacePanelController::convertToObjRequested);
+    addToolAction(tr("Render segment"), toolUsable, &SurfacePanelController::renderSegmentRequested);
+    addToolAction(tr("Convert to OBJ"), toolUsable, &SurfacePanelController::convertToObjRequested);
     addToolAction(tr("Lasagna Vis as OBJ"), usable, &SurfacePanelController::visLasagnaObjRequested);
     addToolAction(tr("Crop bounds to valid region"), usable, &SurfacePanelController::cropBoundsRequested);
 
@@ -514,22 +521,22 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     });
 
     addToolAction(tr("Rotate Surface 90° CW"), usable, &SurfacePanelController::rotateSurfaceRequested);
-    addToolAction(tr("Refine (Alpha-comp)"), usable, &SurfacePanelController::alphaCompRefineRequested);
-    addToolAction(tr("SLIM-flatten"), usable, &SurfacePanelController::slimFlattenRequested);
-    addToolAction(tr("Straighten (vc_straighten)"), usable, &SurfacePanelController::straightenRequested);
-    addToolAction(tr("ABF++ flatten"), usable, &SurfacePanelController::abfFlattenRequested);
+    addToolAction(tr("Refine (Alpha-comp)"), toolUsable, &SurfacePanelController::alphaCompRefineRequested);
+    addToolAction(tr("SLIM-flatten"), toolUsable, &SurfacePanelController::slimFlattenRequested);
+    addToolAction(tr("Straighten (vc_straighten)"), toolUsable, &SurfacePanelController::straightenRequested);
+    addToolAction(tr("ABF++ flatten"), toolUsable, &SurfacePanelController::abfFlattenRequested);
 
     contextMenu.addSeparator();
 
     QAction* rasterizeAction = contextMenu.addAction(tr("Rasterize"));
-    rasterizeAction->setEnabled(allUsable);
+    rasterizeAction->setEnabled(allToolUsable);
     connect(rasterizeAction, &QAction::triggered, this, [this, targets]() {
         emit rasterizeSegmentsRequested(targets);
     });
 
     // Merge only makes sense for >=2 surfaces; gate on selection so it
     // doesn't appear when the user right-clicks a single surface.
-    if (selectedSegmentIds.size() >= 2 && allUsable) {
+    if (selectedSegmentIds.size() >= 2 && allToolUsable) {
         QAction* mergeAction = contextMenu.addAction(tr("Merge surfaces..."));
         connect(mergeAction, &QAction::triggered, this, [this, selectedSegmentIds]() {
             emit mergeTifxyzRequested(selectedSegmentIds);
@@ -537,7 +544,7 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     }
     // Patch is exactly-2-input; gate to exactly 2 selected surfaces so the
     // dialog opens with both pickers pre-filled.
-    if (selectedSegmentIds.size() == 2 && allUsable) {
+    if (selectedSegmentIds.size() == 2 && allToolUsable) {
         QAction* patchAction = contextMenu.addAction(tr("Patch surface..."));
         connect(patchAction, &QAction::triggered, this, [this, selectedSegmentIds]() {
             emit mergePatchRequested(selectedSegmentIds);
@@ -1731,7 +1738,7 @@ void SurfacePanelController::applyFiltersInternal()
         item->setHidden(!show);
         if (!show) {
             ++filterCounter;
-        } else if (row->toVolume && (!currentOnly || id == _currentSurfaceId)) {
+        } else if (row->bound() && (!currentOnly || id == _currentSurfaceId)) {
             visible.push_back(id);
         }
     }

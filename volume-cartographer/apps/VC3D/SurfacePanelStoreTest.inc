@@ -124,7 +124,7 @@ int runSurfacePanelStoreTests()
         catalog.setCatalogSources({{state.catalogAttachment(catalogPath), "catalog-volume", 0.5}});
         pump([&] { return tree.topLevelItemCount() == 4; }, "catalog surfaces are listed beside the user's");
         require(catalog.row(shown)->catalog && !catalog.row(plain)->catalog, "rows know their store");
-        require(catalog.row(shown)->toVolume == 0.5, "catalog rows are scaled to the open volume's level");
+        require(catalog.row(shown)->mapping == vc::objects::VolumeAffine::scale(0.5) && !catalog.row(shown)->toolInput(), "catalog rows are scaled to the open volume's level");
 
         require(panel.activateSurfaceById(shown, &error), "catalog surfaces open");
         require((*activated.back()->rawPointsPtr())(1, 2) == cv::Vec3f(1, 0.5f, 1), "in the open volume's voxels");
@@ -145,7 +145,7 @@ int runSurfacePanelStoreTests()
 
         const auto copy = catalog.copy(shown, "editable");
         catalog.readNow({copy});
-        require(catalog.row(copy) && !catalog.row(copy)->catalog && catalog.row(copy)->toVolume == 1.0,
+        require(catalog.row(copy) && !catalog.row(copy)->catalog && catalog.row(copy)->toolInput(),
                 "a copy of a catalog surface is the user's, in the open volume's voxels");
         require(panel.activateSurfaceById(copy, &error) && panel.opened()->editable &&
                 (*activated.back()->rawPointsPtr())(1, 2) == cv::Vec3f(1, 0.5f, 1), "the copy opens editable");

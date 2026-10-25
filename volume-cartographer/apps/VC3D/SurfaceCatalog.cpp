@@ -43,10 +43,7 @@ Listing list(ObjectStoreSession& session, const std::vector<SurfaceCatalog::Sour
             for (auto& record : db.selectObjects(txn, selection, kRowFields)) {
                 if (cancel.load() || cancelled.load()) return;
                 SurfaceCatalog::Row row;
-                row.mapping = transforms.toVolume(nlohmann::json::parse(record.meta), source.volume,source.scale);
-                row.toVolume = geometryScaleToVolume(nlohmann::json::parse(record.meta), source.volume);
-                if (row.toVolume) *row.toVolume *= source.scale;
-                else if(row.mapping)row.toVolume=1.;
+                row.mapping = transforms.toVolume(nlohmann::json::parse(record.meta), source.volume, source.scale);
                 row.record = std::move(record);
                 row.source = source;
                 row.catalog = catalog;

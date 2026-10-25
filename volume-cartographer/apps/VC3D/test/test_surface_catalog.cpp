@@ -84,8 +84,11 @@ int main(int argc, char** argv)
         session->takeEvents();
         catalog.setSource(attachment, volume);
         pump([&] { return !catalog.loading() && catalog.rows().size() == 4; }, "lists the volume's surfaces and those not bound to it");
-        require(catalog.row(native)->toVolume == 1.0 && catalog.row(half)->toVolume == 2.0 && !catalog.row(unbound)->toVolume &&
-                !catalog.row(other)->toVolume, "rows carry the volume scale; other volumes' surfaces are unbound here");
+        require(catalog.row(native)->mapping == VolumeAffine::identity() && catalog.row(half)->mapping == VolumeAffine::scale(2.0) &&
+                !catalog.row(unbound)->bound() && !catalog.row(other)->bound(),
+                "rows carry the mapping to the volume; other volumes' surfaces are unbound here");
+        require(catalog.row(native)->toolInput() && !catalog.row(half)->toolInput(),
+                "tools take surfaces stored in the volume's voxels");
         require(catalog.row(native)->record.name == "native" && catalog.row(native)->record.tags == std::vector<std::string>{"approved"},
                 "rows carry name and tags");
 

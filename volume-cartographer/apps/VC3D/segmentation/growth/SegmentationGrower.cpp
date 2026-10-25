@@ -726,7 +726,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         }
         PatchTracerSource source{catalog->session(), {}, sourceTag};
         for (const auto& [uuid, row] : catalog->rows()) {
-            if (!row.toVolume || uuid == segmentationSurface->id ||
+            if (!row.bound() || uuid == segmentationSurface->id ||
                 std::find(row.record.tags.begin(), row.record.tags.end(), sourceTag.toStdString()) == row.record.tags.end()) {
                 continue;
             }
@@ -1226,7 +1226,8 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
         return false;
     }
     const auto pin = _context.module->storePin(segmentationSurface.get());
-    if (!pin || !pin->geometryRevision) {
+    const auto* row = catalog->row(segmentationSurface->id);
+    if (!pin || !pin->geometryRevision || !row || !row->toolInput()) {
         showStatus(tr("Copy with NT needs a surface opened from a writable object store in the volume's voxels."),
                    kStatusLong);
         return false;

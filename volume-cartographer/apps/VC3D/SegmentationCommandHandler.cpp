@@ -1475,7 +1475,7 @@ SegmentationCommandHandler::storedSurface(const std::string& id, CommandLaunchEr
                CommandLaunchError::InvalidState);
         return std::nullopt;
     }
-    if (!row->mapping || *row->mapping != vc::objects::VolumeAffine::identity()) {
+    if (!row->toolInput()) {
         setErr(tr("Surface %1 is not stored in the current volume's voxels; tools read stored coordinates.")
                    .arg(QString::fromStdString(id)),
                CommandLaunchError::InvalidState);
@@ -3471,7 +3471,7 @@ std::vector<const SurfaceCatalog::Row*> SegmentationCommandHandler::toolSurfaces
     std::vector<const SurfaceCatalog::Row*> rows;
     if (auto* catalog = _surfacePanel ? _surfacePanel->catalog() : nullptr) {
         for (const auto& [uuid, row] : catalog->rows())
-            if (row.mapping && *row.mapping == vc::objects::VolumeAffine::identity()) rows.push_back(&row);
+            if (row.toolInput()) rows.push_back(&row);
     }
     return rows;
 }

@@ -181,7 +181,7 @@ inline QJsonObject surfaceRowJson(const SurfaceCatalog::Row& row, const std::str
     o["name"] = QString::fromStdString(row.record.name);
     o["tags"] = tags;
     o["catalog"] = row.catalog;
-    o["bound"] = row.toVolume.has_value();
+    o["bound"] = row.bound();
     o["active"] = row.record.uuid == activeId;
     return o;
 }
