@@ -1877,12 +1877,12 @@ void MenuActionController::importUmbilicus()
     }
 
     // One umbilicus per volume: importing replaces the ones bound to it.
-    std::vector<std::string> replaced;
+    vc::objects::RevisionSelection replaced;
     state.objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
         vc::objects::ObjectSelection selection;
         selection.kind = "umbilicus";
         selection.volume = volume->id();
-        for (const auto& record : db.selectObjects(txn, selection)) replaced.push_back(record.uuid);
+        replaced = db.currentRevisions(txn, selection);
     });
     if (!replaced.empty() &&
         QMessageBox::question(_window, QObject::tr("Import Umbilicus"),
@@ -1898,13 +1898,11 @@ void MenuActionController::importUmbilicus()
     vc::geometry::Umbilicus geometry;
     for (const auto& p : info.controlPoints) geometry.points.push_back({p[0], p[1], p[2]});
     const auto uuid = vc::objects::util::newUuid();
-    vc::objects::RevisionSelection pins{{uuid, std::nullopt}};
+    auto pins = replaced;
+    pins[uuid] = std::nullopt;
     try {
-        state.objectStoreSession()->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-            for (const auto& id : replaced) pins[id] = db.currentObjectRevision(txn, id)->uuid;
-        });
         state.objectStoreSession()->act(*attachment, pins, [&](auto& db, auto& txn) {
-            for (const auto& id : replaced) db.retireObject(txn, id);
+            for (const auto& [id, revision] : replaced) db.retireObject(txn, id);
             vc::objects::ObjectRecord record;
             record.uuid = uuid;
             record.kind = "umbilicus";
@@ -1936,8 +1934,7 @@ void MenuActionController::removeUmbilicus()
         vc::objects::ObjectSelection selection;
         selection.kind = "umbilicus";
         selection.volume = volumeId;
-        for (const auto& record : db.selectObjects(txn, selection))
-            pins[record.uuid] = db.currentObjectRevision(txn, record.uuid)->uuid;
+        pins = db.currentRevisions(txn, selection);
     });
     if (pins.empty()) {
         QMessageBox::information(_window, QObject::tr("Remove Umbilicus"),

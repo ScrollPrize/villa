@@ -4846,11 +4846,8 @@ bool LineAnnotationController::exportFibersToPath(const fs::path& exportPath,
         nlohmann::json root{{"type", "vc3d_fiber_collection"}, {"version", 1},
                             {"point_collections", nlohmann::json::array()}};
         connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-            vc::objects::RevisionSelection selection;
             vc::objects::ObjectSelection objects; objects.kind = "fiber"; objects.includeRetired = true;
-            for (const auto& object : db.selectObjects(txn, objects))
-                selection[object.uuid] = db.currentObjectRevision(txn, object.uuid)->uuid;
-            for (const auto& [uuid, document] : vc::objects::fiberNetworkJson(db, txn, selection))
+            for (const auto& [uuid, document] : vc::objects::fiberNetworkJson(db, txn, db.currentRevisions(txn, objects)))
                 root["point_collections"].push_back(nlohmann::json::parse(document));
         });
 
@@ -14854,11 +14851,8 @@ std::map<std::string, fs::path> LineAnnotationController::fiberTransportPaths(
     }
     std::map<std::string, std::string> documents;
     connection->read(*attachment, [&](const auto& db, const auto& txn, const auto&) {
-        vc::objects::RevisionSelection selection;
         vc::objects::ObjectSelection objects; objects.kind = "fiber"; objects.includeRetired = true;
-        for (const auto& object : db.selectObjects(txn, objects))
-            selection[object.uuid] = db.currentObjectRevision(txn, object.uuid)->uuid;
-        documents = vc::objects::fiberNetworkJson(db, txn, selection, roots);
+        documents = vc::objects::fiberNetworkJson(db, txn, db.currentRevisions(txn, objects), roots);
     });
     return vc3d::materializeJsonDocuments(_fiberTransportDirectory, *attachment, documents);
 }
