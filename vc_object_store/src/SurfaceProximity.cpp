@@ -77,7 +77,7 @@ std::vector<SurfaceProximityHit> ObjectStore::nearestSurfaces(const ReadTxn& txn
     if (includedIds) tiles.bind(8, *includedIds);
     const Vec3 p{query.point};
     const double toleranceSq = query.tolerance * query.tolerance;
-    std::optional<GeometryReader> reader;
+    std::optional<RetainedGeometryReader> reader;
     bool hasValid = false;
     std::optional<SurfaceProximityHit> best;
     double bestSq = INFINITY;
@@ -90,12 +90,12 @@ std::vector<SurfaceProximityHit> ObjectStore::nearestSurfaces(const ReadTxn& txn
             finish();
             object = uuid;
             reader.emplace(db, revision);
-            hasValid = reader->manifest().at("arrays").contains(surfaceValidChannel);
+            hasValid = (*reader)->manifest().at("arrays").contains(surfaceValidChannel);
         }
         const auto row0 = tiles.i64(2), col0 = tiles.i64(3), rows = tiles.i64(4), cols = tiles.i64(5);
         if (rows < 2 || cols < 2) continue;
-        const auto bytes = reader->rectangle("points", row0, col0, rows, cols);
-        const auto valid = hasValid ? reader->rectangle(surfaceValidChannel, row0, col0, rows, cols) : std::vector<uint8_t>{};
+        const auto bytes = (*reader)->rectangle("points", row0, col0, rows, cols);
+        const auto valid = hasValid ? (*reader)->rectangle(surfaceValidChannel, row0, col0, rows, cols) : std::vector<uint8_t>{};
         std::vector<Vec3> world(size_t(rows * cols));
         std::vector<uint8_t> usable(world.size());
         for (size_t i = 0; i < world.size(); ++i) {

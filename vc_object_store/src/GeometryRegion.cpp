@@ -51,6 +51,40 @@ RegionKind regionKind(const std::string& kind)
 }
 // A crossing of the plane on the grid edge between two vertices (lower linear index first).
 using GridEdge = std::pair<int64_t, int64_t>;
+// The grid edges a surface's cut crosses, each with its crossing point and the
+// (at most two) segments through it, in insertion order. Open addressing: no
+// allocation per edge.
+class EdgeCrossings {
+public:
+    static constexpr size_t none = SIZE_MAX;
+    struct Slot { GridEdge edge; Point point{}; std::array<size_t, 2> segments{none, none}; };
+    // The slot of `edge`, and whether it was just added.
+    std::pair<size_t, bool> insert(const GridEdge& edge) {
+        if ((slots_.size() + 1) * 2 > table_.size()) grow();
+        for (size_t i = hash(edge) & (table_.size() - 1);; i = (i + 1) & (table_.size() - 1)) {
+            if (table_[i] == none) {
+                table_[i] = slots_.size();
+                slots_.push_back({edge});
+                return {table_[i], true};
+            }
+            if (slots_[table_[i]].edge == edge) return {table_[i], false};
+        }
+    }
+    Slot& operator[](size_t slot) { return slots_[slot]; }
+private:
+    static size_t hash(const GridEdge& e) {
+        const uint64_t h = uint64_t(e.first) * 0x9e3779b97f4a7c15ull ^ uint64_t(e.second) * 0xc2b2ae3d27d4eb4full;
+        return h ^ (h >> 29);
+    }
+    void grow() {
+        table_.assign(std::max<size_t>(1024, table_.size() * 2), none);
+        for (size_t s = 0; s < slots_.size(); ++s)
+            for (size_t i = hash(slots_[s].edge) & (table_.size() - 1);; i = (i + 1) & (table_.size() - 1))
+                if (table_[i] == none) { table_[i] = s; break; }
+    }
+    std::vector<size_t> table_;
+    std::vector<Slot> slots_;
+};
 struct RequestScope {
     sqlite3* db;
     ReadRequest& request;
@@ -79,6 +113,12 @@ Point project(const RegionSlice& view, const Point& point) {
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j) p[i] += (point[j] - view.origin[j]) * axes[i][j];
     return p;
+}
+// project(view, point)[2] with the same arithmetic.
+double normalDistance(const RegionSlice& view, const Point& point) {
+    double d = 0;
+    for (int j = 0; j < 3; ++j) d += (point[j] - view.origin[j]) * view.normal[j];
+    return d;
 }
 Bounds worldBounds(const RegionSlice& view) {
     validateBounds(view.localBounds);
@@ -190,48 +230,67 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
     // into polylines across tiles; the polylines are then clipped to u/v.
     const double planeOffset = (view.localBounds[2] + view.localBounds[5]) / 2;
     const Bounds planeBox{view.localBounds[0], view.localBounds[1], -1, view.localBounds[3], view.localBounds[4], 1};
+    // Every surface tile in the slab, by object in row/column order: one R-tree
+    // search per query instead of scanning each surface's tiles.
+    std::optional<std::map<int64_t, std::vector<std::array<int64_t, 4>>>> surfaceTiles;
+    auto tilesOf = [&](int64_t id) -> const std::vector<std::array<int64_t, 4>>& {
+        if (!surfaceTiles) {
+            surfaceTiles.emplace();
+            Statement tiles(db, "SELECT b.object_id,b.row_start,b.col_start,b.row_count,b.col_count FROM spatial_regions_rtree r "
+                "CROSS JOIN spatial_regions b ON b.id=r.id WHERE b.array_name='points' AND " + spatialOverlapSql() +
+                " ORDER BY b.object_id,b.row_start,b.col_start");
+            for (int i = 0; i < 6; ++i) tiles.bind(i + 1, bounds[i]);
+            while (tiles.row()) (*surfaceTiles)[tiles.i64(0)].push_back({tiles.i64(1), tiles.i64(2), tiles.i64(3), tiles.i64(4)});
+        }
+        static const std::vector<std::array<int64_t, 4>> none;
+        const auto found = surfaceTiles->find(id);
+        return found == surfaceTiles->end() ? none : found->second;
+    };
     auto processSurface = [&](const std::string& uuid, int64_t id, const std::string& revision) {
         if(options.toTarget && options.minLength>0 && transformedLength(db,revision,*options.toTarget,options.kind)<options.minLength)return;
-        GeometryReader reader(db, revision);
+        RetainedGeometryReader retained(db, revision);
+        auto& reader = *retained;
         const auto& arrays = reader.manifest().at("arrays");
         const auto shape = arrays.at("points").at("shape").get<std::vector<int64_t>>();
         if (arrays.at("points").at("dtype") != kind.dtype) throw std::runtime_error("surface coordinates must be <f4");
         const bool hasValid = arrays.contains(surfaceValidChannel);
         const auto columns = shape.at(1);
-        std::map<GridEdge, Point> crossings;
-        std::vector<std::pair<GridEdge, GridEdge>> segments;
-        Statement regions(db, "SELECT row_start,col_start,row_count,col_count FROM spatial_regions WHERE object_id=?7 "
-            "AND array_name='points' AND max_x>=?1 AND max_y>=?2 AND max_z>=?3 AND min_x<=?4 AND min_y<=?5 AND min_z<=?6 "
-            "ORDER BY row_start,col_start");
-        for (int i = 0; i < 6; ++i) regions.bind(i + 1, bounds[i]);
-        regions.bind(7, id);
-        while (regions.row()) {
+        EdgeCrossings crossings;
+        // Segments between crossing slots.
+        std::vector<std::pair<size_t, size_t>> segments;
+        std::vector<Point> world;
+        std::vector<double> distance;
+        std::vector<uint8_t> usable;
+        for (const auto& [row0, col0, rows, cols] : tilesOf(id)) {
             requestWork(&RegionStats::candidateVisits);
-            const auto row0 = regions.i64(0), col0 = regions.i64(1), rows = regions.i64(2), cols = regions.i64(3);
             if (rows < 2 || cols < 2) continue;
             const auto bytes = reader.rectangle("points", row0, col0, rows, cols);
             const auto valid = hasValid ? reader.rectangle(surfaceValidChannel, row0, col0, rows, cols) : std::vector<uint8_t>{};
-            std::vector<Point> world(size_t(rows * cols));
-            std::vector<double> distance(world.size());
-            std::vector<uint8_t> usable(world.size());
+            world.resize(size_t(rows * cols));
+            distance.resize(world.size());
+            usable.resize(world.size());
+            // Only usable vertices take part in a cell; a region whose usable
+            // vertices all lie on one side of the plane has no crossing cell.
+            bool below = false, above = false;
             for (size_t i = 0; i < world.size(); ++i) {
                 std::array<float, 3> q; copyScalars<float>(std::span(bytes).subspan(i * 12, 12), q);
+                usable[i] = vc::geometry::validSurfacePoint(q) && (!hasValid || valid[i]);
+                if (!usable[i]) continue;
                 world[i] = {q[0], q[1], q[2]};
                 if(options.toTarget)world[i]=options.toTarget->apply(world[i]);
-                usable[i] = vc::geometry::validSurfacePoint(q) && (!hasValid || valid[i]);
-                distance[i] = project(view, world[i])[2] - planeOffset;
+                distance[i] = normalDistance(view, world[i]) - planeOffset;
+                (distance[i] >= 0 ? above : below) = true;
             }
+            if (!above || !below) continue;
             auto global = [&](int64_t r, int64_t c) { return (row0 + r) * columns + col0 + c; };
             auto crossing = [&](int64_t a, int64_t b, int64_t ga, int64_t gb) {
                 if (ga > gb) { std::swap(a, b); std::swap(ga, gb); }
-                const GridEdge edge{ga, gb};
-                if (!crossings.contains(edge)) {
+                const auto [slot, inserted] = crossings.insert({ga, gb});
+                if (inserted) {
                     const double t = distance[a] / (distance[a] - distance[b]);
-                    Point p;
-                    for (int k = 0; k < 3; ++k) p[k] = world[a][k] + t * (world[b][k] - world[a][k]);
-                    crossings.emplace(edge, p);
+                    for (int k = 0; k < 3; ++k) crossings[slot].point[k] = world[a][k] + t * (world[b][k] - world[a][k]);
                 }
-                return edge;
+                return slot;
             };
             for (int64_t r = 0; r + 1 < rows; ++r)
                 for (int64_t c = 0; c + 1 < cols; ++c) {
@@ -242,32 +301,36 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
                     const std::array<int64_t, 4> g{global(r, c), global(r, c + 1), global(r + 1, c + 1), global(r + 1, c)};
                     for (const auto& tri : {std::array<int, 3>{0, 1, 3}, std::array<int, 3>{1, 2, 3}}) {
                         ++result.stats.segmentTests;
-                        std::vector<GridEdge> cut;
+                        std::array<size_t, 3> cut;
+                        int cuts = 0;
                         for (int e = 0; e < 3; ++e) {
                             const auto a = tri[e], b = tri[(e + 1) % 3];
-                            if ((distance[v[a]] >= 0) != (distance[v[b]] >= 0)) cut.push_back(crossing(v[a], v[b], g[a], g[b]));
+                            if ((distance[v[a]] >= 0) != (distance[v[b]] >= 0)) cut[cuts++] = crossing(v[a], v[b], g[a], g[b]);
                         }
-                        if (cut.size() == 2) segments.emplace_back(cut[0], cut[1]);
+                        if (cuts == 2) segments.emplace_back(cut[0], cut[1]);
                     }
                 }
         }
-        // Chain segments through their shared grid edges, in emission order.
-        std::map<GridEdge, std::vector<size_t>> incident;
-        for (size_t i = 0; i < segments.size(); ++i) {
-            incident[segments[i].first].push_back(i);
-            incident[segments[i].second].push_back(i);
-        }
+        // Chain segments through their shared grid edges, in emission order. A
+        // grid edge borders at most two triangles, each cut by one segment.
+        constexpr size_t none = EdgeCrossings::none;
+        for (size_t i = 0; i < segments.size(); ++i)
+            for (const auto slot : {segments[i].first, segments[i].second}) {
+                auto& through = crossings[slot].segments;
+                if (through[1] != none) throw std::logic_error("surface region: grid edge on three triangles");
+                through[through[0] == none ? 0 : 1] = i;
+            }
         std::vector<bool> used(segments.size());
         bool hit = false;
         for (size_t start = 0; start < segments.size(); ++start) {
             if (used[start]) continue;
             used[start] = true;
-            std::deque<GridEdge> chain{segments[start].first, segments[start].second};
+            std::deque<size_t> chain{segments[start].first, segments[start].second};
             auto extend = [&](bool front) {
                 for (;;) {
                     const auto end = front ? chain.front() : chain.back();
-                    const auto& next = incident.at(end);
-                    const auto it = std::find_if(next.begin(), next.end(), [&](size_t s) { return !used[s]; });
+                    const auto& next = crossings[end].segments;
+                    const auto it = std::find_if(next.begin(), next.end(), [&](size_t s) { return s != none && !used[s]; });
                     if (it == next.end()) return;
                     used[*it] = true;
                     const auto other = segments[*it].first == end ? segments[*it].second : segments[*it].first;
@@ -278,8 +341,8 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
             // Clip the polyline to the slice's u/v extent; each inside stretch is a run.
             bool open = false;
             for (size_t i = 0; i + 1 < chain.size(); ++i) {
-                const auto& a = crossings.at(chain[i]);
-                const auto& b = crossings.at(chain[i + 1]);
+                const auto& a = crossings[chain[i]].point;
+                const auto& b = crossings[chain[i + 1]].point;
                 auto pa = project(view, a), pb = project(view, b);
                 pa[2] = pb[2] = 0;
                 double first, last;
@@ -305,7 +368,8 @@ RegionResult ObjectStore::geometryRegion(const ReadTxn& txn, const RegionSlice& 
     auto process = [&](const std::string& uuid, int64_t id, const std::string& revision, const std::string& family) {
         if (kind.surface) return processSurface(uuid, id, revision);
         if(options.toTarget && options.minLength>0 && transformedLength(db,revision,*options.toTarget,options.kind)<options.minLength)return;
-        GeometryReader reader(db, revision);
+        RetainedGeometryReader retained(db, revision);
+        auto& reader = *retained;
         const auto& arrays = reader.manifest().at("arrays");
         std::string name = kind.arrays.back();
         for (const auto& candidate : kind.arrays)

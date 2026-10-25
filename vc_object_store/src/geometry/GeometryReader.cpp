@@ -28,8 +28,9 @@ public:
     void retain(const std::string& revision, std::shared_ptr<GeometryReader> reader) {
         const auto charge = reader->retainedCharge();
         if (charge > budget_) return;
-        // Also bound revision/node overhead, including empty geometries.
-        while (charge_ > budget_ - charge || readers_.size() >= 64) {
+        // Also bound revision/node overhead, including empty geometries: one
+        // reader per MiB of budget, at least 64.
+        while (charge_ > budget_ - charge || readers_.size() >= std::max<size_t>(64, budget_ >> 20)) {
             const auto old = readers_.find(recency_.front());
             charge_ -= old->second.charge;
             readers_.erase(old); recency_.pop_front();
@@ -63,19 +64,34 @@ void beginReadCaches(sqlite3* db, StatementPool& pool, size_t geometryBudget, si
     beginSpatialRead(pool, spatialBudget, version);
 }
 
+namespace {
+std::shared_ptr<GeometryReadCache> connectionGeometryCache(sqlite3* db)
+{
+    const auto lease = activeStatementPools.find(db);
+    return lease == activeStatementPools.end() ? nullptr : lease->second->geometryCache;
+}
+}
+
+RetainedGeometryReader::RetainedGeometryReader(sqlite3* db, std::string revision)
+    : db_(db), revision_(std::move(revision)), exceptions_(std::uncaught_exceptions())
+{
+    const auto cache = connectionGeometryCache(db_);
+    reader_ = cache ? cache->take(revision_) : nullptr;
+    if (!reader_) reader_ = std::make_shared<GeometryReader>(db_, revision_);
+}
+
+RetainedGeometryReader::~RetainedGeometryReader()
+{
+    if (std::uncaught_exceptions() != exceptions_) return;
+    try {
+        if (const auto cache = connectionGeometryCache(db_)) cache->retain(revision_, std::move(reader_));
+    } catch (...) {} // retention is an optimization
+}
+
 template<class F> auto withGeometryReader(const Txn& txn, const std::string& revision, F&& read)
 {
-    auto* db = ObjectStoreImplAccess::conn(txn);
-    std::shared_ptr<GeometryReadCache> cache;
-    if (const auto lease = activeStatementPools.find(db); lease != activeStatementPools.end())
-        cache = lease->second->geometryCache;
-    auto reader = cache ? cache->take(revision) : nullptr;
-    if (!reader) reader = std::make_shared<GeometryReader>(db, revision);
-    // A failed read discards its reader; partially verified data never poisons
-    // a future attempt. Successful readers remain connection/snapshot scoped.
-    auto result = read(*reader);
-    if (cache) cache->retain(revision, std::move(reader));
-    return result;
+    RetainedGeometryReader reader(ObjectStoreImplAccess::conn(txn), revision);
+    return read(*reader);
 }
 
 GeometryReader::GeometryReader(const Txn& txn, const std::string& revision, bool cacheChunks)
@@ -185,7 +201,7 @@ void GeometryReader::visitChunk(const std::string& name, int64_t index,
     const ChunkKey key{name, index};
     auto found = chunks_.find(key);
     if (found != chunks_.end()) {
-        requestBytes(found->second.bytes.size(), &RegionStats::cacheBytes);
+        requestServed(found->second.bytes.size(), &RegionStats::cacheBytes);
         recency_.splice(recency_.end(), recency_, found->second.recency);
         visit(found->second.bytes);
         return;
@@ -397,6 +413,7 @@ std::vector<uint8_t> GeometryReader::rectangle(const std::string& name, int64_t 
         rows > shape[0] - row || columns > shape[1] - column)
         throw std::out_of_range("geometry: invalid rectangle");
     const auto pixelBytes = surfacePixelBytes(array.at("dtype"), shape);
+    requestBytes(rows * columns * pixelBytes, &RegionStats::reconstructedBytes);
     std::vector<uint8_t> result(static_cast<size_t>(rows * columns * pixelBytes));
     if (!rows || !columns) return result;
     const auto& layout = found->second;
