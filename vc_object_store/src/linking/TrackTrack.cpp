@@ -197,11 +197,12 @@ DetectorReport linkTracksToTracks(objects::ObjectStore& db, const TrackTrackPara
         report.edgesUpdated = committed.edgesUpdated;
         report.edgesSkippedExisting = committed.edgesSkippedExisting;
         report.staleRemoved = committed.staleRemoved;
-        report.problems = committed.problems;
+        report.committed = true;
     } catch (const Cancelled&) {
-        report.problems.push_back("track-track linking cancelled; no edges changed");
+        detail::reportFailure(report, "cancel", "", "cancelled", "track-track linking cancelled; no edges changed");
     } catch (const std::exception& error) {
-        report.problems.push_back(std::string("track-track linking failed; no edges changed: ") + error.what());
+        detail::reportFailure(report, "run", "", error.what(),
+            std::string("track-track linking failed; no edges changed: ") + error.what());
     }
     return report;
 }

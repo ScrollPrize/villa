@@ -28,6 +28,12 @@ DetectorReport commitStoredCandidates(objects::ObjectStore& db, const StoredGeom
     objects::WriteTxn& txn, const std::string& detectorName, int detectorVersion,
     const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
     const StaleEdgeScope* staleScope, const objects::util::ProgressCallback& progress);
+// Record a DetectorIssue, keeping each detector's existing problems text. An
+// empty object names no object.
+void reportFailure(DetectorReport& report, const std::string& stage, const std::string& object,
+    const std::string& reason, const std::string& text);
+void reportDiagnostic(DetectorReport& report, const std::string& stage, const std::string& object,
+    const std::string& reason, const std::string& text, int64_t count = 1);
 // Preflight the complete selection before expensive work or any writes.
 void validateCoordinateParams(const CoordinateParams& params, double explicitScale = 1.0);
 std::map<std::string, double> coordinateScales(const std::vector<objects::ObjectRecord>& objects,

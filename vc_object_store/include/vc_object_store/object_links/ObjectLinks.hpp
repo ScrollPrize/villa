@@ -39,6 +39,21 @@ struct LinkCandidate {
     std::vector<std::string> tags;
 };
 
+// One structured detector outcome. A failure means the run did not do what was
+// asked for its objects (or, with none named, at all): a selected object could
+// not be loaded or validated, or the run was cancelled. Failed objects are left
+// out of stale-edge removal, so their existing edges are unchanged. A diagnostic
+// is an ordinary result, such as rejected candidate pairs, an object too
+// degenerate to link, or an unavailable strip cache.
+struct DetectorIssue {
+    enum class Severity { Failure, Diagnostic };
+    Severity severity = Severity::Failure;
+    std::string stage;                    // "load", "discover", "cache", "cancel" or "run"
+    std::vector<std::string> objectUuids; // affected objects; empty for the whole run
+    std::string reason;
+    int64_t count = 1;                    // occurrences summarized, e.g. rejected pairs
+};
+
 struct DetectorReport {
     int64_t objectsConsidered = 0;   // objects the pass examined
     int64_t candidatesFound = 0;     // candidates produced (before dedupe)
@@ -46,8 +61,16 @@ struct DetectorReport {
     int64_t edgesUpdated = 0;
     int64_t edgesSkippedExisting = 0;
     int64_t staleRemoved = 0;        // own pending edges replaced on re-run
-    std::vector<std::string> problems;
+    bool committed = false;          // the edge counts above were committed
+    std::vector<DetectorIssue> issues;
+    std::vector<std::string> problems; // human-readable text of every issue, in order
+
+    bool failed() const;
+    // Record an issue together with its problems text.
+    void add(DetectorIssue issue, const std::string& text);
 };
+// Invalid parameters and coordinate frames throw before any work. Other errors
+// that abort a whole detector also throw; nothing is committed in that case.
 
 // Optional stale-edge scope for a partial detector run. Both endpoints
 // must be in objectUuids; empty sets deliberately remove nothing.

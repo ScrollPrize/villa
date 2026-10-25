@@ -180,11 +180,17 @@ try {
         params.progress = progress.callback();
         const auto report = detector(db, inputs..., params, nullptr);
         progress.finish();
-        linkFailed |= !report.problems.empty();
+        // Failures (unloadable objects, cancellation) fail the run; diagnostics such
+        // as rejected candidate pairs are ordinary outcomes.
+        linkFailed |= report.failed();
         std::cout << label << ": " << report.objectsConsidered << " " << noun << ", "
                   << report.candidatesFound << " candidates, " << report.edgesCreated << " edges created, "
-                  << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed\n";
-        for (const auto& problem : report.problems) std::cerr << "  ! " << problem << "\n";
+                  << report.edgesUpdated << " updated, " << report.edgesSkippedExisting << " skipped, " << report.staleRemoved << " stale removed"
+                  << (report.committed ? "" : " (nothing committed)") << "\n";
+        for (size_t i = 0; i < report.issues.size(); ++i) {
+            const bool failure = report.issues[i].severity == vc::object_links::DetectorIssue::Severity::Failure;
+            (failure ? std::cerr : std::cout) << (failure ? "  ! " : "  - ") << report.problems[i] << "\n";
+        }
     };
     using namespace vc::object_links;
     if (linkTracks) run("Track crossings", "track-tracks", "tracks", trackParams, linkTracksToTracks);

@@ -45,12 +45,33 @@ bool validPoint(const cv::Vec3f& p)
     return p[0] != -1 && std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
 }
 
+// Load every selected object, recording each one that fails and leaving it out
+// of the run (and so of stale-edge removal). Cancellation and coordinate-frame
+// errors (invalid_argument, e.g. unrepresentable scaled XYZ) still abort the run
+// before any write.
+template <class Load>
+void loadEach(const std::vector<objects::ObjectRecord>& objects, DetectorReport& report,
+    const std::atomic_bool* cancel, Load load)
+{
+    for (const auto& object : objects) {
+        checkCancelled(cancel);
+        try {
+            load(object);
+        } catch (const std::invalid_argument&) {
+            throw;
+        } catch (const std::exception& e) {
+            checkCancelled(cancel);
+            detail::reportFailure(report, "load", object.uuid, e.what(), object.uuid + ": " + e.what() + ", skipped");
+        }
+    }
+}
+
 std::vector<Collection> loadCollections(detail::StoredGeometry& inputs,
-    const PointCollectionPatchParams& params, const std::map<std::string, double>& scales, const std::atomic_bool* cancel)
+    const PointCollectionPatchParams& params, const std::map<std::string, double>& scales,
+    DetectorReport& report, const std::atomic_bool* cancel)
 {
     std::vector<Collection> result;
-    for (const auto& object : inputs.select("point_collection", params.collectionUuids)) {
-        checkCancelled(cancel);
+    loadEach(inputs.select("point_collection", params.collectionUuids), report, cancel, [&](const objects::ObjectRecord& object) {
         const auto geometry = inputs.load(object);
         const auto xyz = geometry.values<double>("points");
         const auto ids = geometry.values<int64_t>("point_ids");
@@ -81,18 +102,19 @@ std::vector<Collection> loadCollections(detail::StoredGeometry& inputs,
         }
         std::sort(collection.points.begin(), collection.points.end(), [](const Point& a, const Point& b) { return a.id < b.id; });
         result.push_back(std::move(collection));
-    }
+    });
     return result;
 }
 
 std::vector<Patch> loadPatches(detail::StoredGeometry& inputs,
-    const PointCollectionPatchParams& params, const std::map<std::string, double>& scales, const std::atomic_bool* cancel)
+    const PointCollectionPatchParams& params, const std::map<std::string, double>& scales,
+    DetectorReport& report, const std::atomic_bool* cancel)
 {
     std::vector<Patch> patches;
     const auto objects = inputs.select("patch", params.patchUuids);
-    for (const auto& object : objects) {
-        checkCancelled(cancel);
-        objects::util::reportProgress(params.progress, "loading PCL target patches", patches.size(), objects.size(), object.uuid);
+    size_t loaded = 0;
+    loadEach(objects, report, cancel, [&](const objects::ObjectRecord& object) {
+        objects::util::reportProgress(params.progress, "loading PCL target patches", loaded++, objects.size(), object.uuid);
         Patch patch;
         patch.object = object;
         patch.sourceScale = scales.at(object.uuid);
@@ -108,7 +130,7 @@ std::vector<Patch> loadPatches(detail::StoredGeometry& inputs,
         const auto scale = patch.surface->scale();
         patch.area /= double(scale[0]) * scale[1];
         patches.push_back(std::move(patch));
-    }
+    });
     return patches;
 }
 
@@ -150,8 +172,9 @@ DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
     detail::StoredGeometry inputs(db);
     const auto pointScales = detail::coordinateScales(inputs.select("point_collection", params.collectionUuids), params, params.pointScale);
     const auto patchScales = detail::coordinateScales(inputs.select("patch", params.patchUuids), params, params.patchScale);
-    auto collections = loadCollections(inputs, params, pointScales, cancel);
-    auto patches = loadPatches(inputs, params, patchScales, cancel);
+    DetectorReport loading;
+    auto collections = loadCollections(inputs, params, pointScales, loading, cancel);
+    auto patches = loadPatches(inputs, params, patchScales, loading, cancel);
     std::map<std::string, size_t> byName;
     std::unordered_map<PatchGrid*, size_t> bySurface;
     std::vector<PatchIndex::SurfacePtr> surfaces;
@@ -242,7 +265,10 @@ DetectorReport linkPointCollectionsToPatches(objects::ObjectStore& db,
     objects::util::reportProgress(params.progress, "committing point-collection links");
     checkCancelled(cancel);
     txn.commit();
+    report.committed = true;
     report.objectsConsidered = int64_t(collections.size() + patches.size());
+    report.issues = std::move(loading.issues);
+    report.problems = std::move(loading.problems);
     return report;
 }
 } // namespace vc::object_links

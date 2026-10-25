@@ -112,6 +112,17 @@ nb::dict detectorReportToPy(const vc::object_links::DetectorReport& rep)
     d["edges_updated"] = rep.edgesUpdated;
     d["edges_skipped_existing"] = rep.edgesSkippedExisting;
     d["stale_removed"] = rep.staleRemoved;
+    d["committed"] = rep.committed;
+    d["failed"] = rep.failed();
+    nb::list issues;
+    for (const auto& issue : rep.issues) {
+        nb::dict item;
+        item["severity"] = issue.severity == vc::object_links::DetectorIssue::Severity::Failure ? "failure" : "diagnostic";
+        item["stage"] = issue.stage; item["object_uuids"] = issue.objectUuids;
+        item["reason"] = issue.reason; item["count"] = issue.count;
+        issues.append(item);
+    }
+    d["issues"] = issues;
     d["problems"] = rep.problems;
     return d;
 }

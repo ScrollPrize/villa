@@ -158,12 +158,12 @@ std::optional<LoadedPatch> loadPatch(detail::StoredGeometry& inputs, const objec
         patch.uuid = object.uuid;
         patch.scale = patch.surface->scale();
         if (!(patch.scale[0] > 0) || !(patch.scale[1] > 0)) {
-            report.problems.push_back(object.uuid + ": invalid scale, skipped");
+            detail::reportFailure(report, "load", object.uuid, "invalid scale", object.uuid + ": invalid scale, skipped");
             return std::nullopt;
         }
 
     } catch (const std::exception& e) {
-        report.problems.push_back(object.uuid + ": load failed: " + e.what());
+        detail::reportFailure(report, "load", object.uuid, e.what(), object.uuid + ": load failed: " + e.what());
         return std::nullopt;
     }
     const auto* points = patch.surface->rawPointsPtr();
@@ -190,7 +190,7 @@ std::optional<LoadedPatch> loadPatch(detail::StoredGeometry& inputs, const objec
         }
     }
     if (patch.samples.empty()) {
-        report.problems.push_back(object.uuid + ": no usable samples, skipped");
+        detail::reportDiagnostic(report, "load", object.uuid, "no usable samples", object.uuid + ": no usable samples, skipped");
         return std::nullopt;
     }
     return patch;
@@ -657,7 +657,7 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
     for (const auto& object : objects) {
         objects::util::reportProgress(progress, "loading patches", loadedCount++, objects.size(), object.uuid);
         if (cancelled()) {
-            report.problems.push_back("patch-overlap: cancelled during loading");
+            detail::reportFailure(report, "cancel", "", "cancelled", "patch-overlap: cancelled during loading");
             return report;
         }
         PhaseTimer loadingTimer(profile.enabled ? &profile.loading : nullptr);
@@ -701,13 +701,13 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
             return harvestTargets(seed, patches, targets, index, params, cancel, profile, patchProgress);
         }();
         if (cancelled()) {
-            report.problems.push_back("patch-overlap: cancelled");
+            detail::reportFailure(report, "cancel", "", "cancelled", "patch-overlap: cancelled");
             return report;
         }
         objects::util::reportProgress(patchProgress, "fitting overlaps");
         for (auto& [ti, collector] : matches) {
             if (cancelled()) {
-                report.problems.push_back("patch-overlap: cancelled");
+                detail::reportFailure(report, "cancel", "", "cancelled", "patch-overlap: cancelled");
                 return report;
             }
             const LoadedPatch& target = patches[ti];
@@ -783,7 +783,8 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
     }
     objects::util::reportProgress(progress, "checking patch pairs", totalPairs, totalPairs);
     for (const auto& [reason, count] : rejections)
-        report.problems.push_back("patch-overlap: " + std::to_string(count) + " pair(s) rejected: " + reason);
+        detail::reportDiagnostic(report, "discover", "", reason,
+            "patch-overlap: " + std::to_string(count) + " pair(s) rejected: " + reason, int64_t(count));
 
     StaleEdgeScope scope{{params.edgeKind}, {}};
     for (const auto& patch : patches) scope.objectUuids.push_back(patch.uuid);
@@ -791,6 +792,7 @@ DetectorReport linkPatchOverlaps(objects::ObjectStore& db,
     DetectorReport committed = detail::commitStoredCandidates(db, inputs, txn, kPatchOverlapDetector, 1, candidates, params.replaceStalePending, &scope, progress);
     if (cancelled()) throw std::runtime_error("patch-overlap: cancelled before commit");
     txn.commit();
+    report.committed = true;
     report.candidatesFound = committed.candidatesFound;
     report.edgesCreated = committed.edgesCreated;
     report.edgesUpdated = committed.edgesUpdated;

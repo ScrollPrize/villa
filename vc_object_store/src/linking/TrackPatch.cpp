@@ -42,7 +42,8 @@ DetectorReport linkTracksToPatches(objects::ObjectStore& db, const std::filesyst
                 return line;
             } catch (const std::exception& error) {
                 if (cancel && cancel->load()) throw;
-                report.problems.push_back("track " + object.uuid + ": " + error.what() + ", skipped");
+                detail::reportFailure(report, "load", object.uuid, error.what(),
+                    "track " + object.uuid + ": " + error.what() + ", skipped");
                 return {};
             }
         };
@@ -50,7 +51,8 @@ DetectorReport linkTracksToPatches(objects::ObjectStore& db, const std::filesyst
             params, params.trackScale, kTrackPatchDetector, 1, cancel);
     } catch (const std::exception& error) {
         DetectorReport report;
-        report.problems.push_back(std::string("track-patch: no objects or edges committed: ") + error.what());
+        detail::reportFailure(report, "run", "", error.what(),
+            std::string("track-patch: no objects or edges committed: ") + error.what());
         return report;
     }
 }

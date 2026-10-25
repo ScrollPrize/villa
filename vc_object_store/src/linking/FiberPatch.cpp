@@ -28,7 +28,8 @@ std::optional<detail::LineData> loadFiber(detail::StoredGeometry& inputs,
         points("line_points", fiber.line);
         points("control_points", fiber.controls);
         if (fiber.line.size() < 2) {
-            report.problems.push_back(object.uuid + ": fewer than two line points, skipped");
+            detail::reportDiagnostic(report, "load", object.uuid, "fewer than two line points",
+                object.uuid + ": fewer than two line points, skipped");
             return std::nullopt;
         }
         fiber.arclength.assign(fiber.line.size(), 0.0);
@@ -66,7 +67,7 @@ std::optional<detail::LineData> loadFiber(detail::StoredGeometry& inputs,
         }
         return fiber;
     } catch (const std::exception& e) {
-        report.problems.push_back(object.uuid + ": invalid stored fiber: " + e.what());
+        detail::reportFailure(report, "load", object.uuid, e.what(), object.uuid + ": invalid stored fiber: " + e.what());
         return std::nullopt;
     }
 }

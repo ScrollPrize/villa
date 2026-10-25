@@ -40,6 +40,32 @@ bool isDetectorsOwnEdge(const EdgeRecord& e, const std::string& detectorName)
 
 }  // namespace
 
+bool DetectorReport::failed() const
+{
+    return std::any_of(issues.begin(), issues.end(),
+        [](const DetectorIssue& issue) { return issue.severity == DetectorIssue::Severity::Failure; });
+}
+
+void DetectorReport::add(DetectorIssue issue, const std::string& text)
+{
+    issues.push_back(std::move(issue));
+    problems.push_back(text);
+}
+
+void detail::reportFailure(DetectorReport& report, const std::string& stage, const std::string& object,
+    const std::string& reason, const std::string& text)
+{
+    report.add({DetectorIssue::Severity::Failure, stage,
+        object.empty() ? std::vector<std::string>{} : std::vector{object}, reason}, text);
+}
+
+void detail::reportDiagnostic(DetectorReport& report, const std::string& stage, const std::string& object,
+    const std::string& reason, const std::string& text, int64_t count)
+{
+    report.add({DetectorIssue::Severity::Diagnostic, stage,
+        object.empty() ? std::vector<std::string>{} : std::vector{object}, reason, count}, text);
+}
+
 static DetectorReport commitCandidatesImpl(objects::ObjectStore& db, objects::WriteTxn& txn,
                                 const std::string& detectorName, int detectorVersion,
                                 const std::vector<LinkCandidate>& candidates, bool replaceStalePending,
@@ -169,6 +195,7 @@ DetectorReport commitCandidates(objects::ObjectStore& db, const std::string& det
                                    replaceStalePending, staleScope, progress);
     objects::util::reportProgress(progress, "committing links");
     txn.commit();
+    report.committed = true;
     return report;
 }
 

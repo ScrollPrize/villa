@@ -439,7 +439,7 @@ std::shared_ptr<PatchGrid> cachedStrip(const LineData& fiber, const SheetNormalS
         std::error_code ec;
         std::filesystem::remove(temporary, ec);
         checkCancelled(cancel);
-        report.problems.push_back(fiber.uuid + ": could not save strip cache: " + e.what());
+        reportDiagnostic(report, "cache", fiber.uuid, e.what(), fiber.uuid + ": could not save strip cache: " + e.what());
     }
     return strip;
 }
@@ -773,7 +773,7 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
             try {
                 stripSource = sampler.identity();
             } catch (const std::exception& e) {
-                report.problems.push_back(std::string("fiber strip cache unavailable: ") + e.what());
+                reportDiagnostic(report, "cache", "", e.what(), std::string("fiber strip cache unavailable: ") + e.what());
             }
         }
         std::set<std::string> identities;
@@ -798,7 +798,7 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
                 quad = scaledPatchSurface(quad, patchScales.at(object.uuid), params.volumeUuid.has_value());
                 surface = std::make_unique<Surface>(quad);
             } catch (const std::exception& e) {
-                report.problems.push_back(object.uuid + ": " + e.what() + ", skipped");
+                reportFailure(report, "load", object.uuid, e.what(), object.uuid + ": " + e.what() + ", skipped");
                 continue;
             }
             unique(uuid);
@@ -863,7 +863,7 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
                 autoLink(fiber, proposals, patches, sampler, lineParams, lineScale, stripSource, report, cancel);
             } catch (const std::exception& e) {
                 checkCancelled(cancel);
-                report.problems.push_back(fiber.uuid + ": " + e.what() + ", skipped");
+                reportFailure(report, "discover", fiber.uuid, e.what(), fiber.uuid + ": " + e.what() + ", skipped");
                 continue;
             }
             if (std::getenv("VC_FIBER_PATCH_PROFILE")) {
@@ -944,6 +944,7 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
         checkCancelled(cancel);
         objects::util::reportProgress(params.progress, "committing links");
         txn.commit();
+        report.committed = true;
         report.candidatesFound = committed.candidatesFound;
         report.edgesCreated = committed.edgesCreated;
         report.edgesUpdated = committed.edgesUpdated;
@@ -951,7 +952,7 @@ DetectorReport linkLinesToPatches(objects::ObjectStore& db, StoredGeometry& inpu
         report.staleRemoved = committed.staleRemoved;
     } catch (const std::exception&) {
         if (!cancel || !cancel->load()) throw;
-        report.problems.push_back(std::string(detector) + ": cancelled; no edges committed");
+        reportFailure(report, "cancel", "", "cancelled", std::string(detector) + ": cancelled; no edges committed");
     }
     return report;
 }
