@@ -52,25 +52,6 @@ private:
     int _previousThreadCount{1};
 };
 
-// maxBackups < 0 -> use QuadSurface's app-configured count (the user setting).
-void createRotatingBackup(QuadSurface* surface, int maxBackups = -1)
-{
-    if (!surface) {
-        return;
-    }
-
-    qCInfo(lcSegGrowth) << "Creating backup for:" << QString::fromStdString(surface->path.string());
-
-    try {
-        // Rotating snapshot; handles path normalization, rotation, file copying,
-        // the per-segment count, and the per-minute throttle internally.
-        surface->saveSnapshot(maxBackups);
-        qCInfo(lcSegGrowth) << "Backup creation complete";
-    } catch (const std::exception& e) {
-        qCWarning(lcSegGrowth) << "Failed to create backup:" << e.what();
-    }
-}
-
 void ensureMetaObject(QuadSurface* surface)
 {
     if (!surface) {
@@ -512,7 +493,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
             }
         }
         qCInfo(lcSegGrowth) << "  params:" << QString::fromStdString(params.dump());
-        createRotatingBackup(context.resumeSurface);
 
         std::optional<ScopedOmpThreadLimit> regularTracerOmpLimit;
         if (request.method == SegmentationGrowthMethod::Tracer) {
@@ -569,10 +549,7 @@ TracerGrowthResult runPatchTracerGrowth(const SegmentationGrowthRequest& request
     }
 
     std::filesystem::path targetDir;
-    if (!context.resumeSurface->path.empty()) {
-        targetDir = context.resumeSurface->path.parent_path();
-    }
-    if (targetDir.empty() && !context.cacheRoot.isEmpty()) {
+    if (!context.cacheRoot.isEmpty()) {
         targetDir = std::filesystem::path(context.cacheRoot.toStdString());
     }
     if (targetDir.empty()) {
@@ -598,7 +575,6 @@ TracerGrowthResult runPatchTracerGrowth(const SegmentationGrowthRequest& request
         qCInfo(lcSegGrowth) << "  surface count:" << static_cast<int>(surfaces.size());
         qCInfo(lcSegGrowth) << "  external patch index:" << (context.surfacePatchIndex != nullptr);
         qCInfo(lcSegGrowth) << "  params:" << QString::fromStdString(params.dump());
-        createRotatingBackup(context.resumeSurface);
         result.surface = grow_surf_from_surfs(context.resumeSurface,
                                               surfaces,
                                               params,

@@ -4,6 +4,7 @@
 #include <vc_object_store/objects/GeometryIngest.hpp>
 #include "ObjectStoreCoordinates.hpp"
 #include "ObjectStoreEvents.hpp"
+#include "ObjectStoreRegions.hpp"
 #include "ObjectStoreArtifacts.hpp"
 #include <vc_object_store/geometry/Geometry.hpp>
 #include "LineAnnotationController.hpp"
@@ -2620,12 +2621,11 @@ bool LineAnnotationController::enableSessionEditing(const std::string& surfaceNa
                   session->suppressErrorDialogs);
         return false;
     }
-    // A hosted replica edits only fibers it leases. Leasing may first pull the
-    // hub's newer record, which the revision check below then reports.
+    // A hosted replica edits only fibers it leases.
     const auto connection = _state ? _state->objectStoreSession() : nullptr;
     if (connection && session->storePin && !session->storePin->objectRevision.empty()) {
         try {
-            session->editingLeases = connection->holdLeases(session->storePin->attachment, {session->fiberUuid});
+            session->editingLeases = vc3d::store::holdForEditing(*connection, *session->storePin);
         } catch (const std::exception& error) {
             showError(tr("This fiber cannot be edited now: %1").arg(QString::fromUtf8(error.what())),
                       session->suppressErrorDialogs);

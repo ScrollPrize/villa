@@ -1,5 +1,7 @@
 #pragma once
 
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
+
 #include <QColor>
 #include <QFuture>
 #include <QObject>
@@ -45,6 +47,7 @@ class CState;
 class PlaneSurface;
 class Surface;
 class QuadSurface;
+class SurfaceStoreEdit;
 class SegmentationEditManager;
 class SegmentationOverlayController;
 class SegmentationWidget;
@@ -75,7 +78,6 @@ public:
     [[nodiscard]] bool editingEnabled() const { return _editingEnabled; }
     [[nodiscard]] SurfacePatchIndex* activeEditSurfacePatchIndex() const;
     [[nodiscard]] bool annotateMode() const { return _annotateMode; }
-    bool ensureActiveSurfaceEditableForModification();
     void setEditingEnabled(bool enabled);
     void setAnnotateMode(bool enabled);
     void setIgnoreSegSurfaceChange(bool ignore);
@@ -135,6 +137,14 @@ public:
     bool prepareEditingDestination(const std::shared_ptr<QuadSurface>& surface);
     void setEditingDestinationResolver(std::function<bool(const std::shared_ptr<QuadSurface>&)> resolver)
     { _editingDestinationResolver = std::move(resolver); }
+    // The store pin a surface was opened at (nothing for surfaces not opened
+    // from the object store); edits of the active surface commit to it.
+    using StorePinResolver = std::function<std::optional<vc::objects::PinnedObject>(const QuadSurface*)>;
+    void setStorePinResolver(StorePinResolver resolver) { _storePinResolver = std::move(resolver); }
+    // Synchronously publish the loaded `channels` of `surface` (approval flushes at boundaries).
+    bool saveSurfaceChannels(QuadSurface* surface, const std::vector<std::string>& channels);
+    // Synchronously publish every changed vertex and loaded channel of `surface`.
+    bool saveSurfaceNow(QuadSurface* surface);
     void endEditingSession();
     [[nodiscard]] bool hasActiveSession() const;
     [[nodiscard]] QuadSurface* activeBaseSurface() const;
@@ -225,7 +235,6 @@ public slots:
 
 signals:
     void editingEnabledChanged(bool enabled);
-    void segmentationFolderChanged(const QString& surfaceId);
     void annotateModeChanged(bool enabled);
     void statusMessageRequested(const QString& text, int timeoutMs);
     void pendingChangesChanged(bool pending);
@@ -238,7 +247,6 @@ signals:
     void growthInProgressChanged(bool running);
     // Emitted when an in-flight autosave reaches non-stale completion.
     void autosaveCompleted(bool success);
-    void surfaceSavedTo(const QString& path);
     void approvalMaskSaved(const std::string& segmentId);
     void annotationPointSelected(vc::PointRef point);
     void annotationSelectionCleared();
@@ -520,6 +528,12 @@ private:
     QFuture<std::shared_ptr<QuadSurface>> _saveFuture;
     std::shared_ptr<QuadSurface> _saveSnapshot;
     std::function<bool(const std::shared_ptr<QuadSurface>&)> _editingDestinationResolver;
+    StorePinResolver _storePinResolver;
+    // The store edit of the active surface, kept across editing sessions so
+    // saves continue from their own revisions.
+    std::shared_ptr<SurfaceStoreEdit> _storeEdit;
+    std::shared_ptr<SurfaceStoreEdit> storeEditFor(QuadSurface* surface);
+    bool saveNow(QuadSurface* surface, bool vertices, const std::vector<std::string>& channels);
     std::vector<AutosaveVertexUpdate> _pendingAutosaveVertexUpdates;
     std::unordered_map<std::uint64_t, std::size_t> _pendingAutosaveVertexUpdateIndex;
 

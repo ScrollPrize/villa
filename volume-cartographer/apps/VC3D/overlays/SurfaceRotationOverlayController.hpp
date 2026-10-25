@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QPointer>
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -21,6 +22,8 @@ public:
     ~SurfaceRotationOverlayController() override;
 
     void setViewerManager(ViewerManager* manager);
+    // Publishes the transformed surface to the object store.
+    void setSaver(std::function<bool(QuadSurface*)> saver) { _saver = std::move(saver); }
     void beginRotate();
     void cancelRotate();
 
@@ -47,6 +50,7 @@ private:
     static std::shared_ptr<QuadSurface> cloneSurface(const std::shared_ptr<QuadSurface>& surface);
 
     CState* _state{nullptr};
+    std::function<bool(QuadSurface*)> _saver;
     ViewerManager* _viewerManager{nullptr};
     QMetaObject::Connection _viewerCreatedConn;
     QMetaObject::Connection _viewerClosingConn;

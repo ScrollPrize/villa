@@ -1927,20 +1927,46 @@ QString SegmentationCommandHandler::getCurrentRenderVolumePath(QString* remoteUr
     return QString::fromStdString(volume->path().string());
 }
 
+namespace {
+// Whole-surface transforms rewrite every channel: load the ones still in the store.
+void loadAllChannels(QuadSurface& surface)
+{
+    for (const auto& name : surface.channelNames()) {
+        (void)surface.channel(name, SURF_CHANNEL_NORESIZE);
+    }
+}
+}
+
+std::shared_ptr<QuadSurface> SegmentationCommandHandler::activeSurface(const std::string& segmentId) const
+{
+    auto surface = _state ? _state->activeSurface().lock() : nullptr;
+    return surface && surface->id == segmentId ? surface : nullptr;
+}
+
+bool SegmentationCommandHandler::publishSurface(QuadSurface* surface, const QString& action)
+{
+    if (_surfaceSaver && _surfaceSaver(surface)) {
+        return true;
+    }
+    QMessageBox::critical(_parentWidget, tr("%1 failed").arg(action),
+                          tr("Could not save surface %1 to the object store.").arg(QString::fromStdString(surface->id)));
+    return false;
+}
+
 QuadSurface* SegmentationCommandHandler::requireSurfaceAndRunner(
     const std::string& segmentId,
     bool checkRunner)
 {
-    if (_state->currentVolume() == nullptr || !_state->vpkg()) {
+    if (_state->currentVolume() == nullptr) {
         QMessageBox::warning(_parentWidget, tr("Error"),
-                             tr("No volume package or volume loaded."));
+                             tr("No volume loaded."));
         return nullptr;
     }
 
-    auto surf = _state->vpkg()->getSurface(segmentId);
+    auto surf = activeSurface(segmentId);
     if (!surf) {
         QMessageBox::warning(_parentWidget, tr("Error"),
-                             tr("Invalid segment or segment not loaded: %1")
+                             tr("Select surface %1 first.")
                                  .arg(QString::fromStdString(segmentId)));
         return nullptr;
     }
@@ -1959,9 +1985,7 @@ QuadSurface* SegmentationCommandHandler::requireSurfaceAndRunner(
 
     if (_editingDestinationResolver && !_editingDestinationResolver(surf)) return nullptr;
 
-    // Safe to return raw pointer: getSurface() returns a shared_ptr backed by
-    // Segmentation::surface_ (a cached member), so the pointed-to object remains
-    // alive as long as the Segmentation exists in the VolumePkg.
+    // The active surface stays alive while it is CState's active surface.
     return surf.get();
 }
 
@@ -3638,13 +3662,9 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
 
     // Inlined from requireSurfaceAndRunner (which pops dialogs) so this path stays
     // dialog-free; runner state is irrelevant to a synchronous crop.
-    if (!_state || _state->currentVolume() == nullptr || !_state->vpkg()) {
-        return fail(tr("No volume package or volume loaded."));
-    }
-    auto surf = _state->vpkg()->getSurface(segmentId);
+    auto surf = activeSurface(segmentId);
     if (!surf) {
-        return fail(tr("Invalid segment or segment not loaded: %1")
-                        .arg(QString::fromStdString(segmentId)));
+        return fail(tr("Select surface %1 first.").arg(QString::fromStdString(segmentId)));
     }
     if (_editingDestinationResolver && !_editingDestinationResolver(surf))
         return fail(tr("Could not prepare a managed working copy"));
@@ -3718,54 +3738,29 @@ bool SegmentationCommandHandler::cropSurfaceToValidRegion(const std::string& seg
 
     cv::Mat_<cv::Vec3f> croppedPoints = (*points)(roi).clone();
 
-    std::unique_ptr<QuadSurface> tempSurface;
-    try {
-        tempSurface = std::make_unique<QuadSurface>(croppedPoints, surface->scale());
-        tempSurface->path = surface->path;
-        tempSurface->id = surface->id;
-        if (!surface->meta.is_null()) {
-            tempSurface->meta = surface->meta;
-        }
-        for (const auto& ch : croppedChannels) {
-            tempSurface->setChannel(ch.name, ch.data);
-        }
-        tempSurface->save(surface->path, true);
-    } catch (const std::exception& ex) {
-        return fail(tr("Failed to crop %1: %2")
-                        .arg(QString::fromStdString(segmentId))
-                        .arg(QString::fromUtf8(ex.what())));
-    }
-
-    emit surfaceSavedTo(QString::fromStdString(surface->path.string()));
+    // The cropped grid replaces the stored geometry (a dropped channel goes with it).
     croppedPoints.copyTo(*points);
     for (const auto& ch : croppedChannels) {
         surface->setChannel(ch.name, ch.data);
     }
     if (droppedGenerationsChannel) {
         surface->setChannel("generations", cv::Mat());
-        std::error_code ec;
-        std::filesystem::remove(surface->path / "generations.tif", ec);
     }
     surface->invalidateCache();
-
-    if (tempSurface && !tempSurface->meta.is_null()) {
-        surface->meta = tempSurface->meta;
-        surf->meta = surface->meta;
+    if (!_surfaceSaver || !_surfaceSaver(surface)) {
+        return fail(tr("Failed to save the cropped surface %1.").arg(QString::fromStdString(segmentId)));
     }
 
     // Bbox will be recalculated lazily (invalidateCache was already called)
 
     if (_state) {
-        _state->setSurface(segmentId, surf, false, false);
-        if (_state->activeSurfaceId() == segmentId) {
-            _state->setSurface("segmentation", surf, false, false);
-        }
+        _state->setSurface("segmentation", surf, false, false);
     }
 
     const QString segLabel = QString::fromStdString(segmentId);
     emit statusMessage(
         (droppedGenerationsChannel
-             ? tr("Cropped %1 to %2x%3 (offset %4,%5); removed mismatched generations.tif")
+             ? tr("Cropped %1 to %2x%3 (offset %4,%5); removed the mismatched generations channel")
              : tr("Cropped %1 to %2x%3 (offset %4,%5)"))
             .arg(segLabel)
             .arg(roi.width)
@@ -3781,7 +3776,8 @@ void SegmentationCommandHandler::onFlipSurface(const std::string& segmentId, boo
     auto* surface = requireSurfaceAndRunner(segmentId, false);
     if (!surface) return;
 
-    auto surf = _state->vpkg()->getSurface(segmentId);
+    auto surf = activeSurface(segmentId);
+    loadAllChannels(*surface);
 
     if (flipU) {
         surface->flipU();
@@ -3789,23 +3785,12 @@ void SegmentationCommandHandler::onFlipSurface(const std::string& segmentId, boo
         surface->flipV();
     }
 
-    try {
-        surface->save(surface->path, true);
-        emit surfaceSavedTo(QString::fromStdString(surface->path.string()));
-    } catch (const std::exception& ex) {
-        QMessageBox::critical(_parentWidget,
-                              tr("Flip failed"),
-                              tr("Failed to save flipped surface %1: %2")
-                                  .arg(QString::fromStdString(segmentId))
-                                  .arg(QString::fromUtf8(ex.what())));
+    if (!publishSurface(surface, tr("Flip"))) {
         return;
     }
 
     if (_state) {
-        _state->setSurface(segmentId, surf, false, false);
-        if (_state->activeSurfaceId() == segmentId) {
-            _state->setSurface("segmentation", surf, false, false);
-        }
+        _state->setSurface("segmentation", surf, false, false);
     }
 
     const QString directionLabel = flipU ? tr("vertically") : tr("horizontally");
@@ -3821,26 +3806,16 @@ void SegmentationCommandHandler::onRotateSurface(const std::string& segmentId)
     auto* surface = requireSurfaceAndRunner(segmentId, false);
     if (!surface) return;
 
-    auto surf = _state->vpkg()->getSurface(segmentId);
+    auto surf = activeSurface(segmentId);
+    loadAllChannels(*surface);
     surface->rotate(90.0f);
 
-    try {
-        surface->save(surface->path, true);
-        emit surfaceSavedTo(QString::fromStdString(surface->path.string()));
-    } catch (const std::exception& ex) {
-        QMessageBox::critical(_parentWidget,
-                              tr("Rotate failed"),
-                              tr("Failed to save rotated surface %1: %2")
-                                  .arg(QString::fromStdString(segmentId))
-                                  .arg(QString::fromUtf8(ex.what())));
+    if (!publishSurface(surface, tr("Rotate"))) {
         return;
     }
 
     if (_state) {
-        _state->setSurface(segmentId, surf, false, false);
-        if (_state->activeSurfaceId() == segmentId) {
-            _state->setSurface("segmentation", surf, false, false);
-        }
+        _state->setSurface("segmentation", surf, false, false);
     }
 
     emit statusMessage(

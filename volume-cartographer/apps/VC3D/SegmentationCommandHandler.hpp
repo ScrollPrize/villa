@@ -174,13 +174,15 @@ public:
 
     // --- Access to job state ---
 
+    // Publishes a changed active surface to the object store (every vertex and loaded channel).
+    void setSurfaceSaver(std::function<bool(QuadSurface*)> saver) { _surfaceSaver = std::move(saver); }
+
     std::optional<NeighborCopyJob>& neighborCopyJob() { return _neighborCopyJob; }
     const std::optional<NeighborCopyJob>& neighborCopyJob() const { return _neighborCopyJob; }
     std::optional<ResumeLocalJob>& resumeLocalJob() { return _resumeLocalJob; }
     const std::optional<ResumeLocalJob>& resumeLocalJob() const { return _resumeLocalJob; }
 
 signals:
-    void surfaceSavedTo(const QString& path);
     /** Replaces statusBar()->showMessage() */
     void statusMessage(QString text, int timeout);
 
@@ -335,6 +337,10 @@ private:
      * Returns the QuadSurface* on success, or nullptr on failure.
      */
     std::function<bool(const std::shared_ptr<QuadSurface>&)> _editingDestinationResolver;
+    std::function<bool(QuadSurface*)> _surfaceSaver;
+    // The active surface when it is `segmentId`: tools change the surface on screen.
+    std::shared_ptr<QuadSurface> activeSurface(const std::string& segmentId) const;
+    bool publishSurface(QuadSurface* surface, const QString& action);
     QuadSurface* requireSurfaceAndRunner(const std::string& segmentId,
                                           bool checkRunner = true);
 

@@ -2390,47 +2390,11 @@ void SegmentationGrower::onFutureFinished()
     }
 
     if (!sessionActive) {
-        try {
-            if (surfaceToPersist) {
-                ensureSurfaceMetaObject(surfaceToPersist);
-                surfaceToPersist->saveOverwrite();
-
-                // Dense overwrite mode persists an updated segment in-place;
-                // force reload from disk so in-app references observe the new geometry.
-                if (request.denseDisplacement && !request.denseCreateNewSegment) {
-                    std::shared_ptr<QuadSurface> reloadedSurface;
-                    const std::string persistedId = surfaceToPersist->id;
-
-                    if (request.volumeContext.package && !persistedId.empty()) {
-                        request.volumeContext.package->unloadSurface(persistedId);
-                        reloadedSurface = request.volumeContext.package->loadSurface(persistedId);
-                    }
-
-                    if (!reloadedSurface && !surfaceToPersist->path.empty()) {
-                        try {
-                            auto loadedFromDisk = load_quad_from_tifxyz(surfaceToPersist->path.string());
-                            if (loadedFromDisk) {
-                                reloadedSurface.reset(loadedFromDisk.release());
-                            }
-                        } catch (const std::exception& ex) {
-                            qCInfo(lcSegGrowth) << "Dense overwrite reload fallback failed" << ex.what();
-                        }
-                    }
-
-                    if (reloadedSurface) {
-                        if (_context.state && !persistedId.empty() && _context.state->surface(persistedId)) {
-                            _context.state->setSurface(persistedId, reloadedSurface, true, false);
-                        }
-                        request.segmentationSurface = reloadedSurface;
-                        surfaceToPersist = reloadedSurface.get();
-                    } else {
-                        qCInfo(lcSegGrowth) << "Dense overwrite reload skipped; using in-memory geometry";
-                    }
-                }
+        if (surfaceToPersist && _context.module) {
+            ensureSurfaceMetaObject(surfaceToPersist);
+            if (!_context.module->saveSurfaceNow(surfaceToPersist)) {
+                showStatus(tr("Failed to save the grown segmentation to the object store."), kStatusLong);
             }
-        } catch (const std::exception& ex) {
-            qCInfo(lcSegGrowth) << "Failed to save tracer result" << ex.what();
-            showStatus(tr("Failed to save segmentation: %1").arg(ex.what()), kStatusLong);
         }
     } else if (_context.module) {
         _context.module->requestAutosaveFromGrowth();

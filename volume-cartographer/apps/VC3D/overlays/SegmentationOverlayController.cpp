@@ -745,19 +745,16 @@ void SegmentationOverlayController::scheduleDebouncedSave(QuadSurface* surface)
 
 void SegmentationOverlayController::flushPendingApprovalMaskSave()
 {
-    // Boundary flush (segment switch / app close): write the pending approval
-    // edits to disk synchronously before the surface pointer changes. Uses the
-    // full saveOverwrite so it shares the per-dir lock with the autosave.
+    // Boundary flush (segment switch / app close): publish the pending approval
+    // edits synchronously before the surface pointer changes.
     if (!_approvalSaveSurface) {
         return;
     }
     QuadSurface* surface = _approvalSaveSurface;
     _approvalSaveSurface = nullptr;
     composeApprovalMaskToSurface(surface);
-    try {
-        surface->saveOverwrite();
-    } catch (const std::exception& e) {
-        qWarning() << "flushPendingApprovalMaskSave: save failed:" << e.what();
+    if (_approvalSaver) {
+        _approvalSaver(surface);
     }
 }
 

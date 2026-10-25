@@ -6986,6 +6986,9 @@ void CWindow::CreateWidgets(void)
     _segmentationOverlay->setEditManager(_segmentationEdit.get());
     _segmentationOverlay->setViewerManager(_viewerManager.get());
     _surfaceRotationOverlay = std::make_unique<SurfaceRotationOverlayController>(_state, this);
+    _surfaceRotationOverlay->setSaver([this](QuadSurface* surface) {
+        return _segmentationModule && _segmentationModule->saveSurfaceNow(surface);
+    });
     _surfaceRotationOverlay->setViewerManager(_viewerManager.get());
 
     _segmentationModule = std::make_unique<SegmentationModule>(
@@ -7000,10 +7003,13 @@ void CWindow::CreateWidgets(void)
     _segmentationModule->setEditingDestinationResolver([this](const std::shared_ptr<QuadSurface>& surface) {
         return !_spiralWorkspace || _spiralWorkspace->prepareManagedPatch(surface);
     });
-    connect(_segmentationModule.get(), &SegmentationModule::surfaceSavedTo,
-            this, [this](const QString& path) {
-                if (_spiralWorkspace) _spiralWorkspace->noteManagedPatchSaved(path);
-            });
+    // Edits of the active surface commit to the store object it was opened from.
+    _segmentationModule->setStorePinResolver([this](const QuadSurface* surface) -> std::optional<vc::objects::PinnedObject> {
+        const auto& opened = _surfacePanel ? _surfacePanel->opened() : std::nullopt;
+        // By id: transforms and edit previews publish copies of the opened surface.
+        if (opened && surface && opened->surface->id == surface->id && opened->editable) return opened->pin;
+        return std::nullopt;
+    });
 
 
     if (_segmentationModule && _planeSlicingOverlay) {
@@ -7066,10 +7072,9 @@ void CWindow::CreateWidgets(void)
     _segmentationCommandHandler->setEditingDestinationResolver([this](const std::shared_ptr<QuadSurface>& surface) {
         return _segmentationModule->prepareEditingDestination(surface);
     });
-    connect(_segmentationCommandHandler.get(), &SegmentationCommandHandler::surfaceSavedTo,
-            this, [this](const QString& path) {
-                if (_spiralWorkspace) _spiralWorkspace->noteManagedPatchSaved(path);
-            });
+    _segmentationCommandHandler->setSurfaceSaver([this](QuadSurface* surface) {
+        return _segmentationModule && _segmentationModule->saveSurfaceNow(surface);
+    });
     _segmentationCommandHandler->setCmdRunner(_cmdRunner);
     _segmentationCommandHandler->setSurfacePanel(_surfacePanel.get());
     _segmentationCommandHandler->setSegmentationGrower(_segmentationGrower.get());

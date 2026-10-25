@@ -68,7 +68,6 @@ public:
     void refreshTrackedFibers();
     void noteFiberRetired(const QString& objectUuid);
     bool prepareManagedPatch(const std::shared_ptr<QuadSurface>& surface);
-    void noteManagedPatchSaved(const QString& path);
     void requestSessionExit(std::function<void()> continuation);
     bool hasPendingBrushWork() const;
     void setLineAnnotationController(LineAnnotationController* controller);

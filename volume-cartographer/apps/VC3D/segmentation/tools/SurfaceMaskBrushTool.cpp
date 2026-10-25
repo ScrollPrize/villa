@@ -423,13 +423,8 @@ void SurfaceMaskBrushTool::persistSurface()
     }
 
     _surface->invalidateCache();
-
-    if (_surface->path.empty()) {
-        Q_EMIT _module.statusMessageRequested(
-            QCoreApplication::translate("SurfaceMaskBrushTool", "Cannot save surface: surface has no tifxyz path."),
-            kStatusMedium);
-        return;
-    }
+    // The brushed validity is the surface's mask (validity) channel.
+    _surface->setChannel("mask", _mask.clone());
 
     if (_module.hasActiveSession()) {
         _module.emitPendingChanges();
@@ -437,16 +432,11 @@ void SurfaceMaskBrushTool::persistSurface()
         return;
     }
 
-    try {
-        _surface->saveOverwrite();
+    // The mask is the surface's validity: masked vertices keep their stored coordinates.
+    if (_module.saveSurfaceChannels(_surface, {"mask"})) {
         Q_EMIT _module.statusMessageRequested(
             QCoreApplication::translate("SurfaceMaskBrushTool", "Saved surface."),
             kStatusShort);
-    } catch (const std::exception& e) {
-        qCWarning(lcSurfaceMaskBrush) << "Failed to save surface:" << e.what();
-        Q_EMIT _module.statusMessageRequested(
-            QCoreApplication::translate("SurfaceMaskBrushTool", "Failed to save surface."),
-            kStatusLong);
     }
 }
 

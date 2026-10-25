@@ -533,10 +533,6 @@ auto main(int argc, char* argv[]) -> int
             1, perf::REMOTE_DOWNLOAD_WORKER_CAPACITY));
         remoteCacheDelta3d = vc::settings::remoteCacheDelta3dEnabled();
 
-        // Per-segment rotating-backup count -> core (used by saveOverwrite/growth).
-        QuadSurface::setBackupCount(
-            settings.value(backup::SEGMENT_COUNT, backup::SEGMENT_COUNT_DEFAULT).toInt());
-
         constexpr std::uint64_t gib = 1024ULL * 1024ULL * 1024ULL;
         vc::render::PersistentZarrCacheBudget::Limits limits;
         const auto maximumGiB = settings.value(

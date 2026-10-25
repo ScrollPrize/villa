@@ -1541,12 +1541,6 @@ bool SpiralWorkspace::prepareManagedPatch(const std::shared_ptr<QuadSurface>& su
     return true;
 }
 
-void SpiralWorkspace::noteManagedPatchSaved(const QString& path)
-{
-    if (!_managedPatchCopies.contains(path)) return;
-    _service->stagePatch(path, _managedPatchCopies.value(path));
-}
-
 QString SpiralWorkspace::provisionalBrushRoot() const
 {
     return QFileInfo(vc3d::settingsFilePath()).dir().filePath(

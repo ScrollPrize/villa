@@ -1,4 +1,5 @@
 #include "SegmentationModule.hpp"
+#include "SurfaceStoreEdit.hpp"
 
 #include "../OpenDataSegmentCache.hpp"
 #include "../OpenDataCoordinateIdentity.hpp"
@@ -108,95 +109,6 @@ std::optional<std::pair<int, int>> segmentationSceneToGrid(VolumeViewerBase* vie
 }
 
 
-bool SegmentationModule::ensureActiveSurfaceEditableForModification()
-{
-    if (!_state || !_state->vpkg()) {
-        return true;
-    }
-
-    auto surface = _state->activeSurface().lock();
-    if (!surface) {
-        surface = std::dynamic_pointer_cast<QuadSurface>(
-            _state->surface("segmentation"));
-    }
-    if (!surface || surface->path.empty() ||
-        !vc3d::opendata::isOpenDataCatalogSegmentDirectory(surface->path)) {
-        return true;
-    }
-
-    const std::filesystem::path activeSegmentsRoot =
-        _state->vpkg()->outputSegmentsPath();
-    const auto registeredCatalogRoot =
-        vc3d::opendata::registeredOpenDataCatalogRootForSegment(
-            *_state->vpkg(), surface->path);
-    const auto copySourceRoot = registeredCatalogRoot.empty()
-        ? activeSegmentsRoot
-        : registeredCatalogRoot;
-    const std::filesystem::path defaultPath =
-        vc3d::opendata::defaultEditableCopyPathForCatalogSegment(
-            surface->path, copySourceRoot);
-
-    QMessageBox prompt(QApplication::activeWindow());
-    prompt.setWindowTitle(QObject::tr("Open Data Segment"));
-    prompt.setText(QObject::tr("This open-data segment is an immutable catalog cache."));
-    prompt.setInformativeText(
-        QObject::tr("Create or choose an editable copy before modifying it.\n\nSource: %1\nEditable copy: %2")
-            .arg(QString::fromStdString(surface->path.string()),
-                 QString::fromStdString(defaultPath.string())));
-    QPushButton* createButton = prompt.addButton(QObject::tr("Create Editable Copy"), QMessageBox::AcceptRole);
-    QPushButton* chooseButton = prompt.addButton(QObject::tr("Choose Existing Folder"), QMessageBox::ActionRole);
-    prompt.addButton(QMessageBox::Cancel);
-    prompt.setDefaultButton(createButton);
-    prompt.exec();
-
-    std::filesystem::path editablePath;
-    if (prompt.clickedButton() == createButton) {
-        editablePath = defaultPath;
-    } else if (prompt.clickedButton() == chooseButton) {
-        const QString chosen = QFileDialog::getExistingDirectory(
-            QApplication::activeWindow(),
-            QObject::tr("Choose Editable Segment Folder"),
-            QString::fromStdString(defaultPath.parent_path().string()),
-            QFileDialog::ShowDirsOnly);
-        if (chosen.isEmpty()) {
-            if (_widget) _widget->setEditingEnabled(false);
-            return false;
-        }
-        editablePath = std::filesystem::path(chosen.toStdString());
-    } else {
-        if (_widget) _widget->setEditingEnabled(false);
-        return false;
-    }
-
-    try {
-        vc3d::opendata::copyCatalogSegmentToEditableDirectory(
-            *_state->vpkg(), surface->path, editablePath);
-        const std::filesystem::path editableRoot = editablePath.parent_path();
-        auto pkg = _state->vpkg();
-        vc3d::opendata::attachEditableOpenDataSegmentRoot(
-            *pkg, surface->path, editableRoot, true);
-
-        const std::string segmentId = editablePath.filename().string();
-        auto editableSurface = pkg->loadSurface(segmentId);
-        if (!editableSurface) {
-            editableSurface = std::make_shared<QuadSurface>(editablePath);
-        }
-        vc3d::opendata::copyVolumeCoordinateIdentityToSurface(
-            *editableSurface, *pkg, _state->currentVolumeId());
-        editableSurface->save_meta();
-        _state->setSurface("segmentation", editableSurface, false, false);
-        emit segmentationFolderChanged(QString::fromStdString(segmentId));
-        return true;
-    } catch (const std::exception& e) {
-        QMessageBox::warning(
-            QApplication::activeWindow(),
-            QObject::tr("Open Data Segment"),
-            QObject::tr("Could not create editable copy:\n\n%1").arg(QString::fromUtf8(e.what())));
-        if (_widget) _widget->setEditingEnabled(false);
-        return false;
-    }
-}
-
 void SegmentationModule::DragState::reset()
 {
     active = false;
@@ -284,6 +196,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     if (_overlay) {
         _overlay->setEditManager(_editManager);
         _overlay->setEditingEnabled(_editingEnabled);
+        _overlay->setApprovalSaver([this](QuadSurface* surface) { saveSurfaceChannels(surface, {"approval"}); });
         if (_widget) {
             _overlay->setApprovalMaskOpacity(_widget->approvalMaskOpacity());
         }
@@ -668,11 +581,6 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     if (_editingEnabled == enabled) {
         return;
     }
-    if (enabled) {
-        if (!ensureActiveSurfaceEditableForModification()) {
-            return;
-        }
-    }
     _editingEnabled = enabled;
 
     if (_overlay) {
@@ -748,6 +656,10 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
     // This prevents the old mask from being incorrectly saved to the new segment
     if (_overlay) {
         _overlay->loadApprovalMaskImage(nullptr);
+    }
+    // The previous surface's pending approval edits are saved: its edits end here.
+    if (_storeEdit && (!newSurface || newSurface->id != _storeEdit->uuid())) {
+        _storeEdit.reset();
     }
     if (_surfaceMaskTool) {
         _surfaceMaskTool->setSurface(newSurface);
@@ -2942,10 +2854,11 @@ void SegmentationModule::performAutosave()
         _pendingAutosaveVertexUpdates.clear();
         return;
     }
-    if (surfacePtr->path.empty() || surfacePtr->id.empty()) {
+    const auto storeEdit = storeEditFor(surfacePtr.get());
+    if (!storeEdit) {
         if (!_autosaveState.failureNotified()) {
-            qCWarning(lcSegModule) << "Skipping autosave: segmentation surface lacks path or id.";
-            emit statusMessageRequested(tr("Cannot autosave segmentation: surface is missing file metadata."),
+            qCWarning(lcSegModule) << "Skipping autosave: the segmentation surface is not from the object store.";
+            emit statusMessageRequested(tr("Cannot autosave segmentation: the surface is not from the object store."),
                                         kStatusMedium);
             _autosaveState.setFailureNotified(true);
         }
@@ -2962,73 +2875,62 @@ void SegmentationModule::performAutosave()
     auto vertexUpdates = std::move(_pendingAutosaveVertexUpdates);
     _pendingAutosaveVertexUpdates.clear();
 
+    // Vertex edits patch the previous save's copy and publish the rectangle they
+    // touch. Other saves (channels, masks, growth) copy the surface and publish
+    // its loaded channels and every changed vertex.
     auto snapshot = _saveSnapshot;
-    const auto savePath = surfacePtr->path;
-    const auto saveId = surfacePtr->id;
-    const auto saveMeta = surfacePtr->meta;
-    const cv::Vec2f saveScale = surfacePtr->scale();
-    const cv::Mat_<cv::Vec3f>* sourcePoints = surfacePtr->rawPointsPtr();
-    const cv::Size sourceSize = sourcePoints ? sourcePoints->size() : cv::Size();
-
-    // Non-vertex saves, such as channel/mask changes, still need the full
-    // surface state. Keep that compatibility path while avoiding it for the
-    // common geometry-edit case where vertexUpdates carries the precise delta.
-    if (snapshot && (snapshot->path != savePath || snapshot->id != saveId)) {
+    if (snapshot && (snapshot->id != surfacePtr->id ||
+                     snapshot->rawPointsPtr()->size() != surfacePtr->rawPointsPtr()->size())) {
         snapshot.reset();
     }
-
-    if (vertexUpdates.empty()) {
-        snapshot = std::make_shared<QuadSurface>(surfacePtr->rawPoints(), saveScale);
+    std::vector<std::string> channels;
+    cv::Rect rect;
+    if (vertexUpdates.empty() || !snapshot) {
+        snapshot = std::make_shared<QuadSurface>(surfacePtr->rawPoints().clone(), surfacePtr->scale());
         for (const auto& name : surfacePtr->channelNames()) {
-            cv::Mat ch = surfacePtr->channel(name, SURF_CHANNEL_NORESIZE);
-            if (!ch.empty()) {
-                snapshot->setChannel(name, ch.clone());
+            if (!surfacePtr->channelLoaded(name)) {
+                continue;
+            }
+            snapshot->setChannel(name, surfacePtr->channel(name, SURF_CHANNEL_NORESIZE).clone());
+            if (vertexUpdates.empty()) {
+                channels.push_back(name);
             }
         }
-        snapshot->path = savePath;
-        snapshot->id = saveId;
-        snapshot->meta = saveMeta;
+        snapshot->id = surfacePtr->id;
+        snapshot->meta = surfacePtr->meta;
+    }
+    if (vertexUpdates.empty()) {
+        rect = cv::Rect(0, 0, snapshot->rawPointsPtr()->cols, snapshot->rawPointsPtr()->rows);
+    } else {
+        int minRow = INT_MAX, minCol = INT_MAX, maxRow = -1, maxCol = -1;
+        for (const auto& update : vertexUpdates) {
+            minRow = std::min(minRow, update.row); maxRow = std::max(maxRow, update.row);
+            minCol = std::min(minCol, update.col); maxCol = std::max(maxCol, update.col);
+        }
+        rect = cv::Rect(minCol, minRow, maxCol - minCol + 1, maxRow - minRow + 1);
     }
 
     const auto autosaveTicket = _autosaveState.startSave();
 
     emit statusMessageRequested(tr("Saving..."), kStatusShort);
 
-    _saveFuture = QtConcurrent::run([snapshot,
-                                      vertexUpdates = std::move(vertexUpdates),
-                                      savePath,
-                                      saveId,
-                                      saveMeta,
-                                      sourceSize]() mutable -> std::shared_ptr<QuadSurface> {
-        if (!snapshot) {
-            snapshot = std::make_shared<QuadSurface>(savePath);
-            snapshot->ensureLoaded();
-        }
-
+    _saveFuture = QtConcurrent::run([snapshot, storeEdit, rect, channels,
+                                      vertexUpdates = std::move(vertexUpdates)]() mutable -> std::shared_ptr<QuadSurface> {
         auto* points = snapshot->rawPointsPtr();
         if (!points || points->empty()) {
             throw std::runtime_error("Autosave snapshot has no point data");
         }
-
-        if (!sourceSize.empty() && points->size() != sourceSize) {
-            throw std::runtime_error("Autosave snapshot size does not match the active surface");
-        }
-
-        if (!vertexUpdates.empty()) {
-            for (const auto& update : vertexUpdates) {
-                if (update.row < 0 || update.row >= points->rows ||
-                    update.col < 0 || update.col >= points->cols) {
-                    continue;
-                }
-                (*points)(update.row, update.col) = update.world;
+        for (const auto& update : vertexUpdates) {
+            if (update.row < 0 || update.row >= points->rows ||
+                update.col < 0 || update.col >= points->cols) {
+                continue;
             }
+            (*points)(update.row, update.col) = update.world;
+        }
+        if (!vertexUpdates.empty()) {
             snapshot->invalidateCache();
         }
-
-        snapshot->path = savePath;
-        snapshot->id = saveId;
-        snapshot->meta = saveMeta;
-        snapshot->saveOverwrite();
+        storeEdit->save(*snapshot, rect, channels);
         return snapshot;
     });
     auto saveFuture = _saveFuture;
@@ -3055,8 +2957,6 @@ void SegmentationModule::performAutosave()
             failureMessage = tr("unknown error");
         }
 
-        if (failureMessage.isEmpty() && savedSnapshot)
-            emit surfaceSavedTo(QString::fromStdString(savedSnapshot->path.string()));
         const bool canRetry = _editManager && _editManager->hasSession();
         const auto completion = failureMessage.isEmpty()
             ? _autosaveState.completeSuccess(autosaveTicket)
@@ -3150,5 +3050,62 @@ void SegmentationModule::performCorrectionsAutoSave()
         qCDebug(lcSegModule) << "Auto-saved correction points to" << QString::fromStdString(_correctionsSegmentPath.string());
     } else {
         qCWarning(lcSegModule) << "Failed to auto-save correction points";
+    }
+}
+
+std::shared_ptr<SurfaceStoreEdit> SegmentationModule::storeEditFor(QuadSurface* surface)
+{
+    if (!surface || surface->id.empty()) {
+        return nullptr;
+    }
+    if (_storeEdit && _storeEdit->uuid() == surface->id) {
+        return _storeEdit;
+    }
+    const auto pin = _storePinResolver ? _storePinResolver(surface) : std::nullopt;
+    if (!pin || !_state) {
+        return nullptr;
+    }
+    try {
+        _storeEdit = std::make_shared<SurfaceStoreEdit>(_state->objectStoreSession(), *pin);
+    } catch (const std::exception& error) {
+        emit statusMessageRequested(tr("Cannot edit surface: %1").arg(QString::fromUtf8(error.what())), kStatusLong);
+        return nullptr;
+    }
+    return _storeEdit;
+}
+
+bool SegmentationModule::saveSurfaceChannels(QuadSurface* surface, const std::vector<std::string>& channels)
+{
+    return saveNow(surface, false, channels);
+}
+
+bool SegmentationModule::saveSurfaceNow(QuadSurface* surface)
+{
+    return surface && saveNow(surface, true, surface->channelNames());
+}
+
+bool SegmentationModule::saveNow(QuadSurface* surface, bool vertices, const std::vector<std::string>& channels)
+{
+    const auto storeEdit = storeEditFor(surface);
+    if (!storeEdit) {
+        return false;
+    }
+    std::vector<std::string> loaded;
+    for (const auto& name : channels) {
+        if (surface->channelLoaded(name)) {
+            loaded.push_back(name);
+        }
+    }
+    try {
+        if (_saveFuture.isRunning()) {
+            _saveFuture.waitForFinished();
+        }
+        const auto* points = surface->rawPointsPtr();
+        storeEdit->save(*surface, vertices && points ? cv::Rect(0, 0, points->cols, points->rows) : cv::Rect(), loaded);
+        return true;
+    } catch (const std::exception& error) {
+        qCWarning(lcSegModule) << "Saving surface channels failed:" << error.what();
+        emit statusMessageRequested(tr("Failed to save surface: %1").arg(QString::fromUtf8(error.what())), kStatusLong);
+        return false;
     }
 }

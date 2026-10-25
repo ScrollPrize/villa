@@ -101,12 +101,6 @@ SettingsDialog::SettingsDialog(std::shared_ptr<VolumePkg> volumePackage,
     spinRemoteCacheMinimumFreeGiB->setValue(static_cast<int>(settings.value(
         perf::REMOTE_CACHE_MIN_FREE_GIB, perf::REMOTE_CACHE_MIN_FREE_GIB_DEFAULT).toULongLong()));
 
-    // Per-segment rotating-backup count.
-    if (spinSegmentBackupCount) {
-        spinSegmentBackupCount->setValue(
-            settings.value(backup::SEGMENT_COUNT, backup::SEGMENT_COUNT_DEFAULT).toInt());
-    }
-
     const bool automaticDownloads = settings.value(
         perf::REMOTE_DOWNLOAD_AUTOMATIC,
         perf::REMOTE_DOWNLOAD_AUTOMATIC_DEFAULT).toBool();
@@ -291,13 +285,6 @@ void SettingsDialog::accept()
     limits.minimumFreeBytes =
         static_cast<std::uint64_t>(spinRemoteCacheMinimumFreeGiB->value()) * gib;
     vc::render::PersistentZarrCacheBudget::updateAllConfiguredLimits(limits);
-
-    // Per-segment backup count: persist and apply live (no restart needed).
-    if (spinSegmentBackupCount) {
-        const int backupCount = spinSegmentBackupCount->value();
-        settings.setValue(backup::SEGMENT_COUNT, backupCount);
-        QuadSurface::setBackupCount(backupCount);
-    }
 
     QMessageBox::information(this, tr("Restart required"), tr("Note: Some settings only take effect once you restarted the app."));
 

@@ -151,6 +151,8 @@ public:
 
     // Synchronously persist pending approval edits before a segment switch/close.
     void flushPendingApprovalMaskSave();
+    // Publishes a surface's approval channel for the boundary flush.
+    void setApprovalSaver(std::function<void(QuadSurface*)> saver) { _approvalSaver = std::move(saver); }
 
     // Undo support for approval mask painting
     // Undo the last paint stroke (repaints with inverse value)
@@ -267,6 +269,7 @@ private:
     // Surface holding pending (composed-but-unsaved) approval edits, for the
     // boundary flush before a segment switch / close.
     QuadSurface* _approvalSaveSurface{nullptr};
+    std::function<void(QuadSurface*)> _approvalSaver;
 
     // Approval mask overlay opacity (0-100, where 50 is default)
     int _approvalMaskOpacity{50};

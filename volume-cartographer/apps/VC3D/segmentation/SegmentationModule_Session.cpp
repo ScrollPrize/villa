@@ -1,4 +1,5 @@
 #include "SegmentationModule.hpp"
+#include "SurfaceStoreEdit.hpp"
 
 #include "../CState.hpp"
 #include "SegmentationWidget.hpp"
@@ -36,6 +37,19 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
     }
 
     if (!prepareEditingDestination(surface)) return false;
+    // Editing starts from the revision on screen and holds the object until it ends.
+    const auto storeEdit = storeEditFor(surface.get());
+    if (!storeEdit) {
+        emit statusMessageRequested(tr("Only surfaces opened from the object store can be edited."), kStatusLong);
+        return false;
+    }
+    try {
+        storeEdit->hold();
+    } catch (const std::exception& error) {
+        emit statusMessageRequested(tr("This surface cannot be edited now: %1").arg(QString::fromUtf8(error.what())),
+                                    kStatusLong);
+        return false;
+    }
     stopAllPushPull();
     clearUndoStack();
     resetHoverLookupDetail();
@@ -152,6 +166,9 @@ void SegmentationModule::endEditingSession()
     _saveSnapshot.reset();
     _pendingAutosaveVertexUpdates.clear();
     _pendingAutosaveVertexUpdateIndex.clear();
+    if (_storeEdit) {
+        _storeEdit->release();
+    }
     updateAutosaveState();
 }
 

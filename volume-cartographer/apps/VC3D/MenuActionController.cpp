@@ -1708,11 +1708,6 @@ void MenuActionController::beginRotateSurfaceTransform()
         return;
     }
 
-    if (_window->_segmentationModule &&
-        !_window->_segmentationModule->ensureActiveSurfaceEditableForModification()) {
-        return;
-    }
-
     _window->_surfaceRotationOverlay->beginRotate();
     if (_window->statusBar()) {
         _window->showStatusBarMessage(QObject::tr("Surface rotation active"), 3000);

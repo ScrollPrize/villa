@@ -2,6 +2,7 @@
 // volume's surfaces kept current from commit events, opening a surface in the
 // volume's voxels, and record edits (tags, name, retire).
 #include "SurfaceCatalog.hpp"
+#include "segmentation/SurfaceStoreEdit.hpp"
 #include "ObjectStoreCoordinates.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -90,6 +91,40 @@ int main(int argc, char** argv)
         bool refused = false;
         try { catalog.open(unbound); } catch (const std::exception&) { refused = true; }
         require(refused, "unbound surfaces do not open");
+
+        // Editing an opened surface commits to its store object and re-pins.
+        {
+            auto edited = catalog.open(native);
+            SurfaceStoreEdit edit(session, edited.pin);
+            edit.hold();
+            auto& grid = *edited.surface->rawPointsPtr();
+            grid(1, 1) = {5.f, 5.f, 5.f};
+            edit.save(*edited.surface, cv::Rect(1, 1, 1, 1));
+            require(edit.pin().objectRevision != edited.pin.objectRevision, "saves re-pin from the receipt");
+            require((*catalog.open(native).surface->rawPointsPtr())(1, 1) == cv::Vec3f(5, 5, 5), "vertex edits reach the store");
+            // The mask brush: validity 0 and the sentinel in memory; stored coordinates survive.
+            cv::Mat_<uint8_t> mask(3, 3, uint8_t(255));
+            mask(0, 0) = 0;
+            grid(0, 0) = {-1.f, -1.f, -1.f};
+            edited.surface->setChannel("mask", mask);
+            edit.save(*edited.surface, cv::Rect(0, 0, 3, 3), {"mask"});
+            require((*catalog.open(native).surface->rawPointsPtr())(0, 0) == cv::Vec3f(-1, -1, -1), "masked vertices load masked");
+            session->read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+                const auto unmasked = load_quad_from_store(db, txn, native, std::nullopt, false);
+                require((*unmasked->rawPointsPtr())(0, 0) == cv::Vec3f(0, 0, 1), "masking keeps stored coordinates");
+            });
+            // Growth: another grid size replaces the geometry.
+            cv::Mat_<cv::Vec3f> grown(4, 3, cv::Vec3f(-1.f, -1.f, -1.f));
+            grid.copyTo(grown(cv::Rect(0, 0, 3, 3)));
+            grown(3, 1) = {1.f, 3.f, 1.f};
+            QuadSurface larger(grown, {1.f, 1.f});
+            edit.save(larger, cv::Rect(0, 0, 3, 4));
+            require(catalog.open(native).surface->rawPointsPtr()->size() == cv::Size(3, 4), "growth replaces the stored grid");
+            edit.release();
+            bool stale = false;
+            try { SurfaceStoreEdit(session, edited.pin).hold(); } catch (const std::exception&) { stale = true; }
+            require(stale, "an edit from a superseded pin is refused");
+        }
 
         catalog.setTags(native, {"reviewed"});
         catalog.rename(native, "renamed");
