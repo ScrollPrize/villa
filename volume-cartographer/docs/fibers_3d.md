@@ -1,494 +1,189 @@
-# Fibers 3D in VC3D
+# Fibers 3D
 
-Open **View → Fibers → Fibers 3D** in the main workspace. The optional dock sits
-beside the existing CT views. It can be resized, floated, and docked again; its
-layout is saved with the workspace. It does not load another copy of the CT.
+Fibers 3D shows existing project annotations and Automated Fiber Volumes (AFV)
+beside VC3D's CT views. It is an inspection tool: it does not trace, optimize,
+reconstruct or write back geometry.
 
-Drag to orbit, middle/right-drag to pan, and use the wheel to zoom. Click a fibre
-to select it in the existing annotation or automated-fibre list. Right-click a
-fibre to centre the CT views at the picked point or open Line Annotation.
-Press **Escape** with the 3D view focused, click empty space without dragging,
-or choose **Clear selection** in its right-click menu to deselect. This also
-clears the selection in the fibre lists and CT overlays; it does not delete
-fibres or close the collection. Camera dragging does not clear selection.
-**Fit** frames the displayed geometry; **Fit selected** frames its selected
-portion. Changing filters or styles preserves the camera.
+## Main workspace
 
-**Settings** opens a movable, non-modal window with five tabs, instead of a
-scrolling menu. Changes apply immediately; you can orbit or select in the 3D
-view while it stays open. **Close** or **Escape** hides the window and reopening
-it keeps the current tab and position for the session.
+Open **View → Fibers → Fibers 3D**. The dock starts hidden and remembers its
+layout. Resize it by dragging the dock separator; **Detach** floats or redocks
+it. Drag to orbit, right/middle-drag to pan, and use the wheel to zoom.
 
-- **Fibers:** sources, families, minimum length, CT-focus region and box width.
-- **Surface:** mesh visibility/opacity, distance filter and Fit surface.
-- **Appearance:** color mode/palette, line width, camera, cursor, bounds and gaps.
-- **Selection:** nearby fibers, other-fiber opacity, annotation markers and tags.
-- **Memory:** memory budget and fiber count limit (0 means no count limit).
+Click a fiber to select it in the corresponding annotation or AFV list. Selection
+also follows the CT views. **Fit** frames the displayed geometry, including a
+visible surface; **Fit selected** frames the selected fiber. Right-click a fiber
+to center the CT views at that point or open it in Line Annotation. AFV inspection
+is read-only. Escape, an empty-space click, or **Clear selection** clears the
+shared selection. Dragging does not deselect.
 
-Each page fits without scrolling; color-specific controls appear only when
-relevant. Existing preferences, filters and defaults are preserved. Hiding the
-3D dock also hides its settings window.
+## Line Annotation
 
-Settings validation on macOS: the native application harness checks all five
-pages (520 × 460 logical pixels), every color mode including the expanded length
-range, the CT-focus box and annotation options for clipped controls. It checks
-opacity slider synchronization and saved preference units, Escape/Close/reopen,
-remembered tab/position, dock hiding and camera interaction with settings open.
-The isolated Paris 4 test uses a copy of the project/preferences. QA scripts,
-results and screenshots: `exports/VC3D_FIBERS3D_QA/settings-20261024` in the outer
-workspace. With the existing Mac build, run `cmake --build build --target VC3D
--j6`, then `python3 /Users/samir/Fiber3DReview/run-settings-integrated.py` (the
-adjacent `settings-startup.cpp` is linked into a separate QA executable).
-This UI change was not exercised on Ubuntu.
+The **Fibers 3D** header button shows a separate dock containing the open fiber,
+including its current generated geometry. A small cyan point marks the current
+position. Clicking the curve moves Line Annotation to the picked position and
+pauses automatic cut following. Navigating the flattened view updates the point
+without rebuilding the 3D scene or moving its camera. The position readout uses
+distance along the curve, not a percentage of point indices.
 
-**Settings → Surface → Display surface mesh** displays the surface selected
-in Main alongside the fibres. It starts off and remembers that choice. **Opacity**
-runs from 0–100% (default 100%, 5% arrow steps); **Fit surface** frames just the
-surface. Ordinary **Fit** includes it with the fibres. Selection changes and
-geometry edits replace the displayed mesh; changing projects or closing the
-volume removes stale geometry. Fibre filters do not crop the surface.
+This dock keeps its own appearance preferences and does not load the whole AFV.
+The current fiber retains its palette instead of the yellow selection highlight.
+Its CT ribbon uses the actual generated Line Annotation surfaces, including
+manual display-normal changes.
 
-**Only fibers near surface**, in the same Surface section, filters the loaded
-fibres by their shortest distance to that surface. **Distance to surface** is
-in active CT voxels, on either side (default 64; remembered; the filter starts
-off). It retains a whole fibre if any original segment passes within that
-distance. It does not trim the fibre to the neighbourhood or label it as belonging
-to that sheet. The existing length, region, family and selected-fibre proximity
-filters still apply. A selected fibre outside the surface filter stays hidden.
-The filter also works with **Display surface mesh** switched off. Without a
-selected/loaded surface it shows no fibres, rather than silently ignoring the
-constraint.
+## Settings
 
-Distance queries include segment and triangle interiors and preserve mesh holes
-and disconnected fibre runs. A cached BVH of triangle blocks bounds the search;
-index creation and filtering run on cancellable workers. Changing the distance
-reuses the spatial index, and camera movement reuses the visibility mask. On the
-same Paris 4 scene with the user's 16 mm minimum length, 2,024 loaded fibres become
-20 at 32 vx, 40 at 64 vx, and 80 at 128 vx. Initial indexing/filtering at 64 vx
-took 0.90 s; changing to 32 vx took 0.65 s including QA settling time. Tests cover
-both sides, triangle/segment interiors, holes, gaps, clipped regions, intersected
-filters, and indexed queries against exhaustive triangle search. The native app
-also checks radius changes, hidden mesh, missing/replaced surface, and that a
-distant selected fibre cannot bypass the filter or dim the remaining fibres.
-QA: `mesh-proximity-startup.cpp`, `run-proximity-integrated.py` and
-`mesh-proximity-integrated.json` in the same outer QA directory.
+**Settings** opens a movable, non-modal window. Changes apply immediately; the
+3D view remains interactive. Close or Escape hides it.
 
-The display uses the existing `segmentation` QuadSurface, including its editing
-preview, in the active CT coordinate frame. Every valid grid cell becomes two
-triangles; invalid cells and holes remain absent. No CT is read, no surface is
-reconstructed or deformed, and the source files are unchanged. A GUI-owned
-coordinate snapshot feeds a cancellable worker. CPU/GPU mesh buffers are bounded
-by the existing **Memory budget** setting; oversized grids show an explicit error.
-Snapshots, temporary indexing and GPU copies use additional memory. Uploads are
-limited to 4 MiB per frame. Orbit and opacity changes reuse the same mesh buffers.
-Two-sided smooth shading uses depth-tested coverage transparency (MSAA where
-available, screen-door coverage otherwise), avoiding per-frame triangle sorting.
-It is an inspection display, not a test of sheet assignment or H/V non-crossing.
+| Tab | Controls |
+| --- | --- |
+| Fibers | Project/AFV sources, H/V/unclassified families, minimum length, whole volume or a box around CT focus |
+| Surface | Selected surface mesh, opacity, nearby-fiber filter, Fit surface |
+| Appearance | Colors, line width, perspective, cursor, region bounds, gap styles |
+| Selection | Nearby fibers, other-fiber opacity, annotation markers/tags |
+| Memory | Coordinate budget and maximum fibers per source |
 
-Surface validation: `fiber_3d_surface` tests native coordinates, missing cells,
-non-finite points, degenerate triangles, cancellation, allocation bounds and the
-real OpenGL renderer (holes, opacity, foreground occlusion, unload/reload, with
-and without MSAA). All seven focused fibre suites pass on the M2 Max Mac. The
-native application was exercised with public Paris 4 surface `20231221180251`
-in its registered 2.4 µm coordinate frame: 1,598 × 2,103 source points,
-6,085,630 triangles, 139.39 MiB of mesh buffers, and the user's 2,024 displayed
-AFV fibres. Full preparation/upload took 1.42 s while GUI callbacks continued.
-Thirty-five camera drags plus synchronous framebuffer captures took 6.11 ms
-median / 9.59 ms p95 in the existing QuickBuild (-O1), with unchanged mesh data.
-These are capture timings for this scene, not a frame-rate guarantee for all
-scrolls. Toggle/cancellation, mesh-only framing, surface replacement, in-place
-edit updates, deletion and volume closing passed. Reproduction scripts and
-screenshots are in `exports/VC3D_FIBERS3D_QA/mesh-20261024` in the outer workspace.
-Build `VC3D test_fiber_3d_surface`, then run `ctest --test-dir build
---output-on-failure -R '^fiber_3d_surface$'`. Ubuntu was not run.
+The whole-volume filters and memory tab are absent from the single-fiber Line
+Annotation dock. Controls specific to a color mode appear only in that mode.
 
-**CT ribbon** displays the CT directly along the selected fibre in the 3D view.
-The button opens a **Width** slider (full width, 1–512 active-CT voxels; default
-32) and **Rotation** slider (−180° to +180° about the fibre). Both values are
-remembered; the ribbon is initially off. It follows selection from either
-the 3D view or the CT overlays. Clearing selection removes it, and the toggle
-can still be switched off without selecting another fibre.
+### Colors and annotations
 
-Attached Lasagna normals provide its initial orientation, with their signs
-aligned along the fibre. Missing normals use the same parallel transport helper
-as Line Annotation; if there are no usable normals, the initial plane is
-arbitrary and the status says to adjust rotation. The rotation offsets that
-baseline along the entire fibre. This is an inspection plane, not a reconstructed
-papyrus surface or a claim about which sheet contains the fibre. It does not
-modify the AFV or manual annotation. Gaps, invalid points and disconnected runs
-are not bridged, and the displayed region still applies. Consecutive AFV storage
-blocks sharing the same original point use one continuous orientation sequence;
-storage boundaries do not restart the ribbon's frame.
+- **Custom:** one chosen color.
+- **H / V:** the same default colors as AFV CT overlays; unclassified is gray.
+- **Direction:** XYZ orientation, or angle to one axis with a palette. Reversing
+  a curve does not change its color.
+- **Length:** complete source-fiber length in millimeters, with automatic or fixed
+  range and a palette. Cropping the display does not change that length.
 
-The ribbon samples the active CT at level 0 with trilinear interpolation, one
-sample per texel and no depth projection/MIP. Width is centred on the fibre.
-The grayscale window follows the existing CT window controls. Sampling and
-normal resolution run on a worker, with debouncing and cancellation; camera
-movement and contrast changes never read CT or recompute the ribbon. A single
-ribbon is cached for immediate hide/show. Texture tiles share one sampled border
-row and are uploaded progressively. Requests are bounded to 8 million texels
-(16 MiB of grayscale/validity pixels); larger requests show an explicit error
-instead of silently reducing resolution. The active CT's existing chunk cache
-is reused, with no additional full-volume copy. Uint8 and uint16 CT are supported
-(uint16 is converted to an 8-bit display range); missing level 0 is reported.
+Palettes use VC3D/OpenCV's Viridis, Magma, Cividis and Turbo tables. Line width
+defaults to **1 px**. Region bounds start off. **Other fibers opacity** is a
+0–100% slider, applied only while a displayed fiber is selected.
 
-Ribbon validation: `fiber_3d_ribbon`, `fiber_3d_geometry`, `fiber_3d_data` and
-`test_fiber_collection` pass on the M2 Max Mac. The new suite checks curved
-transported frames, sign-flipped/partly missing normals, gap/clipping boundaries,
-rotation against a known CT intensity field, texture seams and cancellation.
-The full application was checked with all 80,887 PHerc1447 fibres loaded, fibre
-2,157,532 selected and 53 nearby fibres displayed. Its 873-row native CT ribbon
-loaded in 4.03 s initially and about 0.48 s on subsequent cached runs (including
-UI debounce/settling); event-loop callbacks continued during loading. Orbit and
-contrast reused the same texture payload. Width/rotation changes, rapid selection
-changes, hide/show, clear and shutdown during a request passed. No real Lasagna
-dataset was attached in that project; normal handling was checked with controlled
-normal fields and the existing dataset-resolution checks. The wider
-`test_open_data_manifest` binary has one failure at `registeredCatalogRoot ==
-sourceRoot` (line 1922), reproduced identically with the pre-change resolver;
-its Lasagna pairing checks passed. QA inputs, screenshots, logs and the baseline
-reproducer are in `exports/VC3D_FIBERS3D_QA/ribbon-20261024` in the outer workspace.
+Markers, tags and dashed gap styles start off. When enabled, existing annotation
+metadata can mark control points, breaks, kollesis terminations, gaps, inferred
+gaps and damaged spans. The renderer does not infer new tags. Geometry remains
+unchanged when these styles are toggled.
 
-The AFV block-boundary regression was also reproduced on PHerc1447 fibre
-1,433,216 (560 source points, three storage blocks, 20.98 mm). Restarting the
-fallback frame per block introduced normal jumps of 87.44° and 96.33°.
-The corrected 2,712-row ribbon has exactly the same frames as the unsplit
-source polyline, including across its three texture tiles. Tests also retain
-real gaps and disconnected runs. The native application check verifies the
-32-voxel default, rotation, contrast, camera dragging, selection changes and
-cancellation (`run-seam-integrated.py` and `ribbon-seam-integrated.json` in the
-same QA directory).
+### Proximity and surfaces
 
-With an existing configured build, compile using `cmake --build build --target
-VC3D test_fiber_3d_ribbon -j 6`. Run the focused tests using `ctest --test-dir build
---output-on-failure -R '^(fiber_3d_ribbon|fiber_3d_geometry|fiber_3d_data|test_fiber_collection)$'`.
+**Only fibers near selection** retains whole loaded fibers passing within the
+chosen distance of any original segment of the selected fiber. Without a
+selection it leaves all loaded fibers visible.
 
-**CT slices** displays the linked **XY**, **XZ** and **YZ** CT planes in the
-3D view, independently of fibre selection. Its controls sit below the toolbar;
-each plane has a checkbox and the shared **Opacity** slider runs from 0–100%
-(default 70%, numeric arrow steps of 5%). XY and YZ start enabled, XZ disabled;
-these choices are remembered, while the CT slices button starts off.
+**Display surface mesh** shows the existing surface selected in Main in the same
+CT coordinates. Valid grid cells become triangles; holes stay open. The mesh is
+refreshed on surface changes and removed when the volume closes.
 
-The planes follow the existing CT views' position, normal offset, rotation,
-pan and zoom. Their footprints match the visible CT areas. A hidden CT view
-has no usable viewport, so its optional plane shows a 1,024-voxel square around
-the shared focus instead. The grayscale window follows the existing CT window
-controls. CT slices and a selected fibre's CT ribbon can be displayed together.
-With **Volumetric** off these are individual inspection slices, with no slab projection or MIP.
+**Only fibers near surface** retains whole loaded fibers within the chosen
+distance, on either side of the surface, even when the mesh is hidden. It checks
+segment and triangle interiors. Without a surface it shows no fibers. This filter
+combines with the other filters; it does not reload excluded source geometry.
 
-Sampling runs on a cancellable worker. A preview (at most 256 texels per edge)
-is followed by detail (at most 1,024 per edge), using the available CT pyramid
-level appropriate for that sampling spacing. Zooming the linked CT view narrows
-the footprint and reveals finer detail. The existing CT cache is reused; the
-three final gray/validity textures occupy at most 6 MiB. Orbit, opacity and
-contrast only redraw cached textures. Switching planes off and back on reuses
-unchanged samples; changed positions discard stale images. A small BSP splits
-intersecting planes so their transparency is ordered correctly during orbit.
+Distances are in active CT voxels. Proximity is not evidence that a fiber belongs
+to a particular sheet. These controls do not reconstruct/deform surfaces or
+validate H/V non-crossing.
 
-**Volumetric**, beside the plane checkboxes, mirrors the mode in **Composite
-View**. Enabling it from either control renders the checked 3D planes as CT
-slabs with real thickness. The 3D XY/XZ/YZ checkboxes determine which slabs are
-visible; the separate Plane View checkboxes in Composite View still control the
-2D viewers. **Layers Front / Behind**, **Reverse**, the alpha intensity range,
-**Material**, **Gamma** and high-pass cutoff are read from the linked views.
-The existing 3D opacity slider fades the complete rendered CT. The 3D camera
-controls the viewing angle, while each 2D viewer retains its own camera.
+## CT in the 3D view
 
-The worker extracts bounded 3D textures (at most 512 samples per axis and
-32 MiB per slab). A lower-resolution preview precedes detail. The status shows
-the physical layer range and sampled grid size; large footprints/ranges use a
-coarser display grid without changing their world-space extent. There is no
-additional CT disk cache. GPU uploads are limited to 4 MiB per frame. Camera,
-window/level and material changes reuse resident textures. GPU ray marching
-uses the existing VC3D unit-voxel opacity transfer function, with optical-length
-correction so changing the integration step does not change homogeneous-volume
-opacity. Up to 512 steps per intersected slab bound the display work. The same
-CT in overlapping slabs is integrated once, choosing the finer sampled grid.
-Resolved scene depth stops the ray at foreground fibre/ribbon geometry. This
-is a world-space volume render, not a composited image pasted onto a plane.
+### Ribbon
 
-Volumetric validation is split between `fiber_3d_slices` (known intensity
-field, physical front/behind bounds, reverse direction, preview and cancellation)
-and `fiber_3d_volume` (the real OpenGL renderer, constant-field extinction,
-overlap counted once, step-size invariance, bounds, and foreground-depth
-occlusion, including an MSAA framebuffer). The latter skips explicitly when
-OpenGL 3.3 cannot be created. A separate run of the actual GLSL on an RTX 3090
-passed these optical checks. Mac compilation passed; the native runtime checks
-and relaunch are pending while the Mac SSH connection is unavailable. Local
-QA scripts are in `exports/VC3D_FIBERS3D_QA/volume-20261024`.
+Select a fiber and enable **CT ribbon**. Width is centered on the fiber, ranges
+from 1–512 CT voxels, and defaults to **32 vx**. The grayscale window is shared
+with CT views. There is one sample per texel, with no depth slab or MIP.
 
-Slice validation: `fiber_3d_slices`, `fiber_3d_ribbon`, `fiber_3d_geometry`,
-`fiber_3d_data` and `test_fiber_collection` passed on the M2 Max Mac. Tests cover
-known 3D intensity fields, axis-aligned/tilted planes, volume bounds, pyramid
-preview/detail footprints, cancellation, and intersecting-plane area, UVs and
-alpha ordering. The native app was also exercised with the complete 80,887-fibre
-PHerc1447 AFV: all three planes, opacity/contrast without resampling, actual
-camera drags, individual toggles, a 7-voxel CT normal offset, CT rotation/zoom,
-concurrent ribbon display, and cancellation/resume. The QA harness and results
-are in `exports/VC3D_FIBERS3D_QA/slices-20261024` in the outer workspace. Ubuntu
-was not run. Add `test_fiber_3d_slices` to the build targets and `fiber_3d_slices`
-to the focused CTest expression above to reproduce the slice tests.
+In Main, the ribbon uses the shared Line Annotation surface builder, Lasagna
+resolution, normal orientation and annotation display overrides. A configured
+but unreadable Lasagna dataset reports an error. Without Lasagna, the builder's
+fallback frame is used and **Rotation** allows adjustment around the curve.
+With Lasagna, rotation is locked to the Line Annotation surface. In the Line
+Annotation dock it is always locked to the live generated surface.
 
-Selecting an AFV fibre in a CT slice or the catalogue also highlights it in
-3D, using the same yellow (`#ffff66`) as the slice overlay and a stroke
-2 logical pixels wider than the other fibres, including on Retina displays.
-The highlight respects the existing 3D depth and region/length filters.
-Other fibres default to 20% opacity while a displayed fibre is selected; the
-selected fibre stays opaque. With no displayed selection, every fibre is opaque.
-Adjust this in **Settings → More display options → Other fibers opacity**,
-using the 0–100% slider or numeric control (5% arrow steps). Existing saved
-opacity preferences are preserved; the stored setting remains a 0–1 fraction.
+AFV storage blocks do not restart the frame. Missing runs, invalid coordinates
+and explicit gaps are not joined. Region clipping happens after construction of
+the full curve's frame, so it cannot change the ribbon's orientation.
 
-**Settings → Selection → Only fibers near selection** hides distant fibres
-in the 3D view. **Distance** starts at 64 active-CT voxels and is
-remembered with the checkbox (off by default). A whole loaded fibre is kept
-if any of its original segments passes within that 3D distance of any part
-of the selected fibre. This includes close approaches between segment interiors,
-not just stored vertices, and does not depend on zoom or display simplification.
-It does not infer that neighbouring fibres belong to the same sheet.
-The existing source, region, length and memory filters still apply: this option
-does not load missing fibres or search outside the loaded region. Separate runs
-are never joined for the distance query. CT overlays remain unchanged.
+Sampling uses the existing CT chunk cache without blocking for missing chunks.
+Coarse data can appear while the requested level loads; uncovered pixels stay
+transparent. Zoom determines the requested pyramid level. Width/rotation changes
+are debounced; selection changes and hiding cancel outstanding work. Contrast
+changes reuse the image. Texture updates are staged across frames.
 
-Selecting from the CT views or fibre lists updates the neighbourhood too.
-Escape/clearing the selection, or disabling the option, restores all loaded
-fibres immediately. Camera position, colours and opacity preferences are kept.
-**Fit** frames the visible neighbours; **Fit selected** frames the selection.
-The status shows the displayed and loaded counts. Neighbour searches reuse
-the spatial index and run on a cancellable worker without rebuilding/uploading
-the scene. Until a new search completes, only the selection is shown, with
-**Finding nearby fibers…**; stale results cannot restore an old neighbourhood.
-Hidden fibres and their annotation markers cannot be picked or drawn.
+A ribbon is limited to 262,144 sampled rows and 8 million texels. Exceeding a
+limit reports an error. Uint8 and uint16 CT are supported; uint16 is converted to
+the viewer's 8-bit display range.
 
-Proximity validation on the M2 Max Mac (QuickBuild `-O1`, Qt 6.11.2), using
-the complete `PHerc1447/1447_5mm_v1.afv` (80,887 fibres): selecting fibre
-2,157,532 retained 27 / 53 / 123 fibres at 32 / 64 / 128 voxels respectively,
-including the selection. End-to-end settling took 114 / 121 / 125 ms in that
-single UI run (includes a 50 ms test settling delay; not a throughput benchmark).
-The event loop continued processing timer events during the searches. The
-same loaded scene was retained. Rapid selection/radius changes, disable,
-Escape, scene clearing and clean process shutdown passed in the full VC3D app.
-The three suites `fiber_3d_geometry`, `fiber_3d_data` and `test_fiber_collection`
-passed. Geometry tests cover interior approaches, parallel/degenerate segments,
-Euclidean rather than box distance, disjoint runs, clipping, cancellation,
-filtered drawing and picking. macOS was exercised; Ubuntu was not run.
+### Slices and volumetric slabs
 
-Reproduce the build/tests in an already configured tree:
+**CT slices** displays the linked XY, XZ and YZ planes. XY/YZ start enabled and XZ
+starts disabled. Their footprints follow the CT views' position, orientation,
+normal offset, pan and zoom. Hidden CT panes use a bounded 1,024-voxel patch
+around the shared focus. Slice opacity defaults to 70%.
+
+**Volumetric** shares the mode, layer counts and transfer-function settings from
+Composite View. Checked planes become slabs; the 3D camera supplies the viewing
+angle. Overlapping slabs are sampled once. Without Volumetric, each plane is a
+single slice. Slices and a ribbon can be displayed together.
+
+Sampling runs on workers, first at preview resolution, then at higher detail.
+Single-slice textures are limited to 1,024 pixels per edge; slabs are limited to
+512 samples per axis and 32 MiB each. The 3D camera, opacity and contrast reuse
+sampled CT. Missing or failed reads are reported by the controls.
+
+## Loading and rendering
+
+The defaults are **50,000 fibers** and **512 MiB of decoded coordinates per
+source**. The selected fiber loads first, then the longest fibers in the active
+region and filters, with ID as the tie-breaker. This order is independent of the
+camera. A full-volume AFV load first publishes a bounded preview.
+
+Memory presets range from 64 MiB to 32 GiB. Set **Fiber limit** to 0 for no count
+limit; the memory limit still applies. A partial view is explicitly reported.
+The same budget bounds the surface mesh buffers. It is not a total application
+RAM/VRAM limit: snapshots, spatial indices, rendering buffers, CT and GPU copies
+use additional memory.
+
+Curve preparation and proximity queries run on cancellable workers owning value
+snapshots. The GUI owns selection and live annotation state. Superseded results
+are discarded. Drawing uses a spatial hierarchy and screen-space detail levels
+(0.5 physical pixel error at rest, 1.25 during interaction). Source geometry and
+picking retain original segments and indices. Simplification does not bridge
+runs, styles, invalid points or region re-entry. GPU uploads are staged; very
+large collections can still require smaller regions or budgets.
+
+## Verification
+
+With dependencies already installed and CMake configured, build and run:
 
 ```sh
-cmake --build <build-dir> --target VC3D test_fiber_3d_geometry test_fiber_3d_data -j 6
-ctest --test-dir <build-dir> --output-on-failure -R '^(fiber_3d_data|fiber_3d_geometry|test_fiber_collection)$'
+cmake --build build --parallel 5 --target VC3D \
+  test_fiber_collection test_lasagna_line_view_surfaces \
+  test_fiber_3d_data test_fiber_3d_geometry test_fiber_3d_ribbon \
+  test_fiber_3d_slices test_fiber_3d_volume test_fiber_3d_surface test_fiber_3d_canvas
+ctest --test-dir build --output-on-failure \
+  -R '^(test_fiber_collection|test_lasagna_line_view_surfaces|fiber_3d_.*)$'
 ```
 
-The local real-data QA harness and screenshots are in
-`exports/VC3D_FIBERS3D_QA/proximity-20261024/` in the parent project. Its
-`run-integrated.py` relinks the existing VC3D objects with `proximity-startup.cpp`
-and runs a disposable copy of the settings/project; it does not modify the AFV.
+Tests cover frames/scales, AFV ordering/budgets/cancellation, original indices,
+gaps and clipping, proximity against exhaustive search, native CT sampling,
+ribbon seams, mesh holes, OpenGL rendering and queued scene replacement. The
+canvas test requires a window system; OpenGL-specific tests report a skip when
+the required context is unavailable.
 
-A white crosshair marks the shared CT focus at its actual 3D position. Moving
-the focus in a CT view updates it immediately without moving the 3D camera;
-in whole-volume mode this does not reload the fibres. It is a navigation
-overlay drawn above the fibres for visibility, not a point snapped to a fibre.
-The marker is hidden when its position is outside the camera view.
-Toggle **Settings → More display options → Show cursor** to hide or show it.
-It is enabled by default, and the choice is remembered across sessions.
+Real-data review should include Paris 4 and PHerc1447 AFVs, including a complete
+collection, a dense local region and a long fiber crossing storage blocks:
 
-The **Settings** button opens controls for:
+1. Compare H/V colors and selection with the CT views; exercise clear, reopen,
+   region/length filters, palette changes, orbit, detach and redock.
+2. Open a fiber in Line Annotation. Compare ribbon orientation with its flattened
+   surface and move the current position from both views. Toggle the ribbon and
+   confirm that CT pixels actually appear in 3D.
+3. Display one CT slice, then its volumetric slab. Move the linked CT view and
+   confirm the 3D plane follows it.
+4. Load a registered public surface; check proximity on both sides and with the
+   mesh hidden. Remove the surface and switch volumes during pending work.
 
-- Sources: loaded project annotations and the attached read-only AFV collection.
-- H, V, unclassified fibres and minimum full-fibre length. H/V and minimum length
-  are shared with the automated-fibre controls.
-- The whole volume (default, within the display budgets), or a box around the
-  current CT focus (initial width: 1,024 current-volume voxels). Moving the 3D
-  camera does not change this box.
-- **Memory budget**: 64, 128, 256, 512 MiB, then 1, 2, 4, 8, 16 and 32 GiB,
-  defaulting to **512 MiB**. This is the decoded-coordinate budget per source,
-  not total process/GPU memory; rendering buffers, indexes and CT need additional
-  memory. It is a limit, not a reservation. The chosen byte size is remembered.
-- Custom colour; H/V colours; local axial direction (XYZ or angle to X, Y, Z);
-  full-fibre length in millimetres with automatic or fixed range. Scalar modes
-  offer Viridis, Magma, Cividis and Turbo with a legend. Reversing a fibre's
-  point order leaves its direction colours unchanged.
-  H/V defaults share the AFV slice palette: H blue (`#40a5ff`) and V orange
-  (`#ffad43`). Both colours remain customisable in the 3D settings.
-- Line width (default: 1 logical pixel), unselected opacity, projection and
-  region bounds (hidden by default). Existing saved preferences take priority.
-- Optional annotation markers/styles. These are off by default, and selected
-  fibres only is the default when enabling them. Whole-fibre tags appear in the
-  selection details. Control points, `break` and `kollesis_termination` have
-  distinct markers; `damaged` has a separate pattern. Link overlays are not
-  drawn. **Dashed gaps** optionally marks known `gap` spans and AFV inferred
-  connections; it is off by default. These are metadata-driven display styles,
-  not additional gaps created in the source geometry.
-
-Settings are grouped into Sources, Appearance, Selection and Annotations. Only controls
-for the active colour mode are shown, and the CT box width appears when using
-the focus region. **More display options** contains unselected opacity,
-perspective, region bounds, the CT cursor and the fibre limit. The popup adapts
-its height to the visible controls and scrolls when necessary.
-
-## Geometry and loading
-
-The view retains original stored polylines and never joins separate runs.
-Its display uses levels of detail: the chosen chords deviate by at most
-0.5 physical screen pixel at rest, or 1.25 pixels during orbit/pan/zoom.
-After 180 ms without movement, it returns to the finer bound. The selected
-fibre always uses the exact original clipped segments. These approximations
-only affect drawing, including the direction colour of a displayed chord;
-they do not edit AFV coordinates, lengths, annotations or exported data.
-Source indices survive region clipping so a pick opens the correct
-original line point. CPU coordinates are double precision; rendering subtracts
-a local origin before uploading floats. Native annotations are transformed from
-the verified annotation frame to the current CT grid. AFV coordinates use the
-existing collection identity validation and native-to-viewer scale.
-
-Lengths and length filters use the complete source fibre, not the visible
-clipped portion. Unavailable physical scale is not guessed. AFV selections use
-collection UUID and fibre ID; native selections use an ID scoped to the loaded
-project, and project changes clear the scene.
-
-Loading is asynchronous, cancellable and coalesced. Workers own value snapshots
-and independent read-only AFV readers. Stale results cannot replace a newer
-scene. Geometry preparation also runs on a cancellable worker. A spatial
-hierarchy rejects blocks outside the view before submitting draw calls and
-restricts picking to blocks near the click. Picking still tests original
-segments, in their original order, with the same depth/distance tie rules.
-Orbit, zoom and colour changes reuse prepared geometry; they do not
-request data again. Selecting a fibre uploads its exact geometry separately.
-Native annotation snapshots are copied from the existing
-controller on the GUI thread.
-
-GPU uploads are staged in chunks of at most 8 MiB per repaint, coarse levels
-first. During the initial **Refining display…** phase a coarser complete level
-can be visible before the requested precision is available. No fibre is removed
-by the level-of-detail system. Separate runs, span styles, invalid points and
-region re-entry are never bridged. Curves are simplified against finite chords
-so hairpins are preserved. Conservative perspective bounds fall back to exact
-detail at the near plane. The CPU index references source runs directly instead
-of duplicating every segment's double-precision endpoints for picking.
-
-This bounds drawing error, not frame time or total application memory. Loaded
-coordinates, prepared display levels, GPU buffers and CT still consume memory;
-very large collections may require a smaller displayed region or data budget.
-There is no guarantee of unlimited geometry at a fixed frame rate.
-
-Each source defaults to 10,000 displayed fibres and a 512 MiB decoded-polyline
-budget. **More display options → Fiber limit → No limit** removes the count
-cap while retaining the memory budget; numeric caps up to 1,000,000 are allowed.
-Within the region and active filters, the selected fibre is loaded first, then
-fibres by decreasing complete-source length, with increasing ID for ties.
-This ordering applies to AFV and native annotations. It does not change with
-camera rotation or zoom. The CT slice renderer keeps its existing stable sample
-ordering. Selection priority does not override region or family/length filters.
-The AFV reader also bounds candidate-block bookkeeping (one sixteenth of the
-coordinate budget, at least 16 MiB) and its block cache.
-Reaching a budget displays an explicit partial-view message; a region
-with too many candidate blocks must be narrowed. These limits bound the new
-AFV view's memory rather than pretending an entire scroll fits in GPU memory.
-
-## Review and verification
-
-The implementation is split into a display-only `Fiber3DCanvas`, value adapters
-in `Fiber3DData`, and `Fiber3DPanel` for main-workspace UI, selection and loading.
-It does not edit fibre geometry, perform inference, or reconstruct surfaces.
-The canvas and adapters can be reused in another workspace later.
-
-Antialiased segment caps use the actual framebuffer's MSAA coverage mask rather
-than writing full depth for partially covered pixels. This prevents faint cap
-edges from hiding the opaque interiors of neighbouring short segments. A
-framebuffer without MSAA uses separate core and fringe passes; fringe pixels do
-not write depth. Geometry and picking are unchanged.
-
-Build targets: `VC3D`, `test_fiber_3d_data`, `test_fiber_3d_geometry`, and
-`test_fiber_collection`. Run CTest names `fiber_3d_data`, `fiber_3d_geometry`,
-`test_fiber_collection`.
-
-Tests cover coordinate scaling and unknown frames, complete-source physical
-lengths, disjoint runs, segments whose endpoints lie outside the region,
-original point indices and span styles across AFV blocks, all family-filter
-combinations, UUID mismatch, cancellation, geometry/candidate limits, and
-sign-invariant direction colours. A real-collection GUI check should also
-exercise orbit/pan/zoom, selection and CT navigation on the target platform.
-
-Validated on macOS / Apple Silicon with Qt 6.11.2, Clang 22 and OpenCV 5:
-all three test suites pass. The application check used a real PHerc1447 AFV
-(2,373 fibres), including H/V filtering (1,287 V fibres), H/V, direction and
-length colours,
-orbit without data reload, picking, exact CT centring, hide/reopen and
-float/redock. Full-window bridge captures composite the OpenGL framebuffer;
-Qt's raster-only widget capture cannot capture this content correctly.
-
-The settings popup was also checked on macOS in H/V, direction and fixed-length
-modes, with advanced options expanded and collapsed. Its height follows the
-visible controls; all controls remain reachable by scrolling with no horizontal
-overflow. The Settings button uses the same text style as the other toolbar
-buttons, without an icon or native menu indicator.
-
-The dense-curve rendering regression was reproduced with every segment styled
-solid, independently of gap metadata. The corrected renderer was checked on
-the complete 2,373-fibre AFV, individual fibres and dense synthetic curves in
-orthographic and perspective views, at line widths 2 and 4, and with 10/50/100%
-unselected opacity. A standalone check also exercised an actual framebuffer
-with `GL_SAMPLES=0`. On the complete collection, 30 orbit frames including
-synchronous framebuffer readback measured 18.38 ms median / 28.41 ms p95 before
-and 17.77 ms / 24.29 ms after; these are harness timings, not whole-application
-frame-rate measurements.
-
-The CT-focus crosshair was checked on the real AFV with the user's 6 mm
-filter (29 displayed fibres): moving the CT focus A → B → A changed only
-the marker pixels, and 12 focus moves caused no scene reload in whole-volume
-mode. Canvas checks also cover a focus outside the fibre bounds but inside the
-view, invalid/out-of-view positions, clearing the scene, and large coordinates.
-These checks ran on macOS; the crosshair uses portable Qt painting.
-
-Deselection was checked on the published Paris4 AFV (512,698 fibres), using an
-isolated profile and a bounded focus region. Escape and an empty-space click
-clear both the AFV list and the 3D selection; dragging preserves selection.
-An outstanding inspection request cannot restore a cleared selection. With no
-selection, 87% and 100% other-fibre opacity produce identical framebuffer pixels.
-
-Memory controls were checked on the full 80,887-fibre PHerc1447 AFV: a fresh
-profile starts at 512 MiB; all ten presets are available; 32 GiB survives an
-application restart without integer overflow; and the popup has no horizontal
-overflow. With a 10,000-fibre cap, 64 MiB loads 5,599 fibres and 512 MiB reaches
-the count cap. Lowering the budget preserves selection priority. A separate
-data-loader check, without the count cap or length filter, loads all 80,887
-fibres in descending length within 494,048,712 decoded coordinate bytes.
-That check does not measure full-scroll rendering frame rate or total RAM.
-
-### Full-scroll rendering measurement (24 October 2026)
-
-Measured on an M2 Max / 32 GiB Mac, Qt 6.11.2, Clang 22, the existing
-`QuickBuild` configuration (`-O1`), with `1447_5mm_v1.afv`: all 80,887 fibres,
-20,472,671 source segments, no count/length filter, 800 × 600 logical pixels at
-2× device scale. Each frame calls the actual canvas paint function followed by
-`glFinish`; these are rendering latencies, not an unlimited-FPS claim. Five
-warm-up frames are excluded, then 60 orbit frames and 10 clicks are measured.
-
-| Operation | Before median / p95 | After median / p95 |
-| --- | --- | --- |
-| Whole-scroll orbit | 190.24 / 194.03 ms | 3.47 / 6.70 ms |
-| Close orbit | 61.02 / 61.47 ms | 3.65 / 5.67 ms |
-| Selection click | 286.73 / 302.41 ms | 1.22 / 2.13 ms |
-
-The baseline macOS `sample` profile spent 1,166 of 1,184 main-thread samples
-waiting for the GPU in `glFinish` / `GLDShareGroupRec::waitUsage`. The new
-preparation/upload took 6.85 seconds once, asynchronously, after reading the
-AFV. This does not occur on camera moves. Initial-load peak process footprint
-was about 6.54 GB; the coordinate budget is still not a total-RAM bound.
-
-A separate full-application check, with CT views open and all 80,887 fibres,
-measured 60 presented frames in a 771 × 882 logical-pixel dock at 2× scale:
-8.35 ms median, 16.83 ms p95, 16.97 ms maximum. Shared AFV selection and Escape
-passed. Additional canvas checks verify exact original point/index picking in
-orthographic and perspective modes, superseded loads, clearing during a load,
-and empty scenes. Tests were run on macOS; Linux was not run for this change.
-
-The local evidence and reproducible harnesses are under
-`exports/VC3D_FIBERS3D_QA/render-lod-20261024` in the parent workspace:
-`build-bench.py baseline` links the saved pre-change canvas,
-`build-bench.py` links the current canvas, and `run-integrated.py` runs an
-isolated application profile. Each harness records its exact inputs and
-JSON timings. `lod-first.json` was an invalid preliminary measurement because
-Qt deferred repaints; it is excluded. The reported comparison uses forced GPU
-completion in both versions (`baseline-forced.json` and `lod-final.json`).
+The implementation has been exercised on macOS arm64. Ubuntu validation remains
+required before claiming coverage on both supported platforms. See
+[CONTRIBUTING.md](../../CONTRIBUTING.md) for the real-data evidence and
+human-commentary requirements for a PR.

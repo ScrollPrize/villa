@@ -14,8 +14,9 @@ public:
     void resume();
     void suspend();
     void setMemoryBudget(size_t bytes);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> d;
 };
-}
+}  // namespace vc3d::fibers3d

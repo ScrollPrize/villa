@@ -671,7 +671,7 @@ add_executable(test_fiber_3d_geometry test_fiber_3d_geometry.cpp)
 set_target_properties(test_fiber_3d_geometry PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_fiber_3d_geometry PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
 target_link_libraries(test_fiber_3d_geometry PRIVATE
-    Qt6::Core Qt6::Gui Qt6::Test vc_fiber_collection)
+    Qt6::Core Qt6::Gui Qt6::Test vc_fiber_collection opencv_core)
 add_test(NAME fiber_3d_geometry COMMAND test_fiber_3d_geometry)
 vc_register_test_target(test_fiber_3d_geometry)
 vc_register_ctest(fiber_3d_geometry test_fiber_3d_geometry)
@@ -679,7 +679,7 @@ vc_register_ctest(fiber_3d_geometry test_fiber_3d_geometry)
 add_executable(test_fiber_3d_ribbon test_fiber_3d_ribbon.cpp ../fibers3d/Fiber3DRibbon.cpp ../fibers3d/Fiber3DCT.cpp)
 set_target_properties(test_fiber_3d_ribbon PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
 target_include_directories(test_fiber_3d_ribbon PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
-target_link_libraries(test_fiber_3d_ribbon PRIVATE Qt6::Core Qt6::Gui Qt6::Test vc_core vc_fiber_collection)
+target_link_libraries(test_fiber_3d_ribbon PRIVATE Qt6::Core Qt6::Gui Qt6::Test vc_core vc_fiber_collection vc_lasagna)
 add_test(NAME fiber_3d_ribbon COMMAND test_fiber_3d_ribbon)
 vc_register_test_target(test_fiber_3d_ribbon)
 vc_register_ctest(fiber_3d_ribbon test_fiber_3d_ribbon)
@@ -707,3 +707,16 @@ target_link_libraries(test_fiber_3d_surface PRIVATE Qt6::Core Qt6::Gui Qt6::Open
 add_test(NAME fiber_3d_surface COMMAND test_fiber_3d_surface)
 vc_register_test_target(test_fiber_3d_surface)
 vc_register_ctest(fiber_3d_surface test_fiber_3d_surface)
+
+add_executable(test_fiber_3d_canvas test_fiber_3d_canvas.cpp
+    ../fibers3d/Fiber3DCanvas.cpp
+    ../fibers3d/Fiber3DSlices.cpp ../fibers3d/Fiber3DCT.cpp
+    ../fibers3d/Fiber3DVolumeRenderer.cpp ../volume_viewers/VolumetricCompositor.cpp
+    ../fibers3d/Fiber3DSurfaceRenderer.cpp ../fibers3d/Fiber3DSurfaceProximity.cpp)
+set_target_properties(test_fiber_3d_canvas PROPERTIES AUTOMOC ON AUTOUIC OFF AUTORCC OFF)
+target_include_directories(test_fiber_3d_canvas PRIVATE ${PROJECT_SOURCE_DIR}/apps/VC3D)
+target_link_libraries(test_fiber_3d_canvas PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets
+    Qt6::OpenGLWidgets Qt6::Concurrent Qt6::Test vc_core vc_fiber_collection)
+add_test(NAME fiber_3d_canvas COMMAND test_fiber_3d_canvas)
+vc_register_test_target(test_fiber_3d_canvas)
+vc_register_ctest(fiber_3d_canvas test_fiber_3d_canvas)

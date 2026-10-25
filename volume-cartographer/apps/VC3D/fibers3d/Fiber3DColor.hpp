@@ -34,15 +34,4 @@ inline const std::array<QColor, 256>& paletteStops(Palette palette)
     return tables[std::clamp(int(palette), 0, 3)];
 }
 
-inline QColor paletteColor(Palette palette, double value)
-{
-    const auto& stops = paletteStops(palette);
-    const double scaled = std::clamp(value, 0.0, 1.0) * 255.0;
-    const int index = std::min(254, int(scaled));
-    const double fraction = scaled - index;
-    const auto& a = stops[index];
-    const auto& b = stops[index + 1];
-    return QColor::fromRgbF(a.redF() + (b.redF() - a.redF()) * fraction, a.greenF() + (b.greenF() - a.greenF()) * fraction, a.blueF() + (b.blueF() - a.blueF()) * fraction);
-}
-
 }  // namespace vc3d::fibers3d

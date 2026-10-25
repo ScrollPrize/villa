@@ -15,8 +15,9 @@ public:
     ~Fiber3DSliceControls() override;
     void resume();
     void cancel();
+
 private:
     struct Impl;
     std::unique_ptr<Impl> d;
 };
-}
+}  // namespace vc3d::fibers3d

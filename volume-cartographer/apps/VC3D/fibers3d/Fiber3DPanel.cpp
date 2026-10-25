@@ -2,6 +2,8 @@
 #include "Fiber3DCanvas.hpp"
 #include "Fiber3DData.hpp"
 #include "Fiber3DRibbonControls.hpp"
+#include "LineAnnotationGeneratedViews.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 #include "Fiber3DSliceControls.hpp"
 #include "Fiber3DSurfaceControls.hpp"
 #include "CState.hpp"
@@ -10,7 +12,6 @@
 #include "ViewerManager.hpp"
 #include "vc/core/types/Volume.hpp"
 
-#include <QApplication>
 #include <QCheckBox>
 #include <QColorDialog>
 #include <QComboBox>
@@ -25,6 +26,7 @@
 #include <QLabel>
 #include <QMenu>
 #include <QPushButton>
+#include <QPromise>
 #include <QSettings>
 #include <QShowEvent>
 #include <QSignalBlocker>
@@ -49,6 +51,7 @@ struct LoadResult {
     std::shared_ptr<Scene> scene;
     QString error;
     uint64_t revision = 0;
+    bool preview = false;
 };
 
 void appendScene(Scene& out, Scene part)
@@ -85,6 +88,7 @@ struct Fiber3DPanel::Impl {
     QWidget *customRow, *familyRow, *directionRow, *paletteRow, *fixedRangeRow, *lengthRangeRow, *boxWidthRow, *annotationOptions;
     QDialog* settingsDialog;
     QTabWidget* settingsTabs;
+    std::vector<QWidget*> preferenceFields;
     DisplaySettings display;
     QTimer debounce;
     QFutureWatcher<LoadResult> watcher;
@@ -92,12 +96,18 @@ struct Fiber3DPanel::Impl {
     std::shared_ptr<const Scene> scene;
     QString selectedKey;
     uint64_t revision = 0;
-    bool pending = false;
+    bool loading = false, pending = false;
+    bool preview = false;
     bool syncingFilters = false;
     bool fitted = false;
+    bool lineAnnotation = false;
+    std::vector<cv::Vec3f> linePoints;
+    std::vector<double> lineArcs;
+    double linePosition = 0;
+    Fiber3DRibbonControls::FramesFactory canonicalSurface;
 
-    Impl(Fiber3DPanel* panel, CState* s, ViewerManager* vm, LineAnnotationController* a, FiberCollectionController* f)
-        : q(panel), state(s), viewers(vm), annotations(a), automated(f)
+    Impl(Fiber3DPanel* panel, CState* s, ViewerManager* vm, LineAnnotationController* a, FiberCollectionController* f, bool inLineAnnotation)
+        : q(panel), state(s), viewers(vm), annotations(a), automated(f), lineAnnotation(inLineAnnotation)
     {
         q->setObjectName(QStringLiteral("fibers3DPanel"));
         q->setMinimumSize(280, 240);
@@ -124,7 +134,7 @@ struct Fiber3DPanel::Impl {
         layout->addLayout(bar);
         canvas = new Fiber3DCanvas(q);
         canvas->setObjectName(QStringLiteral("fibers3DCanvas"));
-        ribbonControls = new Fiber3DRibbonControls(state, viewers, canvas, ribbon, q);
+        ribbonControls = new Fiber3DRibbonControls(state, viewers, annotations, automated, canvas, ribbon, q);
         layout->addWidget(ribbonControls);
         sliceControls = new Fiber3DSliceControls(state, viewers, canvas, slices, q);
         layout->addWidget(sliceControls);
@@ -139,19 +149,45 @@ struct Fiber3DPanel::Impl {
         status->setTextFormat(Qt::PlainText);
         status->setObjectName(QStringLiteral("fibers3DStatus"));
         layout->addWidget(status);
+        auto* annotationStatus = new QLabel(q);
+        annotationStatus->setObjectName(QStringLiteral("fibers3DAnnotationStatus"));
+        annotationStatus->setTextFormat(Qt::PlainText);
+        annotationStatus->setWordWrap(true);
+        annotationStatus->hide();
+        layout->addWidget(annotationStatus);
+        QObject::connect(automated, &FiberCollectionController::annotationStatusChanged, annotationStatus, [annotationStatus](const QString& text) {
+            annotationStatus->setText(text);
+            annotationStatus->setVisible(!text.isEmpty());
+        });
         canvas->setToolTip(
             q->tr("Drag to orbit · right/middle drag to pan · wheel to zoom\nClick to select · Escape or click empty space to clear selection\nRight-click for CT navigation"));
         QObject::connect(canvas, &Fiber3DCanvas::visibilityChanged, q, [this] { updateStatus(); });
         QObject::connect(fit, &QToolButton::clicked, canvas, &Fiber3DCanvas::fitAll);
-        QObject::connect(fitSelected, &QToolButton::clicked, canvas, &Fiber3DCanvas::fitSelected);
+        QObject::connect(fitSelected, &QToolButton::clicked, q, [this] {
+            if (lineAnnotation)
+                canvas->fitAll();
+            else
+                canvas->fitSelected();
+        });
         QObject::connect(detach, &QToolButton::clicked, q, &Fiber3DPanel::detachRequested);
         createSettings(settingsButton);
+        if (lineAnnotation) {
+            fitSelected->hide();
+            for (int i = 0; i < settingsTabs->count(); ++i) {
+                const auto name = settingsTabs->widget(i)->objectName();
+                if (name == QStringLiteral("fibers3DSettingsFibers") || name == QStringLiteral("fibers3DSettingsMemory"))
+                    settingsTabs->setTabVisible(i, false);
+            }
+            QObject::connect(canvas, &Fiber3DCanvas::fiberPositionPicked, q, [this](const QString&, double position) {
+                emit q->linePositionPicked(position);
+            });
+        }
 
         debounce.setSingleShot(true);
         debounce.setInterval(100);
         QObject::connect(&debounce, &QTimer::timeout, q, [this] { startLoad(); });
-        QObject::connect(&watcher, &QFutureWatcher<LoadResult>::finished, q, [this] {
-            const auto result = watcher.result();
+        QObject::connect(&watcher, &QFutureWatcher<LoadResult>::resultReadyAt, q, [this](int index) {
+            const auto result = watcher.resultAt(index);
             if (result.revision == revision && q->isVisible()) {
                 if (!result.error.isEmpty()) {
                     canvas->clear();
@@ -159,6 +195,7 @@ struct Fiber3DPanel::Impl {
                     status->setText(q->tr("Cannot display fibers: %1").arg(result.error));
                     updateSelection();
                 } else if (result.scene) {
+                    preview = result.preview;
                     scene = result.scene;
                     canvas->setScene(scene);
                     syncCursor();
@@ -171,20 +208,32 @@ struct Fiber3DPanel::Impl {
                     updateSelection();
                 }
             }
+        });
+        QObject::connect(&watcher, &QFutureWatcher<LoadResult>::finished, q, [this] {
+            loading = false;
             if (pending && q->isVisible())
                 debounce.start();
         });
         QObject::connect(canvas, &Fiber3DCanvas::fiberPicked, q, [this](const QString& key, qint64, double, double, double) {
-            select(key, true);
+            if (!lineAnnotation)
+                select(key, true);
         });
         QObject::connect(canvas, &Fiber3DCanvas::clearSelectionRequested, q, [this] { clearSelection(); });
         QObject::connect(canvas, &Fiber3DCanvas::fiberContextRequested, q, [this](const QString& key, qint64 index, double x, double y, double z, QPoint p) {
-            select(key, true);
+            if (!lineAnnotation)
+                select(key, true);
             contextMenu(p, key, index, {x, y, z});
         });
         QObject::connect(canvas, &Fiber3DCanvas::emptyContextRequested, q, [this](QPoint p) { contextMenu(p, {}, 0, {}); });
-        QObject::connect(annotations, &LineAnnotationController::fibersChanged, q, [this] { request(); });
+        QObject::connect(annotations, &LineAnnotationController::fibersChanged, q, [this] {
+            // Inspecting a read-only AFV fiber also changes the annotation
+            // controller. It must not restart an unrelated automated-only load.
+            if (nativeSource->isChecked())
+                request();
+        });
         QObject::connect(automated, &FiberCollectionController::collectionChanged, q, [this] {
+            if (lineAnnotation)
+                return;
             afvSource->setEnabled(automated->sourceDescriptor().has_value());
             if (!selectedKey.startsWith(QStringLiteral("annotation:")))
                 selectedKey.clear();
@@ -192,7 +241,7 @@ struct Fiber3DPanel::Impl {
             request(true);
         });
         QObject::connect(automated, &FiberCollectionController::fiberFiltersChanged, q, [this] {
-            if (syncingFilters)
+            if (lineAnnotation || syncingFilters)
                 return;
             const QSignalBlocker b1(minimum), b2(h), b3(v);
             minimum->setValue(automated->minimumLengthMm());
@@ -201,6 +250,8 @@ struct Fiber3DPanel::Impl {
             request();
         });
         QObject::connect(automated, &FiberCollectionController::fiberSelectionChanged, q, [this](qint64 id) {
+            if (lineAnnotation)
+                return;
             if (const auto source = automated->sourceDescriptor(); source && id > 0) {
                 select(source->uuid + QLatin1Char(':') + QString::number(id), false);
             } else if (id == 0 && !selectedKey.startsWith(QStringLiteral("annotation:"))) {
@@ -208,6 +259,10 @@ struct Fiber3DPanel::Impl {
             }
         });
         auto reset = [this] {
+            if (lineAnnotation) {
+                q->clearLineAnnotation();
+                return;
+            }
             selectedKey.clear();
             fitted = false;
             request(true);
@@ -230,6 +285,8 @@ struct Fiber3DPanel::Impl {
 
     void syncCursor()
     {
+        if (lineAnnotation)
+            return;
         const auto* focus = state->poi("focus");
         if (!state->currentVolume() || !focus) {
             canvas->setCursorPosition(std::nullopt);
@@ -243,7 +300,7 @@ struct Fiber3DPanel::Impl {
     void createSettings(QToolButton* settingsButton)
     {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        settings.beginGroup(QStringLiteral("fibers3d"));
+        settings.beginGroup(lineAnnotation ? QStringLiteral("lineAnnotation/fibers3d") : QStringLiteral("fibers3d"));
         settingsDialog = new QDialog(q, Qt::Tool);
         settingsDialog->setObjectName(QStringLiteral("fibers3DSettingsDialog"));
         settingsDialog->setWindowTitle(q->tr("Fibers 3D · Settings"));
@@ -256,8 +313,8 @@ struct Fiber3DPanel::Impl {
         settingsTabs->setUsesScrollButtons(false);
         // The application's dark theme gives all tabs the same background.
         // Keep the current settings page unmistakable in either theme.
-        settingsTabs->setStyleSheet(QStringLiteral(
-            "QTabBar::tab:selected { background-color: palette(highlight); color: palette(highlighted-text); }"));
+        settingsTabs->setStyleSheet(
+            QStringLiteral("QTabBar::tab:selected { background-color: palette(highlight); color: palette(highlighted-text); }"));
         dialogLayout->addWidget(settingsTabs);
         auto* closeButtons = new QDialogButtonBox(QDialogButtonBox::Close, settingsDialog);
         closeButtons->button(QDialogButtonBox::Close)->setAutoDefault(false);
@@ -270,11 +327,12 @@ struct Fiber3DPanel::Impl {
                 // left on a disconnected monitor. Use the button's screen for
                 // a new dialog, also when the 3D dock has been detached.
                 const auto available = settingsButton->screen()->availableGeometry();
-                if (!settingsDialog->property("positioned").toBool() ||
-                    !available.contains(settingsDialog->frameGeometry())) {
-                    auto position = settingsButton->mapToGlobal(QPoint(settingsButton->width() - settingsDialog->width(), settingsButton->height()));
+                if (!settingsDialog->property("positioned").toBool() || !available.contains(settingsDialog->frameGeometry())) {
+                    auto position =
+                        settingsButton->mapToGlobal(QPoint(settingsButton->width() - settingsDialog->width(), settingsButton->height()));
                     position.setX(std::clamp(position.x(), available.left(), std::max(available.left(), available.right() - settingsDialog->width())));
-                    position.setY(std::clamp(position.y(), available.top() + 30, std::max(available.top() + 30, available.bottom() - settingsDialog->height())));
+                    position.setY(
+                        std::clamp(position.y(), available.top() + 30, std::max(available.top() + 30, available.bottom() - settingsDialog->height())));
                     settingsDialog->move(position);
                     settingsDialog->setProperty("positioned", true);
                 }
@@ -287,7 +345,8 @@ struct Fiber3DPanel::Impl {
         QWidget* settingsContents = nullptr;
         QVBoxLayout* body = nullptr;
         auto page = [&](const QString& title, const QString& name) {
-            if (body) body->addStretch();
+            if (body)
+                body->addStretch();
             settingsContents = new QWidget(settingsTabs);
             settingsContents->setObjectName(name);
             body = new QVBoxLayout(settingsContents);
@@ -321,12 +380,14 @@ struct Fiber3DPanel::Impl {
         };
         auto check = [&](const char* key, const QString& label, bool value) {
             auto* w = new QCheckBox(label, settingsContents);
+            preferenceFields.push_back(w);
             w->setObjectName(QString::fromLatin1(key));
             w->setChecked(settings.value(QString::fromLatin1(key), value).toBool());
             return w;
         };
         auto combo = [&](const char* key, const QStringList& choices, int defaultIndex = 0) {
             auto* w = new QComboBox(settingsContents);
+            preferenceFields.push_back(w);
             w->setObjectName(QString::fromLatin1(key));
             w->addItems(choices);
             w->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
@@ -337,6 +398,7 @@ struct Fiber3DPanel::Impl {
         };
         auto real = [&](const char* key, double lo, double hi, double value, int decimals, const QString& suffix = {}) {
             auto* w = new QDoubleSpinBox(settingsContents);
+            preferenceFields.push_back(w);
             w->setObjectName(QString::fromLatin1(key));
             w->setRange(lo, hi);
             w->setDecimals(decimals);
@@ -346,6 +408,7 @@ struct Fiber3DPanel::Impl {
         };
         auto integer = [&](const char* key, int lo, int hi, int value) {
             auto* w = new QSpinBox(settingsContents);
+            preferenceFields.push_back(w);
             w->setObjectName(QString::fromLatin1(key));
             w->setRange(lo, hi);
             w->setValue(settings.value(QString::fromLatin1(key), value).toInt());
@@ -421,6 +484,7 @@ struct Fiber3DPanel::Impl {
         section(q->tr("Loading limits"));
 
         memoryBudget = new QComboBox(settingsContents);
+        preferenceFields.push_back(memoryBudget);
         memoryBudget->setObjectName(QStringLiteral("fibers3DMemoryBudgetMiB"));
         for (int mib = 64; mib <= 32768; mib *= 2) {
             // Omit values that cannot be represented on this build's address space.
@@ -431,16 +495,20 @@ struct Fiber3DPanel::Impl {
         const int savedBudget = memoryBudget->findData(settings.value(memoryBudget->objectName(), 512).toInt());
         memoryBudget->setCurrentIndex(savedBudget >= 0 ? savedBudget : memoryBudget->findData(512));
         surfaceControls->setMemoryBudget(size_t(memoryBudget->currentData().toInt()) * 1024 * 1024);
-        memoryBudget->setToolTip(q->tr("Maximum decoded fiber coordinates per source, and maximum surface mesh buffer size. Additional rendering buffers, snapshots and CT use more memory. This is a limit, not a preallocation."));
+        memoryBudget->setToolTip(
+            q->tr("Maximum decoded fiber coordinates per source, and maximum surface mesh buffer size. Additional rendering buffers, snapshots and CT use more memory. This is a limit, not a preallocation."));
         row(q->tr("Memory budget"), memoryBudget);
-        auto* memoryHelp = new QLabel(q->tr("Budget per fiber source and for the surface mesh. Rendering buffers and CT use additional memory. Memory is allocated only as needed."), settingsContents);
+        auto* memoryHelp =
+            new QLabel(q->tr("Budget per fiber source and for the surface mesh. Rendering buffers and CT use additional memory. Memory is allocated only as needed."), settingsContents);
         memoryHelp->setWordWrap(true);
         body->addWidget(memoryHelp);
-        limit = integer("fibers3DLimit", 0, 1000000, 10000);
+        limit = integer("fibers3DLimit", 0, 1000000, int(QueryOptions{}.maximumFibers));
         limit->setSpecialValueText(q->tr("No limit"));
-        limit->setToolTip(q->tr("Maximum displayed fibers per source. No limit uses only the memory budget. The selected fiber has priority, then the longest fibers in the region."));
+        limit->setToolTip(
+            q->tr("Maximum displayed fibers per source. No limit uses only the memory budget. The selected fiber has priority, then the longest fibers in the region."));
         row(q->tr("Fiber limit"), limit);
-        auto* limitHelp = new QLabel(q->tr("Set to 0 for no count limit. The selected fiber loads first, then the longest fibers in the region."), settingsContents);
+        auto* limitHelp =
+            new QLabel(q->tr("Set to 0 for no count limit. The selected fiber loads first, then the longest fibers in the region."), settingsContents);
         limitHelp->setWordWrap(true);
         body->addWidget(limitHelp);
 
@@ -486,16 +554,23 @@ struct Fiber3DPanel::Impl {
         body->addWidget(gaps);
 
         page(q->tr("Selection"), QStringLiteral("fibers3DSettingsSelection"));
-        section(q->tr("Nearby fibers"));
+        if (!lineAnnotation)
+            section(q->tr("Nearby fibers"));
         auto* nearby = check("fibers3DNearbyOnly", q->tr("Only fibers near selection"), false);
-        nearby->setToolTip(q->tr("Keep whole loaded fibers that pass within this distance of any part of the selected fiber. Without a selection, show all loaded fibers. This only filters the 3D view."));
+        nearby->setToolTip(
+            q->tr("Keep whole loaded fibers that pass within this distance of any part of the selected fiber. Without a selection, show all loaded fibers. This only filters the 3D view."));
         body->addWidget(nearby);
         auto* nearbyDistance = integer("fibers3DNearbyDistance", 1, 100000, 64);
         nearbyDistance->setSuffix(q->tr(" vx"));
         nearbyDistance->setSingleStep(8);
         nearbyDistance->setKeyboardTracking(false);
-        nearbyDistance->setToolTip(q->tr("Shortest 3D distance between fiber centerlines, in active CT voxels. Computed from original segments, independently of zoom."));
-        row(q->tr("Distance"), nearbyDistance);
+        nearbyDistance->setToolTip(
+            q->tr("Shortest 3D distance between fiber centerlines, in active CT voxels. Computed from original segments, independently of zoom."));
+        auto* nearbyRow = row(q->tr("Distance"), nearbyDistance);
+        if (lineAnnotation) {
+            nearby->hide();
+            nearbyRow->hide();
+        }
 
         section(q->tr("Highlight"));
         // Keep the stored 0..1 preference compatible with previous versions;
@@ -504,6 +579,7 @@ struct Fiber3DPanel::Impl {
         if (!std::isfinite(storedOpacity))
             storedOpacity = display.unselectedOpacity;
         auto* opacity = new QSpinBox(settingsContents);
+        preferenceFields.push_back(opacity);
         opacity->setObjectName(QStringLiteral("fibers3DOpacity"));
         opacity->setRange(0, 100);
         opacity->setSingleStep(5);
@@ -521,7 +597,8 @@ struct Fiber3DPanel::Impl {
         opacityLabel->setWordWrap(true);
         opacitySlider->setAccessibleName(opacityLabel->text());
         opacity->setAccessibleName(opacityLabel->text());
-        const auto opacityHelp = q->tr("Opacity of other fibers when a displayed fiber is selected. Without a selection, all fibers are opaque.");
+        const auto opacityHelp =
+            q->tr("Opacity of other fibers when a displayed fiber is selected. Without a selection, all fibers are opaque.");
         opacity->setToolTip(opacityHelp);
         opacitySlider->setToolTip(opacityHelp);
         body->addWidget(opacityLabel);
@@ -552,7 +629,7 @@ struct Fiber3DPanel::Impl {
             display.perspective = perspective->isChecked();
             display.showBounds = bounds->isChecked();
             display.showCursor = cursor->isChecked();
-            display.nearbyOnly = nearby->isChecked();
+            display.nearbyOnly = !lineAnnotation && nearby->isChecked();
             display.nearbyDistanceVoxels = nearbyDistance->value();
             nearbyDistance->setEnabled(display.nearbyOnly);
             applyDisplay();
@@ -598,27 +675,25 @@ struct Fiber3DPanel::Impl {
         settingsDialog->layout()->activate();
         // Never shrink or jump while changing a mode or tab. Grow only if
         // a longer translation/font or newly visible control requires it.
-        settingsDialog->resize(settingsDialog->size().expandedTo(
-            settingsDialog->sizeHint()).expandedTo(QSize(520, 460)));
+        settingsDialog->resize(settingsDialog->size().expandedTo(settingsDialog->sizeHint()).expandedTo(QSize(520, 460)));
     }
 
     void saveSettings()
     {
         QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-        s.beginGroup(QStringLiteral("fibers3d"));
-        // All editable settings have stable object names; the dialog is a child.
-        for (auto* w : q->findChildren<QCheckBox*>())
-            s.setValue(w->objectName(), w->isChecked());
-        for (auto* w : q->findChildren<QComboBox*>())
-            s.setValue(w->objectName(), w == memoryBudget ? w->currentData().toInt() : w->currentIndex());
-        for (auto* w : q->findChildren<QSpinBox*>()) {
-            if (w->objectName() == QStringLiteral("fibers3DOpacity"))
-                s.setValue(w->objectName(), w->value() / 100.0);
-            else
+        s.beginGroup(lineAnnotation ? QStringLiteral("lineAnnotation/fibers3d") : QStringLiteral("fibers3d"));
+        // Only persist fields owned by this panel. Ribbon, slice and surface
+        // controls manage their own preferences and may have another live view.
+        for (auto* field : preferenceFields) {
+            if (auto* w = qobject_cast<QCheckBox*>(field))
+                s.setValue(w->objectName(), w->isChecked());
+            else if (auto* w = qobject_cast<QComboBox*>(field))
+                s.setValue(w->objectName(), w == memoryBudget ? w->currentData().toInt() : w->currentIndex());
+            else if (auto* w = qobject_cast<QSpinBox*>(field))
+                s.setValue(w->objectName(), w->objectName() == QStringLiteral("fibers3DOpacity") ? w->value() / 100.0 : w->value());
+            else if (auto* w = qobject_cast<QDoubleSpinBox*>(field))
                 s.setValue(w->objectName(), w->value());
         }
-        for (auto* w : q->findChildren<QDoubleSpinBox*>())
-            s.setValue(w->objectName(), w->value());
         s.setValue(QStringLiteral("fibers3DCustomColor"), display.custom.name());
         s.setValue(QStringLiteral("fibers3DHColor"), display.horizontal.name());
         s.setValue(QStringLiteral("fibers3DVColor"), display.vertical.name());
@@ -626,6 +701,7 @@ struct Fiber3DPanel::Impl {
 
     void applyDisplay()
     {
+        display.highlightSelection = !lineAnnotation;
         display.colorMode = ColorMode(colors->currentIndex());
         display.directionMode = DirectionMode(direction->currentIndex());
         display.palette = Palette(palette->currentIndex());
@@ -652,6 +728,8 @@ struct Fiber3DPanel::Impl {
 
     void sharedFilters()
     {
+        if (lineAnnotation)
+            return;
         syncingFilters = true;
         automated->setFiberFilters(minimum->value(), h->isChecked(), v->isChecked());
         syncingFilters = false;
@@ -660,6 +738,8 @@ struct Fiber3DPanel::Impl {
 
     void request(bool clear = false)
     {
+        if (lineAnnotation)
+            return;
         ++revision;
         pending = true;
         if (cancelled)
@@ -675,7 +755,7 @@ struct Fiber3DPanel::Impl {
 
     void startLoad()
     {
-        if (!q->isVisible() || watcher.isRunning())
+        if (!q->isVisible() || loading)
             return;
         pending = false;
         const auto volume = state->currentVolume();
@@ -722,24 +802,46 @@ struct Fiber3DPanel::Impl {
         status->setText(q->tr("Loading fibers…"));
         const auto token = cancelled;
         const auto generation = revision;
-        watcher.setFuture(QtConcurrent::run([options, source, snapshot = std::move(snapshot), summaries = std::move(summaries), token, generation]() {
-            LoadResult result;
-            result.revision = generation;
-            try {
-                result.scene = std::make_shared<Scene>();
-                result.scene->clipBounds = options.bounds;
-                if (snapshot && !snapshot->fibers.empty())
-                    appendScene(*result.scene, loadAnnotations(*snapshot, summaries, options, token.get()));
-                if (source)
-                    appendScene(*result.scene, loadAutomated(*source, options, token.get()));
-                if (token->load(std::memory_order_relaxed))
+        loading = true;
+        watcher.setFuture(
+            QtConcurrent::run([options, source, snapshot = std::move(snapshot), summaries = std::move(summaries), token, generation](QPromise<LoadResult>& promise) {
+                LoadResult result;
+                result.revision = generation;
+                try {
+                    // Publish a bounded, selectable first view without changing the
+                    // user's final fiber or memory limits. Full loading stays on
+                    // this worker, with the same revision/cancellation safeguards.
+                    if (source && !options.bounds && options.byteBudget > size_t(64) * 1024 * 1024 &&
+                        (!options.maximumFibers || options.maximumFibers > 2000)) {
+                        auto initial = options;
+                        initial.maximumFibers = 2000;
+                        initial.byteBudget = size_t(64) * 1024 * 1024;
+                        auto first = std::make_shared<Scene>(loadAutomated(*source, initial, token.get()));
+                        if (token->load(std::memory_order_relaxed))
+                            return;
+                        if (!first->fibers.empty()) {
+                            // Budget notices belong to the final view; this one is
+                            // explicitly labelled as a preview still being loaded.
+                            first->message.clear();
+                            first->complete = true;
+                            promise.addResult(LoadResult{std::move(first), {}, generation, true});
+                        }
+                    }
+                    result.scene = std::make_shared<Scene>();
+                    result.scene->clipBounds = options.bounds;
+                    if (snapshot && !snapshot->fibers.empty())
+                        appendScene(*result.scene, loadAnnotations(*snapshot, summaries, options, token.get()));
+                    if (source)
+                        appendScene(*result.scene, loadAutomated(*source, options, token.get()));
+                    if (token->load(std::memory_order_relaxed))
+                        result.scene.reset();
+                } catch (const std::exception& e) {
                     result.scene.reset();
-            } catch (const std::exception& e) {
-                result.scene.reset();
-                result.error = QString::fromUtf8(e.what());
-            }
-            return result;
-        }));
+                    result.error = QString::fromUtf8(e.what());
+                }
+                if (!token->load(std::memory_order_relaxed))
+                    promise.addResult(std::move(result));
+            }));
     }
 
     const Fiber* find(const QString& key) const
@@ -772,6 +874,8 @@ struct Fiber3DPanel::Impl {
 
     void clearSelection()
     {
+        if (lineAnnotation)
+            return;
         // Clear the shared selections as well as this view: slice overlays and
         // asynchronous inspection must not restore the old highlight.
         select({}, false);
@@ -781,22 +885,32 @@ struct Fiber3DPanel::Impl {
 
     void updateStatus()
     {
-        if (!scene) return;
+        if (lineAnnotation) {
+            status->setText(q->tr("Click the fiber to navigate · drag to orbit · wheel to zoom"));
+            return;
+        }
+        if (!scene)
+            return;
         const auto current = canvas->scene();
         if (current != scene) {
             status->setText(q->tr("Preparing %1 fibers…").arg(scene->fibers.size()));
             return;
         }
-        QString text = canvas->isFiltering() ? q->tr("Finding fibers near selection…") :
-            q->tr("%1 fibers displayed / %2 loaded").arg(canvas->visibleFiberCount()).arg(scene->fibers.size());
-        if (!scene->complete) text += q->tr(" · partial view");
-        if (!scene->message.isEmpty()) text += QLatin1Char('\n') + scene->message;
+        QString text = canvas->isFiltering()
+                           ? q->tr("Finding fibers near selection…")
+                           : q->tr("%1 fibers displayed / %2 loaded").arg(canvas->visibleFiberCount()).arg(scene->fibers.size());
+        if (preview)
+            text += q->tr(" · preview — loading remaining fibers…");
+        else if (!scene->complete)
+            text += q->tr(" · partial view");
+        if (!scene->message.isEmpty())
+            text += QLatin1Char('\n') + scene->message;
         status->setText(text);
     }
 
     void updateSelection()
     {
-        ribbonControls->setSelection(scene, selectedKey);
+        ribbonControls->setSelection(scene, selectedKey, canonicalSurface);
         const auto* fiber = find(selectedKey);
         if (!fiber) {
             selection->setText(selectedKey.isEmpty() ? q->tr("Click a fiber to select it.") : q->tr("Selected fiber is outside the displayed region or filters."));
@@ -809,6 +923,8 @@ struct Fiber3DPanel::Impl {
             text += QLatin1Char('\n') + fiber->tags.join(QStringLiteral(", "));
         selection->setText(text);
         selection->setToolTip(q->tr("Escape in the 3D view or click empty space to clear selection."));
+        if (lineAnnotation)
+            q->setLineAnnotationPosition(linePosition);
     }
 
     void contextMenu(QPoint position, const QString& key, qint64 index, Point point)
@@ -821,22 +937,30 @@ struct Fiber3DPanel::Impl {
             const auto id = fiber->id;
             const auto file = fiber->fileName;
             const auto source = fiber->source;
-            menu.addAction(q->tr("Fit selected fiber"), canvas, &Fiber3DCanvas::fitSelected);
+            menu.addAction(q->tr("Fit selected fiber"), q, [this] {
+                if (lineAnnotation)
+                    canvas->fitAll();
+                else
+                    canvas->fitSelected();
+            });
             menu.addAction(q->tr("Center CT views here"), q, [this, point, menuRevision] {
                 if (menuRevision != revision)
                     return;
                 viewers->centerFocusAt({float(point[0]), float(point[1]), float(point[2])}, {0, 0, 1}, "fibers-3d");
             });
-            menu.addAction(q->tr("Open in Line Annotation"), q, [this, id, file, source, index, menuRevision] {
-                if (menuRevision != revision)
-                    return;
-                if (source == Source::Automated)
-                    automated->selectForInspection(qint64(id), true);
-                else if (annotations->hasLoadedFiber(id, file.toStdString()))
-                    annotations->openFiberAtLinePointIndex(id, int(std::clamp<qint64>(index, 0, std::numeric_limits<int>::max())));
-            });
+            if (lineAnnotation) {
+                menu.addAction(q->tr("Go here in Line Annotation"), q, [this, index] { emit q->linePositionPicked(double(index)); });
+            } else
+                menu.addAction(q->tr("Open in Line Annotation"), q, [this, id, file, source, index, menuRevision] {
+                    if (menuRevision != revision)
+                        return;
+                    if (source == Source::Automated)
+                        automated->selectForInspection(qint64(id), true);
+                    else if (annotations->hasLoadedFiber(id, file.toStdString()))
+                        annotations->openFiberAtLinePointIndex(id, int(std::clamp<qint64>(index, 0, std::numeric_limits<int>::max())));
+                });
         }
-        if (!selectedKey.isEmpty()) {
+        if (!lineAnnotation && !selectedKey.isEmpty()) {
             menu.addSeparator();
             menu.addAction(q->tr("Clear selection"), q, [this] { clearSelection(); });
         }
@@ -844,8 +968,8 @@ struct Fiber3DPanel::Impl {
     }
 };
 
-Fiber3DPanel::Fiber3DPanel(CState* s, ViewerManager* vm, LineAnnotationController* a, FiberCollectionController* f, QWidget* parent)
-    : QWidget(parent), d(std::make_unique<Impl>(this, s, vm, a, f))
+Fiber3DPanel::Fiber3DPanel(CState* s, ViewerManager* vm, LineAnnotationController* a, FiberCollectionController* f, QWidget* parent, bool lineAnnotation)
+    : QWidget(parent), d(std::make_unique<Impl>(this, s, vm, a, f, lineAnnotation))
 {
 }
 Fiber3DPanel::~Fiber3DPanel()
@@ -859,6 +983,7 @@ void Fiber3DPanel::showEvent(QShowEvent* e)
     QWidget::showEvent(e);
     d->syncCursor();
     d->request();
+    d->ribbonControls->resume();
     d->sliceControls->resume();
     d->surfaceControls->resume();
 }
@@ -875,6 +1000,90 @@ void Fiber3DPanel::hideEvent(QHideEvent* e)
     if (d->cancelled)
         d->cancelled->store(true, std::memory_order_relaxed);
 }
+void Fiber3DPanel::setLineAnnotationViews(const vc3d::line_annotation::GeneratedViews& views, const QString& name, const QString& family)
+{
+    if (!d->lineAnnotation)
+        return;
+    d->linePoints = views.linePoints;
+    d->lineArcs = vc3d::line_annotation::generatedCumulativeArcLength(d->linePoints);
+    auto scene = std::make_shared<Scene>();
+    if (const auto volume = d->state->currentVolume())
+        scene->voxelSizeMm = volume->voxelSize() / 1000.;
+    Fiber fiber;
+    fiber.key = QStringLiteral("line-annotation:current");
+    fiber.label = name;
+    fiber.family = family == QStringLiteral("H") ? 'H' : family == QStringLiteral("V") ? 'V' : '?';
+    fiber.lengthMm = d->lineArcs.empty() ? 0 : d->lineArcs.back() * scene->voxelSizeMm;
+    Run run;
+    for (size_t i = 0; i < d->linePoints.size(); ++i) {
+        const auto& p = d->linePoints[i];
+        if (!vc3d::line_annotation::finiteGeneratedPoint(p)) {
+            if (run.points.size() > 1)
+                fiber.runs.push_back(std::move(run));
+            run = {};
+            run.firstPoint = int64_t(i + 1);
+        } else
+            run.points.push_back({p[0], p[1], p[2]});
+    }
+    if (run.points.size() > 1)
+        fiber.runs.push_back(std::move(run));
+    for (const auto& cp : views.controlPoints)
+        fiber.markers.push_back({{cp.point[0], cp.point[1], cp.point[2]}, MarkerKind::ControlPoint});
+    d->selectedKey = fiber.key;
+    scene->fibers.push_back(std::move(fiber));
+    d->scene = scene;
+    d->canonicalSurface = {};
+    if (views.lineSurface && views.lineSideSlice) {
+        // Deep copies: a live annotation can replace/edit surfaces while the worker samples CT.
+        const cv::Mat_<cv::Vec3f> grid = views.lineSurface->rawPoints().clone();
+        const cv::Mat_<cv::Vec3f> side = views.lineSideSlice->rawPoints().clone();
+        const double spacing = views.stripPositionMap.stripGridSpacingBaseVoxels;
+        d->canonicalSurface = [grid, side, spacing](const std::atomic_bool* cancel) {
+            return ribbon::framesFromSurface(grid, side, spacing, false, cancel);
+        };
+    }
+    d->canvas->setScene(scene);
+    d->canvas->setSelectedKey(d->selectedKey);
+    if (!d->fitted) {
+        d->canvas->fitAll();
+        d->fitted = true;
+    }
+    d->updateSelection();
+    d->updateStatus();
+}
+
+void Fiber3DPanel::setLineAnnotationPosition(double position)
+{
+    if (!d->lineAnnotation || d->linePoints.empty() || !std::isfinite(position))
+        return;
+    d->linePosition = position;
+    const auto p = vc3d::line_annotation::interpolatedGeneratedLinePoint(d->linePoints, position);
+    const double arc = vc3d::line_annotation::generatedArcLengthAt(d->lineArcs, position);
+    const double total = d->lineArcs.back();
+    const QString label = tr("Position %1%").arg(total > 0 ? 100 * arc / total : 0, 0, 'f', 1);
+    d->selection->setText(
+        label + (d->scene && std::isfinite(d->scene->voxelSizeMm)
+                     ? tr(" · %1 / %2 mm").arg(arc * d->scene->voxelSizeMm, 0, 'f', 2).arg(total * d->scene->voxelSizeMm, 0, 'f', 2)
+                     : QString()));
+    d->selection->setToolTip(tr("Distance from the first stored point, measured along the fiber."));
+    d->canvas->setLinePosition(vc3d::line_annotation::finiteGeneratedPoint(p) ? std::optional<Point>{{p[0], p[1], p[2]}} : std::nullopt);
+}
+
+void Fiber3DPanel::clearLineAnnotation()
+{
+    if (!d->lineAnnotation)
+        return;
+    d->linePoints.clear();
+    d->lineArcs.clear();
+    d->scene.reset();
+    d->canonicalSurface = {};
+    d->fitted = false;
+    d->selectedKey.clear();
+    d->canvas->clear();
+    d->canvas->setLinePosition({});
+    d->updateSelection();
+}
+
 void Fiber3DPanel::selectNativeFiber(uint64_t id)
 {
     if (!id) {

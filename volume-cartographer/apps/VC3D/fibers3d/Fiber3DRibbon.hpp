@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <opencv2/core.hpp>
+#include "vc/lasagna/LineViewBuilder.hpp"
 
 class Volume;
 
@@ -13,8 +14,10 @@ namespace vc3d::fibers3d::ribbon
 {
 
 using NormalAt = std::function<std::optional<cv::Vec3d>(const cv::Vec3d&)>;
+using ModelForPoints = std::function<vc::lasagna::LineModel(const std::vector<cv::Vec3d>&)>;
 struct Row {
-    cv::Vec3d center, tangent, normal;
+    cv::Vec3d center, tangent, normal, side;
+    std::array<cv::Vec3d, vc::lasagna::kLineViewCrossSampleCount> surface;
     bool sampledNormal = false;
 };
 using Strip = std::vector<Row>;
@@ -24,10 +27,18 @@ struct Frames {
 };
 
 // No geometry is connected across runs, invalid coordinates or explicitly
-// missing annotation spans. Original vertices are retained; long segments are
-// subdivided to <= 1 CT voxel. Uses the same frame transport as Line Annotation.
-Frames makeFrames(const Fiber& fiber, const std::optional<Bounds>& clip, const NormalAt& normalAt = {}, const std::atomic_bool* cancelled = nullptr);
-cv::Vec3d across(const Row& row, double rotationDegrees);
+// missing annotation spans. Geometry is the Line Annotation lineSurface grid,
+// interpolated at one voxel along its parameterization for CT texture sampling.
+Frames makeFrames(
+    const Fiber& fiber,
+    const std::optional<Bounds>& clip,
+    const NormalAt& normalAt = {},
+    const std::atomic_bool* cancelled = nullptr,
+    const ModelForPoints& modelForPoints = {},
+    const std::function<cv::Vec3f(const cv::Vec3f&)>& centerReference = {});
+// Reuse an already-built Line Annotation surface (including manual normals).
+Frames framesFromSurface(const cv::Mat_<cv::Vec3f>& grid, const cv::Mat_<cv::Vec3f>& sideGrid, double spacing, bool sampledNormals, const std::atomic_bool* cancelled = nullptr);
+cv::Vec3d position(const Row& row, double offsetVoxels, double rotationDegrees);
 
 using Tile = ct::Tile;
 struct Image {
@@ -35,11 +46,15 @@ struct Image {
     std::vector<Tile> tiles;
     size_t sampledNormals = 0, rows = 0;
     int widthVoxels = 0, rotationDegrees = 0;
+    int level = 0, errors = 0;
+    size_t validTexels = 0, coveredTexels = 0, requestedLevelTexels = 0;
+    bool complete = true;
 };
 
-// One trilinear CT sample per texel at level 0: no depth slab or MIP.
-// Bounded tiles share a border row; their mesh and sampling coordinates agree.
-// Throws on unsupported CT type, missing L0, cancellation or the 8M-texel cap.
-std::shared_ptr<Image> sample(const Frames& frames, Volume& volume, int widthVoxels, int rotationDegrees, const std::atomic_bool* cancelled = nullptr);
+// One trilinear sample per texel, with nonblocking viewer-cache sampling at
+// the zoom's level and coarse fallback. No depth slab or MIP. Bounded tiles
+// share a border row; their mesh and sampling coordinates agree.
+// Throws on unsupported CT type, missing level, cancellation or the 8M-texel cap.
+std::shared_ptr<Image> sampleProgressive(const Frames&, Volume&, int widthVoxels, int rotationDegrees, int level, const std::atomic_bool* cancelled = nullptr);
 
 }  // namespace vc3d::fibers3d::ribbon

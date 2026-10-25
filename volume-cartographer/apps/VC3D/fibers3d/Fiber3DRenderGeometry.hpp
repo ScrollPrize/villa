@@ -56,6 +56,7 @@ struct Geometry {
     std::vector<Chunk> chunks;
     std::vector<Node> nodes;
     std::array<std::vector<Vertex>, tolerances.size()> levels;
+    bool deferredExact = false;
     std::vector<Vertex> markers;
     std::vector<Bounds> fiberBounds;
     std::vector<std::vector<size_t>> fiberChunks;
@@ -84,6 +85,26 @@ inline Vertex vertex(const Geometry& g, const Point& a, const Point& b, size_t f
     const auto t = axialDirection(a, b);
     return {{float(a[0] - g.origin[0]), float(a[1] - g.origin[1]), float(a[2] - g.origin[2])}, {float(b[0] - g.origin[0]), float(b[1] - g.origin[1]), float(b[2] - g.origin[2])}, std::isfinite(f.lengthMm) && f.lengthMm >= 0 ? float(f.lengthMm) : -1.f, f.family == 'H' ? 1.f : (f.family == 'V' ? 2.f : 0.f), style, float(fi), float(arc), {float(t[0]), float(t[1]), float(t[2])}};
 }
+// Rebuild only requested exact chunks from the unchanged source points. The
+// same helper serves zoomed views and selection, so neither loses detail.
+inline void appendExact(const Geometry& g, const Chunk& c, std::vector<Vertex>& out)
+{
+    if (!g.deferredExact) {
+        const auto r = c.levels[0];
+        out.insert(out.end(), g.levels[0].begin() + r.first, g.levels[0].begin() + r.first + r.count);
+        return;
+    }
+    const auto& run = g.scene->fibers[c.fiber].runs[c.run];
+    const float style = c.first < run.styles.size() ? float(run.styles[c.first]) : 0;
+    double arc = c.arc;
+    for (size_t i = c.first; i < c.end; ++i) {
+        Segment s;
+        segment(g, c, i, s);
+        const double len = distance(run.points[i], run.points[i + 1]);
+        out.push_back(vertex(g, s.a, s.b, c.fiber, style, arc + len * s.begin));
+        arc += len;
+    }
+}
 inline double distanceToSegment(const Point& p, const Point& a, const Point& b)
 {
     double ab2 = 0, dot = 0;
@@ -98,14 +119,17 @@ inline double distanceToSegment(const Point& p, const Point& a, const Point& b)
 // |u|²|v|² - (u.v)² for nearly parallel fibers.
 inline double segmentDistance(const Point& a, const Point& b, const Point& c, const Point& d)
 {
-    double best = std::min({distanceToSegment(a, c, d), distanceToSegment(b, c, d),
-                            distanceToSegment(c, a, b), distanceToSegment(d, a, b)});
+    double best = std::min({distanceToSegment(a, c, d), distanceToSegment(b, c, d), distanceToSegment(c, a, b), distanceToSegment(d, a, b)});
     const auto cross = [](const Point& u, const Point& v) -> Point {
-        return {u[1]*v[2]-u[2]*v[1], u[2]*v[0]-u[0]*v[2], u[0]*v[1]-u[1]*v[0]};
+        return {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
     };
-    const auto dot = [](const Point& u, const Point& v) { return u[0]*v[0]+u[1]*v[1]+u[2]*v[2]; };
+    const auto dot = [](const Point& u, const Point& v) { return u[0] * v[0] + u[1] * v[1] + u[2] * v[2]; };
     Point u, v, w;
-    for (int k = 0; k < 3; ++k) { u[k] = b[k]-a[k]; v[k] = d[k]-c[k]; w[k] = c[k]-a[k]; }
+    for (int k = 0; k < 3; ++k) {
+        u[k] = b[k] - a[k];
+        v[k] = d[k] - c[k];
+        w[k] = c[k] - a[k];
+    }
     const auto n = cross(u, v);
     const double denominator = dot(n, n);
     if (denominator > 0) {
@@ -143,7 +167,8 @@ inline Visibility nearbyFibers(const Geometry& g, size_t selected, double radius
     std::vector<uint8_t> keep(g.scene->fibers.size(), 0);
     keep[selected] = 1;
     auto check = [&] {
-        if (cancelled && cancelled->load(std::memory_order_relaxed)) throw std::runtime_error("Cancelled");
+        if (cancelled && cancelled->load(std::memory_order_relaxed))
+            throw std::runtime_error("Cancelled");
     };
     check();
     for (const auto ci : g.fiberChunks[selected]) {
@@ -151,26 +176,42 @@ inline Visibility nearbyFibers(const Geometry& g, size_t selected, double radius
         for (size_t si = selectedChunk.first; si < selectedChunk.end; ++si) {
             check();
             Segment a;
-            if (!segment(g, selectedChunk, si, a)) continue;
-            Bounds search = emptyBounds(); expand(search, a.a); expand(search, a.b);
-            for (int k = 0; k < 3; ++k) { search.lower[k] -= radius; search.upper[k] += radius; }
+            if (!segment(g, selectedChunk, si, a))
+                continue;
+            Bounds search = emptyBounds();
+            expand(search, a.a);
+            expand(search, a.b);
+            for (int k = 0; k < 3; ++k) {
+                search.lower[k] -= radius;
+                search.upper[k] += radius;
+            }
             auto overlaps = [&](const Bounds& box) {
                 for (int k = 0; k < 3; ++k)
-                    if (box.lower[k] > search.upper[k] || box.upper[k] < search.lower[k]) return false;
+                    if (box.lower[k] > search.upper[k] || box.upper[k] < search.lower[k])
+                        return false;
                 return true;
             };
             auto visit = [&](auto&& self, size_t ni) -> void {
                 const auto& node = g.nodes[ni];
-                if (!overlaps(node.bounds)) return;
+                if (!overlaps(node.bounds))
+                    return;
                 check();
-                if (!node.leaf()) { self(self, node.left); self(self, node.right); return; }
+                if (!node.leaf()) {
+                    self(self, node.left);
+                    self(self, node.right);
+                    return;
+                }
                 for (size_t j = node.begin; j < node.end; ++j) {
                     const auto& c = g.chunks[j];
-                    if (keep[c.fiber] || !overlaps(c.bounds)) continue;
+                    if (keep[c.fiber] || !overlaps(c.bounds))
+                        continue;
                     for (size_t k = c.first; k < c.end; ++k) {
                         Segment b;
-                        if (!segment(g, c, k, b)) continue;
-                        Bounds bb = emptyBounds(); expand(bb, b.a); expand(bb, b.b);
+                        if (!segment(g, c, k, b))
+                            continue;
+                        Bounds bb = emptyBounds();
+                        expand(bb, b.a);
+                        expand(bb, b.b);
                         if (overlaps(bb) && segmentDistance(a.a, a.b, b.a, b.b) <= radius) {
                             keep[c.fiber] = 1;
                             break;
@@ -178,7 +219,8 @@ inline Visibility nearbyFibers(const Geometry& g, size_t selected, double radius
                     }
                 }
             };
-            if (!g.nodes.empty()) visit(visit, 0);
+            if (!g.nodes.empty())
+                visit(visit, 0);
         }
     }
     check();
@@ -204,8 +246,10 @@ inline void simplify(const std::vector<Point>& points, size_t a, size_t b, doubl
         out.push_back(b);
     }
 }
-inline size_t buildNode(Geometry& g, size_t begin, size_t end)
+inline size_t buildNode(Geometry& g, size_t begin, size_t end, const std::atomic_bool* cancelled)
 {
+    if (cancelled && cancelled->load(std::memory_order_relaxed))
+        throw std::runtime_error("Cancelled");
     const size_t index = g.nodes.size();
     Node node;
     node.begin = begin;
@@ -227,13 +271,13 @@ inline size_t buildNode(Geometry& g, size_t begin, size_t end)
                 return ac < bc;
             return std::tie(a.fiber, a.run, a.first) < std::tie(b.fiber, b.run, b.first);
         });
-        const auto left = buildNode(g, begin, middle), right = buildNode(g, middle, end);
+        const auto left = buildNode(g, begin, middle, cancelled), right = buildNode(g, middle, end, cancelled);
         g.nodes[index].left = left;
         g.nodes[index].right = right;
     }
     return index;
 }
-inline std::shared_ptr<Geometry> build(std::shared_ptr<const Scene> scene, const std::atomic_bool* cancelled = nullptr)
+inline std::shared_ptr<Geometry> build(std::shared_ptr<const Scene> scene, const std::atomic_bool* cancelled = nullptr, size_t maxResidentExactSegments = 4000000)
 {
     auto check = [&] {
         if (cancelled && cancelled->load(std::memory_order_relaxed))
@@ -291,7 +335,7 @@ inline std::shared_ptr<Geometry> build(std::shared_ptr<const Scene> scene, const
     }
     if (g->chunks.empty())
         return g;
-    buildNode(*g, 0, g->chunks.size());
+    buildNode(*g, 0, g->chunks.size(), cancelled);
     check();
     g->bounds = g->nodes.front().bounds;
     for (int k = 0; k < 3; ++k)
@@ -299,7 +343,10 @@ inline std::shared_ptr<Geometry> build(std::shared_ptr<const Scene> scene, const
     size_t exactCount = 0;
     for (const auto& c : g->chunks)
         exactCount += c.end - c.first;
-    g->levels[0].reserve(exactCount);
+    g->deferredExact = exactCount > maxResidentExactSegments;
+    if (!g->deferredExact)
+        g->levels[0].reserve(exactCount);
+    size_t exactOffset = 0;
     std::vector<Point> points;
     std::vector<double> arcs;
     std::vector<size_t> kept;
@@ -330,6 +377,11 @@ inline std::shared_ptr<Geometry> build(std::shared_ptr<const Scene> scene, const
             arc += len;
         }
         for (size_t level = 0; level < tolerances.size(); ++level) {
+            if (level == 0 && g->deferredExact) {
+                c.levels[0] = {exactOffset, points.size() - 1};
+                exactOffset += points.size() - 1;
+                continue;
+            }
             kept.clear();
             kept.push_back(0);
             if (level == 0)
@@ -448,7 +500,8 @@ inline std::vector<Draw> draws(const Geometry& g, const View& view, double pixel
     auto visit = [&](auto&& self, size_t i) -> void {
         const auto& n = g.nodes[i];
         const size_t kept = visible.fibers.empty() ? n.end - n.begin : visible.chunkPrefix[n.end] - visible.chunkPrefix[n.begin];
-        if (!kept) return;
+        if (!kept)
+            return;
         const int state = view.classify(n.bounds);
         if (state < 0)
             return;
@@ -475,7 +528,8 @@ inline std::vector<size_t> pickChunks(const Geometry& g, const View& view, doubl
         return result;
     auto visit = [&](auto&& self, size_t i) -> void {
         const auto& n = g.nodes[i];
-        if (!visible.fibers.empty() && visible.chunkPrefix[n.end] == visible.chunkPrefix[n.begin]) return;
+        if (!visible.fibers.empty() && visible.chunkPrefix[n.end] == visible.chunkPrefix[n.begin])
+            return;
         if (view.classify(n.bounds, x, x, y, y) < 0)
             return;
         if (n.leaf()) {

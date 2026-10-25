@@ -1,4 +1,5 @@
 #include "Fiber3DData.hpp"
+#include "vc/fiber_tracer/FiberDisplay.hpp"
 
 #include "LineAnnotationPolylineIndices.hpp"
 #include "vc/core/types/FiberCollection.hpp"
@@ -191,6 +192,8 @@ void annotateAutomated(Fiber& fiber, vc::fibers::FiberCollection& reader, int64_
         if (!finite(displayPoint))
             throw std::runtime_error("Non-finite AFV control point");
         controls.push_back(point);
+        fiber.displayNormals.push_back(entry.is_object() ? vc::fiber_tracer::displayNormalFromJson(entry) : std::nullopt);
+        fiber.controlDirections.push_back(entry.is_object() ? vc::fiber_tracer::controlDirectionFromJson(entry) : std::nullopt);
         fiber.markers.push_back({displayPoint, MarkerKind::ControlPoint});
         if (entry.is_object()) {
             if (tagged(entry, "break"))
@@ -294,7 +297,7 @@ Scene loadAutomated(const AutomatedSource& source, const QueryOptions& options, 
         positive(source.nativeVoxelMm) ? options.minLengthMm / source.nativeVoxelMm : 0.0,
         familyFilter(options),
         std::max(size_t(16) * 1024 * 1024, options.byteBudget / 16),
-        vc::fibers::ViewOrder::LongestFirst);
+        options.bounds ? vc::fibers::ViewOrder::LongestFirst : vc::fibers::ViewOrder::LongestFirstCatalog);
     if (page.candidateLimitReached) {
         limited(scene, QStringLiteral("Region contains too many candidate blocks; increase Memory budget or narrow the region."));
         return scene;
@@ -404,6 +407,8 @@ Scene loadAnnotations(
         fiber.id = source->id;
         fiber.label = source->label;
         fiber.family = source->hvTag;
+        fiber.displayNormals = source->displayNormals;
+        fiber.controlDirections = source->controlDirections;
         if (const auto summary = summaryById.find(source->id); summary != summaryById.end())
             for (const auto& tag : summary->second->tags)
                 fiber.tags.push_back(QString::fromStdString(tag));

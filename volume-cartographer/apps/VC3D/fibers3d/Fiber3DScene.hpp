@@ -2,6 +2,7 @@
 
 #include "FiberOverlayColors.hpp"
 #include <QColor>
+#include <opencv2/core/types.hpp>
 #include <QString>
 #include <QStringList>
 #include <array>
@@ -46,6 +47,8 @@ struct Fiber {
     QStringList tags;
     std::vector<Run> runs;
     std::vector<Marker> markers;
+    // Same per-control display overrides used by Line Annotation.
+    std::vector<std::optional<cv::Vec3d>> displayNormals, controlDirections;
 };
 struct Scene {
     std::vector<Fiber> fibers;
@@ -67,6 +70,9 @@ struct DisplaySettings {
     QColor vertical = vc3d::verticalFiberColor();
     float lineWidth = 1.0f;
     float unselectedOpacity = 0.2f;
+    // A pinned Line Annotation fiber stays selected for CT/picking, but keeps
+    // its palette and width; the position marker supplies the emphasis.
+    bool highlightSelection = true;
     bool showGaps = false;
     bool showAnnotations = false;
     bool annotationsSelectedOnly = true;

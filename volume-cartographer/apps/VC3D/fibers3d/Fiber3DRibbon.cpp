@@ -1,7 +1,7 @@
 #include "Fiber3DRibbon.hpp"
 #include "Fiber3DGeometry.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/util/LineFrameGeometry.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 #include "vc/fiber_tracer/FiberDisplay.hpp"
 #include <algorithm>
 #include <cmath>
@@ -26,19 +26,67 @@ Point point(cv::Vec3d p)
 {
     return {p[0], p[1], p[2]};
 }
-cv::Vec3d initialNormal(cv::Vec3d tangent)
+class CallbackSampler : public vc::lasagna::NormalSampler
 {
-    int axis = 0;
-    for (int i = 1; i < 3; ++i)
-        if (std::abs(tangent[i]) < std::abs(tangent[axis]))
-            axis = i;
-    cv::Vec3d n{};
-    n[axis] = 1;
-    return *vc::fiber_tracer::projectDisplayNormal(n, tangent);
-}
+public:
+    explicit CallbackSampler(const NormalAt& at) : at_(at) {}
+    vc::lasagna::NormalSample sampleNormal(const cv::Vec3d& p) const override
+    {
+        const auto n = at_(p);
+        return n ? vc::lasagna::NormalSample{*n, true, {}} : vc::lasagna::NormalSample{};
+    }
+
+private:
+    const NormalAt& at_;
+};
 }  // namespace
 
-Frames makeFrames(const Fiber& fiber, const std::optional<Bounds>& clip, const NormalAt& normalAt, const std::atomic_bool* cancelled)
+Frames framesFromSurface(const cv::Mat_<cv::Vec3f>& grid, const cv::Mat_<cv::Vec3f>& sideGrid, double spacing, bool sampledNormals, const std::atomic_bool* cancelled)
+{
+    Frames result;
+    if (grid.rows != vc::lasagna::kLineViewCrossSampleCount || grid.cols < 2 || sideGrid.size() != grid.size() || !std::isfinite(spacing) ||
+        spacing < 1 || spacing > maxRows)
+        throw std::invalid_argument("Invalid Line Annotation surface grid");
+    const int mid = grid.rows / 2;
+    const int subdivisions = int(std::ceil(spacing));
+    Strip rows;
+    for (int col = 0; col + 1 < grid.cols; ++col) {
+        check(cancelled);
+        for (int k = 0; k < subdivisions + (col + 2 == grid.cols ? 1 : 0); ++k) {
+            const double t = double(k) / subdivisions;
+            const auto at = [&](const cv::Mat_<cv::Vec3f>& g, int r) {
+                return cv::Vec3d(g(r, col)) * (1 - t) + cv::Vec3d(g(r, col + 1)) * t;
+            };
+            Row row;
+            row.center = at(grid, mid);
+            for (int cross = 0; cross < grid.rows; ++cross)
+                row.surface[cross] = at(grid, cross);
+            // Keep the builder's interpolated vectors, including their
+            // length. Renormalizing them would change its CT coordinates.
+            row.side = (at(grid, mid + 1) - at(grid, mid)) / vc::lasagna::kLineViewCrossRowSpacingBaseVoxels;
+            row.normal = (at(sideGrid, mid + 1) - at(sideGrid, mid)) / vc::lasagna::kLineViewCrossRowSpacingBaseVoxels;
+            row.tangent = row.side.cross(row.normal);
+            row.tangent /= cv::norm(row.tangent);
+            row.sampledNormal = sampledNormals;
+            rows.push_back(row);
+            if (row.sampledNormal)
+                ++result.sampledNormals;
+            if (rows.size() + result.rows > maxRows)
+                throw std::runtime_error("CT ribbon is too long; narrow the displayed region");
+        }
+    }
+    result.rows += rows.size();
+    result.strips.push_back(std::move(rows));
+    return result;
+}
+
+Frames makeFrames(
+    const Fiber& fiber,
+    const std::optional<Bounds>& clip,
+    const NormalAt& normalAt,
+    const std::atomic_bool* cancelled,
+    const ModelForPoints& modelForPoints,
+    const std::function<cv::Vec3f(const cv::Vec3f&)>& centerReference)
 {
     Frames result;
     std::vector<cv::Vec3d> points;
@@ -49,39 +97,47 @@ Frames makeFrames(const Fiber& fiber, const std::optional<Bounds>& clip, const N
             return;
         }
         check(cancelled);
-        Strip rows(points.size());
-        size_t firstValid = points.size();
-        for (size_t i = 0; i < rows.size(); ++i) {
-            check(cancelled);
-            auto& r = rows[i];
-            r.center = points[i];
-            r.tangent = vc::geometry::lineTangent(points.size(), i, [&](size_t k) { return points[k]; });
-            if (normalAt)
-                if (const auto sampled = normalAt(r.center))
-                    if (const auto n = vc::fiber_tracer::projectDisplayNormal(*sampled, r.tangent)) {
-                        r.normal = *n;
-                        r.sampledNormal = true;
-                        firstValid = std::min(firstValid, i);
-                        ++result.sampledNormals;
-                    }
+        CallbackSampler sampler(normalAt);
+        auto model = modelForPoints ? modelForPoints(points)
+                     : normalAt     ? vc::lasagna::lineModelFromSampledPoints(points, &sampler)
+                                    : vc::lasagna::lineModelForInspection(points);
+        vc::lasagna::LineViewConfig config;
+        config.buildLineZSlices = false;
+        config.orientedPointNormals = vc::lasagna::orientedLineNormals(model, centerReference);
+        // An AFV without annotation controls opens with its two endpoints.
+        // With controls, keep the exact same nearest-source-point supports.
+
+        for (const auto& marker : fiber.markers) {
+            if (marker.kind != MarkerKind::ControlPoint)
+                continue;
+            size_t closest = 0;
+            double distance = std::numeric_limits<double>::infinity();
+            for (size_t i = 0; i < points.size(); ++i) {
+                const double d = cv::norm(points[i] - vec(marker.point));
+                if (d < distance) {
+                    distance = d;
+                    closest = i;
+                }
+            }
+            config.controlPointLinePositions.push_back(double(closest));
         }
-        // Anchor missing initial rows to the first real Lasagna normal, when
-        // there is one. Never flip a texture just because a normal changes sign.
-        const size_t anchor = firstValid == rows.size() ? 0 : firstValid;
-        if (firstValid == rows.size())
-            rows[0].normal = initialNormal(rows[0].tangent);
-        for (size_t i = anchor; i > 0; --i)
-            rows[i - 1].normal = vc::geometry::transportFrameNormal(rows[i].normal, rows[i].tangent, rows[i - 1].tangent);
-        for (size_t i = anchor + 1; i < rows.size(); ++i) {
-            auto n = vc::geometry::transportFrameNormal(rows[i - 1].normal, rows[i - 1].tangent, rows[i].tangent);
-            if (rows[i].sampledNormal) {
-                if (rows[i].normal.dot(n) < 0)
-                    rows[i].normal *= -1;
-            } else
-                rows[i].normal = n;
+        if (std::any_of(fiber.displayNormals.begin(), fiber.displayNormals.end(), [](const auto& n) { return n.has_value(); })) {
+            std::vector<cv::Vec3f> displayPoints(points.begin(), points.end());
+            config.displayPointNormals =
+                vc::fiber_tracer::fiberDisplayField(
+                    displayPoints, config.orientedPointNormals, config.controlPointLinePositions, fiber.displayNormals, fiber.controlDirections)
+                    .normals;
         }
-        result.rows += rows.size();
-        result.strips.push_back(std::move(rows));
+        if (config.controlPointLinePositions.empty())
+            config.controlPointLinePositions = {0., double(points.size() - 1)};
+        const auto views = vc::lasagna::buildLineViewSurfaces(model, config);
+        auto part =
+            framesFromSurface(views.lineSurface->rawPoints(), views.lineSideSlice->rawPoints(), views.stripPositionMap.stripGridSpacingBaseVoxels, bool(modelForPoints || normalAt), cancelled);
+        result.rows += part.rows;
+        result.sampledNormals += part.sampledNormals;
+        if (result.rows > maxRows)
+            throw std::runtime_error("CT ribbon is too long; narrow the displayed region");
+        result.strips.insert(result.strips.end(), std::make_move_iterator(part.strips.begin()), std::make_move_iterator(part.strips.end()));
         points.clear();
     };
     auto append = [&](cv::Vec3d p) {
@@ -114,15 +170,13 @@ Frames makeFrames(const Fiber& fiber, const std::optional<Bounds>& clip, const N
         for (size_t i = 1; i < run.points.size(); ++i) {
             check(cancelled);
             const auto style = i - 1 < run.styles.size() ? run.styles[i - 1] : SpanStyle::Solid;
-            double begin = 0, end = 1;
             const auto& a = run.points[i - 1];
             const auto& b = run.points[i];
-            if (!finite(a) || !finite(b) || style == SpanStyle::Gap || style == SpanStyle::InferredGap ||
-                (clip && !clipSegment(a, b, *clip, begin, end))) {
+            if (!finite(a) || !finite(b) || style == SpanStyle::Gap || style == SpanStyle::InferredGap) {
                 flush();
                 continue;
             }
-            const auto p = vec(interpolate(a, b, begin)), q = vec(interpolate(a, b, end));
+            const auto p = vec(a), q = vec(b);
             const double length = cv::norm(q - p);
             if (length < 1e-8)
                 continue;
@@ -132,29 +186,83 @@ Frames makeFrames(const Fiber& fiber, const std::optional<Bounds>& clip, const N
                 append(p);
             if (length > double(maxRows))
                 throw std::runtime_error("CT ribbon segment is too long");
-            const size_t steps = size_t(std::ceil(length));
-            for (size_t k = 1; k <= steps; ++k)
-                append(p + (q - p) * (double(k) / steps));
+            append(q);
         }
         previous = source;
     }
     flush();
+    if (clip) {
+        // Crop the already-built canonical surface. Rebuilding its normal
+        // field on a cropped curve would change the Line Annotation cut.
+        Frames cropped;
+        for (const auto& strip : result.strips) {
+            Strip current;
+            const auto flushClipped = [&] {
+                if (current.size() >= 2) {
+                    cropped.rows += current.size();
+                    for (const auto& row : current)
+                        if (row.sampledNormal)
+                            ++cropped.sampledNormals;
+                    cropped.strips.push_back(std::move(current));
+                }
+                current = {};
+            };
+            for (size_t i = 1; i < strip.size(); ++i) {
+                double lo = 0, hi = 1;
+                const auto& a = strip[i - 1];
+                const auto& b = strip[i];
+                if (!clipSegment(point(a.center), point(b.center), *clip, lo, hi)) {
+                    flushClipped();
+                    continue;
+                }
+                const auto at = [&](double t) {
+                    Row row;
+                    row.center = a.center * (1 - t) + b.center * t;
+                    row.normal = a.normal * (1 - t) + b.normal * t;
+                    row.side = a.side * (1 - t) + b.side * t;
+                    row.tangent = a.tangent * (1 - t) + b.tangent * t;
+                    row.tangent /= cv::norm(row.tangent);
+                    row.sampledNormal = a.sampledNormal || b.sampledNormal;
+                    for (size_t j = 0; j < row.surface.size(); ++j)
+                        row.surface[j] = a.surface[j] * (1 - t) + b.surface[j] * t;
+                    return row;
+                };
+                if (current.empty())
+                    current.push_back(at(lo));
+                current.push_back(at(hi));
+                if (hi < 1)
+                    flushClipped();
+            }
+            flushClipped();
+        }
+        return cropped;
+    }
     return result;
 }
 
-cv::Vec3d across(const Row& row, double rotationDegrees)
+cv::Vec3d position(const Row& row, double offsetVoxels, double rotationDegrees)
 {
-    const auto n = vc::fiber_tracer::rotateDisplayNormal(row.normal, row.tangent, rotationDegrees * std::acos(-1.) / 180.);
-    return n.cross(row.tangent);
+    // Interpolate the actual Line Annotation support vertices, rather than
+    // recomputing their plane from normalized vectors (even their rounding
+    // must not cause a different CT lookup).
+    const double y = double(row.surface.size() / 2) + offsetVoxels / vc::lasagna::kLineViewCrossRowSpacingBaseVoxels;
+    const int i = std::clamp(int(std::floor(y)), 0, int(row.surface.size()) - 2);
+    const double t = y - i;
+    const auto p = row.surface[i] * (1 - t) + row.surface[i + 1] * t;
+    if (rotationDegrees == 0)
+        return p;
+    const double a = rotationDegrees * std::acos(-1.) / 180.;
+    const auto v = p - row.center;
+    return row.center + v * std::cos(a) + row.tangent.cross(v) * std::sin(a) + row.tangent * (row.tangent.dot(v) * (1 - std::cos(a)));
 }
 
-std::shared_ptr<Image> sample(const Frames& frames, Volume& volume, int widthVoxels, int rotationDegrees, const std::atomic_bool* cancelled)
+std::shared_ptr<Image> sampleProgressive(const Frames& frames, Volume& volume, int widthVoxels, int rotationDegrees, int level, const std::atomic_bool* cancelled)
 {
     check(cancelled);
     if (widthVoxels < 1 || widthVoxels > 512)
         throw std::invalid_argument("CT ribbon width must be 1–512 voxels");
-    if (!volume.hasScaleLevel(0))
-        throw std::runtime_error("CT ribbon needs level 0 of the active CT");
+    if (!volume.hasScaleLevel(level))
+        throw std::runtime_error("Requested CT ribbon level is unavailable");
     const auto dtype = volume.dtype();
     if (dtype != vc::render::ChunkDtype::UInt8 && dtype != vc::render::ChunkDtype::UInt16)
         throw std::runtime_error("CT ribbon supports uint8 and uint16 CT volumes");
@@ -170,6 +278,7 @@ std::shared_ptr<Image> sample(const Frames& frames, Volume& volume, int widthVox
     image->sampledNormals = frames.sampledNormals;
     image->widthVoxels = widthVoxels;
     image->rotationDegrees = rotationDegrees;
+    image->level = level;
     for (const auto& strip : frames.strips)
         for (size_t start = 0; start + 1 < strip.size(); start += 1023) {
             check(cancelled);
@@ -179,11 +288,15 @@ std::shared_ptr<Image> sample(const Frames& frames, Volume& volume, int widthVox
             tile.pixels.resize(size_t(tile.width) * tile.height * 2);
             for (int r = 0; r < tile.height; ++r) {
                 const auto& row = strip[start + r];
-                const auto axis = across(row, rotationDegrees);
-                tile.left.push_back(point(row.center - axis * (widthVoxels * .5)));
-                tile.right.push_back(point(row.center + axis * (widthVoxels * .5)));
+                tile.left.push_back(point(position(row, -widthVoxels * .5, rotationDegrees)));
+                tile.right.push_back(point(position(row, widthVoxels * .5, rotationDegrees)));
             }
-            ct::sampleTile(tile, volume, 0, cancelled);
+            const auto progress = ct::sampleTileProgressive(tile, *volume.chunkedCache(), level, cancelled);
+            image->validTexels += progress.valid;
+            image->coveredTexels += progress.covered;
+            image->requestedLevelTexels += progress.requestedLevel;
+            image->errors += progress.errors;
+            image->complete = image->complete && progress.requestedLevel == progress.valid;
             image->tiles.push_back(std::move(tile));
         }
     check(cancelled);

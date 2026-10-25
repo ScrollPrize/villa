@@ -5,20 +5,35 @@
 #include <QOpenGLFunctions_3_3_Core>
 #include <QOpenGLShaderProgram>
 
-namespace vc3d::fibers3d {
+namespace vc3d::fibers3d
+{
 // Owns only bounded GPU display resources. Construct/destroy with the canvas
 // context current. CT reads and resampling belong to the existing worker.
-class Fiber3DVolumeRenderer : protected QOpenGLFunctions_3_3_Core {
+class Fiber3DVolumeRenderer : protected QOpenGLFunctions_3_3_Core
+{
 public:
     Fiber3DVolumeRenderer();
     ~Fiber3DVolumeRenderer();
     // Returns true while progressive upload needs another frame.
-    bool draw(const slices::Images&, const std::array<CompositeParams, 3>&,
-              const QMatrix4x4& mvp, const Point& origin, GLuint framebuffer,
-              int width, int height, float low, float high, float opacity, bool interactive);
+    bool draw(
+        const slices::Images&,
+        const std::array<CompositeParams, 3>&,
+        const QMatrix4x4& mvp,
+        const Point& origin,
+        GLuint framebuffer,
+        int width,
+        int height,
+        float low,
+        float high,
+        float opacity,
+        bool interactive);
     const QString& error() const { return error_; }
+
 private:
-    struct Texture { GLuint id = 0; int layers = 0; };
+    struct Texture {
+        GLuint id = 0;
+        int layers = 0;
+    };
     void clearImages();
     bool copyDepth(GLuint framebuffer, int width, int height);
     std::unique_ptr<QOpenGLShaderProgram> program_;
@@ -30,4 +45,4 @@ private:
     bool transferDirty_ = true;
     QString error_;
 };
-}
+}  // namespace vc3d::fibers3d

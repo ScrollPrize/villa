@@ -11248,13 +11248,24 @@ LineAnnotationController::ensureScrollUmbilicusLoaded()
     return _scrollUmbilicus;
 }
 
+std::function<cv::Vec3f(const cv::Vec3f&)> LineAnnotationController::displayCenterReference()
+{
+    const auto umbilicus = ensureScrollUmbilicusLoaded();
+    const float scale = float(annotationFrame().factor);
+    const auto volume = _state->currentVolume();
+    const cv::Vec3f center{float(volume->sliceWidth())*.5f, float(volume->sliceHeight())*.5f, 0.f};
+    return [umbilicus, scale, center](const cv::Vec3f& p) {
+        if (umbilicus) {
+            try { return umbilicus->vector_to_umbilicus(p*scale) / scale; } catch (...) {}
+        }
+        return cv::Vec3f{center[0]-p[0], center[1]-p[1], 0.f};
+    };
+}
+
 std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
     const LineAnnotationSession& session)
 {
     constexpr float kNan = std::numeric_limits<float>::quiet_NaN();
-    std::vector<cv::Vec3f> normals;
-    normals.reserve(session.optimizedLine.points.size());
-
     ensureScrollUmbilicusLoaded();
 
     std::shared_ptr<Volume> volume;
@@ -11271,77 +11282,13 @@ std::vector<cv::Vec3f> LineAnnotationController::orientedLineNormalsForSession(
             static_cast<float>(volume->sliceHeight()) * 0.5f};
     }
 
-    // Pass 1: chain signs along the line. Each valid normal is aligned to
-    // the previous valid one, so a local sign flip -- whether from the field
-    // itself or from any per-point orientation test -- is structurally
-    // impossible, and the displayed frame cannot mirror mid-line.
-    cv::Vec3f previousNormal{kNan, kNan, kNan};
-    for (const auto& point : session.optimizedLine.points) {
-        const cv::Vec3d sampled = normalizedOrZero(point.sampledNormal.normal);
-        if (!point.sampledNormal.valid || !finiteDirection(sampled)) {
-            normals.push_back({kNan, kNan, kNan});
-            continue;
-        }
-        cv::Vec3f normal = toVec3f(sampled);
-        if (std::isfinite(previousNormal[0]) &&
-            normal.dot(previousNormal) < 0.0f) {
-            normal = -normal;
-        }
-        previousNormal = normal;
-        normals.push_back(normal);
-    }
-
-    // Pass 2: one global majority vote decides the whole line's sign, so a
-    // noisy or imperfect center reference cannot flip individual stretches.
-    // The reference only needs to get the hemisphere right on balance; its z
-    // component is zeroed because orientation is radial-only (z is the
-    // scroll axis).
-    // Sign convention: normals point away from the scroll center. The dialog
-    // uses them directly as the cut view's up hint, and the viewer's scene y
-    // renders downward, so this puts the fiber's center-facing surface at
-    // the top of the view.
-    double awayScore = 0.0;
-    for (size_t index = 0; index < normals.size(); ++index) {
-        if (!std::isfinite(normals[index][0])) {
-            continue;
-        }
-        const cv::Vec3f position =
-            toVec3f(session.optimizedLine.points[index].position);
-        cv::Vec3f towardCenter{kNan, kNan, kNan};
-        if (_scrollUmbilicus) {
-            try {
-                towardCenter = _scrollUmbilicus->vector_to_umbilicus(position);
-            } catch (...) {
+    return vc::lasagna::orientedLineNormals(session.optimizedLine,
+        [this, volumeCenterXY](const cv::Vec3f& position) {
+            if (_scrollUmbilicus) {
+                try { return _scrollUmbilicus->vector_to_umbilicus(position); } catch (...) {}
             }
-        }
-        if (!std::isfinite(towardCenter[0]) && std::isfinite(volumeCenterXY[0])) {
-            towardCenter = {volumeCenterXY[0] - position[0],
-                            volumeCenterXY[1] - position[1],
-                            0.0f};
-        }
-        if (!std::isfinite(towardCenter[0])) {
-            continue;
-        }
-        // Cosine-weighted vote: normalize the reference so each point's
-        // influence reflects only how well its normal aligns with the radial
-        // direction, not its distance from the center -- a few large-radius
-        // points must not outvote the rest of the line.
-        towardCenter[2] = 0.0f;
-        const float towardNorm = cv::norm(towardCenter);
-        if (!(towardNorm > 1.0e-3f)) {
-            continue;
-        }
-        awayScore -= static_cast<double>(
-            normals[index].dot(towardCenter) / towardNorm);
-    }
-    if (awayScore < 0.0) {
-        for (cv::Vec3f& normal : normals) {
-            if (std::isfinite(normal[0])) {
-                normal = -normal;
-            }
-        }
-    }
-    return normals;
+            return cv::Vec3f{volumeCenterXY[0]-position[0], volumeCenterXY[1]-position[1], 0.0f};
+        });
 }
 
 vc::fiber_tracer::FiberDisplayField LineAnnotationController::displayFieldForSession(
@@ -14015,49 +13962,7 @@ vc::lasagna::LineModel LineAnnotationController::lineModelFromPoints(
     const std::vector<cv::Vec3d>& points,
     const vc::lasagna::NormalSampler* normalSampler)
 {
-    if (points.empty()) {
-        throw std::runtime_error("Fiber has no line points");
-    }
-    if (!normalSampler) {
-        throw std::runtime_error("No Lasagna normal sampler is available for this fiber");
-    }
-
-    std::vector<vc::lasagna::NormalSampleWithDerivative> samples;
-    const vc::lasagna::NormalBatchReport batchReport =
-        normalSampler->sampleNormalBatch(points, false, samples);
-    (void)batchReport;
-    if (samples.size() != points.size()) {
-        throw std::runtime_error("Normal sampler returned the wrong number of samples");
-    }
-
-    vc::lasagna::LineModel model;
-    model.points.reserve(points.size());
-    int bestAnchor = -1;
-    double bestAnchorDistance = std::numeric_limits<double>::infinity();
-    const double center = static_cast<double>(points.size() - 1) * 0.5;
-    for (size_t i = 0; i < points.size(); ++i) {
-        vc::lasagna::LinePoint linePoint;
-        linePoint.position = points[i];
-        linePoint.sampledNormal = samples[i].sample;
-        linePoint.sampledNormal.normal = normalizedOrZero(linePoint.sampledNormal.normal);
-        linePoint.sampledNormal.valid =
-            linePoint.sampledNormal.valid &&
-            finiteDirection(linePoint.sampledNormal.normal);
-        linePoint.valid = linePoint.sampledNormal.valid;
-        if (linePoint.valid) {
-            const double distance = std::abs(static_cast<double>(i) - center);
-            if (distance < bestAnchorDistance) {
-                bestAnchorDistance = distance;
-                bestAnchor = static_cast<int>(i);
-            }
-        }
-        model.points.push_back(std::move(linePoint));
-    }
-    if (bestAnchor < 0) {
-        throw std::runtime_error("Fiber line points have no valid sampled normals");
-    }
-    model.displayFrameAnchorIndex = bestAnchor;
-    return model;
+    return vc::lasagna::lineModelFromSampledPoints(points, normalSampler);
 }
 
 

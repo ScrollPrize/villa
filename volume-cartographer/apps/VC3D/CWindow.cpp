@@ -2581,6 +2581,7 @@ void CWindow::openLineAnnotationWorkspace(LineAnnotationDialog* dialog, const QS
     }
 
     dialog->setWorkspaceEmbedded(true);
+    dialog->enableFibers3D(_state, _lineAnnotationController.get(), _fiberCollection.get());
 
     int index = _workspaceTabs->indexOf(dialog);
     if (index < 0) {

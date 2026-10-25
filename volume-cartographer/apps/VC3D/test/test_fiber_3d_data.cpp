@@ -228,11 +228,7 @@ private slots:
 
     void memoryBudgetRetainsSelectedThenLongestFibers()
     {
-        const FixtureFile fixture({
-            {{{-5, 0, 0}, {5, 0, 0}}, "H"},
-            {{{-15, 0, 0}, {15, 0, 0}}, "V"},
-            {{{-10, 0, 0}, {10, 0, 0}}, "H"}
-        });
+        const FixtureFile fixture({{{{-5, 0, 0}, {5, 0, 0}}, "H"}, {{{-15, 0, 0}, {15, 0, 0}}, "V"}, {{{-10, 0, 0}, {10, 0, 0}}, "H"}});
         const auto source = automated(fixture);
         QueryOptions options;
         options.maximumFibers = 0;

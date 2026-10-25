@@ -1,3 +1,4 @@
+#include <cstring>
 #include "fibers3d/Fiber3DGeometry.hpp"
 #include "fibers3d/Fiber3DRenderGeometry.hpp"
 
@@ -23,23 +24,30 @@ private slots:
     void proximityKeepsWholeFibersWithoutJoiningRuns()
     {
         auto scene = std::make_shared<Scene>();
-        auto add = [&](std::vector<Run> runs) { Fiber f; f.runs = std::move(runs); scene->fibers.push_back(std::move(f)); };
-        add({Run{{{-10, 0, 0}, {10, 0, 0}}}}); // selected
-        add({Run{{{0, -100, 2}, {0, 100, 2}}}}); // interiors at exactly radius
-        add({Run{{{-10, 1.5, 1.5}, {10, 1.5, 1.5}}}}); // inside padded box, outside sphere
+        auto add = [&](std::vector<Run> runs) {
+            Fiber f;
+            f.runs = std::move(runs);
+            scene->fibers.push_back(std::move(f));
+        };
+        add({Run{{{-10, 0, 0}, {10, 0, 0}}}});          // selected
+        add({Run{{{0, -100, 2}, {0, 100, 2}}}});        // interiors at exactly radius
+        add({Run{{{-10, 1.5, 1.5}, {10, 1.5, 1.5}}}});  // inside padded box, outside sphere
         add({Run{{{-10, 0, 3}, {10, 0, 3}}}});
-        add({Run{{{0, -20, 0}, {0, -10, 0}}}, Run{{{0, 10, 0}, {0, 20, 0}}}}); // disjoint runs
-        add({Run{{{0, -20, 0}, {NAN, 0, 0}, {0, 20, 0}}}}); // no bridge through NaN
+        add({Run{{{0, -20, 0}, {0, -10, 0}}}, Run{{{0, 10, 0}, {0, 20, 0}}}});  // disjoint runs
+        add({Run{{{0, -20, 0}, {NAN, 0, 0}, {0, 20, 0}}}});                     // no bridge through NaN
         auto g = render::build(scene);
         const auto visible = render::nearbyFibers(*g, 0, 2);
         QCOMPARE(visible.fibers, (std::vector<uint8_t>{1, 1, 0, 0, 0, 0}));
         QCOMPARE(visible.count, size_t(2));
-        QMatrix4x4 m; m.ortho(-200.f, 200.f, -200.f, 200.f, -200.f, 200.f);
+        QMatrix4x4 m;
+        m.ortho(-200.f, 200.f, -200.f, 200.f, -200.f, 200.f);
         m.translate(float(g->origin[0]), float(g->origin[1]), float(g->origin[2]));
         render::View view(m, g->origin, 800, 600, 2);
         for (const auto& d : render::draws(*g, view, 10, visible))
-            for (size_t i = d.begin; i < d.end; ++i) QVERIFY(visible.includes(g->chunks[i].fiber));
-        for (auto ci : render::pickChunks(*g, view, 0, 0, visible)) QVERIFY(visible.includes(g->chunks[ci].fiber));
+            for (size_t i = d.begin; i < d.end; ++i)
+                QVERIFY(visible.includes(g->chunks[i].fiber));
+        for (auto ci : render::pickChunks(*g, view, 0, 0, visible))
+            QVERIFY(visible.includes(g->chunks[ci].fiber));
         QCOMPARE(render::nearbyFibers(*g, 0, 3).count, size_t(4));
         std::atomic_bool cancelled{true};
         QVERIFY_THROWS_EXCEPTION(std::runtime_error, render::nearbyFibers(*g, 0, 2, &cancelled));
@@ -51,34 +59,42 @@ private slots:
     {
         auto scene = std::make_shared<Scene>();
         scene->clipBounds = Bounds{{0, -100, -100}, {10, 100, 100}};
-        Fiber selected; selected.runs = {Run{{{-10, 0, 0}, {10, 0, 0}}}};
+        Fiber selected;
+        selected.runs = {Run{{{-10, 0, 0}, {10, 0, 0}}}};
         scene->fibers.push_back(selected);
-        Fiber outside; outside.runs = {Run{{{-9, 0, 0}, {0, 30, 0}, {10, 30, 0}}}};
+        Fiber outside;
+        outside.runs = {Run{{{-9, 0, 0}, {0, 30, 0}, {10, 30, 0}}}};
         scene->fibers.push_back(outside);
         for (int i = 0; i < 80; ++i) {
-            Fiber f; f.runs = {Run{{{0, double(i), 1}, {10, double(i), 1}}}};
+            Fiber f;
+            f.runs = {Run{{{0, double(i), 1}, {10, double(i), 1}}}};
             scene->fibers.push_back(f);
         }
         auto g = render::build(scene);
         const auto visible = render::nearbyFibers(*g, 0, 5);
-        QVERIFY(!visible.includes(1)); // near the selected fiber only outside the region
-        for (int i = 0; i < 80; ++i) QCOMPARE(visible.includes(i + 2), std::hypot(double(i), 1.) <= 5);
+        QVERIFY(!visible.includes(1));  // near the selected fiber only outside the region
+        for (int i = 0; i < 80; ++i)
+            QCOMPARE(visible.includes(i + 2), std::hypot(double(i), 1.) <= 5);
         QCOMPARE(visible.count, size_t(6));
     }
 
     void simplificationBoundsAndHairpins()
     {
         std::vector<Point> points;
-        for (int i = 0; i < 129; ++i) points.push_back({double(i), std::sin(i * .13) * 4, std::cos(i * .07)});
+        for (int i = 0; i < 129; ++i)
+            points.push_back({double(i), std::sin(i * .13) * 4, std::cos(i * .07)});
         for (double tolerance : render::tolerances) {
-            std::vector<size_t> kept{0}; render::simplify(points, 0, points.size() - 1, tolerance, kept);
-            QCOMPARE(kept.front(), size_t(0)); QCOMPARE(kept.back(), points.size() - 1);
+            std::vector<size_t> kept{0};
+            render::simplify(points, 0, points.size() - 1, tolerance, kept);
+            QCOMPARE(kept.front(), size_t(0));
+            QCOMPARE(kept.back(), points.size() - 1);
             for (size_t k = 1; k < kept.size(); ++k)
                 for (size_t i = kept[k - 1]; i <= kept[k]; ++i)
                     QVERIFY(render::distanceToSegment(points[i], points[kept[k - 1]], points[kept[k]]) <= tolerance + 1.e-12);
         }
         points = {{0, 0, 0}, {100, 0, 0}, {1, 0, 0}};
-        std::vector<size_t> kept{0}; render::simplify(points, 0, 2, 1, kept);
+        std::vector<size_t> kept{0};
+        render::simplify(points, 0, 2, 1, kept);
         QCOMPARE(kept, (std::vector<size_t>{0, 1, 2}));
     }
 
@@ -86,10 +102,11 @@ private slots:
     {
         auto scene = std::make_shared<Scene>();
         scene->clipBounds = Bounds{{0, -1, -1}, {10, 1, 1}};
-        Fiber f; f.key = "one";
-        f.runs = {Run{{{-2, 0, 0}, {2, 0, 0}, {5, 0, 0}, {7, 0, 0}, {12, 0, 0}}, 100,
-                      {SpanStyle::Solid, SpanStyle::Solid, SpanStyle::Gap, SpanStyle::Gap}},
-                  Run{{{1, .5, 0}, {9, .5, 0}}, 900}};
+        Fiber f;
+        f.key = "one";
+        f.runs =
+            {Run{{{-2, 0, 0}, {2, 0, 0}, {5, 0, 0}, {7, 0, 0}, {12, 0, 0}}, 100, {SpanStyle::Solid, SpanStyle::Solid, SpanStyle::Gap, SpanStyle::Gap}},
+             Run{{{1, .5, 0}, {9, .5, 0}}, 900}};
         scene->fibers.push_back(f);
         auto g = render::build(scene);
         QCOMPARE(g->levels[0].size(), size_t(5));
@@ -98,17 +115,19 @@ private slots:
             const auto style = c.first < run.styles.size() ? run.styles[c.first] : SpanStyle::Solid;
             for (size_t i = c.first; i < c.end; ++i) {
                 QCOMPARE(i < run.styles.size() ? run.styles[i] : SpanStyle::Solid, style);
-                render::Segment s; QVERIFY(render::segment(*g, c, i, s));
+                render::Segment s;
+                QVERIFY(render::segment(*g, c, i, s));
                 QCOMPARE(s.originalIndex, run.firstPoint + int64_t(i));
                 QVERIFY(s.a[0] >= 0 && s.b[0] <= 10);
             }
             for (size_t level = 0; level < render::tolerances.size(); ++level) {
-                const auto r = c.levels[level]; QVERIFY(r.count > 0);
+                const auto r = c.levels[level];
+                QVERIFY(r.count > 0);
                 for (size_t j = r.first; j < r.first + r.count; ++j)
                     QCOMPARE(g->levels[level][j].style, float(style));
             }
         }
-        QCOMPARE(scene->fibers[0].runs[0].points[0][0], -2.); // never mutates source
+        QCOMPARE(scene->fibers[0].runs[0].points[0][0], -2.);  // never mutates source
     }
 
     void invalidPointsAndReentryNeverJoin()
@@ -116,11 +135,12 @@ private slots:
         auto scene = std::make_shared<Scene>();
         scene->clipBounds = Bounds{{0, 0, 0}, {10, 10, 10}};
         Fiber f;
-        f.runs = {Run{{{1, 1, 1}, {20, 1, 1}, {20, 9, 1}, {1, 9, 1},
-                      {NAN, 0, 0}, {2, 2, 2}, {3, 3, 3}}}};
-        scene->fibers.push_back(f); auto g = render::build(scene);
+        f.runs = {Run{{{1, 1, 1}, {20, 1, 1}, {20, 9, 1}, {1, 9, 1}, {NAN, 0, 0}, {2, 2, 2}, {3, 3, 3}}}};
+        scene->fibers.push_back(f);
+        auto g = render::build(scene);
         QCOMPARE(g->chunks.size(), size_t(3));
-        for (auto& level : g->levels) QCOMPARE(level.size(), size_t(3));
+        for (auto& level : g->levels)
+            QCOMPARE(level.size(), size_t(3));
         std::atomic_bool cancelled{true};
         QVERIFY_THROWS_EXCEPTION(std::runtime_error, render::build(scene, &cancelled));
     }
@@ -129,27 +149,33 @@ private slots:
     {
         auto scene = std::make_shared<Scene>();
         for (int i = 0; i < 100; ++i) {
-            Fiber f; f.runs = {Run{{{-100., double(i), 0}, {100., double(i), 0}}}};
+            Fiber f;
+            f.runs = {Run{{{-100., double(i), 0}, {100., double(i), 0}}}};
             scene->fibers.push_back(f);
         }
         auto g = render::build(scene);
-        QMatrix4x4 m; m.ortho(-2.f, 2.f, -2.f, 2.f, -100.f, 100.f);
+        QMatrix4x4 m;
+        m.ortho(-2.f, 2.f, -2.f, 2.f, -100.f, 100.f);
         // Matrix is relative to the geometry origin, looking at world Y=0.
         m.translate(float(g->origin[0]), float(g->origin[1]), float(g->origin[2]));
         render::View view(m, g->origin, 800, 600, 2);
         const auto candidates = render::pickChunks(*g, view, 0, 0);
-        QCOMPARE(candidates.size(), size_t(1)); QCOMPARE(g->chunks[candidates[0]].fiber, size_t(0));
+        QCOMPARE(candidates.size(), size_t(1));
+        QCOMPARE(g->chunks[candidates[0]].fiber, size_t(0));
         auto draws = render::draws(*g, view, .5);
-        QVERIFY(!draws.empty()); size_t count = 0;
-        for (const auto& d : draws) count += d.range.count;
-        QVERIFY(count >= 3 && count < 10); // y=0,1,2 intersect, others culled
+        QVERIFY(!draws.empty());
+        size_t count = 0;
+        for (const auto& d : draws)
+            count += d.range.count;
+        QVERIFY(count >= 3 && count < 10);  // y=0,1,2 intersect, others culled
         QVERIFY(view.classify(Bounds{{-100, 0, 0}, {100, 0, 0}}) >= 0);
         QVERIFY(view.classify(Bounds{{10, 10, 0}, {11, 11, 0}}) < 0);
     }
 
     void perspectiveErrorBoundAndEyePlane()
     {
-        QMatrix4x4 m; m.perspective(45.f, 1.5f, .1f, 1000.f);
+        QMatrix4x4 m;
+        m.perspective(45.f, 1.5f, .1f, 1000.f);
         render::View view(m, {}, 1200, 800, 4);
         const Bounds b{{-2, -1, -12}, {2, 1, -8}};
         const double rate = view.pixelsPerUnit(b);
@@ -189,6 +215,38 @@ private slots:
         QVERIFY(clipSegment(a, b, box, lo, hi));
         QCOMPARE(lo, .25);
         QCOMPARE(hi, .75);
+    }
+
+    void deferredExactDetailPreservesVertices()
+    {
+        auto scene = std::make_shared<Scene>();
+        scene->clipBounds = Bounds{{12.5, -10, -10}, {287.25, 10, 10}};
+        Fiber f;
+        f.family = 'V';
+        f.lengthMm = 12.3;
+        Run run;
+        for (int i = 0; i < 300; ++i) {
+            run.points.push_back({double(i), std::sin(i * .08), std::cos(i * .03)});
+            run.styles.push_back(i < 150 ? SpanStyle::Solid : SpanStyle::Gap);
+        }
+        f.runs.push_back(run);
+        scene->fibers.push_back(f);
+        const auto eager = render::build(scene);
+        const auto deferred = render::build(scene, nullptr, 0);
+        QVERIFY(!eager->deferredExact);
+        QVERIFY(deferred->deferredExact);
+        QVERIFY(deferred->levels[0].empty());
+        QCOMPARE(deferred->chunks.size(), eager->chunks.size());
+        std::vector<render::Vertex> exact;
+        for (const auto& chunk : deferred->chunks)
+            render::appendExact(*deferred, chunk, exact);
+        QCOMPARE(exact.size(), eager->levels[0].size());
+        static_assert(sizeof(render::Vertex) == 14 * sizeof(float));
+        QVERIFY(std::memcmp(exact.data(), eager->levels[0].data(), exact.size() * sizeof(render::Vertex)) == 0);
+        for (size_t level = 1; level < render::tolerances.size(); ++level) {
+            QCOMPARE(deferred->levels[level].size(), eager->levels[level].size());
+            QVERIFY(std::memcmp(deferred->levels[level].data(), eager->levels[level].data(), eager->levels[level].size() * sizeof(render::Vertex)) == 0);
+        }
     }
 
     void pointMarkersAndInvalidInputs()
