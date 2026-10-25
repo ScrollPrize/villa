@@ -21,7 +21,6 @@
 #include "vc/core/types/ChunkedTensor.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
-#include "vc/core/util/SurfaceArea.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "vc/tracer/Tracer.hpp"
@@ -51,17 +50,6 @@ public:
 private:
     int _previousThreadCount{1};
 };
-
-void ensureMetaObject(QuadSurface* surface)
-{
-    if (!surface) {
-        return;
-    }
-    if (!surface->meta.is_null() && surface->meta.is_object()) {
-        return;
-    }
-    surface->meta = utils::Json::object();
-}
 
 bool ensureGenerationsChannel(QuadSurface* surface)
 {
@@ -590,55 +578,3 @@ TracerGrowthResult runPatchTracerGrowth(const SegmentationGrowthRequest& request
     return result;
 }
 
-void updateSegmentationSurfaceMetadata(QuadSurface* surface,
-                                       double voxelSize)
-{
-    if (!surface) {
-        return;
-    }
-
-    ensureMetaObject(surface);
-
-    // Other writers state an unknown area as null rather than omitting the key
-    // (merge_concat_runs.py, for one), so read leniently: anything that is not
-    // a number means "not established".
-    const double previousAreaVx2 = vc::json::number_or(surface->meta, "area_vx2", -1.0);
-    const double previousAreaCm2 = vc::json::number_or(surface->meta, "area_cm2", -1.0);
-
-    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (points && !points->empty()) {
-        const double areaVx2 = vc::surface::computeSurfaceAreaVox2(*points);
-        surface->meta["area_vx2"] = areaVx2;
-
-        double areaCm2 = std::numeric_limits<double>::quiet_NaN();
-        if (const auto derived = vc::surface::areaCm2FromVox2(areaVx2, voxelSize)) {
-            areaCm2 = *derived;
-        } else if (previousAreaVx2 > std::numeric_limits<double>::epsilon() && previousAreaCm2 > 0.0) {
-            // Rescaling a surface whose physical scale was already established.
-            const double cm2PerVx2 = previousAreaCm2 / previousAreaVx2;
-            areaCm2 = areaVx2 * cm2PerVx2;
-        }
-
-        if (std::isfinite(areaCm2)) {
-            surface->meta["area_cm2"] = areaCm2;
-        } else {
-            // No voxel size and no established scale to carry forward. Leave
-            // area_cm2 absent: a guessed physical area is worse than none,
-            // because nothing downstream can tell it apart from a real one.
-            if (surface->meta.contains("area_cm2")) {
-                surface->meta.erase("area_cm2");
-            }
-            qCWarning(lcSegGrowth) << "Surface area left in voxels only: volume reports no voxel size";
-        }
-    }
-
-    cv::Mat generations = surface->channel("generations");
-    if (!generations.empty()) {
-        double minGen = 0.0;
-        double maxGen = 0.0;
-        cv::minMaxLoc(generations, &minGen, &maxGen);
-        surface->meta["max_gen"] = static_cast<int>(std::round(maxGen));
-    }
-
-    surface->meta["date_last_modified"] = get_surface_time_str();
-}

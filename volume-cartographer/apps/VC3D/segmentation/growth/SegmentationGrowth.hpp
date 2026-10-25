@@ -180,9 +180,6 @@ struct TracerGrowthContext {
     QString normalGridPath;
     QString normal3dZarrPath;
     cv::Mat allowedGrowthMask;
-    // For corrections annotation saving
-    std::filesystem::path volpkgRoot;
-    std::vector<std::string> volumeIds;
     std::string growthVolumeId;
     SurfacePatchIndex* surfacePatchIndex{nullptr};
     std::vector<std::shared_ptr<QuadSurface>> patchSurfaces;
@@ -204,5 +201,3 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
 TracerGrowthResult runPatchTracerGrowth(const SegmentationGrowthRequest& request,
                                         const TracerGrowthContext& context);
 
-void updateSegmentationSurfaceMetadata(QuadSurface* surface,
-                                       double voxelSize);

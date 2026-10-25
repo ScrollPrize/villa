@@ -86,18 +86,6 @@ void ensureGenerationsChannel(QuadSurface* surface)
     surface->setChannel("generations", seeded);
 }
 
-void ensureSurfaceMetaObject(QuadSurface* surface)
-{
-    if (!surface) {
-        return;
-    }
-
-    if (!surface->meta.is_null() && surface->meta.is_object()) {
-        return;
-    }
-
-    surface->meta = utils::Json::object();
-}
 
 
 bool isInvalidPoint(const cv::Vec3f& value)
@@ -737,10 +725,6 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         ctx.resumeSurface = segmentationSurface.get();
         ctx.cacheRoot = cacheRootForVolumePkg(volumeContext.package);
         ctx.voxelSize = volumeContext.activeVolume ? volumeContext.activeVolume->voxelSize() : 1.0;
-        if (volumeContext.package) {
-            ctx.volpkgRoot = std::filesystem::path(volumeContext.package->getVolpkgDirectory());
-            ctx.volumeIds = volumeContext.package->volumeIDs();
-        }
 
         if (_patchTracerCachedIndex && source.key == _patchTracerCachedSourceKey) {
             ctx.surfacePatchIndex = _patchTracerCachedIndex.get();
@@ -1007,11 +991,6 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     ctx.normal3dZarrPath = volumeContext.normal3dZarrPath;
     ctx.allowedGrowthMask = request.allowedGrowthMask;
 
-    // Populate fields for corrections annotation saving
-    if (volumeContext.package) {
-        ctx.volpkgRoot = std::filesystem::path(volumeContext.package->getVolpkgDirectory());
-        ctx.volumeIds = volumeContext.package->volumeIDs();
-    }
     ctx.growthVolumeId = growthVolumeId;
 
     if (ctx.cacheRoot.isEmpty()) {
@@ -1447,7 +1426,6 @@ void SegmentationGrower::onFutureFinished()
         return;
     }
 
-    const double voxelSize = request.growthVoxelSize;
     cv::Mat generations = result.surface->channel("generations");
 
     std::vector<SurfacePatchIndex::SurfacePtr> surfacesToUpdate;
@@ -1515,18 +1493,6 @@ void SegmentationGrower::onFutureFinished()
             targetSurface->invalidateCache();
         }
 
-        // The grown result replaces the target's meta below; the target keeps
-        // its object identity.
-        const std::string preservedUuid = targetSurface->objectUuid();
-        utils::Json preservedTags = utils::Json::object();
-        bool hadPreservedTags = false;
-        if (!targetSurface->meta.is_null() && targetSurface->meta.is_object()) {
-            if (targetSurface->meta.contains("tags") && targetSurface->meta["tags"].is_object()) {
-                preservedTags = targetSurface->meta["tags"];
-                hadPreservedTags = true;
-            }
-        }
-
         if (!generations.empty()) {
             targetSurface->setChannel("generations", generations);
         }
@@ -1536,25 +1502,6 @@ void SegmentationGrower::onFutureFinished()
         if (!approval.empty()) {
             targetSurface->setChannel("approval", approval);
         }
-
-        if (!result.surface->meta.is_null()) {
-            targetSurface->meta = result.surface->meta;
-        } else {
-            ensureSurfaceMetaObject(targetSurface);
-        }
-
-        if (hadPreservedTags && !targetSurface->meta.is_null() && targetSurface->meta.is_object()) {
-            utils::Json mergedTags = preservedTags;
-            if (targetSurface->meta.contains("tags") && targetSurface->meta["tags"].is_object()) {
-                mergedTags.update(targetSurface->meta["tags"]);
-            }
-            targetSurface->meta["tags"] = mergedTags;
-        }
-        if (!preservedUuid.empty() && targetSurface->meta.is_object()) {
-            targetSurface->meta["uuid"] = preservedUuid;
-        }
-
-        updateSegmentationSurfaceMetadata(targetSurface, voxelSize);
 
         // Refresh intersection index for this surface so renderIntersections() has up-to-date data
         if (_context.viewerManager) {
@@ -1582,7 +1529,6 @@ void SegmentationGrower::onFutureFinished()
 
     if (!sessionActive) {
         if (surfaceToPersist && _context.module) {
-            ensureSurfaceMetaObject(surfaceToPersist);
             if (!_context.module->saveSurfaceNow(surfaceToPersist)) {
                 showStatus(tr("Failed to save the grown segmentation to the object store."), kStatusLong);
             }
