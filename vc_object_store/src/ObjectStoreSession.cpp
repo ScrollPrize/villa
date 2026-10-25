@@ -236,6 +236,14 @@ std::filesystem::path ObjectStoreSession::artifactDirectory(const AttachmentIden
     return directory;
 }
 
+std::filesystem::path ObjectStoreSession::path(const AttachmentIdentity& identity)
+{
+    auto attachment = acquire(identity, false);
+    const auto result = attachment->store.path();
+    release(*attachment, false);
+    return result;
+}
+
 RevisionSelection ObjectStoreSession::editKeepingRelationships(const AttachmentIdentity& identity,
     const RevisionSelection& pins, const RevisionSelection& related,
     const std::function<void(ObjectStore&, WriteTxn&, const KeepRecorded&)>& edit)

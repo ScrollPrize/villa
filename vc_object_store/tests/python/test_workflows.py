@@ -547,6 +547,7 @@ def test_service_edits_a_hosted_surface_through_a_session(tmp_path):
     session = vos.ObjectStoreSession()
     attachment = session.attach(str(tmp_path / 'service.vcobj'), 'service', sync_interval_ms=100, push_delay_ms=20)
     assert session.attachments() == [attachment] and session.writable(attachment)
+    assert Path(session.path(attachment)) == tmp_path / 'service.vcobj'  # the replica, not the hub
     model = session.artifact_directory(attachment, surface)
     assert model == hub.parent / 'hub.vcobj.artifacts' / surface and model.is_dir()
     with session.hold_leases(attachment, [surface]):

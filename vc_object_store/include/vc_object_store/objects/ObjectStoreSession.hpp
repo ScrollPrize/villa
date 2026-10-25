@@ -133,6 +133,9 @@ public:
     // beside its hub so every replica and service shares it; a hub addressed
     // by sftp:// URL has no shared directory.
     std::filesystem::path artifactDirectory(const AttachmentIdentity&, const std::string& objectUuid, bool create = true);
+    // The store file of an attachment (a hosted store's local replica), e.g. to
+    // hand to a tool that opens the same file.
+    std::filesystem::path path(const AttachmentIdentity&);
     // Drain accepted writes on every attachment. No delayed persistence or new geometry publication.
     void finalize();
     // Poll from the application's event loop. Includes external commits and

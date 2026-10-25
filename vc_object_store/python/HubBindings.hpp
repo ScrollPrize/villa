@@ -83,6 +83,7 @@ inline void bindObjectStoreSession(nb::module_& m)
         }, nb::arg("attachment"))
         .def("sync_hub", &vo::ObjectStoreSession::syncHub, nb::arg("attachment"))
         .def("resolve_hub_conflicts", &vo::ObjectStoreSession::resolveHubConflicts, nb::arg("attachment"), nb::arg("keep"))
+        .def("path", &vo::ObjectStoreSession::path, nb::arg("attachment"), "The attachment's store file (a hosted store's local replica).")
         .def("artifact_directory", &vo::ObjectStoreSession::artifactDirectory, nb::arg("attachment"), nb::arg("object_uuid"),
              nb::arg("create") = true)
         .def("copy_object", &vo::ObjectStoreSession::copyObject, nb::arg("source"), nb::arg("destination"),
