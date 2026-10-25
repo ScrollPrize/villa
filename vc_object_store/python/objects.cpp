@@ -444,12 +444,12 @@ NB_MODULE(_native, m)
         }, nb::arg("kind"), nb::arg("source"), nb::arg("coordinate_context") = nb::dict())
         .def("export_geometry", [](PyObjectStore& self, const std::string& object,
                                    const std::filesystem::path& destination,
-                                   const std::optional<std::string>& revision, bool overwrite) {
+                                   const std::optional<std::string>& revision, bool overwrite, bool validOnly) {
             return self.withStore<true>([&](auto& db) {
-                return vo::exportGeometry(db, object, destination, revision, overwrite);
+                return vo::exportGeometry(db, object, destination, revision, overwrite, validOnly);
             });
         }, nb::arg("object_uuid"), nb::arg("destination"), nb::arg("object_revision_uuid") = std::nullopt,
-           nb::arg("overwrite") = false,
+           nb::arg("overwrite") = false, nb::arg("valid_only") = false,
            "Export an object revision to native files; return its geometry revision UUID. Does not modify the store.")
         .def("edge_geometry_state", [](PyObjectStore& self, const std::string& uuid) {
             const auto state = self.withRead([&](vo::ObjectStore& db, vo::ReadTxn& txn) { return db.edgeGeometryState(txn, uuid); });

@@ -48,6 +48,19 @@ bool validSurfacePoint(const SurfacePoint& p)
         if (!std::isfinite(v) || v == -1) return false;
     return true;
 }
+std::vector<uint8_t> validityFromMask(std::span<const double> mask, int64_t maskRows, int64_t maskColumns,
+                                      int64_t rows, int64_t columns)
+{
+    if (rows <= 0 || columns <= 0 || maskRows < rows || maskColumns < columns || maskRows % rows ||
+        maskColumns % columns || mask.size() != size_t(maskRows) * size_t(maskColumns))
+        throw std::invalid_argument("a mask must be a whole multiple of the points grid");
+    const int64_t sy = maskRows / rows, sx = maskColumns / columns;
+    std::vector<uint8_t> valid(size_t(rows) * size_t(columns), 255);
+    for (int64_t r = 0; r < maskRows; ++r)
+        for (int64_t c = 0; c < maskColumns; ++c)
+            if (!(mask[size_t(r * maskColumns + c)] >= 255)) valid[size_t((r / sy) * columns + c / sx)] = 0;
+    return valid;
+}
 void PointCollection::validate() const
 {
     if (ids.size() != points.size()) throw std::invalid_argument("point IDs and coordinates differ in length");

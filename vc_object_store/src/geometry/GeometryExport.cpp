@@ -54,7 +54,7 @@ void publish(const fs::path& source, const fs::path& destination, bool overwrite
 } // namespace
 
 std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const fs::path& destination,
-    const std::optional<std::string>& revisionUuid, bool overwrite)
+    const std::optional<std::string>& revisionUuid, bool overwrite, bool validOnly)
 {
     if (destination.empty()) throw std::invalid_argument("export destination is empty");
     const auto dest = fs::absolute(destination).lexically_normal();
@@ -122,7 +122,7 @@ std::string exportGeometry(ObjectStore& db, const std::string& objectUuid, const
         file.close();
     }
     else if (kind == "point_collection") formats::collection(snapshot, attributes, output);
-    else if (kind == "surface") formats::surface(snapshot, attributes, output);
+    else if (kind == "surface") formats::surface(snapshot, attributes, output, validOnly);
     else if (kind == "track") formats::track(snapshot, attributes, output);
     else if (kind == "umbilicus") formats::umbilicus(snapshot, attributes, output);
     else throw std::runtime_error("unsupported geometry kind for export");

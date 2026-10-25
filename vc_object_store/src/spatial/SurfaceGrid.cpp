@@ -1,5 +1,6 @@
 #include "spatial/SurfaceGrid.hpp"
 #include "vc_object_store/Tiff.hpp"
+#include "vc_object_store/geometry/Geometry.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <cstring>
@@ -43,12 +44,10 @@ std::optional<std::vector<uint8_t>> readSurfaceValidity(const std::filesystem::p
     if(!std::filesystem::exists(path/"mask.tif"))return std::nullopt;
     // Page 0, first sample; a later render page is not validity.
     const auto mask=band(path/"mask.tif");
-    if(mask.rows<rows||mask.cols<cols||(rows&&mask.rows%rows)||(cols&&mask.cols%cols))
+    try {
+        return vc::geometry::validityFromMask({mask.ptr<double>(),mask.total()},mask.rows,mask.cols,rows,cols);
+    } catch(const std::invalid_argument&) {
         throw std::runtime_error("mask.tif must be a whole multiple of the points grid: "+path.string());
-    const int sy=rows?mask.rows/rows:1,sx=cols?mask.cols/cols:1;
-    std::vector<uint8_t> valid(size_t(rows)*size_t(cols),255);
-    for(int r=0;r<mask.rows;++r)for(int c=0;c<mask.cols;++c)
-        if(!(mask(r,c)>=255))valid[size_t(r/sy)*size_t(cols)+size_t(c/sx)]=0;
-    return valid;
+    }
 }
 }

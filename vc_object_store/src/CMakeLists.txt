@@ -95,7 +95,7 @@ endif()
 add_library(vc_object_formats STATIC Tiff.cpp MemMap.cpp PackedTrackStore.cpp spatial/SurfaceGrid.cpp)
 add_library(vc_object_store::vc_object_formats ALIAS vc_object_formats)
 target_include_directories(vc_object_formats PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>" "$<INSTALL_INTERFACE:include>" PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_link_libraries(vc_object_formats PUBLIC opencv_core TIFF::TIFF PRIVATE nlohmann_json::nlohmann_json)
+target_link_libraries(vc_object_formats PUBLIC opencv_core TIFF::TIFF vc_geometry PRIVATE nlohmann_json::nlohmann_json)
 target_compile_features(vc_object_formats PUBLIC cxx_std_20)
 add_library(vc_object_geometry STATIC geometry/GeometryIngest.cpp geometry/GeometryExport.cpp geometry/SourceMetadata.cpp
     formats/GeometryInput.cpp formats/FiberInput.cpp formats/SurfaceInput.cpp

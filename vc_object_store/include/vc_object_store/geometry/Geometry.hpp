@@ -65,6 +65,11 @@ using Geometry = std::variant<PointCollection, Fiber, Track, Surface, Umbilicus>
 objects::GeometryData encode(const Geometry&);
 Geometry decode(const objects::GeometryData&);
 
+// Per-vertex validity (255 valid, 0 invalid) of a rows x columns grid from a
+// row-major mask that is a whole multiple of it: a vertex is valid only when
+// every mask value it covers is at least 255.
+std::vector<uint8_t> validityFromMask(std::span<const double> mask, int64_t maskRows, int64_t maskColumns,
+                                      int64_t rows, int64_t columns);
 double polylineLength(std::span<const Point>);
 double polylineLength(std::span<const TrackPoint>);
 // A surface vertex has coordinates unless a component is -1 or non-finite;

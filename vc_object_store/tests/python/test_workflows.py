@@ -634,3 +634,26 @@ def test_attachments_by_role(db):
     assert [other(e) for e in db.attachments(owner, role='corrections')] == [corrections]
     assert sorted(other(e) for e in db.attachments(owner)) == sorted([results, corrections])
     assert db.attachments(owner, role='missing') == []
+
+
+def test_surface_export_keeps_validity_or_writes_valid_only(db, tmp_path):
+    points = np.array([[[1, 2, 3], [4, 5, 6]]], dtype='<f4')
+    valid = np.array([[255, 0]], dtype='u1')
+    uid = db.upsert_object(dict(kind='surface'))
+    db.put_geometry(uid, dict(kind='surface', attributes=dict(scale=[1, 1]), arrays=[
+        array('points', points), array('valid', valid)]))
+    db.export_geometry(uid, tmp_path / 'masked')
+    db.export_geometry(uid, tmp_path / 'valid_only', valid_only=True)
+    assert (tmp_path / 'masked' / 'mask.tif').exists() and not (tmp_path / 'valid_only' / 'mask.tif').exists()
+    def reingest(name):
+        other = ObjectStore.create(str(tmp_path / (name + '.vcobj')), author='t')
+        assert not other.ingest_geometry_source('surface', tmp_path / name)['problems']
+        return other, other.current_geometry(other.objects_by_kind('surface')[0]['uuid'])
+    other, masked = reingest('masked')
+    assert np.frombuffer(other.read_geometry_array(masked['uuid'], 'valid'), 'u1').tolist() == [255, 0]
+    other.close()
+    other, only = reingest('valid_only')
+    assert 'valid' not in {a['name'] for a in only['arrays']}
+    stored = np.frombuffer(other.read_geometry_array(only['uuid'], 'points'), '<f4').reshape(1, 2, 3)
+    assert stored[0, 1].tolist() == [-1, -1, -1] and stored[0, 0].tolist() == [1, 2, 3]
+    other.close()

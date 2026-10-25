@@ -73,13 +73,18 @@ void umbilicus(const Snapshot& s, Json attributes, const fs::path& path)
     attributes["points"] = std::move(points);
     writeJson(path, attributes);
 }
-void surface(const Snapshot& s, Json attributes, const fs::path& path)
+void surface(const Snapshot& s, Json attributes, const fs::path& path, bool validOnly)
 {
     const auto descriptor = std::find_if(s.revision.arrays.begin(), s.revision.arrays.end(), [](const auto& a) { return a.name == "points"; });
     const auto& shape = descriptor->shape;
     if (shape[0] <= 0 || shape[1] <= 0 || shape[0] > INT_MAX || shape[1] > INT_MAX)
         throw std::runtime_error("native surface export requires nonempty dimensions within int32 range");
-    const auto xyz = s.values<float>("points");
+    auto xyz = s.values<float>("points");
+    if (validOnly && s.arrays.contains(detail::surfaceValidChannel)) {
+        const auto& valid = s.arrays.at(detail::surfaceValidChannel);
+        for (size_t v = 0; v < valid.size(); ++v)
+            if (!valid[v]) std::fill_n(xyz.begin() + std::ptrdiff_t(3 * v), 3, -1.f);
+    }
     std::array<float, 3> low{-1,-1,-1}, high = low;
     bool any = false;
     for (size_t i = 0; i < xyz.size(); i += 3) {
@@ -109,6 +114,7 @@ void surface(const Snapshot& s, Json attributes, const fs::path& path)
         if (array.name == "points") continue;
         auto bytes = s.arrays.at(array.name);
         if (array.name == detail::surfaceValidChannel) {
+            if (validOnly) continue;
             for (auto& value : bytes) value = value ? 255 : 0;
             writeTiffSamples(path / "mask.tif", {uint32_t(shape[1]), uint32_t(shape[0]), 8, SAMPLEFORMAT_UINT, 1, std::move(bytes)});
             continue;
