@@ -14,8 +14,9 @@
 namespace {
 // Surfaces cross the slab's mid-plane; the depth only selects candidate tiles.
 constexpr double kHalfDepthVx = 1.0;
-// Each crossed surface tile decodes ~0.5 MB, so the store's default (64 MB) drew
-// about 6 surfaces crossing a 2000 vx view; this covers ~55 crossing 4000 vx.
+// A cold query charges each crossed chunk's payload and hash check (~0.4 MB),
+// so the store's default (64 MB) stopped a 2000 vx view of 16 surfaces; warm
+// queries (verified chunks retained per connection) charge only what they read.
 constexpr uint64_t kProcessingBudget = uint64_t(1) << 30;
 
 vc::fibers::Point point(const cv::Vec3f& p)

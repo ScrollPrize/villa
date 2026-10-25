@@ -35,6 +35,17 @@ std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransformSnapshot(
     return graph;
 }
 
+// Viewers re-query regions as the view moves: keep verified geometry per read
+// connection well beyond the store's default (16 MB) so warm queries skip
+// reloading and re-hashing chunks.
+vc::objects::OpenOptions viewerOpenOptions()
+{
+    vc::objects::OpenOptions options;
+    options.catalogTransforms = catalogTransformSnapshot();
+    options.geometryCacheBytes = size_t(256) << 20;
+    return options;
+}
+
 bool isValidSurfacePoint(const cv::Vec3f& point)
 {
     return point[0] != -1.0f && point[1] != -1.0f && point[2] != -1.0f
@@ -248,8 +259,7 @@ vc::objects::AttachmentIdentity CState::catalogAttachment(const std::filesystem:
     if (_objectStoreOwner) return _objectStoreOwner->catalogAttachment(path);
     const auto found = _catalogAttachments.find(path);
     if (found != _catalogAttachments.end() && _objectStoreSession->current(found->second)) return found->second;
-    vc::objects::OpenOptions options;
-    options.catalogTransforms=catalogTransformSnapshot();
+    auto options = viewerOpenOptions();
     options.readOnly = true;
     const auto attachment = _objectStoreSession->attach(path, options);
     _catalogAttachments[path] = attachment;
@@ -265,8 +275,7 @@ std::optional<vc::objects::AttachmentIdentity> CState::objectStoreAttachment() c
 void CState::attachObjectStore(const QString& path, const QString& author, bool readOnly)
 {
     if (_objectStoreOwner) { _objectStoreOwner->attachObjectStore(path, author, readOnly); return; }
-    vc::objects::OpenOptions options;
-    options.catalogTransforms=catalogTransformSnapshot();
+    auto options = viewerOpenOptions();
     options.author = author.toStdString();
     options.readOnly = readOnly;
     _objectStoreAttachment = _objectStoreAttachment
