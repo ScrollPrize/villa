@@ -1592,6 +1592,14 @@ void MenuActionController::beginRotateSurfaceTransform()
                                  QObject::tr("Select a segmentation surface before rotating."));
         return;
     }
+    const auto* row = _window->_surfaceCatalog ? _window->_surfaceCatalog->row(activeSurface->id) : nullptr;
+    if (row && row->catalog) {
+        QMessageBox::information(_window,
+                                 QObject::tr("Rotate Surface"),
+                                 QObject::tr("Open Data catalog surfaces are read-only. Copy the surface into "
+                                             "your object store (Copy Surface > Copy Surface...) and rotate the copy."));
+        return;
+    }
 
     _window->_surfaceRotationOverlay->beginRotate();
     if (_window->statusBar()) {
