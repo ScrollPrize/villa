@@ -18,6 +18,7 @@ import uuid as uuidlib
 import numpy as np
 from vc_object_store import ObjectStore
 
+from vesuvius.stored_objects import open_store, volume_scale  # noqa: F401  (re-exported for fiber users)
 from vesuvius.neural_tracing.tracers.shared.annotations.repair import ANNOTATION_REPAIR, repair_kinks
 from vesuvius.neural_tracing.tracers.shared.annotations.traced import TracedFiber
 from vesuvius.neural_tracing.tracers.shared.annotations.splits import heldout_ids
@@ -25,19 +26,6 @@ from vesuvius.neural_tracing.tracers.shared.geometry import arclength, interp_at
 
 PAGE = 8192
 WRITE_BATCH = 256
-
-
-def open_store(path):
-    """A read-only handle; a context manager. Not shareable across processes: open one per process."""
-    return ObjectStore.open(str(path), read_only=True, reader_pool_size=1)
-
-
-def volume_scale(meta, volume):
-    """Stored-to-volume-voxel factor of a fiber bound to ``volume``, else None."""
-    coordinates = (meta or {}).get('coordinates') or {}
-    if coordinates.get('volume_uuid') != volume or not coordinates.get('scale_factor'):
-        return None
-    return 1.0/float(coordinates['scale_factor'])
 
 
 def fiber_volume(path):
