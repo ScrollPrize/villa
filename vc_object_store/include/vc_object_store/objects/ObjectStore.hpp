@@ -378,8 +378,11 @@ public:
     double geometryLengthInVolume(const Txn&, const std::string& objectUuid, const std::string& target, double targetScale=1) const;
     std::string registerVolumeTransform(WriteTxn&, const std::string& source, const std::string& target,
         const VolumeAffine&, const std::string& name, const std::optional<std::string>& uuid = std::nullopt);
+    // The route from `source` to `target` (registration keys as a resolution's
+    // candidate path). Updates the pair's existing choice, else creates one
+    // (as `uuid` when given).
     std::string chooseVolumeTransform(WriteTxn&, const std::string& source, const std::string& target,
-        const std::vector<std::string>& path);
+        const std::vector<std::string>& path, const std::optional<std::string>& uuid = std::nullopt);
     WriteTxn write();
     // Check supplied heads before editing; require every changed object/endpoint.
     // Commit publishes one revision per changed object. Missing expectations or

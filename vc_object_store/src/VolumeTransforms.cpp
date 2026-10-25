@@ -77,10 +77,12 @@ std::string ObjectStore::registerVolumeTransform(WriteTxn& txn,const std::string
     meta["registration"]={{"source_volume",source},{"target_volume",target},{"matrix",matrix.json()},{"description",name}};
     record.meta=meta.dump();return upsertObject(txn,record);
 }
-std::string ObjectStore::chooseVolumeTransform(WriteTxn& txn,const std::string& source,const std::string& target,const std::vector<std::string>& path) {
+std::string ObjectStore::chooseVolumeTransform(WriteTxn& txn,const std::string& source,const std::string& target,const std::vector<std::string>& path,
+    const std::optional<std::string>& uuid) {
     auto transforms=volumeTransforms(txn);
     (void)transforms.graph.resolve(source,target,path).resolved();
     ObjectRecord record;record.kind="volume_transform_choice";record.name=source+" -> "+target;
+    if(uuid)record.uuid=*uuid;
     for(const auto& existing:objectsByKind(txn,record.kind)) {
         const auto c=nlohmann::json::parse(existing.meta).at("choice");
         if(c.at("source_volume")==source&&c.at("target_volume")==target)record=existing;

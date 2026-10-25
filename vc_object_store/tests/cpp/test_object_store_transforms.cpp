@@ -129,5 +129,18 @@ int main() try {
         require(ambiguous,"ambiguous target cannot silently choose a view");
         require(!context.toVolume(nlohmann::json::parse(db.objectByUuid(read,fiber)->meta),"b"),"ambiguous object stays unavailable");
     }
+    {
+        // A choice settles the ambiguity; choosing again updates the same record.
+        std::vector<std::vector<std::string>> paths;
+        {auto read=db.read();for(const auto& c:db.volumeTransforms(read).graph.resolve("a","b").candidates)paths.push_back(c.path);}
+        require(paths.size()==2,"two candidate routes");
+        const auto choice=vc::objects::util::newUuid();
+        {auto txn=db.write({{choice,std::nullopt}});require(db.chooseVolumeTransform(txn,"a","b",paths[1],choice)==choice,"choice takes the given uuid");txn.commit();}
+        {auto read=db.read();require(db.volumeTransforms(read).resolve("a","b").status==vcr::catalog::TransformStatus::Resolved,"a choice resolves the pair");}
+        {auto read=db.read();const auto head=db.currentObjectRevision(read,choice)->uuid;
+         auto txn=db.write({{choice,head}});require(db.chooseVolumeTransform(txn,"a","b",paths[0])==choice,"choosing again updates the choice");txn.commit();}
+        auto read=db.read();
+        require(db.volumeTransforms(read).resolve("a","b").resolved().path==paths[0],"the latest choice wins");
+    }
     std::cout<<"object volume transformation checks passed\n";return 0;
 }catch(const std::exception& e){std::cerr<<e.what()<<'\n';return 1;}
