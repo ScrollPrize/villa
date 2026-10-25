@@ -1,10 +1,8 @@
 #include "AtlasControlPointsDock.hpp"
 
 #include <QCheckBox>
-#include <QFile>
 #include <QHeaderView>
 #include <QJsonArray>
-#include <QJsonDocument>
 #include <QJsonObject>
 #include <QLabel>
 #include <QSignalBlocker>
@@ -162,14 +160,10 @@ bool AtlasControlPointsDock::overlayChecked() const
     return _overlayCheck && _overlayCheck->isChecked();
 }
 
-void AtlasControlPointsDock::loadResults(const std::filesystem::path& jsonPath)
+void AtlasControlPointsDock::loadResults(const QJsonObject& results)
 {
-    if (jsonPath.empty() || !std::filesystem::exists(jsonPath)) {
-        clearResults();
-        return;
-    }
     try {
-        _results = parseResults(jsonPath);
+        _results = parseResults(results);
         rebuildTree();
         emit resultsChanged(_results);
     } catch (const std::exception& e) {
@@ -192,47 +186,14 @@ void AtlasControlPointsDock::clearResults()
     emit resultsChanged(_results);
 }
 
-AtlasControlPointResults AtlasControlPointsDock::parseResults(const std::filesystem::path& jsonPath) const
+AtlasControlPointResults AtlasControlPointsDock::parseResults(const QJsonObject& root) const
 {
-    QFile file(QString::fromStdString(jsonPath.string()));
-    if (!file.open(QIODevice::ReadOnly)) {
-        throw std::runtime_error("open failed");
-    }
-    const QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
-    if (!doc.isObject()) {
-        throw std::runtime_error("top-level value is not an object");
-    }
-    const QJsonObject root = doc.object();
-
     AtlasControlPointResults results;
     const QJsonArray records = root.value(QStringLiteral("records")).toArray();
-    if (!records.isEmpty()) {
-        results.reserve(records.size());
-        for (const QJsonValue& value : records) {
-            if (value.isObject()) {
-                results.push_back(parsePoint(value.toObject()));
-            }
-        }
-    } else {
-        const QJsonArray fibers = root.value(QStringLiteral("fibers")).toArray();
-        for (const QJsonValue& fiberValue : fibers) {
-            if (!fiberValue.isObject()) {
-                continue;
-            }
-            const QJsonObject fiber = fiberValue.toObject();
-            const QString fiberId = jsonString(fiber, QStringLiteral("fiber_id"),
-                                               jsonString(fiber, QStringLiteral("object_id"), QStringLiteral("unknown")));
-            const QJsonArray points = fiber.value(QStringLiteral("control_points")).toArray();
-            for (const QJsonValue& pointValue : points) {
-                if (!pointValue.isObject()) {
-                    continue;
-                }
-                AtlasControlPointResult point = parsePoint(pointValue.toObject());
-                if (point.fiberId.isEmpty()) {
-                    point.fiberId = fiberId;
-                }
-                results.push_back(point);
-            }
+    results.reserve(records.size());
+    for (const QJsonValue& value : records) {
+        if (value.isObject()) {
+            results.push_back(parsePoint(value.toObject()));
         }
     }
 

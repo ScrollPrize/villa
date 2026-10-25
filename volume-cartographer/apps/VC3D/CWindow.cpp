@@ -162,6 +162,7 @@
 #include "SurfaceAreaCalculator.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "LasagnaServiceManager.hpp"
+#include "ObjectStoreAttachments.hpp"
 #include "FiberMapWorkspace.hpp"
 #include "SpiralWorkspace.hpp"
 #include "segmentation/panels/SegmentationLasagnaPanel.hpp"
@@ -3213,31 +3214,9 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             ? _segmentationWidget->lasagnaPanel()
                             : nullptr;
 
-                        bool activeSegmentHasLasagnaModel = false;
-                        if (_state && _state->vpkg()) {
-                            auto activeSurface = std::dynamic_pointer_cast<QuadSurface>(
-                                _state->surface("segmentation"));
-                            if (activeSurface && !activeSurface->path.empty()) {
-                                std::filesystem::path segPath = activeSurface->path;
-                                if (segPath.is_relative()) {
-                                    std::filesystem::path outputSegmentsPath =
-                                        _state->vpkg()->outputSegmentsPath();
-                                    if (outputSegmentsPath.empty()) {
-                                        outputSegmentsPath = _state->vpkg()->findSegmentPathByName(
-                                            _state->vpkg()->getSegmentationDirectory());
-                                    }
-                                    if (outputSegmentsPath.empty()) {
-                                        outputSegmentsPath =
-                                            std::filesystem::path(_state->vpkg()->getVolpkgDirectory()) /
-                                            "paths";
-                                    }
-                                    segPath = outputSegmentsPath / segPath.filename();
-                                }
-                                std::error_code ec;
-                                activeSegmentHasLasagnaModel =
-                                    std::filesystem::exists(segPath / "model.pt", ec);
-                            }
-                        }
+                        const auto activeSurface = _state ? _state->surface("segmentation") : nullptr;
+                        const bool activeSegmentHasLasagnaModel =
+                            activeSurface && LasagnaServiceManager::instance().surfaceModel(activeSurface->id);
 
                         QMenu menu(this);
 
@@ -4099,53 +4078,50 @@ void CWindow::repeatLastLasagnaAction()
     }
 }
 
-void CWindow::selectLasagnaOutputSegment(const QString& outputName)
+void CWindow::selectLasagnaOutputSurface(const QString& surfaceUuid)
 {
     switchToMainWorkspace();
-    if (!treeWidgetSurfaces) {
+    if (!treeWidgetSurfaces || surfaceUuid.isEmpty()) {
         return;
     }
-
-    const QString trimmed = outputName.trimmed();
-    if (trimmed.isEmpty()) {
-        return;
-    }
-
-    QStringList candidates;
-    auto addCandidate = [&candidates](const QString& value) {
-        const QString candidate = value.trimmed();
-        if (!candidate.isEmpty() && !candidates.contains(candidate)) {
-            candidates << candidate;
+    for (QTreeWidgetItemIterator it(treeWidgetSurfaces); *it; ++it) {
+        if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() == surfaceUuid) {
+            treeWidgetSurfaces->setCurrentItem(*it);
+            treeWidgetSurfaces->scrollToItem(*it);
+            ui.dockWidgetVolumes->raise();
+            return;
         }
-    };
+    }
+}
 
-    addCandidate(trimmed);
-    addCandidate(QFileInfo(trimmed).fileName());
-    const QStringList baseCandidates = candidates;
-    for (const QString& candidate : baseCandidates) {
-        if (candidate.endsWith(QStringLiteral(".tifxyz"))) {
-            addCandidate(candidate.left(candidate.size() - 7));
+void CWindow::loadLasagnaResults(Surface* surface)
+{
+    std::optional<nlohmann::json> corr, atlas;
+    if (surface && _surfaceCatalog && _surfaceCatalog->attachment()) {
+        try {
+            auto& session = *_surfaceCatalog->session();
+            corr = vc3d::store::attachedDocument(session, *_surfaceCatalog->attachment(), surface->id,
+                                                 LasagnaServiceManager::kCorrResultsRole);
+            atlas = vc3d::store::attachedDocument(session, *_surfaceCatalog->attachment(), surface->id,
+                                                  LasagnaServiceManager::kAtlasResultsRole);
+        } catch (const std::exception& error) {
+            qWarning() << "Cannot read Lasagna results for" << QString::fromStdString(surface->id) << error.what();
+        }
+    }
+    if (_point_collection_widget) {
+        if (corr) {
+            _point_collection_widget->loadCorrPointsResults(utils::Json::parse(corr->dump()));
         } else {
-            addCandidate(candidate + QStringLiteral(".tifxyz"));
+            _point_collection_widget->clearCorrPointsResults();
         }
     }
-
-    auto selectCandidate = [this, &candidates]() -> bool {
-        QTreeWidgetItemIterator it(treeWidgetSurfaces);
-        while (*it) {
-            const QString id = (*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
-            if (candidates.contains(id)) {
-                treeWidgetSurfaces->setCurrentItem(*it);
-                treeWidgetSurfaces->scrollToItem(*it);
-                ui.dockWidgetVolumes->raise();
-                return true;
-            }
-            ++it;
+    if (_atlasControlDock) {
+        if (atlas) {
+            _atlasControlDock->loadResults(QJsonDocument::fromJson(QByteArray::fromStdString(atlas->dump())).object());
+        } else {
+            _atlasControlDock->clearResults();
         }
-        return false;
-    };
-
-    selectCandidate();
+    }
 }
 
 bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId)
@@ -6707,6 +6683,7 @@ void CWindow::CreateWidgets(void)
     _surfaceCatalog = std::make_unique<SurfaceCatalog>(_state->objectStoreSession(), this);
     auto updateSurfaceSource = [this]() {
         _surfaceCatalog->setSource(_state->objectStoreAttachment(), _state->currentVolume());
+        LasagnaServiceManager::instance().setObjectStore(_state->objectStoreSession(), _state->objectStoreAttachment());
     };
     connect(_state, &CState::objectStoreChanged, _surfaceCatalog.get(),
             [this, updateSurfaceSource](const vc::objects::StoreSessionEvent& event) {
@@ -6988,6 +6965,7 @@ void CWindow::CreateWidgets(void)
     {
         auto* panel = _segmentationWidget->lasagnaPanel();
         panel->setState(_state);
+        panel->setSurfaceCatalog(_surfaceCatalog.get());
         panel->setVisible(true);
         _lasagnaWorkspaceWindow->setCentralWidget(panel);
 
@@ -7000,7 +6978,7 @@ void CWindow::CreateWidgets(void)
         connect(panel, &SegmentationLasagnaPanel::openLasagnaWorkspaceRequested,
                 this, &CWindow::switchToLasagnaWorkspace);
         connect(panel, &SegmentationLasagnaPanel::lasagnaOutputActivated,
-                this, &CWindow::selectLasagnaOutputSegment);
+                this, &CWindow::selectLasagnaOutputSurface);
     }
 
     _segmentationEdit = std::make_unique<SegmentationEditManager>(this);
@@ -7173,13 +7151,10 @@ void CWindow::CreateWidgets(void)
     connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::serviceStopped,
             this, &CWindow::updateAtlasFiberDocks);
 
-    // Add only the segments placed by lasagna instead of rescanning every surface.
-    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::resultsPlaced,
-            this, [this](const QString& outputDir, const QStringList& segmentNames) {
-        showStatusBarMessage(
-            tr("Lasagna optimization finished. Added %1 segment(s) from %2")
-                .arg(segmentNames.size())
-                .arg(outputDir), 5000);
+    // The new surfaces reach the surface list through the store's commit events.
+    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::optimizationFinished,
+            this, [this](const QStringList& surfaceUuids) {
+        showStatusBarMessage(tr("Lasagna optimization finished: %1 new surface(s)").arg(surfaceUuids.size()), 5000);
     });
 
     // Create Seeding widget
@@ -9056,24 +9031,7 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, const std::shared_ptr
             }
         }
 
-        // Load corr_points_results for the new segment
-        if (_point_collection_widget) {
-            auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf);
-            if (quadSurf && !quadSurf->path.empty()) {
-                _point_collection_widget->loadCorrPointsResults(
-                    quadSurf->path / "corr_points_results.json");
-            } else {
-                _point_collection_widget->clearCorrPointsResults();
-            }
-        }
-        if (_atlasControlDock) {
-            auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf);
-            if (quadSurf && !quadSurf->path.empty()) {
-                _atlasControlDock->loadResults(quadSurf->path / "atlas_control_points_results.json");
-            } else {
-                _atlasControlDock->clearResults();
-            }
-        }
+        loadLasagnaResults(surf.get());
     }
 
     const bool moveOnSurfaceChange = moveOnSurfaceChangeEnabled();
@@ -9197,24 +9155,7 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, const 
             surf.reset();
         }
 
-        // Load corr_points_results for the new segment
-        if (_point_collection_widget) {
-            auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf);
-            if (quadSurf && !quadSurf->path.empty()) {
-                _point_collection_widget->loadCorrPointsResults(
-                    quadSurf->path / "corr_points_results.json");
-            } else {
-                _point_collection_widget->clearCorrPointsResults();
-            }
-        }
-        if (_atlasControlDock) {
-            auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf);
-            if (quadSurf && !quadSurf->path.empty()) {
-                _atlasControlDock->loadResults(quadSurf->path / "atlas_control_points_results.json");
-            } else {
-                _atlasControlDock->clearResults();
-            }
-        }
+        loadLasagnaResults(surf.get());
 
         const bool wantsEditing = _segmentationWidget && _segmentationWidget->isEditingEnabled();
         if (wantsEditing) {

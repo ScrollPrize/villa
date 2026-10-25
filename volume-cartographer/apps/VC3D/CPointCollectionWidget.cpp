@@ -957,22 +957,13 @@ void CPointCollectionWidget::showContextMenu(const QPoint& pos)
     }
 }
 
-void CPointCollectionWidget::loadCorrPointsResults(const std::filesystem::path& jsonPath)
+void CPointCollectionWidget::loadCorrPointsResults(const utils::Json& results)
 {
     _corr_point_results.clear();
     _corr_collection_avgs.clear();
 
-    if (jsonPath.empty() || !std::filesystem::exists(jsonPath)) {
-        refreshTree();
-        return;
-    }
-
     try {
-        if (!std::filesystem::exists(jsonPath)) {
-            refreshTree();
-            return;
-        }
-        utils::Json j = utils::Json::parse_file(jsonPath);
+        utils::Json j = results;
 
         const auto readId = [](const utils::Json& value) -> std::optional<uint64_t> {
             if (!value.is_number_integer() || value.get_double() < 0) return std::nullopt;
@@ -994,8 +985,6 @@ void CPointCollectionWidget::loadCorrPointsResults(const std::filesystem::path& 
             _corr_point_results[ref] = r;
         };
 
-        // The legacy ID-keyed object loses results when collections share IDs.
-        // Prefer the qualified list, even when it is empty.
         if (j.contains("points_list") && j["points_list"].is_array()) {
             auto points = j["points_list"];
             for (const auto& val : points) {
@@ -1004,23 +993,6 @@ void CPointCollectionWidget::loadCorrPointsResults(const std::filesystem::path& 
                 const auto cid = readId(val["collection_id"]);
                 const auto pid = readId(val["point_id"]);
                 if (cid && pid) storeResult({*cid, *pid}, val);
-            }
-        } else if (j.contains("points") && j["points"].is_object()) {
-            auto points = j["points"];  // copy before nested Json access
-            for (auto it = points.begin(); it != points.end(); ++it) {
-                const std::string key = it.key();
-                const auto& val = *it;
-                if (!val.is_object() || key.empty() ||
-                    key.find_first_not_of("0123456789") != std::string::npos) continue;
-                uint64_t pid = 0;
-                try { pid = std::stoull(key); } catch (...) { continue; }
-                if (val.contains("collection_id")) {
-                    const auto cid = readId(val["collection_id"]);
-                    if (cid) storeResult({*cid, pid}, val);
-                } else {
-                    const auto refs = _point_collection->findPointRefs(pid);
-                    if (refs.size() == 1) storeResult(refs.front(), val);
-                }
             }
         }
 

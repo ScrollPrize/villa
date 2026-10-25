@@ -21,6 +21,7 @@
 #include "vc/flattening/ABFFlattening.hpp"
 #include "ToolDialogs.hpp"
 #include "LasagnaServiceManager.hpp"
+#include "SurfaceCatalog.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "elements/JsonProfilePresets.hpp"
 #include "utils/Json.hpp"
@@ -31,34 +32,21 @@
 
 void CWindow::onVisLasagnaObj(const std::string& segmentId)
 {
-    if (!_state || !_state->vpkg()) {
-        QMessageBox::warning(this, tr("Error"), tr("Cannot export vis: No volume package loaded"));
-        return;
-    }
-
-    auto surf = _state->vpkg()->getSurface(segmentId);
-    if (!surf) {
-        QMessageBox::warning(this, tr("Error"), tr("Cannot export vis: Invalid segment"));
-        return;
-    }
-
     auto& mgr = LasagnaServiceManager::instance();
     if (!mgr.isRunning()) {
         QMessageBox::warning(this, tr("Error"), tr("Lasagna service is not running"));
         return;
     }
-
-    // Find model.pt in the surface directory
-    std::filesystem::path surfPath = surf->path;
-    std::filesystem::path modelPath = surfPath / "model.pt";
-    if (!std::filesystem::exists(modelPath)) {
-        QMessageBox::warning(this, tr("Error"),
-            tr("No model.pt found in %1").arg(QString::fromStdString(surfPath.string())));
+    // The model a fit left with the surface in the store.
+    if (!_surfaceCatalog || !_surfaceCatalog->attachment() || !mgr.surfaceModel(segmentId)) {
+        QMessageBox::warning(this, tr("Error"), tr("This surface has no Lasagna model."));
         return;
     }
 
-    // Default output directory next to the surface
-    QString defaultOutput = QString::fromStdString((surfPath / "vis_obj").string());
+    // Default output directory: the surface's artifacts, beside its model
+    QString defaultOutput = QString::fromStdString(
+        (_surfaceCatalog->session()->artifactDirectory(*_surfaceCatalog->attachment(), segmentId, false) / "vis_obj")
+            .string());
 
     VisLasagnaObjDialog dlg(this, defaultOutput);
     if (dlg.exec() != QDialog::Accepted) {
@@ -69,16 +57,10 @@ void CWindow::onVisLasagnaObj(const std::string& segmentId)
     // Build request JSON
     QJsonObject request;
 
-    // Always read model file and send as base64 (server uses a tempdir)
-    QFile modelFile(QString::fromStdString(modelPath.string()));
-    if (!modelFile.open(QIODevice::ReadOnly)) {
-        QMessageBox::warning(this, tr("Error"),
-            tr("Cannot read model file: %1").arg(QString::fromStdString(modelPath.string())));
-        return;
-    }
-    QByteArray modelBytes = modelFile.readAll();
-    modelFile.close();
-    request[QStringLiteral("model_data")] = QString::fromLatin1(modelBytes.toBase64());
+    QJsonObject model;
+    model[QStringLiteral("type")] = QStringLiteral("surface");
+    model[QStringLiteral("uuid")] = QString::fromStdString(segmentId);
+    request[QStringLiteral("model")] = model;
 
     // data_input is extracted from the checkpoint's _fit_config_ on the Python side.
     // No need to send it explicitly.

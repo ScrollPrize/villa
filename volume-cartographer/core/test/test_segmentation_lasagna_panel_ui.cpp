@@ -12,8 +12,10 @@
 #include <QStatusBar>
 #include <QStackedWidget>
 #include <QTemporaryDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QDir>
+#include <QThread>
 
 #define private public
 #include "segmentation/panels/SegmentationLasagnaPanel.hpp"
@@ -21,8 +23,12 @@
 
 #include "CState.hpp"
 #include "LasagnaServiceManager.hpp"
+#include "ObjectStoreCoordinates.hpp"
+#include "SurfaceCatalog.hpp"
+#include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 #include <memory>
 #include <filesystem>
@@ -171,6 +177,61 @@ int main(int argc, char** argv)
     require(panel._compactNewModelConfigCombo->currentData().toString() == configPath,
             "Changing the full config selector should update the compact selector");
 
+    // The store jobs read: a volume's surfaces, one of them a Lasagna fit
+    // (its model in the store, the reference surface it read in its meta).
+    namespace vo = vc::objects;
+    Volume::ZarrCreateOptions volumeOptions;
+    volumeOptions.shapeZYX = {4, 4, 4};
+    volumeOptions.chunkShapeZYX = {4, 4, 4};
+    volumeOptions.compressor = "none";
+    volumeOptions.uuid = "lasagna-test-volume";
+    const auto volume = Volume::New(std::filesystem::path(tempDir.filePath(QStringLiteral("ct.zarr")).toStdString()),
+                                    volumeOptions);
+    const auto storePath = std::filesystem::path(tempDir.filePath(QStringLiteral("objects.vcobj")).toStdString());
+    vo::OpenOptions storeOptions;
+    storeOptions.author = "lasagna-panel-test";
+    { auto created = vo::ObjectStore::create(storePath, storeOptions); }
+    auto session = std::make_shared<vo::ObjectStoreSession>();
+    const auto attachment = session->attach(storePath, storeOptions);
+    cv::Mat_<cv::Vec3f> points(2, 2);
+    points.setTo(cv::Vec3f{1.0f, 1.0f, 1.0f});
+    QuadSurface grid(points, cv::Vec2f{1.0f, 1.0f});
+    auto addSurface = [&](const std::string& name, nlohmann::json meta) {
+        const auto uuid = vo::util::newUuid();
+        meta.update(vc3d::coordinateBindingForVolume(*volume, 1));
+        session->act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
+            vo::ObjectRecord record;
+            record.uuid = uuid;
+            record.kind = "surface";
+            record.name = name;
+            record.meta = meta.dump();
+            db.upsertObject(txn, record);
+            db.putGeometry(txn, uuid, quad_surface_geometry(grid));
+        });
+        return uuid;
+    };
+    const auto referenceUuid = addSurface("reference_surface", nlohmann::json::object());
+    const auto fittedUuid = addSurface("sheet_v002", {{"lasagna_job", {{"linked_surfaces", nlohmann::json::array({
+        {{"type", "surface"}, {"uuid", referenceUuid}, {"name", "reference_surface"}}})}}}});
+    addSurface("sheet_off1", nlohmann::json::object());
+    const auto noModelUuid = addSurface("sheet_no_model", nlohmann::json::object());
+    writeFile(QString::fromStdString((session->artifactDirectory(attachment, fittedUuid) / "model.pt").string()),
+              QByteArrayLiteral("model"));
+    LasagnaServiceManager::instance().setObjectStore(session, attachment);
+    SurfaceCatalog catalog(session);
+    catalog.setSource(attachment, volume);
+    QElapsedTimer catalogTimer;
+    catalogTimer.start();
+    while ((catalog.loading() || catalog.rows().size() < 4) && catalogTimer.elapsed() < 10000) {
+        for (const auto& event : session->takeEvents()) {
+            catalog.handle(event);
+        }
+        QCoreApplication::processEvents();
+        QThread::msleep(1);
+    }
+    require(catalog.rows().size() == 4, "The catalog should list the volume's four surfaces");
+    panel.setSurfaceCatalog(&catalog);
+
     emit LasagnaServiceManager::instance().jobsUpdated(QJsonArray{
         queuedJob(1, QStringLiteral("sheet_v001.tifxyz")),
         queuedJob(2, QString()),
@@ -284,10 +345,13 @@ int main(int argc, char** argv)
         1,
         2,
         3);
-    require(panel._submittedOutputNames.contains(QStringLiteral("sheet_v001.tifxyz")),
-            "New-model launch should reserve the generated output name");
-    require(statusBar.currentMessage().contains(QStringLiteral("sheet_v001.tifxyz")),
+    require(panel._submittedOutputNames.contains(QStringLiteral("sheet_v003")),
+            "New-model launch should version after the volume's surfaces of that name");
+    require(statusBar.currentMessage().contains(QStringLiteral("sheet_v003")),
             "New-model launch status should include the generated output name");
+    require(g_lastLasagnaOptimizationRequest[QStringLiteral("volume_uuid")].toString() ==
+                QStringLiteral("lasagna-test-volume"),
+            "Launches should name the volume their surfaces are in");
 
     emit LasagnaServiceManager::instance().statusMessage(QStringLiteral("preparing"));
     require(panel._progressLabel->text() == QStringLiteral("preparing"),
@@ -306,9 +370,9 @@ int main(int argc, char** argv)
     require(panel._progressLabel->text().contains(QStringLiteral("fit")),
             "Optimization progress should include the stage name");
 
-    emit LasagnaServiceManager::instance().optimizationFinished(QStringLiteral("/tmp/out"));
-    require(panel._progressLabel->text().contains(QStringLiteral("/tmp/out")),
-            "Optimization finished signal should show output path");
+    emit LasagnaServiceManager::instance().optimizationFinished(QStringList{QString::fromStdString(fittedUuid)});
+    require(panel._progressLabel->text().contains(QStringLiteral("sheet_v002")),
+            "Optimization finished signal should name the new surfaces");
     require(!panel._stopBtn->isEnabled(), "Stop button should be disabled after finish");
 
     emit LasagnaServiceManager::instance().optimizationError(QStringLiteral("failed"));
@@ -335,30 +399,19 @@ int main(int argc, char** argv)
     require(statusBar.currentMessage().contains(QStringLiteral("top-level")),
             "Invalid top-level config should report a config error");
 
-    const QString segDir = tempDir.filePath(QStringLiteral("sheet_v002.tifxyz"));
-    require(QDir().mkpath(segDir), "Failed to create temporary tifxyz segment");
-    writeFile(segDir + QStringLiteral("/x.tif"), QByteArrayLiteral("x"));
-    writeFile(segDir + QStringLiteral("/y.tif"), QByteArrayLiteral("y"));
-    writeFile(segDir + QStringLiteral("/z.tif"), QByteArrayLiteral("z"));
-    writeFile(segDir + QStringLiteral("/meta.json"),
-              QByteArrayLiteral(R"({"lasagna_job":{"linked_surfaces":[{"type":"tifxyz_segment","name":"reference_surface.tifxyz","hash":"md5:11111111111111111111111111111111"}]}})"));
-    writeFile(segDir + QStringLiteral("/approval.tif"), QByteArrayLiteral("a"));
-    writeFile(segDir + QStringLiteral("/d.tif"), QByteArrayLiteral("d"));
-    writeFile(segDir + QStringLiteral("/model.pt"), QByteArrayLiteral("model"));
-    require(QDir().mkpath(tempDir.filePath(QStringLiteral("sheet_off1.tifxyz"))),
-            "Failed to create offset collision directory");
-
-    cv::Mat_<cv::Vec3f> points(2, 2);
-    points.setTo(cv::Vec3f{0.0f, 0.0f, 0.0f});
-    auto surface = std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});
-    surface->path = std::filesystem::path(segDir.toStdString());
+    auto openSurface = [&](const std::string& uuid) {
+        auto opened = std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});
+        opened->id = uuid;
+        return opened;
+    };
+    auto surface = openSurface(fittedUuid);
 
     CState state;
     state.setSurface("segmentation", surface, true);
     panel._lastLasagnaMode = SegmentationLasagnaPanel::LasagnaMode::NewModel;
     panel.setState(&state);
-    require(panel.currentLinkedSurfaceNames().contains(QStringLiteral("reference_surface.tifxyz")),
-            "Linked surface preview should load names from the selected segment meta.json");
+    require(panel.currentLinkedSurfaceNames() == QStringList{QStringLiteral("reference_surface")},
+            "Linked surface preview should list the surfaces the selected fit read");
     panel.startOptimizationAtSeed(
         &state,
         &statusBar,
@@ -386,9 +439,9 @@ int main(int argc, char** argv)
         4,
         5,
         6);
-    require(panel._submittedOutputNames.contains(QStringLiteral("sheet_off2.tifxyz")),
+    require(panel._submittedOutputNames.contains(QStringLiteral("sheet_off2")),
             "Offset launch should reserve the next collision-free offset output name");
-    require(statusBar.currentMessage().contains(QStringLiteral("sheet_off2.tifxyz")),
+    require(statusBar.currentMessage().contains(QStringLiteral("sheet_off2")),
             "Offset launch status should include the generated offset output name");
     QJsonObject jobSpec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
     QJsonObject jobConfig = jobSpec[QStringLiteral("config")].toObject();
@@ -398,13 +451,11 @@ int main(int argc, char** argv)
     require(externalSurfaces.size() == 1,
             "VC3D job config should include one external surface from the linked refs");
     QJsonObject externalSurface = externalSurfaces[0].toObject();
-    require(externalSurface[QStringLiteral("type")].toString() == QStringLiteral("tifxyz_segment"),
-            "External surface should preserve object ref type");
-    require(externalSurface[QStringLiteral("name")].toString() == QStringLiteral("reference_surface.tifxyz"),
-            "External surface should preserve object ref name");
-    require(externalSurface[QStringLiteral("hash")].toString() ==
-                QStringLiteral("md5:11111111111111111111111111111111"),
-            "External surface should preserve object ref hash");
+    require(externalSurface[QStringLiteral("type")].toString() == QStringLiteral("surface") &&
+                externalSurface[QStringLiteral("uuid")].toString() == QString::fromStdString(referenceUuid),
+            "External surface should be the stored reference surface");
+    require(g_lastLasagnaOptimizationRequest[QStringLiteral("_objects")].toArray().isEmpty(),
+            "Surface launches should upload nothing");
     require(externalSurface[QStringLiteral("offset")].toDouble() == panel.offsetValue(),
             "External surface should carry the offset spinner value");
 
@@ -430,20 +481,6 @@ int main(int argc, char** argv)
     require(wrapJobArgs[QStringLiteral("model-w-unit")].toString() == QStringLiteral("wraps"),
             "New Model launch should send the wraps width unit");
 
-    const QString externalModelPath = tempDir.filePath(QStringLiteral("external_model.pt"));
-    writeFile(externalModelPath, QByteArrayLiteral("external-model"));
-    const QString segNoModelDir = tempDir.filePath(QStringLiteral("sheet_no_model.tifxyz"));
-    require(QDir().mkpath(segNoModelDir), "Failed to create no-model tifxyz segment");
-    writeFile(segNoModelDir + QStringLiteral("/x.tif"), QByteArrayLiteral("x"));
-    writeFile(segNoModelDir + QStringLiteral("/y.tif"), QByteArrayLiteral("y"));
-    writeFile(segNoModelDir + QStringLiteral("/z.tif"), QByteArrayLiteral("z"));
-    writeFile(segNoModelDir + QStringLiteral("/meta.json"),
-              QByteArray(R"({"model_source":")") +
-                  externalModelPath.toUtf8().replace("\\", "\\\\").replace("\"", "\\\"") +
-                  QByteArrayLiteral(R"("})"));
-    auto noModelSurface = std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});
-    noModelSurface->path = std::filesystem::path(segNoModelDir.toStdString());
-    state.setSurface("segmentation", noModelSurface, true);
     panel.startOptimizationAtSeed(
         &state,
         &statusBar,
@@ -452,31 +489,12 @@ int main(int argc, char** argv)
         4,
         5,
         6);
-    QJsonObject modelSourceJobSpec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
-    require(!g_lastLasagnaOptimizationRequest.contains(QStringLiteral("copy_model")),
-            "Re-optimize should not send deprecated copy_model request flag");
-    require(modelSourceJobSpec[QStringLiteral("model")].toObject()[QStringLiteral("type")].toString() ==
-                QStringLiteral("lasagna_model"),
-            "Re-optimize should derive job_spec.model from meta.json model_source when model.pt is absent");
-    bool uploadedModelSource = false;
-    for (const QJsonValue& value : g_lastLasagnaOptimizationRequest[QStringLiteral("_objects")].toArray()) {
-        uploadedModelSource = uploadedModelSource ||
-            value.toObject()[QStringLiteral("object")].toObject()[QStringLiteral("type")].toString() ==
-                QStringLiteral("lasagna_model");
-    }
-    require(uploadedModelSource,
-            "Re-optimize should upload the local model_source model when model.pt is absent");
+    QJsonObject modelJobSpec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
+    require(modelJobSpec[QStringLiteral("model")].toObject()[QStringLiteral("uuid")].toString() ==
+                QString::fromStdString(fittedUuid),
+            "Re-optimize should read the model the fit left with the selected surface");
 
-    const QString segModelRefDir = tempDir.filePath(QStringLiteral("sheet_model_ref.tifxyz"));
-    require(QDir().mkpath(segModelRefDir), "Failed to create model-ref tifxyz segment");
-    writeFile(segModelRefDir + QStringLiteral("/x.tif"), QByteArrayLiteral("x"));
-    writeFile(segModelRefDir + QStringLiteral("/y.tif"), QByteArrayLiteral("y"));
-    writeFile(segModelRefDir + QStringLiteral("/z.tif"), QByteArrayLiteral("z"));
-    writeFile(segModelRefDir + QStringLiteral("/meta.json"),
-              QByteArrayLiteral(R"({"object_refs":{"version":1,"objects":[{"type":"lasagna_model","name":"sheet_model_ref.tifxyz/model.pt","hash":"md5:22222222222222222222222222222222"}]}})"));
-    auto modelRefSurface = std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});
-    modelRefSurface->path = std::filesystem::path(segModelRefDir.toStdString());
-    state.setSurface("segmentation", modelRefSurface, true);
+    state.setSurface("segmentation", openSurface(noModelUuid), true);
     panel.startOptimizationAtSeed(
         &state,
         &statusBar,
@@ -485,41 +503,8 @@ int main(int argc, char** argv)
         4,
         5,
         6);
-    QJsonObject modelRefJobSpec = g_lastLasagnaOptimizationRequest[QStringLiteral("job_spec")].toObject();
-    require(!g_lastLasagnaOptimizationRequest.contains(QStringLiteral("copy_model")),
-            "Re-optimize with model ref should not send deprecated copy_model request flag");
-    require(modelRefJobSpec[QStringLiteral("model")].toObject()[QStringLiteral("hash")].toString() ==
-                QStringLiteral("md5:22222222222222222222222222222222"),
-            "Re-optimize should derive job_spec.model from meta.json object_refs when no local model is present");
-
-    const QString segBrokenModelDir = tempDir.filePath(QStringLiteral("sheet_broken_model.tifxyz"));
-    require(QDir().mkpath(segBrokenModelDir), "Failed to create broken-model tifxyz segment");
-    writeFile(segBrokenModelDir + QStringLiteral("/x.tif"), QByteArrayLiteral("x"));
-    writeFile(segBrokenModelDir + QStringLiteral("/y.tif"), QByteArrayLiteral("y"));
-    writeFile(segBrokenModelDir + QStringLiteral("/z.tif"), QByteArrayLiteral("z"));
-    writeFile(segBrokenModelDir + QStringLiteral("/meta.json"), QByteArrayLiteral("{}"));
-    std::error_code symlinkErr;
-    std::filesystem::create_symlink(
-        std::filesystem::path(tempDir.filePath(QStringLiteral("missing_model.pt")).toStdString()),
-        std::filesystem::path((segBrokenModelDir + QStringLiteral("/model.pt")).toStdString()),
-        symlinkErr);
-    if (!symlinkErr) {
-        auto brokenModelSurface = std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});
-        brokenModelSurface->path = std::filesystem::path(segBrokenModelDir.toStdString());
-        state.setSurface("segmentation", brokenModelSurface, true);
-        panel.startOptimizationAtSeed(
-            &state,
-            &statusBar,
-            SegmentationLasagnaPanel::LasagnaMode::ReOptimize,
-            reoptModelConfigPath,
-            4,
-            5,
-            6);
-        require(statusBar.currentMessage().contains(QStringLiteral("broken symlink")),
-                "Re-optimize should reject a broken local model.pt symlink");
-    } else {
-        std::cerr << "Skipping broken-symlink check: " << symlinkErr.message() << std::endl;
-    }
+    require(statusBar.currentMessage().contains(QStringLiteral("made by a Lasagna fit")),
+            "Re-optimize should reject a surface without a Lasagna model");
 
     state.setSurface("segmentation", surface, true);
 
@@ -584,19 +569,16 @@ int main(int argc, char** argv)
                 [QStringLiteral("init-shell-dir")].toString() ==
                 QStringLiteral("/service/pherc0332/init_shells"),
             "Headless New Model launch should forward initShellDir to fit args");
-    const QString outputPathsDir = volpkgRoot + QStringLiteral("/paths");
-    require(QDir().mkpath(outputPathsDir + QStringLiteral("/my_sheet_v001.tifxyz")),
-            "Failed to create atlas output collision directory");
     panel._submittedOutputNames.clear();
-    panel._submittedOutputNames.insert(QStringLiteral("my_sheet_v002.tifxyz"));
+    panel._submittedOutputNames.insert(QStringLiteral("my_sheet_v002"));
     panel._outputNameEdit->setText(QStringLiteral("my_sheet"));
     panel.startAtlasOptimization(&state, &statusBar);
     QJsonObject atlasRequest = g_lastLasagnaOptimizationRequest;
     require(atlasRequest[QStringLiteral("data_input")].toString() == QStringLiteral("/data/atlas_input.lasagna.json"),
             "Atlas launch should send the selected data_input");
-    require(atlasRequest[QStringLiteral("output_name")].toString() == QStringLiteral("my_sheet_v003.tifxyz"),
+    require(atlasRequest[QStringLiteral("output_name")].toString() == QStringLiteral("my_sheet_v003"),
             "Atlas launch should version the explicit output-name field independently");
-    require(panel._submittedOutputNames.contains(QStringLiteral("my_sheet_v003.tifxyz")),
+    require(panel._submittedOutputNames.contains(QStringLiteral("my_sheet_v003")),
             "Atlas launch should reserve the generated output name");
     require(!atlasRequest.contains(QStringLiteral("single_segment")) &&
                 !atlasRequest.contains(QStringLiteral("copy_model")) &&
@@ -651,12 +633,12 @@ int main(int argc, char** argv)
 
     panel._outputNameEdit->clear();
     panel._submittedOutputNames.clear();
-    panel._submittedOutputNames.insert(QStringLiteral("atlas_v001.tifxyz"));
+    panel._submittedOutputNames.insert(QStringLiteral("atlas_v001"));
     panel.startAtlasOptimization(&state, &statusBar);
     QJsonObject fallbackAtlasRequest = g_lastLasagnaOptimizationRequest;
-    require(fallbackAtlasRequest[QStringLiteral("output_name")].toString() == QStringLiteral("atlas_v002.tifxyz"),
+    require(fallbackAtlasRequest[QStringLiteral("output_name")].toString() == QStringLiteral("atlas_v002"),
             "Atlas launch should fall back to atlas and ignore the selected segment name");
-    require(panel._submittedOutputNames.contains(QStringLiteral("atlas_v002.tifxyz")),
+    require(panel._submittedOutputNames.contains(QStringLiteral("atlas_v002")),
             "Atlas fallback launch should reserve submitted-name collisions");
 
     const QString obsoleteMappingAtlas = volpkgRoot + QStringLiteral("/atlases/obsolete_mapping");

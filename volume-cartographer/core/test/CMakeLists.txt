@@ -195,13 +195,14 @@ vc_add_test(NAME test_lasagna_batch_window
             test_lasagna_service_manager_stub.cpp
             ${lasagna_batch_window_moc}
             ${lasagna_service_manager_moc}
-    LIBS Qt6::Core Qt6::Gui Qt6::Widgets vc_core
+    LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Test vc_core
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D)
 
 qt6_wrap_cpp(segmentation_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/segmentation/panels/SegmentationLasagnaPanel.hpp)
 qt6_wrap_cpp(collapsible_settings_group_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.hpp)
 qt6_wrap_cpp(cstate_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.hpp)
 qt6_wrap_cpp(vccollection_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/core/include/vc/ui/VCCollection.hpp)
+qt6_wrap_cpp(surface_catalog_lasagna_panel_moc ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.hpp)
 vc_add_test(NAME test_segmentation_lasagna_panel_ui
     SOURCES test_segmentation_lasagna_panel_ui.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/segmentation/panels/SegmentationLasagnaPanel.cpp
@@ -210,12 +211,14 @@ vc_add_test(NAME test_segmentation_lasagna_panel_ui
             ${PROJECT_SOURCE_DIR}/apps/VC3D/elements/CollapsibleSettingsGroup.cpp
             ${PROJECT_SOURCE_DIR}/apps/VC3D/CState.cpp
             ${PROJECT_SOURCE_DIR}/core/src/VCCollection.cpp
+            ${PROJECT_SOURCE_DIR}/apps/VC3D/SurfaceCatalog.cpp
             ${segmentation_lasagna_panel_moc}
             ${lasagna_batch_window_moc}
             ${lasagna_service_manager_moc}
             ${collapsible_settings_group_moc}
             ${cstate_lasagna_panel_moc}
             ${vccollection_lasagna_panel_moc}
+            ${surface_catalog_lasagna_panel_moc}
     LIBS vc_object_store::vc_objects Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Concurrent Qt6::Test vc_core vc_atlas
     INCLUDES ${PROJECT_SOURCE_DIR}/apps/VC3D
     DEFS VC_TEST_DISABLE_LASAGNA_DISCOVERY VC_TEST_DISABLE_LASAGNA_DIALOGS)

@@ -265,7 +265,9 @@ private:
     void switchToFiberSliceWorkspace();
     void openLineAnnotationWorkspace(LineAnnotationDialog* dialog, const QString& title);
     void repeatLastLasagnaAction();
-    void selectLasagnaOutputSegment(const QString& outputName);
+    void selectLasagnaOutputSurface(const QString& surfaceUuid);
+    // The active surface's Lasagna results (attached to it in the store).
+    void loadLasagnaResults(Surface* surface);
 
     void UpdateView(void);
     void UpdateVolpkgLabel(int filterCounter);

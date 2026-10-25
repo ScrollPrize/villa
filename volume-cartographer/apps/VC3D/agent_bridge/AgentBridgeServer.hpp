@@ -368,8 +368,6 @@ private:
                                double loss, double overallProgress);
     void handleLasagnaFinished(bool success, const QString& message,
                                const QString& outputPath);
-    void handleLasagnaResultsPlaced(const QString& outputDir,
-                                    const QStringList& segmentNames);
     // Atlas fiber-search lifecycle -> source:"atlas" JobRecord.
     // Only bridge-initiated searches are tracked as jobs: progress for
     // an untracked (human-initiated) search is deliberately NOT auto-registered,

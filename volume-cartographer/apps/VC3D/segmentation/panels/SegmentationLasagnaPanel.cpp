@@ -3,6 +3,7 @@
 #include "CState.hpp"
 #include "LasagnaBatchWindow.hpp"
 #include "LasagnaServiceManager.hpp"
+#include "SurfaceCatalog.hpp"
 #include "VCSettings.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
 #include "vc/core/types/Volume.hpp"
@@ -25,6 +26,7 @@
 #include <QFrame>
 #include <QDoubleSpinBox>
 #include <QHash>
+#include <QRegularExpression>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QJsonArray>
@@ -142,39 +144,6 @@ QJsonObject bytesArtifact(const QByteArray& bytes,
     return upload;
 }
 
-QJsonObject modelArtifactForPath(const std::filesystem::path& modelPath,
-                                 const QString& refName,
-                                 qint64* rawBytes)
-{
-    QFile f(QString::fromStdString(modelPath.string()));
-    if (!f.open(QIODevice::ReadOnly)) {
-        return {};
-    }
-    const QByteArray bytes = f.readAll();
-    if (rawBytes) {
-        *rawBytes += bytes.size();
-    }
-    QJsonObject upload;
-    upload[QStringLiteral("object")] = makeObjectRef(
-        QStringLiteral("lasagna_model"), refName, md5Ref(bytes));
-    upload[QStringLiteral("_local_payload")] = QStringLiteral("file");
-    upload[QStringLiteral("_local_path")] = QString::fromStdString(modelPath.string());
-    return upload;
-}
-
-QJsonObject segmentArtifactForPath(const std::filesystem::path& segPath,
-                                   const QString& objectType,
-                                   const QString& objectFormat,
-                                   qint64* rawBytes,
-                                   int* fileCount);
-
-QJsonObject segmentArtifactForPath(const std::filesystem::path& segPath,
-                                   qint64* rawBytes,
-                                   int* fileCount)
-{
-    return segmentArtifactForPath(segPath, QStringLiteral("tifxyz_segment"), QString(), rawBytes, fileCount);
-}
-
 QJsonObject segmentArtifactForPath(const std::filesystem::path& segPath,
                                    const QString& objectType,
                                    const QString& objectFormat,
@@ -224,85 +193,6 @@ QJsonObject segmentArtifactForPath(const std::filesystem::path& segPath,
     return upload;
 }
 
-QJsonArray linkedSurfacesFromMeta(const std::filesystem::path& segPath)
-{
-    QFile metaFile(QString::fromStdString((segPath / "meta.json").string()));
-    if (!metaFile.open(QIODevice::ReadOnly)) {
-        return {};
-    }
-    const QJsonObject meta = QJsonDocument::fromJson(metaFile.readAll()).object();
-    const QJsonObject job = meta[QStringLiteral("lasagna_job")].toObject();
-    QJsonArray links = job[QStringLiteral("linked_surfaces")].toArray();
-    if (!links.isEmpty()) {
-        return links;
-    }
-    links = meta[QStringLiteral("job_spec")].toObject()[QStringLiteral("linked_surfaces")].toArray();
-    if (!links.isEmpty()) {
-        return links;
-    }
-    return meta[QStringLiteral("linked_surfaces")].toArray();
-}
-
-QJsonObject segmentMetaFromPath(const std::filesystem::path& segPath)
-{
-    QFile metaFile(QString::fromStdString((segPath / "meta.json").string()));
-    if (!metaFile.open(QIODevice::ReadOnly)) {
-        return {};
-    }
-    return QJsonDocument::fromJson(metaFile.readAll()).object();
-}
-
-QJsonObject objectRefsFromMeta(const std::filesystem::path& segPath)
-{
-    return segmentMetaFromPath(segPath)[QStringLiteral("object_refs")].toObject();
-}
-
-QJsonObject firstObjectRefOfType(const QJsonObject& objectRefs, const QString& type)
-{
-    for (const QJsonValue& value : objectRefs[QStringLiteral("objects")].toArray()) {
-        const QJsonObject ref = value.toObject();
-        if (ref[QStringLiteral("type")].toString() == type &&
-            !ref[QStringLiteral("name")].toString().isEmpty() &&
-            !ref[QStringLiteral("hash")].toString().isEmpty()) {
-            return ref;
-        }
-    }
-    return {};
-}
-
-QJsonObject modelRefFromMeta(const QJsonObject& meta)
-{
-    QJsonObject ref = meta[QStringLiteral("lasagna_job")].toObject()[QStringLiteral("model")].toObject();
-    if (!ref.isEmpty()) {
-        return ref;
-    }
-    ref = meta[QStringLiteral("job_spec")].toObject()[QStringLiteral("model")].toObject();
-    if (!ref.isEmpty()) {
-        return ref;
-    }
-    return firstObjectRefOfType(meta[QStringLiteral("object_refs")].toObject(), QStringLiteral("lasagna_model"));
-}
-
-QString localModelPathFromMeta(const std::filesystem::path& segPath, const QJsonObject& meta)
-{
-    const QString source = meta[QStringLiteral("model_source")].toString().trimmed();
-    if (source.isEmpty()) {
-        return {};
-    }
-    std::filesystem::path path(source.toStdString());
-    if (path.is_relative()) {
-        path = segPath / path;
-    }
-    if (!std::filesystem::exists(path) || !std::filesystem::is_regular_file(path)) {
-        return {};
-    }
-    try {
-        return QString::fromStdString(std::filesystem::canonical(path).string());
-    } catch (const std::filesystem::filesystem_error&) {
-        return QString::fromStdString(std::filesystem::absolute(path).lexically_normal().string());
-    }
-}
-
 QStringList linkedSurfaceNamesFromRefs(const QJsonArray& refs)
 {
     QStringList names;
@@ -333,43 +223,6 @@ QJsonArray volumeShapeZyxForState(CState* state)
     };
 }
 
-std::filesystem::path outputSegmentsPathForState(CState* state)
-{
-    if (!state || !state->vpkg()) {
-        return {};
-    }
-    std::filesystem::path path = state->vpkg()->outputSegmentsPath();
-    if (path.empty()) {
-        path = state->vpkg()->findSegmentPathByName(
-            state->vpkg()->getSegmentationDirectory());
-    }
-    if (path.empty()) {
-        const auto vpkgRoot = std::filesystem::path(state->vpkg()->getVolpkgDirectory());
-        path = vpkgRoot / "paths";
-    }
-    if (path.empty()) {
-        return {};
-    }
-    return std::filesystem::absolute(path).lexically_normal();
-}
-
-std::filesystem::path selectedSegmentPathForState(CState* state)
-{
-    const std::filesystem::path outputSegmentsPath = outputSegmentsPathForState(state);
-    if (!state) {
-        return {};
-    }
-    auto activeSurface = std::dynamic_pointer_cast<QuadSurface>(state->surface("segmentation"));
-    if (!activeSurface || activeSurface->path.empty()) {
-        return {};
-    }
-    std::filesystem::path segPath = activeSurface->path;
-    if (segPath.is_relative() && !outputSegmentsPath.empty()) {
-        segPath = outputSegmentsPath / segPath.filename();
-    }
-    return segPath;
-}
-
 std::filesystem::path volpkgRootForState(CState* state)
 {
     if (!state || !state->vpkg()) {
@@ -382,69 +235,84 @@ std::filesystem::path volpkgRootForState(CState* state)
     return std::filesystem::absolute(dir).lexically_normal();
 }
 
-QString versionedTifxyzOutputName(const QString& baseNameIn,
-                                  const QString& outputDir,
-                                  const QSet<QString>& submittedOutputNames)
+// A stored surface for a Lasagna job: the service reads it from the store by
+// UUID (at `revision` when given); the name is for display.
+QJsonObject surfaceRef(const std::string& uuid, const std::string& name,
+                       const std::optional<std::string>& revision = std::nullopt)
 {
-    const std::string tifxyzSuffix = ".tifxyz";
-    QString rootNameQt = baseNameIn.trimmed();
-    if (rootNameQt.endsWith(QString::fromStdString(tifxyzSuffix))) {
-        rootNameQt.chop(static_cast<int>(tifxyzSuffix.size()));
+    QJsonObject ref;
+    ref[QStringLiteral("type")] = QStringLiteral("surface");
+    ref[QStringLiteral("uuid")] = QString::fromStdString(uuid);
+    ref[QStringLiteral("name")] = QString::fromStdString(name);
+    if (revision) {
+        ref[QStringLiteral("revision")] = QString::fromStdString(*revision);
     }
-    if (rootNameQt.isEmpty()) {
-        rootNameQt = QStringLiteral("atlas");
-    }
-    const std::string rootName = rootNameQt.toStdString();
+    return ref;
+}
 
-    int maxVersion = 0;
-    if (!outputDir.isEmpty()) {
-        std::error_code ec;
-        for (auto& entry : std::filesystem::directory_iterator(outputDir.toStdString(), ec)) {
-            const std::string name = entry.path().filename().string();
-            const std::string prefix = rootName + "_v";
-            if (name.size() > prefix.size() + tifxyzSuffix.size() &&
-                name.compare(0, prefix.size(), prefix) == 0 &&
-                name.compare(name.size() - tifxyzSuffix.size(),
-                             tifxyzSuffix.size(), tifxyzSuffix) == 0) {
-                const std::string numStr = name.substr(
-                    prefix.size(),
-                    name.size() - prefix.size() - tifxyzSuffix.size());
-                bool allDigits = !numStr.empty();
-                for (char c : numStr) {
-                    if (!std::isdigit(static_cast<unsigned char>(c))) {
-                        allDigits = false;
-                        break;
-                    }
-                }
-                if (allDigits) {
-                    const int version = std::stoi(numStr);
-                    if (version > maxVersion) {
-                        maxVersion = version;
-                    }
-                }
+// The name a result of `name` is versioned from: without its _vNNN version
+// and _off<N> offset suffixes.
+QString lasagnaRootName(QString name)
+{
+    static const QRegularExpression version(QStringLiteral("_v\\d+$"));
+    name.remove(version);
+    const int offset = name.indexOf(QStringLiteral("_off"));
+    return offset >= 0 ? name.left(offset) : name;
+}
+
+// The first free `<root><infix><N>` (N from 1), or after the highest taken
+// version when `afterHighest` (root_v001, root_v002, ...).
+QString nextOutputName(const QString& root, const QString& infix, const QSet<QString>& taken,
+                       bool afterHighest, int width)
+{
+    int next = 1;
+    if (afterHighest) {
+        const QRegularExpression pattern(
+            QStringLiteral("^%1%2(\\d+)$").arg(QRegularExpression::escape(root), QRegularExpression::escape(infix)));
+        for (const QString& name : taken) {
+            if (const auto match = pattern.match(name); match.hasMatch()) {
+                next = std::max(next, match.captured(1).toInt() + 1);
             }
         }
     }
+    const auto candidate = [&](int n) {
+        return root + infix + QStringLiteral("%1").arg(n, width, 10, QLatin1Char('0'));
+    };
+    while (taken.contains(candidate(next))) {
+        ++next;
+    }
+    return candidate(next);
+}
 
-    const QString versionPrefix = QString::fromStdString(rootName + "_v");
-    const QString suffix = QString::fromStdString(tifxyzSuffix);
-    for (const QString& reserved : submittedOutputNames) {
-        if (!reserved.startsWith(versionPrefix) || !reserved.endsWith(suffix)) {
-            continue;
-        }
-        const QString numStr = reserved.mid(
-            versionPrefix.size(),
-            reserved.size() - versionPrefix.size() - suffix.size());
-        bool ok = false;
-        const int version = numStr.toInt(&ok);
-        if (ok && version > maxVersion) {
-            maxVersion = version;
+// The segmentation surface's catalog row, when it is a stored surface.
+const SurfaceCatalog::Row* activeSurfaceRow(CState* state, const SurfaceCatalog* catalog)
+{
+    const auto active = state && catalog ? state->surface("segmentation") : nullptr;
+    return active ? catalog->row(active->id) : nullptr;
+}
+
+QJsonObject recordMeta(const SurfaceCatalog::Row& row)
+{
+    return QJsonDocument::fromJson(QByteArray::fromStdString(row.record.meta)).object();
+}
+
+// The surfaces a job of `row` reads: those its own Lasagna job read, else itself.
+QJsonArray linkedSurfacesOf(const SurfaceCatalog::Row& row)
+{
+    QJsonArray links = recordMeta(row)[QStringLiteral("lasagna_job")].toObject()[QStringLiteral("linked_surfaces")].toArray();
+    return links.isEmpty() ? QJsonArray{surfaceRef(row.record.uuid, row.record.name)} : links;
+}
+
+// Names outputs must not reuse: the volume's surfaces and outputs already requested.
+QSet<QString> takenOutputNames(const SurfaceCatalog* catalog, const QSet<QString>& submitted)
+{
+    QSet<QString> taken = submitted;
+    if (catalog) {
+        for (const auto& [uuid, row] : catalog->rows()) {
+            taken.insert(QString::fromStdString(row.record.name));
         }
     }
-
-    char numBuf[16];
-    std::snprintf(numBuf, sizeof(numBuf), "_v%03d", maxVersion + 1);
-    return QString::fromStdString(rootName + numBuf + tifxyzSuffix);
+    return taken;
 }
 
 QString safeAtlasObjectName(const QString& atlasName, const QString& relPath, const QString& fallback)
@@ -1452,7 +1320,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         syncCompactStatusFromFull();
     });
     connect(&mgr, &LasagnaServiceManager::optimizationFinished, this,
-            [this](const QString& outputDir) {
+            [this](const QStringList& surfaceUuids) {
         if (_stopBtn) _stopBtn->setEnabled(false);
         if (_newModelBtn) _newModelBtn->setEnabled(true);
         if (_reoptBtn) _reoptBtn->setEnabled(true);
@@ -1460,7 +1328,12 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         if (_atlasBtn) _atlasBtn->setEnabled(true);
         if (_progressBar) _progressBar->setVisible(false);
         if (_progressLabel) {
-            _progressLabel->setText(tr("Optimization finished. Output: %1").arg(outputDir));
+            QStringList names;
+            for (const QString& uuid : surfaceUuids) {
+                const auto* row = _surfaceCatalog ? _surfaceCatalog->row(uuid.toStdString()) : nullptr;
+                names.append(row ? QString::fromStdString(row->record.name) : uuid);
+            }
+            _progressLabel->setText(tr("Optimization finished. Output: %1").arg(names.join(QStringLiteral(", "))));
             _progressLabel->setStyleSheet(QStringLiteral("color: #27ae60;"));
             _progressLabel->setVisible(true);
         }
@@ -1808,17 +1681,17 @@ void SegmentationLasagnaPanel::updateLinkedSurfaceTables()
 
 QStringList SegmentationLasagnaPanel::currentLinkedSurfaceNames() const
 {
-    const std::filesystem::path segPath = selectedSegmentPathForState(_state);
-    if (segPath.empty()) {
-        return {};
-    }
+    const auto* row = activeSurfaceRow(_state, _surfaceCatalog);
+    return row ? linkedSurfaceNamesFromRefs(linkedSurfacesOf(*row)) : QStringList{};
+}
 
-    const QStringList storedNames = linkedSurfaceNamesFromRefs(linkedSurfacesFromMeta(segPath));
-    if (!storedNames.isEmpty()) {
-        return storedNames;
+void SegmentationLasagnaPanel::setSurfaceCatalog(SurfaceCatalog* catalog)
+{
+    _surfaceCatalog = catalog;
+    if (catalog) {
+        connect(catalog, &SurfaceCatalog::rowsChanged, this, &SegmentationLasagnaPanel::updateLinkedSurfaceTables);
     }
-
-    return {QString::fromStdString(segPath.filename().string())};
+    updateLinkedSurfaceTables();
 }
 
 // ---------------------------------------------------------------------------
@@ -2305,15 +2178,15 @@ SegmentationLasagnaPanel::startAtlasOptimization(
         return SubmissionResult::failure(error);
     }
 
-    QString outputDir;
-    const std::filesystem::path outputSegmentsPath = outputSegmentsPathForState(state);
-    if (!outputSegmentsPath.empty()) {
-        outputDir = QString::fromStdString(outputSegmentsPath.string());
+    const QString requestedName = newModelOutputName().trimmed();
+    const QString outputName = nextOutputName(
+        lasagnaRootName(requestedName.isEmpty() ? QStringLiteral("atlas") : requestedName), QStringLiteral("_v"),
+        takenOutputNames(_surfaceCatalog, _submittedOutputNames), true, 3);
+    if (!_surfaceCatalog || !_surfaceCatalog->volume()) {
+        const QString msg = tr("Lasagna needs an attached object store and an open volume.");
+        showStatus(msg, 5000);
+        return SubmissionResult::failure(msg);
     }
-    const QString outputName = versionedTifxyzOutputName(
-        newModelOutputName(),
-        outputDir,
-        _submittedOutputNames);
 
     QJsonObject jobSpec;
     jobSpec[QStringLiteral("config")] = config;
@@ -2323,6 +2196,7 @@ SegmentationLasagnaPanel::startAtlasOptimization(
     request[QStringLiteral("data_input")] = dataInput;
     request[QStringLiteral("config_name")] = QFileInfo(_atlasConfigFilePath).fileName();
     request[QStringLiteral("output_name")] = outputName;
+    request[QStringLiteral("volume_uuid")] = QString::fromStdString(_surfaceCatalog->volume()->id());
     request[QStringLiteral("config")] = config;
     request[QStringLiteral("job_spec")] = jobSpec;
     request[QStringLiteral("_objects")] = artifacts.uploads;
@@ -2336,7 +2210,7 @@ SegmentationLasagnaPanel::startAtlasOptimization(
               << " raw=" << bytesToMiB(artifacts.rawBytes) << " MiB"
               << std::endl;
 
-    mgr.startOptimization(request, outputDir);
+    mgr.startOptimization(request);
     _submittedOutputNames.insert(outputName);
     showStatus(tr("Lasagna atlas optimization started. Output: %1").arg(outputName), 3000);
     return SubmissionResult::success();
@@ -2405,152 +2279,28 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
     QElapsedTimer prepTimer;
     prepTimer.start();
 
-    std::filesystem::path outputSegmentsPath;
-    if (state && state->vpkg()) {
-        outputSegmentsPath = state->vpkg()->outputSegmentsPath();
-        if (outputSegmentsPath.empty()) {
-            outputSegmentsPath = state->vpkg()->findSegmentPathByName(
-                state->vpkg()->getSegmentationDirectory());
-        }
-        if (outputSegmentsPath.empty()) {
-            auto vpkgRoot = std::filesystem::path(state->vpkg()->getVolpkgDirectory());
-            outputSegmentsPath = vpkgRoot / "paths";
-        }
-        outputSegmentsPath = std::filesystem::absolute(outputSegmentsPath).lexically_normal();
+    if (!_surfaceCatalog || !_surfaceCatalog->attachment() || !_surfaceCatalog->volume()) {
+        auto msg = tr("Lasagna needs an attached object store and an open volume.");
+        showStatus(msg, 5000);
+        return SubmissionResult::failure(msg);
     }
-
-    std::filesystem::path segPath;
-    if (state) {
-        auto activeSurface = std::dynamic_pointer_cast<QuadSurface>(state->surface("segmentation"));
-        if (activeSurface && !activeSurface->path.empty()) {
-            segPath = activeSurface->path;
-            if (segPath.is_relative() && !outputSegmentsPath.empty()) {
-                segPath = outputSegmentsPath / segPath.filename();
-            }
-        }
-    }
-
+    // The segmentation surface is the job's input and, for re-optimization,
+    // the source of its model (left with it in the store by the fit that made it).
+    const SurfaceCatalog::Row* activeRow = activeSurfaceRow(state, _surfaceCatalog);
     const bool isOffsetMode = (launchMode == LasagnaMode::Offset);
+    const std::string activeUuid = activeRow ? activeRow->record.uuid : std::string{};
+    const bool hasModel = activeRow && mgr.surfaceModel(activeUuid).has_value();
 
-    const QJsonObject selectedSegmentMeta = !segPath.empty() ? segmentMetaFromPath(segPath) : QJsonObject{};
-    const QJsonObject inheritedModelRef = modelRefFromMeta(selectedSegmentMeta);
-    QString modelPath;
-    QString brokenModelSymlinkTarget;
-    if (!segPath.empty()) {
-        auto modelFile = segPath / "model.pt";
-        if (std::filesystem::exists(modelFile)) {
-            try {
-                modelPath = QString::fromStdString(std::filesystem::canonical(modelFile).string());
-            } catch (const std::filesystem::filesystem_error&) {
-            }
-        } else {
-            std::error_code symlinkEc;
-            if (std::filesystem::is_symlink(modelFile, symlinkEc)) {
-                std::error_code readEc;
-                const auto target = std::filesystem::read_symlink(modelFile, readEc);
-                brokenModelSymlinkTarget = readEc
-                    ? QStringLiteral("(unreadable symlink target)")
-                    : QString::fromStdString(target.string());
-            }
+    QString rootName = QStringLiteral("new_model");
+    if (isNewModel) {
+        if (const QString nmName = newModelOutputName().trimmed(); !nmName.isEmpty()) {
+            rootName = lasagnaRootName(nmName);
         }
-        if (modelPath.isEmpty() && !selectedSegmentMeta.isEmpty()) {
-            modelPath = localModelPathFromMeta(segPath, selectedSegmentMeta);
-        }
+    } else if (activeRow) {
+        rootName = lasagnaRootName(QString::fromStdString(activeRow->record.name));
     }
-
-    QString outputDir;
-    if (!outputSegmentsPath.empty()) {
-        outputDir = QString::fromStdString(outputSegmentsPath.string());
-    } else if (!segPath.empty()) {
-        outputDir = QString::fromStdString(
-            std::filesystem::absolute(segPath.parent_path()).lexically_normal().string());
-    }
-
-    const std::string tifxyzSuffix = ".tifxyz";
-    std::string rootName = "new_model";
-    QString outputName;
-    {
-        if (isNewModel) {
-            QString nmName = newModelOutputName();
-            if (!nmName.isEmpty()) {
-                rootName = nmName.toStdString();
-            }
-        } else if (!segPath.empty()) {
-            auto segName = segPath.filename().string();
-            std::string baseName = segName;
-            if (baseName.size() > tifxyzSuffix.size() &&
-                baseName.compare(baseName.size() - tifxyzSuffix.size(),
-                                 tifxyzSuffix.size(), tifxyzSuffix) == 0) {
-                baseName = baseName.substr(0, baseName.size() - tifxyzSuffix.size());
-            }
-            rootName = baseName;
-            if (rootName.size() > 5) {
-                auto pos = rootName.rfind("_v");
-                if (pos != std::string::npos && pos + 2 < rootName.size()) {
-                    bool allDigits = true;
-                    for (size_t i = pos + 2; i < rootName.size(); ++i) {
-                        if (!std::isdigit(static_cast<unsigned char>(rootName[i]))) {
-                            allDigits = false;
-                            break;
-                        }
-                    }
-                    if (allDigits) {
-                        rootName = rootName.substr(0, pos);
-                    }
-                }
-            }
-            auto pos = rootName.find("_off");
-            if (pos != std::string::npos) {
-                rootName = rootName.substr(0, pos);
-            }
-        }
-
-        int maxVersion = 0;
-        if (!outputDir.isEmpty()) {
-            std::error_code ec;
-            for (auto& entry : std::filesystem::directory_iterator(outputDir.toStdString(), ec)) {
-                auto name = entry.path().filename().string();
-                std::string prefix = rootName + "_v";
-                if (name.size() > prefix.size() + tifxyzSuffix.size() &&
-                    name.compare(0, prefix.size(), prefix) == 0 &&
-                    name.compare(name.size() - tifxyzSuffix.size(),
-                                 tifxyzSuffix.size(), tifxyzSuffix) == 0) {
-                    auto numStr = name.substr(prefix.size(),
-                        name.size() - prefix.size() - tifxyzSuffix.size());
-                    bool allDigits = true;
-                    for (auto c : numStr) {
-                        if (!std::isdigit(static_cast<unsigned char>(c))) {
-                            allDigits = false;
-                        }
-                    }
-                    if (allDigits && !numStr.empty()) {
-                        int v = std::stoi(numStr);
-                        if (v > maxVersion) {
-                            maxVersion = v;
-                        }
-                    }
-                }
-            }
-        }
-        const QString versionPrefix = QString::fromStdString(rootName + "_v");
-        for (const QString& reserved : std::as_const(_submittedOutputNames)) {
-            if (!reserved.startsWith(versionPrefix) ||
-                !reserved.endsWith(QString::fromStdString(tifxyzSuffix))) {
-                continue;
-            }
-            const QString numStr = reserved.mid(
-                versionPrefix.size(),
-                reserved.size() - versionPrefix.size() - static_cast<int>(tifxyzSuffix.size()));
-            bool ok = false;
-            const int version = numStr.toInt(&ok);
-            if (ok && version > maxVersion) {
-                maxVersion = version;
-            }
-        }
-        char numBuf[16];
-        std::snprintf(numBuf, sizeof(numBuf), "_v%03d", maxVersion + 1);
-        outputName = QString::fromStdString(rootName + numBuf + ".tifxyz");
-    }
+    const QSet<QString> takenNames = takenOutputNames(_surfaceCatalog, _submittedOutputNames);
+    QString outputName = nextOutputName(rootName, QStringLiteral("_v"), takenNames, true, 3);
 
     QJsonObject config;
     QString configText;
@@ -2643,29 +2393,8 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
               << " windings/depth=" << nmN
               << " offset=" << offsetVal << std::endl;
 
-    if (isOffsetMode && !segPath.empty()) {
-
-        if (!outputDir.isEmpty()) {
-            int offIdx = 1;
-            std::error_code ec2;
-            for (bool collision = true; collision; ++offIdx) {
-                collision = false;
-                const std::string offName = rootName + "_off" + std::to_string(offIdx) + tifxyzSuffix;
-                if (_submittedOutputNames.contains(QString::fromStdString(offName))) {
-                    collision = true;
-                    continue;
-                }
-                for (auto& entry : std::filesystem::directory_iterator(outputDir.toStdString(), ec2)) {
-                    auto name = entry.path().filename().string();
-                    if (name == offName) {
-                        collision = true;
-                        break;
-                    }
-                }
-            }
-            outputName = QString::fromStdString(rootName + "_off" + std::to_string(offIdx - 1) + tifxyzSuffix);
-        }
-
+    if (isOffsetMode && activeRow) {
+        outputName = nextOutputName(rootName, QStringLiteral("_off"), takenNames, false, 1);
         std::cerr << "[lasagna] offset mode: offset=" << offsetVal
                   << " outputName=" << outputName.toStdString() << std::endl;
     }
@@ -2702,17 +2431,9 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
     }
     const QJsonArray volumeShapeZyx = volumeShapeZyxForState(state);
     const QString modelInit = args[QStringLiteral("model-init")].toString().trimmed().toLower();
-    if (!isNewModel &&
-        modelInit == QStringLiteral("model") &&
-        modelPath.isEmpty() &&
-        inheritedModelRef.isEmpty()) {
-        auto msg = tr("Re-optimize requires a model.pt or a Lasagna model object ref in the selected segment metadata.");
-        if (!brokenModelSymlinkTarget.isEmpty()) {
-            msg = tr("Re-optimize cannot use model.pt because it is a broken symlink to %1. Re-run/export the segment so model.pt is copied, or use a segment with a Lasagna model object ref.")
-                .arg(brokenModelSymlinkTarget);
-        }
-        std::cerr << "[lasagna] " << msg.toStdString()
-                  << " segment=" << segPath.string() << std::endl;
+    if (!isNewModel && modelInit == QStringLiteral("model") && !hasModel) {
+        auto msg = tr("Re-optimize needs a surface made by a Lasagna fit (one with its model in the object store).");
+        std::cerr << "[lasagna] " << msg.toStdString() << " surface=" << activeUuid << std::endl;
         showStatus(msg, 7000);
         return SubmissionResult::failure(msg);
     }
@@ -2721,185 +2442,57 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
     request[QStringLiteral("data_input")] = dataInput;
     request[QStringLiteral("single_segment")] = true;
     request[QStringLiteral("config_name")] = QFileInfo(configPath).fileName();
-    if (!outputName.isEmpty()) {
-        request[QStringLiteral("output_name")] = outputName;
-    }
+    request[QStringLiteral("output_name")] = outputName;
+    request[QStringLiteral("volume_uuid")] = QString::fromStdString(_surfaceCatalog->volume()->id());
     if (!volumeShapeZyx.isEmpty()) {
         request[QStringLiteral("volume_shape_zyx")] = volumeShapeZyx;
     }
     QJsonObject jobSpec;
     QJsonArray objectUploads;
     QJsonArray linkedSurfaces;
-    const bool sendModelData = !isNewModel && !modelPath.isEmpty();
-    const bool sendTifxyz = !segPath.empty();
-    qint64 rawTifxyzBytes = 0;
-    int tifxyzFileCount = 0;
-    qint64 rawModelBytes = 0;
-    std::cerr << "[lasagna] request payload: send_model="
-              << (sendModelData ? "yes" : "no")
-              << " send_tifxyz=" << (sendTifxyz ? "yes" : "no")
-              << std::endl;
-
-    auto appendUploadIfNew = [&](const QJsonObject& upload) {
-        const QJsonObject ref = upload[QStringLiteral("object")].toObject();
-        if (ref.isEmpty()) {
-            return;
-        }
-        const QString key = ref[QStringLiteral("type")].toString() + QStringLiteral("\n")
-            + ref[QStringLiteral("name")].toString() + QStringLiteral("\n")
-            + ref[QStringLiteral("hash")].toString();
-        for (const QJsonValue& existingValue : objectUploads) {
-            const QJsonObject existingRef = existingValue.toObject()[QStringLiteral("object")].toObject();
-            const QString existingKey = existingRef[QStringLiteral("type")].toString() + QStringLiteral("\n")
-                + existingRef[QStringLiteral("name")].toString() + QStringLiteral("\n")
-                + existingRef[QStringLiteral("hash")].toString();
-            if (existingKey == key) {
-                return;
+    if (activeRow) {
+        // The job reads the revision on screen now; earlier links read their current one.
+        std::optional<std::string> revision;
+        _surfaceCatalog->session()->read(*_surfaceCatalog->attachment(), [&](const auto& db, const auto& txn, const auto&) {
+            if (const auto head = db.currentGeometry(txn, activeUuid)) revision = head->uuid;
+        });
+        linkedSurfaces = linkedSurfacesOf(*activeRow);
+        for (qsizetype i = 0; i < linkedSurfaces.size(); ++i) {
+            QJsonObject link = linkedSurfaces[i].toObject();
+            if (link[QStringLiteral("uuid")].toString() == QString::fromStdString(activeUuid) && revision) {
+                link[QStringLiteral("revision")] = QString::fromStdString(*revision);
+                linkedSurfaces[i] = link;
             }
         }
-        objectUploads.append(upload);
-    };
-    auto appendDirectoryCandidateForRef = [&](const QJsonObject& ref,
-                                              const std::filesystem::path& localPath) {
-        const QString type = ref[QStringLiteral("type")].toString();
-        const QString format = ref[QStringLiteral("format")].toString();
-        qint64 extraBytes = 0;
-        int extraFiles = 0;
-        QJsonObject upload = segmentArtifactForPath(localPath, type, format, &extraBytes, &extraFiles);
-        QJsonObject uploadRef = upload[QStringLiteral("object")].toObject();
-        if (upload.isEmpty() || uploadRef[QStringLiteral("hash")].toString() != ref[QStringLiteral("hash")].toString()) {
-            return;
-        }
-        uploadRef[QStringLiteral("name")] = ref[QStringLiteral("name")].toString();
-        upload[QStringLiteral("object")] = uploadRef;
-        rawTifxyzBytes += extraBytes;
-        tifxyzFileCount += extraFiles;
-        appendUploadIfNew(upload);
-    };
-    auto appendFileCandidateForRef = [&](const QJsonObject& ref,
-                                         const std::filesystem::path& localPath) {
-        const QString type = ref[QStringLiteral("type")].toString();
-        const QString format = ref[QStringLiteral("format")].toString();
-        QFile f(QString::fromStdString(localPath.string()));
-        if (!f.open(QIODevice::ReadOnly)) {
-            return;
-        }
-        const QByteArray bytes = f.readAll();
-        if (md5Ref(bytes) != ref[QStringLiteral("hash")].toString()) {
-            return;
-        }
-        QJsonObject upload;
-        upload[QStringLiteral("object")] = makeObjectRef(
-            type,
-            ref[QStringLiteral("name")].toString(),
-            ref[QStringLiteral("hash")].toString(),
-            format);
-        upload[QStringLiteral("_local_payload")] = QStringLiteral("file");
-        upload[QStringLiteral("_local_path")] = QString::fromStdString(localPath.string());
-        rawModelBytes += bytes.size();
-        appendUploadIfNew(upload);
-    };
 
-    if (sendTifxyz) {
-        QJsonObject currentSegmentUpload = segmentArtifactForPath(segPath, &rawTifxyzBytes, &tifxyzFileCount);
-        if (currentSegmentUpload.isEmpty()) {
-            auto msg = tr("Cannot pack selected tifxyz segment for Lasagna artifact sync.");
-            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-            showStatus(msg, 5000);
-            return SubmissionResult::failure(msg);
-        }
-
-        linkedSurfaces = linkedSurfacesFromMeta(segPath);
-        if (linkedSurfaces.isEmpty()) {
-            linkedSurfaces.append(currentSegmentUpload[QStringLiteral("object")].toObject());
-            appendUploadIfNew(currentSegmentUpload);
-        } else if (!outputSegmentsPath.empty()) {
-            for (const QJsonValue& value : linkedSurfaces) {
-                const QJsonObject ref = value.toObject();
-                const QString name = ref[QStringLiteral("name")].toString();
-                if (name.isEmpty()) {
-                    continue;
-                }
-                std::filesystem::path localPath = outputSegmentsPath / name.toStdString();
-                if (std::filesystem::exists(localPath) && std::filesystem::is_directory(localPath)) {
-                    qint64 extraBytes = 0;
-                    int extraFiles = 0;
-                    QJsonObject upload = segmentArtifactForPath(localPath, &extraBytes, &extraFiles);
-                    if (!upload.isEmpty() &&
-                        upload[QStringLiteral("object")].toObject()[QStringLiteral("hash")].toString()
-                            == ref[QStringLiteral("hash")].toString()) {
-                        rawTifxyzBytes += extraBytes;
-                        tifxyzFileCount += extraFiles;
-                        appendUploadIfNew(upload);
-                    }
-                }
+        // A re-optimized atlas fit refers to its atlas objects: send them again.
+        const QJsonObject inheritedObjectRefs = recordMeta(*activeRow)[QStringLiteral("object_refs")].toObject();
+        if (!inheritedObjectRefs.isEmpty()) {
+            jobSpec[QStringLiteral("object_refs")] = inheritedObjectRefs;
+            QSet<QString> inheritedRefKeys;
+            for (const QJsonValue& value : inheritedObjectRefs[QStringLiteral("objects")].toArray()) {
+                inheritedRefKeys.insert(objectRefKeyForUpload(value.toObject()));
             }
-        }
-    }
-    const QJsonObject inheritedObjectRefs = sendTifxyz
-        ? selectedSegmentMeta[QStringLiteral("object_refs")].toObject()
-        : QJsonObject{};
-    if (!inheritedObjectRefs.isEmpty()) {
-        jobSpec[QStringLiteral("object_refs")] = inheritedObjectRefs;
-        QSet<QString> inheritedRefKeys;
-        for (const QJsonValue& value : inheritedObjectRefs[QStringLiteral("objects")].toArray()) {
-            const QJsonObject ref = value.toObject();
-            inheritedRefKeys.insert(objectRefKeyForUpload(ref));
-            const QString type = ref[QStringLiteral("type")].toString();
-            const QString name = ref[QStringLiteral("name")].toString();
-            if (type == QStringLiteral("tifxyz_segment") || type == QStringLiteral("atlas-base")) {
-                if (name.isEmpty() || outputSegmentsPath.empty()) {
-                    continue;
-                }
-                const std::filesystem::path localPath = outputSegmentsPath / name.toStdString();
-                if (std::filesystem::exists(localPath) && std::filesystem::is_directory(localPath)) {
-                    appendDirectoryCandidateForRef(ref, localPath);
-                }
-            } else if (type == QStringLiteral("lasagna_model") && !modelPath.isEmpty()) {
-                appendFileCandidateForRef(ref, std::filesystem::path(modelPath.toStdString()));
-            }
-        }
-        if (!_atlasDirPath.isEmpty()) {
             AtlasRequestArtifacts atlasArtifacts;
             QString atlasError;
-            if (buildAtlasRequestArtifacts(
-                    std::filesystem::path(_atlasDirPath.toStdString()),
-                    volpkgRootForState(state),
-                    &atlasArtifacts,
-                    &atlasError, state->objectStoreSession())) {
+            if (!_atlasDirPath.isEmpty() &&
+                buildAtlasRequestArtifacts(std::filesystem::path(_atlasDirPath.toStdString()), volpkgRootForState(state),
+                                           &atlasArtifacts, &atlasError, state->objectStoreSession())) {
                 for (const QJsonValue& value : atlasArtifacts.uploads) {
-                    const QJsonObject upload = value.toObject();
-                    const QJsonObject ref = upload[QStringLiteral("object")].toObject();
-                    if (inheritedRefKeys.contains(objectRefKeyForUpload(ref))) {
-                        appendUploadIfNew(upload);
+                    if (inheritedRefKeys.contains(objectRefKeyForUpload(value.toObject()[QStringLiteral("object")].toObject()))) {
+                        objectUploads.append(value);
                     }
                 }
             }
         }
     }
-    if (sendModelData) {
-        const QString modelRefName = QString::fromStdString(segPath.filename().string())
-            + QStringLiteral("/model.pt");
-        QJsonObject modelUpload = modelArtifactForPath(
-            std::filesystem::path(modelPath.toStdString()), modelRefName, &rawModelBytes);
-        if (modelUpload.isEmpty()) {
-            auto msg = tr("Cannot read model file: %1").arg(modelPath);
-            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
-            showStatus(msg, 5000);
-            return SubmissionResult::failure(msg);
-        }
-        jobSpec[QStringLiteral("model")] = modelUpload[QStringLiteral("object")].toObject();
-        appendUploadIfNew(modelUpload);
-    } else if (!isNewModel && !inheritedModelRef.isEmpty()) {
-        jobSpec[QStringLiteral("model")] = inheritedModelRef;
+    if (!isNewModel && hasModel) {
+        jobSpec[QStringLiteral("model")] = surfaceRef(activeUuid, activeRow->record.name);
     }
     if (!linkedSurfaces.isEmpty()) {
         QJsonArray externalSurfaces;
         for (const QJsonValue& value : linkedSurfaces) {
             QJsonObject surface = value.toObject();
-            if (surface.isEmpty()) {
-                continue;
-            }
             surface[QStringLiteral("offset")] = offsetVal;
             externalSurfaces.append(surface);
         }
@@ -2922,15 +2515,12 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
     std::cerr << "[lasagna] request prep:"
               << " mode=" << lasagnaModeDebugName(static_cast<int>(launchMode)).toStdString()
               << " elapsed=" << (static_cast<double>(prepTimer.elapsed()) / 1000.0) << "s"
-              << " tifxyz_files=" << tifxyzFileCount
-              << " tifxyz_raw=" << bytesToMiB(rawTifxyzBytes) << " MiB"
-              << " model_raw=" << bytesToMiB(rawModelBytes) << " MiB"
+              << " surface=" << activeUuid
+              << " model=" << (jobSpec.contains(QStringLiteral("model")) ? "yes" : "no")
               << std::endl;
 
-    mgr.startOptimization(request, outputDir);
-    if (!outputName.isEmpty()) {
-        _submittedOutputNames.insert(outputName);
-    }
+    mgr.startOptimization(request);
+    _submittedOutputNames.insert(outputName);
     showStatus(
         tr("Lasagna optimization started. Output: %1")
             .arg(outputName),

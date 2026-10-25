@@ -2,6 +2,8 @@
 #include <QGraphicsPathItem>
 #include <QGraphicsScene>
 #include <QIODevice>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QTemporaryDir>
 #include <QTest>
 #include <QTreeWidget>
@@ -928,12 +930,7 @@ private slots:
 
     void atlasControlPointsDockLoadsGroupedRows()
     {
-        QTemporaryDir dir;
-        QVERIFY(dir.isValid());
-        const QString path = dir.filePath(QStringLiteral("atlas_control_points_results.json"));
-        QFile file(path);
-        QVERIFY(file.open(QIODevice::WriteOnly));
-        file.write(R"json(
+        const QJsonObject results = QJsonDocument::fromJson(R"json(
 {
   "format": "lasagna_atlas_control_points_results",
   "version": 1,
@@ -961,11 +958,10 @@ private slots:
     }
   ]
 }
-)json");
-        file.close();
+)json").object();
 
         AtlasControlPointsDock dock;
-        dock.loadResults(std::filesystem::path(path.toStdString()));
+        dock.loadResults(results);
 
         QVERIFY(!dock.overlayChecked());
         QCOMPARE(dock.results().size(), size_t{1});

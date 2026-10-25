@@ -3,8 +3,7 @@
 #include "AtlasControlPointsTypes.hpp"
 
 #include <QDockWidget>
-
-#include <filesystem>
+#include <QJsonObject>
 
 class QCheckBox;
 class QLabel;
@@ -18,7 +17,8 @@ class AtlasControlPointsDock : public QDockWidget
 public:
     explicit AtlasControlPointsDock(QWidget* parent = nullptr);
 
-    void loadResults(const std::filesystem::path& jsonPath);
+    // Lasagna's atlas control-point results for the surface (its records).
+    void loadResults(const QJsonObject& results);
     void clearResults();
     [[nodiscard]] const AtlasControlPointResults& results() const { return _results; }
     [[nodiscard]] bool overlayChecked() const;
@@ -32,7 +32,7 @@ signals:
 private:
     void rebuildTree();
     void setEmptyState(const QString& text);
-    AtlasControlPointResults parseResults(const std::filesystem::path& jsonPath) const;
+    AtlasControlPointResults parseResults(const QJsonObject& root) const;
     const AtlasControlPointResult* pointForItem(QTreeWidgetItem* item) const;
 
     QCheckBox* _overlayCheck = nullptr;

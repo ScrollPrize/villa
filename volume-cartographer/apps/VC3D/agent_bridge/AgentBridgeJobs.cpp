@@ -205,24 +205,21 @@ void AgentBridgeServer::subscribeJobSignals()
                                       step, totalSteps, loss, overallProgress);
             });
     connect(lasagna, &LasagnaServiceManager::optimizationFinished, this,
-            [this](const QString& outputDir) {
-                handleLasagnaFinished(true, QStringLiteral("Optimization finished"), outputDir);
+            [this](const QStringList& surfaceUuids) {
+                handleLasagnaFinished(true, QStringLiteral("Optimization finished"),
+                                      surfaceUuids.join(QStringLiteral(",")));
             });
     connect(lasagna, &LasagnaServiceManager::optimizationError, this,
             [this](const QString& message) {
                 handleLasagnaFinished(false, message, QString());
             });
     connect(lasagna, &LasagnaServiceManager::jobFinished, this,
-            [this](const QString& /*jobId*/, const QString& outputDir) {
-                handleLasagnaFinished(true, QStringLiteral("Job finished"), outputDir);
+            [this](const QString& /*jobId*/, const QStringList& surfaceUuids) {
+                handleLasagnaFinished(true, QStringLiteral("Job finished"), surfaceUuids.join(QStringLiteral(",")));
             });
     connect(lasagna, &LasagnaServiceManager::jobError, this,
             [this](const QString& /*jobId*/, const QString& message) {
                 handleLasagnaFinished(false, message, QString());
-            });
-    connect(lasagna, &LasagnaServiceManager::resultsPlaced, this,
-            [this](const QString& outputDir, const QStringList& segmentNames) {
-                handleLasagnaResultsPlaced(outputDir, segmentNames);
             });
 
     // Atlas fiber-search lifecycle -> source:"atlas" jobs.
@@ -630,24 +627,6 @@ void AgentBridgeServer::handleLasagnaFinished(bool success, const QString& messa
     // optimizationFinished + jobFinished pair resolves the job exactly once.
     if (_activeJobs.contains(QStringLiteral("lasagna")))
         finishJob(QStringLiteral("lasagna"), success, message, outputPath);
-}
-
-
-void AgentBridgeServer::handleLasagnaResultsPlaced(const QString& outputDir,
-                                                   const QStringList& segmentNames)
-{
-    auto it = _activeJobs.find(QStringLiteral("lasagna"));
-    if (it == _activeJobs.end())
-        return;
-    JobRecord& job = it.value();
-    if (!outputDir.isEmpty())
-        job.outputPath = outputDir;
-    const QString label = segmentNames.isEmpty()
-        ? QStringLiteral("Results placed: %1").arg(outputDir)
-        : QStringLiteral("Results placed: %1 (%2)")
-              .arg(outputDir, segmentNames.join(QStringLiteral(", ")));
-    job.message = label;
-    broadcastJobProgress(job, QStringLiteral("output"), label);
 }
 
 

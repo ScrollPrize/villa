@@ -4,7 +4,6 @@
 #include <QJsonObject>
 
 QJsonObject g_lastLasagnaOptimizationRequest;
-QString g_lastLasagnaOptimizationOutputDir;
 
 LasagnaServiceManager& LasagnaServiceManager::instance()
 {
@@ -46,11 +45,26 @@ bool LasagnaServiceManager::isRunning() const
     return _serviceReady;
 }
 
-void LasagnaServiceManager::startOptimization(const QJsonObject& request, const QString& outputDir)
+void LasagnaServiceManager::startOptimization(const QJsonObject& request)
 {
     g_lastLasagnaOptimizationRequest = request;
-    g_lastLasagnaOptimizationOutputDir = outputDir;
     emit optimizationStarted();
+}
+
+void LasagnaServiceManager::setObjectStore(std::shared_ptr<vc::objects::ObjectStoreSession> session,
+                                           std::optional<vc::objects::AttachmentIdentity> attachment)
+{
+    _storeSession = std::move(session);
+    _storeAttachment = attachment;
+}
+
+std::optional<std::filesystem::path> LasagnaServiceManager::surfaceModel(const std::string& surfaceUuid) const
+{
+    if (!_storeSession || !_storeAttachment) {
+        return std::nullopt;
+    }
+    const auto model = _storeSession->artifactDirectory(*_storeAttachment, surfaceUuid, false) / "model.pt";
+    return std::filesystem::is_regular_file(model) ? std::optional(model) : std::nullopt;
 }
 
 void LasagnaServiceManager::stopOptimization()
@@ -84,11 +98,6 @@ QJsonArray LasagnaServiceManager::discoverServices()
 }
 
 QString LasagnaServiceManager::findConfigFile(const QString&)
-{
-    return {};
-}
-
-QJsonObject LasagnaServiceManager::makeTifxyzArtifactUpload(const QString&)
 {
     return {};
 }

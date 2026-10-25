@@ -13,6 +13,7 @@
 
 class CollapsibleSettingsGroup;
 class CState;
+class SurfaceCatalog;
 class LasagnaBatchWindow;
 class QComboBox;
 class QLabel;
@@ -66,6 +67,8 @@ public:
     void setLasagnaDataInputPath(const QString& path);
     void setSelectedAtlasPath(const QString& path);
     void setState(CState* state);
+    // The stored surfaces jobs read and name their outputs among.
+    void setSurfaceCatalog(SurfaceCatalog* catalog);
 
     void restoreSettings(QSettings& settings);
     void syncUiState(bool editingEnabled, bool optimizing);
@@ -108,7 +111,7 @@ signals:
     void lasagnaStatusMessage(const QString& message);
     void seedFromFocusRequested();
     void openLasagnaWorkspaceRequested();
-    void lasagnaOutputActivated(const QString& outputName);
+    void lasagnaOutputActivated(const QString& surfaceUuid);
 
 private:
     enum class Presentation {
@@ -266,6 +269,7 @@ private:
     bool _restoringSettings{false};
     const QString _settingsGroup;
     CState* _state{nullptr};
+    SurfaceCatalog* _surfaceCatalog{nullptr};
     QMetaObject::Connection _stateVpkgChangedConnection;
     QMetaObject::Connection _stateSurfaceChangedConnection;
     QSet<QString> _submittedOutputNames;
