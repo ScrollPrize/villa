@@ -1,6 +1,7 @@
 #include "StorageBindings.hpp"
 #include "ObjectReadBindings.hpp"
 #include "TypedGeometryBindings.hpp"
+#include "vc_object_store/objects/GeometryCoordinates.hpp"
 #include "GeometryRegionBindings.hpp"
 #include "HubBindings.hpp"
 #include <nanobind/stl/map.h>
@@ -267,6 +268,10 @@ NB_MODULE(_native, m)
     bindObjectStoreSession(m);
     bindTypedGeometry(m); // Shared C++ geometry and revision-pinned views.
 
+    m.def("geometry_scale_to_volume", [](const nb::handle& meta, const std::string& volume) {
+        return vo::geometryScaleToVolume(nlohmann::json::parse(jsonDumps(meta)), volume);
+    }, nb::arg("meta"), nb::arg("volume"),
+       "Volume voxels per stored unit for an object whose meta binds it to volume; None when it is not.");
     m.def("hub_init", &vo::initHub, nb::arg("path"), nb::arg("author"),
           "Turn a local store with no other connections into a hub for a network share.");
     m.def("hub_clone", [](const std::filesystem::path& hub, const std::filesystem::path& replica, const std::string& author) {
@@ -340,6 +345,8 @@ NB_MODULE(_native, m)
              nb::arg("kind"), nb::arg("approval_state") = std::nullopt, nb::arg("include_retired") = false)
         .def("object_count", readMethod<&vo::ObjectStore::objectCount>(), nb::arg("kind"),
              nb::arg("include_retired") = false)
+        .def("unbound_object_count", readMethod<&vo::ObjectStore::unboundObjectCount>(), nb::arg("kind"), nb::arg("volume"),
+             "Live objects of kind not bound to volume (no coordinates in its voxels).")
         .def("objects_by_tag", readMethod<&vo::ObjectStore::objectsByTag>(),
              nb::arg("tag"), nb::arg("include_retired") = false)
         .def("object_tags", readMethod<&vo::ObjectStore::objectTags>(),

@@ -657,3 +657,27 @@ def test_surface_export_keeps_validity_or_writes_valid_only(db, tmp_path):
     stored = np.frombuffer(other.read_geometry_array(only['uuid'], 'points'), '<f4').reshape(1, 2, 3)
     assert stored[0, 1].tolist() == [-1, -1, -1] and stored[0, 0].tolist() == [1, 2, 3]
     other.close()
+
+
+def test_numpy_geometry_and_coordinate_bindings(db):
+    from vc_object_store import Umbilicus, geometry_scale_to_volume
+    points = np.array([[[1, 2, 3], [-1, -1, -1], [4, 5, 0]]], dtype='<f4')
+    surface = Surface.from_arrays(points, [1, 1], np.array([[255, 255, 0]], dtype='u1'))
+    assert surface.points_array().tolist() == points.tolist()
+    assert surface.valid_mask().tolist() == [[True, False, False]]
+    uid, _ = put(db, surface, 'surface')
+    bound, _ = put(db, Umbilicus([[1, 2, 3], [4, 5, 6]]), 'umbilicus')
+    db.set_meta(bound, 'coordinates', {'volume_uuid': 'vol', 'scale_factor': 4})
+    fiber, _ = put(db, Fiber([[0, 0, 0], [1, 0, 0]], [[0, 0, 0], [0.5, 0, 0], [1, 0, 0]]), 'fiber')
+    with db.geometry_snapshot() as snapshot:
+        read, valid = snapshot.surface(uid).read_arrays()
+        assert read.dtype == np.float32 and read.tolist() == points.tolist()
+        assert valid.dtype == bool and valid.tolist() == [[True, False, False]]
+        assert snapshot.surface(uid).read_arrays(0, 1, 1, 2)[0].shape == (1, 2, 3)
+        assert snapshot.umbilicus(bound).points_array().tolist() == [[1, 2, 3], [4, 5, 6]]
+        assert snapshot.fiber(fiber).line_points_array(1).tolist() == [[0.5, 0, 0], [1, 0, 0]]
+        assert snapshot.fiber(fiber).control_points_array().shape == (2, 3)
+    assert geometry_scale_to_volume(db.object(bound)['meta'], 'vol') == 0.25
+    assert geometry_scale_to_volume(db.object(bound)['meta'], 'other') is None
+    assert db.unbound_object_count('umbilicus', 'vol') == 0
+    assert db.unbound_object_count('surface', 'vol') == 1
