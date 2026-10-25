@@ -249,6 +249,7 @@ nb::dict geometryReportToPy(const vo::GeometryIngestReport& r)
 {
     nb::dict result;
     result["edges_imported"] = r.edgesImported; result["ingested"] = r.ingested; result["problems"] = r.problems;
+    result["notices"] = r.notices;
     return result;
 }
 

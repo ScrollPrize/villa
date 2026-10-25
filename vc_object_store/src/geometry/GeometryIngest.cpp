@@ -56,15 +56,34 @@ void problem(GeometryIngestReport& report, const std::string& label, const std::
 {
     report.problems.push_back(label + ": " + error.what());
 }
+// Describe the SourceIngestOptions repairs recorded in a prepared batch's metadata.
+std::vector<std::string> repairNotices(const std::vector<Prepared>& batch, const fs::path& source)
+{
+    std::vector<std::string> result;
+    size_t renumbered = 0;
+    for (const auto& p : batch) {
+        if (p.source.value("point_ids_renumbered", false)) ++renumbered;
+        if (!p.source.contains("dropped_branches")) continue;
+        std::string targets;
+        for (const auto& branch : p.source.at("dropped_branches"))
+            targets += (targets.empty() ? "" : ", ") + branch.at("branch_file").get<std::string>();
+        result.push_back("fiber " + p.object.uuid + " (" + p.object.name + "): dropped " +
+            std::to_string(p.source.at("dropped_branches").size()) + " branch declarations to absent files: " + targets);
+    }
+    if (renumbered)
+        result.push_back(source.string() + ": renumbered point IDs of " + std::to_string(renumbered) +
+            " collections sharing IDs; file IDs kept as source_point_id");
+    return result;
+}
 }
 
 std::vector<GeometrySource> prepareGeometrySource(const std::string& kind, const fs::path& source,
-    const std::vector<std::string>& availableUuids, const std::optional<std::string>& uuidNamespace)
+    const std::vector<std::string>& availableUuids, const SourceIngestOptions& options)
 {
-    if (uuidNamespace) util::canonicalUuid(*uuidNamespace);
-    if (kind == "fiber") return formats::fibers(source, availableUuids, uuidNamespace);
-    if (kind == "patch") return {patch(source, uuidNamespace)};
-    if (kind == "point_collection") return collections(source, uuidNamespace);
+    if (options.uuidNamespace) util::canonicalUuid(*options.uuidNamespace);
+    if (kind == "fiber") return formats::fibers(source, availableUuids, options);
+    if (kind == "patch") return {patch(source, options.uuidNamespace)};
+    if (kind == "point_collection") return collections(source, options);
     throw std::invalid_argument("unsupported batch geometry kind: " + kind);
 }
 
@@ -141,12 +160,12 @@ GeometryIngestReport ingestRegisteredGeometry(ObjectStore& db, const std::option
 
 GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& kind, const fs::path& source,
     const util::ProgressCallback& progress, const std::string& coordinateContext,
-    const std::optional<std::string>& uuidNamespace)
+    const SourceIngestOptions& options)
 {
     GeometryIngestReport report;
     try {
         geometryCoordinates(Json::parse(coordinateContext));
-        if (uuidNamespace) util::canonicalUuid(*uuidNamespace);
+        if (options.uuidNamespace) util::canonicalUuid(*options.uuidNamespace);
         if (kind == "track") {
             const auto packed = resolvePackedTrackStore(source);
             PackedTrackStore store(packed);
@@ -194,10 +213,12 @@ GeometryIngestReport ingestGeometrySource(ObjectStore& db, const std::string& ki
                 auto read = db.read();
                 std::vector<std::string> available;
                 for (const auto& object : db.objectsByKind(read, kind)) available.push_back(object.uuid);
-                batch = prepareGeometrySource(kind, source, available, uuidNamespace);
+                batch = prepareGeometrySource(kind, source, available, options);
                 for (const auto& p : batch) expectations[p.object.uuid] = expectedAt(db, read, p.object.uuid);
             }
+            auto notices = repairNotices(batch, source);
             ingestBatch(db, std::move(batch), expectations, report, coordinateContext);
+            report.notices.insert(report.notices.end(), notices.begin(), notices.end());
         }
     } catch (const std::exception& error) { problem(report, source.string(), error); }
     return report;

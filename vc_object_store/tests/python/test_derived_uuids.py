@@ -40,7 +40,7 @@ def test_v3_fibers_without_uuids(tmp_path):
         assert store.object_count("fiber") == 0
     with ObjectStore.create(str(tmp_path / "derived.vcobj"), author="test") as store:
         report = store.ingest_geometry_source("fiber", tmp_path / "fibers", uuid_namespace=NAMESPACE)
-        assert report == dict(ingested=2, edges_imported=1, problems=[])
+        assert report == dict(ingested=2, edges_imported=1, problems=[], notices=[])
         ids = [derived("fiber:" + name) for name in names]
         edge = store.edges_by_kind("fiber_branch")[0]
         assert {edge["a"], edge["b"]} == set(ids)
@@ -57,7 +57,7 @@ def test_canonical_fiber_uuids_are_kept_and_branches_resolve_to_them(tmp_path):
     write_v3_fibers(tmp_path / "fibers", kept_uuid=kept)
     with ObjectStore.create(str(tmp_path / "mixed.vcobj"), author="test") as store:
         report = store.ingest_geometry_source("fiber", tmp_path / "fibers", uuid_namespace=NAMESPACE)
-        assert report == dict(ingested=2, edges_imported=1, problems=[])
+        assert report == dict(ingested=2, edges_imported=1, problems=[], notices=[])
         edge = store.edges_by_kind("fiber_branch")[0]
         assert {edge["a"], edge["b"]} == {derived("fiber:anon_0"), kept}
         assert "uuid_derivation" not in store.object(kept)["meta"]["source"]

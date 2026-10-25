@@ -16,9 +16,8 @@ void deriveSourceUuid(nlohmann::json& root, const std::string& kind, const std::
     const std::optional<std::string>& uuidNamespace);
 Prepared fiber(const std::filesystem::path&);
 std::vector<Prepared> fibers(const std::filesystem::path&, const std::vector<std::string>& available,
-    const std::optional<std::string>& uuidNamespace = std::nullopt);
+    const SourceIngestOptions& options = {});
 Prepared patch(const std::filesystem::path&, const std::optional<std::string>& uuidNamespace = std::nullopt);
-std::vector<Prepared> collections(const std::filesystem::path&,
-    const std::optional<std::string>& uuidNamespace = std::nullopt);
+std::vector<Prepared> collections(const std::filesystem::path&, const SourceIngestOptions& options = {});
 Prepared track(const PackedTrackStore&, size_t row, ObjectRecord);
 } // namespace vc::objects::formats

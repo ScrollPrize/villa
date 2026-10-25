@@ -411,13 +411,16 @@ NB_MODULE(_native, m)
         }, nb::arg("dataset_root") = std::nullopt, nb::arg("object_uuids") = std::vector<std::string>{},
            nb::arg("coordinate_context") = nb::dict())
         .def("ingest_geometry_source", [](PyObjectStore& self, const std::string& kind, const std::filesystem::path& source,
-                                         const nb::dict& context, const std::optional<std::string>& uuidNamespace) {
+                                         const nb::dict& context, const std::optional<std::string>& uuidNamespace,
+                                         bool dropDanglingBranches, bool renumberPointIds) {
             const auto declarations = jsonDumps(context);
+            const vo::SourceIngestOptions options{uuidNamespace, dropDanglingBranches, renumberPointIds};
             return geometryReportToPy(self.withStore<true>([&](auto& db) {
-                return vo::ingestGeometrySource(db, kind, source, {}, declarations, uuidNamespace);
+                return vo::ingestGeometrySource(db, kind, source, {}, declarations, options);
             }));
         }, nb::arg("kind"), nb::arg("source"), nb::arg("coordinate_context") = nb::dict(),
-           nb::arg("uuid_namespace") = std::nullopt)
+           nb::arg("uuid_namespace") = std::nullopt, nb::arg("drop_dangling_branches") = false,
+           nb::arg("renumber_point_ids") = false)
         .def("export_geometry", [](PyObjectStore& self, const std::string& object,
                                    const std::filesystem::path& destination,
                                    const std::optional<std::string>& revision, bool overwrite) {

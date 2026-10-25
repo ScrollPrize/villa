@@ -50,6 +50,26 @@ same identities, so a repeated import fails as an existing identity rather than
 duplicating objects. Keys do not depend on absolute paths, but renaming a file or
 directory changes its identity.
 
+Two dataset defects are also errors by default, with explicit repairs that the
+report lists under `notices` (and `vc_object_ingest` prints):
+
+- A fiber branch naming an absent target file. `--drop-dangling-branches`
+  (`drop_dangling_branches=True`) drops the declaration and records it, with its
+  `declaration` key (`branches`/`adjacent_branches`), in the declaring fiber's
+  `meta.source.dropped_branches`. Resolvable branches are unaffected.
+- PCL collections of one document sharing point IDs (for example collections
+  that each number from 0). `--renumber-point-ids` (`renumber_point_ids=True`)
+  gives every collection involved new IDs above the document's largest, in
+  collection then point-ID order, so point order is kept. Each renumbered point
+  keeps its file ID as the point annotation `source_point_id`, and the collection
+  is marked `meta.source.point_ids_renumbered`. Documents with point `links` are
+  refused, since their targets would be ambiguous. A later import that extends
+  the same document must not reuse the new IDs.
+
+For the Spiral dataset (`../spiral/dataset`, 2026-10) these repair 47 branch
+declarations to 37 absent fiber files and 202 collections of
+`same_windings.json`.
+
 PCL source links use document-scoped collection/point identities. The namespace
 is `meta.source.origin`, the absolute lexically normalized import path; symlink
 aliases and moved files are different namespaces. Import only new collections

@@ -10,7 +10,8 @@ try {
     std::optional<std::filesystem::path> root;
     std::vector<std::string> uuids;
     std::vector<std::pair<std::string, std::filesystem::path>> sources;
-    std::optional<std::string> volumeUuid, scaleFactor, uuidNamespace;
+    std::optional<std::string> volumeUuid, scaleFactor;
+    vc::objects::SourceIngestOptions sourceOptions;
     bool registered = false, showProgress = true;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -29,7 +30,9 @@ try {
         else if (arg == "--tracks") sources.emplace_back("track", next());
         else if (arg == "--volume-uuid") volumeUuid = next();
         else if (arg == "--scale-factor") scaleFactor = next();
-        else if (arg == "--derive-uuids") uuidNamespace = next();
+        else if (arg == "--derive-uuids") sourceOptions.uuidNamespace = next();
+        else if (arg == "--drop-dangling-branches") sourceOptions.dropDanglingBranches = true;
+        else if (arg == "--renumber-point-ids") sourceOptions.renumberCollidingPointIds = true;
         else if (arg == "--no-progress") showProgress = false;
         else if (arg == "--help" || arg == "-h") {
             std::cout << "Usage: vc_object_ingest --db objects.vcobj --author NAME [options]\n"
@@ -43,6 +46,8 @@ try {
                 "  --volume-uuid ID          coordinate frame: catalog volume ID (metadata.json id)\n"
                 "  --scale-factor S          coordinate frame: stored units per volume voxel\n"
                 "  --derive-uuids NAMESPACE  identities for sources without UUIDs (see below)\n"
+                "  --drop-dangling-branches  drop fiber branches to absent files, recording them\n"
+                "  --renumber-point-ids      renumber PCL collections whose point IDs collide\n"
                 "  --no-progress             suppress progress display\n"
                 "Fiber/collection sources and registered batches commit atomically; tracks commit individually. Failures are reported and exit status is nonzero.\n"
                 "Source flags are repeatable. Existing object identities are errors, even when unchanged.\n"
@@ -53,13 +58,18 @@ try {
                 "keyed by its meta.json uuid or directory name, a fiber by its file stem (version-3 branches\n"
                 "resolve the same way), a PCL collection by DOCUMENT_STEM:ID. Rerunning yields the same UUIDs,\n"
                 "so a repeated import fails as an existing identity. Canonical UUIDs are kept; tracks are unaffected.\n"
+                "Without the repair flags, a branch to an absent fiber file and point IDs shared between\n"
+                "collections of one PCL document are errors. --drop-dangling-branches records dropped\n"
+                "declarations in meta.source.dropped_branches. --renumber-point-ids gives each colliding\n"
+                "collection new IDs above the document's largest, keeping each file ID as the point\n"
+                "attribute source_point_id; documents with point links are refused. Repairs are printed.\n"
                 "Edit imported geometry, annotations and relationships through the object API.\n";
             return 0;
         } else throw std::runtime_error("unknown argument: " + arg);
     }
     if (path.empty() || author.empty() || (!registered && sources.empty()))
         throw std::runtime_error("specify --db, --author and --registered/--uuid or source flags; see --help");
-    if (uuidNamespace && !vc::objects::util::isUuid(*uuidNamespace))
+    if (sourceOptions.uuidNamespace && !vc::objects::util::isUuid(*sourceOptions.uuidNamespace))
         throw std::runtime_error("--derive-uuids requires a UUID namespace");
     if (volumeUuid.has_value() != scaleFactor.has_value())
         throw std::runtime_error("--volume-uuid and --scale-factor must be given together");
@@ -78,12 +88,13 @@ try {
     bool failed = false;
     auto print = [&](const vc::objects::GeometryIngestReport& report) {
         std::cout << report.ingested << " ingested, " << report.problems.size() << " problems\n";
+        for (const auto& notice : report.notices) std::cout << notice << '\n';
         for (const auto& problem : report.problems) std::cerr << problem << '\n';
         failed |= !report.problems.empty();
     };
     for (const auto& [kind, source] : sources) {
         vc::objects::util::TerminalProgress progress("Ingest " + kind, showProgress);
-        const auto report = vc::objects::ingestGeometrySource(db, kind, source, progress.callback(), coordinateContext, uuidNamespace);
+        const auto report = vc::objects::ingestGeometrySource(db, kind, source, progress.callback(), coordinateContext, sourceOptions);
         progress.finish(); print(report);
     }
     if (registered) {

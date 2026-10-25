@@ -27,8 +27,9 @@ Prepared fiberDocument(const nlohmann::json& root, const std::filesystem::path& 
 Prepared fiber(const std::filesystem::path& path) { return fiberDocument(readJson(path), path); }
 
 std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vector<std::string>& available,
-    const std::optional<std::string>& uuidNamespace)
+    const SourceIngestOptions& options)
 {
+    const auto& uuidNamespace = options.uuidNamespace;
     namespace fs = std::filesystem;
     using Json = nlohmann::json;
     std::set<std::string> existing, incoming;
@@ -77,12 +78,25 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
         // Copy before appending peers, which can reallocate the batch.
         const auto metadata = batch[i].source;
         const bool version3 = metadata.value("version", 0) == 3;
+        auto dropped = Json::array();
         for (const auto* key : {"branches", "adjacent_branches"}) {
             auto kept = Json::array();
             for (auto branch : metadata.value(key, Json::array())) {
                 const auto peerPath = [&] {
                     return source.parent_path() / fs::path(branch.at("branch_file").get<std::string>()).filename();
                 };
+                // Only a declaration that must be resolved from an absent file can dangle.
+                const bool known = !version3 && branch.contains("target_uuid") &&
+                    (existing.contains(util::canonicalUuid(branch.at("target_uuid").get<std::string>())) ||
+                     incoming.contains(util::canonicalUuid(branch.at("target_uuid").get<std::string>())));
+                if (!known && branch.contains("branch_file") && !fs::exists(peerPath())) {
+                    if (!options.dropDanglingBranches)
+                        throw std::runtime_error("branch target file is absent: " + peerPath().string());
+                    auto record = branch;
+                    record["declaration"] = key;
+                    dropped.push_back(std::move(record));
+                    continue;
+                }
                 if (version3) {
                     const auto peer = peerPath();
                     if (!fileUuids.contains(peer))
@@ -109,8 +123,9 @@ std::vector<Prepared> fibers(const std::filesystem::path& path, const std::vecto
                     throw std::runtime_error("branch target UUID does not match its artifact");
                 add(peer, peerPath());
             }
-            if (version3 && metadata.contains(key)) batch[i].source[key] = std::move(kept);
+            if ((version3 || !dropped.empty()) && metadata.contains(key)) batch[i].source[key] = std::move(kept);
         }
+        if (!dropped.empty()) batch[i].source["dropped_branches"] = std::move(dropped);
     }
     return batch;
 }
