@@ -173,7 +173,7 @@ struct VolumeRow {
     double stored = 0, volume = 0;
     bool bound = true;
 };
-std::vector<std::string> registeredVolumeSelection(sqlite3* db,const ObjectSelection& selection) {
+std::vector<VolumeRow> registeredVolumeSelection(sqlite3* db,const ObjectSelection& selection) {
     requireVolumeSelection(selection);
     const bool byLength=selection.orderBy=="length_desc";
     std::vector<VolumeRow> rows;
@@ -215,10 +215,10 @@ std::vector<std::string> registeredVolumeSelection(sqlite3* db,const ObjectSelec
     });
     const size_t first=std::min(rows.size(),size_t(selection.offset));
     const size_t last=selection.limit?std::min(rows.size(),first+size_t(*selection.limit)):rows.size();
-    std::vector<std::string> result;for(size_t i=first;i<last;++i)result.push_back(rows[i].uuid);return result;
+    return {std::make_move_iterator(rows.begin()+first),std::make_move_iterator(rows.begin()+last)};
 }
-// The volume selection's UUIDs in its order, after the cursor or offset.
-std::vector<std::string> volumeSelection(sqlite3* db, const ObjectSelection& selection)
+// The volume selection's rows in its order, after the cursor or offset.
+std::vector<VolumeRow> volumeSelection(sqlite3* db, const ObjectSelection& selection)
 {
     requireVolumeSelection(selection);
     if(selection.transforms&&!selection.transforms->graph.registrations().empty())return registeredVolumeSelection(db,selection);
@@ -276,9 +276,7 @@ std::vector<std::string> volumeSelection(sqlite3* db, const ObjectSelection& sel
     });
     const size_t begin = std::min(rows.size(), size_t(selection.offset));
     const size_t end = selection.limit ? std::min(rows.size(), begin + size_t(*selection.limit)) : rows.size();
-    std::vector<std::string> uuids;
-    for (size_t i = begin; i < end; ++i) uuids.push_back(std::move(rows[i].uuid));
-    return uuids;
+    return {std::make_move_iterator(rows.begin() + begin), std::make_move_iterator(rows.begin() + end)};
 }
 }
 
@@ -323,15 +321,18 @@ std::vector<ObjectRecord> ObjectStore::selectObjects(const Txn& txn, const Objec
     const auto order = volumeSelection(db, selection);
     if (order.empty()) return {};
     ObjectSelection chosen;
-    chosen.uuids = order;
     chosen.includeRetired = selection.includeRetired;
+    for (const auto& row : order) chosen.uuids.push_back(row.uuid);
     auto rows = objectSelectionQuery(db, chosen, projectedObjectColumns(fields));
     auto records = readObjectRows(db, *rows, fields);
     std::map<std::string, size_t> position;
-    for (size_t i = 0; i < order.size(); ++i) position.emplace(order[i], i);
+    for (size_t i = 0; i < order.size(); ++i) position.emplace(order[i].uuid, i);
     std::sort(records.begin(), records.end(), [&](const ObjectRecord& a, const ObjectRecord& b) {
         return position.at(a.uuid) < position.at(b.uuid);
     });
+    if (selection.orderBy == "length_desc")
+        for (auto& record : records)
+            if (const auto& row = order[position.at(record.uuid)]; row.bound) record.volumeLength = row.volume;
     return records;
 }
 

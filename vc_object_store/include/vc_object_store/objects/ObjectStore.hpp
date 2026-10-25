@@ -75,6 +75,10 @@ struct ObjectRecord : RecordCommon {
     std::optional<FiberDetail> fiber;
     std::optional<SurfaceDetail> surface;
     std::optional<TrackDetail> track;
+    // Set by volume selections ordered by length on objects bound to the
+    // volume: the target-voxel length they were ordered by, which is the
+    // afterLength cursor for the next page.
+    std::optional<double> volumeLength;
 };
 
 struct PointReference {

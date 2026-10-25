@@ -135,6 +135,7 @@ nb::dict objectToPy(const vo::ObjectRecord& r, const std::set<std::string>* fiel
         if (include(key)) d[key] = value;
     });
     if (include("data_checksum")) d["data_checksum"] = r.dataChecksum;
+    if (r.volumeLength) d["volume_length"] = *r.volumeLength;
     vo::detail::objectDetails(r, [&](const char* key, const auto& detail) {
         if (!detail || !include(key)) return;
         nb::dict value;

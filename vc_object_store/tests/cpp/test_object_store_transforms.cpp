@@ -30,6 +30,10 @@ int main() try {
         auto txn=db.read();ObjectSelection select;select.kind="fiber";select.volume="b";select.minLength=5.5;
         require(db.selectObjects(txn,select).size()==1,"target-space length includes registered fiber");
         select.minLength=6.5;require(db.selectObjects(txn,select).empty(),"length threshold in target space");
+        select.minLength.reset();select.orderBy="length_desc";
+        const auto ordered=db.selectObjects(txn,select);
+        require(ordered.size()==1&&ordered.front().volumeLength==db.geometryLengthInVolume(txn,fiber,"b"),
+                "registered rows carry the target length they were ordered by");
         SurfaceProximityQuery query;query.volume="b";query.point={12.5,1,21.5};query.tolerance=.51;
         const auto hits=db.nearestSurfaces(txn,query);require(hits.size()==1,"registered nearest surface");
         require(std::abs(hits.front().distance-.5)<1e-10,"target-space Euclidean distance");

@@ -68,7 +68,8 @@ int main() try
             for (const auto& row : rows) paged.push_back(row.name);
             const auto& last = rows.back();
             const auto toVolume = geometryScaleToVolume(nlohmann::json::parse(last.meta), volume);
-            page.afterUuid = last.uuid; page.afterLength = last.fiber->length * *toVolume;
+            require(last.volumeLength == last.fiber->length * *toVolume, "rows carry the volume length they were ordered by");
+            page.afterUuid = last.uuid; page.afterLength = *last.volumeLength;
         }
         require(paged == ordered, "volume cursor pages without repeats or gaps");
     }
