@@ -2735,6 +2735,13 @@ def _draw_track_sample(
     if sampling_probabilities is None:
         primary_track_idx = torch.randint(
             num_tracks, (k,), device=device, generator=generator)
+    elif device.type == 'mps':
+        # MPS multinomial asks Metal for one oversized buffer (83 GB for
+        # 144k tracks x 5k samples) and aborts; draw on the CPU instead.
+        # The MPS path never passes a generator, so the CPU draw follows
+        # the globally seeded CPU RNG and stays reproducible.
+        primary_track_idx = torch.multinomial(
+            sampling_probabilities.cpu(), k, replacement=True).to(device)
     else:
         primary_track_idx = torch.multinomial(
             sampling_probabilities, k, replacement=True, generator=generator)
@@ -2753,6 +2760,9 @@ def _draw_track_sample(
         seed = int(torch.randint(
             0, (1 << 63) - 1, (1,), dtype=torch.int64,
             device=device, generator=generator).item())
+        # MPS randint with this bound wraps to int32 and can go negative,
+        # which the native sampler's uint64 seed rejects. No-op elsewhere.
+        seed &= (1 << 63) - 1
         primary_cpu = np.asarray(
             primary_track_idx.detach().cpu(), dtype=np.int32)
         native = _load_native_track_crossings()
