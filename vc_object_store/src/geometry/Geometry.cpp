@@ -443,6 +443,45 @@ std::string ObjectStore::editGeometry(WriteTxn& txn, const std::string& objectId
     const auto affected = affectedEdges(*this, txn, objectUuid, current, plan->after);
     const auto decisions = validateEdgeEdits(*this, txn, db, objectUuid, plan->after, affected,
                                              decide ? (*decide)(affected) : edgeEdits);
+    if (geometryDeltaRawSize(plan->changes) > std::min(impl_->options.maxGeometryDeltaBytes, maxGeometryDeltaBytes)) {
+        // Too large for one sparse delta: publish a full revision. Unchanged
+        // arrays are inherited; changed arrays reference their chunks by hash,
+        // storing only bytes the store does not hold yet.
+        auto manifest = plan->manifest;
+        std::set<std::string> changed;
+        for (const auto& change : plan->changes) changed.insert(change.key.first);
+        for (auto& [name, a] : manifest.at("arrays").items()) {
+            if (changed.contains(name)) a.erase("source_revision");
+            else if (!a.contains("source_revision")) a["source_revision"] = current.uuid;
+        }
+        const auto text = manifest.dump(), hash = hashText(text), uuid = util::newUuid();
+        Savepoint savepoint(db);
+        writeRevision(db, *this, object, uuid, &current, hash, text);
+        Statement stored(db, "SELECT 1 FROM geometry_chunks WHERE hash=?");
+        Statement insert(db, "INSERT INTO geometry_chunks(hash,data) VALUES(?,?)");
+        Statement reference(db, "INSERT INTO geometry_revision_chunks VALUES(?,?,?,?)");
+        for (const auto& name : changed) {
+            const auto& array = manifest.at("arrays").at(name);
+            for (int64_t index = 0; index < geometryLayout(array).chunkCount(); ++index) {
+                const std::string chunk = array.at("chunks").at(index);
+                stored.reset(); stored.bind(1, chunk);
+                if (!stored.row()) {
+                    const auto found = plan->modified->find({name, index});
+                    if (found != plan->modified->end()) insert.run(chunk, found->second);
+                    else insert.run(chunk, plan->reader->chunk(name, index));
+                }
+                reference.run(parseUuid(uuid), name, index, chunk);
+            }
+        }
+        clearGeometryMaterialization(db, objectUuid);
+        execute(db, "UPDATE geometry_heads SET revision_uuid=? WHERE object_uuid=?", parseUuid(uuid), parseUuid(objectUuid));
+        const auto id = *objectIdByUuid(db, parseUuid(objectUuid));
+        updateEditedGeometryBounds(db, id, uuid, edits);
+        stampGeometry(db, *this, objectUuid, id, hash);
+        applyEdgeDecisions(*this, txn, db, affected, decisions);
+        savepoint.release();
+        return uuid;
+    }
     auto encoded = encodeGeometryDelta(plan->changes);
     Statement old(db, "SELECT manifest FROM geometry_revisions WHERE uuid=?", parseUuid(current.uuid)); old.row();
     const auto previous = loadGeometryManifest(db, current.uuid, old.text(0), current.contentHash);

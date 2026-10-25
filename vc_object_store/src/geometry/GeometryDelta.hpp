@@ -21,6 +21,10 @@ struct EncodedGeometryDelta {
 inline std::string hashText(const std::string& text) {
     return geometryHash(std::span(reinterpret_cast<const uint8_t*>(text.data()), text.size()));
 }
+// The largest raw (uncompressed) delta encoded or decoded.
+inline constexpr size_t maxGeometryDeltaBytes = 256 * 1024 * 1024;
+// The raw size encodeGeometryDelta would produce, without encoding.
+size_t geometryDeltaRawSize(const std::vector<GeometryChunkChange>&);
 EncodedGeometryDelta encodeGeometryDelta(const std::vector<GeometryChunkChange>&);
 nlohmann::json loadGeometryManifest(sqlite3*, const std::string& revision,
                                    const std::string& text, const std::string& contentHash);

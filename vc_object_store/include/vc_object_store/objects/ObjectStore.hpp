@@ -173,6 +173,10 @@ struct OpenOptions {
     // Resident spatial descriptors/index per read connection; zero uses SQL.
     // Built lazily; snapshots too large for this budget also use SQL.
     std::size_t spatialCacheBytes = 16 * 1024 * 1024;
+    // An edit whose sparse delta would exceed this many raw bytes is published
+    // as a full revision instead (unchanged chunks are shared by hash). Capped
+    // at 256 MiB, the largest delta read back.
+    std::size_t maxGeometryDeltaBytes = 256 * 1024 * 1024;
     // A hosted hub on a network filesystem (sshfs, NFS, SMB): rollback journal
     // and SQLite's unix-dotfile locking instead of WAL, one reader, no caches.
     // Only the hub functions in objects/Hub.hpp open stores this way; ordinary

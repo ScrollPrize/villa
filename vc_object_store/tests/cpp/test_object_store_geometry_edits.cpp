@@ -8,6 +8,9 @@
 #include <tuple>
 #include <nlohmann/json.hpp>
 #include <iostream>
+#include <cstring>
+#include <optional>
+#include <sqlite3.h>
 using namespace vc::objects;
 using Json = nlohmann::json;
 int main() try {
@@ -210,5 +213,61 @@ int main() try {
         require(Json::parse(db.geometryPointAnnotations(txn, initial, "control_points"))[0]["segment_to_next"]["direction"][0] == 1,
             "initial annotations remain immutable");
     });
+    {
+        // An edit too large for one sparse delta is published as a full revision
+        // that shares unchanged chunks; history and later deltas still work.
+        const auto bigPath = directory.path / "large-edits.vcobj";
+        OpenOptions small = options; small.maxGeometryDeltaBytes = 64 * 1024;
+        std::optional<ObjectStore> opened(ObjectStore::create(bigPath, small));
+        auto& store = *opened;
+        ObjectStore* active = &store;
+        auto deltas = [&] {
+            sqlite3* raw = nullptr; sqlite3_open_v2(bigPath.c_str(), &raw, SQLITE_OPEN_READONLY, nullptr);
+            sqlite3_stmt* st = nullptr; sqlite3_prepare_v2(raw, "SELECT count(*) FROM geometry_deltas", -1, &st, nullptr);
+            sqlite3_step(st); const auto n = sqlite3_column_int64(st, 0); sqlite3_finalize(st); sqlite3_close(raw); return n;
+        };
+        vc::geometry::Surface surface{300, 300, {1, 1}, {}};
+        for (int r = 0; r < 300; ++r) for (int c = 0; c < 300; ++c) surface.points.push_back({float(c), float(r), 5});
+        std::string uuid, head;
+        { auto txn = store.write(); ObjectRecord record; record.kind = "surface"; uuid = store.upsertObject(txn, record);
+          head = store.putGeometry(txn, uuid, vc::geometry::encode(surface)); txn.commit(); }
+        auto rectangle = [&](int row, int rows, float z) {
+            std::vector<uint8_t> bytes;
+            for (int r = row; r < row + rows; ++r) for (int c = 0; c < 300; ++c) {
+                const std::array<float, 3> p{float(c), float(r), z + 0.001f * float(r * 300 + c)};
+                const auto* b = reinterpret_cast<const uint8_t*>(p.data()); bytes.insert(bytes.end(), b, b + 12);
+            }
+            auto txn = store.write();
+            head = store.editGeometryRectangle(txn, uuid, "points", row, 0, rows, 300, bytes, head);
+            txn.commit();
+            return head;
+        };
+        auto vertex = [&](const std::string& revision, int row, int col) {
+            auto txn = active->read();
+            const auto bytes = active->readGeometryRectangle(txn, revision, "points", row, col, 1, 1);
+            std::array<float, 3> p; std::memcpy(p.data(), bytes.data(), 12); return p;
+        };
+        const auto first = rectangle(10, 1, 6) ;
+        require(deltas() == 1, "a small edit is a sparse delta");
+        const auto full = rectangle(0, 250, 7);
+        require(deltas() == 1, "an edit over the delta limit is a full revision");
+        require(vertex(full, 249, 299)[2] == 7 + 0.001f * float(249 * 300 + 299) && vertex(full, 260, 3)[2] == 5,
+                "the full revision holds the edit and keeps unchanged chunks");
+        require(vertex(first, 10, 7)[2] == 6 + 0.001f * float(10 * 300 + 7) && vertex(first, 200, 7)[2] == 5,
+                "history before the full revision still reads");
+        const auto after = rectangle(299, 1, 9);
+        require(deltas() == 2 && vertex(after, 299, 0)[2] == 9 + 0.001f * float(299 * 300) &&
+                vertex(after, 249, 299)[2] == vertex(full, 249, 299)[2], "later edits are deltas on the full revision");
+        {
+            auto txn = store.read();
+            RegionSlice cut; cut.origin = {150, 100, 7.1}; cut.localBounds = {-200, -200, -1, 200, 200, 1};
+            RegionOptions surfaces; surfaces.kind = "surface";
+            require(store.geometryRegion(txn, cut, surfaces).intersectingObjects == 1, "bounds follow the full revision");
+        }
+        opened.reset();
+        auto reopened = ObjectStore::open(bigPath, small);
+        active = &reopened;
+        require(vertex(full, 0, 0)[2] == 7.0f && vertex(first, 10, 0)[2] == 6 + 0.001f * float(10 * 300), "revisions survive reopening");
+    }
     std::cout << "generic geometry editing and coordinates passed\n";
 } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }

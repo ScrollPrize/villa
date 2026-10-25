@@ -3,7 +3,12 @@
 
 namespace vc::objects::detail {
 namespace {
-constexpr size_t maxDeltaBytes = 256 * 1024 * 1024;
+constexpr size_t maxDeltaBytes = maxGeometryDeltaBytes;
+size_t numberSize(uint64_t n) {
+    size_t size = 1;
+    while (n > 127) { n >>= 7; ++size; }
+    return size;
+}
 void number(std::vector<uint8_t>& out, uint64_t n) {
     do { out.push_back(uint8_t(n & 127) | (n > 127 ? 128 : 0)); n >>= 7; } while (n);
 }
@@ -29,6 +34,18 @@ nlohmann::json loadGeometryManifest(sqlite3* db, const std::string& revision,
         manifest.at("delta").at("version") != 1 || manifest.at("delta").at("result_hash") != contentHash)
         throw std::runtime_error("geometry delta: corrupt or unsupported revision manifest");
     return manifest;
+}
+size_t geometryDeltaRawSize(const std::vector<GeometryChunkChange>& chunks) {
+    size_t size = 0;
+    for (const auto& c : chunks) {
+        size += numberSize(c.changes.size());
+        int64_t end = 0;
+        for (const auto& change : c.changes) {
+            size += numberSize(change.offset - end) + numberSize(change.length) + 2 * change.length;
+            end = change.offset + change.length;
+        }
+    }
+    return size;
 }
 EncodedGeometryDelta encodeGeometryDelta(const std::vector<GeometryChunkChange>& chunks) {
     std::vector<uint8_t> raw;
