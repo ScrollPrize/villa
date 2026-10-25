@@ -43,6 +43,8 @@ class PolyLRScheduler(_LRScheduler):
                  max_steps: int, 
                  exponent: float = 0.9, 
                  current_step: Optional[int] = None):
+        if max_steps <= 0:
+            raise ValueError("max_steps must be positive")
         self.optimizer = optimizer
         self.initial_lr = initial_lr
         self.max_steps = max_steps
@@ -65,7 +67,8 @@ class PolyLRScheduler(_LRScheduler):
             current_step = self.ctr
             self.ctr += 1
 
-        new_lr = self.initial_lr * (1 - current_step / self.max_steps) ** self.exponent
+        new_lr = (0.0 if current_step >= self.max_steps else
+                  self.initial_lr * (1 - current_step / self.max_steps) ** self.exponent)
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = new_lr
 
@@ -95,9 +98,13 @@ class WarmupPolyLRScheduler(_LRScheduler):
                  warmup_steps: int,
                  exponent: float = 0.9,
                  current_step: Optional[int] = None):
+        if max_steps <= 0:
+            raise ValueError("max_steps must be positive")
         self.optimizer = optimizer
         self.initial_lr = initial_lr
         self.max_steps = max_steps
+        if not 0 <= warmup_steps < max_steps:
+            raise ValueError("warmup_steps must satisfy 0 <= warmup_steps < max_steps")
         self.warmup_steps = warmup_steps
         self.exponent = exponent
         self.ctr = 0
@@ -118,7 +125,9 @@ class WarmupPolyLRScheduler(_LRScheduler):
             current_step = self.ctr
             self.ctr += 1
         
-        if current_step < self.warmup_steps:
+        if current_step >= self.max_steps:
+            new_lr = 0.0
+        elif current_step < self.warmup_steps:
             # Linear warmup
             new_lr = self.initial_lr * (current_step / self.warmup_steps)
         else:
@@ -205,7 +214,9 @@ def get_scheduler(scheduler_type: str,
         )
     
     elif scheduler_type == 'step':
-        step_size = kwargs.get('step_size', max_steps // 3)
+        step_size = kwargs.get('step_size', max(1, max_steps // 3))
+        if step_size <= 0:
+            raise ValueError("step_size must be positive")
         gamma = kwargs.get('gamma', 0.1)
         return torch.optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=gamma)
     
