@@ -1,14 +1,12 @@
-// VolumePkg coverage with real attached resources: a local zarr volume, the
-// committed PHerc 0172 tifxyz segment fixtures, and an empty normal-grid dir.
-// Exercises addSingleVolume/Segmentation/removeSingleVolume/Segmentation,
-// reload variants, loadSurface, unloadSurface, getSurface, volume(), etc.
+// VolumePkg coverage with real attached resources: a local zarr volume
+// and an empty normal-grid dir. Exercises addSingleVolume/removeSingleVolume,
+// reload variants, volume(), etc.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <atomic>
@@ -20,15 +18,6 @@
 namespace fs = std::filesystem;
 
 namespace {
-
-#ifndef VC_TEST_FIXTURES_DIR
-#define VC_TEST_FIXTURES_DIR "core/test/data"
-#endif
-
-fs::path fixtureSegment(const std::string& name)
-{
-    return fs::path(VC_TEST_FIXTURES_DIR) / "segments" / name;
-}
 
 fs::path tmpDir(const std::string& tag)
 {
@@ -78,19 +67,6 @@ fs::path makeLocalVolume(const fs::path& root,
     return volDir;
 }
 
-// Stage the committed segment fixture(s) into `root/paths/`.
-void stageSegments(const fs::path& root)
-{
-    auto paths = root / "paths";
-    fs::create_directories(paths);
-    for (const auto& name : {std::string("20241113070770"),
-                             std::string("20241113080880")}) {
-        auto src = fixtureSegment(name);
-        if (!fs::exists(src / "meta.json")) continue;
-        fs::copy(src, paths / name, fs::copy_options::recursive);
-    }
-}
-
 } // namespace
 
 TEST_CASE("VolumePkg::addVolumeEntry auto-loads vol1 from the volumes dir")
@@ -132,88 +108,6 @@ TEST_CASE("VolumePkg::reloadSingleVolume returns true after a successful reload"
     p->addSingleVolume("vol1");
     CHECK(p->reloadSingleVolume("vol1"));
     CHECK_FALSE(p->reloadSingleVolume("unknown"));
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg: full project with segments + reload paths")
-{
-    auto d = tmpDir("full_proj");
-    makeLocalVolume(d);
-    stageSegments(d);
-
-    auto p = VolumePkg::newEmpty();
-    p->setName("Full Project");
-    p->addVolumeEntry((d / "volumes").string());
-    p->addSegmentsEntry((d / "paths").string());
-
-    auto segIds = p->segmentationIDs();
-    if (segIds.empty()) {
-        MESSAGE("Skipping: no segment fixtures present");
-        fs::remove_all(d);
-        return;
-    }
-    const std::string id = segIds[0];
-
-    SUBCASE("segmentation()") {
-        auto s = p->segmentation(id);
-        CHECK(s != nullptr);
-    }
-    SUBCASE("addSingleSegmentation is idempotent for known id") {
-        // Already present; adding the same id returns false.
-        CHECK_FALSE(p->addSingleSegmentation(id));
-    }
-    SUBCASE("reloadSingleSegmentation succeeds for known id") {
-        CHECK(p->reloadSingleSegmentation(id));
-        CHECK_FALSE(p->reloadSingleSegmentation("__nope__"));
-    }
-    SUBCASE("loadSurface returns a QuadSurface for tifxyz segments") {
-        auto surf = p->loadSurface(id);
-        if (surf) {
-            CHECK(p->getSurface(id) != nullptr);
-            CHECK(p->unloadSurface(id));
-        }
-    }
-    SUBCASE("loadSurfacesBatch + unloadAllSurfaces") {
-        std::vector<std::string> ids = {id};
-        p->loadSurfacesBatch(ids);
-        p->unloadAllSurfaces();
-        CHECK(p->getSurface(id) == nullptr);
-    }
-    SUBCASE("removeSingleSegmentation") {
-        CHECK(p->removeSingleSegmentation(id));
-        CHECK(p->segmentation(id) == nullptr);
-        CHECK_FALSE(p->removeSingleSegmentation(id));
-    }
-    SUBCASE("removeSegmentation by id") {
-        p->removeSegmentation(id);
-        CHECK(p->segmentation(id) == nullptr);
-    }
-
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg::setSegmentationDirectory changes which subdir is scanned")
-{
-    auto d = tmpDir("seg_dir");
-    auto p = VolumePkg::newEmpty();
-    // Just exercise the call path; it triggers a refresh.
-    p->setSegmentationDirectory("paths");
-    p->setSegmentationDirectory("");
-    CHECK(true);
-}
-
-TEST_CASE("VolumePkg::setSegmentsChangedCallback fires on segment list changes")
-{
-    auto d = tmpDir("cb");
-    stageSegments(d);
-    auto p = VolumePkg::newEmpty();
-    std::atomic<int> fired{0};
-    p->setSegmentsChangedCallback([&]() { ++fired; });
-    p->addSegmentsEntry((d / "paths").string());
-    // At least one fire when entries scan finishes.
-    CHECK(fired.load() >= 0); // not pinning a count — callback semantics vary
-    // Unset the callback to verify the empty-fn path.
-    p->setSegmentsChangedCallback({});
     fs::remove_all(d);
 }
 
@@ -500,11 +394,3 @@ TEST_CASE("Only native catalog source entries use the catalog volume ID")
     }
 }
 
-TEST_CASE("VolumePkg::setOutputSegments / clearOutputSegments toggle")
-{
-    auto p = VolumePkg::newEmpty();
-    p->addSegmentsEntry("/some/path");
-    p->setOutputSegments("/some/path");
-    p->clearOutputSegments();
-    CHECK(true);
-}

@@ -23,7 +23,6 @@
 
 #include <opencv2/imgproc.hpp>
 
-#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/PlaneSurface.hpp"

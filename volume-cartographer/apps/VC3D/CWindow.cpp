@@ -116,7 +116,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
-#include "vc/core/types/Segmentation.hpp"
 #include <limits>
 #include <optional>
 #include <sstream>

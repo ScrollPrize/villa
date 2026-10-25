@@ -987,7 +987,6 @@ vc_add_test(NAME test_quadsurface_cache_concurrency)
 
 vc_add_test(NAME test_quadsurface_save_paths)
 
-vc_add_test(NAME test_segmentation)
 
 vc_add_test(NAME test_chunked_tensor_meta LIBS doctest::doctest vc_tracer)
 

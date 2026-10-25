@@ -33,7 +33,6 @@
 #include "vc/core/util/ScrollUmbilicus.hpp"
 #include "vc/core/util/Umbilicus.hpp"
 #include "vc/core/util/VolpkgConvert.hpp"
-#include "vc/core/types/Segmentation.hpp"
 #include "vc/fiber_tracer/FiberTrace.hpp"
 #include "vc/lasagna/Dataset.hpp"
 #include "vc/lasagna/ProjectVolumes.hpp"

@@ -14,7 +14,6 @@ add_library(vc_core
         src/GridStore.cpp
         src/NormalGridVolume.cpp
         src/normalgridtools.cpp
-        src/Segmentation.cpp
         src/Volume.cpp
         src/VolumePkg.cpp
         src/SurfacePatchIndex.cpp

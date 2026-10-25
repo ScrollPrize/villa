@@ -675,44 +675,6 @@ TEST_CASE("OpenDataNormalGrids preserves distinct level artifacts and cache iden
     CHECK(second.string().find("L2-") != std::string::npos);
 }
 
-TEST_CASE("VolumePkg aggregate open-data folders deduplicate segment lineage")
-{
-    const auto root = std::filesystem::temp_directory_path() /
-        ("vc_open_data_aggregate_dedupe_test_" + std::to_string(vc::memmap::pid()));
-    std::filesystem::remove_all(root);
-    const auto published = root / "vol1" / "published-L0" / "published";
-    const auto generated =
-        root / "vol1" / "generated-from-source-L0" / "generated";
-    writeFile(published / "meta.json", nlohmann::json{
-        {"type", "seg"},
-        {"uuid", "published-id"},
-        {"format", "tifxyz"},
-        {"vc_open_data_catalog_segment_lineage_id", "same-lineage"},
-        {"vc_open_data_representation", "published-transformed"}
-    }.dump());
-    writeFile(generated / "meta.json", nlohmann::json{
-        {"type", "seg"},
-        {"uuid", "generated-id"},
-        {"format", "tifxyz"},
-        {"vc_open_data_catalog_segment_lineage_id", "same-lineage"},
-        {"vc_open_data_representation", "generated-native-transform"}
-    }.dump());
-
-    const auto previousAutosaveRoot = VolumePkg::autosaveRoot();
-    VolumePkg::setAutosaveRoot(root / "autosave");
-    auto pkg = VolumePkg::newEmpty();
-    REQUIRE(pkg->addSegmentsEntry(
-        (root / "vol1").string(),
-        {"open-data", "immutable", "vc-open-data-segment-aggregate"}));
-    const auto ids = pkg->segmentationIDs();
-    REQUIRE(ids.size() == 1);
-    CHECK(ids.front() == "published-id");
-
-    pkg.reset();
-    VolumePkg::setAutosaveRoot(previousAutosaveRoot);
-    std::filesystem::remove_all(root);
-}
-
 TEST_CASE("OpenDataManifest parses samples and computes summary counts")
 {
     const auto manifest = parseOpenDataManifest(kFixture, "fixture://metadata.json");

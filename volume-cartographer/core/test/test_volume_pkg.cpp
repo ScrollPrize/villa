@@ -7,7 +7,6 @@
 
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/types/Segmentation.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -84,14 +83,12 @@ TEST_CASE("resolveLocalPath: absolute, relative+base, file:// prefix")
 TEST_CASE("validateLocation: empty location is rejected")
 {
     CHECK_FALSE(validateLocation(Category::Volumes, "").empty());
-    CHECK_FALSE(validateLocation(Category::Segments, "").empty());
     CHECK_FALSE(validateLocation(Category::NormalGrids, "").empty());
 }
 
 TEST_CASE("validateLocation: remote allowed only for Volumes")
 {
     CHECK(validateLocation(Category::Volumes, "s3://b/k").empty());
-    CHECK_FALSE(validateLocation(Category::Segments, "s3://b/k").empty());
     CHECK_FALSE(validateLocation(Category::NormalGrids, "https://x/y").empty());
 }
 
@@ -138,26 +135,11 @@ TEST_CASE("validateLocation: non-directory local path is rejected")
     fs::remove_all(d);
 }
 
-TEST_CASE("validateLocation: empty directory not a valid volume/segment/normalgrid")
+TEST_CASE("validateLocation: empty directory not a valid volume/normalgrid")
 {
     auto d = tmpDir("empty");
     CHECK_FALSE(validateLocation(Category::Volumes, d.string()).empty());
-    CHECK_FALSE(validateLocation(Category::Segments, d.string()).empty());
     CHECK_FALSE(validateLocation(Category::NormalGrids, d.string()).empty());
-    fs::remove_all(d);
-}
-
-TEST_CASE("validateLocation: a segment-shaped dir validates for Segments")
-{
-    // Make a minimal tifxyz segment-like directory.
-    auto d = tmpDir("seg");
-    auto segDir = d / "myseg";
-    fs::create_directories(segDir);
-    { std::ofstream f(segDir / "meta.json");
-      f << R"({"type":"seg","uuid":"test","format":"tifxyz"})"; }
-    // Both the directory itself, and the parent (because it contains a seg subdir).
-    CHECK(validateLocation(Category::Segments, segDir.string()).empty());
-    CHECK(validateLocation(Category::Segments, d.string()).empty());
     fs::remove_all(d);
 }
 
@@ -179,7 +161,6 @@ TEST_CASE("VolumePkg::newEmpty produces an empty package")
     auto p = VolumePkg::newEmpty();
     REQUIRE(p);
     CHECK(p->volumeEntries().empty());
-    CHECK(p->segmentEntries().empty());
     CHECK(p->normalGridEntries().empty());
 }
 
@@ -248,128 +229,6 @@ TEST_CASE("VolumePkg: addVolumeEntry / removeEntry round-trip")
     CHECK_FALSE(p->removeEntry("/vol1"));
 }
 
-TEST_CASE("VolumePkg: addSegmentsEntry sets outputSegments on first add")
-{
-    auto p = VolumePkg::newEmpty();
-    CHECK(p->addSegmentsEntry("/segs"));
-    CHECK(p->segmentEntries().size() == 1);
-    // Second add doesn't override outputSegments
-    CHECK(p->addSegmentsEntry("/more_segs"));
-    CHECK(p->segmentEntries().size() == 2);
-    p->clearOutputSegments();
-    CHECK_FALSE(p->addSegmentsEntry(""));
-}
-
-TEST_CASE("VolumePkg: segment entries match normalized local paths")
-{
-    auto d = tmpDir("segment_entry_identity");
-    fs::create_directories(d / "segments");
-
-    auto p = VolumePkg::newEmpty();
-    p->save(d / "project.volpkg.json");
-    REQUIRE(p->addSegmentsEntry("segments", {"source:test"}));
-
-    const auto matching = p->matchingSegmentsEntry((d / "segments").string() + "/");
-    REQUIRE(matching);
-    CHECK(matching->location == "segments");
-    CHECK(matching->tags == std::vector<std::string>{"source:test"});
-    CHECK_FALSE(p->addSegmentsEntry((d / "segments").string()));
-    CHECK(p->segmentEntries().size() == 1);
-
-    std::error_code symlinkError;
-    fs::create_directory_symlink(
-        d / "segments", d / "segments-alias", symlinkError);
-    if (!symlinkError) {
-        CHECK(p->matchingSegmentsEntry((d / "segments-alias").string()));
-        CHECK_FALSE(p->addSegmentsEntry((d / "segments-alias").string()));
-    }
-
-#ifndef _WIN32
-    fs::create_directories(d / "segments\\");
-    CHECK_FALSE(p->matchingSegmentsEntry((d / "segments\\").string()));
-    CHECK(p->addSegmentsEntry((d / "segments\\").string()));
-#endif
-
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg: segment directory-name lookup is case-insensitive")
-{
-    auto d = tmpDir("segment_source_name");
-    fs::create_directories(d / "one" / "User-Segments");
-
-    auto p = VolumePkg::newEmpty();
-    p->save(d / "project.volpkg.json");
-    REQUIRE(p->addSegmentsEntry(
-        (d / "one" / "User-Segments").string()));
-
-    const auto matching =
-        p->matchingSegmentsEntryByDirectoryName("user-segments");
-    REQUIRE(matching);
-    CHECK(matching->location ==
-          (d / "one" / "User-Segments").string());
-
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg: segment attachment rolls back after a write failure")
-{
-    auto d = tmpDir("segment_attach_rollback");
-    auto makeSegment = [](const fs::path& path, const std::string& id) {
-        fs::create_directories(path);
-        std::ofstream meta(path / "meta.json");
-        meta << R"({"type":"seg","uuid":")" << id
-             << R"(","format":"tifxyz"})";
-    };
-    makeSegment(d / "initial", "initial");
-    makeSegment(d / "new", "new");
-
-    const auto project = d / "project.volpkg.json";
-    auto p = VolumePkg::newEmpty();
-    p->save(project);
-    REQUIRE(p->addSegmentsEntry((d / "initial").string()));
-    fs::remove(project);
-    fs::create_directory(project);
-
-    CHECK_THROWS(p->attachSegmentsEntry(
-        (d / "new").string(), {"source:test"}, true));
-    REQUIRE(p->segmentEntries().size() == 1);
-    CHECK(p->segmentEntries().front().location == (d / "initial").string());
-    CHECK(p->outputSegmentsPath() == d / "initial");
-    CHECK(p->segmentationIDs() == std::vector<std::string>{"initial"});
-
-    vc::project::LoadOptions deferred;
-    deferred.deferResolution = true;
-    auto autosave = VolumePkg::load(VolumePkg::autosaveFile(), deferred);
-    REQUIRE(autosave->segmentEntries().size() == 1);
-    CHECK(autosave->segmentEntries().front().location ==
-          (d / "initial").string());
-
-    fs::remove_all(d);
-}
-
-TEST_CASE("VolumePkg: segment discovery skips transient cache directories")
-{
-    auto d = tmpDir("seg_transients");
-    auto writeSegMeta = [](const fs::path& segDir, const std::string& uuid) {
-        fs::create_directories(segDir);
-        std::ofstream f(segDir / "meta.json");
-        f << R"({"type":"seg","uuid":")" << uuid << R"(","format":"tifxyz"})";
-    };
-
-    writeSegMeta(d / "stable-seg", "stable-seg");
-    writeSegMeta(d / "stable-seg.tmp-12345", "stable-seg.tmp-12345");
-    writeSegMeta(d / "stable-seg.previous", "stable-seg.previous");
-
-    auto p = VolumePkg::newEmpty();
-    CHECK(p->addSegmentsEntry(d.string()));
-    const auto ids = p->segmentationIDs();
-    REQUIRE(ids.size() == 1);
-    CHECK(ids.front() == "stable-seg");
-
-    fs::remove_all(d);
-}
-
 TEST_CASE("VolumePkg: addNormalGridEntry")
 {
     auto p = VolumePkg::newEmpty();
@@ -388,7 +247,6 @@ TEST_CASE("VolumePkg: save then load round-trips entries")
         auto p = VolumePkg::newEmpty();
         p->setName("Roundtrip");
         p->addVolumeEntry("/vol-x");
-        p->addSegmentsEntry("/seg-x");
         p->addNormalGridEntry("/ng-x");
         p->save(jsonPath);
     }
@@ -399,7 +257,6 @@ TEST_CASE("VolumePkg: save then load round-trips entries")
     CHECK(loaded->name() == "Roundtrip");
     CHECK(loaded->volumeEntries().size() == 1);
     CHECK(loaded->volumeEntries()[0].location == "/vol-x");
-    CHECK(loaded->segmentEntries().size() == 1);
     CHECK(loaded->normalGridEntries().size() == 1);
     fs::remove_all(d);
 }
@@ -578,42 +435,12 @@ TEST_CASE("VolumePkg::loadAutosave returns nullptr when no autosave file exists"
     fs::remove_all(d);
 }
 
-TEST_CASE("VolumePkg::setLoadFirstSegmentationDirectory: round-trip")
-{
-    VolumePkg::setLoadFirstSegmentationDirectory("custom_segs");
-    // Clear it again with empty string
-    VolumePkg::setLoadFirstSegmentationDirectory("");
-    CHECK(true);
-}
-
-TEST_CASE("VolumePkg reconciles and relocates coordinate-bearing asset entries")
+TEST_CASE("VolumePkg reconciles coordinate-bearing normal grid tags")
 {
     auto d = tmpDir("asset_reconcile");
-    const auto oldSegments = (d / "segments-old").string();
-    const auto newSegments = (d / "segments-new").string();
     const auto grids = (d / "grids").string();
 
     auto pkg = VolumePkg::newEmpty();
-    REQUIRE(pkg->addSegmentsEntry(
-        oldSegments,
-        {"user-tag", "vc-open-data-coordinate-space:sample/source@L0"}));
-    CHECK(pkg->reconcileSegmentsEntryTags(
-        oldSegments,
-        {"vc-open-data-coordinate-space:sample/source@L2",
-         "vc-open-data-source-coordinate-level:2"},
-        {"vc-open-data-coordinate-space:",
-         "vc-open-data-source-coordinate-level:"}));
-    REQUIRE(pkg->segmentEntries().size() == 1);
-    CHECK(std::find(pkg->segmentEntries()[0].tags.begin(),
-                    pkg->segmentEntries()[0].tags.end(),
-                    "user-tag") != pkg->segmentEntries()[0].tags.end());
-    CHECK(std::find(pkg->segmentEntries()[0].tags.begin(),
-                    pkg->segmentEntries()[0].tags.end(),
-                    "vc-open-data-coordinate-space:sample/source@L0") ==
-          pkg->segmentEntries()[0].tags.end());
-    CHECK(pkg->relocateSegmentsEntry(oldSegments, newSegments));
-    CHECK(pkg->segmentEntries()[0].location == newSegments);
-
     REQUIRE(pkg->addNormalGridEntry(
         grids, {"vc-open-data-source-coordinate-level:0"}));
     CHECK(pkg->reconcileNormalGridEntryTags(
@@ -941,34 +768,3 @@ TEST_CASE("VolumePkg canonicalizes virtual locators and deduplicates explicit ba
     fs::remove_all(d);
 }
 
-TEST_CASE("VolumePkg: segments are keyed by directory name, not meta uuid")
-{
-    // A converted dataset gives each patch a random object uuid that differs
-    // from its directory; a copy may even share one. Neither may hide a
-    // segment or break directory-based lookups.
-    auto d = tmpDir("seg_uuid_keys");
-    auto writeSegMeta = [](const fs::path& segDir, const std::string& uuid) {
-        fs::create_directories(segDir);
-        std::ofstream f(segDir / "meta.json");
-        f << R"({"type":"seg","uuid":")" << uuid << R"(","format":"tifxyz"})";
-    };
-    const std::string shared = "0f8fad5b-d9cb-469f-a165-70867728950e";
-    writeSegMeta(d / "seg_a", shared);
-    writeSegMeta(d / "seg_b", shared);
-
-    auto p = VolumePkg::newEmpty();
-    REQUIRE(p->addSegmentsEntry(d.string()));
-    auto ids = p->segmentationIDs();
-    std::sort(ids.begin(), ids.end());
-    CHECK(ids == std::vector<std::string>{"seg_a", "seg_b"});
-    REQUIRE(p->segmentation("seg_a"));
-    CHECK(p->segmentation("seg_a")->uuid() == shared);
-
-    writeSegMeta(d / "seg_c", "a3bb189e-8bf9-4888-9912-ace4e6543002");
-    CHECK(p->addSingleSegmentation("seg_c"));
-    CHECK(p->segmentation("seg_c"));
-    CHECK(p->reloadSingleSegmentation("seg_c"));
-    CHECK(p->removeSingleSegmentation("seg_c"));
-
-    fs::remove_all(d);
-}

@@ -55,7 +55,6 @@
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "volume_viewers/VolumeViewerBase.hpp"
 
-#include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/ui/VCCollection.hpp"
