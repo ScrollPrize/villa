@@ -466,6 +466,9 @@ static int run_main(int argc, char *argv[])
 
     std::optional<StoreSurfaces> store;
     if (!store_path.empty()) store.emplace(store_path, "vc_grow_seg_from_seed");
+    // Stored surfaces are read in the bound volume's voxels, the units of the
+    // selection, proximity queries and the output binding below.
+    const auto store_volume = volume_uuid.empty() ? std::nullopt : std::optional<std::string>(volume_uuid);
     const bool resuming = !resume_path.empty() || !surface_uuid.empty();
     // Stored surfaces within `tolerance` of a point (in the bound volume's voxels when given).
     auto stored_surfaces_near = [&](const cv::Vec3d& p, double tolerance) {
@@ -651,7 +654,7 @@ static int run_main(int argc, char *argv[])
             std::default_random_engine rng(rng_seed ? *rng_seed : static_cast<unsigned int>(clock()));
             std::shuffle(candidates.begin(), candidates.end(), rng);
             for (const auto& uuid : candidates) {
-                auto candidate = store->load(uuid);
+                auto candidate = store->load(uuid, true, store_volume);
                 if (!sample_seed(*candidate))
                     continue;
                 count_overlap = 0;
@@ -771,7 +774,7 @@ static int run_main(int argc, char *argv[])
     std::unique_ptr<QuadSurface> resume_surf;
     if (mode == "resume") {
         if (store)
-            resume_surf = store->load(surface_uuid, corrections.getAllCollections().empty());
+            resume_surf = store->load(surface_uuid, corrections.getAllCollections().empty(), store_volume);
         else if (corrections.getAllCollections().empty())
            resume_surf = load_quad_from_tifxyz(resume_path);
         else
@@ -826,7 +829,7 @@ static int run_main(int argc, char *argv[])
         // Load source surface
         std::unique_ptr<QuadSurface> src_surface;
         try {
-            src_surface = store ? store->load(surface_uuid) : load_quad_from_tifxyz(resume_path);
+            src_surface = store ? store->load(surface_uuid, true, store_volume) : load_quad_from_tifxyz(resume_path);
         } catch (const std::exception& ex) {
             std::cerr << "ERROR: failed to load resume surface: " << ex.what() << std::endl;
             return EXIT_FAILURE;

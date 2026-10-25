@@ -1,6 +1,7 @@
 #include "vc/core/util/StoreSurfaces.hpp"
 
 #include <vc_object_store/Uuid.hpp>
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
 
 #include <cstdlib>
 #include <stdexcept>
@@ -19,18 +20,27 @@ StoreSurfaces::StoreSurfaces(const std::filesystem::path& store, const std::stri
 // the session detaches when the last of them is gone.
 StoreSurfaces::~StoreSurfaces() = default;
 
-std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool applyValidity)
+std::unique_ptr<QuadSurface> StoreSurfaces::load(const std::string& uuid, bool applyValidity,
+                                                 const std::optional<std::string>& volume)
 {
     std::unique_ptr<QuadSurface> surface;
     std::string objectRevision, revision;
+    double toVolume = 1;
     session_->read(attachment_, [&](const auto& db, const auto& txn, const auto&) {
-        surface = load_quad_from_store(db, txn, uuid, std::nullopt, applyValidity);
+        if (volume) {
+            const auto object = db.objectByUuid(txn, uuid);
+            if (!object) throw std::runtime_error("surface not found: " + uuid);
+            const auto scale = vc::objects::geometryScaleToVolume(nlohmann::json::parse(object->meta), *volume);
+            if (!scale) throw std::runtime_error("surface " + uuid + " is not bound to volume " + *volume);
+            toVolume = *scale;
+        }
+        surface = load_quad_from_store(db, txn, uuid, std::nullopt, applyValidity, toVolume);
         revision = db.currentGeometry(txn, surface->id)->uuid;
         objectRevision = db.currentObjectRevision(txn, surface->id)->uuid;
     });
     {
         std::lock_guard lock(loadedMutex_);
-        loaded_[surface->id] = {objectRevision, revision};
+        loaded_[surface->id] = {objectRevision, revision, toVolume};
     }
     surface->setChannelLoader(store_channel_loader(session_, attachment_, revision));
     return surface;
@@ -62,9 +72,7 @@ std::string StoreSurfaces::create(QuadSurface& surface, const std::string& name,
 std::string StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
 {
     const auto canonical = vc::objects::util::canonicalUuid(uuid);
-    const auto pins = loadedRevision(canonical);
-    if (!pins) throw std::runtime_error("update a surface this tool loaded: " + uuid);
-    const auto& [objectRevision, geometryRevision] = *pins;
+    const auto [objectRevision, geometryRevision, toVolume] = writable(canonical);
     const auto& points = *surface.rawPointsPtr();
     std::string revision;
     session_->editKeepingRelationships(attachment_, {{canonical, objectRevision}}, {}, [&](auto& db, auto& txn, const auto& keep) {
@@ -78,9 +86,7 @@ std::string StoreSurfaces::update(const std::string& uuid, QuadSurface& surface)
 std::string StoreSurfaces::updateChannels(const std::string& uuid, QuadSurface& surface, const std::vector<std::string>& names)
 {
     const auto canonical = vc::objects::util::canonicalUuid(uuid);
-    const auto pins = loadedRevision(canonical);
-    if (!pins) throw std::runtime_error("update a surface this tool loaded: " + uuid);
-    const auto& [objectRevision, geometryRevision] = *pins;
+    const auto [objectRevision, geometryRevision, toVolume] = writable(canonical);
     std::string revision;
     session_->editKeepingRelationships(attachment_, {{canonical, objectRevision}}, {}, [&](auto& db, auto& txn, const auto&) {
         revision = write_quad_channels_to_store(db, txn, canonical, surface, names, {}, geometryRevision);
@@ -89,11 +95,14 @@ std::string StoreSurfaces::updateChannels(const std::string& uuid, QuadSurface& 
     return revision;
 }
 
-std::optional<std::pair<std::string, std::string>> StoreSurfaces::loadedRevision(const std::string& uuid)
+StoreSurfaces::Loaded StoreSurfaces::writable(const std::string& uuid)
 {
     std::lock_guard lock(loadedMutex_);
     const auto found = loaded_.find(uuid);
-    if (found == loaded_.end()) return std::nullopt;
+    if (found == loaded_.end()) throw std::runtime_error("update a surface this tool loaded: " + uuid);
+    // Writing a rescaled grid back would rewrite every stored coordinate.
+    if (found->second.toVolume != 1)
+        throw std::runtime_error("surface " + uuid + " was loaded in a volume's voxels at a scale other than 1");
     return found->second;
 }
 

@@ -155,6 +155,40 @@ TEST_CASE("QuadSurface round trip through the object store")
     CHECK(grown->channel("generations", SURF_CHANNEL_NORESIZE).at<uint16_t>(0, 0) == 0);
 }
 
+TEST_CASE("Tools read surfaces in a bound volume's voxels and write back only stored units")
+{
+    const fs::path dir = fs::temp_directory_path() / ("vc-store-units-" + util::newUuid());
+    fs::create_directories(dir);
+    OpenOptions options; options.author = "units";
+    cv::Mat_<cv::Vec3f> points(2, 2);
+    for (int r = 0; r < 2; ++r)
+        for (int c = 0; c < 2; ++c) points(r, c) = {float(2 * c), float(2 * r), 8.f};
+    QuadSurface stored(points, {1.f, 1.f});
+    const auto uuid = util::newUuid();
+    {
+        auto store = ObjectStore::create(dir / "objects.vcobj", options);
+        auto txn = store.write();
+        ObjectRecord record; record.uuid = uuid; record.kind = "surface";
+        // Two stored units per voxel of "vol".
+        record.meta = R"({"coordinates":{"volume_uuid":"vol","scale_factor":2}})";
+        store.upsertObject(txn, record);
+        store.putGeometry(txn, uuid, quad_surface_geometry(stored));
+        txn.commit();
+    }
+    {
+        StoreSurfaces surfaces(dir / "objects.vcobj", "vc_test_tool");
+        auto inVolume = surfaces.load(uuid, true, std::string("vol"));
+        CHECK((*inVolume->rawPointsPtr())(1, 1) == cv::Vec3f(1, 1, 4));
+        CHECK_THROWS(surfaces.update(uuid, *inVolume));
+        CHECK_THROWS(surfaces.load(uuid, true, std::string("other-volume")));
+        auto inStore = surfaces.load(uuid);
+        CHECK((*inStore->rawPointsPtr())(1, 1) == cv::Vec3f(2, 2, 8));
+        CHECK_NOTHROW(surfaces.update(uuid, *inStore));
+    }
+    std::error_code ignored;
+    fs::remove_all(dir, ignored);
+}
+
 TEST_CASE("Tools create surfaces with provenance and push them to a hub")
 {
     const fs::path dir = fs::temp_directory_path() / ("vc-store-surfaces-" + util::newUuid());

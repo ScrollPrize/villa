@@ -1194,7 +1194,9 @@ int main(int argc, char *argv[])
         });
         if (!src_surface.empty() && std::find(uuids.begin(), uuids.end(), vc::objects::util::canonicalUuid(src_surface)) == uuids.end())
             uuids.push_back(src_surface);
-        for (const auto& uuid : uuids) stored_sources.push_back(store->load(uuid));
+        // Read in the bound volume's voxels, the units of the selection and the output binding.
+        const auto volume = volume_uuid.empty() ? std::nullopt : std::optional<std::string>(volume_uuid);
+        for (const auto& uuid : uuids) stored_sources.push_back(store->load(uuid, true, volume));
     }
     std::vector<QuadSurface*> stored_source_pointers;
     for (const auto& surface : stored_sources) stored_source_pointers.push_back(surface.get());

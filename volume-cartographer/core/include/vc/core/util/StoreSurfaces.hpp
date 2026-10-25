@@ -37,7 +37,11 @@ public:
     StoreSurfaces& operator=(const StoreSurfaces&) = delete;
 
     // The surface's current geometry; channels load on demand from that revision.
-    std::unique_ptr<QuadSurface> load(const std::string& uuid, bool applyValidity = true);
+    // With `volume`, in that volume's voxels (the surface must be bound to it);
+    // otherwise in stored units. Only a surface loaded in stored units, or at a
+    // volume scale of 1, can be written back.
+    std::unique_ptr<QuadSurface> load(const std::string& uuid, bool applyValidity = true,
+                                      const std::optional<std::string>& volume = std::nullopt);
     // A new surface object holding `surface`. Its meta keeps the surface's meta
     // (e.g. area) except tifxyz file keys and status tags (`tags` are the record's); meta.provenance records the tool, its
     // parameters and the source objects; meta.coordinates is taken from the first
@@ -68,6 +72,11 @@ private:
     // Object and geometry revisions of each loaded surface, the pins of updates.
     // Loads may run on several threads.
     std::mutex loadedMutex_;
-    std::map<std::string, std::pair<std::string, std::string>> loaded_;
-    std::optional<std::pair<std::string, std::string>> loadedRevision(const std::string& uuid);
+    struct Loaded {
+        std::string objectRevision, geometryRevision;
+        double toVolume = 1;
+    };
+    std::map<std::string, Loaded> loaded_;
+    // The pins of a surface this tool loaded in stored units; throws otherwise.
+    Loaded writable(const std::string& uuid);
 };
