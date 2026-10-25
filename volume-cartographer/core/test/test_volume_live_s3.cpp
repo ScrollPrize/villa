@@ -59,7 +59,7 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
     const nlohmann::json fiber = {
         {"coordinates", {{"volume_uuid", "20260102150214"}, {"scale_factor", 1}}}};
     // Reproduce the URL-derived identity mismatch before applying catalog tags.
-    CHECK_FALSE(vc3d::geometryScaleForVolume(fiber, *untagged).has_value());
+    CHECK_FALSE(vc::objects::geometryScaleToVolume(fiber, untagged->id()).has_value());
 
     struct TemporaryProject {
         std::filesystem::path path = std::filesystem::temp_directory_path() /
@@ -115,13 +115,13 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
     }
     MESSAGE("Catalog cache reuse: " << (after.bytes ? after.bytes->size() : 0)
             << " decoded bytes, " << fetches->load() << " remote chunk fetches");
-    CHECK(vc3d::geometryScaleForVolume(fiber, *volume) == 1.0);
+    CHECK(vc::objects::geometryScaleToVolume(fiber, volume->id()) == 1.0);
     CHECK(vc3d::coordinateBindingForVolume(*volume, 1).at("coordinates") == fiber.at("coordinates"));
     REQUIRE(project->volumeIDs().size() == 2);
     for (const auto& id : project->volumeIDs()) {
         if (id != volume->id()) {
             const auto rebased = project->volume(id);
-            CHECK_FALSE(vc3d::geometryScaleForVolume(fiber, *rebased).has_value());
+            CHECK_FALSE(vc::objects::geometryScaleToVolume(fiber, rebased->id()).has_value());
             CHECK(rebased->remotePersistentCachePath() != volume->remotePersistentCachePath());
             CHECK(rebased->remotePersistentCachePath() == rebased->remoteCacheRoot() / rebased->id());
         }
@@ -144,7 +144,7 @@ TEST_CASE("Catalog PHerc0139 scan reopens with the object-store volume identity"
         CHECK(matched.size() == all.size());
         CHECK(store.unboundObjectCount(txn, "fiber", volume->id()) == 0);
         for (const auto& object : matched)
-            CHECK(vc3d::geometryScaleForVolume(nlohmann::json::parse(object.meta), *volume) == 1.0);
+            CHECK(vc::objects::geometryScaleToVolume(nlohmann::json::parse(object.meta), volume->id()) == 1.0);
         MESSAGE("Matched " << matched.size() << " real hub fibers to " << volume->id());
     }
 }
