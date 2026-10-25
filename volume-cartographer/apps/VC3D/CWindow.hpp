@@ -269,6 +269,9 @@ private:
     void selectLasagnaOutputSurface(const QString& surfaceUuid);
     // List the current Open Data volume's catalog surfaces beside the user's.
     void updateCatalogSurfaceSources();
+    // An Open Data volume opened at a coarser level is registered to its catalog
+    // volume in the user's store (vc3d::opendata::registerVolumeLevel).
+    void registerCurrentVolumeLevel();
     // The active surface's Lasagna results (attached to it in the store).
     void loadLasagnaResults(Surface* surface);
 

@@ -3939,6 +3939,23 @@ void CWindow::selectLasagnaOutputSurface(const QString& surfaceUuid)
     }
 }
 
+void CWindow::registerCurrentVolumeLevel()
+{
+    const auto attachment = _state->objectStoreAttachment();
+    const auto volume = _state->currentVolume();
+    if (!attachment || !volume || !_state->vpkg()) return;
+    const auto catalog = vc3d::opendata::catalogVolumeFromTags(_state->vpkg()->volumeTags(volume->id()));
+    if (!catalog) return;
+    try {
+        if (vc3d::opendata::registerVolumeLevel(*_state->objectStoreSession(), *attachment, volume->id(),
+                                                catalog->volumeId, catalog->level))
+            Logger()->info("Registered volume {} as {} at level {}", volume->id(), catalog->volumeId, catalog->level);
+    } catch (const std::exception& error) {
+        showStatusBarMessage(tr("Cannot relate this volume to %1 in the object store: %2")
+                                 .arg(QString::fromStdString(catalog->volumeId), QString::fromUtf8(error.what())), 8000);
+    }
+}
+
 void CWindow::updateCatalogSurfaceSources()
 {
     // An Open Data volume shows its catalog volume's surfaces at its pyramid level.
@@ -6555,6 +6572,7 @@ void CWindow::CreateWidgets(void)
         vc3d::opendata::materializeSurface(store, uuid);
     });
     auto updateSurfaceSource = [this]() {
+        registerCurrentVolumeLevel();
         _surfaceCatalog->setSource(_state->objectStoreAttachment(), _state->currentVolume());
         updateCatalogSurfaceSources();
         LasagnaServiceManager::instance().setObjectStore(_state->objectStoreSession(), _state->objectStoreAttachment());

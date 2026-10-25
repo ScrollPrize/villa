@@ -259,7 +259,7 @@ FiberCollectionController::FiberCollectionController(CState* state, ViewerManage
         if (event.kind == vc::objects::StoreSessionEvent::Kind::Hub) return;
         if (event.kind == vc::objects::StoreSessionEvent::Kind::Committed &&
             event.attachment != state_->objectStoreAttachment()) return;
-        if (!vc3d::store::touches(event, {"fiber", "fiber_branch"})) return;
+        if (!vc3d::store::touches(event, {"fiber", "fiber_branch", "volume_transform", "volume_transform_choice"})) return;
         projectChanged(event.kind == vc::objects::StoreSessionEvent::Kind::Committed);
     });
     connect(state_, &CState::volumeChanged, this, [this]() { projectChanged(); });

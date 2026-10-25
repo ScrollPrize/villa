@@ -8,6 +8,7 @@
 #include <vc_object_store/geometry/Geometry.hpp>
 #include <vc_object_store/store/GeometryViews.hpp>
 #include "ObjectStoreCoordinates.hpp"
+#include "OpenDataSurfaceStore.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include <vc_object_store/Uuid.hpp>
@@ -233,6 +234,23 @@ int main(int argc, char** argv)
         bool staleMapping=false;
         try {registeredEdit.save(*registered.surface,cv::Rect(1,2,1,1));}catch(const std::exception&){staleMapping=true;}
         require(staleMapping,"registration conflicts invalidate writable views");
+
+        // A volume opened at pyramid level 1 has its own id: registering the level
+        // relates it to the volume it shows, both ways, once.
+        Volume::ZarrCreateOptions coarse = create;
+        coarse.shapeZYX = {2, 2, 2}; coarse.chunkShapeZYX = {2, 2, 2}; coarse.uuid = "vol1-level1";
+        const auto level = Volume::New(fs::path(dir.path().toStdString()) / "level.zarr", coarse);
+        const auto atLevel = add("at-level", vc3d::coordinateBindingForVolume(*level, 1));
+        require(vc3d::opendata::registerVolumeLevel(*session, attachment, "vol1-level1", "vol1", 1), "the level is registered");
+        require(!vc3d::opendata::registerVolumeLevel(*session, attachment, "vol1-level1", "vol1", 1), "an existing relation is kept");
+        catalog.setSource(attachment, level);
+        pump([&] { const auto* row = catalog.row(native); return !catalog.loading() && row && row->mapping; },
+             "the level lists the surfaces of the volume it shows");
+        require(*catalog.row(native)->mapping == VolumeAffine::scale(0.5), "seen at the level's scale");
+        catalog.setSource(attachment, volume);
+        pump([&] { const auto* row = catalog.row(atLevel); return !catalog.loading() && row && row->mapping; },
+             "the full volume lists surfaces made at the level");
+        require(*catalog.row(atLevel)->mapping == VolumeAffine::scale(2), "seen at the full volume's scale");
 
         catalog.setSource(std::nullopt, volume);
         require(catalog.rows().empty(), "no attachment lists nothing");

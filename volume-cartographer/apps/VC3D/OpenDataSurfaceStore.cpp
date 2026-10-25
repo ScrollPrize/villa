@@ -7,6 +7,7 @@
 #include <vc_object_store/objects/GeometryCoordinates.hpp>
 #include <vc_object_store/objects/GeometryIngest.hpp>
 #include <vc_object_store/objects/ObjectStore.hpp>
+#include <vc_object_store/objects/VolumeTransforms.hpp>
 
 #include <QSaveFile>
 #include <QString>
@@ -617,6 +618,25 @@ std::optional<CatalogVolume> catalogVolumeFromTags(const std::vector<std::string
     }
     volume.level = *level;
     return volume;
+}
+
+bool registerVolumeLevel(vc::objects::ObjectStoreSession& session, const vc::objects::AttachmentIdentity& attachment,
+                         const std::string& volume, const std::string& shown, int level)
+{
+    if (volume == shown || !session.writable(attachment)) return false;
+    bool related = false;
+    session.read(attachment, [&](const auto& db, const auto& txn, const auto&) {
+        related = db.volumeTransforms(txn).resolve(shown, volume).status != vcr::catalog::TransformStatus::Unavailable;
+    });
+    if (related) return false;
+    static const QUuid kNamespace(QStringLiteral("8d7f3c1a-2b4e-4f6a-9c5d-1e0b7a6f3d28"));
+    const auto uuid = QUuid::createUuidV5(kNamespace, QString::fromStdString(shown + "\n" + volume))
+                          .toString(QUuid::WithoutBraces).toStdString();
+    session.act(attachment, {{uuid, std::nullopt}}, [&](auto& db, auto& txn) {
+        db.registerVolumeTransform(txn, shown, volume, vc::objects::VolumeAffine::scale(std::ldexp(1.0, -level)),
+                                   "pyramid level " + std::to_string(level), uuid);
+    });
+    return true;
 }
 
 SurfaceImportResult importSampleSurfaces(const std::filesystem::path& remoteCacheRoot,

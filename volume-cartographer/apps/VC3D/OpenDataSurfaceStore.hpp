@@ -1,5 +1,6 @@
 #pragma once
 #include <vc_reader/catalog.hpp>
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
 
 // Open Data segments as surfaces of one internal object store per sample
 // (<remote cache>/open_data/stores/<sample>.vcobj). Only this importer writes
@@ -57,6 +58,15 @@ struct CatalogVolume {
     int level = 0;
 };
 [[nodiscard]] std::optional<CatalogVolume> catalogVolumeFromTags(const std::vector<std::string>& tags);
+
+// A volume showing a catalog volume at pyramid level `level` (a source opened at
+// a coarser base level) has its own id. Register it to the volume it shows
+// (scale 2^-level) unless the store already relates the two, so objects bound
+// at any level are seen at every other. The registration's UUID depends only on
+// the pair, so replicas that both register it make one object, not two routes.
+// Returns whether a registration was written.
+bool registerVolumeLevel(vc::objects::ObjectStoreSession& session, const vc::objects::AttachmentIdentity& attachment,
+                         const std::string& volume, const std::string& shown, int level);
 
 struct SurfaceImportResult {
     int representations = 0;
