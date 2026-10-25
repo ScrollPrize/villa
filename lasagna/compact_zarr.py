@@ -129,9 +129,7 @@ def _build_compact_pyramid_chunk(origin, *, source_path, dest_path, names,
     chunks = _array_metadata(dest_path)["chunks"]
     slices = tuple(slice(o*2, min((o+c)*2, n)) for o,c,n in zip(origin, chunks[1:], source.shape[1:]))
     raw = np.asarray(source[(slice(None), *slices)])
-    output = [_mean_pool2x_u8(raw[i], zero_overrides=(_product_channel_kind(name) == "grad_mag"))
-              if channel_dtypes[name] == np.dtype("uint8") else _mean_pool2x_f32(raw[i])
-              for i, name in enumerate(names)]
+    output = [None] * len(names)
     for i, name in enumerate(names):
         if _product_channel_kind(name) == "nx":
             sibling = name[:-2] + "ny"
@@ -146,7 +144,7 @@ def _build_compact_pyramid_chunk(origin, *, source_path, dest_path, names,
                     elif ps:
                         mask = np.maximum.reduce(ps)
                 output[i], output[j] = _moment_pool2x_normals(raw[i], raw[j], validity=mask)
-    if blank_invalid:
+    if blank_invalid and any(name == "width" or name.startswith("embedding_") for name in names):
         # Width/embeddings are undefined at zero presence, not physical zero.
         ps = [raw[i] for i,name in enumerate(names) if name == "presence" or name.endswith("_presence")]
         if ps:
@@ -157,6 +155,10 @@ def _build_compact_pyramid_chunk(origin, *, source_path, dest_path, names,
                     mean = _mean_pool2x_f32(raw[i] * valid) / np.maximum(denominator, 1e-12)
                     output[i] = (np.rint(mean).clip(0,255).astype(np.uint8)
                                  if channel_dtypes[name] == np.dtype("uint8") else mean)
+    for i, name in enumerate(names):
+        if output[i] is None:
+            output[i] = (_mean_pool2x_u8(raw[i], zero_overrides=(_product_channel_kind(name) == "grad_mag"))
+                         if channel_dtypes[name] == np.dtype("uint8") else _mean_pool2x_f32(raw[i]))
     values = dict(zip(names, output))
     if blank_invalid:
         values = blank_fiber_channels(values)
@@ -176,12 +178,19 @@ class CompactOutputAdapter:
         self.by_level = {}
         for product in products:
             self.by_level.setdefault(product.level, []).append(product)
+        for level, scale_products in self.by_level.items():
+            enabled = {p.pyramid_policy != "none" for p in scale_products}
+            if len(enabled) != 1:
+                raise ValueError(f"sd{level}: compact groups cannot mix native-only and pyramid products; use legacy output")
         names = [c.name for p in products for c in p.channels]
         if len(set(names)) != len(names) or validity_channel not in names:
             raise ValueError("packed channels must be unique and include validity_channel")
 
     def product_by_name(self, name):
         return next(p for p in self.products if p.name == name)
+
+    def _level_stop(self, product):
+        return product.level + 1 if product.pyramid_policy == "none" else self.n_levels
 
     def array_path(self, product, level=None):
         return Path(self.root) / f"sd{product.level}" / str(product.level if level is None else level)
@@ -238,7 +247,7 @@ class CompactOutputAdapter:
             group = _open_group(root / f"sd{n}")
             dtype = np.result_type(*(p.dtype for p in products))
             datasets = []
-            for level in range(n, self.n_levels):
+            for level in range(n, self._level_stop(products[0])):
                 shape = _omezarr_level_shape(base_shape_zyx, level)
                 # Match the coordinator's grid; source_to_base transforms
                 # coordinates in metadata, not the array dimensions.
@@ -273,7 +282,7 @@ class CompactOutputAdapter:
             array_path = self.array_path(products[0])
             # Invalidate derived outputs before replacing a finest chunk.
             origin = tuple(chunk_origin_zyx)
-            for coarse in range(level + 1, self.n_levels):
+            for coarse in range(level + 1, self._level_stop(products[0])):
                 coarse_origin = tuple((o // (2**(coarse-level)) // products[0].chunk_size) * products[0].chunk_size for o in origin)
                 chunk_file(self.array_path(products[0], coarse), coarse_origin).unlink(missing_ok=True)
             atomic_chunk(array_path, origin, np.stack([values[c] for c in channels]))
@@ -302,7 +311,26 @@ class CompactOutputAdapter:
         for native, products in self.by_level.items():
             names = [c.name for p in products for c in p.channels]
             channel_dtypes = {c.name: np.dtype(p.dtype) for p in products for c in p.channels}
-            for level in range(native+1, self.n_levels):
+            from lasagna.tiled_predict3d import _product_channel_kind
+            methods = {}
+            has_presence = any(n == "presence" or n.endswith("_presence") for n in names)
+            for name in names:
+                kind = _product_channel_kind(name)
+                if products[0].pyramid_policy == "none":
+                    method = "none"
+                elif kind in {"nx", "ny"} and name[:-2] + ("ny" if kind == "nx" else "nx") in names:
+                    method = "normal_second_moment_mean_pool2x"
+                elif self.blank_invalid and has_presence and (name == "width" or name.startswith("embedding_")):
+                    method = "mean_pool2x_valid_presence"
+                else:
+                    method = ("mean_pool2x_zero_overrides"
+                              if kind == "grad_mag" and channel_dtypes[name] == np.dtype("uint8")
+                              else "mean_pool2x")
+                methods[name] = method
+            # Packed arrays use different reducers per channel, unlike legacy
+            # single-channel groups whose attribute is a single method string.
+            _open_group(Path(self.root) / f"sd{native}").attrs["lasagna_pyramid_downsample"] = methods
+            for level in range(native+1, self._level_stop(products[0])):
                 source = zarr.open_array(str(self.array_path(products[0], level-1)), mode="r")
                 dest = zarr.open_array(str(self.array_path(products[0], level)), mode="r")
                 # Discover only chunks with source data; never scan the full volume grid.

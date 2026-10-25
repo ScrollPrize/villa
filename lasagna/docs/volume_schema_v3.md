@@ -349,6 +349,21 @@ contribute normal moments or width/embedding means; they are no-data, not
 zero-width measurements. Scalar presence is still reduced normally, and
 non-presence outputs are blanked again where reduced presence is zero.
 
+Each scale group's `.zattrs` records `lasagna_pyramid_downsample` as an
+object mapping channel names to reduction methods (legacy single-channel
+groups instead store one method string). Methods are `mean_pool2x`,
+`mean_pool2x_zero_overrides` (a zero input makes that output invalid),
+`normal_second_moment_mean_pool2x` (joint encoded normal-pair reduction),
+`mean_pool2x_valid_presence` (width/embedding mean over nonzero-presence inputs),
+or `none` (native level only). The embedded manifest's `blank_invalid` setting
+also determines whether normal moments exclude zero-presence inputs.
+
+Native-only products do not advertise or generate coarse levels. Because a
+packed group's channel list is constant across levels, the compact writer
+rejects mixing native-only and pyramid-enabled products at the same native
+scale; use legacy output for that combination. It does not silently override
+a product's native-only policy.
+
 ## Writer defaults and compatibility options
 
 Both full-volume inference entrypoints default to `--output-format compact`.

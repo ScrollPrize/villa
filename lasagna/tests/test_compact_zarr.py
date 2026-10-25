@@ -13,7 +13,51 @@ from lasagna.tiled_predict3d import OutputProductSpec
 
 def product(name, channels, level=0, dtype=np.uint8):
     return OutputProductSpec(name=name, channels=channels, level=level, scaledown=2**level,
-                             chunk_size=4, dtype=dtype, inference_scaledown=2**level)
+                             chunk_size=4, dtype=dtype, inference_scaledown=2**level,
+                             pyramid_policy="custom")
+
+
+def test_native_only_policy_and_mixed_policy_rejection(tmp_path):
+    from dataclasses import replace
+    p = replace(product("fiber", ["presence"]), pyramid_policy="none")
+    output = CompactOutputAdapter(root=tmp_path / "native.zarr", products=(p,),
+                                  n_levels=3, validity_channel="presence")
+    output.prepare(base_shape_zyx=(8,8,8), ome_chunk=4)
+    output.write_products_chunk([(p, {"presence": np.ones((4,4,4), np.uint8)})], chunk_origin_zyx=(0,0,0))
+    output.build_pyramids(workers=1)
+    group = zarr.open_group(str(tmp_path / "native.zarr/sd0"), mode="r")
+    assert list(group.array_keys()) == ["0"]
+    assert [d["path"] for d in group.attrs["multiscales"][0]["datasets"]] == ["0"]
+    assert group.attrs["lasagna_pyramid_downsample"] == {"presence": "none"}
+    with pytest.raises(ValueError, match="cannot mix"):
+        CompactOutputAdapter(root=tmp_path / "mixed.zarr", products=(p, product("width", ["width"])),
+                             n_levels=3, validity_channel="presence")
+
+
+def test_special_reducers_do_not_compute_discarded_scalar_means(tmp_path, monkeypatch):
+    from lasagna.compact_zarr import _build_compact_pyramid_chunk
+    import lasagna.omezarr_pyramid as pyramid
+    p = product("fiber", ["presence", "nx", "ny", "width", "sheet_grad_mag"])
+    output = CompactOutputAdapter(root=tmp_path / "p.zarr", products=(p,), n_levels=2,
+                                  validity_channel="presence", blank_invalid=True)
+    output.prepare(base_shape_zyx=(4,4,4), ome_chunk=4)
+    output.write_products_chunk([(p, {n: np.full((4,4,4), 128, np.uint8) for n in p.channel_names})],
+                                chunk_origin_zyx=(0,0,0))
+    calls = []
+    original = pyramid._mean_pool2x_u8
+    def counted(*args, **kwargs):
+        calls.append(kwargs.get("zero_overrides", False))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(pyramid, "_mean_pool2x_u8", counted)
+    _build_compact_pyramid_chunk((0,0,0), source_path=str(output.array_path(p)),
+        dest_path=str(output.array_path(p, 1)), names=p.channel_names,
+        channel_dtypes={n: np.dtype("uint8") for n in p.channel_names}, blank_invalid=True)
+    assert calls == [False, True]  # presence and magnitude only
+    output.build_pyramids(workers=1)
+    methods = zarr.open_group(str(tmp_path / "p.zarr/sd0"), mode="r").attrs["lasagna_pyramid_downsample"]
+    assert methods == dict(presence="mean_pool2x", nx="normal_second_moment_mean_pool2x",
+                          ny="normal_second_moment_mean_pool2x", width="mean_pool2x_valid_presence",
+                          sheet_grad_mag="mean_pool2x_zero_overrides")
 
 
 def test_touched_python_parses():
@@ -220,11 +264,14 @@ def test_compact_demand_complete_and_warm_resume(tmp_path):
 def test_compact_lasagna_full_volume_matches_legacy(tmp_path, monkeypatch, with_distance, source_to_base):
     import torch
     from lasagna import preprocess_cos_omezarr as module
+    events = []
     class Model:
         def __call__(self, x):
+            events.append("model")
             return torch.full((x.shape[0], 8, *x.shape[-3:]), .2, device=x.device)
     monkeypatch.setattr(module.LasagnaCosPredict3DAdapter, "load_model", lambda self, device: Model())
     def distance(**kwargs):
+        events.append("distance")
         kwargs["output_level_arr"][:] = 91
     monkeypatch.setattr(module, "_compute_pred_dt_slab", distance)
     source = tmp_path / "input.zarr"
@@ -234,12 +281,15 @@ def test_compact_lasagna_full_volume_matches_legacy(tmp_path, monkeypatch, with_
         array = zarr.open_array(str(source), mode="w", shape=(8,8,8), chunks=(4,4,4), dtype="uint8")
     array[:] = 50
     for fmt in ("legacy", "compact"):
+        events.clear()
         dest = tmp_path / fmt / "output.lasagna.json"
         module.run_preprocess_3d(input_path=str(source), output_path=str(dest), output_format=fmt,
             unet3d_checkpoint="unused.pt", device="cpu", crop_xyzwhd=None, tile_size=8, overlap=0, border=0,
             cos_scaledown=1, scaledown=2, base_ref=str(source), base_scale=0, n_levels=3, ome_chunk=4,
             flush_workers=0, accumulator_workers=0, pred_dt_path=str(source) if with_distance else None,
             source_to_base=source_to_base)
+        if with_distance:
+            assert (events.index("distance") < events.index("model")) == (fmt == "compact")
     packed_root = tmp_path / "compact/output.zarr"
     manifest = LasagnaVolume.load(packed_root)
     assert manifest.validity_channel == "grad_mag"
